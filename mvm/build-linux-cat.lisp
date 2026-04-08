@@ -5,71 +5,48 @@
 
 (load (merge-pathnames "../lib/load-mvm.lisp"
                        (directory-namestring (truename *load-truename*))))
-
 (modus.mvm.x64:install-x64-translator)
 (setf modus.mvm.x64::*x64-linux-mode* t)
-
 (load (merge-pathnames "../boot/boot-linux-x64.lisp"
                        (directory-namestring (truename *load-truename*))))
-
 (in-package :modus.mvm)
 
 (let* ((source "
-;; Boot stub stores at 0x600000 (raw u64):
-;; +0x00: argc, +0x10: argv[0], +0x18: argv[1], +0x20: argv[2]
+;; Globals at heap base 0x10000000 (stored by boot stub).
+;; Source literals = raw byte addresses (compiler tags internally).
 
-;; argc as tagged fixnum
-(defun sys-argc () (mem-ref #x600000 :u32))
+(defun sys-argc () (mem-ref #x10000000 :u32))
 
-;; argv[1] as SAP (wraps the raw C string pointer)
+;; argv[1] as SAP (raw C string pointer from :u64 load)
 (defun argv1-sap ()
-  (make-sap (mem-ref #xC00030 :u64)))
+  (make-sap-raw (mem-ref #x10000018 :u64)))
 
-;; Linux syscall wrappers using SAPs
-;; SYS_open(path-sap, flags, mode) → fd (tagged)
-(defun sys-open (path-sap flags mode)
+;; I/O buffer SAP near end of heap (well away from globals and alloc area)
+(defun io-buf-sap ()
+  (make-sap #x1DF00000))
+
+;; All syscall wrappers use syscall3 (tagged args, tagged result).
+;; sap-address returns tagged fixnum.
+
+(defun sys-open (path-sap)
   (let ((p path-sap))
-    (let ((f flags))
-      (let ((m mode))
-        (let ((raw-path (sap-address p)))
-          (let ((result (syscall3-raw 2 raw-path f m)))
-            (let ((r result))
-              (+ r r))))))))
+    (syscall3 2 (sap-address p) 0 0)))
 
-;; SYS_read(fd, buf-sap, len) → bytes-read (tagged)
 (defun sys-read (fd buf-sap len)
   (let ((f fd))
     (let ((b buf-sap))
       (let ((l len))
-        (let ((raw-buf (sap-address b)))
-          (let ((result (syscall3-raw 0 (ash f -1) raw-buf (ash l -1))))
-            (let ((r result))
-              (+ r r))))))))
+        (syscall3 0 f (sap-address b) l)))))
 
-;; SYS_write(fd, buf-sap, len) → bytes-written (tagged)
-(defun sys-write (fd buf-sap len)
+(defun sys-write-buf (fd buf-sap len)
   (let ((f fd))
     (let ((b buf-sap))
       (let ((l len))
-        (let ((raw-buf (sap-address b)))
-          (let ((result (syscall3-raw 1 (ash f -1) raw-buf (ash l -1))))
-            (let ((r result))
-              (+ r r))))))))
+        (syscall3 1 f (sap-address b) l)))))
 
-;; SYS_close(fd)
 (defun sys-close (fd)
   (let ((f fd))
-    (syscall3-raw 3 (ash f -1) 0 0)))
-
-;; Allocate a SAP-backed buffer via mmap
-(defun alloc-buf (size)
-  (let ((s size))
-    ;; SYS_mmap(NULL, size, PROT_RW=3, MAP_PRIVATE|MAP_ANON=0x22, -1, 0)
-    ;; This needs 6 args but we only have syscall3... use the heap instead
-    ;; For now, allocate a Lisp array and get its raw data pointer as SAP
-    (let ((arr (make-array s)))
-      (let ((raw (+ (ash (logand arr (- 0 4)) 1) 8)))
-        (make-sap raw)))))
+    (syscall3 3 f 0 0)))
 
 (defun cat-fd (fd buf-sap)
   (let ((f fd))
@@ -79,7 +56,7 @@
           (when (<= n 0)
             (sys-close f)
             (return 0))
-          (sys-write 2 b n))))))
+          (sys-write-buf 1 b n))))))
 
 (defun kernel-main ()
   (let ((argc (sys-argc)))
@@ -90,13 +67,13 @@
           (write-char-serial 101) (write-char-serial 10)
           (sys-exit 1))
         (let ((path (argv1-sap)))
-          (let ((fd (sys-open path 0 0)))
+          (let ((fd (sys-open path)))
             (if (< fd 0)
                 (progn
                   (write-char-serial 69) (write-char-serial 114)
                   (write-char-serial 114) (write-char-serial 10)
                   (sys-exit 1))
-                (let ((buf (alloc-buf 4096)))
+                (let ((buf (io-buf-sap)))
                   (cat-fd fd buf)
                   (sys-exit 0))))))))
 ")

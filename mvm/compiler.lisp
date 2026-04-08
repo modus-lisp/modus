@@ -1214,6 +1214,7 @@
 
       ;; --- SAP (System Area Pointer) ---
       ((= op-name 613080895778544554) (compile-make-sap (cdr form) env dest))
+      ((= op-name 848425955895126923) (compile-make-sap-raw (cdr form) env dest))
       ((= op-name 815904472968259812) (compile-sap-ref (cdr form) env dest :u8))
       ((= op-name 333410446086126141) (compile-sap-ref (cdr form) env dest :u32))
       ((= op-name 622121571885883806) (compile-sap-ref (cdr form) env dest :u64))
@@ -3111,8 +3112,17 @@
 ;; --- SAP (System Area Pointer) ---
 
 (defun compile-make-sap (args env dest)
-  "Compile (make-sap raw-addr) — allocate SAP wrapping a raw address.
-   raw-addr should be a raw u64 (from sap-ref-64, syscall result, etc.)"
+  "Compile (make-sap addr) — allocate SAP wrapping an address.
+   addr is a tagged fixnum (Lisp integer of the byte address).
+   Untagged (SHR 1) before storing in the SAP."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :shr +vreg-v0+ +vreg-v0+ +fixnum-shift+)
+  (emit-ir :sap-new dest +vreg-v0+))
+
+(defun compile-make-sap-raw (args env dest)
+  "Compile (make-sap-raw raw-u64) — allocate SAP wrapping a raw u64 address.
+   raw-u64 is already untagged (e.g., from mem-ref :u64 or syscall result).
+   Stored directly without untagging."
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :sap-new dest +vreg-v0+))
 
@@ -3160,22 +3170,31 @@
 (defun compile-syscall3 (args env dest)
   "Compile (syscall3 num arg1 arg2 arg3) — 3-arg Linux syscall.
    All arguments are tagged fixnums, untagged before syscall.
-   Result is tagged fixnum in V0."
-  (compile-form (car args) env +vreg-v0+)
-  (compile-form (cadr args) env +vreg-v1+)
-  (compile-form (caddr args) env +vreg-v2+)
-  (compile-form (cadddr args) env +vreg-v3+)
+   Result is tagged fixnum in V0.
+   Evaluates args to V4-V7 first, then MOVs to V0-V3 to avoid clobber."
+  (compile-form (car args) env +vreg-v4+)
+  (compile-form (cadr args) env +vreg-v5+)
+  (compile-form (caddr args) env +vreg-v6+)
+  (compile-form (cadddr args) env +vreg-v7+)
+  (emit-ir :mov +vreg-v0+ +vreg-v4+)
+  (emit-ir :mov +vreg-v1+ +vreg-v5+)
+  (emit-ir :mov +vreg-v2+ +vreg-v6+)
+  (emit-ir :mov +vreg-v3+ +vreg-v7+)
   (emit-ir :trap #x0502)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-syscall3-raw (args env dest)
   "Compile (syscall3-raw num arg1 arg2 arg3) — 3-arg Linux syscall.
-   Arguments are raw (untagged) values — for passing pointers.
+   V0 (syscall#) is untagged. V1-V3 passed as-is (raw).
    Result is raw (untagged) in V0."
-  (compile-form (car args) env +vreg-v0+)
-  (compile-form (cadr args) env +vreg-v1+)
-  (compile-form (caddr args) env +vreg-v2+)
-  (compile-form (cadddr args) env +vreg-v3+)
+  (compile-form (car args) env +vreg-v4+)
+  (compile-form (cadr args) env +vreg-v5+)
+  (compile-form (caddr args) env +vreg-v6+)
+  (compile-form (cadddr args) env +vreg-v7+)
+  (emit-ir :mov +vreg-v0+ +vreg-v4+)
+  (emit-ir :mov +vreg-v1+ +vreg-v5+)
+  (emit-ir :mov +vreg-v2+ +vreg-v6+)
+  (emit-ir :mov +vreg-v3+ +vreg-v7+)
   (emit-ir :trap #x0503)
   (emit-ir :mov dest +vreg-v0+))
 

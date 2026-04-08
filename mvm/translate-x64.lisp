@@ -1676,7 +1676,7 @@
              ;; offset is tagged fixnum, SAR 1 to get byte offset
              ;; rax + (po >> 1) → effective address
              (emit-mov-reg-reg buf 'rcx po)
-             (emit-sar-imm buf 'rcx 1)
+             (emit-sar-reg-imm buf 'rcx 1)
              (emit-add-reg-reg buf 'rax 'rcx))
            ;; Load u8, zero-extend, tag as fixnum (SHL 1)
            (emit-bytes buf #x0F #xB6 #x00)   ; movzx eax, byte [rax]
@@ -1697,7 +1697,7 @@
            (let ((po (vreg-phys voff)))
              (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
              (emit-mov-reg-reg buf 'rcx po)
-             (emit-sar-imm buf 'rcx 1)
+             (emit-sar-reg-imm buf 'rcx 1)
              (emit-add-reg-reg buf 'rax 'rcx))
            ;; Load u32, zero-extend to 64-bit, tag as fixnum
            (emit-bytes buf #x8B #x00)         ; mov eax, [rax] (32-bit, zero-extends)
@@ -1718,7 +1718,7 @@
            (let ((po (vreg-phys voff)))
              (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
              (emit-mov-reg-reg buf 'rcx po)
-             (emit-sar-imm buf 'rcx 1)
+             (emit-sar-reg-imm buf 'rcx 1)
              (emit-add-reg-reg buf 'rax 'rcx))
            ;; Load raw u64
            (emit-bytes buf #x48 #x8B #x00)    ; mov rax, [rax]
@@ -1737,13 +1737,13 @@
            (let ((po (vreg-phys voff)))
              (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
              (emit-mov-reg-reg buf 'rcx po)
-             (emit-sar-imm buf 'rcx 1)
+             (emit-sar-reg-imm buf 'rcx 1)
              (emit-add-reg-reg buf 'rax 'rcx))
            ;; Value: untag (SAR 1), store byte
            (let ((pv (vreg-phys vval)))
              (unless pv (emit-load-vreg buf vval 'rdx) (setf pv 'rdx))
              (emit-mov-reg-reg buf 'rdx pv)
-             (emit-sar-imm buf 'rdx 1)
+             (emit-sar-reg-imm buf 'rdx 1)
              ;; mov [rax], dl
              (emit-bytes buf #x88 #x10))))
 
@@ -1759,12 +1759,12 @@
            (let ((po (vreg-phys voff)))
              (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
              (emit-mov-reg-reg buf 'rcx po)
-             (emit-sar-imm buf 'rcx 1)
+             (emit-sar-reg-imm buf 'rcx 1)
              (emit-add-reg-reg buf 'rax 'rcx))
            (let ((pv (vreg-phys vval)))
              (unless pv (emit-load-vreg buf vval 'rdx) (setf pv 'rdx))
              (emit-mov-reg-reg buf 'rdx pv)
-             (emit-sar-imm buf 'rdx 1)
+             (emit-sar-reg-imm buf 'rdx 1)
              ;; mov [rax], edx
              (emit-bytes buf #x89 #x10))))
 
@@ -1780,7 +1780,7 @@
            (let ((po (vreg-phys voff)))
              (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
              (emit-mov-reg-reg buf 'rcx po)
-             (emit-sar-imm buf 'rcx 1)
+             (emit-sar-reg-imm buf 'rcx 1)
              (emit-add-reg-reg buf 'rax 'rcx))
            (let ((pv (vreg-phys vval)))
              (unless pv (emit-load-vreg buf vval 'rdx) (setf pv 'rdx))
@@ -1789,15 +1789,18 @@
              (emit-bytes buf #x48 #x89 #x10))))
 
         ((op= +op-sap-addr+)
-         ;; (sap-addr Vd Vsap) - extract raw address from SAP → Vd (raw u64)
-         ;; Returns raw (untagged) for passing to syscalls via syscall3-raw
+         ;; (sap-addr Vd Vsap) - extract address from SAP → tagged fixnum
+         ;; Result is tagged (SHL 1) so it can be used as a normal Lisp value
+         ;; and passed to syscall3 (which untags all args).
          (let* ((vd (first operands))
                 (vsap (second operands))
                 (d (dest-phys-or-scratch vd))
                 (ps (vreg-phys vsap)))
            (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
            (emit-lea buf 'rax ps -9)          ; strip object tag
-           (emit-mov-reg-mem buf d 'rax 8)    ; load raw address
+           (emit-mov-reg-mem buf 'rax 'rax 8) ; load raw address
+           (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag as fixnum)
+           (emit-mov-reg-reg buf d 'rax)
            (maybe-store-scratch buf vd)))
 
         ;; ============================================

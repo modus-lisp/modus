@@ -13,7 +13,9 @@
 (defconstant +linux-x64-load-addr+ #x400000)    ; Traditional Linux x64 load address
 (defconstant +linux-x64-heap-addr+ #x10000000)  ; Heap start (same as bare-metal)
 (defconstant +linux-x64-heap-size+ #x0E000000)  ; 224MB heap
-(defconstant +linux-x64-stack-size+ #x100000)   ; 1MB stack (Linux provides this)
+;; Globals at start of heap region (after mmap succeeds)
+;; +0x00: argc, +0x08: argv base, +0x10: argv[0], +0x18: argv[1], etc.
+(defconstant +linux-x64-globals+  #x10000000)
 
 ;;; ============================================================
 ;;; ELF64 Little-Endian Wrapper
@@ -28,59 +30,37 @@
          (entry-point (+ load-addr header-total))
          (buf (make-mvm-buffer)))
     ;; ---- ELF Header (64 bytes) ----
-    ;; e_ident: magic + class + data + version + OS/ABI + padding
-    (mvm-emit-byte buf #x7F)           ; EI_MAG0
-    (mvm-emit-byte buf (char-code #\E)) ; EI_MAG1
-    (mvm-emit-byte buf (char-code #\L)) ; EI_MAG2
-    (mvm-emit-byte buf (char-code #\F)) ; EI_MAG3
-    (mvm-emit-byte buf 2)              ; EI_CLASS = ELFCLASS64
-    (mvm-emit-byte buf 1)              ; EI_DATA = ELFDATA2LSB (little-endian)
-    (mvm-emit-byte buf 1)              ; EI_VERSION = EV_CURRENT
-    (mvm-emit-byte buf 0)              ; EI_OSABI = ELFOSABI_NONE
-    (dotimes (i 8) (mvm-emit-byte buf 0)) ; EI_ABIVERSION + padding
-    ;; e_type = ET_EXEC (2)
-    (mvm-emit-u16 buf 2)
-    ;; e_machine = EM_X86_64 (62)
-    (mvm-emit-u16 buf 62)
-    ;; e_version = 1
-    (mvm-emit-u32 buf 1)
-    ;; e_entry = entry point (after headers)
-    (mvm-emit-u64 buf entry-point)
-    ;; e_phoff = offset to program header (immediately after ELF header)
-    (mvm-emit-u64 buf ehdr-size)
-    ;; e_shoff = 0 (no section headers)
-    (mvm-emit-u64 buf 0)
-    ;; e_flags = 0
-    (mvm-emit-u32 buf 0)
-    ;; e_ehsize = 64
-    (mvm-emit-u16 buf ehdr-size)
-    ;; e_phentsize = 56
-    (mvm-emit-u16 buf phdr-size)
-    ;; e_phnum = 1
-    (mvm-emit-u16 buf 1)
-    ;; e_shentsize = 0
-    (mvm-emit-u16 buf 0)
-    ;; e_shnum = 0
-    (mvm-emit-u16 buf 0)
-    ;; e_shstrndx = 0
-    (mvm-emit-u16 buf 0)
+    (mvm-emit-byte buf #x7F)
+    (mvm-emit-byte buf (char-code #\E))
+    (mvm-emit-byte buf (char-code #\L))
+    (mvm-emit-byte buf (char-code #\F))
+    (mvm-emit-byte buf 2)              ; ELFCLASS64
+    (mvm-emit-byte buf 1)              ; ELFDATA2LSB
+    (mvm-emit-byte buf 1)              ; EV_CURRENT
+    (mvm-emit-byte buf 0)              ; ELFOSABI_NONE
+    (dotimes (i 8) (mvm-emit-byte buf 0))
+    (mvm-emit-u16 buf 2)              ; ET_EXEC
+    (mvm-emit-u16 buf 62)             ; EM_X86_64
+    (mvm-emit-u32 buf 1)              ; e_version
+    (mvm-emit-u64 buf entry-point)    ; e_entry
+    (mvm-emit-u64 buf ehdr-size)      ; e_phoff
+    (mvm-emit-u64 buf 0)              ; e_shoff
+    (mvm-emit-u32 buf 0)              ; e_flags
+    (mvm-emit-u16 buf ehdr-size)      ; e_ehsize
+    (mvm-emit-u16 buf phdr-size)      ; e_phentsize
+    (mvm-emit-u16 buf 1)              ; e_phnum
+    (mvm-emit-u16 buf 0)              ; e_shentsize
+    (mvm-emit-u16 buf 0)              ; e_shnum
+    (mvm-emit-u16 buf 0)              ; e_shstrndx
     ;; ---- Program Header (56 bytes) ----
-    ;; p_type = PT_LOAD (1)
-    (mvm-emit-u32 buf 1)
-    ;; p_flags = PF_R | PF_W | PF_X (7)
-    (mvm-emit-u32 buf 7)
-    ;; p_offset = 0 (load from start of file)
-    (mvm-emit-u64 buf 0)
-    ;; p_vaddr = load address
-    (mvm-emit-u64 buf load-addr)
-    ;; p_paddr = load address
-    (mvm-emit-u64 buf load-addr)
-    ;; p_filesz = total file size
-    (mvm-emit-u64 buf total-size)
-    ;; p_memsz = file size + heap (BSS-like expansion)
-    (mvm-emit-u64 buf (+ total-size +linux-x64-heap-size+))
-    ;; p_align = 2MB
-    (mvm-emit-u64 buf #x200000)
+    (mvm-emit-u32 buf 1)              ; PT_LOAD
+    (mvm-emit-u32 buf 7)              ; PF_R|PF_W|PF_X
+    (mvm-emit-u64 buf 0)              ; p_offset
+    (mvm-emit-u64 buf load-addr)      ; p_vaddr
+    (mvm-emit-u64 buf load-addr)      ; p_paddr
+    (mvm-emit-u64 buf total-size)     ; p_filesz
+    (mvm-emit-u64 buf (+ total-size +linux-x64-heap-size+)) ; p_memsz
+    (mvm-emit-u64 buf #x200000)       ; p_align
     ;; ---- Raw image data ----
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
     (mvm-buffer-used-bytes buf)))
@@ -91,87 +71,65 @@
 
 (defun emit-linux-x64-entry (buf)
   "Emit the Linux x64 entry stub.
-   On entry from Linux: RSP points to [argc, argv[0], argv[1], ..., NULL, envp...]
-   We save argc/argv, set up MVM runtime registers, allocate heap via mmap, and
-   fall through to native code (which starts with a JMP to kernel-main)."
-  ;; Save argc and first 4 argv entries at fixed addresses.
-  ;; [RSP] = argc, [RSP+8] = argv[0], [RSP+16] = argv[1], etc.
-  ;; 0x600000: argc (u64)
-  ;; 0x600008: argv base pointer (u64)
-  ;; 0x600010: argv[0] (u64, raw C string pointer)
-  ;; 0x600018: argv[1] (u64)
-  ;; 0x600020: argv[2] (u64)
-  ;; 0x600028: argv[3] (u64)
-  (emit-bytes buf #x48 #x8B #x04 #x24)        ; mov rax, [rsp]  (argc)
-  (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [abs32], rax
-  (emit-le32 buf #x600000)                       ; store argc
-  (emit-bytes buf #x48 #x8D #x44 #x24 #x08)    ; lea rax, [rsp+8]  (argv base)
-  (emit-bytes buf #x48 #x89 #x04 #x25)
-  (emit-le32 buf #x600008)                       ; store argv base
-  ;; Copy argv[0..3] to fixed addresses
-  (emit-bytes buf #x48 #x8B #x44 #x24 #x08)    ; mov rax, [rsp+8]  (argv[0])
-  (emit-bytes buf #x48 #x89 #x04 #x25)
-  (emit-le32 buf #x600010)
-  (emit-bytes buf #x48 #x8B #x44 #x24 #x10)    ; mov rax, [rsp+16] (argv[1])
-  (emit-bytes buf #x48 #x89 #x04 #x25)
-  (emit-le32 buf #x600018)
-  (emit-bytes buf #x48 #x8B #x44 #x24 #x18)    ; mov rax, [rsp+24] (argv[2])
-  (emit-bytes buf #x48 #x89 #x04 #x25)
-  (emit-le32 buf #x600020)
-  (emit-bytes buf #x48 #x8B #x44 #x24 #x20)    ; mov rax, [rsp+32] (argv[3])
-  (emit-bytes buf #x48 #x89 #x04 #x25)
-  (emit-le32 buf #x600028)
+   On entry: RSP → [argc, argv[0], argv[1], ..., NULL, envp...]
+   Strategy: save argc/argv to callee-saved regs, mmap heap, then
+   copy argc/argv to globals area in the mmap'd heap."
+  ;; Save argc and argv[0..3] in callee-saved registers (survive mmap syscall)
+  ;; RBX = argc, R13 = argv[0], R14 = argv[1], R15 = argv[2]
+  ;; (R14/R15 will be overwritten later for alloc ptr/NIL)
+  (emit-bytes buf #x48 #x8B #x1C #x24)          ; mov rbx, [rsp]    (argc)
+  (emit-bytes buf #x4C #x8B #x6C #x24 #x08)     ; mov r13, [rsp+8]  (argv[0])
+  (emit-bytes buf #x4C #x8B #x74 #x24 #x10)     ; mov r14, [rsp+16] (argv[1])
+  (emit-bytes buf #x4C #x8B #x7C #x24 #x18)     ; mov r15, [rsp+24] (argv[2])
+
+  ;; mmap heap: rax=9, rdi=hint, rsi=size, rdx=prot, r10=flags, r8=fd, r9=off
+  (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x10) ; mov rdi, 0x10000000
+  (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32
+  (emit-le32 buf +linux-x64-heap-size+)
+  (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_RW)
+  (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x00 #x00) ; mov r10, 0x22 (MAP_PRIV|MAP_ANON)
+  (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1
+  (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0
+  (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
+  (emit-bytes buf #x0F #x05)                      ; syscall
+
+  ;; Store argc/argv to globals area at heap base (mmap result in RAX)
+  ;; argc at [rax+0], argv[0] at [rax+0x10], argv[1] at [rax+0x18], argv[2] at [rax+0x20]
+  (emit-bytes buf #x48 #x89 #x18)                ; mov [rax], rbx     (argc)
+  (emit-bytes buf #x4C #x89 #x68 #x10)           ; mov [rax+0x10], r13 (argv[0])
+  (emit-bytes buf #x4C #x89 #x70 #x18)           ; mov [rax+0x18], r14 (argv[1])
+  (emit-bytes buf #x4C #x89 #x78 #x20)           ; mov [rax+0x20], r15 (argv[2])
 
   ;; Set up MVM runtime registers
-  ;; R15 = NIL (#xDEAD0001)
-  (emit-bytes buf #x49 #xBF)                    ; mov r15, imm64
+  ;; R12 = alloc pointer (skip first 256 bytes used for globals)
+  (emit-bytes buf #x49 #x89 #xC4)                ; mov r12, rax
+  (emit-bytes buf #x49 #x81 #xC4 #x00 #x01 #x00 #x00) ; add r12, 256 (skip globals)
+  ;; R14 = alloc limit
+  (emit-bytes buf #x49 #x89 #xC6)                ; mov r14, rax
+  (emit-bytes buf #x49 #x81 #xC6)                ; add r14, heap_size
+  (emit-le32 buf +linux-x64-heap-size+)
+  ;; R15 = NIL
+  (emit-bytes buf #x49 #xBF)                      ; mov r15, imm64
   (emit-le64 buf #xDEAD0001)
-  ;; R12 = alloc pointer (will be set after mmap)
-  ;; R14 = alloc limit (will be set after mmap)
+  ;; Frame pointer
+  (emit-bytes buf #x48 #x89 #xE5))               ; mov rbp, rsp
 
-  ;; Allocate heap via mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-  ;; syscall: rax=9 (mmap), rdi=addr, rsi=length, rdx=prot, r10=flags, r8=fd, r9=offset
-  (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x10) ; mov rdi, 0x10000000 (hint addr)
-  (emit-bytes buf #x48 #xC7 #xC6)              ; mov rsi, imm32 (length)
-  (emit-le32 buf +linux-x64-heap-size+)
-  (emit-bytes buf #x48 #xC7 #xC2 #x03 #x00 #x00 #x00) ; mov rdx, 3 (PROT_READ|PROT_WRITE)
-  (emit-bytes buf #x49 #xC7 #xC2 #x22 #x00 #x00 #x00) ; mov r10, 0x22 (MAP_PRIVATE|MAP_ANONYMOUS)
-  (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)   ; mov r8, -1 (fd)
-  (emit-bytes buf #x49 #xC7 #xC1 #x00 #x00 #x00 #x00) ; mov r9, 0 (offset)
-  (emit-bytes buf #x48 #xC7 #xC0 #x09 #x00 #x00 #x00) ; mov rax, 9 (SYS_mmap)
-  (emit-bytes buf #x0F #x05)                    ; syscall
-
-  ;; rax = mmap result (heap base address, or -errno on failure)
-  ;; R12 = alloc pointer = mmap result
-  (emit-bytes buf #x49 #x89 #xC4)              ; mov r12, rax
-  ;; R14 = alloc limit = R12 + heap size
-  (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
-  (emit-bytes buf #x49 #x81 #xC6)              ; add r14, imm32
-  (emit-le32 buf +linux-x64-heap-size+)
-
-  ;; Set up frame pointer
-  (emit-bytes buf #x48 #x89 #xE5))             ; mov rbp, rsp
-
-  ;; Fall through to JMP kernel-main (emitted by assemble-kernel-image)
+  ;; Fall through to JMP kernel-main
 
 ;;; ============================================================
 ;;; Helper: emit raw bytes
 ;;; ============================================================
 
 (defun emit-bytes (buf &rest bytes)
-  "Emit raw bytes to the buffer."
-  (dolist (b bytes)
-    (mvm-emit-byte buf b)))
+  (dolist (b bytes) (mvm-emit-byte buf b)))
 
 (defun emit-le32 (buf val)
-  "Emit a 32-bit little-endian value."
   (mvm-emit-byte buf (logand val #xFF))
   (mvm-emit-byte buf (logand (ash val -8) #xFF))
   (mvm-emit-byte buf (logand (ash val -16) #xFF))
   (mvm-emit-byte buf (logand (ash val -24) #xFF)))
 
 (defun emit-le64 (buf val)
-  "Emit a 64-bit little-endian value."
   (emit-le32 buf (logand val #xFFFFFFFF))
   (emit-le32 buf (logand (ash val -32) #xFFFFFFFF)))
 
@@ -180,7 +138,6 @@
 ;;; ============================================================
 
 (defun linux-x64-boot-descriptor ()
-  "Return the Linux x86-64 boot descriptor for ELF executable building."
   (list :arch :x86-64
         :entry-fn #'emit-linux-x64-entry
         :load-addr +linux-x64-load-addr+

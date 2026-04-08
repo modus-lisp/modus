@@ -1212,8 +1212,20 @@
       ((= op-name 821056500804198866) (compile-write-char-serial (cdr form) env dest))
       ((= op-name 602746553318600181)  (compile-read-char-serial dest))
 
-      ;; --- Process Exit (Linux) ---
+      ;; --- SAP (System Area Pointer) ---
+      ((= op-name 613080895778544554) (compile-make-sap (cdr form) env dest))
+      ((= op-name 815904472968259812) (compile-sap-ref (cdr form) env dest :u8))
+      ((= op-name 333410446086126141) (compile-sap-ref (cdr form) env dest :u32))
+      ((= op-name 622121571885883806) (compile-sap-ref (cdr form) env dest :u64))
+      ((= op-name 922421810905006511) (compile-sap-set (cdr form) env :u8))
+      ((= op-name 550869834617056174) (compile-sap-set (cdr form) env :u32))
+      ((= op-name 334162645828734861) (compile-sap-set (cdr form) env :u64))
+      ((= op-name 124167155243180718) (compile-sap-addr (cdr form) env dest))
+
+      ;; --- Linux Syscalls ---
       ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
+      ((= op-name 385320872711688559) (compile-syscall3 (cdr form) env dest))
+      ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
 
       ;; --- Timestamp Counter ---
       ((= op-name 580098868411189197) (compile-rdtsc dest))
@@ -3096,6 +3108,40 @@
   (emit-ir :halt)
   (emit-ir :li dest 0))
 
+;; --- SAP (System Area Pointer) ---
+
+(defun compile-make-sap (args env dest)
+  "Compile (make-sap raw-addr) — allocate SAP wrapping a raw address.
+   raw-addr should be a raw u64 (from sap-ref-64, syscall result, etc.)"
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :sap-new dest +vreg-v0+))
+
+(defun compile-sap-ref (args env dest width)
+  "Compile (sap-ref-N sap offset) — read from SAP address + offset."
+  (compile-form (car args) env +vreg-v0+)
+  (compile-form (cadr args) env +vreg-v1+)
+  (ecase width
+    (:u8  (emit-ir :sap-ref8  dest +vreg-v0+ +vreg-v1+))
+    (:u32 (emit-ir :sap-ref32 dest +vreg-v0+ +vreg-v1+))
+    (:u64 (emit-ir :sap-ref64 dest +vreg-v0+ +vreg-v1+))))
+
+(defun compile-sap-set (args env width)
+  "Compile (sap-set-N sap offset val) — write to SAP address + offset."
+  (compile-form (car args) env +vreg-v0+)
+  (compile-form (cadr args) env +vreg-v1+)
+  (compile-form (caddr args) env +vreg-v2+)
+  (ecase width
+    (:u8  (emit-ir :sap-set8  +vreg-v0+ +vreg-v1+ +vreg-v2+))
+    (:u32 (emit-ir :sap-set32 +vreg-v0+ +vreg-v1+ +vreg-v2+))
+    (:u64 (emit-ir :sap-set64 +vreg-v0+ +vreg-v1+ +vreg-v2+))))
+
+(defun compile-sap-addr (args env dest)
+  "Compile (sap-address sap) — extract raw address from SAP."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :sap-addr dest +vreg-v0+))
+
+;; --- Serial Console ---
+
 (defun compile-write-char-serial (args env dest)
   "Compile (write-char-serial char-code) — write character to serial port.
    The argument is a fixnum containing the ASCII code.
@@ -3110,6 +3156,28 @@
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :trap #x0500)
   (emit-ir :li dest 0))
+
+(defun compile-syscall3 (args env dest)
+  "Compile (syscall3 num arg1 arg2 arg3) — 3-arg Linux syscall.
+   All arguments are tagged fixnums, untagged before syscall.
+   Result is tagged fixnum in V0."
+  (compile-form (car args) env +vreg-v0+)
+  (compile-form (cadr args) env +vreg-v1+)
+  (compile-form (caddr args) env +vreg-v2+)
+  (compile-form (cadddr args) env +vreg-v3+)
+  (emit-ir :trap #x0502)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-syscall3-raw (args env dest)
+  "Compile (syscall3-raw num arg1 arg2 arg3) — 3-arg Linux syscall.
+   Arguments are raw (untagged) values — for passing pointers.
+   Result is raw (untagged) in V0."
+  (compile-form (car args) env +vreg-v0+)
+  (compile-form (cadr args) env +vreg-v1+)
+  (compile-form (caddr args) env +vreg-v2+)
+  (compile-form (cadddr args) env +vreg-v3+)
+  (emit-ir :trap #x0503)
+  (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-read-char-serial (dest)
   "Compile (read-char-serial) — read a character from the serial port.
@@ -3606,6 +3674,8 @@
       (:obj-subtag 3)
       (:array-len 3)
       (:alloc-array 3)  ;; 2-reg: 1 opcode + 2 regs = 3 bytes
+      (:sap-new  3)    ;; 2-reg
+      (:sap-addr 3)    ;; 2-reg
 
       ;; Object allocation: 1 opcode + 1 reg + 2 imm16 + 1 imm8 = 5 bytes
       (:alloc-obj 5)
@@ -3625,6 +3695,12 @@
       (:mul64lo 4)
       (:mul64hi 4)
       (:acc128  4)
+      (:sap-ref8  4)   ;; 3-reg
+      (:sap-ref32 4)
+      (:sap-ref64 4)
+      (:sap-set8  4)
+      (:sap-set32 4)
+      (:sap-set64 4)
       (:div   4)
       (:mod   4)
       (:and   4)
@@ -3798,6 +3874,24 @@
            (mvm-array-len buf (second insn) (third insn)))
           (:alloc-array
            (mvm-alloc-array buf (second insn) (third insn)))
+
+          ;; ---- SAP operations ----
+          (:sap-new
+           (mvm-sap-new buf (second insn) (third insn)))
+          (:sap-addr
+           (mvm-sap-addr buf (second insn) (third insn)))
+          (:sap-ref8
+           (mvm-sap-ref8 buf (second insn) (third insn) (fourth insn)))
+          (:sap-ref32
+           (mvm-sap-ref32 buf (second insn) (third insn) (fourth insn)))
+          (:sap-ref64
+           (mvm-sap-ref64 buf (second insn) (third insn) (fourth insn)))
+          (:sap-set8
+           (mvm-sap-set8 buf (second insn) (third insn) (fourth insn)))
+          (:sap-set32
+           (mvm-sap-set32 buf (second insn) (third insn) (fourth insn)))
+          (:sap-set64
+           (mvm-sap-set64 buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- Object allocation and slot access ----
           (:alloc-obj

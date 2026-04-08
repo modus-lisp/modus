@@ -52,6 +52,8 @@
    #:+op-fn-addr+
    #:+op-mul26lo+ #:+op-mul26hi+
    #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
+   #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
+   #:+op-sap-set8+ #:+op-sap-set32+ #:+op-sap-set64+ #:+op-sap-addr+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -90,6 +92,8 @@
    #:mvm-trap #:mvm-rdtsc
    #:mvm-mul26lo #:mvm-mul26hi
    #:mvm-mul64lo #:mvm-mul64hi #:mvm-acc128
+   #:mvm-sap-new #:mvm-sap-ref8 #:mvm-sap-ref32 #:mvm-sap-ref64
+   #:mvm-sap-set8 #:mvm-sap-set32 #:mvm-sap-set64 #:mvm-sap-addr
    ;; Tagging (from compiler.lisp, shared across modules)
    #:+tag-fixnum+ #:+tag-cons+ #:+tag-object+ #:+tag-immediate+ #:+tag-forward+
    #:+fixnum-shift+ #:tag-fixnum #:+mvm-nil+ #:+mvm-t+
@@ -323,6 +327,16 @@
 (defconstant +op-mul64hi+  #xAB)  ; (mul64hi Vd Va Vb) - high 64 bits of Va*Vb, raw
 (defconstant +op-acc128+   #xAC)  ; (acc128 Vaddr Vlo Vhi) - mem128[Vaddr] += Vhi:Vlo
 
+;; SAP (System Area Pointer) — raw address wrapper for FFI
+(defconstant +op-sap-new+    #xB0)  ; (sap-new Vd Vaddr) - alloc SAP, store raw addr
+(defconstant +op-sap-ref8+   #xB1)  ; (sap-ref8 Vd Vsap Voff) - load u8 → tagged
+(defconstant +op-sap-ref32+  #xB2)  ; (sap-ref32 Vd Vsap Voff) - load u32 → tagged
+(defconstant +op-sap-ref64+  #xB3)  ; (sap-ref64 Vd Vsap Voff) - load u64 → raw
+(defconstant +op-sap-set8+   #xB4)  ; (sap-set8 Vsap Voff Vval) - store byte (val tagged)
+(defconstant +op-sap-set32+  #xB5)  ; (sap-set32 Vsap Voff Vval) - store u32 (val tagged)
+(defconstant +op-sap-set64+  #xB6)  ; (sap-set64 Vsap Voff Vval) - store u64 (val raw)
+(defconstant +op-sap-addr+   #xB7)  ; (sap-addr Vd Vsap) - extract raw addr → Vd
+
 ;;; ============================================================
 ;;; Opcode Metadata Table
 ;;; ============================================================
@@ -449,6 +463,16 @@
 (defopcode :mul64lo  #xAA (:reg :reg :reg)        "Low 64 bits of raw multiply")
 (defopcode :mul64hi  #xAB (:reg :reg :reg)        "High 64 bits of raw multiply")
 (defopcode :acc128   #xAC (:reg :reg :reg)        "128-bit accumulate: mem[Va] += Vc:Vb")
+
+;; SAP (System Area Pointer) operations
+(defopcode :sap-new    #xB0 (:reg :reg)              "Allocate SAP with raw address")
+(defopcode :sap-ref8   #xB1 (:reg :reg :reg)         "Load u8 from SAP+off → tagged")
+(defopcode :sap-ref32  #xB2 (:reg :reg :reg)         "Load u32 from SAP+off → tagged")
+(defopcode :sap-ref64  #xB3 (:reg :reg :reg)         "Load raw u64 from SAP+off")
+(defopcode :sap-set8   #xB4 (:reg :reg :reg)         "Store byte to SAP+off")
+(defopcode :sap-set32  #xB5 (:reg :reg :reg)         "Store u32 to SAP+off")
+(defopcode :sap-set64  #xB6 (:reg :reg :reg)         "Store raw u64 to SAP+off")
+(defopcode :sap-addr   #xB7 (:reg :reg)              "Extract raw address from SAP")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -877,6 +901,24 @@
 
 (defun mvm-acc128 (buf vaddr vlo vhi)
   (encode-instruction buf +op-acc128+ vaddr vlo vhi))
+
+;; SAP operations
+(defun mvm-sap-new (buf vd vaddr)
+  (encode-instruction buf +op-sap-new+ vd vaddr))
+(defun mvm-sap-ref8 (buf vd vsap voff)
+  (encode-instruction buf +op-sap-ref8+ vd vsap voff))
+(defun mvm-sap-ref32 (buf vd vsap voff)
+  (encode-instruction buf +op-sap-ref32+ vd vsap voff))
+(defun mvm-sap-ref64 (buf vd vsap voff)
+  (encode-instruction buf +op-sap-ref64+ vd vsap voff))
+(defun mvm-sap-set8 (buf vsap voff vval)
+  (encode-instruction buf +op-sap-set8+ vsap voff vval))
+(defun mvm-sap-set32 (buf vsap voff vval)
+  (encode-instruction buf +op-sap-set32+ vsap voff vval))
+(defun mvm-sap-set64 (buf vsap voff vval)
+  (encode-instruction buf +op-sap-set64+ vsap voff vval))
+(defun mvm-sap-addr (buf vd vsap)
+  (encode-instruction buf +op-sap-addr+ vd vsap))
 
 ;;; ============================================================
 ;;; Disassembler

@@ -372,6 +372,65 @@
               (emit-bytes buf #x48 #xD1 #xFF)   ; sar rdi, 1 (untag)
               (emit-bytes buf #x48 #xC7 #xC0 #x3C #x00 #x00 #x00) ; mov rax, 60 (SYS_exit)
               (emit-bytes buf #x0F #x05))       ; syscall
+             ((= code #x0502)
+              ;; Generic 3-arg Linux syscall
+              ;; V0(RSI)=syscall#, V1(RDI)=arg1, V2(R8)=arg2, V3(R9)=arg3
+              ;; All tagged fixnums, untagged before syscall
+              ;; Result in V0(RSI), tagged
+              (emit-bytes buf #x56)              ; push rsi
+              (emit-bytes buf #x57)              ; push rdi
+              (emit-bytes buf #x52)              ; push rdx
+              (emit-bytes buf #x41 #x50)         ; push r8
+              (emit-bytes buf #x41 #x51)         ; push r9
+              ;; rax = untag V0 (syscall number)
+              (emit-bytes buf #x48 #x89 #xF0)   ; mov rax, rsi
+              (emit-bytes buf #x48 #xD1 #xF8)   ; sar rax, 1
+              ;; rdi = untag V1 (arg1)
+              (emit-bytes buf #x48 #xD1 #xFF)   ; sar rdi, 1
+              ;; rsi = untag V2 (arg2)
+              (emit-bytes buf #x4C #x89 #xC6)   ; mov rsi, r8
+              (emit-bytes buf #x48 #xD1 #xFE)   ; sar rsi, 1
+              ;; rdx = untag V3 (arg3)
+              (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
+              (emit-bytes buf #x48 #xD1 #xFA)   ; sar rdx, 1
+              ;; syscall
+              (emit-bytes buf #x0F #x05)         ; syscall
+              ;; Tag result → V0 (RSI)
+              (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
+              (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
+              ;; Restore other regs
+              (emit-bytes buf #x41 #x59)         ; pop r9
+              (emit-bytes buf #x41 #x58)         ; pop r8
+              (emit-bytes buf #x5A)              ; pop rdx
+              (emit-bytes buf #x5F)              ; pop rdi (restored)
+              ;; Don't restore RSI — it has the result
+              (emit-bytes buf #x48 #x83 #xC4 #x08)) ; add rsp, 8 (discard saved rsi)
+             ((= code #x0503)
+              ;; Raw syscall: V0(RSI)=syscall#(TAGGED), V1(RDI)=arg1, V2(R8)=arg2, V3(R9)=arg3
+              ;; Syscall number is untagged (SHR 1). Args 1-3 passed as-is (raw).
+              ;; Result in V0(RSI), raw (not tagged).
+              (emit-bytes buf #x57)              ; push rdi
+              (emit-bytes buf #x52)              ; push rdx
+              (emit-bytes buf #x41 #x50)         ; push r8
+              (emit-bytes buf #x41 #x51)         ; push r9
+              ;; rax = untag V0 (syscall number)
+              (emit-bytes buf #x48 #x89 #xF0)   ; mov rax, rsi
+              (emit-bytes buf #x48 #xD1 #xF8)   ; sar rax, 1
+              ;; rdi = V1 (arg1, raw)
+              ;; rdi already has V1
+              ;; rsi = V2 (arg2, raw)
+              (emit-bytes buf #x4C #x89 #xC6)   ; mov rsi, r8
+              ;; rdx = V3 (arg3, raw)
+              (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
+              ;; syscall
+              (emit-bytes buf #x0F #x05)         ; syscall
+              ;; Result → V0 (RSI), raw
+              (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
+              ;; Restore
+              (emit-bytes buf #x41 #x59)         ; pop r9
+              (emit-bytes buf #x41 #x58)         ; pop r8
+              (emit-bytes buf #x5A)              ; pop rdx
+              (emit-bytes buf #x5F))             ; pop rdi
              ((= code #x0320)
               ;; SETUP-IRQ: PIC remap + PIT timer + IDT + ISR for HLT-based io-delay
               (if *x64-linux-mode*
@@ -1565,6 +1624,181 @@
            ;; This is a stub — actual implementation depends on the
            ;; GC card table base address.
            (emit-nop buf)))
+
+        ;; ============================================
+        ;; SAP (System Area Pointer)
+        ;; ============================================
+        ;; SAP object layout: [header:8][raw-address:8] = 16 bytes
+        ;; Tagged SAP pointer: (raw_obj_addr | 0x09)
+        ;; To get raw address: strip tag (AND -16, SHL to byte addr), load [+8]
+
+        ((op= +op-sap-new+)
+         ;; (sap-new Vd Vaddr) - allocate SAP, store raw address from Vaddr
+         ;; Vaddr contains a raw u64 address (from :u64 load or syscall result)
+         (let* ((vd (first operands))
+                (vaddr (second operands))
+                (d (dest-phys-or-scratch vd))
+                (pa (vreg-phys vaddr)))
+           ;; Write header at R12: (1 << 8) | 0x16 = 0x116
+           (emit-mov-reg-imm buf +scratch-reg+ #x116)
+           (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; Write raw address at R12+8
+           (unless pa
+             (emit-load-vreg buf vaddr 'rax)
+             (setf pa 'rax))
+           (emit-mov-mem-reg buf 'r12 pa 8)
+           ;; Result = R12 | 0x09 (object tag)
+           (emit-lea buf d 'r12 #x09)
+           ;; Advance alloc pointer by 16 (header + 1 data word, already 16-aligned)
+           (emit-add-reg-imm buf 'r12 16)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-sap-ref8+)
+         ;; (sap-ref8 Vd Vsap Voff) - load u8 at sap.addr + off → tagged fixnum
+         (let* ((vd (first operands))
+                (vsap (second operands))
+                (voff (third operands))
+                (d (dest-phys-or-scratch vd))
+                (ps (vreg-phys vsap)))
+           ;; Extract raw address from SAP: strip tag, load [obj+8]
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           ;; AND with -16 strips object tag bits, then *2 gives byte addr (ASH 1)
+           ;; But simpler: (sap & ~0xF) gives raw obj base (since tag is in low 4 bits)
+           ;; Then raw_obj_byte_addr = (sap & ~0xF) * 2... no, tagged ptr is already
+           ;; a byte address with tag in low bits on 64-bit.
+           ;; Actually: object tag is 0x09. Raw byte addr = tagged_ptr - 9.
+           ;; Then raw_address = mem[raw_byte_addr + 8]
+           (emit-lea buf 'rax ps -9)         ; rax = raw object base
+           (emit-mov-reg-mem buf 'rax 'rax 8) ; rax = raw address from SAP
+           ;; Add offset (untag: SAR 1)
+           (let ((po (vreg-phys voff)))
+             (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
+             ;; offset is tagged fixnum, SAR 1 to get byte offset
+             ;; rax + (po >> 1) → effective address
+             (emit-mov-reg-reg buf 'rcx po)
+             (emit-sar-imm buf 'rcx 1)
+             (emit-add-reg-reg buf 'rax 'rcx))
+           ;; Load u8, zero-extend, tag as fixnum (SHL 1)
+           (emit-bytes buf #x0F #xB6 #x00)   ; movzx eax, byte [rax]
+           (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag)
+           (emit-mov-reg-reg buf d 'rax)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-sap-ref32+)
+         ;; (sap-ref32 Vd Vsap Voff) - load u32 → tagged fixnum
+         (let* ((vd (first operands))
+                (vsap (second operands))
+                (voff (third operands))
+                (d (dest-phys-or-scratch vd))
+                (ps (vreg-phys vsap)))
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           (emit-lea buf 'rax ps -9)
+           (emit-mov-reg-mem buf 'rax 'rax 8)
+           (let ((po (vreg-phys voff)))
+             (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
+             (emit-mov-reg-reg buf 'rcx po)
+             (emit-sar-imm buf 'rcx 1)
+             (emit-add-reg-reg buf 'rax 'rcx))
+           ;; Load u32, zero-extend to 64-bit, tag as fixnum
+           (emit-bytes buf #x8B #x00)         ; mov eax, [rax] (32-bit, zero-extends)
+           (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag)
+           (emit-mov-reg-reg buf d 'rax)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-sap-ref64+)
+         ;; (sap-ref64 Vd Vsap Voff) - load raw u64 (NOT tagged)
+         (let* ((vd (first operands))
+                (vsap (second operands))
+                (voff (third operands))
+                (d (dest-phys-or-scratch vd))
+                (ps (vreg-phys vsap)))
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           (emit-lea buf 'rax ps -9)
+           (emit-mov-reg-mem buf 'rax 'rax 8)
+           (let ((po (vreg-phys voff)))
+             (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
+             (emit-mov-reg-reg buf 'rcx po)
+             (emit-sar-imm buf 'rcx 1)
+             (emit-add-reg-reg buf 'rax 'rcx))
+           ;; Load raw u64
+           (emit-bytes buf #x48 #x8B #x00)    ; mov rax, [rax]
+           (emit-mov-reg-reg buf d 'rax)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-sap-set8+)
+         ;; (sap-set8 Vsap Voff Vval) - store byte at sap.addr + off
+         (let* ((vsap (first operands))
+                (voff (second operands))
+                (vval (third operands))
+                (ps (vreg-phys vsap)))
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           (emit-lea buf 'rax ps -9)
+           (emit-mov-reg-mem buf 'rax 'rax 8)
+           (let ((po (vreg-phys voff)))
+             (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
+             (emit-mov-reg-reg buf 'rcx po)
+             (emit-sar-imm buf 'rcx 1)
+             (emit-add-reg-reg buf 'rax 'rcx))
+           ;; Value: untag (SAR 1), store byte
+           (let ((pv (vreg-phys vval)))
+             (unless pv (emit-load-vreg buf vval 'rdx) (setf pv 'rdx))
+             (emit-mov-reg-reg buf 'rdx pv)
+             (emit-sar-imm buf 'rdx 1)
+             ;; mov [rax], dl
+             (emit-bytes buf #x88 #x10))))
+
+        ((op= +op-sap-set32+)
+         ;; (sap-set32 Vsap Voff Vval) - store u32 at sap.addr + off
+         (let* ((vsap (first operands))
+                (voff (second operands))
+                (vval (third operands))
+                (ps (vreg-phys vsap)))
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           (emit-lea buf 'rax ps -9)
+           (emit-mov-reg-mem buf 'rax 'rax 8)
+           (let ((po (vreg-phys voff)))
+             (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
+             (emit-mov-reg-reg buf 'rcx po)
+             (emit-sar-imm buf 'rcx 1)
+             (emit-add-reg-reg buf 'rax 'rcx))
+           (let ((pv (vreg-phys vval)))
+             (unless pv (emit-load-vreg buf vval 'rdx) (setf pv 'rdx))
+             (emit-mov-reg-reg buf 'rdx pv)
+             (emit-sar-imm buf 'rdx 1)
+             ;; mov [rax], edx
+             (emit-bytes buf #x89 #x10))))
+
+        ((op= +op-sap-set64+)
+         ;; (sap-set64 Vsap Voff Vval) - store raw u64 at sap.addr + off
+         (let* ((vsap (first operands))
+                (voff (second operands))
+                (vval (third operands))
+                (ps (vreg-phys vsap)))
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           (emit-lea buf 'rax ps -9)
+           (emit-mov-reg-mem buf 'rax 'rax 8)
+           (let ((po (vreg-phys voff)))
+             (unless po (emit-load-vreg buf voff 'rcx) (setf po 'rcx))
+             (emit-mov-reg-reg buf 'rcx po)
+             (emit-sar-imm buf 'rcx 1)
+             (emit-add-reg-reg buf 'rax 'rcx))
+           (let ((pv (vreg-phys vval)))
+             (unless pv (emit-load-vreg buf vval 'rdx) (setf pv 'rdx))
+             ;; Store raw u64 (no untag)
+             ;; mov [rax], rdx
+             (emit-bytes buf #x48 #x89 #x10))))
+
+        ((op= +op-sap-addr+)
+         ;; (sap-addr Vd Vsap) - extract raw address from SAP → Vd (raw u64)
+         ;; Returns raw (untagged) for passing to syscalls via syscall3-raw
+         (let* ((vd (first operands))
+                (vsap (second operands))
+                (d (dest-phys-or-scratch vd))
+                (ps (vreg-phys vsap)))
+           (unless ps (emit-load-vreg buf vsap +scratch-reg+) (setf ps +scratch-reg+))
+           (emit-lea buf 'rax ps -9)          ; strip object tag
+           (emit-mov-reg-mem buf d 'rax 8)    ; load raw address
+           (maybe-store-scratch buf vd)))
 
         ;; ============================================
         ;; Actor / Concurrency

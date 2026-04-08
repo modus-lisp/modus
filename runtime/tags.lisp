@@ -36,6 +36,7 @@
 (defconstant +subtag-string+ #x10)
 (defconstant +subtag-u8-vector+ #x11)
 (defconstant +subtag-u64-vector+ #x14)
+(defconstant +subtag-sap+ #x16)
 (defconstant +subtag-bignum+ #x30)
 (defconstant +subtag-array+ #x32)
 ;;; 0x40-0x4F: Structured objects

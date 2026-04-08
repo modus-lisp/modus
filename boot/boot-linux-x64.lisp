@@ -94,15 +94,33 @@
    On entry from Linux: RSP points to [argc, argv[0], argv[1], ..., NULL, envp...]
    We save argc/argv, set up MVM runtime registers, allocate heap via mmap, and
    fall through to native code (which starts with a JMP to kernel-main)."
-  ;; Save argc and argv pointer for later use
-  ;; [RSP] = argc, [RSP+8] = argv[0], etc.
-  ;; Store argc at a fixed address for later retrieval
+  ;; Save argc and first 4 argv entries at fixed addresses.
+  ;; [RSP] = argc, [RSP+8] = argv[0], [RSP+16] = argv[1], etc.
+  ;; 0x600000: argc (u64)
+  ;; 0x600008: argv base pointer (u64)
+  ;; 0x600010: argv[0] (u64, raw C string pointer)
+  ;; 0x600018: argv[1] (u64)
+  ;; 0x600020: argv[2] (u64)
+  ;; 0x600028: argv[3] (u64)
   (emit-bytes buf #x48 #x8B #x04 #x24)        ; mov rax, [rsp]  (argc)
   (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [abs32], rax
-  (emit-le32 buf #x600000)                       ; address: 0x600000 (globals area)
-  (emit-bytes buf #x48 #x8D #x44 #x24 #x08)    ; lea rax, [rsp+8]  (argv pointer)
-  (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [abs32], rax
-  (emit-le32 buf #x600008)                       ; address: 0x600008
+  (emit-le32 buf #x600000)                       ; store argc
+  (emit-bytes buf #x48 #x8D #x44 #x24 #x08)    ; lea rax, [rsp+8]  (argv base)
+  (emit-bytes buf #x48 #x89 #x04 #x25)
+  (emit-le32 buf #x600008)                       ; store argv base
+  ;; Copy argv[0..3] to fixed addresses
+  (emit-bytes buf #x48 #x8B #x44 #x24 #x08)    ; mov rax, [rsp+8]  (argv[0])
+  (emit-bytes buf #x48 #x89 #x04 #x25)
+  (emit-le32 buf #x600010)
+  (emit-bytes buf #x48 #x8B #x44 #x24 #x10)    ; mov rax, [rsp+16] (argv[1])
+  (emit-bytes buf #x48 #x89 #x04 #x25)
+  (emit-le32 buf #x600018)
+  (emit-bytes buf #x48 #x8B #x44 #x24 #x18)    ; mov rax, [rsp+24] (argv[2])
+  (emit-bytes buf #x48 #x89 #x04 #x25)
+  (emit-le32 buf #x600020)
+  (emit-bytes buf #x48 #x8B #x44 #x24 #x20)    ; mov rax, [rsp+32] (argv[3])
+  (emit-bytes buf #x48 #x89 #x04 #x25)
+  (emit-le32 buf #x600028)
 
   ;; Set up MVM runtime registers
   ;; R15 = NIL (#xDEAD0001)

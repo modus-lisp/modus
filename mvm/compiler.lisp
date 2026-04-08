@@ -1212,6 +1212,9 @@
       ((= op-name 821056500804198866) (compile-write-char-serial (cdr form) env dest))
       ((= op-name 602746553318600181)  (compile-read-char-serial dest))
 
+      ;; --- Process Exit (Linux) ---
+      ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
+
       ;; --- Timestamp Counter ---
       ((= op-name 580098868411189197) (compile-rdtsc dest))
 
@@ -3099,6 +3102,13 @@
    Uses TRAP #x0300 with the value in V0."
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :trap #x0300)
+  (emit-ir :li dest 0))
+
+(defun compile-sys-exit (args env dest)
+  "Compile (sys-exit code) — exit the process (Linux).
+   Uses TRAP #x0500 with exit code in V0."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0500)
   (emit-ir :li dest 0))
 
 (defun compile-read-char-serial (dest)

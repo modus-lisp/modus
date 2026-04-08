@@ -519,6 +519,9 @@
                   (cond
                     ((getf boot-descriptor :uefi)
                      (wrap-in-pe32plus raw-bytes))
+                    ((eq (getf boot-descriptor :elf-format) :linux-x64)
+                     (wrap-in-elf64-le raw-bytes
+                                       (or (getf boot-descriptor :load-addr) #x400000)))
                     (t (let ((elf-machine (getf boot-descriptor :elf-machine))
                              (load-addr (or (getf boot-descriptor :load-addr) 0))
                              (elf-class (getf boot-descriptor :elf-class 32))
@@ -543,6 +546,7 @@
     (:rpi :aarch64)
     (:fixpoint :aarch64)
     (:uefi-x64 :x86-64)
+    (:linux-x64 :x86-64)
     (:x64-console :x86-64)
     (:i386-console :i386)
     (otherwise target)))
@@ -609,6 +613,7 @@
     (:rpi     (rpi-boot-descriptor))
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (:uefi-x64 (uefi-x64-boot-descriptor))
+    (:linux-x64 (linux-x64-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))
     (:i386-console (i386-console-boot-descriptor))
     (otherwise nil)))

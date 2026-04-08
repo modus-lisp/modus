@@ -24,6 +24,11 @@
 
 (in-package :modus.mvm.x64)
 
+(defvar *x64-linux-mode* nil
+  "When non-nil, TRAP codes emit Linux syscalls instead of bare-metal I/O.
+   Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
+   port I/O, PIC/PIT setup, etc.")
+
 ;;; ============================================================
 ;;; Physical Register Mapping
 ;;; ============================================================
@@ -294,39 +299,85 @@
               nil)
              ((= code #x0300)
               ;; Serial write: V0 (RSI) contains tagged fixnum char code
-              ;; mov eax, esi
-              (emit-bytes buf #x89 #xF0)
-              ;; sar eax, 1 (untag fixnum)
-              (emit-bytes buf #xD1 #xF8)
-              ;; mov dx, 0x3F8 (COM1 data port)
-              (emit-bytes buf #x66 #xBA #xF8 #x03)
-              ;; out dx, al
-              (emit-bytes buf #xEE))
+              (if *x64-linux-mode*
+                  (progn
+                    ;; Linux: SYS_write(1, &byte, 1)
+                    ;; Save regs clobbered by syscall (RCX, R11, plus our args RDI, RSI, RDX)
+                    (emit-bytes buf #x56)                  ; push rsi (save V0)
+                    (emit-bytes buf #x57)                  ; push rdi
+                    (emit-bytes buf #x52)                  ; push rdx
+                    ;; Untag char and store on stack
+                    (emit-bytes buf #x48 #x8B #x44 #x24 #x10) ; mov rax, [rsp+16] (saved RSI)
+                    (emit-bytes buf #x48 #xD1 #xF8)       ; sar rax, 1 (untag)
+                    (emit-bytes buf #x88 #x44 #x24 #x10)  ; mov [rsp+16], al (reuse saved RSI slot)
+                    ;; SYS_write(fd=1, buf=&byte, len=1)
+                    (emit-bytes buf #x48 #xC7 #xC7 #x01 #x00 #x00 #x00) ; mov rdi, 1 (stdout)
+                    (emit-bytes buf #x48 #x8D #x74 #x24 #x10) ; lea rsi, [rsp+16]
+                    (emit-bytes buf #x48 #xC7 #xC2 #x01 #x00 #x00 #x00) ; mov rdx, 1
+                    (emit-bytes buf #x48 #xC7 #xC0 #x01 #x00 #x00 #x00) ; mov rax, 1 (SYS_write)
+                    (emit-bytes buf #x0F #x05)             ; syscall
+                    ;; Restore regs
+                    (emit-bytes buf #x5A)                  ; pop rdx
+                    (emit-bytes buf #x5F)                  ; pop rdi
+                    (emit-bytes buf #x5E))                 ; pop rsi
+                  (progn
+                    ;; Bare metal: OUT to COM1
+                    (emit-bytes buf #x89 #xF0)            ; mov eax, esi
+                    (emit-bytes buf #xD1 #xF8)            ; sar eax, 1 (untag)
+                    (emit-bytes buf #x66 #xBA #xF8 #x03)  ; mov dx, 0x3F8
+                    (emit-bytes buf #xEE))))               ; out dx, al
              ((= code #x0301)
-              ;; Serial read: poll COM1 LSR until data ready, read byte
-              ;; Result in V0 (RSI) as tagged fixnum
-              ;; poll: mov dx, 0x3FD (LSR)  ; 4 bytes
-              ;;        in al, dx           ; 1 byte
-              ;;        test al, 1          ; 2 bytes
-              ;;        jz poll             ; 2 bytes  (back 9 = 0xF7)
-              (emit-bytes buf #x66 #xBA #xFD #x03)  ; mov dx, 0x3FD
-              (emit-bytes buf #xEC)                   ; in al, dx
-              (emit-bytes buf #xA8 #x01)              ; test al, 1
-              (emit-bytes buf #x74 #xF7)              ; jz -9 (back to mov dx)
-              ;; Data ready — read from data port
-              (emit-bytes buf #x66 #xBA #xF8 #x03)  ; mov dx, 0x3F8
-              (emit-bytes buf #xEC)                   ; in al, dx
-              ;; movzx esi, al; shl esi, 1 (tag as fixnum)
-              (emit-bytes buf #x0F #xB6 #xF0)       ; movzx esi, al
-              (emit-bytes buf #xD1 #xE6))            ; shl esi, 1
+              (if *x64-linux-mode*
+                  (progn
+                    ;; Linux: SYS_read(0, &byte, 1)
+                    (emit-bytes buf #x57)                  ; push rdi
+                    (emit-bytes buf #x52)                  ; push rdx
+                    (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x00) ; mov rdi, 0 (stdin)
+                    (emit-bytes buf #x48 #x8D #x74 #x24 #x10) ; lea rsi, [rsp+16] (temp on stack)
+                    (emit-bytes buf #x48 #xC7 #xC2 #x01 #x00 #x00 #x00) ; mov rdx, 1
+                    (emit-bytes buf #x48 #xC7 #xC0 #x00 #x00 #x00 #x00) ; mov rax, 0 (SYS_read)
+                    (emit-bytes buf #x0F #x05)             ; syscall
+                    (emit-bytes buf #x5A)                  ; pop rdx
+                    (emit-bytes buf #x5F)                  ; pop rdi
+                    ;; Result byte at [rsp-16] (where we read into, adjusted for pops)
+                    (emit-bytes buf #x0F #xB6 #x74 #x24 #xF0) ; movzx esi, byte [rsp-16]
+                    (emit-bytes buf #xD1 #xE6))            ; shl esi, 1 (tag)
+                  (progn
+                    ;; Bare metal: poll COM1 LSR then IN from COM1
+                    (emit-bytes buf #x66 #xBA #xFD #x03)  ; mov dx, 0x3FD
+                    (emit-bytes buf #xEC)                   ; in al, dx
+                    (emit-bytes buf #xA8 #x01)              ; test al, 1
+                    (emit-bytes buf #x74 #xF7)              ; jz -9
+                    (emit-bytes buf #x66 #xBA #xF8 #x03)  ; mov dx, 0x3F8
+                    (emit-bytes buf #xEC)                   ; in al, dx
+                    (emit-bytes buf #x0F #xB6 #xF0)       ; movzx esi, al
+                    (emit-bytes buf #xD1 #xE6))))
              ((= code #x0302)
               ;; Memory barrier: mfence
               (emit-bytes buf #x0F #xAE #xF0))
+             ((= code #x0303)
+              ;; STI+HLT: sleep until interrupt
+              (if *x64-linux-mode*
+                  ;; Linux: NOP (can't HLT in userspace)
+                  (emit-bytes buf #x90)
+                  (progn
+                    (emit-bytes buf #xFB)    ; sti
+                    (emit-bytes buf #xF4)))) ; hlt
              ((= code #x0304)
               ;; WFI: PAUSE on x86 (hint to yield CPU in spin-wait loops)
               (emit-bytes buf #xF3 #x90))
+             ((= code #x0500)
+              ;; SYS_exit: V0 (RSI) = tagged exit code
+              (emit-bytes buf #x48 #x89 #xF7)  ; mov rdi, rsi (exit code)
+              (emit-bytes buf #x48 #xD1 #xFF)   ; sar rdi, 1 (untag)
+              (emit-bytes buf #x48 #xC7 #xC0 #x3C #x00 #x00 #x00) ; mov rax, 60 (SYS_exit)
+              (emit-bytes buf #x0F #x05))       ; syscall
              ((= code #x0320)
               ;; SETUP-IRQ: PIC remap + PIT timer + IDT + ISR for HLT-based io-delay
+              (if *x64-linux-mode*
+                  ;; Linux: NOP (no PIC/PIT access in userspace)
+                  (emit-bytes buf #x90)
+                  (progn
               ;; Clobbers RAX, RCX, RDX, RDI — save/restore around
               (emit-bytes buf #x51)  ; push rcx
               (emit-bytes buf #x52)  ; push rdx
@@ -395,7 +446,7 @@
               (emit-bytes buf #x48 #x83 #xC4 #x10)  ; add rsp, 16
               (emit-bytes buf #x5F)  ; pop rdi
               (emit-bytes buf #x5A)  ; pop rdx
-              (emit-bytes buf #x59)) ; pop rcx
+              (emit-bytes buf #x59)))) ; pop rcx — end of progn for bare-metal #x0320
              ((= code #x0321)
               ;; TIMER-REARM: NOP on x64 (only meaningful on AArch64 virt)
               nil)

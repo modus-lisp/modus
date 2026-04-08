@@ -1,0 +1,97 @@
+;;;; build-linux-hashtest.lisp - Test hash tables in Linux MVM binary
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
+(modus.mvm.x64:install-x64-translator)
+(setf modus.mvm.x64::*x64-linux-mode* t)
+(load (merge-pathnames "../boot/boot-linux-x64.lisp"
+                       (directory-namestring (truename *load-truename*))))
+(in-package :modus.mvm)
+
+(let* ((source "
+;; Open-addressing hash table using arrays.
+;; Layout: slot 0 = capacity, then [key val key val ...] pairs
+;; Empty slots have key = 0 (nil). Total array size = 1 + 2*capacity.
+;; Uses fixnum keys with multiplicative hashing.
+
+(defun ht-make (capacity)
+  (let ((c capacity))
+    (let ((arr (make-array (+ 1 (* c 2)))))
+      (aset arr 0 c)
+      arr)))
+
+(defun ht-hash (key capacity)
+  (let ((k key))
+    (let ((h (logand (ash (* k 2654435761) -16) #x7FFFFFFF)))
+      (let ((cap capacity))
+        (- h (* (/ h cap) cap))))))
+
+(defun ht-get (ht key)
+  (let ((h ht))
+    (let ((k key))
+      (let ((cap (aref h 0)))
+        (let ((idx (ht-hash k cap)))
+          (let ((i 0))
+            (loop
+              (when (>= i cap) (return 0))
+              (let ((slot (- (+ idx i) (* (/ (+ idx i) cap) cap))))
+                (let ((ki (+ 1 (* slot 2))))
+                  (let ((sk (aref h ki)))
+                    (if (= sk 0)
+                        (return 0)
+                        (when (= sk k)
+                          (return (aref h (+ ki 1))))))))
+              (setq i (+ i 1)))))))))
+
+(defun ht-put (ht key val)
+  (let ((h ht))
+    (let ((k key))
+      (let ((v val))
+        (let ((cap (aref h 0)))
+          (let ((idx (ht-hash k cap)))
+            (let ((i 0))
+              (loop
+                (when (>= i cap) (return 0))
+                (let ((slot (- (+ idx i) (* (/ (+ idx i) cap) cap))))
+                  (let ((ki (+ 1 (* slot 2))))
+                    (let ((sk (aref h ki)))
+                      (if (= sk 0)
+                          (progn (aset h ki k) (aset h (+ ki 1) v) (return v))
+                          (when (= sk k)
+                            (aset h (+ ki 1) v) (return v))))))
+                (setq i (+ i 1))))))))))
+
+(defun print-dec (n)
+  (let ((nn n))
+    (if (< nn 0)
+        (progn (write-char-serial 45) (print-dec (- 0 nn)))
+        (if (< nn 10)
+            (write-char-serial (+ nn 48))
+            (progn (print-dec (/ nn 10))
+                   (write-char-serial (+ 48 (- nn (* (/ nn 10) 10)))))))))
+
+(defun kernel-main ()
+  (let ((ht (ht-make 16)))
+    (ht-put ht 42 100)
+    (ht-put ht 7 200)
+    (ht-put ht 99 300)
+    (print-dec (ht-get ht 42))
+    (write-char-serial 32)
+    (print-dec (ht-get ht 7))
+    (write-char-serial 32)
+    (print-dec (ht-get ht 99))
+    (write-char-serial 32)
+    (print-dec (ht-get ht 1))
+    (write-char-serial 10)
+    (ht-put ht 42 999)
+    (print-dec (ht-get ht 42))
+    (write-char-serial 10))
+  (sys-exit 0))
+")
+       (image (build-image :target :linux-x64 :source-text source)))
+  (let ((path "/tmp/modus-hashtest"))
+    (with-open-file (out path :direction :output
+                              :element-type '(unsigned-byte 8)
+                              :if-exists :supersede)
+      (write-sequence (kernel-image-image-bytes image) out))
+    #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    (format t "Wrote ~D bytes to ~A~%" (length (kernel-image-image-bytes image)) path)))

@@ -458,6 +458,153 @@
             (setq cur (cdr cur)))))))
 
 ;;; ============================================================
+;;; Multiple Values Support
+;;; ============================================================
+;;;
+;;; MV-COUNT at 0x600010: number of values (tagged fixnum)
+;;; MV-VALUES at 0x600020: up to 20 extra values (8 bytes each)
+;;; Primary value is returned normally; extra values stored here.
+;;; Any non-values form implicitly sets MV-COUNT to 1.
+
+(defun %mv-to-list (primary)
+  "Collect multiple values into a list. PRIMARY is the first value.
+   Reads extra values from MV storage at 0x600020 + index*8."
+  (let ((count (mem-ref #x600010 :u64)))
+    (if (or (null count) (zerop count))
+        nil
+        (if (= count 1)
+            (cons primary nil)
+            (let ((result nil)
+                  (i (- count 2)))  ; last extra value index (0-based)
+              ;; Build list from back to front
+              (loop
+                (when (< i 0) (return nil))
+                (let ((addr (+ #x600020 (* i 8))))
+                  (let ((val (mem-ref addr :u64)))
+                    (setq result (cons val result))))
+                (setq i (- i 1)))
+              (cons primary result))))))
+
+;;; ============================================================
+;;; Object Printer
+;;; ============================================================
+
+(defun write-object (obj)
+  "Print a Lisp object to serial output (prin1-style)."
+  (cond
+    ((null obj)
+     (write-char-serial 78)    ; N
+     (write-char-serial 73)    ; I
+     (write-char-serial 76))   ; L
+    ((eq obj t)
+     (write-char-serial 84))   ; T
+    ((fixnump obj)
+     (print-dec obj))
+    ((consp obj)
+     (write-char-serial 40)    ; (
+     (write-object (car obj))
+     (let ((tail (cdr obj)))
+       (loop
+         (cond
+           ((null tail) (return nil))
+           ((consp tail)
+            (write-char-serial 32)  ; space
+            (write-object (car tail))
+            (setq tail (cdr tail)))
+           (t
+            (write-char-serial 32)  ; space
+            (write-char-serial 46)  ; .
+            (write-char-serial 32)  ; space
+            (write-object tail)
+            (return nil)))))
+     (write-char-serial 41))   ; )
+    ((stringp obj)
+     (write-char-serial 34)    ; "
+     (write-string-serial obj)
+     (write-char-serial 34))   ; "
+    ((symbolp obj)
+     ;; Symbols: print as #<SYM hash>
+     (write-char-serial 35)    ; #
+     (write-char-serial 60)    ; <
+     (write-char-serial 83)    ; S
+     (print-dec (aref obj 0))
+     (write-char-serial 62))   ; >
+    (t
+     ;; Unknown object
+     (write-char-serial 35)    ; #
+     (write-char-serial 60)    ; <
+     (write-char-serial 63)    ; ?
+     (write-char-serial 62)))) ; >
+
+(defun princ-object (obj)
+  "Print a Lisp object to serial output (princ-style, no escapes)."
+  (cond
+    ((null obj)
+     (write-char-serial 78)    ; N
+     (write-char-serial 73)    ; I
+     (write-char-serial 76))   ; L
+    ((eq obj t)
+     (write-char-serial 84))   ; T
+    ((fixnump obj)
+     (print-dec obj))
+    ((consp obj)
+     (write-object obj))       ; same as write-object for cons
+    ((stringp obj)
+     (write-string-serial obj)) ; no quotes for princ
+    (t
+     (write-object obj))))
+
+;;; ============================================================
+;;; Format
+;;; ============================================================
+
+(defun format (stream control &rest args)
+  "Basic format: supports ~A ~S ~D ~% ~X ~B directives.
+   STREAM: t = serial output, nil = not yet supported.
+   Returns nil."
+  (let ((len (array-length control))
+        (i 0)
+        (arg-rest args))
+    (loop
+      (when (>= i len) (return nil))
+      (let ((ch (aref control i)))
+        (if (= ch 126)  ; ~
+            (progn
+              (setq i (+ i 1))
+              (when (>= i len) (return nil))
+              (let ((directive (aref control i)))
+                (cond
+                  ;; ~A — aesthetic (princ)
+                  ((or (= directive 65) (= directive 97))  ; A or a
+                   (princ-object (car arg-rest))
+                   (setq arg-rest (cdr arg-rest)))
+                  ;; ~S — standard (prin1)
+                  ((or (= directive 83) (= directive 115))  ; S or s
+                   (write-object (car arg-rest))
+                   (setq arg-rest (cdr arg-rest)))
+                  ;; ~D — decimal
+                  ((or (= directive 68) (= directive 100))  ; D or d
+                   (print-dec (car arg-rest))
+                   (setq arg-rest (cdr arg-rest)))
+                  ;; ~X — hexadecimal
+                  ((or (= directive 88) (= directive 120))  ; X or x
+                   (print-hex (car arg-rest))
+                   (setq arg-rest (cdr arg-rest)))
+                  ;; ~% — newline
+                  ((= directive 37)  ; %
+                   (write-char-serial 10))
+                  ;; ~~ — literal tilde
+                  ((= directive 126)  ; ~
+                   (write-char-serial 126))
+                  ;; Unknown directive — print as-is
+                  (t
+                   (write-char-serial 126)
+                   (write-char-serial directive)))))
+            (write-char-serial ch)))
+      (setq i (+ i 1))))
+  nil)
+
+;;; ============================================================
 ;;; Hash Tables (cons-cell alist, no arrays needed)
 ;;; ============================================================
 ;;;

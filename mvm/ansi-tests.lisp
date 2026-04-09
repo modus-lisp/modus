@@ -591,6 +591,47 @@
   (deftest 2132 (rest-sum 42) 42))
 
 ;;; ============================================================
+;;; Multiple Values (2150-2199)
+;;; ============================================================
+
+(defun run-values-tests ()
+  ;; values with single value = identity
+  (deftest 2150 (values 42) 42)
+  (deftest 2151 (values nil) nil)
+
+  ;; multiple-value-bind with single value
+  (deftest 2160 (multiple-value-bind (x) (values 42) x) 42)
+
+  ;; multiple-value-bind with multiple values
+  (deftest 2161 (multiple-value-bind (x y) (values 1 2) (+ x y)) 3)
+  (deftest 2162 (multiple-value-bind (x y z) (values 10 20 30) (+ x (+ y z))) 60)
+
+  ;; multiple-value-list
+  (deftest 2170 (multiple-value-list (values 1 2 3)) (cons 1 (cons 2 (cons 3 nil))))
+  (deftest 2171 (multiple-value-list (values 42)) (cons 42 nil))
+
+  ;; values in arithmetic context (primary value used)
+  (deftest 2180 (+ (values 10 20) 5) 15))
+
+;;; ============================================================
+;;; Format (2200-2249)
+;;; ============================================================
+
+(defun run-format-tests ()
+  ;; format returns nil
+  (deftest 2200 (format t "hello") nil)
+  ;; format with ~D
+  (deftest 2201 (format t "~D" 42) nil)
+  ;; format with ~A on integer (same as ~D)
+  (deftest 2202 (format t "~A" 42) nil)
+  ;; format returns nil always
+  (deftest 2203 (format t "~A ~A ~A" 1 2 3) nil)
+  ;; Verify format doesn't crash with various types
+  (deftest 2204 (format t "~S" (cons 1 2)) nil)
+  (deftest 2205 (format t "~S" nil) nil)
+  (deftest 2206 (format t "~%") nil))
+
+;;; ============================================================
 ;;; Regression tests (9000+)
 ;;; Tests for previously-fixed bugs
 ;;; ============================================================
@@ -673,4 +714,6 @@
   (run-cl-loop-tests)
   (run-funcall-tests)
   (run-rest-tests)
+  (run-values-tests)
+  (run-format-tests)
   (run-regression-tests))

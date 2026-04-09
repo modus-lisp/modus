@@ -53,6 +53,12 @@
 (defconstant +nil-value+ #xDEAD0001)
 (defconstant +t-value+   #xDEAD1009)
 
+;;; Multiple-value return storage (fixed addresses in BSS/globals area)
+;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)
+;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
+(defconstant +mv-count-addr+ #x600010)
+(defconstant +mv-values-addr+ #x600020)
+
 ;;; Maximum number of register arguments
 (defconstant +max-reg-args+ 4)
 
@@ -1073,6 +1079,15 @@
       ;; RETURN-FROM — treat as return (ignore block name)
       ((= op-name 102326962717880022)
        (compile-return (caddr form) env dest))
+      ;; VALUES — return multiple values
+      ((= op-name 419785975474686239)
+       (compile-values (cdr form) env dest))
+      ;; MULTIPLE-VALUE-BIND — bind variables to multiple return values
+      ((= op-name 544225037749651317)
+       (compile-multiple-value-bind (cadr form) (caddr form) (cdddr form) env dest))
+      ;; MULTIPLE-VALUE-LIST — collect multiple values into a list
+      ((= op-name 76959345744650934)
+       (compile-multiple-value-list (cadr form) env dest))
       ;; HANDLER-CASE — compile body only, skip handler clauses
       ((= op-name 362314411895974678)
        (compile-form (cadr form) env dest))
@@ -2155,6 +2170,64 @@
   (declare (ignore env))
   ;; Emit a load-function-ref IR that will be resolved during linking
   (emit-ir :li-func dest (if (symbolp name) (symbol-name name) (string name))))
+
+;;; ============================================================
+;;; Multiple Values
+;;; ============================================================
+
+(defun compile-values (args env dest)
+  "Compile (values v1 v2 ...).
+   First value goes to dest (normal return path).
+   Extra values stored at MV-VALUES-ADDR, count at MV-COUNT-ADDR.
+   Expands to: store count, store extras, return first."
+  (let ((nvals (length args)))
+    (cond
+      ((= nvals 0)
+       ;; (values) → nil, count = 0
+       (compile-form `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 0) nil)
+                     env dest))
+      ((= nvals 1)
+       ;; (values x) → x, count = 1
+       (compile-form `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+                             ,(car args))
+                     env dest))
+      (t
+       ;; Multiple values: store count + extras, return first
+       (let ((store-forms nil)
+             (idx 0))
+         ;; Store count (compiler tags the integer literal automatically)
+         (push `(setf (mem-ref ,+mv-count-addr+ :u64) ,nvals)
+               store-forms)
+         ;; Store extra values at MV-VALUES-ADDR + i*8
+         (dolist (val-form (cdr args))
+           (let ((addr (+ +mv-values-addr+ (* idx 8))))
+             (push `(setf (mem-ref ,addr :u64) ,val-form) store-forms))
+           (incf idx))
+         ;; Compile: stores then return first value
+         (compile-form `(progn ,@(nreverse store-forms) ,(car args))
+                       env dest))))))
+
+(defun compile-multiple-value-bind (vars form body env dest)
+  "Compile (multiple-value-bind (v1 v2 ...) form body...).
+   Expands to: evaluate form, bind first var to result,
+   bind remaining vars from MV storage via mem-ref."
+  ;; Build let-bindings: first var = form, rest = (mem-ref MV-ADDR :u64)
+  (let ((bindings nil))
+    (push (list (car vars) form) bindings)
+    (let ((idx 0))
+      (dolist (var (cdr vars))
+        (let ((addr (+ +mv-values-addr+ (* idx 8))))
+          (push (list var `(mem-ref ,addr :u64)) bindings))
+        (incf idx)))
+    ;; Compile as (let (bindings...) body...)
+    (compile-let (nreverse bindings) body env dest)))
+
+(defun compile-multiple-value-list (form env dest)
+  "Compile (multiple-value-list form).
+   Evaluates form, then calls %mv-to-list to collect all values into a list."
+  ;; Generate: (let ((#:primary form)) (%mv-to-list #:primary))
+  (let ((tmp (gensym "MV")))
+    (compile-form `(let ((,tmp ,form)) (%mv-to-list ,tmp)) env dest)))
 
 (defun compile-funcall (args env dest)
   "Compile (funcall f arg1 arg2 ...) - indirect function call"

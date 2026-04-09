@@ -55,6 +55,10 @@
   "When non-nil, TRAP #x0320 (setup-irq) emits GICv2 + virtual timer init.
    Set to t for QEMU virt standalone builds. Nil for fixpoint (no GIC access).")
 
+(defvar *aarch64-yield-nop* nil
+  "When non-nil, YIELD emits NOP instead of SEV+WFE. Required for QEMU raspi3b
+   where WFE halts the CPU with no wake event (no GIC to generate events).")
+
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
 ;;; ============================================================
@@ -2106,13 +2110,15 @@
 
           ;; ---- YIELD ----
           ;; Preemption check point (emitted at end of every loop iteration).
-          ;; SEV + WFE: SEV sets the event register, then WFE sees it set,
-          ;; clears it, and returns immediately (never waits). This lets
-          ;; QEMU process events while avoiding the stall that bare WFE
-          ;; causes on real Cortex-A53 cores with no pending events.
+          ;; QEMU virt: SEV+WFE (SEV sets event register, WFE sees it and
+          ;; returns immediately — lets QEMU process events).
+          ;; QEMU raspi3b: NOP (WFE halts CPU with no wake source).
           ((= op +op-yield+)
-           (a64-emit buf #xD503209F)   ; SEV (send event)
-           (a64-wfe buf))
+           (if *aarch64-yield-nop*
+               (a64-nop buf)
+               (progn
+                 (a64-emit buf #xD503209F)   ; SEV (send event)
+                 (a64-wfe buf))))
 
           ;; ---- ATOMIC-XCHG Vd, Vaddr, Vs ----
           ;; LDXR/STXR loop for atomic exchange.

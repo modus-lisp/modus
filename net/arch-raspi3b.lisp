@@ -142,11 +142,14 @@
 ;; ARM virtual timer for WFI-based io-delay
 ;; ============================================================
 ;; setup-irq initializes CNTV_TVAL_EL0/CNTV_CTL_EL0 (1ms at 62.5MHz).
-;; No GIC needed — timer PPI wakes WFI directly on the core.
+;; BCM2836 local interrupt controller at 0x40000000 routes CNTVIRQ
+;; (bit 3) to core 0. No GIC on raspi3b — use QA7 peripheral instead.
 ;; Call after all crypto init (before net-actor-main).
 
 (defun enable-rpi-timer ()
   (setup-irq)
+  ;; Enable CNTVIRQ (bit 3) on core 0: Core0 Timer IRQ Control at 0x40000040
+  (setf (mem-ref #x40000040 :u32) 8)
   (setf (mem-ref (+ #x01090000 #x10) :u32) 1))
 
 ;; ============================================================
@@ -178,11 +181,7 @@
 ;; Actor model stubs -- single-threaded, no spawn/receive/yield
 (defun actor-spawn (fn) nil)
 (defun actor-exit () nil)
-;; yield: WFI when host interrupts configured, busy-wait otherwise
-(defun yield ()
-  (if (zerop (mem-ref (+ #x01090000 #x0C) :u32))
-      (io-delay)
-      (wfi)))
+(defun yield () (io-delay))
 (defun receive ()
   ;; Single-threaded: poll NIC for incoming data
   (e1000-receive)

@@ -45,6 +45,8 @@
 
 ;; Install the AArch64 translator
 (install-aarch64-translator)
+;; NOTE: *aarch64-yield-nop* NOT set — SEV+WFE should work on raspi3b
+;; as long as no WFI is used (io-delay and yield both busy-wait)
 
 ;; Combine: net source + REPL source + SSH kernel-main
 ;; SSH kernel-main MUST be LAST: "last-defun-wins" makes it the entry point.
@@ -55,7 +57,7 @@
                          "  (pci-assign-bars)"
                          ;; Initialize USB + CDC Ethernet (replaces e1000-probe)
                          "  (cdc-ether-init)"
-                         "  (dwc2-enable-host-irq)"
+                         ;; "  (dwc2-enable-host-irq)"
                          "  (write-byte 91) (write-byte 49) (write-byte 93)"
                          "  (sha256-init)"
                          "  (write-byte 91) (write-byte 50) (write-byte 93)"
@@ -94,10 +96,23 @@
                          "      (when (>= i 4) (return 0))"
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
-                         ;; Pre-compute server ephemeral X25519 key pair
-                         "  (pre-compute-server-eph (conn-ssh 0))"
-                         ;; Enable ARM timer for WFI-based io-delay (after all crypto init)
-                         "  (enable-rpi-timer)"
+                         ;; Embed pre-computed ephemeral X25519 key pair (same as AArch64 virt)
+                         ;; pre-compute-server-eph too slow on QEMU raspi3b — hardcode instead
+                         "  (let ((state (e1000-state-base)))"
+                         "    (setf (mem-ref (+ state #x6C4) :u8) #x00)"
+                         "    (dotimes (i 30)"
+                         "      (setf (mem-ref (+ state (+ #x6C5 i)) :u8) #x01))"
+                         "    (setf (mem-ref (+ state #x6E3) :u8) #x41))"
+                         "  (let ((state (e1000-state-base)))"
+                         "    (setf (mem-ref (+ state #x6E4) :u32) #x9292E0A4)"
+                         "    (setf (mem-ref (+ state #x6E8) :u32) #x78C251B6)"
+                         "    (setf (mem-ref (+ state #x6EC) :u32) #x562C77B9)"
+                         "    (setf (mem-ref (+ state #x6F0) :u32) #xBBA95F9F)"
+                         "    (setf (mem-ref (+ state #x6F4) :u32) #xB406D913)"
+                         "    (setf (mem-ref (+ state #x6F8) :u32) #x9D8CB66A)"
+                         "    (setf (mem-ref (+ state #x6FC) :u32) #x442BDCF9)"
+                         "    (setf (mem-ref (+ state #x700) :u32) #x99F8D42C))"
+                         ;; enable-rpi-timer skipped: WFI doesn't wake on QEMU raspi3b
                          "  (net-actor-main))")))
        ;; SSH kernel-main MUST be LAST: "last-defun-wins" makes it the entry point.
        (combined-source (concatenate 'string

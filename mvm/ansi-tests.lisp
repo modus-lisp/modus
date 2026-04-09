@@ -553,7 +553,10 @@
   ;; Basic funcall with #'
   (deftest 750 (funcall (function my-apply-fn) 5) 15)
   ;; funcall with identity-like function
-  (deftest 751 (funcall (function test-helper-identity) 42) 42))
+  (deftest 751 (funcall (function test-helper-identity) 42) 42)
+  ;; NOTE: lambda closures with funcall don't work yet (CALL-IND issue)
+  ;; This limits RT to eager deftest or named-thunk approach
+  )
 
 ;;; ============================================================
 ;;; &rest parameters (2100-2149)

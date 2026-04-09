@@ -136,10 +136,6 @@
 ;;; Override register-mvm-bootstrap-macros to no-op
 (defun register-mvm-bootstrap-macros () nil)
 
-;;; Override check-arith-nesting to no-op
-;;; The SBCL version calls form-arith-call-depth which uses reduce (not on bare metal)
-(defun check-arith-nesting (op operand) nil)
-
 ;;; Override globals functions to use 0x600000 (Linux BSS)
 ;;; The build-compiler-test adapter uses 0x380000 which is below Linux load address.
 (defun init-globals-table ()

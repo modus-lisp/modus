@@ -204,6 +204,33 @@
   "Apply FN to each element of LIST."
   (mapcar1 fn list))
 
+(defun some (fn list)
+  "Return the first non-nil result of applying FN to elements of LIST."
+  (let ((cur list))
+    (loop
+      (when (null cur) (return nil))
+      (let ((result (funcall fn (car cur))))
+        (when result (return result)))
+      (setq cur (cdr cur)))))
+
+(defun every (fn list)
+  "Return T if FN returns non-nil for all elements of LIST."
+  (let ((cur list))
+    (loop
+      (when (null cur) (return t))
+      (when (null (funcall fn (car cur))) (return nil))
+      (setq cur (cdr cur)))))
+
+(defun reduce (fn list keyword initial-value)
+  "Fold FN over LIST with INITIAL-VALUE. KEYWORD is ignored (bare-metal
+   positional stand-in for CL :initial-value keyword)."
+  (let ((acc initial-value)
+        (cur list))
+    (loop
+      (when (null cur) (return acc))
+      (setq acc (funcall fn acc (car cur)))
+      (setq cur (cdr cur)))))
+
 (defun mapc (fn list)
   "Apply FN to each element of LIST for side effects. Return LIST."
   (let ((cur list))

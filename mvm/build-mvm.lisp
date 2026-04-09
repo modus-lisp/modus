@@ -109,6 +109,46 @@
 
 (format t "  opcode init: ~D chars~%" (length cl-user::*opcode-init-source*))
 
+;; Generate correct opcode-pattern function from opcode table
+;; Maps operand specs to pattern numbers used by the bare-metal encode-instruction
+(defvar cl-user::*opcode-pattern-source*
+  (let ((ot *opcode-table*))
+    (flet ((spec-to-pattern (spec)
+             (let ((key (mapcar (lambda (s) (intern (symbol-name s) :keyword)) spec)))
+               (cond
+                 ((null key) 0)                          ;; no operands
+                 ((equal key '(:reg)) 1)                 ;; :reg
+                 ((equal key '(:reg :reg)) 2)            ;; :reg :reg
+                 ((equal key '(:reg :reg :reg)) 3)       ;; :reg :reg :reg
+                 ((equal key '(:reg :imm64)) 4)          ;; :reg :u64
+                 ((equal key '(:off16)) 5)               ;; :off16
+                 ((equal key '(:off32)) 5)               ;; :off32 (same encoding)
+                 ((equal key '(:reg :off16)) 6)          ;; :reg :off16
+                 ((equal key '(:reg :off32)) 6)          ;; :reg :off32
+                 ((equal key '(:imm16)) 7)               ;; :u16
+                 ((equal key '(:imm32)) 8)               ;; :u32
+                 ((equal key '(:reg :reg :imm8)) 9)      ;; :reg :reg :u8
+                 ((equal key '(:reg :imm8 :reg)) 10)     ;; :reg :u8 :reg
+                 ((equal key '(:reg :imm16 :imm8)) 11)   ;; :reg :u16 :u8
+                 ((equal key '(:imm16 :reg :imm8)) 12)   ;; :u16 :reg :u8
+                 ((equal key '(:reg :imm16)) 13)          ;; :reg :u16
+                 ((equal key '(:imm16 :reg)) 14)          ;; :u16 :reg
+                 ((equal key '(:reg :imm32)) 15)          ;; :reg :u32
+                 ((equal key '(:reg :reg :imm8 :imm8)) 9) ;; LDB: same as :reg :reg :u8
+                 (t (format t "WARNING: unhandled operand pattern ~S for opcode~%" key) 0)))))
+      (with-output-to-string (s)
+        (format s "(defun opcode-pattern (op)~%  (cond~%")
+        (let ((entries nil))
+          (cl:maphash (lambda (code info)
+                        (push (cons code (spec-to-pattern (opcode-info-operands info))) entries))
+                      ot)
+          (setf entries (sort entries #'< :key #'car))
+          (dolist (e entries)
+            (format s "    ((= op ~D) ~D)~%" (car e) (cdr e))))
+        (format s "    (t 0)))~%")))))
+
+(format t "  opcode pattern: ~D chars~%" (length cl-user::*opcode-pattern-source*))
+
 ;;; ============================================================
 ;;; 5. Compiler adapter source (from build-compiler-test.lisp)
 ;;; Overrides for bare-metal / MVM-subset compilation.
@@ -505,21 +545,10 @@
     (let ((n-fns (length function-table)))
       (let ((fn-labels (make-array n-fns)))
         (write-char-serial 50) ;; 2
-        (let ((fn-map (make-hash-table)))
-          (write-char-serial 51) ;; 3
+        (let ((fn-map (make-hash-table))
+              (fn-offset-to-label (make-hash-table)))
           (setq *td-fn-label-array* (make-array (array-length bytecode)))
-          (write-char-serial 52) ;; 4
-          ;; Debug: print first entry
-          (let ((e0 (car function-table)))
-            (write-char-serial 91)
-            (print-dec (car e0))        ;; name hash
-            (write-char-serial 44)
-            (print-dec (cadr e0))       ;; offset
-            (write-char-serial 44)
-            (print-dec (caddr e0))      ;; length
-            (write-char-serial 93)
-            (print-nl))
-          ;; Setup function labels
+          ;; Setup function labels — key by BOTH name hash AND bytecode offset
           (let ((rest-ft function-table)
                 (fi 0))
             (loop
@@ -527,19 +556,16 @@
               (let ((entry (car rest-ft)))
                 (let ((name (car entry))
                       (offset (cadr entry)))
-                  (write-char-serial 42) ;; *
                   (let ((label (make-label)))
-                    (write-char-serial 43) ;; +
                     (let ((d0 (aset fn-labels fi label)))
-                      (write-char-serial 44) ;; ,
-                      (let ((d1 (puthash name fn-map label)))
-                        d1)))))
-              (write-char-serial 45) ;; -
+                      (puthash name fn-map label)
+                      (puthash offset fn-offset-to-label label)
+                      d0))))
               (setq rest-ft (cdr rest-ft))
               (setq fi (+ fi 1))))
-          (write-char-serial 53) ;; 5
           ;; Translate each function using td-translate-one-fn
-          (let ((ctx (cons buf (cons bytecode fn-map))))
+          ;; ctx = (buf . (bytecode . fn-offset-to-label))
+          (let ((ctx (cons buf (cons bytecode fn-offset-to-label))))
             (let ((rest-ft function-table)
                   (fi 0))
               (loop
@@ -913,8 +939,10 @@
     ;; 7. Translator overrides (fixpoint-common.lisp)
     *translator-override-source*
     (string #\Newline)
-    ;; 8. Opcode table init
+    ;; 8. Opcode table init + correct opcode-pattern
     *opcode-init-source*
+    (string #\Newline)
+    *opcode-pattern-source*
     (string #\Newline)
     ;; 9. Defvar declarations for boot stub and default path
     ;; (must come before init functions that setq them)

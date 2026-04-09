@@ -203,14 +203,7 @@ These are known compiler bugs/limitations — work around them, don't try to fix
 5. **~~25+ sequential forms — DEBUNKED**: Tested up to 1000 sequential forms on x64, i386, and AArch64 — all pass. Functions previously split for this reason were likely hitting the nested-let or nested-logior bugs instead. Sequential form count is not a compiler limitation.
 6. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 7. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-8. **Nested logior/logand/ash clobber**: 3+ levels of nesting like `(logior b0 (logior (ash b1 8) (logior (ash b2 16) (ash b3 24))))` silently produces wrong values. Break into flat `let` bindings:
-   ```lisp
-   ;; BAD: nested logior with ash
-   (logior b0 (logior (ash b1 8) (logior (ash b2 16) (ash b3 24))))
-   ;; GOOD: flat let bindings
-   (let ((a (ash b3 24))) (let ((b (ash b2 16))) (let ((c (logior a b)))
-     (let ((d (ash b1 8))) (let ((e (logior c d))) (logior e b0))))))
-   ```
+8. **Nested logior/logand/ash clobber**: `check-arith-nesting` crashes on bare metal because `form-arith-call-depth`/`form-contains-call-p` use `member` with SBCL symbol lists that don't match bare-metal symbols `(9999 . chars)`. All nested arithmetic containing `ash` is misidentified as containing function calls → compilation error. Multi-arg logior/logand with pre-computed shift values works fine: `(logior s0 s1 s2 s3)` where each si is let-bound from `(ash bi N)`. The SBCL cross-compiler pipeline handles nesting correctly.
 
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 

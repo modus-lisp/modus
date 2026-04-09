@@ -4472,9 +4472,31 @@
     ;; (defstruct name slot1 slot2 ...)
     ;; Generates constructor (make-name), accessors (name-slot), setters (set-name-slot)
     ((and (consp form) (name-eq (car form) "DEFSTRUCT"))
-     (let* ((struct-name (cadr form))
+     (let* ((name-and-options (cadr form))
+            ;; Parse struct name and options
+            (struct-name (if (consp name-and-options) (car name-and-options) name-and-options))
             (struct-str (symbol-name struct-name))
-            (raw-slots (cddr form))
+            (options (when (consp name-and-options) (cdr name-and-options)))
+            ;; Parse options
+            (conc-name-specified nil)
+            (conc-name nil)  ; nil = no prefix, string = prefix
+            (include-parent nil))
+       ;; Process options
+       (dolist (opt options)
+         (when (consp opt)
+           (let ((opt-name (car opt)))
+             (cond
+               ((name-eq opt-name "CONC-NAME")
+                (setf conc-name-specified t)
+                (setf conc-name (if (cadr opt)
+                                    (format nil "~A-" (symbol-name (cadr opt)))
+                                    nil)))  ; (:conc-name nil) → no prefix
+               ((name-eq opt-name "INCLUDE")
+                (setf include-parent (cadr opt)))))))
+       ;; Default conc-name if not specified
+       (unless conc-name-specified
+         (setf conc-name (format nil "~A-" struct-str)))
+      (let* ((raw-slots (cddr form))
             ;; Parse slot specs: plain symbol or (symbol default)
             (slot-names (mapcar (lambda (s)
                                   (if (consp s) (car s) s))
@@ -4483,18 +4505,12 @@
                                      (if (consp s) (cadr s) nil))
                                    raw-slots))
             (nslots (length slot-names))
-            ;; Generate all defun forms
             (forms-to-compile nil))
-       ;; Constructor: takes keyword-value pairs as flat args
-       ;; e.g., (make-foo :bar 1 :baz 2) → called with args (:bar 1 :baz 2)
-       ;; We generate a function that creates an array and fills slots
-       ;; But since MVM doesn't support &rest, we generate a fixed-arity
-       ;; constructor with (* 2 nslots) args (key1 val1 key2 val2 ...)
+       ;; Constructor
        (let ((ctor-name (format nil "MAKE-~A" struct-str))
              (internal-ctor-name (format nil "%MAKE-~A" struct-str))
              (ctor-params nil)
              (ctor-body nil))
-         ;; Positional constructor with internal name to avoid macro recursion
          (setf ctor-params (loop for s in slot-names
                                  collect (intern (format nil "P-~A" (symbol-name s))
                                                  :modus.mvm)))
@@ -4509,8 +4525,7 @@
                   ,ctor-body)
                forms-to-compile)
 
-         ;; Register macro that expands (make-name ...) to (%make-name ...)
-         ;; with keyword args reordered to positional
+         ;; Register macro for keyword-arg constructor
          (let ((slot-kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
                (defaults slot-defaults)
                (internal-ctor-sym (intern internal-ctor-name :modus.mvm)))
@@ -4518,10 +4533,8 @@
              (lambda (form)
                (let ((args (cdr form))
                      (positional (make-list nslots :initial-element nil)))
-                 ;; Fill defaults
                  (loop for i from 0 for d in defaults
                        do (setf (nth i positional) d))
-                 ;; Parse keyword args
                  (loop while args
                        do (let ((key (car args))
                                 (val (cadr args)))
@@ -4533,43 +4546,50 @@
                             (setf args (cddr args))))
                  `(,internal-ctor-sym ,@positional))))))
 
-       ;; Accessors
+       ;; Accessors — use conc-name prefix (nil = slot name only)
        (loop for slot in slot-names
              for i from 0
-             do (let ((acc-name (format nil "~A-~A" struct-str (symbol-name slot))))
+             do (let ((acc-name (if conc-name
+                                    (format nil "~A~A" conc-name (symbol-name slot))
+                                    (format nil "~A" (symbol-name slot)))))
                   (push `(defun ,(intern acc-name :modus.mvm) (obj)
                            (aref obj ,i))
                         forms-to-compile)
-                  ;; Register SETF handler for this accessor
-                  (let ((setter-name (format nil "SET-~A-~A" struct-str (symbol-name slot))))
+                  (let ((setter-name (format nil "SET-~A" acc-name)))
                     (push `(defun ,(intern setter-name :modus.mvm) (obj val)
                              (aset obj ,i val)
                              val)
                           forms-to-compile)
-                    ;; Register setf macro: (setf (foo-bar x) v) → (set-foo-bar x v)
                     (let ((setter-sym (intern setter-name :modus.mvm)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
                         (mvm-define-macro setf-key
                           (lambda (form)
                             (declare (ignore form))
                             nil))
-                        ;; Add to SETF expansion table
                         (setf (gethash setf-key *macro-table*)
                               setter-sym))))))
 
-       ;; Type predicate (name-p) — always returns t for any array (simple check)
+       ;; Copier
+       (let ((copy-name (format nil "COPY-~A" struct-str)))
+         (push `(defun ,(intern copy-name :modus.mvm) (obj)
+                  (let ((new (make-array ,nslots)))
+                    ,@(loop for i from 0 below nslots
+                            collect `(aset new ,i (aref obj ,i)))
+                    new))
+               forms-to-compile))
+
+       ;; Type predicate
        (let ((pred-name (format nil "~A-P" struct-str)))
          (push `(defun ,(intern pred-name :modus.mvm) (obj)
                   (arrayp obj))
                forms-to-compile))
 
-       ;; Compile all generated forms and return ALL results
+       ;; Compile all generated forms
        (let ((results nil))
          (dolist (gen-form (nreverse forms-to-compile))
            (let ((result (mvm-compile-toplevel gen-form)))
              (when result (push result results))))
-         ;; Return multi-result so mvm-compile-all collects all of them
-         (cons :multi-result (nreverse results)))))
+         (cons :multi-result (nreverse results))))))
 
     ;; Other top-level forms: wrap in anonymous function
     (t

@@ -614,6 +614,51 @@
   (deftest 2180 (+ (values 10 20) 5) 15))
 
 ;;; ============================================================
+;;; Defstruct (2250-2299)
+;;; ============================================================
+
+;; Standard defstruct (prefix = struct-name-)
+(defstruct point x y)
+
+;; Defstruct with :conc-name nil (no prefix — like RT's entry)
+(defstruct (entry (:conc-name nil))
+  pend name props form vals)
+
+;; Defstruct with defaults
+(defstruct note
+  name
+  (disabled nil))
+
+(defun run-defstruct-tests ()
+  ;; Standard constructor + accessors
+  (deftest 2250 (point-x (make-point :x 10 :y 20)) 10)
+  (deftest 2251 (point-y (make-point :x 10 :y 20)) 20)
+
+  ;; :conc-name nil — unprefixed accessors
+  (deftest 2260 (let ((e (make-entry :name 42 :pend t)))
+                  (name e)) 42)
+  (deftest 2261 (let ((e (make-entry :name 42 :pend t)))
+                  (pend e)) t)
+  (deftest 2262 (let ((e (make-entry :form 99)))
+                  (form e)) 99)
+  ;; Unset slots are nil
+  (deftest 2263 (let ((e (make-entry :name 1)))
+                  (vals e)) nil)
+
+  ;; Defaults
+  (deftest 2270 (note-disabled (make-note :name 1)) nil)
+  (deftest 2271 (note-name (make-note :name 42)) 42)
+
+  ;; Copier
+  (deftest 2275 (let ((p (make-point :x 1 :y 2)))
+                  (let ((p2 (copy-point p)))
+                    (point-x p2))) 1)
+
+  ;; Predicate
+  (deftest 2280 (point-p (make-point :x 0 :y 0)) t)
+  (deftest 2281 (point-p 42) nil))
+
+;;; ============================================================
 ;;; Format (2200-2249)
 ;;; ============================================================
 
@@ -715,5 +760,6 @@
   (run-funcall-tests)
   (run-rest-tests)
   (run-values-tests)
+  (run-defstruct-tests)
   (run-format-tests)
   (run-regression-tests))

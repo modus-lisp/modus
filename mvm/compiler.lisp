@@ -1322,6 +1322,20 @@
       ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
 
       ;; --- Function Call (default) ---
+      ;; Package/declaration no-ops (compile to nil)
+      ((member op-name '(36538461984543970    ; MAKE-PACKAGE
+                          683735621833107523   ; EXPORT
+                          979925672549573714   ; IMPORT
+                          578501138257555745   ; SHADOW
+                          1078152541798551995  ; USE-PACKAGE
+                          554740840343413101   ; FIND-PACKAGE
+                          251297473190882665   ; FIND-SYMBOL
+                          757877016639086236   ; PROVIDE
+                          313710498321880194   ; REQUIRE
+                          1094519557412445920  ; PROCLAIM
+                          90289849190648180))  ; DECLAIM
+       (compile-nil dest))
+
       (t (compile-call op (cdr form) env dest)))))
 
 ;;; ============================================================
@@ -4431,6 +4445,19 @@
 
     ;; (in-package ...) — skip, package system is SBCL-side only
     ((and (consp form) (name-eq (car form) "IN-PACKAGE"))
+     nil)
+
+    ;; Package operations — no-op (flat namespace via name hashes)
+    ((and (consp form) (member (normalize-name (car form))
+                               '(36538461984543970    ; MAKE-PACKAGE
+                                 683735621833107523   ; EXPORT
+                                 979925672549573714   ; IMPORT
+                                 578501138257555745   ; SHADOW
+                                 1078152541798551995  ; USE-PACKAGE
+                                 757877016639086236   ; PROVIDE
+                                 313710498321880194   ; REQUIRE
+                                 1094519557412445920  ; PROCLAIM
+                                 90289849190648180))) ; DECLAIM
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

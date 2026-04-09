@@ -659,6 +659,16 @@
   (deftest 2281 (point-p 42) nil))
 
 ;;; ============================================================
+;;; Packages — no-op (2300-2319)
+;;; ============================================================
+
+(defun run-package-tests ()
+  ;; Package operations are no-ops but must not crash
+  (deftest 2300 (progn (make-package "TEST-PKG") nil) nil)
+  (deftest 2301 (progn (export nil) nil) nil)
+  (deftest 2302 (progn (in-package "CL-USER") nil) nil))
+
+;;; ============================================================
 ;;; Format (2200-2249)
 ;;; ============================================================
 
@@ -761,5 +771,6 @@
   (run-rest-tests)
   (run-values-tests)
   (run-defstruct-tests)
+  (run-package-tests)
   (run-format-tests)
   (run-regression-tests))

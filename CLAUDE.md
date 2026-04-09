@@ -196,7 +196,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 These are known compiler bugs/limitations — work around them, don't try to fix:
 
-1. **3-arg `+` is broken**: Always use nested 2-arg `+`: `(+ a (+ b c))` not `(+ a b c)`
+1. **~~3-arg `+` is broken — DEBUNKED~~**: `compile-add` uses push/pop to preserve the accumulator across each operand. Tested: `(+ 60 5 7)` → 72, `(+ 10 20 30 5)` → 65 on x64 via MVM cross-compiler. Multi-arg `+` works.
 2. **~~Function arguments are clobbered — DEBUNKED~~**: `mvm-compile-function-internal` already emits `(:stack-store areg i)` for each register parameter at function entry, and marks all params as `:stack` location. Args are safe across calls. The bare-metal adapter in `build-compiler-test.lisp` does the same (line 769). No manual let-binding needed.
 3. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
 4. **18+ nested lets**: May miscompile. Split into helper functions.

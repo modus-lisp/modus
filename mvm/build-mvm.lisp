@@ -176,13 +176,24 @@
 ;;; Override register-mvm-bootstrap-macros to no-op
 (defun register-mvm-bootstrap-macros () nil)
 
-;;; Override check-arith-nesting to no-op — uses member/reduce with
-;;; SBCL symbols that can't match bare-metal (9999 . chars) symbols.
+;;; ============================================================
+;;; Interned symbol support
+;;; ============================================================
+
+;;; symbolp function — needed by the SBCL-compiled compiler code (called via CALL,
+;;; not the compiler builtin). Checks object subtag #x50.
+(defun symbolp (x)
+  (if (null x) nil
+    (if (fixnump x) nil
+      (if (consp x) nil
+        (if (stringp x) nil
+          (= (obj-subtag x) 80))))))
+
+;;; check-arith-nesting no-op — *arith-ops* defvar isn't initialized on bare metal
 (defun check-arith-nesting (op operand) nil)
 
-;;; Override flatten-arith-args — the original uses (eq (car arg) op) which
-;;; fails on bare metal (SBCL symbol vs bare-metal symbol). Use normalize-name
-;;; hash comparison instead.
+;;; Override flatten-arith-args — the original receives SBCL symbol 'LOGIOR as op,
+;;; but form heads are interned symbol objects. Use normalize-name hash comparison.
 (defun flatten-arith-args (op args)
   (let ((op-hash (normalize-name op))
         (result nil))
@@ -191,9 +202,8 @@
         (when (null tmp) (return (nreverse result)))
         (let ((arg (car tmp)))
           (if (and (consp arg)
-                   (consp (car arg))
+                   (symbolp (car arg))
                    (= (normalize-name (car arg)) op-hash))
-              ;; Recursively flatten
               (let ((inner (flatten-arith-args op (cdr arg))))
                 (let ((itmp inner))
                   (loop
@@ -202,6 +212,41 @@
                     (setq itmp (cdr itmp)))))
               (setq result (cons arg result))))
         (setq tmp (cdr tmp))))))
+
+;;; Override normalize-name — extract hash from symbol object slot 0
+(defun normalize-name (name-input)
+  (if (fixnump name-input)
+      name-input
+    (if (symbolp name-input)
+        (aref name-input 0)
+      (if (consp name-input)
+          (if (= (car name-input) 9999)
+              (compute-name-hash-from-chars (cdr name-input))
+            0)
+        0))))
+
+;;; Override sym-equal — with interned symbols, eq suffices
+(defun sym-equal (a b) (eql a b))
+
+;;; Override mksym in the reader — intern symbols instead of (cons 9999 chars)
+(defun mksym (chars)
+  (let ((hash (compute-name-hash-from-chars chars)))
+    (%intern-symbol hash)))
+
+;;; compute-name-hash-from-chars: dual-FNV-1a on a list of char codes
+(defun compute-name-hash-from-chars (chars)
+  (let ((h1 2166136261)
+        (h2 3735928559)
+        (cur chars))
+    (loop
+      (when (null cur) (return nil))
+      (let ((c (car cur)))
+        (setq h1 (logand (* (logxor h1 c) 16777619) 4294967295))
+        (setq h2 (logand (* (logxor h2 c) 805306457) 4294967295)))
+      (setq cur (cdr cur)))
+    (let ((combined (logior (ash (logand h1 1073741823) 30)
+                            (logand h2 1073741823))))
+      (if (zerop combined) 1 combined))))
 
 ;;; Override globals functions to use 0x600000 (Linux BSS)
 ;;; The build-compiler-test adapter uses 0x380000 which is below Linux load address.
@@ -661,6 +706,8 @@
 
   ;; Initialize globals table first (needed by setq/defvar)
   (init-globals-table)
+  ;; Initialize symbol intern table (needed by reader and quoted symbols)
+  (init-symbol-table)
   ;; Initialize boot stub and default output path
   (init-boot-stub)
   (init-default-out-path)

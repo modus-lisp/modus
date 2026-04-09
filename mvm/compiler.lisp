@@ -47,6 +47,7 @@
 (defconstant +subtag-bignum+ #x30)
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
+(defconstant +subtag-symbol+ #x50)
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
 (defconstant +nil-value+ #xDEAD0001)
@@ -1182,6 +1183,8 @@
       ((= op-name 1084402973118869726)  (compile-fixnump (cadr form) env dest))
       ((= op-name 105613410085771328)     (compile-atom-p (cadr form) env dest))
       ((= op-name 197121891723777229)    (compile-listp (cadr form) env dest))
+      ((= op-name 1005235261373835305)  (compile-symbolp (cadr form) env dest))
+      ((= op-name 701502595840197579) (compile-obj-subtag (cadr form) env dest))  ; obj-subtag
       ((= op-name 1091515641497713485)  (compile-bignump (cadr form) env dest))
       ((= op-name 1024588698656382250)  (compile-stringp (cadr form) env dest))
       ((= op-name 959229030243575902)   (compile-arrayp (cadr form) env dest))
@@ -1291,6 +1294,9 @@
       ;; --- Function Address ---
       ((= op-name 532864888570260201)          (compile-fn-addr (cadr form) dest))
 
+      ;; --- Symbol allocation ---
+      ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
+
       ;; --- Array Operations ---
       ((= op-name 686483400154579705)       (compile-make-array (cadr form) env dest))
       ((= op-name 568601634040735695)             (compile-aref (cadr form) (caddr form) env dest))
@@ -1318,9 +1324,13 @@
      (compile-character value dest))
     ((keywordp value)
      (compile-keyword value dest))
-    ;; Non-keyword symbol: store as tagged name hash
+    ;; Non-keyword symbol: intern at runtime to produce a real symbol object.
+    ;; Emits: LI V0, hash; CALL %INTERN-SYMBOL; MOV dest, VR
     ((symbolp value)
-     (emit-ir :li dest (ash (normalize-name value) +fixnum-shift+)))
+     (emit-ir :li +vreg-v0+ (ash (normalize-name value) +fixnum-shift+))
+     (emit-ir :call "%INTERN-SYMBOL" 1)
+     (unless (= dest +vreg-vr+)
+       (emit-ir :mov dest +vreg-vr+)))
     ;; Cons cell: proper lists built iteratively, dotted pairs recursively
     ((consp value)
      (if (and (listp (cdr (last value)))  ; proper list check
@@ -2751,6 +2761,17 @@
     (free-temp-reg)
     (free-temp-reg)))
 
+(defun compile-obj-subtag (arg env dest)
+  "Compile (obj-subtag x) — extract subtag from object header as tagged fixnum."
+  (let ((temp (alloc-temp-reg)))
+    (compile-form arg env temp)
+    (emit-ir :obj-subtag dest temp)
+    (free-temp-reg)))
+
+(defun compile-symbolp (arg env dest)
+  "Compile (symbolp x) - true if object with symbol subtag #x50"
+  (compile-object-subtype-p arg env dest +subtag-symbol+))
+
 (defun compile-stringp (arg env dest)
   "Compile (stringp x)"
   (compile-object-subtype-p arg env dest +subtag-string+))
@@ -3357,6 +3378,11 @@
 ;;; ============================================================
 ;;; Array Operations
 ;;; ============================================================
+
+(defun compile-make-symbol (dest)
+  "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
+   Returns an uninitialized symbol object; caller stores name-hash in slot 0."
+  (emit-ir :alloc-obj dest 1 +subtag-symbol+))
 
 (defun compile-make-array (size-form env dest)
   "Compile (make-array size).

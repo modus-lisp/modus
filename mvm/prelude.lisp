@@ -592,6 +592,34 @@
             (setq cur (cdr cur)))))))
 
 ;;; ============================================================
+;;; Interned Symbols
+;;; ============================================================
+;;;
+;;; Symbols are 1-slot objects with subtag #x50.
+;;;   Slot 0: name-hash (tagged fixnum, dual-FNV-1a)
+;;;
+;;; The intern table at 0x620000 maps name-hash → symbol object.
+;;; %intern-symbol is called by compile-quote for every quoted symbol
+;;; and by the reader's mksym for every parsed symbol.
+;;; Since intern returns the same object for the same name, eq works.
+
+(defun init-symbol-table ()
+  "Initialize the intern table at 0x620000."
+  (setf (mem-ref #x620000 :u64) (make-hash-table)))
+
+(defun %intern-symbol (name-hash)
+  "Intern a symbol by name hash. Returns existing symbol if already interned.
+   Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate."
+  (let ((table (mem-ref #x620000 :u64)))
+    (let ((existing (gethash name-hash table)))
+      (if existing
+          existing
+          (let ((sym (%make-symbol)))
+            (aset sym 0 name-hash)
+            (puthash name-hash table sym)
+            sym)))))
+
+;;; ============================================================
 ;;; Error handling (bare-metal stubs)
 ;;; ============================================================
 ;;;

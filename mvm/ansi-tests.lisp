@@ -554,9 +554,15 @@
   (deftest 750 (funcall (function my-apply-fn) 5) 15)
   ;; funcall with identity-like function
   (deftest 751 (funcall (function test-helper-identity) 42) 42)
-  ;; NOTE: lambda closures with funcall don't work yet (CALL-IND issue)
-  ;; This limits RT to eager deftest or named-thunk approach
-  )
+  ;; Lambda (no captures)
+  (deftest 752 (funcall (lambda () 42)) 42)
+  ;; Lambda with args
+  (deftest 753 (funcall (lambda (x) (+ x 10)) 5) 15)
+  ;; Store lambda, call later
+  (deftest 754 (let ((f (lambda () (+ 1 2)))) (funcall f)) 3)
+  ;; Lambda returning multiple values
+  (deftest 755 (multiple-value-bind (a b) (funcall (lambda () (values 10 20)))
+                 (+ a b)) 30))
 
 ;;; ============================================================
 ;;; &rest parameters (2100-2149)

@@ -1553,15 +1553,21 @@
 
 (defun compile-lambda (params body env dest)
   "Compile (lambda (params) body*).
-   Creates a closure-like function. Passes outer environment through
-   so closure variables can be resolved (they'll reference outer stack slots)."
+   Creates a named function for the lambda body. Registers it in the
+   function table so FN-ADDR can resolve the bytecode offset to a
+   native address for CALL-IND."
   (let* ((pp (preprocess-params params body))
          (lambda-name (format nil "~A$$LAMBDA~D"
                                (or *current-function-name* "ANON")
                                (make-compiler-label)))
-         (fn-info (mvm-compile-function-internal lambda-name (car pp) (cdr pp) env)))
-    ;; Load function reference into dest
-    ;; This will be resolved to a bytecode offset during linking
+         (result (mvm-compile-function-internal lambda-name (car pp) (cdr pp) env))
+         (info (car result)))
+    ;; Register in function table (like compile-flet does)
+    (setf (gethash (function-info-name info) *functions*) info)
+    (push info *function-table*)
+    ;; Save IR for collection by mvm-compile-all
+    (push result *pending-flet-ir*)
+    ;; Load function address into dest
     (emit-ir :li-func dest lambda-name)))
 
 ;;; ============================================================

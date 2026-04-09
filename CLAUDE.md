@@ -203,7 +203,7 @@ These are known compiler bugs/limitations — work around them, don't try to fix
 5. **~~25+ sequential forms — DEBUNKED**: Tested up to 1000 sequential forms on x64, i386, and AArch64 — all pass. Functions previously split for this reason were likely hitting the nested-let or nested-logior bugs instead. Sequential form count is not a compiler limitation.
 6. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 7. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-8. **Nested logior/logand/ash at depth 4+**: 3 levels of nesting work correctly, but 4+ levels produce wrong values. Tested: `(logior a (logior (ash b 8) (ash c 16)))` → correct. `(logior a (logior (ash b 8) (logior (ash c 16) (ash d 24))))` → wrong (bytes 05,02,03,00 instead of 01,02,03,04). Root cause is push/pop stack interference at 3+ simultaneous pushes. Workaround: pre-compute shift values into let bindings, use multi-arg `(logior s0 s1 s2 s3)`.
+8. **~~Nested logior/logand/ash clobber — FIXED~~**: Was caused by `flatten-arith-args` using `eq` to compare SBCL symbols against bare-metal `(9999 . chars)` symbols — nested logior was never flattened on bare metal. Fixed: override uses `normalize-name` hash comparison. Tested 6-level nesting with correct results.
 
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 

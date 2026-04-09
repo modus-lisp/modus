@@ -176,12 +176,32 @@
 ;;; Override register-mvm-bootstrap-macros to no-op
 (defun register-mvm-bootstrap-macros () nil)
 
-;;; Override check-arith-nesting to no-op — the push/pop mechanism in
-;;; compile-add/compile-logior etc. correctly preserves the accumulator
-;;; at all nesting depths (tested: 20-arg + with 20 nested lets = correct).
-;;; The SBCL version crashes on bare metal due to member/reduce using
+;;; Override check-arith-nesting to no-op — uses member/reduce with
 ;;; SBCL symbols that can't match bare-metal (9999 . chars) symbols.
 (defun check-arith-nesting (op operand) nil)
+
+;;; Override flatten-arith-args — the original uses (eq (car arg) op) which
+;;; fails on bare metal (SBCL symbol vs bare-metal symbol). Use normalize-name
+;;; hash comparison instead.
+(defun flatten-arith-args (op args)
+  (let ((op-hash (normalize-name op))
+        (result nil))
+    (let ((tmp args))
+      (loop
+        (when (null tmp) (return (nreverse result)))
+        (let ((arg (car tmp)))
+          (if (and (consp arg)
+                   (consp (car arg))
+                   (= (normalize-name (car arg)) op-hash))
+              ;; Recursively flatten
+              (let ((inner (flatten-arith-args op (cdr arg))))
+                (let ((itmp inner))
+                  (loop
+                    (when (null itmp) (return nil))
+                    (setq result (cons (car itmp) result))
+                    (setq itmp (cdr itmp)))))
+              (setq result (cons arg result))))
+        (setq tmp (cdr tmp))))))
 
 ;;; Override globals functions to use 0x600000 (Linux BSS)
 ;;; The build-compiler-test adapter uses 0x380000 which is below Linux load address.

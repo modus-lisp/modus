@@ -77,6 +77,37 @@
         (print-dec id)
         (write-char-serial 10))))
 
+(defun rt-run-test (name actual expected)
+  "Run a single RT-style test. NAME is a symbol, ACTUAL is the form result,
+   EXPECTED is the expected value. Compares using rt-equal."
+  (setq *rt-test-count* (+ *rt-test-count* 1))
+  (if (rt-equal actual expected)
+      (setq *rt-pass-count* (+ *rt-pass-count* 1))
+      (progn
+        (setq *rt-fail-count* (+ *rt-fail-count* 1))
+        (write-char-serial 70)   ; F
+        (write-char-serial 65)   ; A
+        (write-char-serial 73)   ; I
+        (write-char-serial 76)   ; L
+        (write-char-serial 32)   ; space
+        (write-object name)
+        (write-char-serial 10))))
+
+(defun rt-run-test-mv (name actuals expecteds)
+  "Run a multi-value RT test. ACTUALS and EXPECTEDS are lists."
+  (setq *rt-test-count* (+ *rt-test-count* 1))
+  (if (rt-equal actuals expecteds)
+      (setq *rt-pass-count* (+ *rt-pass-count* 1))
+      (progn
+        (setq *rt-fail-count* (+ *rt-fail-count* 1))
+        (write-char-serial 70)
+        (write-char-serial 65)
+        (write-char-serial 73)
+        (write-char-serial 76)
+        (write-char-serial 32)
+        (write-object name)
+        (write-char-serial 10))))
+
 (defun do-tests ()
   "Print test summary. Returns fail count (0 = all pass)."
   (write-char-serial 10)

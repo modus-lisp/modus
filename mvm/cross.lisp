@@ -192,6 +192,16 @@
          (if (= word-size 8)
              (mvm-emit-u64 buf (ash constant 1))  ; tagged fixnum
              (mvm-emit-u32 buf (ash constant 1))))
+        (float
+         ;; Floats not supported on bare metal — store as 0
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
+        (ratio
+         ;; Ratios not supported — store as 0
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
         (string
          ;; String object: [header:word | chars...]
          ;; NOTE: constant pool strings are NOT fully functional.

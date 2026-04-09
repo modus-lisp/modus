@@ -121,11 +121,13 @@
 
 (defstruct function-info
   name            ; symbol or string
-  param-count     ; number of formal parameters
+  param-count     ; number of formal parameters (including &rest as 1)
   bytecode-offset ; offset in the module bytecode vector
   bytecode-length ; length of this function's bytecode
   stack-frame-size ; number of stack slots used
-  source-location) ; string describing where defined (e.g. "form#123")
+  source-location ; string describing where defined (e.g. "form#123")
+  rest-param-p    ; T if function has &rest parameter
+  required-count) ; number of required params (before &rest)
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -1846,6 +1848,43 @@
                  do (push (car rest) (loop-state-finally-forms state))
                     (setf rest (cdr rest))))
 
+          ;; ALWAYS expr
+          ((= kw 1091564327776232814)
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :always expr))
+             (setf rest (cddr rest))))
+
+          ;; NEVER expr (same as always (not expr))
+          ((= kw 870389735836749037)
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :always `(not ,expr)))
+             (setf rest (cddr rest))))
+
+          ;; THEREIS expr
+          ((= kw 212607784983936827)
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :thereis expr))
+             (setf rest (cddr rest))))
+
+          ;; UNLESS cond DO body | COLLECT expr
+          ((= kw 123360604517422061)
+           (let ((cond-form (cadr rest)))
+             (setf rest (cddr rest))
+             (let ((action-kw (and rest (normalize-name (car rest)))))
+               (cond
+                 ((or (= action-kw 32547421316216284) (= action-kw 942546142429891564))
+                  (setf rest (cdr rest))
+                  (let ((action-form (car rest)))
+                    (push `(unless ,cond-form ,action-form) (loop-state-body-forms state))
+                    (setf rest (cdr rest))))
+                 ((or (= action-kw 204640710178503481) (= action-kw 1066799008902276193))
+                  (let ((expr (cadr rest)))
+                    (setf (loop-state-accumulator state) (list :collect-when `(not ,cond-form) expr))
+                    (setf rest (cddr rest))))
+                 (t
+                  (push `(unless ,cond-form ,(car rest)) (loop-state-body-forms state))
+                  (setf rest (cdr rest)))))))
+
           ;; RETURN expr
           ((= kw 732905726022713733)
            (push `(return ,(cadr rest)) (loop-state-body-forms state))
@@ -1880,8 +1919,8 @@
     (dolist (wb with-binds)
       (push wb bindings))
 
-    ;; Accumulator binding
-    (when acc
+    ;; Accumulator binding (always/thereis don't need one)
+    (when (and acc (member (car acc) '(:collect :collect-when :sum :count)))
       (push (list acc-var (case (car acc)
                             (:collect nil)
                             (:collect-when nil)
@@ -1976,7 +2015,12 @@
                  (list `(setq ,acc-var (+ ,acc-var ,(cadr acc)))))
                 (:count
                  (list `(when ,(cadr acc)
-                          (setq ,acc-var (+ ,acc-var 1)))))))))
+                          (setq ,acc-var (+ ,acc-var 1)))))
+                (:always
+                 (list `(unless ,(cadr acc) (return nil))))
+                (:thereis
+                 (list `(let ((,acc-var ,(cadr acc)))
+                          (when ,acc-var (return ,acc-var)))))))))
 
       ;; Construct the final form
       ;; (let* (bindings...)
@@ -1995,17 +2039,39 @@
                                 acc-body
                                 (nreverse step-stmts)))
              (inner `(loop ,@loop-body))
+             ;; For always/thereis: rewrite iteration-end returns
+             ;; The test-forms have (return nil) for exhaustion — we need
+             ;; (return t) for always (all passed) and (return nil) for thereis (not found)
+             (final-test-forms
+               (if (and acc (eq (car acc) :always))
+                   ;; Replace (return nil) with (return t) in iteration terminators
+                   (mapcar (lambda (tf)
+                             (if (and (consp tf) (eq (car tf) 'if)
+                                      (equal (caddr tf) '(return nil)))
+                                 `(if ,(cadr tf) (return t))
+                                 tf))
+                           loop-body)
+                   loop-body))
+             (inner2 (if (eq final-test-forms loop-body)
+                         inner
+                         `(loop ,@final-test-forms)))
              (result (cond
                        ;; Collect returns reversed list (nreverse in prelude)
                        ((and acc (member (car acc) '(:collect :collect-when)))
-                        `(progn ,inner ,@finally (nreverse ,acc-var)))
+                        `(progn ,inner2 ,@finally (nreverse ,acc-var)))
                        ;; Sum/count returns accumulator
                        ((and acc (member (car acc) '(:sum :count)))
-                        `(progn ,inner ,@finally ,acc-var))
+                        `(progn ,inner2 ,@finally ,acc-var))
+                       ;; Always: loop returns t/nil directly
+                       ((and acc (eq (car acc) :always))
+                        (if finally `(progn ,inner2 ,@finally) inner2))
+                       ;; Thereis: loop returns value/nil directly
+                       ((and acc (eq (car acc) :thereis))
+                        (if finally `(progn ,inner2 ,@finally) inner2))
                        ;; No accumulator
                        (finally
-                        `(progn ,inner ,@finally nil))
-                       (t inner))))
+                        `(progn ,inner2 ,@finally nil))
+                       (t inner2))))
         (if bindings
             `(let* ,(nreverse bindings) ,result)
             result)))))
@@ -3465,6 +3531,22 @@
    exhausting temp registers when args contain nested function calls.
    Caller-saved temp registers (V5-V8) are saved/restored around the CALL
    to prevent clobbering live variables in those registers."
+  ;; &rest transformation: if the target function has &rest, cons up extra args
+  ;; (foo 1 2 3 4) where foo has (a b &rest r) → (foo 1 2 (cons 3 (cons 4 nil)))
+  (when (and (symbolp fn) (boundp '*functions*) *functions*)
+    (let* ((fn-name (symbol-name fn))
+           (fn-info (gethash fn-name *functions*)))
+      (when (and fn-info (function-info-rest-param-p fn-info))
+        (let ((req (function-info-required-count fn-info))
+              (nargs (length args)))
+          (when (>= nargs req)
+            (let ((required-args (subseq args 0 req))
+                  (rest-args (nthcdr req args)))
+              ;; Build (cons a (cons b ... nil)) form for rest args
+              (let ((rest-form nil))
+                (dolist (a (reverse rest-args))
+                  (setf rest-form `(cons ,a ,rest-form)))
+                (setf args (append required-args (list rest-form))))))))))
   (let ((nargs (length args))
         ;; Save the current temp count BEFORE arg evaluation.
         ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).
@@ -3548,14 +3630,15 @@
   (let ((mode :required)
         (required nil)
         (optional nil)
-        (keys nil))
+        (keys nil)
+        (has-rest nil))
     ;; Parse parameter list
     (dolist (p params)
       (cond
         ((eq p '&optional) (setq mode :optional))
         ((eq p '&key)      (setq mode :key))
-        ((eq p '&rest)     (setq mode :rest))
-        ((eq p '&body)     (setq mode :rest))
+        ((eq p '&rest)     (setq mode :rest) (setq has-rest t))
+        ((eq p '&body)     (setq mode :rest) (setq has-rest t))
         ((eq p '&allow-other-keys) nil) ; skip
         ((eq mode :required) (push p required))
         ((eq mode :optional)
@@ -3572,8 +3655,8 @@
     (setf required (nreverse required))
     (setf optional (nreverse optional))
     (setf keys (nreverse keys))
-    ;; If no &optional or &key, return unchanged
-    (if (and (null optional) (null keys))
+    ;; If no &optional, &key, or &rest, return unchanged
+    (if (and (null optional) (null keys) (not has-rest))
         (cons params body)
         ;; Build new parameter list: required + optional param names
         (let ((new-params (append required (mapcar #'car optional)))
@@ -4222,8 +4305,16 @@
     ;; (defun name (params) body...)
     ((and (consp form) (name-eq (car form) "DEFUN"))
      (destructuring-bind (name params &body body) (cdr form)
-       (let ((pp (preprocess-params params body)))
-         (mvm-compile-function name (car pp) (cdr pp)))))
+       ;; Detect &rest before preprocessing strips it
+       (let ((rest-pos (position '&rest params))
+             (pp (preprocess-params params body)))
+         (let ((result (mvm-compile-function name (car pp) (cdr pp))))
+           ;; Record &rest info in function-info
+           (when rest-pos
+             (let ((info (car result)))
+               (setf (function-info-rest-param-p info) t)
+               (setf (function-info-required-count info) rest-pos)))
+           result))))
 
     ;; (defvar name &optional value)
     ((and (consp form) (name-eq (car form) "DEFVAR"))

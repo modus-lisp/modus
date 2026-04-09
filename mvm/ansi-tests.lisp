@@ -484,6 +484,113 @@
 
 
 ;;; ============================================================
+;;; Chapter 6: Iteration — CL LOOP (2000-2099)
+;;; ============================================================
+
+(defun run-cl-loop-tests ()
+  ;; for/from/to
+  (deftest 2000 (loop for i from 1 to 5 collect i)
+                (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil))))))
+  ;; for/from/below
+  (deftest 2001 (loop for i from 0 below 3 collect i)
+                (cons 0 (cons 1 (cons 2 nil))))
+  ;; for/in
+  (deftest 2002 (loop for x in (cons 10 (cons 20 (cons 30 nil))) collect x)
+                (cons 10 (cons 20 (cons 30 nil))))
+  ;; sum
+  (deftest 2010 (loop for i from 1 to 10 sum i) 55)
+  ;; count
+  (deftest 2011 (loop for i from 1 to 10 count (> i 5)) 5)
+  ;; when/do
+  (deftest 2012 (loop for i from 1 to 6 when (> i 3) collect i)
+                (cons 4 (cons 5 (cons 6 nil))))
+
+  ;; always — all satisfy
+  (deftest 2020 (loop for x in (cons 2 (cons 4 (cons 6 nil))) always (> x 0)) t)
+  ;; always — not all satisfy
+  (deftest 2021 (loop for x in (cons 2 (cons -1 (cons 6 nil))) always (> x 0)) nil)
+  ;; always — empty list
+  (deftest 2022 (loop for x in nil always (> x 0)) t)
+
+  ;; thereis — found
+  (deftest 2030 (loop for x in (cons 1 (cons 2 (cons 3 nil))) thereis (> x 1)) t)
+  ;; thereis — not found
+  (deftest 2031 (loop for x in (cons 1 (cons 2 (cons 3 nil))) thereis (> x 10)) nil)
+
+  ;; never (= always not)
+  (deftest 2040 (loop for x in (cons 1 (cons 2 (cons 3 nil))) never (< x 0)) t)
+  (deftest 2041 (loop for x in (cons 1 (cons -1 (cons 3 nil))) never (< x 0)) nil)
+
+  ;; unless/do
+  (deftest 2050 (loop for i from 1 to 5
+                      unless (= i 3) collect i)
+                (cons 1 (cons 2 (cons 4 (cons 5 nil)))))
+
+  ;; for/on (iterate over tails)
+  (deftest 2060 (let ((n 0))
+                  (loop for tail on (cons 1 (cons 2 (cons 3 nil)))
+                        do (setq n (+ n 1)))
+                  n)
+                3)
+
+  ;; with binding
+  (deftest 2070 (loop with x = 10
+                      for i from 1 to 3
+                      collect (+ x i))
+                (cons 11 (cons 12 (cons 13 nil))))
+
+  ;; for/from downto
+  (deftest 2080 (loop for i from 5 downto 1 collect i)
+                (cons 5 (cons 4 (cons 3 (cons 2 (cons 1 nil)))))))
+
+;;; ============================================================
+;;; Chapter 5: Funcall (750-799)
+;;; ============================================================
+
+(defun my-apply-fn (x) (+ x 10))
+
+(defun run-funcall-tests ()
+  ;; Basic funcall with #'
+  (deftest 750 (funcall (function my-apply-fn) 5) 15)
+  ;; funcall with identity-like function
+  (deftest 751 (funcall (function test-helper-identity) 42) 42))
+
+;;; ============================================================
+;;; &rest parameters (2100-2149)
+;;; ============================================================
+
+(defun rest-test-0 (&rest args) args)
+(defun rest-test-1 (a &rest args) (cons a args))
+(defun rest-test-2 (a b &rest args) (cons a (cons b args)))
+(defun rest-sum (&rest args)
+  (let ((total 0))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return total))
+        (setq total (+ total (car cur)))
+        (setq cur (cdr cur))))))
+
+(defun run-rest-tests ()
+  ;; No args → nil
+  (deftest 2100 (rest-test-0) nil)
+  ;; One arg → (a)
+  (deftest 2101 (rest-test-0 42) (cons 42 nil))
+  ;; Multiple args → list
+  (deftest 2102 (rest-test-0 1 2 3) (cons 1 (cons 2 (cons 3 nil))))
+  ;; One required + empty rest
+  (deftest 2110 (rest-test-1 10) (cons 10 nil))
+  ;; One required + rest args
+  (deftest 2111 (rest-test-1 10 20 30) (cons 10 (cons 20 (cons 30 nil))))
+  ;; Two required + empty rest
+  (deftest 2120 (rest-test-2 1 2) (cons 1 (cons 2 nil)))
+  ;; Two required + rest args
+  (deftest 2121 (rest-test-2 1 2 3 4) (cons 1 (cons 2 (cons 3 (cons 4 nil)))))
+  ;; Variadic sum
+  (deftest 2130 (rest-sum 1 2 3 4 5) 15)
+  (deftest 2131 (rest-sum) 0)
+  (deftest 2132 (rest-sum 42) 42))
+
+;;; ============================================================
 ;;; Regression tests (9000+)
 ;;; Tests for previously-fixed bugs
 ;;; ============================================================
@@ -563,4 +670,7 @@
   (run-type-tests)
   (run-array-tests)
   (run-hash-table-tests)
+  (run-cl-loop-tests)
+  (run-funcall-tests)
+  (run-rest-tests)
   (run-regression-tests))

@@ -25,6 +25,55 @@
 
 
 ;;; ============================================================
+;;; ANSI-AUX helpers (from Paul Dietz test suite)
+;;; ============================================================
+
+(defun eqt (a b)
+  "Like eq but returns exactly T (not just truthy)."
+  (if (eq a b) t nil))
+
+(defun eqlt (a b)
+  "Like eql but returns exactly T."
+  (if (eql a b) t nil))
+
+(defun equalt (a b)
+  "Like my-equal but returns exactly T."
+  (if (my-equal a b) t nil))
+
+(defun notnot (x)
+  "Coerce to boolean: nil → nil, anything else → t."
+  (if x t nil))
+
+;;; ============================================================
+;;; Real ANSI Tests — from Paul Dietz cons/cons.lsp
+;;; ============================================================
+
+(defun run-real-ansi-cons-tests ()
+  ;; cons-of-symbols: (cons 'a 'b) → (a . b)
+  (deftest 3001 (let ((r (cons (quote a) (quote b))))
+                  (if (and (eq (car r) (quote a)) (eq (cdr r) (quote b))) t nil)) t)
+
+  ;; cons-with-nil: (cons 'a nil) → (a)
+  (deftest 3002 (let ((r (cons (quote a) nil)))
+                  (if (and (eq (car r) (quote a)) (null (cdr r))) t nil)) t)
+
+  ;; cons-eq-equal: two cons calls produce equal but not eq results
+  (deftest 3003 (let ((x (cons (quote a) (quote b)))
+                      (y (cons (quote a) (quote b))))
+                  (and (not (eqt x y)) (equalt x y))) t)
+
+  ;; cons-equal-list: cons chain equals list
+  (deftest 3004 (equalt (cons (quote a) (cons (quote b) (cons (quote c) nil)))
+                        (list (quote a) (quote b) (quote c))) t)
+
+  ;; cons.order.1: evaluation order preserved
+  (deftest 3005 (let ((i 0))
+                  (let ((result (cons (progn (setq i (+ i 1)) i)
+                                     (progn (setq i (+ i 1)) i))))
+                    (if (and (= (car result) 1) (= (cdr result) 2) (= i 2))
+                        t nil))) t))
+
+;;; ============================================================
 ;;; Chapter 14: Conses (1400-1499)
 ;;; ============================================================
 
@@ -761,6 +810,7 @@
 ;;; ============================================================
 
 (defun run-all-tests ()
+  (run-real-ansi-cons-tests)
   (run-cons-tests)
   (run-list-tests)
   (run-arithmetic-tests)

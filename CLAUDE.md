@@ -199,7 +199,7 @@ These are known compiler bugs/limitations — work around them, don't try to fix
 1. **~~3-arg `+` is broken — DEBUNKED~~**: `compile-add` uses push/pop to preserve the accumulator across each operand. Tested: `(+ 60 5 7)` → 72, `(+ 10 20 30 5)` → 65 on x64 via MVM cross-compiler. Multi-arg `+` works.
 2. **~~Function arguments are clobbered — DEBUNKED~~**: `mvm-compile-function-internal` already emits `(:stack-store areg i)` for each register parameter at function entry, and marks all params as `:stack` location. Args are safe across calls. The bare-metal adapter in `build-compiler-test.lisp` does the same (line 769). No manual let-binding needed.
 3. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
-4. **18+ nested lets**: May miscompile. Split into helper functions.
+4. **~~18+ nested lets — DEBUNKED~~**: Tested 30 nested single-binding lets on x64 via MVM cross-compiler — all pass. Previous failures were from unbalanced test parens and `check-arith-nesting` calling `reduce` (not available on bare metal, now overridden to no-op).
 5. **~~25+ sequential forms — DEBUNKED**: Tested up to 1000 sequential forms on x64, i386, and AArch64 — all pass. Functions previously split for this reason were likely hitting the nested-let or nested-logior bugs instead. Sequential form count is not a compiler limitation.
 6. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 7. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.

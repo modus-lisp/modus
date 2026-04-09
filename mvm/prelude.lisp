@@ -319,6 +319,18 @@
 ;;; Equality
 ;;; ============================================================
 
+(defun string-equal (a b)
+  "Compare two strings for equality, element by element."
+  (let ((len-a (array-length a)))
+    (if (= len-a (array-length b))
+        (let ((i 0))
+          (loop
+            (when (= i len-a) (return t))
+            (unless (= (aref a i) (aref b i))
+              (return nil))
+            (setq i (+ i 1))))
+        nil)))
+
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,
    element-wise for strings."

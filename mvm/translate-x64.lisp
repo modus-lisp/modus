@@ -1199,44 +1199,52 @@
 
         ((op= +op-consp+)
          ;; (consp Vd Vs) — test low bit for cons tag (0x01)
+         ;; Must exclude NIL (0xDEAD0001 has cons tag but is not a cons)
          ;; Result: T or NIL in Vd
          (let* ((vd (first operands))
                 (vs (second operands))
                 (d (dest-phys-or-scratch vd))
+                (false-label (make-label))
                 (true-label (make-label))
                 (end-label (make-label)))
            (emit-load-vreg buf vs d)
+           ;; Check for nil first: nil is NOT a cons
+           (emit-cmp-reg-reg buf d 'r15)
+           (emit-jcc buf :e false-label)
            ;; Test low 4 bits: AND with 0x0F, compare to 0x01
-           (emit-and-reg-imm buf d #x0F)
-           (emit-cmp-reg-imm buf d 1)
-           (emit-jcc buf :e true-label)
+           (let ((scratch d))
+             (emit-and-reg-imm buf scratch #x0F)
+             (emit-cmp-reg-imm buf scratch 1)
+             (emit-jcc buf :e true-label))
            ;; Not a cons: load NIL
+           (emit-label buf false-label)
            (emit-mov-reg-reg buf d 'r15)
            (emit-jmp buf end-label)
-           ;; Is a cons: load T placeholder
+           ;; Is a cons: load T
            (emit-label buf true-label)
-           ;; T is typically at a known address; for now use a tagged marker
-           ;; that the runtime will recognise.  We use ~NIL (all bits set
-           ;; except low 4 = object tag 0x09) as a portable T indicator.
            (emit-mov-reg-imm buf d #xDEAD1009)
            (emit-label buf end-label)
            (maybe-store-scratch buf vd)))
 
         ((op= +op-atom+)
-         ;; (atom Vd Vs) — opposite of consp
+         ;; (atom Vd Vs) — opposite of consp, but nil IS an atom
          (let* ((vd (first operands))
                 (vs (second operands))
                 (d (dest-phys-or-scratch vd))
                 (true-label (make-label))
                 (end-label (make-label)))
            (emit-load-vreg buf vs d)
+           ;; Check for nil first: nil IS an atom
+           (emit-cmp-reg-reg buf d 'r15)
+           (emit-jcc buf :e true-label)
+           ;; Test low 4 bits
            (emit-and-reg-imm buf d #x0F)
            (emit-cmp-reg-imm buf d 1)
            (emit-jcc buf :ne true-label)
            ;; Is a cons → atom returns NIL
            (emit-mov-reg-reg buf d 'r15)
            (emit-jmp buf end-label)
-           ;; Not a cons → atom returns T
+           ;; Not a cons (or nil) → atom returns T
            (emit-label buf true-label)
            (emit-mov-reg-imm buf d #xDEAD1009)
            (emit-label buf end-label)

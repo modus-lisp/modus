@@ -197,21 +197,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 These are known compiler bugs/limitations — work around them, don't try to fix:
 
 1. **3-arg `+` is broken**: Always use nested 2-arg `+`: `(+ a (+ b c))` not `(+ a b c)`
-2. **Function arguments are clobbered by ANY function call**: Args live in registers (RSI, RDI, R8, R9) and are never spilled to the stack frame. After calling any function, all arg values are garbage. Always `let`-bind args at function entry if they're used after a call:
-   ```lisp
-   ;; BAD: args ssh, payload are in registers, clobbered after first call
-   (defun handle (ssh payload)
-     (some-fn payload)      ; payload works here
-     (other-fn ssh))        ; ssh is GARBAGE — clobbered by some-fn
-
-   ;; GOOD: let-bind args to frame slots immediately
-   (defun handle (ssh payload)
-     (let ((s ssh))
-       (let ((p payload))
-         (some-fn p)         ; p is in frame slot, survives calls
-         (other-fn s))))     ; s is in frame slot, survives calls
-   ```
-   This also applies to `set-car`/`set-cdr` with function call args — pre-compute to a let binding.
+2. **~~Function arguments are clobbered — DEBUNKED~~**: `mvm-compile-function-internal` already emits `(:stack-store areg i)` for each register parameter at function entry, and marks all params as `:stack` location. Args are safe across calls. The bare-metal adapter in `build-compiler-test.lisp` does the same (line 769). No manual let-binding needed.
 3. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
 4. **18+ nested lets**: May miscompile. Split into helper functions.
 5. **~~25+ sequential forms — DEBUNKED**: Tested up to 1000 sequential forms on x64, i386, and AArch64 — all pass. Functions previously split for this reason were likely hitting the nested-let or nested-logior bugs instead. Sequential form count is not a compiler limitation.

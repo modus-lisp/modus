@@ -560,46 +560,35 @@
             (let ((bytes (code-buffer-bytes buf)))
               (cons bytes pos))))))))
 
-;;; Override td-translate-one-fn: fix arg clobber in multi-binding let
-;;; The original uses (let ((buf (car ctx)) (bytecode (car (cdr ctx))) ...))
-;;; which clobbers ctx after the first (car ctx) call.
+;;; Override td-translate-one-fn
+;;; Skips zero-fill loop (Linux mmap returns zeroed pages) and inlines prologue.
 (defun td-translate-one-fn (ctx fn-label offset len)
-  ;; Bind all args to frame slots IMMEDIATELY (arg clobber prevention)
-  (let ((c ctx))
-    (let ((fl fn-label))
-      (let ((off offset))
-        (let ((ln len))
-          (write-char-serial 33) ;; ! — args saved
-          ;; Now extract from ctx safely
-          (let ((buf (car c)))
-            (let ((bytecode (cadr c)))
-              (let ((fn-offset-to-label (cddr c)))
-                (let ((state (make-translate-state)))
-                  (set-translate-state-buf state buf)
-                  (set-translate-state-mvm-bytes state bytecode)
-                  (set-translate-state-mvm-length state ln)
-                  (set-translate-state-mvm-offset state off)
-                  (set-translate-state-function-table state fn-offset-to-label)
-                  ;; Emit function label
-                  (let ((lpos (code-buffer-position buf)))
-                    (aset fl 1 lpos)
-                    (let ((labels-ht (code-buffer-labels buf)))
-                      (puthash fl labels-ht lpos)))
-                  ;; Emit prologue
-                  (emit-function-prologue buf)
-                  ;; Set up array-based position labels
-                  (setq *td-label-array* (make-array ln))
-                  (let ((zi 0))
-                    (loop
-                      (when (>= zi ln) (return nil))
-                      (let ((dummy (aset *td-label-array* zi 0)))
-                        dummy)
-                      (setq zi (+ zi 1))))
-                  (setq *td-label-base* off)
-                  ;; Pre-scan branch targets
-                  (scan-branch-targets state)
-                  ;; Translate instructions
-                  (td-translate-fn-body state))))))))))
+  (let ((buf (car ctx))
+        (bytecode (car (cdr ctx)))
+        (fn-ot (cdr (cdr ctx))))
+    (let ((state (make-translate-state)))
+      (set-translate-state-buf state buf)
+      (set-translate-state-mvm-bytes state bytecode)
+      (set-translate-state-mvm-length state len)
+      (set-translate-state-mvm-offset state offset)
+      (set-translate-state-function-table state fn-ot)
+      ;; Emit function label
+      (let ((lpos (code-buffer-position buf)))
+        (aset fn-label 1 lpos)
+        (let ((labels-ht (code-buffer-labels buf)))
+          (puthash fn-label labels-ht lpos)))
+      ;; Emit prologue (inlined — avoids extra call overhead)
+      (emit-push buf (quote rbp))
+      (emit-mov-reg-reg buf (quote rbp) (quote rsp))
+      (emit-sub-reg-imm buf (quote rsp) 1120)
+      (emit-mov-mem-reg buf (quote rbp) (quote rbx) -8)
+      ;; Set up position labels array (no zero-fill needed — mmap gives zeroed pages)
+      (let ((la (make-array len)))
+        (setq *td-label-array* la)
+        (setq *td-label-base* offset))
+      ;; Pre-scan branch targets + translate
+      (scan-branch-targets state)
+      (td-translate-fn-body state))))
 
 ;;; Default output path initialized by init-default-out-path
 
@@ -751,27 +740,8 @@
                     (setq *td-label-base* 0)
                     (setq *td-fn-label-array* (make-array (+ bc-len 256)))
 
-                    ;; For now, produce a minimal native code stub
-                    ;; that exits with code 0 (proves end-to-end pipeline)
-                    ;; sys-exit(0): mov rdi,0; mov rax,60; syscall
-                    (let ((nc (make-array 32))
-                          (native-len 0))
-                      ;; Prologue (matching translator's emit-function-prologue)
-                      (aset nc 0 #x55)              ;; push rbp
-                      (aset nc 1 #x48) (aset nc 2 #x89) (aset nc 3 #xE5) ;; mov rbp,rsp
-                      (aset nc 4 #x48) (aset nc 5 #x81) (aset nc 6 #xEC) ;; sub rsp, 0x460
-                      (aset nc 7 #x60) (aset nc 8 #x04) (aset nc 9 #x00) (aset nc 10 #x00)
-                      ;; mov rdi,0 (exit code)
-                      (aset nc 11 #x48) (aset nc 12 #xC7) (aset nc 13 #xC7)
-                      (aset nc 14 #x00) (aset nc 15 #x00) (aset nc 16 #x00) (aset nc 17 #x00)
-                      ;; mov rax,60 (SYS_exit)
-                      (aset nc 18 #x48) (aset nc 19 #xC7) (aset nc 20 #xC0)
-                      (aset nc 21 #x3C) (aset nc 22 #x00) (aset nc 23 #x00) (aset nc 24 #x00)
-                      ;; syscall
-                      (aset nc 25 #x0F) (aset nc 26 #x05)
-                      (setq native-len 27)
-                      ;; Package as result
-                      (let ((result (cons nc native-len)))
+                    ;; Call translator (2 args: bytecode-array, fn-table)
+                    (let ((result (translate-mvm-to-x64 bc-arr ft)))
                       (write-char-serial 54)  ;; 6 — translated
                       (let ((native-arr (car result)))
                         (let ((native-len (cdr result)))
@@ -803,7 +773,7 @@
                                       (write-char-serial 56)  ;; 8 — done
                                       (print-dec elf-len)
                                       (print-nl)
-                                      (sys-exit 0)))))))))))))))))))))
+                                      (sys-exit 0))))))))))))))))))))
 
 ;;; Bare-metal name hash (no strings on bare metal)
 ;;; Hash of KERNEL-MAIN using FNV-1a style

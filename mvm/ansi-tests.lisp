@@ -753,6 +753,14 @@
   (deftest 2450 (let ((x (loop for i from 1 to 100 collect i)))
                   (nth 99 x)) 100))
 
+(defun run-equal-fix-tests ()
+  ;; equal now works via macro expansion to equalp-impl
+  (deftest 2500 (equal 1 1) t)
+  (deftest 2501 (equal (cons 1 2) (cons 1 2)) t)
+  (deftest 2502 (equal (cons 1 (cons 2 nil)) (cons 1 (cons 2 nil))) t)
+  (deftest 2503 (equal nil nil) t)
+  (deftest 2504 (equal (cons 1 2) (cons 1 3)) nil))
+
 (defun run-mv-debug-tests ()
   ;; incf basic
   (deftest 2400 (let ((i 0)) (incf i) i) 1)
@@ -874,5 +882,6 @@
   (run-package-tests)
   (run-format-tests)
   (run-heap-test)
+  (run-equal-fix-tests)
   (run-mv-debug-tests)
   (run-regression-tests))

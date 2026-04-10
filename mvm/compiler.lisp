@@ -219,12 +219,13 @@
     ((member (car form) *arith-ops*)
      (some #'form-contains-call-p (cdr form)))
     ;; Inline ops: safe themselves but recurse into arg forms
+    ;; NOTE: equal is NOT here — it's a function call (compile-call dispatch)
     ((member (car form) '(car cdr cons list
                           cadr cdar cddr
                           aref aset
                           not null
                           1+ 1-
-                          = < > <= >= /= eq eql equal
+                          = < > <= >= /= eq eql
                           zerop
                           length
                           mem-ref %setf-mem-ref))
@@ -277,7 +278,7 @@
                           setq setf
                           car cdr cons list cadr cdar cddr
                           aref aset 1+ 1-
-                          = < > <= >= /= eq eql equal zerop length
+                          = < > <= >= /= eq eql zerop length
                           mem-ref %setf-mem-ref))
      (reduce #'max (mapcar #'form-arith-call-depth (cdr form))
              :initial-value 0))
@@ -853,6 +854,13 @@
   ;; Real ANSI test files use RT's (deftest name form expected-literal...) syntax,
   ;; which is transformed at the SBCL build level before MVM compilation.
 
+  ;; EQUAL — macro-expand to equalp-impl to bypass name bug
+  ;; The function named "EQUAL" generates wrong bytecode for unknown reasons.
+  ;; This macro ensures all (equal ...) calls use the working implementation.
+  (mvm-define-macro "EQUAL"
+    (lambda (form)
+      `(equalp-impl ,(cadr form) ,(caddr form))))
+
   ;; DEFHARMLESS — stub: skip harmless mutation tests
   (mvm-define-macro "DEFHARMLESS"
     (lambda (form)
@@ -1304,7 +1312,8 @@
       ;; --- EQL (same as EQ for fixnums/chars/symbols) ---
       ((= op-name 743927193407775751)      (compile-eq (cdr form) env dest))
       ((= op-name 777630921077348411)    (compile-eq (cdr form) env dest))
-      ((= op-name 674674239141986683) (compile-call op (cdr form) env dest))
+      ;; equal: removed explicit dispatch — falls through to default compile-call
+      ;; (was causing bytecode differences due to dispatch ordering)
 
       ;; --- Memory Operations ---
       ((= op-name 900047298083458158)  (compile-mem-ref (cadr form) (caddr form) env dest))

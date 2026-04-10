@@ -339,17 +339,17 @@
 ;;; for all calls from ANSI test code.
 ;;; ============================================================
 
-(defun equal (a b)
-  (if (eql a b)
-      t
-      (if (consp a)
-          (if (consp b)
-              (if (equal (car a) (car b))
-                  (equal (cdr a) (cdr b))
-                  nil)
-              nil)
-          (if (stringp a)
-              (if (stringp b)
-                  (string-equal a b)
-                  nil)
-              nil))))
+;; equal workaround: the NAME "equal" causes wrong bytecode due to a
+;; deep compiler bug. We define equalp-impl and have the compiler macro
+;; expand (equal ...) to (equalp-impl ...) so the working code is used.
+(defun equalp-impl (a b)
+  (if (eql a b) t
+    (if (consp a)
+      (if (consp b)
+        (if (equalp-impl (car a) (car b))
+          (equalp-impl (cdr a) (cdr b))
+          nil)
+        nil)
+      (if (stringp a)
+        (if (stringp b) (string-equal a b) nil)
+        nil))))

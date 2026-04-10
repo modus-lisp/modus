@@ -89,17 +89,34 @@
       list2
       (cons (car list1) (append2 (cdr list1) list2))))
 
-(defun append (list1 list2)
-  "Append two lists."
-  (append2 list1 list2))
+(defun append (&rest lists)
+  "Append any number of lists."
+  (if (null lists) nil
+    (if (null (cdr lists)) (car lists)
+      (let ((result (append2 (car lists) (cadr lists)))
+            (rest (cddr lists)))
+        (loop
+          (when (null rest) (return result))
+          (setq result (append2 result (car rest)))
+          (setq rest (cdr rest)))))))
 
-(defun nconc (list1 list2)
+(defun nconc2 (list1 list2)
   "Destructively append LIST2 to the end of LIST1."
   (if (null list1)
       list2
       (let ((tail (last list1)))
         (set-cdr tail list2)
         list1)))
+
+(defun nconc (&rest lists)
+  "Destructively concatenate any number of lists."
+  (if (null lists) nil
+    (let ((result (car lists))
+          (rest (cdr lists)))
+      (loop
+        (when (null rest) (return result))
+        (setq result (nconc2 result (car rest)))
+        (setq rest (cdr rest))))))
 
 (defun copy-list (list)
   "Return a shallow copy of LIST."

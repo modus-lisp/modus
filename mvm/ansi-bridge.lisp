@@ -40,14 +40,46 @@
     (if (rt-equal x y) y nil)))
 
 (defun nth-1-body (x)
-  "Check that nth works for all indices. Returns 0 on success."
-  (let ((i 0) (bad 0) (cur x))
-    (loop
-      (when (null cur) (return bad))
-      (unless (eql (nth i x) (car cur))
-        (setq bad (+ bad 1)))
-      (setq i (+ i 1))
-      (setq cur (cdr cur)))))
+  "Check nth for all indices. Returns 0 on success."
+  (loop for e in x
+        and i from 0
+        count (not (eqt e (nth i x)))))
+
+;;; Scaffold — tracks cons cell identity for mutation tests
+(defstruct scaffold node car cdr)
+
+(defun make-scaffold-copy (x)
+  (if (consp x)
+      (make-scaffold :node x
+                     :car (make-scaffold-copy (car x))
+                     :cdr (make-scaffold-copy (cdr x)))
+      (make-scaffold :node x :car nil :cdr nil)))
+
+(defun check-scaffold-copy (x xcopy)
+  (if (eq x (scaffold-node xcopy))
+      (if (consp x)
+          (if (check-scaffold-copy (car x) (scaffold-car xcopy))
+              (check-scaffold-copy (cdr x) (scaffold-cdr xcopy))
+              nil)
+          t)
+      nil))
+
+(defun check-cons-copy (x y)
+  (cond
+    ((consp x)
+     (if (consp y)
+         (if (eqt x y) nil
+           (if (check-cons-copy (car x) (car y))
+               (check-cons-copy (cdr x) (cdr y))
+               nil))
+         nil))
+    ((eqt x y) t)
+    (t nil)))
+
+(defun create-c*r-test (n)
+  (if (<= n 0) (quote none)
+    (cons (create-c*r-test (- n 1))
+          (create-c*r-test (- n 1)))))
 
 ;;; ============================================================
 ;;; Stub macros — tests that need these are skipped

@@ -42,10 +42,10 @@
   ;; Real ANSI test files — only those that compile cleanly
   ;; Excluded: push.lsp, pop.lsp (expand-in-current-env macrolet)
   ;;           tree-equal.lsp, append.lsp, make-list.lsp, subst.lsp (complex :test/:key args)
-  ;; Real ANSI test files that pass
-  ;; More files need: &rest nconc/append, make-scaffold-copy, setf nth, etc.
+  ;; Real ANSI test files
   (dolist (file '("cons.lsp" "consp.lsp" "atom.lsp" "endp.lsp"
-                  "rest.lsp" "last.lsp"))
+                  "rest.lsp" "last.lsp"
+                  "revappend.lsp" "rplaca.lsp" "rplacd.lsp"))
     (let ((path (concatenate 'string ansi-dir file)))
       (when (probe-file path)
         (format t "  Transforming: ~A~%" file)

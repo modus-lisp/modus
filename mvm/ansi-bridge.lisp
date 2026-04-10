@@ -250,10 +250,22 @@
 
 (defvar most-positive-fixnum 4611686018427387903)
 (defvar most-negative-fixnum -4611686018427387904)
+(defvar call-arguments-limit 50)
+(defvar lambda-parameters-limit 50)
+(defvar multiple-values-limit 20)
 (defvar *universe*
   (list nil t 0 1 -1 42
         (cons 1 2) (cons nil nil)
         (quote a) (quote b)))
+
+(defvar *numbers*
+  (list 0 1 -1 2 -2 7 -7 42 -42 100 -100
+        most-positive-fixnum most-negative-fixnum))
+(defvar *integers* *numbers*)
+(defvar *non-negative-integers*
+  (list 0 1 2 7 42 100 most-positive-fixnum))
+(defvar *positive-integers*
+  (list 1 2 7 42 100 most-positive-fixnum))
 
 ;;; ============================================================
 ;;; Additional missing functions

@@ -416,10 +416,13 @@
       (if (zerop combined) 1 combined))))
 
 (defun normalize-name (sym)
-  "Convert a symbol to its name hash for comparison"
-  (if (integerp sym)
-      sym
-      (compute-name-hash (symbol-name sym))))
+  "Convert a symbol to its name hash for comparison.
+   Returns 0 for non-symbol, non-integer inputs."
+  (cond
+    ((integerp sym) sym)
+    ((symbolp sym) (compute-name-hash (symbol-name sym)))
+    ((stringp sym) (compute-name-hash sym))
+    (t 0)))
 
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
@@ -1796,7 +1799,8 @@
 ;;; ============================================================
 
 (defun cl-loop-keyword-p (sym)
-  "Check if SYM is a CL loop keyword"
+  "Check if SYM is a CL loop keyword. Non-symbols are never keywords."
+  (when (not (symbolp sym)) (return-from cl-loop-keyword-p nil))
   (and (symbolp sym)
        (member (normalize-name sym)
                '(861144843042936108 1113883427174140325 313452561496444628

@@ -202,6 +202,26 @@
          (if (= word-size 8)
              (mvm-emit-u64 buf 0)
              (mvm-emit-u32 buf 0)))
+        (vector
+         ;; Vectors in constant pool — store as 0 (not supported)
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
+        (cons
+         ;; Cons in constant pool — store as 0 (not supported)
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
+        (symbol
+         ;; Symbol in constant pool — store as 0
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
+        (character
+         ;; Character — store char code as tagged fixnum
+         (if (= word-size 8)
+             (mvm-emit-u64 buf (ash (char-code constant) 1))
+             (mvm-emit-u32 buf (ash (char-code constant) 1))))
         (string
          ;; String object: [header:word | chars...]
          ;; NOTE: constant pool strings are NOT fully functional.

@@ -55,7 +55,22 @@
                   "append.lsp" "mapcar.lsp" "mapc.lsp"
                   "member.lsp" "assoc.lsp"
                   "ldiff.lsp" "subst.lsp" "tree-equal.lsp"
-                  "make-list.lsp"))
+                  "make-list.lsp"
+                  "nbutlast.lsp" "list-length.lsp"
+                  "mapcan.lsp" "mapcon.lsp" "mapl.lsp" "maplist.lsp"
+                  "member-if.lsp" "member-if-not.lsp"
+                  "assoc-if.lsp" "assoc-if-not.lsp"
+                  "rassoc.lsp" "rassoc-if.lsp" "rassoc-if-not.lsp"
+                  "sublis.lsp" "subst-if.lsp" "subst-if-not.lsp"
+                  "nsubst.lsp" "nsubst-if.lsp" "nsubst-if-not.lsp" "nsublis.lsp"
+                  "intersection.lsp" "nintersection.lsp"
+                  "union.lsp" "nunion.lsp"
+                  "set-difference.lsp" "nset-difference.lsp"
+                  "set-exclusive-or.lsp" "nset-exclusive-or.lsp"
+                  "adjoin.lsp" "subsetp.lsp"
+                  "getf.lsp" "get-properties.lsp" "remf.lsp"
+                  "push.lsp" "pop.lsp" "pushnew.lsp"
+))
   ;; Data and Control Flow chapter
   (dolist (file '("if.lsp" "and.lsp" "or.lsp" "not.lsp"
                   "identity.lsp"

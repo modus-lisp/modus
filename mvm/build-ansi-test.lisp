@@ -47,7 +47,7 @@
                   "rest.lsp" "last.lsp"
                   "revappend.lsp" "nreconc.lsp"
                   "rplaca.lsp" "rplacd.lsp"
-                  "acons.lsp"))
+                  "acons.lsp" "pairlis.lsp" "copy-alist.lsp"))
     (let ((path (concatenate 'string ansi-dir file)))
       (when (probe-file path)
         (format t "  Transforming: ~A~%" file)

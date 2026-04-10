@@ -193,14 +193,14 @@
              (mvm-emit-u64 buf (ash constant 1))  ; tagged fixnum
              (mvm-emit-u32 buf (ash constant 1))))
         (float
-         ;; Floats not supported on bare metal — store as 0
+         ;; Store IEEE 754 bits
          (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
+             (mvm-emit-u64 buf (modus.mvm::ieee-float-bits (float constant 1.0d0)))
              (mvm-emit-u32 buf 0)))
         (ratio
-         ;; Ratios not supported — store as 0
+         ;; Convert to float, store IEEE bits
          (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
+             (mvm-emit-u64 buf (modus.mvm::ieee-float-bits (float constant 1.0d0)))
              (mvm-emit-u32 buf 0)))
         (vector
          ;; Vectors in constant pool — store as 0 (not supported)

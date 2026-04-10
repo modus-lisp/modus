@@ -753,6 +753,19 @@
   (deftest 2450 (let ((x (loop for i from 1 to 100 collect i)))
                   (nth 99 x)) 100))
 
+(defun run-float-tests ()
+  ;; Basic: float object is created
+  (deftest 2700 (rt-floatp 1.5) t)
+  ;; Two floats with same value are rt-equal
+  (deftest 2701 (rt-float-equal 1.5 1.5) t)
+  ;; Float in cons cell
+  (deftest 2702 (rt-floatp (cdr (cons 1 2.5))) t)
+  ;; Structural comparison with float
+  (deftest 2703 (rt-equal (cons 1 1.5) (cons 1 1.5)) t)
+  ;; Float in cons with integer key (no string — strings compile to nil)
+  (deftest 2710 (rt-equal (cons 42 1.5) (quote (42 . 1.5))) t)
+  (deftest 2711 (rt-equal (acons 1 2.718 nil) (quote ((1 . 2.718)))) t))
+
 (defun run-iteration-tests ()
   ;; DO
   (deftest 2600 (do ((i 0 (+ i 1))) ((>= i 5) i)) 5)
@@ -909,6 +922,7 @@
   (run-package-tests)
   (run-format-tests)
   (run-heap-test)
+  (run-float-tests)
   (run-iteration-tests)
   (run-equal-fix-tests)
   (run-mv-debug-tests)

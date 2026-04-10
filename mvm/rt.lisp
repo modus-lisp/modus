@@ -33,6 +33,19 @@
 ;;; Core Test Functions
 ;;; ============================================================
 
+(defun rt-floatp (x)
+  "Check if x is a boxed float (subtag 96 = #x60)."
+  (if (fixnump x) nil
+    (if (consp x) nil
+      (if (null x) nil
+        (= (obj-subtag x) 96)))))
+
+(defun rt-float-equal (a b)
+  "Compare two boxed floats by their hi32/lo32 slots."
+  (if (= (aref a 0) (aref b 0))
+      (= (aref a 1) (aref b 1))
+      nil))
+
 (defun rt-equal (a b)
   "Structural equality for RT comparisons."
   (if (eql a b)
@@ -43,7 +56,15 @@
                   (rt-equal (cdr a) (cdr b))
                   nil)
               nil)
-          nil)))
+          (if (rt-floatp a)
+              (if (rt-floatp b)
+                  (rt-float-equal a b)
+                  nil)
+              (if (stringp a)
+                  (if (stringp b)
+                      (string-equal a b)
+                      nil)
+                  nil)))))
 
 (defun deftest (id actual expected)
   "Run a test: compare ACTUAL with EXPECTED using rt-equal.

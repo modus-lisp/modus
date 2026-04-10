@@ -370,6 +370,19 @@
           (set-cdr tail nil)
           list)))))
 
+(defun floatp-impl (x)
+  "Check if x is a boxed float (subtag #x60)."
+  (if (fixnump x) nil
+    (if (consp x) nil
+      (if (null x) nil
+        (= (obj-subtag x) 96)))))  ; #x60 = 96
+
+(defun float-equal (a b)
+  "Compare two boxed floats by hi32/lo32 slots."
+  (if (= (aref a 0) (aref b 0))
+      (= (aref a 1) (aref b 1))
+      nil))
+
 (defun equalp-impl (a b)
   (if (eql a b) t
     (if (consp a)
@@ -378,6 +391,10 @@
           (equalp-impl (cdr a) (cdr b))
           nil)
         nil)
-      (if (stringp a)
-        (if (stringp b) (string-equal a b) nil)
-        nil))))
+      (if (floatp-impl a)
+        (if (floatp-impl b)
+          (float-equal a b)
+          nil)
+        (if (stringp a)
+          (if (stringp b) (string-equal a b) nil)
+          nil)))))

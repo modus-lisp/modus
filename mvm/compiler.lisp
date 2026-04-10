@@ -48,6 +48,7 @@
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
 (defconstant +subtag-symbol+ #x50)
+(defconstant +subtag-float+  #x60)
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
 (defconstant +nil-value+ #xDEAD0001)
@@ -414,6 +415,12 @@
     (let ((combined (logior (ash (logand h1 #x3FFFFFFF) 30)
                             (logand h2 #x3FFFFFFF))))
       (if (zerop combined) 1 combined))))
+
+(defun ieee-float-bits (f)
+  "Convert a double-float to its IEEE 754 bit pattern as an integer."
+  (let ((hi (sb-kernel:double-float-high-bits f))
+        (lo (sb-kernel:double-float-low-bits f)))
+    (logior (ash hi 32) (logand lo #xFFFFFFFF))))
 
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
@@ -1128,9 +1135,9 @@
       ((consp form)
        (compile-compound form env dest))
 
-      ;; Float literal → compile as 0 (bare metal has no floats)
+      ;; Float literal → boxed float object (subtag #x60, IEEE bits in slot 0)
       ((floatp form)
-       (compile-integer 0 dest))
+       (compile-quote form dest))
 
       ;; Vector literal #(...) → (make-array-from elt0 elt1 ...)
       ((and (vectorp form) (not (stringp form)))
@@ -1141,9 +1148,9 @@
                           arr)
                        env dest)))
 
-      ;; Ratio literal → compile as 0 (no ratio support)
+      ;; Ratio literal → convert to float, box as float object
       ((typep form 'ratio)
-       (compile-integer 0 dest))
+       (compile-form (float form 1.0d0) env dest))
 
       ;; Complex number → compile as 0
       ((typep form 'complex)
@@ -1494,6 +1501,7 @@
 
       ;; --- Symbol allocation ---
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
+      ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
 
       ;; --- Array Operations ---
       ((= op-name 686483400154579705)       (compile-make-array (cadr form) env dest))
@@ -1560,6 +1568,20 @@
                (free-temp-reg))))
          ;; Short lists / dotted pairs: recursive
          (compile-cons `(quote ,(car value)) `(quote ,(cdr value)) nil dest)))
+    ;; Float/ratio: boxed float object, 2 slots = high32 + low32 IEEE bits
+    ((or (floatp value) (typep value 'ratio))
+     (let* ((bits (ieee-float-bits (float value 1.0d0)))
+            (hi (ash bits -32))
+            (lo (logand bits #xFFFFFFFF)))
+       (emit-ir :alloc-obj dest 2 +subtag-float+)
+       (let ((temp (alloc-temp-reg)))
+         ;; Slot 0 = high 32 bits (tagged fixnum, always fits)
+         (emit-ir :li temp (ash hi +fixnum-shift+))
+         (emit-ir :obj-set dest 0 temp)
+         ;; Slot 1 = low 32 bits (tagged fixnum, always fits)
+         (emit-ir :li temp (ash lo +fixnum-shift+))
+         (emit-ir :obj-set dest 1 temp)
+         (free-temp-reg))))
     ;; String or other: use constant table
     (t
      (let ((idx (length *constant-table*)))
@@ -3770,6 +3792,10 @@
 ;;; ============================================================
 ;;; Array Operations
 ;;; ============================================================
+
+(defun compile-make-float (dest)
+  "Compile (%make-float) — allocate a 1-slot object with float subtag."
+  (emit-ir :alloc-obj dest 1 +subtag-float+))
 
 (defun compile-make-symbol (dest)
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.

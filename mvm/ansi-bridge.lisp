@@ -342,6 +342,19 @@
 ;; equal workaround: the NAME "equal" causes wrong bytecode due to a
 ;; deep compiler bug. We define equalp-impl and have the compiler macro
 ;; expand (equal ...) to (equalp-impl ...) so the working code is used.
+;;; Safe stub for all unresolved function calls.
+;;; The compiler directs unresolved CALLs here instead of offset 0.
+(defun %unresolved-fn () nil)
+
+(defun nbutlast (list &rest n-arg)
+  "Destructive butlast."
+  (let ((n (if n-arg (car n-arg) 1)))
+    (let ((len (list-length list)))
+      (if (or (null len) (<= len n)) nil
+        (let ((tail (nthcdr (- len n 1) list)))
+          (set-cdr tail nil)
+          list)))))
+
 (defun equalp-impl (a b)
   (if (eql a b) t
     (if (consp a)

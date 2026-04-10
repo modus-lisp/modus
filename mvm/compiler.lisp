@@ -876,6 +876,11 @@
     (lambda (form)
       (declare (ignore form))
       t))
+  ;; LOCALLY — like progn (ignore declarations)
+  (mvm-define-macro "LOCALLY"
+    (lambda (form)
+      `(progn ,@(cdr form))))
+
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"
     (lambda (form)
@@ -4378,7 +4383,12 @@
                   (fn-info (gethash fn-name *functions*))
                   (target (if fn-info
                               (function-info-bytecode-offset fn-info)
-                              0)))
+                              ;; Unresolved: target the %UNRESOLVED-FN stub
+                              ;; which returns nil safely
+                              (let ((stub (gethash "%UNRESOLVED-FN" *functions*)))
+                                (if stub
+                                    (function-info-bytecode-offset stub)
+                                    0)))))
              (unless fn-info
                (format t "  WARN: unresolved CALL ~S~%" fn-name))
              (mvm-call buf target)))

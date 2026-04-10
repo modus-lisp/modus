@@ -50,7 +50,47 @@
                   "rplaca.lsp" "rplacd.lsp"
                   "acons.lsp" "pairlis.lsp" "copy-alist.lsp"
                   "nconc.lsp" "butlast.lsp" "list.lsp"))
-  ;; Iteration chapter
+  ;; Data and Control Flow chapter
+  (dolist (file '("if.lsp" "and.lsp" "or.lsp" "not.lsp" "identity.lsp"))
+    (let ((path (concatenate 'string "/tmp/ansi-test/data-and-control-flow/" file)))
+      (when (probe-file path)
+        (format t "  Transforming: dcf/~A~%" file)
+        (push (pathname-name file) *ansi-file-names*)
+        (let ((forms nil) (test-count *ansi-test-counter*))
+          (with-open-file (s path :direction :input)
+            (let ((*package* (find-package :cl-user)))
+              (loop (let ((form (read s nil :eof)))
+                      (when (eq form :eof) (return))
+                      (push form forms)))))
+          (setf forms (nreverse forms))
+          (let ((out (make-string-output-stream)) (test-forms nil))
+            (format out "~%;; === dcf/~A ===~%" file)
+            (dolist (form forms)
+              (cond
+                ((and (consp form) (eq (car form) 'deftest))
+                 (let ((name (cadr form)) (test-form (caddr form))
+                       (expected (cdddr form)))
+                   (setf *ansi-test-counter* (1+ *ansi-test-counter*))
+                   (let ((test-id *ansi-test-counter*))
+                     (format t "      ~D = ~A~%" test-id name)
+                     (cond
+                       ((= (length expected) 1)
+                        (push (format nil "(rt-run-test ~D (funcall (lambda () ~S)) '~S)"
+                                      test-id test-form (car expected)) test-forms))
+                       ((> (length expected) 0)
+                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list (funcall (lambda () ~S))) '~S)"
+                                      test-id test-form expected) test-forms))))))
+                ((and (consp form) (member (car form)
+                        '(defharmless def-fold-test def-macro-test in-package declaim))) nil)
+                (t (format out "~S~%" form))))
+            (format out "(defun run-ansi-~A ()~%" (pathname-name file))
+            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
+            (format out ")~%")
+            (setf *real-ansi-sources*
+                  (concatenate 'string *real-ansi-sources*
+                               (get-output-stream-string out))))))))
+
+  ;; Iteration chapter (placeholder for future)
   (dolist (file '())
     (let ((path (concatenate 'string "/tmp/ansi-test/iteration/" file)))
       (when (probe-file path)

@@ -332,3 +332,24 @@
 
 (defun count (item list)
   (count-if (lambda (x) (eql x item)) list))
+
+;;; ============================================================
+;;; Override equal — the name "EQUAL" has a compiler bug (form-contains-call-p
+;;; misclassifies it). This override is loaded LAST so it takes effect
+;;; for all calls from ANSI test code.
+;;; ============================================================
+
+(defun equal (a b)
+  (if (eql a b)
+      t
+      (if (consp a)
+          (if (consp b)
+              (if (equal (car a) (car b))
+                  (equal (cdr a) (cdr b))
+                  nil)
+              nil)
+          (if (stringp a)
+              (if (stringp b)
+                  (string-equal a b)
+                  nil)
+              nil))))

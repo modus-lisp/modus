@@ -45,7 +45,9 @@
   ;; Real ANSI test files
   (dolist (file '("cons.lsp" "consp.lsp" "atom.lsp" "endp.lsp"
                   "rest.lsp" "last.lsp"
-                  "revappend.lsp" "rplaca.lsp" "rplacd.lsp"))
+                  "revappend.lsp" "nreconc.lsp"
+                  "rplaca.lsp" "rplacd.lsp"
+                  "acons.lsp"))
     (let ((path (concatenate 'string ansi-dir file)))
       (when (probe-file path)
         (format t "  Transforming: ~A~%" file)

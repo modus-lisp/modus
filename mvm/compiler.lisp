@@ -2451,8 +2451,14 @@
            (string= (symbol-name (car name)) "LAMBDA"))
       ;; #'(lambda (params) body...) → compile as lambda
       (compile-lambda (cadr name) (cddr name) env dest)
-      ;; #'name → load function address
-      (emit-ir :li-func dest (if (symbolp name) (symbol-name name) (string name)))))
+      ;; #'name or #'(setf name) → load function address
+      (let ((fn-name (cond
+                       ((symbolp name) (symbol-name name))
+                       ((and (consp name) (eq (car name) 'setf))
+                        (format nil "SETF-~A" (symbol-name (cadr name))))
+                       ((stringp name) name)
+                       (t "UNKNOWN"))))
+        (emit-ir :li-func dest fn-name))))
 
 ;;; ============================================================
 ;;; Multiple Values
@@ -3963,7 +3969,11 @@
       ((symbolp fn)
        (let ((fn-name (symbol-name fn)))
          (emit-ir :call fn-name nargs)))
-      ;; Other callable expression (rare in this system)
+      ;; (setf name) function — emit as SETF-NAME call
+      ((and (consp fn) (eq (car fn) 'setf) (symbolp (cadr fn)))
+       (let ((fn-name (format nil "SETF-~A" (symbol-name (cadr fn)))))
+         (emit-ir :call fn-name nargs)))
+      ;; Other callable expression
       (t
        (let ((fn-reg (alloc-temp-reg)))
          (compile-form fn env fn-reg)

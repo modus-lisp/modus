@@ -41,46 +41,58 @@
 (defvar *ansi-file-names* nil)
 
 (defun load-ansi-chapter (dir files)
-  "Transform ANSI test files from DIR into MVM-compatible source."
+  "Transform ANSI test files from DIR into MVM-compatible source.
+   Skips files that cause read errors."
   (dolist (file files)
-    (let ((path (concatenate 'string dir file)))
-      (when (probe-file path)
-        (format t "  Transforming: ~A~%" file)
-        (push (pathname-name file) *ansi-file-names*)
-        (let ((forms nil))
-          (with-open-file (s path :direction :input)
-            (let ((*package* (find-package :cl-user)))
-              (loop (let ((form (read s nil :eof)))
-                      (when (eq form :eof) (return))
-                      (push form forms)))))
-          (setf forms (nreverse forms))
-          (let ((out (make-string-output-stream)) (test-forms nil))
-            (format out "~%;; === ~A ===~%" file)
-            (dolist (form forms)
-              (cond
-                ((and (consp form) (eq (car form) 'deftest))
-                 (let ((name (cadr form)) (test-form (caddr form))
-                       (expected (cdddr form)))
-                   (setf *ansi-test-counter* (1+ *ansi-test-counter*))
-                   (let ((test-id *ansi-test-counter*))
-                     (format t "      ~D = ~A~%" test-id name)
-                     (cond
-                       ((= (length expected) 1)
-                        (push (format nil "(rt-run-test ~D ~S '~S)"
-                                      test-id test-form (car expected)) test-forms))
-                       ((> (length expected) 0)
-                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
-                                      test-id test-form expected) test-forms))))))
-                ((and (consp form) (member (car form)
-                        '(defharmless def-fold-test def-macro-test
-                          in-package declaim))) nil)
-                (t (format out "~S~%" form))))
-            (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
-            (format out ")~%")
-            (setf *real-ansi-sources*
-                  (concatenate 'string *real-ansi-sources*
-                               (get-output-stream-string out)))))))))
+    (handler-case
+      (let ((path (concatenate 'string dir file)))
+        (when (probe-file path)
+          (format t "  Transforming: ~A~%" file)
+          (let ((forms nil))
+            (with-open-file (s path :direction :input)
+              (let ((*package* (find-package :cl-user)))
+                (loop (let ((form (read s nil :eof)))
+                        (when (eq form :eof) (return))
+                        (push form forms)))))
+            (push (pathname-name file) *ansi-file-names*)
+            (setf forms (nreverse forms))
+            (let ((out (make-string-output-stream)) (test-forms nil))
+              (format out "~%;; === ~A ===~%" file)
+              (dolist (form forms)
+                (cond
+                  ((and (consp form) (eq (car form) 'deftest))
+                   (let ((name (cadr form)) (test-form (caddr form))
+                         (expected (cdddr form)))
+                     (setf *ansi-test-counter* (1+ *ansi-test-counter*))
+                     (let ((test-id *ansi-test-counter*))
+                       (format t "      ~D = ~A~%" test-id name)
+                       (let ((test-str (handler-case
+                                         (cond
+                                           ((= (length expected) 1)
+                                            (format nil "(rt-run-test ~D ~S '~S)"
+                                                    test-id test-form (car expected)))
+                                           ((> (length expected) 0)
+                                            (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
+                                                    test-id test-form expected)))
+                                         (error () nil))))
+                         (when (and test-str (not (search "#<" test-str)))
+                           (push test-str test-forms))))))
+                  ((and (consp form) (member (car form)
+                          '(defharmless def-fold-test def-macro-test
+                            in-package declaim))) nil)
+                  (t (let ((s (handler-case (format nil "~S" form)
+                                (error () nil))))
+                       (when (and s (not (search "#<" s)))
+                         (write-string s out)
+                         (terpri out))))))
+              (format out "(defun run-ansi-~A ()~%" (pathname-name file))
+              (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
+              (format out ")~%")
+              (setf *real-ansi-sources*
+                    (concatenate 'string *real-ansi-sources*
+                                 (get-output-stream-string out)))))))
+      (error (e)
+        (format t "    SKIP ~A: ~A~%" file e)))))
 
 ;;; ============================================================
 ;;; Load ANSI test files by chapter
@@ -111,7 +123,7 @@
     "push.lsp" "pop.lsp" "pushnew.lsp"
     "cons-test-01.lsp" "cons-test-03.lsp" "cons-test-05.lsp"))
 
-;; Data and Control Flow chapter
+;; Data and Control Flow chapter — all safe files
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
   '("if.lsp" "and.lsp" "or.lsp" "not.lsp" "identity.lsp"
     "not-and-null.lsp" "t.lsp" "nil.lsp"
@@ -119,14 +131,16 @@
     "multiple-value-bind.lsp" "multiple-value-list.lsp"
     "call-arguments-limit.lsp" "lambda-parameters-limit.lsp"
     "ecase.lsp" "block.lsp" "return-from.lsp" "constantly.lsp"
-    "case.lsp" "apply.lsp" "when.lsp" "unless.lsp" "cond.lsp" "progn.lsp"))
+    "case.lsp" "apply.lsp" "when.lsp" "unless.lsp" "cond.lsp" "progn.lsp"
+))
 
 ;; Iteration chapter
 (load-ansi-chapter "/tmp/ansi-test/iteration/"
   '("dolist.lsp" "dotimes.lsp"
     "loop1.lsp" "loop2.lsp" "loop3.lsp" "loop4.lsp" "loop5.lsp"
     "loop6.lsp" "loop7.lsp" "loop8.lsp" "loop9.lsp"
-    "loop10.lsp" "loop11.lsp"))
+    "loop10.lsp" "loop11.lsp" "loop12.lsp" "loop13.lsp"
+))
 
 ;; Hash-tables chapter
 (load-ansi-chapter "/tmp/ansi-test/hash-tables/"
@@ -155,12 +169,13 @@
     "copy-symbol.lsp" "make-symbol.lsp"))
 
 ;; Structures chapter
+;; Structures
 (load-ansi-chapter "/tmp/ansi-test/structures/"
   '("structure-00.lsp" "structures-01.lsp"))
 
 ;; Strings chapter
 (load-ansi-chapter "/tmp/ansi-test/strings/"
-  '("string.lsp"))
+  '("string.lsp" "stringp.lsp"))
 
 ;; Characters chapter
 (load-ansi-chapter "/tmp/ansi-test/characters/"

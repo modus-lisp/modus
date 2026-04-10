@@ -1141,9 +1141,18 @@
                           arr)
                        env dest)))
 
-      ;; Unrecognized
+      ;; Ratio literal → compile as 0 (no ratio support)
+      ((typep form 'ratio)
+       (compile-integer 0 dest))
+
+      ;; Complex number → compile as 0
+      ((typep form 'complex)
+       (compile-integer 0 dest))
+
+      ;; Unrecognized — warn and compile as nil
       (t
-       (error "MVM compiler: cannot compile ~S" form))))))
+       (format t "  WARN: cannot compile ~S, using nil~%" form)
+       (compile-nil dest))))))
 
 ;;; ------ Self-Evaluating Literals ------
 

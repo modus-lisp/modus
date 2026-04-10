@@ -187,7 +187,7 @@
   (let ((buf (make-mvm-buffer))
         (word-size (target-word-size target)))
     (dolist (constant (mvm-module-constant-table module))
-      (etypecase constant
+      (typecase constant
         (integer
          (if (= word-size 8)
              (mvm-emit-u64 buf (ash constant 1))  ; tagged fixnum
@@ -217,6 +217,11 @@
          (if (= word-size 8)
              (mvm-emit-u64 buf 0)
              (mvm-emit-u32 buf 0)))
+        (complex
+         ;; Complex not supported — store as 0
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
         (character
          ;; Character — store char code as tagged fixnum
          (if (= word-size 8)
@@ -238,6 +243,11 @@
                do (mvm-emit-byte buf 0)))
         (null
          ;; NIL placeholder
+         (if (= word-size 8)
+             (mvm-emit-u64 buf 0)
+             (mvm-emit-u32 buf 0)))
+        (t
+         ;; Unknown type — store as 0
          (if (= word-size 8)
              (mvm-emit-u64 buf 0)
              (mvm-emit-u32 buf 0)))))

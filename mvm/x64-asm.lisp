@@ -16,7 +16,7 @@
 ;;; ============================================================
 
 (defstruct code-buffer
-  (bytes (make-array 12582912))             ; 12MB fixed-size, use position tracking
+  (bytes (make-array 33554432))             ; 32MB fixed-size, use position tracking
   (labels (make-hash-table :test 'eq))      ; label -> position
   (fixups nil)                              ; list of (position label offset-size)
   (position 0))

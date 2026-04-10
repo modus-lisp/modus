@@ -273,13 +273,25 @@
 ;;; ============================================================
 
 (defun list-length (list)
-  "Return the length of a proper list."
-  (let ((count 0)
-        (cur list))
+  "Return the length of LIST, or NIL for circular lists.
+   Uses tortoise-and-hare cycle detection."
+  (let ((n 0)
+        (fast list)
+        (slow list))
     (loop
-      (when (null cur) (return count))
-      (setq count (+ count 1))
-      (setq cur (cdr cur)))))
+      ;; Fast pointer moves 2 steps
+      (when (null fast) (return n))
+      (when (atom fast) (return n))
+      (setq fast (cdr fast))
+      (setq n (+ n 1))
+      (when (null fast) (return n))
+      (when (atom fast) (return n))
+      (setq fast (cdr fast))
+      (setq n (+ n 1))
+      ;; Slow pointer moves 1 step
+      (setq slow (cdr slow))
+      ;; If they meet, it's circular
+      (when (eq fast slow) (return nil)))))
 
 (defun length (seq)
   "Return the length of SEQ (list or array)."

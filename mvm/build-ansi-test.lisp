@@ -38,6 +38,7 @@
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
+(defvar *ansi-file-names* nil)
 (let ((ansi-dir "/tmp/ansi-test/cons/"))
   ;; Real ANSI test files — only those that compile cleanly
   ;; Excluded: push.lsp, pop.lsp (expand-in-current-env macrolet)
@@ -47,10 +48,12 @@
                   "rest.lsp" "last.lsp"
                   "revappend.lsp" "nreconc.lsp"
                   "rplaca.lsp" "rplacd.lsp"
-                  "acons.lsp" "pairlis.lsp" "copy-alist.lsp"))
+                  "acons.lsp" "pairlis.lsp" "copy-alist.lsp"
+                  "nconc.lsp" "butlast.lsp" "list.lsp"))
     (let ((path (concatenate 'string ansi-dir file)))
       (when (probe-file path)
         (format t "  Transforming: ~A~%" file)
+        (push (pathname-name file) *ansi-file-names*)
         ;; Read forms with SBCL's reader, transform deftests, write back
         (let ((forms nil)
               (test-count *ansi-test-counter*))
@@ -106,23 +109,12 @@
                   (concatenate 'string *real-ansi-sources*
                                (get-output-stream-string out)))))))))
 
-;; Generate run-real-ansi-tests function that calls all file-level runners
-(let ((runner-calls ""))
-  (let ((ansi-dir "/tmp/ansi-test/cons/"))
-    ;; Same file list as above
-    (dolist (file '("cons" "consp" "atom"
-                    "copy-list" "nth" "endp"
-                    "rest" "last" "nconc"
-                    "revappend" "nreconc" "rplaca" "rplacd"
-                    "acons" "pairlis" "copy-tree"
-                    "tailp" "ldiff" "copy-alist"))
-      (when (probe-file (concatenate 'string ansi-dir file ".lsp"))
-        (setf runner-calls
-              (concatenate 'string runner-calls
-                           (format nil "  (run-ansi-~A)~%" file))))))
-  (setf *real-ansi-sources*
-        (concatenate 'string *real-ansi-sources*
-                     (format nil "~%(defun run-real-ansi-tests ()~%~A)~%" runner-calls))))
+;; Generate run-real-ansi-tests that calls all file-level runners
+(setf *ansi-file-names* (nreverse *ansi-file-names*))
+(setf *real-ansi-sources*
+      (concatenate 'string *real-ansi-sources*
+                   (format nil "~%(defun run-real-ansi-tests ()~%~{  (run-ansi-~A)~%~})~%"
+                           *ansi-file-names*)))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  rt: ~D chars~%" (length *rt-source*))

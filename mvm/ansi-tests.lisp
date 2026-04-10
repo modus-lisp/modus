@@ -753,6 +753,33 @@
   (deftest 2450 (let ((x (loop for i from 1 to 100 collect i)))
                   (nth 99 x)) 100))
 
+(defun run-iteration-tests ()
+  ;; DO
+  (deftest 2600 (do ((i 0 (+ i 1))) ((>= i 5) i)) 5)
+  (deftest 2601 (let ((sum 0))
+                  (do ((i 1 (+ i 1))) ((> i 10) sum)
+                    (setq sum (+ sum i)))) 55)
+  ;; DO*
+  (deftest 2610 (do* ((i 0 (+ i 1))
+                      (j 0 i))   ; j sees updated i (sequential)
+                     ((= i 3) j)) 2)
+  ;; DOLIST
+  (deftest 2620 (let ((sum 0))
+                  (dolist (x (cons 1 (cons 2 (cons 3 nil))) sum)
+                    (setq sum (+ sum x)))) 6)
+  (deftest 2621 (let ((r nil))
+                  (dolist (x (cons 10 (cons 20 (cons 30 nil))) (nreverse r))
+                    (push x r)))
+                (cons 10 (cons 20 (cons 30 nil))))
+  ;; DOTIMES
+  (deftest 2630 (let ((sum 0))
+                  (dotimes (i 5 sum)
+                    (setq sum (+ sum i)))) 10)
+  (deftest 2631 (let ((r nil))
+                  (dotimes (i 4 (nreverse r))
+                    (push i r)))
+                (cons 0 (cons 1 (cons 2 (cons 3 nil))))))
+
 (defun run-equal-fix-tests ()
   ;; equal now works via macro expansion to equalp-impl
   (deftest 2500 (equal 1 1) t)
@@ -882,6 +909,7 @@
   (run-package-tests)
   (run-format-tests)
   (run-heap-test)
+  (run-iteration-tests)
   (run-equal-fix-tests)
   (run-mv-debug-tests)
   (run-regression-tests))

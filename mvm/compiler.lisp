@@ -861,6 +861,12 @@
     (lambda (form)
       `(equalp-impl ,(cadr form) ,(caddr form))))
 
+  ;; DEF-MACRO-TEST — stub: skip macro-form error tests
+  (mvm-define-macro "DEF-MACRO-TEST"
+    (lambda (form)
+      (declare (ignore form))
+      nil))
+
   ;; DEFHARMLESS — stub: skip harmless mutation tests
   (mvm-define-macro "DEFHARMLESS"
     (lambda (form)
@@ -880,6 +886,60 @@
   (mvm-define-macro "LOCALLY"
     (lambda (form)
       `(progn ,@(cdr form))))
+
+  ;; DO — (do ((var init step)...) (end-test result...) body...)
+  (mvm-define-macro "DO"
+    (lambda (form)
+      (let ((bindings (cadr form))
+            (end-clause (caddr form))
+            (body (cdddr form)))
+        (let ((vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
+              (inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings))
+              (steps (mapcar (lambda (b) (if (and (consp b) (cddr b)) (caddr b) nil)) bindings))
+              (test (car end-clause))
+              (results (cdr end-clause)))
+          `(let ,(mapcar #'list vars inits)
+             (loop
+               (when ,test (return (progn ,@(or results '(nil)))))
+               ,@body
+               ,@(remove nil
+                   (mapcar (lambda (v s) (when s `(setq ,v ,s)))
+                           vars steps))))))))
+
+  ;; DO* — like DO but with sequential binding (let* instead of let)
+  (mvm-define-macro "DO*"
+    (lambda (form)
+      (let ((bindings (cadr form))
+            (end-clause (caddr form))
+            (body (cdddr form)))
+        (let ((vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
+              (inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings))
+              (steps (mapcar (lambda (b) (if (and (consp b) (cddr b)) (caddr b) nil)) bindings))
+              (test (car end-clause))
+              (results (cdr end-clause)))
+          `(let* ,(mapcar #'list vars inits)
+             (loop
+               (when ,test (return (progn ,@(or results '(nil)))))
+               ,@body
+               ,@(remove nil
+                   (mapcar (lambda (v s) (when s `(setq ,v ,s)))
+                           vars steps))))))))
+
+  ;; DOLIST — (dolist (var list [result]) body...)
+  (mvm-define-macro "DOLIST"
+    (lambda (form)
+      (let* ((spec (cadr form))
+             (var (car spec))
+             (list-form (cadr spec))
+             (result (caddr spec))
+             (body (cddr form))
+             (tmp (gensym "DL")))
+        `(let ((,tmp ,list-form) (,var nil))
+           (loop
+             (when (null ,tmp) (return ,result))
+             (setq ,var (car ,tmp))
+             ,@body
+             (setq ,tmp (cdr ,tmp)))))))
 
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"

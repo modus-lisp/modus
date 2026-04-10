@@ -50,10 +50,18 @@
                   "rplaca.lsp" "rplacd.lsp"
                   "acons.lsp" "pairlis.lsp" "copy-alist.lsp"
                   "nconc.lsp" "butlast.lsp" "list.lsp"
-))
+                  "listp.lsp" "nthcdr.lsp" "nth.lsp"
+                  "copy-list.lsp" "copy-tree.lsp" "tailp.lsp"
+                  "append.lsp" "mapcar.lsp" "mapc.lsp"
+                  "member.lsp" "assoc.lsp"))
   ;; Data and Control Flow chapter
   (dolist (file '("if.lsp" "and.lsp" "or.lsp" "not.lsp"
-                  "identity.lsp"))
+                  "identity.lsp"
+                  "not-and-null.lsp" "t.lsp" "nil.lsp"
+                  "prog1.lsp" "prog2.lsp" "return.lsp"
+                  "multiple-value-bind.lsp" "multiple-value-list.lsp"
+                  "call-arguments-limit.lsp" "lambda-parameters-limit.lsp"
+                  "ecase.lsp" "block.lsp" "return-from.lsp"))
     (let ((path (concatenate 'string "/tmp/ansi-test/data-and-control-flow/" file)))
       (when (probe-file path)
         (format t "  Transforming: dcf/~A~%" file)

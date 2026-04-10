@@ -1204,7 +1204,14 @@
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+))))
       (t
-       (error "MVM compiler: undefined variable ~A" name)))))
+       ;; Implicit global — treat as dynamic variable (auto-register)
+       (format t "  WARN: implicit global ~A~%" name)
+       (setf (gethash (normalize-name name) *globals*) t)
+       (let ((hash (normalize-name name)))
+         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (emit-ir :call "SYMBOL-VALUE" 1)
+         (unless (= dest +vreg-vr+)
+           (emit-ir :mov dest +vreg-vr+)))))))
 
 ;;; ------ Compound Form Dispatch ------
 
@@ -1707,7 +1714,16 @@
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+))))
       (t
-       (error "MVM compiler: undefined variable ~A in setq" var)))))
+       ;; Implicit global for setq
+       (format t "  WARN: implicit global setq ~A~%" var)
+       (setf (gethash (normalize-name var) *globals*) t)
+       (let ((hash (normalize-name var)))
+         (emit-ir :push dest)
+         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (emit-ir :pop +vreg-v1+)
+         (emit-ir :call "SET-SYMBOL-VALUE" 2)
+         (unless (= dest +vreg-vr+)
+           (emit-ir :mov dest +vreg-vr+)))))))
 
 ;;; ============================================================
 ;;; Lambda
@@ -2324,7 +2340,10 @@
   (declare (ignore env dest))
   (let ((entry (assoc tag *tagbody-tags*)))
     (unless entry
-      (error "MVM compiler: unknown GO tag ~A" tag))
+      (progn
+        (format t "  WARN: unknown GO tag ~A~%" tag)
+        (compile-nil dest)
+        (return-from compile-go)))
     (emit-ir :br (cdr entry))))
 
 ;;; ============================================================

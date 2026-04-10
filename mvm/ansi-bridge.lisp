@@ -248,6 +248,9 @@
 ;;; CL Constants
 ;;; ============================================================
 
+(defvar *terminal-io* nil)
+(defvar *standard-input* nil)
+(defvar *standard-output* nil)
 (defvar most-positive-fixnum 4611686018427387903)
 (defvar most-negative-fixnum -4611686018427387904)
 (defvar call-arguments-limit 50)

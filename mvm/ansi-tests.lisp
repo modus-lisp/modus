@@ -762,9 +762,17 @@
   (deftest 2702 (rt-floatp (cdr (cons 1 2.5))) t)
   ;; Structural comparison with float
   (deftest 2703 (rt-equal (cons 1 1.5) (cons 1 1.5)) t)
-  ;; Float in cons with integer key (no string — strings compile to nil)
+  ;; Float in cons with integer key
   (deftest 2710 (rt-equal (cons 42 1.5) (quote (42 . 1.5))) t)
-  (deftest 2711 (rt-equal (acons 1 2.718 nil) (quote ((1 . 2.718)))) t))
+  (deftest 2711 (rt-equal (acons 1 2.718 nil) (quote ((1 . 2.718)))) t)
+  ;; String + float (like ACONS.5)
+  (deftest 2712 (rt-equal (acons "ancd" 1.143 nil) (quote (("ancd" . 1.143)))) t)
+  ;; Character + float (like COPY-ALIST.1 element)
+  (deftest 2713 (let ((x (cons 119 1.234))) (rt-equal (copy-list (list x)) (list x))) t)
+  ;; copy-alist basic
+  (deftest 2714 (let ((al (list (cons 1 2) (cons 3 4))))
+                  (let ((r (copy-alist al)))
+                    (if (eql (caar r) 1) (if (eql (cdar r) 2) t nil) nil))) t))
 
 (defun run-iteration-tests ()
   ;; DO

@@ -1119,9 +1119,9 @@
       ((characterp form)
        (compile-character form dest))
 
-      ;; String literal (docstrings become no-ops; no heap strings in bare-metal)
+      ;; String literal — allocate string object on heap
       ((stringp form)
-       (compile-nil dest))
+       (compile-quote form dest))
 
       ;; Keyword (self-evaluating)
       ((keywordp form)
@@ -1582,7 +1582,18 @@
          (emit-ir :li temp (ash lo +fixnum-shift+))
          (emit-ir :obj-set dest 1 temp)
          (free-temp-reg))))
-    ;; String or other: use constant table
+    ;; String: allocate array with string subtag, fill with char codes
+    ((stringp value)
+     (let ((n (length value)))
+       ;; Allocate n-element array with string subtag (#x10)
+       (emit-ir :alloc-obj dest n +subtag-string+)
+       ;; Fill with character codes
+       (let ((temp (alloc-temp-reg)))
+         (dotimes (i n)
+           (emit-ir :li temp (ash (char-code (char value i)) +fixnum-shift+))
+           (emit-ir :obj-set dest i temp))
+         (free-temp-reg))))
+    ;; Other: use constant table
     (t
      (let ((idx (length *constant-table*)))
        (push value *constant-table*)

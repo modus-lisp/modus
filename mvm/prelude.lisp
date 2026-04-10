@@ -242,13 +242,22 @@
         (when result (return result)))
       (setq cur (cdr cur)))))
 
-(defun every (fn list)
-  "Return T if FN returns non-nil for all elements of LIST."
-  (let ((cur list))
-    (loop
-      (when (null cur) (return t))
-      (when (null (funcall fn (car cur))) (return nil))
-      (setq cur (cdr cur)))))
+(defun every (fn list &rest more-lists)
+  "Return T if FN returns non-nil for all elements."
+  (if (null more-lists)
+      ;; Single list
+      (let ((cur list))
+        (loop
+          (when (null cur) (return t))
+          (when (null (funcall fn (car cur))) (return nil))
+          (setq cur (cdr cur))))
+      ;; Two lists
+      (let ((a list) (b (car more-lists)))
+        (loop
+          (when (or (null a) (null b)) (return t))
+          (when (null (funcall fn (car a) (car b))) (return nil))
+          (setq a (cdr a))
+          (setq b (cdr b))))))
 
 (defun reduce (fn list keyword initial-value)
   "Fold FN over LIST with INITIAL-VALUE. KEYWORD is ignored (bare-metal
@@ -883,8 +892,9 @@
 ;;; Sequence utilities
 ;;; ============================================================
 
-(defun subseq (seq start end)
-  "Return a subsequence from START to END."
+(defun subseq (seq start &rest end-arg)
+  "Return a subsequence from START to END (END defaults to length)."
+  (let ((end (if end-arg (car end-arg) (length seq))))
   (if (consp seq)
       ;; List: build new list
       (let ((result nil)
@@ -902,7 +912,7 @@
           (loop
             (when (= i len) (return result))
             (aset result i (aref seq (+ start i)))
-            (setq i (+ i 1)))))))
+            (setq i (+ i 1))))))))
 
 (defun concatenate-strings (s1 s2)
   "Concatenate two strings (arrays of chars)."

@@ -762,7 +762,7 @@
   ;; DO*
   (deftest 2610 (do* ((i 0 (+ i 1))
                       (j 0 i))   ; j sees updated i (sequential)
-                     ((= i 3) j)) 2)
+                     ((= i 3) j)) 3)
   ;; DOLIST
   (deftest 2620 (let ((sum 0))
                   (dolist (x (cons 1 (cons 2 (cons 3 nil))) sum)

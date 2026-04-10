@@ -510,7 +510,7 @@
 (defun %mv-to-list (primary)
   "Collect multiple values into a list. PRIMARY is the first value.
    Reads extra values from MV storage at 0x600020 + index*8."
-  (let ((count (mem-ref #x600010 :u64)))
+  (let ((count (mem-ref #x10000090 :u64)))
     (if (or (null count) (zerop count))
         nil
         (if (= count 1)
@@ -520,7 +520,7 @@
               ;; Build list from back to front
               (loop
                 (when (< i 0) (return nil))
-                (let ((addr (+ #x600020 (* i 8))))
+                (let ((addr (+ #x10000098 (* i 8))))
                   (let ((val (mem-ref addr :u64)))
                     (setq result (cons val result))))
                 (setq i (- i 1)))
@@ -760,7 +760,7 @@
 
 (defun symbol-value (name-hash)
   "Look up a global variable by its tagged name hash."
-  (let ((head (mem-ref #x600000 :u64)))
+  (let ((head (mem-ref #x10000080 :u64)))
     (if (zerop head)
         nil
         (let ((cur head))
@@ -773,16 +773,16 @@
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash."
-  (let ((head (mem-ref #x600000 :u64)))
+  (let ((head (mem-ref #x10000080 :u64)))
     (if (zerop head)
         (progn
-          (setf (mem-ref #x600000 :u64)
+          (setf (mem-ref #x10000080 :u64)
                 (cons (cons name-hash value) nil))
           value)
         (let ((cur head))
           (loop
             (when (null cur)
-              (setf (mem-ref #x600000 :u64)
+              (setf (mem-ref #x10000080 :u64)
                     (cons (cons name-hash value) head))
               (return value))
             (let ((pair (car cur)))
@@ -805,12 +805,12 @@
 
 (defun init-symbol-table ()
   "Initialize the intern table at 0x620000."
-  (setf (mem-ref #x620000 :u64) (make-hash-table)))
+  (setf (mem-ref #x10000088 :u64) (make-hash-table)))
 
 (defun %intern-symbol (name-hash)
   "Intern a symbol by name hash. Returns existing symbol if already interned.
    Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate."
-  (let ((table (mem-ref #x620000 :u64)))
+  (let ((table (mem-ref #x10000088 :u64)))
     (let ((existing (gethash name-hash table)))
       (if existing
           existing

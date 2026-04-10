@@ -56,8 +56,8 @@
 ;;; Multiple-value return storage (fixed addresses in BSS/globals area)
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)
 ;;; MV-VALUES at 0x600020: array of up to 20 extra values (0x600020..0x6000C0)
-(defconstant +mv-count-addr+ #x600010)
-(defconstant +mv-values-addr+ #x600020)
+(defconstant +mv-count-addr+ #x10000090)
+(defconstant +mv-values-addr+ #x10000098)
 
 ;;; Maximum number of register arguments
 (defconstant +max-reg-args+ 4)
@@ -2332,10 +2332,11 @@
 ;;; ============================================================
 
 (defun compile-dotimes (spec body env dest)
-  "Compile (dotimes (var count) body...).
-   Expands to: (let ((var 0)) (loop (if (< var count) (progn body (setq var (1+ var))) (return nil))))"
+  "Compile (dotimes (var count [result]) body...).
+   Expands to: (let ((var 0)) (loop ...) result)"
   (let* ((var (car spec))
-         (count-form (cadr spec)))
+         (count-form (cadr spec))
+         (result-form (caddr spec)))
     (compile-let
      (list (list var 0))
      (list (list 'loop
@@ -2343,7 +2344,7 @@
                        (append (list 'progn)
                                body
                                (list (list 'setq var (list '1+ var))))
-                       (list 'return nil))))
+                       (list 'return (or result-form nil)))))
      env dest)))
 
 ;;; ============================================================

@@ -51,7 +51,8 @@
                   "acons.lsp" "pairlis.lsp" "copy-alist.lsp"
                   "nconc.lsp" "butlast.lsp" "list.lsp"))
   ;; Data and Control Flow chapter
-  (dolist (file '("if.lsp" "and.lsp" "or.lsp" "not.lsp" "identity.lsp"))
+  (dolist (file '("if.lsp" "and.lsp" "or.lsp" "not.lsp"
+                  "identity.lsp" "values.lsp" "funcall.lsp"))
     (let ((path (concatenate 'string "/tmp/ansi-test/data-and-control-flow/" file)))
       (when (probe-file path)
         (format t "  Transforming: dcf/~A~%" file)

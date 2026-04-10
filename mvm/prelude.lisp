@@ -42,14 +42,26 @@
       (setq i (+ i 1))
       (setq cur (cdr cur)))))
 
-(defun last (list)
-  "Return the last cons cell of LIST."
-  (if (null list)
-      nil
-      (let ((cur list))
-        (loop
-          (when (null (cdr cur)) (return cur))
-          (setq cur (cdr cur))))))
+(defun last (list &rest n-arg)
+  "Return the last N cons cells of LIST. N defaults to 1."
+  (let ((n (if n-arg (car n-arg) 1)))
+    (if (null list)
+        nil
+        (let ((len 0) (cur list))
+          ;; Count length
+          (loop
+            (when (atom cur) (return nil))
+            (setq len (+ len 1))
+            (setq cur (cdr cur)))
+          ;; Skip to (len - n)th element
+          (if (<= len n)
+              list
+              (let ((skip (- len n))
+                    (cur list))
+                (loop
+                  (when (= skip 0) (return cur))
+                  (setq skip (- skip 1))
+                  (setq cur (cdr cur)))))))))
 
 (defun nreverse (list)
   "Destructively reverse LIST in place."

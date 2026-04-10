@@ -745,6 +745,47 @@
   (deftest 2206 (format t "~%") nil))
 
 ;;; ============================================================
+;;; Multi-value + incf test (debug for ANSI order tests)
+;;; ============================================================
+
+(defun run-heap-test ()
+  ;; Test large list creation
+  (deftest 2450 (let ((x (loop for i from 1 to 100 collect i)))
+                  (nth 99 x)) 100))
+
+(defun run-mv-debug-tests ()
+  ;; incf basic
+  (deftest 2400 (let ((i 0)) (incf i) i) 1)
+  ;; multi-value-list with values
+  (deftest 2402 (multiple-value-list (values 1 2)) (cons 1 (cons 2 nil)))
+  ;; The cons.order.1 pattern — test via mv-list
+  (deftest 2403 (multiple-value-list
+                  (let ((i 0))
+                    (values (cons (progn (setq i (+ i 1)) i)
+                                  (progn (setq i (+ i 1)) i))
+                            i)))
+                (cons (cons 1 2) (cons 2 nil)))
+  ;; Same pattern through funcall lambda (like the ANSI transformer does)
+  (deftest 2404 (multiple-value-list
+                  (funcall (lambda ()
+                    (let ((i 0))
+                      (values (cons (progn (setq i (+ i 1)) i)
+                                    (progn (setq i (+ i 1)) i))
+                              i)))))
+                (cons (cons 1 2) (cons 2 nil)))
+  ;; Test rt-run-test-mv directly
+  (deftest 2405 (progn
+                  (rt-run-test-mv 99999
+                    (multiple-value-list
+                      (funcall (lambda ()
+                        (let ((i 0))
+                          (values (cons (progn (setq i (+ i 1)) i)
+                                        (progn (setq i (+ i 1)) i))
+                                  i)))))
+                    (cons (cons 1 2) (cons 2 nil)))
+                  t) t))
+
+;;; ============================================================
 ;;; Regression tests (9000+)
 ;;; Tests for previously-fixed bugs
 ;;; ============================================================
@@ -832,4 +873,6 @@
   (run-defstruct-tests)
   (run-package-tests)
   (run-format-tests)
+  (run-heap-test)
+  (run-mv-debug-tests)
   (run-regression-tests))

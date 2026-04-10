@@ -34,6 +34,21 @@
 (defun check-type-predicate (pred-name type-name)
   nil)
 
+(defun check-copy-list (x)
+  "Check that copy-list produces an equal but not eq copy."
+  (let ((y (copy-list x)))
+    (if (rt-equal x y) y nil)))
+
+(defun nth-1-body (x)
+  "Check that nth works for all indices. Returns 0 on success."
+  (let ((i 0) (bad 0) (cur x))
+    (loop
+      (when (null cur) (return bad))
+      (unless (eql (nth i x) (car cur))
+        (setq bad (+ bad 1)))
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))))
+
 ;;; ============================================================
 ;;; Stub macros — tests that need these are skipped
 ;;; ============================================================

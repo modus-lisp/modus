@@ -2308,20 +2308,29 @@
                              ,(car args))
                      env dest))
       (t
-       ;; Multiple values: store count + extras, return first
-       (let ((store-forms nil)
-             (idx 0))
-         ;; Store count (compiler tags the integer literal automatically)
-         (push `(setf (mem-ref ,+mv-count-addr+ :u64) ,nvals)
-               store-forms)
-         ;; Store extra values at MV-VALUES-ADDR + i*8
-         (dolist (val-form (cdr args))
-           (let ((addr (+ +mv-values-addr+ (* idx 8))))
-             (push `(setf (mem-ref ,addr :u64) ,val-form) store-forms))
-           (incf idx))
-         ;; Compile: stores then return first value
-         (compile-form `(progn ,@(nreverse store-forms) ,(car args))
-                       env dest))))))
+       ;; Multiple values: evaluate ALL values left-to-right first (CL semantics),
+       ;; then store extras and return primary.
+       (let ((temp-vars nil)
+             (bindings nil))
+         ;; Generate temp vars for each value
+         (dolist (val-form args)
+           (let ((tmp (gensym "MV")))
+             (push tmp temp-vars)
+             (push (list tmp val-form) bindings)))
+         (setf temp-vars (nreverse temp-vars))
+         (setf bindings (nreverse bindings))
+         ;; Generate: (let ((t1 v1) (t2 v2) ...) (setf count) (setf extras) t1)
+         (let ((store-forms nil)
+               (idx 0))
+           (push `(setf (mem-ref ,+mv-count-addr+ :u64) ,nvals) store-forms)
+           (dolist (tmp (cdr temp-vars))
+             (let ((addr (+ +mv-values-addr+ (* idx 8))))
+               (push `(setf (mem-ref ,addr :u64) ,tmp) store-forms))
+             (incf idx))
+           (compile-form `(let ,bindings
+                            ,@(nreverse store-forms)
+                            ,(car temp-vars))
+                         env dest)))))))
 
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).

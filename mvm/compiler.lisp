@@ -1942,8 +1942,10 @@
              (setf rest (cddr rest))
              (let ((iter-kw (normalize-name (car rest))))
                (cond
-                 ;; FOR var FROM start ...
-                 ((= iter-kw 355693237506394641)
+                 ;; FOR var FROM/UPFROM/DOWNFROM start ...
+                 ((or (= iter-kw 355693237506394641)
+                      (= iter-kw 704601669436668564)    ; UPFROM
+                      (= iter-kw 888358500084682875))   ; DOWNFROM
                   (setf rest (cdr rest))
                   (let* ((start-form (car rest))
                          (end-form nil) (end-test :to) (by-form nil))
@@ -2041,7 +2043,11 @@
                                             :by-form by-form)
                             (loop-state-iterations state)))))
 
-                 (t (error "MVM loop: unknown FOR clause ~A" iter-kw))))))
+                 (t
+                  ;; Unknown FOR clause — skip it as body form
+                  (format t "  WARN: unknown FOR clause ~A~%" iter-kw)
+                  (push (car rest) (loop-state-body-forms state))
+                  (setf rest (cdr rest)))))))
 
           ;; WHILE condition
           ((= kw 468563938978316688)
@@ -3894,8 +3900,9 @@
    exhausting temp registers when args contain nested function calls.
    Caller-saved temp registers (V5-V8) are saved/restored around the CALL
    to prevent clobbering live variables in those registers."
+  ;; Guard: args must be a proper list
+  (unless (listp args) (setf args (list args)))
   ;; &rest transformation: if the target function has &rest, cons up extra args
-  ;; (foo 1 2 3 4) where foo has (a b &rest r) → (foo 1 2 (cons 3 (cons 4 nil)))
   (when (and (symbolp fn) (boundp '*functions*) *functions*)
     (let* ((fn-name (symbol-name fn))
            (fn-info (gethash fn-name *functions*)))

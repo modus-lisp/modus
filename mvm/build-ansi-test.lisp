@@ -123,7 +123,10 @@
 
 ;; Iteration chapter
 (load-ansi-chapter "/tmp/ansi-test/iteration/"
-  '("dolist.lsp" "dotimes.lsp"))
+  '("dolist.lsp" "dotimes.lsp"
+    "loop1.lsp" "loop2.lsp" "loop3.lsp" "loop4.lsp" "loop5.lsp"
+    "loop6.lsp" "loop7.lsp" "loop8.lsp" "loop9.lsp"
+    "loop10.lsp" "loop11.lsp"))
 
 ;; Hash-tables chapter
 (load-ansi-chapter "/tmp/ansi-test/hash-tables/"
@@ -134,7 +137,16 @@
 ;; Numbers chapter
 (load-ansi-chapter "/tmp/ansi-test/numbers/"
   '("evenp.lsp" "oddp.lsp" "ash.lsp"
-    "logand.lsp" "logior.lsp" "logxor.lsp" "lognot.lsp"))
+    "logand.lsp" "logior.lsp" "logxor.lsp" "lognot.lsp"
+    "zerop.lsp" "plusp.lsp" "minusp.lsp"
+    "max.lsp" "min.lsp" "abs.lsp"
+    "incf.lsp" "decf.lsp"
+    "integerp.lsp" "numberp.lsp" "realp.lsp"
+    "plus.lsp" "minus.lsp" "times.lsp"
+    "mod.lsp" "rem.lsp"
+    "boole.lsp"
+    "logcount.lsp" "integer-length.lsp"
+    "logbitp.lsp" "logtest.lsp"))
 
 ;; Symbols chapter
 (load-ansi-chapter "/tmp/ansi-test/symbols/"
@@ -153,6 +165,20 @@
 ;; Characters chapter
 (load-ansi-chapter "/tmp/ansi-test/characters/"
   '("char-compare.lsp"))
+
+;; Sequences chapter
+(load-ansi-chapter "/tmp/ansi-test/sequences/"
+  '("length.lsp" "reverse.lsp" "nreverse.lsp" "copy-seq.lsp"
+    "elt.lsp" "subseq.lsp" "map.lsp" "reduce.lsp"
+    "concatenate.lsp" "sort.lsp" "stable-sort.lsp"
+    "count.lsp" "count-if.lsp" "count-if-not.lsp"
+    "find.lsp" "find-if.lsp" "find-if-not.lsp"
+    "position.lsp" "position-if.lsp" "position-if-not.lsp"
+    "remove.lsp" "remove-duplicates.lsp"
+    "substitute.lsp" "substitute-if.lsp" "substitute-if-not.lsp"
+    "fill.lsp" "replace.lsp" "mismatch.lsp"
+    "search-list.lsp" "merge.lsp"
+    "map-into.lsp" "make-sequence.lsp"))
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))

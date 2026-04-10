@@ -39,268 +39,120 @@
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
 (defvar *ansi-file-names* nil)
-(let ((ansi-dir "/tmp/ansi-test/cons/"))
-  ;; Real ANSI test files — only those that compile cleanly
-  ;; Excluded: push.lsp, pop.lsp (expand-in-current-env macrolet)
-  ;;           tree-equal.lsp, append.lsp, make-list.lsp, subst.lsp (complex :test/:key args)
-  ;; Real ANSI test files
-  (dolist (file '("cons.lsp" "consp.lsp" "atom.lsp" "endp.lsp"
-                  "rest.lsp" "last.lsp"
-                  "revappend.lsp" "nreconc.lsp"
-                  "rplaca.lsp" "rplacd.lsp"
-                  "acons.lsp" "pairlis.lsp" "copy-alist.lsp"
-                  "nconc.lsp" "butlast.lsp" "list.lsp"
-                  "listp.lsp" "nthcdr.lsp" "nth.lsp"
-                  "copy-list.lsp" "copy-tree.lsp" "tailp.lsp"
-                  "append.lsp" "mapcar.lsp" "mapc.lsp"
-                  "member.lsp" "assoc.lsp"
-                  "ldiff.lsp" "subst.lsp" "tree-equal.lsp"
-                  "make-list.lsp"
-                  "nbutlast.lsp" "list-length.lsp"
-                  "mapcan.lsp" "mapcon.lsp" "mapl.lsp" "maplist.lsp"
-                  "member-if.lsp" "member-if-not.lsp"
-                  "assoc-if.lsp" "assoc-if-not.lsp"
-                  "rassoc.lsp" "rassoc-if.lsp" "rassoc-if-not.lsp"
-                  "sublis.lsp" "subst-if.lsp" "subst-if-not.lsp"
-                  "nsubst.lsp" "nsubst-if.lsp" "nsubst-if-not.lsp" "nsublis.lsp"
-                  "intersection.lsp" "nintersection.lsp"
-                  "union.lsp" "nunion.lsp"
-                  "set-difference.lsp" "nset-difference.lsp"
-                  "set-exclusive-or.lsp" "nset-exclusive-or.lsp"
-                  "adjoin.lsp" "subsetp.lsp"
-                  "getf.lsp" "get-properties.lsp" "remf.lsp"
-                  "push.lsp" "pop.lsp" "pushnew.lsp"
-))
-  ;; Data and Control Flow chapter
-  (dolist (file '("if.lsp" "and.lsp" "or.lsp" "not.lsp"
-                  "identity.lsp"
-                  "not-and-null.lsp" "t.lsp" "nil.lsp"
-                  "prog1.lsp" "prog2.lsp" "return.lsp"
-                  "multiple-value-bind.lsp" "multiple-value-list.lsp"
-                  "call-arguments-limit.lsp" "lambda-parameters-limit.lsp"
-                  "ecase.lsp" "block.lsp" "return-from.lsp"
-                  "constantly.lsp"
-                  "case.lsp" "apply.lsp"
-                  "when.lsp" "unless.lsp" "cond.lsp"
-                  "progn.lsp"))
-    (let ((path (concatenate 'string "/tmp/ansi-test/data-and-control-flow/" file)))
-      (when (probe-file path)
-        (format t "  Transforming: dcf/~A~%" file)
-        (push (pathname-name file) *ansi-file-names*)
-        (let ((forms nil) (test-count *ansi-test-counter*))
-          (with-open-file (s path :direction :input)
-            (let ((*package* (find-package :cl-user)))
-              (loop (let ((form (read s nil :eof)))
-                      (when (eq form :eof) (return))
-                      (push form forms)))))
-          (setf forms (nreverse forms))
-          (let ((out (make-string-output-stream)) (test-forms nil))
-            (format out "~%;; === dcf/~A ===~%" file)
-            (dolist (form forms)
-              (cond
-                ((and (consp form) (eq (car form) 'deftest))
-                 (let ((name (cadr form)) (test-form (caddr form))
-                       (expected (cdddr form)))
-                   (setf *ansi-test-counter* (1+ *ansi-test-counter*))
-                   (let ((test-id *ansi-test-counter*))
-                     (format t "      ~D = ~A~%" test-id name)
-                     (cond
-                       ((= (length expected) 1)
-                        (push (format nil "(rt-run-test ~D ~S '~S)"
-                                      test-id test-form (car expected)) test-forms))
-                       ((> (length expected) 0)
-                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
-                                      test-id test-form expected) test-forms))))))
-                ((and (consp form) (member (car form)
-                        '(defharmless def-fold-test def-macro-test in-package declaim))) nil)
-                (t (format out "~S~%" form))))
-            (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
-            (format out ")~%")
-            (setf *real-ansi-sources*
-                  (concatenate 'string *real-ansi-sources*
-                               (get-output-stream-string out))))))))
 
-  ;; Iteration chapter (placeholder for future)
-  (dolist (file '())
-    (let ((path (concatenate 'string "/tmp/ansi-test/iteration/" file)))
-      (when (probe-file path)
-        (format t "  Transforming: iteration/~A~%" file)
-        (push (pathname-name file) *ansi-file-names*)
-        (let ((forms nil) (test-count *ansi-test-counter*))
-          (with-open-file (s path :direction :input)
-            (let ((*package* (find-package :cl-user)))
-              (loop (let ((form (read s nil :eof)))
-                      (when (eq form :eof) (return))
-                      (push form forms)))))
-          (setf forms (nreverse forms))
-          (let ((out (make-string-output-stream)) (test-forms nil))
-            (format out "~%;; === iteration/~A ===~%" file)
-            (dolist (form forms)
-              (cond
-                ((and (consp form) (eq (car form) 'deftest))
-                 (let ((name (cadr form)) (test-form (caddr form))
-                       (expected (cdddr form)))
-                   (setf *ansi-test-counter* (1+ *ansi-test-counter*))
-                   (let ((test-id *ansi-test-counter*))
-                     (format t "      ~D = ~A~%" test-id name)
-                     (cond
-                       ((= (length expected) 1)
-                        (push (format nil "(rt-run-test ~D ~S '~S)"
-                                      test-id test-form (car expected)) test-forms))
-                       ((> (length expected) 0)
-                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
-                                      test-id test-form expected) test-forms))))))
-                ((and (consp form) (member (car form)
-                        '(defharmless def-fold-test in-package declaim))) nil)
-                (t (format out "~S~%" form))))
-            (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
-            (format out ")~%")
-            (setf *real-ansi-sources*
-                  (concatenate 'string *real-ansi-sources*
-                               (get-output-stream-string out))))))))
-
-  ;; Hash-tables chapter
-  (dolist (file '("gethash.lsp" "remhash.lsp" "clrhash.lsp" "maphash.lsp"
-                  "hash-table-count.lsp" "hash-table-p.lsp"
-                  "make-hash-table.lsp" "sxhash.lsp"))
-    (let ((path (concatenate 'string "/tmp/ansi-test/hash-tables/" file)))
-      (when (probe-file path)
-        (format t "  Transforming: ht/~A~%" file)
-        (push (pathname-name file) *ansi-file-names*)
-        (let ((forms nil) (test-count *ansi-test-counter*))
-          (with-open-file (s path :direction :input)
-            (let ((*package* (find-package :cl-user)))
-              (loop (let ((form (read s nil :eof)))
-                      (when (eq form :eof) (return))
-                      (push form forms)))))
-          (setf forms (nreverse forms))
-          (let ((out (make-string-output-stream)) (test-forms nil))
-            (format out "~%;; === ht/~A ===~%" file)
-            (dolist (form forms)
-              (cond
-                ((and (consp form) (eq (car form) 'deftest))
-                 (let ((name (cadr form)) (test-form (caddr form))
-                       (expected (cdddr form)))
-                   (setf *ansi-test-counter* (1+ *ansi-test-counter*))
-                   (let ((test-id *ansi-test-counter*))
-                     (format t "      ~D = ~A~%" test-id name)
-                     (cond
-                       ((= (length expected) 1)
-                        (push (format nil "(rt-run-test ~D ~S '~S)"
-                                      test-id test-form (car expected)) test-forms))
-                       ((> (length expected) 0)
-                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
-                                      test-id test-form expected) test-forms))))))
-                ((and (consp form) (member (car form)
-                        '(defharmless def-fold-test def-macro-test in-package declaim))) nil)
-                (t (format out "~S~%" form))))
-            (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
-            (format out ")~%")
-            (setf *real-ansi-sources*
-                  (concatenate 'string *real-ansi-sources*
-                               (get-output-stream-string out))))))))
-
-  ;; Numbers chapter — integer-only files
-  (dolist (file '("evenp.lsp" "oddp.lsp" "ash.lsp"
-                  "logand.lsp" "logior.lsp" "logxor.lsp" "lognot.lsp"))
-    (let ((path (concatenate 'string "/tmp/ansi-test/numbers/" file)))
-      (when (probe-file path)
-        (format t "  Transforming: numbers/~A~%" file)
-        (push (pathname-name file) *ansi-file-names*)
-        (let ((forms nil) (test-count *ansi-test-counter*))
-          (with-open-file (s path :direction :input)
-            (let ((*package* (find-package :cl-user)))
-              (loop (let ((form (read s nil :eof)))
-                      (when (eq form :eof) (return))
-                      (push form forms)))))
-          (setf forms (nreverse forms))
-          (let ((out (make-string-output-stream)) (test-forms nil))
-            (format out "~%;; === numbers/~A ===~%" file)
-            (dolist (form forms)
-              (cond
-                ((and (consp form) (eq (car form) 'deftest))
-                 (let ((name (cadr form)) (test-form (caddr form))
-                       (expected (cdddr form)))
-                   (setf *ansi-test-counter* (1+ *ansi-test-counter*))
-                   (let ((test-id *ansi-test-counter*))
-                     (format t "      ~D = ~A~%" test-id name)
-                     (cond
-                       ((= (length expected) 1)
-                        (push (format nil "(rt-run-test ~D ~S '~S)"
-                                      test-id test-form (car expected)) test-forms))
-                       ((> (length expected) 0)
-                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
-                                      test-id test-form expected) test-forms))))))
-                ((and (consp form) (member (car form)
-                        '(defharmless def-fold-test in-package declaim))) nil)
-                (t (format out "~S~%" form))))
-            (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
-            (format out ")~%")
-            (setf *real-ansi-sources*
-                  (concatenate 'string *real-ansi-sources*
-                               (get-output-stream-string out))))))))
-    (let ((path (concatenate 'string ansi-dir file)))
+(defun load-ansi-chapter (dir files)
+  "Transform ANSI test files from DIR into MVM-compatible source."
+  (dolist (file files)
+    (let ((path (concatenate 'string dir file)))
       (when (probe-file path)
         (format t "  Transforming: ~A~%" file)
         (push (pathname-name file) *ansi-file-names*)
-        ;; Read forms with SBCL's reader, transform deftests, write back
-        (let ((forms nil)
-              (test-count *ansi-test-counter*))
+        (let ((forms nil))
           (with-open-file (s path :direction :input)
             (let ((*package* (find-package :cl-user)))
-              (loop
-                (let ((form (read s nil :eof)))
-                  (when (eq form :eof) (return))
-                  (push form forms)))))
+              (loop (let ((form (read s nil :eof)))
+                      (when (eq form :eof) (return))
+                      (push form forms)))))
           (setf forms (nreverse forms))
-          ;; Transform each form
-          (let ((out (make-string-output-stream)))
+          (let ((out (make-string-output-stream)) (test-forms nil))
             (format out "~%;; === ~A ===~%" file)
-            (let ((test-forms nil))
-            ;; Pass through defun/defvar at top level, collect deftest calls
             (dolist (form forms)
               (cond
-                ;; (deftest name form expected...)
                 ((and (consp form) (eq (car form) 'deftest))
-                 (let ((name (cadr form))
-                       (test-form (caddr form))
+                 (let ((name (cadr form)) (test-form (caddr form))
                        (expected (cdddr form)))
-                   (incf test-count)
-                   ;; Use global counter for unique test IDs
                    (setf *ansi-test-counter* (1+ *ansi-test-counter*))
                    (let ((test-id *ansi-test-counter*))
                      (format t "      ~D = ~A~%" test-id name)
                      (cond
                        ((= (length expected) 1)
-                        (push (format nil "(rt-run-test ~D (funcall (lambda () ~S)) '~S)"
-                                      test-id test-form (car expected))
-                              test-forms))
+                        (push (format nil "(rt-run-test ~D ~S '~S)"
+                                      test-id test-form (car expected)) test-forms))
                        ((> (length expected) 0)
-                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list (funcall (lambda () ~S))) '~S)"
-                                      test-id test-form expected)
-                              test-forms))
-                       (t nil)))))
-                ;; Skip stubs
-                ((and (consp form)
-                      (member (car form) '(defharmless def-fold-test
-                                           in-package declaim)))
-                 nil)
-                ;; Pass through everything else at top level
-                (t
-                 (format out "~S~%" form))))
-            ;; Generate wrapper function for the test calls
+                        (push (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
+                                      test-id test-form expected) test-forms))))))
+                ((and (consp form) (member (car form)
+                        '(defharmless def-fold-test def-macro-test
+                          in-package declaim))) nil)
+                (t (format out "~S~%" form))))
             (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-            (dolist (tf (nreverse test-forms))
-              (format out "  ~A~%" tf))
-            (format out ")~%"))
-            (format t "    ~D tests~%" test-count)
+            (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
+            (format out ")~%")
             (setf *real-ansi-sources*
                   (concatenate 'string *real-ansi-sources*
                                (get-output-stream-string out)))))))))
+
+;;; ============================================================
+;;; Load ANSI test files by chapter
+;;; ============================================================
+
+;; Cons chapter (68 files)
+(load-ansi-chapter "/tmp/ansi-test/cons/"
+  '("cons.lsp" "consp.lsp" "atom.lsp" "endp.lsp" "rest.lsp" "last.lsp"
+    "revappend.lsp" "nreconc.lsp" "rplaca.lsp" "rplacd.lsp"
+    "acons.lsp" "pairlis.lsp" "copy-alist.lsp" "nconc.lsp" "butlast.lsp"
+    "list.lsp" "listp.lsp" "nthcdr.lsp" "nth.lsp"
+    "copy-list.lsp" "copy-tree.lsp" "tailp.lsp"
+    "append.lsp" "mapcar.lsp" "mapc.lsp" "member.lsp" "assoc.lsp"
+    "ldiff.lsp" "subst.lsp" "tree-equal.lsp" "make-list.lsp"
+    "nbutlast.lsp" "list-length.lsp"
+    "mapcan.lsp" "mapcon.lsp" "mapl.lsp" "maplist.lsp"
+    "member-if.lsp" "member-if-not.lsp"
+    "assoc-if.lsp" "assoc-if-not.lsp"
+    "rassoc.lsp" "rassoc-if.lsp" "rassoc-if-not.lsp"
+    "sublis.lsp" "subst-if.lsp" "subst-if-not.lsp"
+    "nsubst.lsp" "nsubst-if.lsp" "nsubst-if-not.lsp" "nsublis.lsp"
+    "intersection.lsp" "nintersection.lsp"
+    "union.lsp" "nunion.lsp"
+    "set-difference.lsp" "nset-difference.lsp"
+    "set-exclusive-or.lsp" "nset-exclusive-or.lsp"
+    "adjoin.lsp" "subsetp.lsp"
+    "getf.lsp" "get-properties.lsp" "remf.lsp"
+    "push.lsp" "pop.lsp" "pushnew.lsp"
+    "cons-test-01.lsp" "cons-test-03.lsp" "cons-test-05.lsp"))
+
+;; Data and Control Flow chapter
+(load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
+  '("if.lsp" "and.lsp" "or.lsp" "not.lsp" "identity.lsp"
+    "not-and-null.lsp" "t.lsp" "nil.lsp"
+    "prog1.lsp" "prog2.lsp" "return.lsp"
+    "multiple-value-bind.lsp" "multiple-value-list.lsp"
+    "call-arguments-limit.lsp" "lambda-parameters-limit.lsp"
+    "ecase.lsp" "block.lsp" "return-from.lsp" "constantly.lsp"
+    "case.lsp" "apply.lsp" "when.lsp" "unless.lsp" "cond.lsp" "progn.lsp"))
+
+;; Iteration chapter
+(load-ansi-chapter "/tmp/ansi-test/iteration/"
+  '("dolist.lsp" "dotimes.lsp"))
+
+;; Hash-tables chapter
+(load-ansi-chapter "/tmp/ansi-test/hash-tables/"
+  '("gethash.lsp" "remhash.lsp" "clrhash.lsp" "maphash.lsp"
+    "hash-table-count.lsp" "hash-table-p.lsp"
+    "make-hash-table.lsp" "sxhash.lsp"))
+
+;; Numbers chapter
+(load-ansi-chapter "/tmp/ansi-test/numbers/"
+  '("evenp.lsp" "oddp.lsp" "ash.lsp"
+    "logand.lsp" "logior.lsp" "logxor.lsp" "lognot.lsp"))
+
+;; Symbols chapter
+(load-ansi-chapter "/tmp/ansi-test/symbols/"
+  '("symbolp.lsp" "keywordp.lsp" "gensym.lsp"
+    "boundp.lsp" "makunbound.lsp" "set.lsp"
+    "copy-symbol.lsp" "make-symbol.lsp"))
+
+;; Structures chapter
+(load-ansi-chapter "/tmp/ansi-test/structures/"
+  '("structure-00.lsp" "structures-01.lsp"))
+
+;; Strings chapter
+(load-ansi-chapter "/tmp/ansi-test/strings/"
+  '("string.lsp"))
+
+;; Characters chapter
+(load-ansi-chapter "/tmp/ansi-test/characters/"
+  '("char-compare.lsp"))
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))

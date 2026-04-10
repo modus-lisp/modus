@@ -1987,6 +1987,27 @@
                                           :step-form (or step init))
                           (loop-state-iterations state))))
 
+                 ;; FOR var BELOW/TO/DOWNTO n — shorthand for FROM 0
+                 ((member iter-kw '(611742951095832940 708656842296756988
+                                    962879967384500096 223271319558938470))
+                  (let ((end-form (car rest))
+                        (end-test (cond
+                                    ((= iter-kw 611742951095832940) :to)
+                                    ((= iter-kw 708656842296756988) :below)
+                                    ((= iter-kw 962879967384500096) :above)
+                                    (t :downto))))
+                    (setf rest (cdr rest))
+                    (let ((by-form nil))
+                      (when (and rest (symbolp (car rest))
+                                 (= (normalize-name (car rest)) 934319717393949980))
+                        (setf by-form (cadr rest) rest (cddr rest)))
+                      (push (make-loop-iter :kind :from :var var
+                                            :init-form 0
+                                            :end-form end-form
+                                            :end-test end-test
+                                            :by-form by-form)
+                            (loop-state-iterations state)))))
+
                  (t (error "MVM loop: unknown FOR clause ~A" iter-kw))))))
 
           ;; WHILE condition

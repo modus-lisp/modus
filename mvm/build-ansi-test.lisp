@@ -236,6 +236,31 @@
     "bit-vector.lsp" "simple-bit-vector.lsp"
     "upgraded-array-element-type.lsp"))
 
+;; Eval and Compile chapter
+(load-ansi-chapter "/tmp/ansi-test/eval-and-compile/"
+  '("constantp.lsp" "eval.lsp" "locally.lsp" "the.lsp" "special.lsp"
+    "lambda.lsp" "eval-when.lsp" "macroexpand.lsp" "macroexpand-1.lsp"
+    "compile.lsp" "defmacro.lsp" "ignore.lsp" "ignorable.lsp"
+    "optimize.lsp" "proclaim.lsp" "declaim.lsp" "type.lsp"
+    "eval-and-compile.lsp" "declaration.lsp"))
+
+;; Types and Classes chapter
+(load-ansi-chapter "/tmp/ansi-test/types-and-classes/"
+  '("typep.lsp" "type-of.lsp" "coerce.lsp" "subtypep.lsp" "deftype.lsp"
+    "types-and-class.lsp" "types-and-class-2.lsp"
+    "subtypep-integer.lsp" "subtypep-cons.lsp" "subtypep-member.lsp"
+    "subtypep-eql.lsp" "subtypep-array.lsp" "subtypep-rational.lsp"
+    "subtypep-real.lsp" "subtypep-float.lsp" "subtypep-function.lsp"))
+
+;; Conditions chapter (what we can handle)
+(load-ansi-chapter "/tmp/ansi-test/conditions/"
+  '("condition.lsp" "error.lsp" "warn.lsp"
+    "handler-case.lsp" "handler-bind.lsp" "ignore-errors.lsp"))
+
+;; Reader chapter
+(load-ansi-chapter "/tmp/ansi-test/reader/"
+  '("readtablep.lsp" "read-from-string.lsp" "read.lsp"))
+
 ;; More DCF
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
   '("every.lsp" "some.lsp" "notany.lsp" "notevery.lsp"

@@ -42,7 +42,22 @@
 (in-package :modus.mvm)
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
+(defun listify-form (form)
+  (if (listp form) form (list form)))
+(defvar lookup-table nil)
 (in-package :cl-user)
+
+;; Create test packages that ANSI test files reference at read time
+(dolist (pkg '("STRUCT-TEST-PACKAGE" "CL-TEST" "FS-A" "FS-B" "B"
+               "DS1" "DS2" "DS3" "DS4" "LOAD-TEST-PACKAGE"
+               "CL-TEST-MLFSS-PACKAGE" "A" "RT" "REGRESSION-TEST"
+               "X" "Y" "Z" "Q" "KEYWORD-TESTS"))
+  (unless (find-package pkg) (make-package pkg :use '(:cl))))
+;; Intern symbols needed by test files
+(dolist (sym '("A" "B" "C" "D" "E" "F" "G" "H" "I" "J" "K"))
+  (dolist (pkg '("DS1" "DS2" "FS-A" "FS-B" "CL-TEST-MLFSS-PACKAGE"
+                  "STRUCT-TEST-PACKAGE" "CL-TEST" "B"))
+    (when (find-package pkg) (intern sym pkg))))
 
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")

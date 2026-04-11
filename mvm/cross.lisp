@@ -90,7 +90,7 @@
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
           (let ((table fn-table)
-                (max-retries 3))
+                (max-retries 2))
             (loop for attempt from 1
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)

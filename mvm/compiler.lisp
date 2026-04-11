@@ -1943,6 +1943,12 @@
                (= kw 313452561496444628))
            (let ((var (cadr rest)))
              (setf rest (cddr rest))
+             (when (consp var)
+               ;; Destructuring FOR (a b) ... — skip until next loop keyword
+               (loop while (and rest (not (and (symbolp (car rest))
+                                               (cl-loop-keyword-p (car rest)))))
+                     do (setf rest (cdr rest))))
+             (when (and (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
                (cond
                  ;; FOR var FROM/UPFROM/DOWNFROM start ...
@@ -2050,7 +2056,7 @@
                   ;; Unknown FOR clause — skip it as body form
                   (format t "  WARN: unknown FOR clause ~A~%" iter-kw)
                   (push (car rest) (loop-state-body-forms state))
-                  (setf rest (cdr rest)))))))
+                  (setf rest (cdr rest))))))))
 
           ;; WHILE condition
           ((= kw 468563938978316688)

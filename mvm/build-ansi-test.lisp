@@ -155,6 +155,7 @@
     "loop1.lsp" "loop2.lsp" "loop3.lsp" "loop4.lsp" "loop5.lsp"
     "loop6.lsp" "loop7.lsp" "loop8.lsp" "loop9.lsp"
     "loop10.lsp" "loop11.lsp" "loop12.lsp" "loop13.lsp"
+    "loop14.lsp" "loop15.lsp" "loop16.lsp" "loop17.lsp"
 ))
 
 ;; Hash-tables chapter
@@ -183,7 +184,11 @@
     "deposit-field.lsp" "mask-field.lsp"
     "isqrt.lsp" "signum.lsp" "random.lsp"
     "floor.lsp" "ceiling.lsp" "truncate.lsp" "round.lsp"
-    "divide.lsp"))
+    "divide.lsp"
+    "sin.lsp" "cos.lsp" "tan.lsp" "exp.lsp" "sqrt.lsp"
+    "atan.lsp" "phase.lsp"
+    "complexp.lsp" "numberp.lsp" "realp.lsp" "integerp.lsp"
+    "float-radix.lsp" "float-digits.lsp"))
 
 ;; Symbols chapter
 (load-ansi-chapter "/tmp/ansi-test/symbols/"
@@ -194,7 +199,8 @@
 ;; Structures chapter
 ;; Structures
 (load-ansi-chapter "/tmp/ansi-test/structures/"
-  '("structure-00.lsp" "structures-01.lsp"))
+  '("structure-00.lsp" "structures-01.lsp"
+    "structures-02.lsp" "structures-03.lsp" "structures-04.lsp"))
 
 ;; Strings chapter
 (load-ansi-chapter "/tmp/ansi-test/strings/"
@@ -215,7 +221,20 @@
     "array-rank.lsp" "array-total-size.lsp"
     "array-dimension.lsp" "array-dimensions.lsp"
     "array-element-type.lsp" "row-major-aref.lsp"
-    "make-array.lsp"))
+    "make-array.lsp"
+    "array.lsp" "simple-array.lsp" "array-t.lsp" "simple-array-t.lsp"
+    "adjust-array.lsp" "adjustable-array-p.lsp"
+    "array-displacement.lsp" "array-has-fill-pointer-p.lsp"
+    "array-in-bounds-p.lsp" "array-misc.lsp"
+    "fill-pointer.lsp" "vector-push.lsp" "vector-push-extend.lsp"
+    "vector-pop.lsp"
+    "bit-vector-p.lsp" "simple-bit-vector-p.lsp"
+    "bit.lsp" "sbit.lsp"
+    "bit-and.lsp" "bit-ior.lsp" "bit-xor.lsp" "bit-eqv.lsp"
+    "bit-nand.lsp" "bit-nor.lsp" "bit-andc1.lsp" "bit-andc2.lsp"
+    "bit-orc1.lsp" "bit-orc2.lsp" "bit-not.lsp"
+    "bit-vector.lsp" "simple-bit-vector.lsp"
+    "upgraded-array-element-type.lsp"))
 
 ;; More DCF
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
@@ -244,7 +263,8 @@
     "fill.lsp" "replace.lsp" "mismatch.lsp"
     "search-list.lsp" "merge.lsp"
     "sort.lsp" "stable-sort.lsp"
-    "map-into.lsp" "make-sequence.lsp"))
+    "map-into.lsp" "make-sequence.lsp"
+    "nsubstitute.lsp" "nsubstitute-if.lsp" "nsubstitute-if-not.lsp"))
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))

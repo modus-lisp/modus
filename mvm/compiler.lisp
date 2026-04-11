@@ -2117,6 +2117,18 @@
              (setf (loop-state-accumulator state) (list :count expr))
              (setf rest (cddr rest))))
 
+          ;; APPEND/APPENDING expr
+          ((or (= kw 195734683635763289) (= kw 682179722204096129))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :append expr))
+             (setf rest (cddr rest))))
+
+          ;; NCONC/NCONCING expr
+          ((or (= kw 876035653932002648) (= kw 1018827631117520136))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :nconc expr))
+             (setf rest (cddr rest))))
+
           ;; WHEN/IF cond DO body | COLLECT expr
           ((or (= kw 89559098115627243) (= kw 448736678201786992))
            (let ((cond-form (cadr rest)))
@@ -2218,7 +2230,7 @@
       (push wb bindings))
 
     ;; Accumulator binding (always/thereis don't need one)
-    (when (and acc (member (car acc) '(:collect :collect-when :sum :count)))
+    (when (and acc (member (car acc) '(:collect :collect-when :sum :count :append :nconc)))
       (push (list acc-var (case (car acc)
                             (:collect nil)
                             (:collect-when nil)
@@ -2314,6 +2326,10 @@
                 (:count
                  (list `(when ,(cadr acc)
                           (setq ,acc-var (+ ,acc-var 1)))))
+                (:append
+                 (list `(setq ,acc-var (append ,acc-var ,(cadr acc)))))
+                (:nconc
+                 (list `(setq ,acc-var (nconc ,acc-var ,(cadr acc)))))
                 (:always
                  (list `(unless ,(cadr acc) (return nil))))
                 (:thereis
@@ -2357,8 +2373,8 @@
                        ;; Collect returns reversed list (nreverse in prelude)
                        ((and acc (member (car acc) '(:collect :collect-when)))
                         `(progn ,inner2 ,@finally (nreverse ,acc-var)))
-                       ;; Sum/count returns accumulator
-                       ((and acc (member (car acc) '(:sum :count)))
+                       ;; Sum/count/append/nconc returns accumulator directly
+                       ((and acc (member (car acc) '(:sum :count :append :nconc)))
                         `(progn ,inner2 ,@finally ,acc-var))
                        ;; Always: loop returns t/nil directly
                        ((and acc (eq (car acc) :always))

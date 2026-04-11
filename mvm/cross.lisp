@@ -65,8 +65,6 @@
          (forms (car forms-and-lines))
          (source-lines (cdr forms-and-lines))
          ;; Compile all forms through the MVM compiler
-         ;; mvm-compile-all is defined in compiler.lisp and returns
-         ;; a compiled-module struct
          (compiled-mod (mvm-compile-all forms :source-lines source-lines))
          ;; Convert to mvm-module for the image pipeline
          (module (compiled-module-to-mvm-module compiled-mod source-text)))
@@ -90,7 +88,7 @@
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
           (let ((table fn-table)
-                (max-retries 2))
+                (max-retries 10))
             (loop for attempt from 1
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)

@@ -617,7 +617,7 @@
   "Decode an MVM instruction starting at POS in BYTES.
    Returns (VALUES opcode operands new-pos) where operands is a list."
   (when (>= pos (length bytes))
-    (return-from decode-instruction (cons 0 (cons nil pos))))  ; NOP
+    (return-from decode-instruction (cons 0 (cons nil (1+ pos)))))  ; NOP, advance past OOB
   (let* ((opcode (aref bytes pos))
          (info (gethash opcode *opcode-table*))
          (spec (if info (opcode-info-operands info) nil))

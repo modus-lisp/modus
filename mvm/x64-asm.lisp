@@ -74,15 +74,14 @@
   (let ((bytes (code-buffer-bytes buf)))
     (dolist (fixup (code-buffer-fixups buf))
       (destructuring-bind (pos label size) fixup
-        (let* ((target (or (label-position label)
-                           (error "Undefined label: ~A" (label-name label))))
-               ;; rel32 is relative to end of instruction (pos + 4)
-               (rel (- target (+ pos size))))
+        (let* ((target (label-position label)))
+          (when target  ; skip unresolved labels
+          (let ((rel (- target (+ pos size))))
           (ecase size
             (4 (setf (aref bytes pos) (ldb (byte 8 0) rel)
                      (aref bytes (+ pos 1)) (ldb (byte 8 8) rel)
                      (aref bytes (+ pos 2)) (ldb (byte 8 16) rel)
-                     (aref bytes (+ pos 3)) (ldb (byte 8 24) rel))))))))
+                     (aref bytes (+ pos 3)) (ldb (byte 8 24) rel))))))))))
   buf)
 
 ;;; ============================================================

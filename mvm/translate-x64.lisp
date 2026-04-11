@@ -2369,7 +2369,8 @@
           for name = (first entry)
           for offset = (second entry)
           for length = (third entry)
-          do (let* ((fn-label (aref fn-labels i))
+          do
+             (let* ((fn-label (aref fn-labels i))
                     (state (make-translate-state
                             :buf buf
                             :mvm-bytes bytecode
@@ -2403,6 +2404,7 @@
                                   (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
                                          c i name pos opcode operands)))
                               (setf pos new-pos)))))))
+
     ;; Resolve all label fixups
     (fixup-labels buf)
     ;; Return result

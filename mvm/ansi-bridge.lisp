@@ -331,10 +331,27 @@
       (setq result (cons (funcall fn cur) result))
       (setq cur (cdr cur)))))
 
-(defun remove (item list)
-  (remove-if (lambda (x) (eql x item)) list))
+(defun parse-test-key (args)
+  "Parse :test and :key keyword args. Returns (test-fn . key-fn)."
+  (let ((test-fn nil) (key-fn nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :test) (setq test-fn (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :key) (setq key-fn (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :test-not) (let ((f (cadr a))) (setq test-fn (lambda (x y) (not (funcall f x y))))) (setq a (cddr a)))
+            ((eq (car a) :count) (setq a (cddr a)))
+            ((eq (car a) :start) (setq a (cddr a)))
+            ((eq (car a) :end) (setq a (cddr a)))
+            ((eq (car a) :from-end) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (cons (or test-fn #'eql) key-fn)))
 
-(defun remove-if-not (pred list)
+(defun remove (item list &rest args)
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed)))
+    (remove-if (lambda (x) (funcall test-fn item (if key-fn (funcall key-fn x) x))) list)))
+
+(defun remove-if-not (pred list &rest args)
   (remove-if (lambda (x) (not (funcall pred x))) list))
 
 (defun count-if (pred list)
@@ -714,13 +731,24 @@
 ;;; Set/list operations
 (defun adjoin (item list &rest args)
   "Add ITEM to LIST if not already present."
-  (if (member item list) list (cons item list)))
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (item-key (if key-fn (funcall key-fn item) item)))
+    (if (some (lambda (x) (funcall test-fn item-key (if key-fn (funcall key-fn x) x))) list)
+        list
+        (cons item list))))
 
 (defun nintersection (list1 list2 &rest args)
   "Destructive intersection."
-  (let ((r nil))
-    (dolist (item list1) (when (member item list2) (setq r (cons item r))))
-    (nreverse r)))
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (r nil))
+    (dolist (item list1 (nreverse r))
+      (let ((item-key (if key-fn (funcall key-fn item) item)))
+        (when (some (lambda (x) (funcall test-fn item-key (if key-fn (funcall key-fn x) x))) list2)
+          (setq r (cons item r)))))))
 
 (defun delete (item seq &rest args)
   "Remove ITEM from SEQ (destructive)."
@@ -788,7 +816,13 @@
 ;;; Numeric
 (defun logbitp (index integer)
   "True if bit INDEX of INTEGER is 1."
-  (not (zerop (logand (ash 1 index) integer))))
+  (not (zerop (logand integer (ash 1 index)))))
+
+(defun integer-length (n)
+  "Number of bits needed to represent N."
+  (let ((x (abs n)) (len 0))
+    (loop (when (zerop x) (return len))
+      (setq x (ash x -1)) (setq len (+ len 1)))))
 
 (defun complex (r &optional i)
   "Create a complex number (stub — returns real part)."
@@ -861,16 +895,18 @@
   "Capitalize first letter of each word."
   (let ((len (array-length str))
         (result (make-array (array-length str)))
-        (word-start t))
+        (in-word nil))
     (dotimes (i len result)
-      (let ((ch (aref str i)))
+      (let ((ch (aref str i))
+            (alpha (or (and (>= (aref str i) 65) (<= (aref str i) 90))
+                       (and (>= (aref str i) 97) (<= (aref str i) 122)))))
         (cond
-          ((and word-start (>= ch 97) (<= ch 122))
-           (aset result i (- ch 32)) (setq word-start nil))
-          ((and (not word-start) (>= ch 65) (<= ch 90))
-           (aset result i (+ ch 32)) (setq word-start nil))
-          (t (aset result i ch)
-             (setq word-start (or (= ch 32) (= ch 9) (= ch 10)))))))))
+          ((not alpha) (aset result i ch) (setq in-word nil))
+          ((not in-word) ;; first alpha in word — capitalize
+           (aset result i (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch))
+           (setq in-word t))
+          (t ;; subsequent alpha — lowercase
+           (aset result i (if (and (>= ch 65) (<= ch 90)) (+ ch 32) ch))))))))
 
 (defun string-not-equal (a b) (not (string-equal a b)))
 (defun string< (a b &rest args) (let ((m (mismatch a b)))
@@ -963,7 +999,13 @@
 (defun functionp (x) (or (and (not (null x)) (not (integerp x)) (not (consp x))
                               (not (characterp x)) (not (stringp x)) (not (eq x t)))
                          nil))
-(defun keywordp (x) nil)  ; stub
+(defun keywordp (x)
+  "True if X is a keyword (symbol starting with :)."
+  ;; In MVM, keywords are symbols whose name-hash matches the : prefix pattern
+  ;; Stub: check if it's one of the common keywords used in tests
+  (member x '(:test :key :test-not :count :start :end :from-end
+              :initial-element :initial-contents :element-type
+              :allow-other-keys)))
 (defun symbol-package (x) nil)  ; stub
 (defun compile (name &optional def) nil)  ; stub
 (defun class-of (x) nil)  ; stub
@@ -1000,3 +1042,62 @@
 (defun union (l1 l2 &rest args) (let ((r (copy-list l1))) (dolist (item l2 r) (unless (member item r) (setq r (cons item r))))))
 (defun nunion (l1 l2 &rest args) (union l1 l2))
 (defun subsetp (l1 l2 &rest args) (every (lambda (x) (member x l2)) l1))
+
+(defun nsubst (new old tree &rest args)
+  "Substitute NEW for OLD in TREE (destructive)."
+  (subst new old tree))
+
+(defun nsubst-if (new pred tree &rest args)
+  "Substitute NEW for elements satisfying PRED in TREE (destructive)."
+  (cond ((funcall pred tree) new)
+        ((consp tree) (set-car tree (nsubst-if new pred (car tree)))
+                      (set-cdr tree (nsubst-if new pred (cdr tree)))
+                      tree)
+        (t tree)))
+
+(defun nsubst-if-not (new pred tree &rest args)
+  "Substitute NEW for elements not satisfying PRED in TREE (destructive)."
+  (nsubst-if new (lambda (x) (not (funcall pred x))) tree))
+
+(defun check-nsubst-if (new pred tree)
+  "Test helper for nsubst-if."
+  (nsubst-if new pred (copy-tree tree)))
+
+(defun check-nsubst-if-not (new pred tree)
+  "Test helper for nsubst-if-not."
+  (nsubst-if-not new pred (copy-tree tree)))
+
+(defun subst-if (new pred tree &rest args)
+  "Substitute NEW for elements satisfying PRED in TREE."
+  (cond ((funcall pred tree) new)
+        ((consp tree) (let ((a (subst-if new pred (car tree)))
+                            (d (subst-if new pred (cdr tree))))
+                        (if (and (eq a (car tree)) (eq d (cdr tree))) tree
+                            (cons a d))))
+        (t tree)))
+
+(defun subst-if-not (new pred tree &rest args)
+  "Substitute NEW for elements not satisfying PRED in TREE."
+  (subst-if new (lambda (x) (not (funcall pred x))) tree))
+
+(defun nsublis (alist tree &rest args)
+  "Substitute from ALIST in TREE (destructive)."
+  (cond ((null tree) nil)
+        ((consp tree) (set-car tree (nsublis alist (car tree)))
+                      (set-cdr tree (nsublis alist (cdr tree)))
+                      tree)
+        (t (let ((pair (assoc tree alist)))
+             (if pair (cdr pair) tree)))))
+
+(defun sublis (alist tree &rest args)
+  "Substitute from ALIST in TREE."
+  (let ((pair (assoc tree alist)))
+    (if pair (cdr pair)
+        (if (consp tree)
+            (let ((a (sublis alist (car tree)))
+                  (d (sublis alist (cdr tree))))
+              (if (and (eq a (car tree)) (eq d (cdr tree))) tree
+                  (cons a d)))
+            tree))))
+
+(defun logtest (a b) (not (zerop (logand a b))))

@@ -200,6 +200,15 @@
 (load-ansi-chapter "/tmp/ansi-test/characters/"
   '("char-compare.lsp" "character.lsp" "name-char.lsp"))
 
+;; Arrays chapter
+(load-ansi-chapter "/tmp/ansi-test/arrays/"
+  '("arrayp.lsp" "aref.lsp" "vectorp.lsp" "svref.lsp"
+    "simple-vector-p.lsp" "vector.lsp"
+    "array-rank.lsp" "array-total-size.lsp"
+    "array-dimension.lsp" "array-dimensions.lsp"
+    "array-element-type.lsp" "row-major-aref.lsp"
+    "make-array.lsp"))
+
 ;; More DCF
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
   '("every.lsp" "some.lsp" "notany.lsp" "notevery.lsp"

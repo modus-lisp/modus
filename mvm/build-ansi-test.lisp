@@ -479,7 +479,53 @@
 (load-ansi-chapter "/tmp/ansi-test/conditions/"
   '("define-condition.lsp"))
 
-;; More DCF
+;; === ALL remaining files ===
+
+(load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
+  '("ccase.lsp" "compiled-function-p.lsp" "complement.lsp" "ctypecase.lsp"
+    "data-and-control-flow.lsp" "define-modify-macro.lsp"
+    "define-setf-expander.lsp" "defsetf.lsp" "destructuring-bind.lsp"
+    "eql.lsp" "fdefinition.lsp" "flet.lsp" "fmakunbound.lsp" "funcall.lsp"
+    "function-lambda-expression.lsp" "function.lsp" "get-setf-expansion.lsp"
+    "labels.lsp" "lambda-list-keywords.lsp" "macrolet.lsp"
+    "multiple-value-call.lsp" "places.lsp" "prog.lsp" "progv.lsp"
+    "psetf.lsp" "rotatef.lsp" "shiftf.lsp" "tagbody.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/format/"
+  '("format-a.lsp" "format-ampersand.lsp" "format-b.lsp" "format-brace.lsp"
+    "format-c.lsp" "format-circumflex.lsp" "format-conditional.lsp"
+    "format-d.lsp" "format-f.lsp" "format-goto.lsp" "format-i.lsp"
+    "format-justify.lsp" "format-logical-block.lsp" "format-newline.lsp"
+    "format-o.lsp" "format-p.lsp" "format-page.lsp" "format-paren.lsp"
+    "format-percent.lsp" "format-question.lsp" "format-r.lsp" "format-s.lsp"
+    "format-slash.lsp" "format-t.lsp" "format-tilde.lsp"
+    "format-underscore.lsp" "format-x.lsp" "formatter-c.lsp"
+    "roman-numerals.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/iteration/" '("loop.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/objects/"
+  '("defclass-forward-reference.lsp" "defclass.lsp"
+    "defgeneric-method-combination-aux.lsp"
+    "define-method-combination-long-form.lsp"
+    "make-instances-obsolete.lsp" "make-load-form-saving-slots.lsp"
+    "make-load-form.lsp" "no-applicable-method.lsp" "no-next-method.lsp"
+    "unbound-slot.lsp" "update-instance-for-different-class.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/pathnames/"
+  '("load-logical-pathname-translations.lsp" "logical-pathname-translations.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/printer/"
+  '("pprint-exit-if-list-exhausted.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/reader/"
+  '("read-suppress.lsp" "set-macro-character.lsp" "syntax-tokens.lsp" "syntax.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/symbols/" '("cl-symbols.lsp"))
+
+(load-ansi-chapter "/tmp/ansi-test/types-and-classes/" '("class-precedence-lists.lsp"))
+
+;; DCF — already loaded above
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
   '("every.lsp" "some.lsp" "notany.lsp" "notevery.lsp"
     "equal.lsp" "equalp.lsp" "typecase.lsp"

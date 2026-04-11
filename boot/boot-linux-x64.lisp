@@ -12,7 +12,7 @@
 
 (defconstant +linux-x64-load-addr+ #x400000)    ; Traditional Linux x64 load address
 (defconstant +linux-x64-heap-addr+ #x10000000)  ; Heap start (same as bare-metal)
-(defconstant +linux-x64-heap-size+ #x0E000000)  ; 224MB heap
+(defconstant +linux-x64-heap-size+ #x38000000)  ; 896MB heap
 ;; Globals at start of heap region (after mmap succeeds)
 ;; +0x00: argc, +0x08: argv base, +0x10: argv[0], +0x18: argv[1], etc.
 (defconstant +linux-x64-globals+  #x10000000)

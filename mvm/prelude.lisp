@@ -302,6 +302,29 @@
       ;; If they meet, it's circular
       (when (eq fast slow) (return nil)))))
 
+(defun cddddr (x) (cdr (cdddr x)))
+
+(defun copy-list (list)
+  "Return a fresh copy of LIST (top-level conses only)."
+  (if (null list) nil
+      (let ((result (cons (car list) nil)))
+        (let ((tail result)
+              (rest (cdr list)))
+          (loop
+            (when (atom rest)
+              (set-cdr tail rest)
+              (return result))
+            (let ((new (cons (car rest) nil)))
+              (set-cdr tail new)
+              (setq tail new)
+              (setq rest (cdr rest))))))))
+
+(defun copy-tree (tree)
+  "Return a fresh copy of TREE (all conses copied recursively)."
+  (if (consp tree)
+      (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
+      tree))
+
 (defun length (seq)
   "Return the length of SEQ (list or array)."
   (if (consp seq)

@@ -44,6 +44,22 @@
 (defun notnot-mv (x) (not (not x)))
 (in-package :cl-user)
 
+;; Rewrite (make-array '(N) ...) → (make-array N ...) for MVM compatibility
+(defun rewrite-make-array-dims (form)
+  "Walk form tree, converting list-dimension make-array to integer-dimension."
+  (cond
+    ((atom form) form)
+    ((and (eq (car form) 'make-array)
+          (consp (cdr form))
+          (consp (cadr form))
+          (eq (car (cadr form)) 'quote)
+          (consp (cadr (cadr form)))
+          (null (cddr (cadr (cadr form)))))
+     ;; (make-array '(N) ...) → (make-array N ...)
+     (cons 'make-array (cons (car (cadr (cadr form)))
+                             (mapcar #'rewrite-make-array-dims (cddr form)))))
+    (t (mapcar #'rewrite-make-array-dims form))))
+
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
@@ -64,7 +80,7 @@
                         (when (eq form :eof) (return))
                         (push form forms)))))
             (push (pathname-name file) *ansi-file-names*)
-            (setf forms (nreverse forms))
+            (setf forms (mapcar #'rewrite-make-array-dims (nreverse forms)))
             (let ((out (make-string-output-stream)) (test-forms nil))
               (format out "~%;; === ~A ===~%" file)
               (dolist (form forms)
@@ -274,6 +290,9 @@
 ;;; ============================================================
 
 (defvar *driver-source* "
+
+(defun halt ()
+  (syscall3 60 1 0 0))
 
 (defun sys-exit (code)
   (let ((c code))

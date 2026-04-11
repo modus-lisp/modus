@@ -4578,7 +4578,7 @@
                               (function-info-bytecode-offset fn-info)
                               ;; Unresolved: target the %UNRESOLVED-FN stub
                               ;; which returns nil safely
-                              (let ((stub (gethash "%UNRESOLVED-FN" *functions*)))
+                              (let ((stub (gethash (compute-name-hash "%UNRESOLVED-FN") *functions*)))
                                 (if stub
                                     (function-info-bytecode-offset stub)
                                     0)))))

@@ -313,21 +313,6 @@
 (defun 1+ (x) (+ x 1))
 (defun 1- (x) (- x 1))
 
-(defun copy-list (list)
-  "Return a fresh copy of LIST (top-level conses only)."
-  (if (null list) nil
-      (let ((result (cons (car list) nil)))
-        (let ((tail result)
-              (rest (cdr list)))
-          (loop
-            (when (atom rest)
-              (set-cdr tail rest)
-              (return result))
-            (let ((new (cons (car rest) nil)))
-              (set-cdr tail new)
-              (setq tail new)
-              (setq rest (cdr rest))))))))
-
 (defun copy-tree (tree)
   "Return a fresh copy of TREE (all conses copied recursively)."
   (if (consp tree)

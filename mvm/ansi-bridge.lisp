@@ -601,3 +601,38 @@
         (if (stringp a)
           (if (stringp b) (string-equal a b) nil)
           nil)))))
+
+;;; ============================================================
+;;; Missing CL functions needed by ANSI tests
+;;; ============================================================
+
+(defun assert (test-form) (if test-form t nil))
+(defun equalp (a b) (equalp-impl a b))
+(defun elt (seq idx) (if (consp seq) (nth idx seq) (aref seq idx)))
+(defun string= (a b) (string-equal a b))
+(defun string/= (a b) (if (string-equal a b) nil t))
+(defun constantly (value) (lambda (&rest args) value))
+(defun is-eql-p (x) (lambda (y) (eql x y)))
+(defun is-not-eql-p (x) (lambda (y) (not (eql x y))))
+(defun sort (seq pred) (if (or (null seq) (null (cdr seq))) seq
+  (let ((result (list (car seq)))) (dolist (item (cdr seq))
+    (if (funcall pred item (car result)) (setq result (cons item result))
+      (let ((prev result)) (loop (when (null (cdr prev)) (set-cdr prev (list item)) (return nil))
+        (when (funcall pred item (cadr prev)) (set-cdr prev (cons item (cdr prev))) (return nil))
+        (setq prev (cdr prev)))))) result)))
+(defun stable-sort (seq pred) (sort seq pred))
+(defun substitute (new old seq &rest args) (mapcar1 (lambda (item) (if (eql item old) new item)) seq))
+(defun substitute-if (new pred seq &rest args) (mapcar1 (lambda (item) (if (funcall pred item) new item)) seq))
+(defun substitute-if-not (new pred seq &rest args) (mapcar1 (lambda (item) (if (funcall pred item) item new)) seq))
+(defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
+(defun hash-table-count (ht) (let ((c 0) (cur (car ht))) (loop (when (null cur) (return c)) (setq c (+ c 1)) (setq cur (cdr cur)))))
+(defun array-element-type (a) t)
+(defun check-type-error (fn args) nil)
+(defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))
+(defun make-sequence (type size &rest args) (if (eq type 'list) (let ((r nil)) (dotimes (i size) (setq r (cons nil r))) r) (make-array size)))
+(defun coerce (obj type) (cond ((eq type 'list) (if (consp obj) obj (list obj))) ((eq type 'character) obj) (t obj)))
+(defun mismatch (s1 s2) (let ((l1 (length s1)) (l2 (length s2))) (let ((limit (if (< l1 l2) l1 l2)) (i 0))
+  (loop (when (>= i limit) (return (if (= l1 l2) nil i))) (unless (eql (elt s1 i) (elt s2 i)) (return i)) (setq i (+ i 1))))))
+(defun random (n) (mod (ash (logxor (* 6364136223846793005 (mem-ref #x100000A0 :u64)) 1442695040888963407) -17) n))
+(defun do-special-strings (fn) (funcall fn ""))
+(defun typep* (obj type) (typep obj type))

@@ -1809,7 +1809,10 @@
       (let ((pp (preprocess-params params fbody)))
         ;; Use mvm-compile-function-internal with parent env (for closure access),
         ;; then manually register and collect IR (like mvm-compile-function does).
-        (let* ((fname (if (symbolp name) (symbol-name name) (string name)))
+        (let* ((fname (cond ((symbolp name) (symbol-name name))
+                            ((and (consp name) (eq (car name) 'setf))
+                             (format nil "SETF-~A" (symbol-name (cadr name))))
+                            (t (format nil "~A" name))))
                (result (mvm-compile-function-internal fname (car pp) (cdr pp) env))
                (info (car result)))
           ;; Register in function table so CALL resolution works

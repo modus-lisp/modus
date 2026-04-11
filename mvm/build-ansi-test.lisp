@@ -35,6 +35,15 @@
 (defvar *bridge-source*  (mvm-text "mvm/ansi-bridge.lisp"))
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
+;; SBCL-level stubs for functions called during macro expansion
+(defun notnot (x) (not (not x)))
+(defun notnot-mv (x) (not (not x)))
+(defun classify-error* (form) nil)
+(in-package :modus.mvm)
+(defun notnot (x) (not (not x)))
+(defun notnot-mv (x) (not (not x)))
+(in-package :cl-user)
+
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
@@ -75,14 +84,20 @@
                                             (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
                                                     test-id test-form expected)))
                                          (error () nil))))
-                         (when (and test-str (not (search "#<" test-str)))
+                         (when (and test-str
+                                    (not (search "#<" test-str))
+                                    (not (search "&ENVIRONMENT" test-str))
+                                    (not (search "STRUCT-TEST-" test-str)))
                            (push test-str test-forms))))))
                   ((and (consp form) (member (car form)
                           '(defharmless def-fold-test def-macro-test
                             in-package declaim))) nil)
                   (t (let ((s (handler-case (format nil "~S" form)
                                 (error () nil))))
-                       (when (and s (not (search "#<" s)))
+                       (when (and s
+                                  (not (search "#<" s))
+                                  (not (search "&ENVIRONMENT" s))
+                                  (not (search "STRUCT-TEST-" s)))
                          (write-string s out)
                          (terpri out))))))
               (format out "(defun run-ansi-~A ()~%" (pathname-name file))
@@ -175,11 +190,25 @@
 
 ;; Strings chapter
 (load-ansi-chapter "/tmp/ansi-test/strings/"
-  '("string.lsp" "stringp.lsp"))
+  '("string.lsp" "stringp.lsp" "simple-string-p.lsp"
+    "char-schar.lsp" "make-string.lsp"
+    "string-upcase.lsp" "string-downcase.lsp" "string-capitalize.lsp"
+    "nstring-upcase.lsp" "nstring-downcase.lsp" "nstring-capitalize.lsp"
+    "string-trim.lsp" "string-left-trim.lsp" "string-right-trim.lsp"
+    "string-comparisons.lsp"))
 
-;; Characters chapter
 (load-ansi-chapter "/tmp/ansi-test/characters/"
-  '("char-compare.lsp"))
+  '("char-compare.lsp" "character.lsp" "name-char.lsp"))
+
+;; More DCF
+(load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
+  '("every.lsp" "some.lsp" "notany.lsp" "notevery.lsp"
+    "equal.lsp" "equalp.lsp" "typecase.lsp"
+    "multiple-value-prog1.lsp" "multiple-value-setq.lsp"
+    "values-list.lsp" "nth-value.lsp"
+    "catch.lsp" "unwind-protect.lsp"
+    "functionp.lsp" "fboundp.lsp"
+    "psetq.lsp" "values.lsp"))
 
 ;; Sequences chapter
 (load-ansi-chapter "/tmp/ansi-test/sequences/"

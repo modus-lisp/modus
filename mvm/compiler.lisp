@@ -100,6 +100,9 @@
 (defvar *function-return-label* nil
   "Label for early return from function body (return outside loop)")
 
+(defvar *unresolved-calls* (make-hash-table :test 'equal)
+  "Tracks unresolved function calls: name-string -> count")
+
 (defvar *globals* (make-hash-table :test 'eql)
   "Set of known global variable names (hash -> t)")
 
@@ -4583,7 +4586,8 @@
                                     (function-info-bytecode-offset stub)
                                     0)))))
              (unless fn-info
-               (format t "  WARN: unresolved CALL ~S~%" fn-name))
+               (when (boundp '*unresolved-calls*)
+                 (incf (gethash fn-name *unresolved-calls* 0))))
              (mvm-call buf target)))
 
           (:call-indirect
@@ -4955,6 +4959,7 @@
         (*function-table* nil)
         (*constant-table* nil)
         (*label-counter* 0)
+        (*unresolved-calls* (make-hash-table :test 'equal))
         (*macro-table* (make-hash-table :test 'eql))
         (*globals* (make-hash-table :test 'eql))
         (*constants* (make-hash-table :test 'eql))
@@ -5072,6 +5077,21 @@
               (remhash (function-info-name (car entry)) *functions*)
               (setf *function-table*
                     (remove (car entry) *function-table*))))))
+
+      ;; Report unresolved calls
+      (when (and (boundp '*unresolved-calls*)
+                 (> (hash-table-count *unresolved-calls*) 0))
+        (let ((total 0) (names nil))
+          (maphash (lambda (k v) (incf total v) (push (cons v k) names))
+                   *unresolved-calls*)
+          (setf names (sort names #'> :key #'car))
+          (format t "~%  === ~D unresolved calls to ~D functions (resolve to %%unresolved-fn → nil) ===~%"
+                  total (length names))
+          (dolist (entry (subseq names 0 (min 25 (length names))))
+            (format t "    ~4D × ~A~%" (car entry) (cdr entry)))
+          (when (> (length names) 25)
+            (format t "    ... and ~D more~%" (- (length names) 25)))
+          (force-output)))
 
       ;; Build module
       (make-compiled-module

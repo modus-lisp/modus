@@ -229,9 +229,16 @@
       (setq result (cons (funcall fn (car cur)) result))
       (setq cur (cdr cur)))))
 
-(defun mapcar (fn list)
-  "Apply FN to each element of LIST."
-  (mapcar1 fn list))
+(defun mapcar (fn list &rest more-lists)
+  "Apply FN to each element of LIST (and MORE-LISTS if provided)."
+  (if (null more-lists)
+      (mapcar1 fn list)
+      (let ((result nil)
+            (lists (cons list more-lists)))
+        (loop
+          (when (some #'null lists) (return (nreverse result)))
+          (setq result (cons (apply fn (mapcar1 #'car lists)) result))
+          (setq lists (mapcar1 #'cdr lists))))))
 
 (defun some (fn list)
   "Return the first non-nil result of applying FN to elements of LIST."
@@ -303,6 +310,8 @@
       (when (eq fast slow) (return nil)))))
 
 (defun cddddr (x) (cdr (cdddr x)))
+(defun 1+ (x) (+ x 1))
+(defun 1- (x) (- x 1))
 
 (defun copy-list (list)
   "Return a fresh copy of LIST (top-level conses only)."

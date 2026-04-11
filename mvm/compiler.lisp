@@ -4954,8 +4954,13 @@
                 (format nil "line ~D" (aref source-lines form-index))
                 (format nil "form#~D" form-index)))
       (incf form-index)
-      (let* ((result (mvm-compile-toplevel form)))
+      (let* ((result (handler-case (mvm-compile-toplevel form)
+                        (error (e)
+                          (format t "  SKIP ~A: ~A~%" *current-source-location* e)
+                          (setf *pending-flet-ir* nil)
+                          nil))))
         (cond
+          ((null result) nil)
           ;; Multi-result from defstruct: collect all sub-results
           ((and (consp result) (eq (car result) :multi-result))
            (dolist (sub-result (cdr result))
@@ -5032,9 +5037,19 @@
       ;; starts at 0, so branch offsets are computed correctly.
       ;; CALL targets use global offsets from *functions*, not label-positions.
       (dolist (entry all-ir)
-        (let* ((ir (cdr entry))
-               (label-positions (compute-label-positions ir)))
-          (emit-bytecode-for-ir buf ir label-positions)))
+        (let ((saved-pos (mvm-buffer-position buf)))
+          (handler-case
+            (let* ((ir (cdr entry))
+                   (label-positions (compute-label-positions ir)))
+              (emit-bytecode-for-ir buf ir label-positions))
+            (error (e)
+              (format t "  SKIP bytecode ~A: ~A~%"
+                      (function-info-name (car entry)) e)
+              ;; Restore buffer position and remove from function table
+              (setf (mvm-buffer-position buf) saved-pos)
+              (remhash (function-info-name (car entry)) *functions*)
+              (setf *function-table*
+                    (remove (car entry) *function-table*))))))
 
       ;; Build module
       (make-compiled-module

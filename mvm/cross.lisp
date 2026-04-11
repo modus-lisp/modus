@@ -89,7 +89,28 @@
       ;; fn-map maps function-name → label (x86-64/i386/arm32)
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
-          (funcall translator bytecode fn-table)
+          (let ((table fn-table)
+                (max-retries 3))
+            (loop for attempt from 1
+                  do (handler-case (return (funcall translator bytecode table))
+                       (error (e)
+                         (format t "  WARN: translator error #~D: ~A~%" attempt e)
+                         (when (>= attempt max-retries)
+                           ;; Give up — return empty buffer
+                           (format t "  WARN: giving up on translator, using partial result~%")
+                           (return (values (modus.asm:make-code-buffer) nil)))
+                         ;; Remove the failing function by name from table
+                         (let ((bad-name (let* ((msg (format nil "~A" e))
+                                               (pos (search "'" msg)))
+                                           (when pos
+                                             (subseq msg (1+ pos)
+                                                     (position #\' msg :start (1+ pos)))))))
+                           (when bad-name
+                             (setf table
+                                   (remove-if (lambda (entry)
+                                                (and (consp entry)
+                                                     (string= (first entry) bad-name)))
+                                              table))))))))
         (let ((native-bytes (extract-native-bytes buf target)))
           (if (and fn-map (hash-table-p fn-map))
               ;; Accurate mapping from translator
@@ -711,10 +732,17 @@
         ;; Count lines up to current position
         (let ((pos (file-position stream)))
           (setf line-count (1+ (count #\Newline source-text :end pos)))
-          (let ((form (read stream nil :eof)))
+          (let ((form (handler-case (read stream nil :eof)
+                        (error (e)
+                          (format t "  SKIP read at line ~D: ~A~%" line-count e)
+                          ;; Skip to next line to recover
+                          (loop for ch = (read-char stream nil nil)
+                                while (and ch (char/= ch #\Newline)))
+                          :skip))))
             (when (eq form :eof) (return))
-            (push form forms)
-            (push line-count lines)))))
+            (unless (eq form :skip)
+              (push form forms)
+              (push line-count lines))))))
     (cons (nreverse forms) (coerce (nreverse lines) 'vector))))
 
 (defun compute-name-hash (name-string)

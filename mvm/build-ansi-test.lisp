@@ -175,7 +175,15 @@
     "mod.lsp" "rem.lsp"
     "boole.lsp"
     "logcount.lsp" "integer-length.lsp"
-    "logbitp.lsp" "logtest.lsp"))
+    "logbitp.lsp" "logtest.lsp"
+    "number-comparison.lsp" "parse-integer.lsp"
+    "oneplus.lsp" "oneminus.lsp"
+    "expt.lsp" "lcm.lsp" "gcd.lsp"
+    "byte.lsp" "dpb.lsp" "ldb.lsp" "ldb-test.lsp"
+    "deposit-field.lsp" "mask-field.lsp"
+    "isqrt.lsp" "signum.lsp" "random.lsp"
+    "floor.lsp" "ceiling.lsp" "truncate.lsp" "round.lsp"
+    "divide.lsp"))
 
 ;; Symbols chapter
 (load-ansi-chapter "/tmp/ansi-test/symbols/"
@@ -217,7 +225,11 @@
     "values-list.lsp" "nth-value.lsp"
     "catch.lsp" "unwind-protect.lsp"
     "functionp.lsp" "fboundp.lsp"
-    "psetq.lsp" "values.lsp"))
+    "psetq.lsp" "values.lsp"
+    "defun.lsp" "defvar.lsp" "defparameter.lsp" "defconstant.lsp"
+    "let.lsp" "letstar.lsp"
+    "etypecase.lsp"
+    "multiple-value-prog1.lsp" "multiple-value-setq.lsp"))
 
 ;; Sequences chapter
 (load-ansi-chapter "/tmp/ansi-test/sequences/"
@@ -231,6 +243,7 @@
     "substitute.lsp" "substitute-if.lsp" "substitute-if-not.lsp"
     "fill.lsp" "replace.lsp" "mismatch.lsp"
     "search-list.lsp" "merge.lsp"
+    "sort.lsp" "stable-sort.lsp"
     "map-into.lsp" "make-sequence.lsp"))
 
 ;; Generate run-real-ansi-tests that calls all file-level runners

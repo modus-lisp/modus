@@ -511,7 +511,7 @@
         (let ((fn-map (make-hash-table))
               (fn-offset-to-label (make-hash-table)))
           ;; Create global array for fn-offset-to-label (bypass hash table)
-          (setq *td-fn-label-array* (make-array (array-length bytecode)))
+          (setq *td-fn-label-array* (make-array (+ (array-length bytecode) 65536)))
           (let ((rest-ft function-table)
                 (i 0))
             (loop

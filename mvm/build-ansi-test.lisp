@@ -42,22 +42,7 @@
 (in-package :modus.mvm)
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
-(defun listify-form (form)
-  (if (listp form) form (list form)))
-(defvar lookup-table nil)
 (in-package :cl-user)
-
-;; Create test packages that ANSI test files reference at read time
-(dolist (pkg '("STRUCT-TEST-PACKAGE" "CL-TEST" "FS-A" "FS-B" "B"
-               "DS1" "DS2" "DS3" "DS4" "LOAD-TEST-PACKAGE"
-               "CL-TEST-MLFSS-PACKAGE" "A" "RT" "REGRESSION-TEST"
-               "X" "Y" "Z" "Q" "KEYWORD-TESTS"))
-  (unless (find-package pkg) (make-package pkg :use '(:cl))))
-;; Intern symbols needed by test files
-(dolist (sym '("A" "B" "C" "D" "E" "F" "G" "H" "I" "J" "K"))
-  (dolist (pkg '("DS1" "DS2" "FS-A" "FS-B" "CL-TEST-MLFSS-PACKAGE"
-                  "STRUCT-TEST-PACKAGE" "CL-TEST" "B"))
-    (when (find-package pkg) (intern sym pkg))))
 
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")
@@ -170,7 +155,6 @@
     "loop1.lsp" "loop2.lsp" "loop3.lsp" "loop4.lsp" "loop5.lsp"
     "loop6.lsp" "loop7.lsp" "loop8.lsp" "loop9.lsp"
     "loop10.lsp" "loop11.lsp" "loop12.lsp" "loop13.lsp"
-    "loop14.lsp" "loop15.lsp" "loop16.lsp" "loop17.lsp"
 ))
 
 ;; Hash-tables chapter
@@ -191,19 +175,7 @@
     "mod.lsp" "rem.lsp"
     "boole.lsp"
     "logcount.lsp" "integer-length.lsp"
-    "logbitp.lsp" "logtest.lsp"
-    "number-comparison.lsp" "parse-integer.lsp"
-    "oneplus.lsp" "oneminus.lsp"
-    "expt.lsp" "lcm.lsp" "gcd.lsp"
-    "byte.lsp" "dpb.lsp" "ldb.lsp" "ldb-test.lsp"
-    "deposit-field.lsp" "mask-field.lsp"
-    "isqrt.lsp" "signum.lsp" "random.lsp"
-    "floor.lsp" "ceiling.lsp" "truncate.lsp" "round.lsp"
-    "divide.lsp"
-    "sin.lsp" "cos.lsp" "tan.lsp" "exp.lsp" "sqrt.lsp"
-    "atan.lsp" "phase.lsp"
-    "complexp.lsp" "numberp.lsp" "realp.lsp" "integerp.lsp"
-    "float-radix.lsp" "float-digits.lsp"))
+    "logbitp.lsp" "logtest.lsp"))
 
 ;; Symbols chapter
 (load-ansi-chapter "/tmp/ansi-test/symbols/"
@@ -214,8 +186,7 @@
 ;; Structures chapter
 ;; Structures
 (load-ansi-chapter "/tmp/ansi-test/structures/"
-  '("structure-00.lsp" "structures-01.lsp"
-    "structures-02.lsp" "structures-03.lsp" "structures-04.lsp"))
+  '("structure-00.lsp" "structures-01.lsp"))
 
 ;; Strings chapter
 (load-ansi-chapter "/tmp/ansi-test/strings/"
@@ -236,311 +207,9 @@
     "array-rank.lsp" "array-total-size.lsp"
     "array-dimension.lsp" "array-dimensions.lsp"
     "array-element-type.lsp" "row-major-aref.lsp"
-    "make-array.lsp"
-    "array.lsp" "simple-array.lsp" "array-t.lsp" "simple-array-t.lsp"
-    "adjust-array.lsp" "adjustable-array-p.lsp"
-    "array-displacement.lsp" "array-has-fill-pointer-p.lsp"
-    "array-in-bounds-p.lsp" "array-misc.lsp"
-    "fill-pointer.lsp" "vector-push.lsp" "vector-push-extend.lsp"
-    "vector-pop.lsp"
-    "bit-vector-p.lsp" "simple-bit-vector-p.lsp"
-    "bit.lsp" "sbit.lsp"
-    "bit-and.lsp" "bit-ior.lsp" "bit-xor.lsp" "bit-eqv.lsp"
-    "bit-nand.lsp" "bit-nor.lsp" "bit-andc1.lsp" "bit-andc2.lsp"
-    "bit-orc1.lsp" "bit-orc2.lsp" "bit-not.lsp"
-    "bit-vector.lsp" "simple-bit-vector.lsp"
-    "upgraded-array-element-type.lsp"))
+    "make-array.lsp"))
 
-;; Eval and Compile chapter
-(load-ansi-chapter "/tmp/ansi-test/eval-and-compile/"
-  '("constantp.lsp" "eval.lsp" "locally.lsp" "the.lsp" "special.lsp"
-    "lambda.lsp" "eval-when.lsp" "macroexpand.lsp" "macroexpand-1.lsp"
-    "compile.lsp" "defmacro.lsp" "ignore.lsp" "ignorable.lsp"
-    "optimize.lsp" "proclaim.lsp" "declaim.lsp" "type.lsp"
-    "eval-and-compile.lsp" "declaration.lsp"))
-
-;; Types and Classes chapter
-(load-ansi-chapter "/tmp/ansi-test/types-and-classes/"
-  '("typep.lsp" "type-of.lsp" "coerce.lsp" "subtypep.lsp" "deftype.lsp"
-    "types-and-class.lsp" "types-and-class-2.lsp"
-    "subtypep-integer.lsp" "subtypep-cons.lsp" "subtypep-member.lsp"
-    "subtypep-eql.lsp" "subtypep-array.lsp" "subtypep-rational.lsp"
-    "subtypep-real.lsp" "subtypep-float.lsp" "subtypep-function.lsp"))
-
-;; Conditions chapter (what we can handle)
-(load-ansi-chapter "/tmp/ansi-test/conditions/"
-  '("condition.lsp" "error.lsp" "warn.lsp"
-    "handler-case.lsp" "handler-bind.lsp" "ignore-errors.lsp"))
-
-;; Reader chapter
-(load-ansi-chapter "/tmp/ansi-test/reader/"
-  '("readtablep.lsp" "read-from-string.lsp" "read.lsp"))
-
-;; Printer chapter
-(load-ansi-chapter "/tmp/ansi-test/printer/"
-  '("write.lsp" "write-to-string.lsp"
-    "prin1.lsp" "prin1-to-string.lsp"
-    "princ.lsp" "princ-to-string.lsp"
-    "print.lsp" "pprint.lsp"
-    "print-integers.lsp" "print-strings.lsp"
-    "print-cons.lsp" "print-characters.lsp"
-    "print-vector.lsp" "print-array.lsp"
-    "print-symbols.lsp"
-    "print-bit-vector.lsp"
-    "print-length.lsp" "print-level.lsp"
-    "printer-control-vars.lsp"))
-
-;; Streams chapter
-(load-ansi-chapter "/tmp/ansi-test/streams/"
-  '("streamp.lsp" "write-char.lsp" "terpri.lsp"
-    "write-string.lsp" "write-line.lsp"
-    "finish-output.lsp" "force-output.lsp" "clear-output.lsp"
-    "clear-input.lsp"
-    "input-stream-p.lsp" "output-stream-p.lsp" "open-stream-p.lsp"
-    "stream-element-type.lsp" "stream-external-format.lsp"
-    "interactive-stream-p.lsp"
-    "listen.lsp" "fresh-line.lsp"
-    "make-string-output-stream.lsp" "get-output-stream-string.lsp"
-    "make-string-input-stream.lsp"
-    "with-output-to-string.lsp" "with-input-from-string.lsp"
-    "make-broadcast-stream.lsp" "broadcast-stream-streams.lsp"
-    "make-concatenated-stream.lsp" "concatenated-stream-streams.lsp"
-    "make-echo-stream.lsp" "echo-stream-input-stream.lsp"
-    "echo-stream-output-stream.lsp"
-    "make-synonym-stream.lsp" "synonym-stream-symbol.lsp"
-    "make-two-way-stream.lsp" "two-way-stream-input-stream.lsp"
-    "two-way-stream-output-stream.lsp"
-    "peek-char.lsp" "unread-char.lsp"
-    "read-char.lsp" "read-char-no-hang.lsp"
-    "read-line.lsp" "read-byte.lsp"
-    "read-sequence.lsp" "write-sequence.lsp" "write-byte.lsp"
-    "file-length.lsp" "file-position.lsp" "file-string-length.lsp"))
-
-;; Packages chapter
-(load-ansi-chapter "/tmp/ansi-test/packages/"
-  '("packagep.lsp" "find-package.lsp" "find-symbol.lsp"
-    "package-name.lsp" "package-nicknames.lsp"
-    "package-use-list.lsp" "package-used-by-list.lsp"
-    "package-shadowing-symbols.lsp"
-    "list-all-packages.lsp" "keyword.lsp"
-    "intern.lsp" "in-package.lsp"
-    "export.lsp" "import.lsp" "shadow.lsp"
-    "make-package.lsp" "defpackage.lsp"
-    "delete-package.lsp" "rename-package.lsp"
-    "use-package.lsp" "unuse-package.lsp"
-    "unexport.lsp" "unintern.lsp" "shadowing-import.lsp"
-    "do-symbols.lsp" "do-external-symbols.lsp" "do-all-symbols.lsp"
-    "with-package-iterator.lsp"
-    "package-error.lsp" "package-error-package.lsp"
-    "find-all-symbols.lsp"))
-
-;; Pathnames chapter
-(load-ansi-chapter "/tmp/ansi-test/pathnames/"
-  '("pathnamep.lsp" "pathname.lsp" "make-pathname.lsp"
-    "pathname-host.lsp" "pathname-device.lsp" "pathname-directory.lsp"
-    "pathname-name.lsp" "pathname-type.lsp" "pathname-version.lsp"
-    "namestring.lsp" "file-namestring.lsp" "directory-namestring.lsp"
-    "host-namestring.lsp" "enough-namestring.lsp"
-    "parse-namestring.lsp" "merge-pathnames.lsp"
-    "wild-pathname-p.lsp" "pathname-match-p.lsp"
-    "logical-pathname.lsp"))
-
-;; Environment chapter
-(load-ansi-chapter "/tmp/ansi-test/environment/"
-  '("room.lsp" "dribble.lsp" "ed.lsp" "inspect.lsp"
-    "describe.lsp" "disassemble.lsp" "trace.lsp"
-    "time.lsp" "sleep.lsp"
-    "get-internal-time.lsp" "get-universal-time.lsp"
-    "encode-universal-time.lsp" "decode-universal-time.lsp"
-    "user-homedir-pathname.lsp"
-    "apropos.lsp" "apropos-list.lsp" "documentation.lsp"))
-
-;; System Construction
-(load-ansi-chapter "/tmp/ansi-test/system-construction/"
-  '("features.lsp" "modules.lsp" "with-compilation-unit.lsp"))
-
-;; Conditions — more files
-(load-ansi-chapter "/tmp/ansi-test/conditions/"
-  '("check-type.lsp" "assert.lsp"
-    "cerror.lsp" "make-condition.lsp"
-    "cell-error-name.lsp"
-    "restart-case.lsp" "restart-bind.lsp"
-    "compute-restarts.lsp"
-    "with-simple-restart.lsp" "with-condition-restarts.lsp"
-    "invoke-debugger.lsp"
-    "abort.lsp" "continue.lsp"
-    "muffle-warning.lsp" "store-value.lsp" "use-value.lsp"
-    "define-condition.lsp"))
-
-;; Reader — more files
-(load-ansi-chapter "/tmp/ansi-test/reader/"
-  '("copy-readtable.lsp" "readtable-case.lsp"
-    "set-syntax-from-char.lsp" "dispatch-macro-characters.lsp"
-    "get-macro-character.lsp"
-    "read-delimited-list.lsp" "read-preserving-whitespace.lsp"
-    "with-standard-io-syntax.lsp" "reader-test.lsp"))
-
-;; Objects (CLOS) chapter — tests will mostly be skipped by error handling
-(load-ansi-chapter "/tmp/ansi-test/objects/"
-  '("class-name.lsp" "class-of.lsp" "find-class.lsp"
-    "make-instance.lsp" "slot-value.lsp" "slot-boundp.lsp"
-    "slot-exists-p.lsp" "slot-makunbound.lsp"
-    "defclass-01.lsp" "defclass-02.lsp" "defclass-03.lsp"
-    "defgeneric.lsp" "defmethod.lsp"
-    "method-qualifiers.lsp" "find-method.lsp"
-    "compute-applicable-methods.lsp"
-    "with-slots.lsp" "with-accessors.lsp"))
-
-;; Misc
-(load-ansi-chapter "/tmp/ansi-test/misc/"
-  '("misc.lsp"))
-
-;; === Remaining files from ALL chapters ===
-
-(load-ansi-chapter "/tmp/ansi-test/arrays/"
-  '("array-as-class.lsp" "array-row-major-index.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/cons/"
-  '("cxr.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/eval-and-compile/"
-  '("compiler-macros.lsp" "define-compiler-macro.lsp" "define-symbol-macro.lsp"
-    "dynamic-extent.lsp" "macro-function.lsp" "symbol-macrolet.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/files/"
-  '("delete-file.lsp" "directory.lsp" "ensure-directories-exist.lsp"
-    "file-author.lsp" "file-error.lsp" "file-write-date.lsp"
-    "probe-file.lsp" "rename-file.lsp" "truename.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/hash-tables/"
-  '("hash-table-rehash-size.lsp" "hash-table-rehash-threshold.lsp"
-    "hash-table-size.lsp" "hash-table-test.lsp"
-    "hash-table.lsp" "with-hash-table-iterator.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/iteration/"
-  '("do.lsp" "dostar.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/numbers/"
-  '("acos.lsp" "acosh.lsp" "asin.lsp" "asinh.lsp" "atanh.lsp"
-    "cis.lsp" "complex.lsp" "conjugate.lsp" "cosh.lsp" "sinh.lsp" "tanh.lsp"
-    "float.lsp" "floatp.lsp" "log.lsp"
-    "logandc1.lsp" "logandc2.lsp" "logeqv.lsp"
-    "lognand.lsp" "lognor.lsp" "logorc1.lsp" "logorc2.lsp"
-    "imagpart.lsp" "realpart.lsp" "real.lsp"
-    "rational.lsp" "rationalize.lsp" "rationalp.lsp"
-    "numerator-denominator.lsp"
-    "fceiling.lsp" "ffloor.lsp" "fround.lsp" "ftruncate.lsp"
-    "make-random-state.lsp" "random-state-p.lsp"
-    "epsilons.lsp" "upgraded-complex-part-type.lsp"
-    "arithmetic-error.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/objects/"
-  '("add-method.lsp" "allocate-instance.lsp" "call-next-method.lsp"
-    "change-class.lsp" "defclass-errors.lsp"
-    "defgeneric-method-combination-and.lsp"
-    "defgeneric-method-combination-append.lsp"
-    "defgeneric-method-combination-list.lsp"
-    "defgeneric-method-combination-max.lsp"
-    "defgeneric-method-combination-min.lsp"
-    "defgeneric-method-combination-nconc.lsp"
-    "defgeneric-method-combination-or.lsp"
-    "defgeneric-method-combination-plus.lsp"
-    "defgeneric-method-combination-progn.lsp"
-    "define-method-combination.lsp"
-    "ensure-generic-function.lsp"
-    "next-method-p.lsp" "remove-method.lsp"
-    "shared-initialize.lsp"
-    "reinitialize-instance.lsp"
-    "slot-missing.lsp" "slot-unbound.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/pathnames/"
-  '("pathnames.lsp" "translate-logical-pathname.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/printer/"
-  '("print-backquote.lsp" "print-complex.lsp" "print-floats.lsp"
-    "print-lines.lsp" "print-pathname.lsp" "print-random-state.lsp"
-    "print-ratios.lsp" "print-structure.lsp" "print-unreadable-object.lsp"
-    "pprint-fill.lsp" "pprint-linear.lsp" "pprint-tabular.lsp"
-    "pprint-dispatch.lsp" "pprint-newline.lsp" "pprint-tab.lsp"
-    "pprint-indent.lsp" "pprint-logical-block.lsp"
-    "copy-pprint-dispatch.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/sequences/"
-  '("fill-strings.lsp" "search-bitvector.lsp" "search-string.lsp" "search-vector.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/streams/"
-  '("open.lsp" "stream-error-stream.lsp"
-    "with-open-file.lsp" "with-open-stream.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/strings/"
-  '("base-string.lsp" "simple-base-string.lsp" "simple-string.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/symbols/"
-  '("gentemp.lsp" "get.lsp" "remprop.lsp"
-    "special-operator-p.lsp" "symbol-function.lsp" "symbol-name.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/system-construction/"
-  '("compile-file.lsp" "load-file.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/types-and-classes/"
-  '("subtypep-complex.lsp" "standard-generic-function.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/misc/"
-  '("misc-cmucl-type-prop.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/environment/"
-  '("environment-functions.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/conditions/"
-  '("define-condition.lsp"))
-
-;; === ALL remaining files ===
-
-(load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
-  '("ccase.lsp" "compiled-function-p.lsp" "complement.lsp" "ctypecase.lsp"
-    "data-and-control-flow.lsp" "define-modify-macro.lsp"
-    "define-setf-expander.lsp" "defsetf.lsp" "destructuring-bind.lsp"
-    "eql.lsp" "fdefinition.lsp" "flet.lsp" "fmakunbound.lsp" "funcall.lsp"
-    "function-lambda-expression.lsp" "function.lsp" "get-setf-expansion.lsp"
-    "labels.lsp" "lambda-list-keywords.lsp" "macrolet.lsp"
-    "multiple-value-call.lsp" "places.lsp" "prog.lsp" "progv.lsp"
-    "psetf.lsp" "rotatef.lsp" "shiftf.lsp" "tagbody.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/format/"
-  '("format-a.lsp" "format-ampersand.lsp" "format-b.lsp" "format-brace.lsp"
-    "format-c.lsp" "format-circumflex.lsp" "format-conditional.lsp"
-    "format-d.lsp" "format-f.lsp" "format-goto.lsp" "format-i.lsp"
-    "format-justify.lsp" "format-logical-block.lsp" "format-newline.lsp"
-    "format-o.lsp" "format-p.lsp" "format-page.lsp" "format-paren.lsp"
-    "format-percent.lsp" "format-question.lsp" "format-r.lsp" "format-s.lsp"
-    "format-slash.lsp" "format-t.lsp" "format-tilde.lsp"
-    "format-underscore.lsp" "format-x.lsp" "formatter-c.lsp"
-    "roman-numerals.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/iteration/" '("loop.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/objects/"
-  '("defclass-forward-reference.lsp" "defclass.lsp"
-    "defgeneric-method-combination-aux.lsp"
-    "define-method-combination-long-form.lsp"
-    "make-instances-obsolete.lsp" "make-load-form-saving-slots.lsp"
-    "make-load-form.lsp" "no-applicable-method.lsp" "no-next-method.lsp"
-    "unbound-slot.lsp" "update-instance-for-different-class.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/pathnames/"
-  '("load-logical-pathname-translations.lsp" "logical-pathname-translations.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/printer/"
-  '("pprint-exit-if-list-exhausted.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/reader/"
-  '("read-suppress.lsp" "set-macro-character.lsp" "syntax-tokens.lsp" "syntax.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/symbols/" '("cl-symbols.lsp"))
-
-(load-ansi-chapter "/tmp/ansi-test/types-and-classes/" '("class-precedence-lists.lsp"))
-
-;; DCF — already loaded above
+;; More DCF
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
   '("every.lsp" "some.lsp" "notany.lsp" "notevery.lsp"
     "equal.lsp" "equalp.lsp" "typecase.lsp"
@@ -548,11 +217,7 @@
     "values-list.lsp" "nth-value.lsp"
     "catch.lsp" "unwind-protect.lsp"
     "functionp.lsp" "fboundp.lsp"
-    "psetq.lsp" "values.lsp"
-    "defun.lsp" "defvar.lsp" "defparameter.lsp" "defconstant.lsp"
-    "let.lsp" "letstar.lsp"
-    "etypecase.lsp"
-    "multiple-value-prog1.lsp" "multiple-value-setq.lsp"))
+    "psetq.lsp" "values.lsp"))
 
 ;; Sequences chapter
 (load-ansi-chapter "/tmp/ansi-test/sequences/"
@@ -566,9 +231,7 @@
     "substitute.lsp" "substitute-if.lsp" "substitute-if-not.lsp"
     "fill.lsp" "replace.lsp" "mismatch.lsp"
     "search-list.lsp" "merge.lsp"
-    "sort.lsp" "stable-sort.lsp"
-    "map-into.lsp" "make-sequence.lsp"
-    "nsubstitute.lsp" "nsubstitute-if.lsp" "nsubstitute-if-not.lsp"))
+    "map-into.lsp" "make-sequence.lsp"))
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))

@@ -570,6 +570,13 @@
             `(setq ,place (- ,place ,delta))
             `(setf ,place (- ,place ,delta))))))
 
+  ;; PUSHNEW → adjoin + setq
+  (mvm-define-macro "PUSHNEW"
+    (lambda (form)
+      (let ((item (cadr form))
+            (place (caddr form)))
+        `(setq ,place (adjoin ,item ,place)))))
+
   ;; PLUSP → (> x 0)
   (mvm-define-macro "PLUSP"
     (lambda (form)
@@ -644,6 +651,24 @@
             `(let ((,tmp (car ,place)))
                (setf ,place (cdr ,place))
                ,tmp)))))
+
+  ;; TYPECASE → COND + TYPEP
+  (mvm-define-macro "TYPECASE"
+    (lambda (form)
+      (let ((keyform (cadr form))
+            (clauses (cddr form))
+            (tmp (gensym "TC")))
+        `(let ((,tmp ,keyform))
+           (cond ,@(mapcar (lambda (clause)
+                             (let ((type (car clause))
+                                   (body (cdr clause)))
+                               (if (or (eq type t)
+                                       (and (symbolp type)
+                                            (= (compute-name-hash (symbol-name type))
+                                               351744830753626451)))
+                                   `(t ,@body)
+                                   `((typep ,tmp ',type) ,@body))))
+                           clauses))))))
 
   ;; DESTRUCTURING-BIND → LET* with car/cdr decomposition
   (mvm-define-macro "DESTRUCTURING-BIND"

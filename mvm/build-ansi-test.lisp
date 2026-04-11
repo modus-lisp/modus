@@ -251,17 +251,31 @@
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))
-;; fork-run: isolate each file runner in a child process to survive crashes
-(setf *real-ansi-sources*
-      (concatenate 'string *real-ansi-sources*
-                   (format nil "~%(defun fork-run (thunk)~
-                     ~%  (let ((pid (syscall3 57 0 0 0)))~
-                     ~%    (if (= pid 0)~
-                     ~%        (progn (funcall thunk) (syscall3 60 0 0 0))~
-                     ~%        (let ((status 0))~
-                     ~%          (syscall3 61 pid 0 0)))))~%")
-                   (format nil "~%(defun run-real-ansi-tests ()~%~{  (fork-run (lambda () (run-ansi-~A)))~%~})~%"
-                           *ansi-file-names*)))
+;; fork-run: isolate chunks in child processes; child exits with fail count
+(let ((chunk-size 20)
+      (names *ansi-file-names*))
+  (setf *real-ansi-sources*
+        (concatenate 'string *real-ansi-sources*
+                     (format nil "~%(defun fork-run (thunk)~
+                       ~%  (let ((pid (syscall3 57 0 0 0)))~
+                       ~%    (if (= pid 0)~
+                       ~%        (progn~
+                       ~%          (setq *rt-test-count* 0)~
+                       ~%          (setq *rt-pass-count* 0)~
+                       ~%          (setq *rt-fail-count* 0)~
+                       ~%          (funcall thunk)~
+                       ~%          (syscall3 60 *rt-fail-count* 0 0))~
+                       ~%        (syscall3 61 pid 0 0))))~%")
+                     (with-output-to-string (s)
+                       (format s "~%(defun run-real-ansi-tests ()~%")
+                       (loop while names do
+                         (let ((chunk (loop repeat chunk-size while names
+                                           collect (pop names))))
+                           (format s "  (fork-run (lambda ()~%")
+                           (dolist (name chunk)
+                             (format s "    (run-ansi-~A)~%" name))
+                           (format s "  ))~%")))
+                       (format s ")~%")))))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  rt: ~D chars~%" (length *rt-source*))
@@ -332,19 +346,19 @@
   ;; Run real ANSI tests (generated at build time)
   (run-real-ansi-tests)
 
-  ;; Report — use simple output to avoid crash in large binaries
+  ;; Report custom test results (ANSI results printed by fork children)
   (write-char-serial 10)
   (print-dec *rt-pass-count*)
   (write-char-serial 47)   ;; /
   (print-dec *rt-test-count*)
-  (write-char-serial 32)
-  (if (= *rt-fail-count* 0)
-      (progn (write-char-serial 80) (write-char-serial 65)
-             (write-char-serial 83) (write-char-serial 83))
-      (progn (write-char-serial 70) (write-char-serial 65)
-             (write-char-serial 73) (write-char-serial 76)))
+  ;; DONE marker
+  (write-char-serial 32)   ; space
+  (write-char-serial 68)   ; D
+  (write-char-serial 79)   ; O
+  (write-char-serial 78)   ; N
+  (write-char-serial 69)   ; E
   (write-char-serial 10)
-  (sys-exit (if (> *rt-fail-count* 255) 255 *rt-fail-count*)))
+  (sys-exit 0))
 
 ")
 

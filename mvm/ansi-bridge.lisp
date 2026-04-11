@@ -636,3 +636,367 @@
 (defun random (n) (mod (ash (logxor (* 6364136223846793005 (mem-ref #x100000A0 :u64)) 1442695040888963407) -17) n))
 (defun do-special-strings (fn) (funcall fn ""))
 (defun typep* (obj type) (typep obj type))
+
+;;; String functions
+(defun concatenate (result-type &rest seqs)
+  "Concatenate sequences."
+  (if (or (eq result-type 'list) (eq result-type (quote list)))
+      (let ((r nil))
+        (dolist (s (nreverse seqs))
+          (if (consp s) (setq r (append s r))
+              (dotimes (i (length s)) (setq r (append r (list (elt s i)))))))
+        r)
+      ;; String result — concatenate all as strings
+      (let ((total 0))
+        (dolist (s seqs) (setq total (+ total (if (stringp s) (array-length s)
+                                                   (if (consp s) (length s) 0)))))
+        (let ((result (make-array total)) (pos 0))
+          (dolist (s seqs)
+            (if (stringp s)
+                (dotimes (i (array-length s))
+                  (aset result pos (aref s i))
+                  (setq pos (+ pos 1)))
+                (dolist (c s)
+                  (aset result pos (if (characterp c) (char-code c) c))
+                  (setq pos (+ pos 1)))))
+          result))))
+
+(defun merge (result-type s1 s2 pred &rest args)
+  "Merge two sorted sequences."
+  (let ((r nil) (a (if (consp s1) s1 (coerce s1 'list)))
+                (b (if (consp s2) s2 (coerce s2 'list))))
+    (loop
+      (cond ((null a) (return (nreconc r b)))
+            ((null b) (return (nreconc r a)))
+            ((funcall pred (car a) (car b))
+             (setq r (cons (car a) r)) (setq a (cdr a)))
+            (t (setq r (cons (car b) r)) (setq b (cdr b)))))))
+
+(defun replace (s1 s2 &rest args)
+  "Replace elements of S1 with elements from S2."
+  (let ((len (if (< (length s1) (length s2)) (length s1) (length s2))))
+    (dotimes (i len)
+      (if (consp s1)
+          (let ((cell (nthcdr i s1))) (when cell (set-car cell (elt s2 i))))
+          (aset s1 i (elt s2 i)))))
+  s1)
+
+(defun fill (seq item &rest args)
+  "Fill SEQUENCE with ITEM."
+  (if (consp seq)
+      (let ((cur seq)) (loop (when (null cur) (return seq))
+                         (set-car cur item) (setq cur (cdr cur))))
+      (dotimes (i (length seq) seq) (aset seq i item))))
+
+(defun map-into (result fn &rest seqs)
+  "Apply FN to elements of SEQS, storing results in RESULT."
+  (let ((len (length result)) (i 0))
+    (if (null seqs)
+        result
+        (let ((src (car seqs)))
+          (if (consp src)
+              (dolist (item src result)
+                (when (>= i len) (return result))
+                (if (consp result) (set-car (nthcdr i result) (funcall fn item))
+                    (aset result i (funcall fn item)))
+                (setq i (+ i 1)))
+              result)))))
+
+;;; Sequence predicates
+(defun notevery (pred seq &rest more)
+  "True if PRED is false for some element."
+  (not (apply #'every pred seq more)))
+
+(defun notany (pred seq &rest more)
+  "True if PRED is false for all elements."
+  (not (apply #'some pred seq more)))
+
+;;; Set/list operations
+(defun adjoin (item list &rest args)
+  "Add ITEM to LIST if not already present."
+  (if (member item list) list (cons item list)))
+
+(defun nintersection (list1 list2 &rest args)
+  "Destructive intersection."
+  (let ((r nil))
+    (dolist (item list1) (when (member item list2) (setq r (cons item r))))
+    (nreverse r)))
+
+(defun delete (item seq &rest args)
+  "Remove ITEM from SEQ (destructive)."
+  (remove item seq))
+
+(defun delete-if (pred seq &rest args)
+  "Remove items satisfying PRED (destructive)."
+  (remove-if pred seq))
+
+(defun delete-if-not (pred seq &rest args)
+  "Remove items not satisfying PRED (destructive)."
+  (remove-if-not pred seq))
+
+(defun delete-duplicates (seq &rest args)
+  "Remove duplicate items (destructive)."
+  (remove-duplicates seq))
+
+(defun pushnew-fn (item place)
+  "Functional pushnew."
+  (if (member item place) place (cons item place)))
+
+;;; String operations
+(defun make-string (size &rest args)
+  "Make a string of SIZE filled with spaces (or :initial-element)."
+  (let ((ch 32) (a args))
+    (loop (when (null a) (return))
+      (when (eq (car a) :initial-element) (setq ch (char-code (cadr a))) (return))
+      (setq a (cddr a)))
+    (let ((s (make-array size)))
+      (dotimes (i size) (aset s i ch))
+      s)))
+
+(defun string-trim (chars str)
+  "Trim characters from both ends of string."
+  (string-left-trim chars (string-right-trim chars str)))
+
+(defun string-left-trim (chars str)
+  "Trim characters from left of string."
+  (let ((char-list (if (stringp chars)
+                       (let ((r nil)) (dotimes (i (array-length chars)) (setq r (cons (aref chars i) r))) r)
+                       chars))
+        (start 0) (len (array-length str)))
+    (loop (when (>= start len) (return ""))
+      (unless (member (aref str start) char-list) (return))
+      (setq start (+ start 1)))
+    (if (= start 0) str
+        (let ((result (make-array (- len start))))
+          (dotimes (i (- len start)) (aset result i (aref str (+ start i))))
+          result))))
+
+(defun string-right-trim (chars str)
+  "Trim characters from right of string."
+  (let ((char-list (if (stringp chars)
+                       (let ((r nil)) (dotimes (i (array-length chars)) (setq r (cons (aref chars i) r))) r)
+                       chars))
+        (end (array-length str)))
+    (loop (when (<= end 0) (return ""))
+      (unless (member (aref str (- end 1)) char-list) (return))
+      (setq end (- end 1)))
+    (if (= end (array-length str)) str
+        (let ((result (make-array end)))
+          (dotimes (i end) (aset result i (aref str i)))
+          result))))
+
+;;; Numeric
+(defun logbitp (index integer)
+  "True if bit INDEX of INTEGER is 1."
+  (not (zerop (logand (ash 1 index) integer))))
+
+(defun complex (r &optional i)
+  "Create a complex number (stub — returns real part)."
+  r)
+
+;;; Hash table
+(defun hash-table-p (obj)
+  "True if OBJ is a hash table (cons cell)."
+  (consp obj))
+
+;;; Symbol
+(defun symbol-name (sym)
+  "Return the name of a symbol as a string (stub)."
+  (if (null sym) "NIL"
+      (if (eq sym t) "T"
+          "")))
+
+;;; Test helpers
+(defun random-from-interval (max &optional (min 0))
+  "Random integer in [min, max)."
+  (+ min (random (- max min))))
+
+(defun is-antisymmetrically-ordered-by (pred)
+  "Return a predicate that checks antisymmetric ordering."
+  (lambda (x y) (and (funcall pred x y) (not (funcall pred y x)))))
+
+(defun do-special-integer-vectors (fn)
+  "Stub — call FN with a simple vector."
+  (funcall fn (make-array 5)))
+
+;;; More CL functions
+(defun evenp (n) (zerop (logand n 1)))
+(defun oddp (n) (not (zerop (logand n 1))))
+(defun boundp (sym) t)  ; stub — all symbols considered bound
+(defun vectorp (obj) (and (not (consp obj)) (not (null obj)) (not (integerp obj))
+                          (not (characterp obj)) (not (eq obj t))))
+(defun remove-duplicates (seq &rest args)
+  "Remove duplicates from SEQ."
+  (if (consp seq)
+      (let ((r nil))
+        (dolist (item seq) (unless (member item r) (setq r (cons item r))))
+        (nreverse r))
+      seq))
+(defun read-from-string (str &rest args)
+  "Stub — returns nil for now."
+  nil)
+(defun find-class (name &rest args) nil)
+(defun make-symbol (name) nil)
+(defun eval (form) nil)  ; stub
+(defun not-mv (x) (not x))
+(defun check-values (fn expected) nil)
+
+(defun string-upcase (str &rest args)
+  "Convert string to uppercase."
+  (let ((len (array-length str))
+        (result (make-array (array-length str))))
+    (dotimes (i len result)
+      (let ((ch (aref str i)))
+        (aset result i (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch))))))
+
+(defun string-downcase (str &rest args)
+  "Convert string to lowercase."
+  (let ((len (array-length str))
+        (result (make-array (array-length str))))
+    (dotimes (i len result)
+      (let ((ch (aref str i)))
+        (aset result i (if (and (>= ch 65) (<= ch 90)) (+ ch 32) ch))))))
+
+(defun string-capitalize (str &rest args)
+  "Capitalize first letter of each word."
+  (let ((len (array-length str))
+        (result (make-array (array-length str)))
+        (word-start t))
+    (dotimes (i len result)
+      (let ((ch (aref str i)))
+        (cond
+          ((and word-start (>= ch 97) (<= ch 122))
+           (aset result i (- ch 32)) (setq word-start nil))
+          ((and (not word-start) (>= ch 65) (<= ch 90))
+           (aset result i (+ ch 32)) (setq word-start nil))
+          (t (aset result i ch)
+             (setq word-start (or (= ch 32) (= ch 9) (= ch 10)))))))))
+
+(defun string-not-equal (a b) (not (string-equal a b)))
+(defun string< (a b &rest args) (let ((m (mismatch a b)))
+  (if m (if (< (aref a m) (aref b m)) m nil) (if (< (length a) (length b)) (length a) nil))))
+(defun string> (a b &rest args) (string< b a))
+(defun string<= (a b &rest args) (not (string> a b)))
+(defun string>= (a b &rest args) (not (string< a b)))
+(defun string-lessp (a b &rest args) (string< (string-downcase a) (string-downcase b)))
+(defun string-greaterp (a b &rest args) (string> (string-downcase a) (string-downcase b)))
+(defun string-not-greaterp (a b &rest args) (not (string-greaterp a b)))
+(defun string-not-lessp (a b &rest args) (not (string-lessp a b)))
+
+(defun char-upcase (c) (let ((code (char-code c)))
+  (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
+(defun char-downcase (c) (let ((code (char-code c)))
+  (code-char (if (and (>= code 65) (<= code 90)) (+ code 32) code))))
+(defun upper-case-p (c) (let ((code (char-code c))) (and (>= code 65) (<= code 90))))
+(defun lower-case-p (c) (let ((code (char-code c))) (and (>= code 97) (<= code 122))))
+(defun both-case-p (c) (or (upper-case-p c) (lower-case-p c)))
+(defun alpha-char-p (c) (both-case-p c))
+(defun digit-char-p (c &optional (radix 10))
+  (let ((code (char-code c)))
+    (cond ((and (>= code 48) (<= code 57)) (let ((v (- code 48))) (if (< v radix) v nil)))
+          ((and (>= code 65) (<= code 90)) (let ((v (+ 10 (- code 65)))) (if (< v radix) v nil)))
+          ((and (>= code 97) (<= code 122)) (let ((v (+ 10 (- code 97)))) (if (< v radix) v nil)))
+          (t nil))))
+(defun alphanumericp (c) (or (alpha-char-p c) (digit-char-p c)))
+(defun graphic-char-p (c) (let ((code (char-code c))) (and (>= code 32) (<= code 126))))
+(defun standard-char-p (c) (graphic-char-p c))
+(defun digit-char (weight &optional (radix 10))
+  (if (< weight radix) (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight))) nil))
+(defun name-char (name) nil)  ; stub
+(defun char-name (c) nil)  ; stub
+
+(defun char= (a b) (eql a b))
+(defun char/= (a b) (not (eql a b)))
+(defun char< (a b) (< (char-code a) (char-code b)))
+(defun char> (a b) (> (char-code a) (char-code b)))
+(defun char<= (a b) (<= (char-code a) (char-code b)))
+(defun char>= (a b) (>= (char-code a) (char-code b)))
+(defun char-equal (a b) (eql (char-upcase a) (char-upcase b)))
+(defun char-not-equal (a b) (not (char-equal a b)))
+(defun char-lessp (a b) (char< (char-upcase a) (char-upcase b)))
+(defun char-greaterp (a b) (char> (char-upcase a) (char-upcase b)))
+(defun char-not-greaterp (a b) (char<= (char-upcase a) (char-upcase b)))
+(defun char-not-lessp (a b) (char>= (char-upcase a) (char-upcase b)))
+
+(defun char-int (c) (char-code c))
+(defun code-char (n) (if (characterp n) n (code-char n)))
+
+;;; Numeric
+(defun abs (n) (if (< n 0) (- 0 n) n))
+(defun max (a &rest more) (let ((r a)) (dolist (x more r) (when (> x r) (setq r x)))))
+(defun min (a &rest more) (let ((r a)) (dolist (x more r) (when (< x r) (setq r x)))))
+(defun floor (n &optional (d 1)) (let ((q (truncate n d))) (values q (- n (* q d)))))
+(defun ceiling (n &optional (d 1)) (let ((q (truncate n d))) (if (zerop (- n (* q d))) (values q 0) (values (+ q 1) (- n (* (+ q 1) d))))))
+(defun rem (n d) (- n (* (truncate n d) d)))
+(defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
+(defun expt (base power) (cond ((= power 0) 1) ((= power 1) base)
+  (t (let ((r 1)) (dotimes (i power r) (setq r (* r base)))))))
+(defun isqrt (n) (if (<= n 0) 0 (let ((x n)) (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
+  (when (>= x1 x) (return x)) (setq x x1))))))
+(defun gcd (a &optional b) (if (null b) (abs a)
+  (let ((a (abs a)) (b (abs b))) (loop (when (zerop b) (return a)) (let ((r (rem a b))) (setq a b) (setq b r))))))
+(defun lcm (a &optional b) (if (null b) (abs a)
+  (if (or (zerop a) (zerop b)) 0 (abs (truncate (* a b) (gcd a b))))))
+
+;;; Type predicates
+(defun numberp (x) (integerp x))
+(defun realp (x) (integerp x))
+(defun rationalp (x) (integerp x))
+(defun complexp (x) nil)
+(defun floatp (x) (floatp-impl x))
+
+;;; Misc
+(defun values-list (list) (apply #'values list))
+(defun nreconc (list tail) (nconc (nreverse list) tail))
+(defun set-elt (seq idx val)
+  "Set element at IDX in SEQ to VAL."
+  (if (consp seq) (set-car (nthcdr idx seq) val)
+      (aset seq idx val))
+  val)
+(defun set-fill-pointer (vec n) n)  ; stub
+(defun random-fixnum () (random most-positive-fixnum))
+(defun subtypep* (t1 t2) nil)  ; stub
+(defun map (result-type fn &rest seqs)
+  "Map FN over sequences, collecting into RESULT-TYPE."
+  (if (null result-type) (progn (apply #'mapc fn seqs) nil)
+      (apply #'mapcar fn seqs)))
+(defun functionp (x) (or (and (not (null x)) (not (integerp x)) (not (consp x))
+                              (not (characterp x)) (not (stringp x)) (not (eq x t)))
+                         nil))
+(defun keywordp (x) nil)  ; stub
+(defun symbol-package (x) nil)  ; stub
+(defun compile (name &optional def) nil)  ; stub
+(defun class-of (x) nil)  ; stub
+(defun simple-vector-p (x) (vectorp x))
+(defun nstring-upcase (str &rest args) (string-upcase str))
+(defun nstring-downcase (str &rest args) (string-downcase str))
+(defun nstring-capitalize (str &rest args) (string-capitalize str))
+(defun array-dimension (a n) (if (= n 0) (array-length a) 0))
+(defun array-total-size (a) (array-length a))
+(defun array-rank (a) 1)
+(defun adjustable-array-p (a) nil)
+(defun row-major-aref (a idx) (aref a idx))
+(defun set-row-major-aref (a idx val) (aset a idx val) val)
+(defun char-type-error-check (fn x) nil)
+(defun copy-seq (seq) (if (consp seq) (copy-list seq) (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))))
+(defun sqrt (n) (isqrt n))  ; integer sqrt stub
+(defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
+(defun set-schar (str idx ch) (aset str idx (char-code ch)) ch)
+(defun schar (str idx) (code-char (aref str idx)))
+(defun char (str idx) (code-char (aref str idx)))
+(defun symbol-plist (sym) nil)
+(defun fboundp (sym) nil)  ; stub
+(defun fill-pointer (vec) (length vec))  ; stub
+(defun bit-vector-p (x) nil)  ; stub
+(defun simple-string-p (x) (stringp x))
+(defun simple-bit-vector-p (x) nil)
+(defun subtypep (t1 t2 &rest args) (values nil nil))  ; stub
+(defun logcount (n) (let ((c 0) (x (abs n))) (loop (when (zerop x) (return c)) (when (oddp x) (setq c (+ c 1))) (setq x (ash x -1)))))
+(defun remf (plist indicator) nil)  ; stub
+(defun nintersection-with-check (l1 l2 &rest args) (nintersection l1 l2))
+(defun intersection (l1 l2 &rest args) (nintersection l1 l2))
+(defun set-difference (l1 l2 &rest args) (let ((r nil)) (dolist (item l1 (nreverse r)) (unless (member item l2) (setq r (cons item r))))))
+(defun nset-difference (l1 l2 &rest args) (set-difference l1 l2))
+(defun union (l1 l2 &rest args) (let ((r (copy-list l1))) (dolist (item l2 r) (unless (member item r) (setq r (cons item r))))))
+(defun nunion (l1 l2 &rest args) (union l1 l2))
+(defun subsetp (l1 l2 &rest args) (every (lambda (x) (member x l2)) l1))

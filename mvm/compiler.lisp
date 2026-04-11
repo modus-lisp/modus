@@ -570,6 +570,18 @@
             `(setq ,place (- ,place ,delta))
             `(setf ,place (- ,place ,delta))))))
 
+  ;; REMF → modify plist, return generalized boolean
+  (mvm-define-macro "REMF"
+    (lambda (form)
+      (let ((place (cadr form))
+            (indicator (caddr form))
+            (result (gensym "R")))
+        (if (symbolp place)
+            `(let ((,result (%remf ,place ,indicator)))
+               (setq ,place (cdr ,result))
+               (car ,result))
+            `(car (%remf ,place ,indicator))))))
+
   ;; PUSHNEW → adjoin + setq
   (mvm-define-macro "PUSHNEW"
     (lambda (form)

@@ -867,8 +867,18 @@
         (nreverse r))
       seq))
 (defun read-from-string (str &rest args)
-  "Stub — returns nil for now."
-  nil)
+  "Basic read-from-string — handles simple atoms."
+  ;; Try to parse as integer
+  (let ((len (length str)) (i 0) (sign 1) (n 0) (got-digit nil))
+    (when (> len 0)
+      (when (eql (elt str 0) #\-) (setq sign -1) (setq i 1))
+      (when (eql (elt str 0) #\+) (setq i 1)))
+    (loop
+      (when (>= i len)
+        (if got-digit (return (* sign n)) (return nil)))
+      (let ((d (digit-char-p (elt str i))))
+        (if d (progn (setq n (+ (* n 10) d)) (setq got-digit t) (setq i (+ i 1)))
+            (return nil))))))
 (defun find-class (name &rest args) nil)
 (defun make-symbol (name) nil)
 (defun eval (form) nil)  ; stub
@@ -1023,6 +1033,18 @@
 (defun copy-seq (seq) (if (consp seq) (copy-list seq) (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))))
 (defun sqrt (n) (isqrt n))  ; integer sqrt stub
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
+(defun set-subseq (seq start end val) seq)  ; stub
+(defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))
+(defun nth-value (n form) nil)  ; stub
+(defun copy-symbol (sym &optional props) nil)  ; stub
+(defun realpart (z) z)
+(defun imagpart (z) 0)
+(defun numerator (r) r)
+(defun denominator (r) 1)
+(defun float (n &optional proto) n)  ; stub — no real floats
+(defun rational (n) n)
+(defun rationalize (n) n)
+(defun integer (n) n)  ; not a real CL function but used as type coercion
 (defun set-schar (str idx ch) (aset str idx (char-code ch)) ch)
 (defun schar (str idx) (code-char (aref str idx)))
 (defun char (str idx) (code-char (aref str idx)))
@@ -1034,7 +1056,20 @@
 (defun simple-bit-vector-p (x) nil)
 (defun subtypep (t1 t2 &rest args) (values nil nil))  ; stub
 (defun logcount (n) (let ((c 0) (x (abs n))) (loop (when (zerop x) (return c)) (when (oddp x) (setq c (+ c 1))) (setq x (ash x -1)))))
-(defun remf (plist indicator) nil)  ; stub
+(defun %remf (plist indicator)
+  "Remove property INDICATOR from PLIST. Returns (removed-p . new-plist)."
+  (cond
+    ((null plist) (cons nil nil))
+    ((eql (car plist) indicator)
+     (cons t (cddr plist)))
+    (t (let ((prev plist) (cur (cddr plist)))
+         (loop
+           (when (null cur) (return (cons nil plist)))
+           (when (eql (car cur) indicator)
+             (set-cdr (cdr prev) (cddr cur))
+             (return (cons t plist)))
+           (setq prev (cddr prev))
+           (setq cur (cddr cur)))))))
 (defun nintersection-with-check (l1 l2 &rest args) (nintersection l1 l2))
 (defun intersection (l1 l2 &rest args) (nintersection l1 l2))
 (defun set-difference (l1 l2 &rest args) (let ((r nil)) (dolist (item l1 (nreverse r)) (unless (member item l2) (setq r (cons item r))))))

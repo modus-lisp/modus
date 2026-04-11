@@ -383,6 +383,209 @@
       (= (aref a 1) (aref b 1))
       nil))
 
+;;; ============================================================
+;;; String stream / printer support
+;;; ============================================================
+
+;; Simple string output stream: cons cell (chars-list . nil)
+;; Characters are collected in reverse, then reversed to build string.
+(defvar *string-output-stream* nil)
+
+(defun make-string-output-stream ()
+  (cons nil nil))
+
+(defun get-output-stream-string (stream)
+  (let ((chars (nreverse (car stream))))
+    (set-car stream nil)
+    (let ((len (list-length chars))
+          (i 0))
+      (if (null chars) (make-array 0)
+        (let ((s (make-array len))
+              (cur chars))
+          (loop
+            (when (null cur) (return s))
+            (aset s i (car cur))
+            (setq cur (cdr cur))
+            (setq i (+ i 1))))))))
+
+(defun write-char-to-stream (ch stream)
+  (if (null stream)
+      (write-char-serial ch)
+      (set-car stream (cons ch (car stream)))))
+
+;; write-object-to-stream: like write-object but outputs to a stream
+(defun write-to-stream (obj stream)
+  (cond
+    ((null obj)
+     (write-char-to-stream 78 stream)
+     (write-char-to-stream 73 stream)
+     (write-char-to-stream 76 stream))
+    ((eq obj t)
+     (write-char-to-stream 84 stream))
+    ((fixnump obj)
+     ;; Print integer to stream
+     (if (< obj 0)
+       (progn (write-char-to-stream 45 stream)
+              (write-to-stream (- 0 obj) stream))
+       (if (= obj 0) (write-char-to-stream 48 stream)
+         (let ((digits nil) (tmp obj))
+           (loop
+             (when (= tmp 0) (return nil))
+             (setq digits (cons (+ 48 (mod tmp 10)) digits))
+             (setq tmp (truncate tmp 10)))
+           (let ((cur digits))
+             (loop
+               (when (null cur) (return nil))
+               (write-char-to-stream (car cur) stream)
+               (setq cur (cdr cur))))))))
+    ((consp obj)
+     (write-char-to-stream 40 stream)
+     (write-to-stream (car obj) stream)
+     (let ((tail (cdr obj)))
+       (loop
+         (cond
+           ((null tail) (return nil))
+           ((consp tail)
+            (write-char-to-stream 32 stream)
+            (write-to-stream (car tail) stream)
+            (setq tail (cdr tail)))
+           (t
+            (write-char-to-stream 32 stream)
+            (write-char-to-stream 46 stream)
+            (write-char-to-stream 32 stream)
+            (write-to-stream tail stream)
+            (return nil)))))
+     (write-char-to-stream 41 stream))
+    ((stringp obj)
+     (write-char-to-stream 34 stream)
+     (let ((len (array-length obj)) (i 0))
+       (loop
+         (when (= i len) (return nil))
+         (write-char-to-stream (aref obj i) stream)
+         (setq i (+ i 1))))
+     (write-char-to-stream 34 stream))
+    (t
+     (write-char-to-stream 35 stream)
+     (write-char-to-stream 60 stream)
+     (write-char-to-stream 63 stream)
+     (write-char-to-stream 62 stream))))
+
+(defun princ-to-stream (obj stream)
+  (cond
+    ((null obj)
+     (write-char-to-stream 78 stream)
+     (write-char-to-stream 73 stream)
+     (write-char-to-stream 76 stream))
+    ((eq obj t)
+     (write-char-to-stream 84 stream))
+    ((fixnump obj)
+     (write-to-stream obj stream))
+    ((stringp obj)
+     (let ((len (array-length obj)) (i 0))
+       (loop
+         (when (= i len) (return nil))
+         (write-char-to-stream (aref obj i) stream)
+         (setq i (+ i 1)))))
+    (t (write-to-stream obj stream))))
+
+(defun write-to-string (obj)
+  (let ((s (make-string-output-stream)))
+    (write-to-stream obj s)
+    (get-output-stream-string s)))
+
+(defun prin1-to-string (obj)
+  (write-to-string obj))
+
+(defun princ-to-string (obj)
+  (let ((s (make-string-output-stream)))
+    (princ-to-stream obj s)
+    (get-output-stream-string s)))
+
+(defun prin1 (obj &rest stream-arg)
+  (let ((stream (if stream-arg (car stream-arg) nil)))
+    (if (or (null stream) (eq stream t))
+        (write-object obj)
+        (write-to-stream obj stream))
+    obj))
+
+(defun princ (obj &rest stream-arg)
+  (let ((stream (if stream-arg (car stream-arg) nil)))
+    (if (or (null stream) (eq stream t))
+        (princ-object obj)
+        (princ-to-stream obj stream))
+    obj))
+
+(defun write (obj &rest args)
+  (write-object obj)
+  obj)
+
+(defun print (obj &rest stream-arg)
+  (write-char-serial 10)
+  (write-object obj)
+  (write-char-serial 32)
+  obj)
+
+(defun terpri (&rest stream-arg)
+  (write-char-serial 10)
+  nil)
+
+(defun fresh-line (&rest stream-arg)
+  (write-char-serial 10)
+  t)
+
+(defun write-string (str &rest args)
+  (write-string-serial str)
+  str)
+
+(defun write-line (str &rest args)
+  (write-string-serial str)
+  (write-char-serial 10)
+  str)
+
+(defun write-char (ch &rest stream-arg)
+  (write-char-serial ch)
+  ch)
+
+(defun finish-output (&rest args) nil)
+(defun force-output (&rest args) nil)
+(defun clear-output (&rest args) nil)
+(defun clear-input (&rest args) nil)
+
+;; with-output-to-string
+(defun input-stream-p (s) nil)
+(defun output-stream-p (s) nil)
+(defun open-stream-p (s) t)
+(defun stream-element-type (s) (quote character))
+(defun stream-external-format (s) (quote default))
+(defun listen (&rest args) nil)
+(defun file-length (s) 0)
+(defun file-position (s &rest args) 0)
+(defun file-string-length (s str) (if (stringp str) (array-length str) 1))
+(defun peek-char (&rest args) nil)
+(defun unread-char (ch &rest args) nil)
+(defun read-char (&rest args) nil)
+(defun read-char-no-hang (&rest args) nil)
+(defun read-line (&rest args) (values nil t))
+(defun read-byte (&rest args) nil)
+(defun read-sequence (seq stream &rest args) 0)
+(defun write-sequence (seq stream &rest args) seq)
+(defun write-byte (byte stream) byte)
+
+(defun make-broadcast-stream (&rest streams) nil)
+(defun broadcast-stream-streams (s) nil)
+(defun make-concatenated-stream (&rest streams) nil)
+(defun concatenated-stream-streams (s) nil)
+(defun make-echo-stream (in out) nil)
+(defun echo-stream-input-stream (s) nil)
+(defun echo-stream-output-stream (s) nil)
+(defun make-synonym-stream (sym) nil)
+(defun synonym-stream-symbol (s) nil)
+(defun make-two-way-stream (in out) nil)
+(defun two-way-stream-input-stream (s) nil)
+(defun two-way-stream-output-stream (s) nil)
+(defun make-string-input-stream (str &rest args) nil)
+(defun interactive-stream-p (s) nil)
+
 (defun equalp-impl (a b)
   (if (eql a b) t
     (if (consp a)

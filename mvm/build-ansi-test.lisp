@@ -261,6 +261,46 @@
 (load-ansi-chapter "/tmp/ansi-test/reader/"
   '("readtablep.lsp" "read-from-string.lsp" "read.lsp"))
 
+;; Printer chapter
+(load-ansi-chapter "/tmp/ansi-test/printer/"
+  '("write.lsp" "write-to-string.lsp"
+    "prin1.lsp" "prin1-to-string.lsp"
+    "princ.lsp" "princ-to-string.lsp"
+    "print.lsp" "pprint.lsp"
+    "print-integers.lsp" "print-strings.lsp"
+    "print-cons.lsp" "print-characters.lsp"
+    "print-vector.lsp" "print-array.lsp"
+    "print-symbols.lsp"
+    "print-bit-vector.lsp"
+    "print-length.lsp" "print-level.lsp"
+    "printer-control-vars.lsp"))
+
+;; Streams chapter
+(load-ansi-chapter "/tmp/ansi-test/streams/"
+  '("streamp.lsp" "write-char.lsp" "terpri.lsp"
+    "write-string.lsp" "write-line.lsp"
+    "finish-output.lsp" "force-output.lsp" "clear-output.lsp"
+    "clear-input.lsp"
+    "input-stream-p.lsp" "output-stream-p.lsp" "open-stream-p.lsp"
+    "stream-element-type.lsp" "stream-external-format.lsp"
+    "interactive-stream-p.lsp"
+    "listen.lsp" "fresh-line.lsp"
+    "make-string-output-stream.lsp" "get-output-stream-string.lsp"
+    "make-string-input-stream.lsp"
+    "with-output-to-string.lsp" "with-input-from-string.lsp"
+    "make-broadcast-stream.lsp" "broadcast-stream-streams.lsp"
+    "make-concatenated-stream.lsp" "concatenated-stream-streams.lsp"
+    "make-echo-stream.lsp" "echo-stream-input-stream.lsp"
+    "echo-stream-output-stream.lsp"
+    "make-synonym-stream.lsp" "synonym-stream-symbol.lsp"
+    "make-two-way-stream.lsp" "two-way-stream-input-stream.lsp"
+    "two-way-stream-output-stream.lsp"
+    "peek-char.lsp" "unread-char.lsp"
+    "read-char.lsp" "read-char-no-hang.lsp"
+    "read-line.lsp" "read-byte.lsp"
+    "read-sequence.lsp" "write-sequence.lsp" "write-byte.lsp"
+    "file-length.lsp" "file-position.lsp" "file-string-length.lsp"))
+
 ;; More DCF
 (load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
   '("every.lsp" "some.lsp" "notany.lsp" "notevery.lsp"

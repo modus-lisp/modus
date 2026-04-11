@@ -251,9 +251,16 @@
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))
+;; fork-run: isolate each file runner in a child process to survive crashes
 (setf *real-ansi-sources*
       (concatenate 'string *real-ansi-sources*
-                   (format nil "~%(defun run-real-ansi-tests ()~%~{  (run-ansi-~A)~%~})~%"
+                   (format nil "~%(defun fork-run (thunk)~
+                     ~%  (let ((pid (syscall3 57 0 0 0)))~
+                     ~%    (if (= pid 0)~
+                     ~%        (progn (funcall thunk) (syscall3 60 0 0 0))~
+                     ~%        (let ((status 0))~
+                     ~%          (syscall3 61 pid 0 0)))))~%")
+                   (format nil "~%(defun run-real-ansi-tests ()~%~{  (fork-run (lambda () (run-ansi-~A)))~%~})~%"
                            *ansi-file-names*)))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))

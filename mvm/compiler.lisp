@@ -2558,29 +2558,26 @@
                              ,(car args))
                      env dest))
       (t
-       ;; Multiple values: evaluate ALL values left-to-right first (CL semantics),
-       ;; then store extras and return primary.
-       (let ((temp-vars nil)
-             (bindings nil))
-         ;; Generate temp vars for each value
+       ;; Multiple values: eval all left-to-right, push to stack,
+       ;; then pop extras to MV storage, pop primary to dest.
+       ;; Uses push/pop to preserve values across function calls.
+       (let ((addr-reg (alloc-temp-reg)))
+         ;; Evaluate each value and push result
          (dolist (val-form args)
-           (let ((tmp (gensym "MV")))
-             (push tmp temp-vars)
-             (push (list tmp val-form) bindings)))
-         (setf temp-vars (nreverse temp-vars))
-         (setf bindings (nreverse bindings))
-         ;; Generate: (let ((t1 v1) (t2 v2) ...) (setf count) (setf extras) t1)
-         (let ((store-forms nil)
-               (idx 0))
-           (push `(setf (mem-ref ,+mv-count-addr+ :u64) ,nvals) store-forms)
-           (dolist (tmp (cdr temp-vars))
-             (let ((addr (+ +mv-values-addr+ (* idx 8))))
-               (push `(setf (mem-ref ,addr :u64) ,tmp) store-forms))
-             (incf idx))
-           (compile-form `(let ,bindings
-                            ,@(nreverse store-forms)
-                            ,(car temp-vars))
-                         env dest)))))))
+           (compile-form val-form env dest)
+           (emit-ir :push dest))
+         ;; Set count
+         (emit-ir :set-mv-count nvals)
+         ;; Pop extra values in reverse order into MV storage
+         (loop for idx from (- nvals 2) downto 0
+               do (emit-ir :pop dest)
+                  (emit-ir :li addr-reg (ash (+ +mv-values-addr+ (* idx 8))
+                                             +fixnum-shift+))
+                  (emit-ir :shr addr-reg addr-reg +fixnum-shift+)
+                  (emit-ir :store addr-reg dest 3))  ; width 3 = :u64
+         ;; Pop primary value into dest
+         (emit-ir :pop dest)
+         (free-temp-reg))))))
 
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).

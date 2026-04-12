@@ -1541,6 +1541,7 @@
 
       ;; --- Symbol allocation ---
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
+      ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
 
       ;; --- Array Operations ---
@@ -3906,6 +3907,10 @@
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
    Returns an uninitialized symbol object; caller stores name-hash in slot 0."
   (emit-ir :alloc-obj dest 1 +subtag-symbol+))
+
+(defun compile-make-bignum (dest)
+  "Compile (%make-bignum) — allocate a 2-slot object with bignum subtag."
+  (emit-ir :alloc-obj dest 2 +subtag-bignum+))
 
 (defun compile-make-array (size-form env dest)
   "Compile (make-array size).

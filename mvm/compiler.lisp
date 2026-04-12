@@ -2575,14 +2575,13 @@
    Expands to: evaluate form, bind first var to result,
    bind remaining vars from MV storage, with nil default if fewer values."
   (when (null vars)
-    ;; No vars: just evaluate form for side effects, then body
     (return-from compile-multiple-value-bind
       (compile-form `(progn ,form ,@body) env dest)))
   (let ((count-var (gensym "MVC"))
         (bindings nil))
     ;; First var = form result (primary value)
     (push (list (car vars) form) bindings)
-    ;; count-var = MV count (set by values or defaulted to 1)
+    ;; count-var = MV count
     (push (list count-var `(mem-ref ,+mv-count-addr+ :u64)) bindings)
     ;; Remaining vars: read from MV storage if count > index+1, else nil
     (let ((idx 0))

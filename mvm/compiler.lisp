@@ -2594,6 +2594,31 @@
         (incf idx)))
     (compile-let (nreverse bindings) body env dest)))
 
+(defun tail-form-is-values-p (body)
+  "Check if the tail form of BODY is a (values ...) call.
+   Walks through progn, let, let*, if to find the actual tail position."
+  (when (null body) (return-from tail-form-is-values-p nil))
+  (let ((form (if (consp body) (car (last body)) body)))
+    (when (atom form) (return-from tail-form-is-values-p nil))
+    (let ((op (car form)))
+      (when (not (symbolp op)) (return-from tail-form-is-values-p nil))
+      (let ((hash (compute-name-hash (symbol-name op))))
+        (cond
+          ;; Direct values call
+          ((= hash 419785975474686239) t)  ; VALUES
+          ;; progn — check last form
+          ((= hash 87505416312042891)      ; PROGN
+           (tail-form-is-values-p (cdr form)))
+          ;; let/let* — check body (last form after bindings)
+          ((or (= hash 347164158959663450)   ; LET
+               (= hash 115433002357585904))  ; LET*
+           (tail-form-is-values-p (cddr form)))
+          ;; if — check both branches
+          ((= hash 448736678201786992)     ; IF
+           (or (and (caddr form) (tail-form-is-values-p (list (caddr form))))
+               (and (cadddr form) (tail-form-is-values-p (list (cadddr form))))))
+          (t nil))))))
+
 (defun compile-multiple-value-list (form env dest)
   "Compile (multiple-value-list form).
    Evaluates form, then calls %mv-to-list to collect all values into a list."
@@ -4186,15 +4211,9 @@
       ;; Compile body (strip any declarations), result goes to VR
       (compile-progn (strip-declares body) env +vreg-vr+))
 
-    ;; If the body's last form was NOT a values call, set MV count = 1
-    ;; so the caller sees single-value return.
-    ;; compile-values already sets the count for multi-value returns.
-    (let ((last-form (car (last (strip-declares body)))))
-      (unless (and (consp last-form)
-                   (symbolp (car last-form))
-                   (= (compute-name-hash (symbol-name (car last-form)))
-                      419785975474686239))  ; VALUES
-        (emit-ir :set-mv-count 1)))
+    ;; Set MV count=1 for non-values functions (Genera-style).
+    (unless (tail-form-is-values-p (strip-declares body))
+      (emit-ir :set-mv-count 1))
 
     ;; Function return label (for early return via (return value))
     (emit-ir-label return-label)
@@ -4652,7 +4671,6 @@
            (mvm-call-ind buf (second insn)))
 
           (:call-native
-           ;; Emit as call-indirect
            (mvm-call-ind buf (second insn)))
 
           ;; ---- Function address ----

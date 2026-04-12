@@ -260,6 +260,7 @@
                        ~%  (let ((pid (syscall3 57 0 0 0)))~
                        ~%    (if (= pid 0)~
                        ~%        (progn~
+                       ~%          (syscall3 37 5 0 0)~
                        ~%          (setq *rt-test-count* 0)~
                        ~%          (setq *rt-pass-count* 0)~
                        ~%          (setq *rt-fail-count* 0)~

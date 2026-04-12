@@ -1046,7 +1046,7 @@
                    (dolist (var (cdr spec))
                      (push var specials))))
                (setf body (cdr body))))
-    specials))
+    (nreverse specials)))
 
 ;;; ============================================================
 ;;; Phase 2: IR Generation (AST -> MVM IR)
@@ -1312,7 +1312,7 @@
       ((= op-name 115433002357585904)
        (let ((specials (extract-special-vars (cddr form))))
          (if specials
-             (compile-let-with-specials (cadr form) (cddr form) specials env dest)
+             (compile-let-with-specials (cadr form) (cddr form) specials env dest t)
              (compile-let* (cadr form) (cddr form) env dest))))
       ((= op-name 565254038635891948)     (compile-setq (cadr form) (caddr form) env dest))
       ((= op-name 527981956251550024)   (compile-lambda (cadr form) (cddr form) env dest))
@@ -1773,53 +1773,83 @@
 ;;; Let / Let*
 ;;; ============================================================
 
-(defun compile-let-with-specials (bindings body specials env dest)
+(defun compile-let-with-specials (bindings body specials env dest &optional sequential)
   "Compile let/let* with (declare (special ...)) variables.
    Special vars use dynamic binding via symbol-value/set-symbol-value.
    On entry: save old values, set new values.
-   On exit: restore old values."
+   On exit: restore old values, preserving multiple-value state.
+   When SEQUENTIAL is true (let* context), all bindings are kept in original
+   order to preserve sequential dependencies (e.g. from multiple-value-bind)."
   (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
          (save-vars (mapcar (lambda (s) (gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
-         ;; Expand: evaluate all bindings, then save+set specials, run body, restore
-         (regular-bindings nil)
          (special-bindings nil))
-    ;; Separate bindings into regular and special
+    ;; Collect just the special bindings for save/set/restore generation
     (dolist (binding bindings)
       (let ((var (if (consp binding) (car binding) binding)))
-        (if (member (symbol-name var) special-names :test #'string=)
-            (push binding special-bindings)
-            (push binding regular-bindings))))
-    (setf regular-bindings (nreverse regular-bindings))
+        (when (member (symbol-name var) special-names :test #'string=)
+          (push binding special-bindings))))
     (setf special-bindings (nreverse special-bindings))
-    ;; Generate expanded form:
-    ;; (let (regular-bindings...)
-    ;;   (let* ((save1 (symbol-value 'hash1)) ...)
-    ;;     (set-symbol-value 'hash1 val1) ...
-    ;;     body...
-    ;;     (set-symbol-value 'hash1 save1) ...))
     (let* ((save-bindings
              (mapcar (lambda (sv spec)
                        (list sv `(symbol-value ,(normalize-name spec))))
                      save-vars specials))
            (set-forms
-             (mapcar (lambda (spec binding)
-                       (let ((val-var (if (consp binding) (car binding) binding)))
+             (mapcar (lambda (spec)
+                       ;; Find the corresponding binding by name
+                       (let* ((spec-name (symbol-name spec))
+                              (binding (find spec-name special-bindings
+                                            :key (lambda (b)
+                                                   (symbol-name (if (consp b) (car b) b)))
+                                            :test #'string=))
+                              (val-var (if (consp binding) (car binding) binding)))
                          `(set-symbol-value ,(normalize-name spec) ,val-var)))
-                     specials special-bindings))
+                     specials))
            (restore-forms
              (mapcar (lambda (sv spec)
                        `(set-symbol-value ,(normalize-name spec) ,sv))
                      save-vars specials))
-           (stripped-body (strip-declares body)))
-      (compile-form
-        `(let ,regular-bindings
-           (let ,special-bindings
-             (let* ,save-bindings
-               ,@set-forms
-               (let ((%special-result (progn ,@stripped-body)))
-                 ,@restore-forms
-                 %special-result))))
-        env dest))))
+           (stripped-body (strip-declares body))
+           ;; Generate MV state save/restore to preserve multiple values across restore-forms.
+           ;; The body may return multiple values (via VALUES), and restore-forms call
+           ;; set-symbol-value which clobbers MV state.  Save count + 8 value slots.
+           (n-mv-slots 3)
+           (mv-count-save (gensym "MVCNT"))
+           (mv-save-vars (loop for i from 0 below n-mv-slots
+                               collect (gensym (format nil "MV~D" i))))
+           (mv-save-bindings
+             (cons (list mv-count-save `(mem-ref ,+mv-count-addr+ :u64))
+                   (loop for i from 0 below n-mv-slots
+                         for sv in mv-save-vars
+                         collect (list sv `(mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64)))))
+           (mv-restore-forms
+             (cons `(setf (mem-ref ,+mv-count-addr+ :u64) ,mv-count-save)
+                   (loop for i from 0 below n-mv-slots
+                         for sv in mv-save-vars
+                         collect `(setf (mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64) ,sv)))))
+      (if sequential
+          ;; let* context: keep ALL bindings in original order, then save/set/restore specials
+          (compile-form
+            `(let* ,bindings
+               (let* ,save-bindings
+                 ,@set-forms
+                 (let ((%special-result (progn ,@stripped-body)))
+                   (let* ,mv-save-bindings
+                     ,@restore-forms
+                     ,@mv-restore-forms
+                     %special-result))))
+            env dest)
+          ;; let context: combine all bindings into a single let* to minimize nesting depth.
+          ;; Order: regular bindings, special bindings, save bindings, then set+body+restore.
+          (let ((all-bindings (append bindings save-bindings)))
+            (compile-form
+              `(let* ,all-bindings
+                 ,@set-forms
+                 (let ((%special-result (progn ,@stripped-body)))
+                   (let* ,mv-save-bindings
+                     ,@restore-forms
+                     ,@mv-restore-forms
+                     %special-result)))
+              env dest))))))
 
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
@@ -2699,7 +2729,6 @@
       (t
        ;; Multiple values: eval all left-to-right, push to stack,
        ;; then pop extras to MV storage, pop primary to dest.
-       ;; Uses push/pop to preserve values across function calls.
        (let ((addr-reg (alloc-temp-reg)))
          ;; Evaluate each value and push result
          (dolist (val-form args)
@@ -2713,25 +2742,28 @@
                   (emit-ir :li addr-reg (ash (+ +mv-values-addr+ (* idx 8))
                                              +fixnum-shift+))
                   (emit-ir :shr addr-reg addr-reg +fixnum-shift+)
-                  (emit-ir :store addr-reg dest 3))  ; width 3 = :u64
+                  (emit-ir :store addr-reg dest 3))
          ;; Pop primary value into dest
          (emit-ir :pop dest)
          (free-temp-reg))))))
 
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).
-   Expands to: evaluate form, bind first var to result,
-   bind remaining vars from MV storage, with nil default if fewer values."
+   Evaluates form, then reads MV count and values into let* bindings.
+   The form is wrapped in a dedicated let binding to isolate its evaluation
+   from any outer push/pop context (prevents interaction with nested
+   compile-values calls)."
   (when (null vars)
     (return-from compile-multiple-value-bind
       (compile-form `(progn ,form ,@body) env dest)))
-  (let ((count-var (gensym "MVC"))
-        (bindings nil))
-    ;; First var = form result (primary value)
-    (push (list (car vars) form) bindings)
-    ;; count-var = MV count
+  (let* ((primary-var (gensym "MVPRI"))
+         (count-var (gensym "MVC"))
+         (bindings nil))
+    ;; First: capture primary in its own let scope
+    (push (list primary-var form) bindings)
+    ;; Then: read MV count
     (push (list count-var `(mem-ref ,+mv-count-addr+ :u64)) bindings)
-    ;; Remaining vars: read from MV storage if count > index+1, else nil
+    ;; Remaining vars: read from MV storage if count > index, else nil
     (let ((idx 0))
       (dolist (var (cdr vars))
         (let ((addr (+ +mv-values-addr+ (* idx 8))))
@@ -2740,7 +2772,9 @@
                                nil))
                 bindings))
         (incf idx)))
-    (compile-let* (nreverse bindings) body env dest)))
+    ;; Bind first user var to the captured primary
+    (push (list (car vars) primary-var) bindings)
+    (compile-form `(let* ,(nreverse bindings) ,@body) env dest)))
 
 (defun tail-form-is-values-p (body)
   "Check if the tail form of BODY is a (values ...) call.

@@ -2592,7 +2592,7 @@
                                nil))
                 bindings))
         (incf idx)))
-    (compile-let (nreverse bindings) body env dest)))
+    (compile-let* (nreverse bindings) body env dest)))
 
 (defun tail-form-is-values-p (body)
   "Check if the tail form of BODY is a (values ...) call.

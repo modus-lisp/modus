@@ -848,10 +848,14 @@
 ;;; these with variable arity — extra args are silently ignored.
 
 (defun error (msg)
-  "Print error indicator and halt. Extra args ignored on bare metal."
-  (write-string-serial "ERR:")
-  (write-byte 10)
-  (halt))
+  "Signal an error. If handler-case is active, longjmp to it.
+   Otherwise print error indicator and halt."
+  (if (%error-handler-active-p)
+      (%hc-longjmp)
+      (progn
+        (write-string-serial "ERR:")
+        (write-byte 10)
+        (halt))))
 
 (defun warn (msg)
   "Print warning indicator. Extra args ignored on bare metal."

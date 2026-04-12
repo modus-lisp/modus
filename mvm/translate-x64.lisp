@@ -522,6 +522,79 @@
               (emit-bytes buf #x48 #xC1 #xE0 #x20)
               ;; or rax, rcx
               (emit-bytes buf #x48 #x09 #xC8))
+             ((= code #x0510)
+              ;; SETJMP: Save RSP, RBP, and return address to fixed memory.
+              ;; On first call, returns NIL (#xDEAD0001) in RAX.
+              ;; On longjmp, execution resumes here with RAX = T (#xDEAD1009).
+              ;;
+              ;; Fixed addresses (in Linux heap reserved area):
+              ;;   0x10000140: saved RSP
+              ;;   0x10000148: saved RBP
+              ;;   0x10000150: saved return address (IP after this sequence)
+              ;;
+              ;; We use LEA + RIP-relative to get the return address.
+              ;; Layout:
+              ;;   lea rcx, [rip+N]    ; address of "return point" after the jmp
+              ;;   mov [addr], rsp     ; save RSP
+              ;;   mov [addr+8], rbp   ; save RBP
+              ;;   mov [addr+16], rcx  ; save return IP
+              ;;   mov rax, NIL        ; first-time return value
+              ;;   jmp +5              ; skip longjmp-return block
+              ;;   (longjmp return point — RAX already has T from longjmp)
+              ;;
+              ;; Save RSP to 0x10000140
+              (emit-bytes buf #x48 #xA3)              ; mov [abs64], rax  — but we need RSP
+              ;; Actually, we need movabs [imm64], reg. Let me use mov r/m, reg approach.
+              ;; mov [abs], rsp:  48 89 24 25 <addr32> (if addr fits 32 bits)
+              ;; 0x10000140 fits in 32 bits (sign-extended) — no, 0x10000140 > 0x7FFFFFFF
+              ;; Use movabs with RCX as temp
+              ;; mov rcx, 0x10000140
+              (emit-bytes buf #x48 #xB9)
+              (emit-u32 buf #x10000140) (emit-u32 buf 0)
+              ;; mov [rcx], rsp
+              (emit-bytes buf #x48 #x89 #x21)
+              ;; mov [rcx+8], rbp
+              (emit-bytes buf #x48 #x89 #x69 #x08)
+              ;; lea rax, [rip+2]  — address of instruction after the JMP below
+              ;; The JMP short is 2 bytes (EB xx), so we want rip+2 to point past it
+              (emit-bytes buf #x48 #x8D #x05 #x02 #x00 #x00 #x00)  ; lea rax, [rip+2]
+              ;; mov [rcx+16], rax  — save return IP
+              (emit-bytes buf #x48 #x89 #x41 #x10)
+              ;; mov rax, NIL (#xDEAD0001) — first-time return
+              (emit-bytes buf #x48 #xB8)
+              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0)
+              ;; jmp +0  — skip 0 bytes (the longjmp path uses the saved IP directly)
+              ;; No skip needed: longjmp jumps to the saved IP which is here
+              ;; RAX has NIL for normal flow; longjmp sets RAX to T before jumping
+              )
+             ((= code #x0511)
+              ;; LONGJMP: Restore RSP/RBP from fixed memory, jump to saved IP.
+              ;; Sets RAX to T (#xDEAD1009) so setjmp "returns" non-nil.
+              ;;
+              ;; Clear the handler first (set saved RSP to 0)
+              ;; mov rcx, 0x10000140
+              (emit-bytes buf #x48 #xB9)
+              (emit-u32 buf #x10000140) (emit-u32 buf 0)
+              ;; mov rdx, [rcx+16]  — saved return IP
+              (emit-bytes buf #x48 #x8B #x51 #x10)
+              ;; mov rbp, [rcx+8]   — restore RBP
+              (emit-bytes buf #x48 #x8B #x69 #x08)
+              ;; mov rsp, [rcx]     — restore RSP
+              (emit-bytes buf #x48 #x8B #x21)
+              ;; Clear handler: mov qword [rcx], 0
+              (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00)
+              ;; mov rax, T (#xDEAD1009)  — longjmp return value
+              (emit-bytes buf #x48 #xB8)
+              (emit-u32 buf #xDEAD1009) (emit-u32 buf 0)
+              ;; jmp rdx  — jump to saved return address
+              (emit-bytes buf #xFF #xE2))
+             ((= code #x0512)
+              ;; CLEAR-HANDLER: Set saved RSP at 0x10000140 to 0
+              ;; mov rcx, 0x10000140
+              (emit-bytes buf #x48 #xB9)
+              (emit-u32 buf #x10000140) (emit-u32 buf 0)
+              ;; mov qword [rcx], 0
+              (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00))
              (t
               ;; Real CPU trap
               (emit-mov-reg-imm buf 'rax code)

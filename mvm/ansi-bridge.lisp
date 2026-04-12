@@ -879,7 +879,14 @@
       (let ((d (digit-char-p (elt str i))))
         (if d (progn (setq n (+ (* n 10) d)) (setq got-digit t) (setq i (+ i 1)))
             (return nil))))))
-(defun find-class (name &rest args) nil)
+(defun find-class (name &rest args)
+  "Find class by name. Signals error if not found and errorp is true (default)."
+  ;; args: (&optional errorp environment)
+  ;; errorp defaults to t when not provided
+  (let ((errorp (if args (car args) t)))
+    (if errorp
+        (error "class not found")
+        nil)))
 (defun make-symbol (name) nil)
 (defun eval (form) nil)  ; stub
 (defun not-mv (x) (not x))

@@ -1341,9 +1341,9 @@
       ;; MULTIPLE-VALUE-LIST — collect multiple values into a list
       ((= op-name 76959345744650934)
        (compile-multiple-value-list (cadr form) env dest))
-      ;; HANDLER-CASE — compile body only, skip handler clauses
+      ;; HANDLER-CASE — setjmp/longjmp error catching
       ((= op-name 362314411895974678)
-       (compile-form (cadr form) env dest))
+       (compile-handler-case (cadr form) (cddr form) env dest))
       ;; IGNORE-ERRORS — compile body only
       ((= op-name 1140402238842668217)
        (compile-progn (cdr form) env dest))
@@ -1501,6 +1501,12 @@
       ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
       ((= op-name 385320872711688559) (compile-syscall3 (cdr form) env dest))
       ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
+
+      ;; --- Error Handler (handler-case support) ---
+      ;; (%hc-longjmp) — longjmp to nearest handler-case
+      ((= op-name 792633669140441529) (compile-hc-longjmp dest))
+      ;; (%error-handler-active-p) — check if a handler-case is active
+      ((= op-name 904577799958313483) (compile-error-handler-active-p dest))
 
       ;; --- Timestamp Counter ---
       ((= op-name 580098868411189197) (compile-rdtsc dest))
@@ -1668,6 +1674,57 @@
      (let ((idx (length *constant-table*)))
        (push value *constant-table*)
        (emit-ir :li-const dest idx)))))
+
+;;; ============================================================
+;;; Handler-Case (setjmp/longjmp error catching)
+;;; ============================================================
+;;;
+;;; Uses TRAP #x0510 (setjmp) and TRAP #x0511 (longjmp).
+;;; The setjmp trap saves RSP/RBP/return-IP to a fixed memory area
+;;; (0x10000140-0x10000157 in the Linux heap reserved region).
+;;; Returns 0 on initial call; longjmp makes it "return" non-zero.
+;;;
+;;; The `error` function in prelude.lisp checks if a handler is active
+;;; (saved RSP != 0 at 0x10000140) and calls longjmp if so.
+
+(defun compile-handler-case (body-form clauses env dest)
+  "Compile (handler-case body (error () handler-forms...))
+   Uses setjmp/longjmp: saves state, runs body, catches errors."
+  ;; Find the error handler clause — look for (error (...) body...)
+  (let ((handler-body nil))
+    (dolist (clause clauses)
+      (when (and (consp clause)
+                 (or (name-eq (car clause) "ERROR")
+                     (name-eq (car clause) "CONDITION")
+                     (name-eq (car clause) "SERIOUS-CONDITION")
+                     (name-eq (car clause) "T")))
+        (setf handler-body (cddr clause))))
+    (if (null handler-body)
+        ;; No error clause found — just compile body
+        (compile-form body-form env dest)
+        ;; Emit setjmp/handler pattern:
+        ;;   setjmp → 0 on first call, non-zero on longjmp
+        ;;   if 0: run body, clear handler, jump to end
+        ;;   if non-zero: run handler
+        (let ((handler-label (make-compiler-label))
+              (end-label (make-compiler-label)))
+          ;; TRAP #x0510: setjmp — saves RSP/RBP/IP to fixed memory,
+          ;; returns NIL in VR (RAX) on first call, T on longjmp
+          (emit-ir :trap #x0510)
+          (emit-ir :mov dest +vreg-vr+)
+          ;; Branch: if not-nil (longjmp return), go to handler
+          (emit-ir :bnnull dest handler-label)
+          ;; === Normal path: body ===
+          (compile-form body-form env dest)
+          ;; Clear handler: TRAP #x0512 (clear-handler)
+          (emit-ir :trap #x0512)
+          (emit-ir :br end-label)
+          ;; === Handler path: error caught ===
+          (emit-ir-label handler-label)
+          ;; Handler already cleared by longjmp/error
+          (compile-progn handler-body env dest)
+          ;; Join
+          (emit-ir-label end-label)))))
 
 ;;; ============================================================
 ;;; If
@@ -3785,6 +3842,34 @@
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :trap #x0500)
   (emit-ir :li dest 0))
+
+(defun compile-hc-longjmp (dest)
+  "Compile (%hc-longjmp) — longjmp to nearest handler-case.
+   Uses TRAP #x0511. Does not return."
+  (emit-ir :trap #x0511)
+  (emit-ir :li dest 0))  ; unreachable, but keeps dest valid for compiler
+
+(defun compile-error-handler-active-p (dest)
+  "Compile (%error-handler-active-p) — returns T if handler-case active, NIL otherwise.
+   Reads saved RSP at fixed address 0x10000140. Non-zero means active."
+  ;; Load the saved RSP from fixed address
+  (emit-ir :li dest #x10000140)
+  (emit-ir :load dest dest +width-u64+)
+  ;; If zero (no handler), return NIL; if non-zero, return T
+  (let ((nil-label (make-compiler-label))
+        (end-label (make-compiler-label)))
+    (let ((temp (alloc-temp-reg)))
+      (emit-ir :li temp 0)
+      (emit-ir :cmp dest temp)
+      (free-temp-reg))
+    (emit-ir :beq dest nil-label)
+    ;; Non-zero: handler active → return T
+    (emit-ir :li dest +t-value+)
+    (emit-ir :br end-label)
+    ;; Zero: no handler → return NIL
+    (emit-ir-label nil-label)
+    (emit-ir :mov dest +vreg-vn+)
+    (emit-ir-label end-label)))
 
 (defun compile-syscall3 (args env dest)
   "Compile (syscall3 num arg1 arg2 arg3) — 3-arg Linux syscall.

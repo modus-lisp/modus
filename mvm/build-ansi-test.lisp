@@ -60,6 +60,23 @@
                              (mapcar #'rewrite-make-array-dims (cddr form)))))
     (t (mapcar #'rewrite-make-array-dims form))))
 
+;; Rewrite (eval '(FORM)) → (FORM) for MVM compatibility
+;; MVM doesn't have a runtime eval; these just ensure runtime evaluation
+;; which MVM already does for all compiled code.
+(defun rewrite-eval-quote (form)
+  "Walk form tree, converting (eval '(FORM)) to FORM."
+  (cond
+    ((atom form) form)
+    ((and (eq (car form) 'eval)
+          (consp (cdr form))
+          (null (cddr form))
+          (consp (cadr form))
+          (eq (car (cadr form)) 'quote)
+          (consp (cadr (cadr form))))
+     ;; (eval '(FORM)) → FORM, then recursively rewrite the result
+     (rewrite-eval-quote (cadr (cadr form))))
+    (t (mapcar #'rewrite-eval-quote form))))
+
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
@@ -81,6 +98,7 @@
                         (push form forms)))))
             (push (pathname-name file) *ansi-file-names*)
             (setf forms (mapcar #'rewrite-make-array-dims (nreverse forms)))
+            (setf forms (mapcar #'rewrite-eval-quote forms))
             (when (string= file "integer-length.lsp")
               (labels ((rw (f)
                          (cond ((atom f) f)

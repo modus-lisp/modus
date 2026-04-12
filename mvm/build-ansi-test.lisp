@@ -92,6 +92,9 @@
                                 (if (cddr f)
                                     (cons 'bignum-sub (mapcar #'rw (cdr f)))
                                     (cons 'bignum-negate (mapcar #'rw (cdr f)))))
+                               ((and (eq (car f) 'eql) (cddr f))
+                                ;; eql needs to handle bignum=fixnum comparison
+                                (cons 'bignum-eql (mapcar #'rw (cdr f))))
                                (t (mapcar #'rw f)))))
                 (setf forms (mapcar #'rw forms))))
             (let ((out (make-string-output-stream)) (test-forms nil))

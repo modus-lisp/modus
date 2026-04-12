@@ -1014,7 +1014,13 @@
 (defun bignum-lo (b) (aref b 0))
 (defun bignum-hi (b) (aref b 1))
 (defun bignum-to-fixnum-if-possible (b)
-  (if (= (bignum-hi b) 0) (bignum-lo b) b))
+  "Collapse bignum to fixnum if it fits in 63-bit signed range."
+  (let ((hi (bignum-hi b)) (lo (bignum-lo b)))
+    (if (= hi 0) lo
+        (if (and (= hi -1) (>= lo 2305843009213693952))
+            ;; hi=-1, lo>=2^61: value = -2^62 + lo, which is a negative fixnum
+            (- lo 4611686018427387904)
+            b))))
 (defun %shl1-fixnum (n)
   (if (>= n 2305843009213693952)
       (make-bignum (logand (ash n 1) 4611686018427387903) (ash n -61))
@@ -1053,18 +1059,19 @@
         (bp (if (bignump b) (cons (bignum-lo b) (bignum-hi b))
                 (%fixnum-to-bignum-parts b))))
     (let ((sum-lo (+ (car ap) (car bp))))
-      (let ((carry (ash sum-lo -62))
+      (let ((carry (if (>= sum-lo 4611686018427387904) 1
+                       (if (< sum-lo 0) 1 0)))
             (lo (logand sum-lo 4611686018427387903)))
         (let ((sum-hi (+ (+ (cdr ap) (cdr bp)) carry)))
           (bignum-to-fixnum-if-possible (make-bignum lo sum-hi)))))))
 
 (defun %bignum-negate-parts (lo hi)
   "Negate bignum with parts lo,hi. Two's complement: invert + add 1."
-  ;; ~lo + 1 for low part, ~hi + carry for high part
-  (let ((neg-lo (+ 1 (logxor lo 4611686018427387903))))
-    (let ((carry (ash neg-lo -62))
-          (new-lo (logand neg-lo 4611686018427387903)))
-      (make-bignum new-lo (+ (logxor hi -1) carry)))))
+  (if (= lo 0)
+      ;; No overflow: ~0 + 1 = 2^62, carry into hi
+      (make-bignum 0 (+ (logxor hi -1) 1))
+      ;; ~lo + 1 < 2^62 when lo > 0, so no carry
+      (make-bignum (+ 1 (logxor lo 4611686018427387903)) (logxor hi -1))))
 
 (defun bignum-negate (n)
   "Negate N (fixnum or bignum)."
@@ -1106,6 +1113,16 @@
             (%bignum-integer-length-pos (bignum-1- (bignum-negate n)))
             (%bignum-integer-length-pos n)))
       (%fixnum-integer-length n)))
+
+(defun bignum-eql (a b)
+  "EQL that handles bignums."
+  (if (bignump a)
+      (if (bignump b)
+          (if (= (bignum-lo a) (bignum-lo b))
+              (= (bignum-hi a) (bignum-hi b))
+              nil)
+          nil)
+      (if (bignump b) nil (eql a b))))
 
 ;; Funcallable versions of compiler builtins (needed for #'consp etc.)
 (defun consp (x) (consp x))

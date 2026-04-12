@@ -249,6 +249,68 @@
     "search-list.lsp" "merge.lsp"
     "map-into.lsp" "make-sequence.lsp"))
 
+;; Printer chapter
+(load-ansi-chapter "/tmp/ansi-test/printer/"
+  '("write.lsp" "prin1.lsp" "print.lsp" "print-integers.lsp"
+    "print-strings.lsp" "print-cons.lsp" "print-characters.lsp"
+    "print-vector.lsp" "print-bit-vector.lsp" "printer-control-vars.lsp"))
+
+;; Streams chapter
+(load-ansi-chapter "/tmp/ansi-test/streams/"
+  '("streamp.lsp" "write-char.lsp" "terpri.lsp" "write-string.lsp"
+    "write-line.lsp" "finish-output.lsp" "force-output.lsp"
+    "input-stream-p.lsp" "output-stream-p.lsp" "open-stream-p.lsp"
+    "stream-element-type.lsp" "interactive-stream-p.lsp"
+    "make-string-output-stream.lsp" "get-output-stream-string.lsp"
+    "make-broadcast-stream.lsp" "broadcast-stream-streams.lsp"
+    "make-echo-stream.lsp" "echo-stream-input-stream.lsp"
+    "echo-stream-output-stream.lsp" "make-synonym-stream.lsp"
+    "synonym-stream-symbol.lsp" "make-two-way-stream.lsp"
+    "two-way-stream-input-stream.lsp" "two-way-stream-output-stream.lsp"
+    "file-length.lsp" "file-position.lsp" "file-string-length.lsp"))
+
+;; Packages chapter
+(load-ansi-chapter "/tmp/ansi-test/packages/"
+  '("packagep.lsp" "keyword.lsp" "intern.lsp"))
+
+;; Eval and compile chapter
+(load-ansi-chapter "/tmp/ansi-test/eval-and-compile/"
+  '("constantp.lsp" "eval.lsp" "locally.lsp"))
+
+;; Types and classes chapter
+(load-ansi-chapter "/tmp/ansi-test/types-and-classes/"
+  '("typep.lsp" "type-of.lsp" "coerce.lsp"))
+
+;; Reader chapter
+(load-ansi-chapter "/tmp/ansi-test/reader/"
+  '("readtablep.lsp" "read-from-string.lsp"))
+
+;; Environment chapter
+(load-ansi-chapter "/tmp/ansi-test/environment/"
+  '("room.lsp" "describe.lsp" "time.lsp"))
+
+;; Conditions chapter
+(load-ansi-chapter "/tmp/ansi-test/conditions/"
+  '("condition.lsp" "error.lsp" "warn.lsp" "handler-case.lsp" "ignore-errors.lsp"))
+
+;; Pathnames chapter
+(load-ansi-chapter "/tmp/ansi-test/pathnames/"
+  '("pathnamep.lsp" "pathname.lsp" "make-pathname.lsp"
+    "pathname-name.lsp" "namestring.lsp"))
+
+;; System construction chapter
+(load-ansi-chapter "/tmp/ansi-test/system-construction/"
+  '("modules.lsp"))
+
+;; Files chapter
+(load-ansi-chapter "/tmp/ansi-test/files/"
+  '("file-error.lsp" "probe-file.lsp" "truename.lsp"))
+
+;; Objects chapter
+(load-ansi-chapter "/tmp/ansi-test/objects/"
+  '("class-name.lsp" "class-of.lsp" "find-class.lsp"
+    "make-instance.lsp" "slot-value.lsp" "defclass-01.lsp"))
+
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))
 ;; fork-run: isolate chunks in child processes; child exits with fail count

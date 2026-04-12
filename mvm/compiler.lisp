@@ -3246,36 +3246,8 @@
     (emit-ir-label end-label)))
 
 (defun compile-bignump (arg env dest)
-  "Compile (bignump x) - true if object tag with bignum subtag"
-  (let ((true-label (make-compiler-label))
-        (end-label (make-compiler-label))
-        (false-label (make-compiler-label))
-        (temp (alloc-temp-reg))
-        (temp2 (alloc-temp-reg)))
-    (compile-form arg env dest)
-    ;; Extract tag: AND with #x0F
-    (emit-ir :li temp #x0F)
-    (emit-ir :and temp dest temp)
-    ;; Compare to object tag (#x09)
-    (emit-ir :li temp2 +tag-object+)
-    (emit-ir :cmp temp temp2)
-    (emit-ir :bne false-label)  ; wrong tag -> false
-    ;; Has object tag: check subtag
-    ;; Extract subtag from header at [obj & ~0xF]
-    (emit-ir :obj-subtag temp dest)
-    (emit-ir :li temp2 (ash +subtag-bignum+ +fixnum-shift+))
-    (emit-ir :cmp temp temp2)
-    (emit-ir :beq true-label)
-    ;; False
-    (emit-ir-label false-label)
-    (compile-nil dest)
-    (emit-ir :br end-label)
-    ;; True
-    (emit-ir-label true-label)
-    (compile-t dest)
-    (emit-ir-label end-label)
-    (free-temp-reg)
-    (free-temp-reg)))
+  "Compile (bignump x) - true if object with bignum subtag #x30"
+  (compile-object-subtype-p arg env dest +subtag-bignum+))
 
 (defun compile-object-subtype-p (arg env dest expected-subtag)
   "Helper: compile a predicate that checks for object tag + specific subtag"
@@ -5176,8 +5148,14 @@
             (error (e)
               (format t "  SKIP bytecode ~A: ~A~%"
                       (function-info-name (car entry)) e)
-              ;; Restore buffer position and remove from function table
+              ;; Restore buffer position to avoid partial bytecode
               (setf (mvm-buffer-position buf) saved-pos)
+              ;; Emit NOP padding to preserve correct offsets for subsequent functions.
+              ;; This wastes space but keeps all function offsets valid.
+              (let ((fn-size (function-info-bytecode-length (car entry))))
+                (dotimes (i fn-size)
+                  (mvm-nop buf)))
+              ;; Remove from function table so calls resolve to %unresolved-fn
               (remhash (function-info-name (car entry)) *functions*)
               (setf *function-table*
                     (remove (car entry) *function-table*))))))

@@ -2048,13 +2048,22 @@
                                           :step-form arr)
                           (loop-state-iterations state))))
 
-                 ;; FOR var ON list
+                 ;; FOR var ON list [BY step-fn]
                  ((= iter-kw 16092538585173950)
                   (setf rest (cdr rest))
-                  (let ((list-form (car rest)))
+                  (let ((list-form (car rest))
+                        (by-fn nil))
                     (setf rest (cdr rest))
+                    ;; Check for optional BY
+                    (when (and rest (symbolp (car rest))
+                               (= (compute-name-hash (symbol-name (car rest)))
+                                  934319717393949980))  ; BY
+                      (setf rest (cdr rest))
+                      (setf by-fn (car rest))
+                      (setf rest (cdr rest)))
                     (push (make-loop-iter :kind :on :var var
-                                          :init-form list-form)
+                                          :init-form list-form
+                                          :by-form by-fn)
                           (loop-state-iterations state))))
 
                  ;; FOR var = init [THEN step]
@@ -2310,10 +2319,13 @@
            (push `(setq ,tmp (cdr ,tmp)) step-stmts)))
 
         (:on
-         (let ((var (loop-iter-var iter)))
+         (let ((var (loop-iter-var iter))
+               (by-fn (loop-iter-by-form iter)))
            (push (list var (loop-iter-init-form iter)) bindings)
            (push `(if (null ,var) (return nil)) test-forms)
-           (push `(setq ,var (cdr ,var)) step-stmts)))
+           (if by-fn
+               (push `(setq ,var (funcall ,by-fn ,var)) step-stmts)
+               (push `(setq ,var (cdr ,var)) step-stmts))))
 
         (:across
          (let ((var (loop-iter-var iter))

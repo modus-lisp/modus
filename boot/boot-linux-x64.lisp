@@ -101,9 +101,11 @@
   (emit-bytes buf #x4C #x89 #x78 #x20)           ; mov [rax+0x20], r15 (argv[2])
 
   ;; Set up MVM runtime registers
-  ;; R12 = alloc pointer (skip first 256 bytes used for globals)
+  ;; R12 = alloc pointer (skip first 512 bytes used for globals + MV storage)
+  ;; Layout: 0x00-0x7F argc/argv, 0x80 globals, 0x88 symtab,
+  ;; 0x90 MV-count, 0x98-0x138 MV-values (20 slots), 0x140-0x1FF reserved
   (emit-bytes buf #x49 #x89 #xC4)                ; mov r12, rax
-  (emit-bytes buf #x49 #x81 #xC4 #x00 #x01 #x00 #x00) ; add r12, 256 (skip globals)
+  (emit-bytes buf #x49 #x81 #xC4 #x00 #x02 #x00 #x00) ; add r12, 512 (skip globals+MV)
   ;; R14 = alloc limit
   (emit-bytes buf #x49 #x89 #xC6)                ; mov r14, rax
   (emit-bytes buf #x49 #x81 #xC6)                ; add r14, heap_size

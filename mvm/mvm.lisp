@@ -54,6 +54,7 @@
    #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
    #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
    #:+op-sap-set8+ #:+op-sap-set32+ #:+op-sap-set64+ #:+op-sap-addr+
+   #:+op-set-mv-count+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -336,6 +337,7 @@
 (defconstant +op-sap-set32+  #xB5)  ; (sap-set32 Vsap Voff Vval) - store u32 (val tagged)
 (defconstant +op-sap-set64+  #xB6)  ; (sap-set64 Vsap Voff Vval) - store u64 (val raw)
 (defconstant +op-sap-addr+   #xB7)  ; (sap-addr Vd Vsap) - extract raw addr → Vd
+(defconstant +op-set-mv-count+ #xB8) ; (set-mv-count imm8) - store count to MV-COUNT
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -473,6 +475,7 @@
 (defopcode :sap-set32  #xB5 (:reg :reg :reg)         "Store u32 to SAP+off")
 (defopcode :sap-set64  #xB6 (:reg :reg :reg)         "Store raw u64 to SAP+off")
 (defopcode :sap-addr   #xB7 (:reg :reg)              "Extract raw address from SAP")
+(defopcode :set-mv-count #xB8 (:imm8)                "Set MV count to imm8 (tagged store to MV-COUNT-ADDR)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -921,6 +924,10 @@
   (encode-instruction buf +op-sap-set64+ vsap voff vval))
 (defun mvm-sap-addr (buf vd vsap)
   (encode-instruction buf +op-sap-addr+ vd vsap))
+
+(defun mvm-set-mv-count (buf count)
+  "Emit SET-MV-COUNT with immediate count value."
+  (encode-instruction buf +op-set-mv-count+ count))
 
 ;;; ============================================================
 ;;; Disassembler

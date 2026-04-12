@@ -1836,6 +1836,29 @@
          ;; scheduler if it reaches zero.  Stub: emit NOP for now.
          (emit-nop buf))
 
+        ((op= +op-set-mv-count+)
+         ;; Store tagged fixnum count to MV-COUNT address.
+         ;; imm8 operand is the raw count (e.g., 1).
+         ;; Tagged value = count << 1 (fixnum shift).
+         ;; Emit: mov qword [MV_COUNT_ADDR], imm32
+         ;; REX.W MOV r/m64, imm32 = 48 C7 05 disp32 imm32  (RIP-relative)
+         ;; But we use absolute addressing: MOV [abs], imm isn't available
+         ;; on x64. Use: MOV RAX, imm64; MOV [RAX], imm32 pattern.
+         ;; Actually simpler: use MOV r/m64,imm32 with SIB=none, disp32
+         ;; For absolute address we need: REX.W C7 04 25 addr32 imm32
+         ;; Store count as tagged fixnum (count << 1) to match compile-values.
+         ;; compile-values does (setf (mem-ref addr :u64) nvals) where nvals
+         ;; is compiled as tagged, so the raw bits are nvals<<1.
+         ;; set-mv-count must match: store count<<1.
+         (let* ((count (first operands))
+                (tagged (ash count 1))  ; fixnum shift to match compile-values
+                (addr #x10000090))      ; MV-COUNT-ADDR
+           ;; MOV qword [addr32], imm32 (sign-extended)
+           ;; 48 C7 04 25 <addr32-le> <imm32-le>
+           (emit-bytes buf #x48 #xC7 #x04 #x25)
+           (emit-u32 buf addr)
+           (emit-u32 buf tagged)))
+
         ((op= +op-atomic-xchg+)
          ;; (atomic-xchg Vd Vaddr Vs) — LOCK XCHG [Vaddr], Vs → Vd
          ;; x86 XCHG with memory is implicitly locked.

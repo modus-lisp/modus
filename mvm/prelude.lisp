@@ -758,13 +758,11 @@
 ;;; Multiple Values (bare-metal stub)
 ;;; ============================================================
 ;;;
-;;; MVM's multiple-value-bind expansion destructures via car/cdr,
-;;; so values must return a cons cell. Callers not using m-v-b
-;;; should destructure with car to get the primary value.
-
+;;; values is a compiler special form (compile-values).
+;;; This stub only exists for funcall/apply compatibility.
 (defun values (a b)
-  "Return multiple values as a cons cell (for m-v-b destructuring)."
-  (cons a b))
+  "Legacy stub — compiler handles values directly."
+  a)
 
 ;;; ============================================================
 ;;; Global Variable Store (bare-metal)

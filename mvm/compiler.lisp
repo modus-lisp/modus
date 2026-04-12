@@ -4186,6 +4186,16 @@
       ;; Compile body (strip any declarations), result goes to VR
       (compile-progn (strip-declares body) env +vreg-vr+))
 
+    ;; If the body's last form was NOT a values call, set MV count = 1
+    ;; so the caller sees single-value return.
+    ;; compile-values already sets the count for multi-value returns.
+    (let ((last-form (car (last (strip-declares body)))))
+      (unless (and (consp last-form)
+                   (symbolp (car last-form))
+                   (= (compute-name-hash (symbol-name (car last-form)))
+                      419785975474686239))  ; VALUES
+        (emit-ir :set-mv-count 1)))
+
     ;; Function return label (for early return via (return value))
     (emit-ir-label return-label)
 
@@ -4232,6 +4242,7 @@
       (:sti   1)
       (:gc-check 1)
       (:yield 1)
+      (:set-mv-count 2)
 
       ;; 1-reg instructions: 1 opcode + 1 reg = 2 bytes
       (:push  2)
@@ -4409,6 +4420,8 @@
            (mvm-gc-check buf))
           (:yield
            (mvm-yield buf))
+          (:set-mv-count
+           (mvm-set-mv-count buf (second insn)))
           (:frame-leave
            ;; Frame teardown: the native backend handles restoring VSP/VFP.
            ;; In bytecode, emit as NOP (frame management is a higher-level concept).

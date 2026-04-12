@@ -1002,6 +1002,19 @@
 (defun set-fill-pointer (vec n) n)  ; stub
 (defun random-fixnum () (random most-positive-fixnum))
 (defun subtypep* (t1 t2) nil)  ; stub
+
+;; Funcallable versions of compiler builtins (needed for #'consp etc.)
+(defun consp (x) (consp x))
+(defun atom (x) (atom x))
+(defun null (x) (null x))
+(defun numberp (x) (integerp x))
+(defun symbolp (x) (symbolp x))
+(defun integerp (x) (integerp x))
+(defun characterp (x) (characterp x))
+(defun stringp (x) (stringp x))
+(defun zerop (x) (zerop x))
+(defun plusp (x) (> x 0))
+(defun minusp (x) (< x 0))
 (defun map (result-type fn &rest seqs)
   "Map FN over sequences, collecting into RESULT-TYPE."
   (if (null result-type) (progn (apply #'mapc fn seqs) nil)

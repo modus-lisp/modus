@@ -1030,6 +1030,24 @@
         do (setf body (cdr body)))
   body)
 
+(defun extract-special-vars (body)
+  "Extract variable names from (declare (special ...)) in BODY. Returns list of symbols."
+  (let ((specials nil))
+    (loop while (and (consp body)
+                     (consp (car body))
+                     (symbolp (caar body))
+                     (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
+          do (let ((decl (car body)))
+               ;; (declare (special x y z) ...)
+               (dolist (spec (cdr decl))
+                 (when (and (consp spec) (symbolp (car spec))
+                            (= (compute-name-hash (symbol-name (car spec)))
+                               494057320882034318))  ; SPECIAL
+                   (dolist (var (cdr spec))
+                     (push var specials))))
+               (setf body (cdr body))))
+    specials))
+
 ;;; ============================================================
 ;;; Phase 2: IR Generation (AST -> MVM IR)
 ;;; ============================================================
@@ -1286,8 +1304,16 @@
       ((= op-name 518921307293258709)    (compile-quote (cadr form) dest))
       ((= op-name 448736678201786992)       (compile-if (cdr form) env dest))
       ((= op-name 87505416312042891)    (compile-progn (cdr form) env dest))
-      ((= op-name 347164158959663450)      (compile-let (cadr form) (cddr form) env dest))
-      ((= op-name 115433002357585904)     (compile-let* (cadr form) (cddr form) env dest))
+      ((= op-name 347164158959663450)
+       (let ((specials (extract-special-vars (cddr form))))
+         (if specials
+             (compile-let-with-specials (cadr form) (cddr form) specials env dest)
+             (compile-let (cadr form) (cddr form) env dest))))
+      ((= op-name 115433002357585904)
+       (let ((specials (extract-special-vars (cddr form))))
+         (if specials
+             (compile-let-with-specials (cadr form) (cddr form) specials env dest)
+             (compile-let* (cadr form) (cddr form) env dest))))
       ((= op-name 565254038635891948)     (compile-setq (cadr form) (caddr form) env dest))
       ((= op-name 527981956251550024)   (compile-lambda (cadr form) (cddr form) env dest))
       ((= op-name 89559098115627243)     (compile-when (cdr form) env dest))
@@ -1689,6 +1715,54 @@
 ;;; ============================================================
 ;;; Let / Let*
 ;;; ============================================================
+
+(defun compile-let-with-specials (bindings body specials env dest)
+  "Compile let/let* with (declare (special ...)) variables.
+   Special vars use dynamic binding via symbol-value/set-symbol-value.
+   On entry: save old values, set new values.
+   On exit: restore old values."
+  (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
+         (save-vars (mapcar (lambda (s) (gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
+         ;; Expand: evaluate all bindings, then save+set specials, run body, restore
+         (regular-bindings nil)
+         (special-bindings nil))
+    ;; Separate bindings into regular and special
+    (dolist (binding bindings)
+      (let ((var (if (consp binding) (car binding) binding)))
+        (if (member (symbol-name var) special-names :test #'string=)
+            (push binding special-bindings)
+            (push binding regular-bindings))))
+    (setf regular-bindings (nreverse regular-bindings))
+    (setf special-bindings (nreverse special-bindings))
+    ;; Generate expanded form:
+    ;; (let (regular-bindings...)
+    ;;   (let* ((save1 (symbol-value 'hash1)) ...)
+    ;;     (set-symbol-value 'hash1 val1) ...
+    ;;     body...
+    ;;     (set-symbol-value 'hash1 save1) ...))
+    (let* ((save-bindings
+             (mapcar (lambda (sv spec)
+                       (list sv `(symbol-value ,(normalize-name spec))))
+                     save-vars specials))
+           (set-forms
+             (mapcar (lambda (spec binding)
+                       (let ((val-var (if (consp binding) (car binding) binding)))
+                         `(set-symbol-value ,(normalize-name spec) ,val-var)))
+                     specials special-bindings))
+           (restore-forms
+             (mapcar (lambda (sv spec)
+                       `(set-symbol-value ,(normalize-name spec) ,sv))
+                     save-vars specials))
+           (stripped-body (strip-declares body)))
+      (compile-form
+        `(let ,regular-bindings
+           (let ,special-bindings
+             (let* ,save-bindings
+               ,@set-forms
+               (let ((%special-result (progn ,@stripped-body)))
+                 ,@restore-forms
+                 %special-result))))
+        env dest))))
 
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).

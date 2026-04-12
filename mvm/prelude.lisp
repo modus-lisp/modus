@@ -777,16 +777,18 @@
 ;;; mem-ref :u64 returns raw bits, which for tagged Lisp values is
 ;;; the value itself (cons pointers, fixnums, etc.).
 
-(defun symbol-value (name-hash)
-  "Look up a global variable by its tagged name hash."
-  (let ((head (mem-ref #x10000080 :u64)))
+(defun symbol-value (name-or-hash)
+  "Look up a global variable by name hash or symbol object."
+  (let ((key (if (integerp name-or-hash) name-or-hash
+                 (aref name-or-hash 0)))  ; extract hash from symbol object
+        (head (mem-ref #x10000080 :u64)))
     (if (zerop head)
         nil
         (let ((cur head))
           (loop
             (when (null cur) (return nil))
             (let ((pair (car cur)))
-              (when (eql (car pair) name-hash)
+              (when (eql (car pair) key)
                 (return (cdr pair))))
             (setq cur (cdr cur)))))))
 

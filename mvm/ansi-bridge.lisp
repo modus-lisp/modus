@@ -1059,8 +1059,13 @@
         (bp (if (bignump b) (cons (bignum-lo b) (bignum-hi b))
                 (%fixnum-to-bignum-parts b))))
     (let ((sum-lo (+ (car ap) (car bp))))
-      (let ((carry (if (>= sum-lo 4611686018427387904) 1
-                       (if (< sum-lo 0) 1 0)))
+      ;; Carry detection: lo parts are in [0, 2^62).  Their sum overflows
+      ;; the 63-bit fixnum range iff it reaches 2^62.  Tagged addition
+      ;; wraps such a result negative, so (< sum-lo 0) is the correct test.
+      ;; NOTE: Do NOT compare against 4611686018427387904 (= 2^62) — that
+      ;; value itself overflows the fixnum range and wraps to the most
+      ;; negative tagged integer, making (>= sum-lo 2^62) always true.
+      (let ((carry (if (< sum-lo 0) 1 0))
             (lo (logand sum-lo 4611686018427387903)))
         (let ((sum-hi (+ (+ (cdr ap) (cdr bp)) carry)))
           (bignum-to-fixnum-if-possible (make-bignum lo sum-hi)))))))

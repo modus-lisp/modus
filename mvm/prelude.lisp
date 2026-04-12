@@ -534,23 +534,18 @@
 ;;; Any non-values form implicitly sets MV-COUNT to 1.
 
 (defun %mv-to-list (primary)
-  "Collect multiple values into a list. PRIMARY is the first value.
-   Reads extra values from MV storage at 0x600020 + index*8."
+  "Collect multiple values into a list. PRIMARY is the first value."
   (let ((count (mem-ref #x10000090 :u64)))
-    (if (or (null count) (zerop count))
+    (if (zerop count)
         nil
         (if (= count 1)
             (cons primary nil)
             (let ((result nil)
-                  (i (- count 2)))  ; last extra value index (0-based)
-              ;; Build list from back to front
+                  (i (- count 2)))
               (loop
-                (when (< i 0) (return nil))
-                (let ((addr (+ #x10000098 (* i 8))))
-                  (let ((val (mem-ref addr :u64)))
-                    (setq result (cons val result))))
-                (setq i (- i 1)))
-              (cons primary result))))))
+                (when (< i 0) (return (cons primary result)))
+                (setq result (cons (mem-ref (+ #x10000098 (* i 8)) :u64) result))
+                (setq i (- i 1))))))))
 
 ;;; ============================================================
 ;;; Object Printer

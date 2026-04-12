@@ -2573,22 +2573,31 @@
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).
    Expands to: evaluate form, bind first var to result,
-   bind remaining vars from MV storage via mem-ref."
-  ;; Build let-bindings: first var = form, rest = (mem-ref MV-ADDR :u64)
-  (let ((bindings nil))
+   bind remaining vars from MV storage, with nil default if fewer values."
+  (when (null vars)
+    ;; No vars: just evaluate form for side effects, then body
+    (return-from compile-multiple-value-bind
+      (compile-form `(progn ,form ,@body) env dest)))
+  (let ((count-var (gensym "MVC"))
+        (bindings nil))
+    ;; First var = form result (primary value)
     (push (list (car vars) form) bindings)
+    ;; count-var = MV count (set by values or defaulted to 1)
+    (push (list count-var `(mem-ref ,+mv-count-addr+ :u64)) bindings)
+    ;; Remaining vars: read from MV storage if count > index+1, else nil
     (let ((idx 0))
       (dolist (var (cdr vars))
         (let ((addr (+ +mv-values-addr+ (* idx 8))))
-          (push (list var `(mem-ref ,addr :u64)) bindings))
+          (push (list var `(if (> ,count-var ,(1+ idx))
+                               (mem-ref ,addr :u64)
+                               nil))
+                bindings))
         (incf idx)))
-    ;; Compile as (let (bindings...) body...)
     (compile-let (nreverse bindings) body env dest)))
 
 (defun compile-multiple-value-list (form env dest)
   "Compile (multiple-value-list form).
    Evaluates form, then calls %mv-to-list to collect all values into a list."
-  ;; Generate: (let ((#:primary form)) (%mv-to-list #:primary))
   (let ((tmp (gensym "MV")))
     (compile-form `(let ((,tmp ,form)) (%mv-to-list ,tmp)) env dest)))
 

@@ -2632,9 +2632,13 @@
                      env dest))
       ((= nvals 1)
        ;; (values x) → x, count = 1
-       (compile-form `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 1)
-                             ,(car args))
-                     env dest))
+       ;; Must evaluate arg FIRST (it may itself be a values form that sets count),
+       ;; then override count to 1.
+       (let ((tmp (gensym "V1")))
+         (compile-form `(let ((,tmp ,(car args)))
+                          (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+                          ,tmp)
+                       env dest)))
       (t
        ;; Multiple values: eval all left-to-right, push to stack,
        ;; then pop extras to MV storage, pop primary to dest.

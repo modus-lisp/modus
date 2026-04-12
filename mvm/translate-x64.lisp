@@ -1309,6 +1309,27 @@
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-alloc-string+)
+         ;; Like alloc-array but with string subtag #x31
+         (let* ((vd (first operands))
+                (vcount (second operands))
+                (d (dest-phys-or-scratch vd))
+                (pc (vreg-phys vcount)))
+           (if pc (emit-mov-reg-reg buf +scratch-reg+ pc)
+               (emit-load-vreg buf vcount +scratch-reg+))
+           (emit-push buf +scratch-reg+)
+           (emit-shl-reg-imm buf +scratch-reg+ 8)
+           (emit-or-reg-imm buf +scratch-reg+ #x31)  ; STRING subtag
+           (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           (emit-lea buf d 'r12 #x09)
+           (emit-pop buf +scratch-reg+)
+           (emit-add-reg-imm buf +scratch-reg+ 2)
+           (emit-shl-reg-imm buf +scratch-reg+ 3)
+           (emit-add-reg-imm buf +scratch-reg+ 15)
+           (emit-and-reg-imm buf +scratch-reg+ -16)
+           (emit-add-reg-reg buf 'r12 +scratch-reg+)
+           (maybe-store-scratch buf vd)))
+
         ((op= +op-obj-ref+)
          ;; (obj-ref Vd Vobj idx:imm8) — load slot at offset
          (let* ((vd (first operands))

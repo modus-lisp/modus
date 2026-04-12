@@ -55,6 +55,7 @@
    #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
    #:+op-sap-set8+ #:+op-sap-set32+ #:+op-sap-set64+ #:+op-sap-addr+
    #:+op-set-mv-count+
+   #:+op-alloc-string+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -338,6 +339,7 @@
 (defconstant +op-sap-set64+  #xB6)  ; (sap-set64 Vsap Voff Vval) - store u64 (val raw)
 (defconstant +op-sap-addr+   #xB7)  ; (sap-addr Vd Vsap) - extract raw addr → Vd
 (defconstant +op-set-mv-count+ #xB8) ; (set-mv-count imm8) - store count to MV-COUNT
+(defconstant +op-alloc-string+ #xB9) ; (alloc-string Vd Vs) - allocate string with size in Vs
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -476,6 +478,7 @@
 (defopcode :sap-set64  #xB6 (:reg :reg :reg)         "Store raw u64 to SAP+off")
 (defopcode :sap-addr   #xB7 (:reg :reg)              "Extract raw address from SAP")
 (defopcode :set-mv-count #xB8 (:imm8)                "Set MV count to imm8 (tagged store to MV-COUNT-ADDR)")
+(defopcode :alloc-string #xB9 (:reg :reg)            "Allocate string (subtag #x31) with size in reg")
 
 ;;; ============================================================
 ;;; Memory Width Constants

@@ -667,7 +667,7 @@
       (let ((total 0))
         (dolist (s seqs) (setq total (+ total (if (stringp s) (array-length s)
                                                    (if (consp s) (length s) 0)))))
-        (let ((result (make-array total)) (pos 0))
+        (let ((result (%make-string-array total)) (pos 0))
           (dolist (s seqs)
             (if (stringp s)
                 (dotimes (i (array-length s))
@@ -777,7 +777,7 @@
     (loop (when (null a) (return))
       (when (eq (car a) :initial-element) (setq ch (char-code (cadr a))) (return))
       (setq a (cddr a)))
-    (let ((s (make-array size)))
+    (let ((s (%make-string-array size)))
       (dotimes (i size) (aset s i ch))
       s)))
 
@@ -795,7 +795,7 @@
       (unless (member (aref str start) char-list) (return))
       (setq start (+ start 1)))
     (if (= start 0) str
-        (let ((result (make-array (- len start))))
+        (let ((result (%make-string-array (- len start))))
           (dotimes (i (- len start)) (aset result i (aref str (+ start i))))
           result))))
 
@@ -809,7 +809,7 @@
       (unless (member (aref str (- end 1)) char-list) (return))
       (setq end (- end 1)))
     (if (= end (array-length str)) str
-        (let ((result (make-array end)))
+        (let ((result (%make-string-array end)))
           (dotimes (i end) (aset result i (aref str i)))
           result))))
 
@@ -888,35 +888,35 @@
 (defun string-upcase (str &rest args)
   "Convert string to uppercase."
   (let ((len (array-length str))
-        (result (make-array (array-length str))))
+        (result (%make-string-array (array-length str))))
     (dotimes (i len result)
       (let ((ch (aref str i)))
-        (aset result i (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch))))))
+        (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))))))
 
 (defun string-downcase (str &rest args)
   "Convert string to lowercase."
   (let ((len (array-length str))
-        (result (make-array (array-length str))))
+        (result (%make-string-array (array-length str))))
     (dotimes (i len result)
       (let ((ch (aref str i)))
-        (aset result i (if (and (>= ch 65) (<= ch 90)) (+ ch 32) ch))))))
+        (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))))))
 
-(defun string-capitalize (str &rest args)
+(defun string-capitalize (str)
   "Capitalize first letter of each word."
   (let ((len (array-length str))
-        (result (make-array (array-length str)))
-        (in-word nil))
-    (dotimes (i len result)
-      (let ((ch (aref str i))
-            (alpha (or (and (>= (aref str i) 65) (<= (aref str i) 90))
-                       (and (>= (aref str i) 97) (<= (aref str i) 122)))))
-        (cond
-          ((not alpha) (aset result i ch) (setq in-word nil))
-          ((not in-word) ;; first alpha in word — capitalize
-           (aset result i (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch))
-           (setq in-word t))
-          (t ;; subsequent alpha — lowercase
-           (aset result i (if (and (>= ch 65) (<= ch 90)) (+ ch 32) ch))))))))
+        (result (%make-string-array (array-length str))))
+    (let ((i 0) (in-word nil))
+      (loop
+        (when (>= i len) (return result))
+        (let ((ch (aref str i)))
+          (if (alpha-char-p (code-char ch))
+              (if in-word
+                  (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))
+                  (progn
+                    (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))
+                    (setq in-word t)))
+              (progn (aset result i ch) (setq in-word nil))))
+        (setq i (+ i 1))))))
 
 (defun string-not-equal (a b) (not (string-equal a b)))
 (defun string< (a b &rest args) (let ((m (mismatch a b)))
@@ -933,9 +933,9 @@
   (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
 (defun char-downcase (c) (let ((code (char-code c)))
   (code-char (if (and (>= code 65) (<= code 90)) (+ code 32) code))))
-(defun upper-case-p (c) (let ((code (char-code c))) (and (>= code 65) (<= code 90))))
-(defun lower-case-p (c) (let ((code (char-code c))) (and (>= code 97) (<= code 122))))
-(defun both-case-p (c) (or (upper-case-p c) (lower-case-p c)))
+(defun upper-case-p (c) (let ((code (char-code c))) (if (>= code 65) (<= code 90) nil)))
+(defun lower-case-p (c) (let ((code (char-code c))) (if (>= code 97) (<= code 122) nil)))
+(defun both-case-p (c) (if (upper-case-p c) t (lower-case-p c)))
 (defun alpha-char-p (c) (both-case-p c))
 (defun digit-char-p (c &optional (radix 10))
   (let ((code (char-code c)))
@@ -1043,7 +1043,10 @@
 (defun row-major-aref (a idx) (aref a idx))
 (defun set-row-major-aref (a idx val) (aset a idx val) val)
 (defun char-type-error-check (fn x) nil)
-(defun copy-seq (seq) (if (consp seq) (copy-list seq) (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))))
+(defun copy-seq (seq) (if (consp seq) (copy-list seq)
+  (if (stringp seq)
+      (let ((r (%make-string-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))
+      (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
 (defun sqrt (n) (isqrt n))  ; integer sqrt stub
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start end val) seq)  ; stub

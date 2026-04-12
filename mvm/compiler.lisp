@@ -1545,6 +1545,9 @@
 
       ;; --- Array Operations ---
       ((= op-name 686483400154579705)       (compile-make-array (cadr form) env dest))
+      ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
+      ((= op-name (compute-name-hash "%MAKE-STRING-ARRAY"))
+       (compile-make-string-array (cadr form) env dest))
       ((= op-name 568601634040735695)             (compile-aref (cadr form) (caddr form) env dest))
       ((= op-name 216456113736582507)            (compile-aref (cadr form) (caddr form) env dest))
       ((= op-name 416706424900304020)             (compile-aset (cadr form) (caddr form) (cadddr form) env dest))
@@ -3951,6 +3954,19 @@
               (emit-ir :sar dest dest +fixnum-shift+)))
         (emit-ir :alloc-array dest dest))))
 
+(defun compile-make-string-array (size-form env dest)
+  "Like compile-make-array but with string subtag #x31."
+  (if (and (integerp size-form) (<= size-form 65535))
+      (emit-ir :alloc-obj dest size-form +subtag-string+)
+      (progn
+        (if (integerp size-form)
+            (emit-ir :li dest size-form)
+            (progn
+              (compile-form size-form env dest)
+              (emit-ir :sar dest dest +fixnum-shift+)))
+        ;; ALLOC-ARRAY uses subtag #x32. Use ALLOC-STRING for #x31.
+        (emit-ir :alloc-string dest dest))))
+
 (defun compile-aref (arr-form idx-form env dest)
   "Compile (aref array index).
    Constant index uses OBJ-REF; variable index uses AREF opcode."
@@ -4294,6 +4310,7 @@
       (:obj-subtag 3)
       (:array-len 3)
       (:alloc-array 3)  ;; 2-reg: 1 opcode + 2 regs = 3 bytes
+      (:alloc-string 3)
       (:sap-new  3)    ;; 2-reg
       (:sap-addr 3)    ;; 2-reg
 
@@ -4496,6 +4513,8 @@
            (mvm-array-len buf (second insn) (third insn)))
           (:alloc-array
            (mvm-alloc-array buf (second insn) (third insn)))
+          (:alloc-string
+           (encode-instruction buf +op-alloc-string+ (second insn) (third insn)))
 
           ;; ---- SAP operations ----
           (:sap-new

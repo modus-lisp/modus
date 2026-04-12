@@ -335,6 +335,7 @@
 
   ;; Initialize runtime
   (init-symbol-table)
+  ;; diagnostic removed
   ;; Init RT counters manually (init-all-globals not safe — some thunks
   ;; reference functions/symbols that may not be available yet)
   (setq *rt-test-count* 0)

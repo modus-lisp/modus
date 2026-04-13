@@ -126,6 +126,64 @@ Layer 7: File I/O           —
 Layer 8: Eval/Compile/Load  —
 ```
 
+## Garbage Collection
+
+No GC today — bump allocator, never frees. Any long-running program 
+eventually exhausts the heap. This is the #1 blocker for real applications.
+
+### Why it's simple for us
+
+The JVM's GC is ~80K lines of C++ because it solves concurrent compaction 
+on terabyte heaps across thousands of threads. We have:
+
+- **Tagged values** — bit 0 tells you fixnum vs pointer. Bits 0-3 give 
+  the full type. No OOP maps needed. Just scan memory and the tags tell 
+  you what to trace.
+- **Cooperative scheduling** — GC at yield points. World is already stopped. 
+  No read/write barriers between threads. No safepoints.
+- **Per-actor heaps** — each actor has its own memory region. GC is per-actor.
+  Actor 1 collecting doesn't pause actor 2. This is the Erlang model.
+- **Message copying** — actors communicate through staging buffers (already 
+  implemented). The serialization boundary IS the GC boundary. No shared 
+  mutable heap.
+
+### Stages
+
+**Stage 1: Cheney copying collector (~200 lines)**
+```
+from-space: [header | obj1 | obj2 | ... | free →]
+to-space:   [empty                              ]
+
+On GC:
+  1. Scan roots (stack, globals) — tag bits identify pointers
+  2. Copy each live object from from-space to to-space  
+  3. Update all pointers (forwarding pointer in old location)
+  4. Swap spaces, reset allocation pointer
+```
+Allocation stays bump-pointer (what we already have). Collection cost is 
+proportional to LIVE data. Dead objects (most of them) cost nothing.
+
+**Stage 2: Generational (+300 lines)**
+```
+nursery (2MB):   [young objects — collected frequently]
+tenured (256MB): [survivors — collected rarely]
+```
+Write barrier: one instruction after set-car/set-cdr/aset. Records 
+old→young pointers. Most GC cycles only touch the nursery.
+
+**Stage 3: Per-actor SMP**
+```
+Core 0: Actor 1 [nursery][tenured]  ← GCs at yield
+Core 1: Actor 2 [nursery][tenured]  ← GCs independently
+Core 2: Actor 3 [nursery][tenured]  ← never pauses for others
+```
+Each core runs its own actor loop. Actors migrate via scheduler.
+GC is still per-actor. Only shared state is lock-free message queues.
+No global pauses, no concurrent compaction, no barriers between actors.
+
+**Validation:** the ANSI test suite (12,600 tests) becomes the GC stress 
+test. If it passes with GC enabled, the collector is correct.
+
 ## The `modus` Command
 
 The self-hosted CL implementation as a userspace binary:

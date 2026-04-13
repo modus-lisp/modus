@@ -1006,6 +1006,44 @@
         (if (= (length vars) 1)
             `(setq ,(car vars) ,val-form)
             `(multiple-value-bind ,vars ,val-form ,(car vars))))))
+
+  ;; MAPHASH — inline when called with #'(lambda ...) to avoid closure mutation issues.
+  ;; For non-lambda calls, expand to call %maphash-impl (the function version).
+  (mvm-define-macro "MAPHASH"
+    (lambda (form)
+      (let ((fn-form (cadr form))
+            (ht-form (caddr form)))
+        ;; Detect (maphash #'(lambda (k v) body...) ht) pattern
+        (if (and (consp fn-form)
+                 (consp (cdr fn-form))
+                 (or (eq (car fn-form) 'function)
+                     (and (symbolp (car fn-form))
+                          (equal (symbol-name (car fn-form)) "FUNCTION")))
+                 (consp (cadr fn-form))
+                 (let ((lam (cadr fn-form)))
+                   (and (consp lam)
+                        (or (eq (car lam) 'lambda)
+                            (and (symbolp (car lam))
+                                 (equal (symbol-name (car lam)) "LAMBDA"))))))
+            ;; Inline: expand to loop with direct variable bindings
+            (let* ((lam (cadr fn-form))
+                   (params (cadr lam))
+                   (body (cddr lam))
+                   (k-var (car params))
+                   (v-var (cadr params))
+                   (ht-tmp (gensym "MH-HT"))
+                   (cur-tmp (gensym "MH-CUR"))
+                   (pair-tmp (gensym "MH-PAIR")))
+              `(let ((,ht-tmp ,ht-form))
+                 (let ((,cur-tmp (car ,ht-tmp)))
+                   (loop (when (null ,cur-tmp) (return nil))
+                     (let ((,pair-tmp (car ,cur-tmp)))
+                       (let ((,k-var (car ,pair-tmp))
+                             (,v-var (cdr ,pair-tmp)))
+                         ,@body))
+                     (setq ,cur-tmp (cdr ,cur-tmp))))))
+            ;; Non-lambda: delegate to function version
+            `(%maphash-impl ,fn-form ,ht-form)))))
   )
 
 ;;; ============================================================
@@ -1374,11 +1412,25 @@
        (let ((spec (cadr form))
              (body (cddr form)))
          (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
-      ;; WITH-INPUT-FROM-STRING — compile as let binding stream var to nil
+      ;; WITH-INPUT-FROM-STRING — bind stream var to make-string-input-stream
       ((= op-name 778706583216373557)
-       (let ((spec (cadr form))
-             (body (cddr form)))
-         (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
+       (let* ((spec (cadr form))
+              (var (car spec))
+              (str-form (cadr spec))
+              (body (cddr form))
+              (var-name (if (symbolp var) (symbol-name var) (format nil "~A" var))))
+         ;; If the variable name has *earmuffs*, use dynamic binding via (declare (special ...))
+         ;; This saves/restores the global and preserves multiple-value state.
+         (if (and (> (length var-name) 2)
+                  (char= (char var-name 0) #\*)
+                  (char= (char var-name (1- (length var-name))) #\*))
+             (compile-form
+              `(let ((,var (make-string-input-stream ,str-form)))
+                 (declare (special ,var))
+                 ,@body)
+              env dest)
+             ;; Lexical: simple let binding
+             (compile-form `(let ((,var (make-string-input-stream ,str-form))) ,@body) env dest))))
       ;; MULTIPLE-VALUE-BIND — compile as let* with car/cdr destructuring
       ((= op-name 544225037749651317)
        (let ((vars (cadr form))

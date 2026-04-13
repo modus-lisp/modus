@@ -579,6 +579,16 @@
 (defun unread-char (ch &rest args) nil)
 (defun read-char (&rest args) nil)
 (defun read-char-no-hang (&rest args) nil)
+(defun %substring (str start end)
+  "Extract a substring from STR between START and END, preserving string subtag."
+  (let ((len (- end start))
+        (result (%make-string-array (- end start))))
+    (let ((i 0))
+      (loop
+        (when (= i len) (return result))
+        (aset result i (aref str (+ start i)))
+        (setq i (+ i 1))))))
+
 (defun read-line (&rest args)
   "Read a line from a string-input-stream. Args: [stream [eof-error-p [eof-value [recursive-p]]]]"
   (let ((stream (if args (car args) *standard-input*))
@@ -611,7 +621,7 @@
                 ;; Update stream position
                 (set-cdr stream (if found-newline (+ pos 1) pos))
                 ;; Return the line and eof-p (true if at end and no newline found)
-                (values (subseq str start pos) (not found-newline))))))))
+                (values (%substring str start pos) (not found-newline))))))))
 (defun read-byte (&rest args) nil)
 (defun read-sequence (seq stream &rest args) 0)
 (defun write-sequence (seq stream &rest args) seq)

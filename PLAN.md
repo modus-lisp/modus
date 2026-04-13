@@ -249,6 +249,57 @@ $ modus --target aarch64 app.lisp  # cross-compile
 Contains: full CL runtime + compiler + reader + printer + translators.
 No SBCL dependency. Bootstraps from the fixpoint.
 
+## Concurrency: Actors, Not Threads
+
+Real shared-memory threads undo the GC design. The JVM's 80K-line 
+GC exists because threads mutate a shared heap concurrently. We don't
+do that.
+
+### The Actor Model (what we have)
+
+Per-actor heaps, message passing, cooperative scheduling. GC is 
+per-actor. No shared mutable state. Already implemented.
+
+### Multi-Core (what we need)
+
+```
+Core 0: Actor loop → [Actor 1] [Actor 4] [Actor 7]
+Core 1: Actor loop → [Actor 2] [Actor 5] [Actor 8]
+Core 2: Actor loop → [Actor 3] [Actor 6] [Actor 9]
+```
+
+OS threads run actor loops. Scheduler migrates actors between cores.
+Lock-free message queues (CAS ring buffer) between threads.
+GC stays per-actor — no concurrent collector needed.
+
+### bordeaux-threads Compatibility
+
+```lisp
+(bt:make-thread fn)              → (spawn (lambda () (funcall fn)))
+(bt:with-lock-held (lock) body)  → actor mailbox protocol
+(bt:condition-wait cv lock)      → (receive)
+(bt:condition-notify cv)         → (send actor msg)
+```
+
+Most Quicklisp libraries use threads abstractly via bordeaux-threads.
+The actor mapping covers cases 1-4 (background tasks, parallel map,
+producer-consumer, timers). No code changes needed.
+
+### Shared Mutable State (the hard case)
+
+For code that genuinely needs cross-actor mutation:
+
+```lisp
+(defvar *shared* (make-shared-cell value))
+(shared-ref *shared*)                          ;; read
+(shared-cas *shared* expected new-value)       ;; atomic CAS
+```
+
+Explicit, not hidden behind locks. The programmer knows they're 
+crossing the isolation boundary. Rare in practice — most "shared" 
+data is better modeled as an actor that owns the data and responds 
+to messages.
+
 ## Self-Improvement Architecture
 
 A bare-metal Lisp that controls its own compiler, memory, and network stack

@@ -1632,26 +1632,26 @@
 ;;; Compound typep for ANSI tests
 ;;; ============================================================
 
+(defun exclusive-bound-p (x)
+  "Check if X is an exclusive type bound like (10), not a ratio like (4 . 3)."
+  (and (consp x) (null (cdr x))))
+
 (defun typep-range-check (obj low high)
   "Check if OBJ is in range [LOW, HIGH]. LOW/HIGH can be * (unbounded),
-   an integer, a ratio cons, or a list (exclusive bound)."
+   an integer, a ratio cons (num . den), or a list (exclusive bound)."
   (let ((above-low
          (cond
            ((eq low '*) t)
-           ((consp low)
+           ((exclusive-bound-p low)
             ;; Exclusive lower bound: (val) means > val
-            (if (integerp (car low))
-                (numeric-value-less-p (car low) obj)
-                (numeric-value-less-p (car low) obj)))
+            (numeric-value-less-p (car low) obj))
            (t (numeric-<= low obj))))
         (below-high
          (cond
            ((eq high '*) t)
-           ((consp high)
+           ((exclusive-bound-p high)
             ;; Exclusive upper bound: (val) means < val
-            (if (integerp (car high))
-                (numeric-value-less-p obj (car high))
-                (numeric-value-less-p obj (car high))))
+            (numeric-value-less-p obj (car high)))
            (t (numeric-<= obj high)))))
     (and above-low below-high)))
 

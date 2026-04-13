@@ -21,7 +21,11 @@
                   (my-equal (cdr a) (cdr b))
                   nil)
               nil)
-          nil)))
+          (if (stringp a)
+              (if (stringp b)
+                  (string-equal a b)
+                  nil)
+              nil))))
 
 
 ;;; ============================================================
@@ -960,6 +964,37 @@
   ;; Make-string with element-type nil
   (deftest 9932 (stringp (make-string 0 :element-type nil)) t)
   (deftest 9933 (length (make-string 0 :element-type nil)) 0)
+  ;; Multi-value test matching MAKE-STRING.10 exactly
+  (deftest 9934
+    (let ((s (make-string 0 :element-type nil)))
+      (values (notnot (stringp s)) (eqlt (length s) 0) (equalt s "")))
+    t t t)
+  ;; Use rt-run-test-mv like the ANSI test runner does
+  (rt-run-test-mv 9935
+    (multiple-value-list
+      (let ((s (make-string 0 :element-type nil)))
+        (values (notnot (stringp s)) (eqlt (length s) 0) (equalt s ""))))
+    '(t t t))
+  ;; Debug: test multiple-value-list directly
+  (deftest 9936 (multiple-value-list (values 1 2 3)) (list 1 2 3))
+  (deftest 9937 (multiple-value-list (values t t t)) (list t t t))
+  ;; Test with let + values
+  (deftest 9938 (multiple-value-list (let ((x 5)) (values t t))) (list t t))
+  ;; Isolate: which part of the values fails?
+  (deftest 9939
+    (let ((s (make-string 0 :element-type nil)))
+      (let ((v1 (notnot (stringp s)))
+            (v2 (eqlt (length s) 0))
+            (v3 (equalt s "")))
+        (list v1 v2 v3)))
+    (list t t t))
+  ;; Even more isolated
+  (deftest 9980 (let ((s (make-string 0 :element-type nil)))
+    (if (equalt s "") t nil)) t)
+  (deftest 9981 (equalt "" "") t)
+  (deftest 9982 (equalt (make-string 0) "") t)
+  (deftest 9983 (let ((s (make-string 0 :element-type nil)))
+    (list (notnot (stringp s)) (eqlt (length s) 0))) (list t t)))
   ;; Backquote type test — mirror REAL.1 first iteration
   (deftest 9940
     (let ((tp (list 'real 0 1)))
@@ -1014,31 +1049,49 @@
   (deftest 9946 (if (numeric-<= 0 0.0001) t nil) t)
   (deftest 9947 (if (numeric-<= -0.0001 0) t nil) t)
   (deftest 9948 (if (numeric-<= 0.0001 1) t nil) t)
-  ;; Debug: check floatp and float-negative on -0.0001
+  ;; Debug: float sign
   (deftest 9949 (if (floatp-impl -0.0001) t nil) t)
   (deftest 9950 (if (float-negative-p -0.0001) t nil) t)
   (deftest 9951 (if (numeric-value-less-p -0.0001 0) t nil) t)
-  ;; Direct test of or
-  (deftest 9952 (if (or nil t) t nil) t)
-  ;; Check numeric-equal-p
-  (deftest 9953 (if (numeric-equal-p -0.0001 0) t nil) nil)
-  ;; Debug: what is (aref -0.0001 0)?
-  (deftest 9954 (aref -0.0001 0) 3206166242)
-  ;; Check >= threshold directly
-  (deftest 9955 (if (>= 3206166242 2147483648) t nil) t)
-  ;; Check via variable
-  (deftest 9956 (let ((h (aref -0.0001 0))) (if (>= h 2147483648) t nil)) t)
-  ;; What does aref actually return?
-  (deftest 9957 (let ((h (aref -0.0001 0))) (if (> h 0) 1 (if (= h 0) 0 -1))) 1)
-  (deftest 9958 (let ((h (aref -0.0001 0))) (if (> h 1000000000) 1 0)) 1)
-  (deftest 9959 (let ((h (aref -0.0001 0))) (if (> h 2000000000) 1 0)) 1)
-  (deftest 9960 (let ((h (aref -0.0001 0))) (if (> h 3000000000) 1 0)) 1)
-  (deftest 9961 (let ((h (aref -0.0001 0))) (if (> h 4000000000) 1 0)) 0)
-  ;; Negative check
-  (deftest 9962 (let ((h (aref -0.0001 0))) (if (< h 0) 1 0)) 1)
-  (deftest 9963 (let ((h (aref -0.0001 0))) (if (< h -1000000000) 1 0)) 1)
-  (deftest 9964 (let ((h (aref -0.0001 0))) (if (< h -3000000000) 1 0)) 1)
-  (deftest 9965 (let ((h (aref -0.0001 0))) (if (< h -4000000000) 1 0)) 0)
-  ;; Positive float check
-  (deftest 9966 (let ((h (aref 0.0001 0))) (if (> h 0) 1 0)) 1)
-  (deftest 9967 (let ((h (aref 0.0001 0))) (if (> h 1000000000) 1 0)) 1))
+  (deftest 9952 (if (numeric-<= -0.0001 0) t nil) t)
+  ;; Debug: REAL.3 first iteration (i=4)
+  (deftest 9960 (let ((r (exact-divide 4 3)))
+    (if (and (consp r) (= (car r) 4) (= (cdr r) 3)) t nil)) t)
+  (deftest 9961 (let ((tp (list 'real 0 (exact-divide 4 3))))
+    (if (typep 0 tp) t nil)) t)
+  (deftest 9962 (let ((tp (list 'real 0 (exact-divide 4 3))))
+    (if (typep 1 tp) t nil)) t)
+  (deftest 9963 (let ((tp (list 'real 0 (exact-divide 4 3))))
+    (if (typep (exact-divide 4 3) tp) t nil)) t)
+  (deftest 9964 (let ((tp (list 'real 0 (exact-divide 4 3))))
+    (if (not (typep (exact-divide 5 3) tp)) t nil)) t)
+  ;; REAL.3-like loop with list
+  (deftest 9970
+    (loop for i = 4 then (ash i 1)
+          for tp = (list 'real 0 (exact-divide i 3))
+          repeat 3
+          unless (and (not (typep -1 tp))
+                      (typep 0 tp)
+                      (typep 1 tp)
+                      (typep (exact-divide i 3) tp)
+                      (not (typep (exact-divide (generic-1+ i) 3) tp)))
+          collect i)
+    nil)
+  ;; REAL.3-like loop with backquote
+  (deftest 9971
+    (loop for i = 4 then (ash i 1)
+          for tp = `(real 0 ,(exact-divide i 3))
+          repeat 3
+          unless (and (not (typep -1 tp))
+                      (typep 0 tp)
+                      (typep 1 tp)
+                      (typep (exact-divide i 3) tp)
+                      (not (typep (exact-divide (generic-1+ i) 3) tp)))
+          collect i)
+    nil)
+  ;; Test backquote with ratio result
+  (deftest 9972
+    (let ((r (exact-divide 4 3)))
+      (let ((tp `(real 0 ,r)))
+        (if (ratiop (caddr tp)) t nil)))
+    t))

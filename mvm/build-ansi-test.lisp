@@ -138,13 +138,11 @@
                                     (not (search "#<" test-str))
                                     (not (search "&ENVIRONMENT" test-str))
                                     (not (search "STRUCT-TEST-" test-str))
-                                    ;; Skip MULTIPLE-VALUE-BIND.7: hits frame-slot overlap
-                                    ;; in deeply nested compile-let-with-specials + m-v-b.
-                                    ;; The test's special variable semantics work correctly
-                                    ;; (verified via direct testing), but the deep nesting
-                                    ;; from multiple-value-list wrapping causes frame-slot
-                                    ;; collision between the outer let-with-specials expansion
-                                    ;; and the inner m-v-b expansion.
+                                    ;; Skip MULTIPLE-VALUE-BIND.7: requires dynamic binding
+                                    ;; stack for symbol-value to see declare-special bindings.
+                                    ;; The frame-slot overlap is fixed, but the test still
+                                    ;; needs symbol-value to check dynamic bindings before
+                                    ;; globals (not yet implemented).
                                     (not (and (symbolp name)
                                              (string= (symbol-name name) "MULTIPLE-VALUE-BIND.7"))))
                            (push test-str test-forms))))))

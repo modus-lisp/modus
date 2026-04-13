@@ -555,19 +555,26 @@
     (if (> n-bindings 0)
         (emit-ir :frame-alloc n-bindings)
       nil)
-    ;; Evaluate each binding's value, store to stack
-    (let ((bp bindings) (i 0))
-      (loop
-        (when (null bp) (return nil))
-        (let ((binding (car bp)))
-          (let ((val (if (consp binding) (cadr binding) nil))
-                (temp (alloc-temp-reg)))
-            (compile-form val env temp)
-            (let ((slot (+ (aref env 1) i)))
-              (emit-ir :stack-store temp slot))
-            (free-temp-reg)))
-        (setq i (+ i 1))
-        (setq bp (cdr bp))))
+    ;; Create reservation env: same bindings as outer env but stack-depth
+    ;; bumped by n-bindings, so nested let/let* inside init forms can't
+    ;; overlap with our reserved slots.
+    (let ((reserve-env (make-array 3)))
+      (aset reserve-env 0 (aref env 0))
+      (aset reserve-env 1 (+ (aref env 1) n-bindings))
+      (aset reserve-env 2 (aref env 2))
+      ;; Evaluate each binding's value, store to stack
+      (let ((bp bindings) (i 0))
+        (loop
+          (when (null bp) (return nil))
+          (let ((binding (car bp)))
+            (let ((val (if (consp binding) (cadr binding) nil))
+                  (temp (alloc-temp-reg)))
+              (compile-form val reserve-env temp)
+              (let ((slot (+ (aref env 1) i)))
+                (emit-ir :stack-store temp slot))
+              (free-temp-reg)))
+          (setq i (+ i 1))
+          (setq bp (cdr bp)))))
     ;; Build new env with all bindings
     (let ((new-env (make-array 3))
           (new-bindings nil)

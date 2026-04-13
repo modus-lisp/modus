@@ -1864,16 +1864,25 @@
     (when (> n-bindings 0)
       ;; Allocate stack frame space for local variables
       (emit-ir :frame-alloc n-bindings))
-    ;; Evaluate each binding value and store it to a stack slot
-    (let ((i 0))
-      (dolist (binding bindings)
-        (let ((val (if (consp binding) (cadr binding) nil))
-              (temp (alloc-temp-reg)))
-          (compile-form val env temp)
-          (let ((slot (+ (compile-env-stack-depth env) i)))
-            (emit-ir :stack-store temp slot))
-          (free-temp-reg)
-          (setq i (+ i 1)))))
+    ;; Create a reservation env: same bindings as outer env (no new names
+    ;; visible, correct for let semantics) but with stack-depth bumped by
+    ;; n-bindings.  This reserves slots D..D+n-1 so that nested let/let*
+    ;; forms inside init expressions allocate their own slots ABOVE this
+    ;; range, preventing frame-slot overlap.
+    (let ((reserve-env (make-compile-env
+                        :bindings (compile-env-bindings env)
+                        :stack-depth (+ (compile-env-stack-depth env) n-bindings)
+                        :parent (compile-env-parent env))))
+      ;; Evaluate each binding value and store it to a stack slot
+      (let ((i 0))
+        (dolist (binding bindings)
+          (let ((val (if (consp binding) (cadr binding) nil))
+                (temp (alloc-temp-reg)))
+            (compile-form val reserve-env temp)
+            (let ((slot (+ (compile-env-stack-depth env) i)))
+              (emit-ir :stack-store temp slot))
+            (free-temp-reg)
+            (setq i (+ i 1))))))
     ;; Phase 2: Build new environment with stack bindings
     (let ((i 0))
       (dolist (binding bindings)

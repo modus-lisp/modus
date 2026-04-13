@@ -334,6 +334,56 @@ Generalizes: shared counter, shared queue, shared config, connection
 pool — any shared data structure is just an actor with a protocol.
 No new primitives. Actors all the way down.
 
+## Execution Tiers
+
+Same source, same compiler, same bytecode. Platform decides execution:
+
+```
+Tier 1 — Full (Linux, macOS, bare metal):
+  compile → translate → native           Full REPL, eval, load, hot-reload
+
+Tier 2 — AOT + Interpreter (iOS, consoles):
+  AOT hot path at build time (native)
+  Interpret dynamic parts at runtime     REPL works, slower for dynamic code
+
+Tier 3 — Full AOT (iOS strict, microcontrollers, embedded):
+  Everything compiled at build time
+  No runtime compilation                 No REPL, full speed, minimal footprint
+```
+
+## Actor Capabilities
+
+Actors can be constrained with sticky (irrevocable) capability restrictions:
+
+```lisp
+(spawn-actor 
+  :code agent-fn
+  :capabilities '(:no-compile       ;; cannot compile/eval/load (Tier 3 mode)
+                  :no-network        ;; cannot send/receive network messages
+                  :no-spawn          ;; cannot create child actors
+                  :heap-limit 4MB    ;; hard memory cap
+                  :cpu-limit 1000ms  ;; per-yield time budget
+                  :read-only-fs))    ;; filesystem is read-only
+```
+
+Sticky = once removed, cannot be re-granted. An actor can restrict
+its children further but never grant capabilities it doesn't have.
+
+**Use cases:**
+- **Sandboxed evaluation** — run untrusted code with `:no-network :no-spawn :heap-limit 1MB`
+- **Simulate embedded** — test with `:no-compile` to verify AOT-only code works
+- **Capability security** — the SSH handler actor has `:no-spawn` so a 
+  compromised session can't fork-bomb
+- **Self-improvement safety** — agent actors get `:heap-limit :cpu-limit` 
+  so a runaway self-modification can't consume all resources
+- **Qubes-like isolation** — already implemented for net-domain actor 
+  (owns all hardware, other actors can't touch NIC directly)
+
+Foundation for object-capability (ocap) security: an actor can only
+access what it was given a reference to. No ambient authority. 
+Combine with hash-verified source and the system is auditable 
+end-to-end.
+
 ## Self-Improvement Architecture
 
 A bare-metal Lisp that controls its own compiler, memory, and network stack

@@ -904,12 +904,6 @@
   ;; Real ANSI test files use RT's (deftest name form expected-literal...) syntax,
   ;; which is transformed at the SBCL build level before MVM compilation.
 
-  ;; EQUAL — macro-expand to equalp-impl to bypass name bug
-  ;; The function named "EQUAL" generates wrong bytecode for unknown reasons.
-  ;; This macro ensures all (equal ...) calls use the working implementation.
-  (mvm-define-macro "EQUAL"
-    (lambda (form)
-      `(equalp-impl ,(cadr form) ,(caddr form))))
 
   ;; DEF-MACRO-TEST — stub: skip macro-form error tests
   (mvm-define-macro "DEF-MACRO-TEST"
@@ -1468,9 +1462,8 @@
 
       ;; --- EQL (same as EQ for fixnums/chars/symbols) ---
       ((= op-name 743927193407775751)      (compile-eq (cdr form) env dest))
-      ((= op-name 777630921077348411)    (compile-eq (cdr form) env dest))
-      ;; equal: removed explicit dispatch — falls through to default compile-call
-      ;; (was causing bytecode differences due to dispatch ordering)
+      ;; NOTE: EQUAL (hash 777630921077348411) is NOT inlined as EQ — it's a
+      ;; user-defined function (structural equality), dispatched via compile-call.
 
       ;; --- Memory Operations ---
       ((= op-name 900047298083458158)  (compile-mem-ref (cadr form) (caddr form) env dest))

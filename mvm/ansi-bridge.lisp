@@ -371,9 +371,6 @@
 ;;; for all calls from ANSI test code.
 ;;; ============================================================
 
-;; equal workaround: the NAME "equal" causes wrong bytecode due to a
-;; deep compiler bug. We define equalp-impl and have the compiler macro
-;; expand (equal ...) to (equalp-impl ...) so the working code is used.
 ;;; Safe stub for all unresolved function calls.
 ;;; The compiler directs unresolved CALLs here instead of offset 0.
 (defun %unresolved-fn () nil)

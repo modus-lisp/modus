@@ -184,6 +184,57 @@ No global pauses, no concurrent compaction, no barriers between actors.
 **Validation:** the ANSI test suite (12,600 tests) becomes the GC stress 
 test. If it passes with GC enabled, the collector is correct.
 
+## Performance: The 80/20 Stack
+
+Current: naive code generation, every value boxed, every call is a full call.
+Target: within 3-5x of SBCL for typical code.
+
+### TCO — Tail Call Elimination (correctness + performance)
+
+Not optional. Without it, idiomatic Lisp blows the stack. `mapcar`, 
+`reduce`, `member`, recursive tree walks all depend on tail calls.
+
+Self-tail-call: the compiler already detects tail position (for 
+`set-mv-count`). Emit JMP to own entry label instead of CALL+RET. 
+Reuses the current frame. Zero stack growth.
+
+Mutual tail call: tear down caller's frame, set up callee's args, 
+JMP. Harder but covers A→B→A patterns.
+
+### Inline Small Functions (2-5x speedup)
+
+`(cadr x)` is currently a full CALL with 1120-byte frame setup for 
+two instructions of actual work. Inline any function < N IR instructions 
+at the call site. The compiler already inlines `car`, `cdr`, `+` as 
+builtins — extend to user-defined functions via `(declaim (inline f))` 
+or auto-detect.
+
+### Leaf Function Optimization (1.5-2x)
+
+Functions that make no calls don't need `sub rsp, 1120`. The compiler
+already tracks this (`form-contains-call-p`). Skip frame setup for
+leaf functions — use registers only.
+
+### Fixnum Loop Unboxing (5-10x numeric loops)
+
+`(dotimes (i 1000000) ...)` — keep `i` as raw integer for the whole
+loop body. Currently every `(+ i 1)` untags, adds, retags. Detect
+`dotimes`/`loop for i from` patterns and unbox the counter.
+
+### Constant Folding (free)
+
+`(+ 3 4)` → `7` at compile time. Extend to all pure functions with
+constant arguments.
+
+### Not Needed (yet)
+
+- SSA form — diminishing returns without full type inference
+- Graph coloring register allocation — memory is fast, spills are cheap
+- Block compilation — optimize across function boundaries
+
+Full type inference is SBCL's killer feature (20 years of work). 
+We can get 80% of the practical benefit from the above without it.
+
 ## The `modus` Command
 
 The self-hosted CL implementation as a userspace binary:

@@ -2736,25 +2736,27 @@
                           ,tmp)
                        env dest)))
       (t
-       ;; Multiple values: eval all left-to-right, push to stack,
-       ;; then pop extras to MV storage, pop primary to dest.
-       (let ((addr-reg (alloc-temp-reg)))
-         ;; Evaluate each value and push result
+       ;; Multiple values: evaluate all left-to-right via let bindings,
+       ;; then store extras to MV storage and return primary.
+       (let ((temp-vars nil)
+             (bindings nil))
          (dolist (val-form args)
-           (compile-form val-form env dest)
-           (emit-ir :push dest))
-         ;; Set count
-         (emit-ir :set-mv-count nvals)
-         ;; Pop extra values in reverse order into MV storage
-         (loop for idx from (- nvals 2) downto 0
-               do (emit-ir :pop dest)
-                  (emit-ir :li addr-reg (ash (+ +mv-values-addr+ (* idx 8))
-                                             +fixnum-shift+))
-                  (emit-ir :shr addr-reg addr-reg +fixnum-shift+)
-                  (emit-ir :store addr-reg dest 3))
-         ;; Pop primary value into dest
-         (emit-ir :pop dest)
-         (free-temp-reg))))))
+           (let ((tmp (gensym "MV")))
+             (push tmp temp-vars)
+             (push (list tmp val-form) bindings)))
+         (setf temp-vars (nreverse temp-vars))
+         (setf bindings (nreverse bindings))
+         (let ((store-forms nil)
+               (idx 0))
+           (push `(setf (mem-ref ,+mv-count-addr+ :u64) ,nvals) store-forms)
+           (dolist (tmp (cdr temp-vars))
+             (let ((addr (+ +mv-values-addr+ (* idx 8))))
+               (push `(setf (mem-ref ,addr :u64) ,tmp) store-forms))
+             (incf idx))
+           (compile-form `(let ,bindings
+                            ,@(nreverse store-forms)
+                            ,(car temp-vars))
+                         env dest)))))))
 
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).

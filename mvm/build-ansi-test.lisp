@@ -138,11 +138,8 @@
                                     (not (search "#<" test-str))
                                     (not (search "&ENVIRONMENT" test-str))
                                     (not (search "STRUCT-TEST-" test-str))
-                                    ;; Skip MULTIPLE-VALUE-BIND.7: requires dynamic binding
-                                    ;; stack for symbol-value to see declare-special bindings.
-                                    ;; The frame-slot overlap is fixed, but the test still
-                                    ;; needs symbol-value to check dynamic bindings before
-                                    ;; globals (not yet implemented).
+                                    ;; Skip MV-BIND.7: declare special works but flet
+                                    ;; closures + symbol-value interaction needs more work
                                     (not (and (symbolp name)
                                              (string= (symbol-name name) "MULTIPLE-VALUE-BIND.7"))))
                            (push test-str test-forms))))))

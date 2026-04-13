@@ -912,9 +912,7 @@
   "Return (new-ch . new-in-word) for string-capitalize."
   (if (alphanumericp (code-char ch))
       (if in-word
-          ;; subsequent char in word — lowercase alpha
           (cons (if (upper-case-p (code-char ch)) (+ ch 32) ch) t)
-          ;; first char in word — uppercase alpha
           (cons (if (lower-case-p (code-char ch)) (- ch 32) ch) t))
       (cons ch nil)))
 

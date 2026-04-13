@@ -939,7 +939,31 @@
   (run-equal-fix-tests)
   (run-mv-debug-tests)
   (run-regression-tests)
-  (run-typep-debug-tests))
+  (run-typep-debug-tests)
+  (run-stream-debug-tests))
+
+(defun run-stream-debug-tests ()
+  ;; Stream type system
+  (deftest 9801 (streamp (make-string-output-stream)) t)
+  (deftest 9802 (streamp (make-string-input-stream "abc")) t)
+  (deftest 9803 (output-stream-p (make-string-output-stream)) t)
+  (deftest 9804 (input-stream-p (make-string-input-stream "abc")) t)
+  ;; read-char from string-input-stream
+  (deftest 9811 (let ((s (make-string-input-stream "abc")))
+                  (read-char s)) #\a)
+  ;; read-char with *standard-input*
+  (deftest 9812 (with-input-from-string (*standard-input* "x")
+                  (read-char)) #\x)
+  ;; with-output-to-string capturing write-char
+  (deftest 9813 (with-output-to-string (s) (write-char #\a s)) "a")
+  ;; unread-char
+  (deftest 9814 (let ((s (make-string-input-stream "abc")))
+                  (read-char s)
+                  (unread-char #\a s)
+                  (read-char s)) #\a)
+  ;; peek-char
+  (deftest 9815 (let ((s (make-string-input-stream "abc")))
+                  (peek-char nil s)) #\a))
 
 (defun run-typep-debug-tests ()
   ;; Basic typep tests

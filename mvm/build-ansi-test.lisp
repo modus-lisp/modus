@@ -172,6 +172,52 @@
      (rewrite-eval-quote (cadr (cadr form))))
     (t (mapcar #'rewrite-eval-quote form))))
 
+;; Rewrite (let ((*earmuff* val)) body) → (let ((*earmuff* val)) (declare (special *earmuff*)) body)
+;; This ensures dynamic binding for standard stream variables like *terminal-io*, *standard-output* etc.
+(defun %earmuff-sym-p (sym)
+  "Check if SYM is a *earmuff* variable."
+  (and (symbolp sym)
+       (let ((name (symbol-name sym)))
+         (and (> (length name) 2)
+              (char= (char name 0) #\*)
+              (char= (char name (1- (length name))) #\*)))))
+
+(defun rewrite-earmuff-specials (form)
+  "Walk form tree, adding (declare (special ...)) to let/let* forms binding earmuff variables."
+  (cond
+    ((atom form) form)
+    ((and (member (car form) '(let let*))
+          (consp (cdr form))
+          (consp (cadr form)))
+     ;; Check if any bindings are earmuff variables
+     (let ((bindings (cadr form))
+           (body (cddr form)))
+       (let ((earmuffs (remove-if-not
+                        (lambda (b)
+                          (let ((var (if (consp b) (car b) b)))
+                            (%earmuff-sym-p var)))
+                        bindings)))
+         ;; Check if there's already a (declare (special ...)) covering these
+         (let* ((existing-specials nil)
+                (has-decl (and (consp body) (consp (car body))
+                               (eq (caar body) 'declare))))
+           (when has-decl
+             (dolist (spec (cdar body))
+               (when (and (consp spec) (eq (car spec) 'special))
+                 (setf existing-specials (append (cdr spec) existing-specials)))))
+           (let ((new-earmuffs (remove-if
+                                (lambda (b)
+                                  (member (if (consp b) (car b) b) existing-specials))
+                                earmuffs)))
+             (if new-earmuffs
+                 (let ((special-decl `(declare (special ,@(mapcar (lambda (b) (if (consp b) (car b) b)) new-earmuffs)))))
+                   `(,(car form) ,(mapcar (lambda (b) (if (consp b) (cons (car b) (mapcar #'rewrite-earmuff-specials (cdr b))) b)) bindings)
+                     ,special-decl
+                     ,@(mapcar #'rewrite-earmuff-specials body)))
+                 `(,(car form) ,(mapcar (lambda (b) (if (consp b) (cons (car b) (mapcar #'rewrite-earmuff-specials (cdr b))) b)) bindings)
+                   ,@(mapcar #'rewrite-earmuff-specials body))))))))
+    (t (mapcar #'rewrite-earmuff-specials form))))
+
 ;; Convert SBCL symbols/keywords used as package designators to strings
 ;; so MVM can handle them (MVM symbols are name-hashes, not printable)
 (defun %stringify-pkg-designator (x)
@@ -312,6 +358,7 @@
             (setf forms (mapcar #'rewrite-make-array-dims forms))
             (setf forms (mapcar #'rewrite-eval-quote forms))
             (setf forms (mapcar #'rewrite-make-array-initcontents forms))
+            (setf forms (mapcar #'rewrite-earmuff-specials forms))
             (when (string= file "integer-length.lsp")
               (labels ((rw (f)
                          (cond ((atom f) f)
@@ -592,6 +639,9 @@
 
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
   (%init-packages)
+
+  ;; Initialize standard streams
+  (%init-streams)
 
   ;; Init RT counters manually (init-all-globals not safe — some thunks
   ;; reference functions/symbols that may not be available yet)

@@ -401,31 +401,361 @@
 ;;; String stream / printer support
 ;;; ============================================================
 
-;; Simple string output stream: cons cell (chars-list . nil)
-;; Characters are collected in reverse, then reversed to build string.
-(defvar *string-output-stream* nil)
+;;; ============================================================
+;;; Stream type system
+;;; ============================================================
+;;;
+;;; Stream = (cons 7770001 (cons type data))
+;;; Types: 1=string-input, 2=string-output, 3=echo, 4=two-way,
+;;;        5=broadcast, 6=concatenated, 7=synonym, 8=serial-io
+;;;
+;;; String-input data:  (cons string (cons position unread-char-or-nil))
+;;; String-output data: (cons char-list nil)
+;;; Echo data:          (cons input-stream output-stream)
+;;; Two-way data:       (cons input-stream output-stream)
+;;; Broadcast data:     list-of-streams
+;;; Concatenated data:  (cons stream-list nil)
+;;; Synonym data:       symbol-name-hash
+;;; Serial-io data:     nil (for bare-metal serial)
+
+(defun %stream-tag () 7770001)
+
+(defun %make-stream (type data)
+  (cons 7770001 (cons type data)))
+
+(defun streamp (obj)
+  (if (consp obj)
+      (if (eq (car obj) 7770001) t nil)
+      nil))
+
+(defun %stream-type (s)
+  (car (cdr s)))
+
+(defun %stream-data (s)
+  (cdr (cdr s)))
+
+(defun input-stream-p (s)
+  (if (streamp s)
+      (let ((ty (%stream-type s)))
+        (cond
+          ((= ty 1) t)   ;; string-input
+          ((= ty 3) t)   ;; echo (input+output)
+          ((= ty 4) t)   ;; two-way (input+output)
+          ((= ty 6) t)   ;; concatenated (input)
+          ((= ty 7) t)   ;; synonym (depends on target, assume both)
+          ((= ty 8) t)   ;; serial-io (both)
+          ((= ty 9) t)   ;; file stream (both)
+          (t nil)))
+      nil))
+
+(defun output-stream-p (s)
+  (if (streamp s)
+      (let ((ty (%stream-type s)))
+        (cond
+          ((= ty 2) t)   ;; string-output
+          ((= ty 3) t)   ;; echo (input+output)
+          ((= ty 4) t)   ;; two-way (input+output)
+          ((= ty 5) t)   ;; broadcast (output)
+          ((= ty 7) t)   ;; synonym
+          ((= ty 8) t)   ;; serial-io (both)
+          ((= ty 9) t)   ;; file stream (both)
+          (t nil)))
+      nil))
+
+(defun open-stream-p (s) (if (streamp s) t nil))
+(defun stream-element-type (s) (quote character))
+(defun stream-external-format (s) (quote default))
+(defun interactive-stream-p (s) nil)
+
+(defun close (stream &rest args) t)
+
+;;; --- Standard stream variables ---
+;;; These are defvar'd as nil above (before stream system exists).
+;;; %init-streams creates actual stream objects and sets them.
+
+(defvar *error-output* nil)
+(defvar *debug-io* nil)
+(defvar *query-io* nil)
+(defvar *trace-output* nil)
+
+(defun %init-streams ()
+  "Initialize standard stream variables to serial-io stream objects."
+  (let ((serial-in (%make-stream 8 nil))
+        (serial-out (%make-stream 8 nil)))
+    (setq *standard-input* serial-in)
+    (setq *standard-output* serial-out)
+    (setq *terminal-io* (%make-stream 4 (cons serial-in serial-out)))
+    (setq *error-output* serial-out)
+    (setq *debug-io* (%make-stream 4 (cons serial-in serial-out)))
+    (setq *query-io* (%make-stream 4 (cons serial-in serial-out)))
+    (setq *trace-output* serial-out)))
+
+;;; --- Stream constructors ---
 
 (defun make-string-output-stream ()
-  (cons nil nil))
+  (%make-stream 2 (cons nil nil)))
 
 (defun get-output-stream-string (stream)
-  (let ((chars (nreverse (car stream))))
-    (set-car stream nil)
-    (let ((len (list-length chars))
-          (i 0))
-      (if (null chars) (make-array 0)
-        (let ((s (make-array len))
-              (cur chars))
-          (loop
-            (when (null cur) (return s))
-            (aset s i (car cur))
-            (setq cur (cdr cur))
-            (setq i (+ i 1))))))))
+  (let ((data (if (streamp stream) (%stream-data stream) stream)))
+    (let ((chars (nreverse (car data))))
+      (set-car data nil)
+      (let ((len (list-length chars))
+            (i 0))
+        (if (null chars) (%make-string-array 0)
+          (let ((s (%make-string-array len))
+                (cur chars))
+            (loop
+              (when (null cur) (return s))
+              (aset s i (car cur))
+              (setq cur (cdr cur))
+              (setq i (+ i 1)))))))))
 
+(defun make-string-input-stream (str &rest args)
+  (let ((start (if args (car args) 0))
+        (end (if (cdr args) (cadr args) nil)))
+    (let ((actual-str (if (or (> start 0) end)
+                          (%substring str start (if end end (length str)))
+                          str)))
+      (%make-stream 1 (cons actual-str (cons 0 nil))))))
+
+(defun make-echo-stream (in out)
+  (%make-stream 3 (cons in out)))
+
+(defun make-two-way-stream (in out)
+  (%make-stream 4 (cons in out)))
+
+(defun make-broadcast-stream (&rest streams)
+  (%make-stream 5 streams))
+
+(defun make-concatenated-stream (&rest streams)
+  (%make-stream 6 (cons streams nil)))
+
+(defun make-synonym-stream (sym)
+  (%make-stream 7 sym))
+
+(defun %make-file-stream ()
+  "Create a dummy file stream (for with-open-file stub)."
+  (%make-stream 9 nil))
+
+;;; --- Stream accessors ---
+
+(defun echo-stream-input-stream (s) (car (%stream-data s)))
+(defun echo-stream-output-stream (s) (cdr (%stream-data s)))
+(defun two-way-stream-input-stream (s) (car (%stream-data s)))
+(defun two-way-stream-output-stream (s) (cdr (%stream-data s)))
+(defun broadcast-stream-streams (s) (%stream-data s))
+(defun concatenated-stream-streams (s) (car (%stream-data s)))
+(defun synonym-stream-symbol (s) (%stream-data s))
+
+;;; --- Stream designator resolution ---
+
+(defun %resolve-input-stream (stream)
+  "Resolve a stream designator to an actual input stream.
+   nil -> *standard-input*, t -> *terminal-io* input side."
+  (cond
+    ((null stream) *standard-input*)
+    ((eq stream t) (if (streamp *terminal-io*)
+                       (two-way-stream-input-stream *terminal-io*)
+                       *terminal-io*))
+    ((streamp stream)
+     (let ((ty (%stream-type stream)))
+       (cond
+         ((= ty 4) (two-way-stream-input-stream stream))  ;; two-way -> input side
+         ((= ty 3) stream)   ;; echo stream stays as-is
+         (t stream))))
+    (t stream)))
+
+(defun %resolve-output-stream (stream)
+  "Resolve a stream designator to an actual output stream.
+   nil -> *standard-output*, t -> *terminal-io* output side."
+  (cond
+    ((null stream) *standard-output*)
+    ((eq stream t) (if (streamp *terminal-io*)
+                       (two-way-stream-output-stream *terminal-io*)
+                       *terminal-io*))
+    ((streamp stream)
+     (let ((ty (%stream-type stream)))
+       (cond
+         ((= ty 4) (two-way-stream-output-stream stream))  ;; two-way -> output side
+         ((= ty 3) stream)   ;; echo stream stays as-is
+         (t stream))))
+    (t stream)))
+
+;;; --- Core read-char ---
+
+(defun read-char (&rest args)
+  "Read one character from stream. Returns character object."
+  (let ((stream-arg (if args (car args) nil))
+        (eof-error-p (if (cdr args) (cadr args) t))
+        (eof-value (if (cddr args) (caddr args) nil)))
+    (let ((s (%resolve-input-stream stream-arg)))
+      (%read-char-from-stream s eof-error-p eof-value))))
+
+(defun %read-char-from-stream (s eof-error-p eof-value)
+  "Read one character from a resolved stream."
+  (if (not (streamp s))
+      ;; Not a stream - return eof-value or nil
+      (if eof-error-p nil eof-value)
+      (let ((ty (%stream-type s)))
+        (cond
+          ;; String-input stream
+          ((= ty 1)
+           (let ((data (%stream-data s)))
+             (let ((str (car data))
+                   (pos-cell (cdr data)))
+               ;; Check unread-char first
+               (let ((unread (cdr pos-cell)))
+                 (if unread
+                     (progn
+                       (set-cdr pos-cell nil)
+                       unread)
+                     ;; Read from string
+                     (let ((pos (car pos-cell)))
+                       (if (>= pos (length str))
+                           ;; EOF
+                           (if eof-error-p nil eof-value)
+                           (let ((ch (code-char (aref str pos))))
+                             (set-car pos-cell (+ pos 1))
+                             ch))))))))
+          ;; Echo stream: read from input, echo to output
+          ((= ty 3)
+           (let ((data (%stream-data s)))
+             ;; Check for unread char on the echo stream itself
+             ;; Echo streams have data = (cons input output . unread-or-nil)
+             ;; Actually keep it simple: delegate to input stream
+             (let ((ch (%read-char-from-stream (car data) eof-error-p eof-value)))
+               (when (characterp ch)
+                 (%write-char-to-stream ch (cdr data)))
+               ch)))
+          ;; Two-way stream: read from input side
+          ((= ty 4)
+           (%read-char-from-stream (car (%stream-data s)) eof-error-p eof-value))
+          ;; Concatenated stream: read from first non-exhausted stream
+          ((= ty 6)
+           (let ((data (%stream-data s)))
+             (let ((streams (car data)))
+               (loop
+                 (when (null streams)
+                   (return (if eof-error-p nil eof-value)))
+                 (let ((ch (%read-char-from-stream (car streams) nil :eof-sentinel-7770002)))
+                   (if (eq ch :eof-sentinel-7770002)
+                       (progn
+                         (setq streams (cdr streams))
+                         (set-car data streams))
+                       (return ch)))))))
+          ;; Serial-io
+          ((= ty 8) (if eof-error-p nil eof-value))
+          (t (if eof-error-p nil eof-value))))))
+
+;;; --- unread-char ---
+
+(defun unread-char (ch &rest args)
+  "Push back a character onto a stream."
+  (let ((stream-arg (if args (car args) nil)))
+    (let ((s (%resolve-input-stream stream-arg)))
+      (when (streamp s)
+        (let ((ty (%stream-type s)))
+          (cond
+            ((= ty 1)
+             ;; String-input: store in unread slot
+             (let ((pos-cell (cdr (%stream-data s))))
+               (set-cdr pos-cell ch)))
+            ((= ty 3)
+             ;; Echo stream: unread on input side (don't echo unreads)
+             (unread-char ch (car (%stream-data s))))
+            ((= ty 4)
+             ;; Two-way: unread on input side
+             (unread-char ch (car (%stream-data s)))))))
+      nil)))
+
+;;; --- peek-char ---
+
+(defun peek-char (&rest args)
+  "Peek at next character. peek-type: nil=next char, t=skip whitespace, char=skip until char."
+  (let ((peek-type (if args (car args) nil))
+        (stream-arg (if (cdr args) (cadr args) nil))
+        (eof-error-p (if (cddr args) (caddr args) t))
+        (eof-value (if (cdddr args) (cadddr args) nil)))
+    (let ((s (%resolve-input-stream stream-arg)))
+      (cond
+        ;; nil: just peek at next char
+        ((null peek-type)
+         (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
+           (when (characterp ch)
+             (unread-char ch s))
+           ch))
+        ;; t: skip whitespace, peek at first non-whitespace
+        ((eq peek-type t)
+         (loop
+           (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
+             (cond
+               ((not (characterp ch)) (return ch))
+               ((not (%whitespace-p ch))
+                (unread-char ch s)
+                (return ch))))))
+        ;; character: skip until that character
+        ((characterp peek-type)
+         (loop
+           (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
+             (cond
+               ((not (characterp ch)) (return ch))
+               ((char= ch peek-type)
+                (unread-char ch s)
+                (return ch))))))
+        (t nil)))))
+
+(defun %whitespace-p (ch)
+  "Check if character is whitespace."
+  (let ((code (char-code ch)))
+    (or (= code 32) (= code 10) (= code 13) (= code 9) (= code 12))))
+
+;;; --- read-char-no-hang ---
+
+(defun read-char-no-hang (&rest args)
+  "Non-blocking read-char. For string streams, same as read-char."
+  (let ((stream-arg (if args (car args) nil))
+        (eof-error-p (if (cdr args) (cadr args) t))
+        (eof-value (if (cddr args) (caddr args) nil)))
+    (let ((s (%resolve-input-stream stream-arg)))
+      (if (and (streamp s) (= (%stream-type s) 1))
+          (%read-char-from-stream s eof-error-p eof-value)
+          nil))))
+
+;;; --- Core write-char ---
+
+(defun %write-char-to-stream (code stream)
+  "Write a char code (integer) to a resolved stream. Caller must convert characters first."
+  (if (not (streamp stream))
+      (write-char-serial code)
+      (let ((ty (%stream-type stream)))
+        (cond
+          ;; String-output: collect char codes
+          ((= ty 2)
+           (let ((data (%stream-data stream)))
+             (set-car data (cons code (car data)))))
+          ;; Echo stream: write to output side
+          ((= ty 3)
+           (%write-char-to-stream code (cdr (%stream-data stream))))
+          ;; Two-way stream: write to output side
+          ((= ty 4)
+           (%write-char-to-stream code (cdr (%stream-data stream))))
+          ;; Broadcast: write to all
+          ((= ty 5)
+           (dolist (s (%stream-data stream))
+             (%write-char-to-stream code s)))
+          ;; Serial-io
+          ((= ty 8) (write-char-serial code))
+          (t (write-char-serial code))))))
+
+;; Backward-compatible wrapper used by write-to-stream, princ-to-stream etc.
 (defun write-char-to-stream (ch stream)
-  (if (null stream)
-      (write-char-serial ch)
-      (set-car stream (cons ch (car stream)))))
+  (let ((code (%ensure-char-code ch)))
+    (if (null stream)
+        (write-char-serial code)
+        (if (streamp stream)
+            (%write-char-to-stream code stream)
+            ;; Legacy: old-style cons output stream (char-list . nil)
+            (set-car stream (cons code (car stream)))))))
 
 ;; write-object-to-stream: like write-object but outputs to a stream
 (defun write-to-stream (obj stream)
@@ -540,45 +870,112 @@
   obj)
 
 (defun terpri (&rest stream-arg)
-  (write-char-serial 10)
+  (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))
+    (if (and (streamp s) (not (= (%stream-type s) 8)))
+        (%write-char-to-stream 10 s)
+        (write-char-serial 10)))
   nil)
 
 (defun fresh-line (&rest stream-arg)
-  (write-char-serial 10)
-  t)
+  "Write newline only if not at beginning of line. Returns nil if at BOL, non-nil otherwise."
+  (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))
+    (if (and (streamp s) (not (= (%stream-type s) 8)))
+        (if (%stream-at-bol-p s)
+            nil
+            (progn (%write-char-to-stream 10 s) t))
+        ;; Serial output: always write newline (no column tracking)
+        (progn (write-char-serial 10) t))))
+
+(defun %stream-at-bol-p (s)
+  "Check if stream is at beginning of line (last char was newline or nothing written)."
+  (if (streamp s)
+      (let ((ty (%stream-type s)))
+        (cond
+          ((= ty 2) ;; string-output: check char-list
+           (let ((chars (car (%stream-data s))))
+             (if (null chars)
+                 t  ;; nothing written = at BOL
+                 (= (car chars) 10))))  ;; last char was newline
+          ((= ty 4) ;; two-way: check output side
+           (%stream-at-bol-p (cdr (%stream-data s))))
+          ((= ty 3) ;; echo: check output side
+           (%stream-at-bol-p (cdr (%stream-data s))))
+          ((= ty 5) ;; broadcast: check first stream
+           (if (%stream-data s)
+               (%stream-at-bol-p (car (%stream-data s)))
+               t))
+          ((= ty 8) nil) ;; serial: assume not at BOL
+          (t nil)))
+      nil))
 
 (defun write-string (str &rest args)
-  (write-string-serial str)
+  (let ((s (%resolve-output-stream (if args (car args) nil))))
+    (if (and (streamp s) (not (= (%stream-type s) 8)))
+        (let ((len (length str)) (i 0))
+          (loop
+            (when (>= i len) (return nil))
+            (%write-char-to-stream (aref str i) s)
+            (setq i (+ i 1))))
+        (write-string-serial str)))
   str)
 
 (defun write-line (str &rest args)
-  (write-string-serial str)
-  (write-char-serial 10)
+  (let ((s (%resolve-output-stream (if args (car args) nil))))
+    (if (and (streamp s) (not (= (%stream-type s) 8)))
+        (progn
+          (let ((len (length str)) (i 0))
+            (loop
+              (when (>= i len) (return nil))
+              (%write-char-to-stream (aref str i) s)
+              (setq i (+ i 1))))
+          (%write-char-to-stream 10 s))
+        (progn
+          (write-string-serial str)
+          (write-char-serial 10))))
   str)
 
+(defun %ensure-char-code (x)
+  "If x is a character, return char-code. Otherwise return x unchanged.
+   Avoids compiler bug with inline characterp + char-code."
+  (if (fixnump x) x (char-code x)))
+
 (defun write-char (ch &rest stream-arg)
-  (write-char-serial ch)
-  ch)
+  "Write character CH to stream. Stream designator: nil=*standard-output*, t=*terminal-io*."
+  (let ((saved-ch ch))
+    (let ((code (%ensure-char-code saved-ch)))
+      (let ((s (if stream-arg
+                   (%resolve-output-stream (car stream-arg))
+                   (%resolve-output-stream nil))))
+        (%write-char-to-stream code s)))
+    saved-ch))
 
 (defun finish-output (&rest args) nil)
 (defun force-output (&rest args) nil)
 (defun clear-output (&rest args) nil)
 (defun clear-input (&rest args) nil)
-
-;; with-output-to-string
-(defun input-stream-p (s) nil)
-(defun output-stream-p (s) nil)
-(defun open-stream-p (s) t)
-(defun stream-element-type (s) (quote character))
-(defun stream-external-format (s) (quote default))
-(defun listen (&rest args) nil)
+(defun listen (&rest args)
+  "Check if input is available on stream."
+  (let ((s (%resolve-input-stream (if args (car args) nil))))
+    (if (streamp s)
+        (let ((ty (%stream-type s)))
+          (cond
+            ;; String-input: check if there's data or unread char
+            ((= ty 1)
+             (let ((data (%stream-data s)))
+               (let ((str (car data))
+                     (pos-cell (cdr data)))
+                 (if (cdr pos-cell)
+                     t  ;; unread char available
+                     (if (< (car pos-cell) (length str)) t nil)))))
+            ;; Two-way: check input side
+            ((= ty 4) (listen (car (%stream-data s))))
+            ;; Echo: check input side
+            ((= ty 3) (listen (car (%stream-data s))))
+            (t nil)))
+        nil)))
 (defun file-length (s) 0)
 (defun file-position (s &rest args) 0)
 (defun file-string-length (s str) (if (stringp str) (array-length str) 1))
-(defun peek-char (&rest args) nil)
-(defun unread-char (ch &rest args) nil)
-(defun read-char (&rest args) nil)
-(defun read-char-no-hang (&rest args) nil)
 (defun %substring (str start end)
   "Extract a substring from STR between START and END, preserving string subtag."
   (let ((len (- end start))
@@ -590,57 +987,47 @@
         (setq i (+ i 1))))))
 
 (defun read-line (&rest args)
-  "Read a line from a string-input-stream. Args: [stream [eof-error-p [eof-value [recursive-p]]]]"
-  (let ((stream (if args (car args) *standard-input*))
+  "Read a line from a stream. Args: [stream [eof-error-p [eof-value [recursive-p]]]]"
+  (let ((stream-arg (if args (car args) nil))
         (eof-error-p (if (cdr args) (cadr args) t))
         (eof-value (if (cddr args) (caddr args) nil)))
-    ;; Handle special stream designators
-    (when (null stream) (setq stream *standard-input*))
-    (when (eq stream t)
-      (setq stream (two-way-stream-input-stream *terminal-io*)))
-    ;; stream is (cons string position)
-    (if (not (consp stream))
-        (values nil t)
-        (let ((str (car stream))
-              (pos (cdr stream)))
-          (if (>= pos (length str))
-              ;; EOF
-              (if eof-error-p
-                  (values eof-value t)  ;; should signal error but return eof-value
-                  (values eof-value t))
-              ;; Read until newline or end of string
-              (let ((start pos)
-                    (found-newline nil))
-                (loop
-                  (when (>= pos (length str))
-                    (return nil))
-                  (when (char= (elt str pos) #\Newline)
-                    (setq found-newline t)
-                    (return nil))
-                  (setq pos (+ pos 1)))
-                ;; Update stream position
-                (set-cdr stream (if found-newline (+ pos 1) pos))
-                ;; Return the line and eof-p (true if at end and no newline found)
-                (values (%substring str start pos) (not found-newline))))))))
+    (let ((s (%resolve-input-stream stream-arg)))
+      ;; Use read-char to read characters until newline or EOF
+      (let ((chars nil)
+            (found-newline nil)
+            (hit-eof nil))
+        (loop
+          (let ((ch (%read-char-from-stream s nil :eof-sentinel-7770002)))
+            (cond
+              ((eq ch :eof-sentinel-7770002)
+               (setq hit-eof t)
+               (return nil))
+              ((char= ch #\Newline)
+               (setq found-newline t)
+               (return nil))
+              (t (setq chars (cons (char-code ch) chars))))))
+        (if (and hit-eof (null chars))
+            ;; EOF with nothing read
+            (if eof-error-p
+                (values eof-value t)
+                (values eof-value t))
+            ;; Build string from collected chars
+            (let ((result-chars (nreverse chars)))
+              (let ((len (list-length result-chars)))
+                (let ((str (%make-string-array len))
+                      (i 0)
+                      (cur result-chars))
+                  (loop
+                    (when (null cur) (return nil))
+                    (aset str i (car cur))
+                    (setq cur (cdr cur))
+                    (setq i (+ i 1)))
+                  (values str (if found-newline nil (if hit-eof t nil)))))))))))
+
 (defun read-byte (&rest args) nil)
 (defun read-sequence (seq stream &rest args) 0)
 (defun write-sequence (seq stream &rest args) seq)
 (defun write-byte (byte stream) byte)
-
-(defun make-broadcast-stream (&rest streams) nil)
-(defun broadcast-stream-streams (s) nil)
-(defun make-concatenated-stream (&rest streams) nil)
-(defun concatenated-stream-streams (s) nil)
-(defun make-echo-stream (in out) (cons in out))
-(defun echo-stream-input-stream (s) (car s))
-(defun echo-stream-output-stream (s) (cdr s))
-(defun make-synonym-stream (sym) nil)
-(defun synonym-stream-symbol (s) nil)
-(defun make-two-way-stream (in out) (cons in out))
-(defun two-way-stream-input-stream (s) (car s))
-(defun two-way-stream-output-stream (s) (cdr s))
-(defun make-string-input-stream (str &rest args) (cons str 0))
-(defun interactive-stream-p (s) nil)
 
 (defun equalp-impl (a b)
   (if (eql a b) t
@@ -2609,6 +2996,7 @@
     ((not (consp type))
      (let ((tn type))
        (cond
+         ((eq tn 'stream) (streamp obj))
          ((eq tn 'package) (packagep obj))
          ((eq tn 'keyword) (keywordp obj))
          ((eq tn 'integer) (integerp obj))

@@ -1402,16 +1402,38 @@
            (if (cdr saved)
                (setf (gethash (car saved) *macro-table*) (cdr saved))
                (remhash (car saved) *macro-table*)))))
-      ;; WITH-OPEN-FILE — compile as let binding stream var to nil, then body
+      ;; WITH-OPEN-FILE — compile as let binding stream var to a dummy file stream
       ((= op-name 258734651587197007)
        (let ((spec (cadr form))
              (body (cddr form)))
-         (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
-      ;; WITH-OUTPUT-TO-STRING — compile as let binding stream var to nil
+         (compile-form `(let ((,(car spec) (%make-file-stream))) ,@body) env dest)))
+      ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
       ((= op-name 884158782725716889)
-       (let ((spec (cadr form))
-             (body (cddr form)))
-         (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
+       (let* ((spec (cadr form))
+              (var (car spec))
+              (body (cddr form))
+              (var-name (if (symbolp var) (symbol-name var) (format nil "~A" var))))
+         ;; Check if second arg is a target string (not supported, just ignore)
+         (if (and (cdr spec) (cadr spec) (not (eq (cadr spec) 'nil)))
+             ;; Writing to an existing string — just run body, return nil
+             (compile-form `(let ((,var (make-string-output-stream))) ,@body nil) env dest)
+             ;; Normal case: create stream, run body, return string
+             (if (and (> (length var-name) 2)
+                      (char= (char var-name 0) #\*)
+                      (char= (char var-name (1- (length var-name))) #\*))
+                 ;; Dynamic binding for *earmuffs* vars
+                 (compile-form
+                  `(let ((,var (make-string-output-stream)))
+                     (declare (special ,var))
+                     ,@body
+                     (get-output-stream-string ,var))
+                  env dest)
+                 ;; Lexical binding
+                 (compile-form
+                  `(let ((,var (make-string-output-stream)))
+                     ,@body
+                     (get-output-stream-string ,var))
+                  env dest)))))
       ;; WITH-INPUT-FROM-STRING — bind stream var to make-string-input-stream
       ((= op-name 778706583216373557)
        (let* ((spec (cadr form))

@@ -640,6 +640,13 @@
 (defun substitute-if-not (new pred seq &rest args) (mapcar1 (lambda (item) (if (funcall pred item) item new)) seq))
 (defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
 (defun hash-table-count (ht) (let ((c 0) (cur (car ht))) (loop (when (null cur) (return c)) (setq c (+ c 1)) (setq cur (cdr cur)))))
+(defun maphash (fn ht)
+  "Apply FN to each key-value pair in hash table."
+  (let ((cur (car ht)))
+    (loop (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (funcall fn (car pair) (cdr pair)))
+      (setq cur (cdr cur)))))
 (defun array-element-type (a) t)
 (defun check-type-error (fn args) nil)
 (defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))
@@ -985,8 +992,9 @@
   (when (>= x1 x) (return x)) (setq x x1))))))
 (defun gcd (a &optional b) (if (null b) (abs a)
   (let ((a (abs a)) (b (abs b))) (loop (when (zerop b) (return a)) (let ((r (rem a b))) (setq a b) (setq b r))))))
-(defun lcm (a &optional b) (if (null b) (abs a)
-  (if (or (zerop a) (zerop b)) 0 (abs (truncate (* a b) (gcd a b))))))
+(defun lcm (&rest args) (if (null args) 1 (if (null (cdr args)) (abs (car args))
+  (let ((a (car args)) (b (cadr args)))
+    (if (or (zerop a) (zerop b)) 0 (abs (truncate (* a b) (gcd a b))))))))
 
 ;;; Type predicates
 (defun numberp (x) (integerp x))
@@ -1158,9 +1166,39 @@
 (defun compile (name &optional def) nil)  ; stub
 (defun class-of (x) nil)  ; stub
 (defun simple-vector-p (x) (vectorp x))
-(defun nstring-upcase (str &rest args) (string-upcase str))
-(defun nstring-downcase (str &rest args) (string-downcase str))
-(defun nstring-capitalize (str &rest args) (string-capitalize str))
+(defun nstring-upcase (str &rest args)
+  "Destructive upcase — modifies STR in place."
+  (let ((len (array-length str)))
+    (dotimes (i len str)
+      (let ((ch (aref str i)))
+        (when (lower-case-p (code-char ch))
+          (aset str i (- ch 32)))))))
+
+(defun nstring-downcase (str &rest args)
+  "Destructive downcase — modifies STR in place."
+  (let ((len (array-length str)))
+    (dotimes (i len str)
+      (let ((ch (aref str i)))
+        (when (upper-case-p (code-char ch))
+          (aset str i (+ ch 32)))))))
+
+(defun nstring-capitalize (str &rest args)
+  "Destructive capitalize — modifies STR in place."
+  (let ((len (array-length str)))
+    (let ((i 0) (in-word nil))
+      (loop
+        (when (>= i len) (return str))
+        (let ((ch (aref str i)))
+          (if (alphanumericp (code-char ch))
+              (if in-word
+                  (when (upper-case-p (code-char ch))
+                    (aset str i (+ ch 32)))
+                  (progn
+                    (when (lower-case-p (code-char ch))
+                      (aset str i (- ch 32)))
+                    (setq in-word t)))
+              (setq in-word nil)))
+        (setq i (+ i 1))))))
 (defun array-dimension (a n) (if (= n 0) (array-length a) 0))
 (defun array-total-size (a) (array-length a))
 (defun array-rank (a) 1)

@@ -137,11 +137,7 @@
                          (when (and test-str
                                     (not (search "#<" test-str))
                                     (not (search "&ENVIRONMENT" test-str))
-                                    (not (search "STRUCT-TEST-" test-str))
-                                    ;; Skip MV-BIND.7: declare special works but flet
-                                    ;; closures + symbol-value interaction needs more work
-                                    (not (and (symbolp name)
-                                             (string= (symbol-name name) "MULTIPLE-VALUE-BIND.7"))))
+                                    (not (search "STRUCT-TEST-" test-str)))
                            (push test-str test-forms))))))
                   ((and (consp form) (member (car form)
                           '(defharmless def-fold-test def-macro-test

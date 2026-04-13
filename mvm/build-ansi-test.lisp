@@ -44,6 +44,69 @@
 (defun notnot-mv (x) (not (not x)))
 (in-package :cl-user)
 
+;; Helper: extract keyword value from plist-style args
+(defun make-array-kwarg (args key)
+  "Get keyword value from make-array keyword args list."
+  (loop for (k v) on args by #'cddr
+        when (eq k key) return v))
+
+;; Helper: check if element-type is a character type
+(defun char-element-type-p (et)
+  "True if element-type is a character type (character, standard-char, base-char, nil)."
+  (or (null et)   ; bare nil
+      (and (consp et) (eq (car et) 'quote)
+           (member (cadr et) '(character standard-char base-char nil)))))
+
+;; Rewrite make-array with :initial-contents and/or character :element-type
+;; into %make-string-array + aset calls
+(defun rewrite-make-array-initcontents (form)
+  "Walk form tree, converting make-array with :initial-contents or char :element-type
+   into %make-string-array + initialization code."
+  (cond
+    ((atom form) form)
+    ((and (eq (car form) 'make-array)
+          (consp (cdr form))
+          (integerp (cadr form))
+          (cddr form))  ; has keyword args
+     (let* ((size (cadr form))
+            (kwargs (cddr form))
+            (et (make-array-kwarg kwargs :element-type))
+            (contents (make-array-kwarg kwargs :initial-contents))
+            (fill-p (make-array-kwarg kwargs :fill-pointer))
+            (displaced (make-array-kwarg kwargs :displaced-to))
+            (disp-offset (or (make-array-kwarg kwargs :displaced-index-offset) 0))
+            (char-et (char-element-type-p et)))
+       (cond
+         ;; Displaced array: (cons (cons declared-size offset) underlying-string)
+         (displaced
+          (let ((disp-form (rewrite-make-array-initcontents displaced)))
+            `(cons (cons ,size ,disp-offset) ,disp-form)))
+         ;; Fill-pointer: (cons fill-pointer underlying-string)
+         ((and fill-p (stringp contents))
+          `(cons ,fill-p (copy-seq ,contents)))
+         ((and fill-p (integerp contents))
+          ;; fill-pointer with non-string contents — unlikely but handle
+          (mapcar #'rewrite-make-array-initcontents form))
+         ;; :initial-contents is a string literal — copy it as a string
+         ((stringp contents)
+          `(copy-seq ,contents))
+         ;; :initial-contents is a quoted list of characters
+         ((and (consp contents) (eq (car contents) 'quote)
+               (consp (cadr contents)) (characterp (car (cadr contents))))
+          (let* ((chars (cadr contents))
+                 (var (gensym "S"))
+                 (asets (loop for ch in chars for i from 0
+                              collect `(aset ,var ,i ,(char-code ch)))))
+            `(let ((,var (%make-string-array ,size)))
+               ,@asets
+               ,var)))
+         ;; char element-type, no initial-contents — just %make-string-array
+         ((and char-et (not contents))
+          `(%make-string-array ,size))
+         ;; fallback
+         (t (mapcar #'rewrite-make-array-initcontents form)))))
+    (t (mapcar #'rewrite-make-array-initcontents form))))
+
 ;; Rewrite (make-array '(N) ...) → (make-array N ...) for MVM compatibility
 (defun rewrite-make-array-dims (form)
   "Walk form tree, converting list-dimension make-array to integer-dimension."
@@ -99,6 +162,7 @@
             (push (pathname-name file) *ansi-file-names*)
             (setf forms (mapcar #'rewrite-make-array-dims (nreverse forms)))
             (setf forms (mapcar #'rewrite-eval-quote forms))
+            (setf forms (mapcar #'rewrite-make-array-initcontents forms))
             (when (string= file "integer-length.lsp")
               (labels ((rw (f)
                          (cond ((atom f) f)
@@ -120,8 +184,15 @@
               (dolist (form forms)
                 (cond
                   ((and (consp form) (eq (car form) 'deftest))
-                   (let ((name (cadr form)) (test-form (caddr form))
-                         (expected (cdddr form)))
+                   (let* ((rest-after-name (cddr form))
+                          ;; Skip :notes (...) if present
+                          (rest-after-notes
+                           (if (eq (car rest-after-name) :notes)
+                               (cddr rest-after-name)
+                               rest-after-name))
+                          (name (cadr form))
+                          (test-form (car rest-after-notes))
+                          (expected (cdr rest-after-notes)))
                      (setf *ansi-test-counter* (1+ *ansi-test-counter*))
                      (let ((test-id *ansi-test-counter*))
                        (format t "      ~D = ~A~%" test-id name)

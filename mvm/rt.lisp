@@ -46,16 +46,35 @@
       (= (aref a 1) (aref b 1))
       nil))
 
+(defun rt-array-wrapper-p (x)
+  "Check if x is a fill-pointer or displaced array wrapper (cons _ string)."
+  (if (consp x) (if (stringp (cdr x)) t nil) nil))
+
+(defun rt-wrapper-to-string (w)
+  "Convert an array wrapper to a plain string for comparison."
+  (let ((len (if (fixnump (car w))
+                 (car w)
+                 (car (car w))))
+        (offset (if (fixnump (car w)) 0 (cdr (car w)))))
+    (let ((s (%make-string-array len)))
+      (dotimes (i len s)
+        (aset s i (aref (cdr w) (+ offset i)))))))
+
 (defun rt-equal (a b)
   "Structural equality for RT comparisons."
   (if (eql a b)
       t
       (if (consp a)
-          (if (consp b)
-              (if (rt-equal (car a) (car b))
-                  (rt-equal (cdr a) (cdr b))
-                  nil)
-              nil)
+          (if (rt-array-wrapper-p a)
+              ;; Convert wrapper to string for comparison
+              (rt-equal (rt-wrapper-to-string a) b)
+              (if (consp b)
+                  (if (rt-array-wrapper-p b)
+                      (rt-equal a (rt-wrapper-to-string b))
+                      (if (rt-equal (car a) (car b))
+                          (rt-equal (cdr a) (cdr b))
+                          nil))
+                  nil))
           (if (rt-floatp a)
               (if (rt-floatp b)
                   (rt-float-equal a b)
@@ -63,7 +82,11 @@
               (if (stringp a)
                   (if (stringp b)
                       (string-equal a b)
-                      nil)
+                      (if (consp b)
+                          (if (rt-array-wrapper-p b)
+                              (rt-equal a (rt-wrapper-to-string b))
+                              nil)
+                          nil))
                   nil)))))
 
 (defun deftest (id actual expected)

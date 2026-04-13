@@ -579,7 +579,39 @@
 (defun unread-char (ch &rest args) nil)
 (defun read-char (&rest args) nil)
 (defun read-char-no-hang (&rest args) nil)
-(defun read-line (&rest args) (values nil t))
+(defun read-line (&rest args)
+  "Read a line from a string-input-stream. Args: [stream [eof-error-p [eof-value [recursive-p]]]]"
+  (let ((stream (if args (car args) *standard-input*))
+        (eof-error-p (if (cdr args) (cadr args) t))
+        (eof-value (if (cddr args) (caddr args) nil)))
+    ;; Handle special stream designators
+    (when (null stream) (setq stream *standard-input*))
+    (when (eq stream t)
+      (setq stream (two-way-stream-input-stream *terminal-io*)))
+    ;; stream is (cons string position)
+    (if (not (consp stream))
+        (values nil t)
+        (let ((str (car stream))
+              (pos (cdr stream)))
+          (if (>= pos (length str))
+              ;; EOF
+              (if eof-error-p
+                  (values eof-value t)  ;; should signal error but return eof-value
+                  (values eof-value t))
+              ;; Read until newline or end of string
+              (let ((start pos)
+                    (found-newline nil))
+                (loop
+                  (when (>= pos (length str))
+                    (return nil))
+                  (when (char= (elt str pos) #\Newline)
+                    (setq found-newline t)
+                    (return nil))
+                  (setq pos (+ pos 1)))
+                ;; Update stream position
+                (set-cdr stream (if found-newline (+ pos 1) pos))
+                ;; Return the line and eof-p (true if at end and no newline found)
+                (values (subseq str start pos) (not found-newline))))))))
 (defun read-byte (&rest args) nil)
 (defun read-sequence (seq stream &rest args) 0)
 (defun write-sequence (seq stream &rest args) seq)
@@ -594,10 +626,10 @@
 (defun echo-stream-output-stream (s) (cdr s))
 (defun make-synonym-stream (sym) nil)
 (defun synonym-stream-symbol (s) nil)
-(defun make-two-way-stream (in out) nil)
-(defun two-way-stream-input-stream (s) nil)
-(defun two-way-stream-output-stream (s) nil)
-(defun make-string-input-stream (str &rest args) nil)
+(defun make-two-way-stream (in out) (cons in out))
+(defun two-way-stream-input-stream (s) (car s))
+(defun two-way-stream-output-stream (s) (cdr s))
+(defun make-string-input-stream (str &rest args) (cons str 0))
 (defun interactive-stream-p (s) nil)
 
 (defun equalp-impl (a b)
@@ -640,8 +672,8 @@
 (defun substitute-if-not (new pred seq &rest args) (mapcar1 (lambda (item) (if (funcall pred item) item new)) seq))
 (defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
 (defun hash-table-count (ht) (let ((c 0) (cur (car ht))) (loop (when (null cur) (return c)) (setq c (+ c 1)) (setq cur (cdr cur)))))
-(defun maphash (fn ht)
-  "Apply FN to each key-value pair in hash table."
+(defun %maphash-impl (fn ht)
+  "Apply FN to each key-value pair in hash table (function version)."
   (let ((cur (car ht)))
     (loop (when (null cur) (return nil))
       (let ((pair (car cur)))
@@ -1011,7 +1043,9 @@
   (if (consp seq) (set-car (nthcdr idx seq) val)
       (aset seq idx val))
   val)
-(defun set-fill-pointer (vec n) n)  ; stub
+(defun set-fill-pointer (vec n)
+  (when (consp vec) (set-car vec n))
+  n)
 (defun random-fixnum () (random most-positive-fixnum))
 (defun subtypep* (t1 t2) nil)  ; stub
 
@@ -1166,39 +1200,102 @@
 (defun compile (name &optional def) nil)  ; stub
 (defun class-of (x) nil)  ; stub
 (defun simple-vector-p (x) (vectorp x))
-(defun nstring-upcase (str &rest args)
-  "Destructive upcase — modifies STR in place."
-  (let ((len (array-length str)))
-    (dotimes (i len str)
+(defun nstring-parse-start-end (args len)
+  "Parse :start/:end keyword args from ARGS plist. Returns (start . end)."
+  (let ((start 0) (end len))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((key (car cur)) (val (cadr cur)))
+          (if (eq key :start) (setq start val)
+            (if (eq key :end) (when val (setq end val)))))
+        (setq cur (cddr cur))))
+    (cons start end)))
+
+(defun nstring-upcase-raw (str start end)
+  "Internal: upcase chars in STR from START to END."
+  (let ((i start))
+    (loop
+      (when (>= i end) (return str))
       (let ((ch (aref str i)))
         (when (lower-case-p (code-char ch))
-          (aset str i (- ch 32)))))))
+          (aset str i (- ch 32))))
+      (setq i (+ i 1)))))
 
-(defun nstring-downcase (str &rest args)
-  "Destructive downcase — modifies STR in place."
-  (let ((len (array-length str)))
-    (dotimes (i len str)
+(defun nstring-downcase-raw (str start end)
+  "Internal: downcase chars in STR from START to END."
+  (let ((i start))
+    (loop
+      (when (>= i end) (return str))
       (let ((ch (aref str i)))
         (when (upper-case-p (code-char ch))
-          (aset str i (+ ch 32)))))))
+          (aset str i (+ ch 32))))
+      (setq i (+ i 1)))))
+
+(defun nstring-capitalize-raw (str start end)
+  "Internal: capitalize chars in STR from START to END."
+  (let ((i start) (in-word nil))
+    (loop
+      (when (>= i end) (return str))
+      (let ((ch (aref str i)))
+        (if (alphanumericp (code-char ch))
+            (if in-word
+                (when (upper-case-p (code-char ch))
+                  (aset str i (+ ch 32)))
+                (progn
+                  (when (lower-case-p (code-char ch))
+                    (aset str i (- ch 32)))
+                  (setq in-word t)))
+            (setq in-word nil)))
+      (setq i (+ i 1)))))
+
+(defun nstring-upcase (str &rest args)
+  "Destructive upcase — modifies STR in place, with :start/:end support."
+  (if (array-wrapper-p str)
+      (let ((elen (wrapper-effective-length str)))
+        (let ((bounds (nstring-parse-start-end args elen)))
+          (let ((start (car bounds)) (end (cdr bounds)))
+            (if (fp-array-p str)
+                (nstring-upcase-raw (cdr str) start end)
+                (let ((offset (cdr (car str))))
+                  (nstring-upcase-raw (cdr str) (+ offset start) (+ offset end))))))
+        str)
+      (let ((len (array-length str)))
+        (let ((bounds (nstring-parse-start-end args len)))
+          (nstring-upcase-raw str (car bounds) (cdr bounds))
+          str))))
+
+(defun nstring-downcase (str &rest args)
+  "Destructive downcase — modifies STR in place, with :start/:end support."
+  (if (array-wrapper-p str)
+      (let ((elen (wrapper-effective-length str)))
+        (let ((bounds (nstring-parse-start-end args elen)))
+          (let ((start (car bounds)) (end (cdr bounds)))
+            (if (fp-array-p str)
+                (nstring-downcase-raw (cdr str) start end)
+                (let ((offset (cdr (car str))))
+                  (nstring-downcase-raw (cdr str) (+ offset start) (+ offset end))))))
+        str)
+      (let ((len (array-length str)))
+        (let ((bounds (nstring-parse-start-end args len)))
+          (nstring-downcase-raw str (car bounds) (cdr bounds))
+          str))))
 
 (defun nstring-capitalize (str &rest args)
-  "Destructive capitalize — modifies STR in place."
-  (let ((len (array-length str)))
-    (let ((i 0) (in-word nil))
-      (loop
-        (when (>= i len) (return str))
-        (let ((ch (aref str i)))
-          (if (alphanumericp (code-char ch))
-              (if in-word
-                  (when (upper-case-p (code-char ch))
-                    (aset str i (+ ch 32)))
-                  (progn
-                    (when (lower-case-p (code-char ch))
-                      (aset str i (- ch 32)))
-                    (setq in-word t)))
-              (setq in-word nil)))
-        (setq i (+ i 1))))))
+  "Destructive capitalize — modifies STR in place, with :start/:end support."
+  (if (array-wrapper-p str)
+      (let ((elen (wrapper-effective-length str)))
+        (let ((bounds (nstring-parse-start-end args elen)))
+          (let ((start (car bounds)) (end (cdr bounds)))
+            (if (fp-array-p str)
+                (nstring-capitalize-raw (cdr str) start end)
+                (let ((offset (cdr (car str))))
+                  (nstring-capitalize-raw (cdr str) (+ offset start) (+ offset end))))))
+        str)
+      (let ((len (array-length str)))
+        (let ((bounds (nstring-parse-start-end args len)))
+          (nstring-capitalize-raw str (car bounds) (cdr bounds))
+          str))))
 (defun array-dimension (a n) (if (= n 0) (array-length a) 0))
 (defun array-total-size (a) (array-length a))
 (defun array-rank (a) 1)
@@ -1206,10 +1303,47 @@
 (defun row-major-aref (a idx) (aref a idx))
 (defun set-row-major-aref (a idx val) (aset a idx val) val)
 (defun char-type-error-check (fn x) nil)
-(defun copy-seq (seq) (if (consp seq) (copy-list seq)
-  (if (stringp seq)
-      (let ((r (%make-string-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))
-      (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
+(defun fp-array-p (x)
+  "Check if x is a fill-pointer array wrapper (cons fixnum string)."
+  (if (consp x)
+      (if (fixnump (car x))
+          (stringp (cdr x))
+          nil)
+      nil))
+(defun displaced-array-p (x)
+  "Check if x is a displaced array wrapper (cons (cons :displaced offset) string)."
+  (if (consp x)
+      (if (consp (car x))
+          (stringp (cdr x))
+          nil)
+      nil))
+(defun array-wrapper-p (x)
+  "Check if x is a fill-pointer or displaced array wrapper."
+  (if (consp x) (if (stringp (cdr x)) t nil) nil))
+(defun wrapper-effective-length (w)
+  "Get effective length of a fill-pointer or displaced array wrapper."
+  (if (fixnump (car w))
+      (car w)   ; fill-pointer
+      (car (car w))))
+(defun wrapper-offset (w)
+  "Get offset for displaced array wrapper, 0 for fill-pointer."
+  (if (fixnump (car w)) 0 (cdr (car w))))
+(defun wrapper-aref (w i)
+  "AREF on a fill-pointer or displaced array wrapper."
+  (aref (cdr w) (+ (wrapper-offset w) i)))
+(defun wrapper-aset (w i val)
+  "ASET on a fill-pointer or displaced array wrapper."
+  (aset (cdr w) (+ (wrapper-offset w) i) val))
+(defun copy-seq (seq)
+  (if (consp seq)
+      (if (array-wrapper-p seq)
+          (let ((len (wrapper-effective-length seq)))
+            (let ((r (%make-string-array len)))
+              (dotimes (i len r) (aset r i (wrapper-aref seq i)))))
+          (copy-list seq))
+      (if (stringp seq)
+          (let ((r (%make-string-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))
+          (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
 (defun sqrt (n) (isqrt n))  ; integer sqrt stub
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start end val) seq)  ; stub
@@ -1229,7 +1363,8 @@
 (defun char (str idx) (code-char (aref str idx)))
 (defun symbol-plist (sym) nil)
 (defun fboundp (sym) nil)  ; stub
-(defun fill-pointer (vec) (length vec))  ; stub
+(defun fill-pointer (vec)
+  (if (consp vec) (car vec) (length vec)))
 (defun bit-vector-p (x) nil)  ; stub
 (defun simple-string-p (x) (stringp x))
 (defun simple-bit-vector-p (x) nil)

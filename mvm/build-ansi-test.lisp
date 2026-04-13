@@ -44,6 +44,38 @@
 (defun notnot-mv (x) (not (not x)))
 (in-package :cl-user)
 
+;; Create SBCL-side packages that ANSI test files reference
+;; (needed so SBCL's reader can resolve qualified symbols like DS1:A)
+(ignore-errors (delete-package "FS-A"))
+(ignore-errors (delete-package "FS-B"))
+(ignore-errors (delete-package "FS-Q"))
+(ignore-errors (delete-package "DS4"))
+(ignore-errors (delete-package "DS3"))
+(ignore-errors (delete-package "DS2"))
+(ignore-errors (delete-package "DS1"))
+(ignore-errors (delete-package "A"))
+(ignore-errors (delete-package "B"))
+(ignore-errors (delete-package "Q"))
+(ignore-errors (delete-package "CL-TEST"))
+(defpackage "A" (:use) (:nicknames "Q") (:export "FOO"))
+(defpackage "B" (:use "A") (:export "BAR"))
+(defpackage "FS-A" (:use) (:nicknames "FS-Q") (:export "FOO"))
+(defpackage "FS-B" (:use "FS-A") (:export "BAR"))
+(defpackage "DS1" (:use) (:intern "C" "D") (:export "A" "B"))
+(defpackage "DS2" (:use) (:intern "E" "F") (:export "G" "H" "A"))
+(defpackage "DS3"
+  (:shadow "B")
+  (:shadowing-import-from "DS1" "A")
+  (:use "DS1" "DS2")
+  (:export "A" "B" "G" "I" "J" "K")
+  (:intern "L" "M"))
+(defpackage "DS4"
+  (:shadowing-import-from "DS1" "B")
+  (:use "DS1" "DS3")
+  (:intern "X" "Y" "Z")
+  (:import-from "DS2" "F"))
+(defpackage "CL-TEST" (:use "CL"))
+
 ;; Helper: extract keyword value from plist-style args
 (defun make-array-kwarg (args key)
   "Get keyword value from make-array keyword args list."
@@ -140,6 +172,122 @@
      (rewrite-eval-quote (cadr (cadr form))))
     (t (mapcar #'rewrite-eval-quote form))))
 
+;; Convert SBCL symbols/keywords used as package designators to strings
+;; so MVM can handle them (MVM symbols are name-hashes, not printable)
+(defun %stringify-pkg-designator (x)
+  "Convert a keyword or symbol package designator to a string."
+  (cond
+    ((stringp x) x)
+    ((characterp x) (string x))
+    ((keywordp x) (symbol-name x))
+    ((symbolp x) (symbol-name x))
+    (t x)))
+
+;; Rewrite do-symbols/do-external-symbols/do-all-symbols/with-package-iterator
+;; These are macros in CL that SBCL expands to SBCL-internal code.
+;; We rewrite them into loop-based iteration that supports RETURN.
+(defvar *pkg-iter-counter* 0)
+
+(defun rewrite-package-iteration (form)
+  "Walk form tree, converting do-symbols/do-external-symbols/do-all-symbols
+   and with-package-iterator into MVM-compatible forms."
+  (cond
+    ((atom form) form)
+    ;; (do-symbols (var pkg result) body...)
+    ;; → collect symbols, then iterate with block nil for return support
+    ((and (eq (car form) 'do-symbols) (consp (cdr form)) (consp (cadr form)))
+     (incf *pkg-iter-counter*)
+     (let* ((binding (cadr form))
+            (var (first binding))
+            (pkg (if (second binding) (rewrite-package-iteration (second binding)) '*package*))
+            (result (if (cddr binding) (rewrite-package-iteration (third binding)) 'nil))
+            (body (mapcar #'rewrite-package-iteration (cddr form)))
+            (real-body (remove-if (lambda (f) (and (consp f) (eq (car f) 'declare))) body))
+            (syms-var (intern (format nil "%PKG-SYMS~D" *pkg-iter-counter*)))
+            (cur-var (intern (format nil "%PKG-CUR~D" *pkg-iter-counter*))))
+       `(let ((,syms-var nil))
+          (%do-symbols-fn (lambda (,var) (setq ,syms-var (cons ,var ,syms-var))) ,pkg)
+          (let ((,cur-var ,syms-var))
+            (block nil
+              (loop
+                (when (null ,cur-var) (return ,result))
+                (let ((,var (car ,cur-var)))
+                  ,@real-body)
+                (setq ,cur-var (cdr ,cur-var))))))))
+    ;; (do-external-symbols (var pkg result) body...)
+    ((and (eq (car form) 'do-external-symbols) (consp (cdr form)) (consp (cadr form)))
+     (incf *pkg-iter-counter*)
+     (let* ((binding (cadr form))
+            (var (first binding))
+            (pkg (if (second binding) (rewrite-package-iteration (second binding)) '*package*))
+            (result (if (cddr binding) (rewrite-package-iteration (third binding)) 'nil))
+            (body (mapcar #'rewrite-package-iteration (cddr form)))
+            (real-body (remove-if (lambda (f) (and (consp f) (eq (car f) 'declare))) body))
+            (syms-var (intern (format nil "%PKG-ESYMS~D" *pkg-iter-counter*)))
+            (cur-var (intern (format nil "%PKG-ECUR~D" *pkg-iter-counter*))))
+       `(let ((,syms-var nil))
+          (%do-external-symbols-fn (lambda (,var) (setq ,syms-var (cons ,var ,syms-var))) ,pkg)
+          (let ((,cur-var ,syms-var))
+            (block nil
+              (loop
+                (when (null ,cur-var) (return ,result))
+                (let ((,var (car ,cur-var)))
+                  ,@real-body)
+                (setq ,cur-var (cdr ,cur-var))))))))
+    ;; (do-all-symbols (var result) body...)
+    ((and (eq (car form) 'do-all-symbols) (consp (cdr form)) (consp (cadr form)))
+     (incf *pkg-iter-counter*)
+     (let* ((binding (cadr form))
+            (var (first binding))
+            (result (if (cdr binding) (rewrite-package-iteration (second binding)) 'nil))
+            (body (mapcar #'rewrite-package-iteration (cddr form)))
+            (real-body (remove-if (lambda (f) (and (consp f) (eq (car f) 'declare))) body))
+            (syms-var (intern (format nil "%PKG-ASYMS~D" *pkg-iter-counter*)))
+            (cur-var (intern (format nil "%PKG-ACUR~D" *pkg-iter-counter*))))
+       `(let ((,syms-var nil))
+          (%do-all-symbols-fn (lambda (,var) (setq ,syms-var (cons ,var ,syms-var))))
+          (let ((,cur-var ,syms-var))
+            (block nil
+              (loop
+                (when (null ,cur-var) (return ,result))
+                (let ((,var (car ,cur-var)))
+                  ,@real-body)
+                (setq ,cur-var (cdr ,cur-var))))))))
+    ;; (with-package-iterator ...) — stub: just return 0
+    ((eq (car form) 'with-package-iterator)
+     0)
+    ;; (defpackage name option...) → (%defpackage-impl name '(option...))
+    ;; Options are bare lists like (:use) that would be evaluated as forms.
+    ;; Convert to a single quoted list of options.
+    ((and (eq (car form) 'defpackage) (cdr form))
+     (let ((name (rewrite-package-iteration (%stringify-pkg-designator (cadr form))))
+           (options (cddr form)))
+       `(%defpackage-impl ,name (quote ,options))))
+    ;; Package functions with keyword/symbol designator args → stringify
+    ((and (member (car form) '(make-package find-package delete-package
+                               safely-delete-package rename-package
+                               intern find-symbol use-package unuse-package
+                               in-package export unexport import unintern
+                               shadow shadowing-import
+                               package-name package-nicknames
+                               package-use-list package-used-by-list
+                               package-shadowing-symbols))
+          (cdr form)
+          (or (keywordp (cadr form)) (and (symbolp (cadr form)) (not (member (cadr form) '(nil t p sym pkg s))))))
+     (let ((str-arg (%stringify-pkg-designator (cadr form))))
+       `(,(car form) ,str-arg ,@(mapcar #'rewrite-package-iteration (cddr form)))))
+    ;; (ignore-errors form) → (handler-case form (error (c) nil))
+    ((and (eq (car form) 'ignore-errors) (cdr form))
+     (let ((body (rewrite-package-iteration (cadr form))))
+       `(handler-case ,body (error (c) nil))))
+    ;; (report-and-ignore-errors form) → form (ignore errors)
+    ((eq (car form) 'report-and-ignore-errors)
+     (rewrite-package-iteration (cadr form)))
+    ;; (return-from block-name value) - need to rewrite body
+    ((eq (car form) 'return-from)
+     `(return-from ,(cadr form) ,@(mapcar #'rewrite-package-iteration (cddr form))))
+    (t (mapcar #'rewrite-package-iteration form))))
+
 ;; Load real ANSI test files (if available)
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
@@ -160,7 +308,8 @@
                         (when (eq form :eof) (return))
                         (push form forms)))))
             (push (pathname-name file) *ansi-file-names*)
-            (setf forms (mapcar #'rewrite-make-array-dims (nreverse forms)))
+            (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
+            (setf forms (mapcar #'rewrite-make-array-dims forms))
             (setf forms (mapcar #'rewrite-eval-quote forms))
             (setf forms (mapcar #'rewrite-make-array-initcontents forms))
             (when (string= file "integer-length.lsp")
@@ -440,6 +589,9 @@
 
   ;; Initialize runtime
   (init-symbol-table)
+
+  ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
+  (%init-packages)
 
   ;; Init RT counters manually (init-all-globals not safe — some thunks
   ;; reference functions/symbols that may not be available yet)

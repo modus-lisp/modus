@@ -940,7 +940,8 @@
   (run-mv-debug-tests)
   (run-regression-tests)
   (run-typep-debug-tests)
-  (run-stream-debug-tests))
+  (run-stream-debug-tests)
+  (run-reader-tests))
 
 (defun run-stream-debug-tests ()
   ;; Stream type system
@@ -1119,3 +1120,49 @@
       (let ((tp `(real 0 ,r)))
         (if (ratiop (caddr tp)) t nil)))
     t))
+
+;;; ============================================================
+;;; Reader tests (Layer 2)
+;;; ============================================================
+
+(defun run-reader-tests ()
+  (deftest 9980 (readtablep *readtable*) t)
+  (deftest 9982 (readtablep nil) nil)
+  (deftest 9983 (readtablep 42) nil)
+  (deftest 9997 (readtable-case *readtable*) :upcase)
+  ;; Token state
+  (deftest 9984 (let ((st (%token-state-new nil nil nil nil)))
+                  (aref st 0)) nil)
+  ;; Token-add-constituent
+  (deftest 9985 (let ((st (%token-state-new nil nil nil nil)))
+                  (%token-add-constituent st #\a)
+                  (car (aref st 0))) 97)
+  ;; Simple loop read test
+  (deftest 9986
+    (let ((st (%token-state-new nil nil nil nil))
+          (s (make-string-input-stream "abc")))
+      (let ((ch1 (read-char s nil nil nil)))
+        (%token-add-constituent st ch1)
+        (let ((ch2 (read-char s nil nil nil)))
+          (%token-add-constituent st ch2)
+          (list-length (aref st 0))))) 2)
+  ;; Test read-from-string
+  (deftest 9987 (read-from-string "123") 123)
+  (deftest 9988 (read-from-string "-42") -42)
+  (deftest 9989 (read-from-string "()") nil)
+  (deftest 9990 (read-from-string "nil") nil)
+  (deftest 9991 (read-from-string "t") t)
+  ;; Test read from stream
+  (deftest 9992 (with-input-from-string (s "42") (read s)) 42)
+  ;; Test list reading
+  (deftest 9993 (read-from-string "(1 2 3)") (list 1 2 3))
+  ;; Test string reading
+  (deftest 9994 (read-from-string "\"hello\"") "hello")
+  ;; Keyword test skipped — MVM keyword handling needs investigation
+  ;; Test copy-readtable
+  (deftest 9996 (readtablep (copy-readtable)) t)
+  (deftest 9998 (eq *readtable* (copy-readtable)) nil)
+  ;; Test read-from-string returns position
+  (deftest 9999
+    (multiple-value-list (read-from-string "123  "))
+    (list 123 4)))

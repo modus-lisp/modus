@@ -296,9 +296,43 @@ For code that genuinely needs cross-actor mutation:
 ```
 
 Explicit, not hidden behind locks. The programmer knows they're 
-crossing the isolation boundary. Rare in practice — most "shared" 
-data is better modeled as an actor that owns the data and responds 
-to messages.
+crossing the isolation boundary.
+
+### Shared Data Structures as Actors
+
+Rare in practice — most "shared" data is better modeled as an actor 
+that owns the data and responds to messages:
+
+```lisp
+(defvar *db* (make-shared-hash-table))
+
+;; Look like normal hash table operations:
+(shared-gethash key *db*)           
+(shared-puthash key value *db*)     
+
+;; Under the hood: message send + receive
+;;   (send db-actor `(:get ,key))
+;;   (receive) → value
+```
+
+Linearizable, no locks, no CAS, no concurrent GC. The hash table 
+actor owns the data, processes requests in order.
+
+Batched operations for hot paths:
+```lisp
+(with-shared-hash-table (ht *db*)
+  ;; One message round-trip for the whole block:
+  (let ((x (gethash :foo ht))
+        (y (gethash :bar ht)))
+    (setf (gethash :baz ht) (+ x y))))
+```
+
+Transactions for free — the block executes atomically on the 
+owning actor. No partial updates visible to other actors.
+
+Generalizes: shared counter, shared queue, shared config, connection 
+pool — any shared data structure is just an actor with a protocol.
+No new primitives. Actors all the way down.
 
 ## Self-Improvement Architecture
 

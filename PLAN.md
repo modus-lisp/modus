@@ -44,6 +44,18 @@ Translators (bytecode → native):     Boot stubs (OS interface):
 New OS target = one boot stub (~200 lines mapping mmap/read/write/exit).
 Cross-compilation = pick a different translator + boot stub. Zero runtime dispatch.
 
+WASM target (tentative — here be dragons):
+```
+translate-wasm.lisp        —    MVM bytecode → WASM bytecode
+boot-wasm.lisp             —    WASI imports for I/O (or JS FFI)
+```
+MVM registers → WASM locals. Heap → linear memory. CALL → call_indirect.
+Main challenge: WASM requires structured control flow (block/loop/br,
+no arbitrary goto). MVM branches need relooper-style restructuring.
+No register allocation needed (stack machine). i64 gives us 63-bit fixnums.
+Unlocks: browser REPL, edge compute, universal distribution, sandboxed
+self-modification via runtime module compilation.
+
 ### Package-Based Module System
 
 Arch-specific code composes via packages, resolved at build time:

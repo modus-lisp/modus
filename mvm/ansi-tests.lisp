@@ -802,7 +802,7 @@
                 (cons 0 (cons 1 (cons 2 (cons 3 nil))))))
 
 (defun run-equal-fix-tests ()
-  ;; equal now works via macro expansion to equalp-impl
+  ;; equal is a normal function call (structural equality, not pointer eq)
   (deftest 2500 (equal 1 1) t)
   (deftest 2501 (equal (cons 1 2) (cons 1 2)) t)
   (deftest 2502 (equal (cons 1 (cons 2 nil)) (cons 1 (cons 2 nil))) t)
@@ -934,4 +934,111 @@
   (run-iteration-tests)
   (run-equal-fix-tests)
   (run-mv-debug-tests)
-  (run-regression-tests))
+  (run-regression-tests)
+  (run-typep-debug-tests))
+
+(defun run-typep-debug-tests ()
+  ;; Basic typep tests
+  (deftest 9901 (typep 5 'integer) t)
+  (deftest 9902 (typep 5 'real) t)
+  (deftest 9903 (if (typep 5 (list 'real 0 10)) t nil) t)
+  (deftest 9904 (if (typep -1 (list 'real 0 10)) t nil) nil)
+  (deftest 9905 (if (typep 0 (list 'real 0 10)) t nil) t)
+  (deftest 9906 (if (typep 10 (list 'real 0 10)) t nil) t)
+  (deftest 9907 (if (typep 11 (list 'real 0 10)) t nil) nil)
+  ;; Float typep tests
+  (deftest 9910 (realp 0.0) t)
+  (deftest 9911 (if (typep 0.0001 (list 'real 0 10)) t nil) t)
+  (deftest 9912 (if (typep -0.0001 (list 'real 0 10)) t nil) nil)
+  ;; Ratio tests
+  (deftest 9920 (ratiop (exact-divide 4 3)) t)
+  (deftest 9921 (ratiop (exact-divide 6 3)) nil)
+  (deftest 9922 (exact-divide 6 3) 2)
+  ;; Make-string test
+  (deftest 9930 (stringp (make-string 0)) t)
+  (deftest 9931 (length (make-string 0)) 0)
+  ;; Make-string with element-type nil
+  (deftest 9932 (stringp (make-string 0 :element-type nil)) t)
+  (deftest 9933 (length (make-string 0 :element-type nil)) 0)
+  ;; Backquote type test — mirror REAL.1 first iteration
+  (deftest 9940
+    (let ((tp (list 'real 0 1)))
+      (if (and (not (typep -1 tp))
+               (typep 0 tp)
+               (typep 1 tp)
+               (not (typep 2 tp)))
+          t nil))
+    t)
+  ;; REAL.1-like loop (reduced) with (list ...)
+  (deftest 9941
+    (loop for i = 1 then (ash i 1)
+          for tp = (list 'real 0 i)
+          repeat 5
+          unless (and (not (typep -1 tp))
+                      (typep 0 tp)
+                      (typep 1 tp)
+                      (typep i tp)
+                      (not (typep (+ i 1) tp)))
+          collect i)
+    nil)
+  ;; Same but with backquote
+  (deftest 9942
+    (loop for i = 1 then (ash i 1)
+          for tp = `(real 0 ,i)
+          repeat 5
+          unless (and (not (typep -1 tp))
+                      (typep 0 tp)
+                      (typep 1 tp)
+                      (typep i tp)
+                      (not (typep (+ i 1) tp)))
+          collect i)
+    nil)
+  ;; Full REAL.1 replica with floats
+  (deftest 9943
+    (loop for i = 1 then (ash i 1)
+          for tp = `(real 0 ,i)
+          repeat 5
+          unless (and (not (typep -1 tp))
+                      (not (typep -0.0001 tp))
+                      (typep 0 tp)
+                      (typep 0.0001 tp)
+                      (typep 1 tp)
+                      (typep i tp)
+                      (not (typep (generic-1+ i) tp)))
+          collect (list i tp))
+    nil)
+  ;; Simple float typep test
+  (deftest 9944 (if (typep -0.0001 (list 'real 0 1)) t nil) nil)
+  (deftest 9945 (if (typep 0.0001 (list 'real 0 1)) t nil) t)
+  ;; Test numeric-<= with floats
+  (deftest 9946 (if (numeric-<= 0 0.0001) t nil) t)
+  (deftest 9947 (if (numeric-<= -0.0001 0) t nil) t)
+  (deftest 9948 (if (numeric-<= 0.0001 1) t nil) t)
+  ;; Debug: check floatp and float-negative on -0.0001
+  (deftest 9949 (if (floatp-impl -0.0001) t nil) t)
+  (deftest 9950 (if (float-negative-p -0.0001) t nil) t)
+  (deftest 9951 (if (numeric-value-less-p -0.0001 0) t nil) t)
+  ;; Direct test of or
+  (deftest 9952 (if (or nil t) t nil) t)
+  ;; Check numeric-equal-p
+  (deftest 9953 (if (numeric-equal-p -0.0001 0) t nil) nil)
+  ;; Debug: what is (aref -0.0001 0)?
+  (deftest 9954 (aref -0.0001 0) 3206166242)
+  ;; Check >= threshold directly
+  (deftest 9955 (if (>= 3206166242 2147483648) t nil) t)
+  ;; Check via variable
+  (deftest 9956 (let ((h (aref -0.0001 0))) (if (>= h 2147483648) t nil)) t)
+  ;; What does aref actually return?
+  (deftest 9957 (let ((h (aref -0.0001 0))) (if (> h 0) 1 (if (= h 0) 0 -1))) 1)
+  (deftest 9958 (let ((h (aref -0.0001 0))) (if (> h 1000000000) 1 0)) 1)
+  (deftest 9959 (let ((h (aref -0.0001 0))) (if (> h 2000000000) 1 0)) 1)
+  (deftest 9960 (let ((h (aref -0.0001 0))) (if (> h 3000000000) 1 0)) 1)
+  (deftest 9961 (let ((h (aref -0.0001 0))) (if (> h 4000000000) 1 0)) 0)
+  ;; Negative check
+  (deftest 9962 (let ((h (aref -0.0001 0))) (if (< h 0) 1 0)) 1)
+  (deftest 9963 (let ((h (aref -0.0001 0))) (if (< h -1000000000) 1 0)) 1)
+  (deftest 9964 (let ((h (aref -0.0001 0))) (if (< h -3000000000) 1 0)) 1)
+  (deftest 9965 (let ((h (aref -0.0001 0))) (if (< h -4000000000) 1 0)) 0)
+  ;; Positive float check
+  (deftest 9966 (let ((h (aref 0.0001 0))) (if (> h 0) 1 0)) 1)
+  (deftest 9967 (let ((h (aref 0.0001 0))) (if (> h 1000000000) 1 0)) 1))

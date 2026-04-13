@@ -908,14 +908,6 @@
       (let ((ch (aref str i)))
         (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))))))
 
-(defun %capitalize-char (ch in-word)
-  "Return (new-ch . new-in-word) for string-capitalize."
-  (if (alphanumericp (code-char ch))
-      (if in-word
-          (cons (if (upper-case-p (code-char ch)) (+ ch 32) ch) t)
-          (cons (if (lower-case-p (code-char ch)) (- ch 32) ch) t))
-      (cons ch nil)))
-
 (defun string-capitalize (str)
   "Capitalize first letter of each word."
   (let ((len (array-length str))
@@ -923,9 +915,14 @@
     (let ((i 0) (in-word nil))
       (loop
         (when (>= i len) (return result))
-        (let ((pair (%capitalize-char (aref str i) in-word)))
-          (aset result i (car pair))
-          (setq in-word (cdr pair)))
+        (let ((ch (aref str i)))
+          (if (alphanumericp (code-char ch))
+              (if in-word
+                  (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))
+                  (progn
+                    (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))
+                    (setq in-word t)))
+              (progn (aset result i ch) (setq in-word nil))))
         (setq i (+ i 1))))))
 
 (defun string-not-equal (a b) (not (string-equal a b)))

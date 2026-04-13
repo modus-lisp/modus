@@ -4217,20 +4217,29 @@
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
   ;; &rest transformation: if the target function has &rest, cons up extra args
+  ;; &optional padding: if fewer args than params, pad with NIL
   (when (and (symbolp fn) (boundp '*functions*) *functions*)
     (let* ((fn-name (symbol-name fn))
            (fn-info (gethash fn-name *functions*)))
-      (when (and fn-info (function-info-rest-param-p fn-info))
-        (let ((req (function-info-required-count fn-info))
-              (nargs (length args)))
-          (when (>= nargs req)
-            (let ((required-args (subseq args 0 req))
-                  (rest-args (nthcdr req args)))
-              ;; Build (cons a (cons b ... nil)) form for rest args
-              (let ((rest-form nil))
-                (dolist (a (reverse rest-args))
-                  (setf rest-form `(cons ,a ,rest-form)))
-                (setf args (append required-args (list rest-form))))))))))
+      (when fn-info
+        (cond
+          ((function-info-rest-param-p fn-info)
+           (let ((req (function-info-required-count fn-info))
+                 (nargs (length args)))
+             (when (>= nargs req)
+               (let ((required-args (subseq args 0 req))
+                     (rest-args (nthcdr req args)))
+                 ;; Build (cons a (cons b ... nil)) form for rest args
+                 (let ((rest-form nil))
+                   (dolist (a (reverse rest-args))
+                     (setf rest-form `(cons ,a ,rest-form)))
+                   (setf args (append required-args (list rest-form))))))))
+          (t
+           ;; Pad with NIL for missing &optional parameters
+           (let ((param-count (function-info-param-count fn-info))
+                 (nargs (length args)))
+             (when (< nargs param-count)
+               (setf args (append args (make-list (- param-count nargs)))))))))))
   (let ((nargs (length args))
         ;; Save the current temp count BEFORE arg evaluation.
         ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).

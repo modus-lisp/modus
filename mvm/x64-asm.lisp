@@ -347,7 +347,8 @@
 ;;; Shifts
 
 (defun emit-shl-reg-imm (buf reg count)
-  (emit-rex-if-needed buf reg nil)
+  ;; SHL r/m, imm8: register is in r/m field, so REX.B extends it (not REX.R)
+  (emit-rex-if-needed buf nil reg)
   (if (= count 1)
       (progn
         (emit-byte buf #xD1)
@@ -358,7 +359,8 @@
         (emit-byte buf count))))
 
 (defun emit-shr-reg-imm (buf reg count)
-  (emit-rex-if-needed buf reg nil)
+  ;; SHR r/m, imm8: register is in r/m field, so REX.B extends it (not REX.R)
+  (emit-rex-if-needed buf nil reg)
   (if (= count 1)
       (progn
         (emit-byte buf #xD1)
@@ -369,7 +371,8 @@
         (emit-byte buf count))))
 
 (defun emit-sar-reg-imm (buf reg count)
-  (emit-rex-if-needed buf reg nil)
+  ;; SAR r/m, imm8: register is in r/m field, so REX.B extends it (not REX.R)
+  (emit-rex-if-needed buf nil reg)
   (if (= count 1)
       (progn
         (emit-byte buf #xD1)
@@ -381,19 +384,22 @@
 
 (defun emit-shl-reg-cl (buf reg)
   "SHL reg, CL — shift left by count in CL register."
-  (emit-rex-if-needed buf reg nil)
+  ;; Register is in r/m field, so REX.B extends it
+  (emit-rex-if-needed buf nil reg)
   (emit-byte buf #xD3)
   (emit-byte buf (modrm #b11 4 (reg-code reg))))
 
 (defun emit-shr-reg-cl (buf reg)
   "SHR reg, CL — logical shift right by count in CL register."
-  (emit-rex-if-needed buf reg nil)
+  ;; Register is in r/m field, so REX.B extends it
+  (emit-rex-if-needed buf nil reg)
   (emit-byte buf #xD3)
   (emit-byte buf (modrm #b11 5 (reg-code reg))))
 
 (defun emit-sar-reg-cl (buf reg)
   "SAR reg, CL — arithmetic shift right by count in CL register."
-  (emit-rex-if-needed buf reg nil)
+  ;; Register is in r/m field, so REX.B extends it
+  (emit-rex-if-needed buf nil reg)
   (emit-byte buf #xD3)
   (emit-byte buf (modrm #b11 7 (reg-code reg))))
 

@@ -4441,6 +4441,189 @@
 (defun simple-vector-p (x) (vectorp x))
 
 ;;; ===================================================
+;;; Sequence Search Functions (find, search, position-if, etc.)
+;;; ===================================================
+
+(defun find (item sequence &rest args)
+  "Return the first element of SEQUENCE that matches ITEM."
+  (let ((test #'eql) (key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :test) (setq test v))
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (if (listp sequence)
+        ;; List path
+        (let ((lst sequence) (i 0) (result nil))
+          ;; Skip to start
+          (loop
+            (when (or (null lst) (= i start)) (return nil))
+            (setq lst (cdr lst))
+            (setq i (+ i 1)))
+          ;; Search
+          (loop
+            (when (null lst) (return result))
+            (when (and end (= i end)) (return result))
+            (let ((elem (car lst)))
+              (let ((test-val (if key (funcall key elem) elem)))
+                (when (funcall test item test-val)
+                  (if from-end
+                      (setq result elem)
+                      (return elem)))))
+            (setq lst (cdr lst))
+            (setq i (+ i 1))))
+        ;; Vector path
+        (let ((len (length sequence))
+              (result nil))
+          (when (null end) (setq end len))
+          (let ((i start))
+            (loop
+              (when (= i end) (return result))
+              (let ((elem (aref sequence i)))
+                (let ((test-val (if key (funcall key elem) elem)))
+                  (when (funcall test item test-val)
+                    (if from-end
+                        (setq result elem)
+                        (return elem)))))
+              (setq i (+ i 1))))))))
+
+(defun find-if (predicate sequence &rest args)
+  "Return the first element of SEQUENCE satisfying PREDICATE."
+  (let ((key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (if (listp sequence)
+        (let ((lst sequence) (i 0) (result nil))
+          (loop
+            (when (or (null lst) (= i start)) (return nil))
+            (setq lst (cdr lst))
+            (setq i (+ i 1)))
+          (loop
+            (when (null lst) (return result))
+            (when (and end (= i end)) (return result))
+            (let ((elem (car lst)))
+              (let ((test-val (if key (funcall key elem) elem)))
+                (when (funcall predicate test-val)
+                  (if from-end (setq result elem) (return elem)))))
+            (setq lst (cdr lst))
+            (setq i (+ i 1))))
+        (let ((len (length sequence)) (result nil))
+          (when (null end) (setq end len))
+          (let ((i start))
+            (loop
+              (when (= i end) (return result))
+              (let ((elem (aref sequence i)))
+                (let ((test-val (if key (funcall key elem) elem)))
+                  (when (funcall predicate test-val)
+                    (if from-end (setq result elem) (return elem)))))
+              (setq i (+ i 1))))))))
+
+(defun find-if-not (predicate sequence &rest args)
+  "Return the first element of SEQUENCE not satisfying PREDICATE."
+  (apply #'find-if (lambda (x) (not (funcall predicate x))) sequence args))
+
+(defun position-if (predicate sequence &rest args)
+  "Return the index of first element satisfying PREDICATE."
+  (let ((key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (if (listp sequence)
+        (let ((lst sequence) (i 0) (result nil))
+          (loop
+            (when (or (null lst) (= i start)) (return nil))
+            (setq lst (cdr lst))
+            (setq i (+ i 1)))
+          (loop
+            (when (null lst) (return result))
+            (when (and end (= i end)) (return result))
+            (let ((elem (car lst)))
+              (let ((test-val (if key (funcall key elem) elem)))
+                (when (funcall predicate test-val)
+                  (if from-end (setq result i) (return i)))))
+            (setq lst (cdr lst))
+            (setq i (+ i 1))))
+        (let ((len (length sequence)) (result nil))
+          (when (null end) (setq end len))
+          (let ((i start))
+            (loop
+              (when (= i end) (return result))
+              (let ((elem (aref sequence i)))
+                (let ((test-val (if key (funcall key elem) elem)))
+                  (when (funcall predicate test-val)
+                    (if from-end (setq result i) (return i)))))
+              (setq i (+ i 1))))))))
+
+(defun position-if-not (predicate sequence &rest args)
+  "Return the index of first element not satisfying PREDICATE."
+  (apply #'position-if (lambda (x) (not (funcall predicate x))) sequence args))
+
+(defun search (seq1 seq2 &rest args)
+  "Search for SEQ1 as a subsequence of SEQ2. Return index or nil."
+  (let ((test #'eql) (key nil) (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :test) (setq test v))
+            ((eq k :key) (setq key v))
+            ((eq k :start1) (setq start1 v))
+            ((eq k :end1) (setq end1 v))
+            ((eq k :start2) (setq start2 v))
+            ((eq k :end2) (setq end2 v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    ;; Convert to vectors for simpler indexing
+    (let ((s1 (if (stringp seq1) seq1 (coerce seq1 'vector)))
+          (s2 (if (stringp seq2) seq2 (coerce seq2 'vector))))
+      (when (null end1) (setq end1 (length s1)))
+      (when (null end2) (setq end2 (length s2)))
+      (let ((len1 (- end1 start1))
+            (result nil))
+        (let ((i start2))
+          (loop
+            (when (> (+ i len1) end2) (return result))
+            ;; Check if s1[start1..end1) matches s2[i..i+len1)
+            (let ((match t) (j 0))
+              (loop
+                (when (= j len1) (return nil))
+                (let ((e1 (aref s1 (+ start1 j)))
+                      (e2 (aref s2 (+ i j))))
+                  (let ((v1 (if key (funcall key e1) e1))
+                        (v2 (if key (funcall key e2) e2)))
+                    (unless (funcall test v1 v2)
+                      (setq match nil)
+                      (return nil))))
+                (setq j (+ j 1)))
+              (when match
+                (if from-end
+                    (setq result i)
+                    (return i))))
+            (setq i (+ i 1))))))))
+
+;;; ===================================================
 ;;; Minimal CLOS implementation for ANSI test suite
 ;;; ===================================================
 

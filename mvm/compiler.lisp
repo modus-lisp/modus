@@ -1914,6 +1914,212 @@
                    (setq remaining rest))))))
 
 ;;; ============================================================
+;;; Mutable Closure Support: Cell Boxing
+;;; ============================================================
+;;;
+;;; When a variable is bound in a LET and then mutated (via SETQ) inside
+;;; a nested LAMBDA, the mutation must be visible through the closure.
+;;; The standard solution: box the variable into a cons cell so both the
+;;; enclosing scope and the lambda share a pointer to the same cell.
+;;;
+;;;   (let ((x 0)) (lambda () (setq x (+ x 1)) x))
+;;; becomes:
+;;;   (let ((%cell-x (cons 0 nil)))
+;;;     (lambda () (setcar %cell-x (+ (car %cell-x) 1)) (car %cell-x)))
+;;;
+;;; Only variables that are BOTH captured in a lambda AND mutated need boxing.
+
+(defun name-equal (a b)
+  "Compare two variable names for equality. Handles symbols, strings, and integers."
+  (cond ((and (symbolp a) (symbolp b)) (eq a b))
+        ((and (stringp a) (stringp b)) (string= a b))
+        ((and (integerp a) (integerp b)) (= a b))
+        ((and (symbolp a) (stringp b)) (string= (symbol-name a) b))
+        ((and (stringp a) (symbolp b)) (string= a (symbol-name b)))
+        (t nil)))
+
+(defun mutation-op-p (op)
+  "Return T if OP is a mutation operator (setq, incf, decf, setf)."
+  (when (symbolp op)
+    (let ((n (symbol-name op)))
+      (or (string= n "SETQ") (string= n "SETF")
+          (string= n "INCF") (string= n "DECF"))))
+  ;; Also handle pre-hashed integer ops
+  )
+
+(defun collect-setq-vars-in-body (form bound-vars)
+  "Return list of variables (from BOUND-VARS) that are mutated anywhere in FORM
+   (via setq/incf/decf), including inside lambdas. BOUND-VARS is a list of variable
+   names to watch for."
+  (cond
+    ((not (consp form)) nil)
+    ;; (setq var val), (incf var ...), (decf var ...) — var is being mutated
+    ((and (consp form) (consp (cdr form))
+          (let ((op (car form)))
+            (or (and (symbolp op)
+                     (or (string= (symbol-name op) "SETQ")
+                         (string= (symbol-name op) "SETF")
+                         (string= (symbol-name op) "INCF")
+                         (string= (symbol-name op) "DECF")))
+                (and (integerp op) (= op 565254038635891948)))))  ; setq hash
+     (let ((var (cadr form))
+           (rest (apply #'append
+                        (mapcar (lambda (f) (collect-setq-vars-in-body f bound-vars))
+                                (cddr form)))))
+       (if (and (symbolp var) (member var bound-vars :test #'name-equal))
+           (adjoin var rest :test #'name-equal)
+           rest)))
+    ;; Skip init of lambda params — they shadow the outer vars
+    ((and (consp form)
+          (or (and (symbolp (car form)) (string= (symbol-name (car form)) "LAMBDA"))
+              (and (integerp (car form)) (= (car form) 527981956251550024))))  ; lambda hash
+     ;; Collect mutations in lambda body but shadow params from bound-vars
+     (let* ((params (if (consp (cadr form)) (cadr form) nil))
+            (inner-bound (remove-if (lambda (v)
+                                      (member v params :test #'name-equal))
+                                    bound-vars)))
+       (when inner-bound
+         (apply #'append
+                (mapcar (lambda (f) (collect-setq-vars-in-body f inner-bound))
+                        (cddr form))))))
+    (t
+     ;; Recurse into all subforms
+     (let ((results nil))
+       (dolist (sub form results)
+         (dolist (v (collect-setq-vars-in-body sub bound-vars))
+           (setq results (adjoin v results :test #'name-equal))))))))
+
+(defun vars-mutated-in-lambdas (body-forms let-vars)
+  "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
+   Returns a list of variable names that need cell boxing."
+  ;; Walk body forms looking for lambdas, then check for setq of let-vars inside them
+  (let ((result nil))
+    (labels ((scan (form in-lambda)
+               (unless (consp form) (return-from scan))
+               (let ((op (car form)))
+                 (cond
+                   ;; lambda — now we're inside a lambda, check for setq of let-vars
+                   ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+                        (and (integerp op) (= op 527981956251550024)))
+                    ;; Find vars setq'd in this lambda's body (shadowing its own params)
+                    (let* ((params (if (consp (cadr form)) (cadr form) nil))
+                           (visible-vars (remove-if
+                                          (lambda (v)
+                                            (member v params :test #'name-equal))
+                                          let-vars)))
+                      (when visible-vars
+                        (dolist (v (collect-setq-vars-in-body form visible-vars))
+                          (setq result (adjoin v result :test #'name-equal))))
+                      ;; Also recurse into lambda body for nested lambdas with shadowing
+                      (dolist (f (cddr form))
+                        (scan f t))))
+                   ;; function literal — same as lambda
+                   ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+                        (and (integerp op) (= op 113179339635393781)))
+                    (scan (cadr form) in-lambda))
+                   ;; skip quoted forms
+                   ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+                        (and (integerp op) (= op 518921307293258709)))
+                    nil)
+                   (t
+                    (dolist (sub (cdr form))
+                      (scan sub in-lambda)))))))
+      (dolist (f body-forms)
+        (scan f nil)))
+    result))
+
+(defun cell-var-name (var)
+  "Generate the cell variable name for a boxed variable."
+  (let ((base (cond ((symbolp var) (symbol-name var))
+                    ((stringp var) var)
+                    (t (format nil "~A" var)))))
+    (intern (concatenate 'string "%CELL-" base) :modus.mvm)))
+
+(defun cell-rewrite-form (form boxed-vars &optional (lambda-params nil))
+  "Rewrite FORM to use cell indirection for BOXED-VARS.
+   Reads of boxed var V become (car %cell-V).
+   Writes (setq V expr) become (setcar %cell-V (cell-rewrite-form expr)).
+   Lambda params shadow boxed vars within the lambda body."
+  (cond
+    ((null form) nil)
+    ((not (consp form))
+     ;; Atom: if it's a boxed variable, rewrite to (car %cell-V)
+     (if (member form boxed-vars :test #'name-equal)
+         `(car ,(cell-var-name form))
+         form))
+    (t
+     (let ((op (car form)))
+       (cond
+         ;; (setq var expr) — if var is boxed, use setcar
+         ((or (and (symbolp op) (string= (symbol-name op) "SETQ"))
+              (and (integerp op) (= op 565254038635891948)))
+          (let ((var (cadr form))
+                (val (caddr form)))
+            (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
+                `(set-car ,(cell-var-name var)
+                         ,(cell-rewrite-form val boxed-vars lambda-params))
+                `(setq ,var ,(cell-rewrite-form val boxed-vars lambda-params)))))
+         ;; (incf var delta) — if var is boxed, rewrite to setcar + car + +
+         ((and (symbolp op) (string= (symbol-name op) "INCF"))
+          (let ((var (cadr form))
+                (delta (or (caddr form) 1)))
+            (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
+                `(set-car ,(cell-var-name var)
+                         (+ (car ,(cell-var-name var))
+                            ,(cell-rewrite-form delta boxed-vars lambda-params)))
+                `(incf ,var ,(cell-rewrite-form delta boxed-vars lambda-params)))))
+         ;; (decf var delta) — if var is boxed, rewrite to setcar + car + -
+         ((and (symbolp op) (string= (symbol-name op) "DECF"))
+          (let ((var (cadr form))
+                (delta (or (caddr form) 1)))
+            (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
+                `(set-car ,(cell-var-name var)
+                         (- (car ,(cell-var-name var))
+                            ,(cell-rewrite-form delta boxed-vars lambda-params)))
+                `(decf ,var ,(cell-rewrite-form delta boxed-vars lambda-params)))))
+         ;; lambda — shadow boxed-vars with lambda params
+         ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+              (and (integerp op) (= op 527981956251550024)))
+          (let* ((params (if (consp (cadr form)) (cadr form) (list (cadr form))))
+                 ;; Remove params from boxed-vars (they shadow)
+                 (inner-boxed (remove-if (lambda (v)
+                                           (member v params :test #'name-equal))
+                                         boxed-vars)))
+            `(lambda ,(cadr form)
+               ,@(mapcar (lambda (f) (cell-rewrite-form f inner-boxed params))
+                         (cddr form)))))
+         ;; quote — don't rewrite inside
+         ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+              (and (integerp op) (= op 518921307293258709)))
+          form)
+         ;; let/let* — inner bindings may shadow
+         ((or (and (symbolp op) (string= (symbol-name op) "LET"))
+              (and (integerp op) (= op 347164158959663450))
+              (and (symbolp op) (string= (symbol-name op) "LET*"))
+              (and (integerp op) (= op 115433002357585904)))
+          (let* ((bindings (cadr form))
+                 (body (cddr form))
+                 ;; Variables bound by this let shadow outer boxed vars
+                 (let-names (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
+                 (inner-boxed (remove-if (lambda (v)
+                                           (member v let-names :test #'name-equal))
+                                         boxed-vars))
+                 ;; Rewrite init forms with outer boxed vars (let semantics: all see outer)
+                 (new-bindings (mapcar (lambda (b)
+                                         (if (consp b)
+                                             `(,(car b) ,(cell-rewrite-form (cadr b) boxed-vars lambda-params))
+                                             b))
+                                       bindings))
+                 (new-body (mapcar (lambda (f) (cell-rewrite-form f inner-boxed lambda-params))
+                                   body)))
+            `(,op ,new-bindings ,@new-body)))
+         ;; General case: rewrite all subforms
+         (t
+          `(,(cell-rewrite-form op boxed-vars lambda-params)
+            ,@(mapcar (lambda (f) (cell-rewrite-form f boxed-vars lambda-params))
+                      (cdr form)))))))))
+
+;;; ============================================================
 ;;; Let / Let*
 ;;; ============================================================
 
@@ -1998,6 +2204,45 @@
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
+  ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
+  ;; We use GLOBAL variables for the cells so lambdas can access them via
+  ;; symbol-value (independent of stack frames).
+  (let* ((body-stripped (strip-declares body))
+         (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
+         (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
+    (when boxed-vars
+      ;; Register cell vars as globals so lambdas can access via symbol-value
+      (dolist (var boxed-vars)
+        (let ((cell-name (cell-var-name var)))
+          (setf (gethash (normalize-name cell-name) *globals*) t)))
+      ;; Build new bindings: non-boxed vars stay as let, boxed vars use global setq
+      ;; We use a progn structure:
+      ;;   (let (non-boxed-bindings)
+      ;;     (setq %cell-V1 (cons init1 nil))
+      ;;     ...
+      ;;     rewritten-body)
+      (let* ((non-boxed-bindings
+               (remove-if (lambda (b)
+                            (member (if (consp b) (car b) b) boxed-vars
+                                    :test #'name-equal))
+                           bindings))
+             (cell-setqs
+               (mapcar (lambda (b)
+                         (let* ((var (if (consp b) (car b) b))
+                                (init (if (consp b) (cadr b) nil)))
+                           `(setq ,(cell-var-name var)
+                                  (cons ,(cell-rewrite-form init nil nil) nil))))
+                       (remove-if-not (lambda (b)
+                                        (member (if (consp b) (car b) b) boxed-vars
+                                                :test #'name-equal))
+                                      bindings)))
+             (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
+                               body-stripped))
+             (inner-form `(progn ,@cell-setqs ,@new-body)))
+        (return-from compile-let
+          (if non-boxed-bindings
+              (compile-form `(let ,non-boxed-bindings ,inner-form) env dest)
+              (compile-form inner-form env dest))))))
   (check-frame-overflow (length bindings) "let" env)
   (let ((body (strip-declares body))
         (n-bindings (length bindings))
@@ -2055,6 +2300,39 @@
 (defun compile-let* (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
+  ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
+  ;; Use globals for cell vars so lambdas can access via symbol-value.
+  (let* ((body-stripped (strip-declares body))
+         (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
+         (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
+    (when boxed-vars
+      ;; Register cell vars as globals
+      (dolist (var boxed-vars)
+        (let ((cell-name (cell-var-name var)))
+          (setf (gethash (normalize-name cell-name) *globals*) t)))
+      ;; Rewrite: non-boxed vars stay in let*, boxed vars use setq to globals
+      (let* ((non-boxed-bindings
+               (remove-if (lambda (b)
+                            (member (if (consp b) (car b) b) boxed-vars
+                                    :test #'name-equal))
+                           bindings))
+             (cell-setqs
+               (mapcar (lambda (b)
+                         (let* ((var (if (consp b) (car b) b))
+                                (init (if (consp b) (cadr b) nil)))
+                           `(setq ,(cell-var-name var)
+                                  (cons ,(cell-rewrite-form init nil nil) nil))))
+                       (remove-if-not (lambda (b)
+                                        (member (if (consp b) (car b) b) boxed-vars
+                                                :test #'name-equal))
+                                      bindings)))
+             (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
+                               body-stripped))
+             (inner-form `(progn ,@cell-setqs ,@new-body)))
+        (return-from compile-let*
+          (if non-boxed-bindings
+              (compile-form `(let* ,non-boxed-bindings ,inner-form) env dest)
+              (compile-form inner-form env dest))))))
   (check-frame-overflow (length bindings) "let*" env)
   (let ((body (strip-declares body))
         (n-bindings (length bindings))
@@ -3092,7 +3370,11 @@
           (emit-ir :push temp)
           (free-temp-reg)))
       (loop for i from (1- reg-count) downto 0
-            do (emit-ir :pop (+ +vreg-v0+ i))))
+            do (emit-ir :pop (+ +vreg-v0+ i)))
+      ;; When nargs=0, V0 retains stale value from caller context.
+      ;; Clear V0 to nil so callee receives a clean first argument slot.
+      (when (= nargs 0)
+        (emit-ir :mov +vreg-v0+ +vreg-vn+)))
     ;; Pop function address (on top of overflow args) and call indirect
     (let ((fn-call-reg (alloc-temp-reg)))
       (emit-ir :pop fn-call-reg)

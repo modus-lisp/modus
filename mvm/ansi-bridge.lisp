@@ -4440,6 +4440,60 @@
 (defun compile (name &optional def) nil)  ; stub
 (defun simple-vector-p (x) (vectorp x))
 
+;; Module system stubs
+(defvar *modules* nil)
+(defun provide (module-name)
+  "Register a module as provided."
+  (let ((name (string module-name)))
+    (unless (member name *modules* :test #'string=)
+      (setq *modules* (cons name *modules*))))
+  t)
+(defun require (module-name &optional pathnames)
+  "Stub: load a module if not already provided."
+  (let ((name (string module-name)))
+    (unless (member name *modules* :test #'string=)
+      nil)))  ; no-op stub
+
+;; replace: copy elements from one sequence to another
+(defun replace (seq1 seq2 &rest args)
+  "Destructively replace elements of SEQ1 with elements from SEQ2."
+  (let ((start1 0) (end1 nil) (start2 0) (end2 nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :start1) (setq start1 v))
+            ((eq k :end1) (setq end1 v))
+            ((eq k :start2) (setq start2 v))
+            ((eq k :end2) (setq end2 v))))
+        (setq cur (cddr cur))))
+    (when (null end1) (setq end1 (length seq1)))
+    (when (null end2) (setq end2 (length seq2)))
+    (let ((n1 (- end1 start1))
+          (n2 (- end2 start2)))
+      (let ((count (if (< n1 n2) n1 n2))
+            (i 0))
+        (loop
+          (when (= i count) (return seq1))
+          (let ((src-elem (if (listp seq2)
+                              (nth (+ start2 i) seq2)
+                              (aref seq2 (+ start2 i)))))
+            (if (listp seq1)
+                (setf (nth (+ start1 i) seq1) src-elem)
+                (if (stringp seq1)
+                    (aset seq1 (+ start1 i) (if (characterp src-elem) (char-code src-elem) src-elem))
+                    (aset seq1 (+ start1 i) src-elem))))
+          (setq i (+ i 1)))))))
+
+;; Adjustable arrays
+(defun adjustable-array-p (array)
+  "Return true if array is adjustable. Our arrays are not adjustable by default."
+  nil)
+(defun array-displacement (array)
+  "Return displacement info for ARRAY. Our arrays are never displaced."
+  (values nil 0))
+
 ;;; ===================================================
 ;;; Sequence Search Functions (find, search, position-if, etc.)
 ;;; ===================================================
@@ -4635,8 +4689,10 @@
 ;; slot-spec: nil = any slot; symbol = that specific slot name
 (defvar *slot-unbound-methods* nil)
 
-;; Unbound slot sentinel: a unique cons cell
-(defvar *%unbound-slot* (list '%unbound-slot-sentinel))
+;; Unbound slot sentinel: fixnum -999.
+;; Using a fixnum literal avoids SYMBOL-VALUE call clobbering arr-reg
+;; in variable-index aset during %make-instance initialization loop.
+(defvar *%unbound-slot* -999)
 
 (defun %clos-instance-p (x)
   "True if X is a CLOS instance array."
@@ -4697,7 +4753,9 @@
       (let ((i 0))
         (loop
           (when (= i n) (return nil))
-          (aset inst (+ 2 i) *%unbound-slot*)
+          ;; Use literal -999 (unbound sentinel) to avoid SYMBOL-VALUE clobbering
+          ;; arr-reg (V0) in variable-index aset compilation
+          (aset inst (+ 2 i) -999)
           (setq i (+ i 1))))
       inst)))
 
@@ -4711,7 +4769,8 @@
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx) (return-from %slot-value nil))
       (let ((val (aref obj (+ 2 idx))))
-        (if (eq val *%unbound-slot*)
+        ;; -999 is the unbound slot sentinel (fixnum, no global lookup needed)
+        (if (= val -999)
           ;; Call slot-unbound method
           (%dispatch-slot-unbound cls obj slot-name)
           val)))))
@@ -4733,7 +4792,8 @@
     (when (null cls) (return-from %slot-boundp nil))
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx) (return-from %slot-boundp nil))
-      (not (eq (aref obj (+ 2 idx)) *%unbound-slot*)))))
+      ;; -999 is the unbound slot sentinel
+      (not (= (aref obj (+ 2 idx)) -999)))))
 
 (defun %slot-makunbound (obj slot-name)
   "Mark slot SLOT-NAME in OBJ as unbound."
@@ -4741,7 +4801,8 @@
     (when (null cls) (return-from %slot-makunbound obj))
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx) (return-from %slot-makunbound obj))
-      (aset obj (+ 2 idx) *%unbound-slot*)
+      ;; Use literal -999 to avoid SYMBOL-VALUE clobber in variable-index aset
+      (aset obj (+ 2 idx) -999)
       obj)))
 
 ;; slot-unbound dispatch
@@ -7098,20 +7159,24 @@
 ;;; --- Updated find-class to support condition types ---
 
 (defun find-class (name &rest args)
-  "Find class by name. Returns a proxy for condition types."
+  "Find class by name. Returns CLOS class descriptor or proxy for condition types."
   (let ((errorp (if args (car args) t)))
-    ;; Check if it's a condition type
-    (let ((entry (%cond-reg-find name)))
-      (if entry
-          ;; Return a proxy object (just a 2-element array with type indicator)
-          (let ((cls (make-array 2)))
-            (aset cls 0 '%class-proxy)
-            (aset cls 1 name)
-            cls)
-          ;; Not a condition type
-          (if errorp
-              (error "class not found")
-              nil)))))
+    ;; Check CLOS user-defined classes first
+    (let ((clos-cls (%find-clos-class name)))
+      (if clos-cls
+          clos-cls
+          ;; Check condition types
+          (let ((entry (%cond-reg-find name)))
+            (if entry
+                ;; Return a proxy object
+                (let ((cls (make-array 2)))
+                  (aset cls 0 '%class-proxy)
+                  (aset cls 1 name)
+                  cls)
+                ;; Not found
+                (if errorp
+                    (error "class not found")
+                    nil)))))))
 
 (defun %class-proxy-p (obj)
   "Check if obj is a class proxy."

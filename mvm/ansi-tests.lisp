@@ -1157,7 +1157,29 @@
                   (read-char s)) #\a)
   ;; peek-char
   (deftest 9815 (let ((s (make-string-input-stream "abc")))
-                  (peek-char nil s)) #\a))
+                  (peek-char nil s)) #\a)
+  ;; File I/O tests
+  (deftest 9820 (let ((s (open "/tmp/ansi-test-probe.txt" :direction :output :if-exists :supersede)))
+                  (if s (progn (close s) t) nil)) t)
+  (deftest 9821 (let ((s (open "/tmp/ansi-test-probe.txt" :direction :output :if-exists :supersede)))
+                  (if s
+                      (progn (write-char #\H s) (write-char #\i s) (close s) t)
+                      nil)) t)
+  (deftest 9822 (let ((p (probe-file "/tmp/ansi-test-probe.txt")))
+                  (if p t nil)) t)
+  ;; Test read-char from file stream (tests %fs-read-char buffer fill)
+  (deftest 9823 (let ((s (open "/tmp/ansi-test-probe.txt"
+                               :direction :input
+                               :if-does-not-exist nil)))
+                  (if (null s)
+                      nil
+                      (let ((c1 (read-char s nil nil))
+                            (c2 (read-char s nil nil)))
+                        (close s)
+                        (and (char= c1 #\H) (char= c2 #\i)))))
+                t)
+  (deftest 9824 (let ((s (open "/tmp/ansi-test-probe.txt" :direction :input)))
+                  (if s (let ((len (file-length s))) (close s) len) nil)) 2))
 
 (defun run-typep-debug-tests ()
   ;; Basic typep tests

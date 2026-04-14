@@ -684,6 +684,9 @@
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
+    ;; Pathname objects (created by SBCL from #P"..." reader syntax) → namestring
+    ((and (not (null form)) (typep form 'pathname))
+     (namestring form))
     ((atom form) form)
     ;; (multiple-value-call fn arg1 arg2 ...)
     ;; Collect all MV from each arg, pass to fn.
@@ -1188,6 +1191,33 @@
           (let ,bindings
             ,@body))))
 
+    ;; (with-open-file (var filespec &rest opts) body...)
+    ;; → (let ((var (open filespec opts...))) (unwind-protect (progn body) (when var (close var))))
+    ;; Since MVM has no unwind-protect, we use let + close at end (no exception safety for now)
+    ((and (eq (car form) 'with-open-file) (cdr form) (consp (cadr form)))
+     (let* ((binding (cadr form))
+            (var (car binding))
+            (filespec (rewrite-reader-forms (cadr binding)))
+            (opts (mapcar #'rewrite-reader-forms (cddr binding)))
+            (body (mapcar #'rewrite-reader-forms (cddr form))))
+       `(let ((,var (open ,filespec ,@opts)))
+          (when ,var
+            (let ((%wof-result (progn ,@body)))
+              (close ,var)
+              %wof-result)))))
+
+    ;; (with-open-stream (var stream-form) body...)
+    ;; → (let ((var stream-form)) (progn body... (close var)))
+    ((and (eq (car form) 'with-open-stream) (cdr form) (consp (cadr form)))
+     (let* ((binding (cadr form))
+            (var (car binding))
+            (stream-form (rewrite-reader-forms (cadr binding)))
+            (body (mapcar #'rewrite-reader-forms (cddr form))))
+       `(let ((,var ,stream-form))
+          (let ((%wos-result (progn ,@body)))
+            (close ,var)
+            %wos-result))))
+
     (t (rewrite-reader-forms-list form))))
 
 (defun rewrite-reader-forms-list (list)
@@ -1555,6 +1585,15 @@
 
   ;; Initialize condition type registry
   (%init-condition-types)
+
+  ;; Set default pathname defaults to the ANSI test sandbox directory
+  (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")
+
+  ;; Init file I/O scratch buffers (defvar defaults not applied without init-all-globals)
+  (setq *cstr-scratch* #x1DF00000)
+  (setq *io-buf-addr*  #x1DE00000)
+  (setq *scratch-mmapped* nil)
+  (setq *filesystem* nil)
 
   ;; Init RT counters manually (init-all-globals not safe — some thunks
   ;; reference functions/symbols that may not be available yet)

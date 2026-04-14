@@ -4770,7 +4770,8 @@
       (when (null idx) (return-from %slot-value nil))
       (let ((val (aref obj (+ 2 idx))))
         ;; -999 is the unbound slot sentinel (fixnum, no global lookup needed)
-        (if (= val -999)
+        ;; Guard with fixnump to avoid type error when slot contains non-fixnum
+        (if (and (fixnump val) (= val -999))
           ;; Call slot-unbound method
           (%dispatch-slot-unbound cls obj slot-name)
           val)))))
@@ -4792,8 +4793,9 @@
     (when (null cls) (return-from %slot-boundp nil))
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx) (return-from %slot-boundp nil))
-      ;; -999 is the unbound slot sentinel
-      (not (= (aref obj (+ 2 idx)) -999)))))
+      ;; -999 is the unbound slot sentinel (fixnum guard prevents type error)
+      (let ((v (aref obj (+ 2 idx))))
+        (not (and (fixnump v) (= v -999)))))))
 
 (defun %slot-makunbound (obj slot-name)
   "Mark slot SLOT-NAME in OBJ as unbound."

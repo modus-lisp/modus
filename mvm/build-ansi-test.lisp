@@ -1287,7 +1287,7 @@
                                     nil))
                                 (list form)))
                           forms))
-            (let ((out (make-string-output-stream)) (test-forms nil))
+            (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
               (dolist (form forms)
                 (cond
@@ -1340,15 +1340,36 @@
                   ((and (consp form) (member (car form)
                           '(defharmless def-fold-test def-macro-test
                             in-package declaim))) nil)
-                  (t (let ((s (handler-case (format nil "~S" form)
-                                (error () nil))))
-                       (when (and s
-                                  (not (search "#<" s))
-                                  (not (search "&ENVIRONMENT" s))
-                                  (not (search "STRUCT-TEST-" s)))
-                         (write-string s out)
-                         (terpri out))))))
+                  (t
+                   ;; For progn forms (from rewritten defclass/defmethod):
+                   ;; - defun sub-forms → top-level (compiled as global functions)
+                   ;; - non-defun sub-forms (like %defclass calls) → init-forms
+                   ;;   (run inside run-ansi-* since TOPLEVEL thunks never execute)
+                   ;; For non-progn forms: write to top-level as before.
+                   (if (and (consp form) (eq (car form) 'progn))
+                       (dolist (sub (cdr form))
+                         (when (consp sub)
+                           (let ((sub-s (handler-case (format nil "~S" sub)
+                                          (error () nil))))
+                             (when (and sub-s
+                                        (not (search "#<" sub-s))
+                                        (not (search "&ENVIRONMENT" sub-s))
+                                        (not (search "STRUCT-TEST-" sub-s)))
+                               (if (member (car sub) '(defun defvar defparameter defstruct))
+                                   (progn (write-string sub-s out) (terpri out))
+                                   (push sub-s init-forms))))))
+                       (let ((s (handler-case (format nil "~S" form)
+                                  (error () nil))))
+                         (when (and s
+                                    (not (search "#<" s))
+                                    (not (search "&ENVIRONMENT" s))
+                                    (not (search "STRUCT-TEST-" s)))
+                           (write-string s out)
+                           (terpri out)))))))
               (format out "(defun run-ansi-~A ()~%" (pathname-name file))
+              ;; Emit init calls first (%defclass, %add-slot-unbound-method, etc.)
+              (dolist (s (nreverse init-forms)) (format out "  ~A~%" s))
+              ;; Then test forms
               (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
               (format out ")~%")
               (setf *real-ansi-sources*

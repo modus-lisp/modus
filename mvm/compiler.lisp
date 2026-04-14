@@ -1804,42 +1804,70 @@
 ;;; (saved RSP != 0 at 0x10000140) and calls longjmp if so.
 
 (defun compile-handler-case (body-form clauses env dest)
-  "Compile (handler-case body (error () handler-forms...))
-   Uses setjmp/longjmp: saves state, runs body, catches errors."
-  ;; Find the error handler clause — look for (error (...) body...)
-  (let ((handler-body nil))
+  "Compile (handler-case body (type (var) handler-forms...))
+   Uses setjmp/longjmp: saves state, runs body, catches errors.
+   Multi-clause: dispatches on *current-condition* type at runtime."
+  ;; Find the first non-warning handler clause
+  ;; Clauses: ((type (var) body...) ...)
+  ;; Build a unified handler that dispatches on condition type
+  (let ((error-clauses nil)
+        (body-only-p t))
+    ;; Collect clauses that can catch errors/conditions
     (dolist (clause clauses)
-      (when (and (consp clause)
-                 (or (name-eq (car clause) "ERROR")
-                     (name-eq (car clause) "CONDITION")
-                     (name-eq (car clause) "SERIOUS-CONDITION")
-                     (name-eq (car clause) "T")))
-        (setf handler-body (cddr clause))))
-    (if (null handler-body)
-        ;; No error clause found — just compile body
+      (when (consp clause)
+        (setf body-only-p nil)
+        (push clause error-clauses)))
+    (setf error-clauses (nreverse error-clauses))
+    (if body-only-p
+        ;; No clauses at all — just compile body
         (compile-form body-form env dest)
-        ;; Emit setjmp/handler pattern:
-        ;;   setjmp → 0 on first call, non-zero on longjmp
-        ;;   if 0: run body, clear handler, jump to end
-        ;;   if non-zero: run handler
-        (let ((handler-label (make-compiler-label))
-              (end-label (make-compiler-label)))
-          ;; TRAP #x0510: setjmp — saves RSP/RBP/IP to fixed memory,
-          ;; returns NIL in VR (RAX) on first call, T on longjmp
+        ;; Build unified handler with type dispatch
+        ;; All clauses collapsed into: (let ((var *current-condition*)) (cond ...))
+        (let* ((handler-label (make-compiler-label))
+               (end-label (make-compiler-label))
+               ;; Build unified handler body: type-dispatch on *current-condition*
+               ;; (cond ((typep *cc* 'T1) (let ((v1 *cc*)) body1))
+               ;;       ((typep *cc* 'T2) (let ((v2 *cc*)) body2))
+               ;;       (t (%hc-longjmp)))
+               (cc-sym (quote *current-condition*))
+               (dispatch-forms
+                (let ((result nil))
+                  (dolist (clause error-clauses)
+                    (let* ((type-spec (car clause))
+                           (var-list (if (consp (cadr clause)) (cadr clause) nil))
+                           (var (if (and var-list (consp var-list)) (car var-list) nil))
+                           (hbody (cddr clause))
+                           ;; Build condition check
+                           (type-check
+                            (cond
+                              ((or (name-eq type-spec "T"))
+                               t)
+                              (t
+                               ;; Use typep check on *current-condition*
+                               `(typep ,cc-sym ',type-spec))))
+                           ;; Build handler body with variable binding
+                           (handler-expr
+                            (if var
+                                `(let ((,var ,cc-sym)) ,@hbody)
+                                `(progn ,@hbody))))
+                      (push (list type-check handler-expr) result)))
+                  (nreverse result)))
+               ;; Build the full cond dispatch
+               (cond-form
+                (if dispatch-forms
+                    `(cond ,@dispatch-forms (t (%hc-longjmp)))
+                    '(%hc-longjmp))))
+          ;; Emit setjmp/handler pattern
           (emit-ir :trap #x0510)
           (emit-ir :mov dest +vreg-vr+)
-          ;; Branch: if not-nil (longjmp return), go to handler
           (emit-ir :bnnull dest handler-label)
           ;; === Normal path: body ===
           (compile-form body-form env dest)
-          ;; Clear handler: TRAP #x0512 (clear-handler)
           (emit-ir :trap #x0512)
           (emit-ir :br end-label)
-          ;; === Handler path: error caught ===
+          ;; === Handler path: dispatch on condition type ===
           (emit-ir-label handler-label)
-          ;; Handler already cleared by longjmp/error
-          (compile-progn handler-body env dest)
-          ;; Join
+          (compile-form cond-form env dest)
           (emit-ir-label end-label)))))
 
 ;;; ============================================================

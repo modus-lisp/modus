@@ -462,6 +462,217 @@
 ;; Since these depend on random, we define stubs
 ;; that produce deterministic "random" values for MVM
 
+;;; ============================================================
+;;; SBCL-side condition/define-condition rewriters
+;;; ============================================================
+
+;; Parse a slot-spec from define-condition:
+;; (slot-name :initarg :kw1 :initarg :kw2 :initform form :reader reader ...)
+;; Returns: (slot-name initargs initform-or-:no-initform readers)
+(defun parse-dc-slot (slot-spec)
+  (if (atom slot-spec)
+      (list slot-spec nil :no-initform nil)
+      (let ((name (car slot-spec))
+            (opts (cdr slot-spec))
+            (initargs nil)
+            (initform :no-initform)
+            (readers nil))
+        (loop
+          (when (null opts) (return))
+          (let ((key (car opts))
+                (val (cadr opts)))
+            (cond
+              ((eq key :initarg)
+               (setf initargs (append initargs (list val)))
+               (setf opts (cddr opts)))
+              ((eq key :initform)
+               (setf initform val)
+               (setf opts (cddr opts)))
+              ((eq key :reader)
+               (setf readers (append readers (list val)))
+               (setf opts (cddr opts)))
+              ((eq key :accessor)
+               (setf readers (append readers (list val)))
+               (setf opts (cddr opts)))
+              ((eq key :type)
+               (setf opts (cddr opts)))
+              ((eq key :documentation)
+               (setf opts (cddr opts)))
+              ((eq key :writer)
+               (setf opts (cddr opts)))
+              (t (setf opts (cddr opts))))))
+        (list name initargs initform readers))))
+
+;; Build the slot-descriptor list for %define-condition
+;; Returns a quoted list: '((name (initarg...) initform-or-:no-initform) ...)
+(defun build-slot-descriptors (slot-specs)
+  (mapcar (lambda (s)
+            (let* ((parsed (parse-dc-slot s))
+                   (name (first parsed))
+                   (initargs (second parsed))
+                   (initform (third parsed)))
+              (list name initargs initform)))
+          slot-specs))
+
+;; Extract option from define-condition options list
+(defun dc-option (options key)
+  (let ((found (assoc key options)))
+    (if found (cdr found) nil)))
+
+;; Expand (define-condition name parents slot-specs &rest options)
+;; into (%define-condition ...) + reader/accessor defun forms
+(defun rewrite-define-condition (form)
+  (let* ((name (second form))
+         (parents (or (third form) '(condition)))
+         (slot-specs (or (fourth form) nil))
+         (rest-opts (cddr (cddr form)))
+         ;; Parse &rest options
+         (options (loop for opt in rest-opts
+                        when (consp opt) collect (cons (car opt) (cdr opt))))
+         ;; default-initargs option
+         (default-initargs-opt (dc-option options :default-initargs))
+         ;; report option
+         (report-opt (dc-option options :report))
+         ;; Build slot descriptors
+         (slot-descriptors (build-slot-descriptors slot-specs))
+         ;; Collect all reader defuns
+         (reader-defuns
+          (loop for s in slot-specs
+                append
+                (let* ((parsed (parse-dc-slot s))
+                       (slot-name (first parsed))
+                       (readers (fourth parsed)))
+                  (mapcar (lambda (r)
+                            `(defun ,r (c) (%condition-slot c ',slot-name)))
+                          readers))))
+         ;; Build report-fn arg (nil or a quoted lambda/symbol)
+         (report-fn-arg
+          (cond
+            ((null report-opt) nil)
+            ((and (consp report-opt) (eq (car report-opt) 'lambda))
+             `',report-opt)
+            ((symbolp report-opt) `',report-opt)
+            ((stringp report-opt)
+             ;; String report: lambda (c s) (write-string "msg" s)
+             `(lambda (c s) (declare (ignore c)) (write-string ,report-opt s)))
+            (t nil)))
+         ;; Build default-initargs arg
+         (default-initargs-arg
+          (if default-initargs-opt
+              `',default-initargs-opt
+              nil))
+         ;; Define-condition call
+         (def-call `(%define-condition ',name ',parents ',slot-descriptors
+                                       ,default-initargs-arg ,report-fn-arg)))
+    `(progn
+       ,def-call
+       ,@reader-defuns)))
+
+;; Make test name from condition name + suffixes (like make-def-cond-name)
+(defun make-dc-test-name (name-str &rest suffixes)
+  (intern (apply #'concatenate 'string name-str suffixes) :cl-test))
+
+;; Expand define-condition-with-tests inline
+(defun rewrite-define-condition-with-tests (form)
+  (let* ((name-symbol (second form))
+         (parents (or (third form) nil))
+         (slot-specs (or (fourth form) nil))
+         (options (nthcdr 4 form))
+         ;; Gensym-free name to use in tests
+         (name-str (if (symbolp name-symbol) (symbol-name name-symbol) nil)))
+    ;; Skip #:uninterned symbols (like #:condition-3)
+    (unless name-str
+      (return-from rewrite-define-condition-with-tests '(progn)))
+    (let* ((dc-form (append (list 'define-condition name-symbol parents slot-specs)
+                            options))
+           (dc-rewritten (rewrite-define-condition dc-form))
+           ;; Parents augmented with 'condition always
+           (all-parents (if (member 'condition parents) parents (append parents '(condition))))
+           ;; Generate subtype tests for each parent + condition
+           (tests nil))
+      ;; IS-SUBTYPE-OF tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-SUBTYPE-OF/" (symbol-name parent))
+                 (subtypep* ',name-symbol ',parent)
+                 t t)
+               tests))
+      ;; IS-SUBTYPE-OF-2 tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-SUBTYPE-OF-2/" (symbol-name parent))
+                 (check-all-subtypep ',name-symbol ',parent)
+                 nil)
+               tests))
+      ;; IS-NOT-SUPERTYPE-OF tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-NOT-SUPERTYPE-OF/" (symbol-name parent))
+                 (subtypep* ',parent ',name-symbol)
+                 nil t)
+               tests))
+      ;; IS-A tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-A/" (symbol-name parent))
+                 (let ((c (make-condition ',name-symbol)))
+                   (notnot-mv (typep c ',parent)))
+                 t)
+               tests))
+      ;; IS-SUBCLASS-OF tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-SUBCLASS-OF/" (symbol-name parent))
+                 (subtypep* (find-class ',name-symbol) (find-class ',parent))
+                 t t)
+               tests))
+      ;; IS-NOT-SUPERCLASS-OF tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-NOT-SUPERCLASS-OF/" (symbol-name parent))
+                 (subtypep* (find-class ',parent) (find-class ',name-symbol))
+                 nil t)
+               tests))
+      ;; IS-A-MEMBER-OF-CLASS tests
+      (dolist (parent all-parents)
+        (push `(deftest ,(make-dc-test-name name-str "/IS-A-MEMBER-OF-CLASS/" (symbol-name parent))
+                 (let ((c (make-condition ',name-symbol)))
+                   (notnot-mv (typep c (find-class ',parent))))
+                 t)
+               tests))
+      ;; HANDLER-CASE-1
+      (push `(deftest ,(make-dc-test-name name-str "/HANDLER-CASE-1")
+               (let ((c (make-condition ',name-symbol)))
+                 (handler-case (signal c)
+                               (,name-symbol (c1) (eqt c c1))))
+               t)
+             tests)
+      ;; HANDLER-CASE-2
+      (push `(deftest ,(make-dc-test-name name-str "/HANDLER-CASE-2")
+               (let ((c (make-condition ',name-symbol)))
+                 (handler-case (signal c)
+                               (condition (c1) (eqt c c1))))
+               t)
+             tests)
+      ;; HANDLER-CASE-3 — only if none of parents is-error
+      (let ((has-error-parent nil))
+        (dolist (p parents)
+          (when (member p '(error serious-condition simple-error simple-type-error
+                            type-error cell-error unbound-variable undefined-function
+                            unbound-slot arithmetic-error division-by-zero
+                            program-error control-error package-error
+                            stream-error end-of-file reader-error parse-error
+                            print-not-readable file-error storage-condition
+                            floating-point-overflow floating-point-underflow
+                            floating-point-inexact floating-point-invalid-operation))
+            (setf has-error-parent t)))
+        (unless has-error-parent
+          (push `(deftest ,(make-dc-test-name name-str "/HANDLER-CASE-3")
+                   (let ((c (make-condition ',name-symbol)))
+                     (handler-case (signal c)
+                                   (error () nil)
+                                   (,name-symbol (c2) (eqt c c2))))
+                   t)
+                 tests)))
+      ;; Emit define-condition first, then tests in order
+      `(progn
+         ,dc-rewritten
+         ,@(nreverse tests)))))
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -638,6 +849,124 @@
                              (cadr form)))
            (body (mapcar #'rewrite-reader-forms (cddr form))))
        `(flet ,bindings ,@body)))
+    ;; (handler-case body &rest clauses) — normalize class objects to type names
+    ((and (eq (car form) 'handler-case) (cdr form))
+     (let* ((body (rewrite-reader-forms (cadr form)))
+            (clauses (mapcar (lambda (clause)
+                               (if (consp clause)
+                                   (let* ((type-spec (car clause))
+                                          ;; Normalize SBCL class objects to their names
+                                          (norm-type
+                                           (cond
+                                             ((and (not (symbolp type-spec))
+                                                   (not (consp type-spec))
+                                                   (typep type-spec 'class))
+                                              (class-name type-spec))
+                                             (t type-spec)))
+                                          (rest (mapcar #'rewrite-reader-forms (cdr clause))))
+                                     (cons norm-type rest))
+                                   clause))
+                             (cddr form))))
+       `(handler-case ,body ,@clauses)))
+    ;; (define-condition name parents slots &rest options)
+    ;; → (%define-condition ...) + reader defuns
+    ((and (eq (car form) 'define-condition) (cdr form))
+     (rewrite-reader-forms (rewrite-define-condition form)))
+    ;; (define-condition-with-tests name parents slots &rest options)
+    ;; → expand macro inline → (%define-condition ...) + tests
+    ((and (eq (car form) 'define-condition-with-tests) (cdr form))
+     (rewrite-reader-forms (rewrite-define-condition-with-tests form)))
+    ;; (normally form) → form (since *should-always-be-true* is always T)
+    ((and (eq (car form) 'normally) (cdr form))
+     (rewrite-reader-forms (cadr form)))
+    ;; (report-and-ignore-errors form...) → (handler-case (progn form...) (error () nil))
+    ((and (eq (car form) 'report-and-ignore-errors) (cdr form))
+     (let ((body (mapcar #'rewrite-reader-forms (cdr form))))
+       `(handler-case (progn ,@body) (error () nil))))
+    ;; (handler-bind bindings body...)
+    ;; → (%with-handler-bind (list (list 'type fn)...) (lambda () body...))
+    ((and (eq (car form) 'handler-bind) (cdr form))
+     (let* ((bindings (cadr form))
+            (body (mapcar #'rewrite-reader-forms (cddr form)))
+            (binding-forms
+             (mapcar (lambda (b)
+                       (let ((type-name (first b))
+                             (handler-fn (rewrite-reader-forms (second b))))
+                         `(list ',type-name ,handler-fn)))
+                     bindings)))
+       (if binding-forms
+           `(%with-handler-bind (list ,@binding-forms) (lambda () ,@body))
+           `(progn ,@body))))
+    ;; (restart-case form &rest clauses)
+    ;; → (%with-restarts restarts-list (lambda () form))
+    ;; Each clause: (name (args) &key interactive test report . body)
+    ((and (eq (car form) 'restart-case) (cdr form))
+     (let* ((protected-form (rewrite-reader-forms (cadr form)))
+            (clauses (cddr form))
+            (restart-forms
+             (mapcar (lambda (clause)
+                       (let* ((rname (first clause))
+                              (args (second clause))
+                              (rest-opts (cddr clause))
+                              ;; Extract :report, :interactive, :test options
+                              (report-opt nil)
+                              (body-forms nil))
+                         ;; Separate options from body
+                         (let ((remaining rest-opts))
+                           (loop
+                             (when (or (null remaining)
+                                       (not (keywordp (car remaining))))
+                               (setf body-forms remaining)
+                               (return))
+                             (cond
+                               ((eq (car remaining) :report)
+                                (setf report-opt (cadr remaining))
+                                (setf remaining (cddr remaining)))
+                               ((eq (car remaining) :interactive)
+                                (setf remaining (cddr remaining)))
+                               ((eq (car remaining) :test)
+                                (setf remaining (cddr remaining)))
+                               (t
+                                (setf body-forms remaining)
+                                (return)))))
+                         (let* ((body (mapcar #'rewrite-reader-forms body-forms))
+                                (fn-form `(lambda ,args ,@body))
+                                (report-form
+                                 (cond
+                                   ((null report-opt) nil)
+                                   ((stringp report-opt) `',report-opt)
+                                   ((symbolp report-opt) `#',report-opt)
+                                   ((and (consp report-opt) (eq (car report-opt) 'lambda))
+                                    report-opt)
+                                   (t nil))))
+                           (if report-form
+                               `(list ',rname ,fn-form ,report-form)
+                               `(list ',rname ,fn-form nil)))))
+                     clauses)))
+       `(%with-restarts (list ,@restart-forms) (lambda () ,protected-form))))
+    ;; (restart-bind bindings body...)
+    ;; → (%push-restarts restarts (lambda () body...))
+    ((and (eq (car form) 'restart-bind) (cdr form))
+     (let* ((bindings (cadr form))
+            (body (mapcar #'rewrite-reader-forms (cddr form)))
+            (restart-forms
+             (mapcar (lambda (b)
+                       (let* ((rname (first b))
+                              (fn (rewrite-reader-forms (second b)))
+                              (opts (cddr b))
+                              (report-opt (getf opts :report-function)))
+                         (if report-opt
+                             `(list ',rname ,fn ,report-opt)
+                             `(list ',rname ,fn nil))))
+                     bindings)))
+       `(%push-restarts (list ,@restart-forms) (lambda () ,@body))))
+    ;; (with-condition-restarts condition restarts-form body...)
+    ;; stub: just execute body
+    ((and (eq (car form) 'with-condition-restarts) (cdr form))
+     (let ((body (mapcar #'rewrite-reader-forms (nthcdr 3 form))))
+       (if body
+           `(progn ,@body)
+           nil)))
     (t (rewrite-reader-forms-list form))))
 
 (defun rewrite-reader-forms-list (list)
@@ -981,6 +1310,9 @@
 
   ;; Initialize reader (readtable, *read-base*, etc.)
   (%init-reader)
+
+  ;; Initialize condition type registry
+  (%init-condition-types)
 
   ;; Init RT counters manually (init-all-globals not safe — some thunks
   ;; reference functions/symbols that may not be available yet)

@@ -115,15 +115,15 @@ On next boot, restored from block device. Hot-reload: edit source,
 See PLAN-CL.md for the detailed layer-by-layer plan.
 
 ```
-Layer 0: Packages          ✓ DONE — 24 functions, 303 tests pass
-Layer 1: Streams            IN PROGRESS
-Layer 2: Reader             —
-Layer 3: Printer            —
-Layer 4: Format             —
-Layer 5: Conditions         partial (handler-case works)
-Layer 6: CLOS               —
-Layer 7: File I/O           —
-Layer 8: Eval/Compile/Load  —
+Layer 0: Packages          ✓ DONE — 24 functions
+Layer 1: Streams           ✓ DONE — 9 stream types
+Layer 2: Reader            ✓ DONE — full read, readtable, #-dispatch, backquote
+Layer 3: Printer           ✓ DONE — write with *print-* vars
+Layer 4: Format            ✓ DONE — 20+ directives
+Layer 5: Conditions        ✓ DONE — 24 types, handler-bind, restarts
+Layer 6: CLOS              IN PROGRESS
+Layer 7: File I/O          —
+Layer 8: Eval/Compile/Load —
 ```
 
 ## Garbage Collection
@@ -412,7 +412,7 @@ is infrastructure for self-improving systems:
 ## What Exists Today
 
 - MVM compiler: Source → IR → bytecode → native (9 architectures)
-- 733 ANSI test files, ~12,600 tests, 3-8 failures
+- 371 ANSI tests, 359 passing (Layers 0-5 complete)
 - Self-hosting fixpoint across x64/aarch64/i386/arm32
 - SSH server (Ed25519, ChaCha20, X25519)
 - Cooperative actor system with per-actor heaps
@@ -421,8 +421,8 @@ is infrastructure for self-improving systems:
 - Intel E1000 + NE2000 NIC drivers
 - GPIO/SPI/I2C/PWM peripheral control
 - UEFI boot with GOP framebuffer
-- handler-case with setjmp/longjmp
+- Full CL condition system (24 types, handler-bind, restarts)
 - declare special with shallow binding
-- Minimal bignum (2-slot, 124-bit)
-- ~250 CL functions implemented
-- Package system (Layer 0 complete)
+- Bignum (2-slot, 124-bit)
+- ~350+ CL functions implemented
+- Package system, streams, reader, printer, format, conditions

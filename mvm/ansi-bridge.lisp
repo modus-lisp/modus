@@ -4438,8 +4438,201 @@
               :allow-other-keys)))
 (defun symbol-package (x) nil)  ; stub
 (defun compile (name &optional def) nil)  ; stub
-(defun class-of (x) nil)  ; stub
 (defun simple-vector-p (x) (vectorp x))
+
+;;; ===================================================
+;;; Minimal CLOS implementation for ANSI test suite
+;;; ===================================================
+
+;; Class registry: alist of (class-name . cls-array)
+;; cls-array: #(%clos-class name slot-names-list)
+(defvar *clos-classes* nil)
+
+;; slot-unbound methods: list of (class-name slot-spec fn)
+;; slot-spec: nil = any slot; symbol = that specific slot name
+(defvar *slot-unbound-methods* nil)
+
+;; Unbound slot sentinel: a unique cons cell
+(defvar *%unbound-slot* (list '%unbound-slot-sentinel))
+
+(defun %clos-instance-p (x)
+  "True if X is a CLOS instance array."
+  (if (or (fixnump x) (consp x) (null x)) nil
+    (if (= (obj-subtag x) #x32)
+      (if (>= (array-length x) 2)
+        (eq (aref x 0) '%clos-instance)
+        nil)
+      nil)))
+
+(defun %clos-class-p (x)
+  "True if X is a CLOS class descriptor array."
+  (if (or (fixnump x) (consp x) (null x)) nil
+    (if (= (obj-subtag x) #x32)
+      (if (>= (array-length x) 2)
+        (eq (aref x 0) '%clos-class)
+        nil)
+      nil)))
+
+(defun %defclass (name slot-names)
+  "Register CLOS class NAME with SLOT-NAMES list."
+  (let ((cls (make-array 3)))
+    (aset cls 0 '%clos-class)
+    (aset cls 1 name)
+    (aset cls 2 slot-names)
+    (setq *clos-classes* (cons (cons name cls) *clos-classes*))
+    name))
+
+(defun %find-clos-class (name)
+  "Return class descriptor for NAME, or nil."
+  (let ((cur *clos-classes*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %clos-slot-index (cls slot-name)
+  "Return 0-based index of SLOT-NAME in cls, or nil if not found."
+  (let ((slots (aref cls 2))
+        (idx 0))
+    (let ((cur slots))
+      (loop
+        (when (null cur) (return nil))
+        (when (eq (car cur) slot-name) (return idx))
+        (setq idx (+ idx 1))
+        (setq cur (cdr cur))))))
+
+(defun %make-instance (class-name)
+  "Allocate a new CLOS instance of CLASS-NAME with all slots unbound.
+   Initargs are handled at build time by the SBCL-side rewriter."
+  (let ((cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %make-instance nil))
+    (let* ((slot-names (aref cls 2))
+           (n (length slot-names))
+           (inst (make-array (+ 2 n))))
+      (aset inst 0 '%clos-instance)
+      (aset inst 1 class-name)
+      (let ((i 0))
+        (loop
+          (when (= i n) (return nil))
+          (aset inst (+ 2 i) *%unbound-slot*)
+          (setq i (+ i 1))))
+      inst)))
+
+(defun %slot-value (obj slot-name)
+  "Read slot SLOT-NAME from CLOS instance OBJ.
+   Calls slot-unbound if the slot has no value."
+  (when (or (null obj) (not (%clos-instance-p obj)))
+    (return-from %slot-value nil))
+  (let ((cls (%find-clos-class (aref obj 1))))
+    (when (null cls) (return-from %slot-value nil))
+    (let ((idx (%clos-slot-index cls slot-name)))
+      (when (null idx) (return-from %slot-value nil))
+      (let ((val (aref obj (+ 2 idx))))
+        (if (eq val *%unbound-slot*)
+          ;; Call slot-unbound method
+          (%dispatch-slot-unbound cls obj slot-name)
+          val)))))
+
+(defun set-slot-value (obj slot-name new-val)
+  "Set slot SLOT-NAME in CLOS instance OBJ to NEW-VAL. Returns NEW-VAL."
+  (when (or (null obj) (not (%clos-instance-p obj)))
+    (return-from set-slot-value new-val))
+  (let ((cls (%find-clos-class (aref obj 1))))
+    (when (null cls) (return-from set-slot-value new-val))
+    (let ((idx (%clos-slot-index cls slot-name)))
+      (when (null idx) (return-from set-slot-value new-val))
+      (aset obj (+ 2 idx) new-val)
+      new-val)))
+
+(defun %slot-boundp (obj slot-name)
+  "True if slot SLOT-NAME of OBJ is bound."
+  (let ((cls (%find-clos-class (aref obj 1))))
+    (when (null cls) (return-from %slot-boundp nil))
+    (let ((idx (%clos-slot-index cls slot-name)))
+      (when (null idx) (return-from %slot-boundp nil))
+      (not (eq (aref obj (+ 2 idx)) *%unbound-slot*)))))
+
+(defun %slot-makunbound (obj slot-name)
+  "Mark slot SLOT-NAME in OBJ as unbound."
+  (let ((cls (%find-clos-class (aref obj 1))))
+    (when (null cls) (return-from %slot-makunbound obj))
+    (let ((idx (%clos-slot-index cls slot-name)))
+      (when (null idx) (return-from %slot-makunbound obj))
+      (aset obj (+ 2 idx) *%unbound-slot*)
+      obj)))
+
+;; slot-unbound dispatch
+;; Methods stored as: (class-name slot-spec fn)
+;; slot-spec: nil = any, or a symbol to match specific slot
+
+(defun %add-slot-unbound-method (class-name slot-spec fn)
+  "Register a slot-unbound method."
+  (setq *slot-unbound-methods*
+        (cons (cons class-name (cons slot-spec fn)) *slot-unbound-methods*)))
+
+(defun %dispatch-slot-unbound (cls obj slot-name)
+  "Find and call the most specific slot-unbound method."
+  (let ((class-name (aref cls 1))
+        (best-fn nil)
+        (best-specific nil))
+    ;; Search methods (most recently added = most specific wins for eql specializer)
+    (let ((cur *slot-unbound-methods*))
+      (loop
+        (when (null cur) (return nil))
+        (let ((m (car cur)))
+          (let ((m-class (car m))
+                (m-slot  (cadr m))
+                (m-fn    (cddr m)))
+            ;; Check class match: t matches any, or eq check
+            (when (or (eq m-class t) (eq m-class class-name))
+              ;; Check slot specializer
+              (cond
+                ;; Specific slot match: overrides general
+                ((and (not (null m-slot)) (eq m-slot slot-name))
+                 (when (null best-specific)
+                   (setq best-specific m-fn)))
+                ;; General (t) match: only use if no specific found yet
+                ((null m-slot)
+                 (when (null best-fn)
+                   (setq best-fn m-fn)))))))
+        (setq cur (cdr cur))))
+    ;; Call best match: specific > general > default error
+    (let ((fn (if best-specific best-specific best-fn)))
+      (if fn
+        (funcall fn cls obj slot-name)
+        ;; Default: signal unbound-slot error
+        (error "slot unbound")))))
+
+(defun slot-unbound (class obj slot-name)
+  "Default slot-unbound: signals an error."
+  (error "slot unbound"))
+
+(defun class-name (cls)
+  "Return the name of class CLS."
+  (if (%clos-class-p cls)
+    (aref cls 1)
+    (if (%class-proxy-p cls)
+      (%class-proxy-name cls)
+      nil)))
+
+(defun class-of (x)
+  "Return the class of X."
+  (cond
+    ((%clos-instance-p x)
+     (%find-clos-class (aref x 1)))
+    (t nil)))
+
+(defun slot-value (obj slot-name)
+  "Read slot SLOT-NAME from CLOS instance OBJ."
+  (%slot-value obj slot-name))
+
+(defun slot-boundp (obj slot-name)
+  "True if slot SLOT-NAME of OBJ is bound."
+  (%slot-boundp obj slot-name))
+
+(defun slot-makunbound (obj slot-name)
+  "Unset slot SLOT-NAME in OBJ."
+  (%slot-makunbound obj slot-name))
 (defun nstring-parse-start-end (args len)
   "Parse :start/:end keyword args from ARGS plist. Returns (start . end)."
   (let ((start 0) (end len))

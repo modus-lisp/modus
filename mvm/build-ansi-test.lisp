@@ -76,6 +76,14 @@
   (:import-from "DS2" "F"))
 (defpackage "CL-TEST" (:use "CL"))
 
+;; SBCL-side CLOS class registry for make-instance initarg expansion
+;; Each entry: (class-name slot-names . initarg-map)
+;; where initarg-map = list of (initarg-string . slot-symbol)
+(defvar *sbcl-clos-classes* nil)
+
+;; Counter for generating unique slot-unbound method function names
+(defvar *slot-unbound-method-counter* 0)
+
 ;; Helper: safe mapcar that handles dotted lists (returns dotted list)
 (defun mapcar-dotted (fn list)
   "Like mapcar but handles dotted lists. The dotted cdr is passed through fn."
@@ -762,6 +770,18 @@
      (let ((rt-arg (rewrite-reader-forms (cadr (cadr form))))
            (val (rewrite-reader-forms (caddr form))))
        `(%set-readtable-case ,rt-arg ,val)))
+    ;; (setf (slot-value obj slot) val) → (set-slot-value obj slot val)
+    ;; Must handle before the generic setf fallthrough (MVM setf macro only passes 1 arg)
+    ((and (eq (car form) 'setf)
+          (consp (cdr form))
+          (consp (cadr form))
+          (eq (car (cadr form)) 'slot-value)
+          (cddr form))
+     (let ((place (cadr form))
+           (val (rewrite-reader-forms (caddr form))))
+       (let ((obj (rewrite-reader-forms (cadr place)))
+             (slot (rewrite-reader-forms (caddr place))))
+         `(set-slot-value ,obj ,slot ,val))))
     ;; (signals-error form type) → (handler-case (progn form nil) (error (c) t))
     ((and (eq (car form) 'signals-error) (cdr form) (cddr form))
      (let ((body (rewrite-reader-forms (cadr form))))
@@ -967,6 +987,207 @@
        (if body
            `(progn ,@body)
            nil)))
+
+    ;; ---- Minimal CLOS support ----
+
+    ;; (defclass name supers slots &rest options)
+    ;; → (%defclass 'name '(slot-names...)) + reader/accessor/writer defuns
+    ((and (eq (car form) 'defclass) (cdr form) (cddr form))
+     (let* ((class-name (cadr form))
+            ;; supers = (caddr form) — ignored for now
+            (raw-slots (or (cadddr form) nil))
+            ;; Parse slot specs
+            (slot-names nil)
+            (extra-defuns nil)
+            ;; initarg→slot mapping: list of (initarg-string . slot-name)
+            (initarg-map nil))
+       ;; Process each slot spec
+       (dolist (slot-spec raw-slots)
+         (let* ((sname (if (consp slot-spec) (car slot-spec) slot-spec))
+                (opts (if (consp slot-spec) (cdr slot-spec) nil)))
+           (push sname slot-names)
+           ;; Extract :reader, :writer, :accessor, :initarg from opts
+           (let ((cur opts))
+             (loop
+               (when (null cur) (return))
+               (let ((key (car cur))
+                     (val (cadr cur)))
+                 (cond
+                   ((eq key :reader)
+                    (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns))
+                   ((eq key :accessor)
+                    (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns)
+                    (let ((setter-name (intern (concatenate 'string "SET-" (symbol-name val)))))
+                      (push `(defun ,setter-name (obj nv) (set-slot-value obj ',sname nv)) extra-defuns)))
+                   ((eq key :writer)
+                    ;; writer: (fn new-value object)
+                    (push `(defun ,val (nv obj) (set-slot-value obj ',sname nv)) extra-defuns))
+                   ((eq key :initarg)
+                    ;; val is a keyword like :b; map to slot name
+                    (push (cons (symbol-name val) sname) initarg-map))))
+               (setq cur (cddr cur))))))
+       (let ((slot-list (nreverse slot-names)))
+         ;; Register in SBCL-side class registry for make-instance expansion
+         (setf *sbcl-clos-classes*
+               (cons (cons class-name (cons slot-list initarg-map))
+                     *sbcl-clos-classes*))
+         `(progn
+            (%defclass ',class-name ',slot-list)
+            ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))
+
+    ;; (defgeneric name args &rest options) → stub nil
+    ((and (eq (car form) 'defgeneric) (cdr form))
+     nil)
+
+    ;; (define-method-combination name &rest options) → stub nil
+    ((and (eq (car form) 'define-method-combination) (cdr form))
+     nil)
+
+    ;; (defmethod slot-unbound (...) body...) → defun + %add-slot-unbound-method
+    ;; Specializer on obj (2nd param) by class name and slot-name (3rd param)
+    ;; We generate a named defun instead of a lambda to avoid MVM closure issues.
+    ((and (eq (car form) 'defmethod)
+          (cdr form)
+          (eq (cadr form) 'slot-unbound)
+          (consp (caddr form)))
+     (let* ((lambda-list (caddr form))
+            (body (cdddr form))
+            ;; Extract specializers: ((class spec) (obj spec) (slot-name spec))
+            (class-spec (first lambda-list))
+            (obj-spec   (second lambda-list))
+            (slot-spec  (third lambda-list))
+            ;; Get param names
+            (class-param (if (consp class-spec) (car class-spec) class-spec))
+            (obj-param   (if (consp obj-spec)   (car obj-spec)   obj-spec))
+            (slot-param  (if (consp slot-spec)  (car slot-spec)  slot-spec))
+            ;; Get obj class specializer
+            (obj-class
+             (if (and (consp obj-spec) (consp (cadr obj-spec)))
+                 ;; (obj class-name) — class specializer
+                 (cadr obj-spec)
+                 (if (consp obj-spec)
+                     (cadr obj-spec)
+                     t)))
+            ;; Get slot-name specializer: t or (eql 'sym)
+            (slot-specializer
+             (if (and (consp slot-spec) (consp (cadr slot-spec)))
+                 ;; (slot-name (eql 'x)) → extract x
+                 (let ((eql-form (cadr slot-spec)))
+                   (if (and (consp eql-form)
+                            (eq (car eql-form) 'eql)
+                            (consp (cadr eql-form))
+                            (eq (car (cadr eql-form)) 'quote))
+                       ;; (eql 'sym) → sym
+                       (cadr (cadr eql-form))
+                       nil))
+                 nil))
+            (rewritten-body (mapcar #'rewrite-reader-forms body))
+            ;; Generate unique function name to avoid lambda/closure issues
+            (fn-name (intern (format nil "%SLOT-UNBOUND-METHOD-~D"
+                                     (incf *slot-unbound-method-counter*))
+                             :cl-user))
+            ;; Use nil as slot-spec for "match any", or quoted symbol for specific
+            (slot-arg (if slot-specializer `',slot-specializer nil)))
+       `(progn
+          (defun ,fn-name (,class-param ,obj-param ,slot-param)
+            ,@rewritten-body)
+          (%add-slot-unbound-method ',obj-class ,slot-arg #',fn-name))))
+
+    ;; (defmethod name ...) → stub nil for other methods
+    ((and (eq (car form) 'defmethod) (cdr form))
+     nil)
+
+    ;; (make-instance 'class-name &rest initargs)
+    ;; → (%make-instance 'class-name) + set-slot-value for initargs
+    ;; We expand initargs at build time using SBCL-side class registry.
+    ((and (eq (car form) 'make-instance) (cdr form))
+     (let* ((class-arg-raw (cadr form))
+            (class-arg (rewrite-reader-forms class-arg-raw))
+            (rest-args (cddr form))
+            ;; Check if class-arg is a quoted symbol we know about
+            (class-name (if (and (consp class-arg-raw)
+                                 (eq (car class-arg-raw) 'quote)
+                                 (symbolp (cadr class-arg-raw)))
+                            (cadr class-arg-raw)
+                            nil))
+            (slot-info (if class-name
+                           (cdr (assoc class-name *sbcl-clos-classes*))
+                           nil)))
+       (if (null rest-args)
+           ;; No initargs: simple case
+           `(%make-instance ,class-arg)
+           ;; Has initargs: expand inline
+           ;; Generate: (let ((%mi-tmp (%make-instance 'class)))
+           ;;               (set-slot-value %mi-tmp 'slot val) ...
+           ;;               %mi-tmp)
+           (let* ((inst-var '%clos-make-instance-tmp)
+                  (set-forms nil))
+             ;; Walk initargs pairwise
+             (let ((args rest-args))
+               (loop
+                 (when (null args) (return))
+                 (let ((key (car args))
+                       (val (rewrite-reader-forms (cadr args))))
+                   ;; key should be a keyword; find matching slot
+                   (when (keywordp key)
+                     (let* ((kname (symbol-name key))
+                            ;; Find slot with matching initarg
+                            (slot-name (if slot-info
+                                          ;; Look in class slot info
+                                          (cdr (assoc kname (cdr slot-info)
+                                                      :test #'string-equal))
+                                          ;; Fallback: use keyword name as slot name
+                                          (intern (string-upcase kname) :cl-user))))
+                       (when slot-name
+                         (push `(set-slot-value ,inst-var ',slot-name ,val)
+                               set-forms))))
+                   (setq args (cddr args)))))
+             `(let ((,inst-var (%make-instance ,class-arg)))
+                ,@(nreverse set-forms)
+                ,inst-var)))))
+
+    ;; (slot-value obj slot) → (slot-value obj slot) — already defined at runtime
+    ;; (slot-boundp obj slot) → (slot-boundp obj slot) — already defined
+    ;; (slot-makunbound obj slot) → (slot-makunbound obj slot) — already defined
+
+    ;; (with-slots (slot-bindings...) obj body...)
+    ;; → let bindings using slot-value
+    ((and (eq (car form) 'with-slots) (cddr form))
+     (let* ((slot-entries (cadr form))
+            (obj-form (rewrite-reader-forms (caddr form)))
+            (body (mapcar #'rewrite-reader-forms (cdddr form)))
+            ;; Use a fixed obj var name (no gensym — must survive ~S print/read)
+            (obj-var '%with-slots-obj)
+            (bindings
+             (mapcar (lambda (entry)
+                       (if (consp entry)
+                           ;; (var slot-name)
+                           `(,(car entry) (slot-value ,obj-var ',(cadr entry)))
+                           ;; bare slot-name
+                           `(,entry (slot-value ,obj-var ',entry))))
+                     slot-entries)))
+       `(let ((,obj-var ,obj-form))
+          (let ,bindings
+            ,@body))))
+
+    ;; (with-accessors (accessor-bindings...) obj body...)
+    ;; → let bindings using accessor functions
+    ((and (eq (car form) 'with-accessors) (cddr form))
+     (let* ((acc-entries (cadr form))
+            (obj-form (rewrite-reader-forms (caddr form)))
+            (body (mapcar #'rewrite-reader-forms (cdddr form)))
+            (obj-var '%with-accessors-obj)
+            (bindings
+             (mapcar (lambda (entry)
+                       ;; entry = (var accessor-fn)
+                       (if (consp entry)
+                           `(,(car entry) (,(cadr entry) ,obj-var))
+                           `(,entry (,entry ,obj-var))))
+                     acc-entries)))
+       `(let ((,obj-var ,obj-form))
+          (let ,bindings
+            ,@body))))
+
     (t (rewrite-reader-forms-list form))))
 
 (defun rewrite-reader-forms-list (list)

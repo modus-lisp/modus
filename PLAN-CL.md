@@ -1,9 +1,9 @@
 # Plan: Full ANSI Common Lisp Implementation
 
 ## Current State
-- 733 test files, ~12,600 tests, 0 failures
-- ~150 CL functions implemented (core language)
-- ~900 CL functions stubbed or unresolved
+- 371 ANSI tests loaded, 359 passing, 12 failures (9 CLOS, 3 pre-existing)
+- ~350+ CL functions implemented (core language + packages + streams + reader + printer + format + conditions)
+- ~550 CL functions stubbed or unresolved
 - Compiler: MVM bytecode → x64 native, self-hosting
 - Runtime: bare-metal, no OS, tagged 63-bit fixnums + bignums
 
@@ -139,16 +139,16 @@ File system access. Less critical for bare-metal but needed for conformance.
 ## Implementation Order
 
 ```
-Session 1: Packages (make-package, intern, find-symbol, defpackage, in-package)
-Session 2: Streams (stream objects, read-char, write-char, string streams)
-Session 3: Reader (read, readtable, standard syntax)
-Session 4: Printer (write, prin1, print variables)
-Session 5: Format (full directive set)
-Session 6: Conditions (define-condition, handler-bind, restarts)
-Session 7: CLOS core (defclass, make-instance, slot-value)
-Session 8: CLOS dispatch (defgeneric, defmethod, call-next-method)
-Session 9: File I/O (open, close, pathnames)
-Session 10: Polish (eval, compile, loop extensions, declarations)
+Session 1: Packages          ✓ DONE — 24 functions, 303 tests
+Session 2: Streams            ✓ DONE — 9 stream types, read/write-char
+Session 3: Reader             ✓ DONE — full read, readtable, #-dispatch, backquote
+Session 4: Printer            ✓ DONE — write with *print-* vars, prin1, princ, print
+Session 5: Format             ✓ DONE — ~A ~S ~D ~B ~O ~X ~R ~C ~P ~% ~~ ~& ~| ~T ~* ~? ~W ~(~) ~[~] ~{~} ~^
+Session 6: Conditions         ✓ DONE — 24 types, handler-bind, restart-case, signal/warn/cerror
+Session 7: CLOS core          IN PROGRESS — defclass, make-instance, slot-value
+Session 8: CLOS dispatch      — defgeneric, defmethod, call-next-method
+Session 9: File I/O           — open, close, pathnames
+Session 10: Polish            — eval, compile, loop extensions, declarations
 ```
 
 Each session: implement the layer, add test coverage, verify 0 regressions.

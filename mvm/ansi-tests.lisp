@@ -1133,7 +1133,8 @@
   (run-regression-tests)
   (run-typep-debug-tests)
   (run-stream-debug-tests)
-  (run-reader-tests))
+  (run-reader-tests)
+  (run-clos-diag-tests))
 
 (defun run-stream-debug-tests ()
   ;; Stream type system
@@ -1358,3 +1359,68 @@
   (deftest 9999
     (multiple-value-list (read-from-string "123  "))
     (list 123 4)))
+
+;;; CLOS diagnostics
+(defun run-clos-diag-tests ()
+  ;; Test: interning works: same symbol twice should be eq
+  (let ((s1 (%intern-symbol (ash 12345 1)))
+        (s2 (%intern-symbol (ash 12345 1))))
+    (deftest 9090 (eq s1 s2) t))
+  ;; Test: make-array returns an object with subtag #x32
+  (let ((a (make-array 5)))
+    (deftest 9091 (obj-subtag a) #x32))
+  ;; Test: aset/aref roundtrip for fixnum
+  (let ((a (make-array 3)))
+    (aset a 0 42)
+    (deftest 9092 (aref a 0) 42))
+  ;; Test: aset/aref roundtrip for symbol
+  (let ((a (make-array 3))
+        (sym '%clos-instance))
+    (aset a 0 sym)
+    (deftest 9093 (eq (aref a 0) '%clos-instance) t))
+  ;; Test 1: %defclass creates a class
+  (%defclass 'diag-class-01 '(x y z))
+  (let ((cls (%find-clos-class 'diag-class-01)))
+    (deftest 9100 (null cls) nil))
+  ;; Test 2: class has correct name
+  (let ((cls (%find-clos-class 'diag-class-01)))
+    (deftest 9101 (if cls (aref cls 1) 'no-class) 'diag-class-01))
+  ;; Test 3: %make-instance returns non-nil
+  (let ((inst (%make-instance 'diag-class-01)))
+    (deftest 9102 (null inst) nil))
+  ;; Test 3b: array-length of instance
+  (let ((inst (%make-instance 'diag-class-01)))
+    (deftest 9109 (if inst (array-length inst) -1) 5))
+  ;; Test 3c: aref inst 0 raw value (should be non-nil)
+  (let ((inst (%make-instance 'diag-class-01)))
+    (deftest 9110 (if inst (null (aref inst 0)) t) nil))
+  ;; Test 3d: what IS aref inst 0? Check if it equals aref class 0 (which should be '%clos-class)
+  (let ((inst (%make-instance 'diag-class-01))
+        (cls (%find-clos-class 'diag-class-01)))
+    ;; cls[0] = '%clos-class, inst[0] = '%clos-instance — these should be different
+    (deftest 9111 (if (and inst cls) (eq (aref inst 0) (aref cls 0)) t) nil))
+  ;; Test 3e: verify inst[1] = 'diag-class-01 (the class name was stored correctly)
+  (let ((inst (%make-instance 'diag-class-01)))
+    (deftest 9112 (if inst (eq (aref inst 1) 'diag-class-01) nil) t))
+  ;; Test: direct aset/aref on inst
+  (let ((inst (%make-instance 'diag-class-01)))
+    (when inst
+      (aset inst 0 'my-tag)
+      (aset inst 1 'my-name))
+    (deftest 9113 (if inst (eq (aref inst 0) 'my-tag) nil) t))
+  ;; Test: what if we store directly?
+  (let ((a (make-array 5)))
+    (aset a 0 '%clos-instance)
+    (aset a 1 'diag-class-01)
+    (deftest 9114 (eq (aref a 0) '%clos-instance) t)
+    (deftest 9115 (eq (aref a 1) 'diag-class-01) t))
+  ;; Test 4: instance has tag %clos-instance
+  (let ((inst (%make-instance 'diag-class-01)))
+    (deftest 9103 (if inst (eq (aref inst 0) '%clos-instance) nil) t))
+  ;; Test 5: %clos-instance-p returns t for instance
+  (let ((inst (%make-instance 'diag-class-01)))
+    (deftest 9104 (%clos-instance-p inst) t))
+  ;; Test 6: set-slot-value writes and slot-value reads
+  (let ((inst (%make-instance 'diag-class-01)))
+    (set-slot-value inst 'x 42)
+    (deftest 9105 (slot-value inst 'x) 42)))

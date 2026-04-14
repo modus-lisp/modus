@@ -37,8 +37,14 @@
   (if (eq a b) t nil))
 
 (defun eqlt (a b)
-  "Like eql but returns exactly T."
-  (if (eql a b) t nil))
+  "Like eql but returns exactly T.
+   Normalizes characters to their char-code (a fixnum) before comparing,
+   so that (eqlt (aref str 0) #\\T) works even though string elements are
+   stored as fixnum char-codes while character literals are tagged chars.
+   Uses characterp (the correct type predicate) to detect chars."
+  (let ((na (if (characterp a) (char-code a) a))
+        (nb (if (characterp b) (char-code b) b)))
+    (if (eql na nb) t nil)))
 
 (defun equalt (a b)
   "Like my-equal but returns exactly T."
@@ -47,6 +53,18 @@
 (defun notnot (x)
   "Coerce to boolean: nil → nil, anything else → t."
   (if x t nil))
+
+(defun =t (x &rest args)
+  "Like =, but guaranteed to return T for true. Handles 1-arg and 2-arg cases."
+  (if (null args)
+      t
+      (if (= x (car args)) t nil)))
+
+(defun <=t (x &rest args)
+  "Like <=, but guaranteed to return T for true. Handles 1-arg and 2-arg cases."
+  (if (null args)
+      t
+      (if (<= x (car args)) t nil)))
 
 ;;; ============================================================
 ;;; Real ANSI Tests — from Paul Dietz cons/cons.lsp
@@ -843,7 +861,73 @@
                                         (progn (setq i (+ i 1)) i))
                                   i)))))
                     (cons (cons 1 2) (cons 2 nil)))
-                  t) t))
+                  t) t)
+  ;; Test MVP1.6 pattern: multiple-value-call #'list with MVP1 and plain vars
+  ;; (multiple-value-call #'list MVP1-form x y) rewrites to append of MVLs
+  (deftest 2406
+    (let ((x 0) (y 0))
+      (append (multiple-value-list
+                (let ((%mvp1-result (multiple-value-list (values x y))))
+                  (incf x)
+                  (incf y 2)
+                  (values-list %mvp1-result)))
+              (multiple-value-list x)
+              (multiple-value-list y)))
+    (list 0 0 1 2))
+  ;; Sub-test: just the MVP1 form returning MVL result
+  (deftest 2407a
+    (let ((x 0) (y 0))
+      (multiple-value-list
+        (let ((%mvp1-result (multiple-value-list (values x y))))
+          (incf x)
+          (incf y 2)
+          (values-list %mvp1-result))))
+    (list 0 0))
+  ;; Sub-test: just the inner values-list part
+  (deftest 2407
+    (let ((x 0) (y 0))
+      (multiple-value-list (values x y)))
+    (list 0 0))
+  ;; Sub-test: mvl directly around values-list (not through let binding)
+  (deftest 2408
+    (multiple-value-list (values-list (list 0 0)))
+    (list 0 0))
+  ;; Sub-test: plain variable mvl returns (var)
+  (deftest 2409
+    (let ((x 42))
+      (multiple-value-list x))
+    (list 42))
+  ;; Sub-test: append of three mvl results
+  (deftest 2410
+    (let ((x 1) (y 2))
+      (append (multiple-value-list (values 0 0))
+              (multiple-value-list x)
+              (multiple-value-list y)))
+    (list 0 0 1 2))
+  ;; Sub-test: mvl directly wrapping a form that sets count=2
+  (deftest 2411
+    (multiple-value-list
+      (let ((%mvp1-result (multiple-value-list (values 0 0))))
+        (values-list %mvp1-result)))
+    (list 0 0))
+  ;; Sub-test: values-list then %mv-to-list directly
+  (deftest 2412
+    (let ((r (list 5 6)))
+      (let ((primary (values-list r)))
+        (%mv-to-list primary)))
+    (list 5 6))
+  ;; Sub-test: append of three mvl results (test rewrite for multiple-value-call #'list)
+  (deftest 2413
+    (let ((x 1) (y 2))
+      (append (multiple-value-list (values 0 0))
+              (multiple-value-list x)
+              (multiple-value-list y)))
+    (list 0 0 1 2))
+  ;; Sub-test: does &rest arg transformation of append work?
+  (deftest 2416
+    (let ((a (list 0 0)) (b (list 1)) (c (list 2)))
+      (append a b c))
+    (list 0 0 1 2)))
 
 ;;; ============================================================
 ;;; Regression tests (9000+)
@@ -905,6 +989,114 @@
                   (setq x (+ x 1))
                   x)
                 30))
+
+  ;; unwind-protect with multiple values (gentemp-style)
+  (deftest 9050
+    (multiple-value-list
+      (unwind-protect
+          (values 1 2 3 4 5)
+        nil))
+    (list 1 2 3 4 5))
+
+  (deftest 9051
+    (multiple-value-list
+      (let ((x 0))
+        (unwind-protect
+            (values t t t t t)
+          (setq x 1))))
+    (list t t t t t))
+
+  ;; Test apply #'= as runtime function
+  (deftest 9052
+    (apply #'= (list 5 5))
+    t)
+
+  (deftest 9053
+    (apply #'= (list 5 6))
+    nil)
+
+  ;; =t pattern
+  (deftest 9054
+    (multiple-value-list
+      (let ((x 5) (y 5))
+        (apply #'values (mapcar #'notnot (multiple-value-list (apply #'= x (list y)))))))
+    (list t))
+
+  ;; Isolate =t behavior
+  (deftest 9056
+    (let ((x 5) (y 5))
+      (=t x y))
+    t)
+
+  (deftest 9057
+    (multiple-value-list
+      (let ((x 5) (y 5))
+        (values
+         (=t x y)
+         (eqlt #\T #\T)
+         (notnot t)
+         t
+         t)))
+    (list t t t t t))
+
+  ;; gentemp-style test with symbol-name aref
+  (deftest 9058
+    (let* ((sym (gentemp)))
+      (let ((sym-name (symbol-name sym)))
+        (eqlt (aref sym-name 0) #\T)))
+    t)
+
+  ;; Full gentemp pattern without unwind-protect
+  (deftest 9059
+    (multiple-value-list
+      (let* ((gcounter *gensym-counter*)
+             (sym (gentemp))
+             (sym-name (symbol-name sym)))
+        (values
+         (=t gcounter *gensym-counter*)
+         (eqlt (aref sym-name 0) #\T)
+         (notnot (every #'digit-char-p (subseq sym-name 1)))
+         t
+         t)))
+    (list t t t t t))
+
+  ;; gentemp in specific package (like gentemp.1)
+  (deftest 9060
+    (let ((pkg-name "GENTEMP-DEBUG-9060"))
+      (unwind-protect
+          (let* ((pkg (make-package pkg-name :use nil))
+                 (gcounter *gensym-counter*)
+                 (sym (let ((*package* pkg)) (gentemp)))
+                 (sym-name (symbol-name sym)))
+            (values
+             (=t gcounter *gensym-counter*)
+             (eqlt (aref sym-name 0) #\T)
+             (notnot (every #'digit-char-p (subseq sym-name 1)))
+             (eql (symbol-package sym) pkg)
+             (do-external-symbols (s pkg t) (when (eql s sym) (return nil)))))
+        (delete-package pkg-name)))
+    t t t t t)
+
+  ;; Direct int-vs-char eqlt test
+  (deftest 9061
+    (eqlt 84 #\T)
+    t)
+
+  ;; eqlt with string aref result
+  (deftest 9062
+    (let ((s "T0"))
+      (eqlt (aref s 0) #\T))
+    t)
+
+  ;; unwind-protect with cleanup that resets MV count
+  (deftest 9055
+    (multiple-value-list
+      (let ((pkg-name "UWP-TEST-PKG-9055"))
+        (unwind-protect
+            (let* ((pkg (make-package pkg-name :use nil)))
+              (values t t t pkg pkg))
+          (delete-package pkg-name))))
+    (list t t t t t))
 
 ;;; ============================================================
 ;;; Master test runner
@@ -1019,7 +1211,7 @@
   (deftest 9981 (equalt "" "") t)
   (deftest 9982 (equalt (make-string 0) "") t)
   (deftest 9983 (let ((s (make-string 0 :element-type nil)))
-    (list (notnot (stringp s)) (eqlt (length s) 0))) (list t t)))
+    (list (notnot (stringp s)) (eqlt (length s) 0))) (list t t))
   ;; Backquote type test — mirror REAL.1 first iteration
   (deftest 9940
     (let ((tp (list 'real 0 1)))

@@ -193,7 +193,7 @@
               ;; x64 translator uses code-buffer from modus.asm
               (let* ((raw (modus.asm:code-buffer-bytes buf))
                      (len (modus.asm:code-buffer-position buf))
-                     (result (make-array len)))
+                     (result (make-array len :element-type '(unsigned-byte 8))))
                 (dotimes (i len result)
                   (setf (aref result i) (aref raw i))))))
          (error (e)

@@ -60,6 +60,26 @@
       (dotimes (i len s)
         (aset s i (aref (cdr w) (+ offset i)))))))
 
+(defun rt-arrayp (x)
+  "Check if x is a plain array (object with subtag #x32)."
+  (if (fixnump x) nil
+    (if (consp x) nil
+      (if (null x) nil
+        (= (obj-subtag x) #x32)))))
+
+(defun rt-array-equal (a b)
+  "Compare two arrays element-by-element."
+  (let ((la (array-length a))
+        (lb (array-length b)))
+    (if (= la lb)
+        (let ((i 0))
+          (loop
+            (when (= i la) (return t))
+            (unless (rt-equal (aref a i) (aref b i))
+              (return nil))
+            (setq i (+ i 1))))
+        nil)))
+
 (defun rt-equal (a b)
   "Structural equality for RT comparisons."
   (if (eql a b)
@@ -87,7 +107,11 @@
                               (rt-equal a (rt-wrapper-to-string b))
                               nil)
                           nil))
-                  nil)))))
+                  (if (rt-arrayp a)
+                      (if (rt-arrayp b)
+                          (rt-array-equal a b)
+                          nil)
+                      nil))))))
 
 (defun deftest (id actual expected)
   "Run a test: compare ACTUAL with EXPECTED using rt-equal.
@@ -135,6 +159,13 @@
         (write-char-serial 76)   ; L
         (write-char-serial 32)   ; space
         (write-object name)
+        ;; Print actual value for first 5 failures
+        (when (< *rt-fail-count* 6)
+          (write-char-serial 32)   ; space
+          (write-string-serial "GOT:")
+          (write-object actual)
+          (write-string-serial " EXP:")
+          (write-object expected))
         (write-char-serial 10))))
 
 (defun rt-run-test-mv (name actuals expecteds)
@@ -150,6 +181,12 @@
         (write-char-serial 76)
         (write-char-serial 32)
         (write-object name)
+        (when (< *rt-fail-count* 6)
+          (write-char-serial 32)
+          (write-string-serial "GOT:")
+          (write-object actuals)
+          (write-string-serial " EXP:")
+          (write-object expecteds))
         (write-char-serial 10))))
 
 (defun do-tests ()

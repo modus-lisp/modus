@@ -111,8 +111,8 @@
 (defconstant +frame-total-size+ 1120
   "Total frame reservation in bytes. Callee-saved saves (32) + spill slots (56)
    + 128 frame slots for local variables (1024) = 1112, rounded to 1120.
-   Note: fe-mul (crypto.lisp) has ~74 nested let/let* bindings requiring 74
-   frame slots. 32 was too few, causing silent stack corruption.")
+   Note: fe-mul (crypto.lisp) has ~74 nested let/let* bindings but works because
+   many are within inner lambdas (each gets their own frame).")
 
 ;;; ============================================================
 ;;; Scratch Register for Spill Mediation
@@ -2498,6 +2498,10 @@
                (emit-label buf fn-label)
                ;; Emit prologue
                (emit-function-prologue buf)
+               ;; If length=0 (orphaned stub with no bytecode), emit an immediate
+               ;; epilogue+ret so we don't fall through into the next function.
+               (when (zerop length)
+                 (emit-function-epilogue buf))
                ;; Pre-scan branch targets
                (scan-branch-targets state)
                ;; Translate instructions

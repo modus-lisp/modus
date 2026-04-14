@@ -142,7 +142,8 @@
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
   (stack-depth 0)      ; current stack depth (in slots)
-  (parent nil))        ; parent environment for nested scopes
+  (parent nil)         ; parent environment for nested scopes
+  (fn-names nil))      ; alist of (local-name . unique-global-name) for flet/labels
 
 (defstruct binding
   name               ; symbol name
@@ -374,13 +375,31 @@
               :key #'binding-name :test #'equal)
         (env-lookup (compile-env-parent env) name))))
 
+(defun env-lookup-fn (env name)
+  "Find the unique global function name for a locally-bound flet/labels NAME.
+   Searches the parent chain via fn-names alist. Returns string or nil."
+  (when env
+    (let ((entry (assoc name (compile-env-fn-names env) :test #'equal)))
+      (if entry
+          (cdr entry)
+          (env-lookup-fn (compile-env-parent env) name)))))
+
+(defun env-add-fn (env local-name global-name)
+  "Add a flet/labels function name mapping to ENV."
+  (make-compile-env
+   :bindings (compile-env-bindings env)
+   :stack-depth (compile-env-stack-depth env)
+   :parent (compile-env-parent env)
+   :fn-names (cons (cons local-name global-name) (compile-env-fn-names env))))
+
 (defun env-extend-reg (env name reg)
   "Add a register binding for NAME to ENV"
   (make-compile-env
    :bindings (cons (make-binding :name name :location :reg :reg reg)
                    (compile-env-bindings env))
    :stack-depth (compile-env-stack-depth env)
-   :parent (compile-env-parent env)))
+   :parent (compile-env-parent env)
+   :fn-names (compile-env-fn-names env)))
 
 (defun env-extend-stack (env name)
   "Allocate a stack slot for NAME, return (values new-env slot-index)"
@@ -391,7 +410,8 @@
                                                   :stack-slot slot)
                                    (compile-env-bindings env))
                    :stack-depth (1+ slot)
-                   :parent (compile-env-parent env))))
+                   :parent (compile-env-parent env)
+                   :fn-names (compile-env-fn-names env))))
     (cons new-env slot)))
 
 (defun env-child (env)
@@ -399,6 +419,7 @@
   (make-compile-env
    :bindings nil
    :stack-depth (compile-env-stack-depth env)
+   :fn-names (compile-env-fn-names env)
    :parent env))
 
 ;;; ============================================================
@@ -1358,15 +1379,21 @@
       ((= op-name 1080561289491153610)  (compile-dotimes (cadr form) (cddr form) env dest))
       ((= op-name 113179339635393781) (compile-function-ref (cadr form) env dest))
       ((= op-name 59431251605330656)  (compile-funcall (cdr form) env dest))
-      ;; FLET/LABELS — compile local functions as named lambdas
-      ((or (= op-name 230909053785822708) (= op-name 176230696681611090))
-       (compile-flet (cadr form) (cddr form) env dest))
+      ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
+      ((= op-name 230909053785822708)
+       (compile-flet (cadr form) (cddr form) env dest nil))
+      ;; LABELS — compile local functions, bodies see all local names (recursive)
+      ((= op-name 176230696681611090)
+       (compile-flet (cadr form) (cddr form) env dest t))
       ;; RETURN-FROM — treat as return (ignore block name)
       ((= op-name 102326962717880022)
        (compile-return (caddr form) env dest))
       ;; VALUES — return multiple values
       ((= op-name 419785975474686239)
        (compile-values (cdr form) env dest))
+      ;; VALUES-LIST — return list elements as multiple values
+      ((= op-name 276551395991592440)
+       (compile-values-list (cadr form) env dest))
       ;; MULTIPLE-VALUE-BIND — bind variables to multiple return values
       ((= op-name 544225037749651317)
        (compile-multiple-value-bind (cadr form) (caddr form) (cdddr form) env dest))
@@ -1379,6 +1406,12 @@
       ;; IGNORE-ERRORS — compile body only
       ((= op-name 1140402238842668217)
        (compile-progn (cdr form) env dest))
+      ;; UNWIND-PROTECT — protected form + cleanup, preserving MV state
+      ;; (unwind-protect protected cleanup...)
+      ;; Evaluates protected, saves MV state, runs cleanup forms,
+      ;; restores MV state, returns primary value of protected form.
+      ((= op-name 446290548490879374)
+       (compile-unwind-protect (cadr form) (cddr form) env dest))
       ;; MACROLET — register local macros, compile body, then unregister
       ((= op-name 36999051998272136)
        (let ((saved-macros nil)
@@ -1736,6 +1769,22 @@
            (emit-ir :li temp (ash (char-code (char value i)) +fixnum-shift+))
            (emit-ir :obj-set dest i temp))
          (free-temp-reg))))
+    ;; Vector: allocate array object and fill with elements
+    ((vectorp value)
+     (let ((n (length value)))
+       ;; Allocate into a temp slot so element compile-quote (which may
+       ;; call %INTERN-SYMBOL and clobber VR) doesn't corrupt the pointer
+       (let ((arr-slot (alloc-temp-reg)))
+         (emit-ir :alloc-obj arr-slot n +subtag-array+)
+         (when (> n 0)
+           (let ((elem-slot (alloc-temp-reg)))
+             (dotimes (i n)
+               (compile-quote (aref value i) elem-slot)
+               (emit-ir :obj-set arr-slot i elem-slot))
+             (free-temp-reg)))
+         (unless (= dest arr-slot)
+           (emit-ir :mov dest arr-slot))
+         (free-temp-reg))))
     ;; Other: use constant table
     (t
      (let ((idx (length *constant-table*)))
@@ -1939,7 +1988,8 @@
     (let ((reserve-env (make-compile-env
                         :bindings (compile-env-bindings env)
                         :stack-depth (+ (compile-env-stack-depth env) n-bindings)
-                        :parent (compile-env-parent env))))
+                        :parent (compile-env-parent env)
+                        :fn-names (compile-env-fn-names env))))
       ;; Evaluate each binding value and store it to a stack slot
       (let ((i 0))
         (dolist (binding bindings)
@@ -1962,7 +2012,8 @@
                                   :stack-slot (+ (compile-env-stack-depth env) i))
                                 (compile-env-bindings new-env))
                  :stack-depth (+ (compile-env-stack-depth env) n-bindings)
-                 :parent (compile-env-parent new-env)))
+                 :parent (compile-env-parent new-env)
+                 :fn-names (compile-env-fn-names new-env)))
           (setq i (+ i 1)))))
     ;; Fix stack-depth in the final env
     (setf (compile-env-stack-depth new-env)
@@ -2001,7 +2052,8 @@
                                   :stack-slot slot)
                                 (compile-env-bindings new-env))
                  :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
-                 :parent (compile-env-parent new-env)))
+                 :parent (compile-env-parent new-env)
+                 :fn-names (compile-env-fn-names new-env)))
           (setq i (+ i 1)))))
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
@@ -2078,31 +2130,50 @@
 ;;; Flet / Labels
 ;;; ============================================================
 
-(defun compile-flet (defs body env dest)
+(defun compile-flet (defs body env dest &optional labels-p)
   "Compile (flet ((name (params) body) ...) body).
-   Each local function is compiled as a named global function.
-   The local name is used for calls within the body.
-   The compiled IR is collected in *pending-flet-ir* for later emission."
-  (dolist (def defs)
-    (let ((name (car def))
-          (params (cadr def))
-          (fbody (cddr def)))
-      (let ((pp (preprocess-params params fbody)))
-        ;; Use mvm-compile-function-internal with parent env (for closure access),
-        ;; then manually register and collect IR (like mvm-compile-function does).
-        (let* ((fname (cond ((symbolp name) (symbol-name name))
-                            ((and (consp name) (eq (car name) 'setf))
-                             (format nil "SETF-~A" (symbol-name (cadr name))))
-                            (t (format nil "~A" name))))
-               (result (mvm-compile-function-internal fname (car pp) (cdr pp) env))
-               (info (car result)))
-          ;; Register in function table so CALL resolution works
-          (setf (gethash (function-info-name info) *functions*) info)
-          (push info *function-table*)
-          ;; Save IR for collection by mvm-compile-all
-          (push result *pending-flet-ir*)))))
-  ;; Compile body in same environment
-  (compile-progn (strip-declares body) env dest))
+   Each local function is compiled as a named global function with a UNIQUE
+   name (to prevent last-defun-wins collisions across multiple flet definitions).
+   The local name is mapped to the unique name in the env, so #'local-name
+   references within the body resolve to the unique global name.
+   LABELS-P: if true, local function bodies can reference other local names
+   (implements LABELS mutual recursion). If false (FLET), bodies see only parent env."
+  ;; First pass: build flet-env with all name mappings
+  (let ((flet-env env)
+        (defs-info nil)) ; list of (name unique-name params fbody) for second pass
+    (dolist (def defs)
+      (let ((name (car def))
+            (params (cadr def))
+            (fbody (cddr def)))
+        ;; Generate unique global name
+        (let* ((base-name (cond ((symbolp name) (symbol-name name))
+                                ((and (consp name) (eq (car name) 'setf))
+                                 (format nil "SETF-~A" (symbol-name (cadr name))))
+                                (t (format nil "~A" name))))
+               (unique-name (format nil "~A$$FLET~D" base-name (make-compiler-label)))
+               (local-key base-name))
+          ;; Add local→unique mapping to the flet env
+          (setq flet-env (env-add-fn flet-env local-key unique-name))
+          (push (list local-key unique-name params fbody) defs-info))))
+    ;; Second pass: compile each function body
+    (dolist (d (nreverse defs-info))
+      (let* ((local-key (first d))
+             (unique-name (second d))
+             (params (third d))
+             (fbody (fourth d))
+             ;; For labels, function bodies see flet-env (mutual recursion);
+             ;; for flet, function bodies see parent env only.
+             (body-env (if labels-p flet-env env))
+             (pp (preprocess-params params fbody))
+             (result (mvm-compile-function-internal unique-name (car pp) (cdr pp) body-env))
+             (info (car result)))
+        (declare (ignore local-key))
+        ;; Register with unique name
+        (setf (gethash (function-info-name info) *functions*) info)
+        (push info *function-table*)
+        (push result *pending-flet-ir*)))
+    ;; Compile outer body with the flet env (has name mappings)
+    (compile-progn (strip-declares body) flet-env dest)))
 
 ;;; ============================================================
 ;;; When / Unless
@@ -2764,19 +2835,23 @@
 (defun compile-function-ref (name env dest)
   "Compile (function fname) or (function (lambda ...)).
    For named functions, emits FN-ADDR to load native address.
+   Checks the env for flet/labels name mappings first (unique names).
    For lambda, compiles the lambda expression."
   (if (and (consp name) (symbolp (car name))
            (string= (symbol-name (car name)) "LAMBDA"))
       ;; #'(lambda (params) body...) → compile as lambda
       (compile-lambda (cadr name) (cddr name) env dest)
       ;; #'name or #'(setf name) → load function address
-      (let ((fn-name (cond
-                       ((symbolp name) (symbol-name name))
-                       ((and (consp name) (eq (car name) 'setf))
-                        (format nil "SETF-~A" (symbol-name (cadr name))))
-                       ((stringp name) name)
-                       (t "UNKNOWN"))))
-        (emit-ir :li-func dest fn-name))))
+      (let* ((fn-name (cond
+                        ((symbolp name) (symbol-name name))
+                        ((and (consp name) (eq (car name) 'setf))
+                         (format nil "SETF-~A" (symbol-name (cadr name))))
+                        ((stringp name) name)
+                        (t "UNKNOWN")))
+             ;; Check if this name is a flet/labels local name — use the unique name
+             (unique-name (env-lookup-fn env fn-name))
+             (resolved-name (or unique-name fn-name)))
+        (emit-ir :li-func dest resolved-name))))
 
 ;;; ============================================================
 ;;; Multiple Values
@@ -2825,6 +2900,39 @@
                             ,(car temp-vars))
                          env dest)))))))
 
+(defun compile-values-list (list-form env dest)
+  "Compile (values-list lst).
+   Evaluates lst, then iterates it storing values into the MV buffer.
+   Returns first element as primary value, extras stored in MV-VALUES-ADDR.
+   Equivalent to: (apply #'values lst) but with proper MV buffer writes."
+  (let ((lst-tmp (gensym "VL"))
+        (cur-tmp (gensym "VLCUR"))
+        (idx-tmp (gensym "VLIDX"))
+        (cnt-tmp (gensym "VLCNT"))
+        (pri-tmp (gensym "VLPRI")))
+    ;; Compile to a runtime loop that:
+    ;; 1. Evaluates lst
+    ;; 2. Counts elements
+    ;; 3. Stores count at MV-COUNT-ADDR
+    ;; 4. Stores elements 2+ at MV-VALUES-ADDR[i]
+    ;; 5. Returns first element
+    (compile-form
+     `(let* ((,lst-tmp ,list-form)
+             (,pri-tmp (if (null ,lst-tmp) nil (car ,lst-tmp)))
+             (,cnt-tmp (length ,lst-tmp)))
+        ;; Store count
+        (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
+        ;; Store extra values (elements 1+) into MV-VALUES-ADDR
+        (let ((,cur-tmp (if (null ,lst-tmp) nil (cdr ,lst-tmp)))
+              (,idx-tmp 0))
+          (loop
+            (when (null ,cur-tmp) (return nil))
+            (setf (mem-ref (+ ,+mv-values-addr+ (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
+            (setq ,idx-tmp (+ ,idx-tmp 1))
+            (setq ,cur-tmp (cdr ,cur-tmp))))
+        ,pri-tmp)
+     env dest)))
+
 (defun compile-multiple-value-bind (vars form body env dest)
   "Compile (multiple-value-bind (v1 v2 ...) form body...).
    Evaluates form, then reads MV count and values into let* bindings.
@@ -2866,6 +2974,8 @@
         (cond
           ;; Direct values call
           ((= hash 419785975474686239) t)  ; VALUES
+          ;; VALUES-LIST also returns multiple values
+          ((= hash 276551395991592440) t)  ; VALUES-LIST
           ;; progn — check last form
           ((= hash 87505416312042891)      ; PROGN
            (tail-form-is-values-p (cdr form)))
@@ -2881,9 +2991,45 @@
 
 (defun compile-multiple-value-list (form env dest)
   "Compile (multiple-value-list form).
-   Evaluates form, then calls %mv-to-list to collect all values into a list."
+   Resets MV count to 1 before evaluating form (so plain single-value expressions
+   produce a 1-element list), then evaluates form (which may override count with
+   its actual MV count), then calls %mv-to-list to collect all values into a list."
   (let ((tmp (gensym "MV")))
-    (compile-form `(let ((,tmp ,form)) (%mv-to-list ,tmp)) env dest)))
+    (compile-form
+     `(progn
+        ;; Reset count to 1 so single-valued expressions produce (list val)
+        (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+        (let ((,tmp ,form)) (%mv-to-list ,tmp)))
+     env dest)))
+
+(defun compile-unwind-protect (protected-form cleanup-forms env dest)
+  "Compile (unwind-protect protected cleanup...).
+   Since we have no real non-local exits, this evaluates protected-form,
+   saves the MV state (count + extra values), runs cleanup-forms (which
+   may clobber MV state via their epilogues), restores MV state, then
+   returns the primary value of the protected form."
+  (let* ((result-var (gensym "UWPRES"))
+         (n-mv-slots 8)
+         (mv-count-save (gensym "UWPCNT"))
+         (mv-save-vars (loop for i from 0 below n-mv-slots
+                             collect (gensym (format nil "UWPMV~D" i))))
+         (mv-save-bindings
+           (cons (list mv-count-save `(mem-ref ,+mv-count-addr+ :u64))
+                 (loop for i from 0 below n-mv-slots
+                       for sv in mv-save-vars
+                       collect (list sv `(mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64)))))
+         (mv-restore-forms
+           (cons `(setf (mem-ref ,+mv-count-addr+ :u64) ,mv-count-save)
+                 (loop for i from 0 below n-mv-slots
+                       for sv in mv-save-vars
+                       collect `(setf (mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64) ,sv)))))
+    (compile-form
+     `(let* ((,result-var ,protected-form)
+             ,@mv-save-bindings)
+        ,@cleanup-forms
+        ,@mv-restore-forms
+        ,result-var)
+     env dest)))
 
 (defun compile-funcall (args env dest)
   "Compile (funcall f arg1 arg2 ...) - indirect function call"
@@ -3613,10 +3759,10 @@
     (compile-form arg env dest)
     ;; Extract low byte
     (emit-ir :li temp #xFF)
-    (emit-ir :and temp dest temp)
+    (emit-ir :and dest dest temp)
     ;; Compare to char tag
     (emit-ir :li temp2 +char-tag+)
-    (emit-ir :cmp temp temp2)
+    (emit-ir :cmp dest temp2)
     (emit-ir :beq true-label)
     ;; Not character
     (compile-nil dest)
@@ -3974,7 +4120,7 @@
       (emit-ir :li temp 0)
       (emit-ir :cmp dest temp)
       (free-temp-reg))
-    (emit-ir :beq dest nil-label)
+    (emit-ir :beq nil-label)
     ;; Non-zero: handler active → return T
     (emit-ir :li dest +t-value+)
     (emit-ir :br end-label)
@@ -4287,7 +4433,9 @@
   ;; &optional padding: if fewer args than params, pad with NIL
   (when (and (symbolp fn) (boundp '*functions*) *functions*)
     (let* ((fn-name (symbol-name fn))
-           (fn-info (gethash fn-name *functions*)))
+           ;; Check for flet/labels name mapping
+           (resolved-fn-name (or (env-lookup-fn env fn-name) fn-name))
+           (fn-info (gethash resolved-fn-name *functions*)))
       (when fn-info
         (cond
           ((function-info-rest-param-p fn-info)
@@ -4351,12 +4499,17 @@
     (cond
       ;; Direct call to named function
       ((symbolp fn)
-       (let ((fn-name (symbol-name fn)))
-         (emit-ir :call fn-name nargs)))
+       (let* ((fn-name (symbol-name fn))
+              ;; Check env for flet/labels name mapping (unique name)
+              (unique-name (env-lookup-fn env fn-name))
+              (resolved-name (or unique-name fn-name)))
+         (emit-ir :call resolved-name nargs)))
       ;; (setf name) function — emit as SETF-NAME call
       ((and (consp fn) (eq (car fn) 'setf) (symbolp (cadr fn)))
-       (let ((fn-name (format nil "SETF-~A" (symbol-name (cadr fn)))))
-         (emit-ir :call fn-name nargs)))
+       (let* ((base-name (format nil "SETF-~A" (symbol-name (cadr fn))))
+              (unique-name (env-lookup-fn env base-name))
+              (resolved-name (or unique-name base-name)))
+         (emit-ir :call resolved-name nargs)))
       ;; Other callable expression
       (t
        (let ((fn-reg (alloc-temp-reg)))
@@ -4498,7 +4651,11 @@
       (compile-progn (strip-declares body) env +vreg-vr+))
 
     ;; Set MV count=1 for non-values functions (Genera-style).
-    (unless (tail-form-is-values-p (strip-declares body))
+    ;; Skip for functions that manually manage the MV buffer (e.g., VALUES, VALUES-LIST).
+    (unless (or (tail-form-is-values-p (strip-declares body))
+                (string= *current-function-name* "VALUES")
+                (string= *current-function-name* "VALUES-LIST")
+                (string= *current-function-name* "%MV-RETURNING"))
       (emit-ir :set-mv-count 1))
 
     ;; Function return label (for early return via (return value))
@@ -5346,9 +5503,17 @@
                 (format nil "line ~D" (aref source-lines form-index))
                 (format nil "form#~D" form-index)))
       (incf form-index)
-      (let* ((result (handler-case (mvm-compile-toplevel form)
+      ;; Snapshot *function-table* before compiling this form, so we can
+      ;; remove any orphaned lambda entries on error.
+      (let* ((fn-table-before *function-table*)
+             (result (handler-case (mvm-compile-toplevel form)
                         (error (e)
                           (format t "  SKIP ~A: ~A~%" *current-source-location* e)
+                          ;; Remove any lambda/flet entries that were added to
+                          ;; *function-table* during this failed form's compilation.
+                          ;; These have no corresponding bytecode (bytecode-length=0)
+                          ;; and would become prologue-only stubs that fall through.
+                          (setf *function-table* fn-table-before)
                           (setf *pending-flet-ir* nil)
                           nil))))
         (cond

@@ -591,6 +591,18 @@
      (write-char-serial 83)    ; S
      (print-dec (aref obj 0))
      (write-char-serial 62))   ; >
+    ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
+          (= (obj-subtag obj) #x32))
+     ;; Array: print as #(...)
+     (write-char-serial 35)    ; #
+     (write-char-serial 40)    ; (
+     (let ((len (array-length obj)) (i 0))
+       (loop
+         (when (= i len) (return nil))
+         (when (> i 0) (write-char-serial 32))
+         (write-object (aref obj i))
+         (setq i (+ i 1))))
+     (write-char-serial 41))   ; )
     (t
      ;; Unknown object
      (write-char-serial 35)    ; #
@@ -759,10 +771,21 @@
 ;;; ============================================================
 ;;;
 ;;; values is a compiler special form (compile-values).
-;;; This stub only exists for funcall/apply compatibility.
-(defun values (a b)
-  "Legacy stub — compiler handles values directly."
-  a)
+;;; This function handles the funcall/apply case: (apply #'values list).
+;;; It manually sets the MV buffer and returns the primary value.
+;;; The function epilogue does NOT emit set-mv-count 1 (special-cased in compiler).
+(defun values (&rest args)
+  "Return multiple values. Sets MV buffer for count and extra values."
+  (let ((n (length args)))
+    (setf (mem-ref #x10000090 :u64) n)
+    (let ((cur (if (null args) nil (cdr args)))
+          (idx 0))
+      (loop
+        (when (null cur) (return nil))
+        (setf (mem-ref (+ #x10000098 (* idx 8)) :u64) (car cur))
+        (setq idx (+ idx 1))
+        (setq cur (cdr cur))))
+    (if (null args) nil (car args))))
 
 ;;; ============================================================
 ;;; Global Variable Store (bare-metal)

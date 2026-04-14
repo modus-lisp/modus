@@ -494,7 +494,7 @@
 ;;; ============================================================
 
 (defstruct mvm-buffer
-  (bytes (make-array 33554432))             ; 32MB fixed-size, position tracks fill
+  (bytes (make-array 33554432 :element-type '(unsigned-byte 8)))  ; 32MB fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))     ; label-id → position
   (fixups nil)                               ; list of (position label-id offset-from)
   (position 0))
@@ -509,7 +509,7 @@
   "Return a new array containing only the bytes emitted so far."
   (let* ((n (mvm-buffer-position buf))
          (src (mvm-buffer-bytes buf))
-         (result (make-array n)))
+         (result (make-array n :element-type '(unsigned-byte 8))))
     (dotimes (i n result)
       (setf (aref result i) (aref src i)))))
 

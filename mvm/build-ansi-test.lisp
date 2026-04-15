@@ -729,6 +729,17 @@
               ,@rest-forms
               (values-list ,result-var))
            `(values-list (multiple-value-list ,first-form)))))
+    ;; (with-output-to-string (var &optional string-form) body...)
+    ;; → (let ((var (make-string-output-stream))) (progn body...) (get-output-stream-string var))
+    ((and (eq (car form) 'with-output-to-string)
+          (cdr form) (consp (cadr form)))
+     (let* ((binding (cadr form))
+            (stream-var (car binding))
+            (body (mapcar #'rewrite-reader-forms (cddr form))))
+       ;; stream-var could be *standard-output* or any symbol
+       `(let ((,stream-var (make-string-output-stream)))
+          ,@body
+          (get-output-stream-string ,stream-var))))
     ;; (with-standard-io-syntax body...) → (%with-standard-io-syntax (lambda () body...))
     ((and (eq (car form) 'with-standard-io-syntax) (cdr form))
      (let ((body (mapcar #'rewrite-reader-forms (cdr form))))

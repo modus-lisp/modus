@@ -704,33 +704,78 @@
                            clauses))))))
 
   ;; DESTRUCTURING-BIND → LET* with car/cdr decomposition
+  ;; Supports nested patterns, dotted patterns, &rest, &body, &optional, &whole
   (mvm-define-macro "DESTRUCTURING-BIND"
     (lambda (form)
       (let ((pattern (cadr form))
             (expr (caddr form))
-            (body (cdddr form))
-            (tmp (gensym "DB")))
-        (let ((bindings nil)
-              (cur tmp))
-          ;; Walk the flat pattern, handling &rest and &body
-          (let ((rest-mode nil))
-            (dolist (elt pattern)
-              (cond
-                ((member elt '(&rest &body &optional))
-                 (setf rest-mode t))
-                (rest-mode
-                 ;; Bind rest of list
-                 (push (list elt cur) bindings)
-                 (setf rest-mode nil))
-                (t
-                 ;; Bind car, advance to cdr
-                 (let ((next-cur (gensym "D")))
-                   (push (list elt `(car ,cur)) bindings)
-                   (push (list next-cur `(cdr ,cur)) bindings)
-                   (setf cur next-cur))))))
-          `(let* ((,tmp ,expr)
-                  ,@(nreverse bindings))
-             ,@body)))))
+            (body (cdddr form)))
+        ;; gen-bindings: walk pattern, accumulate forward-ordered bindings list
+        ;; pat: pattern, acc: access-form for current value
+        ;; Returns list of (var form) pairs in correct let* order
+        (labels ((gen-bindings (pat acc)
+                   (cond
+                     ;; Null pattern: no bindings
+                     ((null pat) nil)
+                     ;; Simple symbol: one binding
+                     ((symbolp pat) (list (list pat acc)))
+                     ;; Cons pattern: list or dotted
+                     ((consp pat)
+                      (let ((whole-var nil)
+                            (rest-pat pat))
+                        ;; &whole handling
+                        (when (and (symbolp (car pat))
+                                   (string= (symbol-name (car pat)) "&WHOLE"))
+                          (setf whole-var (cadr pat))
+                          (setf rest-pat (cddr pat)))
+                        ;; Bind a temp for the value to avoid re-evaluation
+                        (let ((tmp (gensym "DB")))
+                          (let ((result (list (list tmp acc))))
+                            (when whole-var
+                              (setf result (append result (list (list whole-var tmp)))))
+                            ;; Walk pattern elements
+                            (let ((cur tmp)
+                                  (remaining rest-pat)
+                                  (rest-mode nil))
+                              (loop while (consp remaining) do
+                                (let ((elt (car remaining)))
+                                  (cond
+                                    ;; Lambda list keywords
+                                    ((and (symbolp elt)
+                                          (or (string= (symbol-name elt) "&REST")
+                                              (string= (symbol-name elt) "&BODY")))
+                                     (setf rest-mode t))
+                                    ((and (symbolp elt)
+                                          (or (string= (symbol-name elt) "&OPTIONAL")
+                                              (string= (symbol-name elt) "&KEY")
+                                              (string= (symbol-name elt) "&ALLOW-OTHER-KEYS")))
+                                     nil) ; skip these for simplicity
+                                    (rest-mode
+                                     ;; Bind rest of list to this variable/sub-pattern
+                                     (setf result
+                                           (append result (gen-bindings elt cur)))
+                                     (setf rest-mode nil))
+                                    (t
+                                     ;; Normal element: bind car, advance cur to cdr
+                                     (let ((next-cur (gensym "DC")))
+                                       ;; For simple symbols: bind directly to (car cur)
+                                       ;; For nested patterns: recurse
+                                       (setf result
+                                             (append result (gen-bindings elt `(car ,cur))))
+                                       (setf result
+                                             (append result (list (list next-cur `(cdr ,cur)))))
+                                       (setf cur next-cur)))))
+                                (setf remaining (cdr remaining)))
+                              ;; Dotted tail: remaining is a symbol (not nil, not cons)
+                              (when (and (not (null remaining))
+                                         (symbolp remaining))
+                                (setf result
+                                      (append result (gen-bindings remaining cur)))))
+                            result))))
+                     (t nil))))
+          (let ((bindings (gen-bindings pattern expr)))
+            `(let* ,bindings
+               ,@body))))))
 
   ;; FIRST, SECOND, THIRD, FOURTH, FIFTH → car of nthcdr
   (mvm-define-macro "FIRST"
@@ -1896,8 +1941,13 @@
        (emit-ir :mov dest +vreg-vr+)))
     ;; Cons cell: proper lists built iteratively, dotted pairs recursively
     ((consp value)
-     (if (and (listp (cdr (last value)))  ; proper list check
-              (> (length value) 4))       ; optimize lists of 5+ elements
+     ;; Safe proper-list check: walk list counting elements.
+     ;; (last ...) raises an error on dotted lists in SBCL, so we avoid it.
+     (if (and (let ((n 0) (lst value))
+                (loop (cond
+                        ((null lst) (return (> n 4)))
+                        ((not (consp lst)) (return nil))
+                        (t (incf n) (setf lst (cdr lst)))))))
          ;; Iterative: build in reverse with single temp reg
          (let ((elems (reverse value)))
            (compile-nil dest)
@@ -2150,11 +2200,14 @@
                 (mapcar (lambda (f) (collect-setq-vars-in-body f inner-bound))
                         (cddr form))))))
     (t
-     ;; Recurse into all subforms
-     (let ((results nil))
-       (dolist (sub form results)
-         (dolist (v (collect-setq-vars-in-body sub bound-vars))
-           (setq results (adjoin v results :test #'name-equal))))))))
+     ;; Recurse into all subforms (guard against dotted pairs)
+     (let ((results nil)
+           (rest form))
+       (loop while (consp rest) do
+         (dolist (v (collect-setq-vars-in-body (car rest) bound-vars))
+           (setq results (adjoin v results :test #'name-equal)))
+         (setf rest (cdr rest)))
+       results))))
 
 (defun vars-mutated-in-lambdas (body-forms let-vars)
   "Find which of LET-VARS are mutated inside a lambda in BODY-FORMS.
@@ -2189,8 +2242,11 @@
                         (and (integerp op) (= op 518921307293258709)))
                     nil)
                    (t
-                    (dolist (sub (cdr form))
-                      (scan sub in-lambda)))))))
+                    ;; cdr might be a symbol (dotted pair like (,X . D)) — guard
+                    (let ((rest (cdr form)))
+                      (loop while (consp rest) do
+                        (scan (car rest) in-lambda)
+                        (setf rest (cdr rest)))))))))
       (dolist (f body-forms)
         (scan f nil)))
     result))
@@ -3759,7 +3815,10 @@
 (defun compile-div (args env dest)
   "Compile (/ a b). Truncating integer division for tagged fixnums.
    Push/pop dest around divisor to survive function calls."
-  (when (null args) (error "/ requires at least one argument"))
+  (when (null args)
+    ;; (/) with no args signals error at runtime
+    (compile-form `(error "/ requires at least one argument") env dest)
+    (return-from compile-div nil))
   (if (null (cdr args))
       ;; (/ x) = 1/x (not meaningful for integers, just return x)
       (compile-form (car args) env dest)
@@ -3785,16 +3844,27 @@
   (emit-ir :dec dest))
 
 (defun compile-truncate (args env dest)
-  "Compile (truncate a b) - integer division, quotient to DEST.
-   Push/pop dest around second operand to survive function calls."
-  (destructuring-bind (a b) args
-    (let ((temp (alloc-temp-reg)))
-      (compile-form a env dest)
-      (emit-ir :push dest)
-      (compile-form b env temp)
-      (emit-ir :pop dest)
-      (emit-ir :div dest dest temp)
-      (free-temp-reg))))
+  "Compile (truncate a) or (truncate a b).
+   0-arg or 3+ args: emit runtime error.
+   1-arg: call float-truncate-to-integer for float→fixnum conversion.
+   2-arg: integer division, quotient to DEST."
+  (cond
+    ;; 0 args or 3+ args: signal error at runtime
+    ((or (null args) (cddr args))
+     (compile-form `(error "TRUNCATE requires 1 or 2 arguments") env dest))
+    ;; 1-arg form
+    ((null (cdr args))
+     (compile-form `(float-truncate-to-integer ,(car args)) env dest))
+    ;; 2-arg form: (truncate a b) → a div b
+    (t
+     (destructuring-bind (a b) args
+       (let ((temp (alloc-temp-reg)))
+         (compile-form a env dest)
+         (emit-ir :push dest)
+         (compile-form b env temp)
+         (emit-ir :pop dest)
+         (emit-ir :div dest dest temp)
+         (free-temp-reg))))))
 
 (defun compile-mod (args env dest)
   "Compile (mod a b) - integer modulus, remainder to DEST.
@@ -3812,54 +3882,80 @@
 ;;; Comparison Operations
 ;;; ============================================================
 
+(defun compile-compare-2 (branch-op a b env dest)
+  "Compile a 2-operand comparison, result T or NIL into DEST."
+  (let ((temp (alloc-temp-reg))
+        (true-label (make-compiler-label))
+        (end-label (make-compiler-label)))
+    (compile-form a env dest)
+    (emit-ir :push dest)
+    (compile-form b env temp)
+    (emit-ir :pop dest)
+    (emit-ir :cmp dest temp)
+    (emit-ir branch-op true-label)
+    (compile-nil dest)
+    (emit-ir :br end-label)
+    (emit-ir-label true-label)
+    (compile-t dest)
+    (emit-ir-label end-label)
+    (free-temp-reg)))
+
 (defun compile-compare (branch-op args env dest)
   "Compile a comparison (<, >, =, <=, >=) producing T or NIL.
-   BRANCH-OP is the branch instruction keyword to use when the comparison
-   is true (:blt, :bgt, :beq, :ble, :bge).
-   Push/pop dest around second operand to survive function calls."
-  (destructuring-bind (a b) args
-    (let ((temp (alloc-temp-reg))
-          (true-label (make-compiler-label))
-          (end-label (make-compiler-label)))
-      (compile-form a env dest)
-      (emit-ir :push dest)
-      (compile-form b env temp)
-      (emit-ir :pop dest)
-      ;; Compare dest vs temp
-      (emit-ir :cmp dest temp)
-      ;; Branch if true
-      (emit-ir branch-op true-label)
-      ;; False: load NIL
-      (compile-nil dest)
-      (emit-ir :br end-label)
-      ;; True: load T
-      (emit-ir-label true-label)
-      (compile-t dest)
-      ;; Join
-      (emit-ir-label end-label)
-      (free-temp-reg))))
+   Handles multiple args: (< a b c) → (and (< a b) (< b c)).
+   BRANCH-OP is the branch instruction keyword for true (:blt, :bgt, etc.)."
+  (cond
+    ;; 0 or 1 arg: error at runtime
+    ((or (null args) (null (cdr args)))
+     (compile-form `(error "comparison requires at least 2 args") env dest))
+    ;; 2 args: simple comparison
+    ((null (cddr args))
+     (compile-compare-2 branch-op (car args) (cadr args) env dest))
+    ;; 3+ args: chain comparisons with AND
+    ;; (< a b c d) → (and (< a b) (< b c) (< c d))
+    (t
+     (let ((end-false (make-compiler-label)))
+       ;; Evaluate all pairwise comparisons, short-circuit on false
+       (let ((remaining args))
+         (loop while (consp (cdr remaining)) do
+           (let ((a (car remaining))
+                 (b (cadr remaining)))
+             (compile-compare-2 branch-op a b env dest)
+             ;; If false (NIL), jump to end-false
+             (let ((temp (alloc-temp-reg)))
+               (compile-nil temp)
+               (emit-ir :cmp dest temp)
+               (emit-ir :beq end-false)
+               (free-temp-reg)))
+           (setf remaining (cdr remaining))))
+       ;; All comparisons passed: result is T (already in dest from last compare)
+       (emit-ir-label end-false)))))
 
 (defun compile-eq (args env dest)
   "Compile (eq a b) - pointer equality.
-   Push/pop dest around second operand to survive function calls."
-  (destructuring-bind (a b) args
-    (let ((temp (alloc-temp-reg))
-          (true-label (make-compiler-label))
-          (end-label (make-compiler-label)))
-      (compile-form a env dest)
-      (emit-ir :push dest)
-      (compile-form b env temp)
-      (emit-ir :pop dest)
-      (emit-ir :cmp dest temp)
-      (emit-ir :beq true-label)
-      ;; Not equal: NIL
-      (compile-nil dest)
-      (emit-ir :br end-label)
-      ;; Equal: T
-      (emit-ir-label true-label)
-      (compile-t dest)
-      (emit-ir-label end-label)
-      (free-temp-reg))))
+   Push/pop dest around second operand to survive function calls.
+   If wrong arg count, emit runtime error call."
+  (if (or (null args) (null (cdr args)) (cddr args))
+      ;; Wrong arg count: emit call that signals error at runtime
+      (compile-form `(error "wrong number of arguments") env dest)
+      (destructuring-bind (a b) args
+        (let ((temp (alloc-temp-reg))
+              (true-label (make-compiler-label))
+              (end-label (make-compiler-label)))
+          (compile-form a env dest)
+          (emit-ir :push dest)
+          (compile-form b env temp)
+          (emit-ir :pop dest)
+          (emit-ir :cmp dest temp)
+          (emit-ir :beq true-label)
+          ;; Not equal: NIL
+          (compile-nil dest)
+          (emit-ir :br end-label)
+          ;; Equal: T
+          (emit-ir-label true-label)
+          (compile-t dest)
+          (emit-ir-label end-label)
+          (free-temp-reg)))))
 
 ;;; ============================================================
 ;;; List Operations
@@ -5160,7 +5256,12 @@
                                       (string name)))
          (*temp-reg-counter* 0)
          (return-label (make-compiler-label))
-         (*function-return-label* return-label))
+         (*function-return-label* return-label)
+         ;; Reset per-function dynamic state so nested FLET/lambda bodies
+         ;; don't inherit the outer function's loop/block context.
+         (*loop-exit-label* nil)
+         (*block-labels* nil)
+         (*tagbody-tags* nil))
     ;; Function prologue: push frame pointer, set up frame
     (emit-ir :frame-enter (length params))
 
@@ -5585,44 +5686,51 @@
           ;; ---- Branches (1 opcode + 4 off32 = 5 bytes) ----
           (:br
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-br buf rel-offset)))
 
           (:beq
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-beq buf rel-offset)))
           (:bne
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bne buf rel-offset)))
           (:blt
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-blt buf rel-offset)))
           (:bge
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bge buf rel-offset)))
           (:ble
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-ble buf rel-offset)))
           (:bgt
            (let* ((target-label (second insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bgt buf rel-offset)))
@@ -5631,14 +5739,16 @@
           (:bnull
            (let* ((reg (second insn))
                   (target-label (third insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 6))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bnull buf reg rel-offset)))
           (:bnnull
            (let* ((reg (second insn))
                   (target-label (third insn))
-                  (target-pos (gethash target-label label-positions))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
                   (insn-end (+ current-offset 6))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bnnull buf reg rel-offset)))
@@ -5920,7 +6030,11 @@
                ((name-eq opt-name "CONC-NAME")
                 (setf conc-name-specified t)
                 (setf conc-name (if (cadr opt)
-                                    (format nil "~A-" (symbol-name (cadr opt)))
+                                    ;; cadr opt may be a symbol or a string
+                                    (let ((cn (cadr opt)))
+                                      (if (stringp cn)
+                                          cn
+                                          (format nil "~A-" (symbol-name cn))))
                                     nil)))  ; (:conc-name nil) → no prefix
                ((name-eq opt-name "INCLUDE")
                 (setf include-parent (cadr opt)))))))
@@ -6061,7 +6175,8 @@
       ;; Snapshot *function-table* before compiling this form, so we can
       ;; remove any orphaned lambda entries on error.
       (let* ((fn-table-before *function-table*)
-             (result (handler-case (mvm-compile-toplevel form)
+             (result (handler-case
+                        (mvm-compile-toplevel form)
                         (error (e)
                           (format t "  SKIP ~A: ~A~%" *current-source-location* e)
                           ;; Remove any lambda/flet entries that were added to

@@ -1491,13 +1491,23 @@
                                         (setq tail (cdr tail)))))
                                   result)))))
                 (setf forms (mapcar #'rw forms))))
-            ;; Macroexpand def-print-test, def-pprint-test, def-format-test
-            ;; into deftest forms before processing
+            ;; Evaluate defun/defmacro forms at SBCL side so that macros
+            ;; defined within the file can be used during macroexpansion below.
+            ;; This is needed for files like adjust-array.lsp that define
+            ;; helper functions/macros used only at SBCL compile time.
+            (dolist (form forms)
+              (when (and (consp form)
+                         (member (car form) '(defun defmacro)))
+                (handler-case (eval form) (error () nil))))
+            ;; Macroexpand def-print-test, def-pprint-test, def-format-test,
+            ;; def-adjust-array-test, etc. into deftest forms before processing
             (setf forms
                   (mapcan (lambda (form)
                             (if (and (consp form)
                                      (member (car form) '(def-print-test def-pprint-test
-                                                          def-format-test def-ppblock-test)))
+                                                          def-format-test def-ppblock-test
+                                                          def-adjust-array-test
+                                                          def-adjust-array-fp-test)))
                                 (handler-case
                                   (let ((expanded (macroexpand-1 form)))
                                     ;; def-format-test expands to (progn deftest deftest)

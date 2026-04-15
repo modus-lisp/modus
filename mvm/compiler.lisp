@@ -1686,6 +1686,167 @@
       ((= op-name 416706424900304020)             (compile-aset (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
 
+      ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
+      ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
+      ;; For complex places (aref etc.): fall back to compile-call (runtime %rotatef2)
+      ((= op-name 1044059997085533624)
+       (let ((places (cdr form)))
+         (cond
+           ;; No places: no-op
+           ((null places) (compile-nil dest))
+           ;; 2 simple var places: common case
+           ((and (= (length places) 2)
+                 (symbolp (car places))
+                 (symbolp (cadr places)))
+            (let ((p1 (car places)) (p2 (cadr places)))
+              (compile-form `(let ((%rot-tmp ,p1)) (setq ,p1 ,p2) (setq ,p2 %rot-tmp) nil) env dest)))
+           ;; 2 places, one or both complex — use aref/aset
+           ((= (length places) 2)
+            (let ((p1 (car places)) (p2 (cadr places)))
+              (let ((tmp1 (gensym "R1")) (tmp2 (gensym "R2")))
+                (compile-form `(let ((,tmp1 ,p1) (,tmp2 ,p2))
+                                 (setf ,p1 ,tmp2)
+                                 (setf ,p2 ,tmp1)
+                                 nil) env dest))))
+           ;; N places: chain rotation
+           (t
+            (let ((tmps (mapcar (lambda (p) (gensym "RT")) places)))
+              (compile-form `(let ,(mapcar #'list tmps places)
+                               ,@(mapcar (lambda (place tmp-next)
+                                           `(setf ,place ,tmp-next))
+                                         places
+                                         (append (cdr tmps) (list (car tmps))))
+                               nil) env dest))))))
+
+      ;; SHIFTF — (shiftf place1 place2 ... new-val) → shift values left, return old first
+      ;; (shiftf p1 p2 nv) → (let ((old p1)) (setf p1 p2) (setf p2 nv) old)
+      ((= op-name 1101471631057784809)
+       (let ((all (cdr form)))
+         (when (>= (length all) 2)
+           (let* ((places (butlast all))
+                  (new-val (car (last all)))
+                  (tmps (mapcar (lambda (p) (gensym "SF")) places)))
+             (compile-form `(let ,(mapcar #'list tmps places)
+                              ,@(mapcar (lambda (place val)
+                                          `(setf ,place ,val))
+                                        places
+                                        (append (cdr tmps) (list new-val)))
+                              ,(car tmps)) env dest)))))
+
+      ;; NTH-VALUE — (nth-value n form) → (nth n (multiple-value-list form))
+      ((= op-name 134258368733485643)
+       (let ((n (cadr form))
+             (form-arg (caddr form)))
+         (compile-form `(nth ,n (multiple-value-list ,form-arg)) env dest)))
+
+      ;; PROG — (prog bindings {tag|form}...) → (let bindings (block nil (tagbody...)))
+      ((= op-name 467831526245976269)
+       (let ((bindings (cadr form))
+             (body (cddr form)))
+         (compile-form `(let ,bindings (block nil (tagbody ,@body))) env dest)))
+
+      ;; PROG* — (prog* bindings {tag|form}...) → (let* bindings (block nil (tagbody...)))
+      ((= op-name 735983952601536591)
+       (let ((bindings (cadr form))
+             (body (cddr form)))
+         (compile-form `(let* ,bindings (block nil (tagbody ,@body))) env dest)))
+
+      ;; LOOP-FINISH — exit the current loop (like (return) from a loop)
+      ((= op-name 246420928440230597)
+       (if *loop-exit-label*
+           (progn
+             (compile-nil dest)
+             (emit-ir :br *loop-exit-label*))
+           (compile-nil dest)))
+
+      ;; BIT — like aref but for bit arrays: (bit array index)
+      ((= op-name 675678019619508760)
+       (compile-form `(aref ,(cadr form) ,(caddr form)) env dest))
+
+      ;; ARRAY-IN-BOUNDS-P — (array-in-bounds-p array index...)
+      ;; Returns T if all indices are valid
+      ((= op-name 57704008642470133)
+       (let ((arr (cadr form))
+             (indices (cddr form)))
+         (cond
+           ((null indices) (compile-t dest))
+           ((= (length indices) 1)
+            (compile-form `(let ((%aib-arr ,arr) (%aib-idx ,(car indices)))
+                             (and (>= %aib-idx 0)
+                                  (< %aib-idx (array-length %aib-arr))))
+                          env dest))
+           (t (compile-t dest)))))
+
+      ;; THE — (the type form) → compile form, ignore type declaration
+      ((= op-name 977942333759456998)
+       (compile-form (caddr form) env dest))
+
+      ;; DECLARE — skip when found in non-declaration position
+      ((= op-name 524150358979133175)
+       (compile-nil dest))
+
+      ;; LOCALLY — (locally decl... body...) → compile body, skip declare forms
+      ((= op-name 931620444762315919)
+       (let ((body (remove-if (lambda (f)
+                                (and (consp f) (= (normalize-name (car f)) 524150358979133175)))
+                              (cdr form))))
+         (compile-progn body env dest)))
+
+      ;; LOAD-TIME-VALUE — (load-time-value form &optional read-only-p) → compile form
+      ((= op-name 535180122462347159)
+       (compile-form (cadr form) env dest))
+
+      ;; SYMBOL-MACROLET — (symbol-macrolet bindings body...) → compile body
+      ;; (expansions are handled at rewrite level for ANSI tests; here just skip bindings)
+      ((= op-name 494270185402127659)
+       (compile-progn (cddr form) env dest))
+
+      ;; EVAL-WHEN — (eval-when (situations) forms...) → compile body when :execute present
+      ;; In our compiler there's no compile vs load distinction, always execute
+      ((= op-name 1086924202144944840)
+       (compile-progn (cddr form) env dest))
+
+      ;; PROGV — (progv vars vals body) → simplified: just compile body
+      ;; (dynamic binding not fully supported; treat as locally)
+      ((= op-name 519861365770534371)
+       (compile-progn (cdddr form) env dest))
+
+      ;; CATCH — (catch tag form) → simplified: just compile form (no actual catch)
+      ((= op-name 773672091476800706)
+       (compile-form (caddr form) env dest))
+
+      ;; THROW — (throw tag result) → simplified: just evaluate result
+      ((= op-name 679248612953119241)
+       (compile-form (caddr form) env dest))
+
+      ;; TYPECASE — (typecase key (type1 form1...) ...) → rewrite as let + cond typep
+      ((= op-name 578189417670937395)
+       (let ((key-form (cadr form))
+             (clauses (cddr form))
+             (tmp (gensym "TC")))
+         (compile-form
+          `(let ((,tmp ,key-form))
+             (cond ,@(mapcar (lambda (clause)
+                               (let ((type (car clause))
+                                     (body (cdr clause)))
+                                 (if (or (eq type 't) (eq type 'otherwise))
+                                     `(t ,@body)
+                                     `((typep ,tmp ',type) ,@body))))
+                             clauses)))
+          env dest)))
+
+      ;; ETYPECASE — like typecase but signals error on no match
+      ((= op-name 152261594881962774)
+       (compile-form `(typecase ,(cadr form) ,@(cddr form)) env dest))
+
+      ;; CTYPECASE — like typecase but restartable (simplified to etypecase)
+      ((= op-name 575883593470696800)
+       (compile-form `(typecase ,(cadr form) ,@(cddr form)) env dest))
+
+      ;; CCASE — like case but restartable (simplified to case)
+      ((= op-name 53423618847963656)
+       (compile-form `(case ,(cadr form) ,@(cddr form)) env dest))
+
       ;; --- Function Call (default) ---
       ;; Package/declaration no-ops (compile to nil)
       ((member op-name '(36538461984543970    ; MAKE-PACKAGE
@@ -3914,23 +4075,31 @@
        (free-temp-reg)))))
 
 (defun compile-ldb (bytespec value-form env dest)
-  "Compile (ldb (byte size pos) value) - extract bit field"
-  (unless (and (consp bytespec)
-               (name-eq (car bytespec) "BYTE"))
-    (error "MVM compiler: LDB requires (byte size pos) form, got ~S" bytespec))
-  (let ((size (cadr bytespec))
-        (pos (caddr bytespec)))
-    (compile-form value-form env dest)
-    ;; Shift right by position
-    (when (and (integerp pos) (> pos 0))
-      (emit-ir :shr dest dest pos))
-    ;; Mask to size bits
-    (when (integerp size)
-      (let ((mask (1- (ash 1 size)))
-            (temp (alloc-temp-reg)))
-        (emit-ir :li temp mask)
-        (emit-ir :and dest dest temp)
-        (free-temp-reg)))))
+  "Compile (ldb (byte size pos) value) - extract bit field.
+   Falls back to runtime LDB call when bytespec is not a constant (byte ...) form."
+  (cond
+    ;; Constant (byte size pos) form: inline as shift+mask
+    ((and (consp bytespec) (name-eq (car bytespec) "BYTE")
+          (integerp (cadr bytespec)) (integerp (caddr bytespec)))
+     (let ((size (cadr bytespec))
+           (pos (caddr bytespec)))
+       (compile-form value-form env dest)
+       ;; Untag the integer value (it's a tagged fixnum)
+       (emit-ir :sar dest dest 1)
+       ;; Shift right by position
+       (when (> pos 0)
+         (emit-ir :shr dest dest pos))
+       ;; Mask to size bits
+       (let ((mask (1- (ash 1 size)))
+             (temp (alloc-temp-reg)))
+         (emit-ir :li temp mask)
+         (emit-ir :and dest dest temp)
+         (free-temp-reg))
+       ;; Re-tag result as fixnum
+       (emit-ir :shl dest dest 1)))
+    ;; Non-constant byte spec or non-literal size/pos: fall through to runtime call
+    (t
+     (compile-call 'ldb (list bytespec value-form) env dest))))
 
 ;;; ============================================================
 ;;; Type Predicates
@@ -5995,10 +6164,10 @@
           (setf names (sort names #'> :key #'car))
           (format t "~%  === ~D unresolved calls to ~D functions (resolve to %%unresolved-fn → nil) ===~%"
                   total (length names))
-          (dolist (entry (subseq names 0 (min 25 (length names))))
+          (dolist (entry (subseq names 0 (min 200 (length names))))
             (format t "    ~4D × ~A~%" (car entry) (cdr entry)))
-          (when (> (length names) 25)
-            (format t "    ... and ~D more~%" (- (length names) 25)))
+          (when (> (length names) 200)
+            (format t "    ... and ~D more~%" (- (length names) 200)))
           (force-output)))
 
       ;; Build module

@@ -770,6 +770,27 @@
 ;;; Multi-value + incf test (debug for ANSI order tests)
 ;;; ============================================================
 
+;;; Override is-eql-p / is-not-eql-p from ansi-aux with closure-based versions.
+;;; These MUST be defined AFTER ansi-aux (last-defun-wins) to override the
+;;; aux version which uses real lambdas (not yet supported by auto-closure).
+;;; The closure helper functions (closure-eql-fn, closure-not-eql-fn) are
+;;; defined in ansi-bridge.lisp.
+(defun is-eql-p (x)
+  (cons #'closure-eql-fn (cons x nil)))
+(defun is-not-eql-p (x)
+  (cons #'closure-not-eql-fn (cons x nil)))
+
+(defun run-closure-test ()
+  ;; Test: is-eql-p returns a closure object (cons)
+  (deftest 2400 (consp (is-eql-p 'a)) t)
+  ;; Test: funcall on closure works
+  (deftest 2401 (funcall (is-eql-p 'a) 'a) t)
+  (deftest 2402 (funcall (is-eql-p 'a) 'b) nil)
+  ;; Test: two closures with different captured values (the key fix)
+  (deftest 2403 (let ((p1 (is-eql-p 'a))
+                      (p2 (is-eql-p 'b)))
+                  (funcall p1 'a)) t))
+
 (defun run-heap-test ()
   ;; Test large list creation
   (deftest 2450 (let ((x (loop for i from 1 to 100 collect i)))
@@ -1125,6 +1146,7 @@
   (run-defstruct-tests)
   (run-package-tests)
   (run-format-tests)
+  (run-closure-test)
   (run-heap-test)
   (run-float-tests)
   (run-iteration-tests)

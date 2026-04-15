@@ -1,0 +1,909 @@
+;;;; cl-packages.lisp — Package system
+;;;; Part of the Modus CL runtime. Depends on cl-types.lisp.
+
+;;; ============================================================
+;;; Common Lisp Package System — Runtime Implementation
+;;; ============================================================
+;;;
+;;; Package = (cons <pkg-tag> <7-slot-array>)
+;;;   slot 0: name (string)
+;;;   slot 1: nicknames (list of strings)
+;;;   slot 2: internal-symbols (alist: string -> symbol)
+;;;   slot 3: external-symbols (alist: string -> symbol)
+;;;   slot 4: use-list (list of packages)
+;;;   slot 5: used-by-list (list of packages)
+;;;   slot 6: shadowing-symbols (list of symbols)
+;;;
+;;; CL Symbol = (cons <sym-tag> <3-slot-array>)
+;;;   slot 0: name-hash (fixnum, for backward compat)
+;;;   slot 1: package (package object or nil)
+;;;   slot 2: name (string)
+
+(defvar *pkg-tag* 987654321)
+(defvar *sym-tag* 123456789)
+
+;;; --- Package predicates and accessors ---
+
+(defun %pkg-p (x)
+  "Check if X is a package object."
+  (if (consp x)
+      (eql (car x) *pkg-tag*)
+      nil))
+
+(defun %pkg-data (pkg) (cdr pkg))
+(defun %pkg-name (pkg) (aref (%pkg-data pkg) 0))
+(defun %pkg-nicknames (pkg) (aref (%pkg-data pkg) 1))
+(defun %pkg-internal (pkg) (aref (%pkg-data pkg) 2))
+(defun %pkg-external (pkg) (aref (%pkg-data pkg) 3))
+(defun %pkg-use-list (pkg) (aref (%pkg-data pkg) 4))
+(defun %pkg-used-by (pkg) (aref (%pkg-data pkg) 5))
+(defun %pkg-shadowing (pkg) (aref (%pkg-data pkg) 6))
+
+(defun %pkg-set-name (pkg v) (aset (%pkg-data pkg) 0 v))
+(defun %pkg-set-nicknames (pkg v) (aset (%pkg-data pkg) 1 v))
+(defun %pkg-set-internal (pkg v) (aset (%pkg-data pkg) 2 v))
+(defun %pkg-set-external (pkg v) (aset (%pkg-data pkg) 3 v))
+(defun %pkg-set-use-list (pkg v) (aset (%pkg-data pkg) 4 v))
+(defun %pkg-set-used-by (pkg v) (aset (%pkg-data pkg) 5 v))
+(defun %pkg-set-shadowing (pkg v) (aset (%pkg-data pkg) 6 v))
+
+;;; --- CL Symbol predicates and accessors ---
+
+(defun %cl-sym-p (x)
+  "Check if X is a CL symbol (package-aware).
+   Symbols are (cons *sym-tag* #<array-3>) when *sym-tag* initialized,
+   or (cons nil #<array-3>) when *sym-tag* is uninitialized.
+   Distinguishable from packages (cons nil #<array-7>) by array length."
+  (if (consp x)
+      (if *sym-tag*
+          (eql (car x) *sym-tag*)
+          ;; Uninitialized: car must be nil, cdr must be a 3-slot array
+          (if (null (car x))
+              (let ((d (cdr x)))
+                (if (arrayp d)
+                    (= (array-length d) 3)
+                    nil))
+              nil))
+      nil))
+
+(defun %cl-sym-data (sym) (cdr sym))
+(defun %cl-sym-hash (sym) (aref (%cl-sym-data sym) 0))
+(defun %cl-sym-package (sym) (aref (%cl-sym-data sym) 1))
+(defun %cl-sym-name (sym) (aref (%cl-sym-data sym) 2))
+
+(defun %cl-sym-set-package (sym pkg) (aset (%cl-sym-data sym) 1 pkg))
+
+(defun %make-cl-symbol (name-string)
+  "Create a new CL symbol with NAME-STRING as its name."
+  (let ((data (make-array 3)))
+    (aset data 0 0)    ; name-hash (unused for CL symbols)
+    (aset data 1 nil)  ; package
+    (aset data 2 name-string)
+    (cons *sym-tag* data)))
+
+;;; --- Global package registry ---
+
+(defvar *all-packages* nil)
+(defvar *package* nil)
+
+;;; Helper: remove all occurrences of ITEM (by eq) from LIST
+(defun %remove-eq-item (item list)
+  "Non-closure version of (remove-if (lambda (x) (eq x item)) list)."
+  (let ((result nil) (cur list))
+    (loop
+      (when (null cur) (return (nreverse result)))
+      (unless (eq (car cur) item)
+        (setq result (cons (car cur) result)))
+      (setq cur (cdr cur)))))
+
+;;; Helper: remove from list where (string-equal (symbol-name s) name-str)
+(defvar *%remove-sym-name* nil)
+(defun %remove-sym-by-name (list)
+  "Non-closure: remove symbols from LIST where name = *%remove-sym-name*."
+  (let ((result nil) (cur list))
+    (loop
+      (when (null cur) (return (nreverse result)))
+      (unless (string-equal (symbol-name (car cur)) *%remove-sym-name*)
+        (setq result (cons (car cur) result)))
+      (setq cur (cdr cur)))))
+
+;;; Helper: map a function over a list where fn takes the string name of each element
+(defun %mapcar-pkg-string-designator (list)
+  "Map %pkg-string-designator over each element of LIST."
+  (let ((result nil) (cur list))
+    (loop
+      (when (null cur) (return (nreverse result)))
+      (setq result (cons (%pkg-string-designator (car cur)) result))
+      (setq cur (cdr cur)))))
+
+;;; --- String coercion for designators ---
+
+(defun %pkg-string-designator (x)
+  "Coerce a string designator to a string.
+   String -> string, character -> 1-char string, symbol -> symbol-name,
+   CL symbol -> name string."
+  (cond
+    ((stringp x) x)
+    ((characterp x)
+     (let ((s (%make-string-array 1)))
+       (aset s 0 (char-code x))
+       s))
+    ((%cl-sym-p x) (%cl-sym-name x))
+    ;; For wrapper arrays (fill-pointer / displaced)
+    ((and (consp x) (stringp (cdr x)))
+     ;; Materialize wrapper to flat string
+     (let ((len (wrapper-effective-length x)))
+       (let ((s (%make-string-array len)))
+         (dotimes (i len s) (aset s i (wrapper-aref x i))))))
+    (t (if (stringp x) x ""))))
+
+(defun %pkg-string= (a b)
+  "Compare two string designators for equality."
+  (let ((sa (%pkg-string-designator a))
+        (sb (%pkg-string-designator b)))
+    (string-equal sa sb)))
+
+;;; --- Package designator resolution ---
+
+(defun %resolve-package (designator)
+  "Resolve a package designator to a package object.
+   Package -> itself, string/symbol/character -> find-package."
+  (cond
+    ((%pkg-p designator) designator)
+    (t (find-package designator))))
+
+;;; --- Internal alist-based symbol table operations ---
+
+(defun %symtab-find (table name-string)
+  "Find symbol in alist TABLE by NAME-STRING. Returns (name . symbol) or nil."
+  (let ((cur table))
+    (loop
+      (when (null cur) (return nil))
+      (let ((entry (car cur)))
+        (when (string-equal (car entry) name-string)
+          (return entry)))
+      (setq cur (cdr cur)))))
+
+(defun %symtab-add (table name-string symbol)
+  "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table."
+  (cons (cons name-string symbol) table))
+
+(defun %symtab-remove (table name-string)
+  "Remove NAME-STRING from alist TABLE. Returns new table."
+  (let ((result nil) (cur table))
+    (loop
+      (when (null cur) (return (nreverse result)))
+      (if (string-equal (car (car cur)) name-string)
+          (setq cur (cdr cur))
+          (progn
+            (setq result (cons (car cur) result))
+            (setq cur (cdr cur)))))))
+
+;;; --- Core package functions ---
+
+(defun packagep (x) (%pkg-p x))
+
+(defun package-name (pkg)
+  (let ((p (%resolve-package pkg)))
+    (if p (%pkg-name p) nil)))
+
+(defun package-nicknames (pkg)
+  (let ((p (%resolve-package pkg)))
+    (if p (%pkg-nicknames p) nil)))
+
+(defun package-use-list (pkg)
+  (let ((p (%resolve-package pkg)))
+    (if p (%pkg-use-list p) nil)))
+
+(defun package-used-by-list (pkg)
+  (let ((p (%resolve-package pkg)))
+    (if p (%pkg-used-by p) nil)))
+
+(defun package-shadowing-symbols (pkg)
+  (let ((p (%resolve-package pkg)))
+    (if p (%pkg-shadowing p) nil)))
+
+(defun list-all-packages ()
+  *all-packages*)
+
+(defun find-package (name)
+  "Find package by name or nickname."
+  (cond
+    ((%pkg-p name) name)
+    (t
+     (let ((name-str (%pkg-string-designator name))
+           (cur *all-packages*))
+       (loop
+         (when (null cur) (return nil))
+         (let ((pkg (car cur)))
+           (when (%pkg-name pkg)
+             (when (string-equal (%pkg-name pkg) name-str)
+               (return pkg))
+             ;; Check nicknames
+             (let ((nicks (%pkg-nicknames pkg))
+                   (found nil))
+               (let ((ncur nicks))
+                 (loop
+                   (when (null ncur) (return nil))
+                   (when (string-equal (car ncur) name-str)
+                     (setq found t)
+                     (return nil))
+                   (setq ncur (cdr ncur))))
+               (when found (return pkg)))))
+         (setq cur (cdr cur)))))))
+
+(defun %make-package-object (name-string)
+  "Allocate and initialize an empty package object."
+  (let ((data (make-array 7)))
+    (aset data 0 name-string) ; name
+    (aset data 1 nil)         ; nicknames
+    (aset data 2 nil)         ; internal-symbols (alist)
+    (aset data 3 nil)         ; external-symbols (alist)
+    (aset data 4 nil)         ; use-list
+    (aset data 5 nil)         ; used-by-list
+    (aset data 6 nil)         ; shadowing-symbols
+    (cons *pkg-tag* data)))
+
+(defun make-package (name &rest args)
+  "Create a new package with NAME."
+  (let ((name-str (%pkg-string-designator name))
+        (nicknames nil)
+        (use-list nil)
+        (a args))
+    ;; Parse keyword args
+    (loop
+      (when (null a) (return nil))
+      (cond
+        ((eq (car a) :nicknames)
+         (setq nicknames (cadr a))
+         (setq a (cddr a)))
+        ((eq (car a) :use)
+         (setq use-list (cadr a))
+         (setq a (cddr a)))
+        (t (setq a (cddr a)))))
+    ;; Check for existing package
+    (when (find-package name-str)
+      (return-from make-package (find-package name-str)))
+    ;; Create package
+    (let ((pkg (%make-package-object name-str)))
+      ;; Set nicknames (coerce to strings)
+      (%pkg-set-nicknames pkg
+        (%mapcar-pkg-string-designator nicknames))
+      ;; Register
+      (setq *all-packages* (cons pkg *all-packages*))
+      ;; Setup use-list
+      (when use-list
+        (dolist (u use-list)
+          (%use-package-impl u pkg)))
+      pkg)))
+
+(defun delete-package (pkg)
+  "Delete package PKG."
+  (let ((p (%resolve-package pkg)))
+    (when (and p (%pkg-name p))
+      ;; Remove from used-by lists
+      (dolist (used (%pkg-use-list p))
+        (%pkg-set-used-by used
+          (%remove-eq-item p (%pkg-used-by used))))
+      ;; Unuse all packages
+      (%pkg-set-use-list p nil)
+      ;; Unintern all symbols in this package (set home package to nil)
+      (dolist (entry (%pkg-internal p))
+        (let ((sym (cdr entry)))
+          (when (and (%cl-sym-p sym) (eq (%cl-sym-package sym) p))
+            (%cl-sym-set-package sym nil))))
+      (dolist (entry (%pkg-external p))
+        (let ((sym (cdr entry)))
+          (when (and (%cl-sym-p sym) (eq (%cl-sym-package sym) p))
+            (%cl-sym-set-package sym nil))))
+      ;; Clear the package
+      (%pkg-set-name p nil)
+      (%pkg-set-nicknames p nil)
+      (%pkg-set-internal p nil)
+      (%pkg-set-external p nil)
+      (%pkg-set-shadowing p nil)
+      ;; Remove from global registry
+      (setq *all-packages* (%remove-eq-item p *all-packages*))
+      t)))
+
+(defun rename-package (pkg new-name &rest new-nicknames-arg)
+  "Rename PKG to NEW-NAME with optional new nicknames."
+  (let ((p (%resolve-package pkg))
+        (new-nicks (if new-nicknames-arg (car new-nicknames-arg) nil)))
+    (when p
+      (%pkg-set-name p (%pkg-string-designator new-name))
+      (%pkg-set-nicknames p
+        (%mapcar-pkg-string-designator new-nicks))
+      p)))
+
+;;; --- Symbol operations ---
+
+(defun symbol-name (sym)
+  "Return the name of a symbol as a string."
+  (cond
+    ((null sym) "NIL")
+    ((eq sym t) "T")
+    ((%cl-sym-p sym) (%cl-sym-name sym))
+    (t "")))
+
+(defun symbol-package (sym)
+  "Return the home package of a symbol."
+  (cond
+    ((null sym) (find-package "COMMON-LISP"))
+    ((eq sym t) (find-package "COMMON-LISP"))
+    ((%cl-sym-p sym) (%cl-sym-package sym))
+    (t nil)))
+
+(defun make-symbol (name)
+  "Create an uninterned symbol with NAME."
+  (let ((sym (%make-cl-symbol (%pkg-string-designator name))))
+    sym))
+
+(defun copy-symbol (sym &optional copy-props)
+  "Create a copy of SYM."
+  (let ((new (%make-cl-symbol (symbol-name sym))))
+    new))
+
+;;; --- gentemp ---
+(defvar *gentemp-counter* 0)
+
+(defun gentemp (&rest args)
+  "Generate a new symbol interned in *PACKAGE*. Prefix defaults to T."
+  (let ((prefix (if args (%pkg-string-designator (car args)) "T"))
+        (pkg (if (and args (cdr args))
+                 (%resolve-package (cadr args))
+                 *package*)))
+    (loop
+      (let* ((name (format nil "~A~D" prefix *gentemp-counter*))
+             (found (find-symbol name pkg)))
+        (setq *gentemp-counter* (+ *gentemp-counter* 1))
+        (when (null found)
+          ;; Symbol doesn't exist yet — intern it
+          (let ((sym (%make-cl-symbol name)))
+            (%cl-sym-set-package sym pkg)
+            (%pkg-set-internal pkg (%symtab-add (%pkg-internal pkg) name sym))
+            (return sym)))))))
+
+;;; --- find-symbol / intern ---
+
+(defun find-symbol (name &rest pkg-arg)
+  "Find symbol named NAME in package PKG.
+   Returns (values symbol status) or (values nil nil)."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (name-str (%pkg-string-designator name)))
+    (if (null pkg)
+        (values nil nil)
+        ;; Check external symbols
+        (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str)))
+          (if ext-entry
+              (values (cdr ext-entry) :external)
+              ;; Check internal symbols
+              (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
+                (if int-entry
+                    (values (cdr int-entry) :internal)
+                    ;; Check inherited (use-list external symbols)
+                    (let ((found nil)
+                          (use (%pkg-use-list pkg)))
+                      (loop
+                        (when (null use) (return nil))
+                        (let ((uext (%symtab-find (%pkg-external (car use)) name-str)))
+                          (when uext
+                            (setq found (cdr uext))
+                            (return nil)))
+                        (setq use (cdr use)))
+                      (if found
+                          (values found :inherited)
+                          (values nil nil))))))))))
+
+(defun intern (name &rest pkg-arg)
+  "Intern symbol named NAME in package PKG.
+   Returns (values symbol status)."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (name-str (%pkg-string-designator name)))
+    (if (null pkg)
+        (values nil nil)
+        ;; Check if already present
+        (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str)))
+          (if ext-entry
+              (values (cdr ext-entry) :external)
+              (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
+                (if int-entry
+                    (values (cdr int-entry) :internal)
+                    ;; Check inherited
+                    (let ((found nil)
+                          (use (%pkg-use-list pkg)))
+                      (loop
+                        (when (null use) (return nil))
+                        (let ((uext (%symtab-find (%pkg-external (car use)) name-str)))
+                          (when uext
+                            (setq found (cdr uext))
+                            (return nil)))
+                        (setq use (cdr use)))
+                      (if found
+                          (values found :inherited)
+                          ;; Create new symbol
+                          (let ((sym (%make-cl-symbol name-str)))
+                            (%cl-sym-set-package sym pkg)
+                            ;; Keyword package: auto-export and self-evaluate
+                            (if (and (find-package "KEYWORD")
+                                     (eq pkg (find-package "KEYWORD")))
+                                (progn
+                                  (%pkg-set-external pkg
+                                    (%symtab-add (%pkg-external pkg) name-str sym))
+                                  (values sym :external))
+                                (progn
+                                  (%pkg-set-internal pkg
+                                    (%symtab-add (%pkg-internal pkg) name-str sym))
+                                  (values sym nil)))))))))))))
+
+;;; --- export / unexport ---
+
+(defun export (symbols &rest pkg-arg)
+  "Export SYMBOLS from PKG."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
+                      symbols
+                      (list symbols))))
+    (dolist (sym sym-list)
+      (let ((name-str (symbol-name sym)))
+        ;; If in internal, move to external
+        (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
+          (when int-entry
+            (%pkg-set-internal pkg (%symtab-remove (%pkg-internal pkg) name-str))))
+        ;; Add to external if not already there
+        (unless (%symtab-find (%pkg-external pkg) name-str)
+          (%pkg-set-external pkg
+            (%symtab-add (%pkg-external pkg) name-str sym)))))
+    t))
+
+(defun unexport (symbols &rest pkg-arg)
+  "Unexport SYMBOLS from PKG (move to internal)."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
+                      symbols
+                      (list symbols))))
+    (dolist (sym sym-list)
+      (let ((name-str (symbol-name sym)))
+        ;; If in external, move to internal
+        (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str)))
+          (when ext-entry
+            (%pkg-set-external pkg (%symtab-remove (%pkg-external pkg) name-str))
+            (unless (%symtab-find (%pkg-internal pkg) name-str)
+              (%pkg-set-internal pkg
+                (%symtab-add (%pkg-internal pkg) name-str sym)))))))
+    t))
+
+;;; --- import ---
+
+(defun import (symbols &rest pkg-arg)
+  "Import SYMBOLS into PKG."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
+                      symbols
+                      (list symbols))))
+    (dolist (sym sym-list)
+      (let ((name-str (symbol-name sym)))
+        ;; Only add if not already accessible
+        (unless (or (%symtab-find (%pkg-internal pkg) name-str)
+                    (%symtab-find (%pkg-external pkg) name-str))
+          (%pkg-set-internal pkg
+            (%symtab-add (%pkg-internal pkg) name-str sym)))))
+    t))
+
+;;; --- unintern ---
+
+(defun unintern (sym &rest pkg-arg)
+  "Remove SYM from PKG."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (name-str (symbol-name sym))
+        (removed nil))
+    (when (%symtab-find (%pkg-internal pkg) name-str)
+      (%pkg-set-internal pkg (%symtab-remove (%pkg-internal pkg) name-str))
+      (setq removed t))
+    (when (%symtab-find (%pkg-external pkg) name-str)
+      (%pkg-set-external pkg (%symtab-remove (%pkg-external pkg) name-str))
+      (setq removed t))
+    ;; Remove from shadowing symbols
+    (%pkg-set-shadowing pkg
+      (%remove-eq-item sym (%pkg-shadowing pkg)))
+    ;; If this was the symbol's home package, set to nil
+    (when (and removed (%cl-sym-p sym) (eq (%cl-sym-package sym) pkg))
+      (%cl-sym-set-package sym nil))
+    removed))
+
+;;; --- use-package / unuse-package ---
+
+(defun %use-package-impl (packages-to-use using-pkg)
+  "Internal: add PACKAGES-TO-USE to USING-PKG's use-list."
+  (let ((to-use (%resolve-package packages-to-use)))
+    (when (and to-use (not (eq to-use using-pkg)))
+      (unless (member to-use (%pkg-use-list using-pkg) :test #'eq)
+        (%pkg-set-use-list using-pkg
+          (cons to-use (%pkg-use-list using-pkg)))
+        (%pkg-set-used-by to-use
+          (cons using-pkg (%pkg-used-by to-use)))))))
+
+(defun use-package (packages &rest pkg-arg)
+  "Add PACKAGES to the use-list of PKG."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (pkg-list (if (and (consp packages) (not (%pkg-p packages)))
+                      packages
+                      (list packages))))
+    (dolist (p pkg-list)
+      (%use-package-impl p pkg))
+    t))
+
+(defun unuse-package (packages &rest pkg-arg)
+  "Remove PACKAGES from the use-list of PKG."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (pkg-list (if (and (consp packages) (not (%pkg-p packages)))
+                      packages
+                      (list packages))))
+    (dolist (p-designator pkg-list)
+      (let ((p (%resolve-package p-designator)))
+        (when p
+          (%pkg-set-use-list pkg
+            (%remove-eq-item p (%pkg-use-list pkg)))
+          (%pkg-set-used-by p
+            (%remove-eq-item pkg (%pkg-used-by p))))))
+    t))
+
+;;; --- shadow / shadowing-import ---
+
+(defun shadow (names &rest pkg-arg)
+  "Create shadowing symbols in PKG."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (name-list (if (or (stringp names) (%cl-sym-p names) (characterp names))
+                       (list names)
+                       (if (consp names) names (list names)))))
+    (dolist (name name-list)
+      (let ((name-str (%pkg-string-designator name)))
+        ;; Find or create symbol
+        (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str))
+              (int-entry (%symtab-find (%pkg-internal pkg) name-str)))
+          (let ((sym (cond (ext-entry (cdr ext-entry))
+                           (int-entry (cdr int-entry))
+                           (t ;; Create new internal symbol
+                            (let ((new-sym (%make-cl-symbol name-str)))
+                              (%cl-sym-set-package new-sym pkg)
+                              (%pkg-set-internal pkg
+                                (%symtab-add (%pkg-internal pkg) name-str new-sym))
+                              new-sym)))))
+            ;; Add to shadowing symbols if not already there
+            (unless (member sym (%pkg-shadowing pkg) :test #'eq)
+              (%pkg-set-shadowing pkg
+                (cons sym (%pkg-shadowing pkg))))))))
+    t))
+
+(defun shadowing-import (symbols &rest pkg-arg)
+  "Import SYMBOLS into PKG as shadowing symbols."
+  (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
+        (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
+                      symbols
+                      (list symbols))))
+    (dolist (sym sym-list)
+      (let ((name-str (symbol-name sym)))
+        ;; Remove any existing symbol with this name
+        (%pkg-set-internal pkg (%symtab-remove (%pkg-internal pkg) name-str))
+        (%pkg-set-external pkg (%symtab-remove (%pkg-external pkg) name-str))
+        ;; Remove old shadowing symbols with same name
+        (setq *%remove-sym-name* name-str)
+        (%pkg-set-shadowing pkg
+          (%remove-sym-by-name (%pkg-shadowing pkg)))
+        ;; Add the symbol as internal
+        (%pkg-set-internal pkg
+          (%symtab-add (%pkg-internal pkg) name-str sym))
+        ;; Add to shadowing list
+        (%pkg-set-shadowing pkg
+          (cons sym (%pkg-shadowing pkg)))))
+    t))
+
+;;; --- find-all-symbols ---
+
+(defun find-all-symbols (name)
+  "Find all symbols with NAME in all packages."
+  (let ((name-str (%pkg-string-designator name))
+        (result nil))
+    (dolist (pkg *all-packages*)
+      (when (%pkg-name pkg)
+        (let ((ext (%symtab-find (%pkg-external pkg) name-str)))
+          (when ext
+            (unless (member (cdr ext) result :test #'eq)
+              (setq result (cons (cdr ext) result)))))
+        (let ((int (%symtab-find (%pkg-internal pkg) name-str)))
+          (when int
+            (unless (member (cdr int) result :test #'eq)
+              (setq result (cons (cdr int) result)))))))
+    result))
+
+;;; --- defpackage ---
+
+(defun %defpackage-impl (name options)
+  "Create/modify a package with options (options is a list)."
+  (let ((name-str (%pkg-string-designator name))
+        (nicknames nil)
+        (use-list nil)
+        (use-provided nil)
+        (export-names nil)
+        (import-from nil)
+        (shadow-names nil)
+        (shadowing-import-from nil)
+        (intern-names nil))
+    ;; Parse options
+    (dolist (opt options)
+      (when (consp opt)
+        (let ((key (car opt)))
+          (cond
+            ((eq key :nicknames)
+             (setq nicknames (append nicknames (cdr opt))))
+            ((eq key :use)
+             (setq use-provided t)
+             (setq use-list (append use-list (cdr opt))))
+            ((eq key :export)
+             (setq export-names (append export-names (cdr opt))))
+            ((eq key :import-from)
+             (setq import-from (cons (cdr opt) import-from)))
+            ((eq key :shadow)
+             (setq shadow-names (append shadow-names (cdr opt))))
+            ((eq key :shadowing-import-from)
+             (setq shadowing-import-from (cons (cdr opt) shadowing-import-from)))
+            ((eq key :intern)
+             (setq intern-names (append intern-names (cdr opt))))
+            ((eq key :documentation) nil)
+            (t nil)))))
+    ;; Delete existing package if any
+    (let ((existing (find-package name-str)))
+      (when existing (safely-delete-package existing)))
+    ;; Create
+    (let ((pkg (make-package name-str
+                 :nicknames nicknames
+                 :use (if use-provided use-list nil))))
+      ;; Shadow
+      (when shadow-names
+        (shadow shadow-names pkg))
+      ;; Shadowing-import-from: ((pkg-name sym-name ...) ...)
+      (dolist (spec shadowing-import-from)
+        (let ((from-pkg (%resolve-package (car spec))))
+          (when from-pkg
+            (dolist (sname (cdr spec))
+              (let ((sname-str (%pkg-string-designator sname)))
+                (let ((found (find-symbol sname-str from-pkg)))
+                  (when found
+                    (shadowing-import found pkg))))))))
+      ;; Import-from: ((pkg-name sym-name ...) ...)
+      (dolist (spec import-from)
+        (let ((from-pkg (%resolve-package (car spec))))
+          (when from-pkg
+            (dolist (sname (cdr spec))
+              (let ((sname-str (%pkg-string-designator sname)))
+                (let ((found (find-symbol sname-str from-pkg)))
+                  (when found
+                    (import found pkg))))))))
+      ;; Intern
+      (dolist (sname intern-names)
+        (intern (%pkg-string-designator sname) pkg))
+      ;; Export
+      (dolist (sname export-names)
+        (let ((sname-str (%pkg-string-designator sname)))
+          (let ((sym (intern sname-str pkg)))
+            (export sym pkg))))
+      pkg)))
+
+;;; --- in-package ---
+
+(defun in-package (name)
+  "Set *package* to the package named NAME."
+  (let ((pkg (find-package name)))
+    (when pkg
+      (setq *package* pkg))
+    pkg))
+
+;;; --- Iteration: do-symbols, do-external-symbols, do-all-symbols ---
+
+(defun %do-symbols-fn (fn pkg)
+  "Call FN on each symbol accessible in PKG (internal + external + inherited)."
+  (let ((p (%resolve-package pkg))
+        (seen nil))
+    (when p
+      ;; Internal symbols
+      (dolist (entry (%pkg-internal p))
+        (let ((sym (cdr entry)))
+          (unless (member sym seen :test #'eq)
+            (setq seen (cons sym seen))
+            (funcall fn sym))))
+      ;; External symbols
+      (dolist (entry (%pkg-external p))
+        (let ((sym (cdr entry)))
+          (unless (member sym seen :test #'eq)
+            (setq seen (cons sym seen))
+            (funcall fn sym))))
+      ;; Inherited
+      (dolist (used (%pkg-use-list p))
+        (dolist (entry (%pkg-external used))
+          (let ((sym (cdr entry))
+                (name-str (car entry)))
+            ;; Only if not shadowed
+            (unless (or (member sym seen :test #'eq)
+                        (%symtab-find (%pkg-internal p) name-str)
+                        (%symtab-find (%pkg-external p) name-str))
+              (setq seen (cons sym seen))
+              (funcall fn sym))))))))
+
+(defun %do-external-symbols-fn (fn pkg)
+  "Call FN on each external symbol in PKG."
+  (let ((p (%resolve-package pkg)))
+    (when p
+      (dolist (entry (%pkg-external p))
+        (funcall fn (cdr entry))))))
+
+(defun %do-all-symbols-fn (fn)
+  "Call FN on each symbol in all packages."
+  (let ((seen nil))
+    (dolist (pkg *all-packages*)
+      (when (%pkg-name pkg)
+        (dolist (entry (%pkg-internal pkg))
+          (let ((sym (cdr entry)))
+            (unless (member sym seen :test #'eq)
+              (setq seen (cons sym seen))
+              (funcall fn sym))))
+        (dolist (entry (%pkg-external pkg))
+          (let ((sym (cdr entry)))
+            (unless (member sym seen :test #'eq)
+              (setq seen (cons sym seen))
+              (funcall fn sym))))))))
+
+;;; --- safely-delete-package (test helper) ---
+
+(defun safely-delete-package (package-designator)
+  "Delete package if it exists, first removing use relationships."
+  (let ((package (find-package package-designator)))
+    (when package
+      (let ((used-by (package-used-by-list package)))
+        (dolist (using-package used-by)
+          (unuse-package package using-package)))
+      (delete-package package))))
+
+;;; --- Override symbolp/keywordp for CL symbols ---
+
+(defun symbolp (x)
+  "True if X is a symbol (MVM native or CL symbol)."
+  (or (null x) (eq x t) (%cl-sym-p x)
+      ;; Check for MVM native symbols (subtag #x50 = 80)
+      (and (not (integerp x)) (not (consp x)) (not (characterp x))
+           (not (stringp x)) (not (null x))
+           (= (obj-subtag x) 80))))
+
+(defun keywordp (x)
+  "True if X is a keyword symbol."
+  (if (%cl-sym-p x)
+      (let ((kw-pkg (find-package "KEYWORD")))
+        (if kw-pkg
+            (eq (%cl-sym-package x) kw-pkg)
+            nil))
+      ;; Fallback for MVM native keyword symbols
+      (member x '(:test :key :test-not :count :start :end :from-end
+                  :initial-element :initial-contents :element-type
+                  :allow-other-keys :internal :external :inherited
+                  :nicknames :use :export :import-from :shadow
+                  :shadowing-import-from :intern :documentation))))
+
+(defun boundp (sym)
+  "True if SYM is bound. Keyword symbols are always bound to themselves."
+  (if (%cl-sym-p sym)
+      (keywordp sym)
+      t))
+
+(defun constantp (sym &rest env)
+  "True if SYM is a constant. Keywords are constants."
+  (if (%cl-sym-p sym)
+      (keywordp sym)
+      nil))
+
+;;; --- Collect package symbols for with-package-iterator ---
+
+(defun %collect-package-symbols (packages symbol-types)
+  "Collect all (symbol access package) triples for WITH-PACKAGE-ITERATOR."
+  (let ((result nil))
+    (let ((pkg-list (if (and (consp packages) (not (%pkg-p packages)))
+                        packages
+                        (list packages))))
+      (dolist (pkg-designator pkg-list)
+        (let ((pkg (%resolve-package pkg-designator)))
+          (when pkg
+            ;; Internal
+            (when (member :internal symbol-types)
+              (dolist (entry (%pkg-internal pkg))
+                (setq result (cons (list (cdr entry) :internal pkg) result))))
+            ;; External
+            (when (member :external symbol-types)
+              (dolist (entry (%pkg-external pkg))
+                (setq result (cons (list (cdr entry) :external pkg) result))))
+            ;; Inherited
+            (when (member :inherited symbol-types)
+              (dolist (used (%pkg-use-list pkg))
+                (dolist (entry (%pkg-external used))
+                  (let ((name-str (car entry)))
+                    ;; Only if not shadowed by internal/external
+                    (unless (or (%symtab-find (%pkg-internal pkg) name-str)
+                                (%symtab-find (%pkg-external pkg) name-str))
+                      (setq result
+                        (cons (list (cdr entry) :inherited used) result)))))))))))
+    result))
+
+;;; --- Test helper functions from packages00-aux ---
+
+(defun set-up-packages ()
+  "Set up test packages A and B."
+  (safely-delete-package "A")
+  (safely-delete-package "B")
+  (safely-delete-package "Q")
+  (%defpackage-impl "A" (list (list :use) (list :nicknames "Q") (list :export "FOO")))
+  (%defpackage-impl "B" (list (list :use "A") (list :export "BAR"))))
+
+;;; Non-closure counter/collector for do-symbols traversal
+(defvar *%sym-count* 0)
+(defvar *%sym-list* nil)
+(defun %count-sym (s) (setq *%sym-count* (+ *%sym-count* 1)))
+(defun %collect-sym (s) (setq *%sym-list* (cons s *%sym-list*)))
+(defun %sym-string< (a b) (string< (symbol-name a) (symbol-name b)))
+(defun %sym-name-pkg< (x y)
+  (or (string< (symbol-name x) (symbol-name y))
+      (and (string-equal (symbol-name x) (symbol-name y))
+           (let ((px (symbol-package x))
+                 (py (symbol-package y)))
+             (if (and px py)
+                 (string< (package-name px) (package-name py))
+                 nil)))))
+
+(defun num-symbols-in-package (p)
+  "Count all accessible symbols in package P."
+  (setq *%sym-count* 0)
+  (%do-symbols-fn #'%count-sym p)
+  *%sym-count*)
+
+(defun num-external-symbols-in-package (p)
+  "Count external symbols in package P."
+  (setq *%sym-count* 0)
+  (%do-external-symbols-fn #'%count-sym p)
+  *%sym-count*)
+
+(defun external-symbols-in-package (p)
+  "List external symbols in package P, sorted."
+  (setq *%sym-list* nil)
+  (%do-external-symbols-fn #'%collect-sym p)
+  (sort *%sym-list* #'%sym-string<))
+
+(defun sort-symbols (sl)
+  "Sort a list of symbols by name, then by package name."
+  (sort (copy-list sl) #'%sym-name-pkg<))
+
+(defun %pkg-name< (a b) (string< (package-name a) (package-name b)))
+
+(defun sort-package-list (x)
+  "Sort packages by name."
+  (sort (copy-list x) #'%pkg-name<))
+
+(defun collect-symbols (pkg)
+  "Collect all symbols accessible in PKG, sorted."
+  (remove-duplicates
+    (sort-symbols
+      (progn
+        (setq *%sym-list* nil)
+        (%do-symbols-fn #'%collect-sym pkg)
+        *%sym-list*))))
+
+(defun collect-external-symbols (pkg)
+  "Collect external symbols in PKG, sorted."
+  (remove-duplicates
+    (sort-symbols
+      (progn
+        (setq *%sym-list* nil)
+        (%do-external-symbols-fn #'%collect-sym pkg)
+        *%sym-list*))))
+
+(defvar *fail-count-limit* 20)
+
+;;; --- documentation stub ---
+
+(defun documentation (obj doc-type) nil)
+

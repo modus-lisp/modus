@@ -32,7 +32,31 @@
 
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
 (defvar *rt-source*      (mvm-text "mvm/rt.lisp"))
-(defvar *bridge-source*  (mvm-text "mvm/ansi-bridge.lisp"))
+(defvar *bridge-source*
+  (concatenate 'string
+    ;; Load order matches original ansi-bridge.lisp concatenation order.
+    ;; cl-sequences first because floatp-impl is needed by the printer.
+    (mvm-text "mvm/cl-sequences.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-streams.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-fileio.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-printer.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-reader.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-eval.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-clos.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-types.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-packages.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/cl-conditions.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/ansi-bridge.lisp")))
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
 ;; SBCL-level stubs for functions called during macro expansion

@@ -819,20 +819,26 @@
 
   ;; LDB — extract byte field from integer
   ;; (ldb (byte size position) integer) → (logand (ash integer (- position)) mask)
+  ;; For constant (byte s p): inline expansion
+  ;; For non-constant bytespec: expand to %ldb-runtime call (avoids re-triggering this macro)
   (mvm-define-macro "LDB"
     (lambda (form)
       (let ((bytespec (cadr form))
             (integer (caddr form)))
         (if (and (consp bytespec)
                  (symbolp (car bytespec))
-                 (string= (symbol-name (car bytespec)) "BYTE"))
+                 (string= (symbol-name (car bytespec)) "BYTE")
+                 (integerp (cadr bytespec))
+                 (integerp (caddr bytespec)))
+            ;; Constant (byte size pos): inline
             (let* ((size (cadr bytespec))
                    (pos (caddr bytespec))
                    (mask (1- (ash 1 size))))
               (if (zerop pos)
                   `(logand ,integer ,mask)
                   `(logand (ash ,integer ,(- pos)) ,mask)))
-            (error "MVM ldb: only (ldb (byte s p) n) supported, got ~S" bytespec)))))
+            ;; Non-constant bytespec: use runtime %ldb-rt which handles byte-spec at runtime
+            `(%ldb-rt ,bytespec ,integer)))))
 
   ;; EMIT-BYTES — expand to individual emit-byte calls (avoids &rest)
   (mvm-define-macro "EMIT-BYTES"
@@ -5780,18 +5786,26 @@
        last-result))
 
     ;; (defun name (params) body...)
+    ;; Also handles (defun (setf name) (params) body...) → compile as "SETF-NAME"
     ((and (consp form) (name-eq (car form) "DEFUN"))
-     (destructuring-bind (name params &body body) (cdr form)
-       ;; Detect &rest before preprocessing strips it
-       (let ((rest-pos (position '&rest params))
-             (pp (preprocess-params params body)))
-         (let ((result (mvm-compile-function name (car pp) (cdr pp))))
-           ;; Record &rest info in function-info
-           (when rest-pos
-             (let ((info (car result)))
-               (setf (function-info-rest-param-p info) t)
-               (setf (function-info-required-count info) rest-pos)))
-           result))))
+     (destructuring-bind (raw-name params &body body) (cdr form)
+       ;; Normalize (setf foo) to "SETF-FOO" string for compilation
+       (let ((name (if (and (consp raw-name)
+                            (= (length raw-name) 2)
+                            (symbolp (car raw-name))
+                            (string= (symbol-name (car raw-name)) "SETF"))
+                       (format nil "SETF-~A" (symbol-name (cadr raw-name)))
+                       raw-name)))
+         ;; Detect &rest before preprocessing strips it
+         (let ((rest-pos (position '&rest params))
+               (pp (preprocess-params params body)))
+           (let ((result (mvm-compile-function name (car pp) (cdr pp))))
+             ;; Record &rest info in function-info
+             (when rest-pos
+               (let ((info (car result)))
+                 (setf (function-info-rest-param-p info) t)
+                 (setf (function-info-required-count info) rest-pos)))
+             result)))))
 
     ;; (defvar name &optional value)
     ((and (consp form) (name-eq (car form) "DEFVAR"))

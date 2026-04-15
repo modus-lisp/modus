@@ -3408,6 +3408,21 @@
 (defun array-element-type (a) t)
 (defun check-type-error (fn args) nil)
 (defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))
+(defun %make-array-ic (size contents)
+  "Create an array of SIZE with :initial-contents from CONTENTS (list or sequence)."
+  (let ((arr (make-array size)))
+    (if (listp contents)
+        (let ((cur contents) (i 0))
+          (loop
+            (when (or (null cur) (= i size)) (return arr))
+            (aset arr i (car cur))
+            (setq cur (cdr cur))
+            (setq i (+ i 1))))
+        (let ((i 0))
+          (loop
+            (when (= i size) (return arr))
+            (aset arr i (aref contents i))
+            (setq i (+ i 1)))))))
 (defun make-sequence (type size &rest args) (if (eq type 'list) (let ((r nil)) (dotimes (i size) (setq r (cons nil r))) r) (make-array size)))
 (defun coerce (obj type) (cond ((eq type 'list) (if (consp obj) obj (list obj))) ((eq type 'character) obj) (t obj)))
 (defun mismatch (s1 s2) (let ((l1 (length s1)) (l2 (length s2))) (let ((limit (if (< l1 l2) l1 l2)) (i 0))
@@ -6049,8 +6064,43 @@
 (defun standard-char-p (c) (graphic-char-p c))
 (defun digit-char (weight &optional (radix 10))
   (if (< weight radix) (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight))) nil))
-(defun name-char (name) nil)  ; stub
-(defun char-name (c) nil)  ; stub
+(defun name-char (name)
+  "Return the character with the given name (case-insensitive), or nil."
+  (let ((s (string-upcase (cond
+                            ((stringp name) name)
+                            ((symbolp name) (symbol-name name))
+                            ((characterp name) (make-string 1 :initial-element name))
+                            (t (coerce name 'string))))))
+    (cond
+      ((string= s "SPACE")     #\Space)
+      ((string= s "NEWLINE")   #\Newline)
+      ((string= s "TAB")       #\Tab)
+      ((string= s "RETURN")    (code-char 13))
+      ((string= s "BACKSPACE") (code-char 8))
+      ((string= s "RUBOUT")    (code-char 127))
+      ((string= s "PAGE")      (code-char 12))
+      ((string= s "LINEFEED")  (code-char 10))
+      ((string= s "ALTMODE")   (code-char 27))
+      ((string= s "NULL")      (code-char 0))
+      ((string= s "NUL")       (code-char 0))
+      ((string= s "ESCAPE")    (code-char 27))
+      ((string= s "DELETE")    (code-char 127))
+      (t nil))))
+
+(defun char-name (c)
+  "Return the name of the character, or nil."
+  (let ((code (%ensure-char-code c)))
+    (cond
+      ((= code 32)  "Space")
+      ((= code 10)  "Newline")
+      ((= code 9)   "Tab")
+      ((= code 13)  "Return")
+      ((= code 8)   "Backspace")
+      ((= code 127) "Rubout")
+      ((= code 12)  "Page")
+      ((= code 27)  "Escape")
+      ((= code 0)   "Null")
+      (t nil))))
 
 (defun char= (a b) (eql (%ensure-char-code a) (%ensure-char-code b)))
 (defun char/= (a b) (not (char= a b)))
@@ -10604,3 +10654,15 @@
 (defun upgraded-complex-part-type (type)
   "Return upgraded complex part type (simplified to T)."
   t)
+
+;;; ============================================================
+;;; Runtime LDB for non-constant byte specs
+;;; ============================================================
+
+(defun %ldb-rt (bytespec integer)
+  "Runtime LDB when bytespec is not a compile-time constant.
+   Bytespec is (size . pos) cons cell."
+  (let ((size (byte-size bytespec))
+        (pos (byte-position bytespec)))
+    (logand (ash integer (- 0 pos))
+            (- (ash 1 size) 1))))

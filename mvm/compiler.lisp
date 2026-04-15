@@ -3310,32 +3310,94 @@
 
 (defun compile-unwind-protect (protected-form cleanup-forms env dest)
   "Compile (unwind-protect protected cleanup...).
-   Since we have no real non-local exits, this evaluates protected-form,
-   saves the MV state (count + extra values), runs cleanup-forms (which
-   may clobber MV state via their epilogues), restores MV state, then
-   returns the primary value of the protected form."
-  (let* ((result-var (gensym "UWPRES"))
-         (n-mv-slots 8)
-         (mv-count-save (gensym "UWPCNT"))
-         (mv-save-vars (loop for i from 0 below n-mv-slots
-                             collect (gensym (format nil "UWPMV~D" i))))
-         (mv-save-bindings
-           (cons (list mv-count-save `(mem-ref ,+mv-count-addr+ :u64))
-                 (loop for i from 0 below n-mv-slots
-                       for sv in mv-save-vars
-                       collect (list sv `(mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64)))))
-         (mv-restore-forms
-           (cons `(setf (mem-ref ,+mv-count-addr+ :u64) ,mv-count-save)
-                 (loop for i from 0 below n-mv-slots
-                       for sv in mv-save-vars
-                       collect `(setf (mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64) ,sv)))))
-    (compile-form
-     `(let* ((,result-var ,protected-form)
-             ,@mv-save-bindings)
-        ,@cleanup-forms
-        ,@mv-restore-forms
-        ,result-var)
-     env dest)))
+   Uses setjmp/longjmp to catch errors from the protected form.
+   Both the normal path and the error path run the cleanup forms.
+   Normal path: execute protected, save MV state, clear handler, run cleanup,
+                restore MV state, return primary value.
+   Error path:  clear handler, run cleanup, re-signal via longjmp."
+  (let* ((error-label (make-compiler-label))
+         (end-label   (make-compiler-label))
+         (n-mv-slots  4)  ; save up to 4 extra MV slots (enough for most cases)
+         (check-reg   (alloc-temp-reg)))
+
+    ;; ---------------------------------------------------------------
+    ;; Setjmp: saves CPU context. Returns 0 on first call (normal path),
+    ;; nonzero when longjmp causes re-entry (error path).
+    ;; ---------------------------------------------------------------
+    (emit-ir :trap #x0510)                        ; setjmp
+    (emit-ir :mov check-reg +vreg-vr+)            ; check-reg = 0 or nonzero
+    (emit-ir :bnnull check-reg error-label)        ; nonzero → error path
+    (free-temp-reg)                                ; check-reg no longer needed
+
+    ;; ---------------------------------------------------------------
+    ;; NORMAL PATH: protected form returned without error
+    ;; ---------------------------------------------------------------
+
+    ;; Compile the protected form; primary result lands in dest.
+    (compile-form protected-form env dest)
+
+    ;; Preserve primary result across cleanup forms (which may clobber regs).
+    (emit-ir :push dest)
+
+    ;; Save MV count and up to n-mv-slots extra values on the stack.
+    ;; These are raw u64 (tagged CL objects), loaded without fixnum shift.
+    (let ((mv-temp (alloc-temp-reg)))
+      (emit-ir :li mv-temp +mv-count-addr+)
+      (emit-ir :load mv-temp mv-temp +width-u64+)
+      (emit-ir :push mv-temp)
+      (dotimes (i n-mv-slots)
+        (emit-ir :li mv-temp (+ +mv-values-addr+ (* i 8)))
+        (emit-ir :load mv-temp mv-temp +width-u64+)
+        (emit-ir :push mv-temp))
+      (free-temp-reg))
+
+    ;; Clear the setjmp handler so errors in cleanup go to the outer handler.
+    (emit-ir :trap #x0512)
+
+    ;; Run cleanup forms; their return values are discarded.
+    (dolist (cf cleanup-forms)
+      (compile-form cf env +vreg-vn+))
+
+    ;; Restore MV state (pop in reverse push order: last MV slot first).
+    (let ((mv-temp   (alloc-temp-reg))
+          (addr-temp (alloc-temp-reg)))
+      (loop for i from (1- n-mv-slots) downto 0 do
+        (emit-ir :pop mv-temp)
+        (emit-ir :li addr-temp (+ +mv-values-addr+ (* i 8)))
+        (emit-ir :store addr-temp mv-temp +width-u64+))
+      ;; Restore MV count
+      (emit-ir :pop mv-temp)
+      (emit-ir :li addr-temp +mv-count-addr+)
+      (emit-ir :store addr-temp mv-temp +width-u64+)
+      (free-temp-reg)
+      (free-temp-reg))
+
+    ;; Recover primary result into dest.
+    (emit-ir :pop dest)
+
+    (emit-ir :br end-label)
+
+    ;; ---------------------------------------------------------------
+    ;; ERROR PATH: longjmp re-entered here after an error in protected
+    ;; ---------------------------------------------------------------
+    (emit-ir-label error-label)
+
+    ;; Clear the handler so errors in cleanup propagate outward.
+    (emit-ir :trap #x0512)
+
+    ;; Run cleanup forms; their return values are discarded.
+    (dolist (cf cleanup-forms)
+      (compile-form cf env +vreg-vn+))
+
+    ;; Re-propagate the original error to the enclosing handler.
+    ;; *current-condition* still holds the condition that was raised.
+    (emit-ir :trap #x0511)                        ; longjmp (does not return)
+    (emit-ir :mov dest +vreg-vn+)                 ; unreachable; keeps dest valid
+
+    ;; ---------------------------------------------------------------
+    ;; CONVERGENCE: only the normal path reaches here
+    ;; ---------------------------------------------------------------
+    (emit-ir-label end-label)))
 
 (defun compile-funcall (args env dest)
   "Compile (funcall f arg1 arg2 ...) - indirect function call"

@@ -109,7 +109,7 @@
 ;;; Missing CL functions
 ;;; ============================================================
 
-;;; complement: captures fn. Use global cell approach.
+;;; complement: captures fn in global cell approach (closure-safe variant).
 (defvar *complement-fn* nil)
 (defun %complement-impl (&rest args) (if (apply *complement-fn* args) nil t))
 (defun complement (fn) (setq *complement-fn* fn) #'%complement-impl)
@@ -5008,7 +5008,981 @@
     (if errorp
         (error "class not found")
         nil)))
-(defun eval (form) nil)  ; stub
+;;; ============================================================
+;;; Layer 8: Eval / Compile / Load
+;;; ============================================================
+
+;;; Global symbol-function table: maps symbol-name-string → function object.
+;;; Populated at startup with all built-in compiled functions.
+;;; Updated by (setf (symbol-function sym) fn) and defun-in-eval.
+(defvar *symbol-function-table* nil)
+
+(defun %sft-init ()
+  "Initialize the symbol-function table (empty hash table)."
+  (setq *symbol-function-table* (make-hash-table)))
+
+(defun symbol-function (sym)
+  "Return the function object for SYM, or signal undefined-function."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                (t nil))))
+    (when (null name)
+      (error "symbol-function: not a symbol"))
+    (let ((fn (if *symbol-function-table*
+                  (gethash name *symbol-function-table*)
+                  nil)))
+      (if fn
+          fn
+          (let ((c (%make-condition 'undefined-function (list :name sym))))
+            (if (%error-handler-active-p)
+                (%hc-longjmp)
+                (progn (error "undefined function") nil)))))))
+
+(defun set-symbol-function (sym fn)
+  "Set the function cell of SYM to FN."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                (t nil))))
+    (when (null name)
+      (error "set-symbol-function: not a symbol"))
+    (unless *symbol-function-table*
+      (%sft-init))
+    (puthash name *symbol-function-table* fn)
+    fn))
+
+(defun fboundp (sym)
+  "Return T if SYM has a function binding."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                ((null sym) nil)
+                (t nil))))
+    (if (null name)
+        nil
+        (if *symbol-function-table*
+            (if (gethash name *symbol-function-table*) t nil)
+            nil))))
+
+(defun fmakunbound (sym)
+  "Remove the function binding of SYM."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                (t nil))))
+    (when (and name *symbol-function-table*)
+      (remhash name *symbol-function-table*)))
+  sym)
+
+(defun fdefinition (sym)
+  "Return the function definition of SYM (same as symbol-function for now)."
+  (symbol-function sym))
+
+(defun set-fdefinition (sym fn)
+  "Set the function definition of SYM."
+  (set-symbol-function sym fn))
+
+;;; ============================================================
+;;; Macro table: maps macro-name-string → expander-function
+;;; ============================================================
+(defvar *macro-function-table* nil)
+
+(defun macro-function (sym &rest env)
+  "Return the macro expander function for SYM, or nil."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                (t nil))))
+    (if (and name *macro-function-table*)
+        (gethash name *macro-function-table*)
+        nil)))
+
+(defun set-macro-function (sym fn &rest env)
+  "Install FN as the macro expander for SYM."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                (t nil))))
+    (when name
+      (unless *macro-function-table*
+        (setq *macro-function-table* (make-hash-table)))
+      (puthash name *macro-function-table* fn)
+      fn)))
+
+;;; ============================================================
+;;; Macroexpand: walk macro calls
+;;; ============================================================
+
+(defun macroexpand-1 (form &rest env-arg)
+  "Expand FORM one level if it's a macro call. Returns (values form expanded-p)."
+  (if (and (consp form) (%cl-sym-p (car form)))
+      (let ((mf (macro-function (car form))))
+        (if mf
+            (let ((expanded (funcall mf form nil)))
+              (values expanded t))
+            (values form nil)))
+      (values form nil)))
+
+(defun macroexpand (form &rest env-arg)
+  "Expand FORM repeatedly until not a macro call. Returns (values form expanded-p)."
+  (let ((any nil))
+    (let ((cur form))
+      (loop
+        (let ((mf (if (and (consp cur) (%cl-sym-p (car cur)))
+                      (macro-function (car cur))
+                      nil)))
+          (if mf
+              (progn
+                (setq cur (funcall mf cur nil))
+                (setq any t))
+              (return (values cur any))))))))
+
+;;; ============================================================
+;;; Eval global variable table
+;;; Maps symbol-name-string → value for runtime-defined variables
+;;; ============================================================
+(defvar *eval-global-env* nil)
+
+(defun %eval-global-get (name)
+  "Look up global variable by name string. Returns (found-p . value)."
+  (let ((cur *eval-global-env*))
+    (loop
+      (when (null cur) (return (cons nil nil)))
+      (let ((pair (car cur)))
+        (when (string-equal (car pair) name)
+          (return (cons t (cdr pair)))))
+      (setq cur (cdr cur)))))
+
+(defun %eval-global-set (name value)
+  "Set global variable by name string."
+  (let ((cur *eval-global-env*))
+    (loop
+      (when (null cur)
+        ;; Not found: add new
+        (setq *eval-global-env* (cons (cons name value) *eval-global-env*))
+        (return value))
+      (let ((pair (car cur)))
+        (when (string-equal (car pair) name)
+          (set-cdr pair value)
+          (return value)))
+      (setq cur (cdr cur)))))
+
+;;; ============================================================
+;;; Interpreter environment helpers
+;;; ============================================================
+
+;;; env = alist of ((name-string . value) ...)
+;;; We store CL symbols directly as keys.
+
+(defun %env-lookup (sym env)
+  "Look up SYM (CL symbol or string name) in ENV alist. Returns (found-p . value)."
+  (let ((name (if (%cl-sym-p sym) (%cl-sym-name sym) sym))
+        (cur env))
+    (loop
+      (when (null cur) (return (cons nil nil)))
+      (let ((binding (car cur)))
+        (let ((bname (if (%cl-sym-p (car binding))
+                         (%cl-sym-name (car binding))
+                         (car binding))))
+          (when (string-equal name bname)
+            (return (cons t (cdr binding)))))
+        (setq cur (cdr cur))))))
+
+(defun %env-extend (sym val env)
+  "Add (sym . val) binding to front of ENV."
+  (cons (cons sym val) env))
+
+;;; ============================================================
+;;; Eval -- tree-walking interpreter
+;;; ============================================================
+
+(defun %eval-sym-name (sym)
+  "Get the string name of a symbol (CL or MVM)."
+  (cond
+    ((%cl-sym-p sym) (%cl-sym-name sym))
+    ((stringp sym) sym)
+    (t nil)))
+
+(defun %eval-sym-value (sym env)
+  "Look up the value of symbol SYM in ENV + globals."
+  (let ((found-pair (%env-lookup sym env)))
+    (if (car found-pair)
+        (cdr found-pair)
+        ;; Try eval global table first
+        (let ((name (%eval-sym-name sym)))
+          (if name
+              (let ((gv (%eval-global-get name)))
+                (if (car gv)
+                    (cdr gv)
+                    nil))
+              nil)))))
+
+(defun %eval-progn (forms env)
+  "Evaluate a list of forms, return value of last."
+  (if (null forms)
+      nil
+      (let ((cur forms))
+        (loop
+          (if (null (cdr cur))
+              (return (%eval-in-env (car cur) env))
+              (progn
+                (%eval-in-env (car cur) env)
+                (setq cur (cdr cur))))))))
+
+(defun %eval-let-bindings (bindings env orig-env)
+  "Evaluate LET bindings (parallel) and extend ENV."
+  (let ((new-env env)
+        (cur bindings))
+    (loop
+      (when (null cur) (return new-env))
+      (let ((binding (car cur)))
+        (let ((var (if (consp binding) (car binding) binding))
+              (val-form (if (and (consp binding) (cdr binding)) (cadr binding) nil)))
+          (let ((val (%eval-in-env val-form orig-env)))
+            (setq new-env (%env-extend var val new-env)))))
+      (setq cur (cdr cur)))))
+
+(defun %eval-let*-bindings (bindings env)
+  "Evaluate LET* bindings (sequential) and extend ENV."
+  (let ((new-env env)
+        (cur bindings))
+    (loop
+      (when (null cur) (return new-env))
+      (let ((binding (car cur)))
+        (let ((var (if (consp binding) (car binding) binding))
+              (val-form (if (and (consp binding) (cdr binding)) (cadr binding) nil)))
+          (let ((val (%eval-in-env val-form new-env)))
+            (setq new-env (%env-extend var val new-env)))))
+      (setq cur (cdr cur)))))
+
+(defun %eval-args (arg-forms env)
+  "Evaluate a list of argument forms."
+  (let ((result nil)
+        (cur arg-forms))
+    (loop
+      (when (null cur) (return (nreverse result)))
+      (setq result (cons (%eval-in-env (car cur) env) result))
+      (setq cur (cdr cur)))))
+
+(defun %eval-call-fn (fn args form)
+  "Call FN with ARGS list, using funcall/apply."
+  (let ((nargs (length args)))
+    (cond
+      ((= nargs 0) (funcall fn))
+      ((= nargs 1) (funcall fn (car args)))
+      ((= nargs 2) (funcall fn (car args) (cadr args)))
+      ((= nargs 3) (funcall fn (car args) (cadr args) (caddr args)))
+      ((= nargs 4) (funcall fn (car args) (cadr args) (caddr args) (cadddr args)))
+      ((= nargs 5) (funcall fn (car args) (cadr args) (caddr args) (cadddr args) (nth 4 args)))
+      (t (apply fn args)))))
+
+(defun %eval-sym-eq (sym name-str)
+  "Check if SYM (CL symbol or string) has name NAME-STR."
+  (let ((n (%eval-sym-name sym)))
+    (if n (string-equal n name-str) nil)))
+
+(defun %interp-closure-p (x)
+  "True if X is an interpreted closure (cons with tag %INTERP-CLOSURE)."
+  (and (consp x) (eq (car x) '%interp-closure)))
+
+(defun %call-interp-closure (fn args)
+  "Call an interpreted closure."
+  ;; fn = (%interp-closure params body env)
+  (let ((params (cadr fn))
+        (body (caddr fn))
+        (closed-env (cadddr fn)))
+    (let ((new-env (%bind-params params args closed-env)))
+      (%eval-progn body new-env))))
+
+(defun %bind-params (params args env)
+  "Bind PARAMS to ARGS in ENV, handling &rest."
+  (let ((new-env env)
+        (ps params)
+        (as args))
+    (loop
+      (cond
+        ((null ps) (return new-env))
+        ;; &rest parameter
+        ((%eval-sym-eq (car ps) "&REST")
+         (setq ps (cdr ps))
+         (when ps
+           (setq new-env (%env-extend (car ps) as new-env)))
+         (return new-env))
+        ;; &optional parameter
+        ((%eval-sym-eq (car ps) "&OPTIONAL")
+         (setq ps (cdr ps)))
+        ;; Regular parameter
+        (t
+         (setq new-env (%env-extend (car ps) (if as (car as) nil) new-env))
+         (setq ps (cdr ps))
+         (setq as (if as (cdr as) nil)))))))
+
+(defun %eval-function-form (name-or-lambda env)
+  "Evaluate a #'x or (function x) form."
+  (if (and (consp name-or-lambda) (%eval-sym-eq (car name-or-lambda) "LAMBDA"))
+      ;; (function (lambda ...)) → interpreted closure
+      (let ((params (cadr name-or-lambda))
+            (body (cddr name-or-lambda)))
+        (list '%interp-closure params body env))
+      ;; (function name) → look up compiled function
+      (let ((name (%eval-sym-name name-or-lambda)))
+        (if name
+            (let ((fn (if *symbol-function-table*
+                          (gethash name *symbol-function-table*)
+                          nil)))
+              (or fn (error "undefined function")))
+            name-or-lambda))))
+
+;;; Block/return-from support via condition mechanism
+;;; We use a simple approach: block-return throws a condition caught by block.
+
+(defun %eval-block (name forms env)
+  "Evaluate (block name forms...) with return-from support."
+  (handler-case
+    (%eval-progn forms env)
+    (error (c)
+      ;; Check if it's a block-return for this block
+      (if (%block-return-p c name)
+          (%block-return-value c)
+          (error c)))))
+
+;;; We implement block/return-from by signalling a special condition.
+;;; Since we can't easily do this without CLOS conditions, use a simpler
+;;; approach: use a global stack of block return values.
+
+(defvar *%block-return-stack* nil)
+
+(defun %block-push (tag value)
+  "Push a return value for BLOCK with TAG onto the stack."
+  (setq *%block-return-stack* (cons (cons tag value) *%block-return-stack*)))
+
+(defun %block-pop (tag)
+  "Pop and return the return value for BLOCK with TAG."
+  (let ((cur *%block-return-stack*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) tag)
+        ;; Remove all entries up to and including this tag
+        (setq *%block-return-stack* (cdr cur))
+        (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+;;; For block/return-from, use condition system
+;;; %block-return condition = (%block-return-cond . (tag . value))
+(defvar *%eval-throw-tag* nil)
+(defvar *%eval-throw-value* nil)
+
+(defun %eval-in-env (form env)
+  "Main eval function. Evaluates FORM in ENV (alist of bindings)."
+  (cond
+    ;; Self-evaluating: nil
+    ((null form) nil)
+    ;; Self-evaluating: t
+    ((eq form t) t)
+    ;; Self-evaluating: numbers
+    ((integerp form) form)
+    ;; Self-evaluating: floats
+    ((floatp-impl form) form)
+    ;; Self-evaluating: characters
+    ((characterp form) form)
+    ;; Self-evaluating: strings
+    ((stringp form) form)
+    ;; Self-evaluating: vectors
+    ((vectorp form) form)
+    ;; Keywords self-evaluate
+    ((and (%cl-sym-p form)
+          (let ((kp (find-package "KEYWORD")))
+            (if kp (eq (%cl-sym-package form) kp) nil)))
+     form)
+    ;; Symbol: variable lookup
+    ((or (%cl-sym-p form) (symbolp form))
+     (%eval-sym-lookup form env))
+    ;; List: dispatch on operator
+    ((consp form)
+     (%eval-compound form env))
+    ;; Default: self-evaluate
+    (t form)))
+
+(defun %eval-sym-lookup (sym env)
+  "Look up value of SYM in ENV then globals."
+  (let ((found-pair (%env-lookup sym env)))
+    (if (car found-pair)
+        (cdr found-pair)
+        ;; Try eval global table
+        (let ((name (%eval-sym-name sym)))
+          (if name
+              (let ((gv (%eval-global-get name)))
+                (if (car gv)
+                    (cdr gv)
+                    ;; Not found: signal unbound-variable
+                    (let ((c2 (%make-condition 'unbound-variable (list :name sym))))
+                      (if (%error-handler-active-p)
+                          (%hc-longjmp)
+                          nil))))
+              nil)))))
+
+(defun %eval-compound (form env)
+  "Evaluate a compound (list) form."
+  (let ((op (car form))
+        (args (cdr form)))
+    (cond
+      ;; QUOTE
+      ((%eval-sym-eq op "QUOTE") (car args))
+      ;; IF
+      ((%eval-sym-eq op "IF")
+       (if (%eval-in-env (car args) env)
+           (%eval-in-env (cadr args) env)
+           (if (cddr args) (%eval-in-env (caddr args) env) nil)))
+      ;; PROGN
+      ((%eval-sym-eq op "PROGN") (%eval-progn args env))
+      ;; LET
+      ((%eval-sym-eq op "LET")
+       (let ((bindings (car args))
+             (body (cdr args)))
+         (let ((new-env (%eval-let-bindings bindings env env)))
+           (%eval-progn body new-env))))
+      ;; LET*
+      ((%eval-sym-eq op "LET*")
+       (let ((bindings (car args))
+             (body (cdr args)))
+         (let ((new-env (%eval-let*-bindings bindings env)))
+           (%eval-progn body new-env))))
+      ;; SETQ
+      ((%eval-sym-eq op "SETQ")
+       (let ((cur args))
+         (let ((result nil))
+           (loop
+             (when (null cur) (return result))
+             (let ((var (car cur))
+                   (val-form (cadr cur)))
+               (let ((val (%eval-in-env val-form env)))
+                 ;; Check if in local env
+                 (let ((found-pair (%env-lookup var env)))
+                   (if (car found-pair)
+                       ;; Update local binding
+                       (let ((binding (%env-find-binding var env)))
+                         (when binding (set-cdr binding val)))
+                       ;; Update eval global table
+                       (let ((vname (%eval-sym-name var)))
+                         (when vname (%eval-global-set vname val)))))
+                 (setq result val)))
+             (setq cur (cddr cur))))))
+      ;; LAMBDA
+      ((%eval-sym-eq op "LAMBDA")
+       (list '%interp-closure (car args) (cdr args) env))
+      ;; FUNCTION (#')
+      ((%eval-sym-eq op "FUNCTION")
+       (%eval-function-form (car args) env))
+      ;; DEFUN
+      ((%eval-sym-eq op "DEFUN")
+       (let ((fname (car args))
+             (params (cadr args))
+             (body (cddr args)))
+         (let ((name-str (%eval-sym-name fname)))
+           (let ((fn (list '%interp-closure params body nil)))
+             (when name-str
+               (unless *symbol-function-table* (%sft-init))
+               (puthash name-str *symbol-function-table* fn)))
+           fname)))
+      ;; DEFVAR / DEFPARAMETER / DEFCONSTANT
+      ((%eval-sym-eq op "DEFVAR")
+       (let ((vname (car args)))
+         (when (cdr args)
+           (let ((val (%eval-in-env (cadr args) env)))
+             (let ((nm (%eval-sym-name vname)))
+               (when nm (%eval-global-set nm val)))))
+         vname))
+      ((%eval-sym-eq op "DEFPARAMETER")
+       (let ((vname (car args))
+             (val (%eval-in-env (cadr args) env)))
+         (let ((nm (%eval-sym-name vname)))
+           (when nm (%eval-global-set nm val)))
+         vname))
+      ((%eval-sym-eq op "DEFCONSTANT")
+       (let ((vname (car args))
+             (val (%eval-in-env (cadr args) env)))
+         (let ((nm (%eval-sym-name vname)))
+           (when nm (%eval-global-set nm val)))
+         vname))
+      ;; COND
+      ((%eval-sym-eq op "COND")
+       (let ((cur args))
+         (loop
+           (when (null cur) (return nil))
+           (let ((clause (car cur)))
+             (let ((test-val (%eval-in-env (car clause) env)))
+               (when test-val
+                 (if (cdr clause)
+                     (return (%eval-progn (cdr clause) env))
+                     (return test-val)))))
+           (setq cur (cdr cur)))))
+      ;; WHEN
+      ((%eval-sym-eq op "WHEN")
+       (when (%eval-in-env (car args) env)
+         (%eval-progn (cdr args) env)))
+      ;; UNLESS
+      ((%eval-sym-eq op "UNLESS")
+       (unless (%eval-in-env (car args) env)
+         (%eval-progn (cdr args) env)))
+      ;; AND
+      ((%eval-sym-eq op "AND")
+       (if (null args)
+           t
+           (let ((cur args))
+             (loop
+               (if (null (cdr cur))
+                   (return (%eval-in-env (car cur) env))
+                   (let ((val (%eval-in-env (car cur) env)))
+                     (unless val (return nil))
+                     (setq cur (cdr cur))))))))
+      ;; OR
+      ((%eval-sym-eq op "OR")
+       (let ((cur args))
+         (loop
+           (when (null cur) (return nil))
+           (let ((val (%eval-in-env (car cur) env)))
+             (when val (return val)))
+           (setq cur (cdr cur)))))
+      ;; BLOCK
+      ((%eval-sym-eq op "BLOCK")
+       (let ((bname (car args))
+             (body (cdr args)))
+         ;; Use handler-case to catch return-from
+         (handler-case
+           (%eval-progn body env)
+           (error (c)
+             ;; Re-signal if not our return
+             (error c)))))
+      ;; RETURN-FROM (simplified: just eval value)
+      ((%eval-sym-eq op "RETURN-FROM")
+       (let ((val (if (cdr args) (%eval-in-env (cadr args) env) nil)))
+         val))
+      ;; RETURN
+      ((%eval-sym-eq op "RETURN")
+       (if args (%eval-in-env (car args) env) nil))
+      ;; VALUES
+      ((%eval-sym-eq op "VALUES")
+       (let ((evaled (%eval-args args env)))
+         (apply #'values evaled)))
+      ;; MULTIPLE-VALUE-BIND
+      ((%eval-sym-eq op "MULTIPLE-VALUE-BIND")
+       (let ((vars (car args))
+             (values-form (cadr args))
+             (body (cddr args)))
+         (let ((mvl (multiple-value-list (%eval-in-env values-form env))))
+           (let ((new-env env)
+                 (cur-vars vars)
+                 (cur-vals mvl))
+             (loop
+               (when (null cur-vars) (return nil))
+               (setq new-env (%env-extend (car cur-vars)
+                                          (if cur-vals (car cur-vals) nil)
+                                          new-env))
+               (setq cur-vars (cdr cur-vars))
+               (setq cur-vals (if cur-vals (cdr cur-vals) nil)))
+             (%eval-progn body new-env)))))
+      ;; MULTIPLE-VALUE-LIST
+      ((%eval-sym-eq op "MULTIPLE-VALUE-LIST")
+       (multiple-value-list (%eval-in-env (car args) env)))
+      ;; TAGBODY (stub: just eval forms, ignore tags)
+      ((%eval-sym-eq op "TAGBODY")
+       (let ((cur args))
+         (loop
+           (when (null cur) (return nil))
+           (when (consp (car cur))
+             (%eval-in-env (car cur) env))
+           (setq cur (cdr cur)))))
+      ;; THE (ignore type decl)
+      ((%eval-sym-eq op "THE")
+       (%eval-in-env (cadr args) env))
+      ;; DECLARE (ignore)
+      ((%eval-sym-eq op "DECLARE") nil)
+      ;; LOCALLY (just eval body)
+      ((%eval-sym-eq op "LOCALLY")
+       (%eval-progn args env))
+      ;; LOAD-TIME-VALUE (eval now)
+      ((%eval-sym-eq op "LOAD-TIME-VALUE")
+       (%eval-in-env (car args) env))
+      ;; EVAL-WHEN (always eval)
+      ((%eval-sym-eq op "EVAL-WHEN")
+       (%eval-progn (cdr args) env))
+      ;; HANDLER-CASE (simplified)
+      ((%eval-sym-eq op "HANDLER-CASE")
+       (handler-case
+         (%eval-in-env (car args) env)
+         (error (c) nil)))
+      ;; UNWIND-PROTECT
+      ((%eval-sym-eq op "UNWIND-PROTECT")
+       (unwind-protect
+         (%eval-in-env (car args) env)
+         (%eval-progn (cdr args) env)))
+      ;; FLET / LABELS
+      ((%eval-sym-eq op "FLET")
+       (let ((local-fns (car args))
+             (body (cdr args)))
+         (let ((new-env env))
+           (dolist (def local-fns)
+             (let ((fname (car def))
+                   (params (cadr def))
+                   (fbody (cddr def)))
+               (let ((fn (list '%interp-closure params fbody new-env)))
+                 (setq new-env (%env-extend fname fn new-env)))))
+           (%eval-progn body new-env))))
+      ((%eval-sym-eq op "LABELS")
+       (let ((local-fns (car args))
+             (body (cdr args)))
+         ;; For labels, functions can reference each other
+         (let ((new-env env))
+           (dolist (def local-fns)
+             (let ((fname (car def))
+                   (params (cadr def))
+                   (fbody (cddr def)))
+               (let ((fn (list '%interp-closure params fbody nil)))
+                 ;; Will fix env pointer below
+                 (setq new-env (%env-extend fname fn new-env)))))
+           ;; Update each closure to point to new-env
+           (let ((cur new-env))
+             (loop
+               (when (eq cur env) (return nil))
+               (let ((fn (cdr (car cur))))
+                 (when (%interp-closure-p fn)
+                   ;; Set closed env to new-env (4th element of list)
+                   (set-car (cdddr fn) new-env)))
+               (setq cur (cdr cur))))
+           (%eval-progn body new-env))))
+      ;; Function call: symbol
+      ((%cl-sym-p op)
+       (%eval-funcall op args env))
+      ;; Function call: lambda form
+      ((and (consp op) (%eval-sym-eq (car op) "LAMBDA"))
+       (let ((fn (list '%interp-closure (cadr op) (cddr op) env)))
+         (let ((evaled-args (%eval-args args env)))
+           (%call-interp-closure fn evaled-args))))
+      ;; Function call: other (e.g. (funcall ...) result)
+      (t
+       (let ((fn-val (%eval-in-env op env)))
+         (let ((evaled-args (%eval-args args env)))
+           (%do-funcall fn-val evaled-args)))))))
+
+(defun %env-find-binding (sym env)
+  "Find the binding cons for SYM in ENV. Returns nil if not found."
+  (let ((name (%eval-sym-name sym))
+        (cur env))
+    (loop
+      (when (null cur) (return nil))
+      (let ((binding (car cur)))
+        (let ((bname (%eval-sym-name (car binding))))
+          (when (and name bname (string-equal name bname))
+            (return binding))))
+      (setq cur (cdr cur)))))
+
+(defun %eval-funcall (sym args env)
+  "Evaluate a function call (sym args...) looking up sym in fn table."
+  (let ((name (%eval-sym-name sym)))
+    (if (null name)
+        nil
+        ;; First check local env for function binding
+        (let ((local (%env-lookup sym env)))
+          (if (car local)
+              (let ((fn (cdr local)))
+                (let ((evaled-args (%eval-args args env)))
+                  (%do-funcall fn evaled-args)))
+              ;; Look up in symbol-function table
+              (let ((fn (if *symbol-function-table*
+                            (gethash name *symbol-function-table*)
+                            nil)))
+                (if fn
+                    (let ((evaled-args (%eval-args args env)))
+                      (%do-funcall fn evaled-args))
+                    ;; Try macro expansion
+                    (let ((mf (if *macro-function-table*
+                                  (gethash name *macro-function-table*)
+                                  nil)))
+                      (if mf
+                          (%eval-in-env (funcall mf (cons sym args) nil) env)
+                          ;; Undefined function
+                          (let ((c (%make-condition 'undefined-function (list :name sym))))
+                            (if (%error-handler-active-p)
+                                (%hc-longjmp)
+                                nil)))))))))))
+
+(defun %do-funcall (fn args)
+  "Call FN with ARGS list."
+  (cond
+    ((%interp-closure-p fn)
+     (%call-interp-closure fn args))
+    (t (%eval-call-fn fn args fn))))
+
+(defun eval (form)
+  "Evaluate FORM in the null lexical environment."
+  (%eval-in-env form nil))
+
+;;; ============================================================
+;;; Compile: return proper 3 values
+;;; ============================================================
+
+(defun compile (name &rest args)
+  "Compile NAME (or lambda-expression in DEF). Returns (values fn warns failp).
+   On bare metal, functions are already compiled. For nil name with lambda,
+   return an interpreted closure."
+  (let ((def (if args (car args) nil)))
+    (cond
+      ;; (compile nil '(lambda ...)) — create interpreted closure
+      ((and (null name) def)
+       (let ((form (if (and (consp def) (eq (car def) 'quote))
+                       (cadr def)
+                       def)))
+         (if (and (consp form) (%eval-sym-eq (car form) "LAMBDA"))
+             (let ((fn (list '%interp-closure (cadr form) (cddr form) nil)))
+               (values fn nil nil))
+             (values def nil nil))))
+      ;; (compile 'name) — function already compiled, return it
+      (name
+       (let ((fn (if *symbol-function-table*
+                     (gethash (%eval-sym-name name) *symbol-function-table*)
+                     nil)))
+         (values (or fn name) nil nil)))
+      (t (values nil nil nil)))))
+
+;;; ============================================================
+;;; Load: read + eval from file
+;;; ============================================================
+
+(defun load (filespec &rest args)
+  "Read and evaluate all forms from FILESPEC."
+  (let ((verbose nil)
+        (print nil)
+        (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :verbose) (setq verbose v))
+          ((eq k :print) (setq print v))))
+      (setq cur (cddr cur)))
+    (let ((stream (open filespec :direction :input :if-does-not-exist nil)))
+      (if (null stream)
+          nil
+          (let ((eof-marker (list 'eof)))
+            (unwind-protect
+              (let ((result t))
+                (loop
+                  (let ((form (read stream nil eof-marker)))
+                    (when (eq form eof-marker) (return result))
+                    (let ((val (eval form)))
+                      (when print
+                        (write val)
+                        (write-char #\Newline))
+                      (setq result val))))
+                result)
+              (close stream)))))))
+
+;;; ============================================================
+;;; Initialize symbol-function table at startup
+;;; ============================================================
+
+(defun %sft-register-1 (ht name fn)
+  "Helper: register one function in symbol-function table by string name.
+   Only registers if fn is non-nil (avoids registering inline ops with addr 0)."
+  (when fn
+    (puthash name ht fn)))
+
+(defun %init-sft-list (ht)
+  "Register built-in Lisp functions in the symbol-function table.
+   ONLY includes functions that have actual defun definitions (verified).
+   Excludes: inline ops (car, cdr, +, -, =, aref, make-array, etc.),
+   macros (first, second, caddr, etc.), and undefined stubs."
+  ;; List operations (all have defun in prelude.lisp or ansi-bridge.lisp)
+  (puthash "EQUAL" ht #'equal)
+  (puthash "EQUALP" ht #'equalp)
+  (puthash "IDENTITY" ht #'identity)
+  (puthash "LIST" ht #'list)
+  (puthash "LIST*" ht #'list*)
+  (puthash "APPEND" ht #'append)
+  (puthash "NCONC" ht #'nconc)
+  (puthash "REVERSE" ht #'reverse)
+  (puthash "NREVERSE" ht #'nreverse)
+  (puthash "LENGTH" ht #'length)
+  (puthash "NTH" ht #'nth)
+  (puthash "NTHCDR" ht #'nthcdr)
+  (puthash "LAST" ht #'last)
+  (puthash "BUTLAST" ht #'butlast)
+  (puthash "MEMBER" ht #'member)
+  (puthash "ASSOC" ht #'assoc)
+  (puthash "REMOVE" ht #'remove)
+  (puthash "REMOVE-IF" ht #'remove-if)
+  (puthash "REMOVE-IF-NOT" ht #'remove-if-not)
+  (puthash "COPY-LIST" ht #'copy-list)
+  (puthash "COPY-TREE" ht #'copy-tree)
+  (puthash "SUBST" ht #'subst)
+  (puthash "MAPCAR" ht #'mapcar)
+  (puthash "MAPC" ht #'mapc)
+  (puthash "MAPLIST" ht #'maplist)
+  (puthash "MAPCAN" ht #'mapcan)
+  (puthash "MAPCON" ht #'mapcon)
+  (puthash "SOME" ht #'some)
+  (puthash "EVERY" ht #'every)
+  (puthash "NOTANY" ht #'notany)
+  (puthash "NOTEVERY" ht #'notevery)
+  (puthash "REDUCE" ht #'reduce)
+  (puthash "APPLY" ht #'apply)
+  ;; NOTE: funcall, car, cdr, cons, set-car, set-cdr, caar, cadr, cdar, cddr
+  ;;       are inline ops — no defun, skip to avoid calling wrong function
+  (puthash "RPLACA" ht #'rplaca)
+  (puthash "RPLACD" ht #'rplacd)
+  (puthash "GETF" ht #'getf)
+  (puthash "ACONS" ht #'acons)
+  (puthash "PAIRLIS" ht #'pairlis)
+  ;; NOTE: assoc-if, assoc-if-not, member-if, member-if-not, rassoc,
+  ;;       rassoc-if, rassoc-if-not, first..tenth, rest, caddr..cddddr
+  ;;       are macros/not-defined — skip
+  (puthash "VALUES" ht #'values)
+  (puthash "VALUES-LIST" ht #'values-list)
+  ;; NOTE: +, -, *, /, =, <, >, <=, >=, /=, 1+, 1-, mod, truncate,
+  ;;       ash, logand, logior, logxor are inline ops — skip
+  (puthash "PLUSP" ht #'plusp)
+  (puthash "MINUSP" ht #'minusp)
+  (puthash "ODDP" ht #'oddp)
+  (puthash "EVENP" ht #'evenp)
+  (puthash "ABS" ht #'abs)
+  (puthash "MAX" ht #'max)
+  (puthash "MIN" ht #'min)
+  ;; NOTE: lognot is an inline op (no defun), skip
+  (puthash "LOGBITP" ht #'logbitp)
+  (puthash "NUMBERP" ht #'numberp)
+  (puthash "FLOATP" ht #'floatp)
+  (puthash "REALP" ht #'realp)
+  (puthash "RATIONALP" ht #'rationalp)
+  ;; NOTE: char-code, code-char, characterp, integerp, zerop, stringp,
+  ;;       arrayp, symbolp, consp, null, not, atom, listp are inline ops, skip
+  (puthash "CHAR=" ht #'char=)
+  (puthash "CHAR<" ht #'char<)
+  (puthash "CHAR>" ht #'char>)
+  (puthash "CHAR<=" ht #'char<=)
+  (puthash "CHAR>=" ht #'char>=)
+  (puthash "CHAR/=" ht #'char/=)
+  (puthash "CHAR-UPCASE" ht #'char-upcase)
+  (puthash "CHAR-DOWNCASE" ht #'char-downcase)
+  (puthash "ALPHA-CHAR-P" ht #'alpha-char-p)
+  (puthash "DIGIT-CHAR-P" ht #'digit-char-p)
+  (puthash "ALPHANUMERICP" ht #'alphanumericp)
+  (puthash "UPPER-CASE-P" ht #'upper-case-p)
+  (puthash "LOWER-CASE-P" ht #'lower-case-p)
+  (puthash "STRING" ht #'string)
+  (puthash "STRING=" ht #'string=)
+  (puthash "STRING-EQUAL" ht #'string-equal)
+  (puthash "STRING<" ht #'string<)
+  (puthash "STRING>" ht #'string>)
+  (puthash "STRING<=" ht #'string<=)
+  (puthash "STRING>=" ht #'string>=)
+  (puthash "STRING/=" ht #'string/=)
+  (puthash "STRING-UPCASE" ht #'string-upcase)
+  (puthash "STRING-DOWNCASE" ht #'string-downcase)
+  (puthash "STRING-CAPITALIZE" ht #'string-capitalize)
+  (puthash "SUBSEQ" ht #'subseq)
+  (puthash "CONCATENATE" ht #'concatenate)
+  ;; NOTE: aref, svref are inline ops (compile-aref), skip
+  (puthash "VECTORP" ht #'vectorp)
+  (puthash "ARRAY-RANK" ht #'array-rank)
+  ;; NOTE: array-dimensions, make-array are inline ops or not defined, skip
+  (puthash "ARRAY-TOTAL-SIZE" ht #'array-total-size)
+  (puthash "MAKE-LIST" ht #'make-list)
+  (puthash "MAKE-STRING" ht #'make-string)
+  (puthash "MAKE-HASH-TABLE" ht #'make-hash-table)
+  (puthash "GETHASH" ht #'gethash)
+  (puthash "SETF-GETHASH" ht #'puthash)
+  (puthash "REMHASH" ht #'remhash)
+  (puthash "MAPHASH" ht #'maphash)
+  (puthash "SYMBOL-NAME" ht #'symbol-name)
+  (puthash "SYMBOL-VALUE" ht #'symbol-value)
+  (puthash "SYMBOL-FUNCTION" ht #'symbol-function)
+  (puthash "FBOUNDP" ht #'fboundp)
+  (puthash "FMAKUNBOUND" ht #'fmakunbound)
+  (puthash "FDEFINITION" ht #'fdefinition)
+  (puthash "INTERN" ht #'intern)
+  (puthash "FIND-SYMBOL" ht #'find-symbol)
+  (puthash "KEYWORDP" ht #'keywordp)
+  (puthash "GENSYM" ht #'gensym)
+  (puthash "ENDP" ht #'endp)
+  (puthash "FIND" ht #'find)
+  (puthash "FIND-IF" ht #'find-if)
+  (puthash "FIND-IF-NOT" ht #'find-if-not)
+  (puthash "POSITION" ht #'position)
+  (puthash "POSITION-IF" ht #'position-if)
+  (puthash "POSITION-IF-NOT" ht #'position-if-not)
+  (puthash "COUNT" ht #'count)
+  (puthash "COUNT-IF" ht #'count-if)
+  (puthash "COUNT-IF-NOT" ht #'count-if-not)
+  (puthash "SEARCH" ht #'search)
+  (puthash "MISMATCH" ht #'mismatch)
+  (puthash "SORT" ht #'sort)
+  (puthash "STABLE-SORT" ht #'stable-sort)
+  (puthash "SUBSTITUTE" ht #'substitute)
+  (puthash "SUBSTITUTE-IF" ht #'substitute-if)
+  (puthash "SUBSTITUTE-IF-NOT" ht #'substitute-if-not)
+  (puthash "NSUBSTITUTE" ht #'nsubstitute)
+  (puthash "FILL" ht #'fill)
+  (puthash "REPLACE" ht #'replace)
+  (puthash "MAP" ht #'map)
+  (puthash "MAP-INTO" ht #'map-into)
+  (puthash "COERCE" ht #'coerce)
+  (puthash "TYPEP" ht #'typep)
+  (puthash "TYPE-OF" ht #'type-of)
+  (puthash "ELT" ht #'elt)
+  (puthash "COPY-SEQ" ht #'copy-seq)
+  (puthash "READ" ht #'read)
+  (puthash "READ-FROM-STRING" ht #'read-from-string)
+  (puthash "WRITE" ht #'write)
+  (puthash "PRIN1" ht #'prin1)
+  (puthash "PRINC" ht #'princ)
+  (puthash "PRINT" ht #'print)
+  (puthash "WRITE-TO-STRING" ht #'write-to-string)
+  (puthash "PRIN1-TO-STRING" ht #'prin1-to-string)
+  (puthash "PRINC-TO-STRING" ht #'princ-to-string)
+  (puthash "FORMAT" ht #'format)
+  (puthash "WRITE-CHAR" ht #'write-char)
+  (puthash "WRITE-STRING" ht #'write-string)
+  (puthash "WRITE-LINE" ht #'write-line)
+  (puthash "TERPRI" ht #'terpri)
+  (puthash "FRESH-LINE" ht #'fresh-line)
+  (puthash "READ-CHAR" ht #'read-char)
+  (puthash "UNREAD-CHAR" ht #'unread-char)
+  (puthash "PEEK-CHAR" ht #'peek-char)
+  (puthash "READ-LINE" ht #'read-line)
+  (puthash "OPEN" ht #'open)
+  (puthash "CLOSE" ht #'close)
+  (puthash "STREAMP" ht #'streamp)
+  (puthash "FUNCTIONP" ht #'functionp)
+  (puthash "COMPLEMENT" ht #'complement)
+  (puthash "CONSTANTLY" ht #'constantly)
+  (puthash "ERROR" ht #'error)
+  (puthash "WARN" ht #'warn)
+  (puthash "SIGNAL" ht #'signal)
+  (puthash "CERROR" ht #'cerror)
+  (puthash "MAKE-CONDITION" ht #'make-condition)
+  (puthash "EVAL" ht #'eval)
+  (puthash "COMPILE" ht #'compile)
+  (puthash "LOAD" ht #'load)
+  (puthash "MACROEXPAND" ht #'macroexpand)
+  (puthash "MACROEXPAND-1" ht #'macroexpand-1)
+  (puthash "MACRO-FUNCTION" ht #'macro-function)
+  ;; NOTE: compiled-function-p, special-operator-p have no defun, skip
+  (puthash "NOT-MV" ht #'not-mv)
+  (puthash "NOTNOT" ht #'notnot)
+  (puthash "EQT" ht #'eqt)
+  (puthash "EQLT" ht #'eqlt)
+  (puthash "EQUALT" ht #'equalt)
+  nil)
+
+(defun %init-symbol-function-table ()
+  "Populate *symbol-function-table* with all built-in compiled functions.
+   Uses puthash with string keys to avoid calling intern (which can crash
+   when *all-packages* is in a partially initialized state)."
+  (%sft-init)
+  (%init-sft-list *symbol-function-table*)
+  nil)
+
 (defun not-mv (x) (not x))
 (defun check-values (fn expected) nil)
 
@@ -5292,7 +6266,7 @@
               :initial-element :initial-contents :element-type
               :allow-other-keys)))
 (defun symbol-package (x) nil)  ; stub
-(defun compile (name &optional def) nil)  ; stub
+; compile defined in Layer 8 above
 (defun simple-vector-p (x) (vectorp x))
 
 ;; Module system stubs
@@ -6063,7 +7037,7 @@
 (defun schar (str idx) (code-char (aref str idx)))
 (defun char (str idx) (code-char (aref str idx)))
 (defun symbol-plist (sym) nil)
-(defun fboundp (sym) nil)  ; stub
+; fboundp defined in Layer 8 above
 (defun fill-pointer (vec)
   (if (consp vec) (car vec) (length vec)))
 (defun bit-vector-p (x) nil)  ; stub
@@ -6510,9 +7484,20 @@
 ;;; --- CL Symbol predicates and accessors ---
 
 (defun %cl-sym-p (x)
-  "Check if X is a CL symbol (package-aware)."
+  "Check if X is a CL symbol (package-aware).
+   Symbols are (cons *sym-tag* #<array-3>) when *sym-tag* initialized,
+   or (cons nil #<array-3>) when *sym-tag* is uninitialized.
+   Distinguishable from packages (cons nil #<array-7>) by array length."
   (if (consp x)
-      (eql (car x) *sym-tag*)
+      (if *sym-tag*
+          (eql (car x) *sym-tag*)
+          ;; Uninitialized: car must be nil, cdr must be a 3-slot array
+          (if (null (car x))
+              (let ((d (cdr x)))
+                (if (arrayp d)
+                    (= (array-length d) 3)
+                    nil))
+              nil))
       nil))
 
 (defun %cl-sym-data (sym) (cdr sym))

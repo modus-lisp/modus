@@ -785,6 +785,24 @@
        (let ((obj (rewrite-reader-forms (cadr place)))
              (slot (rewrite-reader-forms (caddr place))))
          `(set-slot-value ,obj ,slot ,val))))
+    ;; (setf (symbol-function sym) fn) → (set-symbol-function sym fn)
+    ((and (eq (car form) 'setf)
+          (consp (cdr form))
+          (consp (cadr form))
+          (eq (car (cadr form)) 'symbol-function)
+          (cddr form))
+     (let ((sym-arg (rewrite-reader-forms (cadr (cadr form))))
+           (val (rewrite-reader-forms (caddr form))))
+       `(set-symbol-function ,sym-arg ,val)))
+    ;; (setf (fdefinition sym) fn) → (set-fdefinition sym fn)
+    ((and (eq (car form) 'setf)
+          (consp (cdr form))
+          (consp (cadr form))
+          (eq (car (cadr form)) 'fdefinition)
+          (cddr form))
+     (let ((sym-arg (rewrite-reader-forms (cadr (cadr form))))
+           (val (rewrite-reader-forms (caddr form))))
+       `(set-fdefinition ,sym-arg ,val)))
     ;; (signals-error form type) → (handler-case (progn form nil) (error (c) t))
     ((and (eq (car form) 'signals-error) (cdr form) (cddr form))
      (let ((body (rewrite-reader-forms (cadr form))))
@@ -1585,6 +1603,9 @@
 
   ;; Initialize condition type registry
   (%init-condition-types)
+
+  ;; Initialize symbol-function table with all built-in compiled functions
+  (%init-symbol-function-table)
 
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")

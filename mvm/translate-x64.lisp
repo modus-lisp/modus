@@ -543,11 +543,7 @@
               ;;   (longjmp return point — RAX already has T from longjmp)
               ;;
               ;; Save RSP to 0x10000140
-              (emit-bytes buf #x48 #xA3)              ; mov [abs64], rax  — but we need RSP
-              ;; Actually, we need movabs [imm64], reg. Let me use mov r/m, reg approach.
-              ;; mov [abs], rsp:  48 89 24 25 <addr32> (if addr fits 32 bits)
-              ;; 0x10000140 fits in 32 bits (sign-extended) — no, 0x10000140 > 0x7FFFFFFF
-              ;; Use movabs with RCX as temp
+              ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
               ;; mov rcx, 0x10000140
               (emit-bytes buf #x48 #xB9)
               (emit-u32 buf #x10000140) (emit-u32 buf 0)

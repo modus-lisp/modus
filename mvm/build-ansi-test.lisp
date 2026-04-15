@@ -57,6 +57,19 @@
 (ignore-errors (delete-package "B"))
 (ignore-errors (delete-package "Q"))
 (ignore-errors (delete-package "CL-TEST"))
+;; REGRESSION-TEST package: needed so SBCL reader can parse
+;; regression-test::my-aref, regression-test::*compile-tests*, etc.
+;; in ansi-aux.lsp without signaling "Package does not exist".
+(ignore-errors (delete-package "REGRESSION-TEST"))
+(ignore-errors (delete-package "RTEST"))
+(ignore-errors (delete-package "RT"))
+(defpackage "REGRESSION-TEST"
+  (:use "CL")
+  (:nicknames "RTEST" "RT")
+  (:export "MY-AREF" "MY-ROW-MAJOR-AREF" "*COMPILE-TESTS*"
+           "*DO-TESTS-WHEN-DEFINED*" "*TEST*" "DEFTEST" "DO-TESTS"
+           "PENDING-TESTS" "REM-ALL-TESTS" "REM-TEST"
+           "*CATCH-ERRORS*" "*PASSED-TESTS*" "*FAILED-TESTS*"))
 (defpackage "A" (:use) (:nicknames "Q") (:export "FOO"))
 (defpackage "B" (:use "A") (:export "BAR"))
 (defpackage "FS-A" (:use) (:nicknames "FS-Q") (:export "FOO"))
@@ -1421,6 +1434,7 @@
              (rewrite-reader-forms-list (cdr list))))))
 
 ;; Load real ANSI test files (if available)
+(defvar *ansi-aux-sources* "")       ; auxiliary/helper files (loaded before test files)
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
 (defvar *ansi-file-names* nil)
@@ -1446,6 +1460,8 @@
             (setf forms (mapcar #'rewrite-make-array-initcontents forms))
             (setf forms (mapcar #'rewrite-earmuff-specials forms))
             (setf forms (mapcar #'rewrite-reader-forms forms))
+            ;; Rewrite multi-arg apply: (apply fn a1 a2 ... list) → 2-arg form
+            (setf forms (mapcar #'rewrite-multi-arg-apply forms))
             (when (string= file "integer-length.lsp")
               (labels ((rw (f)
                          (cond ((atom f) f)
@@ -1610,12 +1626,254 @@
       (error (e)
         (format t "    SKIP ~A: ~A~%" file e)))))
 
+;; Rewrite multi-arg apply calls into 2-arg form that MVM's apply supports.
+;; MVM's apply only takes (fn args-list). CL allows (apply fn a1 a2 ... list).
+;; (apply fn a1 a2 ... aN list) → (apply fn (append (list a1 a2 ... aN) list))
+;; (apply fn list) → unchanged (already 2-arg form)
+(defun rewrite-multi-arg-apply (form)
+  "Walk form tree, converting (apply fn a1 a2 ... list) to (apply fn (append (list a1 a2 ...) list))."
+  (cond
+    ((atom form) form)
+    ((and (eq (car form) 'apply)
+          (consp (cdr form))  ; has fn arg
+          (consp (cddr form)) ; has at least one more arg
+          (consp (cdddr form))) ; has at least 2 more args (fn + spread args + list)
+     ;; (apply fn a1 a2 ... aN list) where there are N >= 1 spread args before the list
+     (let* ((fn (rewrite-multi-arg-apply (cadr form)))
+            (rest-args (cddr form))  ; a1 a2 ... aN list
+            (spread-args (butlast rest-args))  ; a1 a2 ... aN
+            (final-list (car (last rest-args))) ; list
+            (final-rewritten (rewrite-multi-arg-apply final-list))
+            (spread-rewritten (mapcar #'rewrite-multi-arg-apply spread-args)))
+       (if spread-args
+           `(apply ,fn (append (list ,@spread-rewritten) ,final-rewritten))
+           `(apply ,fn ,final-rewritten))))
+    (t (mapcar-dotted #'rewrite-multi-arg-apply form))))
+
+;; Rewrite &aux bindings in defun/lambda parameter lists into let* in the body.
+;; MVM compiler does not support &aux.
+;; (defun foo (a b &aux (x expr)) body) → (defun foo (a b) (let* ((x expr)) body))
+(defun rewrite-aux-params (form)
+  "Walk form tree, expanding &aux parameter sections into let* bindings."
+  (cond
+    ((atom form) form)
+    ;; Handle defun
+    ((and (eq (car form) 'defun) (consp (cdr form)) (consp (cddr form)))
+     (let* ((name (cadr form))
+            (params (caddr form))
+            (body (cdddr form)))
+       (multiple-value-bind (new-params aux-bindings)
+           (split-aux-params params)
+         (let ((new-body (mapcar #'rewrite-aux-params body)))
+           (if aux-bindings
+               `(defun ,name ,new-params (let* ,aux-bindings ,@new-body))
+               `(defun ,name ,new-params ,@new-body))))))
+    ;; Handle lambda
+    ((and (eq (car form) 'lambda) (consp (cdr form)))
+     (let* ((params (cadr form))
+            (body (cddr form)))
+       (multiple-value-bind (new-params aux-bindings)
+           (split-aux-params params)
+         (let ((new-body (mapcar #'rewrite-aux-params body)))
+           (if aux-bindings
+               `(lambda ,new-params (let* ,aux-bindings ,@new-body))
+               `(lambda ,new-params ,@new-body))))))
+    (t (mapcar-dotted #'rewrite-aux-params form))))
+
+(defun split-aux-params (params)
+  "Split a parameter list at &aux, returning (values required-params aux-bindings).
+   aux-bindings is nil if no &aux present."
+  (let ((aux-pos (position '&aux params)))
+    (if aux-pos
+        (let ((before (subseq params 0 aux-pos))
+              (aux-forms (subseq params (1+ aux-pos))))
+          (values before
+                  (mapcar (lambda (b)
+                            (if (consp b)
+                                b
+                                (list b nil)))
+                          aux-forms)))
+        (values params nil))))
+
+(defvar *ansi-aux-loaded* nil)  ; track which aux files already loaded (avoid duplicates)
+
+(defun load-ansi-aux (filename)
+  "Transform an ANSI test auxiliary file into MVM-compatible source.
+   Emits defun/defstruct/defvar/defparameter/defconstant forms into *ansi-aux-sources*.
+   Skips CLOS methods, defgeneric, and forms that reference unsupported features."
+  (let ((path (concatenate 'string "/tmp/ansi-test/auxiliary/" filename)))
+    (when (member filename *ansi-aux-loaded* :test #'string=)
+      (return-from load-ansi-aux nil))
+    (unless (probe-file path)
+      (format t "  AUX MISSING: ~A~%" filename)
+      (return-from load-ansi-aux nil))
+    (push filename *ansi-aux-loaded*)
+    (format t "  Loading aux: ~A~%" filename)
+    (handler-case
+      (let ((forms nil))
+        (with-open-file (s path :direction :input)
+          (let ((*package* (find-package :cl-user)))
+            (loop (let ((form (read s nil :eof)))
+                    (when (eq form :eof) (return))
+                    (push form forms)))))
+        ;; Apply the same rewriter pipeline as test files
+        (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
+        (setf forms (mapcar #'rewrite-make-array-dims forms))
+        (setf forms (mapcar #'rewrite-eval-quote forms))
+        (setf forms (mapcar #'rewrite-make-array-initcontents forms))
+        (setf forms (mapcar #'rewrite-earmuff-specials forms))
+        (setf forms (mapcar #'rewrite-reader-forms forms))
+        ;; Expand &aux lambda keyword into let* bindings in function body.
+        ;; MVM compiler does not support &aux.
+        (setf forms (mapcar #'rewrite-aux-params forms))
+        ;; Rewrite (apply fn a1 a2 ... list) → (apply fn (append (list a1 a2 ...) list))
+        ;; MVM's apply only handles (fn list) form; CL allows spread args before final list.
+        (setf forms (mapcar #'rewrite-multi-arg-apply forms))
+        ;; Evaluate defun/defmacro forms at SBCL side so macros defined here
+        ;; can be used during macroexpansion of test files loaded after this.
+        (dolist (form forms)
+          (when (and (consp form)
+                     (member (car form) '(defun defmacro defstruct defparameter defvar)))
+            (handler-case (eval form) (error () nil))))
+        (labels
+          ;; Strip package prefixes that MVM doesn't understand:
+          ;; REGRESSION-TEST:: and CL-TEST:: symbols → unqualified symbols.
+          ;; This is done as a tree walk so the symbols themselves are renamed.
+          ((strip-pkg-prefix (form)
+             (cond
+               ((symbolp form)
+                (let* ((name (symbol-name form))
+                       (pkg  (symbol-package form))
+                       (pname (and pkg (package-name pkg))))
+                  (if (and pname (or (string= pname "REGRESSION-TEST")
+                                     (string= pname "CL-TEST")))
+                      (intern name)   ; re-intern in cl-user
+                      form)))
+               ((consp form)
+                (cons (strip-pkg-prefix (car form))
+                      (strip-pkg-prefix (cdr form))))
+               (t form))))
+          (let ((out (make-string-output-stream)))
+            (format out "~%;; === aux: ~A ===~%" filename)
+            (dolist (form forms)
+              (when (consp form)
+                ;; Skip forms that can't compile on MVM or reference SBCL internals:
+                ;; defgeneric, defmethod, eval-when, declaim, proclaim, compile-and-load
+                (when (member (car form) '(defgeneric defmethod eval-when declaim proclaim
+                                          compile-and-load in-package))
+                  (setf form nil))
+                (when form
+                  ;; Strip REGRESSION-TEST:: and CL-TEST:: prefixes
+                  (setf form (strip-pkg-prefix form))
+                  ;; For progn wrapping (from rewritten defclass etc.):
+                  ;; split into sub-forms and process each
+                  (if (and (consp form) (eq (car form) 'progn))
+                      (dolist (sub (cdr form))
+                        (when (and (consp sub)
+                                   (member (car sub) '(defun defvar defparameter defstruct
+                                                       defconstant %defclass)))
+                          (let ((s (handler-case (format nil "~S" sub) (error () nil))))
+                            (when (and s
+                                       (not (search "#<" s))
+                                       (not (search "&ENVIRONMENT" s)))
+                              (write-string s out)
+                              (terpri out)))))
+                      ;; Top-level form: emit if it's a defun/defstruct definition.
+                      ;; defvar/defparameter/defconstant: only emit if init value is a
+                      ;; simple literal (string, number, nil, t, or quoted form).
+                      ;; Complex init expressions may call undefined functions and crash.
+                      (cond
+                        ((member (car form) '(defun defstruct deftype %defclass))
+                         (let ((s (handler-case (format nil "~S" form) (error () nil))))
+                           (when (and s
+                                      (not (search "#<" s))
+                                      (not (search "&ENVIRONMENT" s)))
+                             (write-string s out)
+                             (terpri out))))
+                        ((member (car form) '(defvar defparameter defconstant))
+                         ;; Skip defparameters whose init values are known to crash on MVM:
+                         ;; - (make-int-array N): uses funcall with keyword args that MVM doesn't handle
+                         ;; - (if (boundp ...)):  boundp not available at init time for specials
+                         ;; All other defparameters are emitted as-is.
+                         (let ((name (cadr form))
+                               (init (if (cddr form) (caddr form) nil))
+                               (skip-p nil))
+                           ;; Skip *displaced* (make-int-array 100000) — complex funcall
+                           (when (and (symbolp name)
+                                      (string= (symbol-name name) "*DISPLACED*"))
+                             (setf skip-p t))
+                           ;; Skip *initial-print-pprint-dispatch* (uses boundp)
+                           (when (and (symbolp name)
+                                      (string= (symbol-name name)
+                                               "*INITIAL-PRINT-PPRINT-DISPATCH*"))
+                             (setf skip-p t))
+                           ;; Skip *similarity-list* (defgeneric is-similar* not in MVM)
+                           (when (and (symbolp name)
+                                      (string= (symbol-name name) "*SIMILARITY-LIST*"))
+                             (setf skip-p t))
+                           (unless skip-p
+                             (let ((s (handler-case (format nil "~S" form) (error () nil))))
+                               (when (and s
+                                          (not (search "#<" s))
+                                          (not (search "&ENVIRONMENT" s)))
+                                 (write-string s out)
+                                 (terpri out)))))))))))
+            (setf *ansi-aux-sources*
+                  (concatenate 'string *ansi-aux-sources*
+                               (get-output-stream-string out))))))
+      (error (e)
+        (format t "    SKIP AUX ~A: ~A~%" filename e)))))
+
 ;;; ============================================================
 ;;; Load ANSI test files by chapter
 ;;; ============================================================
 
 ;;; Load ALL ANSI test files by chapter
 ;;; ============================================================
+
+;;; Load auxiliary files first — these define scaffolding used by all chapters
+(format t "~%Loading auxiliary files...~%")
+
+;; Core aux: used by almost everything
+(load-ansi-aux "ansi-aux.lsp")
+(load-ansi-aux "cons-aux.lsp")
+
+;; Chapter-specific aux files
+(load-ansi-aux "types-aux.lsp")
+(load-ansi-aux "array-aux.lsp")
+(load-ansi-aux "bit-aux.lsp")
+(load-ansi-aux "char-aux.lsp")
+(load-ansi-aux "hash-table-aux.lsp")
+(load-ansi-aux "numbers-aux.lsp")
+(load-ansi-aux "random-aux.lsp")
+(load-ansi-aux "floor-aux.lsp")
+(load-ansi-aux "ffloor-aux.lsp")
+(load-ansi-aux "ceiling-aux.lsp")
+(load-ansi-aux "fceiling-aux.lsp")
+(load-ansi-aux "truncate-aux.lsp")
+(load-ansi-aux "ftruncate-aux.lsp")
+(load-ansi-aux "round-aux.lsp")
+(load-ansi-aux "fround-aux.lsp")
+(load-ansi-aux "times-aux.lsp")
+(load-ansi-aux "division-aux.lsp")
+(load-ansi-aux "exp-aux.lsp")
+(load-ansi-aux "gcd-aux.lsp")
+(load-ansi-aux "string-aux.lsp")
+(load-ansi-aux "subseq-aux.lsp")
+(load-ansi-aux "search-aux.lsp")
+(load-ansi-aux "remove-aux.lsp")
+(load-ansi-aux "remove-duplicates-aux.lsp")
+(load-ansi-aux "printer-aux.lsp")
+(load-ansi-aux "backquote-aux.lsp")
+(load-ansi-aux "reader-aux.lsp")
+(load-ansi-aux "package-aux.lsp")
+(load-ansi-aux "packages00-aux.lsp")
+(load-ansi-aux "pathnames-aux.lsp")
+(load-ansi-aux "cl-symbols-aux.lsp")
+(load-ansi-aux "define-condition-aux.lsp")
+(load-ansi-aux "defclass-aux.lsp")
+
+(format t "  aux sources: ~D chars~%" (length *ansi-aux-sources*))
 
 (load-ansi-chapter "/tmp/ansi-test/cons/"
   '("acons.lsp" "adjoin.lsp" "append.lsp" "assoc-if-not.lsp" "assoc-if.lsp" "assoc.lsp" "atom.lsp" "butlast.lsp" "cons-test-01.lsp" "cons-test-03.lsp" "cons-test-05.lsp" "cons.lsp" "consp.lsp" "copy-alist.lsp" "copy-list.lsp" "copy-tree.lsp" "cxr.lsp" "endp.lsp" "get-properties.lsp" "getf.lsp" "intersection.lsp" "last.lsp" "ldiff.lsp" "list-length.lsp" "list.lsp" "listp.lsp" "load.lsp" "make-list.lsp" "mapc.lsp" "mapcan.lsp" "mapcar.lsp" "mapcon.lsp" "mapl.lsp" "maplist.lsp" "member-if-not.lsp" "member-if.lsp" "member.lsp" "nbutlast.lsp" "nconc.lsp" "nintersection.lsp" "nreconc.lsp" "nset-difference.lsp" "nset-exclusive-or.lsp" "nsublis.lsp" "nsubst-if-not.lsp" "nsubst-if.lsp" "nsubst.lsp" "nth.lsp" "nthcdr.lsp" "nunion.lsp" "pairlis.lsp" "pop.lsp" "push.lsp" "pushnew.lsp" "rassoc-if-not.lsp" "rassoc-if.lsp" "rassoc.lsp" "remf.lsp" "rest.lsp" "revappend.lsp" "rplaca.lsp" "rplacd.lsp" "set-difference.lsp" "set-exclusive-or.lsp" "sublis.lsp" "subsetp.lsp" "subst-if-not.lsp" "subst-if.lsp" "subst.lsp" "tailp.lsp" "tree-equal.lsp" "union.lsp" ))
@@ -1724,6 +1982,7 @@
 (format t "  rt: ~D chars~%" (length *rt-source*))
 (format t "  bridge: ~D chars~%" (length *bridge-source*))
 (format t "  tests: ~D chars~%" (length *test-source*))
+(format t "  ansi-aux: ~D chars~%" (length *ansi-aux-sources*))
 (format t "  real-ansi: ~D chars~%" (length *real-ansi-sources*))
 
 ;;; ============================================================
@@ -1747,6 +2006,7 @@
 (setf *rt-source*      (strip-in-package *rt-source*))
 (setf *bridge-source*  (strip-in-package *bridge-source*))
 (setf *test-source*    (strip-in-package *test-source*))
+(setf *ansi-aux-sources*  (strip-in-package *ansi-aux-sources*))
 (setf *real-ansi-sources* (strip-in-package *real-ansi-sources*))
 
 ;;; ============================================================
@@ -1847,13 +2107,19 @@
     ;; 3. ANSI bridge (helpers, stubs, missing functions)
     *bridge-source*
     (string #\Newline)
-    ;; 4. Our test source (run-*-tests, run-all-tests)
+    ;; 4. ANSI auxiliary files (scaffold, helpers used by test files)
+    ;;    Loaded BEFORE test-source so that test-source can override
+    ;;    any aux definitions with simpler MVM-compatible versions.
+    *ansi-aux-sources*
+    (string #\Newline)
+    ;; 5. Our test source (run-*-tests, run-all-tests)
+    ;;    Functions defined here override aux (last-defun-wins).
     *test-source*
     (string #\Newline)
-    ;; 5. Real ANSI test files
+    ;; 6. Real ANSI test files
     *real-ansi-sources*
     (string #\Newline)
-    ;; 6. Driver (sys-exit, kernel-main)
+    ;; 7. Driver (sys-exit, kernel-main)
     *driver-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))

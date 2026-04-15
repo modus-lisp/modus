@@ -1008,9 +1008,9 @@
                                                 (error () f))))
                                  ;; Only recurse if result changed and still a macro call
                                  (if (equal result f)
-                                     (mapcar (lambda (x) (expand-one x (1+ depth))) f)
+                                     (mapcar-dotted (lambda (x) (expand-one x (1+ depth))) f)
                                      (expand-one result (1+ depth)))))
-                              (t (mapcar (lambda (x) (expand-one x depth)) f)))))
+                              (t (mapcar-dotted (lambda (x) (expand-one x depth)) f)))))
                    (mapcar (lambda (x) (expand-one x 0)) body))
                  body)))
        (let ((rewritten (mapcar #'rewrite-reader-forms expanded-body)))

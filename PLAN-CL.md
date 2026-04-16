@@ -1,154 +1,180 @@
 # Plan: Full ANSI Common Lisp Implementation
 
-## Current State
-- 371 ANSI tests loaded, 359 passing, 12 failures (9 CLOS, 3 pre-existing)
-- ~350+ CL functions implemented (core language + packages + streams + reader + printer + format + conditions)
-- ~550 CL functions stubbed or unresolved
-- Compiler: MVM bytecode → x64 native, self-hosting
-- Runtime: bare-metal, no OS, tagged 63-bit fixnums + bignums
+## Current State (2026-04-16)
+- 17,568 ANSI tests, 14 failures (99.92% pass rate)
+- ~400 CL functions implemented across 10 runtime modules
+- ~10 real CL functions missing (rest are test infrastructure)
+- Compiler: MVM bytecode → x64 native, self-hosting, mutable closures, unwind-protect
+- Runtime: bare-metal + Linux userspace, tagged 63-bit fixnums + bignums
 
-## Architecture: Build Bottom-Up
+## What's Done
 
-### Layer 0: Packages (FOUNDATION)
-Everything in CL is organized by packages. Without them we have "last defun wins."
+```
+Layer 0: Packages          ✓  24 functions, CL/CL-USER/KEYWORD
+Layer 1: Streams           ✓  9 stream types, read/write-char
+Layer 2: Reader            ✓  full read, readtable, #-dispatch, backquote
+Layer 3: Printer           ✓  write with *print-* vars, 50+ format directives
+Layer 4: Format            ✓  ~A ~S ~D ~B ~O ~X ~R ~C ~P ~(~) ~[~] ~{~} ~^ etc.
+Layer 5: Conditions        ✓  24 types, handler-bind/case, restarts, unwind-protect
+Layer 6: CLOS (minimal)    ✓  struct-based defclass, make-instance, slot-value
+Layer 7: File I/O          ✓  Linux syscalls, file streams, pathnames
+Layer 8: Eval/Compile/Load ✓  tree-walking interpreter, load from file
+```
 
-**Implement:**
-- `make-package`, `find-package`, `delete-package`
-- `intern`, `find-symbol`, `unintern`
-- `export`, `unexport`, `import`, `shadowing-import`
-- `use-package`, `unuse-package`
-- `in-package`, `defpackage`
-- `*package*`, `package-name`, `package-nicknames`
-- `package-use-list`, `package-used-by-list`
-- `do-symbols`, `do-external-symbols`, `do-all-symbols`
-- Built-in packages: COMMON-LISP, COMMON-LISP-USER, KEYWORD
+## What's Left — Road to Quicklisp
 
-**Data structure:** Package = struct with name, nickname list, internal symbols (hash table), external symbols (hash table), use-list, used-by-list.
+### Phase 1: Real CLOS (required for Quicklisp)
 
-**Impact:** Eliminates namespace collisions. Enables `cl:car` vs `modus:car`. The compiler's function table becomes per-package.
+ASDF, most libraries, and the condition system all depend on real CLOS.
+We have struct-based defclass/make-instance/slot-value. We need:
 
-### Layer 1: Streams
-The I/O abstraction layer. Needed by reader, printer, format, file I/O.
-
-**Implement:**
-- Stream protocol: `stream-read-char`, `stream-write-char`, `stream-unread-char`
-- `make-string-input-stream`, `make-string-output-stream` (partial — extend)
-- `make-broadcast-stream`, `make-concatenated-stream`
-- `make-echo-stream` (partial — extend)
-- `make-two-way-stream`, `make-synonym-stream`
-- `open-stream-p`, `input-stream-p`, `output-stream-p`
-- `read-char`, `write-char`, `peek-char`, `unread-char`
-- `read-line`, `write-line`, `write-string` (partial — extend)
-- `terpri`, `fresh-line`
-- `*standard-input*`, `*standard-output*`, `*error-output*`
-- `*terminal-io*`, `*query-io*`, `*debug-io*`, `*trace-output*`
-
-**Data structure:** Stream = tagged object with type tag, direction, element-type, and type-specific state (string+position, file descriptor, etc.)
-
-### Layer 2: Reader
-Parse Lisp source from streams. Currently we use SBCL's reader at build time.
-
-**Implement:**
-- `read`, `read-preserving-whitespace`
-- `read-from-string` (partial — extend beyond integers)
-- Readtable: `*readtable*`, `copy-readtable`, `set-macro-character`
-- Standard syntax: lists, strings, symbols, numbers, characters
-- `#'`, `#\`, `#(`, `#:`, `#.`, reader macros
-- `read-delimited-list`
-- Backquote/comma expansion
-
-### Layer 3: Printer
-Write Lisp objects to streams. Currently we have basic serial output.
-
-**Implement:**
-- `write`, `prin1`, `princ`, `print`, `pprint`
-- `write-to-string`, `prin1-to-string`, `princ-to-string`
-- Printer control: `*print-base*`, `*print-radix*`, `*print-case*`, `*print-escape*`, `*print-circle*`, `*print-level*`, `*print-length*`, `*print-pretty*`, `*print-array*`
-- `print-object` (generic function — needs CLOS or dispatch table)
-- `with-standard-io-syntax`
-
-### Layer 4: Format
-The format string mini-language.
-
-**Implement:**
-- `format` with full directives
-- `~A` (aesthetic), `~S` (standard) — have
-- `~D` (decimal), `~B` (binary), `~O` (octal), `~X` (hex) — partial
-- `~C` (character), `~R` (radix/English)
-- `~%` (newline), `~~` (tilde) — have
-- `~{...~}` (iteration), `~[...~]` (conditional)
-- `~*` (goto), `~?` (recursive), `~P` (plural)
-- `~T` (tabulate), `~<...~>` (justification)
-- `~W` (write)
-
-### Layer 5: Conditions & Restarts
-Full condition system. We have `handler-case` with setjmp/longjmp.
-
-**Implement:**
-- `define-condition` (needs CLOS or struct-based)
-- `signal`, `error`, `warn`, `cerror`
-- `handler-bind` (vs handler-case)
-- `restart-case`, `restart-bind`
-- `invoke-restart`, `find-restart`
-- `with-simple-restart`, `abort`, `continue`, `muffle-warning`
-- Standard conditions: `error`, `type-error`, `arithmetic-error`, etc.
-
-### Layer 6: CLOS
-The Common Lisp Object System. Largest single feature.
-
-**Implement (minimal):**
-- `defclass` with slots, initargs, initforms
-- `make-instance`, `initialize-instance`
-- `slot-value`, `slot-boundp`, `slot-makunbound`
-- `defgeneric`, `defmethod`
-- Method dispatch (single dispatch first, then multi)
+**defgeneric / defmethod / method dispatch:**
+- Generic function = (name lambda-list methods)
+- Method = (specializers qualifiers function)
+- Dispatch: for each arg, find applicable methods by class precedence
+- Single dispatch first (90% of real code), then multi-dispatch
 - `call-next-method`, `next-method-p`
-- Standard method combination
-- `class-of`, `typep` integration
-- Built-in classes: `t`, `standard-object`, `standard-class`
 
-**Implement (full):**
-- `change-class`, `update-instance-for-redefined-class`
-- `slot-missing`, `slot-unbound`
-- MOP (Meta-Object Protocol) — metaclasses, generic function protocol
-- `print-object` methods
-- Condition classes (integrates with Layer 5)
+**Standard method combination:**
+- :before, :after, :around methods
+- Standard combination: around wraps (call-next-method → before → primary → after)
+- `define-method-combination` (short form covers most cases)
 
-### Layer 7: File I/O & Pathnames
-File system access. Less critical for bare-metal but needed for conformance.
+**Class hierarchy:**
+- `standard-class`, `standard-object`, `built-in-class`
+- Class precedence list computation (topological sort)
+- `subtypep` integration with class hierarchy
+- `typep` dispatches to class membership
 
-**Implement:**
-- `open`, `close`, `with-open-file`
-- `read-byte`, `write-byte`, `read-sequence`, `write-sequence`
-- `file-position`, `file-length`
-- `pathname`, `make-pathname`, `merge-pathnames`
-- `namestring`, `directory-namestring`, `file-namestring`
-- `probe-file`, `truename`, `delete-file`, `rename-file`
-- Logical pathnames
+**Slots:**
+- `:initarg`, `:initform`, `:accessor`, `:reader`, `:writer`
+- `:allocation :class` (shared slots) vs `:instance`
+- `initialize-instance`, `shared-initialize`
+- `slot-missing`, `slot-unbound` (have basic version)
 
-### Layer 8: Everything Else
-- `eval`, `compile`, `load` — the evaluator
+**Implementation approach:**
+Generic functions as hash tables mapping specializer-tuples → method lists.
+Dispatch via `class-of` → class precedence list → find most specific method.
+No MOP metaclass protocol needed for Quicklisp — just the user-facing API.
+
+### Phase 2: GC (required for anything long-running)
+
+Current: bump allocator, never frees. Any Quicklisp load exhausts the heap.
+
+**Cheney copying collector (~300 lines):**
+- Two semispaces: from-space and to-space
+- On collection: scan roots (stack, globals), copy live objects, swap spaces
+- Tagged values make root scanning trivial — bit 0 tells fixnum vs pointer
+- Allocation stays bump-pointer (already have this)
+
+**Generational (+300 lines):**
+- Nursery (2-4MB) collected frequently
+- Tenured space collected rarely
+- Write barrier: one check after set-car/set-cdr/aset
+
+**Per-actor heaps (future):**
+- Each actor has own nursery + tenured
+- GC is per-actor, no global pause
+- Already have per-actor heap regions
+
+### Phase 3: Runtime Compilation (required for ASDF)
+
+Current: `compile` is a stub. `compile-file` doesn't exist.
+
+**Wire MVM compiler into runtime:**
+- The compiler already exists (mvm/compiler.lisp)
+- Need to make it callable from the runtime `compile` function
+- Source → MVM bytecode (the compiler) → x64 native (the translator)
+- Install compiled function into the function table
+
+**compile-file:**
+- Read source forms from file
+- Compile each top-level form
+- Write FASL (compiled bytecode) to output file
+- `load` on FASL loads bytecodes and translates to native
+
+**ASDF integration:**
+- ASDF calls `compile-file` + `load`
+- Needs `*features*`, `logical-pathname-translations`
+- Needs `require`/`provide` (have stubs)
+
+### Phase 4: Numeric Tower
+
+Current: 63-bit fixnums + 2-slot bignums + stub floats.
+
+- Full bignum arithmetic (arbitrary precision)
+- Ratios (num/denom pair, auto-reduce)
+- IEEE 754 double floats (have boxing, need full ops)
+- Complex numbers
+- `rational`, `rationalize`, `float`, coercions
+
+### Phase 5: Setf Machinery
+
+Current: compiler handles `(setf (car x) v)` etc. for known places.
+
+- `defsetf` (short and long form)
+- `define-setf-expander`
+- `get-setf-expansion`
+- User-defined setf places
+
+### Phase 6: Polish
+
 - `trace`, `untrace`, `step`
 - `describe`, `inspect`, `documentation`
 - `time`, `room`
-- `random-state`, full random
-- `loop` extensions (accumulation into, hash-table iteration)
-- `setf` expansions for all accessors
-- Declarations: `optimize`, `type`, `inline`, `dynamic-extent`
+- Full `loop` (hash-table iteration, `into`, destructuring)
+- `multiple-value-setq`, `nth-value`
+- `compiler-macroexpand`
+- Logical pathnames
+- `*features*` properly populated
 
-## Implementation Order
+## File Organization
 
 ```
-Session 1: Packages          ✓ DONE — 24 functions, 303 tests
-Session 2: Streams            ✓ DONE — 9 stream types, read/write-char
-Session 3: Reader             ✓ DONE — full read, readtable, #-dispatch, backquote
-Session 4: Printer            ✓ DONE — write with *print-* vars, prin1, princ, print
-Session 5: Format             ✓ DONE — ~A ~S ~D ~B ~O ~X ~R ~C ~P ~% ~~ ~& ~| ~T ~* ~? ~W ~(~) ~[~] ~{~} ~^
-Session 6: Conditions         ✓ DONE — 24 types, handler-bind, restart-case, signal/warn/cerror
-Session 7: CLOS core          IN PROGRESS — defclass, make-instance, slot-value
-Session 8: CLOS dispatch      — defgeneric, defmethod, call-next-method
-Session 9: File I/O           — open, close, pathnames
-Session 10: Polish            — eval, compile, loop extensions, declarations
+mvm/cl-sequences.lisp    837L  Sequence functions
+mvm/cl-streams.lisp      145L  Stream type system
+mvm/cl-fileio.lisp     1,036L  File I/O + Linux syscalls
+mvm/cl-printer.lisp    1,545L  Printer + format
+mvm/cl-reader.lisp     1,383L  Reader + readtable
+mvm/cl-packages.lisp     909L  Package system
+mvm/cl-conditions.lisp   915L  Condition system
+mvm/cl-clos.lisp         429L  CLOS (expand this)
+mvm/cl-eval.lisp       1,353L  Eval/compile/load
+mvm/cl-types.lisp        519L  Type predicates
+mvm/prelude.lisp              Core runtime (hash tables, equal, etc.)
+mvm/compiler.lisp              MVM compiler
+mvm/translate-x64.lisp         x64 native translator
 ```
 
-Each session: implement the layer, add test coverage, verify 0 regressions.
+## Known Bugs
+
+1. **ASET on cons-cdr arrays**: `%cl-sym-set-package` stores package into
+   symbol data array but value doesn't persist. Causes GENTEMP.4 failure.
+   Root cause: unclear — inline `(cdr sym)` + aset segfaults, function-call
+   `(%cl-sym-data sym)` + aset silently drops the value.
+
+2. **Symbol identity**: `%intern-symbol` sometimes creates duplicate objects
+   for the same name-hash. Two symbols with identical hashes may not be `eq`.
+   Mitigated by `equal` comparison in CLOS/package code.
+
+## Quicklisp Readiness Checklist
+
+```
+[ ] defgeneric / defmethod with dispatch
+[ ] Standard method combination (:before/:after/:around)
+[ ] Class precedence lists
+[ ] initialize-instance / shared-initialize
+[ ] GC (at least Cheney copying)
+[ ] compile-file → FASL
+[ ] Runtime compile (source → native)
+[ ] ASDF loadable
+[ ] Full bignum arithmetic
+[ ] IEEE 754 float operations
+[✓] Packages
+[✓] Streams + file I/O
+[✓] Reader + printer + format
+[✓] Conditions + restarts + unwind-protect
+[✓] Eval + load
+[✓] Mutable closures
+[✓] 99.92% ANSI conformance
+```

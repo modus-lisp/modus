@@ -2304,6 +2304,11 @@
 (setf modus.mvm.x64::*x64-gc-enabled* t)
 ;; Set R14 to midpoint so GC fires at half heap
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; Set native code offset for funcall alignment:
+;; ELF header (64+56=120) + linux-x64 boot code (192) + JMP rel32 (5) = 317 = 0x13D
+;; Functions at code-buffer positions P where (0x13D+P) & 0xF == 1 would be
+;; misidentified as cons cells by compile-funcall's consp check.
+(setf modus.mvm.x64::*x64-native-code-offset* 317)
 
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 

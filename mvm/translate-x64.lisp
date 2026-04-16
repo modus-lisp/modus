@@ -2455,6 +2455,15 @@
   "When non-nil, emit GC trampoline and wire gc-check to call it.
    Set by Linux x64 builds that include gc.lisp.")
 
+(defvar *x64-native-code-offset* 0
+  "Byte offset from load-address where native code begins in the final image.
+   For linux-x64: ELF-header(120) + boot-code(192) + JMP(5) = 317 = 0x13D.
+   Used to compute actual native addresses for funcall alignment checks.
+   A function at code-buffer position P has native address:
+     load_addr + *x64-native-code-offset* + P
+   funcall checks (addr & 0xF == 1) to detect closures, so we must ensure
+   ((*x64-native-code-offset* + P) & 0xF) != 1 for all function start P.")
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -2863,7 +2872,14 @@
                                   (error (c)
                                     (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
                                            c i name pos opcode operands)))
-                                (setf pos new-pos)))))))
+                                (setf pos new-pos)))))
+                 ;; Ensure next function's native address doesn't have low nibble = 1.
+                 ;; compile-funcall checks (native_addr & 0xF == 1) to detect closures.
+                 ;; native_addr = load_addr + *x64-native-code-offset* + code_buf_pos
+                 ;; We only care about low nibble: (offset + pos) & 0xF must != 1.
+                 (let ((pos-after-fn (code-buffer-position buf)))
+                   (when (= 1 (logand (+ *x64-native-code-offset* pos-after-fn) #xF))
+                     (emit-nop buf)))))
 
       ;; Emit GC trampoline (after all functions, before fixup)
       (when (and gc-trampoline-label gc-collect-label)

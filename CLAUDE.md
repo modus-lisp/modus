@@ -73,9 +73,60 @@ scripts/        Deployment and boot scripts
   make-uefi-usb.sh     Create bootable USB image for UEFI hardware
   run-rpi-periph.sh    Launch RPi peripheral test in QEMU
 
+mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
+  cl-sequences.lisp    837L  find, search, sort, merge, map, reduce
+  cl-streams.lisp      145L  Stream type system (9+ types)
+  cl-fileio.lisp     1,036L  File I/O, Linux syscalls, pathnames
+  cl-printer.lisp    1,545L  Printer + format (50+ directives)
+  cl-reader.lisp     1,383L  Reader, readtable, #-dispatch, backquote
+  cl-packages.lisp     909L  Package system (intern, defpackage, etc.)
+  cl-conditions.lisp   915L  Condition system (24 types, handler-bind, restarts)
+  cl-clos.lisp         429L  CLOS (defclass, defgeneric, defmethod, dispatch)
+  cl-eval.lisp       1,353L  Eval/compile/load, symbol-function table
+  cl-types.lisp        519L  typep, coerce, numeric helpers
+  ansi-bridge.lisp   1,888L  Test helpers (eqlt, scaffold, stubs)
+  gc.lisp                    GC helper functions (Lisp-side)
+
 runtime/        Runtime type system
   tags.lisp            Tag/subtag definitions
   packages.lisp        Runtime package definitions
+```
+
+## ANSI CL Conformance
+
+**17,568 tests, 17,567 passing (99.994%), 1 failure.**
+
+Build: `sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp`
+Run: `/tmp/modus-ansi-test`
+
+The sole failure is GENTEMP.4 — see Known Bugs below.
+
+### CL Implementation Status
+
+```
+Packages          ✓  make-package, intern, find-symbol, defpackage, 24 functions
+Streams           ✓  9 stream types, read/write-char, string/file/broadcast/echo
+Reader            ✓  full read, readtable, #-dispatch, backquote, package qualifiers
+Printer           ✓  write with *print-* vars, 50+ format directives
+Conditions        ✓  24 types, handler-case/bind, restart-case, signal/warn/cerror
+CLOS              ✓  defclass, defgeneric, defmethod, standard method combination
+                     :before/:after/:around, call-next-method, class precedence lists
+File I/O          ✓  Linux syscalls, file streams, open/close, pathnames
+Eval/Compile/Load ✓  Tree-walking interpreter, load from file, macroexpand
+Closures          ✓  Mutable closures via heap-allocated cells
+unwind-protect    ✓  setjmp/longjmp, cleanup on both normal and error paths
+GC                ✓  Cheney semi-space copying collector
+~400+ CL functions implemented
+```
+
+### What's Missing for Quicklisp
+
+```
+[ ] Runtime compile (source → bytecode → native at runtime)
+[ ] compile-file → FASL
+[ ] Full numeric tower (arbitrary bignums, ratios, full floats, complex)
+[ ] Setf machinery (defsetf, define-setf-expander)
+[✓] Everything else
 ```
 
 ## Build Commands
@@ -175,10 +226,19 @@ Key subtags: string=#x10, symbol=#x50, closure=#x52, array=#x32, hash-table=#x41
 - `:u64` loads/stores → **raw** bits, no shift
 - Address operand is always **untagged** (SHR 1)
 
-### Array Access
-Raw address from object pointer: `(ash (logand obj (- 0 4)) 1)` — strips tag bits, doubles to byte address. Data starts at +8 (past header).
+### Object Layout
+Objects have 8-byte header + 8-byte padding + data. Data starts at raw+16 (not raw+8).
+OBJ-REF/OBJ-SET offset formula: `idx*8 + 7` (accounts for tag 9 and 16-byte header).
 
-## x86-64 Memory Layout
+### CL Symbol Layout
+CL symbols: `(cons *sym-tag* #<array [hash, package, name]>)` where *sym-tag* = 123456789.
+`%cl-sym-p` checks `(eql (car x) *sym-tag*)`. Package is array slot 1. Name is slot 2.
+See `mvm/cl-packages.lisp` for all accessors.
+
+### CL Package Layout
+Packages: `(cons *pkg-tag* #<array-7 [name, nicknames, internal, external, use-list, used-by, shadowing]>)`.
+
+## x86-64 Memory Layout (bare metal)
 
 The kernel image loads at 0x100000 (1MB). Memory regions must not overlap:
 - **0x100000**: Kernel image (native code + bytecode + fn table + metadata)
@@ -189,21 +249,69 @@ The kernel image loads at 0x100000 (1MB). Memory regions must not overlap:
 - **0x10000000**: Heap start (R12 alloc pointer)
 - **0x1E000000**: Heap limit (R14)
 
+## Linux x64 Memory Layout
+
+ELF loads at 0x400000. Heap via mmap (hint 0x10000000, kernel may place elsewhere).
+- **0x400000**: ELF image (code + data)
+- **0x400078**: Entry point (boot stub)
+- **0x10000040-0x10000068**: GC metadata (BSS, part of ELF LOAD segment)
+- **0x10000080**: Global variable alist (BSS)
+- **0x10000088**: Symbol intern table (BSS)
+- **0x10000090**: MV-count + MV-values (BSS)
+- **mmap result**: Heap (R12=alloc ptr, R14=limit)
+
+**Important**: The mmap hint 0x10000000 is NOT honored — Linux typically maps at 0x7fff...
+The BSS at 0x10000000 is part of the ELF's LOAD segment (p_memsz >> p_filesz).
+GC metadata stores mmap-relative addresses at BSS locations. The GC trampoline reads
+these at collection time.
+
+## Garbage Collector
+
+Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd heap.
+
+- **GC check**: `CMP R12, R14; JB skip; CALL gc_trampoline` after every allocation
+- **Roots**: stack scan (RSP to stack_base) + globals alist + symbol table
+- **Copy**: cons cells (16 bytes manual) + objects (REP MOVSQ, size from header)
+- **Forwarding**: tag 0xF in from-space, Cheney scan in to-space
+- **Init**: lazy — metadata computed from heap_base on first trigger
+
+`scan_word` saves/restores RDX (stack_base) around copy_object calls.
+
+Functions are NOP-aligned to avoid addresses ending in 0x1 (cons tag collision
+with closure-aware funcall dispatch). See `*x64-native-code-offset*`.
+
 The image (especially fixpoint-ssh with networking) can grow past 0x400000. The fn table
 at the end of the image must not overlap the globals or stack. Build scripts assert this.
 
-## MVM Compiler Limitations
+## MVM Compiler — Active Limitations
 
-These are known compiler bugs/limitations — work around them, don't try to fix:
+1. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
+2. **Variable-index ASET bug**: When `(aset arr idx val)` with a variable `idx` is a non-last form (`dest=nil`), the value may not load correctly. **Workaround**: `(let ((dummy (aset arr idx val))) body)` forces `dest=frame-slot`.
+3. **Symbol identity**: `%intern-symbol` sometimes creates duplicate objects for the same name-hash. Two symbols with identical hashes may be `eql` but not `eq`. Use `equal` for symbol comparison in critical paths.
+4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
+5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
+6. **Funcall tag collision**: Function addresses ending in `0x1` get misidentified as cons pointers by the closure-aware funcall dispatch. The translator NOP-aligns functions to avoid this. If adding boot code that changes the code offset, update `*x64-native-code-offset*` in the build script.
 
-1. **~~3-arg `+` is broken — DEBUNKED~~**: `compile-add` uses push/pop to preserve the accumulator across each operand. Tested: `(+ 60 5 7)` → 72, `(+ 10 20 30 5)` → 65 on x64 via MVM cross-compiler. Multi-arg `+` works.
-2. **~~Function arguments are clobbered — DEBUNKED~~**: `mvm-compile-function-internal` already emits `(:stack-store areg i)` for each register parameter at function entry, and marks all params as `:stack` location. Args are safe across calls. The bare-metal adapter in `build-compiler-test.lisp` does the same (line 769). No manual let-binding needed.
-3. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
-4. **~~18+ nested lets — DEBUNKED~~**: Tested 30 nested single-binding lets on x64 via MVM cross-compiler — all pass. Previous failures were from unbalanced test parens and `check-arith-nesting` calling `reduce` (not available on bare metal, now overridden to no-op).
-5. **~~25+ sequential forms — DEBUNKED**: Tested up to 1000 sequential forms on x64, i386, and AArch64 — all pass. Functions previously split for this reason were likely hitting the nested-let or nested-logior bugs instead. Sequential form count is not a compiler limitation.
-6. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
-7. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-8. **~~Nested logior/logand/ash clobber — FIXED~~**: Root cause was `flatten-arith-args` using `eq` on symbols that had different representations. Fixed by implementing interned symbols (subtag #x50 objects via `%intern-symbol`). Reader and compile-quote both produce interned objects, so `eq` works natively. Tested: `(logior b0 (logior (ash b1 8) (logior (ash b2 16) (ash b3 24))))` → correct.
+## Known Bugs
+
+### GENTEMP.4 — `%cl-sym-set-package` doesn't persist (1 ANSI failure)
+
+`(aset (%cl-sym-data sym) 1 pkg)` called through `%cl-sym-set-package` doesn't
+persist for packages allocated during init (low addresses). Storing fixnums works.
+Storing freshly allocated cons/arrays works. Only startup-allocated packages fail.
+The OBJ-SET instruction encoding is verified correct. Root cause unknown — likely
+a subtle register/spill interaction in the x64 translator when the value operand
+is a function parameter pointing to early heap memory. See `OBJ-SET-BUG.md`.
+
+### Mutable Closures — Global Cell Limitation
+
+The cell-boxing for captured+mutated variables uses global cells (`%CELL-varname`).
+Multiple closures from the SAME source function share the same global cell. This breaks
+`(let ((closures ...)) (mapcar #'(lambda (x) (push x acc)) items))` patterns where
+the lambda is created once but `acc` should be independent per call.
+
+Heap-allocated closure cells (`is-eql-p` pattern) work around this for specific
+functions. Full fix: allocate a fresh cons cell per closure creation in compile-lambda.
 
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 

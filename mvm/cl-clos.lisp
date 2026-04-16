@@ -6,7 +6,12 @@
 ;;; ===================================================
 
 ;; Class registry: alist of (class-name . cls-array)
-;; cls-array: #(%clos-class name slot-names-list)
+;; cls-array: #(%clos-class name slot-names-list supers cpl)
+;;   slot [0] = '%clos-class
+;;   slot [1] = name (symbol)
+;;   slot [2] = slot-names (list)
+;;   slot [3] = direct supers (list of class-names)
+;;   slot [4] = CPL (list of class-names, most-specific first)
 (defvar *clos-classes* nil)
 
 ;; slot-unbound methods: list of (class-name slot-spec fn)
@@ -17,6 +22,82 @@
 ;; Using a fixnum literal avoids SYMBOL-VALUE call clobbering arr-reg
 ;; in variable-index aset during %make-instance initialization loop.
 (defvar *%unbound-slot* -999)
+
+;; Generic function registry: alist of (name . gf-object)
+;; gf-object is a vector: #(%generic-function name lambda-list methods-alist combination)
+;;   methods-alist: list of (qualifier specializer-list . fn)
+(defvar *generic-functions* nil)
+
+;; Method combination registry: alist of (name . mc-object)
+;; mc-object: list (name operator identity-with-one-argument)
+(defvar *method-combinations* nil)
+
+;; Dynamic variable for call-next-method chain
+;; Holds: list of (qualifier specializer-list . fn) remaining
+(defvar *%next-methods* nil)
+;; Dynamic variable for current method's args (for call-next-method with no args)
+(defvar *%current-gf-args* nil)
+
+;;; ============================================================
+;;; Built-in class precedence hierarchy
+;;; Used for dispatch on non-CLOS objects
+;;; ============================================================
+
+;; Returns the CPL (list of class names, most-specific first)
+;; for a built-in type determined from an object
+(defun %builtin-cpl (type-name)
+  "Return CPL for a built-in type name."
+  (cond
+    ((eq type-name 'integer)   '(integer rational real number t))
+    ((eq type-name 'ratio)     '(ratio rational real number t))
+    ((eq type-name 'rational)  '(rational real number t))
+    ((eq type-name 'float)     '(float real number t))
+    ((eq type-name 'real)      '(real number t))
+    ((eq type-name 'complex)   '(complex number t))
+    ((eq type-name 'number)    '(number t))
+    ((eq type-name 'string)    '(string vector array sequence t))
+    ((eq type-name 'vector)    '(vector array sequence t))
+    ((eq type-name 'array)     '(array t))
+    ((eq type-name 'cons)      '(cons list sequence t))
+    ((eq type-name 'list)      '(list sequence t))
+    ((eq type-name 'null)      '(null symbol list sequence t))
+    ((eq type-name 'symbol)    '(symbol t))
+    ((eq type-name 'character) '(character t))
+    ((eq type-name 'function)  '(function t))
+    ((eq type-name 'boolean)   '(boolean symbol t))
+    (t                         (list type-name 't))))
+
+(defun %type-of-for-dispatch (obj)
+  "Return the most-specific built-in class name for OBJ."
+  (cond
+    ((null obj)        'null)
+    ((eq obj t)        'boolean)
+    ((fixnump obj)     'integer)
+    ((stringp obj)     'string)
+    ((characterp obj)  'character)
+    ((symbolp obj)     'symbol)
+    ;; ratio check before general cons (ratiop also checks consp)
+    ((ratiop obj)      'ratio)
+    ;; float check — floatp-impl checks for float objects
+    ((floatp-impl obj) 'float)
+    ((consp obj)       'cons)
+    (t 'standard-object)))
+
+(defun %obj-class-name (obj)
+  "Return most-specific class name for OBJ (CLOS or built-in)."
+  (if (%clos-instance-p obj)
+    (aref obj 1)
+    (%type-of-for-dispatch obj)))
+
+(defun %obj-cpl (obj)
+  "Return CPL for OBJ as list of class names."
+  (if (%clos-instance-p obj)
+    (let ((cls-name (aref obj 1)))
+      (let ((cls (%find-clos-class cls-name)))
+        (if cls
+          (aref cls 4)
+          (list cls-name 't))))
+    (%builtin-cpl (%type-of-for-dispatch obj))))
 
 (defun %clos-instance-p (x)
   "True if X is a CLOS instance array."
@@ -36,14 +117,70 @@
         nil)
       nil)))
 
-(defun %defclass (name slot-names)
-  "Register CLOS class NAME with SLOT-NAMES list."
-  (let ((cls (make-array 3)))
-    (aset cls 0 '%clos-class)
-    (aset cls 1 name)
-    (aset cls 2 slot-names)
-    (setq *clos-classes* (cons (cons name cls) *clos-classes*))
-    name))
+;;; ============================================================
+;;; Class registration with inheritance + CPL computation
+;;; ============================================================
+
+(defun %compute-cpl (name supers)
+  "Compute a simple CPL for NAME with SUPERS (linearization).
+   Uses C3-like: name first, then each super's CPL, deduped, ending with t."
+  (let ((result (list name))
+        (seen (list name)))
+    ;; Collect each super's CPL in order
+    (let ((cur supers))
+      (loop
+        (when (null cur) (return nil))
+        (let ((sup-name (car cur)))
+          (let ((sup-cpl
+                 (let ((sup-cls (%find-clos-class sup-name)))
+                   (if sup-cls
+                     (aref sup-cls 4)
+                     (%builtin-cpl sup-name)))))
+            (let ((c sup-cpl))
+              (loop
+                (when (null c) (return nil))
+                (let ((item (car c)))
+                  (let ((already nil))
+                    (let ((s seen))
+                      (loop
+                        (when (null s) (return nil))
+                        (when (eq (car s) item) (setq already t) (return nil))
+                        (setq s (cdr s))))
+                    (when (not already)
+                      (setq result (cons item result))
+                      (setq seen  (cons item seen)))))
+                (setq c (cdr c))))))
+        (setq cur (cdr cur))))
+    ;; Ensure 't' is always last
+    (let ((already-t nil))
+      (let ((r result))
+        (loop
+          (when (null r) (return nil))
+          (when (eq (car r) 't) (setq already-t t) (return nil))
+          (setq r (cdr r))))
+      (when (not already-t)
+        (setq result (cons 't result))))
+    (nreverse result)))
+
+(defun %defclass (name slot-names supers)
+  "Register CLOS class NAME with SLOT-NAMES list and SUPERS."
+  (let ((cpl (%compute-cpl name (if (null supers) '(standard-object) supers))))
+    (let ((cls (make-array 5)))
+      (aset cls 0 '%clos-class)
+      (aset cls 1 name)
+      (aset cls 2 slot-names)
+      (aset cls 3 supers)
+      (aset cls 4 cpl)
+      ;; Remove old entry if exists, then add new
+      (let ((new-registry nil)
+            (cur *clos-classes*))
+        (loop
+          (when (null cur) (return nil))
+          (when (not (eq (car (car cur)) name))
+            (setq new-registry (cons (car cur) new-registry)))
+          (setq cur (cdr cur)))
+        (setq *clos-classes* (cons (cons name cls) new-registry)))
+      name)))
 
 (defun %find-clos-class (name)
   "Return class descriptor for NAME, or nil."
@@ -216,6 +353,565 @@
 (defun slot-makunbound (obj slot-name)
   "Unset slot SLOT-NAME in OBJ."
   (%slot-makunbound obj slot-name))
+
+;;; ============================================================
+;;; Generic Function System
+;;; ============================================================
+
+;; GF storage: vector #(%generic-function name methods-alist combination)
+;;   methods-alist: list of method-records
+;;   method-record: list (qualifier specializer-list fn)
+;;     qualifier: nil = primary, :before, :after, :around, or custom symbol
+;;     specializer-list: list of class-names (or (eql val) forms)
+;;   combination: nil = standard, or method-combination name symbol
+
+(defun %make-gf (name)
+  "Create a new generic function object."
+  (let ((gf (make-array 4)))
+    (aset gf 0 '%generic-function)
+    (aset gf 1 name)
+    (aset gf 2 nil)  ; methods-alist
+    (aset gf 3 nil)  ; method-combination name
+    gf))
+
+(defun %gf-p (x)
+  "True if X is a generic function object."
+  (if (or (fixnump x) (consp x) (null x)) nil
+    (if (= (obj-subtag x) #x32)
+      (if (>= (array-length x) 1)
+        (eq (aref x 0) '%generic-function)
+        nil)
+      nil)))
+
+(defun %gf-name (gf)     (aref gf 1))
+(defun %gf-methods (gf)  (aref gf 2))
+(defun %gf-combination (gf) (aref gf 3))
+(defun %gf-set-methods (gf m) (aset gf 2 m))
+(defun %gf-set-combination (gf c) (aset gf 3 c))
+
+(defun %find-gf (name)
+  "Find generic function by name."
+  (let ((cur *generic-functions*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %defgeneric (name lambda-list combination)
+  "Register or update a generic function."
+  (let ((existing (%find-gf name)))
+    (if existing
+      (progn
+        (%gf-set-combination existing combination)
+        existing)
+      (let ((gf (%make-gf name)))
+        (%gf-set-combination gf combination)
+        (setq *generic-functions* (cons (cons name gf) *generic-functions*))
+        gf))))
+
+;; Make a method record: (qualifier specializer-list . fn)
+(defun %make-method (qualifier specializers fn)
+  (cons qualifier (cons specializers fn)))
+
+(defun %method-qualifier (m)    (car m))
+(defun %method-specializers (m) (cadr m))
+(defun %method-fn (m)           (cddr m))
+
+(defun %defmethod (gf-name qualifier specializers fn)
+  "Add or replace a method on a generic function."
+  ;; Ensure GF exists
+  (when (null (%find-gf gf-name))
+    (%defgeneric gf-name nil nil))
+  (let ((gf (%find-gf gf-name)))
+    (let ((new-method (%make-method qualifier specializers fn)))
+      ;; Remove existing method with same qualifier+specializers, then prepend
+      (let ((old (%gf-methods gf))
+            (filtered nil))
+        (let ((cur old))
+          (loop
+            (when (null cur) (return nil))
+            (let ((m (car cur)))
+              (let ((same-qual  (eq (%method-qualifier m) qualifier))
+                    (same-specs (let ((s1 (%method-specializers m))
+                                     (s2 specializers)
+                                     (match t))
+                                  (loop
+                                    (when (and (null s1) (null s2)) (return match))
+                                    (when (or (null s1) (null s2))
+                                      (setq match nil) (return match))
+                                    (when (not (eq (car s1) (car s2)))
+                                      (setq match nil) (return match))
+                                    (setq s1 (cdr s1))
+                                    (setq s2 (cdr s2))))))
+                (when (not (and same-qual same-specs))
+                  (setq filtered (cons m filtered)))))
+            (setq cur (cdr cur))))
+        (%gf-set-methods gf (cons new-method (nreverse filtered))))
+      new-method)))
+
+;;; ============================================================
+;;; Method Combination (short form)
+;;; ============================================================
+
+;; mc-record: vector #(%method-combination name operator identity-with-one)
+(defun %make-mc (name operator identity-with-one)
+  (let ((mc (make-array 4)))
+    (aset mc 0 '%method-combination)
+    (aset mc 1 name)
+    (aset mc 2 operator)
+    (aset mc 3 identity-with-one)
+    mc))
+
+(defun %mc-p (x)
+  (if (or (fixnump x) (consp x) (null x)) nil
+    (if (= (obj-subtag x) #x32)
+      (if (>= (array-length x) 1)
+        (eq (aref x 0) '%method-combination)
+        nil)
+      nil)))
+
+(defun %mc-name (mc)               (aref mc 1))
+(defun %mc-operator (mc)           (aref mc 2))
+(defun %mc-identity-with-one (mc)  (aref mc 3))
+
+(defun %find-mc (name)
+  (let ((cur *method-combinations*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %define-method-combination (name operator identity-with-one)
+  "Register a method combination (short form)."
+  (let ((mc (%make-mc name operator identity-with-one)))
+    ;; Remove old entry if any
+    (let ((new-reg nil)
+          (cur *method-combinations*))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (eq (car (car cur)) name))
+          (setq new-reg (cons (car cur) new-reg)))
+        (setq cur (cdr cur)))
+      (setq *method-combinations* (cons (cons name mc) new-reg)))
+    ;; Return the name (CLHS says define-method-combination returns the name)
+    name))
+
+;;; ============================================================
+;;; Specializer matching
+;;; ============================================================
+
+(defun %specializer-matches-p (spec obj)
+  "Return true if specializer SPEC matches OBJ.
+   SPEC is a class name symbol, (eql val), or t."
+  (cond
+    ((eq spec 't) t)
+    ;; (eql val) specializer
+    ((and (consp spec) (eq (car spec) 'eql))
+     (eql obj (cadr spec)))
+    ;; Class name: check if obj's CPL includes it
+    (t
+     (let ((cpl (%obj-cpl obj)))
+       (let ((cur cpl) (found nil))
+         (loop
+           (when (null cur) (return found))
+           (when (eq (car cur) spec) (setq found t) (return found))
+           (setq cur (cdr cur))))))))
+
+(defun %specializers-match-p (specs args)
+  "True if all specializers in SPECS match corresponding ARGS."
+  (let ((s specs) (a args) (ok t))
+    (loop
+      (when (or (null s) (null a)) (return ok))
+      (when (not (%specializer-matches-p (car s) (car a)))
+        (setq ok nil) (return ok))
+      (setq s (cdr s))
+      (setq a (cdr a)))
+    ok))
+
+;;; ============================================================
+;;; Method applicability + ordering
+;;; ============================================================
+
+(defun %method-specificity (m args)
+  "Return a specificity score for method M on ARGS.
+   Lower = more specific. Based on position of primary specializer in CPL."
+  (let ((specs (%method-specializers m))
+        (score 0))
+    (let ((s specs) (a args))
+      (loop
+        (when (or (null s) (null a)) (return score))
+        (let ((spec (car s))
+              (arg  (car a)))
+          (cond
+            ;; (eql val) — extremely specific (score 0)
+            ((and (consp spec) (eq (car spec) 'eql))
+             (setq score score))
+            ((eq spec 't)
+             (setq score (+ score 10000)))
+            (t
+             ;; Position in CPL (0 = most specific)
+             (let ((cpl (%obj-cpl arg))
+                   (pos 0)
+                   (found nil))
+               (let ((c cpl))
+                 (loop
+                   (when (null c) (return nil))
+                   (when (eq (car c) spec) (setq found t) (return nil))
+                   (setq pos (+ pos 1))
+                   (setq c (cdr c))))
+               (if found
+                 (setq score (+ score pos))
+                 (setq score (+ score 10000)))))))
+        (setq s (cdr s))
+        (setq a (cdr a))))
+    score))
+
+(defun %collect-applicable-methods (gf args)
+  "Return all applicable methods sorted most-specific first."
+  (let ((methods (%gf-methods gf))
+        (applicable nil))
+    ;; Collect applicable
+    (let ((cur methods))
+      (loop
+        (when (null cur) (return nil))
+        (let ((m (car cur)))
+          (when (%specializers-match-p (%method-specializers m) args)
+            (setq applicable (cons m applicable))))
+        (setq cur (cdr cur))))
+    ;; Sort by specificity (insertion sort — usually few methods)
+    (let ((sorted nil))
+      (let ((cur applicable))
+        (loop
+          (when (null cur) (return nil))
+          (let ((m (car cur))
+                (score (%method-specificity (car cur) args)))
+            ;; Insert m into sorted in correct position
+            (let ((new-sorted nil)
+                  (inserted nil)
+                  (prev sorted))
+              (loop
+                (when (null prev)
+                  (if inserted
+                    (setq new-sorted (nreverse new-sorted))
+                    (setq new-sorted (nreverse (cons m new-sorted))))
+                  (return nil))
+                (let ((pm (car prev))
+                      (pm-score (%method-specificity (car prev) args)))
+                  (if (and (not inserted) (< score pm-score))
+                    (progn
+                      (setq new-sorted (cons m new-sorted))
+                      (setq new-sorted (cons pm new-sorted))
+                      (setq inserted t))
+                    (setq new-sorted (cons pm new-sorted))))
+                (setq prev (cdr prev)))
+              (setq sorted new-sorted)))
+          (setq cur (cdr cur))))
+      sorted)))
+
+;;; ============================================================
+;;; Standard method combination dispatch
+;;; ============================================================
+
+(defun %gf-dispatch-standard (gf args applicable)
+  "Standard method combination: :around > :before + primary + :after."
+  (let ((around-methods nil)
+        (before-methods nil)
+        (primary-methods nil)
+        (after-methods nil))
+    ;; Partition by qualifier
+    (let ((cur applicable))
+      (loop
+        (when (null cur) (return nil))
+        (let ((m (car cur)))
+          (let ((q (%method-qualifier m)))
+            (cond
+              ((eq q :around)
+               (setq around-methods (cons m around-methods)))
+              ((eq q :before)
+               (setq before-methods (cons m before-methods)))
+              ((eq q :after)
+               (setq after-methods (cons m after-methods)))
+              ;; nil or primary
+              (t
+               (setq primary-methods (cons m primary-methods))))))
+        (setq cur (cdr cur))))
+    (setq around-methods  (nreverse around-methods))
+    (setq before-methods  (nreverse before-methods))
+    (setq primary-methods (nreverse primary-methods))
+    ;; after methods run in reverse order (most specific last)
+    ;; but we collected them in most-specific-first order, so reverse = least-specific-first
+    ;; Actually CL spec: :after most specific last, so keep them reversed:
+    ;; after-methods currently in most-specific-first; run least-specific-first
+    (when (null primary-methods)
+      (error "no applicable primary method"))
+    ;; Build the effective method chain
+    (let ((run-primary
+           (lambda ()
+             ;; Run before methods
+             (let ((cur before-methods))
+               (loop
+                 (when (null cur) (return nil))
+                 (apply (%method-fn (car cur)) args)
+                 (setq cur (cdr cur))))
+             ;; Run primary methods with call-next-method chain
+             (let ((result
+                    (let ((*%next-methods* (cdr primary-methods))
+                          (*%current-gf-args* args))
+                      (apply (%method-fn (car primary-methods)) args))))
+               ;; Run after methods (least specific first = most-specific last)
+               (let ((cur (nreverse after-methods)))
+                 (loop
+                   (when (null cur) (return nil))
+                   (apply (%method-fn (car cur)) args)
+                   (setq cur (cdr cur))))
+               result))))
+      (if around-methods
+        ;; Run around methods wrapping the primary chain
+        (let ((*%next-methods*
+               (let ((remaining (cdr around-methods)))
+                 ;; Last around calls run-primary as "next"
+                 remaining))
+              (*%current-gf-args* args))
+          ;; Build synthetic "next" for the last around to call primary
+          (let ((primary-sentinel (%make-method nil nil run-primary)))
+            (let ((*%next-methods*
+                   (let ((rev-around (cdr around-methods)))
+                     ;; Append primary-sentinel after last around
+                     (let ((result nil)
+                           (cur rev-around))
+                       (loop
+                         (when (null cur)
+                           (setq result (cons primary-sentinel result))
+                           (return nil))
+                         (setq result (cons (car cur) result))
+                         (setq cur (cdr cur)))
+                       (nreverse result))))
+                  (*%current-gf-args* args))
+              (apply (%method-fn (car around-methods)) args))))
+        ;; No around: just run primary + before/after
+        (funcall run-primary)))))
+
+;;; ============================================================
+;;; Custom method combination dispatch (short form)
+;;; ============================================================
+
+(defun %gf-dispatch-custom (gf args applicable mc)
+  "Short-form method combination: collect qualifying methods and apply operator."
+  (let ((comb-name (%mc-name mc))
+        (operator (%mc-operator mc))
+        (identity-with-one (%mc-identity-with-one mc)))
+    ;; Collect :around and comb-name-qualified methods
+    (let ((around-methods nil)
+          (primary-methods nil))
+      (let ((cur applicable))
+        (loop
+          (when (null cur) (return nil))
+          (let ((m (car cur)))
+            (let ((q (%method-qualifier m)))
+              (cond
+                ((eq q :around)
+                 (setq around-methods (cons m around-methods)))
+                ((eq q comb-name)
+                 (setq primary-methods (cons m primary-methods)))
+                ;; Primary methods with this combination also qualify
+                ((null q)
+                 ;; Not allowed in custom combination — should error
+                 nil))))
+          (setq cur (cdr cur))))
+      (setq around-methods  (nreverse around-methods))
+      (setq primary-methods (nreverse primary-methods))
+      (when (null primary-methods)
+        (error "no applicable method for combination"))
+      ;; Compute the combined result
+      (let ((combined-thunk
+             (lambda ()
+               ;; If identity-with-one and only one method, call it directly
+               (if (and identity-with-one (null (cdr primary-methods)))
+                 (apply (%method-fn (car primary-methods)) args)
+                 ;; Otherwise collect results and apply operator
+                 (let ((results nil)
+                       (cur primary-methods))
+                   (loop
+                     (when (null cur) (return nil))
+                     (setq results (cons (apply (%method-fn (car cur)) args) results))
+                     (setq cur (cdr cur)))
+                   (apply operator (nreverse results)))))))
+        (if around-methods
+          ;; Around wraps combined
+          (let ((primary-sentinel (%make-method nil nil combined-thunk)))
+            (let ((*%next-methods*
+                   (let ((result nil)
+                         (cur (cdr around-methods)))
+                     (loop
+                       (when (null cur)
+                         (setq result (cons primary-sentinel result))
+                         (return nil))
+                       (setq result (cons (car cur) result))
+                       (setq cur (cdr cur)))
+                     (nreverse result)))
+                  (*%current-gf-args* args))
+              (apply (%method-fn (car around-methods)) args)))
+          ;; No around
+          (funcall combined-thunk))))))
+
+;;; ============================================================
+;;; Main dispatch entry point
+;;; ============================================================
+
+(defun %gf-dispatch (name args)
+  "Dispatch generic function NAME with ARGS."
+  (let ((gf (%find-gf name)))
+    (when (null gf)
+      (error "undefined generic function"))
+    (let ((applicable (%collect-applicable-methods gf args)))
+      (when (null applicable)
+        ;; Try no-applicable-method hook
+        (error "no applicable method"))
+      (let ((comb-name (%gf-combination gf)))
+        (if comb-name
+          ;; Custom method combination
+          (let ((mc (%find-mc comb-name)))
+            (if mc
+              (%gf-dispatch-custom gf args applicable mc)
+              ;; Unknown combination — fall through to standard
+              (%gf-dispatch-standard gf args applicable)))
+          ;; Standard method combination
+          (%gf-dispatch-standard gf args applicable))))))
+
+;;; ============================================================
+;;; call-next-method / next-method-p
+;;; ============================================================
+
+(defun call-next-method (&rest new-args)
+  "Call the next method in the applicable method list."
+  (let ((next *%next-methods*))
+    (if (null next)
+      (error "no next method")
+      (let ((m (car next))
+            (remaining (cdr next)))
+        (let ((*%next-methods* remaining)
+              (actual-args (if new-args new-args *%current-gf-args*)))
+          (let ((*%current-gf-args* actual-args))
+            (apply (%method-fn m) actual-args)))))))
+
+(defun next-method-p ()
+  "True if there is a next method available."
+  (not (null *%next-methods*)))
+
+;;; ============================================================
+;;; ensure-generic-function
+;;; ============================================================
+
+(defun ensure-generic-function (name &rest args)
+  "Ensure generic function NAME exists."
+  (let ((existing (%find-gf name)))
+    (if existing
+      existing
+      (%defgeneric name nil nil))))
+
+;;; ============================================================
+;;; find-method / remove-method / add-method
+;;; ============================================================
+
+(defun find-method (gf qualifiers specializers &rest args)
+  "Find a method on GF."
+  (if (%gf-p gf)
+    (let ((methods (%gf-methods gf))
+          (result nil))
+      (let ((cur methods))
+        (loop
+          (when (null cur) (return result))
+          (let ((m (car cur)))
+            (let ((mq (%method-qualifier m))
+                  (ms (%method-specializers m)))
+              (let ((q-match (eq mq (if qualifiers (car qualifiers) nil)))
+                    (s-match t))
+                ;; Check specializers match (compare class names)
+                (let ((s1 ms) (s2 specializers))
+                  (loop
+                    (when (and (null s1) (null s2)) (return nil))
+                    (when (or (null s1) (null s2))
+                      (setq s-match nil) (return nil))
+                    (let ((spec1 (car s1)) (spec2 (car s2)))
+                      ;; spec2 might be a class object or name
+                      (let ((name2 (if (%clos-class-p spec2)
+                                     (aref spec2 1)
+                                     spec2)))
+                        (when (not (eq spec1 name2))
+                          (setq s-match nil) (return nil))))
+                    (setq s1 (cdr s1))
+                    (setq s2 (cdr s2))))
+                (when (and q-match s-match)
+                  (setq result m)
+                  (return result)))))
+          (setq cur (cdr cur))))
+      result)
+    nil))
+
+(defun remove-method (gf method)
+  "Remove METHOD from GF."
+  (when (%gf-p gf)
+    (let ((new-methods nil)
+          (cur (%gf-methods gf)))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (eq (car cur) method))
+          (setq new-methods (cons (car cur) new-methods)))
+        (setq cur (cdr cur)))
+      (%gf-set-methods gf (nreverse new-methods))))
+  gf)
+
+(defun add-method (gf method)
+  "Add METHOD to GF."
+  (when (%gf-p gf)
+    (%gf-set-methods gf (cons method (%gf-methods gf))))
+  gf)
+
+(defun method-qualifiers (m)
+  "Return qualifiers of METHOD M."
+  (let ((q (%method-qualifier m)))
+    (if q (list q) nil)))
+
+(defun method-specializers (m)
+  "Return specializer class objects for METHOD M."
+  (mapcar (lambda (s)
+            (let ((cls (%find-clos-class s)))
+              (or cls s)))
+          (%method-specializers m)))
+
+;;; ============================================================
+;;; compute-applicable-methods (public API)
+;;; ============================================================
+
+(defun compute-applicable-methods (gf args)
+  "Return applicable methods for GF called with ARGS."
+  (if (%gf-p gf)
+    (%collect-applicable-methods gf args)
+    nil))
+
+;;; ============================================================
+;;; typep support for generic-function / standard-method
+;;; ============================================================
+
+(defun %generic-function-p (x)
+  "True if X is a generic function."
+  (%gf-p x))
+
+(defun %standard-method-p (x)
+  "True if X is a standard method."
+  (if (or (fixnump x) (null x)) nil
+    (if (consp x)
+      (let ((q (car x)))
+        ;; method record: (qualifier specializers . fn)
+        (if (or (null q) (eq q :before) (eq q :after) (eq q :around)
+                (symbolp q))
+          (if (consp (cdr x))
+            (let ((fn (cddr x)))
+              (if (functionp fn) t nil))
+            nil)
+          nil))
+      nil)))
+
 (defun nstring-parse-start-end (args len)
   "Parse :start/:end keyword args from ARGS plist. Returns (start . end)."
   (let ((start 0) (end len))

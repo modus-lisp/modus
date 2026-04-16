@@ -444,6 +444,14 @@
          ((eq tn 'bit) (or (= obj 0) (= obj 1)))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
+         ((eq tn 'function) (or (functionp obj) (%generic-function-p obj)))
+         ((eq tn 'generic-function) (%generic-function-p obj))
+         ((eq tn 'standard-generic-function) (%generic-function-p obj))
+         ((eq tn 'standard-method) (%standard-method-p obj))
+         ((eq tn 'method) (%standard-method-p obj))
+         ((eq tn 'method-combination) (%mc-p obj))
+         ;; CLOS instance check
+         ((eq tn 'standard-object) (%clos-instance-p obj))
          (t nil))))
     ;; Compound type specifiers
     (t

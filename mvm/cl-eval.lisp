@@ -69,8 +69,27 @@
   sym)
 
 (defun fdefinition (sym)
-  "Return the function definition of SYM (same as symbol-function for now)."
-  (symbol-function sym))
+  "Return the function definition of SYM.
+   For generic functions, returns the GF object."
+  (let ((name (cond
+                ((%cl-sym-p sym) (%cl-sym-name sym))
+                ((stringp sym) sym)
+                ((and (consp sym) (eq (car sym) 'setf))
+                 ;; (setf foo) — look up as regular name for now
+                 nil)
+                (t nil))))
+    (when (null name)
+      (return-from fdefinition (symbol-function sym)))
+    ;; Check GF registry first
+    (let ((gf-sym (cond
+                    ((%cl-sym-p sym) sym)
+                    ((stringp sym) nil)
+                    (t nil))))
+      (when gf-sym
+        (let ((gf (%find-gf gf-sym)))
+          (when gf (return-from fdefinition gf)))))
+    ;; Fall back to symbol-function
+    (symbol-function sym)))
 
 (defun set-fdefinition (sym fn)
   "Set the function definition of SYM."

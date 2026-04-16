@@ -1194,10 +1194,10 @@
     ;; ---- Minimal CLOS support ----
 
     ;; (defclass name supers slots &rest options)
-    ;; → (%defclass 'name '(slot-names...)) + reader/accessor/writer defuns
+    ;; → (%defclass 'name '(slot-names...) '(supers...)) + reader/accessor/writer defuns
     ((and (eq (car form) 'defclass) (cdr form) (cddr form))
      (let* ((class-name (cadr form))
-            ;; supers = (caddr form) — ignored for now
+            (raw-supers (caddr form))  ; list of parent class names
             (raw-slots (or (cadddr form) nil))
             ;; Parse slot specs
             (slot-names nil)
@@ -1235,16 +1235,84 @@
                (cons (cons class-name (cons slot-list initarg-map))
                      *sbcl-clos-classes*))
          `(progn
-            (%defclass ',class-name ',slot-list)
+            (%defclass ',class-name ',slot-list ',raw-supers)
             ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))
 
-    ;; (defgeneric name args &rest options) → stub nil
+    ;; (defgeneric name lambda-list &rest options)
+    ;; → (%defgeneric 'name 'lambda-list combination)
+    ;;   + (defun name (&rest %gf-args) (%gf-dispatch 'name %gf-args))
+    ;; Also handles inline (:method ...) options and :method-combination.
     ((and (eq (car form) 'defgeneric) (cdr form))
-     nil)
+     (let* ((gf-name (cadr form))
+            (lambda-list (caddr form))
+            (options (cdddr form))
+            (combination nil)
+            (inline-methods nil))
+       (dolist (opt options)
+         (when (consp opt)
+           (cond
+             ((eq (car opt) :method-combination)
+              (setq combination (cadr opt)))
+             ((eq (car opt) :method)
+              (push opt inline-methods)))))
+       ;; Build method-add forms for inline :method options
+       (let* ((method-counter 0)
+              (method-forms
+               (mapcar (lambda (mopt)
+                         ;; mopt = (:method [qualifier] specialized-ll body...)
+                         (setf method-counter (1+ method-counter))
+                         (let* ((rest (cdr mopt))
+                                ;; qualifier: non-list symbol that is not the lambda list
+                                (has-qualifier (and rest (cdr rest) (symbolp (car rest))
+                                                    (not (listp (car rest)))))
+                                (qualifier (if has-qualifier (car rest) nil))
+                                (rest2 (if has-qualifier (cdr rest) rest))
+                                (sll (car rest2))
+                                (body (cdr rest2))
+                                ;; Specializers from specialized lambda list
+                                (specs
+                                 (mapcar (lambda (p)
+                                           (cond
+                                             ((consp p)
+                                              (let ((spec (cadr p)))
+                                                (if (and (consp spec) (eq (car spec) 'eql))
+                                                  `(list 'eql ,(rewrite-reader-forms (cadr spec)))
+                                                  `',spec)))
+                                             (t ''t)))
+                                         (remove-if (lambda (p)
+                                                       (and (symbolp p)
+                                                            (member p '(&optional &rest &key &aux &allow-other-keys))))
+                                                     sll)))
+                                (params (mapcar (lambda (p) (if (consp p) (car p) p)) sll))
+                                (rewritten-body (mapcar #'rewrite-reader-forms body)))
+                           `(%defmethod ',gf-name ',(if qualifier qualifier nil)
+                                        (list ,@specs)
+                                        (lambda ,params ,@rewritten-body))))
+                       (nreverse inline-methods))))
+         `(progn
+            (%defgeneric ',gf-name ',lambda-list ',(if combination combination nil))
+            (defun ,gf-name (&rest %gf-args)
+              (%gf-dispatch ',gf-name %gf-args))
+            ,@method-forms))))
 
-    ;; (define-method-combination name &rest options) → stub nil
+    ;; (define-method-combination name &rest options)
+    ;; Short form: (define-method-combination name :operator op :documentation ... :identity-with-one-argument t)
     ((and (eq (car form) 'define-method-combination) (cdr form))
-     nil)
+     (let* ((mc-name (cadr form))
+            (options (cddr form))
+            (operator mc-name)
+            (identity-with-one nil))
+       (let ((cur options))
+         (loop
+           (when (null cur) (return))
+           (let ((key (car cur)) (val (cadr cur)))
+             (cond
+               ((eq key :operator) (setq operator val))
+               ((eq key :identity-with-one-argument) (setq identity-with-one val))
+               ((eq key :documentation) nil)  ; ignored
+               (t nil)))
+           (setq cur (cddr cur))))
+       `(%define-method-combination ',mc-name ',operator ,identity-with-one)))
 
     ;; (defmethod slot-unbound (...) body...) → defun + %add-slot-unbound-method
     ;; Specializer on obj (2nd param) by class name and slot-name (3rd param)
@@ -1296,9 +1364,46 @@
             ,@rewritten-body)
           (%add-slot-unbound-method ',obj-class ,slot-arg #',fn-name))))
 
-    ;; (defmethod name ...) → stub nil for other methods
+    ;; (defmethod name [qualifier] specialized-lambda-list body...)
+    ;; → (%defmethod 'name qualifier '(specializers) (lambda params body))
     ((and (eq (car form) 'defmethod) (cdr form))
-     nil)
+     (let* ((gf-name (cadr form))
+            (rest (cddr form))
+            ;; Check for qualifier: if (car rest) is a non-list symbol, it's a qualifier
+            (has-qualifier (and rest (symbolp (car rest)) (not (listp (car rest)))))
+            (qualifier (if has-qualifier (car rest) nil))
+            (rest2 (if has-qualifier (cdr rest) rest))
+            (sll (car rest2))      ; specialized lambda list
+            (body (cdr rest2)))
+       (when (null sll) (return-from rewrite-reader-forms nil))
+       (when (not (listp sll)) (return-from rewrite-reader-forms nil))
+       ;; Extract specializers (skip &optional, &rest, &key, &aux, &allow-other-keys)
+       (let* ((specs
+               (mapcar (lambda (p)
+                         (cond
+                           ;; (var class-name) or (var (eql val))
+                           ((consp p)
+                            (let ((spec (cadr p)))
+                              (if (and (consp spec) (eq (car spec) 'eql))
+                                ;; eql specializer: preserve as (eql val)
+                                `(list 'eql ,(rewrite-reader-forms (cadr spec)))
+                                `',(cadr p))))
+                           ;; plain var — specializer is t
+                           (t ''t)))
+                       (remove-if (lambda (p)
+                                    (and (symbolp p)
+                                         (member p '(&optional &rest &key &aux &allow-other-keys))))
+                                  sll)))
+              ;; Extract parameter names (strip specializers)
+              (params
+               (mapcar (lambda (p)
+                         (if (consp p) (car p) p))
+                       sll))
+              (rewritten-body (mapcar #'rewrite-reader-forms body)))
+         ;; Use lambda directly — can be inside init expressions
+         `(%defmethod ',gf-name ',(if qualifier qualifier nil)
+                      (list ,@specs)
+                      (lambda ,params ,@rewritten-body)))))
 
     ;; (make-instance 'class-name &rest initargs)
     ;; → (%make-instance 'class-name) + set-slot-value for initargs
@@ -1613,31 +1718,36 @@
                           '(defharmless def-fold-test def-macro-test
                             in-package declaim))) nil)
                   (t
-                   ;; For progn forms (from rewritten defclass/defmethod):
+                   ;; For progn forms (from rewritten defclass/defmethod/defgeneric):
                    ;; - defun sub-forms → top-level (compiled as global functions)
-                   ;; - non-defun sub-forms (like %defclass calls) → init-forms
+                   ;; - non-defun sub-forms (like %defclass, %defmethod calls) → init-forms
                    ;;   (run inside run-ansi-* since TOPLEVEL thunks never execute)
+                   ;; Handles nested progn forms recursively.
                    ;; For non-progn forms: write to top-level as before.
-                   (if (and (consp form) (eq (car form) 'progn))
-                       (dolist (sub (cdr form))
-                         (when (consp sub)
-                           (let ((sub-s (handler-case (format nil "~S" sub)
-                                          (error () nil))))
-                             (when (and sub-s
-                                        (not (search "#<" sub-s))
-                                        (not (search "&ENVIRONMENT" sub-s))
-                                        (not (search "STRUCT-TEST-" sub-s)))
-                               (if (member (car sub) '(defun defvar defparameter defstruct))
-                                   (progn (write-string sub-s out) (terpri out))
-                                   (push sub-s init-forms))))))
-                       (let ((s (handler-case (format nil "~S" form)
-                                  (error () nil))))
-                         (when (and s
-                                    (not (search "#<" s))
-                                    (not (search "&ENVIRONMENT" s))
-                                    (not (search "STRUCT-TEST-" s)))
-                           (write-string s out)
-                           (terpri out)))))))
+                   (labels ((emit-sub (sub)
+                              (when (consp sub)
+                                ;; Recursively flatten nested progns
+                                (if (eq (car sub) 'progn)
+                                    (dolist (inner (cdr sub)) (emit-sub inner))
+                                    (let ((sub-s (handler-case (format nil "~S" sub)
+                                                   (error () nil))))
+                                      (when (and sub-s
+                                                 (not (search "#<" sub-s))
+                                                 (not (search "&ENVIRONMENT" sub-s))
+                                                 (not (search "STRUCT-TEST-" sub-s)))
+                                        (if (member (car sub) '(defun defvar defparameter defstruct))
+                                            (progn (write-string sub-s out) (terpri out))
+                                            (push sub-s init-forms))))))))
+                     (if (and (consp form) (eq (car form) 'progn))
+                         (dolist (sub (cdr form)) (emit-sub sub))
+                         (let ((s (handler-case (format nil "~S" form)
+                                    (error () nil))))
+                           (when (and s
+                                      (not (search "#<" s))
+                                      (not (search "&ENVIRONMENT" s))
+                                      (not (search "STRUCT-TEST-" s)))
+                             (write-string s out)
+                             (terpri out))))))))
               (format out "(defun run-ansi-~A ()~%" (pathname-name file))
               ;; Emit init calls first (%defclass, %add-slot-unbound-method, etc.)
               (dolist (s (nreverse init-forms)) (format out "  ~A~%" s))

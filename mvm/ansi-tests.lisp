@@ -1423,7 +1423,7 @@
     (aset a 0 sym)
     (deftest 9093 (eq (aref a 0) '%clos-instance) t))
   ;; Test 1: %defclass creates a class
-  (%defclass 'diag-class-01 '(x y z))
+  (%defclass 'diag-class-01 '(x y z) nil)
   (let ((cls (%find-clos-class 'diag-class-01)))
     (deftest 9100 (null cls) nil))
   ;; Test 2: class has correct name

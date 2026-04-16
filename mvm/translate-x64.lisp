@@ -2590,6 +2590,7 @@
     ;; and update the word with the new pointer.
     ;; ===========================================================
     (emit-label buf scan-word-label)
+    (emit-push buf 'rdx)                          ; save RDX (stack scan uses it for stack_base)
     (emit-push buf 'rax)                          ; save word address
     (let ((sw-not-ptr (make-label))
           (sw-done (make-label))
@@ -2649,6 +2650,7 @@
       (emit-label buf sw-not-ptr)
       (emit-label buf sw-done)
       (emit-pop buf 'rax)                         ; discard saved word address
+      (emit-pop buf 'rdx)                         ; restore RDX (stack_base for caller)
       (emit-ret buf))
 
     ;; ===========================================================

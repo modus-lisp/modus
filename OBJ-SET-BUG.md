@@ -1,6 +1,20 @@
-# OBJ-SET Register Clobber Bug
+# OBJ-SET Bug — UPDATE: Likely GC Root Scanning Issue
 
-## Summary
+## Status (2026-04-16)
+
+The "OBJ-SET bug" may actually be GC-related. Key finding:
+- The Linux mmap for the heap returns 0x7fffc1600000, NOT 0x10000000
+- GC metadata at BSS 0x10000040 stores the correct mmap-relative addresses
+- But 12 CLOS failures appear ONLY when GC is enabled
+- The original GENTEMP.4 failure (1 failure, pre-GC) had the heap at 0x7fff...
+  yet most OBJ-SET operations worked fine
+- The 12 additional CLOS failures appeared with GC, suggesting GC
+  doesn't trace all CLOS roots (GF registry, method tables)
+
+Next step: add CLOS global variables to GC root scanning, or disable
+GC for the test suite until the root set is complete.
+
+## Original Analysis
 
 `(aset array 1 value)` via OBJ-SET opcode silently drops the stored value
 when called through a function like `%cl-sym-set-package`. The value reads

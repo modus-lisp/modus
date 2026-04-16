@@ -13,6 +13,13 @@
 (defconstant +linux-x64-load-addr+ #x400000)    ; Traditional Linux x64 load address
 (defconstant +linux-x64-heap-addr+ #x10000000)  ; Heap start (same as bare-metal)
 (defconstant +linux-x64-heap-size+ #x38000000)  ; 896MB heap
+(defconstant +linux-x64-heap-alloc-start+ #x200)  ; Offset from heap base to first allocatable byte
+(defconstant +linux-x64-gc-midpoint+ #x1C000000)  ; Midpoint offset from heap base (from/to boundary)
+
+;; When GC is enabled, R14 = midpoint (GC fires at half heap).
+;; When GC is disabled, R14 = full heap size (no GC trigger).
+(defvar *linux-x64-r14-offset* +linux-x64-heap-size+
+  "Offset from heap base for R14 (alloc limit). Set to midpoint for GC.")
 ;; Globals at start of heap region (after mmap succeeds)
 ;; +0x00: argc, +0x08: argv base, +0x10: argv[0], +0x18: argv[1], etc.
 (defconstant +linux-x64-globals+  #x10000000)
@@ -102,14 +109,56 @@
 
   ;; Set up MVM runtime registers
   ;; R12 = alloc pointer (skip first 512 bytes used for globals + MV storage)
-  ;; Layout: 0x00-0x7F argc/argv, 0x80 globals, 0x88 symtab,
+  ;; Layout: 0x00-0x3F argc/argv, 0x40-0x7F GC metadata,
+  ;; 0x80 globals, 0x88 symtab,
   ;; 0x90 MV-count, 0x98-0x138 MV-values (20 slots), 0x140-0x1FF reserved
+  ;; RAX = mmap result = heap base
   (emit-bytes buf #x49 #x89 #xC4)                ; mov r12, rax
-  (emit-bytes buf #x49 #x81 #xC4 #x00 #x02 #x00 #x00) ; add r12, 512 (skip globals+MV)
+  (emit-bytes buf #x49 #x81 #xC4)                ; add r12, imm32 (alloc start offset)
+  (emit-le32 buf +linux-x64-heap-alloc-start+)
   ;; R14 = alloc limit
+  ;; With GC: midpoint (GC fires when from-space fills)
+  ;; Without GC: full heap end (no GC trigger)
   (emit-bytes buf #x49 #x89 #xC6)                ; mov r14, rax
-  (emit-bytes buf #x49 #x81 #xC6)                ; add r14, heap_size
-  (emit-le32 buf +linux-x64-heap-size+)
+  (emit-bytes buf #x49 #x81 #xC6)                ; add r14, imm32
+  (emit-le32 buf *linux-x64-r14-offset*)
+
+  ;; Initialize GC metadata at ABSOLUTE addresses 0x10000040..0x10000060
+  ;; These are in the ELF BSS region (zero-initialized by the kernel loader).
+  ;; The mmap'd heap is at a DIFFERENT address (RAX), so we store
+  ;; mmap-relative addresses here for the GC to use.
+  ;; All values are raw byte addresses.
+
+  ;; [0x10000040] = from_start = mmap_base + alloc_offset
+  (emit-bytes buf #x48 #x89 #xC1)                ; mov rcx, rax     (mmap base)
+  (emit-bytes buf #x48 #x81 #xC1)                ; add rcx, imm32
+  (emit-le32 buf +linux-x64-heap-alloc-start+)
+  (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
+  (emit-le32 buf #x10000040)
+
+  ;; [0x10000048] = to_start = mmap_base + midpoint
+  (emit-bytes buf #x48 #x89 #xC1)                ; mov rcx, rax
+  (emit-bytes buf #x48 #x81 #xC1)                ; add rcx, imm32
+  (emit-le32 buf +linux-x64-gc-midpoint+)
+  (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
+  (emit-le32 buf #x10000048)
+
+  ;; [0x10000050] = space_size = midpoint - alloc_offset
+  (emit-bytes buf #x48 #xC7 #xC1)                ; mov rcx, imm32
+  (emit-le32 buf (- +linux-x64-gc-midpoint+ +linux-x64-heap-alloc-start+))
+  (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
+  (emit-le32 buf #x10000050)
+
+  ;; [0x10000058] = stack_base = initial RSP
+  (emit-bytes buf #x48 #x89 #xE1)                ; mov rcx, rsp
+  (emit-bytes buf #x48 #x89 #x0C #x25)           ; mov [abs32], rcx
+  (emit-le32 buf #x10000058)
+
+  ;; [0x10000060] = gc_count = 0
+  (emit-bytes buf #x48 #xC7 #x04 #x25)           ; mov qword [abs32], imm32
+  (emit-le32 buf #x10000060)
+  (emit-le32 buf 0)
+
   ;; R15 = NIL
   (emit-bytes buf #x49 #xBF)                      ; mov r15, imm64
   (emit-le64 buf #xDEAD0001)

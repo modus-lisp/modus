@@ -1695,17 +1695,14 @@
 
         ((op= +op-gc-check+)
          ;; Check R12 (alloc ptr) against R14 (alloc limit)
-         ;; If R12 >= R14, call GC
-         (let ((skip-label (make-label)))
-           (emit-cmp-reg-reg buf 'r12 'r14)
-           (emit-jcc buf :l skip-label)    ; if alloc < limit, skip
-           ;; Call GC routine.  The GC label is set up once per
-           ;; translation unit; if not available, emit INT 0x31.
-           (let ((gc-lbl (translate-state-gc-label state)))
-             (if gc-lbl
-                 (emit-call buf gc-lbl)
-                 (emit-int buf #x31)))     ; trap to GC handler
-           (emit-label buf skip-label)))
+         ;; If R12 >= R14, call GC (or NOP if no GC configured)
+         (let ((gc-lbl (translate-state-gc-label state)))
+           (when gc-lbl
+             (let ((skip-label (make-label)))
+               (emit-cmp-reg-reg buf 'r12 'r14)
+               (emit-jcc buf :l skip-label)    ; if alloc < limit, skip
+               (emit-call buf gc-lbl)
+               (emit-label buf skip-label)))))
 
         ((op= +op-write-barrier+)
          ;; (write-barrier Vobj) — mark card table dirty
@@ -2454,6 +2451,339 @@
 ;;; Full Bytecode Translation
 ;;; ============================================================
 
+(defvar *x64-gc-enabled* nil
+  "When non-nil, emit GC trampoline and wire gc-check to call it.
+   Set by Linux x64 builds that include gc.lisp.")
+
+(defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
+  "Emit a complete Cheney copying GC in native x64 assembly.
+
+   GC metadata layout (raw byte addresses at heap base 0x10000000):
+     +0x40: from_start   +0x48: to_start   +0x50: space_size
+     +0x58: stack_base   +0x60: gc_count
+   All metadata values are stored as raw byte addresses (NOT tagged).
+
+   Register convention during GC:
+     R13 = free pointer (next write position in to-space)
+     RBX = from_start (old from-space base)
+     RCX = from_end   (old from-space end = from_start + space_size)
+     R12/R14 = scratch during GC, restored to new alloc/limit at end"
+  (declare (ignore gc-collect-label))
+
+  ;; Labels for GC subroutines
+  (let ((copy-label (make-label))      ; copy_object(RAX) -> RAX=new ptr, R13 advanced
+        (scan-word-label (make-label))  ; scan_word(RAX=addr of word) -> update word, R13
+        (restore-label (make-label)))
+
+    (emit-label buf gc-trampoline-label)
+
+    ;; ---- Save all caller registers ----
+    (emit-push buf 'rax)
+    (emit-push buf 'rsi)
+    (emit-push buf 'rdi)
+    (emit-push buf 'r8)
+    (emit-push buf 'r9)
+    (emit-push buf 'rbx)
+    (emit-push buf 'rcx)
+    (emit-push buf 'rdx)
+    (emit-push buf 'r10)
+    (emit-push buf 'r11)
+    (emit-push buf 'r13)
+    (emit-push buf 'rbp)
+    ;; Save RSP for stack root scanning (after all pushes)
+    (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp  (save scan start)
+
+    ;; ---- Load GC metadata ----
+    ;; RBX = from_start (raw byte addr)
+    (emit-bytes buf #x48 #x8B #x1C #x25)         ; mov rbx, [abs32]
+    (emit-u32 buf #x10000040)
+    ;; R13 = to_start -> becomes free pointer
+    (emit-bytes buf #x4C #x8B #x2C #x25)         ; mov r13, [abs32]
+    (emit-u32 buf #x10000048)
+    ;; RCX = from_start + space_size = from_end
+    (emit-bytes buf #x48 #x8B #x0C #x25)         ; mov rcx, [abs32]
+    (emit-u32 buf #x10000050)
+    (emit-add-reg-reg buf 'rcx 'rbx)             ; rcx = from_start + space_size
+
+    ;; ---- Scan stack roots ----
+    ;; Walk from RBP (saved RSP) to stack_base
+    ;; RDI = current scan address
+    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp  (start of stack)
+    (let ((stack-loop (make-label))
+          (stack-done (make-label)))
+      ;; RDX = stack_base
+      (emit-bytes buf #x48 #x8B #x14 #x25)       ; mov rdx, [abs32]
+      (emit-u32 buf #x10000058)
+
+      (emit-label buf stack-loop)
+      (emit-cmp-reg-reg buf 'rdi 'rdx)           ; rdi >= stack_base?
+      (emit-jcc buf :ae stack-done)
+      ;; Load the stack word
+      (emit-mov-reg-mem buf 'rax 'rdi 0)          ; rax = [rdi]
+      ;; Call scan_word subroutine (rax = addr of word to scan)
+      (emit-bytes buf #x48 #x89 #xF8)            ; mov rax, rdi  (addr of the word)
+      (emit-call buf scan-word-label)
+      ;; Advance to next word
+      (emit-add-reg-imm buf 'rdi 8)
+      (emit-jmp buf stack-loop)
+      (emit-label buf stack-done))
+
+    ;; ---- Scan globals roots ----
+    ;; Globals alist at 0x10000080
+    (emit-mov-reg-imm buf 'rax #x10000080)
+    (emit-call buf scan-word-label)
+    ;; Symbol table at 0x10000088
+    (emit-mov-reg-imm buf 'rax #x10000088)
+    (emit-call buf scan-word-label)
+
+    ;; ---- Cheney scan loop ----
+    ;; R10 = scan pointer (starts at to_start)
+    (emit-bytes buf #x4C #x8B #x14 #x25)         ; mov r10, [abs32]
+    (emit-u32 buf #x10000048)                     ; r10 = to_start
+
+    (let ((cheney-loop (make-label))
+          (cheney-done (make-label)))
+      (emit-label buf cheney-loop)
+      ;; scan >= free_ptr? done
+      (emit-cmp-reg-reg buf 'r10 'r13)
+      (emit-jcc buf :ae cheney-done)
+      ;; Scan the word at [r10]
+      (emit-bytes buf #x4C #x89 #xD0)            ; mov rax, r10
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'r10 8)
+      (emit-jmp buf cheney-loop)
+      (emit-label buf cheney-done))
+
+    ;; ---- Swap semispaces ----
+    ;; new from_start = old to_start
+    (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000048]
+    (emit-u32 buf #x10000048)
+    (emit-bytes buf #x48 #x89 #x04 #x25)         ; mov [0x10000040], rax
+    (emit-u32 buf #x10000040)
+    ;; new to_start = old from_start (in RBX)
+    (emit-bytes buf #x48 #x89 #x1C #x25)         ; mov [0x10000048], rbx
+    (emit-u32 buf #x10000048)
+
+    ;; ---- Update R12 and R14 ----
+    ;; R12 = free_ptr (R13)
+    (emit-bytes buf #x4D #x89 #xEC)              ; mov r12, r13
+    ;; R14 = new from_start + space_size
+    ;; new from_start was old to_start, now at [0x10000040]
+    (emit-bytes buf #x48 #x8B #x04 #x25)         ; mov rax, [0x10000040]
+    (emit-u32 buf #x10000040)
+    (emit-bytes buf #x48 #x03 #x04 #x25)         ; add rax, [0x10000050]
+    (emit-u32 buf #x10000050)
+    (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
+
+    ;; ---- Increment GC count ----
+    (emit-bytes buf #x48 #xFF #x04 #x25)          ; inc qword [0x10000060]
+    (emit-u32 buf #x10000060)
+
+    ;; ---- Restore registers ----
+    (emit-jmp buf restore-label)
+
+    ;; ===========================================================
+    ;; SUBROUTINE: scan_word
+    ;; Input: RAX = address of the 8-byte word to scan
+    ;; Uses: RAX, RSI (temp), preserves RBX, RCX, R13
+    ;; If the word is a heap pointer into from-space, copy the object
+    ;; and update the word with the new pointer.
+    ;; ===========================================================
+    (emit-label buf scan-word-label)
+    (emit-push buf 'rax)                          ; save word address
+    (let ((sw-not-ptr (make-label))
+          (sw-done (make-label))
+          (sw-is-cons (make-label))
+          (sw-is-obj (make-label)))
+      ;; Load the actual value at [rax]
+      (emit-mov-reg-mem buf 'rsi 'rax 0)          ; rsi = [rax] = the value
+      ;; Check tag: low 4 bits
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax #x0F)           ; rax = tag
+      ;; Is it a cons (tag = 0x01)?
+      (emit-cmp-reg-imm buf 'rax 1)
+      (emit-jcc buf :e sw-is-cons)
+      ;; Is it an object (tag = 0x09)?
+      (emit-cmp-reg-imm buf 'rax 9)
+      (emit-jcc buf :e sw-is-obj)
+      ;; Not a pointer — skip
+      (emit-jmp buf sw-not-ptr)
+
+      ;; ---- Cons pointer ----
+      (emit-label buf sw-is-cons)
+      ;; Check if in from-space: from_start <= (rsi & ~0xF) < from_end
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax -16)            ; strip tag bits
+      (emit-cmp-reg-reg buf 'rax 'rbx)           ; < from_start?
+      (emit-jcc buf :b sw-not-ptr)
+      (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= from_end?
+      (emit-jcc buf :ae sw-not-ptr)
+      ;; In from-space. RSI = tagged cons ptr. Call copy_object.
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-call buf copy-label)
+      ;; RAX = new tagged pointer. Update the stack/heap word.
+      (emit-pop buf 'rsi)                         ; rsi = original word address
+      (emit-mov-mem-reg buf 'rsi 'rax 0)          ; [word_addr] = new ptr
+      (emit-push buf 'rsi)                        ; keep stack balanced for sw-done
+      (emit-jmp buf sw-done)
+
+      ;; ---- Object pointer ----
+      (emit-label buf sw-is-obj)
+      ;; Check if in from-space
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax -16)            ; strip tag bits
+      (emit-cmp-reg-reg buf 'rax 'rbx)           ; < from_start?
+      (emit-jcc buf :b sw-not-ptr)
+      (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= from_end?
+      (emit-jcc buf :ae sw-not-ptr)
+      ;; In from-space. Call copy_object.
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-call buf copy-label)
+      ;; Update the word
+      (emit-pop buf 'rsi)
+      (emit-mov-mem-reg buf 'rsi 'rax 0)
+      (emit-push buf 'rsi)
+      (emit-jmp buf sw-done)
+
+      ;; Not a pointer or not in from-space
+      (emit-label buf sw-not-ptr)
+      (emit-label buf sw-done)
+      (emit-pop buf 'rax)                         ; discard saved word address
+      (emit-ret buf))
+
+    ;; ===========================================================
+    ;; SUBROUTINE: copy_object
+    ;; Input: RAX = tagged pointer (cons or object) in from-space
+    ;; Output: RAX = new tagged pointer in to-space
+    ;; Side effect: R13 (free ptr) advanced, forwarding ptr left in from-space
+    ;; Preserves: RBX, RCX, RDI, R10, RBP
+    ;; Clobbers: RAX, RSI, RDX, R8
+    ;; ===========================================================
+    (emit-label buf copy-label)
+    (let ((copy-cons (make-label))
+          (copy-obj (make-label))
+          (copy-fwd (make-label))
+          (copy-done (make-label)))
+      ;; Determine type from tag
+      (emit-mov-reg-reg buf 'rdx 'rax)           ; rdx = tagged ptr
+      (emit-and-reg-imm buf 'rax #x0F)
+      (emit-cmp-reg-imm buf 'rax 1)
+      (emit-jcc buf :e copy-cons)
+      ;; Must be object (tag 9)
+      (emit-jmp buf copy-obj)
+
+      ;; ---- Copy cons ----
+      (emit-label buf copy-cons)
+      ;; RDX = tagged cons ptr. Raw addr = rdx & ~0xF (same as rdx-1 for aligned ptrs)
+      (emit-mov-reg-reg buf 'rsi 'rdx)
+      (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of cons
+      ;; Check if already forwarded: [rsi] has tag 0xF?
+      (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = car word
+      (emit-mov-reg-reg buf 'r8 'rax)
+      (emit-and-reg-imm buf 'r8 #x0F)
+      (emit-cmp-reg-imm buf 'r8 #x0F)
+      (emit-jcc buf :e copy-fwd)
+      ;; Not forwarded. Copy 16 bytes to free_ptr (R13)
+      ;; Copy car
+      (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = [rsi+0] = car
+      (emit-bytes buf #x49 #x89 #x45 #x00)       ; mov [r13+0], rax
+      ;; Copy cdr
+      (emit-mov-reg-mem buf 'rax 'rsi 8)          ; rax = [rsi+8] = cdr
+      (emit-bytes buf #x49 #x89 #x45 #x08)       ; mov [r13+8], rax
+      ;; New tagged pointer = r13 | 1 (cons tag)
+      (emit-bytes buf #x4C #x89 #xE8)            ; mov rax, r13
+      (emit-or-reg-imm buf 'rax 1)               ; rax = r13 | 1
+      ;; Leave forwarding pointer in from-space: [rsi] = r13 | 0xF
+      (emit-bytes buf #x4C #x89 #xEA)            ; mov rdx, r13
+      (emit-or-reg-imm buf 'rdx #x0F)            ; rdx = r13 | 0xF
+      (emit-mov-mem-reg buf 'rsi 'rdx 0)          ; [rsi] = forward ptr
+      ;; Advance free pointer
+      (emit-add-reg-imm buf 'r13 16)
+      (emit-jmp buf copy-done)
+
+      ;; ---- Already forwarded ----
+      (emit-label buf copy-fwd)
+      ;; RAX = forwarding word = new_addr | 0xF
+      ;; Extract new addr and apply original tag
+      (emit-and-reg-imm buf 'rax -16)            ; strip forward tag
+      ;; RDX still has original tagged ptr. Extract tag from it.
+      (emit-mov-reg-reg buf 'r8 'rdx)
+      (emit-and-reg-imm buf 'r8 #x0F)            ; r8 = original tag
+      (emit-or-reg-reg buf 'rax 'r8)             ; rax = new_addr | orig_tag
+      (emit-jmp buf copy-done)
+
+      ;; ---- Copy object ----
+      (emit-label buf copy-obj)
+      ;; RDX = tagged object ptr. Raw addr = rdx & ~0xF
+      (emit-mov-reg-reg buf 'rsi 'rdx)
+      (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw addr of object
+      ;; Check if already forwarded
+      (emit-mov-reg-mem buf 'rax 'rsi 0)          ; rax = header word
+      (emit-mov-reg-reg buf 'r8 'rax)
+      (emit-and-reg-imm buf 'r8 #x0F)
+      (emit-cmp-reg-imm buf 'r8 #x0F)
+      (emit-jcc buf :e copy-fwd)
+      ;; Not forwarded. Read element count from header.
+      ;; Header = [subtag:8][unused:7][element-count:49]
+      ;; Element count = header >> 8
+      (emit-mov-reg-reg buf 'r8 'rax)            ; r8 = header
+      (emit-shr-reg-imm buf 'r8 8)               ; r8 = element count
+      ;; Total size = (count + 2) * 8, aligned to 16
+      (emit-add-reg-imm buf 'r8 2)               ; count + 2
+      (emit-shl-reg-imm buf 'r8 3)               ; * 8
+      (emit-add-reg-imm buf 'r8 15)              ; + 15
+      (emit-and-reg-imm buf 'r8 -16)             ; & ~15 (align to 16)
+      ;; Copy R8 bytes from RSI to R13 using REP MOVSQ
+      ;; Save RDI and RCX (used by caller for stack scan / from_end)
+      (emit-push buf 'rdi)
+      (emit-push buf 'rcx)
+      ;; Save old R13 (start of dest) for new tagged pointer
+      (emit-push buf 'r13)
+      ;; Set up REP MOVSQ: RSI=source, RDI=dest, RCX=count
+      (emit-bytes buf #x4C #x89 #xEF)            ; mov rdi, r13 (dest)
+      (emit-mov-reg-reg buf 'rcx 'r8)
+      (emit-shr-reg-imm buf 'rcx 3)              ; count in qwords
+      ;; RSI = source (already set)
+      (emit-bytes buf #xF3 #x48 #xA5)            ; rep movsq
+      ;; R13 = RDI (new free pointer, after copied data)
+      (emit-bytes buf #x49 #x89 #xFD)            ; mov r13, rdi
+      ;; Restore old R13 into RAX for new tagged pointer
+      (emit-pop buf 'rax)                          ; rax = old r13 = dest start
+      (emit-or-reg-imm buf 'rax 9)               ; tag as object
+      ;; Restore RSI to point back to source for forwarding ptr
+      ;; RSI was advanced by REP MOVSQ, restore from RDX
+      (emit-mov-reg-reg buf 'rsi 'rdx)
+      (emit-and-reg-imm buf 'rsi -16)            ; rsi = raw source addr again
+      ;; Leave forwarding pointer: [rsi] = dest_start | 0xF
+      (emit-mov-reg-reg buf 'rdx 'rax)           ; rdx = new tagged ptr (addr | 9)
+      (emit-and-reg-imm buf 'rdx -16)            ; strip object tag
+      (emit-or-reg-imm buf 'rdx #x0F)            ; add forward tag
+      (emit-mov-mem-reg buf 'rsi 'rdx 0)          ; [old_addr] = forward ptr
+      ;; Restore caller's RCX and RDI
+      (emit-pop buf 'rcx)
+      (emit-pop buf 'rdi)
+      (emit-label buf copy-done)
+      ;; RAX = new tagged pointer
+      (emit-ret buf))
+
+    ;; ---- Restore label ----
+    (emit-label buf restore-label)
+    ;; RSP should equal RBP (saved after all pushes). Force it for safety.
+    (emit-mov-reg-reg buf 'rsp 'rbp)
+    (emit-pop buf 'rbp)
+    (emit-pop buf 'r13)
+    (emit-pop buf 'r11)
+    (emit-pop buf 'r10)
+    (emit-pop buf 'rdx)
+    (emit-pop buf 'rcx)
+    (emit-pop buf 'rbx)
+    (emit-pop buf 'r9)
+    (emit-pop buf 'r8)
+    (emit-pop buf 'rdi)
+    (emit-pop buf 'rsi)
+    (emit-pop buf 'rax)
+    (emit-ret buf)))
+
 (defun translate-mvm-to-x64 (bytecode function-table)
   "Translate MVM bytecode to x86-64 native code.
    BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.
@@ -2466,7 +2796,13 @@
          (fn-labels (make-array n-functions))
          (fn-map (make-hash-table :test 'equal))
          ;; Map bytecode-offset → native label for CALL resolution
-         (fn-offset-to-label (make-hash-table :test 'eql)))
+         (fn-offset-to-label (make-hash-table :test 'eql))
+         ;; GC trampoline label (pre-allocated so all translate-states can use it)
+         (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
+         ;; Find %GC-COLLECT function in the table (if present)
+         (gc-collect-entry (when *x64-gc-enabled*
+                             (find "%GC-COLLECT" function-table
+                                   :key #'first :test #'string-equal))))
     ;; Allocate a label for each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -2476,51 +2812,61 @@
                (setf (aref fn-labels i) label)
                (setf (gethash name fn-map) label)
                (setf (gethash offset fn-offset-to-label) label)))
-    ;; Translate each function
-    (loop for i from 0 below n-functions
-          for entry in function-table
-          for name = (first entry)
-          for offset = (second entry)
-          for length = (third entry)
-          do
-             (let* ((fn-label (aref fn-labels i))
-                    (state (make-translate-state
-                            :buf buf
-                            :mvm-bytes bytecode
-                            :mvm-length length
-                            :mvm-offset offset
-                            :function-table fn-offset-to-label)))
-               ;; Emit function label
-               (emit-label buf fn-label)
-               ;; Emit prologue
-               (emit-function-prologue buf)
-               ;; If length=0 (orphaned stub with no bytecode), emit an immediate
-               ;; epilogue+ret so we don't fall through into the next function.
-               (when (zerop length)
-                 (emit-function-epilogue buf))
-               ;; Pre-scan branch targets
-               (scan-branch-targets state)
-               ;; Translate instructions
-               (let ((pos offset)
-                     (limit (+ offset length)))
-                 (loop while (< pos limit)
-                       do (progn
-                            ;; Emit label if branch target
-                            (let ((label (gethash pos
-                                                  (translate-state-position-labels state))))
-                              (when label
-                                (emit-label buf label)))
-                            ;; Decode and translate
-                            (let* ((decoded (decode-instruction bytecode pos))
-                                   (opcode (car decoded))
-                                   (operands (cadr decoded))
-                                   (new-pos (cddr decoded)))
-                              (handler-case
-                                  (translate-instruction state opcode operands new-pos)
-                                (error (c)
-                                  (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
-                                         c i name pos opcode operands)))
-                              (setf pos new-pos)))))))
+    ;; Find the label for %gc-collect
+    (let ((gc-collect-label (when gc-collect-entry
+                              (gethash (second gc-collect-entry)
+                                       fn-offset-to-label))))
+      ;; Translate each function
+      (loop for i from 0 below n-functions
+            for entry in function-table
+            for name = (first entry)
+            for offset = (second entry)
+            for length = (third entry)
+            do
+               (let* ((fn-label (aref fn-labels i))
+                      (state (make-translate-state
+                              :buf buf
+                              :mvm-bytes bytecode
+                              :mvm-length length
+                              :mvm-offset offset
+                              :function-table fn-offset-to-label
+                              :gc-label gc-trampoline-label)))
+                 ;; Emit function label
+                 (emit-label buf fn-label)
+                 ;; Emit prologue
+                 (emit-function-prologue buf)
+                 ;; If length=0 (orphaned stub with no bytecode), emit an immediate
+                 ;; epilogue+ret so we don't fall through into the next function.
+                 (when (zerop length)
+                   (emit-function-epilogue buf))
+                 ;; Pre-scan branch targets
+                 (scan-branch-targets state)
+                 ;; Translate instructions
+                 (let ((pos offset)
+                       (limit (+ offset length)))
+                   (loop while (< pos limit)
+                         do (progn
+                              ;; Emit label if branch target
+                              (let ((label (gethash pos
+                                                    (translate-state-position-labels state))))
+                                (when label
+                                  (emit-label buf label)))
+                              ;; Decode and translate
+                              (let* ((decoded (decode-instruction bytecode pos))
+                                     (opcode (car decoded))
+                                     (operands (cadr decoded))
+                                     (new-pos (cddr decoded)))
+                                (handler-case
+                                    (translate-instruction state opcode operands new-pos)
+                                  (error (c)
+                                    (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
+                                           c i name pos opcode operands)))
+                                (setf pos new-pos)))))))
+
+      ;; Emit GC trampoline (after all functions, before fixup)
+      (when (and gc-trampoline-label gc-collect-label)
+        (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
+        (format t "  GC trampoline emitted, %GC-COLLECT wired~%")))
 
     ;; Resolve all label fixups
     (fixup-labels buf)

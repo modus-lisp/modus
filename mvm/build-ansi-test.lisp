@@ -31,6 +31,7 @@
   (read-file-text (merge-pathnames relative-path *modus-base*)))
 
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
+(defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
 (defvar *rt-source*      (mvm-text "mvm/rt.lisp"))
 (defvar *bridge-source*
   (concatenate 'string
@@ -2235,6 +2236,9 @@
     ;; 1. Prelude (list utils, equal, print-dec, hash tables, etc.)
     *prelude-source*
     (string #\Newline)
+    ;; 1b. GC (Cheney copying collector)
+    *gc-source*
+    (string #\Newline)
     ;; 2. RT harness (deftest, do-tests)
     *rt-source*
     (string #\Newline)
@@ -2294,9 +2298,12 @@
         :load-addr +linux-x64-load-addr+
         :elf-format :linux-x64))
 
-;; Install x64 translator in Linux mode
+;; Install x64 translator in Linux mode with GC enabled
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)
+(setf modus.mvm.x64::*x64-gc-enabled* t)
+;; Set R14 to midpoint so GC fires at half heap
+(setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
 
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 

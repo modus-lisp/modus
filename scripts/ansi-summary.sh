@@ -22,30 +22,27 @@ trap 'rm -f "$OUT"' EXIT
 status=$?
 
 awk '
-  match($0, /ANSI-TOTAL=[0-9]+/)       { tot = substr($0, RSTART+11, RLENGTH-11)+0 }
-  match($0, /P:[0-9]+\/[0-9]+\/[0-9]+\/[0-9]+/) { pdone++ }
-  /^FAIL/                              { fails++ }
+  match($0, /ANSI-TOTAL=[0-9]+/) { tot = substr($0, RSTART+11, RLENGTH-11)+0 }
+  /^FAIL/                        { fails++ }
   {
-    # Count "+" bytes anywhere in the line — rt-run-test writes one per pass,
-    # with no newline, so they may be packed onto lines with other content.
+    # Each passing test writes a single "+" byte to stdout with no newline.
     n = gsub(/\+/, "+")
     pass += n
   }
   END {
     ran = pass + fails
     lost = tot - ran
-    printf "ANSI summary\n"
-    printf "  expected:               %d\n", tot
-    printf "  forks finished cleanly: %d\n", pdone
-    printf "  ran:                    %d\n", ran
-    printf "  passed:                 %d  (includes a few non-ANSI rt-run-test calls)\n", pass
-    printf "  failed:                 %d\n", fails
-    printf "  lost (fork crash):      %d\n", lost
+    printf "ANSI summary (per-test fork isolation)\n"
+    printf "  expected:           %d\n", tot
+    printf "  ran:                %d\n", ran
+    printf "  passed:             %d  (includes a few non-ANSI rt-run-test calls)\n", pass
+    printf "  failed:             %d\n", fails
+    printf "  lost to test crash: %d  (test process died mid-body)\n", lost
     if (ran > 0) {
-      printf "  pass rate of run tests: %.2f%%  (%d / %d)\n", 100.0*pass/ran, pass, ran
+      printf "  pass rate of run:   %.2f%%  (%d / %d)\n", 100.0*pass/ran, pass, ran
     }
     if (tot > 0) {
-      printf "  pass rate of expected:  %.2f%%  (%d / %d)\n", 100.0*pass/tot, pass, tot
+      printf "  pass rate overall:  %.2f%%  (%d / %d)\n", 100.0*pass/tot, pass, tot
     }
   }
 ' "$OUT"

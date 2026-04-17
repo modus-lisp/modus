@@ -1685,13 +1685,13 @@
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
-                                            ;; Wrap in handler-case so a SIGSEGV/etc
-                                            ;; in the test body longjmps to here and
-                                            ;; we report :CRASHED instead of dying.
-                                            (format nil "(rt-run-test ~D (handler-case ~S (t (c) :CRASHED)) '~S)"
+                                            ;; Wrap fork-test in a parent-side handler-case so
+                                            ;; a bad lambda-compile doesn't kill the parent
+                                            ;; (which would stop all remaining tests).
+                                            (format nil "(handler-case (fork-test ~D (lambda () ~S) '~S) (t (c) nil))"
                                                     test-id test-form (car expected)))
                                            ((> (length expected) 0)
-                                            (format nil "(rt-run-test-mv ~D (handler-case (multiple-value-list ~S) (t (c) (list :CRASHED))) '~S)"
+                                            (format nil "(handler-case (fork-test-mv ~D (lambda () (multiple-value-list ~S)) '~S) (t (c) nil))"
                                                     test-id test-form expected)))
                                          (error () nil))))
                          ;; For real.lsp: fix / and - inside backquote commas
@@ -1753,14 +1753,14 @@
                              (write-string s out)
                              (terpri out))))))))
               (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-              ;; Wrap the entire body in handler-case so init-form crashes
-              ;; (defstruct, defclass, %add-method, etc.) don't kill the fork.
-              (format out "  (handler-case (progn~%")
-              ;; Emit init calls first (%defclass, %add-slot-unbound-method, etc.)
-              (dolist (s (nreverse init-forms)) (format out "    ~A~%" s))
-              ;; Then test forms
-              (dolist (tf (nreverse test-forms)) (format out "    ~A~%" tf))
-              (format out "  ) (t (c) nil)))~%")
+              ;; Init forms run in PARENT (their side effects need to persist
+              ;; for subsequent tests that depend on them, e.g. defclass).
+              ;; Each is wrapped individually so one crash doesn't skip others.
+              (dolist (s (nreverse init-forms))
+                (format out "  (handler-case ~A (t (c) nil))~%" s))
+              ;; Test forms — each is a (fork-test ...) that isolates itself.
+              (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
+              (format out ")~%")
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
                                  (get-output-stream-string out)))))))
@@ -2090,45 +2090,37 @@
 
 ;; Generate run-real-ansi-tests that calls all file-level runners
 (setf *ansi-file-names* (nreverse *ansi-file-names*))
-;; fork-run: isolate chunks in child processes; child exits with fail count
-(let ((chunk-size 20)
-      (names *ansi-file-names*))
-  (setf *real-ansi-sources*
-        (concatenate 'string *real-ansi-sources*
-                     (format nil "~%(defvar *chunk-num* 0)~
-                       ~%(defun fork-run (thunk)~
-                       ~%  (setq *chunk-num* (+ *chunk-num* 1))~
-                       ~%  (let ((pid (syscall3 57 0 0 0)))~
-                       ~%    (if (= pid 0)~
-                       ~%        (progn~
-                       ~%          (syscall3 37 30 0 0)~
-                       ~%          (setq *rt-test-count* 0)~
-                       ~%          (setq *rt-pass-count* 0)~
-                       ~%          (setq *rt-fail-count* 0)~
-                       ~%          (funcall thunk)~
-                       ~%          ;; P:chunk/passes/fails/total — only on clean exit;~
-                       ~%          ;; crashed forks omit it so the summary can see lost tests.~
-                       ~%          (write-string-serial \"P:\")~
-                       ~%          (print-dec *chunk-num*)~
-                       ~%          (write-char-serial 47)~
-                       ~%          (print-dec *rt-pass-count*)~
-                       ~%          (write-char-serial 47)~
-                       ~%          (print-dec *rt-fail-count*)~
-                       ~%          (write-char-serial 47)~
-                       ~%          (print-dec *rt-test-count*)~
-                       ~%          (write-char-serial 10)~
-                       ~%          (syscall3 60 *rt-fail-count* 0 0))~
-                       ~%        (syscall3 61 pid 0 0))))~%")
-                     (with-output-to-string (s)
-                       (format s "~%(defun run-real-ansi-tests ()~%")
-                       (loop while names do
-                         (let ((chunk (loop repeat chunk-size while names
-                                           collect (pop names))))
-                           (format s "  (fork-run (lambda ()~%")
-                           (dolist (name chunk)
-                             (format s "    (run-ansi-~A)~%" name))
-                           (format s "  ))~%")))
-                       (format s ")~%")))))
+;; Per-test forking: every rt-run-test becomes (fork-test id thunk expected).
+;; Parent forks, child evaluates the test thunk and runs rt-run-test, then
+;; exits. Parent waits on each child. A crashing test takes out only itself.
+;;
+;; We have the hardware for it: 128 cores and 1TB RAM — 17K forks is fine.
+(setf *real-ansi-sources*
+      (concatenate 'string *real-ansi-sources*
+                   (format nil "~%(defun fork-test (id thunk expected)~
+                     ~%  (let ((pid (syscall3 57 0 0 0)))~
+                     ~%    (if (= pid 0)~
+                     ~%        (progn~
+                     ~%          (syscall3 37 10 0 0)~
+                     ~%          (rt-run-test id (funcall thunk) expected)~
+                     ~%          (syscall3 60 0 0 0))~
+                     ~%        (syscall3 61 pid 0 0))))~
+                     ~%(defun fork-test-mv (id thunk expecteds)~
+                     ~%  (let ((pid (syscall3 57 0 0 0)))~
+                     ~%    (if (= pid 0)~
+                     ~%        (progn~
+                     ~%          (syscall3 37 10 0 0)~
+                     ~%          (rt-run-test-mv id (funcall thunk) expecteds)~
+                     ~%          (syscall3 60 0 0 0))~
+                     ~%        (syscall3 61 pid 0 0))))~%")
+                   (with-output-to-string (s)
+                     (format s "~%(defun run-real-ansi-tests ()~%")
+                     (dolist (name *ansi-file-names*)
+                       ;; Wrap each file's runner in handler-case: a crash in
+                       ;; one file's init forms or bad test compile shouldn't
+                       ;; stop the rest of the suite from processing.
+                       (format s "  (handler-case (run-ansi-~A) (t (c) nil))~%" name))
+                     (format s ")~%"))))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  rt: ~D chars~%" (length *rt-source*))

@@ -32,15 +32,20 @@ awk '
     pass += n
   }
   END {
-    lost = tot - pass - fails
+    ran = pass + fails
+    lost = tot - ran
     printf "ANSI summary\n"
-    printf "  expected:        %d\n", tot
-    printf "  forks finished:  %d\n", pdone
-    printf "  passed:          %d  (includes any non-ANSI rt-run-test calls)\n", pass
-    printf "  failed:          %d\n", fails
-    printf "  lost to crash:   %d  (forks that died mid-thunk)\n", lost
+    printf "  expected:               %d\n", tot
+    printf "  forks finished cleanly: %d\n", pdone
+    printf "  ran:                    %d\n", ran
+    printf "  passed:                 %d  (includes a few non-ANSI rt-run-test calls)\n", pass
+    printf "  failed:                 %d\n", fails
+    printf "  lost (fork crash):      %d\n", lost
+    if (ran > 0) {
+      printf "  pass rate of run tests: %.2f%%  (%d / %d)\n", 100.0*pass/ran, pass, ran
+    }
     if (tot > 0) {
-      printf "  pass rate:       %.4f%%  (%d / %d)\n", 100.0*pass/tot, pass, tot
+      printf "  pass rate of expected:  %.2f%%  (%d / %d)\n", 100.0*pass/tot, pass, tot
     }
   }
 ' "$OUT"

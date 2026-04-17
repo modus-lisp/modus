@@ -94,10 +94,24 @@ runtime/        Runtime type system
 
 ## ANSI CL Conformance
 
-**17,568 tests, 17,568 passing (100%).**
+**Real numbers (single run, current state):**
+- Expected: ~17,700 tests
+- Ran: ~112 (rest lost to fork crashes — see below)
+- Passed: ~100 (89.3% of those that ran)
+- Failed: 12 (visible FAIL lines)
+- Lost: ~17,596 (fork crashed before reaching the test)
+
+The historical "17,567/17,568" figure was inflated. Per-chunk forks die
+silently mid-thunk on unimplemented forms (handler-case quirks, complex
+setf-in-let with INCF, EXPAND-IN-CURRENT-ENV, define-method-combination,
+etc.), and the summary only saw tests that finished AND passed/failed
+cleanly. Every test after a fork's first crash was simply lost.
+
+The harness now writes one "+" byte per pass to stdout immediately (no
+buffering, survives the fork dying later); the summary counts those bytes.
 
 Build: `sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp`
-Run: `/tmp/modus-ansi-test`
+Run with summary: `./scripts/ansi-summary.sh` (runs binary, prints honest pass/fail/lost counts)
 
 ### CL Implementation Status
 
@@ -106,14 +120,18 @@ Packages          ✓  make-package, intern, find-symbol, defpackage, 24 functio
 Streams           ✓  9 stream types, read/write-char, string/file/broadcast/echo
 Reader            ✓  full read, readtable, #-dispatch, backquote, package qualifiers
 Printer           ✓  write with *print-* vars, 50+ format directives
-Conditions        ✓  24 types, handler-case/bind, restart-case, signal/warn/cerror
-CLOS              ✓  defclass, defgeneric, defmethod, standard method combination
+Conditions        ~  24 types, handler-case/bind, restart-case, signal/warn/cerror
+                     (handler-case has gaps — many ANSI tests crash forks)
+CLOS              ~  defclass, defgeneric, defmethod, standard method combination
                      :before/:after/:around, call-next-method, class precedence lists
+                     (define-method-combination tests fail)
 File I/O          ✓  Linux syscalls, file streams, open/close, pathnames
 Eval/Compile/Load ✓  Tree-walking interpreter, load from file, macroexpand
 Closures          ✓  Mutable closures via heap-allocated cells
 unwind-protect    ✓  setjmp/longjmp, cleanup on both normal and error paths
 GC                ✓  Cheney semi-space copying collector
+Setf              ~  defsetf/define-setf-expander/get-setf-expansion/define-modify-macro
+                     register, but compile-time only (no runtime defsetf in eval)
 ~400+ CL functions implemented
 ```
 

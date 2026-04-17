@@ -148,6 +148,12 @@
 (defun rt-run-test (name actual expected)
   "Run a single RT-style test. NAME is a symbol, ACTUAL is the form result,
    EXPECTED is the expected value. Compares using rt-equal."
+  ;; "T:N\n" — last successful T: + 1 = test that crashed the fork.
+  ;; Printed after args eval, so it tells us "the previous test's args
+  ;; finished computing and we entered rt-run-test for THIS test."
+  (write-char-serial 84) (write-char-serial 58)
+  (print-dec name)
+  (write-char-serial 10)
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (rt-equal actual expected)
       (progn
@@ -175,6 +181,9 @@
 
 (defun rt-run-test-mv (name actuals expecteds)
   "Run a multi-value RT test. ACTUALS and EXPECTEDS are lists."
+  (write-char-serial 84) (write-char-serial 58)
+  (print-dec name)
+  (write-char-serial 10)
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (rt-equal actuals expecteds)
       (progn

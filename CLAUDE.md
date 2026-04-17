@@ -96,19 +96,25 @@ runtime/        Runtime type system
 
 **Real numbers (single run, current state):**
 - Expected: ~17,700 tests
-- Ran: ~112 (rest lost to fork crashes — see below)
-- Passed: ~100 (89.3% of those that ran)
-- Failed: 12 (visible FAIL lines)
-- Lost: ~17,596 (fork crashed before reaching the test)
+- Ran: ~660
+- Passed: ~353 (53% of those that ran)
+- Failed: ~307
+- Lost: ~17,048 (fork crashed in a way the SIGSEGV handler couldn't recover)
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
-silently mid-thunk on unimplemented forms (handler-case quirks, complex
-setf-in-let with INCF, EXPAND-IN-CURRENT-ENV, define-method-combination,
-etc.), and the summary only saw tests that finished AND passed/failed
-cleanly. Every test after a fork's first crash was simply lost.
+silently mid-thunk on unimplemented forms — and the summary only saw
+tests that finished AND passed/failed cleanly. Every test after a fork's
+first crash was simply lost.
 
-The harness now writes one "+" byte per pass to stdout immediately (no
-buffering, survives the fork dying later); the summary counts those bytes.
+Now the harness:
+- Installs a SIGSEGV/SIGBUS/SIGFPE/SIGILL handler at boot. Faults longjmp
+  to the nearest handler-case instead of killing the fork.
+- Wraps every `rt-run-test` in `(handler-case ... (t (c) :CRASHED))` so a
+  fault during a test eval reports `:CRASHED` rather than dying.
+- Wraps each `run-ansi-FOO` body in an outer `(handler-case (progn ...) (t (c) nil))`
+  so init-form crashes don't kill the chunk.
+- Writes one "+" byte per pass to stdout immediately (no buffering,
+  survives any later crash); the summary counts those bytes.
 
 Build: `sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp`
 Run with summary: `./scripts/ansi-summary.sh` (runs binary, prints honest pass/fail/lost counts)

@@ -5418,13 +5418,19 @@
            (fn-info (gethash resolved-fn-name *functions*)))
       (when fn-info
         (let ((req (function-info-required-count fn-info))
+              (param-count (function-info-param-count fn-info))
+              (has-rest (function-info-rest-param-p fn-info))
               (nargs (length args)))
           (cond
             ;; Too few required args: arity error.
             ((and req (> req 0) (< nargs req))
              (compile-arity-error env dest)
              (return-from compile-call))
-            ((function-info-rest-param-p fn-info)
+            ;; Too-many-args check was attempted but caused universal
+            ;; crashes — some functions have param-count set too low
+            ;; for their actual accepted arity. Leaving it out until
+            ;; param-count accuracy can be verified.
+            (has-rest
              (when (>= nargs req)
                (let ((required-args (subseq args 0 req))
                      (rest-args (nthcdr req args)))
@@ -5435,9 +5441,8 @@
                    (setf args (append required-args (list rest-form)))))))
             (t
              ;; Pad with NIL for missing &optional parameters
-             (let ((param-count (function-info-param-count fn-info)))
-               (when (< nargs param-count)
-                 (setf args (append args (make-list (- param-count nargs))))))))))))
+             (when (and param-count (< nargs param-count))
+               (setf args (append args (make-list (- param-count nargs)))))))))))
   (let ((nargs (length args))
         ;; Save the current temp count BEFORE arg evaluation.
         ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).

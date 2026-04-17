@@ -1568,6 +1568,10 @@
 (defvar *real-ansi-sources* "")
 (defvar *ansi-test-counter* 10000)
 (defvar *ansi-file-names* nil)
+;; Per-file test ID ranges, list of (name first-id last-id).
+;; Used to skip files whose range doesn't overlap the active shard range,
+;; so init-forms in unrelated files don't run (many crash the parent).
+(defvar *ansi-file-ranges* nil)
 
 (defun load-ansi-chapter (dir files)
   "Transform ANSI test files from DIR into MVM-compatible source.
@@ -1584,6 +1588,10 @@
                         (when (eq form :eof) (return))
                         (push form forms)))))
             (push (pathname-name file) *ansi-file-names*)
+            ;; Snapshot the test-id counter on entry so we can record the
+            ;; file's [first .. last] test-id range after processing.
+            (let ((file-first-id (1+ *ansi-test-counter*)))
+              (push (list (pathname-name file) file-first-id nil) *ansi-file-ranges*))
             (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
             (setf forms (mapcar #'rewrite-make-array-dims forms))
             (setf forms (mapcar #'rewrite-eval-quote forms))
@@ -1689,7 +1697,13 @@
                                                     test-id test-form (car expected)))
                                            ((> (length expected) 0)
                                             (format nil "(fork-test-mv ~D (lambda () (multiple-value-list ~S)) '~S)"
-                                                    test-id test-form expected)))
+                                                    test-id test-form expected))
+                                           ;; (deftest NAME FORM) with no explicit
+                                           ;; expected — test expects zero values.
+                                           ;; Render as fork-test-mv with '() expected.
+                                           (t
+                                            (format nil "(fork-test-mv ~D (lambda () (multiple-value-list ~S)) 'NIL)"
+                                                    test-id test-form)))
                                          (error () nil))))
                          ;; For real.lsp: fix / and - inside backquote commas
                          ;; (tree rewriter can't reach inside SBCL comma objects)
@@ -1710,8 +1724,18 @@
                              (setf test-str (str-replace-all ",(GENERIC-NEGATE (/ " ",(GENERIC-NEGATE (EXACT-DIVIDE " test-str))
                              (when (member name '(real.3 real.4) :test #'string=)
                                (format *error-output* "~%POST-REPLACE ~A:~%~A~%~%" name test-str))))
+                         ;; Filter: unreadable-object printouts can't round-trip.
+                         ;; Match SBCL's `#<CLASS-NAME ...>` pattern specifically
+                         ;; — `(search "#<" ...)` was too broad, rejecting any test
+                         ;; whose source contains the 2-char string "#<" (e.g.
+                         ;; print.array.2.28 checks whether output starts with "#<").
                          (when (and test-str
-                                    (not (search "#<" test-str))
+                                    (not (search "#<FUNCTION" test-str))
+                                    (not (search "#<CLASS" test-str))
+                                    (not (search "#<SB-" test-str))
+                                    (not (search "#<STANDARD" test-str))
+                                    (not (search "#<STRUCTURE" test-str))
+                                    (not (search "#<CLOSURE" test-str))
                                     (not (search "&ENVIRONMENT" test-str))
                                     (not (search "STRUCT-TEST-" test-str)))
                            (push test-str test-forms))))))
@@ -1755,12 +1779,27 @@
               ;; Each is wrapped individually so one crash doesn't skip others.
               (dolist (s (nreverse init-forms))
                 (format out "  (handler-case ~A (t (c) nil))~%" s))
-              ;; Test forms — each is a (fork-test ...) that isolates itself.
-              (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
+              ;; Test forms — wrap EACH fork-test call in its own handler-case
+              ;; so a crash during parent-side arg-evaluation (vector literal,
+              ;; closure creation, etc.) of test N doesn't kill test N+1.
+              ;; On catch, call (%test-crash-fail <id>) which emits
+              ;; \"\\nFAIL <id>\\n\" so the sharded summary accounts for it.
+              ;; Using a helper function keeps the per-call code tiny.
+              (dolist (tf (nreverse test-forms))
+                (let* ((form-str tf)
+                       (id-start (position #\Space form-str))
+                       (id-end (position #\Space form-str :start (1+ id-start)))
+                       (id-num (parse-integer form-str :start (1+ id-start) :end id-end :junk-allowed t)))
+                  (if id-num
+                      (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%" form-str id-num)
+                      (format out "  (handler-case ~A (t (c) nil))~%" form-str))))
               (format out ")~%")
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
-                                 (get-output-stream-string out)))))))
+                                 (get-output-stream-string out)))
+              ;; Record the last test-id used in this file (may be nil if none).
+              (let ((entry (car *ansi-file-ranges*)))
+                (setf (third entry) *ansi-test-counter*))))))
       (error (e)
         (format t "    SKIP ~A: ~A~%" file e)))))
 
@@ -2096,33 +2135,102 @@
       (concatenate 'string *real-ansi-sources*
                    (format nil "~%(defvar *skip-below* 0)~
                      ~%(defvar *run-only-below* 0)~
+                     ~%;; Child crash handler: print \"FAIL <id>\\n\" and return nil.~
+                     ~%;; Kept tiny — only fixed serial writes, no allocation.~
+                     ~%(defun %fork-child-fail (id)~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-char-serial 70) (write-char-serial 65)~
+                     ~%  (write-char-serial 73) (write-char-serial 76)~
+                     ~%  (write-char-serial 32)~
+                     ~%  (print-dec id)~
+                     ~%  (write-char-serial 10)~
+                     ~%  (syscall3 60 0 0 0)     ;; hard-exit from child directly~
+                     ~%  nil)~
+                     ~%;; Parent-side crash handler: called when parent fails during~
+                     ~%;; arg-evaluation of a fork-test (e.g. bad literal). Records a~
+                     ~%;; clean FAIL line so the test doesn't appear lost-to-crash.~
+                     ~%(defun %test-crash-fail (id)~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-char-serial 70) (write-char-serial 65)~
+                     ~%  (write-char-serial 73) (write-char-serial 76)~
+                     ~%  (write-char-serial 32)~
+                     ~%  (print-dec id)~
+                     ~%  (write-char-serial 10)~
+                     ~%  nil)~
+                     ~%;; Child MUST establish its own handler-case. If a SIGSEGV~
+                     ~%;; happens without one, the signal stub longjmps to whatever~
+                     ~%;; saved RSP is at [0x10000140] — inherited from the parent's~
+                     ~%;; run-ansi-X handler-case. The child would then resume in~
+                     ~%;; the parent's test loop and fork-bomb the rest of the suite.~
+                     ~%;; Child MUST zero the handler-case saved-RSP inherited from~
+                     ~%;; the parent's run-ansi-FILE wrapper. Otherwise any SIGSEGV~
+                     ~%;; BEFORE the child's own handler-case setjmp runs would~
+                     ~%;; longjmp the child back into parent-space code, silently~
+                     ~%;; skipping rt-run-test and losing the test count.~
+                     ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~
+                     ~%;; Lets the parent detect when the child died uncaught (child's~
+                     ~%;; own handler-case couldn't recover; nested SIGSEGV, etc.).~
+                     ~%(defvar *wstatus-addr* #x100001A0)~
                      ~%(defun fork-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from fork-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from fork-test nil))~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
                      ~%        (progn~
+                     ~%          (setf (mem-ref #x10000180 :u64) 0)~
                      ~%          (syscall3 37 10 0 0)~
-                     ~%          (rt-run-test id (funcall thunk) expected)~
+                     ~%          (handler-case (rt-run-test id (funcall thunk) expected)~
+                     ~%            (t (c) (%fork-child-fail id)))~
                      ~%          (syscall3 60 0 0 0))~
-                     ~%        (syscall3 61 pid 0 0))))~
+                     ~%        (progn~
+                     ~%          (setf (mem-ref *wstatus-addr* :u32) 0)~
+                     ~%          (syscall3 61 pid *wstatus-addr* 0)~
+                     ~%          ;; wstatus != 0 → child didn't exit(0). Either killed by~
+                     ~%          ;; a signal or exited with nonzero code (e.g. 139 from our~
+                     ~%          ;; SIGSEGV handler's sys_exit path). Child never emitted~
+                     ~%          ;; P:/FAIL for this id — record a FAIL from the parent.~
+                     ~%          (when (> (mem-ref *wstatus-addr* :u32) 0)~
+                     ~%            (%test-crash-fail id))))))~
                      ~%(defun fork-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from fork-test-mv nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from fork-test-mv nil))~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
                      ~%        (progn~
+                     ~%          (setf (mem-ref #x10000180 :u64) 0)~
                      ~%          (syscall3 37 10 0 0)~
-                     ~%          (rt-run-test-mv id (funcall thunk) expecteds)~
+                     ~%          (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
+                     ~%            (t (c) (%fork-child-fail id)))~
                      ~%          (syscall3 60 0 0 0))~
-                     ~%        (syscall3 61 pid 0 0))))~%")
+                     ~%        (progn~
+                     ~%          (setf (mem-ref *wstatus-addr* :u32) 0)~
+                     ~%          (syscall3 61 pid *wstatus-addr* 0)~
+                     ~%          (when (> (mem-ref *wstatus-addr* :u32) 0)~
+                     ~%            (%test-crash-fail id))))))~%")
                    (with-output-to-string (s)
+                     ;; Helper: return T iff the active shard range [skip..run-only)
+                     ;; overlaps [first..last]. Run-only=0 means "no upper bound".
+                     ;; Simpler expression than the inline (or (and...) (and...))
+                     ;; chain — easier for the MVM compiler and debugger.
+                     (format s "~%(defun %ansi-file-in-range (first last)~%")
+                     (format s "  (if (> *run-only-below* 0)~%")
+                     (format s "      (if (< last *skip-below*) nil (if (>= first *run-only-below*) nil t))~%")
+                     (format s "      t))~%")
                      (format s "~%(defun run-real-ansi-tests ()~%")
-                     (dolist (name *ansi-file-names*)
-                       ;; Wrap each file's runner in handler-case: a crash in
-                       ;; one file's init forms or bad test compile shouldn't
-                       ;; stop the rest of the suite from processing.
-                       (format s "  (handler-case (run-ansi-~A) (t (c) nil))~%" name))
+                     ;; Each file is guarded by an ID-range overlap check.
+                     (let ((by-name nil))
+                       (dolist (entry *ansi-file-ranges*)
+                         (push entry by-name))
+                       (dolist (name *ansi-file-names*)
+                         (let* ((entry (find name by-name :test #'string= :key #'car))
+                                (first-id (if entry (second entry) nil))
+                                (last-id  (if entry (third  entry) nil)))
+                           (cond
+                             ((and first-id last-id)
+                              (format s "  (when (%ansi-file-in-range ~D ~D)~%" first-id last-id)
+                              (format s "    (handler-case (run-ansi-~A) (t (c) nil)))~%" name))
+                             (t
+                              (format s "  (handler-case (run-ansi-~A) (t (c) nil))~%" name))))))
                      (format s ")~%"))))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
@@ -2131,6 +2239,11 @@
 (format t "  tests: ~D chars~%" (length *test-source*))
 (format t "  ansi-aux: ~D chars~%" (length *ansi-aux-sources*))
 (format t "  real-ansi: ~D chars~%" (length *real-ansi-sources*))
+
+;; Dump generated sources for debugging
+(with-open-file (s "/tmp/real-ansi-gen.lisp" :direction :output :if-exists :supersede)
+  (write-string *real-ansi-sources* s))
+(format t "  dumped: /tmp/real-ansi-gen.lisp~%")
 
 ;;; ============================================================
 ;;; 3. Strip in-package forms from source text
@@ -2169,12 +2282,22 @@
   (let ((c code))
     (syscall3 60 c 0 0)))
 
-(defun %parse-decimal-at (addr)
-  ;; Parse C-string at ADDR as decimal integer. Stops at non-digit.
-  ;; Returns 0 on empty / non-numeric.
+;; Parse a null-terminated ASCII decimal at a fixed address as an integer.
+;; Two variants for the two argv buffers: the compiler treats #x10000208
+;; as a tagged-fixnum literal, so (mem-ref #x10000208 :u8) reads from that
+;; address correctly (mem-ref untags the address operand).
+(defun %parse-decimal-at-fixed-208 ()
   (let ((n 0) (i 0))
     (loop
-      (let ((b (mem-ref (+ addr i) :u8)))
+      (let ((b (mem-ref (+ #x10000208 i) :u8)))
+        (when (or (< b 48) (> b 57)) (return n))
+        (setq n (+ (* n 10) (- b 48)))
+        (setq i (+ i 1))))))
+
+(defun %parse-decimal-at-fixed-248 ()
+  (let ((n 0) (i 0))
+    (loop
+      (let ((b (mem-ref (+ #x10000248 i) :u8)))
         (when (or (< b 48) (> b 57)) (return n))
         (setq n (+ (* n 10) (- b 48)))
         (setq i (+ i 1))))))
@@ -2232,6 +2355,20 @@
   (setq *rt-fail-count* 0)
   (setq *skip-below* 0)
   (setq *run-only-below* 0)
+  (setq *write-object-budget* 0)
+  (setq *wstatus-addr* #x100001A0)
+
+  ;; Parse argv from BSS (boot stub writes argc/argv there).
+  ;;   argv[1] → *skip-below*       (skip tests with id < N)
+  ;;   argv[2] → *run-only-below*   (skip tests with id >= M)
+  ;; This lets external shards run non-overlapping ranges in parallel.
+  ;; argc is a u32 at 0x10000200 (mem-ref :u32 auto-tags for us). argv[1]
+  ;; and argv[2] are null-terminated strings already copied to fixed BSS
+  ;; addresses by the boot stub — we parse decimals directly from there.
+  (when (> (mem-ref #x10000200 :u32) 1)
+    (setq *skip-below* (%parse-decimal-at-fixed-208)))
+  (when (> (mem-ref #x10000200 :u32) 2)
+    (setq *run-only-below* (%parse-decimal-at-fixed-248)))
 
   ;; Run custom tests
   (run-all-tests)

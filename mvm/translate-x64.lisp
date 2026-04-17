@@ -528,9 +528,16 @@
               ;; On longjmp, execution resumes here with RAX = T (#xDEAD1009).
               ;;
               ;; Fixed addresses (in Linux heap reserved area):
-              ;;   0x10000140: saved RSP
-              ;;   0x10000148: saved RBP
-              ;;   0x10000150: saved return address (IP after this sequence)
+              ;;   0x10000180: saved RSP
+              ;;   0x10000188: saved RBP
+              ;;   0x10000190: saved return address (IP after this sequence)
+              ;;
+              ;; CRITICAL: must NOT overlap +closure-env-addr+ (0x10000140) —
+              ;; every closure call writes env there, so sharing the address
+              ;; with saved-RSP silently nuked handler-case state whenever the
+              ;; body made a closure call. The cascade of FAIL lines in
+              ;; per-test fork output was the signal handler longjmping with
+              ;; a stale env-pointer masquerading as a saved RSP.
               ;;
               ;; We use LEA + RIP-relative to get the return address.
               ;; Layout:
@@ -542,11 +549,11 @@
               ;;   jmp +5              ; skip longjmp-return block
               ;;   (longjmp return point — RAX already has T from longjmp)
               ;;
-              ;; Save RSP to 0x10000140
+              ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
-              ;; mov rcx, 0x10000140
+              ;; mov rcx, 0x10000180
               (emit-bytes buf #x48 #xB9)
-              (emit-u32 buf #x10000140) (emit-u32 buf 0)
+              (emit-u32 buf #x10000180) (emit-u32 buf 0)
               ;; mov [rcx], rsp
               (emit-bytes buf #x48 #x89 #x21)
               ;; mov [rcx+8], rbp
@@ -574,9 +581,9 @@
               ;; Sets RAX to T (#xDEAD1009) so setjmp "returns" non-nil.
               ;;
               ;; Clear the handler first (set saved RSP to 0)
-              ;; mov rcx, 0x10000140
+              ;; mov rcx, 0x10000180
               (emit-bytes buf #x48 #xB9)
-              (emit-u32 buf #x10000140) (emit-u32 buf 0)
+              (emit-u32 buf #x10000180) (emit-u32 buf 0)
               ;; mov rdx, [rcx+16]  — saved return IP
               (emit-bytes buf #x48 #x8B #x51 #x10)
               ;; mov rbp, [rcx+8]   — restore RBP
@@ -591,10 +598,10 @@
               ;; jmp rdx  — jump to saved return address
               (emit-bytes buf #xFF #xE2))
              ((= code #x0512)
-              ;; CLEAR-HANDLER: Set saved RSP at 0x10000140 to 0
-              ;; mov rcx, 0x10000140
+              ;; CLEAR-HANDLER: Set saved RSP at 0x10000180 to 0
+              ;; mov rcx, 0x10000180
               (emit-bytes buf #x48 #xB9)
-              (emit-u32 buf #x10000140) (emit-u32 buf 0)
+              (emit-u32 buf #x10000180) (emit-u32 buf 0)
               ;; mov qword [rcx], 0
               (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00))
              ((= code #x0520)
@@ -615,9 +622,9 @@
 
                 ;; --- Embedded handler stub (kernel jumps here on signal) ---
                 (emit-label buf stub-label)
-                ;; mov rcx, 0x10000140  (saved-handler-state address)
+                ;; mov rcx, 0x10000180  (saved-handler-state address)
                 (emit-bytes buf #x48 #xB9)
-                (emit-u32 buf #x10000140) (emit-u32 buf 0)
+                (emit-u32 buf #x10000180) (emit-u32 buf 0)
                 ;; rdx = [rcx]  (saved RSP — zero means no handler-case active)
                 (emit-bytes buf #x48 #x8B #x11)
                 ;; test rdx, rdx
@@ -675,11 +682,12 @@
                 ;; lea rax, [rip+disp] then mov [rsp], rax.
                 (emit-lea-label buf 'rax stub-label)
                 (emit-bytes buf #x48 #x89 #x04 #x24) ; mov [rsp], rax
-                ;; [rsp+8]  = sa_flags = SA_NODEFER | SA_RESTORER (0x40000000 | 0x04000000).
-                ;; SA_RESTORER tells the kernel to use the sa_restorer field —
-                ;; required on x86-64 for raw sigaction (without it the kernel
-                ;; silently fails to deliver signals). SA_NODEFER prevents the
-                ;; kernel from auto-blocking the same signal on entry.
+                ;; [rsp+8]  = sa_flags = SA_NODEFER | SA_RESTORER.
+                ;; SA_RESTORER is required on x86-64 (kernel silently drops
+                ;; signals without it). SA_NODEFER lets us re-enter the
+                ;; handler for a SIGSEGV that happens during longjmp setup,
+                ;; otherwise the kernel queues and eventually kills via
+                ;; the default handler anyway.
                 (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x00 #x00 #x00 #x44)
                 ;; [rsp+16] = sa_restorer = restorer-label.
                 (emit-lea-label buf 'rax restorer-label)

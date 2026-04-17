@@ -115,34 +115,50 @@
 
 (defun deftest (id actual expected)
   "Run a test: compare ACTUAL with EXPECTED using rt-equal.
-   ID is an integer test number. Prints FAIL line on mismatch."
+   ID is an integer test number OR a symbol (for define-condition tests).
+   Prints FAIL line on mismatch."
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (rt-equal actual expected)
-      (setq *rt-pass-count* (+ *rt-pass-count* 1))
+      (progn
+        (setq *rt-pass-count* (+ *rt-pass-count* 1))
+        ;; Mirror rt-run-test: emit \"\\nP:<id>\\n\" so the shard summary
+        ;; counts passes accurately regardless of deftest vs rt-run-test.
+        (write-char-serial 10)
+        (write-char-serial 80)    ; P
+        (write-char-serial 58)    ; :
+        (if (fixnump id) (print-dec id) (write-object id))
+        (write-char-serial 10))
       (progn
         (setq *rt-fail-count* (+ *rt-fail-count* 1))
-        ;; Print: FAIL <id>\n
+        (write-char-serial 10)   ; guarantee a newline before FAIL
         (write-char-serial 70)   ; F
         (write-char-serial 65)   ; A
         (write-char-serial 73)   ; I
         (write-char-serial 76)   ; L
         (write-char-serial 32)   ; space
-        (print-dec id)
+        ;; Use write-object for non-fixnums so symbols print correctly.
+        (if (fixnump id) (print-dec id) (write-object id))
         (write-char-serial 10))))
 
 (defun deftest-eq (id actual expected)
   "Test with eq comparison (pointer identity)."
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (eq actual expected)
-      (setq *rt-pass-count* (+ *rt-pass-count* 1))
+      (progn
+        (setq *rt-pass-count* (+ *rt-pass-count* 1))
+        (write-char-serial 10)
+        (write-char-serial 80) (write-char-serial 58)
+        (if (fixnump id) (print-dec id) (write-object id))
+        (write-char-serial 10))
       (progn
         (setq *rt-fail-count* (+ *rt-fail-count* 1))
+        (write-char-serial 10)
         (write-char-serial 70)
         (write-char-serial 65)
         (write-char-serial 73)
         (write-char-serial 76)
         (write-char-serial 32)
-        (print-dec id)
+        (if (fixnump id) (print-dec id) (write-object id))
         (write-char-serial 10))))
 
 (defun rt-run-test (name actual expected)
@@ -158,9 +174,14 @@
   (if (rt-equal actual expected)
       (progn
         (setq *rt-pass-count* (+ *rt-pass-count* 1))
-        ;; Tally byte: "+" per pass so the summary can count survivors
-        ;; even when a fork crashes before printing its P: line.
-        (write-char-serial 43))   ; #\+
+        ;; "P:<id>\n" per pass — ID-tagged so the summary can count exactly
+        ;; even when other output contains spurious "+" characters from
+        ;; cyclic/huge print output.
+        (write-char-serial 10)    ; \n (in case prior line unterminated)
+        (write-char-serial 80)    ; P
+        (write-char-serial 58)    ; :
+        (print-dec name)
+        (write-char-serial 10))
       (progn
         (setq *rt-fail-count* (+ *rt-fail-count* 1))
         (write-char-serial 10)   ; newline before FAIL (since "+" has none)
@@ -170,12 +191,14 @@
         (write-char-serial 76)   ; L
         (write-char-serial 32)   ; space
         (write-object name)
-        ;; Print actual value for first 5 failures
+        ;; Print actual value for first 5 failures — bounded.
         (when (< *rt-fail-count* 6)
           (write-char-serial 32)   ; space
           (write-string-serial "GOT:")
+          (setq *write-object-budget* 200)
           (write-object actual)
           (write-string-serial " EXP:")
+          (setq *write-object-budget* 200)
           (write-object expected))
         (write-char-serial 10))))
 
@@ -188,7 +211,12 @@
   (if (rt-equal actuals expecteds)
       (progn
         (setq *rt-pass-count* (+ *rt-pass-count* 1))
-        (write-char-serial 43))   ; #\+
+        ;; Emit \"\\nP:<name>\\n\" — same format as rt-run-test so the
+        ;; sharded summary counts multi-value passes the same way.
+        (write-char-serial 10)
+        (write-char-serial 80) (write-char-serial 58)
+        (write-object name)
+        (write-char-serial 10))
       (progn
         (setq *rt-fail-count* (+ *rt-fail-count* 1))
         (write-char-serial 10)
@@ -201,8 +229,10 @@
         (when (< *rt-fail-count* 6)
           (write-char-serial 32)
           (write-string-serial "GOT:")
+          (setq *write-object-budget* 200)
           (write-object actuals)
           (write-string-serial " EXP:")
+          (setq *write-object-budget* 200)
           (write-object expecteds))
         (write-char-serial 10))))
 

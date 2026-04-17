@@ -24,11 +24,7 @@ status=$?
 awk '
   match($0, /ANSI-TOTAL=[0-9]+/) { tot = substr($0, RSTART+11, RLENGTH-11)+0 }
   /^FAIL/                        { fails++ }
-  {
-    # Each passing test writes a single "+" byte to stdout with no newline.
-    n = gsub(/\+/, "+")
-    pass += n
-  }
+  /^P:/                          { pass++ }
   END {
     ran = pass + fails
     lost = tot - ran

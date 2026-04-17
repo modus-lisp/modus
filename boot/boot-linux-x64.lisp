@@ -89,6 +89,44 @@
   (emit-bytes buf #x4C #x8B #x74 #x24 #x10)     ; mov r14, [rsp+16] (argv[1])
   (emit-bytes buf #x4C #x8B #x7C #x24 #x18)     ; mov r15, [rsp+24] (argv[2])
 
+  ;; Store argc and COPIES of argv[1], argv[2] strings to fixed BSS addresses
+  ;; before mmap. We copy content (not pointers) so Lisp can read strings
+  ;; without dealing with raw pointer-as-fixnum arithmetic. Each buffer is
+  ;; 64 bytes, null-terminated.
+  ;;   [0x10000200]: argc (u32)
+  ;;   [0x10000208]: argv[1] string (64 bytes)
+  ;;   [0x10000248]: argv[2] string (64 bytes)
+
+  ;; [0x10000200] = argc (32-bit store; Lisp reads via mem-ref :u32 which tags)
+  (emit-bytes buf #x89 #x1C #x25)                ; mov [abs32], ebx (argc low32)
+  (emit-le32 buf #x10000200)
+
+  ;; Zero-fill 128 bytes at 0x10000208 (both string buffers).
+  ;; mov rdi, 0x10000208; mov ecx, 16; xor rax, rax; rep stosq
+  (emit-bytes buf #x48 #xBF)                     ; movabs rdi, imm64
+  (emit-le32 buf #x10000208) (emit-le32 buf 0)
+  (emit-bytes buf #xB9 #x10 #x00 #x00 #x00)      ; mov ecx, 16 (8-byte words)
+  (emit-bytes buf #x48 #x31 #xC0)                ; xor rax, rax
+  (emit-bytes buf #xF3 #x48 #xAB)                ; rep stosq
+
+  ;; Copy argv[1] → 0x10000208 if argc > 1. Skip block is 20 bytes.
+  (emit-bytes buf #x48 #x83 #xFB #x01)           ; cmp rbx, 1
+  (emit-bytes buf #x7E #x14)                     ; jle +20 (skip copy block)
+  (emit-bytes buf #x4C #x89 #xF6)                ; mov rsi, r14 (argv[1] ptr)
+  (emit-bytes buf #x48 #xBF)                     ; movabs rdi, 0x10000208
+  (emit-le32 buf #x10000208) (emit-le32 buf 0)
+  (emit-bytes buf #xB9 #x3F #x00 #x00 #x00)      ; mov ecx, 63 (max)
+  (emit-bytes buf #xF3 #xA4)                     ; rep movsb  — 20 bytes
+
+  ;; Copy argv[2] → 0x10000248 if argc > 2. Same structure.
+  (emit-bytes buf #x48 #x83 #xFB #x02)           ; cmp rbx, 2
+  (emit-bytes buf #x7E #x14)                     ; jle +20
+  (emit-bytes buf #x4C #x89 #xFE)                ; mov rsi, r15 (argv[2] ptr)
+  (emit-bytes buf #x48 #xBF)                     ; movabs rdi, 0x10000248
+  (emit-le32 buf #x10000248) (emit-le32 buf 0)
+  (emit-bytes buf #xB9 #x3F #x00 #x00 #x00)      ; mov ecx, 63
+  (emit-bytes buf #xF3 #xA4)                     ; rep movsb  — 20 bytes
+
   ;; mmap heap: rax=9, rdi=hint, rsi=size, rdx=prot, r10=flags, r8=fd, r9=off
   (emit-bytes buf #x48 #xC7 #xC7 #x00 #x00 #x00 #x10) ; mov rdi, 0x10000000
   (emit-bytes buf #x48 #xC7 #xC6)                ; mov rsi, imm32

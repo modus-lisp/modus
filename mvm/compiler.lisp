@@ -5063,9 +5063,9 @@
 
 (defun compile-error-handler-active-p (dest)
   "Compile (%error-handler-active-p) — returns T if handler-case active, NIL otherwise.
-   Reads saved RSP at fixed address 0x10000140. Non-zero means active."
+   Reads saved RSP at fixed address 0x10000180. Non-zero means active."
   ;; Load the saved RSP from fixed address
-  (emit-ir :li dest #x10000140)
+  (emit-ir :li dest #x10000180)
   (emit-ir :load dest dest +width-u64+)
   ;; If zero (no handler), return NIL; if non-zero, return T
   (let ((nil-label (make-compiler-label))

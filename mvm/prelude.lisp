@@ -551,64 +551,78 @@
 ;;; Object Printer
 ;;; ============================================================
 
+;; Caller sets this before write-object to bound output on potentially
+;; cyclic / huge structures. Each element of a cons/array consumes one.
+;; At 0 we print "..." once and stop. Set to big positive to not bound.
+(defvar *write-object-budget* 0)
+
 (defun write-object (obj)
-  "Print a Lisp object to serial output (prin1-style)."
+  "Print a Lisp object to serial output (prin1-style).
+   Bounded by *write-object-budget* if positive.
+   Atomic types (fixnum, NIL, T) are always printed — they can't be cyclic
+   and consumers like rt-run-test rely on them printing unconditionally."
   (cond
-    ((null obj)
-     (write-char-serial 78)    ; N
-     (write-char-serial 73)    ; I
-     (write-char-serial 76))   ; L
-    ((eq obj t)
-     (write-char-serial 84))   ; T
-    ((fixnump obj)
-     (print-dec obj))
-    ((consp obj)
-     (write-char-serial 40)    ; (
-     (write-object (car obj))
-     (let ((tail (cdr obj)))
-       (loop
-         (cond
-           ((null tail) (return nil))
-           ((consp tail)
-            (write-char-serial 32)  ; space
-            (write-object (car tail))
-            (setq tail (cdr tail)))
-           (t
-            (write-char-serial 32)  ; space
-            (write-char-serial 46)  ; .
-            (write-char-serial 32)  ; space
-            (write-object tail)
-            (return nil)))))
-     (write-char-serial 41))   ; )
-    ((stringp obj)
-     (write-char-serial 34)    ; "
-     (write-string-serial obj)
-     (write-char-serial 34))   ; "
-    ((symbolp obj)
-     ;; Symbols: print as #<SYM hash>
-     (write-char-serial 35)    ; #
-     (write-char-serial 60)    ; <
-     (write-char-serial 83)    ; S
-     (print-dec (aref obj 0))
-     (write-char-serial 62))   ; >
-    ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
-          (= (obj-subtag obj) #x32))
-     ;; Array: print as #(...)
-     (write-char-serial 35)    ; #
-     (write-char-serial 40)    ; (
-     (let ((len (array-length obj)) (i 0))
-       (loop
-         (when (= i len) (return nil))
-         (when (> i 0) (write-char-serial 32))
-         (write-object (aref obj i))
-         (setq i (+ i 1))))
-     (write-char-serial 41))   ; )
+    ;; Atomic, bounded-size types: print unconditionally without touching budget.
+    ((fixnump obj) (print-dec obj))
+    ((null obj)    (write-char-serial 78) (write-char-serial 73) (write-char-serial 76))
+    ((eq obj t)    (write-char-serial 84))
+    ;; Budget-exhausted sentinel.
+    ((= *write-object-budget* 0)
+     ;; First time budget hits zero: emit "..." sentinel and flip to -1
+     ;; so subsequent calls produce no output.
+     (setq *write-object-budget* -1)
+     (write-char-serial 46) (write-char-serial 46) (write-char-serial 46))
+    ((< *write-object-budget* 0)
+     nil)
     (t
-     ;; Unknown object
-     (write-char-serial 35)    ; #
-     (write-char-serial 60)    ; <
-     (write-char-serial 63)    ; ?
-     (write-char-serial 62)))) ; >
+     (setq *write-object-budget* (- *write-object-budget* 1))
+     (cond
+       ((null obj)
+        (write-char-serial 78) (write-char-serial 73) (write-char-serial 76))
+       ((eq obj t)
+        (write-char-serial 84))
+       ((fixnump obj)
+        (print-dec obj))
+       ((consp obj)
+        (write-char-serial 40)
+        (write-object (car obj))
+        (let ((tail (cdr obj)))
+          (loop
+            (cond
+              ((null tail) (return nil))
+              ((<= *write-object-budget* 0) (return nil))
+              ((consp tail)
+               (write-char-serial 32)
+               (write-object (car tail))
+               (setq tail (cdr tail)))
+              (t
+               (write-char-serial 32)
+               (write-char-serial 46)
+               (write-char-serial 32)
+               (write-object tail)
+               (return nil)))))
+        (write-char-serial 41))
+       ((stringp obj)
+        (write-char-serial 34)
+        (write-string-serial obj)
+        (write-char-serial 34))
+       ((symbolp obj)
+        (write-char-serial 35) (write-char-serial 60) (write-char-serial 83)
+        (print-dec (aref obj 0))
+        (write-char-serial 62))
+       ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
+             (= (obj-subtag obj) #x32))
+        (write-char-serial 35) (write-char-serial 40)
+        (let ((len (array-length obj)) (i 0))
+          (loop
+            (when (= i len) (return nil))
+            (when (<= *write-object-budget* 0) (return nil))
+            (when (> i 0) (write-char-serial 32))
+            (write-object (aref obj i))
+            (setq i (+ i 1))))
+        (write-char-serial 41))
+       (t
+        (write-char-serial 35) (write-char-serial 60) (write-char-serial 63) (write-char-serial 62))))))
 
 (defun princ-object (obj)
   "Print a Lisp object to serial output (princ-style, no escapes)."

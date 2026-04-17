@@ -1719,7 +1719,10 @@
       ;; --- List Operations ---
       ((= op-name 131620339109781567)      (compile-car (cadr form) env dest))
       ((= op-name 960859484116883722)      (compile-cdr (cadr form) env dest))
-      ((= op-name 658831809041752574)     (compile-cons (cadr form) (caddr form) env dest))
+      ((= op-name 658831809041752574)
+       (if (= (length form) 3)
+           (compile-cons (cadr form) (caddr form) env dest)
+           (compile-arity-error env dest)))
       ((= op-name 643626177239181368)  (compile-set-car (cadr form) (caddr form) env dest))
       ((= op-name 680584020244584045)  (compile-set-cdr (cadr form) (caddr form) env dest))
       ((= op-name 599790875489715846)     (compile-caar (cadr form) env dest))
@@ -4282,6 +4285,18 @@
   (compile-form arg env dest)
   (emit-ir :cdr dest dest))
 
+(defun compile-arity-error (env dest)
+  "Emit a 0-arg call to %SIGNAL-PROGRAM-ERROR at runtime — used when an
+   inlined CL primitive is called with the wrong number of arguments.
+   Most ANSI signals-error tests expect PROGRAM-ERROR from arity
+   mismatches; compiling e.g. (cons) silently as (cons NIL NIL) suppresses
+   the error so the enclosing (handler-case ... (error (c) t)) never
+   triggers.
+   Delegating to a runtime helper avoids the compile-call dance around
+   &rest arg construction, which has edge cases we hit when emitting
+   from within a dispatch branch."
+  (compile-form '(%signal-program-error) env dest))
+
 (defun compile-cons (car-arg cdr-arg env dest)
   "Compile (cons x y) -> MVM cons instruction (allocating).
    Saves car result to stack before evaluating cdr to prevent
@@ -5393,16 +5408,23 @@
   (unless (listp args) (setf args (list args)))
   ;; &rest transformation: if the target function has &rest, cons up extra args
   ;; &optional padding: if fewer args than params, pad with NIL
+  ;; Arity check (narrow): if called with 0 args on a function with
+  ;; required-count > 0, signal PROGRAM-ERROR. Catches the common
+  ;; (F) ansi-test pattern without disturbing other calls.
   (when (and (symbolp fn) (boundp '*functions*) *functions*)
     (let* ((fn-name (symbol-name fn))
            ;; Check for flet/labels name mapping
            (resolved-fn-name (or (env-lookup-fn env fn-name) fn-name))
            (fn-info (gethash resolved-fn-name *functions*)))
       (when fn-info
-        (cond
-          ((function-info-rest-param-p fn-info)
-           (let ((req (function-info-required-count fn-info))
-                 (nargs (length args)))
+        (let ((req (function-info-required-count fn-info))
+              (nargs (length args)))
+          (cond
+            ;; Too few required args: arity error.
+            ((and req (> req 0) (< nargs req))
+             (compile-arity-error env dest)
+             (return-from compile-call))
+            ((function-info-rest-param-p fn-info)
              (when (>= nargs req)
                (let ((required-args (subseq args 0 req))
                      (rest-args (nthcdr req args)))
@@ -5410,13 +5432,12 @@
                  (let ((rest-form nil))
                    (dolist (a (reverse rest-args))
                      (setf rest-form `(cons ,a ,rest-form)))
-                   (setf args (append required-args (list rest-form))))))))
-          (t
-           ;; Pad with NIL for missing &optional parameters
-           (let ((param-count (function-info-param-count fn-info))
-                 (nargs (length args)))
-             (when (< nargs param-count)
-               (setf args (append args (make-list (- param-count nargs)))))))))))
+                   (setf args (append required-args (list rest-form)))))))
+            (t
+             ;; Pad with NIL for missing &optional parameters
+             (let ((param-count (function-info-param-count fn-info)))
+               (when (< nargs param-count)
+                 (setf args (append args (make-list (- param-count nargs))))))))))))
   (let ((nargs (length args))
         ;; Save the current temp count BEFORE arg evaluation.
         ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).

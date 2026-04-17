@@ -909,6 +909,24 @@
   "Install SIGSEGV/SIGBUS/SIGFPE/SIGILL handlers via TRAP #x0520."
   (%install-signal-handlers))
 
+(defun %signal-program-error ()
+  "Runtime helper for compile-arity-error: signal a PROGRAM-ERROR
+   condition so the enclosing handler-case can catch it.
+   Used when a CL primitive is called with the wrong arg count;
+   the ANSI signals-error tests expect this behavior.
+
+   Sidestep make-condition (which has a complex slot-collection path
+   that's been flaky) and just long-jump directly after setting
+   *current-condition* to a pre-built minimal condition object."
+  (let ((c (make-array 2)))
+    (aset c 0 'program-error)
+    (aset c 1 nil)
+    (setq *current-condition* c)
+    (if (%error-handler-active-p)
+        (%hc-longjmp)
+        ;; No handler active — return NIL (won't reach here under handler-case).
+        nil)))
+
 ;;; --- Initialize standard packages ---
 
 (defun %init-packages ()

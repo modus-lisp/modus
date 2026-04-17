@@ -897,6 +897,8 @@
 
 (defun %init-packages ()
   "Create standard CL packages."
+  (setq *pkg-tag* 987654321)
+  (setq *sym-tag* 123456789)
   (setq *all-packages* nil)
   (make-package "COMMON-LISP" :nicknames (list "CL") :use nil)
   (make-package "COMMON-LISP-USER" :nicknames (list "CL-USER") :use (list "CL"))

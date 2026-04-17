@@ -94,12 +94,10 @@ runtime/        Runtime type system
 
 ## ANSI CL Conformance
 
-**17,568 tests, 17,567 passing (99.994%), 1 failure.**
+**17,568 tests, 17,568 passing (100%).**
 
 Build: `sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp`
 Run: `/tmp/modus-ansi-test`
-
-The sole failure is GENTEMP.4 — see Known Bugs below.
 
 ### CL Implementation Status
 
@@ -291,17 +289,9 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
 6. **Funcall tag collision**: Function addresses ending in `0x1` get misidentified as cons pointers by the closure-aware funcall dispatch. The translator NOP-aligns functions to avoid this. If adding boot code that changes the code offset, update `*x64-native-code-offset*` in the build script.
+7. **defvar init-thunks not run**: `(defvar *foo* 42)` declares `*foo*` but does NOT set it to 42 at boot — `init-all-globals` is skipped. Defvars default to NIL. Initialize required values explicitly via setq in an init function (e.g. `*pkg-tag*`, `*sym-tag*` set in `%init-packages`). Predicates that compare against an uninitialized tag with `(eql (car x) *tag*)` will return T for *any* cons-with-NIL-car — see `%pkg-p` history.
 
 ## Known Bugs
-
-### GENTEMP.4 — `%cl-sym-set-package` doesn't persist (1 ANSI failure)
-
-`(aset (%cl-sym-data sym) 1 pkg)` called through `%cl-sym-set-package` doesn't
-persist for packages allocated during init (low addresses). Storing fixnums works.
-Storing freshly allocated cons/arrays works. Only startup-allocated packages fail.
-The OBJ-SET instruction encoding is verified correct. Root cause unknown — likely
-a subtle register/spill interaction in the x64 translator when the value operand
-is a function parameter pointing to early heap memory. See `OBJ-SET-BUG.md`.
 
 ### Mutable Closures — Global Cell Limitation
 

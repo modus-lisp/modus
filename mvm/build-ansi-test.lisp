@@ -1685,10 +1685,13 @@
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
-                                            (format nil "(rt-run-test ~D ~S '~S)"
+                                            ;; Wrap in handler-case so a SIGSEGV/etc
+                                            ;; in the test body longjmps to here and
+                                            ;; we report :CRASHED instead of dying.
+                                            (format nil "(rt-run-test ~D (handler-case ~S (t (c) :CRASHED)) '~S)"
                                                     test-id test-form (car expected)))
                                            ((> (length expected) 0)
-                                            (format nil "(rt-run-test-mv ~D (multiple-value-list ~S) '~S)"
+                                            (format nil "(rt-run-test-mv ~D (handler-case (multiple-value-list ~S) (t (c) (list :CRASHED))) '~S)"
                                                     test-id test-form expected)))
                                          (error () nil))))
                          ;; For real.lsp: fix / and - inside backquote commas
@@ -1750,11 +1753,14 @@
                              (write-string s out)
                              (terpri out))))))))
               (format out "(defun run-ansi-~A ()~%" (pathname-name file))
+              ;; Wrap the entire body in handler-case so init-form crashes
+              ;; (defstruct, defclass, %add-method, etc.) don't kill the fork.
+              (format out "  (handler-case (progn~%")
               ;; Emit init calls first (%defclass, %add-slot-unbound-method, etc.)
-              (dolist (s (nreverse init-forms)) (format out "  ~A~%" s))
+              (dolist (s (nreverse init-forms)) (format out "    ~A~%" s))
               ;; Then test forms
-              (dolist (tf (nreverse test-forms)) (format out "  ~A~%" tf))
-              (format out ")~%")
+              (dolist (tf (nreverse test-forms)) (format out "    ~A~%" tf))
+              (format out "  ) (t (c) nil)))~%")
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
                                  (get-output-stream-string out)))))))
@@ -2198,6 +2204,11 @@
 
   ;; Initialize symbol-function table with all built-in compiled functions
   (%init-symbol-function-table)
+
+  ;; Install signal handlers (SIGSEGV/etc) — converts hardware faults to
+  ;; CL conditions that handler-case can catch, instead of killing the fork.
+  (%init-signal-handling)
+
 
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")

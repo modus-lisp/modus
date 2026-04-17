@@ -1794,6 +1794,9 @@
       ((= op-name 792633669140441529) (compile-hc-longjmp dest))
       ;; (%error-handler-active-p) — check if a handler-case is active
       ((= op-name 904577799958313483) (compile-error-handler-active-p dest))
+      ;; (%install-signal-handlers handler-addr) — install SIGSEGV/etc handlers
+      ((= op-name (compute-name-hash "%INSTALL-SIGNAL-HANDLERS"))
+       (compile-install-signal-handlers (cdr form) env dest))
 
       ;; --- Timestamp Counter ---
       ((= op-name 580098868411189197) (compile-rdtsc dest))
@@ -5079,6 +5082,14 @@
     (emit-ir-label nil-label)
     (emit-ir :mov dest +vreg-vn+)
     (emit-ir-label end-label)))
+
+(defun compile-install-signal-handlers (form env dest)
+  "Compile (%install-signal-handlers) — install SIGSEGV/SIGBUS/SIGFPE/SIGILL
+   handlers via rt_sigaction. The handler is an embedded assembly stub in
+   the trap itself, not a Lisp function."
+  (declare (ignore form env))
+  (emit-ir :trap #x0520)
+  (compile-nil dest))
 
 (defun compile-syscall3 (args env dest)
   "Compile (syscall3 num arg1 arg2 arg3) — 3-arg Linux syscall.

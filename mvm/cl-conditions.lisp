@@ -893,6 +893,22 @@
        s))
     (t x)))
 
+;;; --- Signal handling: catch SIGSEGV/SIGBUS/SIGFPE/SIGILL ---
+;;;
+;;; The handler is an embedded assembly stub (TRAP #x0520 in the x64
+;;; translator), NOT a Lisp function — Lisp function entry would allocate
+;;; stack frame and possibly trigger GC, neither safe in signal context.
+;;;
+;;; The stub does the equivalent of (%hc-longjmp): if a handler-case is
+;;; active (saved RSP at 0x10000140 != 0), restore RSP/RBP/IP and resume;
+;;; otherwise sys_exit(139). It does NOT set *current-condition* — handler
+;;; clauses that need a meaningful condition won't get one for signal
+;;; longjmps, but the fork survives.
+
+(defun %init-signal-handling ()
+  "Install SIGSEGV/SIGBUS/SIGFPE/SIGILL handlers via TRAP #x0520."
+  (%install-signal-handlers))
+
 ;;; --- Initialize standard packages ---
 
 (defun %init-packages ()

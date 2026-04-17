@@ -551,18 +551,24 @@
               (emit-bytes buf #x48 #x89 #x21)
               ;; mov [rcx+8], rbp
               (emit-bytes buf #x48 #x89 #x69 #x08)
-              ;; lea rax, [rip+2]  — address of instruction after the JMP below
-              ;; The JMP short is 2 bytes (EB xx), so we want rip+2 to point past it
-              (emit-bytes buf #x48 #x8D #x05 #x02 #x00 #x00 #x00)  ; lea rax, [rip+2]
+              ;; Save the address of the FIRST instruction after this trap block
+              ;; into [rcx+16]. After lea (7 bytes), we still have:
+              ;;   mov [rcx+16], rax     (4 bytes)
+              ;;   movabs rax, NIL       (10 bytes)
+              ;; = 14 bytes between end-of-LEA and end-of-trap-block.
+              ;; lea rax, [rip+14] lands rax at the byte AFTER the trap.
+              ;; (Historical bug: this was rip+2, intended for a since-removed
+              ;; 2-byte JMP. Saved IP landed mid-instruction; longjmp would
+              ;; jump to garbage. Latent until the SIGSEGV signal handler
+              ;; started exercising the longjmp path frequently.)
+              (emit-bytes buf #x48 #x8D #x05 #x0E #x00 #x00 #x00)  ; lea rax, [rip+14]
               ;; mov [rcx+16], rax  — save return IP
               (emit-bytes buf #x48 #x89 #x41 #x10)
-              ;; mov rax, NIL (#xDEAD0001) — first-time return
+              ;; mov rax, NIL (#xDEAD0001) — first-time return.
+              ;; On longjmp, execution jumps just past this and RAX holds T
+              ;; (set by LONGJMP trap), so the value going into VR is T.
               (emit-bytes buf #x48 #xB8)
-              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0)
-              ;; jmp +0  — skip 0 bytes (the longjmp path uses the saved IP directly)
-              ;; No skip needed: longjmp jumps to the saved IP which is here
-              ;; RAX has NIL for normal flow; longjmp sets RAX to T before jumping
-              )
+              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0))
              ((= code #x0511)
               ;; LONGJMP: Restore RSP/RBP from fixed memory, jump to saved IP.
               ;; Sets RAX to T (#xDEAD1009) so setjmp "returns" non-nil.
@@ -591,6 +597,115 @@
               (emit-u32 buf #x10000140) (emit-u32 buf 0)
               ;; mov qword [rcx], 0
               (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00))
+             ((= code #x0520)
+              ;; INSTALL-SIGNAL-HANDLERS:
+              ;; Installs SIGSEGV (11), SIGBUS (7), SIGFPE (8), SIGILL (4) handlers.
+              ;; The handler is an embedded assembly stub — NOT a Lisp function,
+              ;; because a Lisp function entry would allocate stack and possibly
+              ;; trigger GC (unsafe in signal context). The stub does the same
+              ;; work as TRAP #x0511 (%hc-longjmp): if a handler-case is active
+              ;; (saved RSP at 0x10000140 != 0), restore RSP/RBP/IP and jump back;
+              ;; otherwise sys_exit(139).
+              (let ((stub-label (make-label))
+                    (exit-label (make-label))
+                    (restorer-label (make-label))
+                    (past-stub-label (make-label)))
+                ;; Skip stub on this execution path.
+                (emit-jmp buf past-stub-label)
+
+                ;; --- Embedded handler stub (kernel jumps here on signal) ---
+                (emit-label buf stub-label)
+                ;; mov rcx, 0x10000140  (saved-handler-state address)
+                (emit-bytes buf #x48 #xB9)
+                (emit-u32 buf #x10000140) (emit-u32 buf 0)
+                ;; rdx = [rcx]  (saved RSP — zero means no handler-case active)
+                (emit-bytes buf #x48 #x8B #x11)
+                ;; test rdx, rdx
+                (emit-bytes buf #x48 #x85 #xD2)
+                ;; jz exit_path
+                (emit-jcc buf :e exit-label)
+                ;; --- Active handler-case: do the longjmp ---
+                ;; rdx = [rcx+16]  (saved IP)
+                (emit-bytes buf #x48 #x8B #x51 #x10)
+                ;; rbp = [rcx+8]
+                (emit-bytes buf #x48 #x8B #x69 #x08)
+                ;; rsp = [rcx]
+                (emit-bytes buf #x48 #x8B #x21)
+                ;; mov qword [rcx], 0 (clear handler)
+                (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00)
+                ;; mov eax, 0xDEAD1009 (T sentinel — 32-bit imm zero-extends to rax)
+                (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
+                ;; jmp rdx
+                (emit-bytes buf #xFF #xE2)
+
+                ;; --- No active handler: sys_exit(139) ---
+                (emit-label buf exit-label)
+                ;; mov edi, 139
+                (emit-bytes buf #xBF #x8B #x00 #x00 #x00)
+                ;; mov eax, 60 (sys_exit)
+                (emit-bytes buf #xB8 #x3C #x00 #x00 #x00)
+                ;; syscall
+                (emit-bytes buf #x0F #x05)
+
+                ;; --- Restorer trampoline (sa_restorer) ---
+                ;; Linux x86-64 requires SA_RESTORER + sa_restorer on raw
+                ;; sigaction; without them, signal delivery to user handlers
+                ;; silently fails.  Our handler longjmps and never returns,
+                ;; so the restorer is reached only if the handler returns
+                ;; normally — defensive: invoke rt_sigreturn.
+                (emit-label buf restorer-label)
+                ;; mov eax, 15 (SYS_rt_sigreturn)
+                (emit-bytes buf #xB8 #x0F #x00 #x00 #x00)
+                (emit-bytes buf #x0F #x05)              ; syscall
+
+                ;; --- Past stub: install handlers via rt_sigaction ---
+                (emit-label buf past-stub-label)
+
+                ;; Save callee-saved/clobbered regs.
+                (emit-bytes buf #x57)              ; push rdi
+                (emit-bytes buf #x52)              ; push rdx
+                (emit-bytes buf #x41 #x50)         ; push r8
+                (emit-bytes buf #x41 #x52)         ; push r10
+                (emit-bytes buf #x41 #x53)         ; push r11
+
+                ;; Allocate 32 bytes on stack for sigaction struct.
+                (emit-bytes buf #x48 #x83 #xEC #x20)  ; sub rsp, 32
+
+                ;; [rsp+0]  = sa_handler = stub-label.
+                ;; lea rax, [rip+disp] then mov [rsp], rax.
+                (emit-lea-label buf 'rax stub-label)
+                (emit-bytes buf #x48 #x89 #x04 #x24) ; mov [rsp], rax
+                ;; [rsp+8]  = sa_flags = SA_NODEFER | SA_RESTORER (0x40000000 | 0x04000000).
+                ;; SA_RESTORER tells the kernel to use the sa_restorer field —
+                ;; required on x86-64 for raw sigaction (without it the kernel
+                ;; silently fails to deliver signals). SA_NODEFER prevents the
+                ;; kernel from auto-blocking the same signal on entry.
+                (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x00 #x00 #x00 #x44)
+                ;; [rsp+16] = sa_restorer = restorer-label.
+                (emit-lea-label buf 'rax restorer-label)
+                (emit-bytes buf #x48 #x89 #x44 #x24 #x10)  ; mov [rsp+16], rax
+                ;; [rsp+24] = sa_mask = 0
+                (emit-bytes buf #x48 #xC7 #x44 #x24 #x18 #x00 #x00 #x00 #x00)
+
+                ;; Install for each signum.
+                (dolist (signum '(11 7 8 4))
+                  (emit-bytes buf #x48 #xC7 #xC7) (emit-u32 buf signum) ; mov rdi, signum
+                  (emit-bytes buf #x48 #x89 #xE6)        ; mov rsi, rsp
+                  (emit-bytes buf #x48 #x31 #xD2)        ; xor rdx, rdx
+                  (emit-bytes buf #x49 #xC7 #xC2 #x08 #x00 #x00 #x00) ; mov r10, 8
+                  (emit-bytes buf #x48 #xC7 #xC0 #x0D #x00 #x00 #x00) ; mov rax, 13 (rt_sigaction)
+                  (emit-bytes buf #x0F #x05))            ; syscall
+
+                ;; Free struct
+                (emit-bytes buf #x48 #x83 #xC4 #x20)  ; add rsp, 32
+                ;; Restore regs
+                (emit-bytes buf #x41 #x5B)         ; pop r11
+                (emit-bytes buf #x41 #x5A)         ; pop r10
+                (emit-bytes buf #x41 #x58)         ; pop r8
+                (emit-bytes buf #x5A)              ; pop rdx
+                (emit-bytes buf #x5F)              ; pop rdi
+                ;; Result in V0 = NIL
+                (emit-bytes buf #x49 #x89 #xFE)))  ; mov rsi, r15
              (t
               ;; Real CPU trap
               (emit-mov-reg-imm buf 'rax code)

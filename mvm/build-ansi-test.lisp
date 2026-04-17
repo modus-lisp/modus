@@ -1685,13 +1685,10 @@
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
-                                            ;; Wrap fork-test in a parent-side handler-case so
-                                            ;; a bad lambda-compile doesn't kill the parent
-                                            ;; (which would stop all remaining tests).
-                                            (format nil "(handler-case (fork-test ~D (lambda () ~S) '~S) (t (c) nil))"
+                                            (format nil "(fork-test ~D (lambda () ~S) '~S)"
                                                     test-id test-form (car expected)))
                                            ((> (length expected) 0)
-                                            (format nil "(handler-case (fork-test-mv ~D (lambda () (multiple-value-list ~S)) '~S) (t (c) nil))"
+                                            (format nil "(fork-test-mv ~D (lambda () (multiple-value-list ~S)) '~S)"
                                                     test-id test-form expected)))
                                          (error () nil))))
                          ;; For real.lsp: fix / and - inside backquote commas
@@ -2097,7 +2094,11 @@
 ;; We have the hardware for it: 128 cores and 1TB RAM — 17K forks is fine.
 (setf *real-ansi-sources*
       (concatenate 'string *real-ansi-sources*
-                   (format nil "~%(defun fork-test (id thunk expected)~
+                   (format nil "~%(defvar *skip-below* 0)~
+                     ~%(defvar *run-only-below* 0)~
+                     ~%(defun fork-test (id thunk expected)~
+                     ~%  (when (< id *skip-below*) (return-from fork-test nil))~
+                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from fork-test nil))~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
                      ~%        (progn~
@@ -2106,6 +2107,8 @@
                      ~%          (syscall3 60 0 0 0))~
                      ~%        (syscall3 61 pid 0 0))))~
                      ~%(defun fork-test-mv (id thunk expecteds)~
+                     ~%  (when (< id *skip-below*) (return-from fork-test-mv nil))~
+                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from fork-test-mv nil))~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
                      ~%        (progn~
@@ -2166,6 +2169,16 @@
   (let ((c code))
     (syscall3 60 c 0 0)))
 
+(defun %parse-decimal-at (addr)
+  ;; Parse C-string at ADDR as decimal integer. Stops at non-digit.
+  ;; Returns 0 on empty / non-numeric.
+  (let ((n 0) (i 0))
+    (loop
+      (let ((b (mem-ref (+ addr i) :u8)))
+        (when (or (< b 48) (> b 57)) (return n))
+        (setq n (+ (* n 10) (- b 48)))
+        (setq i (+ i 1))))))
+
 (defun kernel-main ()
   ;; Banner: ANSI-TEST
   (write-char-serial 65)   ; A
@@ -2212,10 +2225,13 @@
   (setq *filesystem* nil)
 
   ;; Init RT counters manually (init-all-globals not safe — some thunks
-  ;; reference functions/symbols that may not be available yet)
+  ;; reference functions/symbols that may not be available yet).
+  ;; Also init skip/run-only bounds (defvar init-thunks aren't run).
   (setq *rt-test-count* 0)
   (setq *rt-pass-count* 0)
   (setq *rt-fail-count* 0)
+  (setq *skip-below* 0)
+  (setq *run-only-below* 0)
 
   ;; Run custom tests
   (run-all-tests)

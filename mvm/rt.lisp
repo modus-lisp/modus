@@ -150,9 +150,14 @@
    EXPECTED is the expected value. Compares using rt-equal."
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (rt-equal actual expected)
-      (setq *rt-pass-count* (+ *rt-pass-count* 1))
+      (progn
+        (setq *rt-pass-count* (+ *rt-pass-count* 1))
+        ;; Tally byte: "+" per pass so the summary can count survivors
+        ;; even when a fork crashes before printing its P: line.
+        (write-char-serial 43))   ; #\+
       (progn
         (setq *rt-fail-count* (+ *rt-fail-count* 1))
+        (write-char-serial 10)   ; newline before FAIL (since "+" has none)
         (write-char-serial 70)   ; F
         (write-char-serial 65)   ; A
         (write-char-serial 73)   ; I
@@ -172,9 +177,12 @@
   "Run a multi-value RT test. ACTUALS and EXPECTEDS are lists."
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (rt-equal actuals expecteds)
-      (setq *rt-pass-count* (+ *rt-pass-count* 1))
+      (progn
+        (setq *rt-pass-count* (+ *rt-pass-count* 1))
+        (write-char-serial 43))   ; #\+
       (progn
         (setq *rt-fail-count* (+ *rt-fail-count* 1))
+        (write-char-serial 10)
         (write-char-serial 70)
         (write-char-serial 65)
         (write-char-serial 73)

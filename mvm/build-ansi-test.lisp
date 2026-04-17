@@ -2089,9 +2089,9 @@
       (names *ansi-file-names*))
   (setf *real-ansi-sources*
         (concatenate 'string *real-ansi-sources*
-                     (format nil "~%(defvar *fork-chunk* 0)~
+                     (format nil "~%(defvar *chunk-num* 0)~
                        ~%(defun fork-run (thunk)~
-                       ~%  (setq *fork-chunk* (+ *fork-chunk* 1))~
+                       ~%  (setq *chunk-num* (+ *chunk-num* 1))~
                        ~%  (let ((pid (syscall3 57 0 0 0)))~
                        ~%    (if (= pid 0)~
                        ~%        (progn~
@@ -2100,6 +2100,17 @@
                        ~%          (setq *rt-pass-count* 0)~
                        ~%          (setq *rt-fail-count* 0)~
                        ~%          (funcall thunk)~
+                       ~%          ;; P:chunk/passes/fails/total — only on clean exit;~
+                       ~%          ;; crashed forks omit it so the summary can see lost tests.~
+                       ~%          (write-string-serial \"P:\")~
+                       ~%          (print-dec *chunk-num*)~
+                       ~%          (write-char-serial 47)~
+                       ~%          (print-dec *rt-pass-count*)~
+                       ~%          (write-char-serial 47)~
+                       ~%          (print-dec *rt-fail-count*)~
+                       ~%          (write-char-serial 47)~
+                       ~%          (print-dec *rt-test-count*)~
+                       ~%          (write-char-serial 10)~
                        ~%          (syscall3 60 *rt-fail-count* 0 0))~
                        ~%        (syscall3 61 pid 0 0))))~%")
                      (with-output-to-string (s)
@@ -2206,6 +2217,14 @@
   ;; Run custom tests
   (run-all-tests)
 
+  ;; Print expected ANSI test total so the summary can compute lost tests.
+  ;; Distinctive prefix so it can't be confused with FAIL ... EXP:... lines.
+  ;; The placeholder is replaced with the build-time count.
+  (write-char-serial 10)
+  (write-string-serial \"ANSI-TOTAL=\")
+  (print-dec ~~ANSI-EXP-TOTAL~~)
+  (write-char-serial 10)
+
   ;; Run real ANSI tests (generated at build time)
   (run-real-ansi-tests)
 
@@ -2257,10 +2276,21 @@
     ;; 6. Real ANSI test files
     *real-ansi-sources*
     (string #\Newline)
-    ;; 7. Driver (sys-exit, kernel-main)
-    *driver-source*))
+    ;; 7. Driver (sys-exit, kernel-main).
+    ;; Substitute the placeholder for the build-time ANSI test count
+    ;; so kernel-main can print EXP:N before running tests.
+    (let* ((tag "~~ANSI-EXP-TOTAL~~")
+           (tag-pos (search tag *driver-source*))
+           (count (- *ansi-test-counter* 10000)))
+      (if tag-pos
+          (concatenate 'string
+                       (subseq *driver-source* 0 tag-pos)
+                       (princ-to-string count)
+                       (subseq *driver-source* (+ tag-pos (length tag))))
+          *driver-source*))))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
+(format t "  ANSI tests: ~D~%" (- *ansi-test-counter* 10000))
 
 ;;; ============================================================
 ;;; 6. Build Linux ELF via MVM pipeline

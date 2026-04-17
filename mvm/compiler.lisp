@@ -1717,54 +1717,51 @@
       ((= op-name 644866047583222547)       (compile-eq (cdr form) env dest))
 
       ;; --- List Operations ---
-      ((= op-name 131620339109781567)      (compile-car (cadr form) env dest))
-      ((= op-name 960859484116883722)      (compile-cdr (cadr form) env dest))
-      ((= op-name 658831809041752574)
-       (if (= (length form) 3)
-           (compile-cons (cadr form) (caddr form) env dest)
-           (compile-arity-error env dest)))
-      ((= op-name 643626177239181368)  (compile-set-car (cadr form) (caddr form) env dest))
-      ((= op-name 680584020244584045)  (compile-set-cdr (cadr form) (caddr form) env dest))
-      ((= op-name 599790875489715846)     (compile-caar (cadr form) env dest))
-      ((= op-name 492519292879068819)     (compile-cadr (cadr form) env dest))
-      ((= op-name 779194256552149755)     (compile-cdar (cadr form) env dest))
-      ((= op-name 455511896952479694)     (compile-cddr (cadr form) env dest))
+      ((= op-name 131620339109781567)      (when (arity-ok-p form 1 1 env dest) (compile-car (cadr form) env dest)))
+      ((= op-name 960859484116883722)      (when (arity-ok-p form 1 1 env dest) (compile-cdr (cadr form) env dest)))
+      ((= op-name 658831809041752574)      (when (arity-ok-p form 2 2 env dest) (compile-cons (cadr form) (caddr form) env dest)))
+      ((= op-name 643626177239181368)      (when (arity-ok-p form 2 2 env dest) (compile-set-car (cadr form) (caddr form) env dest)))
+      ((= op-name 680584020244584045)      (when (arity-ok-p form 2 2 env dest) (compile-set-cdr (cadr form) (caddr form) env dest)))
+      ((= op-name 599790875489715846)      (when (arity-ok-p form 1 1 env dest) (compile-caar (cadr form) env dest)))
+      ((= op-name 492519292879068819)      (when (arity-ok-p form 1 1 env dest) (compile-cadr (cadr form) env dest)))
+      ((= op-name 779194256552149755)      (when (arity-ok-p form 1 1 env dest) (compile-cdar (cadr form) env dest)))
+      ((= op-name 455511896952479694)      (when (arity-ok-p form 1 1 env dest) (compile-cddr (cadr form) env dest)))
 
       ;; --- Bitwise Operations ---
       ((= op-name 245376457710419216)   (compile-logand (cdr form) env dest))
       ((= op-name 444641700551290191)   (compile-logior (cdr form) env dest))
       ((= op-name 91997575206662710)   (compile-logxor (cdr form) env dest))
-      ((= op-name 498596602025227109)      (compile-ash (cadr form) (caddr form) env dest))
-      ((= op-name 707618725562015373)      (compile-ldb (cadr form) (caddr form) env dest))
+      ((= op-name 498596602025227109)      (when (arity-ok-p form 2 2 env dest) (compile-ash (cadr form) (caddr form) env dest)))
+      ((= op-name 707618725562015373)      (when (arity-ok-p form 2 2 env dest) (compile-ldb (cadr form) (caddr form) env dest)))
 
-      ;; --- Type Predicates ---
-      ((= op-name 1034692707450833644)     (compile-null (cadr form) env dest))
-      ((= op-name 791386596785250882)      (compile-null (cadr form) env dest))
-      ((= op-name 193192138738169214)    (compile-consp (cadr form) env dest))
-      ((= op-name 1084402973118869726)  (compile-fixnump (cadr form) env dest))
-      ((= op-name 105613410085771328)     (compile-atom-p (cadr form) env dest))
-      ((= op-name 197121891723777229)    (compile-listp (cadr form) env dest))
-      ((= op-name 1005235261373835305)  (compile-symbolp (cadr form) env dest))
-      ((= op-name 701502595840197579) (compile-obj-subtag (cadr form) env dest))  ; obj-subtag
-      ((= op-name 1091515641497713485)  (compile-bignump (cadr form) env dest))
-      ((= op-name 1024588698656382250)  (compile-stringp (cadr form) env dest))
-      ((= op-name 959229030243575902)   (compile-arrayp (cadr form) env dest))
-      ((= op-name 467922512990154729) (compile-integerp (cadr form) env dest))
-      ((= op-name 641752649465622469)    (compile-zerop (cadr form) env dest))
-      ((= op-name 322465010757792166) (compile-characterp (cadr form) env dest))
+      ;; --- Type Predicates (all 1-arg) ---
+      ((= op-name 1034692707450833644)     (when (arity-ok-p form 1 1 env dest) (compile-null (cadr form) env dest)))
+      ((= op-name 791386596785250882)      (when (arity-ok-p form 1 1 env dest) (compile-null (cadr form) env dest)))
+      ((= op-name 193192138738169214)      (when (arity-ok-p form 1 1 env dest) (compile-consp (cadr form) env dest)))
+      ((= op-name 1084402973118869726)     (when (arity-ok-p form 1 1 env dest) (compile-fixnump (cadr form) env dest)))
+      ((= op-name 105613410085771328)      (when (arity-ok-p form 1 1 env dest) (compile-atom-p (cadr form) env dest)))
+      ((= op-name 197121891723777229)      (when (arity-ok-p form 1 1 env dest) (compile-listp (cadr form) env dest)))
+      ((= op-name 1005235261373835305)     (when (arity-ok-p form 1 1 env dest) (compile-symbolp (cadr form) env dest)))
+      ((= op-name 701502595840197579)      (when (arity-ok-p form 1 1 env dest) (compile-obj-subtag (cadr form) env dest)))
+      ((= op-name 1091515641497713485)     (when (arity-ok-p form 1 1 env dest) (compile-bignump (cadr form) env dest)))
+      ((= op-name 1024588698656382250)     (when (arity-ok-p form 1 1 env dest) (compile-stringp (cadr form) env dest)))
+      ((= op-name 959229030243575902)      (when (arity-ok-p form 1 1 env dest) (compile-arrayp (cadr form) env dest)))
+      ((= op-name 467922512990154729)      (when (arity-ok-p form 1 1 env dest) (compile-integerp (cadr form) env dest)))
+      ((= op-name 641752649465622469)      (when (arity-ok-p form 1 1 env dest) (compile-zerop (cadr form) env dest)))
+      ((= op-name 322465010757792166)      (when (arity-ok-p form 1 1 env dest) (compile-characterp (cadr form) env dest)))
 
-      ;; --- Character Operations ---
-      ((= op-name 511431138979586071) (compile-char-code (cadr form) env dest))
-      ((= op-name 632535660519644111) (compile-code-char (cadr form) env dest))
+      ;; --- Character Operations (1-arg) ---
+      ((= op-name 511431138979586071) (when (arity-ok-p form 1 1 env dest) (compile-char-code (cadr form) env dest)))
+      ((= op-name 632535660519644111) (when (arity-ok-p form 1 1 env dest) (compile-code-char (cadr form) env dest)))
 
       ;; --- EQL (same as EQ for fixnums/chars/symbols) ---
       ((= op-name 743927193407775751)      (compile-eq (cdr form) env dest))
       ;; NOTE: EQUAL (hash 777630921077348411) is NOT inlined as EQ — it's a
       ;; user-defined function (structural equality), dispatched via compile-call.
 
-      ;; --- Memory Operations ---
-      ((= op-name 900047298083458158)  (compile-mem-ref (cadr form) (caddr form) env dest))
-      ((= op-name 61397303667544258) (compile-setf (cadr form) (caddr form) env dest))
+      ;; --- Memory Operations (2-arg) ---
+      ((= op-name 900047298083458158)  (when (arity-ok-p form 2 2 env dest) (compile-mem-ref (cadr form) (caddr form) env dest)))
+      ((= op-name 61397303667544258)   (when (arity-ok-p form 2 2 env dest) (compile-setf (cadr form) (caddr form) env dest)))
 
       ;; --- I/O Port Operations ---
       ((= op-name 951008440734391765)  (compile-io-out-byte (cadr form) (caddr form) env dest))
@@ -4296,6 +4293,17 @@
    &rest arg construction, which has edge cases we hit when emitting
    from within a dispatch branch."
   (compile-form '(%signal-program-error) env dest))
+
+(defun arity-ok-p (form min-args max-args env dest)
+  "Return T if FORM has [min-args..max-args] arguments (after the head).
+   If wrong, emit compile-arity-error and return NIL. Used by inline
+   dispatch cases in compile-compound-form to catch wrong-arity calls
+   on builtins (e.g. (cons), (car), (null a b))."
+  (let ((n (- (length form) 1)))
+    (if (and (>= n min-args)
+             (or (null max-args) (<= n max-args)))
+        t
+        (progn (compile-arity-error env dest) nil))))
 
 (defun compile-cons (car-arg cdr-arg env dest)
   "Compile (cons x y) -> MVM cons instruction (allocating).

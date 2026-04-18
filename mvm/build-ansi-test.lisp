@@ -1710,6 +1710,13 @@
                                     nil))
                                 (list form)))
                           forms))
+            ;; Re-run rewrite-earmuff-specials after macroexpansion. The
+            ;; def-print-test/def-format-test templates expand to (let
+            ;; ((*print-base* 2) ...) ...) bindings whose earmuff vars need
+            ;; (declare (special ...)) so prin1 inside the body sees the
+            ;; dynamic binding via symbol-value. The first rewrite pass
+            ;; ran before macro expansion and couldn't see these.
+            (setf forms (mapcar #'rewrite-earmuff-specials forms))
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
               (dolist (form forms)

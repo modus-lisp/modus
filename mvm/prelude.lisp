@@ -225,16 +225,47 @@
               (when (eql (aref seq i) item) (return i))
               (setq i (+ i 1)))))))
 
-(defun remove-if (pred list)
-  "Return a new list with elements for which PRED returns non-nil removed.
-   PRED must be a function (use with funcall)."
-  (let ((result nil)
-        (cur list))
-    (loop
-      (when (null cur) (return (nreverse result)))
-      (unless (funcall pred (car cur))
-        (setq result (cons (car cur) result)))
-      (setq cur (cdr cur)))))
+(defun remove-if (pred seq)
+  "Return a new sequence with elements for which PRED returns non-nil removed.
+   Polymorphic over list / string / plain array — returns the same shape."
+  (cond
+    ((or (null seq) (consp seq))
+     (let ((result nil)
+           (cur seq))
+       (loop
+         (when (null cur) (return (nreverse result)))
+         (unless (funcall pred (car cur))
+           (setq result (cons (car cur) result)))
+         (setq cur (cdr cur)))))
+    ((stringp seq)
+     ;; Count kept, allocate sized string, copy slot-wise (slots are fixnums).
+     (let ((len (array-length seq))
+           (kept 0))
+       (let ((i 0))
+         (loop (when (= i len) (return nil))
+           (unless (funcall pred (aref seq i))
+             (setq kept (+ kept 1)))
+           (setq i (+ i 1))))
+       (let ((out (%make-string-array kept)) (i 0) (j 0))
+         (loop (when (= i len) (return out))
+           (unless (funcall pred (aref seq i))
+             (aset out j (aref seq i))
+             (setq j (+ j 1)))
+           (setq i (+ i 1))))))
+    (t
+     (let ((len (array-length seq))
+           (kept 0))
+       (let ((i 0))
+         (loop (when (= i len) (return nil))
+           (unless (funcall pred (aref seq i))
+             (setq kept (+ kept 1)))
+           (setq i (+ i 1))))
+       (let ((out (make-array kept)) (i 0) (j 0))
+         (loop (when (= i len) (return out))
+           (unless (funcall pred (aref seq i))
+             (aset out j (aref seq i))
+             (setq j (+ j 1)))
+           (setq i (+ i 1))))))))
 
 ;;; ============================================================
 ;;; Higher-Order Functions

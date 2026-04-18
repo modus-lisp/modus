@@ -380,7 +380,7 @@
               (%hc-longjmp)
               (progn
                 (write-string-serial "ERR:")
-                (write-byte 10)
+                (write-char-serial 10)
                 (halt)))))))
 
 (defun signal (datum &rest args)
@@ -441,7 +441,7 @@
               (%hc-longjmp)
               (progn
                 (write-string-serial "ERR:")
-                (write-byte 10)
+                (write-char-serial 10)
                 (halt))))))
   nil)
 
@@ -767,7 +767,7 @@
   "Stub — just signal the error."
   (if (%error-handler-active-p)
       (%hc-longjmp)
-      (progn (write-string-serial "DEBUG:") (write-byte 10) (halt))))
+      (progn (write-string-serial "DEBUG:") (write-char-serial 10) (halt))))
 
 ;;; --- Override typep for package type ---
 

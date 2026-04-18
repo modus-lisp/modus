@@ -279,11 +279,17 @@
           (setq a (cdr a))
           (setq b (cdr b))))))
 
-(defun reduce (fn list keyword initial-value)
-  "Fold FN over LIST with INITIAL-VALUE. KEYWORD is ignored (bare-metal
-   positional stand-in for CL :initial-value keyword)."
-  (let ((acc initial-value)
-        (cur list))
+(defun reduce (fn list &rest args)
+  "Fold FN over LIST. Optional :initial-value (taken positionally as
+   args[1] when args[0] is the keyword stand-in). Matches the existing
+   call sites that pass either (reduce fn list) or
+   (reduce fn list :initial-value v)."
+  (let* ((init (cond
+                 ((null args) nil)
+                 ((cdr args) (cadr args))   ; (... :initial-value V)
+                 (t nil)))
+         (acc init)
+         (cur list))
     (loop
       (when (null cur) (return acc))
       (setq acc (funcall fn acc (car cur)))
@@ -775,8 +781,11 @@
 
 (defvar *gensym-counter* 0)
 
-(defun gensym (prefix)
-  "Generate a unique integer ID. PREFIX is ignored on bare metal."
+(defun gensym (&optional prefix)
+  "Generate a unique integer ID. PREFIX is ignored on bare metal.
+   ANSI gensym takes &optional prefix; making this an &optional matches
+   that and lets compile-call's arity check distinguish (gensym) (valid)
+   from (gensym 1 2 3) (invalid)."
   (let ((n *gensym-counter*))
     (setq *gensym-counter* (+ *gensym-counter* 1))
     n))

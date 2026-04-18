@@ -888,11 +888,14 @@
                 ;; (setf (svref a i) v) → (aset a i v)
                 ((and (consp place) (name-eq (car place) "SVREF"))
                  `(aset ,(cadr place) ,(caddr place) ,value))
-                ;; Generic struct accessor: (setf (foo-bar x) v) → (set-foo-bar x v)
+                ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
+                ;; Pass ALL place args plus the value (was only passing the
+                ;; first arg, which silently dropped the index in
+                ;; (setf (char s i) ch) → (set-char s ch) and similar).
                 ((consp place)
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
                                        :modus.mvm)))
-                   `(,setter ,(cadr place) ,value)))))))))
+                   `(,setter ,@(cdr place) ,value)))))))))
 
   ;; DEFSETF — register a setf expander.
   ;;   Short form:  (defsetf accessor setter-fn [doc])
@@ -6259,15 +6262,18 @@
                             (string= (symbol-name (car raw-name)) "SETF"))
                        (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                        raw-name)))
-         ;; Detect &rest before preprocessing strips it
-         (let ((rest-pos (position '&rest params))
-               (pp (preprocess-params params body)))
+         ;; Detect &rest, &optional, &key before preprocessing strips them
+         ;; so we can compute required-count for arity checks.
+         (let* ((rest-pos (position '&rest params))
+                (opt-pos  (position '&optional params))
+                (key-pos  (position '&key params))
+                (req-end  (or rest-pos opt-pos key-pos (length params)))
+                (pp (preprocess-params params body)))
            (let ((result (mvm-compile-function name (car pp) (cdr pp))))
-             ;; Record &rest info in function-info
-             (when rest-pos
-               (let ((info (car result)))
-                 (setf (function-info-rest-param-p info) t)
-                 (setf (function-info-required-count info) rest-pos)))
+             (let ((info (car result)))
+               (setf (function-info-required-count info) req-end)
+               (when rest-pos
+                 (setf (function-info-rest-param-p info) t)))
              result)))))
 
     ;; (defvar name &optional value)

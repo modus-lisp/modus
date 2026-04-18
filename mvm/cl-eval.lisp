@@ -996,7 +996,7 @@
   nil)
 
 (defun not-mv (x) (not x))
-(defun check-values (fn expected) nil)
+(defun check-values (fn &optional expected) (declare (ignore expected)) fn)
 
 (defun string-upcase (str &rest args)
   "Convert string to uppercase."

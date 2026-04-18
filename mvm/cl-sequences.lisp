@@ -74,6 +74,8 @@
           (copy-alist (cdr alist)))))
 
 (defun nthcdr (n list)
+  (when (or (not (fixnump n)) (< n 0))
+    (%signal-type-error))
   (let ((i 0) (cur list))
     (loop
       (when (= i n) (return cur))
@@ -202,8 +204,10 @@
 (defun %unresolved-fn () nil)
 
 (defun nbutlast (list &rest n-arg)
-  "Destructive butlast."
+  "Destructive butlast. Signals TYPE-ERROR on negative or non-fixnum N."
   (let ((n (if n-arg (car n-arg) 1)))
+    (when (or (not (fixnump n)) (< n 0))
+      (%signal-type-error))
     (let ((len (list-length list)))
       (if (or (null len) (<= len n)) nil
         (let ((tail (nthcdr (- len n 1) list)))
@@ -230,7 +234,11 @@
 
 (defun assert (test-form) (if test-form t nil))
 (defun equalp (a b) (equalp-impl a b))
-(defun elt (seq idx) (if (consp seq) (nth idx seq) (aref seq idx)))
+(defun elt (seq idx)
+  ;; Signal TYPE-ERROR for negative or non-fixnum index.
+  (when (or (not (fixnump idx)) (< idx 0))
+    (%signal-type-error))
+  (if (consp seq) (nth idx seq) (aref seq idx)))
 (defun string= (a b) (string-equal a b))
 (defun string/= (a b) (if (string-equal a b) nil t))
 ;;; constantly: captures value. Use global cell.

@@ -23,7 +23,11 @@
   (null x))
 
 (defun nth (n list)
-  "Return the Nth element of LIST (0-indexed)."
+  "Return the Nth element of LIST (0-indexed). Signals TYPE-ERROR if N
+   is not a non-negative fixnum (matches the ANSI requirement that N
+   be of type unsigned-byte)."
+  (when (or (not (fixnump n)) (< n 0))
+    (%signal-type-error))
   (let ((i 0)
         (cur list))
     (loop
@@ -33,7 +37,10 @@
       (setq cur (cdr cur)))))
 
 (defun nthcdr (n list)
-  "Return the Nth cdr of LIST."
+  "Return the Nth cdr of LIST. Signals TYPE-ERROR on negative or
+   non-fixnum N."
+  (when (or (not (fixnump n)) (< n 0))
+    (%signal-type-error))
   (let ((i 0)
         (cur list))
     (loop
@@ -43,8 +50,11 @@
       (setq cur (cdr cur)))))
 
 (defun last (list &rest n-arg)
-  "Return the last N cons cells of LIST. N defaults to 1."
+  "Return the last N cons cells of LIST. N defaults to 1.
+   Signals TYPE-ERROR if N is not a non-negative fixnum."
   (let ((n (if n-arg (car n-arg) 1)))
+    (when (or (not (fixnump n)) (< n 0))
+      (%signal-type-error))
     (if (null list)
         nil
         (let ((len 0) (cur list))
@@ -138,7 +148,10 @@
 ;;; ============================================================
 
 (defun member (item list)
-  "Return the tail of LIST starting from the first element EQL to ITEM."
+  "Return the tail of LIST starting from the first element EQL to ITEM.
+   Signals TYPE-ERROR if LIST is not a list (i.e. not nil and not a cons)."
+  (when (and (not (null list)) (not (consp list)))
+    (%signal-type-error))
   (let ((cur list))
     (loop
       (when (null cur) (return nil))

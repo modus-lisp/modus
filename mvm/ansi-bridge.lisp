@@ -202,6 +202,8 @@
 
 (defun butlast (list &rest n-arg)
   (let ((n (if n-arg (car n-arg) 1)))
+    (when (or (not (fixnump n)) (< n 0))
+      (%signal-type-error))
     (let ((len (list-length list)))
       (if (<= len n) nil
         (let ((result nil) (i 0) (cur list))
@@ -1081,30 +1083,42 @@
 ;;; ============================================================
 ;;; C*R Extensions (4-deep)
 ;;; ============================================================
+;;;
+;;; Use %safe-car / %safe-cdr at each composition step so that calling
+;;; e.g. (cdaaar 'a) signals TYPE-ERROR (per ANSI) rather than silently
+;;; dereferencing garbage at the symbol's "car slot".
 
-(defun caaar (x) (car (caar x)))
-(defun caadr (x) (car (cadr x)))
-(defun cadar (x) (car (cdar x)))
-(defun cdaar (x) (cdr (caar x)))
-(defun cdadr (x) (cdr (cadr x)))
-(defun cddar (x) (cdr (cdar x)))
+(defun %safe-car (x)
+  (if (consp x) (car x)
+      (if (null x) nil (%signal-type-error))))
 
-(defun caaaar (x) (car (caaar x)))
-(defun caaadr (x) (car (caadr x)))
-(defun caadar (x) (car (cadar x)))
-(defun caaddr (x) (car (caddr x)))
-(defun cadaar (x) (car (cdaar x)))
-(defun cadadr (x) (car (cdadr x)))
-(defun caddar (x) (car (cddar x)))
-(defun cadddr (x) (car (cdddr x)))
-(defun cdaaar (x) (cdr (caaar x)))
-(defun cdaadr (x) (cdr (caadr x)))
-(defun cdadar (x) (cdr (cadar x)))
-(defun cdaddr (x) (cdr (caddr x)))
-(defun cddaar (x) (cdr (cdaar x)))
-(defun cddadr (x) (cdr (cdadr x)))
-(defun cdddar (x) (cdr (cddar x)))
-(defun cddddr (x) (cdr (cdddr x)))
+(defun %safe-cdr (x)
+  (if (consp x) (cdr x)
+      (if (null x) nil (%signal-type-error))))
+
+(defun caaar (x) (%safe-car (%safe-car (%safe-car x))))
+(defun caadr (x) (%safe-car (%safe-car (%safe-cdr x))))
+(defun cadar (x) (%safe-car (%safe-cdr (%safe-car x))))
+(defun cdaar (x) (%safe-cdr (%safe-car (%safe-car x))))
+(defun cdadr (x) (%safe-cdr (%safe-car (%safe-cdr x))))
+(defun cddar (x) (%safe-cdr (%safe-cdr (%safe-car x))))
+
+(defun caaaar (x) (%safe-car (caaar x)))
+(defun caaadr (x) (%safe-car (caadr x)))
+(defun caadar (x) (%safe-car (cadar x)))
+(defun caaddr (x) (%safe-car (caddr x)))
+(defun cadaar (x) (%safe-car (cdaar x)))
+(defun cadadr (x) (%safe-car (cdadr x)))
+(defun caddar (x) (%safe-car (cddar x)))
+(defun cadddr (x) (%safe-car (cdddr x)))
+(defun cdaaar (x) (%safe-cdr (caaar x)))
+(defun cdaadr (x) (%safe-cdr (caadr x)))
+(defun cdadar (x) (%safe-cdr (cadar x)))
+(defun cdaddr (x) (%safe-cdr (caddr x)))
+(defun cddaar (x) (%safe-cdr (cdaar x)))
+(defun cddadr (x) (%safe-cdr (cdadr x)))
+(defun cdddar (x) (%safe-cdr (cddar x)))
+(defun cddddr (x) (%safe-cdr (cdddr x)))
 
 ;;; ============================================================
 ;;; Bitwise Logic Extensions

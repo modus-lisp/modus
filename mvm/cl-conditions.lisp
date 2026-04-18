@@ -910,22 +910,24 @@
   (%install-signal-handlers))
 
 (defun %signal-program-error ()
-  "Runtime helper for compile-arity-error: signal a PROGRAM-ERROR
-   condition so the enclosing handler-case can catch it.
-   Used when a CL primitive is called with the wrong arg count;
-   the ANSI signals-error tests expect this behavior.
-
-   Sidestep make-condition (which has a complex slot-collection path
-   that's been flaky) and just long-jump directly after setting
-   *current-condition* to a pre-built minimal condition object."
+  "Runtime helper: signal a PROGRAM-ERROR condition for handler-case.
+   Used by the compiler for arity errors. Sidesteps make-condition,
+   which has a complex slot-collection path that's been flaky."
   (let ((c (make-array 2)))
     (aset c 0 'program-error)
     (aset c 1 nil)
     (setq *current-condition* c)
-    (if (%error-handler-active-p)
-        (%hc-longjmp)
-        ;; No handler active — return NIL (won't reach here under handler-case).
-        nil)))
+    (if (%error-handler-active-p) (%hc-longjmp) nil)))
+
+(defun %signal-type-error ()
+  "Runtime helper: signal a TYPE-ERROR condition for handler-case.
+   Used when a CL primitive is called with an argument of the wrong
+   type (e.g. negative index to elt, non-list to nthcdr)."
+  (let ((c (make-array 2)))
+    (aset c 0 'type-error)
+    (aset c 1 nil)
+    (setq *current-condition* c)
+    (if (%error-handler-active-p) (%hc-longjmp) nil)))
 
 ;;; --- Initialize standard packages ---
 

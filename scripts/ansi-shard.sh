@@ -30,14 +30,23 @@ echo "# output dir: $OUTDIR"
 
 start_time=$(date +%s)
 
+# Per-shard wall-clock cap (seconds). Each shard processes ~150 tests; even at
+# 30s/file with our per-file alarm, no shard should run past ~10 min. The cap
+# protects against everything outside the per-file alarm (e.g. a hang in the
+# parent's bookkeeping between fork-files, or a runaway in custom tests before
+# the ANSI section starts).
+SHARD_TIMEOUT=${SHARD_TIMEOUT:-600}
+
 # Launch all shards in parallel. Shard 0 also runs the pre-fork custom tests
-# (it uses start=0 to not skip them).
+# (it uses start=0 to not skip them). `timeout` lets the shard binary write
+# its output normally but kills it if it runs over.
 for i in $(seq 0 $(( SHARDS - 1 ))); do
   lo=$(( FIRST + i * STEP ))
   hi=$(( lo + STEP ))
   if [ $hi -gt $LAST ]; then hi=$LAST; fi
   if [ $i -eq 0 ]; then lo=0; fi     # shard 0 gets pre-fork custom tests too
-  "$BINARY" "$lo" "$hi" > "$OUTDIR/shard-$i.out" 2>&1 &
+  timeout --kill-after=5s "$SHARD_TIMEOUT" \
+    "$BINARY" "$lo" "$hi" > "$OUTDIR/shard-$i.out" 2>&1 &
 done
 
 # Wait for all.
@@ -65,7 +74,10 @@ awk '
   }
   /^FAIL / {
     rest = substr($0, 6)
-    if (match(rest, /^[0-9]+$/)) {
+    # ID-tagged fails may have a trailing " GOT:... EXP:..." annotation
+    # (rt-run-test prints details for the first few failures of each chunk).
+    # Match leading integer id either with or without trailing text.
+    if (match(rest, /^[0-9]+( |$)/)) {
       id = rest + 0
       if (id >= 10001) { ansi_fail[id] = 1 }
       else             { custom_fail[id] = 1 }

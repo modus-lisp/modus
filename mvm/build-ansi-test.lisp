@@ -1693,16 +1693,16 @@
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
-                                            (format nil "(fork-test ~D (lambda () ~S) '~S)"
+                                            (format nil "(run-test ~D (lambda () ~S) '~S)"
                                                     test-id test-form (car expected)))
                                            ((> (length expected) 0)
-                                            (format nil "(fork-test-mv ~D (lambda () (multiple-value-list ~S)) '~S)"
+                                            (format nil "(run-test-mv ~D (lambda () (multiple-value-list ~S)) '~S)"
                                                     test-id test-form expected))
                                            ;; (deftest NAME FORM) with no explicit
                                            ;; expected — test expects zero values.
-                                           ;; Render as fork-test-mv with '() expected.
+                                           ;; Render as run-test-mv with '() expected.
                                            (t
-                                            (format nil "(fork-test-mv ~D (lambda () (multiple-value-list ~S)) 'NIL)"
+                                            (format nil "(run-test-mv ~D (lambda () (multiple-value-list ~S)) 'NIL)"
                                                     test-id test-form)))
                                          (error () nil))))
                          ;; For real.lsp: fix / and - inside backquote commas
@@ -2124,32 +2124,32 @@
 (load-ansi-chapter "/tmp/ansi-test/objects/"
   '("add-method.lsp" "allocate-instance.lsp" "call-next-method.lsp" "change-class.lsp" "class-name.lsp" "class-of.lsp" "compute-applicable-methods.lsp" "defclass-01.lsp" "defclass-02.lsp" "defclass-03.lsp" "defclass-errors.lsp" "defclass-forward-reference.lsp" "defclass.lsp" "defgeneric-method-combination-and.lsp" "defgeneric-method-combination-append.lsp" "defgeneric-method-combination-aux.lsp" "defgeneric-method-combination-list.lsp" "defgeneric-method-combination-max.lsp" "defgeneric-method-combination-min.lsp" "defgeneric-method-combination-nconc.lsp" "defgeneric-method-combination-or.lsp" "defgeneric-method-combination-plus.lsp" "defgeneric-method-combination-progn.lsp" "defgeneric.lsp" "define-method-combination-long-form.lsp" "define-method-combination.lsp" "defmethod.lsp" "ensure-generic-function.lsp" "find-class.lsp" "find-method.lsp" "load.lsp" "make-instance.lsp" "make-instances-obsolete.lsp" "make-load-form-saving-slots.lsp" "make-load-form.lsp" "method-qualifiers.lsp" "next-method-p.lsp" "no-applicable-method.lsp" "no-next-method.lsp" "reinitialize-instance.lsp" "remove-method.lsp" "shared-initialize.lsp" "slot-boundp.lsp" "slot-exists-p.lsp" "slot-makunbound.lsp" "slot-missing.lsp" "slot-unbound.lsp" "slot-value.lsp" "unbound-slot.lsp" "update-instance-for-different-class.lsp" "with-accessors.lsp" "with-slots.lsp" ))
 
-;; Generate run-real-ansi-tests that calls all file-level runners
-(setf *ansi-file-names* (nreverse *ansi-file-names*))
-;; Per-test forking: every rt-run-test becomes (fork-test id thunk expected).
-;; Parent forks, child evaluates the test thunk and runs rt-run-test, then
-;; exits. Parent waits on each child. A crashing test takes out only itself.
+;; Generate run-real-ansi-tests that calls all file-level runners.
 ;;
-;; We have the hardware for it: 128 cores and 1TB RAM — 17K forks is fine.
+;; Per-FILE forking: each (run-ansi-FILE) is wrapped in fork+wait at the
+;; parent. Within a file, tests run in-process: each (run-test ...) wraps
+;; rt-run-test in handler-case so a single test crash becomes a clean FAIL
+;; (caught by SIGSEGV → handler-case longjmp) without taking the file down.
+;;
+;; Why per-file: ANSI test files build up shared state — an early test
+;; defparameters something a later test references. Per-test forking
+;; broke those chains. Files are independent, so per-file fork still
+;; isolates crashes that escape in-process recovery.
+(setf *ansi-file-names* (nreverse *ansi-file-names*))
 (setf *real-ansi-sources*
       (concatenate 'string *real-ansi-sources*
                    (format nil "~%(defvar *skip-below* 0)~
                      ~%(defvar *run-only-below* 0)~
-                     ~%;; Child crash handler: print \"FAIL <id>\\n\" and return nil.~
-                     ~%;; Kept tiny — only fixed serial writes, no allocation.~
-                     ~%(defun %fork-child-fail (id)~
-                     ~%  (write-char-serial 10)~
-                     ~%  (write-char-serial 70) (write-char-serial 65)~
-                     ~%  (write-char-serial 73) (write-char-serial 76)~
-                     ~%  (write-char-serial 32)~
-                     ~%  (print-dec id)~
-                     ~%  (write-char-serial 10)~
-                     ~%  (syscall3 60 0 0 0)     ;; hard-exit from child directly~
-                     ~%  nil)~
-                     ~%;; Parent-side crash handler: called when parent fails during~
-                     ~%;; arg-evaluation of a fork-test (e.g. bad literal). Records a~
-                     ~%;; clean FAIL line so the test doesn't appear lost-to-crash.~
-                     ~%(defun %test-crash-fail (id)~
+                     ~%;; Bound on FAIL lines per fork-child to prevent any pathological~
+                     ~%;; cascade (e.g. nested SIGSEGV in handler) from inflating output.~
+                     ~%(defvar *fail-cap* 200)~
+                     ~%(defvar *fail-emitted* 0)~
+                     ~%;; In-process test runner: rt-run-test wrapped in handler-case.~
+                     ~%;; Side effects (defparameter, setq globals) persist across calls~
+                     ~%;; within the same process — that's the whole point of per-file fork.~
+                     ~%(defun %record-test-fail (id)~
+                     ~%  (when (>= *fail-emitted* *fail-cap*) (return-from %record-test-fail nil))~
+                     ~%  (setq *fail-emitted* (+ *fail-emitted* 1))~
                      ~%  (write-char-serial 10)~
                      ~%  (write-char-serial 70) (write-char-serial 65)~
                      ~%  (write-char-serial 73) (write-char-serial 76)~
@@ -2157,67 +2157,50 @@
                      ~%  (print-dec id)~
                      ~%  (write-char-serial 10)~
                      ~%  nil)~
-                     ~%;; Child MUST establish its own handler-case. If a SIGSEGV~
-                     ~%;; happens without one, the signal stub longjmps to whatever~
-                     ~%;; saved RSP is at [0x10000140] — inherited from the parent's~
-                     ~%;; run-ansi-X handler-case. The child would then resume in~
-                     ~%;; the parent's test loop and fork-bomb the rest of the suite.~
-                     ~%;; Child MUST zero the handler-case saved-RSP inherited from~
-                     ~%;; the parent's run-ansi-FILE wrapper. Otherwise any SIGSEGV~
-                     ~%;; BEFORE the child's own handler-case setjmp runs would~
-                     ~%;; longjmp the child back into parent-space code, silently~
-                     ~%;; skipping rt-run-test and losing the test count.~
+                     ~%(defun run-test (id thunk expected)~
+                     ~%  (when (< id *skip-below*) (return-from run-test nil))~
+                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
+                     ~%  (handler-case (rt-run-test id (funcall thunk) expected)~
+                     ~%    (t (c) (%record-test-fail id))))~
+                     ~%(defun run-test-mv (id thunk expecteds)~
+                     ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
+                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
+                     ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
+                     ~%    (t (c) (%record-test-fail id))))~
                      ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~
-                     ~%;; Lets the parent detect when the child died uncaught (child's~
-                     ~%;; own handler-case couldn't recover; nested SIGSEGV, etc.).~
                      ~%(defvar *wstatus-addr* #x100001A0)~
-                     ~%(defun fork-test (id thunk expected)~
-                     ~%  (when (< id *skip-below*) (return-from fork-test nil))~
-                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from fork-test nil))~
+                     ~%;; Per-FILE fork: parent forks, child runs the file's run-ansi-X~
+                     ~%;; in-process (with run-test handling per-test crashes), then exits.~
+                     ~%;; If the child exit status is nonzero (signal kill or our SIGSEGV~
+                     ~%;; sys_exit path), parent records a single FAIL with the file's~
+                     ~%;; first test id so it isn't double-counted as 'lost to crash'.~
+                     ~%;; Per-file wall-clock cap (seconds). SIGALRM has no handler,~
+                     ~%;; so an over-time child is hard-killed by the kernel and the~
+                     ~%;; parent records a single FAIL with the file's first id.~
+                     ~%(defvar *file-alarm-secs* 30)~
+                     ~%(defun fork-file (first-id thunk)~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
                      ~%        (progn~
-                     ~%          (setf (mem-ref #x10000180 :u64) 0)~
-                     ~%          (syscall3 37 10 0 0)~
-                     ~%          (handler-case (rt-run-test id (funcall thunk) expected)~
-                     ~%            (t (c) (%fork-child-fail id)))~
-                     ~%          (syscall3 60 0 0 0))~
-                     ~%        (progn~
-                     ~%          (setf (mem-ref *wstatus-addr* :u32) 0)~
-                     ~%          (syscall3 61 pid *wstatus-addr* 0)~
-                     ~%          ;; wstatus != 0 → child didn't exit(0). Either killed by~
-                     ~%          ;; a signal or exited with nonzero code (e.g. 139 from our~
-                     ~%          ;; SIGSEGV handler's sys_exit path). Child never emitted~
-                     ~%          ;; P:/FAIL for this id — record a FAIL from the parent.~
-                     ~%          (when (> (mem-ref *wstatus-addr* :u32) 0)~
-                     ~%            (%test-crash-fail id))))))~
-                     ~%(defun fork-test-mv (id thunk expecteds)~
-                     ~%  (when (< id *skip-below*) (return-from fork-test-mv nil))~
-                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from fork-test-mv nil))~
-                     ~%  (let ((pid (syscall3 57 0 0 0)))~
-                     ~%    (if (= pid 0)~
-                     ~%        (progn~
-                     ~%          (setf (mem-ref #x10000180 :u64) 0)~
-                     ~%          (syscall3 37 10 0 0)~
-                     ~%          (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
-                     ~%            (t (c) (%fork-child-fail id)))~
+                     ~%          (setf (mem-ref #x10000140 :u64) 0)~
+                     ~%          (setq *fail-emitted* 0)~
+                     ~%          (syscall3 37 *file-alarm-secs* 0 0)~
+                     ~%          (handler-case (funcall thunk) (t (c) nil))~
                      ~%          (syscall3 60 0 0 0))~
                      ~%        (progn~
                      ~%          (setf (mem-ref *wstatus-addr* :u32) 0)~
                      ~%          (syscall3 61 pid *wstatus-addr* 0)~
                      ~%          (when (> (mem-ref *wstatus-addr* :u32) 0)~
-                     ~%            (%test-crash-fail id))))))~%")
+                     ~%            (%record-test-fail first-id))))))~%")
                    (with-output-to-string (s)
                      ;; Helper: return T iff the active shard range [skip..run-only)
                      ;; overlaps [first..last]. Run-only=0 means "no upper bound".
-                     ;; Simpler expression than the inline (or (and...) (and...))
-                     ;; chain — easier for the MVM compiler and debugger.
                      (format s "~%(defun %ansi-file-in-range (first last)~%")
                      (format s "  (if (> *run-only-below* 0)~%")
                      (format s "      (if (< last *skip-below*) nil (if (>= first *run-only-below*) nil t))~%")
                      (format s "      t))~%")
                      (format s "~%(defun run-real-ansi-tests ()~%")
-                     ;; Each file is guarded by an ID-range overlap check.
+                     ;; Each file is fork+wait wrapped, gated by the shard range.
                      (let ((by-name nil))
                        (dolist (entry *ansi-file-ranges*)
                          (push entry by-name))
@@ -2228,9 +2211,9 @@
                            (cond
                              ((and first-id last-id)
                               (format s "  (when (%ansi-file-in-range ~D ~D)~%" first-id last-id)
-                              (format s "    (handler-case (run-ansi-~A) (t (c) nil)))~%" name))
+                              (format s "    (fork-file ~D (lambda () (run-ansi-~A))))~%" first-id name))
                              (t
-                              (format s "  (handler-case (run-ansi-~A) (t (c) nil))~%" name))))))
+                              (format s "  (fork-file 0 (lambda () (run-ansi-~A)))~%" name))))))
                      (format s ")~%"))))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
@@ -2356,6 +2339,9 @@
   (setq *skip-below* 0)
   (setq *run-only-below* 0)
   (setq *write-object-budget* 0)
+  (setq *fail-emitted* 0)
+  (setq *fail-cap* 200)
+  (setq *file-alarm-secs* 30)
   (setq *wstatus-addr* #x100001A0)
 
   ;; Parse argv from BSS (boot stub writes argc/argv there).

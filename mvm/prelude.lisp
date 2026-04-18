@@ -634,8 +634,16 @@
           (loop
             (cond
               ((null tail) (return nil))
-              ((<= *write-object-budget* 0) (return nil))
+              ((<= *write-object-budget* 0)
+               ;; Budget exhausted mid-list: emit ellipsis once and stop.
+               (write-char-serial 32) (write-char-serial 46)
+               (write-char-serial 46) (write-char-serial 46)
+               (return nil))
               ((consp tail)
+               ;; Each list element consumes one unit of budget so cons-of-fixnum
+               ;; lists (which print fixnums unconditionally without decrementing)
+               ;; are still bounded.
+               (setq *write-object-budget* (- *write-object-budget* 1))
                (write-char-serial 32)
                (write-object (car tail))
                (setq tail (cdr tail)))
@@ -660,8 +668,15 @@
         (let ((len (array-length obj)) (i 0))
           (loop
             (when (= i len) (return nil))
-            (when (<= *write-object-budget* 0) (return nil))
-            (when (> i 0) (write-char-serial 32))
+            (when (<= *write-object-budget* 0)
+              (write-char-serial 32) (write-char-serial 46)
+              (write-char-serial 46) (write-char-serial 46)
+              (return nil))
+            (when (> i 0)
+              ;; Same per-element charge as the cons case — fixnums don't
+              ;; consume budget on their own, so the array itself must.
+              (setq *write-object-budget* (- *write-object-budget* 1))
+              (write-char-serial 32))
             (write-object (aref obj i))
             (setq i (+ i 1))))
         (write-char-serial 41))

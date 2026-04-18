@@ -50,6 +50,13 @@
   "Like my-equal but returns exactly T."
   (if (my-equal a b) t nil))
 
+;; Override ansi-bridge's equalpt (which used rt-equal).  rt-equal's deep
+;; if-chain trips a register-allocation issue when called from inside
+;; lambda bodies that ALSO contain large let-with-specials forms — the
+;; very pattern emitted by def-print-test for every PRINT.* test.  Using
+;; my-equal here matches equalt and dodges the crash.
+(defun equalpt (a b) (if (my-equal a b) t nil))
+
 (defun notnot (x)
   "Coerce to boolean: nil → nil, anything else → t."
   (if x t nil))
@@ -565,6 +572,36 @@
   ;; for/to (no from — should default to 0)
   (deftest 2099 (loop for i to 5 collect i)
                 (cons 0 (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil)))))))
+  ;; Call a lambda that does the full print-integers.1 body — matches what
+  ;; codegen produces for def-print-test. If this hangs/crashes, the bug
+  ;; is in lambda compilation of nested lets-with-specials rather than
+  ;; in the body itself.
+  (deftest 2098
+    (funcall
+     (lambda ()
+       (if (equalpt
+            (let ((*package* (find-package "COMMON-LISP-USER"))
+                  (*print-array* t) (*print-base* 10) (*print-case* :upcase)
+                  (*print-circle* nil) (*print-escape* t) (*print-gensym* t)
+                  (*print-length* nil) (*print-level* nil) (*print-readably* t)
+                  (*print-pretty* nil) (*print-radix* nil) (*read-base* 10)
+                  (*read-suppress* nil) (*read-eval* t))
+              (declare (special *package* *print-array* *print-base* *print-case*
+                                *print-circle* *print-escape* *print-gensym*
+                                *print-length* *print-level* *print-readably*
+                                *print-pretty* *print-radix*
+                                *read-base* *read-suppress* *read-eval*))
+              (let ((*print-readably* nil))
+                (declare (special *print-readably*))
+                (let ()
+                  (let ((*standard-output* (make-string-output-stream)))
+                    (declare (special *standard-output*))
+                    (prin1 1)
+                    (get-output-stream-string *standard-output*)))))
+            "1")
+           t
+           "1")))
+    t)
   ;; for/from/below
   (deftest 2001 (loop for i from 0 below 3 collect i)
                 (cons 0 (cons 1 (cons 2 nil))))

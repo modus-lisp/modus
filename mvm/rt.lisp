@@ -81,37 +81,31 @@
         nil)))
 
 (defun rt-equal (a b)
-  "Structural equality for RT comparisons."
-  (if (eql a b)
-      t
-      (if (consp a)
-          (if (rt-array-wrapper-p a)
-              ;; Convert wrapper to string for comparison
-              (rt-equal (rt-wrapper-to-string a) b)
-              (if (consp b)
-                  (if (rt-array-wrapper-p b)
-                      (rt-equal a (rt-wrapper-to-string b))
-                      (if (rt-equal (car a) (car b))
-                          (rt-equal (cdr a) (cdr b))
-                          nil))
-                  nil))
-          (if (rt-floatp a)
-              (if (rt-floatp b)
-                  (rt-float-equal a b)
-                  nil)
-              (if (stringp a)
-                  (if (stringp b)
-                      (string-equal a b)
-                      (if (consp b)
-                          (if (rt-array-wrapper-p b)
-                              (rt-equal a (rt-wrapper-to-string b))
-                              nil)
-                          nil))
-                  (if (rt-arrayp a)
-                      (if (rt-arrayp b)
-                          (rt-array-equal a b)
-                          nil)
-                      nil))))))
+  "Structural equality for RT comparisons.
+   Flattened to cond so the compiler doesn't run out of registers on
+   the deeply-nested IF chain (which crashed inside (equalpt STR STR)
+   when called from a lambda body with lots of ambient special vars)."
+  (cond
+    ((eql a b) t)
+    ;; Cons + wrapper handling.
+    ((and (consp a) (rt-array-wrapper-p a))
+     (rt-equal (rt-wrapper-to-string a) b))
+    ((and (consp b) (rt-array-wrapper-p b))
+     (rt-equal a (rt-wrapper-to-string b)))
+    ;; Plain cons-cell equality.
+    ((and (consp a) (consp b))
+     (if (rt-equal (car a) (car b))
+         (rt-equal (cdr a) (cdr b))
+         nil))
+    ;; One is cons, one isn't — not equal.
+    ((or (consp a) (consp b)) nil)
+    ;; Float equality.
+    ((and (rt-floatp a) (rt-floatp b)) (rt-float-equal a b))
+    ;; Strings.
+    ((and (stringp a) (stringp b)) (string-equal a b))
+    ;; Plain arrays.
+    ((and (rt-arrayp a) (rt-arrayp b)) (rt-array-equal a b))
+    (t nil)))
 
 (defun deftest (id actual expected &rest extra-expected)
   "Run a test: compare ACTUAL with EXPECTED using rt-equal.

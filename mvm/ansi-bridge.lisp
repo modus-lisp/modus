@@ -30,6 +30,8 @@
   (if (rt-equal a b) t nil))
 
 (defun equalpt (a b)
+  "Pure T/NIL equalpt — equivalent to equalt, kept separate because some
+   ANSI tests reference it by name (e.g. via def-print-test templates)."
   (if (rt-equal a b) t nil))
 
 (defun notnot (x)

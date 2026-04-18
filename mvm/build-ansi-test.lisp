@@ -1710,12 +1710,21 @@
                                     nil))
                                 (list form)))
                           forms))
-            ;; Re-run rewrite-earmuff-specials after macroexpansion. The
-            ;; def-print-test/def-format-test templates expand to (let
-            ;; ((*print-base* 2) ...) ...) bindings whose earmuff vars need
-            ;; (declare (special ...)) so prin1 inside the body sees the
-            ;; dynamic binding via symbol-value. The first rewrite pass
-            ;; ran before macro expansion and couldn't see these.
+            ;; Re-run select rewriters after macroexpansion. Macros like
+            ;; def-print-test/def-format-test expand to forms that contain
+            ;; their own (let ((*print-base* 2) ...) ...) bindings and
+            ;; with-output-to-string / with-standard-io-syntax forms — none
+            ;; of which existed in the input forms the first-pass rewriters
+            ;; saw. Re-running here:
+            ;;   - earmuff-specials adds (declare (special ...)) to inner
+            ;;     let bindings of *print-* / *read-* vars (was the +109
+            ;;     win in the previous commit).
+            ;;   - reader-forms expands with-output-to-string into a let
+            ;;     and with-standard-io-syntax into %with-standard-io-syntax
+            ;;     (lambda) so the runtime path is consistent.
+            (setf forms (mapcar #'rewrite-reader-forms forms))
+            (setf forms (mapcar #'rewrite-multi-arg-apply forms))
+            (setf forms (mapcar #'rewrite-aux-params forms))
             (setf forms (mapcar #'rewrite-earmuff-specials forms))
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)

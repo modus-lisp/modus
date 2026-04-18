@@ -768,16 +768,26 @@
               (values-list ,result-var))
            `(values-list (multiple-value-list ,first-form)))))
     ;; (with-output-to-string (var &optional string-form) body...)
-    ;; → (let ((var (make-string-output-stream))) (progn body...) (get-output-stream-string var))
+    ;; → (let ((var (make-string-output-stream))) body... (get-output-stream-string var))
+    ;; If var is an earmuff special (e.g. *standard-output*), add (declare
+    ;; (special var)) so prin1/format inside the body see the new binding
+    ;; via dynamic lookup. Without this, the binding is lexical, prin1 reads
+    ;; the global *standard-output* (often nil → serial fallback), and the
+    ;; captured output ends up empty.
     ((and (eq (car form) 'with-output-to-string)
           (cdr form) (consp (cadr form)))
      (let* ((binding (cadr form))
             (stream-var (car binding))
-            (body (mapcar #'rewrite-reader-forms (cddr form))))
-       ;; stream-var could be *standard-output* or any symbol
-       `(let ((,stream-var (make-string-output-stream)))
-          ,@body
-          (get-output-stream-string ,stream-var))))
+            (body (mapcar #'rewrite-reader-forms (cddr form)))
+            (is-special (and (symbolp stream-var) (%earmuff-sym-p stream-var))))
+       (if is-special
+           `(let ((,stream-var (make-string-output-stream)))
+              (declare (special ,stream-var))
+              ,@body
+              (get-output-stream-string ,stream-var))
+           `(let ((,stream-var (make-string-output-stream)))
+              ,@body
+              (get-output-stream-string ,stream-var)))))
     ;; (with-standard-io-syntax body...) → (%with-standard-io-syntax (lambda () body...))
     ((and (eq (car form) 'with-standard-io-syntax) (cdr form))
      (let ((body (mapcar #'rewrite-reader-forms (cdr form))))
@@ -795,9 +805,36 @@
             (body (mapcar #'rewrite-reader-forms (cddr form))))
        `(%print-unreadable-object ,obj ,stream ,type-p ,identity-p
                                   ,(if body `(lambda () ,@body) nil))))
-    ;; (my-with-standard-io-syntax body...) when called as macro form
-    ;; — handle both (my-with-standard-io-syntax (lambda () ...)) and direct body
-    ;; Actually it's a function, so just leave it
+    ;; (my-with-standard-io-syntax body...) — printer-aux.lsp's def-print-test
+    ;; redefines def-print-test (when we eval its defmacro from load-ansi-aux)
+    ;; to omit the lambda wrap, so the test bodies arrive here as a direct
+    ;; form rather than a thunk. Our runtime my-with-standard-io-syntax is a
+    ;; function (takes a thunk), so calling it on a direct form would funcall
+    ;; the form's value (e.g., a string) and crash. Expand at codegen time
+    ;; into the same let-bindings the ANSI-aux macro produces.
+    ((and (eq (car form) 'my-with-standard-io-syntax) (cdr form))
+     (let ((body (mapcar #'rewrite-reader-forms (cdr form))))
+       `(let ((*package* (find-package "COMMON-LISP-USER"))
+              (*print-array* t)
+              (*print-base* 10)
+              (*print-case* :upcase)
+              (*print-circle* nil)
+              (*print-escape* t)
+              (*print-gensym* t)
+              (*print-length* nil)
+              (*print-level* nil)
+              (*print-readably* t)
+              (*print-pretty* nil)
+              (*print-radix* nil)
+              (*read-base* 10)
+              (*read-suppress* nil)
+              (*read-eval* t))
+          (declare (special *package* *print-array* *print-base* *print-case*
+                            *print-circle* *print-escape* *print-gensym*
+                            *print-length* *print-level* *print-readably*
+                            *print-pretty* *print-radix*
+                            *read-base* *read-suppress* *read-eval*))
+          ,@body)))
     ;; (formatter string) → (formatter string) — runtime function
     ;; (pprint-logical-block (stream list &key) body...) → simplified
     ((and (eq (car form) 'pprint-logical-block)
@@ -2193,7 +2230,12 @@
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
                      ~%        (progn~
-                     ~%          (setf (mem-ref #x10000140 :u64) 0)~
+                     ~%          ;; Clear inherited handler-case saved-RSP at 0x10000180~
+                     ~%          ;; (moved from 0x10000140 to avoid closure-env-addr collision).~
+                     ~%          ;; If we don't clear, a SIGSEGV in the child BEFORE its own~
+                     ~%          ;; handler-case setjmp would longjmp using the parent's stale~
+                     ~%          ;; RSP/RBP/IP — jumping to garbage and killing the fork silently.~
+                     ~%          (setf (mem-ref #x10000180 :u64) 0)~
                      ~%          (setq *fail-emitted* 0)~
                      ~%          (syscall3 37 *file-alarm-secs* 0 0)~
                      ~%          (handler-case (funcall thunk) (t (c) nil))~

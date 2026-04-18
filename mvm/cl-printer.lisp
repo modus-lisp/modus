@@ -49,11 +49,15 @@
               (setq tmp (truncate tmp base)))
             (dolist (d digits) (%print-char d stream))))))
 
-;;; Print radix prefix: #b, #o, #x, #Nr
+;;; Print radix prefix: #b, #o, #x, #Nr. Base 10 with *print-radix* is
+;;; conventionally written with a TRAILING dot (not a leading prefix), so
+;;; this function skips base 10 — caller is responsible for emitting the
+;;; trailing dot in that case.
 (defun %print-radix-prefix (base stream)
   (cond
     ((= base 2)  (%print-char 35 stream) (%print-char 98 stream))  ; #b
     ((= base 8)  (%print-char 35 stream) (%print-char 111 stream)) ; #o
+    ((= base 10) nil)                                              ; handled by trailing dot
     ((= base 16) (%print-char 35 stream) (%print-char 120 stream)) ; #x
     (t (%print-char 35 stream)
        (%print-decimal-to-stream base stream)
@@ -191,6 +195,13 @@
 ;;; LEVEL: current nesting level (nil = not tracking)
 ;;; ESCAPE: current escape setting
 (defun %write-obj (obj stream level escape)
+  ;; These *print-* vars are declared special so the let below reads them
+  ;; via dynamic (symbol-value) lookup rather than lexical/global. Tests
+  ;; that do (let ((*print-base* 2)) (prin1 N)) expect the printer to see
+  ;; the dynamic binding — without this declare it read the global.
+  (declare (special *print-length* *print-level* *print-base* *print-radix*
+                    *print-case* *print-escape* *print-readably*
+                    *print-gensym* *print-array*))
   (let ((plen *print-length*)
         (plev *print-level*)
         (pbase *print-base*)
@@ -230,7 +241,10 @@
       ;; Integer (fixnum)
       ((fixnump obj)
        (when pradix (%print-radix-prefix pbase stream))
-       (%print-integer-in-base obj pbase stream))
+       (%print-integer-in-base obj pbase stream)
+       ;; Base 10 with *print-radix* uses TRAILING dot, not a prefix.
+       (when (and pradix (= pbase 10))
+         (%print-char 46 stream)))
       ;; Float
       ((floatp-impl obj)
        ;; Use standard float printing

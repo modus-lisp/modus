@@ -113,10 +113,16 @@
                           nil)
                       nil))))))
 
-(defun deftest (id actual expected)
+(defun deftest (id actual expected &rest extra-expected)
   "Run a test: compare ACTUAL with EXPECTED using rt-equal.
    ID is an integer test number OR a symbol (for define-condition tests).
+   ANSI's deftest takes (name form &rest expected-values), so we accept
+   extra trailing expected values via &rest and ignore them — the test
+   harness's MVM-side bridge passes either 1 expected (rt-equal) or
+   collects multi-value expected via fork-test-mv, never reaches here
+   with extras except when load-time deftest forms slip through.
    Prints FAIL line on mismatch."
+  (declare (ignore extra-expected))
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (rt-equal actual expected)
       (progn
@@ -140,8 +146,9 @@
         (if (fixnump id) (print-dec id) (write-object id))
         (write-char-serial 10))))
 
-(defun deftest-eq (id actual expected)
+(defun deftest-eq (id actual expected &rest extra-expected)
   "Test with eq comparison (pointer identity)."
+  (declare (ignore extra-expected))
   (setq *rt-test-count* (+ *rt-test-count* 1))
   (if (eq actual expected)
       (progn

@@ -232,14 +232,16 @@
 ;;; Missing CL functions needed by ANSI tests
 ;;; ============================================================
 
-(defun assert (test-form) (if test-form t nil))
+(defun assert (test-form &rest ignored)
+  (declare (ignore ignored))
+  (if test-form t nil))
 (defun equalp (a b) (equalp-impl a b))
 (defun elt (seq idx)
   ;; Signal TYPE-ERROR for negative or non-fixnum index.
   (when (or (not (fixnump idx)) (< idx 0))
     (%signal-type-error))
   (if (consp seq) (nth idx seq) (aref seq idx)))
-(defun string= (a b) (string-equal a b))
+(defun string= (a b &rest options) (declare (ignore options)) (string-equal a b))
 (defun string/= (a b) (if (string-equal a b) nil t))
 ;;; constantly: captures value. Use global cell.
 (defvar *constantly-value* nil)
@@ -262,7 +264,7 @@
 (defvar *is-eql-p-item* nil)
 (defun is-eql-p (x) (cons #'closure-eql-fn (cons x nil)))
 (defun is-not-eql-p (x) (cons #'closure-not-eql-fn (cons x nil)))
-(defun sort (seq pred) (if (or (null seq) (null (cdr seq))) seq
+(defun sort (seq pred &rest options) (declare (ignore options)) (if (or (null seq) (null (cdr seq))) seq
   (let ((result (list (car seq)))) (dolist (item (cdr seq))
     (if (funcall pred item (car result)) (setq result (cons item result))
       (let ((prev result)) (loop (when (null (cdr prev)) (set-cdr prev (list item)) (return nil))
@@ -443,7 +445,7 @@
 (defun coerce (obj type) (cond ((eq type 'list) (if (consp obj) obj (list obj))) ((eq type 'character) obj) (t obj)))
 (defun mismatch (s1 s2) (let ((l1 (length s1)) (l2 (length s2))) (let ((limit (if (< l1 l2) l1 l2)) (i 0))
   (loop (when (>= i limit) (return (if (= l1 l2) nil i))) (unless (eql (elt s1 i) (elt s2 i)) (return i)) (setq i (+ i 1))))))
-(defun random (n) (mod (ash (logxor (* 6364136223846793005 (mem-ref #x100000A0 :u64)) 1442695040888963407) -17) n))
+(defun random (n &rest state) (declare (ignore state)) (mod (ash (logxor (* 6364136223846793005 (mem-ref #x100000A0 :u64)) 1442695040888963407) -17) n))
 (defun do-special-strings (fn) (funcall fn ""))
 (defun typep* (obj type) (typep obj type))
 

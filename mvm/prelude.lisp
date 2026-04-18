@@ -147,9 +147,11 @@
 ;;; Search and Membership
 ;;; ============================================================
 
-(defun member (item list)
+(defun member (item list &rest options)
   "Return the tail of LIST starting from the first element EQL to ITEM.
-   Signals TYPE-ERROR if LIST is not a list (i.e. not nil and not a cons)."
+   Signals TYPE-ERROR if LIST is not a list.
+   Accepts ANSI &key TEST/TEST-NOT/KEY via &rest (currently ignored)."
+  (declare (ignore options))
   (when (and (not (null list)) (not (consp list)))
     (%signal-type-error))
   (let ((cur list))
@@ -166,8 +168,11 @@
       (when (string-equal (car cur) item) (return cur))
       (setq cur (cdr cur)))))
 
-(defun assoc (key alist)
-  "Find the first pair in ALIST whose car is EQL to KEY."
+(defun assoc (key alist &rest options)
+  "Find the first pair in ALIST whose car is EQL to KEY.
+   Accepts (and ignores) ANSI &key TEST/TEST-NOT/KEY options as &rest
+   so callers using the keyword form don't trigger a too-many arity error."
+  (declare (ignore options))
   (let ((cur alist))
     (loop
       (when (null cur) (return nil))
@@ -204,8 +209,10 @@
       (setq idx (+ idx 1))
       (setq cur (cdr cur)))))
 
-(defun position (item seq)
-  "Return the index of ITEM in SEQ (list or array, EQL test), or nil."
+(defun position (item seq &rest options)
+  "Return the index of ITEM in SEQ (list or array, EQL test), or nil.
+   Accepts ANSI &key TEST/TEST-NOT/KEY/START/END via &rest (ignored)."
+  (declare (ignore options))
   (if (consp seq)
       (position-in-list item seq)
       (if (null seq)
@@ -479,17 +486,35 @@
 ;;; Apply (limited: call with list of args, up to 4 args)
 ;;; ============================================================
 
-(defun apply (fn args)
-  "Call FN with elements of ARGS as arguments. Supports 0-4 args."
-  (if (null args)
-      (funcall fn)
-      (if (null (cdr args))
-          (funcall fn (car args))
-          (if (null (cddr args))
-              (funcall fn (car args) (cadr args))
-              (if (null (cdddr args))
-                  (funcall fn (car args) (cadr args) (caddr args))
-                  (funcall fn (car args) (cadr args) (caddr args) (cadddr args)))))))
+(defun apply (fn &rest spread)
+  "ANSI apply: (apply fn a1 a2 ... aN list) — call FN with the
+   spread args followed by the elements of the final LIST.
+   Special case: (apply fn list) is just (funcall fn list-elements)."
+  ;; Build the full arg list: (a1 a2 ... aN) ++ final-list
+  (let ((all-args
+         (if (null spread)
+             nil
+             (if (null (cdr spread))
+                 ;; (apply fn list) — spread = (list)
+                 (car spread)
+                 ;; (apply fn a1 a2 ... list) — append individual args + list
+                 (let ((individual nil) (cur spread))
+                   (loop
+                     (when (null (cdr cur))
+                       ;; last cur is the spread list; append it
+                       (return (append (nreverse individual) (car cur))))
+                     (setq individual (cons (car cur) individual))
+                     (setq cur (cdr cur))))))))
+    ;; Now dispatch on length of all-args (supports 0-4 args).
+    (if (null all-args)
+        (funcall fn)
+        (if (null (cdr all-args))
+            (funcall fn (car all-args))
+            (if (null (cddr all-args))
+                (funcall fn (car all-args) (cadr all-args))
+                (if (null (cdddr all-args))
+                    (funcall fn (car all-args) (cadr all-args) (caddr all-args))
+                    (funcall fn (car all-args) (cadr all-args) (caddr all-args) (cadddr all-args))))))))
 
 ;;; ============================================================
 ;;; Format stub (for self-compilation — writes string to serial)
@@ -906,20 +931,25 @@
 ;;; On bare metal, errors halt the system. MVM-compiled code calls
 ;;; these with variable arity — extra args are silently ignored.
 
-(defun error (msg)
+(defun error (msg &rest args)
   "Signal an error. If handler-case is active, longjmp to it.
-   Otherwise print error indicator and halt."
+   Otherwise print error indicator and halt.
+   ANSI's error is (datum &rest args); we mirror that signature here
+   in prelude so all later callers see the &rest version even if
+   compiled before cl-conditions.lisp redefines this function."
+  (declare (ignore args))
   (if (%error-handler-active-p)
       (%hc-longjmp)
       (progn
         (write-string-serial "ERR:")
-        (write-byte 10)
+        (write-char-serial 10)
         (halt))))
 
-(defun warn (msg)
+(defun warn (msg &rest args)
   "Print warning indicator. Extra args ignored on bare metal."
+  (declare (ignore args))
   (write-string-serial "WARN:")
-  (write-byte 10))
+  (write-char-serial 10))
 
 ;;; ============================================================
 ;;; Format stub (bare-metal)
@@ -949,8 +979,13 @@
 ;;; Intern / symbol stubs
 ;;; ============================================================
 
-(defun intern (name)
-  "Intern stub — returns the name hash on bare metal."
+(defun intern (name &rest pkg-arg)
+  "Intern stub — returns the name hash on bare metal.
+   ANSI's intern is (string &optional package). Use &rest here so the
+   prelude version's signature matches cl-packages.lisp's later
+   redefinition (and so callers compiled before that redefinition still
+   pass arity check)."
+  (declare (ignore pkg-arg))
   (if (integerp name)
       name
       (compute-name-hash name)))

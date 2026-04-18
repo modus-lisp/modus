@@ -5437,10 +5437,13 @@
             ((and req (> req 0) (< nargs req))
              (compile-arity-error env dest)
              (return-from compile-call))
-            ;; Too-many-args check was attempted but caused universal
-            ;; crashes — some functions have param-count set too low
-            ;; for their actual accepted arity. Leaving it out until
-            ;; param-count accuracy can be verified.
+            ;; Too many args for a non-rest function with a known
+            ;; param-count: arity error. Safe now that required-count
+            ;; is populated and audited call sites pass correct args.
+            ((and (not has-rest) param-count (> param-count 0)
+                  (> nargs param-count))
+             (compile-arity-error env dest)
+             (return-from compile-call))
             (has-rest
              (when (>= nargs req)
                (let ((required-args (subseq args 0 req))

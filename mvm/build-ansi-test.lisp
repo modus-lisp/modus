@@ -1785,6 +1785,11 @@
               ;; On catch, call (%test-crash-fail <id>) which emits
               ;; \"\\nFAIL <id>\\n\" so the sharded summary accounts for it.
               ;; Using a helper function keeps the per-call code tiny.
+              ;; Wrap each run-test call in an outer handler-case that calls
+              ;; %test-crash-fail (defined in the runtime preamble below). This
+              ;; catches any crash during parent-side arg-evaluation that
+              ;; happens before run-test's own handler-case takes effect —
+              ;; especially closure construction and special var binding.
               (dolist (tf (nreverse test-forms))
                 (let* ((form-str tf)
                        (id-start (position #\Space form-str))
@@ -2157,6 +2162,12 @@
                      ~%  (print-dec id)~
                      ~%  (write-char-serial 10)~
                      ~%  nil)~
+                     ~%;; Codegen wraps each (run-test ...) in (handler-case ... (t (c) (%test-crash-fail ID)))~
+                     ~%;; for the rare case that arg-evaluation crashes before run-test sets up its~
+                     ~%;; own handler-case. Without this defun, calling an undefined function from~
+                     ~%;; the handler triggers a cascade that kills the whole file's fork — losing~
+                     ~%;; every remaining test.~
+                     ~%(defun %test-crash-fail (id) (%record-test-fail id))~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~

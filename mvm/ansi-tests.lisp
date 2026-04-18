@@ -562,6 +562,9 @@
   ;; for/from/to
   (deftest 2000 (loop for i from 1 to 5 collect i)
                 (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil))))))
+  ;; for/to (no from — should default to 0)
+  (deftest 2099 (loop for i to 5 collect i)
+                (cons 0 (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil)))))))
   ;; for/from/below
   (deftest 2001 (loop for i from 0 below 3 collect i)
                 (cons 0 (cons 1 (cons 2 nil))))

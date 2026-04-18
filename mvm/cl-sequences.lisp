@@ -271,9 +271,38 @@
         (when (funcall pred item (cadr prev)) (set-cdr prev (cons item (cdr prev))) (return nil))
         (setq prev (cdr prev)))))) result)))
 (defun stable-sort (seq pred) (sort seq pred))
-(defun substitute (new old seq &rest args) (mapcar1 (lambda (item) (if (eql item old) new item)) seq))
-(defun substitute-if (new pred seq &rest args) (mapcar1 (lambda (item) (if (funcall pred item) new item)) seq))
-(defun substitute-if-not (new pred seq &rest args) (mapcar1 (lambda (item) (if (funcall pred item) item new)) seq))
+;; Internal helpers: build a sequence of the same shape (list -> list,
+;; string -> string, array -> array) by applying TRANSFORM to each element.
+(defun %seq-substitute-with (transform seq)
+  (cond
+    ((or (null seq) (consp seq))
+     (let ((result nil) (cur seq))
+       (loop (when (null cur) (return (nreverse result)))
+         (setq result (cons (funcall transform (car cur)) result))
+         (setq cur (cdr cur)))))
+    ((stringp seq)
+     (let ((len (array-length seq))
+           (out (%make-string-array (array-length seq))))
+       (let ((i 0))
+         (loop (when (= i len) (return out))
+           (let ((v (funcall transform (aref seq i))))
+             ;; String slots hold fixnum char-codes; coerce char if needed.
+             (aset out i (if (characterp v) (char-code v) v)))
+           (setq i (+ i 1))))))
+    (t  ;; plain array
+     (let ((len (array-length seq))
+           (out (make-array (array-length seq))))
+       (let ((i 0))
+         (loop (when (= i len) (return out))
+           (aset out i (funcall transform (aref seq i)))
+           (setq i (+ i 1))))))))
+
+(defun substitute (new old seq &rest args)
+  (%seq-substitute-with (lambda (item) (if (eql item old) new item)) seq))
+(defun substitute-if (new pred seq &rest args)
+  (%seq-substitute-with (lambda (item) (if (funcall pred item) new item)) seq))
+(defun substitute-if-not (new pred seq &rest args)
+  (%seq-substitute-with (lambda (item) (if (funcall pred item) item new)) seq))
 
 ;;; Destructive substitute variants
 ;;; nsubstitute-if-core: shared implementation
@@ -383,9 +412,14 @@
         seq
         (if (consp seq)
             (%nsubst-list-core new pred-fn seq eff-count from-end start-idx end-idx)
-            ;; vector case
+            ;; vector case — coerce char → char-code when seq is a string,
+            ;; so stored slots stay fixnums (matches literal strings and
+            ;; what aref is expected to return for downstream = comparisons).
             (let* ((len (array-length seq))
                    (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+                   (store-new (if (and (stringp seq) (characterp new))
+                                  (char-code new)
+                                  new))
                    (n eff-count))
               (if from-end
                   (let ((i (- eff-end 1)))
@@ -393,7 +427,7 @@
                       (when (< i start-idx) (return seq))
                       (when (and n (= n 0)) (return seq))
                       (when (funcall pred-fn (aref seq i))
-                        (aset seq i new)
+                        (aset seq i store-new)
                         (when n (setq n (- n 1))))
                       (setq i (- i 1))))
                   (let ((i start-idx))
@@ -401,7 +435,7 @@
                       (when (>= i eff-end) (return seq))
                       (when (and n (= n 0)) (return seq))
                       (when (funcall pred-fn (aref seq i))
-                        (aset seq i new)
+                        (aset seq i store-new)
                         (when n (setq n (- n 1))))
                       (setq i (+ i 1))))))))))
 (defun nsubstitute-if-not (new pred seq &rest args)
@@ -494,11 +528,16 @@
   s1)
 
 (defun fill (seq item &rest args)
-  "Fill SEQUENCE with ITEM."
+  "Fill SEQUENCE with ITEM. Strings store fixnum char-codes; coerce
+   character ITEM to its char-code before aset so the stored value
+   matches what literal strings hold (used by string-equal/aref/=)."
   (if (consp seq)
       (let ((cur seq)) (loop (when (null cur) (return seq))
                          (set-car cur item) (setq cur (cdr cur))))
-      (dotimes (i (length seq) seq) (aset seq i item))))
+      (let ((store-item (if (and (stringp seq) (characterp item))
+                            (char-code item)
+                            item)))
+        (dotimes (i (length seq) seq) (aset seq i store-item)))))
 
 (defun map-into (result fn &rest seqs)
   "Apply FN to elements of SEQS, storing results in RESULT."

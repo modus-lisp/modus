@@ -387,25 +387,30 @@
         ch)))
 
 (defun string-upcase (str)
-  "Return a new string with all characters uppercased."
+  "Return a new string with all characters uppercased.
+   Uses %make-string-array so the result is actually a string (subtag),
+   and converts char-upcase's returned character back to a fixnum char-code
+   to match the convention that string slots hold fixnum char-codes."
   (let ((len (array-length str))
-        (result (make-array (array-length str))))
+        (result (%make-string-array (array-length str))))
     (let ((i 0))
       (loop
         (when (= i len) (return result))
         (let ((ch (aref str i)))
-          (aset result i (char-upcase ch)))
+          (let ((up (char-upcase ch)))
+            (aset result i (if (characterp up) (char-code up) up))))
         (setq i (+ i 1))))))
 
 (defun string-downcase (str)
   "Return a new string with all characters lowercased."
   (let ((len (array-length str))
-        (result (make-array (array-length str))))
+        (result (%make-string-array (array-length str))))
     (let ((i 0))
       (loop
         (when (= i len) (return result))
         (let ((ch (aref str i)))
-          (aset result i (char-downcase ch)))
+          (let ((dn (char-downcase ch)))
+            (aset result i (if (characterp dn) (char-code dn) dn))))
         (setq i (+ i 1))))))
 
 ;;; ============================================================

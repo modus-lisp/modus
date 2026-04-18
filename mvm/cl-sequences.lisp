@@ -281,12 +281,15 @@
          (setq result (cons (funcall transform (car cur)) result))
          (setq cur (cdr cur)))))
     ((stringp seq)
+     ;; String slots hold fixnum char-codes but test predicates typically
+     ;; work with characters (e.g. (is-eql-p #\a)).  Present elements as
+     ;; characters to TRANSFORM, coerce character return back to char-code
+     ;; for aset into the new string.
      (let ((len (array-length seq))
            (out (%make-string-array (array-length seq))))
        (let ((i 0))
          (loop (when (= i len) (return out))
-           (let ((v (funcall transform (aref seq i))))
-             ;; String slots hold fixnum char-codes; coerce char if needed.
+           (let ((v (funcall transform (code-char (aref seq i)))))
              (aset out i (if (characterp v) (char-code v) v)))
            (setq i (+ i 1))))))
     (t  ;; plain array
@@ -415,9 +418,14 @@
             ;; vector case — coerce char → char-code when seq is a string,
             ;; so stored slots stay fixnums (matches literal strings and
             ;; what aref is expected to return for downstream = comparisons).
+            ;; For strings, also PRESENT each element as a character to
+            ;; pred-fn — string slots hold fixnum char-codes but tests
+            ;; typically call nsubstitute-if with a character-matching
+            ;; predicate (e.g. (is-eql-p #\a)).
             (let* ((len (array-length seq))
                    (eff-end (if (and end-idx (< end-idx len)) end-idx len))
-                   (store-new (if (and (stringp seq) (characterp new))
+                   (string-p (stringp seq))
+                   (store-new (if (and string-p (characterp new))
                                   (char-code new)
                                   new))
                    (n eff-count))
@@ -426,17 +434,21 @@
                     (loop
                       (when (< i start-idx) (return seq))
                       (when (and n (= n 0)) (return seq))
-                      (when (funcall pred-fn (aref seq i))
-                        (aset seq i store-new)
-                        (when n (setq n (- n 1))))
+                      (let ((elt (aref seq i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (when (funcall pred-fn elt)
+                          (aset seq i store-new)
+                          (when n (setq n (- n 1)))))
                       (setq i (- i 1))))
                   (let ((i start-idx))
                     (loop
                       (when (>= i eff-end) (return seq))
                       (when (and n (= n 0)) (return seq))
-                      (when (funcall pred-fn (aref seq i))
-                        (aset seq i store-new)
-                        (when n (setq n (- n 1))))
+                      (let ((elt (aref seq i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (when (funcall pred-fn elt)
+                          (aset seq i store-new)
+                          (when n (setq n (- n 1)))))
                       (setq i (+ i 1))))))))))
 (defun nsubstitute-if-not (new pred seq &rest args)
   "Destructive substitute-if-not."

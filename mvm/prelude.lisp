@@ -210,20 +210,45 @@
       (setq cur (cdr cur)))))
 
 (defun position (item seq &rest options)
-  "Return the index of ITEM in SEQ (list or array, EQL test), or nil.
-   Accepts ANSI &key TEST/TEST-NOT/KEY/START/END via &rest (ignored)."
-  (declare (ignore options))
-  (if (consp seq)
-      (position-in-list item seq)
-      (if (null seq)
-          nil
-          ;; Array
-          (let ((len (array-length seq))
-                (i 0))
-            (loop
-              (when (= i len) (return nil))
-              (when (eql (aref seq i) item) (return i))
-              (setq i (+ i 1)))))))
+  "Return the index of ITEM in SEQ (list or array). Honors :TEST, :KEY,
+   :START, :END, :FROM-END. Default test is inline `eql`."
+  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil)
+        (a options))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :key)  (setq key  (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :end)  (setq end  (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :test-not)
+             (let ((f (cadr a)))
+               (setq test (lambda (x y) (not (funcall f x y)))))
+             (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (cond
+      ((null seq) nil)
+      ((consp seq)
+       ;; Walk to start, then iterate to end (or list end)
+       (let ((cur seq) (i 0) (result nil))
+         (loop (when (or (null cur) (= i start)) (return nil))
+           (setq cur (cdr cur)) (setq i (+ i 1)))
+         (loop
+           (when (null cur) (return result))
+           (when (and end (= i end)) (return result))
+           (let ((v (if key (funcall key (car cur)) (car cur))))
+             (when (if test (funcall test item v) (eql item v))
+               (if from-end (setq result i) (return i))))
+           (setq cur (cdr cur)) (setq i (+ i 1)))))
+      (t  ;; vector
+       (let ((len (array-length seq))
+             (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop (when (= i end) (return result))
+             (let ((v (if key (funcall key (aref seq i)) (aref seq i))))
+               (when (if test (funcall test item v) (eql item v))
+                 (if from-end (setq result i) (return i))))
+             (setq i (+ i 1)))))))))
 
 (defun remove-if (pred seq)
   "Return a new sequence with elements for which PRED returns non-nil removed.

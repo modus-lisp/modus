@@ -22,6 +22,23 @@
   "Logical negation — same as null."
   (null x))
 
+;;; ============================================================
+;;; Function-cell wrappers for primitive ops
+;;; ============================================================
+;;; eql, eq, =, etc. are inline opcodes — they have no callable function
+;;; entry, so #'eql is a NIL/garbage pointer. Tests that pass `:test #'eql`
+;;; or `:test-not 'eql` get silently wrong answers. compile-function-ref
+;;; rewrites #'eql etc. to these wrappers.
+(defun %eql-fn (a b) (eql a b))
+(defun %eq-fn (a b) (eq a b))
+(defun %equal-fn (a b) (equal a b))
+(defun %lt-fn (a b) (< a b))
+(defun %gt-fn (a b) (> a b))
+(defun %le-fn (a b) (<= a b))
+(defun %ge-fn (a b) (>= a b))
+(defun %eq-num-fn (a b) (= a b))
+(defun %ne-num-fn (a b) (/= a b))
+
 (defun nth (n list)
   "Return the Nth element of LIST (0-indexed). Signals TYPE-ERROR if N
    is not a non-negative fixnum (matches the ANSI requirement that N

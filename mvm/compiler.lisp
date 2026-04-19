@@ -3834,7 +3834,10 @@
   "Compile (function fname) or (function (lambda ...)).
    For named functions, emits FN-ADDR to load native address.
    Checks the env for flet/labels name mappings first (unique names).
-   For lambda, compiles the lambda expression."
+   For lambda, compiles the lambda expression.
+   Primitive operator names (EQL, EQ, =, <, >, <=, >=, EQUAL, /=) are
+   inline opcodes with no callable entry, so we redirect to wrapper
+   functions defined in prelude.lisp (e.g. EQL → %eql-fn)."
   (if (and (consp name) (symbolp (car name))
            (string= (symbol-name (car name)) "LAMBDA"))
       ;; #'(lambda (params) body...) → compile as lambda
@@ -3848,7 +3851,19 @@
                         (t "UNKNOWN")))
              ;; Check if this name is a flet/labels local name — use the unique name
              (unique-name (env-lookup-fn env fn-name))
-             (resolved-name (or unique-name fn-name)))
+             ;; Primitive-op names → corresponding %*-fn wrapper.
+             (wrapper-name
+              (cond ((string= fn-name "EQL")    "%EQL-FN")
+                    ((string= fn-name "EQ")     "%EQ-FN")
+                    ((string= fn-name "EQUAL")  "%EQUAL-FN")
+                    ((string= fn-name "<")      "%LT-FN")
+                    ((string= fn-name ">")      "%GT-FN")
+                    ((string= fn-name "<=")     "%LE-FN")
+                    ((string= fn-name ">=")     "%GE-FN")
+                    ((string= fn-name "=")      "%EQ-NUM-FN")
+                    ((string= fn-name "/=")     "%NE-NUM-FN")
+                    (t nil)))
+             (resolved-name (or unique-name wrapper-name fn-name)))
         (emit-ir :li-func dest resolved-name))))
 
 ;;; ============================================================

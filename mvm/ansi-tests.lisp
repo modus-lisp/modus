@@ -109,6 +109,9 @@
   ;; compile-form delegates literal vectors to compile-quote.
   (deftest 3091 (let ((v #(a b a c))) (if (eq (aref v 0) 'a) t nil)) t)
   (deftest 3092 (let ((v #(a b a c))) (symbolp (aref v 0))) t)
+  ;; %eql-fn defined in prelude — should work as plain function and via #'
+  (deftest 3110 (%eql-fn 1 1) t)
+  (deftest 3111 (%eql-fn 1 2) nil)
   ;; CATCH/THROW basics
   (deftest 3093 (catch 'foo 17) 17)
   (deftest 3094 (catch 'foo (throw 'foo 42) 99) 42)

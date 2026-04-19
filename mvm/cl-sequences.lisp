@@ -1317,19 +1317,26 @@
 
 (defun find (item sequence &rest args)
   "Return the first element of SEQUENCE that matches ITEM.
-   :test defaults to inline `eql` (#'eql is unusable in MVM)."
-  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil))
+   :test defaults to inline `eql` (#'eql is unusable in MVM).
+   :test-not is the negation of :test."
+  (let ((test nil) (test-not nil)
+        (key nil) (start 0) (end nil) (from-end nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
             ((eq k :test) (setq test v))
+            ((eq k :test-not) (setq test-not v))
             ((eq k :key) (setq key v))
             ((eq k :start) (setq start v))
             ((eq k :end) (setq end v))
             ((eq k :from-end) (setq from-end v))))
         (setq cur (cddr cur))))
+    ;; Build effective test predicate that accounts for :test-not.
+    (when test-not
+      (let ((tn test-not))
+        (setq test (lambda (a b) (not (funcall tn a b))))))
     (if (listp sequence)
         ;; List path
         (let ((lst sequence) (i 0) (result nil))

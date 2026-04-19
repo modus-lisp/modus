@@ -327,6 +327,54 @@ the lambda is created once but `acc` should be independent per call.
 Heap-allocated closure cells (`is-eql-p` pattern) work around this for specific
 functions. Full fix: allocate a fresh cons cell per closure creation in compile-lambda.
 
+### `&rest` in defun + funcall-of-let-allocated-lambda → SIGSEGV
+
+Adding `&rest args` to a defun that's later called via `(funcall (lambda () ...))`
+where the lambda is bound by `let` makes the binary SIGSEGV at the funcall, often
+several tests downstream of the `&rest` defun (so the crash site isn't where the
+broken function was defined).
+
+Symptom seen during ANSI work: switching `remove-if` from `(pred seq)` to
+`(pred seq &rest args)` (so callers could pass `:test`/`:key`) made `run-cl-loop-tests`
+crash at the very next `funcall` on a let-bound lambda. Reverting the `&rest`
+restored the binary even though `remove-if` was never called between definition
+and the crashing site.
+
+Workaround: keep prelude / heavily-called runtime functions to fixed positional
+parameters. If you need keyword tolerance, hand-parse the `&rest` in a wrapper
+that itself uses positional params and dispatches.
+
+### Vector literal `#(...)` inside `(let ((x #(...))) ...)` in a lambda body → SIGSEGV
+
+The `#(...)` reader macro compiles to `(let ((arr (make-array N))) (aset arr 0 ...) ... arr)`.
+When this expansion lands inside another `let`'s init-form inside a lambda body
+(e.g. `(funcall (lambda () (let ((x #(a b a c))) (substitute 'b 'a x))))`), the
+nested frame allocation collides with the outer frame and the runtime SIGSEGVs.
+
+Same pattern at top level (no lambda wrap) works fine. Replacing `#(a b a c)`
+with `(vector 'a 'b 'a 'c)` would dodge it — but `vector` isn't defined as a
+runtime function (only opcode-style `make-array` + `aset` are), so the literal
+expansion has no clean alternative.
+
+Affects: `SUBSTITUTE-VECTOR.*`, `NSUBSTITUTE-VECTOR.*`, `SUBSTITUTE-IF-VECTOR.*`,
+`NSUBSTITUTE-IF-VECTOR.*` and friends — every test of the shape
+`(let ((x #(...))) (some-fn ... x))` that the per-file fork's wrap turns into
+a `(funcall (lambda () ...))`. ~250 tests in the ANSI suite fail to this.
+
+Reproducer is fragile: the same form added as a custom deftest passes when the
+surrounding function is small but crashes when more deftests are added before
+or after it. That points to a register-pressure or code-size threshold in the
+function compiler rather than a clean bug in vector-literal expansion.
+
+### Function size in run-cl-loop-tests changes which sub-tests crash
+
+Adding too many `deftest` forms to `run-cl-loop-tests` makes some passing
+tests start crashing — even ones that have nothing to do with the new tests
+and were passing in a smaller version of the function. Some compile-state
+(register pressure? code buffer size? branch displacement limits?) silently
+flips at a threshold. Workaround: split big test runners into multiple defuns
+called sequentially.
+
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 
 The fixpoint build combines source from multiple architectures into a single multi-arch binary.

@@ -777,18 +777,38 @@
            (setq i (+ i 1))))))))
 
 (defun map-into (result fn &rest seqs)
-  "Apply FN to elements of SEQS, storing results in RESULT."
-  (let ((len (length result)) (i 0))
+  "Apply FN to elements of SEQS, storing each result in successive
+   positions of RESULT. Stops at the shortest of RESULT and SEQS."
+  (let* ((result-len (length result))
+         ;; Determine iteration count: min of result length and all seq lengths.
+         (n (let ((m result-len))
+              (dolist (s seqs m)
+                (let ((sl (length s)))
+                  (when (< sl m) (setq m sl)))))))
     (if (null seqs)
-        result
-        (let ((src (car seqs)))
-          (if (consp src)
-              (dolist (item src result)
-                (when (>= i len) (return result))
-                (if (consp result) (set-car (nthcdr i result) (funcall fn item))
-                    (aset result i (funcall fn item)))
-                (setq i (+ i 1)))
-              result)))))
+        ;; Zero-arg FN: fill result with (funcall fn) calls.
+        (let ((i 0))
+          (loop (when (>= i result-len) (return result))
+            (let ((v (funcall fn)))
+              (if (consp result)
+                  (set-car (nthcdr i result) v)
+                  (aset result i (if (and (stringp result) (characterp v))
+                                     (char-code v)
+                                     v))))
+            (setq i (+ i 1))))
+        ;; One-or-more seqs: collect ith elements, apply fn, store.
+        (let ((i 0))
+          (loop (when (>= i n) (return result))
+            (let ((args (let ((r nil) (sr (reverse seqs)))
+                          (dolist (s sr r)
+                            (setq r (cons (elt s i) r))))))
+              (let ((v (apply fn args)))
+                (if (consp result)
+                    (set-car (nthcdr i result) v)
+                    (aset result i (if (and (stringp result) (characterp v))
+                                       (char-code v)
+                                       v)))))
+            (setq i (+ i 1)))))))
 
 ;;; Sequence predicates
 (defun notevery (pred seq &rest more)

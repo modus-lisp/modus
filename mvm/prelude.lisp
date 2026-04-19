@@ -351,21 +351,65 @@
           (setq a (cdr a))
           (setq b (cdr b))))))
 
-(defun reduce (fn list &rest args)
-  "Fold FN over LIST. Optional :initial-value (taken positionally as
-   args[1] when args[0] is the keyword stand-in). Matches the existing
-   call sites that pass either (reduce fn list) or
-   (reduce fn list :initial-value v)."
-  (let* ((init (cond
-                 ((null args) nil)
-                 ((cdr args) (cadr args))   ; (... :initial-value V)
-                 (t nil)))
-         (acc init)
-         (cur list))
-    (loop
-      (when (null cur) (return acc))
-      (setq acc (funcall fn acc (car cur)))
-      (setq cur (cdr cur)))))
+(defun reduce (fn seq &rest args)
+  "Fold FN over SEQ (list or vector). Honors :initial-value, :from-end,
+   :start, :end, :key.  Without :initial-value:
+     - empty seq: return (funcall fn) with no args
+     - single elt: return that element unchanged
+     - else: starts with the first element"
+  (let ((init :no-init) (init-given nil)
+        (from-end nil) (start 0) (end nil) (key nil)
+        (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :initial-value)
+             (setq init (cadr a)) (setq init-given t) (setq a (cddr a)))
+            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :end)   (setq end   (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :key)   (setq key   (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    ;; Materialise as a list slice [start..end). Cheap conversion: walk
+    ;; the original sequence (works for lists, vectors, fill-pointer
+    ;; arrays via aref/length), collect the elements we'll fold.
+    (let* ((elts (let ((lst nil) (i 0) (n (if seq (length seq) 0))
+                       (eff-end (if end end (if seq (length seq) 0))))
+                   (cond
+                     ((or (null seq) (consp seq))
+                      ;; Walk list once
+                      (let ((cur seq))
+                        (loop (when (null cur) (return nil))
+                          (when (and (>= i start) (< i eff-end))
+                            (let ((v (if key (funcall key (car cur)) (car cur))))
+                              (setq lst (cons v lst))))
+                          (setq cur (cdr cur))
+                          (setq i (+ i 1)))))
+                     (t
+                      ;; Vector/string indexing
+                      (loop (when (>= i eff-end) (return nil))
+                        (when (>= i start)
+                          (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
+                            (setq lst (cons v lst))))
+                        (setq i (+ i 1)))))
+                   (nreverse lst))))
+      (cond
+        ((and (null elts) init-given) init)
+        ((null elts) (funcall fn))
+        ((and (null (cdr elts)) (not init-given)) (car elts))
+        (from-end
+         ;; Right-fold: (fn e1 (fn e2 (fn e3 init)))
+         (let* ((rev (reverse elts))
+                (acc (if init-given init (car rev)))
+                (cur (if init-given rev (cdr rev))))
+           (loop (when (null cur) (return acc))
+             (setq acc (funcall fn (car cur) acc))
+             (setq cur (cdr cur)))))
+        (t
+         ;; Left-fold: (fn (fn (fn init e1) e2) e3)
+         (let* ((acc (if init-given init (car elts)))
+                (cur (if init-given elts (cdr elts))))
+           (loop (when (null cur) (return acc))
+             (setq acc (funcall fn acc (car cur)))
+             (setq cur (cdr cur)))))))))
 
 (defun mapc (fn list)
   "Apply FN to each element of LIST for side effects. Return LIST."

@@ -155,16 +155,59 @@
 (defun remove-if-not (pred list &rest args)
   (remove-if (lambda (x) (not (funcall pred x))) list))
 
-(defun count-if (pred list)
-  (let ((n 0) (cur list))
-    (loop
-      (when (null cur) (return n))
-      (when (funcall pred (car cur))
-        (setq n (+ n 1)))
-      (setq cur (cdr cur)))))
+(defun count-if (pred seq &rest args)
+  "Count elements of SEQ for which PRED is true. Honors :key, :start, :end."
+  (let ((key nil) (start 0) (end nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (cond
+      ((null seq) 0)
+      ((consp seq)
+       (let ((n 0) (cur seq) (i 0)
+             (eff-end (if end end most-positive-fixnum)))
+         (loop (when (or (null cur) (>= i eff-end)) (return n))
+           (when (>= i start)
+             (let ((v (if key (funcall key (car cur)) (car cur))))
+               (when (funcall pred v) (setq n (+ n 1)))))
+           (setq cur (cdr cur))
+           (setq i (+ i 1)))))
+      (t  ;; vector / string
+       (let ((n 0) (i start)
+             (eff-end (if end end (length seq))))
+         (loop (when (>= i eff-end) (return n))
+           (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
+             (when (funcall pred v) (setq n (+ n 1))))
+           (setq i (+ i 1))))))))
 
-(defun count (item list)
-  (count-if (lambda (x) (eql x item)) list))
+(defun count (item seq &rest args)
+  "Count occurrences of ITEM in SEQ. Honors :test, :key, :start, :end.
+   For strings, presents each element as a character (string slots
+   hold fixnum char-codes; the natural test against #\\X expects a
+   character comparison via eql)."
+  (let ((test nil) (key nil) (start 0) (end nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :test-not)
+             (let ((f (cadr a)))
+               (setq test (lambda (x y) (not (funcall f x y)))))
+             (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (let ((string-p (stringp seq)))
+      (count-if (lambda (x)
+                  (let ((c (if string-p (code-char x) x)))
+                    (if test (funcall test item c) (eql item c))))
+                seq
+                :start start
+                :end (or end (cond ((null seq) 0)
+                                    ((consp seq) most-positive-fixnum)
+                                    (t (length seq))))
+                :key key))))
 
 ;;; Function wrappers for compiler builtins (needed for apply/#')
 ;;; The compiler uses XOR/AND/OR opcodes for inline (logxor a b) etc.

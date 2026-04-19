@@ -464,9 +464,10 @@
 (defun nsubstitute (new old seq &rest args)
   "Destructive substitute."
   (let* ((parsed (%nsubst-parse-args args))
-         (test-fn (car (cddddr parsed)))   ; index 4
-         (actual-test (or test-fn #'eql)))
-    (apply #'nsubstitute-if new (lambda (x) (funcall actual-test old x)) seq args)))
+         (test-fn (car (cddddr parsed))))   ; index 4
+    (apply #'nsubstitute-if new
+           (lambda (x) (if test-fn (funcall test-fn old x) (eql old x)))
+           seq args)))
 (defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
 (defun hash-table-count (ht) (let ((c 0) (cur (car ht))) (loop (when (null cur) (return c)) (setq c (+ c 1)) (setq cur (cdr cur)))))
 (defun %maphash-impl (fn ht)
@@ -835,8 +836,9 @@
 ;;; ===================================================
 
 (defun find (item sequence &rest args)
-  "Return the first element of SEQUENCE that matches ITEM."
-  (let ((test #'eql) (key nil) (start 0) (end nil) (from-end nil))
+  "Return the first element of SEQUENCE that matches ITEM.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
+  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
@@ -862,7 +864,7 @@
             (when (and end (= i end)) (return result))
             (let ((elem (car lst)))
               (let ((test-val (if key (funcall key elem) elem)))
-                (when (funcall test item test-val)
+                (when (if test (funcall test item test-val) (eql item test-val))
                   (if from-end
                       (setq result elem)
                       (return elem)))))
@@ -877,7 +879,7 @@
               (when (= i end) (return result))
               (let ((elem (aref sequence i)))
                 (let ((test-val (if key (funcall key elem) elem)))
-                  (when (funcall test item test-val)
+                  (when (if test (funcall test item test-val) (eql item test-val))
                     (if from-end
                         (setq result elem)
                         (return elem)))))
@@ -970,8 +972,9 @@
   (apply #'position-if (lambda (x) (not (funcall predicate x))) sequence args))
 
 (defun search (seq1 seq2 &rest args)
-  "Search for SEQ1 as a subsequence of SEQ2. Return index or nil."
-  (let ((test #'eql) (key nil) (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil))
+  "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
+  (let ((test nil) (key nil) (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
@@ -1003,7 +1006,7 @@
                       (e2 (aref s2 (+ i j))))
                   (let ((v1 (if key (funcall key e1) e1))
                         (v2 (if key (funcall key e2) e2)))
-                    (unless (funcall test v1 v2)
+                    (unless (if test (funcall test v1 v2) (eql v1 v2))
                       (setq match nil)
                       (return nil))))
                 (setq j (+ j 1)))

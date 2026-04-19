@@ -344,53 +344,30 @@ Workaround: keep prelude / heavily-called runtime functions to fixed positional
 parameters. If you need keyword tolerance, hand-parse the `&rest` in a wrapper
 that itself uses positional params and dispatches.
 
-### Lambda body + nested-let-with-mutation crash → SIGSEGV before body executes
+### Vector-literal symbol elements (FIXED)
 
-Minimum reproducer:
+The earlier docs claimed `#(...)` literals containing symbols caused a SIGSEGV
+inside lambda bodies that contained nested-let-with-mutation. That was wrong;
+nothing crashed. The actual bug was a silent value-corruption in compile-form's
+vector-literal path:
 
-  (funcall (lambda ()
-    (let ((x (let ((arr (make-array 4)))
-               (aset arr 0 'a)
-               arr)))
-      (length x))))
+  ((and (vectorp form) (not (stringp form)))
+   (compile-form `(let ((arr (make-array ,n)))
+                    ,@(loop for i from 0 below n
+                            collect `(aset arr ,i ,(aref form i)))
+                    arr) env dest))
 
-Crashes with SIGSEGV. No breadcrumbs printed inside the lambda body — the
-crash happens before the body executes. Removing ANY of the following
-makes it work:
-- the outer lambda (run as a top-level form: works)
-- the outer let (just the inner let directly: works)
-- the inner let (lift arr into the outer let directly: works)
-- the aset (just `(let ((arr (make-array N))) arr)`: works)
-- the trailing `arr` reference (return the aset result instead: works)
+The `,(aref form i)` pasted SBCL-side element values directly into the
+expansion. For symbol elements (e.g. `#(A B A C)`), each element became a
+bare token `A`, `B`, etc., which compile-form then resolved as a variable
+reference — `(symbol-value 'A)` → NIL. So vector literals containing symbols
+silently became vectors of NILs. NSUBSTITUTE/SUBSTITUTE/FIND on such vectors
+trivially failed because the elements never matched the search items.
 
-So the failing pattern is specifically:
-  lambda body
-    + outer-let with init = inner-let
-    + inner-let body has aset/setcar/mutation followed by return-bound-var
-
-cons + set-car triggers it the same way as make-array + aset, so the bug
-isn't in the array opcodes. It's in how compile-let evaluates init-forms
-that themselves contain compile-let with a mutating body, when the
-enclosing function is a lambda compiled via mvm-compile-function-internal.
-
-Affects: every `#(...)` vector literal (compiles to a let-arr-aset-arr
-expansion) when it appears as a let-binding init inside a lambda body —
-which is almost every SUBSTITUTE-VECTOR / NSUBSTITUTE-VECTOR /
-NSUBSTITUTE-IF-VECTOR / FIND-VECTOR / etc. test (~250 tests gated).
-
-Things tried and reverted:
-- Changing #(...) expansion to compile-make-array + direct OBJ-SET emits
-  bypassing the inner let — same crash. Suggests the bug is in compile-aset
-  or how its IR interacts with the let frame layout, not in the let itself.
-- Replacing #(...) with a runtime (vector ...) call — `vector` isn't defined.
-- Bisection only narrowed the pattern; the underlying compiler-state issue
-  isn't visible in the IR I dumped. Likely needs translator-level work to
-  see what bytecode actually gets emitted for the lambda body's prologue.
-
-Surface symptom is also positional: adding more deftests in the same defun
-can flip a previously-passing test to crash. Likely a register allocator
-or *temp-reg-counter* state issue that interacts with the failing pattern,
-amplifying it once a threshold is reached.
+Fix: compile-form delegates literal vectors to `compile-quote`, which emits
+proper element loads (`%INTERN-SYMBOL` for symbols, fixnum loads for ints,
+etc.) and `:obj-set` into the freshly allocated array. See `mvm/compiler.lisp`
+~line 1444. Regression: `ansi-tests.lisp` deftests 3091/3092.
 
 ### Function size in run-cl-loop-tests changes which sub-tests crash
 

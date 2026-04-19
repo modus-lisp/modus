@@ -100,7 +100,15 @@
                   (let ((result (cons (progn (setq i (+ i 1)) i)
                                      (progn (setq i (+ i 1)) i))))
                     (if (and (= (car result) 1) (= (cdr result) 2) (= i 2))
-                        t nil))) t))
+                        t nil))) t)
+
+  ;; ── Regression: vector-literal element compile path ──
+  ;; Pre-fix: compile-form expanded #(A B A C) to (let ((arr (make-array 4)))
+  ;; (aset arr 0 A) ... arr) — `A` was compiled as a variable reference,
+  ;; quietly filling the vector with (symbol-value 'A) ≈ NIL. After fix,
+  ;; compile-form delegates literal vectors to compile-quote.
+  (deftest 3091 (let ((v #(a b a c))) (if (eq (aref v 0) 'a) t nil)) t)
+  (deftest 3092 (let ((v #(a b a c))) (symbolp (aref v 0))) t))
 
 ;;; ============================================================
 ;;; Chapter 14: Conses (1400-1499)

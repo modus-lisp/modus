@@ -351,11 +351,123 @@
            (setq i (+ i 1))))))))
 
 (defun substitute (new old seq &rest args)
-  (%seq-substitute-with (lambda (item) (if (eql item old) new item)) seq))
+  "Non-destructive substitute. Honors :test/:test-not/:key/:start/:end/
+   :count/:from-end. Inline vector path so we don't depend on lambda
+   capture of OLD across nested apply paths."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (test-fn (car (cddddr parsed)))      ; index 4
+         (key-fn (caddr (cddddr parsed)))     ; index 6
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) seq)
+      ((consp seq)
+       (%seq-substitute-with
+        (lambda (item)
+          (let ((v (if key-fn (funcall key-fn item) item)))
+            (if (if test-fn (funcall test-fn old v) (eql old v))
+                new
+                item)))
+        seq))
+      (t
+       (let ((copy (copy-seq seq)))
+         (cond
+           ((and eff-count (= eff-count 0)) copy)
+           (t
+            (let* ((len (array-length copy))
+                   (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+                   (string-p (stringp copy))
+                   (store-new (if (and string-p (characterp new))
+                                  (char-code new)
+                                  new))
+                   (n eff-count))
+              (if from-end
+                  (let ((i (- eff-end 1)))
+                    (loop
+                      (when (< i start-idx) (return copy))
+                      (when (and n (= n 0)) (return copy))
+                      (let ((elt (aref copy i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                          (let ((match (if test-fn (funcall test-fn old cmp)
+                                           (eql old cmp))))
+                            (when match
+                              (aset copy i store-new)
+                              (when n (setq n (- n 1)))))))
+                      (setq i (- i 1))))
+                  (let ((i start-idx))
+                    (loop
+                      (when (>= i eff-end) (return copy))
+                      (when (and n (= n 0)) (return copy))
+                      (let ((elt (aref copy i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                          (let ((match (if test-fn (funcall test-fn old cmp)
+                                           (eql old cmp))))
+                            (when match
+                              (aset copy i store-new)
+                              (when n (setq n (- n 1)))))))
+                      (setq i (+ i 1)))))))))))))
+
 (defun substitute-if (new pred seq &rest args)
-  (%seq-substitute-with (lambda (item) (if (funcall pred item) new item)) seq))
+  "Non-destructive substitute-if. Same shape as SUBSTITUTE."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) seq)
+      ((consp seq)
+       (%seq-substitute-with
+        (lambda (item)
+          (let ((v (if key-fn (funcall key-fn item) item)))
+            (if (funcall pred v) new item)))
+        seq))
+      (t
+       (let ((copy (copy-seq seq)))
+         (cond
+           ((and eff-count (= eff-count 0)) copy)
+           (t
+            (let* ((len (array-length copy))
+                   (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+                   (string-p (stringp copy))
+                   (store-new (if (and string-p (characterp new))
+                                  (char-code new)
+                                  new))
+                   (n eff-count))
+              (if from-end
+                  (let ((i (- eff-end 1)))
+                    (loop
+                      (when (< i start-idx) (return copy))
+                      (when (and n (= n 0)) (return copy))
+                      (let ((elt (aref copy i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                          (when (funcall pred cmp)
+                            (aset copy i store-new)
+                            (when n (setq n (- n 1))))))
+                      (setq i (- i 1))))
+                  (let ((i start-idx))
+                    (loop
+                      (when (>= i eff-end) (return copy))
+                      (when (and n (= n 0)) (return copy))
+                      (let ((elt (aref copy i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                          (when (funcall pred cmp)
+                            (aset copy i store-new)
+                            (when n (setq n (- n 1))))))
+                      (setq i (+ i 1)))))))))))))
+
 (defun substitute-if-not (new pred seq &rest args)
-  (%seq-substitute-with (lambda (item) (if (funcall pred item) item new)) seq))
+  "Non-destructive substitute-if-not. Inverts pred and forwards."
+  (apply #'substitute-if new (lambda (x) (not (funcall pred x))) seq args))
 
 ;;; Destructive substitute variants
 ;;; nsubstitute-if-core: shared implementation
@@ -505,12 +617,64 @@
   (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) seq args))
 
 (defun nsubstitute (new old seq &rest args)
-  "Destructive substitute."
+  "Destructive substitute. Inline vector path so we don't depend on a
+   lambda closure capturing OLD (which can be lost across apply / nested
+   funcall when the closure cell is shared with siblings)."
   (let* ((parsed (%nsubst-parse-args args))
-         (test-fn (car (cddddr parsed))))   ; index 4
-    (apply #'nsubstitute-if new
-           (lambda (x) (if test-fn (funcall test-fn old x) (eql old x)))
-           seq args)))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (test-fn (car (cddddr parsed)))      ; index 4
+         (key-fn (caddr (cddddr parsed)))     ; index 6
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) seq)
+      ((and eff-count (= eff-count 0)) seq)
+      ((consp seq)
+       ;; Lists: existing list-core works fine, build a small pred
+       (%nsubst-list-core
+        new
+        (lambda (x)
+          (let ((v (if key-fn (funcall key-fn x) x)))
+            (if test-fn (funcall test-fn old v) (eql old v))))
+        seq eff-count from-end start-idx end-idx))
+      (t
+       ;; Vector path: inline. Avoids lambda capture of OLD.
+       (let* ((len (array-length seq))
+              (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+              (string-p (stringp seq))
+              (store-new (if (and string-p (characterp new))
+                             (char-code new)
+                             new))
+              (n eff-count))
+         (if from-end
+             (let ((i (- eff-end 1)))
+               (loop
+                 (when (< i start-idx) (return seq))
+                 (when (and n (= n 0)) (return seq))
+                 (let ((elt (aref seq i)))
+                   (when string-p (setq elt (code-char elt)))
+                   (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                     (let ((match (if test-fn (funcall test-fn old cmp)
+                                      (eql old cmp))))
+                       (when match
+                         (aset seq i store-new)
+                         (when n (setq n (- n 1)))))))
+                 (setq i (- i 1))))
+             (let ((i start-idx))
+               (loop
+                 (when (>= i eff-end) (return seq))
+                 (when (and n (= n 0)) (return seq))
+                 (let ((elt (aref seq i)))
+                   (when string-p (setq elt (code-char elt)))
+                   (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                     (let ((match (if test-fn (funcall test-fn old cmp)
+                                      (eql old cmp))))
+                       (when match
+                         (aset seq i store-new)
+                         (when n (setq n (- n 1)))))))
+                 (setq i (+ i 1))))))))))
 (defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
 (defun hash-table-count (ht) (let ((c 0) (cur (car ht))) (loop (when (null cur) (return c)) (setq c (+ c 1)) (setq cur (cdr cur)))))
 (defun %maphash-impl (fn ht)

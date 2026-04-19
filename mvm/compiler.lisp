@@ -1440,14 +1440,16 @@
       ((floatp form)
        (compile-quote form dest))
 
-      ;; Vector literal #(...) → (make-array-from elt0 elt1 ...)
+      ;; Vector literal #(...) is self-evaluating in ANSI CL.
+      ;; Delegate to compile-quote so each element is materialized as a
+      ;; literal value (intern for symbols, etc.) rather than treated as
+      ;; a variable reference. The previous expansion to a let+aset chain
+      ;; turned `#(A B A C)` into `(aset arr 0 A)` where `A` was compiled
+      ;; as `(symbol-value 'A)` — silently filling the vector with the
+      ;; current global value of each element-named variable, breaking
+      ;; ~250 SUBSTITUTE-VECTOR / FIND-VECTOR / etc. tests.
       ((and (vectorp form) (not (stringp form)))
-       (let ((n (length form)))
-         (compile-form `(let ((arr (make-array ,n)))
-                          ,@(loop for i from 0 below n
-                                  collect `(aset arr ,i ,(aref form i)))
-                          arr)
-                       env dest)))
+       (compile-quote form dest))
 
       ;; Ratio literal → convert to float, box as float object
       ((typep form 'ratio)

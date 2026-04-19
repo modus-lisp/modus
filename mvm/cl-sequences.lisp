@@ -848,16 +848,16 @@
           (setq r (cons item r)))))))
 
 (defun delete (item seq &rest args)
-  "Remove ITEM from SEQ (destructive)."
-  (remove item seq))
+  "Remove ITEM from SEQ (destructive). Forwards :test/:key/:start/:end."
+  (apply #'remove item seq args))
 
 (defun delete-if (pred seq &rest args)
-  "Remove items satisfying PRED (destructive)."
-  (remove-if pred seq))
+  "Remove items satisfying PRED (destructive). Forwards keyword args."
+  (apply #'remove-if pred seq args))
 
 (defun delete-if-not (pred seq &rest args)
-  "Remove items not satisfying PRED (destructive)."
-  (remove-if-not pred seq))
+  "Remove items not satisfying PRED (destructive). Forwards keyword args."
+  (apply #'remove-if-not pred seq args))
 
 (defun delete-duplicates (seq &rest args)
   "Remove duplicate items (destructive). Forwards :test/:key/:from-end."

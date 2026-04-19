@@ -3112,7 +3112,11 @@
   (iterations nil)
   ;; Body forms
   (body-forms nil)
-  ;; Accumulator: nil or (:collect var) or (:sum var) or (:count var)
+  ;; Accumulator: a list of accumulator specs (most recent first; reversed
+  ;; before code generation). Each spec is (:KIND expr) or (:KIND expr INTO)
+  ;; for :collect/:sum/:count/:append/:nconc/:maximize/:minimize, or
+  ;; (:collect-when cond expr) for inline conditional collect.
+  ;; :always/:thereis stay as a single non-list value here for simplicity.
   (accumulator nil)
   ;; Finally forms
   (finally-forms nil)
@@ -3339,56 +3343,56 @@
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :collect expr (car iv)) (list :collect expr))))))
+               (push (if iv (list :collect expr (car iv)) (list :collect expr))
+                     (loop-state-accumulator state)))))
 
           ((or (= kw 579297982844014476) (= kw 820203232253031873))   ; SUM
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :sum expr (car iv)) (list :sum expr))))))
+               (push (if iv (list :sum expr (car iv)) (list :sum expr))
+                     (loop-state-accumulator state)))))
 
           ((or (= kw 647934184416839188) (= kw 146808687552856964))   ; COUNT
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :count expr (car iv)) (list :count expr))))))
+               (push (if iv (list :count expr (car iv)) (list :count expr))
+                     (loop-state-accumulator state)))))
 
           ((or (= kw 195734683635763289) (= kw 682179722204096129))   ; APPEND
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :append expr (car iv)) (list :append expr))))))
+               (push (if iv (list :append expr (car iv)) (list :append expr))
+                     (loop-state-accumulator state)))))
 
           ((or (= kw 876035653932002648) (= kw 1018827631117520136))  ; NCONC
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :nconc expr (car iv)) (list :nconc expr))))))
+               (push (if iv (list :nconc expr (car iv)) (list :nconc expr))
+                     (loop-state-accumulator state)))))
 
           ((or (= kw 891107942385378521) (= kw 220277010584993844))   ; MAXIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :maximize expr (car iv)) (list :maximize expr))))))
+               (push (if iv (list :maximize expr (car iv)) (list :maximize expr))
+                     (loop-state-accumulator state)))))
 
           ((or (= kw 646649243001235175) (= kw 1092018583149917146))  ; MINIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
                (when iv (setf rest (cdr iv)))
-               (setf (loop-state-accumulator state)
-                     (if iv (list :minimize expr (car iv)) (list :minimize expr))))))
+               (push (if iv (list :minimize expr (car iv)) (list :minimize expr))
+                     (loop-state-accumulator state)))))
 
           ;; WHEN/IF cond DO body | COLLECT expr
           ((or (= kw 89559098115627243) (= kw 448736678201786992))
@@ -3404,7 +3408,7 @@
                     (setf rest (cdr rest))))
                  ((or (= action-kw 204640710178503481) (= action-kw 1066799008902276193))
                   (let ((expr (cadr rest)))
-                    (setf (loop-state-accumulator state) (list :collect-when cond-form expr))
+                    (push (list :collect-when cond-form expr) (loop-state-accumulator state))
                     (setf rest (cddr rest))))
                  (t
                   ;; Bare when: the next form is the body
@@ -3422,19 +3426,19 @@
           ;; ALWAYS expr
           ((= kw 1091564327776232814)
            (let ((expr (cadr rest)))
-             (setf (loop-state-accumulator state) (list :always expr))
+             (push (list :always expr) (loop-state-accumulator state))
              (setf rest (cddr rest))))
 
           ;; NEVER expr (same as always (not expr))
           ((= kw 870389735836749037)
            (let ((expr (cadr rest)))
-             (setf (loop-state-accumulator state) (list :always `(not ,expr)))
+             (push (list :always `(not ,expr)) (loop-state-accumulator state))
              (setf rest (cddr rest))))
 
           ;; THEREIS expr
           ((= kw 212607784983936827)
            (let ((expr (cadr rest)))
-             (setf (loop-state-accumulator state) (list :thereis expr))
+             (push (list :thereis expr) (loop-state-accumulator state))
              (setf rest (cddr rest))))
 
           ;; UNLESS cond DO body | COLLECT expr
@@ -3450,7 +3454,8 @@
                     (setf rest (cdr rest))))
                  ((or (= action-kw 204640710178503481) (= action-kw 1066799008902276193))
                   (let ((expr (cadr rest)))
-                    (setf (loop-state-accumulator state) (list :collect-when `(not ,cond-form) expr))
+                    (push (list :collect-when `(not ,cond-form) expr)
+                          (loop-state-accumulator state))
                     (setf rest (cddr rest))))
                  (t
                   (push `(unless ,cond-form ,(car rest)) (loop-state-body-forms state))
@@ -3471,27 +3476,49 @@
     (setf (loop-state-body-forms state) (nreverse (loop-state-body-forms state)))
     (setf (loop-state-finally-forms state) (nreverse (loop-state-finally-forms state)))
     (setf (loop-state-with-bindings state) (nreverse (loop-state-with-bindings state)))
+    (setf (loop-state-accumulator state) (nreverse (loop-state-accumulator state)))
     state))
+
+(defun %loop-acc-into-var (acc-spec)
+  "Return the INTO var of ACC-SPEC, or NIL if it doesn't have one."
+  (when (and (member (car acc-spec) '(:collect :sum :count :append
+                                      :nconc :maximize :minimize))
+             (= (length acc-spec) 3))
+    (caddr acc-spec)))
+
+(defun %loop-acc-init-value (kind)
+  (case kind
+    (:collect nil)
+    (:collect-when nil)
+    (:sum 0)
+    (:count 0)
+    (t nil)))
 
 (defun generate-loop-code (state)
   "Generate Lisp code from a parsed loop-state."
   (let* ((iters (loop-state-iterations state))
          (body (loop-state-body-forms state))
-         (acc (loop-state-accumulator state))
+         (accs (loop-state-accumulator state))   ; list of acc specs
          (finally (loop-state-finally-forms state))
          (with-binds (loop-state-with-bindings state))
-         ;; Accumulator destination var. With INTO, the user-named var lives
-         ;; in scope so FINALLY etc. can read it; without INTO, a gensym
+         ;; For each acc-spec, compute its destination var. INTO uses the
+         ;; user-named symbol so FINALLY can read it; without INTO, a gensym
          ;; backs the LOOP's return value.
-         ;; Accumulator shape after parser: (KIND expr) or (KIND expr INTO-var)
-         ;; for :collect/:sum/:count/:append/:nconc/:maximize/:minimize, and
-         ;; (:collect-when cond expr) (no INTO support yet).
-         (acc-into-var (when (and acc
-                                  (member (car acc) '(:collect :sum :count :append
-                                                      :nconc :maximize :minimize))
-                                  (= (length acc) 3))
-                         (caddr acc)))
-         (acc-var (when acc (or acc-into-var (gensym "ACC"))))
+         (acc-vars (mapcar (lambda (a)
+                             (or (%loop-acc-into-var a) (gensym "ACC")))
+                           accs))
+         ;; Picks "the" return-value acc (first non-INTO acc with a value).
+         ;; Used only when there's exactly one anonymous accumulator and the
+         ;; LOOP's own value should be its accumulated value.
+         (anon-acc-idx (let ((idx -1) (found nil))
+                         (dolist (a accs)
+                           (incf idx)
+                           (unless (or (%loop-acc-into-var a)
+                                       (member (car a) '(:always :thereis)))
+                             (unless found (setf found idx))))
+                         found))
+         (anon-acc (when anon-acc-idx (nth anon-acc-idx accs)))
+         (anon-acc-var (when anon-acc-idx (nth anon-acc-idx acc-vars)))
          (bindings nil)
          (init-stmts nil)
          (test-forms nil)
@@ -3501,18 +3528,16 @@
     (dolist (wb with-binds)
       (push wb bindings))
 
-    ;; Accumulator binding (always/thereis don't need one).
+    ;; Accumulator bindings (always/thereis don't need one).
     ;; :maximize/:minimize start at NIL — the body sets initial value on
     ;; first iteration via (if (null acc) val (max acc val)).
-    (when (and acc (member (car acc) '(:collect :collect-when :sum :count :append
-                                       :nconc :maximize :minimize)))
-      (push (list acc-var (case (car acc)
-                            (:collect nil)
-                            (:collect-when nil)
-                            (:sum 0)
-                            (:count 0)
-                            (t nil)))
-            bindings))
+    (let ((i -1))
+      (dolist (acc accs)
+        (incf i)
+        (when (member (car acc) '(:collect :collect-when :sum :count :append
+                                  :nconc :maximize :minimize))
+          (push (list (nth i acc-vars) (%loop-acc-init-value (car acc)))
+                bindings))))
 
     ;; Process iterations
     (dolist (iter iters)
@@ -3594,41 +3619,51 @@
            (push `(if (%loop-le ,var 0) (return nil)) test-forms)
            (push `(setq ,var (- ,var 1)) step-stmts)))))
 
-    ;; Build accumulation body
-    (let ((acc-body
-            (when acc
-              (case (car acc)
-                (:collect
-                 (list `(setq ,acc-var (cons ,(cadr acc) ,acc-var))))
-                (:collect-when
-                 (list `(when ,(cadr acc)
-                          (setq ,acc-var (cons ,(caddr acc) ,acc-var)))))
-                (:sum
-                 (list `(setq ,acc-var (+ ,acc-var ,(cadr acc)))))
-                (:count
-                 (list `(when ,(cadr acc)
-                          (setq ,acc-var (+ ,acc-var 1)))))
-                (:append
-                 (list `(setq ,acc-var (append ,acc-var ,(cadr acc)))))
-                (:nconc
-                 (list `(setq ,acc-var (nconc ,acc-var ,(cadr acc)))))
-                (:maximize
-                 (list `(let ((%acc-v ,(cadr acc)))
-                          (setq ,acc-var
-                                (if (null ,acc-var)
-                                    %acc-v
-                                    (if (%loop-gt %acc-v ,acc-var) %acc-v ,acc-var))))))
-                (:minimize
-                 (list `(let ((%acc-v ,(cadr acc)))
-                          (setq ,acc-var
-                                (if (null ,acc-var)
-                                    %acc-v
-                                    (if (%loop-lt %acc-v ,acc-var) %acc-v ,acc-var))))))
-                (:always
-                 (list `(unless ,(cadr acc) (return nil))))
-                (:thereis
-                 (list `(let ((,acc-var ,(cadr acc)))
-                          (when ,acc-var (return ,acc-var)))))))))
+    ;; Build accumulation body — one chunk per accumulator.
+    (let ((acc-body nil)
+          (has-always nil)
+          (has-thereis nil)
+          (i -1))
+      (dolist (acc accs)
+        (incf i)
+        (let ((av (nth i acc-vars)))
+          (case (car acc)
+            (:collect
+             (push `(setq ,av (cons ,(cadr acc) ,av)) acc-body))
+            (:collect-when
+             (push `(when ,(cadr acc)
+                      (setq ,av (cons ,(caddr acc) ,av))) acc-body))
+            (:sum
+             (push `(setq ,av (+ ,av ,(cadr acc))) acc-body))
+            (:count
+             (push `(when ,(cadr acc)
+                      (setq ,av (+ ,av 1))) acc-body))
+            (:append
+             (push `(setq ,av (append ,av ,(cadr acc))) acc-body))
+            (:nconc
+             (push `(setq ,av (nconc ,av ,(cadr acc))) acc-body))
+            (:maximize
+             (push `(let ((%acc-v ,(cadr acc)))
+                      (setq ,av
+                            (if (null ,av)
+                                %acc-v
+                                (if (%loop-gt %acc-v ,av) %acc-v ,av))))
+                   acc-body))
+            (:minimize
+             (push `(let ((%acc-v ,(cadr acc)))
+                      (setq ,av
+                            (if (null ,av)
+                                %acc-v
+                                (if (%loop-lt %acc-v ,av) %acc-v ,av))))
+                   acc-body))
+            (:always
+             (setf has-always t)
+             (push `(unless ,(cadr acc) (return nil)) acc-body))
+            (:thereis
+             (setf has-thereis t)
+             (push `(let ((,av ,(cadr acc)))
+                      (when ,av (return ,av))) acc-body)))))
+      (setf acc-body (nreverse acc-body))
 
       ;; Construct the final form
       ;; (let* (bindings...)
@@ -3640,19 +3675,18 @@
       ;;     step-stmts...
       ;;   )
       ;;   finally...
-      ;;   acc-var or nil)
+      ;;   anon-acc-var or nil)
       (let* ((loop-body (append (nreverse test-forms)
                                 (nreverse init-stmts)
                                 body
                                 acc-body
                                 (nreverse step-stmts)))
              (inner `(loop ,@loop-body))
-             ;; For always/thereis: rewrite iteration-end returns
+             ;; For always: rewrite iteration-end returns
              ;; The test-forms have (return nil) for exhaustion — we need
-             ;; (return t) for always (all passed) and (return nil) for thereis (not found)
+             ;; (return t) for always (all passed)
              (final-test-forms
-               (if (and acc (eq (car acc) :always))
-                   ;; Replace (return nil) with (return t) in iteration terminators
+               (if has-always
                    (mapcar (lambda (tf)
                              (if (and (consp tf) (eq (car tf) 'if)
                                       (equal (caddr tf) '(return nil)))
@@ -3663,33 +3697,31 @@
              (inner2 (if (eq final-test-forms loop-body)
                          inner
                          `(loop ,@final-test-forms)))
+             ;; Pre-finally fixups: nreverse any anonymous COLLECT acc so it
+             ;; appears in correct order in FINALLY (and as the LOOP value).
+             ;; INTO-named COLLECTs also need nreverse so user code sees the
+             ;; collected list in iteration order.
+             (collect-fixups
+               (let ((ix -1) (fixups nil))
+                 (dolist (a accs)
+                   (incf ix)
+                   (when (member (car a) '(:collect :collect-when))
+                     (push `(setq ,(nth ix acc-vars) (nreverse ,(nth ix acc-vars)))
+                           fixups)))
+                 (nreverse fixups)))
              (result (cond
-                       ;; Collect returns reversed list (nreverse in prelude).
-                       ;; With INTO, the user-named acc-var must hold the
-                       ;; nreversed list while FINALLY runs (so RETURN can
-                       ;; pick it up); update it in place before FINALLY.
-                       ((and acc (member (car acc) '(:collect :collect-when)))
-                        (if acc-into-var
-                            `(progn ,inner2
-                                    (setq ,acc-var (nreverse ,acc-var))
-                                    ,@finally
-                                    (if ,acc-var ,acc-var nil))
-                            `(progn ,inner2 ,@finally (nreverse ,acc-var))))
-                       ;; Sum/count/append/nconc/maximize/minimize: return acc-var
-                       ;; without INTO; with INTO, the LOOP returns NIL (the
-                       ;; user-named acc-var is in scope for FINALLY/RETURN).
-                       ((and acc (member (car acc) '(:sum :count :append :nconc
-                                                     :maximize :minimize)))
-                        (if acc-into-var
-                            `(progn ,inner2 ,@finally nil)
-                            `(progn ,inner2 ,@finally ,acc-var)))
-                       ;; Always: loop returns t/nil directly
-                       ((and acc (eq (car acc) :always))
+                       (has-always
                         (if finally `(progn ,inner2 ,@finally) inner2))
-                       ;; Thereis: loop returns value/nil directly
-                       ((and acc (eq (car acc) :thereis))
+                       (has-thereis
                         (if finally `(progn ,inner2 ,@finally) inner2))
-                       ;; No accumulator
+                       (anon-acc
+                        (let ((return-form
+                                (if (member (car anon-acc) '(:collect :collect-when))
+                                    anon-acc-var  ; already nreversed by fixup
+                                    anon-acc-var)))
+                          `(progn ,inner2 ,@collect-fixups ,@finally ,return-form)))
+                       (accs   ; only INTO accs, no anon — return NIL after fixups+finally
+                        `(progn ,inner2 ,@collect-fixups ,@finally nil))
                        (finally
                         `(progn ,inner2 ,@finally nil))
                        (t inner2))))

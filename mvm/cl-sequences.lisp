@@ -527,28 +527,83 @@
 (defun typep* (obj type) (typep obj type))
 
 ;;; String functions
+(defun %concat-elt-count (s)
+  (cond ((null s) 0)
+        ((consp s) (length s))
+        ((stringp s) (array-length s))
+        (t (array-length s))))
+
+(defun %concat-result-kind (result-type)
+  "Resolve a concatenate RESULT-TYPE designator to one of :LIST,
+   :STRING, or :VECTOR.  Compound forms like (vector ...) and
+   (simple-vector ...) are recognised by their car."
+  (cond
+    ((or (eq result-type 'list) (eq result-type 'cons)) :list)
+    ((or (eq result-type 'string) (eq result-type 'simple-string)
+         (eq result-type 'base-string) (eq result-type 'simple-base-string))
+     :string)
+    ((or (eq result-type 'vector) (eq result-type 'simple-vector)
+         (eq result-type 'array)  (eq result-type 'simple-array)
+         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector))
+     :vector)
+    ((consp result-type)
+     (let ((head (car result-type)))
+       (cond ((or (eq head 'vector) (eq head 'simple-vector)
+                  (eq head 'array)  (eq head 'simple-array)
+                  (eq head 'bit-vector) (eq head 'simple-bit-vector))
+              :vector)
+             ((or (eq head 'string) (eq head 'simple-string)
+                  (eq head 'base-string) (eq head 'simple-base-string))
+              :string)
+             (t :vector))))
+    (t :vector)))
+
 (defun concatenate (result-type &rest seqs)
-  "Concatenate sequences."
-  (if (or (eq result-type 'list) (eq result-type (quote list)))
-      (let ((r nil))
-        (dolist (s (nreverse seqs))
-          (if (consp s) (setq r (append s r))
-              (dotimes (i (length s)) (setq r (append r (list (elt s i)))))))
-        r)
-      ;; String result — concatenate all as strings
-      (let ((total 0))
-        (dolist (s seqs) (setq total (+ total (if (stringp s) (array-length s)
-                                                   (if (consp s) (length s) 0)))))
-        (let ((result (%make-string-array total)) (pos 0))
-          (dolist (s seqs)
-            (if (stringp s)
+  "Concatenate sequences.  Recognises list / string / vector result
+   types (atomic and compound forms like (vector * *))."
+  (let ((kind (%concat-result-kind result-type)))
+    (cond
+      ((eq kind :list)
+       (let ((r nil))
+         (dolist (s (nreverse seqs))
+           (if (consp s) (setq r (append s r))
+               (dotimes (i (length s)) (setq r (append r (list (elt s i)))))))
+         r))
+      ((eq kind :string)
+       (let ((total 0))
+         (dolist (s seqs) (setq total (+ total (%concat-elt-count s))))
+         (let ((result (%make-string-array total)) (pos 0))
+           (dolist (s seqs)
+             (cond
+               ((null s) nil)
+               ((stringp s)
                 (dotimes (i (array-length s))
-                  (aset result pos (aref s i))
-                  (setq pos (+ pos 1)))
+                  (aset result pos (aref s i)) (setq pos (+ pos 1))))
+               ((consp s)
                 (dolist (c s)
                   (aset result pos (if (characterp c) (char-code c) c))
-                  (setq pos (+ pos 1)))))
-          result))))
+                  (setq pos (+ pos 1))))
+               (t  ;; vector
+                (dotimes (i (array-length s))
+                  (let ((c (aref s i)))
+                    (aset result pos (if (characterp c) (char-code c) c))
+                    (setq pos (+ pos 1)))))))
+           result)))
+      (t  ;; :vector
+       (let ((total 0))
+         (dolist (s seqs) (setq total (+ total (%concat-elt-count s))))
+         (let ((result (make-array total)) (pos 0))
+           (dolist (s seqs)
+             (cond
+               ((null s) nil)
+               ((consp s)
+                (dolist (c s)
+                  (aset result pos c) (setq pos (+ pos 1))))
+               (t  ;; string or vector
+                (dotimes (i (array-length s))
+                  (aset result pos (aref s i))
+                  (setq pos (+ pos 1))))))
+           result))))))
 
 (defun merge (result-type s1 s2 pred &rest args)
   "Merge two sorted sequences."

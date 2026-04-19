@@ -126,7 +126,11 @@
       (setq cur (cdr cur)))))
 
 (defun parse-test-key (args)
-  "Parse :test and :key keyword args. Returns (test-fn . key-fn)."
+  "Parse :test and :key keyword args. Returns (test-fn . key-fn).
+   test-fn may be NIL — callers should use inline `eql` in that case
+   rather than `#'eql`, because `eql` is an inline opcode in MVM and
+   has no callable function entry (#'eql evaluates to a NIL/garbage
+   pointer; (funcall <that> ...) silently returns wrong values)."
   (let ((test-fn nil) (key-fn nil) (a args))
     (loop (when (null a) (return))
       (cond ((eq (car a) :test) (setq test-fn (cadr a)) (setq a (cddr a)))
@@ -137,13 +141,16 @@
             ((eq (car a) :end) (setq a (cddr a)))
             ((eq (car a) :from-end) (setq a (cddr a)))
             (t (setq a (cdr a)))))
-    (cons (or test-fn #'eql) key-fn)))
+    (cons test-fn key-fn)))
 
 (defun remove (item list &rest args)
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed)))
-    (remove-if (lambda (x) (funcall test-fn item (if key-fn (funcall key-fn x) x))) list)))
+    (remove-if (lambda (x)
+                 (let ((v (if key-fn (funcall key-fn x) x)))
+                   (if test-fn (funcall test-fn item v) (eql item v))))
+               list)))
 
 (defun remove-if-not (pred list &rest args)
   (remove-if (lambda (x) (not (funcall pred x))) list))
@@ -685,7 +692,10 @@
          (test-fn (car parsed))
          (key-fn (cdr parsed))
          (item-key (if key-fn (funcall key-fn item) item)))
-    (if (some (lambda (x) (funcall test-fn item-key (if key-fn (funcall key-fn x) x))) list)
+    (if (some (lambda (x)
+                (let ((v (if key-fn (funcall key-fn x) x)))
+                  (if test-fn (funcall test-fn item-key v) (eql item-key v))))
+              list)
         list
         (cons item list))))
 
@@ -697,7 +707,10 @@
          (r nil))
     (dolist (item list1 (nreverse r))
       (let ((item-key (if key-fn (funcall key-fn item) item)))
-        (when (some (lambda (x) (funcall test-fn item-key (if key-fn (funcall key-fn x) x))) list2)
+        (when (some (lambda (x)
+                      (let ((v (if key-fn (funcall key-fn x) x)))
+                        (if test-fn (funcall test-fn item-key v) (eql item-key v))))
+                    list2)
           (setq r (cons item r)))))))
 
 (defun delete (item seq &rest args)

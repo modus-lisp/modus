@@ -1873,32 +1873,36 @@
                 (return sym))))))))
 
 ;;; SET-DIFFERENCE — add :key and :test support
+;; Find :test/:key in a flat &rest plist — common helper used by the
+;; set-* / -if-* family.  Returns 'em separately (nil if not present).
+(defun %find-key-arg (args key)
+  (let ((cur args) (found nil))
+    (loop (when (null cur) (return found))
+      (when (eq (car cur) key) (setq found (cadr cur)) (return found))
+      (setq cur (cddr cur)))))
+
 (defun set-difference (l1 l2 &rest args)
-  (let ((test-fn (let ((cur args))
-                   (let ((found nil))
-                     (loop
-                       (when (null cur) (return nil))
-                       (when (eq (car cur) :test) (setq found (cadr cur)))
-                       (setq cur (cddr cur)))
-                     found)))
-        (key-fn (let ((cur args))
-                  (let ((found nil))
-                    (loop
-                      (when (null cur) (return nil))
-                      (when (eq (car cur) :key) (setq found (cadr cur)))
-                      (setq cur (cddr cur)))
-                    found))))
-    (let ((actual-test (or test-fn #'eql))
-          (actual-key (if (null key-fn) nil key-fn)))
-      (let ((r nil))
-        (dolist (item l1 (nreverse r))
-          (let ((item-key (if actual-key (funcall actual-key item) item)))
-            (unless (let ((found nil))
-                      (dolist (x l2 found)
-                        (let ((x-key (if actual-key (funcall actual-key x) x)))
-                          (when (funcall actual-test item-key x-key)
-                            (setq found t)))))
-              (setq r (cons item r)))))))))
+  ;; #'eql is unavailable in the runtime (eql is an inline opcode, not
+  ;; a real function), so the previous (or test-fn #'eql) bound a NIL
+  ;; or otherwise-unusable function and (funcall actual-test ...)
+  ;; effectively short-circuited "no match" for every element — making
+  ;; set-difference always return l1 (or NIL via different earlier
+  ;; bug). Use the inline `eql` opcode directly when no :test is given.
+  (let ((test-fn (%find-key-arg args :test))
+        (key-fn  (%find-key-arg args :key))
+        (r nil))
+    (dolist (item l1 (nreverse r))
+      (let ((item-key (if key-fn (funcall key-fn item) item))
+            (in-l2 nil)
+            (cur l2))
+        (loop
+          (when (or in-l2 (null cur)) (return nil))
+          (let ((x-key (if key-fn (funcall key-fn (car cur)) (car cur))))
+            (when (if test-fn (funcall test-fn item-key x-key)
+                              (eql item-key x-key))
+              (setq in-l2 t)))
+          (setq cur (cdr cur)))
+        (unless in-l2 (setq r (cons item r)))))))
 
 (defun nset-difference (l1 l2 &rest args)
   (apply #'set-difference l1 l2 args))

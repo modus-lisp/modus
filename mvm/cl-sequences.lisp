@@ -502,6 +502,8 @@
       (when (eq (car a) :initial-element) (setq init (cadr a)) (return))
       (setq a (cddr a)))
     (cond
+      ;; null: only valid for size 0; returns NIL
+      ((eq type 'null) (if (= size 0) nil (make-array size)))
       ((or (eq type 'list) (eq type 'cons))
        (let ((r nil) (i 0))
          (loop (when (= i size) (return r))

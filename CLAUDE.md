@@ -344,27 +344,53 @@ Workaround: keep prelude / heavily-called runtime functions to fixed positional
 parameters. If you need keyword tolerance, hand-parse the `&rest` in a wrapper
 that itself uses positional params and dispatches.
 
-### Vector literal `#(...)` inside `(let ((x #(...))) ...)` in a lambda body → SIGSEGV
+### Lambda body + nested-let-with-mutation crash → SIGSEGV before body executes
 
-The `#(...)` reader macro compiles to `(let ((arr (make-array N))) (aset arr 0 ...) ... arr)`.
-When this expansion lands inside another `let`'s init-form inside a lambda body
-(e.g. `(funcall (lambda () (let ((x #(a b a c))) (substitute 'b 'a x))))`), the
-nested frame allocation collides with the outer frame and the runtime SIGSEGVs.
+Minimum reproducer:
 
-Same pattern at top level (no lambda wrap) works fine. Replacing `#(a b a c)`
-with `(vector 'a 'b 'a 'c)` would dodge it — but `vector` isn't defined as a
-runtime function (only opcode-style `make-array` + `aset` are), so the literal
-expansion has no clean alternative.
+  (funcall (lambda ()
+    (let ((x (let ((arr (make-array 4)))
+               (aset arr 0 'a)
+               arr)))
+      (length x))))
 
-Affects: `SUBSTITUTE-VECTOR.*`, `NSUBSTITUTE-VECTOR.*`, `SUBSTITUTE-IF-VECTOR.*`,
-`NSUBSTITUTE-IF-VECTOR.*` and friends — every test of the shape
-`(let ((x #(...))) (some-fn ... x))` that the per-file fork's wrap turns into
-a `(funcall (lambda () ...))`. ~250 tests in the ANSI suite fail to this.
+Crashes with SIGSEGV. No breadcrumbs printed inside the lambda body — the
+crash happens before the body executes. Removing ANY of the following
+makes it work:
+- the outer lambda (run as a top-level form: works)
+- the outer let (just the inner let directly: works)
+- the inner let (lift arr into the outer let directly: works)
+- the aset (just `(let ((arr (make-array N))) arr)`: works)
+- the trailing `arr` reference (return the aset result instead: works)
 
-Reproducer is fragile: the same form added as a custom deftest passes when the
-surrounding function is small but crashes when more deftests are added before
-or after it. That points to a register-pressure or code-size threshold in the
-function compiler rather than a clean bug in vector-literal expansion.
+So the failing pattern is specifically:
+  lambda body
+    + outer-let with init = inner-let
+    + inner-let body has aset/setcar/mutation followed by return-bound-var
+
+cons + set-car triggers it the same way as make-array + aset, so the bug
+isn't in the array opcodes. It's in how compile-let evaluates init-forms
+that themselves contain compile-let with a mutating body, when the
+enclosing function is a lambda compiled via mvm-compile-function-internal.
+
+Affects: every `#(...)` vector literal (compiles to a let-arr-aset-arr
+expansion) when it appears as a let-binding init inside a lambda body —
+which is almost every SUBSTITUTE-VECTOR / NSUBSTITUTE-VECTOR /
+NSUBSTITUTE-IF-VECTOR / FIND-VECTOR / etc. test (~250 tests gated).
+
+Things tried and reverted:
+- Changing #(...) expansion to compile-make-array + direct OBJ-SET emits
+  bypassing the inner let — same crash. Suggests the bug is in compile-aset
+  or how its IR interacts with the let frame layout, not in the let itself.
+- Replacing #(...) with a runtime (vector ...) call — `vector` isn't defined.
+- Bisection only narrowed the pattern; the underlying compiler-state issue
+  isn't visible in the IR I dumped. Likely needs translator-level work to
+  see what bytecode actually gets emitted for the lambda body's prologue.
+
+Surface symptom is also positional: adding more deftests in the same defun
+can flip a previously-passing test to crash. Likely a register allocator
+or *temp-reg-counter* state issue that interacts with the failing pattern,
+amplifying it once a threshold is reached.
 
 ### Function size in run-cl-loop-tests changes which sub-tests crash
 

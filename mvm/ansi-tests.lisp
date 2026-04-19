@@ -108,7 +108,14 @@
   ;; quietly filling the vector with (symbol-value 'A) ≈ NIL. After fix,
   ;; compile-form delegates literal vectors to compile-quote.
   (deftest 3091 (let ((v #(a b a c))) (if (eq (aref v 0) 'a) t nil)) t)
-  (deftest 3092 (let ((v #(a b a c))) (symbolp (aref v 0))) t))
+  (deftest 3092 (let ((v #(a b a c))) (symbolp (aref v 0))) t)
+  ;; CATCH/THROW basics
+  (deftest 3093 (catch 'foo 17) 17)
+  (deftest 3094 (catch 'foo (throw 'foo 42) 99) 42)
+  ;; LOOP keyword ordering
+  (deftest 3095 (loop for x to 10 from 1 collect x) (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 (cons 6 (cons 7 (cons 8 (cons 9 (cons 10 nil)))))))))))
+  (deftest 3096 (loop for x to 10 by 2 from 1 collect x) (cons 1 (cons 3 (cons 5 (cons 7 (cons 9 nil))))))
+  (deftest 3097 (loop for x by 2 to 10 from 1 collect x) (cons 1 (cons 3 (cons 5 (cons 7 (cons 9 nil)))))))
 
 ;;; ============================================================
 ;;; Chapter 14: Conses (1400-1499)

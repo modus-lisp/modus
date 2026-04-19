@@ -2006,13 +2006,40 @@
       ((= op-name 519861365770534371)
        (compile-progn (cdddr form) env dest))
 
-      ;; CATCH — (catch tag form) → simplified: just compile form (no actual catch)
+      ;; CATCH — (catch tag body...) — establish catch frame for THROW.
+      ;; Wraps body in handler-case; the handler returns *catch-value*
+      ;; if the throw's tag matches our tag. We don't support nested
+      ;; catches with the SAME tag (the inner catches the throw); good
+      ;; enough for most ANSI tests. The tag is evaluated once and saved
+      ;; locally so it isn't re-evaluated by the handler.
       ((= op-name 773672091476800706)
-       (compile-form (caddr form) env dest))
+       (let ((tag-form (cadr form))
+             (body-forms (cddr form)))
+         (compile-form
+          `(let ((%c-tag ,tag-form))
+             (handler-case (progn ,@body-forms)
+               (t (%c-cnd)
+                 (if (if *catch-active* (eql *catch-tag* %c-tag) nil)
+                     (let ((%c-v *catch-value*))
+                       (setq *catch-active* nil)
+                       (setq *catch-tag* nil)
+                       (setq *catch-value* nil)
+                       %c-v)
+                     (error %c-cnd)))))
+          env dest)))
 
-      ;; THROW — (throw tag result) → simplified: just evaluate result
+      ;; THROW — (throw tag value) — set globals, signal error to unwind
+      ;; to the nearest CATCH. The (error ...) call longjmps out.
       ((= op-name 679248612953119241)
-       (compile-form (caddr form) env dest))
+       (let ((tag-form (cadr form))
+             (val-form (caddr form)))
+         (compile-form
+          `(progn
+             (setq *catch-tag* ,tag-form)
+             (setq *catch-value* ,val-form)
+             (setq *catch-active* t)
+             (error "throw"))
+          env dest)))
 
       ;; TYPECASE — (typecase key (type1 form1...) ...) → rewrite as let + cond typep
       ((= op-name 578189417670937395)
@@ -3121,31 +3148,52 @@
              (when (and (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
                (cond
-                 ;; FOR var FROM/UPFROM/DOWNFROM start ...
-                 ((or (= iter-kw 355693237506394641)
+                 ;; FOR var [FROM/UPFROM/DOWNFROM start] [TO/BELOW/DOWNTO/ABOVE end] [BY step]
+                 ;; in any order. Triggered by any of FROM/UPFROM/DOWNFROM/TO/BELOW/
+                 ;; DOWNTO/ABOVE/BY. Defaults: start=0, end-test=:to (loop forever
+                 ;; without END), by=1.
+                 ((or (= iter-kw 355693237506394641)    ; FROM
                       (= iter-kw 704601669436668564)    ; UPFROM
-                      (= iter-kw 888358500084682875))   ; DOWNFROM
-                  (setf rest (cdr rest))
-                  (let* ((start-form (car rest))
-                         (end-form nil) (end-test :to) (by-form nil))
-                    (setf rest (cdr rest))
-                    ;; Parse optional TO/BELOW/DOWNTO/ABOVE and BY
+                      (= iter-kw 888358500084682875)    ; DOWNFROM
+                      (= iter-kw 611742951095832940)    ; TO
+                      (= iter-kw 708656842296756988)    ; BELOW
+                      (= iter-kw 962879967384500096)    ; ABOVE
+                      (= iter-kw 223271319558938470)    ; DOWNTO
+                      (= iter-kw 934319717393949980))   ; BY
+                  (let ((start-form 0)
+                        (end-form nil)
+                        (end-test :to)
+                        (by-form nil)
+                        (downward nil))
+                    ;; Loop while next token is one of these clause keywords.
                     (loop while (and rest (symbolp (car rest))
-                                    (member (normalize-name (car rest))
-                                            '(611742951095832940 708656842296756988
-                                              962879967384500096 223271319558938470
-                                              934319717393949980)))
+                                    (let ((kw2 (normalize-name (car rest))))
+                                      (or (= kw2 355693237506394641)
+                                          (= kw2 704601669436668564)
+                                          (= kw2 888358500084682875)
+                                          (= kw2 611742951095832940)
+                                          (= kw2 708656842296756988)
+                                          (= kw2 962879967384500096)
+                                          (= kw2 223271319558938470)
+                                          (= kw2 934319717393949980))))
                           do (let ((sub-kw (normalize-name (car rest))))
                                (cond
-                                 ((= sub-kw 611742951095832940)
-                                  (setf end-test :to end-form (cadr rest) rest (cddr rest)))
-                                 ((= sub-kw 708656842296756988)
+                                 ((= sub-kw 355693237506394641)  ; FROM
+                                  (setf start-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 704601669436668564)  ; UPFROM
+                                  (setf start-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 888358500084682875)  ; DOWNFROM
+                                  (setf start-form (cadr rest) downward t rest (cddr rest)))
+                                 ((= sub-kw 611742951095832940)  ; TO
+                                  (setf end-test (if downward :downto :to)
+                                        end-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 708656842296756988)  ; BELOW
                                   (setf end-test :below end-form (cadr rest) rest (cddr rest)))
-                                 ((= sub-kw 962879967384500096)
+                                 ((= sub-kw 962879967384500096)  ; ABOVE
                                   (setf end-test :above end-form (cadr rest) rest (cddr rest)))
-                                 ((= sub-kw 223271319558938470)
+                                 ((= sub-kw 223271319558938470)  ; DOWNTO
                                   (setf end-test :downto end-form (cadr rest) rest (cddr rest)))
-                                 ((= sub-kw 934319717393949980)
+                                 ((= sub-kw 934319717393949980)  ; BY
                                   (setf by-form (cadr rest) rest (cddr rest))))))
                     (push (make-loop-iter :kind :from :var var
                                           :init-form start-form
@@ -3209,32 +3257,6 @@
                                           :init-form init
                                           :step-form (or step init))
                           (loop-state-iterations state))))
-
-                 ;; FOR var BELOW/TO/DOWNTO n — shorthand for FROM 0.
-                 ;; rest still points at the TO/BELOW keyword — skip it
-                 ;; BEFORE reading the end-form value (earlier code read
-                 ;; end-form as the keyword itself, so the loop compared
-                 ;; the iteration var to a symbol pointer and ran forever).
-                 ((member iter-kw '(611742951095832940 708656842296756988
-                                    962879967384500096 223271319558938470))
-                  (let ((end-test (cond
-                                    ((= iter-kw 611742951095832940) :to)
-                                    ((= iter-kw 708656842296756988) :below)
-                                    ((= iter-kw 962879967384500096) :above)
-                                    (t :downto))))
-                    (setf rest (cdr rest))
-                    (let ((end-form (car rest)))
-                      (setf rest (cdr rest))
-                      (let ((by-form nil))
-                        (when (and rest (symbolp (car rest))
-                                   (= (normalize-name (car rest)) 934319717393949980))
-                          (setf by-form (cadr rest) rest (cddr rest)))
-                        (push (make-loop-iter :kind :from :var var
-                                              :init-form 0
-                                              :end-form end-form
-                                              :end-test end-test
-                                              :by-form by-form)
-                              (loop-state-iterations state))))))
 
                  (t
                   ;; Unknown FOR clause — skip it as body form

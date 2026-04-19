@@ -354,6 +354,14 @@
 (defvar *current-condition* nil)
 (defvar *handler-bind-stack* nil)
 
+;; CATCH/THROW state. (THROW tag value) sets these globals then signals an
+;; error so the longjmp machinery unwinds to the nearest CATCH. CATCH checks
+;; whether the active throw matches its tag and either captures the value or
+;; re-signals so an outer CATCH can handle it.
+(defvar *catch-active* nil)
+(defvar *catch-tag* nil)
+(defvar *catch-value* nil)
+
 (defun error (msg &rest args)
   "Signal an error with a condition object."
   (let ((cond-obj

@@ -797,8 +797,8 @@
   (remove-if-not pred seq))
 
 (defun delete-duplicates (seq &rest args)
-  "Remove duplicate items (destructive)."
-  (remove-duplicates seq))
+  "Remove duplicate items (destructive). Forwards :test/:key/:from-end."
+  (apply #'remove-duplicates seq args))
 
 (defun pushnew-fn (item place)
   "Functional pushnew."

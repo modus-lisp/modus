@@ -1038,12 +1038,16 @@
             (setq i (+ i 1))))
         ;; Vector path
         (let ((len (length sequence))
-              (result nil))
+              (result nil)
+              (string-p (stringp sequence)))
           (when (null end) (setq end len))
           (let ((i start))
             (loop
               (when (= i end) (return result))
-              (let ((elem (aref sequence i)))
+              (let* ((raw (aref sequence i))
+                     ;; String slots hold fixnum char-codes; present as
+                     ;; characters so (eql item #\X) works.
+                     (elem (if string-p (code-char raw) raw)))
                 (let ((test-val (if key (funcall key elem) elem)))
                   (when (if test (funcall test item test-val) (eql item test-val))
                     (if from-end

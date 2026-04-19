@@ -3056,7 +3056,9 @@
                  744661507158602198 340376721697683628 1091564327776232814
                  870389735836749037 212607784983936827
                  195734683635763289 682179722204096129
-                 876035653932002648 1018827631117520136))))
+                 876035653932002648 1018827631117520136
+                 ;; UPTO (TO synonym), MAXIMIZING/MINIMIZING (synonyms)
+                 819586319614622873 220277010584993844 1092018583149917146))))
 
 
 (defun compile-loop (body env dest)
@@ -3146,6 +3148,11 @@
                                                (cl-loop-keyword-p (car rest)))))
                      do (setf rest (cdr rest))))
              (when (and (not (consp var)) rest)
+             ;; Skip OF-TYPE type-spec — we ignore type declarations.
+             (when (and (symbolp (car rest))
+                        (= (normalize-name (car rest)) 729509721274984859))
+               (setf rest (cddr rest)))
+             (when (and (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
                (cond
                  ;; FOR var [FROM/UPFROM/DOWNFROM start] [TO/BELOW/DOWNTO/ABOVE end] [BY step]
@@ -3156,6 +3163,7 @@
                       (= iter-kw 704601669436668564)    ; UPFROM
                       (= iter-kw 888358500084682875)    ; DOWNFROM
                       (= iter-kw 611742951095832940)    ; TO
+                      (= iter-kw 819586319614622873)    ; UPTO (TO synonym)
                       (= iter-kw 708656842296756988)    ; BELOW
                       (= iter-kw 962879967384500096)    ; ABOVE
                       (= iter-kw 223271319558938470)    ; DOWNTO
@@ -3172,6 +3180,7 @@
                                           (= kw2 704601669436668564)
                                           (= kw2 888358500084682875)
                                           (= kw2 611742951095832940)
+                                          (= kw2 819586319614622873)  ; UPTO
                                           (= kw2 708656842296756988)
                                           (= kw2 962879967384500096)
                                           (= kw2 223271319558938470)
@@ -3184,7 +3193,8 @@
                                   (setf start-form (cadr rest) rest (cddr rest)))
                                  ((= sub-kw 888358500084682875)  ; DOWNFROM
                                   (setf start-form (cadr rest) downward t rest (cddr rest)))
-                                 ((= sub-kw 611742951095832940)  ; TO
+                                 ((or (= sub-kw 611742951095832940)  ; TO
+                                      (= sub-kw 819586319614622873)) ; UPTO
                                   (setf end-test (if downward :downto :to)
                                         end-form (cadr rest) rest (cddr rest)))
                                  ((= sub-kw 708656842296756988)  ; BELOW
@@ -3262,7 +3272,7 @@
                   ;; Unknown FOR clause — skip it as body form
                   (format t "  WARN: unknown FOR clause ~A~%" iter-kw)
                   (push (car rest) (loop-state-body-forms state))
-                  (setf rest (cdr rest))))))))
+                  (setf rest (cdr rest)))))))))
 
           ;; WHILE condition
           ((= kw 468563938978316688)
@@ -3333,6 +3343,18 @@
           ((or (= kw 876035653932002648) (= kw 1018827631117520136))
            (let ((expr (cadr rest)))
              (setf (loop-state-accumulator state) (list :nconc expr))
+             (setf rest (cddr rest))))
+
+          ;; MAXIMIZE/MAXIMIZING expr
+          ((or (= kw 891107942385378521) (= kw 220277010584993844))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :maximize expr))
+             (setf rest (cddr rest))))
+
+          ;; MINIMIZE/MINIMIZING expr
+          ((or (= kw 646649243001235175) (= kw 1092018583149917146))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :minimize expr))
              (setf rest (cddr rest))))
 
           ;; WHEN/IF cond DO body | COLLECT expr
@@ -3435,8 +3457,11 @@
     (dolist (wb with-binds)
       (push wb bindings))
 
-    ;; Accumulator binding (always/thereis don't need one)
-    (when (and acc (member (car acc) '(:collect :collect-when :sum :count :append :nconc)))
+    ;; Accumulator binding (always/thereis don't need one).
+    ;; :maximize/:minimize start at NIL — the body sets initial value on
+    ;; first iteration via (if (null acc) val (max acc val)).
+    (when (and acc (member (car acc) '(:collect :collect-when :sum :count :append
+                                       :nconc :maximize :minimize)))
       (push (list acc-var (case (car acc)
                             (:collect nil)
                             (:collect-when nil)
@@ -3521,8 +3546,9 @@
         (:repeat
          (let ((var (loop-iter-var iter)))
            (push (list var (loop-iter-init-form iter)) bindings)
-           (push `(if (<= ,var 0) (return nil)) test-forms)
-           (push `(setq ,var (1- ,var)) step-stmts)))))
+           ;; %loop-le handles float/ratio bounds without hanging.
+           (push `(if (%loop-le ,var 0) (return nil)) test-forms)
+           (push `(setq ,var (- ,var 1)) step-stmts)))))
 
     ;; Build accumulation body
     (let ((acc-body
@@ -3542,6 +3568,18 @@
                  (list `(setq ,acc-var (append ,acc-var ,(cadr acc)))))
                 (:nconc
                  (list `(setq ,acc-var (nconc ,acc-var ,(cadr acc)))))
+                (:maximize
+                 (list `(let ((%acc-v ,(cadr acc)))
+                          (setq ,acc-var
+                                (if (null ,acc-var)
+                                    %acc-v
+                                    (if (%loop-gt %acc-v ,acc-var) %acc-v ,acc-var))))))
+                (:minimize
+                 (list `(let ((%acc-v ,(cadr acc)))
+                          (setq ,acc-var
+                                (if (null ,acc-var)
+                                    %acc-v
+                                    (if (%loop-lt %acc-v ,acc-var) %acc-v ,acc-var))))))
                 (:always
                  (list `(unless ,(cadr acc) (return nil))))
                 (:thereis
@@ -3585,8 +3623,9 @@
                        ;; Collect returns reversed list (nreverse in prelude)
                        ((and acc (member (car acc) '(:collect :collect-when)))
                         `(progn ,inner2 ,@finally (nreverse ,acc-var)))
-                       ;; Sum/count/append/nconc returns accumulator directly
-                       ((and acc (member (car acc) '(:sum :count :append :nconc)))
+                       ;; Sum/count/append/nconc/maximize/minimize returns acc directly
+                       ((and acc (member (car acc) '(:sum :count :append :nconc
+                                                     :maximize :minimize)))
                         `(progn ,inner2 ,@finally ,acc-var))
                        ;; Always: loop returns t/nil directly
                        ((and acc (eq (car acc) :always))

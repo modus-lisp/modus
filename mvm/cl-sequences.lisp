@@ -606,15 +606,33 @@
            result))))))
 
 (defun merge (result-type s1 s2 pred &rest args)
-  "Merge two sorted sequences."
+  "Merge two sorted sequences. Honors RESULT-TYPE designator."
   (let ((r nil) (a (if (consp s1) s1 (coerce s1 'list)))
                 (b (if (consp s2) s2 (coerce s2 'list))))
-    (loop
-      (cond ((null a) (return (nreconc r b)))
-            ((null b) (return (nreconc r a)))
-            ((funcall pred (car a) (car b))
-             (setq r (cons (car a) r)) (setq a (cdr a)))
-            (t (setq r (cons (car b) r)) (setq b (cdr b)))))))
+    (let ((merged (loop
+                    (cond ((null a) (return (nreconc r b)))
+                          ((null b) (return (nreconc r a)))
+                          ((funcall pred (car a) (car b))
+                           (setq r (cons (car a) r)) (setq a (cdr a)))
+                          (t (setq r (cons (car b) r)) (setq b (cdr b))))))
+          (kind (%concat-result-kind result-type)))
+      (cond
+        ((eq kind :list) merged)
+        ((eq kind :string)
+         (let ((n (length merged))
+               (cur merged))
+           (let ((s (%make-string-array n)) (i 0))
+             (loop (when (= i n) (return s))
+               (let ((c (car cur)))
+                 (aset s i (if (characterp c) (char-code c) c)))
+               (setq cur (cdr cur)) (setq i (+ i 1))))))
+        (t  ;; :vector
+         (let ((n (length merged))
+               (cur merged))
+           (let ((v (make-array n)) (i 0))
+             (loop (when (= i n) (return v))
+               (aset v i (car cur))
+               (setq cur (cdr cur)) (setq i (+ i 1))))))))))
 
 (defun replace (s1 s2 &rest args)
   "Replace elements of S1 with elements from S2."

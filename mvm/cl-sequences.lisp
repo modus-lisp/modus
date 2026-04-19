@@ -652,16 +652,34 @@
   s1)
 
 (defun fill (seq item &rest args)
-  "Fill SEQUENCE with ITEM. Strings store fixnum char-codes; coerce
-   character ITEM to its char-code before aset so the stored value
-   matches what literal strings hold (used by string-equal/aref/=)."
-  (if (consp seq)
-      (let ((cur seq)) (loop (when (null cur) (return seq))
-                         (set-car cur item) (setq cur (cdr cur))))
-      (let ((store-item (if (and (stringp seq) (characterp item))
-                            (char-code item)
-                            item)))
-        (dotimes (i (length seq) seq) (aset seq i store-item)))))
+  "Fill SEQUENCE with ITEM. Honors :START and :END.  Strings store
+   fixnum char-codes; coerce character ITEM to its char-code before
+   aset so the stored value matches what literal strings hold."
+  (let ((start 0) (end nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :end)   (setq end   (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (cond
+      ((consp seq)
+       (let ((cur seq) (i 0)
+             (eff-end (if end end most-positive-fixnum)))
+         (loop (when (null cur) (return seq))
+           (when (and (>= i start) (< i eff-end))
+             (set-car cur item))
+           (setq cur (cdr cur))
+           (setq i (+ i 1)))
+         seq))
+      (t
+       (let* ((len (length seq))
+              (eff-end (if end end len))
+              (store-item (if (and (stringp seq) (characterp item))
+                              (char-code item)
+                              item))
+              (i start))
+         (loop (when (>= i eff-end) (return seq))
+           (aset seq i store-item)
+           (setq i (+ i 1))))))))
 
 (defun map-into (result fn &rest seqs)
   "Apply FN to elements of SEQS, storing results in RESULT."

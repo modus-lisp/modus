@@ -624,7 +624,8 @@
 ;;; ============================================================
 
 (defun rassoc (item alist &rest args)
-  "Find first pair in ALIST whose cdr matches ITEM."
+  "Find first pair in ALIST whose cdr matches ITEM.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
@@ -634,7 +635,7 @@
       (let ((pair (car cur)))
         (when (consp pair)
           (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
-            (when (funcall test-fn item val)
+            (when (if test-fn (funcall test-fn item val) (eql item val))
               (return pair)))))
       (setq cur (cdr cur)))))
 
@@ -771,7 +772,8 @@
 ;;; ============================================================
 
 (defun set-exclusive-or (list1 list2 &rest args)
-  "Return symmetric difference of LIST1 and LIST2."
+  "Return symmetric difference of LIST1 and LIST2.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
@@ -780,14 +782,16 @@
     (dolist (e1 list1)
       (let ((k1 (if key-fn (funcall key-fn e1) e1)))
         (unless (some (lambda (e2)
-                        (funcall test-fn k1 (if key-fn (funcall key-fn e2) e2)))
+                        (let ((v2 (if key-fn (funcall key-fn e2) e2)))
+                          (if test-fn (funcall test-fn k1 v2) (eql k1 v2))))
                       list2)
           (setq result (cons e1 result)))))
     ;; Elements in list2 not in list1
     (dolist (e2 list2)
       (let ((k2 (if key-fn (funcall key-fn e2) e2)))
         (unless (some (lambda (e1)
-                        (funcall test-fn (if key-fn (funcall key-fn e1) e1) k2))
+                        (let ((v1 (if key-fn (funcall key-fn e1) e1)))
+                          (if test-fn (funcall test-fn v1 k2) (eql v1 k2))))
                       list1)
           (setq result (cons e2 result)))))
     result))

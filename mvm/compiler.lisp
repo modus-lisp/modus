@@ -3118,6 +3118,8 @@
   ;; (:collect-when cond expr) for inline conditional collect.
   ;; :always/:thereis stay as a single non-list value here for simplicity.
   (accumulator nil)
+  ;; INITIALLY forms — run once before the loop starts (after WITH bindings)
+  (initially-forms nil)
   ;; Finally forms
   (finally-forms nil)
   ;; With-bindings: list of (var init)
@@ -3159,6 +3161,9 @@
                (= kw 313452561496444628))
            (let ((var (cadr rest)))
              (setf rest (cddr rest))
+             ;; FOR NIL is the "dummy iterator" — discard value via gensym
+             ;; (binding NIL would error since it's a constant).
+             (when (null var) (setf var (gensym "FORNIL")))
              (when (consp var)
                ;; Destructuring FOR (a b) ... — skip until next loop keyword
                (loop while (and rest (not (and (symbolp (car rest))
@@ -3423,6 +3428,14 @@
                  do (push (car rest) (loop-state-finally-forms state))
                     (setf rest (cdr rest))))
 
+          ;; INITIALLY form... (runs once before the loop body)
+          ((= kw 340376721697683628)
+           (setf rest (cdr rest))
+           (loop while (and rest (not (and (symbolp (car rest))
+                                           (cl-loop-keyword-p (car rest)))))
+                 do (push (car rest) (loop-state-initially-forms state))
+                    (setf rest (cdr rest))))
+
           ;; ALWAYS expr
           ((= kw 1091564327776232814)
            (let ((expr (cadr rest)))
@@ -3475,6 +3488,7 @@
     (setf (loop-state-iterations state) (nreverse (loop-state-iterations state)))
     (setf (loop-state-body-forms state) (nreverse (loop-state-body-forms state)))
     (setf (loop-state-finally-forms state) (nreverse (loop-state-finally-forms state)))
+    (setf (loop-state-initially-forms state) (nreverse (loop-state-initially-forms state)))
     (setf (loop-state-with-bindings state) (nreverse (loop-state-with-bindings state)))
     (setf (loop-state-accumulator state) (nreverse (loop-state-accumulator state)))
     state))
@@ -3500,6 +3514,7 @@
          (body (loop-state-body-forms state))
          (accs (loop-state-accumulator state))   ; list of acc specs
          (finally (loop-state-finally-forms state))
+         (initially (loop-state-initially-forms state))
          (with-binds (loop-state-with-bindings state))
          ;; For each acc-spec, compute its destination var. INTO uses the
          ;; user-named symbol so FINALLY can read it; without INTO, a gensym
@@ -3724,10 +3739,18 @@
                         `(progn ,inner2 ,@collect-fixups ,@finally nil))
                        (finally
                         `(progn ,inner2 ,@finally nil))
-                       (t inner2))))
+                       (t inner2)))
+             ;; INITIALLY runs once before the loop body, after WITH bindings
+             (with-init (if initially
+                            `(progn ,@initially ,result)
+                            result)))
+        ;; NOTE: We don't wrap in (block nil ...) — that change broke
+        ;; multi-accumulator COLLECT (test 21250 regressed). Revisit if
+        ;; we need RETURN-skip-finally semantics; for now accept that
+        ;; (LOOP COUNT (RETURN N)) returns the accumulator instead of N.
         (if bindings
-            `(let* ,(nreverse bindings) ,result)
-            result)))))
+            `(let* ,(nreverse bindings) ,with-init)
+            with-init)))))
 
 (defun compile-return (value env dest)
   "Compile (return value) - exit from enclosing loop or function.

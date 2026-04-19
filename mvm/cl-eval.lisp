@@ -1299,9 +1299,30 @@
 (defun plusp (x) (> x 0))
 (defun minusp (x) (< x 0))
 (defun map (result-type fn &rest seqs)
-  "Map FN over sequences, collecting into RESULT-TYPE."
-  (if (null result-type) (progn (apply #'mapc fn seqs) nil)
-      (apply #'mapcar fn seqs)))
+  "Map FN over sequences, collecting into RESULT-TYPE.
+   Honors atomic and compound result types (list / string / vector /
+   bit-vector / array, plus (vector ...) (string ...) etc.)."
+  (cond
+    ((null result-type)
+     (apply #'mapc fn seqs)
+     nil)
+    (t
+     (let* ((kind (%concat-result-kind result-type))
+            (lst (apply #'mapcar fn seqs))
+            (n (length lst)))
+       (cond
+         ((eq kind :list) lst)
+         ((eq kind :string)
+          (let ((s (%make-string-array n)) (i 0) (cur lst))
+            (loop (when (= i n) (return s))
+              (let ((c (car cur)))
+                (aset s i (if (characterp c) (char-code c) c)))
+              (setq cur (cdr cur)) (setq i (+ i 1)))))
+         (t  ;; :vector
+          (let ((v (make-array n)) (i 0) (cur lst))
+            (loop (when (= i n) (return v))
+              (aset v i (car cur))
+              (setq cur (cdr cur)) (setq i (+ i 1))))))))))
 (defun functionp (x) (or (and (not (null x)) (not (integerp x)) (not (consp x))
                               (not (characterp x)) (not (stringp x)) (not (eq x t)))
                          nil))

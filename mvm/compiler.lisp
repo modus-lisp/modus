@@ -3455,11 +3455,14 @@
            (when (loop-iter-end-form iter)
              (let ((end-var (gensym "END")))
                (push (list end-var (loop-iter-end-form iter)) bindings)
+               ;; Use %loop-cmp helper so float/ratio end-forms work too —
+               ;; raw `>` is fixnum-only and silently mis-compares with a
+               ;; boxed-float pointer, hanging the loop.
                (push (ecase (loop-iter-end-test iter)
-                       (:to    `(if (> ,var ,end-var) (return nil)))
-                       (:below `(if (>= ,var ,end-var) (return nil)))
-                       (:downto `(if (< ,var ,end-var) (return nil)))
-                       (:above `(if (<= ,var ,end-var) (return nil))))
+                       (:to    `(if (%loop-gt ,var ,end-var) (return nil)))
+                       (:below `(if (%loop-ge ,var ,end-var) (return nil)))
+                       (:downto `(if (%loop-lt ,var ,end-var) (return nil)))
+                       (:above `(if (%loop-le ,var ,end-var) (return nil))))
                      test-forms)))
            (if (and (loop-iter-end-test iter)
                     (member (loop-iter-end-test iter) '(:downto :above)))

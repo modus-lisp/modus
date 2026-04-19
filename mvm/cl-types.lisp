@@ -410,6 +410,18 @@
      (and (= (cdr b) 1) (= (car b) a)))
     (t nil)))
 
+;; LOOP comparison helpers — fast fixnum path inline, slow numeric path
+;; for floats/ratios. Used by generate-loop-code so end-tests don't hang
+;; on boxed-float end-forms.
+(defun %loop-lt (a b)
+  (if (and (fixnump a) (fixnump b)) (< a b) (numeric-value-less-p a b)))
+(defun %loop-gt (a b)
+  (if (and (fixnump a) (fixnump b)) (> a b) (numeric-value-less-p b a)))
+(defun %loop-le (a b)
+  (if (and (fixnump a) (fixnump b)) (<= a b) (numeric-<= a b)))
+(defun %loop-ge (a b)
+  (if (and (fixnump a) (fixnump b)) (>= a b) (numeric->= a b)))
+
 ;;; ============================================================
 ;;; Compound typep for ANSI tests
 ;;; ============================================================

@@ -143,17 +143,167 @@
             (t (setq a (cdr a)))))
     (cons test-fn key-fn)))
 
-(defun remove (item list &rest args)
-  (let* ((parsed (parse-test-key args))
-         (test-fn (car parsed))
-         (key-fn (cdr parsed)))
-    (remove-if (lambda (x)
-                 (let ((v (if key-fn (funcall key-fn x) x)))
-                   (if test-fn (funcall test-fn item v) (eql item v))))
-               list)))
+;; Full ANSI parse: (count from-end start end test-fn test-not-fn key-fn).
+;; Reuses %nsubst-parse-args defined in this file.
+(defun remove (item seq &rest args)
+  "Honors :test/:test-not/:key/:start/:end/:count/:from-end. Inline pred so
+   we don't depend on a lambda closure capturing ITEM (lossy in MVM)."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (test-fn (car (cddddr parsed)))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) nil)
+      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((consp seq)
+       (%remove-list item seq test-fn key-fn start-idx end-idx eff-count from-end))
+      (t
+       (%remove-vector item seq test-fn key-fn start-idx end-idx eff-count from-end)))))
 
-(defun remove-if-not (pred list &rest args)
-  (remove-if (lambda (x) (not (funcall pred x))) list))
+(defun %remove-list (item lst test-fn key-fn start-idx end-idx count from-end)
+  ;; Walk the list, marking which indices to drop, then build a new list.
+  ;; FROM-END only matters when COUNT is bounded.
+  (let ((indices nil) (cur lst) (i 0))
+    (loop
+      (when (null cur) (return nil))
+      (when (and end-idx (>= i end-idx)) (return nil))
+      (when (>= i start-idx)
+        (let ((v (if key-fn (funcall key-fn (car cur)) (car cur))))
+          (when (if test-fn (funcall test-fn item v) (eql item v))
+            (push i indices))))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    ;; Apply count: keep only the first/last N matched indices.
+    (let ((to-drop indices))
+      (when count
+        (when from-end
+          ;; indices in reverse-traversal order (largest first); take first N
+          (setq to-drop (subseq indices 0 (min count (length indices)))))
+        (unless from-end
+          ;; want first N matches (smallest indices); indices is largest-first
+          (let ((rev (reverse indices)))
+            (setq to-drop (subseq rev 0 (min count (length rev))))
+            (setq to-drop to-drop))))
+      ;; Build result list excluding to-drop indices
+      (let ((result nil) (cur lst) (i 0))
+        (loop
+          (when (null cur) (return (nreverse result)))
+          (unless (member i to-drop) (push (car cur) result))
+          (setq cur (cdr cur))
+          (setq i (+ i 1)))))))
+
+(defun %remove-vector (item vec test-fn key-fn start-idx end-idx count from-end)
+  (let* ((len (array-length vec))
+         (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+         (string-p (stringp vec))
+         (indices nil))
+    ;; Collect matching indices.
+    (let ((i start-idx))
+      (loop
+        (when (>= i eff-end) (return nil))
+        (let ((elt (aref vec i)))
+          (when string-p (setq elt (code-char elt)))
+          (let ((v (if key-fn (funcall key-fn elt) elt)))
+            (when (if test-fn (funcall test-fn item v) (eql item v))
+              (push i indices))))
+        (setq i (+ i 1))))
+    (let ((to-drop indices))
+      (when count
+        (if from-end
+            (setq to-drop (subseq indices 0 (min count (length indices))))
+            (let ((rev (reverse indices)))
+              (setq to-drop (subseq rev 0 (min count (length rev)))))))
+      ;; Build a new vector skipping to-drop indices.
+      (let* ((drop-count (length to-drop))
+             (out-len (- len drop-count))
+             (out (if string-p (%make-string-array out-len) (make-array out-len)))
+             (i 0) (j 0))
+        (loop
+          (when (= i len) (return out))
+          (unless (member i to-drop)
+            (aset out j (aref vec i))
+            (setq j (+ j 1)))
+          (setq i (+ i 1)))))))
+
+(defun remove-if (pred seq &rest args)
+  "Honors :key/:start/:end/:count/:from-end. Drops elements where PRED is true.
+   Inline pred-eval so we don't depend on closure capture across apply paths.
+   Overrides the simpler 2-arg version in prelude.lisp."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) nil)
+      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((consp seq)
+       (%remove-if-list pred seq key-fn start-idx end-idx eff-count from-end))
+      (t
+       (%remove-if-vector pred seq key-fn start-idx end-idx eff-count from-end)))))
+
+(defun %remove-if-list (pred lst key-fn start-idx end-idx count from-end)
+  (let ((indices nil) (cur lst) (i 0))
+    (loop
+      (when (null cur) (return nil))
+      (when (and end-idx (>= i end-idx)) (return nil))
+      (when (>= i start-idx)
+        (let ((v (if key-fn (funcall key-fn (car cur)) (car cur))))
+          (when (funcall pred v) (push i indices))))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    (let ((to-drop indices))
+      (when count
+        (if from-end
+            (setq to-drop (subseq indices 0 (min count (length indices))))
+            (let ((rev (reverse indices)))
+              (setq to-drop (subseq rev 0 (min count (length rev)))))))
+      (let ((result nil) (cur lst) (i 0))
+        (loop
+          (when (null cur) (return (nreverse result)))
+          (unless (member i to-drop) (push (car cur) result))
+          (setq cur (cdr cur))
+          (setq i (+ i 1)))))))
+
+(defun %remove-if-vector (pred vec key-fn start-idx end-idx count from-end)
+  (let* ((len (array-length vec))
+         (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+         (string-p (stringp vec))
+         (indices nil))
+    (let ((i start-idx))
+      (loop
+        (when (>= i eff-end) (return nil))
+        (let ((elt (aref vec i)))
+          (when string-p (setq elt (code-char elt)))
+          (let ((v (if key-fn (funcall key-fn elt) elt)))
+            (when (funcall pred v) (push i indices))))
+        (setq i (+ i 1))))
+    (let ((to-drop indices))
+      (when count
+        (if from-end
+            (setq to-drop (subseq indices 0 (min count (length indices))))
+            (let ((rev (reverse indices)))
+              (setq to-drop (subseq rev 0 (min count (length rev)))))))
+      (let* ((drop-count (length to-drop))
+             (out-len (- len drop-count))
+             (out (if string-p (%make-string-array out-len) (make-array out-len)))
+             (i 0) (j 0))
+        (loop
+          (when (= i len) (return out))
+          (unless (member i to-drop)
+            (aset out j (aref vec i))
+            (setq j (+ j 1)))
+          (setq i (+ i 1)))))))
+
+(defun remove-if-not (pred seq &rest args)
+  "Inverse of remove-if; forwards the same keyword args."
+  (apply #'remove-if (lambda (x) (not (funcall pred x))) seq args))
 
 (defun count-if (pred seq &rest args)
   "Count elements of SEQ for which PRED is true. Honors :key, :start, :end."

@@ -261,7 +261,9 @@
 
 (defun remove-if (pred seq)
   "Return a new sequence with elements for which PRED returns non-nil removed.
-   Polymorphic over list / string / plain array — returns the same shape."
+   Polymorphic over list / string / plain array — returns the same shape.
+   Note: this short form ignores keyword args; the keyword-aware version
+   in cl-sequences.lisp shadows this for callers via apply."
   (cond
     ((or (null seq) (consp seq))
      (let ((result nil)

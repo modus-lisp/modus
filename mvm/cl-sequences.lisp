@@ -894,12 +894,45 @@
 (defun vectorp (obj) (and (not (consp obj)) (not (null obj)) (not (integerp obj))
                           (not (characterp obj)) (not (eq obj t))))
 (defun remove-duplicates (seq &rest args)
-  "Remove duplicates from SEQ."
-  (if (consp seq)
-      (let ((r nil))
-        (dolist (item seq) (unless (member item r) (setq r (cons item r))))
-        (nreverse r))
-      seq))
+  "Remove duplicates from SEQ. CL default keeps the LAST occurrence
+   of each duplicate group (so the relative order of survivors is the
+   order they last appeared). With :from-end t, keeps the FIRST.
+   Honors :test, :key. Default :test is inline `eql`."
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (from-end nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (cond
+      ((null seq) nil)
+      ((consp seq)
+       (if from-end
+           ;; Keep first occurrence — walk forward
+           (let ((r nil))
+             (dolist (item seq (nreverse r))
+               (let ((item-key (if key-fn (funcall key-fn item) item)))
+                 (unless (some (lambda (x)
+                                 (let ((v (if key-fn (funcall key-fn x) x)))
+                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
+                               r)
+                   (setq r (cons item r))))))
+           ;; Default: keep last occurrence of each — walk forward,
+           ;; remove element if a duplicate appears LATER in seq.
+           (let ((r nil) (cur seq))
+             (loop
+               (when (null cur) (return (nreverse r)))
+               (let* ((item (car cur))
+                      (item-key (if key-fn (funcall key-fn item) item))
+                      (rest-tail (cdr cur)))
+                 (unless (some (lambda (x)
+                                 (let ((v (if key-fn (funcall key-fn x) x)))
+                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
+                               rest-tail)
+                   (setq r (cons item r))))
+               (setq cur (cdr cur))))))
+      (t seq))))
 
 ;;; ===================================================
 ;;; Sequence Search Functions (find, search, position-if, etc.)

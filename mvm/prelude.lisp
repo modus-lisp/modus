@@ -169,16 +169,25 @@
       (setq cur (cdr cur)))))
 
 (defun assoc (key alist &rest options)
-  "Find the first pair in ALIST whose car is EQL to KEY.
-   Accepts (and ignores) ANSI &key TEST/TEST-NOT/KEY options as &rest
-   so callers using the keyword form don't trigger a too-many arity error."
-  (declare (ignore options))
-  (let ((cur alist))
-    (loop
-      (when (null cur) (return nil))
-      (let ((pair (car cur)))
-        (when (consp pair)
-          (when (eql (car pair) key) (return pair)))
+  "Find the first pair in ALIST whose car matches KEY. Honors :TEST,
+   :TEST-NOT, :KEY. Default test is inline `eql`."
+  (let ((test nil) (key-fn nil) (a options))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :key)  (setq key-fn (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :test-not)
+             (let ((f (cadr a)))
+               (setq test (lambda (x y) (not (funcall f x y)))))
+             (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (let ((cur alist))
+      (loop
+        (when (null cur) (return nil))
+        (let ((pair (car cur)))
+          (when (consp pair)
+            (let ((c (if key-fn (funcall key-fn (car pair)) (car pair))))
+              (when (if test (funcall test key c) (eql key c))
+                (return pair)))))
         (setq cur (cdr cur))))))
 
 (defun assoc-string (key alist)

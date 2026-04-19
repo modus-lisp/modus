@@ -812,6 +812,19 @@
          ((eq tn 'bit) (or (= obj 0) (= obj 1)))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
+         ;; Array / vector / sequence — strings and arrays alike. Cons
+         ;; lists (and nil) are sequences but not vectors/arrays.
+         ((eq tn 'array)         (or (arrayp obj) (stringp obj)))
+         ((eq tn 'simple-array)  (or (arrayp obj) (stringp obj)))
+         ((eq tn 'vector)        (or (arrayp obj) (stringp obj)))
+         ((eq tn 'simple-vector) (or (arrayp obj) (stringp obj)))
+         ((eq tn 'bit-vector)    (arrayp obj))
+         ((eq tn 'simple-bit-vector) (arrayp obj))
+         ((eq tn 'sequence)      (or (null obj) (consp obj)
+                                     (arrayp obj) (stringp obj)))
+         ((eq tn 'function)      (functionp obj))
+         ((eq tn 'compiled-function) (functionp obj))
+         ((eq tn 'hash-table)    (hash-table-p obj))
          ((eq tn 'condition) (%condition-p obj))
          ;; Check if it's a condition type name
          (t (if (%cond-reg-find tn)

@@ -212,7 +212,15 @@
   ;; Function table: function-index → native code label
   (function-table nil)
   ;; GC helper label (one per translated unit)
-  (gc-label nil))
+  (gc-label nil)
+  ;; Handler-stack helper labels (one per translated unit). The push helper
+  ;; saves the current [#x10000180/+8/+16] state to a memory stack so nested
+  ;; handler-cases don't clobber their parent's setjmp frame; the pop helper
+  ;; restores. Without these, every per-test handler-case in ANSI fork
+  ;; wrappers would reset [180]=0 on completion, killing signal recovery
+  ;; for subsequent tests in the same fork.
+  (handler-push-label nil)
+  (handler-pop-label nil))
 
 (defun ensure-label-at (state mvm-pos)
   "Ensure a label exists for MVM bytecode position MVM-POS.
@@ -541,6 +549,7 @@
               ;;
               ;; We use LEA + RIP-relative to get the return address.
               ;; Layout:
+              ;;   call __handler_push ; push outer state to stack at 0x10000408
               ;;   lea rcx, [rip+N]    ; address of "return point" after the jmp
               ;;   mov [addr], rsp     ; save RSP
               ;;   mov [addr+8], rbp   ; save RBP
@@ -549,6 +558,10 @@
               ;;   jmp +5              ; skip longjmp-return block
               ;;   (longjmp return point — RAX already has T from longjmp)
               ;;
+              ;; First, save the OUTER handler state to the per-fork stack.
+              ;; CLEAR-HANDLER (and longjmp/sigsegv) pop it back, so nested
+              ;; handler-cases don't tear down the parent's setjmp frame.
+              (emit-call buf (translate-state-handler-push-label state))
               ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
               ;; mov rcx, 0x10000180
@@ -577,33 +590,54 @@
               (emit-bytes buf #x48 #xB8)
               (emit-u32 buf #xDEAD0001) (emit-u32 buf 0))
              ((= code #x0511)
-              ;; LONGJMP: Restore RSP/RBP from fixed memory, jump to saved IP.
-              ;; Sets RAX to T (#xDEAD1009) so setjmp "returns" non-nil.
+              ;; LONGJMP: Restore RSP/RBP/IP from [#x10000180], then pop
+              ;; the per-fork handler stack so the OUTER handler frame
+              ;; becomes active. Sets RAX = T (#xDEAD1009) so setjmp
+              ;; "returns" non-nil.
               ;;
-              ;; Clear the handler first (set saved RSP to 0)
+              ;; Order matters: we must read OUR state BEFORE the pop
+              ;; helper overwrites [180]. We stash it in scratch memory
+              ;; at #x10000C10..#x10000C28 (24 bytes).
               ;; mov rcx, 0x10000180
               (emit-bytes buf #x48 #xB9)
               (emit-u32 buf #x10000180) (emit-u32 buf 0)
-              ;; mov rdx, [rcx+16]  — saved return IP
+              ;; rdx = [rcx]      ; our RSP
+              (emit-bytes buf #x48 #x8B #x11)
+              ;; mov [0x10000C10], rdx
+              (emit-bytes buf #x48 #x89 #x14 #x25)
+              (emit-u32 buf #x10000C10)
+              ;; rdx = [rcx+8]    ; our RBP
+              (emit-bytes buf #x48 #x8B #x51 #x08)
+              ;; mov [0x10000C18], rdx
+              (emit-bytes buf #x48 #x89 #x14 #x25)
+              (emit-u32 buf #x10000C18)
+              ;; rdx = [rcx+16]   ; our IP
               (emit-bytes buf #x48 #x8B #x51 #x10)
-              ;; mov rbp, [rcx+8]   — restore RBP
-              (emit-bytes buf #x48 #x8B #x69 #x08)
-              ;; mov rsp, [rcx]     — restore RSP
-              (emit-bytes buf #x48 #x8B #x21)
-              ;; Clear handler: mov qword [rcx], 0
-              (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00)
-              ;; mov rax, T (#xDEAD1009)  — longjmp return value
-              (emit-bytes buf #x48 #xB8)
-              (emit-u32 buf #xDEAD1009) (emit-u32 buf 0)
-              ;; jmp rdx  — jump to saved return address
+              ;; mov [0x10000C20], rdx
+              (emit-bytes buf #x48 #x89 #x14 #x25)
+              (emit-u32 buf #x10000C20)
+              ;; Pop the handler stack back into [180]/+8/+16
+              (emit-call buf (translate-state-handler-pop-label state))
+              ;; Restore from scratch and jump
+              ;; mov rdx, [0x10000C20]   ; IP
+              (emit-bytes buf #x48 #x8B #x14 #x25)
+              (emit-u32 buf #x10000C20)
+              ;; mov rbp, [0x10000C18]   ; RBP
+              (emit-bytes buf #x48 #x8B #x2C #x25)
+              (emit-u32 buf #x10000C18)
+              ;; mov rsp, [0x10000C10]   ; RSP
+              (emit-bytes buf #x48 #x8B #x24 #x25)
+              (emit-u32 buf #x10000C10)
+              ;; mov eax, 0xDEAD1009  (T sentinel; 32-bit zero-extends)
+              (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
+              ;; jmp rdx
               (emit-bytes buf #xFF #xE2))
              ((= code #x0512)
-              ;; CLEAR-HANDLER: Set saved RSP at 0x10000180 to 0
-              ;; mov rcx, 0x10000180
-              (emit-bytes buf #x48 #xB9)
-              (emit-u32 buf #x10000180) (emit-u32 buf 0)
-              ;; mov qword [rcx], 0
-              (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00))
+              ;; CLEAR-HANDLER: Pop outer handler state back into
+              ;; [#x10000180/+8/+16]. If the per-fork handler stack is
+              ;; empty, the helper writes 0 to [#x10000180] (legacy
+              ;; "no handler" sentinel that the SIGSEGV stub checks).
+              (emit-call buf (translate-state-handler-pop-label state)))
              ((= code #x0520)
               ;; INSTALL-SIGNAL-HANDLERS:
               ;; Installs SIGSEGV (11), SIGBUS (7), SIGFPE (8), SIGILL (4) handlers.
@@ -616,7 +650,8 @@
               (let ((stub-label (make-label))
                     (exit-label (make-label))
                     (restorer-label (make-label))
-                    (past-stub-label (make-label)))
+                    (past-stub-label (make-label))
+                    (pop-label (translate-state-handler-pop-label state)))
                 ;; Skip stub on this execution path.
                 (emit-jmp buf past-stub-label)
 
@@ -632,14 +667,32 @@
                 ;; jz exit_path
                 (emit-jcc buf :e exit-label)
                 ;; --- Active handler-case: do the longjmp ---
-                ;; rdx = [rcx+16]  (saved IP)
+                ;; Save OUR state to scratch (#x10000C10..) before the pop
+                ;; helper overwrites [180].
+                ;; rdx already = [rcx] = our RSP
+                (emit-bytes buf #x48 #x89 #x14 #x25)             ; mov [imm32], rdx
+                (emit-u32 buf #x10000C10)
+                ;; rdx = [rcx+8] (our RBP)
+                (emit-bytes buf #x48 #x8B #x51 #x08)
+                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-u32 buf #x10000C18)
+                ;; rdx = [rcx+16] (our IP)
                 (emit-bytes buf #x48 #x8B #x51 #x10)
-                ;; rbp = [rcx+8]
-                (emit-bytes buf #x48 #x8B #x69 #x08)
-                ;; rsp = [rcx]
-                (emit-bytes buf #x48 #x8B #x21)
-                ;; mov qword [rcx], 0 (clear handler)
-                (emit-bytes buf #x48 #xC7 #x01 #x00 #x00 #x00 #x00)
+                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-u32 buf #x10000C20)
+                ;; Pop handler stack into [180]/+8/+16 so the outer
+                ;; handler-case becomes active when we land in the body.
+                (emit-call buf pop-label)
+                ;; Restore from scratch and jump
+                ;; mov rdx, [0x10000C20]   ; IP
+                (emit-bytes buf #x48 #x8B #x14 #x25)
+                (emit-u32 buf #x10000C20)
+                ;; mov rbp, [0x10000C18]
+                (emit-bytes buf #x48 #x8B #x2C #x25)
+                (emit-u32 buf #x10000C18)
+                ;; mov rsp, [0x10000C10]
+                (emit-bytes buf #x48 #x8B #x24 #x25)
+                (emit-u32 buf #x10000C10)
                 ;; mov eax, 0xDEAD1009 (T sentinel — 32-bit imm zero-extends to rax)
                 (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
                 ;; jmp rdx
@@ -2587,6 +2640,91 @@
    funcall checks (addr & 0xF == 1) to detect closures, so we must ensure
    ((*x64-native-code-offset* + P) & 0xF) != 1 for all function start P.")
 
+(defun emit-handler-helpers (buf push-label pop-label)
+  "Emit two helper functions used by handler-case setjmp/clear traps:
+     __handler_push: push current [#x10000180/+8/+16] state onto a memory
+                     stack at #x10000408 (depth at #x10000400, max 64).
+     __handler_pop:  pop top of stack into [#x10000180/+8/+16]; if stack
+                     empty, write 0 to [#x10000180].
+   Both preserve all callee-saved regs. They clobber rax/rcx/rdx/r10/r11
+   only — caller-saved per SysV ABI.
+
+   Memory map:
+     #x10000180/+8/+16 — current handler state (RSP/RBP/IP, 24 bytes)
+     #x10000400        — handler-stack depth (qword, init 0 by fork)
+     #x10000408+24*N   — handler-stack frame N (24 bytes, max 64 frames)"
+  ;; ---- __handler_push ----
+  (let ((skip (make-label)))
+    (emit-label buf push-label)
+    ;; r10 = depth = [0x10000400]
+    (emit-bytes buf #x4C #x8B #x14 #x25)
+    (emit-u32 buf #x10000400)
+    ;; cmp r10, 64 ; jge skip
+    (emit-bytes buf #x49 #x83 #xFA #x40)
+    (emit-jcc buf :ge skip)
+    ;; r11 = depth*24
+    (emit-bytes buf #x4D #x6B #xDA #x18)            ; imul r11, r10, 24
+    ;; r11 += 0x10000408
+    (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
+    (emit-u32 buf #x10000408)
+    ;; rax = [0x10000180]; [r11] = rax
+    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-u32 buf #x10000180)
+    (emit-bytes buf #x49 #x89 #x03)                  ; mov [r11], rax
+    ;; rax = [0x10000188]; [r11+8] = rax
+    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-u32 buf #x10000188)
+    (emit-bytes buf #x49 #x89 #x43 #x08)             ; mov [r11+8], rax
+    ;; rax = [0x10000190]; [r11+16] = rax
+    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-u32 buf #x10000190)
+    (emit-bytes buf #x49 #x89 #x43 #x10)             ; mov [r11+16], rax
+    ;; depth++ ; [0x10000400] = r10
+    (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
+    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-u32 buf #x10000400)
+    (emit-label buf skip)
+    (emit-bytes buf #xC3))                           ; ret
+  ;; ---- __handler_pop ----
+  (let ((empty (make-label))
+        (done (make-label)))
+    (emit-label buf pop-label)
+    ;; r10 = depth = [0x10000400]
+    (emit-bytes buf #x4C #x8B #x14 #x25)
+    (emit-u32 buf #x10000400)
+    ;; test r10, r10 ; jz empty
+    (emit-bytes buf #x4D #x85 #xD2)
+    (emit-jcc buf :e empty)
+    ;; depth-- ; [0x10000400] = r10
+    (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
+    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-u32 buf #x10000400)
+    ;; r11 = depth*24 + 0x10000408
+    (emit-bytes buf #x4D #x6B #xDA #x18)             ; imul r11, r10, 24
+    (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
+    (emit-u32 buf #x10000408)
+    ;; [0x10000180] = [r11]
+    (emit-bytes buf #x49 #x8B #x03)                  ; mov rax, [r11]
+    (emit-bytes buf #x48 #x89 #x04 #x25)             ; mov [imm32], rax
+    (emit-u32 buf #x10000180)
+    ;; [0x10000188] = [r11+8]
+    (emit-bytes buf #x49 #x8B #x43 #x08)
+    (emit-bytes buf #x48 #x89 #x04 #x25)
+    (emit-u32 buf #x10000188)
+    ;; [0x10000190] = [r11+16]
+    (emit-bytes buf #x49 #x8B #x43 #x10)
+    (emit-bytes buf #x48 #x89 #x04 #x25)
+    (emit-u32 buf #x10000190)
+    (emit-jmp buf done)
+    (emit-label buf empty)
+    ;; [0x10000180] = 0  (legacy "no handler" sentinel)
+    (emit-bytes buf #x48 #xC7 #x04 #x25)             ; mov qword [imm32], 0
+    (emit-u32 buf #x10000180)
+    (emit-u32 buf 0)
+    (emit-label buf done)
+    (emit-bytes buf #xC3))                           ; ret
+  (format t "  Handler-stack helpers emitted (push/pop)~%"))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -2933,6 +3071,9 @@
          (fn-offset-to-label (make-hash-table :test 'eql))
          ;; GC trampoline label (pre-allocated so all translate-states can use it)
          (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
+         ;; Handler-stack helpers (push/pop the per-fork stack at #x10000400)
+         (handler-push-lbl (make-label))
+         (handler-pop-lbl  (make-label))
          ;; Find %GC-COLLECT function in the table (if present)
          (gc-collect-entry (when *x64-gc-enabled*
                              (find "%GC-COLLECT" function-table
@@ -2964,7 +3105,9 @@
                               :mvm-length length
                               :mvm-offset offset
                               :function-table fn-offset-to-label
-                              :gc-label gc-trampoline-label)))
+                              :gc-label gc-trampoline-label
+                              :handler-push-label handler-push-lbl
+                              :handler-pop-label handler-pop-lbl)))
                  ;; Emit function label
                  (emit-label buf fn-label)
                  ;; Emit prologue
@@ -3007,7 +3150,11 @@
       ;; Emit GC trampoline (after all functions, before fixup)
       (when (and gc-trampoline-label gc-collect-label)
         (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
-        (format t "  GC trampoline emitted, %GC-COLLECT wired~%")))
+        (format t "  GC trampoline emitted, %GC-COLLECT wired~%"))
+      ;; Emit handler-stack helpers (push/pop) used by SETJMP/CLEAR-HANDLER
+      ;; traps to support nested handler-cases without clobbering the
+      ;; parent's setjmp frame.
+      (emit-handler-helpers buf handler-push-lbl handler-pop-lbl))
 
     ;; Resolve all label fixups
     (fixup-labels buf)

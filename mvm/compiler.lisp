@@ -2246,6 +2246,10 @@
                     `(cond ,@dispatch-forms (t (%hc-longjmp)))
                     '(%hc-longjmp))))
           ;; Emit setjmp/handler pattern
+          ;; SETJMP (#x0510) pushes outer handler state to the per-fork
+          ;; handler stack at 0x10000400 before saving its own state at
+          ;; 0x10000180. CLEAR-HANDLER (#x0512) pops, so nested
+          ;; handler-cases don't tear down their parent's setjmp frame.
           (emit-ir :trap #x0510)
           (emit-ir :mov dest +vreg-vr+)
           (emit-ir :bnnull dest handler-label)

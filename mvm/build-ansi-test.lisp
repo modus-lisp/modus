@@ -2200,7 +2200,7 @@
                      ~%(defvar *run-only-below* 0)~
                      ~%;; Bound on FAIL lines per fork-child to prevent any pathological~
                      ~%;; cascade (e.g. nested SIGSEGV in handler) from inflating output.~
-                     ~%(defvar *fail-cap* 200)~
+                     ~%(defvar *fail-cap* 2000)~
                      ~%(defvar *fail-emitted* 0)~
                      ~%;; In-process test runner: rt-run-test wrapped in handler-case.~
                      ~%;; Side effects (defparameter, setq globals) persist across calls~
@@ -2252,6 +2252,9 @@
                      ~%          ;; handler-case setjmp would longjmp using the parent's stale~
                      ~%          ;; RSP/RBP/IP — jumping to garbage and killing the fork silently.~
                      ~%          (setf (mem-ref #x10000180 :u64) 0)~
+                     ~%          ;; Reset the handler-stack depth too (forks inherit any~
+                     ~%          ;; outer handler-case frames the parent had pushed).~
+                     ~%          (setf (mem-ref #x10000400 :u64) 0)~
                      ~%          (setq *fail-emitted* 0)~
                      ~%          (syscall3 37 *file-alarm-secs* 0 0)~
                      ~%          (handler-case (funcall thunk) (t (c) nil))~

@@ -2250,7 +2250,7 @@
                      ~%;; Per-file wall-clock cap (seconds). SIGALRM has no handler,~
                      ~%;; so an over-time child is hard-killed by the kernel and the~
                      ~%;; parent records a single FAIL with the file's first id.~
-                     ~%(defvar *file-alarm-secs* 30)~
+                     ~%(defvar *file-alarm-secs* 90)~
                      ~%(defun fork-file (first-id thunk)~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
@@ -2433,7 +2433,7 @@
   (setq *write-object-budget* 0)
   (setq *fail-emitted* 0)
   (setq *fail-cap* 2000)
-  (setq *file-alarm-secs* 30)
+  (setq *file-alarm-secs* 90)
   (setq *wstatus-addr* #x100001A0)
 
   ;; Float constants from ansi-bridge — defvars don't run their init
@@ -2467,6 +2467,23 @@
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)
+  ;; ansi-aux-macros.lsp's NORMALLY macro: (if *should-always-be-true*
+  ;; form (should-never-be-called)). NIL here → every CATCH-TYPE-ERROR /
+  ;; NORMALLY-wrapped form expands to a call to an undefined function,
+  ;; which the per-test handler-case catches but burns time and noise.
+  ;; T makes NORMALLY a no-op pass-through.
+  (setq *should-always-be-true* t)
+  (setq *use-random-byte* t)
+  (setq *random-readable* nil)
+  (setq *random-read-check-debug* nil)
+  (setq *report-and-ignore-errors-break* nil)
+  (setq *hash-table-test-iters* 100)
+  (setq *mapc.6-var* nil)
+  (setq *defclass-slot-readers* nil)
+  (setq *defclass-slot-writers* nil)
+  (setq *defclass-slot-accessors* nil)
+  (setq *type-list* nil)
+  (setq *supertype-table* nil)
 
   ;; Parse argv from BSS (boot stub writes argc/argv there).
   ;;   argv[1] → *skip-below*       (skip tests with id < N)

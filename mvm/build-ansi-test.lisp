@@ -2257,7 +2257,13 @@
                      ~%          (setf (mem-ref #x10000400 :u64) 0)~
                      ~%          (setq *fail-emitted* 0)~
                      ~%          (syscall3 37 *file-alarm-secs* 0 0)~
-                     ~%          (handler-case (funcall thunk) (t (c) nil))~
+                     ~%          ;; If the per-test handler-cases miss something (e.g. a~
+                     ~%          ;; crash during init-form load or in a code path that~
+                     ~%          ;; bypasses our wrapping), record the file's first id as~
+                     ~%          ;; a FAIL before exiting so the summary doesn't lose the~
+                     ~%          ;; rest of the file's tests as silent zeros.~
+                     ~%          (handler-case (funcall thunk)~
+                     ~%            (t (c) (%record-test-fail first-id)))~
                      ~%          (syscall3 60 0 0 0))~
                      ~%        (progn~
                      ~%          (setf (mem-ref *wstatus-addr* :u32) 0)~
@@ -2412,7 +2418,7 @@
   (setq *run-only-below* 0)
   (setq *write-object-budget* 0)
   (setq *fail-emitted* 0)
-  (setq *fail-cap* 200)
+  (setq *fail-cap* 2000)
   (setq *file-alarm-secs* 30)
   (setq *wstatus-addr* #x100001A0)
 

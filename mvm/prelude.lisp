@@ -813,8 +813,26 @@
             (write-object (aref obj i))
             (setq i (+ i 1))))
         (write-char-serial 41))
+       ((characterp obj)
+        ;; #\X (print the literal character after a #\ prefix)
+        (write-char-serial 35) (write-char-serial 92)
+        (write-char-serial (char-code obj)))
+       ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
+             (= (obj-subtag obj) #x60))
+        ;; Boxed float (subtag #x60) — emit a placeholder so tests can
+        ;; see the type name instead of #<?>. The underlying IEEE bits
+        ;; live in slots 0 and 1 but we don't decimal-print them.
+        (write-char-serial 35) (write-char-serial 60) (write-char-serial 70)
+        (write-char-serial 62))   ; #<F>
        (t
-        (write-char-serial 35) (write-char-serial 60) (write-char-serial 63) (write-char-serial 62))))))
+        ;; Emit a type-hinting sentinel that includes the subtag as a
+        ;; decimal. "#<?123>" is still a distinctive "unknown type"
+        ;; token but lets us tell different unprintable types apart
+        ;; in test output.
+        (write-char-serial 35) (write-char-serial 60) (write-char-serial 63)
+        (when (and (not (fixnump obj)) (not (consp obj)) (not (null obj)))
+          (print-dec (obj-subtag obj)))
+        (write-char-serial 62))))))
 
 (defun princ-object (obj)
   "Print a Lisp object to serial output (princ-style, no escapes)."

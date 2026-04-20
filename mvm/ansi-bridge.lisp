@@ -588,12 +588,20 @@
 ;;; ============================================================
 
 (defun member-if (pred list &rest args)
-  "Return first tail of LIST whose car satisfies PRED."
+  "Return first tail of LIST whose car satisfies PRED.
+   Outer LISTP check signals TYPE-ERROR for non-lists so tests like
+   (catch-type-error (member-if-not #'listp \"abc\")) get a clean
+   error instead of spinning a (cdr garbage) loop until SIGALRM kills
+   the fork. Improper-list tails (proper-with-dotted-end) are walked
+   to NIL or to a non-cons; we only check the initial argument."
+  (unless (listp list)
+    (error "member-if: not a list ~S" list))
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur list))
     (loop
       (when (null cur) (return nil))
+      (when (atom cur) (return nil))
       (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
         (when (funcall pred k) (return cur)))
       (setq cur (cdr cur)))))

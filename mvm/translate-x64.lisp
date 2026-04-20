@@ -637,6 +637,9 @@
               ;; [#x10000180/+8/+16]. If the per-fork handler stack is
               ;; empty, the helper writes 0 to [#x10000180] (legacy
               ;; "no handler" sentinel that the SIGSEGV stub checks).
+              ;; __handler_pop preserves RAX (see emit-handler-helpers)
+              ;; so (handler-case body) bodies that return in RAX aren't
+              ;; clobbered by the pop.
               (emit-call buf (translate-state-handler-pop-label state)))
              ((= code #x0520)
               ;; INSTALL-SIGNAL-HANDLERS:
@@ -2686,9 +2689,14 @@
     (emit-label buf skip)
     (emit-bytes buf #xC3))                           ; ret
   ;; ---- __handler_pop ----
+  ;; Preserves RAX across the call. CLEAR-HANDLER is emitted after a
+  ;; handler-case body succeeds; if dest == VR == RAX, the body's result
+  ;; lives in RAX, and clobbering it would hand back a popped RSP
+  ;; (masquerading as an unknown-subtag object like #<?184>).
   (let ((empty (make-label))
         (done (make-label)))
     (emit-label buf pop-label)
+    (emit-bytes buf #x50)                            ; push rax
     ;; r10 = depth = [0x10000400]
     (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
@@ -2703,17 +2711,19 @@
     (emit-bytes buf #x4D #x6B #xDA #x18)             ; imul r11, r10, 24
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
     (emit-u32 buf #x10000408)
+    ;; Use r10 as memory-scratch (its value is now consumed) so RAX
+    ;; stays pristine across mem-to-mem copies.
     ;; [0x10000180] = [r11]
-    (emit-bytes buf #x49 #x8B #x03)                  ; mov rax, [r11]
-    (emit-bytes buf #x48 #x89 #x04 #x25)             ; mov [imm32], rax
+    (emit-bytes buf #x4D #x8B #x13)                  ; mov r10, [r11]
+    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
     (emit-u32 buf #x10000180)
     ;; [0x10000188] = [r11+8]
-    (emit-bytes buf #x49 #x8B #x43 #x08)
-    (emit-bytes buf #x48 #x89 #x04 #x25)
+    (emit-bytes buf #x4D #x8B #x53 #x08)             ; mov r10, [r11+8]
+    (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000188)
     ;; [0x10000190] = [r11+16]
-    (emit-bytes buf #x49 #x8B #x43 #x10)
-    (emit-bytes buf #x48 #x89 #x04 #x25)
+    (emit-bytes buf #x4D #x8B #x53 #x10)             ; mov r10, [r11+16]
+    (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000190)
     (emit-jmp buf done)
     (emit-label buf empty)
@@ -2722,6 +2732,7 @@
     (emit-u32 buf #x10000180)
     (emit-u32 buf 0)
     (emit-label buf done)
+    (emit-bytes buf #x58)                            ; pop rax
     (emit-bytes buf #xC3))                           ; ret
   (format t "  Handler-stack helpers emitted (push/pop)~%"))
 

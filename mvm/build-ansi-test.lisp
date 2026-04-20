@@ -1811,30 +1811,51 @@
                    ;;   (run inside run-ansi-* since TOPLEVEL thunks never execute)
                    ;; Handles nested progn forms recursively.
                    ;; For non-progn forms: write to top-level as before.
-                   (labels ((emit-sub (sub)
-                              (when (consp sub)
-                                ;; Recursively flatten nested progns
-                                (if (eq (car sub) 'progn)
-                                    (dolist (inner (cdr sub)) (emit-sub inner))
-                                    (let ((sub-s (handler-case (format nil "~S" sub)
-                                                   (error () nil))))
-                                      (when (and sub-s
-                                                 (not (search "#<" sub-s))
-                                                 (not (search "&ENVIRONMENT" sub-s))
-                                                 (not (search "STRUCT-TEST-" sub-s)))
-                                        (if (member (car sub) '(defun defvar defparameter defstruct))
-                                            (progn (write-string sub-s out) (terpri out))
-                                            (push sub-s init-forms))))))))
-                     (if (and (consp form) (eq (car form) 'progn))
-                         (dolist (sub (cdr form)) (emit-sub sub))
-                         (let ((s (handler-case (format nil "~S" form)
-                                    (error () nil))))
-                           (when (and s
-                                      (not (search "#<" s))
-                                      (not (search "&ENVIRONMENT" s))
-                                      (not (search "STRUCT-TEST-" s)))
-                             (write-string s out)
-                             (terpri out))))))))
+                   ;; For (defvar|defparameter NAME VALUE ...) queue an
+                   ;; equivalent (setq NAME VALUE) into init-forms: at runtime
+                   ;; defvar init-thunks never run, so NAME would otherwise
+                   ;; stay NIL and any test referencing it fails silently.
+                   (flet ((queue-defvar-setq (f)
+                            (when (and (consp f) (member (car f) '(defvar defparameter))
+                                       (consp (cdr f)) (consp (cddr f))
+                                       (symbolp (cadr f)))
+                              (let ((setq-s (handler-case
+                                              (format nil "(setq ~S ~S)" (cadr f) (caddr f))
+                                              (error () nil))))
+                                (when (and setq-s
+                                           (not (search "#<" setq-s))
+                                           (not (search "&ENVIRONMENT" setq-s))
+                                           (not (search "STRUCT-TEST-" setq-s)))
+                                  (push setq-s init-forms))))))
+                     (labels ((emit-sub (sub)
+                                (when (consp sub)
+                                  ;; Recursively flatten nested progns
+                                  (if (eq (car sub) 'progn)
+                                      (dolist (inner (cdr sub)) (emit-sub inner))
+                                      (let ((sub-s (handler-case (format nil "~S" sub)
+                                                     (error () nil))))
+                                        (when (and sub-s
+                                                   (not (search "#<" sub-s))
+                                                   (not (search "&ENVIRONMENT" sub-s))
+                                                   (not (search "STRUCT-TEST-" sub-s)))
+                                          (cond
+                                            ((member (car sub) '(defun defstruct))
+                                             (write-string sub-s out) (terpri out))
+                                            ((member (car sub) '(defvar defparameter))
+                                             (write-string sub-s out) (terpri out)
+                                             (queue-defvar-setq sub))
+                                            (t (push sub-s init-forms)))))))))
+                       (if (and (consp form) (eq (car form) 'progn))
+                           (dolist (sub (cdr form)) (emit-sub sub))
+                           (let ((s (handler-case (format nil "~S" form)
+                                      (error () nil))))
+                             (when (and s
+                                        (not (search "#<" s))
+                                        (not (search "&ENVIRONMENT" s))
+                                        (not (search "STRUCT-TEST-" s)))
+                               (write-string s out)
+                               (terpri out)
+                               (queue-defvar-setq form)))))))))
               (format out "(defun run-ansi-~A ()~%" (pathname-name file))
               ;; Init forms run in PARENT (their side effects need to persist
               ;; for subsequent tests that depend on them, e.g. defclass).

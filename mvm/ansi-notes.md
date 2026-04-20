@@ -1,10 +1,15 @@
 # ANSI test notes — session log
 
-State as of last session: **6589 passes / ~10000 fails / ~1089 lost**
-(from 6097 / ~7600 / 3952 at session start — **−72% lost**).
+State as of last session: **6615 passes / 9998 fails / 1079 lost**
+(started that session at 6589 / ~10000 / 1089).
+Relevant commits:
+- Auto-emit (setq) for test-file defvar/defparameter inits
+- __handler_pop: preserve RAX so handler-case body result isn't clobbered
+  (eliminates all 318 `#<?184>` verdicts — the RAX clobber turned body
+  values into popped-RSP garbage; was option #1 in the prior handoff)
 
-Starting point for next session: `git log --oneline` for the 11
-commits from this run, they're self-contained and explain their own
+Starting point for next session: `git log --oneline` for the
+handoff-chain commits — they're self-contained and explain their own
 rationale. This doc is the shared context.
 
 ## How the harness works
@@ -219,41 +224,38 @@ grep -oE "run-test(-mv)? [0-9]+" /tmp/real-ansi-gen.lisp | awk '{print $NF}' \
 
 ## Where would I start next session?
 
-1. **Investigate the 328 `#<?184>` GOT: tests.** They share the
-   `(HANDLER-CASE (PROGN <op-with-bad-kwarg>) (ERROR (C) T))` →
-   expects T pattern. Our lambda returns some object with subtag 184
-   that is neither T nor NIL. Diagnose: add a simple deftest
-   `(deftest 3300 (handler-case nil (error (c) t)) nil)` and see if
-   plain-NIL-body HANDLER-CASE works. If yes, narrow down toward the
-   progn + bad-keyword case. Something in our PROGN or handler
-   dispatch is mis-returning a pointer to an unrecognized object.
+Options #1 (#<?184>) and #2 (defvar auto-emit) are DONE. What's left:
 
-2. **Retry the defvar-init emit but more carefully.** There are 268
-   defvars/defparameters in the ANSI test files and none of them
-   currently get their values at runtime. A clean auto-emit of
-   `(setq *foo* val)` into the file's init-forms for every
-   `(defvar *foo* val)` would unlock a large class of tests — the 400
-   `GOT:NIL` tests where we return NIL because a fixture was NIL.
-   Previous attempt had a parenthesis mismatch in the
-   `labels`/`emit-sub` rewrite; simpler version might work:
+1. **"Expect T get NIL" — the 536-test bucket.** Pattern is
+   `(handler-case (progn <op-with-bad-arg>) (error (c) t))` where the
+   bad arg *should* trigger a type/keyword error but our runtime
+   silently accepts it. Examples:
+   - `(ASSOC-IF #'NULL NIL :BAD T)` — unknown keyword :BAD ignored
+   - `(MAKE-LIST 5 :BAD T)` — same
+   - `(BUTLAST 'A 0)` — non-list argument silently returns NIL
+   - `(LOCALLY (CAR 'A) T)` — non-cons argument silently returns NIL
+   Fixing these properly means adding arg validation to many
+   builtins. No shared helper — it's case-by-case. Highest-leverage
+   single fix: make unknown-keyword a signaled error in the
+   arg-parsing helper of sequence/list builtins (puts ~150+ tests in
+   one fix), then chip away at the rest.
 
-   ```lisp
-   ;; In the loop that processes each file form, right after the
-   ;; (write-string sub-s out) for defvar/defparameter, immediately:
-   (when (and (consp sub) (consp (cddr sub)))
-     (let ((setq-s (handler-case (format nil "(setq ~S ~S)" (cadr sub) (caddr sub))
-                     (error () nil))))
-       (when (and setq-s (not (search "#<" setq-s))) (push setq-s init-forms))))
-   ```
+2. **FORMATTER / ~{...~^...~} — the format-circumflex & format-brace
+   bucket (~540 tests).** Tests build `(FORMATTER "...")` then
+   funcall the formatter. Our cl-printer doesn't compile format
+   strings to closures — FORMATTER calls crash. Either implement
+   FORMATTER as "wrap the string in a thunk that calls FORMAT" or
+   accept those tests as permanently out-of-scope until the printer
+   is refactored.
 
-   Keep the structure flat — don't introduce a new `labels` binding.
+3. **SUBTYPEP multiple-value return.** `(SUBTYPEP* 'NULL 'CONS)`
+   returns `(NIL)` instead of `(NIL T)` in the ANSI tests even though
+   cl-conditions.lisp's subtypep does `(values nil t)`. About 30 tests
+   rely on the T-return for determinism. Worth a 20-minute
+   bisect — is MV-COUNT getting reset on the funcall-through-alias
+   path? (`subtypep*` is `(defun subtypep* (t1 t2) (subtypep t1 t2))`.)
 
-3. **Numeric tower, but committed to seeing it through.** Don't start
+4. **Numeric tower, but committed to seeing it through.** Don't start
    unless you can land all of: ratios, complex, multi-float aliases,
    and overflow-detecting multiply. Half-done leaves tests in
-   "hangs in different place" state (see this session's Phase 1).
-
-4. **If just polishing: count what `GOT:NIL EXP:...` tests are failing
-   per file**, then focus on the file whose fixture is most likely
-   missing. E.g. cons tests need `*cons-test-4*`; one explicit setq
-   in the parent init recovers ~10 tests.
+   "hangs in different place" state.

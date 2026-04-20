@@ -2457,6 +2457,17 @@
   (setq most-positive-short-float     3.4028235d38)
   (setq most-negative-short-float    -3.4028235d38)
 
+  ;; Standard CL constants the ANSI test auxiliary files reference
+  ;; (char-code-limit, call-arguments-limit, *-fixnum). Without these
+  ;; the tests get NIL where they expect a number — (min 65536 NIL),
+  ;; (random NIL), etc. — and the fork hangs or crashes inside the
+  ;; aux helper before reaching the per-test handler.
+  (setq char-code-limit       256)
+  (setq call-arguments-limit  256)
+  ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
+  (setq most-positive-fixnum  4611686018427387903)
+  (setq most-negative-fixnum -4611686018427387904)
+
   ;; Parse argv from BSS (boot stub writes argc/argv there).
   ;;   argv[1] → *skip-below*       (skip tests with id < N)
   ;;   argv[2] → *run-only-below*   (skip tests with id >= M)

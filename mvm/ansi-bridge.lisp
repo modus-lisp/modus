@@ -357,8 +357,8 @@
 ;;; sxhash — hash code for objects
 ;;; ============================================================
 
-(defun sxhash (object)
-  "Return a hash code for OBJECT."
+(defun %sxhash-1 (object depth)
+  "SXHASH with bounded recursion so circular conses can't blow the stack."
   (cond
     ((null object) 0)
     ((eq object t) 1)
@@ -382,14 +382,20 @@
     ((symbolp object)
      ;; Use name hash if available
      (if (%cl-sym-p object)
-         (sxhash (%cl-sym-name object))
+         (%sxhash-1 (%cl-sym-name object) (+ depth 1))
          (logand (ash object -1) most-positive-fixnum)))
     ((consp object)
-     ;; Combine car and cdr hashes
-     (let ((h1 (sxhash (car object)))
-           (h2 (sxhash (cdr object))))
-       (logand (logxor (+ (* h1 31) h2) 12345) most-positive-fixnum)))
+     ;; Combine car and cdr hashes. Bound the walk so circular conses
+     ;; (e.g. (let ((c (list 'a))) (setf (cdr c) c) (sxhash c)) — ANSI
+     ;; sxhash.7) don't recurse forever and SIGSEGV the fork.
+     (if (>= depth 16)
+         42
+         (let ((h1 (%sxhash-1 (car object) (+ depth 1)))
+               (h2 (%sxhash-1 (cdr object) (+ depth 1))))
+           (logand (logxor (+ (* h1 31) h2) 12345) most-positive-fixnum))))
     (t 42)))
+
+(defun sxhash (object) (%sxhash-1 object 0))
 
 ;;; ============================================================
 ;;; float-radix — IEEE floats always use base 2

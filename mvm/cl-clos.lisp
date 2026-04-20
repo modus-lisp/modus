@@ -1076,7 +1076,11 @@
 (defun adjust-array (a new-size &rest args)
   "Return new array of NEW-SIZE with elements from A (or displacement target).
    Does not modify A in place (since adjustable-array-p always returns nil).
-   Handles :displaced-to and :displaced-index-offset keywords."
+   Handles :displaced-to and :displaced-index-offset keywords.
+   NEW-SIZE may be an integer (new vector length) or a 1-element list
+   like '(11); the list form is normalized first because make-array's
+   variable-size path otherwise interprets the cons pointer as a length."
+  (when (consp new-size) (setq new-size (car new-size)))
   (let* ((displaced-to nil)
          (displaced-offset 0)
          (cur args))

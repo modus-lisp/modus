@@ -458,7 +458,15 @@
        (cond
          ((eq tn 'integer) (integerp obj))
          ((eq tn 'fixnum) (integerp obj))
-         ((eq tn 'bignum) nil)
+         ;; MVM has no real bignum tower — all integers are 63-bit
+         ;; fixnums. Reporting BIGNUM as NIL traps tests like the
+         ;; (loop while (not (typep x 'bignum)) do (setf x (* x x)))
+         ;; pattern in an infinite squaring loop until SIGALRM fires.
+         ;; Treat anything beyond the 32-bit fixnum range that other
+         ;; CL impls use as "bignum" so that loop exits.
+         ((eq tn 'bignum)
+          (and (integerp obj)
+               (or (> obj 1073741823) (< obj -1073741824))))
          ((eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
          ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
          ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))

@@ -2250,7 +2250,7 @@
                      ~%;; Per-file wall-clock cap (seconds). SIGALRM has no handler,~
                      ~%;; so an over-time child is hard-killed by the kernel and the~
                      ~%;; parent records a single FAIL with the file's first id.~
-                     ~%(defvar *file-alarm-secs* 90)~
+                     ~%(defvar *file-alarm-secs* 45)~
                      ~%(defun fork-file (first-id thunk)~
                      ~%  (let ((pid (syscall3 57 0 0 0)))~
                      ~%    (if (= pid 0)~
@@ -2433,7 +2433,7 @@
   (setq *write-object-budget* 0)
   (setq *fail-emitted* 0)
   (setq *fail-cap* 2000)
-  (setq *file-alarm-secs* 90)
+  (setq *file-alarm-secs* 45)
   (setq *wstatus-addr* #x100001A0)
 
   ;; Float constants from ansi-bridge — defvars don't run their init

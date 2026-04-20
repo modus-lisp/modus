@@ -196,7 +196,9 @@
 
 ;; Rewrite (make-array '(N) ...) → (make-array N ...) for MVM compatibility
 (defun rewrite-make-array-dims (form)
-  "Walk form tree, converting list-dimension make-array to integer-dimension."
+  "Walk form tree, converting list-dimension make-array to integer-dimension.
+   Also flattens (make-array nil ...) → (make-array 1 ...) so 0-dim array
+   tests don't crash MVM's make-array on a NIL size operand."
   (cond
     ((atom form) form)
     ((and (eq (car form) 'make-array)
@@ -208,6 +210,13 @@
      ;; (make-array '(N) ...) → (make-array N ...)
      (cons 'make-array (cons (car (cadr (cadr form)))
                              (mapcar #'rewrite-make-array-dims (cddr form)))))
+    ((and (eq (car form) 'make-array)
+          (consp (cdr form))
+          (null (cadr form)))
+     ;; (make-array nil ...) — 0-dim scalar array. MVM has no scalar
+     ;; arrays; treat as a 1-element vector so the test crashes a
+     ;; comparison instead of crashing the whole fork.
+     (cons 'make-array (cons 1 (mapcar #'rewrite-make-array-dims (cddr form)))))
     (t (mapcar-dotted #'rewrite-make-array-dims form))))
 
 ;; Rewrite (eval '(FORM)) → (FORM) for MVM compatibility
@@ -2426,6 +2435,27 @@
   (setq *fail-cap* 2000)
   (setq *file-alarm-secs* 30)
   (setq *wstatus-addr* #x100001A0)
+
+  ;; Float constants from ansi-bridge — defvars don't run their init
+  ;; thunks (per CLAUDE.md), so without these explicit setqs every
+  ;; *-float-epsilon resolves to NIL at runtime, and the first ANSI
+  ;; test that funcalls DECODE-FLOAT on one of them used to loop
+  ;; forever inside its sig-normalization until SIGALRM killed the
+  ;; whole fork (losing every later test in the file).
+  (setq double-float-epsilon          2.220446049250313d-16)
+  (setq single-float-epsilon          1.1920929d-7)
+  (setq short-float-epsilon           1.1920929d-7)
+  (setq long-float-epsilon            2.220446049250313d-16)
+  (setq double-float-negative-epsilon 1.1102230246251565d-16)
+  (setq single-float-negative-epsilon 5.9604645d-8)
+  (setq short-float-negative-epsilon  5.9604645d-8)
+  (setq long-float-negative-epsilon   1.1102230246251565d-16)
+  (setq most-positive-double-float    1.7976931348623157d308)
+  (setq most-negative-double-float   -1.7976931348623157d308)
+  (setq most-positive-single-float    3.4028235d38)
+  (setq most-negative-single-float   -3.4028235d38)
+  (setq most-positive-short-float     3.4028235d38)
+  (setq most-negative-short-float    -3.4028235d38)
 
   ;; Parse argv from BSS (boot stub writes argc/argv there).
   ;;   argv[1] → *skip-below*       (skip tests with id < N)

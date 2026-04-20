@@ -508,16 +508,25 @@
   (* float (expt 2.0d0 integer)))
 
 (defun decode-float (float)
-  "Decode float into (significand exponent sign)."
+  "Decode float into (significand exponent sign).
+   Bails on non-floats (e.g. NIL from an uninitialized
+   *-float-epsilon defvar) so the caller sees a TYPE-ERROR
+   instead of looping forever in the normalize loop below."
+  (unless (floatp float)
+    (error "decode-float: not a float ~S" float))
   ;; Stub: return approximate values
   (if (= float 0.0d0)
       (values 0.0d0 0 1.0d0)
       (let ((sign (if (< float 0.0d0) -1.0d0 1.0d0))
             (abs-f (if (< float 0.0d0) (- 0.0d0 float) float)))
-        ;; Find exponent such that 0.5 <= sig < 1.0
-        (let ((exp 0) (sig abs-f))
+        ;; Find exponent such that 0.5 <= sig < 1.0. Safety cap so a
+        ;; pathological input (denormal, ±inf, or a value the comparisons
+        ;; never converge on) can't loop indefinitely.
+        (let ((exp 0) (sig abs-f) (iter 0))
           (loop
             (when (and (>= sig 0.5d0) (< sig 1.0d0)) (return))
+            (when (> iter 4096) (return))
+            (setq iter (+ iter 1))
             (if (>= sig 1.0d0)
                 (progn (setq sig (/ sig 2.0d0)) (setq exp (+ exp 1)))
                 (progn (setq sig (* sig 2.0d0)) (setq exp (- exp 1)))))

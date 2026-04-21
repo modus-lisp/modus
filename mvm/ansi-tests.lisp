@@ -844,7 +844,20 @@
 (defun run-cond-depth-tests ()
   (rt-run-test 2300 (cond-depth-probe 101) 1)
   (rt-run-test 2301 (cond-depth-probe 123) 23)
-  (rt-run-test 2302 (cond-depth-probe 999) 0))
+  (rt-run-test 2302 (cond-depth-probe 999) 0)
+  ;; Arity-error probe — do our defuns signal on wrong arg count?
+  ;; compile-call has the logic (lines ~5636-5660); these should
+  ;; raise program-error and handler-case should catch it.
+  (rt-run-test 2380 (handler-case (progn (plusp) nil) (error (c) t)) t)
+  (rt-run-test 2381 (handler-case (progn (plusp 0 0) nil) (error (c) t)) t)
+  (rt-run-test 2382 (handler-case (progn (abs) nil) (error (c) t)) t)
+  (rt-run-test 2383 (handler-case (progn (abs 0 0) nil) (error (c) t)) t)
+  (rt-run-test 2384 (handler-case (progn (minusp) nil) (error (c) t)) t)
+  ;; Compare with an inline primitive (cons): arity-ok-p emits error
+  (rt-run-test 2385 (handler-case (progn (cons) nil) (error (c) t)) t)
+  (rt-run-test 2386 (handler-case (progn (cons 1 2 3) nil) (error (c) t)) t)
+  (rt-run-test 2387 (handler-case (progn (car) nil) (error (c) t)) t)
+  (rt-run-test 2388 (handler-case (progn (car 1 2) nil) (error (c) t)) t))
 
 (defun run-format-tests ()
   ;; format returns nil

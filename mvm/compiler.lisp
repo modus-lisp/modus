@@ -635,19 +635,31 @@
         `(setq ,place (adjoin ,item ,place)))))
 
   ;; PLUSP → (> x 0)
+  ;; PLUSP/MINUSP/ABS/LOGNOT all take exactly one argument. Without
+  ;; an arity check the macro silently drops extras (`(plusp 0 0)`
+  ;; expands to `(> 0 0)`) or feeds NIL to the body (`(plusp)` →
+  ;; `(> nil 0)`), neither of which raises — so ~40 ANSI arity tests
+  ;; like `(HANDLER-CASE (PROGN (PLUSP) NIL) (ERROR (C) T))` never
+  ;; see an error. Expand to %signal-program-error on arity mismatch.
   (mvm-define-macro "PLUSP"
     (lambda (form)
-      `(> ,(cadr form) 0)))
+      (if (= (length form) 2)
+          `(> ,(cadr form) 0)
+          '(%signal-program-error))))
 
   ;; MINUSP → (< x 0)
   (mvm-define-macro "MINUSP"
     (lambda (form)
-      `(< ,(cadr form) 0)))
+      (if (= (length form) 2)
+          `(< ,(cadr form) 0)
+          '(%signal-program-error))))
 
   ;; LOGNOT → LOGXOR with -1
   (mvm-define-macro "LOGNOT"
     (lambda (form)
-      `(logxor ,(cadr form) -1)))
+      (if (= (length form) 2)
+          `(logxor ,(cadr form) -1)
+          '(%signal-program-error))))
 
   ;; MAX → IF + comparison
   (mvm-define-macro "MAX"
@@ -670,9 +682,11 @@
   ;; ABS → IF + negate
   (mvm-define-macro "ABS"
     (lambda (form)
-      (let ((tmp (gensym "ABS")))
-        `(let ((,tmp ,(cadr form)))
-           (if (< ,tmp 0) (- 0 ,tmp) ,tmp)))))
+      (if (= (length form) 2)
+          (let ((tmp (gensym "ABS")))
+            `(let ((,tmp ,(cadr form)))
+               (if (< ,tmp 0) (- 0 ,tmp) ,tmp)))
+          '(%signal-program-error))))
 
   ;; PROG1 → LET + body + return first value
   (mvm-define-macro "PROG1"

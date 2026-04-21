@@ -810,6 +810,42 @@
 ;;; Format (2200-2249)
 ;;; ============================================================
 
+;;; Cond-depth bug diagnostic (kept as a breadcrumb).
+;;;
+;;; In %format-impl, late cond branches (dir=123, dir=94) silently
+;;; never matched when the dispatch cond was >~20 clauses. Moving them
+;;; to the top fixed it. The investigation we did next session tried
+;;; to isolate this in a standalone function:
+;;;
+;;; - 30-clause `(= dir N)` cond: WORKS
+;;; - Same cond with `or`-heavy clauses (mirrors %format-impl shape): WORKS
+;;; - Same cond inside outer let/loop/if with many locals: WORKS
+;;; - "Bulked-up" reproducer that replicates %format-impl's param
+;;;   parser + modifier parser + 25-clause cond with substantial
+;;;   bodies: still WORKS
+;;;
+;;; So it's not pure cond-depth, not nested scaffolding, not bulk.
+;;; The actual trigger is the "function-size threshold" bug already
+;;; documented in CLAUDE.md — the same compile-state flip that makes
+;;; run-cl-loop-tests lose unrelated tests when deftest forms are
+;;; added. In %format-impl the symptom is "late cond branches don't
+;;; match"; elsewhere it can manifest differently.
+;;;
+;;; Takeaway: moving late branches earlier is a SYMPTOMATIC fix.
+;;; Root cause lives somewhere in the MVM compiler's register
+;;; allocator / spill logic at high instruction counts.
+
+(defun cond-depth-probe (dir)
+  "Long cond chain sanity probe — does *not* catch the %format-impl
+   bug but verifies 30-clause cond dispatch works standalone."
+  (cond ((= dir 101) 1)  ((= dir 115) 15) ((= dir 123) 23)
+        ((= dir 130) 30) (t 0)))
+
+(defun run-cond-depth-tests ()
+  (rt-run-test 2300 (cond-depth-probe 101) 1)
+  (rt-run-test 2301 (cond-depth-probe 123) 23)
+  (rt-run-test 2302 (cond-depth-probe 999) 0))
+
 (defun run-format-tests ()
   ;; format returns nil
   (deftest 2200 (format t "hello") nil)
@@ -1210,6 +1246,7 @@
   (run-values-tests)
   (run-defstruct-tests)
   (run-package-tests)
+  (run-cond-depth-tests)
   (run-format-tests)
   (run-closure-test)
   (run-heap-test)

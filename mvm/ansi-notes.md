@@ -17,21 +17,44 @@ Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own
 rationale. This doc is the shared context.
 
-## NEW gotcha: MVM miscompiles late cond branches
+## NEW gotcha: MVM miscompiles late cond branches (IN LARGE FUNCTIONS)
 
 As of 2026-04 the MVM compiler silently stops matching cond branches
-beyond an (unknown) threshold clause count. Symptom: for a branch
-`((= dir <N>) ...)` sitting deep in a long cond, the body never
-executes even when dir equals N. A standalone `(= dir N)` test in
-arbitrary code still returns T — so the bug is in cond-dispatch code
-generation, not in = on fixnums.
+beyond an (unknown) threshold clause count in **sufficiently large
+functions**. Symptom: for a branch `((= dir <N>) ...)` sitting deep in
+a long cond, the body never executes even when dir equals N. A
+standalone `(= dir N)` test in arbitrary code still returns T — so
+the bug is in cond-dispatch code generation interacting with function
+size, not in = on fixnums.
 
-Workaround: hoist frequently-missed branches to the top of the cond.
-See the `~{` / `~^` handling in `%format-impl` for an example + a
-`NOTE:` comment flagging the reordering.
+### What tried to isolate it (all pass, none reproduce the bug)
 
-If you add a new cond branch to a long dispatch (>~25 clauses?) and
-it seems to never fire, this is the first thing to check.
+- 30-clause `(= dir N)` cond in a trivial function.
+- Same cond with `or`-heavy clauses mirroring %format-impl's shape.
+- Same cond inside outer let/loop/if with many locals.
+- "Bulked-up" function: full param parser + modifier parser + 25-clause
+  cond with substantial bodies.
+
+All of those work correctly. Only `%format-impl` exhibits the bug. It
+shares the same shape as the bulked-up reproducer but is larger — the
+trigger seems to be cumulative function size / IR instruction count
+past some threshold, at which point the register allocator or spill
+logic flips.
+
+This is the same "compile-state flip" that CLAUDE.md documents for
+run-cl-loop-tests: "Adding too many deftest forms ... makes some
+passing tests start crashing — even ones that have nothing to do with
+the new tests." Same root cause, different symptom.
+
+### Workaround
+
+Hoist frequently-missed branches to the top of the cond. See the `~{`
+/ `~^` handling in `%format-impl` for an example plus a `NOTE:`
+comment flagging the reordering. Also consider factoring very large
+functions into helpers so each stays under the threshold.
+
+If you add a new cond branch to a long dispatch in a complex function
+and it seems to never fire, this is the first thing to check.
 
 ## How the harness works
 

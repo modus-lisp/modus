@@ -837,6 +837,75 @@
         (%print-char 32 stream)
         (setq i (+ i 1))))))
 
+;;; ~{...~} helpers. Factored out of %format-impl because inlining the
+;;; matching-brace scan + the per-iteration recursive call with all its
+;;; nested let/loop/cond state confused the MVM register allocator
+;;; (the recursive %format-impl call received the outer's arg-list
+;;; instead of the lst being passed).
+
+(defun %format-find-close-brace (control start len)
+  "Scan CONTROL from START for the matching ~} (respecting nested ~{~}).
+   Returns the position of ~ in the ~} pair, or NIL if not found."
+  (let ((pos start) (depth 1) (result nil))
+    (loop
+      (when (or result (>= pos len)) (return result))
+      (if (= (aref control pos) 126)
+          (let ((nc (if (< (+ pos 1) len) (aref control (+ pos 1)) 0)))
+            (cond
+              ((= nc 123) (setq depth (+ depth 1)) (setq pos (+ pos 2)))
+              ((= nc 125)
+               (setq depth (- depth 1))
+               (if (= depth 0)
+                   (setq result pos)
+                   (setq pos (+ pos 2))))
+              ;; Any other ~X: skip both chars to not re-match a
+              ;; literal ~ embedded in another directive's params.
+              (t (setq pos (+ pos 2)))))
+          (setq pos (+ pos 1))))))
+
+(defun %format-iter-inside (stream body lst max-iter)
+  "Iterate BODY over LST (the ~{...~} case). BODY is the template, LST
+   is the list to feed as successive args. Stops when LST exhausted, or
+   MAX-ITER reached, or a pass makes no progress."
+  (let ((count 0))
+    (loop
+      (when (null lst) (return nil))
+      (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
+      (let ((new-lst (%format-impl stream body lst)))
+        (when (eq new-lst lst) (return nil))
+        (setq lst new-lst))
+      (setq count (+ count 1)))))
+
+(defun %format-iter-remaining (stream body arg-list max-iter)
+  "Iterate BODY consuming elements from ARG-LIST (the ~@{...~} case).
+   Returns the remaining (unconsumed) arg-list."
+  (let ((count 0))
+    (loop
+      (when (null arg-list) (return arg-list))
+      (when (and (>= max-iter 0) (>= count max-iter)) (return arg-list))
+      (let ((new-args (%format-impl stream body arg-list)))
+        (when (eq new-args arg-list) (return arg-list))
+        (setq arg-list new-args))
+      (setq count (+ count 1)))))
+
+(defun %format-dispatch-brace (stream control i len arg-list atp param1)
+  "Handle a ~{...~} directive at position i of CONTROL.
+   Finds the matching ~}, extracts the body substring, runs the
+   iteration (either ~{ or ~@{), and returns (cons NEW-I NEW-ARG-LIST).
+   If no matching ~} is found, returns (cons i arg-list) unchanged."
+  (let ((end-pos (%format-find-close-brace control i len)))
+    (if (null end-pos)
+        (cons i arg-list)
+        (let ((body (%substring control i end-pos))
+              (max-iter (if param1 param1 -1))
+              (new-i (+ end-pos 2)))
+          (if atp
+              (cons new-i (%format-iter-remaining stream body arg-list max-iter))
+              (let ((lst (car arg-list))
+                    (rest-args (cdr arg-list)))
+                (%format-iter-inside stream body lst max-iter)
+                (cons new-i rest-args)))))))
+
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)
 (defun %format-impl (stream control args)
@@ -921,6 +990,22 @@
               (let ((dir (aref control pos)))
                 (setq i (+ pos 1))
                 (cond
+                  ;; NOTE: ~{ ~} and ~^ are intentionally placed FIRST.
+                  ;; MVM (as of 2026-04) miscompiles cond branches that
+                  ;; sit beyond a threshold number of clauses ahead —
+                  ;; late branches silently never match. Observed with
+                  ;; `~{` (dir=123) and `~^` (dir=94) before this
+                  ;; reordering. Keep them up top until the compiler
+                  ;; bug is fixed.
+                  ((= dir 94)
+                   (when (null arg-list) (return arg-list)))
+                  ((= dir 123)
+                   (let ((new-i-and-args
+                          (%format-dispatch-brace stream control i len
+                                                  arg-list atp param1)))
+                     (setq i (car new-i-and-args))
+                     (setq arg-list (cdr new-i-and-args))))
+                  ((= dir 125) nil)
                   ;; ~A — aesthetic
                   ((or (= dir 65) (= dir 97))
                    (let ((obj (car arg-list)))
@@ -1249,53 +1334,17 @@
                                 (let ((default (car (last sections))))
                                   (when default
                                     (setq arg-list (%format-impl stream default arg-list)))))))))))
-                  ;; ~{ ~} — iteration
-                  ((or (= dir 123) (= dir 125))
-                   (when (= dir 123)
-                     ;; Find matching ~}
-                     (let ((end-pos i) (depth 1))
-                       (loop
-                         (when (>= end-pos len) (return nil))
-                         (when (= (aref control end-pos) 126)
-                           (let ((nc (if (< (+ end-pos 1) len) (aref control (+ end-pos 1)) 0)))
-                             (cond
-                               ((= nc 123) (setq depth (+ depth 1)) (setq end-pos (+ end-pos 2)))
-                               ((= nc 125)
-                                (setq depth (- depth 1))
-                                (when (= depth 0)
-                                  (let ((body (%substring control i end-pos))
-                                        (max-iter (if param1 param1 -1)))
-                                    (setq i (+ end-pos 2))
-                                    (if atp
-                                        ;; ~@{: use remaining args as list
-                                        (let ((count 0))
-                                          (loop
-                                            (when (or (null arg-list)
-                                                      (and (>= max-iter 0) (>= count max-iter)))
-                                              (return nil))
-                                            (let ((new-args (%format-impl stream body arg-list)))
-                                              (when (eq new-args arg-list) (return nil))  ; no progress
-                                              (setq arg-list new-args))
-                                            (setq count (+ count 1))))
-                                        ;; ~{: use next arg as list
-                                        (let ((lst (car arg-list))
-                                              (count 0))
-                                          (setq arg-list (cdr arg-list))
-                                          (loop
-                                            (when (or (null lst)
-                                                      (and (>= max-iter 0) (>= count max-iter)))
-                                              (return nil))
-                                            (let ((new-lst (%format-impl stream body lst)))
-                                              (when (eq new-lst lst) (return nil))
-                                              (setq lst new-lst))
-                                            (setq count (+ count 1))))))
-                                  (return nil)))
-                               (t (setq end-pos (+ end-pos 1)))))
-                           (return nil))
-                         (setq end-pos (+ end-pos 1)))))
+                  ;; ~{ ~} — iteration. Delegated entirely to a helper
+                  ;; (%format-dispatch-brace) to keep %format-impl's
+                  ;; frame small. When %format-impl's ~{ handler was
+                  ;; inlined with its own let/loop/cond nesting, the
+                  ;; MVM register allocator handed the recursive body
+                  ;; call the outer's arg-list instead of the intended
+                  ;; lst, producing "(1 2 3)" for "~{~A ~}".
+                  ;; (~{ ~} moved earlier; no-op placeholder to keep
+                  ;; branch count stable if other changes expect it here)
                   ;; ~^ — escape upward
-                  ((= dir 94)
-                   (when (null arg-list) (return arg-list)))
+                  ;; (~^ moved earlier; late position was miscompiled)
                   ;; ~_ — conditional newline (pprint, ignore)
                   ((= dir 95) nil)
                   ;; ~I — indent (pprint, ignore)

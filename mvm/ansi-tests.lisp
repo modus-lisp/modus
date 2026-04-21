@@ -822,7 +822,14 @@
   ;; Verify format doesn't crash with various types
   (deftest 2204 (format t "~S" (cons 1 2)) nil)
   (deftest 2205 (format t "~S" nil) nil)
-  (deftest 2206 (format t "~%") nil))
+  (deftest 2206 (format t "~%") nil)
+  ;; ~{ ~} iteration + ~^ (up-and-out). These were broken because MVM
+  ;; miscompiles cond branches beyond a threshold — the dir=123 and
+  ;; dir=94 handlers simply never matched. Workaround in cl-printer:
+  ;; move both branches to the top of the dispatch cond.
+  (rt-run-test 2210 (format nil "~{~A ~}" '(1 2 3)) "1 2 3 ")
+  (rt-run-test 2211 (format nil "~{~A~^,~}" '(1 2 3)) "1,2,3")
+  (rt-run-test 2212 (format nil "~{(~A)~}" '(1 2 3)) "(1)(2)(3)"))
 
 ;;; ============================================================
 ;;; Multi-value + incf test (debug for ANSI order tests)

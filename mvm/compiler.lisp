@@ -4526,24 +4526,38 @@
 ;;; ============================================================
 
 (defun compile-car (arg env dest)
-  "Baseline — no null check."
+  "Compile (car x). ANSI: (car nil)=nil, non-list signals type-error.
+   - Quoted non-list at compile time → signal at build.
+   - Runtime: null short-circuits to nil via bnull.
+   We don't emit a full consp check here: even though symbols and
+   closures are now distinct object tags (so the consp path is
+   technically safe), adding :consp + :bnull in sequence still
+   regresses ~15k tests for reasons we haven't root-caused — likely
+   liveness / flag interaction in the register allocator. Null
+   short-circuit alone is a small correctness win without the risk."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
      (compile-form '(%signal-type-error) env dest))
     (t
      (compile-form arg env dest)
-     (emit-ir :car dest dest))))
+     (let ((done (make-compiler-label)))
+       (emit-ir :bnull dest done)
+       (emit-ir :car dest dest)
+       (emit-ir-label done)))))
 
 (defun compile-cdr (arg env dest)
-  "Baseline — no null check."
+  "Compile (cdr x). Same null short-circuit as compile-car."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
      (compile-form '(%signal-type-error) env dest))
     (t
      (compile-form arg env dest)
-     (emit-ir :cdr dest dest))))
+     (let ((done (make-compiler-label)))
+       (emit-ir :bnull dest done)
+       (emit-ir :cdr dest dest)
+       (emit-ir-label done)))))
 
 (defun compile-arity-error (env dest)
   "Emit a 0-arg call to %SIGNAL-PROGRAM-ERROR at runtime — used when an

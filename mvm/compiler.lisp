@@ -1901,6 +1901,7 @@
 
       ;; --- Symbol allocation ---
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
+      ((= op-name 559186982902022686)   (compile-alloc-sym3 dest))   ; %alloc-sym3
       ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
       ;; --- Closure construction ---
@@ -5575,6 +5576,14 @@
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
    Returns an uninitialized symbol object; caller stores name-hash in slot 0."
   (emit-ir :alloc-obj dest 1 +subtag-symbol+))
+
+(defun compile-alloc-sym3 (dest)
+  "Compile (%alloc-sym3) — allocate a 3-slot object with symbol subtag
+   (#x50). Slots are uninitialized; the caller fills them. Used by the
+   CL symbol allocator to build a full package-aware symbol with slots
+   [hash, package, name] without going through make-array (which would
+   give subtag #x32 and require a header rewrite)."
+  (emit-ir :alloc-obj dest 3 +subtag-symbol+))
 
 (defun compile-make-closure (fn-form env-form env dest)
   "Compile (%make-closure fn env) — allocate a 2-slot object with

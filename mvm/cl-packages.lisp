@@ -14,13 +14,19 @@
 ;;;   slot 5: used-by-list (list of packages)
 ;;;   slot 6: shadowing-symbols (list of symbols)
 ;;;
-;;; CL Symbol = (cons <sym-tag> <3-slot-array>)
+;;; CL Symbol = heap object (tag=9 / subtag #x50) with 3 slots
 ;;;   slot 0: name-hash (fixnum, for backward compat)
 ;;;   slot 1: package (package object or nil)
 ;;;   slot 2: name (string)
+;;;
+;;; The symbol's subtag #x50 (+subtag-symbol+) distinguishes it from
+;;; cons cells, general arrays, and closures (subtag #x52). This is
+;;; the representation tags.lisp has reserved all along; the earlier
+;;; (cons <sym-tag> <array-3>) form collided with closures in the
+;;; funcall dispatch and needed day-scale cleanup to migrate.
 
 (defvar *pkg-tag* 987654321)
-(defvar *sym-tag* 123456789)
+(defvar *sym-tag* 123456789)  ; legacy marker — now unused by %cl-sym-p
 
 ;;; --- Package predicates and accessors ---
 
@@ -48,38 +54,36 @@
 (defun %pkg-set-shadowing (pkg v) (aset (%pkg-data pkg) 6 v))
 
 ;;; --- CL Symbol predicates and accessors ---
+;;;
+;;; Symbols are heap objects: tag=9, subtag=#x50, 3 slots. Accessors
+;;; read/write those slots directly via aref/aset — the array ops
+;;; work uniformly across object subtypes because the header layout
+;;; (count + subtag) is shared.
 
 (defun %cl-sym-p (x)
-  "Check if X is a CL symbol (package-aware).
-   Symbols are (cons *sym-tag* #<array-3>) when *sym-tag* initialized,
-   or (cons nil #<array-3>) when *sym-tag* is uninitialized.
-   Distinguishable from packages (cons nil #<array-7>) by array length."
-  (if (consp x)
-      (if *sym-tag*
-          (eql (car x) *sym-tag*)
-          ;; Uninitialized: car must be nil, cdr must be a 3-slot array
-          (if (null (car x))
-              (let ((d (cdr x)))
-                (if (arrayp d)
-                    (= (array-length d) 3)
-                    nil))
-              nil))
-      nil))
+  "Check if X is a CL symbol (tag=object, subtag=#x50)."
+  (cond
+    ((fixnump x) nil)
+    ((consp x) nil)
+    ((null x) nil)
+    ((characterp x) nil)
+    (t (= (obj-subtag x) #x50))))
 
-(defun %cl-sym-data (sym) (cdr sym))
-(defun %cl-sym-hash (sym) (aref (%cl-sym-data sym) 0))
-(defun %cl-sym-package (sym) (aref (%cl-sym-data sym) 1))
-(defun %cl-sym-name (sym) (aref (%cl-sym-data sym) 2))
+(defun %cl-sym-data (sym) sym)  ; legacy accessor — slots live directly on sym
+(defun %cl-sym-hash (sym) (aref sym 0))
+(defun %cl-sym-package (sym) (aref sym 1))
+(defun %cl-sym-name (sym) (aref sym 2))
 
-(defun %cl-sym-set-package (sym pkg) (aset (%cl-sym-data sym) 1 pkg))
+(defun %cl-sym-set-package (sym pkg) (aset sym 1 pkg))
 
 (defun %make-cl-symbol (name-string)
-  "Create a new CL symbol with NAME-STRING as its name."
-  (let ((data (make-array 3)))
-    (aset data 0 0)    ; name-hash (unused for CL symbols)
-    (aset data 1 nil)  ; package
-    (aset data 2 name-string)
-    (cons *sym-tag* data)))
+  "Create a new CL symbol with NAME-STRING as its name. The returned
+   object is tag-9 / subtag-0x50 with three slots [hash, package, name]."
+  (let ((sym (%alloc-sym3)))
+    (aset sym 0 0)           ; name-hash (unused for CL symbols)
+    (aset sym 1 nil)         ; package
+    (aset sym 2 name-string) ; name
+    sym))
 
 ;;; --- Global package registry ---
 

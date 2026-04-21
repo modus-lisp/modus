@@ -816,16 +816,21 @@
                ,@body))))))
 
   ;; FIRST, SECOND, THIRD, FOURTH, FIFTH → car of nthcdr
+  ;; FIRST..FIFTH and REST/CADDR/CDDDR/CADDDR each take exactly 1 arg.
+  ;; Without a length check the macros silently expand `(first)` into
+  ;; `(car nil)` and drop extras like `(first 1 2)`. Emit
+  ;; %signal-program-error on arity mismatch so (handler-case ...)
+  ;; sees the error.
   (mvm-define-macro "FIRST"
-    (lambda (form) `(car ,(cadr form))))
+    (lambda (form) (if (= (length form) 2) `(car ,(cadr form)) '(%signal-program-error))))
   (mvm-define-macro "SECOND"
-    (lambda (form) `(car (cdr ,(cadr form)))))
+    (lambda (form) (if (= (length form) 2) `(car (cdr ,(cadr form))) '(%signal-program-error))))
   (mvm-define-macro "THIRD"
-    (lambda (form) `(car (cdr (cdr ,(cadr form))))))
+    (lambda (form) (if (= (length form) 2) `(car (cdr (cdr ,(cadr form)))) '(%signal-program-error))))
   (mvm-define-macro "FOURTH"
-    (lambda (form) `(car (cdr (cdr (cdr ,(cadr form)))))))
+    (lambda (form) (if (= (length form) 2) `(car (cdr (cdr (cdr ,(cadr form))))) '(%signal-program-error))))
   (mvm-define-macro "FIFTH"
-    (lambda (form) `(car (cdr (cdr (cdr (cdr ,(cadr form))))))))
+    (lambda (form) (if (= (length form) 2) `(car (cdr (cdr (cdr (cdr ,(cadr form)))))) '(%signal-program-error))))
 
   ;; WHEN → (if test (progn body...) nil)
   (mvm-define-macro "WHEN"
@@ -1060,23 +1065,34 @@
   ;; REST — alias for CDR
   (mvm-define-macro "REST"
     (lambda (form)
-      `(cdr ,(cadr form))))
+      (if (= (length form) 2)
+          `(cdr ,(cadr form))
+          '(%signal-program-error))))
 
-  ;; /= — not equal
+  ;; /= — not equal (exactly 2 args for now — macro doesn't yet
+  ;; handle 3+ correctly either).
   (mvm-define-macro "/="
     (lambda (form)
-      `(not (= ,(cadr form) ,(caddr form)))))
+      (if (= (length form) 3)
+          `(not (= ,(cadr form) ,(caddr form)))
+          '(%signal-program-error))))
 
   ;; CADDR, CDDDR, CADDDR — extended car/cdr compositions
   (mvm-define-macro "CADDR"
     (lambda (form)
-      `(car (cddr ,(cadr form)))))
+      (if (= (length form) 2)
+          `(car (cddr ,(cadr form)))
+          '(%signal-program-error))))
   (mvm-define-macro "CDDDR"
     (lambda (form)
-      `(cdr (cddr ,(cadr form)))))
+      (if (= (length form) 2)
+          `(cdr (cddr ,(cadr form)))
+          '(%signal-program-error))))
   (mvm-define-macro "CADDDR"
     (lambda (form)
-      `(car (cdr (cddr ,(cadr form))))))
+      (if (= (length form) 2)
+          `(car (cdr (cddr ,(cadr form))))
+          '(%signal-program-error))))
 
   ;; PUSH — (push item place) → (setq place (cons item place))
   (mvm-define-macro "PUSH"

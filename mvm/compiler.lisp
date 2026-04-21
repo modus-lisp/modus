@@ -1026,22 +1026,24 @@
   ;; For non-constant bytespec: expand to %ldb-runtime call (avoids re-triggering this macro)
   (mvm-define-macro "LDB"
     (lambda (form)
-      (let ((bytespec (cadr form))
-            (integer (caddr form)))
-        (if (and (consp bytespec)
-                 (symbolp (car bytespec))
-                 (string= (symbol-name (car bytespec)) "BYTE")
-                 (integerp (cadr bytespec))
-                 (integerp (caddr bytespec)))
-            ;; Constant (byte size pos): inline
-            (let* ((size (cadr bytespec))
-                   (pos (caddr bytespec))
-                   (mask (1- (ash 1 size))))
-              (if (zerop pos)
-                  `(logand ,integer ,mask)
-                  `(logand (ash ,integer ,(- pos)) ,mask)))
-            ;; Non-constant bytespec: use runtime %ldb-rt which handles byte-spec at runtime
-            `(%ldb-rt ,bytespec ,integer)))))
+      (if (/= (length form) 3)
+          '(%signal-program-error)
+          (let ((bytespec (cadr form))
+                (integer (caddr form)))
+            (if (and (consp bytespec)
+                     (symbolp (car bytespec))
+                     (string= (symbol-name (car bytespec)) "BYTE")
+                     (integerp (cadr bytespec))
+                     (integerp (caddr bytespec)))
+                ;; Constant (byte size pos): inline
+                (let* ((size (cadr bytespec))
+                       (pos (caddr bytespec))
+                       (mask (1- (ash 1 size))))
+                  (if (zerop pos)
+                      `(logand ,integer ,mask)
+                      `(logand (ash ,integer ,(- pos)) ,mask)))
+                ;; Non-constant bytespec: use runtime %ldb-rt which handles byte-spec at runtime
+                `(%ldb-rt ,bytespec ,integer))))))
 
   ;; EMIT-BYTES — expand to individual emit-byte calls (avoids &rest)
   (mvm-define-macro "EMIT-BYTES"

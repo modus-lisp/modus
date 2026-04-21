@@ -1,17 +1,24 @@
 # ANSI test notes — session log
 
-State as of last session: **~6655 passes / ~9940 fails / ~1090 lost**
-(started that session at 6589 / ~10000 / 1089; gains across two
-sessions are cumulative — run-to-run variance is ±20 via SIGALRM
+State as of last session: **~6695 passes / ~10023 fails / ~974 lost**
+(+107 passes and -115 lost since 6588 / ~10000 / 1089 at the start
+of the multi-session run; run-to-run variance is ±20 via SIGALRM
 timing).
 
-Relevant commits (this session's three wins):
+Relevant commits across these sessions:
 - Auto-emit (setq) for test-file defvar/defparameter inits
 - __handler_pop: preserve RAX so handler-case body result isn't
   clobbered (eliminated all 318 `#<?184>` verdicts)
 - format ~{~} / ~^: fixed scanner, factored helpers, and **moved ~{
   and ~^ to the top of the dispatch cond** to avoid an MVM compiler
   bug where late cond branches silently never match.
+- Error-detection wave: type/arity checks in list-length, endp,
+  butlast, last, make-list, and critical compiler macros (PLUSP,
+  MINUSP, ABS, LOGNOT, LDB, FIRST..FIFTH, REST, /=, CADDR, CDDDR,
+  CADDDR). The macro fixes alone were worth +32 passes and -108
+  lost — the macros silently dropped extra args so (HANDLER-CASE
+  (PROGN (PLUSP 0 0) NIL) (ERROR (C) T)) never saw an error to
+  catch.
 
 Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own
@@ -270,19 +277,22 @@ grep -oE "run-test(-mv)? [0-9]+" /tmp/real-ansi-gen.lisp | awk '{print $NF}' \
 
 Options #1 (#<?184>) and #2 (defvar auto-emit) are DONE. What's left:
 
-1. **"Expect T get NIL" — the 536-test bucket.** Pattern is
-   `(handler-case (progn <op-with-bad-arg>) (error (c) t))` where the
-   bad arg *should* trigger a type/keyword error but our runtime
-   silently accepts it. Examples:
-   - `(ASSOC-IF #'NULL NIL :BAD T)` — unknown keyword :BAD ignored
-   - `(MAKE-LIST 5 :BAD T)` — same
-   - `(BUTLAST 'A 0)` — non-list argument silently returns NIL
-   - `(LOCALLY (CAR 'A) T)` — non-cons argument silently returns NIL
-   Fixing these properly means adding arg validation to many
-   builtins. No shared helper — it's case-by-case. Highest-leverage
-   single fix: make unknown-keyword a signaled error in the
-   arg-parsing helper of sequence/list builtins (puts ~150+ tests in
-   one fix), then chip away at the rest.
+1. **"Expect T get NIL" — the ~509-test bucket (down from 536).**
+   Pattern is `(handler-case (progn <op-with-bad-arg>) (error (c) t))`
+   where the bad arg *should* trigger a type/keyword error but our
+   runtime silently accepts it. Remaining sub-patterns:
+   - MVM inline `:car` / `:cdr` IR reads garbage without a type
+     check. `(CAR 'A)` silently returns garbage instead of signaling.
+     Fixing means either emitting type-check+branch in the inline
+     translator or replacing inline with a safe defun (the latter
+     regressed unrelated tests when tried — needs more care).
+   - `(MAPC #'CONS list)` / `(MAPCAR #'CONS list)` etc. — the
+     callback is called with 1 arg but needs 2. Our funcall doesn't
+     check arity at call time, so the wrong-arity call silently
+     reads garbage. Fix needs funcall arity-check, which requires
+     storing per-function arity in the callable object.
+   - Many defuns (FBOUNDP, ELT on NIL, etc.) don't type-check args.
+     Each one is a targeted fix like LIST-LENGTH/ENDP/BUTLAST.
 
 2. **FORMATTER / ~{...~^...~} — the format-circumflex & format-brace
    bucket (~540 tests).** Tests build `(FORMATTER "...")` then

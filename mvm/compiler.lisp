@@ -4513,8 +4513,10 @@
    Compile-time check for common quoted-constant error pattern:
    `(car 'A)` where 'A is a non-list symbol/number/etc. unconditionally
    signals type-error at build time. For variable args we skip the check
-   because a dynamic runtime wrapper regressed too many lists-of-cons
-   inner loops."
+   — a dynamic runtime wrapper regressed too many tests (both the
+   stack-frame-bloat version and the register-temp version exploded
+   the run with ~16k lost, suggesting codegen or aliasing issues deeper
+   than the wrapper itself)."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))

@@ -4509,14 +4509,30 @@
 ;;; ============================================================
 
 (defun compile-car (arg env dest)
-  "Compile (car x) -> MVM car instruction"
-  (compile-form arg env dest)
-  (emit-ir :car dest dest))
+  "Compile (car x) -> MVM car instruction.
+   Compile-time check for common quoted-constant error pattern:
+   `(car 'A)` where 'A is a non-list symbol/number/etc. unconditionally
+   signals type-error at build time. For variable args we skip the check
+   because a dynamic runtime wrapper regressed too many lists-of-cons
+   inner loops."
+  (cond
+    ((and (consp arg) (eq (car arg) 'quote)
+          (not (null (cadr arg))) (not (consp (cadr arg))))
+     (compile-form '(%signal-type-error) env dest))
+    (t
+     (compile-form arg env dest)
+     (emit-ir :car dest dest))))
 
 (defun compile-cdr (arg env dest)
-  "Compile (cdr x) -> MVM cdr instruction"
-  (compile-form arg env dest)
-  (emit-ir :cdr dest dest))
+  "Compile (cdr x) -> MVM cdr instruction. Same compile-time check as
+   compile-car for quoted-constant non-list args."
+  (cond
+    ((and (consp arg) (eq (car arg) 'quote)
+          (not (null (cadr arg))) (not (consp (cadr arg))))
+     (compile-form '(%signal-type-error) env dest))
+    (t
+     (compile-form arg env dest)
+     (emit-ir :cdr dest dest))))
 
 (defun compile-arity-error (env dest)
   "Emit a 0-arg call to %SIGNAL-PROGRAM-ERROR at runtime — used when an

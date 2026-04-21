@@ -68,7 +68,14 @@
 
 (defun last (list &rest n-arg)
   "Return the last N cons cells of LIST. N defaults to 1.
-   Signals TYPE-ERROR if N is not a non-negative fixnum."
+   Signals TYPE-ERROR if N is not a non-negative fixnum,
+   or if LIST is neither a list nor NIL,
+   or if more than one optional argument is supplied."
+  ;; ANSI: (last list &optional (n 1)). Extra args → program-error.
+  (when (and n-arg (cdr n-arg))
+    (error "last: too many arguments"))
+  (when (and list (not (consp list)))
+    (error "last: first argument is not a list"))
   (let ((n (if n-arg (car n-arg) 1)))
     (when (or (not (fixnump n)) (< n 0))
       (%signal-type-error))
@@ -444,7 +451,13 @@
 
 (defun list-length (list)
   "Return the length of LIST, or NIL for circular lists.
-   Uses tortoise-and-hare cycle detection."
+   Uses tortoise-and-hare cycle detection.
+   Signals a type-error if LIST is not a list (cons or NIL).
+   For improper lists, stops at the improper tail and returns the
+   partial count — this is more lenient than ANSI but many internal
+   callers rely on it."
+  (when (and list (not (consp list)))
+    (error "list-length: argument is not a list"))
   (let ((n 0)
         (fast list)
         (slow list))

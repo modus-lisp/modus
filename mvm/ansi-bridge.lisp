@@ -156,9 +156,10 @@
       (setq cur (cddr cur)))))
 
 (defun endp (x)
-  (if (null x) t
-    (if (consp x) nil
-      nil)))
+  ;; ANSI: type-error if x is not a list (cons or nil).
+  (cond ((null x) t)
+        ((consp x) nil)
+        (t (error "endp: argument is not a list"))))
 
 (defun tree-equal (a b)
   (if (eql a b) t
@@ -203,6 +204,11 @@
         (setq cur next)))))
 
 (defun butlast (list &rest n-arg)
+  ;; ANSI: (butlast list &optional (n 1)). Extra args → program-error.
+  (when (and n-arg (cdr n-arg))
+    (error "butlast: too many arguments"))
+  (when (and list (not (consp list)))
+    (error "butlast: argument is not a list"))
   (let ((n (if n-arg (car n-arg) 1)))
     (when (or (not (fixnump n)) (< n 0))
       (%signal-type-error))
@@ -228,19 +234,38 @@
       (setq d (cdr d)))))
 
 (defun make-list (n &rest args)
-  (let ((initial-element nil) (cur args))
-    ;; Parse :initial-element keyword
+  ;; ANSI: (make-list size &key initial-element). Unknown keywords
+  ;; are a program-error unless :allow-other-keys t is also present.
+  ;; For duplicate keys, first-binding wins.
+  (when (or (not (fixnump n)) (< n 0))
+    (error "make-list: size must be a non-negative fixnum"))
+  ;; Pre-scan for :allow-other-keys so it doesn't have to appear first.
+  (let ((allow-other nil) (scan args))
     (loop
-      (when (null cur) (return nil))
-      (when (eq (car cur) :initial-element)
-        (setq initial-element (cadr cur))
+      (when (null scan) (return nil))
+      (when (null (cdr scan))
+        (error "make-list: odd number of keyword arguments"))
+      (when (eq (car scan) :allow-other-keys)
+        (setq allow-other (cadr scan))
         (return nil))
-      (setq cur (cddr cur)))
-    (let ((result nil) (i 0))
+      (setq scan (cddr scan)))
+    (let ((initial-element nil) (init-set nil) (cur args))
       (loop
-        (when (= i n) (return result))
-        (setq result (cons initial-element result))
-        (setq i (+ i 1))))))
+        (when (null cur) (return nil))
+        (cond
+          ((eq (car cur) :initial-element)
+           (unless init-set
+             (setq initial-element (cadr cur))
+             (setq init-set t)))
+          ((eq (car cur) :allow-other-keys) nil)
+          (t (unless allow-other
+               (error "make-list: unknown keyword argument"))))
+        (setq cur (cddr cur)))
+      (let ((result nil) (i 0))
+        (loop
+          (when (= i n) (return result))
+          (setq result (cons initial-element result))
+          (setq i (+ i 1)))))))
 
 (defun tailp (obj list)
   (let ((cur list))

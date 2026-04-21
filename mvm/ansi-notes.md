@@ -1,7 +1,7 @@
 # ANSI test notes — session log
 
-State as of last session: **~6695 passes / ~10023 fails / ~974 lost**
-(+107 passes and -115 lost since 6588 / ~10000 / 1089 at the start
+State as of last session: **~7048 passes / ~9429 fails / ~1215 lost**
+(+460 passes and +126 lost since 6588 / ~10000 / 1089 at the start
 of the multi-session run; run-to-run variance is ±20 via SIGALRM
 timing).
 
@@ -19,6 +19,11 @@ Relevant commits across these sessions:
   lost — the macros silently dropped extra args so (HANDLER-CASE
   (PROGN (PLUSP 0 0) NIL) (ERROR (C) T)) never saw an error to
   catch.
+- **Closures and symbols migrated off cons representation** to their
+  reserved object subtags (#x52 for closures, #x50 for symbols).
+  The old form collided in funcall's consp dispatch and was the
+  root cause of `(funcall 'sym …)` crashing through misdispatch.
+  +352 passes across the two migrations.
 
 Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own

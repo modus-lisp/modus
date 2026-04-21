@@ -4510,13 +4510,22 @@
 
 (defun compile-car (arg env dest)
   "Compile (car x) -> MVM car instruction.
-   Compile-time check for common quoted-constant error pattern:
-   `(car 'A)` where 'A is a non-list symbol/number/etc. unconditionally
-   signals type-error at build time. For variable args we skip the check
-   — a dynamic runtime wrapper regressed too many tests (both the
-   stack-frame-bloat version and the register-temp version exploded
-   the run with ~16k lost, suggesting codegen or aliasing issues deeper
-   than the wrapper itself)."
+   Compile-time check: (car 'A) for literal quoted non-list constants
+   emits (%signal-type-error).
+
+   Did NOT add runtime safety. Three attempts all regressed
+   catastrophically — 100-16k tests flipped to lost/fail even when
+   the emitted IR was semantically correct. Each attempt:
+   - `(let ((tmp arg)) (cond ((null tmp) nil) ((consp tmp) (%raw-car tmp))
+      (t (%signal-type-error))))` — -122 pass, +245 lost even with
+      only the null branch.
+   - Inline `bnull → done; consp tp dest; bnull tp err; :car; done; err:
+      call signal` — same damage.
+   - Inline without consp — `(car x)` guarded only by null check —
+      same 245+ lost tests, meaning the bug is NOT the consp branch.
+   Hypothesis: something in our stack/register state is disturbed
+   when a label-branch is inserted between the arg evaluation and
+   the :car IR. Needs deeper compiler instrumentation to root cause."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
@@ -4527,7 +4536,8 @@
 
 (defun compile-cdr (arg env dest)
   "Compile (cdr x) -> MVM cdr instruction. Same compile-time check as
-   compile-car for quoted-constant non-list args."
+   compile-car for quoted-constant non-list args. See compile-car
+   comment for the runtime-safety history."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))

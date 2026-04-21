@@ -1,16 +1,37 @@
 # ANSI test notes — session log
 
-State as of last session: **6615 passes / 9998 fails / 1079 lost**
-(started that session at 6589 / ~10000 / 1089).
-Relevant commits:
+State as of last session: **~6655 passes / ~9940 fails / ~1090 lost**
+(started that session at 6589 / ~10000 / 1089; gains across two
+sessions are cumulative — run-to-run variance is ±20 via SIGALRM
+timing).
+
+Relevant commits (this session's three wins):
 - Auto-emit (setq) for test-file defvar/defparameter inits
-- __handler_pop: preserve RAX so handler-case body result isn't clobbered
-  (eliminates all 318 `#<?184>` verdicts — the RAX clobber turned body
-  values into popped-RSP garbage; was option #1 in the prior handoff)
+- __handler_pop: preserve RAX so handler-case body result isn't
+  clobbered (eliminated all 318 `#<?184>` verdicts)
+- format ~{~} / ~^: fixed scanner, factored helpers, and **moved ~{
+  and ~^ to the top of the dispatch cond** to avoid an MVM compiler
+  bug where late cond branches silently never match.
 
 Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own
 rationale. This doc is the shared context.
+
+## NEW gotcha: MVM miscompiles late cond branches
+
+As of 2026-04 the MVM compiler silently stops matching cond branches
+beyond an (unknown) threshold clause count. Symptom: for a branch
+`((= dir <N>) ...)` sitting deep in a long cond, the body never
+executes even when dir equals N. A standalone `(= dir N)` test in
+arbitrary code still returns T — so the bug is in cond-dispatch code
+generation, not in = on fixnums.
+
+Workaround: hoist frequently-missed branches to the top of the cond.
+See the `~{` / `~^` handling in `%format-impl` for an example + a
+`NOTE:` comment flagging the reordering.
+
+If you add a new cond branch to a long dispatch (>~25 clauses?) and
+it seems to never fire, this is the first thing to check.
 
 ## How the harness works
 

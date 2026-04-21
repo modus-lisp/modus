@@ -4529,12 +4529,14 @@
   "Compile (car x). ANSI: (car nil)=nil, non-list signals type-error.
    - Quoted non-list at compile time → signal at build.
    - Runtime: null short-circuits to nil via bnull.
-   We don't emit a full consp check here: even though symbols and
-   closures are now distinct object tags (so the consp path is
-   technically safe), adding :consp + :bnull in sequence still
-   regresses ~15k tests for reasons we haven't root-caused — likely
-   liveness / flag interaction in the register allocator. Null
-   short-circuit alone is a small correctness win without the risk."
+
+   Tried the full consp-check path (bnull null | consp tp | bnull tp err
+   | :car | err-branch: %signal-type-error) AFTER the symbol and closure
+   migrations made the consp check semantically safe. Unexpectedly
+   *still* regresses 16k tests. Forks produce interleaved stdout,
+   suggesting fork-file's wait4 is somehow not serializing children
+   when compile-call emits the safe sequence. Root cause beyond
+   reach right now — filed as follow-up. Null-check-only is stable."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))

@@ -25,6 +25,19 @@ Relevant commits across these sessions:
   root cause of `(funcall 'sym …)` crashing through misdispatch.
   +352 passes across the two migrations.
 
+## Follow-up still pending: full consp-check in compile-car/cdr
+
+After the symbol+closure migrations, adding a runtime consp-check
+to compile-car/cdr (bnull null | consp tp | bnull tp err | :car |
+err-path: %signal-type-error) *still* regresses 16k tests. The
+failure mode is unusual: isolated forks (run with skip-below /
+run-only-below to run just one file) complete cleanly, but the
+full run produces interleaved stdout suggesting fork-file's wait4
+isn't serializing children. Null-check-only works fine. Something
+about the specific IR sequence when applied across 500+ files
+disturbs the parent/child fork lifecycle in a way that needs fresh
+investigation. Kept null-check-only to preserve stability.
+
 Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own
 rationale. This doc is the shared context.

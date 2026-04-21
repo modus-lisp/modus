@@ -449,9 +449,10 @@
 (defun constantly (value) (setq *constantly-value* value) #'%constantly-impl)
 ;;; Closure support functions for is-eql-p / is-not-eql-p.
 ;;; These load the captured env from CLOSURE-ENV-ADDR (#x10000140), which
-;;; funcall stores when it detects a closure object (cons fn-addr . env-list).
-;;; The is-eql-p/is-not-eql-p functions themselves are defined in ansi-tests.lisp
-;;; (loaded after ansi-aux.lsp) to override the aux version.
+;;; funcall stores when it detects a closure object (tag=object,
+;;; subtag=#x52, 2 slots [fn-addr env-list]). Previously closures were
+;;; represented as cons cells, but that collided with CL symbols (also
+;;; cons cells) in the funcall dispatch — see ansi-notes.md.
 (defun closure-eql-fn (y)
   (let* ((env (mem-ref #x10000140 :u64))
          (x (car env)))
@@ -462,8 +463,8 @@
     (not (eql x y))))
 ;;; Placeholder is-eql-p/is-not-eql-p (will be overridden by ansi-tests.lisp)
 (defvar *is-eql-p-item* nil)
-(defun is-eql-p (x) (cons #'closure-eql-fn (cons x nil)))
-(defun is-not-eql-p (x) (cons #'closure-not-eql-fn (cons x nil)))
+(defun is-eql-p (x) (%make-closure #'closure-eql-fn (cons x nil)))
+(defun is-not-eql-p (x) (%make-closure #'closure-not-eql-fn (cons x nil)))
 (defun sort (seq pred &rest options) (declare (ignore options)) (if (or (null seq) (null (cdr seq))) seq
   (let ((result (list (car seq)))) (dolist (item (cdr seq))
     (if (funcall pred item (car result)) (setq result (cons item result))

@@ -48,6 +48,7 @@
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
 (defconstant +subtag-symbol+ #x50)
+(defconstant +subtag-closure+ #x52)
 (defconstant +subtag-float+  #x60)
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
@@ -1902,6 +1903,14 @@
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
       ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
+      ;; --- Closure construction ---
+      ;; (%make-closure fn env) -> tag-object / subtag-0x52, 2 slots.
+      ;; Replaces (cons #'fn env) for closure object creation. The
+      ;; cons form collided with CL symbols (also cons cells) in the
+      ;; funcall dispatch; see ansi-notes.md.
+      ((= op-name 82305594443552132)
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-make-closure (cadr form) (caddr form) env dest)))
 
       ;; --- Array Operations ---
       ((= op-name 686483400154579705)       (compile-make-array (cadr form) env dest))
@@ -2990,22 +2999,15 @@
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
           (push result *pending-flet-ir*)
-          ;; Build closure object at definition site:
-          ;; (cons fn-addr (cons cap0 (cons cap1 ... nil)))
+          ;; Build closure object at definition site as a 2-slot
+          ;; object with subtag +subtag-closure+ (#x52). Slot 0 =
+          ;; fn-addr, slot 1 = env-list. Replaces the earlier
+          ;; (cons fn-addr env-list) representation that collided
+          ;; with CL symbols in funcall's consp-based dispatch.
           (let ((env-form 'nil))
             (dolist (var (reverse captured-vars))
               (setq env-form (list 'cons var env-form)))
-            ;; Compile env-list into dest, save on stack
-            (compile-form env-form env dest)
-            (emit-ir :push dest)
-            ;; Load fn-addr into dest
-            (emit-ir :li-func dest lambda-name)
-            ;; Pop env-list into temp, cons fn-addr with env-list
-            (let ((env-reg (alloc-temp-reg)))
-              (emit-ir :pop env-reg)
-              (emit-ir :gc-check)
-              (emit-ir :cons dest dest env-reg)
-              (free-temp-reg)))))))
+            (compile-make-closure (list 'function lambda-name) env-form env dest))))))
 
 ;;; ============================================================
 ;;; Flet / Labels
@@ -4181,23 +4183,37 @@
       (when (= nargs 0)
         (emit-ir :mov +vreg-v0+ +vreg-vn+)))
     ;; Pop function address (on top of overflow args) and call indirect.
-    ;; Supports closure objects: if fn is a cons (fn-addr . env), extract
-    ;; fn-addr, store env at CLOSURE-ENV-ADDR, then call fn-addr.
+    ;; Supports closures: fn may be either a raw code address (fixnum-like)
+    ;; or a closure OBJECT (tag=object, subtag=#x52, 2 slots [fn-addr env-list]).
+    ;; Closure representation was a cons until the funcall-tag-collision bug
+    ;; forced a migration — see ansi-notes.md. We tag-check + subtag-check
+    ;; inline here; anything else falls through to direct call.
     (let ((fn-call-reg (alloc-temp-reg))
           (direct-call-label (make-compiler-label))
           (after-call-label (make-compiler-label)))
       (emit-ir :pop fn-call-reg)
-      ;; Check if fn-call-reg is a cons (closure object)
-      (let ((check-reg (alloc-temp-reg)))
-        (emit-ir :consp check-reg fn-call-reg)
-        (emit-ir :bnull check-reg direct-call-label)
-        (free-temp-reg))  ; free check-reg
+      ;; Detect closure object: must have object-tag AND subtag-closure.
+      (let ((check-reg (alloc-temp-reg))
+            (cmp-reg   (alloc-temp-reg)))
+        ;; obj-tag check first — skips non-objects (fixnums, immediates, cons
+        ;; cells) without dereferencing.
+        (emit-ir :obj-tag check-reg fn-call-reg)
+        (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+        (emit-ir :cmp check-reg cmp-reg)
+        (emit-ir :bne direct-call-label)
+        ;; Object-tag confirmed — now check subtag.
+        (emit-ir :obj-subtag check-reg fn-call-reg)
+        (emit-ir :li cmp-reg (ash +subtag-closure+ +fixnum-shift+))
+        (emit-ir :cmp check-reg cmp-reg)
+        (emit-ir :bne direct-call-label)
+        (free-temp-reg)   ; free cmp-reg
+        (free-temp-reg)) ; free check-reg
       ;; === Closure path ===
-      ;; Extract env = cdr(closure), fn-addr = car(closure)
+      ;; Slot 0 = fn-addr, slot 1 = env-list.
       (let ((env-reg (alloc-temp-reg))
             (addr-reg (alloc-temp-reg)))
-        (emit-ir :cdr env-reg fn-call-reg)     ; env = cdr(closure)
-        (emit-ir :car fn-call-reg fn-call-reg) ; fn-addr = car(closure)
+        (emit-ir :obj-ref env-reg fn-call-reg 1)
+        (emit-ir :obj-ref fn-call-reg fn-call-reg 0)
         ;; Store env at fixed CLOSURE-ENV-ADDR (raw u64 write)
         (emit-ir :li addr-reg +closure-env-addr+)
         (emit-ir :store addr-reg env-reg +width-u64+)
@@ -4509,23 +4525,7 @@
 ;;; ============================================================
 
 (defun compile-car (arg env dest)
-  "Compile (car x) -> MVM car instruction.
-   Compile-time check: (car 'A) for literal quoted non-list constants
-   emits (%signal-type-error).
-
-   Did NOT add runtime safety. Three attempts all regressed
-   catastrophically — 100-16k tests flipped to lost/fail even when
-   the emitted IR was semantically correct. Each attempt:
-   - `(let ((tmp arg)) (cond ((null tmp) nil) ((consp tmp) (%raw-car tmp))
-      (t (%signal-type-error))))` — -122 pass, +245 lost even with
-      only the null branch.
-   - Inline `bnull → done; consp tp dest; bnull tp err; :car; done; err:
-      call signal` — same damage.
-   - Inline without consp — `(car x)` guarded only by null check —
-      same 245+ lost tests, meaning the bug is NOT the consp branch.
-   Hypothesis: something in our stack/register state is disturbed
-   when a label-branch is inserted between the arg evaluation and
-   the :car IR. Needs deeper compiler instrumentation to root cause."
+  "Baseline — no null check."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
@@ -4535,9 +4535,7 @@
      (emit-ir :car dest dest))))
 
 (defun compile-cdr (arg env dest)
-  "Compile (cdr x) -> MVM cdr instruction. Same compile-time check as
-   compile-car for quoted-constant non-list args. See compile-car
-   comment for the runtime-safety history."
+  "Baseline — no null check."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
@@ -5577,6 +5575,40 @@
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
    Returns an uninitialized symbol object; caller stores name-hash in slot 0."
   (emit-ir :alloc-obj dest 1 +subtag-symbol+))
+
+(defun compile-make-closure (fn-form env-form env dest)
+  "Compile (%make-closure fn env) — allocate a 2-slot object with
+   closure subtag (#x52). Slot 0 = fn-addr (native code pointer),
+   slot 1 = env (arbitrary Lisp object, usually a list of captured
+   values). funcall detects closures by tag+subtag and extracts
+   the slots, so closures can never be mistaken for symbols (which
+   also happen to be cons-like) or any other value.
+
+   Emits:
+     compute fn    -> push
+     compute env   -> push
+     alloc-obj 2 #x52 into dest
+     pop env,  obj-set dest 1 env
+     pop fn,   obj-set dest 0 fn"
+  ;; Evaluate fn and env into temp slots, push.  Using push/pop
+  ;; instead of direct allocation ordering avoids stepping on the
+  ;; GC check that runs inside alloc-obj: env-form may call funcall
+  ;; which could trigger GC and invalidate the fresh closure pointer.
+  (let ((fn-temp  (alloc-temp-reg)))
+    (compile-form fn-form  env fn-temp)
+    (emit-ir :push fn-temp)
+    (free-temp-reg))
+  (let ((env-temp (alloc-temp-reg)))
+    (compile-form env-form env env-temp)
+    (emit-ir :push env-temp)
+    (free-temp-reg))
+  (emit-ir :alloc-obj dest 2 +subtag-closure+)
+  (let ((slot-temp (alloc-temp-reg)))
+    (emit-ir :pop slot-temp)                  ; env
+    (emit-ir :obj-set dest 1 slot-temp)
+    (emit-ir :pop slot-temp)                  ; fn
+    (emit-ir :obj-set dest 0 slot-temp)
+    (free-temp-reg)))
 
 (defun compile-make-bignum (dest)
   "Compile (%make-bignum) — allocate a 2-slot object with bignum subtag."

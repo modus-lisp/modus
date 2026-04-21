@@ -884,19 +884,20 @@
 ;;; Multi-value + incf test (debug for ANSI order tests)
 ;;; ============================================================
 
-;;; Override is-eql-p / is-not-eql-p from ansi-aux with closure-based versions.
-;;; These MUST be defined AFTER ansi-aux (last-defun-wins) to override the
-;;; aux version which uses real lambdas (not yet supported by auto-closure).
-;;; The closure helper functions (closure-eql-fn, closure-not-eql-fn) are
-;;; defined in ansi-bridge.lisp.
+;;; Override is-eql-p / is-not-eql-p from ansi-aux with closure-based
+;;; versions.  These MUST be defined AFTER ansi-aux (last-defun-wins)
+;;; to override the aux version which uses real lambdas (not yet
+;;; supported by auto-closure).  The closure helper functions
+;;; (closure-eql-fn, closure-not-eql-fn) are defined in cl-sequences.lisp.
+;;; Closures use the subtag-0x52 object representation (see %make-closure).
 (defun is-eql-p (x)
-  (cons #'closure-eql-fn (cons x nil)))
+  (%make-closure #'closure-eql-fn (cons x nil)))
 (defun is-not-eql-p (x)
-  (cons #'closure-not-eql-fn (cons x nil)))
+  (%make-closure #'closure-not-eql-fn (cons x nil)))
 
 (defun run-closure-test ()
-  ;; Test: is-eql-p returns a closure object (cons)
-  (deftest 2400 (consp (is-eql-p 'a)) t)
+  ;; Test: is-eql-p returns a closure object (subtag 0x52).
+  (deftest 2400 (= (obj-subtag (is-eql-p 'a)) #x52) t)
   ;; Test: funcall on closure works
   (deftest 2401 (funcall (is-eql-p 'a) 'a) t)
   (deftest 2402 (funcall (is-eql-p 'a) 'b) nil)

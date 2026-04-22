@@ -25,38 +25,38 @@ Relevant commits across these sessions:
   root cause of `(funcall 'sym …)` crashing through misdispatch.
   +352 passes across the two migrations.
 
-## Follow-up still pending: full consp-check in compile-car/cdr
+## SOLVED: compile-syscall3 V-reg clobber bug
 
-After the symbol+closure migrations, adding a runtime consp-check
-to compile-car/cdr (bnull null | consp tp | bnull tp err | :car |
-err-path: %signal-type-error) *still* regresses 16k tests.
-Investigation 2026-04-22:
+Root-caused the 16k-lost regression that appeared whenever
+compile-car/cdr emitted a runtime consp-check + signal branch.
 
-- Versions tested (stable baseline = null-only short-circuit):
-  1. null-only               → works (7048 pass).
-  2. null + consp + no err   → works but ~8m runtime (slow).
-  3. null + consp + err-call → catastrophic, parent dies ~1s.
+The bug was in `compile-syscall3`: it staged arg0..arg3 into fixed
+VRs V4-V7 and then MOV'd them into V0-V3 right before the trap.
+But it didn't bump `*temp-reg-counter*`, so a nested compile-form
+for a later arg — like reading a global variable, which goes through
+`compile-variable-ref → :call "SYMBOL-VALUE"` — reached
+compile-call's caller-save loop, which reads the temp counter to
+decide which of V5-V8 to push. Counter = 0, nothing pushed. Callee
+clobbered V5, and the pid that compile-syscall3 had just stored
+there (for the wait4 call in fork-file) was gone. strace saw
+`wait4(1867941892)` — the low bytes of a string pointer that
+SYMBOL-VALUE had left in V5.
 
-- strace of version 3 shows parent looping on
-  `wait4(1867941892, ...) = -1 ECHILD` — it's waiting on a nonsense
-  pid. Real child pids are ~3.2M, and the value 1867941892 = 0x6F5F5304
-  doesn't correspond to any tagged / untagged pid we can identify.
-  So parent's `pid` variable is getting clobbered between the
-  `syscall3 57 (fork)` and `syscall3 61 (wait4)` calls.
+The bug was LATENT in baseline: register allocation in SYMBOL-VALUE
+happened not to clobber V5. Adding a compile-car safe-path (which
+touches SYMBOL-VALUE's compiled body too, since it has car/cdr
+internally) shifted the allocator and surfaced the bug.
 
-- The only thing version 2 and version 3 differ on is the err-branch
-  body: `(compile-nil dest)` vs `(compile-form '(%signal-type-error)
-  env dest)`. The latter compiles to a funcall, which now (after
-  closure migration) emits obj-tag + obj-subtag checks inline at the
-  call site. That's the sequence that destabilizes.
+Fix: push each syscall3 arg onto the stack before compile-form'ing
+the next, pop into V0-V3 right before the trap. No more fixed-VR
+staging, no dependency on the temp counter being accurate across
+sub-compile-form calls.
 
-Hypothesis: the err-branch's compile-funcall emission (happening
-during compile-car called recursively from compile-form of fork-file
-itself) allocates temp regs / labels in a pattern that collides with
-fork-file's own frame slots for `pid`. Needs tracing of the IR
-emitted for fork-file specifically.
-
-Kept null-check-only to preserve stability.
+With the fix in place, the full consp-check version is stable —
+6984 pass vs 7048 baseline — so we lose 64 passes from legitimate
+tests that relied on `(car non-cons)` returning lax garbage. Keeping
+null-only for now to preserve those; the consp-check is ready to
+enable whenever we want strict ANSI semantics.
 
 Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own

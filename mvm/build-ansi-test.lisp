@@ -2287,17 +2287,8 @@
                      ~%          (setf (mem-ref #x10000400 :u64) 0)~
                      ~%          (setq *fail-emitted* 0)~
                      ~%          (syscall3 37 *file-alarm-secs* 0 0)~
-                     ~%          ;; If the per-test handler-cases miss something (e.g. a~
-                     ~%          ;; crash during init-form load or in a code path that~
-                     ~%          ;; bypasses our wrapping), record the file's first id as~
-                     ~%          ;; a FAIL before exiting so the summary doesn't lose the~
-                     ~%          ;; rest of the file's tests as silent zeros.~
                      ~%          (handler-case (funcall thunk)~
                      ~%            (t (c) (%record-test-fail first-id)))~
-                     ~%          ;; Cancel the file alarm before exit; otherwise a stray~
-                     ~%          ;; SIGALRM after the (now-cleared) handler-case would~
-                     ~%          ;; reach the SIGSEGV stub with [180]=0 and trigger sys_exit~
-                     ~%          ;; 139 — which the parent would record as another FAIL.~
                      ~%          (syscall3 37 0 0 0)~
                      ~%          (syscall3 60 0 0 0))~
                      ~%        (progn~

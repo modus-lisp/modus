@@ -4530,13 +4530,16 @@
    - Quoted non-list at compile time → signal at build.
    - Runtime: null short-circuits to nil via bnull.
 
-   Tried the full consp-check path (bnull null | consp tp | bnull tp err
-   | :car | err-branch: %signal-type-error) AFTER the symbol and closure
-   migrations made the consp check semantically safe. Unexpectedly
-   *still* regresses 16k tests. Forks produce interleaved stdout,
-   suggesting fork-file's wait4 is somehow not serializing children
-   when compile-call emits the safe sequence. Root cause beyond
-   reach right now — filed as follow-up. Null-check-only is stable."
+   A full consp-check + signal branch was attempted twice (once with
+   a gensym-let wrapper, once inline with alloc-temp-reg). Both caused
+   the parent process to exit with `wait4(pid) = -1 ECHILD` — parent's
+   `pid` variable somehow loses its real value between the fork and
+   the wait. Strace shows parent calling wait4 with pid=1867941892
+   (not a real pid). Root cause is elsewhere in the translator, not
+   in compile-car itself — null-check + :consp + branch is
+   semantically fine, so this is a follow-up investigation: likely
+   a register/spill interaction that clobbers the fork-file frame
+   when compile-car emits multiple IR branches in the same function."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))

@@ -29,14 +29,34 @@ Relevant commits across these sessions:
 
 After the symbol+closure migrations, adding a runtime consp-check
 to compile-car/cdr (bnull null | consp tp | bnull tp err | :car |
-err-path: %signal-type-error) *still* regresses 16k tests. The
-failure mode is unusual: isolated forks (run with skip-below /
-run-only-below to run just one file) complete cleanly, but the
-full run produces interleaved stdout suggesting fork-file's wait4
-isn't serializing children. Null-check-only works fine. Something
-about the specific IR sequence when applied across 500+ files
-disturbs the parent/child fork lifecycle in a way that needs fresh
-investigation. Kept null-check-only to preserve stability.
+err-path: %signal-type-error) *still* regresses 16k tests.
+Investigation 2026-04-22:
+
+- Versions tested (stable baseline = null-only short-circuit):
+  1. null-only               → works (7048 pass).
+  2. null + consp + no err   → works but ~8m runtime (slow).
+  3. null + consp + err-call → catastrophic, parent dies ~1s.
+
+- strace of version 3 shows parent looping on
+  `wait4(1867941892, ...) = -1 ECHILD` — it's waiting on a nonsense
+  pid. Real child pids are ~3.2M, and the value 1867941892 = 0x6F5F5304
+  doesn't correspond to any tagged / untagged pid we can identify.
+  So parent's `pid` variable is getting clobbered between the
+  `syscall3 57 (fork)` and `syscall3 61 (wait4)` calls.
+
+- The only thing version 2 and version 3 differ on is the err-branch
+  body: `(compile-nil dest)` vs `(compile-form '(%signal-type-error)
+  env dest)`. The latter compiles to a funcall, which now (after
+  closure migration) emits obj-tag + obj-subtag checks inline at the
+  call site. That's the sequence that destabilizes.
+
+Hypothesis: the err-branch's compile-funcall emission (happening
+during compile-car called recursively from compile-form of fork-file
+itself) allocates temp regs / labels in a pattern that collides with
+fork-file's own frame slots for `pid`. Needs tracing of the IR
+emitted for fork-file specifically.
+
+Kept null-check-only to preserve stability.
 
 Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own

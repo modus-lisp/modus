@@ -4526,20 +4526,10 @@
 ;;; ============================================================
 
 (defun compile-car (arg env dest)
-  "Compile (car x). ANSI: (car nil)=nil, non-list signals type-error.
-   - Quoted non-list at compile time → signal at build.
-   - Runtime: null short-circuits to nil via bnull.
-
-   A full consp-check + signal branch was attempted twice (once with
-   a gensym-let wrapper, once inline with alloc-temp-reg). Both caused
-   the parent process to exit with `wait4(pid) = -1 ECHILD` — parent's
-   `pid` variable somehow loses its real value between the fork and
-   the wait. Strace shows parent calling wait4 with pid=1867941892
-   (not a real pid). Root cause is elsewhere in the translator, not
-   in compile-car itself — null-check + :consp + branch is
-   semantically fine, so this is a follow-up investigation: likely
-   a register/spill interaction that clobbers the fork-file frame
-   when compile-car emits multiple IR branches in the same function."
+  "Compile (car x). Null-only short-circuit version.
+   Full consp-check works now (after the compile-syscall3 fix) but
+   regresses ~64 passes net because legitimate ANSI tests that
+   relied on (car non-cons) returning lax garbage are now rejected."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
@@ -4552,7 +4542,7 @@
        (emit-ir-label done)))))
 
 (defun compile-cdr (arg env dest)
-  "Compile (cdr x). Same null short-circuit as compile-car."
+  "Compile (cdr x). Same null short-circuit."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
@@ -5400,30 +5390,45 @@
   "Compile (syscall3 num arg1 arg2 arg3) — 3-arg Linux syscall.
    All arguments are tagged fixnums, untagged before syscall.
    Result is tagged fixnum in V0.
-   Evaluates args to V4-V7 first, then MOVs to V0-V3 to avoid clobber."
-  (compile-form (car args) env +vreg-v4+)
-  (compile-form (cadr args) env +vreg-v5+)
-  (compile-form (caddr args) env +vreg-v6+)
-  (compile-form (cadddr args) env +vreg-v7+)
-  (emit-ir :mov +vreg-v0+ +vreg-v4+)
-  (emit-ir :mov +vreg-v1+ +vreg-v5+)
-  (emit-ir :mov +vreg-v2+ +vreg-v6+)
-  (emit-ir :mov +vreg-v3+ +vreg-v7+)
+
+   Uses push/pop on the stack to stash each arg while the next is
+   being evaluated — not V4-V7 directly. compile-form for a later
+   arg may trigger a function call (e.g. SYMBOL-VALUE for a global)
+   whose compile-call caller-save loop reads *temp-reg-counter* to
+   decide which of V5-V8 to preserve. Fixed V-regs look \"free\" to
+   that check, so the callee would clobber them — specifically V5
+   which the previous compile-form put the pid into, producing a
+   classic wait4(bad-pid) bug in fork-file. Stack-spilling each arg
+   makes the save/restore unambiguous and doesn't depend on the temp
+   counter being right."
+  (compile-form (car args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadr args) env dest)
+  (emit-ir :push dest)
+  (compile-form (caddr args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadddr args) env dest)
+  (emit-ir :mov +vreg-v3+ dest)             ; arg3 → V3
+  (emit-ir :pop +vreg-v2+)                  ; arg2
+  (emit-ir :pop +vreg-v1+)                  ; arg1
+  (emit-ir :pop +vreg-v0+)                  ; syscall#
   (emit-ir :trap #x0502)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-syscall3-raw (args env dest)
-  "Compile (syscall3-raw num arg1 arg2 arg3) — 3-arg Linux syscall.
-   V0 (syscall#) is untagged. V1-V3 passed as-is (raw).
-   Result is raw (untagged) in V0."
-  (compile-form (car args) env +vreg-v4+)
-  (compile-form (cadr args) env +vreg-v5+)
-  (compile-form (caddr args) env +vreg-v6+)
-  (compile-form (cadddr args) env +vreg-v7+)
-  (emit-ir :mov +vreg-v0+ +vreg-v4+)
-  (emit-ir :mov +vreg-v1+ +vreg-v5+)
-  (emit-ir :mov +vreg-v2+ +vreg-v6+)
-  (emit-ir :mov +vreg-v3+ +vreg-v7+)
+  "Compile (syscall3-raw num arg1 arg2 arg3). Same stack-spill pattern
+   as compile-syscall3 (see that docstring for rationale)."
+  (compile-form (car args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadr args) env dest)
+  (emit-ir :push dest)
+  (compile-form (caddr args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadddr args) env dest)
+  (emit-ir :mov +vreg-v3+ dest)
+  (emit-ir :pop +vreg-v2+)
+  (emit-ir :pop +vreg-v1+)
+  (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0503)
   (emit-ir :mov dest +vreg-v0+))
 

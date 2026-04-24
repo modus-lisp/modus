@@ -28,7 +28,12 @@
       (subseq text 0 (read-sequence text s)))))
 
 (defun mvm-text (relative-path)
-  (read-file-text (merge-pathnames relative-path *modus-base*)))
+  "Read a first-party source file as text, verifying it parses cleanly
+   first. A paren mismatch here fails fast at the specific file instead
+   of getting silently skipped later during the concatenated compile."
+  (let ((path (merge-pathnames relative-path *modus-base*)))
+    (modus.mvm::check-parses path)
+    (read-file-text path)))
 
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
@@ -1879,7 +1884,20 @@
                        (id-end (position #\Space form-str :start (1+ id-start)))
                        (id-num (parse-integer form-str :start (1+ id-start) :end id-end :junk-allowed t)))
                   (if id-num
-                      (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%" form-str id-num)
+                      ;; Known uncatchable-hang tests that SIGALRM doesn't
+                      ;; kill cleanly (each wastes 45s per file alarm when
+                      ;; left alone).  The shm fork-recovery handles most
+                      ;; SIGSEGV-style crashes now, but these are true
+                      ;; infinite loops that consume wallclock until kill.
+                      ;; 13567..13577 = expt.18..28 + gcd.4 etc. (float /
+                      ;;                 random-iter hangs)
+                      ;; 25630       = typep.19 (typep.19-fn 1000)
+                      (cond
+                        ((or (and (>= id-num 13567) (<= id-num 13577))
+                             (= id-num 25630))
+                         (format out "  (%test-crash-fail ~D) ; skipped: uncatchable hang~%" id-num))
+                        (t
+                         (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%" form-str id-num)))
                       (format out "  (handler-case ~A (t (c) nil))~%" form-str))))
               (format out ")~%")
               (setf *real-ansi-sources*
@@ -2251,51 +2269,122 @@
                      ~%;; the handler triggers a cascade that kills the whole file's fork — losing~
                      ~%;; every remaining test.~
                      ~%(defun %test-crash-fail (id) (%record-test-fail id))~
+                     ~%;; Shared-memory slot for parent/child recovery.~
+                     ~%;; *fork-shm-addr* holds a tagged mmap'd address (4K page)~
+                     ~%;; mapped with MAP_SHARED|MAP_ANONYMOUS so writes from the~
+                     ~%;; forked child survive its death and can be read by the~
+                     ~%;; parent after wait4.  Offset 0 is the u32 \"last-attempted~
+                     ~%;; test id\" — written by run-test before each test so the~
+                     ~%;; parent knows exactly where the child crashed.~
+                     ~%(defvar *fork-shm-addr* 0)~
+                     ~%(defun %init-fork-shm ()~
+                     ~%  (setq *fork-shm-addr* (%mmap-shared-page 4096))~
+                     ~%  (setf (mem-ref *fork-shm-addr* :u32) 0))~
+                     ~%(defun %fork-set-last-id (id)~
+                     ~%  (when (> *fork-shm-addr* 0)~
+                     ~%    (setf (mem-ref *fork-shm-addr* :u32) id)))~
+                     ~%(defun %fork-get-last-id ()~
+                     ~%  (if (> *fork-shm-addr* 0)~
+                     ~%      (mem-ref *fork-shm-addr* :u32)~
+                     ~%      0))~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
+                     ~%  (%fork-set-last-id id)~
                      ~%  (handler-case (rt-run-test id (funcall thunk) expected)~
                      ~%    (t (c) (%record-test-fail id))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
+                     ~%  (%fork-set-last-id id)~
                      ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%    (t (c) (%record-test-fail id))))~
                      ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~
                      ~%(defvar *wstatus-addr* #x100001A0)~
                      ~%;; Per-FILE fork: parent forks, child runs the file's run-ansi-X~
                      ~%;; in-process (with run-test handling per-test crashes), then exits.~
-                     ~%;; If the child exit status is nonzero (signal kill or our SIGSEGV~
-                     ~%;; sys_exit path), parent records a single FAIL with the file's~
-                     ~%;; first test id so it isn't double-counted as 'lost to crash'.~
-                     ~%;; Per-file wall-clock cap (seconds). SIGALRM has no handler,~
-                     ~%;; so an over-time child is hard-killed by the kernel and the~
-                     ~%;; parent records a single FAIL with the file's first id.~
+                     ~%;; If the child exit status is nonzero, the parent re-forks~
+                     ~%;; with *skip-below* advanced past the last test the child~
+                     ~%;; attempted (read from the shared-memory slot), so a single~
+                     ~%;; uncatchable per-test crash doesn't sink the whole file.~
                      ~%(defvar *file-alarm-secs* 45)~
-                     ~%(defun fork-file (first-id thunk)~
-                     ~%  (let ((pid (syscall3 57 0 0 0)))~
-                     ~%    (if (= pid 0)~
-                     ~%        (progn~
-                     ~%          ;; Clear inherited handler-case saved-RSP at 0x10000180~
-                     ~%          ;; (moved from 0x10000140 to avoid closure-env-addr collision).~
-                     ~%          ;; If we don't clear, a SIGSEGV in the child BEFORE its own~
-                     ~%          ;; handler-case setjmp would longjmp using the parent's stale~
-                     ~%          ;; RSP/RBP/IP — jumping to garbage and killing the fork silently.~
-                     ~%          (setf (mem-ref #x10000180 :u64) 0)~
-                     ~%          ;; Reset the handler-stack depth too (forks inherit any~
-                     ~%          ;; outer handler-case frames the parent had pushed).~
-                     ~%          (setf (mem-ref #x10000400 :u64) 0)~
-                     ~%          (setq *fail-emitted* 0)~
-                     ~%          (syscall3 37 *file-alarm-secs* 0 0)~
-                     ~%          (handler-case (funcall thunk)~
-                     ~%            (t (c) (%record-test-fail first-id)))~
-                     ~%          (syscall3 37 0 0 0)~
-                     ~%          (syscall3 60 0 0 0))~
-                     ~%        (progn~
-                     ~%          (setf (mem-ref *wstatus-addr* :u32) 0)~
-                     ~%          (syscall3 61 pid *wstatus-addr* 0)~
-                     ~%          (when (> (mem-ref *wstatus-addr* :u32) 0)~
-                     ~%            (%record-test-fail first-id))))))~%")
+                     ~%(defvar *fork-retry-cap* 256)~
+                     ~%(defvar *no-progress-cap* 4)~
+                     ~%(defun %stamp-remaining-fails (first-id last-id)~
+                     ~%  ;; Stamp every id in [max(skip-below, first-id) .. last-id] as FAIL~
+                     ~%  ;; so they count as crashed rather than silently lost.~
+                     ~%  (when (> last-id 0)~
+                     ~%    (let ((i (if (> *skip-below* first-id) *skip-below* first-id)))~
+                     ~%      (loop~
+                     ~%        (when (> i last-id) (return nil))~
+                     ~%        (%record-test-fail i)~
+                     ~%        (setq i (+ i 1))))))~
+                     ~%(defun fork-file (first-id last-id thunk)~
+                     ~%  ;; Reset skip-below to first-id at entry so an earlier chunk's~
+                     ~%  ;; terminal skip value can't silently suppress this chunk's tests.~
+                     ~%  (when (and (> first-id 0) (> *skip-below* first-id))~
+                     ~%    (setq *skip-below* first-id))~
+                     ~%  (let ((saved-skip *skip-below*)~
+                     ~%        (done nil)~
+                     ~%        (tries 0)~
+                     ~%        (no-progress 0))~
+                     ~%    (loop~
+                     ~%      (when done (return nil))~
+                     ~%      (when (>= tries *fork-retry-cap*)~
+                     ~%        (%stamp-remaining-fails first-id last-id)~
+                     ~%        (return nil))~
+                     ~%      (when (>= no-progress *no-progress-cap*)~
+                     ~%        ;; Init-crash or hang — don't burn alarm budget further.~
+                     ~%        (%stamp-remaining-fails first-id last-id)~
+                     ~%        (return nil))~
+                     ~%      (setq tries (+ tries 1))~
+                     ~%      (%fork-set-last-id 0)~
+                     ~%      (let ((pid (syscall3 57 0 0 0)))~
+                     ~%        (if (= pid 0)~
+                     ~%            (progn~
+                     ~%              (setf (mem-ref #x10000180 :u64) 0)~
+                     ~%              (setf (mem-ref #x10000400 :u64) 0)~
+                     ~%              (setq *fail-emitted* 0)~
+                     ~%              (syscall3 37 *file-alarm-secs* 0 0)~
+                     ~%              (handler-case (funcall thunk)~
+                     ~%                (t (c) (%record-test-fail first-id)))~
+                     ~%              (syscall3 37 0 0 0)~
+                     ~%              (syscall3 60 0 0 0))~
+                     ~%            (progn~
+                     ~%              (setf (mem-ref *wstatus-addr* :u32) 0)~
+                     ~%              (syscall3 61 pid *wstatus-addr* 0)~
+                     ~%              (let ((wstat (mem-ref *wstatus-addr* :u32))~
+                     ~%                    (child-last (%fork-get-last-id)))~
+                     ~%                (cond~
+                     ~%                  ;; Child crashed AND pinned a last-id beyond skip-below~
+                     ~%                  ((and (> wstat 0) (> child-last 0) (> child-last *skip-below*))~
+                     ~%                   (%record-test-fail child-last)~
+                     ~%                   (setq *skip-below* (+ child-last 1))~
+                     ~%                   (setq no-progress 0)~
+                     ~%                   (when (and (> last-id 0) (> *skip-below* last-id))~
+                     ~%                     (setq done t)))~
+                     ~%                  ;; Child crashed without pinning a new id — advance~
+                     ~%                  ((> wstat 0)~
+                     ~%                   (setq no-progress (+ no-progress 1))~
+                     ~%                   (if (<= last-id 0)~
+                     ~%                       (progn (%record-test-fail first-id)~
+                     ~%                              (setq done t))~
+                     ~%                       (let ((sb (if (> *skip-below* first-id)~
+                     ~%                                     *skip-below*~
+                     ~%                                     first-id)))~
+                     ~%                         (%record-test-fail sb)~
+                     ~%                         (setq *skip-below* (+ sb 1))~
+                     ~%                         (when (> *skip-below* last-id)~
+                     ~%                           (setq done t)))))~
+                     ~%                  ;; Child exited cleanly but ran zero tests (thunk was~
+                     ~%                  ;; a no-op — bad compilation of TYPECASE/PPRINT/etc).~
+                     ~%                  ;; Stamp all remaining so the chunk isn't silently lost.~
+                     ~%                  ((and (= wstat 0) (= child-last 0) (> last-id 0))~
+                     ~%                   (%stamp-remaining-fails first-id last-id)~
+                     ~%                   (setq done t))~
+                     ~%                  ;; Child exited cleanly with progress — normal end.~
+                     ~%                  (t (setq done t))))))))~
+                     ~%    (setq *skip-below* saved-skip)))~%")
                    (with-output-to-string (s)
                      ;; Helper: return T iff the active shard range [skip..run-only)
                      ;; overlaps [first..last]. Run-only=0 means "no upper bound".
@@ -2315,10 +2404,17 @@
                            (cond
                              ((and first-id last-id)
                               (format s "  (when (%ansi-file-in-range ~D ~D)~%" first-id last-id)
-                              (format s "    (fork-file ~D (lambda () (run-ansi-~A))))~%" first-id name))
+                              (format s "    (fork-file ~D ~D (lambda () (run-ansi-~A))))~%" first-id last-id name))
                              (t
-                              (format s "  (fork-file 0 (lambda () (run-ansi-~A)))~%" name))))))
+                              (format s "  (fork-file 0 0 (lambda () (run-ansi-~A)))~%" name))))))
                      (format s ")~%"))))
+
+;; Dump file → id-range map to /tmp so post-mortem analysis of a test
+;; run can map T:/FAIL ids back to source files. Small side effect;
+;; useful for lost-test hunts.
+(with-open-file (s "/tmp/ansi-file-ranges.txt" :direction :output :if-exists :supersede)
+  (dolist (entry (reverse *ansi-file-ranges*))
+    (format s "~D ~D ~A~%" (second entry) (or (third entry) -1) (first entry))))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  rt: ~D chars~%" (length *rt-source*))
@@ -2519,6 +2615,10 @@
   (write-string-serial \"ANSI-TOTAL=\")
   (print-dec ~~ANSI-EXP-TOTAL~~)
   (write-char-serial 10)
+
+  ;; Allocate the parent/child shared-memory page used by fork-file's
+  ;; re-fork loop before any file forks start.
+  (%init-fork-shm)
 
   ;; Run real ANSI tests (generated at build time)
   (run-real-ansi-tests)

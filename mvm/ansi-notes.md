@@ -1,6 +1,39 @@
 # ANSI test notes — session log
 
-State as of last session: **~7048 passes / ~9429 fails / ~1215 lost**
+State as of last session: **7542 passes / 10551 fails / 0 lost**
+(was 7048 / 9429 / 1215 at session start). Net
+**+494 passes / +1122 fails / −1215 lost** across five wins:
+- Paren-bug fix in `%format-impl`: +23 passes, -111 lost
+- `extended-char.3` fork-crash workaround: +97 passes, -133 lost
+  (now subsumed by generic shm fork recovery — workaround removed)
+- Package-system unlock (MAKE-PACKAGE/FIND-PACKAGE/EXPORT/etc. no
+  longer compile to no-ops): +65 passes, -150 lost
+- Shared-memory parent-child fork recovery (`%mmap-shared-page`
+  + re-fork loop in fork-file): recovered ~820 previously-lost
+  tests.
+- **Lost → 0**: fork-file now passes chunk last-id in, bumps
+  retry-cap to 256, adds no-progress-cap=4 to bail on init-crashes
+  without burning alarm budget, stamps all remaining chunk IDs as
+  FAIL when giving up, and — critically — detects "child exited
+  cleanly but ran zero tests" (silent thunk no-op from broken
+  TYPECASE/PPRINT compilation) and stamps those too. Recovered
+  14 chunks (print-array, format-t, typecase, etypecase, ctypecase,
+  pprint-tab, pprint-newline, pprint-tabular, print-unreadable-object,
+  pprint, prin1, princ, prin1-to-string, princ-to-string — 221 tests)
+  plus the partial-loss chunks (loop13/loop6/adjust-array/elt/etc.).
+
+The three "lost" IDs reported by range-based analysis (12372, 24909,
+24910) are phantom — the build counter advances past IDs that never
+get a deftest emitted, so they exist in `/tmp/ansi-file-ranges.txt`
+but there's no corresponding test to run.
+
+Measured 2026-04-24. Raw `grep -c '^P:'` reports 7669; 127 duplicates
+across re-forks → 7542 unique. Fails: 11119 raw → 10551 unique.
+Pass rate of tests that ran cleanly: 7542/(7542+1916 real fails)
+= **79.8%**. The remaining 8747 "crash fails" are runtime SIGSEGVs —
+the next attack surface.
+
+Historical:
 (+460 passes and +126 lost since 6588 / ~10000 / 1089 at the start
 of the multi-session run; run-to-run variance is ±20 via SIGALRM
 timing).
@@ -62,44 +95,274 @@ Starting point for next session: `git log --oneline` for the
 handoff-chain commits — they're self-contained and explain their own
 rationale. This doc is the shared context.
 
-## NEW gotcha: MVM miscompiles late cond branches (IN LARGE FUNCTIONS)
+## Lost-test hunt: extended-char.3 workaround (+97 passes)
 
-As of 2026-04 the MVM compiler silently stops matching cond branches
-beyond an (unknown) threshold clause count in **sufficiently large
-functions**. Symptom: for a branch `((= dir <N>) ...)` sitting deep in
-a long cond, the body never executes even when dir equals N. A
-standalone `(= dir N)` test in arbitrary code still returns T — so
-the bug is in cond-dispatch code generation interacting with function
-size, not in = on fixnums.
+**Current: 7168 passes, 9553 fails, 971 lost.** Baseline was 7071/9517/1104.
 
-### What tried to isolate it (all pass, none reproduce the bug)
+### Finding the biggest loss
 
-- 30-clause `(= dir N)` cond in a trivial function.
-- Same cond with `or`-heavy clauses mirroring %format-impl's shape.
-- Same cond inside outer let/loop/if with many locals.
-- "Bulked-up" function: full param parser + modifier parser + 25-clause
-  cond with substantial bodies.
+Used the output post-processor to enumerate T: id gaps. Each first-party
+ANSI file's fork records ONE `FAIL <first-id>` sentinel on death; tests
+in that file with no `T:<id>` line are lost. The largest gap (115
+tests) sat in `characters/character.lsp`, IDs 16499..16622.
 
-All of those work correctly. Only `%format-impl` exhibits the bug. It
-shares the same shape as the bulked-up reproducer but is larger — the
-trigger seems to be cumulative function size / IR instruction count
-past some threshold, at which point the register allocator or spill
-logic flips.
+### Narrowing to the crasher
 
-This is the same "compile-state flip" that CLAUDE.md documents for
-run-cl-loop-tests: "Adding too many deftest forms ... makes some
-passing tests start crashing — even ones that have nothing to do with
-the new tests." Same root cause, different symptom.
+Added per-test `B:<id>` markers just before the outer `handler-case`
+entry for tests in the suspect range 16505..16520. Output showed:
 
-### Workaround
+    B:16509 → FAIL 16509        ; outer handler caught (expected)
+    B:16510 → (then nothing)    ; handler entered but didn't return
+    FAIL 16499                  ; fork-death sentinel
 
-Hoist frequently-missed branches to the top of the cond. See the `~{`
-/ `~^` handling in `%format-impl` for an example plus a `NOTE:`
-comment flagging the reordering. Also consider factoring very large
-functions into helpers so each stays under the threshold.
+Then split the marker in two (one before `handler-case`, one inside
+the thunk after setjmp):
 
-If you add a new cond branch to a long dispatch in a complex function
-and it seems to never fire, this is the first thing to check.
+    B1 → B2 → (nothing)         ; thunk entered, body crashed
+
+So `(extended-char.3.body)` is the culprit. Neither the inner nor
+outer handler-case catches it; the fork dies.
+
+### The workaround
+
+In `mvm/build-ansi-test.lisp`, replaced the wrapper for id 16510 with
+a bare `(%test-crash-fail 16510)` (no `handler-case`, no `run-test`
+call). The file's fork now records the pre-stamped FAIL for 16510 and
+continues into tests 16511..16622. 113 downstream tests recovered +
+some side-effect passes elsewhere = +97 passes / -133 lost.
+
+### Root cause: still open
+
+`extended-char.3.body` is:
+
+    (loop for i from 0 below (min 65536 char-code-limit)
+          for c = (code-char i)
+          unless (not (and (typep c 'base-char)
+                           (typep c 'extended-char)))
+          collect (char-name c))
+
+With `char-code-limit` set to 256 and both type predicates never
+simultaneously true (our `typep` correctly returns NIL for
+`'extended-char`), the loop should produce `()` without ever
+consing anything. Standalone reproducer with stubs doesn't crash.
+Standalone with real typep + char-name from a fresh MVM build
+crashed — but that was because typep was unresolved and
+CALL-INDIRECT'd on poison. In the ANSI build, typep is resolved
+and the crash is real but the diagnosis path stalls here.
+
+Hypothesis: GC interaction. The loop creates a long-lived `result`
+list accumulator + short-lived `c` chars; if GC triggers mid-loop
+from an unrelated allocation and has a bug in the specific state
+left by this body, the fork could segfault inside the collector in
+a way the SIGSEGV → longjmp handler can't recover from. Confirmation
+would need core-dump analysis or GDB on the child fork.
+
+### Attempts to skip other first-test-crashing files (didn't pan out)
+
+Added an `I:<first-id>` diagnostic after init forms so we could tell
+init-dying files from first-test-dying files. Categorizer found 10
+"init OK, first test dies" candidates (loop7, format-ampersand,
+defmethod, array-as-class, set-syntax-from-char, acosh,
+update-instance-for-different-class, subtypep-function,
+defclass-forward-reference, unbound-slot).
+
+Result: stamping FAIL for the first test of each of those files and
+re-measuring, only format-ampersand got any recovery (9 tests ran, 3
+passes). The other 9 files recovered nothing — the "first-test dies"
+classification was wrong (the `I:<first-id>` actually coincides with
+the first test's `T:<first-id>`, so the marker succeeded but the
+first test's body still crashed uncatchably). Net effect vs pure
+16510-only baseline was about -13 passes, within run-to-run variance.
+
+Skipping expt.18..28 (13567..13577) and typep.19 (25630) was also
+tried — they're slow infinite-loops that eventually die to SIGALRM
+at 45s each. Saves wall-clock but no passes; skip wasn't worth the
+complexity. Reverted.
+
+**Current skip list: just 16510.** +97 passes, -133 lost vs the
+7071 baseline that preceded the paren fix.
+
+### Next fork-death gaps (unskipped, for future hunts)
+
+Files where the fork dies during init-or-first-test (no `T:` in
+range) and no simple skip helps:
+
+| File                  | Lost  |
+|-----------------------|-------|
+| format-circumflex     | ~250  |
+| syntax                | ~141  |
+| nsubstitute-if-not    | ~116  |
+| make-array            | ~114  |
+| substitute-if-not     | ~114  |
+| format-brace          |  ~96  |
+| string-comparisons    |  ~95  |
+| number-comparison     |  ~94  |
+| adjust-array          |  ~87  |
+| count-if-not          |  ~80  |
+
+A generic auto-recovery (parent re-forks with `*skip-below*` after a
+child dies) would require parent/child shared memory so the parent
+can read the last-attempted test id. MVM has `syscall3` but not
+`syscall6`; the cleanest route is a pipe-based channel (`syscall 22 =
+pipe` takes one arg, fits `syscall3`). Child writes test id after
+each `T:` emit; parent reads all buffered data after `wait4` returns
+non-zero. Deferred.
+
+## SOLVED: Package functions compiled to no-ops (+65 passes)
+
+`mvm/compiler.lisp` had a special-dispatch at the top of
+`compile-compound` that turned every call to `MAKE-PACKAGE`,
+`FIND-PACKAGE`, `FIND-SYMBOL`, `EXPORT`, `IMPORT`, `SHADOW`, and
+`USE-PACKAGE` into `(compile-nil dest)` — a hard-coded NIL. Next to
+them were `PROVIDE` / `REQUIRE` / `PROCLAIM` / `DECLAIM`, which
+genuinely have no runtime implementation and should stay as no-ops.
+
+The grouping was wrong: the package functions all have real defuns in
+`mvm/cl-packages.lisp`. Falling through to `compile-call` (the default)
+makes those real defuns get invoked, at which point the package
+system actually functions — `*all-packages*` populates, `find-package
+"COMMON-LISP"` returns a package object, etc.
+
+Removed the package functions from the no-op list, kept
+`PROVIDE/REQUIRE/PROCLAIM/DECLAIM`. +65 passes concentrated in
+files that genuinely exercise the package system: syntax (+16),
+find-package (+12), package-name (+10), find-symbol (+9), format-x
+(+9), make-package (+5), package-nicknames (+5), etc. 43 tests
+regressed (mostly format-d, gentemp, in-package) because some
+downstream code was relying on the silent-nil behavior.
+
+### What didn't help: `*pkg-hash-to-name*` for native MVM symbols
+
+ANSI tests pass designators like `'common-lisp` as the package arg
+to `find-package`. That quoted symbol compiles to a native MVM symbol
+(subtag 0x50 object with just a hash at slot 0 — no stored name).
+`%pkg-string-designator` can't recover the string "COMMON-LISP" from
+just the hash, so `find-symbol "&OPTIONAL" 'common-lisp` always
+returns `(values nil nil)` and cl-symbols.lsp (978 tests) keeps
+failing.
+
+Tried: build a hash→name map in `make-package` so native symbols
+with matching hashes can resolve. The runtime's `compute-name-hash`
+had to match the build-time algorithm (added an equivalent `defun`
+in `mvm/prelude.lisp`). Got hashes matching — but the subsequent
+`find-symbol` path introduced an uncatchable crash somewhere in
+the resolve chain, so reverted.
+
+A cleaner fix would be to extend native MVM symbols to carry their
+name string at allocation time (requires layout change to
+subtag-0x50 objects and the compile-quote emission path). Deferred.
+
+## SOLVED: "late-cond-branch miscompilation" was a paren bug
+
+Turns out this wasn't a compiler bug at all — it was a mis-counted
+paren in `%format-impl`'s `~( ~)` clause.
+
+### How it masqueraded as a compiler bug
+
+The `~( ~)` clause had one missing `)` inside its body (specifically
+at the close of `(%print-string-raw converted stream)` — the sequence
+of trailing `))` needed to be `)))` to close LET-CONVERTED, LET-RESULT,
+AND LET-SUB-S2). The `%format-impl` function was "balanced" overall
+because two extra `)` at the very end of the function absorbed the
+stray opens. SBCL's `READ` actually errors on this file with "unmatched
+close parenthesis" — but the MVM reader is more forgiving and
+processed the structure in its miscounted form.
+
+The net effect of the off-by-one: every `cond` clause after `~( ~)` —
+`~[`, `~{`, `~}`, `~^`, `~_`, `~I`, `~/`, and the `(t ...)` default —
+ended up as body forms of the `~( ~)` clause, not sibling clauses of
+the outer cond. The outer cond looked like:
+
+    (cond (...)                ; ~A through ~(
+          ((or (= dir 40) (= dir 41))
+           (when ...)           ; real ~( body
+           ((or (= dir 91) ...)    ; absorbed as a second body form of ~(
+            (when ...) ...)
+           ((= dir 123) (let ...)) ; absorbed as a third body form
+           ...))
+
+So when `compile-if` compiled the `~( ~)` clause, it passed those
+"extra body forms" to `compile-progn`. `compile-progn` iterated over
+them and called `compile-form` on each, which fell into
+`compile-compound`. Each "form" looked like `((= dir 123) (let ...))`
+— a list-headed form. That matches the `(null op-name)` branch of
+`compile-compound`, which hands off to `compile-call` with the LIST
+as the "function" and the body as a single argument. `compile-call`
+then goes to its last branch (not a symbol, not a `(setf name)` form)
+and emits `:call-indirect` on whatever `(= dir N)` evaluates to.
+Since `(= dir N)` evaluates to T or NIL, the runtime called through
+T or NIL as if they were code — which failed silently.
+
+That's why the symptom presented as "late clauses never match":
+- The test compiled as a normal equality producing T/NIL.
+- The body was then indirect-called through that T/NIL.
+- CALL-INDIRECT(T, 1) and CALL-INDIRECT(NIL, 1) do nothing observable.
+- So `cond` fell through every "clause" after `~( ~)` without running
+  any body.
+
+### How we found it
+
+1. `ansi-notes` sentinel bisection showed the cutoff was at cond
+   position 19 (the `~( ~)` clause) — replacing that body with `nil`
+   fixed every downstream clause. That localized it to `~(`.
+2. Dumped `%format-impl`'s IR to `/tmp/format-impl-ir.txt` and saw
+   `:CALL-INDIRECT` instructions where `:BNULL` dispatches should have
+   been. Each CALL-INDIRECT was preceded by a compile-eq pattern
+   (CMP/BEQ + T/NIL materialization), confirming the T/NIL value was
+   being CALLED.
+3. Only three sites emit `:call-indirect`. Logged `fn` and `args`
+   at the `compile-call` fallback for `%format-impl` and saw:
+
+       FALLBACK-INDIRECT fn=(OR (= DIR 91) (= DIR 93)) nargs=1
+         args=((WHEN (= DIR 91) ...))
+       FALLBACK-INDIRECT fn=(= DIR 123) nargs=1
+         args=((LET ((NEW-I-AND-ARGS ...)) ...))
+       FALLBACK-INDIRECT fn=(= DIR 125) nargs=1 args=(NIL)
+       ...
+
+   Each "fn" was a cond-clause test and each "args" was that clause's
+   body — i.e., the cond clauses were being compiled as function
+   calls.
+4. `sb-debug:print-backtrace` at the fallback showed the caller was
+   `COMPILE-PROGN` with a form list containing the remaining cond
+   clauses. The enclosing frame was `COMPILE-IF` handling the `~(`
+   test — so the cond clauses after `~(` had been absorbed into `~(`'s
+   `then` branch.
+5. Python paren-balance checker on `mvm/cl-printer.lisp` reported
+   `final depth: -1` — confirming one paren was off.
+6. Line-by-line depth trace showed the depth at the end of the `~(`
+   clause was `1` instead of `0`, with one missing close on the line
+   `(%print-string-raw converted stream)))`.
+
+### The fix
+
+`mvm/cl-printer.lisp`:
+- Add the missing `)` after `(%print-string-raw converted stream))))`
+  so `LET-CONVERTED / LET-RESULT / LET-SUB-S2` all close in the
+  intended place.
+- Remove the two compensating extra `)` at the very end of
+  `%format-impl` (`arg-list))))` → `arg-list))`).
+
+Result: +23 passes (7048 → 7071), −111 lost to test crash. And the
+earlier workaround that hoisted `~{` / `~}` / `~^` to the top of the
+cond is no longer needed — those clauses now dispatch correctly from
+their natural late positions.
+
+### Relation to the other "N-th thing silently vanishes" cases
+
+- **rt-equal regalloc crash** (commit 489c557): genuinely a compiler
+  issue and still worth understanding. Different fingerprint.
+- **AArch64 ~25-form truncation** (`tests/test-aarch64-progn-limit`):
+  also genuinely a translator bug, still to be investigated.
+- **run-cl-loop-tests threshold flip**: likely the same family as
+  AArch64.
+
+The `%format-impl` cond failure was NOT one of these. It was a
+hand-crafted paren bug that happened to present with the same symptom
+("dispatch silently skips past some position"), which is why it was
+initially misdiagnosed as part of this family. Moral: when the
+compiler appears to "silently skip" forms, always verify the source
+parses first.
 
 ## How the harness works
 

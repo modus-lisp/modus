@@ -439,6 +439,49 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
+             ((= code #x0504)
+              ;; %MMAP-SHARED-PAGE: shared-memory anonymous mmap.
+              ;; V0(RSI) = size (tagged fixnum, expected page-multiple).
+              ;; Result = mmap address, stored in V0(RSI) tagged.
+              ;;
+              ;; Equivalent to:
+              ;;   mmap(NULL, size, PROT_READ|PROT_WRITE,
+              ;;        MAP_SHARED|MAP_ANONYMOUS, -1, 0)
+              ;; → 6-arg syscall we'd otherwise need syscall6 support for.
+              ;; Hard-coded here so parent-child shared memory works over
+              ;; the existing syscall3 trap infrastructure.
+              (emit-bytes buf #x57)              ; push rdi
+              (emit-bytes buf #x52)              ; push rdx
+              (emit-bytes buf #x41 #x50)         ; push r8
+              (emit-bytes buf #x41 #x51)         ; push r9
+              (emit-bytes buf #x41 #x52)         ; push r10
+              (emit-bytes buf #x41 #x53)         ; push r11
+              ;; rax = 9 (SYS_mmap)
+              (emit-bytes buf #xB8 #x09 #x00 #x00 #x00)
+              ;; rdi = 0 (addr = NULL)
+              (emit-bytes buf #x48 #x31 #xFF)
+              ;; rsi = untag(V0) (size)
+              (emit-bytes buf #x48 #xD1 #xFE)   ; sar rsi, 1
+              ;; rdx = 3 (prot = PROT_READ|PROT_WRITE)
+              (emit-bytes buf #xBA #x03 #x00 #x00 #x00)
+              ;; r10 = 33 (flags = MAP_SHARED|MAP_ANONYMOUS = 0x01|0x20)
+              (emit-bytes buf #x41 #xBA #x21 #x00 #x00 #x00)
+              ;; r8 = -1 (fd)
+              (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF)
+              ;; r9 = 0 (offset)
+              (emit-bytes buf #x4D #x31 #xC9)
+              ;; syscall
+              (emit-bytes buf #x0F #x05)
+              ;; Tag result → V0 (RSI)
+              (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
+              (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
+              ;; Restore
+              (emit-bytes buf #x41 #x5B)         ; pop r11
+              (emit-bytes buf #x41 #x5A)         ; pop r10
+              (emit-bytes buf #x41 #x59)         ; pop r9
+              (emit-bytes buf #x41 #x58)         ; pop r8
+              (emit-bytes buf #x5A)              ; pop rdx
+              (emit-bytes buf #x5F))             ; pop rdi
              ((= code #x0320)
               ;; SETUP-IRQ: PIC remap + PIT timer + IDT + ISR for HLT-based io-delay
               (if *x64-linux-mode*

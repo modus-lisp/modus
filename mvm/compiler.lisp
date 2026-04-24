@@ -1826,6 +1826,13 @@
       ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
       ((= op-name 385320872711688559) (compile-syscall3 (cdr form) env dest))
       ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
+      ;; (%mmap-shared-page size) — allocate a shared-memory anonymous
+      ;; mmap page.  Returns the tagged address or -1 (tagged) on error.
+      ;; Used by fork-file to share a last-attempted-test-id slot
+      ;; between parent and child so the parent can re-fork past an
+      ;; uncatchable per-test crash.
+      ((= op-name (compute-name-hash "%MMAP-SHARED-PAGE"))
+       (compile-mmap-shared (cdr form) env dest))
 
       ;; --- Error Handler (handler-case support) ---
       ;; (%hc-longjmp) — longjmp to nearest handler-case
@@ -5430,6 +5437,21 @@
   (emit-ir :pop +vreg-v1+)
   (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0503)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-mmap-shared (args env dest)
+  "Compile (%mmap-shared-page size) — allocate a shared anonymous mmap
+   region of SIZE bytes (page-multiple).  The result is the tagged
+   mmap address (subsequent mem-ref calls untag it back to the raw
+   pointer).  Uses TRAP #x0504, which hard-codes the rest of the
+   mmap6 arguments (NULL addr, PROT_RW, MAP_SHARED|MAP_ANONYMOUS,
+   fd=-1, offset=0) — avoids the need for a general syscall6 trap.
+
+   Used by the fork-file re-fork loop: parent mmaps once, both
+   parent and child see the same page, child writes last-attempted
+   test id, parent reads after wait4."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0504)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-read-char-serial (dest)

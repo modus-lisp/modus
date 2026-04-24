@@ -990,22 +990,6 @@
               (let ((dir (aref control pos)))
                 (setq i (+ pos 1))
                 (cond
-                  ;; NOTE: ~{ ~} and ~^ are intentionally placed FIRST.
-                  ;; MVM (as of 2026-04) miscompiles cond branches that
-                  ;; sit beyond a threshold number of clauses ahead —
-                  ;; late branches silently never match. Observed with
-                  ;; `~{` (dir=123) and `~^` (dir=94) before this
-                  ;; reordering. Keep them up top until the compiler
-                  ;; bug is fixed.
-                  ((= dir 94)
-                   (when (null arg-list) (return arg-list)))
-                  ((= dir 123)
-                   (let ((new-i-and-args
-                          (%format-dispatch-brace stream control i len
-                                                  arg-list atp param1)))
-                     (setq i (car new-i-and-args))
-                     (setq arg-list (cdr new-i-and-args))))
-                  ((= dir 125) nil)
                   ;; ~A — aesthetic
                   ((or (= dir 65) (= dir 97))
                    (let ((obj (car arg-list)))
@@ -1269,7 +1253,7 @@
                                                     result))
                                                (t
                                                 (string-downcase result)))))
-                                        (%print-string-raw converted stream)))
+                                        (%print-string-raw converted stream))))
                                   (setq i (+ end-pos 2))
                                   (return nil)))
                                (t nil))))
@@ -1334,17 +1318,17 @@
                                 (let ((default (car (last sections))))
                                   (when default
                                     (setq arg-list (%format-impl stream default arg-list)))))))))))
-                  ;; ~{ ~} — iteration. Delegated entirely to a helper
-                  ;; (%format-dispatch-brace) to keep %format-impl's
-                  ;; frame small. When %format-impl's ~{ handler was
-                  ;; inlined with its own let/loop/cond nesting, the
-                  ;; MVM register allocator handed the recursive body
-                  ;; call the outer's arg-list instead of the intended
-                  ;; lst, producing "(1 2 3)" for "~{~A ~}".
-                  ;; (~{ ~} moved earlier; no-op placeholder to keep
-                  ;; branch count stable if other changes expect it here)
+                  ;; ~{ ~} — iteration
+                  ((= dir 123)
+                   (let ((new-i-and-args
+                          (%format-dispatch-brace stream control i len
+                                                  arg-list atp param1)))
+                     (setq i (car new-i-and-args))
+                     (setq arg-list (cdr new-i-and-args))))
+                  ((= dir 125) nil)
                   ;; ~^ — escape upward
-                  ;; (~^ moved earlier; late position was miscompiled)
+                  ((= dir 94)
+                   (when (null arg-list) (return arg-list)))
                   ;; ~_ — conditional newline (pprint, ignore)
                   ((= dir 95) nil)
                   ;; ~I — indent (pprint, ignore)
@@ -1364,7 +1348,7 @@
                   (t
                    (%print-char 126 stream)
                    (%print-char dir stream))))))))
-    arg-list))))
+    arg-list))
 
 ;;; format: the main user-facing function
 (defun format (stream control &rest args)

@@ -43,8 +43,13 @@
         (subseq text 0 n)))))
 
 (defun mvm-text (relative-path)
-  "Read a file relative to *modus-base* as text."
-  (read-file-text (merge-pathnames relative-path *modus-base*)))
+  "Read a file relative to *modus-base* as text, parse-checking it first.
+   A missing close paren in %format-impl once hid behind the lenient
+   mid-build reader for weeks — see ansi-notes.md: SOLVED:
+   late-cond-branch."
+  (let ((path (merge-pathnames relative-path *modus-base*)))
+    (modus.mvm::check-parses path)
+    (read-file-text path)))
 
 (format t "Collecting fixpoint source...~%")
 

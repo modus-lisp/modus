@@ -31,7 +31,13 @@
       (subseq text 0 (read-sequence text s)))))
 
 (defun mvm-text (relative-path)
-  (read-file-text (merge-pathnames relative-path *modus-base*)))
+  "Read a first-party source file as text, parse-checking it first.
+   A missing close paren in %format-impl once hid behind the lenient
+   mid-build reader for weeks — see ansi-notes.md: SOLVED:
+   late-cond-branch."
+  (let ((path (merge-pathnames relative-path *modus-base*)))
+    (modus.mvm::check-parses path)
+    (read-file-text path)))
 
 (format t "Reading source files...~%")
 

@@ -721,19 +721,22 @@
 (defun read-all-forms-with-locations (source-text)
   "Read all Lisp forms from SOURCE-TEXT, tracking line numbers.
    Returns (forms . line-numbers) where line-numbers is a vector
-   mapping form index to approximate source line."
+   mapping form index to approximate source line.
+
+   Reader errors SKIP to the next line and continue — needed for ANSI
+   test fixtures that contain platform-specific reader syntax (`#<`
+   etc.) the SBCL reader rejects. First-party sources should be
+   verified via CHECK-PARSES first (see that function's docstring)."
   (let ((forms nil)
         (lines nil)
         (line-count 1))
     (with-input-from-string (stream source-text)
       (loop
-        ;; Count lines up to current position
         (let ((pos (file-position stream)))
           (setf line-count (1+ (count #\Newline source-text :end pos)))
           (let ((form (handler-case (read stream nil :eof)
                         (error (e)
                           (format t "  SKIP read at line ~D: ~A~%" line-count e)
-                          ;; Skip to next line to recover
                           (loop for ch = (read-char stream nil nil)
                                 while (and ch (char/= ch #\Newline)))
                           :skip))))
@@ -742,6 +745,23 @@
               (push form forms)
               (push line-count lines))))))
     (cons (nreverse forms) (coerce (nreverse lines) 'vector))))
+
+(defun check-parses (path)
+  "Verify PATH reads cleanly with SBCL's reader — errors loudly otherwise.
+   Build scripts call this on every first-party source file (prelude,
+   cl-*, boot, translator, etc.) BEFORE concatenating them into the
+   build blob, so a paren mismatch fails fast at a specific file
+   instead of getting silently skipped later by
+   READ-ALL-FORMS-WITH-LOCATIONS (which must stay lenient for ANSI
+   test fixtures). A missing close paren in %format-impl once hid
+   behind that leniency for weeks — see ansi-notes.md: 'SOLVED:
+   late-cond-branch'."
+  (handler-case
+      (with-open-file (f path)
+        (loop for next = (read f nil :eof)
+              until (eq next :eof)))
+    (error (e)
+      (error "check-parses: ~A failed to parse: ~A" path e))))
 
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a function name.

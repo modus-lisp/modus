@@ -2112,15 +2112,15 @@
        (compile-form `(case ,(cadr form) ,@(cddr form)) env dest))
 
       ;; --- Function Call (default) ---
-      ;; Package/declaration no-ops (compile to nil)
-      ((member op-name '(36538461984543970    ; MAKE-PACKAGE
-                          683735621833107523   ; EXPORT
-                          979925672549573714   ; IMPORT
-                          578501138257555745   ; SHADOW
-                          1078152541798551995  ; USE-PACKAGE
-                          554740840343413101   ; FIND-PACKAGE
-                          251297473190882665   ; FIND-SYMBOL
-                          757877016639086236   ; PROVIDE
+      ;; Declaration no-ops (compile to nil). The runtime doesn't
+      ;; implement PROVIDE/REQUIRE/PROCLAIM/DECLAIM, so compile them
+      ;; away.  MAKE-PACKAGE / FIND-PACKAGE / FIND-SYMBOL / EXPORT /
+      ;; IMPORT / SHADOW / USE-PACKAGE all HAVE real runtime defuns in
+      ;; cl-packages.lisp — they used to be in this no-op list too,
+      ;; which silently made the whole package system a stub and cost
+      ;; ~980 passes on cl-symbols.lsp.  Now they fall through to
+      ;; compile-call so the real defuns get invoked.
+      ((member op-name '(757877016639086236   ; PROVIDE
                           313710498321880194   ; REQUIRE
                           1094519557412445920  ; PROCLAIM
                           90289849190648180))  ; DECLAIM
@@ -5838,8 +5838,24 @@
               (unique-name (env-lookup-fn env base-name))
               (resolved-name (or unique-name base-name)))
          (emit-ir :call resolved-name nargs)))
-      ;; Other callable expression
+      ;; Other callable expression. ((lambda (...) body) args...) is the
+      ;; only legitimate list-headed case; anything else is suspect.
+      ;; The paren-mismatch case in %format-impl's `~( ~)` clause
+      ;; previously routed every downstream cond clause through this
+      ;; path, silently CALL-INDIRECT'ing on T/NIL (see ansi-notes.md:
+      ;; SOLVED: late-cond-branch). We now print a prominent warning so
+      ;; the same shape would be visible next time. ANSI tests
+      ;; deliberately construct bad fn values (numbers, keywords) to
+      ;; trigger runtime type errors; build-script CHECK-PARSES is the
+      ;; primary defense for first-party code.
       (t
+       (when (and (consp fn)
+                  (not (and (symbolp (car fn))
+                            (string= (symbol-name (car fn)) "LAMBDA"))))
+         (format *error-output*
+                 "~&;; WARN compile-call: list-headed non-lambda in fn ~
+                  position at ~A: ~S~%"
+                 *current-source-location* fn))
        (let ((fn-reg (alloc-temp-reg)))
          (compile-form fn env fn-reg)
          (emit-ir :call-indirect fn-reg nargs)

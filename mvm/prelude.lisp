@@ -1155,8 +1155,32 @@
   nil)
 
 ;;; ============================================================
-;;; Intern / symbol stubs
+;;; Hash / symbol stubs
 ;;; ============================================================
+
+;; Dual-FNV-1a 60-bit hash. Must match the build-time definition in
+;; cross.lisp so that a symbol's stored hash (set by the compiler at
+;; compile-quote time) matches what (compute-name-hash "NAME") yields
+;; at runtime — used by the package hash→name map to round-trip
+;; native MVM symbols back to their name string.
+(defun compute-name-hash (name-string)
+  "Dual-FNV-1a hash for a name string. 60-bit collision-resistant."
+  (let ((h1 2166136261) (h2 3735928559)
+        (len (array-length name-string))
+        (i 0))
+    (loop
+      (when (>= i len) (return nil))
+      (let ((c (aref name-string i)))
+        ;; Uppercase if lowercase ASCII letter (matches string-upcase
+        ;; path in build-time version).
+        (when (and (>= c 97) (<= c 122))
+          (setq c (- c 32)))
+        (setq h1 (logand (* (logxor h1 c) 16777619) #xFFFFFFFF))
+        (setq h2 (logand (* (logxor h2 c) 805306457) #xFFFFFFFF)))
+      (setq i (+ i 1)))
+    (let ((combined (logior (ash (logand h1 #x3FFFFFFF) 30)
+                            (logand h2 #x3FFFFFFF))))
+      (if (zerop combined) 1 combined))))
 
 (defun intern (name &rest pkg-arg)
   "Intern stub — returns the name hash on bare metal.

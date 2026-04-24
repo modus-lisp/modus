@@ -305,6 +305,11 @@ with closure-aware funcall dispatch). See `*x64-native-code-offset*`.
 The image (especially fixpoint-ssh with networking) can grow past 0x400000. The fn table
 at the end of the image must not overlap the globals or stack. Build scripts assert this.
 
+## MVM Compiler — Source-Quality Guardrails
+
+- **`check-parses` at build time**: Build scripts (`build-ansi-test.lisp`, `build-fixpoint.lisp`, `build-mvm.lisp`) call `modus.mvm::check-parses` on every first-party source file before reading it. A paren mismatch in `%format-impl` once hid behind the lenient in-build reader for weeks, presenting as a fake "late cond branch miscompilation". `check-parses` fails fast with the specific file and error so this can't recur silently. If you write a new build script, wire it into your `mvm-text` wrapper.
+- **`compile-call` warns on list-headed non-lambda fn**: The old fallback silently emitted `CALL-INDIRECT` on whatever the "function expression" evaluated to, which routed every downstream cond clause through T/NIL indirection for the `~( ~)` paren bug. Now any `((test) body)`-shaped fn (other than `(lambda …)` or `(setf NAME)`) prints `;; WARN compile-call: …` to stderr with the source location. The code still emits the indirect call so ANSI tests that deliberately construct bad callables keep compiling.
+
 ## MVM Compiler — Active Limitations
 
 1. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.

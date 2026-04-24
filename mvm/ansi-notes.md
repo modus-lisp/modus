@@ -1,8 +1,9 @@
 # ANSI test notes — session log
 
-State as of last session: **7542 passes / 10551 fails / 0 lost**
+State as of last session: **8512 passes / 9581 fails / 0 lost**
 (was 7048 / 9429 / 1215 at session start). Net
-**+494 passes / +1122 fails / −1215 lost** across five wins:
+**+1464 passes / +152 fails / −1215 lost** across six wins:
+
 - Paren-bug fix in `%format-impl`: +23 passes, -111 lost
 - `extended-char.3` fork-crash workaround: +97 passes, -133 lost
   (now subsumed by generic shm fork recovery — workaround removed)
@@ -21,17 +22,28 @@ State as of last session: **7542 passes / 10551 fails / 0 lost**
   pprint-tab, pprint-newline, pprint-tabular, print-unreadable-object,
   pprint, prin1, princ, prin1-to-string, princ-to-string — 221 tests)
   plus the partial-loss chunks (loop13/loop6/adjust-array/elt/etc.).
+- **cl-symbols crash fix**: 978 cl-symbols.lsp tests were crashing
+  because `(find-symbol str 'common-lisp)` passed a *native* MVM
+  symbol (subtag 0x50, 1 slot = hash) as the package designator.
+  `%cl-sym-p` returned T (only checked subtag), then
+  `%pkg-string-designator` called `(aref x 2)` on a 1-slot object →
+  garbage from adjacent heap → crash. Fix: `%cl-sym-p` now also
+  checks element-count >= 3 (CL syms have 3 slots [hash, package,
+  name]); `%resolve-package` recognises native MVM syms via a new
+  `%native-mvm-sym-p` helper and resolves them by hashing each
+  candidate package's name with the runtime `compute-name-hash`.
+  +970 passes, −995 crashes.
 
 The three "lost" IDs reported by range-based analysis (12372, 24909,
 24910) are phantom — the build counter advances past IDs that never
 get a deftest emitted, so they exist in `/tmp/ansi-file-ranges.txt`
 but there's no corresponding test to run.
 
-Measured 2026-04-24. Raw `grep -c '^P:'` reports 7669; 127 duplicates
-across re-forks → 7542 unique. Fails: 11119 raw → 10551 unique.
-Pass rate of tests that ran cleanly: 7542/(7542+1916 real fails)
-= **79.8%**. The remaining 8747 "crash fails" are runtime SIGSEGVs —
-the next attack surface.
+Measured 2026-04-24. Pass rate of tests that ran cleanly:
+8512 / (8512 + 1943 real fails) = **81.4%** (up from 79.8%).
+Overall pass rate: 8512 / 17692 = **48.1%**.
+The remaining 7752 crash-fails are runtime SIGSEGVs; the substitute /
+count / format-circumflex / numbers chunks are the next big surfaces.
 
 Historical:
 (+460 passes and +126 lost since 6588 / ~10000 / 1089 at the start

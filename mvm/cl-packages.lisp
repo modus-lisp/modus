@@ -61,13 +61,28 @@
 ;;; (count + subtag) is shared.
 
 (defun %cl-sym-p (x)
-  "Check if X is a CL symbol (tag=object, subtag=#x50)."
+  "Check if X is a CL symbol (tag=object, subtag=#x50, 3 slots).
+   Native MVM symbols share subtag #x50 but have 1 slot (hash only) —
+   distinguished here by element count."
   (cond
     ((fixnump x) nil)
     ((consp x) nil)
     ((null x) nil)
     ((characterp x) nil)
-    (t (= (obj-subtag x) #x50))))
+    ((not (= (obj-subtag x) #x50)) nil)
+    (t (>= (array-length x) 3))))
+
+(defun %native-mvm-sym-p (x)
+  "Check if X is a native MVM symbol (subtag #x50, single hash slot)."
+  (cond
+    ((fixnump x) nil)
+    ((consp x) nil)
+    ((null x) nil)
+    ((characterp x) nil)
+    ((not (= (obj-subtag x) #x50)) nil)
+    (t (= (array-length x) 1))))
+
+(defun %native-mvm-sym-hash (s) (aref s 0))
 
 (defun %cl-sym-data (sym) sym)  ; legacy accessor — slots live directly on sym
 (defun %cl-sym-hash (sym) (aref sym 0))
@@ -151,10 +166,26 @@
 
 (defun %resolve-package (designator)
   "Resolve a package designator to a package object.
-   Package -> itself, string/symbol/character -> find-package."
+   Package -> itself, string/symbol/character -> find-package.
+   Native MVM symbol (carries name-hash only, no name string) ->
+   match against package name hashes."
   (cond
     ((%pkg-p designator) designator)
+    ((%native-mvm-sym-p designator)
+     (%pkg-find-by-hash (%native-mvm-sym-hash designator)))
     (t (find-package designator))))
+
+(defun %pkg-find-by-hash (h)
+  "Look up a package by hashing each candidate's name. Used when a
+   designator is a native MVM symbol that carries only a hash."
+  (let ((cur *all-packages*))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pkg (car cur)))
+        (when (and (%pkg-name pkg)
+                   (= (compute-name-hash (%pkg-name pkg)) h))
+          (return pkg)))
+      (setq cur (cdr cur)))))
 
 ;;; --- Internal alist-based symbol table operations ---
 

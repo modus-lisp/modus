@@ -214,12 +214,20 @@
     ;; *print-readably* overrides *print-escape*
     (when preadably (setq escape t))
     (cond
-      ;; NIL
+      ;; NIL — honor *print-case*. NIL is a symbol whose name is "NIL";
+      ;; under :downcase / :capitalize the printed form must follow.
+      ;; (:capitalize on "NIL" → "Nil", which needs per-word handling.)
       ((null obj)
-       (%print-char 78 stream) (%print-char 73 stream) (%print-char 76 stream))
+       (cond
+         ((eq pcase :downcase)
+          (%print-char 110 stream) (%print-char 105 stream) (%print-char 108 stream))
+         ((eq pcase :capitalize)
+          (%print-char 78 stream) (%print-char 105 stream) (%print-char 108 stream))
+         (t
+          (%print-char 78 stream) (%print-char 73 stream) (%print-char 76 stream))))
       ;; T
       ((eq obj t)
-       (%print-char 84 stream))
+       (%print-char (if (eq pcase :downcase) 116 84) stream))
       ;; Character
       ((characterp obj)
        (if escape
@@ -805,25 +813,38 @@
           (setq ss (cdr ss)))))))
 
 ;;; Pad string to minimum column
-(defun %fmt-pad (str mincol colinc minpad padchar stream)
-  "Write STR padded to MINCOL using PADCHAR, with MINPAD minimum padding."
+(defun %fmt-pad (str mincol colinc minpad padchar stream &rest opts)
+  "Write STR padded to MINCOL using PADCHAR, with MINPAD minimum padding.
+   ANSI ~A / ~S default to LEFT-ALIGN (string first, padding right). The
+   ~@A / ~@S form (passes :right-align as the only opt) flips to
+   RIGHT-ALIGN (padding first, string right)."
   (let ((slen (if (stringp str) (array-length str) 0))
         (mc (if mincol mincol 0))
         (ci (if colinc colinc 1))
         (mp (if minpad minpad 0))
-        (pc (if padchar padchar 32)))
+        (pc (if padchar padchar 32))
+        (right-align (and opts (eq (car opts) :right-align))))
     (let ((padding mp))
-      ;; Increase padding until we meet mincol
       (loop
         (when (>= (+ slen padding) mc) (return nil))
         (setq padding (+ padding ci)))
-      ;; Write padding then string (right-align style default)
-      (let ((i 0))
-        (loop
-          (when (= i padding) (return nil))
-          (%print-char pc stream)
-          (setq i (+ i 1))))
-      (when (stringp str) (%print-string-raw str stream)))))
+      (cond
+        (right-align
+         ;; Padding first, then string.
+         (let ((i 0))
+           (loop
+             (when (= i padding) (return nil))
+             (%print-char pc stream)
+             (setq i (+ i 1))))
+         (when (stringp str) (%print-string-raw str stream)))
+        (t
+         ;; String first, then padding (default ~A / ~S).
+         (when (stringp str) (%print-string-raw str stream))
+         (let ((i 0))
+           (loop
+             (when (= i padding) (return nil))
+             (%print-char pc stream)
+             (setq i (+ i 1)))))))))
 
 ;;; Format ~T: tabulate
 (defun %fmt-tabulate (colnum colinc stream)
@@ -990,29 +1011,38 @@
               (let ((dir (aref control pos)))
                 (setq i (+ pos 1))
                 (cond
-                  ;; ~A — aesthetic
+                  ;; ~A — aesthetic. The `:` modifier (~:A) prints NIL
+                  ;; as "()" instead of "nil"/"NIL"/"Nil".
                   ((or (= dir 65) (= dir 97))
                    (let ((obj (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (let ((s (make-string-output-stream))
                            (*print-escape* nil))
                        (declare (special *print-escape*))
-                       (%write-obj obj s nil nil)
+                       (if (and colonp (null obj))
+                           (progn (%print-char 40 s) (%print-char 41 s))
+                           (%write-obj obj s nil nil))
                        (let ((str (get-output-stream-string s)))
                          (if (or param1 param2 param3 param4)
-                             (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream)
+                             (if atp
+                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream :right-align)
+                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream))
                              (%print-string-raw str stream))))))
-                  ;; ~S — standard
+                  ;; ~S — standard. ~:S also prints NIL as "()".
                   ((or (= dir 83) (= dir 115))
                    (let ((obj (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (let ((s (make-string-output-stream))
                            (*print-escape* t))
                        (declare (special *print-escape*))
-                       (%write-obj obj s nil t)
+                       (if (and colonp (null obj))
+                           (progn (%print-char 40 s) (%print-char 41 s))
+                           (%write-obj obj s nil t))
                        (let ((str (get-output-stream-string s)))
                          (if (or param1 param2 param3 param4)
-                             (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream)
+                             (if atp
+                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream :right-align)
+                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream))
                              (%print-string-raw str stream))))))
                   ;; ~W — write (like ~S but respects all print vars)
                   ((or (= dir 87) (= dir 119))

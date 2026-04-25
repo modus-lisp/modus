@@ -1049,8 +1049,14 @@
 (defun randomly-check-readability (obj &rest args) t)
 
 (defun formatter-call-to-string (fn &rest args)
-  "Stub for formatter-call-to-string."
-  "")
+  "Call FN (the closure returned by FORMATTER) on a string-output-stream
+   with ARGS, return the accumulated string. ANSI tests use this as a
+   parallel of (format nil control args...) to exercise the FORMATTER
+   form alongside FORMAT — same semantics, twice the coverage per
+   directive. Was a stub returning \"\" until 2026-04-25."
+  (let ((s (make-string-output-stream)))
+    (apply fn s args)
+    (get-output-stream-string s)))
 
 ;;; ============================================================
 ;;; rotatef/shiftf as runtime functions (for edge cases where

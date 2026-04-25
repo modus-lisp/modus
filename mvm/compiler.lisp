@@ -2980,10 +2980,6 @@
            (push (caddr p) result)))))
     (nreverse result)))
 
-(defun %collect-free-vars-list (forms bound env acc)
-  (dolist (f forms) (setq acc (%collect-free-vars f bound env acc)))
-  acc)
-
 (defun %special-var-name-p (sym)
   "T when SYM looks like a special (dynamic) variable — i.e. its name
    begins and ends with `*`. Special vars must NOT be lexically captured
@@ -2995,11 +2991,23 @@
               (char= (char name 0) #\*)
               (char= (char name (1- (length name))) #\*)))))
 
+;;; The walker is implemented as a single recursive %collect-free-vars
+;;; that walks BOTH car and cdr at every cons. List-of-forms iteration
+;;; via DOLIST + a helper (%collect-free-vars-list) was the original
+;;; shape but tickled a SBCL/MVM compile-state interaction: even with
+;;; a NIL env (so the walker can't add anything to acc), invoking the
+;;; helper at compile-lambda time silently dropped about a dozen
+;;; chunks (number-comparison, assoc, labels, destructuring-bind, …)
+;;; from the binary. Bisecting showed direct (rec (cdr form) (rec
+;;; (car form) acc)) does not regress, while (dolist (f forms) (setq
+;;; acc (rec f bound env acc))) does. We don't fully understand the
+;;; SBCL-side interaction; the dolist-recursive shape is just avoided.
+
 (defun %collect-free-vars (form bound env acc)
   "Walk FORM; collect symbol references that are not in BOUND and ARE
    present in ENV. The result is the list of outer-scope variables the
    form references — i.e., what compile-lambda needs to copy into the
-   closure env-list."
+   closure env-list. Every cons recurses into both car and cdr."
   (cond
     ((null form) acc)
     ((symbolp form)
@@ -3014,62 +3022,81 @@
     (t
      (let ((head (car form)))
        (cond
+         ;; Don't walk inside (quote …) or (function …).
          ((or (eq head 'quote) (eq head 'function)) acc)
+         ;; LET: bindings see OUTER scope; body sees inner.
          ((eq head 'let)
           (let ((bindings (cadr form))
                 (body (cddr form))
                 (new-bound bound))
-            (dolist (b bindings)
-              (cond
-                ((symbolp b) (push b new-bound))
-                ((consp b)
-                 (setq acc (%collect-free-vars (cadr b) bound env acc))
-                 (push (car b) new-bound))))
-            (%collect-free-vars-list body new-bound env acc)))
+            ;; Walk each binding's init in OUTER scope.
+            (let ((bs bindings))
+              (loop
+                (when (null bs) (return nil))
+                (let ((b (car bs)))
+                  (cond
+                    ((symbolp b) (push b new-bound))
+                    ((consp b)
+                     (setq acc (%collect-free-vars (cadr b) bound env acc))
+                     (push (car b) new-bound))))
+                (setq bs (cdr bs))))
+            ;; Walk body forms with new-bound. Direct car/cdr recursion.
+            (let ((bs body))
+              (loop
+                (when (null bs) (return acc))
+                (setq acc (%collect-free-vars (car bs) new-bound env acc))
+                (setq bs (cdr bs))))))
+         ;; LET*: each binding sees previous names.
          ((eq head 'let*)
           (let ((bindings (cadr form))
                 (body (cddr form))
                 (cur-bound bound))
-            (dolist (b bindings)
-              (cond
-                ((symbolp b) (push b cur-bound))
-                ((consp b)
-                 (setq acc (%collect-free-vars (cadr b) cur-bound env acc))
-                 (push (car b) cur-bound))))
-            (%collect-free-vars-list body cur-bound env acc)))
+            (let ((bs bindings))
+              (loop
+                (when (null bs) (return nil))
+                (let ((b (car bs)))
+                  (cond
+                    ((symbolp b) (push b cur-bound))
+                    ((consp b)
+                     (setq acc (%collect-free-vars (cadr b) cur-bound env acc))
+                     (push (car b) cur-bound))))
+                (setq bs (cdr bs))))
+            (let ((bs body))
+              (loop
+                (when (null bs) (return acc))
+                (setq acc (%collect-free-vars (car bs) cur-bound env acc))
+                (setq bs (cdr bs))))))
+         ;; LAMBDA: own params shadow.
          ((eq head 'lambda)
-          (let ((params (cadr form))
-                (body (cddr form)))
-            (%collect-free-vars-list body
-                                     (append (%extract-lambda-param-names params) bound)
-                                     env acc)))
-         ((or (eq head 'flet) (eq head 'labels))
-          (let ((defs (cadr form))
-                (body (cddr form))
-                (fn-names (mapcar #'car (cadr form))))
-            (dolist (def defs)
-              (let ((params (cadr def)) (db (cddr def)))
-                (setq acc (%collect-free-vars-list
-                           db
-                           (append (%extract-lambda-param-names params)
-                                   (if (eq head 'labels) fn-names nil)
-                                   bound)
-                           env acc))))
-            (%collect-free-vars-list body (append fn-names bound) env acc)))
-         ((or (eq head 'dolist) (eq head 'dotimes))
-          (let* ((spec (cadr form))
-                 (var (car spec))
-                 (init (cadr spec))
-                 (body (cddr form)))
-            (setq acc (%collect-free-vars init bound env acc))
-            (%collect-free-vars-list body (cons var bound) env acc)))
+          (let* ((params (cadr form))
+                 (body (cddr form))
+                 (new-bound (append (%extract-lambda-param-names params) bound)))
+            (let ((bs body))
+              (loop
+                (when (null bs) (return acc))
+                (setq acc (%collect-free-vars (car bs) new-bound env acc))
+                (setq bs (cdr bs))))))
+         ;; SETQ / PSETQ: read every value form, bind nothing.
          ((or (eq head 'setq) (eq head 'psetq))
           (let ((pairs (cdr form)))
             (loop
               (when (null pairs) (return acc))
               (setq acc (%collect-free-vars (cadr pairs) bound env acc))
               (setq pairs (cddr pairs)))))
-         (t (%collect-free-vars-list (cdr form) bound env acc)))))))
+         ;; Default: walk car AND cdr through the spine. This is the
+         ;; shape that does NOT trigger the dolist regression.
+         (t
+          (setq acc (%collect-free-vars (car form) bound env acc))
+          (%collect-free-vars (cdr form) bound env acc)))))))
+
+(defun %collect-free-vars-list (forms bound env acc)
+  "Walk a list of forms (e.g. a lambda body). Iterates via plain LOOP
+   and CDR rather than DOLIST because of the regression noted above."
+  (let ((bs forms))
+    (loop
+      (when (null bs) (return acc))
+      (setq acc (%collect-free-vars (car bs) bound env acc))
+      (setq bs (cdr bs)))))
 
 (defun compile-lambda (params body env dest)
   "Compile (lambda (params) body*).
@@ -3082,16 +3109,11 @@
   (let* ((pp (preprocess-params params body))
          (actual-params (car pp))
          (actual-body (cdr pp))
-         ;; Auto-capture is disabled. The walker (%collect-free-vars
-         ;; above) correctly identifies free variables and the closure
-         ;; build path is wired up, but enabling it triggers a global
-         ;; compile-state cascade: chunks with ZERO captures of their own
-         ;; (number-comparison, assoc, flet, let, destructuring-bind …)
-         ;; suddenly compile to defuns whose bodies silent-exit at runtime,
-         ;; even though the bodies themselves are unchanged. Excluding
-         ;; special vars from the walker (the only correctness fix we found)
-         ;; doesn't help — same chunks regress to 0 passes.
-         (captured-vars nil))
+         (captured-vars
+           (reverse
+             (%collect-free-vars-list actual-body
+                                      (%extract-lambda-param-names actual-params)
+                                      env nil))))
     (if (null captured-vars)
         ;; No captures: compile as before (plain function pointer)
         (let* ((lambda-name (format nil "~A$$LAMBDA~D"

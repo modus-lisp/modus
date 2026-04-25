@@ -1622,24 +1622,31 @@
            (maybe-store-scratch buf vd)))
 
         ((op= +op-set-nargs+)
-         ;; Set RAX = nargs (untagged immediate). Used by caller of
-         ;; :call-indirect just before the call so callee's prologue
-         ;; can read nargs and pack &rest args into a list.
+         ;; Store nargs (imm8) at fixed slot #x10000150 — the nargs
+         ;; convention slot used by callees with &rest to know how
+         ;; many args the caller passed. Encoded as:
+         ;;   mov dword [0x10000150], imm32
          (let ((n (first operands)))
-           ;; mov eax, imm32 — small imm fits in 32-bit form
-           (emit-bytes buf #xB8)         ; mov eax, imm32
-           (emit-bytes buf (logand n #xFF)
-                            (logand (ash n -8) #xFF)
-                            (logand (ash n -16) #xFF)
-                            (logand (ash n -24) #xFF))))
+           (emit-bytes buf #xC7 #x04 #x25)         ; mov [disp32], imm32
+           (emit-bytes buf #x50 #x01 #x00 #x10)    ; disp32 = #x10000150
+           (emit-bytes buf (logand n #xFF) #x00 #x00 #x00)))
 
         ((op= +op-get-nargs+)
-         ;; Read RAX into Vd as the LAST thing the callee's prologue
-         ;; needs from the nargs convention. After this point RAX is
-         ;; freely reusable by the callee (return value path).
+         ;; Load the nargs slot into RAX (scratch), tag as fixnum
+         ;; (shl 1), then move to Vd.  Tagging here keeps :get-nargs
+         ;; compatible with the rest of the IR's tagged-value world
+         ;; — comparisons against :li (which takes already-tagged
+         ;; immediates) and :cons just work.
          (let* ((vd (first operands))
                 (d (dest-phys-or-scratch vd)))
-           (emit-mov-reg-reg buf d 'rax)
+           ;; mov eax, dword [0x10000150]
+           (emit-bytes buf #xA1)                   ; mov eax, m32 (special form)
+           (emit-bytes buf #x50 #x01 #x00 #x10
+                            #x00 #x00 #x00 #x00)   ; abs64 (mov eax variant)
+           ;; shl rax, 1  — tag as fixnum
+           (emit-bytes buf #x48 #xD1 #xE0)
+           (unless (eq d 'rax)
+             (emit-mov-reg-reg buf d 'rax))
            (maybe-store-scratch buf vd)))
 
         ((op= +op-alloc-string+)

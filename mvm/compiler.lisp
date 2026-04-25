@@ -3106,9 +3106,17 @@
    When the lambda captures variables from the enclosing scope, builds
    a closure object and emits code to load captured values from R13
    (the closure-env register) into locals at function entry."
-  (let* ((pp (preprocess-params params body))
+  (let* ((rest-pos      (position '&rest params))
+         (pp            (preprocess-params params body))
          (actual-params (car pp))
-         (actual-body (cdr pp))
+         (actual-body   (cdr pp))
+         (rest-slot     (when rest-pos
+                          ;; After preprocess-params, &rest is gone but
+                          ;; the rest param sits at position rest-pos
+                          ;; in actual-params (required come first,
+                          ;; rest comes immediately after — preprocess
+                          ;; preserves required order).
+                          rest-pos))
          (captured-vars
            (reverse
              (%collect-free-vars-list actual-body
@@ -3119,7 +3127,7 @@
         (let* ((lambda-name (format nil "~A$$LAMBDA~D"
                                      (or *current-function-name* "ANON")
                                      (make-compiler-label)))
-               (result (mvm-compile-function-internal lambda-name actual-params actual-body env))
+               (result (mvm-compile-function-internal lambda-name actual-params actual-body env rest-slot))
                (info (car result)))
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
@@ -3146,7 +3154,7 @@
                (wrapped-body `((let* ,all-bindings ,@actual-body)))
                ;; Compile the closure function (NO parent-env — captured vars
                ;; are loaded as locals from the closure env at entry)
-               (result (mvm-compile-function-internal lambda-name actual-params wrapped-body nil))
+               (result (mvm-compile-function-internal lambda-name actual-params wrapped-body nil rest-slot))
                (info (car result)))
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
@@ -3199,8 +3207,9 @@
              ;; For labels, function bodies see flet-env (mutual recursion);
              ;; for flet, function bodies see parent env only.
              (body-env (if labels-p flet-env env))
+             (rest-pos (position '&rest params))
              (pp (preprocess-params params fbody))
-             (result (mvm-compile-function-internal unique-name (car pp) (cdr pp) body-env))
+             (result (mvm-compile-function-internal unique-name (car pp) (cdr pp) body-env rest-pos))
              (info (car result)))
         (declare (ignore local-key))
         ;; Register with unique name
@@ -4410,10 +4419,15 @@
         (emit-ir :set-cenv env-reg)
         (free-temp-reg))  ; free env-reg
       ;; Call the closure's function with same args.
+      ;; Set nargs slot so a &rest callee can build its rest-list at
+      ;; runtime — funcall is the only path that doesn't statically
+      ;; know whether the callee has &rest, so we always write here.
+      (emit-ir :set-nargs nargs)
       (emit-ir :call-indirect fn-call-reg nargs)
       (emit-ir :br after-call-label)
       ;; === Direct call path (non-closure) ===
       (emit-ir-label direct-call-label)
+      (emit-ir :set-nargs nargs)
       (emit-ir :call-indirect fn-call-reg nargs)
       ;; === Join ===
       (emit-ir-label after-call-label)
@@ -5952,41 +5966,46 @@
   ;; Arity check (narrow): if called with 0 args on a function with
   ;; required-count > 0, signal PROGRAM-ERROR. Catches the common
   ;; (F) ansi-test pattern without disturbing other calls.
-  (when (and (symbolp fn) (boundp '*functions*) *functions*)
-    (let* ((fn-name (symbol-name fn))
-           ;; Check for flet/labels name mapping
-           (resolved-fn-name (or (env-lookup-fn env fn-name) fn-name))
-           (fn-info (gethash resolved-fn-name *functions*)))
-      (when fn-info
-        (let ((req (function-info-required-count fn-info))
-              (param-count (function-info-param-count fn-info))
-              (has-rest (function-info-rest-param-p fn-info))
-              (nargs (length args)))
-          (cond
-            ;; Too few required args: arity error.
-            ((and req (> req 0) (< nargs req))
-             (compile-arity-error env dest)
-             (return-from compile-call))
-            ;; Too many args for a non-rest function with a known
-            ;; param-count: arity error. Safe now that required-count
-            ;; is populated and audited call sites pass correct args.
-            ((and (not has-rest) param-count (> param-count 0)
-                  (> nargs param-count))
-             (compile-arity-error env dest)
-             (return-from compile-call))
-            (has-rest
-             (when (>= nargs req)
-               (let ((required-args (subseq args 0 req))
-                     (rest-args (nthcdr req args)))
-                 ;; Build (cons a (cons b ... nil)) form for rest args
-                 (let ((rest-form nil))
-                   (dolist (a (reverse rest-args))
-                     (setf rest-form `(cons ,a ,rest-form)))
-                   (setf args (append required-args (list rest-form)))))))
-            (t
-             ;; Pad with NIL for missing &optional parameters
-             (when (and param-count (< nargs param-count))
-               (setf args (append args (make-list (- param-count nargs)))))))))))
+  (let ((static-rest-pack nil))
+    (when (and (symbolp fn) (boundp '*functions*) *functions*)
+      (let* ((fn-name (symbol-name fn))
+             ;; Check for flet/labels name mapping
+             (resolved-fn-name (or (env-lookup-fn env fn-name) fn-name))
+             (fn-info (gethash resolved-fn-name *functions*)))
+        (when fn-info
+          (let ((req (function-info-required-count fn-info))
+                (param-count (function-info-param-count fn-info))
+                (has-rest (function-info-rest-param-p fn-info))
+                (nargs (length args)))
+            (cond
+              ;; Too few required args: arity error.
+              ((and req (> req 0) (< nargs req))
+               (compile-arity-error env dest)
+               (return-from compile-call))
+              ;; Too many args for a non-rest function with a known
+              ;; param-count: arity error. Safe now that required-count
+              ;; is populated and audited call sites pass correct args.
+              ((and (not has-rest) param-count (> param-count 0)
+                    (> nargs param-count))
+               (compile-arity-error env dest)
+               (return-from compile-call))
+              (has-rest
+               (when (>= nargs req)
+                 (let ((required-args (subseq args 0 req))
+                       (rest-args (nthcdr req args)))
+                   ;; Build (cons a (cons b ... nil)) form for rest args
+                   (let ((rest-form nil))
+                     (dolist (a (reverse rest-args))
+                       (setf rest-form `(cons ,a ,rest-form)))
+                     (setf args (append required-args (list rest-form)))
+                     ;; Mark that callee should skip its dynamic prologue —
+                     ;; we already packed.  The :call site will emit a
+                     ;; :set-nargs 255 sentinel so the callee can see it.
+                     (setf static-rest-pack t)))))
+              (t
+               ;; Pad with NIL for missing &optional parameters
+               (when (and param-count (< nargs param-count))
+                 (setf args (append args (make-list (- param-count nargs)))))))))))
   (let ((nargs (length args))
         ;; Save the current temp count BEFORE arg evaluation.
         ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).
@@ -6027,6 +6046,17 @@
       (loop for i from (1- reg-count) downto 0
             do (emit-ir :pop (+ +vreg-v0+ i))))
 
+    ;; Tell the callee's &rest prologue (if any) what to do.  Direct
+    ;; calls to known &rest functions get a sentinel 255 to mean 'we
+    ;; already packed'.  Direct calls without static-rest pre-pack
+    ;; (e.g. forward references to a &rest function whose info isn't
+    ;; yet known) emit the actual nargs so the prologue can pack at
+    ;; runtime — the args were not pre-packed in that path.  We
+    ;; always write the slot so a stale value from a prior call
+    ;; can't accidentally satisfy the prologue's checks.
+    (if static-rest-pack
+        (emit-ir :set-nargs 255)
+        (emit-ir :set-nargs (min nargs 254)))
     ;; Emit the call
     (cond
       ;; Direct call to named function
@@ -6062,6 +6092,7 @@
                  *current-source-location* fn))
        (let ((fn-reg (alloc-temp-reg)))
          (compile-form fn env fn-reg)
+         (emit-ir :set-nargs nargs)
          (emit-ir :call-indirect fn-reg nargs)
          (free-temp-reg))))
 
@@ -6080,7 +6111,7 @@
     (when (> save-count 1)
       (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
             do (unless (= r dest)
-                 (emit-ir :pop r))))))
+                 (emit-ir :pop r)))))))
 
 ;;; ============================================================
 ;;; Parameter List Preprocessing
@@ -6152,10 +6183,91 @@
 ;;;
 ;;; Compiles a single function's body, producing IR instructions.
 
-(defun mvm-compile-function-internal (name params body &optional parent-env)
+(defun emit-rest-prologue (rest-slot)
+  "Emit IR for the &rest prologue.
+
+   Convention: the caller writes nargs (untagged byte) to the nargs
+   slot via :set-nargs immediately before its :call/:call-indirect.
+   compile-funcall always writes actual nargs. compile-call's static
+   pre-pack path writes 255 — sentinel for 'already packed', the
+   prologue does nothing in that case (slot[rest-slot] already holds
+   the packed list).
+
+   Otherwise the prologue builds (cons V_req (cons V_(req+1) … nil))
+   from registers and writes it to slot[rest-slot]. We only handle
+   nargs values up to +max-reg-args+ (so all rest args are in
+   register-saved slots) — beyond that the static-pack path in
+   compile-call still applies because it writes the sentinel."
+  (let ((skip-label   (make-compiler-label))
+        (sentinel-tag (ash 255 +fixnum-shift+))
+        (req          rest-slot))
+    (let ((nargs-reg (alloc-temp-reg))
+          (cmp-reg   (alloc-temp-reg))
+          (val-reg   (alloc-temp-reg))
+          (list-reg  (alloc-temp-reg)))
+      ;; Read nargs (already tagged by :get-nargs translator).
+      (emit-ir :get-nargs nargs-reg)
+      ;; Sentinel check: if nargs == 255-tagged, skip — caller pre-packed.
+      (emit-ir :li cmp-reg sentinel-tag)
+      (emit-ir :cmp nargs-reg cmp-reg)
+      (emit-ir :beq skip-label)
+      ;; nargs == req: rest list is nil.  Write nil to slot[req].
+      (let ((case-req-label (make-compiler-label))
+            (built-label    (make-compiler-label)))
+        (emit-ir :li cmp-reg (ash req +fixnum-shift+))
+        (emit-ir :cmp nargs-reg cmp-reg)
+        (emit-ir :bne case-req-label)
+        ;; nargs == req — empty rest list.  NIL lives in +vreg-vn+
+        ;; (R15 by convention); load via :mov, not :li 0.
+        (emit-ir :mov list-reg +vreg-vn+)
+        (emit-ir :br built-label)
+        ;; Build cond-ladder for nargs = req+1..+max-reg-args+.
+        ;; Emit checks in descending order (most-args first) so each
+        ;; case's branch is small.  We build the list with explicit
+        ;; cons chains rather than a runtime loop because the IR has
+        ;; no "load slot[i] for variable i".
+        (emit-ir-label case-req-label)
+        (let ((cases nil))
+          (loop for k from (- +max-reg-args+ req) downto 1
+                do (push k cases))
+          ;; cases now (1 2 3 …) — emit largest first
+          (setf cases (reverse cases))
+          (dolist (k cases)
+            (let ((next-label (make-compiler-label)))
+              (emit-ir :li cmp-reg (ash (+ req k) +fixnum-shift+))
+              (emit-ir :cmp nargs-reg cmp-reg)
+              (emit-ir :bne next-label)
+              ;; Build (cons slot[req] (cons slot[req+1] … nil)) for k rest args.
+              (emit-ir :mov list-reg +vreg-vn+)   ; NIL
+              (loop for j from (- (+ req k) 1) downto req
+                    do (emit-ir :stack-load val-reg j)
+                       (emit-ir :gc-check)
+                       (emit-ir :cons list-reg val-reg list-reg))
+              (emit-ir :br built-label)
+              (emit-ir-label next-label)))
+          ;; Fallthrough: nargs > req+max-rest — too many args for the
+          ;; inline cond ladder.  Conservatively store NIL; the caller
+          ;; should have used the static-pack path with the sentinel.
+          (emit-ir :mov list-reg +vreg-vn+))
+        (emit-ir-label built-label)
+        ;; Store the built list into slot[req] — the &rest param's slot.
+        (emit-ir :stack-store list-reg req))
+      (emit-ir-label skip-label)
+      (free-temp-reg)   ; list-reg
+      (free-temp-reg)   ; val-reg
+      (free-temp-reg)   ; cmp-reg
+      (free-temp-reg)))) ; nargs-reg
+
+(defun mvm-compile-function-internal (name params body &optional parent-env rest-slot)
   "Compile a single function into IR. Returns function-info.
    Does NOT produce bytecode; that happens in phase 3.
-   PARENT-ENV, if provided, allows closure variable references."
+   PARENT-ENV, if provided, allows closure variable references.
+   REST-SLOT, if non-nil, is the slot index (after preprocess-params)
+   that holds the &rest parameter. The prologue emits code to read
+   nargs from the convention slot and pack args[REST-SLOT..nargs-1]
+   into a list, storing the list back to slot[REST-SLOT]. Sentinel
+   value 255 in the nargs slot means 'caller already packed' (used
+   by compile-call's static-rest path) — prologue skips packing."
   (let* ((*ir-buffer* nil)
          (*current-function-name* (if (symbolp name) (symbol-name name)
                                       (string name)))
@@ -6199,6 +6311,13 @@
                                     :stack-slot i)
                      (compile-env-bindings env))
                (setf (compile-env-stack-depth env) (1+ i)))
+
+      ;; &rest prologue: build rest list at runtime from the args
+      ;; actually passed (nargs, written by caller via :set-nargs).
+      ;; Sentinel 255 = "caller already packed" (compile-call's
+      ;; static-rest path) — skip the build.
+      (when (and rest-slot (< rest-slot +max-reg-args+))
+        (emit-rest-prologue rest-slot))
 
       ;; Compile body (strip any declarations), result goes to VR
       (compile-progn (strip-declares body) env +vreg-vr+))
@@ -6774,10 +6893,12 @@
 ;;; Top-Level API
 ;;; ============================================================
 
-(defun mvm-compile-function (name params body)
+(defun mvm-compile-function (name params body &optional rest-slot)
   "Compile a named function to MVM bytecode.
-   Returns function-info with bytecode embedded in the module buffer."
-  (let ((result (mvm-compile-function-internal name params body)))
+   Returns function-info with bytecode embedded in the module buffer.
+   REST-SLOT, if non-nil, is the slot index of the &rest param so the
+   prologue can pack its rest list at runtime (see emit-rest-prologue)."
+  (let ((result (mvm-compile-function-internal name params body nil rest-slot)))
     ;; result is (function-info . ir-list)
     (let ((info (car result))
           (ir (cdr result)))
@@ -6830,7 +6951,7 @@
                 (key-pos  (position '&key params))
                 (req-end  (or rest-pos opt-pos key-pos (length params)))
                 (pp (preprocess-params params body)))
-           (let ((result (mvm-compile-function name (car pp) (cdr pp))))
+           (let ((result (mvm-compile-function name (car pp) (cdr pp) rest-pos)))
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
                (when rest-pos

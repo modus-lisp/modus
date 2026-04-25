@@ -1600,6 +1600,27 @@
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-set-cenv+)
+         ;; Set R13 (closure-env reg) from Vs.  R13 is reserved for
+         ;; passing the closure env-list across funcall — caller writes
+         ;; it before the indirect call, callee reads it at entry.
+         (let* ((vs (first operands))
+                (ps (vreg-phys vs)))
+           (if ps
+               (emit-mov-reg-reg buf 'r13 ps)
+               (progn
+                 (emit-load-vreg buf vs +scratch-reg+)
+                 (emit-mov-reg-reg buf 'r13 +scratch-reg+)))))
+
+        ((op= +op-get-cenv+)
+         ;; Read R13 into Vd.  Closure body prologue uses this exactly
+         ;; once at entry to copy the env-list into a local before any
+         ;; nested funcall could overwrite R13.
+         (let* ((vd (first operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-mov-reg-reg buf d 'r13)
+           (maybe-store-scratch buf vd)))
+
         ((op= +op-alloc-string+)
          ;; Like alloc-array but with string subtag #x31
          (let* ((vd (first operands))

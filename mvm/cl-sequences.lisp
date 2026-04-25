@@ -454,11 +454,11 @@
 ;;; represented as cons cells, but that collided with CL symbols (also
 ;;; cons cells) in the funcall dispatch — see ansi-notes.md.
 (defun closure-eql-fn (y)
-  (let* ((env (mem-ref #x10000140 :u64))
+  (let* ((env (%get-cenv))
          (x (car env)))
     (eql x y)))
 (defun closure-not-eql-fn (y)
-  (let* ((env (mem-ref #x10000140 :u64))
+  (let* ((env (%get-cenv))
          (x (car env)))
     (not (eql x y))))
 ;;; Placeholder is-eql-p/is-not-eql-p (will be overridden by ansi-tests.lisp)

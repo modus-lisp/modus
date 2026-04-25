@@ -56,6 +56,7 @@
    #:+op-sap-set8+ #:+op-sap-set32+ #:+op-sap-set64+ #:+op-sap-addr+
    #:+op-set-mv-count+
    #:+op-alloc-string+
+   #:+op-set-cenv+ #:+op-get-cenv+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -340,6 +341,8 @@
 (defconstant +op-sap-addr+   #xB7)  ; (sap-addr Vd Vsap) - extract raw addr → Vd
 (defconstant +op-set-mv-count+ #xB8) ; (set-mv-count imm8) - store count to MV-COUNT
 (defconstant +op-alloc-string+ #xB9) ; (alloc-string Vd Vs) - allocate string with size in Vs
+(defconstant +op-set-cenv+   #xBA)  ; (set-cenv Vs) - set closure-env register from Vs
+(defconstant +op-get-cenv+   #xBB)  ; (get-cenv Vd) - read closure-env register into Vd
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -479,6 +482,8 @@
 (defopcode :sap-addr   #xB7 (:reg :reg)              "Extract raw address from SAP")
 (defopcode :set-mv-count #xB8 (:imm8)                "Set MV count to imm8 (tagged store to MV-COUNT-ADDR)")
 (defopcode :alloc-string #xB9 (:reg :reg)            "Allocate string (subtag #x31) with size in reg")
+(defopcode :set-cenv     #xBA (:reg)                 "Set closure-env register from Vs (R13 on x64)")
+(defopcode :get-cenv     #xBB (:reg)                 "Read closure-env register into Vd (R13 on x64)")
 
 ;;; ============================================================
 ;;; Memory Width Constants

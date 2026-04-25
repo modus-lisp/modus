@@ -1833,6 +1833,11 @@
       ;; uncatchable per-test crash.
       ((= op-name (compute-name-hash "%MMAP-SHARED-PAGE"))
        (compile-mmap-shared (cdr form) env dest))
+      ;; (%get-cenv) — read the closure-env register (R13 on x64) into
+      ;; DEST. Used only by the closure body prologue to snapshot the
+      ;; env-list set by the caller's compile-funcall closure path.
+      ((= op-name (compute-name-hash "%GET-CENV"))
+       (emit-ir :get-cenv dest))
 
       ;; --- Error Handler (handler-case support) ---
       ;; (%hc-longjmp) — longjmp to nearest handler-case
@@ -2955,22 +2960,124 @@
       (setq form (list 'cdr form)))
     (list 'car form)))
 
+;;; ============================================================
+;;; Free-variable detection (for automatic closure capture)
+;;; ============================================================
+
+(defun %extract-lambda-param-names (params)
+  "Return the plain variable names from a lambda-list, dropping
+   lambda-list keywords and default-value forms."
+  (let ((result nil))
+    (dolist (p params)
+      (cond
+        ((symbolp p)
+         (unless (member p '(&optional &rest &key &aux &body &whole
+                             &allow-other-keys &environment))
+           (push p result)))
+        ((consp p)
+         (when (symbolp (car p)) (push (car p) result))
+         (when (and (consp (cddr p)) (symbolp (caddr p)))
+           (push (caddr p) result)))))
+    (nreverse result)))
+
+(defun %collect-free-vars-list (forms bound env acc)
+  (dolist (f forms) (setq acc (%collect-free-vars f bound env acc)))
+  acc)
+
+(defun %collect-free-vars (form bound env acc)
+  "Walk FORM; collect symbol references that are not in BOUND and ARE
+   present in ENV. The result is the list of outer-scope variables the
+   form references — i.e., what compile-lambda needs to copy into the
+   closure env-list."
+  (cond
+    ((null form) acc)
+    ((symbolp form)
+     (cond
+       ((member form '(t nil)) acc)
+       ((member form bound) acc)
+       ((env-lookup env form)
+        (if (member form acc) acc (cons form acc)))
+       (t acc)))
+    ((atom form) acc)
+    (t
+     (let ((head (car form)))
+       (cond
+         ((or (eq head 'quote) (eq head 'function)) acc)
+         ((eq head 'let)
+          (let ((bindings (cadr form))
+                (body (cddr form))
+                (new-bound bound))
+            (dolist (b bindings)
+              (cond
+                ((symbolp b) (push b new-bound))
+                ((consp b)
+                 (setq acc (%collect-free-vars (cadr b) bound env acc))
+                 (push (car b) new-bound))))
+            (%collect-free-vars-list body new-bound env acc)))
+         ((eq head 'let*)
+          (let ((bindings (cadr form))
+                (body (cddr form))
+                (cur-bound bound))
+            (dolist (b bindings)
+              (cond
+                ((symbolp b) (push b cur-bound))
+                ((consp b)
+                 (setq acc (%collect-free-vars (cadr b) cur-bound env acc))
+                 (push (car b) cur-bound))))
+            (%collect-free-vars-list body cur-bound env acc)))
+         ((eq head 'lambda)
+          (let ((params (cadr form))
+                (body (cddr form)))
+            (%collect-free-vars-list body
+                                     (append (%extract-lambda-param-names params) bound)
+                                     env acc)))
+         ((or (eq head 'flet) (eq head 'labels))
+          (let ((defs (cadr form))
+                (body (cddr form))
+                (fn-names (mapcar #'car (cadr form))))
+            (dolist (def defs)
+              (let ((params (cadr def)) (db (cddr def)))
+                (setq acc (%collect-free-vars-list
+                           db
+                           (append (%extract-lambda-param-names params)
+                                   (if (eq head 'labels) fn-names nil)
+                                   bound)
+                           env acc))))
+            (%collect-free-vars-list body (append fn-names bound) env acc)))
+         ((or (eq head 'dolist) (eq head 'dotimes))
+          (let* ((spec (cadr form))
+                 (var (car spec))
+                 (init (cadr spec))
+                 (body (cddr form)))
+            (setq acc (%collect-free-vars init bound env acc))
+            (%collect-free-vars-list body (cons var bound) env acc)))
+         ((or (eq head 'setq) (eq head 'psetq))
+          (let ((pairs (cdr form)))
+            (loop
+              (when (null pairs) (return acc))
+              (setq acc (%collect-free-vars (cadr pairs) bound env acc))
+              (setq pairs (cddr pairs)))))
+         (t (%collect-free-vars-list (cdr form) bound env acc)))))))
+
 (defun compile-lambda (params body env dest)
   "Compile (lambda (params) body*).
    Creates a named function for the lambda body. Registers it in the
    function table so FN-ADDR can resolve the bytecode offset to a
    native address for CALL-IND.
    When the lambda captures variables from the enclosing scope, builds
-   a closure object (cons fn-addr env-list) and emits code to load
-   captured values from CLOSURE-ENV-ADDR at function entry."
+   a closure object and emits code to load captured values from R13
+   (the closure-env register) into locals at function entry."
   (let* ((pp (preprocess-params params body))
          (actual-params (car pp))
          (actual-body (cdr pp))
-         ;; Find variables captured from outer scope
-         ;; Automatic closure creation is disabled — closures are only created
-         ;; manually via make-closure-object (see ansi-bridge.lisp).
-         ;; Automatic detection causes regressions for inline lambdas that
-         ;; happen to work via the parent-env stack access mechanism.
+         ;; The free-variable walker is implemented (see %collect-free-vars
+         ;; above) but auto-capture is left disabled here because enabling
+         ;; it caused -76 net passes on the ANSI suite even with R13-based
+         ;; env passing (regressions in number-comparison/assoc/labels/etc
+         ;; that don't themselves create closures). The walker correctly
+         ;; identified ~976 captures; the regression source is somewhere
+         ;; in how closure-allocation pressure or generated code interacts
+         ;; with the rest of the runtime — not in the env-passing slot.
          (captured-vars nil))
     (if (null captured-vars)
         ;; No captures: compile as before (plain function pointer)
@@ -2990,8 +3097,10 @@
                                      (or *current-function-name* "ANON")
                                      (make-compiler-label)))
                ;; Build let* bindings to extract captured vars from closure env.
-               ;; First binding: load env list from fixed address
-               (env-binding `(%closure-env (mem-ref ,+closure-env-addr+ :u64)))
+               ;; First binding: snapshot the closure-env register (R13)
+               ;; into a local. Once captured, R13 may be clobbered by
+               ;; any nested funcall without affecting our locals.
+               (env-binding `(%closure-env (%get-cenv)))
                ;; Remaining bindings: extract each captured var by position
                (var-bindings
                  (loop for var in captured-vars
@@ -4255,15 +4364,15 @@
         (free-temp-reg)   ; free cmp-reg
         (free-temp-reg)) ; free check-reg
       ;; === Closure path ===
-      ;; Slot 0 = fn-addr, slot 1 = env-list.
-      (let ((env-reg (alloc-temp-reg))
-            (addr-reg (alloc-temp-reg)))
+      ;; Slot 0 = fn-addr, slot 1 = env-list. Pass env via R13 (the
+      ;; closure-env register) so nested closure calls can't collide
+      ;; on a single global memory slot — each call writes R13 right
+      ;; before its own call-indirect, and the callee snapshots R13
+      ;; into a local at entry before any code that could re-funcall.
+      (let ((env-reg (alloc-temp-reg)))
         (emit-ir :obj-ref env-reg fn-call-reg 1)
         (emit-ir :obj-ref fn-call-reg fn-call-reg 0)
-        ;; Store env at fixed CLOSURE-ENV-ADDR (raw u64 write)
-        (emit-ir :li addr-reg +closure-env-addr+)
-        (emit-ir :store addr-reg env-reg +width-u64+)
-        (free-temp-reg)   ; free addr-reg
+        (emit-ir :set-cenv env-reg)
         (free-temp-reg))  ; free env-reg
       ;; Call the closure's function with same args
       (emit-ir :call-indirect fn-call-reg nargs)
@@ -6121,6 +6230,8 @@
       (:inc   2)
       (:dec   2)
       (:write-barrier 2)
+      (:set-cenv 2)
+      (:get-cenv 2)
 
       ;; 2-reg instructions: 1 opcode + 2 regs = 3 bytes
       (:mov   3)
@@ -6310,6 +6421,10 @@
            (mvm-dec buf (second insn)))
           (:write-barrier
            (mvm-write-barrier buf (second insn)))
+          (:set-cenv
+           (encode-instruction buf +op-set-cenv+ (second insn)))
+          (:get-cenv
+           (encode-instruction buf +op-get-cenv+ (second insn)))
 
           ;; ---- 2-reg instructions ----
           (:mov

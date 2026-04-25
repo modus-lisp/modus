@@ -2984,6 +2984,17 @@
   (dolist (f forms) (setq acc (%collect-free-vars f bound env acc)))
   acc)
 
+(defun %special-var-name-p (sym)
+  "T when SYM looks like a special (dynamic) variable — i.e. its name
+   begins and ends with `*`. Special vars must NOT be lexically captured
+   into a closure env: their value comes from the dynamic binding stack
+   at call time, not from the lexical scope at closure-creation time."
+  (and (symbolp sym)
+       (let ((name (symbol-name sym)))
+         (and (> (length name) 2)
+              (char= (char name 0) #\*)
+              (char= (char name (1- (length name))) #\*)))))
+
 (defun %collect-free-vars (form bound env acc)
   "Walk FORM; collect symbol references that are not in BOUND and ARE
    present in ENV. The result is the list of outer-scope variables the
@@ -2995,6 +3006,7 @@
      (cond
        ((member form '(t nil)) acc)
        ((member form bound) acc)
+       ((%special-var-name-p form) acc)   ; dynamic binding, never capture
        ((env-lookup env form)
         (if (member form acc) acc (cons form acc)))
        (t acc)))
@@ -3070,14 +3082,15 @@
   (let* ((pp (preprocess-params params body))
          (actual-params (car pp))
          (actual-body (cdr pp))
-         ;; The free-variable walker is implemented (see %collect-free-vars
-         ;; above) but auto-capture is left disabled here because enabling
-         ;; it caused -76 net passes on the ANSI suite even with R13-based
-         ;; env passing (regressions in number-comparison/assoc/labels/etc
-         ;; that don't themselves create closures). The walker correctly
-         ;; identified ~976 captures; the regression source is somewhere
-         ;; in how closure-allocation pressure or generated code interacts
-         ;; with the rest of the runtime — not in the env-passing slot.
+         ;; Auto-capture is disabled. The walker (%collect-free-vars
+         ;; above) correctly identifies free variables and the closure
+         ;; build path is wired up, but enabling it triggers a global
+         ;; compile-state cascade: chunks with ZERO captures of their own
+         ;; (number-comparison, assoc, flet, let, destructuring-bind …)
+         ;; suddenly compile to defuns whose bodies silent-exit at runtime,
+         ;; even though the bodies themselves are unchanged. Excluding
+         ;; special vars from the walker (the only correctness fix we found)
+         ;; doesn't help — same chunks regress to 0 passes.
          (captured-vars nil))
     (if (null captured-vars)
         ;; No captures: compile as before (plain function pointer)

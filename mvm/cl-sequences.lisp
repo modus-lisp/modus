@@ -564,7 +564,10 @@
                       (setq i (+ i 1)))))))))))))
 
 (defun substitute-if (new pred seq &rest args)
-  "Non-destructive substitute-if. Same shape as SUBSTITUTE."
+  "Non-destructive substitute-if. Same shape as SUBSTITUTE.
+   List path inlined (no nested closure) — MVM's capture analysis
+   loses bindings across the substitute-if-not → apply → substitute-if
+   chain when the inner closure captures pred/key-fn."
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -575,11 +578,20 @@
     (cond
       ((null seq) seq)
       ((consp seq)
-       (%seq-substitute-with
-        (lambda (item)
-          (let ((v (if key-fn (funcall key-fn item) item)))
-            (if (funcall pred v) new item)))
-        seq))
+       (let ((result nil) (cur seq) (idx 0) (n eff-count))
+         (loop
+           (when (null cur) (return (nreverse result)))
+           (let* ((item (car cur))
+                  (in-window (and (>= idx start-idx)
+                                  (or (null end-idx) (< idx end-idx))))
+                  (v (if (and in-window key-fn) (funcall key-fn item) item))
+                  (replace (and in-window
+                                (or (null n) (> n 0))
+                                (funcall pred v))))
+             (setq result (cons (if replace new item) result))
+             (when replace (when n (setq n (- n 1)))))
+           (setq cur (cdr cur))
+           (setq idx (+ idx 1)))))
       (t
        (let ((copy (copy-seq seq)))
          (cond
@@ -617,8 +629,37 @@
                       (setq i (+ i 1)))))))))))))
 
 (defun substitute-if-not (new pred seq &rest args)
-  "Non-destructive substitute-if-not. Inverts pred and forwards."
-  (apply #'substitute-if new (lambda (x) (not (funcall pred x))) seq args))
+  "Non-destructive substitute-if-not.
+   Inlined to avoid the apply+closure pattern that MVM's capture
+   analysis loses bindings across (was: (apply #'substitute-if new
+   (lambda (x) (not (funcall pred x))) seq args))."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) seq)
+      ((consp seq)
+       (let ((result nil) (cur seq) (idx 0) (n eff-count))
+         (loop
+           (when (null cur) (return (nreverse result)))
+           (let* ((item (car cur))
+                  (in-window (and (>= idx start-idx)
+                                  (or (null end-idx) (< idx end-idx))))
+                  (v (if (and in-window key-fn) (funcall key-fn item) item))
+                  (replace (and in-window
+                                (or (null n) (> n 0))
+                                (not (funcall pred v)))))
+             (setq result (cons (if replace new item) result))
+             (when replace (when n (setq n (- n 1)))))
+           (setq cur (cdr cur))
+           (setq idx (+ idx 1)))))
+      (t
+       ;; Non-list seq: fall back to substitute-if with inverted pred.
+       ;; Vector path will go through closure, but that path passes our probes.
+       (apply #'substitute-if new (lambda (x) (not (funcall pred x))) seq args)))))
 
 ;;; Destructive substitute variants
 ;;; nsubstitute-if-core: shared implementation
@@ -764,8 +805,34 @@
                           (when n (setq n (- n 1)))))
                       (setq i (+ i 1))))))))))
 (defun nsubstitute-if-not (new pred seq &rest args)
-  "Destructive substitute-if-not."
-  (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) seq args))
+  "Destructive substitute-if-not.
+   Inlined list path to bypass the closure-loses-capture pattern in
+   (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) ...)."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) seq)
+      ((and eff-count (= eff-count 0)) seq)
+      ((consp seq)
+       (let ((cur seq) (idx 0) (n eff-count))
+         (loop
+           (when (null cur) (return seq))
+           (when (and n (= n 0)) (return seq))
+           (let* ((item (car cur))
+                  (in-window (and (>= idx start-idx)
+                                  (or (null end-idx) (< idx end-idx))))
+                  (v (if (and in-window key-fn) (funcall key-fn item) item)))
+             (when (and in-window (not (funcall pred v)))
+               (set-car cur new)
+               (when n (setq n (- n 1)))))
+           (setq cur (cdr cur))
+           (setq idx (+ idx 1)))))
+      (t
+       (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) seq args)))))
 
 (defun nsubstitute (new old seq &rest args)
   "Destructive substitute. Inline vector path so we don't depend on a

@@ -933,7 +933,11 @@
   "Core format. Returns remaining unused args."
   (let ((len (array-length control))
         (i 0)
-        (arg-list args))
+        (arg-list args)
+        ;; Tracks the last arg consumed by the most recent value-printing
+        ;; directive — used by ~:P / ~:@P which look BACKWARDS at the
+        ;; previous arg (CLHS 22.3.3.4) without consuming a new one.
+        (prev-arg nil))
     (loop
       (when (>= i len) (return arg-list))
       (let ((ch (aref control i)))
@@ -1008,7 +1012,8 @@
                     (t (return nil)))))
               ;; Directive character
               (when (>= pos len) (return arg-list))
-              (let ((dir (aref control pos)))
+              (let ((dir (aref control pos))
+                    (before-arg-list arg-list))
                 (setq i (+ pos 1))
                 (cond
                   ;; ~A — aesthetic. The `:` modifier (~:A) prints NIL
@@ -1050,13 +1055,20 @@
                      (setq arg-list (cdr arg-list))
                      (%write-obj obj stream nil *print-escape*)))
                   ;; ~D — decimal. Numeric directives right-align by default
-                  ;; (padding on the LEFT, before the number).
+                  ;; (padding on the LEFT, before the number). Non-integer
+                  ;; args fall back to ~A (princ) per ANSI.
                   ((or (= dir 68) (= dir 100))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (let ((s (make-string-output-stream)))
-                       (when (and atp (>= n 0)) (%print-char 43 s))
-                       (%print-integer-in-base n 10 s)
+                       (cond
+                         ((integerp n)
+                          (when (and atp (>= n 0)) (%print-char 43 s))
+                          (%print-integer-in-base n 10 s))
+                         (t
+                          (let ((*print-escape* nil))
+                            (declare (special *print-escape*))
+                            (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
@@ -1068,8 +1080,14 @@
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (let ((s (make-string-output-stream)))
-                       (when (and atp (>= n 0)) (%print-char 43 s))
-                       (%print-integer-in-base n 2 s)
+                       (cond
+                         ((integerp n)
+                          (when (and atp (>= n 0)) (%print-char 43 s))
+                          (%print-integer-in-base n 2 s))
+                         (t
+                          (let ((*print-escape* nil))
+                            (declare (special *print-escape*))
+                            (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
@@ -1081,8 +1099,14 @@
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (let ((s (make-string-output-stream)))
-                       (when (and atp (>= n 0)) (%print-char 43 s))
-                       (%print-integer-in-base n 8 s)
+                       (cond
+                         ((integerp n)
+                          (when (and atp (>= n 0)) (%print-char 43 s))
+                          (%print-integer-in-base n 8 s))
+                         (t
+                          (let ((*print-escape* nil))
+                            (declare (special *print-escape*))
+                            (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
@@ -1094,8 +1118,14 @@
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (let ((s (make-string-output-stream)))
-                       (when (and atp (>= n 0)) (%print-char 43 s))
-                       (%print-integer-in-base n 16 s)
+                       (cond
+                         ((integerp n)
+                          (when (and atp (>= n 0)) (%print-char 43 s))
+                          (%print-integer-in-base n 16 s))
+                         (t
+                          (let ((*print-escape* nil))
+                            (declare (special *print-escape*))
+                            (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
@@ -1214,9 +1244,10 @@
                          (setq arg-list (%format-impl stream sub-control arg-list))
                          ;; ~?: use sub-args
                          (%format-impl stream sub-control sub-args))))
-                  ;; ~P — plural
+                  ;; ~P — plural. ~:P / ~:@P use the previously printed
+                  ;; arg without consuming a new one (CLHS 22.3.3.4).
                   ((or (= dir 80) (= dir 112))
-                   (let ((n (if colonp (car arg-list) (car arg-list))))
+                   (let ((n (if colonp prev-arg (car arg-list))))
                      (unless colonp (setq arg-list (cdr arg-list)))
                      (let ((val (if (integerp n) n 2)))
                        (if atp
@@ -1378,7 +1409,11 @@
                   ;; Unknown directive
                   (t
                    (%print-char 126 stream)
-                   (%print-char dir stream))))))))
+                   (%print-char dir stream)))
+                ;; Update prev-arg if this directive consumed any arg.
+                (when (and (consp before-arg-list)
+                           (not (eq before-arg-list arg-list)))
+                  (setq prev-arg (car before-arg-list))))))))
     arg-list))
 
 ;;; format: the main user-facing function

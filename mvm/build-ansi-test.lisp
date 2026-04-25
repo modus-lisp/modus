@@ -2513,7 +2513,8 @@
   ;; Initialize condition type registry
   (%init-condition-types)
 
-  ;; Initialize symbol-function table with all built-in compiled functions
+  ;; Initialize symbol-function table with all built-in compiled functions.
+  ;; Also populates *native-sym-function-table* for (funcall 'sym ...).
   (%init-symbol-function-table)
 
   ;; Install signal handlers (SIGSEGV/etc) — converts hardware faults to

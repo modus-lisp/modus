@@ -4198,8 +4198,46 @@
     ;; inline here; anything else falls through to direct call.
     (let ((fn-call-reg (alloc-temp-reg))
           (direct-call-label (make-compiler-label))
-          (after-call-label (make-compiler-label)))
+          (after-call-label (make-compiler-label))
+          (after-sym-label (make-compiler-label)))
       (emit-ir :pop fn-call-reg)
+      ;; ============================================================
+      ;; Native MVM symbol dispatch: subtag #x50 with exactly 1 slot
+      ;; (hash only). CL symbols (3 slots) and closures (subtag #x52)
+      ;; are excluded by the combined test. If matched, call the
+      ;; runtime resolver to get the actual function, then continue
+      ;; through the closure-or-direct dispatch below.
+      ;; ============================================================
+      (let ((check-reg (alloc-temp-reg))
+            (cmp-reg   (alloc-temp-reg)))
+        (emit-ir :obj-tag check-reg fn-call-reg)
+        (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+        (emit-ir :cmp check-reg cmp-reg)
+        (emit-ir :bne after-sym-label)
+        (emit-ir :obj-subtag check-reg fn-call-reg)
+        (emit-ir :li cmp-reg (ash #x50 +fixnum-shift+))
+        (emit-ir :cmp check-reg cmp-reg)
+        (emit-ir :bne after-sym-label)
+        (emit-ir :array-len check-reg fn-call-reg)
+        (emit-ir :li cmp-reg (ash 1 +fixnum-shift+))
+        (emit-ir :cmp check-reg cmp-reg)
+        (emit-ir :bne after-sym-label)
+        (free-temp-reg)   ; free cmp-reg
+        (free-temp-reg)) ; free check-reg
+      ;; Confirmed native MVM symbol. Save V0-V3 (hold call args),
+      ;; call resolver, replace fn-call-reg with the returned function.
+      (emit-ir :push +vreg-v0+)
+      (emit-ir :push +vreg-v1+)
+      (emit-ir :push +vreg-v2+)
+      (emit-ir :push +vreg-v3+)
+      (emit-ir :mov +vreg-v0+ fn-call-reg)
+      (emit-ir :call "%NATIVE-SYM-RESOLVE" 1)
+      (emit-ir :mov fn-call-reg +vreg-vr+)
+      (emit-ir :pop +vreg-v3+)
+      (emit-ir :pop +vreg-v2+)
+      (emit-ir :pop +vreg-v1+)
+      (emit-ir :pop +vreg-v0+)
+      (emit-ir-label after-sym-label)
       ;; Detect closure object: must have object-tag AND subtag-closure.
       (let ((check-reg (alloc-temp-reg))
             (cmp-reg   (alloc-temp-reg)))

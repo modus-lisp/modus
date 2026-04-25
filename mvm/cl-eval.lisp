@@ -14,6 +14,45 @@
   "Initialize the symbol-function table (empty hash table)."
   (setq *symbol-function-table* (make-hash-table)))
 
+;;; Parallel hash → function table, keyed by the 60-bit FNV-1a hash that
+;;; native MVM symbols carry in slot 0. ANSI (funcall 'sym ...) / (apply
+;;; 'sym ...) must dispatch through this when sym is a native MVM symbol
+;;; (subtag #x50, element-count 1) — those carry only a hash, no name
+;;; string, so the string-keyed *symbol-function-table* can't find them.
+;;; Populated by mirroring *symbol-function-table* into hash keys.
+(defvar *native-sym-function-table* nil)
+
+(defun %nsft-init ()
+  (setq *native-sym-function-table* (make-hash-table)))
+
+(defun %nsft-populate-from (src)
+  "Walk SRC hash-table internal alist and mirror each (name-string → fn)
+   entry as (name-hash → fn) into *native-sym-function-table*.
+   Written without maphash to avoid closure-capture issues."
+  (let ((cur (car src)))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (puthash (compute-name-hash (car pair))
+                 *native-sym-function-table*
+                 (cdr pair)))
+      (setq cur (cdr cur)))))
+
+(defun %native-sym-resolve (sym)
+  "Given a native MVM symbol, return its function value. Signals
+   UNDEFINED-FUNCTION if unbound. Called from compile-funcall's
+   symbol-dispatch branch."
+  (let ((h (aref sym 0)))
+    (let ((fn (if *native-sym-function-table*
+                  (gethash h *native-sym-function-table*)
+                  nil)))
+      (if fn
+          fn
+          (let ((c (%make-condition 'undefined-function (list :name sym))))
+            (if (%error-handler-active-p)
+                (%hc-longjmp)
+                (progn (error "undefined function (native sym)") nil)))))))
+
 (defun symbol-function (sym)
   "Return the function object for SYM, or signal undefined-function."
   (let ((name (cond
@@ -43,6 +82,10 @@
     (unless *symbol-function-table*
       (%sft-init))
     (puthash name *symbol-function-table* fn)
+    ;; Mirror into the hash-keyed table so native MVM symbol funcall
+    ;; (which has no name string, only a hash) can see the update too.
+    (when *native-sym-function-table*
+      (puthash (compute-name-hash name) *native-sym-function-table* fn))
     fn))
 
 (defun fboundp (sym)
@@ -990,9 +1033,13 @@
 (defun %init-symbol-function-table ()
   "Populate *symbol-function-table* with all built-in compiled functions.
    Uses puthash with string keys to avoid calling intern (which can crash
-   when *all-packages* is in a partially initialized state)."
+   when *all-packages* is in a partially initialized state).
+   Also populates *native-sym-function-table* (hash-keyed mirror) so
+   that (funcall 'sym ...) can resolve native MVM symbols."
   (%sft-init)
   (%init-sft-list *symbol-function-table*)
+  (%nsft-init)
+  (%nsft-populate-from *symbol-function-table*)
   nil)
 
 (defun not-mv (x) (not x))

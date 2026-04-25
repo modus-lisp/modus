@@ -1,8 +1,8 @@
 # ANSI test notes — session log
 
-State as of last session: **8572 passes / 9521 fails / 0 lost**
+State as of last session: **8862 passes / 9231 fails / 0 lost**
 (was 7048 / 9429 / 1215 at session start). Net
-**+1524 passes / +92 fails / −1215 lost** across eight commits:
+**+1814 passes / −198 fails / −1215 lost** across nine commits:
 
 - Paren-bug fix in `%format-impl`: +23 passes, -111 lost
 - `extended-char.3` fork-crash workaround: +97 passes, -133 lost
@@ -61,7 +61,17 @@ Later in the session:
   longer collides on a global slot when nested closures call each
   other. +1 pass (clean substitution, no regression).
 
-## Closure-mechanism investigation (open)
+- **Closure auto-capture finally lit up.** Rewrote the free-variable
+  walker to use direct `(rec (cdr form) (rec (car form) acc))` style
+  instead of the dolist-based `cfv-list` mutual recursion that was
+  triggering the regression cascade. Same captures, same closures —
+  but the dolist shape silently dropped chunks from the binary at MVM
+  compile time. We don't have an SBCL-side explanation; the rec shape
+  doesn't trigger it. +290 passes from substitute/find/count/format-
+  circumflex/format-brace/nintersection/position/adjoin families
+  unlocking now that closure-returning library helpers actually work.
+
+## Closure-mechanism investigation (resolved-but-mysterious)
 
 Wrote a free-variable walker (`%collect-free-vars` family) that
 correctly identifies free vars in lambda bodies, including a

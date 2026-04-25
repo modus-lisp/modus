@@ -1,8 +1,8 @@
 # ANSI test notes — session log
 
-State as of last session: **8907 passes / 9197 fails / 0 lost**
+State as of last session: **8909 passes / 9195 fails / 0 lost**
 (was 7048 / 9429 / 1215 at session start). Net
-**+1859 passes / −232 fails / −1215 lost** across eleven commits:
+**+1861 passes / −234 fails / −1215 lost** across twelve commits:
 
 - Paren-bug fix in `%format-impl`: +23 passes, -111 lost
 - `extended-char.3` fork-crash workaround: +97 passes, -133 lost

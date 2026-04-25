@@ -1,8 +1,8 @@
 # ANSI test notes — session log
 
-State as of last session: **8512 passes / 9581 fails / 0 lost**
+State as of last session: **8572 passes / 9521 fails / 0 lost**
 (was 7048 / 9429 / 1215 at session start). Net
-**+1464 passes / +152 fails / −1215 lost** across six wins:
+**+1524 passes / +92 fails / −1215 lost** across eight commits:
 
 - Paren-bug fix in `%format-impl`: +23 passes, -111 lost
 - `extended-char.3` fork-crash workaround: +97 passes, -133 lost
@@ -39,11 +39,91 @@ The three "lost" IDs reported by range-based analysis (12372, 24909,
 get a deftest emitted, so they exist in `/tmp/ansi-file-ranges.txt`
 but there's no corresponding test to run.
 
-Measured 2026-04-24. Pass rate of tests that ran cleanly:
-8512 / (8512 + 1943 real fails) = **81.4%** (up from 79.8%).
-Overall pass rate: 8512 / 17692 = **48.1%**.
-The remaining 7752 crash-fails are runtime SIGSEGVs; the substitute /
-count / format-circumflex / numbers chunks are the next big surfaces.
+Later in the session:
+
+- **substitute-if{,-not}, nsubstitute-if-not list path inlined** to
+  bypass MVM's lost-capture across the apply+closure chain. +51 passes.
+
+- **funcall on a native MVM symbol now actually dispatches.** Added a
+  hash-keyed parallel `*native-sym-function-table*` mirrored from
+  `*symbol-function-table*` at boot, plus a `compile-funcall` branch
+  that detects subtag #x50 / element-count 1 / matched in the table
+  and routes through `%native-sym-resolve` (signals UNDEFINED-FUNCTION
+  if no binding). Fixes ANSI's required `(funcall 'sym ...)` path.
+  +8 passes (the substitute family that motivated this change is
+  blocked behind a different issue — closure capture — not this one).
+
+- **Closure env passed via R13 register, not a global memory slot.**
+  Replaced the single `+CLOSURE-ENV-ADDR+` (#x10000140) with a
+  reserved x86-64 register (R13 was unused). New IR opcodes
+  `:set-cenv` / `:get-cenv` handle the transfer; closure body's
+  `(%get-cenv)` snapshot at entry stays the same in shape but no
+  longer collides on a global slot when nested closures call each
+  other. +1 pass (clean substitution, no regression).
+
+## Closure-mechanism investigation (open)
+
+Wrote a free-variable walker (`%collect-free-vars` family) that
+correctly identifies free vars in lambda bodies, including a
+special-var exclusion (`*foo*` patterns aren't lexically captured).
+At ~845 captures across the build, enabling auto-capture causes a
+**−76 pass regression** that is *not* about the env-passing
+mechanism (R13-only is +1) and *not* about correctness of the
+walker itself. Confirmed with chunk-entry markers: when the walker
+is invoked at compile-lambda time, run-ansi-NUMBER-COMPARISON (and
+~12 other chunks: assoc, rassoc, labels, destructuring-bind, flet,
+equalp, letstar, let, loop2-5, member-if{,-not}, nsublis, sublis,
+multiple-value-setq, with-hash-table-iterator) silently exits — its
+defun's first form (`(write-string-serial "[E:...]")`) never prints,
+even though the *caller* lambda's first form (the analogous
+`[C:...]`) does.
+
+Reproducer:
+
+```
+(let* ((_walker (%collect-free-vars-list actual-body nil nil nil))
+       (captured-vars nil))
+  (declare (ignore _walker))
+  ...)
+```
+
+A walker call with **NIL env** — guaranteed pure traversal, can't
+find any captures, returns NIL — still reproduces the regression.
+Replacing the walker call with anything else of similar shape
+(`(length actual-body)`, a hand-written deep-walk no-op, just
+`(%extract-lambda-param-names actual-params)`) does **not** cause
+the regression. Only `%collect-free-vars-list` does.
+
+Binary size: 32.66MB without walker, 31.87MB with walker. Smaller =
+some ~800KB of compiled code is missing — almost exactly matching
+the test wrappers in the regressed chunks. So the chunks aren't
+just silent at runtime; they fail to compile cleanly. But there's
+no translator error, no SBCL warning specific to those chunks, no
+"WARN: giving up" — the build looks normal, the binary just lacks
+those defuns.
+
+Open hypotheses, none confirmed:
+- SBCL form-traversal mutates something that affects later
+  compilation (cons-cell sharing? hash-cons interning? GC pressure?)
+- Walker recursion through `cdr` chains tickles a SBCL compiler bug
+- Some `let*` in my walker shadows a special variable the MVM
+  compiler relies on
+- `*compiler-label-counter*` advances during walker-invoked side
+  effects we haven't found
+
+Next-session path: 1) bisect the walker — start from a literal
+no-op and add operations one at a time until the regression appears;
+2) introspect *functions* hash-table size with vs without walker;
+3) compare the SBCL macro-expansion of compile-lambda walker-on vs
+walker-off for a specific defun. The R13 plumbing and the special-var
+exclusion are committed and ready when this lands.
+
+Measured 2026-04-25. Pass rate of tests that ran cleanly:
+8572 / (8572 + 1942 real fails) = **81.5%** (up from 79.8%).
+Overall pass rate: 8572 / 17692 = **48.5%**.
+The remaining 7681 crash-fails are runtime SIGSEGVs; substitute /
+count / format-circumflex / numbers / typecase / format directives
+are the next big surfaces.
 
 Historical:
 (+460 passes and +126 lost since 6588 / ~10000 / 1089 at the start

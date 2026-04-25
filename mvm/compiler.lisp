@@ -4409,7 +4409,7 @@
         (emit-ir :obj-ref fn-call-reg fn-call-reg 0)
         (emit-ir :set-cenv env-reg)
         (free-temp-reg))  ; free env-reg
-      ;; Call the closure's function with same args
+      ;; Call the closure's function with same args.
       (emit-ir :call-indirect fn-call-reg nargs)
       (emit-ir :br after-call-label)
       ;; === Direct call path (non-closure) ===
@@ -6267,6 +6267,8 @@
       (:write-barrier 2)
       (:set-cenv 2)
       (:get-cenv 2)
+      (:set-nargs 2)   ; opcode + imm8
+      (:get-nargs 2)   ; opcode + reg
 
       ;; 2-reg instructions: 1 opcode + 2 regs = 3 bytes
       (:mov   3)
@@ -6460,6 +6462,10 @@
            (encode-instruction buf +op-set-cenv+ (second insn)))
           (:get-cenv
            (encode-instruction buf +op-get-cenv+ (second insn)))
+          (:set-nargs
+           (encode-instruction buf +op-set-nargs+ (second insn)))
+          (:get-nargs
+           (encode-instruction buf +op-get-nargs+ (second insn)))
 
           ;; ---- 2-reg instructions ----
           (:mov

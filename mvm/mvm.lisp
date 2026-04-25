@@ -57,6 +57,7 @@
    #:+op-set-mv-count+
    #:+op-alloc-string+
    #:+op-set-cenv+ #:+op-get-cenv+
+   #:+op-set-nargs+ #:+op-get-nargs+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -343,6 +344,8 @@
 (defconstant +op-alloc-string+ #xB9) ; (alloc-string Vd Vs) - allocate string with size in Vs
 (defconstant +op-set-cenv+   #xBA)  ; (set-cenv Vs) - set closure-env register from Vs
 (defconstant +op-get-cenv+   #xBB)  ; (get-cenv Vd) - read closure-env register into Vd
+(defconstant +op-set-nargs+  #xBC)  ; (set-nargs imm8) - set nargs reg (RAX) before call
+(defconstant +op-get-nargs+  #xBD)  ; (get-nargs Vd) - read nargs reg into Vd (callee entry)
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -484,6 +487,8 @@
 (defopcode :alloc-string #xB9 (:reg :reg)            "Allocate string (subtag #x31) with size in reg")
 (defopcode :set-cenv     #xBA (:reg)                 "Set closure-env register from Vs (R13 on x64)")
 (defopcode :get-cenv     #xBB (:reg)                 "Read closure-env register into Vd (R13 on x64)")
+(defopcode :set-nargs    #xBC (:imm8)                "Set nargs register (RAX) to imm8 — caller side, before :call-indirect")
+(defopcode :get-nargs    #xBD (:reg)                 "Read nargs register (RAX) into Vd — callee side, first prologue op")
 
 ;;; ============================================================
 ;;; Memory Width Constants

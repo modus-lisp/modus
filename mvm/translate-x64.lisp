@@ -1621,6 +1621,27 @@
            (emit-mov-reg-reg buf d 'r13)
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-set-nargs+)
+         ;; Set RAX = nargs (untagged immediate). Used by caller of
+         ;; :call-indirect just before the call so callee's prologue
+         ;; can read nargs and pack &rest args into a list.
+         (let ((n (first operands)))
+           ;; mov eax, imm32 — small imm fits in 32-bit form
+           (emit-bytes buf #xB8)         ; mov eax, imm32
+           (emit-bytes buf (logand n #xFF)
+                            (logand (ash n -8) #xFF)
+                            (logand (ash n -16) #xFF)
+                            (logand (ash n -24) #xFF))))
+
+        ((op= +op-get-nargs+)
+         ;; Read RAX into Vd as the LAST thing the callee's prologue
+         ;; needs from the nargs convention. After this point RAX is
+         ;; freely reusable by the callee (return value path).
+         (let* ((vd (first operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-mov-reg-reg buf d 'rax)
+           (maybe-store-scratch buf vd)))
+
         ((op= +op-alloc-string+)
          ;; Like alloc-array but with string subtag #x31
          (let* ((vd (first operands))

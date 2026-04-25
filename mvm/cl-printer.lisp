@@ -1049,7 +1049,8 @@
                    (let ((obj (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (%write-obj obj stream nil *print-escape*)))
-                  ;; ~D — decimal
+                  ;; ~D — decimal. Numeric directives right-align by default
+                  ;; (padding on the LEFT, before the number).
                   ((or (= dir 68) (= dir 100))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
@@ -1060,7 +1061,7 @@
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
                                        (if param3 param3 0)
-                                       (if param4 param4 32) stream)
+                                       (if param4 param4 32) stream :right-align)
                              (%print-string-raw str stream))))))
                   ;; ~B — binary
                   ((or (= dir 66) (= dir 98))
@@ -1073,7 +1074,7 @@
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
                                        (if param3 param3 0)
-                                       (if param4 param4 32) stream)
+                                       (if param4 param4 32) stream :right-align)
                              (%print-string-raw str stream))))))
                   ;; ~O — octal
                   ((or (= dir 79) (= dir 111))
@@ -1086,7 +1087,7 @@
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
                                        (if param3 param3 0)
-                                       (if param4 param4 32) stream)
+                                       (if param4 param4 32) stream :right-align)
                              (%print-string-raw str stream))))))
                   ;; ~X — hexadecimal
                   ((or (= dir 88) (= dir 120))
@@ -1099,7 +1100,7 @@
                          (if param1
                              (%fmt-pad str param1 (if param2 param2 1)
                                        (if param3 param3 0)
-                                       (if param4 param4 32) stream)
+                                       (if param4 param4 32) stream :right-align)
                              (%print-string-raw str stream))))))
                   ;; ~R — radix
                   ((or (= dir 82) (= dir 114))

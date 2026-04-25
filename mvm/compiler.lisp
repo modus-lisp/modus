@@ -3364,16 +3364,43 @@
              ;; (binding NIL would error since it's a constant).
              (when (null var) (setf var (gensym "FORNIL")))
              (when (consp var)
-               ;; Destructuring FOR (a b) ... — skip until next loop keyword
-               (loop while (and rest (not (and (symbolp (car rest))
-                                               (cl-loop-keyword-p (car rest)))))
-                     do (setf rest (cdr rest))))
-             (when (and (not (consp var)) rest)
+               ;; Destructuring FOR (a b ...) = vals — handle the (a b ...)
+               ;; flat case (no nesting, no dotted tail).  Capture vals in a
+               ;; gensym, push one general-iter for the gensym, then push
+               ;; (nth k g) iters for each component a, b, ….  The 'rest'
+               ;; advances past the value form; subsequent loop keywords
+               ;; resume at the proper place.  Required for floor.1-fn et al.
+               ;; (`for (q r) = (multiple-value-list (floor n d))`).
+               (let ((components var))
+                 (when (and rest (symbolp (car rest))
+                            (= (normalize-name (car rest)) 1009698407182718722))  ; =
+                   (let ((value-form (cadr rest))
+                         (g (gensym "DSTR")))
+                     (setf rest (cddr rest))
+                     ;; Iter for the captured value.
+                     (push (make-loop-iter :kind :general :var g
+                                           :init-form value-form
+                                           :step-form value-form)
+                           (loop-state-iterations state))
+                     ;; Iter for each component, picking from g via NTH.
+                     (let ((idx 0))
+                       (dolist (comp components)
+                         (let ((acc `(nth ,idx ,g)))
+                           (push (make-loop-iter :kind :general :var comp
+                                                 :init-form acc
+                                                 :step-form acc)
+                                 (loop-state-iterations state)))
+                         (setf idx (+ idx 1)))))
+                   ;; Skip the rest of any FOR-clause we replaced — exit the
+                   ;; outer (when (consp var) ...) without falling into the
+                   ;; consume-iter-keyword path below.
+                   (setf var nil))))
+             (when (and var (not (consp var)) rest)
              ;; Skip OF-TYPE type-spec — we ignore type declarations.
              (when (and (symbolp (car rest))
                         (= (normalize-name (car rest)) 729509721274984859))
                (setf rest (cddr rest)))
-             (when (and (not (consp var)) rest)
+             (when (and var (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
                (cond
                  ;; FOR var [FROM/UPFROM/DOWNFROM start] [TO/BELOW/DOWNTO/ABOVE end] [BY step]
@@ -4634,16 +4661,22 @@
          (free-temp-reg))))))
 
 (defun compile-mod (args env dest)
-  "Compile (mod a b) - integer modulus, remainder to DEST.
-   Push/pop dest around second operand to survive function calls."
+  "Compile (mod a b) — CL floor-style modulus.
+   :mod IR is truncate-rem (sign of n), so (mod -5 3) would yield -2.
+   CL mod returns r with sign(r)=sign(d), so we expand inline as the
+   trunc-rem then adjust if sign mismatch."
   (destructuring-bind (a b) args
-    (let ((temp (alloc-temp-reg)))
-      (compile-form a env dest)
-      (emit-ir :push dest)
-      (compile-form b env temp)
-      (emit-ir :pop dest)
-      (emit-ir :mod dest dest temp)
-      (free-temp-reg))))
+    (let ((n-sym (gensym "MN"))
+          (d-sym (gensym "MD"))
+          (r-sym (gensym "MR")))
+      (compile-form
+        `(let* ((,n-sym ,a)
+                (,d-sym ,b)
+                (,r-sym (- ,n-sym (* (truncate ,n-sym ,d-sym) ,d-sym))))
+           (if (and (not (zerop ,r-sym)) (not (eq (< ,r-sym 0) (< ,d-sym 0))))
+               (+ ,r-sym ,d-sym)
+               ,r-sym))
+        env dest))))
 
 ;;; ============================================================
 ;;; Comparison Operations

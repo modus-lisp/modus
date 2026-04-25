@@ -1007,7 +1007,18 @@
                   (unless (if test (funcall test v1 v2) (eql v1 v2))
                     (return (+ start1 i)))))
               (setq i (+ i 1))))))))
-(defun random (n &rest state) (declare (ignore state)) (mod (ash (logxor (* 6364136223846793005 (mem-ref #x100000A0 :u64)) 1442695040888963407) -17) n))
+;; 30-bit LCG (a=1664525, c=1013904223, m=2^30) — period 2^30, plenty for
+;; ANSI tests' 1000-iteration loops.  Old version forgot to write the new
+;; seed back, so every call returned the same value and floor.1-fn et al.
+;; tested floor on 1000 copies of the same (n,d) instead of 1000 random pairs.
+;; Uses inline truncate-rem (next is positive, n is positive — sign matches
+;; sign of d, so rem == mod in this regime) to stay fast.
+(defun random (n &rest state)
+  (declare (ignore state))
+  (let* ((seed (mem-ref #x100000A0 :u64))
+         (next (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF)))
+    (setf (mem-ref #x100000A0 :u64) next)
+    (- next (* (truncate next n) n))))
 (defun do-special-strings (fn) (funcall fn ""))
 (defun typep* (obj type) (typep obj type))
 

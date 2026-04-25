@@ -1166,8 +1166,42 @@
 (defun abs (n) (if (< n 0) (- 0 n) n))
 (defun max (a &rest more) (let ((r a)) (dolist (x more r) (when (> x r) (setq r x)))))
 (defun min (a &rest more) (let ((r a)) (dolist (x more r) (when (< x r) (setq r x)))))
-(defun floor (n &optional (d 1)) (let ((q (truncate n d))) (values q (- n (* q d)))))
-(defun ceiling (n &optional (d 1)) (let ((q (truncate n d))) (if (zerop (- n (* q d))) (values q 0) (values (+ q 1) (- n (* (+ q 1) d))))))
+;; CL floor: q toward -∞, r = n - q·d (sign of r matches sign of d when r≠0).
+;; truncate gives q toward 0, so when sign(r_t) ≠ sign(d) we adjust.
+(defun floor (n &optional (d 1))
+  (let* ((q (truncate n d))
+         (r (- n (* q d))))
+    (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
+        (values (- q 1) (+ r d))
+        (values q r))))
+;; CL ceiling: q toward +∞, sign(r) opposite of sign(d) when r≠0.
+(defun ceiling (n &optional (d 1))
+  (let* ((q (truncate n d))
+         (r (- n (* q d))))
+    (if (and (not (zerop r)) (eq (< r 0) (< d 0)))
+        (values (+ q 1) (- r d))
+        (values q r))))
+;; CL round: nearest integer, ties to even.  Compute floor first; r_f is in
+;; [0, |d|) (with d's sign).  Compare 2·|r_f| with |d| to pick floor or ceil.
+(defun round (n &optional (d 1))
+  (let* ((q (truncate n d))
+         (r (- n (* q d)))
+         ;; Adjust to floor result (q_f, r_f).
+         (q-f (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
+                  (- q 1) q))
+         (r-f (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
+                  (+ r d) r))
+         ;; q_c = q_f + 1, r_c = r_f - d.
+         (q-c (+ q-f 1))
+         (r-c (- r-f d))
+         (a-f (abs r-f))
+         (a-c (abs r-c)))
+    (cond
+      ((< a-f a-c) (values q-f r-f))
+      ((> a-f a-c) (values q-c r-c))
+      ;; Tie — round to even.
+      ((zerop (rem q-f 2)) (values q-f r-f))
+      (t (values q-c r-c)))))
 (defun rem (n d) (- n (* (truncate n d) d)))
 (defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
 (defun expt (base power) (cond ((= power 0) 1) ((= power 1) base)

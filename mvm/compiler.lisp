@@ -4600,12 +4600,8 @@
          (free-temp-reg))))))
 
 (defun compile-sub (args env dest)
-  "Compile (- args...).  Unary negation and pairwise subtraction.
-   Inline fixnum :sub — no ratio dispatch yet (the bytecode-layout
-   shift from adding tag-check+slow-path to two more arith ops on
-   top of compile-add tipped ~80 unrelated tests via the documented
-   function-size threshold flip; revisit when that compiler-stability
-   item lands in TODO.md)."
+  "Compile (- args...).  Unary :neg inline, pairwise via emit-arith-pair
+   with GENERIC-SUBTRACT slow path."
   (cond
     ((null args) (compile-integer 0 dest))
     ((null (cdr args))
@@ -4620,12 +4616,13 @@
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
-         (emit-ir :sub dest dest temp)
+         (emit-arith-pair :sub "GENERIC-SUBTRACT" dest temp)
          (free-temp-reg))))))
 
 (defun compile-mul (args env dest)
-  "Compile (* args...).  Inline fixnum :mul — see compile-sub for the
-   ratio-dispatch deferral note."
+  "Compile (* args...).  Inline :mul — multiply gets called in tight
+   inner loops (sort, mapcar with arithmetic, hash-table rehash) and
+   the dispatch overhead pushes those tests past the SIGALRM budget."
   (cond
     ((null args) (compile-integer 1 dest))
     ((null (cdr args)) (compile-form (car args) env dest))

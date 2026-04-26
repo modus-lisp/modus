@@ -47,6 +47,7 @@
 (defconstant +subtag-bignum+ #x30)
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
+(defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-symbol+ #x50)
 (defconstant +subtag-closure+ #x52)
 (defconstant +subtag-float+  #x60)
@@ -1731,6 +1732,18 @@
       ((= op-name 721461107543724402)        (compile-sub (cdr form) env dest))
       ((= op-name 847564926404219517)        (compile-mul (cdr form) env dest))
       ((= op-name 757490770535469248)        (compile-div (cdr form) env dest))
+      ;; %IDIV-TRUNC — raw integer division (truncate toward zero), one
+      ;; pair only.  Used by EXACT-DIVIDE / TRUNCATE / generic helpers
+      ;; that need plain IDIV without going through the rational-aware /.
+      ((= op-name 61935208432995099)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :div dest dest temp)
+           (free-temp-reg))))
       ((= op-name 701100176259851453)       (compile-1+ (cadr form) env dest))
       ((= op-name 593011189432099851)       (compile-1- (cadr form) env dest))
       ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
@@ -1782,6 +1795,7 @@
       ((= op-name 1005235261373835305)     (when (arity-ok-p form 1 1 env dest) (compile-symbolp (cadr form) env dest)))
       ((= op-name 701502595840197579)      (when (arity-ok-p form 1 1 env dest) (compile-obj-subtag (cadr form) env dest)))
       ((= op-name 1091515641497713485)     (when (arity-ok-p form 1 1 env dest) (compile-bignump (cadr form) env dest)))
+      ((= op-name 113022884777089022)      (when (arity-ok-p form 1 1 env dest) (compile-ratiop (cadr form) env dest)))
       ((= op-name 1024588698656382250)     (when (arity-ok-p form 1 1 env dest) (compile-stringp (cadr form) env dest)))
       ((= op-name 959229030243575902)      (when (arity-ok-p form 1 1 env dest) (compile-arrayp (cadr form) env dest)))
       ((= op-name 467922512990154729)      (when (arity-ok-p form 1 1 env dest) (compile-integerp (cadr form) env dest)))
@@ -1915,6 +1929,7 @@
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
       ((= op-name 559186982902022686)   (compile-alloc-sym3 dest))   ; %alloc-sym3
       ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
+      ((= op-name 735635543474837196)   (compile-make-ratio dest))   ; %make-ratio
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
       ;; --- Closure construction ---
       ;; (%make-closure fn env) -> tag-object / subtag-0x52, 2 slots.
@@ -4607,25 +4622,36 @@
     (free-temp-reg)))
 
 (defun compile-div (args env dest)
-  "Compile (/ a b). Truncating integer division for tagged fixnums.
-   Push/pop dest around divisor to survive function calls."
+  "Compile (/ a b ...).  Integer-truncate by default (fast path).  When
+   the division isn't exact and both operands are integers, returns a
+   tagged ratio (subtag #x33).  Float / float-mixed cases keep the raw
+   integer-division behaviour because we don't have float arithmetic
+   yet — the tests that rely on float-floor() etc. were happening to
+   pass on garbage; a future float pass will revisit them.
+
+   Implementation: emit code that calls EXACT-DIVIDE only when both
+   operands are integers; otherwise falls through to the old :div IR.
+   This avoids the regression cascade that surfaces when EXACT-DIVIDE
+   is invoked on floats (its (mod a b) check goes wrong)."
   (when (null args)
-    ;; (/) with no args signals error at runtime
     (compile-form `(error "/ requires at least one argument") env dest)
     (return-from compile-div nil))
   (if (null (cdr args))
-      ;; (/ x) = 1/x (not meaningful for integers, just return x)
-      (compile-form (car args) env dest)
-      ;; (/ a b ...) -- divide pairwise
-      (progn
-        (compile-form (car args) env dest)
+      ;; (/ x) — recip; for integer x ≠ ±1 this is 1/x as a ratio.
+      (compile-form `(if (integerp ,(car args))
+                         (exact-divide 1 ,(car args))
+                         (%idiv-trunc 1 ,(car args)))
+                    env dest)
+      ;; (/ a b …) — pairwise; per-step rational dispatch.
+      (let ((acc (car args)))
         (dolist (arg (cdr args))
-          (let ((temp (alloc-temp-reg)))
-            (emit-ir :push dest)
-            (compile-form arg env temp)
-            (emit-ir :pop dest)
-            (emit-ir :div dest dest temp)
-            (free-temp-reg))))))
+          (let ((a-sym (gensym "DA"))
+                (b-sym (gensym "DB")))
+            (setq acc `(let ((,a-sym ,acc) (,b-sym ,arg))
+                         (if (and (integerp ,a-sym) (integerp ,b-sym))
+                             (exact-divide ,a-sym ,b-sym)
+                             (%idiv-trunc ,a-sym ,b-sym))))))
+        (compile-form acc env dest))))
 
 (defun compile-1+ (arg env dest)
   "Compile (1+ x) -> add tagged 1 (which is 2)"
@@ -4723,22 +4749,64 @@
 ;;; ============================================================
 
 (defun compile-compare-2 (branch-op a b env dest)
-  "Compile a 2-operand comparison, result T or NIL into DEST."
-  (let ((temp (alloc-temp-reg))
+  "Compile a 2-operand comparison, result T or NIL into DEST.
+   Fast path: both operands are tagged fixnums (low bit = 0); use :cmp.
+   Slow path: at least one operand isn't a fixnum (ratio, float, etc.);
+   fall back to a runtime helper.  Tag check uses (a OR b) AND 1: zero
+   means both fixnums.
+
+   Helper choice by branch-op:
+     :beq -> NUMERIC-EQUAL-P     (=  result)
+     :blt -> NUMERIC-VALUE-LESS-P  (<  result)
+     :bgt -> NUMERIC-VALUE-LESS-P with args swapped (>)
+     :ble -> NUMERIC-<=
+     :bge -> NUMERIC->=
+
+   Returns T or NIL in DEST in both paths."
+  (let ((a-temp     (alloc-temp-reg))
+        (tag-temp   (alloc-temp-reg))
         (true-label (make-compiler-label))
-        (end-label (make-compiler-label)))
+        (slow-label (make-compiler-label))
+        (end-label  (make-compiler-label)))
     (compile-form a env dest)
     (emit-ir :push dest)
-    (compile-form b env temp)
+    (compile-form b env a-temp)
     (emit-ir :pop dest)
-    (emit-ir :cmp dest temp)
+    ;; Tag check: (dest | a-temp) & 1 == 0  ⇒ both fixnums (low bit 0).
+    ;; :bnnull tests against NIL (≠NIL→branch), so we use :cmp + :bne.
+    (emit-ir :or  tag-temp dest a-temp)
+    (let ((one-temp (alloc-temp-reg)))
+      (emit-ir :li  one-temp 1)
+      (emit-ir :and tag-temp tag-temp one-temp)
+      (emit-ir :li  one-temp 0)
+      (emit-ir :cmp tag-temp one-temp)
+      (free-temp-reg))
+    (emit-ir :bne slow-label)
+    ;; Fast path: tagged-fixnum compare.
+    (emit-ir :cmp dest a-temp)
     (emit-ir branch-op true-label)
     (compile-nil dest)
     (emit-ir :br end-label)
+    ;; Slow path: numeric helper (ratio / float / mixed-type).
+    (emit-ir-label slow-label)
+    (let ((helper (cond
+                    ((eq branch-op :beq) "NUMERIC-EQUAL-P")
+                    ((eq branch-op :blt) "NUMERIC-VALUE-LESS-P")
+                    ((eq branch-op :bgt) "%NUMERIC-VALUE-GREATER-P")
+                    ((eq branch-op :ble) "NUMERIC-<=")
+                    ((eq branch-op :bge) "NUMERIC->=")
+                    (t                   "NUMERIC-EQUAL-P"))))
+      (emit-ir :mov +vreg-v0+ dest)
+      (emit-ir :mov +vreg-v1+ a-temp)
+      (emit-ir :set-nargs 2)
+      (emit-ir :call helper 2)
+      (emit-ir :mov dest +vreg-vr+)
+      (emit-ir :br end-label))
     (emit-ir-label true-label)
     (compile-t dest)
     (emit-ir-label end-label)
-    (free-temp-reg)))
+    (free-temp-reg)   ; tag-temp
+    (free-temp-reg))) ; a-temp
 
 (defun compile-compare (branch-op args env dest)
   "Compile a comparison (<, >, =, <=, >=) producing T or NIL.
@@ -5937,6 +6005,16 @@
 (defun compile-make-bignum (dest)
   "Compile (%make-bignum) — allocate a 2-slot object with bignum subtag."
   (emit-ir :alloc-obj dest 2 +subtag-bignum+))
+
+(defun compile-make-ratio (dest)
+  "Compile (%make-ratio) — allocate a 2-slot object with ratio subtag.
+   Slot 0 = numerator, slot 1 = denominator (both tagged fixnums).
+   Used by the runtime / and rational-arithmetic helpers."
+  (emit-ir :alloc-obj dest 2 +subtag-ratio+))
+
+(defun compile-ratiop (arg env dest)
+  "Compile (ratiop x) — true iff x is a tagged ratio object (subtag #x33)."
+  (compile-object-subtype-p arg env dest +subtag-ratio+))
 
 (defun compile-make-array (size-form env dest)
   "Compile (make-array size).

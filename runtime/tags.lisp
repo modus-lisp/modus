@@ -39,6 +39,10 @@
 (defconstant +subtag-sap+ #x16)
 (defconstant +subtag-bignum+ #x30)
 (defconstant +subtag-array+ #x32)
+;;; 2-slot object holding a ratio: slot 0 = numerator, slot 1 = denominator.
+;;; Replaces the older cons-based representation (cons num den) which
+;;; collided with plain conses of two integers.
+(defconstant +subtag-ratio+ #x33)
 ;;; 0x40-0x4F: Structured objects
 (defconstant +subtag-struct+ #x40)
 (defconstant +subtag-hash-table+ #x41)

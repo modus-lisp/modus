@@ -249,18 +249,46 @@
     (loop (when (= b 0) (return a))
       (let ((r (mod a b))) (setq a b) (setq b r)))))
 
+;; Tagged ratio object (subtag #x33) — slot 0 = numerator, slot 1 = denominator.
+(defun make-ratio-obj (num den)
+  (let ((r (%make-ratio))) (aset r 0 num) (aset r 1 den) r))
+
+(defun %make-rat (num den)
+  "Build a normalised rational from NUM/DEN.  Reduces by gcd, lifts the sign
+   into the numerator, collapses to an integer when DEN=1.  Used by every
+   path that introduces a ratio so callers never need to re-normalise.
+   Uses %idiv-trunc to avoid recursing through / (which itself routes
+   non-exact divisions back here)."
+  (let* ((g (gcd-impl num den))
+         (n (%idiv-trunc num g))
+         (d (%idiv-trunc den g)))
+    (when (< d 0)
+      (setq n (- 0 n))
+      (setq d (- 0 d)))
+    (if (= d 1) n (make-ratio-obj n d))))
+
+(defun ratio-numerator (x) (aref x 0))
+(defun ratio-denominator (x) (aref x 1))
+(defun numerator (x) (if (ratiop x) (aref x 0) x))
+(defun denominator (x) (if (ratiop x) (aref x 1) 1))
+
+;; Real function named RATIOP — most call sites resolve via the compiler
+;; intrinsic, but #'ratiop and (funcall 'ratiop ...) need an actual
+;; entry in the function table.  The body's (ratiop x) re-dispatches to
+;; the intrinsic, so the compiled function is just the inline tag check.
+(defun ratiop (x) (ratiop x))
+
 (defun exact-divide (a b)
-  "Divide A by B. Returns integer if exact, cons (num . den) ratio otherwise."
+  "Divide A by B.  Integer if exact, tagged ratio otherwise.
+   Uses %idiv-trunc directly so a recursive call to / can't reach back here."
   (if (= (mod a b) 0)
-      (/ a b)
-      (let ((g (gcd-impl a b)))
-        (let ((num (/ a g)) (den (/ b g)))
-          (if (< den 0) (cons (- 0 num) (- 0 den)) (cons num den))))))
+      (%idiv-trunc a b)
+      (%make-rat a b)))
 
 (defun generic-negate (x)
   "Negate X (integer or ratio)."
   (if (ratiop x)
-      (cons (- 0 (car x)) (cdr x))
+      (make-ratio-obj (- 0 (aref x 0)) (aref x 1))
       (- 0 x)))
 
 (defun generic-subtract (a b)
@@ -269,45 +297,21 @@
     ((and (integerp a) (integerp b)) (- a b))
     ((and (integerp a) (ratiop b))
      ;; a - num/den = (a*den - num)/den
-     (let ((num (- (* a (cdr b)) (car b)))
-           (den (cdr b)))
-       (if (= (mod num den) 0) (/ num den) (cons num den))))
+     (%make-rat (- (* a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
      ;; num/den - b = (num - b*den)/den
-     (let ((num (- (car a) (* b (cdr a))))
-           (den (cdr a)))
-       (if (= (mod num den) 0) (/ num den) (cons num den))))
+     (%make-rat (- (aref a 0) (* b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     ;; a.num/a.den - b.num/b.den = (a.num*b.den - b.num*a.den)/(a.den*b.den)
-     (let ((num (- (* (car a) (cdr b)) (* (car b) (cdr a))))
-           (den (* (cdr a) (cdr b))))
-       (let ((g (gcd-impl num den)))
-         (let ((rn (/ num g)) (rd (/ den g)))
-           (if (= rd 1) rn (cons rn rd))))))
+     ;; a.n/a.d - b.n/b.d = (a.n*b.d - b.n*a.d)/(a.d*b.d)
+     (%make-rat (- (* (aref a 0) (aref b 1)) (* (aref b 0) (aref a 1)))
+                (* (aref a 1) (aref b 1))))
     (t (- a b))))
 
 (defun generic-1+ (x)
   "Add 1 to X (integer or ratio)."
   (if (ratiop x)
-      (let ((num (+ (car x) (cdr x)))
-            (den (cdr x)))
-        (if (= (mod num den) 0) (/ num den) (cons num den)))
+      (%make-rat (+ (aref x 0) (aref x 1)) (aref x 1))
       (+ x 1)))
-
-(defun ratiop (x)
-  "Check if X is a cons-based ratio (num . den) where both are integers."
-  (if (consp x)
-      (if (integerp (car x))
-          (if (integerp (cdr x))
-              (if (not (= (cdr x) 0)) t nil)
-              nil)
-          nil)
-      nil))
-
-(defun ratio-numerator (x) (car x))
-(defun ratio-denominator (x) (cdr x))
-(defun numerator (x) (if (ratiop x) (car x) x))
-(defun denominator (x) (if (ratiop x) (cdr x) 1))
 
 ;;; ============================================================
 ;;; Float inspection helpers
@@ -346,7 +350,7 @@
 
 (defun numeric-value-less-p (a b)
   "Return T if numeric value A < numeric value B.
-   Handles integers, boxed floats, and cons-based ratios."
+   Handles integers, boxed floats, and tagged ratios (subtag #x33)."
   (cond
     ;; Both integers
     ((and (integerp a) (integerp b)) (< a b))
@@ -354,39 +358,35 @@
     ((floatp-impl a)
      (cond
        ((integerp b)
-        ;; float vs integer
         (if (float-negative-p a)
-            t  ; negative float < any non-negative integer we encounter
+            t
             (let ((int-part (float-truncate-to-integer a)))
               (< int-part b))))
        ((ratiop b)
-        ;; float vs ratio: convert float to approximate integer comparison
         (if (float-negative-p a)
-            (if (> (car b) 0) t nil)  ; negative float < positive ratio
+            (if (> (aref b 0) 0) t nil)
             (let ((int-part (float-truncate-to-integer a)))
-              ;; int-part < num/den iff int-part * den < num
-              (< (* int-part (cdr b)) (car b)))))
+              (< (* int-part (aref b 1)) (aref b 0)))))
        (t nil)))
     ;; a is ratio
     ((ratiop a)
      (cond
        ((integerp b)
-        ;; ratio vs integer: a.num/a.den < b iff a.num < b * a.den
-        (< (car a) (* b (cdr a))))
+        ;; a.num/a.den < b iff a.num < b * a.den
+        (< (aref a 0) (* b (aref a 1))))
        ((ratiop b)
-        ;; ratio vs ratio: a.num/a.den < b.num/b.den iff a.num*b.den < b.num*a.den
-        (< (* (car a) (cdr b)) (* (car b) (cdr a))))
+        ;; a.num/a.den < b.num/b.den iff a.num*b.den < b.num*a.den
+        (< (* (aref a 0) (aref b 1)) (* (aref b 0) (aref a 1))))
        (t nil)))
     ;; a is integer, b is float
     ((and (integerp a) (floatp-impl b))
      (if (float-negative-p b)
-         nil  ; positive or zero integer not less than negative float
+         nil
          (let ((int-part (float-truncate-to-integer b)))
            (<= a int-part))))
     ;; a is integer, b is ratio
     ((and (integerp a) (ratiop b))
-     ;; a < num/den iff a*den < num
-     (< (* a (cdr b)) (car b)))
+     (< (* a (aref b 1)) (aref b 0)))
     (t nil)))
 
 (defun numeric-<= (a b)
@@ -397,17 +397,26 @@
   "Return T if A >= B for any numeric type."
   (numeric-<= b a))
 
+(defun %numeric-value-greater-p (a b)
+  "Return T if A > B for any numeric type — used by compile-compare-2's
+   slow path for the > branch (which has no direct generic helper)."
+  (numeric-value-less-p b a))
+
 (defun numeric-equal-p (a b)
-  "Return T if A equals B numerically."
+  "Return T if A equals B numerically.
+   Tagged-ratio aware: ratios are normalised so num/den uniquely
+   represents value, hence componentwise compare is sufficient."
   (cond
     ((and (integerp a) (integerp b)) (= a b))
     ((and (floatp-impl a) (floatp-impl b)) (float-equal a b))
     ((and (ratiop a) (ratiop b))
-     (and (= (car a) (car b)) (= (cdr a) (cdr b))))
+     (and (= (aref a 0) (aref b 0)) (= (aref a 1) (aref b 1))))
     ((and (ratiop a) (integerp b))
-     (and (= (cdr a) 1) (= (car a) b)))
+     ;; Normalised ratios never have den=1 (they collapse to integer
+     ;; in %make-rat), so a ratio vs integer is always unequal.
+     nil)
     ((and (integerp a) (ratiop b))
-     (and (= (cdr b) 1) (= (car b) a)))
+     nil)
     (t nil)))
 
 ;; LOOP comparison helpers — fast fixnum path inline, slow numeric path

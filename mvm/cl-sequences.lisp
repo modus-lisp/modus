@@ -1347,8 +1347,14 @@
 (defun evenp (n) (zerop (logand n 1)))
 (defun oddp (n) (not (zerop (logand n 1))))
 (defun boundp (sym) t)  ; stub — all symbols considered bound
-(defun vectorp (obj) (and (not (consp obj)) (not (null obj)) (not (integerp obj))
-                          (not (characterp obj)) (not (eq obj t))))
+;; Old definition was a process-of-elimination heuristic (the same
+;; fragility class as the old functionp — see commit 7203e19).  It
+;; returned T for closures, bignums, ratios, packages, and anything
+;; else that survived the negation chain — and was layout-sensitive
+;; for fn-addrs whose low bit happened to land on 0 or 1.  Replaced
+;; with proper subtag checks.  In MVM all vectors share +subtag-array+
+;; (#x32) — strings (#x31) are also vector-shaped per CL semantics.
+(defun vectorp (obj) (or (arrayp obj) (stringp obj)))
 (defun remove-duplicates (seq &rest args)
   "Remove duplicates from SEQ. CL default keeps the LAST occurrence
    of each duplicate group (so the relative order of survivors is the

@@ -145,6 +145,36 @@ Audit of this class so far:
   ? trig stubs (sin/cos/tan/etc.) — still heuristic + obj-subtag
     check; benign because all stubs return 0 or a placeholder float.
 
+## Dead-code dispatch entries (commit 34341e0)
+
+Audit of compile-form's intrinsic-dispatch cond (175 unique hashes
+across 176 entries) found one duplicate:
+MULTIPLE-VALUE-BIND was dispatched at lines 1624 and 1716 — the
+first delegated to compile-multiple-value-bind helper, the second
+inline expansion was dead code (unreachable due to cond ordering).
+Removed the dead clause; replaced with a forward pointer comment.
+
+This is its own fragility class: dead dispatch entries silently
+fail to take effect when someone tries to fix the (unreachable)
+case, leading them to conclude the compiler is broken in some
+other way.
+
+## Hash-collision audit results
+
+Run via `compute-name-hash` over all 1133 user defuns + the 175
+intrinsic-dispatch hashes:
+
+  - **No collisions among user defuns** (60-bit dual-FNV-1a is
+    collision-resistant at this scale).
+  - **20 user-defun ↔ intrinsic collisions** (consp / integerp /
+    + / - / * / / / mod / values / values-list / not / null /
+    listp / symbolp / stringp / zerop / logand / logior / logxor /
+    nth-value / set-car / set-cdr / code-char / ldb / ratiop) —
+    all INTENTIONAL.  The user defuns are thin wrappers whose
+    body recurses to the same name; compile-form re-dispatches
+    on the body call, so the compiled function is just the inline
+    IR.  Required so `#'consp` etc. work via funcall.
+
 Concrete tools to dig deeper:
 1. **Layout-flip fuzzer**: build N variants with different NOP padding
    in different places.  Diff which tests flip across variants.

@@ -517,7 +517,10 @@
          ((eq tn 'cons) (consp obj))
          ((eq tn 'list) (or (null obj) (consp obj)))
          ((eq tn 'null) (null obj))
-         ((eq tn 'symbol) (or (null obj) (eq obj t) (integerp obj)))
+         ;; (typep x 'symbol) — `(integerp obj)` was a leftover from when
+         ;; native MVM symbols were stored as bare hash fixnums.  Real
+         ;; symbols today are heap objects (subtag #x50); use symbolp.
+         ((eq tn 'symbol) (symbolp obj))
          ((eq tn 'string) (stringp obj))
          ((eq tn 'simple-string) (stringp obj))
          ((eq tn 'base-string) (stringp obj))
@@ -529,7 +532,10 @@
          ((eq tn 't) t)
          ((eq tn 'nil) nil)
          ((eq tn 'boolean) (or (null obj) (eq obj t)))
-         ((eq tn 'bit) (or (= obj 0) (= obj 1)))
+         ;; (typep x 'bit) — must be 0 or 1 AS AN INTEGER.  Without the
+         ;; integerp guard `(= obj 0)` runs `=` on arbitrary values
+         ;; (strings, conses, fn-addrs) which goes wrong fast.
+         ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
          ((eq tn 'function) (or (functionp obj) (%generic-function-p obj)))

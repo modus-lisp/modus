@@ -4726,12 +4726,17 @@
         (compile-form acc env dest))))
 
 (defun compile-1+ (arg env dest)
-  "Compile (1+ x) -> add tagged 1 (which is 2)"
+  "Compile (1+ x) -> add tagged 1 (which is 2).
+   Tried rerouting via (+ x 1) for ratio dispatch, regressed 2 tests
+   via layout-shift; the underlying ratio-aware-1+ behaviour is still
+   needed for floor.7-fn etc., but the per-call-site size growth
+   hurts more than the correctness gain right now.  Revisit when
+   layout-stability lands."
   (compile-form arg env dest)
   (emit-ir :inc dest))
 
 (defun compile-1- (arg env dest)
-  "Compile (1- x) -> subtract tagged 1 (which is 2)"
+  "Compile (1- x) -> subtract tagged 1 (which is 2)."
   (compile-form arg env dest)
   (emit-ir :dec dest))
 

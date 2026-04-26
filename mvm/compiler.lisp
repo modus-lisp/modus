@@ -4649,15 +4649,55 @@
     ;; 1-arg form
     ((null (cdr args))
      (compile-form `(float-truncate-to-integer ,(car args)) env dest))
-    ;; 2-arg form: (truncate a b) → a div b
+    ;; 2-arg form: (truncate a b) → quotient q = a÷b toward zero plus
+    ;; remainder r = a − q·b (CL spec returns 2 values).  Tests use
+    ;; (multiple-value-list (truncate n d)) so MV[0]=r, MV-COUNT=2.
+    ;;
+    ;; The :div / :mul / :mod translators clobber caller-saved physical
+    ;; registers (RAX, RDX, RCX), which can happen to be n-temp's or
+    ;; b-temp's physical reg.  Use :push / :pop to save the operands
+    ;; explicitly across each clobbering op.
     (t
      (destructuring-bind (a b) args
-       (let ((temp (alloc-temp-reg)))
-         (compile-form a env dest)
-         (emit-ir :push dest)
-         (compile-form b env temp)
-         (emit-ir :pop dest)
-         (emit-ir :div dest dest temp)
+       (let ((n-temp    (alloc-temp-reg))
+             (d-temp    (alloc-temp-reg))
+             (q-temp    (alloc-temp-reg))
+             (mul-temp  (alloc-temp-reg))
+             (addr-temp (alloc-temp-reg)))
+         ;; Evaluate n and d into temp regs.
+         (compile-form a env n-temp)
+         (compile-form b env d-temp)
+         ;; Save n and d on stack (div clobbers RAX/RDX/RCX).
+         (emit-ir :push n-temp)
+         (emit-ir :push d-temp)
+         ;; q = n / d.
+         (emit-ir :div q-temp n-temp d-temp)
+         ;; Restore d, n.
+         (emit-ir :pop d-temp)
+         (emit-ir :pop n-temp)
+         ;; q × d → mul-temp, then save d again (mul also clobbers).
+         (emit-ir :push n-temp)
+         (emit-ir :push q-temp)
+         (emit-ir :mul mul-temp q-temp d-temp)
+         (emit-ir :pop q-temp)
+         (emit-ir :pop n-temp)
+         ;; r = n - q·d.
+         (emit-ir :sub n-temp n-temp mul-temp)
+         ;; MV[0] = r (raw u64 store; r is tagged fixnum).
+         (emit-ir :li addr-temp +mv-values-addr+)
+         (emit-ir :store addr-temp n-temp +width-u64+)
+         ;; MV-COUNT = tagged 2 — the runtime reads this slot as a
+         ;; tagged fixnum (compile-values stores the literal 2 via
+         ;; compile-integer, which applies fixnum-shift).
+         (emit-ir :li addr-temp +mv-count-addr+)
+         (emit-ir :li mul-temp (ash 2 +fixnum-shift+))
+         (emit-ir :store addr-temp mul-temp +width-u64+)
+         ;; Primary value → dest.
+         (emit-ir :mov dest q-temp)
+         (free-temp-reg)
+         (free-temp-reg)
+         (free-temp-reg)
+         (free-temp-reg)
          (free-temp-reg))))))
 
 (defun compile-mod (args env dest)

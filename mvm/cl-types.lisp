@@ -291,27 +291,56 @@
       (make-ratio-obj (- 0 (aref x 0)) (aref x 1))
       (- 0 x)))
 
-(defun generic-subtract (a b)
-  "Subtract B from A, handling ratios."
+;; Slow-path runtime helpers — compile-add/sub/mul's tag-check hits these
+;; when at least one operand isn't a fixnum.  We cannot use plain +/-/*
+;; in the integer branch because for bignum operands the dispatch would
+;; route right back here, causing infinite recursion.  The fixnum body
+;; uses %fixnum-+ / %fixnum-- / %fixnum-* primitives instead — direct IR
+;; emission with no further dispatch — and the ratio/integer branches
+;; use the same primitives plus the (already-recursion-safe) ratio shape.
+(defun generic-add (a b)
   (cond
-    ((and (integerp a) (integerp b)) (- a b))
+    ((and (integerp a) (integerp b)) (%fixnum-+ a b))
     ((and (integerp a) (ratiop b))
-     ;; a - num/den = (a*den - num)/den
-     (%make-rat (- (* a (aref b 1)) (aref b 0)) (aref b 1)))
+     (%make-rat (%fixnum-+ (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     ;; num/den - b = (num - b*den)/den
-     (%make-rat (- (aref a 0) (* b (aref a 1))) (aref a 1)))
+     (%make-rat (%fixnum-+ (aref a 0) (%fixnum-* b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     ;; a.n/a.d - b.n/b.d = (a.n*b.d - b.n*a.d)/(a.d*b.d)
-     (%make-rat (- (* (aref a 0) (aref b 1)) (* (aref b 0) (aref a 1)))
-                (* (aref a 1) (aref b 1))))
-    (t (- a b))))
+     (%make-rat (%fixnum-+ (%fixnum-* (aref a 0) (aref b 1))
+                           (%fixnum-* (aref b 0) (aref a 1)))
+                (%fixnum-* (aref a 1) (aref b 1))))
+    (t (%fixnum-+ a b))))
+
+(defun generic-multiply (a b)
+  (cond
+    ((and (integerp a) (integerp b)) (%fixnum-* a b))
+    ((and (integerp a) (ratiop b))
+     (%make-rat (%fixnum-* a (aref b 0)) (aref b 1)))
+    ((and (ratiop a) (integerp b))
+     (%make-rat (%fixnum-* (aref a 0) b) (aref a 1)))
+    ((and (ratiop a) (ratiop b))
+     (%make-rat (%fixnum-* (aref a 0) (aref b 0))
+                (%fixnum-* (aref a 1) (aref b 1))))
+    (t (%fixnum-* a b))))
+
+(defun generic-subtract (a b)
+  (cond
+    ((and (integerp a) (integerp b)) (%fixnum-- a b))
+    ((and (integerp a) (ratiop b))
+     (%make-rat (%fixnum-- (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
+    ((and (ratiop a) (integerp b))
+     (%make-rat (%fixnum-- (aref a 0) (%fixnum-* b (aref a 1))) (aref a 1)))
+    ((and (ratiop a) (ratiop b))
+     (%make-rat (%fixnum-- (%fixnum-* (aref a 0) (aref b 1))
+                           (%fixnum-* (aref b 0) (aref a 1)))
+                (%fixnum-* (aref a 1) (aref b 1))))
+    (t (%fixnum-- a b))))
 
 (defun generic-1+ (x)
   "Add 1 to X (integer or ratio)."
   (if (ratiop x)
-      (%make-rat (+ (aref x 0) (aref x 1)) (aref x 1))
-      (+ x 1)))
+      (%make-rat (%fixnum-+ (aref x 0) (aref x 1)) (aref x 1))
+      (%fixnum-+ x 1)))
 
 ;;; ============================================================
 ;;; Float inspection helpers

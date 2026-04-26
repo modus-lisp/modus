@@ -1744,6 +1744,38 @@
            (emit-ir :pop dest)
            (emit-ir :div dest dest temp)
            (free-temp-reg))))
+      ;; %FIXNUM-+, %FIXNUM--, %FIXNUM-*: raw two-operand fixnum
+      ;; arithmetic with no ratio/bignum dispatch.  Used by GENERIC-ADD /
+      ;; GENERIC-SUBTRACT / GENERIC-MULTIPLY in their fixnum branches so
+      ;; that the slow-path runtime helpers can't infinite-recurse back
+      ;; through the rational-aware + - * intrinsics.
+      ((= op-name 600786370690744885)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :add dest dest temp)
+           (free-temp-reg))))
+      ((= op-name 492697382789251459)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :sub dest dest temp)
+           (free-temp-reg))))
+      ((= op-name 582771539731743196)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :mul dest dest temp)
+           (free-temp-reg))))
       ((= op-name 701100176259851453)       (compile-1+ (cadr form) env dest))
       ((= op-name 593011189432099851)       (compile-1- (cadr form) env dest))
       ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
@@ -4493,19 +4525,47 @@
 ;;; Arithmetic Operations
 ;;; ============================================================
 
+(defun emit-arith-pair (fast-op generic-name dest temp)
+  "Emit a tag-checked pairwise arithmetic step.  DEST holds the
+   accumulator (left operand), TEMP holds the right operand.  When
+   both are tagged fixnums (low bits zero) we emit FAST-OP inline;
+   otherwise we call GENERIC-NAME (a runtime helper that handles
+   ratios / mixed types).
+
+   Mirrors the compile-compare-2 pattern, hoisting the boilerplate so
+   compile-add / compile-sub / compile-mul share a single tag-check."
+  (let ((tag-temp   (alloc-temp-reg))
+        (one-temp   (alloc-temp-reg))
+        (slow-label (make-compiler-label))
+        (end-label  (make-compiler-label)))
+    ;; Tag check: ((dest | temp) & 1) == 0  ⇒  both fixnums.
+    (emit-ir :or  tag-temp dest temp)
+    (emit-ir :li  one-temp 1)
+    (emit-ir :and tag-temp tag-temp one-temp)
+    (emit-ir :li  one-temp 0)
+    (emit-ir :cmp tag-temp one-temp)
+    (emit-ir :bne slow-label)
+    ;; Fast path: tagged-fixnum primitive.
+    (emit-ir fast-op dest dest temp)
+    (emit-ir :br end-label)
+    ;; Slow path: runtime helper.
+    (emit-ir-label slow-label)
+    (emit-ir :mov +vreg-v0+ dest)
+    (emit-ir :mov +vreg-v1+ temp)
+    (emit-ir :set-nargs 2)
+    (emit-ir :call generic-name 2)
+    (emit-ir :mov dest +vreg-vr+)
+    (emit-ir-label end-label)
+    (free-temp-reg)   ; one-temp
+    (free-temp-reg))) ; tag-temp
+
 (defun compile-add (args env dest)
   "Compile (+ args...). Fixnum addition preserves tags for 2-arg case.
    Push/pop dest around each operand to survive function calls."
   (cond
-    ((null args)
-     ;; (+) = 0
-     (compile-integer 0 dest))
-    ((null (cdr args))
-     ;; (+ x) = x
-     (compile-form (car args) env dest))
+    ((null args) (compile-integer 0 dest))
+    ((null (cdr args)) (compile-form (car args) env dest))
     (t
-     ;; (+ a b ...) -- evaluate pairwise, push/pop to preserve accumulator
-     ;; across function calls in later args.
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '+ arg)
@@ -4514,23 +4574,17 @@
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
-         ;; Tagged fixnum add: (a<<1) + (b<<1) = (a+b)<<1
          (emit-ir :add dest dest temp)
          (free-temp-reg))))))
 
 (defun compile-sub (args env dest)
-  "Compile (- args...). Handles unary negation and multi-arg subtraction.
-   Push/pop dest around each operand to survive function calls."
+  "Compile (- args...).  Unary negation and pairwise subtraction."
   (cond
-    ((null args)
-     (compile-integer 0 dest))
+    ((null args) (compile-integer 0 dest))
     ((null (cdr args))
-     ;; Unary minus: (- x) = negate
      (compile-form (car args) env dest)
      (emit-ir :neg dest dest))
     (t
-     ;; (- a b ...) -- subtract pairwise, push/pop to preserve accumulator
-     ;; across function calls in later args.
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '- arg)
@@ -4543,18 +4597,11 @@
          (free-temp-reg))))))
 
 (defun compile-mul (args env dest)
-  "Compile (* args...). For tagged fixnums: result = (a*b)>>1 to fix double-tag.
-   Push/pop dest around each operand to survive function calls."
+  "Compile (* args...). For tagged fixnums: result = (a*b)>>1."
   (cond
-    ((null args)
-     ;; (*) = 1
-     (compile-integer 1 dest))
-    ((null (cdr args))
-     ;; (* x) = x
-     (compile-form (car args) env dest))
+    ((null args) (compile-integer 1 dest))
+    ((null (cdr args)) (compile-form (car args) env dest))
     (t
-     ;; (* a b ...) -- multiply pairwise, push/pop to preserve accumulator
-     ;; across function calls in later args.
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '* arg)

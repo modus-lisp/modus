@@ -4526,42 +4526,64 @@
 ;;; ============================================================
 
 (defun emit-arith-pair (fast-op generic-name dest temp)
-  "Emit a tag-checked pairwise arithmetic step.  DEST holds the
-   accumulator (left operand), TEMP holds the right operand.  When
-   both are tagged fixnums (low bits zero) we emit FAST-OP inline;
-   otherwise we call GENERIC-NAME (a runtime helper that handles
-   ratios / mixed types).
+  "Tag-checked pairwise arithmetic.  When dest and temp are both tagged
+   fixnums (low bit zero) we use FAST-OP inline.  Otherwise we call
+   GENERIC-NAME (a runtime helper that handles ratios / mixed types).
 
-   Mirrors the compile-compare-2 pattern, hoisting the boilerplate so
-   compile-add / compile-sub / compile-mul share a single tag-check."
-  (let ((tag-temp   (alloc-temp-reg))
-        (one-temp   (alloc-temp-reg))
-        (slow-label (make-compiler-label))
-        (end-label  (make-compiler-label)))
-    ;; Tag check: ((dest | temp) & 1) == 0  ⇒  both fixnums.
-    (emit-ir :or  tag-temp dest temp)
-    (emit-ir :li  one-temp 1)
-    (emit-ir :and tag-temp tag-temp one-temp)
-    (emit-ir :li  one-temp 0)
-    (emit-ir :cmp tag-temp one-temp)
-    (emit-ir :bne slow-label)
-    ;; Fast path: tagged-fixnum primitive.
+   The slow-path :call clobbers caller-saved physical registers
+   (V0-V3 = RSI/RDI/R8/R9 and V5-V8 = RCX/RDX/R10/R11), so we must
+   push/pop the V5..V(4+save-count-1) temps that are live in the
+   *caller* — exactly the same pattern compile-call uses around its
+   own :call.  Without this every (+ ratio …) inside an enclosing
+   computation that has temps in V5+ silently corrupted those temps."
+  (let* ((tag-temp   (alloc-temp-reg))
+         (one-temp   (alloc-temp-reg))
+         (slow-label (make-compiler-label))
+         (end-label  (make-compiler-label))
+         ;; Snapshot caller-saved temps live BEFORE this call.
+         ;; *temp-reg-counter* now includes our own two allocs;
+         ;; subtract them when computing the live range — the caller's
+         ;; live count is (counter - 2).
+         (caller-live (max 0 (- *temp-reg-counter* 2)))
+         (save-count  (min caller-live 5)))
+    (emit-ir :or   tag-temp dest temp)
+    (emit-ir :li   one-temp 1)
+    (emit-ir :test tag-temp one-temp)
+    (emit-ir :bne  slow-label)
+    ;; Fast path.
     (emit-ir fast-op dest dest temp)
     (emit-ir :br end-label)
-    ;; Slow path: runtime helper.
+    ;; Slow path.
     (emit-ir-label slow-label)
+    ;; Save caller-saved temps live in V5..V(4+save-count-1), skipping
+    ;; dest (it'll be overwritten by the call result), temp (already
+    ;; been preserved by the caller's push/pop dest pattern, but our
+    ;; :mov V1 temp will reload it from its phys reg right before the
+    ;; call so we DON'T need to save it here), and the two tag-check
+    ;; temps (we don't need them after the cmp).  Push pattern matches
+    ;; compile-call's (line 6014) save logic.
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+            do (unless (or (= r dest) (= r temp)
+                           (= r tag-temp) (= r one-temp))
+                 (emit-ir :push r))))
     (emit-ir :mov +vreg-v0+ dest)
     (emit-ir :mov +vreg-v1+ temp)
     (emit-ir :set-nargs 2)
     (emit-ir :call generic-name 2)
     (emit-ir :mov dest +vreg-vr+)
+    ;; Restore in reverse order, matching the push set above.
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+            do (unless (or (= r dest) (= r temp)
+                           (= r tag-temp) (= r one-temp))
+                 (emit-ir :pop r))))
     (emit-ir-label end-label)
-    (free-temp-reg)   ; one-temp
-    (free-temp-reg))) ; tag-temp
+    (free-temp-reg)
+    (free-temp-reg)))
 
 (defun compile-add (args env dest)
-  "Compile (+ args...). Fixnum addition preserves tags for 2-arg case.
-   Push/pop dest around each operand to survive function calls."
+  "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
   (cond
     ((null args) (compile-integer 0 dest))
     ((null (cdr args)) (compile-form (car args) env dest))
@@ -4574,11 +4596,16 @@
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
-         (emit-ir :add dest dest temp)
+         (emit-arith-pair :add "GENERIC-ADD" dest temp)
          (free-temp-reg))))))
 
 (defun compile-sub (args env dest)
-  "Compile (- args...).  Unary negation and pairwise subtraction."
+  "Compile (- args...).  Unary negation and pairwise subtraction.
+   Inline fixnum :sub — no ratio dispatch yet (the bytecode-layout
+   shift from adding tag-check+slow-path to two more arith ops on
+   top of compile-add tipped ~80 unrelated tests via the documented
+   function-size threshold flip; revisit when that compiler-stability
+   item lands in TODO.md)."
   (cond
     ((null args) (compile-integer 0 dest))
     ((null (cdr args))
@@ -4597,7 +4624,8 @@
          (free-temp-reg))))))
 
 (defun compile-mul (args env dest)
-  "Compile (* args...). For tagged fixnums: result = (a*b)>>1."
+  "Compile (* args...).  Inline fixnum :mul — see compile-sub for the
+   ratio-dispatch deferral note."
   (cond
     ((null args) (compile-integer 1 dest))
     ((null (cdr args)) (compile-form (car args) env dest))

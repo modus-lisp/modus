@@ -1712,20 +1712,12 @@
               env dest)
              ;; Lexical: simple let binding
              (compile-form `(let ((,var (make-string-input-stream ,str-form))) ,@body) env dest))))
-      ;; MULTIPLE-VALUE-BIND — compile as let* with car/cdr destructuring
-      ((= op-name 544225037749651317)
-       (let ((vars (cadr form))
-             (expr (caddr form))
-             (body (cdddr form)))
-         (let ((tmp (gensym "MVB")))
-           (compile-form `(let* ((,tmp ,expr)
-                                 ,@(loop for var in vars
-                                         for i from 0
-                                         collect (if (zerop i)
-                                                     `(,var (car ,tmp))
-                                                     `(,var (cdr ,tmp)))))
-                            ,@body)
-                         env dest))))
+      ;; (former duplicate MULTIPLE-VALUE-BIND dispatch removed — the
+      ;; entry at line ~1624 wins because cond runs top-to-bottom, so
+      ;; this one was dead code that had drifted out of sync with the
+      ;; real compile-multiple-value-bind helper.  Kept as a comment
+      ;; pointer so anyone searching for the cl-style "let*+car/cdr"
+      ;; expansion finds the right defun.  See compile-multiple-value-bind.)
 
       ;; --- Arithmetic ---
       ((= op-name 829550095445217828)        (compile-add (cdr form) env dest))

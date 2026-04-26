@@ -1404,9 +1404,47 @@
             (loop (when (= i n) (return v))
               (aset v i (car cur))
               (setq cur (cdr cur)) (setq i (+ i 1))))))))))
-(defun functionp (x) (or (and (not (null x)) (not (integerp x)) (not (consp x))
-                              (not (characterp x)) (not (stringp x)) (not (eq x t)))
-                         nil))
+;; functionp identifies callable values.  In MVM these are:
+;;   - raw fn-addrs from #'foo  (low bit 0 with our nibble alignment)
+;;   - closure objects (subtag #x52)
+;;   - generic-function objects (CLOS)
+;;   - native MVM symbols carrying function bindings (resolved at funcall)
+;;
+;; The old implementation excluded everything that integerp said yes
+;; to — but raw fn-addrs LOOK like fixnums (low bit 0 after nibble-9
+;; alignment), so functionp returned NIL for them.  That made test
+;; 12257's pass/fail purely a function of whether the lambda's address
+;; happened to land on an odd nibble (~36% chance), which was the
+;; root cause of the bytecode-layout fragility.
+;;
+;; Strategy: exclude all the obvious non-functions (nil, t, conses,
+;; characters, strings, symbols, packages, hash-tables, arrays, ratios,
+;; numbers within the typical fixnum range) and accept the rest.
+;; This isn't a perfect runtime check — a huge fixnum looks like a
+;; fn-addr — but it's deterministic across layouts and matches what
+;; ANSI tests need.
+(defun functionp (x)
+  (cond
+    ((null x) nil)
+    ((eq x t) nil)
+    ((consp x) nil)
+    ((characterp x) nil)
+    ((stringp x) nil)
+    ((symbolp x) nil)
+    ;; Generic functions ARE arrays (subtag #x32), so the arrayp
+    ;; check needs to come AFTER %generic-function-p — otherwise
+    ;; `(functionp gf)` returns NIL.  But a plain array is not a
+    ;; function.  Order: gf, then plain array, then fixnum-range,
+    ;; then anything left.
+    ((%generic-function-p x) t)
+    ((arrayp x) nil)
+    ;; Fixnum heuristic: small integers are values, not fn-addrs.
+    ;; (Will be replaced by a proper [code_base, code_end) range check
+    ;;  once we have a way to populate those bounds at boot.)
+    ((and (integerp x) (< x #x100000)) nil)
+    ;; Anything else that survived the elimination — closure objects,
+    ;; raw fn-addrs in the code-segment range — counts as a function.
+    (t t)))
 (defun keywordp (x)
   "True if X is a keyword (symbol starting with :)."
   ;; In MVM, keywords are symbols whose name-hash matches the : prefix pattern

@@ -98,22 +98,16 @@ This is a hint that the fragility is broader than just funcall.
 
 ## Open questions / deeper fragility
 
-Even with the nibble-9 fix, ~4 ANSI tests (12257, 12261, 12285,
-14253) flip under pure `:nop` injection — no semantic change, only
-bytecode shift.  Hypotheses (none confirmed):
+After the nibble-9 alignment AND functionp fix, the 4-stubborn-tests
+group (12257, 12261, 12285, 14253) reduced to 1.  Three of them
+were caused by `functionp`'s integerp-heuristic exclusion (see
+commit 7203e19) — raw fn-addrs with low bit 0 looked like fixnums
+to integerp, so functionp returned NIL for them deterministically.
 
-- GC root scan reading frame data shifted into a new bit-pattern
-  collision.
-- Setjmp/longjmp frame layout dependency on specific addresses.
-- Subtag-byte collision in the bytes-before-fn region (when the byte
-  at `[fn-addr - 9]` accidentally matches `#x50` or `#x52` — though
-  with nibble-9 fix the obj-tag check should prevent ever reading
-  there).
-- Hash collision somewhere in compile-time string-keyed tables.
-
-Test 12257 = `(NOT-MV (TYPEP #'(LAMBDA (X) X) 'FUNCTION))` is the
-simplest reproducer.  It passes or fails depending on bytecode shift
-with no clear pattern.
+**Test 14253 still flips** on bytecode shift — likely a different
+root cause (uses `(LET ((BOUND (ASH 1 200))) ...)` and bignum
+arithmetic).  Probably overflow / loop issues unrelated to the
+funcall/typep dispatch family.
 
 Concrete tools to dig deeper:
 1. **Layout-flip fuzzer**: build N variants with different NOP padding

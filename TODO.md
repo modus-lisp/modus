@@ -30,16 +30,46 @@ Found by deep investigation of register clobbering, stack smashing, and layout s
 
 **Symptom**: Adding or removing functions causes unrelated tests to break.
 
-**Root cause**: Global flat namespace, "last defun wins." Adding functions can:
-1. Shadow existing functions via name-hash collision
-2. Change total bytecode size, shifting function offsets
-3. Trigger `check-arith-nesting` on previously-passing forms (silent skip)
+**Root cause** (partially understood):
+1. **Funcall dispatch reads tag bits of raw fn-addrs.** PARTIALLY FIXED:
+   the translator now NOP-aligns function entry points away from low
+   nibbles 1 (cons) and 9 (object).  Both nibbles caused
+   compile-funcall's closure / native-MVM-sym detection to dereference
+   `[fn-addr - 9]` looking for a heap-object header and SIGSEGV when
+   the bytes there happened to look like a real subtag.
+   - Tried full 16-byte alignment as a stronger fix; regressed via
+     more layout shifting elsewhere — fragility runs deeper than just
+     the funcall path.
+2. **Global flat namespace, "last defun wins."** Adding functions can
+   shadow existing ones via name-hash collision.  Not yet addressed.
+3. **Bytecode-size shift triggers other layout-sensitive code paths.**
+   Around 4 tests (12257 typep-of-lambda, 12261, 12285, 14253) flip
+   when bytecode layout shifts even with no semantic change (pure
+   `:nop` injection).  Root cause not yet found — may be GC root scan
+   reading incorrect frame data, or setjmp frame layout, or some
+   address ending up in another bit-pattern collision we haven't
+   identified yet.
 
-**Fixes needed**:
+**Fixes attempted**:
+- ✓ NOP-align fn entry away from nibbles 1, 9 (in
+  `mvm/translate-x64.lisp`'s post-function alignment pass)
+- ✗ Full 16-byte alignment (regressed via bigger layout shift)
+- ✗ caller-save in compile-compare-2's slow path (regressed CLOS
+  tests via per-comparison size growth)
+
+**Fixes still needed**:
+- Funcall dispatch via runtime range check (`if addr in [code_base,
+  code_end) → direct call; else → object dispatch`).  Eliminates
+  bit-pattern dependence entirely.  Requires storing code base/end
+  in fixed memory slots at boot.
 - Per-module namespaces (compile each source file separately, link)
 - Warn on function name hash collisions
-- Make `check-arith-nesting` non-fatal (skip single form, not whole function)
+- Make `check-arith-nesting` non-fatal (skip single form, not whole
+  function)
 - Two-pass bytecode emission stable under function count changes
+- Layout-flip fuzzer: build N variants of the binary with different
+  NOP padding, run suite, surface tests that flip across variants —
+  those are the layout-sensitive ones to fix.
 
 ### OPEN — `bignump` Tag Extraction Bug
 

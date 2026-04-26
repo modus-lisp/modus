@@ -4860,6 +4860,14 @@
     (compile-nil dest)
     (emit-ir :br end-label)
     ;; Slow path: numeric helper (ratio / float / mixed-type).
+    ;; NB: this :call has the same caller-save hazard as emit-arith-pair
+    ;; (clobbers V5..V8), but adding push/pop here regressed ~10 CLOS
+    ;; tests via the bytecode-layout-shift family — every comparison in
+    ;; the binary grew by a few bytes, tipping fn-addrs into the
+    ;; problem zone elsewhere.  The hazard is benign in practice
+    ;; because comparisons don't tend to nest deeply with live
+    ;; ancestor temps.  Revisit if the layout-stability work makes
+    ;; per-call-site growth safe.
     (emit-ir-label slow-label)
     (let ((helper (cond
                     ((eq branch-op :beq) "NUMERIC-EQUAL-P")

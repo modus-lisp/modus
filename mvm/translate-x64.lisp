@@ -3242,22 +3242,18 @@
                                     (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
                                            c i name pos opcode operands)))
                                 (setf pos new-pos)))))
-                 ;; Ensure next function's native address doesn't have a
-                 ;; "tagged-pointer" low nibble that compile-funcall's
-                 ;; dispatch would mis-interpret.  Bad nibbles:
-                 ;;   1 (cons)      — historical funcall-cons-collision
-                 ;;   9 (object)    — closure / native-MVM-sym dispatch:
-                 ;;                   obj-subtag deref reads the memory
-                 ;;                   8 bytes before the address; if those
-                 ;;                   bytes happen to contain subtag #x50
-                 ;;                   or #x52 the dispatch routes to a
-                 ;;                   closure path on a raw fn pointer →
-                 ;;                   SIGSEGV.  This is the bytecode-layout
-                 ;;                   fragility documented in TODO.md and
-                 ;;                   ansi-notes.md.
-                 ;; Walk forward emitting NOPs while either bad nibble
-                 ;; matches; one NOP is 1 byte so at most a couple of
-                 ;; iterations.
+                 ;; Avoid low nibble 1 (cons) or 9 (object).  Tried
+                 ;; full 16-byte alignment as a stronger structural
+                 ;; fix but it regressed tests via the same layout-shift
+                 ;; failure mode it was meant to address — every
+                 ;; function gained more NOPs, shifting all subsequent
+                 ;; addresses, tipping previously-stable tests into
+                 ;; new bad-bit-pattern territory inside the GC root
+                 ;; scan / setjmp frame layout / etc. (the fragility
+                 ;; runs deeper than the funcall path alone).  Only
+                 ;; align away from the two confirmed-bad nibbles for
+                 ;; now; any aggressive padding has to wait until the
+                 ;; deeper fragility is rooted out.
                  (loop
                    (let* ((p (code-buffer-position buf))
                           (n (logand (+ *x64-native-code-offset* p) #xF)))

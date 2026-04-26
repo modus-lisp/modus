@@ -104,10 +104,46 @@ were caused by `functionp`'s integerp-heuristic exclusion (see
 commit 7203e19) — raw fn-addrs with low bit 0 looked like fixnums
 to integerp, so functionp returned NIL for them deterministically.
 
-**Test 14253 still flips** on bytecode shift — likely a different
-root cause (uses `(LET ((BOUND (ASH 1 200))) ...)` and bignum
-arithmetic).  Probably overflow / loop issues unrelated to the
-funcall/typep dispatch family.
+**Test 14253 has a different root cause:** it uses `(1+ R)` and
+`(+ R 1)` on a ratio R.  Today's `compile-1+` emits `:inc` (raw
+pointer-bump), which gives garbage for ratio operands; `compile-add`
+dispatches properly via emit-arith-pair so `(+ R 1)` works.  The
+test compares `(1+ R)` to `(+ R 1)` with EQL — they diverge → test
+fails.  The fix (route compile-1+ through `(+ x 1)`) regresses 2
+other tests via the same per-call-site-growth fragility we've
+documented; commit 41b1434 reverts it with a forward-pointing
+comment.
+
+## The "process-of-elimination predicate" fragility class
+
+Multiple predicates were implemented as negation chains:
+
+    (defun foo-p (x) (and (not (null x)) (not (integerp x)) ...))
+
+These all have two failure modes:
+1. **Wrong for any heap object that survived elimination** —
+   closures, bignums, ratios, packages, generic functions etc.
+   were classified as "foo-p" by accident.
+2. **Layout-fragile for fn-addrs** — fn-addrs always have low
+   bit 0 after the nibble-9 alignment fix (their low nibble is
+   restricted to {0, 2, 3, 4, 5, 6, 7, 8, A, B, C, D, E, F});
+   `(integerp fn-addr)` returns T for the 8 even nibbles, so the
+   chain short-circuits.  Before the alignment fix, fn-addrs
+   landed on odd nibbles ~36% of the time and were classified
+   as "foo-p" by accident.
+
+Audit of this class so far:
+  ✓ functionp (commit 7203e19) — replaced with positive-list cond
+  ✓ vectorp (commit fd27d1c) — replaced with `(or (arrayp x) (stringp x))`
+  ✓ typep 'symbol branch (commit 1acaf80) — replaced with `(symbolp x)`
+  ✓ typep 'bit branch (commit 1acaf80) — added integerp guard
+  ✓ symbolp — has heuristic but uses obj-subtag check at end (safe)
+  ✓ %clos-instance-p, %gf-p, %standard-method-p, %condition-p,
+    floatp-impl — all use heuristic as a guard before precise
+    obj-subtag check (safe)
+  ✓ %pkg-p, streamp — use cons-marker pattern (safe)
+  ? trig stubs (sin/cos/tan/etc.) — still heuristic + obj-subtag
+    check; benign because all stubs return 0 or a placeholder float.
 
 Concrete tools to dig deeper:
 1. **Layout-flip fuzzer**: build N variants with different NOP padding

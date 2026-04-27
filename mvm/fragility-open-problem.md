@@ -230,8 +230,74 @@ Mirror fix applied.
   + functionp fix    : N=0 9159 unique / N=1 9167 unique
   + obj-subtag fix   : N=0 9327 unique / N=1 9317 unique
   + array-len fix    : N=0 9386 unique / N=1 9395 unique
+  + functionp mask   : N=0 9395 unique / N=1 9386 unique
 
-Cumulative gain: **+217 unique tests at N=0, +239 at N=1**.
+Cumulative gain: **+226 unique tests at N=0, +230 at N=1**.
+
+### SIGSEGV handler instrumentation (commit 48c1b36)
+
+To attack the residual, the SIGSEGV handler stub now captures
+ucontext state into fixed slots at the moment of fault, before
+the longjmp clobbers it.  Six values:
+
+  0x10000C30 — saved RIP   (ucontext+0xA8 = uc_mcontext.gregs[16])
+  0x10000C38 — saved RSP   (ucontext+0xA0 = gregs[15])
+  0x10000C40 — [saved RSP] (return addr — byte after failing call)
+  0x10000C48 — saved RAX   (ucontext+0x90 = gregs[13])
+  0x10000C50 — si_addr     (siginfo+16 — the bad memory address)
+  0x10000C58 — ucontext ptr itself (RDX, for verification)
+
+Required adding **SA_SIGINFO** to the sigaction flags — without it
+the kernel doesn't populate RDX with the ucontext pointer on
+handler entry, and our ucontext-relative reads were reading
+garbage from wherever RDX happened to point.  (The earlier
+"RIP=1053720 across all fails" output was meaningless — it was
+some constant that happened to be in RDX-relative memory.)
+
+%record-test-fail prints all five (output values are raw/4 — divide
+by 4 to recover real address; low 2 bits lost in the sar).
+
+### Two residual bug classes confirmed (uncommitted findings)
+
+1. **Genuine call-NIL from method dispatch.**  Captured RAX = NIL
+   (= #xDEAD0001) on fail confirms the contact's prediction:
+   tagged NIL got loaded as a function pointer.  The %method-fn
+   accessor `(cddr method-record)` returns NIL when the record
+   has fewer than 2 elements, and `(apply NIL args)` → call-NIL.
+   This *can* be the predicted same-shape sixth bug — eq-collision
+   on class-name or slot-name during dispatch's
+   `%specializers-match-p` causing the applicable-methods list to
+   be empty AND the method-record's structure malformed.
+
+2. **CHANGE-CLASS is a no-op stub** (ansi-bridge.lisp:1352-54).
+   Tests like CLASS-0203.2 (ID 27081) fail because change-class
+   returns the instance unchanged — slot values aren't transferred
+   to a new layout, and the test's expected `(T NIL NIL NIL)` slot
+   pattern (slots set to T by initforms in the new class) shows up
+   as `(NIL NIL NIL NIL)` (initforms never ran).  This is *not*
+   the same family as the other five — it's an unimplemented
+   feature.  The layout-fragility comes from how the test path
+   probes around the no-op stub; at some layouts the probes happen
+   to match by coincidence, at others they don't.
+
+### What's left
+
+Pin down (1) by reading the captured state from a failing run.  The
+collaborator's classification rubric:
+
+  - if `si_addr` falls inside the NIL-page (`0xDEAD0000..0xDEAD1000`),
+    it's instruction-fetch; saved RIP equals si_addr, and `[saved-RSP]`
+    is just past the failing call in the caller — that byte is what
+    to disasm.
+  - if `si_addr` is elsewhere, it's a data fault; saved RIP is the
+    load/store and si_addr is the bad effective address.
+
+Implementing CHANGE-CLASS properly would close (2) and remove
+~5 of the residual flippy tests from the count.  The unification
+between (1) and (2) the collaborator suggested doesn't apply
+directly — change-class doesn't even reach the slot-by-slot
+transfer logic — but the dispatch path's eq-on-symbols hypothesis
+is still live for the remaining call-NIL crashes.
 
 ## What's still open
 

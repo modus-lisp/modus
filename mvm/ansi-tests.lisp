@@ -1585,4 +1585,28 @@
   (deftest 9121 (stringp  t)  nil)
   (deftest 9122 (arrayp   t)  nil)
   (deftest 9123 (= (obj-subtag t) 0) t) ;; explicit obj-subtag tag-mismatch
+
+  ;; Regression markers for the SIXTH same-shape bug (DEFERRED, not yet
+  ;; fixed): :car / :cdr IR-ops deref `[src ± 1/7]' without verifying
+  ;; src is a real cons (low nibble 1).  For src = NIL, the NIL-page
+  ;; mmap absorbs the read and (car NIL) / (cdr NIL) return NIL — fine.
+  ;; For src = raw 0 (uninitialized slot, fixnum mistakenly chased as
+  ;; cons), the read goes to address ±1 from zero → unmapped → SIGSEGV.
+  ;;
+  ;; These tests EXPECT NIL (the lispy traditional behavior).  Today,
+  ;; pre-fix: thunk SIGSEGVs, handler-case catches, %record-test-fail
+  ;; prints "FAIL 9130/9131" so we get a clear regression signal.
+  ;; Post-fix (fast-path tag-check at translator level, see
+  ;; fragility-open-problem.md "fast-path fix sketch"): tests pass.
+  ;;
+  ;; Their job is to give future-you a binary signal — pass/fail —
+  ;; instead of waiting for the bug to surface as a layout-fragility
+  ;; flip in some unrelated test next month.
+  (deftest 9130 (cdr 0) nil)
+  (deftest 9131 (car 0) nil)
+  ;; Same shape on a fixnum that doesn't happen to be 0 — the NIL-page
+  ;; only saves us for src in [0xDEAD0000, 0xDEAD1000); for any other
+  ;; non-cons src the deref fails the same way.
+  (deftest 9132 (cdr 42) nil)
+  (deftest 9133 (car 42) nil)
   )

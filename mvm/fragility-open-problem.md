@@ -297,11 +297,91 @@ by 4 to recover real address; low 2 bits lost in the sar).
    values mistakenly chased as cons) the read goes to address ±1
    from 0 → unmapped → SIGSEGV.
 
-   The fix is the same shape as obj-subtag/array-len: tag-check at
-   IR-op level, return NIL on tag mismatch.  Cost: ~15 bytes per
-   `car`/`cdr` site, and these are everywhere — risk of significant
-   layout shift.  Held until the layout-stability work makes
-   per-call-site changes safe.
+   The naive same-shape fix (tag-check + branch + return NIL inline,
+   like obj-subtag/array-len got) costs ~15 bytes per car/cdr site,
+   and these are *everywhere* — significant layout shift, likely
+   regression cost similar to the 159-test AREF/ARRAY hit we got
+   from a single mem-ref.
+
+### Fast-path-fix sketch for car/cdr (deferred, not implemented)
+
+A non-naive fix is much cheaper.  car/cdr is unique among the family
+because it's so dense in the binary that the per-site cost matters.
+
+  **Option A — fast path + shared trampoline.**  Emit the per-site
+  check as a 3-byte tag test + 2-byte short-jcc to an out-of-line
+  trampoline that does the NIL-return.  Per-site cost ≈ 5-7 bytes
+  instead of ~15; the trampoline is one copy at the end of code.
+
+      ; per-site (bug-6 fix, fast-path version):
+      test src, 1            ; 3 bytes, tests low bit (cons-tag bit)
+      jz   .Lcar_slow_path   ; 2 bytes (short jcc rel8)
+      mov  d, [src - 1]      ; 4 bytes (the original deref)
+      ; .Lcar_slow_path is shared at end of code: mov d, R15 ; jmp back
+    
+  R15 already holds NIL in our calling convention, so the trampoline
+  is essentially `mov d, R15; jmp <return>` — but each car/cdr site
+  needs its own return address, which negates the sharing.  So
+  Option A really wants:
+
+  **Option B — cmov against R15 (NIL).**  Use a conditional move so
+  there's no branch and no trampoline:
+
+      ; per-site (cmov version):
+      test src, 1            ; 3 bytes
+      cmovz d, R15           ; 4 bytes — if low bit is 0, d = NIL
+      mov  d, [src - 1]      ; 4 bytes — but this still derefs!
+
+  cmov doesn't gate the load.  So either we branch (costing the jcc)
+  or we let the deref happen even on non-cons.  Forced back to a
+  branch — but the trampoline can be local (5 bytes after the deref):
+
+      test src, 1            ; 3 bytes
+      jnz  .Lreal_cons       ; 2 bytes — most uses, taken
+      mov  d, R15            ; 3 bytes — d = NIL on bad src
+      jmp  .Ldone            ; 2 bytes
+    .Lreal_cons:
+      mov  d, [src - 1]      ; 4 bytes
+    .Ldone:
+    
+  Total ~14 bytes per site, but the FAST PATH (real cons) is just
+  5 bytes (test + jnz + mov) and the cold path is local.  Better
+  than the naive 15 because the test+jnz is so cheap on
+  predictably-taken paths.
+
+  **Option C — type inference at compile time.**  Most uses of
+  car/cdr in compiled code are inside loops, after a consp/listp
+  check, or in destructuring patterns where the tag is already
+  established.  A dumb local analysis ("preceded by a consp branch
+  in the same basic block, or appears inside an iteration over a
+  list") would eliminate most of the runtime checks entirely.
+  
+  This is the right structural fix.  car/cdr that survive the
+  type-inference pass (entries through untyped data: argument
+  positions, `(aref x i)` results, fixnum-arithmetic results
+  treated as conses, etc.) get the runtime check.  The rest stay
+  fast.  This is the version to push for if there's appetite in
+  the next iteration.
+
+### Regression tests (committed)
+
+`ansi-tests.lisp` carries four custom tests (IDs 9130-9133) that
+exercise car/cdr on non-cons values:
+
+    (deftest 9130 (cdr 0)  nil)
+    (deftest 9131 (car 0)  nil)
+    (deftest 9132 (cdr 42) nil)
+    (deftest 9133 (car 42) nil)
+
+Pre-fix (today): each thunk SIGSEGVs at `mov d, [src ± 1/7]`,
+handler-case catches, `%record-test-fail` records a FAIL with the
+captured RIP/SITE/RAX/si_addr signature.  Future-you sees the
+4-test FAIL block and knows immediately what's not done.
+
+Post-fix: each test returns NIL (lispy car-of-non-cons traditional
+behavior), matches expected NIL, passes.  The transition from "4
+FAILs in the 91xx range" to "4 Ps in the 91xx range" is the
+regression-test signal.
 
 ### What's left after this finding
 

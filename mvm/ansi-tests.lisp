@@ -1559,4 +1559,30 @@
   ;; Tests 9103-9105 removed: cross-function symbol eq is known-broken
   ;; (two interned symbols with same name-hash are not pointer-eq)
   ;; Tests 9112: same issue — eq on symbols across function boundaries
+
+  ;; FRAGILITY PROBE 27509-style — runs in parent with diag-class-01 (which IS
+  ;; registered) to mimic the cascade in REINITIALIZE-INSTANCE.1 et al.
+  ;; If this fails / crashes, the bug is reproducible in parent and not
+  ;; specific to fork-context.  GOT/EXP printing kicks in because we're
+  ;; running early (low fail-count), so we can see WHERE the cascade
+  ;; goes wrong rather than just "FAIL N".
+  ;; Regression tests for the obj-subtag-on-T crash class
+  ;; (translate-x64.lisp's +op-obj-subtag+ now tag-checks).
+  ;;
+  ;; T = +t-value+ = #xDEAD1009 has low nibble 9 (looks like a heap obj
+  ;; pointer) but is actually an immediate.  Without the tag-check in
+  ;; +op-obj-subtag+'s translator, predicates that reach obj-subtag(T)
+  ;; deref'd [T-9] = #xDEAD1000 (one byte past the 4KB NIL-page mmap)
+  ;; and SIGSEGV'd.  The path that surfaced this in practice was
+  ;; rt-equal → rt-floatp(T) whenever a test returned T and expected
+  ;; was something else; also cl-types' cos/sin/exp/cosh/etc. and
+  ;; integerp's bignum-check.
+  ;;
+  ;; The predicates below all reach obj-subtag and used to crash on T;
+  ;; with the IR-op fix they now return a sensible answer for an
+  ;; immediate value.
+  (deftest 9120 (integerp t)  nil)
+  (deftest 9121 (stringp  t)  nil)
+  (deftest 9122 (arrayp   t)  nil)
+  (deftest 9123 (= (obj-subtag t) 0) t) ;; explicit obj-subtag tag-mismatch
   )

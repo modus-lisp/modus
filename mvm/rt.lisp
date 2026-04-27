@@ -34,7 +34,11 @@
 ;;; ============================================================
 
 (defun rt-floatp (x)
-  "Check if x is a boxed float (subtag 96 = #x60)."
+  "Check if x is a boxed float (subtag 96 = #x60).
+
+   The obj-subtag IR-op is tag-safe (translate-x64.lisp's +op-obj-subtag+
+   guards the deref), so reaching this on T no longer crashes — it
+   returns 0 which won't match 96."
   (if (fixnump x) nil
     (if (consp x) nil
       (if (null x) nil

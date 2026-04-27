@@ -5339,7 +5339,11 @@
   (compile-object-subtype-p arg env dest +subtag-bignum+))
 
 (defun compile-object-subtype-p (arg env dest expected-subtag)
-  "Helper: compile a predicate that checks for object tag + specific subtag"
+  "Helper: compile a predicate that checks for object tag + specific subtag.
+
+   The obj-subtag IR-op now bails safely for non-tag-9 values
+   (translate-x64.lisp's +op-obj-subtag+ handler), so reaching it on T
+   no longer crashes — it returns 0 which won't match any real subtag."
   (let ((true-label (make-compiler-label))
         (end-label (make-compiler-label))
         (false-label (make-compiler-label))
@@ -5389,7 +5393,12 @@
   (compile-object-subtype-p arg env dest +subtag-array+))
 
 (defun compile-integerp (arg env dest)
-  "Compile (integerp x) - true if fixnum or bignum"
+  "Compile (integerp x) - true if fixnum or bignum.
+
+   The obj-subtag IR-op now safely returns 0 for non-tag-9 values
+   (translate-x64.lisp's +op-obj-subtag+ handler), so this code can
+   reach the bignum-subtag check on T without crashing — the result is
+   simply 'subtag != bignum-subtag' → false."
   (let ((check-bignum-label (make-compiler-label))
         (true-label (make-compiler-label))
         (false-label (make-compiler-label))

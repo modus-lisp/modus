@@ -1748,23 +1748,62 @@
 
         ((op= +op-obj-subtag+)
          ;; (obj-subtag Vd Vs) — extract subtag from header word
-         ;; Header is at [Vs - 9] (untag object pointer)
+         ;; Header is at [Vs - 9] (untag object pointer).
+         ;;
+         ;; Tag-safety: only deref if Vs is actually a heap pointer.  Two
+         ;; ways the deref can crash:
+         ;;
+         ;;   1. Vs's low nibble is not 9 (it's a fixnum, cons, immediate,
+         ;;      or forward).  [Vs - 9] is then off by some random offset
+         ;;      and may land in unmapped memory.
+         ;;
+         ;;   2. Vs IS T (= +t-value+ = #xDEAD1009) — low nibble 9 looks
+         ;;      like a heap pointer, but T is an immediate.  [T - 9] =
+         ;;      #xDEAD1000, one byte past the 4KB NIL-page mmap, and
+         ;;      SIGSEGVs.  The crash surfaces from process-of-elimination
+         ;;      cond chains in cl-types (cos/sin/exp/cosh/...) whose
+         ;;      guards (fixnump/consp/null) don't catch T, and from
+         ;;      rt-floatp called via rt-equal whenever a test returns T
+         ;;      and expected something else.
+         ;;
+         ;; Result on tag mismatch: dest = 0 (subtag 0, falsifies any
+         ;; specific-subtag comparison the caller does — e.g. (= subtag
+         ;; #x32) returns NIL, (= subtag #x50) returns NIL, etc.).
+         ;;
+         ;; NIL = #xDEAD0001 has low nibble 1 (cons) so the nibble check
+         ;; catches it; we only need the explicit T-check for T.
          (let* ((vd (first operands))
                 (vs (second operands))
                 (d (dest-phys-or-scratch vd)))
-           (let ((ps (vreg-phys vs)))
-             (if ps
-                 (emit-mov-reg-mem buf d ps -9)
-                 (progn
-                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
-                     (emit-push buf tmp)
-                     (emit-load-vreg buf vs tmp)
-                     (emit-mov-reg-mem buf d tmp -9)
-                     (emit-pop buf tmp)))))
-           ;; Extract low 8 bits of header as subtag
-           (emit-and-reg-imm buf d #xFF)
-           ;; Tag as fixnum
-           (emit-shl-reg-imm buf d 1)
+           (let* ((ps (vreg-phys vs))
+                  (src-reg (if ps ps +scratch-reg+))
+                  (fail-label (make-label))
+                  (done-label (make-label)))
+             (unless ps
+               (emit-load-vreg buf vs +scratch-reg+))
+             ;; Tag check: low 4 bits == 9 ?
+             (emit-mov-reg-reg buf d src-reg)
+             (emit-and-reg-imm buf d #x0F)
+             (emit-cmp-reg-imm buf d 9)
+             (emit-jcc buf :ne fail-label)
+             ;; src is tag-9.  Reject T explicitly (T's tag is 9 but T is
+             ;; an immediate, [T-9] is unmapped).  Push/pop a scratch we
+             ;; can clobber for the imm64 compare.
+             (let ((t-reg (if (or (eq src-reg 'rax) (eq d 'rax)) 'r10 'rax)))
+               (emit-push buf t-reg)
+               (emit-mov-reg-imm buf t-reg #xDEAD1009)
+               (emit-cmp-reg-reg buf src-reg t-reg)
+               (emit-pop buf t-reg)
+               (emit-jcc buf :e fail-label))
+             ;; OK, real heap object — extract subtag from header.
+             (emit-mov-reg-mem buf d src-reg -9)
+             (emit-and-reg-imm buf d #xFF)
+             (emit-shl-reg-imm buf d 1)
+             (emit-jmp buf done-label)
+             (emit-label buf fail-label)
+             ;; subtag = 0 (any specific-subtag compare in caller fails).
+             (emit-mov-reg-imm buf d 0)
+             (emit-label buf done-label))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================

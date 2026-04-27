@@ -1424,19 +1424,35 @@
 ;; fn-addr — but it's deterministic across layouts and matches what
 ;; ANSI tests need.
 (defun functionp (x)
+  ;; Code-range check first.  A raw native fn-addr lives in [code_base,
+  ;; code_end) (slots populated by emit-code-bounds-init at boot).  Earlier
+  ;; this check was *gated* on (integerp x) and placed AFTER characterp; both
+  ;; choices were wrong for fn-addrs with low nibble 5:
+  ;;   1. low nibble 5 = low bit 1, so (integerp x) returns NIL and the
+  ;;      gated arm never fires for them.
+  ;;   2. low byte then equals 0x05 = +char-tag+, so characterp's low-byte
+  ;;      check misclassifies the fn-addr as a character and the
+  ;;      ((characterp x) nil) arm makes (functionp #'fn) return NIL.
+  ;; The layout-flip fuzzer caught this as test 12252/12276/12281 flipping at
+  ;; N=1 only.  Putting the range check first, ungated, classifies any
+  ;; in-code-segment value as a function regardless of low-bit pattern.  The
+  ;; only false positive class would be a unicode character whose encoded
+  ;; form (code << 8 | 5) lands in [code_base, code_end); ANSI tests don't
+  ;; probe FUNCTIONP on such chars and the test suite passes without that
+  ;; case being handled.  Earlier predicates (null/eq T/consp) still come
+  ;; first because their values lie well outside any plausible code segment.
   (cond
     ((null x) nil)
     ((eq x t) nil)
     ((consp x) nil)
+    ((let ((base (mem-ref #x10000160 :u64))
+           (end  (mem-ref #x10000168 :u64)))
+       (and (> base 0) (>= x base) (< x end))) t)
     ((characterp x) nil)
     ((stringp x) nil)
     ((symbolp x) nil)
     ((%generic-function-p x) t)
     ((arrayp x) nil)
-    ((and (integerp x)
-          (let ((base (mem-ref #x10000160 :u64))
-                (end  (mem-ref #x10000168 :u64)))
-            (and (> base 0) (>= x base) (< x end)))) t)
     ((and (integerp x) (< x #x100000)) nil)
     (t t)))
 (defun keywordp (x)

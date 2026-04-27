@@ -5446,7 +5446,20 @@
     (free-temp-reg)))
 
 (defun compile-characterp (arg env dest)
-  "Compile (characterp x) - true if low byte = #x05"
+  "Compile (characterp x) - true if low byte = #x05.
+
+   The MVM character encoding is `(char-code << 8) | +char-tag+` so byte 1
+   carries the low byte of the char-code (NOT a separate +imm-char+ subtype
+   field as in runtime/tags.lisp's never-used SBCL-side scheme).  That means
+   characterp can only safely look at the low BYTE — byte 1 varies with the
+   char.  Any tightening here (e.g. checking byte 1 = 0) would reject genuine
+   non-#\\Null characters.
+
+   Consequence: characterp will spuriously return T for a non-character whose
+   low byte happens to be #x05.  Raw native fn-addrs at vaddr ...???05 after
+   layout shifting hit this.  The fix lives in `functionp` (cl-eval.lisp),
+   which moves a code-range check ahead of the characterp arm so fn-addrs are
+   classified as functions before characterp gets a chance to misclassify them."
   (let ((true-label (make-compiler-label))
         (end-label (make-compiler-label))
         (temp (alloc-temp-reg))

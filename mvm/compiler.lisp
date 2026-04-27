@@ -4420,6 +4420,16 @@
           (after-call-label (make-compiler-label))
           (after-sym-label (make-compiler-label)))
       (emit-ir :pop fn-call-reg)
+      ;; (Tried adding a [code_base, code_end) range-check fast path
+      ;; before the tag dispatches.  It works correctly but the
+      ;; per-funcall overhead — 8 IR ops × every funcall in the
+      ;; binary — regressed 33 ANSI tests via layout-shift fragility.
+      ;; The nibble-9 alignment in translate-x64.lisp already
+      ;; prevents the obj-tag mis-dispatch this would protect against,
+      ;; so the range check is structurally cleaner but functionally
+      ;; redundant here.  functionp's range check (cl-eval.lisp) is
+      ;; the principled use case for the slot infrastructure since
+      ;; that's a single check, not a per-call check.)
       ;; ============================================================
       ;; Native MVM symbol dispatch: subtag #x50 with exactly 1 slot
       ;; (hash only). CL symbols (3 slots) and closures (subtag #x52)

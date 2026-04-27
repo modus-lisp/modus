@@ -257,28 +257,63 @@ some constant that happened to be in RDX-relative memory.)
 %record-test-fail prints all five (output values are raw/4 — divide
 by 4 to recover real address; low 2 bits lost in the sar).
 
-### Two residual bug classes confirmed (uncommitted findings)
+### Three residual bug classes confirmed
 
-1. **Genuine call-NIL from method dispatch.**  Captured RAX = NIL
-   (= #xDEAD0001) on fail confirms the contact's prediction:
-   tagged NIL got loaded as a function pointer.  The %method-fn
-   accessor `(cddr method-record)` returns NIL when the record
-   has fewer than 2 elements, and `(apply NIL args)` → call-NIL.
-   This *can* be the predicted same-shape sixth bug — eq-collision
-   on class-name or slot-name during dispatch's
-   `%specializers-match-p` causing the applicable-methods list to
-   be empty AND the method-record's structure malformed.
-
-2. **CHANGE-CLASS is a no-op stub** (ansi-bridge.lisp:1352-54).
+1. **CHANGE-CLASS no-op stub** (ansi-bridge.lisp:1352-54).
+   `(defun change-class (instance new-class &rest initargs) instance)`.
    Tests like CLASS-0203.2 (ID 27081) fail because change-class
    returns the instance unchanged — slot values aren't transferred
    to a new layout, and the test's expected `(T NIL NIL NIL)` slot
    pattern (slots set to T by initforms in the new class) shows up
-   as `(NIL NIL NIL NIL)` (initforms never ran).  This is *not*
-   the same family as the other five — it's an unimplemented
-   feature.  The layout-fragility comes from how the test path
-   probes around the no-op stub; at some layouts the probes happen
-   to match by coincidence, at others they don't.
+   as `(NIL NIL NIL NIL)` (initforms never ran).  This is
+   *unimplemented feature*, not a same-shape bug.
+
+2. **Cross-function intern non-determinism (RULED OUT
+   empirically).**  Probe at `%specializer-matches-p` (cl-clos.lisp,
+   gated to fire only when two symbols' eq-mismatch coincides
+   with a name-hash match) ran a full ANSI suite without firing
+   once.  The collaborator's hypothesis that dispatch's
+   eq-on-class-name was the call-NIL source is therefore not
+   the cause.
+
+3. **The same-shape sixth bug: `:car` / `:cdr` IR-ops are
+   tag-unsafe.**  After the eq-collision probe came up empty, the
+   captured-state SIGSEGV signatures decoded against the binary's
+   disasm.  Three distinct fault patterns dominate:
+
+      Sig 1 (72 hits) at RIP 0x41812C: `mov rax, [rax+7]` = `(cdr X)`.
+        RAX = 0 at fault, si_addr = 7 → reading [+7] off NULL.
+      Sig 3 (31 hits) at RIP 0x462134: `mov rax, [rax-1]` = `(car X)`.
+        RAX = 0, si_addr = 0xFFFFFFFFFFFFFFFE → reading [-1] off NULL.
+      Sig 2 (36 hits) at RIP 0x405060 (middle of a movabs in some
+        array-init function — the same-shape pattern but on a
+        different opcode; needs more investigation).
+
+   All three are deref-without-tag-check, the same family as the
+   five already-fixed bugs.  car/cdr translate to `mov d, [src ± 1/7]`
+   with no validation that `src` is a real cons (low nibble 1).
+   For NIL = 0xDEAD0001 they happen to work because the NIL-page
+   mmap absorbs the read; for raw 0 (uninitialized slots, integer
+   values mistakenly chased as cons) the read goes to address ±1
+   from 0 → unmapped → SIGSEGV.
+
+   The fix is the same shape as obj-subtag/array-len: tag-check at
+   IR-op level, return NIL on tag mismatch.  Cost: ~15 bytes per
+   `car`/`cdr` site, and these are everywhere — risk of significant
+   layout shift.  Held until the layout-stability work makes
+   per-call-site changes safe.
+
+### What's left after this finding
+
+The same-shape bug class is fully named.  Closing it needs:
+
+  - **car/cdr IR-op tag-check** (this commit's hypothesis,
+    implementation deferred for layout-shift reasons).
+  - **Implement CHANGE-CLASS** (separate feature work, not
+    fragility).
+
+A fresh fragility-fuzzer N=0..8 sweep after the car/cdr fix would
+empirically validate "the family is closed" or surface a seventh.
 
 ### What's left
 

@@ -514,7 +514,32 @@
        (let ((cur cpl) (found nil))
          (loop
            (when (null cur) (return found))
-           (when (eq (car cur) spec) (setq found t) (return found))
+           (let ((c (car cur)))
+             (when (eq c spec) (setq found t) (return found))
+             ;; FRAGILITY DIAG: detect the same-shape sixth bug.
+             ;; If two symbols with the same name-hash failed to
+             ;; compare eq, that's cross-function intern
+             ;; non-determinism — the very thing the
+             ;; contact predicted for the call-NIL path.
+             ;; Only fire on eq-mismatch + name-hash match (rare
+             ;; diagnostic event, doesn't perturb the hot success
+             ;; path).  Budget at slot 0x10000C60 caps prints to
+             ;; prevent flood + Heisenberg; kernel-main initializes
+             ;; it to 5 (defvar init-thunks don't run on bare metal).
+             ;; Gated on symbolp on both sides so we skip T/NIL/
+             ;; conses/etc. that wouldn't have name-hashes anyway.
+             (let ((budget (mem-ref #x10000C60 :u64)))
+               (when (and (> budget 0)
+                          (symbolp c) (symbolp spec)
+                          (= (aref c 0) (aref spec 0)))
+                 (write-string-serial "EQ-COLL hash=")
+                 (print-dec (aref spec 0))
+                 (write-string-serial " a/4=")
+                 (print-dec (ash c -1))
+                 (write-string-serial " b/4=")
+                 (print-dec (ash spec -1))
+                 (write-char-serial 10)
+                 (setf (mem-ref #x10000C60 :u64) (- budget 1)))))
            (setq cur (cdr cur))))))))
 
 (defun %specializers-match-p (specs args)

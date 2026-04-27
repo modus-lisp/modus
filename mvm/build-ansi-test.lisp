@@ -1861,12 +1861,27 @@
                                (write-string s out)
                                (terpri out)
                                (queue-defvar-setq form)))))))))
-              (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-              ;; Init forms run in PARENT (their side effects need to persist
-              ;; for subsequent tests that depend on them, e.g. defclass).
-              ;; Each is wrapped individually so one crash doesn't skip others.
-              (dolist (s (nreverse init-forms))
-                (format out "  (handler-case ~A (t (c) nil))~%" s))
+              ;; Emit run-init-X — a separate function holding ONLY the init
+              ;; forms (defclass / defmethod / setq for defvar's value, etc.).
+              ;; run-real-ansi-tests now calls all run-init-* in the PARENT
+              ;; before any fork-file, so cross-file class references like
+              ;; reinitialize-instance.lsp's `(make-instance 'class-01)` —
+              ;; where class-01 is defined in defclass-01.lsp — see a
+              ;; populated *clos-classes* in their fork.
+              (let ((init-list (nreverse init-forms)))
+                (format out "(defun run-init-~A ()~%" (pathname-name file))
+                (if (null init-list)
+                    (format out "  nil~%")
+                    (dolist (s init-list)
+                      (format out "  (handler-case ~A (t (c) nil))~%" s)))
+                (format out ")~%")
+                (format out "(defun run-ansi-~A ()~%" (pathname-name file))
+                ;; run-ansi-X also re-runs init forms (idempotent — defclass
+                ;; updates the registry) so a fork's run-ansi-X still
+                ;; populates the registry even if the parent's run-init-*
+                ;; pass somehow missed it.
+                (dolist (s init-list)
+                  (format out "  (handler-case ~A (t (c) nil))~%" s)))
               ;; Test forms — wrap EACH fork-test call in its own handler-case
               ;; so a crash during parent-side arg-evaluation (vector literal,
               ;; closure creation, etc.) of test N doesn't kill test N+1.
@@ -2393,7 +2408,24 @@
                      (format s "      (if (< last *skip-below*) nil (if (>= first *run-only-below*) nil t))~%")
                      (format s "      t))~%")
                      (format s "~%(defun run-real-ansi-tests ()~%")
-                     ;; Each file is fork+wait wrapped, gated by the shard range.
+                     ;; Phase 1 (PARENT): run init-forms for the defclass-*
+                     ;; files so *clos-classes* gets the cross-referenced
+                     ;; class definitions (class-01, class-02, etc.) before
+                     ;; any test fork starts.  Without this, a fork for
+                     ;; reinitialize-instance.lsp couldn't see class-01
+                     ;; (defined in defclass-01.lsp's fork) and the tests
+                     ;; there used to pass only via a NIL-cascade
+                     ;; coincidence, which was layout-fragile.
+                     ;;
+                     ;; Conservative scope (defclass-* only): trying to run
+                     ;; init for ALL files crashes the parent (some defmethod
+                     ;; init forms apparently SIGSEGV unrecoverably even with
+                     ;; handler-case wrapping).
+                     (dolist (name *ansi-file-names*)
+                       (when (and (>= (length name) 9)
+                                  (string= (subseq name 0 9) "defclass-"))
+                         (format s "  (handler-case (run-init-~A) (t (c) nil))~%" name)))
+                     ;; Phase 2: forks per file.
                      (let ((by-name nil))
                        (dolist (entry *ansi-file-ranges*)
                          (push entry by-name))

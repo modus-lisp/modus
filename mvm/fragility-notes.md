@@ -219,6 +219,30 @@ against, run with N=1 (failing) and N=0 (passing), diff to see
 which `eq` returns differently.  That should pinpoint the exact
 collision.
 
+**Heisenberg note (commit 9530b1b):** any in-process instrumentation
+of the predicates (write-char-serial, print-dec etc.) adds bytes to
+the predicate's compiled body, multiplying across thousands of call
+sites and shifting the binary far enough to change the failure mode.
+The instrumentation literally moves the bug.
+
+**Strace observations (commit 9530b1b):** running the N=1 binary
+under `strace -e signal,rt_sigaction` shows the binary takes
+*hundreds* of SIGSEGVs during a normal run, all caught by the
+sigaction handler stub and longjmp'd back to the nearest
+handler-case.  The fault addresses cluster in two ranges:
+  - 0xdead0001 / 0xdead1009 / 0xdead3ca2: NIL/T/some-immediate
+    being dereffed (expected — guarded car/cdr-on-nil path)
+  - 0x7c259b000xxx, 0xffff83da7e...: high-userspace addresses
+    that look like mmapped heap regions or stack values being
+    treated as pointers.  These appear in chunks per test,
+    suggesting the handler-case recovery path itself sometimes
+    re-faults a few times before settling.
+
+The test-12252 fault wasn't directly observed (strace timed out
+before reaching it), so the precise mechanism for these 14 CLOS
+tests is still open.  External observation via gdb-on-binary or
+dual-binary disassembly diff is what's left.
+
 ## Open questions / deeper fragility
 
 After the nibble-9 alignment AND functionp fix, the 4-stubborn-tests

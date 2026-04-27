@@ -238,10 +238,63 @@ handler-case.  The fault addresses cluster in two ranges:
     suggesting the handler-case recovery path itself sometimes
     re-faults a few times before settling.
 
-The test-12252 fault wasn't directly observed (strace timed out
-before reaching it), so the precise mechanism for these 14 CLOS
-tests is still open.  External observation via gdb-on-binary or
-dual-binary disassembly diff is what's left.
+## Layout-stable diagnostic finding (commit 21ae4eb, 2026-04-27)
+
+The Heisenberg-safe approach finally pinned down 12252/12276/12281:
+
+1. Add diagnostic to the END of `kernel-main` — the LAST defun in
+   the build, so any code added there shifts only kernel-main's body
+   and not earlier functions.  IDENTITY's runtime address is
+   therefore the SAME with diagnostic as without it at the same
+   fuzz-N.
+2. Diagnostic uses non-fixnum-arithmetic outputs (single-character
+   Y/n bytes per predicate via write-char-serial) to avoid the
+   integer-arithmetic crash that print-dec hits on a value with
+   low bit 1.
+3. With diagnostic, observed at N=1: `(characterp #'identity)`
+   returns T even though IDENTITY is a function.
+
+**Root cause:** The MVM character encoding is
+`(char-code << 8) | +char-tag+`.  characterp's intrinsic checks
+`(low byte) == +char-tag+ (#x05)`.  Any non-character whose low
+byte happens to be 0x05 — including a raw fn-addr that landed at
+vaddr ...???05 after layout shifting — passes characterp.  The
+process-of-elimination cond in functionp had `((characterp x) nil)`
+ahead of any range check, so such fn-addrs returned NIL from
+functionp.
+
+**Fix:** move the [code_base, code_end) range check to BEFORE
+characterp in functionp's cond (commit 21ae4eb).  The range check
+is layout-independent — fn-addrs always live in the code segment
+regardless of low-bit pattern.  Result: 12252/12276/12281 pass at
+both N=0 and N=1; unique passes +17 at N=0 and +20 at N=1.
+
+(We tried tightening characterp itself to check 16 bits = 0x0005,
+but the MVM encoding puts the char-code's low byte in byte 1 — so
+that tightening rejected every non-#\\Null character.  Regression:
+-191 tests at N=0.  Reverted; only the docstring update kept.
+See compile-characterp's docstring.)
+
+## CLOS family (26949 / 27084 / 27465 / 27484 / 27509-27512 /
+##                27534 / 27551 / 27561) — different fragility class
+
+After the functionp fix, the other 11 originally-flippy CLOS tests
+INVERTED their pattern: most now pass at N=1 and fail at N=0 (vs
+the baseline where they passed at N=0 and failed at N=1).  This is
+*shifted layout luck*, not a fix — the fragility itself is intact
+and now sits at a different N.  Net unique passes still up at both
+N=0 and N=1, but the underlying mechanism is unsolved.
+
+These tests all manipulate CLOS instances (CHANGE-CLASS,
+MAKE-INSTANCE, REINITIALIZE-INSTANCE, SHARED-INITIALIZE,
+MAKE-LOAD-FORM, CLASS-0206) and the hypothesis remains
+*eq-collision on slot-0 markers*:
+`%clos-instance-p` reads `(aref x 0)` and compares with `eq` to
+`'%clos-instance`; if some *other* heap object happens to land at
+the bit-pattern of that interned symbol, the predicate misclassifies.
+
+External observation via gdb-on-binary or dual-binary disassembly
+diff is what's left to pin the precise mechanism.
 
 ## Open questions / deeper fragility
 

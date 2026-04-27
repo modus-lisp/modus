@@ -1445,9 +1445,24 @@
     ((null x) nil)
     ((eq x t) nil)
     ((consp x) nil)
-    ((let ((base (mem-ref #x10000160 :u64))
-           (end  (mem-ref #x10000168 :u64)))
-       (and (> base 0) (>= x base) (< x end))) t)
+    ;; Mask the low bit so the range comparison stays on the fast path.
+    ;; After our nibble-1-and-9 alignment, raw fn-addrs can still land on
+    ;; odd nibbles (3, 5, 7, B, D, F).  For those, low bit 1 makes the
+    ;; tag-check in compile-compare-2 fail and the slow numeric helper
+    ;; runs — but numeric-value-less-p calls (integerp x) which returns
+    ;; NIL for odd-nibble fn-addrs (they're not real fixnums or bignums),
+    ;; so the slow path returns NIL and the range check fails.
+    ;;
+    ;; (logand x -2) clears the bottom two bits via raw bitwise AND
+    ;; (compile-logand → :and IR-op which does raw register AND).  The
+    ;; result has low bit 0 → fixnum-shaped → fast-path compare.  The
+    ;; relation `xs in [base, end)' still answers `x in [base, end]'
+    ;; correctly for any x within ±3 bytes of the range, which is far
+    ;; tighter than the segment alignment of code_base/code_end.
+    ((let* ((base (mem-ref #x10000160 :u64))
+            (end  (mem-ref #x10000168 :u64))
+            (xs   (logand x -2)))
+       (and (> base 0) (>= xs base) (< xs end))) t)
     ((characterp x) nil)
     ((stringp x) nil)
     ((symbolp x) nil)

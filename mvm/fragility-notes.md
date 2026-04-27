@@ -132,6 +132,93 @@ What doesn't work yet:
 Likely-needed prerequisite: solve the residual "what gets flipped by
 small-uniform shifts" mystery, then per-call-site additions become safe.
 
+## Layout-flip fuzzer findings (2026-04-27)
+
+`scripts/fragility-fuzzer.sh` builds the ANSI-test binary with N
+extra `:nop` IR ops injected at every compile-funcall site, for
+N ∈ {0..8}, and diffs which tests flip across builds.  Each NOP
+is 1 byte, and there are thousands of funcall sites, so each
+increment of N shifts the binary by thousands of bytes.
+
+Results:
+```
+  N=0  passed=9573  failed=9573
+  N=1  passed=9559  failed=9587
+  N=2  passed=9562  failed=9584
+  N=3  passed=9571  failed=9575
+  N=4  passed=9562  failed=9584
+  N=5  passed=9571  failed=9575
+  N=6  passed=9571  failed=9575
+  N=7  passed=9573  failed=9573
+  N=8  passed=9573  failed=9573
+
+  Stable across all N: 9156 tests
+  Flippy: 14 tests
+```
+
+**Key observations:**
+
+1. **Non-monotonic.**  N=0 and N=7,8 both score 9573.  The pass count
+   doesn't drop and stay dropped — it dips and recovers.  This is the
+   signature of an alignment-modulo issue (something needs to be at a
+   particular address mod K), not a generic "code grew, something
+   broke" issue.
+
+2. **Only 14 tests are flippy.**  9156 are stable across all N — most
+   of the suite is layout-insensitive.
+
+3. **All 14 flippy tests are CLOS:**
+
+   ```
+   12252  function          (TYPEP #'IDENTITY 'FUNCTION)
+   12276  functionp         (FUNCTIONP #'IDENTITY)
+   12281  functionp         (FUNCTIONP ...)
+   26949  change-class      CHANGE-CLASS-CLASS-04B
+   27084  defclass-02       (defclass with metaclass)
+   27465  make-instance
+   27484  make-load-form
+   27509-27512  reinitialize-instance
+   27534, 27551, 27561  shared-initialize
+   ```
+
+   The 12252/12276/12281 group is `(typep / functionp #'IDENTITY)`
+   — they fail only at N=1, suggesting the lookup path encounters
+   something that's at a layout-specific bad address only at that
+   shift.
+
+   The 26949/27484/27509-27561 group fails at N ∈ {1, 2, 4} but
+   passes at N ∈ {0, 3, 5, 6, 7, 8}.  These all involve CLOS
+   instance manipulation (slot access, generic dispatch, metaclass
+   protocol).
+
+   27084/27465 pass only at N ∈ {0, 7, 8} — most restrictive.
+   Both are CLOS metaprotocol tests.
+
+4. **At our default (N=0) we already score 9573.**  We're "lucky"
+   on the current layout — all 14 flippy tests happen to pass.
+   Any per-call-site code growth (like the ratio-aware `*` we
+   tried earlier) shifts addresses and flips these tests.
+
+5. **The mechanism is CLOS-specific.**  CLOS in `mvm/cl-clos.lisp`
+   uses a few patterns that could be layout-sensitive:
+     - `eq` against marker symbols (`'%clos-instance`,
+       `'%generic-function`) stored in slot 0 of objects.
+     - `obj-subtag` / `array-length` checks on objects to
+       distinguish GFs / methods / instances.
+     - generic-function dispatch via assoc on method tables.
+
+   The non-monotonic flip pattern strongly suggests `eq` collisions:
+   at certain layouts, two different things have the same bit
+   pattern (e.g. an `aref instance 0` lookup happens to return
+   bytes that match `'%generic-function`'s value).  Adding NOPs
+   shifts addresses and the coincidence comes and goes.
+
+**Next step (if we keep digging):** instrument cl-clos.lisp's
+`%clos-instance-p` / `%gf-p` to print the values they're comparing
+against, run with N=1 (failing) and N=0 (passing), diff to see
+which `eq` returns differently.  That should pinpoint the exact
+collision.
+
 ## Open questions / deeper fragility
 
 After the nibble-9 alignment AND functionp fix, the 4-stubborn-tests

@@ -2744,6 +2744,16 @@
 ;; misidentified as cons/object pointers by compile-funcall.
 (setf modus.mvm.x64::*x64-native-code-offset* 351)
 
+;; Layout-flip fuzzer: read MODUS_FUZZ_FUNCALL_NOPS from the environment.
+;; Defaults to 0; set to a positive integer to inject N :nop IR ops at
+;; the start of every compile-funcall.  Used by scripts/fragility-fuzzer.sh.
+(let ((env (sb-ext:posix-getenv "MODUS_FUZZ_FUNCALL_NOPS")))
+  (when env
+    (let ((n (parse-integer env :junk-allowed t)))
+      (when (and n (>= n 0))
+        (setf modus.mvm::*fuzz-funcall-nops* n)
+        (format t "~%FUZZ: injecting ~D :nop ops per funcall~%" n)))))
+
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))

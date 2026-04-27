@@ -144,6 +144,15 @@
    Compiling a function call at depth > 0 risks register clobber
    from the call's save/restore interacting with the arithmetic stack.")
 
+(defvar *fuzz-funcall-nops* 0
+  "DIAGNOSTIC: number of :nop IR ops to inject at the start of each
+   compile-funcall.  Used by the layout-flip fuzzer to vary bytecode
+   layout in controlled increments without changing semantics.  Build
+   the binary with different values and diff which tests flip — the
+   pattern reveals what underlying mechanism still depends on layout
+   (alignment? branch displacement? GC scan finding a specific value
+   on the stack?).  Set to 0 in production builds.")
+
 (defvar *pending-flet-ir* nil
   "Collects (info . ir) pairs from flet/labels function compilations.
    These are drained by mvm-compile-all into all-ir after each top-level form.")
@@ -4420,6 +4429,12 @@
           (after-call-label (make-compiler-label))
           (after-sym-label (make-compiler-label)))
       (emit-ir :pop fn-call-reg)
+      ;; Layout-flip fuzzer hook — defaults to 0.  Used by
+      ;; scripts/fragility-fuzzer.sh to vary bytecode layout in
+      ;; controlled increments.  Run with various N and diff which
+      ;; tests flip.  See fragility-notes.md for findings.
+      (when (> *fuzz-funcall-nops* 0)
+        (dotimes (i *fuzz-funcall-nops*) (emit-ir :nop)))
       ;; (Tried adding a [code_base, code_end) range-check fast path
       ;; before the tag dispatches.  It works correctly but the
       ;; per-funcall overhead — 8 IR ops × every funcall in the

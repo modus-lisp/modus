@@ -181,23 +181,102 @@ the wrong place.
 
 ## Where to start fresh
 
-The functionp fix landed (commit 21ae4eb) and is layout-stable.
+Progress against the open question came from reframing it:
+**stop chasing CLOS, start auditing every "low byte/nibble equals K"
+predicate the same way we audited characterp.**
 
-The harness now (commit pending) pre-runs `defclass-*` init forms
-in the parent so cross-file class references are real instead of
-relying on the NIL-cascade.  This is structurally correct but
-doesn't on its own resolve the CLOS family.
+That found two more root causes of the same shape:
 
-The next concrete step is **dual-binary disassembly diff**: build at
-N=0 (where 27509 fails after our fixes) and N=1 (where it passes),
-locate the compiled body of `run-tests-reinitialize-instance`, and
-compare the bytes around the test thunk for test 27509.  That will
-either reveal a register-allocation / branch-displacement difference
-that points at the layout-fragile path, or it will show byte-for-byte
-identical code in which case the fragility is in shared code reached
-via the test (most likely `%make-instance`, `%slot-boundp`, or
-`map-slot-boundp*`).
+### Root cause #3: `:obj-subtag` IR-op tag-unsafe (commit 9a11f24)
 
-The harness changes for parent-init are in commits to come; the
-functionp fix is at 21ae4eb.
+The x64 translator emitted a bare `mov d, [src - 9]' with no check
+that `src' was actually a tag-9 heap pointer.  Two crashes possible:
 
+  1. src low nibble != 9 (fixnum/cons/immediate/forward) — random
+     offset, often unmapped → SIGSEGV.
+  2. src IS T (= +t-value+ = #xDEAD1009).  Low nibble 9 looks like
+     a heap pointer, but T is an immediate and [T-9] = #xDEAD1000
+     is one byte past the 4KB NIL-page mmap → SIGSEGV.
+
+Class (2) was the path that surfaced via rt-equal → rt-floatp(T)
+whenever a test returned T but expected something non-T:
+
+    rt-equal:
+      (eql a b) → NIL                       ; a=T, b=other
+      ((or (consp a) (consp b)) NIL)        ; falls through
+      ((and (rt-floatp a) (rt-floatp b)) …) ; calls (rt-floatp T)
+        rt-floatp guards: fixnump/consp/null all NIL for T, then
+        (= (obj-subtag T) 96) → deref [T-9] → SIGSEGV.
+
+Same shape as characterp/functionp: a process-of-elimination
+predicate validates with insufficient guards and a non-matching
+immediate slips through to a deref.  cl-types' cos/sin/exp/cosh
+and integerp's bignum-check all had identical shape.
+
+Fix: tag-check at the IR-op level, returning subtag 0 on mismatch.
+
+### Root cause #4: `:array-len` IR-op tag-unsafe (commit f7fa46c)
+
+Same shape as obj-subtag.  CLOS predicates do
+`(if (= (obj-subtag x) #x32) (if (>= (array-length x) 1) ...))';
+the obj-subtag fix makes the first arm safely return NIL for T,
+but `%gf-p' / similar reach `array-length' on T → crash.
+
+Mirror fix applied.
+
+### Empirical results
+
+  Baseline           : N=0 9169 unique / N=1 9156 unique
+  + functionp fix    : N=0 9159 unique / N=1 9167 unique
+  + obj-subtag fix   : N=0 9327 unique / N=1 9317 unique
+  + array-len fix    : N=0 9386 unique / N=1 9395 unique
+
+Cumulative gain: **+217 unique tests at N=0, +239 at N=1**.
+
+## What's still open
+
+The 11-test CLOS family (REINITIALIZE-INSTANCE.{1-4},
+SHARED-INITIALIZE.*, CHANGE-CLASS.4.5, MAKE-LOAD-FORM.13,
+CLASS-0206.1) is no longer all-or-nothing per N — but has a
+**residual layout-fragility** that flips it across N.  At N=0 most
+fail; at N=1 most pass.  This is *less bad* than baseline (where
+N=1 was a total wipeout) but it's not solved.
+
+The crash signature in fork at N=0 is now:
+
+    SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_ACCERR,
+             si_addr=0xdead0001}
+
+i.e. **`call NIL`** — execution jumped to NIL's value `#xDEAD0001`,
+which lies inside the NIL-page mmap (RW but not X) so the access
+faults on instruction-fetch.
+
+This says: somewhere in the test path, a function pointer is NIL.
+Most likely path: `mapcar (applyf #'slot-boundp obj) slots'.
+applyf returns NIL only if its etypecase matches no clause.
+etypecase rewrites to typecase and typecase has no error-on-no-match
+arm, so a non-symbol non-function `fn' gives NIL.
+
+Hypothesis to investigate: at certain layouts, `#'slot-boundp` (or
+similar) loads as something that fails both `(typep x 'symbol)` and
+`(typep x 'function)`.  But `functionp` uses a code-bounds range
+check now, which should be layout-stable for any in-segment fn-addr.
+
+Other concrete things to audit:
+  - `:obj-ref' and `:obj-set' for large idx (currently safe for
+    small idx because [obj+7+8N] lands in the 4KB NIL page; for
+    N >= ~510 it'd fault).
+  - `&rest defun + funcall-of-let-allocated-lambda' SIGSEGV
+    documented in CLAUDE.md.  reinitialize-instance has &rest.
+  - `etypecase' rewrite's no-match path — should signal but
+    currently silently returns NIL.  applyf depends on it.
+  - Caller-saved registers V5..V8 around `:call-ind' in
+    `compile-funcall' / `compile-call' — there were past
+    regressions when the slow-path didn't save these.
+
+The pattern that's been productive: **every (obj OP) intrinsic
+where OP eventually derefs needs the same tag-check**.  We've done
+obj-subtag and array-len.  Remaining IR-ops with deref: car/cdr,
+set-car/set-cdr, obj-ref, obj-set, aref, aset.  None of these were
+the immediate cause of the call-NIL crash, but they're worth
+auditing to close the bug class.

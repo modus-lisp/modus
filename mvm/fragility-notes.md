@@ -96,6 +96,42 @@ documents why this remains unfixed.
 
 This is a hint that the fragility is broader than just funcall.
 
+## Per-call-site code growth as its own fragility class
+
+Several attempted fixes failed not because they were semantically wrong
+but because they grew the bytecode at every call site, shifting addresses
+elsewhere into bad-bit-pattern territory.  Confirmed cases:
+
+- compile-compare-2 caller-save (commit 39a414d, comment in source):
+  push/pop V5..V8 across the slow-path :call.  Correct semantically;
+  regressed 10 CLOS tests via per-comparison size growth.
+- compile-1+/1- ratio dispatch (commit 41b1434): rerouting through
+  (+ x 1) so ratios get incremented properly.  Regressed 2 tests.
+- compile-* ratio dispatch (commit 40faf94 contains the working +/-
+  variant; * not enabled): ~85 tests over SIGALRM budget because
+  multiply hits tight inner loops.
+- compile-funcall code-bounds range check (commit 28ceb52): 8 IR ops
+  before every funcall; regressed 33 tests.
+
+Hypothesis: each per-call-site addition shifts function offsets by a
+small amount, but compounded over the call density of a hot operator
+(thousands of call sites in a real binary), the cumulative shift is
+enough to flip tests via the still-not-fully-rooted-out underlying
+fragility (whatever's left after our two fixed root causes).
+
+What works without per-call-site growth:
+- Translator alignment fixes (NOP padding, applied per-function not
+  per-call-site).
+- Predicate body fixes (functionp, vectorp etc. — applied to the
+  defun once, not per call).
+- Boot-stub init code (one-time at boot).
+
+What doesn't work yet:
+- Anything inserted at every call site of a hot intrinsic.
+
+Likely-needed prerequisite: solve the residual "what gets flipped by
+small-uniform shifts" mystery, then per-call-site additions become safe.
+
 ## Open questions / deeper fragility
 
 After the nibble-9 alignment AND functionp fix, the 4-stubborn-tests

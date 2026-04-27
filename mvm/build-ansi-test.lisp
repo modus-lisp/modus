@@ -2276,6 +2276,26 @@
                      ~%  (write-char-serial 73) (write-char-serial 76)~
                      ~%  (write-char-serial 32)~
                      ~%  (print-dec id)~
+                     ~%  ;; FRAGILITY DIAG: print captured signal state from the~
+                     ~%  ;; SIGSEGV handler (translate-x64.lisp #x0520 stub).~
+                     ~%  ;; Slots 0x10000C30/C38/C40/C48 hold rip/rsp/[rsp]/rax at~
+                     ~%  ;; the moment of the LAST SIGSEGV before this FAIL.~
+                     ~%  ;; SITE is the byte AFTER the failing call in the caller —~
+                     ~%  ;; the actual address to disassemble.  TARGET is what got~
+                     ~%  ;; loaded as the call destination (0xdead0001 = tagged NIL).~
+                     ~%  ;; Each value is divided by 2 for print-dec safety~
+                     ~%  ;; (raw u64 with arbitrary low bit upsets print-dec).~
+                     ~%  (let ((rip  (mem-ref #x10000C30 :u64))~
+                     ~%        (site (mem-ref #x10000C40 :u64))~
+                     ~%        (rax  (mem-ref #x10000C48 :u64))~
+                     ~%        (siad (mem-ref #x10000C50 :u64))~
+                     ~%        (uctx (mem-ref #x10000C58 :u64)))~
+                     ~%    (when (> rip 0)~
+                     ~%      (write-string-serial \" RIP/4=\") (print-dec (ash rip -1))~
+                     ~%      (write-string-serial \" SITE/4=\") (print-dec (ash site -1))~
+                     ~%      (write-string-serial \" RAX/4=\") (print-dec (ash rax -1))~
+                     ~%      (write-string-serial \" SI/4=\") (print-dec (ash siad -1))~
+                     ~%      (write-string-serial \" UCTX/4=\") (print-dec (ash uctx -1))))~
                      ~%  (write-char-serial 10)~
                      ~%  nil)~
                      ~%;; Codegen wraps each (run-test ...) in (handler-case ... (t (c) (%test-crash-fail ID)))~

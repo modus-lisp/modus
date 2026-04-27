@@ -703,6 +703,50 @@
 
                 ;; --- Embedded handler stub (kernel jumps here on signal) ---
                 (emit-label buf stub-label)
+                ;; FRAGILITY DIAG: capture useful state from the kernel's
+                ;; ucontext (RDX, requires SA_SIGINFO above).
+                ;;
+                ;; Offsets are ucontext-relative: ucontext starts with
+                ;; uc_flags(8) + uc_link(8) + uc_stack(24) = 40 bytes header,
+                ;; then uc_mcontext.gregs[NGREG=23 longs of 8 bytes each].
+                ;; gregs index for each named register:
+                ;;   R8=0 .. R15=7, RDI=8, RSI=9, RBP=10, RBX=11, RDX=12,
+                ;;   RAX=13, RCX=14, RSP=15, RIP=16
+                ;; ucontext-relative byte offsets = 40 + gregs[i] * 8:
+                ;;   RAX = 40 + 13*8 = 144 = 0x90
+                ;;   RSP = 40 + 15*8 = 160 = 0xA0
+                ;;   RIP = 40 + 16*8 = 168 = 0xA8
+                ;;
+                ;; Why each is useful:
+                ;;   RIP   = the faulting target (= 0xdead0001 for `call NIL')
+                ;;   RSP   = top of caller's stack at the moment of fault
+                ;;   [RSP] = byte AFTER the failing call instruction —
+                ;;           the call site we actually want to disassemble
+                ;;   RAX   = what got loaded as the call target (0xdead0001
+                ;;           confirms "tagged NIL was used as a function")
+                ;;
+                ;; Slots 0x10000C30/C38/C40/C48 — overwritten on each fault,
+                ;; so the FAIL-record path reads them after the longjmp settles.
+                (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (saved RIP)
+                (emit-bytes buf #x48 #x89 #x04 #x25)
+                (emit-u32 buf #x10000C30)
+                (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
+                (emit-bytes buf #x48 #x89 #x04 #x25)
+                (emit-u32 buf #x10000C38)
+                (emit-bytes buf #x48 #x8B #x00)                     ; mov rax, [rax]    (call site)
+                (emit-bytes buf #x48 #x89 #x04 #x25)
+                (emit-u32 buf #x10000C40)
+                (emit-bytes buf #x48 #x8B #x82 #x90 #x00 #x00 #x00) ; mov rax, [rdx+0x90] (saved RAX)
+                (emit-bytes buf #x48 #x89 #x04 #x25)
+                (emit-u32 buf #x10000C48)
+                ;; Also capture si_addr (siginfo+16) and the kernel-passed
+                ;; RDX itself, to verify our ucontext-relative reads.
+                (emit-bytes buf #x48 #x8B #x46 #x10)                ; mov rax, [rsi+16] (si_addr)
+                (emit-bytes buf #x48 #x89 #x04 #x25)
+                (emit-u32 buf #x10000C50)
+                (emit-bytes buf #x48 #x89 #xD0)                     ; mov rax, rdx (ucontext ptr)
+                (emit-bytes buf #x48 #x89 #x04 #x25)
+                (emit-u32 buf #x10000C58)
                 ;; mov rcx, 0x10000180  (saved-handler-state address)
                 (emit-bytes buf #x48 #xB9)
                 (emit-u32 buf #x10000180) (emit-u32 buf 0)
@@ -781,13 +825,17 @@
                 ;; lea rax, [rip+disp] then mov [rsp], rax.
                 (emit-lea-label buf 'rax stub-label)
                 (emit-bytes buf #x48 #x89 #x04 #x24) ; mov [rsp], rax
-                ;; [rsp+8]  = sa_flags = SA_NODEFER | SA_RESTORER.
+                ;; [rsp+8]  = sa_flags = SA_NODEFER | SA_RESTORER | SA_SIGINFO.
                 ;; SA_RESTORER is required on x86-64 (kernel silently drops
                 ;; signals without it). SA_NODEFER lets us re-enter the
                 ;; handler for a SIGSEGV that happens during longjmp setup,
                 ;; otherwise the kernel queues and eventually kills via
-                ;; the default handler anyway.
-                (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x00 #x00 #x00 #x44)
+                ;; the default handler anyway.  SA_SIGINFO (0x4) is required
+                ;; for the kernel to populate RDX with the ucontext pointer
+                ;; on handler entry — without it, RDX is unspecified and our
+                ;; ucontext-relative reads (uc_mcontext.gregs[…]) read
+                ;; garbage from wherever RDX happened to point.
+                (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x04 #x00 #x00 #x44)
                 ;; [rsp+16] = sa_restorer = restorer-label.
                 (emit-lea-label buf 'rax restorer-label)
                 (emit-bytes buf #x48 #x89 #x44 #x24 #x10)  ; mov [rsp+16], rax

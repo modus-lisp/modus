@@ -1776,34 +1776,37 @@
                 (vs (second operands))
                 (d (dest-phys-or-scratch vd)))
            (let* ((ps (vreg-phys vs))
-                  (src-reg (if ps ps +scratch-reg+))
                   (fail-label (make-label))
-                  (done-label (make-label)))
-             (unless ps
-               (emit-load-vreg buf vs +scratch-reg+))
-             ;; Tag check: low 4 bits == 9 ?
-             (emit-mov-reg-reg buf d src-reg)
+                  (done-label (make-label))
+                  ;; tmp must be distinct from d.  d ∈ {V-phys-regs, rax};
+                  ;; r13 isn't a V-phys-reg, so r13 is always disjoint
+                  ;; except when d is rax — in that case use r13 ourselves.
+                  (tmp (if (eq d 'rax) 'r13 'rax)))
+             (emit-push buf tmp)
+             ;; Load vs into tmp — preserves the source through clobbers.
+             (if ps
+                 (emit-mov-reg-reg buf tmp ps)
+                 (emit-load-vreg buf vs tmp))
+             ;; Tag check: low nibble of tmp == 9 ?  d is scratch for AND.
+             (emit-mov-reg-reg buf d tmp)
              (emit-and-reg-imm buf d #x0F)
              (emit-cmp-reg-imm buf d 9)
              (emit-jcc buf :ne fail-label)
-             ;; src is tag-9.  Reject T explicitly (T's tag is 9 but T is
-             ;; an immediate, [T-9] is unmapped).  Push/pop a scratch we
-             ;; can clobber for the imm64 compare.
-             (let ((t-reg (if (or (eq src-reg 'rax) (eq d 'rax)) 'r10 'rax)))
-               (emit-push buf t-reg)
-               (emit-mov-reg-imm buf t-reg #xDEAD1009)
-               (emit-cmp-reg-reg buf src-reg t-reg)
-               (emit-pop buf t-reg)
-               (emit-jcc buf :e fail-label))
-             ;; OK, real heap object — extract subtag from header.
-             (emit-mov-reg-mem buf d src-reg -9)
+             ;; T-immediate check — T (#xDEAD1009) shares tag-9 with real
+             ;; heap pointers but [T-9] is unmapped.  d still scratch.
+             (emit-mov-reg-imm buf d #xDEAD1009)
+             (emit-cmp-reg-reg buf tmp d)
+             (emit-jcc buf :e fail-label)
+             ;; Real heap object — extract subtag from header at [tmp-9].
+             (emit-mov-reg-mem buf d tmp -9)
              (emit-and-reg-imm buf d #xFF)
              (emit-shl-reg-imm buf d 1)
              (emit-jmp buf done-label)
              (emit-label buf fail-label)
-             ;; subtag = 0 (any specific-subtag compare in caller fails).
+             ;; subtag = 0 — falsifies any caller's specific-subtag cmp.
              (emit-mov-reg-imm buf d 0)
-             (emit-label buf done-label))
+             (emit-label buf done-label)
+             (emit-pop buf tmp))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================
@@ -1870,22 +1873,51 @@
 
         ((op= +op-array-len+)
          ;; (array-len Vd Vobj) — extract element count from header
-         ;; Header at [Vobj - 9], count = header >> 8, tagged = count << 1
+         ;; Header at [Vobj - 9], count = header >> 8, tagged = count << 1.
+         ;;
+         ;; Same tag-safety hazard as +op-obj-subtag+: T (= #xDEAD1009)
+         ;; passes the implicit tag-9 check by sharing the low nibble,
+         ;; but T is an immediate and [T - 9] = #xDEAD1000 is one byte
+         ;; past the NIL-page mmap → SIGSEGV.  Predicates that gate on
+         ;; obj-subtag now succeed-but-return-zero for T (post-fix), but
+         ;; %clos-instance-p / %gf-p then proceed to (>= (array-length x) 1)
+         ;; which crashes here.  This was the residual layout-fragility
+         ;; for the CLOS family at N=1 even after the obj-subtag fix.
+         ;;
+         ;; Fix mirror: tag-check, then T-check; on either fail, return
+         ;; tagged fixnum 0 (no real array has length 0 normally; callers
+         ;; like `(>= (array-length x) 1)' yield NIL on zero, which is
+         ;; the correct "not an array of N+ slots" answer).
          (let* ((vd (first operands))
                 (vobj (second operands))
                 (d (dest-phys-or-scratch vd)))
-           (let ((po (vreg-phys vobj)))
+           (let* ((po (vreg-phys vobj))
+                  (fail-label (make-label))
+                  (done-label (make-label))
+                  ;; tmp must differ from d; r13 isn't a V-phys-reg.
+                  (tmp (if (eq d 'rax) 'r13 'rax)))
+             (emit-push buf tmp)
              (if po
-                 (emit-mov-reg-mem buf d po -9)
-                 (progn
-                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
-                     (emit-push buf tmp)
-                     (emit-load-vreg buf vobj tmp)
-                     (emit-mov-reg-mem buf d tmp -9)
-                     (emit-pop buf tmp)))))
-           ;; header >> 8 gives element count, << 1 tags as fixnum
-           (emit-shr-reg-imm buf d 8)
-           (emit-shl-reg-imm buf d 1)
+                 (emit-mov-reg-reg buf tmp po)
+                 (emit-load-vreg buf vobj tmp))
+             ;; Tag check.
+             (emit-mov-reg-reg buf d tmp)
+             (emit-and-reg-imm buf d #x0F)
+             (emit-cmp-reg-imm buf d 9)
+             (emit-jcc buf :ne fail-label)
+             ;; T-immediate check.
+             (emit-mov-reg-imm buf d #xDEAD1009)
+             (emit-cmp-reg-reg buf tmp d)
+             (emit-jcc buf :e fail-label)
+             ;; Real heap object — read header at [tmp-9], count = h >> 8, tag.
+             (emit-mov-reg-mem buf d tmp -9)
+             (emit-shr-reg-imm buf d 8)
+             (emit-shl-reg-imm buf d 1)
+             (emit-jmp buf done-label)
+             (emit-label buf fail-label)
+             (emit-mov-reg-imm buf d 0)
+             (emit-label buf done-label)
+             (emit-pop buf tmp))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================

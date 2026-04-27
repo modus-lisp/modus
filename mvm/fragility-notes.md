@@ -313,6 +313,32 @@ test file's run-ansi-X holds only the file's *own* %defclass calls
 itself defines `reinit-class-01` but not `class-01` — yet the tests
 that say `(make-instance 'class-01)` PASS at certain layouts.
 
+**A second probe also ruled out cross-function intern non-determinism:**
+two different defuns each return `'%xfn-probe-sym`; eq across them
+returns Y.  ansi-tests.lisp:1559's "cross-function symbol eq is
+known-broken" comment is therefore stale.  Both intra- and
+cross-function intern is consistent.
+
+So the surviving theory of the layout-fragile passes is the cascade
+mechanism: when class-01 is missing,
+  (make-instance 'class-01) → NIL
+  (reinitialize-instance NIL) → NIL
+  (eqt NIL NIL) → T
+  (map-slot-boundp* NIL '(s1 s2 s3)) → walks slot-boundp on NIL,
+    %slot-boundp does (aref NIL 1) — which lands inside the
+    NIL-page mmap (0xDEAD0000+4096 filled with NIL) so it
+    returns NIL rather than crashing — then (%find-clos-class nil)
+    returns NIL, %slot-boundp returns NIL → cascade gives
+    (NIL NIL NIL).
+  Final values (T (NIL NIL NIL)) match expected — test passes.
+
+The flip at certain N must come from this cascade going wrong.
+Candidates: at some layouts the (aref NIL 1) lands BEYOND the
+4KB NIL page (e.g. larger offsets in different cascade paths)
+and SIGSEGVs; or %slot-boundp's path takes a turn that the
+sigaction handler can't longjmp out of cleanly; or some intermediate
+operation produces a non-NIL value that breaks the cascade.
+
 This means either:
   - There's a path that registers `class-01` in the test fork that
     we haven't identified (some shared init?  some lazy load on

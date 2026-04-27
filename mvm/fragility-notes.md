@@ -302,20 +302,44 @@ So intern survives GC correctly — the GC's stack scan updates
 frame slots, including %intern-symbol's `table` binding.
 
 The actual mechanism for the CLOS family is therefore something
-else.  Open hypotheses:
-  1. `(aref x 0)` on a non-CLOS object happens to return the bits of
-     '%clos-instance via layout coincidence — but then x must be an
-     array (subtag 0x32) AND its slot 0 must equal the symbol's
-     pointer.  Not obvious how to engineer this collision.
-  2. %make-instance returns NIL because %find-clos-class fails for
-     reasons unrelated to intern (e.g. *clos-classes* alist itself
-     getting corrupted or the parent fork's load missing class-01
-     under some layout).  Test then crashes on `(aref nil 1)`.
-  3. A frame-slot collision in some hot CLOS function whose register
-     allocator behaves differently at layout-shifted positions.
+else.
+
+**Surprising find from a kernel-main probe (commit XXX, 2026-04-27):**
+the parent process at the diag point reports
+`DIAG-CLASS-01-FOUND: N` and `DIAG-MAKE-INSTANCE-NIL: Y` — i.e.
+the parent's `*clos-classes*` does NOT contain `class-01`.  Each
+test file's run-ansi-X holds only the file's *own* %defclass calls
+(see comment at build-ansi-test.lisp:1624).  reinitialize-instance.lsp
+itself defines `reinit-class-01` but not `class-01` — yet the tests
+that say `(make-instance 'class-01)` PASS at certain layouts.
+
+This means either:
+  - There's a path that registers `class-01` in the test fork that
+    we haven't identified (some shared init?  some lazy load on
+    first reference?), and that path is what's layout-fragile.
+  - The make-instance call somehow returns a non-nil value despite
+    class-01 missing — implying %make-instance has a layout-
+    sensitive non-NIL return path we don't yet understand.
+  - The harness fork-wait recovery is inadvertently *passing* some
+    tests by stamping P: rather than FAIL: under specific signal
+    timing, and at "lucky" N values 27509 and friends are being
+    erroneously credited.
 
 External observation via gdb-on-binary or dual-binary disassembly
-diff is what's left to pin the precise mechanism.
+diff is what's left to pin the precise mechanism.  The probe code
+(remembered for next time) was at the end of kernel-main BEFORE
+(run-all-tests):
+
+    (write-string-serial \"DIAG-CLASS-01-FOUND: \")
+    (write-char-serial (if (null (%find-clos-class 'class-01)) 78 89))
+    (write-char-serial 10)
+    (write-string-serial \"DIAG-MAKE-INSTANCE-NIL: \")
+    (write-char-serial (if (null (%make-instance 'class-01)) 89 78))
+    (write-char-serial 10)
+
+To probe inside the failing fork, the equivalent diag would need to
+be injected into the rewritten run-ansi-reinitialize-instance body
+(via build-ansi-test.lisp's per-file source emitter).
 
 ## Open questions / deeper fragility
 

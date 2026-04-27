@@ -2606,7 +2606,6 @@
   (when (> (mem-ref #x10000200 :u32) 2)
     (setq *run-only-below* (%parse-decimal-at-fixed-248)))
 
-
   ;; Run custom tests
   (run-all-tests)
 

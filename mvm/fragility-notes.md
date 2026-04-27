@@ -282,16 +282,37 @@ After the functionp fix, the other 11 originally-flippy CLOS tests
 INVERTED their pattern: most now pass at N=1 and fail at N=0 (vs
 the baseline where they passed at N=0 and failed at N=1).  This is
 *shifted layout luck*, not a fix — the fragility itself is intact
-and now sits at a different N.  Net unique passes still up at both
-N=0 and N=1, but the underlying mechanism is unsolved.
+and now sits at a different N.
 
 These tests all manipulate CLOS instances (CHANGE-CLASS,
 MAKE-INSTANCE, REINITIALIZE-INSTANCE, SHARED-INITIALIZE,
-MAKE-LOAD-FORM, CLASS-0206) and the hypothesis remains
-*eq-collision on slot-0 markers*:
-`%clos-instance-p` reads `(aref x 0)` and compares with `eq` to
-`'%clos-instance`; if some *other* heap object happens to land at
-the bit-pattern of that interned symbol, the predicate misclassifies.
+MAKE-LOAD-FORM, CLASS-0206) and an early hypothesis was
+*eq-collision via intern non-determinism*: %intern-symbol's local
+`table` binding could go stale across %make-symbol's GC trigger,
+puthash would write into a from-space table that gets reclaimed,
+and a later intern of the same name would allocate a fresh symbol —
+breaking eq comparison in %find-clos-class and %clos-instance-p.
+
+That hypothesis is **wrong**.  Verified empirically (commit XXX,
+2026-04-27) by an end-of-kernel-main diagnostic that interns
+'%clos-fragility-probe twice with 1M cons-allocations between (forcing
+multiple GCs) and prints `DIAG-INTERN-EQ: Y` if the two interns
+are eq.  Result was Y at the same N=0 layout that fails 27509 etc.
+So intern survives GC correctly — the GC's stack scan updates
+frame slots, including %intern-symbol's `table` binding.
+
+The actual mechanism for the CLOS family is therefore something
+else.  Open hypotheses:
+  1. `(aref x 0)` on a non-CLOS object happens to return the bits of
+     '%clos-instance via layout coincidence — but then x must be an
+     array (subtag 0x32) AND its slot 0 must equal the symbol's
+     pointer.  Not obvious how to engineer this collision.
+  2. %make-instance returns NIL because %find-clos-class fails for
+     reasons unrelated to intern (e.g. *clos-classes* alist itself
+     getting corrupted or the parent fork's load missing class-01
+     under some layout).  Test then crashes on `(aref nil 1)`.
+  3. A frame-slot collision in some hot CLOS function whose register
+     allocator behaves differently at layout-shifted positions.
 
 External observation via gdb-on-binary or dual-binary disassembly
 diff is what's left to pin the precise mechanism.

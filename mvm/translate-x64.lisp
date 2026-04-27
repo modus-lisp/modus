@@ -2735,6 +2735,70 @@
    funcall checks (addr & 0xF == 1) to detect closures, so we must ensure
    ((*x64-native-code-offset* + P) & 0xF) != 1 for all function start P.")
 
+;;; ============================================================
+;;; Code-bounds patch records
+;;; ============================================================
+;;;
+;;; The boot stub writes code_base and code_end (load_addr + native
+;;; code section bounds) into fixed memory slots so user-level
+;;; functionp / range-check predicates can identify raw fn-addrs by
+;;; address rather than by a fragile bit-pattern heuristic.
+;;;
+;;; The values aren't known when the boot stub is emitted — they
+;;; depend on total native-code size.  Strategy: emit `mov rax,
+;;; imm64; mov [slot], rax` with placeholder zeros; the cross.lisp
+;;; image-assembly path patches the imm64 bytes after the buffer
+;;; layout is final.
+;;;
+;;; *x64-code-base-patch-offset* / *x64-code-end-patch-offset* are
+;;; byte offsets within the BOOT-CODE BUFFER (not the final image)
+;;; pointing at the 8-byte imm64 of the corresponding `mov rax,
+;;; imm64`.  cross.lisp adds the boot-code base offset to convert
+;;; them to image offsets at patch time.
+;;;
+;;; The slots are reserved at fixed BSS-equivalent addresses:
+;;;   #x10000160 = code-base   (lowest fn-addr, inclusive)
+;;;   #x10000168 = code-end    (one past highest fn-addr, exclusive)
+
+(defconstant +code-base-slot+ #x10000160)
+(defconstant +code-end-slot+  #x10000168)
+
+(defvar *x64-code-base-patch-offset* nil)
+(defvar *x64-code-end-patch-offset*  nil)
+
+(defun emit-code-bounds-init (buf)
+  "Emit the boot-stub init block that records code_base and code_end
+   into fixed memory slots.  Call this from the per-build entry stub.
+
+   Records the byte offsets of the two imm64 placeholders into
+   *x64-code-base-patch-offset* and *x64-code-end-patch-offset* so
+   cross.lisp can patch them with the resolved load_addr-relative
+   addresses after the final image layout is known.
+
+   Code emitted (34 bytes total):
+     48 B8 ?? ?? ?? ?? ?? ?? ?? ??   ; mov rax, imm64 (code_base)
+     48 89 04 25 60 01 00 10         ; mov [#x10000160], rax
+     48 B8 ?? ?? ?? ?? ?? ?? ?? ??   ; mov rax, imm64 (code_end)
+     48 89 04 25 68 01 00 10         ; mov [#x10000168], rax"
+  (let ((start-pos (mvm-buffer-position buf)))
+    ;; mov rax, imm64 (code_base placeholder).
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+    (setf *x64-code-base-patch-offset* (mvm-buffer-position buf))
+    (dotimes (i 8) (mvm-emit-byte buf 0))
+    ;; mov [imm32], rax — REX.W (48) + opcode (89) + ModR/M (04) + SIB (25) + disp32.
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89)
+    (mvm-emit-byte buf #x04) (mvm-emit-byte buf #x25)
+    (mvm-emit-u32  buf +code-base-slot+)
+    ;; mov rax, imm64 (code_end placeholder).
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+    (setf *x64-code-end-patch-offset* (mvm-buffer-position buf))
+    (dotimes (i 8) (mvm-emit-byte buf 0))
+    ;; mov [code-end-slot], rax.
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89)
+    (mvm-emit-byte buf #x04) (mvm-emit-byte buf #x25)
+    (mvm-emit-u32  buf +code-end-slot+)
+    (- (mvm-buffer-position buf) start-pos)))
+
 (defun emit-handler-helpers (buf push-label pop-label)
   "Emit two helper functions used by handler-case setjmp/clear traps:
      __handler_push: push current [#x10000180/+8/+16] state onto a memory

@@ -545,7 +545,34 @@
                 do (mvm-emit-byte final-buf b))
           ;; Update entry point to absolute offset
           (when (kernel-image-entry-point image)
-            (incf (kernel-image-entry-point image) code-offset))))
+            (incf (kernel-image-entry-point image) code-offset))
+          ;; Patch the boot stub's code-bounds init block (if the
+          ;; entry stub emitted one).  See translate-x64.lisp's
+          ;; emit-code-bounds-init.  The patch offsets are recorded
+          ;; in *x64-code-base-patch-offset* / *x64-code-end-patch-offset*
+          ;; relative to the boot-code buffer; here we have the boot
+          ;; code at the START of final-buf so the patch offsets are
+          ;; the same as image offsets.  The values written are
+          ;; load_addr + code-offset (code_base) and load_addr +
+          ;; code-offset + native-code-length (code_end).
+          (let* ((load-addr (and boot-descriptor
+                                 (getf boot-descriptor :load-addr)))
+                 (cb-off (and (boundp 'modus.mvm.x64::*x64-code-base-patch-offset*)
+                              modus.mvm.x64::*x64-code-base-patch-offset*))
+                 (ce-off (and (boundp 'modus.mvm.x64::*x64-code-end-patch-offset*)
+                              modus.mvm.x64::*x64-code-end-patch-offset*)))
+            (when (and load-addr cb-off ce-off)
+              (let ((code-base (+ load-addr code-offset))
+                    (code-end  (+ load-addr code-offset (length native-code)))
+                    (raw       (mvm-buffer-bytes final-buf)))
+                (dotimes (i 8)
+                  (setf (aref raw (+ cb-off i))
+                        (logand (ash code-base (- (* i 8))) #xFF))
+                  (setf (aref raw (+ ce-off i))
+                        (logand (ash code-end (- (* i 8))) #xFF)))
+                ;; Reset for next build (they're SBCL-side dynamic state).
+                (setf modus.mvm.x64::*x64-code-base-patch-offset* nil)
+                (setf modus.mvm.x64::*x64-code-end-patch-offset*  nil))))))
       ;; Constant pool
       (loop for b across constant-pool
             do (mvm-emit-byte final-buf b))

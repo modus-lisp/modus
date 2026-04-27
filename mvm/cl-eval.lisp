@@ -1433,17 +1433,23 @@
     ((symbolp x) nil)
     ;; Generic functions ARE arrays (subtag #x32), so the arrayp
     ;; check needs to come AFTER %generic-function-p — otherwise
-    ;; `(functionp gf)` returns NIL.  But a plain array is not a
-    ;; function.  Order: gf, then plain array, then fixnum-range,
-    ;; then anything left.
+    ;; `(functionp gf)` returns NIL.
     ((%generic-function-p x) t)
     ((arrayp x) nil)
-    ;; Fixnum heuristic: small integers are values, not fn-addrs.
-    ;; (Will be replaced by a proper [code_base, code_end) range check
-    ;;  once we have a way to populate those bounds at boot.)
+    ;; Range check against the code section.  The boot stub writes
+    ;; code_base / code_end into fixed slots #x10000160 / #x10000168
+    ;; (see modus.mvm.x64::emit-code-bounds-init); a value in that
+    ;; range IS a fn-addr no matter what its low bit looks like.
+    ;; If the slots haven't been populated (older builds) both reads
+    ;; return zero and the check is a no-op.
+    ((and (integerp x)
+          (let ((base (mem-ref #x10000160 :u64))
+                (end  (mem-ref #x10000168 :u64)))
+            (and (> base 0) (>= x base) (< x end)))) t)
+    ;; Fallback: small integers are values, not fn-addrs.
     ((and (integerp x) (< x #x100000)) nil)
-    ;; Anything else that survived the elimination — closure objects,
-    ;; raw fn-addrs in the code-segment range — counts as a function.
+    ;; Anything else that survived elimination — closure objects in
+    ;; particular — counts as a function.
     (t t)))
 (defun keywordp (x)
   "True if X is a keyword (symbol starting with :)."

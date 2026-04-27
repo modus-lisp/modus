@@ -2700,7 +2700,7 @@
 ;; Override linux-x64-boot-descriptor to include nil page mmap
 ;; (car nil must not segfault)
 (defun mvm-linux-x64-test-entry (buf)
-  "Emit Linux x64 entry stub with NIL page mmap."
+  "Emit Linux x64 entry stub with NIL page mmap and code-bounds init."
   (emit-linux-x64-entry buf)
   ;; mmap NIL page at 0xDEAD0000 (car/cdr nil dereferences this)
   ;; movabs rdi, 0xDEAD0000
@@ -2716,7 +2716,14 @@
   (emit-bytes buf #x48 #x89 #xC7)                       ; mov rdi, rax
   (emit-bytes buf #x48 #xC7 #xC1 #x00 #x02 #x00 #x00) ; mov rcx, 512
   (emit-bytes buf #x4C #x89 #xF8)                       ; mov rax, r15 (NIL)
-  (emit-bytes buf #xF3 #x48 #xAB))                       ; rep stosq
+  (emit-bytes buf #xF3 #x48 #xAB)                        ; rep stosq
+  ;; Code-bounds init: writes load_addr-relative code-base / code-end
+  ;; into fixed memory slots (#x10000160 / #x10000168) so functionp
+  ;; can identify raw fn-addrs by address rather than bit-pattern
+  ;; heuristic.  The imm64 placeholders are patched by cross.lisp's
+  ;; image-assembly path once the layout is final.  See
+  ;; modus.mvm.x64::emit-code-bounds-init.
+  (modus.mvm.x64::emit-code-bounds-init buf))
 
 (defun linux-x64-boot-descriptor ()
   (list :arch :x86-64
@@ -2731,10 +2738,11 @@
 ;; Set R14 to midpoint so GC fires at half heap
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
 ;; Set native code offset for funcall alignment:
-;; ELF header (64+56=120) + linux-x64 boot code (192) + JMP rel32 (5) = 317 = 0x13D
-;; Functions at code-buffer positions P where (0x13D+P) & 0xF == 1 would be
-;; misidentified as cons cells by compile-funcall's consp check.
-(setf modus.mvm.x64::*x64-native-code-offset* 317)
+;; ELF header (64+56=120) + linux-x64 boot code (192) + nil-page mmap (49) +
+;; code-bounds init (34) + JMP rel32 (5) = 351 = 0x15F
+;; Functions at code-buffer positions P where (0x15F+P) & 0xF in {1,9} would be
+;; misidentified as cons/object pointers by compile-funcall.
+(setf modus.mvm.x64::*x64-native-code-offset* 351)
 
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 

@@ -1093,7 +1093,23 @@
 
 (defun %intern-symbol (name-hash)
   "Intern a symbol by name hash. Returns existing symbol if already interned.
-   Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate."
+   Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate.
+
+   NOTE on a known GC hazard kept-as-is for now: %make-symbol can trigger
+   GC, which moves the hash table to to-space and updates the root slot
+   at #x10000088.  Our local `table` binding is just a register/frame
+   value (not GC-tracked) so it ends up pointing at the from-space copy,
+   and the (puthash ... table sym) below writes the new entry into a
+   table that gets reclaimed at the next collection.  The symptom is
+   non-deterministic: future `'foo` references re-allocate a fresh
+   symbol, eq between two `'foo` literals returns NIL, and CLOS marker
+   checks ((eq (aref instance 0) '%clos-instance)) misclassify.
+
+   The straightforward fix is to re-read the table from #x10000088 after
+   %make-symbol.  When tried it shifted layout enough to net-regress
+   the ANSI run by 159 tests (chunk-crash cascade in AREF.* / ARRAY.*),
+   so it's not deployed here yet.  Revisit after the layout-stability
+   work makes a one-instruction predicate-body change safe."
   (let ((table (mem-ref #x10000088 :u64)))
     (let ((existing (gethash name-hash table)))
       (if existing

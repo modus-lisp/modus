@@ -139,6 +139,21 @@
 (defun null (x) (if x nil t))
 (defun zerop (x) (= x 0))
 (defun identity (x) x)
+;; Selectors
+(defun first (x) (car x))
+(defun rest (x) (cdr x))
+;; Numeric increment helpers
+(defun 1+ (n) (+ n 1))
+(defun 1- (n) (- n 1))
+;; More callable inline-equivalents
+(defun listp (x) (if (consp x) t (null x)))
+(defun fixnump (x) (fixnump x))
+;; eq/eql don't have wrapper-name mapping in compile-li-func, but they
+;; ARE inline.  Bare defun gives #'eq/#'eql callable addresses.
+;; equal IS wrappped via compile-li-func to %EQUAL-FN already; no defun
+;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
+(defun eq (a b) (eq a b))
+(defun eql (a b) (eql a b))
 ;; ANSI: for n>=0, count 1-bits.  For n<0, count 0-bits in two's
 ;; complement — equivalently, count 1-bits of (lognot n) = -1-n.
 (defun logcount (n)

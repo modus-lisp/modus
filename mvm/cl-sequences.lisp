@@ -982,20 +982,35 @@
            (len2 (- eff-end2 start2))
            (limit (if (< len1 len2) len1 len2)))
       (if from-end
-          ;; Compare from end backward; return index in s1.
-          (let ((i (- limit 1)) (mismatch-at nil))
+          ;; Compare from end backward.  ANSI: align the END of s1[start1..end1)
+          ;; with the END of s2[start2..end2); compare element-wise from the
+          ;; right; return one-past the index in s1 where the elements first
+          ;; differ (or NIL if all matched and lengths equal; otherwise the
+          ;; common-tail length signals an unequal-length pair).
+          ;;
+          ;; Pre-fix this code aligned start1 with start2 (using `(+ start1 i)'
+          ;; and `(+ start2 i)' for the backward scan), so for sequences of
+          ;; different lengths it compared the wrong elements — e.g.
+          ;; (mismatch '(a b c a b c d) '(a b c) :from-end t) returned 3
+          ;; instead of 7 because it compared (a b c) with (a b c) instead
+          ;; of (b c d) with (a b c).
+          (let ((i (- limit 1)) (mismatch-at nil)
+                (off1 (+ start1 (- len1 limit)))
+                (off2 (+ start2 (- len2 limit))))
             (loop (when (< i 0) (return mismatch-at))
-              (let ((e1 (elt s1 (+ start1 i)))
-                    (e2 (elt s2 (+ start2 i))))
+              (let ((e1 (elt s1 (+ off1 i)))
+                    (e2 (elt s2 (+ off2 i))))
                 (let ((v1 (if key (funcall key e1) e1))
                       (v2 (if key (funcall key e2) e2)))
                   (unless (if test (funcall test v1 v2) (eql v1 v2))
-                    (setq mismatch-at (+ start1 i 1))
+                    (setq mismatch-at (+ off1 i 1))
                     (return mismatch-at))))
               (setq i (- i 1)))
             (if (= len1 len2)
                 mismatch-at
-                (or mismatch-at (+ start1 limit))))
+                ;; Lengths differ and the common tail matched — the
+                ;; mismatch is at the index past the longer prefix.
+                (or mismatch-at (+ start1 (- len1 limit)))))
           ;; Forward
           (let ((i 0))
             (loop (when (>= i limit)
@@ -1501,8 +1516,45 @@
               (setq i (+ i 1))))))))
 
 (defun find-if-not (predicate sequence &rest args)
-  "Return the first element of SEQUENCE not satisfying PREDICATE."
-  (apply #'find-if (lambda (x) (not (funcall predicate x))) sequence args))
+  "Return the first element of SEQUENCE not satisfying PREDICATE.
+   Inlined (rather than `(apply #'find-if (lambda ...) ...)') to dodge
+   the documented apply-of-rest-through-sibling-defun fragility."
+  (let ((key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (if (listp sequence)
+        (let ((lst sequence) (i 0) (result nil))
+          (loop
+            (when (or (null lst) (= i start)) (return nil))
+            (setq lst (cdr lst))
+            (setq i (+ i 1)))
+          (loop
+            (when (null lst) (return result))
+            (when (and end (= i end)) (return result))
+            (let* ((elem (car lst))
+                   (test-val (if key (funcall key elem) elem)))
+              (unless (funcall predicate test-val)
+                (if from-end (setq result elem) (return elem))))
+            (setq lst (cdr lst))
+            (setq i (+ i 1))))
+        (let ((len (length sequence)) (result nil))
+          (when (null end) (setq end len))
+          (let ((i start))
+            (loop
+              (when (= i end) (return result))
+              (let* ((elem (aref sequence i))
+                     (test-val (if key (funcall key elem) elem)))
+                (unless (funcall predicate test-val)
+                  (if from-end (setq result elem) (return elem))))
+              (setq i (+ i 1))))))))
 
 (defun position-if (predicate sequence &rest args)
   "Return the index of first element satisfying PREDICATE."
@@ -1544,8 +1596,45 @@
               (setq i (+ i 1))))))))
 
 (defun position-if-not (predicate sequence &rest args)
-  "Return the index of first element not satisfying PREDICATE."
-  (apply #'position-if (lambda (x) (not (funcall predicate x))) sequence args))
+  "Return the index of first element not satisfying PREDICATE.
+   Inlined (rather than `(apply #'position-if (lambda ...) ...)') to
+   dodge the documented apply-of-rest-through-sibling-defun fragility."
+  (let ((key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (if (listp sequence)
+        (let ((lst sequence) (i 0) (result nil))
+          (loop
+            (when (or (null lst) (= i start)) (return nil))
+            (setq lst (cdr lst))
+            (setq i (+ i 1)))
+          (loop
+            (when (null lst) (return result))
+            (when (and end (= i end)) (return result))
+            (let* ((elem (car lst))
+                   (test-val (if key (funcall key elem) elem)))
+              (unless (funcall predicate test-val)
+                (if from-end (setq result i) (return i))))
+            (setq lst (cdr lst))
+            (setq i (+ i 1))))
+        (let ((len (length sequence)) (result nil))
+          (when (null end) (setq end len))
+          (let ((i start))
+            (loop
+              (when (= i end) (return result))
+              (let* ((elem (aref sequence i))
+                     (test-val (if key (funcall key elem) elem)))
+                (unless (funcall predicate test-val)
+                  (if from-end (setq result i) (return i))))
+              (setq i (+ i 1))))))))
 
 (defun position (item sequence &rest args)
   "Return the position of the first ITEM in SEQUENCE satisfying TEST.

@@ -1611,6 +1611,9 @@
   (deftest 9135 (%key-regression-helper 'a nil) '(a))
   (deftest 9136 (car (%key-regression-helper 'a nil)) 'a)
   (deftest 9137 (cdr (%key-regression-helper 'a nil)) nil)
+  ;; DIAG complement: ensure closure capture works
+  (deftest 9170 (funcall (complement #'eql) 1 2) t)
+  (deftest 9171 (funcall (complement #'eql) 1 1) nil)
 
   ;; Markers for the (car/cdr non-cons) signaling path.  CL semantics
   ;; say (car X) for X not a cons (and not NIL) signals TYPE-ERROR.

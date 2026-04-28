@@ -302,8 +302,25 @@
           (setq i (+ i 1)))))))
 
 (defun remove-if-not (pred seq &rest args)
-  "Inverse of remove-if; forwards the same keyword args."
-  (apply #'remove-if (lambda (x) (not (funcall pred x))) seq args))
+  "Inverse of remove-if; forwards the same keyword args.  Inlined
+   instead of `(apply #'remove-if (lambda (x) (not (funcall pred x)))
+   seq args)' to dodge apply-of-rest fragility (see find-if-not /
+   position-if-not for the same pattern in commit 9c625ec)."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count))
+         (neg-pred (lambda (x) (not (funcall pred x)))))
+    (cond
+      ((null seq) nil)
+      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((consp seq)
+       (%remove-if-list neg-pred seq key-fn start-idx end-idx eff-count from-end))
+      (t
+       (%remove-if-vector neg-pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun count-if (pred seq &rest args)
   "Count elements of SEQ for which PRED is true. Honors :key, :start, :end."
@@ -1218,14 +1235,22 @@
                                        v)))))
             (setq i (+ i 1)))))))
 
-;;; Sequence predicates
+;;; Sequence predicates.  Avoid `(apply #'every pred seq more)' — apply
+;;; through a sibling &rest defun is documented as fragile.  Dispatch
+;;; manually for the common 1- and 2-sequence cases (3+ rare in tests).
 (defun notevery (pred seq &rest more)
   "True if PRED is false for some element."
-  (not (apply #'every pred seq more)))
+  (cond
+    ((null more)        (not (every pred seq)))
+    ((null (cdr more))  (not (every pred seq (car more))))
+    (t                  (not (apply #'every pred seq more)))))
 
 (defun notany (pred seq &rest more)
   "True if PRED is false for all elements."
-  (not (apply #'some pred seq more)))
+  (cond
+    ((null more)        (not (some pred seq)))
+    ((null (cdr more))  (not (some pred seq (car more))))
+    (t                  (not (apply #'some pred seq more)))))
 
 ;;; Set/list operations
 (defun adjoin (item list &rest args)
@@ -1256,16 +1281,60 @@
           (setq r (cons item r)))))))
 
 (defun delete (item seq &rest args)
-  "Remove ITEM from SEQ (destructive). Forwards :test/:key/:start/:end."
-  (apply #'remove item seq args))
+  "Remove ITEM from SEQ (destructive — but we forward to non-destructive
+   remove since MVM doesn't track in-place mutation guarantees).
+   Inlined parsing (same as remove) so we don't go through apply-of-rest."
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (test-fn (car (cddddr parsed)))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) nil)
+      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((consp seq)
+       (%remove-list item seq test-fn key-fn start-idx end-idx eff-count from-end))
+      (t
+       (%remove-vector item seq test-fn key-fn start-idx end-idx eff-count from-end)))))
 
+;; delete-if: same body shape as remove-if without the apply trampoline.
 (defun delete-if (pred seq &rest args)
   "Remove items satisfying PRED (destructive). Forwards keyword args."
-  (apply #'remove-if pred seq args))
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count)))
+    (cond
+      ((null seq) nil)
+      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((consp seq)
+       (%remove-if-list pred seq key-fn start-idx end-idx eff-count from-end))
+      (t
+       (%remove-if-vector pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun delete-if-not (pred seq &rest args)
   "Remove items not satisfying PRED (destructive). Forwards keyword args."
-  (apply #'remove-if-not pred seq args))
+  (let* ((parsed (%nsubst-parse-args args))
+         (count (car parsed))
+         (from-end (cadr parsed))
+         (start-idx (or (caddr parsed) 0))
+         (end-idx (cadddr parsed))
+         (key-fn (caddr (cddddr parsed)))
+         (eff-count (%nsubst-effective-count count))
+         (neg-pred (lambda (x) (not (funcall pred x)))))
+    (cond
+      ((null seq) nil)
+      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((consp seq)
+       (%remove-if-list neg-pred seq key-fn start-idx end-idx eff-count from-end))
+      (t
+       (%remove-if-vector neg-pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun delete-duplicates (seq &rest args)
   "Remove duplicate items (destructive). Forwards :test/:key/:from-end."

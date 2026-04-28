@@ -144,21 +144,71 @@
       (funcall fn cur)
       (setq cur (cdr cur)))))
 
-(defun mapcon (fn list)
-  (let ((result nil) (cur list))
-    (loop
-      (when (null cur) (return result))
-      (let ((r (funcall fn cur)))
-        (setq result (nconc result r)))
-      (setq cur (cdr cur)))))
+(defun mapcon (fn list &rest more-lists)
+  "ANSI variadic mapcon. Fast paths for 1/2/3 lists avoid apply-of-rest
+   fragility. fn is called on the cdrs (sublists), and results are nconc'd."
+  (cond
+    ((null more-lists)
+     (let ((result nil) (cur list))
+       (loop
+         (when (null cur) (return result))
+         (let ((r (funcall fn cur)))
+           (setq result (nconc result r)))
+         (setq cur (cdr cur)))))
+    ((null (cdr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2)) (return result))
+         (let ((r (funcall fn c1 c2)))
+           (setq result (nconc result r)))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)))))
+    ((null (cddr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (c3 (cadr more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return result))
+         (let ((r (funcall fn c1 c2 c3)))
+           (setq result (nconc result r)))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    (t
+     (let ((result nil) (lists (cons list more-lists)))
+       (loop
+         (when (some #'null lists) (return result))
+         (let ((r (apply fn lists)))
+           (setq result (nconc result r)))
+         (setq lists (mapcar1 #'cdr lists)))))))
 
-(defun mapcan (fn list)
-  (let ((result nil) (cur list))
-    (loop
-      (when (null cur) (return result))
-      (let ((r (funcall fn (car cur))))
-        (setq result (nconc result r)))
-      (setq cur (cdr cur)))))
+(defun mapcan (fn list &rest more-lists)
+  "ANSI variadic mapcan. Fast paths for 1/2/3 lists avoid apply-of-rest
+   fragility. fn is called on the cars (elements), and results are nconc'd."
+  (cond
+    ((null more-lists)
+     (let ((result nil) (cur list))
+       (loop
+         (when (null cur) (return result))
+         (let ((r (funcall fn (car cur))))
+           (setq result (nconc result r)))
+         (setq cur (cdr cur)))))
+    ((null (cdr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2)) (return result))
+         (let ((r (funcall fn (car c1) (car c2))))
+           (setq result (nconc result r)))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)))))
+    ((null (cddr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (c3 (cadr more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return result))
+         (let ((r (funcall fn (car c1) (car c2) (car c3))))
+           (setq result (nconc result r)))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    (t
+     (let ((result nil) (lists (cons list more-lists)))
+       (loop
+         (when (some #'null lists) (return result))
+         (let ((r (apply fn (mapcar1 #'car lists))))
+           (setq result (nconc result r)))
+         (setq lists (mapcar1 #'cdr lists)))))))
 
 (defun maplist (fn list)
   (let ((result nil) (cur list))
@@ -749,6 +799,7 @@
    (lambda (x) (not (funcall pred x))) seq args))."
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
+         (from-end (cadr parsed))
          (start-idx (or (caddr parsed) 0))
          (end-idx (cadddr parsed))
          (key-fn (caddr (cddddr parsed)))
@@ -771,9 +822,43 @@
            (setq cur (cdr cur))
            (setq idx (+ idx 1)))))
       (t
-       ;; Non-list seq: fall back to substitute-if with inverted pred.
-       ;; Vector path will go through closure, but that path passes our probes.
-       (apply #'substitute-if new (lambda (x) (not (funcall pred x))) seq args)))))
+       ;; Vector path inlined — mirror substitute-if with negated pred.
+       ;; Avoids (apply #'substitute-if new (lambda ...) seq args), which
+       ;; trips the apply-of-rest + closure-capture fragility.
+       (let ((copy (copy-seq seq)))
+         (cond
+           ((and eff-count (= eff-count 0)) copy)
+           (t
+            (let* ((len (array-length copy))
+                   (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+                   (string-p (stringp copy))
+                   (store-new (if (and string-p (characterp new))
+                                  (char-code new)
+                                  new))
+                   (n eff-count))
+              (if from-end
+                  (let ((i (- eff-end 1)))
+                    (loop
+                      (when (< i start-idx) (return copy))
+                      (when (and n (= n 0)) (return copy))
+                      (let ((elt (aref copy i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                          (when (not (funcall pred cmp))
+                            (aset copy i store-new)
+                            (when n (setq n (- n 1))))))
+                      (setq i (- i 1))))
+                  (let ((i start-idx))
+                    (loop
+                      (when (>= i eff-end) (return copy))
+                      (when (and n (= n 0)) (return copy))
+                      (let ((elt (aref copy i)))
+                        (when string-p (setq elt (code-char elt)))
+                        (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                          (when (not (funcall pred cmp))
+                            (aset copy i store-new)
+                            (when n (setq n (- n 1))))))
+                      (setq i (+ i 1)))))))))))))
 
 ;;; Destructive substitute variants
 ;;; nsubstitute-if-core: shared implementation
@@ -924,6 +1009,7 @@
    (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) ...)."
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
+         (from-end (cadr parsed))
          (start-idx (or (caddr parsed) 0))
          (end-idx (cadddr parsed))
          (key-fn (caddr (cddddr parsed)))
@@ -946,7 +1032,38 @@
            (setq cur (cdr cur))
            (setq idx (+ idx 1)))))
       (t
-       (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) seq args)))))
+       ;; Vector path inlined — mirror nsubstitute-if with negated pred.
+       ;; Avoids (apply #'nsubstitute-if ...) trampoline.
+       (let* ((len (array-length seq))
+              (eff-end (if (and end-idx (< end-idx len)) end-idx len))
+              (string-p (stringp seq))
+              (store-new (if (and string-p (characterp new))
+                             (char-code new)
+                             new))
+              (n eff-count))
+         (if from-end
+             (let ((i (- eff-end 1)))
+               (loop
+                 (when (< i start-idx) (return seq))
+                 (when (and n (= n 0)) (return seq))
+                 (let ((elt (aref seq i)))
+                   (when string-p (setq elt (code-char elt)))
+                   (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                     (when (not (funcall pred cmp))
+                       (aset seq i store-new)
+                       (when n (setq n (- n 1))))))
+                 (setq i (- i 1))))
+             (let ((i start-idx))
+               (loop
+                 (when (>= i eff-end) (return seq))
+                 (when (and n (= n 0)) (return seq))
+                 (let ((elt (aref seq i)))
+                   (when string-p (setq elt (code-char elt)))
+                   (let ((cmp (if key-fn (funcall key-fn elt) elt)))
+                     (when (not (funcall pred cmp))
+                       (aset seq i store-new)
+                       (when n (setq n (- n 1))))))
+                 (setq i (+ i 1))))))))))
 
 (defun nsubstitute (new old seq &rest args)
   "Destructive substitute. Inline vector path so we don't depend on a
@@ -1460,8 +1577,42 @@
        (%remove-if-vector neg-pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun delete-duplicates (seq &rest args)
-  "Remove duplicate items (destructive). Forwards :test/:key/:from-end."
-  (apply #'remove-duplicates seq args))
+  "Remove duplicate items (destructive). Honors :test/:key/:from-end.
+   Inlined (rather than `(apply #'remove-duplicates seq args)') to dodge
+   apply-of-rest fragility — same body as remove-duplicates, since we
+   don't truly mutate seq in place anyway (we cons a fresh result list)."
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (from-end nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (cond
+      ((null seq) nil)
+      ((consp seq)
+       (if from-end
+           (let ((r nil))
+             (dolist (item seq (nreverse r))
+               (let ((item-key (if key-fn (funcall key-fn item) item)))
+                 (unless (some (lambda (x)
+                                 (let ((v (if key-fn (funcall key-fn x) x)))
+                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
+                               r)
+                   (setq r (cons item r))))))
+           (let ((r nil) (cur seq))
+             (loop
+               (when (null cur) (return (nreverse r)))
+               (let* ((item (car cur))
+                      (item-key (if key-fn (funcall key-fn item) item))
+                      (rest-tail (cdr cur)))
+                 (unless (some (lambda (x)
+                                 (let ((v (if key-fn (funcall key-fn x) x)))
+                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
+                               rest-tail)
+                   (setq r (cons item r))))
+               (setq cur (cdr cur))))))
+      (t seq))))
 
 (defun pushnew-fn (item place)
   "Functional pushnew."

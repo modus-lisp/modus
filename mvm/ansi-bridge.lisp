@@ -652,20 +652,23 @@
 ;;; ============================================================
 
 (defun union-with-check (x y &rest args)
-  "union with result checking."
-  (apply #'union x y args))
+  "union with result checking. Routes directly through the positional
+   helper (rather than `(apply #'union x y args)`) to dodge apply-of-rest
+   fragility."
+  (%union-impl x y args))
 
 (defun nunion-with-copy (x y &rest args)
-  "nunion that doesn't destroy inputs."
-  (apply #'union (copy-list x) (copy-list y) args))
+  "nunion that doesn't destroy inputs. Routes through positional helper."
+  (%union-impl (copy-list x) (copy-list y) args))
 
 (defun set-exclusive-or-with-check (x y &rest args)
-  "set-exclusive-or with checking."
-  (apply #'set-exclusive-or x y args))
+  "set-exclusive-or with checking. Inlined positional call to dodge
+   apply-of-rest fragility."
+  (%set-exclusive-or-impl x y args))
 
 (defun nintersection-with-copy (x y &rest args)
-  "nintersection that doesn't destroy inputs."
-  (apply #'intersection (copy-list x) (copy-list y) args))
+  "nintersection that doesn't destroy inputs. Routes through positional helper."
+  (%intersection-impl (copy-list x) (copy-list y) args))
 
 ;;; ============================================================
 ;;; ANSI array test helpers
@@ -714,8 +717,20 @@
       (setq cur (cdr cur)))))
 
 (defun rassoc-if-not (pred alist &rest args)
-  "Find first pair in ALIST whose cdr does NOT satisfy PRED."
-  (apply #'rassoc-if (lambda (x) (not (funcall pred x))) alist args))
+  "Find first pair in ALIST whose cdr does NOT satisfy PRED.
+   Inlined (rather than `(apply #'rassoc-if (lambda ...) ...)') to dodge
+   apply-of-rest fragility."
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (when (consp pair)
+          (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+            (when (not (funcall pred val))
+              (return pair)))))
+      (setq cur (cdr cur)))))
 
 (defun assoc-if (pred alist &rest args)
   "Find first pair in ALIST whose car satisfies PRED."
@@ -732,8 +747,20 @@
       (setq cur (cdr cur)))))
 
 (defun assoc-if-not (pred alist &rest args)
-  "Find first pair in ALIST whose car does NOT satisfy PRED."
-  (apply #'assoc-if (lambda (x) (not (funcall pred x))) alist args))
+  "Find first pair in ALIST whose car does NOT satisfy PRED.
+   Inlined (rather than `(apply #'assoc-if (lambda ...) ...)') to dodge
+   apply-of-rest fragility."
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (when (consp pair)
+          (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
+            (when (not (funcall pred k))
+              (return pair)))))
+      (setq cur (cdr cur)))))
 
 (defun find-if (pred seq &rest args)
   "Find first element of SEQ satisfying PRED."
@@ -756,8 +783,28 @@
             (setq i (+ i 1)))))))
 
 (defun find-if-not (pred seq &rest args)
-  "Find first element of SEQ NOT satisfying PRED."
-  (apply #'find-if (lambda (x) (not (funcall pred x))) seq args))
+  "Find first element of SEQ NOT satisfying PRED.
+   Inlined (rather than `(apply #'find-if (lambda ...) ...)') to dodge
+   apply-of-rest fragility — and because ansi-bridge.lisp loads AFTER
+   cl-sequences.lisp, this defun overrides the (already inlined) one
+   there, so we have to keep the inline form here too."
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed)))
+    (if (consp seq)
+        (let ((cur seq))
+          (loop
+            (when (null cur) (return nil))
+            (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
+              (when (not (funcall pred k))
+                (return (car cur))))
+            (setq cur (cdr cur))))
+        (let ((len (array-length seq)) (i 0))
+          (loop
+            (when (>= i len) (return nil))
+            (let ((k (if key-fn (funcall key-fn (aref seq i)) (aref seq i))))
+              (when (not (funcall pred k))
+                (return (aref seq i))))
+            (setq i (+ i 1)))))))
 
 ;;; ============================================================
 ;;; vector-push / vector-push-extend / fill-pointer
@@ -831,9 +878,9 @@
 ;;; set operations (set-exclusive-or, nset-exclusive-or)
 ;;; ============================================================
 
-(defun set-exclusive-or (list1 list2 &rest args)
-  "Return symmetric difference of LIST1 and LIST2.
-   :test defaults to inline `eql` (#'eql is unusable in MVM)."
+(defun %set-exclusive-or-impl (list1 list2 args)
+  "Positional helper for set-exclusive-or. Takes args as a real list,
+   so callers can route through it without apply-of-rest."
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
@@ -856,9 +903,15 @@
           (setq result (cons e2 result)))))
     result))
 
+(defun set-exclusive-or (list1 list2 &rest args)
+  "Return symmetric difference of LIST1 and LIST2.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
+  (%set-exclusive-or-impl list1 list2 args))
+
 (defun nset-exclusive-or (list1 list2 &rest args)
-  "Destructive set-exclusive-or."
-  (apply #'set-exclusive-or list1 list2 args))
+  "Destructive set-exclusive-or. Routes through positional helper to
+   dodge apply-of-rest fragility."
+  (%set-exclusive-or-impl list1 list2 args))
 
 ;;; ============================================================
 ;;; trace/untrace stubs
@@ -1951,13 +2004,8 @@
       (when (eq (car cur) key) (setq found (cadr cur)) (return found))
       (setq cur (cddr cur)))))
 
-(defun set-difference (l1 l2 &rest args)
-  ;; #'eql is unavailable in the runtime (eql is an inline opcode, not
-  ;; a real function), so the previous (or test-fn #'eql) bound a NIL
-  ;; or otherwise-unusable function and (funcall actual-test ...)
-  ;; effectively short-circuited "no match" for every element — making
-  ;; set-difference always return l1 (or NIL via different earlier
-  ;; bug). Use the inline `eql` opcode directly when no :test is given.
+(defun %set-difference-impl (l1 l2 args)
+  "Positional helper for set-difference. See set-difference docstring."
   (let ((test-fn (%find-key-arg args :test))
         (key-fn  (%find-key-arg args :key))
         (r nil))
@@ -1974,6 +2022,16 @@
           (setq cur (cdr cur)))
         (unless in-l2 (setq r (cons item r)))))))
 
+(defun set-difference (l1 l2 &rest args)
+  ;; #'eql is unavailable in the runtime (eql is an inline opcode, not
+  ;; a real function), so the previous (or test-fn #'eql) bound a NIL
+  ;; or otherwise-unusable function and (funcall actual-test ...)
+  ;; effectively short-circuited "no match" for every element — making
+  ;; set-difference always return l1 (or NIL via different earlier
+  ;; bug). Use the inline `eql` opcode directly when no :test is given.
+  (%set-difference-impl l1 l2 args))
+
 (defun nset-difference (l1 l2 &rest args)
-  (apply #'set-difference l1 l2 args))
+  "Routes through positional helper to dodge apply-of-rest fragility."
+  (%set-difference-impl l1 l2 args))
 

@@ -734,6 +734,15 @@
                (setf ,place (cdr ,place))
                ,tmp)))))
 
+  ;; NTH-VALUE → (nth N (multiple-value-list FORM))
+  ;; Implemented as a macro because FORM must be evaluated in a
+  ;; multiple-values context; a defun would receive only the primary.
+  (mvm-define-macro "NTH-VALUE"
+    (lambda (form)
+      (let ((n (cadr form))
+            (val-form (caddr form)))
+        `(nth ,n (multiple-value-list ,val-form)))))
+
   ;; TYPECASE → COND + TYPEP
   (mvm-define-macro "TYPECASE"
     (lambda (form)

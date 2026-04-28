@@ -927,15 +927,25 @@
   "Create an empty hash table (wrapper cons cell)."
   (cons nil nil))
 
-(defun gethash (key ht)
-  "Look up KEY in hash table HT. Returns value or nil."
-  (let ((cur (car ht)))
-    (loop
-      (when (null cur) (return nil))
-      (let ((pair (car cur)))
-        (when (equal (car pair) key)
-          (return (cdr pair))))
-      (setq cur (cdr cur)))))
+(defun gethash (key ht &optional default)
+  "Look up KEY in hash table HT.  Returns (values value present-p);
+   if not present, value is DEFAULT (nil if not supplied) and
+   present-p is NIL.  We compute the (value present-p) pair as a cons
+   inside the search loop and call `values' once at the tail — calling
+   `values' inside `return' was losing the second value (loop+return
+   appears to clobber MV-count on its way out)."
+  (let ((found-pair nil))
+    (let ((cur (car ht)))
+      (loop
+        (when (null cur) (return nil))
+        (let ((pair (car cur)))
+          (when (equal (car pair) key)
+            (setq found-pair pair)
+            (return nil)))
+        (setq cur (cdr cur))))
+    (if found-pair
+        (values (cdr found-pair) t)
+        (values default nil))))
 
 (defun puthash (key ht value)
   "Set KEY to VALUE in hash table HT. Returns VALUE."

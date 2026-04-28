@@ -6429,13 +6429,19 @@
     ;; If no &optional, &key, or &rest, return unchanged
     (if (and (null optional) (null keys) (not has-rest))
         (cons params body)
-        ;; Build new parameter list: required + optional param names
-        (let ((new-params (append required (mapcar #'car optional)))
+        ;; Build new parameter list: required + optional param names + key
+        ;; param names.  Order MUST be (required..., optional..., keys...) —
+        ;; pushing keys (as a previous version did) reverses them and
+        ;; misaligns every caller's args with the parameters.  This was
+        ;; the bug behind NUNION.2-5 returning NIL: nunion-with-copy
+        ;; (x y &key test test-not) was being compiled as if its params
+        ;; were (test-not test x y), so calling (nunion-with-copy lst nil)
+        ;; landed `lst' in test-not and `nil' in test, leaving x and y
+        ;; with garbage from the caller's outgoing-arg registers.
+        (let ((new-params (append required
+                                  (mapcar #'car optional)
+                                  (mapcar #'car keys)))
               (new-body body))
-          ;; For &key params, add key params as regular params
-          (when keys
-            (dolist (k keys)
-              (push (car k) new-params)))
           ;; Prepend default value checks for optional params
           (let ((defaults nil))
             (dolist (opt optional)

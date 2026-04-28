@@ -1529,6 +1529,16 @@
     (multiple-value-list (read-from-string "123  "))
     (list 123 4)))
 
+;;; Regression: &key parameter handling (compiler.lisp preprocess-params).
+;;; Pre-fix nunion-with-copy (x y &key test test-not) compiled as if its
+;;; params were (test-not test x y) — calling (foo lst nil) landed lst
+;;; in test-not and nil in test, leaving x and y with caller's outgoing
+;;; arg-register garbage.  Top-level helper so we exercise the same code
+;;; path as ANSI test files (which define helpers at top level).
+(defun %key-regression-helper (x y &key test test-not)
+  (declare (ignore test test-not))
+  (cons x y))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -1594,6 +1604,13 @@
   (deftest 9121 (stringp  t)  nil)
   (deftest 9122 (arrayp   t)  nil)
   (deftest 9123 (= (obj-subtag t) 0) t) ;; explicit obj-subtag tag-mismatch
+
+  ;; Regression markers for &key parameter ordering bug (preprocess-params).
+  ;; Pre-fix: (... 'a nil) landed in (test-not test) instead of (x y), so
+  ;; (cons x y) saw garbage for x.  Post-fix: x='a, y=nil → (a) (a cons of a and nil).
+  (deftest 9135 (%key-regression-helper 'a nil) '(a))
+  (deftest 9136 (car (%key-regression-helper 'a nil)) 'a)
+  (deftest 9137 (cdr (%key-regression-helper 'a nil)) nil)
 
   ;; Markers for the (car/cdr non-cons) signaling path.  CL semantics
   ;; say (car X) for X not a cons (and not NIL) signals TYPE-ERROR.

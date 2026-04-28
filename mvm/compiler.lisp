@@ -3473,11 +3473,23 @@
                       (= iter-kw 962879967384500096)    ; ABOVE
                       (= iter-kw 223271319558938470)    ; DOWNTO
                       (= iter-kw 934319717393949980))   ; BY
+                  ;; Capture each FROM/TO/BY clause's value into a fresh
+                  ;; gensym in SOURCE ORDER, then push them as WITH bindings.
+                  ;; ANSI says clauses evaluate left-to-right (CLHS 6.1.2.1.1
+                  ;; "evaluated in the order in which they appear in the loop
+                  ;; expression").  Storing the value-forms straight into
+                  ;; named slots (start-form / end-form / by-form) and
+                  ;; emitting them via a fixed-order let* lost source order
+                  ;; — `(loop for x to (+ n 5) from (incf n) ...)' wrongly
+                  ;; evaluated `(incf n)' before `(+ n 5)' and got 6 elements
+                  ;; instead of 5.  Source-ordering the gensym bindings fixes
+                  ;; LOOP.1.17/18/19 and similar.
                   (let ((start-form 0)
                         (end-form nil)
                         (end-test :to)
                         (by-form nil)
-                        (downward nil))
+                        (downward nil)
+                        (clause-binds nil))   ; in source order; final result reversed
                     ;; Loop while next token is one of these clause keywords.
                     (loop while (and rest (symbolp (car rest))
                                     (let ((kw2 (normalize-name (car rest))))
@@ -3493,23 +3505,45 @@
                           do (let ((sub-kw (normalize-name (car rest))))
                                (cond
                                  ((= sub-kw 355693237506394641)  ; FROM
-                                  (setf start-form (cadr rest) rest (cddr rest)))
+                                  (let ((g (gensym "FROM")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf start-form g rest (cddr rest))))
                                  ((= sub-kw 704601669436668564)  ; UPFROM
-                                  (setf start-form (cadr rest) rest (cddr rest)))
+                                  (let ((g (gensym "UPFROM")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf start-form g rest (cddr rest))))
                                  ((= sub-kw 888358500084682875)  ; DOWNFROM
-                                  (setf start-form (cadr rest) downward t rest (cddr rest)))
+                                  (let ((g (gensym "DOWNFROM")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf start-form g downward t rest (cddr rest))))
                                  ((or (= sub-kw 611742951095832940)  ; TO
                                       (= sub-kw 819586319614622873)) ; UPTO
-                                  (setf end-test (if downward :downto :to)
-                                        end-form (cadr rest) rest (cddr rest)))
+                                  (let ((g (gensym "TO")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf end-test (if downward :downto :to)
+                                          end-form g rest (cddr rest))))
                                  ((= sub-kw 708656842296756988)  ; BELOW
-                                  (setf end-test :below end-form (cadr rest) rest (cddr rest)))
+                                  (let ((g (gensym "BELOW")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf end-test :below end-form g rest (cddr rest))))
                                  ((= sub-kw 962879967384500096)  ; ABOVE
-                                  (setf end-test :above end-form (cadr rest) rest (cddr rest)))
+                                  (let ((g (gensym "ABOVE")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf end-test :above end-form g rest (cddr rest))))
                                  ((= sub-kw 223271319558938470)  ; DOWNTO
-                                  (setf end-test :downto end-form (cadr rest) rest (cddr rest)))
+                                  (let ((g (gensym "DOWNTO")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf end-test :downto end-form g rest (cddr rest))))
                                  ((= sub-kw 934319717393949980)  ; BY
-                                  (setf by-form (cadr rest) rest (cddr rest))))))
+                                  (let ((g (gensym "BY")))
+                                    (push (list g (cadr rest)) clause-binds)
+                                    (setf by-form g rest (cddr rest)))))))
+                    ;; clause-binds is reverse-source-order (push reverses).
+                    ;; Reverse so first-clause comes first; push to with-bindings
+                    ;; in source order.  with-bindings is reversed before
+                    ;; the final let*, so push tail-first to get correct order.
+                    (dolist (b (nreverse clause-binds))
+                      (push b (loop-state-with-bindings state)))
                     (push (make-loop-iter :kind :from :var var
                                           :init-form start-form
                                           :end-form end-form

@@ -149,6 +149,11 @@
       (and (consp et) (eq (car et) 'quote)
            (member (cadr et) '(character standard-char base-char nil)))))
 
+;; Helper: check if element-type is BIT
+(defun bit-element-type-p (et)
+  "True if element-type is 'bit."
+  (and (consp et) (eq (car et) 'quote) (eq (cadr et) 'bit)))
+
 ;; Rewrite make-array with :initial-contents and/or character :element-type
 ;; into %make-string-array + aset calls
 (defun rewrite-make-array-initcontents (form)
@@ -195,6 +200,14 @@
          ;; char element-type, no initial-contents — just %make-string-array
          ((and char-et (not contents))
           `(%make-string-array ,size))
+         ;; bit element-type with :initial-contents — array of fixnum 0/1
+         ((and (bit-element-type-p et) contents)
+          (let ((init-form (rewrite-make-array-initcontents contents)))
+            `(%make-bit-vector-from-contents ,size ,init-form)))
+         ;; bit element-type — make a bit vector with :initial-element default 0
+         ((bit-element-type-p et)
+          (let ((init (or (make-array-kwarg kwargs :initial-element) 0)))
+            `(make-bit-vector ,size ,init)))
          ;; fallback
          (t (mapcar-dotted #'rewrite-make-array-initcontents form)))))
     (t (mapcar-dotted #'rewrite-make-array-initcontents form))))
@@ -2838,7 +2851,7 @@
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
-  (let ((path "/tmp/modus-ansi-test"))
+  (let ((path "/tmp/modus-ansi-test-PROGV"))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

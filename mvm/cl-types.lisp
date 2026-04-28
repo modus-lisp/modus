@@ -599,6 +599,8 @@
          ;; integerp guard `(= obj 0)` runs `=` on arbitrary values
          ;; (strings, conses, fn-addrs) which goes wrong fast.
          ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
+         ((eq tn 'bit-vector) (bit-vector-p obj))
+         ((eq tn 'simple-bit-vector) (simple-bit-vector-p obj))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
          ((eq tn 'function) (or (functionp obj) (%generic-function-p obj)))
@@ -700,4 +702,134 @@
          (t nil))))))
 
 (defun typep* (obj type) (typep obj type))
+
+;;; ============================================================
+;;; Bit-vector primitives
+;;; ============================================================
+;;; Bit vectors are represented as plain MVM arrays whose elements are
+;;; the fixnums 0 and 1.  The reader's #*101 syntax (cl-reader.lisp)
+;;; already produces this representation, and rt-array-equal compares
+;;; element-by-element so #*0001 from the reader is rt-equal to a
+;;; bit-and result allocated at runtime.
+;;;
+;;; bit-vector-p / simple-bit-vector-p detect bit-vectors heuristically:
+;;; an array all of whose elements are 0 or 1.  This catches the
+;;; common ANSI test cases (#*..., make-array :element-type 'bit) and
+;;; correctly rejects mixed-element arrays.
+
+(defun bitp (x)
+  "T if X is the integer 0 or 1."
+  (and (integerp x) (or (= x 0) (= x 1))))
+
+(defun %array-bits-only-p (a)
+  "Return T if every element of array A is the integer 0 or 1."
+  (let ((len (array-length a)) (i 0) (ok t))
+    (loop
+      (when (or (not ok) (= i len)) (return ok))
+      (let ((e (aref a i)))
+        (unless (and (integerp e) (or (= e 0) (= e 1)))
+          (setq ok nil)))
+      (setq i (+ i 1)))))
+
+(defun bit-vector-p (x)
+  "T if X is a bit-vector — an array whose elements are all 0 or 1.
+   Empty arrays count as bit-vectors."
+  (and (arrayp x) (not (stringp x)) (%array-bits-only-p x)))
+
+(defun simple-bit-vector-p (x)
+  "T if X is a simple bit-vector."
+  (bit-vector-p x))
+
+(defun make-bit-vector (size &optional init)
+  "Allocate a bit-vector of SIZE filled with INIT (default 0)."
+  (let ((v (make-array size)) (i 0) (b (or init 0)))
+    (loop
+      (when (= i size) (return v))
+      (aset v i b)
+      (setq i (+ i 1)))))
+
+(defun %make-bit-vector-from-contents (size contents)
+  "Allocate a bit-vector of SIZE and initialise from CONTENTS (list or vector)."
+  (let ((v (make-array size)))
+    (cond
+      ((listp contents)
+       (let ((cur contents) (i 0))
+         (loop
+           (when (or (null cur) (= i size)) (return v))
+           (aset v i (car cur))
+           (setq cur (cdr cur))
+           (setq i (+ i 1))))
+       (let ((j 0))
+         (loop
+           (when (= j size) (return v))
+           (let ((e (aref v j)))
+             (when (null e) (aset v j 0)))
+           (setq j (+ j 1))))
+       v)
+      (t
+       (let ((i 0))
+         (loop
+           (when (= i size) (return v))
+           (aset v i (aref contents i))
+           (setq i (+ i 1))))))))
+
+(defun bit (bv idx) (aref bv idx))
+(defun sbit (bv idx) (aref bv idx))
+
+(defun %bit-result-array (bv1 result-arg)
+  "Resolve the result-array argument of a bit-X function.
+   T  → bv1 (destructive on bv1).
+   NIL/missing → fresh bit-vector of bv1's length.
+   array → use as-is."
+  (cond
+    ((eq result-arg t) bv1)
+    ((null result-arg) (make-bit-vector (array-length bv1) 0))
+    (t result-arg)))
+
+(defun %bit-binop (bv1 bv2 result-arg op)
+  "Apply OP (a 2-arg lambda taking two bits) element-wise on BV1 and BV2,
+   writing into the result chosen by RESULT-ARG."
+  (let* ((len (array-length bv1))
+         (result (%bit-result-array bv1 result-arg))
+         (i 0))
+    (loop
+      (when (= i len) (return result))
+      (let ((a (aref bv1 i))
+            (b (aref bv2 i)))
+        (aset result i (funcall op a b)))
+      (setq i (+ i 1)))))
+
+(defun %bit-and-op  (a b) (logand a b))
+(defun %bit-ior-op  (a b) (logior a b))
+(defun %bit-xor-op  (a b) (logxor a b))
+(defun %bit-eqv-op  (a b) (if (= a b) 1 0))
+(defun %bit-nand-op (a b) (if (and (= a 1) (= b 1)) 0 1))
+(defun %bit-nor-op  (a b) (if (and (= a 0) (= b 0)) 1 0))
+(defun %bit-andc1-op (a b) (logand (if (= a 0) 1 0) b))
+(defun %bit-andc2-op (a b) (logand a (if (= b 0) 1 0)))
+(defun %bit-orc1-op  (a b) (logior (if (= a 0) 1 0) b))
+(defun %bit-orc2-op  (a b) (logior a (if (= b 0) 1 0)))
+
+(defun bit-and  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-and-op))
+(defun bit-ior  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-ior-op))
+(defun bit-or   (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-ior-op))
+(defun bit-xor  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-xor-op))
+(defun bit-eqv  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-eqv-op))
+(defun bit-nand (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-nand-op))
+(defun bit-nor  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-nor-op))
+(defun bit-andc1 (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-andc1-op))
+(defun bit-andc2 (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-andc2-op))
+(defun bit-orc1  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-orc1-op))
+(defun bit-orc2  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-orc2-op))
+
+(defun bit-not (bv &optional result)
+  "Return a bit-vector whose elements are 1 - bv[i]."
+  (let* ((len (array-length bv))
+         (out (%bit-result-array bv result))
+         (i 0))
+    (loop
+      (when (= i len) (return out))
+      (let ((e (aref bv i)))
+        (aset out i (if (= e 0) 1 0)))
+      (setq i (+ i 1)))))
 

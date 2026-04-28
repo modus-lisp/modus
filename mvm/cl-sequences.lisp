@@ -1547,6 +1547,65 @@
   "Return the index of first element not satisfying PREDICATE."
   (apply #'position-if (lambda (x) (not (funcall predicate x))) sequence args))
 
+(defun position (item sequence &rest args)
+  "Return the position of the first ITEM in SEQUENCE satisfying TEST.
+   Supports :test/:test-not/:key/:start/:end/:from-end."
+  (let ((test nil) (test-not nil) (key nil)
+        (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :test)     (setq test v))
+            ((eq k :test-not) (setq test-not v))
+            ((eq k :key)      (setq key v))
+            ((eq k :start)    (setq start v))
+            ((eq k :end)      (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    ;; Effective test: prefer :test-not if both somehow specified.
+    (when test-not
+      (let ((tn test-not))
+        (setq test (lambda (a b) (not (funcall tn a b))))))
+    ;; Walk inline (don't (apply #'position-if ...) — apply-of-rest
+    ;; through a sibling &rest defun is documented as fragile).
+    (if (listp sequence)
+        (let ((lst sequence) (i 0) (result nil))
+          (loop
+            (when (or (null lst) (= i start)) (return nil))
+            (setq lst (cdr lst))
+            (setq i (+ i 1)))
+          (loop
+            (when (null lst) (return result))
+            (when (and end (= i end)) (return result))
+            (let* ((elem (car lst))
+                   (test-val (if key (funcall key elem) elem))
+                   (matched (if test (funcall test item test-val)
+                                (eql item test-val))))
+              (when matched
+                (if from-end (setq result i) (return i))))
+            (setq lst (cdr lst))
+            (setq i (+ i 1))))
+        (let ((len (length sequence)) (result nil))
+          (when (null end) (setq end len))
+          (let ((i start))
+            (loop
+              (when (= i end) (return result))
+              (let* ((elem (aref sequence i))
+                     (test-val (if key (funcall key elem) elem))
+                     (matched (if test (funcall test item test-val)
+                                  (eql item test-val))))
+                (when matched
+                  (if from-end (setq result i) (return i))))
+              (setq i (+ i 1))))))))
+
+;; complement: (complement #'pred) returns a function that negates pred.
+;; Defined for 0/1/2-arg cases; CL allows any arity but this covers the
+;; common test patterns ((complement #'eql) for sequence ops).
+(defun complement (fn)
+  (lambda (a b) (not (funcall fn a b))))
+
 (defun search (seq1 seq2 &rest args)
   "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.
    :test defaults to inline `eql` (#'eql is unusable in MVM)."
@@ -1557,6 +1616,9 @@
         (let ((k (car cur)) (v (cadr cur)))
           (cond
             ((eq k :test) (setq test v))
+            ((eq k :test-not)
+             (let ((f v))
+               (setq test (lambda (a b) (not (funcall f a b))))))
             ((eq k :key) (setq key v))
             ((eq k :start1) (setq start1 v))
             ((eq k :end1) (setq end1 v))

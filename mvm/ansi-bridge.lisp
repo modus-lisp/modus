@@ -1405,18 +1405,114 @@
 ;;; ============================================================
 
 (defun allocate-instance (class &rest initargs)
-  "Allocate a new instance of CLASS."
-  (let ((class-name (if (symbolp class) class
-                        (if (arrayp class) (aref class 0) 'unknown))))
-    (%make-clos-instance class-name)))
+  "Allocate a new instance of CLASS (a class object or class name).
+   All slots are unbound; initforms are NOT applied (per ANSI: that
+   happens in initialize-instance, not allocate-instance)."
+  (let ((class-name (cond
+                      ((symbolp class) class)
+                      ((%clos-class-p class) (aref class 1))
+                      (t nil))))
+    (when (null class-name) (return-from allocate-instance nil))
+    (%make-instance class-name)))
 
 (defun shared-initialize (instance slot-names &rest initargs)
   "Initialize slots of INSTANCE."
   instance)
 
 (defun change-class (instance new-class &rest initargs)
-  "Change the class of INSTANCE."
-  instance)
+  "Change INSTANCE's class to NEW-CLASS, preserving same-named slots.
+   Mutates INSTANCE in place (preserves identity) so EQ holds.
+
+   Limitations vs full ANSI:
+   - No update-instance-for-different-class hook is invoked.
+   - No before/after/around methods on change-class itself
+     (those tests exercise generic-function dispatch on change-class
+     which we do not register here).
+   - If NEW-CLASS has more slots than the underlying array allocates,
+     trailing slots may be inaccessible (we cap at the array size).
+   - :allocation :class is treated as :instance — class-shared slots
+     not implemented.
+   - allow-other-keys checking not enforced."
+  (when (null instance) (return-from change-class instance))
+  (when (not (%clos-instance-p instance)) (return-from change-class instance))
+  ;; Resolve new-class to a class object
+  (let ((new-cls (cond
+                   ((symbolp new-class) (%find-clos-class new-class))
+                   ((%clos-class-p new-class) new-class)
+                   (t nil))))
+    (when (null new-cls) (return-from change-class instance))
+    (let* ((new-name (aref new-cls 1))
+           (new-slot-names (aref new-cls 2))
+           (old-name (aref instance 1))
+           (old-cls (%find-clos-class old-name))
+           (old-slot-names (if old-cls (aref old-cls 2) nil))
+           (inst-len (array-length instance))
+           ;; First, snapshot old slot values keyed by slot name (alist)
+           (old-values nil))
+      ;; Snapshot old values (incl. unbound sentinel -999)
+      (let ((sn old-slot-names) (idx 0))
+        (loop
+          (when (null sn) (return nil))
+          (when (< (+ 2 idx) inst-len)
+            (setq old-values (cons (cons (car sn) (aref instance (+ 2 idx)))
+                                   old-values)))
+          (setq idx (+ idx 1))
+          (setq sn (cdr sn))))
+      ;; Mutate instance to its new class
+      (aset instance 1 new-name)
+      ;; Fill new slot positions: copy from old if same name, else apply
+      ;; initform if available, else mark unbound (-999).
+      (let ((sn new-slot-names) (idx 0))
+        (loop
+          (when (null sn) (return nil))
+          (when (< (+ 2 idx) inst-len)
+            (let* ((nm (car sn))
+                   ;; Look up old value for this slot name
+                   (old-pair (let ((cur old-values) (found nil))
+                               (loop
+                                 (when (null cur) (return found))
+                                 (when (eq (car (car cur)) nm)
+                                   (setq found (car cur))
+                                   (return found))
+                                 (setq cur (cdr cur)))))
+                   (had-old (not (null old-pair)))
+                   (old-val (if had-old (cdr old-pair) -999))
+                   (was-unbound (and (fixnump old-val) (= old-val -999))))
+              (cond
+                ;; Slot exists in both, and was bound — keep it
+                ((and had-old (not was-unbound))
+                 (aset instance (+ 2 idx) old-val))
+                ;; Slot exists in both but was unbound — leave unbound
+                ;; (do NOT apply new class's initform per ANSI)
+                ((and had-old was-unbound)
+                 (aset instance (+ 2 idx) -999))
+                (t
+                 ;; Slot only in new class: try initform from new-class
+                 (let ((thunk (%clos-initform-thunk new-name nm)))
+                   (if thunk
+                     (aset instance (+ 2 idx) (funcall thunk))
+                     ;; No initform — leave unbound
+                     (aset instance (+ 2 idx) -999)))))))
+          (setq idx (+ idx 1))
+          (setq sn (cdr sn))))
+      ;; Apply :initargs on top — they override.
+      ;; Per ANSI: when an initarg appears multiple times, the LEFTMOST wins.
+      ;; Track which slots we've already set so later duplicates don't overwrite.
+      (let ((set-slots nil)
+            (cur initargs))
+        (loop
+          (when (null cur) (return nil))
+          (when (null (cdr cur)) (return nil))
+          (let* ((key (car cur))
+                 (val (car (cdr cur)))
+                 (slot-nm (%clos-initarg-to-slot new-name key)))
+            (when (and slot-nm (not (member slot-nm set-slots)))
+              (let ((idx (%clos-slot-index new-cls slot-nm)))
+                (when (and idx (< (+ 2 idx) inst-len))
+                  (aset instance (+ 2 idx) val)
+                  (setq set-slots (cons slot-nm set-slots))))))
+          (setq cur (cdr (cdr cur)))))
+      instance)))
 
 (defun update-instance-for-redefined-class (instance added-slots discarded-slots plist &rest initargs)
   instance)

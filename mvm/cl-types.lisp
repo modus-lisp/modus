@@ -609,7 +609,26 @@
          ((eq tn 'method-combination) (%mc-p obj))
          ;; CLOS instance check
          ((eq tn 'standard-object) (%clos-instance-p obj))
-         (t nil))))
+         ;; User-defined CLOS class: check if obj is a CLOS instance and
+         ;; tn is in obj's class precedence list (so typep recognizes
+         ;; subclasses correctly).
+         ;; Symbol equality uses eq first, then symbol-name string-equal
+         ;; to dodge the bare-metal "duplicate-symbol" identity bug.
+         (t
+          (if (%clos-instance-p obj)
+            (let ((cpl (%obj-cpl obj))
+                  (tn-name (if (symbolp tn) (symbol-name tn) nil))
+                  (found nil))
+              (let ((c cpl))
+                (loop
+                  (when (null c) (return found))
+                  (let ((cur (car c)))
+                    (when (or (eq cur tn)
+                              (and tn-name (symbolp cur)
+                                   (string-equal (symbol-name cur) tn-name)))
+                      (setq found t) (return found)))
+                  (setq c (cdr c)))))
+            nil)))))
     ;; Compound type specifiers
     (t
      (let ((head (car type)))

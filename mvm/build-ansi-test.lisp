@@ -1255,13 +1255,15 @@
             (slot-names nil)
             (extra-defuns nil)
             ;; initarg→slot mapping: list of (initarg-string . slot-name)
-            (initarg-map nil))
+            (initarg-map nil)
+            ;; initform map: list of (slot-name . form)
+            (initform-map nil))
        ;; Process each slot spec
        (dolist (slot-spec raw-slots)
          (let* ((sname (if (consp slot-spec) (car slot-spec) slot-spec))
                 (opts (if (consp slot-spec) (cdr slot-spec) nil)))
            (push sname slot-names)
-           ;; Extract :reader, :writer, :accessor, :initarg from opts
+           ;; Extract :reader, :writer, :accessor, :initarg, :initform from opts
            (let ((cur opts))
              (loop
                (when (null cur) (return))
@@ -1279,15 +1281,38 @@
                     (push `(defun ,val (nv obj) (set-slot-value obj ',sname nv)) extra-defuns))
                    ((eq key :initarg)
                     ;; val is a keyword like :b; map to slot name
-                    (push (cons (symbol-name val) sname) initarg-map))))
+                    (push (cons (symbol-name val) sname) initarg-map))
+                   ((eq key :initform)
+                    ;; Save the form; it'll be wrapped in a thunk at expansion
+                    (push (cons sname val) initform-map))))
                (setq cur (cddr cur))))))
-       (let ((slot-list (nreverse slot-names)))
+       (let* ((slot-list (nreverse slot-names))
+              ;; Build (initarg-keyword . slot-name) cons pairs as quoted forms.
+              ;; We store the keyword symbol itself (not its name string) so
+              ;; runtime comparison works with bare-metal native MVM symbols
+              ;; (where symbol-name returns "" for native syms — their identity
+              ;; is the hash). Keyword like :b2 will be re-interned by the
+              ;; reader to a sym with matching hash.
+              (initarg-pairs
+               (mapcar (lambda (p)
+                         (let ((kw-sym (intern (car p) :keyword)))
+                           `(cons ',kw-sym ',(cdr p))))
+                       initarg-map))
+              ;; Build (slot-name . thunk) pairs; thunk evaluates the initform
+              (initform-pairs
+               (mapcar (lambda (p)
+                         `(cons ',(car p)
+                                (lambda () ,(rewrite-reader-forms (cdr p)))))
+                       initform-map)))
          ;; Register in SBCL-side class registry for make-instance expansion
          (setf *sbcl-clos-classes*
                (cons (cons class-name (cons slot-list initarg-map))
                      *sbcl-clos-classes*))
          `(progn
             (%defclass ',class-name ',slot-list ',raw-supers)
+            (%register-clos-slot-info ',class-name
+                                      (list ,@initarg-pairs)
+                                      (list ,@initform-pairs))
             ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))
 
     ;; (defgeneric name lambda-list &rest options)

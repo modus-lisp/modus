@@ -897,6 +897,9 @@
 (defun typep (obj type)
   "Extended typep supporting compound type specifiers and package type."
   (cond
+    ;; CLOS class object as type — extract its name and recurse.
+    ((%clos-class-p type)
+     (typep obj (aref type 1)))
     ;; Simple type names (symbols/keywords)
     ((not (consp type))
      (let ((tn type))
@@ -949,10 +952,35 @@
          ((eq tn 'compiled-function) (functionp obj))
          ((eq tn 'hash-table)    (hash-table-p obj))
          ((eq tn 'condition) (%condition-p obj))
+         ((eq tn 'standard-object) (%clos-instance-p obj))
          ;; Check if it's a condition type name
-         (t (if (%cond-reg-find tn)
-                (%condition-typep obj tn)
-                nil)))))
+         (t (cond
+              ((%cond-reg-find tn) (%condition-typep obj tn))
+              ;; User-defined CLOS class: search obj's class precedence list.
+              ;; Use eq, then native-MVM-sym hash compare for symbol identity.
+              ;; Native MVM symbols (1-slot, subtag #x50) carry just a hash;
+              ;; we compare hashes when both sides are native syms. CL syms
+              ;; (3-slot) have name strings — fall back to string-equal.
+              ((%clos-instance-p obj)
+               (let ((cpl (%obj-cpl obj))
+                     (found nil))
+                 (let ((c cpl))
+                   (loop
+                     (when (null c) (return found))
+                     (let ((cur (car c)))
+                       (when (cond
+                               ((eq cur tn) t)
+                               ((and (%native-mvm-sym-p cur)
+                                     (%native-mvm-sym-p tn))
+                                (= (%native-mvm-sym-hash cur)
+                                   (%native-mvm-sym-hash tn)))
+                               ((and (%cl-sym-p cur) (%cl-sym-p tn))
+                                (string-equal (%cl-sym-name cur)
+                                              (%cl-sym-name tn)))
+                               (t nil))
+                         (setq found t) (return found)))
+                     (setq c (cdr c))))))
+              (t nil))))))
     ;; Class proxy (find-class result)
     ((%class-proxy-p type)
      (typep obj (%class-proxy-name type)))

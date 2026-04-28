@@ -14,6 +14,13 @@
 ;;   slot [4] = CPL (list of class-names, most-specific first)
 (defvar *clos-classes* nil)
 
+;; Per-class slot info registry: alist of
+;;   (class-name . (initarg-map . initform-map))
+;; initarg-map: list of (initarg-string-name . slot-name-symbol)
+;; initform-map: list of (slot-name-symbol . thunk-fn)
+;; Populated by %register-clos-slot-info from the SBCL-side defclass rewriter.
+(defvar *clos-slot-info* nil)
+
 ;; slot-unbound methods: list of (class-name slot-spec fn)
 ;; slot-spec: nil = any slot; symbol = that specific slot name
 (defvar *slot-unbound-methods* nil)
@@ -189,6 +196,69 @@
       (when (null cur) (return nil))
       (when (eq (car (car cur)) name) (return (cdr (car cur))))
       (setq cur (cdr cur)))))
+
+(defun %register-clos-slot-info (class-name initarg-map initform-map)
+  "Register per-slot initarg→slot mapping and initform thunks for CLASS-NAME.
+   Called from rewriter-emitted code right after %defclass."
+  ;; Replace existing entry if present
+  (let ((new-reg nil)
+        (cur *clos-slot-info*))
+    (loop
+      (when (null cur) (return nil))
+      (when (not (eq (car (car cur)) class-name))
+        (setq new-reg (cons (car cur) new-reg)))
+      (setq cur (cdr cur)))
+    (setq *clos-slot-info*
+          (cons (cons class-name (cons initarg-map initform-map))
+                new-reg)))
+  class-name)
+
+(defun %clos-slot-info-for (class-name)
+  "Return (initarg-map . initform-map) for CLASS-NAME, or nil."
+  (let ((cur *clos-slot-info*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %clos-initarg-to-slot (class-name initarg-key)
+  "Map an initarg keyword (symbol) to a slot-name for CLASS-NAME, or nil.
+   Compares by eq, then native-MVM-sym hash, then CL-sym name string.
+   Bare-metal symbols-from-quoted-literals are native (1-slot, hash-only),
+   so plain eq sometimes fails for symbols-with-the-same-name."
+  (let ((info (%clos-slot-info-for class-name)))
+    (when (null info) (return-from %clos-initarg-to-slot nil))
+    (let ((iar (car info)))
+      (let ((cur iar))
+        (loop
+          (when (null cur) (return nil))
+          (let ((entry (car cur)))
+            (let ((stored-key (car entry)))
+              (when (cond
+                      ((eq stored-key initarg-key) t)
+                      ((and (%native-mvm-sym-p stored-key)
+                            (%native-mvm-sym-p initarg-key))
+                       (= (%native-mvm-sym-hash stored-key)
+                          (%native-mvm-sym-hash initarg-key)))
+                      ((and (%cl-sym-p stored-key) (%cl-sym-p initarg-key))
+                       (string-equal (%cl-sym-name stored-key)
+                                     (%cl-sym-name initarg-key)))
+                      (t nil))
+                (return (cdr entry)))))
+          (setq cur (cdr cur)))))))
+
+(defun %clos-initform-thunk (class-name slot-name)
+  "Return the initform thunk for SLOT-NAME in CLASS-NAME, or nil."
+  (let ((info (%clos-slot-info-for class-name)))
+    (when (null info) (return-from %clos-initform-thunk nil))
+    (let ((ifm (cdr info)))
+      (let ((cur ifm))
+        (loop
+          (when (null cur) (return nil))
+          (let ((entry (car cur)))
+            (when (eq (car entry) slot-name)
+              (return (cdr entry))))
+          (setq cur (cdr cur)))))))
 
 (defun %clos-slot-index (cls slot-name)
   "Return 0-based index of SLOT-NAME in cls, or nil if not found."

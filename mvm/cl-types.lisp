@@ -153,11 +153,17 @@
           (setq found t)))
       (setq cur (cdr cur)))))
 
-(defun nintersection-with-check (l1 l2 &rest args)
-  (apply #'nintersection l1 l2 args))
-(defun intersection (l1 l2 &rest args)
-  (apply #'nintersection l1 l2 args))
-(defun union (l1 l2 &rest args)
+;; Positional helpers for set-ops.  We avoid `(apply #'foo l1 l2 args)' for
+;; trampolining between &rest-defun siblings because that combination
+;; (the prelude.lisp `apply' allocates a let-bound lambda for the
+;; collected args) is documented in CLAUDE.md as fragile — funcall of
+;; a let-allocated lambda after a &rest defun has been called recently
+;; can crash or return wrong values, which is exactly what we observed
+;; for nunion/intersection in the 2026-04-28 ANSI run (NUNION.2-5
+;; returned NIL when expecting (a)).  Going through a positional
+;; helper sidesteps the whole pattern.
+
+(defun %union-impl (l1 l2 args)
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
@@ -166,7 +172,29 @@
       (let ((item-key (if key-fn (funcall key-fn item) item)))
         (unless (%set-member-p item-key r test-fn key-fn)
           (setq r (cons item r)))))))
-(defun nunion (l1 l2 &rest args) (apply #'union l1 l2 args))
+
+(defun union (l1 l2 &rest args) (%union-impl l1 l2 args))
+(defun nunion (l1 l2 &rest args) (%union-impl l1 l2 args))
+
+;; intersection/nintersection-with-check: forward to the real
+;; nintersection in cl-sequences.lisp via direct args, not apply.
+;; nintersection is itself a &rest defun; calling it directly with
+;; the collected args list as a final positional doesn't work in
+;; vanilla CL — but here we re-implement intersection inline so it
+;; doesn't matter.  Kept as a thin shim because nintersection's
+;; semantics are identical to intersection for our purposes.
+(defun %intersection-impl (l1 l2 args)
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (r nil))
+    (dolist (item l1 (nreverse r))
+      (let ((item-key (if key-fn (funcall key-fn item) item)))
+        (when (%set-member-p item-key l2 test-fn key-fn)
+          (setq r (cons item r)))))))
+
+(defun intersection (l1 l2 &rest args) (%intersection-impl l1 l2 args))
+(defun nintersection-with-check (l1 l2 &rest args) (%intersection-impl l1 l2 args))
 (defun subsetp (l1 l2 &rest args)
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))

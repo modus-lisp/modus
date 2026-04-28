@@ -7,64 +7,95 @@
 
 ;;; Sequence-aware some/every (override prelude versions that only handle lists)
 (defun some (fn seq &rest more-seqs)
-  "Return first non-nil result of FN on elements of SEQ (list or vector)."
-  (if (null more-seqs)
-      (if (consp seq)
-          (let ((cur seq))
+  "Return first non-nil result of FN on elements of SEQ (list or vector).
+   Multi-sequence form stops at the shortest sequence (ANSI)."
+  (cond
+    ((null more-seqs)
+     (cond
+       ((consp seq)
+        (let ((cur seq))
+          (loop
+            (when (null cur) (return nil))
+            (let ((result (funcall fn (car cur))))
+              (when result (return result)))
+            (setq cur (cdr cur)))))
+       ((null seq) nil)
+       (t (let ((len (array-length seq)) (i 0))
             (loop
-              (when (null cur) (return nil))
-              (let ((result (funcall fn (car cur))))
+              (when (>= i len) (return nil))
+              (let ((result (funcall fn (aref seq i))))
                 (when result (return result)))
-              (setq cur (cdr cur))))
-          (if (null seq)
-              nil
-              ;; vector case
-              (let ((len (array-length seq))
-                    (i 0))
-                (loop
-                  (when (>= i len) (return nil))
-                  (let ((result (funcall fn (aref seq i))))
-                    (when result (return result)))
-                  (setq i (+ i 1))))))
-      ;; multi-sequence: use list form
-      (let ((seqs (cons seq more-seqs)))
-        (block seq-loop
-          (let ((lists (mapcar (lambda (s)
-                                 (if (consp s) s
-                                     (let ((r nil) (n (array-length s)))
-                                       (let ((k (- n 1)))
-                                         (loop
-                                           (when (< k 0) (return r))
-                                           (setq r (cons (aref s k) r))
-                                           (setq k (- k 1))))
-                                       r)))
-                               seqs)))
-            (loop
-              (when (some #'null lists) (return-from seq-loop nil))
-              (let ((result (apply fn (mapcar #'car lists))))
-                (when result (return-from seq-loop result)))
-              (setq lists (mapcar #'cdr lists))))))))
+              (setq i (+ i 1)))))))
+    ;; Two-sequence fast path.
+    ((null (cdr more-seqs))
+     (let ((cur1 seq) (cur2 (car more-seqs)))
+       (loop
+         (when (or (null cur1) (null cur2)) (return nil))
+         (let ((r (funcall fn (car cur1) (car cur2))))
+           (when r (return r)))
+         (setq cur1 (cdr cur1)) (setq cur2 (cdr cur2)))))
+    ;; Three-sequence fast path.
+    ((null (cddr more-seqs))
+     (let ((c1 seq) (c2 (car more-seqs)) (c3 (cadr more-seqs)))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return nil))
+         (let ((r (funcall fn (car c1) (car c2) (car c3))))
+           (when r (return r)))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    ;; Fallback: apply path.
+    (t (let ((seqs (cons seq more-seqs)))
+         (block seq-loop
+           (let ((lists (mapcar (lambda (s)
+                                  (if (consp s) s
+                                      (let ((r nil) (n (array-length s)))
+                                        (let ((k (- n 1)))
+                                          (loop
+                                            (when (< k 0) (return r))
+                                            (setq r (cons (aref s k) r))
+                                            (setq k (- k 1))))
+                                        r)))
+                                seqs)))
+             (loop
+               (when (some #'null lists) (return-from seq-loop nil))
+               (let ((result (apply fn (mapcar #'car lists))))
+                 (when result (return-from seq-loop result)))
+               (setq lists (mapcar #'cdr lists)))))))))
 
 (defun every (fn seq &rest more-seqs)
-  "Return T if FN is true for all elements of SEQ (list or vector)."
-  (if (null more-seqs)
-      (if (consp seq)
-          (let ((cur seq))
+  "Return T if FN is true for all elements of SEQ (list or vector).
+   Multi-sequence form stops at the shortest sequence (ANSI)."
+  (cond
+    ((null more-seqs)
+     (cond
+       ((consp seq)
+        (let ((cur seq))
+          (loop
+            (when (null cur) (return t))
+            (when (null (funcall fn (car cur))) (return nil))
+            (setq cur (cdr cur)))))
+       ((null seq) t)
+       (t (let ((len (array-length seq)) (i 0))
             (loop
-              (when (null cur) (return t))
-              (when (null (funcall fn (car cur))) (return nil))
-              (setq cur (cdr cur))))
-          (if (null seq)
-              t
-              ;; vector case
-              (let ((len (array-length seq))
-                    (i 0))
-                (loop
-                  (when (>= i len) (return t))
-                  (when (null (funcall fn (aref seq i))) (return nil))
-                  (setq i (+ i 1))))))
-      ;; multi-sequence
-      (not (apply #'some (lambda (&rest args) (not (apply fn args))) seq more-seqs))))
+              (when (>= i len) (return t))
+              (when (null (funcall fn (aref seq i))) (return nil))
+              (setq i (+ i 1)))))))
+    ;; Two-sequence fast path — common in tests, avoids apply.
+    ((null (cdr more-seqs))
+     (let ((cur1 seq) (cur2 (car more-seqs)))
+       (loop
+         (when (or (null cur1) (null cur2)) (return t))
+         (when (null (funcall fn (car cur1) (car cur2))) (return nil))
+         (setq cur1 (cdr cur1)) (setq cur2 (cdr cur2)))))
+    ;; Three-sequence fast path.
+    ((null (cddr more-seqs))
+     (let ((c1 seq) (c2 (car more-seqs)) (c3 (cadr more-seqs)))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return t))
+         (when (null (funcall fn (car c1) (car c2) (car c3))) (return nil))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    ;; Fallback: apply path (rare, may hit fragility).
+    (t (not (apply #'some (lambda (&rest args) (not (apply fn args)))
+                   seq more-seqs)))))
 
 (defun copy-alist (alist)
   (if (null alist) nil

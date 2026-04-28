@@ -341,15 +341,28 @@
       (setq cur (cdr cur)))))
 
 (defun mapcar (fn list &rest more-lists)
-  "Apply FN to each element of LIST (and MORE-LISTS if provided)."
-  (if (null more-lists)
-      (mapcar1 fn list)
-      (let ((result nil)
-            (lists (cons list more-lists)))
-        (loop
-          (when (some #'null lists) (return (nreverse result)))
-          (setq result (cons (apply fn (mapcar1 #'car lists)) result))
-          (setq lists (mapcar1 #'cdr lists))))))
+  "Apply FN to each element of LIST (and MORE-LISTS if provided).
+   Fast paths for 1/2/3 lists avoid apply-of-rest fragility."
+  (cond
+    ((null more-lists) (mapcar1 fn list))
+    ((null (cdr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2)) (return (nreverse result)))
+         (setq result (cons (funcall fn (car c1) (car c2)) result))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)))))
+    ((null (cddr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (c3 (cadr more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return (nreverse result)))
+         (setq result (cons (funcall fn (car c1) (car c2) (car c3)) result))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    (t (let ((result nil)
+             (lists (cons list more-lists)))
+         (loop
+           (when (some #'null lists) (return (nreverse result)))
+           (setq result (cons (apply fn (mapcar1 #'car lists)) result))
+           (setq lists (mapcar1 #'cdr lists)))))))
 
 (defun some (fn list)
   "Return the first non-nil result of applying FN to elements of LIST."

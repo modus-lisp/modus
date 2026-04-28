@@ -191,6 +191,49 @@
         *%find-sym-result*)
       nil))
 
+;;; Print a multi-dim array: emit "#NA" then a nested-list literal whose
+;;; structure follows DIMS, drawing elements from FLAT-DATA in row-major order.
+;;; Returns (values).  Forward-declared so %write-obj can recurse into it.
+(defun %print-md-array (dims flat-data stream level escape)
+  ;; Emit "#NA" prefix
+  (%print-char 35 stream)  ; #
+  (let ((rank 0) (d dims))
+    (loop (when (null d) (return nil))
+      (setq rank (+ rank 1))
+      (setq d (cdr d)))
+    (%print-decimal-to-stream rank stream))
+  (%print-char 65 stream)  ; A
+  ;; If no dims (0-dim), print the single element
+  (cond
+    ((null dims)
+     (%write-obj (aref flat-data 0) stream
+                 (if (null level) 1 (+ level 1)) escape))
+    (t
+     (%print-md-array-rec dims flat-data 0 stream level escape))))
+
+;;; Print one slice of an N-D array.  Returns the next index into FLAT-DATA
+;;; after consuming the slice.  DIMS is the remaining dimension list.
+(defun %print-md-array-rec (dims flat-data start stream level escape)
+  (cond
+    ((null dims)
+     ;; Leaf — print the single element at START, return START+1
+     (%write-obj (aref flat-data start) stream
+                 (if (null level) 1 (+ level 1)) escape)
+     (+ start 1))
+    (t
+     (%print-char 40 stream)  ; (
+     (let ((n (car dims))
+           (rest-dims (cdr dims))
+           (i 0)
+           (cur start))
+       (loop
+         (when (= i n) (return nil))
+         (when (> i 0) (%print-char 32 stream))
+         (setq cur (%print-md-array-rec rest-dims flat-data cur stream level escape))
+         (setq i (+ i 1)))
+       (%print-char 41 stream)  ; )
+       cur))))
+
 ;;; Main printer: print OBJ to STREAM respecting all *print-* variables
 ;;; LEVEL: current nesting level (nil = not tracking)
 ;;; ESCAPE: current escape setting
@@ -281,6 +324,17 @@
       ;; Symbol
       ((or (%cl-sym-p obj) (eq obj t) (null obj))
        (%print-symbol-to-stream obj stream))
+      ;; Multi-dim array wrapper: (cons 9867654 (cons DIMS FLAT-ARR))
+      ((and (consp obj) (eql (car obj) 9867654) (consp (cdr obj)))
+       (cond
+         ((not parray)
+          (%print-char 35 stream)
+          (%print-char 60 stream)
+          (%print-string-raw "Array" stream)
+          (%print-char 62 stream))
+         (t
+          (let ((dims (cadr obj)) (data (cddr obj)))
+            (%print-md-array dims data stream level escape)))))
       ;; Cons (list)
       ((consp obj)
        ;; Check *print-level*

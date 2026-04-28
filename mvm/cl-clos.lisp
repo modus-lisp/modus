@@ -1156,9 +1156,30 @@
         (let ((bounds (nstring-parse-start-end args len)))
           (nstring-capitalize-raw str (car bounds) (cdr bounds))
           str))))
-(defun array-dimension (a n) (if (= n 0) (array-length a) 0))
-(defun array-total-size (a) (array-length a))
-(defun array-rank (a) 1)
+(defun array-dimension (a n)
+  (cond
+    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+     (let ((dims (cadr a)) (i 0))
+       (loop
+         (when (null dims) (return 0))
+         (when (= i n) (return (car dims)))
+         (setq dims (cdr dims))
+         (setq i (+ i 1)))))
+    ((= n 0) (array-length a))
+    (t 0)))
+(defun array-total-size (a)
+  (cond
+    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+     (array-length (cddr a)))
+    (t (array-length a))))
+(defun array-rank (a)
+  (cond
+    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+     (let ((n 0) (dims (cadr a)))
+       (loop (when (null dims) (return n))
+         (setq n (+ n 1))
+         (setq dims (cdr dims)))))
+    (t 1)))
 (defun adjustable-array-p (a) nil)
 
 (defun array-displacement (a)

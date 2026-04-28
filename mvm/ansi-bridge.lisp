@@ -1288,8 +1288,14 @@
 ;;; ============================================================
 
 (defun array-dimensions (a)
-  "Return list of dimensions of array A."
-  (list (array-length a)))
+  "Return list of dimensions of array A.
+   Detects multi-dim wrapper: (cons 9867654 (cons DIMS-LIST FLAT-ARR))."
+  (cond
+    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+     (cadr a))
+    ((arrayp a) (list (array-length a)))
+    ((stringp a) (list (array-length a)))
+    (t nil)))
 
 (defun upgraded-array-element-type (type)
   "Return the upgraded element type (simplified to T for all)."

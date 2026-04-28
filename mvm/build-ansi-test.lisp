@@ -212,11 +212,74 @@
          (t (mapcar-dotted #'rewrite-make-array-initcontents form)))))
     (t (mapcar-dotted #'rewrite-make-array-initcontents form))))
 
+;; Helper: flatten nested initial-contents list to a flat list, in row-major
+;; order.  DIMS is the list of dimensions, CONTENTS is the (already unquoted)
+;; nested list literal.
+(defun %flatten-initial-contents (dims contents)
+  (cond
+    ((null dims) (list contents))
+    ((null (cdr dims))
+     ;; Last dim: contents is a flat sequence of elements
+     (if (listp contents) (copy-list contents) nil))
+    (t
+     ;; contents is a list of length (car dims), each a sub-array
+     (let ((acc nil))
+       (dolist (sub contents)
+         (dolist (e (%flatten-initial-contents (cdr dims) sub))
+           (push e acc)))
+       (nreverse acc)))))
+
+;; Helper: build the body for a wrapped make-array with optional :initial-element
+;; or :initial-contents handling.  DIMS is the dim list (NIL for 0-dim).  TOTAL
+;; is the flat-array length (1 for 0-dim).  KWARGS is the original kwarg list.
+(defun %build-wrapped-make-array (dims total kwargs)
+  (let* ((init-elem (rewrite-make-array-dims
+                     (make-array-kwarg kwargs :initial-element)))
+         (init-contents (make-array-kwarg kwargs :initial-contents))
+         (var '%mda-init-tmp))
+    (cond
+      ;; :initial-contents is a quoted nested list literal — flatten it
+      ((and init-contents (consp init-contents) (eq (car init-contents) 'quote))
+       (let* ((nested (cadr init-contents))
+              (flat (%flatten-initial-contents dims nested))
+              (asets (loop for v in flat for i from 0
+                           collect `(aset ,var ,i (quote ,v)))))
+         `(cons 9867654
+                (cons (quote ,dims)
+                      (let ((,var (make-array ,total)))
+                        ,@asets
+                        ,var)))))
+      ;; :initial-element provided — fill all slots.  Bind init once via let
+      ;; (some test exprs have side effects like (- (random) ...)) and emit
+      ;; constant-index ASETs to avoid the variable-index ASET miscompile.
+      (init-elem
+       (let* ((init-var '%mda-init-val)
+              (asets (loop for i from 0 below total
+                           collect `(aset ,var ,i ,init-var))))
+         `(cons 9867654
+                (cons (quote ,dims)
+                      (let ((,var (make-array ,total))
+                            (,init-var ,init-elem))
+                        ,@asets
+                        ,var)))))
+      ;; No init — just wrap a fresh flat array
+      (t
+       `(cons 9867654
+              (cons (quote ,dims) (make-array ,total)))))))
+
 ;; Rewrite (make-array '(N) ...) → (make-array N ...) for MVM compatibility
+;;
+;; For 0-dim and multi-dim arrays we wrap the underlying flat 1-D array in
+;; a sentinel cons so the printer / array-dimensions / array-rank can detect
+;; the rank.  Wrapper layout:
+;;   (cons 9867654 (cons DIMS-LIST FLAT-ARRAY))
+;; where DIMS-LIST is a list of integer dimensions (NIL for 0-dim) and
+;; FLAT-ARRAY is the underlying 1-D array of (product DIMS-LIST) elements
+;; (or 1 element when DIMS-LIST is NIL).
 (defun rewrite-make-array-dims (form)
   "Walk form tree, converting list-dimension make-array to integer-dimension.
-   Also flattens (make-array nil ...) → (make-array 1 ...) so 0-dim array
-   tests don't crash MVM's make-array on a NIL size operand."
+   Also wraps 0-dim and multi-dim make-array results in a md-array tag cons
+   so array-dimensions/array-rank/printer can recover the rank."
   (cond
     ((atom form) form)
     ((and (eq (car form) 'make-array)
@@ -224,17 +287,30 @@
           (consp (cadr form))
           (eq (car (cadr form)) 'quote)
           (consp (cadr (cadr form)))
-          (null (cddr (cadr (cadr form)))))
-     ;; (make-array '(N) ...) → (make-array N ...)
+          (null (cdr (cadr (cadr form)))))
+     ;; (make-array '(N) ...) → (make-array N ...)  [single-dim list]
      (cons 'make-array (cons (car (cadr (cadr form)))
                              (mapcar #'rewrite-make-array-dims (cddr form)))))
     ((and (eq (car form) 'make-array)
           (consp (cdr form))
+          (consp (cadr form))
+          (eq (car (cadr form)) 'quote)
+          (consp (cadr (cadr form))))
+     ;; (make-array '(N M ...) ...) — multi-dim array.  Flatten to a vector
+     ;; of (product dims) elements and wrap so we remember the dims.
+     (let* ((dims (cadr (cadr form)))
+            (total (let ((p 1))
+                     (dolist (d dims p) (setq p (* p d)))))
+            (kwargs (cddr form)))
+       (%build-wrapped-make-array dims total kwargs)))
+    ((and (eq (car form) 'make-array)
+          (consp (cdr form))
           (null (cadr form)))
-     ;; (make-array nil ...) — 0-dim scalar array. MVM has no scalar
-     ;; arrays; treat as a 1-element vector so the test crashes a
-     ;; comparison instead of crashing the whole fork.
-     (cons 'make-array (cons 1 (mapcar #'rewrite-make-array-dims (cddr form)))))
+     ;; (make-array nil ...) — 0-dim scalar array.  Use a 1-elem vector and
+     ;; wrap with NIL dims.
+     (let ((r (%build-wrapped-make-array nil 1 (cddr form))))
+       (format *error-output* "~&;;DEBUG-NIL-DIM in=~S~%~%out=~S~%" form r)
+       r))
     (t (mapcar-dotted #'rewrite-make-array-dims form))))
 
 ;; Rewrite (eval '(FORM)) → (FORM) for MVM compatibility

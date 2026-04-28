@@ -1421,6 +1421,18 @@
         ;; ============================================
         ((op= +op-car+)
          ;; (car Vd Vs) — load car: [Vs - 1] (untag cons ptr)
+         ;;
+         ;; The bare deref is intentional.  CL semantics say (car X) on a
+         ;; non-cons (other than NIL) signals a TYPE-ERROR.  Modus
+         ;; achieves that by faulting: the in-process SIGSEGV handler at
+         ;; #x0520 converts the SEGV into a condition, handler-case
+         ;; catches it, and *.ERROR.* tests get the T they expect.  An
+         ;; earlier bug-6 fix attempt added a tag-check + return-NIL
+         ;; fast-path here; that closed our 4 markers and -90 ANSI
+         ;; *.ERROR.* tests because silently returning NIL is NOT what
+         ;; ANSI says car-of-fixnum should do.  See
+         ;; fragility-open-problem.md "bug 6 misdiagnosis (2026-04-28)"
+         ;; for the full debrief.
          (let* ((vd (first operands))
                 (vs (second operands))
                 (d (dest-phys-or-scratch vd))
@@ -1438,6 +1450,7 @@
 
         ((op= +op-cdr+)
          ;; (cdr Vd Vs) — load cdr: [Vs + 7] (-1 + 8)
+         ;; See +op-car+ for why no tag-check here.
          (let* ((vd (first operands))
                 (vs (second operands))
                 (d (dest-phys-or-scratch vd))

@@ -5,85 +5,65 @@ Concise version for getting back in.  Full backstory lives in
 (the deep-detail current-state doc).  This file is just the
 shortest path to "where am I, what's next."
 
-## Where we are
+## Where we are (refreshed 2026-04-28)
 
-Six bugs of one shape pinned down in the layout-fragility family.
-**Five fixed**, **one deferred** with regression markers.
+Five same-shape bugs of the "deref-without-tag-check" family fixed
+across the prior week (functionp/characterp, obj-subtag, array-len,
+plus two earlier).  Cumulative: **+226 unique tests at N=0, +230
+at N=1** vs pre-investigation baseline.
 
-The shape: **a type/dispatch IR-op or predicate dereferences a
-tagged pointer without first verifying the tag**.  At certain
-layouts an immediate (T) or a small integer (raw 0) ends up in
-that pointer slot; the unguarded deref reads from `[immediate ±
-small-offset]` which lands in unmapped memory → SIGSEGV.  Process
-of elimination predicates (functionp's cond chain) compound this
-because they fall through tag checks until something matches.
+Originally a sixth bug was named ("car/cdr IR-op tag-unsafe") with
+markers 9130-9133.  **Bug 6 is now retired as a misdiagnosis.**
+car/cdr SIGSEGVing on non-cons IS the implementation of CL's
+TYPE-ERROR signaling — the in-process SIGSEGV handler converts the
+fault into a condition.  An attempted "fix" that returned NIL on
+non-cons closed the markers but **broke 90 *.ERROR.* ANSI tests**
+because it silenced an error signal that ANSI requires.  Reverted;
+markers re-aimed to expect the caught-condition sentinel.  See
+`fragility-open-problem.md` "bug 6 misdiagnosis (debrief 2026-04-28)".
 
-Cumulative effect of the five fixes: **+226 unique tests at N=0,
-+230 at N=1** vs the pre-investigation baseline.  All three
-tests in the function/typep family are now layout-stable.
+The doc's "11-test CLOS family" list is stale.  At 2026-04-28
+baseline, 9 of those 11 already pass — only 27084 and 27465
+still fail.  The current flippy distribution has not been
+measured against an up-to-date binary.
 
 ## First thing to do back at the keyboard
-
-Run the binary and look for FAIL 9130-9133.  These are regression
-markers I added for bug 6 (car/cdr IR-op tag-unsafe).
-
-  - **4 FAILs in 9130-9133:** bug 6 still deferred, that's expected.
-  - **4 Ps in 9130-9133:** someone (or some upstream change) closed
-    bug 6.  Rebuild the fragility-fuzzer, characterize the residual,
-    update the open-problem doc.
-  - **Mixed pass/fail or different IDs failing nearby:** something
-    moved.  Read `fragility-open-problem.md` carefully before doing
-    anything; the layout fragility is the kind of thing that comes
-    back wearing a different mask.
 
 ```sh
 sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp
 /tmp/modus-ansi-test | grep -E '^(P|FAIL ).?91[03][0-3]'
 ```
 
+  - **4 Ps in 9130-9133:** car/cdr error-signaling is functional.
+    That's the expected steady state.
+  - **Any FAIL in 9130-9133:** the SIGSEGV → handler-case → :crashed
+    path is broken.  Read the captured RIP/SITE/RAX from the FAIL
+    line, decode per the rubric below.
+
 ## What's left, in priority order
 
-### 1. Close bug 6 (car/cdr IR-op tag-check)
+### 1. Refresh the flippy list
 
-Same-shape bug in the family I named.  See
-`fragility-open-problem.md` for three implementation sketches.
-Short summary:
+The per-test landscape has moved since the doc was written.  The
+old list (REINITIALIZE-INSTANCE.{1-4}, etc.) is largely
+already-passing.  Before doing any new "root cause" work, find out
+what's actually flippy *today*:
 
-  - **Option A (fast path + branch):** cheapest, ~5 bytes on the
-    fast path per site but ~14 total.  Mirror obj-subtag/array-len
-    structure.
-  - **Option B (cmov):** doesn't actually gate the deref, falls
-    back to A.  Skip.
-  - **Option C (compile-time type inference):** the right
-    structural answer.  Most car/cdr is provably-on-cons because
-    it follows a consp/listp/destructure that established the tag.
-    Even a one-pass local analysis ("preceded by consp branch in
-    the same basic block") eliminates most sites; the residual
-    sites — argument positions, aref results, etc. — get the
-    runtime check.
+```sh
+scripts/fragility-fuzzer.sh    # 9 builds × ~22min ≈ 3-4 hours
+```
 
-If a quick win is wanted, do A.  If structural completion is the
-goal, invest a few days in C.  C makes A much cheaper if you do
-both — A as the fallback for inference-failed sites, C eliminates
-most of those.
+Then diff the per-N pass sets to get the current flippy list, with
+*test names* (look up via `build-ansi-test.lisp`'s ID-to-name dump).
+Only after that do the "what to fix next" question.
 
-Validation: 9130-9133 should flip from FAIL to P after the fix.
+### 2. The two remaining flippy CLOS tests (27084, 27465)
 
-### 2. After bug 6: rerun the fragility-fuzzer
-
-`scripts/fragility-fuzzer.sh` builds the binary at N ∈ {0..8} (one
-extra `:nop` IR op per `compile-funcall` site, scaling by N) and
-diffs which tests flip.  Right now the post-fix flippy distribution
-hasn't been measured; baseline had 14 flippy tests.  After
-bug 6 closes, rerun the fuzzer and:
-
-  - **0 or near-0 flippy:** the family is empirically closed.
-    Write that up, retire the layout-fragility track.
-  - **A new set of N flippy tests:** there's a seventh bug in the
-    same family.  The methodology that worked is in §"How to
-    debug another one" below.
-
-Total cost: 9 builds × ~22 min ≈ 3-4 hours.  Run it overnight.
+CLASS-0206.1 and MAKE-INSTANCE.ORDER.1 are the only two from the
+old CLOS family still failing at baseline.  They have no captured
+state (so they're not crashing — they're returning wrong values).
+Worth pulling apart with a `*run-only-below*=27500` shard and
+adding diag prints to see what they return vs expect.
 
 ### 3. CHANGE-CLASS isn't fragility — separate work
 

@@ -363,37 +363,65 @@ because it's so dense in the binary that the per-site cost matters.
   fast.  This is the version to push for if there's appetite in
   the next iteration.
 
-### Regression tests (committed)
+### Bug 6 misdiagnosis (debrief 2026-04-28)
 
-`ansi-tests.lisp` carries four custom tests (IDs 9130-9133) that
-exercise car/cdr on non-cons values:
+The "car/cdr IR-op tag-unsafe" framing above is wrong.  Implementing
+the proposed fix on 2026-04-28 — tag-check + return NIL on non-cons,
+mirror of obj-subtag/array-len — closed the 4 markers and **broke 90
+*.ERROR.* ANSI tests in the 10000-11000 range** (APPEND.ERROR.1,
+ASSOC-IF-NOT.ERROR.11, etc.).
 
-    (deftest 9130 (cdr 0)  nil)
-    (deftest 9131 (car 0)  nil)
-    (deftest 9132 (cdr 42) nil)
-    (deftest 9133 (car 42) nil)
+Why: Modus's CL implementation signals TYPE-ERROR-on-bad-arg by
+*letting the SIGSEGV happen*.  The in-process signal handler at
+#x0520 converts the fault into a condition; handler-case catches it;
+the test sees a signaled error and returns T.  Returning NIL silently
+from car/cdr defeats this — `(append '(a b c) :not-a-list)` no
+longer signals, the walker just ends with NIL, the test gets NIL
+when it expected T (= "an error was caught").
 
-Pre-fix (today): each thunk SIGSEGVs at `mov d, [src ± 1/7]`,
-handler-case catches, `%record-test-fail` records a FAIL with the
-captured RIP/SITE/RAX/si_addr signature.  Future-you sees the
-4-test FAIL block and knows immediately what's not done.
+So `(car 0)` SIGSEGVing isn't a bug — it's the implementation of
+TYPE-ERROR.  The "fix" was an anti-fix: it *silenced* an error
+signal that ANSI requires.
 
-Post-fix: each test returns NIL (lispy car-of-non-cons traditional
-behavior), matches expected NIL, passes.  The transition from "4
-FAILs in the 91xx range" to "4 Ps in the 91xx range" is the
-regression-test signal.
+Reverted.  Markers re-aimed:
 
-### What's left after this finding
+    (deftest 9130 (safe-eval (lambda () (cdr 0)))  :crashed)
+    (deftest 9131 (safe-eval (lambda () (car 0)))  :crashed)
+    (deftest 9132 (safe-eval (lambda () (cdr 42))) :crashed)
+    (deftest 9133 (safe-eval (lambda () (car 42))) :crashed)
 
-The same-shape bug class is fully named.  Closing it needs:
+`safe-eval` wraps its thunk in `handler-case (...) (t (c) :crashed)`.
+The markers now PASS today (error caught, sentinel returned), and
+will continue passing under any future fix that signals a real
+TYPE-ERROR via `error` instead of via SIGSEGV.  They FAIL only if
+car/cdr ever returns silently.
 
-  - **car/cdr IR-op tag-check** (this commit's hypothesis,
-    implementation deferred for layout-shift reasons).
-  - **Implement CHANGE-CLASS** (separate feature work, not
-    fragility).
+### Stale "what's still open" — needs refresh
 
-A fresh fragility-fuzzer N=0..8 sweep after the car/cdr fix would
-empirically validate "the family is closed" or surface a seventh.
+The "11-test CLOS family" listing below is from an earlier era.  At
+the 2026-04-28 measurement, **9 of the 11 are passing in baseline**
+already (only 27084 and 27465 still fail).  Whatever the actual
+flippy distribution is today, it's NOT what this section describes.
+
+Action: rerun the fragility-fuzzer at N=0..8, capture the current
+flippy list with names not just IDs, refresh this section.  Don't
+chase the IDs below before doing that — they've moved on.
+
+### How obj-subtag / array-len fixes were different
+
+Those two fixes return *0* on tag-mismatch, which makes downstream
+predicates (e.g. `(= subtag 96)`) cleanly false instead of crashing.
+That doesn't suppress an error signal because no ANSI test expects
+"obj-subtag of T signals type-error" — the predicate-style usage
+swallows the result.
+
+car/cdr is different: ANSI tests *do* check that
+car-of-non-cons-non-nil signals.  Returning NIL would have to be
+swapped for "call (error 'type-error ...)", which can't be done
+cleanly inline at the IR-op level (needs Lisp-side condition
+machinery).  Defer until either (a) inline `:call` to a small Lisp
+helper is cheap enough, or (b) compile-time type inference removes
+most car/cdr sites and the residual can afford the call.
 
 ### What's left
 

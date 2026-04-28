@@ -61,6 +61,15 @@
   "Coerce to boolean: nil → nil, anything else → t."
   (if x t nil))
 
+(defun safe-eval (thunk)
+  "Run THUNK in handler-case so a SIGSEGV (caught by the in-process signal
+   handler and longjmp'd into our handler-case) becomes a :CRASHED sentinel
+   instead of killing the process.  Used by regression markers that
+   intentionally exercise unsafe paths (e.g. (cdr 0) before the bug-6 fix)
+   from within run-clos-diag-tests, which runs in the PARENT process — a
+   bare crash there aborts the entire ANSI suite."
+  (handler-case (funcall thunk) (t (c) :crashed)))
+
 (defun =t (x &rest args)
   "Like =, but guaranteed to return T for true. Handles 1-arg and 2-arg cases."
   (if (null args)
@@ -1586,27 +1595,23 @@
   (deftest 9122 (arrayp   t)  nil)
   (deftest 9123 (= (obj-subtag t) 0) t) ;; explicit obj-subtag tag-mismatch
 
-  ;; Regression markers for the SIXTH same-shape bug (DEFERRED, not yet
-  ;; fixed): :car / :cdr IR-ops deref `[src ± 1/7]' without verifying
-  ;; src is a real cons (low nibble 1).  For src = NIL, the NIL-page
-  ;; mmap absorbs the read and (car NIL) / (cdr NIL) return NIL — fine.
-  ;; For src = raw 0 (uninitialized slot, fixnum mistakenly chased as
-  ;; cons), the read goes to address ±1 from zero → unmapped → SIGSEGV.
+  ;; Markers for the (car/cdr non-cons) signaling path.  CL semantics
+  ;; say (car X) for X not a cons (and not NIL) signals TYPE-ERROR.
+  ;; Modus implements that by faulting: car/cdr's bare `mov d, [src ± 1/7]'
+  ;; SIGSEGVs on a non-cons src; the in-process SIGSEGV handler converts
+  ;; the fault into a condition; handler-case catches it.  Wrapping in
+  ;; safe-eval converts the caught condition to :CRASHED, which is what
+  ;; we EXPECT here — the markers pass when error-signaling is
+  ;; functional, fail (with diag captured) if the path goes silent.
   ;;
-  ;; These tests EXPECT NIL (the lispy traditional behavior).  Today,
-  ;; pre-fix: thunk SIGSEGVs, handler-case catches, %record-test-fail
-  ;; prints "FAIL 9130/9131" so we get a clear regression signal.
-  ;; Post-fix (fast-path tag-check at translator level, see
-  ;; fragility-open-problem.md "fast-path fix sketch"): tests pass.
-  ;;
-  ;; Their job is to give future-you a binary signal — pass/fail —
-  ;; instead of waiting for the bug to surface as a layout-fragility
-  ;; flip in some unrelated test next month.
-  (deftest 9130 (cdr 0) nil)
-  (deftest 9131 (car 0) nil)
-  ;; Same shape on a fixnum that doesn't happen to be 0 — the NIL-page
-  ;; only saves us for src in [0xDEAD0000, 0xDEAD1000); for any other
-  ;; non-cons src the deref fails the same way.
-  (deftest 9132 (cdr 42) nil)
-  (deftest 9133 (car 42) nil)
+  ;; HISTORY: a 2026-04-28 attempt added a tag-check fast-path that
+  ;; returned NIL on non-cons "to close bug 6".  It closed these markers
+  ;; and -90 *.ERROR.* ANSI tests, because silently returning NIL is
+  ;; not what ANSI says car-of-fixnum should do.  Reverted; the
+  ;; SIGSEGV-via-handler IS the type-error signal.  See
+  ;; fragility-open-problem.md "bug 6 misdiagnosis".
+  (deftest 9130 (safe-eval (lambda () (cdr 0)))  :crashed)
+  (deftest 9131 (safe-eval (lambda () (car 0)))  :crashed)
+  (deftest 9132 (safe-eval (lambda () (cdr 42))) :crashed)
+  (deftest 9133 (safe-eval (lambda () (car 42))) :crashed)
   )

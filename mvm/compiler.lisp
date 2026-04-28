@@ -546,9 +546,16 @@
               (if (and (symbolp (car clause))
                        (= (compute-name-hash (symbol-name (car clause))) 307092296168853251))
                   `(progn ,@(cdr clause))
-                  `(if ,(car clause)
-                       (progn ,@(cdr clause))
-                       (cond ,@(cdr clauses)))))))))
+                  ;; Short form (cond (test)) — when clause has no body,
+                  ;; ANSI returns the value of TEST if non-NIL.  Bind to
+                  ;; a tmp so test is evaluated only once.
+                  (if (null (cdr clause))
+                      (let ((tmp (gensym "CONDV")))
+                        `(let ((,tmp ,(car clause)))
+                           (if ,tmp ,tmp (cond ,@(cdr clauses)))))
+                      `(if ,(car clause)
+                           (progn ,@(cdr clause))
+                           (cond ,@(cdr clauses))))))))))
   ;; AND → nested IF
   (mvm-define-macro "AND"
     (lambda (form)

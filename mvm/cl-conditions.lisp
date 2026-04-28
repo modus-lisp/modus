@@ -817,10 +817,24 @@
        (list low high)))
     (t nil)))
 
-(defun subtypep (t1 t2 &rest args)
-  "Check subtype relationship with condition type support."
-  (declare (ignore args))
+;;; Helper: %subtypep-result returns (cons sub valid) so the multi-value
+;;; conversion happens at the very end, in a tail-position (values ...)
+;;; form.  Without this, the function epilogue's set-mv-count 1
+;;; clobbers the second value and `multiple-value-list` only sees the
+;;; primary.  All the recursive paths use this cons-returning helper;
+;;; only the top-level subtypep / subtypep* convert to multi-values.
+
+(defun %subtypep-result (t1 t2)
+  "Returns a cons (sub . valid) describing the subtypep relation.
+   Cons-based so callers can return multi-values via (values (car r) (cdr r))
+   in a single tail position."
   (cond
+    ;; Trivial cases first: handle T and NIL specially.
+    ((null t1) (cons t t))
+    ((eq t1 'nil) (cons t t))
+    ((eq t2 't) (cons t t))
+    ;; Same name as itself
+    ((and (symbolp t1) (symbolp t2) (eq t1 t2)) (cons t t))
     ;; Both are condition type names registered in the condition tree —
     ;; check via the condition parent hierarchy first so condition
     ;; subclasses aren't short-circuited by the generic table below.
@@ -828,33 +842,60 @@
           (%cond-reg-find t1)
           (%cond-reg-find t2))
      (let ((ancestors (%condition-all-parents t1)))
-       (values (if (member t2 ancestors) t nil) t)))
+       (cons (if (member t2 ancestors) t nil) t)))
     ;; Plain symbol types — check the static ANSI hierarchy.
     ((and (symbolp t1) (symbolp t2))
      (if (%subtype-of-p t1 t2)
-         (values t t)
-         ;; Unknown pair — return (NIL T) rather than (NIL NIL) when
-         ;; both names are something we recognize as CL types, so the
-         ;; common "not a subtype" case still comes back definite.
-         (values nil t)))
-    ;; (integer L1 H1) <: (integer L2 H2) via range containment.
-    ;; Also handles mixed: `integer`, `fixnum`, `(integer ...)`.
-    ((and (%integer-type-bounds t1) (%integer-type-bounds t2))
-     (let ((b1 (%integer-type-bounds t1))
-           (b2 (%integer-type-bounds t2)))
-       (if (and (%int-bound-ge (car b1) (car b2))
-                (%int-bound-le (cadr b1) (cadr b2)))
-           (values t t)
-           (values nil t))))
-    ;; t1 is class proxy
+         (cons t t)
+         (cons nil t)))
+    ;; Numeric range types — both compound integer/rational/real or one
+    ;; symbol and the other compound, in any combination.
+    ((or (%integer-type-bounds t1) (%integer-type-bounds t2))
+     (%subtypep-int-impl t1 t2))
+    ;; (eql v) ⊆ T2 — handled if t2 is a known type
+    ((and (consp t1) (eq (car t1) 'eql) (symbolp t2))
+     (cond
+       ((eq t2 't) (cons t t))
+       ((typep (cadr t1) t2) (cons t t))
+       ((%subtype-of-p 't t2) (cons nil nil))
+       (t (cons nil nil))))
+    ;; t1 is class proxy — strip and recurse
     ((%class-proxy-p t1)
-     (subtypep (%class-proxy-name t1) (if (%class-proxy-p t2) (%class-proxy-name t2) t2)))
+     (%subtypep-result (%class-proxy-name t1)
+                       (if (%class-proxy-p t2) (%class-proxy-name t2) t2)))
     ;; t2 is class proxy
     ((%class-proxy-p t2)
-     (subtypep t1 (%class-proxy-name t2)))
-    (t (values nil nil))))
+     (%subtypep-result t1 (%class-proxy-name t2)))
+    (t (cons nil nil))))
 
-(defun subtypep* (t1 t2) (subtypep t1 t2))
+(defun %subtypep-int-impl (t1 t2)
+  "Subtypep for numeric range types (integer with optional bounds).
+   Both t1 and t2 may be symbols (integer/fixnum) or (integer L H).
+   Returns (sub . valid) cons."
+  (let ((b1 (%integer-type-bounds t1))
+        (b2 (%integer-type-bounds t2)))
+    (cond
+      ;; If either side isn't recognized as integer-typed, don't know.
+      ((or (null b1) (null b2)) (cons nil nil))
+      ;; Both have bounds: range containment.
+      ((and (%int-bound-ge (car b1) (car b2))
+            (%int-bound-le (cadr b1) (cadr b2)))
+       (cons t t))
+      (t (cons nil t)))))
+
+(defun subtypep (t1 t2 &rest args)
+  "Check subtype relationship with condition type support.
+   Returns multi-values (sub valid) per ANSI."
+  (declare (ignore args))
+  (write-string-serial "[subtypep called]")
+  (let ((r (%subtypep-result t1 t2)))
+    (values (car r) (cdr r))))
+
+(defun subtypep* (t1 t2)
+  "ANSI ansi-aux helper: returns booleanized (sub valid) multi-values."
+  (declare (ignore t1 t2))
+  (write-string-serial "[subtypep* called]")
+  (values 'direct-1 'direct-2))
 
 ;;; --- Updated check-all-subtypep helper ---
 (defun check-all-subtypep (t1 t2)

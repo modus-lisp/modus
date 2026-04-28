@@ -125,7 +125,539 @@
 (defun bit-vector-p (x) nil)  ; stub
 (defun simple-string-p (x) (stringp x))
 (defun simple-bit-vector-p (x) nil)
-(defun subtypep (t1 t2 &rest args) (values nil nil))  ; stub
+;;; ============================================================
+;;; SUBTYPEP — basic ANSI lattice support.
+;;;
+;;; Strategy: be CONSERVATIVE.  Only return a definite answer
+;;; (T T) for proven sub-relations or (NIL T) for proven disjoint
+;;; pairs.  When we are not sure, return (NIL NIL) ("don't know").
+;;; A wrong (T T) breaks check-all-not-subtypep tests; a wrong
+;;; (NIL T) breaks anything that uses subtypep* and expects T T.
+;;; (NIL NIL) at least preserves the stub's failure mode.
+;;; ============================================================
+
+(defun %subtype-bound-le (a b)
+  "Numeric bound A <= B, where bounds are integers (no * here)."
+  (numeric-<= a b))
+
+(defun %subtype-bound-lt (a b)
+  "Numeric bound A < B, where bounds are integers (no * here)."
+  (numeric-value-less-p a b))
+
+(defun %canon-low (lo)
+  "Convert numeric range low bound to (kind . val) form.
+   Returns (:open . n), (:closed . n), or (:neg-inf . nil)."
+  (cond
+    ((eq lo '*) (cons ':neg-inf nil))
+    ((null lo) (cons ':neg-inf nil))
+    ((and (consp lo) (null (cdr lo))) (cons ':open (car lo)))
+    (t (cons ':closed lo))))
+
+(defun %canon-high (hi)
+  "Convert numeric range high bound to (kind . val) form.
+   Returns (:open . n), (:closed . n), or (:pos-inf . nil)."
+  (cond
+    ((eq hi '*) (cons ':pos-inf nil))
+    ((null hi) (cons ':pos-inf nil))
+    ((and (consp hi) (null (cdr hi))) (cons ':open (car hi)))
+    (t (cons ':closed hi))))
+
+(defun %low-le-low (lo1 lo2)
+  "Is the lower bound LO1 <= LO2 (i.e. LO1 lets in everything LO2 does)?
+   LO1 and LO2 are canonicalized."
+  (let ((k1 (car lo1)) (k2 (car lo2)))
+    (cond
+      ((eq k1 ':neg-inf) t)
+      ((eq k2 ':neg-inf) nil)
+      ;; both finite
+      (t
+       (let ((v1 (cdr lo1)) (v2 (cdr lo2)))
+         (cond
+           ((and (eq k1 ':closed) (eq k2 ':closed)) (%subtype-bound-le v1 v2))
+           ((and (eq k1 ':closed) (eq k2 ':open))   (%subtype-bound-le v1 v2))
+           ((and (eq k1 ':open)   (eq k2 ':closed)) (%subtype-bound-lt v1 v2))
+           ((and (eq k1 ':open)   (eq k2 ':open))   (%subtype-bound-le v1 v2))
+           (t nil)))))))
+
+(defun %high-ge-high (hi1 hi2)
+  "Is the upper bound HI1 >= HI2 (i.e. HI1 lets in everything HI2 does)?"
+  (let ((k1 (car hi1)) (k2 (car hi2)))
+    (cond
+      ((eq k1 ':pos-inf) t)
+      ((eq k2 ':pos-inf) nil)
+      (t
+       (let ((v1 (cdr hi1)) (v2 (cdr hi2)))
+         (cond
+           ((and (eq k1 ':closed) (eq k2 ':closed)) (%subtype-bound-le v2 v1))
+           ((and (eq k1 ':closed) (eq k2 ':open))   (%subtype-bound-le v2 v1))
+           ((and (eq k1 ':open)   (eq k2 ':closed)) (%subtype-bound-lt v2 v1))
+           ((and (eq k1 ':open)   (eq k2 ':open))   (%subtype-bound-le v2 v1))
+           (t nil)))))))
+
+(defun %range-contains-p (lo1 hi1 lo2 hi2)
+  "Range1 [lo1,hi1] contains range2 [lo2,hi2]?
+   I.e. is range2 a subset of range1?"
+  (and (%low-le-low lo1 lo2)
+       (%high-ge-high hi1 hi2)))
+
+(defun %parse-num-range (type)
+  "TYPE is e.g. (integer L H), (integer L), (integer), 'integer.
+   Returns cons (CANON-LOW . CANON-HIGH).  Caller has already
+   verified the head matches the desired numeric type."
+  (cond
+    ((symbolp type) (cons (cons ':neg-inf nil) (cons ':pos-inf nil)))
+    ((not (consp type)) (cons (cons ':neg-inf nil) (cons ':pos-inf nil)))
+    (t
+     (let ((rest (cdr type)))
+       (let ((lo (if rest (car rest) '*))
+             (hi (if (and rest (cdr rest)) (cadr rest) '*)))
+         (cons (%canon-low lo) (%canon-high hi)))))))
+
+(defun %num-type-head (type)
+  "Return the head symbol of TYPE if TYPE is a numeric range type.
+   Symbols return themselves."
+  (cond
+    ((symbolp type) type)
+    ((consp type) (car type))
+    (t nil)))
+
+(defun %numeric-range-type-p (head)
+  "Is HEAD one of the numeric range type names?"
+  (or (eq head 'integer) (eq head 'rational) (eq head 'real)
+      (eq head 'float) (eq head 'single-float) (eq head 'double-float)
+      (eq head 'short-float) (eq head 'long-float) (eq head 'fixnum)
+      (eq head 'bignum) (eq head 'bit) (eq head 'number)
+      (eq head 'unsigned-byte) (eq head 'signed-byte)))
+
+(defun %numeric-supertype-p (sup sub)
+  "Is SUP a numeric supertype of (or equal to) SUB at the head level?
+   SUP and SUB are head symbols (not compound types).
+   Lattice: number > real > rational > integer > {fixnum, bignum, bit}
+            number > real > rational > ratio
+            number > real > float > {single,short,double,long}-float."
+  (cond
+    ((eq sup sub) t)
+    ((eq sup 'number) (or (eq sub 'real) (eq sub 'rational) (eq sub 'integer)
+                          (eq sub 'float) (eq sub 'fixnum) (eq sub 'bignum)
+                          (eq sub 'bit) (eq sub 'ratio)
+                          (eq sub 'single-float) (eq sub 'double-float)
+                          (eq sub 'short-float) (eq sub 'long-float)
+                          (eq sub 'unsigned-byte) (eq sub 'signed-byte)))
+    ((eq sup 'real) (or (eq sub 'rational) (eq sub 'integer)
+                        (eq sub 'float) (eq sub 'fixnum) (eq sub 'bignum)
+                        (eq sub 'bit) (eq sub 'ratio)
+                        (eq sub 'single-float) (eq sub 'double-float)
+                        (eq sub 'short-float) (eq sub 'long-float)
+                        (eq sub 'unsigned-byte) (eq sub 'signed-byte)))
+    ((eq sup 'rational) (or (eq sub 'integer) (eq sub 'fixnum) (eq sub 'bignum)
+                            (eq sub 'bit) (eq sub 'ratio)
+                            (eq sub 'unsigned-byte) (eq sub 'signed-byte)))
+    ((eq sup 'integer) (or (eq sub 'fixnum) (eq sub 'bignum) (eq sub 'bit)
+                           (eq sub 'unsigned-byte) (eq sub 'signed-byte)))
+    ((eq sup 'signed-byte) (or (eq sub 'integer) (eq sub 'fixnum)
+                               (eq sub 'bignum) (eq sub 'bit)
+                               (eq sub 'unsigned-byte)))
+    ((eq sup 'unsigned-byte) (eq sub 'bit))
+    ((eq sup 'fixnum) (eq sub 'bit))
+    ((eq sup 'float) (or (eq sub 'single-float) (eq sub 'double-float)
+                         (eq sub 'short-float) (eq sub 'long-float)))
+    (t nil)))
+
+(defun %sub-default-low (head)
+  "The default LOW bound when a subtype HEAD is unbounded.
+   Most numeric types are unbounded below."
+  (declare (ignore head))
+  (cons ':neg-inf nil))
+
+(defun %sub-default-high (head)
+  "The default HIGH bound when a subtype HEAD is unbounded."
+  (declare (ignore head))
+  (cons ':pos-inf nil))
+
+(defun %sub-numeric-range (sub-type sup-type)
+  "Both SUB-TYPE and SUP-TYPE are numeric range types (compound or symbol).
+   Returns (values RESULT VALID).
+   Returns (T T) if SUB ⊆ SUP, (NIL T) if disjoint or sup-too-narrow,
+   (NIL NIL) otherwise."
+  (let* ((sub-head (%num-type-head sub-type))
+         (sup-head (%num-type-head sup-type))
+         (sub-range (%parse-num-range sub-type))
+         (sup-range (%parse-num-range sup-type))
+         (sub-lo (car sub-range)) (sub-hi (cdr sub-range))
+         (sup-lo (car sup-range)) (sup-hi (cdr sup-range)))
+    ;; First: check head-level subtype
+    (cond
+      ;; FLOAT vs RATIONAL/INTEGER are disjoint
+      ((and (or (eq sub-head 'float) (eq sub-head 'single-float)
+                (eq sub-head 'double-float) (eq sub-head 'short-float)
+                (eq sub-head 'long-float))
+            (or (eq sup-head 'rational) (eq sup-head 'integer)
+                (eq sup-head 'fixnum) (eq sup-head 'bignum)
+                (eq sup-head 'bit) (eq sup-head 'ratio)))
+       (values nil t))
+      ((and (or (eq sub-head 'rational) (eq sub-head 'integer)
+                (eq sub-head 'fixnum) (eq sub-head 'bignum)
+                (eq sub-head 'bit) (eq sub-head 'ratio))
+            (or (eq sup-head 'float) (eq sup-head 'single-float)
+                (eq sup-head 'double-float) (eq sup-head 'short-float)
+                (eq sup-head 'long-float)))
+       (values nil t))
+      ;; Heads compatible?
+      ((%numeric-supertype-p sup-head sub-head)
+       ;; If sup is unbounded (head only or default range), trivially yes
+       (cond
+         ((%range-contains-p sup-lo sup-hi sub-lo sub-hi)
+          (values t t))
+         ;; Same head, range not contained → definite no
+         ((eq sub-head sup-head)
+          (values nil t))
+         ;; Different heads, sup has narrower range — can't be sure for compound mismatch.
+         ;; Conservative: if sub is unbounded but sup is bounded → no
+         ((and (eq (car sub-lo) ':neg-inf) (eq (car sub-hi) ':pos-inf)
+               (or (not (eq (car sup-lo) ':neg-inf))
+                   (not (eq (car sup-hi) ':pos-inf))))
+          (values nil t))
+         (t (values nil nil))))
+      ;; sup-head is not supertype of sub-head — but maybe sub-head is supertype of sup
+      (t
+       ;; e.g. (subtypep 'integer 'fixnum) — if sub-head ⊃ sup-head, definite NO
+       ;; only if sub is unbounded or covers more than sup.
+       (cond
+         ((%numeric-supertype-p sub-head sup-head)
+          ;; sub broader than sup at head level — must be NO unless ranges
+          ;; restrict sub to fit within sup.  Be conservative: NIL NIL.
+          (values nil nil))
+         (t (values nil nil)))))))
+
+;; --- Type-name lattice (non-numeric portion) ---
+;; List of (sub super) edges; transitive closure handled by walker.
+;; Includes redundant edges to cover ANSI subtype-table.
+
+(defun %type-direct-supers (n)
+  "Return list of immediate supertypes for type-name symbol N.
+   Returns NIL for unknown names."
+  (cond
+    ((eq n 'null) '(symbol list boolean))
+    ((eq n 'symbol) '(atom))
+    ((eq n 'boolean) '(symbol))
+    ((eq n 'keyword) '(symbol))
+    ((eq n 'cons) '(list))
+    ((eq n 'list) '(sequence))
+    ((eq n 'sequence) '(atom))
+    ((eq n 'array) '(atom))
+    ((eq n 'simple-array) '(array))
+    ((eq n 'vector) '(array sequence))
+    ((eq n 'simple-vector) '(vector simple-array))
+    ((eq n 'string) '(vector))
+    ((eq n 'simple-string) '(string simple-array))
+    ((eq n 'base-string) '(string))
+    ((eq n 'simple-base-string) '(base-string simple-string))
+    ((eq n 'bit-vector) '(vector))
+    ((eq n 'simple-bit-vector) '(bit-vector simple-array))
+    ((eq n 'character) '(atom))
+    ((eq n 'base-char) '(character))
+    ((eq n 'standard-char) '(base-char))
+    ((eq n 'extended-char) '(character))
+    ((eq n 'number) '(atom))
+    ((eq n 'real) '(number))
+    ((eq n 'rational) '(real))
+    ((eq n 'integer) '(rational signed-byte))
+    ((eq n 'ratio) '(rational))
+    ((eq n 'float) '(real))
+    ((eq n 'single-float) '(float))
+    ((eq n 'double-float) '(float))
+    ((eq n 'short-float) '(float))
+    ((eq n 'long-float) '(float))
+    ((eq n 'fixnum) '(integer))
+    ((eq n 'bignum) '(integer))
+    ((eq n 'bit) '(unsigned-byte fixnum))
+    ((eq n 'unsigned-byte) '(signed-byte))
+    ((eq n 'signed-byte) '(integer))
+    ((eq n 'complex) '(number))
+    ((eq n 'function) '(t))
+    ((eq n 'compiled-function) '(function))
+    ((eq n 'generic-function) '(function))
+    ((eq n 'standard-generic-function) '(generic-function))
+    ((eq n 'standard-object) '(t))
+    ((eq n 'method) '(standard-object))
+    ((eq n 'standard-method) '(method))
+    ((eq n 'method-combination) '(t))
+    ((eq n 'class) '(standard-object))
+    ((eq n 'built-in-class) '(class))
+    ((eq n 'structure-class) '(class))
+    ((eq n 'standard-class) '(class))
+    ((eq n 'structure-object) '(t))
+    ((eq n 'condition) '(t))
+    ((eq n 'serious-condition) '(condition))
+    ((eq n 'error) '(serious-condition))
+    ((eq n 'arithmetic-error) '(error))
+    ((eq n 'division-by-zero) '(arithmetic-error))
+    ((eq n 'cell-error) '(error))
+    ((eq n 'unbound-slot) '(cell-error))
+    ((eq n 'unbound-variable) '(cell-error))
+    ((eq n 'undefined-function) '(cell-error))
+    ((eq n 'parse-error) '(error))
+    ((eq n 'reader-error) '(parse-error stream-error))
+    ((eq n 'control-error) '(error))
+    ((eq n 'program-error) '(error))
+    ((eq n 'simple-condition) '(condition))
+    ((eq n 'simple-error) '(simple-condition error))
+    ((eq n 'simple-type-error) '(simple-condition type-error))
+    ((eq n 'simple-warning) '(simple-condition warning))
+    ((eq n 'type-error) '(error))
+    ((eq n 'storage-condition) '(serious-condition))
+    ((eq n 'warning) '(condition))
+    ((eq n 'style-warning) '(warning))
+    ((eq n 'package) '(t))
+    ((eq n 'package-error) '(error))
+    ((eq n 'random-state) '(atom))
+    ((eq n 'pathname) '(atom))
+    ((eq n 'logical-pathname) '(pathname))
+    ((eq n 'file-error) '(error))
+    ((eq n 'stream) '(atom))
+    ((eq n 'broadcast-stream) '(stream))
+    ((eq n 'concatenated-stream) '(stream))
+    ((eq n 'echo-stream) '(stream))
+    ((eq n 'file-stream) '(stream))
+    ((eq n 'string-stream) '(stream))
+    ((eq n 'synonym-stream) '(stream))
+    ((eq n 'two-way-stream) '(stream))
+    ((eq n 'stream-error) '(error))
+    ((eq n 'end-of-file) '(stream-error))
+    ((eq n 'print-not-readable) '(error))
+    ((eq n 'readtable) '(atom))
+    ((eq n 'hash-table) '(atom))
+    ((eq n 'restart) '(t))
+    ((eq n 'atom) '(t))
+    (t nil)))
+
+(defun %type-known-p (n)
+  "Is N a recognized type name we know about?"
+  (or (eq n 't) (eq n 'nil)
+      (%type-direct-supers n)
+      ;; Bare numeric types still known even if direct-supers is nil
+      (eq n 'atom)))
+
+(defun %has-supertype-p (sub sup depth)
+  "Walk supertype chain: is SUP transitively a supertype of SUB?
+   Bounded depth to prevent any cycle silliness."
+  (cond
+    ((<= depth 0) nil)
+    ((eq sub sup) t)
+    ((eq sup 't) t)
+    (t
+     (let ((parents (%type-direct-supers sub))
+           (found nil))
+       (dolist (p parents found)
+         (when (and (not found) (%has-supertype-p p sup (- depth 1)))
+           (setq found t)))))))
+
+;; --- Disjoint-types check ---
+;; Two types are disjoint if they belong to incompatible top-level
+;; "buckets" with no shared bottom.  We determine the "root bucket"
+;; for each type and compare.
+
+(defun %type-bucket (n)
+  "Return a top-level disjointness bucket symbol for type N, or NIL
+   if uncertain.  Types in different buckets are disjoint."
+  (cond
+    ((eq n 'cons) ':cons)
+    ;; symbol family — but null is in both symbol and list
+    ((eq n 'null) ':null)
+    ((eq n 'symbol) ':symbol)
+    ((eq n 'boolean) ':symbol)
+    ((eq n 'keyword) ':symbol)
+    ;; numeric
+    ((or (eq n 'number) (eq n 'real) (eq n 'rational) (eq n 'integer)
+         (eq n 'float) (eq n 'fixnum) (eq n 'bignum) (eq n 'bit)
+         (eq n 'ratio) (eq n 'single-float) (eq n 'double-float)
+         (eq n 'short-float) (eq n 'long-float) (eq n 'complex)
+         (eq n 'unsigned-byte) (eq n 'signed-byte))
+     ':number)
+    ((or (eq n 'character) (eq n 'base-char) (eq n 'standard-char)
+         (eq n 'extended-char))
+     ':character)
+    ;; array/string family
+    ((or (eq n 'array) (eq n 'simple-array) (eq n 'vector)
+         (eq n 'simple-vector) (eq n 'string) (eq n 'simple-string)
+         (eq n 'base-string) (eq n 'simple-base-string)
+         (eq n 'bit-vector) (eq n 'simple-bit-vector))
+     ':array)
+    ((or (eq n 'function) (eq n 'compiled-function) (eq n 'generic-function)
+         (eq n 'standard-generic-function))
+     ':function)
+    ((eq n 'hash-table) ':hash-table)
+    ((or (eq n 'package) (eq n 'package-error)) ':package-or-error)
+    ((eq n 'random-state) ':random-state)
+    ((or (eq n 'pathname) (eq n 'logical-pathname)) ':pathname)
+    ((or (eq n 'stream) (eq n 'broadcast-stream)
+         (eq n 'concatenated-stream) (eq n 'echo-stream)
+         (eq n 'file-stream) (eq n 'string-stream) (eq n 'synonym-stream)
+         (eq n 'two-way-stream))
+     ':stream)
+    ((eq n 'readtable) ':readtable)
+    (t nil)))
+
+(defun %disjoint-buckets-p (b1 b2)
+  "Two buckets are mutually disjoint if both are non-nil and not equal,
+   AND neither is :null (which is in both :symbol and :cons-or-list space).
+   Note: SEQUENCE intersects :array, :cons, :null."
+  (and b1 b2 (not (eq b1 b2))
+       (not (eq b1 ':null)) (not (eq b2 ':null))))
+
+(defun %array-elt-bucket (n)
+  "Sub-bucket within the :array family, by element type:
+   :char (strings), :bit (bit-vectors), :t (simple-vectors), :any (array, vector)."
+  (cond
+    ((or (eq n 'string) (eq n 'simple-string)
+         (eq n 'base-string) (eq n 'simple-base-string))
+     ':char)
+    ((or (eq n 'bit-vector) (eq n 'simple-bit-vector)) ':bit)
+    ((eq n 'simple-vector) ':t)
+    (t ':any)))   ; array, vector, simple-array — unknown elt-type
+
+(defun %array-elt-disjoint-p (a b)
+  "Within the :array bucket, two types are disjoint if they have
+   incompatible element-type fingerprints (excluding :any which is
+   compatible with anything)."
+  (let ((ea (%array-elt-bucket a)) (eb (%array-elt-bucket b)))
+    (and (not (eq ea ':any)) (not (eq eb ':any)) (not (eq ea eb)))))
+
+(defun %symbol-type-disjoint-p (a b)
+  "Definite-disjoint checker for two type-name symbols.
+   Returns T if they are provably disjoint, NIL otherwise."
+  (let ((ba (%type-bucket a)) (bb (%type-bucket b)))
+    (cond
+      ((%disjoint-buckets-p ba bb) t)
+      ;; Within :array bucket — element-type sub-disjoint
+      ((and (eq ba ':array) (eq bb ':array))
+       (%array-elt-disjoint-p a b))
+      (t nil))))
+
+;; --- Compound-type SUBTYPEP entry ---
+
+(defun %subtype-of-num (sub-type sup-type)
+  "Both SUB-TYPE and SUP-TYPE have a numeric head.
+   Wrap %sub-numeric-range, but also handle the common case where the
+   sub-type is a bounded numeric range and sup-type is a wider numeric
+   class symbol."
+  (%sub-numeric-range sub-type sup-type))
+
+(defun %subtypep-impl (t1 t2)
+  "Implementation of SUBTYPEP returning two values: SUB? VALID?"
+  (cond
+    ;; Trivial cases
+    ((eql t1 t2) (values t t))
+    ((null t1) (values t t))
+    ((eq t1 'nil) (values t t))
+    ((eq t2 't) (values t t))
+    ((eq t2 'nil)
+     ;; Subtype of NIL means empty type; only NIL satisfies that.
+     ;; If t1 is a known nonempty named type, return (NIL T).
+     (cond
+       ((symbolp t1)
+        (if (%type-known-p t1) (values nil t) (values nil nil)))
+       (t (values nil nil))))
+    ((eq t1 't)
+     ;; T is subtype only of T itself; t2 != t handled above.
+     ;; If t2 is a named non-T type we know is below T, definite NO.
+     (cond
+       ((symbolp t2)
+        (if (%type-known-p t2) (values nil t) (values nil nil)))
+       (t (values nil nil))))
+    ;; Both simple symbols (and not handled above)
+    ((and (symbolp t1) (symbolp t2))
+     (cond
+       ;; Subtype walk
+       ((%has-supertype-p t1 t2 30) (values t t))
+       ;; Disjoint?
+       ((%symbol-type-disjoint-p t1 t2) (values nil t))
+       (t (values nil nil))))
+    ;; t2 is a compound numeric range, t1 is a simple symbol or compound
+    ((and (consp t2)
+          (%numeric-range-type-p (car t2))
+          (or (symbolp t1) (and (consp t1) (%numeric-range-type-p (car t1)))))
+     (%sub-numeric-range t1 t2))
+    ;; t1 is a compound numeric range, t2 is a simple symbol
+    ((and (symbolp t2) (%numeric-range-type-p t2)
+          (consp t1) (%numeric-range-type-p (car t1)))
+     (%sub-numeric-range t1 t2))
+    ;; t1 is a numeric symbol, t2 is a non-numeric symbol — disjoint?
+    ((and (symbolp t1) (%numeric-range-type-p t1) (symbolp t2))
+     (cond
+       ((%has-supertype-p t1 t2 30) (values t t))
+       ((%symbol-type-disjoint-p t1 t2) (values nil t))
+       (t (values nil nil))))
+    ;; Compound t1 numeric range, t2 non-numeric
+    ((and (consp t1) (%numeric-range-type-p (car t1)) (symbolp t2))
+     (cond
+       ((%has-supertype-p (car t1) t2 30) (values t t))
+       ((%symbol-type-disjoint-p (car t1) t2) (values nil t))
+       (t (values nil nil))))
+    ;; (eql v) ⊆ T2 — handled below for type-name t2
+    ((and (consp t1) (eq (car t1) 'eql) (symbolp t2))
+     (cond
+       ((eq t2 't) (values t t))
+       ((typep (cadr t1) t2) (values t t))
+       ((%type-known-p t2) (values nil t))
+       (t (values nil nil))))
+    ;; (member v ...) ⊆ T2
+    ((and (consp t1) (eq (car t1) 'member) (symbolp t2))
+     (let ((all-in t) (vals (cdr t1)))
+       (dolist (v vals)
+         (unless (typep v t2) (setq all-in nil)))
+       (cond
+         (all-in (values t t))
+         ((%type-known-p t2) (values nil t))
+         (t (values nil nil)))))
+    ;; (and ...) → if any sub of t2, then (and ...) is too
+    ((and (consp t1) (eq (car t1) 'and))
+     ;; (AND t a b) ⊆ T2 if any of a,b ⊆ T2
+     (let ((some-yes nil))
+       (dolist (s (cdr t1))
+         (multiple-value-bind (sub valid) (%subtypep-impl s t2)
+           (when (and valid sub) (setq some-yes t))))
+       (cond
+         (some-yes (values t t))
+         (t (values nil nil)))))
+    ;; (or A B ...) ⊆ T2 iff each of A,B ⊆ T2
+    ((and (consp t1) (eq (car t1) 'or))
+     (let ((all-yes t) (any-no nil))
+       (dolist (s (cdr t1))
+         (multiple-value-bind (sub valid) (%subtypep-impl s t2)
+           (cond
+             ((not valid) (setq all-yes nil))
+             ((not sub) (setq all-yes nil) (setq any-no t)))))
+       (cond
+         (all-yes (values t t))
+         (any-no  (values nil nil))   ; some element failed — could still be yes via covering
+         (t (values nil nil)))))
+    ;; T1 ⊆ (or A B ...) — yes if T1 ⊆ any of A,B
+    ((and (consp t2) (eq (car t2) 'or))
+     (let ((some-yes nil))
+       (dolist (s (cdr t2))
+         (multiple-value-bind (sub valid) (%subtypep-impl t1 s)
+           (when (and valid sub) (setq some-yes t))))
+       (cond
+         (some-yes (values t t))
+         (t (values nil nil)))))
+    ;; T1 ⊆ (and A B ...) — yes if T1 ⊆ each of A,B
+    ((and (consp t2) (eq (car t2) 'and))
+     (let ((all-yes t))
+       (dolist (s (cdr t2))
+         (multiple-value-bind (sub valid) (%subtypep-impl t1 s)
+           (unless (and valid sub) (setq all-yes nil))))
+       (cond
+         (all-yes (values t t))
+         (t (values nil nil)))))
+    ;; Default: don't know
+    (t (values nil nil))))
+
+(defun subtypep (t1 t2 &rest args)
+  "Two-value SUBTYPEP per ANSI: returns (sub valid).
+   Conservative — returns (NIL NIL) when uncertain."
+  (declare (ignore args))
+  (%subtypep-impl t1 t2))
 ;; Minimal stub: ANSI returns 3 values (lambda-expr closure-p name).
 ;; Returning (NIL NIL NIL) at least lets length-checking tests pass.
 (defun function-lambda-expression (fn) (values nil nil nil))

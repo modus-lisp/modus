@@ -4487,6 +4487,19 @@
           ((= hash 448736678201786992)     ; IF
            (or (and (caddr form) (tail-form-is-values-p (list (caddr form))))
                (and (cadddr form) (tail-form-is-values-p (list (cadddr form))))))
+          ;; cond — check the body of each clause (last expression)
+          ;; Hash for COND.  We compute it dynamically on first use.
+          ((= hash (compute-name-hash "COND"))
+           (let ((any-yes nil))
+             (dolist (clause (cdr form))
+               (when (and (consp clause) (cdr clause)
+                          (tail-form-is-values-p (cdr clause)))
+                 (setq any-yes t)))
+             any-yes))
+          ;; when/unless — body returns (values ...) if its last form does
+          ((or (= hash (compute-name-hash "WHEN"))
+               (= hash (compute-name-hash "UNLESS")))
+           (tail-form-is-values-p (cddr form)))
           (t nil))))))
 
 (defun compile-multiple-value-list (form env dest)

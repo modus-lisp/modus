@@ -2851,7 +2851,7 @@
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
-  (let ((path "/tmp/modus-ansi-test-PROGV"))
+  (let ((path "/tmp/modus-ansi-test"))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

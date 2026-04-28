@@ -942,3 +942,60 @@
 
 (defun documentation (obj doc-type) nil)
 
+;;; ============================================================
+;;; PROGV runtime support
+;;; ============================================================
+;;;
+;;; PROGV needs to dynamically bind a list of vars to a list of vals,
+;;; run a body, and restore the previous values on (any) exit. The
+;;; compile-time expansion in compiler.lisp wraps the body in
+;;; unwind-protect and uses these helpers for save/set/restore.
+;;;
+;;; Each "var" in the var-list is a symbol designator. We canonicalize
+;;; to a name-hash (the same key the global alist at #x10000080 uses),
+;;; so the same key is used in save and restore.
+
+(defun %progv-hash (sym)
+  "Canonicalize a symbol designator to a name-hash key."
+  (cond
+    ((integerp sym) sym)
+    ((%cl-sym-p sym) (compute-name-hash (%cl-sym-name sym)))
+    ((stringp sym) (compute-name-hash sym))
+    ;; Native MVM symbol: hash already lives in slot 0.
+    ((and (not (consp sym)) (not (null sym)) (not (characterp sym))
+          (= (obj-subtag sym) 80))
+     (aref sym 0))
+    (t 0)))
+
+(defun %progv-save (vars)
+  "For each VAR in VARS, return (hash . current-value) pairs.
+   Order is preserved (we will restore in this order at exit)."
+  (let ((result nil) (cur vars))
+    (loop
+      (when (null cur) (return (nreverse result)))
+      (let ((h (%progv-hash (car cur))))
+        (setq result (cons (cons h (symbol-value h)) result)))
+      (setq cur (cdr cur)))))
+
+(defun %progv-set (vars vals)
+  "Assign successive VARS to successive VALS via set-symbol-value.
+   Stops when either list is exhausted; extras on either side are ignored.
+   Vars without a corresponding val keep their saved value (an
+   approximation of full ANSI 'makunbound' semantics)."
+  (let ((vc vars) (vlc vals))
+    (loop
+      (when (null vc) (return nil))
+      (when (null vlc) (return nil))
+      (set-symbol-value (%progv-hash (car vc)) (car vlc))
+      (setq vc (cdr vc))
+      (setq vlc (cdr vlc)))))
+
+(defun %progv-restore (saves)
+  "Restore values saved by %progv-save."
+  (let ((cur saves))
+    (loop
+      (when (null cur) (return nil))
+      (let ((p (car cur)))
+        (set-symbol-value (car p) (cdr p)))
+      (setq cur (cdr cur)))))
+

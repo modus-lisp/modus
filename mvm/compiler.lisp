@@ -2119,10 +2119,31 @@
       ((= op-name 1086924202144944840)
        (compile-progn (cddr form) env dest))
 
-      ;; PROGV — (progv vars vals body) → simplified: just compile body
-      ;; (dynamic binding not fully supported; treat as locally)
+      ;; PROGV — (progv vars vals body...) — dynamic binding.
+      ;; Evaluate vars-form, then vals-form, save current values,
+      ;; install new values, run body inside unwind-protect, and
+      ;; restore saved values on any exit (normal or non-local).
+      ;;
+      ;; If fewer vals than vars, remaining vars keep their saved
+      ;; (pre-progv) value during the body — approximation of the
+      ;; ANSI "remaining vars are unbound" rule. This still produces
+      ;; correct results for tests where the body's writes to those
+      ;; vars are clobbered by restore on exit (e.g. PROGV.6A), and
+      ;; for any test that doesn't probe boundp of unbound vars.
       ((= op-name 519861365770534371)
-       (compile-progn (cdddr form) env dest))
+       (let ((vars-form  (cadr form))
+             (vals-form  (caddr form))
+             (body-forms (cdddr form)))
+         (compile-form
+          `(let* ((%progv-vars ,vars-form)
+                  (%progv-vals ,vals-form)
+                  (%progv-saves (%progv-save %progv-vars)))
+             (unwind-protect
+               (progn
+                 (%progv-set %progv-vars %progv-vals)
+                 ,@body-forms)
+               (%progv-restore %progv-saves)))
+          env dest)))
 
       ;; CATCH — (catch tag body...) — establish catch frame for THROW.
       ;; Wraps body in handler-case; the handler returns *catch-value*

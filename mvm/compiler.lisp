@@ -6396,12 +6396,18 @@
 ;;; with default value initialization code prepended to the body.
 
 (defun preprocess-params (params body)
-  "Transform a CL parameter list with &optional/&key into simple required params.
-   Returns (cons new-params new-body)."
+  "Transform a CL parameter list with &optional/&key/&aux into simple
+   required params.  Returns (cons new-params new-body).
+
+   &aux is handled by wrapping the body in a let* — init forms execute
+   inside the function's implicit block, so a (return-from FOO X) in
+   an &aux init form exits FOO with X (used by ANSI tests like FLET.6
+   where a `:fail-not-array' branch returns from the function early)."
   (let ((mode :required)
         (required nil)
         (optional nil)
         (keys nil)
+        (auxes nil)
         (has-rest nil))
     ;; Parse parameter list
     (dolist (p params)
@@ -6410,6 +6416,7 @@
         ((eq p '&key)      (setq mode :key))
         ((eq p '&rest)     (setq mode :rest) (setq has-rest t))
         ((eq p '&body)     (setq mode :rest) (setq has-rest t))
+        ((eq p '&aux)      (setq mode :aux))
         ((eq p '&allow-other-keys) nil) ; skip
         ((eq mode :required) (push p required))
         ((eq mode :optional)
@@ -6420,14 +6427,19 @@
          (if (consp p)
              (push (list (car p) (cadr p)) keys)
              (push (list p nil) keys)))
+        ((eq mode :aux)
+         (if (consp p)
+             (push (list (car p) (cadr p)) auxes)
+             (push (list p nil) auxes)))
         ((eq mode :rest)
          ;; &rest param — just treat as regular param for now
          (push p required))))
     (setf required (nreverse required))
     (setf optional (nreverse optional))
     (setf keys (nreverse keys))
-    ;; If no &optional, &key, or &rest, return unchanged
-    (if (and (null optional) (null keys) (not has-rest))
+    (setf auxes (nreverse auxes))
+    ;; If no &optional, &key, &rest, or &aux, return unchanged
+    (if (and (null optional) (null keys) (null auxes) (not has-rest))
         (cons params body)
         ;; Build new parameter list: required + optional param names + key
         ;; param names.  Order MUST be (required..., optional..., keys...) —
@@ -6442,6 +6454,12 @@
                                   (mapcar #'car optional)
                                   (mapcar #'car keys)))
               (new-body body))
+          ;; Wrap body in let* for &aux bindings.  Init forms run after
+          ;; required/optional/key bindings; return-from inside an init
+          ;; exits the surrounding function (implicit block).
+          (when auxes
+            (setf new-body
+                  `((let* ,auxes ,@new-body))))
           ;; Prepend default value checks for optional params
           (let ((defaults nil))
             (dolist (opt optional)
@@ -6455,7 +6473,7 @@
                          (setq ,(car k) ,(cadr k)))
                       defaults)))
             (when defaults
-              (setf new-body (append (nreverse defaults) body))))
+              (setf new-body (append (nreverse defaults) new-body))))
           (cons new-params new-body)))))
 
 ;;; ============================================================

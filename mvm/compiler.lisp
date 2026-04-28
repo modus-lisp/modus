@@ -3412,14 +3412,16 @@
   (with-bindings nil))
 
 (defstruct loop-iter
-  kind            ; :from, :in, :across, :on, :general, :while, :repeat
+  kind            ; :from, :in, :across, :on, :general, :while, :repeat,
+                  ; :hash-keys, :hash-values, :pkg-symbols, :pkg-external,
+                  ; :pkg-present
   var             ; iteration variable
-  init-form       ; initial value
-  step-form       ; step expression
+  init-form       ; initial value (or source EXPR for :hash-* / :pkg-*)
+  step-form       ; step expression (or USING-var for :hash-* / :pkg-*)
   end-form        ; end value (for :from)
   end-test        ; :to, :below, :above, :downto (for :from)
   by-form         ; step amount (for :from)
-  list-var)       ; internal temp var (for :in, :on, :across)
+  list-var)       ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
 
 (defun %loop-try-into (rest)
   "If REST starts with INTO var [type], return (var . new-rest-after).
@@ -3636,6 +3638,70 @@
                                           :init-form init
                                           :step-form (or step init))
                           (loop-state-iterations state))))
+
+                 ;; FOR var BEING [THE | EACH] kind {OF | IN} expr [USING (k v)]
+                 ;;   kind ∈ {HASH-KEY[S], HASH-VALUE[S],
+                 ;;           SYMBOL[S], EXTERNAL-SYMBOL[S], PRESENT-SYMBOL[S]}
+                 ;; (USING (HASH-KEY var)/(HASH-VALUE var) binds the other half.)
+                 ((= iter-kw 31436867775890672)   ; BEING
+                  (setf rest (cdr rest))
+                  ;; Optional THE / EACH
+                  (when (and rest (symbolp (car rest))
+                             (or (= (normalize-name (car rest)) 977942333759456998)   ; THE
+                                 (= (normalize-name (car rest)) 1109496130581528424)));EACH
+                    (setf rest (cdr rest)))
+                  ;; Kind keyword
+                  (let ((kind-kw (and rest (symbolp (car rest))
+                                      (normalize-name (car rest))))
+                        (iter-kind nil))
+                    (cond
+                      ((or (= kind-kw 1147972382719290703)   ; HASH-KEY
+                           (= kind-kw 887827087004053180))   ; HASH-KEYS
+                       (setf iter-kind :hash-keys))
+                      ((or (= kind-kw 828835450700251691)    ; HASH-VALUE
+                           (= kind-kw 213861533733362616))   ; HASH-VALUES
+                       (setf iter-kind :hash-values))
+                      ((or (= kind-kw 414411792086412289)    ; SYMBOL
+                           (= kind-kw 1023250092332836994))  ; SYMBOLS
+                       (setf iter-kind :pkg-symbols))
+                      ((or (= kind-kw 872512145144985745)    ; EXTERNAL-SYMBOL
+                           (= kind-kw 593846167963712370))   ; EXTERNAL-SYMBOLS
+                       (setf iter-kind :pkg-external))
+                      ((or (= kind-kw 37498298314639895)     ; PRESENT-SYMBOL
+                           (= kind-kw 412098041472307620))   ; PRESENT-SYMBOLS
+                       (setf iter-kind :pkg-present))
+                      (t
+                       (format t "  WARN: unknown BEING kind ~A~%" kind-kw)))
+                    (when iter-kind
+                      (setf rest (cdr rest))
+                      ;; Optional OF | IN expr.  (If omitted for symbol-iter,
+                      ;; expr defaults to *package*.)
+                      (let ((src-form nil))
+                        (when (and rest (symbolp (car rest))
+                                   (or (= (normalize-name (car rest)) 160211188404669686) ; OF
+                                       (= (normalize-name (car rest)) 592855328021284152)));IN
+                          (setf rest (cdr rest))
+                          (setf src-form (car rest))
+                          (setf rest (cdr rest)))
+                        (when (and (null src-form)
+                                   (member iter-kind
+                                           '(:pkg-symbols :pkg-external :pkg-present)))
+                          (setf src-form '*package*))
+                        ;; Optional USING (HASH-KEY var) / (HASH-VALUE var)
+                        (let ((using-var nil))
+                          (when (and rest (symbolp (car rest))
+                                     (= (normalize-name (car rest)) 328151623910292473))
+                            (setf rest (cdr rest))
+                            (let ((u-spec (car rest)))
+                              (setf rest (cdr rest))
+                              (when (consp u-spec)
+                                (setf using-var (cadr u-spec)))))
+                          (push (make-loop-iter
+                                 :kind iter-kind :var var
+                                 :init-form src-form
+                                 :step-form using-var
+                                 :list-var (gensym "BNG"))
+                                (loop-state-iterations state)))))))
 
                  (t
                   ;; Unknown FOR clause — skip it as body form
@@ -3979,7 +4045,81 @@
            (push (list var (loop-iter-init-form iter)) bindings)
            ;; %loop-le handles float/ratio bounds without hanging.
            (push `(if (%loop-le ,var 0) (return nil)) test-forms)
-           (push `(setq ,var (- ,var 1)) step-stmts)))))
+           (push `(setq ,var (- ,var 1)) step-stmts)))
+
+        ;; FOR var BEING THE HASH-KEY[S] OF ht [USING (HASH-VALUE v)]
+        ;; Walks the alist that backs HT (`(car ht)` is `((k . v) ...)`),
+        ;; binding VAR to each key.  USING-var, when given, is bound to
+        ;; the matching value via the same pair.
+        (:hash-keys
+         (let ((var (loop-iter-var iter))
+               (using (loop-iter-step-form iter))
+               (alist (loop-iter-list-var iter))
+               (pair-var (gensym "HP")))
+           (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
+           (push (list var nil) bindings)
+           (when using (push (list using nil) bindings))
+           (push (list pair-var nil) bindings)
+           (push `(if (null ,alist) (return nil)) test-forms)
+           (push `(setq ,pair-var (car ,alist)) init-stmts)
+           (push `(setq ,var (car ,pair-var)) init-stmts)
+           (when using
+             (push `(setq ,using (cdr ,pair-var)) init-stmts))
+           (push `(setq ,alist (cdr ,alist)) step-stmts)))
+
+        ;; FOR var BEING THE HASH-VALUE[S] OF ht [USING (HASH-KEY k)]
+        (:hash-values
+         (let ((var (loop-iter-var iter))
+               (using (loop-iter-step-form iter))
+               (alist (loop-iter-list-var iter))
+               (pair-var (gensym "HP")))
+           (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
+           (push (list var nil) bindings)
+           (when using (push (list using nil) bindings))
+           (push (list pair-var nil) bindings)
+           (push `(if (null ,alist) (return nil)) test-forms)
+           (push `(setq ,pair-var (car ,alist)) init-stmts)
+           (push `(setq ,var (cdr ,pair-var)) init-stmts)
+           (when using
+             (push `(setq ,using (car ,pair-var)) init-stmts))
+           (push `(setq ,alist (cdr ,alist)) step-stmts)))
+
+        ;; FOR var BEING THE SYMBOL[S] OF pkg
+        ;; Use %do-symbols-fn-style materialization: collect all accessible
+        ;; symbols into a list once, then iterate.
+        (:pkg-symbols
+         (let ((var (loop-iter-var iter))
+               (lst (loop-iter-list-var iter)))
+           (push (list lst `(%loop-collect-symbols ,(loop-iter-init-form iter)))
+                 bindings)
+           (push (list var nil) bindings)
+           (push `(if (null ,lst) (return nil)) test-forms)
+           (push `(setq ,var (car ,lst)) init-stmts)
+           (push `(setq ,lst (cdr ,lst)) step-stmts)))
+
+        ;; FOR var BEING THE EXTERNAL-SYMBOL[S] OF pkg
+        (:pkg-external
+         (let ((var (loop-iter-var iter))
+               (lst (loop-iter-list-var iter)))
+           (push (list lst `(%loop-collect-external-symbols
+                             ,(loop-iter-init-form iter)))
+                 bindings)
+           (push (list var nil) bindings)
+           (push `(if (null ,lst) (return nil)) test-forms)
+           (push `(setq ,var (car ,lst)) init-stmts)
+           (push `(setq ,lst (cdr ,lst)) step-stmts)))
+
+        ;; FOR var BEING THE PRESENT-SYMBOL[S] OF pkg
+        (:pkg-present
+         (let ((var (loop-iter-var iter))
+               (lst (loop-iter-list-var iter)))
+           (push (list lst `(%loop-collect-present-symbols
+                             ,(loop-iter-init-form iter)))
+                 bindings)
+           (push (list var nil) bindings)
+           (push `(if (null ,lst) (return nil)) test-forms)
+           (push `(setq ,var (car ,lst)) init-stmts)
+           (push `(setq ,lst (cdr ,lst)) step-stmts)))))
 
     ;; Build accumulation body — one chunk per accumulator.
     (let ((acc-body nil)

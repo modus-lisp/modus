@@ -1896,9 +1896,19 @@
                                         (not (search "#<" s))
                                         (not (search "&ENVIRONMENT" s))
                                         (not (search "STRUCT-TEST-" s)))
+                               ;; ALSO emit root-level (%defpackage-impl ...)
+                               ;; calls into init-forms — they were previously
+                               ;; only being written as TOPLEVEL-N thunks, and
+                               ;; those thunks never run on bare metal (defvar
+                               ;; init thunks aren't run; same applies here).
+                               ;; We keep the top-level write so any compile-time
+                               ;; side effects stay in place.
                                (write-string s out)
                                (terpri out)
-                               (queue-defvar-setq form)))))))))
+                               (queue-defvar-setq form)
+                               (when (and (consp form)
+                                          (eq (car form) '%defpackage-impl))
+                                 (push s init-forms))))))))))
               ;; Emit run-init-X — a separate function holding ONLY the init
               ;; forms (defclass / defmethod / setq for defvar's value, etc.).
               ;; run-real-ansi-tests now calls all run-init-* in the PARENT

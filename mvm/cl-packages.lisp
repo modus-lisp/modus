@@ -927,6 +927,34 @@
         (%do-symbols-fn #'%collect-sym pkg)
         *%sym-list*))))
 
+;;; --- LOOP `being the SYMBOL[S]/EXTERNAL-SYMBOL[S]/PRESENT-SYMBOL[S] of pkg`
+;;; helpers.  The compiler emits a call to one of these to materialize the
+;;; symbol list before iteration; bare-metal code can't host a closure-based
+;;; iterator state.
+
+(defun %loop-collect-symbols (pkg)
+  "All symbols accessible in PKG (internal + external + inherited)."
+  (setq *%sym-list* nil)
+  (%do-symbols-fn #'%collect-sym pkg)
+  *%sym-list*)
+
+(defun %loop-collect-external-symbols (pkg)
+  "External symbols of PKG."
+  (setq *%sym-list* nil)
+  (%do-external-symbols-fn #'%collect-sym pkg)
+  *%sym-list*)
+
+(defun %loop-collect-present-symbols (pkg)
+  "Present (= directly interned: internal + external) symbols of PKG."
+  (let ((p (%resolve-package pkg))
+        (acc nil))
+    (when p
+      (dolist (entry (%pkg-internal p))
+        (setq acc (cons (cdr entry) acc)))
+      (dolist (entry (%pkg-external p))
+        (setq acc (cons (cdr entry) acc))))
+    acc))
+
 (defun collect-external-symbols (pkg)
   "Collect external symbols in PKG, sorted."
   (remove-duplicates

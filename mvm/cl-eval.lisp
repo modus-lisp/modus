@@ -957,6 +957,12 @@
   (puthash "FDEFINITION" ht #'fdefinition)
   (puthash "INTERN" ht #'intern)
   (puthash "FIND-SYMBOL" ht #'find-symbol)
+  ;; Helpers used by `loop … being the SYMBOLS/EXTERNAL-SYMBOLS/PRESENT-SYMBOLS
+  ;; of pkg`.  expand-cl-loop emits a call to these to materialize the symbol
+  ;; list before iterating; they need to be eval-callable at runtime.
+  (puthash "%LOOP-COLLECT-SYMBOLS" ht #'%loop-collect-symbols)
+  (puthash "%LOOP-COLLECT-EXTERNAL-SYMBOLS" ht #'%loop-collect-external-symbols)
+  (puthash "%LOOP-COLLECT-PRESENT-SYMBOLS" ht #'%loop-collect-present-symbols)
   (puthash "KEYWORDP" ht #'keywordp)
   (puthash "GENSYM" ht #'gensym)
   (puthash "ENDP" ht #'endp)

@@ -482,13 +482,68 @@
 (defvar *is-eql-p-item* nil)
 (defun is-eql-p (x) (%make-closure #'closure-eql-fn (cons x nil)))
 (defun is-not-eql-p (x) (%make-closure #'closure-not-eql-fn (cons x nil)))
-(defun sort (seq pred &rest options) (declare (ignore options)) (if (or (null seq) (null (cdr seq))) seq
-  (let ((result (list (car seq)))) (dolist (item (cdr seq))
-    (if (funcall pred item (car result)) (setq result (cons item result))
-      (let ((prev result)) (loop (when (null (cdr prev)) (set-cdr prev (list item)) (return nil))
-        (when (funcall pred item (cadr prev)) (set-cdr prev (cons item (cdr prev))) (return nil))
-        (setq prev (cdr prev)))))) result)))
-(defun stable-sort (seq pred) (sort seq pred))
+(defun %sort-list (seq pred key)
+  ;; Insertion sort over a list — destructive on the spine of result.
+  (if (or (null seq) (null (cdr seq)))
+      seq
+      (let ((result (list (car seq))))
+        (dolist (item (cdr seq))
+          (let ((iv (if key (funcall key item) item))
+                (rv (if key (funcall key (car result)) (car result))))
+            (if (funcall pred iv rv)
+                (setq result (cons item result))
+                (let ((prev result))
+                  (loop
+                    (when (null (cdr prev))
+                      (set-cdr prev (list item)) (return nil))
+                    (let ((nv (if key (funcall key (cadr prev)) (cadr prev))))
+                      (when (funcall pred iv nv)
+                        (set-cdr prev (cons item (cdr prev)))
+                        (return nil)))
+                    (setq prev (cdr prev)))))))
+        result)))
+
+(defun %sort-vector (seq pred key)
+  ;; Insertion sort over a vector, in-place.  Walk i from 1 to len-1;
+  ;; for each, slide it left while predicate(i, j-1) holds.
+  (let ((len (array-length seq)))
+    (let ((i 1))
+      (loop
+        (when (>= i len) (return seq))
+        (let ((j i))
+          (loop
+            (when (= j 0) (return nil))
+            (let* ((a (aref seq j))
+                   (b (aref seq (- j 1)))
+                   (av (if key (funcall key a) a))
+                   (bv (if key (funcall key b) b)))
+              (if (funcall pred av bv)
+                  (progn (aset seq j b) (aset seq (- j 1) a)
+                         (setq j (- j 1)))
+                  (return nil)))))
+        (setq i (+ i 1))))))
+
+(defun sort (seq pred &rest options)
+  ;; Honors :key.  Dispatches list vs vector.
+  (let ((key nil) (a options))
+    (loop (when (null a) (return))
+      (when (eq (car a) :key) (setq key (cadr a)))
+      (setq a (cddr a)))
+    (cond
+      ((null seq) seq)
+      ((consp seq) (%sort-list seq pred key))
+      (t (%sort-vector seq pred key)))))
+
+(defun stable-sort (seq pred &rest options)
+  ;; Insertion sort is naturally stable; same impl.
+  (let ((key nil) (a options))
+    (loop (when (null a) (return))
+      (when (eq (car a) :key) (setq key (cadr a)))
+      (setq a (cddr a)))
+    (cond
+      ((null seq) seq)
+      ((consp seq) (%sort-list seq pred key))
+      (t (%sort-vector seq pred key)))))
 ;; Internal helpers: build a sequence of the same shape (list -> list,
 ;; string -> string, array -> array) by applying TRANSFORM to each element.
 (defun %seq-substitute-with (transform seq)
@@ -1253,6 +1308,32 @@
     (t                  (not (apply #'some pred seq more)))))
 
 ;;; Set/list operations
+;; ANSI: (tree-equal x y &key test test-not)
+;; Recursive structural equality using TEST (default eql) for leaves.
+;; Conses are equal iff cars are tree-equal AND cdrs are tree-equal.
+(defun tree-equal (a b &rest args)
+  (let ((test nil) (test-not nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :test) (setq test v))
+          ((eq k :test-not) (setq test-not v))))
+      (setq cur (cddr cur)))
+    (when test-not
+      (let ((tn test-not))
+        (setq test (lambda (x y) (not (funcall tn x y))))))
+    (%tree-equal-rec a b test)))
+
+(defun %tree-equal-rec (a b test)
+  (cond
+    ((and (consp a) (consp b))
+     (if (%tree-equal-rec (car a) (car b) test)
+         (%tree-equal-rec (cdr a) (cdr b) test)
+         nil))
+    ((or (consp a) (consp b)) nil)
+    (t (if test (funcall test a b) (eql a b)))))
+
 (defun adjoin (item list &rest args)
   "Add ITEM to LIST if not already present."
   (let* ((parsed (parse-test-key args))
@@ -1758,11 +1839,18 @@
                   (if from-end (setq result i) (return i))))
               (setq i (+ i 1))))))))
 
-;; complement: (complement #'pred) returns a function that negates pred.
-;; Defined for 0/1/2-arg cases; CL allows any arity but this covers the
-;; common test patterns ((complement #'eql) for sequence ops).
+;; complement: (complement #'pred) returns a function that negates pred,
+;; accepting any number of arguments (ANSI requirement).  We dispatch
+;; manually for 0/1/2/3 args to avoid the (apply fn args) path inside
+;; an inner lambda, which is fragile in MVM.
 (defun complement (fn)
-  (lambda (a b) (not (funcall fn a b))))
+  (lambda (&rest args)
+    (cond
+      ((null args)            (not (funcall fn)))
+      ((null (cdr args))      (not (funcall fn (car args))))
+      ((null (cddr args))     (not (funcall fn (car args) (cadr args))))
+      ((null (cdddr args))    (not (funcall fn (car args) (cadr args) (caddr args))))
+      (t                      (not (apply fn args))))))
 
 (defun search (seq1 seq2 &rest args)
   "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.

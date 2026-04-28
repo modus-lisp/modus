@@ -1479,30 +1479,68 @@
           (t nil)))
       nil))
 
+;; ANSI: (write-string str &optional stream &key start end)
+;; Honor :start/:end for substring writes.
 (defun write-string (str &rest args)
-  (let ((s (%resolve-output-stream (if args (car args) nil))))
-    (if (and (streamp s) (not (= (%stream-type s) 8)))
-        (let ((len (length str)) (i 0))
-          (loop
-            (when (>= i len) (return nil))
-            (%write-char-to-stream (aref str i) s)
-            (setq i (+ i 1))))
-        (write-string-serial str)))
+  (let ((stream-arg (if args (car args) nil))
+        (start 0)
+        (end nil))
+    ;; Parse keyword args from args[1..] (post-stream).
+    (let ((cur (if args (cdr args) nil)))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :start) (setq start v))
+            ((eq k :end)   (setq end v))))
+        (setq cur (cddr cur))))
+    (let* ((s (%resolve-output-stream stream-arg))
+           (len (length str))
+           (eff-end (if end end len)))
+      (if (and (streamp s) (not (= (%stream-type s) 8)))
+          (let ((i start))
+            (loop
+              (when (>= i eff-end) (return nil))
+              (%write-char-to-stream (aref str i) s)
+              (setq i (+ i 1))))
+          ;; Serial fallback only handles whole-string writes; emulate.
+          (let ((i start))
+            (loop
+              (when (>= i eff-end) (return nil))
+              (write-char-serial (aref str i))
+              (setq i (+ i 1)))))))
   str)
 
 (defun write-line (str &rest args)
-  (let ((s (%resolve-output-stream (if args (car args) nil))))
-    (if (and (streamp s) (not (= (%stream-type s) 8)))
-        (progn
-          (let ((len (length str)) (i 0))
-            (loop
-              (when (>= i len) (return nil))
-              (%write-char-to-stream (aref str i) s)
-              (setq i (+ i 1))))
-          (%write-char-to-stream 10 s))
-        (progn
-          (write-string-serial str)
-          (write-char-serial 10))))
+  (let ((stream-arg (if args (car args) nil))
+        (start 0)
+        (end nil))
+    (let ((cur (if args (cdr args) nil)))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :start) (setq start v))
+            ((eq k :end)   (setq end v))))
+        (setq cur (cddr cur))))
+    (let* ((s (%resolve-output-stream stream-arg))
+           (len (length str))
+           (eff-end (if end end len)))
+      (if (and (streamp s) (not (= (%stream-type s) 8)))
+          (progn
+            (let ((i start))
+              (loop
+                (when (>= i eff-end) (return nil))
+                (%write-char-to-stream (aref str i) s)
+                (setq i (+ i 1))))
+            (%write-char-to-stream 10 s))
+          (progn
+            (let ((i start))
+              (loop
+                (when (>= i eff-end) (return nil))
+                (write-char-serial (aref str i))
+                (setq i (+ i 1))))
+            (write-char-serial 10)))))
   str)
 
 (defun %ensure-char-code (x)

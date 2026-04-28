@@ -632,8 +632,20 @@
       (setq cur (cdr cur)))))
 
 (defun member-if-not (pred list &rest args)
-  "Return first tail of LIST whose car does NOT satisfy PRED."
-  (apply #'member-if (lambda (x) (not (funcall pred x))) list args))
+  "Return first tail of LIST whose car does NOT satisfy PRED.  Inlined
+   instead of `(apply #'member-if (lambda ...) ...)' to avoid the
+   apply-of-rest-through-sibling-defun fragility."
+  (unless (listp list)
+    (error "member-if-not: not a list ~S" list))
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur list))
+    (loop
+      (when (null cur) (return nil))
+      (when (atom cur) (return nil))
+      (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
+        (unless (funcall pred k) (return cur)))
+      (setq cur (cdr cur)))))
 
 ;;; ============================================================
 ;;; ANSI test helper cons functions (from cons-aux.lsp)

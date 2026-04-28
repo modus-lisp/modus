@@ -26,16 +26,21 @@
               (let ((result (funcall fn (aref seq i))))
                 (when result (return result)))
               (setq i (+ i 1)))))))
-    ;; Two-sequence fast path.
-    ((null (cdr more-seqs))
+    ;; Two-sequence fast path for two LISTS.
+    ((and (null (cdr more-seqs))
+          (or (consp seq) (null seq))
+          (or (consp (car more-seqs)) (null (car more-seqs))))
      (let ((cur1 seq) (cur2 (car more-seqs)))
        (loop
          (when (or (null cur1) (null cur2)) (return nil))
          (let ((r (funcall fn (car cur1) (car cur2))))
            (when r (return r)))
          (setq cur1 (cdr cur1)) (setq cur2 (cdr cur2)))))
-    ;; Three-sequence fast path.
-    ((null (cddr more-seqs))
+    ;; Three-sequence fast path for three LISTS.
+    ((and (null (cddr more-seqs))
+          (or (consp seq) (null seq))
+          (or (consp (car more-seqs)) (null (car more-seqs)))
+          (or (consp (cadr more-seqs)) (null (cadr more-seqs))))
      (let ((c1 seq) (c2 (car more-seqs)) (c3 (cadr more-seqs)))
        (loop
          (when (or (null c1) (null c2) (null c3)) (return nil))
@@ -79,15 +84,21 @@
               (when (>= i len) (return t))
               (when (null (funcall fn (aref seq i))) (return nil))
               (setq i (+ i 1)))))))
-    ;; Two-sequence fast path — common in tests, avoids apply.
-    ((null (cdr more-seqs))
+    ;; Two-sequence fast path for two LISTS (skip if either is non-list,
+    ;; e.g., a vector — fall through to the general path below).
+    ((and (null (cdr more-seqs))
+          (or (consp seq) (null seq))
+          (or (consp (car more-seqs)) (null (car more-seqs))))
      (let ((cur1 seq) (cur2 (car more-seqs)))
        (loop
          (when (or (null cur1) (null cur2)) (return t))
          (when (null (funcall fn (car cur1) (car cur2))) (return nil))
          (setq cur1 (cdr cur1)) (setq cur2 (cdr cur2)))))
-    ;; Three-sequence fast path.
-    ((null (cddr more-seqs))
+    ;; Three-sequence fast path for three LISTS.
+    ((and (null (cddr more-seqs))
+          (or (consp seq) (null seq))
+          (or (consp (car more-seqs)) (null (car more-seqs)))
+          (or (consp (cadr more-seqs)) (null (cadr more-seqs))))
      (let ((c1 seq) (c2 (car more-seqs)) (c3 (cadr more-seqs)))
        (loop
          (when (or (null c1) (null c2) (null c3)) (return t))

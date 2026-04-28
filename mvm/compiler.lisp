@@ -3173,7 +3173,9 @@
   (let* ((rest-pos      (position '&rest params))
          (pp            (preprocess-params params body))
          (actual-params (car pp))
-         (actual-body   (cdr pp))
+         (actual-body   (cadr pp))
+         (opt-start     (caddr pp))
+         (opt-count     (cadddr pp))
          (rest-slot     (when rest-pos
                           ;; After preprocess-params, &rest is gone but
                           ;; the rest param sits at position rest-pos
@@ -3191,7 +3193,7 @@
         (let* ((lambda-name (format nil "~A$$LAMBDA~D"
                                      (or *current-function-name* "ANON")
                                      (make-compiler-label)))
-               (result (mvm-compile-function-internal lambda-name actual-params actual-body env rest-slot))
+               (result (mvm-compile-function-internal lambda-name actual-params actual-body env rest-slot opt-start opt-count))
                (info (car result)))
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
@@ -3218,7 +3220,7 @@
                (wrapped-body `((let* ,all-bindings ,@actual-body)))
                ;; Compile the closure function (NO parent-env — captured vars
                ;; are loaded as locals from the closure env at entry)
-               (result (mvm-compile-function-internal lambda-name actual-params wrapped-body nil rest-slot))
+               (result (mvm-compile-function-internal lambda-name actual-params wrapped-body nil rest-slot opt-start opt-count))
                (info (car result)))
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
@@ -3273,7 +3275,7 @@
              (body-env (if labels-p flet-env env))
              (rest-pos (position '&rest params))
              (pp (preprocess-params params fbody))
-             (result (mvm-compile-function-internal unique-name (car pp) (cdr pp) body-env rest-pos))
+             (result (mvm-compile-function-internal unique-name (car pp) (cadr pp) body-env rest-pos (caddr pp) (cadddr pp)))
              (info (car result)))
         (declare (ignore local-key))
         ;; Register with unique name
@@ -6447,7 +6449,13 @@
 
 (defun preprocess-params (params body)
   "Transform a CL parameter list with &optional/&key/&aux into simple
-   required params.  Returns (cons new-params new-body).
+   required params.  Returns (list new-params new-body optional-start
+   optional-count) — optional-start is the slot index in new-params
+   where &optional params begin (or nil if there are none), and
+   optional-count is the number of &optional params.  The trailing
+   slots are needed by mvm-compile-function-internal so the prologue
+   can NIL-init optional slots that the caller didn't supply (otherwise
+   the slot retains the stale outgoing-arg register from the caller).
 
    &aux is handled by wrapping the body in a let* — init forms execute
    inside the function's implicit block, so a (return-from FOO X) in
@@ -6490,7 +6498,7 @@
     (setf auxes (nreverse auxes))
     ;; If no &optional, &key, &rest, or &aux, return unchanged
     (if (and (null optional) (null keys) (null auxes) (not has-rest))
-        (cons params body)
+        (list params body nil 0)
         ;; Build new parameter list: required + optional param names + key
         ;; param names.  Order MUST be (required..., optional..., keys...) —
         ;; pushing keys (as a previous version did) reverses them and
@@ -6500,10 +6508,12 @@
         ;; were (test-not test x y), so calling (nunion-with-copy lst nil)
         ;; landed `lst' in test-not and `nil' in test, leaving x and y
         ;; with garbage from the caller's outgoing-arg registers.
-        (let ((new-params (append required
-                                  (mapcar #'car optional)
-                                  (mapcar #'car keys)))
-              (new-body body))
+        (let* ((new-params (append required
+                                   (mapcar #'car optional)
+                                   (mapcar #'car keys)))
+               (optional-start (when optional (length required)))
+               (optional-count (length optional))
+               (new-body body))
           ;; Wrap body in let* for &aux bindings.  Init forms run after
           ;; required/optional/key bindings; return-from inside an init
           ;; exits the surrounding function (implicit block).
@@ -6524,7 +6534,7 @@
                       defaults)))
             (when defaults
               (setf new-body (append (nreverse defaults) new-body))))
-          (cons new-params new-body)))))
+          (list new-params new-body optional-start optional-count)))))
 
 ;;; ============================================================
 ;;; Phase 2.5: Internal Function Compilation
@@ -6607,7 +6617,65 @@
       (free-temp-reg)   ; cmp-reg
       (free-temp-reg)))) ; nargs-reg
 
-(defun mvm-compile-function-internal (name params body &optional parent-env rest-slot)
+(defun emit-optional-prologue (opt-start opt-count)
+  "Emit IR that NIL-initializes &optional slots the caller didn't supply.
+
+   After preprocess-params, slots [opt-start .. opt-start+opt-count-1]
+   hold &optional params.  But the function-entry prologue already
+   stored the incoming arg registers (V0..V3) into those slots
+   unconditionally — so a slot the caller didn't pass for now contains
+   stale outgoing-arg register data.  This function emits, for each
+   optional slot i, code equivalent to:
+       if nargs <= i then slot[i] := NIL
+
+   This makes the existing default-init thunks (which check
+   `(when (null OPT) (setq OPT default))') see NIL when the caller
+   didn't supply the value.
+
+   Caller convention: compile-funcall always writes actual nargs.
+   compile-call writes actual nargs for non-rest direct calls (and pads
+   the args with NIL for missing optionals), and writes the 255 sentinel
+   when it pre-packed the &rest list.  In the sentinel case the caller
+   supplied only required-args + packed-rest-list, so ALL optional slots
+   are unsupplied and we NIL-init them unconditionally."
+  (when (and opt-start opt-count (> opt-count 0))
+    (let ((nargs-reg     (alloc-temp-reg))
+          (cmp-reg       (alloc-temp-reg))
+          (skip-all      (make-compiler-label))
+          (after-sentinel (make-compiler-label))
+          (sentinel-tag  (ash 255 +fixnum-shift+)))
+      ;; Read nargs (already tagged by :get-nargs translator).
+      (emit-ir :get-nargs nargs-reg)
+      ;; Sentinel check: if nargs == 255 the caller pre-packed for &rest
+      ;; and did NOT pad optional slots — NIL-init them all.
+      (emit-ir :li cmp-reg sentinel-tag)
+      (emit-ir :cmp nargs-reg cmp-reg)
+      (emit-ir :bne after-sentinel)
+      (loop for i from opt-start
+            below (min (+ opt-start opt-count) +max-reg-args+)
+            do (emit-ir :stack-store +vreg-vn+ i))
+      (emit-ir :br skip-all)
+      (emit-ir-label after-sentinel)
+      ;; Non-sentinel path: per-slot conditional NIL-init.  We only
+      ;; handle slots within +max-reg-args+ — beyond that the caller
+      ;; pushed args directly onto our stack frame and we have no way
+      ;; to "untouch" them.
+      (loop for i from opt-start
+            below (min (+ opt-start opt-count) +max-reg-args+)
+            do
+            (let ((skip-slot (make-compiler-label)))
+              ;; If nargs >= i+1 then the slot was supplied — skip NIL-init.
+              (emit-ir :li cmp-reg (ash (+ i 1) +fixnum-shift+))
+              (emit-ir :cmp nargs-reg cmp-reg)
+              (emit-ir :bge skip-slot)
+              ;; nargs < i+1 — slot i was not supplied.  Write NIL.
+              (emit-ir :stack-store +vreg-vn+ i)
+              (emit-ir-label skip-slot)))
+      (emit-ir-label skip-all)
+      (free-temp-reg)   ; cmp-reg
+      (free-temp-reg)))) ; nargs-reg
+
+(defun mvm-compile-function-internal (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR. Returns function-info.
    Does NOT produce bytecode; that happens in phase 3.
    PARENT-ENV, if provided, allows closure variable references.
@@ -6616,7 +6684,11 @@
    nargs from the convention slot and pack args[REST-SLOT..nargs-1]
    into a list, storing the list back to slot[REST-SLOT]. Sentinel
    value 255 in the nargs slot means 'caller already packed' (used
-   by compile-call's static-rest path) — prologue skips packing."
+   by compile-call's static-rest path) — prologue skips packing.
+   OPT-START / OPT-COUNT, if non-nil, identify the slot range that
+   holds &optional params; the prologue NIL-inits any slot in that
+   range that the caller didn't supply (so default-init thunks see
+   NIL instead of the stale outgoing-arg register from the caller)."
   (let* ((*ir-buffer* nil)
          (*current-function-name* (if (symbolp name) (symbol-name name)
                                       (string name)))
@@ -6667,6 +6739,18 @@
       ;; static-rest path) — skip the build.
       (when (and rest-slot (< rest-slot +max-reg-args+))
         (emit-rest-prologue rest-slot))
+
+      ;; &optional prologue: NIL-init optional slots the caller didn't
+      ;; supply.  The rest-prologue already wrote the rest slot, and
+      ;; opt-start sits past it (preprocess-params places optional names
+      ;; AFTER required+rest in the new param list), so the two
+      ;; prologues don't fight over the same slot.  Run after the
+      ;; rest-prologue so the rest list is built from the still-stale
+      ;; arg-register values rather than from NIL.  Note that today
+      ;; emit-rest-prologue itself only reads slots within +max-reg-args+,
+      ;; so the order doesn't actually matter, but it's the safer
+      ;; invariant to preserve.
+      (emit-optional-prologue opt-start opt-count)
 
       ;; Compile body (strip any declarations), result goes to VR
       (compile-progn (strip-declares body) env +vreg-vr+))
@@ -7242,12 +7326,14 @@
 ;;; Top-Level API
 ;;; ============================================================
 
-(defun mvm-compile-function (name params body &optional rest-slot)
+(defun mvm-compile-function (name params body &optional rest-slot opt-start opt-count)
   "Compile a named function to MVM bytecode.
    Returns function-info with bytecode embedded in the module buffer.
    REST-SLOT, if non-nil, is the slot index of the &rest param so the
-   prologue can pack its rest list at runtime (see emit-rest-prologue)."
-  (let ((result (mvm-compile-function-internal name params body nil rest-slot)))
+   prologue can pack its rest list at runtime (see emit-rest-prologue).
+   OPT-START / OPT-COUNT, if non-nil, mark the slot range that holds
+   &optional params so the prologue can NIL-init unsupplied slots."
+  (let ((result (mvm-compile-function-internal name params body nil rest-slot opt-start opt-count)))
     ;; result is (function-info . ir-list)
     (let ((info (car result))
           (ir (cdr result)))
@@ -7300,7 +7386,7 @@
                 (key-pos  (position '&key params))
                 (req-end  (or rest-pos opt-pos key-pos (length params)))
                 (pp (preprocess-params params body)))
-           (let ((result (mvm-compile-function name (car pp) (cdr pp) rest-pos)))
+           (let ((result (mvm-compile-function name (car pp) (cadr pp) rest-pos (caddr pp) (cadddr pp))))
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
                (when rest-pos

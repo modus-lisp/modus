@@ -1051,38 +1051,144 @@
 (defun not-mv (x) (not x))
 (defun check-values (fn &optional expected) (declare (ignore expected)) fn)
 
+;;; --- String helpers shared by string-upcase/downcase/capitalize and trims ---
+(defun %string-coerce (x)
+  "Coerce X to a flat string. STRING->itself, CHARACTER->1-char string,
+   SYMBOL->name. Fill-pointer/displaced array wrappers are flattened to a
+   freshly allocated string of the effective length."
+  (cond
+    ((stringp x) x)
+    ((%cl-sym-p x) (%cl-sym-name x))
+    ((characterp x)
+     (let ((s (%make-string-array 1)))
+       (aset s 0 (%ensure-char-code x))
+       s))
+    ((consp x)
+     (if (array-wrapper-p x)
+         (let ((len (wrapper-effective-length x)))
+           (let ((s (%make-string-array len)))
+             (dotimes (i len) (aset s i (wrapper-aref x i)))
+             s))
+         x))
+    (t x)))
+
+(defun %char-bag-list (chars)
+  "Normalize CHARS (a string, list, or vector of char-or-code) to a list of
+   char-codes (fixnums) for membership testing."
+  (cond
+    ((null chars) nil)
+    ((stringp chars)
+     (let ((r nil) (n (array-length chars)))
+       (dotimes (i n) (setq r (cons (aref chars (- (- n 1) i)) r)))
+       r))
+    ((consp chars)
+     (let ((cur chars) (head nil) (tail nil))
+       (loop
+         (when (null cur) (return head))
+         (let ((cc (%ensure-char-code (car cur))))
+           (let ((cell (cons cc nil)))
+             (if (null head)
+                 (progn (setq head cell) (setq tail cell))
+                 (progn (set-cdr tail cell) (setq tail cell)))))
+         (setq cur (cdr cur)))))
+    (t  ;; vector of characters/codes
+     (let ((r nil) (n (array-length chars)))
+       (dotimes (i n)
+         (setq r (cons (%ensure-char-code (aref chars (- (- n 1) i))) r)))
+       r))))
+
+(defun %parse-start-end (args len)
+  "Extract :start (default 0) and :end (default LEN, NIL→LEN) from ARGS.
+   Returns (cons start end)."
+  (let ((start 0) (end len) (a args))
+    (loop
+      (when (null a) (return nil))
+      (when (null (cdr a)) (return nil))
+      (cond
+        ((eq (car a) :start) (setq start (cadr a)))
+        ((eq (car a) :end)   (let ((e (cadr a))) (setq end (if (null e) len e)))))
+      (setq a (cddr a)))
+    (cons start end)))
+
 (defun string-upcase (str &rest args)
-  "Convert string to uppercase."
-  (let ((len (array-length str))
-        (result (%make-string-array (array-length str))))
-    (dotimes (i len result)
-      (let ((ch (aref str i)))
-        (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))))))
+  "Convert STR to uppercase. Honors :start and :end keyword args."
+  (let ((s (%string-coerce str)))
+    (let* ((len (array-length s))
+           (be  (%parse-start-end args len))
+           (start (car be)) (end (cdr be))
+           (result (%make-string-array len)))
+      (dotimes (i len)
+        (let ((ch (aref s i)))
+          (if (and (>= i start) (< i end) (lower-case-p (code-char ch)))
+              (aset result i (- ch 32))
+              (aset result i ch))))
+      result)))
 
 (defun string-downcase (str &rest args)
-  "Convert string to lowercase."
-  (let ((len (array-length str))
-        (result (%make-string-array (array-length str))))
-    (dotimes (i len result)
-      (let ((ch (aref str i)))
-        (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))))))
+  "Convert STR to lowercase. Honors :start and :end keyword args."
+  (let ((s (%string-coerce str)))
+    (let* ((len (array-length s))
+           (be  (%parse-start-end args len))
+           (start (car be)) (end (cdr be))
+           (result (%make-string-array len)))
+      (dotimes (i len)
+        (let ((ch (aref s i)))
+          (if (and (>= i start) (< i end) (upper-case-p (code-char ch)))
+              (aset result i (+ ch 32))
+              (aset result i ch))))
+      result)))
 
-(defun string-capitalize (str)
-  "Capitalize first letter of each word."
-  (let ((len (array-length str))
-        (result (%make-string-array (array-length str))))
-    (let ((i 0) (in-word nil))
-      (loop
-        (when (>= i len) (return result))
-        (let ((ch (aref str i)))
-          (if (alphanumericp (code-char ch))
-              (if in-word
-                  (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))
-                  (progn
-                    (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))
-                    (setq in-word t)))
-              (progn (aset result i ch) (setq in-word nil))))
-        (setq i (+ i 1))))))
+(defun string-capitalize (str &rest args)
+  "Capitalize first letter of each word in STR. Honors :start :end."
+  (let ((s (%string-coerce str)))
+    (let* ((len (array-length s))
+           (be  (%parse-start-end args len))
+           (start (car be)) (end (cdr be))
+           (result (%make-string-array len)))
+      (let ((i 0) (in-word nil))
+        (loop
+          (when (>= i len) (return result))
+          (let ((ch (aref s i)))
+            (if (and (>= i start) (< i end))
+                (if (alphanumericp (code-char ch))
+                    (if in-word
+                        (aset result i (if (upper-case-p (code-char ch)) (+ ch 32) ch))
+                        (progn
+                          (aset result i (if (lower-case-p (code-char ch)) (- ch 32) ch))
+                          (setq in-word t)))
+                    (progn (aset result i ch) (setq in-word nil)))
+                (aset result i ch)))
+          (setq i (+ i 1)))))))
+
+(defun string-trim (chars str)
+  "Remove characters of CHARS bag from both ends of STR."
+  (string-left-trim chars (string-right-trim chars str)))
+
+(defun string-left-trim (chars str)
+  "Remove characters of CHARS bag from the left of STR."
+  (let ((char-list (%char-bag-list chars))
+        (s (%string-coerce str)))
+    (let ((start 0) (len (array-length s)))
+      (loop (when (>= start len) (return ""))
+        (unless (member (aref s start) char-list) (return))
+        (setq start (+ start 1)))
+      (if (= start 0) s
+          (let ((result (%make-string-array (- len start))))
+            (dotimes (i (- len start)) (aset result i (aref s (+ start i))))
+            result)))))
+
+(defun string-right-trim (chars str)
+  "Remove characters of CHARS bag from the right of STR."
+  (let ((char-list (%char-bag-list chars))
+        (s (%string-coerce str)))
+    (let ((end (array-length s)))
+      (loop (when (<= end 0) (return ""))
+        (unless (member (aref s (- end 1)) char-list) (return))
+        (setq end (- end 1)))
+      (if (= end (array-length s)) s
+          (let ((result (%make-string-array end)))
+            (dotimes (i end) (aset result i (aref s i)))
+            result)))))
 
 (defun string-not-equal (a b) (not (string-equal a b)))
 (defun string< (a b &rest args) (let ((m (mismatch a b)))

@@ -4374,12 +4374,17 @@
         (:across
          (let ((var (loop-iter-var iter))
                (idx (loop-iter-list-var iter))
-               (arr (loop-iter-step-form iter)))
+               (arr (loop-iter-step-form iter))
+               (raw (gensym "ACROSSRAW")))
            (push (list arr (loop-iter-init-form iter)) bindings)
            (push (list idx 0) bindings)
            (push (list var nil) bindings)
            (push `(if (>= ,idx (array-length ,arr)) (return nil)) test-forms)
-           (push `(setq ,var (aref ,arr ,idx)) init-stmts)
+           ;; Strings store raw u8 char-codes; convert to characters per ANSI
+           ;; when iterating across a string. Other arrays keep raw element.
+           (push `(setq ,var (let ((,raw (aref ,arr ,idx)))
+                               (if (stringp ,arr) (code-char ,raw) ,raw)))
+                 init-stmts)
            (push `(setq ,idx (1+ ,idx)) step-stmts)))
 
         (:general

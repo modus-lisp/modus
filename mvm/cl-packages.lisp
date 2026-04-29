@@ -354,11 +354,16 @@
 ;;; --- Symbol operations ---
 
 (defun symbol-name (sym)
-  "Return the name of a symbol as a string."
+  "Return the name of a symbol as a string. For Modus's integer-valued
+   gensyms (sym is an integer), produce a unique 'G<N>' name so tests
+   like (string= (symbol-name (gensym)) (symbol-name (gensym))) → NIL."
   (cond
     ((null sym) "NIL")
     ((eq sym t) "T")
     ((%cl-sym-p sym) (%cl-sym-name sym))
+    ((integerp sym)
+     (let ((digs (write-to-string sym)))
+       (concatenate 'string "G" digs)))
     (t "")))
 
 (defun symbol-package (sym)

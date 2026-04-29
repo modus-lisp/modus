@@ -3450,6 +3450,23 @@
         (setf after (cdr after)))
       (cons var after))))
 
+(defun %loop-destr-pairs (pattern accessor)
+  "Walk PATTERN (a cons tree of variable names) and produce a list of
+   (NAME . ACCESSOR-FORM) pairs that bind each NAME from ACCESSOR.
+   Handles nested cons and dotted tails:
+     (a . b)    →  ((a car-expr) (b cdr-expr))
+     (a b)      →  ((a car-expr) (b car-of-cdr-expr))
+     (a (b c))  →  ((a ...) (b ...) (c ...))
+   Used to expand `(loop for (key . val) in alist ...)' destructuring."
+  (cond
+    ((null pattern) nil)
+    ((symbolp pattern)
+     (list (cons pattern accessor)))
+    ((consp pattern)
+     (append (%loop-destr-pairs (car pattern) `(car ,accessor))
+             (%loop-destr-pairs (cdr pattern) `(cdr ,accessor))))
+    (t nil)))
+
 (defun parse-cl-loop (body)
   "Parse loop clauses into a loop-state struct."
   (let ((state (make-loop-state))
@@ -3461,43 +3478,62 @@
           ;; FOR, AS, or AND (loop conjunction — starts another iteration clause)
           ((or (= kw 861144843042936108) (= kw 1113883427174140325)
                (= kw 313452561496444628))
-           (let ((var (cadr rest)))
+           (let ((var (cadr rest))
+                 (destr-pairs nil))      ; list of (component . accessor-on-gensym)
              (setf rest (cddr rest))
              ;; FOR NIL is the "dummy iterator" — discard value via gensym
              ;; (binding NIL would error since it's a constant).
              (when (null var) (setf var (gensym "FORNIL")))
              (when (consp var)
-               ;; Destructuring FOR (a b ...) = vals — handle the (a b ...)
-               ;; flat case (no nesting, no dotted tail).  Capture vals in a
-               ;; gensym, push one general-iter for the gensym, then push
-               ;; (nth k g) iters for each component a, b, ….  The 'rest'
-               ;; advances past the value form; subsequent loop keywords
-               ;; resume at the proper place.  Required for floor.1-fn et al.
-               ;; (`for (q r) = (multiple-value-list (floor n d))`).
+               ;; Destructuring FOR.  Two cases:
+               ;;   1. FOR (a b ...) = value-form — flat list, value is captured
+               ;;      directly; components pulled with NTH.  Kept as a fast path
+               ;;      for the existing `(for (q r) = (multiple-value-list ...))'
+               ;;      pattern.
+               ;;   2. FOR pattern [OF-TYPE type] IN/ON/ACROSS source — pattern is
+               ;;      an arbitrary cons tree (incl. dotted tails like `(key . val)`).
+               ;;      We replace VAR with a gensym so the IN/ON/ACROSS handler
+               ;;      below pushes its iter against the gensym, then queue
+               ;;      destructure setq's on the gensym to bind the components.
+               ;;      This unblocks `(loop for (k . v) in alist do ...)`
+               ;;      patterns used heavily by LOOP.6.* and MAPHASH tests.
                (let ((components var))
+                 ;; Skip OF-TYPE type-spec early so destructuring pattern can be
+                 ;; followed by `of-type fixnum in ...' or similar.
                  (when (and rest (symbolp (car rest))
-                            (= (normalize-name (car rest)) 1009698407182718722))  ; =
-                   (let ((value-form (cadr rest))
-                         (g (gensym "DSTR")))
-                     (setf rest (cddr rest))
-                     ;; Iter for the captured value.
-                     (push (make-loop-iter :kind :general :var g
-                                           :init-form value-form
-                                           :step-form value-form)
-                           (loop-state-iterations state))
-                     ;; Iter for each component, picking from g via NTH.
-                     (let ((idx 0))
-                       (dolist (comp components)
-                         (let ((acc `(nth ,idx ,g)))
-                           (push (make-loop-iter :kind :general :var comp
-                                                 :init-form acc
-                                                 :step-form acc)
-                                 (loop-state-iterations state)))
-                         (setf idx (+ idx 1)))))
-                   ;; Skip the rest of any FOR-clause we replaced — exit the
-                   ;; outer (when (consp var) ...) without falling into the
-                   ;; consume-iter-keyword path below.
-                   (setf var nil))))
+                            (= (normalize-name (car rest)) 729509721274984859))  ; OF-TYPE
+                   (setf rest (cddr rest)))
+                 (cond
+                   ;; Case 1: =-destructuring (legacy NTH-based path)
+                   ((and rest (symbolp (car rest))
+                         (= (normalize-name (car rest)) 1009698407182718722))  ; =
+                    (let ((value-form (cadr rest))
+                          (g (gensym "DSTR")))
+                      (setf rest (cddr rest))
+                      (push (make-loop-iter :kind :general :var g
+                                            :init-form value-form
+                                            :step-form value-form)
+                            (loop-state-iterations state))
+                      (let ((idx 0))
+                        (dolist (comp components)
+                          (let ((acc `(nth ,idx ,g)))
+                            (push (make-loop-iter :kind :general :var comp
+                                                  :init-form acc
+                                                  :step-form acc)
+                                  (loop-state-iterations state)))
+                          (setf idx (+ idx 1))))
+                      (setf var nil)))
+                   ;; Case 2: IN/ON/ACROSS with destructuring pattern.
+                   ;; Replace var with gensym; queue destructure pairs to be
+                   ;; pushed as general iters AFTER the IN/ON/ACROSS iter.
+                   ((and rest (symbolp (car rest))
+                         (let ((nk (normalize-name (car rest))))
+                           (or (= nk 592855328021284152)        ; IN
+                               (= nk 16092538585173950)         ; ON
+                               (= nk 1027666347502942664))))    ; ACROSS
+                    (let ((g (gensym "DSTR")))
+                      (setf destr-pairs (%loop-destr-pairs components g))
+                      (setf var g))))))
              (when (and var (not (consp var)) rest)
              ;; Skip OF-TYPE type-spec — we ignore type declarations.
              (when (and (symbolp (car rest))
@@ -3721,7 +3757,19 @@
                   ;; Unknown FOR clause — skip it as body form
                   (format t "  WARN: unknown FOR clause ~A~%" iter-kw)
                   (push (car rest) (loop-state-body-forms state))
-                  (setf rest (cdr rest)))))))))
+                  (setf rest (cdr rest)))))))
+             ;; If we replaced a destructuring var with a gensym above, push
+             ;; general iters that bind each component from the gensym.
+             ;; Pushed AFTER the IN/ON/ACROSS iter so the gensym is bound
+             ;; to the current list element before destructuring runs.
+             (when destr-pairs
+               (dolist (pair destr-pairs)
+                 (let ((comp (car pair))
+                       (acc (cdr pair)))
+                   (push (make-loop-iter :kind :general :var comp
+                                         :init-form acc
+                                         :step-form acc)
+                         (loop-state-iterations state)))))))
 
           ;; WHILE condition
           ((= kw 468563938978316688)

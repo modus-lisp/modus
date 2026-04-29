@@ -872,6 +872,81 @@
           (setq vs (cdr vs))
           (setq ss (cdr ss)))))))
 
+;;; CLHS-conformant integer formatter for ~D, ~B, ~O, ~X (and ~R with base).
+;;; Params (per CLHS):
+;;;   mincol   minimum column width (NIL → no padding)
+;;;   padchar  fill character (default #\Space). Char OR fixnum (char-code).
+;;;   commachar comma character (default #\,). Char OR fixnum.
+;;;   commaint comma interval (default 3)
+;;;   colonp   T = insert commachar every commaint digits
+;;;   atp      T = always print sign (+ for non-negative)
+;;; Non-integer falls back to ~A (princ) — no padding/commas.
+(defun %fmt-integer (n base mincol padchar commachar commaint colonp atp stream)
+  (cond
+    ((not (integerp n))
+     ;; ANSI: non-integer → print as ~A (princ), no padding
+     (let ((*print-escape* nil))
+       (declare (special *print-escape*))
+       (%write-obj n stream nil nil)))
+    (t
+     (let ((s (make-string-output-stream)))
+       ;; 1. Sign
+       (cond
+         ((< n 0) (%print-char 45 s) (setq n (- 0 n)))
+         (atp     (%print-char 43 s)))
+       ;; 2. Digits (no commas yet) — collect into a list to count length
+       (let ((digits nil))
+         (cond
+           ((= n 0) (setq digits (cons 48 nil)))
+           (t
+            (let ((tmp n))
+              (loop
+                (when (= tmp 0) (return nil))
+                (setq digits (cons (%digit-char-upper (mod tmp base)) digits))
+                (setq tmp (truncate tmp base))))))
+         ;; 3. With colonp, walk digit list emitting commachar at intervals
+         (cond
+           (colonp
+            (let ((cc (%ensure-char-code (if commachar commachar 44)))
+                  (ci (if commaint commaint 3))
+                  (dl digits)
+                  (total 0))
+              ;; total = (length digits)
+              (let ((lp digits))
+                (loop
+                  (when (null lp) (return nil))
+                  (setq total (+ total 1))
+                  (setq lp (cdr lp))))
+              (let ((idx 0))
+                (loop
+                  (when (null dl) (return nil))
+                  (when (and (> idx 0)
+                             (= 0 (mod (- total idx) ci)))
+                    (%print-char cc s))
+                  (%print-char (car dl) s)
+                  (setq dl (cdr dl))
+                  (setq idx (+ idx 1))))))
+           (t
+            (let ((dl digits))
+              (loop
+                (when (null dl) (return nil))
+                (%print-char (car dl) s)
+                (setq dl (cdr dl)))))))
+       ;; 4. Apply mincol padding (left-pad to right-align)
+       (let ((str (get-output-stream-string s)))
+         (cond
+           ((and mincol (> mincol 0))
+            (let ((slen (array-length str))
+                  (pc (%ensure-char-code (if padchar padchar 32))))
+              (let ((pad (- mincol slen)))
+                (loop
+                  (when (<= pad 0) (return nil))
+                  (%print-char pc stream)
+                  (setq pad (- pad 1))))
+              (%print-string-raw str stream)))
+           (t
+            (%print-string-raw str stream))))))))
+
 ;;; Pad string to minimum column
 (defun %fmt-pad-aligned (str mincol colinc minpad padchar stream right-align)
   "Write STR padded to MINCOL using PADCHAR, with MINPAD minimum padding.
@@ -1039,6 +1114,7 @@
             ;; Parse directive
             (let ((pos (+ i 1))
                   (param1 nil) (param2 nil) (param3 nil) (param4 nil)
+                  (param5 nil)
                   (colonp nil) (atp nil))
               ;; Parse parameters (comma-separated integers or v/V/# placeholders)
               (let ((params nil) (pcount 0))
@@ -1071,8 +1147,9 @@
                          (setq pcount (+ pcount 1)))
                        (when (and (< pos len) (= (aref control pos) 44))
                          (setq pos (+ pos 1))))
-                      ;; Integer parameter
-                      ((or (= c 45) (and (>= c 48) (<= c 57)))
+                      ;; Integer parameter (supports leading + or -)
+                      ((or (= c 43) (= c 45) (and (>= c 48) (<= c 57)))
+                       (when (= c 43) (setq pos (+ pos 1)))
                        (let ((pr (%fmt-parse-int control pos len)))
                          (setq params (cons (car pr) params))
                          (setq pos (cdr pr))
@@ -1092,7 +1169,8 @@
                 (setq param1 (if (>= pcount 1) (nth 0 params) nil))
                 (setq param2 (if (>= pcount 2) (nth 1 params) nil))
                 (setq param3 (if (>= pcount 3) (nth 2 params) nil))
-                (setq param4 (if (>= pcount 4) (nth 3 params) nil)))
+                (setq param4 (if (>= pcount 4) (nth 3 params) nil))
+                (setq param5 (if (>= pcount 5) (nth 4 params) nil)))
               ;; Parse modifiers : and @
               (loop
                 (when (>= pos len) (return nil))
@@ -1145,76 +1223,32 @@
                    (let ((obj (car arg-list)))
                      (setq arg-list (cdr arg-list))
                      (%write-obj obj stream nil *print-escape*)))
-                  ;; ~D — decimal. Numeric directives right-align by default
-                  ;; (padding on the LEFT, before the number). Non-integer
-                  ;; args fall back to ~A (princ) per ANSI.
+                  ;; ~D — decimal. CLHS params: mincol,padchar,commachar,commaint
+                  ;; Numeric directives right-align (left-pad). Non-integer falls
+                  ;; back to ~A (princ) per ANSI. ":" inserts commas, "@" forces sign.
                   ((or (= dir 68) (= dir 100))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
-                     (let ((s (make-string-output-stream)))
-                       (cond
-                         ((integerp n)
-                          (when (and atp (>= n 0)) (%print-char 43 s))
-                          (%print-integer-in-base n 10 s))
-                         (t
-                          (let ((*print-escape* nil))
-                            (declare (special *print-escape*))
-                            (%write-obj n s nil nil))))
-                       (let ((str (get-output-stream-string s)))
-                         (if param1
-                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
-                             (%print-string-raw str stream))))))
+                     (%fmt-integer n 10 param1 param2 param3 param4
+                                   colonp atp stream)))
                   ;; ~B — binary
                   ((or (= dir 66) (= dir 98))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
-                     (let ((s (make-string-output-stream)))
-                       (cond
-                         ((integerp n)
-                          (when (and atp (>= n 0)) (%print-char 43 s))
-                          (%print-integer-in-base n 2 s))
-                         (t
-                          (let ((*print-escape* nil))
-                            (declare (special *print-escape*))
-                            (%write-obj n s nil nil))))
-                       (let ((str (get-output-stream-string s)))
-                         (if param1
-                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
-                             (%print-string-raw str stream))))))
+                     (%fmt-integer n 2 param1 param2 param3 param4
+                                   colonp atp stream)))
                   ;; ~O — octal
                   ((or (= dir 79) (= dir 111))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
-                     (let ((s (make-string-output-stream)))
-                       (cond
-                         ((integerp n)
-                          (when (and atp (>= n 0)) (%print-char 43 s))
-                          (%print-integer-in-base n 8 s))
-                         (t
-                          (let ((*print-escape* nil))
-                            (declare (special *print-escape*))
-                            (%write-obj n s nil nil))))
-                       (let ((str (get-output-stream-string s)))
-                         (if param1
-                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
-                             (%print-string-raw str stream))))))
+                     (%fmt-integer n 8 param1 param2 param3 param4
+                                   colonp atp stream)))
                   ;; ~X — hexadecimal
                   ((or (= dir 88) (= dir 120))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
-                     (let ((s (make-string-output-stream)))
-                       (cond
-                         ((integerp n)
-                          (when (and atp (>= n 0)) (%print-char 43 s))
-                          (%print-integer-in-base n 16 s))
-                         (t
-                          (let ((*print-escape* nil))
-                            (declare (special *print-escape*))
-                            (%write-obj n s nil nil))))
-                       (let ((str (get-output-stream-string s)))
-                         (if param1
-                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
-                             (%print-string-raw str stream))))))
+                     (%fmt-integer n 16 param1 param2 param3 param4
+                                   colonp atp stream)))
                   ;; ~R — radix. ~radix,mincol,padchar,commachar,commaintR
                   ;; mirrors ~D except RADIX is the FIRST parameter (so ~D's
                   ;; param1=mincol shifts to param2 here).
@@ -1234,23 +1268,11 @@
                        ;; ~R with no params: cardinal English
                        ((and (not colonp) (not atp) (not param1))
                         (%format-cardinal n stream))
-                       ;; ~NR / ~N,M,'cR: base N with optional mincol/pad/commachar
+                       ;; ~NR / ~N,M,'cR: base N w/ mincol,padchar,commachar,commaint
+                       ;; Note: for ~R, params shift left by one (radix is param1).
                        (param1
-                        (let ((s (make-string-output-stream)))
-                          (cond
-                            ((integerp n)
-                             (when (and atp (>= n 0)) (%print-char 43 s))
-                             (%print-integer-in-base n param1 s))
-                            (t
-                             (let ((*print-escape* nil))
-                               (declare (special *print-escape*))
-                               (%write-obj n s nil nil))))
-                          (let ((str (get-output-stream-string s)))
-                            (if param2
-                                (%fmt-pad-aligned str param2 (if param3 param3 1)
-                                                  (if param4 param4 0)
-                                                  32 stream t)
-                                (%print-string-raw str stream)))))
+                        (%fmt-integer n param1 param2 param3 param4 param5
+                                      colonp atp stream))
                        (t
                         (%format-cardinal n stream)))))
                   ;; ~C — character

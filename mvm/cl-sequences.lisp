@@ -20,10 +20,13 @@
               (when result (return result)))
             (setq cur (cdr cur)))))
        ((null seq) nil)
-       (t (let ((len (array-length seq)) (i 0))
+       (t (let ((len (array-length seq)) (i 0)
+                (string-p (stringp seq)))
             (loop
               (when (>= i len) (return nil))
-              (let ((result (funcall fn (aref seq i))))
+              (let* ((raw (aref seq i))
+                     (elem (if string-p (code-char raw) raw))
+                     (result (funcall fn elem)))
                 (when result (return result)))
               (setq i (+ i 1)))))))
     ;; Two-sequence fast path for two LISTS.
@@ -79,10 +82,13 @@
             (when (null (funcall fn (car cur))) (return nil))
             (setq cur (cdr cur)))))
        ((null seq) t)
-       (t (let ((len (array-length seq)) (i 0))
+       (t (let ((len (array-length seq)) (i 0)
+                (string-p (stringp seq)))
             (loop
               (when (>= i len) (return t))
-              (when (null (funcall fn (aref seq i))) (return nil))
+              (let* ((raw (aref seq i))
+                     (elem (if string-p (code-char raw) raw)))
+                (when (null (funcall fn elem)) (return nil)))
               (setq i (+ i 1)))))))
     ;; Two-sequence fast path for two LISTS (skip if either is non-list,
     ;; e.g., a vector — fall through to the general path below).

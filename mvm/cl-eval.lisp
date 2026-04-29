@@ -890,8 +890,12 @@
   (puthash "NOTEVERY" ht #'notevery)
   (puthash "REDUCE" ht #'reduce)
   (puthash "APPLY" ht #'apply)
-  ;; NOTE: funcall, car, cdr, cons, set-car, set-cdr, caar, cadr, cdar, cddr
-  ;;       are inline ops — no defun, skip to avoid calling wrong function
+  ;; cons/car/cdr now have defun wrappers in cl-types.lisp; register them
+  ;; so fboundp / symbol-function find them. funcall and the cxr variants
+  ;; remain inline-only.
+  (puthash "CAR" ht #'car)
+  (puthash "CDR" ht #'cdr)
+  (puthash "CONS" ht #'cons)
   (puthash "RPLACA" ht #'rplaca)
   (puthash "RPLACD" ht #'rplacd)
   (puthash "GETF" ht #'getf)
@@ -902,8 +906,11 @@
   ;;       are macros/not-defined — skip
   (puthash "VALUES" ht #'values)
   (puthash "VALUES-LIST" ht #'values-list)
-  ;; NOTE: +, -, *, /, =, <, >, <=, >=, /=, 1+, 1-, mod, truncate,
-  ;;       ash, logand, logior, logxor are inline ops — skip
+  ;; +, -, * have defun wrappers in cl-types.lisp; register so fboundp
+  ;; / symbol-function finds them. /, =, <, >, etc. remain inline-only.
+  (puthash "+" ht #'+)
+  (puthash "-" ht #'-)
+  (puthash "*" ht #'*)
   (puthash "PLUSP" ht #'plusp)
   (puthash "MINUSP" ht #'minusp)
   (puthash "ODDP" ht #'oddp)

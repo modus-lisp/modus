@@ -686,6 +686,31 @@
 ;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
 (defun eq (a b) (eq a b))
 (defun eql (a b) (eql a b))
+;; Bare defuns for the primitive cons/car/cdr opcodes so #'cons /
+;; #'car / #'cdr resolve to callable function objects (used by reduce
+;; and similar tests like (reduce #'cons '(a b c))).
+(defun cons (a b) (cons a b))
+(defun car (x) (car x))
+(defun cdr (x) (cdr x))
+(defun + (&rest args)
+  ;; Variadic + so #'+ is callable. Inline + opcode requires fixed args.
+  (if (null args) 0
+      (let ((r (car args)) (rest (cdr args)))
+        (loop (when (null rest) (return r))
+              (setq r (+ r (car rest)))
+              (setq rest (cdr rest))))))
+(defun - (a &rest rest)
+  (if (null rest) (- 0 a)
+      (let ((r a) (cur rest))
+        (loop (when (null cur) (return r))
+              (setq r (- r (car cur)))
+              (setq cur (cdr cur))))))
+(defun * (&rest args)
+  (if (null args) 1
+      (let ((r (car args)) (rest (cdr args)))
+        (loop (when (null rest) (return r))
+              (setq r (* r (car rest)))
+              (setq rest (cdr rest))))))
 ;; ANSI: for n>=0, count 1-bits.  For n<0, count 0-bits in two's
 ;; complement — equivalently, count 1-bits of (lognot n) = -1-n.
 (defun logcount (n)

@@ -1650,9 +1650,27 @@
       ;; LABELS — compile local functions, bodies see all local names (recursive)
       ((= op-name 176230696681611090)
        (compile-flet (cadr form) (cddr form) env dest t))
-      ;; RETURN-FROM — treat as return (ignore block name)
+      ;; RETURN-FROM block-name value — look up name in *block-labels* and
+      ;; branch directly to that block's exit.  Compiles the value into the
+      ;; BLOCK's own dest (saved in the entry) so the value reaches the
+      ;; block's exit-label even when RETURN-FROM is nested deep inside
+      ;; intermediate compile-form contexts (e.g. let bindings).  Falls back
+      ;; to compile-return when name isn't a known block.
       ((= op-name 102326962717880022)
-       (compile-return (caddr form) env dest))
+       (let* ((bname (cadr form))
+              (entry (assoc bname *block-labels*
+                            :test (lambda (a b)
+                                    (or (eql a b)
+                                        (and (symbolp a) (symbolp b)
+                                             (= (normalize-name a)
+                                                (normalize-name b))))))))
+         (if entry
+             ;; entry = (name label block-dest).  Use block-dest so the
+             ;; value lands where the BLOCK form expects to read it from.
+             (progn
+               (compile-form (caddr form) env (caddr entry))
+               (emit-ir :br (cadr entry)))
+             (compile-return (caddr form) env dest))))
       ;; VALUES — return multiple values
       ((= op-name 419785975474686239)
        (compile-values (cdr form) env dest))
@@ -3372,7 +3390,9 @@
                  195734683635763289 682179722204096129
                  876035653932002648 1018827631117520136
                  ;; UPTO (TO synonym), MAXIMIZING/MINIMIZING (synonyms)
-                 819586319614622873 220277010584993844 1092018583149917146))))
+                 819586319614622873 220277010584993844 1092018583149917146
+                 ;; NAMED, ELSE, END (for LOOP.13/14 conditional execution)
+                 534228586620302156 755721607140894312 851431579352036592))))
 
 
 (defun compile-loop (body env dest)
@@ -3437,7 +3457,16 @@
   ;; Finally forms
   (finally-forms nil)
   ;; With-bindings: list of (var init)
-  (with-bindings nil))
+  (with-bindings nil)
+  ;; Block name from `LOOP NAMED foo ...'.  NIL means no NAMED clause
+  ;; (LOOP introduces an implicit BLOCK NIL via *loop-exit-label*).
+  (block-name nil)
+  ;; INTO-only accumulator vars seen inside conditional WHEN/IF/UNLESS
+  ;; clauses.  Each entry is (var . kind).  Used so generate-loop-code
+  ;; emits proper let bindings + collect nreverse fixups + finally
+  ;; visibility for those vars.  Body of the conditional sets them
+  ;; directly via emitted (when ...) / (if ...) forms in body-forms.
+  (cond-into-acc nil))
 
 (defstruct loop-iter
   kind            ; :from, :in, :across, :on, :general, :while, :repeat,
@@ -3481,13 +3510,190 @@
              (%loop-destr-pairs (cdr pattern) `(cdr ,accessor))))
     (t nil)))
 
+(defun %loop-acc-clause-kw-p (kw)
+  "Return the canonical accumulator kind keyword if KW is the hash of an
+   accumulating clause word that may appear inside WHEN/IF/UNLESS, else NIL.
+   Recognises COLLECT/COLLECTING, SUM/SUMMING, COUNT/COUNTING,
+   APPEND/APPENDING, NCONC/NCONCING, MAXIMIZE/MAXIMIZING,
+   MINIMIZE/MINIMIZING, RETURN, DO/DOING, IF, WHEN, UNLESS."
+  (cond ((or (= kw 204640710178503481) (= kw 1066799008902276193)) :collect)
+        ((or (= kw 579297982844014476) (= kw 820203232253031873)) :sum)
+        ((or (= kw 647934184416839188) (= kw 146808687552856964)) :count)
+        ((or (= kw 195734683635763289) (= kw 682179722204096129)) :append)
+        ((or (= kw 876035653932002648) (= kw 1018827631117520136)) :nconc)
+        ((or (= kw 891107942385378521) (= kw 220277010584993844)) :maximize)
+        ((or (= kw 646649243001235175) (= kw 1092018583149917146)) :minimize)
+        ((= kw 732905726022713733) :return)
+        ((or (= kw 32547421316216284) (= kw 942546142429891564)) :do)
+        ((or (= kw 89559098115627243) (= kw 448736678201786992)) :when)
+        ((= kw 123360604517422061) :unless)))
+
+(defun %loop-acc-stmt (kind expr into-var)
+  "Build the body statement for a single accumulator clause inside a
+   WHEN/IF/UNLESS branch.  INTO-VAR is the variable to write into.  The
+   caller is responsible for binding it (via state-cond-into-acc) and for
+   wrapping the resulting statement in the conditional branch."
+  (case kind
+    (:collect `(setq ,into-var (cons ,expr ,into-var)))
+    (:sum     `(setq ,into-var (+ ,into-var ,expr)))
+    (:count   `(when ,expr (setq ,into-var (+ ,into-var 1))))
+    (:append  `(setq ,into-var (append ,into-var ,expr)))
+    (:nconc   `(setq ,into-var (nconc ,into-var ,expr)))
+    (:maximize `(let ((%v ,expr))
+                  (setq ,into-var (if (null ,into-var) %v
+                                      (if (%loop-gt %v ,into-var) %v ,into-var)))))
+    (:minimize `(let ((%v ,expr))
+                  (setq ,into-var (if (null ,into-var) %v
+                                      (if (%loop-lt %v ,into-var) %v ,into-var)))))
+    (:return  `(return ,expr))
+    (:do      expr)
+    (t (error "%loop-acc-stmt: bad kind ~A" kind))))
+
+(defun %loop-acc-init-for-kind (kind)
+  "Initial binding value for an INTO accumulator of KIND."
+  (case kind
+    (:sum 0)
+    (:count 0)
+    (t nil)))
+
+(defun %loop-parse-cond-clauses (rest state)
+  "Parse a sequence of conditional accumulator/action clauses inside a
+   WHEN/IF/UNLESS branch.  Stops at AND/ELSE/END or any non-clause
+   token.  Returns (cons stmt-list new-rest).  STMT-LIST is a list of
+   body-form statements (already-built setqs/whens/returns) to be wrapped
+   in the conditional branch by the caller.  Each accumulator with INTO
+   registers its var in state-cond-into-acc so that generate-loop-code
+   binds and finalises it."
+  (let ((stmts nil)
+        (first t))
+    (loop while rest do
+      (let ((tok (and (symbolp (car rest)) (normalize-name (car rest)))))
+        ;; First clause is required; subsequent clauses must be after AND.
+        (unless first
+          (unless (and tok (= tok 313452561496444628))   ; AND
+            (return))
+          (setf rest (cdr rest)))
+        (setf first nil)
+        (let* ((tok2 (and rest (symbolp (car rest)) (normalize-name (car rest))))
+               (kind (and tok2 (%loop-acc-clause-kw-p tok2))))
+          (unless kind (return))
+          (case kind
+            (:do
+             ;; DO body... — collect forms until next non-form
+             (setf rest (cdr rest))
+             (let ((do-forms nil))
+               (loop while (and rest
+                                (not (and (symbolp (car rest))
+                                          (cl-loop-keyword-p (car rest)))))
+                     do (push (car rest) do-forms)
+                        (setf rest (cdr rest)))
+               (setf do-forms (nreverse do-forms))
+               (push (if (= (length do-forms) 1)
+                         (car do-forms)
+                         (cons 'progn do-forms))
+                     stmts)))
+            (:return
+             (push `(return ,(cadr rest)) stmts)
+             (setf rest (cddr rest)))
+            ((:when :unless)
+             ;; Nested WHEN/IF/UNLESS inside a conditional clause.  Recurse
+             ;; into %loop-parse-cond-clauses to gather the inner THEN-branch
+             ;; (and optional ELSE / END), then build a nested if/when form.
+             (let ((inner-cond (cadr rest)))
+               (setf rest (cddr rest))
+               (let* ((inner-then (%loop-parse-cond-clauses rest state))
+                      (inner-then-stmts (car inner-then)))
+                 (setf rest (cdr inner-then))
+                 (let ((inner-else-stmts nil))
+                   (when (and rest (symbolp (car rest))
+                              (= (normalize-name (car rest)) 755721607140894312))
+                     (setf rest (cdr rest))
+                     (let ((er (%loop-parse-cond-clauses rest state)))
+                       (setf inner-else-stmts (car er))
+                       (setf rest (cdr er))))
+                   (when (and rest (symbolp (car rest))
+                              (= (normalize-name (car rest)) 851431579352036592))
+                     (setf rest (cdr rest)))
+                   (let ((eff-cond (if (eq kind :unless)
+                                       `(not ,inner-cond)
+                                       inner-cond)))
+                     (cond
+                       ((null inner-then-stmts)
+                        nil)  ; defensive: skip empty conditional
+                       (inner-else-stmts
+                        (push `(if ,eff-cond
+                                   ,(if (= (length inner-then-stmts) 1)
+                                        (car inner-then-stmts)
+                                        (cons 'progn inner-then-stmts))
+                                   ,(if (= (length inner-else-stmts) 1)
+                                        (car inner-else-stmts)
+                                        (cons 'progn inner-else-stmts)))
+                              stmts))
+                       (t
+                        (push `(when ,eff-cond
+                                 ,@inner-then-stmts)
+                              stmts))))))))
+            (t
+             (let ((expr (cadr rest)))
+               (setf rest (cddr rest))
+               (let ((iv (%loop-try-into rest))
+                     (var nil))
+                 (cond
+                   (iv
+                    (setf var (car iv))
+                    (setf rest (cdr iv))
+                    ;; Register the INTO var so generate-loop-code binds
+                    ;; and finalises it (but skips body emission).
+                    (push (cons var kind) (loop-state-cond-into-acc state)))
+                   (t
+                    ;; No INTO — anonymous accumulator.  Per CLHS, all
+                    ;; anonymous accumulators of the same compatible kind
+                    ;; share a single accumulator (so interleaved COLLECT
+                    ;; clauses produce one list in source order).  Reuse the
+                    ;; loop's existing anon var of compatible kind if any;
+                    ;; otherwise allocate a fresh one.
+                    (let ((existing
+                           (dolist (ci (loop-state-cond-into-acc state) nil)
+                             (when (and (eq (cdr ci) kind)
+                                        ;; only treat as shared if it was
+                                        ;; an anon (registered via :anon-cond)
+                                        (find-if
+                                         (lambda (a)
+                                           (and (eq (car a) :anon-cond)
+                                                (eq (cadr a) (car ci))))
+                                         (loop-state-accumulator state)))
+                               (return (car ci))))))
+                      (cond
+                        (existing
+                         (setf var existing))
+                        (t
+                         (setf var (gensym "CACC"))
+                         (push (cons var kind) (loop-state-cond-into-acc state))
+                         ;; Push as accumulator with no INTO so generate-loop-code
+                         ;; treats this gensym as the loop's return value.
+                         (push (list :anon-cond var kind)
+                               (loop-state-accumulator state)))))))
+                 (push (%loop-acc-stmt kind expr var) stmts))))))))
+    (cons (nreverse stmts) rest)))
+
 (defun parse-cl-loop (body)
   "Parse loop clauses into a loop-state struct."
   (let ((state (make-loop-state))
         (rest body))
+    ;; NAMED <symbol>: optional, must come first.  Stores the block name so
+    ;; expand-cl-loop can wrap the result in (block <name> ...).
+    (when (and rest (symbolp (car rest))
+               (= (normalize-name (car rest)) 534228586620302156))   ; NAMED
+      (setf (loop-state-block-name state) (cadr rest))
+      (setf rest (cddr rest)))
     (loop while rest do
       (let ((kw (normalize-name (car rest))))
         (cond
+          ;; END as a top-level token: defensive no-op (most ENDs are
+          ;; consumed inside WHEN/IF/UNLESS, but a stray one shouldn't
+          ;; abort parsing).
+          ((= kw 851431579352036592)
+           (setf rest (cdr rest)))
           ;; FOR var FROM start [TO|BELOW end] [BY step]
           ;; FOR, AS, or AND (loop conjunction — starts another iteration clause)
           ((or (= kw 861144843042936108) (= kw 1113883427174140325)
@@ -3647,15 +3853,29 @@
                                           :by-form by-form)
                           (loop-state-iterations state))))
 
-                 ;; FOR var IN list
+                 ;; FOR var IN list [BY step-fn]
+                 ;; BY (if present) is evaluated ONCE at loop entry — captured
+                 ;; via with-bindings so a side-effecting BY form (e.g. one
+                 ;; that does RETURN-FROM the LOOP's named block) fires before
+                 ;; the loop body runs.
                  ((= iter-kw 592855328021284152)
                   (setf rest (cdr rest))
                   (let ((list-form (car rest))
-                        (tmp (gensym "LI")))
+                        (tmp (gensym "LI"))
+                        (by-fn nil))
                     (setf rest (cdr rest))
+                    (when (and rest (symbolp (car rest))
+                               (= (compute-name-hash (symbol-name (car rest)))
+                                  934319717393949980))  ; BY
+                      (setf rest (cdr rest))
+                      (let ((g (gensym "INBY")))
+                        (push (list g (car rest)) (loop-state-with-bindings state))
+                        (setf by-fn g))
+                      (setf rest (cdr rest)))
                     (push (make-loop-iter :kind :in :var var
                                           :init-form list-form
-                                          :list-var tmp)
+                                          :list-var tmp
+                                          :by-form by-fn)
                           (loop-state-iterations state))))
 
                  ;; FOR var ACROSS array
@@ -3672,6 +3892,10 @@
                           (loop-state-iterations state))))
 
                  ;; FOR var ON list [BY step-fn]
+                 ;; BY is evaluated ONCE at loop entry (CLHS 6.1.2.1.1) — push
+                 ;; a clause-bind so the BY value-form is captured exactly once
+                 ;; in source order, then store the gensym in by-form so the
+                 ;; step uses the captured value rather than re-evaluating.
                  ((= iter-kw 16092538585173950)
                   (setf rest (cdr rest))
                   (let ((list-form (car rest))
@@ -3682,7 +3906,9 @@
                                (= (compute-name-hash (symbol-name (car rest)))
                                   934319717393949980))  ; BY
                       (setf rest (cdr rest))
-                      (setf by-fn (car rest))
+                      (let ((g (gensym "ONBY")))
+                        (push (list g (car rest)) (loop-state-with-bindings state))
+                        (setf by-fn g))
                       (setf rest (cdr rest)))
                     (push (make-loop-iter :kind :on :var var
                                           :init-form list-form
@@ -3888,26 +4114,52 @@
                (push (if iv (list :minimize expr (car iv)) (list :minimize expr))
                      (loop-state-accumulator state)))))
 
-          ;; WHEN/IF cond DO body | COLLECT expr
+          ;; WHEN/IF cond <clause> [AND <clause>]* [ELSE <clause> [AND <clause>]*] [END]
+          ;;   <clause> = COLLECT/SUM/COUNT/APPEND/NCONC/MAXIMIZE/MINIMIZE expr [INTO var]
+          ;;            | RETURN expr | DO body... | WHEN/IF/UNLESS ...
+          ;; Binds IT to the test value so clause bodies (e.g. COLLECT IT)
+          ;; can reference the cond result per CLHS 6.1.8.1.
           ((or (= kw 89559098115627243) (= kw 448736678201786992))
            (let ((cond-form (cadr rest)))
              (setf rest (cddr rest))
-             ;; Next should be DO or COLLECT
-             (let ((action-kw (and rest (normalize-name (car rest)))))
-               (cond
-                 ((or (= action-kw 32547421316216284) (= action-kw 942546142429891564))
-                  (setf rest (cdr rest))
-                  (let ((action-form (car rest)))
-                    (push `(when ,cond-form ,action-form) (loop-state-body-forms state))
-                    (setf rest (cdr rest))))
-                 ((or (= action-kw 204640710178503481) (= action-kw 1066799008902276193))
-                  (let ((expr (cadr rest)))
-                    (push (list :collect-when cond-form expr) (loop-state-accumulator state))
-                    (setf rest (cddr rest))))
-                 (t
-                  ;; Bare when: the next form is the body
-                  (push `(when ,cond-form ,(car rest)) (loop-state-body-forms state))
-                  (setf rest (cdr rest)))))))
+             ;; Parse THEN-branch: a chain of AND-separated accumulator clauses.
+             (let* ((then-result (%loop-parse-cond-clauses rest state))
+                    (then-stmts (car then-result)))
+               (setf rest (cdr then-result))
+               ;; Optional ELSE.
+               (let ((else-stmts nil))
+                 (when (and rest (symbolp (car rest))
+                            (= (normalize-name (car rest)) 755721607140894312))  ; ELSE
+                   (setf rest (cdr rest))
+                   (let ((else-result (%loop-parse-cond-clauses rest state)))
+                     (setf else-stmts (car else-result))
+                     (setf rest (cdr else-result))))
+                 ;; Optional END.
+                 (when (and rest (symbolp (car rest))
+                            (= (normalize-name (car rest)) 851431579352036592))  ; END
+                   (setf rest (cdr rest)))
+                 ;; Build the conditional body form and push it.  Bind IT
+                 ;; for clause bodies that reference it.
+                 (cond
+                   ((null then-stmts)
+                    ;; Defensive: WHEN/IF with no recognised clause.  Treat
+                    ;; the next single token as a body form (legacy fallback).
+                    (when rest
+                      (push `(when ,cond-form ,(car rest)) (loop-state-body-forms state))
+                      (setf rest (cdr rest))))
+                   (else-stmts
+                    (push `(let ((it ,cond-form))
+                             (if it
+                                 ,(if (= (length then-stmts) 1) (car then-stmts)
+                                      (cons 'progn then-stmts))
+                                 ,(if (= (length else-stmts) 1) (car else-stmts)
+                                      (cons 'progn else-stmts))))
+                          (loop-state-body-forms state)))
+                   (t
+                    (push `(let ((it ,cond-form))
+                             (when it
+                               ,@then-stmts))
+                          (loop-state-body-forms state))))))))
 
           ;; FINALLY form...
           ((= kw 744661507158602198)
@@ -3943,25 +4195,44 @@
              (push (list :thereis expr) (loop-state-accumulator state))
              (setf rest (cddr rest))))
 
-          ;; UNLESS cond DO body | COLLECT expr
+          ;; UNLESS cond <clause> ... — same shape as WHEN with negated cond.
+          ;; IT is bound to the test value (per CLHS) so clause bodies can
+          ;; reference it.
           ((= kw 123360604517422061)
            (let ((cond-form (cadr rest)))
              (setf rest (cddr rest))
-             (let ((action-kw (and rest (normalize-name (car rest)))))
-               (cond
-                 ((or (= action-kw 32547421316216284) (= action-kw 942546142429891564))
-                  (setf rest (cdr rest))
-                  (let ((action-form (car rest)))
-                    (push `(unless ,cond-form ,action-form) (loop-state-body-forms state))
-                    (setf rest (cdr rest))))
-                 ((or (= action-kw 204640710178503481) (= action-kw 1066799008902276193))
-                  (let ((expr (cadr rest)))
-                    (push (list :collect-when `(not ,cond-form) expr)
-                          (loop-state-accumulator state))
-                    (setf rest (cddr rest))))
-                 (t
-                  (push `(unless ,cond-form ,(car rest)) (loop-state-body-forms state))
-                  (setf rest (cdr rest)))))))
+             (let* ((then-result (%loop-parse-cond-clauses rest state))
+                    (then-stmts (car then-result)))
+               (setf rest (cdr then-result))
+               (let ((else-stmts nil))
+                 (when (and rest (symbolp (car rest))
+                            (= (normalize-name (car rest)) 755721607140894312))
+                   (setf rest (cdr rest))
+                   (let ((else-result (%loop-parse-cond-clauses rest state)))
+                     (setf else-stmts (car else-result))
+                     (setf rest (cdr else-result))))
+                 (when (and rest (symbolp (car rest))
+                            (= (normalize-name (car rest)) 851431579352036592))
+                   (setf rest (cdr rest)))
+                 (cond
+                   ((null then-stmts)
+                    (when rest
+                      (push `(unless ,cond-form ,(car rest)) (loop-state-body-forms state))
+                      (setf rest (cdr rest))))
+                   (else-stmts
+                    ;; UNLESS cond X else Y == IF cond Y X
+                    (push `(let ((it ,cond-form))
+                             (if it
+                                 ,(if (= (length else-stmts) 1) (car else-stmts)
+                                      (cons 'progn else-stmts))
+                                 ,(if (= (length then-stmts) 1) (car then-stmts)
+                                      (cons 'progn then-stmts))))
+                          (loop-state-body-forms state)))
+                   (t
+                    (push `(let ((it ,cond-form))
+                             (unless it
+                               ,@then-stmts))
+                          (loop-state-body-forms state))))))))
 
           ;; RETURN expr
           ((= kw 732905726022713733)
@@ -4005,19 +4276,27 @@
          (finally (loop-state-finally-forms state))
          (initially (loop-state-initially-forms state))
          (with-binds (loop-state-with-bindings state))
+         (block-name (loop-state-block-name state))
+         ;; Conditional INTO accumulators: list of (var . kind).  Each is
+         ;; bound here and finalised; body emission already happened in
+         ;; parse-cl-loop via %loop-parse-cond-clauses.
+         (cond-into (loop-state-cond-into-acc state))
          ;; For each acc-spec, compute its destination var. INTO uses the
          ;; user-named symbol so FINALLY can read it; without INTO, a gensym
-         ;; backs the LOOP's return value.
+         ;; backs the LOOP's return value.  :anon-cond uses its embedded var.
          (acc-vars (mapcar (lambda (a)
-                             (or (%loop-acc-into-var a) (gensym "ACC")))
+                             (cond ((eq (car a) :anon-cond) (cadr a))
+                                   (t (or (%loop-acc-into-var a) (gensym "ACC")))))
                            accs))
          ;; Picks "the" return-value acc (first non-INTO acc with a value).
          ;; Used only when there's exactly one anonymous accumulator and the
-         ;; LOOP's own value should be its accumulated value.
+         ;; LOOP's own value should be its accumulated value.  :anon-cond is
+         ;; treated like a non-INTO accumulator so the loop returns its var.
          (anon-acc-idx (let ((idx -1) (found nil))
                          (dolist (a accs)
                            (incf idx)
-                           (unless (or (%loop-acc-into-var a)
+                           (unless (or (and (not (eq (car a) :anon-cond))
+                                            (%loop-acc-into-var a))
                                        (member (car a) '(:always :thereis)))
                              (unless found (setf found idx))))
                          found))
@@ -4027,6 +4306,10 @@
          (init-stmts nil)
          (test-forms nil)
          (step-stmts nil))
+
+    ;; Bind conditional-INTO accumulator vars (independent of accs list).
+    (dolist (ci cond-into)
+      (push (list (car ci) (%loop-acc-init-for-kind (cdr ci))) bindings))
 
     ;; WITH bindings
     (dolist (wb with-binds)
@@ -4069,12 +4352,15 @@
 
         (:in
          (let ((var (loop-iter-var iter))
-               (tmp (loop-iter-list-var iter)))
+               (tmp (loop-iter-list-var iter))
+               (by-fn (loop-iter-by-form iter)))
            (push (list tmp (loop-iter-init-form iter)) bindings)
            (push (list var nil) bindings)
            (push `(if (null ,tmp) (return nil)) test-forms)
            (push `(setq ,var (car ,tmp)) init-stmts)
-           (push `(setq ,tmp (cdr ,tmp)) step-stmts)))
+           (if by-fn
+               (push `(setq ,tmp (funcall ,by-fn ,tmp)) step-stmts)
+               (push `(setq ,tmp (cdr ,tmp)) step-stmts))))
 
         (:on
          (let ((var (loop-iter-var iter))
@@ -4240,7 +4526,13 @@
             (:thereis
              (setf has-thereis t)
              (push `(let ((,av ,(cadr acc)))
-                      (when ,av (return ,av))) acc-body)))))
+                      (when ,av (return ,av))) acc-body))
+            (:anon-cond
+             ;; No body emission — body-forms already contains the setq
+             ;; via the conditional clause built in parse-cl-loop.  This
+             ;; acc-spec exists only to mark the gensym var as the loop's
+             ;; anonymous return value.
+             nil))))
       (setf acc-body (nreverse acc-body))
 
       ;; Construct the final form
@@ -4278,13 +4570,23 @@
              ;; Pre-finally fixups: nreverse any anonymous COLLECT acc so it
              ;; appears in correct order in FINALLY (and as the LOOP value).
              ;; INTO-named COLLECTs also need nreverse so user code sees the
-             ;; collected list in iteration order.
+             ;; collected list in iteration order.  Also nreverse cond-INTO
+             ;; collect vars (registered via WHEN/IF/UNLESS COLLECT INTO).
              (collect-fixups
                (let ((ix -1) (fixups nil))
                  (dolist (a accs)
                    (incf ix)
                    (when (member (car a) '(:collect :collect-when))
                      (push `(setq ,(nth ix acc-vars) (nreverse ,(nth ix acc-vars)))
+                           fixups)))
+                 ;; cond-into-acc covers BOTH INTO-named and gensym-anon
+                 ;; conditional collects (:anon-cond entries also live in
+                 ;; cond-into-acc).  This is the single source of truth for
+                 ;; conditional collect fixups, so :anon-cond doesn't need
+                 ;; a parallel fixup pass.
+                 (dolist (ci cond-into)
+                   (when (eq (cdr ci) :collect)
+                     (push `(setq ,(car ci) (nreverse ,(car ci)))
                            fixups)))
                  (nreverse fixups)))
              (result (cond
@@ -4293,12 +4595,9 @@
                        (has-thereis
                         (if finally `(progn ,inner2 ,@finally) inner2))
                        (anon-acc
-                        (let ((return-form
-                                (if (member (car anon-acc) '(:collect :collect-when))
-                                    anon-acc-var  ; already nreversed by fixup
-                                    anon-acc-var)))
+                        (let ((return-form anon-acc-var))
                           `(progn ,inner2 ,@collect-fixups ,@finally ,return-form)))
-                       (accs   ; only INTO accs, no anon — return NIL after fixups+finally
+                       ((or accs cond-into)   ; only INTO accs — return NIL after fixups+finally
                         `(progn ,inner2 ,@collect-fixups ,@finally nil))
                        (finally
                         `(progn ,inner2 ,@finally nil))
@@ -4306,14 +4605,18 @@
              ;; INITIALLY runs once before the loop body, after WITH bindings
              (with-init (if initially
                             `(progn ,@initially ,result)
-                            result)))
-        ;; NOTE: We don't wrap in (block nil ...) — that change broke
-        ;; multi-accumulator COLLECT (test 21250 regressed). Revisit if
-        ;; we need RETURN-skip-finally semantics; for now accept that
-        ;; (LOOP COUNT (RETURN N)) returns the accumulator instead of N.
-        (if bindings
-            `(let* ,(nreverse bindings) ,with-init)
-            with-init)))))
+                            result))
+             ;; Apply bindings (let*), then wrap in (block <name> ...) if NAMED.
+             (with-bindings-form
+               (if bindings
+                   `(let* ,(nreverse bindings) ,with-init)
+                   with-init)))
+        ;; NOTE: We don't wrap unnamed loops in (block nil ...) — that change
+        ;; broke multi-accumulator COLLECT (test 21250 regressed).  But NAMED
+        ;; loops need the wrapper so RETURN-FROM <name> can branch out.
+        (if block-name
+            `(block ,block-name ,with-bindings-form)
+            with-bindings-form)))))
 
 (defun compile-return (value env dest)
   "Compile (return value) - exit from enclosing loop or function.
@@ -4335,9 +4638,11 @@
 ;;; ============================================================
 
 (defun compile-block (name body env dest)
-  "Compile (block name forms...)"
+  "Compile (block name forms...).  Stores (NAME LABEL DEST) in
+   *block-labels* so RETURN-FROM compiled deep inside the block body can
+   write its value into the block's own dest before branching to exit."
   (let* ((exit-label (make-compiler-label))
-         (*block-labels* (cons (cons name exit-label) *block-labels*)))
+         (*block-labels* (cons (list name exit-label dest) *block-labels*)))
     (compile-progn body env dest)
     (emit-ir-label exit-label)))
 

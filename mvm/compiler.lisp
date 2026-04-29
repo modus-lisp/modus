@@ -859,6 +859,16 @@
     (lambda (form) (if (= (length form) 2) `(car (cdr (cdr (cdr ,(cadr form))))) '(%signal-program-error))))
   (mvm-define-macro "FIFTH"
     (lambda (form) (if (= (length form) 2) `(car (cdr (cdr (cdr (cdr ,(cadr form)))))) '(%signal-program-error))))
+  (mvm-define-macro "SIXTH"
+    (lambda (form) (if (= (length form) 2) `(nth 5 ,(cadr form)) '(%signal-program-error))))
+  (mvm-define-macro "SEVENTH"
+    (lambda (form) (if (= (length form) 2) `(nth 6 ,(cadr form)) '(%signal-program-error))))
+  (mvm-define-macro "EIGHTH"
+    (lambda (form) (if (= (length form) 2) `(nth 7 ,(cadr form)) '(%signal-program-error))))
+  (mvm-define-macro "NINTH"
+    (lambda (form) (if (= (length form) 2) `(nth 8 ,(cadr form)) '(%signal-program-error))))
+  (mvm-define-macro "TENTH"
+    (lambda (form) (if (= (length form) 2) `(nth 9 ,(cadr form)) '(%signal-program-error))))
 
   ;; WHEN → (if test (progn body...) nil)
   (mvm-define-macro "WHEN"

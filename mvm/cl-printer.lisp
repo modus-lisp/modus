@@ -1017,7 +1017,9 @@
   "Scan CONTROL from START for the matching ~} (respecting nested ~{~}).
    Skips parameters (digits, commas, V, #, '<char>) and modifiers (:, @)
    between ~ and the directive char so e.g. ~1{ and ~v,3:@{ are recognized.
-   Returns the position of ~ in the ~} pair, or NIL if not found."
+   Returns the position of ~ in the ~} pair, or NIL if not found.
+   The caller can detect a colon-modified close (~:}) by scanning forward
+   from result+1 looking for : before the } character."
   (let ((pos start) (depth 1) (result nil))
     (loop
       (when (or result (>= pos len)) (return result))
@@ -1051,12 +1053,52 @@
                      (setq pos (+ p 1))))
                 (t (setq pos (+ p 1))))))))))
 
-(defun %format-iter-inside (stream body lst max-iter)
+(defun %format-close-brace-colon-p (control close-pos len)
+  "Return T if the ~} close at CLOSE-POS (the ~ position) had a colon
+   modifier — i.e. it was actually ~:}. CLHS 22.3.7.4: ~:} forces at
+   least one iteration even when the argument list is empty."
+  (let ((p (+ close-pos 1)) (saw-colon nil))
+    (loop
+      (when (>= p len) (return saw-colon))
+      (let ((c (aref control p)))
+        (cond
+          ((= c 58) (setq saw-colon t) (setq p (+ p 1)))   ; :
+          ((= c 125) (return saw-colon))                    ; }
+          ;; Skip params/at: digits, comma, V, #, ', @
+          ((or (and (>= c 48) (<= c 57))
+               (= c 44) (= c 118) (= c 86)
+               (= c 35) (= c 64)
+               (= c 39))
+           (setq p (+ p 1)))
+          (t (return saw-colon)))))))
+
+(defun %format-close-brace-end (control close-pos len)
+  "Return the position immediately after the closing }. CLOSE-POS points
+   to the ~ in ~}. Scans forward through any modifiers (:, @) and params
+   to land just past the }."
+  (let ((p (+ close-pos 1)))
+    (loop
+      (when (>= p len) (return len))
+      (let ((c (aref control p)))
+        (cond
+          ((= c 125) (return (+ p 1)))                       ; }
+          ((or (= c 58) (= c 64)                             ; : @
+               (and (>= c 48) (<= c 57))
+               (= c 44) (= c 118) (= c 86)
+               (= c 35) (= c 39))
+           (setq p (+ p 1)))
+          (t (return (+ p 1))))))))
+
+(defun %format-iter-inside (stream body lst max-iter &optional force-once)
   "Iterate BODY over LST (the ~{...~} case). BODY is the template, LST
    is the list to feed as successive args. Stops when LST exhausted, or
-   MAX-ITER reached, ~^ fires, or a pass makes no progress."
+   MAX-ITER reached, ~^ fires, or a pass makes no progress.
+   FORCE-ONCE (set by ~:}) runs the body at least once even if LST is
+   empty, unless MAX-ITER is 0."
   (let ((count 0))
     (declare (special *format-iter-escape*))
+    (when (and force-once (null lst) (or (< max-iter 0) (> max-iter 0)))
+      (%format-impl stream body nil))
     (loop
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
       (when (null lst) (return nil))
@@ -1067,11 +1109,13 @@
         (setq lst new-lst))
       (setq count (+ count 1)))))
 
-(defun %format-iter-remaining (stream body arg-list max-iter)
+(defun %format-iter-remaining (stream body arg-list max-iter &optional force-once)
   "Iterate BODY consuming elements from ARG-LIST (the ~@{...~} case).
-   Returns the remaining (unconsumed) arg-list."
+   Returns the remaining (unconsumed) arg-list. FORCE-ONCE for ~:@}."
   (let ((count 0))
     (declare (special *format-iter-escape*))
+    (when (and force-once (null arg-list) (or (< max-iter 0) (> max-iter 0)))
+      (%format-impl stream body nil))
     (loop
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
       (when (null arg-list) (return arg-list))
@@ -1082,13 +1126,17 @@
         (setq arg-list new-args))
       (setq count (+ count 1)))))
 
-(defun %format-iter-of-lists (stream body lst max-iter)
+(defun %format-iter-of-lists (stream body lst max-iter &optional force-once)
   "Iterate BODY over LST where each element of LST is itself a list of args
    passed to BODY. The ~:{...~} case. Stops when LST exhausted, MAX-ITER
    reached, or ~^ fires. Binds *format-outer-rest* so ~:^ inside the body
    can check the outer iteration state (CLHS 22.3.9.2)."
   (let ((count 0))
     (declare (special *format-iter-escape* *format-outer-rest*))
+    (when (and force-once (null lst) (or (< max-iter 0) (> max-iter 0)))
+      (let ((*format-outer-rest* nil))
+        (declare (special *format-outer-rest*))
+        (%format-impl stream body nil)))
     (loop
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
       (when (null lst) (return nil))
@@ -1100,12 +1148,16 @@
       (setq lst (cdr lst))
       (setq count (+ count 1)))))
 
-(defun %format-iter-of-lists-rest (stream body arg-list max-iter)
+(defun %format-iter-of-lists-rest (stream body arg-list max-iter &optional force-once)
   "Iterate BODY consuming successive args from ARG-LIST, each treated as a
    list passed to BODY as its args. The ~:@{...~} case. Returns the
    remaining (unconsumed) arg-list. Binds *format-outer-rest* for ~:^."
   (let ((count 0))
     (declare (special *format-iter-escape* *format-outer-rest*))
+    (when (and force-once (null arg-list) (or (< max-iter 0) (> max-iter 0)))
+      (let ((*format-outer-rest* nil))
+        (declare (special *format-outer-rest*))
+        (%format-impl stream body nil)))
     (loop
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
       (when (null arg-list) (return arg-list))
@@ -1135,7 +1187,8 @@
                (body-empty (= (length raw-body) 0))
                (body raw-body)
                (max-iter (if param1 param1 -1))
-               (new-i (+ end-pos 2))
+               (force-once (%format-close-brace-colon-p control end-pos len))
+               (new-i (%format-close-brace-end control end-pos len))
                (use-fn nil))
           ;; CLHS 22.3.7.4: empty ~{~} body consumes the next argument and
           ;; uses it as the body. String → reuse as control. Function (e.g.
@@ -1150,18 +1203,18 @@
             (use-fn
              (%format-iter-via-fn stream use-fn arg-list colonp atp max-iter new-i))
             ((and colonp atp)
-             (cons new-i (%format-iter-of-lists-rest stream body arg-list max-iter)))
+             (cons new-i (%format-iter-of-lists-rest stream body arg-list max-iter force-once)))
             (colonp
              (let ((lst (car arg-list))
                    (rest-args (cdr arg-list)))
-               (%format-iter-of-lists stream body lst max-iter)
+               (%format-iter-of-lists stream body lst max-iter force-once)
                (cons new-i rest-args)))
             (atp
-             (cons new-i (%format-iter-remaining stream body arg-list max-iter)))
+             (cons new-i (%format-iter-remaining stream body arg-list max-iter force-once)))
             (t
              (let ((lst (car arg-list))
                    (rest-args (cdr arg-list)))
-               (%format-iter-inside stream body lst max-iter)
+               (%format-iter-inside stream body lst max-iter force-once)
                (cons new-i rest-args))))))))
 
 (defun %format-iter-via-fn (stream fn arg-list colonp atp max-iter new-i)

@@ -649,8 +649,9 @@
   (mvm-define-macro "PUSHNEW"
     (lambda (form)
       (let ((item (cadr form))
-            (place (caddr form)))
-        `(setq ,place (adjoin ,item ,place)))))
+            (place (caddr form))
+            (kwargs (cdddr form)))
+        `(setq ,place (adjoin ,item ,place ,@kwargs)))))
 
   ;; PLUSP → (> x 0)
   ;; PLUSP/MINUSP/ABS/LOGNOT all take exactly one argument. Without

@@ -90,17 +90,28 @@
     fn))
 
 (defun fboundp (sym)
-  "Return T if SYM has a function binding."
-  (let ((name (cond
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                ((null sym) nil)
-                (t nil))))
-    (if (null name)
-        nil
-        (if *symbol-function-table*
-            (if (gethash name *symbol-function-table*) t nil)
-            nil))))
+  "Return T if SYM has a function binding. Checks both the named CL
+   table and the native-symbol hash table for native MVM symbols
+   (which lack a recoverable name string)."
+  (cond
+    ((null sym) nil)
+    ((eq sym t) nil)
+    ((%cl-sym-p sym)
+     (let ((name (%cl-sym-name sym)))
+       (if (and *symbol-function-table*
+                (gethash name *symbol-function-table*))
+           t nil)))
+    ((stringp sym)
+     (if (and *symbol-function-table*
+              (gethash sym *symbol-function-table*))
+         t nil))
+    ;; Native MVM symbol (subtag #x50, 1 slot — hash only).
+    ((and (not (consp sym)) (not (fixnump sym))
+          (not (characterp sym)) (= (obj-subtag sym) 80))
+     (if (and *native-sym-function-table*
+              (gethash (aref sym 0) *native-sym-function-table*))
+         t nil))
+    (t nil)))
 
 (defun fmakunbound (sym)
   "Remove the function binding of SYM."

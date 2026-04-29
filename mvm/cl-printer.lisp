@@ -1000,6 +1000,13 @@
 ;;; that iteration's loop, not the entire format.
 (defvar *format-iter-escape* nil)
 
+;;; ~:^ checks the OUTER list (the list-of-sublists for ~:{ / ~:@{), not
+;;; the current sublist that's being passed as args. Bound by the
+;;; ~:{ / ~:@{ helpers to the remaining outer iterations after the
+;;; current one. NIL when not inside ~:{ / ~:@{ — ~:^ then has nothing
+;;; useful to check; CLHS says behaviour is unspecified there.
+(defvar *format-outer-rest* nil)
+
 ;;; ~{...~} helpers. Factored out of %format-impl because inlining the
 ;;; matching-brace scan + the per-iteration recursive call with all its
 ;;; nested let/loop/cond state confused the MVM register allocator
@@ -1078,14 +1085,17 @@
 (defun %format-iter-of-lists (stream body lst max-iter)
   "Iterate BODY over LST where each element of LST is itself a list of args
    passed to BODY. The ~:{...~} case. Stops when LST exhausted, MAX-ITER
-   reached, or ~^ fires."
+   reached, or ~^ fires. Binds *format-outer-rest* so ~:^ inside the body
+   can check the outer iteration state (CLHS 22.3.9.2)."
   (let ((count 0))
-    (declare (special *format-iter-escape*))
+    (declare (special *format-iter-escape* *format-outer-rest*))
     (loop
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
       (when (null lst) (return nil))
       (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
-      (%format-impl stream body (car lst))
+      (let ((*format-outer-rest* (cdr lst)))
+        (declare (special *format-outer-rest*))
+        (%format-impl stream body (car lst)))
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
       (setq lst (cdr lst))
       (setq count (+ count 1)))))
@@ -1093,14 +1103,16 @@
 (defun %format-iter-of-lists-rest (stream body arg-list max-iter)
   "Iterate BODY consuming successive args from ARG-LIST, each treated as a
    list passed to BODY as its args. The ~:@{...~} case. Returns the
-   remaining (unconsumed) arg-list."
+   remaining (unconsumed) arg-list. Binds *format-outer-rest* for ~:^."
   (let ((count 0))
-    (declare (special *format-iter-escape*))
+    (declare (special *format-iter-escape* *format-outer-rest*))
     (loop
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
       (when (null arg-list) (return arg-list))
       (when (and (>= max-iter 0) (>= count max-iter)) (return arg-list))
-      (%format-impl stream body (car arg-list))
+      (let ((*format-outer-rest* (cdr arg-list)))
+        (declare (special *format-outer-rest*))
+        (%format-impl stream body (car arg-list)))
       (when *format-iter-escape* (setq *format-iter-escape* nil)
             (return (cdr arg-list)))
       (setq arg-list (cdr arg-list))
@@ -1618,7 +1630,7 @@
                   ;; iteration loop can terminate. If we're not inside an
                   ;; iteration the flag still gets cleared next time.
                   ((= dir 94)
-                   (declare (special *format-iter-escape*))
+                   (declare (special *format-iter-escape* *format-outer-rest*))
                    (let ((should-escape
                           (cond
                             (param3
@@ -1629,6 +1641,10 @@
                                   (= param1 param2)))
                             (param1
                              (and (integerp param1) (= param1 0)))
+                            ;; ~:^ — escape if outer iteration list exhausted.
+                            ;; CLHS 22.3.9.2: ~:^ checks the list passed to ~:{,
+                            ;; not the inner sublist passed to the body.
+                            (colonp (null *format-outer-rest*))
                             (t (null arg-list)))))
                      (when should-escape
                        (setq *format-iter-escape* t)

@@ -828,11 +828,19 @@
       (keywordp sym)
       t))
 
-(defun constantp (sym &rest env)
-  "True if SYM is a constant. Keywords are constants."
-  (if (%cl-sym-p sym)
-      (keywordp sym)
-      nil))
+(defun constantp (form &rest env)
+  "True if FORM is a constant per CLHS. Numbers, characters, strings,
+   bit-vectors, T, NIL, keywords, and (quote ...) forms are constants."
+  (declare (ignore env))
+  (cond
+    ((null form) t)              ; NIL
+    ((eq form t) t)              ; T
+    ((numberp form) t)
+    ((characterp form) t)
+    ((stringp form) t)
+    ((%cl-sym-p form) (keywordp form))
+    ((and (consp form) (eq (car form) 'quote)) t)
+    (t nil)))
 
 ;;; --- Collect package symbols for with-package-iterator ---
 

@@ -555,7 +555,10 @@
   ;; Signal TYPE-ERROR for negative or non-fixnum index.
   (when (or (not (fixnump idx)) (< idx 0))
     (%signal-type-error))
-  (if (consp seq) (nth idx seq) (aref seq idx)))
+  (if (consp seq)
+      (nth idx seq)
+      (let ((v (aref seq idx)))
+        (if (stringp seq) (code-char v) v))))
 (defun string= (a b &rest options) (declare (ignore options)) (string-equal a b))
 (defun string/= (a b) (if (string-equal a b) nil t))
 ;;; constantly: captures value. Use global cell.

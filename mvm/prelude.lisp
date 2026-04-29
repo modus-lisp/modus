@@ -174,15 +174,26 @@
 (defun member (item list &rest options)
   "Return the tail of LIST starting from the first element EQL to ITEM.
    Signals TYPE-ERROR if LIST is not a list.
-   Accepts ANSI &key TEST/TEST-NOT/KEY via &rest (currently ignored)."
-  (declare (ignore options))
+   Honors ANSI &key TEST/TEST-NOT/KEY."
   (when (and (not (null list)) (not (consp list)))
     (%signal-type-error))
-  (let ((cur list))
-    (loop
-      (when (null cur) (return nil))
-      (when (eql (car cur) item) (return cur))
-      (setq cur (cdr cur)))))
+  (let ((test nil) (test-not nil) (key nil) (a options))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :test-not) (setq test-not (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (let ((cur list))
+      (loop
+        (when (null cur) (return nil))
+        (let* ((v (if key (funcall key (car cur)) (car cur)))
+               (matched
+                (cond
+                  (test (funcall test item v))
+                  (test-not (not (funcall test-not item v)))
+                  (t (eql item v)))))
+          (when matched (return cur)))
+        (setq cur (cdr cur))))))
 
 (defun member-string (item list)
   "Return the tail of LIST starting from the first element STRING-EQUAL to ITEM."

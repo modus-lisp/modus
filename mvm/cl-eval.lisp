@@ -11,8 +11,9 @@
 (defvar *symbol-function-table* nil)
 
 (defun %sft-init ()
-  "Initialize the symbol-function table (empty hash table)."
-  (setq *symbol-function-table* (make-hash-table)))
+  "Initialize the symbol-function table.
+   Keyed by name-string, so :TEST 'EQUAL is mandatory."
+  (setq *symbol-function-table* (make-hash-table :test 'equal)))
 
 ;;; Parallel hash → function table, keyed by the 60-bit FNV-1a hash that
 ;;; native MVM symbols carry in slot 0. ANSI (funcall 'sym ...) / (apply
@@ -849,7 +850,14 @@
    Excludes: inline ops (car, cdr, +, -, =, aref, make-array, etc.),
    macros (first, second, caddr, etc.), and undefined stubs."
   ;; List operations (all have defun in prelude.lisp or ansi-bridge.lisp)
-  (puthash "EQUAL" ht #'equal)
+  ;; Inline ops EQ and EQL also live as wrapper fns (%EQ-FN / %EQL-FN)
+  ;; in prelude.  We register them under the bare name so that
+  ;; (symbol-function 'eq) and #'EQ resolve to the same address — needed
+  ;; by ANSI hash-table-test.3, which calls (make-hash-table
+  ;; :test (symbol-function 'eq)).
+  (puthash "EQ"     ht #'%eq-fn)
+  (puthash "EQL"    ht #'%eql-fn)
+  (puthash "EQUAL"  ht #'equal)
   (puthash "EQUALP" ht #'equalp)
   (puthash "IDENTITY" ht #'identity)
   (puthash "LIST" ht #'list)
@@ -949,6 +957,13 @@
   (puthash "SETF-GETHASH" ht #'puthash)
   (puthash "REMHASH" ht #'remhash)
   (puthash "MAPHASH" ht #'maphash)
+  (puthash "CLRHASH" ht #'clrhash)
+  (puthash "HASH-TABLE-COUNT" ht #'hash-table-count)
+  (puthash "HASH-TABLE-TEST" ht #'hash-table-test)
+  (puthash "HASH-TABLE-SIZE" ht #'hash-table-size)
+  (puthash "HASH-TABLE-REHASH-SIZE" ht #'hash-table-rehash-size)
+  (puthash "HASH-TABLE-REHASH-THRESHOLD" ht #'hash-table-rehash-threshold)
+  (puthash "HASH-TABLE-P" ht #'hash-table-p)
   (puthash "SYMBOL-NAME" ht #'symbol-name)
   (puthash "SYMBOL-VALUE" ht #'symbol-value)
   (puthash "SYMBOL-FUNCTION" ht #'symbol-function)

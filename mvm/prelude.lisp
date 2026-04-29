@@ -933,12 +933,25 @@
 ;;; ============================================================
 ;;;
 ;;; Structure: wrapper cons cell whose car is an alist of
-;;; (key . value) pairs. Keys compared using equal.
-;;; O(n) lookup — sufficient for fixpoint proof.
+;;; (key . value) pairs and whose cdr is metadata.
+;;;
+;;;   ht   = (cons alist meta)
+;;;   meta = nil                      (legacy: equal test, no metadata)
+;;;        | (cons %ht-tag (cons test (cons rsize (cons rthresh size))))
+;;;
+;;; %HT-TAG = 442386510 (= #x1A571A8E) is a fixnum sentinel that lets
+;;; HASH-TABLE-P distinguish a real hash-table from an arbitrary cons.
+;;; TEST is one of the symbols EQ EQL EQUAL EQUALP.
+;;; O(n) lookup — sufficient for the small tables ANSI exercises.
 
-(defun make-hash-table ()
-  "Create an empty hash table (wrapper cons cell)."
-  (cons nil nil))
+(defun make-hash-table (&rest options)
+  "Create a hash table.  Honoring OPTIONS (`&key TEST SIZE
+   REHASH-SIZE REHASH-THRESHOLD`) is delegated to make-hash-table-args
+   when any options were supplied; the no-arg path returns the cheap
+   legacy (cons nil nil) shape that all internal callers rely on."
+  (if (null options)
+      (cons nil nil)
+      (make-hash-table-args options)))
 
 (defun gethash (key ht &optional default)
   "Look up KEY in hash table HT.  Returns (values value present-p);
@@ -1001,6 +1014,123 @@
       (let ((pair (car cur)))
         (funcall fn (car pair) (cdr pair)))
       (setq cur (cdr cur)))))
+
+;;; -------- ANSI hash-table accessors (added 2026-04-27) --------
+;;;
+;;; The legacy MAKE-HASH-TABLE above creates (cons nil nil) — equal-keyed,
+;;; no recorded test/size/threshold.  These accessors return ANSI-required
+;;; defaults for legacy tables; for tables created via the metadata-aware
+;;; path (cl-eval.lisp's make-hash-table-args, exposed at runtime as the
+;;; CL `MAKE-HASH-TABLE`), they pull the real values from the cdr.
+
+(defun %ht-tag () 442386510)   ; #x1A571A8E
+
+(defun %ht-meta (ht)
+  "Return the (test rsize rthresh size) tail-cons, or NIL for legacy."
+  (let ((c (cdr ht)))
+    (if (and (consp c) (eql (car c) (%ht-tag)))
+        (cdr c)
+        nil)))
+
+(defun hash-table-p (ht)
+  "True iff HT is a hash-table created by MAKE-HASH-TABLE.
+   Recognizes both the legacy (cons alist nil) and the modern
+   (cons alist (cons %ht-tag meta)) shapes."
+  (and (consp ht)
+       (let ((c (cdr ht)))
+         (or (null c)                              ; legacy
+             (and (consp c) (eql (car c) (%ht-tag)))))))
+
+(defun hash-table-test (ht)
+  "Return the test designator for HT — one of EQ EQL EQUAL EQUALP.
+   Legacy 0-arg tables report EQL (the ANSI default)."
+  (let ((m (%ht-meta ht))) (if m (car m) 'eql)))
+
+(defun hash-table-rehash-size (ht)
+  "Return the rehash-size of HT (default 2)."
+  (let ((m (%ht-meta ht)))
+    (if (and m (consp (cdr m))) (car (cdr m)) 2)))
+
+(defun hash-table-rehash-threshold (ht)
+  "Return the rehash-threshold of HT (default 1)."
+  (let ((m (%ht-meta ht)))
+    (if (and m (consp (cdr m)) (consp (cddr m))) (car (cddr m)) 1)))
+
+(defun hash-table-size (ht)
+  "Return the declared size of HT (default 16)."
+  (let ((m (%ht-meta ht)))
+    (if (and m (consp (cdr m)) (consp (cddr m))) (cdr (cddr m)) 16)))
+
+(defun hash-table-count (ht)
+  "Return the number of entries in HT."
+  (let ((cur (car ht)) (n 0))
+    (loop
+      (when (null cur) (return n))
+      (setq n (+ n 1))
+      (setq cur (cdr cur)))))
+
+(defun clrhash (ht)
+  "Remove all entries from HT.  Returns HT."
+  (set-car ht nil)
+  ht)
+
+;;; --- Metadata-aware constructor.  Kept as a separate name so the
+;;; --- 0-arg make-hash-table above (called from many internal init
+;;; --- sites) keeps its fixed arity — adding &rest there can interact
+;;; --- badly with funcall-of-let-allocated-lambda (CLAUDE.md known bug).
+
+(defun %ht-canonicalize-test (v)
+  "Map :TEST argument V to one of EQ / EQL / EQUAL / EQUALP. Default EQL.
+
+   Symbol path: native MVM symbols (subtag #x50, single hash slot)
+   carry only their FNV-1a name-hash; SYMBOL-NAME returns \"\" for them
+   so we have to compare the hash directly.  CL-symbols (cons-tagged)
+   go through SYMBOL-NAME → STRING= as a fallback.
+
+   Function path: when the source said #'EQ etc, compile-function-ref
+   already rewrote that to the address of the corresponding %FOO-FN
+   wrapper, and #'EQUALP loads the address of EQUALP itself.  EQL the
+   FN-ADDR fixnums for an exact match."
+  (cond
+    ((null v) 'eql)
+    ((%native-mvm-sym-p v)
+     (let ((h (%native-mvm-sym-hash v)))
+       (cond ((eql h 644866047583222547) 'eq)
+             ((eql h 743927193407775751) 'eql)
+             ((eql h 777630921077348411) 'equal)
+             ((eql h 349037300549106995) 'equalp)
+             (t 'eql))))
+    ((symbolp v)
+     (let ((n (symbol-name v)))
+       (cond ((string= n "EQ") 'eq)
+             ((string= n "EQL") 'eql)
+             ((string= n "EQUAL") 'equal)
+             ((string= n "EQUALP") 'equalp)
+             (t 'eql))))
+    ((eql v (function %eq-fn))    'eq)
+    ((eql v (function %eql-fn))   'eql)
+    ((eql v (function %equal-fn)) 'equal)
+    ((eql v (function equalp))    'equalp)
+    (t 'eql)))
+
+(defun make-hash-table-args (options)
+  "Internal worker: parse OPTIONS plist (`(:test eq :size 100 ...)`) and
+   build a metadata-bearing hash-table.  Defaults: test=eql, rsize=2,
+   rthresh=1, size=16."
+  (let ((test 'eql) (rsize 2) (rthresh 1) (size 16) (cur options))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :test)             (setq test (%ht-canonicalize-test v)))
+          ((eq k :size)             (setq size v))
+          ((eq k :rehash-size)      (setq rsize v))
+          ((eq k :rehash-threshold) (setq rthresh v))))
+      (setq cur (cddr cur)))
+    (cons nil
+          (cons (%ht-tag)
+                (cons test (cons rsize (cons rthresh size)))))))
 
 ;;; ============================================================
 ;;; Gensym (for macro expansion)

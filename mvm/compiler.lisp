@@ -922,9 +922,23 @@
                 ;; (setf (aref a i) v) → (aset a i v)
                 ((and (consp place) (name-eq (car place) "AREF"))
                  `(aset ,(cadr place) ,(caddr place) ,value))
-                ;; (setf (gethash k h) v) → (puthash k h v)
+                ;; (setf (gethash k h) v)     → (puthash k h v)
+                ;; (setf (gethash k h d) v)   → evaluate D for side effect.
+                ;;     ANSI demands left-to-right evaluation of K, H, D, V
+                ;;     for setf-of-gethash even though setf-gethash drops
+                ;;     D.  Emit a let* so K then H then D fire in order
+                ;;     before the puthash.  Tests gethash.order.{2,4} hit
+                ;;     this — they used to see D's (incf i) skipped.
                 ((and (consp place) (name-eq (car place) "GETHASH"))
-                 `(puthash ,(cadr place) ,(caddr place) ,value))
+                 (if (cdddr place)
+                     (let ((kt (gensym "K")) (ht (gensym "H"))
+                           (dt (gensym "D")))
+                       `(let* ((,kt ,(cadr place))
+                               (,ht ,(caddr place))
+                               (,dt ,(cadddr place)))
+                          ,dt   ; touch DT so the binding isn't dead-stripped
+                          (puthash ,kt ,ht ,value)))
+                     `(puthash ,(cadr place) ,(caddr place) ,value)))
                 ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
                 ((and (consp place) (name-eq (car place) "MEM-REF"))
                  `(%setf-mem-ref ,place ,value))

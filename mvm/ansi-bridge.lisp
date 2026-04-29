@@ -1412,20 +1412,11 @@
 ;;; Hash Table Extensions
 ;;; ============================================================
 
-(defun hash-table-test (ht) 'equal)
-(defun hash-table-rehash-threshold (ht) 0.75)
-(defun hash-table-rehash-size (ht) 1.5)
-(defun clrhash (ht)
-  "Clear all entries from hash table HT."
-  ;; Walk through and remove all keys
-  (let ((keys nil))
-    (maphash (lambda (k v) (setq keys (cons k keys))) ht)
-    (let ((cur keys))
-      (loop
-        (when (null cur) (return ht))
-        (remhash (car cur) ht)
-        (setq cur (cdr cur)))))
-  ht)
+;; HASH-TABLE-TEST / HASH-TABLE-REHASH-{SIZE,THRESHOLD} / CLRHASH all
+;; live in prelude.lisp now and pull real metadata out of the new
+;; cdr-cell shape.  Earlier this file had three constant-returning stubs
+;; that won under last-defun-wins, so MAKE-HASH-TABLE :TEST 'EQ tables
+;; still reported HASH-TABLE-TEST → EQUAL etc.  Removed.
 
 ;;; ============================================================
 ;;; Sleep (stub)

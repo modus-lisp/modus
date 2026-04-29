@@ -1125,7 +1125,9 @@
                          (when n (setq n (- n 1)))))))
                  (setq i (+ i 1))))))))))
 (defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
-(defun hash-table-count (ht) (let ((c 0) (cur (car ht))) (loop (when (null cur) (return c)) (setq c (+ c 1)) (setq cur (cdr cur)))))
+;; HASH-TABLE-COUNT lives in prelude.lisp; the duplicate here used to
+;; win under last-defun-wins and worked the same way for the alist shape,
+;; but routing through prelude keeps a single point of truth.
 (defun %maphash-impl (fn ht)
   "Apply FN to each key-value pair in hash table (function version)."
   (let ((cur (car ht)))
@@ -1677,9 +1679,11 @@
   r)
 
 ;;; Hash table
-(defun hash-table-p (obj)
-  "True if OBJ is a hash table (cons cell)."
-  (consp obj))
+;;; The real definition is in prelude.lisp — it recognizes both the
+;;; legacy (cons alist nil) shape and the modern (cons alist (cons %ht-tag
+;;; meta)) shape that make-hash-table-args creates.  Removed the loose
+;;; (consp obj) stub that previously won under last-defun-wins so plain
+;;; cons lists wouldn't (typep '(1 2 3) 'hash-table) → T anymore.
 
 ;;; Symbol
 (defun symbol-name (sym)

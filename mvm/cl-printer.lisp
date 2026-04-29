@@ -1606,10 +1606,16 @@
         (setq *format-iter-escape* nil)
         nil)))
 
-;;; formatter macro: returns a function that takes (stream &rest args)
-;;; and applies the format control string
-;;; In MVM, defmacro not available, so formatter is a function
-;;; that returns a closure at runtime
+;;; formatter: returns a closure that takes (stream &rest args) and
+;;; applies the format control string.
+;;;
+;;; The closure mirrors what (formatter STR) is supposed to do per ANSI
+;;; CLHS — return a function consuming a stream + arguments and
+;;; returning the unused tail.  Test-site calls look like
+;;;   (let ((fn (formatter STR))) ... (apply fn stream args) ...)
+;;;
+;;; Bumped the apply dispatch (above; see prelude.lisp) from 4 args to
+;;; 8 so formatter tests with several args succeed.
 (defun formatter (control)
   "Return a function (stream &rest args) that formats using CONTROL."
   (declare (special *format-iter-escape*))
@@ -1619,6 +1625,50 @@
     (let ((remaining (%format-impl (%resolve-output-stream stream) control args)))
       (setq *format-iter-escape* nil)
       remaining)))
+
+;;; Extended apply that handles up to 8 spread args (prelude APPLY tops
+;;; out at 4, silently dropping trailing args for any formatter call
+;;; with 4+ format arguments — which is most of the format-d tests).
+(defun apply (fn &rest spread)
+  "ANSI apply: build a single arg list and funcall (up to 8 args)."
+  (let ((all-args
+         (if (null spread)
+             nil
+             (if (null (cdr spread))
+                 (car spread)
+                 (let ((individual nil) (cur spread))
+                   (loop
+                     (when (null (cdr cur))
+                       (return (append (nreverse individual) (car cur))))
+                     (setq individual (cons (car cur) individual))
+                     (setq cur (cdr cur))))))))
+    (cond
+      ((null all-args)
+       (funcall fn))
+      ((null (cdr all-args))
+       (funcall fn (car all-args)))
+      ((null (cddr all-args))
+       (funcall fn (car all-args) (cadr all-args)))
+      ((null (cdddr all-args))
+       (funcall fn (car all-args) (cadr all-args) (caddr all-args)))
+      ((null (cddddr all-args))
+       (funcall fn (car all-args) (cadr all-args) (caddr all-args) (cadddr all-args)))
+      ((null (cdr (cddddr all-args)))
+       (funcall fn (car all-args) (cadr all-args) (caddr all-args)
+                (cadddr all-args) (car (cddddr all-args))))
+      ((null (cddr (cddddr all-args)))
+       (funcall fn (car all-args) (cadr all-args) (caddr all-args)
+                (cadddr all-args) (car (cddddr all-args))
+                (cadr (cddddr all-args))))
+      ((null (cdddr (cddddr all-args)))
+       (funcall fn (car all-args) (cadr all-args) (caddr all-args)
+                (cadddr all-args) (car (cddddr all-args))
+                (cadr (cddddr all-args)) (caddr (cddddr all-args))))
+      (t
+       (funcall fn (car all-args) (cadr all-args) (caddr all-args)
+                (cadddr all-args) (car (cddddr all-args))
+                (cadr (cddddr all-args)) (caddr (cddddr all-args))
+                (cadddr (cddddr all-args)))))))
 
 (defun terpri (&rest stream-arg)
   (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))

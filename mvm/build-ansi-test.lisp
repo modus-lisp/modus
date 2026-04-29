@@ -536,10 +536,13 @@
      (let ((name (rewrite-package-iteration (%stringify-pkg-designator (cadr form))))
            (options (cddr form)))
        `(%defpackage-impl ,name (quote ,options))))
-    ;; Package functions with keyword/symbol designator args → stringify
+    ;; Package functions with keyword/symbol designator args → stringify.
+    ;; INTERN and FIND-SYMBOL are EXCLUDED here: their first arg is the
+    ;; string NAME (not a package designator), and their optional second
+    ;; arg is the package — handled separately just below.
     ((and (member (car form) '(make-package find-package delete-package
                                safely-delete-package rename-package
-                               intern find-symbol use-package unuse-package
+                               use-package unuse-package
                                in-package export unexport import unintern
                                shadow shadowing-import
                                package-name package-nicknames
@@ -549,6 +552,22 @@
           (or (keywordp (cadr form)) (and (symbolp (cadr form)) (not (member (cadr form) '(nil t p sym pkg s))))))
      (let ((str-arg (%stringify-pkg-designator (cadr form))))
        `(,(car form) ,str-arg ,@(mapcar #'rewrite-package-iteration (cddr form)))))
+    ;; (intern NAME [PACKAGE]) / (find-symbol NAME [PACKAGE]) — only the
+    ;; SECOND arg may need stringification; the first is a runtime string
+    ;; and must be left alone (was the cause of the FORMATTER-TEST-NAME-STRING
+    ;; macroexpansion bug — see commit log).
+    ((and (member (car form) '(intern find-symbol))
+          (consp (cdr form))
+          (consp (cddr form))
+          (let ((p (caddr form)))
+            (or (keywordp p)
+                (and (symbolp p)
+                     (not (member p '(nil t p sym pkg s)))))))
+     (let* ((name-arg (rewrite-package-iteration (cadr form)))
+            (pkg-arg  (%stringify-pkg-designator (caddr form)))
+            (rest     (cdddr form)))
+       `(,(car form) ,name-arg ,pkg-arg
+                     ,@(mapcar #'rewrite-package-iteration rest))))
     ;; (ignore-errors form) → (handler-case form (error (c) nil))
     ((and (eq (car form) 'ignore-errors) (cdr form))
      (let ((body (rewrite-package-iteration (cadr form))))
@@ -3006,7 +3025,7 @@
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
-  (let ((path "/tmp/modus-ansi-test"))
+  (let ((path "/tmp/modus-ansi-test-FMT2"))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

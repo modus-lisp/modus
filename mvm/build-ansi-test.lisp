@@ -158,7 +158,15 @@
 ;; into %make-string-array + aset calls
 (defun rewrite-make-array-initcontents (form)
   "Walk form tree, converting make-array with :initial-contents or char :element-type
-   into %make-string-array + initialization code."
+   into %make-string-array + initialization code.
+
+   Adjustable arrays use a 'wrap-with-marker' convention so adjustable-array-p
+   can detect them at runtime:
+     adjustable-only:    (cons 8765432 underlying)
+     adjustable + fp:    (cons 8765432 (cons fp underlying))
+   The marker 8765432 is distinct from the multi-dim marker 9867654 and from
+   any plausible fill-pointer value.  fill-pointer-only arrays keep the
+   existing (cons fp underlying) layout."
   (cond
     ((atom form) form)
     ((and (eq (car form) 'make-array)
@@ -169,7 +177,12 @@
             (kwargs (cddr form))
             (et (make-array-kwarg kwargs :element-type))
             (contents (make-array-kwarg kwargs :initial-contents))
-            (fill-p (make-array-kwarg kwargs :fill-pointer))
+            (fill-p-raw (make-array-kwarg kwargs :fill-pointer))
+            ;; :fill-pointer t means fp = size; :fill-pointer N is N; :fill-pointer nil means no fp
+            (fill-p (cond ((eq fill-p-raw t) size)
+                          ((null fill-p-raw) nil)
+                          (t fill-p-raw)))
+            (adj-p (eq (make-array-kwarg kwargs :adjustable) t))
             (displaced (make-array-kwarg kwargs :displaced-to))
             (disp-offset (or (make-array-kwarg kwargs :displaced-index-offset) 0))
             (char-et (char-element-type-p et)))
@@ -180,13 +193,17 @@
             `(cons (cons ,size ,disp-offset) ,disp-form)))
          ;; Fill-pointer: (cons fill-pointer underlying-string)
          ((and fill-p (stringp contents))
-          `(cons ,fill-p (copy-seq ,contents)))
+          (if adj-p
+              `(cons 8765432 (cons ,fill-p (copy-seq ,contents)))
+              `(cons ,fill-p (copy-seq ,contents))))
          ((and fill-p (integerp contents))
           ;; fill-pointer with non-string contents — unlikely but handle
           (mapcar-dotted #'rewrite-make-array-initcontents form))
          ;; :initial-contents is a string literal — copy it as a string
          ((stringp contents)
-          `(copy-seq ,contents))
+          (if adj-p
+              `(cons 8765432 (copy-seq ,contents))
+              `(copy-seq ,contents)))
          ;; :initial-contents is a quoted list of characters
          ((and (consp contents) (eq (car contents) 'quote)
                (consp (cadr contents)) (characterp (car (cadr contents))))
@@ -194,20 +211,71 @@
                  (var '%str-init-tmp)  ; fixed name, not gensym (survives ~S print+read)
                  (asets (loop for ch in chars for i from 0
                               collect `(aset ,var ,i ,(char-code ch)))))
-            `(let ((,var (%make-string-array ,size)))
-               ,@asets
-               ,var)))
+            (let ((body `(let ((,var (%make-string-array ,size)))
+                           ,@asets
+                           ,var)))
+              (cond
+                ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
+                (adj-p              `(cons 8765432 ,body))
+                (fill-p             `(cons ,fill-p ,body))
+                (t                  body)))))
          ;; char element-type, no initial-contents — just %make-string-array
          ((and char-et (not contents))
-          `(%make-string-array ,size))
+          (let ((body `(%make-string-array ,size)))
+            (cond
+              ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
+              (adj-p              `(cons 8765432 ,body))
+              (fill-p             `(cons ,fill-p ,body))
+              (t                  body))))
          ;; bit element-type with :initial-contents — array of fixnum 0/1
          ((and (bit-element-type-p et) contents)
           (let ((init-form (rewrite-make-array-initcontents contents)))
-            `(%make-bit-vector-from-contents ,size ,init-form)))
+            (let ((body `(%make-bit-vector-from-contents ,size ,init-form)))
+              (cond
+                ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
+                (adj-p              `(cons 8765432 ,body))
+                (fill-p             `(cons ,fill-p ,body))
+                (t                  body)))))
          ;; bit element-type — make a bit vector with :initial-element default 0
          ((bit-element-type-p et)
           (let ((init (or (make-array-kwarg kwargs :initial-element) 0)))
-            `(make-bit-vector ,size ,init)))
+            (let ((body `(make-bit-vector ,size ,init)))
+              (cond
+                ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
+                (adj-p              `(cons 8765432 ,body))
+                (fill-p             `(cons ,fill-p ,body))
+                (t                  body)))))
+         ;; :adjustable t and/or :fill-pointer with no other handler matched
+         ;; (general object array path).  Build a fresh array with optional
+         ;; :initial-element fill or :initial-contents fill, then wrap.
+         ((or adj-p fill-p)
+          (let* ((init-elem (make-array-kwarg kwargs :initial-element))
+                 (var '%mka-tmp)
+                 (init-var '%mka-init)
+                 (body
+                  (cond
+                    ;; :initial-contents is a quoted list literal — splat as constants
+                    ((and contents (consp contents) (eq (car contents) 'quote)
+                          (consp (cadr contents)))
+                     (let* ((vals (cadr contents))
+                            (asets (loop for v in vals for i from 0
+                                         while (< i size)
+                                         collect `(aset ,var ,i (quote ,v)))))
+                       `(let ((,var (make-array ,size)))
+                          ,@asets
+                          ,var)))
+                    (init-elem
+                     (let ((asets (loop for i from 0 below size
+                                        collect `(aset ,var ,i ,init-var))))
+                       `(let ((,var (make-array ,size))
+                              (,init-var ,(rewrite-make-array-initcontents init-elem)))
+                          ,@asets
+                          ,var)))
+                    (t `(make-array ,size)))))
+            (cond
+              ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
+              (adj-p              `(cons 8765432 ,body))
+              (fill-p             `(cons ,fill-p ,body)))))
          ;; fallback
          (t (mapcar-dotted #'rewrite-make-array-initcontents form)))))
     (t (mapcar-dotted #'rewrite-make-array-initcontents form))))
@@ -236,36 +304,37 @@
   (let* ((init-elem (rewrite-make-array-dims
                      (make-array-kwarg kwargs :initial-element)))
          (init-contents (make-array-kwarg kwargs :initial-contents))
+         (adj-p (eq (make-array-kwarg kwargs :adjustable) t))
          (var '%mda-init-tmp))
-    (cond
-      ;; :initial-contents is a quoted nested list literal — flatten it
-      ((and init-contents (consp init-contents) (eq (car init-contents) 'quote))
-       (let* ((nested (cadr init-contents))
-              (flat (%flatten-initial-contents dims nested))
-              (asets (loop for v in flat for i from 0
-                           collect `(aset ,var ,i (quote ,v)))))
-         `(cons 9867654
-                (cons (quote ,dims)
-                      (let ((,var (make-array ,total)))
-                        ,@asets
-                        ,var)))))
-      ;; :initial-element provided — fill all slots.  Bind init once via let
-      ;; (some test exprs have side effects like (- (random) ...)) and emit
-      ;; constant-index ASETs to avoid the variable-index ASET miscompile.
-      (init-elem
-       (let* ((init-var '%mda-init-val)
-              (asets (loop for i from 0 below total
-                           collect `(aset ,var ,i ,init-var))))
-         `(cons 9867654
-                (cons (quote ,dims)
-                      (let ((,var (make-array ,total))
-                            (,init-var ,init-elem))
-                        ,@asets
-                        ,var)))))
-      ;; No init — just wrap a fresh flat array
-      (t
-       `(cons 9867654
-              (cons (quote ,dims) (make-array ,total)))))))
+    (let ((md-form
+           (cond
+             ;; :initial-contents is a quoted nested list literal — flatten it
+             ((and init-contents (consp init-contents) (eq (car init-contents) 'quote))
+              (let* ((nested (cadr init-contents))
+                     (flat (%flatten-initial-contents dims nested))
+                     (asets (loop for v in flat for i from 0
+                                  collect `(aset ,var ,i (quote ,v)))))
+                `(cons 9867654
+                       (cons (quote ,dims)
+                             (let ((,var (make-array ,total)))
+                               ,@asets
+                               ,var)))))
+             ;; :initial-element provided — fill all slots.
+             (init-elem
+              (let* ((init-var '%mda-init-val)
+                     (asets (loop for i from 0 below total
+                                  collect `(aset ,var ,i ,init-var))))
+                `(cons 9867654
+                       (cons (quote ,dims)
+                             (let ((,var (make-array ,total))
+                                   (,init-var ,init-elem))
+                               ,@asets
+                               ,var)))))
+             ;; No init — just wrap a fresh flat array
+             (t
+              `(cons 9867654
+                     (cons (quote ,dims) (make-array ,total)))))))
+      (if adj-p `(cons 8765432 ,md-form) md-form))))
 
 ;; Rewrite (make-array '(N) ...) → (make-array N ...) for MVM compatibility
 ;;

@@ -50,19 +50,25 @@
       (= (aref a 1) (aref b 1))
       nil))
 
+(defun %rt-unadj (x)
+  "Peel (cons 8765432 ...) adjustable wrapper if present."
+  (if (and (consp x) (eql (car x) 8765432)) (cdr x) x))
+
 (defun rt-array-wrapper-p (x)
   "Check if x is a fill-pointer or displaced array wrapper (cons _ string)."
-  (if (consp x) (if (stringp (cdr x)) t nil) nil))
+  (let ((y (%rt-unadj x)))
+    (if (consp y) (if (stringp (cdr y)) t nil) nil)))
 
 (defun rt-wrapper-to-string (w)
   "Convert an array wrapper to a plain string for comparison."
-  (let ((len (if (fixnump (car w))
-                 (car w)
-                 (car (car w))))
-        (offset (if (fixnump (car w)) 0 (cdr (car w)))))
-    (let ((s (%make-string-array len)))
-      (dotimes (i len s)
-        (aset s i (aref (cdr w) (+ offset i)))))))
+  (let ((y (%rt-unadj w)))
+    (let ((len (if (fixnump (car y))
+                   (car y)
+                   (car (car y))))
+          (offset (if (fixnump (car y)) 0 (cdr (car y)))))
+      (let ((s (%make-string-array len)))
+        (dotimes (i len s)
+          (aset s i (aref (cdr y) (+ offset i))))))))
 
 (defun rt-arrayp (x)
   "Check if x is a plain array (object with subtag #x32)."
@@ -84,6 +90,24 @@
             (setq i (+ i 1))))
         nil)))
 
+(defun rt-fp-array-wrapper-p (x)
+  "True if x is a fill-pointer wrapper around a non-string array.
+   Shape: (cons fixnum array) or (cons 8765432 (cons fixnum array))."
+  (let ((y (if (and (consp x) (eql (car x) 8765432)) (cdr x) x)))
+    (if (consp y)
+        (if (fixnump (car y))
+            (if (stringp (cdr y)) nil (rt-arrayp (cdr y)))
+            nil)
+        nil)))
+
+(defun rt-fp-wrapper-to-array (w)
+  "Truncate fp-wrapped array to its fill pointer length."
+  (let ((y (if (and (consp w) (eql (car w) 8765432)) (cdr w) w)))
+    (let ((fp (car y))
+          (arr (cdr y)))
+      (let ((out (make-array fp)))
+        (dotimes (i fp out) (aset out i (aref arr i)))))))
+
 (defun rt-equal (a b)
   "Structural equality for RT comparisons.
    Flattened to cond so the compiler doesn't run out of registers on
@@ -96,6 +120,11 @@
      (rt-equal (rt-wrapper-to-string a) b))
     ((and (consp b) (rt-array-wrapper-p b))
      (rt-equal a (rt-wrapper-to-string b)))
+    ;; Fill-pointer-wrapped non-string array (e.g. #(a b x) wrapper)
+    ((and (consp a) (rt-fp-array-wrapper-p a))
+     (rt-equal (rt-fp-wrapper-to-array a) b))
+    ((and (consp b) (rt-fp-array-wrapper-p b))
+     (rt-equal a (rt-fp-wrapper-to-array b)))
     ;; Plain cons-cell equality.
     ((and (consp a) (consp b))
      (if (rt-equal (car a) (car b))

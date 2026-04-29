@@ -1157,115 +1157,207 @@
           (nstring-capitalize-raw str (car bounds) (cdr bounds))
           str))))
 (defun array-dimension (a n)
-  (cond
-    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-     (let ((dims (cadr a)) (i 0))
-       (loop
-         (when (null dims) (return 0))
-         (when (= i n) (return (car dims)))
-         (setq dims (cdr dims))
-         (setq i (+ i 1)))))
-    ((= n 0) (array-length a))
-    (t 0)))
+  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+    (cond
+      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+       (let ((dims (cadr a)) (i 0))
+         (loop
+           (when (null dims) (return 0))
+           (when (= i n) (return (car dims)))
+           (setq dims (cdr dims))
+           (setq i (+ i 1)))))
+      ((and (consp a) (fixnump (car a)))
+       ;; fill-pointer wrapper: dimension 0 is underlying length
+       (if (= n 0) (array-length (cdr a)) 0))
+      ((and (consp a) (consp (car a)))
+       ;; displaced wrapper: dimension 0 is declared size
+       (if (= n 0) (car (car a)) 0))
+      ((= n 0) (array-length a))
+      (t 0))))
 (defun array-total-size (a)
-  (cond
-    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-     (array-length (cddr a)))
-    (t (array-length a))))
+  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+    (cond
+      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+       (array-length (cddr a)))
+      ((and (consp a) (fixnump (car a)))
+       (array-length (cdr a)))
+      ((and (consp a) (consp (car a)))
+       (car (car a)))
+      (t (array-length a)))))
 (defun array-rank (a)
-  (cond
-    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-     (let ((n 0) (dims (cadr a)))
-       (loop (when (null dims) (return n))
-         (setq n (+ n 1))
-         (setq dims (cdr dims)))))
-    (t 1)))
-(defun adjustable-array-p (a) nil)
+  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+    (cond
+      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+       (let ((n 0) (dims (cadr a)))
+         (loop (when (null dims) (return n))
+           (setq n (+ n 1))
+           (setq dims (cdr dims)))))
+      (t 1))))
+(defun adjustable-array-p (a)
+  "True iff A was created with :adjustable t.  Detected by the outer
+   marker (cons 8765432 ...) the build-ansi-test rewriter emits."
+  (if (consp a) (eql (car a) 8765432) nil))
+
+(defun %unadj (a)
+  "Peel the (cons 8765432 ...) adjustable wrapper if present."
+  (if (and (consp a) (eql (car a) 8765432)) (cdr a) a))
 
 (defun array-displacement (a)
   "Return (values displaced-to displaced-index-offset) or (values nil 0)."
   ;; Displaced arrays represented as (cons (cons size offset) base-array)
-  (if (and (consp a) (consp (car a)))
-      (values (cdr a) (cdr (car a)))
-      (values nil 0)))
+  (let ((a (%unadj a)))
+    (if (and (consp a) (consp (car a)))
+        (values (cdr a) (cdr (car a)))
+        (values nil 0))))
 
 (defun adjust-array (a new-size &rest args)
-  "Return new array of NEW-SIZE with elements from A (or displacement target).
-   Does not modify A in place (since adjustable-array-p always returns nil).
-   Handles :displaced-to and :displaced-index-offset keywords.
-   NEW-SIZE may be an integer (new vector length) or a 1-element list
-   like '(11); the list form is normalized first because make-array's
-   variable-size path otherwise interprets the cons pointer as a length."
+  "Return an array of NEW-SIZE with elements from A.
+   When A is adjustable (outer (cons 8765432 ...)), we modify A in place so
+   (eq a (adjust-array a ...)) holds, as required by ANSI for adjustable
+   arrays.  For non-adjustable A, return a fresh array.
+   Handles :displaced-to, :displaced-index-offset, :fill-pointer,
+   :initial-element, :initial-contents."
   (when (consp new-size) (setq new-size (car new-size)))
   (let* ((displaced-to nil)
          (displaced-offset 0)
+         (fp-arg :unset)
+         (init-elem :unset)
+         (init-contents :unset)
          (cur args))
     ;; Parse keyword args
     (loop
       (when (null cur) (return nil))
       (let ((k (car cur)) (v (cadr cur)))
         (cond
-          ((eq k :displaced-to)
-           (setq displaced-to v)
-           (setq cur (cddr cur)))
-          ((eq k :displaced-index-offset)
-           (setq displaced-offset v)
-           (setq cur (cddr cur)))
-          (t (setq cur (cddr cur))))))
-    (if displaced-to
-        ;; Return displaced array: (cons (cons new-size offset) base-array)
-        (cons (cons new-size displaced-offset) displaced-to)
-        ;; Return new array with elements from a (up to new-size)
-        (let ((new-arr (make-array new-size))
-              (src-arr (if (and (consp a) (consp (car a)))
-                           ;; a is displaced: get base array
-                           (cdr a)
-                           a))
-              (src-offset (if (and (consp a) (consp (car a)))
-                              (cdr (car a))
-                              0)))
-          (let ((i 0) (old-size (array-length src-arr)))
-            (loop
-              (when (>= i new-size) (return new-arr))
-              (let ((src-idx (+ src-offset i)))
-                (when (< src-idx old-size)
-                  (aset new-arr i (aref src-arr src-idx))))
-              (setq i (+ i 1))))))))
+          ((eq k :displaced-to)            (setq displaced-to v)       (setq cur (cddr cur)))
+          ((eq k :displaced-index-offset)  (setq displaced-offset v)   (setq cur (cddr cur)))
+          ((eq k :fill-pointer)            (setq fp-arg v)             (setq cur (cddr cur)))
+          ((eq k :initial-element)         (setq init-elem v)          (setq cur (cddr cur)))
+          ((eq k :initial-contents)        (setq init-contents v)      (setq cur (cddr cur)))
+          (t                               (setq cur (cddr cur))))))
+    (let* ((adj-p (and (consp a) (eql (car a) 8765432)))
+           (inner (if adj-p (cdr a) a))
+           (had-fp (and (consp inner) (fixnump (car inner))))
+           ;; Compute the source plain array & its current length / offset.
+           (src-arr (cond
+                      ((and (consp inner) (consp (car inner))) (cdr inner))   ; displaced
+                      ((consp inner) (cdr inner))                              ; fp wrapper
+                      (t inner)))
+           (src-offset (cond
+                         ((and (consp inner) (consp (car inner))) (cdr (car inner)))
+                         (t 0)))
+           (src-len (array-length src-arr))
+           (string-elt (stringp src-arr)))
+      ;; Build the new flat array contents.
+      (let ((new-arr (cond
+                       (displaced-to
+                        ;; Displaced: don't allocate; just point at base
+                        nil)
+                       ((and (eq init-contents :unset) (eq init-elem :unset))
+                        ;; Copy first min(new-size, src-len) from src
+                        (let ((nb (if string-elt
+                                      (%make-string-array new-size)
+                                      (make-array new-size)))
+                              (i 0))
+                          (loop
+                            (when (>= i new-size) (return nb))
+                            (let ((si (+ src-offset i)))
+                              (when (< si src-len)
+                                (aset nb i (aref src-arr si))))
+                            (setq i (+ i 1)))))
+                       ((not (eq init-elem :unset))
+                        (let ((nb (if string-elt
+                                      (%make-string-array new-size)
+                                      (make-array new-size)))
+                              (i 0))
+                          (loop
+                            (when (>= i new-size) (return nb))
+                            (let ((si (+ src-offset i)))
+                              (if (< si src-len)
+                                  (aset nb i (aref src-arr si))
+                                  (aset nb i init-elem)))
+                            (setq i (+ i 1)))))
+                       ((not (eq init-contents :unset))
+                        (let ((nb (if string-elt
+                                      (%make-string-array new-size)
+                                      (make-array new-size))))
+                          ;; Walk init-contents and aset
+                          (let ((i 0) (cur init-contents))
+                            (loop
+                              (when (>= i new-size) (return nb))
+                              (when (consp cur)
+                                (aset nb i (car cur))
+                                (setq cur (cdr cur)))
+                              (setq i (+ i 1)))
+                            nb))))))
+        ;; Build the inner shape (fp-wrapper, displaced-wrapper, or plain).
+        (let ((new-inner
+               (cond
+                 (displaced-to
+                  (cons (cons new-size displaced-offset) displaced-to))
+                 (had-fp
+                  ;; preserve / update fill pointer
+                  (let ((new-fp (cond
+                                  ((eq fp-arg :unset) (if (< (car inner) new-size) (car inner) new-size))
+                                  ((eq fp-arg t) new-size)
+                                  ((null fp-arg) (if (< (car inner) new-size) (car inner) new-size))
+                                  (t fp-arg))))
+                    (cons new-fp new-arr)))
+                 ((and (not (eq fp-arg :unset)) fp-arg (not (eq fp-arg nil)))
+                  ;; new fill pointer
+                  (cons (if (eq fp-arg t) new-size fp-arg) new-arr))
+                 (t new-arr))))
+          (cond
+            (adj-p
+             ;; In-place update: mutate the outer cons so EQ holds.
+             (set-cdr a new-inner)
+             a)
+            (t
+             ;; Non-adjustable: return a fresh value.
+             new-inner)))))))
 
 (defun row-major-aref (a idx) (aref a idx))
 (defun set-row-major-aref (a idx val) (aset a idx val) val)
 (defun char-type-error-check (fn x) nil)
 (defun fp-array-p (x)
-  "Check if x is a fill-pointer array wrapper (cons fixnum string)."
-  (if (consp x)
-      (if (fixnump (car x))
-          (stringp (cdr x))
-          nil)
-      nil))
+  "Check if x is a fill-pointer array wrapper (cons fixnum string).
+   Peels (cons 8765432 ...) adjustable layer first."
+  (let ((y (%unadj x)))
+    (if (consp y)
+        (if (fixnump (car y))
+            (stringp (cdr y))
+            nil)
+        nil)))
 (defun displaced-array-p (x)
   "Check if x is a displaced array wrapper (cons (cons :displaced offset) string)."
-  (if (consp x)
-      (if (consp (car x))
-          (stringp (cdr x))
-          nil)
-      nil))
+  (let ((y (%unadj x)))
+    (if (consp y)
+        (if (consp (car y))
+            (stringp (cdr y))
+            nil)
+        nil)))
 (defun array-wrapper-p (x)
   "Check if x is a fill-pointer or displaced array wrapper."
-  (if (consp x) (if (stringp (cdr x)) t nil) nil))
+  (let ((y (%unadj x)))
+    (if (consp y) (if (stringp (cdr y)) t nil) nil)))
 (defun wrapper-effective-length (w)
   "Get effective length of a fill-pointer or displaced array wrapper."
-  (if (fixnump (car w))
-      (car w)   ; fill-pointer
-      (car (car w))))
+  (let ((y (%unadj w)))
+    (if (fixnump (car y))
+        (car y)   ; fill-pointer
+        (car (car y)))))
 (defun wrapper-offset (w)
   "Get offset for displaced array wrapper, 0 for fill-pointer."
-  (if (fixnump (car w)) 0 (cdr (car w))))
+  (let ((y (%unadj w)))
+    (if (fixnump (car y)) 0 (cdr (car y)))))
 (defun wrapper-aref (w i)
   "AREF on a fill-pointer or displaced array wrapper."
-  (aref (cdr w) (+ (wrapper-offset w) i)))
+  (let ((y (%unadj w)))
+    (aref (cdr y) (+ (wrapper-offset y) i))))
 (defun wrapper-aset (w i val)
   "ASET on a fill-pointer or displaced array wrapper."
-  (aset (cdr w) (+ (wrapper-offset w) i) val))
+  (let ((y (%unadj w)))
+    (aset (cdr y) (+ (wrapper-offset y) i) val)))
 (defun copy-seq (seq)
   (if (consp seq)
       (if (array-wrapper-p seq)

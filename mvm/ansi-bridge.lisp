@@ -812,67 +812,84 @@
 ;;; Vectors with fill-pointers are represented as (cons fill-pointer underlying-array).
 ;;; Regular arrays are just arrays (no fill pointer support).
 
+;; Helper: peel adjustable wrapper if present.  Returns the inner cell
+;; (which is either an array, a fill-pointer wrapper, a displaced wrapper,
+;; or a multi-dim wrapper).
+(defun %fp-inner (arr)
+  (if (and (consp arr) (eql (car arr) 8765432)) (cdr arr) arr))
+
 (defun array-has-fill-pointer-p (arr)
-  "True if ARR has a fill pointer."
-  (consp arr))
+  "True if ARR has a fill pointer.
+   Plain (cons fp underlying) → T.  (cons 8765432 (cons fp underlying)) → T.
+   (cons 8765432 underlying) → NIL (adjustable but no fp)."
+  (let ((y (%fp-inner arr)))
+    (if (consp y) (fixnump (car y)) nil)))
 
 (defun fill-pointer (arr)
-  "Return the fill pointer of ARR."
-  (if (consp arr) (car arr) nil))
+  "Return the fill pointer of ARR (NIL if none)."
+  (let ((y (%fp-inner arr)))
+    (if (and (consp y) (fixnump (car y))) (car y) nil)))
 
 (defun set-fill-pointer (arr val)
   "Set fill pointer of ARR to VAL."
-  (when (consp arr)
-    (set-car arr val))
-  val)
+  (let ((y (%fp-inner arr)))
+    (when (and (consp y) (fixnump (car y)))
+      (set-car y val))
+    val))
 
 (defun vector-push (new-element vector)
   "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil."
-  (if (consp vector)
-      (let ((fp (car vector))
-            (arr (cdr vector)))
-        (let ((len (array-length arr)))
-          (if (>= fp len)
-              nil
-              (progn
-                (aset arr fp new-element)
-                (set-car vector (+ fp 1))
-                fp))))
-      nil))
+  (let ((vector (%fp-inner vector)))
+    (if (and (consp vector) (fixnump (car vector)))
+        (let ((fp (car vector))
+              (arr (cdr vector)))
+          (let ((len (array-length arr)))
+            (if (>= fp len)
+                nil
+                (progn
+                  (aset arr fp new-element)
+                  (set-car vector (+ fp 1))
+                  fp))))
+        nil)))
 
 (defun vector-push-extend (new-element vector &rest args)
   "Push NEW-ELEMENT onto VECTOR, extending if needed."
-  (if (consp vector)
-      (let ((fp (car vector))
-            (arr (cdr vector)))
-        (let ((len (array-length arr)))
-          (when (>= fp len)
-            ;; Extend: create new array, copy old, replace
-            (let ((new-len (max (* len 2) (+ fp 1)))
-                  (new-arr nil))
-              (setq new-arr (make-array new-len))
-              (let ((i 0))
-                (loop
-                  (when (>= i len) (return))
-                  (aset new-arr i (aref arr i))
-                  (setq i (+ i 1))))
-              (set-cdr vector new-arr)
-              (setq arr new-arr)))
-          (aset (cdr vector) fp new-element)
-          (set-car vector (+ fp 1))
-          fp))
-      nil))
+  (let ((vector (%fp-inner vector)))
+    (if (and (consp vector) (fixnump (car vector)))
+        (let ((fp (car vector))
+              (arr (cdr vector)))
+          (let ((len (array-length arr)))
+            (when (>= fp len)
+              ;; Extend: create new array, copy old, replace
+              (let ((new-len (max (* len 2) (+ fp 1)))
+                    (new-arr nil))
+                ;; Use string array if old underlying is a string; else generic.
+                (if (stringp arr)
+                    (setq new-arr (%make-string-array new-len))
+                    (setq new-arr (make-array new-len)))
+                (let ((i 0))
+                  (loop
+                    (when (>= i len) (return))
+                    (aset new-arr i (aref arr i))
+                    (setq i (+ i 1))))
+                (set-cdr vector new-arr)
+                (setq arr new-arr)))
+            (aset (cdr vector) fp new-element)
+            (set-car vector (+ fp 1))
+            fp))
+        nil)))
 
 (defun vector-pop (vector)
   "Pop an element from VECTOR (with fill pointer)."
-  (if (consp vector)
-      (let ((fp (car vector)))
-        (if (> fp 0)
-            (let ((new-fp (- fp 1)))
-              (set-car vector new-fp)
-              (aref (cdr vector) new-fp))
-            (error "vector-pop: empty vector")))
-      (error "vector-pop: no fill pointer")))
+  (let ((vector (%fp-inner vector)))
+    (if (and (consp vector) (fixnump (car vector)))
+        (let ((fp (car vector)))
+          (if (> fp 0)
+              (let ((new-fp (- fp 1)))
+                (set-car vector new-fp)
+                (aref (cdr vector) new-fp))
+              (error "vector-pop: empty vector")))
+        (error "vector-pop: no fill pointer"))))
 
 ;;; ============================================================
 ;;; set operations (set-exclusive-or, nset-exclusive-or)
@@ -1289,13 +1306,23 @@
 
 (defun array-dimensions (a)
   "Return list of dimensions of array A.
-   Detects multi-dim wrapper: (cons 9867654 (cons DIMS-LIST FLAT-ARR))."
-  (cond
-    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-     (cadr a))
-    ((arrayp a) (list (array-length a)))
-    ((stringp a) (list (array-length a)))
-    (t nil)))
+   Peels (cons 8765432 ...) adjustable wrapper.
+   Detects multi-dim wrapper: (cons 9867654 (cons DIMS-LIST FLAT-ARR)).
+   Detects fill-pointer wrapper: (cons FP underlying).
+   Detects displaced wrapper: (cons (cons SIZE OFFSET) underlying)."
+  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+    (cond
+      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+       (cadr a))
+      ((and (consp a) (fixnump (car a)))
+       ;; fill-pointer wrapper — declared dim is underlying length
+       (list (array-length (cdr a))))
+      ((and (consp a) (consp (car a)))
+       ;; displaced wrapper — declared dim is the size in the head cons
+       (list (car (car a))))
+      ((arrayp a) (list (array-length a)))
+      ((stringp a) (list (array-length a)))
+      (t nil))))
 
 (defun upgraded-array-element-type (type)
   "Return the upgraded element type (simplified to T for all)."

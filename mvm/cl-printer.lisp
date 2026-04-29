@@ -324,6 +324,9 @@
       ;; Symbol
       ((or (%cl-sym-p obj) (eq obj t) (null obj))
        (%print-symbol-to-stream obj stream))
+      ;; Adjustable wrapper: (cons 8765432 inner) — peel and recurse
+      ((and (consp obj) (eql (car obj) 8765432) (consp (cdr obj)))
+       (%write-obj (cdr obj) stream level escape))
       ;; Multi-dim array wrapper: (cons 9867654 (cons DIMS FLAT-ARR))
       ((and (consp obj) (eql (car obj) 9867654) (consp (cdr obj)))
        (cond

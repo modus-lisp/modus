@@ -1448,32 +1448,108 @@
     (when (null class-name) (return-from allocate-instance nil))
     (%make-instance class-name)))
 
-(defun shared-initialize (instance slot-names &rest initargs)
-  "Initialize slots of INSTANCE."
-  instance)
+(defun %shared-initialize-default (instance slot-names &rest initargs)
+  "Default method body for SHARED-INITIALIZE.
+   Per ANSI:
+     - For each slot-name in INSTANCE's class:
+       1. If an initarg in INITARGS names this slot, set to its value (leftmost wins).
+       2. Else if (eq slot-names t) or (member slot-name slot-names),
+          and slot is currently unbound, apply initform if present.
+       3. Else leave slot alone.
+   Returns INSTANCE."
+  (when (or (null instance) (not (%clos-instance-p instance)))
+    (return-from %shared-initialize-default instance))
+  (let* ((class-name (aref instance 1))
+         (cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %shared-initialize-default instance))
+    (let* ((slot-list (aref cls 2))
+           (inst-len (array-length instance))
+           (set-slots nil))
+      ;; 1. Apply initargs first (leftmost wins).
+      (let ((cur initargs))
+        (loop
+          (when (null cur) (return nil))
+          (when (null (cdr cur)) (return nil))
+          (let* ((key (car cur))
+                 (val (car (cdr cur)))
+                 (slot-nm (%clos-initarg-to-slot class-name key)))
+            (when (and slot-nm (not (member slot-nm set-slots)))
+              (let ((idx (%clos-slot-index cls slot-nm)))
+                (when (and idx (< (+ 2 idx) inst-len))
+                  (aset instance (+ 2 idx) val)
+                  (setq set-slots (cons slot-nm set-slots))))))
+          (setq cur (cdr (cdr cur)))))
+      ;; 2. Then apply initforms for slots in slot-names that are still unbound.
+      (let ((sn slot-list) (idx 0))
+        (loop
+          (when (null sn) (return nil))
+          (when (< (+ 2 idx) inst-len)
+            (let* ((nm (car sn))
+                   (already-set (member nm set-slots))
+                   (covered (cond ((eq slot-names t) t)
+                                  ((null slot-names) nil)
+                                  (t (member nm slot-names))))
+                   (cur-val (aref instance (+ 2 idx)))
+                   (was-unbound (and (fixnump cur-val) (= cur-val -999))))
+              (when (and (not already-set) covered was-unbound)
+                (let ((thunk (%clos-initform-thunk class-name nm)))
+                  (when thunk
+                    (aset instance (+ 2 idx) (funcall thunk)))))))
+          (setq idx (+ idx 1))
+          (setq sn (cdr sn))))
+      instance)))
 
-(defun change-class (instance new-class &rest initargs)
-  "Change INSTANCE's class to NEW-CLASS, preserving same-named slots.
+(defun %dispatch-shared-init (args)
+  "Inline dispatch for SHARED-INITIALIZE.  Direct call to default fn
+   when no user methods exist on the GF (cheap path); GF dispatch when
+   they do.  funcall on a quoted symbol would require the symbol-function
+   table to know about the default, which it doesn't for our internal
+   helpers — so we call the bare defun by name in the fast path."
+  (let ((gf (%find-gf 'shared-initialize)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%shared-init-default-spread args)))
+        (%shared-init-default-spread args))))
+
+(defun %shared-init-default-spread (args)
+  "Spread the args list to call %shared-initialize-default by name."
+  (let ((n (length args)))
+    (cond
+      ((= n 0) (%shared-initialize-default nil nil))
+      ((= n 1) (%shared-initialize-default (car args) nil))
+      ((= n 2) (%shared-initialize-default (car args) (cadr args)))
+      ((= n 3) (%shared-initialize-default (car args) (cadr args) (caddr args)))
+      ((= n 4) (%shared-initialize-default (car args) (cadr args) (caddr args)
+                                           (cadddr args)))
+      (t (%shared-initialize-default (car args) (cadr args) (caddr args)
+                                     (cadddr args) (cadddr (cdr args)))))))
+
+(defun shared-initialize (&rest %sh-args)
+  "SHARED-INITIALIZE generic function entry.  Falls through to
+   %shared-initialize-default unless user methods were defined."
+  (%dispatch-shared-init %sh-args))
+
+(defun %change-class-default (instance new-class &rest initargs)
+  "Default method body for CHANGE-CLASS.
    Mutates INSTANCE in place (preserves identity) so EQ holds.
 
    Limitations vs full ANSI:
    - No update-instance-for-different-class hook is invoked.
-   - No before/after/around methods on change-class itself
-     (those tests exercise generic-function dispatch on change-class
-     which we do not register here).
    - If NEW-CLASS has more slots than the underlying array allocates,
      trailing slots may be inaccessible (we cap at the array size).
    - :allocation :class is treated as :instance — class-shared slots
      not implemented.
    - allow-other-keys checking not enforced."
-  (when (null instance) (return-from change-class instance))
-  (when (not (%clos-instance-p instance)) (return-from change-class instance))
+  (when (null instance) (return-from %change-class-default instance))
+  (when (not (%clos-instance-p instance)) (return-from %change-class-default instance))
   ;; Resolve new-class to a class object
   (let ((new-cls (cond
                    ((symbolp new-class) (%find-clos-class new-class))
                    ((%clos-class-p new-class) new-class)
                    (t nil))))
-    (when (null new-cls) (return-from change-class instance))
+    (when (null new-cls) (return-from %change-class-default instance))
     (let* ((new-name (aref new-cls 1))
            (new-slot-names (aref new-cls 2))
            (old-name (aref instance 1))
@@ -1546,6 +1622,35 @@
                   (setq set-slots (cons slot-nm set-slots))))))
           (setq cur (cdr (cdr cur)))))
       instance)))
+
+(defun %dispatch-change-class (args)
+  "Inline dispatch for CHANGE-CLASS — direct call to default unless GF
+   has user methods (cheap path)."
+  (let ((gf (%find-gf 'change-class)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%change-class-default-spread args)))
+        (%change-class-default-spread args))))
+
+(defun %change-class-default-spread (args)
+  "Spread args list to %change-class-default by name (no funcall-on-symbol)."
+  (let ((n (length args)))
+    (cond
+      ((= n 0) (%change-class-default nil nil))
+      ((= n 1) (%change-class-default (car args) nil))
+      ((= n 2) (%change-class-default (car args) (cadr args)))
+      ((= n 3) (%change-class-default (car args) (cadr args) (caddr args)))
+      ((= n 4) (%change-class-default (car args) (cadr args) (caddr args)
+                                      (cadddr args)))
+      (t (%change-class-default (car args) (cadr args) (caddr args)
+                                (cadddr args) (cadddr (cdr args)))))))
+
+(defun change-class (&rest %cc-args)
+  "CHANGE-CLASS generic function entry.  Falls through to
+   %change-class-default unless user methods were defined."
+  (%dispatch-change-class %cc-args))
 
 (defun update-instance-for-redefined-class (instance added-slots discarded-slots plist &rest initargs)
   instance)

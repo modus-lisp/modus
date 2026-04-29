@@ -98,13 +98,21 @@
 
 (defun %obj-cpl (obj)
   "Return CPL for OBJ as list of class names."
-  (if (%clos-instance-p obj)
-    (let ((cls-name (aref obj 1)))
-      (let ((cls (%find-clos-class cls-name)))
-        (if cls
-          (aref cls 4)
-          (list cls-name 't))))
-    (%builtin-cpl (%type-of-for-dispatch obj))))
+  (cond
+    ((%clos-instance-p obj)
+     (let ((cls-name (aref obj 1)))
+       (let ((cls (%find-clos-class cls-name)))
+         (if cls
+           (aref cls 4)
+           (list cls-name 't)))))
+    ;; A CLOS class descriptor itself is an instance of standard-class
+    ;; (per CLHS) for dispatch purposes. Tests like change-class.6.x
+    ;; specialize on (new-class standard-class) — so class objects need
+    ;; standard-class in their CPL.
+    ((%clos-class-p obj)
+     '(standard-class class standard-object t))
+    (t
+     (%builtin-cpl (%type-of-for-dispatch obj)))))
 
 (defun %clos-instance-p (x)
   "True if X is a CLOS instance array."

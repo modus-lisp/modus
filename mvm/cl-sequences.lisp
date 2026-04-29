@@ -1317,11 +1317,27 @@
   (let ((kind (%concat-result-kind result-type)))
     (cond
       ((eq kind :list)
-       (let ((r nil))
-         (dolist (s (nreverse seqs))
-           (if (consp s) (setq r (append s r))
-               (dotimes (i (length s)) (setq r (append r (list (elt s i)))))))
-         r))
+       ;; Walk seqs in order, splicing each onto a tail-pointer chain so
+       ;; the result preserves the input order (was reversed for vectors:
+       ;; the old code mixed (append s r) for cons with (append r (...))
+       ;; for vectors, producing wrong order on mixed-type input).
+       (let* ((head (cons nil nil))
+              (tail head))
+         (dolist (s seqs)
+           (cond
+             ((null s) nil)
+             ((consp s)
+              (dolist (e s)
+                (setf (cdr tail) (cons e nil))
+                (setq tail (cdr tail))))
+             (t
+              (let ((n (length s)) (i 0))
+                (loop
+                  (when (>= i n) (return nil))
+                  (setf (cdr tail) (cons (elt s i) nil))
+                  (setq tail (cdr tail))
+                  (setq i (+ i 1)))))))
+         (cdr head)))
       ((eq kind :string)
        (let ((total 0))
          (dolist (s seqs) (setq total (+ total (%concat-elt-count s))))

@@ -1366,6 +1366,121 @@
   "ASET on a fill-pointer or displaced array wrapper."
   (let ((y (%unadj w)))
     (aset (cdr y) (+ (wrapper-offset y) i) val)))
+
+;;; ===========================================================================
+;;; %WRAPPER-AREF / %WRAPPER-ASET / %WRAPPER-ARRAY-LENGTH
+;;;
+;;; Universal wrapper-peeling helpers — handle every array-wrapper variant
+;;; (adjustable / fp / displaced / multi-dim).  Used by the wrapper-aware
+;;; AREF/ASET/ARRAY-LENGTH front-ends in compiler.lisp; they emit a
+;;; (consp arr) test that routes to these helpers when the input is a
+;;; cons-wrapped array.
+;;;
+;;; Each helper accepts ANY value (cons or not) and falls back to the
+;;; primitive op via %prim-aref / %prim-aset / %prim-array-length when the
+;;; input is not a wrapper.  This makes them safe to call directly from
+;;; user code that passes mixed-shape arrays.
+;;; ===========================================================================
+
+;; Disambiguate a (cons fp underlying) or (cons (cons size off) underlying)
+;; wrapper from an ordinary list by checking that CDR (chain) points at a
+;; real array or string within one cons hop.  This is what keeps
+;; `(aref '(1 2 3) 0)` etc. from spuriously routing into the wrapper path.
+;;
+;; Bounded at one cons hop (O(1), not O(list-length)) — recursing through a
+;; long list to reject it would blow the stack on `(length (make-list N))`
+;; for large N.  Adjustable wrappers (car == 8765432) are tested before
+;; this helper is reached, so the deepest legitimate shape we need to
+;; recognise is one cons (fp or displaced) over array/string.
+(defun %cdr-is-array-or-wrapper-p (x)
+  (let ((u (cdr x)))
+    (cond
+      ((null u) nil)
+      ((%prim-stringp u) t)
+      ((arrayp u) t)
+      ((not (consp u)) nil)
+      ;; one cons deep — recognise nested wrapper terminating in array/string
+      (t (let ((uu (cdr u)))
+           (cond
+             ((null uu) nil)
+             ((%prim-stringp uu) t)
+             ((arrayp uu) t)
+             (t nil)))))))
+
+(defun %wrapper-aref (w i)
+  (cond
+    ;; adjustable wrapper: peel and recurse
+    ((eql (car w) 8765432)
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-aref u i) (%prim-aref u i))))
+    ;; multi-dim: index into flat backing array
+    ((and (eql (car w) 9867654) (consp (cdr w)))
+     (%prim-aref (cddr w) i))
+    ;; fp-wrapper: aref underlying
+    ((and (fixnump (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-aref u i) (%prim-aref u i))))
+    ;; displaced wrapper: aref underlying at offset+i
+    ((and (consp (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)) (off (cdr (car w))))
+       (if (consp u)
+           (%wrapper-aref u (+ off i))
+           (%prim-aref u (+ off i)))))
+    ;; not a wrapper — fall back to primitive (caller passed a real list etc.)
+    (t (%prim-aref w i))))
+
+(defun %wrapper-aset (w i val)
+  (cond
+    ((eql (car w) 8765432)
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-aset u i val) (%prim-aset u i val))))
+    ((and (eql (car w) 9867654) (consp (cdr w)))
+     (%prim-aset (cddr w) i val))
+    ((and (fixnump (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-aset u i val) (%prim-aset u i val))))
+    ((and (consp (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)) (off (cdr (car w))))
+       (if (consp u)
+           (%wrapper-aset u (+ off i) val)
+           (%prim-aset u (+ off i) val))))
+    (t (%prim-aset w i val))))
+
+;;; %wrapper-array-length: ARRAY-LENGTH semantics — returns the underlying
+;;; storage size (NOT the fill-pointer).  ARRAY-IN-BOUNDS-P relies on this
+;;; matching the actual array dimension (e.g. fp 5 in length-10 backing →
+;;; in-bounds for indices 0..9).
+(defun %wrapper-array-length (w)
+  (cond
+    ((eql (car w) 8765432)
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-array-length u) (%prim-array-length u))))
+    ((and (eql (car w) 9867654) (consp (cdr w)))
+     (%prim-array-length (cddr w)))
+    ((and (fixnump (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-array-length u) (%prim-array-length u))))
+    ((and (consp (car w)) (%cdr-is-array-or-wrapper-p w))
+     ;; displaced wrapper: declared SIZE is car of car
+     (car (car w)))
+    (t (%prim-array-length w))))
+
+;;; %wrapper-stringp: STRINGP semantics — true iff the underlying storage is
+;;; a string.  Handles all wrapper variants by recursing through the layers.
+(defun %wrapper-stringp (w)
+  (cond
+    ((eql (car w) 8765432)
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-stringp u) (%prim-stringp u))))
+    ((and (eql (car w) 9867654) (consp (cdr w)))
+     (%prim-stringp (cddr w)))
+    ((and (fixnump (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-stringp u) (%prim-stringp u))))
+    ((and (consp (car w)) (%cdr-is-array-or-wrapper-p w))
+     (let ((u (cdr w)))
+       (if (consp u) (%wrapper-stringp u) (%prim-stringp u))))
+    (t nil)))
 (defun copy-seq (seq)
   (if (consp seq)
       (if (array-wrapper-p seq)

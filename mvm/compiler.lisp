@@ -2012,6 +2012,20 @@
       ((= op-name 216456113736582507)            (compile-aref (cadr form) (caddr form) env dest))
       ((= op-name 416706424900304020)             (compile-aset (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
+      ;; %PRIM-AREF / %PRIM-ASET / %PRIM-ARRAY-LENGTH / %PRIM-STRINGP —
+      ;; non-wrapper-peeling variants used internally by the wrapper-aware
+      ;; trampolines emitted by compile-aref/compile-aset/compile-array-length/
+      ;; compile-stringp.  They emit the raw opcodes directly without testing
+      ;; for fp/displaced/adjustable wrappers.  Use these only when the arg
+      ;; is known not to be a wrapper.
+      ((= op-name (compute-name-hash "%PRIM-AREF"))
+       (compile-prim-aref (cadr form) (caddr form) env dest))
+      ((= op-name (compute-name-hash "%PRIM-ASET"))
+       (compile-prim-aset (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name (compute-name-hash "%PRIM-ARRAY-LENGTH"))
+       (compile-prim-array-length (cadr form) env dest))
+      ((= op-name (compute-name-hash "%PRIM-STRINGP"))
+       (compile-prim-stringp (cadr form) env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -5672,9 +5686,21 @@
   "Compile (symbolp x) - true if object with symbol subtag #x50"
   (compile-object-subtype-p arg env dest +subtag-symbol+))
 
-(defun compile-stringp (arg env dest)
-  "Compile (stringp x)"
+(defun compile-prim-stringp (arg env dest)
+  "Compile primitive (stringp x) — checks subtag without wrapper peel."
   (compile-object-subtype-p arg env dest +subtag-string+))
+
+(defun compile-stringp (arg env dest)
+  "Compile (stringp x).  Routes wrapper inputs (cons-headed arrays) through
+   %wrapper-stringp so adj/fp/displaced wrappers around strings still
+   report STRINGP=T."
+  (let ((g-arg (gensym "STRPA")))
+    (compile-form
+     `(let ((,g-arg ,arg))
+        (if (consp ,g-arg)
+            (%wrapper-stringp ,g-arg)
+            (%prim-stringp ,g-arg)))
+     env dest)))
 
 (defun compile-arrayp (arg env dest)
   "Compile (arrayp x)"
@@ -6460,17 +6486,17 @@
         ;; ALLOC-ARRAY uses subtag #x32. Use ALLOC-STRING for #x31.
         (emit-ir :alloc-string dest dest))))
 
-(defun compile-aref (arr-form idx-form env dest)
-  "Compile (aref array index).
-   Constant index uses OBJ-REF; variable index uses AREF opcode."
+;;; %PRIM-AREF / %PRIM-ASET / %PRIM-ARRAY-LENGTH — primitive (non-peeling)
+;;; emitters.  These do NOT check for fp/displaced/adjustable wrappers;
+;;; they emit the raw opcode and assume the array argument is a real array.
+;;; compile-aref/compile-aset/compile-array-length wrap these in a runtime
+;;; consp check so wrapper inputs route to the helper trampolines.
+(defun compile-prim-aref (arr-form idx-form env dest)
   (if (integerp idx-form)
-      ;; Constant index — use OBJ-REF
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
         (emit-ir :obj-ref dest arr-reg idx-form)
         (free-temp-reg))
-      ;; Variable index — use AREF opcode
-      ;; AREF expects tagged fixnum index: SHL 2 with tagged gives real_idx*8
       (let ((arr-reg (alloc-temp-reg))
             (idx-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
@@ -6479,11 +6505,8 @@
         (free-temp-reg)
         (free-temp-reg))))
 
-(defun compile-aset (arr-form idx-form val-form env dest)
-  "Compile (aset array index value).
-   Constant index uses OBJ-SET; variable index uses ASET opcode."
+(defun compile-prim-aset (arr-form idx-form val-form env dest)
   (if (integerp idx-form)
-      ;; Constant index — use OBJ-SET
       (let ((arr-reg (alloc-temp-reg))
             (val-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
@@ -6492,9 +6515,6 @@
         (emit-ir :mov dest val-reg)
         (free-temp-reg)
         (free-temp-reg))
-      ;; Variable index — use ASET opcode
-      ;; ASET expects tagged fixnum index: SHL 2 with tagged gives real_idx*8
-      ;; Use dedicated val-reg to avoid VR=scratch(RAX) clobber in translator
       (let ((arr-reg (alloc-temp-reg))
             (idx-reg (alloc-temp-reg))
             (val-reg (alloc-temp-reg)))
@@ -6507,10 +6527,55 @@
         (free-temp-reg)
         (free-temp-reg))))
 
-(defun compile-array-length (arr-form env dest)
-  "Compile (array-length array). Extracts element count from header."
+(defun compile-prim-array-length (arr-form env dest)
   (compile-form arr-form env dest)
   (emit-ir :array-len dest dest))
+
+;;; AREF / ASET / ARRAY-LENGTH — wrapper-aware front-ends.
+;;;
+;;; Build commit 7c9a463 introduced array wrappers
+;;;   adjustable-only:   (cons 8765432 underlying)
+;;;   adjustable + fp:   (cons 8765432 (cons fp underlying))
+;;;   fp-only:           (cons fp underlying)            (fp = fixnum)
+;;;   displaced:         (cons (cons size offset) underlying)
+;;; that downstream inline ops (AREF/ASET/ARRAY-LEN opcodes, OBJ-REF,
+;;; OBJ-SET) don't peel.  We rewrite each call site to a runtime cons
+;;; check that routes wrapped arrays through %wrapper-aref / %wrapper-aset
+;;; / %wrapper-length helpers (defined in cl-clos.lisp).  Plain (non-cons)
+;;; arrays go straight to the primitive op so the common case stays fast
+;;; (one consp test).
+(defun compile-aref (arr-form idx-form env dest)
+  "Compile (aref array index).  Routes wrapper inputs through %wrapper-aref."
+  (let ((g-arr (gensym "AREFA"))
+        (g-idx (gensym "AREFI")))
+    (compile-form
+     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
+        (if (consp ,g-arr)
+            (%wrapper-aref ,g-arr ,g-idx)
+            (%prim-aref ,g-arr ,g-idx)))
+     env dest)))
+
+(defun compile-aset (arr-form idx-form val-form env dest)
+  "Compile (aset array index value).  Routes wrapper inputs through %wrapper-aset."
+  (let ((g-arr (gensym "ASETA"))
+        (g-idx (gensym "ASETI"))
+        (g-val (gensym "ASETV")))
+    (compile-form
+     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
+        (if (consp ,g-arr)
+            (%wrapper-aset ,g-arr ,g-idx ,g-val)
+            (%prim-aset ,g-arr ,g-idx ,g-val)))
+     env dest)))
+
+(defun compile-array-length (arr-form env dest)
+  "Compile (array-length array). Routes wrapper inputs through %wrapper-array-length."
+  (let ((g-arr (gensym "ALENA")))
+    (compile-form
+     `(let ((,g-arr ,arr-form))
+        (if (consp ,g-arr)
+            (%wrapper-array-length ,g-arr)
+            (%prim-array-length ,g-arr)))
+     env dest)))
 
 ;;; ============================================================
 ;;; Function Call

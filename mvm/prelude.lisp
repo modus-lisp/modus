@@ -499,14 +499,58 @@
       (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
       tree))
 
+(defun %length-cdr-is-array-tail-p (x)
+  "True if X is a real array, a string, or a one-cons-deep wrapper around
+   one.  Used by LENGTH to disambiguate a fp / displaced wrapper from an
+   ordinary list whose car happens to be a fixnum or cons.
+
+   Bounded at one cons hop (so this is O(1), not O(list-length)) — long
+   ANSI lists like `(make-list 200000)` would otherwise blow the stack.
+   The adjustable wrapper layer (cons 8765432 ...) is peeled by LENGTH
+   before invoking this helper, so we only need to recognise fp / displaced
+   shapes here."
+  (cond
+    ((null x) nil)
+    ((arrayp x) t)
+    ((stringp x) t)
+    ((not (consp x)) nil)
+    (t (let ((cd (cdr x)))
+         (cond
+           ((null cd) nil)
+           ((arrayp cd) t)
+           ((stringp cd) t)
+           (t nil))))))
+
 (defun length (seq)
-  "Return the length of SEQ (list or array)."
-  (if (consp seq)
-      (list-length seq)
-      (if (null seq)
-          0
-          ;; Array: read element-count from header
-          (array-length seq))))
+  "Return the length of SEQ (list or array).
+   For array wrappers (commit 7c9a463: adj/fp/displaced/multi-dim wrappers
+   over plain arrays), returns the ANSI length:
+     fp wrapper       → fill pointer
+     adj-only wrapper → length of underlying
+     displaced        → declared size
+     multi-dim        → length of flat backing array
+   Plain conses route through list-length as before.
+   A wrapper is disambiguated from an ordinary list by its CDR (chain)
+   eventually pointing at an array/string rather than NIL/list."
+  (cond
+    ((null seq) 0)
+    ((consp seq)
+     (cond
+       ;; adjustable wrapper marker — always a wrapper, peel and recurse
+       ((eql (car seq) 8765432)
+        (length (cdr seq)))
+       ;; multi-dim wrapper marker
+       ((and (eql (car seq) 9867654) (consp (cdr seq)))
+        (array-length (cddr seq)))
+       ;; fp / displaced wrapper — disambiguate from list by walking cdr chain
+       ((%length-cdr-is-array-tail-p (cdr seq))
+        (cond
+          ((fixnump (car seq)) (car seq))                  ; fp → fill pointer
+          ((consp (car seq))   (car (car seq)))            ; displaced → size
+          (t (list-length seq))))                          ; defensive
+       ;; ordinary list
+       (t (list-length seq))))
+    (t (array-length seq))))
 
 ;;; ============================================================
 ;;; Array Utilities

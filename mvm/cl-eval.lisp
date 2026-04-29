@@ -1070,21 +1070,26 @@
 (defun %string-coerce (x)
   "Coerce X to a flat string. STRING->itself, CHARACTER->1-char string,
    SYMBOL->name. Fill-pointer/displaced array wrappers are flattened to a
-   freshly allocated string of the effective length."
+   freshly allocated string of the effective length.
+
+   Wrapper check goes BEFORE stringp because the wrapper-aware stringp
+   added by compile-stringp peel reports T for fp-wrapped strings, which
+   would otherwise skip the wrapper-flattening branch and leave the
+   subsequent (array-length s) returning the underlying-storage length
+   instead of the fill pointer."
   (cond
-    ((stringp x) x)
+    ((and (consp x) (array-wrapper-p x))
+     (let ((len (wrapper-effective-length x)))
+       (let ((s (%make-string-array len)))
+         (dotimes (i len) (aset s i (wrapper-aref x i)))
+         s)))
+    ((%prim-stringp x) x)
     ((%cl-sym-p x) (%cl-sym-name x))
     ((characterp x)
      (let ((s (%make-string-array 1)))
        (aset s 0 (%ensure-char-code x))
        s))
-    ((consp x)
-     (if (array-wrapper-p x)
-         (let ((len (wrapper-effective-length x)))
-           (let ((s (%make-string-array len)))
-             (dotimes (i len) (aset s i (wrapper-aref x i)))
-             s))
-         x))
+    ((consp x) x)
     (t x)))
 
 (defun %char-bag-list (chars)

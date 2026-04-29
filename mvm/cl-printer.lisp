@@ -11,7 +11,8 @@
 
 ;;; Write a string to stream
 (defun %print-string-raw (str stream)
-  (let ((len (array-length str)) (i 0))
+  ;; LENGTH (fp-aware) so fp-wrapped strings print only their active prefix.
+  (let ((len (length str)) (i 0))
     (loop
       (when (= i len) (return nil))
       (%print-char (aref str i) stream)
@@ -305,12 +306,14 @@
        (%print-integer-in-base (ratio-numerator obj) pbase stream)
        (%print-char 47 stream)  ; /
        (%print-integer-in-base (ratio-denominator obj) pbase stream))
-      ;; String
+      ;; String  (also matches fp-wrapped strings — wrapper-aware stringp
+      ;; reports T for them.  Use LENGTH (fill-pointer aware) instead of
+      ;; ARRAY-LENGTH so the printed form respects the fp truncation.)
       ((stringp obj)
        (if escape
            (progn
              (%print-char 34 stream)  ; "
-             (let ((len (array-length obj)) (i 0))
+             (let ((len (length obj)) (i 0))
                (loop
                  (when (= i len) (return nil))
                  (let ((ch (aref obj i)))

@@ -1829,20 +1829,23 @@
 (defun find (item sequence &rest args)
   "Return the first element of SEQUENCE that matches ITEM.
    :test defaults to inline `eql` (#'eql is unusable in MVM).
-   :test-not is the negation of :test."
-  (let ((test nil) (test-not nil)
-        (key nil) (start 0) (end nil) (from-end nil))
+   :test-not is the negation of :test.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (let ((test nil) (test-not nil) (key nil)
+        (start 0) (end nil) (from-end nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (start-set nil) (end-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :test) (setq test v))
-            ((eq k :test-not) (setq test-not v))
-            ((eq k :key) (setq key v))
-            ((eq k :start) (setq start v))
-            ((eq k :end) (setq end v))
-            ((eq k :from-end) (setq from-end v))))
+            ((eq k :test) (unless test-set (setq test (%resolve-fn v) test-set t)))
+            ((eq k :test-not) (unless tn-set (setq test-not (%resolve-fn v) tn-set t)))
+            ((eq k :key) (unless key-set (setq key (%resolve-fn v) key-set t)))
+            ((eq k :start) (unless start-set (setq start v start-set t)))
+            ((eq k :end) (unless end-set (setq end v end-set t)))
+            ((eq k :from-end) (unless fe-set (setq from-end v fe-set t)))))
         (setq cur (cddr cur))))
     ;; Build effective test predicate that accounts for :test-not.
     (when test-not
@@ -2049,20 +2052,23 @@
 
 (defun position (item sequence &rest args)
   "Return the position of the first ITEM in SEQUENCE satisfying TEST.
-   Supports :test/:test-not/:key/:start/:end/:from-end."
+   Supports :test/:test-not/:key/:start/:end/:from-end.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
   (let ((test nil) (test-not nil) (key nil)
-        (start 0) (end nil) (from-end nil))
+        (start 0) (end nil) (from-end nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (start-set nil) (end-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :test)     (setq test v))
-            ((eq k :test-not) (setq test-not v))
-            ((eq k :key)      (setq key v))
-            ((eq k :start)    (setq start v))
-            ((eq k :end)      (setq end v))
-            ((eq k :from-end) (setq from-end v))))
+            ((eq k :test)     (unless test-set (setq test (%resolve-fn v) test-set t)))
+            ((eq k :test-not) (unless tn-set (setq test-not (%resolve-fn v) tn-set t)))
+            ((eq k :key)      (unless key-set (setq key (%resolve-fn v) key-set t)))
+            ((eq k :start)    (unless start-set (setq start v start-set t)))
+            ((eq k :end)      (unless end-set (setq end v end-set t)))
+            ((eq k :from-end) (unless fe-set (setq from-end v fe-set t)))))
         (setq cur (cddr cur))))
     ;; Effective test: prefer :test-not if both somehow specified.
     (when test-not

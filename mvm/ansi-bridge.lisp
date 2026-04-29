@@ -2260,3 +2260,67 @@
   "Routes through positional helper to dodge apply-of-rest fragility."
   (%set-difference-impl l1 l2 args))
 
+;; -------------------------------------------------------------------
+;; %make-array-fill-init / %make-array-fill-list / %make-array-fill-vec
+;;
+;; Used by build-ansi-test's rewrite-make-array-initcontents to keep
+;; the per-test expansion small.  The previous in-line expansion
+;;   (let ((tmp (make-array N)))
+;;     (aset tmp 0 v) (aset tmp 1 v) ... (aset tmp (1- N) v)
+;;     tmp)
+;; produced O(N) source forms per make-array call, which inflated the
+;; lambda body of large test runners (run-ansi-adjust-array,
+;; run-ansi-make-array, etc.) past a compile-time fragility threshold,
+;; flipping unrelated tests to FAIL.  These runtime helpers replace the
+;; per-element ASETs with a single function call.
+;; -------------------------------------------------------------------
+(defun %make-array-fill-init (n init)
+  "Allocate a fresh general array of size N and fill every slot with INIT."
+  (let ((a (make-array n)) (i 0))
+    (loop
+      (when (>= i n) (return a))
+      (aset a i init)
+      (setq i (+ i 1)))))
+
+(defun %make-array-fill-list (n lst)
+  "Allocate a fresh general array of size N and fill from LST (head-first).
+   Stops when LST is exhausted; remaining slots are left NIL."
+  (let ((a (make-array n)) (i 0) (cur lst))
+    (loop
+      (when (or (>= i n) (null cur)) (return a))
+      (aset a i (car cur))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))))
+
+(defun %make-array-fill-vec (n vec)
+  "Allocate a fresh general array of size N and fill from vector VEC.
+   Stops at min(N, length VEC); remaining slots NIL."
+  (let* ((vlen (array-length vec))
+         (lim (if (< vlen n) vlen n))
+         (a (make-array n))
+         (i 0))
+    (loop
+      (when (>= i lim) (return a))
+      (aset a i (aref vec i))
+      (setq i (+ i 1)))))
+
+(defun %make-array-fill-string (n s)
+  "Allocate a fresh general array of size N and fill from string S
+   (each char in S becomes a character element)."
+  (let* ((slen (array-length s))
+         (lim (if (< slen n) slen n))
+         (a (make-array n))
+         (i 0))
+    (loop
+      (when (>= i lim) (return a))
+      (aset a i (code-char (aref s i)))
+      (setq i (+ i 1)))))
+
+(defun %make-string-fill-char (n ch)
+  "Allocate a fresh string of size N and fill with character CH."
+  (let ((s (%make-string-array n)) (i 0) (code (char-code ch)))
+    (loop
+      (when (>= i n) (return s))
+      (aset s i code)
+      (setq i (+ i 1)))))
+

@@ -108,6 +108,28 @@
       (let ((out (make-array fp)))
         (dotimes (i fp out) (aset out i (aref arr i)))))))
 
+;; Displaced array wrappers around a non-string array.
+;; Shape: (cons (cons SIZE OFFSET) array) — the head cons describes the
+;; declared dimension (size) plus an offset into the underlying base array.
+(defun rt-disp-array-wrapper-p (x)
+  (let ((y (if (and (consp x) (eql (car x) 8765432)) (cdr x) x)))
+    (if (consp y)
+        (if (consp (car y))
+            (if (stringp (cdr y)) nil (rt-arrayp (cdr y)))
+            nil)
+        nil)))
+
+(defun rt-disp-wrapper-to-array (w)
+  "Convert a displaced array wrapper to a plain array of the declared size,
+   slicing offset..offset+size out of the underlying."
+  (let ((y (if (and (consp w) (eql (car w) 8765432)) (cdr w) w)))
+    (let ((size (car (car y)))
+          (off (cdr (car y)))
+          (arr (cdr y)))
+      (let ((out (make-array size)))
+        (dotimes (i size out)
+          (aset out i (aref arr (+ off i))))))))
+
 (defun rt-equal (a b)
   "Structural equality for RT comparisons.
    Flattened to cond so the compiler doesn't run out of registers on
@@ -115,6 +137,16 @@
    when called from a lambda body with lots of ambient special vars)."
   (cond
     ((eql a b) t)
+    ;; Adjustable wrapper (cons 8765432 inner): peel and recurse.
+    ((and (consp a) (eql (car a) 8765432))
+     (rt-equal (cdr a) b))
+    ((and (consp b) (eql (car b) 8765432))
+     (rt-equal a (cdr b)))
+    ;; Multi-dim wrapper (cons 9867654 (cons DIMS FLAT)): peel to flat array.
+    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+     (rt-equal (cddr a) b))
+    ((and (consp b) (eql (car b) 9867654) (consp (cdr b)))
+     (rt-equal a (cddr b)))
     ;; Cons + wrapper handling.
     ((and (consp a) (rt-array-wrapper-p a))
      (rt-equal (rt-wrapper-to-string a) b))
@@ -125,6 +157,11 @@
      (rt-equal (rt-fp-wrapper-to-array a) b))
     ((and (consp b) (rt-fp-array-wrapper-p b))
      (rt-equal a (rt-fp-wrapper-to-array b)))
+    ;; Displaced array wrapper around a non-string array
+    ((and (consp a) (rt-disp-array-wrapper-p a))
+     (rt-equal (rt-disp-wrapper-to-array a) b))
+    ((and (consp b) (rt-disp-array-wrapper-p b))
+     (rt-equal a (rt-disp-wrapper-to-array b)))
     ;; Plain cons-cell equality.
     ((and (consp a) (consp b))
      (if (rt-equal (car a) (car b))
@@ -138,7 +175,38 @@
     ((and (stringp a) (stringp b)) (string-equal a b))
     ;; Plain arrays.
     ((and (rt-arrayp a) (rt-arrayp b)) (rt-array-equal a b))
+    ;; String vs vector-of-chars: ANSI tests pass mixed-type sequences when
+    ;; (make-array N :initial-contents "abc") is expected to equal
+    ;; #(#\a #\b #\c).  Compare by aref.
+    ((and (stringp a) (rt-arrayp b)) (rt-string-array-equal a b))
+    ((and (rt-arrayp a) (stringp b)) (rt-string-array-equal b a))
     (t nil)))
+
+(defun rt-string-array-equal (s a)
+  "Compare a string S to a general array A of characters.  Returns T iff
+   they have the same length and each char in A matches the corresponding
+   char-code in S (using char= regardless of how the elements are encoded)."
+  (let ((ls (array-length s))
+        (la (array-length a)))
+    (if (= ls la)
+        (let ((i 0))
+          (loop
+            (when (= i ls) (return t))
+            (let ((cs (aref s i)) (ca (aref a i)))
+              ;; AREF on a string returns a character (immediate), AREF on
+              ;; a general T-array returns whatever was stored — usually a
+              ;; character.  Compare via char-code if both are characters,
+              ;; else fall back to eql.
+              (cond
+                ((and (characterp cs) (characterp ca))
+                 (unless (eql (char-code cs) (char-code ca)) (return nil)))
+                ((and (fixnump cs) (characterp ca))
+                 (unless (eql cs (char-code ca)) (return nil)))
+                ((and (characterp cs) (fixnump ca))
+                 (unless (eql (char-code cs) ca) (return nil)))
+                (t (unless (eql cs ca) (return nil)))))
+            (setq i (+ i 1))))
+        nil)))
 
 (defun deftest (id actual expected &rest extra-expected)
   "Run a test: compare ACTUAL with EXPECTED using rt-equal.

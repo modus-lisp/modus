@@ -149,10 +149,51 @@
       (and (consp et) (eq (car et) 'quote)
            (member (cadr et) '(character standard-char base-char nil)))))
 
+;; Helper: check if element-type was explicitly specified as a character type.
+;; Returns NIL when no :element-type kwarg was given (default is T, not char).
+(defun explicit-char-element-type-p (et)
+  (and (consp et) (eq (car et) 'quote)
+       (member (cadr et) '(character standard-char base-char))))
+
+;; Helper: check if any kwarg was explicitly specified (key present in plist).
+(defun has-kwarg-p (kwargs key)
+  (loop for (k v) on kwargs by #'cddr
+        when (eq k key) return t))
+
 ;; Helper: check if element-type is BIT
 (defun bit-element-type-p (et)
   "True if element-type is 'bit."
   (and (consp et) (eq (car et) 'quote) (eq (cadr et) 'bit)))
+
+;; Helper: filter out unknown kwargs (e.g., :allow-other-keys, :nonsense-argument)
+;; from a make-array kwarg list.  Returns a fresh list containing only the
+;; kwargs that make-array's rewriter actually recognises.
+(defun %filter-make-array-kwargs (kwargs)
+  (let ((known '(:element-type :initial-contents :initial-element
+                 :adjustable :fill-pointer :displaced-to :displaced-index-offset))
+        (out nil))
+    (loop for (k v) on kwargs by #'cddr
+          when (member k known)
+          do (push k out) (push v out))
+    (nreverse out)))
+
+;; Rewrite (make-array-with-checks DIMS . OPTS) → (make-array DIMS . FILTERED-OPTS).
+;; The aux defun for make-array-with-checks does many CL-conformance checks
+;; (typep with complex types, simple-array detection, etc.) that our runtime
+;; doesn't fully support — so calling it through apply+#'make-array silently
+;; returns garbage.  By rewriting at compile time we let the existing
+;; rewrite-make-array-{dims,initcontents} handle the actual array creation.
+(defun rewrite-make-array-with-checks (form)
+  (cond
+    ((atom form) form)
+    ((and (eq (car form) 'make-array-with-checks)
+          (consp (cdr form)))
+     (let* ((dims (cadr form))
+            (opts (cddr form))
+            (filtered (%filter-make-array-kwargs opts)))
+       (rewrite-make-array-with-checks
+        (cons 'make-array (cons dims filtered)))))
+    (t (mapcar-dotted #'rewrite-make-array-with-checks form))))
 
 ;; Rewrite make-array with :initial-contents and/or character :element-type
 ;; into %make-string-array + aset calls
@@ -185,7 +226,12 @@
             (adj-p (eq (make-array-kwarg kwargs :adjustable) t))
             (displaced (make-array-kwarg kwargs :displaced-to))
             (disp-offset (or (make-array-kwarg kwargs :displaced-index-offset) 0))
-            (char-et (char-element-type-p et)))
+            (char-et (char-element-type-p et))
+            ;; Was :element-type explicitly given?  If not, the default is T
+            ;; (general object array), and we must NOT route to %make-string-array
+            ;; just because (or (null et) ...) was true.
+            (et-given (has-kwarg-p kwargs :element-type))
+            (explicit-char-et (and et-given (explicit-char-element-type-p et))))
        (cond
          ;; Displaced array: (cons (cons declared-size offset) underlying-string)
          (displaced
@@ -219,9 +265,18 @@
                 (adj-p              `(cons 8765432 ,body))
                 (fill-p             `(cons ,fill-p ,body))
                 (t                  body)))))
-         ;; char element-type, no initial-contents — just %make-string-array
-         ((and char-et (not contents))
-          (let ((body `(%make-string-array ,size)))
+         ;; char element-type, no initial-contents — just %make-string-array,
+         ;; optionally filled with :initial-element if provided.
+         ;; Only matches when :element-type was EXPLICITLY given as a char type.
+         ;; Otherwise the default element-type T means a general object array,
+         ;; not a string.
+         ((and explicit-char-et (not contents))
+          (let* ((init-elem (make-array-kwarg kwargs :initial-element))
+                 (body
+                   (if init-elem
+                       `(%make-string-fill-char ,size
+                                                ,(rewrite-make-array-initcontents init-elem))
+                       `(%make-string-array ,size))))
             (cond
               ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
               (adj-p              `(cons 8765432 ,body))
@@ -250,32 +305,51 @@
          ;; :initial-element fill or :initial-contents fill, then wrap.
          ((or adj-p fill-p)
           (let* ((init-elem (make-array-kwarg kwargs :initial-element))
-                 (var '%mka-tmp)
-                 (init-var '%mka-init)
                  (body
                   (cond
-                    ;; :initial-contents is a quoted list literal — splat as constants
                     ((and contents (consp contents) (eq (car contents) 'quote)
                           (consp (cadr contents)))
-                     (let* ((vals (cadr contents))
-                            (asets (loop for v in vals for i from 0
-                                         while (< i size)
-                                         collect `(aset ,var ,i (quote ,v)))))
-                       `(let ((,var (make-array ,size)))
-                          ,@asets
-                          ,var)))
+                     `(%make-array-fill-list ,size ',(cadr contents)))
+                    ((and contents (vectorp contents) (not (stringp contents)))
+                     `(%make-array-fill-vec ,size ',contents))
+                    (contents
+                     `(%make-array-fill-vec ,size
+                                            ,(rewrite-make-array-initcontents contents)))
                     (init-elem
-                     (let ((asets (loop for i from 0 below size
-                                        collect `(aset ,var ,i ,init-var))))
-                       `(let ((,var (make-array ,size))
-                              (,init-var ,(rewrite-make-array-initcontents init-elem)))
-                          ,@asets
-                          ,var)))
+                     `(%make-array-fill-init ,size
+                                             ,(rewrite-make-array-initcontents init-elem)))
                     (t `(make-array ,size)))))
             (cond
               ((and adj-p fill-p) `(cons 8765432 (cons ,fill-p ,body)))
               (adj-p              `(cons 8765432 ,body))
               (fill-p             `(cons ,fill-p ,body)))))
+         ;; ---------------------------------------------------------------
+         ;; Plain (non-adjustable, no fill-pointer, no displaced) make-array
+         ;; with :initial-element or :initial-contents.  Generate a single
+         ;; runtime call to %make-array-fill-* helpers (defined in
+         ;; ansi-bridge.lisp) instead of per-element asets — this keeps
+         ;; the per-test source small enough that it doesn't push the
+         ;; enclosing run-ansi-XXX function past the size threshold that
+         ;; flips unrelated tests.
+         ;; ---------------------------------------------------------------
+         ;; :initial-contents is a quoted list literal — keep the literal
+         ;; quoted so the runtime helper walks it directly.
+         ((and contents (consp contents) (eq (car contents) 'quote)
+               (consp (cadr contents)))
+          `(%make-array-fill-list ,size ',(cadr contents)))
+         ;; :initial-contents is a vector literal #(...) — keep the
+         ;; literal quoted so the runtime helper aref's it.
+         ((and contents (vectorp contents) (not (stringp contents)))
+          `(%make-array-fill-vec ,size ',contents))
+         ;; :initial-contents is any other expression (a function call
+         ;; producing an array, etc.).  Fall back to a runtime copy.
+         (contents
+          `(%make-array-fill-vec ,size ,(rewrite-make-array-initcontents contents)))
+         ;; :initial-element provided — fill all slots
+         ((make-array-kwarg kwargs :initial-element)
+          `(%make-array-fill-init ,size
+                                  ,(rewrite-make-array-initcontents
+                                    (make-array-kwarg kwargs :initial-element))))
          ;; fallback
          (t (mapcar-dotted #'rewrite-make-array-initcontents form)))))
     (t (mapcar-dotted #'rewrite-make-array-initcontents form))))
@@ -1846,6 +1920,7 @@
             (let ((file-first-id (1+ *ansi-test-counter*)))
               (push (list (pathname-name file) file-first-id nil) *ansi-file-ranges*))
             (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
+            (setf forms (mapcar #'rewrite-make-array-with-checks forms))
             (setf forms (mapcar #'rewrite-make-array-dims forms))
             (setf forms (mapcar #'rewrite-eval-quote forms))
             (setf forms (mapcar #'rewrite-make-array-initcontents forms))
@@ -1942,6 +2017,12 @@
             (setf forms (mapcar #'rewrite-multi-arg-apply forms))
             (setf forms (mapcar #'rewrite-aux-params forms))
             (setf forms (mapcar #'rewrite-earmuff-specials forms))
+            ;; Re-run make-array rewriters: macros like def-adjust-array-test
+            ;; expand into forms containing fresh (make-array ...) calls with
+            ;; keyword args that the first-pass rewriters never saw.
+            (setf forms (mapcar #'rewrite-make-array-with-checks forms))
+            (setf forms (mapcar #'rewrite-make-array-dims forms))
+            (setf forms (mapcar #'rewrite-make-array-initcontents forms))
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
               (dolist (form forms)
@@ -2228,6 +2309,7 @@
                     (push form forms)))))
         ;; Apply the same rewriter pipeline as test files
         (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
+        (setf forms (mapcar #'rewrite-make-array-with-checks forms))
         (setf forms (mapcar #'rewrite-make-array-dims forms))
         (setf forms (mapcar #'rewrite-eval-quote forms))
         (setf forms (mapcar #'rewrite-make-array-initcontents forms))

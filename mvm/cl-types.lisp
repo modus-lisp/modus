@@ -657,7 +657,8 @@
   "Two-value SUBTYPEP per ANSI: returns (sub valid).
    Conservative — returns (NIL NIL) when uncertain."
   (declare (ignore args))
-  (%subtypep-impl t1 t2))
+  (multiple-value-bind (sub valid) (%subtypep-impl t1 t2)
+    (values sub valid)))
 ;; Minimal stub: ANSI returns 3 values (lambda-expr closure-p name).
 ;; Returning (NIL NIL NIL) at least lets length-checking tests pass.
 (defun function-lambda-expression (fn) (values nil nil nil))

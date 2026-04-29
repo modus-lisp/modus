@@ -1394,7 +1394,9 @@
   (when (consp vec) (set-car vec n))
   n)
 (defun random-fixnum () (random most-positive-fixnum))
-(defun subtypep* (t1 t2) nil)  ; stub
+(defun subtypep* (t1 t2)
+  (multiple-value-bind (sub good) (subtypep t1 t2)
+    (values (if sub t nil) (if good t nil))))
 
 ;;; Minimal Bignum (2-slot object, subtag #x30, lo/hi tagged fixnums)
 (defun make-bignum (lo hi)

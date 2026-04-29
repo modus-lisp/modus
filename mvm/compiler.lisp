@@ -4917,7 +4917,41 @@
           ((or (= hash (compute-name-hash "WHEN"))
                (= hash (compute-name-hash "UNLESS")))
            (tail-form-is-values-p (cddr form)))
+          ;; loop / block — walk body looking for any (return (values ...))
+          ;; or (return-from NAME (values ...)).  Required so functions whose
+          ;; tail is a loop with multi-value return don't get MV-COUNT=1
+          ;; clobber on the function epilogue.
+          ((or (= hash (compute-name-hash "LOOP"))
+               (= hash (compute-name-hash "BLOCK")))
+           (loop-body-has-mv-return-p (cdr form)))
+          ;; multiple-value-bind / multiple-value-call — tail is the body's tail
+          ((or (= hash (compute-name-hash "MULTIPLE-VALUE-BIND"))
+               (= hash (compute-name-hash "MULTIPLE-VALUE-CALL"))
+               (= hash (compute-name-hash "MULTIPLE-VALUE-PROG1")))
+           (tail-form-is-values-p (cdddr form)))
           (t nil))))))
+
+(defun loop-body-has-mv-return-p (forms)
+  "Walk FORMS looking for any (return X) or (return-from N X) where X is a
+   tail-form-is-values-p form.  Used to detect that a loop may return
+   multiple values so the function epilogue doesn't clobber MV-COUNT."
+  (cond
+    ((atom forms) nil)
+    ((and (consp forms) (symbolp (car forms))
+          (let ((h (compute-name-hash (symbol-name (car forms)))))
+            (or (= h (compute-name-hash "RETURN"))
+                (= h (compute-name-hash "RETURN-FROM"))))
+          (cdr forms))
+     ;; (return X) — X is (cadr forms); (return-from N X) — X is (caddr forms)
+     (let* ((is-rfrom (= (compute-name-hash (symbol-name (car forms)))
+                         (compute-name-hash "RETURN-FROM")))
+            (val-form (if is-rfrom (caddr forms) (cadr forms))))
+       (and val-form (consp val-form)
+            (tail-form-is-values-p (list val-form)))))
+    ((consp forms)
+     (or (loop-body-has-mv-return-p (car forms))
+         (loop-body-has-mv-return-p (cdr forms))))
+    (t nil)))
 
 (defun compile-multiple-value-list (form env dest)
   "Compile (multiple-value-list form).

@@ -465,23 +465,24 @@
 (defun list-length (list)
   "Return the length of LIST, or NIL for circular lists.
    Uses tortoise-and-hare cycle detection.
-   Signals a type-error if LIST is not a list (cons or NIL).
-   For improper lists, stops at the improper tail and returns the
-   partial count — this is more lenient than ANSI but many internal
-   callers rely on it."
+   Signals a type-error if LIST is not a proper list (i.e., dotted or
+   non-list).  Per ANSI CLHS list-length:
+     - proper list → length
+     - circular     → NIL
+     - improper     → type-error"
   (when (and list (not (consp list)))
-    (error "list-length: argument is not a list"))
+    (%signal-type-error))
   (let ((n 0)
         (fast list)
         (slow list))
     (loop
-      ;; Fast pointer moves 2 steps
+      ;; Fast pointer moves 2 steps; bail with type-error on dotted tail.
       (when (null fast) (return n))
-      (when (atom fast) (return n))
+      (when (not (consp fast)) (%signal-type-error))
       (setq fast (cdr fast))
       (setq n (+ n 1))
       (when (null fast) (return n))
-      (when (atom fast) (return n))
+      (when (not (consp fast)) (%signal-type-error))
       (setq fast (cdr fast))
       (setq n (+ n 1))
       ;; Slow pointer moves 1 step

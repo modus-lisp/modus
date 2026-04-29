@@ -223,17 +223,30 @@
       (setq result (cons (funcall fn cur) result))
       (setq cur (cdr cur)))))
 
+(defun %resolve-fn (v)
+  "If V is a symbol, return its symbol-function (so e.g. :test 'equal
+   yields a callable). Else return V unchanged."
+  (if (and (%cl-sym-p v) (not (keywordp v))) (symbol-function v) v))
+
 (defun parse-test-key (args)
   "Parse :test and :key keyword args. Returns (test-fn . key-fn).
    test-fn may be NIL — callers should use inline `eql` in that case
    rather than `#'eql`, because `eql` is an inline opcode in MVM and
    has no callable function entry (#'eql evaluates to a NIL/garbage
-   pointer; (funcall <that> ...) silently returns wrong values)."
+   pointer; (funcall <that> ...) silently returns wrong values).
+   Symbol values (e.g. :test 'equal) are resolved via symbol-function."
   (let ((test-fn nil) (key-fn nil) (a args))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test-fn (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key) (setq key-fn (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :test-not) (let ((f (cadr a))) (setq test-fn (lambda (x y) (not (funcall f x y))))) (setq a (cddr a)))
+      (cond ((eq (car a) :test)
+             (setq test-fn (%resolve-fn (cadr a)))
+             (setq a (cddr a)))
+            ((eq (car a) :key)
+             (setq key-fn (%resolve-fn (cadr a)))
+             (setq a (cddr a)))
+            ((eq (car a) :test-not)
+             (let ((f (%resolve-fn (cadr a))))
+               (setq test-fn (lambda (x y) (not (funcall f x y)))))
+             (setq a (cddr a)))
             ((eq (car a) :count) (setq a (cddr a)))
             ((eq (car a) :start) (setq a (cddr a)))
             ((eq (car a) :end) (setq a (cddr a)))

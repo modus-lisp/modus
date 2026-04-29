@@ -1131,10 +1131,24 @@
   (let ((end-pos (%format-find-close-brace control i len)))
     (if (null end-pos)
         (cons i arg-list)
-        (let ((body (%substring control i end-pos))
-              (max-iter (if param1 param1 -1))
-              (new-i (+ end-pos 2)))
+        (let* ((raw-body (%substring control i end-pos))
+               (body-empty (= (length raw-body) 0))
+               (body raw-body)
+               (max-iter (if param1 param1 -1))
+               (new-i (+ end-pos 2))
+               (use-fn nil))
+          ;; CLHS 22.3.7.4: empty ~{~} body consumes the next argument and
+          ;; uses it as the body. String → reuse as control. Function (e.g.
+          ;; FORMATTER closure) → iterate via %format-iter-via-fn.
+          (when body-empty
+            (let ((next-body (car arg-list)))
+              (setq arg-list (cdr arg-list))
+              (cond
+                ((stringp next-body) (setq body next-body))
+                ((functionp next-body) (setq use-fn next-body)))))
           (cond
+            (use-fn
+             (%format-iter-via-fn stream use-fn arg-list colonp atp max-iter new-i))
             ((and colonp atp)
              (cons new-i (%format-iter-of-lists-rest stream body arg-list max-iter)))
             (colonp
@@ -1149,6 +1163,63 @@
                    (rest-args (cdr arg-list)))
                (%format-iter-inside stream body lst max-iter)
                (cons new-i rest-args))))))))
+
+(defun %format-iter-via-fn (stream fn arg-list colonp atp max-iter new-i)
+  "Iterate FN (a formatter-style closure) over args, the empty-body case of
+   ~{~} where the body argument was a function. FN should be called as
+   (funcall FN stream &rest args) per CLHS 22.3.10.2 — it returns the
+   remaining args. Returns (cons NEW-I REMAINING-ARG-LIST)."
+  (let ((count 0))
+    (declare (special *format-iter-escape* *format-outer-rest*))
+    (cond
+      ((and colonp atp)
+       (loop
+         (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+         (when (null arg-list) (return nil))
+         (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
+         (let ((*format-outer-rest* (cdr arg-list)))
+           (declare (special *format-outer-rest*))
+           (funcall fn stream (car arg-list)))
+         (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+         (setq arg-list (cdr arg-list))
+         (setq count (+ count 1)))
+       (cons new-i arg-list))
+      (colonp
+       (let ((lst (car arg-list))
+             (rest-args (cdr arg-list)))
+         (loop
+           (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+           (when (null lst) (return nil))
+           (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
+           (let ((*format-outer-rest* (cdr lst)))
+             (declare (special *format-outer-rest*))
+             (funcall fn stream (car lst)))
+           (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+           (setq lst (cdr lst))
+           (setq count (+ count 1)))
+         (cons new-i rest-args)))
+      (atp
+       (loop
+         (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+         (when (null arg-list) (return nil))
+         (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
+         (let ((rem (apply fn stream arg-list)))
+           (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+           (if (eq rem arg-list) (return nil) (setq arg-list rem)))
+         (setq count (+ count 1)))
+       (cons new-i arg-list))
+      (t
+       (let ((lst (car arg-list))
+             (rest-args (cdr arg-list)))
+         (loop
+           (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+           (when (null lst) (return nil))
+           (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
+           (let ((rem (apply fn stream lst)))
+             (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+             (if (eq rem lst) (return nil) (setq lst rem)))
+           (setq count (+ count 1)))
+         (cons new-i rest-args))))))
 
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)

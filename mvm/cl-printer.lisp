@@ -870,24 +870,20 @@
           (setq ss (cdr ss)))))))
 
 ;;; Pad string to minimum column
-(defun %fmt-pad (str mincol colinc minpad padchar stream &rest opts)
+(defun %fmt-pad-aligned (str mincol colinc minpad padchar stream right-align)
   "Write STR padded to MINCOL using PADCHAR, with MINPAD minimum padding.
-   ANSI ~A / ~S default to LEFT-ALIGN (string first, padding right). The
-   ~@A / ~@S form (passes :right-align as the only opt) flips to
-   RIGHT-ALIGN (padding first, string right)."
+   RIGHT-ALIGN: T puts padding first (~@A/~@S/~D-style). NIL puts string first."
   (let ((slen (if (stringp str) (array-length str) 0))
         (mc (if mincol mincol 0))
         (ci (if colinc colinc 1))
         (mp (if minpad minpad 0))
-        (pc (if padchar padchar 32))
-        (right-align (and opts (eq (car opts) :right-align))))
+        (pc (if padchar padchar 32)))
     (let ((padding mp))
       (loop
         (when (>= (+ slen padding) mc) (return nil))
         (setq padding (+ padding ci)))
       (cond
         (right-align
-         ;; Padding first, then string.
          (let ((i 0))
            (loop
              (when (= i padding) (return nil))
@@ -895,13 +891,18 @@
              (setq i (+ i 1))))
          (when (stringp str) (%print-string-raw str stream)))
         (t
-         ;; String first, then padding (default ~A / ~S).
          (when (stringp str) (%print-string-raw str stream))
          (let ((i 0))
            (loop
              (when (= i padding) (return nil))
              (%print-char pc stream)
              (setq i (+ i 1)))))))))
+
+;;; Compatibility wrapper preserving the old &rest signature so older callers
+;;; that pass :right-align as a trailing keyword still work.
+(defun %fmt-pad (str mincol colinc minpad padchar stream &rest opts)
+  (%fmt-pad-aligned str mincol colinc minpad padchar stream
+                    (and opts (eq (car opts) :right-align))))
 
 ;;; Format ~T: tabulate
 (defun %fmt-tabulate (colnum colinc stream)
@@ -915,6 +916,12 @@
         (%print-char 32 stream)
         (setq i (+ i 1))))))
 
+;;; ~^ inside ~{ ~} sets *format-iter-escape* to t — the inner %format-impl
+;;; returns immediately and the iteration helper checks the flag to break out
+;;; of the iteration loop. CLHS 22.3.9.2: ~^ inside an iteration terminates
+;;; that iteration's loop, not the entire format.
+(defvar *format-iter-escape* nil)
+
 ;;; ~{...~} helpers. Factored out of %format-impl because inlining the
 ;;; matching-brace scan + the per-iteration recursive call with all its
 ;;; nested let/loop/cond state confused the MVM register allocator
@@ -923,33 +930,54 @@
 
 (defun %format-find-close-brace (control start len)
   "Scan CONTROL from START for the matching ~} (respecting nested ~{~}).
+   Skips parameters (digits, commas, V, #, '<char>) and modifiers (:, @)
+   between ~ and the directive char so e.g. ~1{ and ~v,3:@{ are recognized.
    Returns the position of ~ in the ~} pair, or NIL if not found."
   (let ((pos start) (depth 1) (result nil))
     (loop
       (when (or result (>= pos len)) (return result))
-      (if (= (aref control pos) 126)
-          (let ((nc (if (< (+ pos 1) len) (aref control (+ pos 1)) 0)))
-            (cond
-              ((= nc 123) (setq depth (+ depth 1)) (setq pos (+ pos 2)))
-              ((= nc 125)
-               (setq depth (- depth 1))
-               (if (= depth 0)
-                   (setq result pos)
-                   (setq pos (+ pos 2))))
-              ;; Any other ~X: skip both chars to not re-match a
-              ;; literal ~ embedded in another directive's params.
-              (t (setq pos (+ pos 2)))))
-          (setq pos (+ pos 1))))))
+      (if (/= (aref control pos) 126)
+          (setq pos (+ pos 1))
+          ;; Found ~ — scan past parameters and modifiers to the directive char.
+          (let ((p (+ pos 1)))
+            (loop
+              (when (>= p len) (return nil))
+              (let ((c (aref control p)))
+                (cond
+                  ;; ' (apostrophe) consumes the next char as a literal param
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p len) (setq p (+ p 1))))
+                  ;; digits, minus, comma, v/V, #, :, @ — keep scanning
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 58) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (return nil)))))
+            (when (>= p len) (return result))
+            (let ((dch (aref control p)))
+              (cond
+                ((= dch 123) (setq depth (+ depth 1)) (setq pos (+ p 1)))
+                ((= dch 125)
+                 (setq depth (- depth 1))
+                 (if (= depth 0)
+                     (setq result pos)
+                     (setq pos (+ p 1))))
+                (t (setq pos (+ p 1))))))))))
 
 (defun %format-iter-inside (stream body lst max-iter)
   "Iterate BODY over LST (the ~{...~} case). BODY is the template, LST
    is the list to feed as successive args. Stops when LST exhausted, or
-   MAX-ITER reached, or a pass makes no progress."
+   MAX-ITER reached, ~^ fires, or a pass makes no progress."
   (let ((count 0))
+    (declare (special *format-iter-escape*))
     (loop
+      (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
       (when (null lst) (return nil))
       (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
       (let ((new-lst (%format-impl stream body lst)))
+        (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
         (when (eq new-lst lst) (return nil))
         (setq lst new-lst))
       (setq count (+ count 1)))))
@@ -958,10 +986,13 @@
   "Iterate BODY consuming elements from ARG-LIST (the ~@{...~} case).
    Returns the remaining (unconsumed) arg-list."
   (let ((count 0))
+    (declare (special *format-iter-escape*))
     (loop
+      (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
       (when (null arg-list) (return arg-list))
       (when (and (>= max-iter 0) (>= count max-iter)) (return arg-list))
       (let ((new-args (%format-impl stream body arg-list)))
+        (when *format-iter-escape* (setq *format-iter-escape* nil) (return new-args))
         (when (eq new-args arg-list) (return arg-list))
         (setq arg-list new-args))
       (setq count (+ count 1)))))
@@ -1087,8 +1118,8 @@
                        (let ((str (get-output-stream-string s)))
                          (if (or param1 param2 param3 param4)
                              (if atp
-                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream :right-align)
-                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream))
+                                 (%fmt-pad-aligned str param1 param2 param3 (if param4 param4 32) stream t)
+                                 (%fmt-pad-aligned str param1 param2 param3 (if param4 param4 32) stream nil))
                              (%print-string-raw str stream))))))
                   ;; ~S — standard. ~:S also prints NIL as "()".
                   ((or (= dir 83) (= dir 115))
@@ -1103,8 +1134,8 @@
                        (let ((str (get-output-stream-string s)))
                          (if (or param1 param2 param3 param4)
                              (if atp
-                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream :right-align)
-                                 (%fmt-pad str param1 param2 param3 (if param4 param4 32) stream))
+                                 (%fmt-pad-aligned str param1 param2 param3 (if param4 param4 32) stream t)
+                                 (%fmt-pad-aligned str param1 param2 param3 (if param4 param4 32) stream nil))
                              (%print-string-raw str stream))))))
                   ;; ~W — write (like ~S but respects all print vars)
                   ((or (= dir 87) (= dir 119))
@@ -1128,9 +1159,7 @@
                             (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
-                             (%fmt-pad str param1 (if param2 param2 1)
-                                       (if param3 param3 0)
-                                       (if param4 param4 32) stream :right-align)
+                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
                              (%print-string-raw str stream))))))
                   ;; ~B — binary
                   ((or (= dir 66) (= dir 98))
@@ -1147,9 +1176,7 @@
                             (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
-                             (%fmt-pad str param1 (if param2 param2 1)
-                                       (if param3 param3 0)
-                                       (if param4 param4 32) stream :right-align)
+                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
                              (%print-string-raw str stream))))))
                   ;; ~O — octal
                   ((or (= dir 79) (= dir 111))
@@ -1166,9 +1193,7 @@
                             (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
-                             (%fmt-pad str param1 (if param2 param2 1)
-                                       (if param3 param3 0)
-                                       (if param4 param4 32) stream :right-align)
+                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
                              (%print-string-raw str stream))))))
                   ;; ~X — hexadecimal
                   ((or (= dir 88) (= dir 120))
@@ -1185,11 +1210,11 @@
                             (%write-obj n s nil nil))))
                        (let ((str (get-output-stream-string s)))
                          (if param1
-                             (%fmt-pad str param1 (if param2 param2 1)
-                                       (if param3 param3 0)
-                                       (if param4 param4 32) stream :right-align)
+                             (%fmt-pad-aligned str param1 (if param2 param2 1) (if param3 param3 0) (if param4 param4 32) stream t)
                              (%print-string-raw str stream))))))
-                  ;; ~R — radix
+                  ;; ~R — radix. ~radix,mincol,padchar,commachar,commaintR
+                  ;; mirrors ~D except RADIX is the FIRST parameter (so ~D's
+                  ;; param1=mincol shifts to param2 here).
                   ((or (= dir 82) (= dir 114))
                    (let ((n (car arg-list)))
                      (setq arg-list (cdr arg-list))
@@ -1206,9 +1231,23 @@
                        ;; ~R with no params: cardinal English
                        ((and (not colonp) (not atp) (not param1))
                         (%format-cardinal n stream))
-                       ;; ~NR: base N
+                       ;; ~NR / ~N,M,'cR: base N with optional mincol/pad/commachar
                        (param1
-                        (%print-integer-in-base n param1 stream))
+                        (let ((s (make-string-output-stream)))
+                          (cond
+                            ((integerp n)
+                             (when (and atp (>= n 0)) (%print-char 43 s))
+                             (%print-integer-in-base n param1 s))
+                            (t
+                             (let ((*print-escape* nil))
+                               (declare (special *print-escape*))
+                               (%write-obj n s nil nil))))
+                          (let ((str (get-output-stream-string s)))
+                            (if param2
+                                (%fmt-pad-aligned str param2 (if param3 param3 1)
+                                                  (if param4 param4 0)
+                                                  32 stream t)
+                                (%print-string-raw str stream)))))
                        (t
                         (%format-cardinal n stream)))))
                   ;; ~C — character
@@ -1280,17 +1319,41 @@
                    (%fmt-tabulate param1 param2 stream))
                   ;; ~* — goto
                   ((= dir 42)
-                   (let ((n (if param1 param1 1)))
-                     (if colonp
-                         ;; ~:* go back n args (not easily supported without arg array)
-                         ;; stub: ignore
-                         nil
-                         ;; ~* skip n args
-                         (let ((j 0))
-                           (loop
-                             (when (= j n) (return nil))
-                             (setq arg-list (cdr arg-list))
-                             (setq j (+ j 1)))))))
+                   (cond
+                     ;; ~@N* / ~@*: absolute goto — set arg-list to (nthcdr N args)
+                     (atp
+                      (let ((n (if param1 param1 0)))
+                        (let ((cur args) (j 0))
+                          (loop
+                            (when (or (null cur) (= j n)) (return nil))
+                            (setq cur (cdr cur))
+                            (setq j (+ j 1)))
+                          (setq arg-list cur))))
+                     ;; ~:N* / ~:*: go back N args (default 1)
+                     (colonp
+                      (let ((n (if param1 param1 1)))
+                        ;; consumed = (length args) - (length arg-list)
+                        ;; new pos = consumed - n  (clamped to 0)
+                        (let ((consumed 0) (al args))
+                          (loop (when (eq al arg-list) (return nil))
+                                (when (null al) (return nil))
+                                (setq consumed (+ consumed 1))
+                                (setq al (cdr al)))
+                          (let ((new-pos (- consumed n)))
+                            (when (< new-pos 0) (setq new-pos 0))
+                            (let ((cur args) (j 0))
+                              (loop
+                                (when (or (null cur) (= j new-pos)) (return nil))
+                                (setq cur (cdr cur))
+                                (setq j (+ j 1)))
+                              (setq arg-list cur))))))
+                     ;; ~N*: skip N args (default 1)
+                     (t
+                      (let ((n (if param1 param1 1)) (j 0))
+                        (loop
+                          (when (or (null arg-list) (= j n)) (return nil))
+                          (setq arg-list (cdr arg-list))
+                          (setq j (+ j 1)))))))
                   ;; ~? — indirection
                   ((= dir 63)
                    (let ((sub-control (car arg-list))
@@ -1311,10 +1374,14 @@
                            (if (= val 1) (%print-char 121 stream)  ; y
                                (%print-string-raw "ies" stream))
                            (if (/= val 1) (%print-char 115 stream))))))  ; s
-                  ;; ~newline — ignore newline and leading whitespace
+                  ;; ~newline — discard literal newline and following whitespace.
+                  ;;   ~newline    : discard the newline AND following whitespace (default)
+                  ;;   ~@newline   : KEEP the newline, discard following whitespace
+                  ;;   ~:newline   : discard the newline only, KEEP the whitespace
                   ((= dir 10)
-                   ;; Skip leading whitespace in control string
-                   (unless atp  ; ~@newline: keep newline
+                   (when atp
+                     (%print-char 10 stream))
+                   (unless colonp
                      (loop
                        (when (>= i len) (return nil))
                        (let ((wc (aref control i)))
@@ -1348,26 +1415,25 @@
                                                 ;; capitalize each word
                                                 (string-capitalize result))
                                                (atp
-                                                ;; capitalize first word
+                                                ;; ~@(...~): uppercase the FIRST alpha
+                                                ;; character, lowercase everything else.
                                                 (if (> (array-length result) 0)
                                                     (let ((r (%make-string-array (array-length result))))
-                                                      (let ((first-upper nil))
-                                                        (let ((k 0) (in-word nil))
-                                                          (loop
-                                                            (when (= k (array-length result)) (return nil))
-                                                            (let ((c (aref result k)))
-                                                              (let ((alpha (or (and (>= c 65) (<= c 90))
-                                                                               (and (>= c 97) (<= c 122)))))
-                                                                (if (and alpha (not in-word) (not first-upper))
-                                                                    (progn
-                                                                      (aset r k (if (and (>= c 97) (<= c 122)) (- c 32) c))
-                                                                      (setq first-upper t)
-                                                                      (setq in-word t))
-                                                                    (progn
-                                                                      (aset r k c)
-                                                                      (if alpha (setq in-word t)
-                                                                          (setq in-word nil))))))
-                                                            (setq k (+ k 1)))))
+                                                      (let ((first-done nil) (k 0))
+                                                        (loop
+                                                          (when (= k (array-length result)) (return nil))
+                                                          (let ((c (aref result k)))
+                                                            (let ((upper (and (>= c 65) (<= c 90)))
+                                                                  (lower (and (>= c 97) (<= c 122))))
+                                                              (cond
+                                                                ((and (not first-done) (or upper lower))
+                                                                 (aset r k (if lower (- c 32) c))
+                                                                 (setq first-done t))
+                                                                (upper
+                                                                 (aset r k (+ c 32)))
+                                                                (t
+                                                                 (aset r k c)))))
+                                                          (setq k (+ k 1))))
                                                       r)
                                                     result))
                                                (t
@@ -1385,29 +1451,53 @@
                      ;; ~[: numeric selection by first arg
                      ;; ~@[: boolean test on first arg (true = process, false = skip + consume)
                      ;; ~:[: boolean test (false=first clause, true=second)
-                     (let ((sections (list)) (start i) (depth 1) (pos2 i))
+                     ;; The default-section marker is ~:; (a ~; with a colon
+                     ;; modifier). We treat that specially below.
+                     (let ((sections (list)) (default-idx nil) (start i) (depth 1) (pos2 i))
                        (loop
                          (when (>= pos2 len)
                            (setq sections (cons (%substring control start pos2) sections))
                            (return nil))
-                         (when (= (aref control pos2) 126)
-                           (let ((nc (if (< (+ pos2 1) len) (aref control (+ pos2 1)) 0)))
-                             (cond
-                               ((= nc 91) (setq depth (+ depth 1)) (setq pos2 (+ pos2 2)))
-                               ((= nc 93)
-                                (setq depth (- depth 1))
-                                (when (= depth 0)
-                                  (setq sections (cons (%substring control start pos2) sections))
-                                  (setq i (+ pos2 2))
-                                  (return nil))
-                                (setq pos2 (+ pos2 2)))
-                               ((and (= nc 59) (= depth 1))  ; ~;
-                                (setq sections (cons (%substring control start pos2) sections))
-                                (setq pos2 (+ pos2 2))
-                                (setq start pos2))
-                               (t (setq pos2 (+ pos2 1)))))
-                           (return nil))  ; just in case
-                         (setq pos2 (+ pos2 1)))
+                         (if (/= (aref control pos2) 126)
+                             (setq pos2 (+ pos2 1))
+                             ;; At ~: scan past parameters/modifiers to directive char.
+                             (let ((p (+ pos2 1)) (saw-colon nil))
+                               (loop
+                                 (when (>= p len) (return nil))
+                                 (let ((c (aref control p)))
+                                   (cond
+                                     ((= c 39)  ; ' literal-char param
+                                      (setq p (+ p 1))
+                                      (when (< p len) (setq p (+ p 1))))
+                                     ((or (and (>= c 48) (<= c 57))
+                                          (= c 45) (= c 44)
+                                          (= c 118) (= c 86)
+                                          (= c 35) (= c 64))
+                                      (setq p (+ p 1)))
+                                     ((= c 58)
+                                      (setq saw-colon t)
+                                      (setq p (+ p 1)))
+                                     (t (return nil)))))
+                               (if (>= p len)
+                                   (setq pos2 p)
+                                   (let ((nc (aref control p)))
+                                     (cond
+                                       ((= nc 91) (setq depth (+ depth 1)) (setq pos2 (+ p 1)))
+                                       ((= nc 93)
+                                        (setq depth (- depth 1))
+                                        (cond
+                                          ((= depth 0)
+                                           (setq sections (cons (%substring control start pos2) sections))
+                                           (setq i (+ p 1))
+                                           (return nil))
+                                          (t (setq pos2 (+ p 1)))))
+                                       ((and (= nc 59) (= depth 1))  ; ~; or ~:;
+                                        (when saw-colon
+                                          (setq default-idx (length sections)))
+                                        (setq sections (cons (%substring control start pos2) sections))
+                                        (setq pos2 (+ p 1))
+                                        (setq start pos2))
+                                       (t (setq pos2 (+ p 1)))))))))
                        (setq sections (nreverse sections))
                        (cond
                          ;; ~@[: boolean conditional
@@ -1425,18 +1515,22 @@
                             (if (not val)
                                 (when sections (%format-impl stream (car sections) arg-list))
                                 (when (cdr sections) (%format-impl stream (cadr sections) arg-list)))))
-                         ;; ~[: numeric selection
+                         ;; ~[: numeric selection. If idx is out of range
+                         ;; AND the format had a ~:; default-section marker,
+                         ;; use that section. Otherwise emit nothing.
                          (t
                           (let ((idx (car arg-list)))
                             (setq arg-list (cdr arg-list))
-                            (if (integerp idx)
-                                (let ((selected (nth idx sections)))
-                                  (when selected
-                                    (setq arg-list (%format-impl stream selected arg-list))))
-                                ;; Check for default clause (~;)
-                                (let ((default (car (last sections))))
-                                  (when default
-                                    (setq arg-list (%format-impl stream default arg-list)))))))))))
+                            (cond
+                              ((and (integerp idx) (>= idx 0) (< idx (length sections)))
+                               (let ((selected (nth idx sections)))
+                                 (when selected
+                                   (setq arg-list (%format-impl stream selected arg-list)))))
+                              ;; Out of range with default section
+                              (default-idx
+                               (let ((selected (nth default-idx sections)))
+                                 (when selected
+                                   (setq arg-list (%format-impl stream selected arg-list))))))))))))
                   ;; ~{ ~} — iteration
                   ((= dir 123)
                    (let ((new-i-and-args
@@ -1445,9 +1539,30 @@
                      (setq i (car new-i-and-args))
                      (setq arg-list (cdr new-i-and-args))))
                   ((= dir 125) nil)
-                  ;; ~^ — escape upward
+                  ;; ~^ — escape upward (CLHS 22.3.9.2)
+                  ;; ~^        : exit if no remaining args
+                  ;; ~N^       : exit if N is zero
+                  ;; ~N,M^     : exit if N = M
+                  ;; ~N,M,K^   : exit if N <= M <= K
+                  ;; Sets *format-iter-escape* so the surrounding ~{ ~}
+                  ;; iteration loop can terminate. If we're not inside an
+                  ;; iteration the flag still gets cleared next time.
                   ((= dir 94)
-                   (when (null arg-list) (return arg-list)))
+                   (declare (special *format-iter-escape*))
+                   (let ((should-escape
+                          (cond
+                            (param3
+                             (and (integerp param1) (integerp param2) (integerp param3)
+                                  (<= param1 param2) (<= param2 param3)))
+                            (param2
+                             (and (integerp param1) (integerp param2)
+                                  (= param1 param2)))
+                            (param1
+                             (and (integerp param1) (= param1 0)))
+                            (t (null arg-list)))))
+                     (when should-escape
+                       (setq *format-iter-escape* t)
+                       (return arg-list))))
                   ;; ~_ — conditional newline (pprint, ignore)
                   ((= dir 95) nil)
                   ;; ~I — indent (pprint, ignore)
@@ -1477,14 +1592,18 @@
 (defun format (stream control &rest args)
   "Format output. STREAM: nil=return string, t=*standard-output*.
    Returns nil for stream output, string for nil stream."
+  (declare (special *format-iter-escape*))
+  (setq *format-iter-escape* nil)
   (if (null stream)
       ;; Return string
       (let ((s (make-string-output-stream)))
         (%format-impl s control args)
+        (setq *format-iter-escape* nil)
         (get-output-stream-string s))
       ;; Output to stream
       (let ((s (if (eq stream t) (%resolve-output-stream nil) (%resolve-output-stream stream))))
         (%format-impl s control args)
+        (setq *format-iter-escape* nil)
         nil)))
 
 ;;; formatter macro: returns a function that takes (stream &rest args)
@@ -1493,8 +1612,12 @@
 ;;; that returns a closure at runtime
 (defun formatter (control)
   "Return a function (stream &rest args) that formats using CONTROL."
+  (declare (special *format-iter-escape*))
   (lambda (stream &rest args)
+    (declare (special *format-iter-escape*))
+    (setq *format-iter-escape* nil)
     (let ((remaining (%format-impl (%resolve-output-stream stream) control args)))
+      (setq *format-iter-escape* nil)
       remaining)))
 
 (defun terpri (&rest stream-arg)

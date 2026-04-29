@@ -234,18 +234,26 @@
    rather than `#'eql`, because `eql` is an inline opcode in MVM and
    has no callable function entry (#'eql evaluates to a NIL/garbage
    pointer; (funcall <that> ...) silently returns wrong values).
-   Symbol values (e.g. :test 'equal) are resolved via symbol-function."
-  (let ((test-fn nil) (key-fn nil) (a args))
+   Symbol values (e.g. :test 'equal) are resolved via symbol-function.
+   Per CLHS 3.4.1.4.1, when the same keyword appears multiple times the
+   LEFTMOST occurrence supplies the value."
+  (let ((test-fn nil) (key-fn nil) (test-set nil) (key-set nil) (a args))
     (loop (when (null a) (return))
       (cond ((eq (car a) :test)
-             (setq test-fn (%resolve-fn (cadr a)))
+             (unless test-set
+               (setq test-fn (%resolve-fn (cadr a)))
+               (setq test-set t))
              (setq a (cddr a)))
             ((eq (car a) :key)
-             (setq key-fn (%resolve-fn (cadr a)))
+             (unless key-set
+               (setq key-fn (%resolve-fn (cadr a)))
+               (setq key-set t))
              (setq a (cddr a)))
             ((eq (car a) :test-not)
-             (let ((f (%resolve-fn (cadr a))))
-               (setq test-fn (lambda (x y) (not (funcall f x y)))))
+             (unless test-set
+               (let ((f (%resolve-fn (cadr a))))
+                 (setq test-fn (lambda (x y) (not (funcall f x y)))))
+               (setq test-set t))
              (setq a (cddr a)))
             ((eq (car a) :count) (setq a (cddr a)))
             ((eq (car a) :start) (setq a (cddr a)))

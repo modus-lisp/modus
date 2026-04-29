@@ -1236,14 +1236,28 @@
               (inits (mapcar (lambda (b) (if (consp b) (cadr b) nil)) bindings))
               (steps (mapcar (lambda (b) (if (and (consp b) (cddr b)) (caddr b) nil)) bindings))
               (test (car end-clause))
-              (results (cdr end-clause)))
+              (results (cdr end-clause))
+              (tmpvars nil))
+          ;; Per CLHS DO uses PARALLEL binding for step forms: compute every
+          ;; step from the OLD var values, then assign in lockstep. Use
+          ;; gensym tmpvars to capture the new values before any setq fires.
+          (setf tmpvars (mapcar (lambda (v s)
+                                  (declare (ignore s))
+                                  (gensym (concatenate 'string "DO-" (symbol-name v))))
+                                vars steps))
           `(let ,(mapcar #'list vars inits)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
                ,@body
-               ,@(remove nil
-                   (mapcar (lambda (v s) (when s `(setq ,v ,s)))
-                           vars steps))))))))
+               ,@(let ((bind nil) (assign nil))
+                   (dolist (pair (mapcar #'list vars steps tmpvars))
+                     (let ((v (car pair)) (s (cadr pair)) (tv (caddr pair)))
+                       (when s
+                         (push `(,tv ,s) bind)
+                         (push `(setq ,v ,tv) assign))))
+                   (when bind
+                     (list `(let ,(nreverse bind)
+                              ,@(nreverse assign)))))))))))
 
   ;; DO* — like DO but with sequential binding (let* instead of let)
   (mvm-define-macro "DO*"

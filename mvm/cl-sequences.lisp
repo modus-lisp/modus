@@ -572,7 +572,22 @@
       (nth idx seq)
       (let ((v (aref seq idx)))
         (if (stringp seq) (code-char v) v))))
-(defun string= (a b &rest options) (declare (ignore options)) (string-equal a b))
+(defun %string-designator (x)
+  "Coerce a string designator (string, character, or symbol) to a string."
+  (cond
+    ((stringp x) x)
+    ((characterp x) (let ((s (%make-string-array 1)))
+                      (aset s 0 (char-code x))
+                      s))
+    ((%cl-sym-p x) (%cl-sym-name x))
+    ((null x) "NIL")
+    ((eq x t) "T")
+    (t x)))                      ; fallthrough — might be a wrapper
+
+(defun string= (a b &rest options)
+  "ANSI string= takes string designators (strings, characters, symbols)."
+  (declare (ignore options))
+  (string-equal (%string-designator a) (%string-designator b)))
 (defun string/= (a b) (if (string-equal a b) nil t))
 ;;; constantly: captures value. Use global cell.
 (defvar *constantly-value* nil)

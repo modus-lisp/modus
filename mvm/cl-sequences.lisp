@@ -915,20 +915,23 @@
 ;;; Returns seq (modified in place for lists, or new seq for vectors)
 (defun %nsubst-parse-args (args)
   "Parse keyword args: :from-end :test :test-not :start :end :count :key.
-   Returns (count from-end start end test-fn test-not-fn key-fn)."
+   Returns (count from-end start end test-fn test-not-fn key-fn).
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
   (let ((from-end nil) (test-fn nil) (test-not-fn nil)
-        (count nil) (key-fn nil) (start 0) (end nil) (cur args))
+        (count nil) (key-fn nil) (start 0) (end nil) (cur args)
+        (fe-set nil) (test-set nil) (tn-set nil)
+        (count-set nil) (key-set nil) (start-set nil) (end-set nil))
     (loop
       (when (null cur) (return nil))
       (let ((k (car cur)) (v (cadr cur)))
         (cond
-          ((eq k :from-end) (setq from-end v))
-          ((eq k :test) (setq test-fn v))
-          ((eq k :test-not) (setq test-not-fn v))
-          ((eq k :count) (setq count v))
-          ((eq k :key) (setq key-fn v))
-          ((eq k :start) (setq start v))
-          ((eq k :end) (setq end v)))
+          ((eq k :from-end) (unless fe-set (setq from-end v) (setq fe-set t)))
+          ((eq k :test) (unless test-set (setq test-fn v) (setq test-set t)))
+          ((eq k :test-not) (unless tn-set (setq test-not-fn v) (setq tn-set t)))
+          ((eq k :count) (unless count-set (setq count v) (setq count-set t)))
+          ((eq k :key) (unless key-set (setq key-fn v) (setq key-set t)))
+          ((eq k :start) (unless start-set (setq start v) (setq start-set t)))
+          ((eq k :end) (unless end-set (setq end v) (setq end-set t))))
         (setq cur (cddr cur))))
     (list count from-end start end test-fn test-not-fn key-fn)))
 

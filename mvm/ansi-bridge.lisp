@@ -2237,9 +2237,14 @@
 ;; Find :test/:key in a flat &rest plist — common helper used by the
 ;; set-* / -if-* family.  Returns 'em separately (nil if not present).
 (defun %find-key-arg (args key)
-  (let ((cur args) (found nil))
-    (loop (when (null cur) (return found))
-      (when (eq (car cur) key) (setq found (cadr cur)) (return found))
+  "Return the value of the leftmost KEY in ARGS plist, or NIL.
+   Symbol values (e.g. :test 'equal) are resolved via symbol-function."
+  (let ((cur args) (found nil) (was-found nil))
+    (loop (when (null cur) (return (if was-found (%resolve-fn found) nil)))
+      (when (eq (car cur) key)
+        (setq found (cadr cur))
+        (setq was-found t)
+        (return (%resolve-fn found)))
       (setq cur (cddr cur)))))
 
 (defun %set-difference-impl (l1 l2 args)

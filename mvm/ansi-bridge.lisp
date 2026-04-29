@@ -275,10 +275,23 @@
       (setq cur (cdr cur)))))
 
 (defun ldiff (list obj)
+  "Return a copy of LIST up to (but not including) OBJ if OBJ is a tail.
+   Per CLHS LDIFF: if OBJ isn't a tail (i.e., (tailp OBJ LIST) is false),
+   return a copy of LIST including any dotted tail."
   (let ((result nil) (cur list))
     (loop
       (when (eql cur obj) (return (nreverse result)))
-      (when (atom cur) (return (nreverse result)))
+      (when (atom cur)
+        ;; OBJ wasn't a tail. Append the dotted final atom to preserve
+        ;; the input shape (proper list → proper list, dotted → dotted).
+        (let ((rev (nreverse result)))
+          (if (null rev)
+              (return cur)
+              (let ((last-cell rev))
+                (loop (when (null (cdr last-cell)) (return nil))
+                  (setq last-cell (cdr last-cell)))
+                (set-cdr last-cell cur)
+                (return rev)))))
       (setq result (cons (car cur) result))
       (setq cur (cdr cur)))))
 

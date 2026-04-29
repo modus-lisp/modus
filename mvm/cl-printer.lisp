@@ -2118,19 +2118,46 @@
         (setq i (+ i 1)))))
   seq)
 
+(defun %equalp-array-elt (seq i)
+  "Read element i from seq (vector or string) — coerce string bytes to chars."
+  (let ((v (aref seq i)))
+    (if (stringp seq) (code-char v) v)))
+
+(defun %equalp-array-array (a b)
+  "Element-wise equalp over two non-cons sequences (vectors or strings).
+   Uses array-length and aref/code-char so plain arrays, strings, and
+   bit-vectors all compare correctly."
+  (let ((la (array-length a))
+        (lb (array-length b)))
+    (if (= la lb)
+        (let ((i 0) (ok t))
+          (loop
+            (when (or (not ok) (= i la)) (return ok))
+            (unless (equalp-impl (%equalp-array-elt a i)
+                                  (%equalp-array-elt b i))
+              (setq ok nil))
+            (setq i (+ i 1))))
+        nil)))
+
 (defun equalp-impl (a b)
   (if (eql a b) t
-    (if (consp a)
-      (if (consp b)
-        (if (equalp-impl (car a) (car b))
-          (equalp-impl (cdr a) (cdr b))
-          nil)
-        nil)
-      (if (floatp-impl a)
-        (if (floatp-impl b)
-          (float-equal a b)
-          nil)
-        (if (stringp a)
-          (if (stringp b) (string-equal a b) nil)
-          nil)))))
+    (if (and (characterp a) (characterp b))
+        (char-equal a b)
+      (if (consp a)
+          (if (consp b)
+              (if (equalp-impl (car a) (car b))
+                  (equalp-impl (cdr a) (cdr b))
+                  nil)
+              nil)
+          (if (floatp-impl a)
+              (if (floatp-impl b)
+                  (float-equal a b)
+                  nil)
+              ;; ANSI equalp: arrays of any type compare element-wise.
+              ;; A string and a vector-of-chars compare equalp if their
+              ;; chars match. Bit-vectors with bit-vectors etc.
+              (if (and (or (stringp a) (arrayp a))
+                       (or (stringp b) (arrayp b)))
+                  (%equalp-array-array a b)
+                  nil))))))
 

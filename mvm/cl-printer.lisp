@@ -1075,23 +1075,68 @@
         (setq arg-list new-args))
       (setq count (+ count 1)))))
 
-(defun %format-dispatch-brace (stream control i len arg-list atp param1)
+(defun %format-iter-of-lists (stream body lst max-iter)
+  "Iterate BODY over LST where each element of LST is itself a list of args
+   passed to BODY. The ~:{...~} case. Stops when LST exhausted, MAX-ITER
+   reached, or ~^ fires."
+  (let ((count 0))
+    (declare (special *format-iter-escape*))
+    (loop
+      (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+      (when (null lst) (return nil))
+      (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
+      (%format-impl stream body (car lst))
+      (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+      (setq lst (cdr lst))
+      (setq count (+ count 1)))))
+
+(defun %format-iter-of-lists-rest (stream body arg-list max-iter)
+  "Iterate BODY consuming successive args from ARG-LIST, each treated as a
+   list passed to BODY as its args. The ~:@{...~} case. Returns the
+   remaining (unconsumed) arg-list."
+  (let ((count 0))
+    (declare (special *format-iter-escape*))
+    (loop
+      (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
+      (when (null arg-list) (return arg-list))
+      (when (and (>= max-iter 0) (>= count max-iter)) (return arg-list))
+      (%format-impl stream body (car arg-list))
+      (when *format-iter-escape* (setq *format-iter-escape* nil)
+            (return (cdr arg-list)))
+      (setq arg-list (cdr arg-list))
+      (setq count (+ count 1)))))
+
+(defun %format-dispatch-brace (stream control i len arg-list colonp atp param1)
   "Handle a ~{...~} directive at position i of CONTROL.
-   Finds the matching ~}, extracts the body substring, runs the
-   iteration (either ~{ or ~@{), and returns (cons NEW-I NEW-ARG-LIST).
-   If no matching ~} is found, returns (cons i arg-list) unchanged."
+   Finds the matching ~}, extracts the body substring, runs the iteration
+   (one of ~{, ~@{, ~:{, ~:@{), and returns (cons NEW-I NEW-ARG-LIST).
+   If no matching ~} is found, returns (cons i arg-list) unchanged.
+   Per CLHS 22.3.7.4:
+     ~{...~}    : (car arg-list) is the list, body iterates over it as args
+     ~@{...~}   : rest of arg-list is consumed as iteration args
+     ~:{...~}   : (car arg-list) is list of sublists; body sees each sublist as args
+     ~:@{...~}  : rest of arg-list, each one a sublist; body sees its elements as args"
   (let ((end-pos (%format-find-close-brace control i len)))
     (if (null end-pos)
         (cons i arg-list)
         (let ((body (%substring control i end-pos))
               (max-iter (if param1 param1 -1))
               (new-i (+ end-pos 2)))
-          (if atp
-              (cons new-i (%format-iter-remaining stream body arg-list max-iter))
-              (let ((lst (car arg-list))
-                    (rest-args (cdr arg-list)))
-                (%format-iter-inside stream body lst max-iter)
-                (cons new-i rest-args)))))))
+          (cond
+            ((and colonp atp)
+             (cons new-i (%format-iter-of-lists-rest stream body arg-list max-iter)))
+            (colonp
+             (let ((lst (car arg-list))
+                   (rest-args (cdr arg-list)))
+               (%format-iter-of-lists stream body lst max-iter)
+               (cons new-i rest-args)))
+            (atp
+             (cons new-i (%format-iter-remaining stream body arg-list max-iter)))
+            (t
+             (let ((lst (car arg-list))
+                   (rest-args (cdr arg-list)))
+               (%format-iter-inside stream body lst max-iter)
+               (cons new-i rest-args))))))))
 
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)
@@ -1556,11 +1601,11 @@
                                (let ((selected (nth default-idx sections)))
                                  (when selected
                                    (setq arg-list (%format-impl stream selected arg-list))))))))))))
-                  ;; ~{ ~} — iteration
+                  ;; ~{ ~} — iteration (with optional :, @, or :@ flags)
                   ((= dir 123)
                    (let ((new-i-and-args
                           (%format-dispatch-brace stream control i len
-                                                  arg-list atp param1)))
+                                                  arg-list colonp atp param1)))
                      (setq i (car new-i-and-args))
                      (setq arg-list (cdr new-i-and-args))))
                   ((= dir 125) nil)

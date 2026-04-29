@@ -4386,11 +4386,17 @@
          (let ((var (loop-iter-var iter))
                (idx (loop-iter-list-var iter))
                (arr (loop-iter-step-form iter))
+               (lim (gensym "ACROSSLIM"))
                (raw (gensym "ACROSSRAW")))
            (push (list arr (loop-iter-init-form iter)) bindings)
            (push (list idx 0) bindings)
            (push (list var nil) bindings)
-           (push `(if (>= ,idx (array-length ,arr)) (return nil)) test-forms)
+           ;; Use LENGTH (fill-pointer-aware) per ANSI 6.1.2.1.4 — iteration
+           ;; bound is the array's "effective length"; for fp-wrappers that's
+           ;; the fill-pointer, not the underlying size. Cache once at entry
+           ;; so we don't pay the wrapper-peel cost per element.
+           (push (list lim `(length ,arr)) bindings)
+           (push `(if (>= ,idx ,lim) (return nil)) test-forms)
            ;; Strings store raw u8 char-codes; convert to characters per ANSI
            ;; when iterating across a string. Other arrays keep raw element.
            (push `(setq ,var (let ((,raw (aref ,arr ,idx)))

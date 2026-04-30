@@ -812,9 +812,45 @@
                                               (string= (symbol-name elt) "&BODY")))
                                      (setf rest-mode t))
                                     ((and (symbolp elt)
-                                          (or (string= (symbol-name elt) "&OPTIONAL")
-                                              (string= (symbol-name elt) "&KEY")
-                                              (string= (symbol-name elt) "&ALLOW-OTHER-KEYS")))
+                                          (string= (symbol-name elt) "&OPTIONAL"))
+                                     ;; Switch to optional mode for remaining
+                                     ;; positional elements.  Each can be
+                                     ;; (var [default [supplied-p]]) or just var.
+                                     ;; If cur is NIL, var gets default (or NIL).
+                                     (setf remaining (cdr remaining))
+                                     (loop while (and (consp remaining)
+                                                      (not (and (symbolp (car remaining))
+                                                                (or (string= (symbol-name (car remaining)) "&REST")
+                                                                    (string= (symbol-name (car remaining)) "&BODY")
+                                                                    (string= (symbol-name (car remaining)) "&KEY")
+                                                                    (string= (symbol-name (car remaining)) "&AUX")))))
+                                           do (let* ((opt-elt (car remaining))
+                                                     (opt-var (if (consp opt-elt) (car opt-elt) opt-elt))
+                                                     (opt-default (if (and (consp opt-elt) (cdr opt-elt))
+                                                                      (cadr opt-elt) nil))
+                                                     (opt-supplied (if (and (consp opt-elt) (cddr opt-elt))
+                                                                       (caddr opt-elt) nil))
+                                                     (next-cur (gensym "DC")))
+                                                (setf result
+                                                      (append result
+                                                              (list (list opt-var
+                                                                          `(if ,cur (car ,cur) ,opt-default)))))
+                                                (when opt-supplied
+                                                  (setf result
+                                                        (append result
+                                                                (list (list opt-supplied
+                                                                            `(if ,cur t nil))))))
+                                                (setf result
+                                                      (append result
+                                                              (list (list next-cur `(if ,cur (cdr ,cur) nil)))))
+                                                (setf cur next-cur)
+                                                (setf remaining (cdr remaining))))
+                                     ;; loop incremented remaining; un-do one because outer dec
+                                     (setf remaining (cons nil remaining))) ; outer (cdr remaining) → remaining
+                                    ((and (symbolp elt)
+                                          (or (string= (symbol-name elt) "&KEY")
+                                              (string= (symbol-name elt) "&ALLOW-OTHER-KEYS")
+                                              (string= (symbol-name elt) "&AUX")))
                                      nil) ; skip these for simplicity
                                     (rest-mode
                                      ;; Bind rest of list to this variable/sub-pattern

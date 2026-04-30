@@ -1248,7 +1248,7 @@
           `(let ,(mapcar #'list vars inits)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
-               ,@body
+               (tagbody ,@body)
                ,@(let ((bind nil) (assign nil))
                    (dolist (pair (mapcar #'list vars steps tmpvars))
                      (let ((v (car pair)) (s (cadr pair)) (tv (caddr pair)))
@@ -1273,7 +1273,7 @@
           `(let* ,(mapcar #'list vars inits)
              (loop
                (when ,test (return (progn ,@(or results '(nil)))))
-               ,@body
+               (tagbody ,@body)
                ,@(remove nil
                    (mapcar (lambda (v s) (when s `(setq ,v ,s)))
                            vars steps))))))))

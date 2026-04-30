@@ -8,7 +8,9 @@
 ;;; Sequence-aware some/every (override prelude versions that only handle lists)
 (defun some (fn seq &rest more-seqs)
   "Return first non-nil result of FN on elements of SEQ (list or vector).
-   Multi-sequence form stops at the shortest sequence (ANSI)."
+   Multi-sequence form stops at the shortest sequence (ANSI).
+   Accepts a symbol or function as FN per ANSI function designator."
+  (let ((fn (%resolve-fn fn)))
   (cond
     ((null more-seqs)
      (cond
@@ -79,11 +81,13 @@
                (when (some #'null lists) (return-from seq-loop nil))
                (let ((result (apply fn (mapcar #'car lists))))
                  (when result (return-from seq-loop result)))
-               (setq lists (mapcar #'cdr lists)))))))))
+               (setq lists (mapcar #'cdr lists))))))))))
 
 (defun every (fn seq &rest more-seqs)
   "Return T if FN is true for all elements of SEQ (list or vector).
-   Multi-sequence form stops at the shortest sequence (ANSI)."
+   Multi-sequence form stops at the shortest sequence (ANSI).
+   Accepts a symbol or function as FN per ANSI function designator."
+  (let ((fn (%resolve-fn fn)))
   (cond
     ((null more-seqs)
      (cond
@@ -138,7 +142,7 @@
          (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
     ;; Fallback: apply path (rare, may hit fragility).
     (t (not (apply #'some (lambda (&rest args) (not (apply fn args)))
-                   seq more-seqs)))))
+                   seq more-seqs))))))
 
 (defun copy-alist (alist)
   (if (null alist) nil

@@ -1239,24 +1239,46 @@
   "Coerce OBJECT to RESULT-TYPE."
   (cond
     ((eq result-type 'list)
-     (if (consp object) object
-         (if (null object) nil
-             (if (stringp object)
-                 (let ((len (length object)) (result nil) (i 0))
-                   (loop
-                     (when (>= i len) (return (nreverse result)))
-                     (setq result (cons (code-char (aref object i)) result))
-                     (setq i (+ i 1))))
-                 (if (arrayp object)
-                     (let ((len (array-length object)) (result nil) (i 0))
-                       (loop
-                         (when (>= i len) (return (nreverse result)))
-                         (setq result (cons (aref object i) result))
-                         (setq i (+ i 1))))
-                     object)))))
+     (cond
+       ;; Wrapped vector — use length+wrapper-aref to read effective contents
+       ((and (consp object) (array-wrapper-p object))
+        (let ((len (length object)) (result nil) (i 0)
+              (string-p (stringp object)))
+          (loop
+            (when (>= i len) (return (nreverse result)))
+            (let ((raw (%wrapper-aref object i)))
+              (setq result (cons (if (and string-p (integerp raw))
+                                     (code-char raw) raw)
+                                 result)))
+            (setq i (+ i 1)))))
+       ((consp object) object)
+       ((null object) nil)
+       ((stringp object)
+        (let ((len (length object)) (result nil) (i 0))
+          (loop
+            (when (>= i len) (return (nreverse result)))
+            (setq result (cons (code-char (aref object i)) result))
+            (setq i (+ i 1)))))
+       ((arrayp object)
+        (let ((len (array-length object)) (result nil) (i 0))
+          (loop
+            (when (>= i len) (return (nreverse result)))
+            (setq result (cons (aref object i) result))
+            (setq i (+ i 1)))))
+       (t object)))
     ((or (eq result-type 'string) (eq result-type 'simple-string)
          (eq result-type 'base-string) (eq result-type 'simple-base-string))
      (cond
+       ;; Wrapped string — flatten to plain string of effective length
+       ((and (consp object) (array-wrapper-p object) (stringp object))
+        (let* ((len (length object))
+               (s (%make-string-array len))
+               (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (let ((raw (%wrapper-aref object i)))
+              (aset s i (if (integerp raw) raw (char-code raw))))
+            (setq i (+ i 1)))))
        ((stringp object) object)
        ((consp object)
         (let ((len (length object))
@@ -1272,6 +1294,17 @@
        (t object)))
     ((or (eq result-type 'vector) (eq result-type 'simple-vector))
      (cond
+       ;; Wrapped vector — flatten to plain vector of effective length
+       ((and (consp object) (array-wrapper-p object))
+        (let* ((len (length object))
+               (v (make-array len))
+               (string-p (stringp object))
+               (i 0))
+          (loop
+            (when (>= i len) (return v))
+            (let ((raw (%wrapper-aref object i)))
+              (aset v i (if (and string-p (integerp raw)) (code-char raw) raw)))
+            (setq i (+ i 1)))))
        ((arrayp object) object)
        ((consp object)
         (let ((len (length object))

@@ -251,8 +251,22 @@
 
 (defun %resolve-fn (v)
   "If V is a symbol, return its symbol-function (so e.g. :test 'equal
-   yields a callable). Else return V unchanged."
-  (if (and (%cl-sym-p v) (not (keywordp v))) (symbol-function v) v))
+   yields a callable).  Handles BOTH CL symbols and native MVM symbols
+   (which need *native-sym-function-table* lookup).  Else return V."
+  (cond
+    ((null v) nil)
+    ((eq v t) v)
+    ((and (%cl-sym-p v) (not (keywordp v))) (symbol-function v))
+    ;; Native MVM symbol: subtag #x50 = 80, single-slot [hash]
+    ((and (not (consp v)) (not (fixnump v)) (not (characterp v))
+          (not (stringp v))
+          (= (obj-subtag v) 80))
+     (let ((h (aref v 0)))
+       (let ((fn (if *native-sym-function-table*
+                     (gethash h *native-sym-function-table*)
+                     nil)))
+         (if fn fn v))))
+    (t v)))
 
 (defun parse-test-key (args)
   "Parse :test and :key keyword args. Returns (test-fn . key-fn).

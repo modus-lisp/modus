@@ -477,6 +477,18 @@
             (t (setq a (cdr a)))))
     (cond
       ((null seq) 0)
+      ;; Wrapped vector — use length+wrapper-aref so fp/displaced/adj are honored
+      ((and (consp seq) (array-wrapper-p seq))
+       (let* ((n 0)
+              (string-p (stringp seq))
+              (eff-end (if end end (length seq)))
+              (i start))
+         (loop (when (>= i eff-end) (return n))
+           (let* ((raw (%wrapper-aref seq i))
+                  (elem (if (and string-p (integerp raw)) (code-char raw) raw))
+                  (v (if key (funcall key elem) elem)))
+             (when (funcall pred v) (setq n (+ n 1))))
+           (setq i (+ i 1)))))
       ((consp seq)
        (let ((n 0) (cur seq) (i 0)
              (eff-end (if end end most-positive-fixnum)))
@@ -1877,44 +1889,63 @@
     (when test-not
       (let ((tn test-not))
         (setq test (lambda (a b) (not (funcall tn a b))))))
-    (if (listp sequence)
-        ;; List path
-        (let ((lst sequence) (i 0) (result nil))
-          ;; Skip to start
-          (loop
-            (when (or (null lst) (= i start)) (return nil))
-            (setq lst (cdr lst))
-            (setq i (+ i 1)))
-          ;; Search
-          (loop
-            (when (null lst) (return result))
-            (when (and end (= i end)) (return result))
-            (let ((elem (car lst)))
-              (let ((test-val (if key (funcall key elem) elem)))
-                (when (if test (funcall test item test-val) (eql item test-val))
-                  (if from-end
-                      (setq result elem)
-                      (return elem)))))
-            (setq lst (cdr lst))
-            (setq i (+ i 1))))
-        ;; Vector path
-        (let ((len (length sequence))
-              (result nil)
-              (string-p (stringp sequence)))
-          (when (null end) (setq end len))
-          (let ((i start))
-            (loop
-              (when (= i end) (return result))
-              (let* ((raw (aref sequence i))
-                     ;; String slots hold fixnum char-codes; present as
-                     ;; characters so (eql item #\X) works.
-                     (elem (if string-p (code-char raw) raw)))
-                (let ((test-val (if key (funcall key elem) elem)))
-                  (when (if test (funcall test item test-val) (eql item test-val))
-                    (if from-end
-                        (setq result elem)
-                        (return elem)))))
-              (setq i (+ i 1))))))))
+    (cond
+      ;; Wrapped vector — handled before LISTP since wrappers are conses
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence))
+             (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (if test (funcall test item test-val) (eql item test-val))
+                   (if from-end
+                       (setq result elem)
+                       (return elem)))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       ;; List path
+       (let ((lst sequence) (i 0) (result nil))
+         ;; Skip to start
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         ;; Search
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let ((elem (car lst)))
+             (let ((test-val (if key (funcall key elem) elem)))
+               (when (if test (funcall test item test-val) (eql item test-val))
+                 (if from-end
+                     (setq result elem)
+                     (return elem)))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       ;; Vector path
+       (let ((len (length sequence))
+             (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (aref sequence i))
+                    ;; String slots hold fixnum char-codes; present as
+                    ;; characters so (eql item #\X) works.
+                    (elem (if string-p (code-char raw) raw)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (if test (funcall test item test-val) (eql item test-val))
+                   (if from-end
+                       (setq result elem)
+                       (return elem)))))
+             (setq i (+ i 1)))))))))
 
 (defun find-if (predicate sequence &rest args)
   "Return the first element of SEQUENCE satisfying PREDICATE."
@@ -1929,31 +1960,46 @@
             ((eq k :end) (setq end v))
             ((eq k :from-end) (setq from-end v))))
         (setq cur (cddr cur))))
-    (if (listp sequence)
-        (let ((lst sequence) (i 0) (result nil))
-          (loop
-            (when (or (null lst) (= i start)) (return nil))
-            (setq lst (cdr lst))
-            (setq i (+ i 1)))
-          (loop
-            (when (null lst) (return result))
-            (when (and end (= i end)) (return result))
-            (let ((elem (car lst)))
-              (let ((test-val (if key (funcall key elem) elem)))
-                (when (funcall predicate test-val)
-                  (if from-end (setq result elem) (return elem)))))
-            (setq lst (cdr lst))
-            (setq i (+ i 1))))
-        (let ((len (length sequence)) (result nil))
-          (when (null end) (setq end len))
-          (let ((i start))
-            (loop
-              (when (= i end) (return result))
-              (let ((elem (aref sequence i)))
-                (let ((test-val (if key (funcall key elem) elem)))
-                  (when (funcall predicate test-val)
-                    (if from-end (setq result elem) (return elem)))))
-              (setq i (+ i 1))))))))
+    (cond
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence)) (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (funcall predicate test-val)
+                   (if from-end (setq result elem) (return elem)))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       (let ((lst sequence) (i 0) (result nil))
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let ((elem (car lst)))
+             (let ((test-val (if key (funcall key elem) elem)))
+               (when (funcall predicate test-val)
+                 (if from-end (setq result elem) (return elem)))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       (let ((len (length sequence)) (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let ((elem (aref sequence i)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (funcall predicate test-val)
+                   (if from-end (setq result elem) (return elem)))))
+             (setq i (+ i 1)))))))))
 
 (defun find-if-not (predicate sequence &rest args)
   "Return the first element of SEQUENCE not satisfying PREDICATE.
@@ -1970,31 +2016,46 @@
             ((eq k :end) (setq end v))
             ((eq k :from-end) (setq from-end v))))
         (setq cur (cddr cur))))
-    (if (listp sequence)
-        (let ((lst sequence) (i 0) (result nil))
-          (loop
-            (when (or (null lst) (= i start)) (return nil))
-            (setq lst (cdr lst))
-            (setq i (+ i 1)))
-          (loop
-            (when (null lst) (return result))
-            (when (and end (= i end)) (return result))
-            (let* ((elem (car lst))
-                   (test-val (if key (funcall key elem) elem)))
-              (unless (funcall predicate test-val)
-                (if from-end (setq result elem) (return elem))))
-            (setq lst (cdr lst))
-            (setq i (+ i 1))))
-        (let ((len (length sequence)) (result nil))
-          (when (null end) (setq end len))
-          (let ((i start))
-            (loop
-              (when (= i end) (return result))
-              (let* ((elem (aref sequence i))
-                     (test-val (if key (funcall key elem) elem)))
-                (unless (funcall predicate test-val)
-                  (if from-end (setq result elem) (return elem))))
-              (setq i (+ i 1))))))))
+    (cond
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence)) (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw))
+                    (test-val (if key (funcall key elem) elem)))
+               (unless (funcall predicate test-val)
+                 (if from-end (setq result elem) (return elem))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       (let ((lst sequence) (i 0) (result nil))
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let* ((elem (car lst))
+                  (test-val (if key (funcall key elem) elem)))
+             (unless (funcall predicate test-val)
+               (if from-end (setq result elem) (return elem))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       (let ((len (length sequence)) (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((elem (aref sequence i))
+                    (test-val (if key (funcall key elem) elem)))
+               (unless (funcall predicate test-val)
+                 (if from-end (setq result elem) (return elem))))
+             (setq i (+ i 1)))))))))
 
 (defun position-if (predicate sequence &rest args)
   "Return the index of first element satisfying PREDICATE."
@@ -2009,31 +2070,46 @@
             ((eq k :end) (setq end v))
             ((eq k :from-end) (setq from-end v))))
         (setq cur (cddr cur))))
-    (if (listp sequence)
-        (let ((lst sequence) (i 0) (result nil))
-          (loop
-            (when (or (null lst) (= i start)) (return nil))
-            (setq lst (cdr lst))
-            (setq i (+ i 1)))
-          (loop
-            (when (null lst) (return result))
-            (when (and end (= i end)) (return result))
-            (let ((elem (car lst)))
-              (let ((test-val (if key (funcall key elem) elem)))
-                (when (funcall predicate test-val)
-                  (if from-end (setq result i) (return i)))))
-            (setq lst (cdr lst))
-            (setq i (+ i 1))))
-        (let ((len (length sequence)) (result nil))
-          (when (null end) (setq end len))
-          (let ((i start))
-            (loop
-              (when (= i end) (return result))
-              (let ((elem (aref sequence i)))
-                (let ((test-val (if key (funcall key elem) elem)))
-                  (when (funcall predicate test-val)
-                    (if from-end (setq result i) (return i)))))
-              (setq i (+ i 1))))))))
+    (cond
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence)) (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw))
+                    (test-val (if key (funcall key elem) elem)))
+               (when (funcall predicate test-val)
+                 (if from-end (setq result i) (return i))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       (let ((lst sequence) (i 0) (result nil))
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let ((elem (car lst)))
+             (let ((test-val (if key (funcall key elem) elem)))
+               (when (funcall predicate test-val)
+                 (if from-end (setq result i) (return i)))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       (let ((len (length sequence)) (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let ((elem (aref sequence i)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (funcall predicate test-val)
+                   (if from-end (setq result i) (return i)))))
+             (setq i (+ i 1)))))))))
 
 (defun position-if-not (predicate sequence &rest args)
   "Return the index of first element not satisfying PREDICATE.
@@ -2050,31 +2126,46 @@
             ((eq k :end) (setq end v))
             ((eq k :from-end) (setq from-end v))))
         (setq cur (cddr cur))))
-    (if (listp sequence)
-        (let ((lst sequence) (i 0) (result nil))
-          (loop
-            (when (or (null lst) (= i start)) (return nil))
-            (setq lst (cdr lst))
-            (setq i (+ i 1)))
-          (loop
-            (when (null lst) (return result))
-            (when (and end (= i end)) (return result))
-            (let* ((elem (car lst))
-                   (test-val (if key (funcall key elem) elem)))
-              (unless (funcall predicate test-val)
-                (if from-end (setq result i) (return i))))
-            (setq lst (cdr lst))
-            (setq i (+ i 1))))
-        (let ((len (length sequence)) (result nil))
-          (when (null end) (setq end len))
-          (let ((i start))
-            (loop
-              (when (= i end) (return result))
-              (let* ((elem (aref sequence i))
-                     (test-val (if key (funcall key elem) elem)))
-                (unless (funcall predicate test-val)
-                  (if from-end (setq result i) (return i))))
-              (setq i (+ i 1))))))))
+    (cond
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence)) (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw))
+                    (test-val (if key (funcall key elem) elem)))
+               (unless (funcall predicate test-val)
+                 (if from-end (setq result i) (return i))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       (let ((lst sequence) (i 0) (result nil))
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let* ((elem (car lst))
+                  (test-val (if key (funcall key elem) elem)))
+             (unless (funcall predicate test-val)
+               (if from-end (setq result i) (return i))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       (let ((len (length sequence)) (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((elem (aref sequence i))
+                    (test-val (if key (funcall key elem) elem)))
+               (unless (funcall predicate test-val)
+                 (if from-end (setq result i) (return i))))
+             (setq i (+ i 1)))))))))
 
 (defun position (item sequence &rest args)
   "Return the position of the first ITEM in SEQUENCE satisfying TEST.
@@ -2102,35 +2193,52 @@
         (setq test (lambda (a b) (not (funcall tn a b))))))
     ;; Walk inline (don't (apply #'position-if ...) — apply-of-rest
     ;; through a sibling &rest defun is documented as fragile).
-    (if (listp sequence)
-        (let ((lst sequence) (i 0) (result nil))
-          (loop
-            (when (or (null lst) (= i start)) (return nil))
-            (setq lst (cdr lst))
-            (setq i (+ i 1)))
-          (loop
-            (when (null lst) (return result))
-            (when (and end (= i end)) (return result))
-            (let* ((elem (car lst))
-                   (test-val (if key (funcall key elem) elem))
-                   (matched (if test (funcall test item test-val)
-                                (eql item test-val))))
-              (when matched
-                (if from-end (setq result i) (return i))))
-            (setq lst (cdr lst))
-            (setq i (+ i 1))))
-        (let ((len (length sequence)) (result nil))
-          (when (null end) (setq end len))
-          (let ((i start))
-            (loop
-              (when (= i end) (return result))
-              (let* ((elem (aref sequence i))
-                     (test-val (if key (funcall key elem) elem))
-                     (matched (if test (funcall test item test-val)
-                                  (eql item test-val))))
-                (when matched
-                  (if from-end (setq result i) (return i))))
-              (setq i (+ i 1))))))))
+    (cond
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence)) (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw))
+                    (test-val (if key (funcall key elem) elem))
+                    (matched (if test (funcall test item test-val)
+                                 (eql item test-val))))
+               (when matched
+                 (if from-end (setq result i) (return i))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       (let ((lst sequence) (i 0) (result nil))
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let* ((elem (car lst))
+                  (test-val (if key (funcall key elem) elem))
+                  (matched (if test (funcall test item test-val)
+                               (eql item test-val))))
+             (when matched
+               (if from-end (setq result i) (return i))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       (let ((len (length sequence)) (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((elem (aref sequence i))
+                    (test-val (if key (funcall key elem) elem))
+                    (matched (if test (funcall test item test-val)
+                                 (eql item test-val))))
+               (when matched
+                 (if from-end (setq result i) (return i))))
+             (setq i (+ i 1)))))))))
 
 ;; complement: (complement #'pred) returns a function that negates pred,
 ;; accepting any number of arguments (ANSI requirement).  We dispatch

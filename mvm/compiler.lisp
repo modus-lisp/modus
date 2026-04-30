@@ -2331,6 +2331,8 @@
           env dest)))
 
       ;; TYPECASE — (typecase key (type1 form1...) ...) → rewrite as let + cond typep
+      ;; Per CLHS, an empty-body clause whose type matches returns NIL
+      ;; (not the truth value).  Wrap body with (or body '(nil)).
       ((= op-name 578189417670937395)
        (let ((key-form (cadr form))
              (clauses (cddr form))
@@ -2338,11 +2340,12 @@
          (compile-form
           `(let ((,tmp ,key-form))
              (cond ,@(mapcar (lambda (clause)
-                               (let ((type (car clause))
-                                     (body (cdr clause)))
+                               (let* ((type (car clause))
+                                      (body (cdr clause))
+                                      (effective-body (or body '(nil))))
                                  (if (or (eq type 't) (eq type 'otherwise))
-                                     `(t ,@body)
-                                     `((typep ,tmp ',type) ,@body))))
+                                     `(t ,@effective-body)
+                                     `((typep ,tmp ',type) ,@effective-body))))
                              clauses)))
           env dest)))
 

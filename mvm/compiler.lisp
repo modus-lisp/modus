@@ -4609,21 +4609,25 @@
              ;; collected list in iteration order.  Also nreverse cond-INTO
              ;; collect vars (registered via WHEN/IF/UNLESS COLLECT INTO).
              (collect-fixups
-               (let ((ix -1) (fixups nil))
+               (let ((ix -1) (fixups nil) (seen-vars nil))
                  (dolist (a accs)
                    (incf ix)
                    (when (member (car a) '(:collect :collect-when))
-                     (push `(setq ,(nth ix acc-vars) (nreverse ,(nth ix acc-vars)))
-                           fixups)))
+                     (let ((v (nth ix acc-vars)))
+                       (unless (member v seen-vars)
+                         (push v seen-vars)
+                         (push `(setq ,v (nreverse ,v)) fixups)))))
                  ;; cond-into-acc covers BOTH INTO-named and gensym-anon
                  ;; conditional collects (:anon-cond entries also live in
-                 ;; cond-into-acc).  This is the single source of truth for
-                 ;; conditional collect fixups, so :anon-cond doesn't need
-                 ;; a parallel fixup pass.
+                 ;; cond-into-acc).  Dedup: if two WHEN clauses both COLLECT
+                 ;; INTO foo, foo gets pushed twice — fixing it twice would
+                 ;; cancel the nreverse.
                  (dolist (ci cond-into)
                    (when (eq (cdr ci) :collect)
-                     (push `(setq ,(car ci) (nreverse ,(car ci)))
-                           fixups)))
+                     (let ((v (car ci)))
+                       (unless (member v seen-vars)
+                         (push v seen-vars)
+                         (push `(setq ,v (nreverse ,v)) fixups)))))
                  (nreverse fixups)))
              (result (cond
                        (has-always

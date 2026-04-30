@@ -144,7 +144,21 @@
    Compiling a function call at depth > 0 risks register clobber
    from the call's save/restore interacting with the arithmetic stack.")
 
-(defvar *fuzz-funcall-nops* 0
+;;; ============================================================
+;;; Compiler tuning parameters
+;;;
+;;; These are defparameter (not defvar) so re-loading the file resets
+;;; them to defaults.  All are reachable from bare-metal self-hosted
+;;; Modus too — the defparameter forms get loaded as part of the MVM
+;;; source, so a self-hosted REPL/build script can `(setq *foo* val)`
+;;; before invoking the compiler.
+;;;
+;;; The build-time env-var bridge (mvm/build-*.lisp) just calls setq
+;;; on these from MODUS_* env vars; that's an SBCL-side convenience
+;;; that doesn't affect bare-metal availability.
+;;; ============================================================
+
+(defparameter *fuzz-funcall-nops* 0
   "DIAGNOSTIC: number of :nop IR ops to inject at the start of each
    compile-funcall.  Used by the layout-flip fuzzer to vary bytecode
    layout in controlled increments without changing semantics.  Build
@@ -152,6 +166,30 @@
    pattern reveals what underlying mechanism still depends on layout
    (alignment? branch displacement? GC scan finding a specific value
    on the stack?).  Set to 0 in production builds.")
+
+(defparameter *compile-trace* nil
+  "When non-nil, print each top-level form as it's compiled.  Useful
+   for diagnosing build hangs or last-form-before-crash.  Output goes
+   to stdout via format.")
+
+(defparameter *compile-warn-unresolved* t
+  "When non-nil, mvm-compile-all prints a list of unresolved function
+   calls (callee names that no defun resolved) at the end of compilation.
+   Set to nil to silence this output for clean build logs.")
+
+(defparameter *compile-list-headed-fn-warn* t
+  "When non-nil, compile-call prints `;; WARN compile-call:` to stderr
+   for any callable form that's a list with non-LAMBDA head (e.g.
+   `((cond ...) args)`).  This was the silent miscompile vector for the
+   ~( ~) paren bug; warn loud now.  Set nil to silence on test code that
+   intentionally constructs malformed callables.")
+
+(defparameter *write-symmap-path* nil
+  "When non-nil, write a side-channel symbol map at this path during
+   image build.  Format: one tab-separated line per function, columns:
+     virtual-addr<TAB>size<TAB>native-offset<TAB>name
+   So you can resolve any RIP without parsing the ELF.  Independent of
+   the .symtab in the ELF — that one sits alongside.")
 
 (defvar *pending-flet-ir* nil
   "Collects (info . ir) pairs from flet/labels function compilations.
@@ -7172,7 +7210,8 @@
       ;; trigger runtime type errors; build-script CHECK-PARSES is the
       ;; primary defense for first-party code.
       (t
-       (when (and (consp fn)
+       (when (and *compile-list-headed-fn-warn*
+                  (consp fn)
                   (not (and (symbolp (car fn))
                             (string= (symbol-name (car fn)) "LAMBDA"))))
          (format *error-output*
@@ -8409,6 +8448,11 @@
             (if (and source-lines (< form-index (length source-lines)))
                 (format nil "line ~D" (aref source-lines form-index))
                 (format nil "form#~D" form-index)))
+      (when *compile-trace*
+        (format t ";; compile ~A: ~A~%"
+                *current-source-location*
+                (let ((s (format nil "~S" form)))
+                  (if (> (length s) 70) (subseq s 0 70) s))))
       (incf form-index)
       ;; Snapshot *function-table* before compiling this form, so we can
       ;; remove any orphaned lambda entries on error.
@@ -8523,7 +8567,8 @@
                     (remove (car entry) *function-table*))))))
 
       ;; Report unresolved calls
-      (when (and (boundp '*unresolved-calls*)
+      (when (and *compile-warn-unresolved*
+                 (boundp '*unresolved-calls*)
                  (> (hash-table-count *unresolved-calls*) 0))
         (let ((total 0) (names nil))
           (maphash (lambda (k v) (incf total v) (push (cons v k) names))

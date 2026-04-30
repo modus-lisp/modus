@@ -3153,15 +3153,40 @@
 ;; misidentified as cons/object pointers by compile-funcall.
 (setf modus.mvm.x64::*x64-native-code-offset* 351)
 
-;; Layout-flip fuzzer: read MODUS_FUZZ_FUNCALL_NOPS from the environment.
-;; Defaults to 0; set to a positive integer to inject N :nop IR ops at
-;; the start of every compile-funcall.  Used by scripts/fragility-fuzzer.sh.
-(let ((env (sb-ext:posix-getenv "MODUS_FUZZ_FUNCALL_NOPS")))
-  (when env
-    (let ((n (parse-integer env :junk-allowed t)))
-      (when (and n (>= n 0))
-        (setf modus.mvm::*fuzz-funcall-nops* n)
-        (format t "~%FUZZ: injecting ~D :nop ops per funcall~%" n)))))
+;; Compiler-parameter env-var bridge.
+;;
+;; Each entry maps a MODUS_* env var to a defparameter symbol in
+;; :modus.mvm.  When the env var is set to a parseable value, we setq
+;; the corresponding param BEFORE building.  All params live in
+;; mvm/compiler.lisp as defparameter, so they're also reachable from
+;; bare-metal self-hosted Modus (just `(setq *foo* val)` before
+;; invoking the compiler).
+;;
+;; To add a new knob: defparameter it in compiler.lisp, then add a row
+;; here.  TYPE is :int (parse-integer), :bool (any non-empty truthy
+;; string → t, else nil), or :str.
+(let ((bridge '(("MODUS_FUZZ_FUNCALL_NOPS"   *fuzz-funcall-nops*           :int)
+                ("MODUS_COMPILE_TRACE"        *compile-trace*               :bool)
+                ("MODUS_COMPILE_WARN_UNRESOLVED" *compile-warn-unresolved*  :bool)
+                ("MODUS_COMPILE_WARN_LIST_FN"    *compile-list-headed-fn-warn* :bool)
+                ("MODUS_SYMMAP"               *write-symmap-path*           :str))))
+  (dolist (entry bridge)
+    (let* ((var-name (first entry))
+           (sym-name (second entry))
+           (kind     (third entry))
+           (env-val  (sb-ext:posix-getenv var-name))
+           (sym      (intern (symbol-name sym-name) :modus.mvm)))
+      (when (and env-val (> (length env-val) 0))
+        (let ((parsed (case kind
+                        (:int  (parse-integer env-val :junk-allowed t))
+                        (:bool (let ((lc (string-downcase env-val)))
+                                 (not (member lc '("" "0" "no" "false" "off" "nil")
+                                              :test #'string=))))
+                        (:str  env-val))))
+          (when (or (eq kind :str) (not (null parsed)))
+            (setf (symbol-value sym) parsed)
+            (format t "~%PARAM: ~A = ~S (from ~A)~%"
+                    sym-name parsed var-name)))))))
 
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 

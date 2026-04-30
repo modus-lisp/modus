@@ -629,7 +629,49 @@
                             (wrap-in-elf64-be raw-bytes load-addr elf-machine elf-flags))
                            (t raw-bytes)))))
                   raw-bytes))))
+    ;; Side-channel symbol map: tab-separated, easy to grep/awk.
+    ;; Independent of the ELF .symtab — useful for non-ELF targets too,
+    ;; and for resolving RIPs without parsing the binary.
+    (when *write-symmap-path*
+      (write-symmap *write-symmap-path*
+                    (mvm-module-function-table module)
+                    image
+                    boot-descriptor))
     image))
+
+(defun write-symmap (path function-table image boot-descriptor)
+  "Write a tab-separated symbol map to PATH.
+   Columns: virtual-addr<TAB>size<TAB>native-offset<TAB>name
+   Rows are sorted by virtual-addr ascending."
+  (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr))
+                        #x400000))
+         ;; ehdr+phdr for the ELF wrapper.  For non-ELF targets this is 0;
+         ;; the image-byte 0 already lives at the load address.
+         (elf-header (if (and boot-descriptor
+                              (eq (getf boot-descriptor :elf-format) :linux-x64))
+                         120
+                         0))
+         (nio (or (kernel-image-native-image-offset image) 0))
+         (ncl (length (kernel-image-native-code image)))
+         (sorted (stable-sort (copy-list function-table)
+                              #'< :key #'mvm-function-info-native-offset)))
+    (with-open-file (out path :direction :output :if-exists :supersede
+                              :if-does-not-exist :create)
+      (format out "# virtual-addr~Csize~Cnative-offset~Cname~%"
+              #\Tab #\Tab #\Tab)
+      (loop for fi in sorted
+            for i from 0
+            for nat-off = (or (mvm-function-info-native-offset fi) 0)
+            for next-off = (if (< (1+ i) (length sorted))
+                               (mvm-function-info-native-offset
+                                 (nth (1+ i) sorted))
+                               ncl)
+            for size = (max 0 (- next-off nat-off))
+            for vaddr = (+ load-addr elf-header nio nat-off)
+            do (format out "~16,'0X~C~D~C~D~C~A~%"
+                       vaddr #\Tab size #\Tab nat-off #\Tab
+                       (string (mvm-function-info-name fi))))
+      (format t "  Wrote symbol map: ~A~%" path))))
 
 ;;; ============================================================
 ;;; Top-Level API

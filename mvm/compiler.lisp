@@ -581,17 +581,21 @@
             (tmp (gensym "CASE")))
         `(let ((,tmp ,keyform))
            (cond ,@(mapcar (lambda (clause)
-                             (let ((keys (car clause))
-                                   (body (cdr clause)))
+                             (let* ((keys (car clause))
+                                    (body (cdr clause))
+                                    ;; Per CLHS, a clause with no body
+                                    ;; whose key matches returns NIL,
+                                    ;; not the truth value of the test.
+                                    (effective-body (or body '(nil))))
                                (cond
                                  ((or (eq keys t)
                                       (and (symbolp keys)
                                            (= (compute-name-hash (symbol-name keys)) 351744830753626451)))
-                                  `(t ,@body))
+                                  `(t ,@effective-body))
                                  ((listp keys)
                                   `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
-                                    ,@body))
-                                 (t `((eql ,tmp ',keys) ,@body)))))
+                                    ,@effective-body))
+                                 (t `((eql ,tmp ',keys) ,@effective-body)))))
                            clauses))))))
 
   ;; ECASE → CASE (same behavior for now; no error on mismatch)

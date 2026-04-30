@@ -174,14 +174,23 @@
 (defun member (item list &rest options)
   "Return the tail of LIST starting from the first element EQL to ITEM.
    Signals TYPE-ERROR if LIST is not a list.
-   Honors ANSI &key TEST/TEST-NOT/KEY."
+   Honors ANSI &key TEST/TEST-NOT/KEY.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
   (when (and (not (null list)) (not (consp list)))
     (%signal-type-error))
-  (let ((test nil) (test-not nil) (key nil) (a options))
+  (let ((test nil) (test-not nil) (key nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (a options))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :test-not) (setq test-not (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :test)
+             (unless test-set (setq test (cadr a)) (setq test-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :test-not)
+             (unless tn-set (setq test-not (cadr a)) (setq tn-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :key)
+             (unless key-set (setq key (cadr a)) (setq key-set t))
+             (setq a (cddr a)))
             (t (setq a (cdr a)))))
     (let ((cur list))
       (loop

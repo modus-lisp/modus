@@ -926,7 +926,8 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) seq)
-      ((consp seq)
+      ;; List + forward (or no count) → simple forward walk.
+      ((and (consp seq) (not from-end))
        (let ((result nil) (cur seq) (idx 0) (n eff-count))
          (loop
            (when (null cur) (return (nreverse result)))
@@ -941,6 +942,32 @@
              (when replace (when n (setq n (- n 1)))))
            (setq cur (cdr cur))
            (setq idx (+ idx 1)))))
+      ;; List + :from-end → walk to collect matches, keep last :count of them.
+      ((consp seq)
+       (let* ((items seq) (n (length items))
+              (eff-end (if (and end-idx (< end-idx n)) end-idx n))
+              (matches nil) (cur items) (i 0))
+         (loop (when (or (null cur) (>= i eff-end)) (return nil))
+           (when (>= i start-idx)
+             (let* ((elt (car cur))
+                    (v (if key-fn (funcall key-fn elt) elt)))
+               (when (funcall pred v) (setq matches (cons i matches)))))
+           (setq cur (cdr cur))
+           (setq i (+ i 1)))
+         ;; from-end + count → leading from reverse-walk = last :count matches.
+         (let ((selected
+                 (cond
+                   ((null eff-count) matches)
+                   (t (let ((kept nil) (src matches) (k eff-count))
+                        (loop (when (or (null src) (= k 0)) (return kept))
+                          (setq kept (cons (car src) kept))
+                          (setq src (cdr src))
+                          (setq k (- k 1))))))))
+           (let ((out nil) (cur items) (j 0))
+             (loop (when (null cur) (return (nreverse out)))
+               (setq out (cons (if (member j selected) new (car cur)) out))
+               (setq cur (cdr cur))
+               (setq j (+ j 1)))))))
       (t
        (let ((copy (copy-seq seq)))
          (cond

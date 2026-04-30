@@ -205,16 +205,25 @@
 
 (defun assoc (key alist &rest options)
   "Find the first pair in ALIST whose car matches KEY. Honors :TEST,
-   :TEST-NOT, :KEY. Default test is inline `eql`."
-  (let ((test nil) (key-fn nil) (a options))
+   :TEST-NOT, :KEY. Default test is inline `eql`.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (let ((test nil) (test-not nil) (key-fn nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (a options))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key)  (setq key-fn (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :test)
+             (unless test-set (setq test (cadr a)) (setq test-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :key)
+             (unless key-set (setq key-fn (cadr a)) (setq key-set t))
+             (setq a (cddr a)))
             ((eq (car a) :test-not)
-             (let ((f (cadr a)))
-               (setq test (lambda (x y) (not (funcall f x y)))))
+             (unless tn-set (setq test-not (cadr a)) (setq tn-set t))
              (setq a (cddr a)))
             (t (setq a (cdr a)))))
+    (when (and test-not (not test))
+      (let ((f test-not))
+        (setq test (lambda (x y) (not (funcall f x y))))))
     (let ((cur alist))
       (loop
         (when (null cur) (return nil))

@@ -555,9 +555,7 @@
 
 (defun count (item seq &rest args)
   "Count occurrences of ITEM in SEQ. Honors :test, :test-not, :key,
-   :start, :end, :from-end.  For strings, presents each element as a
-   character (string slots hold fixnum char-codes; the natural test
-   against #\\X expects a character comparison via eql)."
+   :start, :end, :from-end."
   (let ((test nil) (key nil) (start 0) (end nil) (from-end nil) (a args))
     (loop (when (null a) (return))
       (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
@@ -570,17 +568,18 @@
                (setq test (lambda (x y) (not (funcall f x y)))))
              (setq a (cddr a)))
             (t (setq a (cdr a)))))
-    (let ((string-p (stringp seq)))
-      (count-if (lambda (x)
-                  (let ((c (if string-p (code-char x) x)))
-                    (if test (funcall test item c) (eql item c))))
-                seq
-                :start start
-                :end (or end (cond ((null seq) 0)
-                                    ((consp seq) most-positive-fixnum)
-                                    (t (length seq))))
-                :key key
-                :from-end from-end))))
+    ;; count-if's iteration already presents string elements as CHARACTERS
+    ;; via (elt seq i) on the vector path and (%wrapper-aref + code-char)
+    ;; on the wrapper path, so the lambda just compares item against x as-is.
+    (count-if (lambda (x)
+                (if test (funcall test item x) (eql item x)))
+              seq
+              :start start
+              :end (or end (cond ((null seq) 0)
+                                  ((consp seq) most-positive-fixnum)
+                                  (t (length seq))))
+              :key key
+              :from-end from-end)))
 
 ;;; Function wrappers for compiler builtins (needed for apply/#')
 ;;; The compiler uses XOR/AND/OR opcodes for inline (logxor a b) etc.

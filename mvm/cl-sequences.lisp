@@ -815,7 +815,11 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) seq)
-      ((consp seq)
+      ;; List + no positional/count kwargs → simple per-element transform.
+      ;; Keep this fast path for the bulk of plain (substitute new old list)
+      ;; calls so we don't do index-tracking overhead.
+      ((and (consp seq) (= start-idx 0) (null end-idx) (null eff-count)
+            (not from-end))
        (%seq-substitute-with
         (lambda (item)
           (let ((v (if key-fn (funcall key-fn item) item)))
@@ -823,6 +827,51 @@
                 new
                 item)))
         seq))
+      ((consp seq)
+       ;; List + at least one of :start/:end/:count/:from-end.
+       ;; Walk to find match indices; build output replacing the right subset.
+       (let* ((items seq)
+              (n (length items))
+              (eff-end (if (and end-idx (< end-idx n)) end-idx n))
+              (matches nil)        ; reverse-walk order: highest idx first
+              (cur items)
+              (i 0))
+         (loop (when (or (null cur) (>= i eff-end)) (return nil))
+           (when (>= i start-idx)
+             (let* ((elt (car cur))
+                    (v (if key-fn (funcall key-fn elt) elt))
+                    (match (if test-fn (funcall test-fn old v) (eql old v))))
+               (when match (setq matches (cons i matches)))))
+           (setq cur (cdr cur))
+           (setq i (+ i 1)))
+         ;; Pick the right subset given :count and :from-end.
+         (let ((selected
+                 (cond
+                   ((null eff-count) matches)
+                   ;; from-end keeps the LAST count matches = leading from
+                   ;; reverse-walk order.
+                   (from-end
+                    (let ((kept nil) (src matches) (k eff-count))
+                      (loop (when (or (null src) (= k 0)) (return kept))
+                        (setq kept (cons (car src) kept))
+                        (setq src (cdr src))
+                        (setq k (- k 1)))))
+                   ;; forward keeps the FIRST count matches = take from
+                   ;; the tail of reverse-walk order.
+                   (t
+                    (let* ((nm (length matches))
+                           (skip (- nm eff-count))
+                           (src matches))
+                      (when (< skip 0) (setq skip 0))
+                      (loop (when (= skip 0) (return src))
+                        (setq src (cdr src))
+                        (setq skip (- skip 1))))))))
+           ;; Build output replacing items at indices in `selected'.
+           (let ((out nil) (cur items) (j 0))
+             (loop (when (null cur) (return (nreverse out)))
+               (setq out (cons (if (member j selected) new (car cur)) out))
+               (setq cur (cdr cur))
+               (setq j (+ j 1)))))))
       (t
        (let ((copy (copy-seq seq)))
          (cond

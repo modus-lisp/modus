@@ -599,7 +599,7 @@
     (lambda (form)
       `(case ,@(cdr form))))
 
-  ;; DOLIST → LET + LOOP
+  ;; DOLIST → LET + LOOP.  Per CLHS body is an implicit tagbody.
   (mvm-define-macro "DOLIST"
     (lambda (form)
       (let ((spec (cadr form))
@@ -612,7 +612,7 @@
                (if (null ,tmp)
                    (return nil)
                    (let ((,var (car ,tmp)))
-                     ,@body
+                     (tagbody ,@body)
                      (setq ,tmp (cdr ,tmp))))))))))
 
   ;; INCF → SETQ + +
@@ -1278,7 +1278,8 @@
                    (mapcar (lambda (v s) (when s `(setq ,v ,s)))
                            vars steps))))))))
 
-  ;; DOLIST — (dolist (var list [result]) body...)
+  ;; DOLIST — (dolist (var list [result]) body...).  Per CLHS, the body
+  ;; is in an implicit tagbody so GO/tags work.
   (mvm-define-macro "DOLIST"
     (lambda (form)
       (let* ((spec (cadr form))
@@ -1291,7 +1292,7 @@
            (loop
              (when (null ,tmp) (return ,result))
              (setq ,var (car ,tmp))
-             ,@body
+             (tagbody ,@body)
              (setq ,tmp (cdr ,tmp)))))))
 
   ;; CLASSIFY-ERROR* — stub
@@ -4720,7 +4721,7 @@
 
 (defun compile-dotimes (spec body env dest)
   "Compile (dotimes (var count [result]) body...).
-   Expands to: (let ((var 0)) (loop ...) result)"
+   Per CLHS, body is in an implicit tagbody so GO/tags work."
   (let* ((var (car spec))
          (count-form (cadr spec))
          (result-form (caddr spec)))
@@ -4728,9 +4729,9 @@
      (list (list var 0))
      (list (list 'loop
                  (list 'if (list '< var count-form)
-                       (append (list 'progn)
-                               body
-                               (list (list 'setq var (list '1+ var))))
+                       (list 'progn
+                             (cons 'tagbody body)
+                             (list 'setq var (list '1+ var)))
                        (list 'return (or result-form nil)))))
      env dest)))
 

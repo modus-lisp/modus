@@ -973,28 +973,37 @@
 ;;; ============================================================
 
 (defun %set-exclusive-or-impl (list1 list2 args)
-  "Positional helper for set-exclusive-or. Takes args as a real list,
-   so callers can route through it without apply-of-rest."
+  "Positional helper for set-exclusive-or. Takes args as a real list.
+   Inlined search loops avoid the nested-lambda-with-capture pattern
+   that's fragile in MVM (closure cell aliasing across iterations)."
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
          (result nil))
     ;; Elements in list1 not in list2
     (dolist (e1 list1)
-      (let ((k1 (if key-fn (funcall key-fn e1) e1)))
-        (unless (some (lambda (e2)
-                        (let ((v2 (if key-fn (funcall key-fn e2) e2)))
-                          (if test-fn (funcall test-fn k1 v2) (eql k1 v2))))
-                      list2)
-          (setq result (cons e1 result)))))
+      (let ((k1 (if key-fn (funcall key-fn e1) e1))
+            (found nil)
+            (cur list2))
+        (loop
+          (when (or found (null cur)) (return nil))
+          (let ((v2 (if key-fn (funcall key-fn (car cur)) (car cur))))
+            (when (if test-fn (funcall test-fn k1 v2) (eql k1 v2))
+              (setq found t)))
+          (setq cur (cdr cur)))
+        (unless found (setq result (cons e1 result)))))
     ;; Elements in list2 not in list1
     (dolist (e2 list2)
-      (let ((k2 (if key-fn (funcall key-fn e2) e2)))
-        (unless (some (lambda (e1)
-                        (let ((v1 (if key-fn (funcall key-fn e1) e1)))
-                          (if test-fn (funcall test-fn v1 k2) (eql v1 k2))))
-                      list1)
-          (setq result (cons e2 result)))))
+      (let ((k2 (if key-fn (funcall key-fn e2) e2))
+            (found nil)
+            (cur list1))
+        (loop
+          (when (or found (null cur)) (return nil))
+          (let ((v1 (if key-fn (funcall key-fn (car cur)) (car cur))))
+            (when (if test-fn (funcall test-fn v1 k2) (eql v1 k2))
+              (setq found t)))
+          (setq cur (cdr cur)))
+        (unless found (setq result (cons e2 result)))))
     result))
 
 (defun set-exclusive-or (list1 list2 &rest args)

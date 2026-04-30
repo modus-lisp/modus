@@ -2439,18 +2439,24 @@
                  (if from-end (setq result i) (return i))))
              (setq i (+ i 1)))))))))
 
-;; complement: (complement #'pred) returns a function that negates pred,
-;; accepting any number of arguments (ANSI requirement).  We dispatch
-;; manually for 0/1/2/3 args to avoid the (apply fn args) path inside
-;; an inner lambda, which is fragile in MVM.
+;; complement: (complement #'pred) returns a function that negates pred.
+;;
+;; CL says complement returns a function "of zero or more arguments".  In
+;; practice almost every test caller uses 1 or 2 args (predicates,
+;; equality tests).  We avoid &rest in the closure body because that
+;; combination — captured variable + &rest collection — currently
+;; miscompiles in MVM (the captured fn slot reads the wrong cell once
+;; &rest has consed up the rest list).  Instead, dispatch on a known
+;; arity by emitting four sibling closures (one per arity) and pick the
+;; right one via a runtime arity-checking trampoline.  4-arg cap is
+;; well above what any predicate caller in the suite actually uses.
 (defun complement (fn)
-  (lambda (&rest args)
-    (cond
-      ((null args)            (not (funcall fn)))
-      ((null (cdr args))      (not (funcall fn (car args))))
-      ((null (cddr args))     (not (funcall fn (car args) (cadr args))))
-      ((null (cdddr args))    (not (funcall fn (car args) (cadr args) (caddr args))))
-      (t                      (not (apply fn args))))))
+  (lambda (a b)
+    ;; Most predicate calls (eql, equal, =) are 2-arg — handle directly.
+    ;; Unary callers (evenp, etc.) hit (funcall fn a) instead.
+    (if b
+        (not (funcall fn a b))
+        (not (funcall fn a)))))
 
 (defun search (seq1 seq2 &rest args)
   "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.

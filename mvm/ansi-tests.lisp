@@ -1079,6 +1079,25 @@
 ;;; Tests for previously-fixed bugs
 ;;; ============================================================
 
+(defun %simple-complement (fn)
+  (lambda (a b) (not (funcall fn a b))))
+
+;; Cond-shaped complement (no &rest)
+(defun %cond-complement (fn)
+  (lambda (a b)
+    (cond
+      (t (not (funcall fn a b))))))
+
+;; Like real complement but only 2-arg branch
+(defun %cond-complement-rest (fn)
+  (lambda (&rest args)
+    (cond
+      ((null args)            (not (funcall fn)))
+      ((null (cdr args))      (not (funcall fn (car args))))
+      ((null (cddr args))     (not (funcall fn (car args) (cadr args))))
+      ((null (cdddr args))    (not (funcall fn (car args) (cadr args) (caddr args))))
+      (t                      (not (apply fn args))))))
+
 (defun %probe-find-if-full (predicate sequence &rest args)
   "Mirror find-if exactly, with all 3 cond branches."
   (let ((key nil) (start 0) (end nil) (from-end nil))
@@ -1248,6 +1267,23 @@
   ;; Force into wrapper-p false branch
   (deftest 9713 (let ((from-end t))
                   (find-if #'evenp '(1 2 4 8 3 1 6 7) :from-end from-end)) 6)
+  ;; Probe: complement of #'eql
+  (deftest 9714 (funcall (complement #'eql) 'a 'a) nil)
+  (deftest 9715 (funcall (complement #'eql) 'a 'b) t)
+  (deftest 9716 (funcall #'eql 'a 'a) t)
+  (deftest 9717 (apply #'eql '(a a)) t)
+  (deftest 9718 (apply #'eql '(a b)) nil)
+  ;; Probe: simpler complement
+  (deftest 9719 (funcall (%simple-complement #'eql) 'a 'a) nil)
+  ;; Even simpler — just the lambda
+  (deftest 9720 (funcall (lambda (a b) (not (eql a b))) 'a 'a) nil)
+  (deftest 9721 (funcall (lambda (a b) (not (funcall #'eql a b))) 'a 'a) nil)
+  ;; Closure capture of fn
+  (deftest 9722 (let ((f #'eql))
+                  (funcall (lambda (a b) (not (funcall f a b))) 'a 'a))
+                nil)
+  (deftest 9723 (funcall (%cond-complement #'eql) 'a 'a) nil)
+  (deftest 9724 (funcall (%cond-complement-rest #'eql) 'a 'a) nil)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

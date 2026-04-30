@@ -111,10 +111,12 @@
 ;;; Missing CL functions
 ;;; ============================================================
 
-;;; complement: captures fn in global cell approach (closure-safe variant).
-(defvar *complement-fn* nil)
-(defun %complement-impl (&rest args) (if (apply *complement-fn* args) nil t))
-(defun complement (fn) (setq *complement-fn* fn) #'%complement-impl)
+;; complement was a global-cell stub here; cl-sequences.lisp now has the
+;; real per-closure implementation.  Removed so the cl-sequences version
+;; (which loads earlier but wins because we deleted the override) takes
+;; effect.  Multiple coexisting complements now work — was: every
+;; complement used the LAST fn, breaking (position x lst :test (complement
+;; #'eql)) once any other complement had been created.
 
 (defun identity (x) x)
 

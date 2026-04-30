@@ -607,7 +607,11 @@
                      (wrap-in-pe32plus raw-bytes))
                     ((eq (getf boot-descriptor :elf-format) :linux-x64)
                      (wrap-in-elf64-le raw-bytes
-                                       (or (getf boot-descriptor :load-addr) #x400000)))
+                                       (or (getf boot-descriptor :load-addr) #x400000)
+                                       :function-table
+                                       (mvm-module-function-table module)
+                                       :native-code-offset
+                                       (or modus.mvm.x64::*x64-native-code-offset* 0)))
                     (t (let ((elf-machine (getf boot-descriptor :elf-machine))
                              (load-addr (or (getf boot-descriptor :load-addr) 0))
                              (elf-class (getf boot-descriptor :elf-class 32))

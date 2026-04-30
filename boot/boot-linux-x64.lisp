@@ -28,28 +28,61 @@
 ;;; ELF64 Little-Endian Wrapper
 ;;; ============================================================
 
-(defun wrap-in-elf64-le (raw-bytes load-addr)
+(defun %sanitize-symbol-name (name)
+  "ELF strtab can't have NULs (used as terminator).  Replace any NULs in
+   NAME with '_' and limit length to a reasonable upper bound."
+  (let ((s (string name)))
+    (with-output-to-string (out)
+      (loop for c across s
+            for i below (min (length s) 200)
+            do (write-char (if (char= c #\Null) #\_ c) out)))))
+
+(defun wrap-in-elf64-le (raw-bytes load-addr &key function-table native-code-offset)
   "Wrap raw image bytes in a Linux ELF64 little-endian executable.
-   Emits section headers (.text + .shstrtab) so objdump -d works.
-   The .text section spans the full LOAD region so all our code is
-   covered (boot stub + native code + data + bytecode).  Without
-   section headers, objdump returns empty and disassembly tools
-   refuse to operate."
+   Emits section headers (.text + .shstrtab + .symtab + .strtab) plus
+   one symbol per FUNCTION-TABLE entry, so objdump -d shows function
+   names and addr2line works.  Without section headers, objdump
+   returns empty and disassembly tools refuse to operate."
   (let* ((ehdr-size 64)
          (phdr-size 56)
          (shdr-size 64)
+         (sym-size  24)
          (header-total (+ ehdr-size phdr-size))
          (raw-len (length raw-bytes))
-         ;; .shstrtab contents: NUL + ".text\0" + ".shstrtab\0"
+         (nco (or native-code-offset 0))
+         ;; .shstrtab: section names
          (shstrtab (concatenate 'string
                                 (string #\Null)
                                 ".text" (string #\Null)
-                                ".shstrtab" (string #\Null)))
+                                ".shstrtab" (string #\Null)
+                                ".symtab" (string #\Null)
+                                ".strtab" (string #\Null)))
          (shstrtab-bytes (map 'vector #'char-code shstrtab))
+         (shstrtab-len (length shstrtab-bytes))
+         ;; .strtab: symbol names.  First byte must be NUL.
+         (sym-names (cons "" (mapcar (lambda (fi)
+                                       (%sanitize-symbol-name
+                                         (mvm-function-info-name fi)))
+                                     function-table)))
+         (sym-name-offsets (let ((acc 0) (offs nil))
+                             (dolist (n sym-names (nreverse offs))
+                               (push acc offs)
+                               (incf acc (1+ (length n))))))
+         (strtab-bytes (with-output-to-string (out)
+                         (dolist (n sym-names)
+                           (write-string n out)
+                           (write-char #\Null out))))
+         (strtab-byte-vec (map 'vector #'char-code strtab-bytes))
+         (strtab-len (length strtab-byte-vec))
+         ;; Symbol entries: one NULL + one per function
+         (n-syms (1+ (length function-table)))
+         (symtab-len (* n-syms sym-size))
          ;; Layout:
-         ;;   ehdr(64) | phdr(56) | raw-bytes | shstrtab | shdrs(3*64)
+         ;;   ehdr | phdr | raw-bytes | shstrtab | symtab | strtab | shdrs(5*64)
          (shstrtab-offset (+ header-total raw-len))
-         (shdrs-offset (+ shstrtab-offset (length shstrtab-bytes)))
+         (symtab-offset (+ shstrtab-offset shstrtab-len))
+         (strtab-offset (+ symtab-offset symtab-len))
+         (shdrs-offset (+ strtab-offset strtab-len))
          (entry-point (+ load-addr header-total))
          (buf (make-mvm-buffer)))
     ;; ---- ELF Header (64 bytes) ----
@@ -73,15 +106,15 @@
     (mvm-emit-u16 buf phdr-size)      ; e_phentsize
     (mvm-emit-u16 buf 1)              ; e_phnum
     (mvm-emit-u16 buf shdr-size)      ; e_shentsize
-    (mvm-emit-u16 buf 3)              ; e_shnum (NULL + .text + .shstrtab)
-    (mvm-emit-u16 buf 2)              ; e_shstrndx (.shstrtab is index 2)
+    (mvm-emit-u16 buf 5)              ; e_shnum (NULL + .text + .shstrtab + .symtab + .strtab)
+    (mvm-emit-u16 buf 2)              ; e_shstrndx (.shstrtab at index 2)
     ;; ---- Program Header (56 bytes) ----
     (mvm-emit-u32 buf 1)              ; PT_LOAD
     (mvm-emit-u32 buf 7)              ; PF_R|PF_W|PF_X
     (mvm-emit-u64 buf 0)              ; p_offset
     (mvm-emit-u64 buf load-addr)      ; p_vaddr
     (mvm-emit-u64 buf load-addr)      ; p_paddr
-    ;; p_filesz: only the LOAD segment (header + raw); shstrtab/shdrs are not loaded
+    ;; p_filesz: only the LOAD segment; shstrtab/symtab/strtab/shdrs are not loaded
     (mvm-emit-u64 buf (+ header-total raw-len))
     (mvm-emit-u64 buf (+ header-total raw-len +linux-x64-heap-size+)) ; p_memsz
     (mvm-emit-u64 buf #x200000)       ; p_align
@@ -89,11 +122,29 @@
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
     ;; ---- .shstrtab ----
     (loop for b across shstrtab-bytes do (mvm-emit-byte buf b))
-    ;; ---- Section headers (3 × 64 bytes) ----
-    ;; [0] NULL section (all zeros)
+    ;; ---- .symtab — one ELF64 Sym entry per function ----
+    ;; Sym layout: u32 name + u8 info + u8 other + u16 shndx + u64 value + u64 size
+    ;; First: NULL symbol (all zeros, except maybe).
+    (dotimes (i sym-size) (mvm-emit-byte buf 0))
+    ;; Then one per function-table entry.
+    (loop for fi in function-table
+          for name-offset in (cdr sym-name-offsets)
+          do (let* ((nat-off (or (mvm-function-info-native-offset fi) 0))
+                    (nat-len (or (mvm-function-info-native-length fi) 0))
+                    (sym-addr (+ load-addr nco nat-off)))
+               (mvm-emit-u32 buf name-offset)            ; st_name (offset in .strtab)
+               (mvm-emit-byte buf #x12)                   ; st_info: STB_GLOBAL(1) | STT_FUNC(2)
+               (mvm-emit-byte buf 0)                      ; st_other
+               (mvm-emit-u16 buf 1)                       ; st_shndx (point at .text section)
+               (mvm-emit-u64 buf sym-addr)                ; st_value
+               (mvm-emit-u64 buf nat-len)))               ; st_size
+    ;; ---- .strtab — symbol names ----
+    (loop for b across strtab-byte-vec do (mvm-emit-byte buf b))
+    ;; ---- Section headers (5 × 64 bytes) ----
+    ;; [0] NULL
     (dotimes (i shdr-size) (mvm-emit-byte buf 0))
-    ;; [1] .text — covers the entire LOAD region (code + data + bytecode)
-    (mvm-emit-u32 buf 1)              ; sh_name = offset of ".text" in shstrtab
+    ;; [1] .text — covers full LOAD region
+    (mvm-emit-u32 buf 1)              ; sh_name (".text" offset in shstrtab)
     (mvm-emit-u32 buf 1)              ; sh_type = SHT_PROGBITS
     (mvm-emit-u64 buf 6)              ; sh_flags = SHF_ALLOC|SHF_EXECINSTR
     (mvm-emit-u64 buf load-addr)      ; sh_addr
@@ -103,13 +154,35 @@
     (mvm-emit-u32 buf 0)              ; sh_info
     (mvm-emit-u64 buf 16)             ; sh_addralign
     (mvm-emit-u64 buf 0)              ; sh_entsize
-    ;; [2] .shstrtab — section names string table
-    (mvm-emit-u32 buf 7)              ; sh_name = offset of ".shstrtab" in shstrtab
+    ;; [2] .shstrtab
+    (mvm-emit-u32 buf 7)              ; sh_name (".shstrtab" offset)
     (mvm-emit-u32 buf 3)              ; sh_type = SHT_STRTAB
     (mvm-emit-u64 buf 0)              ; sh_flags
-    (mvm-emit-u64 buf 0)              ; sh_addr (not loaded)
+    (mvm-emit-u64 buf 0)              ; sh_addr
     (mvm-emit-u64 buf shstrtab-offset); sh_offset
-    (mvm-emit-u64 buf (length shstrtab-bytes)) ; sh_size
+    (mvm-emit-u64 buf shstrtab-len)   ; sh_size
+    (mvm-emit-u32 buf 0)              ; sh_link
+    (mvm-emit-u32 buf 0)              ; sh_info
+    (mvm-emit-u64 buf 1)              ; sh_addralign
+    (mvm-emit-u64 buf 0)              ; sh_entsize
+    ;; [3] .symtab
+    (mvm-emit-u32 buf 17)             ; sh_name (".symtab" offset = 1+5+1+9+1 = 17)
+    (mvm-emit-u32 buf 2)              ; sh_type = SHT_SYMTAB
+    (mvm-emit-u64 buf 0)              ; sh_flags
+    (mvm-emit-u64 buf 0)              ; sh_addr
+    (mvm-emit-u64 buf symtab-offset)  ; sh_offset
+    (mvm-emit-u64 buf symtab-len)     ; sh_size
+    (mvm-emit-u32 buf 4)              ; sh_link = .strtab section index
+    (mvm-emit-u32 buf 1)              ; sh_info = index of first non-local symbol (1 past NULL)
+    (mvm-emit-u64 buf 8)              ; sh_addralign
+    (mvm-emit-u64 buf sym-size)       ; sh_entsize
+    ;; [4] .strtab
+    (mvm-emit-u32 buf 25)             ; sh_name (".strtab" offset = 17+8 = 25)
+    (mvm-emit-u32 buf 3)              ; sh_type = SHT_STRTAB
+    (mvm-emit-u64 buf 0)              ; sh_flags
+    (mvm-emit-u64 buf 0)              ; sh_addr
+    (mvm-emit-u64 buf strtab-offset)  ; sh_offset
+    (mvm-emit-u64 buf strtab-len)     ; sh_size
     (mvm-emit-u32 buf 0)              ; sh_link
     (mvm-emit-u32 buf 0)              ; sh_info
     (mvm-emit-u64 buf 1)              ; sh_addralign

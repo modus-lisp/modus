@@ -48,6 +48,9 @@
   gc-metadata       ; GC root information
   image-bytes       ; final assembled image (byte vector)
   entry-point       ; offset of kernel-main in native code
+  native-image-offset ; byte offset of native-code start within raw image bytes
+                      ; (i.e. (length boot-code) + jmp-size).  Used by ELF wrappers
+                      ; to compute correct virtual addresses for the symbol table.
   metadata)         ; plist of image metadata
 
 ;;; ============================================================
@@ -541,6 +544,7 @@
                  (setq jmp-size 4))))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
+          (setf (kernel-image-native-image-offset image) code-offset)
           (loop for b across native-code
                 do (mvm-emit-byte final-buf b))
           ;; Update entry point to absolute offset
@@ -610,8 +614,10 @@
                                        (or (getf boot-descriptor :load-addr) #x400000)
                                        :function-table
                                        (mvm-module-function-table module)
-                                       :native-code-offset
-                                       (or modus.mvm.x64::*x64-native-code-offset* 0)))
+                                       :native-image-offset
+                                       (or (kernel-image-native-image-offset image) 0)
+                                       :native-code-length
+                                       (length (kernel-image-native-code image))))
                     (t (let ((elf-machine (getf boot-descriptor :elf-machine))
                              (load-addr (or (getf boot-descriptor :load-addr) 0))
                              (elf-class (getf boot-descriptor :elf-class 32))

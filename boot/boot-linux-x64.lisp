@@ -37,19 +37,47 @@
             for i below (min (length s) 200)
             do (write-char (if (char= c #\Null) #\_ c) out)))))
 
-(defun wrap-in-elf64-le (raw-bytes load-addr &key function-table native-code-offset)
+(defun wrap-in-elf64-le (raw-bytes load-addr &key function-table native-image-offset
+                                                  native-code-length)
   "Wrap raw image bytes in a Linux ELF64 little-endian executable.
    Emits section headers (.text + .shstrtab + .symtab + .strtab) plus
    one symbol per FUNCTION-TABLE entry, so objdump -d shows function
    names and addr2line works.  Without section headers, objdump
-   returns empty and disassembly tools refuse to operate."
+   returns empty and disassembly tools refuse to operate.
+
+   NATIVE-IMAGE-OFFSET is the byte offset of the native-code area within
+   raw-bytes (= len(boot-code) + len(JMP-stub)).  Symbol addresses are
+   computed as: load-addr + ehdr+phdr + native-image-offset + native-offset.
+   Since p_offset=0 and p_vaddr=load-addr, file offset == virtual addr -
+   load-addr, so this lands symbols on real prologue bytes.
+
+   NATIVE-CODE-LENGTH is the size of the native-code area; used to compute
+   each symbol's st_size (distance to the next function, or to native-end
+   for the last)."
   (let* ((ehdr-size 64)
          (phdr-size 56)
          (shdr-size 64)
          (sym-size  24)
          (header-total (+ ehdr-size phdr-size))
          (raw-len (length raw-bytes))
-         (nco (or native-code-offset 0))
+         (nio (or native-image-offset 0))
+         (ncl (or native-code-length 0))
+         ;; Sort function-table by native-offset so each symbol's size can
+         ;; be computed as (next.offset - this.offset).  Stable sort to
+         ;; preserve source order on ties.
+         (sorted-fns (stable-sort (copy-list function-table)
+                                  #'< :key #'mvm-function-info-native-offset))
+         (fn-sizes (let ((arr (make-array (length sorted-fns) :initial-element 0)))
+                     (loop for i from 0 below (length sorted-fns)
+                           for fi in sorted-fns
+                           for next-off = (if (< (1+ i) (length sorted-fns))
+                                              (mvm-function-info-native-offset
+                                                (nth (1+ i) sorted-fns))
+                                              ncl)
+                           do (setf (aref arr i)
+                                    (max 0 (- next-off
+                                              (mvm-function-info-native-offset fi)))))
+                     arr))
          ;; .shstrtab: section names
          (shstrtab (concatenate 'string
                                 (string #\Null)
@@ -60,10 +88,12 @@
          (shstrtab-bytes (map 'vector #'char-code shstrtab))
          (shstrtab-len (length shstrtab-bytes))
          ;; .strtab: symbol names.  First byte must be NUL.
+         ;; Use SORTED-FNS so name order matches the symbol-table order
+         ;; (otherwise st_name offsets land on the wrong names).
          (sym-names (cons "" (mapcar (lambda (fi)
                                        (%sanitize-symbol-name
                                          (mvm-function-info-name fi)))
-                                     function-table)))
+                                     sorted-fns)))
          (sym-name-offsets (let ((acc 0) (offs nil))
                              (dolist (n sym-names (nreverse offs))
                                (push acc offs)
@@ -126,18 +156,19 @@
     ;; Sym layout: u32 name + u8 info + u8 other + u16 shndx + u64 value + u64 size
     ;; First: NULL symbol (all zeros, except maybe).
     (dotimes (i sym-size) (mvm-emit-byte buf 0))
-    ;; Then one per function-table entry.
-    (loop for fi in function-table
+    ;; Then one per function-table entry, in NATIVE-OFFSET order so addresses
+    ;; are monotonic and st_size is the gap to the next function.
+    (loop for fi in sorted-fns
           for name-offset in (cdr sym-name-offsets)
-          do (let* ((nat-off (or (mvm-function-info-native-offset fi) 0))
-                    (nat-len (or (mvm-function-info-native-length fi) 0))
-                    (sym-addr (+ load-addr nco nat-off)))
+          for fn-size across fn-sizes
+          do (let* ((nat-off  (or (mvm-function-info-native-offset fi) 0))
+                    (sym-addr (+ load-addr header-total nio nat-off)))
                (mvm-emit-u32 buf name-offset)            ; st_name (offset in .strtab)
                (mvm-emit-byte buf #x12)                   ; st_info: STB_GLOBAL(1) | STT_FUNC(2)
                (mvm-emit-byte buf 0)                      ; st_other
                (mvm-emit-u16 buf 1)                       ; st_shndx (point at .text section)
                (mvm-emit-u64 buf sym-addr)                ; st_value
-               (mvm-emit-u64 buf nat-len)))               ; st_size
+               (mvm-emit-u64 buf fn-size)))               ; st_size
     ;; ---- .strtab — symbol names ----
     (loop for b across strtab-byte-vec do (mvm-emit-byte buf b))
     ;; ---- Section headers (5 × 64 bytes) ----

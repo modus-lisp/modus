@@ -2273,22 +2273,29 @@
             ((eq k :end2) (setq end2 v))
             ((eq k :from-end) (setq from-end v))))
         (setq cur (cddr cur))))
-    ;; Convert to vectors for simpler indexing
-    (let ((s1 (if (stringp seq1) seq1 (coerce seq1 'vector)))
-          (s2 (if (stringp seq2) seq2 (coerce seq2 'vector))))
-      (when (null end1) (setq end1 (length s1)))
-      (when (null end2) (setq end2 (length s2)))
+    ;; Read element through wrappers via %seq-elt (handles list, vector,
+    ;; and wrapper conses uniformly).
+    (labels ((%seq-elt (seq i)
+               (cond
+                 ((null seq) nil)
+                 ((and (consp seq) (array-wrapper-p seq))
+                  (let* ((raw (%wrapper-aref seq i)))
+                    (if (and (stringp seq) (integerp raw)) (code-char raw) raw)))
+                 ((consp seq) (nth i seq))
+                 ((stringp seq) (code-char (aref seq i)))
+                 (t (aref seq i)))))
+      (when (null end1) (setq end1 (length seq1)))
+      (when (null end2) (setq end2 (length seq2)))
       (let ((len1 (- end1 start1))
             (result nil))
         (let ((i start2))
           (loop
             (when (> (+ i len1) end2) (return result))
-            ;; Check if s1[start1..end1) matches s2[i..i+len1)
             (let ((match t) (j 0))
               (loop
                 (when (= j len1) (return nil))
-                (let ((e1 (aref s1 (+ start1 j)))
-                      (e2 (aref s2 (+ i j))))
+                (let ((e1 (%seq-elt seq1 (+ start1 j)))
+                      (e2 (%seq-elt seq2 (+ i j))))
                   (let ((v1 (if key (funcall key e1) e1))
                         (v2 (if key (funcall key e2) e2)))
                     (unless (if test (funcall test v1 v2) (eql v1 v2))

@@ -653,10 +653,13 @@
     ;; Default: don't know
     (t (values nil nil))))
 
-(defun subtypep (t1 t2 &rest args)
+(defun subtypep (t1 t2)
   "Two-value SUBTYPEP per ANSI: returns (sub valid).
-   Conservative — returns (NIL NIL) when uncertain."
-  (declare (ignore args))
+   Conservative — returns (NIL NIL) when uncertain.
+   Note: dropped &rest args (was &rest args (declare (ignore args))).
+   The &rest+MV-tail combination interfered with multiple-value
+   propagation, so callers using (multiple-value-list (subtypep ...))
+   only got 1 value back instead of 2."
   (multiple-value-bind (sub valid) (%subtypep-impl t1 t2)
     (values sub valid)))
 ;; Minimal stub: ANSI returns 3 values (lambda-expr closure-p name).

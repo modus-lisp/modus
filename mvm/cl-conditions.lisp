@@ -883,19 +883,18 @@
        (cons t t))
       (t (cons nil t)))))
 
-(defun subtypep (t1 t2 &rest args)
+(defun subtypep (t1 t2)
   "Check subtype relationship with condition type support.
-   Returns multi-values (sub valid) per ANSI."
-  (declare (ignore args))
-  (write-string-serial "[subtypep called]")
+   Returns multi-values (sub valid) per ANSI.
+   Note: dropped &rest args because the &rest+MV-tail combination
+   was clobbering the MV-COUNT in some call paths."
   (let ((r (%subtypep-result t1 t2)))
     (values (car r) (cdr r))))
 
 (defun subtypep* (t1 t2)
   "ANSI ansi-aux helper: returns booleanized (sub valid) multi-values."
-  (declare (ignore t1 t2))
-  (write-string-serial "[subtypep* called]")
-  (values 'direct-1 'direct-2))
+  (multiple-value-bind (sub valid) (subtypep t1 t2)
+    (values (if sub t nil) (if valid t nil))))
 
 ;;; --- Updated check-all-subtypep helper ---
 (defun check-all-subtypep (t1 t2)

@@ -12,6 +12,18 @@
   (cond
     ((null more-seqs)
      (cond
+       ;; Wrapped vector — peel via array-wrapper-p / wrapper-aref
+       ((and (consp seq) (array-wrapper-p seq))
+        (let* ((len (length seq))
+               (string-p (stringp seq))
+               (i 0))
+          (loop
+            (when (>= i len) (return nil))
+            (let* ((raw (%wrapper-aref seq i))
+                   (elem (if (and string-p (integerp raw)) (code-char raw) raw))
+                   (result (funcall fn elem)))
+              (when result (return result)))
+            (setq i (+ i 1)))))
        ((consp seq)
         (let ((cur seq))
           (loop
@@ -20,7 +32,7 @@
               (when result (return result)))
             (setq cur (cdr cur)))))
        ((null seq) nil)
-       (t (let ((len (array-length seq)) (i 0)
+       (t (let ((len (length seq)) (i 0)
                 (string-p (stringp seq)))
             (loop
               (when (>= i len) (return nil))
@@ -75,6 +87,20 @@
   (cond
     ((null more-seqs)
      (cond
+       ;; Wrapped vector (adj/fp/displaced/multi-dim).  Detected via
+       ;; array-wrapper-p (peels adj wrapper if present).  Use length to
+       ;; honor fill pointer, %wrapper-aref to read through the wrapper.
+       ;; Determine string-ness by checking the underlying storage type.
+       ((and (consp seq) (array-wrapper-p seq))
+        (let* ((len (length seq))
+               (string-p (stringp seq))
+               (i 0))
+          (loop
+            (when (>= i len) (return t))
+            (let* ((raw (%wrapper-aref seq i))
+                   (elem (if (and string-p (integerp raw)) (code-char raw) raw)))
+              (when (null (funcall fn elem)) (return nil)))
+            (setq i (+ i 1)))))
        ((consp seq)
         (let ((cur seq))
           (loop
@@ -82,7 +108,7 @@
             (when (null (funcall fn (car cur))) (return nil))
             (setq cur (cdr cur)))))
        ((null seq) t)
-       (t (let ((len (array-length seq)) (i 0)
+       (t (let ((len (length seq)) (i 0)
                 (string-p (stringp seq)))
             (loop
               (when (>= i len) (return t))

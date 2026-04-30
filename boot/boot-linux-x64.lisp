@@ -29,11 +29,27 @@
 ;;; ============================================================
 
 (defun wrap-in-elf64-le (raw-bytes load-addr)
-  "Wrap raw image bytes in a Linux ELF64 little-endian executable."
+  "Wrap raw image bytes in a Linux ELF64 little-endian executable.
+   Emits section headers (.text + .shstrtab) so objdump -d works.
+   The .text section spans the full LOAD region so all our code is
+   covered (boot stub + native code + data + bytecode).  Without
+   section headers, objdump returns empty and disassembly tools
+   refuse to operate."
   (let* ((ehdr-size 64)
          (phdr-size 56)
+         (shdr-size 64)
          (header-total (+ ehdr-size phdr-size))
-         (total-size (+ header-total (length raw-bytes)))
+         (raw-len (length raw-bytes))
+         ;; .shstrtab contents: NUL + ".text\0" + ".shstrtab\0"
+         (shstrtab (concatenate 'string
+                                (string #\Null)
+                                ".text" (string #\Null)
+                                ".shstrtab" (string #\Null)))
+         (shstrtab-bytes (map 'vector #'char-code shstrtab))
+         ;; Layout:
+         ;;   ehdr(64) | phdr(56) | raw-bytes | shstrtab | shdrs(3*64)
+         (shstrtab-offset (+ header-total raw-len))
+         (shdrs-offset (+ shstrtab-offset (length shstrtab-bytes)))
          (entry-point (+ load-addr header-total))
          (buf (make-mvm-buffer)))
     ;; ---- ELF Header (64 bytes) ----
@@ -51,25 +67,53 @@
     (mvm-emit-u32 buf 1)              ; e_version
     (mvm-emit-u64 buf entry-point)    ; e_entry
     (mvm-emit-u64 buf ehdr-size)      ; e_phoff
-    (mvm-emit-u64 buf 0)              ; e_shoff
+    (mvm-emit-u64 buf shdrs-offset)   ; e_shoff
     (mvm-emit-u32 buf 0)              ; e_flags
     (mvm-emit-u16 buf ehdr-size)      ; e_ehsize
     (mvm-emit-u16 buf phdr-size)      ; e_phentsize
     (mvm-emit-u16 buf 1)              ; e_phnum
-    (mvm-emit-u16 buf 0)              ; e_shentsize
-    (mvm-emit-u16 buf 0)              ; e_shnum
-    (mvm-emit-u16 buf 0)              ; e_shstrndx
+    (mvm-emit-u16 buf shdr-size)      ; e_shentsize
+    (mvm-emit-u16 buf 3)              ; e_shnum (NULL + .text + .shstrtab)
+    (mvm-emit-u16 buf 2)              ; e_shstrndx (.shstrtab is index 2)
     ;; ---- Program Header (56 bytes) ----
     (mvm-emit-u32 buf 1)              ; PT_LOAD
     (mvm-emit-u32 buf 7)              ; PF_R|PF_W|PF_X
     (mvm-emit-u64 buf 0)              ; p_offset
     (mvm-emit-u64 buf load-addr)      ; p_vaddr
     (mvm-emit-u64 buf load-addr)      ; p_paddr
-    (mvm-emit-u64 buf total-size)     ; p_filesz
-    (mvm-emit-u64 buf (+ total-size +linux-x64-heap-size+)) ; p_memsz
+    ;; p_filesz: only the LOAD segment (header + raw); shstrtab/shdrs are not loaded
+    (mvm-emit-u64 buf (+ header-total raw-len))
+    (mvm-emit-u64 buf (+ header-total raw-len +linux-x64-heap-size+)) ; p_memsz
     (mvm-emit-u64 buf #x200000)       ; p_align
     ;; ---- Raw image data ----
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
+    ;; ---- .shstrtab ----
+    (loop for b across shstrtab-bytes do (mvm-emit-byte buf b))
+    ;; ---- Section headers (3 × 64 bytes) ----
+    ;; [0] NULL section (all zeros)
+    (dotimes (i shdr-size) (mvm-emit-byte buf 0))
+    ;; [1] .text — covers the entire LOAD region (code + data + bytecode)
+    (mvm-emit-u32 buf 1)              ; sh_name = offset of ".text" in shstrtab
+    (mvm-emit-u32 buf 1)              ; sh_type = SHT_PROGBITS
+    (mvm-emit-u64 buf 6)              ; sh_flags = SHF_ALLOC|SHF_EXECINSTR
+    (mvm-emit-u64 buf load-addr)      ; sh_addr
+    (mvm-emit-u64 buf 0)              ; sh_offset (file offset)
+    (mvm-emit-u64 buf (+ header-total raw-len)) ; sh_size
+    (mvm-emit-u32 buf 0)              ; sh_link
+    (mvm-emit-u32 buf 0)              ; sh_info
+    (mvm-emit-u64 buf 16)             ; sh_addralign
+    (mvm-emit-u64 buf 0)              ; sh_entsize
+    ;; [2] .shstrtab — section names string table
+    (mvm-emit-u32 buf 7)              ; sh_name = offset of ".shstrtab" in shstrtab
+    (mvm-emit-u32 buf 3)              ; sh_type = SHT_STRTAB
+    (mvm-emit-u64 buf 0)              ; sh_flags
+    (mvm-emit-u64 buf 0)              ; sh_addr (not loaded)
+    (mvm-emit-u64 buf shstrtab-offset); sh_offset
+    (mvm-emit-u64 buf (length shstrtab-bytes)) ; sh_size
+    (mvm-emit-u32 buf 0)              ; sh_link
+    (mvm-emit-u32 buf 0)              ; sh_info
+    (mvm-emit-u64 buf 1)              ; sh_addralign
+    (mvm-emit-u64 buf 0)              ; sh_entsize
     (mvm-buffer-used-bytes buf)))
 
 ;;; ============================================================

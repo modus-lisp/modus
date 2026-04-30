@@ -3051,9 +3051,10 @@
 (defun check-nsubst-if-not (new pred tree &rest args)
   (apply #'nsubst-if-not new pred tree args))
 (defun check-sublis (a al &rest args)
-  (apply #'sublis a al args))
+  ;; Note arg order: a=tree, al=alist; CL sublis takes (alist tree ...).
+  (apply #'sublis al a args))
 (defun check-nsublis (a al &rest args)
-  (apply #'nsublis a al args))
+  (apply #'nsublis al a args))
 "
     (string #\Newline)
     ;; 5. Our test source (run-*-tests, run-all-tests)

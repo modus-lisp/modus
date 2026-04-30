@@ -879,25 +879,74 @@
         (setq cur (cddr cur))))
     (%subst-if-rec new (lambda (x) (not (funcall pred x))) tree key-fn)))
 
+(defun %sublis-parse-args (args)
+  "Parse :test/:test-not/:key for sublis.  Leftmost wins."
+  (let ((test-fn nil) (test-not-fn nil) (key-fn nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :test)     (unless test-set (setq test-fn (%resolve-fn v) test-set t)))
+          ((eq k :test-not) (unless tn-set (setq test-not-fn (%resolve-fn v) tn-set t)))
+          ((eq k :key)      (unless key-set (setq key-fn (%resolve-fn v) key-set t))))
+        (setq cur (cddr cur))))
+    (list test-fn test-not-fn key-fn)))
+
+(defun %sublis-find (item alist test-fn test-not-fn key-fn)
+  "Find first pair in alist whose car matches item per test/key.  Returns
+   the pair or NIL."
+  (let ((cur alist) (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (let ((pair (car cur)))
+        (when (consp pair)
+          (let* ((k (car pair))
+                 (v (if key-fn (funcall key-fn item) item)))
+            (when (cond
+                    (test-fn     (funcall test-fn v k))
+                    (test-not-fn (not (funcall test-not-fn v k)))
+                    (t           (eql v k)))
+              (setq found pair)))))
+      (setq cur (cdr cur)))))
+
 (defun nsublis (alist tree &rest args)
-  "Substitute from ALIST in TREE (destructive)."
-  (cond ((null tree) nil)
-        ((consp tree) (set-car tree (nsublis alist (car tree)))
-                      (set-cdr tree (nsublis alist (cdr tree)))
-                      tree)
-        (t (let ((pair (assoc tree alist)))
-             (if pair (cdr pair) tree)))))
+  "Substitute from ALIST in TREE (destructive).  Honors :test/:test-not/:key."
+  (let* ((parsed (%sublis-parse-args args))
+         (test-fn (car parsed))
+         (test-not-fn (cadr parsed))
+         (key-fn (caddr parsed)))
+    (%nsublis-rec alist tree test-fn test-not-fn key-fn)))
+
+(defun %nsublis-rec (alist tree test-fn test-not-fn key-fn)
+  (let ((pair (%sublis-find tree alist test-fn test-not-fn key-fn)))
+    (cond
+      (pair (cdr pair))
+      ((consp tree)
+       (set-car tree (%nsublis-rec alist (car tree) test-fn test-not-fn key-fn))
+       (set-cdr tree (%nsublis-rec alist (cdr tree) test-fn test-not-fn key-fn))
+       tree)
+      (t tree))))
 
 (defun sublis (alist tree &rest args)
-  "Substitute from ALIST in TREE."
-  (let ((pair (assoc tree alist)))
-    (if pair (cdr pair)
-        (if (consp tree)
-            (let ((a (sublis alist (car tree)))
-                  (d (sublis alist (cdr tree))))
-              (if (and (eq a (car tree)) (eq d (cdr tree))) tree
-                  (cons a d)))
-            tree))))
+  "Substitute from ALIST in TREE.  Honors :test/:test-not/:key."
+  (let* ((parsed (%sublis-parse-args args))
+         (test-fn (car parsed))
+         (test-not-fn (cadr parsed))
+         (key-fn (caddr parsed)))
+    (%sublis-rec alist tree test-fn test-not-fn key-fn)))
+
+(defun %sublis-rec (alist tree test-fn test-not-fn key-fn)
+  (let ((pair (%sublis-find tree alist test-fn test-not-fn key-fn)))
+    (cond
+      (pair (cdr pair))
+      ((consp tree)
+       (let ((a (%sublis-rec alist (car tree) test-fn test-not-fn key-fn))
+             (d (%sublis-rec alist (cdr tree) test-fn test-not-fn key-fn)))
+         (if (and (eq a (car tree)) (eq d (cdr tree))) tree
+             (cons a d))))
+      (t tree))))
 
 (defun logtest (a b) (not (zerop (logand a b))))
 

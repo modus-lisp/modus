@@ -1079,10 +1079,175 @@
 ;;; Tests for previously-fixed bugs
 ;;; ============================================================
 
+(defun %probe-find-if-full (predicate sequence &rest args)
+  "Mirror find-if exactly, with all 3 cond branches."
+  (let ((key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (cond
+      ((and (consp sequence) (array-wrapper-p sequence))
+       (let ((len (length sequence)) (result nil)
+             (string-p (stringp sequence)))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let* ((raw (%wrapper-aref sequence i))
+                    (elem (if (and string-p (integerp raw)) (code-char raw) raw)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (funcall predicate test-val)
+                   (if from-end (setq result elem) (return elem)))))
+             (setq i (+ i 1))))))
+      ((listp sequence)
+       (let ((lst sequence) (i 0) (result nil))
+         (loop
+           (when (or (null lst) (= i start)) (return nil))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))
+         (loop
+           (when (null lst) (return result))
+           (when (and end (= i end)) (return result))
+           (let ((elem (car lst)))
+             (let ((test-val (if key (funcall key elem) elem)))
+               (when (funcall predicate test-val)
+                 (if from-end (setq result elem) (return elem)))))
+           (setq lst (cdr lst))
+           (setq i (+ i 1)))))
+      (t
+       (let ((len (length sequence)) (result nil))
+         (when (null end) (setq end len))
+         (let ((i start))
+           (loop
+             (when (= i end) (return result))
+             (let ((elem (aref sequence i)))
+               (let ((test-val (if key (funcall key elem) elem)))
+                 (when (funcall predicate test-val)
+                   (if from-end (setq result elem) (return elem)))))
+             (setq i (+ i 1)))))))))
+
+(defun %probe-find-if (predicate sequence &rest args)
+  "Mirror of find-if's list path for diagnosis."
+  (let ((key nil) (start 0) (end nil) (from-end nil))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :key) (setq key v))
+            ((eq k :start) (setq start v))
+            ((eq k :end) (setq end v))
+            ((eq k :from-end) (setq from-end v))))
+        (setq cur (cddr cur))))
+    (let ((lst sequence) (i 0) (result nil))
+      (loop
+        (when (or (null lst) (= i start)) (return nil))
+        (setq lst (cdr lst))
+        (setq i (+ i 1)))
+      (loop
+        (when (null lst) (return result))
+        (when (and end (= i end)) (return result))
+        (let ((elem (car lst)))
+          (let ((test-val (if key (funcall key elem) elem)))
+            (when (funcall predicate test-val)
+              (if from-end (setq result elem) (return elem)))))
+        (setq lst (cdr lst))
+        (setq i (+ i 1))))))
+
 (defun run-regression-tests ()
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)
+  ;; Probes for find-if + :from-end (find-if-list.4 reports 2; should be 6).
+  (deftest 9700 (find-if #'evenp '(1 2 4 8 3 1 6 7) :from-end t) 6)
+  (deftest 9701 (find-if #'evenp '(1 2 4 8 3 1 6 7)) 2)
+  (deftest 9702 (find-if #'evenp #(1 2 4 8 3 1 6 7) :from-end t) 6)
+  (deftest 9703 (find #'evenp #(1 2 4 8 3 1 6 7) :from-end t) nil)
+  ;; Probe: does the &rest plist get :from-end at all?
+  (deftest 9704 (let ((args '(:from-end t)) (fe nil))
+                  (let ((cur args))
+                    (loop (when (null cur) (return))
+                      (when (eq (car cur) :from-end) (setq fe (cadr cur)))
+                      (setq cur (cddr cur))))
+                  fe)
+                t)
+  ;; Probe: simpler from-end loop pattern; does setq from inside loop+if propagate?
+  (deftest 9705 (let ((result nil) (lst '(1 2 4 8 3 1 6 7)))
+                  (loop (when (null lst) (return result))
+                    (let ((elem (car lst)))
+                      (when (and (integerp elem) (= 0 (mod elem 2)))
+                        (setq result elem)))
+                    (setq lst (cdr lst))))
+                6)
+  ;; Probe: when-if-return inside loop, exact find-if shape
+  (deftest 9706 (let ((result nil) (lst '(1 2 4 8 3 1 6 7)) (from-end t))
+                  (loop (when (null lst) (return result))
+                    (let ((elem (car lst)))
+                      (when (and (integerp elem) (= 0 (mod elem 2)))
+                        (if from-end (setq result elem) (return elem))))
+                    (setq lst (cdr lst))))
+                6)
+  ;; Probe: same as 9706 but with extra nested let around elem
+  (deftest 9707 (let ((result nil) (lst '(1 2 4 8 3 1 6 7)) (from-end t))
+                  (loop (when (null lst) (return result))
+                    (let ((elem (car lst)))
+                      (let ((tv elem))
+                        (when (and (integerp tv) (= 0 (mod tv 2)))
+                          (if from-end (setq result elem) (return elem)))))
+                    (setq lst (cdr lst))))
+                6)
+  ;; Probe: same shape as find-if list path with funcall on predicate
+  (deftest 9708 (let ((predicate #'evenp)
+                      (key nil)
+                      (start 0)
+                      (end nil)
+                      (from-end t)
+                      (lst '(1 2 4 8 3 1 6 7))
+                      (i 0)
+                      (result nil))
+                  (loop
+                    (when (or (null lst) (= i start)) (return nil))
+                    (setq lst (cdr lst))
+                    (setq i (+ i 1)))
+                  (loop
+                    (when (null lst) (return result))
+                    (when (and end (= i end)) (return result))
+                    (let ((elem (car lst)))
+                      (let ((test-val (if key (funcall key elem) elem)))
+                        (when (funcall predicate test-val)
+                          (if from-end (setq result elem) (return elem)))))
+                    (setq lst (cdr lst))
+                    (setq i (+ i 1))))
+                6)
+  ;; Probe: 9708 but predicate inline
+  (deftest 9709 (let ((from-end t)
+                      (lst '(1 2 4 8 3 1 6 7))
+                      (i 0)
+                      (result nil))
+                  (loop
+                    (when (null lst) (return result))
+                    (let ((elem (car lst)))
+                      (when (funcall #'evenp elem)
+                        (if from-end (setq result elem) (return elem))))
+                    (setq lst (cdr lst))
+                    (setq i (+ i 1))))
+                6)
+  ;; Probe: defun with &rest, exact find-if structure
+  (deftest 9710 (%probe-find-if #'evenp '(1 2 4 8 3 1 6 7) :from-end t) 6)
+  ;; Probe: full find-if shape with all 3 cond branches
+  (deftest 9711 (%probe-find-if-full #'evenp '(1 2 4 8 3 1 6 7) :from-end t) 6)
+  ;; Same again, calling actual find-if
+  (deftest 9712 (find-if #'evenp '(1 2 4 8 3 1 6 7) :from-end t) 6)
+  ;; Force into wrapper-p false branch
+  (deftest 9713 (let ((from-end t))
+                  (find-if #'evenp '(1 2 4 8 3 1 6 7) :from-end from-end)) 6)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

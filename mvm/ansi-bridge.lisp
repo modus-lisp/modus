@@ -839,49 +839,11 @@
               (return pair)))))
       (setq cur (cdr cur)))))
 
-(defun find-if (pred seq &rest args)
-  "Find first element of SEQ satisfying PRED."
-  (let* ((parsed (parse-test-key args))
-         (key-fn (cdr parsed)))
-    (if (consp seq)
-        (let ((cur seq))
-          (loop
-            (when (null cur) (return nil))
-            (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
-              (when (funcall pred k)
-                (return (car cur))))
-            (setq cur (cdr cur))))
-        (let ((len (array-length seq)) (i 0))
-          (loop
-            (when (>= i len) (return nil))
-            (let ((k (if key-fn (funcall key-fn (aref seq i)) (aref seq i))))
-              (when (funcall pred k)
-                (return (aref seq i))))
-            (setq i (+ i 1)))))))
-
-(defun find-if-not (pred seq &rest args)
-  "Find first element of SEQ NOT satisfying PRED.
-   Inlined (rather than `(apply #'find-if (lambda ...) ...)') to dodge
-   apply-of-rest fragility — and because ansi-bridge.lisp loads AFTER
-   cl-sequences.lisp, this defun overrides the (already inlined) one
-   there, so we have to keep the inline form here too."
-  (let* ((parsed (parse-test-key args))
-         (key-fn (cdr parsed)))
-    (if (consp seq)
-        (let ((cur seq))
-          (loop
-            (when (null cur) (return nil))
-            (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
-              (when (not (funcall pred k))
-                (return (car cur))))
-            (setq cur (cdr cur))))
-        (let ((len (array-length seq)) (i 0))
-          (loop
-            (when (>= i len) (return nil))
-            (let ((k (if key-fn (funcall key-fn (aref seq i)) (aref seq i))))
-              (when (not (funcall pred k))
-                (return (aref seq i))))
-            (setq i (+ i 1)))))))
+;; find-if / find-if-not previously had bridge overrides here that only
+;; honored :test/:key — they silently dropped :from-end, :start, :end.
+;; Removed in favor of cl-sequences.lisp's full implementations, which
+;; load earlier in source order but win because (a) they're complete and
+;; (b) MVM's "last-defun-wins" rule is satisfied by deleting the override.
 
 ;;; ============================================================
 ;;; vector-push / vector-push-extend / fill-pointer

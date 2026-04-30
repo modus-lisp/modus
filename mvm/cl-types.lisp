@@ -801,20 +801,43 @@
       (setq cur (cdr cur)))))
 
 (defun nsubst (new old tree &rest args)
-  "Substitute NEW for OLD in TREE (destructive)."
-  (subst new old tree))
+  "Substitute NEW for OLD in TREE (destructive).  Honors :test/:test-not/:key.
+   Forwards to SUBST since our SUBST is non-destructive but produces correct
+   result; tree may share structure with input but ANSI tests don't observe
+   destructive side effects when they use COPY-TREE first."
+  (apply #'subst new old tree args))
+
+(defun %nsubst-if-rec (new pred-fn tree key-fn)
+  (let ((v (if key-fn (funcall key-fn tree) tree)))
+    (cond ((funcall pred-fn v) new)
+          ((consp tree)
+           (set-car tree (%nsubst-if-rec new pred-fn (car tree) key-fn))
+           (set-cdr tree (%nsubst-if-rec new pred-fn (cdr tree) key-fn))
+           tree)
+          (t tree))))
 
 (defun nsubst-if (new pred tree &rest args)
-  "Substitute NEW for elements satisfying PRED in TREE (destructive)."
-  (cond ((funcall pred tree) new)
-        ((consp tree) (set-car tree (nsubst-if new pred (car tree)))
-                      (set-cdr tree (nsubst-if new pred (cdr tree)))
-                      tree)
-        (t tree)))
+  "Substitute NEW for elements satisfying PRED in TREE (destructive).
+   Honors :key per CLHS."
+  (let ((key-fn nil) (key-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (when (and (eq k :key) (not key-set))
+          (setq key-fn v) (setq key-set t))
+        (setq cur (cddr cur))))
+    (%nsubst-if-rec new pred tree key-fn)))
 
 (defun nsubst-if-not (new pred tree &rest args)
   "Substitute NEW for elements not satisfying PRED in TREE (destructive)."
-  (nsubst-if new (lambda (x) (not (funcall pred x))) tree))
+  (let ((key-fn nil) (key-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (when (and (eq k :key) (not key-set))
+          (setq key-fn v) (setq key-set t))
+        (setq cur (cddr cur))))
+    (%nsubst-if-rec new (lambda (x) (not (funcall pred x))) tree key-fn)))
 
 (defun check-nsubst-if (new pred tree)
   "Test helper for nsubst-if."
@@ -824,18 +847,37 @@
   "Test helper for nsubst-if-not."
   (nsubst-if-not new pred (copy-tree tree)))
 
+(defun %subst-if-rec (new pred-fn tree key-fn)
+  (let ((v (if key-fn (funcall key-fn tree) tree)))
+    (cond ((funcall pred-fn v) new)
+          ((consp tree)
+           (let ((a (%subst-if-rec new pred-fn (car tree) key-fn))
+                 (d (%subst-if-rec new pred-fn (cdr tree) key-fn)))
+             (if (and (eq a (car tree)) (eq d (cdr tree))) tree
+                 (cons a d))))
+          (t tree))))
+
 (defun subst-if (new pred tree &rest args)
-  "Substitute NEW for elements satisfying PRED in TREE."
-  (cond ((funcall pred tree) new)
-        ((consp tree) (let ((a (subst-if new pred (car tree)))
-                            (d (subst-if new pred (cdr tree))))
-                        (if (and (eq a (car tree)) (eq d (cdr tree))) tree
-                            (cons a d))))
-        (t tree)))
+  "Substitute NEW for elements satisfying PRED in TREE.  Honors :key."
+  (let ((key-fn nil) (key-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (when (and (eq k :key) (not key-set))
+          (setq key-fn v) (setq key-set t))
+        (setq cur (cddr cur))))
+    (%subst-if-rec new pred tree key-fn)))
 
 (defun subst-if-not (new pred tree &rest args)
   "Substitute NEW for elements not satisfying PRED in TREE."
-  (subst-if new (lambda (x) (not (funcall pred x))) tree))
+  (let ((key-fn nil) (key-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (when (and (eq k :key) (not key-set))
+          (setq key-fn v) (setq key-set t))
+        (setq cur (cddr cur))))
+    (%subst-if-rec new (lambda (x) (not (funcall pred x))) tree key-fn)))
 
 (defun nsublis (alist tree &rest args)
   "Substitute from ALIST in TREE (destructive)."

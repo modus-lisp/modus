@@ -177,15 +177,79 @@
           (copy-tree (cdr tree)))
     tree))
 
-(defun subst (new old tree)
-  (if (eql tree old) new
-    (if (consp tree)
-      (let ((a (subst new old (car tree)))
-            (d (subst new old (cdr tree))))
-        (if (and (eq a (car tree)) (eq d (cdr tree)))
-          tree
-          (cons a d)))
-      tree)))
+(defun %subst-check-kwargs (args)
+  "Validate keyword args for SUBST/SUBST-IF/etc.  Allows :test :test-not
+   :key :allow-other-keys.  Signals program-error on bad input."
+  ;; First pass: find :allow-other-keys (leftmost wins).
+  (let ((aok nil) (aok-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur))
+        (%signal-program-error))    ; odd-length plist
+      (let ((k (car cur)))
+        (when (and (eq k :allow-other-keys) (not aok-set))
+          (setq aok (cadr cur)) (setq aok-set t)))
+      (setq cur (cddr cur)))
+    ;; Second pass: each key must be recognized or :allow-other-keys T.
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (cond
+            ((not (symbolp k))    (%signal-program-error))
+            ((eq k :test))
+            ((eq k :test-not))
+            ((eq k :key))
+            ((eq k :allow-other-keys))
+            (aok)
+            (t (%signal-program-error))))
+        (setq cur (cddr cur))))))
+
+(defun %subst-match-p (item node test-fn test-not-fn key-fn)
+  (let ((v (if key-fn (funcall key-fn node) node)))
+    (cond
+      (test-fn     (funcall test-fn item v))
+      (test-not-fn (not (funcall test-not-fn item v)))
+      (t           (eql item v)))))
+
+(defun %subst-rec (new old tree test-fn test-not-fn key-fn)
+  (cond
+    ((%subst-match-p old tree test-fn test-not-fn key-fn) new)
+    ((consp tree)
+     (let ((a (%subst-rec new old (car tree) test-fn test-not-fn key-fn))
+           (d (%subst-rec new old (cdr tree) test-fn test-not-fn key-fn)))
+       (if (and (eq a (car tree)) (eq d (cdr tree))) tree
+           (cons a d))))
+    (t tree)))
+
+(defun subst (new old tree &rest args)
+  ;; Honor :test, :test-not, :key per CLHS.  Default test = eql.
+  ;; Inline kwarg validation: bad kwargs signal program-error unless
+  ;; :allow-other-keys T.  Per CLHS, leftmost :allow-other-keys wins.
+  (let ((test-fn nil) (test-not-fn nil) (key-fn nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (aok nil) (aok-set nil)
+        (cur args)
+        (bad-key nil))
+    ;; Single pass: collect all kwargs + detect first bad key + first :aok.
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur))
+        (%signal-program-error))     ; odd-length plist
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((not (symbolp k)) (%signal-program-error))
+          ((eq k :test)     (unless test-set (setq test-fn v) (setq test-set t)))
+          ((eq k :test-not) (unless tn-set (setq test-not-fn v) (setq tn-set t)))
+          ((eq k :key)      (unless key-set (setq key-fn v) (setq key-set t)))
+          ((eq k :allow-other-keys)
+                            (unless aok-set (setq aok v) (setq aok-set t)))
+          (t (when (null bad-key) (setq bad-key k))))
+        (setq cur (cddr cur))))
+    ;; If a bad key was seen and :allow-other-keys T was not present, error.
+    (when (and bad-key (not aok))
+      (%signal-program-error))
+    (%subst-rec new old tree test-fn test-not-fn key-fn)))
 
 (defun revappend (list tail)
   (let ((cur list))

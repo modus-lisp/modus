@@ -1284,6 +1284,11 @@
                 nil)
   (deftest 9723 (funcall (%cond-complement #'eql) 'a 'a) nil)
   (deftest 9724 (funcall (%cond-complement-rest #'eql) 'a 'a) nil)
+  ;; signals-error on tree-equal arity
+  (deftest 9730 (handler-case (progn (tree-equal) nil) (error (c) t)) t)
+  (deftest 9731 (handler-case (progn (tree-equal '(a b)) nil) (error (c) t)) t)
+  (deftest 9732 (tree-equal '(1 2) '(1 2)) t)
+  (deftest 9733 (tree-equal '(1 2) '(1 3)) nil)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

@@ -848,8 +848,46 @@
                                      ;; loop incremented remaining; un-do one because outer dec
                                      (setf remaining (cons nil remaining))) ; outer (cdr remaining) → remaining
                                     ((and (symbolp elt)
-                                          (or (string= (symbol-name elt) "&KEY")
-                                              (string= (symbol-name elt) "&ALLOW-OTHER-KEYS")
+                                          (string= (symbol-name elt) "&KEY"))
+                                     ;; &KEY var | (var [default [supplied-p]])
+                                     ;; Each var binds by searching cur (a plist)
+                                     ;; for :var.  If found, use the value;
+                                     ;; otherwise use default (or NIL).
+                                     (setf remaining (cdr remaining))
+                                     (loop while (and (consp remaining)
+                                                      (not (and (symbolp (car remaining))
+                                                                (or (string= (symbol-name (car remaining)) "&REST")
+                                                                    (string= (symbol-name (car remaining)) "&BODY")
+                                                                    (string= (symbol-name (car remaining)) "&AUX")
+                                                                    (string= (symbol-name (car remaining)) "&ALLOW-OTHER-KEYS")))))
+                                           do (let* ((key-elt (car remaining))
+                                                     (key-var (if (consp key-elt) (car key-elt) key-elt))
+                                                     (key-default (if (and (consp key-elt) (cdr key-elt))
+                                                                      (cadr key-elt) nil))
+                                                     (key-supplied (if (and (consp key-elt) (cddr key-elt))
+                                                                       (caddr key-elt) nil))
+                                                     ;; Make :var keyword from var name
+                                                     (kw (intern (symbol-name key-var) :keyword))
+                                                     (probe-tmp (gensym "KP")))
+                                                (setf result
+                                                      (append result
+                                                              (list (list probe-tmp
+                                                                          `(let ((c ,cur)) (loop (when (null c) (return nil)) (when (eq (car c) ',kw) (return c)) (setq c (cdr c)))))))
+                                                      )
+                                                (setf result
+                                                      (append result
+                                                              (list (list key-var
+                                                                          `(if ,probe-tmp (cadr ,probe-tmp) ,key-default)))))
+                                                (when key-supplied
+                                                  (setf result
+                                                        (append result
+                                                                (list (list key-supplied
+                                                                            `(if ,probe-tmp t nil))))))
+                                                (setf remaining (cdr remaining))))
+                                     ;; Adjust for outer (cdr remaining) increment
+                                     (setf remaining (cons nil remaining)))
+                                    ((and (symbolp elt)
+                                          (or (string= (symbol-name elt) "&ALLOW-OTHER-KEYS")
                                               (string= (symbol-name elt) "&AUX")))
                                      nil) ; skip these for simplicity
                                     (rest-mode

@@ -2616,16 +2616,29 @@
                      ~%  (if (> *fork-shm-addr* 0)~
                      ~%      (mem-ref *fork-shm-addr* :u32)~
                      ~%      0))~
+                     ~%(defun %clear-fault-slots ()~
+                     ~%  ;; Zero the SIGSEGV-handler diag slots so a FAIL caught~
+                     ~%  ;; from a NON-SIGSEGV path (handler-case t-clause) doesn't~
+                     ~%  ;; print stale RIP/SITE/RAX values from a prior intentional~
+                     ~%  ;; SIGSEGV (e.g. run-clos-diag-tests's `(car 42)' marker).~
+                     ~%  (setf (mem-ref #x10000C30 :u64) 0)~
+                     ~%  (setf (mem-ref #x10000C38 :u64) 0)~
+                     ~%  (setf (mem-ref #x10000C40 :u64) 0)~
+                     ~%  (setf (mem-ref #x10000C48 :u64) 0)~
+                     ~%  (setf (mem-ref #x10000C50 :u64) 0)~
+                     ~%  (setf (mem-ref #x10000C58 :u64) 0))~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (%fork-set-last-id id)~
+                     ~%  (%clear-fault-slots)~
                      ~%  (handler-case (rt-run-test id (funcall thunk) expected)~
                      ~%    (t (c) (%record-test-fail id))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
                      ~%  (%fork-set-last-id id)~
+                     ~%  (%clear-fault-slots)~
                      ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%    (t (c) (%record-test-fail id))))~
                      ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~

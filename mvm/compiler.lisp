@@ -3014,44 +3014,46 @@
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
-  ;; We use GLOBAL variables for the cells so lambdas can access them via
-  ;; symbol-value (independent of stack frames).
+  ;; Cells are LOCAL let bindings (was: global %CELL-V).  Local cells let
+  ;; the existing closure-env-list machinery capture them per-closure, so
+  ;; two invocations of (defun outer () (let ((c 0)) (lambda () (incf c))))
+  ;; get fresh independent cells.  The old global-cell scheme tied every
+  ;; closure built from the same source to one shared cons, which broke
+  ;; (mapcar (lambda (x) (push x acc)) items) and side-effecting :test
+  ;; closures across the count/find/substitute family.
   (let* ((body-stripped (strip-declares body))
          (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
          (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
     (when boxed-vars
-      ;; Register cell vars as globals so lambdas can access via symbol-value
-      (dolist (var boxed-vars)
-        (let ((cell-name (cell-var-name var)))
-          (setf (gethash (normalize-name cell-name) *globals*) t)))
-      ;; Build new bindings: non-boxed vars stay as let, boxed vars use global setq
-      ;; We use a progn structure:
-      ;;   (let (non-boxed-bindings)
-      ;;     (setq %cell-V1 (cons init1 nil))
-      ;;     ...
-      ;;     rewritten-body)
       (let* ((non-boxed-bindings
                (remove-if (lambda (b)
                             (member (if (consp b) (car b) b) boxed-vars
                                     :test #'name-equal))
                            bindings))
-             (cell-setqs
+             ;; Each boxed var V gets a let-binding %CELL-V = (cons init nil).
+             ;; The let semantics (init forms see outer env, all bindings
+             ;; created simultaneously) match what the original setq-based
+             ;; scheme provided.
+             (cell-bindings
                (mapcar (lambda (b)
                          (let* ((var (if (consp b) (car b) b))
                                 (init (if (consp b) (cadr b) nil)))
-                           `(setq ,(cell-var-name var)
-                                  (cons ,(cell-rewrite-form init nil nil) nil))))
+                           `(,(cell-var-name var)
+                             (cons ,(cell-rewrite-form init nil nil) nil))))
                        (remove-if-not (lambda (b)
                                         (member (if (consp b) (car b) b) boxed-vars
                                                 :test #'name-equal))
                                       bindings)))
+             ;; Body references to V become (car %CELL-V); writes become
+             ;; (set-car %CELL-V ...).  Inside lambdas, %CELL-V is now a
+             ;; captured local (free-var in lambda → closure-env entry).
              (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
                                body-stripped))
-             (inner-form `(progn ,@cell-setqs ,@new-body)))
+             (combined-bindings (append non-boxed-bindings cell-bindings)))
         (return-from compile-let
-          (if non-boxed-bindings
-              (compile-form `(let ,non-boxed-bindings ,inner-form) env dest)
-              (compile-form inner-form env dest))))))
+          (if combined-bindings
+              (compile-form `(let ,combined-bindings ,@new-body) env dest)
+              (compile-form `(progn ,@new-body) env dest))))))
   (check-frame-overflow (length bindings) "let" env)
   (let ((body (strip-declares body))
         (n-bindings (length bindings))
@@ -3110,38 +3112,33 @@
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
-  ;; Use globals for cell vars so lambdas can access via symbol-value.
+  ;; Cells are LOCAL let* bindings — see compile-let for the rationale.
+  ;; In let* order, the cell binding for V replaces V's binding in place,
+  ;; so that subsequent let* inits that read V see (car %CELL-V) via the
+  ;; rewriter's lookup.
   (let* ((body-stripped (strip-declares body))
          (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
          (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
     (when boxed-vars
-      ;; Register cell vars as globals
-      (dolist (var boxed-vars)
-        (let ((cell-name (cell-var-name var)))
-          (setf (gethash (normalize-name cell-name) *globals*) t)))
-      ;; Rewrite: non-boxed vars stay in let*, boxed vars use setq to globals
-      (let* ((non-boxed-bindings
-               (remove-if (lambda (b)
-                            (member (if (consp b) (car b) b) boxed-vars
-                                    :test #'name-equal))
-                           bindings))
-             (cell-setqs
-               (mapcar (lambda (b)
-                         (let* ((var (if (consp b) (car b) b))
-                                (init (if (consp b) (cadr b) nil)))
-                           `(setq ,(cell-var-name var)
-                                  (cons ,(cell-rewrite-form init nil nil) nil))))
-                       (remove-if-not (lambda (b)
-                                        (member (if (consp b) (car b) b) boxed-vars
-                                                :test #'name-equal))
-                                      bindings)))
+      ;; Walk the bindings in order, replacing each boxed V's slot with
+      ;; %CELL-V → (cons init nil).  Subsequent inits' references to V
+      ;; need to be rewritten to (car %CELL-V); cell-rewrite-form
+      ;; already handles that when given the running boxed-vars list.
+      (let* ((new-bindings
+               (loop for b in bindings
+                     for var = (if (consp b) (car b) b)
+                     for init = (if (consp b) (cadr b) nil)
+                     ;; Rewrite this init using the boxed-vars set.  Earlier
+                     ;; boxed vars in this let* are already cells visible
+                     ;; here; the rewriter turns refs to them into car-of-cell.
+                     for rewritten-init = (cell-rewrite-form init boxed-vars nil)
+                     collect (if (member var boxed-vars :test #'name-equal)
+                                 `(,(cell-var-name var) (cons ,rewritten-init nil))
+                                 `(,var ,rewritten-init))))
              (new-body (mapcar (lambda (f) (cell-rewrite-form f boxed-vars nil))
-                               body-stripped))
-             (inner-form `(progn ,@cell-setqs ,@new-body)))
+                               body-stripped)))
         (return-from compile-let*
-          (if non-boxed-bindings
-              (compile-form `(let* ,non-boxed-bindings ,inner-form) env dest)
-              (compile-form inner-form env dest))))))
+          (compile-form `(let* ,new-bindings ,@new-body) env dest)))))
   (check-frame-overflow (length bindings) "let*" env)
   (let ((body (strip-declares body))
         (n-bindings (length bindings))

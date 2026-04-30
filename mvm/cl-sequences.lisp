@@ -1377,6 +1377,7 @@
 ;;; String functions
 (defun %concat-elt-count (s)
   (cond ((null s) 0)
+        ((and (consp s) (array-wrapper-p s)) (length s))
         ((consp s) (length s))
         ((stringp s) (array-length s))
         (t (array-length s))))
@@ -1440,6 +1441,19 @@
            (dolist (s seqs)
              (cond
                ((null s) nil)
+               ;; Wrapped vector — use length/wrapper-aref
+               ((and (consp s) (array-wrapper-p s))
+                (let ((n (length s)) (i 0)
+                      (string-p (stringp s)))
+                  (loop
+                    (when (>= i n) (return nil))
+                    (let ((raw (%wrapper-aref s i)))
+                      (aset result pos
+                            (cond ((characterp raw) (char-code raw))
+                                  ((and string-p (integerp raw)) raw)
+                                  (t raw))))
+                    (setq pos (+ pos 1))
+                    (setq i (+ i 1)))))
                ((stringp s)
                 (dotimes (i (array-length s))
                   (aset result pos (aref s i)) (setq pos (+ pos 1))))
@@ -1460,6 +1474,19 @@
            (dolist (s seqs)
              (cond
                ((null s) nil)
+               ;; Wrapped vector — use length/wrapper-aref
+               ((and (consp s) (array-wrapper-p s))
+                (let ((n (length s)) (i 0)
+                      (string-p (stringp s)))
+                  (loop
+                    (when (>= i n) (return nil))
+                    (let ((raw (%wrapper-aref s i)))
+                      (aset result pos
+                            (if (and string-p (integerp raw))
+                                (code-char raw)
+                                raw)))
+                    (setq pos (+ pos 1))
+                    (setq i (+ i 1)))))
                ((consp s)
                 (dolist (c s)
                   (aset result pos c) (setq pos (+ pos 1))))

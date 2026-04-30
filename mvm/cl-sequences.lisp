@@ -554,16 +554,17 @@
                  (setq i (+ i 1))))))))))
 
 (defun count (item seq &rest args)
-  "Count occurrences of ITEM in SEQ. Honors :test, :key, :start, :end.
-   For strings, presents each element as a character (string slots
-   hold fixnum char-codes; the natural test against #\\X expects a
-   character comparison via eql)."
-  (let ((test nil) (key nil) (start 0) (end nil) (a args))
+  "Count occurrences of ITEM in SEQ. Honors :test, :test-not, :key,
+   :start, :end, :from-end.  For strings, presents each element as a
+   character (string slots hold fixnum char-codes; the natural test
+   against #\\X expects a character comparison via eql)."
+  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil) (a args))
     (loop (when (null a) (return))
       (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
             ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
             ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
             ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
             ((eq (car a) :test-not)
              (let ((f (cadr a)))
                (setq test (lambda (x y) (not (funcall f x y)))))
@@ -578,7 +579,8 @@
                 :end (or end (cond ((null seq) 0)
                                     ((consp seq) most-positive-fixnum)
                                     (t (length seq))))
-                :key key))))
+                :key key
+                :from-end from-end))))
 
 ;;; Function wrappers for compiler builtins (needed for apply/#')
 ;;; The compiler uses XOR/AND/OR opcodes for inline (logxor a b) etc.
@@ -1261,7 +1263,24 @@
                          (aset seq i store-new)
                          (when n (setq n (- n 1)))))))
                  (setq i (+ i 1))))))))))
-(defun count-if-not (pred seq) (let ((c 0)) (dolist (item seq) (unless (funcall pred item) (setq c (+ c 1)))) c))
+(defun count-if-not (pred seq &rest args)
+  "Count elements of SEQ for which PRED is FALSE.  Honors :key, :start,
+   :end, :from-end.  Equivalent to (count-if (complement pred) ...)."
+  (let ((key nil) (start 0) (end nil) (from-end nil) (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
+            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (count-if (lambda (x) (not (funcall pred x)))
+              seq
+              :start start
+              :end (or end (cond ((null seq) 0)
+                                  ((consp seq) most-positive-fixnum)
+                                  (t (length seq))))
+              :key key
+              :from-end from-end)))
 ;; HASH-TABLE-COUNT lives in prelude.lisp; the duplicate here used to
 ;; win under last-defun-wins and worked the same way for the alist shape,
 ;; but routing through prelude keeps a single point of truth.

@@ -3015,6 +3015,47 @@
     ;;    any aux definitions with simpler MVM-compatible versions.
     *ansi-aux-sources*
     (string #\Newline)
+    ;; 4b. Aux overrides — for helpers in cons-aux.lsp etc. that use
+    ;; &key, we can't compile them faithfully (compiler treats &key as
+    ;; positional, misbinding when callers pass `:test bar`).  Replace
+    ;; the &key-using helpers with &rest forwarders that route through
+    ;; apply (which the compiler handles correctly on a single &rest).
+    "
+;; Aux overrides — replace &key-using helpers with &rest versions.
+(defun union-with-check (x y &rest args)
+  (apply #'union x y args))
+(defun nunion-with-copy (x y &rest args)
+  (apply #'union (copy-list x) (copy-list y) args))
+(defun nintersection-with-check (x y &rest args)
+  (apply #'intersection x y args))
+(defun set-difference-with-check (x y &rest args)
+  (apply #'set-difference x y args))
+(defun nset-difference-with-check (x y &rest args)
+  (apply #'set-difference (copy-list x) (copy-list y) args))
+(defun set-exclusive-or-with-check (x y &rest args)
+  (apply #'set-exclusive-or x y args))
+(defun nset-exclusive-or-with-check (x y &rest args)
+  (apply #'set-exclusive-or (copy-list x) (copy-list y) args))
+(defun subsetp-with-check (x y &rest args)
+  (apply #'subsetp x y args))
+(defun check-subst (new old tree &rest args)
+  (apply #'subst new old (copy-tree tree) args))
+(defun check-subst-if (new pred tree &rest args)
+  (apply #'subst-if new pred (copy-tree tree) args))
+(defun check-subst-if-not (new pred tree &rest args)
+  (apply #'subst-if-not new pred (copy-tree tree) args))
+(defun check-nsubst (new old tree &rest args)
+  (apply #'nsubst new old tree args))
+(defun check-nsubst-if (new pred tree &rest args)
+  (apply #'nsubst-if new pred tree args))
+(defun check-nsubst-if-not (new pred tree &rest args)
+  (apply #'nsubst-if-not new pred tree args))
+(defun check-sublis (a al &rest args)
+  (apply #'sublis a al args))
+(defun check-nsublis (a al &rest args)
+  (apply #'nsublis a al args))
+"
+    (string #\Newline)
     ;; 5. Our test source (run-*-tests, run-all-tests)
     ;;    Functions defined here override aux (last-defun-wins).
     *test-source*

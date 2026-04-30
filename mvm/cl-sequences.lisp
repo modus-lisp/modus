@@ -614,10 +614,14 @@
   ;; Signal TYPE-ERROR for negative or non-fixnum index.
   (when (or (not (fixnump idx)) (< idx 0))
     (%signal-type-error))
-  (if (consp seq)
-      (nth idx seq)
-      (let ((v (aref seq idx)))
-        (if (stringp seq) (code-char v) v))))
+  (cond
+    ;; Array wrapper (adj/fp/displaced/multi-dim) — peel via wrapper-aref
+    ((and (consp seq) (array-wrapper-p seq))
+     (let ((v (%wrapper-aref seq idx)))
+       (if (and (stringp seq) (integerp v)) (code-char v) v)))
+    ((consp seq) (nth idx seq))
+    (t (let ((v (aref seq idx)))
+         (if (stringp seq) (code-char v) v)))))
 (defun %string-designator (x)
   "Coerce a string designator (string, character, or symbol) to a string."
   (cond

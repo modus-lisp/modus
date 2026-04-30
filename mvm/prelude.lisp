@@ -424,6 +424,13 @@
     (let* ((elts (let ((lst nil) (i 0) (n (if seq (length seq) 0))
                        (eff-end (if end end (if seq (length seq) 0))))
                    (cond
+                     ;; Wrapper cons — index via elt (wrapper-aware)
+                     ((and (consp seq) (array-wrapper-p seq))
+                      (loop (when (>= i eff-end) (return nil))
+                        (when (>= i start)
+                          (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
+                            (setq lst (cons v lst))))
+                        (setq i (+ i 1))))
                      ((or (null seq) (consp seq))
                       ;; Walk list once
                       (let ((cur seq))

@@ -1152,16 +1152,21 @@
   (%gf-p x))
 
 (defun %standard-method-p (x)
-  "True if X is a standard method."
+  "True if X is a standard method.  Method records have shape
+   (qualifier specializers . fn) where fn is either a real function
+   (functionp returns T) or an interp-closure (cons-tagged with
+   car=%interp-closure — eval-defmethod produces these)."
   (if (or (fixnump x) (null x)) nil
     (if (consp x)
       (let ((q (car x)))
-        ;; method record: (qualifier specializers . fn)
         (if (or (null q) (eq q :before) (eq q :after) (eq q :around)
                 (symbolp q))
           (if (consp (cdr x))
             (let ((fn (cddr x)))
-              (if (functionp fn) t nil))
+              (cond
+                ((and (consp fn) (eq (car fn) '%interp-closure)) t)
+                ((functionp fn) t)
+                (t nil)))
             nil)
           nil))
       nil)))

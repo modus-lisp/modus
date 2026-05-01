@@ -93,9 +93,12 @@
 
 (defun %make-cl-symbol (name-string)
   "Create a new CL symbol with NAME-STRING as its name. The returned
-   object is tag-9 / subtag-0x50 with three slots [hash, package, name]."
+   object is tag-9 / subtag-0x50 with three slots [hash, package, name].
+   Slot 0 = compute-name-hash(name-string) — used by compile-funcall's
+   resolver path so funcall-on-CL-sym can find the function via the
+   *native-sym-function-table* mirror that set-symbol-function maintains."
   (let ((sym (%alloc-sym3)))
-    (aset sym 0 0)           ; name-hash (unused for CL symbols)
+    (aset sym 0 (compute-name-hash name-string))
     (aset sym 1 nil)         ; package
     (aset sym 2 name-string) ; name
     sym))

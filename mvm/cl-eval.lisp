@@ -40,19 +40,16 @@
       (setq cur (cdr cur)))))
 
 (defun %native-sym-resolve (sym)
-  "Given a native MVM symbol, return its function value. Signals
-   UNDEFINED-FUNCTION if unbound. Called from compile-funcall's
-   symbol-dispatch branch."
+  "Given a symbol (native MVM or CL — both have hash at slot 0), return
+   its function value.  On miss, returns SYM itself so the caller's
+   downstream dispatch falls through to direct-call (= same path that
+   ran before this branch handled CL syms — preserves crash-or-recovery
+   behavior for unbound symbols)."
   (let ((h (aref sym 0)))
     (let ((fn (if *native-sym-function-table*
                   (gethash h *native-sym-function-table*)
                   nil)))
-      (if fn
-          fn
-          (let ((c (%make-condition 'undefined-function (list :name sym))))
-            (if (%error-handler-active-p)
-                (%hc-longjmp)
-                (progn (error "undefined function (native sym)") nil)))))))
+      (if fn fn sym))))
 
 (defun symbol-function (sym)
   "Return the function object for SYM, or signal undefined-function."

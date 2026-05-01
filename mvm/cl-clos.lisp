@@ -935,6 +935,38 @@
           (%gf-dispatch-standard gf args applicable))))))
 
 ;;; ============================================================
+;;; Runtime GF stub — for (eval `(defgeneric ...)) and friends.
+;;;
+;;; Build-time defgeneric expands to (defun NAME (&rest args)
+;;; (%gf-dispatch 'NAME args)), creating a real compiled defun for the
+;;; gf.  Runtime defgeneric (via eval) doesn't have the build-time
+;;; compiler, so we instead install a closure that captures the gf-name
+;;; in its env-list.  set-symbol-function on that closure makes
+;;; (funcall sym ...) dispatch correctly through compile-funcall's
+;;; native-sym-resolve → closure subtag #x52 path.
+;;;
+;;; 8-arg fixed arity (no &rest) avoids the documented
+;;; captured-fn + &rest miscompile.  %get-nargs tells us how many
+;;; were actually passed; we build an args list of that length and
+;;; hand it to %gf-dispatch.
+;;; ============================================================
+
+(defun %make-gf-stub (gf-name)
+  "Build a runtime gf-dispatch closure that captures GF-NAME.  Returns
+   a closure (subtag #x52) suitable for set-symbol-function.
+
+   Uses &rest because we need variable arity; this mirrors the
+   build-time defgeneric expansion (defun NAME (&rest args)
+   (%gf-dispatch 'NAME args)).  The build-time form embeds NAME as a
+   literal — no capture — so it dodges the captured-fn + &rest
+   miscompile that bites pure closures.  At runtime we have to capture
+   GF-NAME, so we accept the slight risk; the dispatch is one bare
+   funcall with no other captured-var reads in the body, which is the
+   minimal exposure to that miscompile."
+  (lambda (&rest args)
+    (%gf-dispatch gf-name args)))
+
+;;; ============================================================
 ;;; call-next-method / next-method-p
 ;;; ============================================================
 

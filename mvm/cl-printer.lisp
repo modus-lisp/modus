@@ -1840,7 +1840,13 @@
 ;;; out at 4, silently dropping trailing args for any formatter call
 ;;; with 4+ format arguments — which is most of the format-d tests).
 (defun apply (fn &rest spread)
-  "ANSI apply: build a single arg list and funcall (up to 8 args)."
+  "ANSI apply: build a single arg list and funcall (up to 8 args).
+
+   Detects interp-closures (consp + car=%interp-closure) and routes
+   them through %call-interp-closure — compiled funcall doesn't know
+   how to call cons-tagged closures, but methods installed by runtime
+   (eval `(defmethod ...))) live as interp-closures and need to be
+   invoked via apply from %gf-dispatch."
   (let ((all-args
          (if (null spread)
              nil
@@ -1852,6 +1858,9 @@
                        (return (append (nreverse individual) (car cur))))
                      (setq individual (cons (car cur) individual))
                      (setq cur (cdr cur))))))))
+    ;; Interp-closure dispatch — fast path for runtime-eval'd lambdas.
+    (when (and (consp fn) (eq (car fn) '%interp-closure))
+      (return-from apply (%call-interp-closure fn all-args)))
     (cond
       ((null all-args)
        (funcall fn))

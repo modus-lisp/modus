@@ -265,11 +265,33 @@
 ;;; ============================================================
 
 (defun %eval-sym-name (sym)
-  "Get the string name of a symbol (CL or MVM)."
+  "Get the string name of a symbol (CL or MVM).
+
+   Native MVM symbols (subtag #x50, 1-slot — just a hash) have no name
+   string in our representation; the source-level reader interns them
+   by hash only.  For these we return nil; callers that compare against
+   a known name should also use %eval-sym-hash-eq for hash-based eq."
   (cond
     ((%cl-sym-p sym) (%cl-sym-name sym))
     ((stringp sym) sym)
     (t nil)))
+
+(defun %native-sym-p (sym)
+  "True if SYM is a native MVM symbol (subtag #x50, hash-only).
+   Conservative: returns nil for any value where the tag/subtag check
+   couldn't be made safely."
+  (cond
+    ((or (null sym) (consp sym) (fixnump sym)) nil)
+    ((stringp sym) nil)
+    ((%cl-sym-p sym) nil)
+    ((characterp sym) nil)
+    ;; T, other immediates — eq compare to known immediates.
+    ((eq sym t) nil)
+    (t
+     ;; If we got here, sym should be an object.  obj-subtag on
+     ;; non-objects SIGSEGVs in some paths, but we've ruled out
+     ;; cons/fixnum/immediate, so it should be safe.
+     (eql (obj-subtag sym) #x50))))
 
 (defun %eval-sym-value (sym env)
   "Look up the value of symbol SYM in ENV + globals."
@@ -345,9 +367,16 @@
       (t (apply fn args)))))
 
 (defun %eval-sym-eq (sym name-str)
-  "Check if SYM (CL symbol or string) has name NAME-STR."
+  "Check if SYM has name NAME-STR.  Handles CL symbols (string-equal),
+   strings (direct), and native MVM symbols (compare hash to
+   compute-name-hash of NAME-STR, since native syms only carry a hash)."
   (let ((n (%eval-sym-name sym)))
-    (if n (string-equal n name-str) nil)))
+    (if n
+        (string-equal n name-str)
+        ;; Native MVM sym path — compare slot 0 (hash) to name's hash.
+        (if (%native-sym-p sym)
+            (eql (aref sym 0) (compute-name-hash name-str))
+            nil))))
 
 (defun %interp-closure-p (x)
   "True if X is an interpreted closure (cons with tag %INTERP-CLOSURE)."
@@ -572,6 +601,141 @@
          (let ((nm (%eval-sym-name vname)))
            (when nm (%eval-global-set nm val)))
          vname))
+      ;; ----- CLOS forms — runtime evaluation of defmethod/defgeneric/defclass.
+      ;; All three reuse the back-end functions the build-time rewriter
+      ;; targets (%defmethod, %defgeneric, %defclass) so eval'd CLOS forms
+      ;; share the same registry and dispatch as compiled ones.
+      ;;
+      ;; (defmethod gf-name [qualifier] specialized-lambda-list body...)
+      ((%eval-sym-eq op "DEFMETHOD")
+       (let* ((gf-name (car args))
+              (rest (cdr args))
+              ;; qualifier: leading non-list symbol
+              (has-qual (and rest (symbolp (car rest)) (not (listp (car rest)))))
+              (qualifier (if has-qual (car rest) nil))
+              (rest2 (if has-qual (cdr rest) rest))
+              (sll (car rest2))
+              (body (cdr rest2)))
+         ;; Build specializers list: T for plain var, class-name for (var class),
+         ;; (eql VAL) for (var (eql expr)) — VAL is evaluated NOW in env.
+         (let ((specs nil)
+               (params nil)
+               (cur sll))
+           (loop
+             (when (null cur) (return nil))
+             (let ((p (car cur)))
+               (cond
+                 ;; lambda-list keyword — stop collecting specializers
+                 ((and (symbolp p)
+                       (or (%eval-sym-eq p "&OPTIONAL")
+                           (%eval-sym-eq p "&REST")
+                           (%eval-sym-eq p "&KEY")
+                           (%eval-sym-eq p "&AUX")
+                           (%eval-sym-eq p "&ALLOW-OTHER-KEYS")))
+                  ;; Keep collecting params (no specializer added) until end of sll.
+                  ;; Emit param keyword as a symbol in the params list so the
+                  ;; lambda we build below preserves it.
+                  (setq params (cons p params)))
+                 ((consp p)
+                  (let ((var (car p))
+                        (spec (cadr p)))
+                    (setq params (cons var params))
+                    (if (and (consp spec)
+                             (symbolp (car spec))
+                             (%eval-sym-eq (car spec) "EQL"))
+                        ;; eql specializer: evaluate value form NOW in env
+                        (setq specs (cons (list 'eql (%eval-in-env (cadr spec) env))
+                                          specs))
+                        (setq specs (cons spec specs)))))
+                 (t
+                  ;; Plain var — specializer is t
+                  (setq params (cons p params))
+                  (setq specs (cons 't specs)))))
+             (setq cur (cdr cur)))
+           (setq params (nreverse params))
+           (setq specs (nreverse specs))
+           ;; Build the method body as an interp-closure that captures env.
+           (let ((fn (list '%interp-closure params body env)))
+             ;; Ensure gf exists with a runtime stub installed under gf-name.
+             (when (null (%find-gf gf-name))
+               (%defgeneric gf-name nil nil))
+             (let ((fname (cond ((%cl-sym-p gf-name) (%cl-sym-name gf-name))
+                                ((stringp gf-name) gf-name)
+                                (t nil))))
+               (when fname
+                 (let ((existing (gethash fname *symbol-function-table*)))
+                   (when (null existing)
+                     (set-symbol-function gf-name (%make-gf-stub gf-name))))))
+             ;; Add the method to the gf and return it.
+             (%defmethod gf-name qualifier specs fn)))))
+      ;; (defgeneric name lambda-list &rest options)
+      ;; Options handled: :method-combination, :method (inline)
+      ((%eval-sym-eq op "DEFGENERIC")
+       (let* ((gf-name (car args))
+              (lambda-list (cadr args))
+              (options (cddr args))
+              (combination nil))
+         (declare (ignore lambda-list))
+         (dolist (opt options)
+           (when (and (consp opt) (symbolp (car opt))
+                      (%eval-sym-eq (car opt) ":METHOD-COMBINATION"))
+             (setq combination (cadr opt))))
+         (%defgeneric gf-name nil combination)
+         ;; Install runtime stub so (funcall sym ...) dispatches.
+         (set-symbol-function gf-name (%make-gf-stub gf-name))
+         ;; Inline (:method ...) options — re-eval each as a defmethod form.
+         (dolist (opt options)
+           (when (and (consp opt) (symbolp (car opt))
+                      (%eval-sym-eq (car opt) ":METHOD"))
+             (%eval-in-env (cons 'defmethod (cons gf-name (cdr opt))) env)))
+         ;; Return the gf object.
+         (%find-gf gf-name)))
+      ;; (defclass name supers slot-specs &rest options)
+      ((%eval-sym-eq op "DEFCLASS")
+       (let* ((class-name (car args))
+              (supers (cadr args))
+              (slot-specs (caddr args))
+              (slot-names nil)
+              (initarg-pairs nil)
+              (initform-pairs nil))
+         (dolist (spec slot-specs)
+           (let* ((sname (if (consp spec) (car spec) spec))
+                  (opts (if (consp spec) (cdr spec) nil)))
+             (setq slot-names (cons sname slot-names))
+             ;; Walk options: :reader/:writer/:accessor/:initarg/:initform
+             (let ((cur opts))
+               (loop
+                 (when (null cur) (return nil))
+                 (let ((key (car cur)) (val (cadr cur)))
+                   (cond
+                     ((and (symbolp key) (%eval-sym-eq key ":READER"))
+                      (let ((slot sname))
+                        (set-symbol-function val
+                                             (lambda (obj) (slot-value obj slot)))))
+                     ((and (symbolp key) (%eval-sym-eq key ":ACCESSOR"))
+                      (let ((slot sname))
+                        (set-symbol-function val
+                                             (lambda (obj) (slot-value obj slot)))))
+                     ((and (symbolp key) (%eval-sym-eq key ":WRITER"))
+                      (let ((slot sname))
+                        (set-symbol-function val
+                                             (lambda (nv obj) (set-slot-value obj slot nv)))))
+                     ((and (symbolp key) (%eval-sym-eq key ":INITARG"))
+                      (setq initarg-pairs (cons (cons val sname) initarg-pairs)))
+                     ((and (symbolp key) (%eval-sym-eq key ":INITFORM"))
+                      ;; Wrap the initform in a thunk that evals later in this env
+                      (let ((form val) (thunk-env env))
+                        (setq initform-pairs
+                              (cons (cons sname
+                                          (lambda () (%eval-in-env form thunk-env)))
+                                    initform-pairs))))))
+                 (setq cur (cddr cur))))))
+         (setq slot-names (nreverse slot-names))
+         (%defclass class-name slot-names supers)
+         (%register-clos-slot-info class-name
+                                   (nreverse initarg-pairs)
+                                   (nreverse initform-pairs))
+         class-name))
       ;; COND
       ((%eval-sym-eq op "COND")
        (let ((cur args))
@@ -718,9 +882,15 @@
                    (set-car (cdddr fn) new-env)))
                (setq cur (cdr cur))))
            (%eval-progn body new-env))))
-      ;; Function call: symbol
+      ;; Function call: CL symbol
       ((%cl-sym-p op)
        (%eval-funcall op args env))
+      ;; Function call: native MVM symbol (subtag #x50, hash-only).
+      ;; Use %eval-call-fn which dispatches by arg count via funcall —
+      ;; runtime funcall has %NATIVE-SYM-RESOLVE built in for native syms.
+      ((%native-sym-p op)
+       (let ((evaled-args (%eval-args args env)))
+         (%eval-call-fn op evaled-args nil)))
       ;; Function call: lambda form
       ((and (consp op) (%eval-sym-eq (car op) "LAMBDA"))
        (let ((fn (list '%interp-closure (cadr op) (cddr op) env)))

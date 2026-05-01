@@ -178,12 +178,34 @@
     (nreverse result)))
 
 (defun %defclass (name slot-names supers)
-  "Register CLOS class NAME with SLOT-NAMES list and SUPERS."
-  (let ((cpl (%compute-cpl name (if (null supers) '(standard-object) supers))))
+  "Register CLOS class NAME with SLOT-NAMES list and SUPERS.
+   SLOT-NAMES is the directly-declared list; the effective slots are
+   computed by walking the CPL and unioning names — most-specific class
+   first.  This gives instances enough storage for inherited slots."
+  (let* ((cpl (%compute-cpl name (if (null supers) '(standard-object) supers)))
+         ;; Effective slots: this class's slots + each ancestor's slots
+         ;; (de-duplicated, in CPL order).  Walk cpl skipping the leading
+         ;; reference to NAME itself (since slot-names is its own contribution).
+         (effective-slots
+          (let ((acc nil) (seen nil))
+            (dolist (n slot-names)
+              (unless (member n seen :test #'eq)
+                (setq seen (cons n seen))
+                (setq acc (cons n acc))))
+            (dolist (cls-name cpl)
+              (unless (eq cls-name name)
+                (let ((parent (%find-clos-class cls-name)))
+                  (when parent
+                    (let ((p-slots (aref parent 2)))
+                      (dolist (n p-slots)
+                        (unless (member n seen :test #'eq)
+                          (setq seen (cons n seen))
+                          (setq acc (cons n acc)))))))))
+            (nreverse acc))))
     (let ((cls (make-array 5)))
       (aset cls 0 '%clos-class)
       (aset cls 1 name)
-      (aset cls 2 slot-names)
+      (aset cls 2 effective-slots)
       (aset cls 3 supers)
       (aset cls 4 cpl)
       ;; Remove old entry if exists, then add new

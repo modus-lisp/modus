@@ -279,10 +279,54 @@
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))))
 
-(defun %make-instance (class-name)
-  "Allocate a new CLOS instance of CLASS-NAME with all slots unbound.
-   Initargs are handled at build time by the SBCL-side rewriter."
-  (let ((cls (%find-clos-class class-name)))
+;;; make-instance: user-facing function (build-time rewriter expands
+;;; the common (make-instance 'class :k v ...) shape inline; this defun
+;;; handles the rest — class-object args, missing/extra args, runtime
+;;; (eval `(make-instance ...)) callers).
+(defun make-instance (&rest args)
+  (cond
+    ;; Strict arity: (make-instance) with no class is a program-error.
+    ((null args) (error "make-instance: requires a class designator"))
+    (t
+     (let* ((class-or-name (car args))
+            (initargs (cdr args))
+            (inst (%make-instance class-or-name)))
+       (when (null inst) (return-from make-instance nil))
+       ;; Apply initargs: for each :keyword value pair, look up the
+       ;; corresponding slot name via the class's initarg-map.
+       (let ((class-name (aref inst 1))
+             (cur initargs))
+         (loop
+           (when (or (null cur) (null (cdr cur))) (return nil))
+           (let ((kw (car cur)) (val (cadr cur)))
+             (let ((slot (%clos-initarg-to-slot class-name kw)))
+               (when slot
+                 (set-slot-value inst slot val))))
+           (setq cur (cddr cur))))
+       ;; Apply :initform thunks for slots that weren't initarg-set
+       ;; and remain unbound.
+       (let ((cls (%find-clos-class (aref inst 1))))
+         (when cls
+           (let ((slot-names (aref cls 2)))
+             (dolist (sname slot-names)
+               (when (eql (aref inst (+ 2 (%clos-slot-index cls sname))) -999)
+                 (let ((thunk (%clos-initform-thunk class-name sname)))
+                   (when thunk
+                     (set-slot-value inst sname (funcall thunk)))))))))
+       inst))))
+
+(defun %make-instance (class-or-name)
+  "Allocate a new CLOS instance.  Accepts either a class name (symbol)
+   or a class-object (returned by find-class).  Initargs are handled
+   at build time by the SBCL-side rewriter for the (make-instance
+   'symbol :k v ...) shape; the class-object shape is for runtime
+   (eval `(make-instance (find-class 'X))) and similar."
+  (let* ((cls (if (%clos-class-p class-or-name)
+                  class-or-name
+                  (%find-clos-class class-or-name)))
+         (class-name (if (%clos-class-p class-or-name)
+                         (aref class-or-name 1)
+                         class-or-name)))
     (when (null cls) (return-from %make-instance nil))
     (let* ((slot-names (aref cls 2))
            (n (length slot-names))

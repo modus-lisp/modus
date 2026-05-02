@@ -653,14 +653,17 @@
 ;;; ============================================================
 
 (defun string-equal (a b)
-  "Compare two strings for equality, element by element."
+  ;; ANSI: case-insensitive compare. STRING= is the strict variant.
   (let ((len-a (array-length a)))
     (if (= len-a (array-length b))
         (let ((i 0))
           (loop
             (when (= i len-a) (return t))
-            (unless (= (aref a i) (aref b i))
-              (return nil))
+            (let ((ca (aref a i))
+                  (cb (aref b i)))
+              (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
+              (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
+              (unless (= ca cb) (return nil)))
             (setq i (+ i 1))))
         nil)))
 

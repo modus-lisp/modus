@@ -1202,19 +1202,19 @@
            (t (numeric-<= obj high)))))
     (and above-low below-high)))
 
-;; %typename-eq: eq fast path with symbol-name fallback.  The bare-metal
+;; %typename-eq: eq fast path with name-hash fallback.  The bare-metal
 ;; `%intern-symbol` sometimes produces multiple symbol objects with the
-;; same name (CLAUDE.md "Symbol identity"), so the bare `eq` checks below
-;; can miss when the user's type-name symbol came from a different read
-;; site than this file's literal.  Falling back to symbol-name
-;; string-equal restores correct dispatch without requiring symbol
-;; identity to be globally unique.
+;; same name (CLAUDE.md "Symbol identity"), so the bare `eq` checks
+;; below can miss when the user's type-name symbol came from a different
+;; intern site than this file's literal.  Both native MVM symbols
+;; (1 slot) and CL symbols (3 slots) store compute-name-hash(name) at
+;; slot 0, so equal slot-0 hashes ≡ same name even when objects differ.
 (defun %typename-eq (tn lit)
   (or (eq tn lit)
       (and (symbolp tn) (symbolp lit)
-           (let ((n1 (symbol-name tn))
-                 (n2 (symbol-name lit)))
-             (and (stringp n1) (stringp n2) (string-equal n1 n2))))))
+           (not (null tn)) (not (eq tn t))
+           (not (null lit)) (not (eq lit t))
+           (= (aref tn 0) (aref lit 0)))))
 
 (defun typep (obj type)
   "Extended typep supporting compound type specifiers."

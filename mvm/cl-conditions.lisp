@@ -960,6 +960,10 @@
     ;; CLOS class object as type — extract its name and recurse.
     ((%clos-class-p type)
      (typep obj (aref type 1)))
+    ;; Built-in class proxy (find-class result for 'integer, 'array, etc.)
+    ;; — recurse on the underlying name.
+    ((%class-proxy-p type)
+     (typep obj (aref type 1)))
     ;; Simple type names (symbols/keywords)
     ((not (consp type))
      (let ((tn type))

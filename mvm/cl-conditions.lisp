@@ -683,25 +683,45 @@
 
 ;;; --- Updated find-class to support condition types ---
 
+(defun %builtin-class-name-p (name)
+  "True if NAME designates a built-in CL type that should be findable
+   via find-class (so it can be used as a method specializer)."
+  (and (symbolp name)
+       (or (eq name 'integer) (eq name 'fixnum) (eq name 'bignum)
+           (eq name 'rational) (eq name 'ratio) (eq name 'real)
+           (eq name 'number) (eq name 'float) (eq name 'single-float)
+           (eq name 'double-float) (eq name 'short-float) (eq name 'long-float)
+           (eq name 'symbol) (eq name 'keyword) (eq name 'cons) (eq name 'list)
+           (eq name 'null) (eq name 'string) (eq name 'character)
+           (eq name 'array) (eq name 'vector) (eq name 'simple-vector)
+           (eq name 'simple-string) (eq name 'base-string) (eq name 'simple-base-string)
+           (eq name 'sequence) (eq name 'function) (eq name 'compiled-function)
+           (eq name 'hash-table) (eq name 'package) (eq name 'stream)
+           (eq name 'file-stream) (eq name 't) (eq name 'atom)
+           (eq name 'standard-object) (eq name 'standard-class)
+           (eq name 'method-combination) (eq name 'method)
+           (eq name 'standard-method) (eq name 'standard-generic-function)
+           (eq name 'generic-function))))
+
 (defun find-class (name &rest args)
-  "Find class by name. Returns CLOS class descriptor or proxy for condition types."
+  "Find class by name. Returns CLOS class descriptor, or a proxy object
+   for condition / built-in types so find-method specializers work."
   (let ((errorp (if args (car args) t)))
     ;; Check CLOS user-defined classes first
     (let ((clos-cls (%find-clos-class name)))
       (if clos-cls
           clos-cls
-          ;; Check condition types
-          (let ((entry (%cond-reg-find name)))
-            (if entry
-                ;; Return a proxy object
-                (let ((cls (make-array 2)))
-                  (aset cls 0 '%class-proxy)
-                  (aset cls 1 name)
-                  cls)
-                ;; Not found
-                (if errorp
-                    (error "class not found")
-                    nil)))))))
+          ;; Built-in types and condition types both get a proxy.
+          (if (or (%cond-reg-find name)
+                  (%builtin-class-name-p name))
+              (let ((cls (make-array 2)))
+                (aset cls 0 '%class-proxy)
+                (aset cls 1 name)
+                cls)
+              ;; Not found
+              (if errorp
+                  (error "class not found")
+                  nil))))))
 
 (defun %class-proxy-p (obj)
   "Check if obj is a class proxy."

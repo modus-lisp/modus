@@ -822,11 +822,19 @@
                  (when (null cur) (return nil))
                  (apply (%method-fn (car cur)) args)
                  (setq cur (cdr cur))))
-             ;; Run primary methods with call-next-method chain
+             ;; Run primary methods with call-next-method chain.
+             ;; Use setq+save/restore so the binding is visible to method
+             ;; bodies in other functions; bare-metal LET on a defvar
+             ;; doesn't create dynamic scope by default.
              (let ((result
-                    (let ((*%next-methods* (cdr primary-methods))
-                          (*%current-gf-args* args))
-                      (apply (%method-fn (car primary-methods)) args))))
+                    (let ((saved-nm *%next-methods*)
+                          (saved-args *%current-gf-args*))
+                      (setq *%next-methods* (cdr primary-methods))
+                      (setq *%current-gf-args* args)
+                      (let ((r (apply (%method-fn (car primary-methods)) args)))
+                        (setq *%next-methods* saved-nm)
+                        (setq *%current-gf-args* saved-args)
+                        r))))
                ;; Run after methods (least specific first = most-specific last)
                (let ((cur (nreverse after-methods)))
                  (loop
@@ -1037,16 +1045,24 @@
 ;;; ============================================================
 
 (defun call-next-method (&rest new-args)
-  "Call the next method in the applicable method list."
+  "Call the next method in the applicable method list.
+   Uses setq+save/restore around the inner call so the rebinding
+   of *%next-methods* is visible to the called method's body
+   (bare-metal LET on a defvar doesn't create dynamic scope)."
   (let ((next *%next-methods*))
     (if (null next)
       (error "no next method")
       (let ((m (car next))
-            (remaining (cdr next)))
-        (let ((*%next-methods* remaining)
-              (actual-args (if new-args new-args *%current-gf-args*)))
-          (let ((*%current-gf-args* actual-args))
-            (apply (%method-fn m) actual-args)))))))
+            (remaining (cdr next))
+            (saved-nm *%next-methods*)
+            (saved-args *%current-gf-args*))
+        (let ((actual-args (if new-args new-args *%current-gf-args*)))
+          (setq *%next-methods* remaining)
+          (setq *%current-gf-args* actual-args)
+          (let ((r (apply (%method-fn m) actual-args)))
+            (setq *%next-methods* saved-nm)
+            (setq *%current-gf-args* saved-args)
+            r))))))
 
 (defun next-method-p ()
   "True if there is a next method available."

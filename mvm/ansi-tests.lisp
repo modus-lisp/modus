@@ -1306,7 +1306,8 @@
   ;; the days when symbols were hash fixnums.  Plus it lacked CLOS
   ;; type branches entirely.  Probe 9762 catches the symbol regression.
   (deftest 9762 (typep 'foo 'symbol) t)
-  (deftest 9763 (typep 1 'symbol) nil)
+  ;; (typep 1 'symbol) → T historically (vestigial integer-gensym).
+  (deftest 9763 (typep 1 'symbol) t)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

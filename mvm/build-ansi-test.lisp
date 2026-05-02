@@ -1621,7 +1621,10 @@
             (%defgeneric ',gf-name ',lambda-list ',(if combination combination nil))
             (defun ,gf-name (&rest %gf-args)
               (%gf-dispatch ',gf-name %gf-args))
-            ,@method-forms))))
+            ,@method-forms
+            ;; ANSI: defgeneric returns the GF object so callers like
+            ;; (defparameter *gf* (defgeneric foo (x))) capture it.
+            (%find-gf ',gf-name)))))
 
     ;; (define-method-combination name &rest options)
     ;; Short form: (define-method-combination name :operator op :documentation ... :identity-with-one-argument t)

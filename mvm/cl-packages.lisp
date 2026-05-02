@@ -387,6 +387,21 @@
   (let ((new (%make-cl-symbol (symbol-name sym))))
     new))
 
+;;; --- gensym (override prelude.lisp's integer-returning stub) ---
+;;;
+;;; ANSI gensym must return a fresh uninterned symbol — not an integer —
+;;; so (funcall (gensym) ...), (symbol-name (gensym)), and the eval/funcall
+;;; pattern in defmethod tests work.  The earlier integer-returning stub
+;;; was here because %make-cl-symbol predated this file; now it doesn't.
+(defun gensym (&optional prefix)
+  (let ((p (cond ((stringp prefix) prefix)
+                 ((null prefix) "G")
+                 (t "G")))
+        (n *gensym-counter*))
+    (let ((name (format nil "~A~D" p n)))
+      (setq *gensym-counter* (+ n 1))
+      (%make-cl-symbol name))))
+
 ;;; --- gentemp ---
 (defvar *gentemp-counter* 0)
 

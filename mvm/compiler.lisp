@@ -5244,11 +5244,12 @@
       ;; the principled use case for the slot infrastructure since
       ;; that's a single check, not a per-call check.)
       ;; ============================================================
-      ;; Native MVM symbol dispatch: subtag #x50 with exactly 1 slot
-      ;; (hash only). CL symbols (3 slots) and closures (subtag #x52)
-      ;; are excluded by the combined test. If matched, call the
-      ;; runtime resolver to get the actual function, then continue
-      ;; through the closure-or-direct dispatch below.
+      ;; Symbol dispatch: subtag #x50 (native MVM 1-slot OR CL 3-slot —
+      ;; both store the function-table hash at slot 0, which is what
+      ;; %native-sym-resolve looks up).  Closures (subtag #x52) are
+      ;; excluded by the subtag check.  Length-1-only check used to
+      ;; live here but kept (funcall <gensym>) from working when gensym
+      ;; was changed to return a proper CL symbol.
       ;; ============================================================
       (let ((check-reg (alloc-temp-reg))
             (cmp-reg   (alloc-temp-reg)))
@@ -5258,10 +5259,6 @@
         (emit-ir :bne after-sym-label)
         (emit-ir :obj-subtag check-reg fn-call-reg)
         (emit-ir :li cmp-reg (ash #x50 +fixnum-shift+))
-        (emit-ir :cmp check-reg cmp-reg)
-        (emit-ir :bne after-sym-label)
-        (emit-ir :array-len check-reg fn-call-reg)
-        (emit-ir :li cmp-reg (ash 1 +fixnum-shift+))
         (emit-ir :cmp check-reg cmp-reg)
         (emit-ir :bne after-sym-label)
         (free-temp-reg)   ; free cmp-reg

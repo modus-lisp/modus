@@ -1294,6 +1294,12 @@
   ;; cl-types.lisp's 'symbol via raw eq, which missed when the bare-metal
   ;; intern produced separate symbol objects per source file.
   (deftest 9752 (typep* 'standard-method 'symbol) t)
+  ;; Regression: gensym returns a real CL symbol (not an integer).
+  (deftest 9760 (let ((sym (gensym)))
+                  (and (symbolp sym) (not (integerp sym)) t))
+                t)
+  ;; Regression: gensym counter increments (returns distinct symbols).
+  (deftest 9761 (string-equal (symbol-name (gensym)) (symbol-name (gensym))) nil)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

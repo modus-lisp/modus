@@ -1300,6 +1300,13 @@
                 t)
   ;; Regression: gensym counter increments (returns distinct symbols).
   (deftest 9761 (string-equal (symbol-name (gensym)) (symbol-name (gensym))) nil)
+  ;; Regression: cl-conditions.lisp's typep was the runtime version
+  ;; (overrides cl-types.lisp via last-defun-wins) but had a stale
+  ;; (typep x 'symbol) → (or null t %cl-sym-p integerp) branch from
+  ;; the days when symbols were hash fixnums.  Plus it lacked CLOS
+  ;; type branches entirely.  Probe 9762 catches the symbol regression.
+  (deftest 9762 (typep 'foo 'symbol) t)
+  (deftest 9763 (typep 1 'symbol) nil)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

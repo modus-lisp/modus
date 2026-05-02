@@ -1502,13 +1502,54 @@
      (let* ((class-name (cadr form))
             (raw-supers (caddr form))  ; list of parent class names
             (raw-slots (or (cadddr form) nil))
+            (rest-opts (cddddr form))
             ;; Parse slot specs
             (slot-names nil)
             (extra-defuns nil)
             ;; initarg→slot mapping: list of (initarg-string . slot-name)
             (initarg-map nil)
             ;; initform map: list of (slot-name . form)
-            (initform-map nil))
+            (initform-map nil)
+            ;; ANSI defclass errors: signal a program-error at runtime
+            ;; if any of these structural defects are detected.
+            (defect-msg nil))
+       ;; Detect duplicate slot names
+       (let ((seen nil))
+         (dolist (slot-spec raw-slots)
+           (let ((sname (if (consp slot-spec) (car slot-spec) slot-spec)))
+             (when (and sname (member sname seen))
+               (setq defect-msg "duplicate slot name in defclass"))
+             (push sname seen))))
+       ;; Detect duplicate :initform/:type/:documentation/:allocation
+       ;; within a single slot spec (ANSI requires program-error).
+       (dolist (slot-spec raw-slots)
+         (when (consp slot-spec)
+           (let ((opts (cdr slot-spec))
+                 (n-initform 0) (n-type 0) (n-doc 0) (n-alloc 0))
+             (let ((cur opts))
+               (loop
+                 (when (or (null cur) (null (cdr cur))) (return))
+                 (let ((key (car cur)))
+                   (cond
+                     ((eq key :initform) (incf n-initform))
+                     ((eq key :type) (incf n-type))
+                     ((eq key :documentation) (incf n-doc))
+                     ((eq key :allocation) (incf n-alloc))))
+                 (setq cur (cddr cur))))
+             (when (or (> n-initform 1) (> n-type 1)
+                       (> n-doc 1) (> n-alloc 1))
+               (setq defect-msg "duplicate slot option in defclass")))))
+       ;; Detect duplicate :default-initargs key in class options
+       (dolist (opt rest-opts)
+         (when (and (consp opt) (eq (car opt) :default-initargs))
+           (let ((seen nil) (cur (cdr opt)))
+             (loop
+               (when (or (null cur) (null (cdr cur))) (return))
+               (let ((k (car cur)))
+                 (when (member k seen)
+                   (setq defect-msg "duplicate :default-initargs key"))
+                 (push k seen))
+               (setq cur (cddr cur))))))
        ;; Process each slot spec
        (dolist (slot-spec raw-slots)
          (let* ((sname (if (consp slot-spec) (car slot-spec) slot-spec))
@@ -1559,12 +1600,16 @@
          (setf *sbcl-clos-classes*
                (cons (cons class-name (cons slot-list initarg-map))
                      *sbcl-clos-classes*))
-         `(progn
-            (%defclass ',class-name ',slot-list ',raw-supers)
-            (%register-clos-slot-info ',class-name
-                                      (list ,@initarg-pairs)
-                                      (list ,@initform-pairs))
-            ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))
+         (if defect-msg
+             ;; ANSI: signal program-error so signals-error catches it.
+             ;; Don't register the broken class.
+             `(error ,defect-msg)
+             `(progn
+                (%defclass ',class-name ',slot-list ',raw-supers)
+                (%register-clos-slot-info ',class-name
+                                          (list ,@initarg-pairs)
+                                          (list ,@initform-pairs))
+                ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns)))))))
 
     ;; (defgeneric name lambda-list &rest options)
     ;; → (%defgeneric 'name 'lambda-list combination)

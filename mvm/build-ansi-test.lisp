@@ -1703,6 +1703,15 @@
             (rest2 (if has-qualifier (cdr rest) rest))
             (sll (car rest2))      ; specialized lambda list
             (body (cdr rest2)))
+       ;; Guard: gf-name must be a symbol (or (setf SYM) form), not a
+       ;; comma struct from a quasiquoted (defmethod ,sym ...) inside
+       ;; (eval ...).  Backquoted defmethod is a runtime form that
+       ;; should hit our cl-eval.lisp eval-defmethod handler — DON'T
+       ;; rewrite it at build time.  Return the form unchanged so the
+       ;; surrounding quasiquote expansion preserves it for runtime eval.
+       (unless (or (symbolp gf-name)
+                   (and (consp gf-name) (eq (car gf-name) 'setf)))
+         (return-from rewrite-reader-forms form))
        (when (null sll) (return-from rewrite-reader-forms nil))
        (when (not (listp sll)) (return-from rewrite-reader-forms nil))
        ;; Extract specializers (skip &optional, &rest, &key, &aux, &allow-other-keys)

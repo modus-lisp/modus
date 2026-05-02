@@ -1740,6 +1740,38 @@
             ,@rewritten-body)
           (%add-slot-unbound-method ',obj-class ,slot-arg #',fn-name))))
 
+    ;; (defmethod slot-missing (...) body...) → defun + %add-slot-missing-method
+    ;; Lambda list: (class obj slot-name operation &optional (new-value nil new-value-p))
+    ;; Specializer on obj (2nd param) by class.  We dispatch only on
+    ;; obj's class — simpler than the full method protocol.
+    ((and (eq (car form) 'defmethod)
+          (cdr form)
+          (eq (cadr form) 'slot-missing)
+          (consp (caddr form)))
+     (let* ((lambda-list (caddr form))
+            (body (cdddr form))
+            (class-spec (first lambda-list))
+            (obj-spec   (second lambda-list))
+            (slot-spec  (third lambda-list))
+            (op-spec    (fourth lambda-list))
+            (rest-spec  (nthcdr 4 lambda-list))
+            (class-param (if (consp class-spec) (car class-spec) class-spec))
+            (obj-param   (if (consp obj-spec)   (car obj-spec)   obj-spec))
+            (slot-param  (if (consp slot-spec)  (car slot-spec)  slot-spec))
+            (op-param    (if (consp op-spec)    (car op-spec)    op-spec))
+            (obj-class
+             (if (and (consp obj-spec) (consp (cdr obj-spec)))
+                 (cadr obj-spec)
+                 t))
+            (rewritten-body (mapcar #'rewrite-reader-forms body))
+            (fn-name (intern (format nil "%SLOT-MISSING-METHOD-~D"
+                                     (incf *slot-unbound-method-counter*))
+                             :cl-user)))
+       `(progn
+          (defun ,fn-name (,class-param ,obj-param ,slot-param ,op-param ,@rest-spec)
+            ,@rewritten-body)
+          (%add-slot-missing-method ',obj-class #',fn-name))))
+
     ;; (defmethod name [qualifier] specialized-lambda-list body...)
     ;; → (%defmethod 'name qualifier '(specializers) (lambda params body))
     ((and (eq (car form) 'defmethod) (cdr form))

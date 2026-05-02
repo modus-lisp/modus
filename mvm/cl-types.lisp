@@ -1202,6 +1202,20 @@
            (t (numeric-<= obj high)))))
     (and above-low below-high)))
 
+;; %typename-eq: eq fast path with symbol-name fallback.  The bare-metal
+;; `%intern-symbol` sometimes produces multiple symbol objects with the
+;; same name (CLAUDE.md "Symbol identity"), so the bare `eq` checks below
+;; can miss when the user's type-name symbol came from a different read
+;; site than this file's literal.  Falling back to symbol-name
+;; string-equal restores correct dispatch without requiring symbol
+;; identity to be globally unique.
+(defun %typename-eq (tn lit)
+  (or (eq tn lit)
+      (and (symbolp tn) (symbolp lit)
+           (let ((n1 (symbol-name tn))
+                 (n2 (symbol-name lit)))
+             (and (stringp n1) (stringp n2) (string-equal n1 n2))))))
+
 (defun typep (obj type)
   "Extended typep supporting compound type specifiers."
   (cond
@@ -1209,60 +1223,60 @@
     ((not (consp type))
      (let ((tn type))
        (cond
-         ((eq tn 'integer) (integerp obj))
-         ((eq tn 'fixnum) (integerp obj))
+         ((%typename-eq tn 'integer) (integerp obj))
+         ((%typename-eq tn 'fixnum) (integerp obj))
          ;; MVM has no real bignum tower — all integers are 63-bit
          ;; fixnums. Reporting BIGNUM as NIL traps tests like the
          ;; (loop while (not (typep x 'bignum)) do (setf x (* x x)))
          ;; pattern in an infinite squaring loop until SIGALRM fires.
          ;; Treat anything beyond the 32-bit fixnum range that other
          ;; CL impls use as "bignum" so that loop exits.
-         ((eq tn 'bignum)
+         ((%typename-eq tn 'bignum)
           (and (integerp obj)
                (or (> obj 1073741823) (< obj -1073741824))))
-         ((eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
-         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((eq tn 'float) (floatp-impl obj))
-         ((eq tn 'single-float) (floatp-impl obj))
-         ((eq tn 'double-float) (floatp-impl obj))
-         ((eq tn 'short-float) (floatp-impl obj))
-         ((eq tn 'long-float) (floatp-impl obj))
-         ((eq tn 'ratio) (ratiop obj))
-         ((eq tn 'cons) (consp obj))
-         ((eq tn 'list) (or (null obj) (consp obj)))
-         ((eq tn 'null) (null obj))
+         ((%typename-eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((%typename-eq tn 'rational) (or (integerp obj) (ratiop obj)))
+         ((%typename-eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((%typename-eq tn 'float) (floatp-impl obj))
+         ((%typename-eq tn 'single-float) (floatp-impl obj))
+         ((%typename-eq tn 'double-float) (floatp-impl obj))
+         ((%typename-eq tn 'short-float) (floatp-impl obj))
+         ((%typename-eq tn 'long-float) (floatp-impl obj))
+         ((%typename-eq tn 'ratio) (ratiop obj))
+         ((%typename-eq tn 'cons) (consp obj))
+         ((%typename-eq tn 'list) (or (null obj) (consp obj)))
+         ((%typename-eq tn 'null) (null obj))
          ;; (typep x 'symbol) — `(integerp obj)` was a leftover from when
          ;; native MVM symbols were stored as bare hash fixnums.  Real
          ;; symbols today are heap objects (subtag #x50); use symbolp.
-         ((eq tn 'symbol) (symbolp obj))
-         ((eq tn 'string) (stringp obj))
-         ((eq tn 'simple-string) (stringp obj))
-         ((eq tn 'base-string) (stringp obj))
-         ((eq tn 'simple-base-string) (stringp obj))
-         ((eq tn 'character) (characterp obj))
-         ((eq tn 'base-char) (characterp obj))
-         ((eq tn 'standard-char) (characterp obj))
-         ((eq tn 'atom) (not (consp obj)))
-         ((eq tn 't) t)
-         ((eq tn 'nil) nil)
-         ((eq tn 'boolean) (or (null obj) (eq obj t)))
+         ((%typename-eq tn 'symbol) (symbolp obj))
+         ((%typename-eq tn 'string) (stringp obj))
+         ((%typename-eq tn 'simple-string) (stringp obj))
+         ((%typename-eq tn 'base-string) (stringp obj))
+         ((%typename-eq tn 'simple-base-string) (stringp obj))
+         ((%typename-eq tn 'character) (characterp obj))
+         ((%typename-eq tn 'base-char) (characterp obj))
+         ((%typename-eq tn 'standard-char) (characterp obj))
+         ((%typename-eq tn 'atom) (not (consp obj)))
+         ((%typename-eq tn 't) t)
+         ((%typename-eq tn 'nil) nil)
+         ((%typename-eq tn 'boolean) (or (null obj) (eq obj t)))
          ;; (typep x 'bit) — must be 0 or 1 AS AN INTEGER.  Without the
          ;; integerp guard `(= obj 0)` runs `=` on arbitrary values
          ;; (strings, conses, fn-addrs) which goes wrong fast.
-         ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
-         ((eq tn 'bit-vector) (bit-vector-p obj))
-         ((eq tn 'simple-bit-vector) (simple-bit-vector-p obj))
-         ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
-         ((eq tn 'signed-byte) (integerp obj))
-         ((eq tn 'function) (or (functionp obj) (%generic-function-p obj)))
-         ((eq tn 'generic-function) (%generic-function-p obj))
-         ((eq tn 'standard-generic-function) (%generic-function-p obj))
-         ((eq tn 'standard-method) (%standard-method-p obj))
-         ((eq tn 'method) (%standard-method-p obj))
-         ((eq tn 'method-combination) (%mc-p obj))
+         ((%typename-eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
+         ((%typename-eq tn 'bit-vector) (bit-vector-p obj))
+         ((%typename-eq tn 'simple-bit-vector) (simple-bit-vector-p obj))
+         ((%typename-eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
+         ((%typename-eq tn 'signed-byte) (integerp obj))
+         ((%typename-eq tn 'function) (or (functionp obj) (%generic-function-p obj)))
+         ((%typename-eq tn 'generic-function) (%generic-function-p obj))
+         ((%typename-eq tn 'standard-generic-function) (%generic-function-p obj))
+         ((%typename-eq tn 'standard-method) (%standard-method-p obj))
+         ((%typename-eq tn 'method) (%standard-method-p obj))
+         ((%typename-eq tn 'method-combination) (%mc-p obj))
          ;; CLOS instance check
-         ((eq tn 'standard-object) (%clos-instance-p obj))
+         ((%typename-eq tn 'standard-object) (%clos-instance-p obj))
          ;; User-defined CLOS class: check if obj is a CLOS instance and
          ;; tn is in obj's class precedence list (so typep recognizes
          ;; subclasses correctly).

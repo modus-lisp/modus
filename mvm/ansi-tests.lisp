@@ -1289,6 +1289,11 @@
   (deftest 9731 (handler-case (progn (tree-equal '(a b)) nil) (error (c) t)) t)
   (deftest 9732 (tree-equal '(1 2) '(1 2)) t)
   (deftest 9733 (tree-equal '(1 2) '(1 3)) nil)
+  ;; Regression: typep symbol-name dispatch.  9752 used to FAIL because
+  ;; (typep* 'standard-method 'symbol) compared the user's 'symbol to
+  ;; cl-types.lisp's 'symbol via raw eq, which missed when the bare-metal
+  ;; intern produced separate symbol objects per source file.
+  (deftest 9752 (typep* 'standard-method 'symbol) t)
 
   ;; Nested logior/ash (was broken before interned symbols fix)
   (deftest 9010 (let ((b0 1) (b1 2) (b2 3) (b3 4))

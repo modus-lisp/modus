@@ -1988,25 +1988,9 @@
 ;;; FIND-METHOD, ADD-METHOD, REMOVE-METHOD (CLOS MOP stubs)
 ;;; ============================================================
 
-(defun find-method (gf qualifiers specializers &optional errorp)
-  "Find a method (simplified stub)."
-  nil)
-
-(defun add-method (gf method)
-  "Add method to generic function (simplified stub)."
-  gf)
-
-(defun remove-method (gf method)
-  "Remove method from generic function (simplified stub)."
-  gf)
-
-(defun method-qualifiers (method)
-  "Return method qualifiers."
-  nil)
-
-(defun compute-applicable-methods (gf args)
-  "Return applicable methods (stub)."
-  nil)
+;; find-method / add-method / remove-method / method-qualifiers /
+;; compute-applicable-methods all live in cl-clos.lisp; the stubs here
+;; were shadowing them via last-defun-wins.
 
 ;; ensure-generic-function lives in cl-clos.lisp now; the stub here
 ;; was shadowing it via last-defun-wins.

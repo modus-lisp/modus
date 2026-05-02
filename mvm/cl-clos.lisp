@@ -1073,40 +1073,63 @@
 ;;; find-method / remove-method / add-method
 ;;; ============================================================
 
+(defun %spec-name (spec)
+  "Resolve a specializer designator to its underlying name (or list for
+   eql).  Accepts a class proxy, a CLOS class descriptor, or the bare
+   name/list form."
+  (cond
+    ((%clos-class-p spec) (aref spec 1))
+    ((%class-proxy-p spec) (aref spec 1))
+    (t spec)))
+
+(defun %spec-equal (a b)
+  "Compare two method specializer designators by their resolved name."
+  (let ((na (%spec-name a)) (nb (%spec-name b)))
+    (cond
+      ((eq na nb) t)
+      ;; (eql VAL) specializers compare by val (eql)
+      ((and (consp na) (consp nb)
+            (eq (car na) 'eql) (eq (car nb) 'eql))
+       (eql (cadr na) (cadr nb)))
+      ;; Cross-file symbol identity dodge
+      ((and (symbolp na) (symbolp nb)
+            (not (null na)) (not (null nb))
+            (not (eq na t)) (not (eq nb t))
+            (= (aref na 0) (aref nb 0))) t)
+      (t nil))))
+
 (defun find-method (gf qualifiers specializers &rest args)
-  "Find a method on GF."
-  (if (%gf-p gf)
-    (let ((methods (%gf-methods gf))
-          (result nil))
-      (let ((cur methods))
-        (loop
-          (when (null cur) (return result))
-          (let ((m (car cur)))
-            (let ((mq (%method-qualifier m))
-                  (ms (%method-specializers m)))
-              (let ((q-match (eq mq (if qualifiers (car qualifiers) nil)))
-                    (s-match t))
-                ;; Check specializers match (compare class names)
-                (let ((s1 ms) (s2 specializers))
-                  (loop
-                    (when (and (null s1) (null s2)) (return nil))
-                    (when (or (null s1) (null s2))
-                      (setq s-match nil) (return nil))
-                    (let ((spec1 (car s1)) (spec2 (car s2)))
-                      ;; spec2 might be a class object or name
-                      (let ((name2 (if (%clos-class-p spec2)
-                                     (aref spec2 1)
-                                     spec2)))
-                        (when (not (eq spec1 name2))
-                          (setq s-match nil) (return nil))))
-                    (setq s1 (cdr s1))
-                    (setq s2 (cdr s2))))
-                (when (and q-match s-match)
-                  (setq result m)
-                  (return result)))))
-          (setq cur (cdr cur))))
-      result)
-    nil))
+  "Find a method on GF.  ARGS is (errorp); when non-nil and no method
+   matches, signal an error."
+  (let ((errorp (if args (car args) t)))
+    (if (%gf-p gf)
+      (let ((methods (%gf-methods gf))
+            (result nil))
+        (let ((cur methods))
+          (loop
+            (when (null cur) (return nil))
+            (let ((m (car cur)))
+              (let ((mq (%method-qualifier m))
+                    (ms (%method-specializers m)))
+                (let ((q-match (eq mq (if qualifiers (car qualifiers) nil)))
+                      (s-match t))
+                  (let ((s1 ms) (s2 specializers))
+                    (loop
+                      (when (and (null s1) (null s2)) (return nil))
+                      (when (or (null s1) (null s2))
+                        (setq s-match nil) (return nil))
+                      (unless (%spec-equal (car s1) (car s2))
+                        (setq s-match nil) (return nil))
+                      (setq s1 (cdr s1))
+                      (setq s2 (cdr s2))))
+                  (when (and q-match s-match)
+                    (setq result m)
+                    (return nil)))))
+            (setq cur (cdr cur))))
+        (if (and (null result) errorp)
+          (error "find-method: no matching method")
+          result))
+      (if errorp (error "find-method: not a generic function") nil))))
 
 (defun remove-method (gf method)
   "Remove METHOD from GF."

@@ -366,13 +366,16 @@
 
 (defun %slot-value (obj slot-name)
   "Read slot SLOT-NAME from CLOS instance OBJ.
-   Calls slot-unbound if the slot has no value."
+   Calls slot-unbound if the slot has no value, errors when SLOT-NAME
+   doesn't name a slot of OBJ's class."
   (when (or (null obj) (not (%clos-instance-p obj)))
     (return-from %slot-value nil))
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from %slot-value nil))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx) (return-from %slot-value nil))
+      (when (null idx)
+        (error "slot-value: no slot named ~S in class ~S"
+               slot-name (aref cls 1)))
       (let ((val (aref obj (+ 2 idx))))
         ;; -999 is the unbound slot sentinel (fixnum, no global lookup needed)
         ;; Guard with fixnump to avoid type error when slot contains non-fixnum
@@ -382,32 +385,41 @@
           val)))))
 
 (defun set-slot-value (obj slot-name new-val)
-  "Set slot SLOT-NAME in CLOS instance OBJ to NEW-VAL. Returns NEW-VAL."
+  "Set slot SLOT-NAME in CLOS instance OBJ to NEW-VAL. Returns NEW-VAL.
+   Errors when SLOT-NAME doesn't name a slot of OBJ's class."
   (when (or (null obj) (not (%clos-instance-p obj)))
     (return-from set-slot-value new-val))
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from set-slot-value new-val))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx) (return-from set-slot-value new-val))
+      (when (null idx)
+        (error "set-slot-value: no slot named ~S in class ~S"
+               slot-name (aref cls 1)))
       (aset obj (+ 2 idx) new-val)
       new-val)))
 
 (defun %slot-boundp (obj slot-name)
-  "True if slot SLOT-NAME of OBJ is bound."
+  "True if slot SLOT-NAME of OBJ is bound.  Errors when SLOT-NAME
+   doesn't name a slot of OBJ's class."
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from %slot-boundp nil))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx) (return-from %slot-boundp nil))
+      (when (null idx)
+        (error "slot-boundp: no slot named ~S in class ~S"
+               slot-name (aref cls 1)))
       ;; -999 is the unbound slot sentinel (fixnum guard prevents type error)
       (let ((v (aref obj (+ 2 idx))))
         (not (and (fixnump v) (= v -999)))))))
 
 (defun %slot-makunbound (obj slot-name)
-  "Mark slot SLOT-NAME in OBJ as unbound."
+  "Mark slot SLOT-NAME in OBJ as unbound.  Errors when SLOT-NAME
+   doesn't name a slot of OBJ's class."
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from %slot-makunbound obj))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx) (return-from %slot-makunbound obj))
+      (when (null idx)
+        (error "slot-makunbound: no slot named ~S in class ~S"
+               slot-name (aref cls 1)))
       ;; Use literal -999 to avoid SYMBOL-VALUE clobber in variable-index aset
       (aset obj (+ 2 idx) -999)
       obj)))

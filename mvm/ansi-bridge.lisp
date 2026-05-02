@@ -2008,9 +2008,8 @@
   "Return applicable methods (stub)."
   nil)
 
-(defun ensure-generic-function (name &rest args)
-  "Ensure generic function (stub)."
-  nil)
+;; ensure-generic-function lives in cl-clos.lisp now; the stub here
+;; was shadowing it via last-defun-wins.
 
 (defun reinitialize-instance (instance &rest initargs)
   "Reinitialize CLOS instance (stub)."

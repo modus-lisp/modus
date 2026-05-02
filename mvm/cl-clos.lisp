@@ -1057,11 +1057,17 @@
 ;;; ============================================================
 
 (defun ensure-generic-function (name &rest args)
-  "Ensure generic function NAME exists."
+  "Ensure generic function NAME exists.  ANSI: signals an error if NAME
+   names a special operator, macro, or ordinary (non-generic) function."
+  (declare (ignore args))
   (let ((existing (%find-gf name)))
-    (if existing
-      existing
-      (%defgeneric name nil nil))))
+    (when existing
+      (return-from ensure-generic-function existing))
+    ;; No GF yet — refuse if NAME is already bound to a non-GF function.
+    (when (and (fboundp name)
+               (not (%generic-function-p (fdefinition name))))
+      (error "ensure-generic-function: ~S already names a non-generic function" name))
+    (%defgeneric name nil nil)))
 
 ;;; ============================================================
 ;;; find-method / remove-method / add-method

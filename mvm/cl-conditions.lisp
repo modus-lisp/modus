@@ -64,9 +64,22 @@
   (aref cond 1))
 
 (defun %condition-slot (cond slot-name)
-  "Get slot value by slot name (symbol)."
-  (let ((entry (assoc slot-name (%condition-slot-alist cond))))
-    (if entry (cdr entry) nil)))
+  "Get slot value by slot name (symbol).  Uses hash equality on
+   slot-0 so cross-file native MVM symbol identity doesn't break
+   the alist lookup."
+  (let ((nhash (and (symbolp slot-name) (not (null slot-name)) (not (eq slot-name t))
+                    (aref slot-name 0)))
+        (cur (%condition-slot-alist cond)))
+    (loop
+      (when (null cur) (return nil))
+      (let ((entry (car cur)))
+        (when (consp entry)
+          (let ((k (car entry)))
+            (when (or (eq k slot-name)
+                      (and nhash (symbolp k) (not (null k)) (not (eq k t))
+                           (= (aref k 0) nhash)))
+              (return (cdr entry))))))
+      (setq cur (cdr cur)))))
 
 (defun %condition-all-parents (name)
   "Get all ancestor type names of a condition type (including itself)."
@@ -179,12 +192,20 @@
                 c)))))))
 
 (defun %plist-get (plist key)
-  "Get value for KEY in plist. Returns :not-found if not present."
-  (let ((rest plist))
+  "Get value for KEY in plist. Returns :not-found if not present.
+   Compares by eq, then by symbol-name-hash so cross-file native MVM
+   keyword identity doesn't break initarg matching."
+  (let ((khash (and (symbolp key) (not (null key)) (not (eq key t))
+                    (aref key 0)))
+        (rest plist))
     (loop
       (when (null rest) (return :not-found))
       (when (null (cdr rest)) (return :not-found))
-      (when (eq (car rest) key) (return (cadr rest)))
+      (let ((k (car rest)))
+        (when (or (eq k key)
+                  (and khash (symbolp k) (not (null k)) (not (eq k t))
+                       (= (aref k 0) khash)))
+          (return (cadr rest))))
       (setq rest (cddr rest)))))
 
 (defun %eval-initform (form)
@@ -234,6 +255,7 @@
 (defun cell-error-name (c)
   (let ((v (%condition-slot c 'name)))
     (if v v (%condition-slot c 'cell-name))))
+(defun unbound-slot-instance (c) (%condition-slot c 'instance))
 (defun package-error-package (c) (%condition-slot c 'package))
 (defun stream-error-stream (c) (%condition-slot c 'stream))
 (defun file-error-pathname (c) (%condition-slot c 'pathname))
@@ -279,8 +301,10 @@
   (%define-condition 'unbound-variable '(cell-error) nil nil nil)
   ;; undefined-function
   (%define-condition 'undefined-function '(cell-error) nil nil nil)
-  ;; unbound-slot
-  (%define-condition 'unbound-slot '(cell-error error) nil nil nil)
+  ;; unbound-slot — has :instance and inherits :name from cell-error.
+  (%define-condition 'unbound-slot '(cell-error error)
+    (list (list 'instance '(:instance) :no-initform))
+    nil nil)
   ;; arithmetic-error
   (%define-condition 'arithmetic-error '(error)
     (list (list 'operation '(:operation) :no-initform)

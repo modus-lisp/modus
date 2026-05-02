@@ -506,12 +506,15 @@
     (let ((fn (if best-specific best-specific best-fn)))
       (if fn
         (funcall fn cls obj slot-name)
-        ;; Default: signal unbound-slot error
-        (error "slot unbound")))))
+        ;; Default: signal unbound-slot condition
+        (error 'unbound-slot :name slot-name :instance obj)))))
 
 (defun slot-unbound (class obj slot-name)
-  "Default slot-unbound: signals an error."
-  (error "slot unbound"))
+  "Default slot-unbound: signals an unbound-slot condition with
+   :instance OBJ and :name SLOT-NAME so handler-case can pull them
+   back out via unbound-slot-instance / cell-error-name."
+  (declare (ignore class))
+  (error 'unbound-slot :name slot-name :instance obj))
 
 (defun class-name (cls)
   "Return the name of class CLS."

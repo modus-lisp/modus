@@ -653,7 +653,11 @@
 ;;; ============================================================
 
 (defun string-equal (a b)
-  ;; ANSI: case-insensitive compare. STRING= is the strict variant.
+  "Case-insensitive string compare (ANSI semantics: chars match if
+   they would compare CHAR-EQUAL, i.e. case-folded for ASCII letters).
+   STRING= is the case-sensitive variant.  Most callers in
+   cl-packages.lisp / make-condition initarg matching want this case-
+   insensitive form so cross-file keyword identity works."
   (let ((len-a (array-length a)))
     (if (= len-a (array-length b))
         (let ((i 0))

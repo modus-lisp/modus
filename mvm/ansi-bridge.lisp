@@ -181,7 +181,18 @@
 
 (defun %subst-check-kwargs (args)
   "Validate keyword args for SUBST/SUBST-IF/etc.  Allows :test :test-not
-   :key :allow-other-keys.  Signals program-error on bad input."
+   :key :allow-other-keys.  Signals program-error on bad input.
+
+   Note: don't use (symbolp k) as a type-check — compile-keyword emits
+   keywords as raw fixnums (compiler.lisp ~line 1720), so symbolp returns
+   NIL on every keyword.  The eq-vs-known-keyword cond-clauses already
+   correctly accept valid keys and reject invalid ones; falling through
+   to the (t ...) clause catches both unknown keywords and non-keyword
+   garbage (e.g. (subst ... 1 2)).  Earlier code had (not (symbolp k))
+   as a leading clause; that wrongly signaled program-error on every
+   real :key/:test/etc. and silently broke SUBST.ALLOW-OTHER-KEYS.* tests
+   (the symbolp check is unreachable as a defensive net but actively
+   misfires)."
   ;; First pass: find :allow-other-keys (leftmost wins).
   (let ((aok nil) (aok-set nil) (cur args))
     (loop
@@ -198,7 +209,6 @@
         (when (null cur) (return nil))
         (let ((k (car cur)))
           (cond
-            ((not (symbolp k))    (%signal-program-error))
             ((eq k :test))
             ((eq k :test-not))
             ((eq k :key))
@@ -239,8 +249,11 @@
       (when (null (cdr cur))
         (%signal-program-error))     ; odd-length plist
       (let ((k (car cur)) (v (cadr cur)))
+        ;; Don't reject by symbolp — keywords are emitted as raw fixnums
+        ;; (compile-keyword in compiler.lisp).  The cond's eq-clauses
+        ;; match valid keys; the (t ...) branch records anything else as
+        ;; bad-key, which only signals if no :allow-other-keys T was set.
         (cond
-          ((not (symbolp k)) (%signal-program-error))
           ((eq k :test)     (unless test-set (setq test-fn v) (setq test-set t)))
           ((eq k :test-not) (unless tn-set (setq test-not-fn v) (setq tn-set t)))
           ((eq k :key)      (unless key-set (setq key-fn v) (setq key-set t)))

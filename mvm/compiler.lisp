@@ -1480,12 +1480,28 @@
 ;;; MVM ignores declarations; this helper strips them.
 
 (defun strip-declares (body)
-  "Remove leading (declare ...) forms from BODY."
+  "Remove leading (declare ...) forms AND a leading docstring (a string
+   that isn't the only form) from BODY.  Without the docstring strip,
+   the bare-metal compiler emits ~20 bytes per char of allocate-and-
+   discard code at the head of every function — silently growing the
+   binary by hundreds of bytes per docstring and shifting downstream
+   code addresses enough to corrupt funcall dispatch."
   (loop while (and (consp body)
                    (consp (car body))
                    (symbolp (caar body))
                    (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
         do (setf body (cdr body)))
+  ;; Drop a leading string — docstring — when the body has more forms.
+  ;; A lone (defun foo (x) "x") still returns the string, so don't
+  ;; strip if it's the only form.
+  (when (and (consp body) (cdr body) (stringp (car body)))
+    (setf body (cdr body))
+    ;; declarations may follow a docstring — strip those too.
+    (loop while (and (consp body)
+                     (consp (car body))
+                     (symbolp (caar body))
+                     (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
+          do (setf body (cdr body))))
   body)
 
 (defun extract-special-vars (body)

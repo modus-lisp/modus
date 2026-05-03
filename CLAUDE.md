@@ -383,6 +383,23 @@ and were passing in a smaller version of the function. Some compile-state
 flips at a threshold. Workaround: split big test runners into multiple defuns
 called sequentially.
 
+**Major source root-caused 2026-05-03**: `strip-declares` did not strip
+docstrings, so every `(defun name (...) "doc" body)` emitted ~14 bytes of
+x86 per character of docstring as an allocate-and-discard string in the
+function prologue (movabs + obj-set per char, plus alloc-obj for the
+header).  STRING-EQUAL with a 280-char docstring grew the function from
+1.8KB to 7KB of native code, and the 5KB downstream shift tipped
+unrelated callers across nibble-1/9 funcall-tag-collision edges, SIGSEGV
+at boot.  Fix in `mvm/compiler.lisp` `strip-declares` saved 1.3MB and
++67 ANSI tests.
+
+Remaining layout fragility comes from genuine string/cons literal
+allocation in user code (each char is ~14 bytes of code, each cons
+element is several) plus the funcall-tag NOP alignment.  Adding 5KB
+of any code can still tip; future investigations should look for other
+silently-emitted bloat (notably `compile-quote` over large literals
+and `compile-keyword` patterns).
+
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 
 The fixpoint build combines source from multiple architectures into a single multi-arch binary.

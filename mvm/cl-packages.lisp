@@ -356,10 +356,47 @@
 
 ;;; --- Symbol operations ---
 
+(defun %native-mvm-sym-name-lookup (h)
+  "Walk every interned-package symbol table looking for a symbol whose
+   slot-0 hash equals H.  Returns the matching name string or NIL.
+   Used by SYMBOL-NAME for native-MVM symbols (which carry only a hash,
+   no name slot of their own)."
+  (let ((cur *all-packages*) (found nil))
+    (loop
+      (when (or (null cur) found) (return found))
+      (let ((p (car cur)))
+        (when (%pkg-p p)
+          ;; Internal table
+          (let ((entries (%pkg-internal p)))
+            (let ((c2 entries))
+              (loop
+                (when (or (null c2) found) (return found))
+                (let ((entry (car c2)))
+                  (when (and (consp entry) (stringp (car entry)))
+                    (when (= (compute-name-hash (car entry)) h)
+                      (setq found (car entry)))))
+                (setq c2 (cdr c2)))))
+          ;; External table
+          (unless found
+            (let ((entries (%pkg-external p)))
+              (let ((c2 entries))
+                (loop
+                  (when (or (null c2) found) (return found))
+                  (let ((entry (car c2)))
+                    (when (and (consp entry) (stringp (car entry)))
+                      (when (= (compute-name-hash (car entry)) h)
+                        (setq found (car entry)))))
+                  (setq c2 (cdr c2))))))))
+      (setq cur (cdr cur)))
+    found))
+
 (defun symbol-name (sym)
   "Return the name of a symbol as a string. For Modus's integer-valued
    gensyms (sym is an integer), produce a unique 'G<N>' name so tests
-   like (string= (symbol-name (gensym)) (symbol-name (gensym))) → NIL."
+   like (string= (symbol-name (gensym)) (symbol-name (gensym))) → NIL.
+   For native-MVM symbols (subtag #x50, 1 slot — hash only), look the
+   hash up in *all-packages*' symbol tables to recover a name; many
+   tests print or string-compare these and fail silently otherwise."
   (cond
     ((null sym) "NIL")
     ((eq sym t) "T")
@@ -367,6 +404,11 @@
     ((integerp sym)
      (let ((digs (write-to-string sym)))
        (concatenate 'string "G" digs)))
+    ;; Native MVM symbol: look up via package symtabs.
+    ((and (not (consp sym)) (not (characterp sym)) (not (stringp sym))
+          (= (obj-subtag sym) 80))
+     (let ((nm (%native-mvm-sym-name-lookup (aref sym 0))))
+       (if nm nm "")))
     (t "")))
 
 (defun symbol-package (sym)

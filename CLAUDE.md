@@ -241,7 +241,17 @@ All values are tagged 64-bit words with fixnum-shift=1:
 - **Forward** (tag 1111): GC forwarding pointer
 
 Object header: `[subtag:8][unused:7][element-count:49]`
-Key subtags: string=#x10, symbol=#x50, closure=#x52, array=#x32, hash-table=#x41
+Key subtags: string=#x10, symbol=#x50, keyword=#x53, closure=#x52, array=#x32, hash-table=#x41
+
+Keywords (`:foo`) are subtag #x53 — distinct from #x50 symbols so KEYWORDP
+can identify them without a per-symbol package slot.  compile-keyword in
+mvm/compiler.lisp emits `(li v0 hash; call %INTERN-KEYWORD)` so all `:foo`
+literals at any call site resolve to the same heap object via the keyword
+intern table at #x10000148 (init by `init-keyword-table` early in
+kernel-main).  SYMBOLP accepts both #x50 and #x53; KEYWORDP only #x53.
+Reader's `(intern name (find-package "KEYWORD"))` still produces 3-slot CL
+symbols — eq across the two representations is **not** preserved (yet);
+compile-time `:foo` is a #x53 object, reader `:foo` is a CL symbol.
 
 ### mem-ref Semantics (MVM)
 - `:u8`, `:u32` loads → result is **tagged** (SHL 1); stores → value is **untagged** (SHR 1)

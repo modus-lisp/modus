@@ -123,27 +123,42 @@
         (case *print-case*)
         (gensym *print-gensym*)
         (readably *print-readably*))
-    (let ((name (if (%cl-sym-p sym) (%cl-sym-name sym) (symbol-name sym)))
-          (pkg (if (%cl-sym-p sym) (%cl-sym-package sym) nil)))
+    (let* ((cl-sym-p (%cl-sym-p sym))
+           (name (if cl-sym-p (%cl-sym-name sym) (symbol-name sym)))
+           (pkg (if cl-sym-p (%cl-sym-package sym) nil))
+           ;; For native MVM symbols (no package slot), treat as accessible
+           ;; in *package* iff the name is findable there.  This stops
+           ;; quoted-literal symbols from printing as uninterned (#:NAME).
+           (native-accessible
+             (and (not cl-sym-p) (not (null sym)) (not (eq sym t))
+                  (stringp name) (> (array-length name) 0)
+                  (%pkg-p *package*)
+                  (let ((found (%pkg-find-sym name *package*)))
+                    (and found t)))))
       ;; Determine if we need package qualifier
       (let ((cur-pkg *package*))
         (let ((need-qualifier
                (if (or escape readably)
                    ;; Need qualifier if symbol not accessible in current pkg
-                   (if (null pkg)
-                       ;; Uninterned symbol
-                       (if (or gensym readably) t nil)
-                       ;; Check if symbol is accessible in current package
-                       (let ((accessible nil))
-                         (when (%pkg-p cur-pkg)
-                           (let ((found (%pkg-find-sym name cur-pkg)))
-                             (when (and found (eq found sym))
-                               (setq accessible t))))
-                         (not accessible)))
+                   (cond
+                     (native-accessible nil)
+                     ((null pkg)
+                      ;; Uninterned symbol
+                      (if (or gensym readably) t nil))
+                     (t
+                      ;; Check if symbol is accessible in current package
+                      (let ((accessible nil))
+                        (when (%pkg-p cur-pkg)
+                          (let ((found (%pkg-find-sym name cur-pkg)))
+                            (when (and found (eq found sym))
+                              (setq accessible t))))
+                        (not accessible))))
                    nil)))
           (cond
-            ;; Uninterned symbol: print #:name
-            ((and (null pkg) (or gensym readably escape))
+            ;; Uninterned symbol: print #:name (but native-accessible
+            ;; symbols skip this branch)
+            ((and (null pkg) (not native-accessible)
+                  (or gensym readably escape))
              (%print-char 35 stream) ; #
              (%print-char 58 stream) ; :
              (%print-symbol-name-with-case name stream case))
@@ -324,8 +339,9 @@
              (%print-char 34 stream))  ; "
            ;; princ-style: no quotes
            (%print-string-raw obj stream)))
-      ;; Symbol
-      ((or (%cl-sym-p obj) (eq obj t) (null obj))
+      ;; Symbol — CL syms (3-slot), T, NIL, and native MVM symbols
+      ;; (1-slot subtag #x50, hash only).  symbolp recognises all four.
+      ((symbolp obj)
        (%print-symbol-to-stream obj stream))
       ;; Adjustable wrapper: (cons 8765432 inner) — peel and recurse
       ((and (consp obj) (eql (car obj) 8765432) (consp (cdr obj)))

@@ -50,6 +50,12 @@
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-symbol+ #x50)
 (defconstant +subtag-closure+ #x52)
+;; #x53 = keyword.  1-slot object, slot 0 = name-hash.  Like +subtag-symbol+
+;; but flagged as a keyword so SYMBOLP accepts both, KEYWORDP recognises
+;; only #x53, and the printer emits a leading colon.  Routed through
+;; %INTERN-KEYWORD at runtime (compile-keyword) so eq holds across
+;; compile-time and reader-parsed keyword references.
+(defconstant +subtag-keyword+ #x53)
 (defconstant +subtag-float+  #x60)
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
@@ -1718,10 +1724,23 @@
     (emit-ir :li dest tagged)))
 
 (defun compile-keyword (kw dest)
-  "Load a keyword (as its tagged name hash) into DEST.
-   Uses normalize-name (not sxhash) so keywords match other symbol
-   representations and integer-encoded symbol IDs consistently."
-  (emit-ir :li dest (ash (normalize-name kw) +fixnum-shift+)))
+  "Intern a keyword at runtime via %INTERN-KEYWORD, leaving the resulting
+   keyword symbol object (subtag #x53) in DEST.
+
+   Earlier this just emitted a single LI with the tagged name-hash, so a
+   keyword was a bare fixnum.  That made `(symbolp :foo)` return NIL,
+   `(integerp :foo)` return T, broke `(symbol-name :foo)`, and silently
+   broke every kwarg validator that reasonably checked `(symbolp k)` first
+   (SUBST.ALLOW-OTHER-KEYS.* and the entire family that wanted the same
+   guard in member/assoc/adjoin/etc.)  See feedback_kwarg_validation_fragility.md.
+
+   Now we route through %INTERN-KEYWORD just like compile-quote routes
+   non-keyword symbols through %INTERN-SYMBOL.  Same eq guarantee
+   (interned per name-hash) but real symbol-typed objects."
+  (emit-ir :li +vreg-v0+ (ash (normalize-name kw) +fixnum-shift+))
+  (emit-ir :call "%INTERN-KEYWORD" 1)
+  (unless (= dest +vreg-vr+)
+    (emit-ir :mov dest +vreg-vr+)))
 
 ;;; ------ Variable Reference ------
 
@@ -2166,6 +2185,7 @@
 
       ;; --- Symbol allocation ---
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
+      ((= op-name 977538405397341142)   (compile-make-keyword-obj dest))  ; %make-keyword-obj
       ((= op-name 559186982902022686)   (compile-alloc-sym3 dest))   ; %alloc-sym3
       ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 735635543474837196)   (compile-make-ratio dest))   ; %make-ratio
@@ -6906,6 +6926,12 @@
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
    Returns an uninitialized symbol object; caller stores name-hash in slot 0."
   (emit-ir :alloc-obj dest 1 +subtag-symbol+))
+
+(defun compile-make-keyword-obj (dest)
+  "Compile (%make-keyword-obj) — allocate a 1-slot object with keyword subtag
+   (#x53).  Returns an uninitialized keyword object; caller stores name-hash
+   in slot 0.  Used by %INTERN-KEYWORD."
+  (emit-ir :alloc-obj dest 1 +subtag-keyword+))
 
 (defun compile-alloc-sym3 (dest)
   "Compile (%alloc-sym3) — allocate a 3-slot object with symbol subtag

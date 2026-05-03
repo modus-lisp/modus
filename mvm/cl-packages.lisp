@@ -404,9 +404,14 @@
     ((integerp sym)
      (let ((digs (write-to-string sym)))
        (concatenate 'string "G" digs)))
-    ;; Native MVM symbol: look up via package symtabs.
+    ;; Native MVM symbol (#x50) or keyword (#x53): both single-slot, hash only.
+    ;; Recover name by walking package symtabs for matching hash.  Keywords
+    ;; that compile-keyword interned at runtime won't be in any package
+    ;; symtab — fall back to "" so symbol-name doesn't crash (callers that
+    ;; care about real keyword names use the reader's intern path which
+    ;; populates the KEYWORD package's symtab).
     ((and (not (consp sym)) (not (characterp sym)) (not (stringp sym))
-          (= (obj-subtag sym) 80))
+          (let ((st (obj-subtag sym))) (or (= st 80) (= st 83))))
      (let ((nm (%native-mvm-sym-name-lookup (aref sym 0))))
        (if nm nm "")))
     (t "")))
@@ -866,26 +871,27 @@
 ;;; --- Override symbolp/keywordp for CL symbols ---
 
 (defun symbolp (x)
-  "True if X is a symbol (MVM native or CL symbol)."
+  "True if X is a symbol (MVM native, MVM keyword, or CL symbol).
+   Subtag #x50 = native symbol; #x53 = native keyword (compile-keyword
+   routes :foo through %INTERN-KEYWORD into a #x53 object).  Both are
+   symbols per ANSI."
   (or (null x) (eq x t) (%cl-sym-p x)
-      ;; Check for MVM native symbols (subtag #x50 = 80)
       (and (not (integerp x)) (not (consp x)) (not (characterp x))
            (not (stringp x)) (not (null x))
-           (= (obj-subtag x) 80))))
+           (let ((st (obj-subtag x)))
+             (or (= st 80)     ; #x50 symbol
+                 (= st 83))))))  ; #x53 keyword
 
 (defun keywordp (x)
-  "True if X is a keyword symbol."
-  (if (%cl-sym-p x)
-      (let ((kw-pkg (find-package "KEYWORD")))
-        (if kw-pkg
-            (eq (%cl-sym-package x) kw-pkg)
-            nil))
-      ;; Fallback for MVM native keyword symbols
-      (member x '(:test :key :test-not :count :start :end :from-end
-                  :initial-element :initial-contents :element-type
-                  :allow-other-keys :internal :external :inherited
-                  :nicknames :use :export :import-from :shadow
-                  :shadowing-import-from :intern :documentation))))
+  "True if X is a keyword symbol.  CL-symbol path: package eq KEYWORD.
+   Native path: object with subtag #x53 (allocated by %INTERN-KEYWORD)."
+  (cond
+    ((%cl-sym-p x)
+     (let ((kw-pkg (find-package "KEYWORD")))
+       (and kw-pkg (eq (%cl-sym-package x) kw-pkg))))
+    ((or (null x) (eq x t)) nil)
+    ((or (integerp x) (consp x) (characterp x) (stringp x)) nil)
+    (t (= (obj-subtag x) 83))))   ; #x53 keyword
 
 (defun boundp (sym)
   "True if SYM is bound. Keyword symbols are always bound to themselves."
@@ -904,6 +910,7 @@
     ((characterp form) t)
     ((stringp form) t)
     ((%cl-sym-p form) (keywordp form))
+    ((keywordp form) t)          ; native keyword (subtag #x53)
     ((and (consp form) (eq (car form) 'quote)) t)
     (t nil)))
 

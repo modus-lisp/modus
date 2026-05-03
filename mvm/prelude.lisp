@@ -1340,6 +1340,12 @@
   "Initialize the intern table at 0x620000."
   (setf (mem-ref #x10000088 :u64) (make-hash-table)))
 
+(defun init-keyword-table ()
+  "Initialize the keyword intern table at #x10000148.
+   Distinct from the symbol table so KEYWORDP can identify keywords without
+   a per-symbol package slot.  See compile-keyword in mvm/compiler.lisp."
+  (setf (mem-ref #x10000148 :u64) (make-hash-table)))
+
 (defun %intern-symbol (name-hash)
   "Intern a symbol by name hash. Returns existing symbol if already interned.
    Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate.
@@ -1367,6 +1373,23 @@
             (aset sym 0 name-hash)
             (puthash name-hash table sym)
             sym)))))
+
+(defun %intern-keyword (name-hash)
+  "Intern a keyword by name hash.  Same shape as %INTERN-SYMBOL but uses
+   the keyword table at #x10000148 and allocates a #x53-subtag object so
+   KEYWORDP can identify it.  Compile-keyword in compiler.lisp emits
+   `(li v0 hash) (call %INTERN-KEYWORD)' for every `:foo' literal in
+   compiled code; the runtime reader's `intern KEYWORD' path lands here
+   too via cl-packages.lisp.  Eq across both routes is preserved by the
+   shared name-hash → object table."
+  (let ((table (mem-ref #x10000148 :u64)))
+    (let ((existing (gethash name-hash table)))
+      (if existing
+          existing
+          (let ((kw (%make-keyword-obj)))
+            (aset kw 0 name-hash)
+            (puthash name-hash table kw)
+            kw)))))
 
 ;;; ============================================================
 ;;; Error handling (bare-metal stubs)

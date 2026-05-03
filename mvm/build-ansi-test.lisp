@@ -2948,6 +2948,7 @@
 
   ;; Initialize runtime
   (init-symbol-table)
+  (init-keyword-table)
 
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
   (%init-packages)

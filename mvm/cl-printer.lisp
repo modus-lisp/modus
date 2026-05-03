@@ -123,6 +123,17 @@
         (case *print-case*)
         (gensym *print-gensym*)
         (readably *print-readably*))
+    ;; Native keyword (subtag #x53): just emit ":NAME" — no package qualifier
+    ;; logic.  The CL-symbol path below handles KEYWORD-package CL symbols
+    ;; via the qualifier branch (pkg-name = "" when KEYWORD).
+    (when (and (not (%cl-sym-p sym)) (not (null sym)) (not (eq sym t))
+               (not (consp sym)) (not (integerp sym))
+               (not (characterp sym)) (not (stringp sym))
+               (= (obj-subtag sym) 83))   ; #x53 keyword
+      (%print-char 58 stream)             ; :
+      (let ((name (symbol-name sym)))
+        (%print-symbol-name-with-case name stream *print-case*))
+      (return-from %print-symbol-to-stream nil))
     (let* ((cl-sym-p (%cl-sym-p sym))
            (name (if cl-sym-p (%cl-sym-name sym) (symbol-name sym)))
            (pkg (if cl-sym-p (%cl-sym-package sym) nil))

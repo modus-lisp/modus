@@ -1832,7 +1832,7 @@
       ;; expansion).  Now we recognise nested DEFUN like the toplevel
       ;; path does and yield NIL into DEST (defun's value isn't used in
       ;; expression contexts).  Probe 9795 captures the original bug.
-      ((= op-name 974270913155467339)
+      ((= op-name 974270913155467339)   ; DEFUN
        (let* ((raw-name (cadr form))
               (params   (caddr form))
               (body     (cdddr form))
@@ -1854,6 +1854,24 @@
                (when rest-pos
                  (setf (function-info-rest-param-p info) t)))))
          (compile-nil dest)))
+      ;; DEFVAR / DEFPARAMETER inside an expression context.  Same fall-
+      ;; through trap as DEFUN: nested DEFVAR landed in compile-call as
+      ;; a call to a function named "DEFVAR", evaluating BODY at runtime.
+      ;; Register as global + emit a runtime SET-SYMBOL-VALUE for the
+      ;; init-value (DEFPARAMETER unconditional, DEFVAR only if VALUE was
+      ;; supplied — but the call form being compiled here always has a
+      ;; value position, so just compile it).  Return the symbol-name as
+      ;; an interned symbol (same as compile-quote would for any quoted
+      ;; sym), matching ANSI: defvar/defparameter return the variable name.
+      ((or (= op-name 263277541136800469)   ; DEFVAR
+           (= op-name 131999690084823585))  ; DEFPARAMETER
+       (let* ((var-name (cadr form))
+              (value-form (caddr form))
+              (name-hash (normalize-name var-name)))
+         (setf (gethash name-hash *globals*) t)
+         (when value-form
+           (compile-form `(set-symbol-value ,name-hash ,value-form) env dest))
+         (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
       ((= op-name 230909053785822708)
        (compile-flet (cadr form) (cddr form) env dest nil))

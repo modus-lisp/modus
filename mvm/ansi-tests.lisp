@@ -1775,13 +1775,14 @@
   ;;   - symbolp / keywordp on a #x53 keyword
   ;;   - symbol-package returns KEYWORD
   ;;   - symbol-name returns the right string for a reader-interned keyword
-  (deftest 9701 (symbolp :test) t)
-  (deftest 9702 (keywordp :test) t)
-  (deftest 9703 (eq (symbol-package :test) (find-package "KEYWORD")) t)
+  ;; (Renamed to 9751-6 from 9701-6 — collided with run-cl-loop-tests' 9701-6.)
+  (deftest 9751 (symbolp :test) t)
+  (deftest 9752 (keywordp :test) t)
+  (deftest 9753 (eq (symbol-package :test) (find-package "KEYWORD")) t)
   (let ((k (read-from-string ":TEST")))
-    (deftest 9704 (eq k :test) t)
-    (deftest 9705 (string= (symbol-name k) "TEST") t)
-    (deftest 9706 (eq (symbol-package k) (find-package "KEYWORD")) t))
+    (deftest 9754 (eq k :test) t)
+    (deftest 9755 (string= (symbol-name k) "TEST") t)
+    (deftest 9756 (eq (symbol-package k) (find-package "KEYWORD")) t))
   ;; Test: make-array returns an object with subtag #x32
   (let ((a (make-array 5)))
     (deftest 9091 (obj-subtag a) #x32))

@@ -1569,9 +1569,19 @@
                    ((eq key :accessor)
                     (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns)
                     (push `(%register-gf-fn (function ,val)) extra-defuns)
-                    (let ((setter-name (intern (concatenate 'string "SET-" (symbol-name val)))))
-                      (push `(defun ,setter-name (obj nv) (set-slot-value obj ',sname nv)) extra-defuns)
-                      (push `(%register-gf-fn (function ,setter-name)) extra-defuns)))
+                    ;; Two setter aliases, different arg orders:
+                    ;;   SET-NAME (obj val)  — what compiler.lisp's SETF macro
+                    ;;     fallback emits for (setf (NAME obj) val) → (SET-NAME obj val)
+                    ;;   SETF-NAME (val obj) — what compile-function-ref resolves
+                    ;;     #'(setf NAME) to (lookup "SETF-NAME") and what an
+                    ;;     ANSI SETF expansion would funcall as (val place-args...)
+                    ;; Both register so (typep #' on either) → T.
+                    (let ((set-name (intern (concatenate 'string "SET-" (symbol-name val))))
+                          (setf-name (intern (concatenate 'string "SETF-" (symbol-name val)))))
+                      (push `(defun ,set-name (obj nv) (set-slot-value obj ',sname nv)) extra-defuns)
+                      (push `(%register-gf-fn (function ,set-name)) extra-defuns)
+                      (push `(defun ,setf-name (nv obj) (set-slot-value obj ',sname nv)) extra-defuns)
+                      (push `(%register-gf-fn (function ,setf-name)) extra-defuns)))
                    ((eq key :writer)
                     ;; writer: (fn new-value object)
                     (push `(defun ,val (nv obj) (set-slot-value obj ',sname nv)) extra-defuns)

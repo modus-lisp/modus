@@ -248,10 +248,14 @@ can identify them without a per-symbol package slot.  compile-keyword in
 mvm/compiler.lisp emits `(li v0 hash; call %INTERN-KEYWORD)` so all `:foo`
 literals at any call site resolve to the same heap object via the keyword
 intern table at #x10000148 (init by `init-keyword-table` early in
-kernel-main).  SYMBOLP accepts both #x50 and #x53; KEYWORDP only #x53.
-Reader's `(intern name (find-package "KEYWORD"))` still produces 3-slot CL
-symbols — eq across the two representations is **not** preserved (yet);
-compile-time `:foo` is a #x53 object, reader `:foo` is a CL symbol.
+kernel-main).  SYMBOLP accepts both #x50 and #x53; KEYWORDP only #x53;
+SYMBOL-PACKAGE returns the KEYWORD package for #x53 objects.
+
+Reader's `(intern name (find-package "KEYWORD"))` is unified with
+compile-keyword: it also routes through %INTERN-KEYWORD and returns the
+**same** #x53 object the literal `:foo` in source resolved to.  Round-trip
+eq holds: `(eq (read-from-string ":FOO") :foo)` is T.  Regression tests
+9701–9706 in `run-clos-diag-tests` lock in the contract.
 
 ### mem-ref Semantics (MVM)
 - `:u8`, `:u32` loads → result is **tagged** (SHL 1); stores → value is **untagged** (SHR 1)

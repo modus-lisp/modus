@@ -1074,6 +1074,21 @@
 ;;; hand it to %gf-dispatch.
 ;;; ============================================================
 
+;;; Registry of "anything that should typep as 'generic-function".
+;;; Holds whatever objects (typically closures or raw fn-addrs) live in
+;;; the symbol-function table for known GF names.  Without this,
+;;; (typep #'foo 'generic-function) returns NIL because %generic-function-p
+;;; only recognizes the underlying gf-object (4-slot array, %generic-function
+;;; marker), not the dispatch wrapper that #'foo actually resolves to.
+(defvar *gf-stub-closures* nil)
+
+(defun %register-gf-fn (val)
+  "Add VAL (a closure or raw fn-addr) to *gf-stub-closures* so
+   %generic-function-p recognises it.  Idempotent — won't add duplicates."
+  (unless (member val *gf-stub-closures*)
+    (setq *gf-stub-closures* (cons val *gf-stub-closures*)))
+  val)
+
 (defun %make-gf-stub (gf-name)
   "Build a runtime gf-dispatch closure that captures GF-NAME.  Returns
    a closure (subtag #x52) suitable for set-symbol-function.
@@ -1085,9 +1100,13 @@
    miscompile that bites pure closures.  At runtime we have to capture
    GF-NAME, so we accept the slight risk; the dispatch is one bare
    funcall with no other captured-var reads in the body, which is the
-   minimal exposure to that miscompile."
-  (lambda (&rest args)
-    (%gf-dispatch gf-name args)))
+   minimal exposure to that miscompile.
+
+   Registers the stub in *gf-stub-closures* so %generic-function-p
+   recognizes (typep #'gf-name 'generic-function) → T."
+  (let ((stub (lambda (&rest args) (%gf-dispatch gf-name args))))
+    (%register-gf-fn stub)
+    stub))
 
 ;;; ============================================================
 ;;; call-next-method / next-method-p
@@ -1242,8 +1261,15 @@
 ;;; ============================================================
 
 (defun %generic-function-p (x)
-  "True if X is a generic function."
-  (%gf-p x))
+  "True if X is a generic function — either the underlying gf-object
+   (4-slot array, %generic-function marker in slot 0) or a gf-stub
+   closure produced by %make-gf-stub (registered in *gf-stub-closures*).
+   The closure case matters for (typep #'gf-name 'generic-function),
+   where #'gf-name resolves via symbol-function to the stub closure."
+  (or (%gf-p x)
+      (and x (not (fixnump x)) (not (consp x)) (not (characterp x))
+           (not (stringp x)) (not (= (obj-subtag x) 80))
+           (member x *gf-stub-closures*))))
 
 (defun %standard-method-p (x)
   "True if X is a standard method.  Method records have shape

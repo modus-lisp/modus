@@ -1563,14 +1563,19 @@
                      (val (cadr cur)))
                  (cond
                    ((eq key :reader)
-                    (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns))
+                    (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns)
+                    ;; Register so (typep #',val 'generic-function) → T
+                    (push `(%register-gf-fn (function ,val)) extra-defuns))
                    ((eq key :accessor)
                     (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns)
+                    (push `(%register-gf-fn (function ,val)) extra-defuns)
                     (let ((setter-name (intern (concatenate 'string "SET-" (symbol-name val)))))
-                      (push `(defun ,setter-name (obj nv) (set-slot-value obj ',sname nv)) extra-defuns)))
+                      (push `(defun ,setter-name (obj nv) (set-slot-value obj ',sname nv)) extra-defuns)
+                      (push `(%register-gf-fn (function ,setter-name)) extra-defuns)))
                    ((eq key :writer)
                     ;; writer: (fn new-value object)
-                    (push `(defun ,val (nv obj) (set-slot-value obj ',sname nv)) extra-defuns))
+                    (push `(defun ,val (nv obj) (set-slot-value obj ',sname nv)) extra-defuns)
+                    (push `(%register-gf-fn (function ,val)) extra-defuns))
                    ((eq key :initarg)
                     ;; val is a keyword like :b; map to slot name
                     (push (cons (symbol-name val) sname) initarg-map))
@@ -1666,6 +1671,10 @@
             (%defgeneric ',gf-name ',lambda-list ',(if combination combination nil))
             (defun ,gf-name (&rest %gf-args)
               (%gf-dispatch ',gf-name %gf-args))
+            ;; Register the dispatch defun's fn-addr so
+            ;; (typep #',gf-name 'generic-function) → T (cl-clos.lisp's
+            ;; %generic-function-p consults *gf-stub-closures*).
+            (%register-gf-fn (function ,gf-name))
             ,@method-forms
             ;; ANSI: defgeneric returns the GF object so callers like
             ;; (defparameter *gf* (defgeneric foo (x))) capture it.

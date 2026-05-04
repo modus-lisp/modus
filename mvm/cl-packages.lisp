@@ -417,11 +417,16 @@
     (t "")))
 
 (defun symbol-package (sym)
-  "Return the home package of a symbol."
+  "Return the home package of a symbol.  Native MVM keywords (#x53)
+   are always in the KEYWORD package; native MVM symbols (#x50) carry
+   no package slot — return NIL for them (callers that care can walk
+   *all-packages* via %native-mvm-sym-name-lookup)."
   (cond
     ((null sym) (find-package "COMMON-LISP"))
     ((eq sym t) (find-package "COMMON-LISP"))
     ((%cl-sym-p sym) (%cl-sym-package sym))
+    ((or (integerp sym) (consp sym) (characterp sym) (stringp sym)) nil)
+    ((= (obj-subtag sym) 83) (find-package "KEYWORD"))   ; #x53 keyword
     (t nil)))
 
 (defun make-symbol (name)
@@ -527,19 +532,25 @@
                       (if found
                           (values found :inherited)
                           ;; Create new symbol
-                          (let ((sym (%make-cl-symbol name-str)))
-                            (%cl-sym-set-package sym pkg)
-                            ;; Keyword package: auto-export and self-evaluate
-                            (if (and (find-package "KEYWORD")
-                                     (eq pkg (find-package "KEYWORD")))
-                                (progn
-                                  (%pkg-set-external pkg
-                                    (%symtab-add (%pkg-external pkg) name-str sym))
-                                  (values sym :external))
-                                (progn
-                                  (%pkg-set-internal pkg
-                                    (%symtab-add (%pkg-internal pkg) name-str sym))
-                                  (values sym nil)))))))))))))
+                          (if (and (find-package "KEYWORD")
+                                   (eq pkg (find-package "KEYWORD")))
+                              ;; Keyword package: route through %INTERN-KEYWORD
+                              ;; so the resulting object is the same #x53 native
+                              ;; keyword that compile-keyword's `:foo' literals
+                              ;; resolve to.  Eq across reader and compile-time
+                              ;; references.  Add to the KEYWORD package's
+                              ;; external symtab so find-symbol / symbol-name /
+                              ;; do-external-symbols still see it.
+                              (let ((kw (%intern-keyword
+                                          (compute-name-hash name-str))))
+                                (%pkg-set-external pkg
+                                  (%symtab-add (%pkg-external pkg) name-str kw))
+                                (values kw :external))
+                              (let ((sym (%make-cl-symbol name-str)))
+                                (%cl-sym-set-package sym pkg)
+                                (%pkg-set-internal pkg
+                                  (%symtab-add (%pkg-internal pkg) name-str sym))
+                                (values sym nil))))))))))))
 
 ;;; --- export / unexport ---
 

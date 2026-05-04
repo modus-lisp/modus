@@ -483,7 +483,9 @@
     ((stringp form) form)
     ;; Self-evaluating: vectors
     ((vectorp form) form)
-    ;; Keywords self-evaluate
+    ;; Keywords self-evaluate.  Native keywords (#x53) self-evaluate by
+    ;; type; KEYWORD-package CL symbols match via package eq.
+    ((keywordp form) form)
     ((and (%cl-sym-p form)
           (let ((kp (find-package "KEYWORD")))
             (if kp (eq (%cl-sym-package form) kp) nil)))

@@ -1770,6 +1770,18 @@
   (let ((s1 (%intern-symbol (ash 12345 1)))
         (s2 (%intern-symbol (ash 12345 1))))
     (deftest 9090 (eq s1 s2) t))
+  ;; Keyword unification probes (2026-05-04):
+  ;;   - compile-time :foo and reader-interned :foo should be eq
+  ;;   - symbolp / keywordp on a #x53 keyword
+  ;;   - symbol-package returns KEYWORD
+  ;;   - symbol-name returns the right string for a reader-interned keyword
+  (deftest 9701 (symbolp :test) t)
+  (deftest 9702 (keywordp :test) t)
+  (deftest 9703 (eq (symbol-package :test) (find-package "KEYWORD")) t)
+  (let ((k (read-from-string ":TEST")))
+    (deftest 9704 (eq k :test) t)
+    (deftest 9705 (string= (symbol-name k) "TEST") t)
+    (deftest 9706 (eq (symbol-package k) (find-package "KEYWORD")) t))
   ;; Test: make-array returns an object with subtag #x32
   (let ((a (make-array 5)))
     (deftest 9091 (obj-subtag a) #x32))

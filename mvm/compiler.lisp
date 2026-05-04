@@ -1821,6 +1821,39 @@
       ((= op-name 1080561289491153610)  (compile-dotimes (cadr form) (cddr form) env dest))
       ((= op-name 113179339635393781) (compile-function-ref (cadr form) env dest))
       ((= op-name 59431251605330656)  (compile-funcall (cdr form) env dest))
+      ;; DEFUN inside an expression context — register the function (the
+      ;; build script's mvm-compile-toplevel had a clause for this, but
+      ;; nested defun (inside a lambda body, a deftest thunk, an eval'd
+      ;; form, etc.) reached compile-compound and fell through to
+      ;; compile-call, which treats DEFUN as a call to a function named
+      ;; "DEFUN" — evaluating each arg, including BODY, at the call site.
+      ;; That call into BODY's free variables / undefined fns crashed
+      ;; the surrounding thunk (e.g. DG-MC.* tests' inline defgeneric
+      ;; expansion).  Now we recognise nested DEFUN like the toplevel
+      ;; path does and yield NIL into DEST (defun's value isn't used in
+      ;; expression contexts).  Probe 9795 captures the original bug.
+      ((= op-name 974270913155467339)
+       (let* ((raw-name (cadr form))
+              (params   (caddr form))
+              (body     (cdddr form))
+              (name (if (and (consp raw-name)
+                             (= (length raw-name) 2)
+                             (symbolp (car raw-name))
+                             (string= (symbol-name (car raw-name)) "SETF"))
+                        (format nil "SETF-~A" (symbol-name (cadr raw-name)))
+                        raw-name)))
+         (let* ((rest-pos (position '&rest params))
+                (opt-pos  (position '&optional params))
+                (key-pos  (position '&key params))
+                (req-end  (or rest-pos opt-pos key-pos (length params)))
+                (pp (preprocess-params params body)))
+           (let ((result (mvm-compile-function name (car pp) (cadr pp)
+                                               rest-pos (caddr pp) (cadddr pp))))
+             (let ((info (car result)))
+               (setf (function-info-required-count info) req-end)
+               (when rest-pos
+                 (setf (function-info-rest-param-p info) t)))))
+         (compile-nil dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
       ((= op-name 230909053785822708)
        (compile-flet (cadr form) (cddr form) env dest nil))

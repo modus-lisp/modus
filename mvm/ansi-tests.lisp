@@ -1817,6 +1817,42 @@
   (%defmethod '%diag-mc-append-1 'nil (list 't) (lambda (x) '(a)))
   (deftest 9790 (notnot (%find-gf '%diag-mc-append-1)) t)
   (deftest 9791 (handler-case (%diag-mc-append-1 'x) (error nil :err)) :err)
+  ;; Inline-defun-in-lambda crash pattern (CLAUDE.md "nested defun w/
+  ;; %gf-dispatch body in funcall thunk"; bisected via probes 9792-9816
+  ;; on 2026-05-04, those probes deleted to avoid noise).
+  ;;
+  ;; The DG-MC.* tests (defgeneric-method-combination-*.lsp) put a
+  ;; defgeneric form inline inside a deftest thunk.  The build script's
+  ;; defgeneric rewriter expands it to:
+  ;;   (progn (%defgeneric ...)
+  ;;          (defun NAME (&rest %gf-args) (%gf-dispatch 'NAME %gf-args))
+  ;;          ... (handler-case (NAME ...) (error () :ERROR)))
+  ;; The thunk is then funcall'd by run-test.  The inner defun whose
+  ;; body references %gf-dispatch crashes the WHOLE thunk before
+  ;; rt-run-test prints T:NNN.  Symptoms: "FAIL <id>" with no
+  ;; GOT/EXP and no SIGSEGV diag (handler-case caught a regular error).
+  ;;
+  ;; Bisection found:
+  ;;   - PASS: nested defun whose body is plain (cons/length/return-arg)
+  ;;   - PASS: nested defun whose body calls %find-gf or %defmethod
+  ;;   - PASS: nested defun whose body calls %gf-dispatch on FIRST run
+  ;;     of run-clos-diag-tests (init phase, before fork)
+  ;;   - FAIL: same on SECOND run (per-fork run, after init)
+  ;;
+  ;; The function being called from the nested defun body matters
+  ;; (%gf-dispatch fails, %find-gf/%defmethod don't), and the failure
+  ;; only manifests on re-execution of the surrounding context.
+  ;; Hypothesis: nested compilation of a defun whose body emits a
+  ;; multi-arg :call ir-op leaves *symbol-function-table* lookup state
+  ;; in a way that the OUTER lambda's :li-func resolution sees stale
+  ;; addresses on re-entry.  Not pinned down yet — leaves DG-MC.*
+  ;; tests at the failure baseline.
+  (deftest 9795 (handler-case
+                  (funcall (lambda ()
+                             (progn (defun %diag-il-x (a) (%gf-dispatch '%diag-il-x a))
+                                    'setup-ok)))
+                  (error nil :outer-err))
+                'setup-ok)
   ;; Inside-the-box probes
   (deftest 9775 (consp *gf-stub-closures*) t)
   (deftest 9776 (notnot (member (function %clos-diag-reader) *gf-stub-closures*)) t)

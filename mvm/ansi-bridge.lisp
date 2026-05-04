@@ -713,6 +713,7 @@
    to NIL or to a non-cons; we only check the initial argument."
   (unless (listp list)
     (error "member-if: not a list ~S" list))
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur list))
@@ -729,6 +730,7 @@
    apply-of-rest-through-sibling-defun fragility."
   (unless (listp list)
     (error "member-if-not: not a list ~S" list))
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur list))
@@ -781,6 +783,7 @@
 (defun rassoc (item alist &rest args)
   "Find first pair in ALIST whose cdr matches ITEM.
    :test defaults to inline `eql` (#'eql is unusable in MVM)."
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
@@ -796,6 +799,7 @@
 
 (defun rassoc-if (pred alist &rest args)
   "Find first pair in ALIST whose cdr satisfies PRED."
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur alist))
@@ -812,6 +816,7 @@
   "Find first pair in ALIST whose cdr does NOT satisfy PRED.
    Inlined (rather than `(apply #'rassoc-if (lambda ...) ...)') to dodge
    apply-of-rest fragility."
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur alist))
@@ -826,6 +831,7 @@
 
 (defun assoc-if (pred alist &rest args)
   "Find first pair in ALIST whose car satisfies PRED."
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur alist))
@@ -842,6 +848,7 @@
   "Find first pair in ALIST whose car does NOT satisfy PRED.
    Inlined (rather than `(apply #'assoc-if (lambda ...) ...)') to dodge
    apply-of-rest fragility."
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur alist))

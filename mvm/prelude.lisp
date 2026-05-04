@@ -178,6 +178,7 @@
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
   (when (and (not (null list)) (not (consp list)))
     (%signal-type-error))
+  (%subst-check-kwargs options)
   (let ((test nil) (test-not nil) (key nil)
         (test-set nil) (tn-set nil) (key-set nil)
         (a options))
@@ -216,6 +217,7 @@
   "Find the first pair in ALIST whose car matches KEY. Honors :TEST,
    :TEST-NOT, :KEY. Default test is inline `eql`.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (%subst-check-kwargs options)
   (let ((test nil) (test-not nil) (key-fn nil)
         (test-set nil) (tn-set nil) (key-set nil)
         (a options))

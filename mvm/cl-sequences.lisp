@@ -1797,6 +1797,7 @@
 
 (defun adjoin (item list &rest args)
   "Add ITEM to LIST if not already present."
+  (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))

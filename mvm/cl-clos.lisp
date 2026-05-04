@@ -689,6 +689,25 @@
     ;; Return the name (CLHS says define-method-combination returns the name)
     name))
 
+(defun %init-method-combinations ()
+  "Register the nine ANSI-defined short-form method combinations:
+   AND, OR, APPEND, LIST, MAX, MIN, NCONC, PROGN, +.
+   Each takes the same name as its operator; the :identity-with-one-argument
+   semantics matches CLHS 7.6.6.4 (PROGN/AND/OR don't fold for one method,
+   the rest do).  Without these, %gf-dispatch falls through to standard
+   dispatch which silently calls primary methods on a custom-combination
+   GF — wrong per ANSI (DG-MC.APPEND.10/etc. should error out)."
+  (%define-method-combination 'and    'and    t)
+  (%define-method-combination 'or     'or     t)
+  (%define-method-combination 'append 'append t)
+  (%define-method-combination 'list   'list   nil)
+  (%define-method-combination 'max    'max    t)
+  (%define-method-combination 'min    'min    t)
+  (%define-method-combination 'nconc  'nconc  t)
+  (%define-method-combination 'progn  'progn  t)
+  (%define-method-combination '+      '+      t)
+  nil)
+
 ;;; ============================================================
 ;;; Specializer matching
 ;;; ============================================================

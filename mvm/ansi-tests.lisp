@@ -1769,6 +1769,11 @@
 (defun %clos-diag-reader (obj) (slot-value obj 'foo))
 (defun setf-%clos-diag-reader (nv obj) (set-slot-value obj 'foo nv))
 
+;; Method-combination diag GF, mirrors DG-MC.APPEND.10 / test 27183 shape.
+;; Setup at top level (not inside run-clos-diag-tests) so defun registers
+;; properly and (function ...) lookups resolve.
+(defun %diag-mc-append-1 (&rest %gf-args) (%gf-dispatch '%diag-mc-append-1 %gf-args))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -1800,6 +1805,18 @@
   (deftest 9772 (eq (function %clos-diag-reader) (function %clos-diag-reader)) t)
   (deftest 9773 (eq (function (setf %clos-diag-reader)) (function (setf %clos-diag-reader))) t)
   (deftest 9774 (eq (function (setf %clos-diag-reader)) (function setf-%clos-diag-reader)) t)
+  ;; Method combination probes (2026-05-04)
+  (deftest 9785 (notnot (%find-mc 'append)) t)
+  (deftest 9786 (notnot (%find-mc 'list)) t)
+  (deftest 9787 (notnot (%find-mc 'and)) t)
+  ;; Method-combination dispatch test — gf has APPEND combination but only
+  ;; a primary (no-qualifier) method, so dispatch must error.  Setup is
+  ;; here (init-time only); the gf defun is at file top level.
+  (%defgeneric '%diag-mc-append-1 '(x) 'append)
+  (%register-gf-fn (function %diag-mc-append-1))
+  (%defmethod '%diag-mc-append-1 'nil (list 't) (lambda (x) '(a)))
+  (deftest 9790 (notnot (%find-gf '%diag-mc-append-1)) t)
+  (deftest 9791 (handler-case (%diag-mc-append-1 'x) (error nil :err)) :err)
   ;; Inside-the-box probes
   (deftest 9775 (consp *gf-stub-closures*) t)
   (deftest 9776 (notnot (member (function %clos-diag-reader) *gf-stub-closures*)) t)
@@ -1817,9 +1834,11 @@
                     t)
       ;; What value does member actually return?
       (deftest 9783 (let ((r (member fa registry))) (consp r)) t)))
-  ;; Did %register-gf-fn really push #'%clos-diag-reader?  Check first elem.
-  (deftest 9780 (eql (car *gf-stub-closures*) (function setf-%clos-diag-reader)) t)
-  (deftest 9781 (eql (car (cdr *gf-stub-closures*)) (function %clos-diag-reader)) t)
+  ;; Did %register-gf-fn really push #'%clos-diag-reader?  Use member to
+  ;; check (was checking car/cadr but registry order is fragile to other
+  ;; init-time registrations interleaved before us).
+  (deftest 9780 (notnot (member (function setf-%clos-diag-reader) *gf-stub-closures*)) t)
+  (deftest 9781 (notnot (member (function %clos-diag-reader) *gf-stub-closures*)) t)
   ;; Test: make-array returns an object with subtag #x32
   (let ((a (make-array 5)))
     (deftest 9091 (obj-subtag a) #x32))

@@ -1684,7 +1684,12 @@
             ;; Register the dispatch defun's fn-addr so
             ;; (typep #',gf-name 'generic-function) → T (cl-clos.lisp's
             ;; %generic-function-p consults *gf-stub-closures*).
-            (%register-gf-fn (function ,gf-name))
+            ;; handler-case wrap: when defgeneric is INSIDE a lambda body
+            ;; (eg DG-MC tests inline both defgeneric and the test call),
+            ;; (function ,gf-name) at build time may resolve to 0 because
+            ;; the just-defined defun isn't visible to the function-ref
+            ;; compiler.  Don't take the whole lambda down with us.
+            (handler-case (%register-gf-fn (function ,gf-name)) (t (c) nil))
             ,@method-forms
             ;; ANSI: defgeneric returns the GF object so callers like
             ;; (defparameter *gf* (defgeneric foo (x))) capture it.
@@ -2980,6 +2985,12 @@
 
   ;; Initialize condition type registry
   (%init-condition-types)
+
+  ;; Register the nine standard method combinations (AND/OR/APPEND/LIST/etc.)
+  ;; so %gf-dispatch routes (defgeneric ... (:method-combination append))
+  ;; through %gf-dispatch-custom instead of silently falling through to the
+  ;; standard dispatch.
+  (%init-method-combinations)
 
   ;; Initialize symbol-function table with all built-in compiled functions.
   ;; Also populates *native-sym-function-table* for (funcall 'sym ...).

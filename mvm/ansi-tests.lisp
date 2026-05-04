@@ -1764,6 +1764,11 @@
   (declare (ignore test test-not))
   (cons x y))
 
+;; CLOS diag accessors at top level so the defuns are real top-level fns,
+;; not nested-in-defun ones (which behave differently in MVM compilation).
+(defun %clos-diag-reader (obj) (slot-value obj 'foo))
+(defun setf-%clos-diag-reader (nv obj) (set-slot-value obj 'foo nv))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -1783,6 +1788,38 @@
     (deftest 9754 (eq k :test) t)
     (deftest 9755 (string= (symbol-name k) "TEST") t)
     (deftest 9756 (eq (symbol-package k) (find-package "KEYWORD")) t))
+  ;; CLOS gf-typep probes (2026-05-04): %register-gf-fn + typep should
+  ;; recognise both ordinary symbol fn-names and (setf NAME) forms.
+  ;; Renumbered 9770-4 to dodge ID collisions with deftests 9760-2 elsewhere.
+  ;; %clos-diag-reader and setf-%clos-diag-reader are defined at top level
+  ;; (just above this defun) so they're real top-level fns.
+  (%register-gf-fn (function %clos-diag-reader))
+  (%register-gf-fn (function setf-%clos-diag-reader))
+  (deftest 9770 (typep (function %clos-diag-reader) 'generic-function) t)
+  (deftest 9771 (typep #'(setf %clos-diag-reader) 'generic-function) t)
+  (deftest 9772 (eq (function %clos-diag-reader) (function %clos-diag-reader)) t)
+  (deftest 9773 (eq (function (setf %clos-diag-reader)) (function (setf %clos-diag-reader))) t)
+  (deftest 9774 (eq (function (setf %clos-diag-reader)) (function setf-%clos-diag-reader)) t)
+  ;; Inside-the-box probes
+  (deftest 9775 (consp *gf-stub-closures*) t)
+  (deftest 9776 (notnot (member (function %clos-diag-reader) *gf-stub-closures*)) t)
+  (deftest 9777 (%generic-function-p (function %clos-diag-reader)) t)
+  ;; Use a let-bound value to verify member works as expected
+  (let ((fa (function %clos-diag-reader)))
+    (let ((registry (cons fa nil)))
+      (deftest 9778 (notnot (member fa registry)) t)
+      (deftest 9779 (eql fa (car registry)) t)
+      ;; Direct: walk the list manually
+      (deftest 9782 (let ((cur registry) (found nil))
+                      (loop (when (null cur) (return found))
+                        (when (eql fa (car cur)) (setq found t) (return found))
+                        (setq cur (cdr cur))))
+                    t)
+      ;; What value does member actually return?
+      (deftest 9783 (let ((r (member fa registry))) (consp r)) t)))
+  ;; Did %register-gf-fn really push #'%clos-diag-reader?  Check first elem.
+  (deftest 9780 (eql (car *gf-stub-closures*) (function setf-%clos-diag-reader)) t)
+  (deftest 9781 (eql (car (cdr *gf-stub-closures*)) (function %clos-diag-reader)) t)
   ;; Test: make-array returns an object with subtag #x32
   (let ((a (make-array 5)))
     (deftest 9091 (obj-subtag a) #x32))

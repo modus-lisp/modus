@@ -1262,14 +1262,20 @@
 
 (defun %generic-function-p (x)
   "True if X is a generic function — either the underlying gf-object
-   (4-slot array, %generic-function marker in slot 0) or a gf-stub
-   closure produced by %make-gf-stub (registered in *gf-stub-closures*).
-   The closure case matters for (typep #'gf-name 'generic-function),
-   where #'gf-name resolves via symbol-function to the stub closure."
-  (or (%gf-p x)
-      (and x (not (fixnump x)) (not (consp x)) (not (characterp x))
-           (not (stringp x)) (not (= (obj-subtag x) 80))
-           (member x *gf-stub-closures*))))
+   (4-slot array, %generic-function marker in slot 0) or a registered
+   gf-stub (closure or raw fn-addr in *gf-stub-closures*).
+
+   The member check goes BEFORE any type-shape filtering: raw native
+   function addresses end in even bits (NOP-aligned per CLAUDE.md to
+   dodge funcall-tag collisions), so fixnump returns T on them and an
+   earlier (not (fixnump x)) gate wrongly excluded all #'NAME results.
+   Eq on the registry is safe regardless of type — for fixnum-shaped
+   addresses it's just a value comparison."
+  (cond
+    ((%gf-p x) t)
+    ((null x) nil)
+    ((member x *gf-stub-closures*) t)
+    (t nil)))
 
 (defun %standard-method-p (x)
   "True if X is a standard method.  Method records have shape

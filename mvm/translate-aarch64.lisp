@@ -135,7 +135,9 @@
 ;;; Branch fixups are resolved in a second pass.
 
 (defstruct a64-buffer
-  (code (make-array 524288))                  ; 512K entries, position tracks fill
+  ;; 8M entries × 4 bytes = 32 MB native code.  ANSI-test-sized images
+  ;; need ~30 MB; the previous 512K-entry cap overflowed mid-build.
+  (code (make-array 8388608))
   (labels (make-hash-table :test 'eql))      ; label-id → instruction index
   (fixups nil)                                ; (index label-id type)
   (position 0))                               ; current instruction index
@@ -1228,11 +1230,64 @@
                 ;; TIMER-REARM: re-arm virtual timer (always emit on AArch64)
                 (a64-load-imm64 buf +a64-x0+ 62500)
                 (a64-emit buf #xD51BE300))  ; MSR CNTV_TVAL_EL0, x0
+               ((= code #x0323)
+                ;; UNMASK-IRQS: clear DAIF.{I,F} so IRQ and FIQ both fire.
+                ;; Used by per-test deadline mechanism.  FIQ matters because
+                ;; on QEMU virt the vtimer fires as Group 0 (which the GICv2
+                ;; non-secure CPU interface routes as FIQ, vector entry 6),
+                ;; not as IRQ (vector entry 5).  Unmasking I alone leaves
+                ;; FIQ masked and the vtimer goes silent.
+                ;; MSR DAIFClr, #3 — encoding 0xD50343FF (imm=3 = I+F).
+                (a64-emit buf #xD50343FF))
                ((= code #x0400)
                 ;; switch-idle-stack: set SP to per-CPU idle-stack-top
                 (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
                 (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ #x38)
                 (a64-add-imm buf +a64-sp+ +a64-x16+ 0))
+               ((= code #x0510)
+                ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
+                ;; First call: return NIL (=X26=0) in X0.  On longjmp:
+                ;; execution resumes here with X0 = T (#xDEAD1009).
+                ;; Mirrors x64 #x0510 (translate-x64.lisp:584).  Saved IP
+                ;; is the byte AFTER the trap block — both first-call and
+                ;; longjmp-call land there.  No skip-branch needed.
+                (a64-load-imm64 buf +a64-x16+ #x10000180)
+                (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
+                (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
+                (a64-str-unsigned buf +a64-x29+ +a64-x16+ 8)
+                ;; ADR x17, <after-mov-x0> — placeholder, patched below.
+                (let ((adr-idx (a64-current-index buf)))
+                  (a64-emit buf 0)  ; placeholder for ADR x17
+                  (a64-str-unsigned buf +a64-x17+ +a64-x16+ 16)
+                  (a64-mov-reg buf +a64-x0+ +a64-x26+)         ; first-time return = NIL
+                  ;; AFTER this point execution falls through.  ADR target is here.
+                  (let ((return-idx (a64-current-index buf)))
+                    (let* ((byte-off (* (- return-idx adr-idx) 4))
+                           (immlo (logand byte-off 3))
+                           (immhi (logand (ash byte-off -2) #x7FFFF)))
+                      (setf (aref (a64-buffer-code buf) adr-idx)
+                            (logior (ash immlo 29)
+                                    (ash #b10000 24)
+                                    (ash immhi 5)
+                                    17))))))
+               ((= code #x0511)
+                ;; LONGJMP: Restore SP, FP, IP from 0x10000180.
+                ;; Set X0 = T (#xDEAD1009). BR to saved IP.
+                (a64-load-imm64 buf +a64-x16+ #x10000180)
+                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)  ; saved SP
+                (a64-add-imm buf +a64-sp+ +a64-x17+ 0)
+                (a64-ldr-unsigned buf +a64-x29+ +a64-x16+ 8)  ; FP
+                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 16) ; IP
+                (a64-load-imm64 buf +a64-x0+ #xDEAD1009)      ; T
+                (a64-br buf +a64-x17+))
+               ((= code #x0512)
+                ;; CLEAR-HANDLER: simple version (no per-fork stack on
+                ;; bare-metal AArch64 yet).  Just zero slot 0x10000180
+                ;; so the sync-exception handler (Phase A.2) can detect
+                ;; "no active handler-case".  Preserves X0 (return value
+                ;; of handler-case body).
+                (a64-load-imm64 buf +a64-x16+ #x10000180)
+                (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
                (t
                 ;; Real CPU trap
                 (a64-svc buf code)))))
@@ -1953,10 +2008,14 @@
           ((= op +op-call+)
            (let* ((target-offset (vr 0))
                   (label (gethash target-offset mvm-to-native-label)))
-             (when label
-               (let ((idx (a64-current-index buf)))
-                 (a64-bl buf 0)  ; placeholder
-                 (a64-add-fixup buf idx label :bl)))))
+             (cond
+               (label
+                (let ((idx (a64-current-index buf)))
+                  (a64-bl buf 0)  ; placeholder
+                  (a64-add-fixup buf idx label :bl)))
+               (t
+                (format t "~&  AARCH64 CALL: NO LABEL for target-offset=~D~%"
+                        target-offset)))))
 
           ;; ---- CALL-IND Vs ----
           ((= op +op-call-ind+)
@@ -2231,6 +2290,61 @@
                  (a64-movz buf pd 0 0))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
+
+          ;; ---- SET-NARGS imm8 ----
+          ;; Store the immediate nargs at the fixed convention slot
+          ;; 0x10000150 (matches x64).  Callees with &rest read it via
+          ;; GET-NARGS to know how many args the caller passed.
+          ;; Sequence:
+          ;;   mov w16, #nargs
+          ;;   mov x17, #0x10000150
+          ;;   str w16, [x17]
+          ((= op +op-set-nargs+)
+           (let ((n (vr 0)))
+             (a64-movz buf +a64-x16+ (logand n #xFFFF) 0)
+             (a64-load-imm64 buf +a64-x17+ #x10000150)
+             (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)))  ; size=2 = 32-bit STR
+
+          ;; ---- GET-NARGS Vd ----
+          ;; Load 32-bit from slot 0x10000150 into Vd, tagged as fixnum.
+          ((= op +op-get-nargs+)
+           (let* ((vd (vr 0))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-load-imm64 buf +a64-x17+ #x10000150)
+             (a64-ldr-width buf pd +a64-x17+ 0 2)  ; size=2 = 32-bit LDR (zero-extends)
+             (a64-lsl-imm buf pd pd 1)              ; tag as fixnum (shl 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- ALLOC-STRING Vd Vcount ----
+          ;; Same as alloc-array but with subtag #x31 (string).
+          ;; Vcount is UNTAGGED.  Header = (count << 16) | #x31.
+          ;; Result = alloc_ptr + 10 (object tag #x09 with header offset).
+          ;; Aligned alloc size = floor((count+2)/2) * 16.
+          ((= op +op-alloc-string+)
+           (let* ((vd (vr 0))
+                  (pcount (ensure-src (vr 1) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-lsl-imm buf +a64-x16+ pcount 16)
+             (a64-movk buf +a64-x16+ #x31 0)
+             (a64-stur buf +a64-x16+ +a64-x24+ 0)
+             (a64-add-imm buf +a64-x17+ pcount 2)
+             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 1)
+             (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)
+             (a64-add-imm buf pd +a64-x24+ 10)
+             (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- SET-MV-COUNT imm8 ----
+          ;; Store tagged fixnum count to slot 0x10000090 (MV-COUNT).
+          ;; Tagged value = count<<1 to match compile-values.
+          ((= op +op-set-mv-count+)
+           (let* ((count (vr 0))
+                  (tagged (ash count 1)))
+             (a64-load-imm64 buf +a64-x16+ tagged)
+             (a64-load-imm64 buf +a64-x17+ #x10000090)
+             (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)))
 
           ;; ---- Unknown opcode ----
           (t

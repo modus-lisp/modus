@@ -213,34 +213,165 @@
   ;;   Entry 6 (0x300): Current EL, SP_ELx, FIQ   → B .
   ;;   Entry 7-15: Lower EL vectors               → B .
   (dotimes (entry 16)
-    (if (= entry 5)
-        ;; Entry 5: IRQ handler for Current EL with SP_ELx
-        ;; This is the active IRQ vector when running in EL1 with SP_EL1.
-        ;; Minimal handler: save regs, acknowledge GIC, restore, ERET.
-        (progn
-          ;; STP x0, x1, [SP, #-16]!    (save scratch regs)
-          (mvm-emit-u32 buf #xA9BF07E0)
-          ;; MOVZ x0, #0x0801, LSL #16  (x0 = 0x08010000 = GICC base)
-          (mvm-emit-u32 buf #xD2A10020)
-          ;; LDR w1, [x0, #0x0C]        (w1 = GICC_IAR — acknowledge IRQ)
-          (mvm-emit-u32 buf #xB9400C01)
-          ;; STR w1, [x0, #0x10]        (GICC_EOIR = w1 — end of interrupt)
-          (mvm-emit-u32 buf #xB9001001)
-          ;; Re-arm timer: CNTV_TVAL_EL0 = 62500 (1ms at 62.5MHz)
-          (mvm-emit-u32 buf #xD29E8480)  ; MOVZ x0, #0xF424
-          (mvm-emit-u32 buf #xD51BE300)  ; MSR CNTV_TVAL_EL0, x0
-          ;; LDP x0, x1, [SP], #16      (restore scratch regs)
-          (mvm-emit-u32 buf #xA8C107E0)
-          ;; ERET                        (return from exception)
-          (mvm-emit-u32 buf #xD69F03E0)
-          ;; Fill remaining 24 instructions with NOP
-          (dotimes (i 24)
-            (mvm-emit-u32 buf #xD503201F)))
-        ;; All other entries: B . (infinite loop for debugging)
-        (progn
-          (mvm-emit-u32 buf #x14000000)    ; B . (branch to self)
-          (dotimes (i 31)
-            (mvm-emit-u32 buf #xD503201F))))))
+    (cond
+      ((= entry 4)
+       ;; Entry 4: Sync exception, Current EL with SP_ELx.
+       ;; This is the SIGSEGV-equivalent path on bare-metal AArch64.
+       ;; Mirrors x64 SIGSEGV stub (translate-x64.lisp #x0520):
+       ;; if a handler-case is active (saved SP at 0x10000180 != 0),
+       ;; restore SP/FP/IP from saved slots and ERET back to it,
+       ;; with X0 = T to signal "longjmp-return".  Otherwise fall
+       ;; into B . (debug halt).
+       ;;
+       ;; Capture state to diag slots (mirror x64 layout) FIRST so a
+       ;; later FAIL line can print useful debug info:
+       ;;   0x10000C30 = ELR (faulting PC)
+       ;;   0x10000C40 = FAR (fault addr / "site" on x64)
+       ;;   0x10000C50 = X0 at fault
+       ;;
+       ;; Layout of this entry (need <= 32 instructions = 128 bytes):
+       ;;   1.  MRS x16, ELR_EL1           ; faulting PC
+       ;;   2.  MOVZ x17, #0x0c30          ; addr lo
+       ;;   3.  MOVK x17, #0x1000, lsl #16 ; addr hi
+       ;;   4.  STR x16, [x17]             ; save ELR
+       ;;   5.  MRS x16, FAR_EL1           ; fault addr
+       ;;   6.  STR x16, [x17, #0x10]      ; save FAR (slot C40)
+       ;;   7.  STR x0,  [x17, #0x18]      ; save X0 (slot C48)
+       ;;   8.  MOVZ x16, #0x0180          ; addr lo
+       ;;   9.  MOVK x16, #0x1000, lsl #16 ; addr hi
+       ;;  10.  LDR x17, [x16]             ; saved SP (handler-case state)
+       ;;  11.  CBZ x17, +N                ; if 0, no active handler
+       ;;  12.  ADD sp, x17, #0            ; restore SP (MOV SP)
+       ;;  13.  LDR x29, [x16, #8]         ; restore FP
+       ;;  14.  LDR x17, [x16, #16]        ; saved IP
+       ;;  15.  MSR ELR_EL1, x17           ; ELR = saved IP
+       ;;  16.  MOVZ x0, #0x1009           ; X0 lo = T low
+       ;;  17.  MOVK x0, #0xDEAD, lsl #16  ; X0 = T (#xDEAD1009)
+       ;;  18.  ERET
+       ;;  19.  B .                         (no-handler halt — CBZ target)
+       (mvm-emit-u32 buf #xD5384030)        ; MRS x16, ELR_EL1
+       (mvm-emit-u32 buf #xD2818611)        ; MOVZ x17, #0x0c30
+       (mvm-emit-u32 buf #xF2A20011)        ; MOVK x17, #0x1000, lsl #16
+       (mvm-emit-u32 buf #xF9000230)        ; STR x16, [x17]
+       (mvm-emit-u32 buf #xD5386010)        ; MRS x16, FAR_EL1
+       (mvm-emit-u32 buf #xF9000A30)        ; STR x16, [x17, #0x10]
+       (mvm-emit-u32 buf #xF9000E20)        ; STR x0,  [x17, #0x18]
+       (mvm-emit-u32 buf #xD2803010)        ; MOVZ x16, #0x0180
+       (mvm-emit-u32 buf #xF2A20010)        ; MOVK x16, #0x1000, lsl #16
+       (mvm-emit-u32 buf #xF9400211)        ; LDR x17, [x16]
+       (mvm-emit-u32 buf #xB4000111)        ; CBZ x17, +8 instructions — lands on B .
+       (mvm-emit-u32 buf #x9100023F)        ; ADD sp, x17, #0
+       (mvm-emit-u32 buf #xF940061D)        ; LDR x29, [x16, #8]
+       (mvm-emit-u32 buf #xF9400A11)        ; LDR x17, [x16, #16]
+       (mvm-emit-u32 buf #xD5184031)        ; MSR ELR_EL1, x17
+       (mvm-emit-u32 buf #xD2820120)        ; MOVZ x0, #0x1009
+       (mvm-emit-u32 buf #xF2BBD5A0)        ; MOVK x0, #0xDEAD, lsl #16
+       (mvm-emit-u32 buf #xD69F03E0)        ; ERET
+       (mvm-emit-u32 buf #x14000000)        ; B .  (no handler — halt here)
+       ;; Fill remaining 13 instructions with NOP
+       (dotimes (i 13)
+         (mvm-emit-u32 buf #xD503201F)))
+      ((= entry 5)
+       ;; Entry 5: IRQ handler for Current EL with SP_ELx.
+       ;;
+       ;; Per-test wall-clock deadline.  Slot 0x10000C70 is a tick
+       ;; countdown.  Each timer IRQ decrements it; when it reaches
+       ;; zero AND a handler-case is active (slot 0x10000180 != 0),
+       ;; we longjmp to the handler-case as if a sync exception fired
+       ;; (mirrors entry 4's longjmp path: SP/FP/IP from saved slots,
+       ;; X0 = T, ERET).  This unblocks test runs that hit infinite
+       ;; loops: ANSI tests like (acons) called with too few args
+       ;; previously hung the entire suite.
+       ;;
+       ;; Slot 0x10000180 base + #2800 offset reaches 0x10000C70, so
+       ;; we load the address once (MOVZ + MOVK) and reuse it for
+       ;; both the deadline slot and the handler-case state.
+       ;;
+       ;; Layout (need <= 32 instructions = 128 bytes):
+       ;;   1.  STP x0, x1, [SP, #-16]!     ; save scratch
+       ;;   2.  MOVZ x0, #0x0801, LSL #16   ; GICC base
+       ;;   3.  LDR  w1, [x0, #0x0C]        ; GICC_IAR (acknowledge)
+       ;;   4.  STR  w1, [x0, #0x10]        ; GICC_EOIR (end of int)
+       ;;   5.  MOVZ x0, #0xF424            ; 62500 (1ms @ 62.5MHz)
+       ;;   6.  MSR  CNTV_TVAL_EL0, x0      ; re-arm timer
+       ;;   7.  MOVZ x0, #0x0180            ; addr lo
+       ;;   8.  MOVK x0, #0x1000, LSL #16   ; addr hi → 0x10000180
+       ;;   9.  LDR  x1, [x0, #2800]        ; deadline (slot 0xC70)
+       ;;  10.  CBZ  x1, NORMAL (+13)        ; not armed → return
+       ;;  11.  SUBS x1, x1, #1
+       ;;  12.  STR  x1, [x0, #2800]        ; store decremented
+       ;;  13.  B.NE NORMAL (+10)            ; not yet zero → return
+       ;;  14.  LDR  x1, [x0, #0]            ; saved SP from setjmp
+       ;;  15.  CBZ  x1, NORMAL (+8)         ; no handler-case → return
+       ;;  16.  ADD  SP, x1, #0              ; restore SP
+       ;;  17.  LDR  x29, [x0, #8]           ; restore FP
+       ;;  18.  LDR  x1, [x0, #16]           ; saved IP
+       ;;  19.  MSR  ELR_EL1, x1
+       ;;  20.  MOVZ x0, #0x1009             ; X0 lo
+       ;;  21.  MOVK x0, #0xDEAD, LSL #16    ; X0 = T
+       ;;  22.  ERET                          ; longjmp to handler-case
+       ;;  23.  NORMAL: LDP x0, x1, [SP], #16
+       ;;  24.  ERET
+       (progn
+         (mvm-emit-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
+         (mvm-emit-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
+         (mvm-emit-u32 buf #xB9400C01)  ; LDR w1,[x0,#0x0C]        (GICC_IAR)
+         (mvm-emit-u32 buf #xB9001001)  ; STR w1,[x0,#0x10]        (GICC_EOIR)
+         (mvm-emit-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
+         (mvm-emit-u32 buf #xD51BE300)  ; MSR CNTV_TVAL_EL0,x0     (re-arm)
+         (mvm-emit-u32 buf #xD2803000)  ; MOVZ x0,#0x0180
+         (mvm-emit-u32 buf #xF2A20000)  ; MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
+         (mvm-emit-u32 buf #xF9457801)  ; LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
+         (mvm-emit-u32 buf #xB4000241)  ; CBZ x1,+18 → NORMAL      (not armed)
+         (mvm-emit-u32 buf #xF1000421)  ; SUBS x1,x1,#1
+         (mvm-emit-u32 buf #xF9057801)  ; STR x1,[x0,#2800]
+         (mvm-emit-u32 buf #x540001E1)  ; B.NE +15 → NORMAL        (not yet zero)
+         ;; PROBE: deadline expired this tick → write 'X' to UART
+         (mvm-emit-u32 buf #xF81F0FE0)  ; STR x0,[SP,#-16]!
+         (mvm-emit-u32 buf #xD2A40000)  ; MOVZ x0,#0x2000,LSL #16
+         (mvm-emit-u32 buf #xD2800B01)  ; MOVZ x1,#0x58            ('X')
+         (mvm-emit-u32 buf #xB9000001)  ; STR  w1,[x0]
+         (mvm-emit-u32 buf #xF84107E0)  ; LDR x0,[SP],#16
+         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (saved SP)
+         (mvm-emit-u32 buf #xB4000101)  ; CBZ x1,+8 → NORMAL       (no handler-case)
+         (mvm-emit-u32 buf #x9100003F)  ; ADD SP,x1,#0
+         (mvm-emit-u32 buf #xF940041D)  ; LDR x29,[x0,#8]
+         (mvm-emit-u32 buf #xF9400801)  ; LDR x1,[x0,#16]
+         (mvm-emit-u32 buf #xD5184021)  ; MSR ELR_EL1,x1
+         (mvm-emit-u32 buf #xD2820120)  ; MOVZ x0,#0x1009
+         (mvm-emit-u32 buf #xF2BBD5A0)  ; MOVK x0,#0xDEAD,LSL #16  (X0 = T)
+         (mvm-emit-u32 buf #xD69F03E0)  ; ERET (longjmp)
+         ;; NORMAL:
+         (mvm-emit-u32 buf #xA8C107E0)  ; LDP x0,x1,[SP],#16
+         (mvm-emit-u32 buf #xD69F03E0)  ; ERET (normal return)
+         ;; Fill remaining 3 instructions with NOP
+         (dotimes (i 3)
+           (mvm-emit-u32 buf #xD503201F))))
+      ((= entry 6)
+       ;; DIAGNOSTIC: FIQ probe — write 'f' to UART each tick.  GICv2 on
+       ;; QEMU virt routes Group 0 interrupts as FIQ to non-secure EL1,
+       ;; and the virtual timer is Group 0 by default.  If we see 'f'
+       ;; chars but no '!', the vtimer fires as FIQ not IRQ.
+       (progn
+         (mvm-emit-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
+         (mvm-emit-u32 buf #xD2A40000)  ; MOVZ x0,#0x2000,LSL #16  (UART VA)
+         (mvm-emit-u32 buf #xD2800CC1)  ; MOVZ x1,#0x66            ('f')
+         (mvm-emit-u32 buf #xB9000001)  ; STR  w1,[x0]
+         (mvm-emit-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
+         (mvm-emit-u32 buf #xB9400C01)  ; LDR  w1,[x0,#0x0C]       (GICC_IAR)
+         (mvm-emit-u32 buf #xB9001001)  ; STR  w1,[x0,#0x10]       (GICC_EOIR)
+         (mvm-emit-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
+         (mvm-emit-u32 buf #xD51BE300)  ; MSR  CNTV_TVAL_EL0,x0    (re-arm)
+         (mvm-emit-u32 buf #xA8C107E0)  ; LDP  x0,x1,[SP],#16
+         (mvm-emit-u32 buf #xD69F03E0)  ; ERET
+         (dotimes (i 21)
+           (mvm-emit-u32 buf #xD503201F))))
+      (t
+       ;; All other entries: B . (infinite loop for debugging)
+       (progn
+         (mvm-emit-u32 buf #x14000000)    ; B . (branch to self)
+         (dotimes (i 31)
+           (mvm-emit-u32 buf #xD503201F)))))))
 
 ;;; ============================================================
 ;;; AArch64 PL011 UART
@@ -526,6 +657,38 @@
     (emit-aarch64-load-imm64 buf x1 #x09000705)
     (emit-aarch64-str-x buf x1 x0 0)
 
+    ;; 7d. Restore L2[128] = DRAM scratch for runtime metadata (was
+    ;;     overwritten by PCI loop above).  VA 0x10000000-0x10200000
+    ;;     → PA 0x50000000-0x50200000 (DRAM, normal cacheable).
+    ;;     The runtime hardcodes its BSS-equivalent slots at
+    ;;     0x10000040+ (GC), 0x10000080+ (globals), 0x10000148 (kw),
+    ;;     0x10000180+ (handler-case), 0x10000C30+ (SIGSEGV diag).
+    ;;     Without this remap those addresses land in PCI device
+    ;;     memory and writes to them hang.  Matches the comment at
+    ;;     ;;;   VA 0x10000000 → PA 0x50000000 (alloc region, in DRAM)
+    ;;     above — Phase A.1 ANSI port discovered this.
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 128 8)))
+    (emit-aarch64-load-imm64 buf x1 #x50000701)
+    (emit-aarch64-str-x buf x1 x0 0)
+
+    ;; 7e. Override L2[64] = GIC identity map, VA 0x08000000-0x081FFFFF
+    ;;     → PA 0x08000000-0x081FFFFF (device memory).  Required for the
+    ;;     AArch64 ANSI build's per-test deadline IRQ: setup-irq writes
+    ;;     to GICD/GICC at "address 0x08000000" / "0x08010000" which
+    ;;     the fixpoint MMU's L2[64] otherwise routes to PA 0x48000000
+    ;;     (image-buffer DRAM in the cross-compile pipeline, but
+    ;;     unused on the ANSI build).  Without this override the GIC
+    ;;     enable writes silently land in DRAM and the timer IRQ never
+    ;;     fires — Boulder #30 root cause.
+    ;;
+    ;; Cost: VA 0x08000000-0x081FFFFF is no longer DRAM.  Fixpoint
+    ;; runtime's image-buffer at this VA stops working.  Acceptable
+    ;; for the ANSI build (no runtime image-buffer use); other builds
+    ;; that depend on this VA→DRAM mapping must skip this fixup.
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 64 8)))
+    (emit-aarch64-load-imm64 buf x1 #x08000705)
+    (emit-aarch64-str-x buf x1 x0 0)
+
     ;; ================================================================
     ;; Phase C: Configure system registers and enable MMU
     ;; ================================================================
@@ -601,8 +764,16 @@
     (emit-aarch64-load-imm64 buf x16 +tdk-percpu-va+)
     (emit-aarch64-u32 buf #xD518D090)            ; MSR TPIDR_EL1, X16
 
-    ;; 19. Set VBAR_EL1 for exception vectors at VA 0x800
-    (emit-aarch64-movz buf x16 #x0800 0)         ; x16 = VA 0x800
+    ;; 19. Set VBAR_EL1 for exception vectors.  QEMU virt's `-kernel`
+    ;; loads our binary at PA 0x40080000 (Linux Image convention).
+    ;; With offset MMU (VA = PA - 0x40000000), the binary's exception
+    ;; vectors at file offset 0x800 land at VA 0x80800, NOT 0x800.
+    ;; Setting VBAR=0x800 caused sync exceptions to vector to PA 0x40000A00
+    ;; (before our binary, unloaded memory) — undefined-instruction loop.
+    ;; Compute the right VA: load 0x80800 via MOVZ + MOVK (0x80800 doesn't
+    ;; fit in a single MOVZ).
+    (emit-aarch64-movz buf x16 #x0800 0)         ; x16 = 0x0800
+    (emit-aarch64-movk buf x16 #x0008 16)        ; x16 |= 0x80000 (bits 31:16)
     (emit-aarch64-u32 buf #xD518C010)            ; MSR VBAR_EL1, X16
     (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
 

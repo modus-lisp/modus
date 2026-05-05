@@ -197,6 +197,14 @@
    So you can resolve any RIP without parsing the ELF.  Independent of
    the .symtab in the ELF — that one sits alongside.")
 
+(defparameter *compile-bloat-report* nil
+  "When non-nil, mvm-compile-all dumps a per-function bloat report at
+   the end of phase 3: top-N functions ranked by bytecode-length, with
+   IR-op histogram for each.  The histogram identifies bloat sources —
+   e.g. heavy :obj-set + :li counts indicate per-element literal-fill
+   cost (string/cons/vector quote in compile-quote).  Set to an integer
+   to control top-N (default 30 when t).  Output goes to stdout.")
+
 (defvar *pending-flet-ir* nil
   "Collects (info . ir) pairs from flet/labels function compilations.
    These are drained by mvm-compile-all into all-ir after each top-level form.")
@@ -2563,12 +2571,17 @@
          (emit-ir :li temp (ash lo +fixnum-shift+))
          (emit-ir :obj-set dest 1 temp)
          (free-temp-reg))))
-    ;; String: allocate array with string subtag, fill with char codes
+    ;; String: allocate array with string subtag, fill with char codes.
+    ;; Pool routing (push to *constant-table* + emit :li-const) was wired
+    ;; end-to-end and proven mechanically correct, but introduces SEMANTIC
+    ;; regressions in CLOS / objects tests (tests in objects/ chapter raise
+    ;; simple-error from inside their let* — root cause traced as far as
+    ;; "find-class for known class returns NIL or allocate-instance fails"
+    ;; but the actual mechanism still unknown).  Reverted; see
+    ;; reference_constant_pool.md.
     ((stringp value)
      (let ((n (length value)))
-       ;; Allocate n-element array with string subtag (#x10)
        (emit-ir :alloc-obj dest n +subtag-string+)
-       ;; Fill with character codes
        (let ((temp (alloc-temp-reg)))
          (dotimes (i n)
            (emit-ir :li temp (ash (char-code (char value i)) +fixnum-shift+))
@@ -8026,8 +8039,10 @@
           (:li
            (mvm-li buf (second insn) (third insn)))
           (:li-const
-           ;; Load constant by index (placeholder, resolved during linking)
-           (mvm-li buf (second insn) (third insn)))
+           ;; Load tagged address of constant-pool[idx].  The translator
+           ;; emits a placeholder absolute load; image-assembly patches it
+           ;; with the real pool slot address once layout is known.
+           (mvm-li-const buf (second insn) (third insn)))
           (:li-func
            ;; Load function address (resolved during translation to native)
            ;; Use FN-ADDR opcode so the translator can map bytecode offset
@@ -8669,6 +8684,14 @@
             (format t "    ... and ~D more~%" (- (length names) 200)))
           (force-output)))
 
+      ;; Bloat report: rank functions by bytecode-length, dump IR-op
+      ;; histograms for the top-N.  Identifies layout-fragility sources.
+      (when *compile-bloat-report*
+        (dump-bloat-report all-ir
+                           (if (integerp *compile-bloat-report*)
+                               *compile-bloat-report*
+                               30)))
+
       ;; Build module
       (make-compiled-module
        :bytecode (mvm-buffer-used-bytes buf)
@@ -8678,6 +8701,63 @@
 ;;; ============================================================
 ;;; Disassembly / Debug Support
 ;;; ============================================================
+
+(defun dump-bloat-report (all-ir top-n)
+  "Print a bloat report for ALL-IR (list of (info . ir) pairs).
+   Ranks functions by bytecode-length, prints top-N with their IR-op
+   histograms.  Designed to identify layout-fragility sources: high
+   :obj-set + :li counts mean per-element literal-fill bloat.
+   Also prints a global IR-op histogram so absolute fattest opcodes
+   across the entire image are visible."
+  (let* ((entries (mapcar (lambda (e)
+                            (let* ((info (car e))
+                                   (ir (cdr e))
+                                   (size (function-info-bytecode-length info))
+                                   (counts (make-hash-table :test 'eq)))
+                              (dolist (insn ir)
+                                (let ((op (car insn)))
+                                  (incf (gethash op counts 0))))
+                              (list info ir size counts)))
+                          all-ir))
+         (sorted (sort (copy-list entries) #'> :key #'third))
+         (total-bytes (reduce #'+ entries :key #'third))
+         (global-counts (make-hash-table :test 'eq)))
+    (format t "~%=== BLOAT REPORT ===~%")
+    (format t "Functions: ~D    Total bytecode: ~D bytes~%~%"
+            (length entries) total-bytes)
+    ;; Top-N table
+    (format t "Top ~D by bytecode-length:~%" top-n)
+    (format t "  ~6@A  ~6@A   ~A~%" "BYTES" "%TOT" "FUNCTION (top IR ops)")
+    (dolist (entry (subseq sorted 0 (min top-n (length sorted))))
+      (let* ((info (first entry))
+             (counts (fourth entry))
+             (size (third entry))
+             (pct (if (zerop total-bytes) 0
+                      (/ (* size 100.0) total-bytes)))
+             ;; Top 4 IR ops by count for this function
+             (op-list nil))
+        (maphash (lambda (k v) (push (cons v k) op-list)) counts)
+        (setf op-list (sort op-list #'> :key #'car))
+        (format t "  ~6D  ~5,1F%   ~A   {"
+                size pct (function-info-name info))
+        (loop for cell in (subseq op-list 0 (min 5 (length op-list)))
+              for i from 0
+              do (when (> i 0) (format t " "))
+                 (format t "~A:~D" (cdr cell) (car cell)))
+        (format t "}~%")))
+    ;; Aggregate global histogram
+    (dolist (entry entries)
+      (maphash (lambda (k v)
+                 (incf (gethash k global-counts 0) v))
+               (fourth entry)))
+    (let (op-list)
+      (maphash (lambda (k v) (push (cons v k) op-list)) global-counts)
+      (setf op-list (sort op-list #'> :key #'car))
+      (format t "~%Global IR-op histogram (top 25):~%")
+      (loop for cell in (subseq op-list 0 (min 25 (length op-list)))
+            do (format t "  ~8D  ~A~%" (car cell) (cdr cell))))
+    (format t "=== END BLOAT REPORT ===~%~%")
+    (force-output)))
 
 (defun disassemble-module (module)
   "Print a human-readable disassembly of a compiled MVM module"

@@ -324,11 +324,18 @@
     (mvm-emit-byte buf #xAD) (mvm-emit-byte buf #xDE)
     (mvm-emit-u32 buf 0)              ; high 32 bits
 
-    ;; R12 = allocation pointer (heap starts at 256MB)
-    ;; mov r12, 0x10000000
+    ;; R12 = allocation pointer.  Heap region is 0x10000000+ but the
+    ;; first 4KB (0x10000000-0x10000FFF) is reserved for runtime metadata
+    ;; (GC slots, global-alist head, symbol intern table, keyword intern
+    ;; table, handler-case state, SIGSEGV diag slots, etc. — see CLAUDE.md
+    ;; "Linux x64 Memory Layout").  On Linux those are part of the ELF
+    ;; BSS segment and the mmap'd heap lives elsewhere; on bare-metal the
+    ;; same address space is shared, so we start the alloc pointer past
+    ;; the metadata reservation.  Anything below 0x10001000 is metadata.
+    ;; mov r12, 0x10001000
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBC)          ; mov r12, imm64
-    (mvm-emit-u32 buf #x10000000)
+    (mvm-emit-u32 buf #x10001000)
     (mvm-emit-u32 buf 0)
 
     ;; R14 = allocation limit (heap ends at 480MB)

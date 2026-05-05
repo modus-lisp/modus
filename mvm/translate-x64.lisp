@@ -29,6 +29,14 @@
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
    port I/O, PIC/PIT setup, etc.")
 
+(defvar *x64-li-const-patches* nil
+  "List of (native-byte-offset . pool-index) pairs collected during
+   translation.  Each entry says: at NATIVE-BYTE-OFFSET in the native
+   code buffer, an 8-byte placeholder immediate needs to be patched
+   with the tagged address of constant-pool[POOL-INDEX].
+   Bound freshly to nil at the start of TRANSLATE-MVM-TO-X64; read
+   by ASSEMBLE-KERNEL-IMAGE after translation completes.")
+
 ;;; ============================================================
 ;;; Physical Register Mapping
 ;;; ============================================================
@@ -882,6 +890,27 @@
            (let ((d (dest-phys-or-scratch vd)))
              (emit-mov-reg-imm buf d imm)
              (maybe-store-scratch buf vd))))
+
+        ((op= +op-li-const+)
+         ;; (li-const Vd idx)
+         ;; Emit a MOVABS reg, 0 placeholder.  The 8-byte immediate
+         ;; will be patched with the tagged pool address at image-
+         ;; assembly time.  emit-mov-reg-imm in 64-bit mode emits:
+         ;;   REX.W (1B) | B8+r (1B) | imm64 (8B) = 10 bytes.
+         ;; The immediate sits at start+2.
+         (let* ((vd (first operands))
+                (idx (second operands))
+                (d (dest-phys-or-scratch vd))
+                (start-pos (code-buffer-position buf)))
+           (emit-mov-reg-imm buf d 0)
+           ;; Sanity: 10-byte movabs.  If this changes (e.g. due to
+           ;; small-immediate optimisation in emit-mov-reg-imm), the
+           ;; patch offset below would be wrong.
+           (let ((emitted (- (code-buffer-position buf) start-pos)))
+             (unless (= emitted 10)
+               (error "li-const: expected 10-byte movabs, got ~D" emitted)))
+           (push (cons (+ start-pos 2) idx) *x64-li-const-patches*)
+           (maybe-store-scratch buf vd)))
 
         ((op= +op-push+)
          ;; (push Vs)
@@ -3360,7 +3389,14 @@
    BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.
    FUNCTION-TABLE is a list of (name offset length) entries describing
    the functions within the bytecode.
-   Returns a code-buffer with the native code."
+   Returns a code-buffer with the native code.
+
+   Side effect: populates *x64-li-const-patches* with a list of
+   (native-byte-offset . pool-index) pairs that the image-assembly
+   stage uses to patch placeholder MOVABS immediates with real
+   tagged constant-pool addresses."
+  ;; Reset the patch list for this translation.
+  (setf *x64-li-const-patches* nil)
   (let* ((buf (make-code-buffer))
          (n-functions (length function-table))
          ;; Create native labels for each function

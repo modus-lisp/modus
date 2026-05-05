@@ -30,7 +30,7 @@
    #:+vreg-vsp+ #:+vreg-vfp+ #:+vreg-vpc+
    ;; Opcodes
    #:+op-nop+ #:+op-break+
-   #:+op-mov+ #:+op-li+ #:+op-push+ #:+op-pop+
+   #:+op-mov+ #:+op-li+ #:+op-li-const+ #:+op-push+ #:+op-pop+
    #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-div+ #:+op-mod+
    #:+op-neg+ #:+op-inc+ #:+op-dec+
    #:+op-and+ #:+op-or+ #:+op-xor+
@@ -72,7 +72,7 @@
    #:mvm-emit-label #:mvm-emit-branch-to-label #:mvm-fixup-labels
    ;; Instruction constructors
    #:mvm-nop #:mvm-break
-   #:mvm-mov #:mvm-li #:mvm-push #:mvm-pop
+   #:mvm-mov #:mvm-li #:mvm-li-const #:mvm-push #:mvm-pop
    #:mvm-add #:mvm-sub #:mvm-mul #:mvm-div #:mvm-mod
    #:mvm-neg #:mvm-inc #:mvm-dec
    #:mvm-and #:mvm-or #:mvm-xor
@@ -232,6 +232,12 @@
 (defconstant +op-li+     #x11)  ; (li Vd imm64) - reg + 64-bit immediate
 (defconstant +op-push+   #x12)  ; (push Vs) - 1 reg operand
 (defconstant +op-pop+    #x13)  ; (pop Vd) - 1 reg operand
+(defconstant +op-li-const+ #x14) ; (li-const Vd idx:imm64) - load tagged address
+                                 ; of constant-pool entry [idx]; resolved at
+                                 ; image-assembly time once pool address known.
+                                 ; Wire-compatible with LI in encoded size (10 B),
+                                 ; differs only in semantics: translator emits a
+                                 ; placeholder absolute load and records a patch.
 
 ;; Arithmetic (tagged fixnum fast path)
 (defconstant +op-add+    #x20)  ; (add Vd Va Vb) - 3 reg
@@ -378,6 +384,7 @@
 (defopcode :li     #x11 (:reg :imm64)         "Load 64-bit immediate (tagged)")
 (defopcode :push   #x12 (:reg)                "Push register to stack")
 (defopcode :pop    #x13 (:reg)                "Pop from stack to register")
+(defopcode :li-const #x14 (:reg :imm64)       "Load tagged addr of constant-pool[idx]")
 
 ;; Arithmetic
 (defopcode :add    #x20 (:reg :reg :reg)      "Add tagged fixnums")
@@ -689,6 +696,14 @@
 
 (defun mvm-li (buf vd imm64)
   (encode-instruction buf +op-li+ vd imm64))
+
+(defun mvm-li-const (buf vd idx)
+  "Emit a li-const instruction (load tagged addr of constant-pool[idx]).
+   Wire-format mirrors LI: 1 opcode + 1 reg + 8-byte immediate.  The
+   immediate is the constant-pool index; the translator emits a
+   placeholder absolute-address load and records a fixup that the
+   image-assembly stage patches with the real tagged pool address."
+  (encode-instruction buf +op-li-const+ vd idx))
 
 (defun mvm-push (buf vs)
   (encode-instruction buf +op-push+ vs))

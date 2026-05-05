@@ -51,6 +51,9 @@
   native-image-offset ; byte offset of native-code start within raw image bytes
                       ; (i.e. (length boot-code) + jmp-size).  Used by ELF wrappers
                       ; to compute correct virtual addresses for the symbol table.
+  constant-pool-offset ; byte offset of constant-pool start within raw image
+                       ; bytes, after the 16-byte-virtual-address alignment pad.
+                       ; Used by apply-li-const-patches to compute pool vaddr.
   metadata)         ; plist of image metadata
 
 ;;; ============================================================
@@ -205,75 +208,62 @@
 
 (defun build-constant-pool (module target)
   "Build the constant pool for the image.
-   Serializes constants according to target endianness and word size."
-  (let ((buf (make-mvm-buffer))
-        (word-size (target-word-size target)))
-    (dolist (constant (mvm-module-constant-table module))
-      (typecase constant
-        (integer
-         (if (= word-size 8)
-             (mvm-emit-u64 buf (ash constant 1))  ; tagged fixnum
-             (mvm-emit-u32 buf (ash constant 1))))
-        (float
-         ;; Store IEEE 754 bits
-         (if (= word-size 8)
-             (mvm-emit-u64 buf (modus.mvm::ieee-float-bits (float constant 1.0d0)))
-             (mvm-emit-u32 buf 0)))
-        (ratio
-         ;; Convert to float, store IEEE bits
-         (if (= word-size 8)
-             (mvm-emit-u64 buf (modus.mvm::ieee-float-bits (float constant 1.0d0)))
-             (mvm-emit-u32 buf 0)))
-        (vector
-         ;; Vectors in constant pool — store as 0 (not supported)
-         (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
-             (mvm-emit-u32 buf 0)))
-        (cons
-         ;; Cons in constant pool — store as 0 (not supported)
-         (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
-             (mvm-emit-u32 buf 0)))
-        (symbol
-         ;; Symbol in constant pool — store as 0
-         (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
-             (mvm-emit-u32 buf 0)))
-        (complex
-         ;; Complex not supported — store as 0
-         (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
-             (mvm-emit-u32 buf 0)))
-        (character
-         ;; Character — store char code as tagged fixnum
-         (if (= word-size 8)
-             (mvm-emit-u64 buf (ash (char-code constant) 1))
-             (mvm-emit-u32 buf (ash (char-code constant) 1))))
-        (string
-         ;; String object: [header:word | chars...]
-         ;; NOTE: constant pool strings are NOT fully functional.
-         ;; LI-CONST loads a table index, not an object address.
-         ;; Use write-string-codes with cons lists instead.
-         (let ((header (logior #x10 (ash (length constant) 16))))
-           (if (= word-size 8)
-               (mvm-emit-u64 buf header)
-               (mvm-emit-u32 buf header)))
-         (loop for c across constant
-               do (mvm-emit-byte buf (char-code c)))
-         ;; Align to word boundary
-         (loop while (/= 0 (mod (mvm-buffer-position buf) word-size))
-               do (mvm-emit-byte buf 0)))
-        (null
-         ;; NIL placeholder
-         (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
-             (mvm-emit-u32 buf 0)))
-        (t
-         ;; Unknown type — store as 0
-         (if (= word-size 8)
-             (mvm-emit-u64 buf 0)
-             (mvm-emit-u32 buf 0)))))
-    (mvm-buffer-used-bytes buf)))
+   Lays out compound constants (currently: strings) as full heap objects
+   so that LI-CONST can load tagged pointers into them directly.
+   Returns (values pool-bytes addr-table) where ADDR-TABLE is a vector
+   indexed by constant-pool index, holding a POOL-RELATIVE tagged offset
+   (with object/cons tag already OR'd in).  Image-assembly adds the pool's
+   image-relative base to each entry to compute the final tagged address
+   used when patching LI-CONST instructions in native code.
+
+   Currently only STRING constants are laid out as real heap objects;
+   other compound types keep falling through compile-quote's inline
+   emit path and never reach the constant table.  Primitives also do
+   not reach here — compile-quote handles them directly.  Any constant
+   that does land here without a heap-object layout gets a single zero
+   word and addr-table[idx] = 0 (LI-CONST will load tag-0, which the
+   patch step leaves unmodified — caller code must not rely on it)."
+  (let* ((buf (make-mvm-buffer))
+         (word-size (target-word-size target))
+         (constants (mvm-module-constant-table module))
+         (n (length constants))
+         (addr-table (make-array n :initial-element 0)))
+    (loop for constant in constants
+          for idx from 0
+          do (typecase constant
+               (string
+                ;; Each heap object is 16-byte aligned at its header.
+                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                      do (mvm-emit-byte buf 0))
+                (let ((obj-offset (mvm-buffer-position buf))
+                      (len (length constant)))
+                  (cond
+                    ((= word-size 8)
+                     ;; 64-bit layout: header (8B) | padding (8B) | N tagged char slots (8B each)
+                     ;; Header: (count << 8) | subtag-string (#x31).
+                     ;; Matches alloc-obj's runtime header format and the
+                     ;; (count + 2) * 8 align-16 alloc-size convention.
+                     (mvm-emit-u64 buf (logior #x31 (ash len 8)))
+                     (mvm-emit-u64 buf 0)
+                     (loop for c across constant
+                           do (mvm-emit-u64 buf (ash (char-code c) 1)))
+                     (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                           do (mvm-emit-byte buf 0))
+                     ;; Tagged offset: object tag (#x09) on the header address.
+                     (setf (aref addr-table idx) (logior obj-offset #x09)))
+                    (t
+                     ;; 32-bit: not yet supported; leave addr=0 and emit 0 word.
+                     (mvm-emit-u32 buf 0)))))
+               (t
+                ;; Non-string constants in the table are unexpected for now —
+                ;; primitives are inlined by compile-quote, and other
+                ;; compound types haven't been routed through yet.  Emit a
+                ;; single zero so subsequent layout doesn't drift if such an
+                ;; entry creeps in; addr-table[idx] stays 0.
+                (if (= word-size 8)
+                    (mvm-emit-u64 buf 0)
+                    (mvm-emit-u32 buf 0)))))
+    (values (mvm-buffer-used-bytes buf) addr-table)))
 
 (defun build-nfn-table (module target)
   "Build the NFN (Name-to-Function-Number) table.
@@ -461,19 +451,81 @@
 ;;; Image Assembly
 ;;; ============================================================
 
+(defun wrap-header-size-for-boot (boot-descriptor)
+  "Return the byte size of any wrapper headers prepended to raw-bytes
+   when wrapping the image for the given boot descriptor.  This is
+   added to load-addr to compute virtual addresses for raw-bytes
+   content (boot code, native code, constant pool, etc.).
+   Returns 0 for un-wrapped (bare-metal) builds."
+  (cond
+    ((null boot-descriptor) 0)
+    ;; Linux x64 ELF64: ELF header (64) + 1 program header (56) = 120
+    ((eq (getf boot-descriptor :elf-format) :linux-x64) 120)
+    ;; UEFI PE wrap: complex, no LI-CONST support yet
+    ((getf boot-descriptor :uefi) 0)
+    ;; Generic ELF32-be / ELF64-be wraps
+    ((and (getf boot-descriptor :elf-machine)
+          (= (getf boot-descriptor :elf-class 32) 32))
+     (+ 52 32))    ; ELF32 ehdr (52) + 1 phdr (32)
+    ((and (getf boot-descriptor :elf-machine)
+          (= (getf boot-descriptor :elf-class 32) 64))
+     (+ 64 56))    ; ELF64 ehdr (64) + 1 phdr (56)
+    (t 0)))
+
+(defun apply-li-const-patches (raw-bytes image module boot-descriptor
+                                pool-addr-table native-code)
+  "Walk the architecture-specific LI-CONST patch list and write tagged
+   constant-pool addresses into the placeholder MOVABS immediates that
+   the translator emitted.  The patches were collected during translation
+   (one per LI-CONST instruction, holding the native-byte-offset of the
+   8-byte immediate field and the pool index it should resolve to).
+   We compute the absolute virtual address of each pool slot from the
+   final image layout and write it as little-endian into raw-bytes."
+  (declare (ignore module))
+  (let* ((arch (and boot-descriptor (getf boot-descriptor :arch)))
+         (patches (case arch
+                    ((:x86-64 :linux-x64)
+                     (and (boundp 'modus.mvm.x64::*x64-li-const-patches*)
+                          (symbol-value 'modus.mvm.x64::*x64-li-const-patches*)))
+                    (t nil))))
+    (when patches
+      (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
+             (native-code-length (length native-code))
+             ;; The pool may have been padded for 16-byte VADDR alignment;
+             ;; use the recorded offset if present.
+             (pool-offset-in-raw (or (kernel-image-constant-pool-offset image)
+                                     (+ native-image-offset native-code-length)))
+             (load-addr (or (getf boot-descriptor :load-addr) 0))
+             (wrap-header (wrap-header-size-for-boot boot-descriptor))
+             (pool-vaddr (+ load-addr wrap-header pool-offset-in-raw)))
+        (dolist (patch patches)
+          (let* ((native-pos (car patch))
+                 (idx (cdr patch))
+                 (file-pos (+ native-image-offset native-pos))
+                 (offset (if (and pool-addr-table
+                                  (< idx (length pool-addr-table)))
+                             (aref pool-addr-table idx)
+                             0))
+                 (tagged-addr (if (zerop offset) 0 (+ pool-vaddr offset))))
+            ;; Little-endian 8-byte write at raw-bytes[file-pos..file-pos+8].
+            (dotimes (i 8)
+              (setf (aref raw-bytes (+ file-pos i))
+                    (logand (ash tagged-addr (* i -8)) #xFF)))))))))
+
 (defun assemble-kernel-image (module target &key boot-descriptor)
   "Assemble a complete bootable kernel image for TARGET."
-  (let* ((native-code (translate-module-to-native module target))
-         (constant-pool (build-constant-pool module target))
-         (nfn-table (build-nfn-table module target))
-         (source-blob (embed-source-blob
-                       (mvm-module-source-text module) target))
-         (image (make-kernel-image
-                 :target target
-                 :native-code native-code
-                 :constant-data constant-pool
-                 :source-blob source-blob
-                 :symbol-table nfn-table)))
+  (let* ((native-code (translate-module-to-native module target)))
+    (multiple-value-bind (constant-pool pool-addr-table)
+        (build-constant-pool module target)
+      (let* ((nfn-table (build-nfn-table module target))
+             (source-blob (embed-source-blob
+                           (mvm-module-source-text module) target))
+             (image (make-kernel-image
+                     :target target
+                     :native-code native-code
+                     :constant-data constant-pool
+                     :source-blob source-blob
+                     :symbol-table nfn-table)))
     ;; Emit boot code (architecture-specific)
     (when boot-descriptor
       (let ((boot-buf (make-mvm-buffer)))
@@ -577,6 +629,20 @@
                 ;; Reset for next build (they're SBCL-side dynamic state).
                 (setf modus.mvm.x64::*x64-code-base-patch-offset* nil)
                 (setf modus.mvm.x64::*x64-code-end-patch-offset*  nil))))))
+      ;; Pad to 16-byte alignment of the constant pool's VIRTUAL ADDRESS,
+      ;; not just the buffer position.  Pool entries are heap-format objects
+      ;; whose tagged addresses must be 16-byte-aligned for OBJ-REF/OBJ-SET
+      ;; (offset = idx*8 + 7 with object tag #x09 expects header at addr&-16).
+      (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))
+             (wrap-header (wrap-header-size-for-boot boot-descriptor))
+             (cur-pos (mvm-buffer-position final-buf))
+             (cur-vaddr (+ load-addr wrap-header cur-pos))
+             (pad (mod (- cur-vaddr) 16)))
+        (dotimes (i pad) (mvm-emit-byte final-buf 0))
+        ;; Record where the pool actually starts so the patcher uses
+        ;; the right offset.
+        (setf (kernel-image-constant-pool-offset image)
+              (mvm-buffer-position final-buf)))
       ;; Constant pool
       (loop for b across constant-pool
             do (mvm-emit-byte final-buf b))
@@ -599,6 +665,14 @@
             (mvm-emit-u32 final-buf (- (mvm-buffer-position final-buf)
                                         (length source-blob) 4))))
       (let ((raw-bytes (mvm-buffer-used-bytes final-buf)))
+        ;; LI-CONST patches: walk the per-arch patch list and write
+        ;; tagged constant-pool addresses into the placeholder MOVABS
+        ;; immediates that the translator emitted.  The translator's
+        ;; patch list holds (native-byte-offset . pool-index) pairs;
+        ;; we add native-image-offset to land in raw-bytes, and compute
+        ;; tagged-addr from pool-vaddr + addr-table[idx].
+        (apply-li-const-patches raw-bytes image module boot-descriptor
+                                pool-addr-table native-code)
         ;; UEFI: patch stub with kernel data offset/size, then wrap in PE32+
         (when (and boot-descriptor (getf boot-descriptor :uefi))
           (patch-uefi-stub raw-bytes
@@ -637,7 +711,7 @@
                     (mvm-module-function-table module)
                     image
                     boot-descriptor))
-    image))
+    image))))
 
 (defun write-symmap (path function-table image boot-descriptor)
   "Write a tab-separated symbol map to PATH.

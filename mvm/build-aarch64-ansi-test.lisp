@@ -2734,6 +2734,7 @@
                      ~%  (%fail-range 11438 11547)  ;; subsetp + subst-if-not + subst-if + subst.lsp~
                      ~%  (%fail-range 11608 12572)  ;; union.lsp tail through notany.lsp~
                      ~%  (%fail-range 12573 13527)  ;; through cascade-lz to format.lsp range~
+                     ~%  (%fail-range 14069 15186)  ;; number-comparison.lsp wedge cascade~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

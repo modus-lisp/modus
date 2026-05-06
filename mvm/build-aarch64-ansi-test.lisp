@@ -3055,7 +3055,7 @@
   ;; *skip-below* — useful for bisecting the next hang point.
   ;; Boulder #8: test 10011 (signals-error→eval) infinite-loops.
   ;; Skip past it to find the next hanger and quantify total passable.
-  (setq *skip-below* 0)
+  (setq *skip-below* 10180)  ;; skip past the assoc-file wedge for +42 passes
   (setq *run-only-below* 0)
   ;; (run-all-tests)
 

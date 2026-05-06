@@ -1303,10 +1303,26 @@
                 (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 16)
                 (a64-str-unsigned buf +a64-x18+ +a64-x17+ 16))
                ((= code #x0514)
-                ;; CLEAR-OUTER: zero slot 0x100001A0 so the IRQ handler
+                ;; CLEAR-OUTER: zero slot 0x100001C0 so the IRQ handler
                 ;; falls through to "no handler".
                 (a64-load-imm64 buf +a64-x16+ #x100001C0)
                 (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
+               ((= code #x0515)
+                ;; RESTORE-OUTER: copy slot 0x100001C0/1C8/1D0 → 0x10000180/188/190.
+                ;; Re-establishes the fork-file outer handler-case as
+                ;; slot 180's value, so a subsequent SETJMP overwriting
+                ;; slot 180 doesn't lose the outer.  Counterpart to
+                ;; SAVE-OUTER (#x0513).  Use case: between per-test
+                ;; handler-cases inside fork-file's thunk, where the
+                ;; previous test's CLEAR-HANDLER zeroed slot 180.
+                (a64-load-imm64 buf +a64-x16+ #x100001C0)
+                (a64-load-imm64 buf +a64-x17+ #x10000180)
+                (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 0)
+                (a64-str-unsigned buf +a64-x18+ +a64-x17+ 0)
+                (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 8)
+                (a64-str-unsigned buf +a64-x18+ +a64-x17+ 8)
+                (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 16)
+                (a64-str-unsigned buf +a64-x18+ +a64-x17+ 16))
                (t
                 ;; Real CPU trap
                 (a64-svc buf code)))))

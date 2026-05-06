@@ -2224,9 +2224,10 @@
       ((= op-name 1009685354534069733) (compile-setup-nic-idt dest))
       ((= op-name 739607750214719398)  (compile-nic-irq-unmask dest))
 
-      ;; --- Outer-handler save/clear (AArch64 fork-file fallback) ---
+      ;; --- Outer-handler save/clear/restore (AArch64 fork-file fallback) ---
       ((= op-name 290749171156322546)  (compile-save-outer-handler dest))
       ((= op-name 1092167958334654506) (compile-clear-outer-handler dest))
+      ((= op-name 987952812817568243)  (compile-restore-outer-handler dest))
 
       ;; --- MMIO (raw 32-bit address at 0x600140, result at 0x600148) ---
       ((= op-name 372079205816461105)  (compile-mmio-do-read32 dest))
@@ -6910,6 +6911,15 @@
    IRQ handler stops falling back to the fork-file frame.  Pair
    with %save-outer-handler.  Returns 0."
   (emit-ir :trap #x0514)
+  (emit-ir :li dest 0))
+
+(defun compile-restore-outer-handler (dest)
+  "Compile (%restore-outer-handler) — copy slot 0x100001C0 to slot
+   0x10000180, re-establishing the fork-file outer handler-case as
+   the active SETJMP frame.  Used between per-test handler-cases to
+   prevent slot 180 from being zeroed (CLEAR-HANDLER) and breaking
+   the deadline IRQ's longjmp path.  Returns 0."
+  (emit-ir :trap #x0515)
   (emit-ir :li dest 0))
 
 (defun compile-mmio-do-read32 (dest)

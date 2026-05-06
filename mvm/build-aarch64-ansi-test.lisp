@@ -2743,6 +2743,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (when (%tested-p id) (return-from run-test nil))~
                      ~%  (%mark-tested id)~
+                     ~%  (%restore-outer-handler)~
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (setf (mem-ref #x10000C70 :u64) 50)~
@@ -2755,6 +2756,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
                      ~%  (when (%tested-p id) (return-from run-test-mv nil))~
                      ~%  (%mark-tested id)~
+                     ~%  (%restore-outer-handler)~
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (setf (mem-ref #x10000C70 :u64) 50)~

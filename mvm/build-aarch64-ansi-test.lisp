@@ -2724,6 +2724,12 @@
                      ~%  (%fail-range 10620 10625)  ;; mapcar.lsp wedge tail~
                      ~%  (%fail-range 10634 10638)  ;; mapcon.lsp wedge tail~
                      ~%  (%fail-range 10647 10652)  ;; mapl.lsp wedge tail~
+                     ~%  (%fail-range 10653 10671)  ;; maplist.lsp~
+                     ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp~
+                     ~%  (%fail-range 10695 10718)  ;; member-if.lsp~
+                     ~%  (%fail-range 10719 10768)  ;; member.lsp~
+                     ~%  (%fail-range 10810 11125)  ;; nintersection.lsp tail through nunion.lsp~
+                     ~%  (%fail-range 11151 11180)  ;; pushnew.lsp~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

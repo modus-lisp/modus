@@ -2719,9 +2719,12 @@
                      ~%;; frame) and disarm BEFORE the handler-case body returns~
                      ~%;; (so a stale countdown doesn't longjmp into a frame that~
                      ~%;; no longer exists).~
-                     ~%;; *test-deadline-ticks* would be a defvar but defvar init~
-                     ~%;; thunks aren't run on bare-metal (CLAUDE.md), so it'd~
-                     ~%;; default to NIL.  Inline the 5000-tick (5 s) constant.~
+                     ~%;; Deadline countdown in 1 ms ticks (guest time).  QEMU~
+                     ~%;; AArch64 emulation runs the system counter at roughly~
+                     ~%;; 1/100 of wall clock, so 5000 ticks ~~ 10 min wall.~
+                     ~%;; Lower deadlines risk false timeouts on legitimately~
+                     ~%;; slow tests; 5000 catches real infinite loops without~
+                     ~%;; killing slow-but-finite tests.~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
@@ -3011,7 +3014,7 @@
   ;; *skip-below* — useful for bisecting the next hang point.
   ;; Boulder #8: test 10011 (signals-error→eval) infinite-loops.
   ;; Skip past it to find the next hanger and quantify total passable.
-  (setq *skip-below* 0)  ;; bisect knob — signals-error override should eliminate hangs
+  (setq *skip-below* 0)  ;; bisect knob
   ;; (run-all-tests)
 
   ;; Print expected ANSI test total so the summary can compute lost tests.

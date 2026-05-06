@@ -2730,6 +2730,9 @@
                      ~%  (%fail-range 10719 10768)  ;; member.lsp~
                      ~%  (%fail-range 10810 11125)  ;; nintersection.lsp tail through nunion.lsp~
                      ~%  (%fail-range 11151 11180)  ;; pushnew.lsp~
+                     ~%  (%fail-range 11183 11410)  ;; rassoc-* + reduce/remf/remove-dup/rplaca/d + set-* wedges~
+                     ~%  (%fail-range 11438 11547)  ;; subsetp + subst-if-not + subst-if + subst.lsp~
+                     ~%  (%fail-range 11608 12572)  ;; union.lsp tail + everything to notany.lsp~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

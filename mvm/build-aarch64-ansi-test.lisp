@@ -2707,6 +2707,24 @@
                      ~%  (write-char-serial 10)~
                      ~%  nil)~
                      ~%(defun %test-crash-fail (id) (%record-test-fail id))~
+                     ~%(defun %fail-range (lo hi)~
+                     ~%  (let ((i lo))~
+                     ~%    (loop (when (> i hi) (return nil))~
+                     ~%      (%record-test-fail i)~
+                     ~%      (setq i (+ i 1)))))~
+                     ~%;; Pre-stamp known wedge ranges as FAIL.  Called from kernel-main~
+                     ~%;; before run-real-ansi-tests so the bitmap pre-marks (in %record-~
+                     ~%;; test-fail) make run-test no-op on these IDs.  Defined as its~
+                     ~%;; own function to keep kernel-main small (layout-fragility avoidance).~
+                     ~%(defun %pre-stamp-wedges ()~
+                     ~%  (%fail-range 10001 10179)  ;; pre-assoc + assoc.lsp wedge~
+                     ~%  (%fail-range 10436 10484)  ;; intersection.lsp wedge~
+                     ~%  (%fail-range 10587 10591)  ;; mapc.lsp wedge tail~
+                     ~%  (%fail-range 10606 10610)  ;; mapcan.lsp wedge tail~
+                     ~%  (%fail-range 10620 10625)  ;; mapcar.lsp wedge tail~
+                     ~%  (%fail-range 10634 10638)  ;; mapcon.lsp wedge tail~
+                     ~%  (%fail-range 10647 10652)  ;; mapl.lsp wedge tail~
+                     ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~
                      ~%(defvar *fork-shm-addr* 0)~
@@ -3057,18 +3075,19 @@
   ;; Skip past it to find the next hanger and quantify total passable.
   (setq *skip-below* 10180)  ;; skip past pre-assoc + the assoc.lsp wedge
   (setq *run-only-below* 0)
-  ;; Pre-mark known wedge ranges as tested so run-test no-ops them.
-  ;; Each wedge is a file (or sub-range) where a test contains a pattern
-  ;; that hangs the suite (typically funcall-of-let-allocated-lambda
-  ;; via :TEST/:TEST-NOT/:KEY against the &rest defun INTERSECTION).
-  ;; The deadline IRQ ought to recover but doesn't in these specific
-  ;; layouts.  Each range is appended as we discover new wedges via
-  ;; bisection — a sustainable workaround until the per-fork handler
-  ;; stack lands.
-  (let ((i 10436))                                              ;; intersection.lsp wedge
-    (loop (when (> i 10484) (return nil))
-      (setf (mem-ref (+ #x10001000 (- i 10000)) :u8) 1)
-      (setq i (+ i 1))))
+  ;; Stamp known wedge ranges as FAIL up front, so each wedge test
+  ;; counts in the per-test totals — the harness goal is per-test
+  ;; accounting, every ID emits a record, not did-this-test-pass.
+  ;; %record-test-fail emits FAIL N to UART AND sets the bitmap, so
+  ;; run-test will see %tested-p = T on entry and return nil — the
+  ;; thunk never runs, no wedge can fire.  Each range is appended as
+  ;; we bisect new wedges; a sustainable workaround until the per-fork
+  ;; handler stack lands and the deadline IRQ can recover from any
+  ;; handler-case state.
+  ;;
+  ;; Stamp pre-assoc range too (10001-10179) which was previously
+  ;; bypassed via *skip-below*=10180 but produced no FAIL records.
+  (%pre-stamp-wedges)
   ;; (run-all-tests)
 
   ;; Print expected ANSI test total so the summary can compute lost tests.

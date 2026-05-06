@@ -2732,7 +2732,8 @@
                      ~%  (%fail-range 11151 11180)  ;; pushnew.lsp~
                      ~%  (%fail-range 11183 11410)  ;; rassoc-* + reduce/remf/remove-dup/rplaca/d + set-* wedges~
                      ~%  (%fail-range 11438 11547)  ;; subsetp + subst-if-not + subst-if + subst.lsp~
-                     ~%  (%fail-range 11608 12572)  ;; union.lsp tail + everything to notany.lsp~
+                     ~%  (%fail-range 11608 12572)  ;; union.lsp tail through notany.lsp~
+                     ~%  (%fail-range 12573 13527)  ;; through cascade-lz to format.lsp range~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~
@@ -3019,7 +3020,7 @@
   (setq *run-only-below* 0)
   (setq *write-object-budget* 0)
   (setq *fail-emitted* 0)
-  (setq *fail-cap* 2000)
+  (setq *fail-cap* 30000)  ;; cover all 17,692 ANSI tests + room for re-emits
   (setq *file-alarm-secs* 45)
   (setq *wstatus-addr* #x100001A0)
 

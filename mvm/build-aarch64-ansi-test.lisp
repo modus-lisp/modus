@@ -2694,6 +2694,10 @@
                      ~%;; Bare-metal harness: no fork, no shm, no fault slots.~
                      ~%(defun %record-test-fail (id)~
                      ~%  (when (>= *fail-emitted* *fail-cap*) (return-from %record-test-fail nil))~
+                     ~%  ;; Re-entry guard: don't double-emit FAIL for an already-recorded test.~
+                     ~%  (when (not (zerop (mem-ref (+ #x10001000 (- id 10000)) :u8)))~
+                     ~%    (return-from %record-test-fail nil))~
+                     ~%  (setf (mem-ref (+ #x10001000 (- id 10000)) :u8) 1)~
                      ~%  (setq *fail-emitted* (+ *fail-emitted* 1))~
                      ~%  (write-char-serial 10)~
                      ~%  (write-char-serial 70) (write-char-serial 65)~
@@ -2725,12 +2729,23 @@
                      ~%;; Lower deadlines risk false timeouts on legitimately~
                      ~%;; slow tests; 5000 catches real infinite loops without~
                      ~%;; killing slow-but-finite tests.~
+                     ~%;; Re-entry detection bitmap at 0x10001000.  Byte per test,~
+                     ~%;; indexed by (id - 10000).  Set to 1 once a test has produced~
+                     ~%;; a result (P or FAIL).  If run-test sees a tested id, return~
+                     ~%;; nil immediately — breaks tight loops where stale handler-case~
+                     ~%;; frames cause a longjmp to land back at an already-run test.~
+                     ~%(defun %tested-p (id)~
+                     ~%  (not (zerop (mem-ref (+ #x10001000 (- id 10000)) :u8))))~
+                     ~%(defun %mark-tested (id)~
+                     ~%  (setf (mem-ref (+ #x10001000 (- id 10000)) :u8) 1))~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
+                     ~%  (when (%tested-p id) (return-from run-test nil))~
+                     ~%  (%mark-tested id)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 5000)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
                      ~%      (rt-run-test id (funcall thunk) expected))~
                      ~%    (t (c)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0)~
@@ -2738,9 +2753,11 @@
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
+                     ~%  (when (%tested-p id) (return-from run-test-mv nil))~
+                     ~%  (%mark-tested id)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 5000)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
                      ~%      (rt-run-test-mv id (funcall thunk) expecteds))~
                      ~%    (t (c)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0)~
@@ -2905,6 +2922,14 @@
   ;; fork-file uses %save-outer-handler / %clear-outer-handler to
   ;; activate/deactivate this fallback per file.
   (setf (mem-ref #x100001C0 :u64) 0)
+
+  ;; Re-entry bitmap at 0x10001000.  18000 bytes covers all 17692 tests.
+  ;; Zero so no test starts in tested state.
+  (let ((i 0))
+    (loop
+      (when (>= i 18000) (return nil))
+      (setf (mem-ref (+ #x10001000 i) :u64) 0)
+      (setq i (+ i 8))))
 
   ;; Per-test deadline slot — must be zero so the IRQ handler doesn't
   ;; trigger before run-test arms it.

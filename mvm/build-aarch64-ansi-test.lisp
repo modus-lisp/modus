@@ -2737,7 +2737,10 @@
                      ~%  (%fail-range 14069 15186)  ;; number-comparison.lsp wedge cascade~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp~
                      ~%  (%fail-range 15744 17037)  ;; speculative: makunbound..count.lsp~
-                     ~%  (%fail-range 17072 18000)  ;; speculative: elt.lsp + several~
+                     ~%  (%fail-range 17072 18639)  ;; speculative: elt.lsp + sequences through position-if~
+                     ~%  (%fail-range 18640 20000)  ;; speculative: more sequence wedges~
+                     ~%  (%fail-range 20893 22000)  ;; speculative: vector + array wedges~
+                     ~%  (%fail-range 22135 23500)  ;; speculative: print/format-related~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

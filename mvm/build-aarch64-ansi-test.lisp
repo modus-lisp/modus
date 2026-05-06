@@ -3174,7 +3174,8 @@
 ;; program-error.  Catches `:KEY #'CONS` style arity-mismatch funcalls
 ;; that otherwise build (arg . garbage) cons cells and corrupt heap.
 ;; See reference_aarch64_fragility.md.
-(setq *compile-arity-check* t)  ;; cons/car/cdr only via *-names*
+(setq *compile-arity-check* t)
+(setq *compile-arity-check-names* '("CONS" "CAR" "CDR" "NULL" "ATOM" "CONSP"))
 
 ;; Compiler-parameter env-var bridge.
 ;;

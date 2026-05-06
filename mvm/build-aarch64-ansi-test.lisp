@@ -3169,6 +3169,13 @@
 ;; + PPI 27 mask) which (setup-irq) emits when this flag is set.
 (setq *aarch64-setup-irq-enable* t)
 
+;; Per-function NARGS check (fragility #33 mitigation): fixed-arity
+;; defuns get a runtime NARGS check in the prologue.  If wrong, signal
+;; program-error.  Catches `:KEY #'CONS` style arity-mismatch funcalls
+;; that otherwise build (arg . garbage) cons cells and corrupt heap.
+;; See reference_aarch64_fragility.md.
+(setq *compile-arity-check* t)  ;; cons/car/cdr only via *-names*
+
 ;; Compiler-parameter env-var bridge.
 ;;
 ;; Each entry maps a MODUS_* env var to a defparameter symbol in

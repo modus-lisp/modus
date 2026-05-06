@@ -205,6 +205,36 @@
    cost (string/cons/vector quote in compile-quote).  Set to an integer
    to control top-N (default 30 when t).  Output goes to stdout.")
 
+(defparameter *compile-arity-check* nil
+  "When non-nil, fixed-arity defuns whose name appears in
+   *compile-arity-check-names* emit a runtime NARGS check in the
+   prologue.  If the caller passed the wrong arg count, the prologue
+   returns NIL via the function's normal return path (skipping the
+   body, preventing garbage register reads from producing
+   corrupting cons cells).
+
+   Catches the AArch64 fragility class where (e.g.) `:KEY #'CONS`
+   funcalls CONS with 1 arg; without this check, CONS reads X1 (arg)
+   and X2 (garbage) and builds (arg . garbage), which can become a
+   bad-pointer cons that survives into long-lived structures and
+   corrupts unrelated tests downstream.  See
+   reference_aarch64_fragility.md.
+
+   Off by default — even with the gate list, runtime checks add
+   instructions per call and may interact with other code paths.
+   Verify on a baseline build first.")
+
+(defparameter *compile-arity-check-names*
+  '("CONS" "CAR" "CDR")
+  "Function names that get the runtime NARGS check in their
+   prologue, when *compile-arity-check* is non-nil.  Narrow scope
+   minimizes risk of interacting with other code paths during init.
+
+   Default: just the cons/car/cdr wrappers from cl-types.lisp,
+   which are the specific primitives that our test 10053 fragility
+   bisection identified as silent-corrupters when called with the
+   wrong arg count via :KEY funcalls.")
+
 (defvar *pending-flet-ir* nil
   "Collects (info . ir) pairs from flet/labels function compilations.
    These are drained by mvm-compile-all into all-ir after each top-level form.")
@@ -7443,6 +7473,39 @@
 ;;;
 ;;; Compiles a single function's body, producing IR instructions.
 
+(defun emit-arity-check-prologue (required-count)
+  "Emit IR that checks NARGS == REQUIRED-COUNT at function entry.
+   On mismatch, returns NIL via the function's normal return path
+   (skipping the body — preventing garbage register reads from
+   producing corrupting cons cells).  On match, falls through to
+   the rest of the prologue.
+
+   Returning NIL on mismatch is a deliberate compromise: ANSI says
+   wrong arity should signal program-error.  A signal-and-longjmp
+   here would need a working call to %SIGNAL-PROGRAM-ERROR, which
+   itself goes through the IR call path that 1-MB ADR fixups don't
+   reliably reach.  Returning NIL is safer: no garbage propagation,
+   no fragility, no false-positive call resolution.
+
+   Required-count is the param count for fixed-arity defuns (no
+   &rest, no &optional, no &key).  See *compile-arity-check*."
+  (let ((ok-label (make-compiler-label))
+        (nargs-reg (alloc-temp-reg))
+        (cmp-reg (alloc-temp-reg)))
+    ;; :get-nargs returns tagged (already shifted left by +fixnum-shift+).
+    (emit-ir :get-nargs nargs-reg)
+    (emit-ir :li cmp-reg (ash required-count +fixnum-shift+))
+    (emit-ir :cmp nargs-reg cmp-reg)
+    (emit-ir :beq ok-label)
+    ;; Mismatch: return NIL via the function-return path.  +vreg-vn+ holds
+    ;; NIL by convention (R15 on x64, X26 on AArch64).  Move to the
+    ;; result register +vreg-vr+ and jump to *function-return-label*.
+    (emit-ir :mov +vreg-vr+ +vreg-vn+)
+    (emit-ir :br *function-return-label*)
+    (emit-ir-label ok-label)
+    (free-temp-reg)
+    (free-temp-reg)))
+
 (defun emit-rest-prologue (rest-slot)
   "Emit IR for the &rest prologue.
 
@@ -7603,6 +7666,20 @@
          (*tagbody-tags* nil))
     ;; Function prologue: push frame pointer, set up frame
     (emit-ir :frame-enter (length params))
+
+    ;; Fixed-arity NARGS check (gated by *compile-arity-check* + name list).
+    ;; Emit ONLY for functions named in *compile-arity-check-names* AND
+    ;; with no &rest, no &optional.  Those name+shape constraints together
+    ;; keep the check off init-path code that the gate isn't tested
+    ;; against, while still covering the cons/car/cdr wrappers that the
+    ;; AArch64 11048 fragility bisection identified.
+    (when (and *compile-arity-check*
+               (null rest-slot)
+               (or (null opt-count) (zerop opt-count))
+               (let ((fname (if (symbolp name) (symbol-name name)
+                                (string name))))
+                 (member fname *compile-arity-check-names* :test #'string=)))
+      (emit-arity-check-prologue (length params)))
 
     ;; Build initial environment with parameter bindings.
     ;; Parameters arrive in V0-V3 (for the first 4), rest on stack.

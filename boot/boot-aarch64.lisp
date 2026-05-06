@@ -322,18 +322,19 @@
          (mvm-emit-u32 buf #xD2803000)  ; MOVZ x0,#0x0180
          (mvm-emit-u32 buf #xF2A20000)  ; MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
          (mvm-emit-u32 buf #xF9457801)  ; LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
-         (mvm-emit-u32 buf #xB4000241)  ; CBZ x1,+18 → NORMAL      (not armed)
+         (mvm-emit-u32 buf #xB4000201)  ; CBZ x1,+16 → NORMAL      (not armed)
          (mvm-emit-u32 buf #xF1000421)  ; SUBS x1,x1,#1
          (mvm-emit-u32 buf #xF9057801)  ; STR x1,[x0,#2800]
-         (mvm-emit-u32 buf #x540001E1)  ; B.NE +15 → NORMAL        (not yet zero)
-         ;; PROBE: deadline expired this tick → write 'X' to UART
-         (mvm-emit-u32 buf #xF81F0FE0)  ; STR x0,[SP,#-16]!
-         (mvm-emit-u32 buf #xD2A40000)  ; MOVZ x0,#0x2000,LSL #16
-         (mvm-emit-u32 buf #xD2800B01)  ; MOVZ x1,#0x58            ('X')
-         (mvm-emit-u32 buf #xB9000001)  ; STR  w1,[x0]
-         (mvm-emit-u32 buf #xF84107E0)  ; LDR x0,[SP],#16
-         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (saved SP)
-         (mvm-emit-u32 buf #xB4000101)  ; CBZ x1,+8 → NORMAL       (no handler-case)
+         (mvm-emit-u32 buf #x540001A1)  ; B.NE +13 → NORMAL        (not yet zero)
+         ;; Deadline expired this tick — try slot 0x10000180 (per-test
+         ;; handler) first; if zero, fall back to slot 0x100001A0
+         ;; (file-level outer handler set by SAVE-OUTER trap).
+         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 180 SP)
+         (mvm-emit-u32 buf #xB5000081)  ; CBNZ x1,+4 → DO_LJ       (use slot 180)
+         (mvm-emit-u32 buf #x91010000)  ; ADD x0,x0,#0x40          (→ slot 1C0)
+         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 1A0 SP)
+         (mvm-emit-u32 buf #xB4000101)  ; CBZ x1,+8 → NORMAL       (no handler at all)
+         ;; DO_LJ:
          (mvm-emit-u32 buf #x9100003F)  ; ADD SP,x1,#0
          (mvm-emit-u32 buf #xF940041D)  ; LDR x29,[x0,#8]
          (mvm-emit-u32 buf #xF9400801)  ; LDR x1,[x0,#16]
@@ -344,8 +345,8 @@
          ;; NORMAL:
          (mvm-emit-u32 buf #xA8C107E0)  ; LDP x0,x1,[SP],#16
          (mvm-emit-u32 buf #xD69F03E0)  ; ERET (normal return)
-         ;; Fill remaining 3 instructions with NOP
-         (dotimes (i 3)
+         ;; Fill remaining 5 instructions with NOP
+         (dotimes (i 5)
            (mvm-emit-u32 buf #xD503201F))))
       ((= entry 6)
        ;; DIAGNOSTIC: FIQ probe — write 'f' to UART each tick.  GICv2 on

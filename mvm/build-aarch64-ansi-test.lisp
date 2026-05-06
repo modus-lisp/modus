@@ -2731,8 +2731,7 @@
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (setf (mem-ref #x10000C70 :u64) 5000)~
-                     ~%      (rt-run-test id (funcall thunk) expected)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 0))~
+                     ~%      (rt-run-test id (funcall thunk) expected))~
                      ~%    (t (c)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0)~
                      ~%      (%record-test-fail id))))~
@@ -2742,8 +2741,7 @@
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (setf (mem-ref #x10000C70 :u64) 5000)~
-                     ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 0))~
+                     ~%      (rt-run-test-mv id (funcall thunk) expecteds))~
                      ~%    (t (c)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0)~
                      ~%      (%record-test-fail id))))~
@@ -2754,12 +2752,22 @@
                      ~%        (when (> i last-id) (return nil))~
                      ~%        (%record-test-fail i)~
                      ~%        (setq i (+ i 1))))))~
-                     ~%;; fork-file becomes a pass-through: just runs the file's thunk in-process.~
-                     ~%;; A test crash that escapes handler-case will triple-fault the kernel~
-                     ~%;; (Phase A.2 will add IDT-based recovery for that).~
+                     ~%;; fork-file: passes through to the file's thunk.  Establishes~
+                     ~%;; an outer fallback handler at slot 0x100001C0 (via the AArch64~
+                     ~%;; %save-outer-handler builtin) so the deadline IRQ can longjmp~
+                     ~%;; here when slot 0x10000180 has been zeroed by a per-test~
+                     ~%;; CLEAR-HANDLER (between-test wedges).  On longjmp, stamp every~
+                     ~%;; remaining test in [first-id..last-id] as FAIL so we get~
+                     ~%;; per-test coverage even when a file deadlocks.~
                      ~%(defun fork-file (first-id last-id thunk)~
-                     ~%  (handler-case (funcall thunk)~
-                     ~%    (t (c) (%record-test-fail first-id))))~%")
+                     ~%  (handler-case~
+                     ~%    (progn~
+                     ~%      (%save-outer-handler)~
+                     ~%      (funcall thunk)~
+                     ~%      (%clear-outer-handler))~
+                     ~%    (t (c)~
+                     ~%      (%clear-outer-handler)~
+                     ~%      (%stamp-remaining-fails first-id last-id))))~%")
                    (with-output-to-string (s)
                      ;; Helper: return T iff the active shard range [skip..run-only)
                      ;; overlaps [first..last]. Run-only=0 means "no upper bound".
@@ -2891,6 +2899,12 @@
   (setf (mem-ref #x10000088 :u64) 0)
   (setf (mem-ref #x10000090 :u64) 0)
   (setf (mem-ref #x10000098 :u64) 0)
+
+  ;; Outer-handler slot 0x100001C0 — must be zero so the IRQ handler
+  ;; doesn't try to longjmp to a fallback that wasn't established yet.
+  ;; fork-file uses %save-outer-handler / %clear-outer-handler to
+  ;; activate/deactivate this fallback per file.
+  (setf (mem-ref #x100001C0 :u64) 0)
 
   ;; Per-test deadline slot — must be zero so the IRQ handler doesn't
   ;; trigger before run-test arms it.

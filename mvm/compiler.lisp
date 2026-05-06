@@ -2224,6 +2224,10 @@
       ((= op-name 1009685354534069733) (compile-setup-nic-idt dest))
       ((= op-name 739607750214719398)  (compile-nic-irq-unmask dest))
 
+      ;; --- Outer-handler save/clear (AArch64 fork-file fallback) ---
+      ((= op-name 290749171156322546)  (compile-save-outer-handler dest))
+      ((= op-name 1092167958334654506) (compile-clear-outer-handler dest))
+
       ;; --- MMIO (raw 32-bit address at 0x600140, result at 0x600148) ---
       ((= op-name 372079205816461105)  (compile-mmio-do-read32 dest))
       ((= op-name 186965853563265998) (compile-mmio-do-write32 dest))
@@ -6892,6 +6896,22 @@
   (emit-ir :trap #x0323)
   (emit-ir :li dest 0))
 
+(defun compile-save-outer-handler (dest)
+  "Compile (%save-outer-handler) — copy the current handler-case
+   setjmp state at slot 0x10000180/188/190 to slot 0x100001A0/1A8/1B0.
+   Used by fork-file to install a fallback frame so the deadline
+   IRQ can longjmp here even after a per-test handler-case has
+   zeroed slot 0x10000180.  Returns 0."
+  (emit-ir :trap #x0513)
+  (emit-ir :li dest 0))
+
+(defun compile-clear-outer-handler (dest)
+  "Compile (%clear-outer-handler) — zero slot 0x100001A0 so the
+   IRQ handler stops falling back to the fork-file frame.  Pair
+   with %save-outer-handler.  Returns 0."
+  (emit-ir :trap #x0514)
+  (emit-ir :li dest 0))
+
 (defun compile-mmio-do-read32 (dest)
   "Compile (mmio-do-read32) — read 32-bit value from raw address at 0x600140,
    store result at 0x600148. Returns 0. Used for MMIO above 2GB on i386."
@@ -7667,18 +7687,18 @@
     ;; Function prologue: push frame pointer, set up frame
     (emit-ir :frame-enter (length params))
 
-    ;; Fixed-arity NARGS check (gated by *compile-arity-check* + name list).
-    ;; Emit ONLY for functions named in *compile-arity-check-names* AND
-    ;; with no &rest, no &optional.  Those name+shape constraints together
-    ;; keep the check off init-path code that the gate isn't tested
-    ;; against, while still covering the cons/car/cdr wrappers that the
-    ;; AArch64 11048 fragility bisection identified.
+    ;; Fixed-arity NARGS check (gated by *compile-arity-check*).
+    ;; Emit for all functions with no &rest, no &optional.  When
+    ;; *compile-arity-check-names* is non-nil, restrict to that
+    ;; list — useful for narrow rollouts.  When it's nil, the check
+    ;; is universal (any fixed-arity defun gets it).
     (when (and *compile-arity-check*
                (null rest-slot)
                (or (null opt-count) (zerop opt-count))
-               (let ((fname (if (symbolp name) (symbol-name name)
-                                (string name))))
-                 (member fname *compile-arity-check-names* :test #'string=)))
+               (or (null *compile-arity-check-names*)
+                   (let ((fname (if (symbolp name) (symbol-name name)
+                                    (string name))))
+                     (member fname *compile-arity-check-names* :test #'string=))))
       (emit-arity-check-prologue (length params)))
 
     ;; Build initial environment with parameter bindings.

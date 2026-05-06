@@ -69,6 +69,7 @@
 (defconstant +a64-x3+   3)
 (defconstant +a64-x16+ 16)   ; IP0 scratch
 (defconstant +a64-x17+ 17)   ; IP1 scratch
+(defconstant +a64-x18+ 18)   ; platform reg (free on bare-metal — used by handler-case copy traps)
 (defconstant +a64-x19+ 19)
 (defconstant +a64-x20+ 20)
 (defconstant +a64-x21+ 21)
@@ -1287,6 +1288,24 @@
                 ;; "no active handler-case".  Preserves X0 (return value
                 ;; of handler-case body).
                 (a64-load-imm64 buf +a64-x16+ #x10000180)
+                (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
+               ((= code #x0513)
+                ;; SAVE-OUTER: copy slot 0x10000180/188/190 → 0x100001A0/1A8/1B0.
+                ;; Used by fork-file to establish a "fallback" handler that
+                ;; the IRQ deadline can longjmp to even when slot 180 has
+                ;; been zeroed by a per-test CLEAR-HANDLER.
+                (a64-load-imm64 buf +a64-x16+ #x10000180)
+                (a64-load-imm64 buf +a64-x17+ #x100001C0)
+                (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 0)
+                (a64-str-unsigned buf +a64-x18+ +a64-x17+ 0)
+                (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 8)
+                (a64-str-unsigned buf +a64-x18+ +a64-x17+ 8)
+                (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 16)
+                (a64-str-unsigned buf +a64-x18+ +a64-x17+ 16))
+               ((= code #x0514)
+                ;; CLEAR-OUTER: zero slot 0x100001A0 so the IRQ handler
+                ;; falls through to "no handler".
+                (a64-load-imm64 buf +a64-x16+ #x100001C0)
                 (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
                (t
                 ;; Real CPU trap

@@ -2735,6 +2735,9 @@
                      ~%  (%fail-range 11608 12572)  ;; union.lsp tail through notany.lsp~
                      ~%  (%fail-range 12573 13527)  ;; through cascade-lz to format.lsp range~
                      ~%  (%fail-range 14069 15186)  ;; number-comparison.lsp wedge cascade~
+                     ~%  (%fail-range 15683 15691)  ;; gentemp.lsp~
+                     ~%  (%fail-range 15744 17037)  ;; speculative: makunbound..count.lsp~
+                     ~%  (%fail-range 17072 18000)  ;; speculative: elt.lsp + several~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

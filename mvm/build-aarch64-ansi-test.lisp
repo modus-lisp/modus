@@ -38,6 +38,45 @@
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
 (defvar *rt-source*      (mvm-text "mvm/rt.lisp"))
+
+;; Actor source: minimal address-defun preamble + net/actors.lisp.
+;; The actor system normally pulls addresses from net/arch-aarch64.lisp,
+;; but those defaults (0x412xxxxx scheduler metadata, 0x46000000 actor
+;; heaps) overlap our 38 MB ANSI image at PA 0x40200000-0x42800000.
+;; Override to past-image VA 0x47000000+ which is identity-mapped in
+;; the fixpoint MMU (L1 entry 1, VA 0x40000000-0x80000000 → PA same).
+;;
+;; Layout (16 max actors, 4MB heap each):
+;;   0x47000000  Per-CPU data (8 CPUs × 64 bytes = 512 bytes)
+;;   0x47001000  Locks (24 bytes)
+;;   0x47002000  Actor table (16 × 128 = 2KB)
+;;   0x47003000  Scheduler state (64 bytes)
+;;   0x47100000  Actor stacks (16 × 64KB = 1MB)
+;;   0x47200000  Mailbox pool (128KB)
+;;   0x47220000  Pool state
+;;   0x47230000  Staging buffers (16 × 16KB = 256KB)
+;;   0x48000000  Actor heaps (16 × 4MB = 64MB)
+(defvar *actor-addr-overrides* "
+(defun percpu-data-base ()   #x47000000)
+(defun sched-lock-addr ()    #x47001000)
+(defun actor-table-base ()   #x47002000)
+(defun sched-state-base ()   #x47003000)
+(defun scratch-addr ()       #x47003050)
+(defun decode-ptr-addr ()    #x47003058)
+(defun actor-stack-base ()   #x47100000)
+(defun mailbox-pool-base ()  #x47200000)
+(defun mailbox-pool-limit () #x47220000)
+(defun pool-state-base ()    #x47220000)
+(defun staging-base-addr ()  #x47230000)
+(defun actor-heap-base ()    #x48000000)
+;; get-alloc-ptr / get-alloc-limit: read R12 / R14.  Used by actor-init
+;; to record the primordial actor's heap state.  In bare metal these
+;; are MVM intrinsics — provide stubs returning 0 for now since the
+;; ANSI build does not currently swap heaps per actor.
+(defun get-alloc-ptr () 0)
+(defun get-alloc-limit () 0)
+")
+(defvar *actor-source*   (mvm-text "net/actors.lisp"))
 (defvar *bridge-source*
   (concatenate 'string
     ;; Load order matches original ansi-bridge.lisp concatenation order.
@@ -3218,6 +3257,14 @@
     (string #\Newline)
     ;; 6. Real ANSI test files
     *real-ansi-sources*
+    (string #\Newline)
+    ;; 6b. Actor system source — appended AFTER all test source so the
+    ;; native code offsets of run-test/rt-run-test/etc are unaffected.
+    ;; The carefully-bisected wedge ranges in %pre-stamp-wedges depend
+    ;; on those offsets; putting actors here avoids re-bisection.
+    *actor-addr-overrides*
+    (string #\Newline)
+    *actor-source*
     (string #\Newline)
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count

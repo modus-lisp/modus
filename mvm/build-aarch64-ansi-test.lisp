@@ -2978,6 +2978,15 @@
 (defun halt ()
   (loop (trap #x0304)))
 
+;; POC step 3: trivial worker actor.  Prints WK! and yields.  Each
+;; iteration of the loop yields back to the scheduler so primordial
+;; can resume.  Actor lifecycle: spawned from kernel-main, never exits
+;; (loops yielding).  Heap is independent (per-actor 4MB starting at
+;; actor-heap-base + (id-1)<<22).
+(defun %trivial-worker ()
+  (write-char-serial 87) (write-char-serial 75) (write-char-serial 33) ;; WK!
+  (loop (yield)))
+
 (defun sys-exit (code)
   ;; No process model — code argument ignored; just halt.
   (let ((c code)) c)
@@ -3047,6 +3056,16 @@
   ;; just verifies actor-init doesn't break the 17,692-record baseline.
   (smp-init)
   (actor-init)
+
+  ;; POC step 3: spawn a worker actor that prints WK and loops.
+  ;; If raw-fn fix in actor-spawn override works, restore-context BR's
+  ;; to the worker's entry, worker writes WK, then yields back, then
+  ;; we proceed to [P].
+  (write-char-serial 91) (write-char-serial 49) (write-char-serial 93) ;; [1] pre-spawn
+  (actor-spawn (fn-addr %trivial-worker))
+  (write-char-serial 91) (write-char-serial 50) (write-char-serial 93) ;; [2] post-spawn
+  (yield)
+  (write-char-serial 91) (write-char-serial 80) (write-char-serial 93) ;; [P] post-yield
 
   ;; Standard init sequence (matches Linux x64 build).
   (init-symbol-table)
@@ -3287,6 +3306,44 @@
     (string #\Newline)
     *actor-source*
     (string #\Newline)
+    ;; 6c. Actor overrides — fix bugs that bite the ANSI build path.
+    ;; actors.lisp's actor-spawn does (untag fn) when storing the
+    ;; continuation address.  fn-addr returns a RAW native address
+    ;; (per translate-aarch64.lisp's +op-fn-addr+ comment), so untag-ing
+    ;; it gives address/2 — restore-context BR's to a corrupt target.
+    ;; Override to store fn directly.  Other (untag X) calls in the
+    ;; original are correct (X is fixnum-tagged in those cases).
+    "
+(defun actor-spawn (fn)
+  (spin-lock (sched-lock-addr))
+  (let ((count (mem-ref (+ (sched-state-base) 8) :u64)))
+    (if (>= count 64)
+        (progn
+          (spin-unlock (sched-lock-addr))
+          (write-char-serial 33)   ; '!' too many actors
+          0)
+        (let ((id count))
+          (setf (mem-ref (+ (sched-state-base) 8) :u64) (+ count 1))
+          (actor-set id #x00 2)
+          (actor-set id #x38 id)
+          (let ((stack-top (actor-stack-top id)))
+            (actor-set id #x08 (untag stack-top))
+            (let ((id1 (- id 1)))
+              (let ((heap-off (ash id1 22)))
+                (let ((heap-base (+ (actor-heap-base) heap-off)))
+                  (actor-set id #x10 (untag heap-base))
+                  (let ((limit (+ heap-base #x400000)))
+                    (actor-set id #x18 (untag limit)))
+                  (actor-set id #x70 (+ heap-base #x80000))
+                  (actor-set id #x78 (+ heap-base #x400000)))))
+            (actor-set id #x20 0)
+            ;; Continuation = raw fn address (NO untag — fn-addr is raw)
+            (actor-set id #x30 fn))
+          (actor-enqueue id)
+          (spin-unlock (sched-lock-addr))
+          id))))
+"
+    (string #\Newline)
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count
     ;; so kernel-main can print EXP:N before running tests.
@@ -3320,7 +3377,10 @@
 (setq *aarch64-serial-base* #x20000000)
 (setq *aarch64-serial-width* 0)        ; byte stores for PL011 (per fixpoint)
 (setq *aarch64-serial-tx-poll* nil)
-(setq *aarch64-sched-lock-addr* nil)
+;; Actor system uses this to make restore-context release the scheduler
+;; lock + unmask interrupts after the SP switch.  Must match the
+;; sched-lock-addr defun above.  Was nil pre-actor (no scheduler).
+(setq *aarch64-sched-lock-addr* #x47001000)
 
 ;; Per-test deadline (Boulder #8 mitigation): the timer IRQ at vector
 ;; entry 5 decrements slot 0x10000C70 each tick (1 ms).  When it hits

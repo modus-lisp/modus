@@ -3028,10 +3028,15 @@
     (cond
       ((= status 2)
        (let ((actual (mem-ref #x100A0020 :u64)))
-         (rt-run-test id actual expected)))
+         (rt-run-test id actual expected)
+         ;; rt-run-test emits P/FAIL but doesn't touch the bitmap.
+         ;; Set it so %pre-stamp-wedges and re-entry checks see this
+         ;; id as already-tested.
+         (%mark-tested id)))
       (t
        ;; Worker's handler-case caught (status=3), or it timed out
        ;; (status=1 still).  Either way: heap-isolated FAIL.
+       ;; %record-test-fail sets bitmap internally.
        (%record-test-fail id))))
   ;; Reset work block (note: if status was 1 the worker is still spinning
   ;; on the wedge; setting status=0 means it won't try a new request — but
@@ -3235,9 +3240,55 @@
   ;;
   ;; Stamp pre-assoc range too (10001-10179) which was previously
   ;; bypassed via *skip-below*=10180 but produced no FAIL records.
-  ;; POC step 4: route 10449 (the :TEST-NOT wedge) through the actor
-  ;; path BEFORE pre-stamping. Init must be done; symbol table + CL
-  ;; functions need to be live for the test thunk's INTERSECTION etc.
+  ;; POC step 5: scale actor routing to a batch of intersection.lsp
+  ;; tests.  Three categories:
+  ;;   simple:  10436, 10437, 10438 — should pass cleanly (P)
+  ;;   :TEST lambda:    10448 — moderate-complexity, may pass or wedge
+  ;;   :TEST-NOT lambda: 10449 — known wedge
+  ;;   :TEST #'IDENTITY: 10477 — known wedge (HANDLER-CASE around bad call)
+  ;;
+  ;; All run BEFORE %pre-stamp-wedges so bitmap is clear.  Each routes
+  ;; through the actor, gets P or FAIL, sets bitmap.  Pre-stamp later
+  ;; sees bitmap=1 and skips them.
+
+  ;; 10436: (INTERSECTION NIL NIL) → 'NIL
+  (handler-case
+    (run-test-via-actor 10436 (lambda () (INTERSECTION NIL NIL)) 'NIL)
+    (t (c) (%test-crash-fail 10436)))
+
+  ;; 10437: (INTERSECTION (1..100) NIL) → 'NIL
+  (handler-case
+    (run-test-via-actor 10437 (lambda () (INTERSECTION
+                                            (LOOP FOR I FROM 1 TO 100 COLLECT I)
+                                            NIL))
+                        'NIL)
+    (t (c) (%test-crash-fail 10437)))
+
+  ;; 10438: (INTERSECTION NIL (1..100)) → 'NIL
+  (handler-case
+    (run-test-via-actor 10438 (lambda () (INTERSECTION
+                                            NIL
+                                            (LOOP FOR I FROM 1 TO 100 COLLECT I)))
+                        'NIL)
+    (t (c) (%test-crash-fail 10438)))
+
+  ;; 10448: :TEST lambda — original ANSI test passed (had bitmap=1 P)
+  ;; on primordial path before; let's see if actor path agrees.
+  (handler-case
+    (run-test-via-actor 10448 (lambda () (EQUALT
+                                            (SORT
+                                             (INTERSECTION
+                                              (LOOP FOR I FROM 0 TO 999 BY 5 COLLECT I)
+                                              (LOOP FOR I FROM 0 TO 999 BY 7 COLLECT I)
+                                              :TEST
+                                              (LAMBDA (A B) (AND (EQL A B) (= (MOD A 3) 0))))
+                                             (LAMBDA (A B) (< A B)))
+                                            (LOOP FOR I FROM 0 TO 999 BY (* 3 5 7) COLLECT I)))
+                        'T)
+    (t (c) (%test-crash-fail 10448)))
+
+  ;; 10449: :TEST-NOT lambda — known wedge.  Original investigation
+  ;; trigger; expected status=3 (worker handler-case catches crash).
   (handler-case
     (run-test-via-actor 10449
                         (lambda () (EQUALT
@@ -3251,6 +3302,18 @@
                                      (LOOP FOR I FROM 0 TO 999 BY (* 3 5 7) COLLECT I)))
                         'T)
     (t (c) (%test-crash-fail 10449)))
+
+  ;; 10477: HANDLER-CASE around bad call — :TEST #'IDENTITY.
+  ;; Inner handler-case catches and returns NIL; outer EQUALT vs T → fail.
+  ;; (or the wedge fires inside INTERSECTION before HANDLER-CASE can fire).
+  (handler-case
+    (run-test-via-actor 10477 (lambda () (HANDLER-CASE
+                                            (PROGN
+                                              (INTERSECTION '(A B C) '(D E F) :TEST IDENTITY)
+                                              NIL)
+                                            (T (C) T)))
+                        'T)
+    (t (c) (%test-crash-fail 10477)))
 
   (%pre-stamp-wedges)
   ;; (run-all-tests)

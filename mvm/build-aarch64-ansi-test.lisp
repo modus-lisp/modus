@@ -57,7 +57,14 @@
 ;;   0x47230000  Staging buffers (16 × 16KB = 256KB)
 ;;   0x48000000  Actor heaps (16 × 4MB = 64MB)
 (defvar *actor-addr-overrides* "
-(defun percpu-data-base ()   #x47000000)
+;; percpu-data-base: must match the VA that boot-aarch64.lisp writes
+;; to TPIDR_EL1 (+tdk-percpu-va+ = #x10080000, in fixpoint MMU's DRAM
+;; scratch region remapped to PA 0x50080000 by L2[128] override).
+;; percpu-ref/set use TPIDR_EL1 as the base, so this defun must report
+;; the same address smp-init writes through to keep the two views
+;; coherent.  Earlier value 0x00360000 → PA 0x40360000 was INSIDE our
+;; 38 MB ANSI image (loaded at PA 0x40200000+).
+(defun percpu-data-base ()   #x10080000)
 (defun sched-lock-addr ()    #x47001000)
 (defun actor-table-base ()   #x47002000)
 (defun sched-state-base ()   #x47003000)
@@ -75,6 +82,12 @@
 ;; ANSI build does not currently swap heaps per actor.
 (defun get-alloc-ptr () 0)
 (defun get-alloc-limit () 0)
+;; write-byte: actors.lisp + arch-*.lisp use the 1-arg UART version,
+;; but cl-fileio.lisp loaded earlier in our build defines a 2-arg
+;; CL stream-aware version which would supersede.  Override after
+;; cl-fileio (this string is concatenated AFTER bridge in *full-source*)
+;; so calls from actor source get the bare UART path.
+(defun write-byte (b) (write-char-serial b))
 ")
 (defvar *actor-source*   (mvm-text "net/actors.lisp"))
 (defvar *bridge-source*
@@ -3026,6 +3039,14 @@
   ;; underlying semantic is unmask-IRQs in the interrupt controller.
   (setup-irq)
   (nic-irq-unmask)
+
+  ;; Actor system init (POC step 2).  smp-init zeros per-CPU at
+  ;; TPIDR_EL1 base; actor-init zeros the actor table, sets primordial
+  ;; (actor 1) as current, initializes mailbox pool.  No worker actors
+  ;; spawned yet — primordial keeps running on the boot stack.  This
+  ;; just verifies actor-init doesn't break the 17,692-record baseline.
+  (smp-init)
+  (actor-init)
 
   ;; Standard init sequence (matches Linux x64 build).
   (init-symbol-table)

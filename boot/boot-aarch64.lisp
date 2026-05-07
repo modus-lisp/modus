@@ -506,7 +506,7 @@
 (defconstant +tdk-cons-base-va+  #x09000000)  ; Cons alloc (above image buffer at 0x08000000)
 (defconstant +tdk-cons-limit-va+ #x10000000)  ; Cons limit (112MB heap, below E1000 BAR at 0x10000000)
 (defconstant +tdk-uart-va+       #x20000000)  ; UART via page tables
-(defconstant +tdk-percpu-va+     #x00360000)  ; Per-CPU data (same as x64)
+(defconstant +tdk-percpu-va+     #x10080000)  ; Per-CPU data (DRAM scratch — 0x00360000 was inside the kernel image for builds >5MB)
 
 (defun emit-aarch64-load-imm64 (buf rd value)
   "Load a 64-bit immediate into Xd using MOVZ + up to 3 MOVK."

@@ -2978,14 +2978,66 @@
 (defun halt ()
   (loop (trap #x0304)))
 
-;; POC step 3: trivial worker actor.  Prints WK! and yields.  Each
-;; iteration of the loop yields back to the scheduler so primordial
-;; can resume.  Actor lifecycle: spawned from kernel-main, never exits
-;; (loops yielding).  Heap is independent (per-actor 4MB starting at
-;; actor-heap-base + (id-1)<<22).
-(defun %trivial-worker ()
-  (write-char-serial 87) (write-char-serial 75) (write-char-serial 33) ;; WK!
-  (loop (yield)))
+;; Wedge-runner work block at #x100A0000 (DRAM scratch via L2[128]
+;; override, well past runtime metadata at #x10000080+ and re-entry
+;; bitmap at #x10001000-#x100053A0).  Layout (raw u64 cells):
+;;   +0x00  status: 0=idle, 1=request, 2=done, 3=crashed-handled
+;;   +0x08  test id
+;;   +0x10  thunk (raw tagged-fn bits — funcall accepts directly)
+;;   +0x18  expected (raw tagged-Lisp bits)
+;;   +0x20  result (raw tagged-Lisp bits — only valid when status=2)
+
+;; Worker actor: loops yielding, picks up requests when status=1,
+;; runs the thunk under handler-case, posts the result.  Runs on its
+;; own per-actor heap+stack — heap corruption from a wedge cannot
+;; leak into the primordial actor's heap.
+(defun %wedge-worker ()
+  (loop
+    (when (= (mem-ref #x100A0000 :u64) 1)
+      (handler-case
+        (let ((thunk (mem-ref #x100A0010 :u64)))
+          (let ((result (funcall thunk)))
+            (setf (mem-ref #x100A0020 :u64) result)
+            (setf (mem-ref #x100A0000 :u64) 2)))
+        (t (c)
+          (setf (mem-ref #x100A0000 :u64) 3))))
+    (yield)))
+
+;; Dispatcher: send (id, thunk, expected) to the worker, yield up to
+;; *wedge-actor-deadline* times waiting for a result, then process.
+;; If the worker times out (status still 1), we record FAIL and leak
+;; the actor (it'll keep spinning in its wedge — not great, but the
+;; primordial keeps going with its heap intact).
+(defvar *wedge-worker-id* 0)
+(defvar *wedge-actor-deadline* 200)
+(defun run-test-via-actor (id thunk expected)
+  (when (%tested-p id) (return-from run-test-via-actor nil))
+  (when (= *wedge-worker-id* 0)
+    (setq *wedge-worker-id* (actor-spawn (fn-addr %wedge-worker))))
+  (setf (mem-ref #x100A0008 :u64) id)
+  (setf (mem-ref #x100A0010 :u64) thunk)
+  (setf (mem-ref #x100A0018 :u64) expected)
+  (setf (mem-ref #x100A0000 :u64) 1)
+  (let ((deadline *wedge-actor-deadline*))
+    (loop
+      (when (<= deadline 0) (return nil))
+      (yield)
+      (when (>= (mem-ref #x100A0000 :u64) 2) (return nil))
+      (setq deadline (- deadline 1))))
+  (let ((status (mem-ref #x100A0000 :u64)))
+    (cond
+      ((= status 2)
+       (let ((actual (mem-ref #x100A0020 :u64)))
+         (rt-run-test id actual expected)))
+      (t
+       ;; Worker's handler-case caught (status=3), or it timed out
+       ;; (status=1 still).  Either way: heap-isolated FAIL.
+       (%record-test-fail id))))
+  ;; Reset work block (note: if status was 1 the worker is still spinning
+  ;; on the wedge; setting status=0 means it won't try a new request — but
+  ;; it will keep running its dead loop forever in its corner of the heap).
+  (setf (mem-ref #x100A0000 :u64) 0)
+  nil)
 
 (defun sys-exit (code)
   ;; No process model — code argument ignored; just halt.
@@ -3057,15 +3109,12 @@
   (smp-init)
   (actor-init)
 
-  ;; POC step 3: spawn a worker actor that prints WK and loops.
-  ;; If raw-fn fix in actor-spawn override works, restore-context BR's
-  ;; to the worker's entry, worker writes WK, then yields back, then
-  ;; we proceed to [P].
-  (write-char-serial 91) (write-char-serial 49) (write-char-serial 93) ;; [1] pre-spawn
-  (actor-spawn (fn-addr %trivial-worker))
-  (write-char-serial 91) (write-char-serial 50) (write-char-serial 93) ;; [2] post-spawn
-  (yield)
-  (write-char-serial 91) (write-char-serial 80) (write-char-serial 93) ;; [P] post-yield
+  ;; POC step 4: wedge worker actor.  Spawned lazily from
+  ;; run-test-via-actor on first call.  Initialize the work block status
+  ;; to 0 (idle) and zero the worker-id slot so the lazy-spawn path fires.
+  (setf (mem-ref #x100A0000 :u64) 0)
+  (setq *wedge-worker-id* 0)
+  (setq *wedge-actor-deadline* 200)
 
   ;; Standard init sequence (matches Linux x64 build).
   (init-symbol-table)
@@ -3186,6 +3235,23 @@
   ;;
   ;; Stamp pre-assoc range too (10001-10179) which was previously
   ;; bypassed via *skip-below*=10180 but produced no FAIL records.
+  ;; POC step 4: route 10449 (the :TEST-NOT wedge) through the actor
+  ;; path BEFORE pre-stamping. Init must be done; symbol table + CL
+  ;; functions need to be live for the test thunk's INTERSECTION etc.
+  (handler-case
+    (run-test-via-actor 10449
+                        (lambda () (EQUALT
+                                     (SORT
+                                      (INTERSECTION (LOOP FOR I FROM 0 TO 999 BY 5 COLLECT I)
+                                                    (LOOP FOR I FROM 0 TO 999 BY 7 COLLECT I)
+                                                    :TEST-NOT
+                                                    (LAMBDA (A B)
+                                                        (NOT (AND (EQL A B) (= (MOD A 3) 0)))))
+                                      (LAMBDA (A B) (< A B)))
+                                     (LOOP FOR I FROM 0 TO 999 BY (* 3 5 7) COLLECT I)))
+                        'T)
+    (t (c) (%test-crash-fail 10449)))
+
   (%pre-stamp-wedges)
   ;; (run-all-tests)
 

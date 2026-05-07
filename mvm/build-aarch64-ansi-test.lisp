@@ -121,6 +121,21 @@
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
 (defun classify-error* (form) nil)
+
+;; Set of test IDs to route through run-test-via-actor (worker actor
+;; with heap+stack isolation).  Populated during build-script eval —
+;; the test-source generator at line ~2200 substitutes the function
+;; name in each (run-test ID ...) call when ID is in this list.
+;;
+;; Initially: all of intersection.lsp's pre-stamped wedge range.
+;; Tests that pass cleanly via the worker recover from FAIL → P;
+;; tests that wedge keep emitting FAIL but with isolated effects.
+(defparameter *actor-routed-ids*
+  ;; Start small: just a few tests at the head of intersection.lsp.
+  ;; Scaling up reveals worker-state-accumulation bugs (heap exhaustion
+  ;; after ~10 tests, lost results past ~15).  Need either GC support
+  ;; in the worker or per-test actor respawn before going wider.
+  '(10436 10437 10438 10439 10440 10441 10442 10443))
 (in-package :modus.mvm)
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
@@ -2210,20 +2225,30 @@
                      (setf *ansi-test-counter* (1+ *ansi-test-counter*))
                      (let ((test-id *ansi-test-counter*))
                        (format t "      ~D = ~A~%" test-id name)
+                       ;; Route specific test IDs through run-test-via-actor
+                       ;; (worker actor with isolated stack/heap).  Set of IDs
+                       ;; checked at generation time.  Multi-value tests stay on
+                       ;; run-test-mv for now (no -mv actor variant yet).
+                       (let* ((runner-name
+                               (if (and (boundp '*actor-routed-ids*)
+                                        (member test-id (symbol-value '*actor-routed-ids*)))
+                                   "run-test-via-actor"
+                                   "run-test"))
+                              (runner-mv-name "run-test-mv"))
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
-                                            (format nil "(run-test ~D (lambda () ~S) '~S)"
-                                                    test-id test-form (car expected)))
+                                            (format nil "(~A ~D (lambda () ~S) '~S)"
+                                                    runner-name test-id test-form (car expected)))
                                            ((> (length expected) 0)
-                                            (format nil "(run-test-mv ~D (lambda () (multiple-value-list ~S)) '~S)"
-                                                    test-id test-form expected))
+                                            (format nil "(~A ~D (lambda () (multiple-value-list ~S)) '~S)"
+                                                    runner-mv-name test-id test-form expected))
                                            ;; (deftest NAME FORM) with no explicit
                                            ;; expected — test expects zero values.
                                            ;; Render as run-test-mv with '() expected.
                                            (t
-                                            (format nil "(run-test-mv ~D (lambda () (multiple-value-list ~S)) 'NIL)"
-                                                    test-id test-form)))
+                                            (format nil "(~A ~D (lambda () (multiple-value-list ~S)) 'NIL)"
+                                                    runner-mv-name test-id test-form)))
                                          (error () nil))))
                          ;; For real.lsp: fix / and - inside backquote commas
                          ;; (tree rewriter can't reach inside SBCL comma objects)
@@ -2258,7 +2283,7 @@
                                     (not (search "#<CLOSURE" test-str))
                                     (not (search "&ENVIRONMENT" test-str))
                                     (not (search "STRUCT-TEST-" test-str)))
-                           (push test-str test-forms))))))
+                           (push test-str test-forms)))))))
                   ((and (consp form) (member (car form)
                           '(defharmless def-fold-test def-macro-test
                             in-package declaim))) nil)
@@ -2770,7 +2795,7 @@
                      ~%;; own function to keep kernel-main small (layout-fragility avoidance).~
                      ~%(defun %pre-stamp-wedges ()~
                      ~%  (%fail-range 10001 10179)  ;; pre-assoc + assoc.lsp wedge~
-                     ~%  (%fail-range 10436 10484)  ;; intersection.lsp wedge~
+                     ~%  (%fail-range 10444 10484)  ;; intersection.lsp tail — 10436-10443 actor-routed~
                      ~%  (%fail-range 10587 10591)  ;; mapc.lsp wedge tail~
                      ~%  (%fail-range 10606 10610)  ;; mapcan.lsp wedge tail~
                      ~%  (%fail-range 10620 10625)  ;; mapcar.lsp wedge tail~
@@ -3240,81 +3265,10 @@
   ;;
   ;; Stamp pre-assoc range too (10001-10179) which was previously
   ;; bypassed via *skip-below*=10180 but produced no FAIL records.
-  ;; POC step 5: scale actor routing to a batch of intersection.lsp
-  ;; tests.  Three categories:
-  ;;   simple:  10436, 10437, 10438 — should pass cleanly (P)
-  ;;   :TEST lambda:    10448 — moderate-complexity, may pass or wedge
-  ;;   :TEST-NOT lambda: 10449 — known wedge
-  ;;   :TEST #'IDENTITY: 10477 — known wedge (HANDLER-CASE around bad call)
-  ;;
-  ;; All run BEFORE %pre-stamp-wedges so bitmap is clear.  Each routes
-  ;; through the actor, gets P or FAIL, sets bitmap.  Pre-stamp later
-  ;; sees bitmap=1 and skips them.
-
-  ;; 10436: (INTERSECTION NIL NIL) → 'NIL
-  (handler-case
-    (run-test-via-actor 10436 (lambda () (INTERSECTION NIL NIL)) 'NIL)
-    (t (c) (%test-crash-fail 10436)))
-
-  ;; 10437: (INTERSECTION (1..100) NIL) → 'NIL
-  (handler-case
-    (run-test-via-actor 10437 (lambda () (INTERSECTION
-                                            (LOOP FOR I FROM 1 TO 100 COLLECT I)
-                                            NIL))
-                        'NIL)
-    (t (c) (%test-crash-fail 10437)))
-
-  ;; 10438: (INTERSECTION NIL (1..100)) → 'NIL
-  (handler-case
-    (run-test-via-actor 10438 (lambda () (INTERSECTION
-                                            NIL
-                                            (LOOP FOR I FROM 1 TO 100 COLLECT I)))
-                        'NIL)
-    (t (c) (%test-crash-fail 10438)))
-
-  ;; 10448: :TEST lambda — original ANSI test passed (had bitmap=1 P)
-  ;; on primordial path before; let's see if actor path agrees.
-  (handler-case
-    (run-test-via-actor 10448 (lambda () (EQUALT
-                                            (SORT
-                                             (INTERSECTION
-                                              (LOOP FOR I FROM 0 TO 999 BY 5 COLLECT I)
-                                              (LOOP FOR I FROM 0 TO 999 BY 7 COLLECT I)
-                                              :TEST
-                                              (LAMBDA (A B) (AND (EQL A B) (= (MOD A 3) 0))))
-                                             (LAMBDA (A B) (< A B)))
-                                            (LOOP FOR I FROM 0 TO 999 BY (* 3 5 7) COLLECT I)))
-                        'T)
-    (t (c) (%test-crash-fail 10448)))
-
-  ;; 10449: :TEST-NOT lambda — known wedge.  Original investigation
-  ;; trigger; expected status=3 (worker handler-case catches crash).
-  (handler-case
-    (run-test-via-actor 10449
-                        (lambda () (EQUALT
-                                     (SORT
-                                      (INTERSECTION (LOOP FOR I FROM 0 TO 999 BY 5 COLLECT I)
-                                                    (LOOP FOR I FROM 0 TO 999 BY 7 COLLECT I)
-                                                    :TEST-NOT
-                                                    (LAMBDA (A B)
-                                                        (NOT (AND (EQL A B) (= (MOD A 3) 0)))))
-                                      (LAMBDA (A B) (< A B)))
-                                     (LOOP FOR I FROM 0 TO 999 BY (* 3 5 7) COLLECT I)))
-                        'T)
-    (t (c) (%test-crash-fail 10449)))
-
-  ;; 10477: HANDLER-CASE around bad call — :TEST #'IDENTITY.
-  ;; Inner handler-case catches and returns NIL; outer EQUALT vs T → fail.
-  ;; (or the wedge fires inside INTERSECTION before HANDLER-CASE can fire).
-  (handler-case
-    (run-test-via-actor 10477 (lambda () (HANDLER-CASE
-                                            (PROGN
-                                              (INTERSECTION '(A B C) '(D E F) :TEST IDENTITY)
-                                              NIL)
-                                            (T (C) T)))
-                        'T)
-    (t (c) (%test-crash-fail 10477)))
-
+  ;; POC step 5: actor routing applied at SBCL build-time via
+  ;; *actor-routed-ids*.  Each (run-test ID ...) call for ID in that
+  ;; set was rewritten to (run-test-via-actor ID ...).  No inline
+  ;; hardcoded tests in kernel-main any more.
   (%pre-stamp-wedges)
   ;; (run-all-tests)
 

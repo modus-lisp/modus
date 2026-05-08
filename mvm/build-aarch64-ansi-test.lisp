@@ -131,10 +131,13 @@
 ;; Tests that pass cleanly via the worker recover from FAIL → P;
 ;; tests that wedge keep emitting FAIL but with isolated effects.
 (defparameter *actor-routed-ids*
-  ;; Start small: just a few tests at the head of intersection.lsp.
-  ;; Scaling up reveals worker-state-accumulation bugs (heap exhaustion
-  ;; after ~10 tests, lost results past ~15).  Need either GC support
-  ;; in the worker or per-test actor respawn before going wider.
+  ;; Validated working: 8 tests at the head of intersection.lsp.
+  ;; Wider ranges hit a different bug — the symptom is that even
+  ;; simple tests (like 10440 (INTERSECTION X Y) where X,Y are tiny
+  ;; copy-lists) start failing past the 4th routed test.  Cause TBD;
+  ;; might be cross-test state leak in worker, or actor scheduler
+  ;; quirk.  Stick to 8 for the committed POC; investigate scaling
+  ;; in a follow-up.
   '(10436 10437 10438 10439 10440 10441 10442 10443))
 (in-package :modus.mvm)
 (defun notnot (x) (not (not x)))

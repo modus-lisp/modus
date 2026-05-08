@@ -138,7 +138,8 @@
   ;; might be cross-test state leak in worker, or actor scheduler
   ;; quirk.  Stick to 8 for the committed POC; investigate scaling
   ;; in a follow-up.
-  '(10436 10437 10438 10439 10440 10441 10442 10443))
+  '(10436 10437 10438 10439 10440 10441 10442 10443
+    10444 10445 10446 10447 10448 10449 10450))
 (in-package :modus.mvm)
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
@@ -2798,7 +2799,7 @@
                      ~%;; own function to keep kernel-main small (layout-fragility avoidance).~
                      ~%(defun %pre-stamp-wedges ()~
                      ~%  (%fail-range 10001 10179)  ;; pre-assoc + assoc.lsp wedge~
-                     ~%  (%fail-range 10444 10484)  ;; intersection.lsp tail — 10436-10443 actor-routed~
+                     ~%  (%fail-range 10451 10484)  ;; intersection.lsp tail (10436-10450 actor-routed)~
                      ~%  (%fail-range 10587 10591)  ;; mapc.lsp wedge tail~
                      ~%  (%fail-range 10606 10610)  ;; mapcan.lsp wedge tail~
                      ~%  (%fail-range 10620 10625)  ;; mapcar.lsp wedge tail~
@@ -3046,12 +3047,20 @@
   (setf (mem-ref #x100A0010 :u64) thunk)
   (setf (mem-ref #x100A0018 :u64) expected)
   (setf (mem-ref #x100A0000 :u64) 1)
+  ;; Arm the deadline IRQ before yielding to worker.  When worker hits
+  ;; an infinite-loop wedge (no handler-case crash, just won't return),
+  ;; the timer longjmps via slot 0x10000180 — but slot 180 is whatever
+  ;; the worker's handler-case last set, so the worker's T-clause fires
+  ;; and writes status=3.  Without this, infinite-loop wedges leave the
+  ;; worker stuck forever and subsequent dispatches hang.
+  (setf (mem-ref #x10000C70 :u64) 50)
   (let ((deadline *wedge-actor-deadline*))
     (loop
       (when (<= deadline 0) (return nil))
       (yield)
       (when (>= (mem-ref #x100A0000 :u64) 2) (return nil))
       (setq deadline (- deadline 1))))
+  (setf (mem-ref #x10000C70 :u64) 0)  ; disarm
   (let ((status (mem-ref #x100A0000 :u64)))
     (cond
       ((= status 2)

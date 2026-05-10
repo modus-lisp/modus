@@ -2821,7 +2821,26 @@
                      ~%  (%fail-range 17072 18639)  ;; speculative: elt.lsp + sequences through position-if~
                      ~%  (%fail-range 18640 20000)  ;; speculative: more sequence wedges~
                      ~%  (%fail-range 20893 22134)  ;; speculative: vector + array + pprint + prin*~
-                     ~%  (%fail-range 22135 27692)  ;; speculative: everything from print/format to end~
+                     ~%  (%fail-range 22135 22154)  ;; print-bit-vector through print-complex (wedge-prone print)~
+                     ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
+                     ~%  (%fail-range 22538 23957)  ;; format-* family (complex output wedges)~
+                     ~%  (%fail-range 24347 24349)  ;; stream-error-stream wedge~
+                     ~%  (%fail-range 24496 24522)  ;; defpackage wedge~
+                     ~%  (%fail-range 24568 24574)  ;; export wedge~
+                     ~%  (%fail-range 24764 24775)  ;; shadow wedge~
+                     ~%  (%fail-range 24790 24835)  ;; unintern through with-package-iterator (package wedges)~
+                     ~%  (%fail-range 24836 24948)  ;; compile through eval-when (runtime-compile not implemented)~
+                     ~%  (%fail-range 25039 25151)  ;; lambda through type wedges~
+                     ~%  (%fail-range 25184 25204)  ;; deftype wedge~
+                     ~%  (%fail-range 25702 25897)  ;; reader test wedges~
+                     ~%  (%fail-range 25898 26045)  ;; syntax wedges~
+                     ~%  (%fail-range 26067 26068)  ;; with-standard-io-syntax tail wedge~
+                     ~%  (%fail-range 26113 26260)  ;; disassemble through user-homedir-pathname (introspection)~
+                     ~%  (%fail-range 26261 26501)  ;; abort through restart-case (condition system)~
+                     ~%  (%fail-range 26502 26546)  ;; store-value through with-simple-restart~
+                     ~%  (%fail-range 26547 27037)  ;; pathname/namestring family wedges~
+                     ~%  (%fail-range 27162 27692)  ;; entire defgeneric/defclass/CLOS family (incomplete)~
+                     ~%  ;; 23958-27692: streams, CLOS, conditions, etc — UNSKIPPED for bisect~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

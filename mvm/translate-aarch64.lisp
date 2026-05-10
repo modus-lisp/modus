@@ -59,6 +59,21 @@
   "When non-nil, YIELD emits NOP instead of SEV+WFE. Required for QEMU raspi3b
    where WFE halts the CPU with no wake event (no GIC to generate events).")
 
+(defvar *aarch64-fn-addr-patches* nil
+  "List of (native-byte-offset . target-bytecode-offset) recorded by
+   +op-fn-addr+ translation.  Each entry says: at NATIVE-BYTE-OFFSET in
+   the translator's output buffer, there is a MOVZ + MOVK pair whose
+   imm16 fields need to be patched with the low and high 16 bits of
+   the runtime address of the function whose bytecode entry is at
+   TARGET-BYTECODE-OFFSET.  The patch is applied by cross.lisp's
+   `apply-aarch64-fn-addr-patches` after image assembly, when the
+   native-image-offset is known.
+
+   This replaces the original ADR (±1 MB PC-relative) emit with an
+   absolute 32-bit address load.  Image-wide function references
+   become layout-shift-stable, eliminating the ADR-truncation class
+   of fragility bugs on AArch64 ANSI builds.")
+
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
 ;;; ============================================================
@@ -2307,22 +2322,39 @@
                    (a64-stur buf ps +a64-x16+ 0)))))
 
           ;; ---- FN-ADDR Vd, target:imm32 ----
-          ;; Load tagged function address. Target is bytecode offset.
-          ;; Resolved via ADR (PC-relative), then LSL #1 to tag as fixnum.
+          ;; Load raw function address. Target is bytecode offset.
+          ;;
+          ;; Emits a MOVZ + MOVK pair (placeholder imm16=0 in both)
+          ;; that loads a 32-bit absolute address.  The patch list
+          ;; records the byte offset so cross.lisp can write the
+          ;; actual address into the imm16 fields after image
+          ;; assembly (when load_addr + native_image_offset +
+          ;; target_native_offset is known).
+          ;;
+          ;; Replaces the original ADR (PC-relative ±1 MB), which
+          ;; truncated for any function more than 1 MB from the
+          ;; call site — the cause of layout-fragility bugs on
+          ;; the 38 MB ANSI build.
           ((= op +op-fn-addr+)
            (let* ((vd (vr 0))
                   (target-offset (vr 1))
-                  (pd (or (a64-phys-reg vd) +a64-x16+))
-                  (label (gethash target-offset mvm-to-native-label)))
-             (if label
-                 (let ((idx (a64-current-index buf)))
-                   ;; ADR Xd, target — placeholder, resolved by fixup
-                   ;; Result is raw address (NOT tagged) — matches x64 behavior.
-                   ;; CALL-IND uses BLR which needs a raw address.
-                   (a64-emit buf (logior (ash #b10000 24) pd))
-                   (a64-add-fixup buf idx label :adr))
-                 ;; Unknown target: load 0
-                 (a64-movz buf pd 0 0))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (cond
+               ((gethash target-offset mvm-to-native-label)
+                ;; Record the byte position of the MOVZ so the patcher
+                ;; can find both MOVZ (movz-pos) and MOVK (movz-pos+4).
+                (let ((movz-byte-pos (* (a64-current-index buf) 4)))
+                  (push (cons movz-byte-pos target-offset)
+                        *aarch64-fn-addr-patches*))
+                ;; MOVZ Xd, #0 (placeholder for low 16 bits)
+                (a64-movz buf pd 0 0)
+                ;; MOVK Xd, #0, lsl 16 (placeholder for high 16 bits)
+                (a64-movk buf pd 0 1))
+               (t
+                ;; Unknown target: load 0 (NIL/sentinel)
+                (a64-movz buf pd 0 0)
+                ;; Pad with NOP so all fn-addr sites are 8 bytes.
+                (a64-emit buf #xD503201F)))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -2503,6 +2535,10 @@
 
    Also returns as a second value a hash table mapping
    function-index → native-byte-offset."
+  ;; Reset fn-addr patch list at start of each image translation.
+  ;; Patches accumulated here are applied by cross.lisp after image
+  ;; assembly; see *aarch64-fn-addr-patches* docstring.
+  (setf *aarch64-fn-addr-patches* nil)
   (let* ((buf (make-a64-buffer))
          (func-offsets (make-hash-table :test 'eql))
          (mvm-to-native-label (make-hash-table :test 'equal))

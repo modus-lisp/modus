@@ -472,6 +472,74 @@
      (+ 64 56))    ; ELF64 ehdr (64) + 1 phdr (56)
     (t 0)))
 
+(defun apply-aarch64-fn-addr-patches (raw-bytes image module boot-descriptor)
+  "Walk *aarch64-fn-addr-patches* and write the runtime address of each
+   target function into the MOVZ + MOVK immediate fields that the
+   translator emitted as placeholders.
+
+   Each patch entry is (native-byte-offset . target-bytecode-offset):
+   the byte position of the MOVZ in the native code, and the bytecode
+   offset of the target function.  We look up the function's
+   native-offset (in mvm-function-info), compute its runtime virtual
+   address, and write the low 16 bits into the MOVZ imm16 field and
+   the high 16 bits into the MOVK imm16 field (4 bytes later).
+
+   AArch64 MOVZ/MOVK encoding has imm16 at bits [20:5] of the 32-bit
+   instruction word.  We read the existing instruction word, clear
+   bits [20:5], OR in the new imm16, write back."
+  (let ((patches (and (boundp '*aarch64-fn-addr-patches*)
+                      *aarch64-fn-addr-patches*)))
+    (when patches
+      (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
+             (declared-load-addr
+              (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))
+             ;; QEMU virt's `-kernel` loads AArch64 binaries at PA
+             ;; load-addr + 0x80000 (Linux Image convention).  After
+             ;; the boot stub enables MMU with offset mapping, native
+             ;; code runs at identity-mapped VAs which equal those PAs.
+             ;; So function-address constants must use load-addr + 0x80000.
+             (arch (and boot-descriptor (getf boot-descriptor :arch)))
+             (image-load-offset
+              (if (member arch '(:aarch64 :rpi)) #x80000 0))
+             (load-addr (+ declared-load-addr image-load-offset))
+             ;; Build bytecode-offset → native-offset lookup.
+             (bc-to-native (make-hash-table :test 'eql)))
+        (dolist (fn-info (mvm-module-function-table module))
+          (when (mvm-function-info-native-offset fn-info)
+            (setf (gethash (mvm-function-info-bytecode-offset fn-info) bc-to-native)
+                  (mvm-function-info-native-offset fn-info))))
+        (dolist (patch patches)
+          (let* ((movz-byte-pos (car patch))
+                 (target-bc-offset (cdr patch))
+                 (target-native-offset (gethash target-bc-offset bc-to-native))
+                 (movz-file-pos (+ native-image-offset movz-byte-pos))
+                 (movk-file-pos (+ movz-file-pos 4)))
+            (when target-native-offset
+              (let* ((target-vaddr (+ load-addr native-image-offset
+                                      target-native-offset))
+                     (lo16 (logand target-vaddr #xFFFF))
+                     (hi16 (logand (ash target-vaddr -16) #xFFFF)))
+                (patch-aarch64-mov-imm16 raw-bytes movz-file-pos lo16)
+                (patch-aarch64-mov-imm16 raw-bytes movk-file-pos hi16)))))))))
+
+(defun patch-aarch64-mov-imm16 (raw-bytes file-pos imm16)
+  "Patch the imm16 field of an AArch64 MOVZ or MOVK instruction at
+   FILE-POS in RAW-BYTES.  imm16 lives at bits [20:5] of the 32-bit
+   instruction word (little-endian).  We read 4 bytes, clear bits
+   [20:5], OR in (imm16 << 5), write back."
+  (let* ((b0 (aref raw-bytes file-pos))
+         (b1 (aref raw-bytes (+ file-pos 1)))
+         (b2 (aref raw-bytes (+ file-pos 2)))
+         (b3 (aref raw-bytes (+ file-pos 3)))
+         (insn (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))
+         ;; Clear bits [20:5] (16 bits starting at position 5)
+         (cleared (logand insn (lognot (ash #xFFFF 5))))
+         (patched (logior cleared (ash (logand imm16 #xFFFF) 5))))
+    (setf (aref raw-bytes file-pos)       (logand patched #xFF))
+    (setf (aref raw-bytes (+ file-pos 1)) (logand (ash patched -8) #xFF))
+    (setf (aref raw-bytes (+ file-pos 2)) (logand (ash patched -16) #xFF))
+    (setf (aref raw-bytes (+ file-pos 3)) (logand (ash patched -24) #xFF))))
+
 (defun apply-li-const-patches (raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
   "Walk the architecture-specific LI-CONST patch list and write tagged
@@ -673,6 +741,11 @@
         ;; tagged-addr from pool-vaddr + addr-table[idx].
         (apply-li-const-patches raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
+        ;; AArch64 fn-addr patches: write the absolute runtime address
+        ;; of each target function into the MOVZ + MOVK placeholder
+        ;; pair that +op-fn-addr+ emitted.  See translate-aarch64.lisp
+        ;; *aarch64-fn-addr-patches* docstring.
+        (apply-aarch64-fn-addr-patches raw-bytes image module boot-descriptor)
         ;; UEFI: patch stub with kernel data offset/size, then wrap in PE32+
         (when (and boot-descriptor (getf boot-descriptor :uefi))
           (patch-uefi-stub raw-bytes

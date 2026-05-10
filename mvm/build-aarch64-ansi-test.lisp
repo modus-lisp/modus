@@ -2809,18 +2809,18 @@
                      ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp~
                      ~%  (%fail-range 10695 10718)  ;; member-if.lsp~
                      ~%  (%fail-range 10719 10768)  ;; member.lsp~
-                     ~%  (%fail-range 10810 11125)  ;; nintersection.lsp tail through nunion.lsp~
+                     ~%  ;; 10810-11125 confirmed clean post-fn-addr-fix (no wedges)~
                      ~%  (%fail-range 11151 11180)  ;; pushnew.lsp~
-                     ~%  (%fail-range 11183 11410)  ;; rassoc-* + reduce/remf/remove-dup/rplaca/d + set-* wedges~
-                     ~%  (%fail-range 11438 11547)  ;; subsetp + subst-if-not + subst-if + subst.lsp~
-                     ~%  (%fail-range 11608 12572)  ;; union.lsp tail through notany.lsp~
-                     ~%  (%fail-range 12573 13527)  ;; through cascade-lz to format.lsp range~
-                     ~%  (%fail-range 14069 15186)  ;; number-comparison.lsp wedge cascade~
+                     ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
+                     ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
+                     ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella restored~
+                     ~%  (%fail-range 12573 13527)  ;; format range — multi-wedge umbrella~
+                     ~%  (%fail-range 14069 15186)  ;; number-comparison — multi-wedge~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp~
-                     ~%  (%fail-range 15744 17037)  ;; speculative: makunbound..count.lsp~
-                     ~%  (%fail-range 17072 18639)  ;; speculative: elt.lsp + sequences through position-if~
-                     ~%  (%fail-range 18640 20000)  ;; speculative: more sequence wedges~
-                     ~%  (%fail-range 20893 22134)  ;; speculative: vector + array + pprint + prin*~
+                     ~%  (%fail-range 15744 17037)  ;; makunbound..count — multi-wedge~
+                     ~%  (%fail-range 17072 18639)  ;; elt + sequences — multi-wedge~
+                     ~%  (%fail-range 18640 20000)  ;; more sequence — multi-wedge~
+                     ~%  (%fail-range 20893 22134)  ;; vector + array + pprint — multi-wedge~
                      ~%  (%fail-range 22135 22154)  ;; print-bit-vector through print-complex (wedge-prone print)~
                      ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
                      ~%  (%fail-range 22538 23957)  ;; format-* family (complex output wedges)~

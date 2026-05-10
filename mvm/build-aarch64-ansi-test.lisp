@@ -2808,14 +2808,21 @@
                      ~%  (%fail-range 10695 10718)  ;; member-if.lsp wedge~
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
                      ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
-                     ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella restored~
+                     ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella~
+                     ~%  (%fail-range 11642 11656)  ;; and (1st-wedge bisect probe target)~
                      ~%  (%fail-range 12573 13527)  ;; format range — multi-wedge umbrella~
+                     ~%  (%fail-range 12641 12651)  ;; nth-value~
                      ~%  (%fail-range 14069 15186)  ;; number-comparison — multi-wedge~
+                     ~%  (%fail-range 14341 14374)  ;; plus~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp~
                      ~%  (%fail-range 15744 17037)  ;; makunbound..count — multi-wedge~
-                     ~%  (%fail-range 17072 18639)  ;; elt + sequences — multi-wedge~
+                     ~%  (%fail-range 15743 15747)  ;; makunbound (1st)~
+                     ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
+                     ~%  (%fail-range 17072 17106)  ;; elt tail (only wedge in 17072-18639)~
                      ~%  (%fail-range 18640 20000)  ;; more sequence — multi-wedge~
+                     ~%  (%fail-range 18790 18891)  ;; reduce (1st)~
                      ~%  (%fail-range 20893 22134)  ;; vector + array + pprint — multi-wedge~
+                     ~%  (%fail-range 20893 20897)  ;; vector-pop (1st)~
                      ~%  (%fail-range 22135 22154)  ;; print-bit-vector through print-complex (wedge-prone print)~
                      ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
                      ~%  (%fail-range 22538 23957)  ;; format-* family (complex output wedges)~

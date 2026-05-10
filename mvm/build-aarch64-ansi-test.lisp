@@ -2798,19 +2798,14 @@
                      ~%;; test-fail) make run-test no-op on these IDs.  Defined as its~
                      ~%;; own function to keep kernel-main small (layout-fragility avoidance).~
                      ~%(defun %pre-stamp-wedges ()~
-                     ~%  (%fail-range 10001 10179)  ;; pre-assoc + assoc.lsp wedge~
-                     ~%  (%fail-range 10451 10484)  ;; intersection.lsp tail (10436-10450 actor-routed)~
-                     ~%  (%fail-range 10587 10591)  ;; mapc.lsp wedge tail~
-                     ~%  (%fail-range 10606 10610)  ;; mapcan.lsp wedge tail~
-                     ~%  (%fail-range 10620 10625)  ;; mapcar.lsp wedge tail~
-                     ~%  (%fail-range 10634 10638)  ;; mapcon.lsp wedge tail~
-                     ~%  (%fail-range 10647 10652)  ;; mapl.lsp wedge tail~
-                     ~%  (%fail-range 10653 10671)  ;; maplist.lsp~
-                     ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp~
-                     ~%  (%fail-range 10695 10718)  ;; member-if.lsp~
-                     ~%  (%fail-range 10719 10768)  ;; member.lsp~
-                     ~%  ;; 10810-11125 confirmed clean post-fn-addr-fix (no wedges)~
-                     ~%  (%fail-range 11151 11180)  ;; pushnew.lsp~
+                     ~%  ;; All these confirmed clean post-fn-addr-fix:~
+                     ~%  ;;   10001-10179 (pre-assoc + assoc), 10451-10484 (intersection tail),~
+                     ~%  ;;   10587-10591 (mapc), 10606-10610 (mapcan), 10620-10625 (mapcar),~
+                     ~%  ;;   10634-10638 (mapcon), 10647-10652 (mapl), 10719-10768 (member),~
+                     ~%  ;;   11151-11180 (pushnew), 10810-11125 (nintersection..nunion).~
+                     ~%  (%fail-range 10653 10671)  ;; maplist — clean but layout-flippy (-68 P), keep~
+                     ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp wedge~
+                     ~%  (%fail-range 10695 10718)  ;; member-if.lsp wedge~
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
                      ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
                      ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella restored~

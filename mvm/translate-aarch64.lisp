@@ -1341,13 +1341,50 @@
                ((= code #x0511)
                 ;; LONGJMP: Restore SP, FP, IP from 0x10000180.
                 ;; Set X0 = T (#xDEAD1009). BR to saved IP.
-                (a64-load-imm64 buf +a64-x16+ #x10000180)
-                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)  ; saved SP
-                (a64-add-imm buf +a64-sp+ +a64-x17+ 0)
-                (a64-ldr-unsigned buf +a64-x29+ +a64-x16+ 8)  ; FP
-                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 16) ; IP
-                (a64-load-imm64 buf +a64-x0+ #xDEAD1009)      ; T
-                (a64-br buf +a64-x17+))
+                ;;
+                ;; Phase 3(d): if the per-fork pop helper is wired up,
+                ;; we copy the inner 180/188/190 triple to scratch
+                ;; slots (mirrors x64 #x10000C10/18/20), BL pop so
+                ;; that 180/188/190 now hold the OUTER handler-case,
+                ;; then restore SP/FP/IP from scratch.  The outer
+                ;; becomes active for any future sync exception that
+                ;; fires AFTER we BR back into the body.  When depth
+                ;; is zero the pop helper writes zeros — same as the
+                ;; pre-Phase-3 LONGJMP-then-CLEAR semantics.
+                (cond
+                  (*aarch64-handler-pop-label*
+                   ;; Read current 180/188/190 → scratch 0xC10/C18/C20.
+                   (a64-load-imm64 buf +a64-x16+ #x10000180)
+                   (a64-load-imm64 buf +a64-x17+ #x10000C10)
+                   (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 0)
+                   (a64-str-unsigned buf +a64-x18+ +a64-x17+ 0)
+                   (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 8)
+                   (a64-str-unsigned buf +a64-x18+ +a64-x17+ 8)
+                   (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 16)
+                   (a64-str-unsigned buf +a64-x18+ +a64-x17+ 16)
+                   ;; Pop the handler stack — overwrites 180/188/190
+                   ;; with outer (or zeros if depth==0).  No need to
+                   ;; preserve x30 here: we BR to scratch-IP at the end
+                   ;; rather than returning.
+                   (let ((idx (a64-current-index buf)))
+                     (a64-bl buf 0)
+                     (a64-add-fixup buf idx *aarch64-handler-pop-label* :bl))
+                   ;; Restore inner SP/FP/IP from scratch.
+                   (a64-load-imm64 buf +a64-x17+ #x10000C10)
+                   (a64-ldr-unsigned buf +a64-x16+ +a64-x17+ 0)
+                   (a64-add-imm buf +a64-sp+ +a64-x16+ 0)
+                   (a64-ldr-unsigned buf +a64-x29+ +a64-x17+ 8)
+                   (a64-ldr-unsigned buf +a64-x16+ +a64-x17+ 16)
+                   (a64-load-imm64 buf +a64-x0+ #xDEAD1009)
+                   (a64-br buf +a64-x16+))
+                  (t
+                   (a64-load-imm64 buf +a64-x16+ #x10000180)
+                   (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)  ; saved SP
+                   (a64-add-imm buf +a64-sp+ +a64-x17+ 0)
+                   (a64-ldr-unsigned buf +a64-x29+ +a64-x16+ 8)  ; FP
+                   (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 16) ; IP
+                   (a64-load-imm64 buf +a64-x0+ #xDEAD1009)      ; T
+                   (a64-br buf +a64-x17+))))
                ((= code #x0512)
                 ;; CLEAR-HANDLER: Phase 3(c) — BL the per-fork handler
                 ;; stack POP helper if it's wired up.  The helper either

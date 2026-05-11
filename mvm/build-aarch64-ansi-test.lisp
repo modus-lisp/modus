@@ -2844,7 +2844,7 @@
                      ~%  ;; (%fail-range 21960 21988)  ;; pprint-indent — unstamp trial~
                      ~%  ;; (%fail-range 22135 22154)  ;; print-bit-vector — unstamp trial~
                      ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
-                     ~%  (%fail-range 22538 23957)  ;; format-* family (complex output wedges)~
+                     ~%  ;; (%fail-range 22538 23957)  ;; format-* umbrella — unstamp trial post-Phase 3~
                      ~%  ;; (%fail-range 24347 24349)  ;; stream-error-stream wedge — unstamp trial~
                      ~%  ;; (%fail-range 24496 24522)  ;; defpackage — unstamp trial~
                      ~%  ;; (%fail-range 24568 24574)  ;; export wedge — unstamp trial~

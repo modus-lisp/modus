@@ -2843,7 +2843,8 @@
                      ~%  ;; (%fail-range 21932 21948)  ;; pprint-exit-if-list-exhausted — unstamp trial~
                      ~%  ;; (%fail-range 21960 21988)  ;; pprint-indent — unstamp trial~
                      ~%  ;; (%fail-range 22135 22154)  ;; print-bit-vector — unstamp trial~
-                     ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
+                     ~%  ;; Split print-floats: 22175-22453 runs (8 P), 22454+ wedges~
+                     ~%  (%fail-range 22454 22526)  ;; print-floats tail — wedges at 22454 post-Phase 3~
                      ~%  ;; (%fail-range 22538 23957)  ;; format-* umbrella — unstamp trial post-Phase 3~
                      ~%  ;; (%fail-range 24347 24349)  ;; stream-error-stream wedge — unstamp trial~
                      ~%  ;; (%fail-range 24496 24522)  ;; defpackage — unstamp trial~
@@ -2860,7 +2861,7 @@
                      ~%  (%fail-range 26261 26501)  ;; abort through restart-case (condition system)~
                      ~%  ;; (%fail-range 26502 26546)  ;; store-value..with-simple-restart — unstamp trial~
                      ~%  (%fail-range 26547 27037)  ;; pathname/namestring family wedges~
-                     ~%  (%fail-range 27162 27692)  ;; entire defgeneric/defclass/CLOS family (incomplete)~
+                     ~%  (%fail-range 27162 27692)  ;; CLOS family — wedges at first test (27162) post-Phase 3~
                      ~%  ;; 23958-27692: streams, CLOS, conditions, etc — UNSKIPPED for bisect~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~

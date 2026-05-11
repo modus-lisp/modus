@@ -596,7 +596,14 @@
                      :symbol-table nfn-table)))
     ;; Emit boot code (architecture-specific)
     (when boot-descriptor
-      (let ((boot-buf (make-mvm-buffer)))
+      (let* ((boot-arch (getf boot-descriptor :arch))
+             ;; AArch64 boot emits AArch64 instructions; use a64-buffer so
+             ;; future cross-buffer label resolution (boot ↔ helpers ↔
+             ;; native code) can be unified.  Other arches still emit raw
+             ;; bytes into mvm-buffer.
+             (boot-buf (if (member boot-arch '(:aarch64 :rpi))
+                           (modus.mvm::make-a64-buffer)
+                           (make-mvm-buffer))))
         ;; x86-64 has a multi-stage boot: multiboot header → 32-bit stub → 64-bit entry
         (let ((mb-fn  (getf boot-descriptor :multiboot-header-fn))
               (b32-fn (getf boot-descriptor :boot32-fn))
@@ -608,7 +615,9 @@
           ;; Generic entry-fn (RISC-V, AArch64)
           (when entry-fn (funcall entry-fn boot-buf)))
         (setf (kernel-image-boot-code image)
-              (mvm-buffer-used-bytes boot-buf))))
+              (if (member boot-arch '(:aarch64 :rpi))
+                  (modus.mvm::a64-buffer-to-bytes boot-buf)
+                  (mvm-buffer-used-bytes boot-buf)))))
     ;; Find kernel-main entry point (native offset within code buffer)
     ;; Use LAST match — "last-defun-wins" means the last kernel-main is the real one.
     (dolist (fn-info (mvm-module-function-table module))

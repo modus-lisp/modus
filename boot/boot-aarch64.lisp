@@ -56,11 +56,15 @@
 ;;; ============================================================
 
 (defun emit-aarch64-u32 (buf word)
-  "Emit a 32-bit little-endian instruction into BUF."
-  (mvm-emit-byte buf (ldb (byte 8  0) word))
-  (mvm-emit-byte buf (ldb (byte 8  8) word))
-  (mvm-emit-byte buf (ldb (byte 8 16) word))
-  (mvm-emit-byte buf (ldb (byte 8 24) word)))
+  "Emit a 32-bit instruction into BUF.
+
+   BUF is an a64-buffer (translate-aarch64.lisp:153), which stores the
+   word in its `code` array as a u32 (little-endian conversion deferred
+   to a64-buffer-to-bytes).  Earlier this emitted 4 mvm-emit-byte calls
+   into an mvm-buffer; switched to a64-buffer so boot preamble and
+   translated kernel code share the same label/fixup space.  See task
+   #34 and reference_handler_stack_design.md."
+  (a64-emit buf word))
 
 (defun emit-aarch64-movz (buf rd imm16 &optional (shift 0))
   "MOVZ Xd, #imm16{, LSL #shift}  shift=0,16,32,48"
@@ -182,13 +186,13 @@
 
     ;; 6. Branch over exception vectors to native code
     ;; Vectors occupy 0x800-0x1000 (2KB). Native code starts at offset 0x1000.
-    (let* ((current-insn (/ (mvm-buffer-position buf) 4))
+    (let* ((current-insn (a64-buffer-position buf))
            (native-start 1024)                  ; instruction 1024 = offset 0x1000
            (skip (- native-start current-insn)))
       ;; B forward to native code
       (emit-aarch64-u32 buf (logior (ash #b000101 26) (logand skip #x3FFFFFF)))
       ;; Pad with NOPs to offset 0x800 (instruction 512)
-      (let ((pad (- 512 (/ (mvm-buffer-position buf) 4))))
+      (let ((pad (- 512 (a64-buffer-position buf))))
         (dotimes (i pad)
           (emit-aarch64-u32 buf #xD503201F))))
 
@@ -249,32 +253,32 @@
        ;;  17.  MOVK x0, #0xDEAD, lsl #16  ; X0 = T (#xDEAD1009)
        ;;  18.  ERET
        ;;  19.  B .                         (no-handler halt — CBZ target)
-       (mvm-emit-u32 buf #xD5384030)        ; MRS x16, ELR_EL1
-       (mvm-emit-u32 buf #xD2818611)        ; MOVZ x17, #0x0c30
-       (mvm-emit-u32 buf #xF2A20011)        ; MOVK x17, #0x1000, lsl #16
-       (mvm-emit-u32 buf #xF9000230)        ; STR x16, [x17]
-       (mvm-emit-u32 buf #xD5386010)        ; MRS x16, FAR_EL1
-       (mvm-emit-u32 buf #xF9000A30)        ; STR x16, [x17, #0x10]
-       (mvm-emit-u32 buf #xF9000E20)        ; STR x0,  [x17, #0x18]
-       (mvm-emit-u32 buf #xD2803010)        ; MOVZ x16, #0x0180
-       (mvm-emit-u32 buf #xF2A20010)        ; MOVK x16, #0x1000, lsl #16
-       (mvm-emit-u32 buf #xF9400211)        ; LDR x17, [x16]
-       (mvm-emit-u32 buf #xB4000131)        ; CBZ x17, +9 instructions — lands on B .
-       (mvm-emit-u32 buf #x9100023F)        ; ADD sp, x17, #0
-       (mvm-emit-u32 buf #xF940061D)        ; LDR x29, [x16, #8]
-       (mvm-emit-u32 buf #xF9400A11)        ; LDR x17, [x16, #16]
+       (emit-aarch64-u32 buf #xD5384030)        ; MRS x16, ELR_EL1
+       (emit-aarch64-u32 buf #xD2818611)        ; MOVZ x17, #0x0c30
+       (emit-aarch64-u32 buf #xF2A20011)        ; MOVK x17, #0x1000, lsl #16
+       (emit-aarch64-u32 buf #xF9000230)        ; STR x16, [x17]
+       (emit-aarch64-u32 buf #xD5386010)        ; MRS x16, FAR_EL1
+       (emit-aarch64-u32 buf #xF9000A30)        ; STR x16, [x17, #0x10]
+       (emit-aarch64-u32 buf #xF9000E20)        ; STR x0,  [x17, #0x18]
+       (emit-aarch64-u32 buf #xD2803010)        ; MOVZ x16, #0x0180
+       (emit-aarch64-u32 buf #xF2A20010)        ; MOVK x16, #0x1000, lsl #16
+       (emit-aarch64-u32 buf #xF9400211)        ; LDR x17, [x16]
+       (emit-aarch64-u32 buf #xB4000131)        ; CBZ x17, +9 instructions — lands on B .
+       (emit-aarch64-u32 buf #x9100023F)        ; ADD sp, x17, #0
+       (emit-aarch64-u32 buf #xF940061D)        ; LDR x29, [x16, #8]
+       (emit-aarch64-u32 buf #xF9400A11)        ; LDR x17, [x16, #16]
        ;; Zero slot 180 — same rationale as entry-5: a one-shot longjmp
        ;; consumes the frame, otherwise a subsequent fault would re-use
        ;; the dead frame.
-       (mvm-emit-u32 buf #xF900021F)        ; STR XZR, [x16]
-       (mvm-emit-u32 buf #xD5184031)        ; MSR ELR_EL1, x17
-       (mvm-emit-u32 buf #xD2820120)        ; MOVZ x0, #0x1009
-       (mvm-emit-u32 buf #xF2BBD5A0)        ; MOVK x0, #0xDEAD, lsl #16
-       (mvm-emit-u32 buf #xD69F03E0)        ; ERET
-       (mvm-emit-u32 buf #x14000000)        ; B .  (no handler — halt here)
+       (emit-aarch64-u32 buf #xF900021F)        ; STR XZR, [x16]
+       (emit-aarch64-u32 buf #xD5184031)        ; MSR ELR_EL1, x17
+       (emit-aarch64-u32 buf #xD2820120)        ; MOVZ x0, #0x1009
+       (emit-aarch64-u32 buf #xF2BBD5A0)        ; MOVK x0, #0xDEAD, lsl #16
+       (emit-aarch64-u32 buf #xD69F03E0)        ; ERET
+       (emit-aarch64-u32 buf #x14000000)        ; B .  (no handler — halt here)
        ;; Fill remaining 12 instructions with NOP
        (dotimes (i 12)
-         (mvm-emit-u32 buf #xD503201F)))
+         (emit-aarch64-u32 buf #xD503201F)))
       ((= entry 5)
        ;; Entry 5: IRQ handler for Current EL with SP_ELx.
        ;;
@@ -317,73 +321,73 @@
        ;;  23.  NORMAL: LDP x0, x1, [SP], #16
        ;;  24.  ERET
        (progn
-         (mvm-emit-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
-         (mvm-emit-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
-         (mvm-emit-u32 buf #xB9400C01)  ; LDR w1,[x0,#0x0C]        (GICC_IAR)
-         (mvm-emit-u32 buf #xB9001001)  ; STR w1,[x0,#0x10]        (GICC_EOIR)
-         (mvm-emit-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
-         (mvm-emit-u32 buf #xD51BE300)  ; MSR CNTV_TVAL_EL0,x0     (re-arm)
-         (mvm-emit-u32 buf #xD2803000)  ; MOVZ x0,#0x0180
-         (mvm-emit-u32 buf #xF2A20000)  ; MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
-         (mvm-emit-u32 buf #xF9457801)  ; LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
-         (mvm-emit-u32 buf #xB4000221)  ; CBZ x1,+17 → NORMAL      (not armed)
-         (mvm-emit-u32 buf #xF1000421)  ; SUBS x1,x1,#1
-         (mvm-emit-u32 buf #xF9057801)  ; STR x1,[x0,#2800]
-         (mvm-emit-u32 buf #x540001C1)  ; B.NE +14 → NORMAL        (not yet zero)
+         (emit-aarch64-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
+         (emit-aarch64-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
+         (emit-aarch64-u32 buf #xB9400C01)  ; LDR w1,[x0,#0x0C]        (GICC_IAR)
+         (emit-aarch64-u32 buf #xB9001001)  ; STR w1,[x0,#0x10]        (GICC_EOIR)
+         (emit-aarch64-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
+         (emit-aarch64-u32 buf #xD51BE300)  ; MSR CNTV_TVAL_EL0,x0     (re-arm)
+         (emit-aarch64-u32 buf #xD2803000)  ; MOVZ x0,#0x0180
+         (emit-aarch64-u32 buf #xF2A20000)  ; MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
+         (emit-aarch64-u32 buf #xF9457801)  ; LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
+         (emit-aarch64-u32 buf #xB4000221)  ; CBZ x1,+17 → NORMAL      (not armed)
+         (emit-aarch64-u32 buf #xF1000421)  ; SUBS x1,x1,#1
+         (emit-aarch64-u32 buf #xF9057801)  ; STR x1,[x0,#2800]
+         (emit-aarch64-u32 buf #x540001C1)  ; B.NE +14 → NORMAL        (not yet zero)
          ;; Deadline expired this tick — try slot 0x10000180 (per-test
          ;; handler) first; if zero, fall back to slot 0x100001C0
          ;; (file-level outer handler set by SAVE-OUTER trap).
-         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 180 SP)
-         (mvm-emit-u32 buf #xB5000081)  ; CBNZ x1,+4 → DO_LJ       (use slot 180)
-         (mvm-emit-u32 buf #x91010000)  ; ADD x0,x0,#0x40          (→ slot 1C0)
-         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 1C0 SP)
-         (mvm-emit-u32 buf #xB4000121)  ; CBZ x1,+9 → NORMAL       (no handler at all)
+         (emit-aarch64-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 180 SP)
+         (emit-aarch64-u32 buf #xB5000081)  ; CBNZ x1,+4 → DO_LJ       (use slot 180)
+         (emit-aarch64-u32 buf #x91010000)  ; ADD x0,x0,#0x40          (→ slot 1C0)
+         (emit-aarch64-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 1C0 SP)
+         (emit-aarch64-u32 buf #xB4000121)  ; CBZ x1,+9 → NORMAL       (no handler at all)
          ;; DO_LJ:
-         (mvm-emit-u32 buf #x9100003F)  ; ADD SP,x1,#0
-         (mvm-emit-u32 buf #xF940041D)  ; LDR x29,[x0,#8]
-         (mvm-emit-u32 buf #xF9400801)  ; LDR x1,[x0,#16]
+         (emit-aarch64-u32 buf #x9100003F)  ; ADD SP,x1,#0
+         (emit-aarch64-u32 buf #xF940041D)  ; LDR x29,[x0,#8]
+         (emit-aarch64-u32 buf #xF9400801)  ; LDR x1,[x0,#16]
          ;; Zero the consumed slot so a subsequent IRQ won't longjmp via
          ;; the now-dead frame.  Without this, a caught test-deadline
          ;; leaves slot 180 (or 1C0) pointing at the just-restored stack
          ;; pos; if the harness fires the next IRQ before any handler-case
          ;; reuses the slot, the longjmp lands in arbitrary code (we've
          ;; observed PC ending up mid-%read-user-dispatch).
-         (mvm-emit-u32 buf #xF900001F)  ; STR XZR,[x0]             (zero slot 180/1C0)
-         (mvm-emit-u32 buf #xD5184021)  ; MSR ELR_EL1,x1
-         (mvm-emit-u32 buf #xD2820120)  ; MOVZ x0,#0x1009
-         (mvm-emit-u32 buf #xF2BBD5A0)  ; MOVK x0,#0xDEAD,LSL #16  (X0 = T)
-         (mvm-emit-u32 buf #xD69F03E0)  ; ERET (longjmp)
+         (emit-aarch64-u32 buf #xF900001F)  ; STR XZR,[x0]             (zero slot 180/1C0)
+         (emit-aarch64-u32 buf #xD5184021)  ; MSR ELR_EL1,x1
+         (emit-aarch64-u32 buf #xD2820120)  ; MOVZ x0,#0x1009
+         (emit-aarch64-u32 buf #xF2BBD5A0)  ; MOVK x0,#0xDEAD,LSL #16  (X0 = T)
+         (emit-aarch64-u32 buf #xD69F03E0)  ; ERET (longjmp)
          ;; NORMAL:
-         (mvm-emit-u32 buf #xA8C107E0)  ; LDP x0,x1,[SP],#16
-         (mvm-emit-u32 buf #xD69F03E0)  ; ERET (normal return)
+         (emit-aarch64-u32 buf #xA8C107E0)  ; LDP x0,x1,[SP],#16
+         (emit-aarch64-u32 buf #xD69F03E0)  ; ERET (normal return)
          ;; Fill remaining 4 instructions with NOP
          (dotimes (i 4)
-           (mvm-emit-u32 buf #xD503201F))))
+           (emit-aarch64-u32 buf #xD503201F))))
       ((= entry 6)
        ;; DIAGNOSTIC: FIQ probe — write 'f' to UART each tick.  GICv2 on
        ;; QEMU virt routes Group 0 interrupts as FIQ to non-secure EL1,
        ;; and the virtual timer is Group 0 by default.  If we see 'f'
        ;; chars but no '!', the vtimer fires as FIQ not IRQ.
        (progn
-         (mvm-emit-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
-         (mvm-emit-u32 buf #xD2A40000)  ; MOVZ x0,#0x2000,LSL #16  (UART VA)
-         (mvm-emit-u32 buf #xD2800CC1)  ; MOVZ x1,#0x66            ('f')
-         (mvm-emit-u32 buf #xB9000001)  ; STR  w1,[x0]
-         (mvm-emit-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
-         (mvm-emit-u32 buf #xB9400C01)  ; LDR  w1,[x0,#0x0C]       (GICC_IAR)
-         (mvm-emit-u32 buf #xB9001001)  ; STR  w1,[x0,#0x10]       (GICC_EOIR)
-         (mvm-emit-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
-         (mvm-emit-u32 buf #xD51BE300)  ; MSR  CNTV_TVAL_EL0,x0    (re-arm)
-         (mvm-emit-u32 buf #xA8C107E0)  ; LDP  x0,x1,[SP],#16
-         (mvm-emit-u32 buf #xD69F03E0)  ; ERET
+         (emit-aarch64-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
+         (emit-aarch64-u32 buf #xD2A40000)  ; MOVZ x0,#0x2000,LSL #16  (UART VA)
+         (emit-aarch64-u32 buf #xD2800CC1)  ; MOVZ x1,#0x66            ('f')
+         (emit-aarch64-u32 buf #xB9000001)  ; STR  w1,[x0]
+         (emit-aarch64-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
+         (emit-aarch64-u32 buf #xB9400C01)  ; LDR  w1,[x0,#0x0C]       (GICC_IAR)
+         (emit-aarch64-u32 buf #xB9001001)  ; STR  w1,[x0,#0x10]       (GICC_EOIR)
+         (emit-aarch64-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
+         (emit-aarch64-u32 buf #xD51BE300)  ; MSR  CNTV_TVAL_EL0,x0    (re-arm)
+         (emit-aarch64-u32 buf #xA8C107E0)  ; LDP  x0,x1,[SP],#16
+         (emit-aarch64-u32 buf #xD69F03E0)  ; ERET
          (dotimes (i 21)
-           (mvm-emit-u32 buf #xD503201F))))
+           (emit-aarch64-u32 buf #xD503201F))))
       (t
        ;; All other entries: B . (infinite loop for debugging)
        (progn
-         (mvm-emit-u32 buf #x14000000)    ; B . (branch to self)
+         (emit-aarch64-u32 buf #x14000000)    ; B . (branch to self)
          (dotimes (i 31)
-           (mvm-emit-u32 buf #xD503201F)))))))
+           (emit-aarch64-u32 buf #xD503201F)))))))
 
 ;;; ============================================================
 ;;; AArch64 PL011 UART
@@ -577,14 +581,14 @@
     (emit-aarch64-movz buf x1 0 0)              ; x1 = 0 (zero value)
     (emit-aarch64-movz buf x2 512 0)            ; x2 = 512 (entries)
     ;; loop: str xzr, [x0], #8; sub x2, x2, #1; cbnz x2, loop
-    (let ((zero-loop-pos (mvm-buffer-position buf)))
+    (let ((zero-loop-pos (a64-buffer-position buf)))
       ;; STR XZR, [X0], #8  (post-index)
       ;; Encoding: 11 111000 00 0 000001000 01 00000 11111
       (emit-aarch64-u32 buf #xF800841F)         ; STR XZR, [X0], #8
       ;; SUB X2, X2, #1
       (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
       ;; CBNZ X2, loop  (back 2 instructions = -8 bytes = -2 words)
-      (let ((offset (/ (- zero-loop-pos (mvm-buffer-position buf)) 4)))
+      (let ((offset (- zero-loop-pos (a64-buffer-position buf))))
         (emit-aarch64-u32 buf (logior (ash #b10110101 24) ; CBNZ (64-bit)
                                       (ash (logand offset #x7FFFF) 5)
                                       x2))))
@@ -592,10 +596,10 @@
     ;; 3. Zero L2 table (4KB) at PA 0x40011000
     (emit-aarch64-load-imm64 buf x0 +tdk-l2-table-pa+)
     (emit-aarch64-movz buf x2 512 0)
-    (let ((zero-loop2-pos (mvm-buffer-position buf)))
+    (let ((zero-loop2-pos (a64-buffer-position buf)))
       (emit-aarch64-u32 buf #xF800841F)         ; STR XZR, [X0], #8
       (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
-      (let ((offset (/ (- zero-loop2-pos (mvm-buffer-position buf)) 4)))
+      (let ((offset (- zero-loop2-pos (a64-buffer-position buf))))
         (emit-aarch64-u32 buf (logior (ash #b10110101 24)
                                       (ash (logand offset #x7FFFF) 5)
                                       x2))))
@@ -627,7 +631,7 @@
     (emit-aarch64-load-imm64 buf x1 #x40000701)         ; x1 = first entry
     (emit-aarch64-movz buf x2 256 0)                     ; x2 = count
     (emit-aarch64-load-imm64 buf x3 #x200000)           ; x3 = 2MB step
-    (let ((fill-loop-pos (mvm-buffer-position buf)))
+    (let ((fill-loop-pos (a64-buffer-position buf)))
       ;; STR X1, [X0], #8
       (emit-aarch64-u32 buf #xF8008401)
       ;; ADD X1, X1, X3  (next PA)
@@ -636,7 +640,7 @@
       ;; SUB X2, X2, #1
       (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
       ;; CBNZ X2, fill_loop
-      (let ((offset (/ (- fill-loop-pos (mvm-buffer-position buf)) 4)))
+      (let ((offset (- fill-loop-pos (a64-buffer-position buf))))
         (emit-aarch64-u32 buf (logior (ash #b10110101 24)
                                       (ash (logand offset #x7FFFF) 5)
                                       x2))))
@@ -650,7 +654,7 @@
     (emit-aarch64-load-imm64 buf x1 #x10000705)                     ; x1 = first entry (PA 0x10000000)
     (emit-aarch64-movz buf x2 384 0)                                 ; x2 = count (128..511 = 384 entries)
     ;; Reuse x3 = 0x200000 (2MB step, already loaded from step 6)
-    (let ((pci-loop-pos (mvm-buffer-position buf)))
+    (let ((pci-loop-pos (a64-buffer-position buf)))
       ;; STR X1, [X0], #8
       (emit-aarch64-u32 buf #xF8008401)
       ;; ADD X1, X1, X3 (next PA)
@@ -658,7 +662,7 @@
       ;; SUB X2, X2, #1
       (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
       ;; CBNZ X2, pci_loop
-      (let ((offset (/ (- pci-loop-pos (mvm-buffer-position buf)) 4)))
+      (let ((offset (- pci-loop-pos (a64-buffer-position buf))))
         (emit-aarch64-u32 buf (logior (ash #b10110101 24)
                                       (ash (logand offset #x7FFFF) 5)
                                       x2))))
@@ -793,13 +797,13 @@
     ;; Native code starts at offset 0x1000 in the image = VA 0x1000
     ;; (Boot preamble occupies offsets 0x000-0x7FF, vectors at 0x800-0xFFF)
     ;; We need to branch from identity-mapped VA (0x4000xxxx) to offset VA (0x1000)
-    (let* ((current-insn (/ (mvm-buffer-position buf) 4))
+    (let* ((current-insn (a64-buffer-position buf))
            (native-start-insn 1024)               ; instruction 1024 = offset 0x1000
            (skip (- native-start-insn current-insn)))
       ;; B forward to native code at offset 0x1000
       (emit-aarch64-u32 buf (logior (ash #b000101 26) (logand skip #x3FFFFFF)))
       ;; Pad with NOPs to offset 0x800 (instruction 512)
-      (let ((pad (- 512 (/ (mvm-buffer-position buf) 4))))
+      (let ((pad (- 512 (a64-buffer-position buf))))
         (dotimes (i pad)
           (emit-aarch64-u32 buf #xD503201F))))
 

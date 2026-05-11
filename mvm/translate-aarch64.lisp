@@ -1298,6 +1298,27 @@
                 ;; Mirrors x64 #x0510 (translate-x64.lisp:584).  Saved IP
                 ;; is the byte AFTER the trap block — both first-call and
                 ;; longjmp-call land there.  No skip-branch needed.
+                ;;
+                ;; Phase 3(b): if the per-fork handler-stack push helper
+                ;; is registered, BL it FIRST so the OUTER 180/188/190
+                ;; triple gets saved before this SETJMP overwrites it.
+                ;; BL clobbers x30, so we save/restore the caller's LR
+                ;; via scratch slot 0x10000FF0 (unused elsewhere).
+                ;; CLEAR-HANDLER and LONGJMP (later steps) will pop the
+                ;; outer triple back into 180/188/190.
+                (when *aarch64-handler-push-label*
+                  ;; save caller x30 to 0x10000FF0
+                  (a64-movz buf +a64-x16+ #xFFF0 0)
+                  (a64-movk buf +a64-x16+ #x1000 1)
+                  (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
+                  ;; BL handler_push (fixup resolved at end of unified emit)
+                  (let ((idx (a64-current-index buf)))
+                    (a64-bl buf 0)
+                    (a64-add-fixup buf idx *aarch64-handler-push-label* :bl))
+                  ;; restore caller x30
+                  (a64-movz buf +a64-x16+ #xFFF0 0)
+                  (a64-movk buf +a64-x16+ #x1000 1)
+                  (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
                 (a64-load-imm64 buf +a64-x16+ #x10000180)
                 (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
                 (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
@@ -1328,13 +1349,34 @@
                 (a64-load-imm64 buf +a64-x0+ #xDEAD1009)      ; T
                 (a64-br buf +a64-x17+))
                ((= code #x0512)
-                ;; CLEAR-HANDLER: simple version (no per-fork stack on
-                ;; bare-metal AArch64 yet).  Just zero slot 0x10000180
-                ;; so the sync-exception handler (Phase A.2) can detect
-                ;; "no active handler-case".  Preserves X0 (return value
-                ;; of handler-case body).
-                (a64-load-imm64 buf +a64-x16+ #x10000180)
-                (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
+                ;; CLEAR-HANDLER: Phase 3(c) — BL the per-fork handler
+                ;; stack POP helper if it's wired up.  The helper either
+                ;; reloads slot 0x10000180/188/190 from frame[depth-1]
+                ;; (uncovering the outer handler-case) OR — when depth
+                ;; is zero — writes zeros to slot 180/188/190 so the
+                ;; sync-exception handler still sees "no handler"
+                ;; (legacy semantics).  Preserves X0 (the handler-case
+                ;; body's return value); see emit-aarch64-handler-helpers
+                ;; — only x9..x13 are touched.
+                ;;
+                ;; Fall back to the simple STR XZR if helpers aren't
+                ;; registered (non-unified caller or pre-Phase-3 build).
+                (cond
+                  (*aarch64-handler-pop-label*
+                   ;; save caller x30 to 0x10000FF0 (slot reserved for
+                   ;; trap-time LR scratch by Phase 3(b)).
+                   (a64-movz buf +a64-x16+ #xFFF0 0)
+                   (a64-movk buf +a64-x16+ #x1000 1)
+                   (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
+                   (let ((idx (a64-current-index buf)))
+                     (a64-bl buf 0)
+                     (a64-add-fixup buf idx *aarch64-handler-pop-label* :bl))
+                   (a64-movz buf +a64-x16+ #xFFF0 0)
+                   (a64-movk buf +a64-x16+ #x1000 1)
+                   (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
+                  (t
+                   (a64-load-imm64 buf +a64-x16+ #x10000180)
+                   (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))))
                ((= code #x0513)
                 ;; SAVE-OUTER: copy slot 0x10000180/188/190 → 0x100001A0/1A8/1B0.
                 ;; Used by fork-file to establish a "fallback" handler that
@@ -2467,8 +2509,8 @@
 ;;; Memory layout (heap, low-1GB identity-mapped on bare metal):
 ;;;   0x10000180/188/190  = CURRENT handler state (SP / FP / IP)
 ;;;                          — what SETJMP writes, LONGJMP reads.
-;;;   0x10000400          = handler-stack depth (pseudo-BSP).
-;;;   0x10000408 + 24*N   = frame N = (saved-SP, saved-FP, saved-IP).
+;;;   0x10010000          = handler-stack depth (pseudo-BSP).
+;;;   0x10010008 + 24*N   = frame N = (saved-SP, saved-FP, saved-IP).
 ;;;
 ;;; PUSH (called by SETJMP just before it overwrites slot 180/188/190):
 ;;;   save current 180/188/190 triple to frame[depth], depth += 1.
@@ -2491,12 +2533,12 @@
   (when (and *aarch64-handler-push-label* *aarch64-handler-pop-label*)
     ;; ---- PUSH helper ----
     (a64-set-label buf *aarch64-handler-push-label*)
-    ;; x9 = 0x10000400 (depth slot)
-    (a64-movz buf +a64-x9+ #x0400 0)
-    (a64-movk buf +a64-x9+ #x1000 1)
+    ;; x9 = 0x10010000 (depth slot)
+    (a64-movz buf +a64-x9+ #x0000 0)
+    (a64-movk buf +a64-x9+ #x1001 1)
     ;; x10 = depth
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
-    ;; x11 = frame_base = 0x10000408 + depth*24
+    ;; x11 = frame_base = 0x10010008 + depth*24
     (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
     (a64-lsl-imm buf +a64-x12+ +a64-x10+ 4)        ; depth*16
     (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
@@ -2518,8 +2560,8 @@
     (a64-ret buf)
     ;; ---- POP helper ----
     (a64-set-label buf *aarch64-handler-pop-label*)
-    (a64-movz buf +a64-x9+ #x0400 0)
-    (a64-movk buf +a64-x9+ #x1000 1)
+    (a64-movz buf +a64-x9+ #x0000 0)
+    (a64-movk buf +a64-x9+ #x1001 1)
     (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
     ;; if depth == 0 → zero slot 180/188/190 and return
     (a64-cmp-imm buf +a64-x10+ 0)
@@ -2538,7 +2580,7 @@
       (a64-set-label buf nz-label)
       (a64-sub-imm buf +a64-x10+ +a64-x10+ 1)
       (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
-      ;; x11 = 0x10000408 + depth*24
+      ;; x11 = 0x10010008 + depth*24
       (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
       (a64-lsl-imm buf +a64-x12+ +a64-x10+ 4)
       (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)

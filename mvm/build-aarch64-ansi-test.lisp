@@ -2819,8 +2819,8 @@
                      ~%  ;;    14391-14401 random, 14572-14601 times)~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp — still wedges; needs Phase 3(e) entry-5 too~
                      ~%  ;; 15744-17037 confirmed: 3 wedges (makunbound, symbol-function, copy-seq) — umbrella removed~
-                     ~%  (%fail-range 15743 15747)  ;; makunbound~
-                     ~%  (%fail-range 15768 15773)  ;; symbol-function~
+                     ~%  ;; (%fail-range 15743 15747)  ;; makunbound — unstamp trial~
+                     ~%  ;; (%fail-range 15768 15773)  ;; symbol-function — unstamp trial~
                      ~%  (%fail-range 16685 16713)  ;; copy-seq~
                      ~%  (%fail-range 17717 17793)  ;; map (exposed by other unskips)~
                      ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
@@ -2833,7 +2833,7 @@
                      ~%  ;; 20893-22134 umbrella replaced by narrow stamps for the actual~
                      ~%  ;;   wedges (probe found pprint-indent at 21960-21988; vector-pop/~
                      ~%  ;;   push/push-extend/pprint-exit-if-list-exhausted from earlier).~
-                     ~%  (%fail-range 20893 20897)  ;; vector-pop~
+                     ~%  ;; (%fail-range 20893 20897)  ;; vector-pop — unstamp trial~
                      ~%  (%fail-range 20898 20944)  ;; vector-push-extend~
                      ~%  (%fail-range 20945 20980)  ;; vector-push~
                      ~%  (%fail-range 21932 21948)  ;; pprint-exit-if-list-exhausted~
@@ -2841,10 +2841,10 @@
                      ~%  (%fail-range 22135 22154)  ;; print-bit-vector through print-complex (wedge-prone print)~
                      ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
                      ~%  (%fail-range 22538 23957)  ;; format-* family (complex output wedges)~
-                     ~%  (%fail-range 24347 24349)  ;; stream-error-stream wedge~
+                     ~%  ;; (%fail-range 24347 24349)  ;; stream-error-stream wedge — unstamp trial~
                      ~%  (%fail-range 24496 24522)  ;; defpackage wedge~
-                     ~%  (%fail-range 24568 24574)  ;; export wedge~
-                     ~%  (%fail-range 24764 24775)  ;; shadow wedge~
+                     ~%  ;; (%fail-range 24568 24574)  ;; export wedge — unstamp trial~
+                     ~%  ;; (%fail-range 24764 24775)  ;; shadow wedge — unstamp trial~
                      ~%  (%fail-range 24790 24835)  ;; unintern through with-package-iterator (package wedges)~
                      ~%  (%fail-range 24836 24948)  ;; compile through eval-when (runtime-compile not implemented)~
                      ~%  (%fail-range 25039 25151)  ;; lambda through type wedges~

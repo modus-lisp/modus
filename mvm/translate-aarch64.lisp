@@ -67,6 +67,13 @@
    a64-resolve-fixups so the caller can resolve once after all emit.
    Bound by translate-module-to-native via its :into-buf keyword.")
 
+(defvar *aarch64-translated-start-idx* nil
+  "Buffer position (instruction units) where the current translation began
+   within *aarch64-translate-into-buf*.  Subtract from a64-current-index
+   to get offsets RELATIVE to translated-start (so the fn-addr patcher
+   and any other downstream consumer of native-byte-offset arithmetic
+   keeps working regardless of buffer prefix).")
+
 (defvar *aarch64-fn-addr-patches* nil
   "List of (native-byte-offset . target-bytecode-offset) recorded by
    +op-fn-addr+ translation.  Each entry says: at NATIVE-BYTE-OFFSET in
@@ -2351,7 +2358,14 @@
                ((gethash target-offset mvm-to-native-label)
                 ;; Record the byte position of the MOVZ so the patcher
                 ;; can find both MOVZ (movz-pos) and MOVK (movz-pos+4).
-                (let ((movz-byte-pos (* (a64-current-index buf) 4)))
+                ;; Position is RELATIVE to the start of translated code
+                ;; (so the patcher's `native-image-offset + movz-byte-pos`
+                ;; arithmetic works whether or not the buffer was shared
+                ;; with a boot preamble — Phase 2 unification).
+                (let ((movz-byte-pos
+                       (* (- (a64-current-index buf)
+                             (or *aarch64-translated-start-idx* 0))
+                          4)))
                   (push (cons movz-byte-pos target-offset)
                         *aarch64-fn-addr-patches*))
                 ;; MOVZ Xd, #0 (placeholder for low 16 bits)
@@ -2455,6 +2469,9 @@
          ;; (kernel-image-entry-point arithmetic, JMP/B emission, etc.)
          ;; doesn't have to know whether the buffer was shared.
          (translated-start-idx (a64-buffer-position buf))
+         ;; Expose to trap-time code (e.g. fn-addr patch site recorder)
+         ;; via dynamic variable; see *aarch64-translated-start-idx*.
+         (*aarch64-translated-start-idx* translated-start-idx)
          (insns (decode-mvm-stream bytecode))
          (offset-map (build-offset-to-index-map insns))
          (mvm-to-native-label (make-hash-table :test 'equal))

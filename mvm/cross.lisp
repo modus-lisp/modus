@@ -121,7 +121,16 @@
                                                 (and (consp entry)
                                                      (string= (first entry) bad-name)))
                                               table))))))))
-        (let ((native-bytes (extract-native-bytes buf target)))
+        (let ((native-bytes
+               ;; When appending into a shared a64-buffer, fixups aren't
+               ;; resolved yet — extracting bytes now would yield placeholder
+               ;; bytes for unresolved BL/B targets.  The caller resolves
+               ;; and slices afterwards.  Return a length-only fake so
+               ;; fn-info native-offset proportional fallback math still
+               ;; works for arches that need it.
+               (if into-buf
+                   (make-array 0 :element-type '(unsigned-byte 8))
+                   (extract-native-bytes buf target))))
           (if (and fn-map (hash-table-p fn-map))
               ;; Accurate mapping from translator
               (dolist (fn-info fn-list)
@@ -588,7 +597,37 @@
 
 (defun assemble-kernel-image (module target &key boot-descriptor)
   "Assemble a complete bootable kernel image for TARGET."
-  (let* ((native-code (translate-module-to-native module target)))
+  (let* ((boot-arch (and boot-descriptor (getf boot-descriptor :arch)))
+         (aarch64-unified-p (member boot-arch '(:aarch64 :rpi)))
+         ;; Phase 2b unification: for AArch64/RPi we create ONE a64-buffer,
+         ;; emit boot into it, then call translate-module-to-native with
+         ;; :into-buf to append translated code into the same buffer.
+         ;; That lets boot's BL/B-to-kernel-main and translator-side BLs
+         ;; (handler-stack helpers from IRQ entries etc.) share one fixup
+         ;; pass.  After translation we patch boot's placeholder B with
+         ;; the kernel-main offset, resolve all fixups, and slice bytes.
+         (aarch64-unified-buf
+          (when aarch64-unified-p (modus.mvm::make-a64-buffer)))
+         (aarch64-boot-end-instr nil)
+         (native-code
+          (cond
+            (aarch64-unified-p
+             ;; Phase A: emit boot preamble into the unified buffer first.
+             (let ((entry-fn (getf boot-descriptor :entry-fn)))
+               (when entry-fn (funcall entry-fn aarch64-unified-buf)))
+             ;; Phase B: remember the position before the B placeholder.
+             ;; We emit one instruction-word as a placeholder; assemble's
+             ;; final byte concat skips re-emitting JMP/B for AArch64
+             ;; unified (the B is inside our unified bytes already).
+             (setf aarch64-boot-end-instr
+                   (modus.mvm::a64-buffer-position aarch64-unified-buf))
+             (modus.mvm::a64-emit aarch64-unified-buf 0)  ; placeholder B
+             ;; Phase C: translate into the same buffer.
+             (translate-module-to-native module target
+                                         :into-buf aarch64-unified-buf))
+            (t
+             ;; Original path for other arches: translate first, then boot.
+             (translate-module-to-native module target)))))
     (multiple-value-bind (constant-pool pool-addr-table)
         (build-constant-pool module target)
       (let* ((nfn-table (build-nfn-table module target))
@@ -601,15 +640,8 @@
                      :source-blob source-blob
                      :symbol-table nfn-table)))
     ;; Emit boot code (architecture-specific)
-    (when boot-descriptor
-      (let* ((boot-arch (getf boot-descriptor :arch))
-             ;; AArch64 boot emits AArch64 instructions; use a64-buffer so
-             ;; future cross-buffer label resolution (boot ↔ helpers ↔
-             ;; native code) can be unified.  Other arches still emit raw
-             ;; bytes into mvm-buffer.
-             (boot-buf (if (member boot-arch '(:aarch64 :rpi))
-                           (modus.mvm::make-a64-buffer)
-                           (make-mvm-buffer))))
+    (when (and boot-descriptor (not aarch64-unified-p))
+      (let* ((boot-buf (make-mvm-buffer)))
         ;; x86-64 has a multi-stage boot: multiboot header → 32-bit stub → 64-bit entry
         (let ((mb-fn  (getf boot-descriptor :multiboot-header-fn))
               (b32-fn (getf boot-descriptor :boot32-fn))
@@ -618,18 +650,45 @@
           (when mb-fn  (funcall mb-fn boot-buf))
           (when b32-fn (funcall b32-fn boot-buf))
           (when k64-fn (funcall k64-fn boot-buf))
-          ;; Generic entry-fn (RISC-V, AArch64)
+          ;; Generic entry-fn (RISC-V, ARM32, …)
           (when entry-fn (funcall entry-fn boot-buf)))
         (setf (kernel-image-boot-code image)
-              (if (member boot-arch '(:aarch64 :rpi))
-                  (modus.mvm::a64-buffer-to-bytes boot-buf)
-                  (mvm-buffer-used-bytes boot-buf)))))
+              (mvm-buffer-used-bytes boot-buf))))
     ;; Find kernel-main entry point (native offset within code buffer)
     ;; Use LAST match — "last-defun-wins" means the last kernel-main is the real one.
     (dolist (fn-info (mvm-module-function-table module))
       (when (string-equal (string (mvm-function-info-name fn-info)) "KERNEL-MAIN")
         (setf (kernel-image-entry-point image)
               (mvm-function-info-native-offset fn-info))))
+
+    ;; AArch64 unified emit: patch placeholder B with kernel-main offset,
+    ;; resolve all fixups, slice the unified buffer's bytes into boot+B
+    ;; and native code parts.  Set both on the kernel-image so the
+    ;; downstream final-buf assembly works unchanged (except for skipping
+    ;; the explicit JMP emission since our B is already inside boot-code).
+    (when aarch64-unified-p
+      (let* ((b-instr-idx aarch64-boot-end-instr)
+             ;; kernel-image-entry-point is kernel-main's offset in BYTES
+             ;; within the translated region (Phase 2a kept it relative).
+             (km-byte-offset (or (kernel-image-entry-point image) 0))
+             ;; Translated region starts immediately after B (1 instruction).
+             (km-instr-idx (+ b-instr-idx 1 (/ km-byte-offset 4)))
+             ;; AArch64 B imm26 = target_pc - current_pc, in instruction units.
+             (b-imm26 (- km-instr-idx b-instr-idx))
+             (b-insn (logior #x14000000 (logand b-imm26 #x3FFFFFF))))
+        ;; Patch the placeholder B with the real instruction.
+        (setf (aref (modus.mvm::a64-buffer-code aarch64-unified-buf) b-instr-idx)
+              b-insn)
+        ;; Resolve all fixups across boot + native + helpers.
+        (modus.mvm::a64-resolve-fixups aarch64-unified-buf)
+        ;; Extract bytes and split.  boot-code-bytes includes the patched
+        ;; B at its tail; native-code-bytes starts at the byte right after.
+        (let* ((all-bytes (modus.mvm::a64-buffer-to-bytes aarch64-unified-buf))
+               (boot-end-bytes (* (+ b-instr-idx 1) 4)))
+          (setf (kernel-image-boot-code image)
+                (subseq all-bytes 0 boot-end-bytes))
+          (setf native-code (subseq all-bytes boot-end-bytes))
+          (setf (kernel-image-native-code image) native-code))))
     ;; Assemble final image
     (let ((final-buf (make-mvm-buffer)))
       ;; Boot code (architecture-specific preamble)
@@ -664,7 +723,8 @@
                  (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
                  (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
                  (setq jmp-size 4)))
-              ((member arch '(:aarch64 :rpi))
+              ((and (member arch '(:aarch64 :rpi))
+                    (not aarch64-unified-p))
                ;; AArch64 B (unconditional branch, 4 bytes)
                ;; B target = PC + imm26*4 (PC = this instruction).
                ;; Native code starts 4 bytes after this B instruction,
@@ -676,7 +736,13 @@
                  (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
                  (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
                  (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
-                 (setq jmp-size 4))))))
+                 (setq jmp-size 4)))
+              ;; AArch64 unified path: the B is already inside boot-code
+              ;; (emitted into the unified a64-buffer as a placeholder
+              ;; and patched after translation in the block above).
+              ;; jmp-size stays 0 — native-image-offset = boot-code-length.
+              ((and (member arch '(:aarch64 :rpi)) aarch64-unified-p)
+               nil))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)

@@ -2835,11 +2835,14 @@
                      ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
                      ~%  ;;   (commit c7350d3): probes show +51/+54/+2 P respectively, DN=1.~
                      ~%  (%fail-range 18790 18891)  ;; reduce~
-                     ~%  (%fail-range 20893 22134)  ;; vector + array + pprint — multi-wedge~
+                     ~%  ;; 20893-22134 umbrella replaced by narrow stamps for the actual~
+                     ~%  ;;   wedges (probe found pprint-indent at 21960-21988; vector-pop/~
+                     ~%  ;;   push/push-extend/pprint-exit-if-list-exhausted from earlier).~
                      ~%  (%fail-range 20893 20897)  ;; vector-pop~
                      ~%  (%fail-range 20898 20944)  ;; vector-push-extend~
                      ~%  (%fail-range 20945 20980)  ;; vector-push~
                      ~%  (%fail-range 21932 21948)  ;; pprint-exit-if-list-exhausted~
+                     ~%  (%fail-range 21960 21988)  ;; pprint-indent (next wedge after umbrella removal)~
                      ~%  (%fail-range 22135 22154)  ;; print-bit-vector through print-complex (wedge-prone print)~
                      ~%  (%fail-range 22175 22526)  ;; print-floats through write-to-string (more print wedges)~
                      ~%  (%fail-range 22538 23957)  ;; format-* family (complex output wedges)~

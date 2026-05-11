@@ -2812,7 +2812,8 @@
                      ~%  (%fail-range 11654 12572)  ;; union..notany tail — wedges at 11654 post-Phase 3~
                      ~%  ;;   (probed-clean narrows inside 11608-12572: 11642-11656 and,~
                      ~%  ;;    11687-11726 case, 11743-11775 ccase, 11800-11819 cond)~
-                     ~%  (%fail-range 12573 13527)  ;; format range — multi-wedge umbrella~
+                     ~%  ;; Split format umbrella: 12573-12648 runs (31 P), 12649+ wedges~
+                     ~%  (%fail-range 12649 13527)  ;; format tail — wedges at 12649 post-Phase 3~
                      ~%  ;;   (probed-clean narrows inside 12573-13527: 12641-12651 nth-value,~
                      ~%  ;;    12652-12665 or, 12755-12774 progv, 12821-12833 psetq)~
                      ~%  ;; Split number-comparison: 14069-14363 runs (some pass), 14364+ wedges~

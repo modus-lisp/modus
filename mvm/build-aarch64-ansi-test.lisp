@@ -2814,7 +2814,8 @@
                      ~%  (%fail-range 12573 13527)  ;; format range — multi-wedge umbrella~
                      ~%  ;;   (probed-clean narrows inside 12573-13527: 12641-12651 nth-value,~
                      ~%  ;;    12652-12665 or, 12755-12774 progv, 12821-12833 psetq)~
-                     ~%  (%fail-range 14069 15186)  ;; number-comparison — multi-wedge~
+                     ~%  ;; Split number-comparison: 14069-14363 runs (some pass), 14364+ wedges~
+                     ~%  (%fail-range 14364 15186)  ;; number-comparison tail — wedges at 14364 post-Phase 3~
                      ~%  ;;   (probed-clean narrows inside 14069-15186: 14341-14374 plus,~
                      ~%  ;;    14391-14401 random, 14572-14601 times)~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp — still wedges; needs Phase 3(e) entry-5 too~

@@ -2803,7 +2803,7 @@
                      ~%  ;;   10587-10591 (mapc), 10606-10610 (mapcan), 10620-10625 (mapcar),~
                      ~%  ;;   10634-10638 (mapcon), 10647-10652 (mapl), 10719-10768 (member),~
                      ~%  ;;   11151-11180 (pushnew), 10810-11125 (nintersection..nunion).~
-                     ~%  (%fail-range 10653 10671)  ;; maplist — clean but layout-flippy (-68 P), keep~
+                     ~%  ;; (%fail-range 10653 10671)  ;; maplist — try unstamp post-Phase 3~
                      ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp — still wedges post-Phase 3~
                      ~%  (%fail-range 10695 10718)  ;; member-if.lsp — restamp paired with member-if-not~
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~

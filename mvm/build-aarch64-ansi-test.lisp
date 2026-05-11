@@ -2854,13 +2854,13 @@
                      ~%  (%fail-range 24836 24948)  ;; compile..eval-when — wedges at first test (24836)~
                      ~%  (%fail-range 25039 25151)  ;; lambda..type — still wedges post-Phase 3~
                      ~%  (%fail-range 25184 25204)  ;; deftype — still wedges past 25201 post-Phase 3~
-                     ~%  (%fail-range 25702 25897)  ;; reader test wedges~
-                     ~%  (%fail-range 25898 26045)  ;; syntax wedges~
+                     ~%  ;; (%fail-range 25702 25897)  ;; reader — unstamp trial post-Phase 3~
+                     ~%  ;; (%fail-range 25898 26045)  ;; syntax — unstamp trial post-Phase 3~
                      ~%  ;; (%fail-range 26067 26068)  ;; with-standard-io-syntax tail wedge — try unstamp post-Phase 3~
                      ~%  (%fail-range 26113 26260)  ;; disassemble..user-homedir-pathname — still wedges at 26116~
-                     ~%  (%fail-range 26261 26501)  ;; abort through restart-case (condition system)~
+                     ~%  ;; (%fail-range 26261 26501)  ;; abort..restart-case — unstamp trial post-Phase 3~
                      ~%  ;; (%fail-range 26502 26546)  ;; store-value..with-simple-restart — unstamp trial~
-                     ~%  (%fail-range 26547 27037)  ;; pathname/namestring family wedges~
+                     ~%  ;; (%fail-range 26547 27037)  ;; pathname/namestring — unstamp trial post-Phase 3~
                      ~%  (%fail-range 27162 27692)  ;; CLOS family — wedges at first test (27162) post-Phase 3~
                      ~%  ;; 23958-27692: streams, CLOS, conditions, etc — UNSKIPPED for bisect~
                      ~%  nil)~

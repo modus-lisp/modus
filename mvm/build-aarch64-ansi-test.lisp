@@ -2817,7 +2817,7 @@
                      ~%  (%fail-range 14069 15186)  ;; number-comparison — multi-wedge~
                      ~%  ;;   (probed-clean narrows inside 14069-15186: 14341-14374 plus,~
                      ~%  ;;    14391-14401 random, 14572-14601 times)~
-                     ~%  (%fail-range 15683 15691)  ;; gentemp.lsp~
+                     ~%  (%fail-range 15683 15691)  ;; gentemp.lsp — still wedges; needs Phase 3(e) entry-5 too~
                      ~%  ;; 15744-17037 confirmed: 3 wedges (makunbound, symbol-function, copy-seq) — umbrella removed~
                      ~%  (%fail-range 15743 15747)  ;; makunbound~
                      ~%  (%fail-range 15768 15773)  ;; symbol-function~

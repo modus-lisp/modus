@@ -335,49 +335,64 @@
        ;;  22.  ERET                          ; longjmp to handler-case
        ;;  23.  NORMAL: LDP x0, x1, [SP], #16
        ;;  24.  ERET
+       ;; Phase 3(e) entry-5: when slot 180 is the active handler,
+       ;; BL the pop helper instead of STR XZR — so the handler stack
+       ;; depth stays balanced after an IRQ-deadline longjmp (no
+       ;; explicit CLEAR-HANDLER runs on that path, mirroring x64's
+       ;; SIGSEGV-stub-pops design).  For the slot-1C0 fallback (set
+       ;; by the SAVE-OUTER trap, not part of the per-fork stack),
+       ;; keep the legacy STR XZR.  Discriminate via TBNZ x0, #6 —
+       ;; the only bit that differs between 0x180 (bit6=0) and 0x1C0
+       ;; (bit6=1) within the LSB nibble of the address.
+       ;;
+       ;; Layout grows from 28 emits + 4 NOPs to 31 emits + 1 NOP.
+       ;; CBZ/B.NE forward offsets shift by +3.
        (progn
-         (emit-aarch64-u32 buf #xA9BF07E0)  ; STP x0,x1,[SP,#-16]!
-         (emit-aarch64-u32 buf #xD2A10020)  ; MOVZ x0,#0x0801,LSL #16  (GICC base)
-         (emit-aarch64-u32 buf #xB9400C01)  ; LDR w1,[x0,#0x0C]        (GICC_IAR)
-         (emit-aarch64-u32 buf #xB9001001)  ; STR w1,[x0,#0x10]        (GICC_EOIR)
-         (emit-aarch64-u32 buf #xD29E8480)  ; MOVZ x0,#0xF424          (62500)
-         (emit-aarch64-u32 buf #xD51BE300)  ; MSR CNTV_TVAL_EL0,x0     (re-arm)
-         (emit-aarch64-u32 buf #xD2803000)  ; MOVZ x0,#0x0180
-         (emit-aarch64-u32 buf #xF2A20000)  ; MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
-         (emit-aarch64-u32 buf #xF9457801)  ; LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
-         (emit-aarch64-u32 buf #xB4000221)  ; CBZ x1,+17 → NORMAL      (not armed)
-         (emit-aarch64-u32 buf #xF1000421)  ; SUBS x1,x1,#1
-         (emit-aarch64-u32 buf #xF9057801)  ; STR x1,[x0,#2800]
-         (emit-aarch64-u32 buf #x540001C1)  ; B.NE +14 → NORMAL        (not yet zero)
-         ;; Deadline expired this tick — try slot 0x10000180 (per-test
-         ;; handler) first; if zero, fall back to slot 0x100001C0
-         ;; (file-level outer handler set by SAVE-OUTER trap).
-         (emit-aarch64-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 180 SP)
-         (emit-aarch64-u32 buf #xB5000081)  ; CBNZ x1,+4 → DO_LJ       (use slot 180)
-         (emit-aarch64-u32 buf #x91010000)  ; ADD x0,x0,#0x40          (→ slot 1C0)
-         (emit-aarch64-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 1C0 SP)
-         (emit-aarch64-u32 buf #xB4000121)  ; CBZ x1,+9 → NORMAL       (no handler at all)
-         ;; DO_LJ:
-         (emit-aarch64-u32 buf #x9100003F)  ; ADD SP,x1,#0
-         (emit-aarch64-u32 buf #xF940041D)  ; LDR x29,[x0,#8]
-         (emit-aarch64-u32 buf #xF9400801)  ; LDR x1,[x0,#16]
-         ;; Zero the consumed slot so a subsequent IRQ won't longjmp via
-         ;; the now-dead frame.  Without this, a caught test-deadline
-         ;; leaves slot 180 (or 1C0) pointing at the just-restored stack
-         ;; pos; if the harness fires the next IRQ before any handler-case
-         ;; reuses the slot, the longjmp lands in arbitrary code (we've
-         ;; observed PC ending up mid-%read-user-dispatch).
-         (emit-aarch64-u32 buf #xF900001F)  ; STR XZR,[x0]             (zero slot 180/1C0)
-         (emit-aarch64-u32 buf #xD5184021)  ; MSR ELR_EL1,x1
-         (emit-aarch64-u32 buf #xD2820120)  ; MOVZ x0,#0x1009
-         (emit-aarch64-u32 buf #xF2BBD5A0)  ; MOVK x0,#0xDEAD,LSL #16  (X0 = T)
-         (emit-aarch64-u32 buf #xD69F03E0)  ; ERET (longjmp)
-         ;; NORMAL:
-         (emit-aarch64-u32 buf #xA8C107E0)  ; LDP x0,x1,[SP],#16
-         (emit-aarch64-u32 buf #xD69F03E0)  ; ERET (normal return)
-         ;; Fill remaining 4 instructions with NOP
-         (dotimes (i 4)
-           (emit-aarch64-u32 buf #xD503201F))))
+         (emit-aarch64-u32 buf #xA9BF07E0)  ;  1. STP x0,x1,[SP,#-16]!
+         (emit-aarch64-u32 buf #xD2A10020)  ;  2. MOVZ x0,#0x0801,LSL #16  (GICC base)
+         (emit-aarch64-u32 buf #xB9400C01)  ;  3. LDR w1,[x0,#0x0C]        (GICC_IAR)
+         (emit-aarch64-u32 buf #xB9001001)  ;  4. STR w1,[x0,#0x10]        (GICC_EOIR)
+         (emit-aarch64-u32 buf #xD29E8480)  ;  5. MOVZ x0,#0xF424          (62500)
+         (emit-aarch64-u32 buf #xD51BE300)  ;  6. MSR CNTV_TVAL_EL0,x0     (re-arm)
+         (emit-aarch64-u32 buf #xD2803000)  ;  7. MOVZ x0,#0x0180
+         (emit-aarch64-u32 buf #xF2A20000)  ;  8. MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
+         (emit-aarch64-u32 buf #xF9457801)  ;  9. LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
+         (emit-aarch64-u32 buf #xB4000281)  ; 10. CBZ x1,+20 → NORMAL      (not armed)
+         (emit-aarch64-u32 buf #xF1000421)  ; 11. SUBS x1,x1,#1
+         (emit-aarch64-u32 buf #xF9057801)  ; 12. STR x1,[x0,#2800]
+         (emit-aarch64-u32 buf #x54000221)  ; 13. B.NE +17 → NORMAL        (not yet zero)
+         (emit-aarch64-u32 buf #xF9400001)  ; 14. LDR x1,[x0]              (slot 180 SP)
+         (emit-aarch64-u32 buf #xB5000081)  ; 15. CBNZ x1,+4 → DO_LJ       (use slot 180)
+         (emit-aarch64-u32 buf #x91010000)  ; 16. ADD x0,x0,#0x40          (→ slot 1C0)
+         (emit-aarch64-u32 buf #xF9400001)  ; 17. LDR x1,[x0]              (slot 1C0 SP)
+         (emit-aarch64-u32 buf #xB4000181)  ; 18. CBZ x1,+12 → NORMAL      (no handler at all)
+         ;; DO_LJ (instr 19):
+         (emit-aarch64-u32 buf #x9100003F)  ; 19. ADD SP,x1,#0
+         (emit-aarch64-u32 buf #xF940041D)  ; 20. LDR x29,[x0,#8]
+         (emit-aarch64-u32 buf #xF9400801)  ; 21. LDR x1,[x0,#16]
+         ;; Discriminate slot 180 vs 1C0 by bit 6 of x0.
+         (emit-aarch64-u32 buf #x37300060)  ; 22. TBNZ x0,#6,+3 → slot_1C0_path
+         (cond
+           (modus.mvm::*aarch64-handler-pop-label*
+            (let ((idx (modus.mvm::a64-current-index buf)))
+              (modus.mvm::a64-bl buf 0)        ; 23. BL pop_helper (slot 180 path)
+              (modus.mvm::a64-add-fixup buf idx
+                                        modus.mvm::*aarch64-handler-pop-label*
+                                        :bl)))
+           (t
+            (emit-aarch64-u32 buf #xF900001F))) ; fallback: STR XZR,[x0]
+         (emit-aarch64-u32 buf #x14000002)  ; 24. B +2 → do_eret
+         (emit-aarch64-u32 buf #xF900001F)  ; 25. STR XZR,[x0] (slot_1C0_path — clear 1C0)
+         ;; do_eret (instr 26):
+         (emit-aarch64-u32 buf #xD5184021)  ; 26. MSR ELR_EL1,x1
+         (emit-aarch64-u32 buf #xD2820120)  ; 27. MOVZ x0,#0x1009
+         (emit-aarch64-u32 buf #xF2BBD5A0)  ; 28. MOVK x0,#0xDEAD,LSL #16  (X0 = T)
+         (emit-aarch64-u32 buf #xD69F03E0)  ; 29. ERET (longjmp)
+         ;; NORMAL (instr 30):
+         (emit-aarch64-u32 buf #xA8C107E0)  ; 30. LDP x0,x1,[SP],#16
+         (emit-aarch64-u32 buf #xD69F03E0)  ; 31. ERET (normal return)
+         ;; Fill remaining 1 instruction with NOP
+         (emit-aarch64-u32 buf #xD503201F)))
       ((= entry 6)
        ;; DIAGNOSTIC: FIQ probe — write 'f' to UART each tick.  GICv2 on
        ;; QEMU virt routes Group 0 interrupts as FIQ to non-secure EL1,

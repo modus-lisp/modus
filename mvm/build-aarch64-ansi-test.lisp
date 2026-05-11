@@ -2822,14 +2822,14 @@
                      ~%  ;; (%fail-range 15743 15747)  ;; makunbound — unstamp trial~
                      ~%  ;; (%fail-range 15768 15773)  ;; symbol-function — unstamp trial~
                      ~%  (%fail-range 16685 16713)  ;; copy-seq — still wedges post-Phase 3~
-                     ~%  (%fail-range 17717 17793)  ;; map (exposed by other unskips)~
+                     ~%  ;; (%fail-range 17717 17793)  ;; map — unstamp trial post-Phase 3~
                      ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
                      ~%  (%fail-range 17072 17106)  ;; elt tail — still wedges post-Phase 3~
                      ~%  (%fail-range 18640 20000)  ;; more sequence — multi-wedge~
                      ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
                      ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
                      ~%  ;;   (commit c7350d3): probes show +51/+54/+2 P respectively, DN=1.~
-                     ~%  (%fail-range 18790 18891)  ;; reduce~
+                     ~%  ;; (%fail-range 18790 18891)  ;; reduce — unstamp trial post-Phase 3~
                      ~%  ;; 20893-22134 umbrella replaced by narrow stamps for the actual~
                      ~%  ;;   wedges (probe found pprint-indent at 21960-21988; vector-pop/~
                      ~%  ;;   push/push-extend/pprint-exit-if-list-exhausted from earlier).~

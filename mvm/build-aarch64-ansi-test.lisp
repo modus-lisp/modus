@@ -2804,8 +2804,8 @@
                      ~%  ;;   10634-10638 (mapcon), 10647-10652 (mapl), 10719-10768 (member),~
                      ~%  ;;   11151-11180 (pushnew), 10810-11125 (nintersection..nunion).~
                      ~%  (%fail-range 10653 10671)  ;; maplist — clean but layout-flippy (-68 P), keep~
-                     ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp wedge~
-                     ~%  (%fail-range 10695 10718)  ;; member-if.lsp wedge~
+                     ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp — still wedges post-Phase 3~
+                     ~%  (%fail-range 10695 10718)  ;; member-if.lsp — restamp paired with member-if-not~
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
                      ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
                      ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella~
@@ -2824,7 +2824,7 @@
                      ~%  (%fail-range 16685 16713)  ;; copy-seq — still wedges post-Phase 3~
                      ~%  (%fail-range 17717 17793)  ;; map (exposed by other unskips)~
                      ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
-                     ~%  (%fail-range 17072 17106)  ;; elt tail (only wedge in 17072-18639)~
+                     ~%  (%fail-range 17072 17106)  ;; elt tail — still wedges post-Phase 3~
                      ~%  (%fail-range 18640 20000)  ;; more sequence — multi-wedge~
                      ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
                      ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
@@ -2834,8 +2834,8 @@
                      ~%  ;;   wedges (probe found pprint-indent at 21960-21988; vector-pop/~
                      ~%  ;;   push/push-extend/pprint-exit-if-list-exhausted from earlier).~
                      ~%  ;; (%fail-range 20893 20897)  ;; vector-pop — unstamp trial~
-                     ~%  (%fail-range 20898 20944)  ;; vector-push-extend~
-                     ~%  (%fail-range 20945 20980)  ;; vector-push~
+                     ~%  ;; (%fail-range 20898 20944)  ;; vector-push-extend — unstamp trial~
+                     ~%  ;; (%fail-range 20945 20980)  ;; vector-push — unstamp trial~
                      ~%  ;; (%fail-range 21932 21948)  ;; pprint-exit-if-list-exhausted — unstamp trial~
                      ~%  ;; (%fail-range 21960 21988)  ;; pprint-indent — unstamp trial~
                      ~%  ;; (%fail-range 22135 22154)  ;; print-bit-vector — unstamp trial~
@@ -2845,7 +2845,7 @@
                      ~%  ;; (%fail-range 24496 24522)  ;; defpackage — unstamp trial~
                      ~%  ;; (%fail-range 24568 24574)  ;; export wedge — unstamp trial~
                      ~%  ;; (%fail-range 24764 24775)  ;; shadow wedge — unstamp trial~
-                     ~%  (%fail-range 24790 24835)  ;; unintern through with-package-iterator (package wedges)~
+                     ~%  ;; (%fail-range 24790 24835)  ;; unintern..with-package-iterator — unstamp trial~
                      ~%  (%fail-range 24836 24948)  ;; compile through eval-when (runtime-compile not implemented)~
                      ~%  (%fail-range 25039 25151)  ;; lambda through type wedges~
                      ~%  (%fail-range 25184 25204)  ;; deftype — still wedges past 25201 post-Phase 3~
@@ -2854,7 +2854,7 @@
                      ~%  ;; (%fail-range 26067 26068)  ;; with-standard-io-syntax tail wedge — try unstamp post-Phase 3~
                      ~%  (%fail-range 26113 26260)  ;; disassemble through user-homedir-pathname (introspection)~
                      ~%  (%fail-range 26261 26501)  ;; abort through restart-case (condition system)~
-                     ~%  (%fail-range 26502 26546)  ;; store-value through with-simple-restart~
+                     ~%  ;; (%fail-range 26502 26546)  ;; store-value..with-simple-restart — unstamp trial~
                      ~%  (%fail-range 26547 27037)  ;; pathname/namestring family wedges~
                      ~%  (%fail-range 27162 27692)  ;; entire defgeneric/defclass/CLOS family (incomplete)~
                      ~%  ;; 23958-27692: streams, CLOS, conditions, etc — UNSKIPPED for bisect~

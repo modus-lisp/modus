@@ -2809,19 +2809,14 @@
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
                      ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
                      ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella~
-                     ~%  (%fail-range 11642 11656)  ;; and~
-                     ~%  (%fail-range 11687 11726)  ;; case~
-                     ~%  (%fail-range 11743 11775)  ;; ccase~
-                     ~%  (%fail-range 11800 11819)  ;; cond~
+                     ~%  ;;   (probed-clean narrows inside 11608-12572: 11642-11656 and,~
+                     ~%  ;;    11687-11726 case, 11743-11775 ccase, 11800-11819 cond)~
                      ~%  (%fail-range 12573 13527)  ;; format range — multi-wedge umbrella~
-                     ~%  (%fail-range 12641 12651)  ;; nth-value~
-                     ~%  (%fail-range 12652 12665)  ;; or~
-                     ~%  (%fail-range 12755 12774)  ;; progv~
-                     ~%  (%fail-range 12821 12833)  ;; psetq~
+                     ~%  ;;   (probed-clean narrows inside 12573-13527: 12641-12651 nth-value,~
+                     ~%  ;;    12652-12665 or, 12755-12774 progv, 12821-12833 psetq)~
                      ~%  (%fail-range 14069 15186)  ;; number-comparison — multi-wedge~
-                     ~%  (%fail-range 14341 14374)  ;; plus~
-                     ~%  (%fail-range 14391 14401)  ;; random~
-                     ~%  (%fail-range 14572 14601)  ;; times~
+                     ~%  ;;   (probed-clean narrows inside 14069-15186: 14341-14374 plus,~
+                     ~%  ;;    14391-14401 random, 14572-14601 times)~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp~
                      ~%  ;; 15744-17037 confirmed: 3 wedges (makunbound, symbol-function, copy-seq) — umbrella removed~
                      ~%  (%fail-range 15743 15747)  ;; makunbound~

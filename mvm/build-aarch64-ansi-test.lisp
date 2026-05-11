@@ -2939,9 +2939,18 @@
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (%save-outer-handler)~
+                     ~%      ;; Arm a long deadline for the file init phase too — without~
+                     ~%      ;; this, an init-form wedge (defclass, defstruct, etc. that~
+                     ~%      ;; never returns) would hang forever because no per-test~
+                     ~%      ;; handler-case has yet armed slot 0xC70.  The per-test code~
+                     ~%      ;; in run-test re-arms to 50ms before each individual test,~
+                     ~%      ;; so this large value only matters for between-test/init.~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 5000)~
                      ~%      (funcall thunk)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 0)~
                      ~%      (%clear-outer-handler))~
                      ~%    (t (c)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 0)~
                      ~%      (%clear-outer-handler)~
                      ~%      (%stamp-remaining-fails first-id last-id))))~%")
                    (with-output-to-string (s)

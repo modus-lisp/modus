@@ -2808,7 +2808,8 @@
                      ~%  (%fail-range 10695 10718)  ;; member-if.lsp — restamp paired with member-if-not~
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
                      ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
-                     ~%  (%fail-range 11608 12572)  ;; union..notany — multi-wedge umbrella~
+                     ~%  ;; Split union..notany: 11608-11653 runs (33 P), 11654+ wedges~
+                     ~%  (%fail-range 11654 12572)  ;; union..notany tail — wedges at 11654 post-Phase 3~
                      ~%  ;;   (probed-clean narrows inside 11608-12572: 11642-11656 and,~
                      ~%  ;;    11687-11726 case, 11743-11775 ccase, 11800-11819 cond)~
                      ~%  (%fail-range 12573 13527)  ;; format range — multi-wedge umbrella~

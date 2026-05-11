@@ -2828,7 +2828,8 @@
                      ~%  ;; (%fail-range 17717 17793)  ;; map — unstamp trial post-Phase 3~
                      ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
                      ~%  (%fail-range 17072 17106)  ;; elt tail — still wedges post-Phase 3~
-                     ~%  (%fail-range 18640 20000)  ;; more sequence — multi-wedge~
+                     ~%  ;; Split sequence umbrella: 18640-18891 runs (108 P), 18892+ wedges~
+                     ~%  (%fail-range 18892 20000)  ;; sequence tail — wedges at 18892 post-Phase 3~
                      ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
                      ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
                      ~%  ;;   (commit c7350d3): probes show +51/+54/+2 P respectively, DN=1.~

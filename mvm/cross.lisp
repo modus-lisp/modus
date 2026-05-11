@@ -77,12 +77,18 @@
     (setf (mvm-module-name module) name)
     module))
 
-(defun translate-module-to-native (module target)
+(defun translate-module-to-native (module target &key into-buf)
   "Phase 2: Translate MVM bytecode to native code for TARGET.
    Calls the target's bulk translator with (bytecode function-table),
    extracts native bytes from the architecture-specific buffer,
-   and maps native offsets back to mvm-function-info structs."
-  (let ((translator (target-translate-fn target)))
+   and maps native offsets back to mvm-function-info structs.
+
+   When INTO-BUF is an a64-buffer (AArch64 only), the translator appends
+   into that buffer instead of creating a fresh one, and we return the
+   buffer itself (so the caller can append more — e.g. handler-stack
+   helpers, deferred boot-side fixups — before resolving fixups once)."
+  (let ((translator (target-translate-fn target))
+        (modus.mvm::*aarch64-translate-into-buf* into-buf))
     (unless translator
       (error "No translator installed for target ~A" (target-name target)))
     (let* ((fn-list (mvm-module-function-table module))

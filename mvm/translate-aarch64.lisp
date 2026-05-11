@@ -59,6 +59,14 @@
   "When non-nil, YIELD emits NOP instead of SEV+WFE. Required for QEMU raspi3b
    where WFE halts the CPU with no wake event (no GIC to generate events).")
 
+(defvar *aarch64-translate-into-buf* nil
+  "When non-nil, an a64-buffer that translate-mvm-to-aarch64 should APPEND
+   into (instead of creating a fresh one).  Used by assemble-kernel-image
+   to unify the boot preamble and translated code in a single buffer with
+   shared labels and one fixup pass.  When set, the translator skips
+   a64-resolve-fixups so the caller can resolve once after all emit.
+   Bound by translate-module-to-native via its :into-buf keyword.")
+
 (defvar *aarch64-fn-addr-patches* nil
   "List of (native-byte-offset . target-bytecode-offset) recorded by
    +op-fn-addr+ translation.  Each entry says: at NATIVE-BYTE-OFFSET in
@@ -2437,8 +2445,16 @@
      3. Emit prologue
      4. Translate each instruction, recording native label positions
      5. Emit epilogue
-     6. Resolve all branch fixups"
-  (let* ((buf (make-a64-buffer))
+     6. Resolve all branch fixups (skipped if appending into a shared
+        buffer; caller resolves once after all emit)."
+  (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
+         ;; Index (instruction units) where translated code starts within
+         ;; buf.  Zero when buf is a fresh one; non-zero when we're
+         ;; appending into a pre-filled boot buffer.  fn-entry-offsets
+         ;; are stored RELATIVE TO THIS START so existing downstream code
+         ;; (kernel-image-entry-point arithmetic, JMP/B emission, etc.)
+         ;; doesn't have to know whether the buffer was shared.
+         (translated-start-idx (a64-buffer-position buf))
          (insns (decode-mvm-stream bytecode))
          (offset-map (build-offset-to-index-map insns))
          (mvm-to-native-label (make-hash-table :test 'equal))
@@ -2482,10 +2498,13 @@
         (let ((label (gethash mvm-off mvm-to-native-label)))
           (when label
             (a64-set-label buf label)))
-        ;; Record native position for function entries
+        ;; Record native position for function entries.  Subtract
+        ;; translated-start-idx so offsets stay relative to the start
+        ;; of the translated region (whether or not buf was shared
+        ;; with a boot preamble).
         (when (gethash mvm-off fn-bc-offsets)
           (setf (gethash mvm-off fn-entry-offsets)
-                (* (a64-current-index buf) 4)))  ; instruction index → byte offset
+                (* (- (a64-current-index buf) translated-start-idx) 4)))
         ;; Record MVM offset → native index mapping
         (setf (gethash mvm-off mvm-offset-to-native-index)
               (a64-current-index buf))
@@ -2498,8 +2517,12 @@
         (when label
           (a64-set-label buf label))))
 
-    ;; Pass 2: Resolve all branch fixups
-    (a64-resolve-fixups buf)
+    ;; Pass 2: Resolve all branch fixups.  Skip if we're appending into
+    ;; a shared buffer — the caller will resolve once after appending
+    ;; its own emit (e.g. handler-stack helpers, IRQ vector BLs to those
+    ;; helpers from boot code).
+    (unless *aarch64-translate-into-buf*
+      (a64-resolve-fixups buf))
 
     (values buf fn-entry-offsets)))
 

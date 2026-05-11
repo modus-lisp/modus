@@ -2851,7 +2851,7 @@
                      ~%  (%fail-range 25184 25204)  ;; deftype wedge~
                      ~%  (%fail-range 25702 25897)  ;; reader test wedges~
                      ~%  (%fail-range 25898 26045)  ;; syntax wedges~
-                     ~%  (%fail-range 26067 26068)  ;; with-standard-io-syntax tail wedge~
+                     ~%  ;; (%fail-range 26067 26068)  ;; with-standard-io-syntax tail wedge — try unstamp post-Phase 3~
                      ~%  (%fail-range 26113 26260)  ;; disassemble through user-homedir-pathname (introspection)~
                      ~%  (%fail-range 26261 26501)  ;; abort through restart-case (condition system)~
                      ~%  (%fail-range 26502 26546)  ;; store-value through with-simple-restart~

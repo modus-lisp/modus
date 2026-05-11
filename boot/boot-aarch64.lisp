@@ -259,17 +259,21 @@
        (mvm-emit-u32 buf #xD2803010)        ; MOVZ x16, #0x0180
        (mvm-emit-u32 buf #xF2A20010)        ; MOVK x16, #0x1000, lsl #16
        (mvm-emit-u32 buf #xF9400211)        ; LDR x17, [x16]
-       (mvm-emit-u32 buf #xB4000111)        ; CBZ x17, +8 instructions — lands on B .
+       (mvm-emit-u32 buf #xB4000131)        ; CBZ x17, +9 instructions — lands on B .
        (mvm-emit-u32 buf #x9100023F)        ; ADD sp, x17, #0
        (mvm-emit-u32 buf #xF940061D)        ; LDR x29, [x16, #8]
        (mvm-emit-u32 buf #xF9400A11)        ; LDR x17, [x16, #16]
+       ;; Zero slot 180 — same rationale as entry-5: a one-shot longjmp
+       ;; consumes the frame, otherwise a subsequent fault would re-use
+       ;; the dead frame.
+       (mvm-emit-u32 buf #xF900021F)        ; STR XZR, [x16]
        (mvm-emit-u32 buf #xD5184031)        ; MSR ELR_EL1, x17
        (mvm-emit-u32 buf #xD2820120)        ; MOVZ x0, #0x1009
        (mvm-emit-u32 buf #xF2BBD5A0)        ; MOVK x0, #0xDEAD, lsl #16
        (mvm-emit-u32 buf #xD69F03E0)        ; ERET
        (mvm-emit-u32 buf #x14000000)        ; B .  (no handler — halt here)
-       ;; Fill remaining 13 instructions with NOP
-       (dotimes (i 13)
+       ;; Fill remaining 12 instructions with NOP
+       (dotimes (i 12)
          (mvm-emit-u32 buf #xD503201F)))
       ((= entry 5)
        ;; Entry 5: IRQ handler for Current EL with SP_ELx.
@@ -322,22 +326,29 @@
          (mvm-emit-u32 buf #xD2803000)  ; MOVZ x0,#0x0180
          (mvm-emit-u32 buf #xF2A20000)  ; MOVK x0,#0x1000,LSL #16  (x0 = 0x10000180)
          (mvm-emit-u32 buf #xF9457801)  ; LDR x1,[x0,#2800]        (deadline @ slot 0xC70)
-         (mvm-emit-u32 buf #xB4000201)  ; CBZ x1,+16 → NORMAL      (not armed)
+         (mvm-emit-u32 buf #xB4000221)  ; CBZ x1,+17 → NORMAL      (not armed)
          (mvm-emit-u32 buf #xF1000421)  ; SUBS x1,x1,#1
          (mvm-emit-u32 buf #xF9057801)  ; STR x1,[x0,#2800]
-         (mvm-emit-u32 buf #x540001A1)  ; B.NE +13 → NORMAL        (not yet zero)
+         (mvm-emit-u32 buf #x540001C1)  ; B.NE +14 → NORMAL        (not yet zero)
          ;; Deadline expired this tick — try slot 0x10000180 (per-test
-         ;; handler) first; if zero, fall back to slot 0x100001A0
+         ;; handler) first; if zero, fall back to slot 0x100001C0
          ;; (file-level outer handler set by SAVE-OUTER trap).
          (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 180 SP)
          (mvm-emit-u32 buf #xB5000081)  ; CBNZ x1,+4 → DO_LJ       (use slot 180)
          (mvm-emit-u32 buf #x91010000)  ; ADD x0,x0,#0x40          (→ slot 1C0)
-         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 1A0 SP)
-         (mvm-emit-u32 buf #xB4000101)  ; CBZ x1,+8 → NORMAL       (no handler at all)
+         (mvm-emit-u32 buf #xF9400001)  ; LDR x1,[x0]              (slot 1C0 SP)
+         (mvm-emit-u32 buf #xB4000121)  ; CBZ x1,+9 → NORMAL       (no handler at all)
          ;; DO_LJ:
          (mvm-emit-u32 buf #x9100003F)  ; ADD SP,x1,#0
          (mvm-emit-u32 buf #xF940041D)  ; LDR x29,[x0,#8]
          (mvm-emit-u32 buf #xF9400801)  ; LDR x1,[x0,#16]
+         ;; Zero the consumed slot so a subsequent IRQ won't longjmp via
+         ;; the now-dead frame.  Without this, a caught test-deadline
+         ;; leaves slot 180 (or 1C0) pointing at the just-restored stack
+         ;; pos; if the harness fires the next IRQ before any handler-case
+         ;; reuses the slot, the longjmp lands in arbitrary code (we've
+         ;; observed PC ending up mid-%read-user-dispatch).
+         (mvm-emit-u32 buf #xF900001F)  ; STR XZR,[x0]             (zero slot 180/1C0)
          (mvm-emit-u32 buf #xD5184021)  ; MSR ELR_EL1,x1
          (mvm-emit-u32 buf #xD2820120)  ; MOVZ x0,#0x1009
          (mvm-emit-u32 buf #xF2BBD5A0)  ; MOVK x0,#0xDEAD,LSL #16  (X0 = T)
@@ -345,8 +356,8 @@
          ;; NORMAL:
          (mvm-emit-u32 buf #xA8C107E0)  ; LDP x0,x1,[SP],#16
          (mvm-emit-u32 buf #xD69F03E0)  ; ERET (normal return)
-         ;; Fill remaining 5 instructions with NOP
-         (dotimes (i 5)
+         ;; Fill remaining 4 instructions with NOP
+         (dotimes (i 4)
            (mvm-emit-u32 buf #xD503201F))))
       ((= entry 6)
        ;; DIAGNOSTIC: FIQ probe — write 'f' to UART each tick.  GICv2 on

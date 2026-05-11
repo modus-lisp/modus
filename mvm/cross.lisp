@@ -609,6 +609,16 @@
          (aarch64-unified-buf
           (when aarch64-unified-p (modus.mvm::make-a64-buffer)))
          (aarch64-boot-end-instr nil)
+         ;; Allocate fresh label IDs for the per-fork handler-stack
+         ;; push/pop helpers.  Bound dynamically around the translate
+         ;; call so emit-aarch64-handler-helpers knows to emit them
+         ;; and so any future trap/boot BL site can a64-add-fixup
+         ;; against the same IDs.  At Phase 3(a) the helpers are
+         ;; emitted but unreferenced (dead code).
+         (aarch64-push-label
+          (when aarch64-unified-p (incf modus.mvm::*mvm-label-counter*)))
+         (aarch64-pop-label
+          (when aarch64-unified-p (incf modus.mvm::*mvm-label-counter*)))
          (native-code
           (cond
             (aarch64-unified-p
@@ -623,8 +633,10 @@
                    (modus.mvm::a64-buffer-position aarch64-unified-buf))
              (modus.mvm::a64-emit aarch64-unified-buf 0)  ; placeholder B
              ;; Phase C: translate into the same buffer.
-             (translate-module-to-native module target
-                                         :into-buf aarch64-unified-buf))
+             (let ((modus.mvm::*aarch64-handler-push-label* aarch64-push-label)
+                   (modus.mvm::*aarch64-handler-pop-label*  aarch64-pop-label))
+               (translate-module-to-native module target
+                                           :into-buf aarch64-unified-buf)))
             (t
              ;; Original path for other arches: translate first, then boot.
              (translate-module-to-native module target)))))

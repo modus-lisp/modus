@@ -74,6 +74,17 @@
    and any other downstream consumer of native-byte-offset arithmetic
    keeps working regardless of buffer prefix).")
 
+(defvar *aarch64-handler-push-label* nil
+  "Label-id (integer) for the per-fork handler-stack push helper.  Bound
+   by assemble-kernel-image around the unified-buffer translate call so
+   that trap emitters and boot's IRQ vectors can BL to one shared helper.
+   Nil outside that dynamic extent — emit-aarch64-handler-helpers is a
+   no-op when nil so non-unified callers don't pay the cost.")
+
+(defvar *aarch64-handler-pop-label* nil
+  "Label-id (integer) for the per-fork handler-stack pop helper.  See
+   *aarch64-handler-push-label*.")
+
 (defvar *aarch64-fn-addr-patches* nil
   "List of (native-byte-offset . target-bytecode-offset) recorded by
    +op-fn-addr+ translation.  Each entry says: at NATIVE-BYTE-OFFSET in
@@ -97,6 +108,11 @@
 (defconstant +a64-x1+   1)
 (defconstant +a64-x2+   2)
 (defconstant +a64-x3+   3)
+(defconstant +a64-x9+   9)   ; AAPCS caller-saved temp
+(defconstant +a64-x10+ 10)   ; AAPCS caller-saved temp
+(defconstant +a64-x11+ 11)   ; AAPCS caller-saved temp
+(defconstant +a64-x12+ 12)   ; AAPCS caller-saved temp
+(defconstant +a64-x13+ 13)   ; AAPCS caller-saved temp
 (defconstant +a64-x16+ 16)   ; IP0 scratch
 (defconstant +a64-x17+ 17)   ; IP1 scratch
 (defconstant +a64-x18+ 18)   ; platform reg (free on bare-metal — used by handler-case copy traps)
@@ -2441,6 +2457,105 @@
            (a64-brk buf op)))))))
 
 ;;; ============================================================
+;;; Per-fork handler-stack helpers
+;;; ============================================================
+;;;
+;;; Mirrors SBCL's binding stack (BSP) and CCL's catch-frame linked
+;;; list: per-fork handler-case state is saved/restored across a
+;;; dedicated stack rather than being a single global slot.
+;;;
+;;; Memory layout (heap, low-1GB identity-mapped on bare metal):
+;;;   0x10000180/188/190  = CURRENT handler state (SP / FP / IP)
+;;;                          — what SETJMP writes, LONGJMP reads.
+;;;   0x10000400          = handler-stack depth (pseudo-BSP).
+;;;   0x10000408 + 24*N   = frame N = (saved-SP, saved-FP, saved-IP).
+;;;
+;;; PUSH (called by SETJMP just before it overwrites slot 180/188/190):
+;;;   save current 180/188/190 triple to frame[depth], depth += 1.
+;;;
+;;; POP (called by CLEAR-HANDLER on normal completion AND by LONGJMP
+;;; after it has copied 180/188/190 into scratch — pop discards the
+;;; just-restored outer frame from the stack so a future SETJMP doesn't
+;;; double-push.  Also called by the boot IRQ entries when an IRQ-caught
+;;; wedge skips CLEAR-HANDLER):
+;;;   if depth == 0: zero slot 180/188/190 and return.
+;;;   else: depth -= 1; reload slot 180/188/190 from frame[depth].
+;;;
+;;; Both helpers are leaf functions: clobber x9..x13, preserve x30 (LR).
+
+(defun emit-aarch64-handler-helpers (buf)
+  "If *aarch64-handler-push-label* / *aarch64-handler-pop-label* are
+   bound (non-nil), emit the push and pop helpers into BUF and set
+   those labels at the entry points.  No-op otherwise — non-unified
+   callers don't pay for this."
+  (when (and *aarch64-handler-push-label* *aarch64-handler-pop-label*)
+    ;; ---- PUSH helper ----
+    (a64-set-label buf *aarch64-handler-push-label*)
+    ;; x9 = 0x10000400 (depth slot)
+    (a64-movz buf +a64-x9+ #x0400 0)
+    (a64-movk buf +a64-x9+ #x1000 1)
+    ;; x10 = depth
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
+    ;; x11 = frame_base = 0x10000408 + depth*24
+    (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
+    (a64-lsl-imm buf +a64-x12+ +a64-x10+ 4)        ; depth*16
+    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
+    (a64-lsl-imm buf +a64-x12+ +a64-x10+ 3)        ; depth*8
+    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
+    ;; x12 = 0x10000180 (current handler slot)
+    (a64-movz buf +a64-x12+ #x0180 0)
+    (a64-movk buf +a64-x12+ #x1000 1)
+    ;; copy 3 doublewords: 180→frame+0, 188→frame+8, 190→frame+16
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 0)
+    (a64-str-unsigned buf +a64-x13+ +a64-x11+ 0)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 8)
+    (a64-str-unsigned buf +a64-x13+ +a64-x11+ 8)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 16)
+    (a64-str-unsigned buf +a64-x13+ +a64-x11+ 16)
+    ;; depth += 1
+    (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
+    (a64-ret buf)
+    ;; ---- POP helper ----
+    (a64-set-label buf *aarch64-handler-pop-label*)
+    (a64-movz buf +a64-x9+ #x0400 0)
+    (a64-movk buf +a64-x9+ #x1000 1)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
+    ;; if depth == 0 → zero slot 180/188/190 and return
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((nz-label (incf *mvm-label-counter*)))
+      (let ((idx (a64-current-index buf)))
+        (a64-bcond buf +cc-ne+ 0)
+        (a64-add-fixup buf idx nz-label :bcond))
+      ;; depth == 0 path: zero 0x180/188/190 and return
+      (a64-movz buf +a64-x12+ #x0180 0)
+      (a64-movk buf +a64-x12+ #x1000 1)
+      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 0)
+      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 8)
+      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 16)
+      (a64-ret buf)
+      ;; depth > 0 path: decrement, restore from frame[new-depth]
+      (a64-set-label buf nz-label)
+      (a64-sub-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
+      ;; x11 = 0x10000408 + depth*24
+      (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
+      (a64-lsl-imm buf +a64-x12+ +a64-x10+ 4)
+      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
+      (a64-lsl-imm buf +a64-x12+ +a64-x10+ 3)
+      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
+      ;; restore 0x180/188/190 from frame
+      (a64-movz buf +a64-x12+ #x0180 0)
+      (a64-movk buf +a64-x12+ #x1000 1)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 0)
+      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 0)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 8)
+      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 8)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 16)
+      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 16)
+      (a64-ret buf))))
+
+;;; ============================================================
 ;;; Main Translation Entry Point
 ;;; ============================================================
 
@@ -2533,6 +2648,14 @@
       (let ((label (gethash end-offset mvm-to-native-label)))
         (when label
           (a64-set-label buf label))))
+
+    ;; If we're emitting into a shared buffer AND handler-stack labels
+    ;; are bound, append the push/pop helpers after all translated code.
+    ;; They sit at the tail of native-code (past kernel-main and every
+    ;; defun) so adding them doesn't shift any fn-entry-offset.  At
+    ;; Phase 3(a) these are dead code — no trap BLs to them yet.
+    (when *aarch64-translate-into-buf*
+      (emit-aarch64-handler-helpers buf))
 
     ;; Pass 2: Resolve all branch fixups.  Skip if we're appending into
     ;; a shared buffer — the caller will resolve once after appending

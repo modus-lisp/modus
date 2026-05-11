@@ -622,19 +622,23 @@
          (native-code
           (cond
             (aarch64-unified-p
-             ;; Phase A: emit boot preamble into the unified buffer first.
-             (let ((entry-fn (getf boot-descriptor :entry-fn)))
-               (when entry-fn (funcall entry-fn aarch64-unified-buf)))
-             ;; Phase B: remember the position before the B placeholder.
-             ;; We emit one instruction-word as a placeholder; assemble's
-             ;; final byte concat skips re-emitting JMP/B for AArch64
-             ;; unified (the B is inside our unified bytes already).
-             (setf aarch64-boot-end-instr
-                   (modus.mvm::a64-buffer-position aarch64-unified-buf))
-             (modus.mvm::a64-emit aarch64-unified-buf 0)  ; placeholder B
-             ;; Phase C: translate into the same buffer.
+             ;; Bind handler-stack helper labels for the entire AArch64
+             ;; unified emit.  Phase 3(e) lets boot's IRQ entry 4/5
+             ;; emit BL fixups against the pop label too, so the
+             ;; dynamic binding now wraps entry-fn AND translate-mvm.
              (let ((modus.mvm::*aarch64-handler-push-label* aarch64-push-label)
                    (modus.mvm::*aarch64-handler-pop-label*  aarch64-pop-label))
+               ;; Phase A: emit boot preamble into the unified buffer first.
+               (let ((entry-fn (getf boot-descriptor :entry-fn)))
+                 (when entry-fn (funcall entry-fn aarch64-unified-buf)))
+               ;; Phase B: remember the position before the B placeholder.
+               ;; We emit one instruction-word as a placeholder; assemble's
+               ;; final byte concat skips re-emitting JMP/B for AArch64
+               ;; unified (the B is inside our unified bytes already).
+               (setf aarch64-boot-end-instr
+                     (modus.mvm::a64-buffer-position aarch64-unified-buf))
+               (modus.mvm::a64-emit aarch64-unified-buf 0)  ; placeholder B
+               ;; Phase C: translate into the same buffer.
                (translate-module-to-native module target
                                            :into-buf aarch64-unified-buf)))
             (t

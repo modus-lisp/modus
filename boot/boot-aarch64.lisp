@@ -267,10 +267,25 @@
        (emit-aarch64-u32 buf #x9100023F)        ; ADD sp, x17, #0
        (emit-aarch64-u32 buf #xF940061D)        ; LDR x29, [x16, #8]
        (emit-aarch64-u32 buf #xF9400A11)        ; LDR x17, [x16, #16]
-       ;; Zero slot 180 — same rationale as entry-5: a one-shot longjmp
-       ;; consumes the frame, otherwise a subsequent fault would re-use
-       ;; the dead frame.
-       (emit-aarch64-u32 buf #xF900021F)        ; STR XZR, [x16]
+       ;; Phase 3(e): BL the per-fork handler-stack pop helper instead
+       ;; of the legacy STR XZR.  The helper either uncovers the OUTER
+       ;; handler (frame[depth-1]) or, when depth==0, zeros slot 180
+       ;; — same legacy "no handler" semantics for the case where this
+       ;; was the only handler-case in scope.  Crucially: we're inside
+       ;; the exception handler (SP_ELx), so the helper's x9..x13 +
+       ;; x30 clobbers are harmless; ERET reads ELR_EL1, not x30.
+       ;; (Fallback to STR XZR when the pop label isn't bound — that
+       ;; can only happen if some non-unified path runs this entry-fn,
+       ;; which the AArch64 ANSI build never does.)
+       (cond
+         (modus.mvm::*aarch64-handler-pop-label*
+          (let ((idx (modus.mvm::a64-current-index buf)))
+            (modus.mvm::a64-bl buf 0)
+            (modus.mvm::a64-add-fixup buf idx
+                                      modus.mvm::*aarch64-handler-pop-label*
+                                      :bl)))
+         (t
+          (emit-aarch64-u32 buf #xF900021F)))   ; STR XZR, [x16]
        (emit-aarch64-u32 buf #xD5184031)        ; MSR ELR_EL1, x17
        (emit-aarch64-u32 buf #xD2820120)        ; MOVZ x0, #0x1009
        (emit-aarch64-u32 buf #xF2BBD5A0)        ; MOVK x0, #0xDEAD, lsl #16

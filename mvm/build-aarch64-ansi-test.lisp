@@ -2831,9 +2831,9 @@
                      ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
                      ~%  (%fail-range 17072 17106)  ;; elt tail (only wedge in 17072-18639)~
                      ~%  (%fail-range 18640 20000)  ;; more sequence — multi-wedge~
-                     ~%  (%fail-range 18480 18557)  ;; position-if-not~
-                     ~%  (%fail-range 18558 18635)  ;; position-if~
-                     ~%  (%fail-range 18636 18789)  ;; position~
+                     ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
+                     ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
+                     ~%  ;;   (commit c7350d3): probes show +51/+54/+2 P respectively, DN=1.~
                      ~%  (%fail-range 18790 18891)  ;; reduce~
                      ~%  (%fail-range 20893 22134)  ;; vector + array + pprint — multi-wedge~
                      ~%  (%fail-range 20893 20897)  ;; vector-pop~

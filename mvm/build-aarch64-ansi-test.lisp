@@ -2835,7 +2835,8 @@
                      ~%  (%fail-range 17072 17106)  ;; elt tail — still wedges post-Phase 3~
                      ~%  ;; Split sequence umbrella: 18640-18891 runs (108 P), 18892+ wedges~
                      ~%  ;; Sub-split sequence tail: keep 18892-19499 stamped (wedge zone), try 19500-20000~
-                     ~%  (%fail-range 18892 19499)  ;; sequence wedge zone — keep stamped~
+                     ~%  (%fail-range 18892 19200)  ;; sequence wedge zone 1 — keep stamped~
+                     ~%  ;; 19201-19499 try unstamping~
                      ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
                      ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
                      ~%  ;;   (commit c7350d3): probes show +51/+54/+2 P respectively, DN=1.~

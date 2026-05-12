@@ -1968,26 +1968,24 @@
                (store-dst pd vd))))
 
           ;; ---- ALLOC-OBJ Vd, count:imm16, subtag:imm8 ----
-          ;; Allocate object with COUNT element slots from bump allocator
-          ;; Header word: [element-count:48 | unused:8 | subtag:8]
-          ;; = (count << 16) | subtag
+          ;; LAYOUT matches x64 and cross.lisp's constant-pool emitter:
+          ;;   [header(8) | padding(8) | slot0(8) | slot1(8) ... | align]
+          ;; Header = (count << 8) | subtag.  Tagged pointer = raw + 9.
+          ;; Total bytes = (count+2)*8 rounded up to 16.
+          ;; OBJ-REF/OBJ-SET use offset = idx*8 + 7 (= raw - 9 + 16 + idx*8).
           ((= op +op-alloc-obj+)
            (let* ((vd (vr 0))
                   (count (vr 1))
                   (subtag (vr 2))
-                  ;; Total bytes = 8 (header) + count * 8 (data slots)
-                  ;; Aligned to 16 bytes for cons pointer tag safety
-                  (data-bytes (* count 8))
-                  (total-size (logand (+ 8 data-bytes 15) (lognot 15)))
+                  (total-size (logand (+ (* (+ count 2) 8) 15) (lognot 15)))
+                  (header-imm (logior (ash count 8) subtag))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Build header: (count << 16) | subtag
-             (a64-movz buf +a64-x16+ subtag 0)
-             (a64-movk buf +a64-x16+ count 1)
-             ;; Store header at alloc pointer
+             ;; Header value fits in MOVZ (if subtag-only) or MOVZ+MOVK
+             ;; for larger counts — a64-load-imm64 picks the right form.
+             (a64-load-imm64 buf +a64-x16+ header-imm)
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
-             ;; Result = alloc pointer + 8 (skip header) + object tag (2)
-             (a64-add-imm buf pd +a64-x24+ 10)  ; 8 (header) + 2 (tag)
-             ;; Bump alloc pointer (aligned to 16 bytes)
+             ;; Tagged result = alloc_ptr + 9 (object tag matches x64).
+             (a64-add-imm buf pd +a64-x24+ 9)
              (if (<= total-size #xFFF)
                  (a64-add-imm buf +a64-x24+ +a64-x24+ total-size)
                  (progn
@@ -2012,9 +2010,10 @@
                        (progn
                          (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
                          (a64-ldur buf pd +a64-x16+ 0))))
-                 ;; Normal object slot access
+                 ;; Normal object slot access — tag=9 layout, slot N at
+                 ;; tagged + N*8 + 7 (= raw + 16 + N*8).
                  (let* ((pobj (ensure-src vobj +a64-x16+))
-                        (offset (- (* idx 8) 2)))  ; subtract object tag
+                        (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
                        (a64-ldur buf pd pobj offset)
                        (progn
@@ -2038,9 +2037,9 @@
                        (progn
                          (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
                          (a64-stur buf ps +a64-x16+ 0))))
-                 ;; Normal object slot store
+                 ;; Normal object slot store — tag=9 layout, slot N at +N*8+7.
                  (let* ((pobj (ensure-src vobj +a64-x16+))
-                        (offset (- (* idx 8) 2)))
+                        (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
                        (a64-stur buf ps pobj offset)
                        (progn
@@ -2049,97 +2048,96 @@
                          (a64-stur buf ps +a64-x16+ 0)))))))
 
           ;; ---- OBJ-TAG Vd, Vs ----
-          ;; Extract low 4 bits: AND Vd, Vs, #0xF
+          ;; Extract low 4 bits, then fixnum-tag (SHL 1) — matches x64.
+          ;; compile-funcall compares against `(ash +tag-object+ +fixnum-shift+)`
+          ;; = 18; result must be the shifted value or closure/symbol dispatch
+          ;; is silently bypassed.  UBFIZ Xd, Xn, #1, #4 = UBFM Xd, Xn, #63, #3
+          ;; — one instruction (replaces 2-insn AND+SHL).
           ((= op +op-obj-tag+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-movz buf +a64-x17+ #xF 0)
-             (a64-and-reg buf pd ps +a64-x17+)
+             (a64-ubfm buf pd ps 63 3)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
           ;; ---- OBJ-SUBTAG Vd, Vs ----
-          ;; Load header word, extract subtag from bits [7:0]
+          ;; Load header at raw = tagged-9, extract low 8 bits, fixnum-tag.
+          ;; Returns (subtag << 1) so downstream `(= (obj-subtag x) #x32)`
+          ;; patterns match the same fixnum-tagged constants as on x64.
+          ;; UBFIZ Xd, X17, #1, #8 = UBFM Xd, X17, #63, #7 — one insn.
           ((= op +op-obj-subtag+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Header is at [Vs - tag(2) - 8]
-             (a64-ldur buf +a64-x17+ ps -10)
-             (a64-movz buf +a64-x16+ #xFF 0)
-             (a64-and-reg buf pd +a64-x17+ +a64-x16+)
+             (a64-ldur buf +a64-x17+ ps -9)
+             (a64-ubfm buf pd +a64-x17+ 63 7)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
           ;; ---- AREF Vd, Vobj, Vidx ----
-          ;; Variable-index array load: Vd = obj[idx]
-          ;; Vidx is raw (untagged) index, Vobj is tagged object pointer
+          ;; Variable-index array load.  tag=9 layout: slot 0 at tagged+7
+          ;; (= raw+16).  Vidx is fixnum-tagged (real_idx*2); shifting by 2
+          ;; gives real_idx*8 in the address computation.
           ((= op +op-aref+)
            (let* ((vd (vr 0))
                   (pobj (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Compute address: x16 = (Vobj - 2) + Vidx * 4
-             ;; Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8
-             (a64-sub-imm buf +a64-x16+ pobj 2)
+             (a64-add-imm buf +a64-x16+ pobj 7)
              (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
-             ;; Load from computed address
              (a64-ldur buf pd +a64-x16+ 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
           ;; ---- ASET Vobj, Vidx, Vs ----
-          ;; Variable-index array store: obj[idx] = Vs
+          ;; Variable-index array store — tag=9 layout, slot 0 at tagged+7.
           ((= op +op-aset+)
            (let* ((pobj (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+)))
-             ;; Compute address: x16 = (Vobj - 2) + Vidx * 4
-             ;; Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8
-             (a64-sub-imm buf +a64-x16+ pobj 2)
+             (a64-add-imm buf +a64-x16+ pobj 7)
              (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
-             ;; Reload value into x17 (safe — done with idx)
              (let ((ps (ensure-src (vr 2) +a64-x17+)))
                (a64-stur buf ps +a64-x16+ 0))))
 
           ;; ---- ARRAY-LEN Vd, Vobj ----
-          ;; Extract element count from object header, return as tagged fixnum
-          ;; Header at [Vobj - 10], element-count = header >> 16
+          ;; Extract element count from header at raw = tagged-9.
+          ;; count = header >> 8 (matches x64 count<<8 packing).
+          ;; Tagged fixnum result = count << 1.
           ((= op +op-array-len+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Load header: at Vobj - 2 (tag) - 8 (header size) = Vobj - 10
-             (a64-ldur buf +a64-x17+ ps -10)
-             ;; Extract element count: LSR by 16, then tag as fixnum (LSL 1)
-             ;; Combined: LSR by 15 then clear low bit
-             ;; Simpler: two shifts
-             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 16)
+             (a64-ldur buf +a64-x17+ ps -9)
+             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 8)
              (a64-lsl-imm buf pd +a64-x17+ 1)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
           ;; ---- ALLOC-ARRAY Vd, Vcount ----
-          ;; Dynamic array allocation: count is in a register (raw, untagged)
-          ;; Header: (count << 16) | #x32 (array subtag)
-          ;; Allocate 8 + count*8 bytes, aligned to 16
+          ;; Dynamic array allocation (tag=9 layout, matches x64).
+          ;; Header = (count << 8) | #x32 (array subtag).
+          ;; Layout: header(8)+padding(8)+count*slot(8).
+          ;; Total bytes = (count+2)*8 round-up-16 = floor((count+3)/2)*16
+          ;; — correct for BOTH even and odd counts under the padding layout.
+          ;; (The earlier (count+2)/2*16 formula under-allocates by 8 bytes
+          ;;  for odd count when padding is present.)
           ((= op +op-alloc-array+)
            (let* ((vd (vr 0))
                   (pcount (ensure-src (vr 1) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Build header: x16 = (count << 16) | #x32
-             (a64-lsl-imm buf +a64-x16+ pcount 16)
-             (a64-movk buf +a64-x16+ #x32 0)
-             ;; Store header at alloc pointer
+             ;; Build header: x16 = (count << 8) | #x32 via LSL + ORR-reg
+             ;; (MOVK at shift=0 would clobber bits 0-15 and corrupt the
+             ;;  low byte of count for count>=256, so use a separate temp).
+             (a64-lsl-imm buf +a64-x16+ pcount 8)
+             (a64-movz buf +a64-x9+ #x32 0)
+             (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x9+)
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
-             ;; Compute aligned allocation: floor((count+2)/2) * 16
-             ;; This equals (8 + count*8) rounded up to 16
-             (a64-add-imm buf +a64-x17+ pcount 2)
+             ;; Aligned size = floor((count+3)/2)*16.
+             (a64-add-imm buf +a64-x17+ pcount 3)
              (a64-lsr-imm buf +a64-x17+ +a64-x17+ 1)
              (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)
-             ;; Result = alloc_ptr + 10 (8 header + 2 tag)
-             (a64-add-imm buf pd +a64-x24+ 10)
-             ;; Bump alloc pointer
+             (a64-add-imm buf pd +a64-x24+ 9)
              (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
@@ -2504,21 +2502,22 @@
                (store-dst pd vd))))
 
           ;; ---- ALLOC-STRING Vd Vcount ----
-          ;; Same as alloc-array but with subtag #x31 (string).
-          ;; Vcount is UNTAGGED.  Header = (count << 16) | #x31.
-          ;; Result = alloc_ptr + 10 (object tag #x09 with header offset).
-          ;; Aligned alloc size = floor((count+2)/2) * 16.
+          ;; Same shape as alloc-array but with subtag #x31 (string).
+          ;; tag=9 layout: header(8)+padding(8)+char_slots.
+          ;; Header = (count << 8) | #x31.  Tagged = alloc_ptr + 9.
+          ;; Total bytes = (count+2)*8 round-up-16 = floor((count+3)/2)*16.
           ((= op +op-alloc-string+)
            (let* ((vd (vr 0))
                   (pcount (ensure-src (vr 1) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-lsl-imm buf +a64-x16+ pcount 16)
-             (a64-movk buf +a64-x16+ #x31 0)
+             (a64-lsl-imm buf +a64-x16+ pcount 8)
+             (a64-movz buf +a64-x9+ #x31 0)
+             (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x9+)
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
-             (a64-add-imm buf +a64-x17+ pcount 2)
+             (a64-add-imm buf +a64-x17+ pcount 3)
              (a64-lsr-imm buf +a64-x17+ +a64-x17+ 1)
              (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)
-             (a64-add-imm buf pd +a64-x24+ 10)
+             (a64-add-imm buf pd +a64-x24+ 9)
              (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))

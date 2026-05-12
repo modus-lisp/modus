@@ -124,6 +124,9 @@
 (defconstant +a64-x24+ 24)   ; VA alloc pointer
 (defconstant +a64-x25+ 25)   ; VL alloc limit
 (defconstant +a64-x26+ 26)   ; VN nil
+(defconstant +a64-x27+ 27)   ; CENV — closure-env (mirrors x64 R13).  Callee-
+                             ; saved by AAPCS; not touched by handler-stack
+                             ; PUSH/POP helpers (those clobber x9..x13 only).
 (defconstant +a64-x29+ 29)   ; FP
 (defconstant +a64-x30+ 30)   ; LR
 (defconstant +a64-sp+  31)   ; SP (context-dependent encoding with XZR)
@@ -2529,6 +2532,30 @@
              (a64-load-imm64 buf +a64-x16+ tagged)
              (a64-load-imm64 buf +a64-x17+ #x10000090)
              (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)))
+
+          ;; ---- SET-CENV Vs ----
+          ;; Store the closure env-list into the dedicated closure-env
+          ;; register x27.  Emitted only by compile-funcall's closure
+          ;; path right before the BLR; callee reads x27 via GET-CENV at
+          ;; entry.  x27 is callee-saved per AAPCS and is not touched by
+          ;; the handler-stack PUSH/POP helpers — so it survives any
+          ;; SETJMP/CLEAR-HANDLER BL that may sit between the funcall
+          ;; site and the closure body's GET-CENV.
+          ((= op +op-set-cenv+)
+           (let* ((ps (ensure-src (vr 0) +a64-x16+)))
+             (a64-mov-reg buf +a64-x27+ ps)))
+
+          ;; ---- GET-CENV Vd ----
+          ;; Snapshot the closure-env register x27 into a local at
+          ;; closure body entry.  After this point the env is in a
+          ;; frame slot / vreg and x27 is free to be re-set for any
+          ;; further closure call.
+          ((= op +op-get-cenv+)
+           (let* ((vd (vr 0))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-mov-reg buf pd +a64-x27+)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
 
           ;; ---- Unknown opcode ----
           (t

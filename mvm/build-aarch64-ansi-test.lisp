@@ -2813,7 +2813,9 @@
                      ~%  ;;   (probed-clean narrows inside 11608-12572: 11642-11656 and,~
                      ~%  ;;    11687-11726 case, 11743-11775 ccase, 11800-11819 cond)~
                      ~%  ;; Split format umbrella: 12573-12648 runs (31 P), 12649+ wedges~
-                     ~%  (%fail-range 12649 13527)  ;; format tail — wedges at 12649 post-Phase 3~
+                     ~%  ;; Sub-split format tail: keep wedge zone, try rest~
+                     ~%  (%fail-range 12649 13050)  ;; format wedge zone 1 — keep stamped~
+                     ~%  (%fail-range 13332 13527)  ;; format wedge zone 2 — keep stamped~
                      ~%  ;;   (probed-clean narrows inside 12573-13527: 12641-12651 nth-value,~
                      ~%  ;;    12652-12665 or, 12755-12774 progv, 12821-12833 psetq)~
                      ~%  ;; Sub-split numcomp tail: keep 14364-14800 stamped, try 14801-15186~

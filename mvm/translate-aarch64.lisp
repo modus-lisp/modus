@@ -251,7 +251,15 @@
                ;; Use nested 2-arg logior (bare-metal multi-arg may clobber)
                (setf (aref code index)
                      (logior (logior (ash immlo 29) (ash #b10000 24))
-                             (logior (ash immhi 5) rd))))))))))))
+                             (logior (ash immhi 5) rd)))))
+            (:tbz
+             ;; TBZ Xt, #imm6, label  /  TBNZ same shape
+             ;; Layout: b5|0110110|b40(5)|imm14(14 bits at [18:5])|Rt(5)
+             ;; Patch bits [18:5] with the signed offset (offset = target - index).
+             (let ((word (aref code index)))
+               (setf (aref code index)
+                     (logior (logand word #xFFF8001F)
+                             (ash (logand offset #x3FFF) 5))))))))))))
 
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."
@@ -2216,8 +2224,29 @@
                         target-offset)))))
 
           ;; ---- CALL-IND Vs ----
+          ;; Tag-aware indirect call.  If Vs has its low bit set, it's a
+          ;; tagged Lisp value (cons, immediate, object, or forward) —
+          ;; not a 4-byte-aligned native fn-addr.  BLR on such a value
+          ;; branches to data → UDF → sync handler → longjmp/halt.  We
+          ;; preempt that by trapping into the handler-case longjmp path
+          ;; via TRAP #x0511, which signals "longjmp now" and the kernel
+          ;; recovers cleanly through the active handler-case (test FAILs
+          ;; rather than wedges).
           ((= op +op-call-ind+)
-           (let ((ps (ensure-src (vr 0) +a64-x16+)))
+           (let* ((ps (ensure-src (vr 0) +a64-x16+))
+                  (ok-label (incf *mvm-label-counter*)))
+             ;; TBZ ps, #0, ok-label  (if low bit CLEAR → BLR safely)
+             (let ((idx (a64-current-index buf)))
+               (a64-emit buf (logior (ash #b00110110 24)   ; TBZ (32-bit)
+                                     (ash 0 19)             ; bit #0
+                                     (ash 0 5)              ; placeholder offset
+                                     (logand ps #x1F)))
+               (a64-add-fixup buf idx ok-label :tbz))
+             ;; Tagged value: invoke longjmp via SVC #x0511.  Caught by
+             ;; the kernel's sync exception handler which routes through
+             ;; the active handler-case (the test's enclosing wrapper).
+             (a64-svc buf #x0511)
+             (a64-set-label buf ok-label)
              (a64-blr buf ps)))
 
           ;; ---- RET ----

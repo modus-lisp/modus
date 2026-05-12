@@ -2070,13 +2070,45 @@
           ;; Load header at raw = tagged-9, extract low 8 bits, fixnum-tag.
           ;; Returns (subtag << 1) so downstream `(= (obj-subtag x) #x32)`
           ;; patterns match the same fixnum-tagged constants as on x64.
-          ;; UBFIZ Xd, X17, #1, #8 = UBFM Xd, X17, #63, #7 — one insn.
+          ;;
+          ;; TAG-SAFETY (mirrors translate-x64.lisp +op-obj-subtag+):
+          ;;   1. Low nibble != 9 → not a heap pointer (fixnum/cons/imm/forward).
+          ;;      Loading at [Vs-9] would hit unmapped memory.  Return 0.
+          ;;   2. Vs == T (#xDEAD1009) → low nibble 9 but T is an immediate.
+          ;;      [T-9] = #xDEAD1000 is unmapped on AArch64 (beyond L2 range).
+          ;;      Return 0.
+          ;;
+          ;; Result-on-fail = 0 (subtag 0) falsifies any caller's specific-
+          ;; subtag comparison.  E.g. `(= (obj-subtag x) #x32)` on T returns
+          ;; NIL — matches the x64 behaviour.
           ((= op +op-obj-subtag+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
-                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (fail-label (incf *mvm-label-counter*))
+                  (done-label (incf *mvm-label-counter*)))
+             ;; Check 1: low nibble == 9 ?
+             (a64-ubfm buf +a64-x17+ ps 63 3)  ; x17 = (Vs & 0xF) << 1
+             (a64-cmp-imm buf +a64-x17+ 18)    ; compare to 18 (= 9 << 1)
+             (let ((idx (a64-current-index buf)))
+               (a64-bcond buf +cc-ne+ 0)
+               (a64-add-fixup buf idx fail-label :bcond))
+             ;; Check 2: Vs == T (#xDEAD1009) ?
+             (a64-load-imm64 buf +a64-x17+ #xDEAD1009)
+             (a64-cmp-reg buf ps +a64-x17+)
+             (let ((idx (a64-current-index buf)))
+               (a64-bcond buf +cc-eq+ 0)
+               (a64-add-fixup buf idx fail-label :bcond))
+             ;; Real object: load header, extract subtag, fixnum-tag.
              (a64-ldur buf +a64-x17+ ps -9)
              (a64-ubfm buf pd +a64-x17+ 63 7)
+             (let ((idx (a64-current-index buf)))
+               (a64-emit buf (logior (ash #b000101 26) (logand 0 #x3FFFFFF)))  ; B placeholder
+               (a64-add-fixup buf idx done-label :b))
+             (a64-set-label buf fail-label)
+             ;; fail: pd = 0
+             (a64-movz buf pd 0 0)
+             (a64-set-label buf done-label)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

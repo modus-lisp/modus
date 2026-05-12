@@ -139,7 +139,9 @@
   ;; quirk.  Stick to 8 for the committed POC; investigate scaling
   ;; in a follow-up.
   '(10436 10437 10438 10439 10440 10441 10442 10443
-    10444 10445 10446 10447 10448 10449 10450))
+    10444 10445 10446 10447 10448 10449 10450
+    ;; Layout-conditional LOOP wedge with float — re-routes through actor
+    21196))
 (in-package :modus.mvm)
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))

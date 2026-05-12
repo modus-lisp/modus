@@ -2822,7 +2822,8 @@
                      ~%  ;;   (probed-clean narrows inside 12573-13527: 12641-12651 nth-value,~
                      ~%  ;;    12652-12665 or, 12755-12774 progv, 12821-12833 psetq)~
                      ~%  ;; Sub-split numcomp tail: keep 14364-14800 stamped, try 14801-15186~
-                     ~%  (%fail-range 14364 14800)  ;; numcomp wedge zone — keep stamped~
+                     ~%  (%fail-range 14364 14600)  ;; numcomp wedge zone 1a — keep stamped~
+                     ~%  ;; 14601-14800 try unstamping~
                      ~%  ;;   (probed-clean narrows inside 14069-15186: 14341-14374 plus,~
                      ~%  ;;    14391-14401 random, 14572-14601 times)~
                      ~%  (%fail-range 15683 15691)  ;; gentemp.lsp — still wedges; needs Phase 3(e) entry-5 too~
@@ -2835,7 +2836,8 @@
                      ~%  (%fail-range 17072 17106)  ;; elt tail — still wedges post-Phase 3~
                      ~%  ;; Split sequence umbrella: 18640-18891 runs (108 P), 18892+ wedges~
                      ~%  ;; Sub-split sequence tail: keep 18892-19499 stamped (wedge zone), try 19500-20000~
-                     ~%  (%fail-range 18892 19200)  ;; sequence wedge zone 1 — keep stamped~
+                     ~%  (%fail-range 18892 19050)  ;; sequence wedge zone 1a — keep stamped~
+                     ~%  ;; 19051-19200 try unstamping~
                      ~%  ;; 19201-19499 try unstamping~
                      ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
                      ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~

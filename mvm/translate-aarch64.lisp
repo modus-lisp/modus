@@ -1042,41 +1042,46 @@
      MOV x29, sp
      STP x19, x20, [sp, #16]
      STP x21, x22, [sp, #32]
-     STP x23, xzr, [sp, #48]
+     STP x23, x27, [sp, #48]
      ;; x24/x25/x26 are global state (alloc/limit/nil) — NOT saved
      SUB sp, sp, #1024
    Frame: 80 bytes save area + 1024 bytes for spill slots and frame locals.
    Note: x24 (alloc ptr), x25 (alloc limit), x26 (nil) are global state
    shared across all functions. They must NOT be saved/restored, or
-   allocations made by callees would be lost on return."
+   allocations made by callees would be lost on return.
+   x27 (CENV) is callee-saved per AAPCS and IS preserved — set-cenv
+   in the closure-dispatch path overwrites it on the path TO a callee,
+   but a caller that itself was called by something expects its own
+   x27 to survive the inner call."
   ;; Save FP and LR, allocate save area
   (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ -80)
   ;; Set up frame pointer: ADD x29, SP, #0
   ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
   (a64-add-imm buf +a64-x29+ +a64-sp+ 0)
-  ;; Save callee-saved registers (x19-x23 only)
+  ;; Save callee-saved registers (x19-x23, x27)
   ;; x24/x25/x26 are global alloc/limit/nil — must persist across calls
   (a64-stp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
   (a64-stp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
-  ;; Save x23 paired with xzr (x31 = zero register in this context)
-  (a64-stp-offset buf +a64-x23+ +a64-xzr+ +a64-sp+ 48)
+  ;; Save x23 paired with x27 (CENV).  Replaces the previous xzr slot.
+  (a64-stp-offset buf +a64-x23+ +a64-x27+ +a64-sp+ 48)
   ;; Allocate space for spill slots and frame locals below FP
   (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+))
 
 (defun a64-emit-epilogue (buf)
   "Emit the standard function epilogue:
      ADD sp, sp, #1024
-     LDP x23, xzr, [sp, #48]
+     LDP x23, x27, [sp, #48]
      LDP x21, x22, [sp, #32]
      LDP x19, x20, [sp, #16]
      LDP x29, x30, [sp], #80
      RET
-   Note: x24/x25/x26 are NOT restored (global state)."
+   Note: x24/x25/x26 are NOT restored (global state).  x27 (CENV) IS
+   restored — see prologue docstring."
   ;; Deallocate spill/frame-slot area
   (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
-  ;; Restore callee-saved registers (x19-x23 only)
+  ;; Restore callee-saved registers (x19-x23, x27)
   ;; x24/x25/x26 are global alloc/limit/nil — do NOT restore
-  (a64-ldp-offset buf +a64-x23+ +a64-xzr+ +a64-sp+ 48)
+  (a64-ldp-offset buf +a64-x23+ +a64-x27+ +a64-sp+ 48)
   (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
   (a64-ldp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
   ;; Restore FP/LR and deallocate save area

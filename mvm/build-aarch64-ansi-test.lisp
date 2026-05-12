@@ -2795,6 +2795,15 @@
                      ~%    (loop (when (> i hi) (return nil))~
                      ~%      (%record-test-fail i)~
                      ~%      (setq i (+ i 1)))))~
+                     ~%;; Data-driven %fail-range: walks a flat LO HI LO HI ... list~
+                     ~%;; calling %fail-range on each pair.  One call site instead of N~
+                     ~%;; cuts native-code emit ~~30 bytes per range — buys fragility~
+                     ~%;; headroom for unstamping more.  Constant list lives in the~
+                     ~%;; constant pool, not native code.~
+                     ~%(defun %fail-pairs (pairs)~
+                     ~%  (loop (when (null pairs) (return nil))~
+                     ~%    (%fail-range (car pairs) (cadr pairs))~
+                     ~%    (setq pairs (cddr pairs))))~
                      ~%;; Pre-stamp known wedge ranges as FAIL.  Called from kernel-main~
                      ~%;; before run-real-ansi-tests so the bitmap pre-marks (in %record-~
                      ~%;; test-fail) make run-test no-op on these IDs.  Defined as its~
@@ -2805,75 +2814,28 @@
                      ~%  ;;   10587-10591 (mapc), 10606-10610 (mapcan), 10620-10625 (mapcar),~
                      ~%  ;;   10634-10638 (mapcon), 10647-10652 (mapl), 10719-10768 (member),~
                      ~%  ;;   11151-11180 (pushnew), 10810-11125 (nintersection..nunion).~
-                     ~%  ;; (%fail-range 10653 10671)  ;; maplist — try unstamp post-Phase 3~
-                     ~%  (%fail-range 10672 10694)  ;; member-if-not.lsp — still wedges post-Phase 3~
-                     ~%  (%fail-range 10695 10718)  ;; member-if.lsp — restamp paired with member-if-not~
-                     ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
-                     ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
-                     ~%  ;; Split union..notany: 11608-11653 runs (33 P), 11654+ wedges~
-                     ~%  ;; Sub-split union..notany tail: keep wedge zone, try rest~
-                     ~%  (%fail-range 11654 12100)  ;; union wedge zone 1 — keep stamped~
-                     ~%  (%fail-range 12240 12300)  ;; union wedge zone 2a — keep stamped~
-                     ~%  (%fail-range 12483 12572)  ;; union wedge zone 2b — keep stamped~
-                     ~%  ;;   (probed-clean narrows inside 11608-12572: 11642-11656 and,~
-                     ~%  ;;    11687-11726 case, 11743-11775 ccase, 11800-11819 cond)~
-                     ~%  ;; Split format umbrella: 12573-12648 runs (31 P), 12649+ wedges~
-                     ~%  ;; Sub-split format tail: keep wedge zone, try rest~
-                     ~%  (%fail-range 12649 13050)  ;; format wedge zone 1 — keep stamped~
-                     ~%  (%fail-range 13332 13527)  ;; format wedge zone 2 — keep stamped~
-                     ~%  ;;   (probed-clean narrows inside 12573-13527: 12641-12651 nth-value,~
-                     ~%  ;;    12652-12665 or, 12755-12774 progv, 12821-12833 psetq)~
-                     ~%  ;; Sub-split numcomp tail: keep 14364-14800 stamped, try 14801-15186~
-                     ~%  (%fail-range 14364 14600)  ;; numcomp wedge zone 1a — keep stamped~
-                     ~%  ;; 14601-14800 try unstamping~
-                     ~%  ;;   (probed-clean narrows inside 14069-15186: 14341-14374 plus,~
-                     ~%  ;;    14391-14401 random, 14572-14601 times)~
-                     ~%  (%fail-range 15683 15691)  ;; gentemp.lsp — still wedges; needs Phase 3(e) entry-5 too~
-                     ~%  ;; 15744-17037 confirmed: 3 wedges (makunbound, symbol-function, copy-seq) — umbrella removed~
-                     ~%  ;; (%fail-range 15743 15747)  ;; makunbound — unstamp trial~
-                     ~%  ;; (%fail-range 15768 15773)  ;; symbol-function — unstamp trial~
-                     ~%  (%fail-range 16685 16713)  ;; copy-seq — still wedges post-Phase 3~
-                     ~%  ;; (%fail-range 17717 17793)  ;; map — unstamp trial post-Phase 3~
-                     ~%  ;; 17072-18639 confirmed: only wedge is elt tail (proven via probe round 3)~
-                     ~%  (%fail-range 17072 17106)  ;; elt tail — still wedges post-Phase 3~
-                     ~%  ;; Split sequence umbrella: 18640-18891 runs (108 P), 18892+ wedges~
-                     ~%  ;; Sub-split sequence tail: keep 18892-19499 stamped (wedge zone), try 19500-20000~
-                     ~%  (%fail-range 18892 19050)  ;; sequence wedge zone 1a — keep stamped~
-                     ~%  ;; 19051-19200 try unstamping~
-                     ~%  ;; 19201-19499 try unstamping~
-                     ~%  ;; 18480-18557 (position-if-not), 18558-18635 (position-if),~
-                     ~%  ;;   18636-18789 (position) — confirmed clean post-IRQ-stale-frame fix~
-                     ~%  ;;   (commit c7350d3): probes show +51/+54/+2 P respectively, DN=1.~
-                     ~%  ;; (%fail-range 18790 18891)  ;; reduce — unstamp trial post-Phase 3~
-                     ~%  ;; 20893-22134 umbrella replaced by narrow stamps for the actual~
-                     ~%  ;;   wedges (probe found pprint-indent at 21960-21988; vector-pop/~
-                     ~%  ;;   push/push-extend/pprint-exit-if-list-exhausted from earlier).~
-                     ~%  ;; (%fail-range 20893 20897)  ;; vector-pop — unstamp trial~
-                     ~%  ;; (%fail-range 20898 20944)  ;; vector-push-extend — unstamp trial~
-                     ~%  ;; (%fail-range 20945 20980)  ;; vector-push — unstamp trial~
-                     ~%  ;; (%fail-range 21932 21948)  ;; pprint-exit-if-list-exhausted — unstamp trial~
-                     ~%  ;; (%fail-range 21960 21988)  ;; pprint-indent — unstamp trial~
-                     ~%  ;; (%fail-range 22135 22154)  ;; print-bit-vector — unstamp trial~
-                     ~%  ;; Split print-floats: 22175-22453 runs (8 P), 22454+ wedges~
-                     ~%  (%fail-range 22454 22526)  ;; print-floats tail — wedges at 22454 post-Phase 3~
-                     ~%  ;; (%fail-range 22538 23957)  ;; format-* umbrella — unstamp trial post-Phase 3~
-                     ~%  ;; (%fail-range 24347 24349)  ;; stream-error-stream wedge — unstamp trial~
-                     ~%  ;; (%fail-range 24496 24522)  ;; defpackage — unstamp trial~
-                     ~%  ;; (%fail-range 24568 24574)  ;; export wedge — unstamp trial~
-                     ~%  ;; (%fail-range 24764 24775)  ;; shadow wedge — unstamp trial~
-                     ~%  ;; (%fail-range 24790 24835)  ;; unintern..with-package-iterator — unstamp trial~
-                     ~%  (%fail-range 24836 24948)  ;; compile..eval-when — wedges at first test (24836)~
-                     ~%  (%fail-range 25039 25151)  ;; lambda..type — still wedges post-Phase 3~
-                     ~%  (%fail-range 25184 25204)  ;; deftype — still wedges past 25201 post-Phase 3~
-                     ~%  ;; (%fail-range 25702 25897)  ;; reader — unstamp trial post-Phase 3~
-                     ~%  ;; (%fail-range 25898 26045)  ;; syntax — unstamp trial post-Phase 3~
-                     ~%  ;; (%fail-range 26067 26068)  ;; with-standard-io-syntax tail wedge — try unstamp post-Phase 3~
-                     ~%  (%fail-range 26113 26260)  ;; disassemble..user-homedir-pathname — still wedges at 26116~
-                     ~%  ;; (%fail-range 26261 26501)  ;; abort..restart-case — unstamp trial post-Phase 3~
-                     ~%  ;; (%fail-range 26502 26546)  ;; store-value..with-simple-restart — unstamp trial~
-                     ~%  ;; (%fail-range 26547 27037)  ;; pathname/namestring — unstamp trial post-Phase 3~
-                     ~%  (%fail-range 27162 27692)  ;; CLOS family — wedges at first test (27162) post-Phase 3~
-                     ~%  ;; 23958-27692: streams, CLOS, conditions, etc — UNSKIPPED for bisect~
+                     ~%  ;; Single call into the data-driven walker.  Constant list~
+                     ~%  ;; lives in the constant pool — cuts ~~30 bytes of native~
+                     ~%  ;; code per range vs one BL site each.  Pairs:~
+                     ~%  ;;   10672-10694 member-if-not, 10695-10718 member-if,~
+                     ~%  ;;   11654-12100 union 1, 12240-12300 union 2a,~
+                     ~%  ;;   12483-12572 union 2b, 12649-13050 format 1,~
+                     ~%  ;;   13332-13527 format 2, 14364-14600 numcomp 1a,~
+                     ~%  ;;   15683-15691 gentemp, 16685-16713 copy-seq,~
+                     ~%  ;;   17072-17106 elt tail, 18892-19050 sequence 1a,~
+                     ~%  ;;   22454-22526 print-floats tail, 24836-24948 compile,~
+                     ~%  ;;   25039-25151 lambda..type, 25184-25204 deftype,~
+                     ~%  ;;   26113-26260 disassemble, 27162-27692 CLOS.~
+                     ~%  (%fail-pairs '(10672 10694 10695 10718~
+                     ~%                 11654 12100 12240 12300 12483 12572~
+                     ~%                 12649 13050 13332 13527~
+                     ~%                 14364 14600~
+                     ~%                 15683 15691 16685 16713 17072 17106~
+                     ~%                 18892 19050~
+                     ~%                 22454 22526~
+                     ~%                 24836 24948 25039 25151 25184 25204~
+                     ~%                 26113 26260~
+                     ~%                 27162 27692))~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

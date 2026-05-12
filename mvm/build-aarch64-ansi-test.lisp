@@ -2809,7 +2809,9 @@
                      ~%  ;; 11183-11410 confirmed clean post-fn-addr-fix~
                      ~%  ;; 11438-11547 confirmed clean post-fn-addr-fix~
                      ~%  ;; Split union..notany: 11608-11653 runs (33 P), 11654+ wedges~
-                     ~%  (%fail-range 11654 12572)  ;; union..notany tail — wedges at 11654 post-Phase 3~
+                     ~%  ;; Sub-split union..notany tail: keep wedge zone, try rest~
+                     ~%  (%fail-range 11654 12100)  ;; union wedge zone 1 — keep stamped~
+                     ~%  (%fail-range 12240 12572)  ;; union wedge zone 2 — keep stamped~
                      ~%  ;;   (probed-clean narrows inside 11608-12572: 11642-11656 and,~
                      ~%  ;;    11687-11726 case, 11743-11775 ccase, 11800-11819 cond)~
                      ~%  ;; Split format umbrella: 12573-12648 runs (31 P), 12649+ wedges~

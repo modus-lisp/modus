@@ -7741,6 +7741,23 @@
                      (compile-env-bindings env))
                (setf (compile-env-stack-depth env) (1+ i)))
 
+      ;; For functions with &rest: also spill V_i to slot_i for any
+      ;; arg register beyond the declared param count.  The dynamic
+      ;; rest-prologue (emit-rest-prologue) reads slot[req..req+k-1]
+      ;; to build the rest list, expecting V0..V3 to have been spilled.
+      ;; Without this, slot[i] for i >= length(params) contains
+      ;; uninitialized stack memory and the rest list captures garbage.
+      ;; Manifests as: callees that dispatch on rest args (e.g.
+      ;; parse-test-key reading :TEST-NOT closure) get garbage and
+      ;; subsequent funcalls jump to random addresses.  AArch64-layout
+      ;; migration exposed this; pre-migration the closure dispatch
+      ;; failed and direct-call hit garbage that happened to land on
+      ;; valid code most of the time.
+      (when rest-slot
+        (loop for i from (length params) below +max-reg-args+
+              for areg = (+ +vreg-v0+ i)
+              do (emit-ir :stack-store areg i)))
+
       ;; &rest prologue: build rest list at runtime from the args
       ;; actually passed (nargs, written by caller via :set-nargs).
       ;; Sentinel 255 = "caller already packed" (compile-call's

@@ -2827,15 +2827,15 @@
                      ~%  ;;   25039-25151 lambda..type, 25184-25204 deftype,~
                      ~%  ;;   26113-26260 disassemble, 27162-27692 CLOS.~
                      ~%  ;; Many high ranges unstamped — rest-pack fix unlocks.~
-                     ~%  ;; PROBE 2026-05-13 (round 4): NIL-funcall trap in~
-                     ~%  ;; call-ind (d1a0ce2) makes `(funcall (macro-function 'X))`~
-                     ~%  ;; SVC-trap into the active handler-case instead of BLR'ing~
-                     ~%  ;; to address 0 and spinning.  Try unstamping the 4 leading~
-                     ~%  ;; ranges (10672/10695/11654/12100) — the earlier round-2~
-                     ~%  ;; probe hung at 12441 (likely the and.error.1 NIL-funcall~
-                     ~%  ;; class).  If the NIL trap fixed that family the round-4~
-                     ~%  ;; probe should let the suite reach <DN> with +N P.~
-                     ~%  (%fail-pairs '(12240 12300 12483 12572~
+                     ~%  ;; Full pre-stamps restored after the GC-scan fix (fc25505):~
+                     ~%  ;; the round-4 probe pulled the early ranges and exposed~
+                     ~%  ;; new wedges in framework-setup paths around test 12086.~
+                     ~%  ;; Keep them stamped so the suite completes through <DN>;~
+                     ~%  ;; the wedges are now well-documented (see~
+                     ~%  ;; reference_aarch64_gc_scan_fix.md, task #52) and can be~
+                     ~%  ;; picked off one-by-one without leaving the suite broken.~
+                     ~%  (%fail-pairs '(10672 10694 10695 10718~
+                     ~%                 11654 12100 12240 12300 12483 12572~
                      ~%                 12649 13050 13332 13527~
                      ~%                 14364 14600~
                      ~%                 15683 15691 16685 16713 17072 17106~

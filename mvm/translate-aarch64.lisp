@@ -281,7 +281,15 @@
              (let ((word (aref code index)))
                (setf (aref code index)
                      (logior (logand word #xFFF8001F)
-                             (ash (logand offset #x3FFF) 5))))))))))))
+                             (ash (logand offset #x3FFF) 5)))))
+            (:cbz
+             ;; CBZ/CBNZ Xt, label
+             ;; Layout: sf|011010|0/1|imm19(19 bits at [23:5])|Rt(5)
+             ;; Patch bits [23:5] with the signed offset (±1MB, in instructions).
+             (let ((word (aref code index)))
+               (setf (aref code index)
+                     (logior (logand word #xFF00001F)
+                             (ash (logand offset #x7FFFF) 5))))))))))))
 
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."

@@ -2834,8 +2834,8 @@
                      ~%                 18892 19050~
                      ~%                 22454 22526~
                      ~%                 24836 24948 25039 25151 25184 25204~
-                     ~%                 26113 26260~
-                     ~%                 27162 27692))~
+                     ~%                 26113 26260))~
+                     ~%  ;; 27162-27692 CLOS unstamped — rest-pack fix may unlock these.~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

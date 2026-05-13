@@ -547,17 +547,23 @@
 (defconstant +tdk-uart-pa+       #x09000000)  ; PL011 UART physical
 
 ;; VA addresses for fixpoint runtime (same as x64)
-;; Stack top moved out of the kernel image as of task #47.  Image loads
-;; at PA 0x40080000 (= VA 0x80000) and grows up; the ANSI test image is
-;; ~40 MB (ends at ~VA 0x02880000).  The old stack top at VA 0x00200000
-;; (= PA 0x40200000) sat 1.5 MB *inside* the image, so every stack push
-;; overwrote whatever the build happened to emit at file offset
-;; 0x180000+.  Each byte the image grew shifted what got clobbered,
-;; which is the AArch64 layout-fragility source (see
-;; reference_aarch64_ansi_saturation).  VA 0x08000000 (= PA 0x48000000)
-;; sits 88 MB above the largest reasonable image end and 16 MB below the
-;; alloc heap base — safe in both directions.
-(defconstant +tdk-stack-va+      #x08000000)  ; Stack top (above image)
+;; ATTEMPTED stack move (task #47, 2026-05-13, reverted):
+;; Image loads at PA 0x40080000 (= VA 0x80000) and grows up; the ANSI
+;; test image is ~40 MB (ends at ~VA 0x02880000).  The stack top at
+;; VA 0x00200000 (= PA 0x40200000) sits 1.5 MB *inside* the image, so
+;; every stack push overwrites whatever the build happened to emit at
+;; file offset 0x180000+.  Each byte the image grew shifts what got
+;; clobbered, which is the AArch64 layout-fragility source (see
+;; reference_aarch64_ansi_saturation).
+;;
+;; Moved to VA 0x08000000 to fix this — that PA is 88 MB above the
+;; largest reasonable image end and 16 MB below the alloc heap base,
+;; safe in both directions.  But the move *exposes* a different wedge
+;; somewhere around fill tests (17138-17140) where the per-test
+;; deadline timer fails to recover — likely a layout-shift artifact
+;; in the same family.  Reverted while we investigate; the audit
+;; comments below stay so the trail is preserved.
+(defconstant +tdk-stack-va+      #x00200000)  ; Stack top (in image — TODO)
 ;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
 ;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
 ;; boot loader sets x24=base and x25=mid-point (end of the initial

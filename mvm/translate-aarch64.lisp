@@ -2264,17 +2264,36 @@
           ;; rather than wedges).
           ((= op +op-call-ind+)
            (let* ((ps (ensure-src (vr 0) +a64-x16+))
-                  (ok-label (incf *mvm-label-counter*)))
-             ;; TBZ ps, #0, ok-label  (if low bit CLEAR → BLR safely)
+                  (ok-label (incf *mvm-label-counter*))
+                  (bad-label (incf *mvm-label-counter*)))
+             ;; Two checks for callable validity:
+             ;;   TBNZ ps, #0, bad   — tagged value (low bit set) → trap
+             ;;   CBZ  ps,    bad   — NIL (raw 0) → trap; else BLR.
+             ;; Before adding the CBZ, `(funcall NIL)` on AArch64 BLR'd
+             ;; address 0 and spun on QEMU virt's identity-mapped
+             ;; pre-RAM bytes; the timer IRQ couldn't recover because
+             ;; whatever bytes live there mask interrupts.  Accepts a
+             ;; layout-fragility regression at the current ceiling —
+             ;; see reference_aarch64_nil_funcall_wedge.md.
              (let ((idx (a64-current-index buf)))
-               (a64-emit buf (logior (ash #b00110110 24)   ; TBZ (32-bit)
+               (a64-emit buf (logior (ash #b00110111 24)   ; TBNZ (32-bit)
                                      (ash 0 19)             ; bit #0
                                      (ash 0 5)              ; placeholder offset
                                      (logand ps #x1F)))
-               (a64-add-fixup buf idx ok-label :tbz))
-             ;; Tagged value: invoke longjmp via SVC #x0511.  Caught by
-             ;; the kernel's sync exception handler which routes through
-             ;; the active handler-case (the test's enclosing wrapper).
+               (a64-add-fixup buf idx bad-label :tbz))
+             (let ((idx (a64-current-index buf)))
+               (a64-emit buf (logior (ash #b10110100 24)   ; CBZ (64-bit)
+                                     (ash 0 5)              ; placeholder offset
+                                     (logand ps #x1F)))
+               (a64-add-fixup buf idx bad-label :cbz))
+             ;; Valid callable: skip over the trap and BLR.
+             (let ((idx (a64-current-index buf)))
+               (a64-b buf 0)
+               (a64-add-fixup buf idx ok-label :b))
+             ;; Bad-callable trap: SVC #x0511 — caught by the kernel's
+             ;; sync exception handler, which longjmps through the
+             ;; active handler-case.
+             (a64-set-label buf bad-label)
              (a64-svc buf #x0511)
              (a64-set-label buf ok-label)
              (a64-blr buf ps)))

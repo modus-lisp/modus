@@ -2293,6 +2293,20 @@
           ;; Target operand is the bytecode offset of the called function.
           ;; Look up in mvm-to-native-label (bytecode-offset → label, set during init).
           ((= op +op-call+)
+           ;; RAW-ADDR-AUDIT: direct call to a named function.  When the
+           ;; target offset resolves to a label, emit BL.  When it
+           ;; doesn't (undefined function — see e.g. `(%M arg)` in the
+           ;; ANSI tests' macrolet-leaked source), we used to emit zero
+           ;; bytes and silently fall through — control-flow continued
+           ;; into whatever follow-up IR the compiler emitted, with
+           ;; junk in V0.  That worked in baseline only by layout
+           ;; coincidence; any address shift moved the fall-through
+           ;; into something that wedged.  Now: emit SVC #x0511 so the
+           ;; undefined-call traps into the active handler-case (which
+           ;; the test wrappers always have armed) instead of running
+           ;; off into the next instruction.  Same family as the NIL-
+           ;; funcall trap in +op-call-ind+ — undefined direct call is
+           ;; just the named-target variant.
            (let* ((target-offset (vr 0))
                   (label (gethash target-offset mvm-to-native-label)))
              (cond
@@ -2301,8 +2315,9 @@
                   (a64-bl buf 0)  ; placeholder
                   (a64-add-fixup buf idx label :bl)))
                (t
-                (format t "~&  AARCH64 CALL: NO LABEL for target-offset=~D~%"
-                        target-offset)))))
+                (format t "~&  AARCH64 CALL: NO LABEL for target-offset=~D — emitting SVC #x0511 trap~%"
+                        target-offset)
+                (a64-svc buf #x0511)))))
 
           ;; ---- CALL-IND Vs ----
           ;; Tag-aware indirect call.  If Vs has its low bit set, it's a
@@ -2944,13 +2959,19 @@
     (a64-load-imm64 buf +a64-x16+ #x10000078)
     (a64-lsl-imm buf +a64-x17+ +a64-x25+ 1)
     (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
-    ;; Stash PRE-PUSH SP (= current SP + 240) → 0x10000068.  The 240
-    ;; bytes of register spills above pre-entry SP are not roots; the
-    ;; collector should scan from the caller's SP upward.  Stored in
-    ;; SHL'd form for the same reason as the alloc ptr/limit.
+    ;; Stash CURRENT SP → 0x10000068.  The trampoline's register-save
+    ;; area at [sp, sp+232) IS a root region: any tagged pointer in
+    ;; x0..x23/x26/x27 that's now sitting on the stack must be
+    ;; forwarded by the GC scan or its restore at trampoline exit
+    ;; uncovers a stale pre-GC pointer.  Pre-GC bug: we used SP+240
+    ;; here, which skipped past the saved-reg frame and missed roots
+    ;; — the kernel "worked" until a saved closure pointer landed in
+    ;; the saved-reg frame and the post-GC restore handed it back as
+    ;; a forwarding-tagged value, which then took funcall to a stale
+    ;; object and wedged the runtime.  Stored SHL'd to match
+    ;; (mem-ref :u64)'s tagging convention on the Lisp side.
     (a64-load-imm64 buf +a64-x16+ #x10000068)
-    (a64-add-imm buf +a64-x17+ +a64-sp+ 240)
-    (a64-lsl-imm buf +a64-x17+ +a64-x17+ 1)
+    (a64-lsl-imm buf +a64-x17+ +a64-sp+ 1)
     (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
     ;; Set NARGS = 0 for the %gc-collect call (the ABI puts nargs at
     ;; raw u32 slot 0x10000150; only matters if the callee has an

@@ -5269,8 +5269,16 @@
     (emit-ir :trap #x0512)
 
     ;; Run cleanup forms; their return values are discarded.
+    ;; NOTE: must NOT use +vreg-vn+ as dest — vreg-vn maps to a fixed
+    ;; physical register holding NIL (x26 on AArch64, r15 on x64), and
+    ;; writing the cleanup result to it would clobber the NIL register
+    ;; for ALL subsequent code in the kernel.  That breaks every
+    ;; BNULL/BNNULL test until something fortuitously restores NIL.
+    ;; Use +vreg-vr+ (the return register) instead — the protected
+    ;; form's primary is preserved on the stack across cleanup, so
+    ;; clobbering vreg-vr here is harmless.
     (dolist (cf cleanup-forms)
-      (compile-form cf env +vreg-vn+))
+      (compile-form cf env +vreg-vr+))
 
     ;; Restore MV state (pop in reverse push order: last MV slot first).
     (let ((mv-temp   (alloc-temp-reg))
@@ -5300,8 +5308,9 @@
     (emit-ir :trap #x0512)
 
     ;; Run cleanup forms; their return values are discarded.
+    ;; Use +vreg-vr+, NOT +vreg-vn+: see comment in the normal path above.
     (dolist (cf cleanup-forms)
-      (compile-form cf env +vreg-vn+))
+      (compile-form cf env +vreg-vr+))
 
     ;; Re-propagate the original error to the enclosing handler.
     ;; *current-condition* still holds the condition that was raised.

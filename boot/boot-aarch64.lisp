@@ -547,7 +547,17 @@
 (defconstant +tdk-uart-pa+       #x09000000)  ; PL011 UART physical
 
 ;; VA addresses for fixpoint runtime (same as x64)
-(defconstant +tdk-stack-va+      #x00200000)  ; Stack top
+;; Stack top moved out of the kernel image as of task #47.  Image loads
+;; at PA 0x40080000 (= VA 0x80000) and grows up; the ANSI test image is
+;; ~40 MB (ends at ~VA 0x02880000).  The old stack top at VA 0x00200000
+;; (= PA 0x40200000) sat 1.5 MB *inside* the image, so every stack push
+;; overwrote whatever the build happened to emit at file offset
+;; 0x180000+.  Each byte the image grew shifted what got clobbered,
+;; which is the AArch64 layout-fragility source (see
+;; reference_aarch64_ansi_saturation).  VA 0x08000000 (= PA 0x48000000)
+;; sits 88 MB above the largest reasonable image end and 16 MB below the
+;; alloc heap base — safe in both directions.
+(defconstant +tdk-stack-va+      #x08000000)  ; Stack top (above image)
 ;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
 ;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
 ;; boot loader sets x24=base and x25=mid-point (end of the initial
@@ -789,7 +799,14 @@
     ;; resources and then branch to native code via offset map.
     ;; ================================================================
 
-    ;; 15. Set stack pointer to VA 0x200000 (→ PA 0x40200000)
+    ;; 15. Set stack pointer to +tdk-stack-va+.
+    ;; RAW-ADDR-AUDIT: SP gets a raw VA, not a Lisp value.  See the
+    ;; defconstant for the layout-fragility caveat — every byte that
+    ;; crosses the stack region between boot and the first GC scan is
+    ;; un-tagged and trusted.  Also influences GC: %gc-init's
+    ;; stack-base argument MUST match this value (in raw bytes), and
+    ;; the GC trampoline must apply LSL/ASR around the mem-ref :u64
+    ;; pair that bridges the trampoline (raw) and %gc-collect (Lisp).
     (emit-aarch64-load-imm64 buf x16 +tdk-stack-va+)
     (emit-aarch64-mov-sp buf sp x16)
 
@@ -812,6 +829,13 @@
     (emit-aarch64-str-w buf x0 x17 12)
 
     ;; 17. Set allocation registers (VA addresses)
+    ;; RAW-ADDR-AUDIT: x24 (alloc ptr) and x25 (alloc limit) hold RAW
+    ;; byte addresses.  Compiled code BUMPS x24 by 16 per CONS and by
+    ;; alloc-bytes per ALLOC-OBJ, then writes through it.  The GC
+    ;; trampoline rotates x24/x25 via the LSL/ASR convention at
+    ;; 0x10000070/78 (see translate-aarch64.lisp).  x26 = NIL is also
+    ;; raw 0 — *not* a tagged immediate — and the AArch64 call-ind
+    ;; check explicitly CBZ's on it to catch `(funcall NIL)`.
     (emit-aarch64-load-imm64 buf x24 +tdk-cons-base-va+)   ; cons alloc
     (emit-aarch64-load-imm64 buf x25 +tdk-cons-limit-va+)  ; cons limit
     (emit-aarch64-movz buf x26 0 0)                         ; NIL = 0

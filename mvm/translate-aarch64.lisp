@@ -20,6 +20,34 @@
 ;;;;   x16 (IP0) - intra-procedure scratch 0
 ;;;;   x17 (IP1) - intra-procedure scratch 1
 ;;;;   x30 (LR)  - link register
+;;;;
+;;;; ============================================================
+;;;; RAW-ADDR-AUDIT — grep this token to find every site below where
+;;;; a raw native byte address (untagged, no Lisp value tag) is
+;;;; produced or consumed in a way that could surprise the runtime.
+;;;; The hazards split into two categories:
+;;;;
+;;;;   (1) Untrusted callable.  Most prominently +op-call-ind+ — the
+;;;;       BLR target is whatever Vd holds, which could be NIL (raw
+;;;;       0), a fixnum, or arbitrary user data.  The fix here is a
+;;;;       TBNZ+CBZ filter in front of BLR; future range-check (task
+;;;;       #46) would complete it.
+;;;;
+;;;;   (2) Raw/Lisp boundary mismatch.  Memory slots written natively
+;;;;       (raw bytes) but read via (mem-ref :u64) from Lisp — or
+;;;;       vice versa — must agree on tagging.  (mem-ref :u64) treats
+;;;;       the loaded 64-bit word as a Lisp value, and Lisp fixnums
+;;;;       are stored SHL'd by 1 in registers, so any raw address the
+;;;;       native side deposits at a slot the Lisp side later reads
+;;;;       must be SHL'd at write time and ASR'd at the next native
+;;;;       read.  The GC trampoline (emit-aarch64-handler-helpers)
+;;;;       has the canonical example at slots 0x10000068/70/78; the
+;;;;       handler-state slots at 0x10000180/188/190 are *not* read
+;;;;       from Lisp and use the simpler raw-only convention.
+;;;;
+;;;; If you add a new boundary-crosser, follow these conventions and
+;;;; leave a "RAW-ADDR-AUDIT:" comment so it can be re-found later.
+;;;; ============================================================
 
 (in-package :modus.mvm)
 
@@ -1341,6 +1369,17 @@
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
                 ;; execution resumes here with X0 = T (#xDEAD1009).
+                ;;
+                ;; RAW-ADDR-AUDIT: writes RAW SP, RAW FP, RAW IP into the
+                ;; three handler-state slots (8 bytes each).  These slots
+                ;; are read RAW by the sync-exception handler at entry
+                ;; offset 0x200 (boot-aarch64.lisp::emit-aarch64-exception-vectors
+                ;; entry 4) and by the IRQ deadline handler at entry
+                ;; offset 0x280 — both restore SP from slot 180 and BR
+                ;; to slot 190.  Nothing reads these via mem-ref :u64,
+                ;; so NO SHL convention applies (unlike the GC metadata
+                ;; at 0x10000068+).  Treat slots 180/188/190 + the
+                ;; per-fork handler-stack frames as raw-only.
                 ;; Mirrors x64 #x0510 (translate-x64.lisp:584).  Saved IP
                 ;; is the byte AFTER the trap block — both first-call and
                 ;; longjmp-call land there.  No skip-branch needed.
@@ -1387,6 +1426,18 @@
                ((= code #x0511)
                 ;; LONGJMP: Restore SP, FP, IP from 0x10000180.
                 ;; Set X0 = T (#xDEAD1009). BR to saved IP.
+                ;;
+                ;; RAW-ADDR-AUDIT: BR x16/x17 below jumps to a raw
+                ;; native address read from slot 0x10000180+16.  That
+                ;; slot is written by SETJMP (trap #x0510) with the
+                ;; resume-PC of the active handler-case.  If LONGJMP
+                ;; ever fires with no handler-case armed (slot=0), we
+                ;; BR to 0 and wedge.  In normal use the sync-exception
+                ;; handler at entry-4 takes that "no handler" path
+                ;; *before* SVC #x0511 ever executes, so the trap body
+                ;; assumes a handler is armed — but a stale call-ind to
+                ;; this trap from outside a handler-case would skip the
+                ;; pre-check.  TODO: prepend a CBZ x16, halt to be safe.
                 ;;
                 ;; Phase 3(d): if the per-fork pop helper is wired up,
                 ;; we copy the inner 180/188/190 triple to scratch
@@ -2263,6 +2314,17 @@
           ;; recovers cleanly through the active handler-case (test FAILs
           ;; rather than wedges).
           ((= op +op-call-ind+)
+           ;; RAW-ADDR-AUDIT: ps is an UNTRUSTED native function address
+           ;; (low bit 0, ≥ kernel code range).  Source could be a
+           ;; closure-slot read (compile-make-closure → :obj-set on
+           ;; slot 0 of a #x52 object), a symbol's `function-value`
+           ;; lookup result, or `(funcall <user-form>)`.  Any user-
+           ;; constructed value reaches here.  TBNZ + CBZ catch the
+           ;; obvious bad cases (tagged values, NIL) but a non-zero,
+           ;; low-bit-clear garbage value would still BLR to garbage.
+           ;; For defense-in-depth a range check against
+           ;; [kernel_code_base, kernel_code_end] would be ideal — task
+           ;; #46 (compile-functionp safe) is the wider variant.
            (let* ((ps (ensure-src (vr 0) +a64-x16+))
                   (ok-label (incf *mvm-label-counter*))
                   (bad-label (incf *mvm-label-counter*)))
@@ -2579,6 +2641,18 @@
           ;; call site — the cause of layout-fragility bugs on
           ;; the 38 MB ANSI build.
           ((= op +op-fn-addr+)
+           ;; RAW-ADDR-AUDIT: produces a RAW native function address
+           ;; in Vd (low bit 0, no Lisp tag).  Callers must treat the
+           ;; value as opaque-and-untagged.  In particular: storing it
+           ;; into a closure slot is fine (subtag #x52 obj-set just
+           ;; copies the bytes; obj-ref pulls them out for call-ind),
+           ;; but storing it via mem-ref :u64 would silently SHL it by
+           ;; 1 and any subsequent mem-ref :u64 read would interpret
+           ;; the bits as a Lisp fixnum (= addr/2) — same trap the GC
+           ;; trampoline metadata stash had.  Any future code that
+           ;; flows fn-addr through :u64 storage must apply the
+           ;; LSL/ASR-by-1 convention (see emit-aarch64-handler-helpers
+           ;; for the canonical example).
            (let* ((vd (vr 0))
                   (target-offset (vr 1))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
@@ -2845,6 +2919,19 @@
     (a64-str-unsigned buf +a64-x27+ +a64-sp+ 200)
     (a64-str-unsigned buf +a64-x29+ +a64-sp+ 208)
     (a64-str-unsigned buf +a64-x30+ +a64-sp+ 216)
+    ;; RAW-ADDR-AUDIT: the trampoline writes RAW byte addresses (x24,
+    ;; x25, SP+240) but %gc-collect reads them via (mem-ref ADDR :u64)
+    ;; which treats the loaded bits as a Lisp value (low-bit-0 fixnum
+    ;; = value/2).  To keep the round-trip lossless we LSL by 1 before
+    ;; STR and ASR by 1 after LDR — that way the bytes deposited at
+    ;; 0x10000068/70/78 match what mem-ref :u64 will reconstruct as the
+    ;; raw byte address back in Lisp.  Without this the trampoline
+    ;; "succeeds" (we even see %gc-collect's '12345' progress markers)
+    ;; and *then* the runtime silently corrupts itself.  Any future
+    ;; raw-address slot that's read on both the native and Lisp sides
+    ;; needs the same SHL/ASR-by-1 dance — see also
+    ;; reference_aarch64_gc_trampoline.md for the original debugging.
+    ;;
     ;; Stash x24 (alloc ptr) → 0x10000070.  %gc-collect reads this
     ;; via (mem-ref ADDR :u64) and treats the result as a Lisp
     ;; integer.  Modus tags fixnums by SHL 1, so the stored 64-bit

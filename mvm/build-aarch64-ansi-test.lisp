@@ -2827,6 +2827,16 @@
                      ~%  ;;   25039-25151 lambda..type, 25184-25204 deftype,~
                      ~%  ;;   26113-26260 disassemble, 27162-27692 CLOS.~
                      ~%  ;; Many high ranges unstamped — rest-pack fix unlocks.~
+                     ~%  ;; PROBE RESULT 2026-05-13: even after GC trampoline~
+                     ~%  ;; 73c2adb landed, removing the early pre-stamps (10672/~
+                     ~%  ;; 10695/11654) un-masks a wedge at test 12441 that was~
+                     ~%  ;; previously dormant — pre-stamping the 4 leading ranges~
+                     ~%  ;; lets the kernel reach an undocumented wedge in the~
+                     ~%  ;; 12301-12482 window.  Either the earlier ranges shift~
+                     ~%  ;; the heap allocation cadence so GC fires at a moment~
+                     ~%  ;; that exposes a latent bug, or the IRQ-longjmp paper~
+                     ~%  ;; is leaking state.  Keep original stamps until the new~
+                     ~%  ;; wedges are root-caused.  See task #52.~
                      ~%  (%fail-pairs '(10672 10694 10695 10718~
                      ~%                 11654 12100 12240 12300 12483 12572~
                      ~%                 12649 13050 13332 13527~

@@ -2826,16 +2826,14 @@
                      ~%  ;;   22454-22526 print-floats tail, 24836-24948 compile,~
                      ~%  ;;   25039-25151 lambda..type, 25184-25204 deftype,~
                      ~%  ;;   26113-26260 disassemble, 27162-27692 CLOS.~
+                     ~%  ;; Many high ranges unstamped — rest-pack fix unlocks.~
                      ~%  (%fail-pairs '(10672 10694 10695 10718~
                      ~%                 11654 12100 12240 12300 12483 12572~
                      ~%                 12649 13050 13332 13527~
                      ~%                 14364 14600~
                      ~%                 15683 15691 16685 16713 17072 17106~
                      ~%                 18892 19050~
-                     ~%                 22454 22526~
-                     ~%                 24836 24948 25039 25151 25184 25204~
-                     ~%                 26113 26260))~
-                     ~%  ;; 27162-27692 CLOS unstamped — rest-pack fix may unlock these.~
+                     ~%                 24836 24948 25039 25151))~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

@@ -3139,6 +3139,16 @@
   ;; activate/deactivate this fallback per file.
   (setf (mem-ref #x100001C0 :u64) 0)
 
+  ;; Initialize GC metadata before any allocation that might hit the
+  ;; alloc limit.  Heap is 112 MB split into two 56-MB semispaces:
+  ;;   from-start = 0x09000000, to-start = 0x0C800000.
+  ;; The boot loader (boot-aarch64.lisp) puts x25 = 0x0C800000 (= the
+  ;; semispace mid-point) so the first overflow trips the GC trampoline
+  ;; rather than running off the end of the from-space.  stack-base is
+  ;; the SP value at boot (= 0x00200000); the GC scans roots from the
+  ;; current SP up to stack-base.
+  (%gc-init #x09000000 #x07000000 #x00200000)
+
   ;; Re-entry bitmap at 0x10001000.  18000 bytes covers all 17692 tests.
   ;; Zero so no test starts in tested state.
   (let ((i 0))

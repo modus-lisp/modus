@@ -85,6 +85,21 @@
   "Label-id (integer) for the per-fork handler-stack pop helper.  See
    *aarch64-handler-push-label*.")
 
+(defvar *aarch64-gc-trampoline-label* nil
+  "Label-id (integer) for the GC trampoline.  Bound by
+   assemble-kernel-image around the unified-buffer translate call so
+   that +op-gc-check+ can BL into one shared trampoline instead of
+   trapping with BRK #1 (which has no recovery path on AArch64
+   bare metal).  Nil outside that dynamic extent — the gc-check
+   translator falls back to legacy BRK behaviour when unbound.")
+
+(defvar *aarch64-gc-collect-bytecode-offset* nil
+  "Bytecode-offset of %gc-collect in the kernel image, computed in
+   cross.lisp by scanning the function table.  Used by the GC
+   trampoline emit (in emit-aarch64-handler-helpers) to plant a
+   fn-addr-patched MOVZ+MOVK+BLR sequence that calls the compiled
+   collector at runtime.")
+
 (defvar *aarch64-fn-addr-patches* nil
   "List of (native-byte-offset . target-bytecode-offset) recorded by
    +op-fn-addr+ translation.  Each entry says: at NATIVE-BYTE-OFFSET in
@@ -108,11 +123,18 @@
 (defconstant +a64-x1+   1)
 (defconstant +a64-x2+   2)
 (defconstant +a64-x3+   3)
+(defconstant +a64-x4+   4)   ; AAPCS caller-saved
+(defconstant +a64-x5+   5)   ; AAPCS caller-saved
+(defconstant +a64-x6+   6)   ; AAPCS caller-saved
+(defconstant +a64-x7+   7)   ; AAPCS caller-saved
+(defconstant +a64-x8+   8)   ; AAPCS indirect-result reg
 (defconstant +a64-x9+   9)   ; AAPCS caller-saved temp
 (defconstant +a64-x10+ 10)   ; AAPCS caller-saved temp
 (defconstant +a64-x11+ 11)   ; AAPCS caller-saved temp
 (defconstant +a64-x12+ 12)   ; AAPCS caller-saved temp
 (defconstant +a64-x13+ 13)   ; AAPCS caller-saved temp
+(defconstant +a64-x14+ 14)   ; AAPCS caller-saved temp
+(defconstant +a64-x15+ 15)   ; AAPCS caller-saved temp
 (defconstant +a64-x16+ 16)   ; IP0 scratch
 (defconstant +a64-x17+ 17)   ; IP1 scratch
 (defconstant +a64-x18+ 18)   ; platform reg (free on bare-metal — used by handler-case copy traps)
@@ -2284,9 +2306,26 @@
           ;; ---- GC-CHECK ----
           ;; CMP VA, VL; B.LT ok; BRK #1 (GC trap); ok:
           ((= op +op-gc-check+)
+           ;; CMP alloc-ptr (x24) against limit (x25).  When x24 < x25
+           ;; (still room) skip the slow path; otherwise call the GC
+           ;; trampoline if it's wired up.  Legacy BRK #1 retained as
+           ;; a fallback for builds where no trampoline is registered.
            (a64-cmp-reg buf +a64-x24+ +a64-x25+)
-           (a64-bcond buf +cc-lt+ 2)  ; skip BRK if VA < VL
-           (a64-brk buf 1))           ; GC needed trap
+           (cond
+             (*aarch64-gc-trampoline-label*
+              ;; B.LT skip; BL gc-trampoline; skip:
+              (let ((skip-label (incf *mvm-label-counter*)))
+                (let ((idx (a64-current-index buf)))
+                  (a64-bcond buf +cc-lt+ 0)
+                  (a64-add-fixup buf idx skip-label :bcond))
+                (let ((idx (a64-current-index buf)))
+                  (a64-bl buf 0)
+                  (a64-add-fixup buf idx *aarch64-gc-trampoline-label* :bl))
+                (a64-set-label buf skip-label)))
+             (t
+              ;; Legacy: BRK #1 — wedges on AArch64 (no GC handler).
+              (a64-bcond buf +cc-lt+ 2)
+              (a64-brk buf 1))))
 
           ;; ---- WRITE-BARRIER Vobj ----
           ;; Mark the card table entry dirty (simplified: just a DMB for now)
@@ -2724,7 +2763,135 @@
       (a64-str-unsigned buf +a64-x13+ +a64-x12+ 8)
       (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 16)
       (a64-str-unsigned buf +a64-x13+ +a64-x12+ 16)
-      (a64-ret buf))))
+      (a64-ret buf)))
+  ;; ---- GC trampoline ----
+  ;; Called by +op-gc-check+ when x24 (alloc ptr) >= x25 (alloc limit).
+  ;; Saves caller-saved regs, stashes x24/x25/pre-entry-SP into GC
+  ;; metadata slots, invokes %gc-collect, reloads x24/x25 from the
+  ;; (updated) metadata, restores caller regs, RETs.
+  ;;
+  ;; Frame layout (240 bytes, 16-byte aligned).  Saves ALL non-SP
+  ;; integer regs except x24/x25 (which are the GC's input, not preserved)
+  ;; and x28 (unused by Modus codegen) so any caller-saved or
+  ;; Modus-global register that %gc-collect's compiled body touches
+  ;; round-trips intact through the trampoline:
+  ;;   [sp+  0..  7] x0   [sp+  8.. 15] x1   (STP pair)
+  ;;   [sp+ 16.. 23] x2   [sp+ 24.. 31] x3
+  ;;   [sp+ 32.. 39] x4   [sp+ 40.. 47] x5
+  ;;   [sp+ 48.. 55] x6   [sp+ 56.. 63] x7
+  ;;   [sp+ 64.. 71] x8   [sp+ 72.. 79] x9
+  ;;   [sp+ 80.. 87] x10  [sp+ 88.. 95] x11
+  ;;   [sp+ 96..103] x12  [sp+104..111] x13
+  ;;   [sp+112..119] x14  [sp+120..127] x15
+  ;;   [sp+128..135] x16  [sp+136..143] x17
+  ;;   [sp+144..151] x18  [sp+152..159] x19
+  ;;   [sp+160..167] x20  [sp+168..175] x21
+  ;;   [sp+176..183] x22  [sp+184..191] x23
+  ;;   [sp+192..199] x26  [sp+200..207] x27
+  ;;   [sp+208..215] x29 (FP) [sp+216..223] x30 (LR)
+  ;;   [sp+224..239] padding (2 slots)
+  (when (and *aarch64-gc-trampoline-label*
+             *aarch64-gc-collect-bytecode-offset*)
+    (a64-set-label buf *aarch64-gc-trampoline-label*)
+    ;; Save x0..x17 as nine STP pairs (also allocates 240-byte frame
+    ;; via the first pair's pre-index).
+    (a64-stp-pre    buf +a64-x0+  +a64-x1+  +a64-sp+ -240)
+    (a64-stp-offset buf +a64-x2+  +a64-x3+  +a64-sp+ 16)
+    (a64-stp-offset buf +a64-x4+  +a64-x5+  +a64-sp+ 32)
+    (a64-stp-offset buf +a64-x6+  +a64-x7+  +a64-sp+ 48)
+    (a64-stp-offset buf +a64-x8+  +a64-x9+  +a64-sp+ 64)
+    (a64-stp-offset buf +a64-x10+ +a64-x11+ +a64-sp+ 80)
+    (a64-stp-offset buf +a64-x12+ +a64-x13+ +a64-sp+ 96)
+    (a64-stp-offset buf +a64-x14+ +a64-x15+ +a64-sp+ 112)
+    (a64-stp-offset buf +a64-x16+ +a64-x17+ +a64-sp+ 128)
+    ;; Save x18 (platform reg used for some traps), x19..x23 (AAPCS
+    ;; callee-saved — Modus's vreg spill slots), x26 (NIL), x27 (CENV),
+    ;; x29 (FP), x30 (LR).  x28 is not defined as a constant and is
+    ;; unused by Modus codegen, so we skip it.
+    (a64-str-unsigned buf +a64-x18+ +a64-sp+ 144)
+    (a64-str-unsigned buf +a64-x19+ +a64-sp+ 152)
+    (a64-str-unsigned buf +a64-x20+ +a64-sp+ 160)
+    (a64-str-unsigned buf +a64-x21+ +a64-sp+ 168)
+    (a64-str-unsigned buf +a64-x22+ +a64-sp+ 176)
+    (a64-str-unsigned buf +a64-x23+ +a64-sp+ 184)
+    (a64-str-unsigned buf +a64-x26+ +a64-sp+ 192)
+    (a64-str-unsigned buf +a64-x27+ +a64-sp+ 200)
+    (a64-str-unsigned buf +a64-x29+ +a64-sp+ 208)
+    (a64-str-unsigned buf +a64-x30+ +a64-sp+ 216)
+    ;; Stash x24 (alloc ptr) → 0x10000070.  %gc-collect reads this
+    ;; via (mem-ref ADDR :u64) and treats the result as a Lisp
+    ;; integer.  Modus tags fixnums by SHL 1, so the stored 64-bit
+    ;; word must already be SHL'd: we LSL x24 by 1 before storing,
+    ;; and on the way back out (after %gc-collect) we ASR by 1.
+    (a64-load-imm64 buf +a64-x16+ #x10000070)
+    (a64-lsl-imm buf +a64-x17+ +a64-x24+ 1)       ; x17 = x24 << 1 (Lisp-tagged)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
+    ;; Stash x25 (alloc limit) → 0x10000078 (same SHL convention).
+    (a64-load-imm64 buf +a64-x16+ #x10000078)
+    (a64-lsl-imm buf +a64-x17+ +a64-x25+ 1)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
+    ;; Stash PRE-PUSH SP (= current SP + 240) → 0x10000068.  The 240
+    ;; bytes of register spills above pre-entry SP are not roots; the
+    ;; collector should scan from the caller's SP upward.  Stored in
+    ;; SHL'd form for the same reason as the alloc ptr/limit.
+    (a64-load-imm64 buf +a64-x16+ #x10000068)
+    (a64-add-imm buf +a64-x17+ +a64-sp+ 240)
+    (a64-lsl-imm buf +a64-x17+ +a64-x17+ 1)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
+    ;; Set NARGS = 0 for the %gc-collect call (the ABI puts nargs at
+    ;; raw u32 slot 0x10000150; only matters if the callee has an
+    ;; arity check, but emit it for parity with the standard call
+    ;; sequence).
+    (a64-load-imm64 buf +a64-x17+ #x10000150)
+    (a64-movz buf +a64-x16+ 0 0)
+    ;; STUR w16, [x17] — 32-bit store; reuse a64-emit raw.
+    (a64-emit buf (logior #xB8000010                ; STUR Wt, [Xn, #imm9]
+                          (ash 0 12)                ; imm9 = 0
+                          (ash 17 5)                ; Rn = x17
+                          16))                      ; Rt = w16
+    ;; Call %gc-collect via fn-addr-patched MOVZ+MOVK+BLR.  The
+    ;; cross-link patcher will fill in the imm16 fields once
+    ;; %gc-collect's native-offset is known.
+    (let ((movz-byte-pos
+           (* (- (a64-current-index buf)
+                 (or *aarch64-translated-start-idx* 0))
+              4)))
+      (push (cons movz-byte-pos *aarch64-gc-collect-bytecode-offset*)
+            *aarch64-fn-addr-patches*))
+    (a64-movz buf +a64-x16+ 0 0)              ; placeholder for low 16
+    (a64-movk buf +a64-x16+ 0 1)              ; placeholder for high 16
+    (a64-blr buf +a64-x16+)
+    ;; Reload x24, x25 from (now-updated) metadata.  %gc-collect
+    ;; wrote these via (setf (mem-ref ADDR :u64) FREE-PTR) — and
+    ;; since Lisp fixnums are stored SHL'd in registers, :u64 emits
+    ;; the SHL'd 64-bit pattern.  ASR by 1 to recover the raw address.
+    (a64-load-imm64 buf +a64-x16+ #x10000070)
+    (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
+    (a64-load-imm64 buf +a64-x16+ #x10000078)
+    (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x25+ +a64-x25+ 1)
+    ;; Restore caller-saved regs and frame.
+    (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
+    (a64-ldr-unsigned buf +a64-x29+ +a64-sp+ 208)
+    (a64-ldr-unsigned buf +a64-x27+ +a64-sp+ 200)
+    (a64-ldr-unsigned buf +a64-x26+ +a64-sp+ 192)
+    (a64-ldr-unsigned buf +a64-x23+ +a64-sp+ 184)
+    (a64-ldr-unsigned buf +a64-x22+ +a64-sp+ 176)
+    (a64-ldr-unsigned buf +a64-x21+ +a64-sp+ 168)
+    (a64-ldr-unsigned buf +a64-x20+ +a64-sp+ 160)
+    (a64-ldr-unsigned buf +a64-x19+ +a64-sp+ 152)
+    (a64-ldr-unsigned buf +a64-x18+ +a64-sp+ 144)
+    (a64-ldp-offset buf +a64-x16+ +a64-x17+ +a64-sp+ 128)
+    (a64-ldp-offset buf +a64-x14+ +a64-x15+ +a64-sp+ 112)
+    (a64-ldp-offset buf +a64-x12+ +a64-x13+ +a64-sp+ 96)
+    (a64-ldp-offset buf +a64-x10+ +a64-x11+ +a64-sp+ 80)
+    (a64-ldp-offset buf +a64-x8+  +a64-x9+  +a64-sp+ 64)
+    (a64-ldp-offset buf +a64-x6+  +a64-x7+  +a64-sp+ 48)
+    (a64-ldp-offset buf +a64-x4+  +a64-x5+  +a64-sp+ 32)
+    (a64-ldp-offset buf +a64-x2+  +a64-x3+  +a64-sp+ 16)
+    (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 240)
+    (a64-ret buf)))
 
 ;;; ============================================================
 ;;; Main Translation Entry Point

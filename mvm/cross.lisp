@@ -619,6 +619,20 @@
           (when aarch64-unified-p (incf modus.mvm::*mvm-label-counter*)))
          (aarch64-pop-label
           (when aarch64-unified-p (incf modus.mvm::*mvm-label-counter*)))
+         (aarch64-gc-label
+          (when aarch64-unified-p (incf modus.mvm::*mvm-label-counter*)))
+         ;; Look up %gc-collect's bytecode-offset from the module's
+         ;; function table.  Returns NIL if not present (then the GC
+         ;; trampoline emit is skipped and +op-gc-check+ falls back
+         ;; to legacy BRK #1 — i.e., no behaviour change from earlier
+         ;; builds that didn't include gc.lisp).
+         (gc-collect-bc-offset
+          (when aarch64-unified-p
+            (let ((found nil))
+              (dolist (fi (mvm-module-function-table module))
+                (when (string-equal (mvm-function-info-name fi) "%GC-COLLECT")
+                  (setf found (mvm-function-info-bytecode-offset fi))))
+              found)))
          (native-code
           (cond
             (aarch64-unified-p
@@ -627,7 +641,10 @@
              ;; emit BL fixups against the pop label too, so the
              ;; dynamic binding now wraps entry-fn AND translate-mvm.
              (let ((modus.mvm::*aarch64-handler-push-label* aarch64-push-label)
-                   (modus.mvm::*aarch64-handler-pop-label*  aarch64-pop-label))
+                   (modus.mvm::*aarch64-handler-pop-label*  aarch64-pop-label)
+                   (modus.mvm::*aarch64-gc-trampoline-label* aarch64-gc-label)
+                   (modus.mvm::*aarch64-gc-collect-bytecode-offset*
+                    gc-collect-bc-offset))
                ;; Phase A: emit boot preamble into the unified buffer first.
                (let ((entry-fn (getf boot-descriptor :entry-fn)))
                  (when entry-fn (funcall entry-fn aarch64-unified-buf)))

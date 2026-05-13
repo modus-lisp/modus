@@ -548,8 +548,18 @@
 
 ;; VA addresses for fixpoint runtime (same as x64)
 (defconstant +tdk-stack-va+      #x00200000)  ; Stack top
-(defconstant +tdk-cons-base-va+  #x09000000)  ; Cons alloc (above image buffer at 0x08000000)
-(defconstant +tdk-cons-limit-va+ #x10000000)  ; Cons limit (112MB heap, below E1000 BAR at 0x10000000)
+;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
+;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
+;; boot loader sets x24=base and x25=mid-point (end of the initial
+;; from-space).  When x24 hits x25 the +op-gc-check+ pattern BL's the
+;; GC trampoline (translate-aarch64.lisp::emit-aarch64-handler-helpers),
+;; which calls %gc-collect (gc.lisp).  After collection the trampoline
+;; reloads x24/x25 from updated metadata slots.  See mvm/gc.lisp for
+;; the algorithm and 0x10000040–0x10000078 metadata layout.
+(defconstant +tdk-cons-base-va+   #x09000000)  ; Cons alloc base
+(defconstant +tdk-cons-half-va+   #x0C800000)  ; Mid-point of 112-MB heap
+(defconstant +tdk-cons-end-va+    #x10000000)  ; End of 112-MB heap
+(defconstant +tdk-cons-limit-va+  #x0C800000)  ; Initial alloc limit (= half)
 (defconstant +tdk-uart-va+       #x20000000)  ; UART via page tables
 (defconstant +tdk-percpu-va+     #x10080000)  ; Per-CPU data (DRAM scratch — 0x00360000 was inside the kernel image for builds >5MB)
 

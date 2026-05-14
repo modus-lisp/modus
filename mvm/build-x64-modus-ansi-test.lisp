@@ -2971,14 +2971,14 @@
   ;; ticks at 1000Hz PIT) longjmps via slot 0x10000180 — wired in
   ;; boot/boot-x64.lisp's deadline-aware PIT ISR at 0x4F0900.
   ;;
-  ;; Known wedge cluster at 10675+: tests with CATCH-TYPE-ERROR
-  ;; around MEMBER-IF-NOT on non-list values.  MEMBER-IF-NOT errors
-  ;; via `(unless (listp list) (error ...))` and longjmps via TRAP
-  ;; #x0511; run-test's handler-clause catches it.  But somehow,
-  ;; cons calls in the handler-clause body return ALIASED pointers
-  ;; (R12 doesn't advance between sequential cons), so print-dec
-  ;; spams the same digit forever.  Mystery: see translate-x64.lisp
-  ;; SETJMP/LONGJMP RBX-save/restore commit; that didn't fix this.
+  ;; Current frontier: T:12266 P=1647 (60s wall) — wedge in test
+  ;; 12267/12268's FLET with &REST X / &KEY FOO BAR.  Known Modus
+  ;; &rest-funcall compiler bug class (per CLAUDE.md): an
+  ;; indirect call computes a corrupted function pointer that
+  ;; lands inside the page-table area (0x500000-0x504000), CPU
+  ;; tries to execute PML4/PDPT bytes as code with RSP=0, infinite
+  ;; recovery loop.  Fix needs deeper compiler work in FLET/&REST
+  ;; nargs handling.
   (setq *skip-below* 0)
   ;; (run-all-tests)
 

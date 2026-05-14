@@ -1520,10 +1520,16 @@
 ;; sign of d, so rem == mod in this regime) to stay fast.
 (defun random (n &rest state)
   (declare (ignore state))
-  (let* ((seed (mem-ref #x100000A0 :u64))
-         (next (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF)))
-    (setf (mem-ref #x100000A0 :u64) next)
-    (- next (* (truncate next n) n))))
+  ;; (random 0) is undefined in CL but happens when callers pass an
+  ;; overflowed bound like (ASH 1 64) → 0.  Returning 0 keeps the
+  ;; caller alive instead of #DE-trapping into a kernel-killing
+  ;; nested-exception loop (we don't install an IDT entry for #DE).
+  (if (= n 0)
+      0
+      (let* ((seed (mem-ref #x100000A0 :u64))
+             (next (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF)))
+        (setf (mem-ref #x100000A0 :u64) next)
+        (- next (* (truncate next n) n)))))
 (defun do-special-strings (fn) (funcall fn ""))
 (defun typep* (obj type) (typep obj type))
 

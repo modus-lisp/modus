@@ -507,14 +507,38 @@
     ;;   EB FD                    jmp halt
     (let* ((sigsegv-isr-addr #x4F0820)
            (sg-bytes
+            ;; 150-byte handler with INLINE per-fork handler-stack pop:
+            ;; before iretq, walks the depth counter at 0x10000400 and
+            ;; copies frame[depth-1] back into slot 0x10000180/188/190
+            ;; (or zero-fills if depth==0).  Subsequent faults during
+            ;; the recovered handler-clause body then see the OUTER
+            ;; handler-case instead of "no handler", which previously
+            ;; caused a clean halt after 2-3 nested faults.
             #(#x48 #x83 #xC4 #x08
               #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
               #x48 #x8B #x01
               #x48 #x85 #xC0
-              #x74 #x21
+              #x74 #x7D
               #x48 #x8B #x69 #x08
               #x48 #x8B #x51 #x10
-              #x48 #xC7 #x01 #x00 #x00 #x00 #x00
+              #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10
+              #x4D #x85 #xD2
+              #x74 #x3B
+              #x49 #xFF #xCA
+              #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10
+              #x4D #x6B #xDA #x18
+              #x49 #x81 #xC3 #x08 #x04 #x00 #x10
+              #x4D #x8B #x13
+              #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10
+              #x4D #x8B #x53 #x08
+              #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
+              #x4D #x8B #x53 #x10
+              #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
+              #xEB #x1B
+              #x4D #x31 #xD2
+              #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10
+              #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
+              #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
               #x48 #x89 #xC4
               #x68 #x02 #x02 #x00 #x00
               #x6A #x10
@@ -527,12 +551,20 @@
       (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
       (mvm-emit-u32 buf sigsegv-isr-addr) (mvm-emit-u32 buf 0)
       ;; For each byte i in sg-bytes: mov byte [rdi+i], imm8.
-      ;; Encoding: C6 47 imm8(offset) imm8(value) — only valid for offset<128.
+      ;; i<128: disp8 (C6 47 disp8 imm8).
+      ;; i>=128: disp32 (C6 87 disp32 imm8) — signed disp8 would wrap negative.
       (dotimes (i (length sg-bytes))
-        (mvm-emit-byte buf #xC6)
-        (mvm-emit-byte buf #x47)
-        (mvm-emit-byte buf i)
-        (mvm-emit-byte buf (aref sg-bytes i)))
+        (cond
+          ((< i 128)
+           (mvm-emit-byte buf #xC6)
+           (mvm-emit-byte buf #x47)
+           (mvm-emit-byte buf i)
+           (mvm-emit-byte buf (aref sg-bytes i)))
+          (t
+           (mvm-emit-byte buf #xC6)
+           (mvm-emit-byte buf #x87)
+           (mvm-emit-u32  buf i)
+           (mvm-emit-byte buf (aref sg-bytes i)))))
 
       ;; Write IDT entries 13 (#GP) and 14 (#PF) pointing at our handler.
       ;; Same encoding pattern as vector 0x20 above.

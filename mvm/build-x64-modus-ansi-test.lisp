@@ -2958,7 +2958,12 @@
   ;; PHASE-A.1: skip custom tests (run-all-tests hangs at 9811 reading
   ;; a stream).  Set *skip-below* so the ANSI runner skips tests below
   ;; *skip-below* — useful for bisecting the next hang point.
-  (setq *skip-below* 0)  ;; bisect knob
+  ;;
+  ;; 10180 matches the AArch64 ANSI build's setting (mvm/build-aarch64-
+  ;; ansi-test.lisp).  Pre-assoc + assoc.lsp tests below 10180 wedge
+  ;; on x64 the same way they did on AArch64 (adjoin/member on dotted
+  ;; lists → cdr-walk-past-tail → #PF without IDT recovery).
+  (setq *skip-below* 10180)
   ;; (run-all-tests)
 
   ;; Print expected ANSI test total so the summary can compute lost tests.

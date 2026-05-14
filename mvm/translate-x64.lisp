@@ -622,16 +622,24 @@
               (emit-bytes buf #x48 #x89 #x21)
               ;; mov [rcx+8], rbp
               (emit-bytes buf #x48 #x89 #x69 #x08)
+              ;; mov [rcx+24], rbx  — save callee-saved RBX (V4) at slot 0x198.
+              ;; The compiler caches values (e.g. let-bound cons-list cursors)
+              ;; in V4 across function calls, relying on callees to preserve
+              ;; it.  But a longjmp INTERRUPTS a mid-flight callee whose
+              ;; epilogue may not have completed the RBX restore — RBX then
+              ;; holds the callee's local value, not the setjmp-time value
+              ;; the compiler tracks.  Saving RBX here and restoring in all
+              ;; three longjmp paths (TRAP #x0511, #PF handler at 0x4F0820,
+              ;; deadline-IRQ ISR at 0x4F0900) keeps RBX consistent.
+              (emit-bytes buf #x48 #x89 #x59 #x18)
               ;; Save the address of the FIRST instruction after this trap block
-              ;; into [rcx+16]. After lea (7 bytes), we still have:
+              ;; into [rcx+16].  After lea (7 bytes), we still have:
               ;;   mov [rcx+16], rax     (4 bytes)
               ;;   movabs rax, NIL       (10 bytes)
+              ;; plus the new mov [rcx+24], rbx (4 bytes; emitted ABOVE so
+              ;; not in the post-lea distance).
               ;; = 14 bytes between end-of-LEA and end-of-trap-block.
               ;; lea rax, [rip+14] lands rax at the byte AFTER the trap.
-              ;; (Historical bug: this was rip+2, intended for a since-removed
-              ;; 2-byte JMP. Saved IP landed mid-instruction; longjmp would
-              ;; jump to garbage. Latent until the SIGSEGV signal handler
-              ;; started exercising the longjmp path frequently.)
               (emit-bytes buf #x48 #x8D #x05 #x0E #x00 #x00 #x00)  ; lea rax, [rip+14]
               ;; mov [rcx+16], rax  — save return IP
               (emit-bytes buf #x48 #x89 #x41 #x10)
@@ -667,6 +675,11 @@
               ;; mov [0x10000C20], rdx
               (emit-bytes buf #x48 #x89 #x14 #x25)
               (emit-u32 buf #x10000C20)
+              ;; rdx = [rcx+24]   ; our saved RBX
+              (emit-bytes buf #x48 #x8B #x51 #x18)
+              ;; mov [0x10000C28], rdx
+              (emit-bytes buf #x48 #x89 #x14 #x25)
+              (emit-u32 buf #x10000C28)
               ;; Pop the handler stack back into [180]/+8/+16
               (emit-call buf (translate-state-handler-pop-label state))
               ;; Restore from scratch and jump
@@ -676,6 +689,9 @@
               ;; mov rbp, [0x10000C18]   ; RBP
               (emit-bytes buf #x48 #x8B #x2C #x25)
               (emit-u32 buf #x10000C18)
+              ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
+              (emit-bytes buf #x48 #x8B #x1C #x25)
+              (emit-u32 buf #x10000C28)
               ;; mov rsp, [0x10000C10]   ; RSP
               (emit-bytes buf #x48 #x8B #x24 #x25)
               (emit-u32 buf #x10000C10)

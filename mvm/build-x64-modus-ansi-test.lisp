@@ -2972,13 +2972,13 @@
   ;; boot/boot-x64.lisp's deadline-aware PIT ISR at 0x4F0900.
   ;;
   ;; Known wedge cluster at 10675+: tests with CATCH-TYPE-ERROR
-  ;; around MEMBER-IF-NOT on non-list values.  When MEMBER-IF-NOT
-  ;; does not error on a non-list (Modus bug), the bogus return
-  ;; gets printed by FORMAT with the S directive on a circular
-  ;; structure and spams the UART.  The deadline-IRQ catches each
-  ;; spam; after wiring the inline handler-stack pop into the IRQ
-  ;; longjmp path (boot-x64.lisp 0x4F0900), the next test should
-  ;; advance instead of re-entering a stale handler-case frame.
+  ;; around MEMBER-IF-NOT on non-list values.  MEMBER-IF-NOT errors
+  ;; via `(unless (listp list) (error ...))` and longjmps via TRAP
+  ;; #x0511; run-test's handler-clause catches it.  But somehow,
+  ;; cons calls in the handler-clause body return ALIASED pointers
+  ;; (R12 doesn't advance between sequential cons), so print-dec
+  ;; spams the same digit forever.  Mystery: see translate-x64.lisp
+  ;; SETJMP/LONGJMP RBX-save/restore commit; that didn't fix this.
   (setq *skip-below* 0)
   ;; (run-all-tests)
 

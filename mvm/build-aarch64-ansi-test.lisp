@@ -2834,8 +2834,11 @@
                      ~%  ;; the wedges are now well-documented (see~
                      ~%  ;; reference_aarch64_gc_scan_fix.md, task #52) and can be~
                      ~%  ;; picked off one-by-one without leaving the suite broken.~
+                     ~%  ;; PROBE 2026-05-14: remove just the 12240-12300 stamp~
+                     ~%  ;; to see if the code-bounds-init fix (e6b4a65) lets~
+                     ~%  ;; the function/functionp.lsp tests pass cleanly.~
                      ~%  (%fail-pairs '(10672 10694 10695 10718~
-                     ~%                 11654 12100 12240 12300 12483 12572~
+                     ~%                 11654 12100 12483 12572~
                      ~%                 12649 13050 13332 13527~
                      ~%                 14364 14600~
                      ~%                 15683 15691 16685 16713 17072 17106~

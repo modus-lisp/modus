@@ -332,18 +332,65 @@
     ;; BSS segment and the mmap'd heap lives elsewhere; on bare-metal the
     ;; same address space is shared, so we start the alloc pointer past
     ;; the metadata reservation.  Anything below 0x10001000 is metadata.
+    ;;
+    ;; Heap split into two Cheney semispaces of ~112MB each:
+    ;;   from-space: [0x10001000, 0x17000000)
+    ;;   to-space:   [0x17000000, 0x1DFFF000)
+    ;;   space_size: 0x06FFF000
+    ;; R14 = from_start + space_size = 0x16FFF000, so the FIRST overflow
+    ;; trips the GC trampoline at the correct from-space boundary.
+    ;; Without this, the trampoline reads zero metadata and ALL HELL
+    ;; BREAKS LOOSE (see comment block below for GC metadata init).
     ;; mov r12, 0x10001000
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBC)          ; mov r12, imm64
     (mvm-emit-u32 buf #x10001000)
     (mvm-emit-u32 buf 0)
 
-    ;; R14 = allocation limit (heap ends at 480MB)
-    ;; mov r14, 0x1E000000
+    ;; R14 = from-space end (alloc limit).
+    ;; mov r14, 0x17000000
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBE)          ; mov r14, imm64
-    (mvm-emit-u32 buf #x1E000000)
+    (mvm-emit-u32 buf #x17000000)
     (mvm-emit-u32 buf 0)
+
+    ;; Initialize GC metadata at 0x10000040..0x10000058.  The x64 GC
+    ;; trampoline (translate-x64.lisp emit-gc-trampoline) reads these
+    ;; slots as RAW byte addresses — NOT as tagged Lisp values.  So
+    ;; we must store RAW addresses via asm, NOT via Lisp's
+    ;; (setf (mem-ref ADDR :u64) val) which auto-stores the
+    ;; fixnum-tagged form (2*val).  Without this initialization, any
+    ;; GC trigger reads zero metadata, swaps both semispaces to
+    ;; address 0, and sets R14 := 0 — after which every cons triggers
+    ;; another zero-metadata GC, allocating cons cells at address 0
+    ;; (overwriting BIOS/IDT/page tables/etc.).  Worth ~1000 extra
+    ;; ANSI passes on bare-metal x64 by neutralising the
+    ;; (make-array '(N)) compile-time bug's runaway allocations.
+    ;;
+    ;; Slot 0x10000040 = from_start = 0x10001000
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000040) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+    (mvm-emit-u32 buf #x10001000) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+    ;; Slot 0x10000048 = to_start = 0x17000000
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000048) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+    (mvm-emit-u32 buf #x17000000) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+    ;; Slot 0x10000050 = space_size = 0x06FFF000
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000050) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+    (mvm-emit-u32 buf #x06FFF000) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+    ;; Slot 0x10000058 = stack_base = 0x00800000 (top of stack)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000058) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+    (mvm-emit-u32 buf #x00800000) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
 
     ;; RBP = frame pointer (same as RSP initially)
     ;; mov rbp, rsp

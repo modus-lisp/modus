@@ -2849,7 +2849,7 @@
                      ~%  ;; Probe 2026-05-14: with supplied-p + NIL-funcall +~
                      ~%  ;; code-bounds-init fixed, sweep more ranges off.  The~
                      ~%  ;; suite holds through <DN> as long as the wedge-cause~
-                     ~%  ;; for each removed range is in the "now-fixed" set.~
+                     ~%  ;; for each removed range is in the now-fixed set.~
                      ~%  ;; Probe 2026-05-14 NUCLEAR: drop every remaining~
                      ~%  ;; pre-stamp.  Goal is fewest stamps that still reach <DN>.~
                      ~%  (%fail-pairs '())~
@@ -3313,7 +3313,14 @@
   ;; *skip-below* — useful for bisecting the next hang point.
   ;; Boulder #8: test 10011 (signals-error→eval) infinite-loops.
   ;; Skip past it to find the next hanger and quantify total passable.
-  (setq *skip-below* 10180)  ;; skip past pre-assoc + the assoc.lsp wedge
+  ;; *skip-below* = 10180 papers over wedges in tests 10001-10179.
+  ;; Probe with *skip-below*=0: suite wedges at T:12313 (in `if` file)
+  ;; after running 2313 tests with ~51% pass rate.  So it's another
+  ;; wedge band-aid in the same family as %fail-pairs (which we
+  ;; retired in 02f3def).  Real fix: root-cause the 10001-10179
+  ;; wedges + the 12300-12313 wedge that surfaces with skip=0.
+  ;; For now keep skip=10180 so the suite reaches <DN>.
+  (setq *skip-below* 10180)  ;; TODO: drive this to 0 — see task #61.
   (setq *run-only-below* 0)
   ;; Stamp known wedge ranges as FAIL up front, so each wedge test
   ;; counts in the per-test totals — the harness goal is per-test

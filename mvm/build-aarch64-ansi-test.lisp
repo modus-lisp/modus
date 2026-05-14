@@ -2846,8 +2846,11 @@
                      ~%  ;; downstream.  Same fragility class as the labels+&KEY~
                      ~%  ;; wedge in round 2.  Try again after a future fix~
                      ~%  ;; that raises the fragility ceiling.~
+                     ~%  ;; Probe 2026-05-14: with supplied-p fixed, re-try~
+                     ~%  ;; unstamping 11654-12100 (union-1) to see if the layout~
+                     ~%  ;; shift now stays harmless past the labels file.~
                      ~%  (%fail-pairs '(10672 10694 10695 10718~
-                     ~%                 11654 12100 12483 12572~
+                     ~%                 12483 12572~
                      ~%                 12649 13050 13332 13527~
                      ~%                 14364 14600~
                      ~%                 15683 15691 16685 16713 17072 17106~

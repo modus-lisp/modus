@@ -2840,6 +2840,12 @@
                      ~%  ;; Round 2 also tried removing 10672/10695/11654-12100~
                      ~%  ;; but that layout shift wedged test 12326 (LABELS+&KEY)~
                      ~%  ;; — different fragility class; reverted.~
+                     ~%  ;; Round-3 probe 2026-05-14 (dropping 16685-16713,~
+                     ~%  ;; copy-seq) reverted — the layout shift wedged~
+                     ~%  ;; test 21861 (LOOP WITH (NIL A) = '(1 2)) far~
+                     ~%  ;; downstream.  Same fragility class as the labels+&KEY~
+                     ~%  ;; wedge in round 2.  Try again after a future fix~
+                     ~%  ;; that raises the fragility ceiling.~
                      ~%  (%fail-pairs '(10672 10694 10695 10718~
                      ~%                 11654 12100 12483 12572~
                      ~%                 12649 13050 13332 13527~

@@ -2710,7 +2710,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 100)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 10)~
                      ~%      (rt-run-test id (funcall thunk) expected)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0))~
                      ~%    (t (c)~
@@ -2721,7 +2721,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 100)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 10)~
                      ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0))~
                      ~%    (t (c)~
@@ -2967,12 +2967,22 @@
   ;; (cl-clos.lisp's %specializer-matches-p reads/decrements this).
   (setf (mem-ref #x10000C60 :u64) 5)
 
-  ;; *skip-below* = 0: run everything, including the pre-assoc and assoc.lsp
-  ;; tests that wedge on cdr-walk-past-tail.  The IDT #PF/#GP handler at
-  ;; 0x4F0820 (158d7ae, 5cdad46) catches the fault and longjmps into the
-  ;; nearest handler-case, so cdr-walk crashes should be recoverable as
-  ;; clean FAILs.  Tests that go into an INFINITE LOOP (rather than fault)
-  ;; will still hang — those need a separate per-test deadline mechanism.
+  ;; skip-below=0: run everything.  Per-test deadline (10ms / 10
+  ;; ticks at 1000Hz PIT) longjmps via slot 0x10000180 — wired in
+  ;; boot/boot-x64.lisp's deadline-aware PIT ISR at 0x4F0900.
+  ;;
+  ;; Known wedge cluster at 10675+: tests do
+  ;;   (CATCH-TYPE-ERROR (MEMBER-IF-NOT #'LISTP X))
+  ;; with X = fixnum/string/array.  When MEMBER-IF-NOT doesn't error
+  ;; on non-lists (Modus bug), CATCH-TYPE-ERROR returns the bogus
+  ;; result; then (FORMAT T "~S" RESULT) on a circular structure
+  ;; (because MEMBER-IF-NOT walked into garbage memory) spams the
+  ;; UART.  The deadline-IRQ catches each FORMAT spam, but on x64
+  ;; the handler-stack pop after CATCH-TYPE-ERROR returns normally
+  ;; isn't fully restoring slot 0x10000180 to the outer run-test
+  ;; handler — so the next deadline-IRQ longjmps right back into a
+  ;; stale slot and effectively re-enters the same test forever.
+  ;; Fix is a clear-handler equivalent for x64 normal-return paths.
   (setq *skip-below* 0)
   ;; (run-all-tests)
 

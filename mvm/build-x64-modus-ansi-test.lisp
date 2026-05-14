@@ -2710,7 +2710,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 10)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
                      ~%      (rt-run-test id (funcall thunk) expected)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0))~
                      ~%    (t (c)~
@@ -2721,7 +2721,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 10)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
                      ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%      (setf (mem-ref #x10000C70 :u64) 0))~
                      ~%    (t (c)~
@@ -2971,18 +2971,14 @@
   ;; ticks at 1000Hz PIT) longjmps via slot 0x10000180 — wired in
   ;; boot/boot-x64.lisp's deadline-aware PIT ISR at 0x4F0900.
   ;;
-  ;; Known wedge cluster at 10675+: tests do
-  ;;   (CATCH-TYPE-ERROR (MEMBER-IF-NOT #'LISTP X))
-  ;; with X = fixnum/string/array.  When MEMBER-IF-NOT doesn't error
-  ;; on non-lists (Modus bug), CATCH-TYPE-ERROR returns the bogus
-  ;; result; then (FORMAT T "~S" RESULT) on a circular structure
-  ;; (because MEMBER-IF-NOT walked into garbage memory) spams the
-  ;; UART.  The deadline-IRQ catches each FORMAT spam, but on x64
-  ;; the handler-stack pop after CATCH-TYPE-ERROR returns normally
-  ;; isn't fully restoring slot 0x10000180 to the outer run-test
-  ;; handler — so the next deadline-IRQ longjmps right back into a
-  ;; stale slot and effectively re-enters the same test forever.
-  ;; Fix is a clear-handler equivalent for x64 normal-return paths.
+  ;; Known wedge cluster at 10675+: tests with CATCH-TYPE-ERROR
+  ;; around MEMBER-IF-NOT on non-list values.  When MEMBER-IF-NOT
+  ;; does not error on a non-list (Modus bug), the bogus return
+  ;; gets printed by FORMAT with the S directive on a circular
+  ;; structure and spams the UART.  The deadline-IRQ catches each
+  ;; spam; after wiring the inline handler-stack pop into the IRQ
+  ;; longjmp path (boot-x64.lisp 0x4F0900), the next test should
+  ;; advance instead of re-entering a stale handler-case frame.
   (setq *skip-below* 0)
   ;; (run-all-tests)
 

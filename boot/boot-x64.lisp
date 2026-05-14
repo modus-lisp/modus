@@ -498,46 +498,82 @@
     ;; Deadline-aware PIT ISR at 0x4F0900.  Decrements counter at
     ;; 0x10000C70; on 1→0 transition, longjmp via slot 0x10000180.
     ;;
-    ;; CRITICAL: the normal-return path (pit_normal) IRETQs with IF=1
-    ;; injected into the saved RFLAGS frame.  CPU clears IF on IRQ
-    ;; entry through an interrupt gate; without this OR, the first tick
-    ;; would re-enable interrupts via IRETQ-restored-saved-IF=0 (CPU
-    ;; pushed cleared IF), and subsequent ticks never fire.  The deadline
-    ;; path uses STI+JMP directly so handles IF on its own.
+    ;; CRITICAL fix #1: pit_normal IRETQ path injects IF=1 into the
+    ;; saved IRETQ-frame RFLAGS via `or [rsp+16], 0x200`.  CPU clears
+    ;; IF on IRQ entry through an interrupt gate; without the OR, the
+    ;; first tick re-restores IF=0 and the timer never fires again.
+    ;;
+    ;; CRITICAL fix #2: the deadline-hit path INLINES the handler-stack
+    ;; pop (mirrors the 150-byte #PF handler at 0x4F0820): reads frame
+    ;; [0x10000408 + (depth-1)*24] into slot 0x10000180/188/190, or
+    ;; zeros slot 180 if depth==0.  Without this, depth grows unbounded
+    ;; across timer-longjmps — each SETJMP pushes but only CLEAR-HANDLER
+    ;; and explicit LONGJMP normally pop.  The IRQ-deadline longjmp
+    ;; otherwise leaves a stale push that fakes nested-handler-case
+    ;; state, so the next OUTER CLEAR-HANDLER restores a stale slot
+    ;; 180 and the next FORMAT-spam test infinitely re-enters the same
+    ;; failed handler.  AArch64 entry-5 calls BL pop_helper for the
+    ;; same reason (boot-aarch64.lisp lines 375-381).
     (let ((deadline-isr-addr #x4F0900)
           (deadline-bytes
-           #(#x50
-             #x51
-             #x52
-             #xB0 #x20
-             #xE6 #x20
-             #x48 #xB9 #x70 #x0C #x00 #x10 #x00 #x00 #x00 #x00
-             #x48 #x8B #x01
-             #x48 #x85 #xC0
-             #x74 #x34
-             #x48 #xFF #xC8
-             #x48 #x89 #x01
-             #x75 #x2C
-             #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
-             #x48 #x8B #x01
-             #x48 #x85 #xC0
-             #x74 #x1A
-             #x48 #x8B #x69 #x08
-             #x48 #x8B #x51 #x10
-             #x48 #xC7 #x01 #x00 #x00 #x00 #x00
-             #x48 #x89 #xC4
-             #xB8 #x09 #x10 #xAD #xDE
-             #xFB
-             #xFF #xE2
-             ;; pit_normal: pop saved regs, set IF in IRETQ-frame
-             ;; RFLAGS, then IRETQ.  Without the OR, IRQs stay
-             ;; disabled after the first tick because CPU pushed
-             ;; RFLAGS with IF=0 on interrupt-gate entry.
-             #x5A
-             #x59
-             #x58
-             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00
-             #x48 #xCF)))
+           #(;; entry + EOI
+             #x50                                       ; 0: push rax
+             #x51                                       ; 1: push rcx
+             #x52                                       ; 2: push rdx
+             #xB0 #x20                                  ; 3: mov al, 0x20
+             #xE6 #x20                                  ; 5: out 0x20, al
+             ;; load counter address
+             #x48 #xB9 #x70 #x0C #x00 #x10 #x00 #x00 #x00 #x00  ; 7: mov rcx, 0x10000C70
+             #x48 #x8B #x01                             ; 17: mov rax, [rcx]
+             #x48 #x85 #xC0                             ; 20: test rax, rax
+             ;; jz NEAR pit_normal (target byte 177; delta from PC=29 = 148 = 0x94)
+             #x0F #x84 #x94 #x00 #x00 #x00              ; 23: jz pit_normal
+             #x48 #xFF #xC8                             ; 29: dec rax
+             #x48 #x89 #x01                             ; 32: mov [rcx], rax
+             ;; jnz NEAR pit_normal (delta from PC=41 = 136 = 0x88)
+             #x0F #x85 #x88 #x00 #x00 #x00              ; 35: jnz pit_normal
+             ;; Deadline hit:
+             #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00  ; 41: mov rcx, 0x10000180
+             #x48 #x8B #x01                             ; 51: mov rax, [rcx]
+             #x48 #x85 #xC0                             ; 54: test rax, rax
+             ;; jz SHORT pit_normal (delta from PC=59 to 177 = 118 = 0x76)
+             #x74 #x76                                  ; 57: jz pit_normal
+             #x48 #x8B #x69 #x08                        ; 59: mov rbp, [rcx+8]
+             #x48 #x8B #x51 #x10                        ; 63: mov rdx, [rcx+16]
+             ;; Inline handler-stack pop:
+             #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10    ; 67: mov r10, [0x10000400]
+             #x4D #x85 #xD2                             ; 75: test r10, r10
+             ;; jz SHORT zero_fill (target byte 139; delta from PC=80 = 59 = 0x3B)
+             #x74 #x3B                                  ; 78: jz zero_fill
+             #x49 #xFF #xCA                             ; 80: dec r10
+             #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10    ; 83: mov [0x10000400], r10
+             #x4D #x6B #xDA #x18                        ; 91: imul r11, r10, 24
+             #x49 #x81 #xC3 #x08 #x04 #x00 #x10         ; 95: add r11, 0x10000408
+             #x4D #x8B #x13                             ; 102: mov r10, [r11]
+             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 105: mov [0x10000180], r10
+             #x4D #x8B #x53 #x08                        ; 113: mov r10, [r11+8]
+             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 117: mov [0x10000188], r10
+             #x4D #x8B #x53 #x10                        ; 125: mov r10, [r11+16]
+             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 129: mov [0x10000190], r10
+             ;; jmp SHORT epilogue (target byte 166; delta from PC=139 = 27 = 0x1B)
+             #xEB #x1B                                  ; 137: jmp epilogue
+             ;; zero_fill (byte 139):
+             #x4D #x31 #xD2                             ; 139: xor r10, r10
+             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 142: mov [0x10000180], r10
+             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 150: mov [0x10000188], r10
+             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 158: mov [0x10000190], r10
+             ;; epilogue (byte 166):
+             #x48 #x89 #xC4                             ; 166: mov rsp, rax
+             #xB8 #x09 #x10 #xAD #xDE                   ; 169: mov eax, 0xDEAD1009
+             #xFB                                       ; 174: sti
+             #xFF #xE2                                  ; 175: jmp rdx
+             ;; pit_normal (byte 177):
+             #x5A                                       ; 177: pop rdx
+             #x59                                       ; 178: pop rcx
+             #x58                                       ; 179: pop rax
+             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00  ; 180: or qword [rsp+16], 0x200
+             #x48 #xCF                                  ; 189: iretq
+             )))
       ;; Write the ISR bytes at 0x4F0900.
       (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
       (mvm-emit-u32 buf deadline-isr-addr) (mvm-emit-u32 buf 0)
@@ -718,15 +754,32 @@
     ;; add rsp, 16  (restore stack)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x83)
     (mvm-emit-byte buf #xC4) (mvm-emit-byte buf #x10)
-    ;; Zero the deadline counter at 0x10000C70 BEFORE enabling interrupts.
-    ;; Without this, uninitialized memory could be non-zero, count down,
-    ;; and longjmp into a slot 0x10000180 that has no real handler-case
-    ;; armed — crashing at boot.
-    ;; mov rdi, 0x10000C70 ; mov qword [rdi], 0
+    ;; Zero handler-case state + handler-stack depth + deadline counter
+    ;; BEFORE enabling interrupts.  On Linux the fork-time BSS is
+    ;; zeroed; bare-metal has no such guarantee — leftover memory
+    ;; could fake a handler-case armed (slot 180 != 0) or a non-empty
+    ;; handler-stack (depth > 0), causing the first IRQ-longjmp or
+    ;; CLEAR-HANDLER to read a fictional frame.
+    ;; Zero qword [0x10000180]: mov rdi, addr; mov qword [rdi], 0
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000180) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
+    (mvm-emit-u32 buf 0)
+    ;; Zero qword [0x10000188]: mov qword [rdi+8], 0
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x08)
+    (mvm-emit-u32 buf 0)
+    ;; Zero qword [0x10000190]: mov qword [rdi+16], 0
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x10)
+    (mvm-emit-u32 buf 0)
+    ;; Zero qword [0x10000400] (handler-stack depth)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000400) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
+    (mvm-emit-u32 buf 0)
+    ;; Zero qword [0x10000C70] (deadline counter)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf #x10000C70) (mvm-emit-u32 buf 0)
-    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7)
-    (mvm-emit-byte buf #x07)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
     (mvm-emit-u32 buf 0)
     ;; STI — enable interrupts so the deadline-aware PIT ISR (0x4F0900)
     ;; can fire and longjmp out of infinite-loop tests.  In the original

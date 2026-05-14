@@ -7125,21 +7125,31 @@
 (defun compile-make-array (size-form env dest)
   "Compile (make-array size).
    Constant size <= 65535: ALLOC-OBJ with imm16 element count.
-   Constant size > 65535 or variable size: ALLOC-ARRAY (register-based)."
-  (if (and (integerp size-form) (<= size-form 65535))
-      ;; Small constant size — emit ALLOC-OBJ directly
-      ;; imm16 = element count, translator computes allocation size
-      (emit-ir :alloc-obj dest size-form +subtag-array+)
-      ;; Large constant or variable size — compile to register, ALLOC-ARRAY
-      (progn
-        (if (integerp size-form)
-            ;; Large constant: load as immediate, already untagged
-            (emit-ir :li dest size-form)
-            ;; Variable: compile and untag
-            (progn
-              (compile-form size-form env dest)
-              (emit-ir :sar dest dest +fixnum-shift+)))
-        (emit-ir :alloc-array dest dest))))
+   Constant size > 65535: ALLOC-ARRAY (register-based, untagged).
+   Variable size or non-integer literal: fall back to MAKE-ARRAY-WITH-CHECKS
+   runtime call (ansi-bridge.lisp).  Without this fallback, a quoted list
+   `'(10)` (the CL dimensions arg) gets treated as a fixnum count — its
+   cons pointer untags to ~0x08000800 elements, advancing R12 by ~1GB
+   per call and triggering catastrophic GC."
+  (cond
+    ;; Small constant: ALLOC-OBJ direct
+    ((and (integerp size-form) (<= size-form 65535))
+     (emit-ir :alloc-obj dest size-form +subtag-array+))
+    ;; Large constant: load imm, ALLOC-ARRAY
+    ((integerp size-form)
+     (emit-ir :li dest size-form)
+     (emit-ir :alloc-array dest dest))
+    ;; Quoted list `(N) → first element is the 1-D size; handle inline.
+    ((and (consp size-form) (name-eq (car size-form) "QUOTE")
+          (consp (cadr size-form))
+          (integerp (car (cadr size-form)))
+          (null (cdr (cadr size-form)))
+          (<= (car (cadr size-form)) 65535))
+     (emit-ir :alloc-obj dest (car (cadr size-form)) +subtag-array+))
+    ;; Anything else (variable, quoted complex, etc.): route to the
+    ;; runtime wrapper that handles dimension lists, &key args, etc.
+    (t
+     (compile-form `(make-array-with-checks ,size-form) env dest))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31."

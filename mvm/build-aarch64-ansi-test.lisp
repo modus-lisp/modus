@@ -2837,6 +2837,9 @@
                      ~%  ;; PROBE 2026-05-14: remove just the 12240-12300 stamp~
                      ~%  ;; to see if the code-bounds-init fix (e6b4a65) lets~
                      ~%  ;; the function/functionp.lsp tests pass cleanly.~
+                     ~%  ;; Round 2 also tried removing 10672/10695/11654-12100~
+                     ~%  ;; but that layout shift wedged test 12326 (LABELS+&KEY)~
+                     ~%  ;; — different fragility class; reverted.~
                      ~%  (%fail-pairs '(10672 10694 10695 10718~
                      ~%                 11654 12100 12483 12572~
                      ~%                 12649 13050 13332 13527~

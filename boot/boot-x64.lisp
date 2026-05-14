@@ -480,6 +480,98 @@
     (mvm-emit-byte buf #xCF)
 
     ;; ============================================================
+    ;; Deadline-aware PIT ISR at 0x4F0900.  Mirrors AArch64 entry-5:
+    ;; on every IRQ tick, decrement the counter at 0x10000C70.  When
+    ;; the counter is 0, do nothing (no deadline armed).  When it
+    ;; transitions 1→0, check slot 0x10000180 (handler-case armed by
+    ;; setjmp) and longjmp to its saved RIP with RAX = T sentinel.
+    ;;
+    ;; Critical design choice: we use STI + JMP rather than IRETQ.
+    ;; IRETQ in 64-bit mode pops 5 quadwords (RIP, CS, RFLAGS, RSP,
+    ;; SS) unconditionally — even at CPL=0.  Constructing a faithful
+    ;; 5-quad frame inside an asynchronous ISR is fiddly.  Instead:
+    ;; mov rsp, saved_rsp; mov rbp, saved_rbp; mov eax, T_sentinel;
+    ;; sti; jmp saved_rip.  This skips the segment-restore phase of
+    ;; IRETQ but in 64-bit kernel mode CS/SS values are not used for
+    ;; addressing anyway (only descriptor-cache flags matter).
+    ;;
+    ;; Deadline-aware PIT ISR at 0x4F0900.  Decrements counter at
+    ;; 0x10000C70; on 1→0 transition, longjmp via slot 0x10000180.
+    ;;
+    ;; CRITICAL: the normal-return path (pit_normal) IRETQs with IF=1
+    ;; injected into the saved RFLAGS frame.  CPU clears IF on IRQ
+    ;; entry through an interrupt gate; without this OR, the first tick
+    ;; would re-enable interrupts via IRETQ-restored-saved-IF=0 (CPU
+    ;; pushed cleared IF), and subsequent ticks never fire.  The deadline
+    ;; path uses STI+JMP directly so handles IF on its own.
+    (let ((deadline-isr-addr #x4F0900)
+          (deadline-bytes
+           #(#x50
+             #x51
+             #x52
+             #xB0 #x20
+             #xE6 #x20
+             #x48 #xB9 #x70 #x0C #x00 #x10 #x00 #x00 #x00 #x00
+             #x48 #x8B #x01
+             #x48 #x85 #xC0
+             #x74 #x34
+             #x48 #xFF #xC8
+             #x48 #x89 #x01
+             #x75 #x2C
+             #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
+             #x48 #x8B #x01
+             #x48 #x85 #xC0
+             #x74 #x1A
+             #x48 #x8B #x69 #x08
+             #x48 #x8B #x51 #x10
+             #x48 #xC7 #x01 #x00 #x00 #x00 #x00
+             #x48 #x89 #xC4
+             #xB8 #x09 #x10 #xAD #xDE
+             #xFB
+             #xFF #xE2
+             ;; pit_normal: pop saved regs, set IF in IRETQ-frame
+             ;; RFLAGS, then IRETQ.  Without the OR, IRQs stay
+             ;; disabled after the first tick because CPU pushed
+             ;; RFLAGS with IF=0 on interrupt-gate entry.
+             #x5A
+             #x59
+             #x58
+             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00
+             #x48 #xCF)))
+      ;; Write the ISR bytes at 0x4F0900.
+      (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+      (mvm-emit-u32 buf deadline-isr-addr) (mvm-emit-u32 buf 0)
+      (dotimes (i (length deadline-bytes))
+        (cond
+          ((< i 128)
+           (mvm-emit-byte buf #xC6)
+           (mvm-emit-byte buf #x47)
+           (mvm-emit-byte buf i)
+           (mvm-emit-byte buf (aref deadline-bytes i)))
+          (t
+           (mvm-emit-byte buf #xC6)
+           (mvm-emit-byte buf #x87)
+           (mvm-emit-u32  buf i)
+           (mvm-emit-byte buf (aref deadline-bytes i)))))
+      ;; Repatch IDT entry 0x20 (PIT timer) to point at 0x4F0900.
+      (let* ((eaddr (+ idt-base (* #x20 16)))
+             (off-lo (logand deadline-isr-addr #xFFFF))
+             (off-mid (logand (ash deadline-isr-addr -16) #xFFFF))
+             (off-hi (logand (ash deadline-isr-addr -32) #xFFFFFFFF)))
+        (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+        (mvm-emit-u32 buf eaddr) (mvm-emit-u32 buf 0)
+        (mvm-emit-byte buf #xB8)
+        (mvm-emit-u32 buf (logior off-lo (ash selector 16)))
+        (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+        (mvm-emit-byte buf #xB8)
+        (mvm-emit-u32 buf (logior (ash type-attr 8) (ash off-mid 16)))
+        (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x04)
+        (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x08)
+        (mvm-emit-u32 buf off-hi)
+        (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x0C)
+        (mvm-emit-u32 buf 0)))
+
+    ;; ============================================================
     ;; Exception-recovery handler for #GP (13) and #PF (14).
     ;; Mirrors AArch64 sync-exception entry-4: if a handler-case is
     ;; armed (slot 0x10000180 != 0), restore SP/RBP/RIP from
@@ -514,11 +606,22 @@
             ;; the recovered handler-clause body then see the OUTER
             ;; handler-case instead of "no handler", which previously
             ;; caused a clean halt after 2-3 nested faults.
+            ;; Epilogue at byte 129 onwards uses STI+JMP instead of
+            ;; pushing 3 quads + IRETQ.  IRETQ in 64-bit mode pops 5
+            ;; quadwords unconditionally (RIP, CS, RFLAGS, RSP, SS),
+            ;; but the original handler only pushed 3 — IRETQ then
+            ;; popped RSP and SS from undefined memory above the
+            ;; saved-stack region, corrupting state on resume.  With
+            ;; STI+JMP, we use the RSP we just set (mov rsp, rax) and
+            ;; jump directly to the saved RIP (in RDX) with IF=1.
+            ;; Layout shifts: halt now at byte 140 (was 147), so the
+            ;; "no handler armed" jz at byte 20-21 targets 0x76 (was
+            ;; 0x7D).
             #(#x48 #x83 #xC4 #x08
               #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
               #x48 #x8B #x01
               #x48 #x85 #xC0
-              #x74 #x7D
+              #x74 #x76
               #x48 #x8B #x69 #x08
               #x48 #x8B #x51 #x10
               #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10
@@ -540,11 +643,9 @@
               #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
               #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
               #x48 #x89 #xC4
-              #x68 #x02 #x02 #x00 #x00
-              #x6A #x10
-              #x52
               #xB8 #x09 #x10 #xAD #xDE
-              #x48 #xCF
+              #xFB
+              #xFF #xE2
               #xF4
               #xEB #xFD)))
       ;; mov rdi, sigsegv-isr-addr
@@ -616,9 +717,22 @@
     (mvm-emit-byte buf #x1C) (mvm-emit-byte buf #x24)
     ;; add rsp, 16  (restore stack)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x83)
-    (mvm-emit-byte buf #xC4) (mvm-emit-byte buf #x10))
-  ;; Interrupts remain disabled (CLI from boot). Lisp code uses (sti-hlt) to
-  ;; atomically enable + halt, then (cli) after wake.
+    (mvm-emit-byte buf #xC4) (mvm-emit-byte buf #x10)
+    ;; Zero the deadline counter at 0x10000C70 BEFORE enabling interrupts.
+    ;; Without this, uninitialized memory could be non-zero, count down,
+    ;; and longjmp into a slot 0x10000180 that has no real handler-case
+    ;; armed — crashing at boot.
+    ;; mov rdi, 0x10000C70 ; mov qword [rdi], 0
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000C70) (mvm-emit-u32 buf 0)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7)
+    (mvm-emit-byte buf #x07)
+    (mvm-emit-u32 buf 0)
+    ;; STI — enable interrupts so the deadline-aware PIT ISR (0x4F0900)
+    ;; can fire and longjmp out of infinite-loop tests.  In the original
+    ;; boot, IRQs stayed disabled and Lisp used (sti-hlt) at idle points
+    ;; only.  For ANSI testing the timer must fire throughout each test.
+    (mvm-emit-byte buf #xFB))   ; sti
   )
 
 (defun emit-x64-ap-trampoline (buf)

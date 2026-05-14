@@ -2708,13 +2708,25 @@
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
-                     ~%  (handler-case (rt-run-test id (funcall thunk) expected)~
-                     ~%    (t (c) (%record-test-fail id))))~
+                     ~%  (handler-case~
+                     ~%    (progn~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 100)~
+                     ~%      (rt-run-test id (funcall thunk) expected)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 0))~
+                     ~%    (t (c)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 0)~
+                     ~%      (%record-test-fail id))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
-                     ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
-                     ~%    (t (c) (%record-test-fail id))))~
+                     ~%  (handler-case~
+                     ~%    (progn~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 100)~
+                     ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 0))~
+                     ~%    (t (c)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 0)~
+                     ~%      (%record-test-fail id))))~
                      ~%(defun %stamp-remaining-fails (first-id last-id)~
                      ~%  (when (> last-id 0)~
                      ~%    (let ((i (if (> *skip-below* first-id) *skip-below* first-id)))~
@@ -2955,15 +2967,13 @@
   ;; (cl-clos.lisp's %specializer-matches-p reads/decrements this).
   (setf (mem-ref #x10000C60 :u64) 5)
 
-  ;; PHASE-A.1: skip custom tests (run-all-tests hangs at 9811 reading
-  ;; a stream).  Set *skip-below* so the ANSI runner skips tests below
-  ;; *skip-below* — useful for bisecting the next hang point.
-  ;;
-  ;; 10180 matches the AArch64 ANSI build's setting (mvm/build-aarch64-
-  ;; ansi-test.lisp).  Pre-assoc + assoc.lsp tests below 10180 wedge
-  ;; on x64 the same way they did on AArch64 (adjoin/member on dotted
-  ;; lists → cdr-walk-past-tail → #PF without IDT recovery).
-  (setq *skip-below* 10180)
+  ;; *skip-below* = 0: run everything, including the pre-assoc and assoc.lsp
+  ;; tests that wedge on cdr-walk-past-tail.  The IDT #PF/#GP handler at
+  ;; 0x4F0820 (158d7ae, 5cdad46) catches the fault and longjmps into the
+  ;; nearest handler-case, so cdr-walk crashes should be recoverable as
+  ;; clean FAILs.  Tests that go into an INFINITE LOOP (rather than fault)
+  ;; will still hang — those need a separate per-test deadline mechanism.
+  (setq *skip-below* 0)
   ;; (run-all-tests)
 
   ;; Print expected ANSI test total so the summary can compute lost tests.

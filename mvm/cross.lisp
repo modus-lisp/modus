@@ -537,6 +537,42 @@
                 (patch-aarch64-mov-imm16 raw-bytes movz-file-pos lo16)
                 (patch-aarch64-mov-imm16 raw-bytes movk-file-pos hi16)))))))))
 
+(defun apply-aarch64-code-bounds-patches (raw-bytes image boot-descriptor)
+  "Patch the MOVZ+MOVK pairs that emit-aarch64-code-bounds-init left
+   as placeholders in the boot stub.  The cross-link writes:
+     code_base = load-addr + 0x80000 (image_load_offset for AArch64)
+                  + native-image-offset
+     code_end  = code_base + native-code-length
+   into slots 0x10000160 / 0x10000168, matching the x64 emit-code-
+   bounds-init contract that functionp (cl-eval.lisp) consumes."
+  (let ((cb-off (and (boundp 'modus.mvm::*aarch64-code-base-patch-offset*)
+                     modus.mvm::*aarch64-code-base-patch-offset*))
+        (ce-off (and (boundp 'modus.mvm::*aarch64-code-end-patch-offset*)
+                     modus.mvm::*aarch64-code-end-patch-offset*)))
+    (when (and cb-off ce-off boot-descriptor)
+      (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
+             (arch (getf boot-descriptor :arch))
+             (image-load-offset (if (member arch '(:aarch64 :rpi)) #x80000 0))
+             (load-addr (+ declared-load-addr image-load-offset))
+             (native-image-offset (or (kernel-image-native-image-offset image) 0))
+             (native-code-length (length (kernel-image-native-code image)))
+             (code-base (+ load-addr native-image-offset))
+             (code-end  (+ code-base native-code-length)))
+        ;; Each patch site is a MOVZ at offset N (lo16) and a MOVK at
+        ;; offset N+4 (hi16 lsl 16) — same convention the fn-addr
+        ;; patcher uses.
+        (patch-aarch64-mov-imm16 raw-bytes cb-off
+                                 (logand code-base #xFFFF))
+        (patch-aarch64-mov-imm16 raw-bytes (+ cb-off 4)
+                                 (logand (ash code-base -16) #xFFFF))
+        (patch-aarch64-mov-imm16 raw-bytes ce-off
+                                 (logand code-end #xFFFF))
+        (patch-aarch64-mov-imm16 raw-bytes (+ ce-off 4)
+                                 (logand (ash code-end -16) #xFFFF))
+        ;; Reset for next build.
+        (setf modus.mvm::*aarch64-code-base-patch-offset* nil)
+        (setf modus.mvm::*aarch64-code-end-patch-offset*  nil)))))
+
 (defun patch-aarch64-mov-imm16 (raw-bytes file-pos imm16)
   "Patch the imm16 field of an AArch64 MOVZ or MOVK instruction at
    FILE-POS in RAW-BYTES.  imm16 lives at bits [20:5] of the 32-bit
@@ -860,6 +896,11 @@
         ;; pair that +op-fn-addr+ emitted.  See translate-aarch64.lisp
         ;; *aarch64-fn-addr-patches* docstring.
         (apply-aarch64-fn-addr-patches raw-bytes image module boot-descriptor)
+        ;; AArch64 code-bounds patches: fill in slot 0x10000160 (code_base)
+        ;; and 0x10000168 (code_end) so functionp's range arm classifies
+        ;; raw fn-addrs correctly.  See translate-aarch64.lisp's
+        ;; emit-aarch64-code-bounds-init.
+        (apply-aarch64-code-bounds-patches raw-bytes image boot-descriptor)
         ;; UEFI: patch stub with kernel data offset/size, then wrap in PE32+
         (when (and boot-descriptor (getf boot-descriptor :uefi))
           (patch-uefi-stub raw-bytes

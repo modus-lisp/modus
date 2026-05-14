@@ -863,6 +863,14 @@
     (emit-aarch64-u32 buf #xD518C010)            ; MSR VBAR_EL1, X16
     (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
 
+    ;; 19c. Record code_base and code_end at fixed slots so functionp's
+    ;; range-check arm can classify raw fn-addrs correctly.  Mirrors x64
+    ;; emit-code-bounds-init; cross.lisp patches the MOVZ/MOVK pairs
+    ;; once the runtime layout is known.  Without this, fn-addrs whose
+    ;; low byte happens to be 0x05 get misclassified as characters by
+    ;; functionp's fallback path.
+    (emit-aarch64-code-bounds-init buf)
+
     ;; 20. Branch to native code via offset-mapped VA
     ;; Native code starts at offset 0x1000 in the image = VA 0x1000
     ;; (Boot preamble occupies offsets 0x000-0x7FF, vectors at 0x800-0xFFF)

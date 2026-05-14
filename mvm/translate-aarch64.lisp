@@ -143,6 +143,20 @@
    become layout-shift-stable, eliminating the ADR-truncation class
    of fragility bugs on AArch64 ANSI builds.")
 
+(defvar *aarch64-code-base-patch-offset* nil
+  "Byte offset of the MOVZ that loads code_base in the boot stub's
+   emit-aarch64-code-bounds-init block.  Patched at link time by
+   cross.lisp::apply-aarch64-code-bounds-patches once the runtime
+   code_base / code_end addresses are known.  Same encoding shape
+   as *aarch64-fn-addr-patches* — MOVZ at offset, MOVK at offset+4 —
+   together they materialise a 32-bit address into x16.  Nil between
+   builds.  Without this slot wired up, functionp (cl-eval.lisp:1747)
+   falls through to its characterp fallback for any fn-addr whose
+   low byte is 0x05 and misclassifies it as a non-function.")
+
+(defvar *aarch64-code-end-patch-offset* nil
+  "Companion to *aarch64-code-base-patch-offset* for code_end.")
+
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
 ;;; ============================================================
@@ -2808,6 +2822,36 @@
 ;;;   else: depth -= 1; reload slot 180/188/190 from frame[depth].
 ;;;
 ;;; Both helpers are leaf functions: clobber x9..x13, preserve x30 (LR).
+
+(defun emit-aarch64-code-bounds-init (buf)
+  "Emit the boot-stub init block that records code_base and code_end
+   into fixed slots 0x10000160 / 0x10000168.  Mirrors the x64 helper
+   emit-code-bounds-init in translate-x64.lisp.
+
+   Without this block, functionp's code-range check (cl-eval.lisp)
+   sees zero in both slots, short-circuits past the in-code arm, and
+   falls through to characterp/stringp/etc. — which can misclassify
+   raw fn-addrs (low byte 0x05) as characters and return NIL.
+
+   Records *aarch64-code-base-patch-offset* and -end-patch-offset as
+   *byte* offsets so cross.lisp can fill in the actual addresses
+   post-link.  Each value loads via MOVZ + MOVK (32-bit absolute,
+   same convention as fn-addr patches) into x16, then stores via
+   STR through x17 that holds the slot address."
+  ;; a64-buffer-position is in 32-bit instruction units; convert to bytes
+  ;; so the cross.lisp patcher (which works in bytes) finds the right MOVZ.
+  ;; ---- code_base ----
+  (setf *aarch64-code-base-patch-offset* (* (a64-buffer-position buf) 4))
+  (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
+  (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
+  (a64-load-imm64 buf +a64-x17+ #x10000160)
+  (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0)
+  ;; ---- code_end ----
+  (setf *aarch64-code-end-patch-offset* (* (a64-buffer-position buf) 4))
+  (a64-movz buf +a64-x16+ 0 0)              ; placeholder (lo16)
+  (a64-movk buf +a64-x16+ 0 1)              ; placeholder (hi16 lsl 16)
+  (a64-load-imm64 buf +a64-x17+ #x10000168)
+  (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0))
 
 (defun emit-aarch64-handler-helpers (buf)
   "If *aarch64-handler-push-label* / *aarch64-handler-pop-label* are

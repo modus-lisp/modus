@@ -7452,25 +7452,9 @@
              (push (list (car p) (cadr p)) optional)
              (push (list p nil) optional)))
         ((eq mode :key)
-         ;; (B 0 B-P) — third element is the supplied-p variable.
-         ;; Modus treats &key as POSITIONAL (see feedback_andkey_
-         ;; compilation), so we can't actually tell whether B was
-         ;; supplied vs. defaulted; bind the supplied-p var to NIL
-         ;; in the common no-args case so references in the body
-         ;; resolve to a real local instead of an undefined free
-         ;; variable.  Better than leaving B-P unbound and letting
-         ;; the runtime symbol-value lookup error.
-         (cond
-           ((and (consp p) (consp (cdr p)) (consp (cddr p)))
-            ;; (NAME DEFAULT SUPPLIED-P)
-            (push (list (car p) (cadr p)) keys)
-            (push (list (caddr p) nil) keys))
-           ((consp p)
-            ;; (NAME DEFAULT)
-            (push (list (car p) (cadr p)) keys))
-           (t
-            ;; NAME
-            (push (list p nil) keys))))
+         (if (consp p)
+             (push (list (car p) (cadr p)) keys)
+             (push (list p nil) keys)))
         ((eq mode :aux)
          (if (consp p)
              (push (list (car p) (cadr p)) auxes)

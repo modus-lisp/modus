@@ -2850,11 +2850,9 @@
                      ~%  ;; code-bounds-init fixed, sweep more ranges off.  The~
                      ~%  ;; suite holds through <DN> as long as the wedge-cause~
                      ~%  ;; for each removed range is in the "now-fixed" set.~
-                     ~%  (%fail-pairs '(12649 13050 13332 13527~
-                     ~%                 14364 14600~
-                     ~%                 15683 15691 16685 16713 17072 17106~
-                     ~%                 18892 19050~
-                     ~%                 24836 24948 25039 25151))~
+                     ~%  ;; Probe 2026-05-14 NUCLEAR: drop every remaining~
+                     ~%  ;; pre-stamp.  Goal is fewest stamps that still reach <DN>.~
+                     ~%  (%fail-pairs '())~
                      ~%  nil)~
                      ~%;; Stubs for the parts of the Linux harness called by~
                      ~%;; codegen elsewhere — keep symbols defined but no-op them.~

@@ -7125,31 +7125,34 @@
 (defun compile-make-array (size-form env dest)
   "Compile (make-array size).
    Constant size <= 65535: ALLOC-OBJ with imm16 element count.
-   Constant size > 65535: ALLOC-ARRAY (register-based, untagged).
-   Variable size or non-integer literal: fall back to MAKE-ARRAY-WITH-CHECKS
-   runtime call (ansi-bridge.lisp).  Without this fallback, a quoted list
-   `'(10)` (the CL dimensions arg) gets treated as a fixnum count — its
-   cons pointer untags to ~0x08000800 elements, advancing R12 by ~1GB
-   per call and triggering catastrophic GC."
+   Constant size > 65535 or variable size: ALLOC-ARRAY (register-based).
+
+   Special-case quoted 1-element list `(N)` (the standard CL dims
+   form): treat as 1-D size N.  Without this intercept, the cons
+   pointer for `'(10)` reaches the variable path which `(compile-form
+   ...)`s the quote into a register and `SAR 1`s it — yielding
+   ~0x08000800 as the element count.  ALLOC-ARRAY then advances R12
+   by ~1GB per call, wedging the kernel via runaway GC.
+
+   We canNOT route the variable path to MAKE-ARRAY-WITH-CHECKS:
+   its body calls (make-array X) which would recurse through this
+   function indefinitely at runtime."
   (cond
-    ;; Small constant: ALLOC-OBJ direct
     ((and (integerp size-form) (<= size-form 65535))
      (emit-ir :alloc-obj dest size-form +subtag-array+))
-    ;; Large constant: load imm, ALLOC-ARRAY
     ((integerp size-form)
      (emit-ir :li dest size-form)
      (emit-ir :alloc-array dest dest))
-    ;; Quoted list `(N) → first element is the 1-D size; handle inline.
+    ;; Quoted 1-element fixnum list: 1-D dims '(N) → size N.
     ((and (consp size-form) (name-eq (car size-form) "QUOTE")
           (consp (cadr size-form))
           (integerp (car (cadr size-form)))
-          (null (cdr (cadr size-form)))
-          (<= (car (cadr size-form)) 65535))
-     (emit-ir :alloc-obj dest (car (cadr size-form)) +subtag-array+))
-    ;; Anything else (variable, quoted complex, etc.): route to the
-    ;; runtime wrapper that handles dimension lists, &key args, etc.
+          (null (cdr (cadr size-form))))
+     (compile-make-array (car (cadr size-form)) env dest))
     (t
-     (compile-form `(make-array-with-checks ,size-form) env dest))))
+     (compile-form size-form env dest)
+     (emit-ir :sar dest dest +fixnum-shift+)
+     (emit-ir :alloc-array dest dest))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31."

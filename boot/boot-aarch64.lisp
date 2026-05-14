@@ -224,35 +224,45 @@
        ;; Mirrors x64 SIGSEGV stub (translate-x64.lisp #x0520):
        ;; if a handler-case is active (saved SP at 0x10000180 != 0),
        ;; restore SP/FP/IP from saved slots and ERET back to it,
-       ;; with X0 = T to signal "longjmp-return".  Otherwise fall
-       ;; into B . (debug halt).
+       ;; with X0 = T to signal "longjmp-return".
        ;;
-       ;; Capture state to diag slots (mirror x64 layout) FIRST so a
-       ;; later FAIL line can print useful debug info:
+       ;; FALLBACK to slot 0x100001C0 (set by SAVE-OUTER trap, used by
+       ;; fork-file for the outer "deadline-can-longjmp-here" handler):
+       ;; when slot 180 is zero (no nested handler-case armed), try
+       ;; slot 1C0 before halting.  Without this, a sync exception
+       ;; (e.g. cdr-walk-past-tail) that fires when the nested
+       ;; handler-case stack has unwound to zero would halt the
+       ;; kernel even though fork-file's outer fallback IS armed —
+       ;; manifested as the kernel halting at T:14577 once the
+       ;; make-array `'(N)` fix (aefe8f2) stopped triggering spurious
+       ;; allocs that hid this case.
+       ;;
+       ;; Mirrors entry-5 (IRQ) which already had this fallback.
+       ;;
+       ;; Capture state to diag slots first:
        ;;   0x10000C30 = ELR (faulting PC)
-       ;;   0x10000C40 = FAR (fault addr / "site" on x64)
-       ;;   0x10000C50 = X0 at fault
+       ;;   0x10000C40 = FAR (fault addr)
+       ;;   0x10000C48 = X0 at fault
        ;;
-       ;; Layout of this entry (need <= 32 instructions = 128 bytes):
-       ;;   1.  MRS x16, ELR_EL1           ; faulting PC
-       ;;   2.  MOVZ x17, #0x0c30          ; addr lo
-       ;;   3.  MOVK x17, #0x1000, lsl #16 ; addr hi
-       ;;   4.  STR x16, [x17]             ; save ELR
-       ;;   5.  MRS x16, FAR_EL1           ; fault addr
-       ;;   6.  STR x16, [x17, #0x10]      ; save FAR (slot C40)
-       ;;   7.  STR x0,  [x17, #0x18]      ; save X0 (slot C48)
-       ;;   8.  MOVZ x16, #0x0180          ; addr lo
-       ;;   9.  MOVK x16, #0x1000, lsl #16 ; addr hi
-       ;;  10.  LDR x17, [x16]             ; saved SP (handler-case state)
-       ;;  11.  CBZ x17, +N                ; if 0, no active handler
-       ;;  12.  ADD sp, x17, #0            ; restore SP (MOV SP)
-       ;;  13.  LDR x29, [x16, #8]         ; restore FP
-       ;;  14.  LDR x17, [x16, #16]        ; saved IP
-       ;;  15.  MSR ELR_EL1, x17           ; ELR = saved IP
-       ;;  16.  MOVZ x0, #0x1009           ; X0 lo = T low
-       ;;  17.  MOVK x0, #0xDEAD, lsl #16  ; X0 = T (#xDEAD1009)
-       ;;  18.  ERET
-       ;;  19.  B .                         (no-handler halt — CBZ target)
+       ;; Layout (26 instructions):
+       ;;   1-9.  Save ELR/FAR/X0 to diag slots, load x16 = 0x10000180
+       ;;  10.   LDR x17, [x16]              ; slot 180 SP
+       ;;  11.   CBNZ x17, +4 → DO_LJ        ; use slot 180
+       ;;  12.   ADD x16, x16, #0x40         ; → slot 0x100001C0
+       ;;  13.   LDR x17, [x16]              ; slot 1C0 SP (outer fallback)
+       ;;  14.   CBZ x17, +12 → HALT         ; both zero, halt
+       ;;  15.   ADD sp, x17, #0
+       ;;  16.   LDR x29, [x16, #8]
+       ;;  17.   LDR x17, [x16, #16]
+       ;;  18.   TBNZ x16, #6, +3 → slot_1C0 ; discriminate by addr bit 6
+       ;;  19.   BL pop_helper                (slot 180 path)
+       ;;  20.   B +2 → do_eret
+       ;;  21.   STR XZR, [x16]              ; slot_1C0: clear 1C0
+       ;;  22.   MSR ELR_EL1, x17            ; do_eret
+       ;;  23.   MOVZ x0, #0x1009
+       ;;  24.   MOVK x0, #0xDEAD, lsl #16
+       ;;  25.   ERET
+       ;;  26.   B .                          ; HALT
        (emit-aarch64-u32 buf #xD5384030)        ; MRS x16, ELR_EL1
        (emit-aarch64-u32 buf #xD2818611)        ; MOVZ x17, #0x0c30
        (emit-aarch64-u32 buf #xF2A20011)        ; MOVK x17, #0x1000, lsl #16
@@ -262,21 +272,18 @@
        (emit-aarch64-u32 buf #xF9000E20)        ; STR x0,  [x17, #0x18]
        (emit-aarch64-u32 buf #xD2803010)        ; MOVZ x16, #0x0180
        (emit-aarch64-u32 buf #xF2A20010)        ; MOVK x16, #0x1000, lsl #16
-       (emit-aarch64-u32 buf #xF9400211)        ; LDR x17, [x16]
-       (emit-aarch64-u32 buf #xB4000131)        ; CBZ x17, +9 instructions — lands on B .
+       (emit-aarch64-u32 buf #xF9400211)        ; LDR x17, [x16]   (slot 180 SP)
+       (emit-aarch64-u32 buf #xB5000091)        ; CBNZ x17, +4 → DO_LJ
+       (emit-aarch64-u32 buf #x91010210)        ; ADD x16, x16, #0x40 (→ 0x1C0)
+       (emit-aarch64-u32 buf #xF9400211)        ; LDR x17, [x16]   (slot 1C0 SP)
+       (emit-aarch64-u32 buf #xB4000191)        ; CBZ x17, +12 → HALT
+       ;; DO_LJ (instr 15):
        (emit-aarch64-u32 buf #x9100023F)        ; ADD sp, x17, #0
        (emit-aarch64-u32 buf #xF940061D)        ; LDR x29, [x16, #8]
        (emit-aarch64-u32 buf #xF9400A11)        ; LDR x17, [x16, #16]
-       ;; Phase 3(e): BL the per-fork handler-stack pop helper instead
-       ;; of the legacy STR XZR.  The helper either uncovers the OUTER
-       ;; handler (frame[depth-1]) or, when depth==0, zeros slot 180
-       ;; — same legacy "no handler" semantics for the case where this
-       ;; was the only handler-case in scope.  Crucially: we're inside
-       ;; the exception handler (SP_ELx), so the helper's x9..x13 +
-       ;; x30 clobbers are harmless; ERET reads ELR_EL1, not x30.
-       ;; (Fallback to STR XZR when the pop label isn't bound — that
-       ;; can only happen if some non-unified path runs this entry-fn,
-       ;; which the AArch64 ANSI build never does.)
+       ;; Discriminate slot 180 (bit6=0) vs slot 1C0 (bit6=1) of x16.
+       (emit-aarch64-u32 buf #x37300070)        ; TBNZ x16, #6, +3 → slot_1C0
+       ;; slot 180 path (instr 19): BL pop_helper.
        (cond
          (modus.mvm::*aarch64-handler-pop-label*
           (let ((idx (modus.mvm::a64-current-index buf)))
@@ -285,14 +292,19 @@
                                       modus.mvm::*aarch64-handler-pop-label*
                                       :bl)))
          (t
-          (emit-aarch64-u32 buf #xF900021F)))   ; STR XZR, [x16]
+          (emit-aarch64-u32 buf #xD503201F)))   ; NOP if no pop helper
+       (emit-aarch64-u32 buf #x14000002)        ; B +2 → do_eret
+       ;; slot_1C0 (instr 21): STR XZR, [x16] (clear 1C0 fallback)
+       (emit-aarch64-u32 buf #xF900021F)
+       ;; do_eret (instr 22):
        (emit-aarch64-u32 buf #xD5184031)        ; MSR ELR_EL1, x17
        (emit-aarch64-u32 buf #xD2820120)        ; MOVZ x0, #0x1009
        (emit-aarch64-u32 buf #xF2BBD5A0)        ; MOVK x0, #0xDEAD, lsl #16
        (emit-aarch64-u32 buf #xD69F03E0)        ; ERET
-       (emit-aarch64-u32 buf #x14000000)        ; B .  (no handler — halt here)
-       ;; Fill remaining 12 instructions with NOP
-       (dotimes (i 12)
+       ;; HALT (instr 26):
+       (emit-aarch64-u32 buf #x14000000)        ; B .
+       ;; Fill remaining 6 instructions with NOP
+       (dotimes (i 6)
          (emit-aarch64-u32 buf #xD503201F)))
       ((= entry 5)
        ;; Entry 5: IRQ handler for Current EL with SP_ELx.

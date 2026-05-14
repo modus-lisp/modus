@@ -479,6 +479,87 @@
     (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x07)
     (mvm-emit-byte buf #xCF)
 
+    ;; ============================================================
+    ;; Exception-recovery handler for #GP (13) and #PF (14).
+    ;; Mirrors AArch64 sync-exception entry-4: if a handler-case is
+    ;; armed (slot 0x10000180 != 0), restore SP/RBP/RIP from
+    ;; 0x10000180/188/190 and IRETQ with RAX = T (#xDEAD1009).  If not
+    ;; armed, HLT loop.  Clears slot 0x10000180 before IRETQ so a
+    ;; subsequent fault without a re-armed handler-case takes the
+    ;; halt path instead of resuming on stale state.
+    ;;
+    ;; Handler bytes at 0x4F0820 (58 bytes):
+    ;;   48 83 C4 08              add rsp, 8   (pop CPU-pushed error code)
+    ;;   48 B9 ...........        mov rcx, 0x10000180
+    ;;   48 8B 01                 mov rax, [rcx]            ; saved RSP
+    ;;   48 85 C0                 test rax, rax
+    ;;   74 21                    jz halt (+33)
+    ;;   48 8B 69 08              mov rbp, [rcx+8]          ; saved RBP
+    ;;   48 8B 51 10              mov rdx, [rcx+16]         ; saved RIP -> rdx
+    ;;   48 C7 01 00 00 00 00     mov qword [rcx], 0        ; clear slot 180
+    ;;   48 89 C4                 mov rsp, rax              ; switch to saved stack
+    ;;   68 02 02 00 00           push 0x202                ; RFLAGS (IF set)
+    ;;   6A 10                    push 0x10                 ; CS = kernel selector
+    ;;   52                       push rdx                  ; RIP
+    ;;   B8 09 10 AD DE           mov eax, 0xDEAD1009       ; T sentinel
+    ;;   48 CF                    iretq
+    ;;   F4                       hlt                       ; halt:
+    ;;   EB FD                    jmp halt
+    (let* ((sigsegv-isr-addr #x4F0820)
+           (sg-bytes
+            #(#x48 #x83 #xC4 #x08
+              #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
+              #x48 #x8B #x01
+              #x48 #x85 #xC0
+              #x74 #x21
+              #x48 #x8B #x69 #x08
+              #x48 #x8B #x51 #x10
+              #x48 #xC7 #x01 #x00 #x00 #x00 #x00
+              #x48 #x89 #xC4
+              #x68 #x02 #x02 #x00 #x00
+              #x6A #x10
+              #x52
+              #xB8 #x09 #x10 #xAD #xDE
+              #x48 #xCF
+              #xF4
+              #xEB #xFD)))
+      ;; mov rdi, sigsegv-isr-addr
+      (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+      (mvm-emit-u32 buf sigsegv-isr-addr) (mvm-emit-u32 buf 0)
+      ;; For each byte i in sg-bytes: mov byte [rdi+i], imm8.
+      ;; Encoding: C6 47 imm8(offset) imm8(value) — only valid for offset<128.
+      (dotimes (i (length sg-bytes))
+        (mvm-emit-byte buf #xC6)
+        (mvm-emit-byte buf #x47)
+        (mvm-emit-byte buf i)
+        (mvm-emit-byte buf (aref sg-bytes i)))
+
+      ;; Write IDT entries 13 (#GP) and 14 (#PF) pointing at our handler.
+      ;; Same encoding pattern as vector 0x20 above.
+      (dolist (vec '(13 14))
+        (let* ((eoff (* vec 16))
+               (eaddr (+ idt-base eoff))
+               (off-lo (logand sigsegv-isr-addr #xFFFF))
+               (off-mid (logand (ash sigsegv-isr-addr -16) #xFFFF))
+               (off-hi (logand (ash sigsegv-isr-addr -32) #xFFFFFFFF)))
+          ;; mov rdi, eaddr
+          (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+          (mvm-emit-u32 buf eaddr) (mvm-emit-u32 buf 0)
+          ;; Word 0: offset_lo + selector
+          (mvm-emit-byte buf #xB8)
+          (mvm-emit-u32 buf (logior off-lo (ash selector 16)))
+          (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+          ;; Word 1: type_attr + offset_mid
+          (mvm-emit-byte buf #xB8)
+          (mvm-emit-u32 buf (logior (ash type-attr 8) (ash off-mid 16)))
+          (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x04)
+          ;; Word 2: offset_hi
+          (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x08)
+          (mvm-emit-u32 buf off-hi)
+          ;; Word 3: reserved = 0
+          (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x0C)
+          (mvm-emit-u32 buf 0))))
+
     ;; === Load IDTR ===
     ;; IDTR format: [limit:16 | base:64] at a scratch location
     ;; Use stack for IDTR descriptor

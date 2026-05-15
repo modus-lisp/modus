@@ -156,7 +156,10 @@
         (ppc-buffer-fixups buf)))
 
 (defun ppc-fixup-labels (buf)
-  "Resolve all branch label references."
+  "Resolve all branch label references.  Asserts each branch's signed
+   immediate fits before encoding; over-range silently truncates.
+   :branch24 = ±2^25 bytes (signed 26-bit byte offset, LI shifted)
+   :branch14 = ±2^15 bytes (signed 16-bit byte offset, BD shifted)"
   (let ((words (ppc-buffer-words buf)))
     (dolist (fixup (ppc-buffer-fixups buf))
       (destructuring-bind (word-idx label-id fixup-type) fixup
@@ -170,12 +173,20 @@
             (:branch24
              ;; I-form: bits 6-29 hold offset/4, bit 30=AA, bit 31=LK
              ;; The offset is sign-extended 26-bit, shifted right 2
+             (unless (<= (- (ash 1 25)) rel (1- (ash 1 25)))
+               (error "PPC :branch24 rel ~D out of range ±2^25 at ~
+                       word-idx ~D — would silently truncate"
+                      rel word-idx))
              (let ((field (logand (ash rel -2) #xFFFFFF)))
                (setf (aref words word-idx)
                      (logior (logand word #xFC000003)
                              (ash field 2)))))
             (:branch14
              ;; B-form: bits 16-29 hold offset/4, bit 30=AA, bit 31=LK
+             (unless (<= (- (ash 1 15)) rel (1- (ash 1 15)))
+               (error "PPC :branch14 rel ~D out of range ±2^15 at ~
+                       word-idx ~D — would silently truncate"
+                      rel word-idx))
              (let ((field (logand (ash rel -2) #x3FFF)))
                (setf (aref words word-idx)
                      (logior (logand word #xFFFF0003)

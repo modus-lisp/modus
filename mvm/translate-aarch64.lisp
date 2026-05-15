@@ -276,8 +276,36 @@
    LABEL-ID is the target, TYPE is :b/:bcond/:bl."
   (push (list index label-id type) (a64-buffer-fixups buf)))
 
+(defun %a64-check-branch-range (type offset index)
+  "Assert OFFSET (in 32-bit instruction units) fits the encoding range
+   for the branch TYPE.  Without this each branch silently truncates
+   via (logand offset MASK), turning an out-of-range branch into a
+   wild jump.  Ranges are signed:
+     :b / :bl         imm26 = ±2^25 instructions (±128 MB)
+     :bcond / :cbz    imm19 = ±2^18 instructions (±1 MB)
+     :adr             imm21 BYTES = ±2^20 (±1 MB) — offset arg is in
+                      instruction units, so range is ±2^18 here.
+     :tbz             imm14 = ±2^13 instructions (±32 KB)
+   ADR's overflow class is the original (still-open) AArch64
+   `reference_aarch64_fragility.md` cliff — the fn-addr SBCL-style
+   fix moved most fn-addr loads to MOVZ+MOVK absolute, but pure
+   `ADR` sites in the translator still exist."
+  (let ((lo nil) (hi nil))
+    (ecase type
+      ((:b :bl)         (setq lo (- (ash 1 25)) hi (1- (ash 1 25))))
+      ((:bcond :cbz)    (setq lo (- (ash 1 18)) hi (1- (ash 1 18))))
+      (:adr             (setq lo (- (ash 1 18)) hi (1- (ash 1 18))))
+      (:tbz             (setq lo (- (ash 1 13)) hi (1- (ash 1 13)))))
+    (unless (<= lo offset hi)
+      (error "AArch64 ~A branch offset ~D out of range [~D, ~D] at ~
+              index ~D — would silently truncate"
+             type offset lo hi index))))
+
 (defun a64-resolve-fixups (buf)
-  "Resolve all branch fixups by patching instruction words."
+  "Resolve all branch fixups by patching instruction words.
+   Each branch type's offset is range-checked before encoding so an
+   out-of-range branch produces a build-time error instead of a
+   silently-truncated wild jump."
   (let ((code (a64-buffer-code buf)))
     (dolist (fixup (a64-buffer-fixups buf))
       (destructuring-bind (index label-id type) fixup
@@ -285,53 +313,54 @@
           (unless target
             (error "AArch64: undefined label ~D (fixup at index ~D, type ~A)" label-id index type))
           (let ((offset (- target index)))
-          (ecase type
-            (:b
-             ;; B imm26: patch bits [25:0]
-             (let ((word (aref code index)))
-               (setf (aref code index)
-                     (logior (logand word #xFC000000)
-                             (logand offset #x3FFFFFF)))))
-            (:bl
-             ;; BL imm26: patch bits [25:0]
-             (let ((word (aref code index)))
-               (setf (aref code index)
-                     (logior (logand word #xFC000000)
-                             (logand offset #x3FFFFFF)))))
-            (:bcond
-             ;; B.cond imm19: patch bits [23:5]
-             (let ((word (aref code index)))
-               (setf (aref code index)
-                     (logior (logand word #xFF00001F)
-                             (ash (logand offset #x7FFFF) 5)))))
-            (:adr
-             ;; ADR Xd: immlo(2)|10000|immhi(19)|Rd(5)
-             ;; offset is in instructions, convert to bytes for ADR encoding
-             (let* ((byte-off (* offset 4))
-                    (immlo (logand byte-off 3))
-                    (immhi (logand (ash byte-off -2) #x7FFFF))
-                    (word (aref code index))
-                    (rd (logand word #x1F)))
-               ;; Use nested 2-arg logior (bare-metal multi-arg may clobber)
-               (setf (aref code index)
-                     (logior (logior (ash immlo 29) (ash #b10000 24))
-                             (logior (ash immhi 5) rd)))))
-            (:tbz
-             ;; TBZ Xt, #imm6, label  /  TBNZ same shape
-             ;; Layout: b5|0110110|b40(5)|imm14(14 bits at [18:5])|Rt(5)
-             ;; Patch bits [18:5] with the signed offset (offset = target - index).
-             (let ((word (aref code index)))
-               (setf (aref code index)
-                     (logior (logand word #xFFF8001F)
-                             (ash (logand offset #x3FFF) 5)))))
-            (:cbz
-             ;; CBZ/CBNZ Xt, label
-             ;; Layout: sf|011010|0/1|imm19(19 bits at [23:5])|Rt(5)
-             ;; Patch bits [23:5] with the signed offset (±1MB, in instructions).
-             (let ((word (aref code index)))
-               (setf (aref code index)
-                     (logior (logand word #xFF00001F)
-                             (ash (logand offset #x7FFFF) 5))))))))))))
+            (%a64-check-branch-range type offset index)
+            (ecase type
+              (:b
+               ;; B imm26: patch bits [25:0]
+               (let ((word (aref code index)))
+                 (setf (aref code index)
+                       (logior (logand word #xFC000000)
+                               (logand offset #x3FFFFFF)))))
+              (:bl
+               ;; BL imm26: patch bits [25:0]
+               (let ((word (aref code index)))
+                 (setf (aref code index)
+                       (logior (logand word #xFC000000)
+                               (logand offset #x3FFFFFF)))))
+              (:bcond
+               ;; B.cond imm19: patch bits [23:5]
+               (let ((word (aref code index)))
+                 (setf (aref code index)
+                       (logior (logand word #xFF00001F)
+                               (ash (logand offset #x7FFFF) 5)))))
+              (:adr
+               ;; ADR Xd: immlo(2)|10000|immhi(19)|Rd(5)
+               ;; offset is in instructions, convert to bytes for ADR encoding
+               (let* ((byte-off (* offset 4))
+                      (immlo (logand byte-off 3))
+                      (immhi (logand (ash byte-off -2) #x7FFFF))
+                      (word (aref code index))
+                      (rd (logand word #x1F)))
+                 ;; Use nested 2-arg logior (bare-metal multi-arg may clobber)
+                 (setf (aref code index)
+                       (logior (logior (ash immlo 29) (ash #b10000 24))
+                               (logior (ash immhi 5) rd)))))
+              (:tbz
+               ;; TBZ Xt, #imm6, label  /  TBNZ same shape
+               ;; Layout: b5|0110110|b40(5)|imm14(14 bits at [18:5])|Rt(5)
+               ;; Patch bits [18:5] with the signed offset (offset = target - index).
+               (let ((word (aref code index)))
+                 (setf (aref code index)
+                       (logior (logand word #xFFF8001F)
+                               (ash (logand offset #x3FFF) 5)))))
+              (:cbz
+               ;; CBZ/CBNZ Xt, label
+               ;; Layout: sf|011010|0/1|imm19(19 bits at [23:5])|Rt(5)
+               ;; Patch bits [23:5] with the signed offset (±1MB, in instructions).
+               (let ((word (aref code index)))
+                 (setf (aref code index)
+                       (logior (logand word #xFF00001F)
+                               (ash (logand offset #x7FFFF) 5))))))))))))
 
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."

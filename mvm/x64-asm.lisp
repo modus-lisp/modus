@@ -45,7 +45,16 @@
   (emit-u32 buf (ldb (byte 32 32) value)))
 
 (defun emit-s32 (buf value)
-  ;; Sign-extend if negative
+  ;; Assert the value fits in signed 32-bit range before truncating.
+  ;; rel32 branch offsets that overflow silently produce a branch to
+  ;; the wrong target — historically a major source of "layout bug"
+  ;; mystery crashes.  The image hasn't grown anywhere near 2GB, so
+  ;; this assert should never fire under normal builds; if it does,
+  ;; the diagnostic beats a triple-fault every time.
+  (unless (<= -2147483648 value 2147483647)
+    (error "emit-s32: value ~D (#x~X) out of range for signed 32-bit ~
+            (rel32 branch would silently truncate); buf position ~D"
+           value value (code-buffer-position buf)))
   (emit-u32 buf (if (minusp value)
                     (logand #xFFFFFFFF value)
                     value)))
@@ -70,7 +79,9 @@
   (emit-u32 buf 0))  ; placeholder
 
 (defun fixup-labels (buf)
-  "Resolve all label references"
+  "Resolve all label references.  Asserts each computed rel32 fits in
+   signed 32-bit range before truncating to 4 bytes — without this an
+   overflowed offset silently becomes an arbitrary branch target."
   (let ((bytes (code-buffer-bytes buf)))
     (dolist (fixup (code-buffer-fixups buf))
       (destructuring-bind (pos label size) fixup
@@ -78,10 +89,16 @@
           (when target  ; skip unresolved labels
           (let ((rel (- target (+ pos size))))
           (ecase size
-            (4 (setf (aref bytes pos) (ldb (byte 8 0) rel)
-                     (aref bytes (+ pos 1)) (ldb (byte 8 8) rel)
-                     (aref bytes (+ pos 2)) (ldb (byte 8 16) rel)
-                     (aref bytes (+ pos 3)) (ldb (byte 8 24) rel))))))))))
+            (4
+             (unless (<= -2147483648 rel 2147483647)
+               (error "fixup-labels: rel32 ~D (#x~X) overflows ~
+                      signed 32-bit at pos ~D (target ~D, label ~A) ~
+                      — branch would silently truncate"
+                      rel rel pos target (label-name label)))
+             (setf (aref bytes pos) (ldb (byte 8 0) rel)
+                   (aref bytes (+ pos 1)) (ldb (byte 8 8) rel)
+                   (aref bytes (+ pos 2)) (ldb (byte 8 16) rel)
+                   (aref bytes (+ pos 3)) (ldb (byte 8 24) rel))))))))))
   buf)
 
 ;;; ============================================================

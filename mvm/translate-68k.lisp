@@ -140,7 +140,8 @@
         (m68k-buffer-fixups buf)))
 
 (defun m68k-fixup-labels (buf)
-  "Resolve all branch label references."
+  "Resolve all branch label references.  Each displacement size is
+   range-checked before encoding — out-of-range silently truncates."
   (let ((words (m68k-buffer-words buf)))
     (dolist (fixup (m68k-buffer-fixups buf))
       (destructuring-bind (word-idx label-id fixup-type ref-pos) fixup
@@ -153,17 +154,27 @@
              ;; The extension word is at ref-pos, displacement is target - (ref-pos - 2)
              ;; Because on 68k, PC for displacement calculation points to the extension word
              (let ((disp (- target (- ref-pos 2))))
+               (unless (<= -32768 disp 32767)
+                 (error "68k :disp16 ~D out of range at word-idx ~D"
+                        disp word-idx))
                (setf (aref words word-idx) (logand disp #xFFFF))))
             (:disp8-in-opcode
              ;; 8-bit displacement embedded in opcode word (Bcc.S)
              ;; PC points to opcode + 2 at execution time
              (let ((disp (- target ref-pos)))
+               (unless (<= -128 disp 127)
+                 (error "68k :disp8 ~D out of range at word-idx ~D"
+                        disp word-idx))
                (setf (aref words word-idx)
                      (logior (logand (aref words word-idx) #xFF00)
                              (logand disp #xFF)))))
             (:disp32
-             ;; 32-bit displacement (two words)
+             ;; 32-bit displacement (two words) — full 32-bit signed range,
+             ;; no realistic overflow but the assert keeps the invariant.
              (let ((disp (- target (- ref-pos 2))))
+               (unless (<= -2147483648 disp 2147483647)
+                 (error "68k :disp32 ~D out of range at word-idx ~D"
+                        disp word-idx))
                (setf (aref words word-idx)
                      (logand (ash disp -16) #xFFFF))
                (setf (aref words (1+ word-idx))

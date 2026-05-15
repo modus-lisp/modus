@@ -249,7 +249,11 @@
   (i386-emit-u32 buf 0))
 
 (defun i386-fixup-labels (buf)
-  "Resolve all branch label references."
+  "Resolve all branch label references.  Asserts rel32 fits in signed
+   32-bit before encoding; out-of-range silently truncates and becomes
+   a wild jump.  (Linux ELF max code size is 4GB so rel32 can in
+   principle overflow once images grow past 2GB — currently impossible
+   but the assert costs nothing.)"
   (let ((bytes (i386-buffer-bytes buf)))
     (dolist (fixup (i386-buffer-fixups buf))
       (destructuring-bind (pos label-id fixup-type) fixup
@@ -259,12 +263,16 @@
           (ecase fixup-type
             (:rel32
              ;; rel32 is relative to end of the 4-byte displacement field
-             (let* ((rel (- target (+ pos 4)))
-                    (urel (if (minusp rel) (logand rel #xFFFFFFFF) rel)))
-               (setf (aref bytes (+ pos 0)) (logand urel #xFF)
-                     (aref bytes (+ pos 1)) (logand (ash urel -8) #xFF)
-                     (aref bytes (+ pos 2)) (logand (ash urel -16) #xFF)
-                     (aref bytes (+ pos 3)) (logand (ash urel -24) #xFF))))))))))
+             (let* ((rel (- target (+ pos 4))))
+               (unless (<= -2147483648 rel 2147483647)
+                 (error "i386 rel32 ~D out of range at pos ~D — ~
+                         would silently truncate"
+                        rel pos))
+               (let ((urel (if (minusp rel) (logand rel #xFFFFFFFF) rel)))
+                 (setf (aref bytes (+ pos 0)) (logand urel #xFF)
+                       (aref bytes (+ pos 1)) (logand (ash urel -8) #xFF)
+                       (aref bytes (+ pos 2)) (logand (ash urel -16) #xFF)
+                       (aref bytes (+ pos 3)) (logand (ash urel -24) #xFF)))))))))))
 
 (defun i386-buffer-to-bytes (buf)
   "Return the code buffer as a simple byte vector."

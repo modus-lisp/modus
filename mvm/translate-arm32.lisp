@@ -185,7 +185,9 @@
               (aref bytes (+ (* i 4) 3)) (logand (ash w -24) #xFF))))))
 
 (defun arm32-resolve-fixups (buf)
-  "Resolve all branch fixups."
+  "Resolve all branch fixups.  Asserts the signed 24-bit imm fits
+   before encoding (±2^23 instructions = ±32 MB).  Without the assert
+   an over-range branch silently truncates to a wild jump."
   (let ((code (arm32-buffer-code buf)))
     (dolist (fixup (arm32-buffer-fixups buf))
       (destructuring-bind (index label-id type) fixup
@@ -197,6 +199,10 @@
           (let ((offset (- target index 2)))
             (ecase type
               ((:b :bl :b-cond)
+               (unless (<= (- (ash 1 23)) offset (1- (ash 1 23)))
+                 (error "ARM32 ~A branch offset ~D out of range ~
+                         [-2^23, 2^23-1] at index ~D — would silently truncate"
+                        type offset index))
                ;; Patch bits [23:0] with signed 24-bit offset
                (let ((word (aref code index)))
                  (setf (aref code index)

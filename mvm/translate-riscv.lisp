@@ -160,6 +160,10 @@
 (defun rv-encode-b-type (imm13 rs2 rs1 funct3 opcode)
   "Encode a B-type instruction. IMM13 is a signed 13-bit offset (bit 0 always 0).
    Layout: [imm[12]][imm[10:5]] | rs2 | rs1 | funct3 | [imm[4:1]][imm[11]] | opcode"
+  (unless (<= -4096 imm13 4095)
+    (error "RISC-V B-type imm13 ~D out of range [-4096, 4095] — ~
+            would silently truncate to ±4KB conditional branch"
+           imm13))
   (let ((imm (logand imm13 #x1FFF)))
     (logior (ash (logand (ash imm -12) #x01) 31)   ; imm[12]
             (ash (logand (ash imm -5) #x3F) 25)    ; imm[10:5]
@@ -179,6 +183,10 @@
 (defun rv-encode-j-type (imm21 rd opcode)
   "Encode a J-type instruction. IMM21 is a signed 21-bit offset (bit 0 always 0).
    Layout: [imm[20]][imm[10:1]][imm[11]][imm[19:12]] | rd | opcode"
+  (unless (<= -1048576 imm21 1048575)
+    (error "RISC-V J-type imm21 ~D out of range [-1MB, 1MB-1] — ~
+            would silently truncate JAL/J branch"
+           imm21))
   (let ((imm (logand imm21 #x1FFFFF)))
     (logior (ash (logand (ash imm -20) #x01) 31)   ; imm[20]
             (ash (logand (ash imm -1) #x3FF) 21)   ; imm[10:1]

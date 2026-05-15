@@ -280,9 +280,24 @@
    pointer; (funcall <that> ...) silently returns wrong values).
    Symbol values (e.g. :test 'equal) are resolved via symbol-function.
    Per CLHS 3.4.1.4.1, when the same keyword appears multiple times the
-   LEFTMOST occurrence supplies the value."
-  (let ((test-fn nil) (key-fn nil) (test-set nil) (key-set nil) (a args))
+   LEFTMOST occurrence supplies the value.
+
+   Per CLHS §3.4.1.4: an odd number of keyword args or an unknown
+   keyword (with :allow-other-keys NIL/absent) signals PROGRAM-ERROR.
+   Caller is responsible for not invoking this on non-keyword-shaped
+   plists (e.g. ADJOIN takes a plain `&rest args` and forwards here)."
+  (let ((test-fn nil) (key-fn nil) (test-set nil) (key-set nil)
+        (allow-other-keys nil) (a args))
+    ;; First pass: look for :allow-other-keys so we know whether to
+    ;; signal on unknown keyword.  CLHS §3.4.1.4.1.1.
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (eq (car p) :allow-other-keys)
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (setq p (cdr p))))
     (loop (when (null a) (return))
+      ;; Odd-length plist — final keyword with no value.
+      (when (null (cdr a)) (%signal-program-error))
       (cond ((eq (car a) :test)
              (unless test-set
                (setq test-fn (%resolve-fn (cadr a)))
@@ -303,7 +318,14 @@
             ((eq (car a) :start) (setq a (cddr a)))
             ((eq (car a) :end) (setq a (cddr a)))
             ((eq (car a) :from-end) (setq a (cddr a)))
-            (t (setq a (cdr a)))))
+            ((eq (car a) :allow-other-keys) (setq a (cddr a)))
+            (t
+             ;; Unknown keyword.  Per ANSI, signal PROGRAM-ERROR unless
+             ;; :allow-other-keys is non-nil.  Also, a non-keyword
+             ;; (non-symbol or symbol not in keyword position) is itself
+             ;; an error per CLHS §3.4.1.5 — covers (INTERSECTION NIL NIL 1 2).
+             (unless allow-other-keys (%signal-program-error))
+             (setq a (cddr a)))))
     (cons test-fn key-fn)))
 
 ;; Full ANSI parse: (count from-end start end test-fn test-not-fn key-fn).

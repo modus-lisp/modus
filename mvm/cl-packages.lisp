@@ -283,22 +283,30 @@
     (cons *pkg-tag* data)))
 
 (defun make-package (name &rest args)
-  "Create a new package with NAME."
+  "Create a new package with NAME.
+   Per CLHS: signals PROGRAM-ERROR on odd-length plist or unknown
+   keyword unless :allow-other-keys is non-nil."
   (let ((name-str (%pkg-string-designator name))
         (nicknames nil)
         (use-list nil)
+        (allow-other-keys nil)
         (a args))
+    ;; Probe :allow-other-keys.
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (eq (car p) :allow-other-keys)
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (setq p (cdr p))))
     ;; Parse keyword args
     (loop
       (when (null a) (return nil))
+      (when (null (cdr a)) (%signal-program-error))
       (cond
-        ((eq (car a) :nicknames)
-         (setq nicknames (cadr a))
-         (setq a (cddr a)))
-        ((eq (car a) :use)
-         (setq use-list (cadr a))
-         (setq a (cddr a)))
-        (t (setq a (cddr a)))))
+        ((eq (car a) :nicknames)         (setq nicknames (cadr a)))
+        ((eq (car a) :use)               (setq use-list (cadr a)))
+        ((eq (car a) :allow-other-keys)  nil)
+        (t (unless allow-other-keys (%signal-program-error))))
+      (setq a (cddr a)))
     ;; Check for existing package
     (when (find-package name-str)
       (return-from make-package (find-package name-str)))

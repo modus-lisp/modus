@@ -1317,14 +1317,30 @@
       nil)))
 
 (defun nstring-parse-start-end (args len)
-  "Parse :start/:end keyword args from ARGS plist. Returns (start . end)."
-  (let ((start 0) (end len))
+  "Parse :start/:end keyword args from ARGS plist. Returns (start . end).
+   Per CLHS §3.4.1.4: an odd-length plist, an unknown keyword (with
+   :allow-other-keys NIL/absent), or :end with a NIL-trailing pair
+   signals PROGRAM-ERROR.  ANSI tests like NSTRING-UPCASE.ERROR.5
+   call (NSTRING-UPCASE str :BAD T) expecting that to signal."
+  (let ((start 0) (end len)
+        (allow-other-keys nil))
+    ;; First pass: probe for :allow-other-keys (CLHS §3.4.1.4.1.1).
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (eq (car p) :allow-other-keys)
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (setq p (cdr p))))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
+        ;; Odd plist — keyword with no value.
+        (when (null (cdr cur)) (%signal-program-error))
         (let ((key (car cur)) (val (cadr cur)))
-          (if (eq key :start) (setq start val)
-            (if (eq key :end) (when val (setq end val)))))
+          (cond
+            ((eq key :start) (when val (setq start val)))
+            ((eq key :end)   (when val (setq end val)))
+            ((eq key :allow-other-keys) nil)
+            (t (unless allow-other-keys (%signal-program-error)))))
         (setq cur (cddr cur))))
     (cons start end)))
 

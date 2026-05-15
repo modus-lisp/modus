@@ -1951,11 +1951,27 @@
 
 ;;; String operations
 (defun make-string (size &rest args)
-  "Make a string of SIZE filled with spaces (or :initial-element)."
-  (let ((ch 32) (a args))
-    (loop (when (null a) (return))
-      (when (eq (car a) :initial-element) (setq ch (char-code (cadr a))) (return))
-      (setq a (cddr a)))
+  "Make a string of SIZE filled with spaces (or :initial-element).
+   Per CLHS: validates &key args; signals PROGRAM-ERROR on odd plist
+   or unknown keyword (with :allow-other-keys NIL/absent).  Recognised
+   keywords are :initial-element and :element-type (the latter is
+   accepted but not interpreted — Modus has one string element type)."
+  (let ((ch 32) (allow-other-keys nil))
+    ;; Probe :allow-other-keys.
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (eq (car p) :allow-other-keys)
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (setq p (cdr p))))
+    (let ((a args))
+      (loop (when (null a) (return))
+        (when (null (cdr a)) (%signal-program-error))
+        (cond
+          ((eq (car a) :initial-element) (setq ch (char-code (cadr a))))
+          ((eq (car a) :element-type)    nil)
+          ((eq (car a) :allow-other-keys) nil)
+          (t (unless allow-other-keys (%signal-program-error))))
+        (setq a (cddr a))))
     (let ((s (%make-string-array size)))
       (dotimes (i size) (aset s i ch))
       s)))

@@ -1352,28 +1352,23 @@
   "Intern a symbol by name hash. Returns existing symbol if already interned.
    Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate.
 
-   NOTE on a known GC hazard kept-as-is for now: %make-symbol can trigger
-   GC, which moves the hash table to to-space and updates the root slot
-   at #x10000088.  Our local `table` binding is just a register/frame
-   value (not GC-tracked) so it ends up pointing at the from-space copy,
-   and the (puthash ... table sym) below writes the new entry into a
-   table that gets reclaimed at the next collection.  The symptom is
-   non-deterministic: future `'foo` references re-allocate a fresh
-   symbol, eq between two `'foo` literals returns NIL, and CLOS marker
-   checks ((eq (aref instance 0) '%clos-instance)) misclassify.
-
-   The straightforward fix is to re-read the table from #x10000088 after
-   %make-symbol.  When tried it shifted layout enough to net-regress
-   the ANSI run by 159 tests (chunk-crash cascade in AREF.* / ARRAY.*),
-   so it's not deployed here yet.  Revisit after the layout-stability
-   work makes a one-instruction predicate-body change safe."
+   GC-safety: %make-symbol can trigger GC, which moves the hash table
+   to to-space and updates the root slot at #x10000088.  We re-read
+   the root AFTER the allocation so the puthash writes into the live
+   to-space copy rather than the about-to-be-reclaimed from-space
+   copy.  Without this, future `'foo` references re-allocate a fresh
+   symbol, (eq 'foo 'foo) returns NIL, and CLOS marker checks
+   ((eq (aref instance 0) '%clos-instance)) misclassify."
   (let ((table (mem-ref #x10000088 :u64)))
     (let ((existing (gethash name-hash table)))
       (if existing
           existing
           (let ((sym (%make-symbol)))
             (aset sym 0 name-hash)
-            (puthash name-hash table sym)
+            ;; Re-read the root — GC during %make-symbol may have moved
+            ;; the table object and updated the root slot.
+            (let ((live-table (mem-ref #x10000088 :u64)))
+              (puthash name-hash live-table sym))
             sym)))))
 
 (defun %intern-keyword (name-hash)
@@ -1390,7 +1385,10 @@
           existing
           (let ((kw (%make-keyword-obj)))
             (aset kw 0 name-hash)
-            (puthash name-hash table kw)
+            ;; Re-read the root (see %intern-symbol comment) — GC during
+            ;; %make-keyword-obj may have relocated the table.
+            (let ((live-table (mem-ref #x10000148 :u64)))
+              (puthash name-hash live-table kw))
             kw)))))
 
 ;;; ============================================================

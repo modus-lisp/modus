@@ -165,3 +165,77 @@ crash immediately.  Recommended order:
 The branch-offset asserts (committed earlier as the precursor) will
 catch any layout-induced regression at build time instead of as a
 mystery crash, so the tag work is well-scaffolded for landing.
+
+## First-attempt notes (`b9efb17` → reverted in `b7fe791`)
+
+Tried the minimal x64 tag-add per "Implementation steps" above.
+Build succeeded, no branch-offset asserts fired (the precursor work
+held).  Linux/x64 sharded run delta:
+
+  Before: P=11576 / F=5881 / lost=235  SIGSEGVs=549
+  After:  P=11527 / F=5930 / lost=235  SIGSEGVs=780
+
+By unique-ID comparison: +52 newly passing, -50 newly broken = +2
+net.  The dominant pre-tag SIGSEGV signature (~125 occurrences from
+RUN-ANSI-POP$$LAMBDA66106 indirect calls) WAS eliminated — that's
+the funcall-tag-collision class going away.  But a new dominant
+signature took its place: ~125 occurrences of RIP/4=933969919, which
+decodes to RIP = 0xDEACFFFE = NIL - 3.
+
+That signature is `sub rax, 3; call rax` where rax = NIL — i.e.,
+`(funcall NIL)` from somewhere in the CLOS allocate-instance /
+change-class path (test ids 26908+).  Pre-tag, the same paths
+called NIL directly and SOMEHOW didn't crash — likely the SIGSEGV
+landed at NIL (= 0xDEAD0001) which is mapped (one of the address
+slots), so the fault was recoverable via handler-case longjmp.
+Post-tag at NIL-3 the fault is on a different / unmapped page and
+the longjmp recovery doesn't catch as cleanly.
+
+What this means for the next attempt:
+
+1. **The collision IS structural and the dodge IS load-bearing.**
+   Removing the dodge AND adding tag works (`*x64-native-code-offset*`
+   alignment loosened from "avoid nibble 1/9" to "require nibble 0"
+   was correct).
+
+2. **NIL-funcall recovery has architecture-dependent latency.**
+   Pre-tag NIL=0xDEAD0001 happens to be in a mapped page; the
+   SIGSEGV handler at 0x4F0820 longjmps to handler-case successfully.
+   Post-tag NIL-3=0xDEACFFFE is at the END of the page-before-NIL
+   (or the start of an unmapped page) — different fault mechanics.
+   Need to audit cl-eval.lisp's SIGSEGV stub for "fault address
+   near NIL" handling, or have compile-funcall test for NIL/T
+   explicitly before calling.  CCL handles this with `fulltag-nil = 11`
+   (separate tag for NIL alone) and tests for it in funcall.
+
+3. **Closures may need slot-0 audit.**  The `(emit-ir :obj-ref
+   fn-call-reg fn-call-reg 0)` extracts the function from a closure
+   and call-indirect strips the tag.  If %make-closure stored a
+   tagged value (which it does, since fn-form compiles via LI-FUNC),
+   the obj-ref returns tagged, call strips, correct.  Verified
+   working on regular closures; CLOS method functions stored in
+   `(cons qual (cons specs fn))` cells are NOT obj-refs but cddr
+   accesses — those return whatever was stored by %make-method,
+   which is the value passed in by defmethod's compile path.  Need
+   to confirm that path also produces a tagged value.
+
+4. **Audit `eq` on fn-pointers.**  Any code that compares
+   `(eq #'FOO stored-fn)` requires both sides to be tagged
+   consistently.  If one side comes from `(symbol-function 'FOO)`
+   (table lookup, tagged) and the other from `#'FOO` directly
+   (LI-FUNC, tagged), good.  But if any path manufactures a raw
+   fn-addr (e.g., via a cross.lisp emit-fn-addr that doesn't go
+   through LI-FUNC), the comparison fails.
+
+Plan for next attempt: same minimal tag-add, PLUS explicit
+NIL/T-funcall guard in compile-funcall:
+```
+(emit-ir :cmp fn-call-reg +vreg-vn+)
+(emit-ir :beq nil-funcall-label)
+;; ... existing dispatch ...
+nil-funcall-label:
+(emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
+```
+This converts the NIL-funcall fault into a clean condition signal
+that handler-case catches the same way as today.  Add the same
+guard for the T sentinel.

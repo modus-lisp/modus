@@ -5917,33 +5917,68 @@
 ;;; ============================================================
 
 (defun compile-car (arg env dest)
-  "Compile (car x). Null-only short-circuit version.
-   Full consp-check works now (after the compile-syscall3 fix) but
-   regresses ~64 passes net because legitimate ANSI tests that
-   relied on (car non-cons) returning lax garbage are now rejected."
+  "Compile (car x).  ANSI: (car NIL) → NIL; (car cons) → car-slot;
+   (car X) for any other X signals TYPE-ERROR.  Inlined with a tag
+   check so the common cons path is one branch + one load.
+
+   Static optimization: a quoted non-cons-non-NIL literal compiles
+   directly to %signal-type-error without emitting the runtime
+   guard."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
      (compile-form '(%signal-type-error) env dest))
     (t
      (compile-form arg env dest)
-     (let ((done (make-compiler-label)))
-       (emit-ir :bnull dest done)
-       (emit-ir :car dest dest)
-       (emit-ir-label done)))))
+     (compile-cxr-guard-and-deref :car dest env))))
 
 (defun compile-cdr (arg env dest)
-  "Compile (cdr x). Same null short-circuit."
+  "Compile (cdr x).  ANSI: (cdr NIL) → NIL; (cdr cons) → cdr-slot;
+   (cdr X) for any other X signals TYPE-ERROR.  Mirrors compile-car."
   (cond
     ((and (consp arg) (eq (car arg) 'quote)
           (not (null (cadr arg))) (not (consp (cadr arg))))
      (compile-form '(%signal-type-error) env dest))
     (t
      (compile-form arg env dest)
-     (let ((done (make-compiler-label)))
-       (emit-ir :bnull dest done)
-       (emit-ir :cdr dest dest)
-       (emit-ir-label done)))))
+     (compile-cxr-guard-and-deref :cdr dest env))))
+
+(defun compile-cxr-guard-and-deref (op dest env)
+  "Helper for compile-car and compile-cdr.  Assumes the input value
+   is already in DEST.  Emits:
+     if dest == NIL    → result = NIL
+     elif (consp dest) → result = (op dest)        ; op is :car or :cdr
+     else              → (%signal-type-error)
+   On unhandled fall-through (handler-case absent and %signal-type-error
+   returns NIL) the value left in DEST is NIL — matches the CLHS
+   suggestion that error-recovery should yield a defined value."
+  (declare (ignore env))
+  (let ((null-label  (make-compiler-label))
+        (cons-label  (make-compiler-label))
+        (error-label (make-compiler-label))
+        (done-label  (make-compiler-label))
+        (tag-reg     (alloc-temp-reg)))
+    ;; NIL short-circuit.
+    (emit-ir :bnull dest null-label)
+    ;; consp dest → tag-reg (T / NIL).
+    (emit-ir :consp tag-reg dest)
+    (emit-ir :bnull tag-reg error-label)
+    ;; Cons path: inline :car / :cdr.
+    (emit-ir-label cons-label)
+    (emit-ir op dest dest)
+    (emit-ir :br done-label)
+    ;; NIL path.
+    (emit-ir-label null-label)
+    (emit-ir :mov dest +vreg-vn+)
+    (emit-ir :br done-label)
+    ;; Non-cons-non-NIL: signal TYPE-ERROR.  %signal-type-error
+    ;; longjmps when a handler-case is active; otherwise it returns
+    ;; NIL and we fall through to done with dest = NIL.
+    (emit-ir-label error-label)
+    (emit-ir :call "%SIGNAL-TYPE-ERROR" 0)
+    (emit-ir :mov dest +vreg-vr+)
+    (emit-ir-label done-label)
+    (free-temp-reg)))
 
 (defun compile-arity-error (env dest)
   "Emit a 0-arg call to %SIGNAL-PROGRAM-ERROR at runtime — used when an
@@ -6010,31 +6045,25 @@
 
 ;; Compound accessors
 
-;;; Compound accessors route through %safe-car / %safe-cdr so a
-;;; non-cons argument signals TYPE-ERROR (caught by handler-case) instead
-;;; of dereferencing into the symbol header / fixnum body / etc.  Bare
-;;; :car / :cdr would either return garbage from a valid-but-non-cons
-;;; pointer (symbol, string, object) or SIGSEGV on a fixnum — only the
-;;; SIGSEGV path is caught by the signal handler; the silent-garbage
-;;; path leaves (caar 'A) returning the symbol header word and the
-;;; test's surrounding (handler-case ... (error (c) t)) never fires,
-;;; producing GOT:NIL EXP:T failures.  Routing through the helpers
-;;; closes that whole class.
+;;; Compound accessors are inlined as two nested (car/cdr) operations.
+;;; compile-car and compile-cdr each emit a NIL / consp / type-error
+;;; guard around their inline :car / :cdr op, so the compound form is
+;;; correct without any function-call overhead.
 (defun compile-caar (arg env dest)
-  "Compile (caar x) → (%safe-car (%safe-car x))."
-  (compile-form `(%safe-car (%safe-car ,arg)) env dest))
+  "Compile (caar x) → (car (car x))."
+  (compile-form `(car (car ,arg)) env dest))
 
 (defun compile-cadr (arg env dest)
-  "Compile (cadr x) → (%safe-car (%safe-cdr x))."
-  (compile-form `(%safe-car (%safe-cdr ,arg)) env dest))
+  "Compile (cadr x) → (car (cdr x))."
+  (compile-form `(car (cdr ,arg)) env dest))
 
 (defun compile-cdar (arg env dest)
-  "Compile (cdar x) → (%safe-cdr (%safe-car x))."
-  (compile-form `(%safe-cdr (%safe-car ,arg)) env dest))
+  "Compile (cdar x) → (cdr (car x))."
+  (compile-form `(cdr (car ,arg)) env dest))
 
 (defun compile-cddr (arg env dest)
-  "Compile (cddr x) → (%safe-cdr (%safe-cdr x))."
-  (compile-form `(%safe-cdr (%safe-cdr ,arg)) env dest))
+  "Compile (cddr x) → (cdr (cdr x))."
+  (compile-form `(cdr (cdr ,arg)) env dest))
 
 ;;; ============================================================
 ;;; Bitwise Operations

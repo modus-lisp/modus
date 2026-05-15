@@ -2335,12 +2335,14 @@
    non-nil somewhere in the plist).  Helper for sequence/list ops that
    pluck individual keys via %find-key-arg and would otherwise silently
    accept (SET-DIFFERENCE NIL NIL :BAD T)."
-  (let ((allow-other-keys nil))
-    ;; First pass: probe :allow-other-keys.
+  (let ((allow-other-keys nil) (aok-set nil))
+    ;; First pass: probe :allow-other-keys (leftmost wins per CLHS
+    ;; §3.4.1.4.1.1.2).
     (let ((p args))
       (loop (when (null p) (return))
-        (when (eq (car p) :allow-other-keys)
-          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
         (setq p (cdr p))))
     (let ((cur args))
       (loop

@@ -287,13 +287,15 @@
    Caller is responsible for not invoking this on non-keyword-shaped
    plists (e.g. ADJOIN takes a plain `&rest args` and forwards here)."
   (let ((test-fn nil) (key-fn nil) (test-set nil) (key-set nil)
-        (allow-other-keys nil) (a args))
-    ;; First pass: look for :allow-other-keys so we know whether to
-    ;; signal on unknown keyword.  CLHS §3.4.1.4.1.1.
+        (allow-other-keys nil) (aok-set nil) (a args))
+    ;; First pass: look for :allow-other-keys (leftmost wins per
+    ;; CLHS §3.4.1.4.1.1.2) so we know whether to signal on unknown
+    ;; keyword.
     (let ((p args))
       (loop (when (null p) (return))
-        (when (eq (car p) :allow-other-keys)
-          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
         (setq p (cdr p))))
     (loop (when (null a) (return))
       ;; Odd-length plist — final keyword with no value.
@@ -1723,12 +1725,14 @@
    (unless :allow-other-keys is non-nil).  Type-error on non-sequence
    SEQ is handled by the (consp …) / (length …) dispatch below: if
    SEQ is neither a cons nor a sequence, (length SEQ) signals."
-  (let ((start 0) (end nil) (allow-other-keys nil))
-    ;; Probe :allow-other-keys.
+  (let ((start 0) (end nil) (allow-other-keys nil) (aok-set nil))
+    ;; Probe :allow-other-keys.  CLHS §3.4.1.4.1.1.2: when multiple
+    ;; :allow-other-keys appear, the LEFTMOST supplies the value.
     (let ((p args))
       (loop (when (null p) (return))
-        (when (eq (car p) :allow-other-keys)
-          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
         (setq p (cdr p))))
     (let ((a args))
       (loop (when (null a) (return))
@@ -1970,12 +1974,13 @@
    or unknown keyword (with :allow-other-keys NIL/absent).  Recognised
    keywords are :initial-element and :element-type (the latter is
    accepted but not interpreted — Modus has one string element type)."
-  (let ((ch 32) (allow-other-keys nil))
-    ;; Probe :allow-other-keys.
+  (let ((ch 32) (allow-other-keys nil) (aok-set nil))
+    ;; Probe :allow-other-keys.  CLHS §3.4.1.4.1.1.2: leftmost wins.
     (let ((p args))
       (loop (when (null p) (return))
-        (when (eq (car p) :allow-other-keys)
-          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
         (setq p (cdr p))))
     (let ((a args))
       (loop (when (null a) (return))

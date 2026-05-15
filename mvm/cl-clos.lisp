@@ -1323,12 +1323,14 @@
    signals PROGRAM-ERROR.  ANSI tests like NSTRING-UPCASE.ERROR.5
    call (NSTRING-UPCASE str :BAD T) expecting that to signal."
   (let ((start 0) (end len)
-        (allow-other-keys nil))
-    ;; First pass: probe for :allow-other-keys (CLHS §3.4.1.4.1.1).
+        (allow-other-keys nil) (aok-set nil))
+    ;; First pass: probe for :allow-other-keys (CLHS §3.4.1.4.1.1.2:
+    ;; leftmost wins).
     (let ((p args))
       (loop (when (null p) (return))
-        (when (eq (car p) :allow-other-keys)
-          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
         (setq p (cdr p))))
     (let ((cur args))
       (loop

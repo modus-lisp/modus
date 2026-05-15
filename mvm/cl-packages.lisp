@@ -290,12 +290,14 @@
         (nicknames nil)
         (use-list nil)
         (allow-other-keys nil)
+        (aok-set nil)
         (a args))
-    ;; Probe :allow-other-keys.
+    ;; Probe :allow-other-keys (leftmost wins per CLHS §3.4.1.4.1.1.2).
     (let ((p args))
       (loop (when (null p) (return))
-        (when (eq (car p) :allow-other-keys)
-          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
         (setq p (cdr p))))
     ;; Parse keyword args
     (loop

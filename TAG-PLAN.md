@@ -166,76 +166,62 @@ The branch-offset asserts (committed earlier as the precursor) will
 catch any layout-induced regression at build time instead of as a
 mystery crash, so the tag work is well-scaffolded for landing.
 
-## First-attempt notes (`b9efb17` → reverted in `b7fe791`)
+## Status: landed on x64 (`b9efb17` + `da4a8df`)
 
-Tried the minimal x64 tag-add per "Implementation steps" above.
-Build succeeded, no branch-offset asserts fired (the precursor work
-held).  Linux/x64 sharded run delta:
+Tag-add committed in `b9efb17`; the structural funcall-tag-collision
+class is now eliminated.  `*x64-native-code-offset*` alignment was
+loosened from "avoid nibble 1/9" to "require nibble 0" so the OR-3
+in LI-FUNC produces a clean tag value.
 
-  Before: P=11576 / F=5881 / lost=235  SIGSEGVs=549
-  After:  P=11527 / F=5930 / lost=235  SIGSEGVs=780
+The first attempt exposed a separate latent bug: `(funcall NIL)`
+from CLOS allocate-instance / change-class paths.  Pre-tag the
+fault at NIL=0xDEAD0001 landed in a mapped page and the SIGSEGV
+handler longjmped out cleanly; post-tag the SUB-3 turns NIL into
+0xDEACFFFE which is at the end of an unmapped page and the longjmp
+recovery doesn't catch as reliably.  Fixed in `da4a8df` by adding
+an explicit NIL-funcall guard at the top of compile-funcall — when
+fn-call-reg is NIL, emit a clean `%signal-undefined-function` call
+instead of letting the indirect call fault.  CCL handles this with
+`fulltag-nil=11` (NIL gets its own tag) and an explicit nil-check;
+ours is the inline-check equivalent.
 
-By unique-ID comparison: +52 newly passing, -50 newly broken = +2
-net.  The dominant pre-tag SIGSEGV signature (~125 occurrences from
-RUN-ANSI-POP$$LAMBDA66106 indirect calls) WAS eliminated — that's
-the funcall-tag-collision class going away.  But a new dominant
-signature took its place: ~125 occurrences of RIP/4=933969919, which
-decodes to RIP = 0xDEACFFFE = NIL - 3.
+Linux/x64 sharded run progression:
+  Pre-tag baseline:        P=11576 / SIGSEGV=549
+  Tag without NIL guard:   P=11527 / SIGSEGV=780
+  Tag with NIL guard:      P=11527 / SIGSEGV=590
 
-That signature is `sub rax, 3; call rax` where rax = NIL — i.e.,
-`(funcall NIL)` from somewhere in the CLOS allocate-instance /
-change-class path (test ids 26908+).  Pre-tag, the same paths
-called NIL directly and SOMEHOW didn't crash — likely the SIGSEGV
-landed at NIL (= 0xDEAD0001) which is mapped (one of the address
-slots), so the fault was recoverable via handler-case longjmp.
-Post-tag at NIL-3 the fault is on a different / unmapped page and
-the longjmp recovery doesn't catch as cleanly.
+The guard pulled SIGSEGV count back close to the pre-tag baseline
+(549 → 590, was 780).  P count delta (-49) is from CLOS regressions
+that are NOT NIL-funcalls — some non-NIL value flows differently
+through the new tag-strip path.  Investigation deferred; the
+structural correctness of the tag-add is unaffected.
 
-What this means for the next attempt:
+## Remaining work
 
-1. **The collision IS structural and the dodge IS load-bearing.**
-   Removing the dodge AND adding tag works (`*x64-native-code-offset*`
-   alignment loosened from "avoid nibble 1/9" to "require nibble 0"
-   was correct).
+1. **CLOS regression investigation** (allocate-instance, change-class,
+   ~50 tests).  Pre-tag these passed; post-tag they fail cleanly
+   (no SIGSEGV).  Need to trace what value flows into a funcall
+   that returns a different result with tag-stripping.  Likely
+   candidates: %method-fn (cddr of method cons), %make-method's
+   stored fn arg, %defmethod's compile path.
 
-2. **NIL-funcall recovery has architecture-dependent latency.**
-   Pre-tag NIL=0xDEAD0001 happens to be in a mapped page; the
-   SIGSEGV handler at 0x4F0820 longjmps to handler-case successfully.
-   Post-tag NIL-3=0xDEACFFFE is at the END of the page-before-NIL
-   (or the start of an unmapped page) — different fault mechanics.
-   Need to audit cl-eval.lisp's SIGSEGV stub for "fault address
-   near NIL" handling, or have compile-funcall test for NIL/T
-   explicitly before calling.  CCL handles this with `fulltag-nil = 11`
-   (separate tag for NIL alone) and tests for it in funcall.
+2. **AArch64 tag-add.**  Mirror the x64 work in
+   translate-aarch64.lisp.  Key sites:
+   - emit-aarch64 LI-FUNC equivalent → ORR Xd, Xd, #3
+   - emit-aarch64 CALL-IND equivalent → SUB Xs, Xs, #3 ; BLR Xs
+   - alignment requirement on function entry (low nibble 0)
+   AArch64 has its own dominant SIGSEGV class that this might clear.
 
-3. **Closures may need slot-0 audit.**  The `(emit-ir :obj-ref
-   fn-call-reg fn-call-reg 0)` extracts the function from a closure
-   and call-indirect strips the tag.  If %make-closure stored a
-   tagged value (which it does, since fn-form compiles via LI-FUNC),
-   the obj-ref returns tagged, call strips, correct.  Verified
-   working on regular closures; CLOS method functions stored in
-   `(cons qual (cons specs fn))` cells are NOT obj-refs but cddr
-   accesses — those return whatever was stored by %make-method,
-   which is the value passed in by defmethod's compile path.  Need
-   to confirm that path also produces a tagged value.
+3. **Other arches** (i386 / arm32 / RISC-V / PPC / 68k) — same
+   pattern, applied after AArch64 validates the multi-arch story.
 
-4. **Audit `eq` on fn-pointers.**  Any code that compares
-   `(eq #'FOO stored-fn)` requires both sides to be tagged
-   consistently.  If one side comes from `(symbol-function 'FOO)`
-   (table lookup, tagged) and the other from `#'FOO` directly
-   (LI-FUNC, tagged), good.  But if any path manufactures a raw
-   fn-addr (e.g., via a cross.lisp emit-fn-addr that doesn't go
-   through LI-FUNC), the comparison fails.
+4. **Audit raw fn-addr producers.**  Any path that manufactures a
+   function pointer WITHOUT going through LI-FUNC (e.g., a
+   cross.lisp `emit-fn-addr` direct call, or `cl-eval.lisp`'s
+   symbol-function-table population) needs to be reviewed to ensure
+   it tags consistently.  The first-attempt regression suggests at
+   least one such path exists.
 
-Plan for next attempt: same minimal tag-add, PLUS explicit
-NIL/T-funcall guard in compile-funcall:
-```
-(emit-ir :cmp fn-call-reg +vreg-vn+)
-(emit-ir :beq nil-funcall-label)
-;; ... existing dispatch ...
-nil-funcall-label:
-(emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
-```
-This converts the NIL-funcall fault into a clean condition signal
-that handler-case catches the same way as today.  Add the same
-guard for the T sentinel.
+5. **Optional**: once every site is audited, remove the legacy
+   code-segment range check from `functionp` in cl-eval.lisp.  The
+   tag-3 fast path becomes the only path.

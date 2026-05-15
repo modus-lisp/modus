@@ -1291,21 +1291,27 @@
           `(not (= ,(cadr form) ,(caddr form)))
           '(%signal-program-error))))
 
-  ;; CADDR, CDDDR, CADDDR — extended car/cdr compositions
+  ;; CADDR, CDDDR, CADDDR — extended car/cdr compositions.
+  ;; Use %safe-car / %safe-cdr (with consp checks) at each step rather
+  ;; than bare car/cdr/cddr.  Without this, (caddr '(a c . b)) walks
+  ;; (cddr) down to the symbol B, then (car B) reads the symbol header
+  ;; word as garbage instead of signalling TYPE-ERROR — the
+  ;; (handler-case ... (error (c) t)) wrapper in `signal-error` ANSI
+  ;; tests (e.g. CADDR.ERROR.6) never fires, GOT:NIL EXP:T.
   (mvm-define-macro "CADDR"
     (lambda (form)
       (if (= (length form) 2)
-          `(car (cddr ,(cadr form)))
+          `(%safe-car (%safe-cdr (%safe-cdr ,(cadr form))))
           '(%signal-program-error))))
   (mvm-define-macro "CDDDR"
     (lambda (form)
       (if (= (length form) 2)
-          `(cdr (cddr ,(cadr form)))
+          `(%safe-cdr (%safe-cdr (%safe-cdr ,(cadr form))))
           '(%signal-program-error))))
   (mvm-define-macro "CADDDR"
     (lambda (form)
       (if (= (length form) 2)
-          `(car (cdr (cddr ,(cadr form))))
+          `(%safe-car (%safe-cdr (%safe-cdr (%safe-cdr ,(cadr form)))))
           '(%signal-program-error))))
 
   ;; PUSH — (push item place) → (setq place (cons item place))
@@ -6004,29 +6010,31 @@
 
 ;; Compound accessors
 
+;;; Compound accessors route through %safe-car / %safe-cdr so a
+;;; non-cons argument signals TYPE-ERROR (caught by handler-case) instead
+;;; of dereferencing into the symbol header / fixnum body / etc.  Bare
+;;; :car / :cdr would either return garbage from a valid-but-non-cons
+;;; pointer (symbol, string, object) or SIGSEGV on a fixnum — only the
+;;; SIGSEGV path is caught by the signal handler; the silent-garbage
+;;; path leaves (caar 'A) returning the symbol header word and the
+;;; test's surrounding (handler-case ... (error (c) t)) never fires,
+;;; producing GOT:NIL EXP:T failures.  Routing through the helpers
+;;; closes that whole class.
 (defun compile-caar (arg env dest)
-  "Compile (caar x) = (car (car x))"
-  (compile-form arg env dest)
-  (emit-ir :car dest dest)
-  (emit-ir :car dest dest))
+  "Compile (caar x) → (%safe-car (%safe-car x))."
+  (compile-form `(%safe-car (%safe-car ,arg)) env dest))
 
 (defun compile-cadr (arg env dest)
-  "Compile (cadr x) = (car (cdr x))"
-  (compile-form arg env dest)
-  (emit-ir :cdr dest dest)
-  (emit-ir :car dest dest))
+  "Compile (cadr x) → (%safe-car (%safe-cdr x))."
+  (compile-form `(%safe-car (%safe-cdr ,arg)) env dest))
 
 (defun compile-cdar (arg env dest)
-  "Compile (cdar x) = (cdr (car x))"
-  (compile-form arg env dest)
-  (emit-ir :car dest dest)
-  (emit-ir :cdr dest dest))
+  "Compile (cdar x) → (%safe-cdr (%safe-car x))."
+  (compile-form `(%safe-cdr (%safe-car ,arg)) env dest))
 
 (defun compile-cddr (arg env dest)
-  "Compile (cddr x) = (cdr (cdr x))"
-  (compile-form arg env dest)
-  (emit-ir :cdr dest dest)
-  (emit-ir :cdr dest dest))
+  "Compile (cddr x) → (%safe-cdr (%safe-cdr x))."
+  (compile-form `(%safe-cdr (%safe-cdr ,arg)) env dest))
 
 ;;; ============================================================
 ;;; Bitwise Operations

@@ -1341,12 +1341,20 @@
   (if (consp x) (cdr x)
       (if (null x) nil (%signal-type-error))))
 
+;; 3-letter cXXr — the 2-letter forms (CAAR/CADR/CDAR/CDDR) are routed
+;; through %safe-car/%safe-cdr in compile-caar etc. (mvm/compiler.lisp);
+;; CADDR and CDDDR get safer defuns here so 4-letter forms built on top
+;; of them inherit the type-check.  runtime/cons.lisp defines a lax
+;; (car (cdr (cdr x))) version of CADDR — last-defun-wins so this
+;; override takes effect at runtime.
 (defun caaar (x) (%safe-car (%safe-car (%safe-car x))))
 (defun caadr (x) (%safe-car (%safe-car (%safe-cdr x))))
 (defun cadar (x) (%safe-car (%safe-cdr (%safe-car x))))
+(defun caddr (x) (%safe-car (%safe-cdr (%safe-cdr x))))
 (defun cdaar (x) (%safe-cdr (%safe-car (%safe-car x))))
 (defun cdadr (x) (%safe-cdr (%safe-car (%safe-cdr x))))
 (defun cddar (x) (%safe-cdr (%safe-cdr (%safe-car x))))
+(defun cdddr (x) (%safe-cdr (%safe-cdr (%safe-cdr x))))
 
 (defun caaaar (x) (%safe-car (caaar x)))
 (defun caaadr (x) (%safe-car (caadr x)))

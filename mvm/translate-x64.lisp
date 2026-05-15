@@ -2097,14 +2097,21 @@
                (emit-call buf (make-label)))))
 
         ((op= +op-call-ind+)
-         ;; (call-ind Vs) — indirect call through register
+         ;; (call-ind Vs) — indirect call through register.
+         ;; Vs holds a tagged function pointer (tag = 3, see TAG-PLAN.md).
+         ;; Strip the tag with SUB reg, 3 before the indirect call.
+         ;; If Vs was untagged (e.g. came from an obj-ref slot that
+         ;; stored a raw addr — closure slot-0 should now be tagged
+         ;; too) the call would land 3 bytes before the function and
+         ;; almost certainly fault, which is fine — it's a type error
+         ;; the caller has to fix.
          (let* ((vs (first operands))
-                (ps (vreg-phys vs)))
-           (if ps
-               (emit-call-reg buf ps)
-               (progn
-                 (emit-load-vreg buf vs +scratch-reg+)
-                 (emit-call-reg buf +scratch-reg+)))))
+                (ps (vreg-phys vs))
+                (call-reg (or ps +scratch-reg+)))
+           (unless ps
+             (emit-load-vreg buf vs +scratch-reg+))
+           (emit-sub-reg-imm buf call-reg 3)
+           (emit-call-reg buf call-reg)))
 
         ((op= +op-ret+)
          ;; Return: restore RBX, tear down frame and return
@@ -2521,7 +2528,10 @@
         ;; ============================================
         ((op= +op-fn-addr+)
          ;; (fn-addr Vd target:imm32)
-         ;; Load the native address of a function into Vd.
+         ;; Load the native address of a function into Vd, tagged with
+         ;; +tag-function+ (= 3) so funcall dispatch and FUNCTIONP can
+         ;; identify it without ambiguity vs cons (tag 1) or object
+         ;; (tag 9).  CALL-IND strips the tag before the indirect call.
          ;; Target is the bytecode offset, resolved via function table
          ;; to a native label. Uses LEA [RIP+disp32] for position-independent
          ;; address loading.
@@ -2531,8 +2541,13 @@
                 (label (when fn-table (gethash target-offset fn-table)))
                 (d (dest-phys-or-scratch vd)))
            (if label
-               (emit-lea-label buf d label)
-               ;; Unknown target — load 0
+               (progn
+                 (emit-lea-label buf d label)
+                 ;; OR with 3 to tag (cf. TAG-PLAN.md).  Function code
+                 ;; is 16-byte (or better) aligned by NOP-padding so
+                 ;; the low nibble is 0 — OR-3 gives a clean tag value.
+                 (emit-or-reg-imm buf d 3))
+               ;; Unknown target — load 0 (untagged; would fault on call)
                (emit-mov-reg-imm buf d 0))
            (maybe-store-scratch buf vd)))
 
@@ -3490,24 +3505,20 @@
                                     (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
                                            c i name pos opcode operands)))
                                 (setf pos new-pos)))))
-                 ;; Avoid low nibble 1 (cons) or 9 (object).  Tried
-                 ;; full 16-byte alignment as a stronger structural
-                 ;; fix but it regressed tests via the same layout-shift
-                 ;; failure mode it was meant to address — every
-                 ;; function gained more NOPs, shifting all subsequent
-                 ;; addresses, tipping previously-stable tests into
-                 ;; new bad-bit-pattern territory inside the GC root
-                 ;; scan / setjmp frame layout / etc. (the fragility
-                 ;; runs deeper than the funcall path alone).  Only
-                 ;; align away from the two confirmed-bad nibbles for
-                 ;; now; any aggressive padding has to wait until the
-                 ;; deeper fragility is rooted out.
+                 ;; Function entry alignment.  Functions are tagged
+                 ;; with +tag-function+ (= 3) at LI-FUNC time
+                 ;; (mvm-fn-addr emits LEA + OR-3).  For the OR-3 to
+                 ;; produce a clean tag we need the raw function
+                 ;; address's low nibble to be 0 — otherwise the OR
+                 ;; merges with stray low bits and the CALL-IND
+                 ;; tag-strip (sub 3) lands inside the function body
+                 ;; instead of at its entry.
                  (loop
                    (let* ((p (code-buffer-position buf))
                           (n (logand (+ *x64-native-code-offset* p) #xF)))
-                     (if (or (= n 1) (= n 9))
-                         (emit-nop buf)
-                         (return))))))
+                     (if (zerop n)
+                         (return)
+                         (emit-nop buf))))))
 
       ;; Emit GC trampoline (after all functions, before fixup)
       (when (and gc-trampoline-label gc-collect-label)

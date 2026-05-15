@@ -3060,6 +3060,16 @@
     ;; Call %gc-collect via fn-addr-patched MOVZ+MOVK+BLR.  The
     ;; cross-link patcher will fill in the imm16 fields once
     ;; %gc-collect's native-offset is known.
+    ;;
+    ;; The patcher (apply-aarch64-fn-addr-patches in cross.lisp) ORs
+    ;; the loaded vaddr with +tag-function+ (3) per TAG-PLAN.md.  We
+    ;; SUB-3 here to strip the tag before BLR — same convention as
+    ;; +op-call-ind+.  Without this strip, BLR targets a tagged
+    ;; misaligned address and faults with sync exception when GC
+    ;; first triggers.  Diagnosed via gdb at T:13637 wedge:
+    ;; ELR_EL1=FAR_EL1=(gc-collect-entry|3), entry-4 handler reached
+    ;; HALT loop because slot 180/1C0 were both unarmed at that
+    ;; inter-test moment.
     (let ((movz-byte-pos
            (* (- (a64-current-index buf)
                  (or *aarch64-translated-start-idx* 0))
@@ -3068,6 +3078,7 @@
             *aarch64-fn-addr-patches*))
     (a64-movz buf +a64-x16+ 0 0)              ; placeholder for low 16
     (a64-movk buf +a64-x16+ 0 1)              ; placeholder for high 16
+    (a64-sub-imm buf +a64-x16+ +a64-x16+ 3)   ; strip +tag-function+
     (a64-blr buf +a64-x16+)
     ;; Reload x24, x25 from (now-updated) metadata.  %gc-collect
     ;; wrote these via (setf (mem-ref ADDR :u64) FREE-PTR) — and

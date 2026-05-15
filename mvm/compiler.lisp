@@ -5191,6 +5191,17 @@
                (= hash (compute-name-hash "MULTIPLE-VALUE-CALL"))
                (= hash (compute-name-hash "MULTIPLE-VALUE-PROG1")))
            (tail-form-is-values-p (cdddr form)))
+          ;; (apply #'values ...) or (apply <whatever> ...) — APPLY's
+          ;; result is whatever the called function returned, including
+          ;; its MV state.  ANSI aux helpers shaped as
+          ;;   (apply #'values (mapcar #'notnot (multiple-value-list X)))
+          ;; rely on MV-count being preserved through the apply tail
+          ;; call; the function epilogue's set-mv-count=1 would clobber
+          ;; it back to 1 and break (subtypep* …).
+          ((= hash (compute-name-hash "APPLY")) t)
+          ;; (funcall #'values …) — same reasoning as APPLY but for the
+          ;; spread-args form.
+          ((= hash (compute-name-hash "FUNCALL")) t)
           (t nil))))))
 
 (defun loop-body-has-mv-return-p (forms)

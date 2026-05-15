@@ -1718,12 +1718,26 @@
 (defun fill (seq item &rest args)
   "Fill SEQUENCE with ITEM. Honors :START and :END.  Strings store
    fixnum char-codes; coerce character ITEM to its char-code before
-   aset so the stored value matches what literal strings hold."
-  (let ((start 0) (end nil) (a args))
-    (loop (when (null a) (return))
-      (cond ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end)   (setq end   (cadr a)) (setq a (cddr a)))
-            (t (setq a (cdr a)))))
+   aset so the stored value matches what literal strings hold.
+   Per CLHS, signals PROGRAM-ERROR on odd plist or unknown keyword
+   (unless :allow-other-keys is non-nil).  Type-error on non-sequence
+   SEQ is handled by the (consp …) / (length …) dispatch below: if
+   SEQ is neither a cons nor a sequence, (length SEQ) signals."
+  (let ((start 0) (end nil) (allow-other-keys nil))
+    ;; Probe :allow-other-keys.
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (eq (car p) :allow-other-keys)
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (setq p (cdr p))))
+    (let ((a args))
+      (loop (when (null a) (return))
+        (when (null (cdr a)) (%signal-program-error))
+        (cond ((eq (car a) :start) (setq start (cadr a)))
+              ((eq (car a) :end)   (setq end   (cadr a)))
+              ((eq (car a) :allow-other-keys) nil)
+              (t (unless allow-other-keys (%signal-program-error))))
+        (setq a (cddr a))))
     (cond
       ((consp seq)
        (let ((cur seq) (i 0)

@@ -2328,8 +2328,35 @@
         (return (%resolve-fn found)))
       (setq cur (cddr cur)))))
 
+(defun %validate-test-key-plist (args)
+  "Validate ARGS as a plist of :test/:test-not/:key/:count/:start/:end/
+   :from-end/:allow-other-keys.  Per CLHS §3.4.1.4 signal PROGRAM-ERROR
+   on odd-length plist or unknown keyword (unless :allow-other-keys is
+   non-nil somewhere in the plist).  Helper for sequence/list ops that
+   pluck individual keys via %find-key-arg and would otherwise silently
+   accept (SET-DIFFERENCE NIL NIL :BAD T)."
+  (let ((allow-other-keys nil))
+    ;; First pass: probe :allow-other-keys.
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (eq (car p) :allow-other-keys)
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p))))
+        (setq p (cdr p))))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return))
+        (when (null (cdr cur)) (%signal-program-error))
+        (let ((k (car cur)))
+          (unless (or (eq k :test) (eq k :test-not) (eq k :key)
+                      (eq k :count) (eq k :start) (eq k :end)
+                      (eq k :from-end) (eq k :allow-other-keys)
+                      allow-other-keys)
+            (%signal-program-error)))
+        (setq cur (cddr cur))))))
+
 (defun %set-difference-impl (l1 l2 args)
   "Positional helper for set-difference. See set-difference docstring."
+  (%validate-test-key-plist args)
   (let ((test-fn (%find-key-arg args :test))
         (key-fn  (%find-key-arg args :key))
         (r nil))

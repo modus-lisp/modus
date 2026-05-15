@@ -721,6 +721,38 @@
                                       (ash (logand offset #x7FFFF) 5)
                                       x2))))
 
+    ;; 6b. DIAG: mark image-covering L2 entries RO (AP=10 at EL1).
+    ;;    Image lives at VA 0x00080000 to ~VA 0x02880000.  L2 entries 0..20
+    ;;    cover VA 0x00000000-0x02BFFFFF — including all image bytes.
+    ;;    Setting AP[2]=1 (bit 7) on those entries means writes via low-VA
+    ;;    into image faults with permission abort → entry-4 → diag slots
+    ;;    capture the writing PC.  This catches the corruption-of-code
+    ;;    class (see reference_aarch64_post_stack_move_wedge.md) directly.
+    ;;
+    ;;    Entries 0..20: read L2[i], OR in 0x80 (AP[2]=1), write back.
+    (emit-aarch64-load-imm64 buf x0 +tdk-l2-table-pa+)  ; x0 = L2 base
+    (emit-aarch64-movz buf x2 21 0)                     ; x2 = count (21 entries)
+    (let ((ro-loop-pos (a64-buffer-position buf)))
+      ;; LDR X1, [X0]
+      (emit-aarch64-u32 buf #xF9400001)
+      ;; ORR X1, X1, #0x80 (bit 7 = AP[2])
+      ;; Logical-immediate AND/ORR/EOR: 0x80 = bit 7 only.
+      ;; ORR (immediate) Xd, Xn, #imm = sf=1 0x32x | imms<<10 | immr<<16 | Rn<<5 | Rd
+      ;; For 0x80 = 0b1<<7, element size 64: N=1, immr=63-7=56 mod 64 → wait
+      ;; This is complex.  Simpler: MOV imm + ORR reg.
+      (emit-aarch64-movz buf x4 #x80 0)                 ; x4 = 0x80
+      ;; ORR X1, X1, X4 — sf=1 opc=01 01010 shift=00 N=0 Rm=4 imm6=0 Rn=1 Rd=1
+      (emit-aarch64-u32 buf (logior #xAA040021))
+      ;; STR X1, [X0], #8 (post-index +8)
+      (emit-aarch64-u32 buf #xF8008401)
+      ;; SUB X2, X2, #1
+      (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
+      ;; CBNZ X2, ro_loop
+      (let ((offset (- ro-loop-pos (a64-buffer-position buf))))
+        (emit-aarch64-u32 buf (logior (ash #b10110101 24)
+                                      (ash (logand offset #x7FFFF) 5)
+                                      x2))))
+
     ;; 7. Fill L2[128..511] = identity-mapped device memory for PCI MMIO
     ;;    VA 0x10000000-0x3FFFFFFF → PA 0x10000000-0x3FFFFFFF
     ;;    Covers entire PCI MMIO window (E1000 BAR can be anywhere in range)

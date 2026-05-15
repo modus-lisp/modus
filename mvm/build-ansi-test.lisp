@@ -3309,6 +3309,19 @@
             (format t "~%PARAM: ~A = ~S (from ~A)~%"
                     sym-name parsed var-name)))))))
 
+;; Runtime NARGS check on fixed-arity defuns.  CLHS says calling a
+;; function with the wrong number of arguments signals PROGRAM-ERROR;
+;; emit-arity-check-prologue inserts that signal at function entry.
+;; Restricted to the predicates that ANSI tests routinely pass via
+;; :TEST / :KEY (CONS/CAR/CDR/etc.); a universal rollout (set names to
+;; nil) would also catch user-defined helpers but historically perturbs
+;; layout enough to mask the win, so narrow first.
+(setq *compile-arity-check* t)
+(setq *compile-arity-check-names*
+      '("CONS" "CAR" "CDR" "NULL" "ATOM" "CONSP" "IDENTITY" "LISTP"
+        "SYMBOLP" "NUMBERP" "INTEGERP" "STRINGP" "CHARACTERP" "FUNCTIONP"
+        "ENDP" "FIRST" "REST" "1+" "1-"))
+
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))

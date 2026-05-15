@@ -7580,17 +7580,16 @@
 
 (defun emit-arity-check-prologue (required-count)
   "Emit IR that checks NARGS == REQUIRED-COUNT at function entry.
-   On mismatch, returns NIL via the function's normal return path
-   (skipping the body — preventing garbage register reads from
-   producing corrupting cons cells).  On match, falls through to
-   the rest of the prologue.
+   On mismatch, signals PROGRAM-ERROR via %signal-program-error, which
+   longjmps to the nearest handler-case (or returns NIL if no handler
+   is active).  On match, falls through to the rest of the prologue.
 
-   Returning NIL on mismatch is a deliberate compromise: ANSI says
-   wrong arity should signal program-error.  A signal-and-longjmp
-   here would need a working call to %SIGNAL-PROGRAM-ERROR, which
-   itself goes through the IR call path that 1-MB ADR fixups don't
-   reliably reach.  Returning NIL is safer: no garbage propagation,
-   no fragility, no false-positive call resolution.
+   CLHS §3.5.1.2 specifies that calling a function with the wrong
+   number of arguments should signal PROGRAM-ERROR.  Earlier this
+   path returned NIL silently as a compromise around an AArch64
+   ADR ±1MB-fixup issue; the call now goes through the regular MVM
+   :call mechanism so that constraint no longer applies (and on
+   x64 it never did).
 
    Required-count is the param count for fixed-arity defuns (no
    &rest, no &optional, no &key).  See *compile-arity-check*."
@@ -7602,9 +7601,13 @@
     (emit-ir :li cmp-reg (ash required-count +fixnum-shift+))
     (emit-ir :cmp nargs-reg cmp-reg)
     (emit-ir :beq ok-label)
-    ;; Mismatch: return NIL via the function-return path.  +vreg-vn+ holds
-    ;; NIL by convention (R15 on x64, X26 on AArch64).  Move to the
-    ;; result register +vreg-vr+ and jump to *function-return-label*.
+    ;; Mismatch: signal PROGRAM-ERROR.  %signal-program-error longjmps
+    ;; when a handler-case is armed; otherwise it returns NIL and we
+    ;; fall through to the function body's *function-return-label* via
+    ;; a defensive branch (the body itself never executes because the
+    ;; longjmp unwinds the frame, but the branch keeps the no-handler
+    ;; case from running the body on the wrong number of args).
+    (emit-ir :call "%SIGNAL-PROGRAM-ERROR" 0)
     (emit-ir :mov +vreg-vr+ +vreg-vn+)
     (emit-ir :br *function-return-label*)
     (emit-ir-label ok-label)

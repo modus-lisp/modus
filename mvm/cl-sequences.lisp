@@ -2467,12 +2467,16 @@
 ;; right one via a runtime arity-checking trampoline.  4-arg cap is
 ;; well above what any predicate caller in the suite actually uses.
 (defun complement (fn)
-  (lambda (a b)
-    ;; Most predicate calls (eql, equal, =) are 2-arg — handle directly.
-    ;; Unary callers (evenp, etc.) hit (funcall fn a) instead.
-    (if b
-        (not (funcall fn a b))
-        (not (funcall fn a)))))
+  "Return a function that returns the logical negation of FN's result.
+   The returned function takes any number of args and forwards them
+   verbatim via APPLY — per CLHS §17.3.1 the complement function must
+   accept whatever arity the wrapped predicate accepts.  An earlier
+   version hard-coded (lambda (a b) ...) which silently dropped extra
+   args and passed garbage for unary predicates; with arity checks
+   enabled on LISTP/CONSP/etc., callers like (complement #'listp)
+   now signal PROGRAM-ERROR if invoked with 2 args."
+  (lambda (&rest args)
+    (not (apply fn args))))
 
 (defun search (seq1 seq2 &rest args)
   "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.

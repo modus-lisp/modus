@@ -3602,4 +3602,27 @@
       (write-sequence (kernel-image-image-bytes image) out))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
+    ;; Sanity-check: stack region must NOT overlap kernel image.
+    ;; The image loads at VA 0x80000 (low-VA) = PA 0x40080000 (identity).
+    ;; The stack grows DOWN from +tdk-stack-va+ in boot-aarch64.lisp.
+    ;; If the stack top sits inside the image, stack pushes corrupt
+    ;; code via the shared physical mapping — see commit 8bcacc8.
+    ;; Reserve 8 MB headroom for stack growth: stack [top - 8MB .. top].
+    (let* ((image-bytes (length (kernel-image-image-bytes image)))
+           (image-va-start #x80000)              ; load addr in low-VA window
+           (image-va-end (+ image-va-start image-bytes))
+           (stack-top (or (and (boundp 'modus.mvm::+tdk-stack-va+)
+                               (symbol-value 'modus.mvm::+tdk-stack-va+))
+                          #x08000000))
+           (stack-headroom (* 8 1024 1024))      ; assume 8MB max stack
+           (stack-va-lo (- stack-top stack-headroom)))
+      (when (and (<= stack-va-lo image-va-end)
+                 (>= stack-top image-va-start))
+        (error "BUILD-TIME ASSERT: stack region [~X..~X] overlaps kernel image [~X..~X]~%~
+                Image is ~D bytes (~,1F MB).  Stack top is ~X.~%~
+                Move +tdk-stack-va+ above image-end, e.g. ~X or higher."
+               stack-va-lo stack-top image-va-start image-va-end
+               image-bytes (/ image-bytes 1024.0 1024.0)
+               stack-top
+               (+ image-va-end stack-headroom (* 1024 1024)))))
     (format t "~%Run: qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel ~A -nographic -no-reboot~%" path)))

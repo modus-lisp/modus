@@ -530,8 +530,16 @@
                  (movz-file-pos (+ native-image-offset movz-byte-pos))
                  (movk-file-pos (+ movz-file-pos 4)))
             (when target-native-offset
-              (let* ((target-vaddr (+ load-addr native-image-offset
-                                      target-native-offset))
+              ;; OR with +tag-function+ (3) at patch time so the
+              ;; loaded value carries the function tag, matching the
+              ;; x64 emit-or-reg-imm-3 path.  CALL-IND strips the
+              ;; tag via SUB-3 before BLR.  Function entries are
+              ;; 16-byte aligned (NOP pad after fn-addr alignment
+              ;; loop) so the OR-3 produces a clean tag value.
+              (let* ((target-vaddr (logior (+ load-addr
+                                              native-image-offset
+                                              target-native-offset)
+                                           3))
                      (lo16 (logand target-vaddr #xFFFF))
                      (hi16 (logand (ash target-vaddr -16) #xFFFF)))
                 (patch-aarch64-mov-imm16 raw-bytes movz-file-pos lo16)

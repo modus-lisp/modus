@@ -2372,47 +2372,47 @@
           ;; recovers cleanly through the active handler-case (test FAILs
           ;; rather than wedges).
           ((= op +op-call-ind+)
-           ;; RAW-ADDR-AUDIT: ps is an UNTRUSTED native function address
-           ;; (low bit 0, ≥ kernel code range).  Source could be a
-           ;; closure-slot read (compile-make-closure → :obj-set on
-           ;; slot 0 of a #x52 object), a symbol's `function-value`
-           ;; lookup result, or `(funcall <user-form>)`.  Any user-
-           ;; constructed value reaches here.  TBNZ + CBZ catch the
-           ;; obvious bad cases (tagged values, NIL) but a non-zero,
-           ;; low-bit-clear garbage value would still BLR to garbage.
-           ;; For defense-in-depth a range check against
-           ;; [kernel_code_base, kernel_code_end] would be ideal — task
-           ;; #46 (compile-functionp safe) is the wider variant.
+           ;; ps is a TAGGED function pointer (low nibble = +tag-function+ = 3),
+           ;; per TAG-PLAN.md.  Validate the tag, then strip and BLR.
+           ;; Any value with low nibble != 3 (cons=1, object=9, NIL, T,
+           ;; fixnum, character, ...) takes the bad-callable path which
+           ;; SVCs #x0511 — caught by the kernel's sync-exception
+           ;; handler and longjmped through the active handler-case.
+           ;;
+           ;; The previous untagged-fn-ptr check was TBNZ #0 + CBZ,
+           ;; which trapped any low-bit-set value (i.e., anything that
+           ;; looked Lisp-tagged).  With function tagging that test
+           ;; would fire on every legitimate fn-ptr (tag 3 has bit 0
+           ;; set), so it's replaced with an explicit AND-nibble +
+           ;; CMP-3 + B.NE-bad sequence.
+           ;;
+           ;; The compile-funcall NIL guard (compiler.lisp) already
+           ;; handles NIL via %signal-undefined-function before this
+           ;; IR runs, so this trap should only fire on genuinely
+           ;; corrupt callables.
            (let* ((ps (ensure-src (vr 0) +a64-x16+))
                   (ok-label (incf *mvm-label-counter*))
                   (bad-label (incf *mvm-label-counter*)))
-             ;; Two checks for callable validity:
-             ;;   TBNZ ps, #0, bad   — tagged value (low bit set) → trap
-             ;;   CBZ  ps,    bad   — NIL (raw 0) → trap; else BLR.
-             ;; Before adding the CBZ, `(funcall NIL)` on AArch64 BLR'd
-             ;; address 0 and spun on QEMU virt's identity-mapped
-             ;; pre-RAM bytes; the timer IRQ couldn't recover because
-             ;; whatever bytes live there mask interrupts.  Accepts a
-             ;; layout-fragility regression at the current ceiling —
-             ;; see reference_aarch64_nil_funcall_wedge.md.
+             ;; Extract low nibble into x17, compare with +tag-function+ (3).
+             ;; Load mask via MOVZ (logical-immediate AND on AArch64 has
+             ;; a fiddly imm encoding; register-based AND is clearer).
+             (a64-movz buf +a64-x17+ #xF 0)
+             (a64-and-reg buf +a64-x17+ ps +a64-x17+)
+             (a64-cmp-imm buf +a64-x17+ 3)
              (let ((idx (a64-current-index buf)))
-               (a64-emit buf (logior (ash #b00110111 24)   ; TBNZ (32-bit)
-                                     (ash 0 19)             ; bit #0
-                                     (ash 0 5)              ; placeholder offset
-                                     (logand ps #x1F)))
-               (a64-add-fixup buf idx bad-label :tbz))
-             (let ((idx (a64-current-index buf)))
-               (a64-emit buf (logior (ash #b10110100 24)   ; CBZ (64-bit)
-                                     (ash 0 5)              ; placeholder offset
-                                     (logand ps #x1F)))
-               (a64-add-fixup buf idx bad-label :cbz))
-             ;; Valid callable: skip over the trap and BLR.
+               (a64-emit buf (logior #x54000001     ; B.NE cond=0001
+                                     (ash 0 5)))    ; placeholder offset
+               (a64-add-fixup buf idx bad-label :bcond))
+             ;; Valid tagged function pointer: strip the tag and BLR.
+             (a64-sub-imm buf ps ps 3)
              (let ((idx (a64-current-index buf)))
                (a64-b buf 0)
                (a64-add-fixup buf idx ok-label :b))
-             ;; Bad-callable trap: SVC #x0511 — caught by the kernel's
-             ;; sync exception handler, which longjmps through the
-             ;; active handler-case.
+             ;; Corrupt callable: SVC #x0511 — caught by the kernel's
+             ;; sync-exception handler and longjmped through the
+             ;; active handler-case.  compile-funcall already filters
+             ;; NIL via %signal-undefined-function, so this trap
+             ;; should fire only on genuinely garbage callables.
              (a64-set-label buf bad-label)
              (a64-svc buf #x0511)
              (a64-set-label buf ok-label)
@@ -3171,6 +3171,24 @@
     ;; Pass 1: Translate all instructions
     (dolist (insn insns)
       (let ((mvm-off (decoded-mvm-insn-offset insn)))
+        ;; Function-entry alignment.  Fn pointers are tagged with
+        ;; +tag-function+ (3) at LI-FUNC patch time (see cross.lisp
+        ;; apply-aarch64-fn-addr-patches), and CALL-IND strips with
+        ;; SUB-3 before BLR.  For the OR-3 to produce a clean tag
+        ;; the raw native address must have low nibble 0, i.e.,
+        ;; 16-byte aligned.
+        ;;
+        ;; The final native VA of an entry is
+        ;;   load-addr + native-image-offset + target-native-offset
+        ;;     = load-addr + translated-start-idx*4
+        ;;                 + (current-index - translated-start-idx)*4
+        ;;     = load-addr + current-index*4
+        ;; Both supported load-addrs (QEMU virt 0x40080000, RPi
+        ;; 0x80000) are 16-byte aligned, so the constraint reduces
+        ;; to (current-index mod 4) == 0.  Pad with NOPs.
+        (when (gethash mvm-off fn-bc-offsets)
+          (loop while (/= 0 (mod (a64-current-index buf) 4))
+                do (a64-emit buf #xD503201F)))  ; NOP
         ;; If this MVM offset has a label assigned (branch target),
         ;; record the native position for it now
         (let ((label (gethash mvm-off mvm-to-native-label)))

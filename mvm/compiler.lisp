@@ -5387,7 +5387,8 @@
     (let ((fn-call-reg (alloc-temp-reg))
           (direct-call-label (make-compiler-label))
           (after-call-label (make-compiler-label))
-          (after-sym-label (make-compiler-label)))
+          (after-sym-label (make-compiler-label))
+          (good-fn-label (make-compiler-label)))
       (emit-ir :pop fn-call-reg)
       ;; Layout-flip fuzzer hook — defaults to 0.  Used by
       ;; scripts/fragility-fuzzer.sh to vary bytecode layout in
@@ -5395,6 +5396,20 @@
       ;; tests flip.  See fragility-notes.md for findings.
       (when (> *fuzz-funcall-nops* 0)
         (dotimes (i *fuzz-funcall-nops*) (emit-ir :nop)))
+      ;; NIL-funcall guard.  Per ANSI, (funcall NIL ...) signals
+      ;; UNDEFINED-FUNCTION.  Without this guard, NIL flows into
+      ;; CALL-IND and the indirect call faults at NIL or NIL-3 (after
+      ;; the tag-strip introduced by TAG-PLAN.md).  The SIGSEGV-handler
+      ;; longjmp from a fault inside a CALL is timing-dependent —
+      ;; sometimes the fault address is in a mapped page and recovery
+      ;; works, sometimes it isn't and recovery fails.  An explicit
+      ;; signal eliminates that fragility.
+      (emit-ir :bnnull fn-call-reg good-fn-label)
+      (emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
+      ;; If %signal-undefined-function returns (no handler active),
+      ;; fall through to the existing dispatch — the original
+      ;; "fault on NIL" behaviour, preserved for the no-handler case.
+      (emit-ir-label good-fn-label)
       ;; (Tried adding a [code_base, code_end) range-check fast path
       ;; before the tag dispatches.  It works correctly but the
       ;; per-funcall overhead — 8 IR ops × every funcall in the

@@ -1189,6 +1189,17 @@
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))
 
+(defun %signal-undefined-function ()
+  "Runtime helper: signal UNDEFINED-FUNCTION.  Used by compile-funcall's
+   NIL-guard so (funcall NIL ...) becomes a clean condition signal
+   instead of a faulting indirect-call to NIL (or NIL-3 after
+   function-pointer tagging — see TAG-PLAN.md)."
+  (let ((c (make-array 2)))
+    (aset c 0 'undefined-function)
+    (aset c 1 nil)
+    (setq *current-condition* c)
+    (if (%error-handler-active-p) (%hc-longjmp) nil)))
+
 ;;; --- Initialize standard packages ---
 
 (defun %init-packages ()

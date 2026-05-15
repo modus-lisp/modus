@@ -1766,16 +1766,20 @@
     ((null x) nil)
     ((eq x t) nil)
     ((consp x) nil)
-    ;; Tagged-function-pointer fast path: low 4 bits == 3 (TAG-PLAN.md).
-    ;; Every value produced by LI-FUNC / #'NAME carries this tag, so a
-    ;; single mask+compare answers FUNCTIONP correctly without going
-    ;; through the code-segment range check below.
-    ((= (logand x #x0F) 3) t)
-    ;; Legacy untagged-fn-addr range check, kept for any path that
-    ;; produces a raw native address without going through LI-FUNC.
-    ;; The bottom-two-bits mask preserved here for the few odd-nibble
-    ;; fn-addrs the pre-tag alignment dodge couldn't avoid.  Once every
-    ;; site is audited and all fn-addrs are tagged, this branch can go.
+    ;; Mask the low bit so the range comparison stays on the fast path.
+    ;; After our nibble-1-and-9 alignment, raw fn-addrs can still land on
+    ;; odd nibbles (3, 5, 7, B, D, F).  For those, low bit 1 makes the
+    ;; tag-check in compile-compare-2 fail and the slow numeric helper
+    ;; runs — but numeric-value-less-p calls (integerp x) which returns
+    ;; NIL for odd-nibble fn-addrs (they're not real fixnums or bignums),
+    ;; so the slow path returns NIL and the range check fails.
+    ;;
+    ;; (logand x -2) clears the bottom two bits via raw bitwise AND
+    ;; (compile-logand → :and IR-op which does raw register AND).  The
+    ;; result has low bit 0 → fixnum-shaped → fast-path compare.  The
+    ;; relation `xs in [base, end)' still answers `x in [base, end]'
+    ;; correctly for any x within ±3 bytes of the range, which is far
+    ;; tighter than the segment alignment of code_base/code_end.
     ((let* ((base (mem-ref #x10000160 :u64))
             (end  (mem-ref #x10000168 :u64))
             (xs   (logand x -2)))

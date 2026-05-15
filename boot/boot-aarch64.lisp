@@ -575,7 +575,15 @@
 ;; deadline timer fails to recover — likely a layout-shift artifact
 ;; in the same family.  Reverted while we investigate; the audit
 ;; comments below stay so the trail is preserved.
-(defconstant +tdk-stack-va+      #x00200000)  ; Stack top (in image — TODO)
+;; Stack moved to VA 0x08000000 (PA 0x48000000) — 88 MB above the
+;; ~42 MB image end, 16 MB below the alloc heap base (0x09000000).
+;; Resolves the structural corruption where stack pushes at VA
+;; 0x00200000 were overwriting code at PA 0x40080000+ via shared
+;; physical mapping.  T:13672 wedge (reference_aarch64_t13672_corruption.md):
+;; corrupted bytes at VA 0x40090110 were ACTUALLY the stack working
+;; memory at PA 0x40090110 = VA 0x00090110, written when SP grew
+;; past ~1.4 MB.  See task #47 audit for the original investigation.
+(defconstant +tdk-stack-va+      #x08000000)  ; Stack top (outside image)
 ;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
 ;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
 ;; boot loader sets x24=base and x25=mid-point (end of the initial

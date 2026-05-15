@@ -3166,7 +3166,8 @@
   ;; rather than running off the end of the from-space.  stack-base is
   ;; the SP value at boot — keep this in sync with +tdk-stack-va+ in
   ;; boot-aarch64.lisp.  GC scans roots from the current SP up to here.
-  (%gc-init #x09000000 #x07000000 #x00200000)
+  ;; Stack moved to VA 0x08000000 — matches +tdk-stack-va+ in boot-aarch64.lisp.
+  (%gc-init #x09000000 #x07000000 #x08000000)
 
   ;; Re-entry bitmap at 0x10001000.  18000 bytes covers all 17692 tests.
   ;; Zero so no test starts in tested state.

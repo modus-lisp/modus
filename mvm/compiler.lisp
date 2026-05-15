@@ -35,6 +35,7 @@
 
 (defconstant +tag-fixnum+    #b0000)
 (defconstant +tag-cons+      #b0001)
+(defconstant +tag-function+  #b0011)
 (defconstant +tag-object+    #b1001)
 (defconstant +tag-immediate+ #b0101)
 (defconstant +tag-forward+   #b1111)

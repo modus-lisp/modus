@@ -2970,15 +2970,6 @@
   ;; skip-below=0: run everything.  Per-test deadline (10ms / 10
   ;; ticks at 1000Hz PIT) longjmps via slot 0x10000180 — wired in
   ;; boot/boot-x64.lisp's deadline-aware PIT ISR at 0x4F0900.
-  ;;
-  ;; Current frontier: T:12266 P=1647 (60s wall) — wedge in test
-  ;; 12267/12268's FLET with &REST X / &KEY FOO BAR.  Known Modus
-  ;; &rest-funcall compiler bug class (per CLAUDE.md): an
-  ;; indirect call computes a corrupted function pointer that
-  ;; lands inside the page-table area (0x500000-0x504000), CPU
-  ;; tries to execute PML4/PDPT bytes as code with RSP=0, infinite
-  ;; recovery loop.  Fix needs deeper compiler work in FLET/&REST
-  ;; nargs handling.
   (setq *skip-below* 0)
   ;; (run-all-tests)
 

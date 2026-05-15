@@ -23,7 +23,14 @@
 ;;; ============================================================
 
 (defconstant +x64-kernel-load-addr+ #x100000)     ; 1MB - multiboot load address
-(defconstant +x64-page-tables-addr+ #x500000)     ; 5MB - page table location
+;; Page tables live ABOVE the kernel image to avoid being overlaid by
+;; native code or constant-pool bytes once the image grows past 4MB.
+;; With the image at 0x100000 and routinely 30-40MB, a 0x500000 table
+;; address physically overwrites code at file offset 0x400000-0x406000;
+;; calls to any function placed there land in PDPT bytes (`push rax` at
+;; 0x501002 etc.) and triple-fault.  64MB is well above current image
+;; size and still inside the 4GB identity map.
+(defconstant +x64-page-tables-addr+ #x4000000)    ; 64MB - page table location
 (defconstant +x64-stack-top+        #x800000)     ; 8MB - initial stack top (above image+pagetables)
 (defconstant +x64-kernel64-addr+    #x100100)     ; 64-bit entry point
 

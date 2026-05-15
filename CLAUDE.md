@@ -346,23 +346,6 @@ the lambda is created once but `acc` should be independent per call.
 Heap-allocated closure cells (`is-eql-p` pattern) work around this for specific
 functions. Full fix: allocate a fresh cons cell per closure creation in compile-lambda.
 
-### `&rest` in defun + funcall-of-let-allocated-lambda → SIGSEGV
-
-Adding `&rest args` to a defun that's later called via `(funcall (lambda () ...))`
-where the lambda is bound by `let` makes the binary SIGSEGV at the funcall, often
-several tests downstream of the `&rest` defun (so the crash site isn't where the
-broken function was defined).
-
-Symptom seen during ANSI work: switching `remove-if` from `(pred seq)` to
-`(pred seq &rest args)` (so callers could pass `:test`/`:key`) made `run-cl-loop-tests`
-crash at the very next `funcall` on a let-bound lambda. Reverting the `&rest`
-restored the binary even though `remove-if` was never called between definition
-and the crashing site.
-
-Workaround: keep prelude / heavily-called runtime functions to fixed positional
-parameters. If you need keyword tolerance, hand-parse the `&rest` in a wrapper
-that itself uses positional params and dispatches.
-
 ### Vector-literal symbol elements (FIXED)
 
 The earlier docs claimed `#(...)` literals containing symbols caused a SIGSEGV

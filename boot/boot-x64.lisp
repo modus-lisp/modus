@@ -23,15 +23,21 @@
 ;;; ============================================================
 
 (defconstant +x64-kernel-load-addr+ #x100000)     ; 1MB - multiboot load address
-;; Page tables live ABOVE the kernel image to avoid being overlaid by
-;; native code or constant-pool bytes once the image grows past 4MB.
-;; With the image at 0x100000 and routinely 30-40MB, a 0x500000 table
-;; address physically overwrites code at file offset 0x400000-0x406000;
-;; calls to any function placed there land in PDPT bytes (`push rax` at
-;; 0x501002 etc.) and triple-fault.  64MB is well above current image
-;; size and still inside the 4GB identity map.
-(defconstant +x64-page-tables-addr+ #x4000000)    ; 64MB - page table location
-(defconstant +x64-stack-top+        #x800000)     ; 8MB - initial stack top (above image+pagetables)
+;; Page tables and the IDT page MUST live OUTSIDE the kernel image range,
+;; otherwise paging setup / IDT writes overlay native code or constant
+;; pool bytes that the linker happened to place there.  Symptom: a call
+;; to such a clobbered function lands on PDPT/IDT byte garbage (e.g.
+;; `push rax` byte 0x50 at 0x501002, RSP=0 the moment the fault frame
+;; couldn't be pushed, triple-fault).
+;;
+;; Conventional memory between 0x1000 and 0x80000 (just above the legacy
+;; IVT/BDA, below the EBDA) is free RAM on every BIOS/UEFI x86-64 host
+;; and is well BELOW the kernel load address — the image can grow to
+;; fill all 4GB of identity-mapped RAM without ever colliding.  We
+;; bundle: PML4 / PDPT / PD0..3 / IDT / handlers in 0x10000..0x1A000.
+(defconstant +x64-page-tables-addr+ #x10000)      ; 64KB - PML4 + PDPT + 4xPD (24KB)
+(defconstant +x64-idt-addr+         #x18000)      ; 96KB - IDT + #PF/#GP/PIT ISRs
+(defconstant +x64-stack-top+        #x800000)     ; 8MB - initial stack top (must stay above page tables, below image growth)
 (defconstant +x64-kernel64-addr+    #x100100)     ; 64-bit entry point
 
 ;; Memory regions
@@ -444,14 +450,14 @@
   (emit-x64-out buf #x40 #xA9)   ; divisor low byte (1193 & 0xFF = 0xA9)
   (emit-x64-out buf #x40 #x04)   ; divisor high byte (1193 >> 8 = 0x04)
 
-  ;; === Build minimal 64-bit IDT at 0x4F0000 ===
+  ;; === Build minimal 64-bit IDT at +x64-idt-addr+ ===
   ;; We only need entry 0x20 (PIT timer IRQ). All others can be absent/zero.
   ;; IDT entry format (16 bytes):
   ;;   [offset_lo:16][selector:16][IST:3][zero:5][type:4][zero:1][DPL:2][P:1][offset_mid:16]
   ;;   [offset_hi:32][reserved:32]
-  ;; ISR is placed at 0x4F0800 (2KB into IDT page)
-  (let* ((idt-base #x4F0000)
-         (isr-addr #x4F0800)
+  ;; ISR is placed 2KB into the IDT page (after the IDT entries themselves).
+  (let* ((idt-base +x64-idt-addr+)
+         (isr-addr (+ idt-base #x800))
          (entry-offset (* #x20 16))  ; entry 0x20 = byte offset 512
          (entry-addr (+ idt-base entry-offset))
          (offset-lo (logand isr-addr #xFFFF))
@@ -534,7 +540,7 @@
     (mvm-emit-byte buf #xCF)
 
     ;; ============================================================
-    ;; Deadline-aware PIT ISR at 0x4F0900.  Mirrors AArch64 entry-5:
+    ;; Deadline-aware PIT ISR at +x64-idt-addr+ +0x900.  Mirrors AArch64 entry-5:
     ;; on every IRQ tick, decrement the counter at 0x10000C70.  When
     ;; the counter is 0, do nothing (no deadline armed).  When it
     ;; transitions 1→0, check slot 0x10000180 (handler-case armed by
@@ -549,7 +555,7 @@
     ;; IRETQ but in 64-bit kernel mode CS/SS values are not used for
     ;; addressing anyway (only descriptor-cache flags matter).
     ;;
-    ;; Deadline-aware PIT ISR at 0x4F0900.  Decrements counter at
+    ;; Deadline-aware PIT ISR at +x64-idt-addr+ +0x900.  Decrements counter at
     ;; 0x10000C70; on 1→0 transition, longjmp via slot 0x10000180.
     ;;
     ;; CRITICAL fix #1: pit_normal IRETQ path injects IF=1 into the
@@ -558,7 +564,7 @@
     ;; first tick re-restores IF=0 and the timer never fires again.
     ;;
     ;; CRITICAL fix #2: the deadline-hit path INLINES the handler-stack
-    ;; pop (mirrors the 150-byte #PF handler at 0x4F0820): reads frame
+    ;; pop (mirrors the 150-byte #PF handler at +x64-idt-addr+ +0x820): reads frame
     ;; [0x10000408 + (depth-1)*24] into slot 0x10000180/188/190, or
     ;; zeros slot 180 if depth==0.  Without this, depth grows unbounded
     ;; across timer-longjmps — each SETJMP pushes but only CLEAR-HANDLER
@@ -568,7 +574,7 @@
     ;; 180 and the next FORMAT-spam test infinitely re-enters the same
     ;; failed handler.  AArch64 entry-5 calls BL pop_helper for the
     ;; same reason (boot-aarch64.lisp lines 375-381).
-    (let ((deadline-isr-addr #x4F0900)
+    (let ((deadline-isr-addr (+ idt-base #x900))
           (deadline-bytes
            #(;; entry + EOI
              #x50                                       ; 0: push rax
@@ -628,7 +634,7 @@
              #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00  ; 180: or qword [rsp+16], 0x200
              #x48 #xCF                                  ; 189: iretq
              )))
-      ;; Write the ISR bytes at 0x4F0900.
+      ;; Write the ISR bytes at +x64-idt-addr+ +0x900.
       (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
       (mvm-emit-u32 buf deadline-isr-addr) (mvm-emit-u32 buf 0)
       (dotimes (i (length deadline-bytes))
@@ -643,7 +649,7 @@
            (mvm-emit-byte buf #x87)
            (mvm-emit-u32  buf i)
            (mvm-emit-byte buf (aref deadline-bytes i)))))
-      ;; Repatch IDT entry 0x20 (PIT timer) to point at 0x4F0900.
+      ;; Repatch IDT entry 0x20 (PIT timer) to point at +x64-idt-addr+ +0x900.
       (let* ((eaddr (+ idt-base (* #x20 16)))
              (off-lo (logand deadline-isr-addr #xFFFF))
              (off-mid (logand (ash deadline-isr-addr -16) #xFFFF))
@@ -670,7 +676,7 @@
     ;; subsequent fault without a re-armed handler-case takes the
     ;; halt path instead of resuming on stale state.
     ;;
-    ;; Handler bytes at 0x4F0820 (58 bytes):
+    ;; Handler bytes at +x64-idt-addr+ +0x820 (58 bytes):
     ;;   48 83 C4 08              add rsp, 8   (pop CPU-pushed error code)
     ;;   48 B9 ...........        mov rcx, 0x10000180
     ;;   48 8B 01                 mov rax, [rcx]            ; saved RSP
@@ -687,7 +693,7 @@
     ;;   48 CF                    iretq
     ;;   F4                       hlt                       ; halt:
     ;;   EB FD                    jmp halt
-    (let* ((sigsegv-isr-addr #x4F0820)
+    (let* ((sigsegv-isr-addr (+ idt-base #x820))
            (sg-bytes
             ;; 150-byte handler with INLINE per-fork handler-stack pop:
             ;; before iretq, walks the depth counter at 0x10000400 and
@@ -835,7 +841,7 @@
     (mvm-emit-u32 buf #x10000C70) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
     (mvm-emit-u32 buf 0)
-    ;; STI — enable interrupts so the deadline-aware PIT ISR (0x4F0900)
+    ;; STI — enable interrupts so the deadline-aware PIT ISR (+x64-idt-addr+ +0x900)
     ;; can fire and longjmp out of infinite-loop tests.  In the original
     ;; boot, IRQs stayed disabled and Lisp used (sti-hlt) at idle points
     ;; only.  For ANSI testing the timer must fire throughout each test.

@@ -2969,7 +2969,7 @@
 
   ;; skip-below=0: run everything.  Per-test deadline (10ms / 10
   ;; ticks at 1000Hz PIT) longjmps via slot 0x10000180 — wired in
-  ;; boot/boot-x64.lisp's deadline-aware PIT ISR at 0x4F0900.
+  ;; boot/boot-x64.lisp's deadline-aware PIT ISR at +x64-idt-addr+ + 0x900.
   (setq *skip-below* 0)
   ;; (run-all-tests)
 

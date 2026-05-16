@@ -293,6 +293,17 @@
         (stack-base (%gc-stack-base))
         (saved-rsp (%gc-saved-rsp)))
     (write-char-serial 49)  ; '1' — got metadata
+    ;; Sanity-check: saved-rsp must be in the valid stack window
+    ;; (between guard at 0x07200000 and stack-base at 0x08000000 for
+    ;; the AArch64 ANSI build).  If it's 0 or otherwise bogus, a
+    ;; longjmp earlier zeroed the slot — scanning from 0 would walk
+    ;; 128 MB of unrelated memory, eventually hitting the guard page
+    ;; (or worse, corrupting random objects).  Skip the stack scan
+    ;; in that case; we'll get a less-precise GC but it won't
+    ;; runaway.  Print 'S' to mark the skip.
+    (when (or (< saved-rsp #x07200000) (>= saved-rsp stack-base))
+      (write-char-serial 83)  ; 'S' — stack-scan skipped
+      (setq saved-rsp stack-base))
     ;; The free pointer in to-space starts at to_start
     (let ((free-ptr to-start))
       ;; Step 1: Copy roots from the stack

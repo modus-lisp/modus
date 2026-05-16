@@ -2288,6 +2288,7 @@
                                     (not (search "#<STANDARD" test-str))
                                     (not (search "#<STRUCTURE" test-str))
                                     (not (search "#<CLOSURE" test-str))
+                                    (not (search "#<PACKAGE" test-str))
                                     (not (search "&ENVIRONMENT" test-str))
                                     (not (search "STRUCT-TEST-" test-str)))
                            (push test-str test-forms)))))))

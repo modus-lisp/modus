@@ -2901,7 +2901,7 @@
                      ~%  (%restore-outer-handler)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 200)~
                      ~%      (rt-run-test id (funcall thunk) expected)~
                      ~%      (%mark-tested id))~
                      ~%    (t (c)~
@@ -2914,7 +2914,7 @@
                      ~%  (%restore-outer-handler)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 200)~
                      ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%      (%mark-tested id))~
                      ~%    (t (c)~

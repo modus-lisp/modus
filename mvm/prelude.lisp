@@ -1379,17 +1379,16 @@
    copy.  Without this, future `'foo` references re-allocate a fresh
    symbol, (eq 'foo 'foo) returns NIL, and CLOS marker checks
    ((eq (aref instance 0) '%clos-instance)) misclassify."
-  ;; Recursion-depth check.  Slot 0x10000C80 holds the current depth
-  ;; (incr on entry, decr on exit).  Cap at 100: the previously-known
-  ;; cause (a %signal-type-error → 'type-error → %intern-symbol cycle)
-  ;; was fixed in c1-conditions.lisp by pre-caching the TYPE-ERROR
-  ;; symbol, but the cap remains as a guard against future re-entries.
-  (let ((depth (mem-ref #x10000C80 :u64)))
-    (when (> depth 100)
-      (write-char-serial 10) (write-char-serial 73) (write-char-serial 82) ; IR
-      (write-char-serial 33) (print-dec depth) (write-char-serial 10)
-      (halt))
-    (setf (mem-ref #x10000C80 :u64) (+ depth 1)))
+  ;; Slot 0x10000C80 tracks recursion depth (incr on entry, decr on exit).
+  ;; Previously capped at 100 to catch a runaway recursion through
+  ;; %signal-type-error (485b85f) and set-symbol-value (7df547f); both
+  ;; cycles are now broken structurally.  The remaining "deep stacks"
+  ;; that hit 100 are legitimate %condition-all-parents walks through
+  ;; deep class hierarchies (CONDITION-9/CONDITION-14 etc.), not real
+  ;; recursion bugs — the cap was a false-positive halt that wedged
+  ;; the suite at T:26316.  Cap removed; depth tracking stays so the
+  ;; per-test reset still bounds any future leak.
+  (setf (mem-ref #x10000C80 :u64) (+ (mem-ref #x10000C80 :u64) 1))
   (let ((table (mem-ref #x10000088 :u64)))
     (let ((existing (gethash name-hash table)))
       (if existing

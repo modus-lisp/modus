@@ -1169,12 +1169,29 @@
   "Install SIGSEGV/SIGBUS/SIGFPE/SIGILL handlers via TRAP #x0520."
   (%install-signal-handlers))
 
+;;; Cached symbol objects for the %signal-* helpers.  These helpers
+;;; previously emitted `'foo` literals (-> %INTERN-SYMBOL) inside their
+;;; bodies.  When the type-check guard inside gethash (which %intern-
+;;; symbol itself calls) signalled TYPE-ERROR, that call re-entered
+;;; %signal-type-error, which re-entered %intern-symbol, which... — a
+;;; deep recursion that stalled tests 16714..16870 (CLHS COUNT-IF /
+;;; COUNT-IF-NOT family) for ~50 ms each via the deadline-IRQ recovery.
+;;; Pre-caching breaks the cycle: %signal-* reads a pre-interned symbol
+;;; from a fixed slot instead of interning at runtime.
+(defun %init-signal-symbols ()
+  "Pre-intern the TYPE-ERROR / PROGRAM-ERROR / UNDEFINED-FUNCTION
+   symbols and store them at slots 0xCA0/0xCA8/0xCB0.  Must run after
+   init-symbol-table, before any code can signal these conditions."
+  (setf (mem-ref #x10000CA0 :u64) 'type-error)
+  (setf (mem-ref #x10000CA8 :u64) 'program-error)
+  (setf (mem-ref #x10000CB0 :u64) 'undefined-function))
+
 (defun %signal-program-error ()
   "Runtime helper: signal a PROGRAM-ERROR condition for handler-case.
    Used by the compiler for arity errors. Sidesteps make-condition,
    which has a complex slot-collection path that's been flaky."
   (let ((c (make-array 2)))
-    (aset c 0 'program-error)
+    (aset c 0 (mem-ref #x10000CA8 :u64))
     (aset c 1 nil)
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))
@@ -1182,9 +1199,11 @@
 (defun %signal-type-error ()
   "Runtime helper: signal a TYPE-ERROR condition for handler-case.
    Used when a CL primitive is called with an argument of the wrong
-   type (e.g. negative index to elt, non-list to nthcdr)."
+   type (e.g. negative index to elt, non-list to nthcdr).
+   See %init-signal-symbols for why we read the symbol from a slot
+   instead of `(aset c 0 'type-error)'."
   (let ((c (make-array 2)))
-    (aset c 0 'type-error)
+    (aset c 0 (mem-ref #x10000CA0 :u64))
     (aset c 1 nil)
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))
@@ -1195,7 +1214,7 @@
    instead of a faulting indirect-call to NIL (or NIL-3 after
    function-pointer tagging — see TAG-PLAN.md)."
   (let ((c (make-array 2)))
-    (aset c 0 'undefined-function)
+    (aset c 0 (mem-ref #x10000CB0 :u64))
     (aset c 1 nil)
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))

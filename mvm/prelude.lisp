@@ -1359,15 +1359,14 @@
    copy.  Without this, future `'foo` references re-allocate a fresh
    symbol, (eq 'foo 'foo) returns NIL, and CLOS marker checks
    ((eq (aref instance 0) '%clos-instance)) misclassify."
-  ;; DIAG: recursion-depth check.  Per the runaway-recursion investigation
-  ;; (reference_aarch64_post_stack_move_wedge.md), %intern-symbol may
-  ;; participate in a cycle with gethash + a third function.  Use slot
-  ;; 0x10000C80 as a recursion counter — increment on entry, decrement
-  ;; on exit.  If depth > 100, halt with 'IR' marker.  100 is generous;
-  ;; real %intern-symbol calls don't nest.
+  ;; Recursion-depth check.  Slot 0x10000C80 holds the current depth
+  ;; (incr on entry, decr on exit).  Cap at 100: the previously-known
+  ;; cause (a %signal-type-error → 'type-error → %intern-symbol cycle)
+  ;; was fixed in c1-conditions.lisp by pre-caching the TYPE-ERROR
+  ;; symbol, but the cap remains as a guard against future re-entries.
   (let ((depth (mem-ref #x10000C80 :u64)))
     (when (> depth 100)
-      (write-char-serial 10) (write-char-serial 73) (write-char-serial 82) ; "IR"
+      (write-char-serial 10) (write-char-serial 73) (write-char-serial 82) ; IR
       (write-char-serial 33) (print-dec depth) (write-char-serial 10)
       (halt))
     (setf (mem-ref #x10000C80 :u64) (+ depth 1)))

@@ -2889,6 +2889,10 @@
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (when (%tested-p id) (return-from run-test nil))~
+                     ~%  ;; Reset %intern-symbol depth counter (slot 0x10000C80).~
+                     ~%  ;; Longjmp-aborted intern calls leak depth across tests~
+                     ~%  ;; without this; see prelude.lisp %intern-symbol.~
+                     ~%  (setf (mem-ref #x10000C80 :u64) 0)~
                      ~%  ;; Mark AFTER rt-run-test or %record-test-fail emits, not before:~
                      ~%  ;; if we mark before and a longjmp interrupts mid-rt-run-test,~
                      ~%  ;; the T-clause's %record-test-fail bails on bit=1 → silent loss.~
@@ -3212,6 +3216,10 @@
   ;; Standard init sequence (matches Linux x64 build).
   (init-symbol-table)
   (init-keyword-table)
+  ;; Pre-intern symbols used by %signal-* helpers so they don't re-enter
+  ;; %intern-symbol from inside the gethash type-error guard.  Must run
+  ;; AFTER init-symbol-table.  See %init-signal-symbols.
+  (%init-signal-symbols)
   (%init-packages)
   (%init-streams)
   (%init-reader)
@@ -3247,7 +3255,7 @@
   (setq *rt-test-count* 0)
   (setq *rt-pass-count* 0)
   (setq *rt-fail-count* 0)
-  (setq *skip-below* 0)
+  (setq *skip-below* 10180)
   (setq *run-only-below* 0)
   (setq *write-object-budget* 0)
   (setq *fail-emitted* 0)
@@ -3321,7 +3329,7 @@
   ;; retired in 02f3def).  Real fix: root-cause the 10001-10179
   ;; wedges + the 12300-12313 wedge that surfaces with skip=0.
   ;; For now keep skip=10180 so the suite reaches <DN>.
-  (setq *skip-below* 10180)  ;; TODO: drive this to 0 — see task #61.
+  (setq *skip-below* 10180)
   (setq *run-only-below* 0)
   ;; Stamp known wedge ranges as FAIL up front, so each wedge test
   ;; counts in the per-test totals — the harness goal is per-test

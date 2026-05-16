@@ -1359,16 +1359,31 @@
    copy.  Without this, future `'foo` references re-allocate a fresh
    symbol, (eq 'foo 'foo) returns NIL, and CLOS marker checks
    ((eq (aref instance 0) '%clos-instance)) misclassify."
+  ;; DIAG: recursion-depth check.  Per the runaway-recursion investigation
+  ;; (reference_aarch64_post_stack_move_wedge.md), %intern-symbol may
+  ;; participate in a cycle with gethash + a third function.  Use slot
+  ;; 0x10000C80 as a recursion counter — increment on entry, decrement
+  ;; on exit.  If depth > 100, halt with 'IR' marker.  100 is generous;
+  ;; real %intern-symbol calls don't nest.
+  (let ((depth (mem-ref #x10000C80 :u64)))
+    (when (> depth 100)
+      (write-char-serial 10) (write-char-serial 73) (write-char-serial 82) ; "IR"
+      (write-char-serial 33) (print-dec depth) (write-char-serial 10)
+      (halt))
+    (setf (mem-ref #x10000C80 :u64) (+ depth 1)))
   (let ((table (mem-ref #x10000088 :u64)))
     (let ((existing (gethash name-hash table)))
       (if existing
-          existing
+          (progn
+            (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
+            existing)
           (let ((sym (%make-symbol)))
             (aset sym 0 name-hash)
             ;; Re-read the root — GC during %make-symbol may have moved
             ;; the table object and updated the root slot.
             (let ((live-table (mem-ref #x10000088 :u64)))
               (puthash name-hash live-table sym))
+            (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
             sym)))))
 
 (defun %intern-keyword (name-hash)

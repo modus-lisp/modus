@@ -1292,38 +1292,58 @@
 ;;; the value itself (cons pointers, fixnums, etc.).
 
 (defun symbol-value (name-or-hash)
-  "Look up a global variable by name hash or symbol object."
+  "Look up a global variable by name hash or symbol object.
+   Uses explicit consp checks so a corrupted alist entry doesn't trip
+   the compile-cxr-guard %SIGNAL-TYPE-ERROR path — if it did, the
+   subsequent (setq *current-condition* c) inside %signal-type-error
+   would re-enter set-symbol-value on the same corrupted alist and
+   recurse to stack-overflow.  See reference_aarch64_te_recursion_fix.md."
   (let ((key (if (integerp name-or-hash) name-or-hash
-                 (aref name-or-hash 0)))  ; extract hash from symbol object
+                 (aref name-or-hash 0)))
         (head (mem-ref #x10000080 :u64)))
     (if (zerop head)
         nil
-        (let ((cur head))
+        (let ((cur head)
+              (result nil)
+              (found nil))
           (loop
-            (when (null cur) (return nil))
+            (when found (return result))
+            (when (not (consp cur)) (return nil))
             (let ((pair (car cur)))
-              (when (eql (car pair) key)
-                (return (cdr pair))))
+              (when (consp pair)
+                (when (eql (car pair) key)
+                  (setq result (cdr pair))
+                  (setq found t))))
             (setq cur (cdr cur)))))))
 
 (defun set-symbol-value (name-hash value)
-  "Set a global variable by its tagged name hash."
+  "Set a global variable by its tagged name hash.
+   Uses explicit consp checks (see symbol-value docstring) so a
+   corrupted alist entry can't recursively invoke %signal-type-error
+   via the compile-cxr guard."
   (let ((head (mem-ref #x10000080 :u64)))
     (if (zerop head)
         (progn
           (setf (mem-ref #x10000080 :u64)
                 (cons (cons name-hash value) nil))
           value)
-        (let ((cur head))
+        (let ((cur head)
+              (done nil)
+              (result value))
           (loop
-            (when (null cur)
+            (when done (return result))
+            (when (not (consp cur))
+              ;; Hit a corrupted tail — prepend a new entry as if alist
+              ;; ended here.  Better than recursing into %signal-type-error.
               (setf (mem-ref #x10000080 :u64)
                     (cons (cons name-hash value) head))
-              (return value))
+              (setq done t)
+              (return result))
             (let ((pair (car cur)))
-              (when (eql (car pair) name-hash)
+              (when (and (consp pair) (eql (car pair) name-hash))
                 (set-cdr pair value)
-                (return value)))
+                (setq done t)
+                (return result)))
             (setq cur (cdr cur)))))))
 
 ;;; ============================================================

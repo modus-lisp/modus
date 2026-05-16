@@ -795,27 +795,6 @@
     (emit-aarch64-load-imm64 buf x1 #x50000701)
     (emit-aarch64-str-x buf x1 x0 0)
 
-    ;; 7da. Stack-overflow guard: mark L2[56] (VA 0x07000000-0x071FFFFF)
-    ;;     as INVALID so stack-overflow faults cleanly at the 16 MB
-    ;;     boundary below stack-top (0x08000000).  Without this, a
-    ;;     runaway recursion observed in the post-stack-move wedge can
-    ;;     grow the stack 86 MB into VA 0x02xxxxxx — landing inside
-    ;;     the image's low-VA mirror and corrupting code.  16 MB
-    ;;     window is ~16K frames at 1 KB each: plenty for legitimate
-    ;;     Lisp depth, but bounds the bug at a known fault address.
-    ;;
-    ;;     NOTE: this change SHIFTS native code layout by ~12 bytes,
-    ;;     which on AArch64 currently surfaces a different latent
-    ;;     wedge earlier in the test set (P regresses 3641 → ~2200
-    ;;     in 10-min runs).  See reference_aarch64_post_stack_move_wedge.md.
-    ;;     Keep the guard anyway — it's the structurally correct fix
-    ;;     and the metric regression is layout-fragility, not a guard
-    ;;     bug.  When we land per-arch fragility fixes the P number
-    ;;     should recover and the guard's value stands.
-    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 56 8)))
-    (emit-aarch64-load-imm64 buf x1 0)                  ; INVALID entry
-    (emit-aarch64-str-x buf x1 x0 0)
-
     ;; 7e. Override L2[64] = GIC identity map, VA 0x08000000-0x081FFFFF
     ;;     → PA 0x08000000-0x081FFFFF (device memory).  Required for the
     ;;     AArch64 ANSI build's per-test deadline IRQ: setup-irq writes

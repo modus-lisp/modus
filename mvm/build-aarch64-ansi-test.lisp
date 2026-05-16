@@ -2933,6 +2933,10 @@
                      ~%;; remaining test in [first-id..last-id] as FAIL so we get~
                      ~%;; per-test coverage even when a file deadlocks.~
                      ~%(defun fork-file (first-id last-id thunk)~
+                     ~%  ;; Reset %intern-symbol depth counter at the start of every~
+                     ~%  ;; file's fork-file dispatch so leaks from one file's init~
+                     ~%  ;; phase don't accumulate into the next file's run.~
+                     ~%  (setf (mem-ref #x10000C80 :u64) 0)~
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (%save-outer-handler)~

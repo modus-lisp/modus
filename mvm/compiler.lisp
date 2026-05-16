@@ -4020,7 +4020,10 @@
                             (= (normalize-name (car rest)) 729509721274984859))  ; OF-TYPE
                    (setf rest (cddr rest)))
                  (cond
-                   ;; Case 1: =-destructuring (legacy NTH-based path)
+                   ;; Case 1: =-destructuring (legacy NTH-based path).
+                   ;; Handles both proper-list patterns `(A B C)' and dotted
+                   ;; patterns `(A . B)' / `(A B . C)'.  For dotted, the tail
+                   ;; symbol gets bound to the NTHCDR of value-form, not NTH.
                    ((and rest (symbolp (car rest))
                          (= (normalize-name (car rest)) 1009698407182718722))  ; =
                     (let ((value-form (cadr rest))
@@ -4030,14 +4033,29 @@
                                             :init-form value-form
                                             :step-form value-form)
                             (loop-state-iterations state))
-                      (let ((idx 0))
-                        (dolist (comp components)
-                          (let ((acc `(nth ,idx ,g)))
-                            (push (make-loop-iter :kind :general :var comp
-                                                  :init-form acc
-                                                  :step-form acc)
-                                  (loop-state-iterations state)))
-                          (setf idx (+ idx 1))))
+                      (let ((idx 0)
+                            (cur components))
+                        (loop
+                          (cond
+                            ((null cur) (return nil))
+                            ((consp cur)
+                             ;; Proper-list element: bind to (nth idx g)
+                             (let ((comp (car cur)))
+                               (let ((acc `(nth ,idx ,g)))
+                                 (push (make-loop-iter :kind :general :var comp
+                                                       :init-form acc
+                                                       :step-form acc)
+                                       (loop-state-iterations state))))
+                             (setf cur (cdr cur))
+                             (setf idx (+ idx 1)))
+                            (t
+                             ;; Dotted tail symbol: bind to (nthcdr idx g)
+                             (let ((acc `(nthcdr ,idx ,g)))
+                               (push (make-loop-iter :kind :general :var cur
+                                                     :init-form acc
+                                                     :step-form acc)
+                                     (loop-state-iterations state)))
+                             (return nil)))))
                       (setf var nil)))
                    ;; Case 2: IN/ON/ACROSS with destructuring pattern.
                    ;; Replace var with gensym; queue destructure pairs to be

@@ -3439,6 +3439,18 @@
        (cond
          ;; Don't walk inside (quote …) or (function …).
          ((or (eq head 'quote) (eq head 'function)) acc)
+         ;; Don't walk inside (sb-int:quasiquote …) — the template
+         ;; contains SB-IMPL::COMMA structs in expression positions
+         ;; (e.g. `(let ,bindings ,body)' has COMMA at the bindings
+         ;; position of an inner LET), and %collect-free-vars' LET
+         ;; handler (cadr form) returns a COMMA struct where it
+         ;; expects a list — type-error → outer handler-case eats the
+         ;; whole RUN-ANSI-X defun.  compile-form expands quasiquote
+         ;; before lowering anyway, so free-var collection over the
+         ;; raw template is the wrong thing.  Reach into the expansion
+         ;; via expand-backquote and collect from THAT.
+         ((eq head 'sb-int:quasiquote)
+          (%collect-free-vars (expand-backquote (cadr form)) bound env acc))
          ;; LET: bindings see OUTER scope; body sees inner.
          ((eq head 'let)
           (let ((bindings (cadr form))

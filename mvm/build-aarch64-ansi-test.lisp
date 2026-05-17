@@ -3521,6 +3521,16 @@
 (defun test-if-not-in-cl-package (str)
   (declare (ignore str))
   nil)
+;; NOTNOT and the EQ*T family — ANSI-aux versions use
+;; (APPLY #'VALUES (MAPCAR #'NOTNOT (MULTIPLE-VALUE-LIST ...))) which
+;; relies on a working MV / APPLY-VALUES path on bare metal; failures
+;; there cascade into hundreds of comparison tests.  Re-stub with the
+;; simple bool-coerce so last-defun-wins picks ours.
+(defun notnot (x) (if x t nil))
+(defun eqt    (a b) (if (eq a b) t nil))
+(defun eqlt   (a b) (if (eql a b) t nil))
+(defun equalt (a b) (if (equal a b) t nil))
+(defun equalpt (a b) (if (equalp a b) t nil))
 "
     (string #\Newline)
     ;; 7. Driver (sys-exit, kernel-main).

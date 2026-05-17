@@ -3511,6 +3511,18 @@
           id))))
 "
     (string #\Newline)
+    ;; 6d. Late overrides for test-source defuns that get clobbered by the
+    ;; ANSI test fixtures.  test-if-not-in-cl-package's modus stub (returns
+    ;; NIL — symbol is in CL) gets overridden by /tmp/modus-full-source.lisp
+    ;; (ansi-aux's real impl using find-symbol/symbol-plist), which doesn't
+    ;; work on the bare-metal package system and FAILs ~980 cl-symbols tests.
+    ;; Re-define after all aux loads so last-defun-wins picks ours.
+    "
+(defun test-if-not-in-cl-package (str)
+  (declare (ignore str))
+  nil)
+"
+    (string #\Newline)
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count
     ;; so kernel-main can print EXP:N before running tests.

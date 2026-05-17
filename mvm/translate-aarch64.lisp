@@ -3044,7 +3044,13 @@
     ;; object and wedged the runtime.  Stored SHL'd to match
     ;; (mem-ref :u64)'s tagging convention on the Lisp side.
     (a64-load-imm64 buf +a64-x16+ #x10000068)
-    (a64-lsl-imm buf +a64-x17+ +a64-sp+ 1)
+    ;; LSL encodes reg 31 as XZR, so (lsl x17, sp, 1) produced (lsl x17, xzr, 1)
+    ;; = 0, and every GC stored saved_rsp = 0.  Move SP to x17 via ADD-IMM
+    ;; (which encodes reg 31 as SP) FIRST, then shift.  Diagnosed via gdb
+    ;; watchpoint on 0x10000068 (2026-05-17): str x17, [x16] preceded by
+    ;; lsl x17, xzr, #1 — caught the offending instruction.
+    (a64-add-imm buf +a64-x17+ +a64-sp+ 0)        ; mov x17, sp
+    (a64-lsl-imm buf +a64-x17+ +a64-x17+ 1)       ; x17 = SP << 1
     (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)
     ;; Set NARGS = 0 for the %gc-collect call (the ABI puts nargs at
     ;; raw u32 slot 0x10000150; only matters if the callee has an

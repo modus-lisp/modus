@@ -656,6 +656,19 @@
                    `(let ((,tmp ,(car args)))
                       (if ,tmp ,tmp (or ,@(cdr args))))))))))
 
+  ;; DEFSTRUCT* → DEFSTRUCT — ANSI-aux defines defstruct* as a macro that
+  ;; wraps (eval-when ... (handler-case (eval '(defstruct ...)) (sc () nil))),
+  ;; which buries the inner defstruct behind eval + handler-case so MVM's
+  ;; compile-toplevel never sees a real DEFSTRUCT and named constructors
+  ;; / accessors never get emitted.  Expand directly to the inner defstruct
+  ;; — same semantics as ANSI-aux's intent (silently best-effort), since
+  ;; if the defstruct has unsupported options Modus's DEFSTRUCT handler
+  ;; will signal at build, not silently swallow.  Tests passing means
+  ;; the struct definition succeeded.
+  (mvm-define-macro "DEFSTRUCT*"
+    (lambda (form)
+      `(defstruct ,@(cdr form))))
+
   ;; CASE → LET + COND + EQL
   (mvm-define-macro "CASE"
     (lambda (form)
@@ -8659,7 +8672,12 @@
             ;; Parse options
             (conc-name-specified nil)
             (conc-name nil)  ; nil = no prefix, string = prefix
-            (include-parent nil))
+            (include-parent nil)
+            ;; Named constructors from (:CONSTRUCTOR NAME [arg-spec]).
+            ;; Each entry: (name . arg-spec) where arg-spec is
+            ;; :default (use struct slot order), NIL (0-arg ctor), or
+            ;; a list of slot-name symbols (positional in that order).
+            (named-constructors nil))
        ;; Process options
        (dolist (opt options)
          (when (consp opt)
@@ -8675,7 +8693,13 @@
                                           (format nil "~A-" (symbol-name cn))))
                                     nil)))  ; (:conc-name nil) → no prefix
                ((name-eq opt-name "INCLUDE")
-                (setf include-parent (cadr opt)))))))
+                (setf include-parent (cadr opt)))
+               ((name-eq opt-name "CONSTRUCTOR")
+                (let ((ctor-sym (cadr opt))
+                      (arg-spec (if (cddr opt) (caddr opt) :default)))
+                  (when (and ctor-sym (symbolp ctor-sym))
+                    (push (cons ctor-sym arg-spec)
+                          named-constructors))))))))
        ;; Default conc-name if not specified
        (unless conc-name-specified
          (setf conc-name (format nil "~A-" struct-str)))
@@ -8727,7 +8751,121 @@
                               (when idx
                                 (setf (nth idx positional) val)))
                             (setf args (cddr args))))
-                 `(,internal-ctor-sym ,@positional))))))
+                 `(,internal-ctor-sym ,@positional)))))
+
+         ;; Named constructors from (:CONSTRUCTOR name [arg-spec])
+         (dolist (nc named-constructors)
+           (let* ((ctor-sym (car nc))
+                  (ctor-fn-name (symbol-name ctor-sym))
+                  (arg-spec (cdr nc))
+                  (internal-ctor-sym (intern internal-ctor-name :modus.mvm)))
+             (cond
+               ;; (:CONSTRUCTOR foo NIL) — 0-arg ctor using slot defaults
+               ((null arg-spec)
+                (push `(defun ,(intern ctor-fn-name :modus.mvm) ()
+                         (,internal-ctor-sym ,@slot-defaults))
+                      forms-to-compile))
+               ;; (:CONSTRUCTOR foo) — positional in struct slot order
+               ((eq arg-spec :default)
+                (let ((params (loop for s in slot-names
+                                    collect (intern (format nil "P-~A"
+                                                            (symbol-name s))
+                                                    :modus.mvm))))
+                  (push `(defun ,(intern ctor-fn-name :modus.mvm) ,params
+                           (,internal-ctor-sym ,@params))
+                        forms-to-compile)))
+               ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — positional in given order.
+               ;; &OPTIONAL / &REST / &KEY lambda-list markers in arg-spec pass
+               ;; through.  For an &OPTIONAL slot we emit (P-SLOT SLOT-DEFAULT)
+               ;; so a call with fewer args than the optional list still gets
+               ;; each slot's declared default value rather than NIL/0.
+               ((consp arg-spec)
+                ;; Normalize arg-spec entries — each becomes one of:
+                ;;   :marker / SYMBOL    — &OPTIONAL/&REST/&KEY keyword
+                ;;   (:plain SLOT-SYM)   — required positional
+                ;;   (:opt SLOT-SYM DEF) — optional with explicit default
+                ;;   (:opt SLOT-SYM)     — optional, slot default supplied later
+                (let* ((optional-seen nil)
+                       (slot-name-eq
+                        (lambda (a b)
+                          (or (eq a b)
+                              (and (symbolp a) (symbolp b)
+                                   (string= (symbol-name a) (symbol-name b))))))
+                       (normalized
+                        (mapcar
+                         (lambda (s)
+                           (cond
+                             ((and (symbolp s)
+                                   (string= (symbol-name s) "&OPTIONAL"))
+                              (setf optional-seen t)
+                              (list :marker s))
+                             ((and (symbolp s)
+                                   (or (string= (symbol-name s) "&REST")
+                                       (string= (symbol-name s) "&KEY")))
+                              (list :marker s))
+                             ((and (symbolp s) optional-seen)
+                              (list :opt s :slot-default))
+                             ((symbolp s)
+                              (list :plain s))
+                             ((and (consp s) (symbolp (car s)))
+                              ;; (SYM DEFAULT) form in &OPTIONAL — explicit default.
+                              (list :opt (car s) (cadr s)))
+                             (t (list :marker s))))
+                         arg-spec))
+                       (params
+                        (mapcar
+                         (lambda (n)
+                           (case (car n)
+                             (:marker (cadr n))
+                             (:plain
+                              (intern (format nil "P-~A"
+                                              (symbol-name (cadr n)))
+                                      :modus.mvm))
+                             (:opt
+                              (let* ((sym (cadr n))
+                                     (explicit (caddr n))
+                                     (default (if (eq explicit :slot-default)
+                                                  (let ((pos (position sym slot-names
+                                                                       :test slot-name-eq)))
+                                                    (if pos (nth pos slot-defaults) nil))
+                                                  explicit))
+                                     (pname (intern (format nil "P-~A"
+                                                            (symbol-name sym))
+                                                    :modus.mvm)))
+                                (list pname default)))))
+                         normalized))
+                       (params-syms
+                        (mapcar (lambda (p) (if (consp p) (car p) p)) params))
+                       ;; arg-spec-slots: just the slot symbols (drop markers).
+                       (arg-spec-slots
+                        (let ((r nil))
+                          (dolist (n normalized)
+                            (when (or (eq (car n) :plain) (eq (car n) :opt))
+                              (push (cadr n) r)))
+                          (nreverse r)))
+                       (arg-spec-syms
+                        (let ((r nil))
+                          (dolist (p params)
+                            (cond
+                              ((symbolp p)
+                               ;; lambda-list marker — skip
+                               (unless (and (>= (length (symbol-name p)) 1)
+                                            (char= (char (symbol-name p) 0) #\&))
+                                 (push p r)))
+                              ((consp p) (push (car p) r))))
+                          (nreverse r)))
+                       ;; Build call-args in struct slot order.
+                       (call-args
+                        (loop for slot in slot-names
+                              for default in slot-defaults
+                              collect
+                              (let ((pos (position slot arg-spec-slots
+                                                   :test slot-name-eq)))
+                                (if pos (nth pos arg-spec-syms) default)))))
+                  (push `(defun ,(intern ctor-fn-name :modus.mvm) ,params
+                           (,internal-ctor-sym ,@call-args))
+                        forms-to-compile))))))
+         )  ; close the (let ((ctor-name ...) ...)) ctor block
 
        ;; Accessors — use conc-name prefix (nil = slot name only)
        (loop for slot in slot-names

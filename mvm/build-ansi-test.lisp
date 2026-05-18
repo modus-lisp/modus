@@ -2237,9 +2237,16 @@
                                   (push setq-s init-forms))))))
                      (labels ((emit-sub (sub)
                                 (when (consp sub)
-                                  ;; Recursively flatten nested progns
-                                  (if (eq (car sub) 'progn)
-                                      (dolist (inner (cdr sub)) (emit-sub inner))
+                                  ;; Recursively flatten nested progns AND eval-when
+                                  ;; bodies — `(eval-when (...) body)' must not be
+                                  ;; written opaquely, since modus' runtime doesn't
+                                  ;; auto-run eval-when-load-toplevel init thunks at
+                                  ;; top level.  Pull body forms into init-forms so
+                                  ;; run-init-X executes them.
+                                  (if (or (eq (car sub) 'progn) (eq (car sub) 'eval-when))
+                                      (let ((body (if (eq (car sub) 'eval-when)
+                                                      (cddr sub) (cdr sub))))
+                                        (dolist (inner body) (emit-sub inner)))
                                       (let ((sub-s (handler-case (format nil "~S" sub)
                                                      (error () nil))))
                                         (when (and sub-s
@@ -2253,8 +2260,11 @@
                                              (write-string sub-s out) (terpri out)
                                              (queue-defvar-setq sub))
                                             (t (push sub-s init-forms)))))))))
-                       (if (and (consp form) (eq (car form) 'progn))
-                           (dolist (sub (cdr form)) (emit-sub sub))
+                       (if (and (consp form)
+                                (or (eq (car form) 'progn) (eq (car form) 'eval-when)))
+                           (let ((body (if (eq (car form) 'eval-when)
+                                           (cddr form) (cdr form))))
+                             (dolist (sub body) (emit-sub sub)))
                            (let ((s (handler-case (format nil "~S" form)
                                       (error () nil))))
                              (when (and s

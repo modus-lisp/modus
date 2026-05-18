@@ -2195,6 +2195,8 @@
                          (when (and test-str
                                     (not (search "#<FUNCTION" test-str))
                                     (not (search "#<CLASS" test-str))
+                                    (not (search "#<BUILT-IN-CLASS" test-str))
+                                    (not (search "#<PACKAGE" test-str))
                                     (not (search "#<SB-" test-str))
                                     (not (search "#<STANDARD" test-str))
                                     (not (search "#<STRUCTURE" test-str))

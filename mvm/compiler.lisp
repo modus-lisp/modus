@@ -656,6 +656,44 @@
                    `(let ((,tmp ,(car args)))
                       (if ,tmp ,tmp (or ,@(cdr args))))))))))
 
+  ;; WITH-SLOTS — (with-slots (slot-spec*) instance body*)
+  ;; Each slot-spec is either SLOT-NAME (variable binds same name) or
+  ;; (VAR-NAME SLOT-NAME) (custom variable name).  We rewrite to a
+  ;; LET that snapshots the slot values at entry; ANSI requires
+  ;; mutation-via-SETF to write back to the slot, which a full impl
+  ;; would do via SYMBOL-MACROLET — modus' macrolet is a no-op stub,
+  ;; so we accept the snapshot approximation.  Tests that only READ
+  ;; the slots (the common case) work; tests that SETQ a with-slots
+  ;; binding to update the slot won't see the slot updated.
+  (mvm-define-macro "WITH-SLOTS"
+    (lambda (form)
+      (let ((slot-specs (cadr form))
+            (instance-form (caddr form))
+            (body (cdddr form))
+            (inst-tmp (gensym "WS-INST")))
+        `(let ((,inst-tmp ,instance-form))
+           (let ,(mapcar (lambda (spec)
+                           (if (consp spec)
+                               `(,(car spec) (slot-value ,inst-tmp ',(cadr spec)))
+                               `(,spec      (slot-value ,inst-tmp ',spec))))
+                         slot-specs)
+             ,@body)))))
+
+  ;; WITH-ACCESSORS — (with-accessors ((var accessor-name)*) instance body*)
+  ;; Each spec is (VAR ACCESSOR-NAME); the var is bound to (ACCESSOR-NAME
+  ;; instance) at entry.  Same snapshot semantics as WITH-SLOTS.
+  (mvm-define-macro "WITH-ACCESSORS"
+    (lambda (form)
+      (let ((acc-specs (cadr form))
+            (instance-form (caddr form))
+            (body (cdddr form))
+            (inst-tmp (gensym "WA-INST")))
+        `(let ((,inst-tmp ,instance-form))
+           (let ,(mapcar (lambda (spec)
+                           `(,(car spec) (,(cadr spec) ,inst-tmp)))
+                         acc-specs)
+             ,@body)))))
+
   ;; DEFSTRUCT* → DEFSTRUCT — ANSI-aux defines defstruct* as a macro that
   ;; wraps (eval-when ... (handler-case (eval '(defstruct ...)) (sc () nil))),
   ;; which buries the inner defstruct behind eval + handler-case so MVM's

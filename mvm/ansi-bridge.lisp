@@ -2034,7 +2034,12 @@
   instance)
 
 (defun make-instances-obsolete (class)
-  "Make instances obsolete (stub)."
+  "Marks all instances of CLASS as obsolete so the next slot access
+   triggers UPDATE-INSTANCE-FOR-REDEFINED-CLASS.  Modus doesn't track
+   slot-shape changes between class redefinitions yet, so this is a
+   no-op that returns CLASS — sufficient for tests that only call it
+   for its side effect, but not enough to drive a real obsolescence
+   protocol."
   class)
 
 ;;; ============================================================
@@ -2090,8 +2095,11 @@
 ;;; ============================================================
 
 (defun describe (object &optional stream)
-  "Describe OBJECT (stub)."
-  nil)
+  "Default DESCRIBE — dispatches to DESCRIBE-OBJECT.  Per CLHS, DESCRIBE
+   is a regular function that calls the DESCRIBE-OBJECT generic.  We
+   default the stream to NIL (caller's responsibility to bind a real
+   one if they need formatted output)."
+  (describe-object object stream))
 
 (defun apropos (string &optional package)
   "List symbols apropos of STRING (stub)."

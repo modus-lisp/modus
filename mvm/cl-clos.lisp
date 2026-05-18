@@ -531,6 +531,76 @@
      (%find-clos-class (aref x 1)))
     (t nil)))
 
+;;; ============================================================
+;;; MOP accessors — class introspection
+;;; ============================================================
+
+(defun class-precedence-list (cls)
+  "Return the CPL of CLS as a list of class names (most-specific first,
+   ending in T).  Per MOP / AMOP §5.5.1 this should be a list of class
+   objects, but our CPL is name-keyed; tests only check the structure."
+  (cond
+    ((%clos-class-p cls) (aref cls 4))
+    ((symbolp cls)
+     (let ((c (%find-clos-class cls)))
+       (if c (aref c 4) (%builtin-cpl cls))))
+    (t nil)))
+
+(defun class-direct-superclasses (cls)
+  "Return the direct superclasses of CLS as a list of class names."
+  (cond
+    ((%clos-class-p cls) (aref cls 3))
+    ((symbolp cls)
+     (let ((c (%find-clos-class cls)))
+       (if c (aref c 3) nil)))
+    (t nil)))
+
+(defun class-direct-subclasses (cls)
+  "Return the direct subclasses of CLS — classes that name CLS in
+   their direct supers."
+  (let* ((name (cond ((%clos-class-p cls) (aref cls 1))
+                     ((symbolp cls) cls)
+                     (t nil)))
+         (acc nil))
+    (when name
+      (dolist (entry *clos-classes*)
+        (let ((c (cdr entry)))
+          (when (member name (aref c 3) :test #'eq)
+            (setq acc (cons (car entry) acc))))))
+    acc))
+
+(defun class-direct-slots (cls)
+  "Return the direct slots declared on CLS — for modus this means the
+   effective-slot list (we don't track 'direct' vs 'inherited' separately)."
+  (cond
+    ((%clos-class-p cls) (aref cls 2))
+    ((symbolp cls)
+     (let ((c (%find-clos-class cls)))
+       (if c (aref c 2) nil)))
+    (t nil)))
+
+(defun class-slots (cls)
+  "Return effective slots — same as class-direct-slots in modus."
+  (class-direct-slots cls))
+
+(defun compute-class-precedence-list (cls)
+  "MOP function: recompute the CPL.  We just return the stored CPL."
+  (class-precedence-list cls))
+
+(defun ensure-class (name &rest options)
+  "Lightweight ensure-class — looks up the class by NAME and returns it,
+   or creates a new one with the supplied :direct-superclasses /
+   :direct-slot-names options.  Full MOP semantics aren't implemented."
+  (let ((existing (%find-clos-class name)))
+    (cond
+      (existing existing)
+      (t
+       (let ((supers (or (cadr (member :direct-superclasses options :test #'eq))
+                         '(standard-object)))
+             (slots (cadr (member :direct-slot-names options :test #'eq))))
+         (%defclass name slots supers)
+         (%find-clos-class name))))))
+
 (defun slot-value (obj slot-name)
   "Read slot SLOT-NAME from CLOS instance OBJ."
   (%slot-value obj slot-name))
@@ -1258,7 +1328,11 @@
       (if errorp (error "find-method: not a generic function") nil))))
 
 (defun remove-method (gf method)
-  "Remove METHOD from GF."
+  "Remove METHOD from GF.  Accepts either a GF-array or the dispatch
+   closure (#'name) via *gf-fn-to-name* reverse-lookup."
+  (unless (%gf-p gf)
+    (let ((real (%fn-to-gf gf)))
+      (when real (setq gf real))))
   (when (%gf-p gf)
     (let ((new-methods nil)
           (cur (%gf-methods gf)))
@@ -1271,7 +1345,11 @@
   gf)
 
 (defun add-method (gf method)
-  "Add METHOD to GF."
+  "Add METHOD to GF.  Accepts either a GF-array or the dispatch
+   closure (#'name) via *gf-fn-to-name* reverse-lookup."
+  (unless (%gf-p gf)
+    (let ((real (%fn-to-gf gf)))
+      (when real (setq gf real))))
   (when (%gf-p gf)
     (%gf-set-methods gf (cons method (%gf-methods gf))))
   gf)

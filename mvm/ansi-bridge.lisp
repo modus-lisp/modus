@@ -2024,7 +2024,14 @@
 ;; was shadowing it via last-defun-wins.
 
 (defun reinitialize-instance (instance &rest initargs)
-  "Reinitialize CLOS instance (stub)."
+  "Per ANSI, REINITIALIZE-INSTANCE calls SHARED-INITIALIZE with the
+   instance, slot-names = NIL (so no initforms re-apply), and the
+   passed initargs.  Returns INSTANCE.
+
+   This was a noisy stub that simply returned INSTANCE without
+   applying initargs at all, breaking reinitialize-instance.lsp's
+   tests that pass `:slot value` and expect the slot updated."
+  (apply #'shared-initialize instance nil initargs)
   instance)
 
 (defun make-instances-obsolete (class)

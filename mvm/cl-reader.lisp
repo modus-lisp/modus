@@ -1375,9 +1375,8 @@
       (setq *print-miser-width* saved-print-miser-width)
       result)))
 
-(defun find-class (name &rest args)
-  "Find class by name. Signals error if not found and errorp is true (default)."
-  (let ((errorp (if args (car args) t)))
-    (if errorp
-        (error "class not found")
-        nil)))
+;; FIND-CLASS lives in cl-conditions.lisp with the real implementation
+;; that consults %find-clos-class + the built-in class proxy table.
+;; The reader-stub here unconditionally errored, shadowing the real defun
+;; only if the load order ever flipped — keep the comment so future
+;; refactors don't re-introduce a stub.

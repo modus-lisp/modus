@@ -1227,10 +1227,15 @@
     ((and (eq (car form) 'signals-error) (cdr form) (cddr form))
      (let ((body (rewrite-reader-forms (cadr form))))
        `(handler-case (progn ,body nil) (error (c) t))))
-    ;; (signals-error-always form type) → same
+    ;; (signals-error-always form type) →
+    ;;   (let ((r (handler-case (progn form nil) (t (c) t)))) (values r r))
+    ;; ANSI definition produces TWO values (one per :safety level); tests
+    ;; using multiple-value-list expect (T T) not (T).  Single-eval to
+    ;; avoid doubling work and to match the AArch64 build (commit 26ee8ef).
     ((and (eq (car form) 'signals-error-always) (cdr form))
      (let ((body (rewrite-reader-forms (cadr form))))
-       `(handler-case (progn ,body nil) (error (c) t))))
+       `(let ((%sea-r (handler-case (progn ,body nil) (t (c) t))))
+          (values %sea-r %sea-r))))
     ;; (classify-error form) → nil stub
     ((eq (car form) 'classify-error)
      nil)

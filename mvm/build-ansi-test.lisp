@@ -3000,6 +3000,11 @@
   ;; CL conditions that handler-case can catch, instead of killing the fork.
   (%init-signal-handling)
 
+  ;; Pre-cache TYPE-ERROR / PROGRAM-ERROR / UNDEFINED-FUNCTION symbols at
+  ;; slots 0xCA0/CA8/CB0 so %signal-* helpers can fetch them without
+  ;; re-entering %intern-symbol on each signal (which would recurse the
+  ;; same hash through gethash → car NIL → %signal-type-error → ...).
+  (%init-signal-symbols)
 
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")

@@ -5127,29 +5127,36 @@
   "Compile (values-list lst).
    Evaluates lst, then iterates it storing values into the MV buffer.
    Returns first element as primary value, extras stored in MV-VALUES-ADDR.
-   Equivalent to: (apply #'values lst) but with proper MV buffer writes."
+   Equivalent to: (apply #'values lst) but with proper MV buffer writes.
+
+   The MV-VALUES region is bounded — only ~25 8-byte slots before adjacent
+   slots (0x10000160 code bounds, 0x100001C0 outer handler, etc.) get
+   clobbered.  Cap idx at 16 to leave headroom.  Without the cap, ANSI
+   tests like `(values-list '(1..1000))` overwrite kernel globals + the
+   FAIL bitmap at 0x10001000, poisoning state for downstream tests
+   (bisected to test 13018 via skip-below sweep 2026-05-18).  Tests
+   using more than 16 values lose the overflow — semantically wrong but
+   bounded; the alternative is silent state corruption that wedges every
+   downstream test (most notably tests 16714+ count-if-not)."
   (let ((lst-tmp (gensym "VL"))
         (cur-tmp (gensym "VLCUR"))
         (idx-tmp (gensym "VLIDX"))
         (cnt-tmp (gensym "VLCNT"))
         (pri-tmp (gensym "VLPRI")))
-    ;; Compile to a runtime loop that:
-    ;; 1. Evaluates lst
-    ;; 2. Counts elements
-    ;; 3. Stores count at MV-COUNT-ADDR
-    ;; 4. Stores elements 2+ at MV-VALUES-ADDR[i]
-    ;; 5. Returns first element
     (compile-form
      `(let* ((,lst-tmp ,list-form)
              (,pri-tmp (if (null ,lst-tmp) nil (car ,lst-tmp)))
              (,cnt-tmp (length ,lst-tmp)))
-        ;; Store count
+        ;; Store count (the visible MV count — handler-case dispatch
+        ;; reads this; oversized counts are OK, just the storage region
+        ;; is capped).
         (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
-        ;; Store extra values (elements 1+) into MV-VALUES-ADDR
+        ;; Store extra values (elements 1+) into MV-VALUES-ADDR with bound.
         (let ((,cur-tmp (if (null ,lst-tmp) nil (cdr ,lst-tmp)))
               (,idx-tmp 0))
           (loop
             (when (null ,cur-tmp) (return nil))
+            (when (>= ,idx-tmp 16) (return nil))   ; cap MV-VALUES storage
             (setf (mem-ref (+ ,+mv-values-addr+ (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
             (setq ,idx-tmp (+ ,idx-tmp 1))
             (setq ,cur-tmp (cdr ,cur-tmp))))

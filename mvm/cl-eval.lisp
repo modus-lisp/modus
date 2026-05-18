@@ -1542,13 +1542,15 @@
 
 ;;; Misc
 (defun values-list (list)
-  "Return elements of LIST as multiple values. Sets MV buffer directly."
+  "Return elements of LIST as multiple values. Sets MV buffer directly.
+   Cap idx at 16 — see compile-values-list for the rationale."
   (let ((n (length list)))
     (setf (mem-ref #x10000090 :u64) n)
     (let ((cur (if (null list) nil (cdr list)))
           (idx 0))
       (loop
         (when (null cur) (return nil))
+        (when (>= idx 16) (return nil))
         (setf (mem-ref (+ #x10000098 (* idx 8)) :u64) (car cur))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))

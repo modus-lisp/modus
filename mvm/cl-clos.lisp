@@ -574,6 +574,41 @@
   "MOP function: recompute the CPL.  We just return the stored CPL."
   (class-precedence-list cls))
 
+(defun class-default-initargs (cls)
+  "ANSI: list of default initargs for CLS.  We don't currently track
+   per-class default initargs, so the list is always NIL."
+  (declare (ignore cls))
+  nil)
+
+(defun class-direct-default-initargs (cls)
+  "ANSI: list of directly-declared default initargs.  Same NIL story."
+  (declare (ignore cls))
+  nil)
+
+(defun class-finalized-p (cls)
+  "MOP: classes are eagerly finalized in modus, so always T."
+  (declare (ignore cls))
+  t)
+
+(defun finalize-inheritance (cls)
+  "MOP no-op — modus finalizes inheritance at %defclass time."
+  cls)
+
+(defun standard-instance-access (instance location)
+  "MOP raw slot access by LOCATION (integer slot index).  Returns
+   the unbound sentinel if the slot is unbound."
+  (let ((idx (+ 2 location)))
+    (when (and (%clos-instance-p instance)
+               (< idx (array-length instance)))
+      (aref instance idx))))
+
+(defun (setf standard-instance-access) (new-val instance location)
+  (let ((idx (+ 2 location)))
+    (when (and (%clos-instance-p instance)
+               (< idx (array-length instance)))
+      (aset instance idx new-val)
+      new-val)))
+
 (defun ensure-class (name &rest options)
   "Lightweight ensure-class — looks up the class by NAME and returns it,
    or creates a new one with the supplied :direct-superclasses /
@@ -1353,6 +1388,36 @@
               (or cls s)))
           (%method-specializers m)))
 
+;;; MOP-ish method accessors that ANSI tests probe.
+(defun method-function (m)
+  "Return the function implementing METHOD M."
+  (%method-fn m))
+
+(defun method-generic-function (m)
+  "Return the GF on which METHOD M is installed.  We don't store a
+   back-pointer per method, so walk the GF registry looking for one
+   whose method list contains M."
+  (let ((cur *generic-functions*))
+    (loop
+      (when (null cur) (return nil))
+      (let ((gf (cdr (car cur))))
+        (when (member m (%gf-methods gf))
+          (return gf)))
+      (setq cur (cdr cur)))))
+
+(defun method-lambda-list (m)
+  "Return the lambda-list for METHOD M.  We don't separately track
+   the lambda-list; reconstruct it from specializers."
+  (let ((specs (%method-specializers m))
+        (i 0))
+    (mapcar (lambda (s)
+              (declare (ignore s))
+              (let ((sym (cond ((= i 0) 'arg0) ((= i 1) 'arg1)
+                               ((= i 2) 'arg2) (t 'argn))))
+                (setq i (+ i 1))
+                sym))
+            specs)))
+
 ;;; ============================================================
 ;;; compute-applicable-methods (public API)
 ;;; ============================================================
@@ -1409,6 +1474,83 @@
             nil)
           nil))
       nil)))
+
+;;; ============================================================
+;;; Method-combination API + error signalers
+;;; ============================================================
+
+(defun find-method-combination (gf type-name options)
+  "Look up the method-combination object named TYPE-NAME.  ANSI takes
+   a GF arg (used to scope short-form lookups); we ignore it since
+   method-combinations are stored in a single global registry."
+  (declare (ignore gf options))
+  (%find-mc type-name))
+
+(defun method-combination-error (format-string &rest format-args)
+  "Signal an error from inside a method-combination body.  Per CLHS,
+   this is only meaningful inside DEFINE-METHOD-COMBINATION; outside
+   it just signals a simple-error.  We accept it everywhere."
+  (declare (ignore format-args))
+  (error format-string))
+
+(defun invalid-method-error (method format-string &rest format-args)
+  "Signal an error indicating METHOD is invalid for its method
+   combination."
+  (declare (ignore method format-args))
+  (error format-string))
+
+(defun compute-applicable-methods-using-classes (gf classes)
+  "AMOP variant of compute-applicable-methods that takes a list of
+   class objects (or class names) instead of argument values.
+   Returns (values methods definitive-p).  Modus matches by class
+   name through the specializer; definitive-p is always T."
+  (unless (%gf-p gf)
+    (let ((real (%fn-to-gf gf)))
+      (when real (setq gf real))))
+  (if (%gf-p gf)
+      (let* ((proxies (mapcar (lambda (c)
+                                (let ((cls (cond ((symbolp c) (%find-clos-class c))
+                                                 ((%clos-class-p c) c)
+                                                 (t nil))))
+                                  (if cls
+                                      ;; Build a fake instance whose class slot is the class name
+                                      ;; so %obj-cpl returns the right CPL.  We just need the
+                                      ;; same shape — a 2-slot array with %clos-instance marker.
+                                      (let ((fake (make-array 2)))
+                                        (aset fake 0 '%clos-instance)
+                                        (aset fake 1 (aref cls 1))
+                                        fake)
+                                      c)))
+                              classes)))
+        (values (%collect-applicable-methods gf proxies) t))
+      (values nil t)))
+
+;;; MAKE-METHOD / CALL-METHOD — used inside DEFINE-METHOD-COMBINATION
+;;; bodies.  We support a minimal interpretation: MAKE-METHOD wraps a
+;;; form into a method record; CALL-METHOD invokes one.
+
+(defun make-method (form)
+  "Wrap FORM in a method record that, when CALL-METHOD-invoked,
+   evaluates FORM (no specialization).  ANSI uses this inside
+   DEFINE-METHOD-COMBINATION body to fabricate methods."
+  (cons nil (cons '(t) (lambda (&rest args)
+                         (declare (ignore args))
+                         (eval form)))))
+
+(defun call-method (method &optional next-methods)
+  "Invoke METHOD with no args, in a context where the next-methods
+   chain is NEXT-METHODS.  Modus doesn't carry a method-context dynvar
+   here, so call-next-method may not see the next chain — best-effort."
+  (declare (ignore next-methods))
+  (let ((fn (%method-fn method)))
+    (funcall fn)))
+
+(defun function-keywords (method)
+  "Return (values keywords allow-other-keys-p) for METHOD's
+   keyword-arg signature.  We don't track per-method keyword
+   signatures, so report empty + NIL."
+  (declare (ignore method))
+  (values nil nil))
 
 (defun nstring-parse-start-end (args len)
   "Parse :start/:end keyword args from ARGS plist. Returns (start . end).

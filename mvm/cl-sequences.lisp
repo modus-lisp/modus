@@ -707,10 +707,21 @@
     (t x)))                      ; fallthrough — might be a wrapper
 
 (defun string= (a b &rest options)
-  "ANSI string= takes string designators (strings, characters, symbols)."
+  "ANSI STRING= — case-SENSITIVE element-wise compare.  STRING-EQUAL is
+   the case-insensitive variant.  Takes string designators (strings,
+   characters, symbols)."
   (declare (ignore options))
-  (string-equal (%string-designator a) (%string-designator b)))
-(defun string/= (a b) (if (string-equal a b) nil t))
+  (let ((sa (%string-designator a))
+        (sb (%string-designator b)))
+    (let ((len (array-length sa)))
+      (if (= len (array-length sb))
+          (let ((i 0))
+            (loop
+              (when (= i len) (return t))
+              (unless (= (aref sa i) (aref sb i)) (return nil))
+              (setq i (+ i 1))))
+          nil))))
+(defun string/= (a b) (if (string= a b) nil t))
 ;;; constantly: captures value. Use global cell.
 (defvar *constantly-value* nil)
 (defun %constantly-impl (&rest args) *constantly-value*)

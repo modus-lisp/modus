@@ -512,11 +512,30 @@
       nil)))
 
 (defun class-of (x)
-  "Return the class of X."
+  "Return the class of X.  Per ANSI 4.3.1, every object has a class.
+   For CLOS instances we look up the registered class; for everything
+   else we hand back a class-proxy keyed on the built-in type so
+   things like (class-of 5) → integer-class behave sensibly with
+   (typep ... 'class) and (class-name ...)."
   (cond
     ((%clos-instance-p x)
      (%find-clos-class (aref x 1)))
-    (t nil)))
+    ((%clos-class-p x)
+     ;; A class object is itself an instance of standard-class.
+     (or (%find-clos-class 'standard-class)
+         (let ((proxy (make-array 2)))
+           (aset proxy 0 '%class-proxy)
+           (aset proxy 1 'standard-class)
+           proxy)))
+    (t
+     ;; Any other value — synthesize a class-proxy for its type-of name
+     ;; so callers get an object that responds to class-name and typep.
+     (let ((type-name (%type-of-for-dispatch x)))
+       (or (%find-clos-class type-name)
+           (let ((proxy (make-array 2)))
+             (aset proxy 0 '%class-proxy)
+             (aset proxy 1 type-name)
+             proxy))))))
 
 ;;; ============================================================
 ;;; MOP accessors — class introspection
@@ -1551,6 +1570,49 @@
    signatures, so report empty + NIL."
   (declare (ignore method))
   (values nil nil))
+
+;;; MOP slot-access wrappers — read/write via class+slot-name.  Modus
+;;; doesn't store slot-definition objects separately from slot-name
+;;; symbols, so SLOT-NAME-OR-DEFINITION here is just the slot name.
+
+(defun slot-value-using-class (class instance slot-name)
+  "MOP entry point for slot read; defaults to %slot-value."
+  (declare (ignore class))
+  (%slot-value instance slot-name))
+
+(defun (setf slot-value-using-class) (new-val class instance slot-name)
+  (declare (ignore class))
+  (set-slot-value instance slot-name new-val))
+
+(defun slot-boundp-using-class (class instance slot-name)
+  (declare (ignore class))
+  (%slot-boundp instance slot-name))
+
+(defun slot-makunbound-using-class (class instance slot-name)
+  (declare (ignore class))
+  (%slot-makunbound instance slot-name))
+
+(defun slot-exists-p-using-class (class instance slot-name)
+  (declare (ignore class))
+  (%slot-exists-p instance slot-name))
+
+;;; Slot-definition accessors — modus uses bare symbols as slot
+;;; definitions, so most of these return the symbol unchanged.
+
+(defun slot-definition-name (slot)         slot)
+(defun slot-definition-allocation (slot)   (declare (ignore slot)) :instance)
+(defun slot-definition-initargs (slot)     (declare (ignore slot)) nil)
+(defun slot-definition-initform (slot)     (declare (ignore slot)) nil)
+(defun slot-definition-initfunction (slot) (declare (ignore slot)) nil)
+(defun slot-definition-readers (slot)      (declare (ignore slot)) nil)
+(defun slot-definition-writers (slot)      (declare (ignore slot)) nil)
+(defun slot-definition-type (slot)         (declare (ignore slot)) t)
+(defun slot-definition-location (slot)
+  "Return the integer location of SLOT in its class — modus doesn't
+   precompute these, so callers that need a constant location must
+   look it up via %clos-slot-index themselves."
+  (declare (ignore slot))
+  nil)
 
 (defun nstring-parse-start-end (args len)
   "Parse :start/:end keyword args from ARGS plist. Returns (start . end).

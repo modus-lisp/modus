@@ -3302,6 +3302,11 @@
   ;; aux helper before reaching the per-test handler.
   (setq char-code-limit       256)
   (setq call-arguments-limit  256)
+  ;; MULTIPLE-VALUES-LIMIT defaults to NIL on bare metal (defvar init-thunk
+  ;; doesn't fire).  Tests like 12498/13018 compute (MIN ... MULTIPLE-VALUES-
+  ;; LIMIT); without init the MIN crashes or uses NIL where a number is
+  ;; expected.  Cap matches compile-values-list's MV-VALUES storage cap (16).
+  (setq multiple-values-limit 16)
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)

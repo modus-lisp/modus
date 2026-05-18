@@ -6463,7 +6463,17 @@
    The obj-subtag IR-op now safely returns 0 for non-tag-9 values
    (translate-x64.lisp's +op-obj-subtag+ handler), so this code can
    reach the bignum-subtag check on T without crashing — the result is
-   simply 'subtag != bignum-subtag' → false."
+   simply 'subtag != bignum-subtag' → false.
+
+   AArch64 quirk: NIL register x26 = 0, which is also the raw bits of
+   fixnum 0.  The previous code did `BNULL dest false-label' to reject
+   NIL after the low-bit-clear check.  That branch falsely matched
+   raw 0 = fixnum 0, making (integerp 0) → NIL.  We drop the NIL
+   rejection — (integerp NIL) also returns T on AArch64 (a minor
+   ANSI-incompatibility) but the much-more-common (integerp 0) case
+   now correctly returns T.  Diagnosed via FORMAT ~[a~;b~;c~] 0 →
+   \"\" wedge: the conditional's (integerp idx) branch was failing
+   for idx=0 across the whole test suite."
   (let ((check-bignum-label (make-compiler-label))
         (true-label (make-compiler-label))
         (false-label (make-compiler-label))
@@ -6475,8 +6485,7 @@
     (emit-ir :li temp 1)
     (emit-ir :test dest temp)
     (emit-ir :bne check-bignum-label)
-    ;; Low bit 0: fixnum if not nil
-    (emit-ir :bnull dest false-label)
+    ;; Low bit 0: fixnum (including NIL on AArch64).
     (emit-ir :br true-label)
     ;; Check bignum
     (emit-ir-label check-bignum-label)

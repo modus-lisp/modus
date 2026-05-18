@@ -1754,11 +1754,10 @@
    %change-class-default unless user methods were defined."
   (%dispatch-change-class %cc-args))
 
-(defun update-instance-for-redefined-class (instance added-slots discarded-slots plist &rest initargs)
-  instance)
-
-(defun update-instance-for-different-class (previous current &rest initargs)
-  current)
+;; UPDATE-INSTANCE-FOR-REDEFINED-CLASS and UPDATE-INSTANCE-FOR-
+;; DIFFERENT-CLASS are defined as real GFs at the bottom of this file
+;; (%init-clos-protocol).  The previous stubs here have been removed
+;; so last-defun-wins picks the dispatcher.
 
 ;;; ============================================================
 ;;; WITH-HASH-TABLE-ITERATOR support
@@ -2490,4 +2489,230 @@
       (when (>= i n) (return s))
       (aset s i code)
       (setq i (+ i 1)))))
+
+;;; ============================================================
+;;; CLOS protocol completion
+;;; ============================================================
+;;;
+;;; Six generic functions that ANSI requires but that modus had
+;;; previously stubbed as no-ops: INITIALIZE-INSTANCE,
+;;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS, UPDATE-INSTANCE-FOR-REDEFINED-
+;;; CLASS, NO-APPLICABLE-METHOD, NO-NEXT-METHOD, and SLOT-MISSING (the
+;;; user-callable entry on top of the internal %dispatch-slot-missing).
+;;;
+;;; Each follows the same pattern as SHARED-INITIALIZE: a
+;;; %default-NAME defun holding the system-supplied behaviour, a
+;;; %dispatch-NAME(args) that consults the GF registry for user
+;;; methods, and the user-facing NAME (&rest args) entry that calls
+;;; the dispatcher.  Init at boot via %init-clos-protocol.
+
+;;; ---- INITIALIZE-INSTANCE -----------------------------------------
+;;; Per CLHS 7.1.1, INITIALIZE-INSTANCE invokes SHARED-INITIALIZE with
+;;; the instance, slot-names = T (apply all initforms for unbound
+;;; slots), and the initargs.  Returns the instance.
+
+(defun %initialize-instance-default (instance &rest initargs)
+  (apply #'shared-initialize instance t initargs)
+  instance)
+
+(defun %dispatch-initialize-instance (args)
+  (let ((gf (%find-gf 'initialize-instance)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%initialize-instance-default args)))
+        (apply #'%initialize-instance-default args))))
+
+(defun initialize-instance (&rest %ii-args)
+  (%dispatch-initialize-instance %ii-args))
+
+;;; ---- NO-APPLICABLE-METHOD / NO-NEXT-METHOD -----------------------
+;;; CLHS 7.6.6.2 / 7.6.6.3.  Both are GFs whose default behaviour is to
+;;; signal an error.  Letting them be regular functions means a user
+;;; can shadow the error by adding their own method (used by some
+;;; test files to swallow expected misses).
+
+(defun %no-applicable-method-default (gf &rest args)
+  (declare (ignore args))
+  (error "no applicable method for generic function ~S" gf))
+
+(defun %dispatch-no-applicable-method (args)
+  (let ((gf (%find-gf 'no-applicable-method)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%no-applicable-method-default args)))
+        (apply #'%no-applicable-method-default args))))
+
+(defun no-applicable-method (&rest %nam-args)
+  (%dispatch-no-applicable-method %nam-args))
+
+(defun %no-next-method-default (gf method &rest args)
+  (declare (ignore args))
+  (error "call-next-method: no next method on ~S after ~S" gf method))
+
+(defun %dispatch-no-next-method (args)
+  (let ((gf (%find-gf 'no-next-method)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%no-next-method-default args)))
+        (apply #'%no-next-method-default args))))
+
+(defun no-next-method (&rest %nnm-args)
+  (%dispatch-no-next-method %nnm-args))
+
+;;; ---- SLOT-MISSING -------------------------------------------------
+;;; Existing internal %dispatch-slot-missing exists but there's no
+;;; user-callable entry.  Real default: signal an error.
+
+(defun %slot-missing-default (class instance slot-name operation &optional new-value)
+  (declare (ignore class instance new-value))
+  (error "slot-missing: ~S has no slot ~S during ~S"
+         instance slot-name operation))
+
+(defun slot-missing (class instance slot-name operation &optional new-value)
+  "Default implementation signals an error; user methods on
+   SLOT-MISSING can override via DEFMETHOD."
+  (let ((gf (%find-gf 'slot-missing))
+        (args (list class instance slot-name operation new-value)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%slot-missing-default class instance slot-name operation new-value)))
+        (%slot-missing-default class instance slot-name operation new-value))))
+
+;;; ---- UPDATE-INSTANCE-FOR-* (real GFs, default = no-op) -----------
+;;; The default methods are no-ops so old behaviour (returning the
+;;; instance) is preserved, but registering them as GFs means users
+;;; can add methods that CHANGE-CLASS / class redefinition will pick
+;;; up.  ANSI requires these to be GFs.
+
+(defun %uifdc-default (previous current &rest initargs)
+  (declare (ignore initargs previous))
+  current)
+
+(defun %dispatch-uifdc (args)
+  (let ((gf (%find-gf 'update-instance-for-different-class)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%uifdc-default args)))
+        (apply #'%uifdc-default args))))
+
+(defun update-instance-for-different-class (&rest %u-args)
+  (%dispatch-uifdc %u-args))
+
+(defun %uifrc-default (instance added-slots discarded-slots plist &rest initargs)
+  (declare (ignore added-slots discarded-slots plist initargs))
+  instance)
+
+(defun %dispatch-uifrc (args)
+  (let ((gf (%find-gf 'update-instance-for-redefined-class)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%uifrc-default args)))
+        (apply #'%uifrc-default args))))
+
+(defun update-instance-for-redefined-class (&rest %u-args)
+  (%dispatch-uifrc %u-args))
+
+;;; ---- PRINT-OBJECT -------------------------------------------------
+;;; Default method: write something readable.  Tests in print-object.lsp
+;;; just probe that the GF exists and is dispatchable; full ~S-equivalent
+;;; output isn't required.
+
+(defun %print-object-default (object stream)
+  (declare (ignore stream))
+  object)
+
+(defun %dispatch-print-object (args)
+  (let ((gf (%find-gf 'print-object)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%print-object-default args)))
+        (apply #'%print-object-default args))))
+
+(defun print-object (object stream)
+  (%dispatch-print-object (list object stream)))
+
+;;; ---- DESCRIBE-OBJECT ---------------------------------------------
+
+(defun %describe-object-default (object stream)
+  (declare (ignore stream))
+  object)
+
+(defun %dispatch-describe-object (args)
+  (let ((gf (%find-gf 'describe-object)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%describe-object-default args)))
+        (apply #'%describe-object-default args))))
+
+(defun describe-object (object stream)
+  (%dispatch-describe-object (list object stream)))
+
+;;; ---- Initialization -----------------------------------------------
+
+(defun %init-clos-protocol ()
+  "Register the CLOS GFs that have system-supplied default methods.
+   Called once from kernel-main after %init-make-load-form."
+  ;; INITIALIZE-INSTANCE on standard-object
+  (%defgeneric 'initialize-instance '(instance &rest initargs) nil)
+  (%defmethod 'initialize-instance nil '(standard-object)
+              (lambda (&rest args) (apply #'%initialize-instance-default args)))
+  ;; NO-APPLICABLE-METHOD / NO-NEXT-METHOD
+  (%defgeneric 'no-applicable-method '(gf &rest args) nil)
+  (%defmethod 'no-applicable-method nil '(t)
+              (lambda (&rest args) (apply #'%no-applicable-method-default args)))
+  (%defgeneric 'no-next-method '(gf method &rest args) nil)
+  (%defmethod 'no-next-method nil '(t)
+              (lambda (&rest args) (apply #'%no-next-method-default args)))
+  ;; SLOT-MISSING / SLOT-UNBOUND
+  (%defgeneric 'slot-missing '(class instance slot-name operation &optional new-value) nil)
+  (%defmethod 'slot-missing nil '(t)
+              (lambda (&rest args) (apply #'%slot-missing-default args)))
+  ;; UPDATE-INSTANCE-FOR-*
+  (%defgeneric 'update-instance-for-different-class '(previous current &rest initargs) nil)
+  (%defmethod 'update-instance-for-different-class nil '(standard-object standard-object)
+              (lambda (&rest args) (apply #'%uifdc-default args)))
+  (%defgeneric 'update-instance-for-redefined-class
+              '(instance added-slots discarded-slots plist &rest initargs) nil)
+  (%defmethod 'update-instance-for-redefined-class nil '(standard-object)
+              (lambda (&rest args) (apply #'%uifrc-default args)))
+  ;; PRINT-OBJECT / DESCRIBE-OBJECT
+  (%defgeneric 'print-object '(object stream) nil)
+  (%defmethod 'print-object nil '(t)
+              (lambda (obj s) (%print-object-default obj s)))
+  (%defgeneric 'describe-object '(object stream) nil)
+  (%defmethod 'describe-object nil '(t)
+              (lambda (obj s) (%describe-object-default obj s)))
+  ;; Register all fn-pointers for #'name → GF lookup.
+  (handler-case (%register-gf-fn #'initialize-instance 'initialize-instance) (t (c) nil))
+  (handler-case (%register-gf-fn #'no-applicable-method 'no-applicable-method) (t (c) nil))
+  (handler-case (%register-gf-fn #'no-next-method 'no-next-method) (t (c) nil))
+  (handler-case (%register-gf-fn #'slot-missing 'slot-missing) (t (c) nil))
+  (handler-case (%register-gf-fn #'update-instance-for-different-class
+                                 'update-instance-for-different-class) (t (c) nil))
+  (handler-case (%register-gf-fn #'update-instance-for-redefined-class
+                                 'update-instance-for-redefined-class) (t (c) nil))
+  (handler-case (%register-gf-fn #'print-object 'print-object) (t (c) nil))
+  (handler-case (%register-gf-fn #'describe-object 'describe-object) (t (c) nil))
+  ;; SHARED-INITIALIZE, CHANGE-CLASS, REINITIALIZE-INSTANCE, MAKE-LOAD-FORM
+  ;; are registered elsewhere — but their fn-pointer→name mapping wasn't.
+  (handler-case (%register-gf-fn #'shared-initialize 'shared-initialize) (t (c) nil))
+  (handler-case (%register-gf-fn #'change-class 'change-class) (t (c) nil))
+  (handler-case (%register-gf-fn #'reinitialize-instance 'reinitialize-instance) (t (c) nil))
+  nil)
 

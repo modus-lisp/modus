@@ -3029,6 +3029,13 @@
   ;; from an explicit init defun.
   (%init-make-load-form)
 
+  ;; Register the rest of the CLOS protocol — initialize-instance,
+  ;; update-instance-for-*-class, no-applicable-method, no-next-method,
+  ;; slot-missing, print-object, describe-object — as real GFs with
+  ;; default methods.  Without these, tests that do
+  ;; (compute-applicable-methods #'initialize-instance ...) get NIL.
+  (%init-clos-protocol)
+
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")
 

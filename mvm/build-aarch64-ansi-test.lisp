@@ -3095,6 +3095,14 @@
 (defvar *wedge-worker-id* 0)
 (defvar *wedge-actor-deadline* 200)
 (defun run-test-via-actor (id thunk expected)
+  ;; Bypass actor routing: directly use regular run-test.  The actor
+  ;; system was corrupting state for downstream tests (~700 lost tests
+  ;; including the entire count-if-not range 16714+).  Per-test deadline
+  ;; (200 ticks ≈ 20s wall) still catches infinite-loop wedges via
+  ;; IRQ longjmp.  Diagnosed via skip-below bisect 2026-05-18: with all
+  ;; 17 actor tests disabled, P 7388→8062 (+674).
+  (run-test id thunk expected)
+  (return-from run-test-via-actor nil)
   (when (%tested-p id) (return-from run-test-via-actor nil))
   (when (= *wedge-worker-id* 0)
     (setq *wedge-worker-id* (actor-spawn (fn-addr %wedge-worker))))

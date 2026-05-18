@@ -883,8 +883,16 @@
                 (emit-bytes buf #x41 #x58)         ; pop r8
                 (emit-bytes buf #x5A)              ; pop rdx
                 (emit-bytes buf #x5F)              ; pop rdi
-                ;; Result in V0 = NIL
-                (emit-bytes buf #x49 #x89 #xFE)))  ; mov rsi, r15
+                ;; Result in V0 = NIL.
+                ;; Encoding for `mov rsi, r15`: REX.W|R = 0x4C, opcode 0x89,
+                ;; ModRM 0xFE (mod=11, reg=R15 via REX.R, rm=RSI).  Previous
+                ;; bytes 0x49 0x89 0xFE encoded `mov r14, rdi` (REX.W|B with
+                ;; reg=RDI, rm=R14 via REX.B), silently clobbering the
+                ;; alloc-limit r14 every time signal handlers were installed
+                ;; — every subsequent GC check then took the wrong branch
+                ;; and the allocator walked past the mmap region, SEGV'ing
+                ;; mid-test (e.g. test 3091 on Linux x64 after %INTERN-SYMBOL).
+                (emit-bytes buf #x4C #x89 #xFE)))  ; mov rsi, r15
              (t
               ;; Real CPU trap
               (emit-mov-reg-imm buf 'rax code)

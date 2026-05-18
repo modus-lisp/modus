@@ -2645,14 +2645,21 @@
     ;; Vector: allocate array object and fill with elements
     ((vectorp value)
      (let ((n (length value)))
-       ;; Allocate into a temp slot so element compile-quote (which may
-       ;; call %INTERN-SYMBOL and clobber VR) doesn't corrupt the pointer
+       ;; arr-slot holds the array pointer across element compile-quote
+       ;; calls.  When an element is a symbol, compile-quote emits a
+       ;; CALL to %INTERN-SYMBOL.  On x64 only V4 (RBX) is callee-saved;
+       ;; V5+ (RCX, RDX, R10, ...) are caller-saved and get clobbered by
+       ;; the call.  On AArch64 V4-V7 are callee-saved which masked the
+       ;; bug.  Push/pop arr-slot around each element so the pointer
+       ;; survives — mirrors the cons-iterative path at line ~2606.
        (let ((arr-slot (alloc-temp-reg)))
          (emit-ir :alloc-obj arr-slot n +subtag-array+)
          (when (> n 0)
            (let ((elem-slot (alloc-temp-reg)))
              (dotimes (i n)
+               (emit-ir :push arr-slot)
                (compile-quote (aref value i) elem-slot)
+               (emit-ir :pop arr-slot)
                (emit-ir :obj-set arr-slot i elem-slot))
              (free-temp-reg)))
          (unless (= dest arr-slot)

@@ -2038,6 +2038,50 @@
   "Make instances obsolete (stub)."
   class)
 
+;;; ============================================================
+;;; MAKE-LOAD-FORM — GF with default error-signaling methods
+;;; ============================================================
+;;;
+;;; Per CLHS 4.3.5 / 21.1, MAKE-LOAD-FORM is a generic function.  The
+;;; system-supplied methods on STANDARD-OBJECT, STRUCTURE-OBJECT, and
+;;; CONDITION all signal an error; users override per class.  Tests in
+;;; make-load-form.lsp probe both branches:
+;;;  - (compute-applicable-methods #'make-load-form (list obj)) → non-NIL
+;;;  - (handler-case (make-load-form obj) (error nil :good)) → :good
+;;; Without the GF registered, the test bodies error on #'make-load-form
+;;; (UNDEFINED-FUNCTION), the outer handler-case catches, and the whole
+;;; file crash-fails.
+
+(defun %make-load-form-default (obj &optional env)
+  (declare (ignore env))
+  (error "no MAKE-LOAD-FORM method defined for ~S" obj))
+
+(defun make-load-form (obj &optional env)
+  "Generic function — dispatches via %gf-dispatch."
+  (%gf-dispatch 'make-load-form (list obj env)))
+
+(defun %init-make-load-form ()
+  "Register the MAKE-LOAD-FORM GF and its default error-signaling
+   methods on STANDARD-OBJECT, STRUCTURE-OBJECT, and CONDITION.
+   Top-level forms don't auto-run on bare-metal builds, so this has
+   to be called explicitly from kernel-main."
+  (%defgeneric 'make-load-form '(object &optional environment) nil)
+  (%defmethod 'make-load-form nil '(standard-object)
+              #'%make-load-form-default)
+  (%defmethod 'make-load-form nil '(structure-object)
+              #'%make-load-form-default)
+  (%defmethod 'make-load-form nil '(condition)
+              #'%make-load-form-default)
+  (handler-case (%register-gf-fn #'make-load-form 'make-load-form)
+                (t (c) nil)))
+
+(defun make-load-form-saving-slots (object &key slot-names environment)
+  "Stub.  Returns NIL — should construct a load form recreating the
+   instance with the named slots; full impl requires the printer to
+   walk the form, which we don't support yet."
+  (declare (ignore object slot-names environment))
+  nil)
+
 (defun set-find-class (name class)
   "Set the class for NAME (stub)."
   nil)
@@ -2288,22 +2332,10 @@
           (%program-error "slot-value requires a slot name")
           (%slot-value obj slot-name))))
 
-;;; COMPUTE-APPLICABLE-METHODS — strict 2-arg arity
-(defun compute-applicable-methods (gf &rest more)
-  (if (null more)
-      (%program-error "compute-applicable-methods requires exactly 2 arguments")
-      (if (cdr more)
-          (%program-error "compute-applicable-methods requires exactly 2 arguments")
-          ;; Stub: call the GF's compute-applicable-methods if available
-          (let ((args (car more)))
-            (if (null gf)
-                nil
-                (if (and (consp gf) (eq (car gf) '%generic-function))
-                    (let ((methods (%gf-methods gf))
-                          (result nil))
-                      (dolist (m methods (nreverse result))
-                        (setq result (cons m result))))
-                    nil))))))
+;;; COMPUTE-APPLICABLE-METHODS — lives in cl-clos.lisp now with real
+;;; GF-array support + #'name reverse lookup via *gf-fn-to-name*.  The
+;;; stub here checked `(consp gf)' which never matched our array-shaped
+;;; gf-objects, silently returning NIL for every well-formed call.
 
 ;;; GENTEMP — strict 0-2 arg arity; also accepts make-symbol result as package
 (defun gentemp (&rest args)

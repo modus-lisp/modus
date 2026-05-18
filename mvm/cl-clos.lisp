@@ -1100,13 +1100,30 @@
 ;;; only recognizes the underlying gf-object (4-slot array, %generic-function
 ;;; marker), not the dispatch wrapper that #'foo actually resolves to.
 (defvar *gf-stub-closures* nil)
+;; Reverse-lookup alist for COMPUTE-APPLICABLE-METHODS / FIND-METHOD
+;; when called with #'name — maps fn-pointer → gf-name symbol so the
+;; GF object can be resolved via %find-gf.
+(defvar *gf-fn-to-name* nil)
 
-(defun %register-gf-fn (val)
+(defun %register-gf-fn (val &optional gf-name)
   "Add VAL (a closure or raw fn-addr) to *gf-stub-closures* so
-   %generic-function-p recognises it.  Idempotent — won't add duplicates."
+   %generic-function-p recognises it.  Idempotent — won't add duplicates.
+   When GF-NAME is supplied (or recoverable from a closure's body),
+   also record the fn → name mapping for reverse lookup."
   (unless (member val *gf-stub-closures*)
     (setq *gf-stub-closures* (cons val *gf-stub-closures*)))
+  (when gf-name
+    (let ((existing (assoc val *gf-fn-to-name*)))
+      (when (null existing)
+        (setq *gf-fn-to-name* (cons (cons val gf-name) *gf-fn-to-name*)))))
   val)
+
+(defun %fn-to-gf (fn)
+  "Resolve a function pointer / closure to its underlying GF object,
+   or NIL if FN is not a registered GF dispatch stub."
+  (let ((entry (assoc fn *gf-fn-to-name*)))
+    (when entry
+      (%find-gf (cdr entry)))))
 
 (defun %make-gf-stub (gf-name)
   "Build a runtime gf-dispatch closure that captures GF-NAME.  Returns
@@ -1203,8 +1220,14 @@
 
 (defun find-method (gf qualifiers specializers &rest args)
   "Find a method on GF.  ARGS is (errorp); when non-nil and no method
-   matches, signal an error."
+   matches, signal an error.  Accepts either the GF-array or the
+   dispatch closure (#'name shape) — the latter resolves through
+   *gf-fn-to-name*."
   (let ((errorp (if args (car args) t)))
+    ;; Resolve fn-pointer to real gf-array if needed.
+    (unless (%gf-p gf)
+      (let ((real (%fn-to-gf gf)))
+        (when real (setq gf real))))
     (if (%gf-p gf)
       (let ((methods (%gf-methods gf))
             (result nil))
@@ -1270,10 +1293,16 @@
 ;;; ============================================================
 
 (defun compute-applicable-methods (gf args)
-  "Return applicable methods for GF called with ARGS."
-  (if (%gf-p gf)
-    (%collect-applicable-methods gf args)
-    nil))
+  "Return applicable methods for GF called with ARGS.
+   Accepts either the gf-array (4-slot %generic-function descriptor)
+   or the dispatch closure (#'gf-name shape) — the latter is resolved
+   via *gf-fn-to-name* set up by %register-gf-fn."
+  (cond
+    ((%gf-p gf) (%collect-applicable-methods gf args))
+    (t (let ((real-gf (%fn-to-gf gf)))
+         (if real-gf
+             (%collect-applicable-methods real-gf args)
+             nil)))))
 
 ;;; ============================================================
 ;;; typep support for generic-function / standard-method

@@ -3023,6 +3023,12 @@
   ;; same hash through gethash → car NIL → %signal-type-error → ...).
   (%init-signal-symbols)
 
+  ;; Register MAKE-LOAD-FORM as a GF with default error-signaling methods
+  ;; on STANDARD-OBJECT / STRUCTURE-OBJECT / CONDITION.  Top-level forms
+  ;; don't auto-run on bare metal, so the defmethod calls have to fire
+  ;; from an explicit init defun.
+  (%init-make-load-form)
+
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")
 

@@ -675,7 +675,8 @@
 
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,
-   element-wise for strings."
+   case-SENSITIVE element-wise for strings.  ANSI: EQUAL on strings
+   is case-sensitive; STRING-EQUAL is the case-insensitive variant."
   (if (eql a b)
       t
       (if (consp a)
@@ -686,7 +687,7 @@
               nil)
           (if (stringp a)
               (if (stringp b)
-                  (string-equal a b)
+                  (string= a b)
                   nil)
               nil))))
 

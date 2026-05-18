@@ -6441,8 +6441,37 @@
     (free-temp-reg)))
 
 (defun compile-symbolp (arg env dest)
-  "Compile (symbolp x) - true if object with symbol subtag #x50"
-  (compile-object-subtype-p arg env dest +subtag-symbol+))
+  "Compile (symbolp x) — true if object with symbol subtag #x50 OR
+   keyword subtag #x53.  Per CLHS, keywords ARE symbols (just with
+   the KEYWORD package); the per-subtag predicate KEYWORDP narrows
+   to #x53.  CLAUDE.md documents the dual-subtag contract."
+  (let ((true-label  (make-compiler-label))
+        (false-label (make-compiler-label))
+        (end-label   (make-compiler-label))
+        (temp  (alloc-temp-reg))
+        (temp2 (alloc-temp-reg)))
+    (compile-form arg env dest)
+    ;; Tag check: obj?
+    (emit-ir :obj-tag temp dest)
+    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :bne false-label)
+    ;; Subtag check: symbol OR keyword.
+    (emit-ir :obj-subtag temp dest)
+    (emit-ir :li temp2 (ash +subtag-symbol+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    (emit-ir :li temp2 (ash +subtag-keyword+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    (emit-ir-label false-label)
+    (compile-nil dest)
+    (emit-ir :br end-label)
+    (emit-ir-label true-label)
+    (compile-t dest)
+    (emit-ir-label end-label)
+    (free-temp-reg)
+    (free-temp-reg)))
 
 (defun compile-prim-stringp (arg env dest)
   "Compile primitive (stringp x) — checks subtag without wrapper peel."

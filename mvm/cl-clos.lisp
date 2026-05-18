@@ -306,35 +306,22 @@
 ;;; handles the rest — class-object args, missing/extra args, runtime
 ;;; (eval `(make-instance ...)) callers).
 (defun make-instance (&rest args)
+  "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and calls
+   INITIALIZE-INSTANCE on it with the initargs.  INITIALIZE-INSTANCE
+   in turn invokes SHARED-INITIALIZE with slot-names = T so initforms
+   apply to any slots not set by initargs.  Returns the instance.
+
+   This was a hand-coded initarg+initform loop bypassing the GF
+   protocol — that worked for the simple build-time-rewriter shape
+   but skipped user-defined INITIALIZE-INSTANCE methods entirely."
   (cond
-    ;; Strict arity: (make-instance) with no class is a program-error.
     ((null args) (error "make-instance: requires a class designator"))
     (t
      (let* ((class-or-name (car args))
             (initargs (cdr args))
             (inst (%make-instance class-or-name)))
        (when (null inst) (return-from make-instance nil))
-       ;; Apply initargs: for each :keyword value pair, look up the
-       ;; corresponding slot name via the class's initarg-map.
-       (let ((class-name (aref inst 1))
-             (cur initargs))
-         (loop
-           (when (or (null cur) (null (cdr cur))) (return nil))
-           (let ((kw (car cur)) (val (cadr cur)))
-             (let ((slot (%clos-initarg-to-slot class-name kw)))
-               (when slot
-                 (set-slot-value inst slot val))))
-           (setq cur (cddr cur))))
-       ;; Apply :initform thunks for slots that weren't initarg-set
-       ;; and remain unbound.
-       (let ((cls (%find-clos-class (aref inst 1))))
-         (when cls
-           (let ((slot-names (aref cls 2)))
-             (dolist (sname slot-names)
-               (when (eql (aref inst (+ 2 (%clos-slot-index cls sname))) -999)
-                 (let ((thunk (%clos-initform-thunk class-name sname)))
-                   (when thunk
-                     (set-slot-value inst sname (funcall thunk)))))))))
+       (apply #'initialize-instance inst initargs)
        inst))))
 
 (defun %make-instance (class-or-name)

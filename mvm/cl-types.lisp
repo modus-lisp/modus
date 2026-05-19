@@ -1324,7 +1324,14 @@
 
 (defun numeric-value-less-p (a b)
   "Return T if numeric value A < numeric value B.
-   Handles integers, boxed floats, and tagged ratios (subtag #x33)."
+   Handles integers, boxed floats (subtag #x60 IEEE or #x32 rational
+   form), and tagged ratios (subtag #x33)."
+  ;; IEEE-float either side: coerce to rational and recurse.  Without
+  ;; this, < on IEEE-bit floats falls through and returns NIL, breaking
+  ;; (< 1.0 2.0) and friends.
+  (when (or (%ieee-float-p a) (%ieee-float-p b))
+    (return-from numeric-value-less-p
+      (numeric-value-less-p (%coerce-numeric a) (%coerce-numeric b))))
   (cond
     ;; Both integers
     ((and (integerp a) (integerp b)) (< a b))
@@ -1379,7 +1386,11 @@
 (defun numeric-equal-p (a b)
   "Return T if A equals B numerically.
    Tagged-ratio aware: ratios are normalised so num/den uniquely
-   represents value, hence componentwise compare is sufficient."
+   represents value, hence componentwise compare is sufficient.
+   IEEE float: coerce to rational and recurse."
+  (when (or (%ieee-float-p a) (%ieee-float-p b))
+    (return-from numeric-equal-p
+      (numeric-equal-p (%coerce-numeric a) (%coerce-numeric b))))
   (cond
     ((and (integerp a) (integerp b)) (= a b))
     ((and (floatp-impl a) (floatp-impl b)) (float-equal a b))

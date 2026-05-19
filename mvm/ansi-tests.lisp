@@ -2390,6 +2390,57 @@
     (deftest 5595 (imagpart (* (complex 1 2) (complex 3 4))) 10)
     (t (c) (%record-test-fail-or-emit 5595)))
 
+  ;; --- expt ---
+  (handler-case (deftest 5600 (expt 2 10) 1024) (t (c) (%record-test-fail-or-emit 5600)))
+  (handler-case (deftest 5601 (expt 2 0) 1) (t (c) (%record-test-fail-or-emit 5601)))
+  (handler-case (deftest 5602 (expt 3 4) 81) (t (c) (%record-test-fail-or-emit 5602)))
+  ;; expt with negative power → ratio
+  (handler-case (deftest 5603 (numerator (expt 2 -1)) 1) (t (c) (%record-test-fail-or-emit 5603)))
+  (handler-case (deftest 5604 (denominator (expt 2 -1)) 2) (t (c) (%record-test-fail-or-emit 5604)))
+
+  ;; --- with-slots writable via symbol-macrolet ---
+  (handler-case
+    (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))
+                    (with-slots (radius) c
+                      (setq radius 99)
+                      radius)) 99)
+    (t (c) (%record-test-fail-or-emit 5610)))
+  ;; Verify the write actually hits the slot (not just the local var)
+  (handler-case
+    (deftest 5611 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))
+                    (with-slots (radius) c
+                      (setq radius 99))
+                    (slot-value c 'radius)) 99)
+    (t (c) (%record-test-fail-or-emit 5611)))
+
+  ;; --- symbol-macrolet ---
+  (handler-case (deftest 5615 (symbol-macrolet ((sm (+ 1 2)))
+                                (+ sm 10)) 13)
+    (t (c) (%record-test-fail-or-emit 5615)))
+
+  ;; --- pathname-match-p / wild-pathname-p ---
+  (handler-case (deftest 5620 (wild-pathname-p "*.lisp") t)
+    (t (c) (%record-test-fail-or-emit 5620)))
+  (handler-case (deftest 5621 (wild-pathname-p "foo.lisp") nil)
+    (t (c) (%record-test-fail-or-emit 5621)))
+  (handler-case (deftest 5622 (pathname-match-p "foo.lisp" "*.lisp") t)
+    (t (c) (%record-test-fail-or-emit 5622)))
+  (handler-case (deftest 5623 (pathname-match-p "foo.txt" "*.lisp") nil)
+    (t (c) (%record-test-fail-or-emit 5623)))
+  (handler-case (deftest 5624 (pathname-match-p "f.o" "?.o") t)
+    (t (c) (%record-test-fail-or-emit 5624)))
+
+  ;; --- documentation registry ---
+  (handler-case (deftest 5630 (progn (set-documentation 'foo 'function "fn doc")
+                                     (documentation 'foo 'function)) "fn doc")
+    (t (c) (%record-test-fail-or-emit 5630)))
+  (handler-case (deftest 5631 (documentation 'bar-not-set 'function) nil)
+    (t (c) (%record-test-fail-or-emit 5631)))
+
+  ;; --- apropos-list ---
+  (handler-case (deftest 5640 (notnot (apropos-list "CAR")) t)
+    (t (c) (%record-test-fail-or-emit 5640)))
+
   nil)
 
 ;; --- EQL specializer ---

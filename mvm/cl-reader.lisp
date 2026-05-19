@@ -973,10 +973,13 @@
         ((or (= code 65) (= code 97))  ; A a
          (%read-internal stream t nil t)
          nil)
-        ;; #C — complex (stub)
+        ;; #C(r i) — complex literal.  Read the inner (r i) list, then
+        ;; build the complex object.
         ((or (= code 67) (= code 99))  ; C c
-         (%read-internal stream t nil t)
-         nil)
+         (let ((pair (%read-internal stream t nil t)))
+           (if (and (consp pair) (consp (cdr pair)))
+               (complex (car pair) (cadr pair))
+               (car pair))))
         ;; #P — pathname (stub)
         ((or (= code 80) (= code 112))  ; P p
          (%read-internal stream t nil t)

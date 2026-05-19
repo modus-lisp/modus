@@ -265,9 +265,10 @@
 
 (defstruct binding
   name               ; symbol name
-  location           ; :reg or :stack
+  location           ; :reg / :stack / :symbol-macro
   reg                ; virtual register number if :reg
-  stack-slot)        ; stack slot index if :stack
+  stack-slot         ; stack slot index if :stack
+  expansion)         ; replacement form when :symbol-macro
 
 (defstruct compiled-module
   (bytecode (make-array 0 :element-type '(unsigned-byte 8)))
@@ -658,13 +659,12 @@
 
   ;; WITH-SLOTS — (with-slots (slot-spec*) instance body*)
   ;; Each slot-spec is either SLOT-NAME (variable binds same name) or
-  ;; (VAR-NAME SLOT-NAME) (custom variable name).  We rewrite to a
-  ;; LET that snapshots the slot values at entry; ANSI requires
-  ;; mutation-via-SETF to write back to the slot, which a full impl
-  ;; would do via SYMBOL-MACROLET — modus' macrolet is a no-op stub,
-  ;; so we accept the snapshot approximation.  Tests that only READ
-  ;; the slots (the common case) work; tests that SETQ a with-slots
-  ;; binding to update the slot won't see the slot updated.
+  ;; (VAR-NAME SLOT-NAME) (custom variable name).  Now that
+  ;; SYMBOL-MACROLET works, each binding becomes a symbol-macro that
+  ;; expands to (slot-value INSTANCE 'SLOT) — reads work and SETF
+  ;; writes properly back to the slot (the symbol-macrolet → SETF
+  ;; chain in compile-setq routes through compile-form on the
+  ;; expansion).
   (mvm-define-macro "WITH-SLOTS"
     (lambda (form)
       (let ((slot-specs (cadr form))
@@ -672,16 +672,18 @@
             (body (cdddr form))
             (inst-tmp (gensym "WS-INST")))
         `(let ((,inst-tmp ,instance-form))
-           (let ,(mapcar (lambda (spec)
-                           (if (consp spec)
-                               `(,(car spec) (slot-value ,inst-tmp ',(cadr spec)))
-                               `(,spec      (slot-value ,inst-tmp ',spec))))
-                         slot-specs)
+           (symbol-macrolet
+               ,(mapcar (lambda (spec)
+                          (if (consp spec)
+                              `(,(car spec) (slot-value ,inst-tmp ',(cadr spec)))
+                              `(,spec      (slot-value ,inst-tmp ',spec))))
+                        slot-specs)
              ,@body)))))
 
   ;; WITH-ACCESSORS — (with-accessors ((var accessor-name)*) instance body*)
-  ;; Each spec is (VAR ACCESSOR-NAME); the var is bound to (ACCESSOR-NAME
-  ;; instance) at entry.  Same snapshot semantics as WITH-SLOTS.
+  ;; Each spec is (VAR ACCESSOR-NAME); the var binds to a symbol-macro
+  ;; that expands to (ACCESSOR-NAME INSTANCE), so SETF on the var
+  ;; updates the slot via (setf (accessor instance) v).
   (mvm-define-macro "WITH-ACCESSORS"
     (lambda (form)
       (let ((acc-specs (cadr form))
@@ -689,9 +691,10 @@
             (body (cdddr form))
             (inst-tmp (gensym "WA-INST")))
         `(let ((,inst-tmp ,instance-form))
-           (let ,(mapcar (lambda (spec)
-                           `(,(car spec) (,(cadr spec) ,inst-tmp)))
-                         acc-specs)
+           (symbol-macrolet
+               ,(mapcar (lambda (spec)
+                          `(,(car spec) (,(cadr spec) ,inst-tmp)))
+                        acc-specs)
              ,@body)))))
 
   ;; DEFSTRUCT* → DEFSTRUCT — ANSI-aux defines defstruct* as a macro that
@@ -1852,7 +1855,10 @@
               (emit-ir :mov dest src))))
          (:stack
           ;; Load from stack slot: load [VFP - (slot+1)*8]
-          (emit-ir :stack-load dest (binding-stack-slot binding)))))
+          (emit-ir :stack-load dest (binding-stack-slot binding)))
+         (:symbol-macro
+          ;; Compile the expansion form in place of the symbol reference.
+          (compile-form (binding-expansion binding) env dest))))
       ;; Compile-time constant: fold to literal
       ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
          (unless (eq const-val :not-found)
@@ -2485,10 +2491,30 @@
       ((= op-name 535180122462347159)
        (compile-form (cadr form) env dest))
 
-      ;; SYMBOL-MACROLET — (symbol-macrolet bindings body...) → compile body
-      ;; (expansions are handled at rewrite level for ANSI tests; here just skip bindings)
+      ;; SYMBOL-MACROLET — (symbol-macrolet ((name expansion-form)*) body*)
+      ;; Each NAME, when referenced in BODY, is replaced by EXPANSION-FORM.
+      ;; We extend the compile-env with :symbol-macro bindings; the
+      ;; compile-variable-ref path detects them and compiles the
+      ;; expansion instead.  Per ANSI, SETF on a symbol-macrolet name
+      ;; is equivalent to SETF on the expansion — handled in compile-setq
+      ;; via the same env lookup.
       ((= op-name 494270185402127659)
-       (compile-progn (cddr form) env dest))
+       (let* ((sm-bindings (cadr form))
+              (sm-body (cddr form))
+              (new-bindings (compile-env-bindings env)))
+         (dolist (sb sm-bindings)
+           (when (consp sb)
+             (setq new-bindings
+                   (cons (make-binding :name (car sb)
+                                       :location :symbol-macro
+                                       :expansion (cadr sb))
+                         new-bindings))))
+         (let ((new-env (make-compile-env
+                         :bindings new-bindings
+                         :stack-depth (compile-env-stack-depth env)
+                         :parent (compile-env-parent env)
+                         :fn-names (compile-env-fn-names env))))
+           (compile-progn sm-body new-env dest))))
 
       ;; EVAL-WHEN — (eval-when (situations) forms...) → compile body when :execute present
       ;; In our compiler there's no compile vs load distinction, always execute
@@ -3381,7 +3407,12 @@
 ;;; ============================================================
 
 (defun compile-setq (var val env dest)
-  "Compile (setq var val)"
+  "Compile (setq var val).  symbol-macrolet name → (setf expansion val)
+   per CLHS 5.1.2.4."
+  (let ((sm-binding (env-lookup env var)))
+    (when (and sm-binding (eq (binding-location sm-binding) :symbol-macro))
+      (return-from compile-setq
+        (compile-form `(setf ,(binding-expansion sm-binding) ,val) env dest))))
   (compile-form val env dest)
   (let ((binding (env-lookup env var)))
     (cond
@@ -3391,7 +3422,10 @@
           (unless (= (binding-reg binding) dest)
             (emit-ir :mov (binding-reg binding) dest)))
          (:stack
-          (emit-ir :stack-store dest (binding-stack-slot binding)))))
+          (emit-ir :stack-store dest (binding-stack-slot binding)))
+         (:symbol-macro
+          ;; Already handled above; defensive fallthrough.
+          (compile-form `(setf ,(binding-expansion binding) ,val) env dest))))
       ;; Global variable: emit call to set-symbol-value
       ((gethash (normalize-name var) *globals*)
        (let ((hash (normalize-name var)))

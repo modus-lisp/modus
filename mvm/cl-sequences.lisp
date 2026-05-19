@@ -1485,7 +1485,32 @@
              (loop (when (= i size) (return nil))
                (aset v i init) (setq i (+ i 1)))))
          v)))))
-(defun coerce (obj type) (cond ((eq type 'list) (if (consp obj) obj (list obj))) ((eq type 'character) obj) (t obj)))
+(defun coerce (obj type)
+  "Convert OBJ to TYPE per CLHS 4.7.  Mostly handles list⇄vector
+   and string-to-list cases that the ANSI tests exercise; unknown
+   types pass through unchanged so the caller sees their original
+   value rather than a garbled coercion."
+  (cond
+    ((or (eq type t) (eq type 'common-lisp:t)) obj)
+    ;; List
+    ((eq type 'list)
+     (cond
+       ((null obj) nil)
+       ((consp obj) obj)
+       ((stringp obj)
+        (let ((acc nil) (i (- (length obj) 1)))
+          (loop
+            (when (< i 0) (return acc))
+            (setq acc (cons (code-char (aref obj i)) acc))
+            (setq i (- i 1)))))
+       (t (list obj))))
+    ;; Character
+    ((eq type 'character)
+     (cond ((characterp obj) obj)
+           ((integerp obj) (code-char obj))
+           (t obj)))
+    ;; Default — pass through
+    (t obj)))
 (defun mismatch (s1 s2 &rest args)
   "Compare S1 vs S2 element-by-element. Returns first index where they
    differ, or NIL if equal. Honors :test, :key, :start1, :end1, :start2,

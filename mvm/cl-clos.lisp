@@ -2132,7 +2132,20 @@
        (sqrt (if (= den 1) num (%make-rat num den)))))
     (t 0)))
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
-(defun set-subseq (seq start end val) seq)  ; stub
+(defun set-subseq (seq start end val)
+  "Destructively replace seq[start..end] with val.  Returns seq.
+   Per CLHS, this is the SETF expansion of subseq.  Modus copies
+   from VAL into SEQ between START and END (or end of seq); both
+   must be sequences."
+  (let* ((seq-len (length seq))
+         (effective-end (if end (if (< end seq-len) end seq-len) seq-len))
+         (val-len (length val))
+         (copy-len (min (- effective-end start) val-len))
+         (i 0))
+    (loop
+      (when (>= i copy-len) (return seq))
+      (setf (elt seq (+ start i)) (elt val i))
+      (setq i (+ i 1)))))
 (defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))
 ;; NTH-VALUE — compile-time macro at compiler.lisp:847 handles direct
 ;; call; this runtime defun is for #'NTH-VALUE / funcall-on-symbol.

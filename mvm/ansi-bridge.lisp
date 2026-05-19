@@ -1675,6 +1675,43 @@
 (defun sleep (n) nil)
 
 ;;; ============================================================
+;;; Environment introspection
+;;; ============================================================
+
+(defun lisp-implementation-type ()    "Modus")
+(defun lisp-implementation-version () "0.0.1")
+(defun machine-instance ()            "modus")
+(defun machine-type ()                "x86_64")
+(defun machine-version ()             "x86_64")
+(defun software-type ()               "Modus")
+(defun software-version ()            "0.0.1")
+(defun short-site-name ()             nil)
+(defun long-site-name ()              nil)
+
+;;; ============================================================
+;;; Float versions of integer division — return integer parts as
+;;; integers (modus has no native floats); the fractional remainder is
+;;; reported as a rational.  Mostly returns sensible values for cases
+;;; the ANSI test suite asks about (integer/integer pairs).
+;;; ============================================================
+
+(defun ftruncate (n &optional (d 1))
+  (let ((q (truncate n d)))
+    (values q (- n (* q d)))))
+
+(defun ffloor (n &optional (d 1))
+  (let ((q (floor n d)))
+    (values q (- n (* q d)))))
+
+(defun fceiling (n &optional (d 1))
+  (let ((q (ceiling n d)))
+    (values q (- n (* q d)))))
+
+(defun fround (n &optional (d 1))
+  (let ((q (round n d)))
+    (values q (- n (* q d)))))
+
+;;; ============================================================
 ;;; CLOS MOP Stubs
 ;;; ============================================================
 

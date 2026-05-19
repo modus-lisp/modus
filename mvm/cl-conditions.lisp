@@ -136,6 +136,13 @@
                   (setq result (append result (list parg)))))))
           result))))
 
+(defun %make-condition (type-designator initargs-list)
+  "Internal helper — same as MAKE-CONDITION but takes initargs as a list
+   rather than spreaded.  Some Modus internals (cl-eval, signal helpers)
+   call this without an apply because they already have the plist as
+   a list and don't want a runtime &rest reassembly."
+  (apply 'make-condition type-designator initargs-list))
+
 (defun make-condition (type-designator &rest initargs)
   "Create a condition instance of the given type with initargs."
   (let ((type-name (if (symbolp type-designator) type-designator nil)))

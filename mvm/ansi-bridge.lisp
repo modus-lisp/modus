@@ -883,6 +883,7 @@
 
 (defun rassoc (item alist &rest args)
   "Find first pair in ALIST whose cdr matches ITEM.
+   Skip NIL entries; error on other non-cons alist element.
    :test defaults to inline `eql` (#'eql is unusable in MVM)."
   (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
@@ -892,14 +893,16 @@
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))
-        (when (consp pair)
-          (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
-            (when (if test-fn (funcall test-fn item val) (eql item val))
-              (return pair)))))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "rassoc: not a cons"))
+              (t (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+                   (when (if test-fn (funcall test-fn item val) (eql item val))
+                     (return pair))))))
       (setq cur (cdr cur)))))
 
 (defun rassoc-if (pred alist &rest args)
-  "Find first pair in ALIST whose cdr satisfies PRED."
+  "Find first pair in ALIST whose cdr satisfies PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS)."
   (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
@@ -907,14 +910,16 @@
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))
-        (when (consp pair)
-          (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
-            (when (funcall pred val)
-              (return pair)))))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "rassoc-if: not a cons"))
+              (t (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+                   (when (funcall pred val)
+                     (return pair))))))
       (setq cur (cdr cur)))))
 
 (defun rassoc-if-not (pred alist &rest args)
   "Find first pair in ALIST whose cdr does NOT satisfy PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS).
    Inlined (rather than `(apply #'rassoc-if (lambda ...) ...)') to dodge
    apply-of-rest fragility."
   (%subst-check-kwargs args)
@@ -924,14 +929,16 @@
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))
-        (when (consp pair)
-          (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
-            (when (not (funcall pred val))
-              (return pair)))))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "rassoc-if-not: not a cons"))
+              (t (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+                   (when (not (funcall pred val))
+                     (return pair))))))
       (setq cur (cdr cur)))))
 
 (defun assoc-if (pred alist &rest args)
-  "Find first pair in ALIST whose car satisfies PRED."
+  "Find first pair in ALIST whose car satisfies PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS)."
   (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
@@ -939,14 +946,16 @@
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))
-        (when (consp pair)
-          (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
-            (when (funcall pred k)
-              (return pair)))))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "assoc-if: not a cons"))
+              (t (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
+                   (when (funcall pred k)
+                     (return pair))))))
       (setq cur (cdr cur)))))
 
 (defun assoc-if-not (pred alist &rest args)
   "Find first pair in ALIST whose car does NOT satisfy PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS).
    Inlined (rather than `(apply #'assoc-if (lambda ...) ...)') to dodge
    apply-of-rest fragility."
   (%subst-check-kwargs args)
@@ -956,10 +965,11 @@
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))
-        (when (consp pair)
-          (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
-            (when (not (funcall pred k))
-              (return pair)))))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "assoc-if-not: not a cons"))
+              (t (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
+                   (when (not (funcall pred k))
+                     (return pair))))))
       (setq cur (cdr cur)))))
 
 ;; find-if / find-if-not previously had bridge overrides here that only

@@ -239,10 +239,11 @@
       (loop
         (when (null cur) (return nil))
         (let ((pair (car cur)))
-          (when (consp pair)
-            (let ((c (if key-fn (funcall key-fn (car pair)) (car pair))))
-              (when (if test (funcall test key c) (eql key c))
-                (return pair)))))
+          (cond ((null pair) nil)        ; skip NIL alist entries (SBCL-compat)
+                ((not (consp pair)) (error "assoc: not a cons"))
+                (t (let ((c (if key-fn (funcall key-fn (car pair)) (car pair))))
+                     (when (if test (funcall test key c) (eql key c))
+                       (return pair))))))
         (setq cur (cdr cur))))))
 
 (defun assoc-string (key alist)

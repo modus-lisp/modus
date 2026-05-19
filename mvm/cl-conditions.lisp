@@ -1164,14 +1164,46 @@
                (let ((sz (and (cdr type) (cadr type))))
                  (or (null sz) (eq sz '*) (eq sz t)
                      (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (vector elt-type size) — vector with optional element-type and size.
+         ;; (array elt-type [dims-or-size]) / (vector elt-type [size]) /
+         ;; (simple-array elt-type [dims-or-size])
+         ;; Element-type matters: elt-type=T means a general-T array (not
+         ;; string, not bit-vector); elt-type=* matches any; elt-type=CHARACTER
+         ;; requires string; elt-type=BIT requires bit-vector.  For
+         ;; (vector T n) we still want T to match general arrays only.
+         ;; (Modus's strings are subtag #x31; general arrays #x32.)
          ((or (eq head 'vector) (eq head 'simple-vector)
               (eq head 'simple-array) (eq head 'array))
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32))
-               (let ((sz (and (cddr type) (caddr type))))
-                 (or (null sz) (eq sz '*) (eq sz t)
-                     (and (integerp sz) (= sz (array-length obj)))))))
+               (let* ((et (and (cdr type) (cadr type)))
+                      (sz (and (cddr type) (caddr type)))
+                      (is-string  (= (obj-subtag obj) #x31))
+                      (is-array   (= (obj-subtag obj) #x32))
+                      ;; Only treat as bit-vector when it has elements
+                      ;; (otherwise empty array would heuristic-match
+                      ;; bit-vector and exclude (array T)).
+                      (is-bitvec  (and is-array
+                                       (> (array-length obj) 0)
+                                       (bit-vector-p obj)))
+                      (et-ok
+                       (cond
+                         ((or (null et) (eq et '*) (eq et t))
+                          ;; T excludes strings/bit-vectors; * matches all
+                          (if (or (null et) (eq et '*))
+                              t
+                              (and is-array (not is-bitvec) (not is-string))))
+                         ((eq et 'character)            is-string)
+                         ((eq et 'base-char)            is-string)
+                         ((eq et 'standard-char)        is-string)
+                         ((eq et 'bit)                  is-bitvec)
+                         (t t))))
+                 (and et-ok
+                      (or (null sz) (eq sz '*) (eq sz t)
+                          (and (consp sz) (or (null (cdr sz))
+                                              (and (consp (cdr sz)) (null (cddr sz))))
+                               (or (eq (car sz) '*) (eq (car sz) t)
+                                   (and (integerp (car sz)) (= (car sz) (array-length obj)))))
+                          (and (integerp sz) (= sz (array-length obj))))))))
          ;; (cons car-type cdr-type) — type-check both halves.
          ((eq head 'cons)
           (and (consp obj)

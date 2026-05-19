@@ -3149,6 +3149,17 @@
   ;; aux helper before reaching the per-test handler.
   (setq char-code-limit       256)
   (setq call-arguments-limit  256)
+  ;; Array-related limits (CLHS): bounds on array size/rank/dim.
+  ;; Modus arrays are 49-bit element-count in header; pick conservative
+  ;; values that are well within fixnum range and well above 1024.
+  (setq array-total-size-limit  (ash 1 24))    ; 16M elements
+  (setq array-dimension-limit   (ash 1 24))    ; 16M per dim
+  (setq array-rank-limit        256)
+  (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
+                                   &optional &rest &whole))
+  (setq lambda-parameters-limit 256)
+  (setq multiple-values-limit   16)
+  (setq internal-time-units-per-second 1000000)
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)

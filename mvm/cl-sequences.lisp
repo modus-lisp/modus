@@ -706,13 +706,20 @@
   (when (or (not (fixnump idx)) (< idx 0))
     (%signal-type-error))
   (cond
+    ;; (elt nil i) — empty list, always out of range
+    ((null seq) (error "elt: index out of range"))
     ;; Array wrapper (adj/fp/displaced/multi-dim) — peel via wrapper-aref
     ((and (consp seq) (array-wrapper-p seq))
      (let ((v (%wrapper-aref seq idx)))
        (if (and (stringp seq) (integerp v)) (code-char v) v)))
-    ((consp seq) (nth idx seq))
-    (t (let ((v (aref seq idx)))
-         (if (stringp seq) (code-char v) v)))))
+    ((consp seq)
+     (when (>= idx (length seq)) (error "elt: index out of range"))
+     (nth idx seq))
+    ((or (stringp seq) (arrayp seq))
+     (when (>= idx (length seq)) (error "elt: index out of range"))
+     (let ((v (aref seq idx)))
+       (if (stringp seq) (code-char v) v)))
+    (t (error "elt: not a sequence"))))
 (defun %string-designator (x)
   "Coerce a string designator (string, character, or symbol) to a string."
   (cond
@@ -1830,6 +1837,7 @@
               (t (unless allow-other-keys (%signal-program-error))))
         (setq a (cddr a))))
     (cond
+      ((null seq) seq)
       ((consp seq)
        (let ((cur seq) (i 0)
              (eff-end (if end end most-positive-fixnum)))
@@ -1839,7 +1847,7 @@
            (setq cur (cdr cur))
            (setq i (+ i 1)))
          seq))
-      (t
+      ((or (stringp seq) (arrayp seq))
        (let* ((len (length seq))
               (eff-end (if end end len))
               (store-item (if (and (stringp seq) (characterp item))
@@ -1848,7 +1856,8 @@
               (i start))
          (loop (when (>= i eff-end) (return seq))
            (aset seq i store-item)
-           (setq i (+ i 1))))))))
+           (setq i (+ i 1)))))
+      (t (error "fill: not a sequence")))))
 
 (defun map-into (result fn &rest seqs)
   "Apply FN to elements of SEQS, storing each result in successive

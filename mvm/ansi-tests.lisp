@@ -2459,6 +2459,7 @@
                                 (aref b 2)) 1)
     (t (c) (%record-test-fail-or-emit 5693)))
 
+
   ;; --- IEEE float smoke (Phase 2 verification) ---
   (handler-case (deftest 5670 (floatp 1.0) t)
     (t (c) (%record-test-fail-or-emit 5670)))

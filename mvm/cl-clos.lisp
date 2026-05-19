@@ -2095,10 +2095,8 @@
              (dotimes (i len r) (aset r i (wrapper-aref seq i)))))
          (copy-list seq)))
     ((stringp seq)
-     (let ((r (%make-string-array (length seq))))
-       (dotimes (i (length seq) r) (aset r i (aref seq i)))))
-    (t (let ((r (make-array (length seq))))
-         (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
+     (let ((r (%make-string-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))
+    (t (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
 (defun sqrt (n)
   "Square root.  Returns:
    - exact integer for perfect-square integer input,

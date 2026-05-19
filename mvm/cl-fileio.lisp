@@ -1022,6 +1022,15 @@
            (%fs-write-char code stream))
           ;; Serial-io
           ((= ty 8) (write-char-serial code))
+          ;; Synonym: resolve target symbol's value and delegate.
+          ((= ty 7)
+           (let ((target (%stream-data stream)))
+             (let ((target-stream (cond ((symbolp target) (symbol-value target))
+                                        ((stringp target) (symbol-value (intern target)))
+                                        (t target))))
+               (if (streamp target-stream)
+                   (%write-char-to-stream code target-stream)
+                   (write-char-serial code)))))
           (t (write-char-serial code))))))
 
 ;; Backward-compatible wrapper used by write-to-stream, princ-to-stream etc.

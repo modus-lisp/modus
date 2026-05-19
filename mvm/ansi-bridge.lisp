@@ -1958,8 +1958,13 @@
 ;;; ============================================================
 
 (defun get-universal-time ()
-  "Return seconds since 1900-01-01. Returns 0 as stub."
-  0)
+  "Return seconds since 1900-01-01.  On Linux, calls time(2) (syscall
+   201) to get Unix epoch seconds, then adds the 70-year offset
+   2208988800.  On bare metal where syscall isn't available, returns 0."
+  (let ((unix-sec (handler-case (syscall3 201 0 0 0) (t (c) 0))))
+    (if (and (integerp unix-sec) (> unix-sec 0))
+        (+ unix-sec 2208988800)
+        0)))
 
 (defun get-internal-run-time ()
   "Return internal run time units."
@@ -2392,13 +2397,15 @@
   (if (cdr more)
       (%program-error "encode-universal-time requires 6 or 7 arguments")
       0))
-;;; GET-INTERNAL-REAL-TIME — return a non-negative integer (not 0, actually read clock)
+;;; GET-INTERNAL-REAL-TIME — uses Linux time(2) (syscall 201) when
+;;; available, falls back to a monotonic counter.
+(defvar *%irt-counter* 0)
 (defun get-internal-real-time ()
-  "Return internal real time as an unsigned integer."
-  ;; Use Linux clock_gettime(CLOCK_MONOTONIC) syscall or just return a counter
-  ;; For ANSI compliance, must return an unsigned-byte value
-  ;; Return 1 (non-zero, non-negative integer satisfying unsigned-byte)
-  1)
+  (let ((t (handler-case (syscall3 201 0 0 0) (t (c) 0))))
+    (cond
+      ((and (integerp t) (> t 0)) t)
+      (t (setq *%irt-counter* (+ *%irt-counter* 1))
+         *%irt-counter*))))
 
 ;;; CLASS-OF — strict 1-arg arity
 (defun class-of (x &rest extra)

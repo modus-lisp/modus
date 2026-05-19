@@ -1242,6 +1242,8 @@
      (%make-rat (%fixnum-+ (%fixnum-* (aref a 0) (aref b 1))
                            (%fixnum-* (aref b 0) (aref a 1)))
                 (%fixnum-* (aref a 1) (aref b 1))))
+    ;; Complex: dispatch to complex-add (defined in cl-sequences.lisp)
+    ((or (%complex-p a) (%complex-p b)) (complex-add a b))
     ;; Either operand is a non-integer/non-ratio numeric — coerce and recurse.
     ;; Covers IEEE floats and modus's 2-slot rationals.
     ((or (%ieee-float-p a) (%ieee-float-p b))
@@ -1258,6 +1260,7 @@
     ((and (ratiop a) (ratiop b))
      (%make-rat (%fixnum-* (aref a 0) (aref b 0))
                 (%fixnum-* (aref a 1) (aref b 1))))
+    ((or (%complex-p a) (%complex-p b)) (complex-mul a b))
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (generic-multiply (%coerce-numeric a) (%coerce-numeric b)))
     (t (%fixnum-* a b))))
@@ -1273,6 +1276,7 @@
      (%make-rat (%fixnum-- (%fixnum-* (aref a 0) (aref b 1))
                            (%fixnum-* (aref b 0) (aref a 1)))
                 (%fixnum-* (aref a 1) (aref b 1))))
+    ((or (%complex-p a) (%complex-p b)) (complex-sub a b))
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (generic-subtract (%coerce-numeric a) (%coerce-numeric b)))
     (t (%fixnum-- a b))))

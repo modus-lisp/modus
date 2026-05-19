@@ -2369,6 +2369,27 @@
                                 (list a b)) '(2 1))
     (t (c) (%record-test-fail-or-emit 5583)))
 
+  ;; --- Complex arithmetic ---
+  (handler-case
+    (deftest 5590 (realpart (+ (complex 1 2) (complex 3 4))) 4)
+    (t (c) (%record-test-fail-or-emit 5590)))
+  (handler-case
+    (deftest 5591 (imagpart (+ (complex 1 2) (complex 3 4))) 6)
+    (t (c) (%record-test-fail-or-emit 5591)))
+  (handler-case
+    (deftest 5592 (realpart (- (complex 5 7) (complex 2 3))) 3)
+    (t (c) (%record-test-fail-or-emit 5592)))
+  (handler-case
+    (deftest 5593 (imagpart (- (complex 5 7) (complex 2 3))) 4)
+    (t (c) (%record-test-fail-or-emit 5593)))
+  ;; (1+2i) * (3+4i) = 3+4i+6i-8 = -5+10i
+  (handler-case
+    (deftest 5594 (realpart (* (complex 1 2) (complex 3 4))) -5)
+    (t (c) (%record-test-fail-or-emit 5594)))
+  (handler-case
+    (deftest 5595 (imagpart (* (complex 1 2) (complex 3 4))) 10)
+    (t (c) (%record-test-fail-or-emit 5595)))
+
   nil)
 
 ;; --- EQL specializer ---

@@ -2098,6 +2098,40 @@
 
 (defun complexp (x) (%complex-p x))
 
+;;; Complex arithmetic.  Use modus's existing rational + / - / * routes
+;;; so the resulting (real, imag) parts come back in their natural form
+;;; (integer / ratio / IEEE-decoded).
+;;;
+;;; (a + bi) + (c + di) = (a + c) + (b + d)i
+;;; (a + bi) - (c + di) = (a - c) + (b - d)i
+;;; (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+;;; (a + bi) / (c + di) = ((ac+bd)/(c²+d²)) + ((bc-ad)/(c²+d²))i
+
+(defun %complex-real (x) (if (%complex-p x) (aref x 1) x))
+(defun %complex-imag (x) (if (%complex-p x) (aref x 2) 0))
+
+(defun complex-add (a b)
+  (complex (+ (%complex-real a) (%complex-real b))
+           (+ (%complex-imag a) (%complex-imag b))))
+
+(defun complex-sub (a b)
+  (complex (- (%complex-real a) (%complex-real b))
+           (- (%complex-imag a) (%complex-imag b))))
+
+(defun complex-mul (a b)
+  (let ((ar (%complex-real a)) (ai (%complex-imag a))
+        (br (%complex-real b)) (bi (%complex-imag b)))
+    (complex (- (* ar br) (* ai bi))
+             (+ (* ar bi) (* ai br)))))
+
+(defun complex-div (a b)
+  (let ((ar (%complex-real a)) (ai (%complex-imag a))
+        (br (%complex-real b)) (bi (%complex-imag b)))
+    (let ((denom (+ (* br br) (* bi bi))))
+      (when (= denom 0) (error "complex divide by zero"))
+      (complex (exact-divide (+ (* ar br) (* ai bi)) denom)
+               (exact-divide (- (* ai br) (* ar bi)) denom)))))
+
 ;;; Hash table
 ;;; The real definition is in prelude.lisp — it recognizes both the
 ;;; legacy (cons alist nil) shape and the modern (cons alist (cons %ht-tag
@@ -2128,7 +2162,28 @@
 ;;; More CL functions
 (defun evenp (n) (zerop (logand n 1)))
 (defun oddp (n) (not (zerop (logand n 1))))
-(defun boundp (sym) t)  ; stub — all symbols considered bound
+(defun boundp (sym)
+  "Per CLHS, BOUNDP returns T iff SYM has a value cell binding.
+   Modus stores special-var values at fixed slot 0x10000080 (global
+   alist).  Walk the alist looking for SYM.  Keywords are always
+   bound to themselves.  Non-symbol input signals type-error per ANSI
+   — we just return NIL for robustness."
+  (cond
+    ((null sym) t)
+    ((eq sym t) t)
+    ((keywordp sym) t)
+    ((or (fixnump sym) (consp sym) (characterp sym)) nil)
+    (t
+     ;; Walk the globals alist at 0x10000080.
+     (let ((alist (mem-ref #x10000080 :u64))
+           (found nil))
+       (loop
+         (when (or found (null alist)) (return found))
+         (when (and (consp alist) (consp (car alist))
+                    (eq (car (car alist)) sym))
+           (setq found t))
+         (setq alist (if (consp alist) (cdr alist) nil)))
+       (if found t nil)))))
 ;; Old definition was a process-of-elimination heuristic (the same
 ;; fragility class as the old functionp — see commit 7203e19).  It
 ;; returned T for closures, bignums, ratios, packages, and anything

@@ -5704,9 +5704,11 @@
          (free-temp-reg))))))
 
 (defun compile-mul (args env dest)
-  "Compile (* args...).  Inline :mul — multiply gets called in tight
-   inner loops (sort, mapcar with arithmetic, hash-table rehash) and
-   the dispatch overhead pushes those tests past the SIGALRM budget."
+  "Compile (* args...).  Uses emit-arith-pair so non-fixnum operands
+   (ratios, complex, IEEE floats) route through GENERIC-MULTIPLY for
+   the right semantics.  Previously inlined :mul unconditionally
+   which silently multiplied object-pointers for complex/ratio
+   operands — fixnum-pointer-as-integer overflow producing garbage."
   (cond
     ((null args) (compile-integer 1 dest))
     ((null (cdr args)) (compile-form (car args) env dest))
@@ -5719,7 +5721,7 @@
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
-         (emit-ir :mul dest dest temp)
+         (emit-arith-pair :mul "GENERIC-MULTIPLY" dest temp)
          (free-temp-reg))))))
 
 (defun compile-mul26lo (args env dest)

@@ -740,7 +740,64 @@
 (defun file-author (x) nil)
 
 ;;; --- directory ---
-(defun directory (x &rest args) nil)
+;;; Linux: open(O_DIRECTORY) + getdents64 (syscall 217) — read dirents
+;;; until eof, accumulating name strings.  Falls back to NIL on bare
+;;; metal where the syscall isn't available.
+
+(defvar *%dirent-buf-addr* #x1DD00000)  ; 1MB scratch for getdents
+(defvar *%dirent-buf-size* 4096)
+
+(defun %sys-getdents64 (fd buf-addr buf-size)
+  "Linux SYS_getdents64 (217) — returns bytes read (≤ size) or -1."
+  (handler-case (syscall3 217 fd buf-addr buf-size) (t (c) -1)))
+
+(defun %parse-dirents (buf-addr nread accum)
+  "Walk a dirent64 buffer of NREAD bytes starting at BUF-ADDR.
+   Each entry: u64 d_ino, s64 d_off, u16 d_reclen, u8 d_type,
+   then null-terminated d_name.  Returns list of name strings
+   (in reverse order; caller nreverses)."
+  (let ((off 0) (acc accum))
+    (loop
+      (when (>= off nread) (return acc))
+      (let* ((reclen (mem-ref (+ buf-addr off 16) :u16))
+             (name-off (+ buf-addr off 19))     ; 8+8+2+1
+             (name (%c-string-at name-off)))
+        (unless (or (string= name ".") (string= name ".."))
+          (setq acc (cons name acc)))
+        (when (= reclen 0) (return acc))
+        (setq off (+ off reclen))))))
+
+(defun %c-string-at (addr)
+  "Read a null-terminated string at ADDR via mem-ref."
+  (let ((len 0))
+    (loop
+      (when (= (mem-ref (+ addr len) :u8) 0) (return nil))
+      (setq len (+ len 1))
+      (when (>= len 256) (return nil)))
+    (let ((s (%make-string-array len)) (i 0))
+      (loop
+        (when (>= i len) (return s))
+        (aset s i (mem-ref (+ addr i) :u8))
+        (setq i (+ i 1))))))
+
+(defun directory (x &rest args)
+  "Return list of files in directory X.  Linux-only; uses
+   open(O_DIRECTORY)+getdents64.  Returns NIL when the syscall is
+   unavailable or the path can't be opened."
+  (declare (ignore args))
+  (let ((path (handler-case (namestring x) (t (c) nil))))
+    (when (null path) (return-from directory nil))
+    (let ((fd (handler-case (%sys-open-rdonly path) (t (c) -1))))
+      (when (or (null fd) (< fd 0)) (return-from directory nil))
+      (let ((acc nil) (done nil))
+        (loop
+          (when done (return nil))
+          (let ((n (%sys-getdents64 fd *%dirent-buf-addr* *%dirent-buf-size*)))
+            (cond
+              ((or (null n) (<= n 0)) (setq done t))
+              (t (setq acc (%parse-dirents *%dirent-buf-addr* n acc))))))
+        (handler-case (%sys-close fd) (t (c) nil))
+        (nreverse acc)))))
 
 ;;; --- with-open-stream ---
 (defun %with-open-stream-fn (stream thunk)

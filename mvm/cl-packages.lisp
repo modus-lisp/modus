@@ -1067,9 +1067,9 @@
 
 (defvar *fail-count-limit* 20)
 
-;;; --- documentation stub ---
-
-(defun documentation (obj doc-type) nil)
+;;; documentation lives in ansi-bridge.lisp with a real registry.
+;;; The cl-packages stub here returned NIL always and shadowed the real
+;;; impl via last-defun-wins ordering — now just a forwarding comment.
 
 ;;; ============================================================
 ;;; PROGV runtime support

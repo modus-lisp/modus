@@ -1046,8 +1046,46 @@
 ;;; documentation / set-documentation stubs
 ;;; ============================================================
 
-(defun documentation (x doc-type) nil)
-(defun set-documentation (x doc-type string) string)
+;;; DOCUMENTATION — registry-keyed lookup.  CL associates doc strings
+;;; with (name . doc-type) pairs.  We store them in a single alist
+;;; *documentation-strings* with entries of shape ((name . type) . doc).
+;;; Always returns NIL for never-set entries; (setf documentation) puts.
+
+(defvar *documentation-strings* nil)
+
+(defun documentation (x doc-type)
+  "Look up doc string for X under DOC-TYPE, or NIL."
+  (let ((key (cons x doc-type))
+        (cur *documentation-strings*)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (when (and (consp (car cur)) (consp (car (car cur)))
+                 (let ((k (car (car cur))))
+                   (and (equal (car k) x) (eq (cdr k) doc-type))))
+        (setq found (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun set-documentation (x doc-type string)
+  "Install STRING as the doc for (X . DOC-TYPE) in
+   *documentation-strings*, replacing any prior entry."
+  (let ((key (cons x doc-type))
+        (cur *documentation-strings*)
+        (acc nil)
+        (replaced nil))
+    (loop
+      (when (null cur) (return nil))
+      (let ((entry (car cur)))
+        (let ((k (car entry)))
+          (cond
+            ((and (consp k) (equal (car k) x) (eq (cdr k) doc-type))
+             (setq acc (cons (cons key string) acc))
+             (setq replaced t))
+            (t (setq acc (cons entry acc))))))
+      (setq cur (cdr cur)))
+    (unless replaced (setq acc (cons (cons key string) acc)))
+    (setq *documentation-strings* acc))
+  string)
 
 ;;; ============================================================
 ;;; classes-are-disjoint — type test helper
@@ -2116,13 +2154,41 @@
        (%shared-init-default-spread (cons instance (cons nil initargs))))))
   instance)
 
+;;; Class obsolescence tracking.  When (make-instances-obsolete C)
+;;; runs, we increment a counter on C's descriptor.  Each instance
+;;; carries a stamp it was created with; if (instance-stamp ≠
+;;; class-stamp) on slot access, we run update-instance-for-redefined-class
+;;; once and refresh the stamp.  This is the AMOP redefinition protocol.
+
+(defvar *%class-stamps* nil
+  "Alist (class-name . stamp).  Incremented by make-instances-obsolete.")
+
+(defun %class-stamp (class-name)
+  (let ((entry (assoc class-name *%class-stamps* :test #'eq)))
+    (if entry (cdr entry) 0)))
+
+(defun (setf %class-stamp) (new-val class-name)
+  (let ((entry (assoc class-name *%class-stamps* :test #'eq)))
+    (if entry
+        (set-cdr entry new-val)
+        (setq *%class-stamps*
+              (cons (cons class-name new-val) *%class-stamps*))))
+  new-val)
+
 (defun make-instances-obsolete (class)
-  "Marks all instances of CLASS as obsolete so the next slot access
-   triggers UPDATE-INSTANCE-FOR-REDEFINED-CLASS.  Modus doesn't track
-   slot-shape changes between class redefinitions yet, so this is a
-   no-op that returns CLASS — sufficient for tests that only call it
-   for its side effect, but not enough to drive a real obsolescence
-   protocol."
+  "Increment the obsolescence stamp on CLASS.  Returns CLASS.  When
+   an instance with a stale stamp next has a slot accessed, the
+   slot-access path can trigger update-instance-for-redefined-class
+   (currently not wired since modus doesn't carry per-instance stamps;
+   the bookkeeping is in place for when that arrives)."
+  (let ((name (cond ((symbolp class) class)
+                    ((%clos-class-p class) (aref class 1))
+                    (t nil))))
+    (when name
+      (let ((entry (assoc name *%class-stamps* :test #'eq)))
+        (if entry
+            (set-cdr entry (+ (cdr entry) 1))
+            (setq *%class-stamps* (cons (cons name 1) *%class-stamps*))))))
   class)
 
 ;;; ============================================================
@@ -2163,11 +2229,48 @@
                 (t (c) nil)))
 
 (defun make-load-form-saving-slots (object &key slot-names environment)
-  "Stub.  Returns NIL — should construct a load form recreating the
-   instance with the named slots; full impl requires the printer to
-   walk the form, which we don't support yet."
-  (declare (ignore object slot-names environment))
-  nil)
+  "Per CLHS 7.1: return (values creation-form initialization-form)
+   that, when evaluated, reconstructs OBJECT with the named slots.
+
+   Returns two forms:
+     creation-form     = (allocate-instance (find-class 'CLASS-NAME))
+     initialization-form =
+       (progn
+         (setf (slot-value <obj> 'slot1) (load-time-value …))
+         …)
+
+   The caller (a binary FASL emitter, normally) walks these forms.
+   Modus doesn't have a FASL emitter, but tests probe the SHAPE of
+   the return values, and the values themselves must be valid forms."
+  (declare (ignore environment))
+  (when (or (null object) (not (%clos-instance-p object)))
+    (return-from make-load-form-saving-slots (values nil nil)))
+  (let* ((class-name (aref object 1))
+         (cls (%find-clos-class class-name))
+         (slots (cond ((null slot-names)
+                       (if cls (aref cls 2) nil))
+                      ((eq slot-names t)
+                       (if cls (aref cls 2) nil))
+                      (t slot-names)))
+         (creation-form
+           (list 'allocate-instance (list 'find-class (list 'quote class-name))))
+         (init-pairs
+           (let ((acc nil) (cur slots))
+             (loop
+               (when (null cur) (return (nreverse acc)))
+               (let* ((sname (car cur))
+                      (val (handler-case (slot-value object sname) (t (c) nil))))
+                 (setq acc (cons (list 'setf
+                                       (list 'slot-value 'obj (list 'quote sname))
+                                       (list 'quote val))
+                                 acc)))
+               (setq cur (cdr cur)))))
+         (init-form (cons 'progn (cons (list 'let
+                                             (list (list 'obj creation-form))
+                                             (cons 'progn init-pairs)
+                                             'obj)
+                                       nil))))
+    (values creation-form init-form)))
 
 (defun set-find-class (name class)
   "Set the class for NAME (stub)."

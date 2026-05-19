@@ -550,15 +550,87 @@
 ;;; pprint-newline — stub (pretty-printer not supported)
 ;;; ============================================================
 
-(defun pprint-newline (kind &rest args) nil)
-(defun pprint-tab (kind colnum colinc &rest args) nil)
-(defun pprint-indent (relative-to n &rest args) nil)
-(defun pprint-fill (stream list &rest args) nil)
-(defun pprint-linear (stream list &rest args) nil)
-(defun pprint-tabular (stream list &rest args) nil)
-(defun copy-pprint-dispatch (&rest args) nil)
-(defun set-pprint-dispatch (type-spec fn &rest args) nil)
-(defun pprint-dispatch (object &rest args) (values nil nil))
+;;; Pretty-printer — best-effort impl.  pprint-newline emits an actual
+;;; newline; pprint-tab pads to a column; pprint-indent / pprint-fill /
+;;; pprint-linear / pprint-tabular just write the list space-separated.
+;;; The full PPRINT-LOGICAL-BLOCK / pprint-dispatch table machinery is
+;;; far more complex (40-page spec); we cover the common-case calls.
+
+(defun pprint-newline (kind &rest args)
+  "Emit a newline.  KIND is :linear / :fill / :miser / :mandatory —
+   modus treats all the same (just newline)."
+  (declare (ignore kind))
+  (let ((stream (if args (car args) nil)))
+    (write-char-to-stream (code-char 10) (%resolve-output-stream stream)))
+  nil)
+
+(defun pprint-tab (kind colnum colinc &rest args)
+  "Emit COLINC spaces if at COLNUM (approximate — we just emit COLINC
+   spaces since modus doesn't track current column)."
+  (declare (ignore kind colnum))
+  (let ((stream (if args (car args) nil))
+        (n (if (>= colinc 0) colinc 0)))
+    (dotimes (i n)
+      (write-char-to-stream (code-char 32) (%resolve-output-stream stream))))
+  nil)
+
+(defun pprint-indent (relative-to n &rest args)
+  "No-op — modus doesn't carry a logical-block-relative indent state."
+  (declare (ignore relative-to n args))
+  nil)
+
+(defun pprint-fill (stream list &rest args)
+  "Print LIST elements separated by spaces, breaking onto newlines
+   if needed.  We approximate: just print space-separated."
+  (declare (ignore args))
+  (let ((s (%resolve-output-stream stream))
+        (first t))
+    (dolist (e list)
+      (unless first
+        (write-char-to-stream (code-char 32) s))
+      (setq first nil)
+      (write-to-stream e s)))
+  nil)
+
+(defun pprint-linear (stream list &rest args)
+  "Same approximation as pprint-fill — space-separated."
+  (apply #'pprint-fill stream list args))
+
+(defun pprint-tabular (stream list &rest args)
+  "Same approximation — space-separated."
+  (apply #'pprint-fill stream list args))
+
+(defvar *%pprint-dispatch-table* nil)
+
+(defun copy-pprint-dispatch (&rest args)
+  "Return a copy of the current pprint dispatch table.  We just hand
+   back a fresh symbol — the table contents aren't actually copied."
+  (declare (ignore args))
+  (gensym "PPRINT-DISP-"))
+
+(defun set-pprint-dispatch (type-spec fn &rest args)
+  "Install FN as the pprint-dispatch entry for TYPE-SPEC.  Stored in
+   *%pprint-dispatch-table* keyed by (type . priority)."
+  (declare (ignore args))
+  (setq *%pprint-dispatch-table*
+        (cons (cons type-spec fn) *%pprint-dispatch-table*))
+  nil)
+
+(defun pprint-dispatch (object &rest args)
+  "Look up the most-specific pprint-dispatch entry for OBJECT.
+   Returns (values function found-p)."
+  (declare (ignore args))
+  (let ((cur *%pprint-dispatch-table*)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return nil))
+      (let ((entry (car cur)))
+        (when (handler-case (typep object (car entry)) (t (c) nil))
+          (setq found entry)))
+      (setq cur (cdr cur)))
+    (if found
+        (values (cdr found) t)
+        (values nil nil))))
 
 ;;; ============================================================
 ;;; compile-and-load — stub (no runtime compiler support)
@@ -2287,13 +2359,72 @@
    one if they need formatted output)."
   (describe-object object stream))
 
-(defun apropos (string &optional package)
-  "List symbols apropos of STRING (stub)."
-  nil)
+;;; APROPOS — walk the named package's internal+external symbol tables
+;;; and collect those whose name contains the search substring.
+;;; apropos prints them; apropos-list returns the list.
+
+(defun %symbol-name-of (entry)
+  "Internal-symbol-table entries shape varies; pull the name string."
+  (cond
+    ((stringp entry) entry)
+    ((consp entry)
+     (cond ((stringp (car entry)) (car entry))
+           ((consp (car entry)) (%symbol-name-of (car entry)))
+           (t nil)))
+    (t nil)))
+
+(defun %string-contains (haystack needle)
+  "Case-insensitive substring search."
+  (let* ((hlen (length haystack))
+         (nlen (length needle)))
+    (when (> nlen hlen) (return-from %string-contains nil))
+    (let ((i 0) (found nil))
+      (loop
+        (when (or found (> i (- hlen nlen))) (return found))
+        (let ((j 0) (matches t))
+          (loop
+            (when (or (not matches) (>= j nlen)) (return nil))
+            (let ((c1 (aref haystack (+ i j)))
+                  (c2 (aref needle j)))
+              ;; case-insensitive
+              (when (and (>= c1 65) (<= c1 90)) (setq c1 (+ c1 32)))
+              (when (and (>= c2 65) (<= c2 90)) (setq c2 (+ c2 32)))
+              (unless (= c1 c2) (setq matches nil)))
+            (setq j (+ j 1)))
+          (when matches (setq found t))
+          (setq i (+ i 1))))
+      (if found t nil))))
 
 (defun apropos-list (string &optional package)
-  "Return list of symbols apropos of STRING (stub)."
-  nil)
+  "Return list of symbols whose name contains STRING."
+  (let* ((needle (cond ((stringp string) string)
+                       ((symbolp string) (symbol-name string))
+                       (t (return-from apropos-list nil))))
+         (pkgs (if package
+                   (list (handler-case (find-package package) (t (c) nil)))
+                   (list (handler-case (find-package "CL") (t (c) nil))
+                         (handler-case (find-package "CL-USER") (t (c) nil)))))
+         (acc nil))
+    (dolist (p pkgs)
+      (when p
+        (handler-case
+          (let ((entries (%pkg-internal p)))
+            (dolist (entry entries)
+              (let ((nm (%symbol-name-of entry)))
+                (when (and nm (%string-contains nm needle))
+                  (setq acc (cons entry acc))))))
+          (t (c) nil))))
+    acc))
+
+(defun apropos (string &optional package)
+  "Print apropos list to *standard-output* and return NIL."
+  (let ((syms (apropos-list string package)))
+    (dolist (s syms)
+      (let ((nm (%symbol-name-of s)))
+        (when nm
+          (write-string-serial nm)
+          (write-char-serial 10))))
+    nil))
 
 ;;; ============================================================
 ;;; Set operations with checks

@@ -944,11 +944,27 @@
         (write-char-serial (char-code obj)))
        ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
              (= (obj-subtag obj) #x60))
-        ;; Boxed float (subtag #x60) — emit a placeholder so tests can
-        ;; see the type name instead of #<?>. The underlying IEEE bits
-        ;; live in slots 0 and 1 but we don't decimal-print them.
-        (write-char-serial 35) (write-char-serial 60) (write-char-serial 70)
-        (write-char-serial 62))   ; #<F>
+        ;; Boxed IEEE float — print integer-part.fractional-part by
+        ;; decoding mantissa/exponent.  Approximation: split via
+        ;; %ieee-float-to-rat, scale to ~1e9, emit integer.fractional.
+        (let* ((rat (%ieee-float-to-rat obj))
+               (num (if (ratiop rat) (aref rat 0) rat))
+               (den (if (ratiop rat) (aref rat 1) 1))
+               (sign (if (< num 0) -1 1))
+               (abs-num (if (< num 0) (- 0 num) num))
+               (whole (truncate abs-num den))
+               (frac-num (- abs-num (* whole den)))
+               (frac (truncate (* frac-num 1000000) den)))
+          (when (= sign -1) (write-char-serial 45))     ; -
+          (print-dec whole)
+          (write-char-serial 46)                         ; .
+          ;; pad frac with leading zeros to 6 digits
+          (let ((pad 100000))
+            (loop
+              (when (or (= pad 1) (>= frac pad)) (return nil))
+              (write-char-serial 48)   ; 0
+              (setq pad (truncate pad 10))))
+          (print-dec frac)))
        (t
         ;; Emit a type-hinting sentinel that includes the subtag as a
         ;; decimal. "#<?123>" is still a distinctive "unknown type"

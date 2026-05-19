@@ -1782,31 +1782,45 @@
           (bignum-to-fixnum-if-possible result))))))
 
 (defun bignum-truncate (a b)
-  "Truncate division.  Returns the quotient.  For now, only fixnum-b
-   path is supported via repeated subtraction (slow but correct for
-   small divisors)."
+  "Truncate division: returns the quotient floor(|a|/|b|) with the
+   sign of a/b.  Handles bignum-by-bignum via shift-and-subtract
+   (long division on binary digits).  O(|a|.bits)."
   (when (= b 0) (error "divide by zero"))
   ;; Fixnum / fixnum: native.
   (when (and (not (bignump a)) (not (bignump b)))
     (return-from bignum-truncate (truncate a b)))
-  ;; Bignum / small-fixnum: repeated subtract (very slow if a is huge).
-  ;; Real impl would use schoolbook division; placeholder for now.
-  (let ((q 0) (r a)
-        (sign 1))
-    (when (< (bignum-cmp r 0) 0)
-      (setq r (bignum-negate r))
-      (setq sign (- 0 sign)))
-    (when (< b 0)
-      (setq b (- 0 b))
-      (setq sign (- 0 sign)))
-    (loop
-      (when (< (bignum-cmp r b) 0) (return nil))
-      (setq r (bignum-sub r b))
-      (setq q (+ q 1))
-      (when (> q 100000)
-        ;; Safety cap — real impl needed.
-        (return nil)))
-    (if (= sign -1) (- 0 q) q)))
+  (let* ((sign (cond ((or (and (bignump a) (< (bignum-hi a) 0))
+                          (and (not (bignump a)) (< a 0)))
+                      (let ((s (cond ((or (and (bignump b) (< (bignum-hi b) 0))
+                                          (and (not (bignump b)) (< b 0)))
+                                      1)
+                                     (t -1))))
+                        s))
+                     ((or (and (bignump b) (< (bignum-hi b) 0))
+                          (and (not (bignump b)) (< b 0)))
+                      -1)
+                     (t 1)))
+         (na (if (or (and (bignump a) (< (bignum-hi a) 0))
+                     (and (not (bignump a)) (< a 0)))
+                 (bignum-negate a) a))
+         (nb (if (or (and (bignump b) (< (bignum-hi b) 0))
+                     (and (not (bignump b)) (< b 0)))
+                 (bignum-negate b) b)))
+    ;; Long division: process bits of na from high to low.
+    (let ((nbits (integer-length na)))
+      (when (= nbits 0)
+        (return-from bignum-truncate (if (= sign -1) 0 0)))
+      (let ((q 0) (r 0) (i (- nbits 1)))
+        (loop
+          (when (< i 0) (return nil))
+          ;; r = (r << 1) | bit i of na
+          (setq r (bignum-add (bignum-ash r 1)
+                              (if (logbitp i na) 1 0)))
+          (when (>= (bignum-cmp r nb) 0)
+            (setq r (bignum-sub r nb))
+            (setq q (bignum-add q (bignum-ash 1 i))))
+          (setq i (- i 1)))
+        (if (= sign -1) (bignum-negate q) q)))))
 
 ;; Funcallable versions of compiler builtins (needed for #'consp etc.)
 (defun consp (x) (consp x))

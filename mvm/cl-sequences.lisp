@@ -510,13 +510,23 @@
        (%remove-if-vector neg-pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun count-if (pred seq &rest args)
-  "Count elements of SEQ for which PRED is true. Honors :key, :start, :end, :from-end."
-  (let ((key nil) (start 0) (end nil) (from-end nil) (a args))
+  "Count elements of SEQ for which PRED is true. Honors :key, :start, :end, :from-end.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (let ((key nil) (start 0) (end nil) (from-end nil) (a args)
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :key)
+             (unless key-set (setq key (cadr a)) (setq key-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :start)
+             (unless start-set (setq start (cadr a)) (setq start-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :end)
+             (unless end-set (setq end (cadr a)) (setq end-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a)) (setq fe-set t))
+             (setq a (cddr a)))
             (t (setq a (cdr a)))))
     (cond
       ((null seq) 0)
@@ -650,7 +660,10 @@
 (defun %unresolved-fn () nil)
 
 (defun nbutlast (list &rest n-arg)
-  "Destructive butlast. Signals TYPE-ERROR on negative or non-fixnum N."
+  "Destructive butlast. Signals PROGRAM-ERROR on extra args; TYPE-ERROR
+   on negative or non-fixnum N."
+  (when (and n-arg (cdr n-arg))
+    (error "nbutlast: too many arguments"))
   (let ((n (if n-arg (car n-arg) 1)))
     (when (or (not (fixnump n)) (< n 0))
       (%signal-type-error))
@@ -1407,13 +1420,23 @@
                  (setq i (+ i 1))))))))))
 (defun count-if-not (pred seq &rest args)
   "Count elements of SEQ for which PRED is FALSE.  Honors :key, :start,
-   :end, :from-end.  Equivalent to (count-if (complement pred) ...)."
-  (let ((key nil) (start 0) (end nil) (from-end nil) (a args))
+   :end, :from-end.  Equivalent to (count-if (complement pred) ...).
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (let ((key nil) (start 0) (end nil) (from-end nil) (a args)
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :key)
+             (unless key-set (setq key (cadr a)) (setq key-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :start)
+             (unless start-set (setq start (cadr a)) (setq start-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :end)
+             (unless end-set (setq end (cadr a)) (setq end-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a)) (setq fe-set t))
+             (setq a (cddr a)))
             (t (setq a (cdr a)))))
     (count-if (lambda (x) (not (funcall pred x)))
               seq
@@ -1514,21 +1537,40 @@
 (defun mismatch (s1 s2 &rest args)
   "Compare S1 vs S2 element-by-element. Returns first index where they
    differ, or NIL if equal. Honors :test, :key, :start1, :end1, :start2,
-   :end2, :from-end."
+   :end2, :from-end.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
   (let ((test nil) (key nil)
         (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil)
+        (test-set nil) (key-set nil) (s1-set nil) (e1-set nil)
+        (s2-set nil) (e2-set nil) (fe-set nil)
         (a args))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key)  (setq key  (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :start1) (setq start1 (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end1)   (setq end1   (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :start2) (setq start2 (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end2)   (setq end2   (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :test)
+             (unless test-set (setq test (cadr a)) (setq test-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :key)
+             (unless key-set  (setq key  (cadr a)) (setq key-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :start1)
+             (unless s1-set (setq start1 (cadr a)) (setq s1-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :end1)
+             (unless e1-set (setq end1 (cadr a)) (setq e1-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :start2)
+             (unless s2-set (setq start2 (cadr a)) (setq s2-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :end2)
+             (unless e2-set (setq end2 (cadr a)) (setq e2-set t))
+             (setq a (cddr a)))
+            ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a)) (setq fe-set t))
+             (setq a (cddr a)))
             ((eq (car a) :test-not)
-             (let ((f (cadr a)))
-               (setq test (lambda (x y) (not (funcall f x y)))))
+             (unless test-set
+               (let ((f (cadr a)))
+                 (setq test (lambda (x y) (not (funcall f x y)))))
+               (setq test-set t))
              (setq a (cddr a)))
             (t (setq a (cdr a)))))
     (let* ((l1 (length s1)) (l2 (length s2))
@@ -2346,17 +2388,19 @@
              (setq i (+ i 1)))))))))
 
 (defun find-if (predicate sequence &rest args)
-  "Return the first element of SEQUENCE satisfying PREDICATE."
-  (let ((key nil) (start 0) (end nil) (from-end nil))
+  "Return the first element of SEQUENCE satisfying PREDICATE.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  (let ((key nil) (start 0) (end nil) (from-end nil)
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key) (setq key v))
-            ((eq k :start) (setq start v))
-            ((eq k :end) (setq end v))
-            ((eq k :from-end) (setq from-end v))))
+            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
+            ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2404,17 +2448,19 @@
 (defun find-if-not (predicate sequence &rest args)
   "Return the first element of SEQUENCE not satisfying PREDICATE.
    Inlined (rather than `(apply #'find-if (lambda ...) ...)') to dodge
-   the documented apply-of-rest-through-sibling-defun fragility."
-  (let ((key nil) (start 0) (end nil) (from-end nil))
+   the documented apply-of-rest-through-sibling-defun fragility.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  (let ((key nil) (start 0) (end nil) (from-end nil)
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key) (setq key v))
-            ((eq k :start) (setq start v))
-            ((eq k :end) (setq end v))
-            ((eq k :from-end) (setq from-end v))))
+            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
+            ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2460,17 +2506,19 @@
              (setq i (+ i 1)))))))))
 
 (defun position-if (predicate sequence &rest args)
-  "Return the index of first element satisfying PREDICATE."
-  (let ((key nil) (start 0) (end nil) (from-end nil))
+  "Return the index of first element satisfying PREDICATE.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  (let ((key nil) (start 0) (end nil) (from-end nil)
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key) (setq key v))
-            ((eq k :start) (setq start v))
-            ((eq k :end) (setq end v))
-            ((eq k :from-end) (setq from-end v))))
+            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
+            ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2517,18 +2565,20 @@
 
 (defun position-if-not (predicate sequence &rest args)
   "Return the index of first element not satisfying PREDICATE.
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs.
    Inlined (rather than `(apply #'position-if (lambda ...) ...)') to
    dodge the documented apply-of-rest-through-sibling-defun fragility."
-  (let ((key nil) (start 0) (end nil) (from-end nil))
+  (let ((key nil) (start 0) (end nil) (from-end nil)
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key) (setq key v))
-            ((eq k :start) (setq start v))
-            ((eq k :end) (setq end v))
-            ((eq k :from-end) (setq from-end v))))
+            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
+            ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2673,23 +2723,28 @@
 
 (defun search (seq1 seq2 &rest args)
   "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.
-   :test defaults to inline `eql` (#'eql is unusable in MVM)."
-  (let ((test nil) (key nil) (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil))
+   :test defaults to inline `eql` (#'eql is unusable in MVM).
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  (let ((test nil) (key nil) (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil)
+        (test-set nil) (key-set nil) (s1-set nil) (e1-set nil)
+        (s2-set nil) (e2-set nil) (fe-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :test) (setq test v))
+            ((eq k :test)     (unless test-set (setq test v)     (setq test-set t)))
             ((eq k :test-not)
-             (let ((f v))
-               (setq test (lambda (a b) (not (funcall f a b))))))
-            ((eq k :key) (setq key v))
-            ((eq k :start1) (setq start1 v))
-            ((eq k :end1) (setq end1 v))
-            ((eq k :start2) (setq start2 v))
-            ((eq k :end2) (setq end2 v))
-            ((eq k :from-end) (setq from-end v))))
+             (unless test-set
+               (let ((f v))
+                 (setq test (lambda (a b) (not (funcall f a b)))))
+               (setq test-set t)))
+            ((eq k :key)      (unless key-set  (setq key v)      (setq key-set t)))
+            ((eq k :start1)   (unless s1-set   (setq start1 v)   (setq s1-set t)))
+            ((eq k :end1)     (unless e1-set   (setq end1 v)     (setq e1-set t)))
+            ((eq k :start2)   (unless s2-set   (setq start2 v)   (setq s2-set t)))
+            ((eq k :end2)     (unless e2-set   (setq end2 v)     (setq e2-set t)))
+            ((eq k :from-end) (unless fe-set   (setq from-end v) (setq fe-set t)))))
         (setq cur (cddr cur))))
     ;; Read element through wrappers via %seq-elt (handles list, vector,
     ;; and wrapper conses uniformly).

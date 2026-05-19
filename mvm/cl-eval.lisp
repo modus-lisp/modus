@@ -111,12 +111,15 @@
     (t nil)))
 
 (defun fmakunbound (sym)
-  "Remove the function binding of SYM."
+  "Remove the function binding of SYM.  Signals TYPE-ERROR if SYM is
+   not a symbol (CLHS — fmakunbound requires a function-name)."
   (let ((name (cond
                 ((%cl-sym-p sym) (%cl-sym-name sym))
                 ((stringp sym) sym)
                 (t nil))))
-    (when (and name *symbol-function-table*)
+    (when (null name)
+      (error "fmakunbound: not a function name"))
+    (when *symbol-function-table*
       (remhash name *symbol-function-table*)))
   sym)
 

@@ -2023,6 +2023,14 @@
           (handler-case (progn ,@body)
             (error (c) (declare (ignore c)) 'fail)))))
 
+    ;; (expand-in-current-env inner) → inner — ansi-aux's macroexpand
+    ;; wrapper.  For ANSI tests it mostly receives literals and simple
+    ;; forms; modus has no macro-environment introspection, so just
+    ;; pass the inner form through.  Real macros inside still expand
+    ;; at modus compile time via the *macro-table*.
+    ((and (eq (car form) 'expand-in-current-env) (cdr form))
+     (rewrite-reader-forms (cadr form)))
+
     (t (rewrite-reader-forms-list form))))
 
 (defun rewrite-reader-forms-list (list)

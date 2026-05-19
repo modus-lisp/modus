@@ -1547,7 +1547,16 @@
 
 (defun lognand (a b) (lognot (logand a b)))
 (defun lognor (a b) (lognot (logior a b)))
-(defun logeqv (a b) (lognot (logxor a b)))
+(defun logeqv (&rest args)
+  "Bitwise EQV — identity -1, n-ary fold of pairwise EQV (CLHS 12.2)."
+  (cond
+    ((null args) -1)
+    ((null (cdr args)) (car args))
+    (t (let ((acc (car args)) (rest (cdr args)))
+         (loop
+           (when (null rest) (return acc))
+           (setq acc (lognot (logxor acc (car rest))))
+           (setq rest (cdr rest)))))))
 (defun logandc1 (a b) (logand (lognot a) b))
 (defun logandc2 (a b) (logand a (lognot b)))
 (defun logorc1 (a b) (logior (lognot a) b))

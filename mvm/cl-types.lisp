@@ -95,19 +95,21 @@
         (setq n (+ n 2))))))
 
 (defun sin (x)
-  "Sine.  Exact 0 for integer 0; rational approximation otherwise."
+  "Sine.  Exact 0 for integer 0; IEEE float result for other inputs.
+   Taylor series runs in K-scaled rationals internally then %any-to-float
+   converts to IEEE."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (%scaled-result (%sin-taylor (%as-scaled-int x))))))
+    (t (%any-to-float (%scaled-result (%sin-taylor (%as-scaled-int x)))))))
 
 (defun cos (x)
-  "Cosine.  Exact 1 for integer 0; rational approximation otherwise."
+  "Cosine.  Exact 1 for integer 0; IEEE float result otherwise."
   (cond
     ((and (integerp x) (= x 0)) 1)
-    (t (%scaled-result (%cos-taylor (%as-scaled-int x))))))
+    (t (%any-to-float (%scaled-result (%cos-taylor (%as-scaled-int x)))))))
 
 (defun tan (x)
-  "Tangent = sin/cos.  Result is a scaled rational."
+  "Tangent = sin/cos.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
     (t (let* ((s (%as-scaled-int x))
@@ -115,7 +117,7 @@
               (cs (%cos-taylor s)))
          (if (= cs 0)
              0
-             (%make-float-raw sn cs))))))
+             (%any-to-float (%make-float-raw sn cs)))))))
 
 (defun %exp-taylor (s)
   "Compute exp(s/K) using Taylor series.  Reduce |s| by halving if
@@ -137,10 +139,10 @@
              (setq n (+ n 1)))))))))
 
 (defun exp (x)
-  "e^x.  Exact 1 for integer 0; rational approximation otherwise."
+  "e^x.  Exact 1 for integer 0; IEEE float result otherwise."
   (cond
     ((and (integerp x) (= x 0)) 1)
-    (t (%scaled-result (%exp-taylor (%as-scaled-int x))))))
+    (t (%any-to-float (%scaled-result (%exp-taylor (%as-scaled-int x)))))))
 
 (defun %log-newton (s)
   "Compute log(s/K) by Newton iteration on f(y) = exp(y) - s/K = 0.
@@ -167,31 +169,31 @@
     (when (<= s 0) (return-from log 0))
     (let ((ln-x (%log-newton s)))
       (if (null base)
-          (%scaled-result ln-x)
+          (%any-to-float (%scaled-result ln-x))
           ;; log_b(x) = log(x) / log(b)
           (let ((ln-b (%log-newton (%as-scaled-int base))))
-            (if (= ln-b 0) 0 (%make-float-raw ln-x ln-b)))))))
+            (if (= ln-b 0) 0 (%any-to-float (%make-float-raw ln-x ln-b))))))))
 
 (defun cosh (x)
-  "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2."
+  "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 1)
     (t (let* ((s (%as-scaled-int x))
               (ep (%exp-taylor s))
               (em (%exp-taylor (- 0 s))))
-         (%scaled-result (truncate (+ ep em) 2))))))
+         (%any-to-float (%scaled-result (truncate (+ ep em) 2)))))))
 
 (defun sinh (x)
-  "Hyperbolic sine.  sinh(x) = (exp(x) - exp(-x))/2."
+  "Hyperbolic sine.  sinh(x) = (exp(x) - exp(-x))/2.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
     (t (let* ((s (%as-scaled-int x))
               (ep (%exp-taylor s))
               (em (%exp-taylor (- 0 s))))
-         (%scaled-result (truncate (- ep em) 2))))))
+         (%any-to-float (%scaled-result (truncate (- ep em) 2)))))))
 
 (defun tanh (x)
-  "Hyperbolic tangent = sinh/cosh."
+  "Hyperbolic tangent = sinh/cosh.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
     (t (let* ((s (%as-scaled-int x))
@@ -199,7 +201,7 @@
               (em (%exp-taylor (- 0 s)))
               (num (- ep em))
               (den (+ ep em)))
-         (if (= den 0) 0 (%make-float-raw num den))))))
+         (if (= den 0) 0 (%any-to-float (%make-float-raw num den)))))))
 
 (defun %asin-taylor (s)
   "asin(s/K) via Taylor series for |s/K| ≤ 1.
@@ -220,17 +222,18 @@
         (setq n (+ n 1))))))
 
 (defun asin (x)
-  "Arc sine via Taylor.  Domain |x| ≤ 1."
+  "Arc sine via Taylor.  Domain |x| ≤ 1.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (%scaled-result (%asin-taylor (%as-scaled-int x))))))
+    (t (%any-to-float (%scaled-result (%asin-taylor (%as-scaled-int x)))))))
 
 (defun acos (x)
-  "Arc cosine = π/2 - asin(x)."
+  "Arc cosine = π/2 - asin(x).  IEEE float result."
   (cond
     ((and (integerp x) (= x 1)) 0)
-    ((and (integerp x) (= x 0)) (%scaled-result *%trig-pi/2*))
-    (t (%scaled-result (- *%trig-pi/2* (%asin-taylor (%as-scaled-int x)))))))
+    ((and (integerp x) (= x 0)) (%any-to-float (%scaled-result *%trig-pi/2*)))
+    (t (%any-to-float
+        (%scaled-result (- *%trig-pi/2* (%asin-taylor (%as-scaled-int x))))))))
 
 (defun atan (x &optional y)
   "Arc tangent.  Two-arg form: atan(y, x) for full quadrant.
@@ -252,15 +255,16 @@
             (one-plus-s2 (+ k s2))
             (sqrt-arg (isqrt (* one-plus-s2 k)))       ; sqrt(1+x^2), scaled by K
             (ratio (truncate (* s k) sqrt-arg)))
-       (%scaled-result (%asin-taylor ratio))))))
+       (%any-to-float (%scaled-result (%asin-taylor ratio)))))))
 
 (defun phase (x)
-  "Phase of x.  For real x: 0 if x≥0, π if x<0.  Complex not supported."
-  (cond
-    ((integerp x) (if (>= x 0) 0 (%scaled-result *%trig-pi*)))
-    ((ratiop x) (if (>= (ratio-numerator x) 0) 0 (%scaled-result *%trig-pi*)))
-    (t (let ((s (%as-scaled-int x)))
-         (if (>= s 0) 0 (%scaled-result *%trig-pi*))))))
+  "Phase of x.  For real x: 0 if x≥0, π if x<0.  IEEE float for π case."
+  (let ((pi-float (%any-to-float (%scaled-result *%trig-pi*))))
+    (cond
+      ((integerp x) (if (>= x 0) 0 pi-float))
+      ((ratiop x) (if (>= (ratio-numerator x) 0) 0 pi-float))
+      (t (let ((s (%as-scaled-int x)))
+           (if (>= s 0) 0 pi-float))))))
 
 (defun cis (x)
   "cis(x) = cos(x) + i*sin(x) — modus has no complex type, so return cos(x)
@@ -859,7 +863,17 @@
 ;; equal IS wrappped via compile-li-func to %EQUAL-FN already; no defun
 ;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
 (defun eq (a b) (eq a b))
-(defun eql (a b) (eql a b))
+(defun eql (a b)
+  "EQL — same as EQ for non-numbers/non-chars; for numbers, equal in type
+   AND value.  IEEE floats need explicit bit-equal since two
+   separately-allocated float objects with the same value are EQL per
+   CLHS but FAIL the inline (eql a b) identity opcode."
+  (cond
+    ((eq a b) t)
+    ((and (%ieee-float-p a) (%ieee-float-p b))
+     (and (= (aref a 0) (aref b 0))
+          (= (aref a 1) (aref b 1))))
+    (t (eql a b))))
 ;; Bare defuns for the primitive cons/car/cdr opcodes so #'cons /
 ;; #'car / #'cdr resolve to callable function objects (used by reduce
 ;; and similar tests like (reduce #'cons '(a b c))).
@@ -1258,15 +1272,30 @@
     (t x)))
 
 (defun %any-to-float (n)
-  "Coerce any numeric N (integer/ratio/IEEE float) to an IEEE float
-   object via the SSE2-backed %float-from-int / %float-div primops.
-   Complex inputs are left untouched (caller handles separately)."
+  "Coerce any numeric N to an IEEE float object via the SSE2-backed
+   %float-from-int / %float-div primops.  Handles:
+   - IEEE float (subtag #x60) — return unchanged
+   - integer — %float-from-int
+   - ratio (subtag #x33) — num/den as IEEE
+   - modus rational-form float (subtag #x32, 2 slots) — same as ratio,
+     produced by transcendentals (sin/cos/etc.) and the literal-float
+     reader path before the SSE2 %float-from-int rewrite landed.
+   Complex inputs and anything else are returned unchanged."
   (cond
     ((%ieee-float-p n) n)
     ((integerp n) (%float-from-int n))
     ((ratiop n)
      (%float-div (%float-from-int (aref n 0))
                  (%float-from-int (aref n 1))))
+    ;; Modus rational-form float: 2-slot array with subtag #x32
+    ((and (not (fixnump n)) (not (consp n)) (not (null n))
+          (not (characterp n))
+          (= (obj-subtag n) #x32) (= (array-length n) 2))
+     (let ((num (aref n 0)) (den (aref n 1)))
+       (cond
+         ((= den 0) (%float-from-int 0))
+         ((= den 1) (%float-from-int num))
+         (t (%float-div (%float-from-int num) (%float-from-int den))))))
     (t n)))
 
 (defun generic-add (a b)

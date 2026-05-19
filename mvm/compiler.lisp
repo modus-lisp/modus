@@ -5954,9 +5954,14 @@
     ;; 0 args or 3+ args: signal error at runtime
     ((or (null args) (cddr args))
      (compile-form `(error "TRUNCATE requires 1 or 2 arguments") env dest))
-    ;; 1-arg form
+    ;; 1-arg form: IEEE float → integer (SSE2 CVTTSD2SI); else
+    ;; existing rational-form path via float-truncate-to-integer.
     ((null (cdr args))
-     (compile-form `(float-truncate-to-integer ,(car args)) env dest))
+     (compile-form `(let ((%tv ,(car args)))
+                      (if (%ieee-float-p %tv)
+                          (%float-to-int %tv)
+                          (float-truncate-to-integer %tv)))
+                    env dest))
     ;; 2-arg form: (truncate a b) → quotient q = a÷b toward zero plus
     ;; remainder r = a − q·b (CL spec returns 2 values).  Tests use
     ;; (multiple-value-list (truncate n d)) so MV[0]=r, MV-COUNT=2.

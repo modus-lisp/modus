@@ -2185,13 +2185,13 @@
                   (equalp-impl (cdr a) (cdr b))
                   nil)
               nil)
-          (if (floatp-impl a)
-              (if (floatp-impl b)
-                  (float-equal a b)
-                  nil)
+          ;; Numeric mixed-type equality: int vs float, float vs ratio,
+          ;; etc.  Per CLHS, EQUALP compares numbers via numeric =
+          ;; ignoring type.  (= 3 3.0) is T, so (equalp 3 3.0) is T.
+          (if (and (or (integerp a) (floatp-impl a) (ratiop a))
+                   (or (integerp b) (floatp-impl b) (ratiop b)))
+              (numeric-equal-p a b)
               ;; ANSI equalp: arrays of any type compare element-wise.
-              ;; A string and a vector-of-chars compare equalp if their
-              ;; chars match. Bit-vectors with bit-vectors etc.
               (if (and (or (stringp a) (arrayp a))
                        (or (stringp b) (arrayp b)))
                   (%equalp-array-array a b)

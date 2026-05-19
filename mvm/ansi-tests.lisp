@@ -2203,7 +2203,90 @@
                            #'smoke-describe (list 'smoke-circle))) t)
     (t (c) (%record-test-fail-or-emit 5180)))
 
+  ;; --- next-method-p ---
+  (%init-clos-smoke-nmp)
+  (handler-case
+    (deftest 5190 (smoke-nmp-outer (make-instance 'smoke-circle :radius 1))
+                  '(:has-next t :has-next nil))
+    (t (c) (%record-test-fail-or-emit 5190)))
+
+  ;; --- custom slot-unbound method ---
+  (handler-case
+    (%init-clos-smoke-unbound) (t (c) nil))
+  (handler-case
+    (deftest 5200 (let ((c (make-instance 'smoke-circle :radius 7)))
+                    ;; name not initialised — unbound
+                    (slot-value c 'name)) :got-unbound)
+    (t (c) (%record-test-fail-or-emit 5200)))
+
+  ;; --- custom slot-missing method ---
+  (handler-case
+    (%init-clos-smoke-missing) (t (c) nil))
+  (handler-case
+    (deftest 5210 (let ((c (make-instance 'smoke-circle :radius 7)))
+                    ;; 'no-such-slot doesn't exist
+                    (slot-value c 'no-such-slot)) :missing-slot)
+    (t (c) (%record-test-fail-or-emit 5210)))
+
+  ;; --- call-next-method with explicit args ---
+  ;; child sees n=100, calls (call-next-method s 200) → parent sees n=200 →
+  ;; returns (:parent 200).  Child returns (cons :child (cons 100 parent))
+  ;; = (:child 100 :parent 200).
+  (handler-case (%init-clos-smoke-cnm-args) (t (c) nil))
+  (handler-case
+    (deftest 5220 (smoke-cnm-args (make-instance 'smoke-circle :radius 1) 100)
+                  '(:child 100 :parent 200))
+    (t (c) (%record-test-fail-or-emit 5220)))
+
   nil)
+
+;; --- next-method-p ---
+(defun smoke-nmp-outer (&rest a) (%gf-dispatch 'smoke-nmp-outer a))
+(defun %init-clos-smoke-nmp ()
+  (%defgeneric 'smoke-nmp-outer '(s) nil)
+  (%defmethod 'smoke-nmp-outer nil '(smoke-shape)
+              (lambda (s) (declare (ignore s))
+                (list :has-next (notnot (next-method-p)))))
+  (%defmethod 'smoke-nmp-outer nil '(smoke-circle)
+              (lambda (s) (declare (ignore s))
+                (let ((nmp1 (notnot (next-method-p)))
+                      (next-result (call-next-method)))
+                  (declare (ignore nmp1))
+                  ;; Combine: child reports has-next=T (parent exists);
+                  ;; parent reports has-next=NIL (no further next).
+                  (list :has-next t
+                        (car next-result) (cadr next-result)))))
+  (%register-gf-fn (function smoke-nmp-outer) 'smoke-nmp-outer))
+
+;; --- custom slot-unbound method ---
+;; Modus's %dispatch-slot-unbound uses *slot-unbound-methods* (not
+;; the regular GF registry), so the user-facing way to install a
+;; method is %add-slot-unbound-method.
+(defun %init-clos-smoke-unbound ()
+  (%add-slot-unbound-method 'smoke-circle nil
+                            (lambda (class obj slot)
+                              (declare (ignore class obj slot))
+                              :got-unbound)))
+
+;; --- custom slot-missing method ---
+(defun %init-clos-smoke-missing ()
+  (%add-slot-missing-method 'smoke-circle
+                            (lambda (class obj slot op &rest more)
+                              (declare (ignore class obj slot op more))
+                              :missing-slot)))
+
+;; --- call-next-method with explicit args ---
+(defun smoke-cnm-args (&rest a) (%gf-dispatch 'smoke-cnm-args a))
+(defun %init-clos-smoke-cnm-args ()
+  (%defgeneric 'smoke-cnm-args '(s n) nil)
+  (%defmethod 'smoke-cnm-args nil '(smoke-shape t)
+              (lambda (s n) (declare (ignore s))
+                (list :parent n)))
+  (%defmethod 'smoke-cnm-args nil '(smoke-circle t)
+              (lambda (s n)
+                (let ((parent (call-next-method s (* n 2))))
+                  (cons :child (cons n parent)))))
+  (%register-gf-fn (function smoke-cnm-args) 'smoke-cnm-args))
 
 (defun %record-test-fail-or-emit (id)
   "Print FAIL <id> directly without going through %record-test-fail

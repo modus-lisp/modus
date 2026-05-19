@@ -1607,7 +1607,17 @@
 
 ;;; Type predicates
 (defun numberp (x) (or (integerp x) (floatp-impl x)))
-(defun realp (x) (or (integerp x) (floatp-impl x)))
+(defun realp (x)
+  "T iff X is a real number (integer, float, or rational).  Explicitly
+   rejects complex numbers — modus's %complex-p check first since
+   the underlying #C(1 2) is a 3-slot array sharing subtag #x32 with
+   2-slot modus rational-form floats."
+  (cond
+    ((%complex-p x) nil)
+    ((integerp x) t)
+    ((floatp-impl x) t)
+    ((ratiop x) t)
+    (t nil)))
 (defun rationalp (x) (integerp x))
 ;; complexp lives in cl-sequences.lisp with the proper %complex-p check.
 ;; The stub here always returned NIL and shadowed the real impl via

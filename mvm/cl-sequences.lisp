@@ -1627,7 +1627,10 @@
 ;; Uses inline truncate-rem (next is positive, n is positive — sign matches
 ;; sign of d, so rem == mod in this regime) to stay fast.
 (defun random (n &rest state)
-  (declare (ignore state))
+  ;; CLHS: (random limit &optional state).  Extra args after state are
+  ;; a program-error.
+  (when (and state (cdr state))
+    (error "random: too many arguments"))
   ;; (random 0) is undefined in CL but happens when callers pass an
   ;; overflowed bound like (ASH 1 64) → 0.  Returning 0 keeps the
   ;; caller alive instead of #DE-trapping into a kernel-killing

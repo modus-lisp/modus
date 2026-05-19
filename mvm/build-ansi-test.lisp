@@ -3150,6 +3150,7 @@
   ;; which the per-test handler-case catches but burns time and noise.
   ;; T makes NORMALLY a no-op pass-through.
   (setq *should-always-be-true* t)
+  (setq *random-state* (list 'random-state 12345))
   (setq *use-random-byte* t)
   (setq *random-readable* nil)
   (setq *random-read-check-debug* nil)

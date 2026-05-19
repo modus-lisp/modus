@@ -1847,6 +1847,179 @@
              (emit-mov-reg-reg buf d 'rax))
            (maybe-store-scratch buf vd)))
 
+        ;; ================================================================
+        ;; IEEE 64-bit float arithmetic — SSE2 lowering.
+        ;;
+        ;; Float OBJECTS in modus are subtag #x60, 2 slots:
+        ;;   slot 0 = hi32 tagged fixnum (sign-extended into bits 32..63)
+        ;;   slot 1 = lo32 tagged fixnum (positive when masked to low 32)
+        ;; Stored value = tag-shift left by 1.
+        ;;
+        ;; Per-op pattern:
+        ;;   1. Stack-save both operand pointers (avoids vreg/scratch aliasing).
+        ;;   2. Pop each, load slot 0 + slot 1, untag (sar 1), combine into a
+        ;;      single u64 of IEEE bits, MOVQ into XMM.
+        ;;   3. ADDSD / SUBSD / MULSD / DIVSD xmm0, xmm1.
+        ;;   4. Allocate a fresh 2-slot float object via the R12 bump
+        ;;      (header at [R12], padding at [R12+8], slots at [R12+16/24]).
+        ;;   5. MOVQ rcx, xmm0; split into hi32/lo32; tag-shift left by 1;
+        ;;      store back to slots; LEA dest, [R12+9]; ADD R12, 32.
+        ;;
+        ;; XMM0/XMM1 are caller-saved on System V; modus's allocator doesn't
+        ;; otherwise use XMM regs so we can clobber freely.
+        ;; ================================================================
+        ((or (op= +op-fadd+) (op= +op-fsub+) (op= +op-fmul+) (op= +op-fdiv+))
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (sse-opcode (cond ((op= +op-fadd+) #x58)   ; ADDSD
+                                  ((op= +op-fsub+) #x5C)   ; SUBSD
+                                  ((op= +op-fmul+) #x59)   ; MULSD
+                                  (t                #x5E)))) ; DIVSD
+           ;; Stack-save operands.
+           (emit-load-vreg buf va 'rax)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vb 'rax)
+           (emit-push buf 'rax)
+
+           ;; Pop Vb pointer → load its IEEE bits into xmm1.
+           (emit-pop buf 'rax)
+           (emit-mov-reg-mem buf 'rcx 'rax 7)    ; slot 0 (hi32 tagged)
+           (emit-sar-reg-imm buf 'rcx 1)         ; untag
+           (emit-shl-reg-imm buf 'rcx 32)        ; into upper half
+           (emit-mov-reg-mem buf 'rdx 'rax 15)   ; slot 1 (lo32 tagged)
+           (emit-sar-reg-imm buf 'rdx 1)         ; untag (sign-ext)
+           (emit-shl-reg-imm buf 'rdx 32)        ; mask off sign
+           (emit-shr-reg-imm buf 'rdx 32)        ; via shl/shr 32
+           (emit-or-reg-reg buf 'rcx 'rdx)       ; combine
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC9)  ; MOVQ xmm1, rcx
+
+           ;; Pop Va pointer → load its IEEE bits into xmm0.
+           (emit-pop buf 'rax)
+           (emit-mov-reg-mem buf 'rcx 'rax 7)
+           (emit-sar-reg-imm buf 'rcx 1)
+           (emit-shl-reg-imm buf 'rcx 32)
+           (emit-mov-reg-mem buf 'rdx 'rax 15)
+           (emit-sar-reg-imm buf 'rdx 1)
+           (emit-shl-reg-imm buf 'rdx 32)
+           (emit-shr-reg-imm buf 'rdx 32)
+           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; MOVQ xmm0, rcx
+
+           ;; Float op: ADDSD/SUBSD/MULSD/DIVSD xmm0, xmm1
+           ;;   F2 0F <op> C1  (ModR/M: 11 000 001 — xmm0 dest, xmm1 src)
+           (emit-bytes buf #xF2 #x0F sse-opcode #xC1)
+
+           ;; Allocate fresh 2-slot float object at R12.
+           (emit-mov-reg-imm buf 'rcx #x260)            ; (count=2)<<8 | subtag #x60
+           (emit-mov-mem-reg buf 'r12 'rcx 0)           ; header at [R12]
+
+           ;; Extract result bits: MOVQ rcx, xmm0
+           (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)
+
+           ;; Slot 0 = (hi32 sign-extended) << 1
+           (emit-mov-reg-reg buf 'rdx 'rcx)
+           (emit-sar-reg-imm buf 'rdx 32)
+           (emit-shl-reg-imm buf 'rdx 1)
+           (emit-mov-mem-reg buf 'r12 'rdx 16)
+
+           ;; Slot 1 = (lo32 zero-extended) << 1
+           (emit-mov-reg-reg buf 'rdx 'rcx)
+           (emit-shl-reg-imm buf 'rdx 32)
+           (emit-shr-reg-imm buf 'rdx 32)
+           (emit-shl-reg-imm buf 'rdx 1)
+           (emit-mov-mem-reg buf 'r12 'rdx 24)
+
+           ;; Result tagged pointer = R12 + 9; advance R12 by 32 bytes.
+           (let ((d (dest-phys-or-scratch vd)))
+             (emit-lea buf d 'r12 9)
+             (emit-add-reg-imm buf 'r12 32)
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-itof+)
+         ;; (itof Vd Vs) — tagged integer → freshly-allocated float object.
+         (let* ((vd (first operands))
+                (vs (second operands)))
+           ;; Load tagged int into RAX, untag (SAR 1), CVTSI2SD xmm0, rax
+           (emit-load-vreg buf vs 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           ;; CVTSI2SD xmm0, rax: F2 REX.W 0F 2A C0
+           (emit-bytes buf #xF2 #x48 #x0F #x2A #xC0)
+           ;; Allocate + store-back (same tail as fadd)
+           (emit-mov-reg-imm buf 'rcx #x260)
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)   ; MOVQ rcx, xmm0
+           (emit-mov-reg-reg buf 'rdx 'rcx)
+           (emit-sar-reg-imm buf 'rdx 32)
+           (emit-shl-reg-imm buf 'rdx 1)
+           (emit-mov-mem-reg buf 'r12 'rdx 16)
+           (emit-mov-reg-reg buf 'rdx 'rcx)
+           (emit-shl-reg-imm buf 'rdx 32)
+           (emit-shr-reg-imm buf 'rdx 32)
+           (emit-shl-reg-imm buf 'rdx 1)
+           (emit-mov-mem-reg buf 'r12 'rdx 24)
+           (let ((d (dest-phys-or-scratch vd)))
+             (emit-lea buf d 'r12 9)
+             (emit-add-reg-imm buf 'r12 32)
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-ftoi+)
+         ;; (ftoi Vd Vs) — float → tagged integer (truncate toward zero).
+         (let* ((vd (first operands))
+                (vs (second operands)))
+           ;; Load Vs float bits → xmm0
+           (emit-load-vreg buf vs 'rax)
+           (emit-mov-reg-mem buf 'rcx 'rax 7)
+           (emit-sar-reg-imm buf 'rcx 1)
+           (emit-shl-reg-imm buf 'rcx 32)
+           (emit-mov-reg-mem buf 'rdx 'rax 15)
+           (emit-sar-reg-imm buf 'rdx 1)
+           (emit-shl-reg-imm buf 'rdx 32)
+           (emit-shr-reg-imm buf 'rdx 32)
+           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)   ; MOVQ xmm0, rcx
+           ;; CVTTSD2SI rax, xmm0: F2 REX.W 0F 2C C0
+           (emit-bytes buf #xF2 #x48 #x0F #x2C #xC0)
+           ;; Tag as fixnum: shl rax, 1
+           (emit-shl-reg-imm buf 'rax 1)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-fcmp+)
+         ;; (fcmp Va Vb) — UCOMISD-style float compare, sets x86 flags.
+         ;; After this, :beq/:blt/:bgt/etc. work (UCOMISD sets ZF/PF/CF).
+         (let* ((va (first operands))
+                (vb (second operands)))
+           (emit-load-vreg buf va 'rax)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vb 'rax)
+           (emit-push buf 'rax)
+           ;; Vb → xmm1
+           (emit-pop buf 'rax)
+           (emit-mov-reg-mem buf 'rcx 'rax 7)
+           (emit-sar-reg-imm buf 'rcx 1)
+           (emit-shl-reg-imm buf 'rcx 32)
+           (emit-mov-reg-mem buf 'rdx 'rax 15)
+           (emit-sar-reg-imm buf 'rdx 1)
+           (emit-shl-reg-imm buf 'rdx 32)
+           (emit-shr-reg-imm buf 'rdx 32)
+           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC9)   ; MOVQ xmm1, rcx
+           ;; Va → xmm0
+           (emit-pop buf 'rax)
+           (emit-mov-reg-mem buf 'rcx 'rax 7)
+           (emit-sar-reg-imm buf 'rcx 1)
+           (emit-shl-reg-imm buf 'rcx 32)
+           (emit-mov-reg-mem buf 'rdx 'rax 15)
+           (emit-sar-reg-imm buf 'rdx 1)
+           (emit-shl-reg-imm buf 'rdx 32)
+           (emit-shr-reg-imm buf 'rdx 32)
+           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)   ; MOVQ xmm0, rcx
+           ;; UCOMISD xmm0, xmm1: 66 0F 2E C1
+           (emit-bytes buf #x66 #x0F #x2E #xC1)))
+
         ((op= +op-alloc-string+)
          ;; Like alloc-array but with string subtag #x31
          (let* ((vd (first operands))

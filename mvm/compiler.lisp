@@ -2161,6 +2161,62 @@
       ((= op-name 701100176259851453)       (compile-1+ (cadr form) env dest))
       ((= op-name 593011189432099851)       (compile-1- (cadr form) env dest))
       ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
+
+      ;; --- IEEE float intrinsics (target-:native lowers via :fadd etc.) ---
+      ;; %FLOAT-ADD / -SUB / -MUL / -DIV: 2-arg, both already IEEE-float
+      ;; objects; emit the IR op which the per-arch translator implements
+      ;; (SSE2 on x64, FPU on AArch64, soft-float helper on others).
+      ((= op-name 363733912886848150)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :gc-check)
+           (emit-ir :fadd dest dest temp)
+           (free-temp-reg))))
+      ((= op-name 423520786981492675)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :gc-check)
+           (emit-ir :fsub dest dest temp)
+           (free-temp-reg))))
+      ((= op-name 108770753001553443)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :gc-check)
+           (emit-ir :fmul dest dest temp)
+           (free-temp-reg))))
+      ((= op-name 569140195803361476)
+       (when (arity-ok-p form 2 2 env dest)
+         (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
+           (compile-form a env dest)
+           (emit-ir :push dest)
+           (compile-form b env temp)
+           (emit-ir :pop dest)
+           (emit-ir :gc-check)
+           (emit-ir :fdiv dest dest temp)
+           (free-temp-reg))))
+      ;; %FLOAT-FROM-INT — tagged integer → fresh float object.
+      ((= op-name 457736132923706479)
+       (when (arity-ok-p form 1 1 env dest)
+         (compile-form (cadr form) env dest)
+         (emit-ir :gc-check)
+         (emit-ir :itof dest dest)))
+      ;; %FLOAT-TO-INT — float → tagged integer (truncate toward zero).
+      ((= op-name 1031108042338437058)
+       (when (arity-ok-p form 1 1 env dest)
+         (compile-form (cadr form) env dest)
+         (emit-ir :ftoi dest dest)))
       ((= op-name 1047143422370414916) (compile-mul26lo (cdr form) env dest))
       ((= op-name 3053449675996246) (compile-mul26hi (cdr form) env dest))
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
@@ -8174,6 +8230,10 @@
       (:alloc-string 3)
       (:sap-new  3)    ;; 2-reg
       (:sap-addr 3)    ;; 2-reg
+      ;; IEEE float conversion (2-reg) / compare (2-reg)
+      (:itof  3)
+      (:ftoi  3)
+      (:fcmp  3)
 
       ;; Object allocation: 1 opcode + 1 reg + 2 imm16 + 1 imm8 = 5 bytes
       (:alloc-obj 5)
@@ -8206,6 +8266,11 @@
       (:xor   4)
       (:cons  4)
       (:atomic-xchg 4)
+      ;; IEEE float ops: 3-reg arith = 4 bytes; 2-reg conversion = 3 bytes
+      (:fadd  4)
+      (:fsub  4)
+      (:fmul  4)
+      (:fdiv  4)
 
       ;; reg + imm8 shift: 1 opcode + 2 regs + 1 imm8 = 4 bytes
       (:shl   4)
@@ -8453,6 +8518,17 @@
            (mvm-cons buf (second insn) (third insn) (fourth insn)))
           (:atomic-xchg
            (mvm-atomic-xchg buf (second insn) (third insn) (fourth insn)))
+
+          ;; ---- IEEE float arithmetic (3-reg, all float-object operands) ----
+          (:fadd (mvm-fadd buf (second insn) (third insn) (fourth insn)))
+          (:fsub (mvm-fsub buf (second insn) (third insn) (fourth insn)))
+          (:fmul (mvm-fmul buf (second insn) (third insn) (fourth insn)))
+          (:fdiv (mvm-fdiv buf (second insn) (third insn) (fourth insn)))
+          ;; ---- IEEE float conversions (2-reg) ----
+          (:itof (mvm-itof buf (second insn) (third insn)))
+          (:ftoi (mvm-ftoi buf (second insn) (third insn)))
+          ;; ---- IEEE float compare (2-reg, sets flags) ----
+          (:fcmp (mvm-fcmp buf (second insn) (third insn)))
 
           ;; ---- Shift instructions (reg + reg + imm8) ----
           (:shl

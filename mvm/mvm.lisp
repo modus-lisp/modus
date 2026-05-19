@@ -59,6 +59,8 @@
    #:+op-set-cenv+ #:+op-get-cenv+
    #:+op-set-nargs+ #:+op-get-nargs+
    #:+op-trap+
+   #:+op-fadd+ #:+op-fsub+ #:+op-fmul+ #:+op-fdiv+
+   #:+op-itof+ #:+op-ftoi+ #:+op-fcmp+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
    #:opcode-info-code #:opcode-info-name #:opcode-info-operands #:opcode-info-description
@@ -75,6 +77,8 @@
    #:mvm-mov #:mvm-li #:mvm-li-const #:mvm-push #:mvm-pop
    #:mvm-add #:mvm-sub #:mvm-mul #:mvm-div #:mvm-mod
    #:mvm-neg #:mvm-inc #:mvm-dec
+   #:mvm-fadd #:mvm-fsub #:mvm-fmul #:mvm-fdiv
+   #:mvm-itof #:mvm-ftoi #:mvm-fcmp
    #:mvm-and #:mvm-or #:mvm-xor
    #:mvm-shl #:mvm-shr #:mvm-sar #:mvm-shlv #:mvm-sarv #:mvm-ldb
    #:mvm-cmp #:mvm-test
@@ -353,6 +357,20 @@
 (defconstant +op-set-nargs+  #xBC)  ; (set-nargs imm8) - set nargs reg (RAX) before call
 (defconstant +op-get-nargs+  #xBD)  ; (get-nargs Vd) - read nargs reg into Vd (callee entry)
 
+;; IEEE 64-bit float arithmetic.  Operands are tagged float OBJECTS
+;; (subtag #x60, two slots: hi32 + lo32 as tagged fixnums).  Result is
+;; a freshly-allocated float object via the bump allocator (R12 on x64).
+;; Per-arch translators choose lowering: x64 uses SSE2 (movq/addsd/...);
+;; other archs may emit a call to a software-float runtime helper or
+;; emit-an-error if no float support is wired up.
+(defconstant +op-fadd+   #xBE)  ; (fadd  Vd Va Vb) - Va + Vb, float-typed result
+(defconstant +op-fsub+   #xBF)  ; (fsub  Vd Va Vb) - Va - Vb
+(defconstant +op-fmul+   #xC0)  ; (fmul  Vd Va Vb) - Va * Vb
+(defconstant +op-fdiv+   #xC1)  ; (fdiv  Vd Va Vb) - Va / Vb
+(defconstant +op-itof+   #xC2)  ; (itof  Vd Vs)    - tagged integer → float object
+(defconstant +op-ftoi+   #xC3)  ; (ftoi  Vd Vs)    - float → tagged integer (truncate)
+(defconstant +op-fcmp+   #xC4)  ; (fcmp  Va Vb)    - sets flags (UCOMISD-style)
+
 ;;; ============================================================
 ;;; Opcode Metadata Table
 ;;; ============================================================
@@ -496,6 +514,15 @@
 (defopcode :get-cenv     #xBB (:reg)                 "Read closure-env register into Vd (R13 on x64)")
 (defopcode :set-nargs    #xBC (:imm8)                "Set nargs register (RAX) to imm8 — caller side, before :call-indirect")
 (defopcode :get-nargs    #xBD (:reg)                 "Read nargs register (RAX) into Vd — callee side, first prologue op")
+
+;; IEEE 64-bit float arithmetic (optional — lowering is per-architecture).
+(defopcode :fadd  #xBE (:reg :reg :reg) "IEEE float add  (allocates float result)")
+(defopcode :fsub  #xBF (:reg :reg :reg) "IEEE float sub  (allocates float result)")
+(defopcode :fmul  #xC0 (:reg :reg :reg) "IEEE float mul  (allocates float result)")
+(defopcode :fdiv  #xC1 (:reg :reg :reg) "IEEE float div  (allocates float result)")
+(defopcode :itof  #xC2 (:reg :reg)      "Tagged integer → IEEE float object")
+(defopcode :ftoi  #xC3 (:reg :reg)      "IEEE float → tagged integer (truncate)")
+(defopcode :fcmp  #xC4 (:reg :reg)      "IEEE float compare (sets flags)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -735,6 +762,15 @@
 
 (defun mvm-dec (buf vd)
   (encode-instruction buf +op-dec+ vd))
+
+;; IEEE float arithmetic (optional — see +op-fadd+ etc.).
+(defun mvm-fadd (buf vd va vb) (encode-instruction buf +op-fadd+ vd va vb))
+(defun mvm-fsub (buf vd va vb) (encode-instruction buf +op-fsub+ vd va vb))
+(defun mvm-fmul (buf vd va vb) (encode-instruction buf +op-fmul+ vd va vb))
+(defun mvm-fdiv (buf vd va vb) (encode-instruction buf +op-fdiv+ vd va vb))
+(defun mvm-itof (buf vd vs)    (encode-instruction buf +op-itof+ vd vs))
+(defun mvm-ftoi (buf vd vs)    (encode-instruction buf +op-ftoi+ vd vs))
+(defun mvm-fcmp (buf va vb)    (encode-instruction buf +op-fcmp+ va vb))
 
 ;; Bitwise
 (defun mvm-and (buf vd va vb)

@@ -25,6 +25,7 @@
   emit-prologue   ; function: (target buf) → emit function prologue
   emit-epilogue   ; function: (target buf) → emit function epilogue
   emit-boot       ; function: (target image) → emit boot sequence
+  (float-support :none) ; :native (HW FPU) | :software (Lisp soft-float) | :none
   features)       ; plist of target-specific features
 
 ;;; ============================================================
@@ -68,6 +69,7 @@
    :emit-prologue nil
    :emit-epilogue nil
    :emit-boot nil
+   :float-support :native        ; SSE2: MOVQ/ADDSD/SUBSD/MULSD/DIVSD/UCOMISD
    :features '(:has-io-ports t :has-lapic t :has-sipi t)))
 
 ;;; ============================================================

@@ -2238,7 +2238,91 @@
                   '(:child 100 :parent 200))
     (t (c) (%record-test-fail-or-emit 5220)))
 
+  ;; --- eql specializer ---
+  (handler-case (%init-clos-smoke-eql) (t (c) nil))
+  (handler-case
+    (deftest 5230 (smoke-eql 42) :is-42)
+    (t (c) (%record-test-fail-or-emit 5230)))
+  (handler-case
+    (deftest 5231 (smoke-eql 99) :is-other)
+    (t (c) (%record-test-fail-or-emit 5231)))
+
+  ;; --- defmethod on multiple specializers (binary dispatch) ---
+  (handler-case (%init-clos-smoke-binary) (t (c) nil))
+  (handler-case
+    (deftest 5240 (smoke-binary (make-instance 'smoke-circle :radius 1)
+                                (make-instance 'smoke-circle :radius 2))
+                  :circle-circle)
+    (t (c) (%record-test-fail-or-emit 5240)))
+  (handler-case
+    (deftest 5241 (smoke-binary (make-instance 'smoke-shape :name "x" :area 0)
+                                (make-instance 'smoke-circle :radius 2))
+                  :shape-circle)
+    (t (c) (%record-test-fail-or-emit 5241)))
+
+  ;; --- slot exists via class-direct-slots ---
+  (handler-case
+    (deftest 5250 (let ((slots (class-direct-slots (find-class 'smoke-circle))))
+                    (notnot (member 'radius slots))) t)
+    (t (c) (%record-test-fail-or-emit 5250)))
+
+  ;; --- method-function returns a callable ---
+  (handler-case
+    (deftest 5260 (let* ((m (find-method #'smoke-describe nil '(smoke-circle) nil))
+                         (fn (method-function m)))
+                    (notnot (functionp fn))) t)
+    (t (c) (%record-test-fail-or-emit 5260)))
+
+  ;; --- remove-method ---
+  (handler-case (%init-clos-smoke-remove) (t (c) nil))
+  (handler-case
+    (deftest 5270 (progn
+                    ;; Before removal: extra method on smoke-circle
+                    (let ((c (make-instance 'smoke-circle :radius 1)))
+                      (smoke-remove c))) :extra)
+    (t (c) (%record-test-fail-or-emit 5270)))
+  (handler-case
+    (deftest 5271 (progn
+                    ;; Remove the extra method, primary smoke-shape now wins
+                    (let ((m (find-method #'smoke-remove nil '(smoke-circle) nil)))
+                      (when m (remove-method #'smoke-remove m)))
+                    (let ((c (make-instance 'smoke-circle :radius 1)))
+                      (smoke-remove c))) :base)
+    (t (c) (%record-test-fail-or-emit 5271)))
+
   nil)
+
+;; --- EQL specializer ---
+(defun smoke-eql (&rest a) (%gf-dispatch 'smoke-eql a))
+(defun %init-clos-smoke-eql ()
+  (%defgeneric 'smoke-eql '(x) nil)
+  (%defmethod 'smoke-eql nil '((eql 42))
+              (lambda (x) (declare (ignore x)) :is-42))
+  (%defmethod 'smoke-eql nil '(t)
+              (lambda (x) (declare (ignore x)) :is-other))
+  (%register-gf-fn (function smoke-eql) 'smoke-eql))
+
+;; --- Two-arg dispatch (binary) ---
+(defun smoke-binary (&rest a) (%gf-dispatch 'smoke-binary a))
+(defun %init-clos-smoke-binary ()
+  (%defgeneric 'smoke-binary '(a b) nil)
+  (%defmethod 'smoke-binary nil '(smoke-circle smoke-circle)
+              (lambda (a b) (declare (ignore a b)) :circle-circle))
+  (%defmethod 'smoke-binary nil '(smoke-shape smoke-circle)
+              (lambda (a b) (declare (ignore a b)) :shape-circle))
+  (%defmethod 'smoke-binary nil '(smoke-shape smoke-shape)
+              (lambda (a b) (declare (ignore a b)) :shape-shape))
+  (%register-gf-fn (function smoke-binary) 'smoke-binary))
+
+;; --- remove-method ---
+(defun smoke-remove (&rest a) (%gf-dispatch 'smoke-remove a))
+(defun %init-clos-smoke-remove ()
+  (%defgeneric 'smoke-remove '(s) nil)
+  (%defmethod 'smoke-remove nil '(smoke-shape)
+              (lambda (s) (declare (ignore s)) :base))
+  (%defmethod 'smoke-remove nil '(smoke-circle)
+              (lambda (s) (declare (ignore s)) :extra))
+  (%register-gf-fn (function smoke-remove) 'smoke-remove))
 
 ;; --- next-method-p ---
 (defun smoke-nmp-outer (&rest a) (%gf-dispatch 'smoke-nmp-outer a))

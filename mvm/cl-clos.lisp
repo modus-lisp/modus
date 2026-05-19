@@ -1023,7 +1023,13 @@
       (error "no applicable primary method"))
     ;; Build the effective method chain
     (let ((run-primary
-           (lambda ()
+           ;; Accept &rest so when the :around chain wraps run-primary in
+           ;; a primary-sentinel and call-next-method does
+           ;; (apply (method-fn sentinel) actual-args), the runtime args
+           ;; (e.g. the instance) are happily ignored — run-primary
+           ;; already closed over `args' at outer dispatch time.
+           (lambda (&rest _ignored)
+             (declare (ignore _ignored))
              ;; Run before methods
              (let ((cur before-methods))
                (loop
@@ -1051,28 +1057,33 @@
                    (setq cur (cdr cur))))
                result))))
       (if around-methods
-        ;; Run around methods wrapping the primary chain
-        (let ((*%next-methods*
-               (let ((remaining (cdr around-methods)))
-                 ;; Last around calls run-primary as "next"
-                 remaining))
-              (*%current-gf-args* args))
-          ;; Build synthetic "next" for the last around to call primary
-          (let ((primary-sentinel (%make-method nil nil run-primary)))
-            (let ((*%next-methods*
-                   (let ((rev-around (cdr around-methods)))
-                     ;; Append primary-sentinel after last around
-                     (let ((result nil)
-                           (cur rev-around))
-                       (loop
-                         (when (null cur)
-                           (setq result (cons primary-sentinel result))
-                           (return nil))
-                         (setq result (cons (car cur) result))
-                         (setq cur (cdr cur)))
-                       (nreverse result))))
-                  (*%current-gf-args* args))
-              (apply (%method-fn (car around-methods)) args))))
+        ;; Run around methods wrapping the primary chain.  Modus's LET
+        ;; on a defvar doesn't create dynamic scope, so we have to use
+        ;; setq+save/restore around the call — same pattern as the
+        ;; primary chain above.  Without this, call-next-method inside
+        ;; an :around method reads the GLOBAL *%next-methods* (still
+        ;; whatever the OUTER dispatch left it at) and gets the wrong
+        ;; chain.
+        (let ((primary-sentinel (%make-method nil nil run-primary)))
+          (let ((next-chain
+                 (let ((rev-around (cdr around-methods)))
+                   ;; Append primary-sentinel after the remaining arounds.
+                   (let ((result nil) (cur rev-around))
+                     (loop
+                       (when (null cur)
+                         (setq result (cons primary-sentinel result))
+                         (return nil))
+                       (setq result (cons (car cur) result))
+                       (setq cur (cdr cur)))
+                     (nreverse result)))))
+            (let ((saved-nm   *%next-methods*)
+                  (saved-args *%current-gf-args*))
+              (setq *%next-methods*    next-chain)
+              (setq *%current-gf-args* args)
+              (let ((r (apply (%method-fn (car around-methods)) args)))
+                (setq *%next-methods*    saved-nm)
+                (setq *%current-gf-args* saved-args)
+                r))))
         ;; No around: just run primary + before/after
         (funcall run-primary)))))
 

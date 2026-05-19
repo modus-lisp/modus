@@ -2128,4 +2128,151 @@
   (deftest 5100 (let ((m (find-method #'smoke-greet '(:before) '(smoke-shape) nil)))
                   (method-qualifiers m)) '(:before))
 
+  ;; --- :around methods ---
+  (handler-case (%init-clos-smoke-around) (t (c) nil))
+  (handler-case
+    (deftest 5110 (let ((s (make-instance 'smoke-shape :name "x")))
+                    (smoke-around s)) '(:around-before :primary :around-after))
+    (t (c) (%record-test-fail-or-emit 5110)))
+
+  ;; --- standard method combination: PROGN ---
+  (handler-case (%init-clos-smoke-progn) (t (c) nil))
+  (handler-case
+    (deftest 5120 (progn (setq *smoke-progn-counter* 0)
+                         (smoke-progn (make-instance 'smoke-shape :name "x"))
+                         *smoke-progn-counter*) 3)
+    (t (c) (%record-test-fail-or-emit 5120)))
+
+  ;; --- standard method combination: + ---
+  (handler-case (%init-clos-smoke-plus) (t (c) nil))
+  (handler-case
+    (deftest 5125 (smoke-plus (make-instance 'smoke-shape :name "x")) 60)
+    (t (c) (%record-test-fail-or-emit 5125)))
+
+  ;; --- standard method combination: APPEND ---
+  (handler-case (%init-clos-smoke-append) (t (c) nil))
+  (handler-case
+    (deftest 5130 (smoke-append (make-instance 'smoke-shape :name "x"))
+                  '(:shape-a :shape-b :child-a :child-b))
+    (t (c) (%record-test-fail-or-emit 5130)))
+
+  ;; --- multiple inheritance / diamond CPL ---
+  (handler-case (%init-clos-smoke-diamond) (t (c) nil))
+  (handler-case
+    (progn
+      (deftest 5140 (notnot (typep (%make-instance 'smoke-D) 'smoke-A)) t)
+      (deftest 5141 (notnot (typep (%make-instance 'smoke-D) 'smoke-B)) t)
+      (deftest 5142 (notnot (typep (%make-instance 'smoke-D) 'smoke-C)) t)
+      ;; C3 linearization tail
+      (deftest 5143 (let ((cpl (class-precedence-list (find-class 'smoke-D))))
+                      (member 'smoke-A cpl)) '(smoke-a standard-object t)))
+    (t (c) nil))
+
+  ;; --- ensure-generic-function / ensure-class ---
+  (handler-case
+    (deftest 5150 (let ((gf (ensure-generic-function 'smoke-ensured)))
+                    (notnot gf)) t)
+    (t (c) (%record-test-fail-or-emit 5150)))
+  (handler-case
+    (deftest 5151 (let ((cls (ensure-class 'smoke-ensured-class
+                                            :direct-superclasses '(standard-object)
+                                            :direct-slot-names '(s))))
+                    (class-name cls)) 'smoke-ensured-class)
+    (t (c) (%record-test-fail-or-emit 5151)))
+
+  ;; --- standard-instance-access raw slot ops ---
+  (handler-case
+    (deftest 5160 (let ((c (make-instance 'smoke-circle :name "x" :radius 99)))
+                    (standard-instance-access c 0)) 99)
+    (t (c) (%record-test-fail-or-emit 5160)))
+
+  ;; --- class-direct-superclasses / class-direct-subclasses ---
+  (handler-case
+    (deftest 5170 (class-direct-superclasses (find-class 'smoke-circle))
+                  '(smoke-shape))
+    (t (c) (%record-test-fail-or-emit 5170)))
+  (handler-case
+    (deftest 5171 (let ((subs (class-direct-subclasses (find-class 'smoke-shape))))
+                    (and (member 'smoke-circle subs)
+                         (member 'smoke-square subs) t)) t)
+    (t (c) (%record-test-fail-or-emit 5171)))
+
+  ;; --- compute-applicable-methods-using-classes ---
+  (handler-case
+    (deftest 5180 (notnot (compute-applicable-methods-using-classes
+                           #'smoke-describe (list 'smoke-circle))) t)
+    (t (c) (%record-test-fail-or-emit 5180)))
+
   nil)
+
+(defun %record-test-fail-or-emit (id)
+  "Print FAIL <id> directly without going through %record-test-fail
+   (which is Linux-build-specific) so the CLOS smoke can mark tests
+   crashed without forcing a full halt."
+  (write-char-serial 10)
+  (write-string-serial "FAIL ") (print-dec id) (write-char-serial 10))
+
+;; --- :around method setup ---
+(defun smoke-around (&rest a) (%gf-dispatch 'smoke-around a))
+(defun %init-clos-smoke-around ()
+  (%defgeneric 'smoke-around '(s) nil)
+  (%defmethod 'smoke-around nil '(smoke-shape)
+              (lambda (s) (declare (ignore s)) :primary))
+  (%defmethod 'smoke-around :around '(smoke-shape)
+              (lambda (s)
+                (declare (ignore s))
+                (let ((inner (call-next-method)))
+                  (list :around-before inner :around-after))))
+  (%register-gf-fn (function smoke-around) 'smoke-around))
+
+;; --- PROGN combination setup ---
+(defvar *smoke-progn-counter* 0)
+(defun smoke-progn (&rest a) (%gf-dispatch 'smoke-progn a))
+(defun %init-clos-smoke-progn ()
+  (%defgeneric 'smoke-progn '(s) 'progn)
+  (%defmethod 'smoke-progn nil '(smoke-shape)
+              (lambda (s) (declare (ignore s))
+                (setq *smoke-progn-counter* (+ *smoke-progn-counter* 1))))
+  ;; Add a second method on standard-object so 2 methods run (PROGN runs all).
+  (%defmethod 'smoke-progn nil '(standard-object)
+              (lambda (s) (declare (ignore s))
+                (setq *smoke-progn-counter* (+ *smoke-progn-counter* 2))))
+  (%register-gf-fn (function smoke-progn) 'smoke-progn))
+
+;; --- + combination setup (sums returns) ---
+(defun smoke-plus (&rest a) (%gf-dispatch 'smoke-plus a))
+(defun %init-clos-smoke-plus ()
+  (%defgeneric 'smoke-plus '(s) '+)
+  (%defmethod 'smoke-plus nil '(smoke-shape)
+              (lambda (s) (declare (ignore s)) 10))
+  (%defmethod 'smoke-plus nil '(standard-object)
+              (lambda (s) (declare (ignore s)) 20))
+  (%defmethod 'smoke-plus nil '(t)
+              (lambda (s) (declare (ignore s)) 30))
+  (%register-gf-fn (function smoke-plus) 'smoke-plus))
+
+;; --- APPEND combination setup ---
+(defun smoke-append (&rest a) (%gf-dispatch 'smoke-append a))
+(defun %init-clos-smoke-append ()
+  (%defgeneric 'smoke-append '(s) 'append)
+  (%defmethod 'smoke-append nil '(smoke-shape)
+              (lambda (s) (declare (ignore s)) '(:shape-a :shape-b)))
+  (%defmethod 'smoke-append nil '(standard-object)
+              (lambda (s) (declare (ignore s)) '(:child-a :child-b)))
+  (%register-gf-fn (function smoke-append) 'smoke-append))
+
+;; --- Diamond hierarchy ---
+;;     A
+;;    / \
+;;   B   C
+;;    \ /
+;;     D
+(defun %init-clos-smoke-diamond ()
+  (%defclass 'smoke-A '() '(standard-object))
+  (%register-clos-slot-info 'smoke-A (list) (list))
+  (%defclass 'smoke-B '() '(smoke-A))
+  (%register-clos-slot-info 'smoke-B (list) (list))
+  (%defclass 'smoke-C '() '(smoke-A))
+  (%register-clos-slot-info 'smoke-C (list) (list))
+  (%defclass 'smoke-D '() '(smoke-B smoke-C))
+  (%register-clos-slot-info 'smoke-D (list) (list)))

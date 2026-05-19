@@ -2401,19 +2401,24 @@
                        ((symbolp string) (symbol-name string))
                        (t (return-from apropos-list nil))))
          (pkgs (if package
-                   (list (handler-case (find-package package) (t (c) nil)))
-                   (list (handler-case (find-package "CL") (t (c) nil))
-                         (handler-case (find-package "CL-USER") (t (c) nil)))))
+                   (let ((p (find-package package)))
+                     (if p (list p) nil))
+                   (let ((cl (find-package "CL"))
+                         (clu (find-package "CL-USER")))
+                     (let ((r nil))
+                       (when cl (setq r (cons cl r)))
+                       (when clu (setq r (cons clu r)))
+                       r))))
          (acc nil))
     (dolist (p pkgs)
-      (when p
-        (handler-case
-          (let ((entries (%pkg-internal p)))
-            (dolist (entry entries)
-              (let ((nm (%symbol-name-of entry)))
-                (when (and nm (%string-contains nm needle))
-                  (setq acc (cons entry acc))))))
-          (t (c) nil))))
+      ;; Walk BOTH the internal and the external symbol tables —
+      ;; standard CL packages keep their exported symbols in the
+      ;; external table (slot 3), and apropos must see those.
+      (dolist (entries (list (%pkg-internal p) (%pkg-external p)))
+        (dolist (entry entries)
+          (let ((nm (%symbol-name-of entry)))
+            (when (and nm (%string-contains nm needle))
+              (setq acc (cons entry acc)))))))
     acc))
 
 (defun apropos (string &optional package)

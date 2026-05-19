@@ -1615,18 +1615,57 @@
               (%shared-init-default-spread args)))
         (%shared-init-default-spread args))))
 
+(defun %shared-init-apply-initargs (instance class-name initargs set-slots-acc)
+  "Apply initargs list to INSTANCE.  Avoids %shared-initialize-default's
+   funcall+&rest path (which loses trailing args).  Returns the
+   updated set-slots accumulator (alist of slot-name → t)."
+  (let ((cur initargs) (acc set-slots-acc))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return acc))
+      (let* ((key (car cur))
+             (val (car (cdr cur)))
+             (slot-nm (%clos-initarg-to-slot class-name key)))
+        (when (and slot-nm (null (member slot-nm acc :test #'eq)))
+          (set-slot-value instance slot-nm val)
+          (setq acc (cons slot-nm acc))))
+      (setq cur (cdr (cdr cur))))))
+
 (defun %shared-init-default-spread (args)
-  "Spread the args list to call %shared-initialize-default by name."
-  (let ((n (length args)))
-    (cond
-      ((= n 0) (%shared-initialize-default nil nil))
-      ((= n 1) (%shared-initialize-default (car args) nil))
-      ((= n 2) (%shared-initialize-default (car args) (cadr args)))
-      ((= n 3) (%shared-initialize-default (car args) (cadr args) (caddr args)))
-      ((= n 4) (%shared-initialize-default (car args) (cadr args) (caddr args)
-                                           (cadddr args)))
-      (t (%shared-initialize-default (car args) (cadr args) (caddr args)
-                                     (cadddr args) (cadddr (cdr args)))))))
+  "ARGS is (instance slot-names &rest initargs) as a list.  Apply the
+   initargs and initforms directly, bypassing the &rest re-pack path
+   that loses trailing args.  Mirrors %shared-initialize-default's
+   semantics."
+  (when (or (null args) (null (cdr args)))
+    (return-from %shared-init-default-spread nil))
+  (let* ((instance   (car args))
+         (slot-names (car (cdr args)))
+         (initargs   (cdr (cdr args))))
+    (when (or (null instance) (not (%clos-instance-p instance)))
+      (return-from %shared-init-default-spread instance))
+    (let* ((class-name (aref instance 1))
+           (cls        (%find-clos-class class-name)))
+      (when (null cls)
+        (return-from %shared-init-default-spread instance))
+      (let ((set-slots (%shared-init-apply-initargs
+                        instance class-name initargs nil)))
+        ;; Apply initforms for slots in slot-names that are still unbound.
+        (let ((sn (aref cls 2)) (idx 0))
+          (loop
+            (when (null sn) (return nil))
+            (let* ((nm (car sn))
+                   (already-set (member nm set-slots :test #'eq))
+                   (covered (cond ((eq slot-names t) t)
+                                  ((null slot-names) nil)
+                                  (t (member nm slot-names :test #'eq))))
+                   (cur-val (aref instance (+ 2 idx)))
+                   (was-unbound (and (fixnump cur-val) (= cur-val -999))))
+              (when (and (null already-set) covered was-unbound)
+                (let ((thunk (%clos-initform-thunk class-name nm)))
+                  (when thunk
+                    (set-slot-value instance nm (funcall thunk))))))
+            (setq idx (+ idx 1))
+            (setq sn (cdr sn))))
+        instance))))
 
 (defun shared-initialize (&rest %sh-args)
   "SHARED-INITIALIZE generic function entry.  Falls through to
@@ -2519,18 +2558,42 @@
 ;;; the instance, slot-names = T (apply all initforms for unbound
 ;;; slots), and the initargs.  Returns the instance.
 
-(defun %initialize-instance-default (instance &rest initargs)
-  (apply #'shared-initialize instance t initargs)
+(defun %initialize-instance-default-1 (instance slot-names initargs)
+  "List-form initialize-instance default — takes initargs as a list,
+   not a &rest tail.  Modus's funcall-with-&rest collapses arguments
+   when nargs > +max-reg-args+, so the apply'd chain
+   IIdefault → shared-initialize → %dispatch → %shared-init-default
+   silently drops trailing initargs.  Bypass that whole stack: build
+   the same effect inline by directly calling %shared-initialize-default
+   through the list-spread helper that already handles this shape."
+  ;; Check for user methods on shared-initialize; fall through to default
+  ;; with the args list.  (initialize-instance methods would have already
+  ;; dispatched higher up; this is the default body.)
+  (let* ((sa-args (cons instance (cons slot-names initargs)))
+         (gf (%find-gf 'shared-initialize)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf sa-args)))
+          (if applicable
+              (%gf-dispatch-standard gf sa-args applicable)
+              (%shared-init-default-spread sa-args)))
+        (%shared-init-default-spread sa-args)))
   instance)
 
+(defun %initialize-instance-default (instance &rest initargs)
+  "Same as -1 but exposed for the &rest signature used by methods."
+  (%initialize-instance-default-1 instance t initargs))
+
 (defun %dispatch-initialize-instance (args)
+  "ARGS is (instance &rest initargs).  Calling the default needs the
+   list-form helper because modus' funcall+&rest loses trailing args
+   when nargs > +max-reg-args+."
   (let ((gf (%find-gf 'initialize-instance)))
     (if (and gf (%gf-methods gf))
         (let ((applicable (%collect-applicable-methods gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
-              (apply #'%initialize-instance-default args)))
-        (apply #'%initialize-instance-default args))))
+              (%initialize-instance-default-1 (car args) t (cdr args))))
+        (%initialize-instance-default-1 (car args) t (cdr args)))))
 
 (defun initialize-instance (&rest %ii-args)
   (%dispatch-initialize-instance %ii-args))
@@ -2676,10 +2739,13 @@
 (defun %init-clos-protocol ()
   "Register the CLOS GFs that have system-supplied default methods.
    Called once from kernel-main after %init-make-load-form."
-  ;; INITIALIZE-INSTANCE on standard-object
+  ;; INITIALIZE-INSTANCE — register the GF but DON'T install a default
+  ;; method on standard-object.  %dispatch-initialize-instance falls
+  ;; through to %initialize-instance-default-1 directly when no
+  ;; user-defined methods apply.  Installing a default method whose
+  ;; body uses &rest+apply hits the funcall+&rest truncation that
+  ;; loses trailing initargs.
   (%defgeneric 'initialize-instance '(instance &rest initargs) nil)
-  (%defmethod 'initialize-instance nil '(standard-object)
-              (lambda (&rest args) (apply #'%initialize-instance-default args)))
   ;; NO-APPLICABLE-METHOD / NO-NEXT-METHOD
   (%defgeneric 'no-applicable-method '(gf &rest args) nil)
   (%defmethod 'no-applicable-method nil '(t)

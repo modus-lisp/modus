@@ -1506,7 +1506,8 @@
   (run-typep-debug-tests)
   (run-stream-debug-tests)
   (run-reader-tests)
-  (run-clos-diag-tests))
+  (run-clos-diag-tests)
+  (run-clos-smoke-tests))
 
 (defun run-stream-debug-tests ()
   ;; Stream type system
@@ -1965,3 +1966,166 @@
   (deftest 9132 (safe-eval (lambda () (cdr 42))) :crashed)
   (deftest 9133 (safe-eval (lambda () (car 42))) :crashed)
   )
+
+;;; ============================================================
+;;; CLOS smoke test (5000s) — does CLOS actually work?
+;;; ============================================================
+;;;
+;;; Build-time DEFCLASS / DEFGENERIC / DEFMETHOD are SBCL-side rewrites
+;;; that emit %defclass / %defmethod / accessor defuns; modus' compiler
+;;; doesn't see DEFCLASS as a special form.  So this test runner uses
+;;; the low-level %defclass / %defmethod API directly — exactly what
+;;; the build rewriter would emit — to exercise the runtime.
+
+;; smoke-greet :before / :after probes (defvars register but their
+;; init thunks don't auto-run on bare metal; reset inside the test).
+(defvar *smoke-before-fired* nil)
+(defvar *smoke-after-fired* nil)
+
+;; Dispatchers — these MUST be top-level so set-symbol-function picks
+;; them up.  The %defclass / %defmethod CALLS that wire the methods
+;; happen inside %init-clos-smoke (called from run-clos-smoke-tests
+;; below).
+(defun smoke-describe (&rest %sd-args) (%gf-dispatch 'smoke-describe %sd-args))
+(defun smoke-area     (&rest %sa-args) (%gf-dispatch 'smoke-area     %sa-args))
+(defun smoke-greet    (&rest %sg-args) (%gf-dispatch 'smoke-greet    %sg-args))
+
+(defun %init-clos-smoke ()
+  "Register the smoke-test classes + methods.  Top-level
+   (%defclass …) calls don't run on bare-metal modus, so this fires
+   once at the start of run-clos-smoke-tests instead."
+  (%defclass 'smoke-shape '(name area) '(standard-object))
+  (%register-clos-slot-info 'smoke-shape
+                            (list (cons :name 'name)
+                                  (cons :area 'area))
+                            (list))
+  (%defclass 'smoke-circle '(radius) '(smoke-shape))
+  (%register-clos-slot-info 'smoke-circle
+                            (list (cons :radius 'radius))
+                            (list))
+  (%defclass 'smoke-square '(side) '(smoke-shape))
+  (%register-clos-slot-info 'smoke-square
+                            (list (cons :side 'side))
+                            (list))
+  (%defgeneric 'smoke-describe '(s) nil)
+  (%defmethod 'smoke-describe nil '(smoke-shape)
+              (lambda (s) (list :shape (slot-value s 'name))))
+  (%defmethod 'smoke-describe nil '(smoke-circle)
+              (lambda (s) (list :circle (slot-value s 'name)
+                                        (slot-value s 'radius))))
+  (%register-gf-fn (function smoke-describe) 'smoke-describe)
+  (%defgeneric 'smoke-area '(s) nil)
+  (%defmethod 'smoke-area nil '(smoke-shape)
+              (lambda (s) (declare (ignore s)) :base))
+  (%defmethod 'smoke-area nil '(smoke-circle)
+              (lambda (s) (list :circle-from
+                                (call-next-method)
+                                (slot-value s 'radius))))
+  (%register-gf-fn (function smoke-area) 'smoke-area)
+  (%defgeneric 'smoke-greet '(s) nil)
+  (%defmethod 'smoke-greet :before '(smoke-shape)
+              (lambda (s) (declare (ignore s)) (setq *smoke-before-fired* t)))
+  (%defmethod 'smoke-greet :after '(smoke-shape)
+              (lambda (s) (declare (ignore s)) (setq *smoke-after-fired* t)))
+  (%defmethod 'smoke-greet nil '(smoke-shape)
+              (lambda (s) (slot-value s 'name)))
+  (%register-gf-fn (function smoke-greet) 'smoke-greet)
+  nil)
+
+(defun run-clos-smoke-tests ()
+  "Direct-exercise of CLOS: defclass, make-instance, slot-value,
+   defmethod dispatch, call-next-method, before/after, change-class,
+   reinitialize-instance, class-of, CPL, typep, find-method,
+   compute-applicable-methods, slot-boundp."
+  (setq *write-object-budget* 100)
+  (handler-case (%init-clos-smoke)
+    (t (c) (write-string-serial "smoke-init-crashed") (write-char-serial 10)))
+
+  ;; --- make-instance + slot-value ---
+  (deftest 5001 (let ((c (make-instance 'smoke-circle :name "ring" :radius 5)))
+                  (slot-value c 'name)) "ring")
+  (deftest 5002 (let ((c (make-instance 'smoke-circle :name "ring" :radius 5)))
+                  (slot-value c 'radius)) 5)
+
+  ;; --- typep + class-of ---
+  (deftest 5010 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (notnot (typep c 'smoke-circle))) t)
+  (deftest 5011 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (notnot (typep c 'smoke-shape))) t)
+  (deftest 5012 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (notnot (typep c 'standard-object))) t)
+  (deftest 5013 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (notnot (class-of c))) t)
+  (deftest 5014 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (class-name (class-of c))) 'smoke-circle)
+
+  ;; --- CPL ---
+  (deftest 5020 (let ((cpl (class-precedence-list (find-class 'smoke-circle))))
+                  (notnot (member 'smoke-shape cpl))) t)
+  (deftest 5021 (let ((cpl (class-precedence-list (find-class 'smoke-circle))))
+                  (notnot (member 'standard-object cpl))) t)
+  (deftest 5022 (let ((cpl (class-precedence-list (find-class 'smoke-circle))))
+                  (notnot (member 't cpl))) t)
+
+  ;; --- defmethod dispatch (most-specific wins) ---
+  (deftest 5030 (let ((c (make-instance 'smoke-circle :name "z" :radius 7)))
+                  (car (smoke-describe c))) :circle)
+  (deftest 5031 (let ((s (make-instance 'smoke-shape :name "z" :area 0)))
+                  (car (smoke-describe s))) :shape)
+
+  ;; --- call-next-method ---
+  (deftest 5040 (let ((c (make-instance 'smoke-circle :radius 3)))
+                  (car (smoke-area c))) :circle-from)
+  (deftest 5041 (let ((c (make-instance 'smoke-circle :radius 3)))
+                  (cadr (smoke-area c))) :base)
+  (deftest 5042 (let ((c (make-instance 'smoke-circle :radius 3)))
+                  (caddr (smoke-area c))) 3)
+
+  ;; --- :before / :after side effects ---
+  (deftest 5050 (progn (setq *smoke-before-fired* nil)
+                       (setq *smoke-after-fired* nil)
+                       (smoke-greet (make-instance 'smoke-shape :name "g"))
+                       (and *smoke-before-fired* *smoke-after-fired*
+                            t)) t)
+  (deftest 5051 (let ((s (make-instance 'smoke-shape :name "hi")))
+                  (smoke-greet s)) "hi")
+
+  ;; --- find-class / find-method / compute-applicable-methods ---
+  (deftest 5060 (notnot (find-class 'smoke-circle)) t)
+  (deftest 5061 (notnot (find-method #'smoke-describe nil '(smoke-circle) nil)) t)
+  (deftest 5062 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (notnot (compute-applicable-methods #'smoke-describe (list c))))
+                t)
+
+  ;; --- slot-boundp + slot-makunbound ---
+  (deftest 5070 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))
+                  (notnot (slot-boundp c 'name))) t)
+  (deftest 5071 (let ((c (make-instance 'smoke-circle :radius 1)))
+                  (slot-boundp c 'name)) nil)
+  (deftest 5072 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))
+                  (slot-makunbound c 'name)
+                  (slot-boundp c 'name)) nil)
+
+  ;; --- change-class (instance keeps identity, gets new class) ---
+  (deftest 5080 (let ((c (make-instance 'smoke-shape :name "a" :area 0)))
+                  (change-class c 'smoke-square)
+                  (class-name (class-of c))) 'smoke-square)
+  (deftest 5081 (let ((c (make-instance 'smoke-shape :name "a" :area 0)))
+                  (let ((c2 (change-class c 'smoke-square)))
+                    (eq c c2))) t)
+
+  ;; --- reinitialize-instance updates a slot via initarg ---
+  (deftest 5090 (let ((c (make-instance 'smoke-circle :name "old" :radius 1)))
+                  (reinitialize-instance c :name "new")
+                  (slot-value c 'name)) "new")
+
+  ;; --- shared-initialize directly ---
+  (deftest 5095 (let ((c (allocate-instance (find-class 'smoke-circle))))
+                  (shared-initialize c t :name "direct" :radius 9)
+                  (slot-value c 'radius)) 9)
+
+  ;; --- method-qualifiers / method-specializers ---
+  (deftest 5100 (let ((m (find-method #'smoke-greet '(:before) '(smoke-shape) nil)))
+                  (method-qualifiers m)) '(:before))
+
+  nil)

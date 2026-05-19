@@ -251,13 +251,11 @@
       (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
       (setq cur (cdr cur)))))
 
-(defun %clos-initarg-to-slot (class-name initarg-key)
-  "Map an initarg keyword (symbol) to a slot-name for CLASS-NAME, or nil.
-   Compares by eq, then native-MVM-sym hash, then CL-sym name string.
-   Bare-metal symbols-from-quoted-literals are native (1-slot, hash-only),
-   so plain eq sometimes fails for symbols-with-the-same-name."
+(defun %clos-initarg-lookup-1 (class-name initarg-key)
+  "Look up INITARG-KEY in the initarg-map of just this CLASS-NAME
+   (no super walk).  Returns slot-name or nil."
   (let ((info (%clos-slot-info-for class-name)))
-    (when (null info) (return-from %clos-initarg-to-slot nil))
+    (when (null info) (return-from %clos-initarg-lookup-1 nil))
     (let ((iar (car info)))
       (let ((cur iar))
         (loop
@@ -277,10 +275,28 @@
                 (return (cdr entry)))))
           (setq cur (cdr cur)))))))
 
-(defun %clos-initform-thunk (class-name slot-name)
-  "Return the initform thunk for SLOT-NAME in CLASS-NAME, or nil."
+(defun %clos-initarg-to-slot (class-name initarg-key)
+  "Map INITARG-KEY to slot-name walking the class's CPL — inherited
+   slots get their parent's initarg map.  Without the CPL walk,
+   (make-instance 'subclass :inherited-arg V) would silently drop V
+   because the subclass's own initarg-map only knows its OWN slots."
+  (let ((direct (%clos-initarg-lookup-1 class-name initarg-key)))
+    (when direct (return-from %clos-initarg-to-slot direct)))
+  (let ((cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %clos-initarg-to-slot nil))
+    ;; aref cls 4 is the CPL.  Skip the leading class itself (already checked).
+    (let ((cpl (cdr (aref cls 4))))
+      (let ((cur cpl))
+        (loop
+          (when (null cur) (return nil))
+          (let ((found (%clos-initarg-lookup-1 (car cur) initarg-key)))
+            (when found (return found)))
+          (setq cur (cdr cur)))))))
+
+(defun %clos-initform-thunk-1 (class-name slot-name)
+  "Look up initform thunk for SLOT-NAME on just CLASS-NAME (no super walk)."
   (let ((info (%clos-slot-info-for class-name)))
-    (when (null info) (return-from %clos-initform-thunk nil))
+    (when (null info) (return-from %clos-initform-thunk-1 nil))
     (let ((ifm (cdr info)))
       (let ((cur ifm))
         (loop
@@ -288,6 +304,22 @@
           (let ((entry (car cur)))
             (when (eq (car entry) slot-name)
               (return (cdr entry))))
+          (setq cur (cdr cur)))))))
+
+(defun %clos-initform-thunk (class-name slot-name)
+  "Return the initform thunk for SLOT-NAME in CLASS-NAME, walking the
+   CPL — inherited slots get their parent's initform.  Without the
+   walk, subclass instances would leave inherited slots unbound."
+  (let ((direct (%clos-initform-thunk-1 class-name slot-name)))
+    (when direct (return-from %clos-initform-thunk direct)))
+  (let ((cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %clos-initform-thunk nil))
+    (let ((cpl (cdr (aref cls 4))))
+      (let ((cur cpl))
+        (loop
+          (when (null cur) (return nil))
+          (let ((found (%clos-initform-thunk-1 (car cur) slot-name)))
+            (when found (return found)))
           (setq cur (cdr cur)))))))
 
 (defun %clos-slot-index (cls slot-name)
@@ -306,14 +338,11 @@
 ;;; handles the rest — class-object args, missing/extra args, runtime
 ;;; (eval `(make-instance ...)) callers).
 (defun make-instance (&rest args)
-  "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and calls
-   INITIALIZE-INSTANCE on it with the initargs.  INITIALIZE-INSTANCE
-   in turn invokes SHARED-INITIALIZE with slot-names = T so initforms
-   apply to any slots not set by initargs.  Returns the instance.
-
-   This was a hand-coded initarg+initform loop bypassing the GF
-   protocol — that worked for the simple build-time-rewriter shape
-   but skipped user-defined INITIALIZE-INSTANCE methods entirely."
+  "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
+   INITIALIZE-INSTANCE on it with the initargs.  We bypass apply on
+   initialize-instance — that goes through funcall+&rest, which in
+   modus loses trailing args when nargs > +max-reg-args+.  Instead we
+   call the dispatcher directly with the args list."
   (cond
     ((null args) (error "make-instance: requires a class designator"))
     (t
@@ -321,7 +350,7 @@
             (initargs (cdr args))
             (inst (%make-instance class-or-name)))
        (when (null inst) (return-from make-instance nil))
-       (apply #'initialize-instance inst initargs)
+       (%dispatch-initialize-instance (cons inst initargs))
        inst))))
 
 (defun %make-instance (class-or-name)

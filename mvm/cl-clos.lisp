@@ -2134,8 +2134,35 @@
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start end val) seq)  ; stub
 (defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))
-(defun nth-value (n form) nil)  ; stub
-(defun copy-symbol (sym &optional props) nil)  ; stub
+;; NTH-VALUE — compile-time macro at compiler.lisp:847 handles direct
+;; call; this runtime defun is for #'NTH-VALUE / funcall-on-symbol.
+;; Reads N'th MV slot via mem-ref.
+(defun nth-value (n form)
+  (cond
+    ((= n 0) form)
+    ;; FORM has already been evaluated, MV slots populated.  Read from
+    ;; the MV-values area at 0x10000098+.
+    ((<= n 15)
+     (let ((mv-count (ash (mem-ref #x10000090 :u64) -1)))
+       (if (>= n mv-count)
+           nil
+           (let ((bits (mem-ref (+ #x10000098 (* n 8)) :u64)))
+             (ash bits -1)))))
+    (t nil)))
+(defun copy-symbol (sym &optional copy-props)
+  "Create a fresh uninterned symbol with the same name as SYM.
+   Per CLHS 12.7.5, the new symbol has no function/value bindings;
+   if COPY-PROPS is true the property list is shared (modus has no
+   symbol plists, so this is a no-op)."
+  (declare (ignore copy-props))
+  (cond
+    ((null sym) (make-symbol "NIL"))
+    ((eq sym t) (make-symbol "T"))
+    (t
+     (let ((name (cond ((symbolp sym) (symbol-name sym))
+                       ((stringp sym) sym)
+                       (t "G"))))
+       (make-symbol name)))))
 ;; realpart / imagpart / conjugate / complexp live in cl-sequences.lisp
 ;; with the proper 3-slot complex array recognition.  The stubs that
 ;; were here unconditionally returned z / 0 and shadowed the real

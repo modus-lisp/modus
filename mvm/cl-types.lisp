@@ -274,7 +274,25 @@
 ; fboundp defined in Layer 8 above
 (defun fill-pointer (vec)
   (if (consp vec) (car vec) (length vec)))
-(defun bit-vector-p (x) nil)  ; stub
+(defun bit-vector-p (x)
+  "Recognise a bit-vector: an array of bit elements.  Modus stores
+   bit-vectors as the read-syntax #*…  builds — typically a wrapped
+   array whose element type is bit.  Without a true bit-element
+   storage, modus uses general arrays for #* literals.  For typep /
+   typep-fallback purposes, recognise vectors that contain only 0/1."
+  (cond
+    ((or (fixnump x) (null x) (consp x) (characterp x)) nil)
+    ((stringp x) nil)
+    ((not (= (obj-subtag x) #x32)) nil)
+    (t
+     ;; Walk elements: all must be 0 or 1.
+     (let ((len (array-length x)) (i 0) (ok t))
+       (loop
+         (when (or (not ok) (>= i len)) (return ok))
+         (let ((e (aref x i)))
+           (unless (or (eql e 0) (eql e 1)) (setq ok nil)))
+         (setq i (+ i 1)))
+       ok))))
 (defun simple-string-p (x) (stringp x))
 (defun simple-bit-vector-p (x) nil)
 ;;; ============================================================

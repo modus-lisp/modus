@@ -2066,10 +2066,20 @@
    instance, slot-names = NIL (so no initforms re-apply), and the
    passed initargs.  Returns INSTANCE.
 
-   This was a noisy stub that simply returned INSTANCE without
-   applying initargs at all, breaking reinitialize-instance.lsp's
-   tests that pass `:slot value` and expect the slot updated."
-  (apply #'shared-initialize instance nil initargs)
+   Bypass APPLY+&rest through SHARED-INITIALIZE (which truncates
+   trailing initargs when modus's funcall passes >4 args through
+   the dispatch closure's &rest).  Call %shared-init-default-spread
+   directly with the args list, the same way make-instance does."
+  (let ((gf (%find-gf 'shared-initialize)))
+    (cond
+      ((and gf (%gf-methods gf))
+       (let* ((sa-args (cons instance (cons nil initargs)))
+              (applicable (%collect-applicable-methods gf sa-args)))
+         (if applicable
+             (%gf-dispatch-standard gf sa-args applicable)
+             (%shared-init-default-spread sa-args))))
+      (t
+       (%shared-init-default-spread (cons instance (cons nil initargs))))))
   instance)
 
 (defun make-instances-obsolete (class)

@@ -1165,6 +1165,72 @@
 ;; uses %fixnum-+ / %fixnum-- / %fixnum-* primitives instead — direct IR
 ;; emission with no further dispatch — and the ratio/integer branches
 ;; use the same primitives plus the (already-recursion-safe) ratio shape.
+;;; ============================================================
+;;; IEEE float decode helpers
+;;; ============================================================
+;;;
+;;; Modus stores literal floats as 2-slot objects with subtag #x60.
+;;; Slot 0 = high 32 bits of IEEE bits (signed-stored, sign bit ⇒
+;;; negative fixnum), slot 1 = low 32 bits.
+;;;
+;;; ANSI numeric operations on such floats need to compute REAL float
+;;; arithmetic.  We decode the bits to an exact rational, route
+;;; through %make-rat, and accept that the result will be a rational
+;;; rather than a re-encoded IEEE float — modus's float type is
+;;; effectively a rational with limited precision anyway.
+
+(defun %ieee-float-p (x)
+  "True if X is an IEEE-bits boxed float (subtag #x60, 2 slots)."
+  (and (not (fixnump x)) (not (consp x)) (not (null x))
+       (not (characterp x))
+       (= (obj-subtag x) #x60)
+       (= (array-length x) 2)))
+
+(defun %ieee-float-to-rat (x)
+  "Decode IEEE 64-bit double bits (modus encoding) to an exact rational.
+   Layout: sign|11-bit exponent|52-bit mantissa.  Value = (-1)^sign *
+   (1 + mantissa/2^52) * 2^(exponent - 1023) for normal floats; subnormal
+   has implicit-1 bit cleared and exponent = -1022."
+  (let* ((hi (aref x 0))                              ; tagged fixnum, may be negative if sign bit set
+         (lo (aref x 1))                              ; lo 32 bits (unsigned in 0..2^32-1)
+         (hi-u32 (logand hi 4294967295))              ; mask to unsigned 32-bit
+         (sign-bit (logand (ash hi-u32 -31) 1))
+         (exponent (logand (ash hi-u32 -20) 2047))   ; 11 bits
+         (mantissa-hi (logand hi-u32 1048575))        ; low 20 bits of hi
+         (mantissa (logior (ash mantissa-hi 32) (logand lo 4294967295)))
+         (raw-sign (if (= sign-bit 1) -1 1)))
+    (cond
+      ;; Zero
+      ((and (= exponent 0) (= mantissa 0)) 0)
+      ;; Infinity / NaN — return 0 (modus can't represent these)
+      ((= exponent 2047) 0)
+      ;; Subnormal: value = mantissa * 2^(-1022-52) * (-1)^sign
+      ((= exponent 0)
+       (%make-rat (* raw-sign mantissa) (ash 1 (+ 1022 52))))
+      ;; Normal: value = (2^52 + mantissa) * 2^(exponent-1023-52) * (-1)^sign
+      (t
+       (let ((m (+ (ash 1 52) mantissa))
+             (e (- exponent 1075)))   ; 1023 + 52
+         (if (>= e 0)
+             (* raw-sign m (ash 1 e))
+             (%make-rat (* raw-sign m) (ash 1 (- 0 e)))))))))
+
+(defun %coerce-numeric (x)
+  "Coerce any modus numeric (fixnum / bignum / ratio / modus-float-as-array
+   / IEEE-float) into a uniform fixnum-or-ratio form for arithmetic."
+  (cond
+    ((integerp x) x)
+    ((ratiop x) x)
+    ((%ieee-float-p x) (%ieee-float-to-rat x))
+    ;; 2-slot generic array used as a rational num/den
+    ((and (not (fixnump x)) (not (consp x)) (not (null x))
+          (not (characterp x))
+          (= (obj-subtag x) #x32)
+          (= (array-length x) 2))
+     (let ((n (aref x 0)) (d (aref x 1)))
+       (if (= d 1) n (%make-rat n d))))
+    (t x)))
+
 (defun generic-add (a b)
   (cond
     ((and (integerp a) (integerp b)) (%fixnum-+ a b))
@@ -1176,6 +1242,10 @@
      (%make-rat (%fixnum-+ (%fixnum-* (aref a 0) (aref b 1))
                            (%fixnum-* (aref b 0) (aref a 1)))
                 (%fixnum-* (aref a 1) (aref b 1))))
+    ;; Either operand is a non-integer/non-ratio numeric — coerce and recurse.
+    ;; Covers IEEE floats and modus's 2-slot rationals.
+    ((or (%ieee-float-p a) (%ieee-float-p b))
+     (generic-add (%coerce-numeric a) (%coerce-numeric b)))
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
@@ -1188,6 +1258,8 @@
     ((and (ratiop a) (ratiop b))
      (%make-rat (%fixnum-* (aref a 0) (aref b 0))
                 (%fixnum-* (aref a 1) (aref b 1))))
+    ((or (%ieee-float-p a) (%ieee-float-p b))
+     (generic-multiply (%coerce-numeric a) (%coerce-numeric b)))
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
@@ -1201,6 +1273,8 @@
      (%make-rat (%fixnum-- (%fixnum-* (aref a 0) (aref b 1))
                            (%fixnum-* (aref b 0) (aref a 1)))
                 (%fixnum-* (aref a 1) (aref b 1))))
+    ((or (%ieee-float-p a) (%ieee-float-p b))
+     (generic-subtract (%coerce-numeric a) (%coerce-numeric b)))
     (t (%fixnum-- a b))))
 
 (defun generic-1+ (x)

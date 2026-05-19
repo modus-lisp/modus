@@ -656,15 +656,44 @@
           (values sig exp sign)))))
 
 (defun integer-decode-float (float)
-  "Return (significand exponent sign) as integers."
-  (if (= float 0.0d0)
-      (values 0 0 1)
-      (let ((sign (if (< float 0.0d0) -1 1))
-            (abs-f (if (< float 0.0d0) (- 0.0d0 float) float)))
-        ;; 53 bits of precision for double
-        (let ((sig (truncate (* abs-f (expt 2.0d0 52))))
-              (exp -52))
-          (values sig exp sign)))))
+  "Decode IEEE 64-bit float to (significand exponent sign) — three integers.
+   Returns 0, 0, 1 for ±0.  For non-IEEE (modus rational-form floats or
+   non-floats) falls back to a coarse mantissa*2^exp split."
+  (cond
+    ((%ieee-float-p float)
+     (let* ((hi (aref float 0))
+            (lo (aref float 1))
+            (hi-u32 (logand hi 4294967295))
+            (sign-bit (logand (ash hi-u32 -31) 1))
+            (exponent (logand (ash hi-u32 -20) 2047))
+            (mantissa-hi (logand hi-u32 1048575))
+            (mantissa (logior (ash mantissa-hi 32) (logand lo 4294967295)))
+            (sign (if (= sign-bit 1) -1 1)))
+       (cond
+         ((and (= exponent 0) (= mantissa 0)) (values 0 0 sign))
+         ((= exponent 2047) (values mantissa 0 sign))  ; inf/nan
+         ((= exponent 0)
+          ;; Subnormal — exponent is -1074 effectively
+          (values mantissa -1074 sign))
+         (t
+          ;; Normal: significand = (2^52 | mantissa), exponent = e-1075
+          (values (logior (ash 1 52) mantissa)
+                  (- exponent 1075)
+                  sign)))))
+    ((= float 0)
+     (values 0 0 1))
+    ((integerp float)
+     (let ((sign (if (< float 0) -1 1))
+           (abs (if (< float 0) (- 0 float) float)))
+       (values abs 0 sign)))
+    (t
+     ;; Modus rational-form float (2-slot generic array num/den): mantissa
+     ;; ~= num*2^k for some k that makes (mantissa*2^exp ≈ num/den) — pick
+     ;; exp=0 and return num as the significand.  Approximation only.
+     (let ((sign 1) (m float))
+       (when (< (or (ignore-errors (%coerce-numeric float)) 0) 0)
+         (setq sign -1) (setq m (- 0 m)))
+       (values (or (ignore-errors (truncate m)) 0) 0 sign)))))
 
 ;;; float-related constants
 (defvar double-float-epsilon 2.220446049250313d-16)

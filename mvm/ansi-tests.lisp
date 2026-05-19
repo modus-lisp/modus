@@ -2441,6 +2441,24 @@
   (handler-case (deftest 5640 (notnot (apropos-list "CAR")) t)
     (t (c) (%record-test-fail-or-emit 5640)))
 
+  ;; --- bit/setf-bit smoke ---
+  (handler-case (deftest 5690 (let ((b (make-array 4)))
+                                (aset b 2 1)
+                                (aref b 2)) 1)
+    (t (c) (%record-test-fail-or-emit 5690)))
+  (handler-case (deftest 5691 (let ((b (make-array 4)))
+                                (setf (bit b 2) 1)
+                                (aref b 2)) 1)
+    (t (c) (%record-test-fail-or-emit 5691)))
+  (handler-case (deftest 5692 (let ((b (make-array 4)))
+                                (set-bit b 2 1)
+                                (aref b 2)) 1)
+    (t (c) (%record-test-fail-or-emit 5692)))
+  (handler-case (deftest 5693 (let ((b (make-array 4)))
+                                (setf (aref b 2) 1)
+                                (aref b 2)) 1)
+    (t (c) (%record-test-fail-or-emit 5693)))
+
   ;; --- IEEE float smoke (Phase 2 verification) ---
   (handler-case (deftest 5670 (floatp 1.0) t)
     (t (c) (%record-test-fail-or-emit 5670)))

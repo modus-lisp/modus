@@ -2190,14 +2190,15 @@
   "Access element of simple bit array."
   (aref bit-array (if (null subscripts) 0 (car subscripts))))
 
-(defun set-bit (bit-array new-value &rest subscripts)
-  "Set element of bit array."
-  (aset bit-array (if (null subscripts) 0 (car subscripts)) new-value)
+(defun set-bit (bit-array idx new-value)
+  "Setter for (SETF (BIT BV I) val) — modus's setf macro emits args
+   in (BV IDX VAL) order; not the older val-first convention."
+  (aset bit-array idx new-value)
   new-value)
 
-(defun set-sbit (bit-array new-value &rest subscripts)
-  "Set element of simple bit array."
-  (aset bit-array (if (null subscripts) 0 (car subscripts)) new-value)
+(defun set-sbit (bit-array idx new-value)
+  "Setter for (SETF (SBIT BV I) val) — same arg order as set-bit."
+  (aset bit-array idx new-value)
   new-value)
 
 ;;; ============================================================

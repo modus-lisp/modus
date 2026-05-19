@@ -1848,6 +1848,11 @@
 
 (defun bit (bv idx) (aref bv idx))
 (defun sbit (bv idx) (aref bv idx))
+;; SETF expansions for (bit bv idx) / (sbit bv idx).
+;; SETF macro generic case emits (set-bit BV IDX VAL); our defun
+;; mirrors that arg order.
+(defun set-bit  (bv idx val) (aset bv idx val) val)
+(defun set-sbit (bv idx val) (aset bv idx val) val)
 
 (defun %bit-result-array (bv1 result-arg)
   "Resolve the result-array argument of a bit-X function.

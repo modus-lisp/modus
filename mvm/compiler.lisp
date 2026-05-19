@@ -6654,8 +6654,35 @@
      env dest)))
 
 (defun compile-arrayp (arg env dest)
-  "Compile (arrayp x)"
-  (compile-object-subtype-p arg env dest +subtag-array+))
+  "Compile (arrayp x) — true for any object with a string OR array
+   subtag (#x31 or #x32).  Per CLHS, ARRAY includes vectors, strings,
+   bit-vectors, and multi-dimensional arrays."
+  (let ((true-label (make-compiler-label))
+        (end-label (make-compiler-label))
+        (false-label (make-compiler-label))
+        (temp (alloc-temp-reg))
+        (temp2 (alloc-temp-reg)))
+    (compile-form arg env dest)
+    (emit-ir :obj-tag temp dest)
+    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :bne false-label)
+    ;; Subtag must be string (#x31) or array (#x32)
+    (emit-ir :obj-subtag temp dest)
+    (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    (emit-ir :li temp2 (ash +subtag-array+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    (emit-ir-label false-label)
+    (compile-nil dest)
+    (emit-ir :br end-label)
+    (emit-ir-label true-label)
+    (compile-t dest)
+    (emit-ir-label end-label)
+    (free-temp-reg)
+    (free-temp-reg)))
 
 (defun compile-integerp (arg env dest)
   "Compile (integerp x) - true if fixnum or bignum.

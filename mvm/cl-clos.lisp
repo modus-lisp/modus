@@ -2182,7 +2182,18 @@
 ;; implementations via last-defun-wins.
 (defun numerator (r) r)
 (defun denominator (r) 1)
-(defun float (n &optional proto) n)  ; stub — no real floats
+(defun float (n &optional proto)
+  "Convert N to a float.  Integer → IEEE double via %float-from-int;
+   ratio → num/den as IEEE double; existing float → unchanged.
+   PROTO ignored (modus only has one float type)."
+  (declare (ignore proto))
+  (cond
+    ((%ieee-float-p n) n)
+    ((integerp n) (%float-from-int n))
+    ((ratiop n)
+     (%float-div (%float-from-int (aref n 0))
+                 (%float-from-int (aref n 1))))
+    (t n)))
 (defun rational (n) n)
 (defun rationalize (n) n)
 

@@ -1257,6 +1257,18 @@
        (if (= d 1) n (%make-rat n d))))
     (t x)))
 
+(defun %any-to-float (n)
+  "Coerce any numeric N (integer/ratio/IEEE float) to an IEEE float
+   object via the SSE2-backed %float-from-int / %float-div primops.
+   Complex inputs are left untouched (caller handles separately)."
+  (cond
+    ((%ieee-float-p n) n)
+    ((integerp n) (%float-from-int n))
+    ((ratiop n)
+     (%float-div (%float-from-int (aref n 0))
+                 (%float-from-int (aref n 1))))
+    (t n)))
+
 (defun generic-add (a b)
   (cond
     ((and (integerp a) (integerp b)) (%fixnum-+ a b))
@@ -1270,10 +1282,10 @@
                 (%fixnum-* (aref a 1) (aref b 1))))
     ;; Complex: dispatch to complex-add (defined in cl-sequences.lisp)
     ((or (%complex-p a) (%complex-p b)) (complex-add a b))
-    ;; Either operand is a non-integer/non-ratio numeric — coerce and recurse.
-    ;; Covers IEEE floats and modus's 2-slot rationals.
+    ;; IEEE float fast path — uses SSE2 ADDSD via %float-add primop.
+    ;; Result is a float-typed value (subtag #x60) per CLHS contagion.
     ((or (%ieee-float-p a) (%ieee-float-p b))
-     (generic-add (%coerce-numeric a) (%coerce-numeric b)))
+     (%float-add (%any-to-float a) (%any-to-float b)))
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
@@ -1287,8 +1299,9 @@
      (%make-rat (%fixnum-* (aref a 0) (aref b 0))
                 (%fixnum-* (aref a 1) (aref b 1))))
     ((or (%complex-p a) (%complex-p b)) (complex-mul a b))
+    ;; IEEE float fast path — SSE2 MULSD via %float-mul primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
-     (generic-multiply (%coerce-numeric a) (%coerce-numeric b)))
+     (%float-mul (%any-to-float a) (%any-to-float b)))
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
@@ -1303,8 +1316,9 @@
                            (%fixnum-* (aref b 0) (aref a 1)))
                 (%fixnum-* (aref a 1) (aref b 1))))
     ((or (%complex-p a) (%complex-p b)) (complex-sub a b))
+    ;; IEEE float fast path — SSE2 SUBSD via %float-sub primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
-     (generic-subtract (%coerce-numeric a) (%coerce-numeric b)))
+     (%float-sub (%any-to-float a) (%any-to-float b)))
     (t (%fixnum-- a b))))
 
 (defun generic-1+ (x)

@@ -2440,6 +2440,29 @@
   ;; --- apropos-list ---
   (handler-case (deftest 5640 (notnot (apropos-list "CAR")) t)
     (t (c) (%record-test-fail-or-emit 5640)))
+
+  ;; --- IEEE float smoke (Phase 2 verification) ---
+  (handler-case (deftest 5670 (floatp 1.0) t)
+    (t (c) (%record-test-fail-or-emit 5670)))
+  (handler-case (deftest 5671 (floatp (%float-from-int 3)) t)
+    (t (c) (%record-test-fail-or-emit 5671)))
+  (handler-case (deftest 5672 (floatp (%float-add 1.0 2.0)) t)
+    (t (c) (%record-test-fail-or-emit 5672)))
+  (handler-case (deftest 5673 (%float-to-int (%float-add 1.0 2.0)) 3)
+    (t (c) (%record-test-fail-or-emit 5673)))
+  (handler-case (deftest 5674 (%float-to-int (%float-mul 4.0 5.0)) 20)
+    (t (c) (%record-test-fail-or-emit 5674)))
+  (handler-case (deftest 5675 (%float-to-int (%float-sub 10.0 3.0)) 7)
+    (t (c) (%record-test-fail-or-emit 5675)))
+  (handler-case (deftest 5676 (%float-to-int (%float-div 20.0 4.0)) 5)
+    (t (c) (%record-test-fail-or-emit 5676)))
+  (handler-case (deftest 5677 (%float-to-int (%float-from-int 42)) 42)
+    (t (c) (%record-test-fail-or-emit 5677)))
+  ;; Generic arith should also route IEEE through fast path
+  (handler-case (deftest 5678 (floatp (+ 1.0 2.0)) t)
+    (t (c) (%record-test-fail-or-emit 5678)))
+  (handler-case (deftest 5679 (floatp (* 1.5 2.0)) t)
+    (t (c) (%record-test-fail-or-emit 5679)))
   nil)
 
 ;; --- EQL specializer ---

@@ -1878,9 +1878,9 @@
   (let ((fx (float x)))
     (log (+ fx (sqrt (- (* fx fx) 1.0))))))
 
-(defun conjugate (n)
-  "Return conjugate of N (identity for reals)."
-  n)
+;; conjugate lives in cl-sequences.lisp — the stub here returned the
+;; arg unchanged and shadowed the real implementation that handles
+;; (complex r i) properly.
 
 ;;; ============================================================
 ;;; BOOLE

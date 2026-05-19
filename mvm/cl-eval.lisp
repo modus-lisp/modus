@@ -1537,7 +1537,11 @@
 (defun numberp (x) (or (integerp x) (floatp-impl x)))
 (defun realp (x) (or (integerp x) (floatp-impl x)))
 (defun rationalp (x) (integerp x))
-(defun complexp (x) nil)
+;; complexp lives in cl-sequences.lisp with the proper %complex-p check.
+;; The stub here always returned NIL and shadowed the real impl via
+;; last-defun-wins (cl-eval loads after cl-sequences).
+;; — keeping a forwarder so eval can still find the name.
+(defun complexp (x) (%complex-p x))
 (defun floatp (x) (floatp-impl x))
 
 ;;; Misc
@@ -1853,4 +1857,92 @@
 (defun array-displacement (array)
   "Return displacement info for ARRAY. Our arrays are never displaced."
   (values nil 0))
+
+;;; ============================================================
+;;; SETF runtime — get-setf-expansion as a real function, plus the
+;;; defsetf / define-setf-expander registry that survives across
+;;; eval boundaries.
+;;; ============================================================
+
+(defvar *setf-expanders* nil
+  "Alist (accessor-name . expander-fn) for user-defined SETF places.
+   The expander-fn takes (place-args value-form) and returns a Lisp
+   form that performs the assignment.")
+
+(defun %register-setf-expander (name fn)
+  "Add NAME → FN to *setf-expanders*, replacing any prior entry."
+  (let ((found nil)
+        (cur *setf-expanders*)
+        (acc nil))
+    (loop
+      (when (null cur) (return nil))
+      (cond
+        ((eq (car (car cur)) name)
+         (setq acc (cons (cons name fn) acc))
+         (setq found t))
+        (t (setq acc (cons (car cur) acc))))
+      (setq cur (cdr cur)))
+    (unless found (setq acc (cons (cons name fn) acc)))
+    (setq *setf-expanders* acc))
+  name)
+
+(defun %find-setf-expander (name)
+  "Return expander-fn registered for NAME via defsetf, or NIL."
+  (let ((cur *setf-expanders*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun get-setf-expansion (place &optional env)
+  "Return five values: temp-vars, temp-vals, store-vars, store-form,
+   access-form.  Per CLHS 5.1.2.  Handles common builtin places
+   (car, cdr, aref, slot-value, gethash, nth, symbol-value,
+   symbol-function) and any name registered via DEFSETF; falls back
+   to a generic (setf (NAME args …) v) → (SET-NAME args … v) form
+   for unknown accessors."
+  (declare (ignore env))
+  (cond
+    ;; Plain symbol: (setf var v) → (setq var v).
+    ((symbolp place)
+     (let ((g (gensym "GSE-V")))
+       (values nil nil (list g)
+               (list 'setq place g)
+               place)))
+    ;; Compound form (accessor arg…)
+    ((consp place)
+     (let* ((accessor (car place))
+            (args (cdr place))
+            (g (gensym "GSE-V"))
+            (temps (mapcar (lambda (_a)
+                             (declare (ignore _a))
+                             (gensym "GSE-T"))
+                           args))
+            (expander (and (symbolp accessor) (%find-setf-expander accessor))))
+       (cond
+         (expander
+          ;; User defsetf — call the expander with the temp vars.
+          (values temps args (list g)
+                  (funcall expander temps g)
+                  (cons accessor temps)))
+         (t
+          ;; Fall through to (setf …) — the compiler's SETF macro will
+          ;; handle CAR/CDR/AREF/SLOT-VALUE/etc.  For unknown accessors
+          ;; the SETF macro itself emits (set-NAME args… v) which is
+          ;; the right convention.
+          (values temps args (list g)
+                  (list 'setf (cons accessor temps) g)
+                  (cons accessor temps))))))
+    (t
+     (values nil nil (list (gensym "GSE-V")) place place))))
+
+;;; SETF-SYMBOL-FUNCTION / SETF-MACRO-FUNCTION runtime entries —
+;;; some tests do (setf (symbol-function …) …) via eval.
+
+(defun setf-symbol-function (sym fn)
+  (set-symbol-function sym fn))
+(defun setf-macro-function (sym fn)
+  (set-macro-function sym fn))
+(defun setf-fdefinition (sym fn)
+  (set-fdefinition sym fn))
 

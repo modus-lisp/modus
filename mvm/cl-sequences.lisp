@@ -2055,9 +2055,48 @@
     (loop (when (zerop x) (return len))
       (setq x (ash x -1)) (setq len (+ len 1)))))
 
+(defun %complex-p (x)
+  "Recognise a modus complex number — 3-slot array with %complex-marker
+   in slot 0, real in slot 1, imaginary in slot 2."
+  (and (not (fixnump x)) (not (consp x)) (not (null x))
+       (not (characterp x))
+       (= (obj-subtag x) #x32)
+       (>= (array-length x) 3)
+       (eq (aref x 0) '%complex-marker)))
+
 (defun complex (r &optional i)
-  "Create a complex number (stub — returns real part)."
-  r)
+  "Create a complex number with REAL=r and IMAGINARY=i (default 0).
+   Per CLHS, (complex r 0) is rational-equivalent — modus collapses to
+   r in that case since we don't have a separate (complex rational)
+   vs (complex float) distinction.  When i ≠ 0 a real 3-slot array
+   is built so realpart/imagpart/conjugate can pull the components."
+  (let ((i (or i 0)))
+    (cond
+      ((and (integerp i) (= i 0)) r)
+      (t
+       (let ((c (make-array 3)))
+         (aset c 0 '%complex-marker)
+         (aset c 1 r)
+         (aset c 2 i)
+         c)))))
+
+(defun realpart (x)
+  (cond
+    ((%complex-p x) (aref x 1))
+    (t x)))
+
+(defun imagpart (x)
+  (cond
+    ((%complex-p x) (aref x 2))
+    (t 0)))
+
+(defun conjugate (x)
+  (cond
+    ((%complex-p x)
+     (complex (aref x 1) (- 0 (aref x 2))))
+    (t x)))
+
+(defun complexp (x) (%complex-p x))
 
 ;;; Hash table
 ;;; The real definition is in prelude.lisp — it recognizes both the

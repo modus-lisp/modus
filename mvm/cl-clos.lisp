@@ -2136,8 +2136,10 @@
 (defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))
 (defun nth-value (n form) nil)  ; stub
 (defun copy-symbol (sym &optional props) nil)  ; stub
-(defun realpart (z) z)
-(defun imagpart (z) 0)
+;; realpart / imagpart / conjugate / complexp live in cl-sequences.lisp
+;; with the proper 3-slot complex array recognition.  The stubs that
+;; were here unconditionally returned z / 0 and shadowed the real
+;; implementations via last-defun-wins.
 (defun numerator (r) r)
 (defun denominator (r) 1)
 (defun float (n &optional proto) n)  ; stub — no real floats

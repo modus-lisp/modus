@@ -1482,7 +1482,15 @@
 (defun code-char (n) (if (characterp n) n (code-char n)))
 
 ;;; Numeric
-(defun abs (n) (if (< n 0) (- 0 n) n))
+(defun abs (n)
+  "Absolute value.  For real n: n if n>=0, else -n.  For complex
+   z = a+bi: sqrt(a*a+b*b)."
+  (cond
+    ((complexp n)
+     (let ((r (realpart n)) (i (imagpart n)))
+       (sqrt (+ (* r r) (* i i)))))
+    ((< n 0) (- 0 n))
+    (t n)))
 (defun max (a &rest more) (let ((r a)) (dolist (x more r) (when (> x r) (setq r x)))))
 (defun min (a &rest more) (let ((r a)) (dolist (x more r) (when (< x r) (setq r x)))))
 ;; CL floor: q toward -∞, r = n - q·d (sign of r matches sign of d when r≠0).

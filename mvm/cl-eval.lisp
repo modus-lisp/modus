@@ -1694,6 +1694,120 @@
           nil)
       (if (bignump b) nil (eql a b))))
 
+(defun bignum-cmp (a b)
+  "Compare a and b — returns -1/0/+1."
+  (let ((ah (if (bignump a) (bignum-hi a) (if (< a 0) -1 0)))
+        (al (if (bignump a) (bignum-lo a)
+                (logand a 4611686018427387903)))
+        (bh (if (bignump b) (bignum-hi b) (if (< b 0) -1 0)))
+        (bl (if (bignump b) (bignum-lo b)
+                (logand b 4611686018427387903))))
+    (cond ((< ah bh) -1)
+          ((> ah bh) 1)
+          ((< al bl) -1)
+          ((> al bl) 1)
+          (t 0))))
+
+(defun bignum-lt (a b) (= (bignum-cmp a b) -1))
+(defun bignum-gt (a b) (= (bignum-cmp a b)  1))
+(defun bignum-le (a b) (let ((c (bignum-cmp a b))) (or (= c -1) (= c 0))))
+(defun bignum-ge (a b) (let ((c (bignum-cmp a b))) (or (= c  1) (= c 0))))
+
+;;; Bignum multiplication via 31-bit chunk schoolbook.
+;;; Modus fixnums are 63-bit signed (62-bit positive).  Multiplying two
+;;; 62-bit values overflows.  Split into 31-bit halves and accumulate.
+
+(defun %bignum-abs-parts (n)
+  "Return (sign lo hi) where sign is 1 or -1 and lo/hi are the
+   62-bit magnitude parts of |n|."
+  (cond
+    ((bignump n)
+     (let ((lo (bignum-lo n)) (hi (bignum-hi n)))
+       (if (< hi 0)
+           ;; Negative: negate via two's complement.
+           (let ((neg-lo (+ 1 (logxor lo 4611686018427387903)))
+                 (neg-hi (logxor hi -1)))
+             (cond ((>= neg-lo 4611686018427387904)
+                    (list 1 0 (+ neg-hi 1)))
+                   (t (list -1 neg-lo neg-hi))))
+           (list 1 lo hi))))
+    ((< n 0) (list -1 (- 0 n) 0))
+    (t       (list 1  n        0))))
+
+(defun bignum-mul (a b)
+  "Multiply bignum/fixnum A by bignum/fixnum B.  Returns a fixnum
+   when the result fits, else a bignum.  Caps at 124-bit values —
+   beyond that we return the low 124 bits and lose precision."
+  ;; Fast path: both fixnum and product fits 62 bits.
+  (when (and (not (bignump a)) (not (bignump b)))
+    (let* ((aa (if (< a 0) (- 0 a) a))
+           (bb (if (< b 0) (- 0 b) b))
+           (max 2147483647))   ; 2^31 - 1
+      (when (and (<= aa max) (<= bb max))
+        (return-from bignum-mul (* a b)))))
+  ;; Slow path: split into 31-bit chunks and schoolbook.
+  (let* ((ap (%bignum-abs-parts a))
+         (bp (%bignum-abs-parts b))
+         (sign (* (car ap) (car bp)))
+         (a-lo (cadr ap)) (a-hi (caddr ap))
+         (b-lo (cadr bp)) (b-hi (caddr bp))
+         ;; Split each 62-bit half into two 31-bit chunks.
+         (mask31 2147483647)
+         (a0 (logand a-lo mask31))
+         (a1 (ash a-lo -31))                 ; bits 31..61 of lo
+         (a2 (logand a-hi mask31))           ; bits 0..30 of hi
+         (a3 (ash a-hi -31))                 ; bits 31..61 of hi
+         (b0 (logand b-lo mask31))
+         (b1 (ash b-lo -31))
+         (b2 (logand b-hi mask31))
+         (b3 (ash b-hi -31))
+         ;; Compute partial products that fit in 62 bits (31*31).
+         ;; Accumulator chunks (each 31-bit nominally, but we let them
+         ;; grow then carry-propagate).
+         (c0 (* a0 b0))                                      ; bits 0..62
+         (c1 (+ (* a0 b1) (* a1 b0)))                         ; bits 31..93
+         (c2 (+ (* a0 b2) (* a1 b1) (* a2 b0)))               ; bits 62..124
+         (c3 (+ (* a0 b3) (* a1 b2) (* a2 b1) (* a3 b0))))    ; bits 93..155
+    ;; Combine.  Result lo (bits 0..61) and hi (bits 62..123).
+    (let* ((res-lo (logand c0 (logand 4611686018427387903 4611686018427387903)))
+           (carry0 (ash c0 -62))
+           (mid (+ (ash c1 -0) carry0))           ; bits 31..93
+           ;; Place mid: low 31 bits feed into res-lo (bits 31..61), rest into res-hi.
+           (mid-low31 (logand mid mask31))
+           (mid-rest (ash mid -31)))              ; bits 62.. of mid → goes into res-hi
+      (setq res-lo (logior res-lo (ash mid-low31 31)))
+      (let* ((res-hi (+ mid-rest c2 (ash c3 31))))
+        (let ((result (make-bignum (logand res-lo 4611686018427387903) res-hi)))
+          (when (= sign -1) (setq result (bignum-negate result)))
+          (bignum-to-fixnum-if-possible result))))))
+
+(defun bignum-truncate (a b)
+  "Truncate division.  Returns the quotient.  For now, only fixnum-b
+   path is supported via repeated subtraction (slow but correct for
+   small divisors)."
+  (when (= b 0) (error "divide by zero"))
+  ;; Fixnum / fixnum: native.
+  (when (and (not (bignump a)) (not (bignump b)))
+    (return-from bignum-truncate (truncate a b)))
+  ;; Bignum / small-fixnum: repeated subtract (very slow if a is huge).
+  ;; Real impl would use schoolbook division; placeholder for now.
+  (let ((q 0) (r a)
+        (sign 1))
+    (when (< (bignum-cmp r 0) 0)
+      (setq r (bignum-negate r))
+      (setq sign (- 0 sign)))
+    (when (< b 0)
+      (setq b (- 0 b))
+      (setq sign (- 0 sign)))
+    (loop
+      (when (< (bignum-cmp r b) 0) (return nil))
+      (setq r (bignum-sub r b))
+      (setq q (+ q 1))
+      (when (> q 100000)
+        ;; Safety cap — real impl needed.
+        (return nil)))
+    (if (= sign -1) (- 0 q) q)))
+
 ;; Funcallable versions of compiler builtins (needed for #'consp etc.)
 (defun consp (x) (consp x))
 (defun atom (x) (atom x))

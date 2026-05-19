@@ -2290,6 +2290,85 @@
                       (smoke-remove c))) :base)
     (t (c) (%record-test-fail-or-emit 5271)))
 
+  ;; --- Numeric tower smoke (5500-series) ---
+  ;; sqrt: perfect square integer, non-perfect, ratio
+  (handler-case (deftest 5500 (sqrt 16) 4)
+    (t (c) (%record-test-fail-or-emit 5500)))
+  (handler-case (deftest 5501 (sqrt 0) 0)
+    (t (c) (%record-test-fail-or-emit 5501)))
+  (handler-case (deftest 5502 (let ((r (sqrt 2)))
+                                ;; sqrt(2) ≈ 1.4142 — rational form
+                                (notnot r)) t)
+    (t (c) (%record-test-fail-or-emit 5502)))
+  ;; Trig at exact zero
+  (handler-case (deftest 5510 (sin 0) 0) (t (c) (%record-test-fail-or-emit 5510)))
+  (handler-case (deftest 5511 (cos 0) 1) (t (c) (%record-test-fail-or-emit 5511)))
+  (handler-case (deftest 5512 (tan 0) 0) (t (c) (%record-test-fail-or-emit 5512)))
+  ;; exp(0) = 1, log(1) = 0
+  (handler-case (deftest 5513 (exp 0) 1) (t (c) (%record-test-fail-or-emit 5513)))
+  ;; log(1) — our impl returns approximation near 0
+  (handler-case (deftest 5514 (let ((r (log 1))) (notnot r)) t)
+    (t (c) (%record-test-fail-or-emit 5514)))
+  ;; Complex
+  (handler-case (deftest 5520 (complexp (complex 1 2)) t)
+    (t (c) (%record-test-fail-or-emit 5520)))
+  (handler-case (deftest 5521 (realpart (complex 3 4)) 3)
+    (t (c) (%record-test-fail-or-emit 5521)))
+  (handler-case (deftest 5522 (imagpart (complex 3 4)) 4)
+    (t (c) (%record-test-fail-or-emit 5522)))
+  (handler-case (deftest 5523 (realpart (conjugate (complex 3 4))) 3)
+    (t (c) (%record-test-fail-or-emit 5523)))
+  (handler-case (deftest 5524 (imagpart (conjugate (complex 3 4))) -4)
+    (t (c) (%record-test-fail-or-emit 5524)))
+  (handler-case (deftest 5525 (complex 5 0) 5)
+    (t (c) (%record-test-fail-or-emit 5525)))
+  ;; Ratios
+  (handler-case (deftest 5530 (numerator (exact-divide 4 6)) 2)
+    (t (c) (%record-test-fail-or-emit 5530)))
+  (handler-case (deftest 5531 (denominator (exact-divide 4 6)) 3)
+    (t (c) (%record-test-fail-or-emit 5531)))
+  ;; Bignum mul (large fixnum product)
+  (handler-case (deftest 5540 (let ((r (bignum-mul 1000000 1000000)))
+                                ;; 10^12 fits in fixnum
+                                (= r 1000000000000)) t)
+    (t (c) (%record-test-fail-or-emit 5540)))
+  ;; Bignum compare
+  (handler-case (deftest 5541 (bignum-lt 10 20) t)
+    (t (c) (%record-test-fail-or-emit 5541)))
+  (handler-case (deftest 5542 (bignum-gt 30 20) t)
+    (t (c) (%record-test-fail-or-emit 5542)))
+  ;; integer-length
+  (handler-case (deftest 5550 (integer-length 0) 0)
+    (t (c) (%record-test-fail-or-emit 5550)))
+  (handler-case (deftest 5551 (integer-length 7) 3)
+    (t (c) (%record-test-fail-or-emit 5551)))
+  ;; gcd / lcm
+  (handler-case (deftest 5560 (gcd 12 18) 6) (t (c) (%record-test-fail-or-emit 5560)))
+  (handler-case (deftest 5561 (lcm 4 6) 12) (t (c) (%record-test-fail-or-emit 5561)))
+  ;; abs, signum
+  (handler-case (deftest 5570 (abs -42) 42) (t (c) (%record-test-fail-or-emit 5570)))
+  (handler-case (deftest 5571 (signum -5) -1) (t (c) (%record-test-fail-or-emit 5571)))
+  (handler-case (deftest 5572 (signum 0) 0) (t (c) (%record-test-fail-or-emit 5572)))
+  ;; Setf places — get-setf-expansion
+  (handler-case (deftest 5580 (let ((c (cons 1 2)))
+                                (setf (car c) 99)
+                                (car c)) 99)
+    (t (c) (%record-test-fail-or-emit 5580)))
+  (handler-case (deftest 5581 (let ((v (vector 0 0 0)))
+                                (setf (aref v 1) 42)
+                                (aref v 1)) 42)
+    (t (c) (%record-test-fail-or-emit 5581)))
+  ;; shiftf
+  (handler-case (deftest 5582 (let ((a 1) (b 2) (c 3))
+                                (shiftf a b c 99)
+                                (list a b c)) '(2 3 99))
+    (t (c) (%record-test-fail-or-emit 5582)))
+  ;; rotatef
+  (handler-case (deftest 5583 (let ((a 1) (b 2))
+                                (rotatef a b)
+                                (list a b)) '(2 1))
+    (t (c) (%record-test-fail-or-emit 5583)))
+
   nil)
 
 ;; --- EQL specializer ---

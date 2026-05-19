@@ -159,6 +159,10 @@
 (defun log (x &optional base)
   "Natural log (or log to BASE if supplied).  Domain x > 0; returns
    0 for x ≤ 0 (modus doesn't have complex logs)."
+  ;; Exact 0 for x = 1.
+  (when (and (integerp x) (= x 1)
+             (or (null base) (and (integerp base) (>= base 2))))
+    (return-from log 0))
   (let* ((s (%as-scaled-int x)))
     (when (<= s 0) (return-from log 0))
     (let ((ln-x (%log-newton s)))

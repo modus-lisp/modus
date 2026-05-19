@@ -1523,8 +1523,27 @@
       (t (values q-c r-c)))))
 (defun rem (n d) (- n (* (truncate n d) d)))
 (defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
-(defun expt (base power) (cond ((= power 0) 1) ((= power 1) base)
-  (t (let ((r 1)) (dotimes (i power r) (setq r (* r base)))))))
+(defun expt (base power)
+  "Raise BASE to POWER.  Handles non-negative integer power directly;
+   negative integer power returns 1/expt(base, -power) as a ratio;
+   ratio power approximated as exp(power * log base) when domain
+   allows."
+  (cond
+    ((= power 0) 1)
+    ((= power 1) base)
+    ((and (integerp power) (> power 0))
+     (let ((r 1)) (dotimes (i power r) (setq r (* r base)))))
+    ((and (integerp power) (< power 0))
+     (exact-divide 1 (expt base (- 0 power))))
+    ((ratiop power)
+     ;; Approximate via exp(power * log base) — uses our rational
+     ;; Taylor-series transcendentals.
+     (exp (* power (log base))))
+    (t
+     ;; Default: try positive integer recursion.
+     (if (integerp power)
+         (let ((r 1)) (dotimes (i power r) (setq r (* r base))))
+         (exp (* power (log base)))))))
 (defun isqrt (n) (if (<= n 0) 0 (let ((x n)) (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
   (when (>= x1 x) (return x)) (setq x x1))))))
 (defun gcd (a &optional b) (if (null b) (abs a)

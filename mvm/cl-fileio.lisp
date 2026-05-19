@@ -672,9 +672,76 @@
   "Parse a namestring. Returns (values pathname position)."
   (values (namestring thing) (length (namestring thing))))
 
-(defun wild-pathname-p (x &rest args) nil)
-(defun pathname-match-p (path wild) nil)
-(defun translate-pathname (source from-wild to-wild) source)
+(defun wild-pathname-p (x &rest args)
+  "True if pathname X contains wild components (?, *, **).
+   FIELD-KEY (in args) restricts which field to check; we ignore it
+   and look at the whole namestring."
+  (declare (ignore args))
+  (let ((s (handler-case (namestring x) (t (c) nil))))
+    (when (null s) (return-from wild-pathname-p nil))
+    (let ((i 0) (len (length s)) (found nil))
+      (loop
+        (when (or found (>= i len)) (return found))
+        (let ((c (aref s i)))
+          (when (or (= c 42) (= c 63))   ; * or ?
+            (setq found t)))
+        (setq i (+ i 1)))
+      (if found t nil))))
+
+(defun %glob-match (pattern str)
+  "Glob-match PATTERN against STR.  Supports ? (any char), *
+   (any 0+ chars).  Returns T or NIL."
+  (let ((pi 0) (si 0)
+        (pl (length pattern)) (sl (length str))
+        (star-pos -1) (star-si 0))
+    (loop
+      (cond
+        ((>= si sl)
+         ;; Consumed string; any remaining pattern must be all *
+         (let ((all-star t) (j pi))
+           (loop
+             (when (>= j pl) (return nil))
+             (unless (= (aref pattern j) 42) (setq all-star nil))
+             (setq j (+ j 1)))
+           (return (if all-star t nil))))
+        ((>= pi pl)
+         (if (= star-pos -1)
+             (return nil)
+             (progn
+               (setq pi (+ star-pos 1))
+               (setq star-si (+ star-si 1))
+               (setq si star-si))))
+        ((= (aref pattern pi) 42)   ; *
+         (setq star-pos pi)
+         (setq star-si si)
+         (setq pi (+ pi 1)))
+        ((or (= (aref pattern pi) 63)   ; ?
+             (= (aref pattern pi) (aref str si)))
+         (setq pi (+ pi 1))
+         (setq si (+ si 1)))
+        ((>= star-pos 0)
+         (setq pi (+ star-pos 1))
+         (setq star-si (+ star-si 1))
+         (setq si star-si))
+        (t (return nil))))))
+
+(defun pathname-match-p (path wild)
+  "Return T if PATH matches the glob pattern WILD."
+  (let ((ps (handler-case (namestring path) (t (c) nil)))
+        (ws (handler-case (namestring wild) (t (c) nil))))
+    (cond
+      ((or (null ps) (null ws)) nil)
+      (t (%glob-match ws ps)))))
+
+(defun translate-pathname (source from-wild to-wild &rest args)
+  "Translate SOURCE matching FROM-WILD using TO-WILD as template.
+   Approximation: if SOURCE matches FROM-WILD, return TO-WILD with
+   wild parts of TO-WILD literally; full ANSI translation requires
+   reconstruction of wild captures which we don't track."
+  (declare (ignore args))
+  (if (pathname-match-p source from-wild)
+      to-wild
+      source))
 (defun translate-logical-pathname (x) (pathname x))
 (defun logical-pathname (x) (pathname x))
 (defun logical-pathname-translations (host) nil)

@@ -2440,7 +2440,6 @@
   ;; --- apropos-list ---
   (handler-case (deftest 5640 (notnot (apropos-list "CAR")) t)
     (t (c) (%record-test-fail-or-emit 5640)))
-
   nil)
 
 ;; --- EQL specializer ---

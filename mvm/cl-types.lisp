@@ -1687,6 +1687,48 @@
          ;; (mod n) — integer in [0, n-1]
          ((%typename-eq head 'mod)
           (and (integerp obj) (>= obj 0) (< obj (cadr type))))
+         ;; (bit-vector size) / (bit-vector *) — bit-vector with optional
+         ;; size constraint.  Use %typename-eq for the size sentinel so
+         ;; the literal '* compiled in the typep source matches the
+         ;; runtime '* synthesized via list construction.
+         ((or (%typename-eq head 'bit-vector)
+              (%typename-eq head 'simple-bit-vector))
+          (and (bit-vector-p obj)
+               (let ((sz (and (cdr type) (cadr type))))
+                 (or (null sz) (%typename-eq sz '*) (eq sz t)
+                     (and (integerp sz) (= sz (array-length obj)))))))
+         ;; (string size) / (simple-string size) — string with optional
+         ;; size.
+         ((or (%typename-eq head 'string)
+              (%typename-eq head 'simple-string)
+              (%typename-eq head 'base-string)
+              (%typename-eq head 'simple-base-string))
+          (and (stringp obj)
+               (let ((sz (and (cdr type) (cadr type))))
+                 (or (null sz) (%typename-eq sz '*) (eq sz t)
+                     (and (integerp sz) (= sz (array-length obj)))))))
+         ;; (vector elt-type size) — vector with optional element-type
+         ;; and size.  Accept anything with array-like subtag (#x31 string,
+         ;; #x32 vector, etc.); honor the length filter.
+         ((or (%typename-eq head 'vector)
+              (%typename-eq head 'simple-vector)
+              (%typename-eq head 'simple-array)
+              (%typename-eq head 'array))
+          (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
+               (or (= (obj-subtag obj) #x31)   ; string
+                   (= (obj-subtag obj) #x32))  ; generic array
+               (let ((sz (and (cddr type) (caddr type))))
+                 (or (null sz) (%typename-eq sz '*) (eq sz t)
+                     (and (integerp sz) (= sz (array-length obj)))))))
+         ;; (cons car-type cdr-type) — type-check both halves.
+         ((%typename-eq head 'cons)
+          (and (consp obj)
+               (let ((car-type (and (cdr type) (cadr type)))
+                     (cdr-type (and (cddr type) (caddr type))))
+                 (and (or (null car-type) (eq car-type '*) (eq car-type t)
+                          (typep (car obj) car-type))
+                      (or (null cdr-type) (eq cdr-type '*) (eq cdr-type t)
+                          (typep (cdr obj) cdr-type))))))
          (t nil))))))
 
 (defun typep* (obj type) (typep obj type))

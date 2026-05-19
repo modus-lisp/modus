@@ -1998,6 +1998,31 @@
        `(flet ((,iter-name () (values nil nil nil nil)))
           ,@body)))
 
+    ;; (catch-type-error form) → (handler-case form
+    ;;                              (type-error (c) (declare (ignore c)) 'type-error)
+    ;;                              (error (c) c))
+    ;; ansi-aux.lsp defines this as a macro; build emits SBCL READ output
+    ;; (S-expression printout) without macroexpansion, so test bodies see
+    ;; the bare CATCH-TYPE-ERROR symbol as a function call.  Rewriting it
+    ;; here makes the modus side compile the real handler form.
+    ((and (eq (car form) 'catch-type-error) (cdr form))
+     (let ((inner (rewrite-reader-forms (cadr form))))
+       `(handler-case ,inner
+          (type-error (c) (declare (ignore c)) 'type-error)
+          (error (c) c))))
+
+    ;; (handle-non-abort-restart . body) → (catch 'handled
+    ;;                                       (handler-bind ((error #'has-non-abort-restart))
+    ;;                                         ,@body))
+    ;; ansi-aux.lsp definition; same SBCL-defmacro-not-expanded issue.
+    ;; Provided as a stub that just runs the body for the common case
+    ;; where no restart-establishing error fires.
+    ((and (eq (car form) 'handle-non-abort-restart) (cdr form))
+     (let ((body (mapcar #'rewrite-reader-forms (cdr form))))
+       `(catch 'handled
+          (handler-case (progn ,@body)
+            (error (c) (declare (ignore c)) 'fail)))))
+
     (t (rewrite-reader-forms-list form))))
 
 (defun rewrite-reader-forms-list (list)

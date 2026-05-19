@@ -1340,10 +1340,48 @@
 ;;; Generic numeric comparison
 ;;; ============================================================
 
+(defun %ieee-float-sign-class (x)
+  "Return -2 if X <= -1, -1 if -1 < X < 0, 0 if X = 0, 1 if 0 < X < 1, 2 if X >= 1.
+   Used to short-circuit range comparisons against integers without
+   coercing through %ieee-float-to-rat (whose denominators of the form
+   ash 1 66 overflow modus's 63-bit fixnums)."
+  (let* ((hi (aref x 0))
+         (hi-u32 (logand hi 4294967295))
+         (sign-bit (logand (ash hi-u32 -31) 1))
+         (exponent (logand (ash hi-u32 -20) 2047)))
+    (cond
+      ((and (= exponent 0) (= (aref x 1) 0)
+            (= (logand hi-u32 1048575) 0)) 0)    ; ±zero
+      ((and (= sign-bit 1) (< exponent 1023)) -1) ; -1 < x < 0
+      ((= sign-bit 1) -2)                         ; x <= -1
+      ((< exponent 1023) 1)                       ; 0 < x < 1
+      (t 2))))                                    ; x >= 1
+
 (defun numeric-value-less-p (a b)
   "Return T if numeric value A < numeric value B.
    Handles integers, boxed floats (subtag #x60 IEEE or #x32 rational
    form), and tagged ratios (subtag #x33)."
+  ;; IEEE-float vs integer fast path — avoid %ieee-float-to-rat for
+  ;; sub-unit-magnitude floats whose rational denominator would be
+  ;; ash 1 66+ (overflows modus's 63-bit fixnum, breaks gcd-reduce).
+  (when (and (%ieee-float-p a) (integerp b))
+    (let ((sc (%ieee-float-sign-class a)))
+      (cond
+        ((and (= sc 0) (> b 0))   (return-from numeric-value-less-p t))    ; a=0, b>0
+        ((and (= sc 0) (<= b 0))  (return-from numeric-value-less-p nil))  ; a=0, b<=0
+        ((and (= sc 1) (>= b 1))  (return-from numeric-value-less-p t))    ; 0<a<1, b>=1
+        ((and (= sc 1) (<= b 0))  (return-from numeric-value-less-p nil))  ; 0<a<1, b<=0
+        ((and (= sc -1) (>= b 0)) (return-from numeric-value-less-p t))    ; -1<a<0, b>=0
+        ((and (= sc -1) (<= b -1)) (return-from numeric-value-less-p nil))))) ; -1<a<0, b<=-1
+  (when (and (integerp a) (%ieee-float-p b))
+    (let ((sc (%ieee-float-sign-class b)))
+      (cond
+        ((and (= sc 0) (< a 0))   (return-from numeric-value-less-p t))    ; a<0, b=0
+        ((and (= sc 0) (>= a 0))  (return-from numeric-value-less-p nil))  ; a>=0, b=0
+        ((and (= sc 1) (<= a 0))  (return-from numeric-value-less-p t))    ; a<=0, 0<b<1
+        ((and (= sc 1) (>= a 1))  (return-from numeric-value-less-p nil))  ; a>=1, 0<b<1
+        ((and (= sc -1) (<= a -1)) (return-from numeric-value-less-p t))   ; a<=-1, -1<b<0
+        ((and (= sc -1) (>= a 0)) (return-from numeric-value-less-p nil)))))
   ;; IEEE-float either side: coerce to rational and recurse.  Without
   ;; this, < on IEEE-bit floats falls through and returns NIL, breaking
   ;; (< 1.0 2.0) and friends.
@@ -1406,6 +1444,18 @@
    Tagged-ratio aware: ratios are normalised so num/den uniquely
    represents value, hence componentwise compare is sufficient.
    IEEE float: coerce to rational and recurse."
+  ;; IEEE-float vs integer fast path — avoid coerce-to-rat for the
+  ;; common 0.0/integer 0 case (avoids bignum overflow on small floats).
+  (when (and (%ieee-float-p a) (integerp b))
+    (let ((sc (%ieee-float-sign-class a)))
+      (cond
+        ((= sc 0) (return-from numeric-equal-p (= b 0)))
+        ((or (= sc 1) (= sc -1)) (return-from numeric-equal-p nil)))))
+  (when (and (integerp a) (%ieee-float-p b))
+    (let ((sc (%ieee-float-sign-class b)))
+      (cond
+        ((= sc 0) (return-from numeric-equal-p (= a 0)))
+        ((or (= sc 1) (= sc -1)) (return-from numeric-equal-p nil)))))
   (when (or (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-equal-p
       (numeric-equal-p (%coerce-numeric a) (%coerce-numeric b))))
@@ -1556,73 +1606,78 @@
                       (setq found t) (return found)))
                   (setq c (cdr c)))))
             nil)))))
-    ;; Compound type specifiers
+    ;; Compound type specifiers.  Use %typename-eq instead of eq for
+    ;; the head comparisons — `'real' inside a literal source form and
+    ;; `'real' synthesized at runtime via (list 'real 0 10) can be
+    ;; distinct symbol objects with the same hash (per CLAUDE.md
+    ;; "Symbol identity" known bug).
     (t
      (let ((head (car type)))
        (cond
          ;; (real low high) — range check for reals
-         ((eq head 'real)
+         ((%typename-eq head 'real)
           (if (or (integerp obj) (floatp-impl obj) (ratiop obj))
               (let ((low (if (cdr type) (cadr type) '*))
                     (high (if (cddr type) (caddr type) '*)))
                 (typep-range-check obj low high))
               nil))
          ;; (integer low high)
-         ((eq head 'integer)
+         ((%typename-eq head 'integer)
           (if (integerp obj)
               (let ((low (if (cdr type) (cadr type) '*))
                     (high (if (cddr type) (caddr type) '*)))
                 (typep-range-check obj low high))
               nil))
          ;; (float low high)
-         ((or (eq head 'float) (eq head 'single-float)
-              (eq head 'double-float) (eq head 'short-float) (eq head 'long-float))
+         ((or (%typename-eq head 'float)         (%typename-eq head 'single-float)
+              (%typename-eq head 'double-float)  (%typename-eq head 'short-float)
+              (%typename-eq head 'long-float))
           (if (floatp-impl obj)
               (let ((low (if (cdr type) (cadr type) '*))
                     (high (if (cddr type) (caddr type) '*)))
                 (typep-range-check obj low high))
               nil))
          ;; (rational low high)
-         ((eq head 'rational)
+         ((%typename-eq head 'rational)
           (if (or (integerp obj) (ratiop obj))
               (let ((low (if (cdr type) (cadr type) '*))
                     (high (if (cddr type) (caddr type) '*)))
                 (typep-range-check obj low high))
               nil))
          ;; (eql val)
-         ((eq head 'eql)
+         ((%typename-eq head 'eql)
           (eql obj (cadr type)))
          ;; (member val1 val2 ...)
-         ((eq head 'member)
+         ((%typename-eq head 'member)
           (if (member obj (cdr type)) t nil))
          ;; (and type1 type2 ...)
-         ((eq head 'and)
+         ((%typename-eq head 'and)
           (let ((ok t))
             (dolist (sub (cdr type))
               (unless (typep obj sub) (setq ok nil)))
             ok))
          ;; (or type1 type2 ...)
-         ((eq head 'or)
+         ((%typename-eq head 'or)
           (let ((ok nil))
             (dolist (sub (cdr type))
               (when (typep obj sub) (setq ok t)))
             ok))
          ;; (not type)
-         ((eq head 'not)
+         ((%typename-eq head 'not)
           (not (typep obj (cadr type))))
          ;; (satisfies pred)
-         ((eq head 'satisfies) nil)  ; can't call arbitrary predicates
+         ((%typename-eq head 'satisfies) nil)  ; can't call arbitrary predicates
          ;; (unsigned-byte n) — integer in [0, 2^n - 1]
-         ((eq head 'unsigned-byte)
+         ((%typename-eq head 'unsigned-byte)
           (and (integerp obj) (>= obj 0)
                (< obj (ash 1 (cadr type)))))
          ;; (signed-byte n) — integer in [-2^(n-1), 2^(n-1) - 1]
-         ((eq head 'signed-byte)
+         ((%typename-eq head 'signed-byte)
           (and (integerp obj)
                (let ((half (ash 1 (- (cadr type) 1))))
                  (and (>= obj (- 0 half)) (< obj half)))))
          ;; (mod n) — integer in [0, n-1]
-         ((eq head 'mod)
+         ((%typename-eq head 'mod)
           (and (integerp obj) (>= obj 0) (< obj (cadr type))))
          (t nil))))))
 

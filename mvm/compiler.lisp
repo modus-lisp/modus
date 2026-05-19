@@ -7818,10 +7818,24 @@
         ;; cons chains rather than a runtime loop because the IR has
         ;; no "load slot[i] for variable i".
         (emit-ir-label case-req-label)
-        (let ((cases nil))
-          (loop for k from (- +max-reg-args+ req) downto 1
+        ;; First trigger the runtime overflow-arg copy.  Trap 0x0530
+        ;; reads nargs from [0x10000150] and copies args 4..min(nargs,16)-1
+        ;; from caller's stack ([RBP+16+(i-4)*8]) into the local frame
+        ;; slots 4..15 ([RBP+frame-slot-base+i*-8]) so the cond ladder
+        ;; below can stack-load them via the same idx as args 0..3.
+        ;; Without this, args > +max-reg-args+ stay on caller's stack
+        ;; and the ladder's stack-load reads garbage from unmapped /
+        ;; uninitialised local frame slots.
+        (emit-ir :trap #x0530)
+        ;; Extended ladder: nargs = req+1 .. req+12.  Caps at +12 so
+        ;; the trap above (which itself caps at 16 total args) covers
+        ;; the worst case (req=4 + 12 rest = 16).  For req > 4 we
+        ;; clamp by what the trap could have copied (16 - req); for
+        ;; req <= 4 the full 12 cases apply.
+        (let ((max-k (min 12 (- 16 req)))
+              (cases nil))
+          (loop for k from max-k downto 1
                 do (push k cases))
-          ;; cases now (1 2 3 …) — emit largest first
           (setf cases (reverse cases))
           (dolist (k cases)
             (let ((next-label (make-compiler-label)))
@@ -7836,9 +7850,7 @@
                        (emit-ir :cons list-reg val-reg list-reg))
               (emit-ir :br built-label)
               (emit-ir-label next-label)))
-          ;; Fallthrough: nargs > req+max-rest — too many args for the
-          ;; inline cond ladder.  Conservatively store NIL; the caller
-          ;; should have used the static-pack path with the sentinel.
+          ;; Fallthrough: nargs > req+max-k — conservative NIL.
           (emit-ir :mov list-reg +vreg-vn+))
         (emit-ir-label built-label)
         ;; Store the built list into slot[req] — the &rest param's slot.

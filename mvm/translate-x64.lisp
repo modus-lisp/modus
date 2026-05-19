@@ -708,6 +708,90 @@
               ;; so (handler-case body) bodies that return in RAX aren't
               ;; clobbered by the pop.
               (emit-call buf (translate-state-handler-pop-label state)))
+             ((= code #x0530)
+              ;; COPY-OVERFLOW-ARGS: at runtime, read nargs from the
+              ;; nargs slot and copy any args beyond V0..V3 from the
+              ;; caller's stack (above RBP) into local frame slots 4..N
+              ;; so the &rest prologue can build a list of any size.
+              ;; Without this trap, emit-rest-prologue can only assemble
+              ;; rest lists when nargs ≤ +max-reg-args+ (4) — beyond
+              ;; that, callers (especially apply) silently truncate.
+              ;; Capped at 16 args to bound the loop.
+              ;;
+              ;; Layout:
+              ;;   src ptr = rbp + 16 + (i-4)*8  for arg i ≥ 4
+              ;;   dst ptr = rbp + frame-slot-base + i*-8
+              ;;           = rbp - 96 - i*8
+              ;;
+              ;; Implementation:
+              ;;   mov eax, [0x10000150]     ; nargs untagged
+              ;;   cmp eax, 5
+              ;;   jl  done
+              ;;   cmp eax, 16
+              ;;   jle nocap
+              ;;   mov eax, 16
+              ;; nocap:
+              ;;   sub eax, 4                 ; count = min(nargs,16) - 4
+              ;;   mov rdx, rbp
+              ;;   add rdx, 16                ; src = rbp + 16
+              ;;   mov r8,  rbp
+              ;;   sub r8, 128                ; dst = rbp + slot[4] offset
+              ;; loop:
+              ;;   test eax, eax
+              ;;   jz done
+              ;;   mov rcx, [rdx]
+              ;;   mov [r8], rcx
+              ;;   add rdx, 8
+              ;;   sub r8, 8
+              ;;   dec eax
+              ;;   jmp loop
+              ;; done:
+              ;;
+              ;; mov eax, dword [0x10000150]
+              (emit-bytes buf #xA1 #x50 #x01 #x00 #x10 #x00 #x00 #x00 #x00)
+              ;; cmp eax, 5
+              (emit-bytes buf #x83 #xF8 #x05)
+              ;; jl done (32-bit relative — patched below)
+              (let ((done-label (make-label))
+                    (loop-label (make-label))
+                    (nocap-label (make-label)))
+                (emit-jcc buf :l done-label)
+                ;; cmp eax, 16
+                (emit-bytes buf #x83 #xF8 #x10)
+                ;; jle nocap
+                (emit-jcc buf :le nocap-label)
+                ;; mov eax, 16
+                (emit-bytes buf #xB8 #x10 #x00 #x00 #x00)
+                (emit-label buf nocap-label)
+                ;; sub eax, 4
+                (emit-bytes buf #x83 #xE8 #x04)
+                ;; mov rdx, rbp
+                (emit-bytes buf #x48 #x89 #xEA)
+                ;; add rdx, 16
+                (emit-bytes buf #x48 #x83 #xC2 #x10)
+                ;; mov r8, rbp
+                (emit-bytes buf #x49 #x89 #xE8)
+                ;; sub r8, 128 (imm32 — imm8=0x80 sign-extends to -128 = +128
+                ;; which is the wrong direction).
+                (emit-bytes buf #x49 #x81 #xE8 #x80 #x00 #x00 #x00)
+                (emit-label buf loop-label)
+                ;; test eax, eax
+                (emit-bytes buf #x85 #xC0)
+                ;; jz done
+                (emit-jcc buf :e done-label)
+                ;; mov rcx, [rdx]
+                (emit-bytes buf #x48 #x8B #x0A)
+                ;; mov [r8], rcx
+                (emit-bytes buf #x49 #x89 #x08)
+                ;; add rdx, 8
+                (emit-bytes buf #x48 #x83 #xC2 #x08)
+                ;; sub r8, 8
+                (emit-bytes buf #x49 #x83 #xE8 #x08)
+                ;; dec eax
+                (emit-bytes buf #xFF #xC8)
+                ;; jmp loop
+                (emit-jmp buf loop-label)
+                (emit-label buf done-label)))
              ((= code #x0520)
               ;; INSTALL-SIGNAL-HANDLERS:
               ;; Installs SIGSEGV (11), SIGBUS (7), SIGFPE (8), SIGILL (4) handlers.

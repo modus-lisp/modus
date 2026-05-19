@@ -1688,6 +1688,15 @@
 (defun short-site-name ()             nil)
 (defun long-site-name ()              nil)
 
+;;; rational-safely — ansi-aux helper used by numbers-aux defconstants.
+;;; Defined as a Modus runtime fn so compile-time references at SBCL
+;;; build time and runtime references both succeed.
+(defun rational-safely (x)
+  (cond
+    ((integerp x) x)
+    ((floatp-impl x) (rational x))
+    (t x)))
+
 ;;; ============================================================
 ;;; Float versions of integer division — return integer parts as
 ;;; integers (modus has no native floats); the fractional remainder is

@@ -2062,15 +2062,24 @@
             ;; file's [first .. last] test-id range after processing.
             (let ((file-first-id (1+ *ansi-test-counter*)))
               (push (list (pathname-name file) file-first-id nil) *ansi-file-ranges*))
-            (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
-            (setf forms (mapcar #'rewrite-make-array-with-checks forms))
-            (setf forms (mapcar #'rewrite-make-array-dims forms))
-            (setf forms (mapcar #'rewrite-eval-quote forms))
-            (setf forms (mapcar #'rewrite-make-array-initcontents forms))
-            (setf forms (mapcar #'rewrite-earmuff-specials forms))
-            (setf forms (mapcar #'rewrite-reader-forms forms))
-            ;; Rewrite multi-arg apply: (apply fn a1 a2 ... list) → 2-arg form
-            (setf forms (mapcar #'rewrite-multi-arg-apply forms))
+            ;; Per-form mapcar that catches errors: a defmacro with
+            ;; SBCL backquote-comma objects (SB-INT:UNQUOTE) is not
+            ;; consp, so tree-walking rewriters can hit (car comma-struct)
+            ;; and type-error.  Without the per-form catch the WHOLE file
+            ;; is dropped and all its tests silently disappear.
+            (flet ((mapcar-safe (fn lst)
+                     (mapcar (lambda (f) (handler-case (funcall fn f)
+                                           (error () f)))
+                             lst)))
+              (setf forms (mapcar-safe #'rewrite-package-iteration (nreverse forms)))
+              (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
+              (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
+              (setf forms (mapcar-safe #'rewrite-eval-quote forms))
+              (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
+              (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
+              (setf forms (mapcar-safe #'rewrite-reader-forms forms))
+              ;; Rewrite multi-arg apply: (apply fn a1 a2 ... list) → 2-arg form
+              (setf forms (mapcar-safe #'rewrite-multi-arg-apply forms)))
             (when (string= file "integer-length.lsp")
               (labels ((rw (f)
                          (cond ((atom f) f)
@@ -2144,28 +2153,20 @@
                                     nil))
                                 (list form)))
                           forms))
-            ;; Re-run select rewriters after macroexpansion. Macros like
-            ;; def-print-test/def-format-test expand to forms that contain
-            ;; their own (let ((*print-base* 2) ...) ...) bindings and
-            ;; with-output-to-string / with-standard-io-syntax forms — none
-            ;; of which existed in the input forms the first-pass rewriters
-            ;; saw. Re-running here:
-            ;;   - earmuff-specials adds (declare (special ...)) to inner
-            ;;     let bindings of *print-* / *read-* vars (was the +109
-            ;;     win in the previous commit).
-            ;;   - reader-forms expands with-output-to-string into a let
-            ;;     and with-standard-io-syntax into %with-standard-io-syntax
-            ;;     (lambda) so the runtime path is consistent.
-            (setf forms (mapcar #'rewrite-reader-forms forms))
-            (setf forms (mapcar #'rewrite-multi-arg-apply forms))
-            (setf forms (mapcar #'rewrite-aux-params forms))
-            (setf forms (mapcar #'rewrite-earmuff-specials forms))
-            ;; Re-run make-array rewriters: macros like def-adjust-array-test
-            ;; expand into forms containing fresh (make-array ...) calls with
-            ;; keyword args that the first-pass rewriters never saw.
-            (setf forms (mapcar #'rewrite-make-array-with-checks forms))
-            (setf forms (mapcar #'rewrite-make-array-dims forms))
-            (setf forms (mapcar #'rewrite-make-array-initcontents forms))
+            ;; Re-run select rewriters after macroexpansion.  Use the
+            ;; per-form catching mapcar-safe so a single comma-bearing
+            ;; macro body doesn't drop the whole file.
+            (flet ((mapcar-safe (fn lst)
+                     (mapcar (lambda (f) (handler-case (funcall fn f)
+                                           (error () f)))
+                             lst)))
+              (setf forms (mapcar-safe #'rewrite-reader-forms forms))
+              (setf forms (mapcar-safe #'rewrite-multi-arg-apply forms))
+              (setf forms (mapcar-safe #'rewrite-aux-params forms))
+              (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
+              (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
+              (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
+              (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms)))
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
               (dolist (form forms)
@@ -2462,20 +2463,30 @@
             (loop (let ((form (read s nil :eof)))
                     (when (eq form :eof) (return))
                     (push form forms)))))
-        ;; Apply the same rewriter pipeline as test files
-        (setf forms (mapcar #'rewrite-package-iteration (nreverse forms)))
-        (setf forms (mapcar #'rewrite-make-array-with-checks forms))
-        (setf forms (mapcar #'rewrite-make-array-dims forms))
-        (setf forms (mapcar #'rewrite-eval-quote forms))
-        (setf forms (mapcar #'rewrite-make-array-initcontents forms))
-        (setf forms (mapcar #'rewrite-earmuff-specials forms))
-        (setf forms (mapcar #'rewrite-reader-forms forms))
-        ;; Expand &aux lambda keyword into let* bindings in function body.
-        ;; MVM compiler does not support &aux.
-        (setf forms (mapcar #'rewrite-aux-params forms))
-        ;; Rewrite (apply fn a1 a2 ... list) → (apply fn (append (list a1 a2 ...) list))
-        ;; MVM's apply only handles (fn list) form; CL allows spread args before final list.
-        (setf forms (mapcar #'rewrite-multi-arg-apply forms))
+        ;; Apply the same rewriter pipeline as test files.  Use a
+        ;; per-form mapcar that catches errors and leaves the form
+        ;; unchanged — a defmacro body containing SBCL backquote
+        ;; comma objects (SB-INT:UNQUOTE) is not consp, so the
+        ;; tree-walking rewriters can hit (car comma-struct) and
+        ;; type-error.  Without the per-form catch the WHOLE file is
+        ;; dropped from the aux source.
+        (flet ((mapcar-safe (fn lst)
+                 (mapcar (lambda (f) (handler-case (funcall fn f)
+                                       (error () f)))
+                         lst)))
+          (setf forms (mapcar-safe #'rewrite-package-iteration (nreverse forms)))
+          (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
+          (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
+          (setf forms (mapcar-safe #'rewrite-eval-quote forms))
+          (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
+          (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
+          (setf forms (mapcar-safe #'rewrite-reader-forms forms))
+          ;; Expand &aux lambda keyword into let* bindings in function body.
+          ;; MVM compiler does not support &aux.
+          (setf forms (mapcar-safe #'rewrite-aux-params forms))
+          ;; Rewrite (apply fn a1 a2 ... list) → (apply fn (append (list a1 a2 ...) list))
+          ;; MVM's apply only handles (fn list) form; CL allows spread args before final list.
+          (setf forms (mapcar-safe #'rewrite-multi-arg-apply forms)))
         ;; Evaluate defun/defmacro forms at SBCL side so macros defined here
         ;; can be used during macroexpansion of test files loaded after this.
         (dolist (form forms)
@@ -2503,6 +2514,11 @@
           (let ((out (make-string-output-stream)))
             (format out "~%;; === aux: ~A ===~%" filename)
             (dolist (form forms)
+              ;; Per-form handler-case: errors processing one form (e.g.
+              ;; comma objects inside a defmacro's backquote body that
+              ;; the simple cons-tree walker can't traverse) don't kill
+              ;; the rest of the file's defuns.
+              (handler-case
               (when (consp form)
                 ;; Skip forms that can't compile on MVM or reference SBCL internals:
                 ;; defgeneric, defmethod, eval-when, declaim, proclaim, compile-and-load
@@ -2564,7 +2580,8 @@
                                           (not (search "#<" s))
                                           (not (search "&ENVIRONMENT" s)))
                                  (write-string s out)
-                                 (terpri out)))))))))))
+                                 (terpri out))))))))))
+                (error (e) (declare (ignore e)) nil)))
             (setf *ansi-aux-sources*
                   (concatenate 'string *ansi-aux-sources*
                                (get-output-stream-string out))))))

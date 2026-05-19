@@ -124,6 +124,14 @@
 ;; where initarg-map = list of (initarg-string . slot-symbol)
 (defvar *sbcl-clos-classes* nil)
 
+;; Stubs for variables defined in test source files we don't load
+;; (cl-symbol-names.lsp etc.).  Without these stubs, files that
+;; reference them at SBCL load-time (e.g. class-precedence-lists.lsp)
+;; get SKIP'd entirely.
+(defvar *cl-types-that-are-classes-symbols* nil)
+(defvar *cl-type-symbols* nil)
+(defvar *cl-symbol-names* nil)
+
 ;; Counter for generating unique slot-unbound method function names
 (defvar *slot-unbound-method-counter* 0)
 

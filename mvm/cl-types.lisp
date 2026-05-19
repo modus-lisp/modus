@@ -992,6 +992,7 @@
 (defun nsubst-if (new pred tree &rest args)
   "Substitute NEW for elements satisfying PRED in TREE (destructive).
    Honors :key per CLHS."
+  (%subst-check-kwargs args)
   (let ((key-fn nil) (key-set nil) (cur args))
     (loop
       (when (null cur) (return nil))
@@ -1003,6 +1004,7 @@
 
 (defun nsubst-if-not (new pred tree &rest args)
   "Substitute NEW for elements not satisfying PRED in TREE (destructive)."
+  (%subst-check-kwargs args)
   (let ((key-fn nil) (key-set nil) (cur args))
     (loop
       (when (null cur) (return nil))
@@ -1032,6 +1034,7 @@
 
 (defun subst-if (new pred tree &rest args)
   "Substitute NEW for elements satisfying PRED in TREE.  Honors :key."
+  (%subst-check-kwargs args)
   (let ((key-fn nil) (key-set nil) (cur args))
     (loop
       (when (null cur) (return nil))
@@ -1043,6 +1046,7 @@
 
 (defun subst-if-not (new pred tree &rest args)
   "Substitute NEW for elements not satisfying PRED in TREE."
+  (%subst-check-kwargs args)
   (let ((key-fn nil) (key-set nil) (cur args))
     (loop
       (when (null cur) (return nil))
@@ -1085,7 +1089,9 @@
       (setq cur (cdr cur)))))
 
 (defun nsublis (alist tree &rest args)
-  "Substitute from ALIST in TREE (destructive).  Honors :test/:test-not/:key."
+  "Substitute from ALIST in TREE (destructive).  Honors :test/:test-not/:key.
+   Rejects bad keyword args via %subst-check-kwargs."
+  (%subst-check-kwargs args)
   (let* ((parsed (%sublis-parse-args args))
          (test-fn (car parsed))
          (test-not-fn (cadr parsed))
@@ -1103,7 +1109,9 @@
       (t tree))))
 
 (defun sublis (alist tree &rest args)
-  "Substitute from ALIST in TREE.  Honors :test/:test-not/:key."
+  "Substitute from ALIST in TREE.  Honors :test/:test-not/:key.
+   Rejects bad keyword args via %subst-check-kwargs."
+  (%subst-check-kwargs args)
   (let* ((parsed (%sublis-parse-args args))
          (test-fn (car parsed))
          (test-not-fn (cadr parsed))

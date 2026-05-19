@@ -149,13 +149,20 @@
           (setq cur (cdr cur)))))))
 
 (defun getf (plist indicator &rest default)
+  "Lookup INDICATOR in property list PLIST.  Per CLHS:
+   - extra args after the single optional default → program-error;
+   - improperly-terminated (dotted) plist → type-error/program-error
+     once the search reaches the dotted tail."
+  (when (and default (cdr default))
+    (error "getf: too many arguments"))
   (let ((cur plist))
     (loop
-      (when (null cur)
-        (return (if default (car default) nil)))
-      (when (eq (car cur) indicator)
-        (return (cadr cur)))
-      (setq cur (cddr cur)))))
+      (cond
+        ((null cur) (return (if default (car default) nil)))
+        ((not (consp cur)) (error "getf: not a proper plist"))
+        ((not (consp (cdr cur))) (error "getf: odd-length plist"))
+        ((eq (car cur) indicator) (return (cadr cur)))
+        (t (setq cur (cddr cur)))))))
 
 (defun endp (x)
   ;; ANSI: type-error if x is not a list (cons or nil).
@@ -304,10 +311,22 @@
   (cons (cons key datum) alist))
 
 (defun pairlis (keys data &rest alist-arg)
+  "PAIRLIS keys data &optional alist — extra args after ALIST are a
+   program-error.  Per CLHS, KEYS and DATA must be lists of equal
+   length; an atom in place of either is a type-error."
+  (when (and alist-arg (cdr alist-arg))
+    (error "pairlis: too many arguments"))
+  (when (and keys (not (consp keys)))
+    (error "pairlis: keys is not a list"))
+  (when (and data (not (consp data)))
+    (error "pairlis: data is not a list"))
   (let ((alist (if alist-arg (car alist-arg) nil))
         (k keys) (d data))
     (loop
-      (when (null k) (return alist))
+      (when (null k)
+        (when d (error "pairlis: keys shorter than data"))
+        (return alist))
+      (when (null d) (error "pairlis: data shorter than keys"))
       (setq alist (cons (cons (car k) (car d)) alist))
       (setq k (cdr k))
       (setq d (cdr d)))))

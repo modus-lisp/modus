@@ -3055,6 +3055,10 @@
   ;; Also populates *native-sym-function-table* for (funcall 'sym ...).
   (%init-symbol-function-table)
 
+  ;; Build the compiler-macro name set so MACRO-FUNCTION reports T for
+  ;; PUSH/POP/COND/etc. that the modus compiler implements directly.
+  (init-compiler-macro-set)
+
   ;; Install signal handlers (SIGSEGV/etc) — converts hardware faults to
   ;; CL conditions that handler-case can catch, instead of killing the fork.
   (%init-signal-handling)

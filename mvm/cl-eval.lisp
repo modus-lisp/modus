@@ -152,15 +152,57 @@
 ;;; ============================================================
 (defvar *macro-function-table* nil)
 
+(defvar *%compiler-macro-hashes* nil
+  "Hash-set of name-hashes for CL macros that the modus compiler
+   implements internally (not via *macro-function-table*).  Populated
+   at boot via init-compiler-macro-set.  MACRO-FUNCTION consults this
+   so it reports a non-NIL value for PUSH/POP/COND/etc.")
+
+(defun init-compiler-macro-set ()
+  "Build *%compiler-macro-hashes* — an EQUAL hash-table whose keys are
+   the dual-FNV-1a hashes of compiler-known CL macro names.  Keep this
+   in sync with mvm-define-macro registrations and the special-form
+   dispatch tree in compile-compound."
+  (let ((ht (make-hash-table :test 'equal)))
+    (dolist (name '("PUSH" "POP" "PUSHNEW" "REMF" "INCF" "DECF"
+                    "ROTATEF" "SHIFTF" "PSETQ" "PSETF"
+                    "WHEN" "UNLESS" "AND" "OR" "COND"
+                    "CASE" "ECASE" "CCASE"
+                    "TYPECASE" "ETYPECASE" "CTYPECASE"
+                    "DOLIST" "DOTIMES" "DO" "DO*" "LOOP" "RETURN"
+                    "WITH-OPEN-FILE" "WITH-OUTPUT-TO-STRING"
+                    "WITH-INPUT-FROM-STRING" "WITH-ACCESSORS"
+                    "WITH-SLOTS" "DESTRUCTURING-BIND"
+                    "MULTIPLE-VALUE-BIND" "MULTIPLE-VALUE-SETQ"
+                    "MULTIPLE-VALUE-LIST" "SETF" "ASSERT" "CHECK-TYPE"
+                    "DEFCLASS" "DEFGENERIC" "DEFMETHOD" "DEFUN"
+                    "DEFMACRO" "DEFVAR" "DEFPARAMETER" "DEFCONSTANT"
+                    "DEFSTRUCT" "DEFTYPE" "DEFSETF" "DEFPACKAGE"
+                    "HANDLER-CASE" "HANDLER-BIND" "RESTART-CASE"
+                    "IGNORE-ERRORS" "UNWIND-PROTECT"
+                    "FLET" "LABELS" "PROG" "PROG*" "PROG1" "PROG2"))
+      (puthash name ht t))
+    (setq *%compiler-macro-hashes* ht)))
+
+(defun %compiler-macro-p (name)
+  "True if NAME is a built-in CL macro implemented by the modus compiler."
+  (and *%compiler-macro-hashes*
+       (gethash name *%compiler-macro-hashes*)))
+
 (defun macro-function (sym &rest env)
-  "Return the macro expander function for SYM, or nil."
+  "Return the macro expander function for SYM, or nil.
+   Falls back to a built-in compiler-macro check so MACRO-FUNCTION
+   reports a non-NIL value for PUSH/POP/COND/etc. that the modus
+   compiler implements directly (rather than via runtime expander)."
   (let ((name (cond
                 ((%cl-sym-p sym) (%cl-sym-name sym))
                 ((stringp sym) sym)
                 (t nil))))
-    (if (and name *macro-function-table*)
-        (gethash name *macro-function-table*)
-        nil)))
+    (cond
+      ((null name) nil)
+      ((and *macro-function-table* (gethash name *macro-function-table*)))
+      ((%compiler-macro-p name) t)
+      (t nil))))
 
 (defun set-macro-function (sym fn &rest env)
   "Install FN as the macro expander for SYM."

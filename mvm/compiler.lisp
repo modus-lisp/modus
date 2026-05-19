@@ -1500,7 +1500,9 @@
                            vars steps))))))))
 
   ;; DOLIST — (dolist (var list [result]) body...).  Per CLHS, the body
-  ;; is in an implicit tagbody so GO/tags work.
+  ;; is in an implicit TAGBODY (so GO/tags work) inside an implicit
+  ;; BLOCK NIL (so RETURN/RETURN-FROM NIL inside the body OR the
+  ;; list-form returns from the DOLIST, not from the surrounding block).
   (mvm-define-macro "DOLIST"
     (lambda (form)
       (let* ((spec (cadr form))
@@ -1509,12 +1511,13 @@
              (result (caddr spec))
              (body (cddr form))
              (tmp (gensym "DL")))
-        `(let ((,tmp ,list-form) (,var nil))
-           (loop
-             (when (null ,tmp) (return ,result))
-             (setq ,var (car ,tmp))
-             (tagbody ,@body)
-             (setq ,tmp (cdr ,tmp)))))))
+        `(block nil
+           (let ((,tmp ,list-form) (,var nil))
+             (loop
+               (when (null ,tmp) (return ,result))
+               (setq ,var (car ,tmp))
+               (tagbody ,@body)
+               (setq ,tmp (cdr ,tmp))))))))
 
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"
@@ -3784,14 +3787,20 @@
 
 
 (defun compile-loop (body env dest)
-  "Compile (loop forms...) - either simple infinite loop or CL-style loop"
+  "Compile (loop forms...) - either simple infinite loop or CL-style loop.
+   Per CLHS, LOOP establishes an implicit BLOCK NIL; (return x) within
+   the body returns from that BLOCK NIL, not from any outer block of
+   the same name.  We push a fresh (NIL exit dest) onto *block-labels*
+   so compile-return finds the LOOP's block before any outer match."
   (if (and (consp body) (cl-loop-keyword-p (car body)))
       ;; CL-style loop: expand to basic forms, then compile
       (compile-form (expand-cl-loop body) env dest)
       ;; Simple infinite loop
       (let* ((loop-label (make-compiler-label))
              (exit-label (make-compiler-label))
-             (*loop-exit-label* exit-label))
+             (*loop-exit-label* exit-label)
+             (*block-labels* (cons (list nil exit-label dest)
+                                   *block-labels*)))
         ;; Loop entry
         (emit-ir-label loop-label)
         ;; Compile loop body
@@ -5040,19 +5049,29 @@
             with-bindings-form)))))
 
 (defun compile-return (value env dest)
-  "Compile (return value) - exit from enclosing loop or function.
-   If inside a loop, jumps to loop exit. Otherwise, compiles the value
-   into VR and jumps to the function return epilogue."
-  (cond
-    (*loop-exit-label*
-     (compile-form value env dest)
-     (emit-ir :br *loop-exit-label*))
-    (*function-return-label*
-     ;; Function-level return: result goes to VR, jump to epilogue
-     (compile-form value env +vreg-vr+)
-     (emit-ir :br *function-return-label*))
-    (t
-     (error "MVM compiler: RETURN outside of LOOP or function"))))
+  "Compile (return value) — equivalent to (return-from nil value).
+   CLHS: searches lexically for the innermost block named NIL.  Modus
+   also recognises a loop's implicit BLOCK NIL via *loop-exit-label*.
+   Priority: lexical (BLOCK NIL ...) (via *block-labels*) → loop exit
+   → function return."
+  (let ((block-entry (and *block-labels*
+                          (assoc nil *block-labels*))))
+    (cond
+      (block-entry
+       (let ((exit-label (cadr block-entry))
+             (block-dest (caddr block-entry)))
+         (compile-form value env block-dest)
+         (unless (= dest block-dest)
+           (emit-ir :mov dest block-dest))
+         (emit-ir :br exit-label)))
+      (*loop-exit-label*
+       (compile-form value env dest)
+       (emit-ir :br *loop-exit-label*))
+      (*function-return-label*
+       (compile-form value env +vreg-vr+)
+       (emit-ir :br *function-return-label*))
+      (t
+       (error "MVM compiler: RETURN outside of BLOCK NIL, LOOP, or function")))))
 
 ;;; ============================================================
 ;;; Block / Tagbody / Go
@@ -5101,18 +5120,22 @@
 
 (defun compile-dotimes (spec body env dest)
   "Compile (dotimes (var count [result]) body...).
-   Per CLHS, body is in an implicit tagbody so GO/tags work."
+   Per CLHS, body is in an implicit TAGBODY (so GO/tags work) inside
+   an implicit BLOCK NIL (so RETURN/RETURN-FROM NIL inside body OR
+   count-form returns from DOTIMES, not the surrounding block)."
   (let* ((var (car spec))
          (count-form (cadr spec))
          (result-form (caddr spec)))
-    (compile-let
-     (list (list var 0))
-     (list (list 'loop
-                 (list 'if (list '< var count-form)
-                       (list 'progn
-                             (cons 'tagbody body)
-                             (list 'setq var (list '1+ var)))
-                       (list 'return (or result-form nil)))))
+    (compile-form
+     (list 'block nil
+           (list 'let
+                 (list (list var 0))
+                 (list 'loop
+                       (list 'if (list '< var count-form)
+                             (list 'progn
+                                   (cons 'tagbody body)
+                                   (list 'setq var (list '1+ var)))
+                             (list 'return (or result-form nil))))))
      env dest)))
 
 ;;; ============================================================

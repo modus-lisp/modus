@@ -2096,12 +2096,41 @@
           (let ((r (%make-string-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i))))
           (let ((r (make-array (length seq)))) (dotimes (i (length seq) r) (aset r i (aref seq i)))))))
 (defun sqrt (n)
-  "Square root — returns integer for perfect squares, float approximation otherwise."
-  (if (integerp n)
-      (let ((s (isqrt n)))
-        (if (= (* s s) n) s (%make-float-raw s 1)))
-      ;; Float input — return float with same magnitude
-      (%make-float-raw 1 1)))
+  "Square root.  Returns:
+   - exact integer for perfect-square integer input,
+   - rational approximation otherwise (Newton's method on n/1
+     with 10000:1 precision scaling — gives ~4 digit precision).
+   - For rational/float input %r/d% computes sqrt(r*d)/d scaled."
+  (cond
+    ((integerp n)
+     (when (< n 0) (error "sqrt of negative"))
+     (let ((s (isqrt n)))
+       (if (= (* s s) n)
+           s
+           ;; Newton's method on scaled value: sqrt(n*K^2)/K for precision.
+           (let* ((K 10000)
+                  (scaled (* n K K))
+                  (approx (isqrt scaled)))
+             (%make-rat approx K)))))
+    ((ratiop n)
+     (let* ((num (ratio-numerator n))
+            (den (ratio-denominator n)))
+       (when (< num 0) (error "sqrt of negative"))
+       ;; sqrt(a/b) = sqrt(a*b)/b for b>0.
+       (let ((s (isqrt (* num den))))
+         (if (= (* s s) (* num den))
+             (%make-rat s den)
+             (let* ((K 10000)
+                    (approx (isqrt (* num den K K))))
+               (%make-rat approx (* den K)))))))
+    ;; Boxed float-as-array (subtag #x32 with 2 slots, slot0=num slot1=den):
+    ;; treat as ratio and recurse.
+    ((and (not (fixnump n)) (not (consp n)) (not (null n))
+          (= (obj-subtag n) #x32)
+          (= (array-length n) 2))
+     (let ((num (aref n 0)) (den (aref n 1)))
+       (sqrt (if (= den 1) num (%make-rat num den)))))
+    (t 0)))
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start end val) seq)  ; stub
 (defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))

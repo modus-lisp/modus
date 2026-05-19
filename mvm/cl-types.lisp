@@ -21,99 +21,247 @@
   "Return T if float X has numerator 0."
   (= (aref x 0) 0))
 
-(defun cos (x)
-  "Cosine — stub: exact for 0, approximation 0 for others."
-  (if (integerp x)
-      (if (= x 0) 1 0)
-      ;; Float: return 1.0 for 0.0, else 0.0
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (if (%float-zero-p x)
-              (%make-float-raw 1 1)   ; cos(0.0) = 1.0
-              (%make-float-raw 0 1))  ; cos(x) ≈ 0.0
-          0)))
+;;; ============================================================
+;;; Transcendental functions — rational approximations via Taylor
+;;; series.  Modus floats are 2-slot arrays (num . den) with subtag
+;;; #x32, so we do all the arithmetic in fixed-precision rationals
+;;; with a chosen denominator K (10^9 by default — ~9 digit precision
+;;; for the inputs the ANSI tests probe).  Results return as
+;;; (%make-float-raw num K) — a float-shaped rational.
+;;; ============================================================
+
+(defvar *%trig-precision* 1000000000)  ; K = 10^9
+(defvar *%trig-pi*         3141592653)  ; π * K
+(defvar *%trig-2pi*        6283185307)  ; 2π * K
+(defvar *%trig-pi/2*       1570796327)  ; π/2 * K
+
+(defun %as-scaled-int (x)
+  "Convert X (integer, ratio, or 2-slot float-shape) to a fixnum scaled
+   by *%trig-precision* (K).  Returns the scaled integer."
+  (let ((k *%trig-precision*))
+    (cond
+      ((integerp x) (* x k))
+      ((ratiop x) (truncate (* (ratio-numerator x) k)
+                            (ratio-denominator x)))
+      ((and (not (fixnump x)) (not (consp x)) (not (null x))
+            (= (obj-subtag x) #x32) (= (array-length x) 2))
+       (let ((n (aref x 0)) (d (aref x 1)))
+         (if (= d 1) (* n k) (truncate (* n k) d))))
+      (t 0))))
+
+(defun %scaled-result (s)
+  "Wrap a scaled-by-K integer S as a (num . den) float-shape."
+  (%make-float-raw s *%trig-precision*))
+
+(defun %trig-reduce (s)
+  "Reduce scaled angle S into (-π, π] by repeated subtraction.  S is
+   already an integer scaled by K."
+  (let ((pi-k *%trig-pi*) (two-pi-k *%trig-2pi*))
+    (loop (cond ((> s pi-k) (setq s (- s two-pi-k)))
+                ((<= s (- 0 pi-k)) (setq s (+ s two-pi-k)))
+                (t (return s))))))
+
+(defun %sin-taylor (s)
+  "Compute sin(s/K) using Taylor series, return scaled-by-K integer.
+   s = scaled angle (integer in fixnum range).  Uses 10 terms which
+   gives ~9 digit precision for |s| ≤ π."
+  (let* ((k *%trig-precision*)
+         (s (%trig-reduce s))
+         ;; result = s - s^3/6 + s^5/120 - s^7/5040 + ...
+         (acc s)
+         (term s))   ; current term, scaled by K
+    (let ((n 1))
+      (loop
+        (when (> n 19) (return acc))
+        ;; term := -term * (s/K) * (s/K) / ((n+1)*(n+2))
+        ;; To stay in fixnum range: term := truncate(-term*s*s / (K*K * (n+1)*(n+2)))
+        (setq term (truncate (- 0 (* term (truncate (* s s) k))) (* k (* (+ n 1) (+ n 2)))))
+        (setq acc (+ acc term))
+        (when (and (< (abs term) 10)) (return acc))
+        (setq n (+ n 2))))))
+
+(defun %cos-taylor (s)
+  "Compute cos(s/K) using Taylor series."
+  (let* ((k *%trig-precision*)
+         (s (%trig-reduce s))
+         (acc k)    ; cos(0) = 1, scaled
+         (term k))  ; current term
+    (let ((n 0))
+      (loop
+        (when (> n 18) (return acc))
+        (setq term (truncate (- 0 (* term (truncate (* s s) k))) (* k (* (+ n 1) (+ n 2)))))
+        (setq acc (+ acc term))
+        (when (and (< (abs term) 10)) (return acc))
+        (setq n (+ n 2))))))
 
 (defun sin (x)
-  "Sine — stub: exact for 0, approximation 0 for others."
-  (if (integerp x)
-      0
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (%make-float-raw 0 1)  ; sin(x) ≈ 0.0
-          0)))
+  "Sine.  Exact 0 for integer 0; rational approximation otherwise."
+  (cond
+    ((and (integerp x) (= x 0)) 0)
+    (t (%scaled-result (%sin-taylor (%as-scaled-int x))))))
+
+(defun cos (x)
+  "Cosine.  Exact 1 for integer 0; rational approximation otherwise."
+  (cond
+    ((and (integerp x) (= x 0)) 1)
+    (t (%scaled-result (%cos-taylor (%as-scaled-int x))))))
 
 (defun tan (x)
-  "Tangent — stub: 0 for all inputs."
-  (if (integerp x)
-      0
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (%make-float-raw 0 1)
-          0)))
+  "Tangent = sin/cos.  Result is a scaled rational."
+  (cond
+    ((and (integerp x) (= x 0)) 0)
+    (t (let* ((s (%as-scaled-int x))
+              (sn (%sin-taylor s))
+              (cs (%cos-taylor s)))
+         (if (= cs 0)
+             0
+             (%make-float-raw sn cs))))))
 
-(defun acos (x)
-  "Arc cosine — stub: returns pi/2 ≈ rational {157, 100} for range check."
-  (if (integerp x) 0 (%make-float-raw 0 1)))
-
-(defun asin (x)
-  "Arc sine — stub."
-  (if (integerp x) 0 (%make-float-raw 0 1)))
-
-(defun atan (x &optional y)
-  "Arc tangent — stub."
-  (if (integerp x) 0 (%make-float-raw 0 1)))
-
-(defun cosh (x)
-  "Hyperbolic cosine — stub: 1 for 0, 0 otherwise."
-  (if (integerp x)
-      (if (= x 0) 1 0)
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (if (%float-zero-p x)
-              (%make-float-raw 1 1)
-              (%make-float-raw 0 1))
-          0)))
-
-(defun sinh (x)
-  "Hyperbolic sine — stub."
-  (if (integerp x) 0
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (%make-float-raw 0 1)
-          0)))
-
-(defun tanh (x)
-  "Hyperbolic tangent — stub."
-  (if (integerp x) 0
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (%make-float-raw 0 1)
-          0)))
+(defun %exp-taylor (s)
+  "Compute exp(s/K) using Taylor series.  Reduce |s| by halving if
+   large: exp(s) = exp(s/2)^2."
+  (let ((k *%trig-precision*))
+    (cond
+      ((> (abs s) k)
+       ;; |x| > 1 — reduce
+       (let ((half (%exp-taylor (truncate s 2))))
+         (truncate (* half half) k)))
+      (t
+       (let ((acc k) (term k))
+         (let ((n 1))
+           (loop
+             (when (> n 30) (return acc))
+             (setq term (truncate (* term s) (* k n)))
+             (setq acc (+ acc term))
+             (when (< (abs term) 10) (return acc))
+             (setq n (+ n 1)))))))))
 
 (defun exp (x)
-  "e^x — stub: 1 for 0, 0 otherwise."
-  (if (integerp x)
-      (if (= x 0) 1 0)
-      (if (and (not (fixnump x)) (not (consp x)) (not (null x))
-               (= (obj-subtag x) #x32))
-          (if (%float-zero-p x)
-              (%make-float-raw 1 1)
-              (%make-float-raw 0 1))
-          0)))
+  "e^x.  Exact 1 for integer 0; rational approximation otherwise."
+  (cond
+    ((and (integerp x) (= x 0)) 1)
+    (t (%scaled-result (%exp-taylor (%as-scaled-int x))))))
+
+(defun %log-newton (s)
+  "Compute log(s/K) by Newton iteration on f(y) = exp(y) - s/K = 0.
+   y_{n+1} = y_n - 1 + s / (K * exp(y_n))."
+  (let* ((k *%trig-precision*)
+         (y k))                    ; initial guess y = 1
+    (let ((iter 0))
+      (loop
+        (when (> iter 40) (return y))
+        (let* ((ey (%exp-taylor y))
+               (delta (- (truncate (* s k) ey) k)))
+          (when (< (abs delta) 10) (return y))
+          (setq y (+ y delta))
+          (setq iter (+ iter 1)))))))
 
 (defun log (x &optional base)
-  "Natural logarithm — stub: 0 for all inputs."
-  (if (integerp x) 0 (%make-float-raw 0 1)))
+  "Natural log (or log to BASE if supplied).  Domain x > 0; returns
+   0 for x ≤ 0 (modus doesn't have complex logs)."
+  (let* ((s (%as-scaled-int x)))
+    (when (<= s 0) (return-from log 0))
+    (let ((ln-x (%log-newton s)))
+      (if (null base)
+          (%scaled-result ln-x)
+          ;; log_b(x) = log(x) / log(b)
+          (let ((ln-b (%log-newton (%as-scaled-int base))))
+            (if (= ln-b 0) 0 (%make-float-raw ln-x ln-b)))))))
+
+(defun cosh (x)
+  "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2."
+  (cond
+    ((and (integerp x) (= x 0)) 1)
+    (t (let* ((s (%as-scaled-int x))
+              (ep (%exp-taylor s))
+              (em (%exp-taylor (- 0 s))))
+         (%scaled-result (truncate (+ ep em) 2))))))
+
+(defun sinh (x)
+  "Hyperbolic sine.  sinh(x) = (exp(x) - exp(-x))/2."
+  (cond
+    ((and (integerp x) (= x 0)) 0)
+    (t (let* ((s (%as-scaled-int x))
+              (ep (%exp-taylor s))
+              (em (%exp-taylor (- 0 s))))
+         (%scaled-result (truncate (- ep em) 2))))))
+
+(defun tanh (x)
+  "Hyperbolic tangent = sinh/cosh."
+  (cond
+    ((and (integerp x) (= x 0)) 0)
+    (t (let* ((s (%as-scaled-int x))
+              (ep (%exp-taylor s))
+              (em (%exp-taylor (- 0 s)))
+              (num (- ep em))
+              (den (+ ep em)))
+         (if (= den 0) 0 (%make-float-raw num den))))))
+
+(defun %asin-taylor (s)
+  "asin(s/K) via Taylor series for |s/K| ≤ 1.
+   asin(x) = x + x^3/6 + 3x^5/40 + 15x^7/336 + ..."
+  (let* ((k *%trig-precision*))
+    (when (> (abs s) k) (return-from %asin-taylor 0))   ; out of domain
+    (let ((acc s) (term s) (n 1))
+      (loop
+        (when (> n 30) (return acc))
+        ;; term[n+2] = term[n] * (2n-1)*(2n+1) * s^2 / (K^2 * (2n)(2n+2))
+        ;; Equivalently coefficient ratio.
+        (let ((num-mult (* (- (* 2 n) 1) (+ (* 2 n) 1)))
+              (den-mult (* (* 2 n) (+ (* 2 n) 2))))
+          (setq term (truncate (* (truncate (* term (truncate (* s s) k)) k) num-mult)
+                               den-mult)))
+        (setq acc (+ acc term))
+        (when (< (abs term) 10) (return acc))
+        (setq n (+ n 1))))))
+
+(defun asin (x)
+  "Arc sine via Taylor.  Domain |x| ≤ 1."
+  (cond
+    ((and (integerp x) (= x 0)) 0)
+    (t (%scaled-result (%asin-taylor (%as-scaled-int x))))))
+
+(defun acos (x)
+  "Arc cosine = π/2 - asin(x)."
+  (cond
+    ((and (integerp x) (= x 1)) 0)
+    ((and (integerp x) (= x 0)) (%scaled-result *%trig-pi/2*))
+    (t (%scaled-result (- *%trig-pi/2* (%asin-taylor (%as-scaled-int x)))))))
+
+(defun atan (x &optional y)
+  "Arc tangent.  Two-arg form: atan(y, x) for full quadrant.
+   One-arg: atan(x) via series.  Uses atan(x) = asin(x/sqrt(1+x^2))."
+  (cond
+    (y
+     ;; Two-arg atan(y, x): we treat the first arg as Y here per ANSI:
+     ;; (atan y x).  Note ANSI param order: (atan number &optional divisor).
+     ;; So x = number=Y/X factor, y = divisor=X.  Just compute Y/X via asin.
+     ;; Approximation: only correct for quadrant 1 (x>0).
+     (let ((ratio-scaled (truncate (* (%as-scaled-int x) *%trig-precision*)
+                                   (%as-scaled-int y))))
+       (atan (%make-float-raw ratio-scaled *%trig-precision*))))
+    ((and (integerp x) (= x 0)) 0)
+    (t
+     (let* ((s (%as-scaled-int x))
+            (k *%trig-precision*)
+            (s2 (truncate (* s s) k))                  ; x^2
+            (one-plus-s2 (+ k s2))
+            (sqrt-arg (isqrt (* one-plus-s2 k)))       ; sqrt(1+x^2), scaled by K
+            (ratio (truncate (* s k) sqrt-arg)))
+       (%scaled-result (%asin-taylor ratio))))))
 
 (defun phase (x)
-  "Phase of complex number — stub."
-  (if (integerp x) 0 (%make-float-raw 0 1)))
+  "Phase of x.  For real x: 0 if x≥0, π if x<0.  Complex not supported."
+  (cond
+    ((integerp x) (if (>= x 0) 0 (%scaled-result *%trig-pi*)))
+    ((ratiop x) (if (>= (ratio-numerator x) 0) 0 (%scaled-result *%trig-pi*)))
+    (t (let ((s (%as-scaled-int x)))
+         (if (>= s 0) 0 (%scaled-result *%trig-pi*))))))
 
 (defun cis (x)
-  "cis(x) = cos(x) + i*sin(x) — stub: returns 1 for 0."
-  (if (integerp x)
-      (if (= x 0) 1 0)
-      (%make-float-raw 0 1)))
+  "cis(x) = cos(x) + i*sin(x) — modus has no complex type, so return cos(x)
+   as the real part (lossy but matches our (complex r) → r convention)."
+  (cos x))
 (defun integer (n) n)  ; not a real CL function but used as type coercion
 (defun set-schar (str idx ch) (aset str idx (char-code ch)) ch)
 (defun schar (str idx) (code-char (aref str idx)))

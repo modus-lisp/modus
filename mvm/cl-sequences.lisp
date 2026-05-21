@@ -740,16 +740,30 @@
 (defun string= (a b &rest options)
   "ANSI STRING= — case-SENSITIVE element-wise compare.  STRING-EQUAL is
    the case-insensitive variant.  Takes string designators (strings,
-   characters, symbols).  Honors :START1, :END1, :START2, :END2."
+   characters, symbols).  Honors :START1, :END1, :START2, :END2.
+   Signals error on odd-length args or unknown key (unless
+   :allow-other-keys T precedes)."
   (let ((sa (%string-designator a))
         (sb (%string-designator b))
         (s1 0) (e1 nil) (s2 0) (e2 nil)
+        (allow-other nil)
         (o options))
+    (let ((scan options))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+          (setq allow-other t))
+        (setq scan (cddr scan))))
     (loop (when (null o) (return))
-      (cond ((eq (car o) :start1) (setq s1 (cadr o)))
-            ((eq (car o) :end1)   (setq e1 (cadr o)))
-            ((eq (car o) :start2) (setq s2 (cadr o)))
-            ((eq (car o) :end2)   (setq e2 (cadr o))))
+      (when (null (cdr o))
+        (error "string=: odd-length keyword arg list"))
+      (let ((k (car o)))
+        (cond ((eq k :start1) (setq s1 (cadr o)))
+              ((eq k :end1)   (setq e1 (cadr o)))
+              ((eq k :start2) (setq s2 (cadr o)))
+              ((eq k :end2)   (setq e2 (cadr o)))
+              ((eq k :allow-other-keys) nil)
+              (allow-other nil)
+              (t (error "string=: bad keyword"))))
       (setq o (cddr o)))
     (let* ((la (array-length sa))
            (lb (array-length sb))
@@ -764,7 +778,11 @@
               (unless (= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
               (setq i (+ i 1))))
           nil))))
-(defun string/= (a b) (if (string= a b) nil t))
+(defun string/= (a b &rest args)
+  "Case-sensitive inequality.  Returns position of mismatch (in a's
+   coords) or NIL if equal.  Honors :start1/:end1/:start2/:end2."
+  (let ((r (%str-cmp-core a b args nil)))
+    (when (or (eq (car r) :less) (eq (car r) :greater)) (cadr r))))
 ;;; constantly: captures value. Use global cell.
 (defvar *constantly-value* nil)
 (defun %constantly-impl (&rest args) *constantly-value*)

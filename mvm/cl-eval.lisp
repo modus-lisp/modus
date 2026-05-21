@@ -1533,17 +1533,39 @@
             (dotimes (i end) (aset result i (aref s i)))
             result)))))
 
-(defun string-not-equal (a b) (not (string-equal a b)))
+;; STRING-NOT-EQUAL: case-INSENSITIVE inequality returning mismatch
+;; position or NIL.  Honors :start1/end1/start2/end2 bounds.  Tests
+;; 16103/16104 hit this with bounds args.
+(defun string-not-equal (a b &rest args)
+  (let ((r (%str-cmp-core a b args t)))
+    (when (or (eq (car r) :less) (eq (car r) :greater)) (cadr r))))
 
 ;; Parse :START1/:END1/:START2/:END2 from an arg list.  Returns (s1 e1 s2 e2).
 ;; NIL ends mean "to length"; caller resolves with array-length.
+;; Per CLHS: signal program-error on odd-length arg list, non-keyword
+;; arg head, or unknown key (unless :allow-other-keys T precedes it).
 (defun %parse-str-cmp-bounds (args)
-  (let ((s1 0) (e1 nil) (s2 0) (e2 nil) (o args))
+  (let ((s1 0) (e1 nil) (s2 0) (e2 nil) (o args) (allow-other nil))
+    ;; Pre-scan for :allow-other-keys T so callers can opt out of the
+    ;; strict check.  Modus has no real keyword-validation framework
+    ;; so this is the minimum CLHS requires.
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+          (setq allow-other t))
+        (setq scan (cddr scan))))
     (loop (when (null o) (return))
-      (cond ((eq (car o) :start1) (setq s1 (cadr o)))
-            ((eq (car o) :end1)   (setq e1 (cadr o)))
-            ((eq (car o) :start2) (setq s2 (cadr o)))
-            ((eq (car o) :end2)   (setq e2 (cadr o))))
+      (when (null (cdr o))
+        ;; Odd-length args.
+        (error "string-cmp: odd-length keyword arg list"))
+      (let ((k (car o)))
+        (cond ((eq k :start1) (setq s1 (cadr o)))
+              ((eq k :end1)   (setq e1 (cadr o)))
+              ((eq k :start2) (setq s2 (cadr o)))
+              ((eq k :end2)   (setq e2 (cadr o)))
+              ((eq k :allow-other-keys) nil)
+              (allow-other nil)
+              (t (error "string-cmp: bad keyword"))))
       (setq o (cddr o)))
     (list s1 e1 s2 e2)))
 
@@ -1586,12 +1608,27 @@
 (defun string> (a b &rest args)
   (let ((r (%str-cmp-core a b args nil)))
     (when (eq (car r) :greater) (cadr r))))
+;; STRING<= / STRING>= / STRING-NOT-GREATERP / STRING-NOT-LESSP:
+;; CLHS — return mismatch position when strict comparison holds, OR
+;; length of string1 when strings are EQUAL.  Old impl returned NIL on
+;; :equal (since cadr r = NIL).  Compute the equal-length explicitly
+;; from the bounds args.
+(defun %str-equal-length (a args)
+  (let* ((sa (%string-coerce a))
+         (bounds (%parse-str-cmp-bounds args))
+         (s1 (car bounds))
+         (e1 (or (cadr bounds) (array-length sa))))
+    (- e1 s1)))
 (defun string<= (a b &rest args)
   (let ((r (%str-cmp-core a b args nil)))
-    (when (or (eq (car r) :less) (eq (car r) :equal)) (cadr r))))
+    (cond ((eq (car r) :less) (cadr r))
+          ((eq (car r) :equal) (%str-equal-length a args))
+          (t nil))))
 (defun string>= (a b &rest args)
   (let ((r (%str-cmp-core a b args nil)))
-    (when (or (eq (car r) :greater) (eq (car r) :equal)) (cadr r))))
+    (cond ((eq (car r) :greater) (cadr r))
+          ((eq (car r) :equal) (%str-equal-length a args))
+          (t nil))))
 (defun string-lessp (a b &rest args)
   (let ((r (%str-cmp-core a b args t)))
     (when (eq (car r) :less) (cadr r))))
@@ -1600,10 +1637,14 @@
     (when (eq (car r) :greater) (cadr r))))
 (defun string-not-greaterp (a b &rest args)
   (let ((r (%str-cmp-core a b args t)))
-    (when (or (eq (car r) :less) (eq (car r) :equal)) (cadr r))))
+    (cond ((eq (car r) :less) (cadr r))
+          ((eq (car r) :equal) (%str-equal-length a args))
+          (t nil))))
 (defun string-not-lessp (a b &rest args)
   (let ((r (%str-cmp-core a b args t)))
-    (when (or (eq (car r) :greater) (eq (car r) :equal)) (cadr r))))
+    (cond ((eq (car r) :greater) (cadr r))
+          ((eq (car r) :equal) (%str-equal-length a args))
+          (t nil))))
 
 (defun char-upcase (c) (let ((code (%ensure-char-code c)))
   (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))

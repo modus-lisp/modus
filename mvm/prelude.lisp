@@ -655,24 +655,51 @@
 ;;; Equality
 ;;; ============================================================
 
-(defun string-equal (a b)
+(defun string-equal (a b &rest args)
   "Case-insensitive string compare (ANSI semantics: chars match if
    they would compare CHAR-EQUAL, i.e. case-folded for ASCII letters).
    STRING= is the case-sensitive variant.  Most callers in
    cl-packages.lisp / make-condition initarg matching want this case-
-   insensitive form so cross-file keyword identity works."
-  (let ((len-a (array-length a)))
-    (if (= len-a (array-length b))
-        (let ((i 0))
-          (loop
-            (when (= i len-a) (return t))
-            (let ((ca (aref a i))
-                  (cb (aref b i)))
-              (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
-              (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
-              (unless (= ca cb) (return nil)))
-            (setq i (+ i 1))))
-        nil)))
+   insensitive form so cross-file keyword identity works.
+
+   Honors :START1/:END1/:START2/:END2 — internal 2-arg callers still
+   work (args is NIL, bounds default to full strings)."
+  (let* ((s1 0) (e1 nil) (s2 0) (e2 nil) (o args) (allow-other nil))
+    ;; Pre-scan for :allow-other-keys T.
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+          (setq allow-other t))
+        (setq scan (cddr scan))))
+    (loop (when (null o) (return))
+      (when (null (cdr o))
+        (error "string-equal: odd-length keyword arg list"))
+      (let ((k (car o)))
+        (cond ((eq k :start1) (setq s1 (cadr o)))
+              ((eq k :end1)   (setq e1 (cadr o)))
+              ((eq k :start2) (setq s2 (cadr o)))
+              ((eq k :end2)   (setq e2 (cadr o)))
+              ((eq k :allow-other-keys) nil)
+              (allow-other nil)
+              (t (error "string-equal: bad keyword"))))
+      (setq o (cddr o)))
+    (let* ((len-a (array-length a))
+           (len-b (array-length b))
+           (ee1 (or e1 len-a))
+           (ee2 (or e2 len-b))
+           (slen1 (- ee1 s1))
+           (slen2 (- ee2 s2)))
+      (if (= slen1 slen2)
+          (let ((i 0))
+            (loop
+              (when (= i slen1) (return t))
+              (let ((ca (aref a (+ s1 i)))
+                    (cb (aref b (+ s2 i))))
+                (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
+                (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
+                (unless (= ca cb) (return nil)))
+              (setq i (+ i 1))))
+          nil))))
 
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,

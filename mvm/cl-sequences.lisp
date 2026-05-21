@@ -605,11 +605,16 @@
     ;; count-if's iteration already presents string elements as CHARACTERS
     ;; via (elt seq i) on the vector path and (%wrapper-aref + code-char)
     ;; on the wrapper path, so the lambda just compares item against x as-is.
+    ;; Default :end — array-wrapper-p check MUST precede consp test,
+    ;; because fp/adjustable/displaced wrappers are conses but have a
+    ;; concrete LENGTH; using most-positive-fixnum walks past the array
+    ;; and SIGSEGVs (was the count-test 16963 family fail mode).
     (count-if (lambda (x)
                 (if test (funcall test item x) (eql item x)))
               seq
               :start start
               :end (or end (cond ((null seq) 0)
+                                  ((array-wrapper-p seq) (length seq))
                                   ((consp seq) most-positive-fixnum)
                                   (t (length seq))))
               :key key
@@ -1541,7 +1546,10 @@
     (count-if (lambda (x) (not (funcall pred x)))
               seq
               :start start
+              ;; array-wrapper-p check before consp — wrappers are conses
+              ;; but have a finite LENGTH; MPF crashes the walker.
               :end (or end (cond ((null seq) 0)
+                                  ((array-wrapper-p seq) (length seq))
                                   ((consp seq) most-positive-fixnum)
                                   (t (length seq))))
               :key key
@@ -1754,22 +1762,29 @@
 
 (defun %concat-result-kind (result-type)
   "Resolve a concatenate RESULT-TYPE designator to one of :LIST,
-   :STRING, or :VECTOR.  Compound forms like (vector ...) and
-   (simple-vector ...) are recognised by their car."
+   :STRING, :VECTOR, :BIT-VECTOR, or :NULL.  Compound forms like
+   (vector ...) and (simple-vector ...) are recognised by their car.
+   :NULL ('NULL → empty list) and :BIT-VECTOR (separate from :VECTOR
+   so map/merge wrappers preserve bit-vector identity) are split out
+   from the catch-all :VECTOR bucket — affects MAP/MERGE/CONCATENATE
+   tests that check (typep result 'bit-vector) or compare to NIL."
   (cond
+    ((eq result-type 'null) :null)
     ((or (eq result-type 'list) (eq result-type 'cons)) :list)
     ((or (eq result-type 'string) (eq result-type 'simple-string)
          (eq result-type 'base-string) (eq result-type 'simple-base-string))
      :string)
+    ((or (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector))
+     :bit-vector)
     ((or (eq result-type 'vector) (eq result-type 'simple-vector)
-         (eq result-type 'array)  (eq result-type 'simple-array)
-         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector))
+         (eq result-type 'array)  (eq result-type 'simple-array))
      :vector)
     ((consp result-type)
      (let ((head (car result-type)))
-       (cond ((or (eq head 'vector) (eq head 'simple-vector)
-                  (eq head 'array)  (eq head 'simple-array)
-                  (eq head 'bit-vector) (eq head 'simple-bit-vector))
+       (cond ((or (eq head 'bit-vector) (eq head 'simple-bit-vector))
+              :bit-vector)
+             ((or (eq head 'vector) (eq head 'simple-vector)
+                  (eq head 'array)  (eq head 'simple-array))
               :vector)
              ((or (eq head 'string) (eq head 'simple-string)
                   (eq head 'base-string) (eq head 'simple-base-string))
@@ -1867,15 +1882,35 @@
            result))))))
 
 (defun merge (result-type s1 s2 pred &rest args)
-  "Merge two sorted sequences. Honors RESULT-TYPE designator."
-  (let ((r nil) (a (if (consp s1) s1 (coerce s1 'list)))
-                (b (if (consp s2) s2 (coerce s2 'list))))
-    (let ((merged (loop
-                    (cond ((null a) (return (nreconc r b)))
-                          ((null b) (return (nreconc r a)))
-                          ((funcall pred (car a) (car b))
-                           (setq r (cons (car a) r)) (setq a (cdr a)))
-                          (t (setq r (cons (car b) r)) (setq b (cdr b))))))
+  "Merge two sorted sequences.  Honors RESULT-TYPE designator and :KEY.
+   PRED can be a symbol (function name) or a function; symbol form is
+   resolved via SYMBOL-FUNCTION.  Was: ignored &rest args entirely
+   (merge-test 17815 GOT raw concat instead of properly merged)."
+  (let* ((key-fn (let ((cur args) (k nil))
+                   (loop (when (or (null cur) (null (cdr cur))) (return k))
+                     (when (eq (car cur) :key) (setq k (cadr cur)))
+                     (setq cur (cddr cur)))))
+         (pred-fn (cond
+                    ((functionp pred) pred)
+                    ((symbolp pred) (symbol-function pred))
+                    (t pred)))
+         (kfn (cond
+                ((null key-fn) nil)
+                ((functionp key-fn) key-fn)
+                ((symbolp key-fn) (symbol-function key-fn))
+                (t key-fn)))
+         (r nil)
+         (a (if (consp s1) s1 (coerce s1 'list)))
+         (b (if (consp s2) s2 (coerce s2 'list))))
+    (let ((merged
+            (loop
+              (cond ((null a) (return (nreconc r b)))
+                    ((null b) (return (nreconc r a)))
+                    ((funcall pred-fn
+                              (if kfn (funcall kfn (car a)) (car a))
+                              (if kfn (funcall kfn (car b)) (car b)))
+                     (setq r (cons (car a) r)) (setq a (cdr a)))
+                    (t (setq r (cons (car b) r)) (setq b (cdr b))))))
           (kind (%concat-result-kind result-type)))
       (cond
         ((eq kind :list) merged)
@@ -1886,6 +1921,13 @@
              (loop (when (= i n) (return s))
                (let ((c (car cur)))
                  (aset s i (if (characterp c) (char-code c) c)))
+               (setq cur (cdr cur)) (setq i (+ i 1))))))
+        ((eq kind :bit-vector)
+         (let ((n (length merged))
+               (cur merged))
+           (let ((v (make-array n)) (i 0))
+             (loop (when (= i n) (return v))
+               (aset v i (car cur))
                (setq cur (cdr cur)) (setq i (+ i 1))))))
         (t  ;; :vector
          (let ((n (length merged))
@@ -1959,36 +2001,46 @@
 
 (defun map-into (result fn &rest seqs)
   "Apply FN to elements of SEQS, storing each result in successive
-   positions of RESULT. Stops at the shortest of RESULT and SEQS."
+   positions of RESULT. Stops at the shortest of RESULT and SEQS.
+
+   array-wrapper-p check precedes consp so fp/displaced/adjustable
+   wrappers route to aref/aset (NOT set-car on the wrapper's cons cell
+   which would clobber the fill-pointer).  Was breaking map-into tests
+   like 17697 on fp-wrapped strings."
   (let* ((result-len (length result))
-         ;; Determine iteration count: min of result length and all seq lengths.
+         (wrap-p (and (consp result) (array-wrapper-p result)))
+         (cons-p (and (consp result) (not wrap-p)))
          (n (let ((m result-len))
               (dolist (s seqs m)
                 (let ((sl (length s)))
                   (when (< sl m) (setq m sl)))))))
     (if (null seqs)
-        ;; Zero-arg FN: fill result with (funcall fn) calls.
         (let ((i 0))
           (loop (when (>= i result-len) (return result))
             (let ((v (funcall fn)))
-              (if (consp result)
-                  (set-car (nthcdr i result) v)
-                  (aset result i (if (and (stringp result) (characterp v))
-                                     (char-code v)
-                                     v))))
+              (cond
+                (cons-p (set-car (nthcdr i result) v))
+                (wrap-p (aset result i
+                              (if (and (stringp result) (characterp v))
+                                  (char-code v) v)))
+                (t (aset result i
+                         (if (and (stringp result) (characterp v))
+                             (char-code v) v)))))
             (setq i (+ i 1))))
-        ;; One-or-more seqs: collect ith elements, apply fn, store.
         (let ((i 0))
           (loop (when (>= i n) (return result))
             (let ((args (let ((r nil) (sr (reverse seqs)))
                           (dolist (s sr r)
                             (setq r (cons (elt s i) r))))))
               (let ((v (apply fn args)))
-                (if (consp result)
-                    (set-car (nthcdr i result) v)
-                    (aset result i (if (and (stringp result) (characterp v))
-                                       (char-code v)
-                                       v)))))
+                (cond
+                  (cons-p (set-car (nthcdr i result) v))
+                  (wrap-p (aset result i
+                                (if (and (stringp result) (characterp v))
+                                    (char-code v) v)))
+                  (t (aset result i
+                           (if (and (stringp result) (characterp v))
+                               (char-code v) v))))))
             (setq i (+ i 1)))))))
 
 ;;; Sequence predicates.  Avoid `(apply #'every pred seq more)' — apply

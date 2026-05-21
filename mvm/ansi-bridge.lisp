@@ -1058,7 +1058,9 @@
     val))
 
 (defun vector-push (new-element vector)
-  "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil."
+  "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil.
+   String underlying stores fixnum char-codes; coerce a character element
+   via char-code so subsequent (aref ...) returns the char correctly."
   (let ((vector (%fp-inner vector)))
     (if (and (consp vector) (fixnump (car vector)))
         (let ((fp (car vector))
@@ -1066,14 +1068,19 @@
           (let ((len (array-length arr)))
             (if (>= fp len)
                 nil
-                (progn
-                  (aset arr fp new-element)
+                (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                     (char-code new-element)
+                                     new-element)))
+                  (aset arr fp store-val)
                   (set-car vector (+ fp 1))
                   fp))))
         nil)))
 
 (defun vector-push-extend (new-element vector &rest args)
-  "Push NEW-ELEMENT onto VECTOR, extending if needed."
+  "Push NEW-ELEMENT onto VECTOR, extending if needed.  Character on
+   string-backed vector is char-code-converted (vector-push-extend test
+   20914 was storing tagged character into the string array → garbage
+   on later aref)."
   (let ((vector (%fp-inner vector)))
     (if (and (consp vector) (fixnump (car vector)))
         (let ((fp (car vector))
@@ -1094,7 +1101,10 @@
                     (setq i (+ i 1))))
                 (set-cdr vector new-arr)
                 (setq arr new-arr)))
-            (aset (cdr vector) fp new-element)
+            (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                 (char-code new-element)
+                                 new-element)))
+              (aset arr fp store-val))
             (set-car vector (+ fp 1))
             fp))
         nil)))

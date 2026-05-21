@@ -1841,28 +1841,53 @@
          (return-from rewrite-reader-forms form))
        (when (null sll) (return-from rewrite-reader-forms nil))
        (when (not (listp sll)) (return-from rewrite-reader-forms nil))
-       ;; Extract specializers (skip &optional, &rest, &key, &aux, &allow-other-keys)
+       ;; Extract specializers (skip &optional, &rest, &key, &aux, &allow-other-keys
+       ;; and everything after them — only positional / specialized args have specializers).
        (let* ((specs
-               (mapcar (lambda (p)
+               (let ((stop-at-keyword nil))
+                 (let ((spec-result nil))
+                   (dolist (p sll)
+                     (cond
+                       ((and (symbolp p)
+                             (member p '(&optional &rest &key &aux &allow-other-keys)))
+                        (setq stop-at-keyword t))
+                       ((not stop-at-keyword)
+                        (push
                          (cond
                            ;; (var class-name) or (var (eql val))
                            ((consp p)
                             (let ((spec (cadr p)))
                               (if (and (consp spec) (eq (car spec) 'eql))
-                                ;; eql specializer: preserve as (eql val)
-                                `(list 'eql ,(rewrite-reader-forms (cadr spec)))
-                                `',(cadr p))))
+                                  ;; eql specializer: preserve as (eql val)
+                                  `(list 'eql ,(rewrite-reader-forms (cadr spec)))
+                                  `',(cadr p))))
                            ;; plain var — specializer is t
-                           (t ''t)))
-                       (remove-if (lambda (p)
-                                    (and (symbolp p)
-                                         (member p '(&optional &rest &key &aux &allow-other-keys))))
-                                  sll)))
-              ;; Extract parameter names (strip specializers)
+                           (t ''t))
+                         spec-result))))
+                   (nreverse spec-result))))
+              ;; Build parameter list.  Positional args use bare names (strip
+              ;; specializer).  After &optional / &key / &aux, preserve the
+              ;; full (var default supplied-p) form so supplied-p vars exist
+              ;; in the body — defmethods like
+              ;;   (defmethod foo ((x c) &key (a nil a-p)) (when a-p ...))
+              ;; depend on A-P being bound to T/NIL by the caller's arg list.
               (params
-               (mapcar (lambda (p)
-                         (if (consp p) (car p) p))
-                       sll))
+               (let ((p-list nil)
+                     (in-keyword nil))
+                 (dolist (p sll)
+                   (cond
+                     ((and (symbolp p)
+                           (member p '(&optional &rest &key &aux &allow-other-keys)))
+                      (setq in-keyword t)
+                      (push p p-list))
+                     (in-keyword
+                      ;; After &optional/&key/&aux: preserve full form so
+                      ;; (var default supplied-p) keeps supplied-p binding.
+                      (push p p-list))
+                     (t
+                      ;; Positional / specialized: strip specializer.
+                      (push (if (consp p) (car p) p) p-list))))
+                 (nreverse p-list)))
               (rewritten-body (mapcar #'rewrite-reader-forms body)))
          ;; Use lambda directly — can be inside init expressions
          `(%defmethod ',gf-name ',(if qualifier qualifier nil)
@@ -1870,53 +1895,33 @@
                       (lambda ,params ,@rewritten-body)))))
 
     ;; (make-instance 'class-name &rest initargs)
-    ;; → (%make-instance 'class-name) + set-slot-value for initargs
-    ;; We expand initargs at build time using SBCL-side class registry.
+    ;; → (let ((tmp (%make-instance 'class)))
+    ;;     (%shared-init-default-spread (list tmp t k1 v1 k2 v2 ...))
+    ;;     tmp)
+    ;; %shared-init-default-spread (in ansi-bridge.lisp) does leftmost-
+    ;; wins initarg application AND applies initforms for unset slots —
+    ;; matching CLHS make-instance semantics.  The old expansion emitted
+    ;; set-slot-value calls left-to-right (last-write-wins, wrong) and
+    ;; never applied initforms at all.
     ((and (eq (car form) 'make-instance) (cdr form))
      (let* ((class-arg-raw (cadr form))
             (class-arg (rewrite-reader-forms class-arg-raw))
-            (rest-args (cddr form))
-            ;; Check if class-arg is a quoted symbol we know about
-            (class-name (if (and (consp class-arg-raw)
-                                 (eq (car class-arg-raw) 'quote)
-                                 (symbolp (cadr class-arg-raw)))
-                            (cadr class-arg-raw)
-                            nil))
-            (slot-info (if class-name
-                           (cdr (assoc class-name *sbcl-clos-classes*))
-                           nil)))
+            (rest-args (cddr form)))
        (if (null rest-args)
-           ;; No initargs: simple case
-           `(%make-instance ,class-arg)
-           ;; Has initargs: expand inline
-           ;; Generate: (let ((%mi-tmp (%make-instance 'class)))
-           ;;               (set-slot-value %mi-tmp 'slot val) ...
-           ;;               %mi-tmp)
-           (let* ((inst-var '%clos-make-instance-tmp)
-                  (set-forms nil))
-             ;; Walk initargs pairwise
-             (let ((args rest-args))
-               (loop
-                 (when (null args) (return))
-                 (let ((key (car args))
-                       (val (rewrite-reader-forms (cadr args))))
-                   ;; key should be a keyword; find matching slot
-                   (when (keywordp key)
-                     (let* ((kname (symbol-name key))
-                            ;; Find slot with matching initarg
-                            (slot-name (if slot-info
-                                          ;; Look in class slot info
-                                          (cdr (assoc kname (cdr slot-info)
-                                                      :test #'string-equal))
-                                          ;; Fallback: use keyword name as slot name
-                                          (intern (string-upcase kname) :cl-user))))
-                       (when slot-name
-                         (push `(set-slot-value ,inst-var ',slot-name ,val)
-                               set-forms))))
-                   (setq args (cddr args)))))
-             `(let ((,inst-var (%make-instance ,class-arg)))
-                ,@(nreverse set-forms)
-                ,inst-var)))))
+           ;; No initargs: still want initforms applied.
+           `(let ((%clos-make-instance-tmp (%make-instance ,class-arg)))
+              (%shared-init-default-spread
+                (list %clos-make-instance-tmp t))
+              %clos-make-instance-tmp)
+           ;; Has initargs: pass them through to the spread helper which
+           ;; matches them against the runtime initarg-map and applies
+           ;; initforms for any unset slots.  Values are recursively
+           ;; rewritten so quoted/embedded forms still resolve correctly.
+           (let ((rewritten-args (mapcar #'rewrite-reader-forms rest-args)))
+             `(let ((%clos-make-instance-tmp (%make-instance ,class-arg)))
+                (%shared-init-default-spread
+                  (list %clos-make-instance-tmp t ,@rewritten-args))
+                %clos-make-instance-tmp)))))
 
     ;; (slot-value obj slot) → (slot-value obj slot) — already defined at runtime
     ;; (slot-boundp obj slot) → (slot-boundp obj slot) — already defined

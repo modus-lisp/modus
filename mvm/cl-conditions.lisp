@@ -216,11 +216,18 @@
       (setq rest (cddr rest)))))
 
 (defun %eval-initform (form)
-  "Evaluate an initform. If it's a thunk (function), call it. Otherwise return it."
-  (if (and (not (fixnump form)) (not (consp form)) (not (null form))
-           (= (obj-subtag form) #x52))  ; closure subtag
-      (funcall form)
-      form))
+  "Evaluate an initform.  Three shapes:
+   - closure (subtag #x52): funcall it → user lambda from defclass-rewriter
+   - (QUOTE x) cons: return x (literal value from define-condition rewriter
+     which emits initforms inside a quoted list so values arrive wrapped)
+   - anything else: return as-is (already-evaluated literal)"
+  (cond
+    ((and (not (fixnump form)) (not (consp form)) (not (null form))
+          (= (obj-subtag form) #x52))     ; closure subtag → thunk
+     (funcall form))
+    ((and (consp form) (eq (car form) 'quote) (consp (cdr form)))
+     (cadr form))
+    (t form)))
 
 ;;; --- print-object for conditions ---
 ;;; Conditions print as their type name by default, or using :report fn

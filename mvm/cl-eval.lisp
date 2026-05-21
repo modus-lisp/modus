@@ -196,13 +196,22 @@
   "Return the macro expander function for SYM, or nil.
    Falls back to a built-in compiler-macro check so MACRO-FUNCTION
    reports a non-NIL value for PUSH/POP/COND/etc. that the modus
-   compiler implements directly (rather than via runtime expander)."
+   compiler implements directly (rather than via runtime expander).
+   For native MVM symbols (#x50, hash-only), also consult symbol-name
+   so PUSH/POP etc. are recognised regardless of which symbol-cons type."
   (let ((name (cond
+                ((null sym) nil)
                 ((%cl-sym-p sym) (%cl-sym-name sym))
                 ((stringp sym) sym)
+                ((and (not (consp sym)) (not (fixnump sym))
+                      (not (characterp sym))
+                      (let ((st (obj-subtag sym)))
+                        (or (= st #x50) (= st #x53))))
+                 (symbol-name sym))
                 (t nil))))
     (cond
       ((null name) nil)
+      ((= (length name) 0) nil)
       ((and *macro-function-table* (gethash name *macro-function-table*)))
       ((%compiler-macro-p name) t)
       (t nil))))
@@ -882,11 +891,34 @@
       ;; EVAL-WHEN (always eval)
       ((%eval-sym-eq op "EVAL-WHEN")
        (%eval-progn (cdr args) env))
-      ;; HANDLER-CASE (simplified)
+      ;; HANDLER-CASE — evaluate body; on error, find a matching handler
+      ;; clause and evaluate its body with the condition bound to the var.
+      ;; Clauses look like (TYPE (VAR) BODY...) or (TYPE () BODY...).
+      ;; TYPE T matches anything; ERROR matches any error.
       ((%eval-sym-eq op "HANDLER-CASE")
-       (handler-case
-         (%eval-in-env (car args) env)
-         (error (c) nil)))
+       (let ((body-form (car args))
+             (clauses (cdr args)))
+         (handler-case
+           (%eval-in-env body-form env)
+           (t (c)
+             (let ((found nil) (result nil))
+               (dolist (cl clauses)
+                 (unless found
+                   (let* ((type-spec (car cl))
+                          (lambda-list (cadr cl))
+                          (clause-body (cddr cl))
+                          (matches (or (%eval-sym-eq type-spec "T")
+                                       (%eval-sym-eq type-spec "ERROR")
+                                       (%eval-sym-eq type-spec "CONDITION")
+                                       (typep c type-spec))))
+                     (when matches
+                       (setq found t)
+                       (let ((new-env
+                              (if (and (consp lambda-list) (car lambda-list))
+                                  (%env-extend (car lambda-list) c env)
+                                  env)))
+                         (setq result (%eval-progn clause-body new-env)))))))
+               result)))))
       ;; UNWIND-PROTECT
       ((%eval-sym-eq op "UNWIND-PROTECT")
        (unwind-protect
@@ -1143,6 +1175,41 @@
   (puthash "ABS" ht #'abs)
   (puthash "MAX" ht #'max)
   (puthash "MIN" ht #'min)
+  (puthash "1+" ht #'1+)
+  (puthash "1-" ht #'1-)
+  ;; Transcendentals (Taylor-series impls in cl-types.lisp)
+  (puthash "SIN" ht #'sin)
+  (puthash "COS" ht #'cos)
+  (puthash "TAN" ht #'tan)
+  (puthash "EXP" ht #'exp)
+  (puthash "LOG" ht #'log)
+  (puthash "SINH" ht #'sinh)
+  (puthash "COSH" ht #'cosh)
+  (puthash "TANH" ht #'tanh)
+  (puthash "ASIN" ht #'asin)
+  (puthash "ACOS" ht #'acos)
+  (puthash "ATAN" ht #'atan)
+  (puthash "SQRT" ht #'sqrt)
+  (puthash "FLOAT" ht #'float)
+  (puthash "NUMERATOR" ht #'numerator)
+  (puthash "DENOMINATOR" ht #'denominator)
+  ;; Common set/list ops
+  (puthash "REMOVE-DUPLICATES" ht #'remove-duplicates)
+  (puthash "UNION" ht #'union)
+  (puthash "INTERSECTION" ht #'intersection)
+  (puthash "SET-DIFFERENCE" ht #'set-difference)
+  (puthash "SET-EXCLUSIVE-OR" ht #'set-exclusive-or)
+  (puthash "MAPL" ht #'mapl)
+  (puthash "ADJOIN" ht #'adjoin)
+  (puthash "FIND-PACKAGE" ht #'find-package)
+  (puthash "BOUNDP" ht #'boundp)
+  (puthash "BIT-VECTOR-P" ht #'bit-vector-p)
+  (puthash "BIT" ht #'bit)
+  (puthash "BIT-AND" ht #'bit-and)
+  (puthash "BIT-IOR" ht #'bit-ior)
+  (puthash "BIT-XOR" ht #'bit-xor)
+  (puthash "BIT-NOT" ht #'bit-not)
+  (puthash "ARRAY-ELEMENT-TYPE" ht #'array-element-type)
   ;; NOTE: lognot is an inline op (no defun), skip
   (puthash "LOGBITP" ht #'logbitp)
   (puthash "NUMBERP" ht #'numberp)
@@ -1210,6 +1277,20 @@
   (puthash "%LOOP-COLLECT-SYMBOLS" ht #'%loop-collect-symbols)
   (puthash "%LOOP-COLLECT-EXTERNAL-SYMBOLS" ht #'%loop-collect-external-symbols)
   (puthash "%LOOP-COLLECT-PRESENT-SYMBOLS" ht #'%loop-collect-present-symbols)
+  ;; CLOS internals so eval'd defgeneric/defmethod forms resolve.
+  (puthash "%DEFGENERIC" ht #'%defgeneric)
+  (puthash "%DEFMETHOD" ht #'%defmethod)
+  (puthash "%DEFCLASS" ht #'%defclass)
+  (puthash "%FIND-GF" ht #'%find-gf)
+  (puthash "%GF-DISPATCH" ht #'%gf-dispatch)
+  (puthash "%REGISTER-GF-FN" ht #'%register-gf-fn)
+  (puthash "%MAKE-INSTANCE" ht #'%make-instance)
+  (puthash "%FIND-CLOS-CLASS" ht #'%find-clos-class)
+  ;; Common test-helpers used inside EVAL forms.
+  (puthash "READ-FROM-STRING" ht #'read-from-string)
+  (puthash "NAME-CHAR" ht #'name-char)
+  (puthash "CODE-CHAR" ht #'code-char)
+  (puthash "CHAR-CODE" ht #'char-code)
   (puthash "KEYWORDP" ht #'keywordp)
   (puthash "GENSYM" ht #'gensym)
   (puthash "ENDP" ht #'endp)
@@ -1301,8 +1382,10 @@
 ;;; --- String helpers shared by string-upcase/downcase/capitalize and trims ---
 (defun %string-coerce (x)
   "Coerce X to a flat string. STRING->itself, CHARACTER->1-char string,
-   SYMBOL->name. Fill-pointer/displaced array wrappers are flattened to a
-   freshly allocated string of the effective length.
+   SYMBOL->name (works for both CL symbols and native MVM subtag-#x50
+   single-slot symbols by looking name up via SYMBOL-NAME).
+   Fill-pointer/displaced array wrappers are flattened to a freshly
+   allocated string of the effective length.
 
    Wrapper check goes BEFORE stringp because the wrapper-aware stringp
    added by compile-stringp peel reports T for fp-wrapped strings, which
@@ -1322,6 +1405,14 @@
        (aset s 0 (%ensure-char-code x))
        s))
     ((consp x) x)
+    ;; Native MVM symbol (#x50) or keyword (#x53) — recover name via
+    ;; the package symtab.  Without this, STRING-DOWNCASE/UPCASE on a
+    ;; literal symbol like 'A would iterate over the symbol's 1-slot
+    ;; storage (the hash) and produce garbled output.
+    ((and (not (fixnump x)) (not (null x))
+          (let ((st (obj-subtag x)))
+            (or (= st #x50) (= st #x53))))
+     (symbol-name x))
     (t x)))
 
 (defun %char-bag-list (chars)
@@ -1443,15 +1534,76 @@
             result)))))
 
 (defun string-not-equal (a b) (not (string-equal a b)))
-(defun string< (a b &rest args) (let ((m (mismatch a b)))
-  (if m (if (< (aref a m) (aref b m)) m nil) (if (< (length a) (length b)) (length a) nil))))
-(defun string> (a b &rest args) (string< b a))
-(defun string<= (a b &rest args) (not (string> a b)))
-(defun string>= (a b &rest args) (not (string< a b)))
-(defun string-lessp (a b &rest args) (string< (string-downcase a) (string-downcase b)))
-(defun string-greaterp (a b &rest args) (string> (string-downcase a) (string-downcase b)))
-(defun string-not-greaterp (a b &rest args) (not (string-greaterp a b)))
-(defun string-not-lessp (a b &rest args) (not (string-lessp a b)))
+
+;; Parse :START1/:END1/:START2/:END2 from an arg list.  Returns (s1 e1 s2 e2).
+;; NIL ends mean "to length"; caller resolves with array-length.
+(defun %parse-str-cmp-bounds (args)
+  (let ((s1 0) (e1 nil) (s2 0) (e2 nil) (o args))
+    (loop (when (null o) (return))
+      (cond ((eq (car o) :start1) (setq s1 (cadr o)))
+            ((eq (car o) :end1)   (setq e1 (cadr o)))
+            ((eq (car o) :start2) (setq s2 (cadr o)))
+            ((eq (car o) :end2)   (setq e2 (cadr o))))
+      (setq o (cddr o)))
+    (list s1 e1 s2 e2)))
+
+;; Core lexicographic compare with case-fold flag.  Returns:
+;;   :less    — a[s1..e1) < b[s2..e2)  (mismatch position in a's coords)
+;;   :greater — a[s1..e1) > b[s2..e2)  (mismatch position in a's coords)
+;;   :equal   — slices equal
+;; Second value: mismatch index in a's coordinates (or NIL when :equal).
+(defun %str-cmp-core (a b args fold-p)
+  (let* ((sa (%string-coerce a))
+         (sb (%string-coerce b))
+         (bounds (%parse-str-cmp-bounds args))
+         (s1 (car bounds))
+         (e1 (or (cadr bounds) (array-length sa)))
+         (s2 (caddr bounds))
+         (e2 (or (cadddr bounds) (array-length sb)))
+         (i 0)
+         (len1 (- e1 s1))
+         (len2 (- e2 s2))
+         (mn (if (< len1 len2) len1 len2)))
+    (let ((m nil) (result nil))
+      (loop
+        (when (or m (>= i mn)) (return))
+        (let ((ca (aref sa (+ s1 i)))
+              (cb (aref sb (+ s2 i))))
+          (when fold-p
+            (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
+            (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32))))
+          (cond ((< ca cb) (setq result :less) (setq m (+ s1 i)))
+                ((> ca cb) (setq result :greater) (setq m (+ s1 i)))))
+        (setq i (+ i 1)))
+      (cond (m (list result m))
+            ((< len1 len2) (list :less (+ s1 len1)))
+            ((> len1 len2) (list :greater (+ s1 len2)))
+            (t (list :equal nil))))))
+
+(defun string< (a b &rest args)
+  (let ((r (%str-cmp-core a b args nil)))
+    (when (eq (car r) :less) (cadr r))))
+(defun string> (a b &rest args)
+  (let ((r (%str-cmp-core a b args nil)))
+    (when (eq (car r) :greater) (cadr r))))
+(defun string<= (a b &rest args)
+  (let ((r (%str-cmp-core a b args nil)))
+    (when (or (eq (car r) :less) (eq (car r) :equal)) (cadr r))))
+(defun string>= (a b &rest args)
+  (let ((r (%str-cmp-core a b args nil)))
+    (when (or (eq (car r) :greater) (eq (car r) :equal)) (cadr r))))
+(defun string-lessp (a b &rest args)
+  (let ((r (%str-cmp-core a b args t)))
+    (when (eq (car r) :less) (cadr r))))
+(defun string-greaterp (a b &rest args)
+  (let ((r (%str-cmp-core a b args t)))
+    (when (eq (car r) :greater) (cadr r))))
+(defun string-not-greaterp (a b &rest args)
+  (let ((r (%str-cmp-core a b args t)))
+    (when (or (eq (car r) :less) (eq (car r) :equal)) (cadr r))))
+(defun string-not-lessp (a b &rest args)
+  (let ((r (%str-cmp-core a b args t)))
+    (when (or (eq (car r) :greater) (eq (car r) :equal)) (cadr r))))
 
 (defun char-upcase (c) (let ((code (%ensure-char-code c)))
   (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
@@ -1577,13 +1729,18 @@
 (defun rem (n d) (- n (* (truncate n d) d)))
 (defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
 (defun expt (base power)
-  "Raise BASE to POWER.  Handles non-negative integer power directly;
-   negative integer power returns 1/expt(base, -power) as a ratio;
-   ratio power approximated as exp(power * log base) when domain
-   allows."
+  "Raise BASE to POWER.  Integer base/power uses bignum-mul so the
+   result promotes to a bignum when fixnum range is exceeded —
+   important for tests like (expt 10 20) = 10^20 ≈ 2^66 which
+   silently truncated under plain (* r base) before.  Negative
+   integer power returns 1/expt(base, -power) as a ratio.  Ratio
+   power approximated as exp(power * log base)."
   (cond
     ((= power 0) 1)
     ((= power 1) base)
+    ((and (integerp power) (> power 0) (integerp base))
+     (let ((r 1))
+       (dotimes (i power r) (setq r (bignum-mul r base)))))
     ((and (integerp power) (> power 0))
      (let ((r 1)) (dotimes (i power r) (setq r (* r base)))))
     ((and (integerp power) (< power 0))
@@ -1679,20 +1836,34 @@
   (make-bignum (+ (ash lo -1) (logand (ash hi 61) 4611686018427387903))
                (ash hi -1)))
 (defun bignum-ash (n count)
-  (if (= count 0) n
-      (if (> count 0)
-          (let ((result n) (remaining count))
-            (loop (when (= remaining 0) (return result))
-              (setq result (if (bignump result)
-                               (%shl1-bignum (bignum-lo result) (bignum-hi result))
-                               (%shl1-fixnum result)))
-              (setq remaining (- remaining 1))))
-          (if (bignump n)
-              (let ((result n) (remaining (- 0 count)))
-                (loop (when (= remaining 0) (return (bignum-to-fixnum-if-possible result)))
-                  (setq result (%shr1-bignum (bignum-lo result) (bignum-hi result)))
-                  (setq remaining (- remaining 1))))
-              (ash n count)))))
+  "Arithmetic shift N by COUNT bits, promoting to bignum on left-shift
+   overflow.  All recursion-free: the fixnum negative-count branch uses
+   literal `(ash result -1)` so compile-ash takes its CONSTANT path
+   (inline :sar) — never re-enters bignum-ash.  Safe to wire from
+   compile-ash's variable-count slow path."
+  (cond
+    ((= count 0) n)
+    ((> count 0)
+     (let ((result n) (remaining count))
+       (loop (when (= remaining 0) (return result))
+         (setq result (if (bignump result)
+                          (%shl1-bignum (bignum-lo result) (bignum-hi result))
+                          (%shl1-fixnum result)))
+         (setq remaining (- remaining 1)))))
+    ((bignump n)
+     (let ((result n) (remaining (- 0 count)))
+       (loop (when (= remaining 0) (return (bignum-to-fixnum-if-possible result)))
+         (setq result (%shr1-bignum (bignum-lo result) (bignum-hi result)))
+         (setq remaining (- remaining 1)))))
+    (t
+     ;; Fixnum + negative count.  Inline SAR loop with LITERAL -1 so
+     ;; compile-ash routes to constant fast path (no recursion).
+     (let ((result n) (k (- 0 count)))
+       ;; Cap shift at 63 — anything more zeros (or sign-fills) fixnum.
+       (when (> k 63) (setq k 63))
+       (loop (when (= k 0) (return result))
+         (setq result (ash result -1))
+         (setq k (- k 1)))))))
 (defun %fixnum-to-bignum-parts (n)
   "Convert fixnum N to (lo . hi) bignum parts."
   (if (>= n 0)
@@ -1819,7 +1990,23 @@
 (defun bignum-mul (a b)
   "Multiply bignum/fixnum A by bignum/fixnum B.  Returns a fixnum
    when the result fits, else a bignum.  Caps at 124-bit values —
-   beyond that we return the low 124 bits and lose precision."
+   beyond that we return the low 124 bits and lose precision.
+
+   Schoolbook: split each 62-bit operand half into two 31-bit chunks
+   so each 31x31 partial product fits in 62-bit fixnum.  Layout:
+
+     a = a3 a2 a1 a0  (each 31 bits, low → high)
+     b = b3 b2 b1 b0
+     product positions: c_k at bit (k*31), k = 0..6
+       c0 = a0*b0                      (bits 0..62)
+       c1 = a0*b1 + a1*b0              (bits 31..93)
+       c2 = a0*b2 + a1*b1 + a2*b0      (bits 62..124)
+       c3 = a0*b3 + a1*b2 + a2*b1 + a3*b0  (bits 93..155, truncated)
+
+   Result is split into res-lo (bits 0..61) + res-hi (bits 62..123).
+   Earlier implementation used LOGIOR to fold partials into res-lo,
+   which silently corrupted output whenever c0's bits 31..61 overlapped
+   (c1 << 31)'s bits 31..61 (e.g. (bignum-mul 1e10 1e10) → wrong lo)."
   ;; Fast path: both fixnum and product fits 62 bits.
   (when (and (not (bignump a)) (not (bignump b)))
     (let* ((aa (if (< a 0) (- 0 a) a))
@@ -1827,41 +2014,48 @@
            (max 2147483647))   ; 2^31 - 1
       (when (and (<= aa max) (<= bb max))
         (return-from bignum-mul (* a b)))))
-  ;; Slow path: split into 31-bit chunks and schoolbook.
+  ;; Slow path: split into 31-bit chunks and schoolbook with carry.
   (let* ((ap (%bignum-abs-parts a))
          (bp (%bignum-abs-parts b))
          (sign (* (car ap) (car bp)))
          (a-lo (cadr ap)) (a-hi (caddr ap))
          (b-lo (cadr bp)) (b-hi (caddr bp))
-         ;; Split each 62-bit half into two 31-bit chunks.
          (mask31 2147483647)
+         (mask62 4611686018427387903)
          (a0 (logand a-lo mask31))
-         (a1 (ash a-lo -31))                 ; bits 31..61 of lo
-         (a2 (logand a-hi mask31))           ; bits 0..30 of hi
-         (a3 (ash a-hi -31))                 ; bits 31..61 of hi
+         (a1 (ash a-lo -31))
+         (a2 (logand a-hi mask31))
+         (a3 (ash a-hi -31))
          (b0 (logand b-lo mask31))
          (b1 (ash b-lo -31))
          (b2 (logand b-hi mask31))
          (b3 (ash b-hi -31))
-         ;; Compute partial products that fit in 62 bits (31*31).
-         ;; Accumulator chunks (each 31-bit nominally, but we let them
-         ;; grow then carry-propagate).
-         (c0 (* a0 b0))                                      ; bits 0..62
-         (c1 (+ (* a0 b1) (* a1 b0)))                         ; bits 31..93
-         (c2 (+ (* a0 b2) (* a1 b1) (* a2 b0)))               ; bits 62..124
-         (c3 (+ (* a0 b3) (* a1 b2) (* a2 b1) (* a3 b0))))    ; bits 93..155
-    ;; Combine.  Result lo (bits 0..61) and hi (bits 62..123).
-    (let* ((res-lo (logand c0 (logand 4611686018427387903 4611686018427387903)))
-           (carry0 (ash c0 -62))
-           (mid (+ (ash c1 -0) carry0))           ; bits 31..93
-           ;; Place mid: low 31 bits feed into res-lo (bits 31..61), rest into res-hi.
-           (mid-low31 (logand mid mask31))
-           (mid-rest (ash mid -31)))              ; bits 62.. of mid → goes into res-hi
-      (setq res-lo (logior res-lo (ash mid-low31 31)))
-      (let* ((res-hi (+ mid-rest c2 (ash c3 31))))
-        (let ((result (make-bignum (logand res-lo 4611686018427387903) res-hi)))
-          (when (= sign -1) (setq result (bignum-negate result)))
-          (bignum-to-fixnum-if-possible result))))))
+         (c0 (* a0 b0))
+         (c1 (+ (* a0 b1) (* a1 b0)))
+         (c2 (+ (* a0 b2) (* a1 b1) (* a2 b0)))
+         (c3 (+ (* a0 b3) (* a1 b2) (* a2 b1) (* a3 b0))))
+    ;; Carry-propagating accumulation into res-lo (bits 0..61) and res-hi (bits 62..123).
+    ;; Each ck has bits up to ~62 (since 31*31=62 plus up to log2(4)=2 from summing
+    ;; ≤ 4 partials), so it can spill into the next 31-bit position.  We keep res-lo
+    ;; as a 62-bit accumulator and ARITHMETIC-add each partial (not OR).
+    (let* ((res-lo (logand c0 mask62))
+           (carry-lo (ash c0 -62))                          ; bits 62.. of c0 → res-hi
+           ;; Add (c1 << 31) to res-lo.  c1 may be up to ~63 bits.
+           (c1-low31 (logand c1 mask31))                     ; bits to add to res-lo at bit 31
+           (c1-rest  (ash c1 -31))                            ; bits 62.. → res-hi (after adding to bit 0 of hi)
+           (lo-add (ash c1-low31 31))                         ; fits in 62 bits
+           ;; res-lo += lo-add, with carry into res-hi.
+           (sum1 (+ res-lo lo-add))
+           (res-lo1 (logand sum1 mask62))
+           (carry1 (ash sum1 -62))
+           ;; res-hi = carry-lo + c1-rest + carry1 + c2 + (c3 << 31), all summed in fixnum range.
+           ;; (c3 << 31) may be up to 62 bits; sum of all five ≤ ~64 bits which exceeds
+           ;; 62-bit fixnum range — but we keep only the low 62 bits anyway (124-bit cap).
+           (res-hi-raw (+ carry-lo c1-rest carry1 c2 (ash c3 31)))
+           (res-hi (logand res-hi-raw mask62)))
+      (let ((result (make-bignum res-lo1 res-hi)))
+        (when (= sign -1) (setq result (bignum-negate result)))
+        (bignum-to-fixnum-if-possible result)))))
 
 (defun bignum-truncate (a b)
   "Truncate division: returns the quotient floor(|a|/|b|) with the

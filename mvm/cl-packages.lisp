@@ -193,12 +193,14 @@
 ;;; --- Internal alist-based symbol table operations ---
 
 (defun %symtab-find (table name-string)
-  "Find symbol in alist TABLE by NAME-STRING. Returns (name . symbol) or nil."
+  "Find symbol in alist TABLE by NAME-STRING.  Returns (name . symbol)
+   or nil.  ANSI: symbol-name lookup is CASE-SENSITIVE — 'a' and 'A'
+   are distinct symbol names."
   (let ((cur table))
     (loop
       (when (null cur) (return nil))
       (let ((entry (car cur)))
-        (when (string-equal (car entry) name-string)
+        (when (string= (car entry) name-string)
           (return entry)))
       (setq cur (cdr cur)))))
 

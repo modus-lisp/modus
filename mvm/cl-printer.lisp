@@ -18,37 +18,102 @@
       (%print-char (aref str i) stream)
       (setq i (+ i 1)))))
 
-;;; Write a decimal integer (always base 10, used for radix prefix numbers)
+;;; Write a decimal integer (always base 10).  Routes bignums through
+;;; the same %bignum-divmod-fixnum path as %print-integer-in-base so
+;;; FRESH-LINE / radix prefixes / ratio numerator-denominator printing
+;;; etc. all work for bignum operands.
 (defun %print-decimal-to-stream (n stream)
-  (if (< n 0)
-      (progn (%print-char 45 stream)
-             (%print-decimal-to-stream (- 0 n) stream))
-      (if (= n 0)
-          (%print-char 48 stream)
-          (let ((digits nil) (tmp n))
-            (loop
-              (when (= tmp 0) (return nil))
-              (setq digits (cons (+ 48 (mod tmp 10)) digits))
-              (setq tmp (truncate tmp 10)))
-            (dolist (d digits) (%print-char d stream))))))
+  (cond
+    ((bignump n)
+     (%print-integer-in-base n 10 stream))
+    ((< n 0)
+     (%print-char 45 stream)
+     (%print-decimal-to-stream (- 0 n) stream))
+    ((= n 0)
+     (%print-char 48 stream))
+    (t
+     (let ((digits nil) (tmp n))
+       (loop
+         (when (= tmp 0) (return nil))
+         (setq digits (cons (+ 48 (mod tmp 10)) digits))
+         (setq tmp (truncate tmp 10)))
+       (dolist (d digits) (%print-char d stream))))))
 
 ;;; Digit char for base N (0-9 A-Z)
 (defun %digit-char-upper (n)
   (if (< n 10) (+ 48 n) (+ 55 n)))   ; 55 = 65-10
 
-;;; Print integer in given base
+;;; Divide bignum or fixnum N by a small fixnum divisor D (positive).
+;;; Returns (cons quotient remainder) where remainder is 0..D-1.
+;;; Quotient may collapse to a fixnum.  D ≤ 36 so r-hi*2^31 stays well
+;;; below 2^62 (no internal overflow).
+(defun %bignum-divmod-fixnum (n d)
+  (cond
+    ((not (bignump n))
+     (if (< n 0)
+         (let* ((np (- 0 n)) (q (truncate np d)) (r (mod np d)))
+           (if (= r 0) (cons (- 0 q) 0) (cons (- 0 (+ q 1)) (- d r))))
+         (cons (truncate n d) (mod n d))))
+    (t
+     (let ((hi (bignum-hi n)))
+       (if (< hi 0)
+           (let* ((mag (bignum-negate n))
+                  (qr  (%bignum-divmod-fixnum mag d))
+                  (q (car qr)) (r (cdr qr)))
+             (if (= r 0)
+                 (cons (bignum-negate q) 0)
+                 (cons (bignum-negate (bignum-add q 1)) (- d r))))
+           (let* ((lo (bignum-lo n))
+                  (q-hi (truncate hi d))
+                  (r-hi (mod hi d))
+                  (lo-hi31 (ash lo -31))
+                  (lo-lo31 (logand lo 2147483647))
+                  (partial1 (+ (* r-hi 2147483648) lo-hi31))
+                  (q1 (truncate partial1 d))
+                  (r1 (mod partial1 d))
+                  (partial2 (+ (* r1 2147483648) lo-lo31))
+                  (q2 (truncate partial2 d))
+                  (r2 (mod partial2 d))
+                  (q-lo (+ (ash q1 31) q2))
+                  (q (if (= q-hi 0)
+                         ;; q-lo is already a fixnum (< 2^62 by construction);
+                         ;; do NOT route through bignum-to-fixnum-if-possible
+                         ;; which would read (aref) of a fixnum as a bignum.
+                         q-lo
+                         (bignum-to-fixnum-if-possible
+                           (make-bignum (logand q-lo 4611686018427387903) q-hi)))))
+             (cons q r2)))))))
+
+;;; Print bignum or fixnum in given base.  Bignums route through
+;;; %bignum-divmod-fixnum; pure fixnums use native (mod/truncate).
 (defun %print-integer-in-base (n base stream)
-  (if (< n 0)
-      (progn (%print-char 45 stream)  ; -
-             (%print-integer-in-base (- 0 n) base stream))
-      (if (= n 0)
-          (%print-char 48 stream)   ; 0
-          (let ((digits nil) (tmp n))
-            (loop
-              (when (= tmp 0) (return nil))
-              (setq digits (cons (%digit-char-upper (mod tmp base)) digits))
-              (setq tmp (truncate tmp base)))
-            (dolist (d digits) (%print-char d stream))))))
+  (cond
+    ((bignump n)
+     (if (< (bignum-hi n) 0)
+         (progn (%print-char 45 stream)
+                (%print-integer-in-base (bignum-negate n) base stream))
+         (let ((digits nil) (tmp n))
+           (loop
+             (when (and (not (bignump tmp)) (= tmp 0)) (return nil))
+             (let* ((qr (%bignum-divmod-fixnum tmp base))
+                    (q  (car qr)) (r (cdr qr)))
+               (setq digits (cons (%digit-char-upper r) digits))
+               (setq tmp q)))
+           (if (null digits)
+               (%print-char 48 stream)
+               (dolist (d digits) (%print-char d stream))))))
+    ((< n 0)
+     (%print-char 45 stream)
+     (%print-integer-in-base (- 0 n) base stream))
+    ((= n 0)
+     (%print-char 48 stream))
+    (t
+     (let ((digits nil) (tmp n))
+       (loop
+         (when (= tmp 0) (return nil))
+         (setq digits (cons (%digit-char-upper (mod tmp base)) digits))
+         (setq tmp (truncate tmp base)))
+       (dolist (d digits) (%print-char d stream))))))
 
 ;;; Print radix prefix: #b, #o, #x, #Nr. Base 10 with *print-radix* is
 ;;; conventionally written with a TRAILING dot (not a leading prefix), so
@@ -316,8 +381,8 @@
                ((= code 0)   (%print-string-raw "Null" stream))
                (t (%print-char code stream))))
            (%print-char (char-code obj) stream)))
-      ;; Integer (fixnum)
-      ((fixnump obj)
+      ;; Integer (fixnum or bignum — both route through %print-integer-in-base)
+      ((or (fixnump obj) (bignump obj))
        (when pradix (%print-radix-prefix pbase stream))
        (%print-integer-in-base obj pbase stream)
        ;; Base 10 with *print-radix* uses TRAILING dot, not a prefix.
@@ -332,6 +397,17 @@
        (%print-integer-in-base (ratio-numerator obj) pbase stream)
        (%print-char 47 stream)  ; /
        (%print-integer-in-base (ratio-denominator obj) pbase stream))
+      ;; Complex — 3-slot array with %complex-marker in slot 0.  Format
+      ;; as #C(REAL IMAG) per CLHS.  Detect BEFORE the generic array
+      ;; printer (which would emit #(%COMPLEX-MARKER 1 2)).
+      ((%complex-p obj)
+       (%print-char 35 stream)   ; #
+       (%print-char 67 stream)   ; C
+       (%print-char 40 stream)   ; (
+       (%write-obj (aref obj 1) stream level escape)
+       (%print-char 32 stream)   ; space
+       (%write-obj (aref obj 2) stream level escape)
+       (%print-char 41 stream))  ; )
       ;; String  (also matches fp-wrapped strings — wrapper-aware stringp
       ;; reports T for them.  Use LENGTH (fill-pointer aware) instead of
       ;; ARRAY-LENGTH so the printed form respects the fp truncation.)
@@ -427,51 +503,105 @@
        (%print-char 62 stream)))))
 
 ;;; Float printing helper
+(defun %ieee-float-decode-bits (f)
+  "Decode IEEE 754 double-precision boxed float (subtag #x60) into
+   (sign mant exp) where value = sign * mant * 2^exp, mant is a non-
+   negative integer.  Returns (list sign mant exp) — :infinity for inf,
+   :nan for NaN, :zero for ±0.0."
+  (let* ((hi (aref f 0))
+         (lo (aref f 1))
+         (hi-u32 (logand hi 4294967295))
+         (sign-bit (logand (ash hi-u32 -31) 1))
+         (exp-biased (logand (ash hi-u32 -20) 2047))
+         (mant-hi (logand hi-u32 1048575))
+         (mant (logior (ash mant-hi 32) (logand lo 4294967295)))
+         (sign (if (= sign-bit 1) -1 1)))
+    (cond
+      ((and (= exp-biased 0) (= mant 0)) (list sign 0 0))   ; ±0
+      ((= exp-biased 2047)
+       (if (= mant 0) (list sign :infinity 0) (list sign :nan 0)))
+      ((= exp-biased 0)
+       ;; subnormal: value = sign * mant * 2^(-1022-52)
+       (list sign mant (- 0 (+ 1022 52))))
+      (t
+       ;; normal: value = sign * (2^52 + mant) * 2^(exp_biased - 1023 - 52)
+       (list sign (+ (ash 1 52) mant) (- exp-biased 1075))))))
+
+(defun %ieee-to-num-den (f)
+  "Decode IEEE float F into (cons num den) where value = num/den.
+   Special values (inf/nan) collapse to (0 . 1).  Both num and den
+   are simple integers (modus bignum if needed)."
+  (let* ((decoded (%ieee-float-decode-bits f))
+         (sign (car decoded))
+         (mant (cadr decoded))
+         (e    (caddr decoded)))
+    (cond
+      ((or (eq mant :infinity) (eq mant :nan)) (cons 0 1))
+      ((= mant 0) (cons 0 1))
+      ((>= e 0) (cons (* sign mant (ash 1 e)) 1))
+      (t        (cons (* sign mant) (ash 1 (- 0 e)))))))
+
+(defun %print-fraction-digits (frac-num divisor stream)
+  "Print up to 15 significant fractional digits of FRAC-NUM/DIVISOR to STREAM,
+   with trailing zeros trimmed.  If all digits are zero, prints a single 0."
+  (if (= frac-num 0)
+      (%print-char 48 stream)
+      (let ((digits nil)
+            (rem frac-num)
+            (div divisor)
+            (count 0)
+            (max-digits 15))
+        (loop
+          (when (or (= rem 0) (= count max-digits)) (return nil))
+          (setq rem (* rem 10))
+          (setq digits (cons (truncate rem div) digits))
+          (setq rem (mod rem div))
+          (setq count (+ count 1)))
+        ;; digits is in reverse order; reverse + strip trailing zeros.
+        (let ((lst digits))   ; reversed → first elt is least significant
+          (loop
+            (when (or (null lst) (not (= (car lst) 0))) (return nil))
+            (setq lst (cdr lst)))
+          (if (null lst)
+              (%print-char 48 stream)
+              (dolist (digit (reverse lst))
+                (%print-char (+ 48 digit) stream)))))))
+
 (defun float-to-string (f)
-  "Convert boxed float to string representation."
-  ;; Float stored as array [sign*mantissa, divisor]
-  ;; where value = (sign*mantissa) / divisor
-  (let ((s (make-string-output-stream)))
-    (let ((smant (aref f 0))
-          (divisor (aref f 1)))
-      ;; Handle sign
-      (let ((neg (< smant 0))
-            (mant (abs smant)))
-        (when neg (%print-char 45 s))  ; -
-        ;; Compute integer and fractional parts
-        (let ((int-part (truncate mant divisor))
-              (frac-num (mod mant divisor)))
-          (%print-decimal-to-stream int-part s)
-          (%print-char 46 s)  ; .
-          ;; Print fractional digits
-          (if (= frac-num 0)
-              (%print-char 48 s)  ; 0
-              ;; Print significant digits of fraction
-              (let ((digits nil)
-                    (rem frac-num)
-                    (div divisor)
-                    (max-digits 15))
-                (let ((count 0))
-                  (loop
-                    (when (or (= rem 0) (= count max-digits)) (return nil))
-                    (setq rem (* rem 10))
-                    (setq digits (cons (truncate rem div) digits))
-                    (setq rem (mod rem div))
-                    (setq count (+ count 1))))
-                ;; Remove trailing zeros
-                (let ((d (nreverse digits)))
-                  (let ((trimmed nil) (trailing-zero t))
-                    ;; Find last non-zero digit
-                    (let ((lst (nreverse d)))
-                      (loop
-                        (when (or (null lst) (not (= (car lst) 0)))
-                          (return nil))
-                        (setq lst (cdr lst)))
-                      (setq trimmed (nreverse lst)))
-                    (if (null trimmed)
-                        (%print-char 48 s)  ; 0
-                        (dolist (digit trimmed)
-                          (%print-char (+ 48 digit) s))))))))))
+  "Convert boxed float to printed decimal representation.
+   Handles both IEEE-bit subtag #x60 floats (produced by reader,
+   %float-from-int, SSE2 :fadd/etc.) and legacy 2-slot rational-form
+   floats (subtag #x32 with [signed-mantissa, divisor] slots).  Result
+   is rendered as N.D where the integer part is always present and a
+   single trailing 0 is printed when the fractional part is exactly 0."
+  (let ((s (make-string-output-stream))
+        (subtag (obj-subtag f)))
+    (cond
+      ((= subtag 96)
+       ;; Real IEEE #x60: decode bits, route through (num,den) decimal.
+       (let* ((nd (%ieee-to-num-den f))
+              (signed (car nd))
+              (den    (cdr nd))
+              (neg    (< signed 0))
+              (num    (if neg (- 0 signed) signed)))
+         (when neg (%print-char 45 s))
+         (let ((int-part (if (= den 0) 0 (truncate num den)))
+               (frac-num (if (= den 0) 0 (mod num den))))
+           (%print-decimal-to-stream int-part s)
+           (%print-char 46 s)   ; .
+           (%print-fraction-digits frac-num den s))))
+      (t
+       ;; Legacy [signed-mant, divisor] rational-form (subtag #x32).
+       (let* ((smant (aref f 0))
+              (divisor (aref f 1))
+              (neg (< smant 0))
+              (mant (if neg (- 0 smant) smant)))
+         (when neg (%print-char 45 s))
+         (let ((int-part (truncate mant divisor))
+               (frac-num (mod mant divisor)))
+           (%print-decimal-to-stream int-part s)
+           (%print-char 46 s)
+           (%print-fraction-digits frac-num divisor s)))))
     (get-output-stream-string s)))
 
 (defun %print-float-to-stream (f stream escape)
@@ -917,20 +1047,24 @@
        (%write-obj n stream nil nil)))
     (t
      (let ((s (make-string-output-stream)))
-       ;; 1. Sign
+       ;; 1. Sign — works on bignum because numeric-value-less-p +
+       ;; generic-subtract are bignum-aware.
        (cond
          ((< n 0) (%print-char 45 s) (setq n (- 0 n)))
          (atp     (%print-char 43 s)))
-       ;; 2. Digits (no commas yet) — collect into a list to count length
+       ;; 2. Digits — use %bignum-divmod-fixnum so bignum operands work
+       ;; (raw :mod / :div IR is fixnum-only).
        (let ((digits nil))
          (cond
-           ((= n 0) (setq digits (cons 48 nil)))
+           ((and (not (bignump n)) (= n 0)) (setq digits (cons 48 nil)))
            (t
             (let ((tmp n))
               (loop
-                (when (= tmp 0) (return nil))
-                (setq digits (cons (%digit-char-upper (mod tmp base)) digits))
-                (setq tmp (truncate tmp base))))))
+                (when (and (not (bignump tmp)) (= tmp 0)) (return nil))
+                (let* ((qr (%bignum-divmod-fixnum tmp base))
+                       (q  (car qr)) (r (cdr qr)))
+                  (setq digits (cons (%digit-char-upper r) digits))
+                  (setq tmp q))))))
          ;; 3. With colonp, walk digit list emitting commachar at intervals
          (cond
            (colonp
@@ -1156,8 +1290,10 @@
 (defun %format-iter-of-lists (stream body lst max-iter &optional force-once)
   "Iterate BODY over LST where each element of LST is itself a list of args
    passed to BODY. The ~:{...~} case. Stops when LST exhausted, MAX-ITER
-   reached, or ~^ fires. Binds *format-outer-rest* so ~:^ inside the body
-   can check the outer iteration state (CLHS 22.3.9.2)."
+   reached, or ~:^ fires. Plain ~^ (escape = T) only ends the current
+   sub-iteration; ~:^ (escape = :outer) ends the outer iteration.
+   Binds *format-outer-rest* so ~:^ inside the body can check the outer
+   iteration state (CLHS 22.3.9.2)."
   (let ((count 0))
     (declare (special *format-iter-escape* *format-outer-rest*))
     (when (and force-once (null lst) (or (< max-iter 0) (> max-iter 0)))
@@ -1165,13 +1301,17 @@
         (declare (special *format-outer-rest*))
         (%format-impl stream body nil)))
     (loop
-      (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+      (when (eq *format-iter-escape* :outer)
+        (setq *format-iter-escape* nil) (return nil))
+      (when *format-iter-escape* (setq *format-iter-escape* nil))
       (when (null lst) (return nil))
       (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
       (let ((*format-outer-rest* (cdr lst)))
         (declare (special *format-outer-rest*))
         (%format-impl stream body (car lst)))
-      (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
+      (when (eq *format-iter-escape* :outer)
+        (setq *format-iter-escape* nil) (return nil))
+      (when *format-iter-escape* (setq *format-iter-escape* nil))
       (setq lst (cdr lst))
       (setq count (+ count 1)))))
 
@@ -1186,14 +1326,17 @@
         (declare (special *format-outer-rest*))
         (%format-impl stream body nil)))
     (loop
-      (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
+      (when (eq *format-iter-escape* :outer)
+        (setq *format-iter-escape* nil) (return arg-list))
+      (when *format-iter-escape* (setq *format-iter-escape* nil))
       (when (null arg-list) (return arg-list))
       (when (and (>= max-iter 0) (>= count max-iter)) (return arg-list))
       (let ((*format-outer-rest* (cdr arg-list)))
         (declare (special *format-outer-rest*))
         (%format-impl stream body (car arg-list)))
-      (when *format-iter-escape* (setq *format-iter-escape* nil)
-            (return (cdr arg-list)))
+      (when (eq *format-iter-escape* :outer)
+        (setq *format-iter-escape* nil) (return (cdr arg-list)))
+      (when *format-iter-escape* (setq *format-iter-escape* nil))
       (setq arg-list (cdr arg-list))
       (setq count (+ count 1)))))
 
@@ -1253,18 +1396,22 @@
     (declare (special *format-iter-escape* *format-outer-rest*))
     (cond
       ((and colonp atp)
+       ;; ~:@{...~} (empty-body, fn version): each remaining arg is a
+       ;; sublist; pass its elements as MULTIPLE args to fn via apply.
        (loop
          (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
          (when (null arg-list) (return nil))
          (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
          (let ((*format-outer-rest* (cdr arg-list)))
            (declare (special *format-outer-rest*))
-           (funcall fn stream (car arg-list)))
+           (apply fn stream (car arg-list)))
          (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
          (setq arg-list (cdr arg-list))
          (setq count (+ count 1)))
        (cons new-i arg-list))
       (colonp
+       ;; ~:{...~} (empty-body, fn version): each element of (car arg-list)
+       ;; is a sublist; pass its elements as MULTIPLE args to fn via apply.
        (let ((lst (car arg-list))
              (rest-args (cdr arg-list)))
          (loop
@@ -1273,7 +1420,7 @@
            (when (and (>= max-iter 0) (>= count max-iter)) (return nil))
            (let ((*format-outer-rest* (cdr lst)))
              (declare (special *format-outer-rest*))
-             (funcall fn stream (car lst)))
+             (apply fn stream (car lst)))
            (when *format-iter-escape* (setq *format-iter-escape* nil) (return nil))
            (setq lst (cdr lst))
            (setq count (+ count 1)))
@@ -1523,16 +1670,14 @@
                        (when (= j count) (return nil))
                        (%print-char 10 stream)
                        (setq j (+ j 1)))))
-                  ;; ~& — fresh-line
+                  ;; ~& — fresh-line.  ~N& prints N newlines (N=0 prints none).
+                  ;; Without a prefix param, defaults to 1.
                   ((= dir 38)
-                   (let ((count (if param1 param1 1)))
-                     (when (> count 0)
-                       (%print-char 10 stream))
-                     (let ((j 1))
-                       (loop
-                         (when (= j count) (return nil))
-                         (%print-char 10 stream)
-                         (setq j (+ j 1))))))
+                   (let ((count (if param1 param1 1)) (j 0))
+                     (loop
+                       (when (>= j count) (return nil))
+                       (%print-char 10 stream)
+                       (setq j (+ j 1)))))
                   ;; ~~ — tilde
                   ((= dir 126)
                    (let ((count (if param1 param1 1)) (j 0))
@@ -1550,6 +1695,19 @@
                   ;; ~T — tabulate
                   ((or (= dir 84) (= dir 116))
                    (%fmt-tabulate param1 param2 stream))
+                  ;; ~? — recursive format.  CLHS 22.3.7.1.
+                  ;; ~?      : next arg is control string, arg after is arg-list (a list)
+                  ;; ~@?     : next arg is control string, use remaining args directly
+                  ((= dir 63)
+                   (let ((ctrl (car arg-list)))
+                     (setq arg-list (cdr arg-list))
+                     (cond
+                       (atp
+                        (setq arg-list (%format-impl stream ctrl arg-list)))
+                       (t
+                        (let ((sub-args (car arg-list)))
+                          (setq arg-list (cdr arg-list))
+                          (%format-impl stream ctrl sub-args))))))
                   ;; ~* — goto
                   ((= dir 42)
                    (cond
@@ -1725,9 +1883,16 @@
                                            (return nil))
                                           (t (setq pos2 (+ p 1)))))
                                        ((and (= nc 59) (= depth 1))  ; ~; or ~:;
-                                        (when saw-colon
-                                          (setq default-idx (length sections)))
+                                        ;; Push the section preceding ~; first;
+                                        ;; default-idx then points to the NEXT
+                                        ;; section (the one after ~:;), which
+                                        ;; is the default clause.
                                         (setq sections (cons (%substring control start pos2) sections))
+                                        (when saw-colon
+                                          ;; sections accumulates in reverse; after
+                                          ;; final nreverse, the next pushed section
+                                          ;; will occupy position (length sections).
+                                          (setq default-idx (length sections)))
                                         (setq pos2 (+ p 1))
                                         (setq start pos2))
                                        (t (setq pos2 (+ p 1)))))))))
@@ -1748,12 +1913,16 @@
                             (if (not val)
                                 (when sections (%format-impl stream (car sections) arg-list))
                                 (when (cdr sections) (%format-impl stream (cadr sections) arg-list)))))
-                         ;; ~[: numeric selection. If idx is out of range
-                         ;; AND the format had a ~:; default-section marker,
-                         ;; use that section. Otherwise emit nothing.
+                         ;; ~[: numeric selection.  If a prefix parameter
+                         ;; was given (~N[), use N directly without consuming
+                         ;; an arg.  Otherwise consume the next arg.  If
+                         ;; idx out of range and a ~:; default exists, use it.
                          (t
-                          (let ((idx (car arg-list)))
-                            (setq arg-list (cdr arg-list))
+                          (let ((idx (if (integerp param1)
+                                         param1
+                                         (let ((v (car arg-list)))
+                                           (setq arg-list (cdr arg-list))
+                                           v))))
                             (cond
                               ((and (integerp idx) (>= idx 0) (< idx (length sections)))
                                (let ((selected (nth idx sections)))
@@ -1782,23 +1951,32 @@
                   ;; iteration the flag still gets cleared next time.
                   ((= dir 94)
                    (declare (special *format-iter-escape* *format-outer-rest*))
-                   (let ((should-escape
-                          (cond
-                            (param3
-                             (and (integerp param1) (integerp param2) (integerp param3)
-                                  (<= param1 param2) (<= param2 param3)))
-                            (param2
-                             (and (integerp param1) (integerp param2)
-                                  (= param1 param2)))
-                            (param1
-                             (and (integerp param1) (= param1 0)))
-                            ;; ~:^ — escape if outer iteration list exhausted.
-                            ;; CLHS 22.3.9.2: ~:^ checks the list passed to ~:{,
-                            ;; not the inner sublist passed to the body.
-                            (colonp (null *format-outer-rest*))
-                            (t (null arg-list)))))
+                   (let* ((p1 (cond ((characterp param1) (char-code param1))
+                                    (t param1)))
+                          (p2 (cond ((characterp param2) (char-code param2))
+                                    (t param2)))
+                          (p3 (cond ((characterp param3) (char-code param3))
+                                    (t param3)))
+                          (should-escape
+                           (cond
+                             (p3
+                              (and (integerp p1) (integerp p2) (integerp p3)
+                                   (<= p1 p2) (<= p2 p3)))
+                             (p2
+                              (and (integerp p1) (integerp p2)
+                                   (= p1 p2)))
+                             (p1
+                              (and (integerp p1) (= p1 0)))
+                             ;; ~:^ — escape if outer iteration list exhausted.
+                             ;; CLHS 22.3.9.2: ~:^ checks the list passed to ~:{,
+                             ;; not the inner sublist passed to the body.
+                             (colonp (null *format-outer-rest*))
+                             (t (null arg-list)))))
                      (when should-escape
-                       (setq *format-iter-escape* t)
+                       ;; Distinguish ~^ (end current sub-iteration) from
+                       ;; ~:^ (end outer iteration entirely) so ~:{~A~^~A~A~}
+                       ;; correctly resumes after each sublist's ~^.
+                       (setq *format-iter-escape* (if colonp :outer t))
                        (return arg-list))))
                   ;; ~_ — conditional newline (pprint, ignore)
                   ((= dir 95) nil)

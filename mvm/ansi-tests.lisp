@@ -2397,6 +2397,20 @@
   ;; expt with negative power → ratio
   (handler-case (deftest 5603 (numerator (expt 2 -1)) 1) (t (c) (%record-test-fail-or-emit 5603)))
   (handler-case (deftest 5604 (denominator (expt 2 -1)) 2) (t (c) (%record-test-fail-or-emit 5604)))
+  ;; --- bignum from expt + print ---
+  ;; 10^20 = 100000000000000000000 (21 digits, > 2^62 fixnum range)
+  (handler-case (deftest 5605 (bignump (expt 10 20)) t)
+    (t (c) (%record-test-fail-or-emit 5605)))
+  (handler-case (deftest 5606 (write-to-string (expt 10 20)) "100000000000000000000")
+    (t (c) (%record-test-fail-or-emit 5606)))
+  ;; %bignum-divmod-fixnum sanity
+  (handler-case (deftest 5607 (car (%bignum-divmod-fixnum 100 10)) 10)
+    (t (c) (%record-test-fail-or-emit 5607)))
+  (handler-case (deftest 5608 (cdr (%bignum-divmod-fixnum 100 10)) 0)
+    (t (c) (%record-test-fail-or-emit 5608)))
+  ;; --- float reader/printer round-trip ---
+  (handler-case (deftest 5609 (floatp (read-from-string "1.5")) t)
+    (t (c) (%record-test-fail-or-emit 5609)))
 
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case

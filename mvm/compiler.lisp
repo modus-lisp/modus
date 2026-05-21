@@ -92,6 +92,7 @@
 (defvar *constant-table* nil
   "List of constants needing allocation in the image")
 
+
 (defvar *current-function-name* nil
   "Name of the function currently being compiled")
 
@@ -1531,15 +1532,27 @@
       (declare (ignore form))
       nil))
 
-  ;; MULTIPLE-VALUE-SETQ — (multiple-value-setq (v1 v2) form)
+  ;; MULTIPLE-VALUE-SETQ — (multiple-value-setq (v1 v2 ...) form)
+  ;; CLHS: assigns each var to the corresponding value of FORM; missing
+  ;; values become NIL; returns the primary value.  multiple-value-bind
+  ;; only creates new local bindings — those don't propagate the SET, so
+  ;; build a multiple-value-list and SETQ each var from it.
   (mvm-define-macro "MULTIPLE-VALUE-SETQ"
     (lambda (form)
       (let ((vars (cadr form))
             (val-form (caddr form))
             (tmp (gensym "MVS")))
-        (if (= (length vars) 1)
-            `(setq ,(car vars) ,val-form)
-            `(multiple-value-bind ,vars ,val-form ,(car vars))))))
+        (cond
+          ((null vars) val-form)
+          ((null (cdr vars)) `(setq ,(car vars) ,val-form))
+          (t
+           (let ((setqs nil) (i 0))
+             (dolist (v vars)
+               (push `(setq ,v (nth ,i ,tmp)) setqs)
+               (incf i))
+             `(let ((,tmp (multiple-value-list ,val-form)))
+                ,@(nreverse setqs)
+                (car ,tmp))))))))
 
   ;; MAPHASH — inline when called with #'(lambda ...) to avoid closure mutation issues.
   ;; For non-lambda calls, expand to call %maphash-impl (the function version).
@@ -1914,7 +1927,19 @@
          (if specials
              (compile-let-with-specials (cadr form) (cddr form) specials env dest t)
              (compile-let* (cadr form) (cddr form) env dest))))
-      ((= op-name 565254038635891948)     (compile-setq (cadr form) (caddr form) env dest))
+      ((= op-name 565254038635891948)
+       ;; CLHS 5.1.2.5: (setq var1 val1 var2 val2 ...) — multiple pairs allowed.
+       ;; Compile all but the LAST pair with dest=ignored; LAST pair uses dest.
+       (let ((pairs (cdr form)))
+         (cond
+           ((null pairs) (compile-nil dest))
+           ((null (cddr pairs)) (compile-setq (car pairs) (cadr pairs) env dest))
+           (t
+            (let ((cur pairs))
+              (loop (when (null (cdddr cur)) (return))
+                (compile-setq (car cur) (cadr cur) env dest)
+                (setq cur (cddr cur)))
+              (compile-setq (car cur) (cadr cur) env dest))))))
       ((= op-name 527981956251550024)   (compile-lambda (cadr form) (cddr form) env dest))
       ((= op-name 89559098115627243)     (compile-when (cdr form) env dest))
       ((= op-name 123360604517422061)   (compile-unless (cdr form) env dest))
@@ -2433,6 +2458,8 @@
       ;; is known not to be a wrapper.
       ((= op-name (compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
+      ((= op-name (compute-name-hash "%PRIM-ARRAYP"))
+       (compile-prim-arrayp (cadr form) env dest))
       ((= op-name (compute-name-hash "%PRIM-ASET"))
        (compile-prim-aset (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name (compute-name-hash "%PRIM-ARRAY-LENGTH"))
@@ -3299,13 +3326,9 @@
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
-  ;; Cells are LOCAL let bindings (was: global %CELL-V).  Local cells let
-  ;; the existing closure-env-list machinery capture them per-closure, so
-  ;; two invocations of (defun outer () (let ((c 0)) (lambda () (incf c))))
-  ;; get fresh independent cells.  The old global-cell scheme tied every
-  ;; closure built from the same source to one shared cons, which broke
-  ;; (mapcar (lambda (x) (push x acc)) items) and side-effecting :test
-  ;; closures across the count/find/substitute family.
+  ;; (LET inits are evaluated in the OUTER env, so they can't see other
+  ;; let vars — only body needs scanning here.  LET* differs and scans
+  ;; both inits and body.)
   (let* ((body-stripped (strip-declares body))
          (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
          (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
@@ -3396,14 +3419,16 @@
 (defun compile-let* (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
-  ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
+  ;; Cell-boxing: detect variables that are mutated inside lambdas in
+  ;; body OR in later binding inits (a let* init can reference earlier
+  ;; bindings, including via captured lambdas that mutate them).
   ;; Cells are LOCAL let* bindings — see compile-let for the rationale.
-  ;; In let* order, the cell binding for V replaces V's binding in place,
-  ;; so that subsequent let* inits that read V see (car %CELL-V) via the
-  ;; rewriter's lookup.
   (let* ((body-stripped (strip-declares body))
          (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
-         (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
+         (init-forms (loop for b in bindings
+                           when (consp b) collect (cadr b)))
+         (boxed-vars (vars-mutated-in-lambdas
+                      (append init-forms body-stripped) let-vars)))
     (when boxed-vars
       ;; Walk the bindings in order, replacing each boxed V's slot with
       ;; %CELL-V → (cons init nil).  Subsequent inits' references to V
@@ -5797,13 +5822,16 @@
          (free-temp-reg))))))
 
 (defun compile-sub (args env dest)
-  "Compile (- args...).  Unary :neg inline, pairwise via emit-arith-pair
+  "Compile (- args...).  Unary `(- x)` lowers to `(- 0 x)` so bignum/ratio/
+   float operands take the GENERIC-SUBTRACT path instead of the raw :neg
+   IR that would corrupt non-fixnum pointers.  Pairwise via emit-arith-pair
    with GENERIC-SUBTRACT slow path."
   (cond
     ((null args) (compile-integer 0 dest))
     ((null (cdr args))
-     (compile-form (car args) env dest)
-     (emit-ir :neg dest dest))
+     ;; Rewrite to binary (- 0 x) so the tag-checked slow path handles
+     ;; bignum / ratio / IEEE-float arguments correctly.
+     (compile-sub (list 0 (car args)) env dest))
     (t
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
@@ -6655,8 +6683,18 @@
 
 (defun compile-arrayp (arg env dest)
   "Compile (arrayp x) — true for any object with a string OR array
-   subtag (#x31 or #x32).  Per CLHS, ARRAY includes vectors, strings,
-   bit-vectors, and multi-dimensional arrays."
+   subtag (#x31 or #x32), OR for a multi-dim/adjustable/fp/displaced
+   wrapper cons.  Routes wrapper inputs through %wrapper-arrayp."
+  (let ((g (gensym "ARRAYP")))
+    (compile-form
+     `(let ((,g ,arg))
+        (if (consp ,g)
+            (%wrapper-arrayp ,g)
+            (%prim-arrayp ,g)))
+     env dest)))
+
+(defun compile-prim-arrayp (arg env dest)
+  "Inlined subtag-based arrayp — only valid for non-cons inputs."
   (let ((true-label (make-compiler-label))
         (end-label (make-compiler-label))
         (false-label (make-compiler-label))
@@ -6667,7 +6705,6 @@
     (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
-    ;; Subtag must be string (#x31) or array (#x32)
     (emit-ir :obj-subtag temp dest)
     (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
@@ -6756,36 +6793,29 @@
     (free-temp-reg)))
 
 (defun compile-characterp (arg env dest)
-  "Compile (characterp x) - true if low byte = #x05.
+  "Compile (characterp x) - true if low byte = +char-tag+ (#x05).
 
-   The MVM character encoding is `(char-code << 8) | +char-tag+` so byte 1
-   carries the low byte of the char-code (NOT a separate +imm-char+ subtype
-   field as in runtime/tags.lisp's never-used SBCL-side scheme).  That means
-   characterp can only safely look at the low BYTE — byte 1 varies with the
-   char.  Any tightening here (e.g. checking byte 1 = 0) would reject genuine
-   non-#\\Null characters.
-
-   Consequence: characterp will spuriously return T for a non-character whose
-   low byte happens to be #x05.  Raw native fn-addrs at vaddr ...???05 after
-   layout shifting hit this.  The fix lives in `functionp` (cl-eval.lisp),
-   which moves a code-range check ahead of the characterp arm so fn-addrs are
-   classified as functions before characterp gets a chance to misclassify them."
+   MVM character encoding: `(char-code << 8) | +char-tag+`.  Function
+   pointers are tagged at OR-3 (low nibble = 3, see mvm-fn-addr in
+   translate-x64.lisp) so their low byte ends in nibble {3,7,B,F} —
+   NEVER 5.  That makes the low-byte-only check unambiguous against
+   fn-addrs.  Cons (tag 1) and object (tag 9) low bytes also never
+   end in 5.  Immediate-NIL is #xDEAD0001 (low byte 0x01).
+   Conclusion: the documented \"fn-addrs at vaddr ???05 misclassify
+   as characters\" fragility class is structurally impossible — the
+   OR-3 tagging guarantees fn low-nibble ≠ 5."
   (let ((true-label (make-compiler-label))
         (end-label (make-compiler-label))
         (temp (alloc-temp-reg))
         (temp2 (alloc-temp-reg)))
     (compile-form arg env dest)
-    ;; Extract low byte
     (emit-ir :li temp #xFF)
     (emit-ir :and dest dest temp)
-    ;; Compare to char tag
     (emit-ir :li temp2 +char-tag+)
     (emit-ir :cmp dest temp2)
     (emit-ir :beq true-label)
-    ;; Not character
     (compile-nil dest)
     (emit-ir :br end-label)
-    ;; Is character
     (emit-ir-label true-label)
     (compile-t dest)
     (emit-ir-label end-label)
@@ -8015,36 +8045,14 @@
       (free-temp-reg)))) ; nargs-reg
 
 (defun emit-optional-prologue (opt-start opt-count)
-  "Emit IR that NIL-initializes &optional slots the caller didn't supply.
-
-   After preprocess-params, slots [opt-start .. opt-start+opt-count-1]
-   hold &optional params.  But the function-entry prologue already
-   stored the incoming arg registers (V0..V3) into those slots
-   unconditionally — so a slot the caller didn't pass for now contains
-   stale outgoing-arg register data.  This function emits, for each
-   optional slot i, code equivalent to:
-       if nargs <= i then slot[i] := NIL
-
-   This makes the existing default-init thunks (which check
-   `(when (null OPT) (setq OPT default))') see NIL when the caller
-   didn't supply the value.
-
-   Caller convention: compile-funcall always writes actual nargs.
-   compile-call writes actual nargs for non-rest direct calls (and pads
-   the args with NIL for missing optionals), and writes the 255 sentinel
-   when it pre-packed the &rest list.  In the sentinel case the caller
-   supplied only required-args + packed-rest-list, so ALL optional slots
-   are unsupplied and we NIL-init them unconditionally."
+  "Emit IR that NIL-initializes &optional slots the caller didn't supply."
   (when (and opt-start opt-count (> opt-count 0))
     (let ((nargs-reg     (alloc-temp-reg))
           (cmp-reg       (alloc-temp-reg))
           (skip-all      (make-compiler-label))
           (after-sentinel (make-compiler-label))
           (sentinel-tag  (ash 255 +fixnum-shift+)))
-      ;; Read nargs (already tagged by :get-nargs translator).
       (emit-ir :get-nargs nargs-reg)
-      ;; Sentinel check: if nargs == 255 the caller pre-packed for &rest
-      ;; and did NOT pad optional slots — NIL-init them all.
       (emit-ir :li cmp-reg sentinel-tag)
       (emit-ir :cmp nargs-reg cmp-reg)
       (emit-ir :bne after-sentinel)
@@ -8053,24 +8061,18 @@
             do (emit-ir :stack-store +vreg-vn+ i))
       (emit-ir :br skip-all)
       (emit-ir-label after-sentinel)
-      ;; Non-sentinel path: per-slot conditional NIL-init.  We only
-      ;; handle slots within +max-reg-args+ — beyond that the caller
-      ;; pushed args directly onto our stack frame and we have no way
-      ;; to "untouch" them.
       (loop for i from opt-start
             below (min (+ opt-start opt-count) +max-reg-args+)
             do
             (let ((skip-slot (make-compiler-label)))
-              ;; If nargs >= i+1 then the slot was supplied — skip NIL-init.
               (emit-ir :li cmp-reg (ash (+ i 1) +fixnum-shift+))
               (emit-ir :cmp nargs-reg cmp-reg)
               (emit-ir :bge skip-slot)
-              ;; nargs < i+1 — slot i was not supplied.  Write NIL.
               (emit-ir :stack-store +vreg-vn+ i)
               (emit-ir-label skip-slot)))
       (emit-ir-label skip-all)
-      (free-temp-reg)   ; cmp-reg
-      (free-temp-reg)))) ; nargs-reg
+      (free-temp-reg)
+      (free-temp-reg))))
 
 (defun mvm-compile-function-internal (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR. Returns function-info.

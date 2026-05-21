@@ -186,6 +186,35 @@
           (copy-tree (cdr tree)))
     tree))
 
+(defun %seq-subst-check-kwargs (args)
+  "Validate keyword args for SUBSTITUTE/NSUBSTITUTE/SUBSTITUTE-IF/etc.
+   Allows :test :test-not :key :start :end :from-end :count
+   :allow-other-keys.  Signals program-error on bad input."
+  (let ((aok nil) (aok-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (%signal-program-error))
+      (let ((k (car cur)))
+        (when (and (eq k :allow-other-keys) (not aok-set))
+          (setq aok (cadr cur)) (setq aok-set t)))
+      (setq cur (cddr cur)))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (cond
+            ((eq k :test))
+            ((eq k :test-not))
+            ((eq k :key))
+            ((eq k :start))
+            ((eq k :end))
+            ((eq k :from-end))
+            ((eq k :count))
+            ((eq k :allow-other-keys))
+            (aok)
+            (t (%signal-program-error))))
+        (setq cur (cddr cur))))))
+
 (defun %subst-check-kwargs (args)
   "Validate keyword args for SUBST/SUBST-IF/etc.  Allows :test :test-not
    :key :allow-other-keys.  Signals program-error on bad input.
@@ -2874,6 +2903,15 @@
       (aset a i (car cur))
       (setq cur (cdr cur))
       (setq i (+ i 1)))))
+
+(defun %make-array-fill-any (n contents)
+  "Allocate a fresh general array of size N filled from CONTENTS, which
+   may be either a list or a vector.  Dispatches at runtime so the build
+   doesn't have to guess the shape of an arbitrary initial-contents form."
+  (cond
+    ((null contents) (make-array n))
+    ((consp contents) (%make-array-fill-list n contents))
+    (t (%make-array-fill-vec n contents))))
 
 (defun %make-array-fill-vec (n vec)
   "Allocate a fresh general array of size N and fill from vector VEC.

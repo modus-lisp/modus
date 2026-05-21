@@ -435,6 +435,14 @@
     ((eq sup 'fixnum) (eq sub 'bit))
     ((eq sup 'float) (or (eq sub 'single-float) (eq sub 'double-float)
                          (eq sub 'short-float) (eq sub 'long-float)))
+    ;; CLHS 12.1.4.4: an implementation that lacks any of the float types
+    ;; must consider them equivalent in the sense of SUBTYPEP.  Modus has
+    ;; one IEEE double-precision representation behind all four names, so
+    ;; (SUBTYPEP 'SHORT-FLOAT 'SINGLE-FLOAT) etc. all return T.
+    ((or (eq sup 'single-float) (eq sup 'double-float)
+         (eq sup 'short-float) (eq sup 'long-float))
+     (or (eq sub 'single-float) (eq sub 'double-float)
+         (eq sub 'short-float) (eq sub 'long-float)))
     (t nil)))
 
 (defun %sub-default-low (head)
@@ -614,11 +622,25 @@
 
 (defun %has-supertype-p (sub sup depth)
   "Walk supertype chain: is SUP transitively a supertype of SUB?
-   Bounded depth to prevent any cycle silliness."
+   Bounded depth to prevent any cycle silliness.
+
+   Float-name equivalence (CLHS 12.1.4.4): an implementation that lacks
+   a particular float type must consider it equivalent to another.
+   Modus stores all floats as one IEEE 64-bit type, so SHORT/SINGLE/
+   DOUBLE/LONG-FLOAT are mutually interchangeable in the SUBTYPEP sense.
+   Without this, tests gated on (SUBTYPEP 'SHORT-FLOAT 'SINGLE-FLOAT)
+   would proceed into code that expects an actual distinction and fail."
   (cond
     ((<= depth 0) nil)
     ((eq sub sup) t)
     ((eq sup 't) t)
+    ;; Float-name equivalence — short/single/double/long are all the same
+    ;; underlying type in modus.
+    ((and (or (eq sub 'short-float) (eq sub 'single-float)
+              (eq sub 'double-float) (eq sub 'long-float))
+          (or (eq sup 'short-float) (eq sup 'single-float)
+              (eq sup 'double-float) (eq sup 'long-float)))
+     t)
     (t
      (let ((parents (%type-direct-supers sub))
            (found nil))
@@ -1300,6 +1322,11 @@
 
 (defun generic-add (a b)
   (cond
+    ;; Bignum operands route through bignum-add (overflow-safe).
+    ;; Test bignum FIRST so a bignum-integer mix doesn't fall into the
+    ;; (integerp a) (integerp b) → %fixnum-+ trap (which would add raw
+    ;; pointer bits).
+    ((or (bignump a) (bignump b)) (bignum-add a b))
     ((and (integerp a) (integerp b)) (%fixnum-+ a b))
     ((and (integerp a) (ratiop b))
      (%make-rat (%fixnum-+ (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
@@ -1319,6 +1346,11 @@
 
 (defun generic-multiply (a b)
   (cond
+    ;; Bignum-aware: route integer/bignum products through bignum-mul so
+    ;; (* 10^10 10^10) → 10^20 bignum rather than silent fixnum wraparound.
+    ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b))
+          (or (bignump a) (bignump b)))
+     (bignum-mul a b))
     ((and (integerp a) (integerp b)) (%fixnum-* a b))
     ((and (integerp a) (ratiop b))
      (%make-rat (%fixnum-* a (aref b 0)) (aref b 1)))
@@ -1335,6 +1367,8 @@
 
 (defun generic-subtract (a b)
   (cond
+    ;; Bignum-aware: bignum-sub handles fixnum/bignum mix.
+    ((or (bignump a) (bignump b)) (bignum-sub a b))
     ((and (integerp a) (integerp b)) (%fixnum-- a b))
     ((and (integerp a) (ratiop b))
      (%make-rat (%fixnum-- (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
@@ -1440,7 +1474,14 @@
     (return-from numeric-value-less-p
       (numeric-value-less-p (%coerce-numeric a) (%coerce-numeric b))))
   (cond
-    ;; Both integers
+    ;; Bignum operands: use bignum-cmp which compares hi/lo correctly.
+    ;; Must precede (integerp/integerp) → (< a b) because that branch
+    ;; would recurse infinitely on bignum operands (compile-compare's
+    ;; slow path calls numeric-value-less-p which would dispatch back).
+    ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b))
+          (or (bignump a) (bignump b)))
+     (= (bignum-cmp a b) -1))
+    ;; Both fixnums (integerp w/o bignum) — fast path.
     ((and (integerp a) (integerp b)) (< a b))
     ;; a is float
     ((floatp-impl a)
@@ -1511,6 +1552,10 @@
     (return-from numeric-equal-p
       (numeric-equal-p (%coerce-numeric a) (%coerce-numeric b))))
   (cond
+    ;; Bignum-aware equality: bignum-cmp returns 0 on equal.
+    ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b))
+          (or (bignump a) (bignump b)))
+     (= (bignum-cmp a b) 0))
     ((and (integerp a) (integerp b)) (= a b))
     ((and (floatp-impl a) (floatp-impl b)) (float-equal a b))
     ((and (ratiop a) (ratiop b))

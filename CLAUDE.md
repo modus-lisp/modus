@@ -331,7 +331,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 3. **Symbol identity**: `%intern-symbol` sometimes creates duplicate objects for the same name-hash. Two symbols with identical hashes may be `eql` but not `eq`. Use `equal` for symbol comparison in critical paths.
 4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-6. **Funcall tag collision**: Function addresses ending in `0x1` get misidentified as cons pointers by the closure-aware funcall dispatch. The translator NOP-aligns functions to avoid this. If adding boot code that changes the code offset, update `*x64-native-code-offset*` in the build script.
+6. **Funcall tag — RESOLVED via OR-3**: Function pointers are explicitly tagged in `mvm-fn-addr` (translate-x64.lisp ~line 2794): `LEA + OR-3`.  Raw fn-code is NOP-padded so the low nibble is 0; OR-3 yields tagged fn pointers with low nibble `0x3` always.  Tags `cons=0x1`, `fn=0x3`, `char=0x5`, `obj=0x9` are mutually disjoint in the low nibble, so the historic "funcall-tag-collision" / "fn-addrs at vaddr ???05" classes are STRUCTURALLY impossible.  When bytecode shifts move function addresses, the OR-3 still produces a clean tag — predicate flips don't happen via tag-nibble accident.  Layout-shift cascades that appear during code changes have a different cause (TBD; likely branch-displacement limits, GC root-scan edges, or static-data alignment).
 7. **defvar init-thunks not run**: `(defvar *foo* 42)` declares `*foo*` but does NOT set it to 42 at boot — `init-all-globals` is skipped. Defvars default to NIL. Initialize required values explicitly via setq in an init function (e.g. `*pkg-tag*`, `*sym-tag*` set in `%init-packages`). Predicates that compare against an uninitialized tag with `(eql (car x) *tag*)` will return T for *any* cons-with-NIL-car — see `%pkg-p` history.
 
 ## Known Bugs
@@ -385,10 +385,13 @@ docstrings, so every `(defun name (...) "doc" body)` emitted ~14 bytes of
 x86 per character of docstring as an allocate-and-discard string in the
 function prologue (movabs + obj-set per char, plus alloc-obj for the
 header).  STRING-EQUAL with a 280-char docstring grew the function from
-1.8KB to 7KB of native code, and the 5KB downstream shift tipped
-unrelated callers across nibble-1/9 funcall-tag-collision edges, SIGSEGV
-at boot.  Fix in `mvm/compiler.lisp` `strip-declares` saved 1.3MB and
-+67 ANSI tests.
+1.8KB to 7KB of native code, and the 5KB downstream shift caused other
+crashes.  At the time, this was attributed to "nibble-1/9
+funcall-tag-collision edges" but that diagnosis was WRONG — fn pointers
+are now OR-3 tagged (low nibble = 3) and can't collide with cons (1) or
+object (9) tags.  The actual cascade mechanism for that incident is
+unclear; the docstring-stripping fix in `strip-declares` still saved
+1.3MB and +67 ANSI tests independent of the diagnosis.
 
 Remaining layout fragility comes from genuine string/cons literal
 allocation in user code (each char is ~14 bytes of code, each cons

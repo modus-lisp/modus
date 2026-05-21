@@ -574,7 +574,11 @@
         (loop
           (when (null cur)
             (if got-digit
-                (return-from %try-parse-integer (cons (* sign n) t))
+                (return-from %try-parse-integer
+                  (cons (if (bignump n)
+                            (if (= sign -1) (bignum-sub 0 n) n)
+                            (* sign n))
+                        t))
                 (return-from %try-parse-integer nil)))
           (let ((code (car cur)))
             (let ((digit (cond
@@ -583,10 +587,26 @@
                            ((and (>= code 97) (<= code 122)) (+ 10 (- code 97)))
                            (t nil))))
               (if (and digit (< digit base))
-                  (progn (setq n (+ (* n base) digit)) (setq got-digit t) (setq cur (cdr cur)))
+                  (progn
+                    ;; Lazy bignum promote: while n stays small, use fast
+                    ;; inline (+ (* n base) digit).  Once n exceeds the
+                    ;; safe fixnum*base threshold OR is already a bignum,
+                    ;; route through bignum-mul / bignum-add so large
+                    ;; literals (e.g. 100000000000000000000) parse to a
+                    ;; real bignum instead of silently overflowing :mul.
+                    (cond
+                      ((or (bignump n) (>= n 230584300921369395))   ; 2^61 / 20 (safe for base ≤ 20)
+                       (setq n (bignum-add (bignum-mul n base) digit)))
+                      (t
+                       (setq n (+ (* n base) digit))))
+                    (setq got-digit t) (setq cur (cdr cur)))
                   ;; Check for trailing dot (integer token like "123.")
                   (if (and (= code 46) (null (cdr cur)) got-digit)
-                      (return-from %try-parse-integer (cons (* sign n) t))
+                      (return-from %try-parse-integer
+                        (cons (if (or (bignump n) (= sign 1))
+                                  (if (= sign 1) n (bignum-sub 0 n))
+                                  (- 0 n))
+                              t))
                       (return-from %try-parse-integer nil)))))))))
 
 (defun %try-parse-float (codes)
@@ -653,41 +673,37 @@
       (%make-float sign int-part frac-part frac-div exp-sign exp-part))))
 
 (defun %make-float (sign int-part frac-part frac-div exp-sign exp-part)
-  "Create a boxed float from parsed components."
-  ;; MVM boxed float: subtag=#x60, slots [hi32, lo32] storing IEEE 754 double
-  ;; Simple implementation: compute approximation
-  ;; value = sign * (int-part + frac-part/frac-div) * 10^(exp-sign*exp-part)
-  (let ((obj (make-array 2)))
-    ;; Compute the double value step by step using integer arithmetic
-    ;; We store a simple representation: whole*1000000 + frac-millionths
-    ;; For test purposes, use a boxed object with subtag #x60
-    (let ((mantissa (+ (* int-part frac-div) frac-part))
-          (divisor frac-div)
-          (exp-val (* exp-sign exp-part)))
-      ;; Apply exponent
-      (let ((i 0))
-        (loop
-          (when (>= i exp-val) (return nil))
-          (setq mantissa (* mantissa 10))
-          (setq i (+ i 1))))
-      (let ((i 0))
-        (loop
-          (when (>= i (- 0 exp-val)) (return nil))
-          (setq divisor (* divisor 10))
-          (setq i (+ i 1))))
-      ;; Store sign, mantissa, divisor for later comparison
-      (aset obj 0 (* sign mantissa))
-      (aset obj 1 divisor))
-    ;; Tag as float (subtag #x60)
-    (%tag-as-float obj)))
+  "Create a real IEEE-bit boxed float (subtag #x60) from parsed components.
+   value = sign * (int-part + frac-part/frac-div) * 10^(exp-sign*exp-part)
+   Built via SSE2 %float-from-int + %float-div, so the result is a true
+   #x60 IEEE float that :fadd/:fmul/:fcmp can operate on natively and the
+   printer's IEEE-decoder can format."
+  (let ((mantissa (+ (* int-part frac-div) frac-part))
+        (divisor frac-div)
+        (exp-val (* exp-sign exp-part)))
+    ;; Apply decimal exponent: positive → multiply mantissa, negative → multiply divisor.
+    (let ((i 0))
+      (loop
+        (when (>= i exp-val) (return nil))
+        (setq mantissa (* mantissa 10))
+        (setq i (+ i 1))))
+    (let ((i 0))
+      (loop
+        (when (>= i (- 0 exp-val)) (return nil))
+        (setq divisor (* divisor 10))
+        (setq i (+ i 1))))
+    ;; Convert num/den → IEEE via SSE2.
+    (let ((signed-mant (* sign mantissa)))
+      (if (= divisor 1)
+          (%float-from-int signed-mant)
+          (%float-div (%float-from-int signed-mant)
+                      (%float-from-int divisor))))))
 
 (defun %tag-as-float (arr)
-  "Tag an array as a float object (subtag #x60 = 96)."
-  ;; The obj-subtag function reads the header word
-  ;; We need to set the subtag to #x60
-  ;; For our array, the header is at the raw object address
-  ;; Arrays have subtag #x32 by default; we need to change it
-  ;; Use the %set-obj-subtag primitive if available, otherwise return as-is
+  "Tag an array as a float object (subtag #x60 = 96).
+   Retained as a stub for any caller that imported the old reader path —
+   the new %make-float returns a real #x60 IEEE object directly so this
+   is effectively dead code."
   arr)
 
 (defun %interpret-token (chars all-escaped has-escape rt)
@@ -706,9 +722,9 @@
                     (let ((ratio (%try-parse-ratio cased-chars)))
                       (if ratio ratio
                           ;; It's a symbol
-                          (%interpret-symbol-token cased-chars)))))))
+                          (%interpret-symbol-token cased-chars all-escaped)))))))
         ;; Has escapes — always a symbol
-        (%interpret-symbol-token cased-chars))))
+        (%interpret-symbol-token cased-chars all-escaped))))
 
 (defun %try-parse-ratio (codes)
   "Try to parse char codes as a ratio N/D. Returns value or nil."
@@ -741,26 +757,37 @@
             (exact-divide (car num) (car den))
             nil)))))
 
-(defun %interpret-symbol-token (cased-chars)
-  "Interpret char codes as a symbol, handling package qualifiers."
+(defun %interpret-symbol-token (cased-chars &optional all-escaped)
+  "Interpret char codes as a symbol, handling package qualifiers.
+   Colons that were escaped (single-escape `\\` or inside `|...|`) are
+   treated as constituent chars, not package separators."
   (let ((name-str (%codes-to-string cased-chars)))
-    ;; Check for package qualifier
-    (let ((colon-pos nil) (double-colon nil) (i 0) (len (length name-str)))
-      ;; Find first colon
+    ;; Check for package qualifier — skip escaped colons.
+    (let ((colon-pos nil) (double-colon nil) (i 0) (len (length name-str))
+          (esc-cur all-escaped))
+      ;; Find first UNESCAPED colon
       (loop
         (when (>= i len) (return nil))
-        (when (= (aref name-str i) 58)  ; #\:
+        (when (and (= (aref name-str i) 58)
+                   (not (and esc-cur (car esc-cur))))
           (setq colon-pos i)
           (return nil))
-        (setq i (+ i 1)))
+        (setq i (+ i 1))
+        (when esc-cur (setq esc-cur (cdr esc-cur))))
       (cond
         ;; No colon — intern in *package*
         ((null colon-pos)
-         ;; Check for special tokens
-         (cond
-           ((string-equal name-str "NIL") nil)
-           ((string-equal name-str "T") t)
-           (t (intern name-str *package*))))
+         ;; Special tokens NIL/T match ONLY when token had no escapes —
+         ;; ANSI: `\T` reads as a symbol named "T" in *package*, not the
+         ;; boolean T.  Detect any escape via the all-escaped flag list.
+         (let ((any-escape nil) (ec all-escaped))
+           (loop (when (null ec) (return nil))
+             (when (car ec) (setq any-escape t) (return nil))
+             (setq ec (cdr ec)))
+           (cond
+             ((and (not any-escape) (string-equal name-str "NIL")) nil)
+             ((and (not any-escape) (string-equal name-str "T")) t)
+             (t (intern name-str *package*)))))
         ;; Leading colon — keyword
         ((= colon-pos 0)
          (let ((kw-name (%substring name-str 1 len)))

@@ -1949,9 +1949,16 @@
             nil)
         nil)))
 (defun array-wrapper-p (x)
-  "Check if x is a fill-pointer or displaced array wrapper."
+  "Check if x is a fill-pointer or displaced array wrapper.
+   Accepts wrappers around strings AND general arrays."
   (let ((y (%unadj x)))
-    (if (consp y) (if (stringp (cdr y)) t nil) nil)))
+    (if (consp y)
+        (let ((cdr-y (cdr y)))
+          (cond
+            ((stringp cdr-y) t)
+            ((%prim-arrayp cdr-y) t)
+            (t nil)))
+        nil)))
 (defun wrapper-effective-length (w)
   "Get effective length of a fill-pointer or displaced array wrapper."
   (let ((y (%unadj w)))
@@ -1997,19 +2004,32 @@
 ;; this helper is reached, so the deepest legitimate shape we need to
 ;; recognise is one cons (fp or displaced) over array/string.
 (defun %cdr-is-array-or-wrapper-p (x)
+  ;; Use %prim-arrayp internally to avoid recursion through arrayp →
+  ;; %wrapper-arrayp → here on every cons cell encountered.
   (let ((u (cdr x)))
     (cond
       ((null u) nil)
       ((%prim-stringp u) t)
-      ((arrayp u) t)
+      ((%prim-arrayp u) t)
       ((not (consp u)) nil)
       ;; one cons deep — recognise nested wrapper terminating in array/string
       (t (let ((uu (cdr u)))
            (cond
              ((null uu) nil)
              ((%prim-stringp uu) t)
-             ((arrayp uu) t)
+             ((%prim-arrayp uu) t)
              (t nil)))))))
+
+(defun %wrapper-arrayp (w)
+  "Return T if W is a wrapper around an array (multi-dim, 0-dim,
+   adjustable, fill-pointer, displaced).  Uses %prim-arrayp internally
+   to avoid recursion through arrayp."
+  (cond
+    ((eql (car w) 8765432) t)
+    ((and (eql (car w) 9867654) (consp (cdr w))) t)
+    ((and (fixnump (car w)) (%cdr-is-array-or-wrapper-p w)) t)
+    ((and (consp (car w)) (%cdr-is-array-or-wrapper-p w)) t)
+    (t nil)))
 
 (defun %wrapper-aref (w i)
   (cond

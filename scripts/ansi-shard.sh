@@ -56,7 +56,7 @@ elapsed=$(( $(date +%s) - start_time ))
 echo "# all shards done in ${elapsed}s"
 
 # Aggregate.
-awk '
+grep -ah '' "$OUTDIR"/shard-*.out | awk '
   # Custom/pre-ANSI tests (IDs < 10001) run in every shard — dedupe by ID.
   # ANSI fork-tests (IDs 10001-27708) are sharded exclusively — accumulate.
   # Symbol-named deftest init-forms run in every shard — dedupe by text.
@@ -105,4 +105,4 @@ awk '
     printf "  Custom pass/fail:   %d / %d\n", cust_p, cust_f
     printf "  Symbol pass/fail:   %d / %d   (define-condition init-forms)\n", sym_p, sym_f
   }
-' "$OUTDIR"/shard-*.out
+'

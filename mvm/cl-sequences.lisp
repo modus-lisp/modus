@@ -735,16 +735,28 @@
 (defun string= (a b &rest options)
   "ANSI STRING= — case-SENSITIVE element-wise compare.  STRING-EQUAL is
    the case-insensitive variant.  Takes string designators (strings,
-   characters, symbols)."
-  (declare (ignore options))
+   characters, symbols).  Honors :START1, :END1, :START2, :END2."
   (let ((sa (%string-designator a))
-        (sb (%string-designator b)))
-    (let ((len (array-length sa)))
-      (if (= len (array-length sb))
+        (sb (%string-designator b))
+        (s1 0) (e1 nil) (s2 0) (e2 nil)
+        (o options))
+    (loop (when (null o) (return))
+      (cond ((eq (car o) :start1) (setq s1 (cadr o)))
+            ((eq (car o) :end1)   (setq e1 (cadr o)))
+            ((eq (car o) :start2) (setq s2 (cadr o)))
+            ((eq (car o) :end2)   (setq e2 (cadr o))))
+      (setq o (cddr o)))
+    (let* ((la (array-length sa))
+           (lb (array-length sb))
+           (ee1 (or e1 la))
+           (ee2 (or e2 lb))
+           (len1 (- ee1 s1))
+           (len2 (- ee2 s2)))
+      (if (= len1 len2)
           (let ((i 0))
             (loop
-              (when (= i len) (return t))
-              (unless (= (aref sa i) (aref sb i)) (return nil))
+              (when (= i len1) (return t))
+              (unless (= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
               (setq i (+ i 1))))
           nil))))
 (defun string/= (a b) (if (string= a b) nil t))
@@ -865,16 +877,37 @@
   "Non-destructive substitute. Honors :test/:test-not/:key/:start/:end/
    :count/:from-end. Inline vector path so we don't depend on lambda
    capture of OLD across nested apply paths."
+  (%seq-subst-check-kwargs args)
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
          (start-idx (or (caddr parsed) 0))
          (end-idx (cadddr parsed))
-         (test-fn (car (cddddr parsed)))      ; index 4
-         (key-fn (caddr (cddddr parsed)))     ; index 6
+         (test-fn-raw (car (cddddr parsed)))      ; index 4
+         (test-not-fn (cadr (cddddr parsed)))     ; index 5
+         (key-fn (caddr (cddddr parsed)))         ; index 6
+         ;; If :test-not given, build a negated test-fn so the rest of
+         ;; the body just uses test-fn.
+         (test-fn (cond
+                    (test-fn-raw test-fn-raw)
+                    (test-not-fn
+                     (let ((tn test-not-fn))
+                       (lambda (a b) (not (funcall tn a b)))))
+                    (t nil)))
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) seq)
+      ;; fp/displaced/adjustable wrapper: flatten to a fresh vector of the
+      ;; effective length, then process via the vector path.  Must come
+      ;; BEFORE (consp seq) since wrappers ARE conses.
+      ((and (consp seq) (array-wrapper-p seq))
+       (let* ((len (length seq))
+              (flat (make-array len)))
+         (let ((i 0))
+           (loop (when (>= i len) (return nil))
+             (aset flat i (%wrapper-aref seq i))
+             (setq i (+ i 1))))
+         (apply #'substitute new old flat args)))
       ;; List + no positional/count kwargs → simple per-element transform.
       ;; Keep this fast path for the bulk of plain (substitute new old list)
       ;; calls so we don't do index-tracking overhead.
@@ -890,20 +923,43 @@
       ((consp seq)
        ;; List + at least one of :start/:end/:count/:from-end.
        ;; Walk to find match indices; build output replacing the right subset.
+       ;; With :FROM-END T the test fn must be called in REVERSE order (ANSI)
+       ;; because closure side-effects must observe reverse iteration.
        (let* ((items seq)
               (n (length items))
               (eff-end (if (and end-idx (< end-idx n)) end-idx n))
-              (matches nil)        ; reverse-walk order: highest idx first
-              (cur items)
-              (i 0))
-         (loop (when (or (null cur) (>= i eff-end)) (return nil))
-           (when (>= i start-idx)
-             (let* ((elt (car cur))
-                    (v (if key-fn (funcall key-fn elt) elt))
-                    (match (if test-fn (funcall test-fn old v) (eql old v))))
-               (when match (setq matches (cons i matches)))))
-           (setq cur (cdr cur))
-           (setq i (+ i 1)))
+              (matches nil))
+         (cond
+           (from-end
+            ;; Copy to array for random access, iterate idx high→low.
+            (let* ((arr (make-array n)) (cur items) (j 0))
+              (loop (when (null cur) (return nil))
+                (aset arr j (car cur))
+                (setq cur (cdr cur)) (setq j (+ j 1)))
+              (let ((k (- eff-end 1)))
+                (loop (when (< k start-idx) (return nil))
+                  (let* ((elt (aref arr k))
+                         (v (if key-fn (funcall key-fn elt) elt))
+                         (match (if test-fn (funcall test-fn old v) (eql old v))))
+                    (when match (setq matches (cons k matches))))
+                  (setq k (- k 1))))))
+           (t
+            (let ((cur items) (i 0))
+              (loop (when (or (null cur) (>= i eff-end)) (return nil))
+                (when (>= i start-idx)
+                  (let* ((elt (car cur))
+                         (v (if key-fn (funcall key-fn elt) elt))
+                         (match (if test-fn (funcall test-fn old v) (eql old v))))
+                    (when match (setq matches (cons i matches)))))
+                (setq cur (cdr cur))
+                (setq i (+ i 1))))
+            ;; Forward iter built matches in reverse (highest first). For
+            ;; from-end path we built them with closure reverse-iter; that
+            ;; ends with lowest-idx first. Normalize so subsequent logic
+            ;; gets the OLD contract (highest first).
+            ))
+         (when (and from-end matches)
+           (setq matches (nreverse matches)))
          ;; Pick the right subset given :count and :from-end.
          (let ((selected
                  (cond
@@ -977,6 +1033,7 @@
    List path inlined (no nested closure) — MVM's capture analysis
    loses bindings across the substitute-if-not → apply → substitute-if
    chain when the inner closure captures pred/key-fn."
+  (%seq-subst-check-kwargs args)
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -1069,6 +1126,7 @@
    Inlined to avoid the apply+closure pattern that MVM's capture
    analysis loses bindings across (was: (apply #'substitute-if new
    (lambda (x) (not (funcall pred x))) seq args))."
+  (%seq-subst-check-kwargs args)
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -1202,17 +1260,30 @@
   "Core list nsubstitute with start/end/count/from-end support."
   ;; count: nil=unlimited, 0=nothing, positive=limit. Already normalized by caller.
   (if from-end
-      ;; Backward: collect matching positions in [start-idx, end-idx), apply count from end
-      (let ((positions nil) (cur seq) (idx 0))
-        (loop
-          (when (null cur) (return nil))
-          (let ((in-win (%nsubst-in-window-p idx start-idx end-idx)))
-            (when in-win
-              (let ((match (funcall pred-fn (car cur))))
+      ;; Backward: collect matching positions in [start-idx, end-idx), apply count from end.
+      ;; ANSI: with :FROM-END T the PRED is called in REVERSE order, so
+      ;; closure side-effects observe reverse iteration.  Copy list to an
+      ;; array first for random access, then iterate the index downward.
+      (let* ((len (length seq))
+             (arr (make-array len))
+             (positions nil))
+        (let ((cur seq) (j 0))
+          (loop (when (null cur) (return nil))
+            (aset arr j (car cur))
+            (setq cur (cdr cur)) (setq j (+ j 1))))
+        (let ((k (- len 1)))
+          (loop (when (< k 0) (return nil))
+            (when (%nsubst-in-window-p k start-idx end-idx)
+              (let ((match (funcall pred-fn (aref arr k))))
                 (when match
-                  (setq positions (cons idx positions))))))
-          (setq idx (+ idx 1))
-          (setq cur (cdr cur)))
+                  ;; build positions in low-to-high order so the
+                  ;; "take first COUNT" step below keeps highest-indexed
+                  ;; matches, matching the old semantics.
+                  (setq positions (cons k positions)))))
+            (setq k (- k 1)))
+          ;; positions now: highest-idx-LAST (since we prepended in reverse iter)
+          ;; we need: highest-idx-FIRST (old contract)
+          (setq positions (nreverse positions)))
         ;; positions: largest index first
         ;; Take first count entries (= highest-indexed matches)
         (let ((to-replace nil) (remaining (or count (length positions))) (pos-cur positions))
@@ -1255,6 +1326,7 @@
 
 (defun nsubstitute-if (new pred seq &rest args)
   "Destructive substitute-if."
+  (%seq-subst-check-kwargs args)
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -1308,6 +1380,7 @@
   "Destructive substitute-if-not.
    Inlined list path to bypass the closure-loses-capture pattern in
    (apply #'nsubstitute-if new (lambda (x) (not (funcall pred x))) ...)."
+  (%seq-subst-check-kwargs args)
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -1370,17 +1443,37 @@
   "Destructive substitute. Inline vector path so we don't depend on a
    lambda closure capturing OLD (which can be lost across apply / nested
    funcall when the closure cell is shared with siblings)."
+  (%seq-subst-check-kwargs args)
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
          (start-idx (or (caddr parsed) 0))
          (end-idx (cadddr parsed))
-         (test-fn (car (cddddr parsed)))      ; index 4
-         (key-fn (caddr (cddddr parsed)))     ; index 6
+         (test-fn-raw (car (cddddr parsed)))
+         (test-not-fn (cadr (cddddr parsed)))
+         (key-fn (caddr (cddddr parsed)))
+         (test-fn (cond
+                    (test-fn-raw test-fn-raw)
+                    (test-not-fn
+                     (let ((tn test-not-fn))
+                       (lambda (a b) (not (funcall tn a b)))))
+                    (t nil)))
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) seq)
       ((and eff-count (= eff-count 0)) seq)
+      ;; fp/displaced/adjustable wrapper: destructive operation on the
+      ;; underlying array.  We route to the non-destructive substitute
+      ;; (which already handles wrappers) and copy the result back via
+      ;; the wrapper-aware aset.  replaced is a plain vector; use aref.
+      ((and (consp seq) (array-wrapper-p seq))
+       (let* ((replaced (apply #'substitute new old seq args))
+              (len (length seq))
+              (i 0))
+         (loop (when (>= i len) (return seq))
+           (let ((v (aref replaced i)))
+             (%wrapper-aset seq i v))
+           (setq i (+ i 1)))))
       ((consp seq)
        ;; Lists: existing list-core works fine, build a small pred
        (%nsubst-list-core
@@ -1836,6 +1929,11 @@
               ((eq (car a) :allow-other-keys) nil)
               (t (unless allow-other-keys (%signal-program-error))))
         (setq a (cddr a))))
+    ;; ANSI: :START must be a non-negative integer, :END NIL or non-negative integer.
+    (unless (and (integerp start) (>= start 0))
+      (error "fill: :START must be a non-negative integer"))
+    (unless (or (null end) (and (integerp end) (>= end 0)))
+      (error "fill: :END must be NIL or a non-negative integer"))
     (cond
       ((null seq) seq)
       ((consp seq)
@@ -2069,7 +2167,10 @@
    Per CLHS: validates &key args; signals PROGRAM-ERROR on odd plist
    or unknown keyword (with :allow-other-keys NIL/absent).  Recognised
    keywords are :initial-element and :element-type (the latter is
-   accepted but not interpreted — Modus has one string element type)."
+   accepted but not interpreted — Modus has one string element type).
+   ANSI: requires SIZE as a non-negative integer."
+  (unless (and (integerp size) (>= size 0))
+    (%signal-program-error))
   (let ((ch 32) (allow-other-keys nil) (aok-set nil))
     ;; Probe :allow-other-keys.  CLHS §3.4.1.4.1.1.2: leftmost wins.
     (let ((p args))

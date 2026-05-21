@@ -996,6 +996,14 @@
 
 (defun typep (obj type)
   "Extended typep supporting compound type specifiers and package type."
+  ;; ANSI: typep signals an error on VALUES and FUNCTION type-specifiers
+  ;; with arguments — these are valid in DECLARE/THE but not TYPEP.
+  ;; Atom 'FUNCTION is fine (= functionp).
+  (when (or (eq type 'values)
+            (and (consp type)
+                 (or (eq (car type) 'values)
+                     (eq (car type) 'function))))
+    (error "typep: this type-specifier is not legal here"))
   (cond
     ;; CLOS class object as type — extract its name and recurse.
     ((%clos-class-p type)
@@ -1173,6 +1181,12 @@
          ;; (Modus's strings are subtag #x31; general arrays #x32.)
          ((or (eq head 'vector) (eq head 'simple-vector)
               (eq head 'simple-array) (eq head 'array))
+          ;; Peel multi-dim/adjustable wrappers to inner array before testing.
+          (let ((obj (cond
+                       ((and (consp obj) (eql (car obj) 9867654)
+                             (consp (cdr obj))) (cddr obj))
+                       ((and (consp obj) (eql (car obj) 8765432)) (cdr obj))
+                       (t obj))))
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32))
                (let* ((et (and (cdr type) (cadr type)))
@@ -1203,7 +1217,7 @@
                                               (and (consp (cdr sz)) (null (cddr sz))))
                                (or (eq (car sz) '*) (eq (car sz) t)
                                    (and (integerp (car sz)) (= (car sz) (array-length obj)))))
-                          (and (integerp sz) (= sz (array-length obj))))))))
+                          (and (integerp sz) (= sz (array-length obj)))))))))
          ;; (cons car-type cdr-type) — type-check both halves.
          ((eq head 'cons)
           (and (consp obj)

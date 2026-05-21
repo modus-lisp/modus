@@ -350,9 +350,10 @@
          ((and contents (vectorp contents) (not (stringp contents)))
           `(%make-array-fill-vec ,size ',contents))
          ;; :initial-contents is any other expression (a function call
-         ;; producing an array, etc.).  Fall back to a runtime copy.
+         ;; producing a list or vector, etc.).  Dispatch at runtime
+         ;; via %make-array-fill-any.
          (contents
-          `(%make-array-fill-vec ,size ,(rewrite-make-array-initcontents contents)))
+          `(%make-array-fill-any ,size ,(rewrite-make-array-initcontents contents)))
          ;; :initial-element provided — fill all slots
          ((make-array-kwarg kwargs :initial-element)
           `(%make-array-fill-init ,size
@@ -400,6 +401,15 @@
                        (cons (quote ,dims)
                              (let ((,var (make-array ,total)))
                                ,@asets
+                               ,var)))))
+             ;; 0-dim array with scalar :initial-contents — treat as the single element
+             ((and init-contents (null dims))
+              (let* ((iv '%mda-init-val))
+                `(cons 9867654
+                       (cons (quote ,dims)
+                             (let ((,var (make-array ,total))
+                                   (,iv ,(rewrite-make-array-dims init-contents)))
+                               (aset ,var 0 ,iv)
                                ,var)))))
              ;; :initial-element provided — fill all slots.
              (init-elem
@@ -2049,6 +2059,46 @@
     (t (cons (rewrite-reader-forms (car list))
              (rewrite-reader-forms-list (cdr list))))))
 
+;; True if FORM (or any sub-tree) contains a 0-dim or N-dim array literal.
+;; Walk avoids transforming forms that have no array literals at all
+;; (so the simple '~S quoting still applies to plain values like (1 2 3)).
+(defun %md-contains-array-literal-p (form)
+  (cond
+    ((and (arrayp form) (not (stringp form))
+          (or (= (array-rank form) 0) (> (array-rank form) 1))) t)
+    ((consp form)
+     (or (%md-contains-array-literal-p (car form))
+         (%md-contains-array-literal-p (cdr form))))
+    (t nil)))
+
+;; Convert a literal 0-dim or N-dim SBCL array into a Modus
+;; runtime-construction form using the multi-dim wrapper convention
+;; (cons 9867654 (cons DIMS FLAT-ARR)). Recursively rewrites elements
+;; so nested array literals also become constructions. 1-D vectors and
+;; strings are returned unchanged — their printed form round-trips through
+;; the Modus reader as a real array/string.
+(defun %mdrewrite-array-literals (form)
+  (cond
+    ((and (arrayp form) (not (stringp form))
+          (or (= (array-rank form) 0) (> (array-rank form) 1)))
+     (let* ((dims  (array-dimensions form))
+            (total (array-total-size form))
+            (sz    (if (= total 0) 1 total))
+            (asets (loop for i below total
+                         collect
+                           (let ((v (%mdrewrite-array-literals
+                                     (row-major-aref form i))))
+                             `(aset %md-tmp ,i ',v)))))
+       `(cons 9867654
+              (cons ',dims
+                    (let ((%md-tmp (make-array ,sz)))
+                      ,@asets
+                      %md-tmp)))))
+    ((consp form)
+     (cons (%mdrewrite-array-literals (car form))
+           (%mdrewrite-array-literals (cdr form))))
+    (t form)))
+
 ;; Load real ANSI test files (if available)
 (defvar *ansi-aux-sources* "")       ; auxiliary/helper files (loaded before test files)
 (defvar *real-ansi-sources* "")
@@ -2203,8 +2253,17 @@
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
-                                            (format nil "(run-test ~D (lambda () ~S) '~S)"
-                                                    test-id test-form (car expected)))
+                                            (let* ((exp-raw (car expected))
+                                                   (form-cooked
+                                                    (if (%md-contains-array-literal-p test-form)
+                                                        (%mdrewrite-array-literals test-form)
+                                                        test-form)))
+                                              (if (%md-contains-array-literal-p exp-raw)
+                                                  (format nil "(run-test ~D (lambda () ~S) ~S)"
+                                                          test-id form-cooked
+                                                          (%mdrewrite-array-literals exp-raw))
+                                                  (format nil "(run-test ~D (lambda () ~S) '~S)"
+                                                          test-id form-cooked exp-raw))))
                                            ((> (length expected) 0)
                                             (format nil "(run-test-mv ~D (lambda () (multiple-value-list ~S)) '~S)"
                                                     test-id test-form expected))

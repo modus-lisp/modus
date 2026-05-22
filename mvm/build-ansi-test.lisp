@@ -2913,7 +2913,17 @@
                      ~%        (when (> i last-id) (return nil))~
                      ~%        (%record-test-fail i)~
                      ~%        (setq i (+ i 1))))))~
+                     ~%(defvar *no-fork-debug* 0)~
                      ~%(defun fork-file (first-id last-id thunk)~
+                     ~%  ;; DEBUG: when *no-fork-debug* is non-zero, run the thunk~
+                     ~%  ;; directly in-process (no fork) so a hard crash propagates~
+                     ~%  ;; to an attached debugger instead of being recovered by the~
+                     ~%  ;; parent.  Gated on the chunk overlapping the debug range.~
+                     ~%  (when (and (> *no-fork-debug* 0)~
+                     ~%             (or (<= first-id *no-fork-debug*) (= last-id 0))~
+                     ~%             (or (= last-id 0) (>= last-id *no-fork-debug*)))~
+                     ~%    (funcall thunk)~
+                     ~%    (return-from fork-file nil))~
                      ~%  ;; Reset skip-below to first-id at entry so an earlier chunk's~
                      ~%  ;; terminal skip value can't silently suppress this chunk's tests.~
                      ~%  (when (and (> first-id 0) (> *skip-below* first-id))~

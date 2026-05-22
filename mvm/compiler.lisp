@@ -3713,6 +3713,16 @@
    When the lambda captures variables from the enclosing scope, builds
    a closure object and emits code to load captured values from R13
    (the closure-env register) into locals at function entry."
+  ;; &key transform is OFF for lambdas (only toplevel DEFUN passes T).
+  ;; The transform rewrites the body into a let* extraction prologue;
+  ;; for some lambda forms — definitively the capture-default case
+  ;; (lambda (&key (a b) b) ...) capturing outer b — %collect-free-vars's
+  ;; let*-scope handling and the closure-capture wrapping miscompose,
+  ;; producing garbage values and (in the giant run-ansi-lambda function)
+  ;; corrupting the enclosing function's codegen so it SIGSEGVs on entry.
+  ;; This is a concrete compile-time codegen bug, not "layout shift"
+  ;; (see feedback_andkey_compilation).  Fix the extraction's free-var
+  ;; composition before re-enabling.
   (let* ((rest-pos      (position '&rest params))
          (pp            (preprocess-params params body))
          (actual-params (car pp))

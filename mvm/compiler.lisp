@@ -1984,7 +1984,7 @@
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))
                 (req-end  (or rest-pos opt-pos key-pos (length params)))
-                (pp (preprocess-params params body))
+                (pp (preprocess-params params body t)) ; nested defun &key ON
                 (synth-rest (nth 4 pp))
                 (eff-rest-slot (or rest-pos synth-rest)))
            (let ((result (mvm-compile-function name (car pp) (cadr pp)
@@ -3721,18 +3721,19 @@
    When the lambda captures variables from the enclosing scope, builds
    a closure object and emits code to load captured values from R13
    (the closure-env register) into locals at function entry."
-  ;; &key transform is OFF for lambdas (only toplevel DEFUN passes T).
-  ;; The transform rewrites the body into a let* extraction prologue;
-  ;; for some lambda forms — definitively the capture-default case
-  ;; (lambda (&key (a b) b) ...) capturing outer b — %collect-free-vars's
-  ;; let*-scope handling and the closure-capture wrapping miscompose,
-  ;; producing garbage values and (in the giant run-ansi-lambda function)
-  ;; corrupting the enclosing function's codegen so it SIGSEGVs on entry.
-  ;; This is a concrete compile-time codegen bug, not "layout shift"
-  ;; (see feedback_andkey_compilation).  Fix the extraction's free-var
-  ;; composition before re-enabling.
+  ;; &key transform is ON for lambdas (T = allow-key-transform).  The
+  ;; transform rewrites a (&key ...) lambda into a &rest catch var + a
+  ;; let* extraction prologue (see preprocess-params).  This was OFF for
+  ;; years on a mistaken "free-var composition / layout shift" theory.
+  ;; The real blocker was a swallowed compile-time type-error: the
+  ;; transform called (symbol-name (car k)) on the custom-keyword form
+  ;; ((:kw var) ...), raising a type-error that the toplevel compile loop
+  ;; caught and turned into a silent SKIP — dropping the ENTIRE enclosing
+  ;; defun (e.g. a whole run-ansi-X runner) from the image, which read as
+  ;; "the function mysteriously regressed."  Fixed in preprocess-params'
+  ;; key extraction; lambda &key is now +27 ANSI, 0 regressions.
   (let* ((rest-pos      (position '&rest params))
-         (pp            (preprocess-params params body)) ; lambda &key OFF (see header comment)
+         (pp            (preprocess-params params body t)) ; lambda &key ON
          (actual-params (car pp))
          (actual-body   (cadr pp))
          (opt-start     (caddr pp))
@@ -3833,7 +3834,7 @@
              (key-pos  (position '&key params))
              (opt-pos  (position '&optional params))
              (req-end  (or rest-pos opt-pos key-pos (length params)))
-             (pp (preprocess-params params fbody))
+             (pp (preprocess-params params fbody t)) ; flet/labels &key ON
              (synth-rest (nth 4 pp))
              (eff-rest-slot (or rest-pos synth-rest))
              (result (mvm-compile-function-internal unique-name (car pp) (cadr pp) body-env eff-rest-slot (caddr pp) (cadddr pp)))
@@ -7932,16 +7933,28 @@
               ;; value (default-aware), and optionally the supplied-p var.
               (bindings nil))
          (dolist (k keys)
-           (let* ((name     (car k))
+           ;; (car k) is the key's name spec.  Normally a symbol (FOO →
+           ;; keyword :FOO, variable FOO).  CLHS also allows the
+           ;; custom-keyword form ((:actual-keyword var) ...) where the
+           ;; caller passes :ACTUAL-KEYWORD but binds VAR — the keyword
+           ;; and the variable differ.  Without this branch (symbol-name
+           ;; spec) was called on the (:kw var) list and raised a
+           ;; type-error that the toplevel compile loop swallowed,
+           ;; silently dropping the WHOLE enclosing defun (e.g. an entire
+           ;; run-ansi-X test runner vanished from the image).
+           (let* ((spec     (car k))
+                  (custom   (consp spec))
+                  (var      (if custom (cadr spec) spec))
+                  (kw       (if custom (car spec)
+                                (intern (symbol-name spec) :keyword)))
                   (default  (cadr k))
                   (sup      (caddr k))
-                  (kw       (intern (symbol-name name) :keyword))
                   (found-var (intern (format nil "%KWF-~A-~D"
-                                              (symbol-name name)
+                                              (symbol-name var)
                                               (incf *kw-rest-counter*))
                                      :modus.mvm)))
              (push (list found-var (list '%key-present-p kw-rest (list 'quote kw))) bindings)
-             (push (list name (list 'if found-var
+             (push (list var (list 'if found-var
                                      (list '%key-lookup kw-rest (list 'quote kw) nil)
                                      default))
                    bindings)

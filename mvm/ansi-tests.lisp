@@ -71,6 +71,18 @@
 ;; ((lambda (x) (+ x n)) 5) under (let ((n 10)) ...) must return 15.
 (defun %imm-cap () (let ((n 10)) ((lambda (x) (+ x n)) 5)))
 
+;; &key LAMBDA probes — the transform is now ON for lambda/flet/nested
+;; defun.  These lock in each path (plain, default, supplied-p, captured
+;; default, captured body) plus the custom-keyword form ((:kw var) ...)
+;; whose unhandled type-error used to drop the whole enclosing defun.
+(defun %kl-plain ()    ((lambda (&key a) a) :a 7))                    ; → 7
+(defun %kl-default ()  ((lambda (&key (a 9)) a)))                     ; → 9
+(defun %kl-supp ()     ((lambda (&key (a 9 a-p)) (list a (notnot a-p))) :a 3)) ; (3 T)
+(defun %kl-cap-def ()  (let ((b 1)) ((lambda (&key (a b) b) (list a b)) :b 'x))) ; (1 X)
+(defun %kl-cap-body () (let ((n 5)) ((lambda (&key a) (+ a n)) :a 10)))         ; 15
+(defun %kl-custom-kw () ((lambda (&key ((:foo bar) 9)) bar) :foo 42))           ; 42
+(defun %kl-flet ()     (flet ((g (&key (k 3)) (+ 1 k))) (list (g) (g :k 10))))  ; (4 11)
+
 (defun safe-eval (thunk)
   "Run THUNK in handler-case so a SIGSEGV (caught by the in-process signal
    handler and longjmp'd into our handler-case) becomes a :CRASHED sentinel
@@ -2437,6 +2449,23 @@
   ;; read garbage).  See compile-compound's non-symbol-operator case.
   (handler-case (deftest 56250 (%imm-cap) 15)
     (t (c) (%record-test-fail-or-emit 56250)))
+  ;; &key LAMBDA probes (isolated) — pinpoint which transform path fails.
+  (handler-case (deftest 56260 (%kl-plain) 7)
+    (t (c) (%record-test-fail-or-emit 56260)))
+  (handler-case (deftest 56261 (%kl-default) 9)
+    (t (c) (%record-test-fail-or-emit 56261)))
+  (handler-case (deftest 56262 (%kl-supp) '(3 t))
+    (t (c) (%record-test-fail-or-emit 56262)))
+  (handler-case (deftest 56263 (%kl-cap-def) '(1 x))
+    (t (c) (%record-test-fail-or-emit 56263)))
+  (handler-case (deftest 56264 (%kl-cap-body) 15)
+    (t (c) (%record-test-fail-or-emit 56264)))
+  ;; Custom-keyword form ((:kw var) default): the regression that used to
+  ;; raise (symbol-name (:foo bar)) → type-error → silent whole-defun drop.
+  (handler-case (deftest 56265 (%kl-custom-kw) 42)
+    (t (c) (%record-test-fail-or-emit 56265)))
+  (handler-case (deftest 56266 (%kl-flet) '(4 11))
+    (t (c) (%record-test-fail-or-emit 56266)))
 
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case

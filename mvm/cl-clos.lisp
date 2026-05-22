@@ -2154,12 +2154,16 @@
        (sqrt (if (= den 1) num (%make-rat num den)))))
     (t 0)))
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
-(defun set-subseq (seq start end val)
+(defun set-subseq (seq start &rest rest)
   "Destructively replace seq[start..end] with val.  Returns seq.
-   Per CLHS, this is the SETF expansion of subseq.  Modus copies
-   from VAL into SEQ between START and END (or end of seq); both
-   must be sequences."
-  (let* ((seq-len (length seq))
+   Per CLHS, this is the SETF expansion of subseq with two arities:
+     (set-subseq seq start val)         ; SETF (SUBSEQ seq start)
+     (set-subseq seq start end val)     ; SETF (SUBSEQ seq start end)
+   The compiler's SETF macro emits the longer form for compound place
+   but the shorter form for 2-arg place — handle both via &rest."
+  (let* ((end (if (null (cdr rest)) nil (car rest)))
+         (val (if (null (cdr rest)) (car rest) (cadr rest)))
+         (seq-len (length seq))
          (effective-end (if end (if (< end seq-len) end seq-len) seq-len))
          (val-len (length val))
          (copy-len (min (- effective-end start) val-len))

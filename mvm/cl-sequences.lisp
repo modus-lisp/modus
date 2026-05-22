@@ -1601,20 +1601,23 @@
             (aset arr i (aref contents i))
             (setq i (+ i 1)))))))
 (defun make-sequence (type size &rest args)
-  "Make a sequence of TYPE and SIZE.  Supports :initial-element."
-  (let ((init nil) (a args))
+  "Make a sequence of TYPE and SIZE.  Supports :initial-element.
+   Accepts compound type forms like (VECTOR), (VECTOR *), (VECTOR T 5)
+   by dispatching on the head symbol (CLHS 17.1.3)."
+  (let ((init nil) (a args)
+        (head (if (consp type) (car type) type)))
     (loop (when (null a) (return))
       (when (eq (car a) :initial-element) (setq init (cadr a)) (return))
       (setq a (cddr a)))
     (cond
       ;; null: only valid for size 0; returns NIL
-      ((eq type 'null) (if (= size 0) nil (make-array size)))
-      ((or (eq type 'list) (eq type 'cons))
+      ((eq head 'null) (if (= size 0) nil (make-array size)))
+      ((or (eq head 'list) (eq head 'cons))
        (let ((r nil) (i 0))
          (loop (when (= i size) (return r))
            (setq r (cons init r)) (setq i (+ i 1)))))
-      ((or (eq type 'string) (eq type 'simple-string)
-           (eq type 'base-string) (eq type 'simple-base-string))
+      ((or (eq head 'string) (eq head 'simple-string)
+           (eq head 'base-string) (eq head 'simple-base-string))
        (let ((s (%make-string-array size))
              (ch (cond ((null init) 32)
                        ((characterp init) (char-code init))
@@ -1622,14 +1625,23 @@
          (let ((i 0))
            (loop (when (= i size) (return s))
              (aset s i ch) (setq i (+ i 1))))))
-      ((or (eq type 'bit-vector) (eq type 'simple-bit-vector))
+      ((or (eq head 'bit-vector) (eq head 'simple-bit-vector))
        (let ((v (make-array size)))
          (let ((i 0) (b (or init 0)))
            (loop (when (= i size) (return v))
              (aset v i b) (setq i (+ i 1))))))
       (t  ;; Generic vector / array / sequence / null type fall-back.
-       (let ((v (make-array size)))
-         (when init
+       ;; ALWAYS fill, even when init is NIL — caller asked for NIL
+       ;; explicitly; we shouldn't leave the default-zero in place.
+       ;; Use a sentinel keyword to detect whether :initial-element
+       ;; was actually passed vs. defaulted to NIL.
+       (let ((v (make-array size))
+             (initial-provided (let ((found nil) (p args))
+                                 (loop (when (null p) (return found))
+                                   (when (eq (car p) :initial-element)
+                                     (setq found t) (return found))
+                                   (setq p (cddr p))))))
+         (when initial-provided
            (let ((i 0))
              (loop (when (= i size) (return nil))
                (aset v i init) (setq i (+ i 1)))))

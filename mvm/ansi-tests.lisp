@@ -67,6 +67,9 @@
 (defun %kp-test-c (&key (a 10 a-p)) (list a (notnot a-p)))
 (defun %kp-test-c2 (&key (a 10 a-p)) (list a (notnot a-p)))
 (defun %kp-test-d (x &key b) (list x b))
+;; Regression marker for the immediate-applied capturing-lambda fix:
+;; ((lambda (x) (+ x n)) 5) under (let ((n 10)) ...) must return 15.
+(defun %imm-cap () (let ((n 10)) ((lambda (x) (+ x n)) 5)))
 
 (defun safe-eval (thunk)
   "Run THUNK in handler-case so a SIGSEGV (caught by the in-process signal
@@ -2429,6 +2432,11 @@
     (t (c) (%record-test-fail-or-emit 56203)))
   (handler-case (deftest 56204 (%kp-test-d 1 :b 2) '(1 2))
     (t (c) (%record-test-fail-or-emit 56204)))
+  ;; Regression: immediately-applied capturing lambda must load its
+  ;; closure env (was compiled via bare :call-indirect → captured vars
+  ;; read garbage).  See compile-compound's non-symbol-operator case.
+  (handler-case (deftest 56250 (%imm-cap) 15)
+    (t (c) (%record-test-fail-or-emit 56250)))
 
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case

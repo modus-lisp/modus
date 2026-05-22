@@ -1910,9 +1910,17 @@
   (let* ((op (car form))
          (op-name (cond ((integerp op) op) ((symbolp op) (normalize-name op)) (t nil))))
     (cond
-      ;; Non-symbol operator (lambda call, etc.)
+      ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
+      ;; through compile-funcall, NOT compile-call: compile-call's
+      ;; indirect path emits a bare :call-indirect with no closure
+      ;; dispatch, so a CAPTURING lambda (compiled to a #x52 closure
+      ;; object) is called without its env (R13) being loaded and every
+      ;; captured variable reads garbage.  ((lambda (x) (+ x n)) 5) under
+      ;; (let ((n 10)) ...) returned junk for years.  compile-funcall
+      ;; does the obj-tag/subtag closure dispatch + set-cenv + rest
+      ;; prologue correctly (same path #'fn funcall uses).
       ((null op-name)
-       (compile-call op (cdr form) env dest))
+       (compile-funcall form env dest))
       ;; --- Special Forms ---
       ((= op-name 518921307293258709)    (compile-quote (cadr form) dest))
       ((= op-name 448736678201786992)       (compile-if (cdr form) env dest))
@@ -3724,7 +3732,7 @@
   ;; (see feedback_andkey_compilation).  Fix the extraction's free-var
   ;; composition before re-enabling.
   (let* ((rest-pos      (position '&rest params))
-         (pp            (preprocess-params params body))
+         (pp            (preprocess-params params body)) ; lambda &key OFF (see header comment)
          (actual-params (car pp))
          (actual-body   (cadr pp))
          (opt-start     (caddr pp))
@@ -7833,6 +7841,7 @@
 
 (defvar *kw-rest-counter* 0
   "Counter for generating unique &key-rest catch-var names.")
+
 
 (defun preprocess-params (params body &optional allow-key-transform)
   "Transform a CL parameter list with &optional/&key/&aux into simple

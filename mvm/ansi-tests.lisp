@@ -61,6 +61,13 @@
   "Coerce to boolean: nil → nil, anything else → t."
   (if x t nil))
 
+;; &key extraction probes (real-&key transform, toplevel defuns).
+(defun %kp-test-a (&key a) a)
+(defun %kp-test-b (&key (a 10)) a)
+(defun %kp-test-c (&key (a 10 a-p)) (list a (notnot a-p)))
+(defun %kp-test-c2 (&key (a 10 a-p)) (list a (notnot a-p)))
+(defun %kp-test-d (x &key b) (list x b))
+
 (defun safe-eval (thunk)
   "Run THUNK in handler-case so a SIGSEGV (caught by the in-process signal
    handler and longjmp'd into our handler-case) becomes a :CRASHED sentinel
@@ -2411,6 +2418,17 @@
   ;; --- float reader/printer round-trip ---
   (handler-case (deftest 5609 (floatp (read-from-string "1.5")) t)
     (t (c) (%record-test-fail-or-emit 5609)))
+  ;; --- &key probes: real &key extraction in toplevel defuns ---
+  (handler-case (deftest 56200 (%kp-test-a :a 5) 5)
+    (t (c) (%record-test-fail-or-emit 56200)))
+  (handler-case (deftest 56201 (%kp-test-b) 10)
+    (t (c) (%record-test-fail-or-emit 56201)))
+  (handler-case (deftest 56202 (%kp-test-c) '(10 nil))
+    (t (c) (%record-test-fail-or-emit 56202)))
+  (handler-case (deftest 56203 (%kp-test-c2 :a 7) '(7 t))
+    (t (c) (%record-test-fail-or-emit 56203)))
+  (handler-case (deftest 56204 (%kp-test-d 1 :b 2) '(1 2))
+    (t (c) (%record-test-fail-or-emit 56204)))
 
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case

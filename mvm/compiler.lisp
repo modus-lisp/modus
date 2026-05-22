@@ -1976,12 +1976,14 @@
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))
                 (req-end  (or rest-pos opt-pos key-pos (length params)))
-                (pp (preprocess-params params body)))
+                (pp (preprocess-params params body))
+                (synth-rest (nth 4 pp))
+                (eff-rest-slot (or rest-pos synth-rest)))
            (let ((result (mvm-compile-function name (car pp) (cadr pp)
-                                               rest-pos (caddr pp) (cadddr pp))))
+                                               eff-rest-slot (caddr pp) (cadddr pp))))
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
-               (when rest-pos
+               (when (or rest-pos synth-rest)
                  (setf (function-info-rest-param-p info) t)))))
          (compile-nil dest)))
       ;; DEFVAR / DEFPARAMETER inside an expression context.  Same fall-
@@ -3717,13 +3719,8 @@
          (actual-body   (cadr pp))
          (opt-start     (caddr pp))
          (opt-count     (cadddr pp))
-         (rest-slot     (when rest-pos
-                          ;; After preprocess-params, &rest is gone but
-                          ;; the rest param sits at position rest-pos
-                          ;; in actual-params (required come first,
-                          ;; rest comes immediately after — preprocess
-                          ;; preserves required order).
-                          rest-pos))
+         (synth-rest    (nth 4 pp))
+         (rest-slot     (or rest-pos synth-rest))
          (captured-vars
            (reverse
              (%collect-free-vars-list actual-body
@@ -3815,10 +3812,22 @@
              ;; for flet, function bodies see parent env only.
              (body-env (if labels-p flet-env env))
              (rest-pos (position '&rest params))
+             (key-pos  (position '&key params))
+             (opt-pos  (position '&optional params))
+             (req-end  (or rest-pos opt-pos key-pos (length params)))
              (pp (preprocess-params params fbody))
-             (result (mvm-compile-function-internal unique-name (car pp) (cadr pp) body-env rest-pos (caddr pp) (cadddr pp)))
+             (synth-rest (nth 4 pp))
+             (eff-rest-slot (or rest-pos synth-rest))
+             (result (mvm-compile-function-internal unique-name (car pp) (cadr pp) body-env eff-rest-slot (caddr pp) (cadddr pp)))
              (info (car result)))
         (declare (ignore local-key))
+        ;; Only adjust function-info when a synthesized &key-rest was
+        ;; created — otherwise leave the plain-flet defaults untouched
+        ;; (setting required-count / rest-param-p universally regressed
+        ;; plain flet/labels calls).
+        (when synth-rest
+          (setf (function-info-required-count info) req-end)
+          (setf (function-info-rest-param-p info) t))
         ;; Register with unique name
         (setf (gethash (function-info-name info) *functions*) info)
         (push info *function-table*)
@@ -7812,15 +7821,36 @@
 ;;; Transforms &optional and &key parameter lists into simple required params
 ;;; with default value initialization code prepended to the body.
 
-(defun preprocess-params (params body)
+(defvar *kw-rest-counter* 0
+  "Counter for generating unique &key-rest catch-var names.")
+
+(defun preprocess-params (params body &optional allow-key-transform)
   "Transform a CL parameter list with &optional/&key/&aux into simple
    required params.  Returns (list new-params new-body optional-start
-   optional-count) — optional-start is the slot index in new-params
-   where &optional params begin (or nil if there are none), and
-   optional-count is the number of &optional params.  The trailing
-   slots are needed by mvm-compile-function-internal so the prologue
-   can NIL-init optional slots that the caller didn't supply (otherwise
-   the slot retains the stale outgoing-arg register from the caller).
+   optional-count rest-slot) — optional-start is the slot index in
+   new-params where &optional params begin (or nil), optional-count is
+   the number of &optional params, and REST-SLOT (5th value) is the
+   slot of a synthesized &rest catch var when &key was transformed
+   (nil otherwise).
+
+   ALLOW-KEY-TRANSFORM gates the real-&key path.  Only toplevel DEFUN
+   passes T; lambda/flet/labels pass NIL and fall back to the legacy
+   positional behavior.  The &key→&rest transform adds inlined
+   extraction code per &key function, and enabling it everywhere
+   inflated the image ~130KB and triggered a layout-shift cascade
+   (fork crash at unrelated fdefinition tests, ~-90).  Confining it to
+   toplevel defuns keeps the win (user defuns with &key supplied-p)
+   while bounding the bloat.
+
+   &key handling (real, since 2026-05-22): when a lambda-list has &key
+   params and NO &optional and NO explicit &rest, the keys are turned
+   into a synthesized &rest catch var %KW-REST plus a let* extraction
+   prologue that binds each key var (with default) and supplied-p var
+   from the keyword plist.  This reuses the working &rest calling
+   convention; compile-call already packs trailing args into a list
+   for &rest functions.  The (&optional + &key) and (&rest + &key)
+   combinations still fall back to the old positional behavior — they
+   need slot-range coordination that isn't wired yet.
 
    &aux is handled by wrapping the body in a let* — init forms execute
    inside the function's implicit block, so a (return-from FOO X) in
@@ -7829,14 +7859,15 @@
   (let ((mode :required)
         (required nil)
         (optional nil)
-        (keys nil)
+        (keys nil)          ; list of (name default supplied-p-or-nil)
         (auxes nil)
-        (has-rest nil))
+        (has-rest nil)
+        (has-key nil))
     ;; Parse parameter list
     (dolist (p params)
       (cond
         ((eq p '&optional) (setq mode :optional))
-        ((eq p '&key)      (setq mode :key))
+        ((eq p '&key)      (setq mode :key) (setq has-key t))
         ((eq p '&rest)     (setq mode :rest) (setq has-rest t))
         ((eq p '&body)     (setq mode :rest) (setq has-rest t))
         ((eq p '&aux)      (setq mode :aux))
@@ -7847,25 +7878,15 @@
              (push (list (car p) (cadr p)) optional)
              (push (list p nil) optional)))
         ((eq mode :key)
-         ;; (B 0 B-P) — third element is the supplied-p variable.
-         ;; Modus treats &key as POSITIONAL (see feedback_andkey_
-         ;; compilation), so we can't actually tell whether B was
-         ;; supplied vs. defaulted; bind the supplied-p var to NIL
-         ;; in the common no-args case so references in the body
-         ;; resolve to a real local instead of an undefined free
-         ;; variable.  Better than leaving B-P unbound and letting
-         ;; the runtime symbol-value lookup error.
+         ;; Store full triple (name default supplied-p).  Custom-keyword
+         ;; form ((:kw var) ...) is not handled — treat its car as name.
          (cond
            ((and (consp p) (consp (cdr p)) (consp (cddr p)))
-            ;; (NAME DEFAULT SUPPLIED-P)
-            (push (list (car p) (cadr p)) keys)
-            (push (list (caddr p) nil) keys))
+            (push (list (car p) (cadr p) (caddr p)) keys))
            ((consp p)
-            ;; (NAME DEFAULT)
-            (push (list (car p) (cadr p)) keys))
+            (push (list (car p) (cadr p) nil) keys))
            (t
-            ;; NAME
-            (push (list p nil) keys))))
+            (push (list p nil nil) keys))))
         ((eq mode :aux)
          (if (consp p)
              (push (list (car p) (cadr p)) auxes)
@@ -7878,44 +7899,71 @@
     (setf keys (nreverse keys))
     (setf auxes (nreverse auxes))
     ;; If no &optional, &key, &rest, or &aux, return unchanged
-    (if (and (null optional) (null keys) (null auxes) (not has-rest))
-        (list params body nil 0)
-        ;; Build new parameter list: required + optional param names + key
-        ;; param names.  Order MUST be (required..., optional..., keys...) —
-        ;; pushing keys (as a previous version did) reverses them and
-        ;; misaligns every caller's args with the parameters.  This was
-        ;; the bug behind NUNION.2-5 returning NIL: nunion-with-copy
-        ;; (x y &key test test-not) was being compiled as if its params
-        ;; were (test-not test x y), so calling (nunion-with-copy lst nil)
-        ;; landed `lst' in test-not and `nil' in test, leaving x and y
-        ;; with garbage from the caller's outgoing-arg registers.
-        (let* ((new-params (append required
-                                   (mapcar #'car optional)
-                                   (mapcar #'car keys)))
-               (optional-start (when optional (length required)))
-               (optional-count (length optional))
-               (new-body body))
-          ;; Wrap body in let* for &aux bindings.  Init forms run after
-          ;; required/optional/key bindings; return-from inside an init
-          ;; exits the surrounding function (implicit block).
-          (when auxes
-            (setf new-body
-                  `((let* ,auxes ,@new-body))))
-          ;; Prepend default value checks for optional params
-          (let ((defaults nil))
-            (dolist (opt optional)
-              (when (cadr opt)
-                (push `(when (null ,(car opt))
-                         (setq ,(car opt) ,(cadr opt)))
-                      defaults)))
-            (dolist (k keys)
-              (when (cadr k)
-                (push `(when (null ,(car k))
-                         (setq ,(car k) ,(cadr k)))
-                      defaults)))
-            (when defaults
-              (setf new-body (append (nreverse defaults) new-body))))
-          (list new-params new-body optional-start optional-count)))))
+    (cond
+      ((and (null optional) (null keys) (null auxes) (not has-rest))
+       (list params body nil 0 nil))
+      ;; --- Real &key path: keys present, no &optional, no explicit &rest ---
+      ((and allow-key-transform has-key (null optional) (not has-rest))
+       (let* ((kw-rest (intern (format nil "%KW-REST-~D"
+                                        (incf *kw-rest-counter*))
+                               :modus.mvm))
+              (new-params (append required (list kw-rest)))
+              (rest-slot (length required))
+              ;; Build let* bindings: for each key, a found-flag, the
+              ;; value (default-aware), and optionally the supplied-p var.
+              (bindings nil))
+         (dolist (k keys)
+           (let* ((name     (car k))
+                  (default  (cadr k))
+                  (sup      (caddr k))
+                  (kw       (intern (symbol-name name) :keyword))
+                  (found-var (intern (format nil "%KWF-~A-~D"
+                                              (symbol-name name)
+                                              (incf *kw-rest-counter*))
+                                     :modus.mvm)))
+             (push (list found-var (list '%key-present-p kw-rest (list 'quote kw))) bindings)
+             (push (list name (list 'if found-var
+                                     (list '%key-lookup kw-rest (list 'quote kw) nil)
+                                     default))
+                   bindings)
+             (when sup
+               (push (list sup found-var) bindings))))
+         (setf bindings (nreverse bindings))
+         (let ((new-body
+                 (if auxes
+                     `((let* (,@bindings) (let* ,auxes ,@body)))
+                     `((let* (,@bindings) ,@body)))))
+           (list new-params new-body nil 0 rest-slot))))
+      ;; --- Fallback: old positional behavior for other combinations ---
+      (t
+       (let* ((new-params (append required
+                                  (mapcar #'car optional)
+                                  ;; keys: name + supplied-p (positional, legacy)
+                                  (let ((acc nil))
+                                    (dolist (k keys (nreverse acc))
+                                      (push (car k) acc)
+                                      (when (caddr k) (push (caddr k) acc))))))
+              (optional-start (when optional (length required)))
+              (optional-count (length optional))
+              (new-body body))
+         (when auxes
+           (setf new-body `((let* ,auxes ,@new-body))))
+         (let ((defaults nil))
+           (dolist (opt optional)
+             (when (cadr opt)
+               (push `(when (null ,(car opt))
+                        (setq ,(car opt) ,(cadr opt)))
+                     defaults)))
+           (dolist (k keys)
+             (when (cadr k)
+               (push `(when (null ,(car k))
+                        (setq ,(car k) ,(cadr k)))
+                     defaults))
+             (when (caddr k)
+               (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) defaults)))
+           (when defaults
+             (setf new-body (append (nreverse defaults) new-body))))
+         (list new-params new-body optional-start optional-count nil))))))
 
 ;;; ============================================================
 ;;; Phase 2.5: Internal Function Compilation
@@ -8839,11 +8887,18 @@
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))
                 (req-end  (or rest-pos opt-pos key-pos (length params)))
-                (pp (preprocess-params params body)))
-           (let ((result (mvm-compile-function name (car pp) (cadr pp) rest-pos (caddr pp) (cadddr pp))))
+                (pp (preprocess-params params body t))  ; toplevel defun: allow &key transform
+                ;; 5th value: synthesized &key-rest slot (nil unless the
+                ;; real-&key transform fired).  Prefer it over rest-pos.
+                (synth-rest (nth 4 pp))
+                (eff-rest-slot (or rest-pos synth-rest)))
+           (let ((result (mvm-compile-function name (car pp) (cadr pp) eff-rest-slot (caddr pp) (cadddr pp))))
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
-               (when rest-pos
+               ;; Mark rest-param-p when there's an explicit &rest OR a
+               ;; synthesized &key-rest, so compile-call packs trailing
+               ;; args into a list for the callee's extraction prologue.
+               (when (or rest-pos synth-rest)
                  (setf (function-info-rest-param-p info) t)))
              result)))))
 

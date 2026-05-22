@@ -1814,6 +1814,29 @@
                  (setq a b))
                (setq rest (cdr rest)))))))
 
+;;; --- &key argument extraction helpers ---
+;;; preprocess-params transforms a (... &key k ...) lambda-list into a
+;;; (... &rest %kw) one plus a prologue that calls these to bind each
+;;; key var + supplied-p var.  Keyword identity is `eq` because all
+;;; :foo literals route through the keyword intern table (CLAUDE.md).
+(defun %key-present-p (plist key)
+  "T iff KEY appears as an indicator in the &key PLIST."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (when (eq (car cur) key) (return t))
+      (setq cur (cddr cur)))))
+
+(defun %key-lookup (plist key default)
+  "Leftmost value for KEY in PLIST, or DEFAULT if absent."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return default))
+      (when (null (cdr cur)) (return default))
+      (when (eq (car cur) key) (return (cadr cur)))
+      (setq cur (cddr cur)))))
+
 (defun char-int (c) (char-code c))
 (defun code-char (n) (if (characterp n) n (code-char n)))
 

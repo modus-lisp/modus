@@ -511,21 +511,38 @@
 
 (defun parse-integer (string &rest args)
   "Parse an integer from STRING. Supports :start :end :radix :junk-allowed.
-   Returns (values integer end-position)."
+   Returns (values integer end-position).  Signals error on:
+   - odd-length keyword arg list
+   - unknown keyword (unless :allow-other-keys T)
+   - empty / whitespace-only string (when :junk-allowed NIL)
+   - sign-only string '+', '-' (no digits)
+   - trailing non-digit / non-whitespace junk (when :junk-allowed NIL)"
   (let ((start 0)
         (end nil)
         (radix 10)
         (junk-allowed nil)
+        (allow-other nil)
         (a args))
-    ;; Parse keyword args
+    ;; Pre-scan :allow-other-keys
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+          (setq allow-other t))
+        (setq scan (cddr scan))))
+    ;; Parse keyword args with validation
     (loop
       (when (null a) (return))
+      (when (null (cdr a))
+        (error "parse-integer: odd-length keyword arg list"))
       (let ((k (car a)) (v (cadr a)))
         (cond
           ((eq k :start)       (setq start v))
           ((eq k :end)         (setq end v))
           ((eq k :radix)       (setq radix v))
-          ((eq k :junk-allowed)(setq junk-allowed v))))
+          ((eq k :junk-allowed)(setq junk-allowed v))
+          ((eq k :allow-other-keys) nil)
+          (allow-other nil)
+          (t (error "parse-integer: bad keyword"))))
       (setq a (cddr a)))
     (let ((len (length string)))
       (when (null end) (setq end len))
@@ -561,11 +578,22 @@
                 (setq digit-count (+ digit-count 1)))
               (setq i (+ i 1)))
             ;; Check we got at least one digit
-            (if (= digit-count 0)
-                (if junk-allowed
-                    (values nil i)
-                    (error "parse-integer: no digits"))
-                (values (* sign result) i))))))))
+            (when (= digit-count 0)
+              (if junk-allowed
+                  (return-from parse-integer (values nil i))
+                  (error "parse-integer: no digits")))
+            ;; Check trailing chars: skip trailing whitespace, then check
+            ;; if anything non-whitespace remains.
+            (unless junk-allowed
+              (let ((j i))
+                (loop
+                  (when (>= j end) (return))
+                  (let ((c (aref string j)))
+                    (when (and (not (= c 32)) (not (= c 9)) (not (= c 10)))
+                      (error "parse-integer: junk after digits")))
+                  (setq j (+ j 1)))
+                (setq i j)))
+            (values (* sign result) i)))))))
 
 ;;; ============================================================
 ;;; sxhash — hash code for objects
@@ -1485,7 +1513,11 @@
 ;;; ============================================================
 
 (defun coerce (object result-type)
-  "Coerce OBJECT to RESULT-TYPE."
+  "Coerce OBJECT to RESULT-TYPE.  Accepts compound type forms like
+   (vector *), (vector * 2), (simple-string 5) — uses the head symbol
+   for dispatch (per CLHS, compound array/string subtypes are still
+   the same family of result-type)."
+  (let ((result-type (if (consp result-type) (car result-type) result-type)))
   (cond
     ((eq result-type 'list)
      (cond
@@ -1579,7 +1611,7 @@
      (if (integerp object) (code-char object)
          (if (stringp object) (code-char (aref object 0))
              object)))
-    (t object)))
+    (t object))))
 
 ;;; ============================================================
 ;;; C*R Extensions (4-deep)

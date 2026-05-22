@@ -2183,8 +2183,10 @@
            (emit-ir :pop dest)
            (emit-ir :mul dest dest temp)
            (free-temp-reg))))
-      ((= op-name 701100176259851453)       (compile-1+ (cadr form) env dest))
-      ((= op-name 593011189432099851)       (compile-1- (cadr form) env dest))
+      ((= op-name 701100176259851453)
+       (when (arity-ok-p form 1 1 env dest) (compile-1+ (cadr form) env dest)))
+      ((= op-name 593011189432099851)
+       (when (arity-ok-p form 1 1 env dest) (compile-1- (cadr form) env dest)))
       ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
 
       ;; --- IEEE float intrinsics (target-:native lowers via :fadd etc.) ---

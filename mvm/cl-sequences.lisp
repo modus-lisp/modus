@@ -1635,31 +1635,90 @@
                (aset v i init) (setq i (+ i 1)))))
          v)))))
 (defun coerce (obj type)
-  "Convert OBJ to TYPE per CLHS 4.7.  Mostly handles list⇄vector
-   and string-to-list cases that the ANSI tests exercise; unknown
-   types pass through unchanged so the caller sees their original
-   value rather than a garbled coercion."
-  (cond
-    ((or (eq type t) (eq type 'common-lisp:t)) obj)
-    ;; List
-    ((eq type 'list)
-     (cond
-       ((null obj) nil)
-       ((consp obj) obj)
-       ((stringp obj)
-        (let ((acc nil) (i (- (length obj) 1)))
-          (loop
-            (when (< i 0) (return acc))
-            (setq acc (cons (code-char (aref obj i)) acc))
-            (setq i (- i 1)))))
-       (t (list obj))))
-    ;; Character
-    ((eq type 'character)
-     (cond ((characterp obj) obj)
-           ((integerp obj) (code-char obj))
-           (t obj)))
-    ;; Default — pass through
-    (t obj)))
+  "Convert OBJ to TYPE per CLHS 4.7.  Handles list/vector/string/
+   character/symbol/bit-vector and their compound forms like
+   (vector *) / (vector * 2) / (simple-string)."
+  (let ((head (if (consp type) (car type) type)))
+    (cond
+      ((or (eq type t) (eq type 'common-lisp:t)) obj)
+      ;; List
+      ((eq head 'list)
+       (cond
+         ((null obj) nil)
+         ((consp obj) obj)
+         ((stringp obj)
+          (let ((acc nil) (i (- (length obj) 1)))
+            (loop
+              (when (< i 0) (return acc))
+              (setq acc (cons (code-char (aref obj i)) acc))
+              (setq i (- i 1)))))
+         ((or (arrayp obj) (and (consp obj) (array-wrapper-p obj)))
+          (let ((acc nil) (i (- (length obj) 1)))
+            (loop
+              (when (< i 0) (return acc))
+              (setq acc (cons (aref obj i) acc))
+              (setq i (- i 1)))))
+         (t (list obj))))
+      ;; Vector / simple-vector / array / simple-array
+      ((or (eq head 'vector) (eq head 'simple-vector)
+           (eq head 'array) (eq head 'simple-array))
+       (cond
+         ((null obj) (make-array 0))
+         ((consp obj)
+          (let* ((n (length obj))
+                 (v (make-array n))
+                 (i 0) (cur obj))
+            (loop (when (= i n) (return v))
+              (aset v i (car cur))
+              (setq cur (cdr cur))
+              (setq i (+ i 1)))))
+         ((stringp obj)
+          ;; Tests expect (coerce "ab" '(vector *)) to give #(#\a #\b).
+          (let* ((n (length obj))
+                 (v (make-array n))
+                 (i 0))
+            (loop (when (= i n) (return v))
+              (aset v i (code-char (aref obj i)))
+              (setq i (+ i 1)))))
+         (t obj)))
+      ;; String / simple-string / base-string
+      ((or (eq head 'string) (eq head 'simple-string)
+           (eq head 'base-string) (eq head 'simple-base-string))
+       (cond
+         ((stringp obj) obj)
+         ((characterp obj)
+          (let ((s (%make-string-array 1)))
+            (aset s 0 (char-code obj)) s))
+         ((null obj) (%make-string-array 0))
+         ((consp obj)
+          (let* ((n (length obj))
+                 (s (%make-string-array n))
+                 (i 0) (cur obj))
+            (loop (when (= i n) (return s))
+              (let ((c (car cur)))
+                (aset s i (if (characterp c) (char-code c) c)))
+              (setq cur (cdr cur))
+              (setq i (+ i 1)))))
+         ((arrayp obj)
+          (let* ((n (length obj))
+                 (s (%make-string-array n))
+                 (i 0))
+            (loop (when (= i n) (return s))
+              (let ((c (aref obj i)))
+                (aset s i (if (characterp c) (char-code c) c)))
+              (setq i (+ i 1)))))
+         (t obj)))
+      ;; Character
+      ((eq head 'character)
+       (cond ((characterp obj) obj)
+             ((integerp obj) (code-char obj))
+             ((and (stringp obj) (= (length obj) 1))
+              (code-char (aref obj 0)))
+             ((and (symbolp obj) (= (length (symbol-name obj)) 1))
+              (code-char (aref (symbol-name obj) 0)))
+             (t obj)))
+      ;; Default — pass through
+      (t obj))))
 (defun mismatch (s1 s2 &rest args)
   "Compare S1 vs S2 element-by-element. Returns first index where they
    differ, or NIL if equal. Honors :test, :key, :start1, :end1, :start2,

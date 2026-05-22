@@ -506,6 +506,25 @@
 
 
 ;;; ============================================================
+;;; PROCLAIM / DECLAIM — stub that respects arity
+;;; ============================================================
+
+(defun proclaim (&rest args)
+  "PROCLAIM accepts exactly one declaration spec.  Modus doesn't act
+   on most declarations but the arity check signals error on wrong
+   nargs (proclaim.lsp 25111-25113)."
+  (when (null args)
+    (error "proclaim: missing declaration"))
+  (when (cdr args)
+    (error "proclaim: too many args"))
+  nil)
+
+(defun declaim (&rest decls)
+  "DECLAIM-like wrapper that accepts any declaration list."
+  (declare (ignore decls))
+  nil)
+
+;;; ============================================================
 ;;; parse-integer — parse an integer from a string
 ;;; ============================================================
 

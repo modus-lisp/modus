@@ -1795,9 +1795,15 @@
                (let ((sz (and (cdr type) (cadr type))))
                  (or (null sz) (%typename-eq sz '*) (eq sz t)
                      (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (vector elt-type size) — vector with optional element-type
-         ;; and size.  Accept anything with array-like subtag (#x31 string,
-         ;; #x32 vector, etc.); honor the length filter.
+         ;; (vector elt-type size) / (simple-array elt-type dims)
+         ;; — vector/array with optional element-type and dimensions.
+         ;; dims interpretation per CLHS:
+         ;;   absent          — no constraint
+         ;;   '*              — any rank
+         ;;   integer         — 1D with that size
+         ;;   NIL / ()        — 0-rank (modus has none → NIL)
+         ;;   (n)             — 1D with size n (or '* for any)
+         ;;   (n m ...)       — multi-rank (modus 1D-only → NIL)
          ((or (%typename-eq head 'vector)
               (%typename-eq head 'simple-vector)
               (%typename-eq head 'simple-array)
@@ -1805,9 +1811,31 @@
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31)   ; string
                    (= (obj-subtag obj) #x32))  ; generic array
-               (let ((sz (and (cddr type) (caddr type))))
-                 (or (null sz) (%typename-eq sz '*) (eq sz t)
-                     (and (integerp sz) (= sz (array-length obj)))))))
+               (cond
+                 ;; no dims spec
+                 ((null (cddr type)) t)
+                 (t
+                  (let ((dims (caddr type)))
+                    (cond
+                      ;; '* → any
+                      ((%typename-eq dims '*) t)
+                      ((eq dims t) t)
+                      ;; integer N → 1D length N
+                      ((integerp dims) (= dims (array-length obj)))
+                      ;; NIL → 0-rank (modus has none)
+                      ((null dims) nil)
+                      ;; list of dim-specs
+                      ((consp dims)
+                       (cond
+                         ;; (n) — 1D
+                         ((and (null (cdr dims)))
+                          (or (%typename-eq (car dims) '*)
+                              (eq (car dims) t)
+                              (and (integerp (car dims))
+                                   (= (car dims) (array-length obj)))))
+                         ;; multi-rank — modus is 1D only
+                         (t nil)))
+                      (t nil)))))))
          ;; (cons car-type cdr-type) — type-check both halves.
          ((%typename-eq head 'cons)
           (and (consp obj)

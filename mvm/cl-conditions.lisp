@@ -1188,6 +1188,14 @@
          ;; (Modus's strings are subtag #x31; general arrays #x32.)
          ((or (eq head 'vector) (eq head 'simple-vector)
               (eq head 'simple-array) (eq head 'array))
+          ;; Capture multi-dim wrapper's dim list BEFORE peeling — used
+          ;; for 0-rank / multi-rank dim-spec matching.
+          (let ((wrapped-dims
+                 (cond
+                   ((and (consp obj) (eql (car obj) 9867654)
+                         (consp (cdr obj)))
+                    (cadr obj))   ; the DIMS list (could be NIL for 0-rank)
+                   (t :no-wrapper))))
           ;; Peel multi-dim/adjustable wrappers to inner array before testing.
           (let ((obj (cond
                        ((and (consp obj) (eql (car obj) 9867654)
@@ -1197,6 +1205,7 @@
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32))
                (let* ((et (and (cdr type) (cadr type)))
+                      (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
                       (is-string  (= (obj-subtag obj) #x31))
                       (is-array   (= (obj-subtag obj) #x32))
@@ -1218,13 +1227,58 @@
                          ((eq et 'standard-char)        is-string)
                          ((eq et 'bit)                  is-bitvec)
                          (t t))))
+                 ;; dim-spec semantics:
+                 ;;   absent           — no constraint
+                 ;;   '*  / T          — any rank/size
+                 ;;   integer N        — 1D length N
+                 ;;   NIL ()           — 0-rank (matches multi-dim wrapper
+                 ;;                      with empty dim list)
+                 ;;   (d1 d2 ...)      — list of dim-specs; match by
+                 ;;                      length + per-dim
                  (and et-ok
-                      (or (null sz) (eq sz '*) (eq sz t)
-                          (and (consp sz) (or (null (cdr sz))
-                                              (and (consp (cdr sz)) (null (cddr sz))))
+                      (cond
+                        ((not sz-given) t)
+                        ((eq sz '*) t)
+                        ((eq sz t)  t)
+                        ((null sz)
+                         ;; 0-rank: match if obj is a multi-dim wrapper
+                         ;; with NIL dim list, else NIL.
+                         (and (not (eq wrapped-dims :no-wrapper))
+                              (null wrapped-dims)))
+                        ((integerp sz) (= sz (array-length obj)))
+                        ((consp sz)
+                         (cond
+                           ((null (cdr sz))          ; (d)
+                            ;; 1D match: obj must be 1D (either bare
+                            ;; array or 1-d multi-dim wrapper).  Use
+                            ;; wrapped-dims if present.
+                            (cond
+                              ((eq wrapped-dims :no-wrapper)
                                (or (eq (car sz) '*) (eq (car sz) t)
-                                   (and (integerp (car sz)) (= (car sz) (array-length obj)))))
-                          (and (integerp sz) (= sz (array-length obj)))))))))
+                                   (and (integerp (car sz))
+                                        (= (car sz) (array-length obj)))))
+                              ((and (consp wrapped-dims)
+                                    (null (cdr wrapped-dims)))
+                               (or (eq (car sz) '*) (eq (car sz) t)
+                                   (and (integerp (car sz))
+                                        (= (car sz) (car wrapped-dims)))))
+                              (t nil)))     ; rank mismatch
+                           (t
+                            ;; multi-rank: only matches a multi-dim wrapper
+                            ;; with same-length dim list and per-dim match.
+                            (and (consp wrapped-dims)
+                                 (= (length sz) (length wrapped-dims))
+                                 (let ((ok t) (a sz) (b wrapped-dims))
+                                   (loop (when (null a) (return ok))
+                                     (let ((ad (car a)) (bd (car b)))
+                                       (unless (or (eq ad '*) (eq ad t)
+                                                   (and (integerp ad)
+                                                        (integerp bd)
+                                                        (= ad bd)))
+                                         (setq ok nil) (return nil)))
+                                     (setq a (cdr a)) (setq b (cdr b)))
+                                   ok)))))
+                        (t nil))))))))
          ;; (cons car-type cdr-type) — type-check both halves.
          ((eq head 'cons)
           (and (consp obj)

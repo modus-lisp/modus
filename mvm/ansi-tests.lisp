@@ -2467,6 +2467,138 @@
   (handler-case (deftest 56266 (%kl-flet) '(4 11))
     (t (c) (%record-test-fail-or-emit 56266)))
 
+  ;; ============================================================
+  ;; Runtime-load probes (56300-56307).  Conformance milestones for the
+  ;; "Modus runs unmodified Common Lisp" endpoint: every gap to running
+  ;; `(load <ANSI .lsp>)` + `(do-tests)` becomes a probe that flips from
+  ;; FAIL to P as the gap closes.  Self-contained: probe files are
+  ;; written into /tmp at run time.  Diagnostic markers print to serial
+  ;; alongside the P/FAIL line so a failure is debuggable from one run.
+  ;;
+  ;; Findings the FAILs map to (as of commit landing this probe set):
+  ;;   56303/56304: %init-sft-list is a hand-curated allowlist of ~229
+  ;;                fns; eval can't call any unregistered defun by symbol
+  ;;                (here: write-string-serial).  Fix: auto-register.
+  ;;   56307:       (load file) returns, but a defvar inside doesn't
+  ;;                actually bind — runtime eval's special-form dispatch
+  ;;                doesn't handle the def* family (defvar/defun/...).
+  ;; LIST and FORMAT pass through eval because they ARE in the SFT today.
+  ;; ============================================================
+
+  (when t   ; scoping let* so probe locals don't leak
+    (let ((probe-1 "/tmp/probe-1-simple.lisp"))
+
+      ;; Write the simple probe file every run so /tmp cleaning doesn't
+      ;; break the suite.  Form-1 calls write-string-serial (NOT in SFT
+      ;; today) so a successful load also flushes a visible marker.
+      (handler-case
+          (with-open-file (s probe-1 :direction :output :if-exists :supersede)
+            (format s "(write-string-serial \"PROBE-1-LOADED;\")~%")
+            (format s "(defvar *probe-1-val* (+ 40 2))~%"))
+        (t (c) (write-string-serial "PROBE-SETUP-ERR;")))
+
+      ;; 56300 — OPEN: lowest-layer file I/O
+      (handler-case
+          (let ((s (open probe-1 :direction :input :if-does-not-exist nil)))
+            (write-string-serial (if s "OPEN-OK;" "OPEN-NIL;"))
+            (when s (close s))
+            (deftest 56300 (not (null s)) t))
+        (t (c) (progn (write-string-serial "OPEN-ERR;")
+                      (%record-test-fail-or-emit 56300))))
+
+      ;; 56301 — READ one form via the reader
+      (handler-case
+          (let ((s (open probe-1 :direction :input :if-does-not-exist nil)))
+            (if s
+                (let ((f (read s nil :eof)))
+                  (write-string-serial "READ-OK;")
+                  (close s)
+                  (deftest 56301 (consp f) t))
+                (progn (write-string-serial "OPEN-NIL-AT-READ;")
+                       (%record-test-fail-or-emit 56301))))
+        (t (c) (progn (write-string-serial "READ-ERR;")
+                      (%record-test-fail-or-emit 56301))))
+
+      ;; 56302 — EVAL of a literal `(+ ...)`.  Compiler folds inline ops,
+      ;; so this works without touching the symbol-function table.
+      (handler-case
+          (let ((r (eval '(+ 40 2))))
+            (write-string-serial "EVAL-LITERAL-OK;")
+            (deftest 56302 r 42))
+        (t (c) (progn (write-string-serial "EVAL-LITERAL-ERR;")
+                      (%record-test-fail-or-emit 56302))))
+
+      ;; 56303 — EVAL of a call to an UNREGISTERED function symbol.
+      ;; write-string-serial isn't in %init-sft-list; eval can't reach it.
+      ;; Flips when Gap A (SFT auto-registration) lands.
+      (handler-case
+          (progn (eval '(write-string-serial "S4A-CALL;"))
+                 (write-string-serial "S4A-OK;")
+                 (deftest 56303 t t))
+        (t (c) (progn (write-string-serial "S4A-ERR:")
+                      (handler-case (write-string-serial (symbol-name (type-of c)))
+                        (t (c2) (write-string-serial "<tof>")))
+                      (write-string-serial ";")
+                      (%record-test-fail-or-emit 56303))))
+
+      ;; 56304 — same call but read from disk (round-trip via the reader).
+      ;; Same failure mode as 56303 confirms the gap is SFT lookup, not
+      ;; reader symbol-identity.
+      (handler-case
+          (let ((s (open probe-1 :direction :input :if-does-not-exist nil)))
+            (if s
+                (let ((f (read s nil :eof)))
+                  (close s)
+                  (write-string-serial "READ-CAR=")
+                  (write-string-serial (symbol-name (car f)))
+                  (write-string-serial ";")
+                  (eval f)
+                  (write-string-serial "S4B-OK;")
+                  (deftest 56304 t t))
+                (progn (write-string-serial "OPEN-NIL-S4B;")
+                       (%record-test-fail-or-emit 56304))))
+        (t (c) (progn (write-string-serial "S4B-ERR:")
+                      (handler-case (write-string-serial (symbol-name (type-of c)))
+                        (t (c2) (write-string-serial "<tof>")))
+                      (write-string-serial ";")
+                      (%record-test-fail-or-emit 56304))))
+
+      ;; 56305 — EVAL of a call to a REGISTERED function (LIST).
+      ;; Sanity check that the SFT lookup path itself works.
+      (handler-case
+          (let ((r (eval '(list 1 2 3))))
+            (write-string-serial "S5-EVAL-LIST=")
+            (write-string-serial (if (equal r '(1 2 3)) "OK" "WRONG"))
+            (write-string-serial ";")
+            (deftest 56305 r '(1 2 3)))
+        (t (c) (progn (write-string-serial "S5-ERR;")
+                      (%record-test-fail-or-emit 56305))))
+
+      ;; 56306 — EVAL of FORMAT (registered, exercises strings/streams).
+      (handler-case
+          (let ((r (eval '(format nil "X=~D" 42))))
+            (write-string-serial "S6-FORMAT=")
+            (write-string-serial r)
+            (write-string-serial ";")
+            (deftest 56306 r "X=42"))
+        (t (c) (progn (write-string-serial "S6-ERR;")
+                      (%record-test-fail-or-emit 56306))))
+
+      ;; 56307 — full (load FILE) of a defvar form.  Today: load returns
+      ;; (no hang, no caught error), but the defvar doesn't establish a
+      ;; binding — defvar isn't dispatched at runtime by eval.  Flips
+      ;; when Gap B (runtime def* dispatch) lands.
+      (handler-case
+          (progn
+            (with-open-file (s "/tmp/probe-fmt.lisp" :direction :output :if-exists :supersede)
+              (format s "(defvar *probe-fmt-val* (format nil \"X=~~D\" 42))~%"))
+            (makunbound '*probe-fmt-val*)
+            (write-string-serial "BEFORE-LOAD;")
+            (load "/tmp/probe-fmt.lisp")
+            (write-string-serial "AFTER-LOAD;")
+            (deftest 56307 (if (boundp '*probe-fmt-val*) *probe-fmt-val* :unbound) "X=42"))
+        (t (c) (progn (write-string-serial "LOAD-ERR;")
+                      (%record-test-fail-or-emit 56307))))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

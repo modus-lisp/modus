@@ -656,7 +656,7 @@
     ((atom form) form)
     ;; (do-symbols (var pkg result) body...)
     ;; → collect symbols, then iterate with block nil for return support
-    ((and (eq (car form) 'do-symbols) (consp (cdr form)) (consp (cadr form)))
+    ((and nil (eq (car form) 'do-symbols) (consp (cdr form)) (consp (cadr form))) ; RETIRED — compiler-side macro
      (incf *pkg-iter-counter*)
      (let* ((binding (cadr form))
             (var (first binding))
@@ -676,7 +676,7 @@
                   ,@real-body)
                 (setq ,cur-var (cdr ,cur-var))))))))
     ;; (do-external-symbols (var pkg result) body...)
-    ((and (eq (car form) 'do-external-symbols) (consp (cdr form)) (consp (cadr form)))
+    ((and nil (eq (car form) 'do-external-symbols) (consp (cdr form)) (consp (cadr form))) ; RETIRED — compiler-side macro
      (incf *pkg-iter-counter*)
      (let* ((binding (cadr form))
             (var (first binding))
@@ -696,7 +696,7 @@
                   ,@real-body)
                 (setq ,cur-var (cdr ,cur-var))))))))
     ;; (do-all-symbols (var result) body...)
-    ((and (eq (car form) 'do-all-symbols) (consp (cdr form)) (consp (cadr form)))
+    ((and nil (eq (car form) 'do-all-symbols) (consp (cdr form)) (consp (cadr form))) ; RETIRED — compiler-side macro
      (incf *pkg-iter-counter*)
      (let* ((binding (cadr form))
             (var (first binding))

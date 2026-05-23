@@ -1520,6 +1520,72 @@
                (tagbody ,@body)
                (setq ,tmp (cdr ,tmp))))))))
 
+  ;; DO-SYMBOLS — (do-symbols (var [pkg [result]]) body...)
+  ;; Collect all accessible symbols of PKG via %do-symbols-fn into a fresh
+  ;; list, then iterate.  Body is in an implicit BLOCK NIL so RETURN works.
+  ;; Mirrors the build-side rewrite-package-iteration expansion, but
+  ;; folded into the compiler so the build rewrite can be retired.
+  (mvm-define-macro "DO-SYMBOLS"
+    (lambda (form)
+      (let* ((spec (cadr form))
+             (var (car spec))
+             (pkg (if (cdr spec) (cadr spec) '*package*))
+             (result (and (cddr spec) (caddr spec)))
+             (body (cddr form))
+             (syms (gensym "DS-SYMS"))
+             (cur (gensym "DS-CUR")))
+        `(block nil
+           (let ((,syms nil))
+             (%do-symbols-fn (lambda (,var) (setq ,syms (cons ,var ,syms))) ,pkg)
+             (let ((,cur ,syms))
+               (loop
+                 (when (null ,cur) (return ,result))
+                 (let ((,var (car ,cur)))
+                   (tagbody ,@body))
+                 (setq ,cur (cdr ,cur)))))))))
+
+  ;; DO-EXTERNAL-SYMBOLS — same shape as DO-SYMBOLS but iterates only
+  ;; the package's external symbols via %do-external-symbols-fn.
+  (mvm-define-macro "DO-EXTERNAL-SYMBOLS"
+    (lambda (form)
+      (let* ((spec (cadr form))
+             (var (car spec))
+             (pkg (if (cdr spec) (cadr spec) '*package*))
+             (result (and (cddr spec) (caddr spec)))
+             (body (cddr form))
+             (syms (gensym "DES-SYMS"))
+             (cur (gensym "DES-CUR")))
+        `(block nil
+           (let ((,syms nil))
+             (%do-external-symbols-fn
+               (lambda (,var) (setq ,syms (cons ,var ,syms))) ,pkg)
+             (let ((,cur ,syms))
+               (loop
+                 (when (null ,cur) (return ,result))
+                 (let ((,var (car ,cur)))
+                   (tagbody ,@body))
+                 (setq ,cur (cdr ,cur)))))))))
+
+  ;; DO-ALL-SYMBOLS — (do-all-symbols (var [result]) body...).  Iterates
+  ;; every symbol of every package via %do-all-symbols-fn.
+  (mvm-define-macro "DO-ALL-SYMBOLS"
+    (lambda (form)
+      (let* ((spec (cadr form))
+             (var (car spec))
+             (result (and (cdr spec) (cadr spec)))
+             (body (cddr form))
+             (syms (gensym "DAS-SYMS"))
+             (cur (gensym "DAS-CUR")))
+        `(block nil
+           (let ((,syms nil))
+             (%do-all-symbols-fn (lambda (,var) (setq ,syms (cons ,var ,syms))))
+             (let ((,cur ,syms))
+               (loop
+                 (when (null ,cur) (return ,result))
+                 (let ((,var (car ,cur)))
+                   (tagbody ,@body))
+                 (setq ,cur (cdr ,cur)))))))))
+
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"
     (lambda (form)

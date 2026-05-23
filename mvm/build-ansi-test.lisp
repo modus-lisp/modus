@@ -1515,7 +1515,9 @@
        `(handler-case ,body ,@clauses)))
     ;; (define-condition name parents slots &rest options)
     ;; → (%define-condition ...) + reader defuns
-    ((and (eq (car form) 'define-condition) (cdr form))
+    ;; RETIRED: handled by compile-time macro in compiler.lisp via
+    ;; mvm-define-macro "DEFINE-CONDITION".  Gated off here.
+    ((and nil (eq (car form) 'define-condition) (cdr form))
      (rewrite-reader-forms (rewrite-define-condition form)))
     ;; (define-condition-with-tests name parents slots &rest options)
     ;; → expand macro inline → (%define-condition ...) + tests

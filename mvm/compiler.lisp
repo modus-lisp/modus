@@ -1586,6 +1586,96 @@
                    (tagbody ,@body))
                  (setq ,cur (cdr ,cur)))))))))
 
+  ;; DEFINE-CONDITION — (define-condition NAME (PARENT…) (SLOT-SPEC…)
+  ;;                                       [(:default-initargs …)] [(:report …)] …)
+  ;;
+  ;; Expands into `(%define-condition 'NAME 'PARENTS 'SLOT-DESCRIPTORS
+  ;;                                  DEFAULT-INITARGS REPORT-FN)` + a
+  ;; `(defun NAME (c) (%condition-slot c 'SLOT))` for each :reader.
+  ;; Mirrors the build-side rewrite-define-condition expansion; folded
+  ;; into the compiler so the rewrite can be retired.  Slot-spec parsing
+  ;; inlined to keep the registration self-contained.
+  (mvm-define-macro "DEFINE-CONDITION"
+    (lambda (form)
+      (let* ((name        (cadr form))
+             (parents     (or (caddr form) '(condition)))
+             (slot-specs  (or (cadddr form) nil))
+             (options     (cddddr form))
+             ;; Inline parse: each slot-spec → (name (initargs) initform readers)
+             (parsed-slots
+               (mapcar
+                 (lambda (spec)
+                   (if (atom spec)
+                       (list spec nil :no-initform nil)
+                       (let ((sname (car spec))
+                             (opts (cdr spec))
+                             (initargs nil)
+                             (initform :no-initform)
+                             (readers nil))
+                         (loop
+                           (when (null opts) (return))
+                           (let ((k (car opts)) (v (cadr opts)))
+                             (cond
+                               ((eq k :initarg)
+                                (setf initargs (append initargs (list v))))
+                               ((eq k :initform)
+                                (setf initform v))
+                               ((or (eq k :reader) (eq k :accessor))
+                                (setf readers (append readers (list v))))
+                               ;; :type, :documentation, :writer, :allocation —
+                               ;; recognised, ignored
+                               )
+                             (setf opts (cddr opts))))
+                         (list sname initargs initform readers))))
+                 slot-specs))
+             ;; Descriptors: (name (initargs) initform) — drop readers
+             (slot-descriptors
+               (mapcar (lambda (p) (list (first p) (second p) (third p)))
+                       parsed-slots))
+             ;; Find option by key from the &rest options list
+             (find-opt
+               (lambda (key)
+                 (let ((found nil) (cur options))
+                   (loop
+                     (when (null cur) (return found))
+                     (let ((o (car cur)))
+                       (when (and (consp o) (eq (car o) key))
+                         (setq found (cdr o))
+                         (return found)))
+                     (setq cur (cdr cur))))))
+             (default-initargs-opt (funcall find-opt :default-initargs))
+             (report-opt           (funcall find-opt :report))
+             (default-initargs-arg
+               (if default-initargs-opt
+                   (list 'quote default-initargs-opt)
+                   nil))
+             (report-fn-arg
+               (cond
+                 ((null report-opt) nil)
+                 ;; (:report (lambda (c s) …)) — opt is a list whose car is lambda
+                 ((and (consp (car report-opt)) (eq (caar report-opt) 'lambda))
+                  (list 'quote (car report-opt)))
+                 ;; (:report name) — opt is (name)
+                 ((symbolp (car report-opt))
+                  (list 'quote (car report-opt)))
+                 ;; (:report "string")
+                 ((stringp (car report-opt))
+                  `(lambda (c s) (declare (ignore c)) (write-string ,(car report-opt) s)))
+                 (t nil)))
+             (def-call
+               `(%define-condition (quote ,name) (quote ,parents)
+                                   (quote ,slot-descriptors)
+                                   ,default-initargs-arg
+                                   ,report-fn-arg))
+             (reader-defuns
+               (let ((acc nil))
+                 (dolist (p parsed-slots (nreverse acc))
+                   (let ((sname (first p)) (readers (fourth p)))
+                     (dolist (r readers)
+                       (push `(defun ,r (c) (%condition-slot c (quote ,sname)))
+                             acc)))))))
+        `(progn ,def-call ,@reader-defuns))))
+
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"
     (lambda (form)

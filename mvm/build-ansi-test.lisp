@@ -2329,7 +2329,7 @@
                              lst)))
               (setf forms (mapcar-safe #'rewrite-reader-forms forms))
               (setf forms (mapcar-safe #'rewrite-multi-arg-apply forms))
-              (setf forms (mapcar-safe #'rewrite-aux-params forms))
+              ;; &aux retired: preprocess-params handles it natively.
               (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
               (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
               (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
@@ -2573,50 +2573,11 @@
            `(apply ,fn ,final-rewritten))))
     (t (mapcar-dotted #'rewrite-multi-arg-apply form))))
 
-;; Rewrite &aux bindings in defun/lambda parameter lists into let* in the body.
-;; MVM compiler does not support &aux.
-;; (defun foo (a b &aux (x expr)) body) → (defun foo (a b) (let* ((x expr)) body))
-(defun rewrite-aux-params (form)
-  "Walk form tree, expanding &aux parameter sections into let* bindings."
-  (cond
-    ((atom form) form)
-    ;; Handle defun
-    ((and (eq (car form) 'defun) (consp (cdr form)) (consp (cddr form)))
-     (let* ((name (cadr form))
-            (params (caddr form))
-            (body (cdddr form)))
-       (multiple-value-bind (new-params aux-bindings)
-           (split-aux-params params)
-         (let ((new-body (mapcar #'rewrite-aux-params body)))
-           (if aux-bindings
-               `(defun ,name ,new-params (let* ,aux-bindings ,@new-body))
-               `(defun ,name ,new-params ,@new-body))))))
-    ;; Handle lambda
-    ((and (eq (car form) 'lambda) (consp (cdr form)))
-     (let* ((params (cadr form))
-            (body (cddr form)))
-       (multiple-value-bind (new-params aux-bindings)
-           (split-aux-params params)
-         (let ((new-body (mapcar #'rewrite-aux-params body)))
-           (if aux-bindings
-               `(lambda ,new-params (let* ,aux-bindings ,@new-body))
-               `(lambda ,new-params ,@new-body))))))
-    (t (mapcar-dotted #'rewrite-aux-params form))))
-
-(defun split-aux-params (params)
-  "Split a parameter list at &aux, returning (values required-params aux-bindings).
-   aux-bindings is nil if no &aux present."
-  (let ((aux-pos (position '&aux params)))
-    (if aux-pos
-        (let ((before (subseq params 0 aux-pos))
-              (aux-forms (subseq params (1+ aux-pos))))
-          (values before
-                  (mapcar (lambda (b)
-                            (if (consp b)
-                                b
-                                (list b nil)))
-                          aux-forms)))
-        (values params nil))))
+;; &aux rewriting retired 2026-05-23: preprocess-params in mvm/compiler.lisp
+;; expands &aux into a let* wrapping the body at compile time, so the
+;; build-side rewrite was redundant scaffolding.  Deletion is the first
+;; step of retiring the rewrite-* family (see feedback_no_test_rewrites).
+;; Shard delta: −2 P, −15 F, +17 lost vs Sym-identity v2 (essentially flat).
 
 (defvar *ansi-aux-loaded* nil)  ; track which aux files already loaded (avoid duplicates)
 
@@ -2657,9 +2618,7 @@
           (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
           (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
           (setf forms (mapcar-safe #'rewrite-reader-forms forms))
-          ;; Expand &aux lambda keyword into let* bindings in function body.
-          ;; MVM compiler does not support &aux.
-          (setf forms (mapcar-safe #'rewrite-aux-params forms))
+          ;; &aux retired: preprocess-params handles it natively.
           ;; Rewrite (apply fn a1 a2 ... list) → (apply fn (append (list a1 a2 ...) list))
           ;; MVM's apply only handles (fn list) form; CL allows spread args before final list.
           (setf forms (mapcar-safe #'rewrite-multi-arg-apply forms)))

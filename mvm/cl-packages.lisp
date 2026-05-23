@@ -558,8 +558,49 @@
                                 (%pkg-set-external pkg
                                   (%symtab-add (%pkg-external pkg) name-str kw))
                                 (values kw :external))
-                              (let ((sym (%make-cl-symbol name-str)))
-                                (%cl-sym-set-package sym pkg)
+                              ;; Regular (non-keyword) package: SYMBOL IDENTITY.
+                              ;;
+                              ;; Consult the global compile-time intern table
+                              ;; at #x10000088 FIRST.  Compile-quote interns
+                              ;; every `'foo` literal there via %INTERN-SYMBOL
+                              ;; (returning a 1-slot native MVM sym keyed by
+                              ;; name-hash).  If a sym already exists for this
+                              ;; hash, REUSE it — this is what makes
+                              ;; (eq 'foo (intern "FOO")) hold.  Without this
+                              ;; lookup, the reader created a fresh 3-slot CL
+                              ;; sym while compile-quote referenced the 1-slot
+                              ;; native sym, and the two had distinct identity
+                              ;; even though they shared a name and hash.
+                              ;;
+                              ;; The shared object's name-string lives in the
+                              ;; package symtab we register below; symbol-name
+                              ;; on a 1-slot sym reverse-looks-up through that
+                              ;; symtab.  Slot 1 (package) is unused for native
+                              ;; syms; symbol-package walks *all-packages* via
+                              ;; %native-mvm-sym-name-lookup for them.
+                              (let* ((hash (compute-name-hash name-str))
+                                     ;; Pre-alloc lookup — table pointer
+                                     ;; isn't held across any allocation.
+                                     (existing
+                                       (let ((g (mem-ref #x10000088 :u64)))
+                                         (and g (gethash hash g))))
+                                     (sym (or existing
+                                              (let ((s (%make-cl-symbol name-str)))
+                                                (%cl-sym-set-package s pkg)
+                                                ;; Re-read the table AFTER
+                                                ;; allocation: %make-cl-symbol
+                                                ;; can trigger GC, which moves
+                                                ;; the hash-table to to-space
+                                                ;; and updates the root slot
+                                                ;; (#x10000088).  A stale
+                                                ;; pointer captured before the
+                                                ;; alloc would puthash into
+                                                ;; from-space — same GC trap
+                                                ;; documented on %intern-symbol.
+                                                (let ((g (mem-ref #x10000088 :u64)))
+                                                  (when g
+                                                    (puthash hash g s)))
+                                                s))))
                                 (%pkg-set-internal pkg
                                   (%symtab-add (%pkg-internal pkg) name-str sym))
                                 (values sym nil))))))))))))

@@ -2702,7 +2702,45 @@
                       (%record-test-fail-or-emit 56309)
                       (%record-test-fail-or-emit 56310)
                       (%record-test-fail-or-emit 56311)
-                      (%record-test-fail-or-emit 56312))))))
+                      (%record-test-fail-or-emit 56312))))
+
+      ;; ----------------------------------------------------------------
+      ;; Probes 56320-56324 — SYMBOL IDENTITY.  CLHS guarantees that
+      ;; interning the same name in the same package yields the same
+      ;; object: `(eq (intern "FOO") (intern "FOO"))` must be T.  Modus
+      ;; historically had separate paths for compile-time and runtime
+      ;; intern, producing distinct objects.  cl-packages.lisp::intern
+      ;; now consults the compile-time intern table at #x10000088
+      ;; first, so all routes return the same object.
+      ;; ----------------------------------------------------------------
+      ;; 56320 — two runtime intern calls on the same name return EQ.
+      (handler-case
+          (deftest 56320 (eq (intern "%PROBE-IDENT-A") (intern "%PROBE-IDENT-A")) t)
+        (t (c) (%record-test-fail-or-emit 56320)))
+      ;; 56321 — `'foo` and `(intern "FOO")` return EQ when "FOO" is a
+      ;; symbol that compile-quote already interned.  '%probe-ident-b
+      ;; is interned at this defun's compile time; intern reusing the
+      ;; same object proves the bridge works.
+      (handler-case
+          (deftest 56321 (eq '%probe-ident-b (intern "%PROBE-IDENT-B")) t)
+        (t (c) (%record-test-fail-or-emit 56321)))
+      ;; 56322 — reader-interned symbol from `(read-from-string "X")`
+      ;; returns the same object as `'X` after both are interned in *package*.
+      (handler-case
+          (let ((r (read-from-string "%PROBE-IDENT-C")))
+            (deftest 56322 (eq r (intern "%PROBE-IDENT-C")) t))
+        (t (c) (%record-test-fail-or-emit 56322)))
+      ;; 56323 — and the symbol's printed name round-trips.
+      (handler-case
+          (deftest 56323 (string= (symbol-name (intern "%PROBE-IDENT-D"))
+                                  "%PROBE-IDENT-D") t)
+        (t (c) (%record-test-fail-or-emit 56323)))
+      ;; 56324 — equal on lists containing reader-and-compile-time syms
+      ;; should now be T (used to fail; see probe 56312 above).
+      (handler-case
+          (let ((r (read-from-string "(+ 1 2)")))
+            (deftest 56324 (equal r '(+ 1 2)) t))
+        (t (c) (%record-test-fail-or-emit 56324)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

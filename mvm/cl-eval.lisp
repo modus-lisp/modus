@@ -378,13 +378,20 @@
 (defun %eval-sym-name (sym)
   "Get the string name of a symbol (CL or MVM).
 
-   Native MVM symbols (subtag #x50, 1-slot — just a hash) have no name
-   string in our representation; the source-level reader interns them
-   by hash only.  For these we return nil; callers that compare against
-   a known name should also use %eval-sym-hash-eq for hash-based eq."
+   Falls back to `symbol-name` for native MVM #x50 syms (1-slot, hash-
+   only); symbol-name reverse-looks-up the name via *all-packages* —
+   important now that cl-packages.lisp::intern unifies with the
+   compile-time intern table and may return a 1-slot sym for which
+   the caller (setq, defvar handler, …) still needs a name string."
   (cond
+    ((null sym) nil)
+    ((eq sym t) nil)
     ((%cl-sym-p sym) (%cl-sym-name sym))
     ((stringp sym) sym)
+    ((or (fixnump sym) (consp sym) (characterp sym)) nil)
+    ((let ((st (obj-subtag sym))) (or (= st #x50) (= st #x53)))
+     (let ((nm (symbol-name sym)))
+       (if (and nm (> (length nm) 0)) nm nil)))
     (t nil)))
 
 (defun %native-sym-p (sym)

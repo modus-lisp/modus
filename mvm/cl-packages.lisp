@@ -918,38 +918,43 @@
 
 (defun boundp (sym)
   "True if SYM has a value in the global symbol-value alist (#x10000080).
-   Previous implementation was a stub that returned T for everything that
-   wasn't a CL symbol and `(keywordp sym)` for CL symbols — so a defvar
-   evaluated at runtime never showed as bound to (boundp ...).  Walks
-   the same global alist that symbol-value/set-symbol-value use; finds
-   the entry by hash even if the bound value happens to be NIL (a
-   `symbol-value` lookup that returns NIL conflates 'not bound' with
-   'bound to NIL', so boundp can't just chain through it)."
+   Walks the same alist that symbol-value/set-symbol-value use; finds
+   the entry by SYM's hash even if the bound value happens to be NIL
+   (a symbol-value lookup that returns NIL conflates 'not bound' with
+   'bound to NIL', so boundp can't just chain through it).
+
+   Defensive about argument type: only attempts a hash-based lookup if
+   SYM is provably a symbol (CL or native MVM) via the existing
+   %cl-sym-p / %native-mvm-sym-p predicates, which do all the safe
+   pre-checks (fixnum/cons/null/character) before touching obj-subtag.
+   Returns NIL for anything else.  An earlier version's inline subtag
+   check crashed forks when called on closures/streams (tagged objects
+   whose obj-subtag landed on memory that read as #x50 by accident)."
   (cond
-    ((null sym) nil)                   ; NIL is not bound (the value is itself)
+    ((null sym) t)                     ; NIL is bound to itself (CLHS)
     ((eq sym t) t)
-    ((keywordp sym) t)                 ; keywords self-evaluate
-    (t
-     (let ((key (cond
-                  ((%cl-sym-p sym) (aref sym 0))
-                  ((integerp sym) sym)
-                  ;; Native MVM symbol (subtag #x50, slot 0 = hash)
-                  ((and (not (consp sym)) (not (characterp sym))
-                        (not (stringp sym))
-                        (= (obj-subtag sym) 80))
-                   (aref sym 0))
-                  (t nil))))
-       (if (null key)
-           nil
-           (let ((cur (mem-ref #x10000080 :u64))
-                 (found nil))
-             (loop
-               (when found (return t))
-               (when (not (consp cur)) (return nil))
-               (let ((pair (car cur)))
-                 (when (and (consp pair) (eql (car pair) key))
-                   (setq found t)))
-               (setq cur (cdr cur)))))))))
+    ((keywordp sym) t)
+    ((%cl-sym-p sym)
+     (%boundp-by-hash (aref sym 0)))
+    ((%native-mvm-sym-p sym)
+     (%boundp-by-hash (aref sym 0)))
+    ((integerp sym)
+     (%boundp-by-hash sym))
+    (t nil)))
+
+(defun %boundp-by-hash (key)
+  "Walk the global symbol-value alist looking for KEY.  Returns T if
+   any pair with (eql (car pair) KEY); NIL otherwise — distinguishes
+   'present, bound to NIL' from 'absent'."
+  (let ((cur (mem-ref #x10000080 :u64))
+        (found nil))
+    (loop
+      (when found (return t))
+      (when (not (consp cur)) (return nil))
+      (let ((pair (car cur)))
+        (when (and (consp pair) (eql (car pair) key))
+          (setq found t)))
+      (setq cur (cdr cur)))))
 
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS. Numbers, characters, strings,

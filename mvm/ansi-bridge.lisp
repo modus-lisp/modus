@@ -2687,9 +2687,11 @@
 ;;; SPECIAL-OPERATOR-P, MACRO-FUNCTION, FBOUNDP extensions
 ;;; ============================================================
 
-(defun macro-function (name &optional env)
-  "Return macro function for NAME (stub)."
-  nil)
+;; macro-function lives in cl-eval.lisp (the real impl).  Earlier stub
+;; here returned NIL unconditionally; ansi-bridge.lisp loads AFTER
+;; cl-eval.lisp so last-defun-wins gave the stub, breaking every macro
+;; lookup — including the runtime-load suite-shape probe which loads a
+;; defmacro and then immediately uses it.  Removed.
 
 (defun compiler-macro-function (name &optional env)
   "Return compiler macro function for NAME (stub)."

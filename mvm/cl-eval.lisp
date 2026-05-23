@@ -217,10 +217,19 @@
       (t nil))))
 
 (defun set-macro-function (sym fn &rest env)
-  "Install FN as the macro expander for SYM."
+  "Install FN as the macro expander for SYM.  Accepts CL symbols, native
+   MVM #x50 symbols (hash-only — recover name via symbol-name), strings,
+   and keywords.  Earlier version only handled CL syms; runtime DEFMACRO
+   on a reader-produced native sym silently dropped the binding."
   (let ((name (cond
+                ((null sym) nil)
                 ((%cl-sym-p sym) (%cl-sym-name sym))
                 ((stringp sym) sym)
+                ((and (not (consp sym)) (not (fixnump sym))
+                      (not (characterp sym))
+                      (let ((st (obj-subtag sym)))
+                        (or (= st #x50) (= st #x53))))
+                 (symbol-name sym))
                 (t nil))))
     (when name
       (unless *macro-function-table*
@@ -233,14 +242,27 @@
 ;;; ============================================================
 
 (defun macroexpand-1 (form &rest env-arg)
-  "Expand FORM one level if it's a macro call. Returns (values form expanded-p)."
-  (if (and (consp form) (%cl-sym-p (car form)))
-      (let ((mf (macro-function (car form))))
-        (if mf
-            (let ((expanded (funcall mf form nil)))
-              (values expanded t))
-            (values form nil)))
-      (values form nil)))
+  "Expand FORM one level if it's a macro call. Returns (values form expanded-p).
+   For an %interp-closure macro fn (the shape DEFMACRO produces via
+   eval), bind the user's params to (cdr form) and evaluate body — i.e.
+   the user wrote `(defmacro NAME (p1 p2) body)` and the macro sees its
+   arguments as (p1 p2), not the whole form.  For any other macro fn
+   (compiled real CL fn that wants (form env)), call with (form nil)."
+  (cond
+    ;; Recognise CL syms AND native MVM #x50 syms as macro heads.
+    ((and (consp form)
+          (or (%cl-sym-p (car form))
+              (%native-mvm-sym-p (car form))))
+     (let ((mf (macro-function (car form))))
+       (cond
+         ((null mf) (values form nil))
+         ((%interp-closure-p mf)
+          (let ((expanded (%call-interp-closure mf (cdr form))))
+            (values expanded t)))
+         (t
+          (let ((expanded (funcall mf form nil)))
+            (values expanded t))))))
+    (t (values form nil))))
 
 (defun macroexpand (form &rest env-arg)
   "Expand FORM repeatedly until not a macro call. Returns (values form expanded-p)."
@@ -661,7 +683,11 @@
       ;; FUNCTION (#')
       ((%eval-sym-eq op "FUNCTION")
        (%eval-function-form (car args) env))
-      ;; DEFUN
+      ;; DEFUN — register an %interp-closure in BOTH the name-string SFT
+      ;; AND the hash-keyed native-sym table (mirror).  Without the
+      ;; mirror, fboundp/funcall on a compile-time-quoted symbol like
+      ;; `'foo` (a native MVM #x50 sym) can't find the runtime-defined
+      ;; fn — it consults *native-sym-function-table* by hash.
       ((%eval-sym-eq op "DEFUN")
        (let ((fname (car args))
              (params (cadr args))
@@ -670,7 +696,10 @@
            (let ((fn (list '%interp-closure params body nil)))
              (when name-str
                (unless *symbol-function-table* (%sft-init))
-               (puthash name-str *symbol-function-table* fn)))
+               (puthash name-str *symbol-function-table* fn)
+               (when *native-sym-function-table*
+                 (puthash (compute-name-hash name-str)
+                          *native-sym-function-table* fn))))
            fname)))
       ;; DEFVAR / DEFPARAMETER / DEFCONSTANT — go through %eval-set-global
       ;; (handles native MVM symbols by hash; CL symbols by name+hash).
@@ -690,6 +719,23 @@
              (val (%eval-in-env (cadr args) env)))
          (%eval-set-global vname val)
          vname))
+      ;; DEFMACRO — register an expander so subsequent forms in this
+      ;; eval / load stream macroexpand through it.  The expander is
+      ;; stored as a plain %interp-closure with the user's lambda-list
+      ;; and body verbatim.  macroexpand-1 below knows to call it with
+      ;; (cdr whole-form) instead of (whole-form env) so the user's
+      ;; params bind to the macro's actual arguments.
+      ;;
+      ;; Today this only handles flat lambda-lists (what %bind-params
+      ;; handles for DEFUN); &whole/&environment and nested destructuring
+      ;; are follow-ups.  The gcl ansi-test suite's `deftest` is flat.
+      ((%eval-sym-eq op "DEFMACRO")
+       (let* ((mname (car args))
+              (params (cadr args))
+              (body (cddr args))
+              (expander (list '%interp-closure params body nil)))
+         (set-macro-function mname expander)
+         mname))
       ;; ----- CLOS forms — runtime evaluation of defmethod/defgeneric/defclass.
       ;; All three reuse the back-end functions the build-time rewriter
       ;; targets (%defmethod, %defgeneric, %defclass) so eval'd CLOS forms
@@ -994,6 +1040,22 @@
                    (set-car (cdddr fn) new-env)))
                (setq cur (cdr cur))))
            (%eval-progn body new-env))))
+      ;; Macro call (CL sym or native MVM sym).  Must be checked BEFORE
+      ;; the function-call branches: macros do not evaluate their args.
+      ;; ONLY fires for a CALLABLE expander — runtime DEFMACRO stores
+      ;; an %interp-closure here.  macro-function returns T (a marker)
+      ;; for built-in compiler-macros like PUSH/POP/COND that the modus
+      ;; compiler implements directly; those are NOT expandable at
+      ;; runtime via funcall (would `(funcall T form nil)` → crash).
+      ;; For T markers, fall through to the function-call path; eval
+      ;; will then error with undefined-function, which the suite
+      ;; expects when it eval's a form that's only a compiler macro.
+      ((and (or (%cl-sym-p op) (%native-mvm-sym-p op))
+            (let ((mf (macro-function op)))
+              (and mf (%interp-closure-p mf))))
+       (let* ((mf (macro-function op))
+              (expanded (%call-interp-closure mf args)))
+         (%eval-in-env expanded env)))
       ;; Function call: CL symbol
       ((%cl-sym-p op)
        (%eval-funcall op args env))

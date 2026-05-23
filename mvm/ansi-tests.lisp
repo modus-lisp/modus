@@ -71,6 +71,34 @@
 ;; ((lambda (x) (+ x n)) 5) under (let ((n 10)) ...) must return 15.
 (defun %imm-cap () (let ((n 10)) ((lambda (x) (+ x n)) 5)))
 
+;; Runtime-load probe helper (for 56308+): read each top-level form
+;; from PATH and eval it individually, with per-form diagnostic markers
+;; so a wedge tells us exactly WHICH form crashed.  Lives at top level
+;; (not inline in run-all-tests) so the run-all-tests function stays
+;; small enough to dodge the codegen-size threshold.
+(defun %probe-read-eval-suite (path)
+  (let ((s (open path :direction :input)))
+    (let ((eof (list 'eof))
+          (n 0))
+      (loop
+        (let ((f (read s nil eof)))
+          (when (eq f eof) (return nil))
+          (incf n)
+          (write-string-serial "F")
+          (write-string-serial (write-to-string n))
+          (write-string-serial "-OP=")
+          (write-string-serial
+            (if (and (consp f)
+                     (or (%cl-sym-p (car f)) (%native-mvm-sym-p (car f))))
+                (symbol-name (car f))
+                "?"))
+          (write-string-serial ";")
+          (eval f)
+          (write-string-serial "F")
+          (write-string-serial (write-to-string n))
+          (write-string-serial "-OK;"))))
+    (close s)))
+
 ;; &key LAMBDA probes — the transform is now ON for lambda/flet/nested
 ;; defun.  These lock in each path (plain, default, supplied-p, captured
 ;; default, captured body) plus the custom-keyword form ((:kw var) ...)
@@ -2612,7 +2640,69 @@
             (write-string-serial ";")
             (deftest 56307 (if (boundp '*probe-fmt-val*) *probe-fmt-val* :unbound) "X=42"))
         (t (c) (progn (write-string-serial "OUT-ERR;")
-                      (%record-test-fail-or-emit 56307))))))
+                      (%record-test-fail-or-emit 56307))))
+
+      ;; ----------------------------------------------------------------
+      ;; Probes 56308-56312 — tiny suite-shape file:
+      ;;   defvar registry + defun helper + defmacro deftest + uses.
+      ;; Verifies that loading a file that DEFINES AND IMMEDIATELY USES
+      ;; a macro works end-to-end.  This is what (load <ANSI file>)
+      ;; really needs: tests register via the suite's deftest macro,
+      ;; which must be macroexpanded by the loader's eval, NOT just
+      ;; treated as an opaque function call.
+      ;; ----------------------------------------------------------------
+      (handler-case
+          (progn
+            (makunbound '*probe-suite-entries*)
+            ;; Write the probe file fresh each run so /tmp cleaning
+            ;; doesn't break the suite.
+            (let ((s (open "/tmp/probe-suite.lisp" :direction :output :if-exists :supersede)))
+              (when s
+                (write-string "(defvar *probe-suite-entries* nil)" s) (write-char #\Newline s)
+                (write-string "(defun probe-record (name form expected)" s) (write-char #\Newline s)
+                (write-string "  (setq *probe-suite-entries*" s) (write-char #\Newline s)
+                (write-string "        (cons (list name form expected) *probe-suite-entries*)))" s) (write-char #\Newline s)
+                (write-string "(defmacro probe-deftest (name form expected)" s) (write-char #\Newline s)
+                (write-string "  (list (quote probe-record) (list (quote quote) name) (list (quote quote) form) (list (quote quote) expected)))" s) (write-char #\Newline s)
+                (write-string "(probe-deftest p-add (+ 1 2) 3)" s) (write-char #\Newline s)
+                (write-string "(probe-deftest p-list (list 'a 'b 'c) (a b c))" s) (write-char #\Newline s)
+                (close s)))
+            (write-string-serial "SUITE-WROTE;")
+            ;; Read+eval each form individually with per-form markers so
+            ;; if a single form wedges we know exactly which one.
+            (%probe-read-eval-suite "/tmp/probe-suite.lisp")
+            (write-string-serial "ALL-FORMS-OK;ENTRIES-BOUND=")
+            (write-string-serial (if (boundp '*probe-suite-entries*) "T" "NIL"))
+            (write-string-serial ";")
+            ;; 56308 — registry got bound
+            (deftest 56308 (boundp '*probe-suite-entries*) t)
+            ;; 56309 — defun was registered (fboundp seeing it)
+            (deftest 56309 (fboundp 'probe-record) t)
+            ;; 56310 — defmacro was registered (macro-function returns non-nil)
+            (deftest 56310 (not (null (macro-function 'probe-deftest))) t)
+            ;; 56311 — both uses of the macro registered tests
+            (deftest 56311 (length *probe-suite-entries*) 2)
+            ;; 56312 — first entry has expected shape (NAME FORM EXPECTED).
+            ;; Compare symbols by NAME STRING (Modus's reader-interned
+            ;; symbols may not be `eq` or `equal` to compile-time-quoted
+            ;; ones — see CLAUDE.md "Symbol identity").  cadr and caddr
+            ;; are integer/list literals so they're compared with equal.
+            ;; 56312 — first entry has expected shape (NAME FORM EXPECTED).
+            ;; Avoid comparing list contents that contain symbols (Modus's
+            ;; reader-vs-compile-time symbol-identity quirk would break
+            ;; `equal` on (+ 1 2) vs a quoted equivalent); check only
+            ;; type-shape and the integer EXPECTED value.
+            (deftest 56312 (let ((e (car (last *probe-suite-entries*))))
+                             (and (string= (symbol-name (car e)) "P-ADD")
+                                  (consp (cadr e))                ; form is a list
+                                  (= (length (cadr e)) 3)         ; (op a b)
+                                  (= (caddr e) 3))) t))
+        (t (c) (progn (write-string-serial "SUITE-ERR;")
+                      (%record-test-fail-or-emit 56308)
+                      (%record-test-fail-or-emit 56309)
+                      (%record-test-fail-or-emit 56310)
+                      (%record-test-fail-or-emit 56311)
+                      (%record-test-fail-or-emit 56312))))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

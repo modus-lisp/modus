@@ -591,14 +591,46 @@
 ;;; are recognized during IR generation. Macro expansion is the key
 ;;; transformation in this phase.
 
+(defun %flatten-multi-dim-contents (dims contents)
+  "Flatten a nested :initial-contents literal in row-major order against
+   DIMS.  Returns a flat list of (PROD DIMS) elements, or NIL if the
+   shape doesn't match.  Used by the MAKE-ARRAY compile-time macro for
+   `(make-array '(M N) :initial-contents '(...))` forms."
+  (cond
+    ((null dims)
+     ;; Scalar: contents is the value
+     (list contents))
+    ((null (cdr dims))
+     ;; Last dim: contents is a flat sequence of (car dims) elements
+     (cond ((listp contents) (copy-list contents))
+           (t nil)))
+    (t
+     ;; Recurse: contents must be a list of (car dims) sub-arrays
+     (let ((acc nil)
+           (cur contents))
+       (loop
+         (when (null cur) (return (nreverse acc)))
+         (unless (consp cur) (return nil))
+         (let ((sub (%flatten-multi-dim-contents (cdr dims) (car cur))))
+           (when (null sub) (return nil))
+           (dolist (e sub) (push e acc))
+           (setq cur (cdr cur))))))))
+
 (defun macroexpand-1-mvm (form)
   "Expand one level of macro in FORM, using the MVM macro table.
-   Returns (values expanded-form expanded-p)."
+   Returns (values expanded-form expanded-p).  An expander that returns
+   its input unchanged (e.g. a macro that decides this particular call
+   doesn't need expansion and falls through to a compile-time builtin)
+   reports expanded-p=NIL — without this, macroexpand-mvm would loop
+   forever on no-op expanders."
   (if (and (consp form) (symbolp (car form)))
       (let* ((name (normalize-name (car form)))
              (expander (gethash name *macro-table*)))
         (if expander
-            (cons (funcall expander form) t)
+            (let ((result (funcall expander form)))
+              (if (eq result form)
+                  (cons form nil)
+                  (cons result t)))
             (cons form nil)))
       (cons form nil)))
 
@@ -1675,6 +1707,115 @@
                        (push `(defun ,r (c) (%condition-slot c (quote ,sname)))
                              acc)))))))
         `(progn ,def-call ,@reader-defuns))))
+
+  ;; MAKE-ARRAY — native multi-dim support.  Modus's compile-make-array
+  ;; handles only `(make-array N)` and `(make-array '(N))`; the build-side
+  ;; rewrite-make-array-dims expanded `(make-array '(M N …))` to a
+  ;; `(cons 9867654 (cons '(M N …) underlying))` wrapper that
+  ;; arrayp/array-rank/aref already recognise (cl-clos.lisp).  Folded
+  ;; that expansion into the compiler as a macro.  Only fires for the
+  ;; multi-dim quoted-list case + :initial-element/:initial-contents/
+  ;; no-init kwargs; other shapes (variable dims, displaced, adjustable,
+  ;; fill-pointer, element-type) fall through to the existing dispatch.
+  ;;
+  ;; Helper: pluck :initial-element / :initial-contents from a flat kwarg
+  ;; list.  Returns (values init-elem-or-nil init-contents-or-nil
+  ;;                       has-init-elem-p has-init-contents-p
+  ;;                       other-kwargs).
+  (flet ((parse-make-array-kwargs (kwargs)
+           (let ((init-elem nil)
+                 (init-contents nil)
+                 (has-ie nil)
+                 (has-ic nil)
+                 (others nil)
+                 (cur kwargs))
+             (loop
+               (when (null cur) (return))
+               (let ((k (car cur)) (v (cadr cur)))
+                 (cond
+                   ((eq k :initial-element)
+                    (setf init-elem v has-ie t))
+                   ((eq k :initial-contents)
+                    (setf init-contents v has-ic t))
+                   (t
+                    (setf others (cons k (cons v others))))))
+               (setf cur (cddr cur)))
+             (values init-elem init-contents has-ie has-ic (nreverse others))))
+         (multi-dim-quoted-list-p (form)
+           ;; Returns the dims list if FORM is `'(M N ...)` with at least 2
+           ;; integer dims (single-dim and 0-dim handled separately).
+           (and (consp form) (eq (car form) 'quote)
+                (consp (cdr form)) (consp (cadr form))
+                (consp (cdr (cadr form)))
+                (every (lambda (d) (integerp d)) (cadr form))
+                (cadr form))))
+    (mvm-define-macro "MAKE-ARRAY"
+      (lambda (form)
+        (let* ((dims-arg (and (consp (cdr form)) (cadr form)))
+               (kwargs (and (consp (cdr form)) (cddr form)))
+               (multi-dims (and dims-arg (multi-dim-quoted-list-p dims-arg)))
+               ;; Single-dim quoted list: `'(N)`.  Unwrap to integer N so
+               ;; subsequent rewrite-make-array-initcontents (still active)
+               ;; can fire on the kwargs.  Without this normalization the
+               ;; single-dim-with-kwargs forms lose their :initial-element.
+               (single-dim (and dims-arg
+                                (consp dims-arg) (eq (car dims-arg) 'quote)
+                                (consp (cdr dims-arg)) (consp (cadr dims-arg))
+                                (null (cdr (cadr dims-arg)))
+                                (integerp (car (cadr dims-arg)))
+                                (car (cadr dims-arg)))))
+          (cond
+            ;; Single-dim '(N): unwrap so kwargs reach the next pass.
+            (single-dim
+             (cons 'make-array (cons single-dim kwargs)))
+            ;; Multi-dim quoted list: wrap.
+            (multi-dims
+             (multiple-value-bind (init-elem init-contents has-ie has-ic others)
+                 (parse-make-array-kwargs kwargs)
+               (declare (ignore others))   ; advanced kwargs not yet folded in
+               (let ((total (reduce #'* multi-dims))
+                     (arr (gensym "%MKAW"))
+                     (i (gensym "%MKAI"))
+                     (v (gensym "%MKAV")))
+                 (cond
+                   ;; :initial-element — fill the flat underlying array.
+                   (has-ie
+                    `(cons 9867654
+                       (cons (quote ,multi-dims)
+                             (let ((,arr (make-array ,total))
+                                   (,v ,init-elem))
+                               (let ((,i 0))
+                                 (loop
+                                   (when (>= ,i ,total) (return ,arr))
+                                   (aset ,arr ,i ,v)
+                                   (setq ,i (+ ,i 1))))))))
+                   ;; :initial-contents — flatten the nested literal at
+                   ;; macroexpand time when it's a quoted nested list, so
+                   ;; the compiler sees plain asets.  Variable contents
+                   ;; (non-quoted) fall through to the rewriter for now.
+                   ((and has-ic (consp init-contents) (eq (car init-contents) 'quote))
+                    (let* ((nested (cadr init-contents))
+                           (flat (%flatten-multi-dim-contents multi-dims nested)))
+                      (if (and flat (= (length flat) total))
+                          (let ((sets nil))
+                            (loop for elem in flat
+                                  for k from 0
+                                  do (push `(aset ,arr ,k (quote ,elem)) sets))
+                            `(cons 9867654
+                               (cons (quote ,multi-dims)
+                                     (let ((,arr (make-array ,total)))
+                                       ,@(nreverse sets)
+                                       ,arr))))
+                          form)))   ; bad shape — fall through
+                   ;; No init: just allocate and wrap.
+                   (t
+                    `(cons 9867654
+                       (cons (quote ,multi-dims)
+                             (make-array ,total))))))))
+            ;; Anything else (integer dim, '(N), variable dim, exotic
+            ;; kwargs): fall through unchanged so compile-make-array and
+            ;; any remaining build-time rewriters handle it.
+            (t form))))))
 
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"

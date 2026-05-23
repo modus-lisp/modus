@@ -65,6 +65,102 @@
     (mvm-text "mvm/ansi-bridge.lisp")))
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
+;;; --- Gap A: symbol-function table auto-registration ---
+;;;
+;;; cl-eval.lisp's %init-sft-list is a hand-curated allowlist (~229
+;;; entries).  Any defun not on it is unreachable by runtime EVAL: probes
+;;; 56303/56304 fail because write-string-serial isn't on the list.
+;;; Conformance — i.e. (eval form) for any form a Common Lisp programmer
+;;; would write — requires every defun'd function to be addressable by
+;;; name.  Walking the source via SBCL's reader on the build host gives
+;;; us the complete name list cheaply; we then emit %init-sft-auto with
+;;; (puthash NAME ht #'NAME) for each name and call it from the driver.
+;;;
+;;; Only plain `(defun NAME args body)` is collected:
+;;;   - `(defun (setf NAME) ...)` setf functions are skipped (#'(setf …)
+;;;     doesn't go through the SFT today; will revisit if it gates probes).
+;;;   - defmacro/defgeneric/defmethod/defstruct/defclass are skipped —
+;;;     they don't produce a callable by the bare symbol name (macros) or
+;;;     have their own dispatch (CLOS).
+;;;
+;;; Chunking: a single puthash-heavy defun blows past the codegen-size
+;;; threshold (the run-ansi-lambda class — see CLAUDE.md).  We split into
+;;; CHUNK-sized %init-sft-auto-N defuns called from %init-sft-auto.
+
+(defun %scan-defun-names-host (source-str)
+  "Walk SOURCE-STR via the SBCL reader, return the upcased name-strings
+   of every top-level `(defun NAME ...)` form.  Returns names as strings
+   (the SFT key type) in source order; duplicates kept (last-defun-wins
+   is desirable here — the generated puthash list will re-register the
+   final binding, matching Modus's runtime behavior)."
+  (let ((names nil)
+        (eof (list :eof)))
+    (with-input-from-string (s source-str)
+      (loop
+        (let ((form (handler-case (read s nil eof)
+                      ;; Reader errors (e.g. #+sbcl feature exprs we don't
+                      ;; resolve identically, malformed #. forms): skip
+                      ;; that form and continue scanning.  This is just
+                      ;; defun-name discovery; ignoring is safe.
+                      (error () (return)))))
+          (when (eq form eof) (return))
+          (when (and (consp form)
+                     (eq (car form) 'defun)
+                     (symbolp (cadr form)))   ; skip (defun (setf X) …)
+            (push (symbol-name (cadr form)) names)))))
+    (nreverse names)))
+
+(defun %generate-sft-auto-source (names &key (chunk 120))
+  "Emit Lisp source text for %init-sft-auto-N (chunked) + the master
+   %init-sft-auto that calls them all and remirrors the native-sym table.
+   NAMES is a list of upcased name strings."
+  ;; Dedup while preserving last-occurrence order (matches last-defun-wins).
+  (let* ((seen (make-hash-table :test 'equal))
+         (uniq (let ((rev nil))
+                 (dolist (n (reverse names))
+                   (unless (gethash n seen)
+                     (setf (gethash n seen) t)
+                     (push n rev)))
+                 rev))
+         (n-chunks 0)
+         (out (with-output-to-string (o)
+                (let ((cur uniq))
+                  (loop
+                    (when (null cur) (return))
+                    (incf n-chunks)
+                    (format o "(defun %init-sft-auto-~D ()~%" n-chunks)
+                    (format o "  (let ((ht *symbol-function-table*))~%")
+                    (let ((k 0))
+                      (loop
+                        (when (or (null cur) (>= k chunk)) (return))
+                        (format o "    (puthash ~S ht #'~A)~%"
+                                (car cur) (car cur))
+                        (setq cur (cdr cur))
+                        (incf k)))
+                    (format o "    nil))~%")))
+                (format o "(defun %init-sft-auto ()~%")
+                (let ((c 0))
+                  (loop
+                    (incf c)
+                    (when (> c n-chunks) (return))
+                    (format o "  (%init-sft-auto-~D)~%" c)))
+                (format o "  (when *native-sym-function-table*~%")
+                (format o "    (%nsft-populate-from *symbol-function-table*))~%")
+                (format o "  nil)~%"))))
+    (values out (length uniq) n-chunks)))
+
+(defvar *sft-auto-source*
+  (let ((all-names (append
+                     (%scan-defun-names-host *prelude-source*)
+                     (%scan-defun-names-host *gc-source*)
+                     (%scan-defun-names-host *rt-source*)
+                     (%scan-defun-names-host *bridge-source*))))
+    (multiple-value-bind (src count chunks)
+        (%generate-sft-auto-source all-names)
+      (format t "  SFT auto-init: ~D unique defun names across ~D chunk(s)~%"
+              count chunks)
+      src)))
+
 ;; SBCL-level stubs for functions called during macro expansion
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
@@ -3144,6 +3240,11 @@
   ;; Initialize symbol-function table with all built-in compiled functions.
   ;; Also populates *native-sym-function-table* for (funcall 'sym ...).
   (%init-symbol-function-table)
+  ;; Gap A close: register every defun'd runtime function so runtime EVAL
+  ;; can call any function by name (not just the ~229 on the hand-curated
+  ;; %init-sft-list).  Build-time scanner emits %init-sft-auto from the
+  ;; concatenated source of prelude+gc+rt+bridge.  See probes 56303/56304.
+  (%init-sft-auto)
 
   ;; Build the compiler-macro name set so MACRO-FUNCTION reports T for
   ;; PUSH/POP/COND/etc. that the modus compiler implements directly.
@@ -3376,6 +3477,11 @@
 (defun check-nsublis (a al &rest args)
   (apply #'nsublis al a args))
 "
+    (string #\Newline)
+    ;; 4.5. Auto-generated %init-sft-auto: puthash every defun in the
+    ;;      runtime sources above so runtime EVAL can call any function
+    ;;      by name (closing Gap A — see probes 56303/56304).
+    *sft-auto-source*
     (string #\Newline)
     ;; 5. Our test source (run-*-tests, run-all-tests)
     ;;    Functions defined here override aux (last-defun-wins).

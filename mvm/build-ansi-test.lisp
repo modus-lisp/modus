@@ -2554,24 +2554,14 @@
 ;; (apply fn a1 a2 ... aN list) → (apply fn (append (list a1 a2 ... aN) list))
 ;; (apply fn list) → unchanged (already 2-arg form)
 (defun rewrite-multi-arg-apply (form)
-  "Walk form tree, converting (apply fn a1 a2 ... list) to (apply fn (append (list a1 a2 ...) list))."
-  (cond
-    ((atom form) form)
-    ((and (eq (car form) 'apply)
-          (consp (cdr form))  ; has fn arg
-          (consp (cddr form)) ; has at least one more arg
-          (consp (cdddr form))) ; has at least 2 more args (fn + spread args + list)
-     ;; (apply fn a1 a2 ... aN list) where there are N >= 1 spread args before the list
-     (let* ((fn (rewrite-multi-arg-apply (cadr form)))
-            (rest-args (cddr form))  ; a1 a2 ... aN list
-            (spread-args (butlast rest-args))  ; a1 a2 ... aN
-            (final-list (car (last rest-args))) ; list
-            (final-rewritten (rewrite-multi-arg-apply final-list))
-            (spread-rewritten (mapcar #'rewrite-multi-arg-apply spread-args)))
-       (if spread-args
-           `(apply ,fn (append (list ,@spread-rewritten) ,final-rewritten))
-           `(apply ,fn ,final-rewritten))))
-    (t (mapcar-dotted #'rewrite-multi-arg-apply form))))
+  "RETIRED — prelude.lisp's `(defun apply (fn &rest spread) …)` already
+   handles `(apply fn a1 a2 … list)` by building the merged arg list
+   and dispatching by length.  The build-side rewrite was redundant
+   scaffolding.  Kept as an identity stub to avoid churning every call
+   site; the existing calls now do `(mapcar-safe #'identity …)` worth
+   of work.  Remove the calls and the stub together in a later
+   cleanup pass."
+  form)
 
 ;; &aux rewriting retired 2026-05-23: preprocess-params in mvm/compiler.lisp
 ;; expands &aux into a let* wrapping the body at compile time, so the

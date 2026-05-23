@@ -917,10 +917,39 @@
     (t (= (obj-subtag x) 83))))   ; #x53 keyword
 
 (defun boundp (sym)
-  "True if SYM is bound. Keyword symbols are always bound to themselves."
-  (if (%cl-sym-p sym)
-      (keywordp sym)
-      t))
+  "True if SYM has a value in the global symbol-value alist (#x10000080).
+   Previous implementation was a stub that returned T for everything that
+   wasn't a CL symbol and `(keywordp sym)` for CL symbols — so a defvar
+   evaluated at runtime never showed as bound to (boundp ...).  Walks
+   the same global alist that symbol-value/set-symbol-value use; finds
+   the entry by hash even if the bound value happens to be NIL (a
+   `symbol-value` lookup that returns NIL conflates 'not bound' with
+   'bound to NIL', so boundp can't just chain through it)."
+  (cond
+    ((null sym) nil)                   ; NIL is not bound (the value is itself)
+    ((eq sym t) t)
+    ((keywordp sym) t)                 ; keywords self-evaluate
+    (t
+     (let ((key (cond
+                  ((%cl-sym-p sym) (aref sym 0))
+                  ((integerp sym) sym)
+                  ;; Native MVM symbol (subtag #x50, slot 0 = hash)
+                  ((and (not (consp sym)) (not (characterp sym))
+                        (not (stringp sym))
+                        (= (obj-subtag sym) 80))
+                   (aref sym 0))
+                  (t nil))))
+       (if (null key)
+           nil
+           (let ((cur (mem-ref #x10000080 :u64))
+                 (found nil))
+             (loop
+               (when found (return t))
+               (when (not (consp cur)) (return nil))
+               (let ((pair (car cur)))
+                 (when (and (consp pair) (eql (car pair) key))
+                   (setq found t)))
+               (setq cur (cdr cur)))))))))
 
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS. Numbers, characters, strings,

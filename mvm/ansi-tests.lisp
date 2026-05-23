@@ -2584,20 +2584,34 @@
         (t (c) (progn (write-string-serial "S6-ERR;")
                       (%record-test-fail-or-emit 56306))))
 
-      ;; 56307 — full (load FILE) of a defvar form.  Today: load returns
-      ;; (no hang, no caught error), but the defvar doesn't establish a
-      ;; binding — defvar isn't dispatched at runtime by eval.  Flips
-      ;; when Gap B (runtime def* dispatch) lands.
+      ;; 56307 — full (load FILE) of a `(defvar … …)` form.  Exercises
+      ;; the entire runtime-load pipeline: read+eval of a def* special
+      ;; form whose result must be visible to compiled code's
+      ;; boundp/symbol-value.  Closed by the combined fixes:
+      ;;   %eval-set-global (cl-eval.lisp): eval's def* handlers write
+      ;;     to BOTH the eval-only alist and the compiled-code globals.
+      ;;   %sym-hash (cl-eval.lisp): correctly reads slot 0 of the
+      ;;     symbol object — CL syms ARE the 3-slot subtag-#x50 object,
+      ;;     not (cons *sym-tag* array) as some older docs claimed.
+      ;;   boundp (cl-packages.lisp): walks #x10000080 instead of the
+      ;;     keywordp-only stub.
       (handler-case
-          (progn
-            (with-open-file (s "/tmp/probe-fmt.lisp" :direction :output :if-exists :supersede)
-              (format s "(defvar *probe-fmt-val* (format nil \"X=~~D\" 42))~%"))
-            (makunbound '*probe-fmt-val*)
+          (let ((s (open "/tmp/probe-fmt.lisp" :direction :output :if-exists :supersede)))
+            (when s
+              (write-string "(defvar *probe-fmt-val* \"X=42\")" s)
+              (write-char #\Newline s)
+              (close s))
             (write-string-serial "BEFORE-LOAD;")
             (load "/tmp/probe-fmt.lisp")
-            (write-string-serial "AFTER-LOAD;")
+            (write-string-serial "AFTER-LOAD;BOUNDP=")
+            (write-string-serial (if (boundp '*probe-fmt-val*) "T" "NIL"))
+            (write-string-serial ";VAL=")
+            (write-string-serial (if (boundp '*probe-fmt-val*)
+                                     (symbol-value '*probe-fmt-val*)
+                                     "<u>"))
+            (write-string-serial ";")
             (deftest 56307 (if (boundp '*probe-fmt-val*) *probe-fmt-val* :unbound) "X=42"))
-        (t (c) (progn (write-string-serial "LOAD-ERR;")
+        (t (c) (progn (write-string-serial "OUT-ERR;")
                       (%record-test-fail-or-emit 56307))))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case

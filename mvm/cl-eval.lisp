@@ -272,8 +272,46 @@
           (return (cons t (cdr pair)))))
       (setq cur (cdr cur)))))
 
+(defun %sym-hash (sym)
+  "Return the hash slot of SYM, or NIL if SYM isn't a symbol.  Both
+   CL symbols (3-slot objects [hash package name]) and native MVM
+   symbols (1-slot objects [hash]) store the hash at slot 0 and share
+   subtag #x50 — distinguished only by array-length, which doesn't
+   matter for hash access."
+  (cond
+    ((null sym) nil)
+    ((eq sym t) nil)
+    ((fixnump sym) nil)
+    ((characterp sym) nil)
+    ((stringp sym) nil)
+    ((consp sym) nil)
+    ((= (obj-subtag sym) #x50) (aref sym 0))
+    (t nil)))
+
+(defun %eval-set-global (sym value)
+  "Set the global value of SYM in BOTH the eval-only name-string alist
+   AND the compiled-code globals alist (hash-keyed at #x10000080) so
+   the binding is visible to both subsequent eval calls and any
+   compiled reference (boundp, symbol-value, direct global load).
+   Used by eval's DEFVAR/DEFPARAMETER/DEFCONSTANT handlers."
+  (let ((h  (%sym-hash sym))
+        (nm (%eval-sym-name sym)))
+    (when h  (set-symbol-value h value))
+    (when nm (%eval-global-set nm value))
+    value))
+
 (defun %eval-global-set (name value)
-  "Set global variable by name string."
+  "Set global variable by name string.  Writes to TWO stores so that a
+   form like `(defvar *X* 42)` evaluated at runtime is visible to BOTH
+   subsequent eval calls (via the eval-only alist) AND compiled code
+   (which reads through symbol-value's hash-keyed alist at #x10000080).
+   Without the compiled-code mirror, `(load \"file-with-defvar\")` would
+   appear to succeed but the variable would be invisible to `(boundp …)`
+   and to any compiled reference — exactly the Gap B symptom on probe
+   56307."
+  ;; Mirror into compiled-code's globals alist by name hash.  Done first
+  ;; so a failure here doesn't desync the two stores in the success path.
+  (set-symbol-value (compute-name-hash name) value)
   (let ((cur *eval-global-env*))
     (loop
       (when (null cur)
@@ -634,25 +672,23 @@
                (unless *symbol-function-table* (%sft-init))
                (puthash name-str *symbol-function-table* fn)))
            fname)))
-      ;; DEFVAR / DEFPARAMETER / DEFCONSTANT
+      ;; DEFVAR / DEFPARAMETER / DEFCONSTANT — go through %eval-set-global
+      ;; (handles native MVM symbols by hash; CL symbols by name+hash).
       ((%eval-sym-eq op "DEFVAR")
        (let ((vname (car args)))
          (when (cdr args)
            (let ((val (%eval-in-env (cadr args) env)))
-             (let ((nm (%eval-sym-name vname)))
-               (when nm (%eval-global-set nm val)))))
+             (%eval-set-global vname val)))
          vname))
       ((%eval-sym-eq op "DEFPARAMETER")
        (let ((vname (car args))
              (val (%eval-in-env (cadr args) env)))
-         (let ((nm (%eval-sym-name vname)))
-           (when nm (%eval-global-set nm val)))
+         (%eval-set-global vname val)
          vname))
       ((%eval-sym-eq op "DEFCONSTANT")
        (let ((vname (car args))
              (val (%eval-in-env (cadr args) env)))
-         (let ((nm (%eval-sym-name vname)))
-           (when nm (%eval-global-set nm val)))
+         (%eval-set-global vname val)
          vname))
       ;; ----- CLOS forms — runtime evaluation of defmethod/defgeneric/defclass.
       ;; All three reuse the back-end functions the build-time rewriter

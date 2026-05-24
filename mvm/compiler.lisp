@@ -1552,6 +1552,24 @@
                (tagbody ,@body)
                (setq ,tmp (cdr ,tmp))))))))
 
+  ;; MULTIPLE-VALUE-PROG1 — (multiple-value-prog1 first . rest)
+  ;; Evaluate FIRST, save its multiple values, execute REST (for side
+  ;; effects), then return the saved values.  Mirrors what
+  ;; rewrite-reader-forms produced; folded into the compiler so the
+  ;; rewrite's mv-prog1 clause can be retired.
+  (mvm-define-macro "MULTIPLE-VALUE-PROG1"
+    (lambda (form)
+      (let ((first (cadr form))
+            (rest (cddr form))
+            (tmp (gensym "MVP1")))
+        (if rest
+            `(let ((,tmp (multiple-value-list ,first)))
+               ,@rest
+               (values-list ,tmp))
+            ;; Degenerate (multiple-value-prog1 FIRST) — no side-effect
+            ;; body; just return FIRST's values.
+            first))))
+
   ;; DO-SYMBOLS — (do-symbols (var [pkg [result]]) body...)
   ;; Collect all accessible symbols of PKG via %do-symbols-fn into a fresh
   ;; list, then iterate.  Body is in an implicit BLOCK NIL so RETURN works.

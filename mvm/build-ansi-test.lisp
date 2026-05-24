@@ -1134,10 +1134,11 @@
          ;; Multiple args, generic fn: (apply fn (append ...))
          (t
           `(apply ,fn-form (append ,@mvl-forms))))))
-    ;; (multiple-value-prog1 first-form . rest)
-    ;; → (let ((%mvp1-result (multiple-value-list first-form))) rest... (values-list %mvp1-result))
-    ;; NOTE: use a fixed symbol name (not gensym) so it survives ~S printing+reading
-    ((and (eq (car form) 'multiple-value-prog1) (cdr form))
+    ;; (multiple-value-prog1 first-form . rest) RETIRED — compile-time
+    ;; macro in compiler.lisp via mvm-define-macro "MULTIPLE-VALUE-PROG1".
+    ;; Gated off here with `nil` so the clause stays in place for
+    ;; reference; clean-deletion in a later pass.
+    ((and nil (eq (car form) 'multiple-value-prog1) (cdr form))
      (let* ((first-form (rewrite-reader-forms (cadr form)))
             (rest-forms (mapcar #'rewrite-reader-forms (cddr form)))
             (result-var '%mvp1-result))

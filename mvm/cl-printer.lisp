@@ -444,6 +444,19 @@
          (t
           (let ((dims (cadr obj)) (data (cddr obj)))
             (%print-md-array dims data stream level escape)))))
+      ;; Native MDA (subtag #x34) — Phase 4 of multi-dim arrays.  Rank 1
+      ;; with no kwargs falls back to plain vector path below; rank≠1 or
+      ;; any non-trivial header gets the #nA(...) emitter.
+      ((%mda-p obj)
+       (cond
+         ((not parray)
+          (%print-char 35 stream)
+          (%print-char 60 stream)
+          (%print-string-raw "Array" stream)
+          (%print-char 62 stream))
+         (t
+          (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
+            (%print-md-array dims data stream level escape)))))
       ;; Cons (list)
       ((consp obj)
        ;; Check *print-level*

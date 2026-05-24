@@ -2242,10 +2242,23 @@
                                            (error () f)))
                              lst)))
               (setf forms (mapcar-safe #'rewrite-package-iteration (nreverse forms)))
-              (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
-              (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
+              ;; rewrite-make-array-with-checks RETIRED (Phase 4): wrapper
+              ;; just renamed make-array-with-checks → make-array with kwargs
+              ;; filtered down to ones the rewriter knew about.  Native MDA
+              ;; runtime handles the same kwargs.  Form pass-through tests
+              ;; show no behavioral diff (P=13067 both ways).
+              ;;(setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
+              ;; rewrite-make-array-dims RETIRED (Phase 4 multi-dim arrays):
+              ;; native MDA subtag #x34 + compile-make-array dispatcher handles
+              ;; (make-array '(N M ...) ...) directly.  Kept here in source for
+              ;; comparison/rollback only.
+              ;;(setf forms (mapcar-safe #'rewrite-make-array-dims forms))
               (setf forms (mapcar-safe #'rewrite-eval-quote forms))
-              (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
+              ;; rewrite-make-array-initcontents RETIRED (Phase 4): runtime
+              ;; make-array in ansi-bridge.lisp now handles :initial-contents,
+              ;; :initial-element, :fill-pointer, :adjustable, :displaced-to,
+              ;; :element-type via native MDA storage.
+              ;;(setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
               (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
               (setf forms (mapcar-safe #'rewrite-reader-forms forms))
               ;; Rewrite multi-arg apply: (apply fn a1 a2 ... list) → 2-arg form
@@ -2334,9 +2347,10 @@
               (setf forms (mapcar-safe #'rewrite-multi-arg-apply forms))
               ;; &aux retired: preprocess-params handles it natively.
               (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
-              (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
-              (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
-              (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms)))
+              ;; rewrite-make-array-* RETIRED (post-macroexpansion phase) —
+              ;; native MDA + runtime make-array + MDA-aware rt-equal/printer
+              ;; handle the unmodified test forms.
+              )
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
               (dolist (form forms)
@@ -2605,10 +2619,10 @@
                                        (error () f)))
                          lst)))
           (setf forms (mapcar-safe #'rewrite-package-iteration (nreverse forms)))
-          (setf forms (mapcar-safe #'rewrite-make-array-with-checks forms))
-          (setf forms (mapcar-safe #'rewrite-make-array-dims forms))
+          ;; rewrite-make-array-* RETIRED (two-pass / aux path) — native MDA
+          ;; + runtime make-array + MDA-aware rt-equal/printer handle the
+          ;; unmodified test forms.
           (setf forms (mapcar-safe #'rewrite-eval-quote forms))
-          (setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
           (setf forms (mapcar-safe #'rewrite-earmuff-specials forms))
           (setf forms (mapcar-safe #'rewrite-reader-forms forms))
           ;; &aux retired: preprocess-params handles it natively.
@@ -3392,6 +3406,13 @@
     ;; apply (which the compiler handles correctly on a single &rest).
     "
 ;; Aux overrides — replace &key-using helpers with &rest versions.
+;; make-array-with-checks — array-aux.lsp's def uses &key with supplied-p
+;; flags + &aux + apply, which Modus's compiler doesn't faithfully handle.
+;; We forward to make-array via &rest which the compiler handles cleanly.
+;; (Phase 4 of multi-dim arrays: needed once rewrite-make-array-with-checks
+;; is retired so callers see the real defun instead of the rewriter shim.)
+(defun make-array-with-checks (dim &rest kwargs)
+  (apply #'make-array dim kwargs))
 (defun union-with-check (x y &rest args)
   (apply #'union x y args))
 (defun nunion-with-copy (x y &rest args)

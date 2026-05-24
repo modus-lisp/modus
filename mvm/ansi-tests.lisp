@@ -2955,7 +2955,83 @@
             (deftest 56424 (and (%mda-p a) (= (array-rank a) 0)
                                 (null (array-dimensions a))
                                 (= (aref (%mda-data a) 0) 42)) t))
-        (t (c) (%record-test-fail-or-emit 56424)))))
+        (t (c) (%record-test-fail-or-emit 56424)))
+      ;; Probes 56430-56435 — Phase 4 regression coverage:
+      ;; integer dim with kwargs should NOT wrap in MDA (return plain vector).
+      ;; 56430 — (make-array 3 :initial-element 'z) returns a plain vector
+      (handler-case
+          (let ((a (make-array 3 :initial-element 'z)))
+            (deftest 56430 (and (not (%mda-p a)) (arrayp a) (= (array-length a) 3)
+                                (eq (aref a 0) 'z) (eq (aref a 2) 'z)) t))
+        (t (c) (%record-test-fail-or-emit 56430)))
+      ;; 56431 — and EQUAL to a literal vector
+      (handler-case
+          (let ((a (make-array 3 :initial-element 'z)))
+            (deftest 56431 (equal a #(z z z)) t))
+        (t (c) (%record-test-fail-or-emit 56431)))
+      ;; 56432 — (make-array 5 :initial-contents '(a b c d e))
+      (handler-case
+          (let ((a (make-array 5 :initial-contents '(a b c d e))))
+            (deftest 56432 (and (not (%mda-p a)) (= (array-length a) 5)
+                                (eq (aref a 0) 'a) (eq (aref a 4) 'e)) t))
+        (t (c) (%record-test-fail-or-emit 56432)))
+      ;; 56433 — and EQUAL
+      (handler-case
+          (let ((a (make-array 5 :initial-contents '(a b c d e))))
+            (deftest 56433 (equal a #(a b c d e)) t))
+        (t (c) (%record-test-fail-or-emit 56433)))
+      ;; 56434 — printed form of native MDA
+      (handler-case
+          (let ((a (make-array '(2 3) :initial-contents '((1 3 8) (2 6 10)))))
+            (deftest 56434 (with-standard-io-syntax
+                             (lambda () (write-to-string a :readably nil :array t)))
+              "#2A((1 3 8) (2 6 10))"))
+        (t (c) (%record-test-fail-or-emit 56434)))
+      ;; 56435 — printed form of 0-dim native MDA
+      (handler-case
+          (let ((a (make-array '() :initial-element 0)))
+            (deftest 56435 (with-standard-io-syntax
+                             (lambda () (write-to-string a :readably nil :array t)))
+              "#0A0"))
+        (t (c) (%record-test-fail-or-emit 56435)))
+      ;; 56440 — make-array-with-checks forwards to make-array
+      (handler-case
+          (let ((a (make-array-with-checks 10)))
+            (deftest 56440 (and (arrayp a) (= (array-length a) 10) (not (symbolp a))) t))
+        (t (c) (%record-test-fail-or-emit 56440)))
+      ;; 56441 — make-array-with-checks with kwargs
+      (handler-case
+          (let ((a (make-array-with-checks 5 :initial-element 'x)))
+            (deftest 56441 (and (arrayp a) (= (array-length a) 5) (eq (aref a 0) 'x)) t))
+        (t (c) (%record-test-fail-or-emit 56441)))
+      ;; 56442 — fill on MDA
+      (handler-case
+          (let ((a (make-array '(5) :initial-contents '(a b c d e))))
+            (fill a 'x)
+            (deftest 56442 (and (eq (aref a 0) 'x) (eq (aref a 4) 'x)) t))
+        (t (c) (%record-test-fail-or-emit 56442)))
+      ;; 56443 — vector-push on MDA with fill-pointer
+      (handler-case
+          (let ((a (make-array '(5) :fill-pointer 2 :initial-contents '(a b c d e))))
+            (vector-push 'x a)
+            (deftest 56443 (and (= (fill-pointer a) 3) (eq (aref a 2) 'x)) t))
+        (t (c) (%record-test-fail-or-emit 56443)))
+      ;; 56444 — MDA length sees fp not data-length
+      (handler-case
+          (let ((a (make-array '(5) :fill-pointer 3 :initial-contents '(a b c d e))))
+            (deftest 56444 (length a) 3))
+        (t (c) (%record-test-fail-or-emit 56444)))
+      ;; 56445 — fill returns its arg (EQT A B)
+      (handler-case
+          (let* ((a (make-array '(5) :initial-contents '(a b c d e)))
+                 (b (fill a 'x)))
+            (deftest 56445 (and (eq a b) (eq (aref a 0) 'x) (eq (aref a 4) 'x)) t))
+        (t (c) (%record-test-fail-or-emit 56445)))
+      ;; 56446 — map over MDA returns list
+      (handler-case
+          (let ((a (make-array '(5) :initial-contents '(a b c d e))))
+            (deftest 56446 (equal (map 'list #'identity a) '(a b c d e)) t))
+        (t (c) (%record-test-fail-or-emit 56446)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

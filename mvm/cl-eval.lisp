@@ -2415,6 +2415,12 @@
                              (loop (when (< i 0) (return res))
                                (setq res (cons (code-char (aref s i)) res))
                                (setq i (- i 1)))))
+                          ;; Native MDA: walk via length (fp-aware) + aref.
+                          ((%mda-p s)
+                           (let ((res nil) (i (- (length s) 1)))
+                             (loop (when (< i 0) (return res))
+                               (setq res (cons (aref s i) res))
+                               (setq i (- i 1)))))
                           (t (coerce s 'list))))
                       seqs))
             (lst (apply #'mapcar fn seqs-as-lists))

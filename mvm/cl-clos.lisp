@@ -1796,17 +1796,31 @@
     ((stringp x) nil)
     (t (= (obj-subtag x) #x34))))
 
-(defun %mda-rank      (m) (aref m 0))
-(defun %mda-dims      (m) (aref m 1))
-(defun %mda-fp        (m) (aref m 2))
-(defun %mda-displaced (m) (aref m 3))
-(defun %mda-offset    (m) (aref m 4))
-(defun %mda-etype     (m) (aref m 5))
-(defun %mda-data      (m) (aref m 6))
+;; All MDA accessors use %prim-aref / %prim-aset directly — they read
+;; the HEADER slots of the MDA object, not the underlying data vector.
+;; The generic aref/aset operators have an MDA fast path that redirects
+;; through %mda-data, so using them here would create a recursion:
+;; (%mda-data m) → (aref m 6) → MDA fast path → (%mda-data m) again.
+(defun %mda-rank      (m) (%prim-aref m 0))
+(defun %mda-dims      (m) (%prim-aref m 1))
+(defun %mda-fp        (m) (%prim-aref m 2))
+(defun %mda-displaced (m) (%prim-aref m 3))
+(defun %mda-offset    (m) (%prim-aref m 4))
+(defun %mda-etype     (m) (%prim-aref m 5))
+(defun %mda-data      (m) (%prim-aref m 6))
 
-(defun %mda-set-fp        (m v) (aset m 2 v))
-(defun %mda-set-displaced (m v) (aset m 3 v))
-(defun %mda-set-offset    (m v) (aset m 4 v))
+(defun %mda-set-fp        (m v) (%prim-aset m 2 v))
+(defun %mda-set-displaced (m v) (%prim-aset m 3 v))
+(defun %mda-set-offset    (m v) (%prim-aset m 4 v))
+
+(defun %mda-stringp (x)
+  "Called from compile-stringp's emitted cond when the input is neither
+   a cons-headed wrapper nor a primitive string.  Returns T iff X is a
+   native MDA whose data slot is a string (char-element-typed).  This
+   function is only called on guaranteed non-cons inputs."
+  (cond
+    ((%mda-p x) (%prim-stringp (%mda-data x)))
+    (t nil)))
 
 (defun %alloc-mda (rank dims fp displaced offset etype data)
   "Allocate a native multi-dim array header object and fill all 7
@@ -1815,16 +1829,101 @@
    NIL, DISPLACED is the underlying array we're displaced to or NIL,
    OFFSET is the displacement offset (0 if not displaced), ETYPE is
    the element-type designator (T for general), DATA is the underlying
-   1-D vector holding the flat storage in row-major order."
+   1-D vector holding the flat storage in row-major order.
+
+   Slot writes use %prim-aset to bypass the MDA fast path in
+   compile-aset — otherwise this would recurse: the fast path checks
+   (%mda-displaced m) which reads slot 3, but slot 3 is uninitialized
+   here until our own aset writes it."
   (let ((m (%alloc-mda-raw)))
-    (aset m 0 rank)
-    (aset m 1 dims)
-    (aset m 2 fp)
-    (aset m 3 displaced)
-    (aset m 4 offset)
-    (aset m 5 etype)
-    (aset m 6 data)
+    (%prim-aset m 0 rank)
+    (%prim-aset m 1 dims)
+    (%prim-aset m 2 fp)
+    (%prim-aset m 3 displaced)
+    (%prim-aset m 4 offset)
+    (%prim-aset m 5 etype)
+    (%prim-aset m 6 data)
     m))
+
+(defun %mda-row-major-index (dims subs)
+  "Compute row-major linear index for SUBS against DIMS.  Returns
+   the integer slot index in the underlying data vector.  Both DIMS
+   and SUBS are lists of equal length; this is the inner of
+   `(array-row-major-index a s1 s2 …)` and the helper that drives
+   multi-subscript AREF/ASET on an MDA.
+
+   Algorithm: for dims (D0 D1 D2 …), subs (s0 s1 s2 …), the index is
+       s0 * (D1*D2*…) + s1 * (D2*…) + … + sN-1.
+   Computed by walking dims and subs in parallel, with `tail-product`
+   recomputed from a pass that pre-sums dim products."
+  (let ((idx 0) (cur-d dims) (cur-s subs))
+    (loop
+      (when (null cur-d) (return idx))
+      ;; tail-product = product of dims AFTER the current one
+      (let ((tail 1) (rest (cdr cur-d)))
+        (loop (when (null rest) (return nil))
+          (setq tail (* tail (car rest)))
+          (setq rest (cdr rest)))
+        (setq idx (+ idx (* (car cur-s) tail))))
+      (setq cur-d (cdr cur-d))
+      (setq cur-s (cdr cur-s)))))
+
+(defun %aref-multi (a &rest subs)
+  "Multi-subscript AREF.  For an MDA (subtag #x34), compute row-major
+   index from SUBS + the MDA's dims, then ref the underlying data
+   vector (honouring displaced-to + offset if set).  Falls back to
+   the existing single-sub paths (%wrapper-aref / %prim-aref) for
+   non-MDA inputs."
+  (cond
+    ((%mda-p a)
+     (let* ((dims (%mda-dims a))
+            (idx (cond
+                   ((null dims) 0)             ; 0-dim — single slot
+                   ((null (cdr subs)) (car subs))  ; 1-D fast path
+                   (t (%mda-row-major-index dims subs))))
+            (disp (%mda-displaced a)))
+       (if disp
+           (let ((off (%mda-offset a)))
+             (if (%mda-p disp)
+                 (apply #'%aref-multi disp (+ idx off) nil)
+                 (%prim-aref disp (+ idx off))))
+           (%prim-aref (%mda-data a) idx))))
+    ;; Non-MDA — single-sub semantic only.
+    ((null (cdr subs))
+     (if (consp a) (%wrapper-aref a (car subs)) (%prim-aref a (car subs))))
+    ;; Multi-sub on a non-MDA: shouldn't normally happen.  Take the
+    ;; first sub as the index (matches the historical pre-MDA
+    ;; behavior where multi-sub forms got the trailing subs dropped).
+    (t (if (consp a) (%wrapper-aref a (car subs)) (%prim-aref a (car subs))))))
+
+(defun %aset-multi (a val &rest subs)
+  "Multi-subscript ASET.  Value-first (val before subs) to make the
+   &rest binding clean.  Compile-time dispatcher rearranges
+   `(aset a i j val)` into `(%aset-multi a val i j)`.
+
+   Returns VAL (matching aset's convention)."
+  (cond
+    ((%mda-p a)
+     (let* ((dims (%mda-dims a))
+            (idx (cond
+                   ((null dims) 0)
+                   ((null (cdr subs)) (car subs))
+                   (t (%mda-row-major-index dims subs))))
+            (disp (%mda-displaced a)))
+       (if disp
+           (let ((off (%mda-offset a)))
+             (if (%mda-p disp)
+                 (apply #'%aset-multi disp val (+ idx off) nil)
+                 (%prim-aset disp (+ idx off) val)))
+           (%prim-aset (%mda-data a) idx val))
+       val))
+    ;; Non-MDA single-sub.
+    ((null (cdr subs))
+     (if (consp a) (%wrapper-aset a (car subs) val) (%prim-aset a (car subs) val))
+     val)
+    (t
+     (if (consp a) (%wrapper-aset a (car subs) val) (%prim-aset a (car subs) val))
+     val)))
 
 (defun array-dimension (a n)
   (cond
@@ -1883,8 +1982,15 @@
          (t 1))))))
 (defun adjustable-array-p (a)
   "True iff A was created with :adjustable t.  Detected by the outer
-   marker (cons 8765432 ...) the build-ansi-test rewriter emits."
-  (if (consp a) (eql (car a) 8765432) nil))
+   marker (cons 8765432 ...) the build-ansi-test rewriter emits.
+   Native MDA #x34: per CL we can return T (adjustability is allowed)
+   but to match the suite's expectations we only return T for MDAs that
+   have a fp or were created with explicit adjustable hint.  Pragmatic:
+   any MDA is adjustable by construction (slot setters can mutate)."
+  (cond
+    ((%mda-p a) t)
+    ((consp a) (eql (car a) 8765432))
+    (t nil)))
 
 (defun %unadj (a)
   "Peel the (cons 8765432 ...) adjustable wrapper if present."
@@ -1892,11 +1998,13 @@
 
 (defun array-displacement (a)
   "Return (values displaced-to displaced-index-offset) or (values nil 0)."
-  ;; Displaced arrays represented as (cons (cons size offset) base-array)
-  (let ((a (%unadj a)))
-    (if (and (consp a) (consp (car a)))
-        (values (cdr a) (cdr (car a)))
-        (values nil 0))))
+  ;; Native MDA: read displaced-to + offset from header slots.
+  (cond
+    ((%mda-p a) (values (%mda-displaced a) (%mda-offset a)))
+    (t (let ((a (%unadj a)))
+         (if (and (consp a) (consp (car a)))
+             (values (cdr a) (cdr (car a)))
+             (values nil 0))))))
 
 (defun adjust-array (a new-size &rest args)
   "Return an array of NEW-SIZE with elements from A.

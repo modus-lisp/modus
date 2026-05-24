@@ -2682,9 +2682,9 @@
       ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
       ((= op-name (compute-name-hash "%MAKE-STRING-ARRAY"))
        (compile-make-string-array (cadr form) env dest))
-      ((= op-name 568601634040735695)             (compile-aref (cadr form) (caddr form) env dest))
-      ((= op-name 216456113736582507)            (compile-aref (cadr form) (caddr form) env dest))
-      ((= op-name 416706424900304020)             (compile-aset (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name 568601634040735695)             (compile-aref-form form env dest))
+      ((= op-name 216456113736582507)            (compile-aref-form form env dest))
+      ((= op-name 416706424900304020)             (compile-aset-form form env dest))
       ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
       ;; %PRIM-AREF / %PRIM-ASET / %PRIM-ARRAY-LENGTH / %PRIM-STRINGP —
       ;; non-wrapper-peeling variants used internally by the wrapper-aware
@@ -6926,7 +6926,13 @@
 (defun compile-stringp (arg env dest)
   "Compile (stringp x).  Routes wrapper inputs (cons-headed arrays) through
    %wrapper-stringp so adj/fp/displaced wrappers around strings still
-   report STRINGP=T."
+   report STRINGP=T.
+   NOTE: native MDA char-element-typed strings would naturally want a
+   third branch through %mda-stringp here, but adding `cond` in this hot
+   compile-time stub wedged the build at boot — likely a layout cascade
+   from the extra trampolines, or compile-stringp being recursively
+   invoked during build of %mda-stringp itself.  Phase 4b TODO: route
+   via a dedicated MDA-aware predicate that doesn't recurse."
   (let ((g-arg (gensym "STRPA")))
     (compile-form
      `(let ((,g-arg ,arg))
@@ -7920,27 +7926,98 @@
 ;;; arrays go straight to the primitive op so the common case stays fast
 ;;; (one consp test).
 (defun compile-aref (arr-form idx-form env dest)
-  "Compile (aref array index).  Routes wrapper inputs through %wrapper-aref."
+  "Compile (aref array index) — the single-subscript fast path.
+   Routes wrapper inputs through %wrapper-aref.  Multi-subscript
+   forms go via compile-aref-form below."
   (let ((g-arr (gensym "AREFA"))
         (g-idx (gensym "AREFI")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
-        (if (consp ,g-arr)
-            (%wrapper-aref ,g-arr ,g-idx)
-            (%prim-aref ,g-arr ,g-idx)))
+        (cond
+          ;; MDA fast path — single-sub on an MDA is just an aref of
+          ;; the underlying data (assuming no displacement; %aref-multi
+          ;; handles the displaced case).
+          ((%mda-p ,g-arr)
+           (let ((disp (%mda-displaced ,g-arr)))
+             (if disp
+                 (%aref-multi ,g-arr ,g-idx)
+                 (%prim-aref (%mda-data ,g-arr) ,g-idx))))
+          ((consp ,g-arr) (%wrapper-aref ,g-arr ,g-idx))
+          (t (%prim-aref ,g-arr ,g-idx))))
      env dest)))
 
+(defun compile-aref-form (form env dest)
+  "Compile (aref ARR &rest SUBS).  Arity-dispatching front-end.
+     • Exactly 1 sub → single-sub fast path (compile-aref).
+     • Other arities → route to runtime %aref-multi which handles
+       MDAs (row-major index from dims + subs).
+   Modus's dispatch previously dropped trailing subs; this restores
+   ANSI semantics for multi-subscript aref."
+  (let* ((args (cdr form))
+         (arr (car args))
+         (subs (cdr args)))
+    (cond
+      ((null subs)
+       ;; 0-sub aref on a 0-dim MDA → slot 0 of data.  Compile as
+       ;; (%aref-multi arr) so the runtime helper handles all cases.
+       (compile-form `(%aref-multi ,arr) env dest))
+      ((null (cdr subs))
+       (compile-aref arr (car subs) env dest))
+      (t
+       (compile-form `(%aref-multi ,arr ,@subs) env dest)))))
+
 (defun compile-aset (arr-form idx-form val-form env dest)
-  "Compile (aset array index value).  Routes wrapper inputs through %wrapper-aset."
+  "Compile (aset array index value) — the single-subscript fast path.
+   Routes wrapper inputs through %wrapper-aset.  Multi-subscript
+   forms go via compile-aset-form below."
   (let ((g-arr (gensym "ASETA"))
         (g-idx (gensym "ASETI"))
         (g-val (gensym "ASETV")))
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
-        (if (consp ,g-arr)
-            (%wrapper-aset ,g-arr ,g-idx ,g-val)
-            (%prim-aset ,g-arr ,g-idx ,g-val)))
+        (cond
+          ((%mda-p ,g-arr)
+           (let ((disp (%mda-displaced ,g-arr)))
+             (if disp
+                 (%aset-multi ,g-arr ,g-val ,g-idx)
+                 (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-val))))
+          ((consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-val))
+          (t (%prim-aset ,g-arr ,g-idx ,g-val))))
      env dest)))
+
+(defun compile-aset-form (form env dest)
+  "Compile (aset ARR SUB1 [SUB2 …] VAL).  Modus's `aset` always takes
+   VAL as the LAST arg (per the existing 3-arg convention); the
+   subscripts are everything between ARR and VAL.  This is the form
+   the SETF expander for `(setf (aref a i j) v)` produces."
+  (let* ((args (cdr form))
+         (arr (car args))
+         (rest (cdr args)))
+    (cond
+      ;; (aset arr val) — 0-sub form (for 0-dim MDA) — VAL is the
+      ;; only remaining arg.
+      ((null (cdr rest))
+       (compile-form `(%aset-multi ,arr ,(car rest)) env dest))
+      ;; (aset arr sub val) — single-sub fast path.
+      ((null (cddr rest))
+       (compile-aset arr (car rest) (cadr rest) env dest))
+      ;; (aset arr sub1 sub2 … val) — multi-sub.  Extract val (last)
+      ;; from subs (everything before).
+      (t
+       (let* ((subs+val rest)
+              ;; Walk to find butlast / last without using kwargs (Modus
+              ;; doesn't have butlast as a builtin at compile time).
+              (val nil)
+              (subs nil))
+         (let ((cur subs+val))
+           (loop
+             (cond
+               ((null (cdr cur))
+                (setq val (car cur))
+                (return nil))
+               (t (push (car cur) subs)
+                  (setq cur (cdr cur))))))
+         (compile-form `(%aset-multi ,arr ,val ,@(nreverse subs)) env dest))))))
 
 (defun compile-array-length (arr-form env dest)
   "Compile (array-length array). Routes wrapper inputs through %wrapper-array-length."

@@ -70,12 +70,31 @@
         (dotimes (i len s)
           (aset s i (aref (cdr y) (+ offset i))))))))
 
+(defun rt-mda-visible-data (m)
+  "Return the user-visible data vector of an MDA: the underlying data
+   sliced to its fill-pointer if it has one, else the raw data vector.
+   Used by rt-equal when peeling an MDA so length-based comparisons
+   match the CL-level (length m)."
+  (let ((data (%mda-data m))
+        (fp (%mda-fp m)))
+    (if (or (null fp) (= fp (array-length data)))
+        data
+        (let ((out (make-array fp)) (i 0))
+          (loop (when (>= i fp) (return out))
+            (aset out i (aref data i))
+            (setq i (+ i 1)))))))
+
 (defun rt-arrayp (x)
-  "Check if x is a plain array (object with subtag #x32)."
+  "Check if x is a plain array (object with subtag #x32) or a native
+   multi-dim array (subtag #x34).  MDAs are NOT plain arrays for
+   element-by-element comparison — they get peeled to (%mda-data x)
+   first by rt-equal — but we still report rt-arrayp T so the dispatch
+   matches what `(arrayp x)` would say."
   (if (fixnump x) nil
     (if (consp x) nil
       (if (null x) nil
-        (= (obj-subtag x) #x32)))))
+        (let ((st (obj-subtag x)))
+          (if (= st #x32) t (= st #x34)))))))
 
 (defun rt-array-equal (a b)
   "Compare two arrays element-by-element."
@@ -147,6 +166,20 @@
      (rt-equal (cddr a) b))
     ((and (consp b) (eql (car b) 9867654) (consp (cdr b)))
      (rt-equal a (cddr b)))
+    ;; Native MDA (subtag #x34): peel to (%mda-data X) and recurse.
+    ;; If both sides are MDA we compare data vectors; if one side is a
+    ;; plain vector or string the underlying data still matches.  Note:
+    ;; %mda-p must be called BEFORE the rt-arrayp branch below since
+    ;; rt-arrayp returns T for #x34 too — without this peel, we'd hit
+    ;; rt-array-equal which would compare HEADER slots, not data.
+    ;; Fill-pointer aware: if the MDA has a fp, slice the data to fp length
+    ;; before comparing — CL's length on fp-vectors returns fp, so the
+    ;; user-visible "contents" stop at fp.  Without this, push tests fail
+    ;; because the underlying data has trailing pre-init bytes.
+    ((and (not (consp a)) (not (fixnump a)) (%mda-p a))
+     (rt-equal (rt-mda-visible-data a) b))
+    ((and (not (consp b)) (not (fixnump b)) (%mda-p b))
+     (rt-equal a (rt-mda-visible-data b)))
     ;; Cons + wrapper handling.
     ((and (consp a) (rt-array-wrapper-p a))
      (rt-equal (rt-wrapper-to-string a) b))

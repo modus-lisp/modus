@@ -569,6 +569,7 @@
      adj-only wrapper → length of underlying
      displaced        → declared size
      multi-dim        → length of flat backing array
+     native MDA #x34  → fp if present, else array-length of data
    Plain conses route through list-length as before.
    A wrapper is disambiguated from an ordinary list by its CDR (chain)
    eventually pointing at an array/string rather than NIL/list."
@@ -590,6 +591,10 @@
           (t (list-length seq))))                          ; defensive
        ;; ordinary list
        (t (list-length seq))))
+    ;; Native MDA (subtag #x34) — fp first, else length of data vector.
+    ((%mda-p seq)
+     (let ((fp (%mda-fp seq)))
+       (if fp fp (array-length (%mda-data seq)))))
     (t (array-length seq))))
 
 ;;; ============================================================

@@ -49,6 +49,15 @@
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
+(defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
+                                     ; [rank dims fp displaced-to disp-offset
+                                     ;  etype data].  Phase 1 foundation for
+                                     ; native multi-dim arrays — see
+                                     ; project_multidim_arrays.  Reader fns
+                                     ; (arrayp / array-rank / array-dimensions
+                                     ; / etc.) consult this BEFORE the cons-
+                                     ; wrapper fallback, so an MDA object is
+                                     ; recognized natively.
 (defconstant +subtag-symbol+ #x50)
 (defconstant +subtag-closure+ #x52)
 ;; #x53 = keyword.  1-slot object, slot 0 = name-hash.  Like +subtag-symbol+
@@ -2756,6 +2765,7 @@
       ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
       ((= op-name 977538405397341142)   (compile-make-keyword-obj dest))  ; %make-keyword-obj
       ((= op-name 559186982902022686)   (compile-alloc-sym3 dest))   ; %alloc-sym3
+      ((= op-name 273316247894500307)   (compile-alloc-mda-raw dest)) ; %alloc-mda-raw
       ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 735635543474837196)   (compile-make-ratio dest))   ; %make-ratio
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
@@ -7057,6 +7067,12 @@
     (emit-ir :li temp2 (ash +subtag-array+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; Multi-dim array (subtag #x34) — Phase 1 of native multi-dim
+    ;; arrays.  Recognized by arrayp so test code that does
+    ;; `(arrayp (make-array '(2 3)))` returns T natively.
+    (emit-ir :li temp2 (ash +subtag-mda+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
     (emit-ir-label false-label)
     (compile-nil dest)
     (emit-ir :br end-label)
@@ -7798,6 +7814,15 @@
    [hash, package, name] without going through make-array (which would
    give subtag #x32 and require a header rewrite)."
   (emit-ir :alloc-obj dest 3 +subtag-symbol+))
+
+(defun compile-alloc-mda-raw (dest)
+  "Compile (%alloc-mda-raw) — allocate a 7-slot object with multi-dim
+   array subtag (#x34).  Slots are uninitialized; the caller fills them
+   via aset / obj-set in the order
+       [0:rank 1:dims 2:fp 3:displaced-to 4:disp-offset 5:etype 6:data].
+   Phase 1 of native multi-dim array support; see
+   project_multidim_arrays.md."
+  (emit-ir :alloc-obj dest 7 +subtag-mda+))
 
 (defun compile-make-closure (fn-form env-form env dest)
   "Compile (%make-closure fn env) — allocate a 2-slot object with

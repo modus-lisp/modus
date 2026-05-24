@@ -1768,43 +1768,119 @@
         (let ((bounds (nstring-parse-start-end args len)))
           (nstring-capitalize-raw str (car bounds) (cdr bounds))
           str))))
+;;; ============================================================
+;;; Native multi-dim array (MDA) header — Phase 1 foundation
+;;;
+;;; Subtag #x34, 7 slots: [rank dims fp displaced-to disp-offset etype data]
+;;;
+;;; Replaces the cons-wrapper representations (9867654 / 8765432) used
+;;; by the build-side rewrite-make-array-* passes.  Phase 1 just adds
+;;; the object header + accessors + predicate, and makes the reader fns
+;;; (array-rank / array-dimensions / array-dimension / array-total-size
+;;; / arrayp) recognize it BEFORE falling through to the cons-wrapper
+;;; path.  No make-array call produces these objects yet — that's Phase
+;;; 2.  See project_multidim_arrays.md.
+;;;
+;;; Probes 56400+ exercise %alloc-mda + the accessors + reader-fn
+;;; recognition.
+;;; ============================================================
+
+(defun %mda-p (x)
+  "True iff X is a native multi-dim array header (subtag #x34)."
+  (cond
+    ((null x) nil)
+    ((eq x t) nil)
+    ((fixnump x) nil)
+    ((consp x) nil)
+    ((characterp x) nil)
+    ((stringp x) nil)
+    (t (= (obj-subtag x) #x34))))
+
+(defun %mda-rank      (m) (aref m 0))
+(defun %mda-dims      (m) (aref m 1))
+(defun %mda-fp        (m) (aref m 2))
+(defun %mda-displaced (m) (aref m 3))
+(defun %mda-offset    (m) (aref m 4))
+(defun %mda-etype     (m) (aref m 5))
+(defun %mda-data      (m) (aref m 6))
+
+(defun %mda-set-fp        (m v) (aset m 2 v))
+(defun %mda-set-displaced (m v) (aset m 3 v))
+(defun %mda-set-offset    (m v) (aset m 4 v))
+
+(defun %alloc-mda (rank dims fp displaced offset etype data)
+  "Allocate a native multi-dim array header object and fill all 7
+   slots.  RANK is a non-negative integer (0 for scalar arrays), DIMS
+   is the list of dimensions (NIL for 0-dim), FP is a fill-pointer or
+   NIL, DISPLACED is the underlying array we're displaced to or NIL,
+   OFFSET is the displacement offset (0 if not displaced), ETYPE is
+   the element-type designator (T for general), DATA is the underlying
+   1-D vector holding the flat storage in row-major order."
+  (let ((m (%alloc-mda-raw)))
+    (aset m 0 rank)
+    (aset m 1 dims)
+    (aset m 2 fp)
+    (aset m 3 displaced)
+    (aset m 4 offset)
+    (aset m 5 etype)
+    (aset m 6 data)
+    m))
+
 (defun array-dimension (a n)
-  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
-    (cond
-      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-       (let ((dims (cadr a)) (i 0))
-         (loop
-           (when (null dims) (return 0))
-           (when (= i n) (return (car dims)))
-           (setq dims (cdr dims))
-           (setq i (+ i 1)))))
-      ((and (consp a) (fixnump (car a)))
-       ;; fill-pointer wrapper: dimension 0 is underlying length
-       (if (= n 0) (array-length (cdr a)) 0))
-      ((and (consp a) (consp (car a)))
-       ;; displaced wrapper: dimension 0 is declared size
-       (if (= n 0) (car (car a)) 0))
-      ((= n 0) (array-length a))
-      (t 0))))
+  (cond
+    ;; Native MDA: rank/dims are in the header.
+    ((%mda-p a)
+     (let ((dims (%mda-dims a)) (i 0))
+       (loop
+         (when (null dims) (return 0))
+         (when (= i n) (return (car dims)))
+         (setq dims (cdr dims))
+         (setq i (+ i 1)))))
+    (t
+     (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+       (cond
+         ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+          (let ((dims (cadr a)) (i 0))
+            (loop
+              (when (null dims) (return 0))
+              (when (= i n) (return (car dims)))
+              (setq dims (cdr dims))
+              (setq i (+ i 1)))))
+         ((and (consp a) (fixnump (car a)))
+          ;; fill-pointer wrapper: dimension 0 is underlying length
+          (if (= n 0) (array-length (cdr a)) 0))
+         ((and (consp a) (consp (car a)))
+          ;; displaced wrapper: dimension 0 is declared size
+          (if (= n 0) (car (car a)) 0))
+         ((= n 0) (array-length a))
+         (t 0))))))
 (defun array-total-size (a)
-  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
-    (cond
-      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-       (array-length (cddr a)))
-      ((and (consp a) (fixnump (car a)))
-       (array-length (cdr a)))
-      ((and (consp a) (consp (car a)))
-       (car (car a)))
-      (t (array-length a)))))
+  (cond
+    ((%mda-p a)
+     (let ((d (%mda-data a)))
+       (if d (array-length d) 0)))
+    (t
+     (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+       (cond
+         ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+          (array-length (cddr a)))
+         ((and (consp a) (fixnump (car a)))
+          (array-length (cdr a)))
+         ((and (consp a) (consp (car a)))
+          (car (car a)))
+         (t (array-length a)))))))
 (defun array-rank (a)
-  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
-    (cond
-      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-       (let ((n 0) (dims (cadr a)))
-         (loop (when (null dims) (return n))
-           (setq n (+ n 1))
-           (setq dims (cdr dims)))))
-      (t 1))))
+  (cond
+    ((%mda-p a) (%mda-rank a))
+    (t
+     (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+       (cond
+         ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+          (let ((n 0) (dims (cadr a)))
+            (loop (when (null dims) (return n))
+              (setq n (+ n 1))
+              (setq dims (cdr dims)))))
+         (t 1))))))
 (defun adjustable-array-p (a)
   "True iff A was created with :adjustable t.  Detected by the outer
    marker (cons 8765432 ...) the build-ansi-test rewriter emits."

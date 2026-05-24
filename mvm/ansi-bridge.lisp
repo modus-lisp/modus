@@ -1733,23 +1733,26 @@
 
 (defun array-dimensions (a)
   "Return list of dimensions of array A.
-   Peels (cons 8765432 ...) adjustable wrapper.
-   Detects multi-dim wrapper: (cons 9867654 (cons DIMS-LIST FLAT-ARR)).
-   Detects fill-pointer wrapper: (cons FP underlying).
-   Detects displaced wrapper: (cons (cons SIZE OFFSET) underlying)."
-  (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
-    (cond
-      ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-       (cadr a))
-      ((and (consp a) (fixnump (car a)))
-       ;; fill-pointer wrapper — declared dim is underlying length
-       (list (array-length (cdr a))))
-      ((and (consp a) (consp (car a)))
-       ;; displaced wrapper — declared dim is the size in the head cons
-       (list (car (car a))))
-      ((arrayp a) (list (array-length a)))
-      ((stringp a) (list (array-length a)))
-      (t nil))))
+   First: native MDA (subtag #x34) carries dims directly in slot 1.
+   Otherwise peels (cons 8765432 ...) adjustable wrapper and detects
+   multi-dim (9867654), fill-pointer (cons FP ...), and displaced
+   (cons (cons SIZE OFFSET) ...) wrappers."
+  (cond
+    ((%mda-p a) (%mda-dims a))
+    (t
+     (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+       (cond
+         ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+          (cadr a))
+         ((and (consp a) (fixnump (car a)))
+          ;; fill-pointer wrapper — declared dim is underlying length
+          (list (array-length (cdr a))))
+         ((and (consp a) (consp (car a)))
+          ;; displaced wrapper — declared dim is the size in the head cons
+          (list (car (car a))))
+         ((arrayp a) (list (array-length a)))
+         ((stringp a) (list (array-length a)))
+         (t nil))))))
 
 (defun upgraded-array-element-type (type)
   "Return the upgraded element type (simplified to T for all)."

@@ -2810,7 +2810,58 @@
       ;; (the failure mode the cl-symbols suite exercises).
       (handler-case
           (deftest 56334 (and (is-external-symbol-of "CAR" 'lisp) t) t)
-        (t (c) (%record-test-fail-or-emit 56334)))))
+        (t (c) (%record-test-fail-or-emit 56334)))
+
+      ;; ----------------------------------------------------------------
+      ;; Probes 56400-56407 — Native multi-dim array header (Phase 1).
+      ;; A new subtag #x34 object carries [rank dims fp displaced-to
+      ;; offset etype data].  Existing array reader fns
+      ;; (array-rank/array-dimensions/array-total-size/arrayp) now
+      ;; recognize it BEFORE falling through to the cons-wrapper path.
+      ;; No make-array call produces these yet — Phase 2.  See
+      ;; project_multidim_arrays.md.
+      ;; ----------------------------------------------------------------
+      ;; 56400 — allocator + predicate
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56400 (and (%mda-p m) t) t))
+        (t (c) (%record-test-fail-or-emit 56400)))
+      ;; 56401 — rank accessor
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56401 (%mda-rank m) 2))
+        (t (c) (%record-test-fail-or-emit 56401)))
+      ;; 56402 — dims accessor
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56402 (equal (%mda-dims m) '(2 3)) t))
+        (t (c) (%record-test-fail-or-emit 56402)))
+      ;; 56403 — fill-pointer slot (nil default)
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56403 (%mda-fp m) nil))
+        (t (c) (%record-test-fail-or-emit 56403)))
+      ;; 56404 — array-rank recognizes the MDA
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56404 (array-rank m) 2))
+        (t (c) (%record-test-fail-or-emit 56404)))
+      ;; 56405 — array-dimensions recognizes the MDA
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56405 (equal (array-dimensions m) '(2 3)) t))
+        (t (c) (%record-test-fail-or-emit 56405)))
+      ;; 56406 — array-total-size recognizes the MDA
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56406 (array-total-size m) 6))
+        (t (c) (%record-test-fail-or-emit 56406)))
+      ;; 56407 — arrayp recognizes the MDA (via the new subtag arm of
+      ;; compile-prim-arrayp)
+      (handler-case
+          (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
+            (deftest 56407 (and (arrayp m) t) t))
+        (t (c) (%record-test-fail-or-emit 56407)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

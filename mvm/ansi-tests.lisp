@@ -2514,15 +2514,30 @@
   ;; ============================================================
 
   (when t   ; scoping let* so probe locals don't leak
-    (let ((probe-1 "/tmp/probe-1-simple.lisp"))
+    ;; Per-process temp paths so 32 parallel shard children don't race
+    ;; on a single shared file (truncate during another's read → load
+    ;; wedge → 600 tests stamped "lost" in the shard summary).  PID
+    ;; via syscall 39.
+    (let* ((%pid (%sys-getpid))
+           (%pid-suffix (format nil ".~D" %pid))
+           (probe-1 (concatenate 'string "/tmp/probe-1-simple.lisp" %pid-suffix))
+           (probe-fmt (concatenate 'string "/tmp/probe-fmt.lisp" %pid-suffix))
+           (probe-suite (concatenate 'string "/tmp/probe-suite.lisp" %pid-suffix)))
+      (declare (ignorable probe-fmt probe-suite))
 
-      ;; Write the simple probe file every run so /tmp cleaning doesn't
-      ;; break the suite.  Form-1 calls write-string-serial (NOT in SFT
-      ;; today) so a successful load also flushes a visible marker.
+      ;; Write the simple probe file every run.  Use raw open + write-string
+      ;; rather than (with-open-file + format) — format on file streams via
+      ;; with-open-file silently no-ops in some Modus paths (the file gets
+      ;; opened but nothing is written), see probe-fmt setup below for the
+      ;; working pattern.  TODO: root-cause that.
       (handler-case
-          (with-open-file (s probe-1 :direction :output :if-exists :supersede)
-            (format s "(write-string-serial \"PROBE-1-LOADED;\")~%")
-            (format s "(defvar *probe-1-val* (+ 40 2))~%"))
+          (let ((s (open probe-1 :direction :output :if-exists :supersede)))
+            (when s
+              (write-string "(write-string-serial \"PROBE-1-LOADED;\")" s)
+              (write-char #\Newline s)
+              (write-string "(defvar *probe-1-val* (+ 40 2))" s)
+              (write-char #\Newline s)
+              (close s)))
         (t (c) (write-string-serial "PROBE-SETUP-ERR;")))
 
       ;; 56300 — OPEN: lowest-layer file I/O
@@ -2624,13 +2639,13 @@
       ;;   boundp (cl-packages.lisp): walks #x10000080 instead of the
       ;;     keywordp-only stub.
       (handler-case
-          (let ((s (open "/tmp/probe-fmt.lisp" :direction :output :if-exists :supersede)))
+          (let ((s (open probe-fmt :direction :output :if-exists :supersede)))
             (when s
               (write-string "(defvar *probe-fmt-val* \"X=42\")" s)
               (write-char #\Newline s)
               (close s))
             (write-string-serial "BEFORE-LOAD;")
-            (load "/tmp/probe-fmt.lisp")
+            (load probe-fmt)
             (write-string-serial "AFTER-LOAD;BOUNDP=")
             (write-string-serial (if (boundp '*probe-fmt-val*) "T" "NIL"))
             (write-string-serial ";VAL=")
@@ -2656,7 +2671,7 @@
             (makunbound '*probe-suite-entries*)
             ;; Write the probe file fresh each run so /tmp cleaning
             ;; doesn't break the suite.
-            (let ((s (open "/tmp/probe-suite.lisp" :direction :output :if-exists :supersede)))
+            (let ((s (open probe-suite :direction :output :if-exists :supersede)))
               (when s
                 (write-string "(defvar *probe-suite-entries* nil)" s) (write-char #\Newline s)
                 (write-string "(defun probe-record (name form expected)" s) (write-char #\Newline s)
@@ -2670,7 +2685,7 @@
             (write-string-serial "SUITE-WROTE;")
             ;; Read+eval each form individually with per-form markers so
             ;; if a single form wedges we know exactly which one.
-            (%probe-read-eval-suite "/tmp/probe-suite.lisp")
+            (%probe-read-eval-suite probe-suite)
             (write-string-serial "ALL-FORMS-OK;ENTRIES-BOUND=")
             (write-string-serial (if (boundp '*probe-suite-entries*) "T" "NIL"))
             (write-string-serial ";")

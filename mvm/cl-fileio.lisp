@@ -96,6 +96,11 @@
   "Close file descriptor."
   (syscall3 3 fd 0 0))
 
+(defun %sys-getpid ()
+  "Linux x64 syscall 39 (getpid).  Used to disambiguate per-process
+   temp file paths so parallel shards don't race on a shared name."
+  (syscall3 39 0 0 0))
+
 (defun %sys-read-raw (fd buf-addr count)
   "Read COUNT bytes from FD into buf at BUF-ADDR. Returns bytes read or negative."
   (syscall3 0 fd buf-addr count))

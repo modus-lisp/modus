@@ -1735,114 +1735,13 @@
                              acc)))))))
         `(progn ,def-call ,@reader-defuns))))
 
-  ;; MAKE-ARRAY — native multi-dim support.  Modus's compile-make-array
-  ;; handles only `(make-array N)` and `(make-array '(N))`; the build-side
-  ;; rewrite-make-array-dims expanded `(make-array '(M N …))` to a
-  ;; `(cons 9867654 (cons '(M N …) underlying))` wrapper that
-  ;; arrayp/array-rank/aref already recognise (cl-clos.lisp).  Folded
-  ;; that expansion into the compiler as a macro.  Only fires for the
-  ;; multi-dim quoted-list case + :initial-element/:initial-contents/
-  ;; no-init kwargs; other shapes (variable dims, displaced, adjustable,
-  ;; fill-pointer, element-type) fall through to the existing dispatch.
-  ;;
-  ;; Helper: pluck :initial-element / :initial-contents from a flat kwarg
-  ;; list.  Returns (values init-elem-or-nil init-contents-or-nil
-  ;;                       has-init-elem-p has-init-contents-p
-  ;;                       other-kwargs).
-  (flet ((parse-make-array-kwargs (kwargs)
-           (let ((init-elem nil)
-                 (init-contents nil)
-                 (has-ie nil)
-                 (has-ic nil)
-                 (others nil)
-                 (cur kwargs))
-             (loop
-               (when (null cur) (return))
-               (let ((k (car cur)) (v (cadr cur)))
-                 (cond
-                   ((eq k :initial-element)
-                    (setf init-elem v has-ie t))
-                   ((eq k :initial-contents)
-                    (setf init-contents v has-ic t))
-                   (t
-                    (setf others (cons k (cons v others))))))
-               (setf cur (cddr cur)))
-             (values init-elem init-contents has-ie has-ic (nreverse others))))
-         (multi-dim-quoted-list-p (form)
-           ;; Returns the dims list if FORM is `'(M N ...)` with at least 2
-           ;; integer dims (single-dim and 0-dim handled separately).
-           (and (consp form) (eq (car form) 'quote)
-                (consp (cdr form)) (consp (cadr form))
-                (consp (cdr (cadr form)))
-                (every (lambda (d) (integerp d)) (cadr form))
-                (cadr form))))
-    (mvm-define-macro "MAKE-ARRAY"
-      (lambda (form)
-        (let* ((dims-arg (and (consp (cdr form)) (cadr form)))
-               (kwargs (and (consp (cdr form)) (cddr form)))
-               (multi-dims (and dims-arg (multi-dim-quoted-list-p dims-arg)))
-               ;; Single-dim quoted list: `'(N)`.  Unwrap to integer N so
-               ;; subsequent rewrite-make-array-initcontents (still active)
-               ;; can fire on the kwargs.  Without this normalization the
-               ;; single-dim-with-kwargs forms lose their :initial-element.
-               (single-dim (and dims-arg
-                                (consp dims-arg) (eq (car dims-arg) 'quote)
-                                (consp (cdr dims-arg)) (consp (cadr dims-arg))
-                                (null (cdr (cadr dims-arg)))
-                                (integerp (car (cadr dims-arg)))
-                                (car (cadr dims-arg)))))
-          (cond
-            ;; Single-dim '(N): unwrap so kwargs reach the next pass.
-            (single-dim
-             (cons 'make-array (cons single-dim kwargs)))
-            ;; Multi-dim quoted list: wrap.
-            (multi-dims
-             (multiple-value-bind (init-elem init-contents has-ie has-ic others)
-                 (parse-make-array-kwargs kwargs)
-               (declare (ignore others))   ; advanced kwargs not yet folded in
-               (let ((total (reduce #'* multi-dims))
-                     (arr (gensym "%MKAW"))
-                     (i (gensym "%MKAI"))
-                     (v (gensym "%MKAV")))
-                 (cond
-                   ;; :initial-element — fill the flat underlying array.
-                   (has-ie
-                    `(cons 9867654
-                       (cons (quote ,multi-dims)
-                             (let ((,arr (make-array ,total))
-                                   (,v ,init-elem))
-                               (let ((,i 0))
-                                 (loop
-                                   (when (>= ,i ,total) (return ,arr))
-                                   (aset ,arr ,i ,v)
-                                   (setq ,i (+ ,i 1))))))))
-                   ;; :initial-contents — flatten the nested literal at
-                   ;; macroexpand time when it's a quoted nested list, so
-                   ;; the compiler sees plain asets.  Variable contents
-                   ;; (non-quoted) fall through to the rewriter for now.
-                   ((and has-ic (consp init-contents) (eq (car init-contents) 'quote))
-                    (let* ((nested (cadr init-contents))
-                           (flat (%flatten-multi-dim-contents multi-dims nested)))
-                      (if (and flat (= (length flat) total))
-                          (let ((sets nil))
-                            (loop for elem in flat
-                                  for k from 0
-                                  do (push `(aset ,arr ,k (quote ,elem)) sets))
-                            `(cons 9867654
-                               (cons (quote ,multi-dims)
-                                     (let ((,arr (make-array ,total)))
-                                       ,@(nreverse sets)
-                                       ,arr))))
-                          form)))   ; bad shape — fall through
-                   ;; No init: just allocate and wrap.
-                   (t
-                    `(cons 9867654
-                       (cons (quote ,multi-dims)
-                             (make-array ,total))))))))
-            ;; Anything else (integer dim, '(N), variable dim, exotic
-            ;; kwargs): fall through unchanged so compile-make-array and
-            ;; any remaining build-time rewriters handle it.
-            (t form))))))
+  ;; MAKE-ARRAY native multi-dim support has moved from this
+  ;; compile-time macro (which produced (cons 9867654 …) wrappers) to
+  ;; the dispatcher in compile-make-array (which routes multi-dim and
+  ;; kwarg forms to the runtime MAKE-ARRAY defun that produces real
+  ;; #x34 MDA objects).  See compile-make-array + ansi-bridge.lisp's
+  ;; (defun make-array …) + project_multidim_arrays.md.  Dormant macro
+  ;; from commit 1fba8b6 removed in Phase 2b.
 
   ;; CLASSIFY-ERROR* — stub
   (mvm-define-macro "CLASSIFY-ERROR*"
@@ -2779,7 +2678,7 @@
          (compile-make-closure (cadr form) (caddr form) env dest)))
 
       ;; --- Array Operations ---
-      ((= op-name 686483400154579705)       (compile-make-array (cadr form) env dest))
+      ((= op-name 686483400154579705)       (compile-make-array form env dest))
       ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
       ((= op-name (compute-name-hash "%MAKE-STRING-ARRAY"))
        (compile-make-string-array (cadr form) env dest))
@@ -7872,8 +7771,8 @@
   "Compile (ratiop x) — true iff x is a tagged ratio object (subtag #x33)."
   (compile-object-subtype-p arg env dest +subtag-ratio+))
 
-(defun compile-make-array (size-form env dest)
-  "Compile (make-array size).
+(defun compile-make-array-1d (size-form env dest)
+  "Compile (make-array size) for the simple 1-D / no-kwargs case.
    Constant size <= 65535: ALLOC-OBJ with imm16 element count.
    Constant size > 65535 or variable size: ALLOC-ARRAY (register-based).
 
@@ -7898,11 +7797,56 @@
           (consp (cadr size-form))
           (integerp (car (cadr size-form)))
           (null (cdr (cadr size-form))))
-     (compile-make-array (car (cadr size-form)) env dest))
+     (compile-make-array-1d (car (cadr size-form)) env dest))
     (t
      (compile-form size-form env dest)
      (emit-ir :sar dest dest +fixnum-shift+)
      (emit-ir :alloc-array dest dest))))
+
+(defun %quoted-multidim-list-p (form)
+  "If FORM is `'(M N …)` with all-integer dims and length ≥ 2 (or 0 —
+   the 0-dim scalar array case), return the dims list; otherwise NIL."
+  (and (consp form) (name-eq (car form) "QUOTE")
+       (consp (cdr form))
+       ;; Either '() (0-dim) or a longer-than-1 list of integers.
+       (let ((d (cadr form)))
+         (cond
+           ((null d) :zero-dim)          ; '() → 0-dim scalar array
+           ((and (consp d) (consp (cdr d))
+                 ;; all-integer check
+                 (let ((all t) (cur d))
+                   (loop (when (null cur) (return all))
+                     (unless (integerp (car cur))
+                       (setq all nil)
+                       (return nil))
+                     (setq cur (cdr cur)))))
+            d)
+           (t nil)))))
+
+(defun compile-make-array (form env dest)
+  "Compile (make-array dim &rest kwargs).  Dispatches into:
+     • Simple 1-D path (compile-make-array-1d) when no kwargs and dim
+       is a plain integer / variable / '(N) single-elt list.
+     • Multi-dim / 0-dim / kwarg-bearing path → route to the runtime
+       MAKE-ARRAY defun (ansi-bridge.lisp) via (funcall #'make-array
+       …).  Slightly higher overhead than inline allocation, but keeps
+       compile-time and runtime behavior identical and lets us share
+       the kwarg-handling code.
+
+   Phase 2b of project_multidim_arrays.  Phase 2a's runtime defun is
+   the implementation; this wires the compile-time dispatch to use it
+   for the cases the simple builtin can't handle on its own."
+  (let* ((dim-form (cadr form))
+         (kwargs (cddr form))
+         (multi (%quoted-multidim-list-p dim-form)))
+    (cond
+      ;; Multi-dim or 0-dim quoted list, OR any kwargs present: defer
+      ;; to the runtime defun.
+      ((or multi kwargs)
+       (compile-form `(funcall (function make-array) ,dim-form ,@kwargs)
+                     env dest))
+      ;; Plain dim, no kwargs — emit the fast inline path.
+      (t (compile-make-array-1d dim-form env dest)))))
 
 (defun compile-make-string-array (size-form env dest)
   "Like compile-make-array but with string subtag #x31."

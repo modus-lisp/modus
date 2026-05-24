@@ -2906,7 +2906,56 @@
           (let ((a (funcall #'make-array '(5) :initial-element 0)))
             (deftest 56415 (and (%mda-p a) (= (array-rank a) 1)
                                 (equal (array-dimensions a) '(5))) t))
-        (t (c) (%record-test-fail-or-emit 56415)))))
+        (t (c) (%record-test-fail-or-emit 56415)))
+
+      ;; ----------------------------------------------------------------
+      ;; Probes 56420-56424 — Compile-time MAKE-ARRAY with kwargs / multi-dim
+      ;; (Phase 2b).  `(make-array …)` written directly in compiled
+      ;; source now routes through the new dispatcher: multi-dim or
+      ;; any kwargs → (funcall #'make-array …) at compile time.
+      ;; Plain `(make-array N)` keeps the inline fast path.
+      ;;
+      ;; NOTE: the build-side rewriter pipeline pre-processes test
+      ;; source's make-array calls into cons-wrapper helper calls
+      ;; before these probes reach the compiler.  These probes live in
+      ;; ansi-tests.lisp which is NOT in the rewriter pipeline (per
+      ;; build-ansi-test.lisp's pipeline application sites), so they
+      ;; exercise the compile-time path directly.
+      ;; ----------------------------------------------------------------
+      ;; 56420 — plain integer dim still fast-paths to flat 1-D
+      (handler-case
+          (let ((a (make-array 4)))
+            (deftest 56420 (and (arrayp a) (= (array-rank a) 1)
+                                (= (array-total-size a) 4)
+                                ;; NOT an MDA — plain #x32
+                                (not (%mda-p a))) t))
+        (t (c) (%record-test-fail-or-emit 56420)))
+      ;; 56421 — :initial-element via compile-time path
+      (handler-case
+          (let ((a (make-array 3 :initial-element 99)))
+            (deftest 56421 (and (= (aref (if (%mda-p a) (%mda-data a) a) 0) 99)
+                                (= (aref (if (%mda-p a) (%mda-data a) a) 2) 99)) t))
+        (t (c) (%record-test-fail-or-emit 56421)))
+      ;; 56422 — multi-dim '(2 3) via compile-time path → MDA
+      (handler-case
+          (let ((a (make-array '(2 3))))
+            (deftest 56422 (and (%mda-p a) (= (array-rank a) 2)
+                                (equal (array-dimensions a) '(2 3))) t))
+        (t (c) (%record-test-fail-or-emit 56422)))
+      ;; 56423 — multi-dim with :initial-element
+      (handler-case
+          (let ((a (make-array '(2 2) :initial-element 7)))
+            (deftest 56423 (and (%mda-p a)
+                                (= (aref (%mda-data a) 0) 7)
+                                (= (aref (%mda-data a) 3) 7)) t))
+        (t (c) (%record-test-fail-or-emit 56423)))
+      ;; 56424 — 0-dim scalar array via '()
+      (handler-case
+          (let ((a (make-array '() :initial-element 42)))
+            (deftest 56424 (and (%mda-p a) (= (array-rank a) 0)
+                                (null (array-dimensions a))
+                                (= (aref (%mda-data a) 0) 42)) t))
+        (t (c) (%record-test-fail-or-emit 56424)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

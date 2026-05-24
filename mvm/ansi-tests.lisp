@@ -2740,7 +2740,62 @@
       (handler-case
           (let ((r (read-from-string "(+ 1 2)")))
             (deftest 56324 (equal r '(+ 1 2)) t))
-        (t (c) (%record-test-fail-or-emit 56324)))))
+        (t (c) (%record-test-fail-or-emit 56324)))
+
+      ;; ----------------------------------------------------------------
+      ;; Probes 56330-56334 — CL package external-symbol membership.
+      ;; %init-packages calls %export-standard-cl-symbols at boot; these
+      ;; probes verify CAR/MAPCAR/etc. show up as external symbols and
+      ;; that the iteration / lookup primitives find them.  cl-symbols.lsp
+      ;; (981 tests) fails uniformly with GOT:T EXP:NIL because
+      ;; test-if-not-in-cl-package's `(is-external-symbol-of str 'lisp)`
+      ;; can't see them.  Track every layer.
+      ;; ----------------------------------------------------------------
+      ;; 56330 — direct symtab walk for a known CL sym
+      (handler-case
+          (let* ((pkg (find-package "COMMON-LISP"))
+                 (count (let ((c 0) (cur (and pkg (%pkg-external pkg))))
+                          (loop (when (null cur) (return c))
+                            (incf c) (setq cur (cdr cur))))))
+            (write-string-serial "CL-EXTERNAL-COUNT=")
+            (write-string-serial (write-to-string count))
+            (write-string-serial ";")
+            (deftest 56330 (> count 100) t))
+        (t (c) (progn (write-string-serial "S30-ERR;")
+                      (%record-test-fail-or-emit 56330))))
+      ;; 56331 — find-symbol "CAR" in CL should return :external
+      (handler-case
+          (multiple-value-bind (sym status)
+              (find-symbol "CAR" (find-package "COMMON-LISP"))
+            (write-string-serial "FIND-CAR=")
+            (write-string-serial (if status (symbol-name status) "NIL"))
+            (write-string-serial ";")
+            (deftest 56331 (eq status :external) t))
+        (t (c) (progn (write-string-serial "S31-ERR;")
+                      (%record-test-fail-or-emit 56331))))
+      ;; 56332 — do-external-symbols counts >0 syms in CL
+      (handler-case
+          (let ((c 0))
+            (do-external-symbols (s (find-package "COMMON-LISP"))
+              (incf c))
+            (write-string-serial "DES-COUNT=")
+            (write-string-serial (write-to-string c))
+            (write-string-serial ";")
+            (deftest 56332 (> c 100) t))
+        (t (c) (progn (write-string-serial "S32-ERR;")
+                      (%record-test-fail-or-emit 56332))))
+      ;; 56333 — test-if-not-in-cl-package "CAR" should be NIL.  This
+      ;; is the cl-symbols.lsp gating predicate (981 tests).  Passes
+      ;; once %pkg-find-by-hash walks nicknames so `'lisp` resolves
+      ;; to COMMON-LISP via the LISP nickname.
+      (handler-case
+          (deftest 56333 (test-if-not-in-cl-package "CAR") nil)
+        (t (c) (%record-test-fail-or-emit 56333)))
+      ;; 56334 — is-external-symbol-of with a symbol designator
+      ;; (the failure mode the cl-symbols suite exercises).
+      (handler-case
+          (deftest 56334 (and (is-external-symbol-of "CAR" 'lisp) t) t)
+        (t (c) (%record-test-fail-or-emit 56334)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

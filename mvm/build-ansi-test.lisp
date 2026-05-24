@@ -3171,6 +3171,7 @@
   (init-keyword-table)
 
   ;; Initialize package system (creates CL, CL-USER, KEYWORD, test packages)
+  ;; %init-packages's last step IS %export-standard-cl-symbols.
   (%init-packages)
 
   ;; Initialize standard streams

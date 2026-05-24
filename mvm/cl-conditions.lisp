@@ -1379,7 +1379,16 @@
   (setq *pkg-tag* 987654321)
   (setq *sym-tag* 123456789)
   (setq *all-packages* nil)
-  (make-package "COMMON-LISP" :nicknames (list "CL") :use nil)
+  ;; "LISP" is added alongside "CL" as a nickname.  The gcl ansi-test
+  ;; suite (and many older CL programs) reference the standard package
+  ;; via `'lisp`, e.g. cl-symbols-aux.lsp's
+  ;;   (defun is-external-symbol-of (sym package)
+  ;;     (do-external-symbols (s package) ...))
+  ;; called as `(is-external-symbol-of str 'lisp)`.  Without the LISP
+  ;; nickname, find-package returns NIL and do-external-symbols
+  ;; iterates nothing — every cl-symbols.lsp test fails GOT:T EXP:NIL.
+  ;; "LISP" is an accepted historical nickname per CLHS.
+  (make-package "COMMON-LISP" :nicknames (list "CL" "LISP") :use nil)
   (make-package "COMMON-LISP-USER" :nicknames (list "CL-USER") :use (list "CL"))
   (make-package "KEYWORD" :use nil)
   (setq *package* (find-package "CL-USER"))

@@ -179,15 +179,35 @@
     (t (find-package designator))))
 
 (defun %pkg-find-by-hash (h)
-  "Look up a package by hashing each candidate's name. Used when a
-   designator is a native MVM symbol that carries only a hash."
-  (let ((cur *all-packages*))
+  "Look up a package by hashing each candidate's primary name OR any
+   nickname.  Used when a designator is a native MVM symbol that
+   carries only a hash.  Without the nickname walk, `'lisp` as a
+   designator never resolves to COMMON-LISP even though LISP is a
+   nickname — every `(do-external-symbols (s 'lisp) ...)` call in the
+   gcl ansi-test suite then iterates zero symbols and cl-symbols.lsp
+   (~981 tests) uniformly fails."
+  (let ((cur *all-packages*)
+        (found nil))
     (loop
+      (when found (return found))
       (when (null cur) (return nil))
       (let ((pkg (car cur)))
         (when (and (%pkg-name pkg)
                    (= (compute-name-hash (%pkg-name pkg)) h))
-          (return pkg)))
+          (setq found pkg))
+        ;; Walk nicknames too — LISP/CL nicknames are how older code
+        ;; refers to COMMON-LISP.  Uses an explicit `found` flag rather
+        ;; than `return-from` so we don't rely on the implicit block.
+        (unless found
+          (let ((nicks (%pkg-nicknames pkg)))
+            (loop
+              (when found (return))
+              (when (null nicks) (return))
+              (let ((nn (car nicks)))
+                (when (and (stringp nn)
+                           (= (compute-name-hash nn) h))
+                  (setq found pkg)))
+              (setq nicks (cdr nicks))))))
       (setq cur (cdr cur)))))
 
 ;;; --- Internal alist-based symbol table operations ---

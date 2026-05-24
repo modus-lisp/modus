@@ -2861,7 +2861,52 @@
       (handler-case
           (let ((m (%alloc-mda 2 '(2 3) nil nil 0 t (make-array 6))))
             (deftest 56407 (and (arrayp m) t) t))
-        (t (c) (%record-test-fail-or-emit 56407)))))
+        (t (c) (%record-test-fail-or-emit 56407)))
+
+      ;; ----------------------------------------------------------------
+      ;; Probes 56410-56415 — runtime MAKE-ARRAY defun (Phase 2a).
+      ;; The defun's body compiles via compile-make-array (compile-time
+      ;; builtin) for its internal calls to (make-array N).  The defun
+      ;; itself is reachable via SFT (auto-registered) so eval/funcall
+      ;; routes through it, allowing runtime construction of MDA arrays.
+      ;; ----------------------------------------------------------------
+      ;; 56410 — funcall #'make-array with single integer dim → flat 1-D
+      (handler-case
+          (let ((a (funcall #'make-array 5)))
+            (deftest 56410 (and (arrayp a) (= (array-rank a) 1)
+                                (= (array-total-size a) 5)) t))
+        (t (c) (%record-test-fail-or-emit 56410)))
+      ;; 56411 — funcall #'make-array with :initial-element fills correctly
+      (handler-case
+          (let ((a (funcall #'make-array 4 :initial-element 42)))
+            (deftest 56411 (and (= (aref a 0) 42) (= (aref a 3) 42)) t))
+        (t (c) (%record-test-fail-or-emit 56411)))
+      ;; 56412 — funcall with multi-dim list dim produces MDA with right rank
+      (handler-case
+          (let ((a (funcall #'make-array '(2 3))))
+            (deftest 56412 (and (%mda-p a) (= (array-rank a) 2)
+                                (equal (array-dimensions a) '(2 3))) t))
+        (t (c) (%record-test-fail-or-emit 56412)))
+      ;; 56413 — eval form constructs an MDA with :initial-element
+      (handler-case
+          (let ((a (eval '(make-array '(2 3) :initial-element 7))))
+            (deftest 56413 (and (%mda-p a) (= (array-total-size a) 6)
+                                (= (aref (%mda-data a) 0) 7)) t))
+        (t (c) (%record-test-fail-or-emit 56413)))
+      ;; 56414 — :initial-contents as flat list fills row-major
+      (handler-case
+          (let ((a (funcall #'make-array '(2 3)
+                            :initial-contents '((1 2 3) (4 5 6)))))
+            (deftest 56414 (and (= (aref (%mda-data a) 0) 1)
+                                (= (aref (%mda-data a) 3) 4)
+                                (= (aref (%mda-data a) 5) 6)) t))
+        (t (c) (%record-test-fail-or-emit 56414)))
+      ;; 56415 — single-elem list dim '(N) preserves rank 1 + MDA wrap
+      (handler-case
+          (let ((a (funcall #'make-array '(5) :initial-element 0)))
+            (deftest 56415 (and (%mda-p a) (= (array-rank a) 1)
+                                (equal (array-dimensions a) '(5))) t))
+        (t (c) (%record-test-fail-or-emit 56415)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

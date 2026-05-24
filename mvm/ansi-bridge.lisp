@@ -3001,6 +3001,140 @@
 ;; flipping unrelated tests to FAIL.  These runtime helpers replace the
 ;; per-element ASETs with a single function call.
 ;; -------------------------------------------------------------------
+;; Runtime entry point for MAKE-ARRAY — produces a native MDA (subtag
+;; #x34) for multi-dim / 0-dim / kwarg-bearing cases, or a flat 1-D
+;; #x32 array for the simple `(make-array N)` case.  Phase 2a of
+;; project_multidim_arrays.
+;;
+;; Compile-time calls (`(make-array N …)` in source) still dispatch
+;; through compile-make-array's builtin (op-name match in
+;; compile-compound), which only handles integer N + a couple of
+;; quoted-dim forms.  This defun is the path that runs when MAKE-ARRAY
+;; is reached via runtime eval or `(funcall #'make-array …)` or
+;; `(apply #'make-array …)`.  Auto-SFT (Gap A) registers it so
+;; eval/funcall find it.
+;;
+;; Limited kwarg support in Phase 2a: :initial-element, :initial-
+;; contents (flat list / list-of-lists / vector).  :fill-pointer,
+;; :adjustable, :displaced-to, :element-type non-T are deferred to
+;; Phase 2b — until then the kwarg is recorded in the MDA header but
+;; the actual semantics (fp shadowing length, displacement offset
+;; lookup, etc.) aren't yet propagated through aref/aset/length.
+(defun make-array (dim &rest kwargs)
+  "ANSI make-array — see file-level comment above for current scope."
+  (let* ((dim-list (cond ((null dim) nil)
+                         ((consp dim) dim)
+                         (t (list dim))))
+         (rank 0) (cur dim-list) (total 1))
+    (loop (when (null cur) (return nil))
+      (setq total (* total (car cur)))
+      (setq rank (+ rank 1))
+      (setq cur (cdr cur)))
+    ;; Walk kwargs into local vars.
+    (let ((ie-p nil) (ie nil) (ic-p nil) (ic nil)
+          (fp nil) (adj nil) (etype t)
+          (disp nil) (off 0)
+          (rest kwargs))
+      (loop (when (null rest) (return nil))
+        (let ((k (car rest)) (v (cadr rest)))
+          (cond
+            ((eq k :initial-element)        (setq ie-p t  ie v))
+            ((eq k :initial-contents)       (setq ic-p t  ic v))
+            ((eq k :fill-pointer)
+             (setq fp (cond ((eq v t) total) ((null v) nil) (t v))))
+            ((eq k :adjustable)             (setq adj v))
+            ((eq k :element-type)           (setq etype v))
+            ((eq k :displaced-to)           (setq disp v))
+            ((eq k :displaced-index-offset) (setq off  v))))
+        (setq rest (cddr rest)))
+      ;; Allocate + fill the flat data vector.
+      (let ((data (cond
+                    ;; :initial-element — fill every slot.
+                    (ie-p
+                     (let ((a (make-array total)) (i 0))
+                       (loop (when (>= i total) (return a))
+                         (aset a i ie)
+                         (setq i (+ i 1)))))
+                    ;; :initial-contents — flatten in row-major order
+                    ;; for multi-dim; copy verbatim for 1-D / flat lists.
+                    (ic-p
+                     (%mda-fill-contents-flat (make-array total) ic dim-list))
+                    (t (make-array total)))))
+        ;; Decide return shape.  Phase 2a: wrap in MDA whenever rank ≠ 1,
+        ;; or any non-trivial kwarg appeared, or the dim was passed as
+        ;; a list (even a single-element list) — that preserves rank
+        ;; info per CLHS (`(array-rank (make-array '(5)))` is 1, not 0).
+        (if (and (= rank 1) (not (consp dim))
+                 (not fp) (not adj) (not disp) (eq etype t))
+            data
+            (%alloc-mda rank dim-list fp disp off etype data))))))
+
+(defun %mda-fill-contents-flat (data contents dims)
+  "Fill DATA in row-major order from CONTENTS shaped against DIMS.
+   For rank 0: CONTENTS is the scalar value, stored at slot 0.
+   For rank 1: CONTENTS is a flat sequence (list or vector).
+   For rank >1: CONTENTS is a nested list of lists with the right
+   shape — recursively flattened.  Helper for make-array's
+   :initial-contents kwarg."
+  (let ((i 0))
+    (cond
+      ;; Rank 0: scalar.
+      ((null dims) (aset data 0 contents) data)
+      ;; Last/only dim: contents is a flat sequence.
+      ((null (cdr dims))
+       (let ((cur contents))
+         (cond
+           ((consp cur)
+            (loop (when (null cur) (return data))
+              (aset data i (car cur))
+              (setq cur (cdr cur))
+              (setq i (+ i 1))))
+           ((stringp cur)
+            (let ((len (array-length cur)))
+              (loop (when (>= i len) (return data))
+                (aset data i (aref cur i))
+                (setq i (+ i 1)))))
+           (t data))))
+      ;; Multi-dim: recurse into each sub-list.
+      (t
+       (let ((cur contents)
+             (sub-size 1))
+         ;; size of each "row" = product of remaining dims
+         (let ((d (cdr dims)))
+           (loop (when (null d) (return nil))
+             (setq sub-size (* sub-size (car d)))
+             (setq d (cdr d))))
+         (loop (when (null cur) (return data))
+           (%mda-fill-contents-sub data i (car cur) (cdr dims))
+           (setq i (+ i sub-size))
+           (setq cur (cdr cur)))
+         data)))))
+
+(defun %mda-fill-contents-sub (data offset sub-contents sub-dims)
+  "Fill DATA[offset…offset+sub-size) from SUB-CONTENTS shaped against
+   SUB-DIMS.  Recursive helper for %mda-fill-contents-flat's
+   multi-dim branch."
+  (cond
+    ((null sub-dims)
+     (aset data offset sub-contents))
+    ((null (cdr sub-dims))
+     (let ((cur sub-contents) (i offset))
+       (loop (when (null cur) (return data))
+         (aset data i (car cur))
+         (setq cur (cdr cur))
+         (setq i (+ i 1)))))
+    (t
+     (let ((cur sub-contents) (i offset)
+           (sub-size 1))
+       (let ((d (cdr sub-dims)))
+         (loop (when (null d) (return nil))
+           (setq sub-size (* sub-size (car d)))
+           (setq d (cdr d))))
+       (loop (when (null cur) (return data))
+         (%mda-fill-contents-sub data i (car cur) (cdr sub-dims))
+         (setq i (+ i sub-size))
+         (setq cur (cdr cur)))))))
+
 (defun %make-array-fill-init (n init)
   "Allocate a fresh general array of size N and fill every slot with INIT."
   (let ((a (make-array n)) (i 0))

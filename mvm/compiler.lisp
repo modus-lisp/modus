@@ -1579,6 +1579,20 @@
             ;; body; just return FIRST's values.
             first))))
 
+  ;; NOTNOT-MV — (notnot-mv form) wraps FORM's multiple values so the
+  ;; primary value is booleanized while subsequent values pass through.
+  ;; Matches the ANSI aux:
+  ;;   (defmacro notnot-mv (form)
+  ;;     `(notnot-mv-fn (multiple-value-list ,form)))
+  ;; SUBTYPEP / TYPEP / etc. return (sub valid) — without this macro,
+  ;; the legacy (defun notnot-mv (x) (if x t nil)) only saw the first
+  ;; value, losing VALID.  +60 ANSI subtypep tests gated on this.
+  (mvm-define-macro "NOTNOT-MV"
+    (lambda (form)
+      (let ((tmp (gensym "NNMV")))
+        `(let ((,tmp (multiple-value-list ,(cadr form))))
+           (%notnot-mv-fn ,tmp)))))
+
   ;; DO-SYMBOLS — (do-symbols (var [pkg [result]]) body...)
   ;; Collect all accessible symbols of PKG via %do-symbols-fn into a fresh
   ;; list, then iterate.  Body is in an implicit BLOCK NIL so RETURN works.

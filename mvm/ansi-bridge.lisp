@@ -86,6 +86,20 @@
 (defun notnot (x)
   (if x t nil))
 
+(defun %notnot-mv-fn (results)
+  "Helper for NOTNOT-MV: booleanize the FIRST value, leave rest as-is.
+   Modus's `values` returns multi-values; we wrap rest via apply."
+  (cond
+    ((null results) (values))
+    ((null (cdr results)) (values (if (car results) t nil)))
+    ((null (cddr results))
+     (values (if (car results) t nil) (cadr results)))
+    (t (values (if (car results) t nil) (cadr results) (caddr results)))))
+
+;; Legacy defun (single-value boolean) kept as a fallback for callsites
+;; that don't go through a macroexpander.  The compile-time macro below
+;; intercepts source-level (NOTNOT-MV form) so two-value forms like
+;; SUBTYPEP get their VALID return preserved.
 (defun notnot-mv (x)
   (if x t nil))
 

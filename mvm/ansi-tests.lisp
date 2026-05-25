@@ -3103,7 +3103,46 @@
           (let ((a (make-array '(4) :adjustable t :element-type 'bit
                                     :fill-pointer t :initial-contents '(1 0 0 1))))
             (deftest 56464 (%mda-p a) t))
-        (t (c) (%record-test-fail-or-emit 56464)))))
+        (t (c) (%record-test-fail-or-emit 56464)))
+      ;; 56470 — compound INTEGER subtypep equivalence
+      (handler-case
+          (multiple-value-bind (sub valid)
+              (subtypep '(integer (9)) '(integer 10))
+            (deftest 56470 (and sub valid) t))
+        (t (c) (%record-test-fail-or-emit 56470)))
+      ;; 56471 — (not (integer 10)) ⊆ (not (integer (9))) ⟺ (integer (9)) ⊆ (integer 10) = T
+      (handler-case
+          (multiple-value-bind (sub valid)
+              (subtypep '(not (integer 10)) '(not (integer (9))))
+            (deftest 56471 (and sub valid) t))
+        (t (c) (%record-test-fail-or-emit 56471)))
+      ;; 56472 — (and X (not Y)) ⊆ NIL when X ⊆ Y
+      (handler-case
+          (multiple-value-bind (sub valid)
+              (subtypep '(and (integer (9)) (not (integer 10))) nil)
+            (deftest 56472 (and sub valid) t))
+        (t (c) (%record-test-fail-or-emit 56472)))
+      ;; 56473 — T ⊆ (or X (not Y)) when Y ⊆ X
+      (handler-case
+          (multiple-value-bind (sub valid)
+              (subtypep t '(or (integer 10) (not (integer (9)))))
+            (deftest 56473 (and sub valid) t))
+        (t (c) (%record-test-fail-or-emit 56473)))
+      ;; 56474 — (cons NIL T) ⊆ FLOAT  (cons-with-empty-car is empty)
+      (handler-case
+          (multiple-value-bind (sub valid) (subtypep '(cons nil t) 'float)
+            (deftest 56474 (and sub valid) t))
+        (t (c) (%record-test-fail-or-emit 56474)))
+      ;; 56475 — (array T) ⊆ (array T *)
+      (handler-case
+          (multiple-value-bind (sub valid) (subtypep '(array t) '(array t *))
+            (deftest 56475 (and sub valid) t))
+        (t (c) (%record-test-fail-or-emit 56475)))
+      ;; 56476 — what does (subtypep '(cons nil t) 'float) ACTUALLY return?
+      (handler-case
+          (multiple-value-bind (sub valid) (subtypep '(cons nil t) 'float)
+            (deftest 56476 (list sub valid) '(t t)))
+        (t (c) (%record-test-fail-or-emit 56476)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

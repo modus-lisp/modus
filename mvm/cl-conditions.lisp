@@ -894,7 +894,14 @@
 (defun %subtypep-result (t1 t2)
   "Returns a cons (sub . valid) describing the subtypep relation.
    Cons-based so callers can return multi-values via (values (car r) (cdr r))
-   in a single tail position."
+   in a single tail position.
+
+   Compound types (and / or / not / member / numeric ranges with
+   non-integer head) get routed to %subtypep-impl in cl-types.lisp,
+   which has the full compound-type machinery (NOT/NOT contrapositive,
+   AND-NIL emptiness, T-OR universal-cover, etc.).  Only when both
+   sides are plain symbols (or condition names) do we use the simpler
+   static-hierarchy path below."
   (cond
     ;; Trivial cases first: handle T and NIL specially.
     ((null t1) (cons t t))
@@ -902,6 +909,19 @@
     ((eq t2 't) (cons t t))
     ;; Same name as itself
     ((and (symbolp t1) (symbolp t2) (eq t1 t2)) (cons t t))
+    ;; Route compound types to the richer cl-types.lisp impl FIRST.
+    ;; Detected by: either side is a compound (consp) — catches
+    ;; (not X), (and ...), (or ...), (member ...), (integer L H), etc.
+    ;; We only fall back to the symbol-vs-symbol paths below for plain
+    ;; named types.
+    ((or (consp t1) (consp t2))
+     (multiple-value-bind (sub valid) (%subtypep-impl t1 t2)
+       (cond
+         ;; If %subtypep-impl came back UNKNOWN, give the cl-conditions
+         ;; numeric-int / class-proxy paths a chance.  Otherwise return
+         ;; its answer.
+         (valid (cons (if sub t nil) t))
+         (t (%subtypep-result-fallback t1 t2)))))
     ;; Both are condition type names registered in the condition tree —
     ;; check via the condition parent hierarchy first so condition
     ;; subclasses aren't short-circuited by the generic table below.
@@ -915,8 +935,19 @@
      (if (%subtype-of-p t1 t2)
          (cons t t)
          (cons nil t)))
-    ;; Numeric range types — both compound integer/rational/real or one
-    ;; symbol and the other compound, in any combination.
+    ;; t1 is class proxy — strip and recurse
+    ((%class-proxy-p t1)
+     (%subtypep-result (%class-proxy-name t1)
+                       (if (%class-proxy-p t2) (%class-proxy-name t2) t2)))
+    ;; t2 is class proxy
+    ((%class-proxy-p t2)
+     (%subtypep-result t1 (%class-proxy-name t2)))
+    (t (cons nil nil))))
+
+(defun %subtypep-result-fallback (t1 t2)
+  "Called from %subtypep-result when %subtypep-impl returns UNKNOWN
+   for compound types.  Tries cl-conditions's integer-numeric path."
+  (cond
     ((or (%integer-type-bounds t1) (%integer-type-bounds t2))
      (%subtypep-int-impl t1 t2))
     ;; (eql v) ⊆ T2 — handled if t2 is a known type
@@ -926,13 +957,6 @@
        ((typep (cadr t1) t2) (cons t t))
        ((%subtype-of-p 't t2) (cons nil nil))
        (t (cons nil nil))))
-    ;; t1 is class proxy — strip and recurse
-    ((%class-proxy-p t1)
-     (%subtypep-result (%class-proxy-name t1)
-                       (if (%class-proxy-p t2) (%class-proxy-name t2) t2)))
-    ;; t2 is class proxy
-    ((%class-proxy-p t2)
-     (%subtypep-result t1 (%class-proxy-name t2)))
     (t (cons nil nil))))
 
 (defun %subtypep-int-impl (t1 t2)

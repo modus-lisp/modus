@@ -456,6 +456,28 @@
   (declare (ignore head))
   (cons ':pos-inf nil))
 
+(defun %integer-head-p (h)
+  "Is HEAD an integer-like type? (integer / fixnum / bignum / bit /
+   signed-byte / unsigned-byte) — these have INTEGER bounds, so
+   exclusive N at an integer N is equivalent to inclusive N+1."
+  (or (eq h 'integer) (eq h 'fixnum) (eq h 'bignum) (eq h 'bit)
+      (eq h 'signed-byte) (eq h 'unsigned-byte)))
+
+(defun %normalize-int-low (lo)
+  "If LO is (:open . N) and N is an integer, normalize to (:closed . N+1).
+   Other bounds returned unchanged."
+  (cond
+    ((and (eq (car lo) ':open) (integerp (cdr lo)))
+     (cons ':closed (+ (cdr lo) 1)))
+    (t lo)))
+
+(defun %normalize-int-high (hi)
+  "If HI is (:open . N) and N is an integer, normalize to (:closed . N-1)."
+  (cond
+    ((and (eq (car hi) ':open) (integerp (cdr hi)))
+     (cons ':closed (- (cdr hi) 1)))
+    (t hi)))
+
 (defun %sub-numeric-range (sub-type sup-type)
   "Both SUB-TYPE and SUP-TYPE are numeric range types (compound or symbol).
    Returns (values RESULT VALID).
@@ -467,6 +489,15 @@
          (sup-range (%parse-num-range sup-type))
          (sub-lo (car sub-range)) (sub-hi (cdr sub-range))
          (sup-lo (car sup-range)) (sup-hi (cdr sup-range)))
+    ;; Integer-bound normalization: (:open . N) where N is integer is
+    ;; equivalent to (:closed . N±1) when BOTH sides are integer types.
+    ;; Lets `(integer (9)) ≡ (integer 10)` show as ranges containing each
+    ;; other.
+    (when (and (%integer-head-p sub-head) (%integer-head-p sup-head))
+      (setq sub-lo (%normalize-int-low  sub-lo))
+      (setq sub-hi (%normalize-int-high sub-hi))
+      (setq sup-lo (%normalize-int-low  sup-lo))
+      (setq sup-hi (%normalize-int-high sup-hi)))
     ;; First: check head-level subtype
     (cond
       ;; FLOAT vs RATIONAL/INTEGER are disjoint
@@ -739,6 +770,80 @@
    class symbol."
   (%sub-numeric-range sub-type sup-type))
 
+(defun %subtypep-t-or (t-or)
+  "Handle `T ⊆ (OR ...)`.  Split the OR into positive terms and a
+   single negated term (if any).  Per CL: T ⊆ (OR X (NOT Y)) ⟺ Y ⊆ X.
+   For OR with no NOT terms, only succeed if some term IS T (or all
+   types cover everything — too hard to compute conservatively)."
+  (let ((pos nil) (neg nil) (extra-neg nil))
+    (dolist (term (cdr t-or))
+      (cond
+        ((and (consp term) (eq (car term) 'not))
+         (if neg (setq extra-neg t) (setq neg (cadr term))))
+        (t (push term pos))))
+    (cond
+      ;; Multiple NOT terms — give up.
+      (extra-neg (values nil nil))
+      ;; Single NOT term: T ⊆ (OR P1 P2 ... (NOT Y))
+      ;; ⟺ (NOT (OR P1 P2 ...)) ⊆ NIL OR Y ⊆ (OR P1 P2 ...)
+      ;; ⟺ Y ⊆ (OR P1 P2 ...)
+      (neg
+       (let ((pos-type (cond
+                         ((null pos) 'nil)
+                         ((null (cdr pos)) (car pos))
+                         (t (cons 'or (nreverse pos))))))
+         (multiple-value-bind (sub valid) (%subtypep-impl neg pos-type)
+           (cond
+             ((and valid sub) (values t t))
+             (valid (values nil nil))   ; conservative — couldn't prove
+             (t (values nil nil))))))
+      ;; No NOT term — T ⊆ (OR ...) only if some term is T.
+      ((member 't pos) (values t t))
+      (t (values nil nil)))))
+
+(defun %subtypep-and-nil (t-and)
+  "Handle `(AND ...) ⊆ NIL`.  (AND P1 (NOT Y) P2 ...) ⊆ NIL
+   ⟺ (AND P1 P2 ...) ⊆ Y (all positives are inside Y).
+   For (AND ...) without a NOT term, check if any two positive terms
+   are disjoint."
+  (let ((pos nil) (neg nil) (extra-neg nil))
+    (dolist (term (cdr t-and))
+      (cond
+        ((and (consp term) (eq (car term) 'not))
+         (if neg (setq extra-neg t) (setq neg (cadr term))))
+        (t (push term pos))))
+    (cond
+      (extra-neg (values nil nil))
+      (neg
+       (let ((pos-type (cond
+                         ((null pos) 't)
+                         ((null (cdr pos)) (car pos))
+                         (t (cons 'and (nreverse pos))))))
+         (multiple-value-bind (sub valid) (%subtypep-impl pos-type neg)
+           (cond
+             ((and valid sub) (values t t))
+             (valid (values nil nil))
+             (t (values nil nil))))))
+      ;; No NOT in AND: empty iff any two positives are disjoint
+      ;; (or any positive is NIL).
+      (t
+       (let ((seen nil) (disjoint nil))
+         (dolist (term pos)
+           (cond
+             ((or (null term) (eq term 'nil)) (setq disjoint t))
+             (t
+              (dolist (s seen)
+                (multiple-value-bind (sub valid) (%subtypep-impl term s)
+                  (declare (ignore sub))
+                  (when (and valid (multiple-value-bind (sub2 valid2)
+                                       (%subtypep-impl term `(not ,s))
+                                     (and valid2 sub2)))
+                    (setq disjoint t))))
+              (push term seen))))
+         (cond
+           (disjoint (values t t))
+           (t (values nil nil))))))))
+
 (defun %subtypep-impl (t1 t2)
   "Implementation of SUBTYPEP returning two values: SUB? VALID?"
   (cond
@@ -747,6 +852,23 @@
     ((null t1) (values t t))
     ((eq t1 'nil) (values t t))
     ((eq t2 't) (values t t))
+    ;; (NOT X) ⊆ (NOT Y) ⟺ Y ⊆ X (contrapositive).
+    ;; Handle this BEFORE the t1=T or t2=NIL clauses below; check-
+    ;; equivalence dispatches 4 NOT/NOT subchecks per call.
+    ((and (consp t1) (eq (car t1) 'not)
+          (consp t2) (eq (car t2) 'not))
+     (%subtypep-impl (cadr t2) (cadr t1)))
+    ;; T ⊆ (OR X (NOT Y)) ⟺ Y ⊆ X (everything-not-in-Y is in X).
+    ;; This is the rule the universal-cover check uses.  We split the
+    ;; (or ...) into a positive part and a single negated part; if the
+    ;; negated part exists and the remaining positives are a single
+    ;; type X, recurse on (Y ⊆ X).
+    ((and (eq t1 't) (consp t2) (eq (car t2) 'or))
+     (%subtypep-t-or t2))
+    ;; (AND X (NOT Y)) ⊆ NIL  ⟺  X ⊆ Y (X minus Y is empty).
+    ;; check-equivalence dispatches 4 of these per call.
+    ((and (consp t1) (eq (car t1) 'and) (or (null t2) (eq t2 'nil)))
+     (%subtypep-and-nil t1))
     ((eq t2 'nil)
      ;; Subtype of NIL means empty type; only NIL satisfies that.
      ;; If t1 is a known nonempty named type, return (NIL T).
@@ -846,8 +968,118 @@
        (cond
          (all-yes (values t t))
          (t (values nil nil)))))
+    ;; (array ETYPE DIMS) ⊆ (array ETYPE2 DIMS2) — match ANSI rules
+    ((and (or (and (consp t1) (or (eq (car t1) 'array) (eq (car t1) 'simple-array)))
+              (eq t1 'array) (eq t1 'simple-array))
+          (or (and (consp t2) (or (eq (car t2) 'array) (eq (car t2) 'simple-array)))
+              (eq t2 'array) (eq t2 'simple-array)))
+     (%subtypep-array t1 t2))
+    ;; (cons A B) — compound CONS type.
+    ((and (or (and (consp t1) (eq (car t1) 'cons)) (eq t1 'cons))
+          (or (and (consp t2) (eq (car t2) 'cons)) (eq t2 'cons)))
+     (%subtypep-cons t1 t2))
+    ;; (cons ...) ⊆ symbol Y — true if Y is supertype of cons (list etc.)
+    ;; If the cons is empty (NIL car or cdr), it's empty type ⊆ everything.
+    ((and (or (and (consp t1) (eq (car t1) 'cons)) (eq t1 'cons))
+          (symbolp t2))
+     (let* ((rest1 (if (consp t1) (cdr t1) nil))
+            (a (if rest1 (car rest1) 't))
+            (b (if (and rest1 (cdr rest1)) (cadr rest1) 't)))
+       (cond
+         ((or (%cons-arg-empty-p a) (%cons-arg-empty-p b)) (values t t))
+         ((%has-supertype-p 'cons t2 30) (values t t))
+         ((%type-known-p t2) (values nil t))
+         (t (values nil nil)))))
+    ;; symbol X ⊆ (cons ...) — only NULL is fully covered
+    ((and (symbolp t1) (consp t2) (eq (car t2) 'cons))
+     (cond
+       ((eq t1 'null) (values nil t))   ; null is not cons
+       ((%has-supertype-p t1 'cons 30) (values nil nil))
+       ((%symbol-type-disjoint-p t1 'cons) (values nil t))
+       (t (values nil nil))))
+    ;; (array ...) / (simple-array ...) ⊆ symbol Y
+    ((and (or (and (consp t1) (or (eq (car t1) 'array) (eq (car t1) 'simple-array)))
+              (eq t1 'array) (eq t1 'simple-array))
+          (symbolp t2))
+     (let ((head (if (consp t1) (car t1) t1)))
+       (cond
+         ((%has-supertype-p head t2 30) (values t t))
+         ((%type-known-p t2) (values nil t))
+         (t (values nil nil)))))
     ;; Default: don't know
     (t (values nil nil))))
+
+(defun %subtypep-array (t1 t2)
+  "Subtypep for (array ETYPE DIMS) compound types.
+   ETYPE form: T or * for any element type; otherwise a concrete element type.
+   DIMS form: * for any rank, integer N for rank N, list for specific dim spec.
+
+   Per CL: SIMPLE-ARRAY ⊆ ARRAY.  SUBTYPE relations on ETYPE / DIMS are
+   applied pairwise.  We're conservative: if etypes are EQUAL, considered
+   equivalent; otherwise unknown.  Dims check is structural."
+  (let* ((head1 (if (consp t1) (car t1) t1))
+         (head2 (if (consp t2) (car t2) t2))
+         (rest1 (if (consp t1) (cdr t1) nil))
+         (rest2 (if (consp t2) (cdr t2) nil))
+         (et1 (if rest1 (car rest1) '*))
+         (et2 (if rest2 (car rest2) '*))
+         (dims1 (if (and rest1 (cdr rest1)) (cadr rest1) '*))
+         (dims2 (if (and rest2 (cdr rest2)) (cadr rest2) '*)))
+    ;; Head subtype: simple-array ⊆ array
+    (cond
+      ((and (eq head1 'array) (eq head2 'simple-array))
+       (values nil t))     ; non-simple-array isn't simple-array
+      (t
+       ;; etype check.  CL: array etypes are matched via UPGRADED-ARRAY-
+       ;; ELEMENT-TYPE.  We treat T and * equivalently, and treat
+       ;; any etype as equal to itself.
+       (let ((et-ok (or (and (or (eq et1 't) (eq et1 '*))
+                             (or (eq et2 't) (eq et2 '*)))
+                        (equal et1 et2))))
+         (cond
+           ((not et-ok) (values nil nil))
+           ;; dims check
+           ((or (eq dims2 '*) (equal dims1 dims2)) (values t t))
+           ;; dims1=* but dims2 specific → over-broad
+           ((eq dims1 '*) (values nil t))
+           ;; dims1 specific list, dims2 specific list — must match exactly
+           (t (if (equal dims1 dims2) (values t t) (values nil t)))))))))
+
+(defun %cons-arg-empty-p (a)
+  "True if A as a CONS car/cdr type-spec is empty.  NIL (the type) is
+   empty.  (and X (not X)) is empty.  Conservative: returns NIL when
+   unsure."
+  (cond
+    ((null a) t)
+    ((eq a 'nil) t)
+    (t nil)))
+
+(defun %subtypep-cons (t1 t2)
+  "Subtypep for (cons CAR-TYPE CDR-TYPE) compound types.
+   (cons A B) ⊆ (cons C D) iff A ⊆ C AND B ⊆ D.
+   Missing args default to T.
+   Empty cons (any arg empty) is the empty type, ⊆ everything."
+  (let* ((rest1 (if (consp t1) (cdr t1) nil))
+         (rest2 (if (consp t2) (cdr t2) nil))
+         (a (if rest1 (car rest1) 't))
+         (b (if (and rest1 (cdr rest1)) (cadr rest1) 't))
+         (c (if rest2 (car rest2) 't))
+         (d (if (and rest2 (cdr rest2)) (cadr rest2) 't)))
+    ;; Treat * as t
+    (when (eq a '*) (setq a 't))
+    (when (eq b '*) (setq b 't))
+    (when (eq c '*) (setq c 't))
+    (when (eq d '*) (setq d 't))
+    ;; (cons NIL X) or (cons X NIL) is empty — empty ⊆ anything = T.
+    (cond
+      ((or (%cons-arg-empty-p a) (%cons-arg-empty-p b)) (values t t))
+      (t
+       (multiple-value-bind (s1 v1) (%subtypep-impl a c)
+         (multiple-value-bind (s2 v2) (%subtypep-impl b d)
+           (cond
+             ((and v1 v2 s1 s2) (values t t))
+             ((and v1 v2) (values nil t))
+             (t (values nil nil)))))))))
 
 (defun subtypep (t1 t2)
   "Two-value SUBTYPEP per ANSI: returns (sub valid).

@@ -1009,41 +1009,72 @@
     ;; Default: don't know
     (t (values nil nil))))
 
+(defun %canon-array-dims (dims)
+  "Normalize ARRAY DIMS form to a canonical shape.
+   '* → '*
+   N (integer) → list of N '*'s (representing rank N with all-* dims)
+   (* * ... *) (all-asterisk list) → equivalent to integer rank length
+   (specific) → returned as-is
+   Returns either '* (any rank) or a list of dim entries."
+  (cond
+    ((eq dims '*) '*)
+    ((null dims) nil)
+    ((integerp dims)
+     (let ((acc nil) (i 0))
+       (loop (when (>= i dims) (return acc))
+         (setq acc (cons '* acc))
+         (setq i (+ i 1)))))
+    ((listp dims) dims)
+    (t dims)))
+
+(defun %dim-le-p (d1 d2)
+  "Is dim spec D1 ⊆ D2?  '*' matches anything; integers and other
+   values must match by EQL."
+  (or (eq d2 '*) (eql d1 d2)))
+
+(defun %dims-le-p (ds1 ds2)
+  "Pairwise check that every dim in DS1 fits in DS2.  Both must have
+   the same length."
+  (cond
+    ((and (null ds1) (null ds2)) t)
+    ((or (null ds1) (null ds2)) nil)
+    ((%dim-le-p (car ds1) (car ds2)) (%dims-le-p (cdr ds1) (cdr ds2)))
+    (t nil)))
+
 (defun %subtypep-array (t1 t2)
   "Subtypep for (array ETYPE DIMS) compound types.
    ETYPE form: T or * for any element type; otherwise a concrete element type.
    DIMS form: * for any rank, integer N for rank N, list for specific dim spec.
 
    Per CL: SIMPLE-ARRAY ⊆ ARRAY.  SUBTYPE relations on ETYPE / DIMS are
-   applied pairwise.  We're conservative: if etypes are EQUAL, considered
-   equivalent; otherwise unknown.  Dims check is structural."
+   applied pairwise.  ETYPEs normalized via canon (* or T as wildcard).
+   DIMS normalized via %canon-array-dims so integer rank N and a list of
+   N asterisks are equivalent."
   (let* ((head1 (if (consp t1) (car t1) t1))
          (head2 (if (consp t2) (car t2) t2))
          (rest1 (if (consp t1) (cdr t1) nil))
          (rest2 (if (consp t2) (cdr t2) nil))
          (et1 (if rest1 (car rest1) '*))
          (et2 (if rest2 (car rest2) '*))
-         (dims1 (if (and rest1 (cdr rest1)) (cadr rest1) '*))
-         (dims2 (if (and rest2 (cdr rest2)) (cadr rest2) '*)))
+         (dims1 (%canon-array-dims (if (and rest1 (cdr rest1)) (cadr rest1) '*)))
+         (dims2 (%canon-array-dims (if (and rest2 (cdr rest2)) (cadr rest2) '*))))
     ;; Head subtype: simple-array ⊆ array
     (cond
       ((and (eq head1 'array) (eq head2 'simple-array))
        (values nil t))     ; non-simple-array isn't simple-array
       (t
-       ;; etype check.  CL: array etypes are matched via UPGRADED-ARRAY-
-       ;; ELEMENT-TYPE.  We treat T and * equivalently, and treat
-       ;; any etype as equal to itself.
        (let ((et-ok (or (and (or (eq et1 't) (eq et1 '*))
                              (or (eq et2 't) (eq et2 '*)))
                         (equal et1 et2))))
          (cond
            ((not et-ok) (values nil nil))
-           ;; dims check
-           ((or (eq dims2 '*) (equal dims1 dims2)) (values t t))
-           ;; dims1=* but dims2 specific → over-broad
+           ;; dims2 is * → any rank/dims accepted
+           ((eq dims2 '*) (values t t))
+           ;; dims1 is * but dims2 specific → over-broad
            ((eq dims1 '*) (values nil t))
-           ;; dims1 specific list, dims2 specific list — must match exactly
-           (t (if (equal dims1 dims2) (values t t) (values nil t)))))))))
+           ;; Both are lists — pairwise check
+           ((%dims-le-p dims1 dims2) (values t t))
+           (t (values nil t))))))))
 
 (defun %cons-arg-empty-p (a)
   "True if A as a CONS car/cdr type-spec is empty.  NIL (the type) is

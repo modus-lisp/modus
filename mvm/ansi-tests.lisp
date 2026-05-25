@@ -3429,7 +3429,70 @@
                              "max.lsp" "min.lsp" "gcd.lsp" "lcm.lsp")
                            "NUMBERS"
                            56508)
-        (t (c) (%record-test-fail-or-emit 56508)))))
+        (t (c) (%record-test-fail-or-emit 56508)))
+      ;; 56520 — more cons files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/cons/"
+                           '("adjoin.lsp" "assoc.lsp" "assoc-if.lsp"
+                             "assoc-if-not.lsp" "butlast.lsp"
+                             "get-properties.lsp" "getf.lsp"
+                             "intersection.lsp" "mapc.lsp" "mapcan.lsp"
+                             "mapcar.lsp" "mapcon.lsp" "mapl.lsp"
+                             "maplist.lsp" "member.lsp" "member-if.lsp"
+                             "nconc.lsp" "nintersection.lsp"
+                             "pop.lsp" "push.lsp" "pushnew.lsp"
+                             "rassoc.lsp" "set-difference.lsp"
+                             "subst.lsp" "subst-if.lsp" "union.lsp")
+                           "CONS2"
+                           56520)
+        (t (c) (%record-test-fail-or-emit 56520)))
+      ;; 56521 — iteration/ files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/iteration/"
+                           '("dolist.lsp" "dotimes.lsp" "do.lsp" "do-star.lsp"
+                             "loop1.lsp" "loop2.lsp" "loop3.lsp")
+                           "ITER"
+                           56521)
+        (t (c) (%record-test-fail-or-emit 56521)))
+      ;; 56522 — sequences/ files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/sequences/"
+                           '("length.lsp" "elt.lsp" "reverse.lsp"
+                             "nreverse.lsp" "count.lsp" "count-if.lsp"
+                             "every.lsp" "some.lsp" "notany.lsp"
+                             "notevery.lsp" "find.lsp" "find-if.lsp"
+                             "position.lsp" "position-if.lsp"
+                             "remove.lsp" "remove-if.lsp"
+                             "search.lsp" "subseq.lsp"
+                             "fill.lsp" "map.lsp")
+                           "SEQ"
+                           56522)
+        (t (c) (%record-test-fail-or-emit 56522)))
+      ;; 56523 — data-and-control-flow/ files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/data-and-control-flow/"
+                           '("if.lsp" "when.lsp" "unless.lsp" "cond.lsp"
+                             "and.lsp" "or.lsp" "not.lsp"
+                             "eq.lsp" "eql.lsp" "equal.lsp" "equalp.lsp"
+                             "identity.lsp" "constantly.lsp"
+                             "complement.lsp" "values.lsp"
+                             "block.lsp" "return.lsp" "return-from.lsp"
+                             "tagbody.lsp" "go.lsp" "catch.lsp" "throw.lsp"
+                             "progn.lsp" "prog1.lsp" "prog2.lsp")
+                           "DCF"
+                           56523)
+        (t (c) (%record-test-fail-or-emit 56523)))
+      ;; 56524 — conditions/ files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/conditions/"
+                           '("type-error.lsp" "simple-error.lsp"
+                             "parse-error.lsp" "stream-error.lsp"
+                             "file-error.lsp" "package-error.lsp"
+                             "division-by-zero.lsp" "end-of-file.lsp"
+                             "warning.lsp" "simple-warning.lsp")
+                           "COND-T"
+                           56524)
+        (t (c) (%record-test-fail-or-emit 56524)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

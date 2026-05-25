@@ -2781,7 +2781,11 @@
        (compile-form `(aref ,(cadr form) ,(caddr form)) env dest))
 
       ;; ARRAY-IN-BOUNDS-P — (array-in-bounds-p array index...)
-      ;; Returns T if all indices are valid
+      ;; Returns T if all indices are valid.  Per CLHS this checks
+      ;; against the ARRAY DIMENSION, NOT the fill-pointer (an fp
+      ;; truncates the user-visible length but the underlying storage
+      ;; still backs the full dimension).  Use %array-raw-length to
+      ;; bypass fp slicing — array-length itself is fp-aware for MDAs.
       ((= op-name 57704008642470133)
        (let ((arr (cadr form))
              (indices (cddr form)))
@@ -2790,9 +2794,10 @@
            ((= (length indices) 1)
             (compile-form `(let ((%aib-arr ,arr) (%aib-idx ,(car indices)))
                              (and (>= %aib-idx 0)
-                                  (< %aib-idx (array-length %aib-arr))))
+                                  (< %aib-idx (%array-raw-length %aib-arr))))
                           env dest))
-           (t (compile-t dest)))))
+           (t (compile-form `(%array-in-bounds-multi ,arr (list ,@indices))
+                            env dest)))))
 
       ;; THE — (the type form) → compile form, ignore type declaration
       ((= op-name 977942333759456998)
@@ -6920,8 +6925,61 @@
     (free-temp-reg)))
 
 (defun compile-prim-stringp (arg env dest)
-  "Compile primitive (stringp x) — checks subtag without wrapper peel."
-  (compile-object-subtype-p arg env dest +subtag-string+))
+  "Compile primitive (stringp x) — true if X is a string object (subtag
+   #x31) directly, OR if X is a native MDA (subtag #x34) whose data slot
+   holds a string (char-element-typed MDA returned by make-array with
+   :element-type 'character + fp / adjustable / etc.).
+
+   Generated layout:
+     1. extract obj-tag — if not +tag-object+ → FALSE
+     2. extract obj-subtag — if = #x31 → TRUE
+     3. if subtag = #x34, dereference slot 6 (data), check its obj-tag
+        + obj-subtag — if (tag = object AND subtag = #x31) → TRUE
+     4. otherwise FALSE
+   Mirrors compile-object-subtype-p with an added MDA-peel branch."
+  (let ((true-label (make-compiler-label))
+        (false-label (make-compiler-label))
+        (mda-label (make-compiler-label))
+        (end-label (make-compiler-label))
+        (temp (alloc-temp-reg))
+        (temp2 (alloc-temp-reg)))
+    (compile-form arg env dest)
+    ;; Check object tag
+    (emit-ir :obj-tag temp dest)
+    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :bne false-label)
+    ;; Check subtag == #x31 (string)
+    (emit-ir :obj-subtag temp dest)
+    (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; Check subtag == #x34 (MDA) — if so, peel data slot
+    (emit-ir :li temp2 (ash +subtag-mda+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq mda-label)
+    (emit-ir :br false-label)
+    ;; MDA peel: load (obj-ref dest dest 6) into dest, then check ITS
+    ;; obj-tag + obj-subtag.  Falls through to the string check chain.
+    (emit-ir-label mda-label)
+    (emit-ir :obj-ref dest dest 6)
+    (emit-ir :obj-tag temp dest)
+    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :bne false-label)
+    (emit-ir :obj-subtag temp dest)
+    (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; False fall-through
+    (emit-ir-label false-label)
+    (compile-nil dest)
+    (emit-ir :br end-label)
+    (emit-ir-label true-label)
+    (compile-t dest)
+    (emit-ir-label end-label)
+    (free-temp-reg)
+    (free-temp-reg)))
 
 (defun compile-stringp (arg env dest)
   "Compile (stringp x).  Routes wrapper inputs (cons-headed arrays) through
@@ -8020,13 +8078,17 @@
          (compile-form `(%aset-multi ,arr ,val ,@(nreverse subs)) env dest))))))
 
 (defun compile-array-length (arr-form env dest)
-  "Compile (array-length array). Routes wrapper inputs through %wrapper-array-length."
+  "Compile (array-length array). Routes wrapper inputs through
+   %wrapper-array-length.  Native MDA: peel to data via %mda-array-length
+   helper (returns fp if set, else array-length of data) — without this,
+   %prim-array-length reads the 7-slot count from the MDA header, which
+   breaks sequence ops that loop (dotimes i (array-length s) ...)."
   (let ((g-arr (gensym "ALENA")))
     (compile-form
      `(let ((,g-arr ,arr-form))
         (if (consp ,g-arr)
             (%wrapper-array-length ,g-arr)
-            (%prim-array-length ,g-arr)))
+            (%mda-array-length ,g-arr)))
      env dest)))
 
 ;;; ============================================================

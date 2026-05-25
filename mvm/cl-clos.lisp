@@ -1786,14 +1786,18 @@
 ;;; ============================================================
 
 (defun %mda-p (x)
-  "True iff X is a native multi-dim array header (subtag #x34)."
+  "True iff X is a native multi-dim array header (subtag #x34).
+   Note: DON'T early-out on (stringp x) — my new compile-prim-stringp
+   recognizes MDA-with-string-data as a string, which would create
+   mutual recursion (%mda-p → stringp → %mda-stringp → %mda-p).  The
+   subtag check is fast and unambiguous; the leading non-object filters
+   are enough to keep it cheap on the hot common-non-object path."
   (cond
     ((null x) nil)
     ((eq x t) nil)
     ((fixnump x) nil)
     ((consp x) nil)
     ((characterp x) nil)
-    ((stringp x) nil)
     (t (= (obj-subtag x) #x34))))
 
 ;; All MDA accessors use %prim-aref / %prim-aset directly — they read
@@ -1821,6 +1825,49 @@
   (cond
     ((%mda-p x) (%prim-stringp (%mda-data x)))
     (t nil)))
+
+(defun %array-raw-length (arr)
+  "Like array-length but ignores fill-pointer — returns the underlying
+   storage capacity.  Used by array-in-bounds-p which per CLHS checks
+   against the array's full dimension, not the fp-truncated length."
+  (cond
+    ((%mda-p arr) (%prim-array-length (%mda-data arr)))
+    ((consp arr) (%wrapper-array-length arr))
+    (t (%prim-array-length arr))))
+
+(defun %array-in-bounds-multi (arr indices)
+  "Multi-subscript array-in-bounds-p.  For native MDA, walks dims
+   against indices: each index must be a non-negative integer < its
+   corresponding dimension.  For non-MDA, returns T (per the prior
+   stub behavior — multi-sub on non-MDA isn't really meaningful)."
+  (cond
+    ((%mda-p arr)
+     (let ((dims (%mda-dims arr))
+           (subs indices)
+           (ok t))
+       (loop
+         (when (or (null dims) (null subs) (not ok)) (return ok))
+         (let ((sub (car subs)) (d (car dims)))
+           (when (or (not (integerp sub)) (< sub 0) (>= sub d))
+             (setq ok nil)))
+         (setq dims (cdr dims))
+         (setq subs (cdr subs)))
+       ;; both dims and subs must be exhausted together
+       (and ok (null dims) (null subs))))
+    (t t)))
+
+(defun %mda-array-length (x)
+  "MDA-aware replacement for raw %prim-array-length called from
+   compile-array-length on non-cons inputs.  For an MDA returns the
+   fp if set, else the underlying data vector's length.  Without this
+   `(array-length mda) → 7` (the slot count of the MDA header object),
+   which breaks every sequence loop that uses (dotimes i (array-length s)).
+   Non-MDA arrays return %prim-array-length verbatim."
+  (cond
+    ((%mda-p x)
+     (let ((fp (%mda-fp x)))
+       (if fp fp (%prim-array-length (%mda-data x)))))
+    (t (%prim-array-length x))))
 
 (defun %alloc-mda (rank dims fp displaced offset etype data)
   "Allocate a native multi-dim array header object and fill all 7
@@ -2006,14 +2053,90 @@
              (values (cdr a) (cdr (car a)))
              (values nil 0))))))
 
+(defun %adjust-mda-1d (a new-size args)
+  "Adjust a rank-1 MDA in place: realloc data when growing, copy old
+   contents, honor :initial-element / :initial-contents / :fill-pointer
+   / :displaced-to.  Returns A (eq holds — MDAs are always adjustable
+   in our impl since the header is mutable)."
+  (let ((displaced-to nil) (displaced-offset 0)
+        (fp-arg :unset) (init-elem :unset) (init-contents :unset)
+        (cur args))
+    (loop (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :displaced-to)            (setq displaced-to v))
+          ((eq k :displaced-index-offset)  (setq displaced-offset v))
+          ((eq k :fill-pointer)            (setq fp-arg v))
+          ((eq k :initial-element)         (setq init-elem v))
+          ((eq k :initial-contents)        (setq init-contents v))))
+      (setq cur (cddr cur)))
+    (let* ((old-data (%mda-data a))
+           (old-len  (array-length old-data))
+           (str-data (stringp old-data))
+           ;; Allocate new data of exactly new-size (preserve elt type).
+           (new-data (cond
+                       (displaced-to nil)
+                       (str-data (%make-string-array new-size))
+                       (t (make-array new-size)))))
+      (cond
+        (displaced-to
+         (%prim-aset a 3 displaced-to)
+         (%prim-aset a 4 displaced-offset))
+        ((not (eq init-contents :unset))
+         (let ((i 0) (lst init-contents))
+           (loop (when (>= i new-size) (return))
+             (when (consp lst)
+               (aset new-data i (car lst))
+               (setq lst (cdr lst)))
+             (setq i (+ i 1))))
+         (%prim-aset a 6 new-data)
+         (%prim-aset a 3 nil) (%prim-aset a 4 0))
+        ((not (eq init-elem :unset))
+         (let ((i 0)
+               (store (if (and str-data (characterp init-elem))
+                          (char-code init-elem) init-elem)))
+           (loop (when (>= i new-size) (return))
+             (let ((si i))
+               (if (< si old-len)
+                   (aset new-data i (aref old-data si))
+                   (aset new-data i store)))
+             (setq i (+ i 1))))
+         (%prim-aset a 6 new-data)
+         (%prim-aset a 3 nil) (%prim-aset a 4 0))
+        (t
+         (let ((i 0))
+           (loop (when (>= i new-size) (return))
+             (when (< i old-len)
+               (aset new-data i (aref old-data i)))
+             (setq i (+ i 1))))
+         (%prim-aset a 6 new-data)
+         (%prim-aset a 3 nil) (%prim-aset a 4 0)))
+      ;; Update dims slot to reflect the new size (rank stays 1).
+      (%prim-aset a 1 (list new-size))
+      ;; Update fp if requested
+      (cond
+        ((eq fp-arg :unset) nil)
+        ((eq fp-arg t) (%mda-set-fp a new-size))
+        ((null fp-arg) (%mda-set-fp a nil))
+        (t (%mda-set-fp a fp-arg)))
+      a)))
+
 (defun adjust-array (a new-size &rest args)
   "Return an array of NEW-SIZE with elements from A.
    When A is adjustable (outer (cons 8765432 ...)), we modify A in place so
    (eq a (adjust-array a ...)) holds, as required by ANSI for adjustable
    arrays.  For non-adjustable A, return a fresh array.
    Handles :displaced-to, :displaced-index-offset, :fill-pointer,
-   :initial-element, :initial-contents."
+   :initial-element, :initial-contents.
+
+   Native MDA: always-adjustable; delegate to %adjust-mda-1d (currently
+   1-D only — multi-dim adjust would need to reshape dims).
+   "
   (when (consp new-size) (setq new-size (car new-size)))
+  (when (%mda-p a)
+    (let ((rank (%mda-rank a)))
+      (when (or (= rank 0) (= rank 1))
+        (return-from adjust-array (%adjust-mda-1d a new-size args)))))
   (let* ((displaced-to nil)
          (displaced-offset 0)
          (fp-arg :unset)

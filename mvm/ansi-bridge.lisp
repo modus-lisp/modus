@@ -3183,14 +3183,19 @@
               (setq cur (cdr cur))
               (setq i (+ i 1))))
            ((stringp cur)
-            ;; Both source and dest are strings → copy raw char-codes
-            ;; (or characters depending on destination).
+            ;; Source is a string: aref returns a fixnum char-code.
+            ;; If dest is a string → store fixnum directly (string slots
+            ;; are u8); if dest is general → wrap via code-char to give
+            ;; a proper character object.
             (let ((len (array-length cur)))
               (loop (when (>= i len) (return data))
                 (let ((v (aref cur i)))
-                  (aset data i (if str-data
-                                   (if (characterp v) (char-code v) v)
-                                   v)))
+                  (aset data i (cond
+                                 (str-data
+                                  (if (characterp v) (char-code v) v))
+                                 ((characterp v) v)
+                                 ((integerp v) (code-char v))
+                                 (t v))))
                 (setq i (+ i 1)))))
            ;; Vector / bit-vector / any general array as initial-contents
            ;; source.  CL allows any sequence; we already cover list + string,

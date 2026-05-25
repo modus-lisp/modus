@@ -444,9 +444,11 @@
          (t
           (let ((dims (cadr obj)) (data (cddr obj)))
             (%print-md-array dims data stream level escape)))))
-      ;; Native MDA (subtag #x34) — Phase 4 of multi-dim arrays.  Rank 1
-      ;; with no kwargs falls back to plain vector path below; rank≠1 or
-      ;; any non-trivial header gets the #nA(...) emitter.
+      ;; Native MDA (subtag #x34) — Phase 4 of multi-dim arrays.
+      ;; Rank 1 → use the standard `#(...)` vector emitter (the data
+      ;; slot is already a real vector or string); rank ≠ 1 → `#nA(...)`.
+      ;; The data may be a string (char-element-typed), in which case the
+      ;; downstream stringp branch handles it.
       ((%mda-p obj)
        (cond
          ((not parray)
@@ -456,7 +458,28 @@
           (%print-char 62 stream))
          (t
           (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
-            (%print-md-array dims data stream level escape)))))
+            (cond
+              ;; Rank 1: recurse on the data vector/string (fp aware via
+              ;; the user-visible length).  Slice manually to fp when set.
+              ((and dims (null (cdr dims)))
+               (let ((fp (%mda-fp obj)))
+                 (if (or (null fp) (= fp (array-length data)))
+                     (%write-obj data stream level escape)
+                     ;; Build a temp vector / string of fp items and print it.
+                     (let ((tmp (if (stringp data)
+                                    (%make-string-array fp)
+                                    (make-array fp)))
+                           (i 0))
+                       (loop (when (>= i fp) (return nil))
+                         (aset tmp i (if (stringp data)
+                                         (if (characterp (aref data i))
+                                             (char-code (aref data i))
+                                             (aref data i))
+                                         (aref data i)))
+                         (setq i (+ i 1)))
+                       (%write-obj tmp stream level escape)))))
+              ;; Rank 0 or rank ≥ 2: full multi-dim emitter.
+              (t (%print-md-array dims data stream level escape)))))))
       ;; Cons (list)
       ((consp obj)
        ;; Check *print-level*

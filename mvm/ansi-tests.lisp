@@ -3031,7 +3031,40 @@
       (handler-case
           (let ((a (make-array '(5) :initial-contents '(a b c d e))))
             (deftest 56446 (equal (map 'list #'identity a) '(a b c d e)) t))
-        (t (c) (%record-test-fail-or-emit 56446)))))
+        (t (c) (%record-test-fail-or-emit 56446)))
+      ;; 56447 — stringp on MDA-string with fp
+      (handler-case
+          (let ((s (make-array 4 :element-type 'character :fill-pointer 2
+                                 :initial-contents '(#\a #\b #\c #\d))))
+            (deftest 56447 (stringp s) t))
+        (t (c) (%record-test-fail-or-emit 56447)))
+      ;; 56450 — array-length on MDA char-string with fp returns fp
+      (handler-case
+          (let ((s (make-array 4 :element-type 'character :fill-pointer 2
+                                 :initial-contents '(#\a #\b #\c #\d))))
+            (deftest 56450 (array-length s) 2))
+        (t (c) (%record-test-fail-or-emit 56450)))
+      ;; 56448 — string-trim with MDA char bag — bag="ab" trims to "cd"
+      (handler-case
+          (let* ((bag (make-array 2 :element-type 'character
+                                    :initial-contents '(#\a #\b)))
+                 (s "abcdaba")
+                 (s2 (string-trim bag s)))
+            (deftest 56448 s2 "cd"))
+        (t (c) (%record-test-fail-or-emit 56448)))
+      ;; 56449 — string-trim with MDA + fp=2 — visible bag="ab", trims to "cd"
+      (handler-case
+          (let* ((bag (make-array 4 :element-type 'character :fill-pointer 2
+                                    :initial-contents '(#\a #\b #\c #\d)))
+                 (s "abcdaba")
+                 (s2 (string-trim bag s)))
+            (deftest 56449 s2 "cd"))
+        (t (c) (%record-test-fail-or-emit 56449)))
+      ;; 56451 — rank-1 MDA prints as #(...) vector form
+      (handler-case
+          (let ((a (make-array '(4) :initial-contents '(3 0 2 1))))
+            (deftest 56451 (write-to-string a :readably nil :array t) "#(3 0 2 1)"))
+        (t (c) (%record-test-fail-or-emit 56451)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

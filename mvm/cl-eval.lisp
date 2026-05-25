@@ -192,49 +192,57 @@
   (and *%compiler-macro-hashes*
        (gethash name *%compiler-macro-hashes*)))
 
+(defun %macro-sym-key (sym)
+  "Extract a hash-table key for SYM in the macro-function table.
+   For CL syms returns the name string (\"DEFTEST\" etc.).
+   For STRINGS returns the string verbatim.
+   For native MVM syms (#x50/#x53, hash-only) returns the symbol itself
+   so two native syms with the same hash share a table entry — these
+   syms have empty symbol-name (no reverse hash → name table) so a
+   name-string key would always be \"\" and collide across symbols."
+  (cond
+    ((null sym) nil)
+    ((%cl-sym-p sym) (%cl-sym-name sym))
+    ((stringp sym) sym)
+    ((and (not (consp sym)) (not (fixnump sym))
+          (not (characterp sym))
+          (let ((st (obj-subtag sym)))
+            (or (= st #x50) (= st #x53))))
+     ;; Try symbol-name first (in case a reverse table populated it).
+     ;; Fall back to the symbol object itself (compares by eql in the
+     ;; hash table — same hash → same key).
+     (let ((n (symbol-name sym)))
+       (if (and n (> (length n) 0)) n sym)))
+    (t nil)))
+
 (defun macro-function (sym &rest env)
   "Return the macro expander function for SYM, or nil.
    Falls back to a built-in compiler-macro check so MACRO-FUNCTION
    reports a non-NIL value for PUSH/POP/COND/etc. that the modus
    compiler implements directly (rather than via runtime expander).
-   For native MVM symbols (#x50, hash-only), also consult symbol-name
-   so PUSH/POP etc. are recognised regardless of which symbol-cons type."
-  (let ((name (cond
-                ((null sym) nil)
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                ((and (not (consp sym)) (not (fixnump sym))
-                      (not (characterp sym))
-                      (let ((st (obj-subtag sym)))
-                        (or (= st #x50) (= st #x53))))
-                 (symbol-name sym))
-                (t nil))))
+   For native MVM symbols (#x50, hash-only), keyed by the SYMBOL object
+   itself (since symbol-name returns \"\" for hash-only syms).  For
+   string-named lookups, also try the compiler-macro fallback."
+  (let ((key (%macro-sym-key sym)))
     (cond
-      ((null name) nil)
-      ((= (length name) 0) nil)
-      ((and *macro-function-table* (gethash name *macro-function-table*)))
-      ((%compiler-macro-p name) t)
+      ((null key) nil)
+      ((and *macro-function-table* (gethash key *macro-function-table*)))
+      ;; Compiler-macro fallback only fires on name-string lookups —
+      ;; %compiler-macro-p needs the string form (PUSH/POP/...).
+      ((and (stringp key) (%compiler-macro-p key)) t)
       (t nil))))
 
 (defun set-macro-function (sym fn &rest env)
   "Install FN as the macro expander for SYM.  Accepts CL symbols, native
-   MVM #x50 symbols (hash-only — recover name via symbol-name), strings,
-   and keywords.  Earlier version only handled CL syms; runtime DEFMACRO
-   on a reader-produced native sym silently dropped the binding."
-  (let ((name (cond
-                ((null sym) nil)
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                ((and (not (consp sym)) (not (fixnump sym))
-                      (not (characterp sym))
-                      (let ((st (obj-subtag sym)))
-                        (or (= st #x50) (= st #x53))))
-                 (symbol-name sym))
-                (t nil))))
-    (when name
+   MVM #x50 symbols (keyed by symbol object itself when symbol-name is
+   empty — Modus's native syms only carry a hash, no reverse name
+   table), strings, and keywords.  Routes through %macro-sym-key for
+   consistent key extraction between set and get."
+  (let ((key (%macro-sym-key sym)))
+    (when key
       (unless *macro-function-table*
         (setq *macro-function-table* (make-hash-table)))
-      (puthash name *macro-function-table* fn)
+      (puthash key *macro-function-table* fn)
       fn)))
 
 ;;; ============================================================

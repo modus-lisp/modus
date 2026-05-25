@@ -3277,20 +3277,16 @@
                                     'foo 'bar :keyword
                                     1.0 -1.0 0.5))))
             ;; signals-error — returns T if FORM signals any error.
-            ;; The 'signals-error symbol at runtime may have a different
-            ;; native-sym identity than what set-macro-function looks up,
-            ;; so we set-macro-function with the STRING name "SIGNALS-ERROR"
-            ;; to ensure the macro-function table key matches whatever
-            ;; macroexpand-1 derives from the form's head symbol.
-            (set-macro-function "SIGNALS-ERROR"
-              (list '%interp-closure '(form &rest ignore)
-                    (list (list 'list (list 'quote 'handler-case)
-                                (list 'list (list 'quote 'progn) 'form nil)
-                                (list 'quote '(error (c) t))))
-                    nil))
+            ;; Symbol-keyed registration now works (commit fixed the
+            ;; native-MVM-sym symbol-name="" bug).  Eval-via-defmacro
+            ;; goes through set-macro-function → %macro-sym-key which
+            ;; falls back to symbol-object key for hash-only syms.
+            (eval (list 'defmacro 'signals-error '(form &rest ignore)
+                        (list 'list (list 'quote 'handler-case)
+                                    (list 'list (list 'quote 'progn) 'form nil)
+                                    (list 'quote '(error (c) t)))))
             ;; expand-in-current-env — identity macro
-            (set-macro-function "EXPAND-IN-CURRENT-ENV"
-              (list '%interp-closure '(form) '(form) nil))
+            (eval (list 'defmacro 'expand-in-current-env '(form) 'form))
             (deftest 56490 t t))
         (t (c) (%record-test-fail-or-emit 56490)))
       ;; 56491 — does (eval ...) of a macro-bearing deftest form work?
@@ -3356,10 +3352,13 @@
       (handler-case
           (deftest 56510 (and (listp *universe*) (> (length *universe*) 5)) t)
         (t (c) (%record-test-fail-or-emit 56510)))
-      ;; 56511 — signals-error now via direct set-macro-function
+      ;; 56511 — verify set + get round-trip with native MVM sym
       (handler-case
-          (let ((r (eval '(signals-error (error "test")))))
-            (deftest 56511 r t))
+          (progn
+            (set-macro-function 'my-roundtrip-test
+                                (list '%interp-closure '(x) '(x) nil))
+            (let ((found (macro-function 'my-roundtrip-test)))
+              (deftest 56511 (not (null found)) t)))
         (t (c) (%record-test-fail-or-emit 56511)))
       ;; 56512 — atom.1 form runs directly
       (handler-case

@@ -1593,6 +1593,28 @@
         `(let ((,tmp (multiple-value-list ,(cadr form))))
            (%notnot-mv-fn ,tmp)))))
 
+  ;; DEFTEST — (deftest NAME FORM &rest EXPECTED-VALUES) macroexpands to a
+  ;; registration call that (a) wraps FORM in a thunk so it isn't eagerly
+  ;; evaluated by the call protocol and (b) quotes the EXPECTED values
+  ;; so literal lists like `((a . b))` don't try to call (a . b) as a
+  ;; function.  Mirrors the gcl-ansi-tests rt.lsp deftest macro shape
+  ;; required for the suite's '(do-tests)'.
+  ;;
+  ;; Note: there's a conflicting (defun deftest ...) in mvm/rt.lisp that
+  ;; eagerly evals ACTUAL+EXPECTED.  The compile-time macro WINS for
+  ;; source-level (deftest ...) forms because the macro expands before
+  ;; the defun's calling-convention dispatch.  The defun is now dead
+  ;; code for these forms; left in place because rt-run-test still
+  ;; calls helpers in the same file.
+  ;; (DEFTEST attempted as global macro broke wider tests — reverted.
+  ;; Existing probes use (deftest NN form expected) calling the rt.lisp
+  ;; defun directly with eagerly-evaluated expected.  If we macroexpand
+  ;; uniformly, the runtime defun path is broken for define-condition
+  ;; tests + bare-metal probes that rely on the side-effecting eval.
+  ;; G2 needs a different mechanism: a RUNTIME (load)-time defmacro
+  ;; that only fires when a test file is loaded, not for compile-time
+  ;; probe processing.  TODO.)
+
   ;; DO-SYMBOLS — (do-symbols (var [pkg [result]]) body...)
   ;; Collect all accessible symbols of PKG via %do-symbols-fn into a fresh
   ;; list, then iterate.  Body is in an implicit BLOCK NIL so RETURN works.

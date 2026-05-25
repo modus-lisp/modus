@@ -3142,7 +3142,43 @@
       (handler-case
           (multiple-value-bind (sub valid) (subtypep '(cons nil t) 'float)
             (deftest 56476 (list sub valid) '(t t)))
-        (t (c) (%record-test-fail-or-emit 56476)))))
+        (t (c) (%record-test-fail-or-emit 56476)))
+      ;; Probes 56480-56489 — running an UNMODIFIED ANSI suite file
+      ;; (cons/acons.lsp).  Goal: Modus reads + evals the file directly,
+      ;; via its own defmacro/load infrastructure, and reports pass/fail.
+      ;; 56480 — Modus can READ acons.lsp without error
+      (handler-case
+          (let ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input)))
+            (let ((forms nil))
+              (loop (let ((f (read s nil :eof)))
+                      (when (eq f :eof) (return nil))
+                      (push f forms)))
+              (close s)
+              (deftest 56480 (> (length forms) 5) t)))
+        (t (c) (%record-test-fail-or-emit 56480)))
+      ;; 56481 — Modus can OPEN the file (smaller probe to isolate failure)
+      (handler-case
+          (let ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input)))
+            (close s)
+            (deftest 56481 t t))
+        (t (c) (%record-test-fail-or-emit 56481)))
+      ;; 56482 — Modus can READ ONE form
+      (handler-case
+          (let* ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input))
+                 (f (read s nil :eof)))
+            (close s)
+            (deftest 56482 (not (eq f :eof)) t))
+        (t (c) (%record-test-fail-or-emit 56482)))
+      ;; 56483 — count forms read without error (catches partial readers)
+      (handler-case
+          (let* ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input))
+                 (n 0))
+            (loop (let ((f (handler-case (read s nil :eof) (t (c) :read-err))))
+                    (when (or (eq f :eof) (eq f :read-err)) (return nil))
+                    (setq n (+ n 1))))
+            (close s)
+            (deftest 56483 (>= n 14) t))
+        (t (c) (%record-test-fail-or-emit 56483)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

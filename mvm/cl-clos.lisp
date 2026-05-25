@@ -1829,9 +1829,11 @@
 (defun %array-raw-length (arr)
   "Like array-length but ignores fill-pointer — returns the underlying
    storage capacity.  Used by array-in-bounds-p which per CLHS checks
-   against the array's full dimension, not the fp-truncated length."
+   against the array's full dimension, not the fp-truncated length.
+   For MDA, walks the dim list (NOT data slot — displaced MDAs share
+   data with a larger underlying)."
   (cond
-    ((%mda-p arr) (%prim-array-length (%mda-data arr)))
+    ((%mda-p arr) (%array-raw-length-mda arr))
     ((consp arr) (%wrapper-array-length arr))
     (t (%prim-array-length arr))))
 
@@ -1858,16 +1860,30 @@
 
 (defun %mda-array-length (x)
   "MDA-aware replacement for raw %prim-array-length called from
-   compile-array-length on non-cons inputs.  For an MDA returns the
-   fp if set, else the underlying data vector's length.  Without this
-   `(array-length mda) → 7` (the slot count of the MDA header object),
-   which breaks every sequence loop that uses (dotimes i (array-length s)).
-   Non-MDA arrays return %prim-array-length verbatim."
+   compile-array-length on non-cons inputs.  For an MDA: fp first,
+   else the MDA's own dim product (NOT the data slot's length —
+   displaced MDAs share data with a larger underlying, so data
+   length would over-iterate).  Non-MDA arrays return
+   %prim-array-length verbatim."
   (cond
     ((%mda-p x)
      (let ((fp (%mda-fp x)))
-       (if fp fp (%prim-array-length (%mda-data x)))))
+       (cond
+         (fp fp)
+         (t (let ((dims (%mda-dims x)) (total 1))
+              (loop (when (null dims) (return total))
+                (setq total (* total (car dims)))
+                (setq dims (cdr dims))))))))
     (t (%prim-array-length x))))
+
+(defun %array-raw-length-mda (x)
+  "Like %array-raw-length but resolves MDA dims (NOT fp, NOT data)
+   — used inside %array-raw-length so that array-in-bounds-p sees
+   the array's declared dim, not the underlying displaced storage."
+  (let ((dims (%mda-dims x)) (total 1))
+    (loop (when (null dims) (return total))
+      (setq total (* total (car dims)))
+      (setq dims (cdr dims)))))
 
 (defun %alloc-mda (rank dims fp displaced offset etype data)
   "Allocate a native multi-dim array header object and fill all 7
@@ -2003,8 +2019,12 @@
 (defun array-total-size (a)
   (cond
     ((%mda-p a)
-     (let ((d (%mda-data a)))
-       (if d (array-length d) 0)))
+     ;; Walk dims (NOT data length — for displaced MDAs data slot
+     ;; holds the displaced-to target which may be larger).
+     (let ((dims (%mda-dims a)) (total 1))
+       (loop (when (null dims) (return total))
+         (setq total (* total (car dims)))
+         (setq dims (cdr dims)))))
     (t
      (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
        (cond

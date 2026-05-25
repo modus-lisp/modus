@@ -3064,7 +3064,46 @@
       (handler-case
           (let ((a (make-array '(4) :initial-contents '(3 0 2 1))))
             (deftest 56451 (write-to-string a :readably nil :array t) "#(3 0 2 1)"))
-        (t (c) (%record-test-fail-or-emit 56451)))))
+        (t (c) (%record-test-fail-or-emit 56451)))
+      ;; 56460 — position on a displaced MDA of a string finds the char.
+      ;; The displaced-MDA path: data slot is set to displaced-to so
+      ;; stringp recognizes it; position then code-char-wraps fixnums.
+      (handler-case
+          (let* ((s (copy-seq "xxxabcdyyy"))
+                 (m (make-array '(4) :displaced-to s
+                                    :displaced-index-offset 3)))
+            (deftest 56460 (position #\c m) 2))
+        (t (c) (%record-test-fail-or-emit 56460)))
+      ;; 56461 — make-array adjustable+fp+bit + initial-contents equal #(...)
+      (handler-case
+          (let ((a (make-array-with-checks '(4) :adjustable t
+                                                :element-type 'bit
+                                                :fill-pointer t
+                                                :initial-contents '(1 0 0 1))))
+            (deftest 56461 a #(1 0 0 1)))
+        (t (c) (%record-test-fail-or-emit 56461)))
+      ;; 56462 — element-wise to figure out
+      (handler-case
+          (let ((a (make-array-with-checks '(4) :adjustable t
+                                                :element-type 'bit
+                                                :fill-pointer t
+                                                :initial-contents '(1 0 0 1))))
+            (deftest 56462 (list (length a) (aref a 0) (aref a 1) (aref a 2) (aref a 3))
+              '(4 1 0 0 1)))
+        (t (c) (%record-test-fail-or-emit 56462)))
+      ;; 56463 — directly call make-array
+      (handler-case
+          (let ((a (make-array '(4) :adjustable t :element-type 'bit
+                                    :fill-pointer t :initial-contents '(1 0 0 1))))
+            (deftest 56463 (list (length a) (aref a 0) (aref a 1) (aref a 2) (aref a 3))
+              '(4 1 0 0 1)))
+        (t (c) (%record-test-fail-or-emit 56463)))
+      ;; 56464 — what does mda-p say?
+      (handler-case
+          (let ((a (make-array '(4) :adjustable t :element-type 'bit
+                                    :fill-pointer t :initial-contents '(1 0 0 1))))
+            (deftest 56464 (%mda-p a) t))
+        (t (c) (%record-test-fail-or-emit 56464)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

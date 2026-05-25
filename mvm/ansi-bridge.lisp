@@ -3155,6 +3155,11 @@
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) char-elt)
            data)
+          ;; Displaced MDA: set DATA slot to the displaced target so that
+          ;; type predicates (stringp / typep) and length helpers see
+          ;; through to the underlying.  aref/aset still consult the
+          ;; displaced+offset slots via the MDA fast path.
+          (disp (%alloc-mda rank dim-list fp disp off etype disp))
           (t (%alloc-mda rank dim-list fp disp off etype data)))))))
 
 (defun %mda-fill-contents-flat (data contents dims)

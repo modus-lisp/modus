@@ -72,17 +72,15 @@
 
 (defun rt-mda-visible-data (m)
   "Return the user-visible data vector of an MDA: the underlying data
-   sliced to its fill-pointer if it has one, else the raw data vector.
-   Used by rt-equal when peeling an MDA so length-based comparisons
-   match the CL-level (length m)."
-  (let ((data (%mda-data m))
-        (fp (%mda-fp m)))
-    (if (or (null fp) (= fp (array-length data)))
-        data
-        (let ((out (make-array fp)) (i 0))
-          (loop (when (>= i fp) (return out))
-            (aset out i (aref data i))
-            (setq i (+ i 1)))))))
+   sliced to (length m) — fp if set, else dim product.  For displaced
+   MDAs the data slot holds the displaced-to target which may be
+   larger; we always materialize a fresh vector of the visible length
+   walked through aref (which routes displacement)."
+  (let* ((m-len (length m))
+         (out (make-array m-len)) (i 0))
+    (loop (when (>= i m-len) (return out))
+      (aset out i (aref m i))
+      (setq i (+ i 1)))))
 
 (defun rt-arrayp (x)
   "Check if x is a plain array (object with subtag #x32) or a native

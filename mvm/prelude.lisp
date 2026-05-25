@@ -591,10 +591,17 @@
           (t (list-length seq))))                          ; defensive
        ;; ordinary list
        (t (list-length seq))))
-    ;; Native MDA (subtag #x34) — fp first, else length of data vector.
+    ;; Native MDA (subtag #x34) — fp first, else walk dims.  Cannot use
+    ;; (array-length (%mda-data seq)) — for displaced MDAs, data slot
+    ;; holds the displaced-to target which may be larger.
     ((%mda-p seq)
      (let ((fp (%mda-fp seq)))
-       (if fp fp (array-length (%mda-data seq)))))
+       (cond
+         (fp fp)
+         (t (let ((dims (%mda-dims seq)) (total 1))
+              (loop (when (null dims) (return total))
+                (setq total (* total (car dims)))
+                (setq dims (cdr dims))))))))
     (t (array-length seq))))
 
 ;;; ============================================================

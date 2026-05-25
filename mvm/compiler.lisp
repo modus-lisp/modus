@@ -4083,11 +4083,12 @@
              (result (mvm-compile-function-internal unique-name (car pp) (cadr pp) body-env eff-rest-slot (caddr pp) (cadddr pp)))
              (info (car result)))
         (declare (ignore local-key))
-        ;; Only adjust function-info when a synthesized &key-rest was
-        ;; created — otherwise leave the plain-flet defaults untouched
-        ;; (setting required-count / rest-param-p universally regressed
-        ;; plain flet/labels calls).
-        (when synth-rest
+        ;; Mark the function-info so the caller knows to pack &rest.
+        ;; Both synthesized &rest (from &key transform) AND explicit &rest
+        ;; need this — without it, a caller of (flet ((%F (&rest a) a)) ...)
+        ;; passes positional args and the prologue sees NIL.  Old code
+        ;; only set this for synth-rest, leaving explicit &rest broken.
+        (when (or synth-rest rest-pos)
           (setf (function-info-required-count info) req-end)
           (setf (function-info-rest-param-p info) t))
         ;; Register with unique name
@@ -8521,20 +8522,20 @@
         ;; no "load slot[i] for variable i".
         (emit-ir-label case-req-label)
         ;; First trigger the runtime overflow-arg copy.  Trap 0x0530
-        ;; reads nargs from [0x10000150] and copies args 4..min(nargs,16)-1
+        ;; reads nargs from [0x10000150] and copies args 4..min(nargs,24)-1
         ;; from caller's stack ([RBP+16+(i-4)*8]) into the local frame
-        ;; slots 4..15 ([RBP+frame-slot-base+i*-8]) so the cond ladder
+        ;; slots 4..23 ([RBP+frame-slot-base+i*-8]) so the cond ladder
         ;; below can stack-load them via the same idx as args 0..3.
         ;; Without this, args > +max-reg-args+ stay on caller's stack
         ;; and the ladder's stack-load reads garbage from unmapped /
         ;; uninitialised local frame slots.
         (emit-ir :trap #x0530)
-        ;; Extended ladder: nargs = req+1 .. req+12.  Caps at +12 so
-        ;; the trap above (which itself caps at 16 total args) covers
-        ;; the worst case (req=4 + 12 rest = 16).  For req > 4 we
-        ;; clamp by what the trap could have copied (16 - req); for
-        ;; req <= 4 the full 12 cases apply.
-        (let ((max-k (min 12 (- 16 req)))
+        ;; Extended ladder: nargs = req+1 .. req+20.  Caps at +20 so
+        ;; the trap above (which itself caps at 24 total args) covers
+        ;; the worst case (req=4 + 20 rest = 24).  For req > 4 we
+        ;; clamp by what the trap could have copied (24 - req); for
+        ;; req <= 4 the full 20 cases apply.
+        (let ((max-k (min 20 (- 24 req)))
               (cases nil))
           (loop for k from max-k downto 1
                 do (push k cases))

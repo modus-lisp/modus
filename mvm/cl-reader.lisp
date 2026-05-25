@@ -303,12 +303,24 @@
 
 
 (defun %read-skip-whitespace (stream)
-  "Skip whitespace chars, return first non-whitespace or nil on EOF."
+  "Skip whitespace chars AND line comments (semicolon to newline).
+   Returns first non-whitespace non-comment char or nil on EOF.
+   Without comment-skip, %read-internal hands `;' to the macro dispatch
+   which has no :semicolon clause — the test files (every ANSI .lsp
+   starts with a `;-*- Mode: Lisp -*-' magic line + author comments)
+   would have their first form misread."
   (let ((ch nil))
     (loop
       (setq ch (read-char stream nil nil nil))
       (when (null ch) (return nil))
-      (unless (%whitespace-char-p ch) (return ch)))))
+      (cond
+        ((%whitespace-char-p ch) nil)   ; skip whitespace
+        ((eql ch (code-char 59))         ; #\;
+         ;; skip to end-of-line (or EOF)
+         (loop (let ((c (read-char stream nil nil nil)))
+                 (when (or (null c) (eql c (code-char 10)) (eql c (code-char 13)))
+                   (return nil)))))
+        (t (return ch))))))
 
 (defun %read-as-token (ch stream rt)
   "Read ch as start of a token."

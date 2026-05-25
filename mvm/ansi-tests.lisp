@@ -3198,7 +3198,56 @@
               (write-object f)
               (write-char-serial 10)
               (deftest 56485 (and (consp f) (eq (car f) 'a)) t)))
-        (t (c) (%record-test-fail-or-emit 56485)))))
+        (t (c) (%record-test-fail-or-emit 56485)))
+      ;; 56486 — read from a PRE-EXISTING file (no Modus write).  Uses
+      ;; the same path we know acons.lsp can read one form from.
+      (handler-case
+          (let* ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input))
+                 (f1 (read s nil :eof)))
+            (close s)
+            (write-char-serial 10)
+            (write-string-serial "ACONS-F1-TYPE:")
+            (cond
+              ((eq f1 :eof) (write-string-serial "EOF"))
+              ((consp f1) (write-string-serial "CONS"))
+              ((symbolp f1) (write-string-serial "SYM"))
+              ((stringp f1) (write-string-serial "STR"))
+              ((integerp f1) (write-string-serial "INT"))
+              (t (write-string-serial "OTHER")))
+            (write-char-serial 10)
+            (deftest 56486 (consp f1) t))
+        (t (c) (%record-test-fail-or-emit 56486)))
+      ;; 56487 — does read of a pre-existing file get past 1 form?
+      (handler-case
+          (let* ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input))
+                 (f1 (read s nil :eof))
+                 (f2 (read s nil :eof)))
+            (close s)
+            (write-char-serial 10)
+            (write-string-serial "F2-TYPE:")
+            (cond
+              ((eq f2 :eof) (write-string-serial "EOF"))
+              ((consp f2) (write-string-serial "CONS"))
+              ((symbolp f2) (write-string-serial "SYM"))
+              (t (write-string-serial "OTHER")))
+            (write-char-serial 10)
+            (deftest 56487 (consp f2) t))
+        (t (c) (%record-test-fail-or-emit 56487)))
+      ;; 56488 — read-char from a file stream returns?  Print first 5 chars.
+      (handler-case
+          (let* ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input)))
+            (write-char-serial 10)
+            (write-string-serial "ACONS-CHARS:")
+            (let ((i 0))
+              (loop (when (>= i 30) (return))
+                (let ((c (read-char s nil :eof)))
+                  (when (eq c :eof) (return))
+                  (write-char-serial (if (characterp c) (char-code c) 63))
+                  (setq i (+ i 1)))))
+            (close s)
+            (write-char-serial 10)
+            (deftest 56488 t t))
+        (t (c) (%record-test-fail-or-emit 56488)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

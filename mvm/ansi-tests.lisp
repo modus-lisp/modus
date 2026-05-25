@@ -3295,21 +3295,24 @@
       ;; 56494 — read+eval all forms from acons.lsp via the runtime
       ;; deftest macro.  Count how many tests passed.
       (handler-case
-          (let ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input))
-                (pre-pass *rt-pass-count*)
-                (pre-fail *rt-fail-count*))
-            (loop (let ((f (read s nil :eof)))
-                    (when (eq f :eof) (return nil))
-                    (handler-case (eval f) (t (c) nil))))
-            (close s)
-            (write-char-serial 10)
-            (write-string-serial "ACONS-PASSED:")
-            (print-dec (- *rt-pass-count* pre-pass))
-            (write-string-serial " FAILED:")
-            (print-dec (- *rt-fail-count* pre-fail))
-            (write-char-serial 10)
-            (deftest 56494 t t))
-        (t (c) (%record-test-fail-or-emit 56494)))))
+          (%load-suite-file "/tmp/ansi-test/tests/cons/acons.lsp" "ACONS")
+        (t (c) (%record-test-fail-or-emit 56494)))
+      ;; 56495 — try other simple suite files
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/cons.lsp" "CONS")
+        (t (c) (%record-test-fail-or-emit 56495)))
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/car.lsp" "CAR")
+        (t (c) (%record-test-fail-or-emit 56496)))
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/cdr.lsp" "CDR")
+        (t (c) (%record-test-fail-or-emit 56497)))
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/atom.lsp" "ATOM")
+        (t (c) (%record-test-fail-or-emit 56498)))
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/null.lsp" "NULL")
+        (t (c) (%record-test-fail-or-emit 56499)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))
@@ -3475,6 +3478,25 @@
                 (let ((parent (call-next-method s (* n 2))))
                   (cons :child (cons n parent)))))
   (%register-gf-fn (function smoke-cnm-args) 'smoke-cnm-args))
+
+(defun %load-suite-file (path label)
+  "Load + eval all forms from a single ANSI suite file via the runtime
+   `deftest` defmacro.  Reports `LABEL-PASSED:N FAILED:M' on serial."
+  (let ((s (open path :direction :input))
+        (pre-pass *rt-pass-count*)
+        (pre-fail *rt-fail-count*))
+    (loop (let ((f (handler-case (read s nil :eof) (t (c) :eof))))
+            (when (eq f :eof) (return nil))
+            (handler-case (eval f) (t (c) nil))))
+    (close s)
+    (write-char-serial 10)
+    (write-string-serial label)
+    (write-string-serial "-PASSED:")
+    (print-dec (- *rt-pass-count* pre-pass))
+    (write-string-serial " FAILED:")
+    (print-dec (- *rt-fail-count* pre-fail))
+    (write-char-serial 10)
+    t))
 
 (defun %record-test-fail-or-emit (id)
   "Print FAIL <id> directly without going through %record-test-fail

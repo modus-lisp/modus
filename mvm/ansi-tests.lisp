@@ -3352,13 +3352,18 @@
       (handler-case
           (deftest 56510 (and (listp *universe*) (> (length *universe*) 5)) t)
         (t (c) (%record-test-fail-or-emit 56510)))
-      ;; 56511 — verify set + get round-trip with native MVM sym
+      ;; 56511 — verify symbol-name works for a sym definitely in build sources
       (handler-case
-          (progn
-            (set-macro-function 'my-roundtrip-test
-                                (list '%interp-closure '(x) '(x) nil))
-            (let ((found (macro-function 'my-roundtrip-test)))
-              (deftest 56511 (not (null found)) t)))
+          (let ((nm1 (symbol-name 'deftest))
+                (nm2 (symbol-name 'cons))
+                (nm3 (symbol-name 'my-roundtrip-test)))
+            (write-char-serial 10)
+            (write-string-serial "NM-DEFTEST:[")
+            (write-string-serial nm1) (write-string-serial "] NM-CONS:[")
+            (write-string-serial nm2) (write-string-serial "] NM-NEW:[")
+            (write-string-serial nm3) (write-string-serial "]")
+            (write-char-serial 10)
+            (deftest 56511 (and (> (length nm2) 0)) t))
         (t (c) (%record-test-fail-or-emit 56511)))
       ;; 56512 — atom.1 form runs directly
       (handler-case

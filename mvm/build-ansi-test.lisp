@@ -161,6 +161,88 @@
               count chunks)
       src)))
 
+;;; -----------------------------------------------------------------
+;;; Symbol-name reverse table (hash → name).
+;;;
+;;; Native MVM symbols (subtag #x50, 1-slot hash-only) have NO name
+;;; slot.  symbol-name walks all package symtabs looking for a matching
+;;; hash; if not found returns "".  This breaks tests that compute
+;;; symbol-name of arbitrary symbols, and breaks symbol-keyed macro
+;;; registration.
+;;;
+;;; Fix: at build time scan every source file for every SYMBOL that
+;;; appears anywhere (defun names, quoted refs, function calls, ...)
+;;; and emit %init-sym-name-auto that puts (compute-name-hash NAME, NAME)
+;;; into *sym-name-table* at boot.  symbol-name then consults that
+;;; table for native syms.
+
+(defun %scan-symbol-names-host (source-str)
+  "Walk SOURCE-STR via SBCL reader, recursively collecting every SYMBOL
+   that appears in any form.  Returns a hash-table of upcased name
+   strings → T."
+  (let ((names (make-hash-table :test 'equal))
+        (eof (list :eof)))
+    (labels ((walk (f)
+               (cond
+                 ((symbolp f)
+                  (let ((n (symbol-name f)))
+                    (when (and n (> (length n) 0))
+                      (setf (gethash n names) t))))
+                 ((consp f)
+                  (walk (car f))
+                  (walk (cdr f)))
+                 (t nil))))
+      (with-input-from-string (s source-str)
+        (loop
+          (let ((form (handler-case (read s nil eof) (error () (return)))))
+            (when (eq form eof) (return))
+            (handler-case (walk form) (error () nil))))))
+    names))
+
+(defun %generate-sym-name-auto-source (name-hash-table &key (chunk 200))
+  "Emit Lisp source for chunked %init-sym-name-auto-N defuns + master
+   %init-sym-name-auto.  NAME-HASH-TABLE is hash of name strings → T."
+  (let* ((uniq nil)
+         (n-chunks 0))
+    (maphash (lambda (k v) (declare (ignore v)) (push k uniq)) name-hash-table)
+    (let ((out (with-output-to-string (o)
+                 (let ((cur uniq))
+                   (loop
+                     (when (null cur) (return))
+                     (incf n-chunks)
+                     (format o "(defun %init-sym-name-auto-~D ()~%" n-chunks)
+                     (format o "  (let ((ht *sym-name-table*))~%")
+                     (let ((k 0))
+                       (loop
+                         (when (or (null cur) (>= k chunk)) (return))
+                         (let* ((name (car cur))
+                                (h (modus.mvm::compute-name-hash name)))
+                           (format o "    (puthash ~D ht ~S)~%" h name))
+                         (setq cur (cdr cur))
+                         (incf k)))
+                     (format o "    nil))~%")))
+                 (format o "(defun %init-sym-name-auto ()~%")
+                 (let ((c 0))
+                   (loop
+                     (incf c)
+                     (when (> c n-chunks) (return))
+                     (format o "  (%init-sym-name-auto-~D)~%" c)))
+                 (format o "  nil)~%"))))
+      (values out (hash-table-count name-hash-table) n-chunks))))
+
+(defvar *sym-name-auto-source*
+  (let ((tbl (make-hash-table :test 'equal)))
+    (dolist (src (list *prelude-source* *gc-source* *rt-source*
+                       *bridge-source* *test-source*))
+      (let ((found (%scan-symbol-names-host src)))
+        (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
+                 found)))
+    (multiple-value-bind (src count chunks)
+        (%generate-sym-name-auto-source tbl)
+      (format t "  sym-name auto-init: ~D unique symbol names across ~D chunk(s)~%"
+              count chunks)
+      src)))
+
 ;; SBCL-level stubs for functions called during macro expansion
 (defun notnot (x) (not (not x)))
 (defun notnot-mv (x) (not (not x)))
@@ -3213,6 +3295,13 @@
   ;; concatenated source of prelude+gc+rt+bridge.  See probes 56303/56304.
   (%init-sft-auto)
 
+  ;; Populate *sym-name-table* so symbol-name can recover names for
+  ;; native MVM syms (#x50, hash-only).  Build-time scanner walks every
+  ;; form in the source tree, collects every SYMBOL that appears, and
+  ;; emits puthash (compute-name-hash NAME, NAME) at boot.
+  (setq *sym-name-table* (make-hash-table))
+  (%init-sym-name-auto)
+
   ;; Build the compiler-macro name set so MACRO-FUNCTION reports T for
   ;; PUSH/POP/COND/etc. that the modus compiler implements directly.
   (init-compiler-macro-set)
@@ -3456,6 +3545,11 @@
     ;;      runtime sources above so runtime EVAL can call any function
     ;;      by name (closing Gap A — see probes 56303/56304).
     *sft-auto-source*
+    (string #\Newline)
+    ;; 4.6. Auto-generated %init-sym-name-auto: puthash hash → name for
+    ;;      every symbol that appears in the source tree, so symbol-name
+    ;;      can recover the name of any native MVM sym (#x50, hash-only).
+    *sym-name-auto-source*
     (string #\Newline)
     ;; 5. Our test source (run-*-tests, run-all-tests)
     ;;    Functions defined here override aux (last-defun-wins).

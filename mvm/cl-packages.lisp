@@ -422,13 +422,19 @@
       (setq cur (cdr cur)))
     found))
 
+;; *sym-name-table* — hash → name string, populated at boot by
+;; %init-sym-name-auto.  Lets symbol-name recover names for native MVM
+;; syms (#x50, hash-only) that aren't in any package symbol table.
+(defvar *sym-name-table* nil)
+
 (defun symbol-name (sym)
   "Return the name of a symbol as a string. For Modus's integer-valued
    gensyms (sym is an integer), produce a unique 'G<N>' name so tests
    like (string= (symbol-name (gensym)) (symbol-name (gensym))) → NIL.
    For native-MVM symbols (subtag #x50, 1 slot — hash only), look the
-   hash up in *all-packages*' symbol tables to recover a name; many
-   tests print or string-compare these and fail silently otherwise."
+   hash up in *sym-name-table* (populated at boot from build-time scan
+   of every quoted symbol in the source tree), then fall back to
+   walking *all-packages*' symbol tables, then \"\"."
   (cond
     ((null sym) "NIL")
     ((eq sym t) "T")
@@ -437,15 +443,19 @@
      (let ((digs (write-to-string sym)))
        (concatenate 'string "G" digs)))
     ;; Native MVM symbol (#x50) or keyword (#x53): both single-slot, hash only.
-    ;; Recover name by walking package symtabs for matching hash.  Keywords
-    ;; that compile-keyword interned at runtime won't be in any package
-    ;; symtab — fall back to "" so symbol-name doesn't crash (callers that
-    ;; care about real keyword names use the reader's intern path which
-    ;; populates the KEYWORD package's symtab).
     ((and (not (consp sym)) (not (characterp sym)) (not (stringp sym))
           (let ((st (obj-subtag sym))) (or (= st 80) (= st 83))))
-     (let ((nm (%native-mvm-sym-name-lookup (aref sym 0))))
-       (if nm nm "")))
+     (let ((h (aref sym 0)))
+       ;; First try the build-time reverse table — covers symbols that
+       ;; appear ANYWHERE in the source tree (defuns, quoted refs, etc.).
+       (let ((nm (and *sym-name-table* (gethash h *sym-name-table*))))
+         (cond
+           (nm nm)
+           (t
+            ;; Fall back to walking package symtabs (for runtime-interned
+            ;; symbols whose name was registered via package machinery).
+            (let ((pn (%native-mvm-sym-name-lookup h)))
+              (if pn pn "")))))))
     (t "")))
 
 (defun symbol-package (sym)

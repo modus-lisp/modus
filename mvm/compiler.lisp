@@ -1606,16 +1606,11 @@
   ;; the defun's calling-convention dispatch.  The defun is now dead
   ;; code for these forms; left in place because rt-run-test still
   ;; calls helpers in the same file.
-  ;; DEFTEST as a global macro broke ~1700 tests when tried (commit
-  ;; 6cf5ade) AND a heuristic-quoting version still produced odd dispatch
-  ;; (T:99999 appearances).  Conclusion: source-level deftest semantics
-  ;; in Modus's probes (eager-eval defun) and in ANSI suite (literal-
-  ;; quoted) are too different to unify via a single macro.
-  ;;
-  ;; Path forward: leave the existing (defun deftest …) in rt.lisp
-  ;; intact for Modus probes.  When loading the unmodified suite, bind
-  ;; a defmacro-style deftest TEMPORARILY around the (load …) call so
-  ;; only suite forms get the macro expansion.  TODO for G2.
+  ;; DEFTEST as a global mvm-define-macro REPEATEDLY broke the suite
+  ;; (commits 6cf5ade -1749, a6ac2d9 / two-shard-test -2860).  The
+  ;; existing rt.lisp defun + per-probe handler-case wrapping +
+  ;; build-emitted bridges have too many invariants we can't satisfy
+  ;; with a single macro expansion.  G2 deferred — see project doc.
 
   ;; DO-SYMBOLS — (do-symbols (var [pkg [result]]) body...)
   ;; Collect all accessible symbols of PKG via %do-symbols-fn into a fresh

@@ -3317,8 +3317,12 @@
           (let ((r (eval (list 'cons (list 'quote 'a) (list 'quote 'b)))))
             (deftest 56493 r '(a . b)))
         (t (c) (%record-test-fail-or-emit 56493)))
-      ;; 56494 — read+eval all forms from acons.lsp via the runtime
-      ;; deftest macro.  Count how many tests passed.
+      ;; 56494+ — read+eval unmodified ANSI suite files via runtime
+      ;; deftest macro.  Gated on *skip-below* = 0 so these only run on
+      ;; shard 0 — each suite file load+eval is expensive (~3s/file),
+      ;; and the 32-shard wallclock cap (600s) blows out otherwise.
+      ;; Shard 0 reports the suite-load passes; other shards skip them.
+      (when (= *skip-below* 0)
       (handler-case
           (%load-suite-file "/tmp/ansi-test/tests/cons/acons.lsp" "ACONS")
         (t (c) (%record-test-fail-or-emit 56494)))
@@ -3497,6 +3501,8 @@
                            "COND-T"
                            56524)
         (t (c) (%record-test-fail-or-emit 56524)))))
+      )  ; end (when (= *skip-below* 0) ...)
+
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

@@ -3312,7 +3312,25 @@
         (t (c) (%record-test-fail-or-emit 56498)))
       (handler-case
           (%load-suite-file "/tmp/ansi-test/tests/cons/null.lsp" "NULL")
-        (t (c) (%record-test-fail-or-emit 56499)))))
+        (t (c) (%record-test-fail-or-emit 56499)))
+      ;; 56500 — load ansi-aux.lsp first (defines *universe*, signals-error,
+      ;; check-values, eqt-via-aux etc.) and see if subsequent test files
+      ;; recover more passes
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/auxiliary/ansi-aux.lsp" "AUX")
+        (t (c) (%record-test-fail-or-emit 56500)))
+      ;; 56501 — re-run cons/atom.lsp now that aux is loaded
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/atom.lsp" "ATOM2")
+        (t (c) (%record-test-fail-or-emit 56501)))
+      ;; 56502 — load consp.lsp
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/consp.lsp" "CONSP")
+        (t (c) (%record-test-fail-or-emit 56502)))
+      ;; 56503 — load listp.lsp
+      (handler-case
+          (%load-suite-file "/tmp/ansi-test/tests/cons/listp.lsp" "LISTP")
+        (t (c) (%record-test-fail-or-emit 56503)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

@@ -3178,7 +3178,27 @@
                     (setq n (+ n 1))))
             (close s)
             (deftest 56483 (>= n 14) t))
-        (t (c) (%record-test-fail-or-emit 56483)))))
+        (t (c) (%record-test-fail-or-emit 56483)))
+      ;; 56484 — diagnostic: read-from-string works ✓
+      (handler-case
+          (let ((f (read-from-string "(deftest m.1 (+ 1 2) 3)")))
+            (deftest 56484 (and (consp f) (eq (car f) 'deftest)) t))
+        (t (c) (%record-test-fail-or-emit 56484)))
+      ;; 56485 — does (read FILE-STREAM) work at all?
+      (handler-case
+          (let* ((path "/tmp/probe-mini.lsp"))
+            (let ((s (open path :direction :output)))
+              (write-string "(a b c)" s)
+              (close s))
+            (let* ((s2 (open path :direction :input))
+                   (f (read s2 nil :eof)))
+              (close s2)
+              (write-char-serial 10)
+              (write-string-serial "FILE-READ:")
+              (write-object f)
+              (write-char-serial 10)
+              (deftest 56485 (and (consp f) (eq (car f) 'a)) t)))
+        (t (c) (%record-test-fail-or-emit 56485)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

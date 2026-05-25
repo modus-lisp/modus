@@ -3253,7 +3253,13 @@
       ;; use the quote-friendly expansion.  Uses LIST/QUOTE explicitly
       ;; instead of backquote because SBCL's backquote expansion uses
       ;; SBCL-internal forms (sb-int:quasiquote) that Modus's eval
-      ;; can't interpret.
+      ;; can't interpret.  Also registers aux helpers:
+      ;;   *universe* — sample of values across CL types (enough for
+      ;;     `(loop for x in *universe* ...)' tests to run)
+      ;;   signals-error — macro `(signals-error FORM ERR)' → expands
+      ;;     to `(not (catch 0 FORM t))' (suite's own definition)
+      ;;   expand-in-current-env — macro that returns its arg verbatim
+      ;;     (the suite uses it as a marker for macrolet-aware expansion)
       (handler-case
           (progn
             (eval (list 'defmacro 'deftest '(name form &rest expected-values)
@@ -3262,6 +3268,29 @@
                                     'form
                                     (list 'list (list 'quote 'quote)
                                           (list 'car 'expected-values)))))
+            ;; *universe* — small sample to make for/in loops work
+            (eval (list 'defvar '*universe*
+                        (list 'quote
+                              (list nil t 0 1 -1 100 -100 #\a #\Z #\Space
+                                    "" "abc" "hello"
+                                    (cons 'a 'b) '(1 2 3)
+                                    'foo 'bar :keyword
+                                    1.0 -1.0 0.5))))
+            ;; signals-error — returns T if FORM signals any error.
+            ;; The 'signals-error symbol at runtime may have a different
+            ;; native-sym identity than what set-macro-function looks up,
+            ;; so we set-macro-function with the STRING name "SIGNALS-ERROR"
+            ;; to ensure the macro-function table key matches whatever
+            ;; macroexpand-1 derives from the form's head symbol.
+            (set-macro-function "SIGNALS-ERROR"
+              (list '%interp-closure '(form &rest ignore)
+                    (list (list 'list (list 'quote 'handler-case)
+                                (list 'list (list 'quote 'progn) 'form nil)
+                                (list 'quote '(error (c) t))))
+                    nil))
+            ;; expand-in-current-env — identity macro
+            (set-macro-function "EXPAND-IN-CURRENT-ENV"
+              (list '%interp-closure '(form) '(form) nil))
             (deftest 56490 t t))
         (t (c) (%record-test-fail-or-emit 56490)))
       ;; 56491 — does (eval ...) of a macro-bearing deftest form work?
@@ -3323,6 +3352,22 @@
       (handler-case
           (%load-suite-file "/tmp/ansi-test/tests/cons/atom.lsp" "ATOM2")
         (t (c) (%record-test-fail-or-emit 56501)))
+      ;; 56510 — verify *universe* is bound
+      (handler-case
+          (deftest 56510 (and (listp *universe*) (> (length *universe*) 5)) t)
+        (t (c) (%record-test-fail-or-emit 56510)))
+      ;; 56511 — signals-error now via direct set-macro-function
+      (handler-case
+          (let ((r (eval '(signals-error (error "test")))))
+            (deftest 56511 r t))
+        (t (c) (%record-test-fail-or-emit 56511)))
+      ;; 56512 — atom.1 form runs directly
+      (handler-case
+          (let ((r (eval '(loop for x in *universe*
+                                unless (if (atom x) (not (consp x)) (consp x))
+                                collect x))))
+            (deftest 56512 r nil))
+        (t (c) (%record-test-fail-or-emit 56512)))
       ;; 56502 — load consp.lsp
       (handler-case
           (%load-suite-file "/tmp/ansi-test/tests/cons/consp.lsp" "CONSP")

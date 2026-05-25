@@ -743,6 +743,46 @@
               (expander (list '%interp-closure params body nil)))
          (set-macro-function mname expander)
          mname))
+      ;; MACROLET — (macrolet ((name (params) body) ...) body...)
+      ;; Registers local macros via set-macro-function for the duration
+      ;; of the inner body, then restores prior bindings.  Used heavily
+      ;; by the ANSI test suite to test compile-time expansion in
+      ;; isolation, especially with EXPAND-IN-CURRENT-ENV.
+      ((%eval-sym-eq op "MACROLET")
+       (let* ((defs (car args))
+              (body (cdr args))
+              (saved nil))
+         ;; Save prior bindings + install new expanders
+         (dolist (d defs)
+           (let* ((name (car d))
+                  (params (cadr d))
+                  (mbody (cddr d))
+                  (key-name (cond ((stringp name) name)
+                                  ((%cl-sym-p name) (%cl-sym-name name))
+                                  (t (symbol-name name)))))
+             (push (cons key-name
+                         (and *macro-function-table*
+                              (gethash key-name *macro-function-table*)))
+                   saved)
+             (set-macro-function key-name
+                                 (list '%interp-closure params mbody env))))
+         (handler-case
+             (let ((result (%eval-progn body env)))
+               ;; Restore prior bindings before returning
+               (dolist (s saved)
+                 (let ((nm (car s)) (old (cdr s)))
+                   (if old
+                       (puthash nm *macro-function-table* old)
+                       (remhash nm *macro-function-table*))))
+               result)
+           (t (c)
+             ;; Restore even on error
+             (dolist (s saved)
+               (let ((nm (car s)) (old (cdr s)))
+                 (if old
+                     (puthash nm *macro-function-table* old)
+                     (remhash nm *macro-function-table*))))
+             (%signal-error c)))))
       ;; ----- CLOS forms — runtime evaluation of defmethod/defgeneric/defclass.
       ;; All three reuse the back-end functions the build-time rewriter
       ;; targets (%defmethod, %defgeneric, %defclass) so eval'd CLOS forms

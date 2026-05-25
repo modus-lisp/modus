@@ -1606,11 +1606,19 @@
   ;; the defun's calling-convention dispatch.  The defun is now dead
   ;; code for these forms; left in place because rt-run-test still
   ;; calls helpers in the same file.
-  ;; DEFTEST as a global mvm-define-macro REPEATEDLY broke the suite
-  ;; (commits 6cf5ade -1749, a6ac2d9 / two-shard-test -2860).  The
-  ;; existing rt.lisp defun + per-probe handler-case wrapping +
-  ;; build-emitted bridges have too many invariants we can't satisfy
-  ;; with a single macro expansion.  G2 deferred — see project doc.
+  ;; G2 (deftest as macro) — three attempts (6cf5ade -1749, then -2860,
+  ;; then -1321) all regressed massively despite different heuristics.
+  ;; Even a restrictive macro that ONLY quotes when expected has a
+  ;; nested cons (clearly literal data) blew up.  The build-time
+  ;; pipeline emits ~thousands of (deftest …) forms (via
+  ;; def-print-test, def-pprint-test, def-condition macros) with
+  ;; specific structural assumptions about the defun call protocol;
+  ;; macroexpanding them globally changes too many invariants at once.
+  ;;
+  ;; Path forward: G2 needs a TARGETED approach — either rename Modus
+  ;; probes to a private name (`mvm-deftest`) freeing `deftest` for the
+  ;; suite, or add a LOAD-time-only macro binding.  Not blocking on
+  ;; G1's win (the reader now passes acons.lsp); deferred.
 
   ;; DO-SYMBOLS — (do-symbols (var [pkg [result]]) body...)
   ;; Collect all accessible symbols of PKG via %do-symbols-fn into a fresh

@@ -3247,7 +3247,69 @@
             (close s)
             (write-char-serial 10)
             (deftest 56488 t t))
-        (t (c) (%record-test-fail-or-emit 56488)))))
+        (t (c) (%record-test-fail-or-emit 56488)))
+      ;; 56490 — register a RUNTIME defmacro deftest (G2 via runtime
+      ;; macro table) so subsequent (load) of unmodified suite files
+      ;; use the quote-friendly expansion.  Uses LIST/QUOTE explicitly
+      ;; instead of backquote because SBCL's backquote expansion uses
+      ;; SBCL-internal forms (sb-int:quasiquote) that Modus's eval
+      ;; can't interpret.
+      (handler-case
+          (progn
+            (eval (list 'defmacro 'deftest '(name form &rest expected-values)
+                        (list 'list (list 'quote 'rt-run-test)
+                                    (list 'list (list 'quote 'quote) 'name)
+                                    'form
+                                    (list 'list (list 'quote 'quote)
+                                          (list 'car 'expected-values)))))
+            (deftest 56490 t t))
+        (t (c) (%record-test-fail-or-emit 56490)))
+      ;; 56491 — does (eval ...) of a macro-bearing deftest form work?
+      ;; Three sub-checks: form is read, eval runs without crash, and
+      ;; the macro expansion fires (we expect P:probe-491 in output).
+      (handler-case
+          (let* ((src "(deftest probe-491 (cons 'a 'b) (a . b))")
+                 (form (read-from-string src)))
+            (write-char-serial 10)
+            (write-string-serial "EVAL-START")
+            (write-char-serial 10)
+            (eval form)
+            (write-string-serial "EVAL-DONE")
+            (write-char-serial 10)
+            (deftest 56491 t t))
+        (t (c)
+          (write-char-serial 10)
+          (write-string-serial "EVAL-ERROR")
+          (write-char-serial 10)
+          (%record-test-fail-or-emit 56491)))
+      ;; 56492 — can eval just call (+ 1 2)?
+      (handler-case
+          (let ((r (eval (list '+ 1 2))))
+            (deftest 56492 r 3))
+        (t (c) (%record-test-fail-or-emit 56492)))
+      ;; 56493 — can eval call a custom defun like rt-run-test?
+      (handler-case
+          (let ((r (eval (list 'cons (list 'quote 'a) (list 'quote 'b)))))
+            (deftest 56493 r '(a . b)))
+        (t (c) (%record-test-fail-or-emit 56493)))
+      ;; 56494 — read+eval all forms from acons.lsp via the runtime
+      ;; deftest macro.  Count how many tests passed.
+      (handler-case
+          (let ((s (open "/tmp/ansi-test/tests/cons/acons.lsp" :direction :input))
+                (pre-pass *rt-pass-count*)
+                (pre-fail *rt-fail-count*))
+            (loop (let ((f (read s nil :eof)))
+                    (when (eq f :eof) (return nil))
+                    (handler-case (eval f) (t (c) nil))))
+            (close s)
+            (write-char-serial 10)
+            (write-string-serial "ACONS-PASSED:")
+            (print-dec (- *rt-pass-count* pre-pass))
+            (write-string-serial " FAILED:")
+            (print-dec (- *rt-fail-count* pre-fail))
+            (write-char-serial 10)
+            (deftest 56494 t t))
+        (t (c) (%record-test-fail-or-emit 56494)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

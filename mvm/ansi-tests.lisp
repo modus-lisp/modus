@@ -3330,7 +3330,32 @@
       ;; 56503 — load listp.lsp
       (handler-case
           (%load-suite-file "/tmp/ansi-test/tests/cons/listp.lsp" "LISTP")
-        (t (c) (%record-test-fail-or-emit 56503)))))
+        (t (c) (%record-test-fail-or-emit 56503)))
+      ;; 56504-56520 — bulk-load remaining cons test files.  Each is
+      ;; wrapped in handler-case so individual crashes don't abort the
+      ;; rest.  Reports per-file PASSED/FAILED counts.
+      (handler-case
+          (let ((files '("append.lsp" "endp.lsp" "list.lsp" "first.lsp"
+                         "second.lsp" "third.lsp" "fourth.lsp"
+                         "rest.lsp" "ldiff.lsp" "last.lsp"
+                         "nth.lsp" "list-length.lsp"
+                         "make-list.lsp" "copy-list.lsp" "copy-tree.lsp"
+                         "tree-equal.lsp" "tailp.lsp"))
+                (pre-pass *rt-pass-count*)
+                (pre-fail *rt-fail-count*))
+            (dolist (f files)
+              (handler-case
+                (let ((path (concatenate 'string "/tmp/ansi-test/tests/cons/" f)))
+                  (when (probe-file path) (%load-suite-file path f)))
+                (t (c) nil)))
+            (write-char-serial 10)
+            (write-string-serial "CONS-BULK-PASSED:")
+            (print-dec (- *rt-pass-count* pre-pass))
+            (write-string-serial " FAILED:")
+            (print-dec (- *rt-fail-count* pre-fail))
+            (write-char-serial 10)
+            (deftest 56504 t t))
+        (t (c) (%record-test-fail-or-emit 56504)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))

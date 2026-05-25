@@ -3335,27 +3335,56 @@
       ;; wrapped in handler-case so individual crashes don't abort the
       ;; rest.  Reports per-file PASSED/FAILED counts.
       (handler-case
-          (let ((files '("append.lsp" "endp.lsp" "list.lsp" "first.lsp"
-                         "second.lsp" "third.lsp" "fourth.lsp"
-                         "rest.lsp" "ldiff.lsp" "last.lsp"
-                         "nth.lsp" "list-length.lsp"
-                         "make-list.lsp" "copy-list.lsp" "copy-tree.lsp"
-                         "tree-equal.lsp" "tailp.lsp"))
-                (pre-pass *rt-pass-count*)
-                (pre-fail *rt-fail-count*))
-            (dolist (f files)
-              (handler-case
-                (let ((path (concatenate 'string "/tmp/ansi-test/tests/cons/" f)))
-                  (when (probe-file path) (%load-suite-file path f)))
-                (t (c) nil)))
-            (write-char-serial 10)
-            (write-string-serial "CONS-BULK-PASSED:")
-            (print-dec (- *rt-pass-count* pre-pass))
-            (write-string-serial " FAILED:")
-            (print-dec (- *rt-fail-count* pre-fail))
-            (write-char-serial 10)
-            (deftest 56504 t t))
-        (t (c) (%record-test-fail-or-emit 56504)))))
+          (%load-suite-dir "/tmp/ansi-test/tests/cons/"
+                           '("append.lsp" "endp.lsp" "list.lsp" "first.lsp"
+                             "second.lsp" "third.lsp" "fourth.lsp"
+                             "rest.lsp" "ldiff.lsp" "last.lsp"
+                             "nth.lsp" "list-length.lsp"
+                             "make-list.lsp" "copy-list.lsp" "copy-tree.lsp"
+                             "tree-equal.lsp" "tailp.lsp")
+                           "CONS-BULK"
+                           56504)
+        (t (c) (%record-test-fail-or-emit 56504)))
+      ;; 56505 — symbols/ test files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/symbols/"
+                           '("symbolp.lsp" "keywordp.lsp" "symbol-name.lsp"
+                             "boundp.lsp" "fboundp.lsp" "symbol-value.lsp"
+                             "symbol-function.lsp" "symbol-package.lsp"
+                             "gensym.lsp" "make-symbol.lsp" "copy-symbol.lsp")
+                           "SYMBOLS"
+                           56505)
+        (t (c) (%record-test-fail-or-emit 56505)))
+      ;; 56506 — characters/ test files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/characters/"
+                           '("characterp.lsp" "char-code.lsp" "code-char.lsp"
+                             "char-upcase.lsp" "char-downcase.lsp"
+                             "char-equal.lsp" "alpha-char-p.lsp"
+                             "digit-char-p.lsp" "char-name.lsp")
+                           "CHARS"
+                           56506)
+        (t (c) (%record-test-fail-or-emit 56506)))
+      ;; 56507 — strings/ test files
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/strings/"
+                           '("string.lsp" "stringp.lsp" "string-equal.lsp"
+                             "string-upcase.lsp" "string-downcase.lsp"
+                             "string-trim.lsp" "char.lsp" "schar.lsp"
+                             "make-string.lsp")
+                           "STRINGS"
+                           56507)
+        (t (c) (%record-test-fail-or-emit 56507)))
+      ;; 56508 — numbers/ test files (subset)
+      (handler-case
+          (%load-suite-dir "/tmp/ansi-test/tests/numbers/"
+                           '("numberp.lsp" "integerp.lsp" "rationalp.lsp"
+                             "evenp.lsp" "oddp.lsp" "zerop.lsp"
+                             "plusp.lsp" "minusp.lsp" "abs.lsp"
+                             "max.lsp" "min.lsp" "gcd.lsp" "lcm.lsp")
+                           "NUMBERS"
+                           56508)
+        (t (c) (%record-test-fail-or-emit 56508)))))
   ;; --- with-slots writable via symbol-macrolet ---
   (handler-case
     (deftest 5610 (let ((c (make-instance 'smoke-circle :name "x" :radius 1)))
@@ -3540,6 +3569,27 @@
     (print-dec (- *rt-fail-count* pre-fail))
     (write-char-serial 10)
     t))
+
+(defun %load-suite-dir (dir-path files label probe-id)
+  "Load + eval each FILE in FILES from DIR-PATH.  Each is wrapped in
+   handler-case so individual file crashes don't abort the rest.
+   Reports `LABEL-BULK-PASSED:N FAILED:M' on serial then registers the
+   PROBE-ID deftest so the harness picks up the work."
+  (let ((pre-pass *rt-pass-count*)
+        (pre-fail *rt-fail-count*))
+    (dolist (f files)
+      (handler-case
+        (let ((path (concatenate 'string dir-path f)))
+          (when (probe-file path) (%load-suite-file path f)))
+        (t (c) nil)))
+    (write-char-serial 10)
+    (write-string-serial label)
+    (write-string-serial "-BULK-PASSED:")
+    (print-dec (- *rt-pass-count* pre-pass))
+    (write-string-serial " FAILED:")
+    (print-dec (- *rt-fail-count* pre-fail))
+    (write-char-serial 10)
+    (deftest probe-id t t)))
 
 (defun %record-test-fail-or-emit (id)
   "Print FAIL <id> directly without going through %record-test-fail

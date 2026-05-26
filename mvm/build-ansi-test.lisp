@@ -230,6 +230,94 @@
                  (format o "  nil)~%"))))
       (values out (hash-table-count name-hash-table) n-chunks))))
 
+;; -----------------------------------------------------------------
+;; Runtime macro-table populator.
+;;
+;; mvm/compiler.lisp's register-mvm-bootstrap-macros lives ONLY on the
+;; SBCL build host — it isn't part of *bridge-source* and mvm-define-
+;; macro is undefined at runtime.  But the lambda expansion bodies
+;; ARE valid Modus source: they use backquote / list / cons / car etc.
+;; So we WALK compiler.lisp at build time, find each
+;; (mvm-define-macro NAME EXPANDER) form, and EMIT a runtime puthash
+;; call with the expander LAMBDA as a fresh Modus source form.  The
+;; runtime then compiles the lambdas into real closures and stores
+;; them in *macro-table* keyed by compute-name-hash(NAME).
+
+(defun %scan-mvm-define-macro-forms (source-str)
+  "Walk SOURCE-STR via SBCL reader (bound into :modus.mvm so its symbols
+   resolve correctly), collect every (mvm-define-macro NAME EXPANDER)
+   form.  Returns a list of (NAME-STR EXPANDER-FORM) pairs."
+  (let ((found nil)
+        (eof (list :eof))
+        (modus-pkg (find-package :modus.mvm)))
+    (labels ((walk (form)
+               (cond
+                 ((not (consp form)) nil)
+                 ((and (symbolp (car form))
+                       ;; Accept either fully-qualified modus.mvm::mvm-define-macro
+                       ;; OR any other home package — the suite source can be
+                       ;; read from either :cl-user or :modus.mvm.  Name match
+                       ;; is sufficient since "MVM-DEFINE-MACRO" is unique.
+                       (string= (symbol-name (car form)) "MVM-DEFINE-MACRO")
+                       (consp (cdr form)) (stringp (cadr form))
+                       (consp (cddr form)))
+                  (push (list (cadr form) (caddr form)) found))
+                 (t (dolist (sub form) (walk sub))))))
+      (let ((*package* modus-pkg))   ;; symbols read into :modus.mvm
+        (with-input-from-string (s source-str)
+          (loop
+            (let ((form (handler-case (read s nil eof) (error () (return)))))
+              (when (eq form eof) (return))
+              (handler-case (walk form) (error () nil)))))))
+    (nreverse found)))
+
+(defun %generate-runtime-macro-init (pairs &key (chunk 5))
+  "Emit a (defun %init-runtime-macros ...) that puthashes each macro's
+   expander LAMBDA into *macro-table*.  Chunked so any one defun stays
+   small enough to compile cleanly."
+  (let* ((n-chunks 0)
+         (out (with-output-to-string (o)
+                (let ((cur pairs))
+                  (loop
+                    (when (null cur) (return))
+                    (incf n-chunks)
+                    (format o "(defun %init-runtime-macros-~D ()~%" n-chunks)
+                    (let ((k 0))
+                      (loop
+                        (when (or (null cur) (>= k chunk)) (return))
+                        (let* ((p (car cur))
+                               (name (first p))
+                               (expander-src (second p)))
+                          ;; 5 macros (DECF/DOLIST/POP/PROG1/PUSH) are defined
+                          ;; twice in compiler.lisp; last-wins via hash overwrite.
+                          ;; Net unique = 70.
+                          (handler-case
+                            (let ((*package* (find-package :modus.mvm)))
+                              (format o "  (puthash ~D *macro-table* ~S)~%"
+                                      (modus.mvm::compute-name-hash name)
+                                      expander-src))
+                            (error () nil)))
+                        (setq cur (cdr cur))
+                        (incf k)))
+                    (format o "  nil)~%")))
+                (format o "(defun %init-runtime-macros ()~%")
+                (format o "  (setq *macro-table* (make-hash-table))~%")
+                (let ((c 0))
+                  (loop
+                    (incf c)
+                    (when (> c n-chunks) (return))
+                    (format o "  (%init-runtime-macros-~D)~%" c)))
+                (format o "  nil)~%"))))
+    (values out (length pairs) n-chunks)))
+
+(defvar *runtime-macros-auto-source*
+  (let ((pairs (%scan-mvm-define-macro-forms (mvm-text "mvm/compiler.lisp"))))
+    (multiple-value-bind (src count chunks)
+        (%generate-runtime-macro-init pairs)
+      (format t "  runtime macros: ~D mvm-define-macro entries across ~D chunk(s)~%"
+              count chunks)
+      src)))
+
 (defvar *sym-name-auto-source*
   (let ((tbl (make-hash-table :test 'equal)))
     (dolist (src (list *prelude-source* *gc-source* *rt-source*
@@ -3302,54 +3390,16 @@
   (setq *sym-name-table* (make-hash-table))
   (%init-sym-name-auto)
 
-  ;; Populate compile-time *macro-table* at runtime — content
-  ;; (DOLIST/DOTIMES/COND/AND/OR/CASE/etc.) is registered via
-  ;; mvm-define-macro at SBCL build host, NOT at runtime.  We have to:
-  ;; (1) initialize *macro-table* (defvar init-thunks don't run on bare
-  ;; metal — per CLAUDE.md) and (2) call register-mvm-bootstrap-macros
-  ;; whose body re-runs every mvm-define-macro setf.  Without this,
-  ;; runtime EVAL of (dolist ...) etc. can't macroexpand.
-  (setq *macro-table* (make-hash-table))
-  ;; mvm-define-macro lives in compiler.lisp (build-host only — not in
-  ;; *bridge-source*).  At runtime we directly puthash the expanders.
-  ;; The macros that matter for runtime EVAL of LOAD'd suite files:
-  ;; DOLIST, DOTIMES, COND, AND, OR, WHEN, UNLESS.  Each gets a runtime
-  ;; lambda that builds an expansion.
-  (puthash (compute-name-hash \"DOLIST\") *macro-table*
-    (lambda (form)
-      (let ((spec (cadr form))
-            (body (cddr form)))
-        (let ((var (car spec))
-              (list-form (cadr spec))
-              (tmp (gensym \"DL\")))
-          (list 'block nil
-            (list 'let (list (list tmp list-form) (list var nil))
-              (list 'loop
-                (list 'when (list 'null tmp)
-                  (list 'return (if (cddr spec) (caddr spec) nil)))
-                (list 'setq var (list 'car tmp))
-                (cons 'tagbody body)
-                (list 'setq tmp (list 'cdr tmp)))))))))
-  (puthash (compute-name-hash \"DOTIMES\") *macro-table*
-    (lambda (form)
-      (let ((spec (cadr form))
-            (body (cddr form)))
-        (let ((var (car spec))
-              (count-form (cadr spec))
-              (result (if (cddr spec) (caddr spec) nil))
-              (limit (gensym \"DT\")))
-          (list 'block nil
-            (list 'let (list (list limit count-form) (list var 0))
-              (list 'loop
-                (list 'when (list '>= var limit) (list 'return result))
-                (cons 'tagbody body)
-                (list 'setq var (list '+ var 1)))))))))
-  (puthash (compute-name-hash \"WHEN\") *macro-table*
-    (lambda (form)
-      (list 'if (cadr form) (cons 'progn (cddr form)) nil)))
-  (puthash (compute-name-hash \"UNLESS\") *macro-table*
-    (lambda (form)
-      (list 'if (cadr form) nil (cons 'progn (cddr form)))))
+  ;; Populate *macro-table* at runtime with every mvm-define-macro
+  ;; entry from compiler.lisp.  Build-time %scan-mvm-define-macro-forms
+  ;; reads compiler.lisp, extracts the (NAME . EXPANDER) pairs, and
+  ;; %generate-runtime-macro-init emits chunked %init-runtime-macros-N
+  ;; defuns whose bodies puthash each NAME's expander LAMBDA into
+  ;; *macro-table* at runtime.  Now COND/AND/OR/CASE/ECASE/INCF/DECF/
+  ;; PUSH/POP/WHEN/UNLESS/DOLIST/DOTIMES/TYPECASE/DESTRUCTURING-BIND/...
+  ;; (all 74 of them) are available to macroexpand-1 and %eval-compound
+  ;; at runtime, so LOAD'd .lsp suite files can macroexpand correctly.
+  (%init-runtime-macros)
 
   ;; Build the compiler-macro name set so MACRO-FUNCTION reports T for
   ;; PUSH/POP/COND/etc. that the modus compiler implements directly.
@@ -3599,6 +3649,12 @@
     ;;      every symbol that appears in the source tree, so symbol-name
     ;;      can recover the name of any native MVM sym (#x50, hash-only).
     *sym-name-auto-source*
+    (string #\Newline)
+    ;; 4.7. Auto-generated %init-runtime-macros: puthash runtime expander
+    ;;      lambdas for every (mvm-define-macro NAME ...) in compiler.lisp.
+    ;;      Closes the build-host-only macro-table gap so runtime LOAD'd
+    ;;      suite files can use COND/AND/OR/CASE/etc. via real macro lookup.
+    *runtime-macros-auto-source*
     (string #\Newline)
     ;; 5. Our test source (run-*-tests, run-all-tests)
     ;;    Functions defined here override aux (last-defun-wins).

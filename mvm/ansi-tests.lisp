@@ -3356,19 +3356,29 @@
       (handler-case
           (deftest 56510 (and (listp *universe*) (> (length *universe*) 5)) t)
         (t (c) (%record-test-fail-or-emit 56510)))
-      ;; 56511 — verify symbol-name works for a sym definitely in build sources
+      ;; 56511 — symbol-name works
       (handler-case
-          (let ((nm1 (symbol-name 'deftest))
-                (nm2 (symbol-name 'cons))
-                (nm3 (symbol-name 'my-roundtrip-test)))
-            (write-char-serial 10)
-            (write-string-serial "NM-DEFTEST:[")
-            (write-string-serial nm1) (write-string-serial "] NM-CONS:[")
-            (write-string-serial nm2) (write-string-serial "] NM-NEW:[")
-            (write-string-serial nm3) (write-string-serial "]")
-            (write-char-serial 10)
-            (deftest 56511 (and (> (length nm2) 0)) t))
+          (deftest 56511 (string= (symbol-name 'cons) "CONS") t)
         (t (c) (%record-test-fail-or-emit 56511)))
+      ;; 56513 — runtime eval of (%defgeneric ...)
+      (handler-case
+          (progn
+            (eval '(%defgeneric 'gf-probe-1 '(x) nil))
+            (deftest 56513 (not (null (%find-gf 'gf-probe-1))) t))
+        (t (c) (%record-test-fail-or-emit 56513)))
+      ;; 56514 — runtime eval of (%defmethod ...)
+      (handler-case
+          (progn
+            (eval '(%defmethod 'gf-probe-1 nil '(t) (lambda (x) (list x :ok))))
+            (deftest 56514 t t))
+        (t (c) (%record-test-fail-or-emit 56514)))
+      ;; 56515 — runtime-defun fn called via eval
+      (handler-case
+          (progn
+            (eval '(defun foo-runtime-defun (x) (+ x 1)))
+            (let ((r (eval '(foo-runtime-defun 41))))
+              (deftest 56515 r 42)))
+        (t (c) (%record-test-fail-or-emit 56515)))
       ;; 56512 — atom.1 form runs directly
       (handler-case
           (let ((r (eval '(loop for x in *universe*

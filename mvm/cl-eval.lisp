@@ -481,16 +481,36 @@
       (setq cur (cdr cur)))))
 
 (defun %eval-call-fn (fn args form)
-  "Call FN with ARGS list, using funcall/apply."
-  (let ((nargs (length args)))
+  "Call FN with ARGS list, using funcall/apply.
+   When FN is a SYMBOL, first resolve via the function tables so we can
+   detect an interp-closure (cons starting with '%interp-closure).
+   Compiled funcall can't invoke a cons-shaped fn — it expects a real
+   function pointer or a closure object (subtag #x52).  Without this
+   resolve+interp-closure special case, `(eval '(foo 41))' after
+   `(eval '(defun foo (x) (+ x 1)))' segfaults because foo's SFT entry
+   is an %interp-closure cons."
+  (let ((resolved (cond
+                    ;; If FN is a symbol, look up in fn tables
+                    ((or (%cl-sym-p fn) (%native-sym-p fn))
+                     (let ((name (%eval-sym-name fn)))
+                       (or (and name *symbol-function-table*
+                                (gethash name *symbol-function-table*))
+                           (and (%native-sym-p fn) *native-sym-function-table*
+                                (gethash (aref fn 0) *native-sym-function-table*))
+                           fn)))
+                    (t fn))))
     (cond
-      ((= nargs 0) (funcall fn))
-      ((= nargs 1) (funcall fn (car args)))
-      ((= nargs 2) (funcall fn (car args) (cadr args)))
-      ((= nargs 3) (funcall fn (car args) (cadr args) (caddr args)))
-      ((= nargs 4) (funcall fn (car args) (cadr args) (caddr args) (cadddr args)))
-      ((= nargs 5) (funcall fn (car args) (cadr args) (caddr args) (cadddr args) (nth 4 args)))
-      (t (apply fn args)))))
+      ((%interp-closure-p resolved) (%call-interp-closure resolved args))
+      (t
+       (let ((nargs (length args)))
+         (cond
+           ((= nargs 0) (funcall resolved))
+           ((= nargs 1) (funcall resolved (car args)))
+           ((= nargs 2) (funcall resolved (car args) (cadr args)))
+           ((= nargs 3) (funcall resolved (car args) (cadr args) (caddr args)))
+           ((= nargs 4) (funcall resolved (car args) (cadr args) (caddr args) (cadddr args)))
+           ((= nargs 5) (funcall resolved (car args) (cadr args) (caddr args) (cadddr args) (nth 4 args)))
+           (t (apply resolved args))))))))
 
 (defun %eval-sym-eq (sym name-str)
   "Check if SYM has name NAME-STR.  Handles CL symbols (string-equal),

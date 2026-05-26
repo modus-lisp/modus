@@ -5140,16 +5140,27 @@
                (by (or (loop-iter-by-form iter) 1)))
            (push (list var (loop-iter-init-form iter)) bindings)
            (when (loop-iter-end-form iter)
-             (let ((end-var (gensym "END")))
+             (let* ((end-var (gensym "END"))
+                    (down-p (member (loop-iter-end-test iter) '(:downto :above)))
+                    ;; The body's step already advanced VAR past the last
+                    ;; valid value by the time the test fires.  CLHS-correct
+                    ;; LOOP exposes the LAST valid value to FINALLY (and to
+                    ;; the LOOP's return form), so back out one step before
+                    ;; the (return nil) exit.  For TO/BELOW step adds BY, so
+                    ;; back-out subtracts BY.  For DOWNTO/ABOVE step
+                    ;; subtracts BY, so back-out adds BY.
+                    (back-out (if down-p
+                                  `(setq ,var (+ ,var ,by))
+                                  `(setq ,var (- ,var ,by)))))
                (push (list end-var (loop-iter-end-form iter)) bindings)
                ;; Use %loop-cmp helper so float/ratio end-forms work too —
                ;; raw `>` is fixnum-only and silently mis-compares with a
                ;; boxed-float pointer, hanging the loop.
                (push (ecase (loop-iter-end-test iter)
-                       (:to    `(if (%loop-gt ,var ,end-var) (return nil)))
-                       (:below `(if (%loop-ge ,var ,end-var) (return nil)))
-                       (:downto `(if (%loop-lt ,var ,end-var) (return nil)))
-                       (:above `(if (%loop-le ,var ,end-var) (return nil))))
+                       (:to    `(if (%loop-gt ,var ,end-var) (progn ,back-out (return nil))))
+                       (:below `(if (%loop-ge ,var ,end-var) (progn ,back-out (return nil))))
+                       (:downto `(if (%loop-lt ,var ,end-var) (progn ,back-out (return nil))))
+                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return nil)))))
                      test-forms)))
            (if (and (loop-iter-end-test iter)
                     (member (loop-iter-end-test iter) '(:downto :above)))
@@ -5371,14 +5382,29 @@
              (inner `(loop ,@loop-body))
              ;; For always: rewrite iteration-end returns
              ;; The test-forms have (return nil) for exhaustion — we need
-             ;; (return t) for always (all passed)
+             ;; (return t) for always (all passed).
+             ;;
+             ;; Two shapes after the :from step-back-out fix:
+             ;;   • bare   `(if test (return nil))`           — :in / :across
+             ;;   • progn  `(if test (progn back-out (return nil)))` — :from
+             ;; Detect either, keep the back-out side-effect, rewrite the
+             ;; final (return nil) to (return t).
              (final-test-forms
                (if has-always
                    (mapcar (lambda (tf)
-                             (if (and (consp tf) (eq (car tf) 'if)
-                                      (equal (caddr tf) '(return nil)))
-                                 `(if ,(cadr tf) (return t))
-                                 tf))
+                             (cond
+                               ((and (consp tf) (eq (car tf) 'if)
+                                     (equal (caddr tf) '(return nil)))
+                                `(if ,(cadr tf) (return t)))
+                               ;; (if TEST (progn BACK-OUT (return nil)))
+                               ((and (consp tf) (eq (car tf) 'if)
+                                     (consp (caddr tf))
+                                     (eq (car (caddr tf)) 'progn)
+                                     (equal (car (last (caddr tf))) '(return nil)))
+                                (let* ((then (caddr tf))
+                                       (back-stmts (butlast (cdr then))))
+                                  `(if ,(cadr tf) (progn ,@back-stmts (return t)))))
+                               (t tf)))
                            loop-body)
                    loop-body))
              (inner2 (if (eq final-test-forms loop-body)
@@ -5427,17 +5453,38 @@
              (with-init (if initially
                             `(progn ,@initially ,result)
                             result))
-             ;; Apply bindings (let*), then wrap in (block <name> ...) if NAMED.
+             ;; Apply bindings (let*), then wrap in (block nil ...) if NAMED
+             ;; or if FINALLY contains a (return …) / (return-from nil …).
+             ;; LOOP introduces an implicit BLOCK NIL per CLHS 6.1.2 so the
+             ;; FINALLY's RETURN can branch out of the LOOP with a value;
+             ;; without the wrap, compile-return falls through to
+             ;; *function-return-label* and the lambda exits prematurely
+             ;; with the FINALLY expression's value — making
+             ;; (loop … finally (return x)) crash via uncatchable non-local
+             ;; exit out of the surrounding handler-case.
+             ;;
+             ;; A blanket wrap regressed -140 (multi-accumulator COLLECT
+             ;; tests).  Wrap only when FINALLY has a RETURN.
              (with-bindings-form
                (if bindings
                    `(let* ,(nreverse bindings) ,with-init)
-                   with-init)))
-        ;; NOTE: We don't wrap unnamed loops in (block nil ...) — that change
-        ;; broke multi-accumulator COLLECT (test 21250 regressed).  But NAMED
-        ;; loops need the wrapper so RETURN-FROM <name> can branch out.
-        (if block-name
-            `(block ,block-name ,with-bindings-form)
-            with-bindings-form)))))
+                   with-init))
+             (finally-has-return
+              (labels ((rec (f)
+                         (cond
+                           ((atom f) nil)
+                           ((and (symbolp (car f))
+                                 (or (string= (symbol-name (car f)) "RETURN")
+                                     (and (string= (symbol-name (car f)) "RETURN-FROM")
+                                          (consp (cdr f))
+                                          (null (cadr f)))))
+                            t)
+                           (t (or (rec (car f)) (rec (cdr f)))))))
+                (some #'rec finally))))
+        (cond
+          (block-name `(block ,block-name ,with-bindings-form))
+          (finally-has-return `(block nil ,with-bindings-form))
+          (t with-bindings-form))))))
 
 (defun compile-return (value env dest)
   "Compile (return value) — equivalent to (return-from nil value).

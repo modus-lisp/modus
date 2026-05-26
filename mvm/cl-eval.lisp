@@ -596,18 +596,57 @@
               (or fn (error "undefined function")))
             name-or-lambda))))
 
-;;; Block/return-from support via condition mechanism
-;;; We use a simple approach: block-return throws a condition caught by block.
+;;; Block / Return-from / Loop / Return / Tagbody / Go for runtime eval.
+;;;
+;;; Strategy: a global stack *%eval-escape-stack* holds (tag value) pairs
+;;; for in-flight escapes.  RETURN-FROM / RETURN / GO push a pair and
+;;; signal an %escape-error condition.  BLOCK / LOOP / TAGBODY catch
+;;; that condition, check if the top-of-stack matches their tag, and
+;;; either extract the value (matched) or re-raise (no match — escape
+;;; targets an outer block).
+;;;
+;;; Tags used: a symbol-name for BLOCK/RETURN-FROM, T for unnamed LOOP/
+;;; RETURN, and the GO tag for TAGBODY/GO.  Tag NIL (block named NIL)
+;;; uses NIL as the tag — RETURN escapes the innermost (block nil) or
+;;; loop.
+
+(defvar *%eval-escape-stack* nil
+  "Stack of (TAG . VALUE) for in-flight escapes.  Used by BLOCK/LOOP/
+   RETURN-FROM/RETURN to propagate non-local exits through eval.")
+
+(defun %eval-escape-push (tag value)
+  "Push an escape descriptor and signal."
+  (setq *%eval-escape-stack* (cons (cons tag value) *%eval-escape-stack*))
+  (error "%eval-escape"))
+
+(defun %eval-escape-pop-if (tag)
+  "If the top-of-stack escape's TAG matches, pop and return its value.
+   Returns the special value :%eval-no-escape if no match — caller
+   should re-signal."
+  (cond
+    ((and *%eval-escape-stack*
+          (let ((top (car *%eval-escape-stack*)))
+            (or (eq (car top) tag)
+                ;; LOOP's tag T matches RETURN's tag (which uses T too).
+                ;; Symbol equality otherwise.
+                (and (symbolp (car top)) (symbolp tag)
+                     (eq (car top) tag)))))
+     (let ((val (cdr (car *%eval-escape-stack*))))
+       (setq *%eval-escape-stack* (cdr *%eval-escape-stack*))
+       val))
+    (t :%eval-no-escape)))
 
 (defun %eval-block (name forms env)
   "Evaluate (block name forms...) with return-from support."
   (handler-case
     (%eval-progn forms env)
-    (error (c)
-      ;; Check if it's a block-return for this block
-      (if (%block-return-p c name)
-          (%block-return-value c)
-          (error c)))))
+    (t (c)
+      (declare (ignore c))
+      (let ((val (%eval-escape-pop-if name)))
+        (if (eq val :%eval-no-escape)
+            ;; Not for us — re-signal so an outer handler can catch.
+            (error "%eval-escape")
+            val)))))
 
 ;;; We implement block/return-from by signalling a special condition.
 ;;; Since we can't easily do this without CLOS conditions, use a simpler
@@ -1009,19 +1048,38 @@
       ((%eval-sym-eq op "BLOCK")
        (let ((bname (car args))
              (body (cdr args)))
-         ;; Use handler-case to catch return-from
          (handler-case
            (%eval-progn body env)
-           (error (c)
-             ;; Re-signal if not our return
-             (error c)))))
-      ;; RETURN-FROM (simplified: just eval value)
+           (t (c)
+             (declare (ignore c))
+             (let ((val (%eval-escape-pop-if bname)))
+               (if (eq val :%eval-no-escape)
+                   (error "%eval-escape")
+                   val))))))
+      ;; RETURN-FROM — push (name . value) onto escape stack + signal
       ((%eval-sym-eq op "RETURN-FROM")
-       (let ((val (if (cdr args) (%eval-in-env (cadr args) env) nil)))
-         val))
-      ;; RETURN
+       (let* ((name (car args))
+              (val-form (cadr args))
+              (val (if (cdr args) (%eval-in-env val-form env) nil)))
+         (%eval-escape-push name val)))
+      ;; RETURN — escape from the innermost block named NIL or LOOP
       ((%eval-sym-eq op "RETURN")
-       (if args (%eval-in-env (car args) env) nil))
+       (let ((val (if args (%eval-in-env (car args) env) nil)))
+         (%eval-escape-push nil val)))
+      ;; LOOP — repeat body forever until RETURN (or RETURN-FROM nil)
+      ;; escapes via the stack.  Body is treated as an implicit progn
+      ;; with implicit (block nil) wrapping for RETURN to target.
+      ((%eval-sym-eq op "LOOP")
+       (handler-case
+         (let ((dummy nil))
+           (declare (ignore dummy))
+           (loop (%eval-progn args env)))
+         (t (c)
+           (declare (ignore c))
+           (let ((val (%eval-escape-pop-if nil)))
+             (if (eq val :%eval-no-escape)
+                 (error "%eval-escape")
+                 val)))))
       ;; VALUES
       ((%eval-sym-eq op "VALUES")
        (let ((evaled (%eval-args args env)))
@@ -1046,14 +1104,57 @@
       ;; MULTIPLE-VALUE-LIST
       ((%eval-sym-eq op "MULTIPLE-VALUE-LIST")
        (multiple-value-list (%eval-in-env (car args) env)))
-      ;; TAGBODY (stub: just eval forms, ignore tags)
+      ;; TAGBODY — eval forms in order, jumping to tag on (GO TAG).
+      ;; Tags are atoms (symbols or integers) at the top level; forms
+      ;; are lists.  GO signals via the escape stack with tag = the
+      ;; go-target-symbol; TAGBODY catches and resumes from that label.
       ((%eval-sym-eq op "TAGBODY")
-       (let ((cur args))
-         (loop
-           (when (null cur) (return nil))
-           (when (consp (car cur))
-             (%eval-in-env (car cur) env))
-           (setq cur (cdr cur)))))
+       (let ((tags-and-forms args))
+         (let ((start tags-and-forms))
+           (loop
+             (handler-case
+               (let ((cur start))
+                 (loop
+                   (when (null cur) (return nil))
+                   (when (consp (car cur))
+                     (%eval-in-env (car cur) env))
+                   (setq cur (cdr cur)))
+                 ;; Fell off end — exit TAGBODY normally
+                 (return nil))
+               (t (c)
+                 (declare (ignore c))
+                 ;; Did the escape target one of OUR tags?  Pop only
+                 ;; if matched, resume from that label.
+                 (cond
+                   ((and *%eval-escape-stack*
+                         (let ((esc-tag (car (car *%eval-escape-stack*))))
+                           (and (atom esc-tag)
+                                (let ((sub tags-and-forms))
+                                  (loop
+                                    (when (null sub) (return nil))
+                                    (when (and (atom (car sub))
+                                               (eq (car sub) esc-tag))
+                                      (return t))
+                                    (setq sub (cdr sub)))))))
+                    ;; Pop the escape, resume scan from the tag.
+                    (let ((tag (car (car *%eval-escape-stack*))))
+                      (setq *%eval-escape-stack*
+                            (cdr *%eval-escape-stack*))
+                      ;; Advance start to point AFTER the tag.
+                      (let ((sub tags-and-forms))
+                        (loop
+                          (when (null sub) (return nil))
+                          (when (and (atom (car sub)) (eq (car sub) tag))
+                            (setq start (cdr sub))
+                            (return nil))
+                          (setq sub (cdr sub))))))
+                   (t
+                    ;; Not for us — re-signal
+                    (error "%eval-escape"))))))
+           nil)))
+      ;; GO — push tag onto escape stack and signal
+      ((%eval-sym-eq op "GO")
+       (%eval-escape-push (car args) nil))
       ;; THE (ignore type decl)
       ((%eval-sym-eq op "THE")
        (%eval-in-env (cadr args) env))

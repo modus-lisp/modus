@@ -3302,6 +3302,55 @@
   (setq *sym-name-table* (make-hash-table))
   (%init-sym-name-auto)
 
+  ;; Populate compile-time *macro-table* at runtime — content
+  ;; (DOLIST/DOTIMES/COND/AND/OR/CASE/etc.) is registered via
+  ;; mvm-define-macro at SBCL build host, NOT at runtime.  We have to:
+  ;; (1) initialize *macro-table* (defvar init-thunks don't run on bare
+  ;; metal — per CLAUDE.md) and (2) call register-mvm-bootstrap-macros
+  ;; whose body re-runs every mvm-define-macro setf.  Without this,
+  ;; runtime EVAL of (dolist ...) etc. can't macroexpand.
+  (setq *macro-table* (make-hash-table))
+  ;; mvm-define-macro lives in compiler.lisp (build-host only — not in
+  ;; *bridge-source*).  At runtime we directly puthash the expanders.
+  ;; The macros that matter for runtime EVAL of LOAD'd suite files:
+  ;; DOLIST, DOTIMES, COND, AND, OR, WHEN, UNLESS.  Each gets a runtime
+  ;; lambda that builds an expansion.
+  (puthash (compute-name-hash \"DOLIST\") *macro-table*
+    (lambda (form)
+      (let ((spec (cadr form))
+            (body (cddr form)))
+        (let ((var (car spec))
+              (list-form (cadr spec))
+              (tmp (gensym \"DL\")))
+          (list 'block nil
+            (list 'let (list (list tmp list-form) (list var nil))
+              (list 'loop
+                (list 'when (list 'null tmp)
+                  (list 'return (if (cddr spec) (caddr spec) nil)))
+                (list 'setq var (list 'car tmp))
+                (cons 'tagbody body)
+                (list 'setq tmp (list 'cdr tmp)))))))))
+  (puthash (compute-name-hash \"DOTIMES\") *macro-table*
+    (lambda (form)
+      (let ((spec (cadr form))
+            (body (cddr form)))
+        (let ((var (car spec))
+              (count-form (cadr spec))
+              (result (if (cddr spec) (caddr spec) nil))
+              (limit (gensym \"DT\")))
+          (list 'block nil
+            (list 'let (list (list limit count-form) (list var 0))
+              (list 'loop
+                (list 'when (list '>= var limit) (list 'return result))
+                (cons 'tagbody body)
+                (list 'setq var (list '+ var 1)))))))))
+  (puthash (compute-name-hash \"WHEN\") *macro-table*
+    (lambda (form)
+      (list 'if (cadr form) (cons 'progn (cddr form)) nil)))
+  (puthash (compute-name-hash \"UNLESS\") *macro-table*
+    (lambda (form)
+      (list 'if (cadr form) nil (cons 'progn (cddr form)))))
+
   ;; Build the compiler-macro name set so MACRO-FUNCTION reports T for
   ;; PUSH/POP/COND/etc. that the modus compiler implements directly.
   (init-compiler-macro-set)

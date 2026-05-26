@@ -1060,31 +1060,44 @@
            (emit-alu-rrr buf #'emit-sub-reg-reg vd va vb)))
 
         ((op= +op-mul+)
-         ;; (mul Vd Va Vb) — tagged: result = (Va * Vb) >> 1
-         ;; Since both inputs carry the <<1 fixnum tag, the product
-         ;; has a factor of 4 where we need 2, so SAR 1 corrects.
+         ;; (mul Vd Va Vb) — tagged fixnum multiplication.
          ;;
-         ;; x86-64 IMUL r64, r/m64 (two-operand form):
-         ;;   REX.W 0F AF /r
+         ;; Naïve "IMUL tagged_a tagged_b, then SAR 1" overflows when
+         ;; the raw product approaches 2^62 (fixnum max).  Reason:
+         ;;   tagged_a = a_raw << 1
+         ;;   tagged_b = b_raw << 1
+         ;;   IMUL → (a_raw * b_raw) << 2
+         ;; Fits in 64-bit signed only when (a_raw * b_raw) < 2^62 / 4
+         ;; = 2^60.  Past that the intermediate spills into bit 63 and
+         ;; the SAR 1 propagates a stale sign — silently corrupting any
+         ;; product whose raw value sits in [2^60, 2^62).  This was
+         ;; the bug behind (* 293429342220215299 10) returning negative
+         ;; junk (see %print-decimal-to-stream + %bignum-divmod-fixnum
+         ;; chains on bignum-lo values in [2^60, 2^62)).
+         ;;
+         ;; Fix: untag ONE operand FIRST (SAR 1 on a) so the intermediate
+         ;; is (a_raw * b_raw) << 1 = tagged result directly — no SAR 1
+         ;; needed afterward, and overflow happens only when the result
+         ;; itself can't fit in a tagged fixnum (= what we want).
+         ;;
+         ;; x86-64 IMUL r64, r/m64 (two-operand form):  REX.W 0F AF /r
          (let* ((vd (first operands))
                 (va (second operands))
                 (vb (third operands))
                 (d (dest-phys-or-scratch vd)))
-           ;; Load Va into d
+           ;; Load Va into d and untag.
            (emit-load-vreg buf va d)
-           ;; IMUL d, Vb-phys
+           (emit-sar-reg-imm buf d 1)
+           ;; IMUL d, Vb (tagged) → tagged result directly.
            (let ((pb (vreg-phys vb)))
              (if pb
                  (emit-imul-reg-reg buf d pb)
                  (progn
-                   ;; Vb spilled — load into temp
                    (let ((tmp (if (eq d 'rax) 'r13 'rax)))
                      (emit-push buf tmp)
                      (emit-load-vreg buf vb tmp)
                      (emit-imul-reg-reg buf d tmp)
                      (emit-pop buf tmp)))))
-           ;; Fix tagging: SAR d, 1
-           (emit-sar-reg-imm buf d 1)
            (maybe-store-scratch buf vd)))
 
         ((op= +op-mul26lo+)

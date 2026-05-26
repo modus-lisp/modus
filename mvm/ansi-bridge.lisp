@@ -187,6 +187,48 @@
   "T if ARR's total size is even.  Used in array tests."
   (evenp (array-total-size arr)))
 
+(defun collect-properties (plist prop)
+  "Collect all values for PROP in PLIST.  ansi-aux ll. 357.
+   Iteration uses cddr stepping; we hand-step to avoid LOOP BY."
+  (let ((acc nil) (e plist))
+    (loop (when (null e) (return (nreverse acc)))
+          (when (eql (car e) prop)
+            (setq acc (cons (cadr e) acc)))
+          (setq e (cddr e)))))
+
+(defun to-function (fn)
+  "Coerce designator to function: symbol → symbol-function; lambda → eval-it."
+  (if (symbolp fn) (symbol-function fn) fn))
+
+(defun package-designator-p (x)
+  "T if X could be a package designator (need not actually exist)."
+  (or (packagep x)
+      (handler-case (progn (string x) t) (error () nil))))
+
+(defun equalpt-or-report (x y)
+  "EQUALPT, but on mismatch return (list x y) so callers can dump the
+   actual values into the failure message."
+  (or (equalpt x y) (list x y)))
+
+(defun is-builtin-class (type)
+  "T if TYPE designates a built-in CLOS class.  Used in classes tests."
+  (when (symbolp type) (setq type (find-class type nil)))
+  (typep type 'built-in-class))
+
+(defun typef (type)
+  "Returns a closure that tests typep against TYPE.  ansi-aux defines
+   it via macro magic ('require closure implementation') — function
+   variant is sufficient for test call sites."
+  (lambda (x) (typep x type)))
+
+(defun trim-list (list n)
+  "Take the first N elements of LIST; if longer, append a '... and N
+   more omitted' tail."
+  (let ((len (length list)))
+    (if (<= len n) list
+        (append (subseq list 0 n)
+                (list (format nil "And ~A more omitted." (- len n)))))))
+
 (defun check-predicate (fn)
   nil)
 

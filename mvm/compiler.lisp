@@ -866,20 +866,25 @@
   ;; MAX → IF + comparison
   (mvm-define-macro "MAX"
     (lambda (form)
-      (if (null (cddr form))
-          (cadr form)
-          (let ((tmp (gensym "MAX")))
-            `(let ((,tmp ,(cadr form)))
-               (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form)))))))
+      (cond
+        ((null (cdr form))
+         ;; (max) — CLHS requires at least one arg, signal program-error.
+         '(error "MAX requires at least one argument"))
+        ((null (cddr form)) (cadr form))
+        (t (let ((tmp (gensym "MAX")))
+             `(let ((,tmp ,(cadr form)))
+                (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form))))))))
 
   ;; MIN → IF + comparison
   (mvm-define-macro "MIN"
     (lambda (form)
-      (if (null (cddr form))
-          (cadr form)
-          (let ((tmp (gensym "MIN")))
-            `(let ((,tmp ,(cadr form)))
-               (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form)))))))
+      (cond
+        ((null (cdr form))
+         '(error "MIN requires at least one argument"))
+        ((null (cddr form)) (cadr form))
+        (t (let ((tmp (gensym "MIN")))
+             `(let ((,tmp ,(cadr form)))
+                (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form))))))))
 
   ;; ABS → IF + negate
   (mvm-define-macro "ABS"
@@ -2831,6 +2836,10 @@
        (let ((arr (cadr form))
              (indices (cddr form)))
          (cond
+           ;; No array operand: signal (ANSI test 19837).  CLHS lambda
+           ;; list is (array &rest subscripts) so 0 args is invalid.
+           ((null (cdr form))
+            (compile-form `(error "ARRAY-IN-BOUNDS-P requires an array argument") env dest))
            ((null indices) (compile-t dest))
            ((= (length indices) 1)
             (compile-form `(let ((%aib-arr ,arr) (%aib-idx ,(car indices)))
@@ -6126,9 +6135,15 @@
   "Compile (- args...).  Unary `(- x)` lowers to `(- 0 x)` so bignum/ratio/
    float operands take the GENERIC-SUBTRACT path instead of the raw :neg
    IR that would corrupt non-fixnum pointers.  Pairwise via emit-arith-pair
-   with GENERIC-SUBTRACT slow path."
+   with GENERIC-SUBTRACT slow path.
+
+   `(-)` with zero arguments signals a program-error per CLHS 12.2 (the
+   `-` entry's lambda list is `(arg1 &rest more)`; 0 args is invalid).
+   Previously returned 0 silently, which made minus.lsp test 13974 fail
+   because the test EXPECTS the (error ...) branch to fire."
   (cond
-    ((null args) (compile-integer 0 dest))
+    ((null args)
+     (compile-form `(error "- requires at least one argument") env dest))
     ((null (cdr args))
      ;; Rewrite to binary (- 0 x) so the tag-checked slow path handles
      ;; bignum / ratio / IEEE-float arguments correctly.
@@ -7946,6 +7961,10 @@
          (kwargs (cddr form))
          (multi (%quoted-multidim-list-p dim-form)))
     (cond
+      ;; (make-array) — CLHS lambda list is (dimensions &rest …); 0
+      ;; args is invalid.  ANSI test 20400.
+      ((null (cdr form))
+       (compile-form `(error "MAKE-ARRAY requires a dimensions argument") env dest))
       ;; Multi-dim or 0-dim quoted list, OR any kwargs present: defer
       ;; to the runtime defun.
       ((or multi kwargs)

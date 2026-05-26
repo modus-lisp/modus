@@ -5536,6 +5536,20 @@
           (into-conflict
            `(error "LOOP: variable ~A is already bound by WITH and INTO"
                    ',into-conflict))
+          ;; CLHS 6.1.1.7: an ANONYMOUS value-aggregator (COLLECT / SUM /
+          ;; COUNT / etc. WITHOUT an INTO clause) supplies the LOOP's
+          ;; return value, so combining it with ALWAYS / NEVER / THEREIS
+          ;; (which also want the return value) is a program-error.
+          ;; INTO'd aggregators store into a named var and don't conflict —
+          ;; ALWAYS's value becomes the LOOP's return naturally.  Tests
+          ;; loop12 21108-21113 exercise the no-INTO case.
+          ((and (or has-always has-thereis)
+                (some (lambda (a)
+                        (and (member (car a) '(:collect :collect-when :sum :count
+                                               :append :nconc :maximize :minimize))
+                             (not (%loop-acc-into-var a))))
+                      accs))
+           `(error "LOOP: cannot mix anonymous COLLECT/SUM/COUNT/etc. with ALWAYS/NEVER/THEREIS"))
           ;; NAMED LOOP — use %named-loop so the inner simple-loop's
           ;; implicit block-nil is suppressed.  Per CLHS 6.1.2.2 the
           ;; named LOOP's implicit block IS the named block, so RETURN

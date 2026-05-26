@@ -698,11 +698,12 @@
 
 (defun assert (test-form &rest ignored)
   "ANSI ASSERT returns NIL.  The fully-restartable error path on
-   failure isn't implemented, so we degrade to a silent NIL — same
-   compromise the test files were already relying on (1000+ ASSERT
-   call sites in ANSI sources use it for in-test invariant checking
-   and ignore the return).  ANSI assert.lsp tests 26266/26267 require
-   NIL on success specifically; the previous T return failed them."
+   failure isn't implemented, so we degrade to a silent NIL — the
+   1000+ ASSERT call sites in ANSI sources use it for in-test
+   invariant checking and ignore the return.  Tried real (error)
+   on NIL once; net regression -31 because many test-time invariants
+   that happen to hit a typep edge case were previously masked.
+   Keep silent until typep gaps are closed."
   (declare (ignore ignored test-form))
   nil)
 (defun equalp (a b) (equalp-impl a b))

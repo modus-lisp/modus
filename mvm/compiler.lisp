@@ -105,6 +105,19 @@
 (defvar *current-function-name* nil
   "Name of the function currently being compiled")
 
+;;; Set by compile-form's %NAMED-LOOP dispatch so the inner SIMPLE-LOOP
+;;; doesn't establish an implicit (block nil …).  Per CLHS 6.1.2.2 a
+;;; NAMED LOOP's implicit block IS the named block — RETURN in the body
+;;; should fall through to whatever outer block-nil the caller has, NOT
+;;; be intercepted by the inner simple-loop.
+;;;
+;;; Declared HERE (before compile-form) so SBCL treats subsequent `(let
+;;; ((*suppress-loop-block-nil* t)) …)` as a true dynamic binding —
+;;; with the defvar farther down, SBCL compiled compile-form before
+;;; seeing the special declaration, treating the let as lexical, and
+;;; the binding silently never reached compile-loop.
+(defvar *suppress-loop-block-nil* nil)
+
 (defvar *macro-table* (make-hash-table :test 'eql)
   "Hash table of macro-name (hash integer) -> expander function")
 
@@ -2221,6 +2234,18 @@
       ((= op-name 89559098115627243)     (compile-when (cdr form) env dest))
       ((= op-name 123360604517422061)   (compile-unless (cdr form) env dest))
       ((= op-name 502185558679326091)     (compile-loop (cdr form) env dest))
+      ;; %NAMED-LOOP — expand-cl-loop wraps NAMED LOOPs as
+      ;; (%NAMED-LOOP NAME BODY).  Establishes (block NAME …) AND binds
+      ;; *suppress-loop-block-nil* = t for the body so the inner simple-
+      ;; loop doesn't establish an implicit (block nil …) of its own —
+      ;; per CLHS 6.1.2.2, a NAMED LOOP's implicit block IS the named
+      ;; block, not nil.  Internal `(return nil)` from test-form exits
+      ;; still works via *loop-exit-label* fallback in compile-return.
+      ((= op-name 873406207708231128)
+       (let ((nl-name (cadr form))
+             (nl-body (cddr form)))
+         (let ((*suppress-loop-block-nil* t))
+           (compile-block nl-name nl-body env dest))))
       ((= op-name 732905726022713733)   (compile-return (cadr form) env dest))
       ((= op-name 1062346144843286510)    (compile-block (cadr form) (cddr form) env dest))
       ((= op-name 54884900767456285)  (compile-tagbody (cdr form) env dest))
@@ -4177,12 +4202,19 @@
                  534228586620302156 755721607140894312 851431579352036592))))
 
 
+;;; (defvar *suppress-loop-block-nil*) — declared near top of file
+;;; before compile-form so SBCL treats `(let ((*suppress-loop-block-nil*
+;;; t)) …)` as a dynamic binding.  Used here by compile-loop's
+;;; simple-loop branch to skip the implicit (nil exit dest) push when a
+;;; NAMED LOOP is wrapping us.
+
 (defun compile-loop (body env dest)
   "Compile (loop forms...) - either simple infinite loop or CL-style loop.
-   Per CLHS, LOOP establishes an implicit BLOCK NIL; (return x) within
-   the body returns from that BLOCK NIL, not from any outer block of
-   the same name.  We push a fresh (NIL exit dest) onto *block-labels*
-   so compile-return finds the LOOP's block before any outer match."
+   Per CLHS, an unnamed LOOP establishes an implicit BLOCK NIL; we push
+   a fresh (NIL exit dest) onto *block-labels* so compile-return finds
+   the LOOP's block before any outer match.  Suppressed when the LOOP is
+   NAMED — in that case the named block is the implicit block, RETURN
+   targets the outer nil if present."
   (if (and (consp body) (cl-loop-keyword-p (car body)))
       ;; CL-style loop: expand to basic forms, then compile
       (compile-form (expand-cl-loop body) env dest)
@@ -4190,8 +4222,10 @@
       (let* ((loop-label (make-compiler-label))
              (exit-label (make-compiler-label))
              (*loop-exit-label* exit-label)
-             (*block-labels* (cons (list nil exit-label dest)
-                                   *block-labels*)))
+             (*block-labels*
+               (if *suppress-loop-block-nil*
+                   *block-labels*
+                   (cons (list nil exit-label dest) *block-labels*))))
         ;; Loop entry
         (emit-ir-label loop-label)
         ;; Compile loop body
@@ -5482,7 +5516,12 @@
                            (t (or (rec (car f)) (rec (cdr f)))))))
                 (some #'rec finally))))
         (cond
-          (block-name `(block ,block-name ,with-bindings-form))
+          ;; NAMED LOOP — use %named-loop so the inner simple-loop's
+          ;; implicit block-nil is suppressed.  Per CLHS 6.1.2.2 the
+          ;; named LOOP's implicit block IS the named block, so RETURN
+          ;; inside body falls through to whatever outer nil block (if
+          ;; any) the caller established.
+          (block-name `(%named-loop ,block-name ,with-bindings-form))
           (finally-has-return `(block nil ,with-bindings-form))
           (t with-bindings-form))))))
 

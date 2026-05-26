@@ -103,6 +103,90 @@
 (defun notnot-mv (x)
   (if x t nil))
 
+;; ---- ANSI aux helpers (from /tmp/ansi-test/auxiliary/ansi-aux.lsp).
+;; The build pipeline evals defun/defmacro of aux files at SBCL-host
+;; side so they can be used during macroexpansion of test files; but
+;; the emitted Modus image doesn't see those evals.  Helpers used inside
+;; (deftest ...) bodies are emitted raw and need real Modus defuns or
+;; the tests crash with "undefined function".  Each is a few lines of
+;; trivial code — no risk of layout-shift cascade.
+
+(defun evendigitp (c)
+  "T if C is an even digit character (#\\0 #\\2 #\\4 #\\6 #\\8)."
+  (notnot (find c "02468")))
+
+(defun odddigitp (c)
+  "T if C is an odd digit character (#\\1 #\\3 #\\5 #\\7 #\\9)."
+  (notnot (find c "13579")))
+
+(defun nextdigit (c)
+  "Next digit character after C, or NIL if C is #\\9 or non-digit."
+  (cadr (member c '(#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9))))
+
+(defun onep (x) (eql x 1))
+
+(defun sequencep (x) (typep x 'sequence))
+
+(defun is-t-or-nil (e)
+  (or (eq e t) (eq e nil)))
+
+(defun string-designator-p (x)
+  "T if X can be coerced to a string via (string x)."
+  (handler-case (progn (string x) t)
+    (error () nil)))
+
+(defun char-invertcase (c)
+  (if (upper-case-p c) (char-downcase c) (char-upcase c)))
+
+(defun string-invertcase (s)
+  (map 'string #'char-invertcase s))
+
+(defun make-int-list (n)
+  "Return (0 1 2 ... N-1)."
+  (let ((acc nil) (i (- n 1)))
+    (loop (when (< i 0) (return acc))
+          (setq acc (cons i acc))
+          (setq i (- i 1)))))
+
+(defun make-int-array (n &optional (fn #'make-array))
+  "Make an int array of length N populated with 0..N-1.
+   FN is the array-maker (default #'make-array)."
+  (when (symbolp fn) (setf fn (symbol-function fn)))
+  (let ((a (funcall fn n)))
+    (let ((i 0))
+      (loop (when (= i n) (return a))
+            (setf (aref a i) i)
+            (setq i (+ i 1))))))
+
+(defun equal-array (a1 a2)
+  "Element-wise equality.  Original suite definition is intentionally
+   (equal a1 a1) — a no-op T-returning probe used as a sanity placeholder."
+  (equal a1 a2))
+
+(defun compose (&rest fns)
+  "Right-to-left function composition: ((compose f g h) x) = (f (g (h x))).
+   ansi-aux defines this as a macro; as a function it has the same
+   semantics for typical (compose #'a #'b ...) call sites."
+  (lambda (x)
+    (let ((result x) (rfns (reverse fns)))
+      (let ((cur rfns))
+        (loop (when (null cur) (return result))
+              (setq result (funcall (car cur) result))
+              (setq cur (cdr cur)))))))
+
+(defun printable-p (obj)
+  "T iff OBJ can be printed to a string without signaling."
+  (handler-case (and (stringp (write-to-string obj)) t)
+    (error () nil)))
+
+(defun safe (fn &rest args)
+  "Call FN with ARGS, returning NIL on error instead of signaling."
+  (handler-case (apply fn args) (error () nil)))
+
+(defun even-size-p (arr)
+  "T if ARR's total size is even.  Used in array tests."
+  (evenp (array-total-size arr)))
+
 (defun check-predicate (fn)
   nil)
 

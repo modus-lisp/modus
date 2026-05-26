@@ -3379,6 +3379,26 @@
             (let ((r (eval '(foo-runtime-defun 41))))
               (deftest 56515 r 42)))
         (t (c) (%record-test-fail-or-emit 56515)))
+      ;; 56516 — runtime macroexpand of DOLIST
+      (handler-case
+          (let ((mf (macro-function 'dolist)))
+            (deftest 56516 (not (null mf)) t))
+        (t (c) (%record-test-fail-or-emit 56516)))
+      ;; 56517 — eval (dolist ...) wrapped in (let count 0)
+      (handler-case
+          (let ((r (eval '(let ((count 0))
+                            (dolist (x '(a b c)) (setq count (+ count 1)))
+                            count))))
+            (write-char-serial 10)
+            (write-string-serial "EVAL-R:")
+            (write-object r)
+            (write-char-serial 10)
+            (deftest 56517 r 3))
+        (t (c)
+          (write-char-serial 10)
+          (write-string-serial "EVAL-ERR")
+          (write-char-serial 10)
+          (%record-test-fail-or-emit 56517)))
       ;; 56512 — atom.1 form runs directly
       (handler-case
           (let ((r (eval '(loop for x in *universe*

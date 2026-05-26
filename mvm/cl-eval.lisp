@@ -217,16 +217,29 @@
 
 (defun macro-function (sym &rest env)
   "Return the macro expander function for SYM, or nil.
-   Falls back to a built-in compiler-macro check so MACRO-FUNCTION
-   reports a non-NIL value for PUSH/POP/COND/etc. that the modus
-   compiler implements directly (rather than via runtime expander).
-   For native MVM symbols (#x50, hash-only), keyed by the SYMBOL object
-   itself (since symbol-name returns \"\" for hash-only syms).  For
-   string-named lookups, also try the compiler-macro fallback."
+   1. *macro-function-table* (runtime-registered defmacros)
+   2. *macro-table* (compile-time mvm-define-macros: DOLIST/DO/COND/
+      WHEN/UNLESS/AND/OR/PUSH/POP/CASE/ECASE/etc.) — keyed by
+      compute-name-hash of the symbol's name.  Without this lookup,
+      runtime EVAL of forms containing DOLIST etc. crashes because
+      they expand at COMPILE time only.
+   3. %compiler-macro-p T-marker fallback for syms Modus's compiler
+      implements directly (PUSH/POP/COND for the COMPILED path)."
   (let ((key (%macro-sym-key sym)))
     (cond
       ((null key) nil)
       ((and *macro-function-table* (gethash key *macro-function-table*)))
+      ;; Consult compile-time macro table (keyed by hash).  Returns the
+      ;; expander lambda directly — macroexpand-1 below funcalls it
+      ;; with (form nil) to expand.
+      ((and (boundp '*macro-table*) *macro-table*
+            (let ((h (cond ((stringp key) (compute-name-hash key))
+                           ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
+                           ((and (not (consp key)) (not (fixnump key))
+                                 (not (characterp key)))
+                            (aref key 0))
+                           (t 0))))
+              (and (> h 0) (gethash h *macro-table*)))))
       ;; Compiler-macro fallback only fires on name-string lookups —
       ;; %compiler-macro-p needs the string form (PUSH/POP/...).
       ((and (stringp key) (%compiler-macro-p key)) t)
@@ -254,8 +267,10 @@
    For an %interp-closure macro fn (the shape DEFMACRO produces via
    eval), bind the user's params to (cdr form) and evaluate body — i.e.
    the user wrote `(defmacro NAME (p1 p2) body)` and the macro sees its
-   arguments as (p1 p2), not the whole form.  For any other macro fn
-   (compiled real CL fn that wants (form env)), call with (form nil)."
+   arguments as (p1 p2), not the whole form.  For mvm-define-macro
+   compiled expanders, call with (form) — single arg, since they're
+   defined as (lambda (form) ...).  For full-CL macro fns, call with
+   (form nil)."
   (cond
     ;; Recognise CL syms AND native MVM #x50 syms as macro heads.
     ((and (consp form)
@@ -264,11 +279,16 @@
      (let ((mf (macro-function (car form))))
        (cond
          ((null mf) (values form nil))
+         ((eq mf t) (values form nil))   ; compiler-macro marker
          ((%interp-closure-p mf)
           (let ((expanded (%call-interp-closure mf (cdr form))))
             (values expanded t)))
          (t
-          (let ((expanded (funcall mf form nil)))
+          ;; Compiled lambda from mvm-define-macro: (lambda (form) ...).
+          ;; Try single-arg first; fall back to (form nil) for CL macros
+          ;; that want both form and env.
+          (let ((expanded (handler-case (funcall mf form)
+                            (t (c) (funcall mf form nil)))))
             (values expanded t))))))
     (t (values form nil))))
 
@@ -1127,9 +1147,15 @@
       ;; expects when it eval's a form that's only a compiler macro.
       ((and (or (%cl-sym-p op) (%native-mvm-sym-p op))
             (let ((mf (macro-function op)))
-              (and mf (%interp-closure-p mf))))
+              (and mf (not (eq mf t)))))
        (let* ((mf (macro-function op))
-              (expanded (%call-interp-closure mf args)))
+              (expanded (cond
+                          ((%interp-closure-p mf)
+                           (%call-interp-closure mf args))
+                          (t
+                           ;; mvm-define-macro lambda — (lambda (form) ...)
+                           (handler-case (funcall mf form)
+                             (t (c) (funcall mf form nil)))))))
          (%eval-in-env expanded env)))
       ;; Function call: CL symbol
       ((%cl-sym-p op)

@@ -5117,6 +5117,20 @@
          (initially (loop-state-initially-forms state))
          (with-binds (loop-state-with-bindings state))
          (block-name (loop-state-block-name state))
+         ;; CLHS 6.1.1.7: a name introduced by WITH is in the same scope
+         ;; as iteration vars and INTO accumulators — duplicating it via
+         ;; (loop WITH foo = … … INTO foo) is a PROGRAM-ERROR.  Detect
+         ;; the overlap; the generated code then returns a (error …) form
+         ;; at the very end so HANDLER-CASE in tests like loop10
+         ;; 20959/20960/20982/20983/21002 catches it at runtime.
+         (with-names (mapcar #'car with-binds))
+         (into-conflict
+          (let ((conflict nil))
+            (dolist (a accs)
+              (let ((iv (%loop-acc-into-var a)))
+                (when (and iv (member iv with-names))
+                  (setq conflict iv))))
+            conflict))
          ;; Conditional INTO accumulators: list of (var . kind).  Each is
          ;; bound here and finalised; body emission already happened in
          ;; parse-cl-loop via %loop-parse-cond-clauses.
@@ -5516,6 +5530,12 @@
                            (t (or (rec (car f)) (rec (cdr f)))))))
                 (some #'rec finally))))
         (cond
+          ;; WITH name collides with INTO accumulator name — replace the
+          ;; whole expansion with a runtime (error …) so HANDLER-CASE
+          ;; catches the program-error CLHS 6.1.1.7 requires.
+          (into-conflict
+           `(error "LOOP: variable ~A is already bound by WITH and INTO"
+                   ',into-conflict))
           ;; NAMED LOOP — use %named-loop so the inner simple-loop's
           ;; implicit block-nil is suppressed.  Per CLHS 6.1.2.2 the
           ;; named LOOP's implicit block IS the named block, so RETURN

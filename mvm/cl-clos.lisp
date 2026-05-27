@@ -251,6 +251,111 @@
                 new-reg)))
   class-name)
 
+;;; ============================================================
+;;; :allocation :class — per-class shared slot storage
+;;; ============================================================
+;;; *clos-class-slots* maps class-name → list of slot names with
+;;;   :allocation :class.  Walked through the CPL when checking
+;;;   whether a slot reference should hit class-shared storage.
+;;; *clos-class-slot-values* maps (class-name . slot-name) → value.
+;;;   For a class-allocated slot, the storage lives in the FIRST
+;;;   class in the CPL that declares it (the "owning" class).
+;;;
+;;; CLHS 7.5.2: instances of subclasses share the inherited
+;;; class-allocated slot.  We find the owning class via CPL walk
+;;; (first ancestor that declared :allocation :class for the slot).
+(defvar *clos-class-slots* nil)
+(defvar *clos-class-slot-values* nil)
+
+(defun %register-clos-class-slots (class-name class-slot-names)
+  "Register CLASS-SLOT-NAMES as the :allocation :class slots of CLASS-NAME."
+  (let ((new-reg nil) (cur *clos-class-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (not (eq (car (car cur)) class-name))
+        (setq new-reg (cons (car cur) new-reg)))
+      (setq cur (cdr cur)))
+    (setq *clos-class-slots*
+          (cons (cons class-name class-slot-names) new-reg)))
+  class-name)
+
+(defun %class-slots-for (class-name)
+  "Return list of class-allocated slot names for CLASS-NAME (no CPL walk)."
+  (let ((cur *clos-class-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %slot-class-owner (class-name slot-name)
+  "Return the class-name in CLASS-NAME's CPL that declared SLOT-NAME
+   as :allocation :class — or NIL if no ancestor declares it as
+   class-allocated.  Used so subclass instances share the inherited
+   class slot's storage with their ancestor."
+  ;; First check direct.
+  (when (member slot-name (%class-slots-for class-name) :test #'eq)
+    (return-from %slot-class-owner class-name))
+  ;; Walk CPL.
+  (let ((cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %slot-class-owner nil))
+    (let ((cpl (aref cls 4)))
+      (let ((cur cpl))
+        (loop
+          (when (null cur) (return nil))
+          (let ((cname (car cur)))
+            (when (member slot-name (%class-slots-for cname) :test #'eq)
+              (return cname)))
+          (setq cur (cdr cur)))))))
+
+(defun %class-slot-get (class-name slot-name default)
+  "Return the class-shared value for SLOT-NAME on CLASS-NAME (resolves
+   to the owning class in the CPL).  Returns DEFAULT if unset."
+  (let ((owner (%slot-class-owner class-name slot-name)))
+    (when owner
+      (let ((cur *clos-class-slot-values*))
+        (loop
+          (when (null cur) (return default))
+          (let ((entry (car cur)))
+            (when (and (eq (car (car entry)) owner)
+                       (eq (cdr (car entry)) slot-name))
+              (return (cdr entry))))
+          (setq cur (cdr cur)))))))
+
+(defun %class-slot-set (class-name slot-name value)
+  "Set the class-shared value for SLOT-NAME on CLASS-NAME (writes
+   to the owning class in the CPL)."
+  (let ((owner (%slot-class-owner class-name slot-name)))
+    (when owner
+      ;; Update existing entry or prepend new one.
+      (let ((found nil) (cur *clos-class-slot-values*))
+        (loop
+          (when (null cur) (return nil))
+          (let ((entry (car cur)))
+            (when (and (eq (car (car entry)) owner)
+                       (eq (cdr (car entry)) slot-name))
+              (setf (cdr entry) value)
+              (setq found t)
+              (return nil)))
+          (setq cur (cdr cur)))
+        (unless found
+          (setq *clos-class-slot-values*
+                (cons (cons (cons owner slot-name) value)
+                      *clos-class-slot-values*))))
+      value)))
+
+(defun %class-slot-bound-p (class-name slot-name)
+  "True iff SLOT-NAME on CLASS-NAME (or an ancestor) has been set."
+  (let ((owner (%slot-class-owner class-name slot-name)))
+    (when owner
+      (let ((cur *clos-class-slot-values*))
+        (loop
+          (when (null cur) (return nil))
+          (let ((entry (car cur)))
+            (when (and (eq (car (car entry)) owner)
+                       (eq (cdr (car entry)) slot-name))
+              (return t)))
+          (setq cur (cdr cur)))))))
+
 (defun %clos-slot-info-for (class-name)
   "Return (initarg-map . initform-map) for CLASS-NAME, or nil."
   (let ((cur *clos-slot-info*))
@@ -391,11 +496,22 @@
 (defun %slot-value (obj slot-name)
   "Read slot SLOT-NAME from CLOS instance OBJ.
    Calls slot-unbound if the slot has no value, slot-missing when
-   SLOT-NAME doesn't name a slot of OBJ's class."
+   SLOT-NAME doesn't name a slot of OBJ's class.
+
+   :allocation :class slots route to per-class shared storage via
+   %slot-class-owner / %class-slot-get."
   (when (or (null obj) (not (%clos-instance-p obj)))
     (return-from %slot-value nil))
-  (let ((cls (%find-clos-class (aref obj 1))))
+  (let* ((class-name (aref obj 1))
+         (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-value nil))
+    ;; Class-allocated slot?  Walk CPL via %slot-class-owner.
+    (when (%slot-class-owner class-name slot-name)
+      (if (%class-slot-bound-p class-name slot-name)
+          (return-from %slot-value
+            (%class-slot-get class-name slot-name nil))
+          (return-from %slot-value
+            (%dispatch-slot-unbound cls obj slot-name))))
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx)
         (return-from %slot-value
@@ -410,11 +526,18 @@
 
 (defun set-slot-value (obj slot-name new-val)
   "Set slot SLOT-NAME in CLOS instance OBJ to NEW-VAL. Returns NEW-VAL.
-   Calls slot-missing when SLOT-NAME doesn't name a slot."
+   Calls slot-missing when SLOT-NAME doesn't name a slot.
+
+   :allocation :class slots route to per-class shared storage."
   (when (or (null obj) (not (%clos-instance-p obj)))
     (return-from set-slot-value new-val))
-  (let ((cls (%find-clos-class (aref obj 1))))
+  (let* ((class-name (aref obj 1))
+         (cls (%find-clos-class class-name)))
     (when (null cls) (return-from set-slot-value new-val))
+    ;; Class-allocated slot?
+    (when (%slot-class-owner class-name slot-name)
+      (%class-slot-set class-name slot-name new-val)
+      (return-from set-slot-value new-val))
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx)
         (%dispatch-slot-missing cls obj slot-name 'setf new-val t)
@@ -425,8 +548,12 @@
 (defun %slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound.  Calls slot-missing for
    nonexistent slots; whatever it returns is taken as the boundp answer."
-  (let ((cls (%find-clos-class (aref obj 1))))
+  (let* ((class-name (aref obj 1))
+         (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-boundp nil))
+    ;; Class-allocated slot?
+    (when (%slot-class-owner class-name slot-name)
+      (return-from %slot-boundp (%class-slot-bound-p class-name slot-name)))
     (let ((idx (%clos-slot-index cls slot-name)))
       (when (null idx)
         (return-from %slot-boundp

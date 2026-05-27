@@ -2503,8 +2503,13 @@
                    (covered (cond ((eq slot-names t) t)
                                   ((null slot-names) nil)
                                   (t (member nm slot-names :test #'eq))))
-                   (cur-val (aref instance (+ 2 idx)))
-                   (was-unbound (and (fixnump cur-val) (= cur-val -999))))
+                   ;; Class-allocated slot? Check via per-class storage.
+                   (class-slot (%slot-class-owner class-name nm))
+                   (was-unbound
+                    (if class-slot
+                        (not (%class-slot-bound-p class-name nm))
+                        (let ((cur-val (aref instance (+ 2 idx))))
+                          (and (fixnump cur-val) (= cur-val -999))))))
               (when (and (null already-set) covered was-unbound)
                 (let ((thunk (%clos-initform-thunk class-name nm)))
                   (when thunk

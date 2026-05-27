@@ -1842,18 +1842,24 @@
                    (setq defect-msg "duplicate :default-initargs key"))
                  (push k seen))
                (setq cur (cddr cur))))))
+       ;; class-slots: per-slot :allocation tracking (closed over by the emit form below).
+       (let ((class-slots nil))
        ;; Process each slot spec
        (dolist (slot-spec raw-slots)
          (let* ((sname (if (consp slot-spec) (car slot-spec) slot-spec))
                 (opts (if (consp slot-spec) (cdr slot-spec) nil)))
            (push sname slot-names)
-           ;; Extract :reader, :writer, :accessor, :initarg, :initform from opts
+           ;; Extract :reader, :writer, :accessor, :initarg, :initform, :allocation
            (let ((cur opts))
              (loop
                (when (null cur) (return))
                (let ((key (car cur))
                      (val (cadr cur)))
                  (cond
+                   ((eq key :allocation)
+                    ;; :allocation :class — slot is class-shared.  :instance is default.
+                    (when (eq val :class)
+                      (push sname class-slots)))
                    ((eq key :reader)
                     (push `(defun ,val (obj) (slot-value obj ',sname)) extra-defuns)
                     ;; Register so (typep #',val 'generic-function) → T
@@ -1916,7 +1922,12 @@
                 (%register-clos-slot-info ',class-name
                                           (list ,@initarg-pairs)
                                           (list ,@initform-pairs))
-                ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns)))))))
+                ;; Register :allocation :class slot names so slot-value /
+                ;; set-slot-value can route them to per-class storage.
+                ,@(when class-slots
+                    `((%register-clos-class-slots ',class-name
+                                                  ',(nreverse class-slots))))
+                ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))))
 
     ;; (defgeneric name lambda-list &rest options)
     ;; → (%defgeneric 'name 'lambda-list combination)

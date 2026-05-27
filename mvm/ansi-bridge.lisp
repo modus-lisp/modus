@@ -2515,7 +2515,10 @@
 
 (defun shared-initialize (&rest %sh-args)
   "SHARED-INITIALIZE generic function entry.  Falls through to
-   %shared-initialize-default unless user methods were defined."
+   %shared-initialize-default unless user methods were defined.
+   CLHS: requires at least 2 args (instance + slot-names)."
+  (when (or (null %sh-args) (null (cdr %sh-args)))
+    (%signal-program-error))
   (%dispatch-shared-init %sh-args))
 
 (defun %change-class-default (instance new-class &rest initargs)

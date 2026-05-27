@@ -4199,7 +4199,9 @@
                  ;; UPTO (TO synonym), MAXIMIZING/MINIMIZING (synonyms)
                  819586319614622873 220277010584993844 1092018583149917146
                  ;; NAMED, ELSE, END (for LOOP.13/14 conditional execution)
-                 534228586620302156 755721607140894312 851431579352036592))))
+                 534228586620302156 755721607140894312 851431579352036592
+                 ;; BEING (hash-keys / hash-values / symbols / pkg-* iteration)
+                 31436867775890672))))
 
 
 ;;; (defvar *suppress-loop-block-nil*) — declared near top of file
@@ -4621,6 +4623,15 @@
              (when (and (symbolp (car rest))
                         (= (normalize-name (car rest)) 729509721274984859))
                (setf rest (cddr rest)))
+             ;; Skip BARE type symbol (FIXNUM, T, FLOAT, STRING, ...) —
+             ;; CLHS bare-type shorthand for OF-TYPE.  Only when the
+             ;; FOLLOWING token IS a loop keyword (so we don't eat an
+             ;; iter form like `IN (foo)`).
+             (when (and rest (cdr rest) (symbolp (car rest))
+                        (not (cl-loop-keyword-p (car rest)))
+                        (symbolp (cadr rest))
+                        (cl-loop-keyword-p (cadr rest)))
+               (setf rest (cdr rest)))
              (when (and var (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
                (cond

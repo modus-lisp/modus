@@ -8877,7 +8877,8 @@
         (keys nil)          ; list of (name default supplied-p-or-nil)
         (auxes nil)
         (has-rest nil)
-        (has-key nil))
+        (has-key nil)
+        (allow-other-keys nil))
     ;; Parse parameter list
     (dolist (p params)
       (cond
@@ -8886,7 +8887,7 @@
         ((eq p '&rest)     (setq mode :rest) (setq has-rest t))
         ((eq p '&body)     (setq mode :rest) (setq has-rest t))
         ((eq p '&aux)      (setq mode :aux))
-        ((eq p '&allow-other-keys) nil) ; skip
+        ((eq p '&allow-other-keys) (setq allow-other-keys t))  ; track
         ((eq mode :required) (push p required))
         ((eq mode :optional)
          (if (consp p)
@@ -8956,10 +8957,30 @@
              (when sup
                (push (list sup found-var) bindings))))
          (setf bindings (nreverse bindings))
-         (let ((new-body
-                 (if auxes
-                     `((let* (,@bindings) (let* ,auxes ,@body)))
-                     `((let* (,@bindings) ,@body)))))
+         ;; If the lambda list omits &allow-other-keys, validate the
+         ;; caller's plist against the declared keys.  CLHS requires
+         ;; program-error on unknown keywords unless the plist itself
+         ;; contains :ALLOW-OTHER-KEYS T (handled by %validate-kw-list).
+         (let* ((declared-kws
+                  (let ((acc nil))
+                    (dolist (k keys (nreverse acc))
+                      (let* ((spec (car k))
+                             (kw (if (consp spec)
+                                     (car spec)
+                                     (intern (symbol-name spec) :keyword))))
+                        (push kw acc)))))
+                (validation
+                  (unless allow-other-keys
+                    (list (list '%validate-kw-list kw-rest
+                                (list 'quote declared-kws)))))
+                (new-body
+                  (if auxes
+                      `((let* (,@bindings)
+                          ,@validation
+                          (let* ,auxes ,@body)))
+                      `((let* (,@bindings)
+                          ,@validation
+                          ,@body)))))
            (list new-params new-body nil 0 rest-slot))))
       ;; --- Fallback: old positional behavior for other combinations ---
       (t

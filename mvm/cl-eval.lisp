@@ -2137,6 +2137,39 @@
       (when (eq (car cur) key) (return (cadr cur)))
       (setq cur (cddr cur)))))
 
+(defun %validate-kw-list (kw-rest declared)
+  "Walk KW-REST (caller's &key plist).  Signal program-error if any
+   indicator is not EQ to a declared key, unless the plist itself
+   contains `:ALLOW-OTHER-KEYS T` (CLHS 3.4.1.4).  Used by the &key
+   prologue when the declared lambda list has no &ALLOW-OTHER-KEYS."
+  ;; First scan for :ALLOW-OTHER-KEYS T which short-circuits.
+  (let ((cur kw-rest) (allow nil))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (when (and (eq (car cur) :allow-other-keys) (cadr cur))
+        (setq allow t)
+        (return nil))
+      (setq cur (cddr cur)))
+    (unless allow
+      (let ((cur kw-rest))
+        (loop
+          (when (null cur) (return nil))
+          (when (null (cdr cur))
+            (error "odd-length keyword argument list"))
+          (let ((k (car cur)))
+            (unless (or (eq k :allow-other-keys)
+                        (%kw-in-list-p k declared))
+              (error "unknown keyword argument: ~S" k)))
+          (setq cur (cddr cur)))))))
+
+(defun %kw-in-list-p (k lst)
+  (let ((cur lst))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car cur) k) (return t))
+      (setq cur (cdr cur)))))
+
 (defun char-int (c) (char-code c))
 (defun code-char (n) (if (characterp n) n (code-char n)))
 

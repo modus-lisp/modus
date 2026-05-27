@@ -128,6 +128,16 @@
                           str)))
       (%make-stream 1 (cons actual-str (cons 0 nil))))))
 
+(defun %string-input-stream-pos (stream)
+  "Return the current read position of a string-input stream.  Used by
+   WITH-INPUT-FROM-STRING's :index option (CLHS) to setf the user's
+   place to the final position when the body returns normally."
+  (if (streamp stream)
+      (let ((data (%stream-data stream)))
+        ;; data = (cons actual-str (cons pos nil)) — pos is cadr.
+        (car (cdr data)))
+      0))
+
 (defun make-echo-stream (in out)
   (%make-stream 3 (cons in out)))
 

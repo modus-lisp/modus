@@ -2416,24 +2416,57 @@
                      (get-output-stream-string ,var))
                   env dest)))))
       ;; WITH-INPUT-FROM-STRING — bind stream var to make-string-input-stream
+      ;; CLHS: (with-input-from-string (var string &key index start end) body)
+      ;; The :index argument is a place that gets setf'd to the final
+      ;; stream position when the body completes normally.
       ((= op-name 778706583216373557)
        (let* ((spec (cadr form))
               (var (car spec))
               (str-form (cadr spec))
+              (opts (cddr spec))
               (body (cddr form))
               (var-name (if (symbolp var) (symbol-name var) (format nil "~A" var))))
-         ;; If the variable name has *earmuffs*, use dynamic binding via (declare (special ...))
-         ;; This saves/restores the global and preserves multiple-value state.
-         (if (and (> (length var-name) 2)
-                  (char= (char var-name 0) #\*)
-                  (char= (char var-name (1- (length var-name))) #\*))
-             (compile-form
-              `(let ((,var (make-string-input-stream ,str-form)))
-                 (declare (special ,var))
-                 ,@body)
-              env dest)
-             ;; Lexical: simple let binding
-             (compile-form `(let ((,var (make-string-input-stream ,str-form))) ,@body) env dest))))
+         ;; Parse opts.  Only :index is plausibly used in tests; :start/:end
+         ;; would substring the source up-front.  Detect via plist walk.
+         (let ((idx-place nil) (start-val nil) (end-val nil)
+               (cur opts))
+           (loop
+             (when (null cur) (return nil))
+             (when (null (cdr cur)) (return nil))
+             (let ((k (car cur)) (v (cadr cur)))
+               (cond ((eq k :index) (setq idx-place v))
+                     ((eq k :start) (setq start-val v))
+                     ((eq k :end)   (setq end-val v))))
+             (setq cur (cddr cur)))
+           (let* ((eff-str (cond
+                             ((and start-val end-val)
+                              `(subseq ,str-form ,start-val ,end-val))
+                             (start-val
+                              `(subseq ,str-form ,start-val))
+                             (end-val
+                              `(subseq ,str-form 0 ,end-val))
+                             (t str-form)))
+                  (body-with-idx
+                   (if idx-place
+                       `((multiple-value-prog1 (progn ,@body)
+                           (setf ,idx-place
+                                 ,(if start-val
+                                      `(+ ,start-val (%string-input-stream-pos ,var))
+                                      `(%string-input-stream-pos ,var)))))
+                       body)))
+             ;; If the variable name has *earmuffs*, use dynamic binding via (declare (special ...))
+             (if (and (> (length var-name) 2)
+                      (char= (char var-name 0) #\*)
+                      (char= (char var-name (1- (length var-name))) #\*))
+                 (compile-form
+                  `(let ((,var (make-string-input-stream ,eff-str)))
+                     (declare (special ,var))
+                     ,@body-with-idx)
+                  env dest)
+                 (compile-form
+                  `(let ((,var (make-string-input-stream ,eff-str)))
+                     ,@body-with-idx)
+                  env dest))))))
       ;; (former duplicate MULTIPLE-VALUE-BIND dispatch removed — the
       ;; entry at line ~1624 wins because cond runs top-to-bottom, so
       ;; this one was dead code that had drifted out of sync with the

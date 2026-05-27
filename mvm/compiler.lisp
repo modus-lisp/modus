@@ -2338,7 +2338,10 @@
        (compile-values (cdr form) env dest))
       ;; VALUES-LIST — return list elements as multiple values
       ((= op-name 276551395991592440)
-       (compile-values-list (cadr form) env dest))
+       (let ((n (length (cdr form))))
+         (cond
+           ((= n 1) (compile-values-list (cadr form) env dest))
+           (t (compile-arity-error env dest)))))
       ;; MULTIPLE-VALUE-BIND — bind variables to multiple return values
       ((= op-name 544225037749651317)
        (compile-multiple-value-bind (cadr form) (caddr form) (cdddr form) env dest))
@@ -2754,7 +2757,12 @@
       ((= op-name (compute-name-hash "%MAKE-STRING-ARRAY"))
        (compile-make-string-array (cadr form) env dest))
       ((= op-name 568601634040735695)             (compile-aref-form form env dest))
-      ((= op-name 216456113736582507)            (compile-aref-form form env dest))
+      ;; SVREF — same machinery as AREF but strict 2-arg arity (CLHS):
+      ;; `(svref vec idx)` is illegal with extra args.
+      ((= op-name 216456113736582507)
+       (cond
+         ((= (length (cdr form)) 2) (compile-aref-form form env dest))
+         (t (compile-arity-error env dest))))
       ((= op-name 416706424900304020)             (compile-aset-form form env dest))
       ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
       ;; %PRIM-AREF / %PRIM-ASET / %PRIM-ARRAY-LENGTH / %PRIM-STRINGP —

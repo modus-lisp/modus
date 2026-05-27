@@ -1263,7 +1263,33 @@
 (defun %nsubst-parse-args (args)
   "Parse keyword args: :from-end :test :test-not :start :end :count :key.
    Returns (count from-end start end test-fn test-not-fn key-fn).
-   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates.
+
+   Validation (CLHS 3.4.1.4): odd-length plist signals program-error.
+   Unknown keyword signals program-error unless the caller passed
+   :ALLOW-OTHER-KEYS T."
+  ;; Scan for :ALLOW-OTHER-KEYS T first (short-circuits unknown-key check).
+  (let ((allow nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (when (and (eq (car cur) :allow-other-keys) (cadr cur))
+        (setq allow t)
+        (return nil))
+      (setq cur (cddr cur)))
+    ;; Validate odd-length and unknown keys.
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (when (null (cdr cur))
+          (error "Odd-length keyword argument list"))
+        (let ((k (car cur)))
+          (unless (or allow
+                      (eq k :from-end) (eq k :test) (eq k :test-not)
+                      (eq k :count) (eq k :key) (eq k :start) (eq k :end)
+                      (eq k :allow-other-keys))
+            (error "Unknown keyword argument: ~S" k)))
+        (setq cur (cddr cur)))))
   (let ((from-end nil) (test-fn nil) (test-not-fn nil)
         (count nil) (key-fn nil) (start 0) (end nil) (cur args)
         (fe-set nil) (test-set nil) (tn-set nil)

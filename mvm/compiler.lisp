@@ -5968,18 +5968,27 @@
     (compile-progn body env dest)
     (emit-ir-label exit-label)))
 
+(defun %tagbody-tag-p (x)
+  "CLHS: tagbody tags are symbols OR integers (or any atom other than
+   a number form which gets evaluated).  ANSI allows go-tag to be
+   any atom; in practice symbols and integers cover all tests."
+  (or (symbolp x) (integerp x)))
+
 (defun compile-tagbody (body env dest)
-  "Compile (tagbody {tag | form}*)"
+  "Compile (tagbody {tag | form}*).  Tags can be symbols or integers
+   per CLHS 5.6.1.2; the previous symbol-only check silently treated
+   integer tags as forms — so `(tagbody 10 (return-from blk x))` after
+   `(go 10)` never had a label for 10 to jump to."
   (let ((*tagbody-tags* nil))
     ;; First pass: collect tags and create labels
     (dolist (item body)
-      (when (symbolp item)
+      (when (%tagbody-tag-p item)
         (push (cons item (make-compiler-label)) *tagbody-tags*)))
     ;; Second pass: compile
     (dolist (item body)
-      (if (symbolp item)
+      (if (%tagbody-tag-p item)
           ;; It's a tag: emit label
-          (emit-ir-label (cdr (assoc item *tagbody-tags*)))
+          (emit-ir-label (cdr (assoc item *tagbody-tags* :test #'eql)))
           ;; It's a form: compile it
           (compile-form item env dest)))
     ;; Tagbody returns nil
@@ -5988,7 +5997,8 @@
 (defun compile-go (tag env dest)
   "Compile (go tag)"
   (declare (ignore env dest))
-  (let ((entry (assoc tag *tagbody-tags*)))
+  ;; assoc with EQL so integer tags compare correctly.
+  (let ((entry (assoc tag *tagbody-tags* :test #'eql)))
     (unless entry
       (progn
         (format t "  WARN: unknown GO tag ~A~%" tag)

@@ -6229,7 +6229,35 @@
           ;; (funcall #'values …) — same reasoning as APPLY but for the
           ;; spread-args form.
           ((= hash (compute-name-hash "FUNCALL")) t)
-          (t nil))))))
+          ;; Any other symbol-headed compound: if it's a function call
+          ;; (NOT a primitive like + - * if cond etc.), the callee owns
+          ;; its return MV-state.  Either the callee returns single via
+          ;; its own set-mv-count=1 epilogue (in which case MV-count=1
+          ;; after callee returns, no further action needed) or the
+          ;; callee returns multiple via (values …) and we want to
+          ;; preserve it.  Conservatively NOT resetting MV-count in our
+          ;; epilogue is correct in both cases.
+          ;;
+          ;; Primitives that DON'T go through compile-call: + - * / etc.
+          ;; They don't update MV-count.  Match by symbol-name (package-
+          ;; agnostic) so :modus.mvm:+ and :cl-user::+ both match.
+          ((member (symbol-name op)
+                   '("+" "-" "*" "/" "=" "<" ">" "<=" ">="
+                     "CAR" "CDR" "CONS" "LIST" "NULL" "NOT"
+                     "EQ" "EQL" "EQUAL" "EQUALP"
+                     "ATOM" "CONSP" "LISTP" "SYMBOLP"
+                     "NUMBERP" "STRINGP"
+                     "ASH" "LOGAND" "LOGIOR" "LOGXOR" "LOGNOT"
+                     "ZEROP" "PLUSP" "MINUSP" "EVENP" "ODDP"
+                     "1+" "1-" "ABS" "MIN" "MAX"
+                     "CHAR-CODE" "CODE-CHAR" "CHAR=" "CHAR<" "CHAR>"
+                     "ELT" "AREF" "LENGTH")
+                   :test #'string=)
+           nil)
+          ;; Any other named call — assume the callee may return
+          ;; multi-values via its own (values …) tail.  The callee's
+          ;; own epilogue handles single-value resets.
+          (t t))))))
 
 (defun loop-body-has-mv-return-p (forms)
   "Walk FORMS looking for any (return X) or (return-from N X) where X is a

@@ -1849,6 +1849,14 @@
 ;; of them inherit the type-check.  runtime/cons.lisp defines a lax
 ;; (car (cdr (cdr x))) version of CADDR — last-defun-wins so this
 ;; override takes effect at runtime.
+;; 2-letter c*r accessors — needed as real defuns for #'cadr / #'cddr
+;; etc. in function-designator contexts (e.g. LOOP BY #'cddr).  The
+;; compile-time primitive paths handle these as direct calls, but
+;; (function NAME) needs an fdefinition table entry.
+(defun caar (x) (%safe-car (%safe-car x)))
+(defun cadr (x) (%safe-car (%safe-cdr x)))
+(defun cdar (x) (%safe-cdr (%safe-car x)))
+(defun cddr (x) (%safe-cdr (%safe-cdr x)))
 (defun caaar (x) (%safe-car (%safe-car (%safe-car x))))
 (defun caadr (x) (%safe-car (%safe-car (%safe-cdr x))))
 (defun cadar (x) (%safe-car (%safe-cdr (%safe-car x))))

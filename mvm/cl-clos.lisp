@@ -2036,17 +2036,21 @@
           (car (car a)))
          (t (array-length a)))))))
 (defun array-rank (a)
+  ;; CLHS: signal TYPE-ERROR if A is not an array (CLHS array-rank).
+  ;; Without this guard, (array-rank NIL) silently returned 1 — defeats
+  ;; the (handler-case ... (error (c) t)) tests in array-rank.lsp 19851/2.
   (cond
     ((%mda-p a) (%mda-rank a))
-    (t
-     (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
-       (cond
-         ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
-          (let ((n 0) (dims (cadr a)))
-            (loop (when (null dims) (return n))
-              (setq n (+ n 1))
-              (setq dims (cdr dims)))))
-         (t 1))))))
+    ((and (consp a) (eql (car a) 8765432))
+     (array-rank (cdr a)))
+    ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+     (let ((n 0) (dims (cadr a)))
+       (loop (when (null dims) (return n))
+         (setq n (+ n 1))
+         (setq dims (cdr dims)))))
+    ((stringp a) 1)
+    ((arrayp a) 1)
+    (t (error "ARRAY-RANK: ~S is not an array" a))))
 (defun adjustable-array-p (a)
   "True iff A was created with :adjustable t.  Detected by the outer
    marker (cons 8765432 ...) the build-ansi-test rewriter emits.

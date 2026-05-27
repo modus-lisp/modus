@@ -333,23 +333,35 @@
 ;; Full ANSI parse: (count from-end start end test-fn test-not-fn key-fn).
 ;; Reuses %nsubst-parse-args defined in this file.
 (defun remove (item seq &rest args)
-  "Honors :test/:test-not/:key/:start/:end/:count/:from-end. Inline pred so
-   we don't depend on a lambda closure capturing ITEM (lossy in MVM)."
+  "Honors :test/:test-not/:key/:start/:end/:count/:from-end.
+   :test-not is the test-result-inverted variant: an element is REMOVED
+   when test-not(item, elt) is NIL (i.e., the element MATCHES the
+   inverted test).  Previously the test-not-fn slot was extracted from
+   the parse but never used — :test-not silently degraded to default
+   EQL, returning the wrong list."
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
          (start-idx (or (caddr parsed) 0))
          (end-idx (cadddr parsed))
          (test-fn (car (cddddr parsed)))
+         (test-not-fn (cadr (cddddr parsed)))
          (key-fn (caddr (cddddr parsed)))
-         (eff-count (%nsubst-effective-count count)))
+         (eff-count (%nsubst-effective-count count))
+         ;; When :test-not is given, wrap so the (funcall pred item v)
+         ;; site treats "v does NOT match" as the remove trigger.
+         (eff-test-fn (cond
+                        (test-fn test-fn)
+                        (test-not-fn
+                         (lambda (a b) (not (funcall test-not-fn a b))))
+                        (t nil))))
     (cond
       ((null seq) nil)
       ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
-       (%remove-list item seq test-fn key-fn start-idx end-idx eff-count from-end))
+       (%remove-list item seq eff-test-fn key-fn start-idx end-idx eff-count from-end))
       (t
-       (%remove-vector item seq test-fn key-fn start-idx end-idx eff-count from-end)))))
+       (%remove-vector item seq eff-test-fn key-fn start-idx end-idx eff-count from-end)))))
 
 (defun %remove-list (item lst test-fn key-fn start-idx end-idx count from-end)
   ;; Walk the list, marking which indices to drop, then build a new list.
@@ -2208,22 +2220,29 @@
 (defun delete (item seq &rest args)
   "Remove ITEM from SEQ (destructive — but we forward to non-destructive
    remove since MVM doesn't track in-place mutation guarantees).
-   Inlined parsing (same as remove) so we don't go through apply-of-rest."
+   Inlined parsing (same as remove) so we don't go through apply-of-rest.
+   :test-not handled by wrapping into a negated test-fn."
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
          (start-idx (or (caddr parsed) 0))
          (end-idx (cadddr parsed))
          (test-fn (car (cddddr parsed)))
+         (test-not-fn (cadr (cddddr parsed)))
          (key-fn (caddr (cddddr parsed)))
-         (eff-count (%nsubst-effective-count count)))
+         (eff-count (%nsubst-effective-count count))
+         (eff-test-fn (cond
+                        (test-fn test-fn)
+                        (test-not-fn
+                         (lambda (a b) (not (funcall test-not-fn a b))))
+                        (t nil))))
     (cond
       ((null seq) nil)
       ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
-       (%remove-list item seq test-fn key-fn start-idx end-idx eff-count from-end))
+       (%remove-list item seq eff-test-fn key-fn start-idx end-idx eff-count from-end))
       (t
-       (%remove-vector item seq test-fn key-fn start-idx end-idx eff-count from-end)))))
+       (%remove-vector item seq eff-test-fn key-fn start-idx end-idx eff-count from-end)))))
 
 ;; delete-if: same body shape as remove-if without the apply trampoline.
 (defun delete-if (pred seq &rest args)

@@ -474,7 +474,10 @@
 
 ;; SBT-16: (:constructor) + (:constructor sbt-16-con (a b c)) — slots a b c.
 ;; Default constructor name is make-sbt-16 with &key a b c.
-(defun make-sbt-16 (&key a b c &allow-other-keys)
+;; Tests 15787-15790 verify it signals program-error on unknown keys,
+;; odd-length plist, non-keyword indicator, etc.  Tests 15791/2 verify
+;; :ALLOW-OTHER-KEYS T turns off the validation.
+(defun make-sbt-16 (&key a b c)
   (vector 'sbt-16 a b c))
 (defun sbt-16-con (a b c) (vector 'sbt-16 a b c))
 (defun sbt-16-a (s) (aref s 1))

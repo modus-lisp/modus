@@ -4897,7 +4897,8 @@
           ;; emits LET around the group and LET* across groups.
           ((= kw 264837417035531413)
            (setf rest (cdr rest))   ; consume WITH
-           (let ((group nil))
+           (let ((group nil)
+                 (and-seen nil))
              (block with-parse
                (loop
                  (when (null rest) (return-from with-parse))
@@ -4950,19 +4951,40 @@
                               0.0)
                              ((eq type-spec 'string) "")
                              (t nil))))
-                   (push (list var init) group)
+                   ;; Destructuring WITH: var is a cons pattern.  Expand
+                   ;; into a gensym holding the init, then one binding per
+                   ;; pattern component using car/cdr/nthcdr accessors.
+                   ;; (loop8 21523/21525/21526/21527 etc.)
+                   (cond
+                     ((consp var)
+                      (let* ((g (gensym "DSTRW"))
+                             (pairs (%loop-destr-pairs var g)))
+                        (push (list g init) group)
+                        (dolist (pair pairs)
+                          (when (car pair)   ; skip NIL pattern slots
+                            (push (list (car pair) (cdr pair)) group)))))
+                     (t
+                      (push (list var init) group)))
                    (unless (and rest (symbolp (car rest))
                                 (= (normalize-name (car rest)) 313452561496444628))
                      (return-from with-parse))
-                   (setf rest (cdr rest)))))
+                   (setf rest (cdr rest))
+                   (setf and-seen t))))
              (let ((g (nreverse group)))
-               (if (null (cdr g))
-                   ;; Single binding — push as-is (back-compat with code
-                   ;; that expects (var init) entries in with-bindings).
-                   (push (car g) (loop-state-with-bindings state))
-                   ;; AND-chained — wrap as (:and-group …) marker so
-                   ;; generate-loop-code can emit a single LET.
-                   (push (cons :and-group g) (loop-state-with-bindings state))))))
+               (cond
+                 ;; No AND clause — push entries individually (sequential
+                 ;; LET* across them, which is correct for destructuring
+                 ;; expansions: gensym temp must be bound before component
+                 ;; accessors reference it).
+                 ((not and-seen)
+                  (dolist (b g)
+                    (push b (loop-state-with-bindings state))))
+                 ;; Single binding still (degenerate AND-chain) — same as
+                 ;; non-AND case.
+                 ((null (cdr g))
+                  (push (car g) (loop-state-with-bindings state)))
+                 ;; AND-chained, multiple bindings — parallel via LET.
+                 (t (push (cons :and-group g) (loop-state-with-bindings state)))))))
 
           ;; DO body...
           ((or (= kw 32547421316216284) (= kw 942546142429891564))

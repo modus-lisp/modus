@@ -4583,14 +4583,18 @@
                                      (loop-state-iterations state)))
                              (return nil)))))
                       (setf var nil)))
-                   ;; Case 2: IN/ON/ACROSS with destructuring pattern.
+                   ;; Case 2: IN/ON/ACROSS/BEING with destructuring pattern.
                    ;; Replace var with gensym; queue destructure pairs to be
-                   ;; pushed as general iters AFTER the IN/ON/ACROSS iter.
+                   ;; pushed as general iters AFTER the iter binds.
                    ((and rest (symbolp (car rest))
                          (let ((nk (normalize-name (car rest))))
                            (or (= nk 592855328021284152)        ; IN
                                (= nk 16092538585173950)         ; ON
-                               (= nk 1027666347502942664))))    ; ACROSS
+                               (= nk 1027666347502942664)       ; ACROSS
+                               ;; BEING — hash-keys / hash-values use
+                               ;; this and the iterated var IS commonly
+                               ;; destructured (key is a cons, etc.).
+                               (= nk 31436867775890672))))      ; BEING
                     (let ((g (gensym "DSTR")))
                       (setf destr-pairs (%loop-destr-pairs components g))
                       (setf var g))))))

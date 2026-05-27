@@ -602,6 +602,7 @@
 (defun count (item seq &rest args)
   "Count occurrences of ITEM in SEQ. Honors :test, :test-not, :key,
    :start, :end, :from-end."
+  (%seq-subst-check-kwargs args)
   (let ((test nil) (key nil) (start 0) (end nil) (from-end nil) (a args))
     (loop (when (null a) (return))
       (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
@@ -2609,6 +2610,7 @@
    :test defaults to inline `eql` (#'eql is unusable in MVM).
    :test-not is the negation of :test.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (%seq-subst-check-kwargs args)
   (let ((test nil) (test-not nil) (key nil)
         (start 0) (end nil) (from-end nil)
         (test-set nil) (tn-set nil) (key-set nil)
@@ -2927,6 +2929,7 @@
   "Return the position of the first ITEM in SEQUENCE satisfying TEST.
    Supports :test/:test-not/:key/:start/:end/:from-end.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+  (%seq-subst-check-kwargs args)
   (let ((test nil) (test-not nil) (key nil)
         (start 0) (end nil) (from-end nil)
         (test-set nil) (tn-set nil) (key-set nil)

@@ -2614,6 +2614,21 @@
 (defun symbolp (x) (symbolp x))
 (defun integerp (x) (integerp x))
 (defun characterp (x) (characterp x))
+
+;; CHARACTER per CLHS: designator → character.
+;; - character → itself
+;; - string of length 1 → its sole character
+;; - symbol whose symbol-name has length 1 → that character
+;; - otherwise: TYPE-ERROR
+;; Arity is enforced via the required-arg check in compile-call (X is required).
+(defun character (x)
+  (cond
+    ((characterp x) x)
+    ((and (stringp x) (= (array-length x) 1))
+     (aref x 0))
+    ((and (symbolp x) (= (length (symbol-name x)) 1))
+     (aref (symbol-name x) 0))
+    (t (error "CHARACTER: ~S is not a character designator" x))))
 (defun stringp (x) (stringp x))
 (defun zerop (x) (zerop x))
 (defun plusp (x) (> x 0))

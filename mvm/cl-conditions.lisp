@@ -933,7 +933,18 @@
           (%cond-reg-find t2))
      (let ((ancestors (%condition-all-parents t1)))
        (cons (if (member t2 ancestors) t nil) t)))
-    ;; Plain symbol types — check the static ANSI hierarchy.
+    ;; Plain symbol types — for user-defined CLOS classes, walk the CPL
+    ;; (class-precedence-list).  types-and-class-2.lsp 25283/25284 verify
+    ;; (subtypep* 'tac-3-ab 'tac-3-a) → (T T) where tac-3-ab inherits A.
+    ;; Without this, %subtype-of-p (the static ANSI table) doesn't know
+    ;; user classes and returns nil → (NIL T).
+    ((and (symbolp t1) (symbolp t2) (%find-clos-class t1) (%find-clos-class t2))
+     (let* ((c1 (%find-clos-class t1))
+            (cpl (aref c1 4)))  ; slot 4 = computed CPL
+       (cons (if (member t2 cpl :test #'eq) t nil) t)))
+    ;; t1 is a user CLOS class, t2 is built-in symbol — fall through to
+    ;; the static hierarchy after asking %subtype-of-p; CLOS classes
+    ;; that ultimately inherit from STANDARD-OBJECT pick up that lattice.
     ((and (symbolp t1) (symbolp t2))
      (if (%subtype-of-p t1 t2)
          (cons t t)

@@ -497,11 +497,13 @@
 ;;; Each restart: (name fn report-fn interactive-fn)
 
 (defun %push-restarts (restarts body-fn)
-  "Push RESTARTS onto the restart stack, run BODY-FN, then pop."
+  "Push RESTARTS onto the restart stack, run BODY-FN, then pop.
+   Uses multiple-value-prog1 so body-fn's full MV-state propagates
+   — `(let ((result (funcall body-fn))) … result)` would have
+   collapsed (values …) to a single value."
   (setq *restart-stack* (cons restarts *restart-stack*))
-  (let ((result (funcall body-fn)))
-    (setq *restart-stack* (cdr *restart-stack*))
-    result))
+  (multiple-value-prog1 (funcall body-fn)
+    (setq *restart-stack* (cdr *restart-stack*))))
 
 (defun %pop-restarts ()
   "Pop the top restart frame."

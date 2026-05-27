@@ -1134,8 +1134,18 @@
 (defun null (x) (if x nil t))
 (defun zerop (x) (= x 0))
 (defun identity (x) x)
-;; Selectors
+;; Selectors — needed as defuns so `#'second` etc. have fdefinition entries
+;; for function-designator contexts (SORT :KEY #'SECOND, mapcar #'FIRST, etc.).
 (defun first (x) (car x))
+(defun second (x) (car (cdr x)))
+(defun third (x) (car (cdr (cdr x))))
+(defun fourth (x) (car (cdr (cdr (cdr x)))))
+(defun fifth (x) (car (cdr (cdr (cdr (cdr x))))))
+(defun sixth (x) (car (cdr (cdr (cdr (cdr (cdr x)))))))
+(defun seventh (x) (car (cdr (cdr (cdr (cdr (cdr (cdr x))))))))
+(defun eighth (x) (car (cdr (cdr (cdr (cdr (cdr (cdr (cdr x)))))))))
+(defun ninth (x) (car (cdr (cdr (cdr (cdr (cdr (cdr (cdr (cdr x))))))))))
+(defun tenth (x) (car (cdr (cdr (cdr (cdr (cdr (cdr (cdr (cdr (cdr x)))))))))))
 (defun rest (x) (cdr x))
 ;; Numeric increment helpers
 (defun 1+ (n) (+ n 1))

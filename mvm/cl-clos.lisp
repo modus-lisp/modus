@@ -136,54 +136,80 @@
 ;;; Class registration with inheritance + CPL computation
 ;;; ============================================================
 
+(defun %cpl-head-in-tail-p (head lists)
+  "True iff HEAD appears in the tail (cdr) of any list in LISTS."
+  (let ((cur lists) (found nil))
+    (loop
+      (when (null cur) (return found))
+      (when (member head (cdr (car cur)) :test #'eq)
+        (setq found t)
+        (return found))
+      (setq cur (cdr cur)))))
+
+(defun %cpl-merge (lists)
+  "C3 merge of multiple precedence lists.  Returns merged CPL.
+   At each step, pick the first list's head that doesn't appear in
+   the tail of any other list, append to result, remove from heads
+   of all lists.  Repeat until all lists are empty."
+  (let ((result nil))
+    (loop
+      ;; Drop empty lists.
+      (let ((non-empty nil) (cur lists))
+        (loop
+          (when (null cur) (return nil))
+          (when (consp (car cur)) (setq non-empty (cons (car cur) non-empty)))
+          (setq cur (cdr cur)))
+        (setq lists (nreverse non-empty)))
+      (when (null lists) (return (nreverse result)))
+      ;; Find a good head — head of some list, not in tail of any other.
+      (let ((found nil) (cur lists))
+        (loop
+          (when (null cur) (return nil))
+          (when (null found)
+            (let ((cand (car (car cur))))
+              (unless (%cpl-head-in-tail-p cand lists)
+                (setq found cand))))
+          (setq cur (cdr cur)))
+        (when (null found)
+          ;; Inconsistent precedence graph — fall back to first head.
+          (setq found (car (car lists))))
+        (setq result (cons found result))
+        ;; Remove found from heads of all lists.
+        (setq lists (mapcar (lambda (lst)
+                              (if (eq (car lst) found) (cdr lst) lst))
+                            lists))))))
+
 (defun %compute-cpl (name supers)
-  "Compute CPL for NAME with SUPERS.  Strategy:
-     1. Result starts (name).
-     2. Walk each super's CPL in order, collecting items (deduped).
-     3. STANDARD-OBJECT and T are deferred — appended LAST in that
-        order so they don't end up sandwiched between unrelated
-        super-class lineages.
-   Not strict C3 but matches CLHS for the common diamond
-   patterns the test suite uses (CLASS-0304D inheriting B + C where
-   B and C share ancestor A: result must order [D B C A standard-object T]
-   so the most-specific initform in C beats A's).  Previous version
-   ended up with T sandwiched between A and C because B's CPL T leaked
-   in before C was processed — initforms from C never won."
-  (let ((result (list name))
-        (seen (list name)))
-    (let ((cur supers))
-      (loop
-        (when (null cur) (return nil))
-        (let* ((sup-name (car cur))
-               (sup-cpl
-                (let ((sup-cls (%find-clos-class sup-name)))
-                  (if sup-cls
-                      (aref sup-cls 4)
-                      (%builtin-cpl sup-name)))))
-          (let ((c sup-cpl))
+  "Compute CPL for NAME with SUPERS via C3 linearization (CLHS 4.3.5).
+   Strategy:
+     L(name) = (name) + merge(L(s1), L(s2), …, (s1 s2 …))
+   For built-in supers like T or STANDARD-OBJECT, use %builtin-cpl.
+
+   Diamond inheritance ordering: (D inherits (B C); B, C share A) →
+   (D B C A standard-object T).  Critical for initform lookup: the
+   most-specific class declaring an initform wins, and C must come
+   before A in the CPL.
+
+   Previous naive DFS-and-dedup produced (D B A C standard-object T),
+   making A's initform win over C's — wrong per CLHS."
+  (let* ((super-cpls
+          (let ((acc nil) (cur supers))
             (loop
-              (when (null c) (return nil))
-              (let ((item (car c)))
-                ;; Defer STANDARD-OBJECT and T — they go last regardless.
-                (unless (or (eq item 'standard-object) (eq item 't))
-                  (let ((already nil))
-                    (let ((s seen))
-                      (loop
-                        (when (null s) (return nil))
-                        (when (eq (car s) item) (setq already t) (return nil))
-                        (setq s (cdr s))))
-                    (when (not already)
-                      (setq result (cons item result))
-                      (setq seen  (cons item seen))))))
-              (setq c (cdr c)))))
-        (setq cur (cdr cur))))
-    ;; Append STANDARD-OBJECT and T at the end.
-    (unless (member 'standard-object seen :test #'eq)
-      (setq result (cons 'standard-object result))
-      (setq seen (cons 'standard-object seen)))
-    (unless (member 't seen :test #'eq)
-      (setq result (cons 't result)))
-    (nreverse result)))
+              (when (null cur) (return (nreverse acc)))
+              (let* ((sup-name (car cur))
+                     (sup-cls (%find-clos-class sup-name))
+                     (cpl (if sup-cls
+                              (aref sup-cls 4)
+                              (%builtin-cpl sup-name))))
+                (setq acc (cons cpl acc)))
+              (setq cur (cdr cur)))))
+         (merge-input
+          (let ((acc nil) (cur super-cpls))
+            (loop
+              (when (null cur) (return (nreverse (cons supers acc))))
+              (setq acc (cons (car cur) acc))
+              (setq cur (cdr cur))))))
+    (cons name (%cpl-merge merge-input))))
 
 (defun %defclass (name slot-names supers)
   "Register CLOS class NAME with SLOT-NAMES list and SUPERS.

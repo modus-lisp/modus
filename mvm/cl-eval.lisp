@@ -923,6 +923,13 @@
              (setq cur (cdr cur)))
            (setq params (nreverse params))
            (setq specs (nreverse specs))
+           ;; CLHS 7.6.4 congruence: method LL shape vs GF declared LL.
+           (let ((gf (%find-gf gf-name)))
+             (when (and gf (%gf-lambda-list gf))
+               (let ((gf-shape  (%lambda-list-shape (%gf-lambda-list gf)))
+                     (m-shape   (%lambda-list-shape params)))
+                 (unless (%method-ll-congruent-p gf-shape (length specs) m-shape)
+                   (%signal-program-error)))))
            ;; Build the method body as an interp-closure that captures env.
            (let ((fn (list '%interp-closure params body env)))
              ;; Ensure gf exists with a runtime stub installed under gf-name.
@@ -944,12 +951,13 @@
               (lambda-list (cadr args))
               (options (cddr args))
               (combination nil))
-         (declare (ignore lambda-list))
          (dolist (opt options)
            (when (and (consp opt) (symbolp (car opt))
                       (%eval-sym-eq (car opt) ":METHOD-COMBINATION"))
              (setq combination (cadr opt))))
-         (%defgeneric gf-name nil combination)
+         ;; Pass lambda-list so %defmethod / find-method can validate
+         ;; method-vs-GF arity congruence.
+         (%defgeneric gf-name lambda-list combination)
          ;; Install runtime stub so (funcall sym ...) dispatches.
          (set-symbol-function gf-name (%make-gf-stub gf-name))
          ;; Inline (:method ...) options — re-eval each as a defmethod form.

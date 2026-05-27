@@ -707,12 +707,18 @@
 ;;   combination: nil = standard, or method-combination name symbol
 
 (defun %make-gf (name)
-  "Create a new generic function object."
-  (let ((gf (make-array 4)))
+  "Create a new generic function object.
+   5-slot vector: #(%generic-function name methods combination lambda-list).
+   The lambda-list slot stores the GF's full lambda-list (set by
+   %defgeneric) so %defmethod / find-method can validate method
+   congruence (CLHS 7.6.4).  NIL means unknown — auto-created GFs
+   from a leading %defmethod skip the check."
+  (let ((gf (make-array 5)))
     (aset gf 0 '%generic-function)
     (aset gf 1 name)
     (aset gf 2 nil)  ; methods-alist
     (aset gf 3 nil)  ; method-combination name
+    (aset gf 4 nil)  ; lambda-list (NIL = unknown)
     gf))
 
 (defun %gf-p (x)
@@ -727,8 +733,101 @@
 (defun %gf-name (gf)     (aref gf 1))
 (defun %gf-methods (gf)  (aref gf 2))
 (defun %gf-combination (gf) (aref gf 3))
+;; %gf-lambda-list: safe-read — old 4-slot GFs (deserialized images) may
+;; lack slot 4.  Guard via array-length.
+(defun %gf-lambda-list (gf)
+  (if (>= (array-length gf) 5) (aref gf 4) nil))
 (defun %gf-set-methods (gf m) (aset gf 2 m))
 (defun %gf-set-combination (gf c) (aset gf 3 c))
+(defun %gf-set-lambda-list (gf ll)
+  (when (>= (array-length gf) 5) (aset gf 4 ll)))
+
+(defun %lambda-list-required-count (ll)
+  "Count required parameters in lambda-list LL — items before any
+   &optional/&rest/&key/&aux/&allow-other-keys keyword."
+  (let ((n 0) (cur ll))
+    (loop
+      (when (null cur) (return n))
+      (let ((p (car cur)))
+        (when (and (symbolp p)
+                   (let ((nm (symbol-name p)))
+                     (or (string= nm "&OPTIONAL")
+                         (string= nm "&REST")
+                         (string= nm "&KEY")
+                         (string= nm "&AUX")
+                         (string= nm "&ALLOW-OTHER-KEYS")
+                         (string= nm "&BODY"))))
+          (return n)))
+      (setq n (+ n 1))
+      (setq cur (cdr cur)))))
+
+(defun %lambda-list-has-rest-or-key (ll)
+  "True if LL has &REST, &KEY, or &OPTIONAL — i.e., accepts a
+   variable / open-ended number of args."
+  (let ((cur ll))
+    (loop
+      (when (null cur) (return nil))
+      (let ((p (car cur)))
+        (when (and (symbolp p)
+                   (let ((nm (symbol-name p)))
+                     (or (string= nm "&OPTIONAL")
+                         (string= nm "&REST")
+                         (string= nm "&KEY")
+                         (string= nm "&BODY"))))
+          (return t)))
+      (setq cur (cdr cur)))))
+
+(defun %lambda-list-keyword-p (sym name)
+  "True iff SYM is a symbol whose name is NAME (case-sensitive)."
+  (and (symbolp sym) (string= (symbol-name sym) name)))
+
+(defun %lambda-list-shape (ll)
+  "Return (req-count optional-count has-rest has-key has-allow-other-keys).
+   Used for CLHS 7.6.4 method-vs-GF congruence checks."
+  (let ((mode :required)
+        (req 0) (opt 0)
+        (has-rest nil) (has-key nil) (allow-other nil)
+        (cur ll))
+    (loop
+      (when (null cur)
+        (return (list req opt has-rest has-key allow-other)))
+      (let ((p (car cur)))
+        (cond
+          ((%lambda-list-keyword-p p "&OPTIONAL") (setq mode :optional))
+          ((%lambda-list-keyword-p p "&REST") (setq mode :rest) (setq has-rest t))
+          ((%lambda-list-keyword-p p "&BODY") (setq mode :rest) (setq has-rest t))
+          ((%lambda-list-keyword-p p "&KEY") (setq mode :key) (setq has-key t))
+          ((%lambda-list-keyword-p p "&AUX") (setq mode :aux))
+          ((%lambda-list-keyword-p p "&ALLOW-OTHER-KEYS") (setq allow-other t))
+          (t
+           (cond ((eq mode :required) (setq req (+ req 1)))
+                 ((eq mode :optional) (setq opt (+ opt 1)))))))
+      (setq cur (cdr cur)))))
+
+(defun %method-ll-congruent-p (gf-shape spec-count method-ll-shape)
+  "CLHS 7.6.4 congruence rules.
+   GF-SHAPE = (req opt rest key aok) from %lambda-list-shape.
+   SPEC-COUNT = method's specializer count (must equal GF req).
+   METHOD-LL-SHAPE = (req opt rest key aok) from method's full LL.
+
+   Rules:
+   1. Specializer count = GF required count.
+   2. Method optional count = GF optional count.
+   3. If GF has &rest or &key, method must have &rest or &key.
+   4. If GF has neither &rest nor &key, method must have neither."
+  (let ((g-req  (nth 0 gf-shape))
+        (g-opt  (nth 1 gf-shape))
+        (g-rest (nth 2 gf-shape))
+        (g-key  (nth 3 gf-shape))
+        (m-req  (nth 0 method-ll-shape))
+        (m-opt  (nth 1 method-ll-shape))
+        (m-rest (nth 2 method-ll-shape))
+        (m-key  (nth 3 method-ll-shape)))
+    (declare (ignore m-req))   ; spec-count carries the required count
+    (and (= spec-count g-req)
+         (= m-opt g-opt)
+         (eq (and (or g-rest g-key) t)
+             (and (or m-rest m-key) t)))))
 
 (defun %find-gf (name)
   "Find generic function by name."
@@ -739,16 +838,27 @@
       (setq cur (cdr cur)))))
 
 (defun %defgeneric (name lambda-list combination)
-  "Register or update a generic function."
+  "Register or update a generic function.
+   Stores the lambda-list so %defmethod / find-method can verify
+   method-vs-GF congruence per CLHS 7.6.4.  LAMBDA-LIST = NIL means
+   the GF is being auto-created by an early %defmethod (no declared
+   shape known yet); congruence validation is skipped in that case."
   (let ((existing (%find-gf name)))
-    (if existing
-      (progn
-        (%gf-set-combination existing combination)
-        existing)
-      (let ((gf (%make-gf name)))
-        (%gf-set-combination gf combination)
-        (setq *generic-functions* (cons (cons name gf) *generic-functions*))
-        gf))))
+    (cond
+      (existing
+       (%gf-set-combination existing combination)
+       ;; Only update lambda-list when we actually got one — don't clear
+       ;; an existing declaration with an implicit auto-create call.
+       (when lambda-list
+         (%gf-set-lambda-list existing lambda-list))
+       existing)
+      (t
+       (let ((gf (%make-gf name)))
+         (%gf-set-combination gf combination)
+         (when lambda-list
+           (%gf-set-lambda-list gf lambda-list))
+         (setq *generic-functions* (cons (cons name gf) *generic-functions*))
+         gf)))))
 
 ;; Make a method record: (qualifier specializer-list . fn)
 (defun %make-method (qualifier specializers fn)
@@ -759,11 +869,21 @@
 (defun %method-fn (m)           (cddr m))
 
 (defun %defmethod (gf-name qualifier specializers fn)
-  "Add or replace a method on a generic function."
+  "Add or replace a method on a generic function.
+   CLHS 7.6.4: method specializers list must have the same length as
+   the GF's required-parameter count.  When the GF has a declared
+   lambda-list, validate.  Skip the check when the lambda-list is
+   unknown (e.g., the auto-create case from a leading %defmethod)."
   ;; Ensure GF exists
   (when (null (%find-gf gf-name))
     (%defgeneric gf-name nil nil))
   (let ((gf (%find-gf gf-name)))
+    (let ((decl-ll (%gf-lambda-list gf)))
+      (when decl-ll
+        (let ((req-count (%lambda-list-required-count decl-ll))
+              (spec-count (length specializers)))
+          (unless (= spec-count req-count)
+            (%signal-program-error)))))
     (let ((new-method (%make-method qualifier specializers fn)))
       ;; Remove existing method with same qualifier+specializers, then prepend
       (let ((old (%gf-methods gf))
@@ -1388,12 +1508,22 @@
   "Find a method on GF.  ARGS is (errorp); when non-nil and no method
    matches, signal an error.  Accepts either the GF-array or the
    dispatch closure (#'name shape) — the latter resolves through
-   *gf-fn-to-name*."
+   *gf-fn-to-name*.
+
+   CLHS: specializers length must match GF's required-parameter count.
+   Validate against the GF's stored lambda-list when available
+   (find-method.lsp 27115/27116)."
   (let ((errorp (if args (car args) t)))
     ;; Resolve fn-pointer to real gf-array if needed.
     (unless (%gf-p gf)
       (let ((real (%fn-to-gf gf)))
         (when real (setq gf real))))
+    (when (%gf-p gf)
+      (let ((decl-ll (%gf-lambda-list gf)))
+        (when decl-ll
+          (let ((req-count (%lambda-list-required-count decl-ll)))
+            (unless (= (length specializers) req-count)
+              (%signal-program-error))))))
     (if (%gf-p gf)
       (let ((methods (%gf-methods gf))
             (result nil))

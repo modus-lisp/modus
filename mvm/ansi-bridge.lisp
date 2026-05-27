@@ -200,6 +200,50 @@
   "Coerce designator to function: symbol → symbol-function; lambda → eval-it."
   (if (symbolp fn) (symbol-function fn) fn))
 
+;; More ansi-aux helpers picked up via fail-test scan
+(defun xcons (a b) (cons b a))
+
+(defun rev-assoc-list (x)
+  "ansi-aux/cons-aux: swap each (a . b) pair to (b . a) preserving NIL slots."
+  (cond
+    ((null x) nil)
+    ((null (car x)) (cons nil (rev-assoc-list (cdr x))))
+    (t (acons (cdar x) (caar x) (rev-assoc-list (cdr x))))))
+
+(defun make-adj-array (n &rest args)
+  "ansi-aux/array-aux: shorthand for adjustable (make-array N :adjustable T
+   [:initial-contents …])."
+  (let ((ic nil))
+    (let ((cur args))
+      (loop (when (null cur) (return))
+            (when (eq (car cur) :initial-contents) (setq ic (cadr cur)))
+            (setq cur (cddr cur))))
+    (if ic
+        (make-array n :adjustable t :initial-contents ic)
+        (make-array n :adjustable t))))
+
+(defun my-gcd (x y)
+  "ansi-aux/gcd-aux: educational gcd via Euclid.  CL's GCD already
+   handles bignums, this just gives the suite a separate entry point."
+  (cond ((< x 0) (my-gcd (- x) y))
+        ((< y 0) (my-gcd x (- y)))
+        ((<= x y)
+         (if (= x 0) y (my-gcd x (- y x))))
+        (t (my-gcd y x))))
+
+(defun my-lcm (x y)
+  "ansi-aux/gcd-aux: lcm via gcd."
+  (when (< x 0) (setq x (- x)))
+  (when (< y 0) (setq y (- y)))
+  (if (or (= x 0) (= y 0)) 0
+      (/ (* x y) (my-gcd x y))))
+
+(defun eqlzt (a b) (eqlt a b))
+
+(defun equiv (a b)
+  "ansi-aux: logical equivalence — both true or both false."
+  (if a (if b t nil) (if b nil t)))
+
 (defun package-designator-p (x)
   "T if X could be a package designator (need not actually exist)."
   (or (packagep x)

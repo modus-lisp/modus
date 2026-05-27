@@ -652,25 +652,26 @@
                        (setq result (cons (list rname rfn report) result))))
                    (nreverse result))))
     (setq *restart-stack* (cons wrapped *restart-stack*))
-    ;; Use handler-case setjmp to catch the longjmp from invoke-restart
-    (let ((result (handler-case
-                    (let ((body-val (funcall body-fn)))
-                      (setq *restart-stack* (cdr *restart-stack*))
-                      body-val)
-                    (condition (c)
-                      ;; Either a real error OR a restart invocation
-                      (setq *restart-stack* (cdr *restart-stack*))
-                      (if *restart-invoking-p*
-                          (let ((r *restart-case-result*))
-                            (setq *restart-invoking-p* nil)
-                            (setq *restart-case-result* nil)
-                            r)
-                          ;; Re-signal the condition (propagate error)
-                          (progn
-                            (if (%error-handler-active-p)
-                                (%hc-longjmp)
-                                (halt))))))))
-      result)))
+    ;; Use handler-case setjmp to catch the longjmp from invoke-restart.
+    ;; multiple-value-prog1 preserves the body-fn's MV state across the
+    ;; *restart-stack* pop — without it, restart-case.lsp 26103 silently
+    ;; dropped values 2..N from (values 'A 'B 'C 'D 'E 'F).
+    (handler-case
+        (multiple-value-prog1 (funcall body-fn)
+          (setq *restart-stack* (cdr *restart-stack*)))
+      (condition (c)
+        ;; Either a real error OR a restart invocation
+        (setq *restart-stack* (cdr *restart-stack*))
+        (if *restart-invoking-p*
+            (let ((r *restart-case-result*))
+              (setq *restart-invoking-p* nil)
+              (setq *restart-case-result* nil)
+              r)
+            ;; Re-signal the condition (propagate error)
+            (progn
+              (if (%error-handler-active-p)
+                  (%hc-longjmp)
+                  (halt))))))))
 
 ;;; Override invoke-restart to use longjmp for restart-case restarts
 (defun invoke-restart (name-or-restart &rest args)

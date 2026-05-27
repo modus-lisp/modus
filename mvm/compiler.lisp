@@ -6215,9 +6215,16 @@
            (loop-body-has-mv-return-p (cdr form)))
           ;; multiple-value-bind / multiple-value-call — tail is the body's tail
           ((or (= hash (compute-name-hash "MULTIPLE-VALUE-BIND"))
-               (= hash (compute-name-hash "MULTIPLE-VALUE-CALL"))
-               (= hash (compute-name-hash "MULTIPLE-VALUE-PROG1")))
+               (= hash (compute-name-hash "MULTIPLE-VALUE-CALL")))
            (tail-form-is-values-p (cdddr form)))
+          ;; multiple-value-prog1 — MV propagation comes from FIRST (the
+          ;; saved-values form), NOT the cleanup body.  Without this
+          ;; (defun … (multiple-value-prog1 (funcall body-fn) cleanup))
+          ;; was getting MV-count=1 reset by the epilogue because cdddr
+          ;; tail was the cleanup setq, which the conservative T branch
+          ;; misidentified as values-preserving.  Now we check FIRST.
+          ((= hash (compute-name-hash "MULTIPLE-VALUE-PROG1"))
+           (tail-form-is-values-p (list (cadr form))))
           ;; (apply #'values ...) or (apply <whatever> ...) — APPLY's
           ;; result is whatever the called function returned, including
           ;; its MV state.  ANSI aux helpers shaped as

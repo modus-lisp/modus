@@ -4270,6 +4270,13 @@
   (iterations nil)
   ;; Body forms
   (body-forms nil)
+  ;; WHILE/UNTIL parsed BEFORE any body/acc clause — run AFTER init-
+  ;; stmts (so iter vars are bound) but BEFORE body.
+  (pre-body-tests nil)
+  ;; WHILE/UNTIL parsed AFTER body/acc clauses — run after body but
+  ;; before step-stmts, preserving CLHS source-order for
+  ;; `:collect x :until x` etc.
+  (post-body-tests nil)
   ;; Accumulator: a list of accumulator specs (most recent first; reversed
   ;; before code generation). Each spec is (:KIND expr) or (:KIND expr INTO)
   ;; for :collect/:sum/:count/:append/:nconc/:maximize/:minimize, or
@@ -4884,16 +4891,32 @@
                                          :step-form acc)
                          (loop-state-iterations state)))))))
 
-          ;; WHILE condition
+          ;; WHILE / UNTIL — CLHS source-order: tests run at their
+          ;; source position relative to body clauses.  Internally we
+          ;; split into two test lists:
+          ;;   pre-body-tests (after init-stmts, before body) — for
+          ;;     WHILE/UNTIL parsed BEFORE any body/acc clause.  The
+          ;;     iter var must be set by init-stmts first.
+          ;;   post-body-tests (after body, before step) — for
+          ;;     WHILE/UNTIL parsed AFTER a body/acc clause.
+          ;; Old behavior (push :while iter to iterations → test-forms
+          ;; AT START before init-stmts) broke `:FOR x :IN list :WHILE x`
+          ;; because x was tested before init-stmt set it from car tmp.
           ((= kw 468563938978316688)
-           (push (make-loop-iter :kind :while :init-form (cadr rest))
-                 (loop-state-iterations state))
+           (let ((test `(if (null ,(cadr rest)) (return nil))))
+             (if (or (loop-state-body-forms state)
+                     (loop-state-accumulator state))
+                 (push test (loop-state-post-body-tests state))
+                 (push test (loop-state-pre-body-tests state))))
            (setf rest (cddr rest)))
 
-          ;; UNTIL condition
+          ;; UNTIL condition — same source-order rule.
           ((= kw 666095121438175797)
-           (push (make-loop-iter :kind :until :init-form (cadr rest))
-                 (loop-state-iterations state))
+           (let ((test `(if ,(cadr rest) (return nil))))
+             (if (or (loop-state-body-forms state)
+                     (loop-state-accumulator state))
+                 (push test (loop-state-post-body-tests state))
+                 (push test (loop-state-pre-body-tests state))))
            (setf rest (cddr rest)))
 
           ;; REPEAT n
@@ -5240,6 +5263,8 @@
     (setf (loop-state-initially-forms state) (nreverse (loop-state-initially-forms state)))
     (setf (loop-state-with-bindings state) (nreverse (loop-state-with-bindings state)))
     (setf (loop-state-accumulator state) (nreverse (loop-state-accumulator state)))
+    (setf (loop-state-pre-body-tests state) (nreverse (loop-state-pre-body-tests state)))
+    (setf (loop-state-post-body-tests state) (nreverse (loop-state-post-body-tests state)))
     state))
 
 (defun %loop-acc-into-var (acc-spec)
@@ -5633,10 +5658,18 @@
       ;;   )
       ;;   finally...
       ;;   anon-acc-var or nil)
-      (let* ((loop-body (append (nreverse test-forms)
+      (let* ((pre-body-tests (loop-state-pre-body-tests state))
+             (post-body-tests (loop-state-post-body-tests state))
+             (loop-body (append (nreverse test-forms)
                                 (nreverse init-stmts)
+                                ;; WHILE/UNTIL parsed BEFORE body, here
+                                ;; (post-init pre-body) so iter vars are
+                                ;; bound.
+                                pre-body-tests
                                 body
                                 acc-body
+                                ;; WHILE/UNTIL parsed AFTER body, here.
+                                post-body-tests
                                 (nreverse step-stmts)))
              (inner `(loop ,@loop-body))
              ;; For always: rewrite iteration-end returns

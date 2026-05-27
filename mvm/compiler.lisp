@@ -4303,16 +4303,27 @@
   list-var)       ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
 
 (defun %loop-try-into (rest)
-  "If REST starts with INTO var [type], return (var . new-rest-after).
-   Returns NIL if REST doesn't start with INTO. The optional type is a
-   non-keyword symbol after var (e.g. FIXNUM, T) and is silently consumed."
+  "If REST starts with INTO var [type-or-OF-TYPE], return (var . new-rest-after).
+   Returns NIL if REST doesn't start with INTO.  The optional type
+   syntax recognised here:
+     - bare symbol: FIXNUM, T, INTEGER, etc. — silently consumed
+     - OF-TYPE type-spec: both tokens consumed.  TYPE-SPEC may be a
+       symbol (FIXNUM) or a list ((INTEGER 0 100), (FIXNUM FIXNUM)).
+   ANSI suite uses both forms — loop10 20957 has `INTO FOO OF-TYPE
+   (INTEGER 0 100)` and loop10 20977 has plain `INTO FOO FIXNUM`."
   (when (and rest (symbolp (car rest))
              (= (normalize-name (car rest)) 808667750738154955))   ; INTO
     (let ((var (cadr rest))
           (after (cddr rest)))
-      (when (and after (symbolp (car after))
-                 (not (cl-loop-keyword-p (car after))))
-        (setf after (cdr after)))
+      (cond
+        ;; OF-TYPE type-spec — consume both tokens.
+        ((and after (symbolp (car after))
+              (= (normalize-name (car after)) 729509721274984859))
+         (setf after (cddr after)))
+        ;; Bare type symbol — consume one.
+        ((and after (symbolp (car after))
+              (not (cl-loop-keyword-p (car after))))
+         (setf after (cdr after))))
       (cons var after))))
 
 (defun %loop-destr-pairs (pattern accessor)

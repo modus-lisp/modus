@@ -5040,11 +5040,24 @@
                      (loop-state-accumulator state)))))
 
           ((or (= kw 647934184416839188) (= kw 146808687552856964))   ; COUNT
-           (let ((expr (cadr rest)))
+           (let ((expr (cadr rest))
+                 (type-spec nil))
              (setf rest (cddr rest))
+             (let ((ot (%loop-try-of-type rest)))
+               (when ot
+                 (setf type-spec (car ot))
+                 (setf rest (cdr ot))))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cddr iv)))
-               (push (if iv (list :count expr (car iv)) (list :count expr))
+               (when iv
+                 (setf rest (cddr iv))
+                 (when (cadr iv) (setf type-spec (cadr iv))))
+               (let ((ot2 (%loop-try-of-type rest)))
+                 (when ot2
+                   (setf type-spec (car ot2))
+                   (setf rest (cdr ot2))))
+               (push (if iv
+                         (list :count expr (car iv) type-spec)
+                         (list :count expr nil type-spec))
                      (loop-state-accumulator state)))))
 
           ((or (= kw 195734683635763289) (= kw 682179722204096129))   ; APPEND

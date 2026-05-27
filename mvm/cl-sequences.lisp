@@ -862,6 +862,7 @@
 
 (defun sort (seq pred &rest options)
   ;; Honors :key.  Dispatches list vs vector.
+  (%seq-subst-check-kwargs options)
   (let ((key nil) (a options))
     (loop (when (null a) (return))
       (when (eq (car a) :key) (setq key (cadr a)))
@@ -873,6 +874,7 @@
 
 (defun stable-sort (seq pred &rest options)
   ;; Insertion sort is naturally stable; same impl.
+  (%seq-subst-check-kwargs options)
   (let ((key nil) (a options))
     (loop (when (null a) (return))
       (when (eq (car a) :key) (setq key (cadr a)))
@@ -1776,6 +1778,8 @@
    differ, or NIL if equal. Honors :test, :key, :start1, :end1, :start2,
    :end2, :from-end.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  (%check-kw-allowed args
+   '(:test :test-not :key :start1 :end1 :start2 :end2 :from-end))
   (let ((test nil) (key nil)
         (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil)
         (test-set nil) (key-set nil) (s1-set nil) (e1-set nil)
@@ -2068,6 +2072,7 @@
 
 (defun replace (s1 s2 &rest args)
   "Replace elements of S1 with elements from S2."
+  (%check-kw-allowed args '(:start1 :end1 :start2 :end2))
   (let ((len (if (< (length s1) (length s2)) (length s1) (length s2))))
     (dotimes (i len)
       (if (consp s1)
@@ -3028,6 +3033,8 @@
   "Search for SEQ1 as a subsequence of SEQ2. Return index or nil.
    :test defaults to inline `eql` (#'eql is unusable in MVM).
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  (%check-kw-allowed args
+   '(:test :test-not :key :start1 :end1 :start2 :end2 :from-end))
   (let ((test nil) (key nil) (start1 0) (end1 nil) (start2 0) (end2 nil) (from-end nil)
         (test-set nil) (key-set nil) (s1-set nil) (e1-set nil)
         (s2-set nil) (e2-set nil) (fe-set nil))

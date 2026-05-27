@@ -498,6 +498,28 @@
           (copy-tree (cdr tree)))
     tree))
 
+(defun %check-kw-allowed (args allowed)
+  "Generic kwarg validator.  Walk ARGS plist, signal program-error on
+   odd length or any indicator not EQ to a member of ALLOWED, unless
+   the plist itself contains :ALLOW-OTHER-KEYS T."
+  (let ((aok nil) (aok-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (%signal-program-error))
+      (let ((k (car cur)))
+        (when (and (eq k :allow-other-keys) (not aok-set))
+          (setq aok (cadr cur)) (setq aok-set t)))
+      (setq cur (cddr cur)))
+    (unless aok
+      (let ((cur args))
+        (loop
+          (when (null cur) (return nil))
+          (let ((k (car cur)))
+            (unless (or (eq k :allow-other-keys)
+                        (%kw-in-list-p k allowed))
+              (%signal-program-error)))
+          (setq cur (cddr cur)))))))
+
 (defun %seq-subst-check-kwargs (args)
   "Validate keyword args for SUBSTITUTE/NSUBSTITUTE/SUBSTITUTE-IF/etc.
    Allows :test :test-not :key :start :end :from-end :count

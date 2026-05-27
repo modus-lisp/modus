@@ -428,6 +428,7 @@
      - empty seq: return (funcall fn) with no args
      - single elt: return that element unchanged
      - else: starts with the first element"
+  (%check-kw-allowed args '(:initial-value :from-end :start :end :key))
   (let ((init :no-init) (init-given nil)
         (from-end nil) (start 0) (end nil) (key nil)
         (a args))

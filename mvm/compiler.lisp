@@ -4302,29 +4302,36 @@
   by-form         ; step amount (for :from)
   list-var)       ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
 
+(defun %loop-try-of-type (rest)
+  "If REST starts with OF-TYPE typespec, return (typespec . new-rest).
+   Else NIL."
+  (when (and rest (symbolp (car rest))
+             (= (normalize-name (car rest)) 729509721274984859))
+    (cons (cadr rest) (cddr rest))))
+
 (defun %loop-try-into (rest)
-  "If REST starts with INTO var [type-or-OF-TYPE], return (var . new-rest-after).
-   Returns NIL if REST doesn't start with INTO.  The optional type
-   syntax recognised here:
-     - bare symbol: FIXNUM, T, INTEGER, etc. — silently consumed
-     - OF-TYPE type-spec: both tokens consumed.  TYPE-SPEC may be a
-       symbol (FIXNUM) or a list ((INTEGER 0 100), (FIXNUM FIXNUM)).
-   ANSI suite uses both forms — loop10 20957 has `INTO FOO OF-TYPE
-   (INTEGER 0 100)` and loop10 20977 has plain `INTO FOO FIXNUM`."
+  "If REST starts with INTO var [type-or-OF-TYPE], return
+   (var TYPE-SPEC . new-rest-after).  TYPE-SPEC is NIL if not given.
+   Returns NIL if REST doesn't start with INTO.
+   Type syntax: bare symbol (FIXNUM/T/...) or OF-TYPE type-spec
+   (symbol or list)."
   (when (and rest (symbolp (car rest))
              (= (normalize-name (car rest)) 808667750738154955))   ; INTO
     (let ((var (cadr rest))
-          (after (cddr rest)))
+          (after (cddr rest))
+          (type-spec nil))
       (cond
         ;; OF-TYPE type-spec — consume both tokens.
         ((and after (symbolp (car after))
               (= (normalize-name (car after)) 729509721274984859))
+         (setf type-spec (cadr after))
          (setf after (cddr after)))
         ;; Bare type symbol — consume one.
         ((and after (symbolp (car after))
               (not (cl-loop-keyword-p (car after))))
+         (setf type-spec (car after))
          (setf after (cdr after))))
-      (cons var after))))
+      (list* var type-spec after))))
 
 (defun %loop-destr-pairs (pattern accessor)
   "Walk PATTERN (a cons tree of variable names) and produce a list of
@@ -4474,7 +4481,7 @@
                  (cond
                    (iv
                     (setf var (car iv))
-                    (setf rest (cdr iv))
+                    (setf rest (cddr iv))
                     ;; Register the INTO var so generate-loop-code binds
                     ;; and finalises it (but skips body emission).
                     (push (cons var kind) (loop-state-cond-into-acc state)))
@@ -5005,23 +5012,38 @@
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
+               (when iv (setf rest (cddr iv)))
                (push (if iv (list :collect expr (car iv)) (list :collect expr))
                      (loop-state-accumulator state)))))
 
           ((or (= kw 579297982844014476) (= kw 820203232253031873))   ; SUM
-           (let ((expr (cadr rest)))
+           (let ((expr (cadr rest))
+                 (type-spec nil))
              (setf rest (cddr rest))
+             ;; OF-TYPE typespec — applies to the anon accumulator init.
+             (let ((ot (%loop-try-of-type rest)))
+               (when ot
+                 (setf type-spec (car ot))
+                 (setf rest (cdr ot))))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
-               (push (if iv (list :sum expr (car iv)) (list :sum expr))
+               (when iv
+                 (setf rest (cddr iv))
+                 (when (cadr iv) (setf type-spec (cadr iv))))
+               ;; Trailing OF-TYPE after INTO var typespec too.
+               (let ((ot2 (%loop-try-of-type rest)))
+                 (when ot2
+                   (setf type-spec (car ot2))
+                   (setf rest (cdr ot2))))
+               (push (if iv
+                         (list :sum expr (car iv) type-spec)
+                         (list :sum expr nil type-spec))
                      (loop-state-accumulator state)))))
 
           ((or (= kw 647934184416839188) (= kw 146808687552856964))   ; COUNT
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
+               (when iv (setf rest (cddr iv)))
                (push (if iv (list :count expr (car iv)) (list :count expr))
                      (loop-state-accumulator state)))))
 
@@ -5029,7 +5051,7 @@
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
+               (when iv (setf rest (cddr iv)))
                (push (if iv (list :append expr (car iv)) (list :append expr))
                      (loop-state-accumulator state)))))
 
@@ -5037,7 +5059,7 @@
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
+               (when iv (setf rest (cddr iv)))
                (push (if iv (list :nconc expr (car iv)) (list :nconc expr))
                      (loop-state-accumulator state)))))
 
@@ -5045,7 +5067,7 @@
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
+               (when iv (setf rest (cddr iv)))
                (push (if iv (list :maximize expr (car iv)) (list :maximize expr))
                      (loop-state-accumulator state)))))
 
@@ -5053,7 +5075,7 @@
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
-               (when iv (setf rest (cdr iv)))
+               (when iv (setf rest (cddr iv)))
                (push (if iv (list :minimize expr (car iv)) (list :minimize expr))
                      (loop-state-accumulator state)))))
 
@@ -5197,10 +5219,17 @@
     state))
 
 (defun %loop-acc-into-var (acc-spec)
-  "Return the INTO var of ACC-SPEC, or NIL if it doesn't have one."
+  "Return the INTO var of ACC-SPEC, or NIL if it doesn't have one.
+   Acc-spec shapes after typed-init support:
+     (:KIND expr)                   — anon, no type
+     (:KIND expr into-var)          — INTO'd, no type
+     (:KIND expr into-var type)     — INTO'd, typed
+     (:KIND expr nil type)          — anon, typed
+   INTO-var is element 2 in all cases (or NIL)."
   (when (and (member (car acc-spec) '(:collect :sum :count :append
                                       :nconc :maximize :minimize))
-             (= (length acc-spec) 3))
+             (>= (length acc-spec) 3)
+             (caddr acc-spec))
     (caddr acc-spec)))
 
 (defun %loop-acc-init-value (kind)
@@ -5210,6 +5239,29 @@
     (:sum 0)
     (:count 0)
     (t nil)))
+
+(defun %loop-acc-type-spec (acc-spec)
+  "Return the OF-TYPE typespec of ACC-SPEC, or NIL.
+   Acc-spec shape: (:KIND expr [into-var [type-spec]])."
+  (when (and (member (car acc-spec) '(:collect :sum :count :append
+                                      :nconc :maximize :minimize))
+             (>= (length acc-spec) 4))
+    (cadddr acc-spec)))
+
+(defun %loop-acc-typed-init-value (acc-spec)
+  "Like %loop-acc-init-value but honors the OF-TYPE typespec stashed in
+   the acc-spec for SUM/COUNT: float types → 0.0, integer → 0, NIL."
+  (let ((type-spec (%loop-acc-type-spec acc-spec))
+        (kind (car acc-spec)))
+    (cond
+      ((and (member kind '(:sum :count)) (symbolp type-spec)
+            (or (eq type-spec 'float)
+                (eq type-spec 'short-float)
+                (eq type-spec 'single-float)
+                (eq type-spec 'double-float)
+                (eq type-spec 'long-float)))
+       0.0)
+      (t (%loop-acc-init-value kind)))))
 
 (defun generate-loop-code (state)
   "Generate Lisp code from a parsed loop-state."
@@ -5312,7 +5364,7 @@
         (incf i)
         (when (member (car acc) '(:collect :collect-when :sum :count :append
                                   :nconc :maximize :minimize))
-          (push (list (nth i acc-vars) (%loop-acc-init-value (car acc)))
+          (push (list (nth i acc-vars) (%loop-acc-typed-init-value acc))
                 bindings))))
 
     ;; Process iterations

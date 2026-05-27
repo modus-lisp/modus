@@ -137,24 +137,35 @@
 ;;; ============================================================
 
 (defun %compute-cpl (name supers)
-  "Compute a simple CPL for NAME with SUPERS (linearization).
-   Uses C3-like: name first, then each super's CPL, deduped, ending with t."
+  "Compute CPL for NAME with SUPERS.  Strategy:
+     1. Result starts (name).
+     2. Walk each super's CPL in order, collecting items (deduped).
+     3. STANDARD-OBJECT and T are deferred — appended LAST in that
+        order so they don't end up sandwiched between unrelated
+        super-class lineages.
+   Not strict C3 but matches CLHS for the common diamond
+   patterns the test suite uses (CLASS-0304D inheriting B + C where
+   B and C share ancestor A: result must order [D B C A standard-object T]
+   so the most-specific initform in C beats A's).  Previous version
+   ended up with T sandwiched between A and C because B's CPL T leaked
+   in before C was processed — initforms from C never won."
   (let ((result (list name))
         (seen (list name)))
-    ;; Collect each super's CPL in order
     (let ((cur supers))
       (loop
         (when (null cur) (return nil))
-        (let ((sup-name (car cur)))
-          (let ((sup-cpl
-                 (let ((sup-cls (%find-clos-class sup-name)))
-                   (if sup-cls
-                     (aref sup-cls 4)
-                     (%builtin-cpl sup-name)))))
-            (let ((c sup-cpl))
-              (loop
-                (when (null c) (return nil))
-                (let ((item (car c)))
+        (let* ((sup-name (car cur))
+               (sup-cpl
+                (let ((sup-cls (%find-clos-class sup-name)))
+                  (if sup-cls
+                      (aref sup-cls 4)
+                      (%builtin-cpl sup-name)))))
+          (let ((c sup-cpl))
+            (loop
+              (when (null c) (return nil))
+              (let ((item (car c)))
+                ;; Defer STANDARD-OBJECT and T — they go last regardless.
+                (unless (or (eq item 'standard-object) (eq item 't))
                   (let ((already nil))
                     (let ((s seen))
                       (loop
@@ -163,18 +174,15 @@
                         (setq s (cdr s))))
                     (when (not already)
                       (setq result (cons item result))
-                      (setq seen  (cons item seen)))))
-                (setq c (cdr c))))))
+                      (setq seen  (cons item seen))))))
+              (setq c (cdr c)))))
         (setq cur (cdr cur))))
-    ;; Ensure 't' is always last
-    (let ((already-t nil))
-      (let ((r result))
-        (loop
-          (when (null r) (return nil))
-          (when (eq (car r) 't) (setq already-t t) (return nil))
-          (setq r (cdr r))))
-      (when (not already-t)
-        (setq result (cons 't result))))
+    ;; Append STANDARD-OBJECT and T at the end.
+    (unless (member 'standard-object seen :test #'eq)
+      (setq result (cons 'standard-object result))
+      (setq seen (cons 'standard-object seen)))
+    (unless (member 't seen :test #'eq)
+      (setq result (cons 't result)))
     (nreverse result)))
 
 (defun %defclass (name slot-names supers)

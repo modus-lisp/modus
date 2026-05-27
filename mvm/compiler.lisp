@@ -5455,9 +5455,37 @@
                                (t tf)))
                            loop-body)
                    loop-body))
-             (inner2 (if (eq final-test-forms loop-body)
+             ;; CLHS 6.1.1.7 FINALLY-skip-on-body-RETURN attempt 2:
+             ;; inject (setq %nat t) into each test-form exit.
+             (%nat-var (gensym "NAT"))
+             (%bv-var (gensym "BV"))
+             (test-forms-with-nat
+               (mapcar
+                (lambda (tf)
+                  (cond
+                    ((and (consp tf) (eq (car tf) 'if)
+                          (consp (caddr tf))
+                          (member (car (caddr tf)) '(return return-from)))
+                     `(if ,(cadr tf)
+                          (progn (setq ,%nat-var t) ,(caddr tf))))
+                    ((and (consp tf) (eq (car tf) 'if)
+                          (consp (caddr tf))
+                          (eq (car (caddr tf)) 'progn)
+                          (consp (car (last (caddr tf))))
+                          (member (car (car (last (caddr tf))))
+                                  '(return return-from)))
+                     (let* ((then (caddr tf))
+                            (body-prefix (butlast (cdr then)))
+                            (last-form (car (last then))))
+                       `(if ,(cadr tf)
+                            (progn ,@body-prefix
+                                   (setq ,%nat-var t)
+                                   ,last-form))))
+                    (t tf)))
+                final-test-forms))
+             (inner2 (if (eq test-forms-with-nat loop-body)
                          inner
-                         `(loop ,@final-test-forms)))
+                         `(loop ,@test-forms-with-nat)))
              ;; Pre-finally fixups: nreverse any anonymous COLLECT acc so it
              ;; appears in correct order in FINALLY (and as the LOOP value).
              ;; INTO-named COLLECTs also need nreverse so user code sees the
@@ -5484,19 +5512,34 @@
                          (push v seen-vars)
                          (push `(setq ,v (nreverse ,v)) fixups)))))
                  (nreverse fixups)))
-             (result (cond
-                       (has-always
-                        (if finally `(progn ,inner2 ,@finally) inner2))
-                       (has-thereis
-                        (if finally `(progn ,inner2 ,@finally) inner2))
-                       (anon-acc
-                        (let ((return-form anon-acc-var))
-                          `(progn ,inner2 ,@collect-fixups ,@finally ,return-form)))
-                       ((or accs cond-into)   ; only INTO accs — return NIL after fixups+finally
-                        `(progn ,inner2 ,@collect-fixups ,@finally nil))
-                       (finally
-                        `(progn ,inner2 ,@finally nil))
-                       (t inner2)))
+             ;; New result form: capture inner2's value in %bv; on natural
+             ;; exit (%nat=T) run collect-fixups + finally + accumulator
+             ;; return; on body-RETURN keep %bv (the returned value).
+             (needs-nat-guard
+               (or finally accs cond-into collect-fixups))
+             (natural-form
+               (cond
+                 ;; ALWAYS / THEREIS / NEVER set %bv to T or NIL via the
+                 ;; rewritten (return t) / (return nil) — keep that value.
+                 ((or has-always has-thereis)
+                  `(progn ,@collect-fixups ,@finally ,%bv-var))
+                 (anon-acc
+                  `(progn ,@collect-fixups ,@finally ,anon-acc-var))
+                 ((or accs cond-into)
+                  `(progn ,@collect-fixups ,@finally nil))
+                 (finally
+                  ;; No accumulators — finally is side-effect only.
+                  `(progn ,@finally ,%bv-var))
+                 (t %bv-var)))
+             (result
+               (cond
+                 (needs-nat-guard
+                  `(let ((,%nat-var nil))
+                     (let ((,%bv-var ,inner2))
+                       (if ,%nat-var
+                           ,natural-form
+                           ,%bv-var))))
+                 (t inner2)))
              ;; INITIALLY runs once before the loop body, after WITH bindings
              (with-init (if initially
                             `(progn ,@initially ,result)

@@ -4872,16 +4872,41 @@
                    (loop-state-iterations state))
              (setf rest (cddr rest))))
 
-          ;; WITH var = init
+          ;; WITH var [= init] [AND var2 [= init2] AND …]
+          ;; CLHS 6.1.1.4: AND-chained WITH bindings are PARALLEL — all
+          ;; init-forms are evaluated in the outer environment, then all
+          ;; bindings are established together (LET semantics).
+          ;; UN-chained successive WITH clauses are SEQUENTIAL (LET*).
+          ;; We collect each AND-group as a single tagged binding entry
+          ;; (:and-group (var1 init1) (var2 init2) …); generate-loop-code
+          ;; emits LET around the group and LET* across groups.
           ((= kw 264837417035531413)
-           (let ((var (cadr rest)))
-             (setf rest (cddr rest))
-             ;; Skip optional =
-             (when (and rest (symbolp (car rest))
-                        (= (normalize-name (car rest)) 1009698407182718722))
-               (setf rest (cdr rest))
-               (push (list var (car rest)) (loop-state-with-bindings state))
-               (setf rest (cdr rest)))))
+           (setf rest (cdr rest))   ; consume WITH
+           (let ((group nil))
+             (block with-parse
+               (loop
+                 (when (null rest) (return-from with-parse))
+                 (let ((var (car rest))
+                       (init nil))
+                   (setf rest (cdr rest))
+                   (when (and rest (symbolp (car rest))
+                              (= (normalize-name (car rest)) 1009698407182718722))
+                     (setf rest (cdr rest))
+                     (setf init (car rest))
+                     (setf rest (cdr rest)))
+                   (push (list var init) group)
+                   (unless (and rest (symbolp (car rest))
+                                (= (normalize-name (car rest)) 313452561496444628))
+                     (return-from with-parse))
+                   (setf rest (cdr rest)))))
+             (let ((g (nreverse group)))
+               (if (null (cdr g))
+                   ;; Single binding — push as-is (back-compat with code
+                   ;; that expects (var init) entries in with-bindings).
+                   (push (car g) (loop-state-with-bindings state))
+                   ;; AND-chained — wrap as (:and-group …) marker so
+                   ;; generate-loop-code can emit a single LET.
+                   (push (cons :and-group g) (loop-state-with-bindings state))))))
 
           ;; DO body...
           ((or (= kw 32547421316216284) (= kw 942546142429891564))
@@ -5603,9 +5628,35 @@
              ;;
              ;; A blanket wrap regressed -140 (multi-accumulator COLLECT
              ;; tests).  Wrap only when FINALLY has a RETURN.
+             ;; Build the binding wrap.  Most bindings are simple (var
+             ;; init) pairs that nest as LET*; (:and-group . pairs)
+             ;; entries from WITH-AND chains must be wrapped as a single
+             ;; LET so all inits see the OUTER environment.  Walk the
+             ;; reversed binding list, grouping consecutive simple
+             ;; bindings into LET* chunks and emitting LET for each
+             ;; and-group, nesting outer to inner.
              (with-bindings-form
                (if bindings
-                   `(let* ,(nreverse bindings) ,with-init)
+                   (labels ((wrap (binds inner)
+                              (cond
+                                ((null binds) inner)
+                                ((and (consp (car binds))
+                                      (eq (car (car binds)) :and-group))
+                                 `(let ,(cdr (car binds))
+                                    ,(wrap (cdr binds) inner)))
+                                (t
+                                 ;; Collect consecutive simple bindings
+                                 ;; into one LET*.
+                                 (let ((chunk nil) (cur binds))
+                                   (loop (when (or (null cur)
+                                                   (and (consp (car cur))
+                                                        (eq (car (car cur)) :and-group)))
+                                           (return nil))
+                                         (push (car cur) chunk)
+                                         (setq cur (cdr cur)))
+                                   `(let* ,(nreverse chunk)
+                                      ,(wrap cur inner)))))))
+                     (wrap (nreverse bindings) with-init))
                    with-init))
              (finally-has-return
               (labels ((rec (f)

@@ -393,7 +393,7 @@
          (when (= i len) (return out))
          (aset out i (aref seq (- len i 1)))
          (setq i (+ i 1)))))
-    (t nil)))
+    (t (error "REVERSE: ~S is not a sequence" seq))))
 
 (defun nreverse (seq)
   (cond
@@ -430,7 +430,7 @@
            (aset seq j tmp))
          (setq i (+ i 1))
          (setq j (- j 1)))))
-    (t seq)))
+    (t (error "NREVERSE: ~S is not a sequence" seq))))
 
 (defun rplaca (cons obj)
   (set-car cons obj)
@@ -2062,7 +2062,9 @@
    First: native MDA (subtag #x34) carries dims directly in slot 1.
    Otherwise peels (cons 8765432 ...) adjustable wrapper and detects
    multi-dim (9867654), fill-pointer (cons FP ...), and displaced
-   (cons (cons SIZE OFFSET) ...) wrappers."
+   (cons (cons SIZE OFFSET) ...) wrappers.
+
+   CLHS: signal TYPE-ERROR on non-array."
   (cond
     ((%mda-p a) (%mda-dims a))
     (t
@@ -2078,7 +2080,7 @@
           (list (car (car a))))
          ((arrayp a) (list (array-length a)))
          ((stringp a) (list (array-length a)))
-         (t nil))))))
+         (t (error "ARRAY-DIMENSIONS: ~S is not an array" a)))))))
 
 (defun upgraded-array-element-type (type)
   "Return the upgraded element type (simplified to T for all)."

@@ -2017,6 +2017,7 @@
          ((= n 0) (array-length a))
          (t 0))))))
 (defun array-total-size (a)
+  ;; CLHS: signal TYPE-ERROR on non-array.
   (cond
     ((%mda-p a)
      ;; Walk dims (NOT data length — for displaced MDAs data slot
@@ -2034,7 +2035,9 @@
           (array-length (cdr a)))
          ((and (consp a) (consp (car a)))
           (car (car a)))
-         (t (array-length a)))))))
+         ((stringp a) (array-length a))
+         ((arrayp a) (array-length a))
+         (t (error "ARRAY-TOTAL-SIZE: ~S is not an array" a)))))))
 (defun array-rank (a)
   ;; CLHS: signal TYPE-ERROR if A is not an array (CLHS array-rank).
   ;; Without this guard, (array-rank NIL) silently returned 1 — defeats
@@ -2057,11 +2060,18 @@
    Native MDA #x34: per CL we can return T (adjustability is allowed)
    but to match the suite's expectations we only return T for MDAs that
    have a fp or were created with explicit adjustable hint.  Pragmatic:
-   any MDA is adjustable by construction (slot setters can mutate)."
+   any MDA is adjustable by construction (slot setters can mutate).
+
+   CLHS: signals TYPE-ERROR on non-array input (adjustable-array-p.lsp
+   tests 19722/3)."
   (cond
     ((%mda-p a) t)
-    ((consp a) (eql (car a) 8765432))
-    (t nil)))
+    ((and (consp a) (eql (car a) 8765432)) t)
+    ;; multi-dim wrapper or fp/displaced wrapper — treat as array
+    ((and (consp a) (eql (car a) 9867654)) nil)
+    ((stringp a) nil)
+    ((arrayp a) nil)
+    (t (error "ADJUSTABLE-ARRAY-P: ~S is not an array" a))))
 
 (defun %unadj (a)
   "Peel the (cons 8765432 ...) adjustable wrapper if present."

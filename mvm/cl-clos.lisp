@@ -1040,22 +1040,26 @@
              ;; Use setq+save/restore so the binding is visible to method
              ;; bodies in other functions; bare-metal LET on a defvar
              ;; doesn't create dynamic scope by default.
-             (let ((result
+             ;; Save primary chain's MV via multiple-value-list so :after
+             ;; can run between the primary call and the value return
+             ;; without collapsing MV to a single value.
+             (let ((result-list
                     (let ((saved-nm *%next-methods*)
                           (saved-args *%current-gf-args*))
                       (setq *%next-methods* (cdr primary-methods))
                       (setq *%current-gf-args* args)
-                      (let ((r (apply (%method-fn (car primary-methods)) args)))
+                      (let ((rl (multiple-value-list
+                                 (apply (%method-fn (car primary-methods)) args))))
                         (setq *%next-methods* saved-nm)
                         (setq *%current-gf-args* saved-args)
-                        r))))
+                        rl))))
                ;; Run after methods (least specific first = most-specific last)
                (let ((cur (nreverse after-methods)))
                  (loop
                    (when (null cur) (return nil))
                    (apply (%method-fn (car cur)) args)
                    (setq cur (cdr cur))))
-               result))))
+               (values-list result-list)))))
       (if around-methods
         ;; Run around methods wrapping the primary chain.  Modus's LET
         ;; on a defvar doesn't create dynamic scope, so we have to use
@@ -1080,10 +1084,10 @@
                   (saved-args *%current-gf-args*))
               (setq *%next-methods*    next-chain)
               (setq *%current-gf-args* args)
-              (let ((r (apply (%method-fn (car around-methods)) args)))
+              (multiple-value-prog1
+                  (apply (%method-fn (car around-methods)) args)
                 (setq *%next-methods*    saved-nm)
-                (setq *%current-gf-args* saved-args)
-                r))))
+                (setq *%current-gf-args* saved-args)))))
         ;; No around: just run primary + before/after
         (funcall run-primary)))))
 
@@ -1303,7 +1307,11 @@
   "Call the next method in the applicable method list.
    Uses setq+save/restore around the inner call so the rebinding
    of *%next-methods* is visible to the called method's body
-   (bare-metal LET on a defvar doesn't create dynamic scope)."
+   (bare-metal LET on a defvar doesn't create dynamic scope).
+
+   multiple-value-prog1 preserves the next method's MV state so
+   (call-next-method) inside a chain of methods returning (values …)
+   produces those values, not just the primary."
   (let ((next *%next-methods*))
     (if (null next)
       (error "no next method")
@@ -1314,10 +1322,9 @@
         (let ((actual-args (if new-args new-args *%current-gf-args*)))
           (setq *%next-methods* remaining)
           (setq *%current-gf-args* actual-args)
-          (let ((r (apply (%method-fn m) actual-args)))
+          (multiple-value-prog1 (apply (%method-fn m) actual-args)
             (setq *%next-methods* saved-nm)
-            (setq *%current-gf-args* saved-args)
-            r))))))
+            (setq *%current-gf-args* saved-args)))))))
 
 (defun next-method-p ()
   "True if there is a next method available."

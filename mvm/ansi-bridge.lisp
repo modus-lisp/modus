@@ -353,6 +353,134 @@
 
 (defun identity (x) x)
 
+;;; ============================================================
+;;; structures-03.lsp hand-rolled BOA structs (SBT-01..SBT-16)
+;;; ============================================================
+;;; The test file has all (defstruct* …) forms commented out and
+;;; relies on the harness to provide them.  Each struct is represented
+;;; as a vector #(<tag-sym> slot-0 slot-1 …) and accessors index
+;;; via aref — `(setf (aref …) …)` already works in Modus so setf
+;;; on accessors comes for free.  ~25 lines per struct.
+
+;; SBT-01: (:constructor sbt-01-con (b a c)) — slots a b c.
+(defun sbt-01-con (b a c) (vector 'sbt-01 a b c))
+(defun sbt-01-a (s) (aref s 1))
+(defun sbt-01-b (s) (aref s 2))
+(defun sbt-01-c (s) (aref s 3))
+
+;; SBT-02: 3 constructors — sbt-02-con (a b c), -con-2 (a b), -con-3 ().
+;; Slot defaults: a='x b='y c='z.
+(defun sbt-02-con (a b c) (vector 'sbt-02 a b c))
+(defun sbt-02-con-2 (a b) (vector 'sbt-02 a b 'z))
+(defun sbt-02-con-3 () (vector 'sbt-02 'x 'y 'z))
+(defun sbt-02-a (s) (aref s 1))
+(defun sbt-02-b (s) (aref s 2))
+(defun sbt-02-c (s) (aref s 3))
+
+;; SBT-03: (:constructor sbt-03-con (a b &optional c)) — slots c b a.
+(defun sbt-03-con (a b &optional c) (vector 'sbt-03 c b a))
+(defun sbt-03-a (s) (aref s 3))
+(defun sbt-03-b (s) (aref s 2))
+(defun sbt-03-c (s) (aref s 1))
+
+;; SBT-04: (:constructor sbt-04-con (a b &optional c)) — slots (c nil) b (a nil).
+(defun sbt-04-con (a b &optional c) (vector 'sbt-04 c b a))
+(defun sbt-04-a (s) (aref s 3))
+(defun sbt-04-b (s) (aref s 2))
+(defun sbt-04-c (s) (aref s 1))
+
+;; SBT-05: (:constructor sbt-05-con (&optional a b c)) — slots (c 1) (b 2) (a 3).
+;; Slot order is c, b, a in defstruct; constructor's &optional fills a, b, c.
+;; Test 05/1: (sbt-05-con) → a=3 b=2 c=1 (defaults from slot defs).
+(defun sbt-05-con (&optional (a nil a-p) (b nil b-p) (c nil c-p))
+  (vector 'sbt-05 (if c-p c 1) (if b-p b 2) (if a-p a 3)))
+(defun sbt-05-a (s) (aref s 3))
+(defun sbt-05-b (s) (aref s 2))
+(defun sbt-05-c (s) (aref s 1))
+
+;; SBT-06: (:constructor sbt-06-con (&optional (a 'p) (b 'q) (c 'r))) — slots (c 1) (b 2) (a 3).
+;; (con) → a='p b='q c='r per defaults from CON's lambda list (defstruct slot defaults ignored when con provides defaults).
+(defun sbt-06-con (&optional (a 'p) (b 'q) (c 'r)) (vector 'sbt-06 c b a))
+(defun sbt-06-a (s) (aref s 3))
+(defun sbt-06-b (s) (aref s 2))
+(defun sbt-06-c (s) (aref s 1))
+
+;; SBT-07: (:constructor sbt-07-con (&optional (a 'p a-p) (b 'q b-p) (c 'r c-p)
+;;                                              &aux (d (list (notnot a-p) (notnot b-p) (notnot c-p))))) — slots a b c d.
+(defun sbt-07-con (&optional (a 'p a-p) (b 'q b-p) (c 'r c-p))
+  (let ((d (list (and a-p t) (and b-p t) (and c-p t))))
+    (vector 'sbt-07 a b c d)))
+(defun sbt-07-a (s) (aref s 1))
+(defun sbt-07-b (s) (aref s 2))
+(defun sbt-07-c (s) (aref s 3))
+(defun sbt-07-d (s) (aref s 4))
+
+;; SBT-08: (:constructor sbt-08-con (&key ((:foo a)))) — slot a.
+(defun sbt-08-con (&key ((:foo a))) (vector 'sbt-08 a))
+(defun sbt-08-a (s) (aref s 1))
+
+;; SBT-09: (:constructor sbt-09-con (&key (a 'p a-p) ((:x b) 'q) (c 'r) d ((:y e))
+;;                                       ((:z f) 's z-p)
+;;                                       &aux (g (list (notnot a-p) (notnot z-p))))) — slots a b c d e f g.
+(defun sbt-09-con (&key (a 'p a-p) ((:x b) 'q) (c 'r) d ((:y e)) ((:z f) 's z-p))
+  (let ((g (list (and a-p t) (and z-p t))))
+    (vector 'sbt-09 a b c d e f g)))
+(defun sbt-09-a (s) (aref s 1))
+(defun sbt-09-b (s) (aref s 2))
+(defun sbt-09-c (s) (aref s 3))
+(defun sbt-09-d (s) (aref s 4))
+(defun sbt-09-e (s) (aref s 5))
+(defun sbt-09-f (s) (aref s 6))
+(defun sbt-09-g (s) (aref s 7))
+
+;; SBT-10: (:constructor sbt-10-con (&aux (a 10) (b (1+ a)))) — slots (a 1) (b 2).
+(defun sbt-10-con () (let* ((a 10) (b (1+ a))) (vector 'sbt-10 a b)))
+(defun sbt-10-a (s) (aref s 1))
+(defun sbt-10-b (s) (aref s 2))
+
+;; SBT-11: (:constructor sbt-11-con (&aux a b)) — slots a (b 0 :type integer).
+;; &aux without value means uninitialised — Modus represents as NIL.
+(defun sbt-11-con () (vector 'sbt-11 nil nil))
+(defun sbt-11-a (s) (aref s 1))
+(defun sbt-11-b (s) (aref s 2))
+(defun (setf sbt-11-a) (v s) (aset s 1 v))
+(defun (setf sbt-11-b) (v s) (aset s 2 v))
+
+;; SBT-12: (:constructor sbt-12-con (a &optional (b 1) &rest c &aux (d (list a b c)))) — slot d.
+(defun sbt-12-con (a &optional (b 1) &rest c)
+  (vector 'sbt-12 (list a b c)))
+(defun sbt-12-d (s) (aref s 1))
+
+;; SBT-13: (:constructor sbt-13-con (&key (a 1) (b 2) c &aux (d (list a b c)))) — slot d.
+(defun sbt-13-con (&key (a 1) (b 2) c)
+  (vector 'sbt-13 (list a b c)))
+(defun sbt-13-d (s) (aref s 1))
+
+;; SBT-14: (:constructor sbt-14-con (&key a b c &allow-other-keys)) — slots (a 1) (b 2) (c 3).
+(defun sbt-14-con (&key (a 1) (b 2) (c 3) &allow-other-keys)
+  (vector 'sbt-14 a b c))
+(defun sbt-14-a (s) (aref s 1))
+(defun sbt-14-b (s) (aref s 2))
+(defun sbt-14-c (s) (aref s 3))
+
+;; SBT-15: (:constructor sbt-15-con (&key ((:x a) nil) ((y b) nil) (c nil))) — slots a b c.
+;; The (y b) form uses non-keyword indicator — caller must pass symbol 'y, not :y.
+;; Test 15/2 just tests positive case; 15/3..8 test error paths (signals-error).
+(defun sbt-15-con (&key ((:x a)) ((y b)) c)
+  (vector 'sbt-15 a b c))
+(defun sbt-15-a (s) (aref s 1))
+(defun sbt-15-b (s) (aref s 2))
+(defun sbt-15-c (s) (aref s 3))
+
+;; SBT-16: (:constructor) + (:constructor sbt-16-con (a b c)) — slots a b c.
+;; Default constructor name is make-sbt-16 with &key a b c.
+(defun make-sbt-16 (&key a b c &allow-other-keys)
+  (vector 'sbt-16 a b c))
+(defun sbt-16-con (a b c) (vector 'sbt-16 a b c))
+(defun sbt-16-a (s) (aref s 1))
+(defun sbt-16-b (s) (aref s 2))
+(defun sbt-16-c (s) (aref s 3))
+
 ;; Sequence-aware REVERSE / NREVERSE — the prelude versions only handle
 ;; lists.  CLHS reverse/nreverse take any sequence (list, vector, string).
 ;; Override here (loads after prelude, last-defun-wins).

@@ -322,8 +322,28 @@
                    (return nil)))))
         (t (return ch))))))
 
+(defun %invalid-constituent-p (ch)
+  "Per CLHS 2.4.4.4: #\\Backspace, #\\Tab (when not whitespace),
+   #\\Linefeed, #\\Page, #\\Return, #\\Rubout have constituent trait
+   :invalid in standard syntax — using them in a token is a reader
+   error.  Modus's whitespace set already includes Tab/Newline/Page/CR,
+   so the only chars left here are Backspace (8) and Rubout (127).
+   Plus all OTHER control chars below 32 that aren't in the whitespace
+   set — they're also :invalid by analogy."
+  (let ((code (char-code ch)))
+    (and (or (= code 8) (= code 127)
+             (and (< code 32)
+                  (not (= code 9))   ; tab
+                  (not (= code 10))  ; newline
+                  (not (= code 12))  ; page
+                  (not (= code 13))))  ; return
+         t)))
+
 (defun %read-as-token (ch stream rt)
-  "Read ch as start of a token."
+  "Read ch as start of a token.  Invalid-constituent chars signal a
+   reader-error per CLHS 2.4.4.4."
+  (when (%invalid-constituent-p ch)
+    (%reader-error "invalid character in token"))
   (let ((syn (%syntax-type ch rt)))
     (%read-token-from stream ch rt
                       (or (eq syn :single-escape) (eq syn :multiple-escape)))))

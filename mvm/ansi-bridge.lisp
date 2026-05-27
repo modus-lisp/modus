@@ -353,6 +353,85 @@
 
 (defun identity (x) x)
 
+;; Sequence-aware REVERSE / NREVERSE — the prelude versions only handle
+;; lists.  CLHS reverse/nreverse take any sequence (list, vector, string).
+;; Override here (loads after prelude, last-defun-wins).
+(defun reverse (seq)
+  (cond
+    ((null seq) nil)
+    ((consp seq)
+     ;; List path (covers ordinary lists + chain-tail wrappers — they
+     ;; behave like lists for car/cdr walk; for true wrapper arrays
+     ;; we go through %mda-data below).
+     (let ((result nil) (cur seq))
+       (loop
+         (when (null cur) (return result))
+         (setq result (cons (car cur) result))
+         (setq cur (cdr cur)))))
+    ((%mda-p seq)
+     ;; Native MDA — reverse the logical sequence respecting fill-pointer.
+     (let* ((len (length seq))
+            (out (if (stringp seq) (make-string len) (make-array len)))
+            (i 0))
+       (loop
+         (when (= i len) (return out))
+         (aset out i (aref seq (- len i 1)))
+         (setq i (+ i 1)))))
+    ((stringp seq)
+     (let* ((len (array-length seq))
+            (out (make-string len))
+            (i 0))
+       (loop
+         (when (= i len) (return out))
+         (aset out i (aref seq (- len i 1)))
+         (setq i (+ i 1)))))
+    ((arrayp seq)
+     (let* ((len (array-length seq))
+            (out (make-array len))
+            (i 0))
+       (loop
+         (when (= i len) (return out))
+         (aset out i (aref seq (- len i 1)))
+         (setq i (+ i 1)))))
+    (t nil)))
+
+(defun nreverse (seq)
+  (cond
+    ((null seq) nil)
+    ((consp seq)
+     ;; Destructive list reverse (from prelude).
+     (let ((prev nil) (cur seq))
+       (loop
+         (when (null cur) (return prev))
+         (let ((next (cdr cur)))
+           (rplacd cur prev)
+           (setq prev cur)
+           (setq cur next)))))
+    ((%mda-p seq)
+     ;; Reverse in place over logical length (respects fp).
+     (let* ((len (length seq))
+            (i 0)
+            (j (- len 1)))
+       (loop
+         (when (>= i j) (return seq))
+         (let ((tmp (aref seq i)))
+           (aset seq i (aref seq j))
+           (aset seq j tmp))
+         (setq i (+ i 1))
+         (setq j (- j 1)))))
+    ((or (stringp seq) (arrayp seq))
+     (let* ((len (array-length seq))
+            (i 0)
+            (j (- len 1)))
+       (loop
+         (when (>= i j) (return seq))
+         (let ((tmp (aref seq i)))
+           (aset seq i (aref seq j))
+           (aset seq j tmp))
+         (setq i (+ i 1))
+         (setq j (- j 1)))))
+    (t seq)))
+
 (defun rplaca (cons obj)
   (set-car cons obj)
   cons)

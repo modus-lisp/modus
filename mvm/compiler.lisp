@@ -5163,13 +5163,45 @@
          ;; the overlap; the generated code then returns a (error …) form
          ;; at the very end so HANDLER-CASE in tests like loop10
          ;; 20959/20960/20982/20983/21002 catches it at runtime.
-         (with-names (mapcar #'car with-binds))
+         (with-names
+           ;; Flatten with-binds; entries can be (var init) or
+           ;; (:and-group (var1 init1) (var2 init2) …).
+           (let ((acc nil))
+             (dolist (wb with-binds)
+               (cond ((and (consp wb) (eq (car wb) :and-group))
+                      (dolist (p (cdr wb)) (push (car p) acc)))
+                     ((consp wb) (push (car wb) acc))))
+             acc))
          (into-conflict
           (let ((conflict nil))
             (dolist (a accs)
               (let ((iv (%loop-acc-into-var a)))
                 (when (and iv (member iv with-names))
                   (setq conflict iv))))
+            conflict))
+         ;; CLHS 6.1.1.7: FOR / AS / AND iteration vars must be distinct.
+         ;; Tests loop6 21513-21517 etc. do `(LOOP FOR K FROM 1 TO 10
+         ;; FOR K BEING THE HASH-KEYS …)` expecting a program-error.
+         ;; Also detect (FOR (K . K) …) — duplicate inside destructuring
+         ;; pattern.
+         (iter-var-conflict
+          (let ((seen nil) (conflict nil))
+            (labels ((rec (v)
+                       (cond
+                         ((null v) nil)
+                         ((symbolp v)
+                          (cond ((member v seen) (setq conflict v))
+                                (t (push v seen))))
+                         ((consp v) (rec (car v)) (rec (cdr v))))))
+              (dolist (iter iters)
+                (rec (loop-iter-var iter))
+                ;; :hash-keys / :hash-values stash the USING var in
+                ;; step-form — check it for duplicates too (loop6
+                ;; 21516/21517 do `FOR K BEING THE HASH-KEYS … USING
+                ;; (HASH-VALUE K)`).
+                (when (member (loop-iter-kind iter) '(:hash-keys :hash-values))
+                  (rec (loop-iter-step-form iter))))
+              (dolist (n with-names) (rec n)))
             conflict))
          ;; Conditional INTO accumulators: list of (var . kind).  Each is
          ;; bound here and finalised; body emission already happened in
@@ -5692,6 +5724,9 @@
           (into-conflict
            `(error "LOOP: variable ~A is already bound by WITH and INTO"
                    ',into-conflict))
+          (iter-var-conflict
+           `(error "LOOP: variable ~A is bound twice by FOR / AS / AND / WITH / destructuring"
+                   ',iter-var-conflict))
           ;; CLHS 6.1.1.7: an ANONYMOUS value-aggregator (COLLECT / SUM /
           ;; COUNT / etc. WITHOUT an INTO clause) supplies the LOOP's
           ;; return value, so combining it with ALWAYS / NEVER / THEREIS

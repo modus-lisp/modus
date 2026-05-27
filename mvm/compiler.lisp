@@ -4902,13 +4902,54 @@
                (loop
                  (when (null rest) (return-from with-parse))
                  (let ((var (car rest))
-                       (init nil))
+                       (init nil)
+                       (type-spec nil)
+                       (init-given nil))
                    (setf rest (cdr rest))
+                   ;; Optional OF-TYPE typespec (full form).
+                   (when (and rest (symbolp (car rest))
+                              (= (normalize-name (car rest))
+                                 729509721274984859))   ; OF-TYPE
+                     (setf type-spec (cadr rest))
+                     (setf rest (cddr rest)))
+                   ;; Or bare type symbol shorthand (FIXNUM, FLOAT, T,
+                   ;; STRING, …) — only when NOT `=` and not a LOOP kw.
+                   (when (and rest (null type-spec) (symbolp (car rest))
+                              (not (= (normalize-name (car rest))
+                                      1009698407182718722))  ; =
+                              (not (= (normalize-name (car rest))
+                                      313452561496444628))   ; AND
+                              (not (cl-loop-keyword-p (car rest))))
+                     (setf type-spec (car rest))
+                     (setf rest (cdr rest)))
+                   ;; Optional `= init`.
                    (when (and rest (symbolp (car rest))
                               (= (normalize-name (car rest)) 1009698407182718722))
                      (setf rest (cdr rest))
                      (setf init (car rest))
+                     (setf init-given t)
                      (setf rest (cdr rest)))
+                   ;; No init?  Default per CLHS typed-init: FIXNUM/INT→0,
+                   ;; FLOAT-family→0.0, STRING→"", T/etc→NIL.
+                   (when (and (not init-given) type-spec)
+                     (setf init
+                           (cond
+                             ((not (symbolp type-spec)) nil)
+                             ((or (eq type-spec 'fixnum)
+                                  (eq type-spec 'integer)
+                                  (eq type-spec 'unsigned-byte)
+                                  (eq type-spec 'signed-byte)
+                                  (eq type-spec 'bit)
+                                  (eq type-spec 'number))
+                              0)
+                             ((or (eq type-spec 'float)
+                                  (eq type-spec 'short-float)
+                                  (eq type-spec 'single-float)
+                                  (eq type-spec 'double-float)
+                                  (eq type-spec 'long-float))
+                              0.0)
+                             ((eq type-spec 'string) "")
+                             (t nil))))
                    (push (list var init) group)
                    (unless (and rest (symbolp (car rest))
                                 (= (normalize-name (car rest)) 313452561496444628))

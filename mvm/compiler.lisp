@@ -5483,9 +5483,56 @@
                                    ,last-form))))
                     (t tf)))
                 final-test-forms))
-             (inner2 (if (eq test-forms-with-nat loop-body)
+             ;; Expand LOOP-FINISH to (progn (setq %nat t) (return X)) where
+             ;; X is the natural-exit value for the accumulator type:
+             ;;   has-always: T   (all iterations satisfied)
+             ;;   has-thereis: NIL (no iteration matched)
+             ;;   else: NIL
+             ;; CLHS-defined: LOOP-FINISH terminates normally, runs FINALLY,
+             ;; and returns the accumulator's natural value.
+             (loop-finish-return-val
+               (cond (has-always t) (t nil)))
+             (loop-finish-expander
+               (lambda (f)
+                 (labels ((rec (x)
+                            (cond
+                              ((atom x) x)
+                              ;; Don't recurse into nested LOOP forms.
+                              ((and (consp x) (symbolp (car x))
+                                    (string= (symbol-name (car x)) "LOOP"))
+                               x)
+                              ;; Don't recurse into QUOTE — its argument
+                              ;; can be ANY structure (dotted pairs etc.).
+                              ((and (consp x) (symbolp (car x))
+                                    (string= (symbol-name (car x)) "QUOTE"))
+                               x)
+                              ((and (consp x) (symbolp (car x))
+                                    (string= (symbol-name (car x)) "LOOP-FINISH")
+                                    (null (cdr x)))
+                               `(progn (setq ,%nat-var t)
+                                       (return ,loop-finish-return-val)))
+                              ;; Manual car/cdr walk — mapcar fails on
+                              ;; dotted pairs which appear inside quoted
+                              ;; data and some setq-targets.  rec-cdr
+                              ;; walks the spine, returning the tail
+                              ;; unchanged if it's an atom (dotted).
+                              ((consp x)
+                               (cons (rec (car x)) (rec-cdr (cdr x))))))
+                          (rec-cdr (x)
+                            (cond
+                              ((null x) nil)
+                              ((atom x) x)
+                              ((consp x) (cons (rec (car x)) (rec-cdr (cdr x)))))))
+                   (rec f))))
+             ;; Compose: first inject %nat into test exits, then expand
+             ;; LOOP-FINISH wherever it appears.  test-forms-with-nat is
+             ;; already %nat-injected; finish-expander walks it AND every
+             ;; body form for LOOP-FINISH occurrences.
+             (effective-body
+               (mapcar loop-finish-expander test-forms-with-nat))
+             (inner2 (if (eq effective-body loop-body)
                          inner
-                         `(loop ,@test-forms-with-nat)))
+                         `(loop ,@effective-body)))
              ;; Pre-finally fixups: nreverse any anonymous COLLECT acc so it
              ;; appears in correct order in FINALLY (and as the LOOP value).
              ;; INTO-named COLLECTs also need nreverse so user code sees the

@@ -1784,24 +1784,33 @@
          ;; Allocates (count+1)*8 bytes, aligned to 16 (header + elements)
          ;; Header = (count << 8) | array-subtag
          ;; Result = R12 | 0x09 (object tag)
+         ;;
+         ;; Ordering note: do all scratch-RAX work FIRST (header build,
+         ;; size calc, R12 advance) and compute d = R12-old + 9 LAST via
+         ;; the saved R12-old on the stack.  Earlier code emitted
+         ;; `LEA d, [R12+9]` BEFORE a `POP RAX`; when `d == RAX`
+         ;; (because vd's phys reg was RAX, or vd was spilled and d
+         ;; defaulted to scratch), the pop clobbered the array pointer
+         ;; with the restored count.  Resulting array had length 0 and
+         ;; the slot stored the aligned size instead of the pointer.
          (let* ((vd (first operands))
                 (vcount (second operands))
                 (d (dest-phys-or-scratch vd))
                 (pc (vreg-phys vcount)))
-           ;; Load count into scratch register
+           ;; Save R12-old on stack for final LEA.
+           (emit-push buf 'r12)
+           ;; Load count into scratch register.
            (if pc
                (emit-mov-reg-reg buf +scratch-reg+ pc)
                (emit-load-vreg buf vcount +scratch-reg+))
-           ;; Save count on stack (will be clobbered by header build)
+           ;; Save count on stack (will be clobbered by header build).
            (emit-push buf +scratch-reg+)
-           ;; Build header: (count << 8) | subtag-array
+           ;; Build header: (count << 8) | subtag-array.
            (emit-shl-reg-imm buf +scratch-reg+ 8)
            (emit-or-reg-imm buf +scratch-reg+ #x32)  ; array subtag
-           ;; Write header at [R12]
+           ;; Write header at [R12] (R12 still points to array base).
            (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
-           ;; Result = R12 | 0x09 (object tag)
-           (emit-lea buf d 'r12 #x09)
-           ;; Restore count, compute allocation size
+           ;; Restore count, compute allocation size.
            (emit-pop buf +scratch-reg+)
            ;; size = (count + 2) << 3, aligned to 16
            ;; +2 because elements start at offset +16 (header + padding)
@@ -1809,8 +1818,11 @@
            (emit-shl-reg-imm buf +scratch-reg+ 3)  ; * 8 bytes per word
            (emit-add-reg-imm buf +scratch-reg+ 15)  ; for alignment
            (emit-and-reg-imm buf +scratch-reg+ -16) ; align to 16
-           ;; Advance alloc pointer
+           ;; Advance alloc pointer.
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
+           ;; Recover R12-old (the array base) and compute d = base | 9.
+           (emit-pop buf +scratch-reg+)
+           (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 
         ((op= +op-set-cenv+)
@@ -2036,24 +2048,29 @@
            (emit-bytes buf #x66 #x0F #x2E #xC1)))
 
         ((op= +op-alloc-string+)
-         ;; Like alloc-array but with string subtag #x31
+         ;; Like alloc-array but with string subtag #x31.
+         ;; Same d/scratch-clobber bug fix as +op-alloc-array+: compute
+         ;; d = R12-old + 9 via the saved R12-old at the end, after all
+         ;; RAX-clobbering work is done.
          (let* ((vd (first operands))
                 (vcount (second operands))
                 (d (dest-phys-or-scratch vd))
                 (pc (vreg-phys vcount)))
+           (emit-push buf 'r12)              ; save R12-old
            (if pc (emit-mov-reg-reg buf +scratch-reg+ pc)
                (emit-load-vreg buf vcount +scratch-reg+))
            (emit-push buf +scratch-reg+)
            (emit-shl-reg-imm buf +scratch-reg+ 8)
            (emit-or-reg-imm buf +scratch-reg+ #x31)  ; STRING subtag
            (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
-           (emit-lea buf d 'r12 #x09)
-           (emit-pop buf +scratch-reg+)
+           (emit-pop buf +scratch-reg+)      ; restore count
            (emit-add-reg-imm buf +scratch-reg+ 2)
            (emit-shl-reg-imm buf +scratch-reg+ 3)
            (emit-add-reg-imm buf +scratch-reg+ 15)
            (emit-and-reg-imm buf +scratch-reg+ -16)
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
+           (emit-pop buf +scratch-reg+)      ; recover R12-old
+           (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 
         ((op= +op-obj-ref+)

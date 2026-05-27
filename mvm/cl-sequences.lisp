@@ -2364,7 +2364,7 @@
    ANSI: requires SIZE as a non-negative integer."
   (unless (and (integerp size) (>= size 0))
     (%signal-program-error))
-  (let ((ch 32) (allow-other-keys nil) (aok-set nil))
+  (let ((ch 32) (ie-set nil) (allow-other-keys nil) (aok-set nil))
     ;; Probe :allow-other-keys.  CLHS §3.4.1.4.1.1.2: leftmost wins.
     (let ((p args))
       (loop (when (null p) (return))
@@ -2376,7 +2376,9 @@
       (loop (when (null a) (return))
         (when (null (cdr a)) (%signal-program-error))
         (cond
-          ((eq (car a) :initial-element) (setq ch (char-code (cadr a))))
+          ;; Per CLHS 3.4.1.4.1: leftmost (k v) pair wins on duplicates.
+          ((eq (car a) :initial-element)
+           (unless ie-set (setq ch (char-code (cadr a))) (setq ie-set t)))
           ((eq (car a) :element-type)    nil)
           ((eq (car a) :allow-other-keys) nil)
           (t (unless allow-other-keys (%signal-program-error))))

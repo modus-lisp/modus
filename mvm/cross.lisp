@@ -476,6 +476,8 @@
     ((null boot-descriptor) 0)
     ;; Linux x64 ELF64: ELF header (64) + 1 program header (56) = 120
     ((eq (getf boot-descriptor :elf-format) :linux-x64) 120)
+    ;; Linux AArch64 ELF64: same 64+56 layout as x64.
+    ((eq (getf boot-descriptor :elf-format) :linux-aarch64) 120)
     ;; UEFI PE wrap: complex, no LI-CONST support yet
     ((getf boot-descriptor :uefi) 0)
     ;; Generic ELF32-be / ELF64-be wraps
@@ -514,9 +516,26 @@
              ;; code runs at identity-mapped VAs which equal those PAs.
              ;; So function-address constants must use load-addr + 0x80000.
              (arch (and boot-descriptor (getf boot-descriptor :arch)))
+             (elf-fmt (and boot-descriptor (getf boot-descriptor :elf-format)))
+             ;; Bare-metal QEMU AArch64 / RPi loads the kernel at
+             ;; load-addr+0x80000 (Linux Image convention), so fn-addr
+             ;; constants must point at load-addr+0x80000+offset.
+             ;; Linux/AArch64 (`:linux-aarch64` elf-format) goes through
+             ;; the normal ELF loader — no 0x80000 offset.
              (image-load-offset
-              (if (member arch '(:aarch64 :rpi)) #x80000 0))
-             (load-addr (+ declared-load-addr image-load-offset))
+              (if (and (member arch '(:aarch64 :rpi))
+                       (not (eq elf-fmt :linux-aarch64)))
+                  #x80000
+                  0))
+             ;; ELF wrapping prepends an ehdr+phdr (120 bytes for both
+             ;; Linux/x64 and Linux/AArch64) ahead of the raw image
+             ;; bytes.  native-image-offset is measured from the start
+             ;; of raw-bytes (which doesn't include the ELF header), but
+             ;; the runtime sees the file mapped at p_vaddr with file
+             ;; offset 0 → raw byte K lives at vaddr load-addr+120+K.
+             ;; So fn-addr constants must add the wrap header too.
+             (wrap-header (wrap-header-size-for-boot boot-descriptor))
+             (load-addr (+ declared-load-addr image-load-offset wrap-header))
              ;; Build bytecode-offset → native-offset lookup.
              (bc-to-native (make-hash-table :test 'eql)))
         (dolist (fn-info (mvm-module-function-table module))
@@ -560,8 +579,14 @@
     (when (and cb-off ce-off boot-descriptor)
       (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
              (arch (getf boot-descriptor :arch))
-             (image-load-offset (if (member arch '(:aarch64 :rpi)) #x80000 0))
-             (load-addr (+ declared-load-addr image-load-offset))
+             (elf-fmt (getf boot-descriptor :elf-format))
+             (image-load-offset
+              (if (and (member arch '(:aarch64 :rpi))
+                       (not (eq elf-fmt :linux-aarch64)))
+                  #x80000
+                  0))
+             (wrap-header (wrap-header-size-for-boot boot-descriptor))
+             (load-addr (+ declared-load-addr image-load-offset wrap-header))
              (native-image-offset (or (kernel-image-native-image-offset image) 0))
              (native-code-length (length (kernel-image-native-code image)))
              (code-base (+ load-addr native-image-offset))
@@ -928,6 +953,15 @@
                                        (or (kernel-image-native-image-offset image) 0)
                                        :native-code-length
                                        (length (kernel-image-native-code image))))
+                    ((eq (getf boot-descriptor :elf-format) :linux-aarch64)
+                     (wrap-in-elf64-le-aa64 raw-bytes
+                                            (or (getf boot-descriptor :load-addr) #x400000)
+                                            :function-table
+                                            (mvm-module-function-table module)
+                                            :native-image-offset
+                                            (or (kernel-image-native-image-offset image) 0)
+                                            :native-code-length
+                                            (length (kernel-image-native-code image))))
                     (t (let ((elf-machine (getf boot-descriptor :elf-machine))
                              (load-addr (or (getf boot-descriptor :load-addr) 0))
                              (elf-class (getf boot-descriptor :elf-class 32))
@@ -958,7 +992,8 @@
          ;; ehdr+phdr for the ELF wrapper.  For non-ELF targets this is 0;
          ;; the image-byte 0 already lives at the load address.
          (elf-header (if (and boot-descriptor
-                              (eq (getf boot-descriptor :elf-format) :linux-x64))
+                              (or (eq (getf boot-descriptor :elf-format) :linux-x64)
+                                  (eq (getf boot-descriptor :elf-format) :linux-aarch64)))
                          120
                          0))
          (nio (or (kernel-image-native-image-offset image) 0))
@@ -995,6 +1030,7 @@
     (:fixpoint :aarch64)
     (:uefi-x64 :x86-64)
     (:linux-x64 :x86-64)
+    (:linux-aarch64 :aarch64)
     (:x64-console :x86-64)
     (:i386-console :i386)
     (otherwise target)))
@@ -1062,6 +1098,7 @@
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (:uefi-x64 (uefi-x64-boot-descriptor))
     (:linux-x64 (linux-x64-boot-descriptor))
+    (:linux-aarch64 (linux-aarch64-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))
     (:i386-console (i386-console-boot-descriptor))
     (otherwise nil)))

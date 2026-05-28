@@ -2677,6 +2677,18 @@
       ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
       ((= op-name 385320872711688559) (compile-syscall3 (cdr form) env dest))
       ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
+      ;; AArch64 Linux *at fileio helpers — see translate-aarch64.lisp traps
+      ;; 0x0506..0x050A and the cl-fileio override block in
+      ;; build-aarch64-linux-ansi-test.lisp.  Not callable on bare-metal
+      ;; or x64 (the trap codes are gated on *aarch64-linux-mode* and
+      ;; emit garbage on other targets — the build script doesn't emit
+      ;; calls to these unless we're in Linux/AArch64 mode).
+      ((= op-name (compute-name-hash "%AARCH64-ALARM"))     (compile-aarch64-alarm     (cdr form) env dest))
+      ((= op-name (compute-name-hash "%AARCH64-OPENAT"))    (compile-aarch64-openat    (cdr form) env dest))
+      ((= op-name (compute-name-hash "%AARCH64-UNLINKAT"))  (compile-aarch64-unlinkat  (cdr form) env dest))
+      ((= op-name (compute-name-hash "%AARCH64-NEWFSTATAT")) (compile-aarch64-newfstatat (cdr form) env dest))
+      ((= op-name (compute-name-hash "%AARCH64-MKDIRAT"))   (compile-aarch64-mkdirat   (cdr form) env dest))
+      ((= op-name (compute-name-hash "%AARCH64-RENAMEAT"))  (compile-aarch64-renameat  (cdr form) env dest))
       ;; (%mmap-shared-page size) — allocate a shared-memory anonymous
       ;; mmap page.  Returns the tagged address or -1 (tagged) on error.
       ;; Used by fork-file to share a last-attempted-test-id slot
@@ -8180,6 +8192,45 @@
   (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0503)
   (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-aarch64-fileio-trap (trap-code args env dest)
+  "Compile a Linux/AArch64 file-I/O `*at` syscall trap.
+   Used by the per-arch override `(%aarch64-openat path flags mode)`
+   etc. — the AArch64 generic ABI dropped open/stat/unlink/mkdir/rename
+   in favour of `*at` variants, and these traps emit the `AT_FDCWD`
+   argument inline.  See translate-aarch64.lisp `((= code #x0506))`
+   through `((= code #x050A))`.
+   Args: (path-or-old-addr arg2 arg3); spilled identically to
+   compile-syscall3."
+  (compile-form (car args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadr args) env dest)
+  (emit-ir :push dest)
+  (compile-form (caddr args) env dest)
+  (emit-ir :mov +vreg-v3+ dest)
+  (emit-ir :pop +vreg-v2+)
+  (emit-ir :pop +vreg-v1+)
+  (emit-ir :trap trap-code)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-aarch64-alarm (args env dest)
+  "Compile (%aarch64-alarm seconds).  Setitimer-backed alarm; default
+   SIGALRM action terminates the process so fork-file's child gets
+   killed if its thunk hangs past the deadline."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0505)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-aarch64-openat (args env dest)
+  (compile-aarch64-fileio-trap #x0506 args env dest))
+(defun compile-aarch64-unlinkat (args env dest)
+  (compile-aarch64-fileio-trap #x0507 args env dest))
+(defun compile-aarch64-newfstatat (args env dest)
+  (compile-aarch64-fileio-trap #x0508 args env dest))
+(defun compile-aarch64-mkdirat (args env dest)
+  (compile-aarch64-fileio-trap #x0509 args env dest))
+(defun compile-aarch64-renameat (args env dest)
+  (compile-aarch64-fileio-trap #x050A args env dest))
 
 (defun compile-mmap-shared (args env dest)
   "Compile (%mmap-shared-page size) — allocate a shared anonymous mmap

@@ -1311,13 +1311,29 @@
                 (a64-emit-prologue buf)
                 ;; If > 4 params, copy overflow args from caller's stack
                 ;; to local frame slots so stack-load can find them.
-                ;; Overflow arg k is at [FP + 80 + k*8] (above save area).
+                ;;
+                ;; Source stride matches caller's :push stride.  When
+                ;; *aarch64-stack-align-16* is enabled (Linux EL0
+                ;; SCTLR.SA0 demands 16-byte SP alignment at every
+                ;; SP-relative load/store), :push reserves 16 bytes per
+                ;; arg — the value at [SP+0], 8 bytes of padding above.
+                ;; So overflow arg k lives at [FP + 80 + k*16].  In
+                ;; bare-metal 8-byte-stack mode it lives at [FP + 80 + k*8].
+                ;;
+                ;; Mismatching these silently corrupts every >4-param
+                ;; call's args 5+ (slot N reads either junk padding or
+                ;; the NEXT arg's value).  Found by probing %alloc-mda
+                ;; (7 args): slot 6 (data) consistently read symbol T
+                ;; (slot 5's etype value) instead of the underlying
+                ;; array — triggering SIGSEGV at every subsequent aref
+                ;; on fill-pointer arrays.  See feedback_aa64_stride.
                 (when (> code 4)
-                  (loop for i from 4 below code
-                        for src-offset = (+ 80 (* (- i 4) 8))
-                        for dst-offset = (+ +a64-frame-slot-base+ (* i -8))
-                        do (a64-ldur buf +a64-x16+ +a64-x29+ src-offset)
-                           (a64-stur buf +a64-x16+ +a64-x29+ dst-offset))))
+                  (let ((arg-stride (if *aarch64-stack-align-16* 16 8)))
+                    (loop for i from 4 below code
+                          for src-offset = (+ 80 (* (- i 4) arg-stride))
+                          for dst-offset = (+ +a64-frame-slot-base+ (* i -8))
+                          do (a64-ldur buf +a64-x16+ +a64-x29+ src-offset)
+                             (a64-stur buf +a64-x16+ +a64-x29+ dst-offset)))))
                ((< code #x0300)
                 ;; Frame-alloc/frame-free: NOP for now
                 nil)
@@ -1895,9 +1911,17 @@
                         (a64-ldr-unsigned buf +a64-x16+ 10 0)
                         ;; str x16, [x11]
                         (a64-str-unsigned buf +a64-x16+ 11 0)
-                        ;; add x10, x10, #8
-                        (a64-add-imm buf 10 10 8)
-                        ;; sub x11, x11, #8
+                        ;; add x10, x10, #(stride) — caller's :push stride
+                        ;; (16 in Linux/aligned mode, 8 in bare-metal).
+                        ;; Mismatching this corrupts the copied args the
+                        ;; same way the static frame-enter copy did
+                        ;; before the corresponding fix in <#x0100>.
+                        (a64-add-imm buf 10 10
+                                     (if *aarch64-stack-align-16* 16 8))
+                        ;; sub x11, x11, #8 — dst stride is the frame
+                        ;; slot pitch (always 8), independent of push
+                        ;; mode — frame slots are densely packed in our
+                        ;; spill area.
                         (a64-sub-imm buf 11 11 8)
                         ;; sub w9, w9, #1
                         (a64-sub-imm buf 9 9 1)

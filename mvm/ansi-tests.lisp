@@ -1522,6 +1522,43 @@
 ;;; Master test runner
 ;;; ============================================================
 
+;; AArch64 / Linux codegen probes — narrow regression tests for the
+;; >4-arg stack-stride bug found 2026-05-28 (see translate-aarch64.lisp's
+;; #x0100 trap-decode and #x0530 COPY-OVERFLOW-ARGS comments).  Linux
+;; EL0 SCTLR.SA0 enforces 16-byte SP alignment, so :push consumes 16
+;; bytes per value; the matching frame-enter / overflow-copy stride
+;; must be 16, not 8.  Without the fix, every >4-arg call (notably
+;; %alloc-mda's 7 args) silently corrupts args 5+, breaking every
+;; fill-pointer / multi-dim array down the line.  Kept slim — these
+;; probes are the canonical reproducer; cluster regressions show up in
+;; count.lsp / find.lsp / etc.  Called near the start of run-all-tests
+;; so they fire regardless of later runner crashes.
+(defun run-aa64-probe-tests ()
+  ;; 57001: count of literal vector — passes on both platforms.  Establishes
+  ;; that count.lsp's count-vector.1 form works in isolation.
+  (handler-case
+      (deftest 57001 (count 'a (vector 'a 'b 'c 'd 'e 'a 'e 'f)) 2)
+    (t (c) (%record-test-fail-or-emit 57001)))
+  ;; 57002: the form that hard-SIGSEGV'd on Linux/AArch64 before the
+  ;; stack-stride fix.  make-array with :fill-pointer t routes through
+  ;; %alloc-mda (7 args = 4 reg + 3 stack); the stride mismatch
+  ;; corrupted slot 6 (data) with slot 5's value (etype = T), so the
+  ;; later aref's :obj-ref read a tagged-T as the data pointer and
+  ;; tried to dereference [T+7] — SIGSEGV.
+  (handler-case
+      (deftest 57002 (count 'a (make-array 8
+                                           :initial-contents '(a b c d e a e f)
+                                           :fill-pointer t))
+        2)
+    (t (c) (%record-test-fail-or-emit 57002)))
+  ;; 57003: same shape, accessing an individual element via aref.  This
+  ;; is the crash path inside count's loop.
+  (handler-case
+      (let ((a (make-array 8 :initial-contents '(a b c d e a e f)
+                             :fill-pointer t)))
+        (deftest 57003 (aref a 5) 'a))
+    (t (c) (%record-test-fail-or-emit 57003))))
+
 (defun run-all-tests ()
   ;; Each runner wrapped in handler-case so an uncaught error in one
   ;; suite doesn't abort the rest.  Per-deftest crashes already FAIL
@@ -1529,6 +1566,7 @@
   ;; against runner-init crashes and arg-evaluation crashes inside
   ;; deftest (which is a plain defun, not a macro, so its args are
   ;; eagerly evaluated and any error there propagates up).
+  (handler-case (run-aa64-probe-tests) (t (c) nil))
   (handler-case (run-real-ansi-cons-tests) (t (c) nil))
   (handler-case (run-cons-tests) (t (c) nil))
   (handler-case (run-list-tests) (t (c) nil))

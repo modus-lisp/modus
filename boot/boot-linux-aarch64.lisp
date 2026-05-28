@@ -202,6 +202,46 @@
     ;; STR XZR, [x16, #(i*8)]
     (emit-aarch64-u32 buf (logior #xF9000000 (ash i 10) (ash 16 5) 31)))
 
+  ;; Copy argv strings into fixed BSS so `%parse-decimal-at-fixed-*`
+  ;; can read them.  Mirrors boot-linux-x64.lisp's rep-movsb path: the
+  ;; Lisp side expects the *string contents* of argv[1] at 0x10000208
+  ;; and argv[2] at 0x10000248, not the argv pointer.  Without this
+  ;; copy, the fixed buffers stay zeroed and `(%parse-decimal-at-fixed-208)`
+  ;; returns 0 — *skip-below* / *run-only-below* end up 0, every shard
+  ;; runs the full suite, and the per-test range arguments are silently
+  ;; ignored.  Each block is 13 fixed-size instructions; we hand-encode
+  ;; the relative branches (offset19 in word units) below.
+
+  ;; argv[1] → 0x10000208 (max 63 bytes, source already null-terminated)
+  (emit-aarch64-u32 buf #xF100067F)   ; CMP x19, #1
+  (emit-aarch64-u32 buf #x5400018D)   ; B.LE +12 (skip 12 insns to next block)
+  (emit-aarch64-u32 buf #xAA1403E9)   ; MOV x9, x20      (src = argv[1])
+  (emit-aarch64-u32 buf #xD280410A)   ; MOVZ x10, #0x208
+  (emit-aarch64-u32 buf #xF2A2000A)   ; MOVK x10, #0x1000, LSL #16  (dst = 0x10000208)
+  (emit-aarch64-u32 buf #x528007EB)   ; MOVZ w11, #63    (max bytes)
+  (emit-aarch64-u32 buf #x3940012C)   ; LDRB w12, [x9]
+  (emit-aarch64-u32 buf #x340000CC)   ; CBZ w12, +6      (null term → exit loop)
+  (emit-aarch64-u32 buf #x3900014C)   ; STRB w12, [x10]
+  (emit-aarch64-u32 buf #x91000529)   ; ADD x9, x9, #1
+  (emit-aarch64-u32 buf #x9100054A)   ; ADD x10, x10, #1
+  (emit-aarch64-u32 buf #x5100016B)   ; SUB w11, w11, #1
+  (emit-aarch64-u32 buf #x35FFFF4B)   ; CBNZ w11, -6     (back to LDRB)
+
+  ;; argv[2] → 0x10000248 (same shape, different src/dst)
+  (emit-aarch64-u32 buf #xF1000A7F)   ; CMP x19, #2
+  (emit-aarch64-u32 buf #x5400018D)   ; B.LE +12
+  (emit-aarch64-u32 buf #xAA1503E9)   ; MOV x9, x21      (src = argv[2])
+  (emit-aarch64-u32 buf #xD280490A)   ; MOVZ x10, #0x248
+  (emit-aarch64-u32 buf #xF2A2000A)   ; MOVK x10, #0x1000, LSL #16  (dst = 0x10000248)
+  (emit-aarch64-u32 buf #x528007EB)   ; MOVZ w11, #63
+  (emit-aarch64-u32 buf #x3940012C)   ; LDRB w12, [x9]
+  (emit-aarch64-u32 buf #x340000CC)   ; CBZ w12, +6
+  (emit-aarch64-u32 buf #x3900014C)   ; STRB w12, [x10]
+  (emit-aarch64-u32 buf #x91000529)   ; ADD x9, x9, #1
+  (emit-aarch64-u32 buf #x9100054A)   ; ADD x10, x10, #1
+  (emit-aarch64-u32 buf #x5100016B)   ; SUB w11, w11, #1
+  (emit-aarch64-u32 buf #x35FFFF4B)   ; CBNZ w11, -6
+
   ;; mmap heap:
   ;;   x0=hint=0x10000000, x1=size, x2=PROT_RW(3), x3=MAP_PRIV|ANON(0x22),
   ;;   x4=-1, x5=0, x8=222(mmap).  SVC #0.

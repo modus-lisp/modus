@@ -121,6 +121,31 @@
    bare metal).  Nil outside that dynamic extent — the gc-check
    translator falls back to legacy BRK behaviour when unbound.")
 
+(defvar *aarch64-stack-align-16* nil
+  "When T, emit :push/:pop as a 16-byte aligned pair
+   (SUB SP, #16 ; STR Xs, [SP])/(LDR Xd, [SP] ; ADD SP, #16) instead of
+   the bare-metal STR Xs, [SP, #-8]! / LDR Xd, [SP], #8 single-word form.
+   Linux EL0 enforces SP-alignment via SCTLR_EL1.SA0; any SP-relative
+   load/store with an unaligned SP base traps SIGBUS BUS_ADRALN.  The
+   Linux/AArch64 build script enables this; bare-metal builds leave it
+   NIL to preserve the existing 8-byte stack discipline (the handler
+   frame layout in fork-file etc. assumes single-word push offsets).")
+
+(defvar *aarch64-linux-mode* nil
+  "When T, AArch64 traps that have an OS dependency (serial write 0x0300,
+   sys-exit 0x0500) switch to Linux syscall implementations
+   (write(2) to fd=1; exit(2) with status).  NIL is bare-metal (UART
+   MMIO, infinite WFI loop).")
+
+(defvar *aarch64-fn-align-offset* 0
+  "Bytes of pre-native-code wrapper between load-addr and the first
+   instruction of native code at runtime.  Bare-metal puts native code
+   directly at load-addr+native_image_offset (offset=0 here).  Linux
+   ELF wraps prepend 120 bytes of ehdr+phdr before the LOAD bytes —
+   so set this to 120 in the Linux/AArch64 build script so the
+   function-entry alignment loop lands runtime VAs on 16-byte
+   boundaries (needed for OR-3 fn-pointer tagging).")
+
 (defvar *aarch64-gc-collect-bytecode-offset* nil
   "Bytecode-offset of %gc-collect in the kernel image, computed in
    cross.lisp by scanning the function table.  Used by the GC
@@ -249,12 +274,14 @@
 ;;; Branch fixups are resolved in a second pass.
 
 (defstruct a64-buffer
-  ;; 8M entries × 4 bytes = 32 MB native code.  ANSI-test-sized images
-  ;; need ~30 MB; the previous 512K-entry cap overflowed mid-build.
-  (code (make-array 8388608))
-  (labels (make-hash-table :test 'eql))      ; label-id → instruction index
-  (fixups nil)                                ; (index label-id type)
-  (position 0))                               ; current instruction index
+  ;; 16M entries × 4 bytes = 64 MB native code.  Bare-metal ANSI-test
+  ;; needs ~30 MB; Linux/AArch64 adds ~50% overhead per :push (2 insns
+  ;; vs 1 for SP alignment) plus larger syscall traps, so we bump from
+  ;; 8M to 16M to keep headroom.
+  (code (make-array 16777216))
+  (labels (make-hash-table :test 'eql))
+  (fixups nil)
+  (position 0))
 
 (defun a64-emit (buf word)
   "Emit a single 32-bit instruction word."
@@ -1295,26 +1322,50 @@
                 ;; Frame-alloc/frame-free: NOP for now
                 nil)
                ((= code #x0300)
-                ;; Serial write: V0 (x0) contains tagged fixnum char code
-                ;; asr x16, x0, #1 (untag)
-                (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
-                ;; load UART base (configurable via *aarch64-serial-base*)
-                (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
-                ;; TX-ready poll: wait for transmit FIFO to have space
-                (when *aarch64-serial-tx-poll*
-                  (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
-                    ;; ldr w18, [x17, #offset] — read status register (32-bit)
-                    (a64-ldr-width buf 18 +a64-x17+ offset 2)
-                    ;; tbz/tbnz x18, #bit, -4 — loop back to ldr
-                    (let ((opcode (ecase polarity
-                                    (:tbz  #b00110110)   ; wait while bit clear
-                                    (:tbnz #b00110111)))) ; wait while bit set
-                      (a64-emit buf (logior (ash opcode 24)
-                                            (ash bit 19)
-                                            (ash (logand -1 #x3FFF) 5)
-                                            18)))))
-                ;; store to UART data register (strb for PL011, str for mini UART)
-                (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*))
+                (cond
+                  (*aarch64-linux-mode*
+                   ;; Linux userspace: write 1 byte to fd=1 via write(2).
+                   ;; V0 holds the tagged char code.  Save the char to a
+                   ;; scratch byte slot (0x100001F0), then syscall.
+                   ;; Result discarded.  Caller-saved regs x0/x1/x2 are
+                   ;; clobbered — translator already treats them as
+                   ;; scratch around any function call boundary, and
+                   ;; trap 0x0300 is only emitted in tail position via
+                   ;; compile-write-char-serial which then emits
+                   ;; (li dest 0), so no live value needs preserving.
+                   ;;
+                   ;;   asr x16, x0, #1      ; x16 = untagged char
+                   ;;   load x17, 0x100001F0
+                   ;;   strb w16, [x17]      ; store byte
+                   ;;   mov x0, #1            ; fd=1
+                   ;;   mov x1, x17          ; buf addr
+                   ;;   mov x2, #1           ; count
+                   ;;   mov x8, #64          ; write
+                   ;;   svc #0
+                   (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
+                   (a64-load-imm64 buf +a64-x17+ #x100001F0)
+                   ;; strb w16, [x17] — encoding 0x39000000 | (0 << 10) | (17 << 5) | 16
+                   (a64-emit buf (logior #x39000000 (ash 17 5) 16))
+                   (a64-load-imm64 buf +a64-x0+ 1)
+                   (a64-mov-reg buf +a64-x1+ +a64-x17+)
+                   (a64-load-imm64 buf +a64-x2+ 1)
+                   (a64-load-imm64 buf +a64-x8+ 64)
+                   (a64-emit buf #xD4000001))     ; SVC #0
+                  (t
+                   ;; Bare-metal: write to UART data register.
+                   (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
+                   (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
+                   (when *aarch64-serial-tx-poll*
+                     (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
+                       (a64-ldr-width buf 18 +a64-x17+ offset 2)
+                       (let ((opcode (ecase polarity
+                                       (:tbz  #b00110110)
+                                       (:tbnz #b00110111))))
+                         (a64-emit buf (logior (ash opcode 24)
+                                               (ash bit 19)
+                                               (ash (logand -1 #x3FFF) 5)
+                                               18)))))
+                   (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*))))
                ((= code #x0301)
                 ;; Serial read: poll UART until a byte is available,
                 ;; return tagged fixnum char code in x0.
@@ -1408,6 +1459,189 @@
                 (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
                 (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ #x38)
                 (a64-add-imm buf +a64-sp+ +a64-x16+ 0))
+               ((and *aarch64-linux-mode* (= code #x0500))
+                ;; Linux sys-exit: V0 (x0) = exit status.  exit_group(2) = 94.
+                ;; mov x8, #94; svc #0.
+                (a64-load-imm64 buf +a64-x8+ 94)
+                (a64-emit buf #xD4000001))      ; SVC #0
+               ((= code #x0502)
+                ;; Generic 3-arg Linux syscall — AArch64 ABI.
+                ;;   Inputs: V0=x0=syscall#(tagged), V1=x1=arg1(tagged),
+                ;;           V2=x2=arg2(tagged), V3=x3=arg3(tagged).
+                ;;   Output: V0=x0=result(tagged).
+                ;; Linux AArch64 syscall ABI:
+                ;;   x8 = syscall number (raw)
+                ;;   x0..x5 = args (raw)
+                ;;   SVC #0; result in x0 (raw).
+                ;;
+                ;; cl-fileio.lisp uses x86-64 syscall numbers — remap
+                ;; to AArch64 generic ABI in Linux mode.  For numerical
+                ;; remaps the dispatch is a cmp/csel chain.  For the
+                ;; few syscalls whose AArch64 equivalent takes a
+                ;; different arg shape (open → openat needs AT_FDCWD
+                ;; prepended; stat → newfstatat similarly; unlink/mkdir/
+                ;; rename → ...at), they're handled via a `%linux-*`
+                ;; helper defun in the build script rather than here —
+                ;; the trap just does straight numerical remap.
+                ;;
+                ;; Untag args into x9/x10 first to avoid clobbering
+                ;; x0/x1 mid-shuffle.
+                (a64-asr-imm buf +a64-x10+ +a64-x3+ 1)  ; x10 = arg3 untag
+                (a64-asr-imm buf +a64-x9+  +a64-x2+ 1)  ; x9  = arg2 untag
+                (a64-asr-imm buf +a64-x8+  +a64-x0+ 1)  ; x8  = syscall# untag
+                (a64-asr-imm buf +a64-x0+  +a64-x1+ 1)  ; x0  = arg1 untag
+                (a64-mov-reg buf +a64-x1+ +a64-x9+)     ; x1  = arg2
+                (a64-mov-reg buf +a64-x2+ +a64-x10+)    ; x2  = arg3
+                ;; AArch64 Linux: remap x86-64 syscall numbers to AArch64
+                ;; generic ABI numbers via a sequence of cmp/csel.  Skip
+                ;; the remap path on bare-metal (no Linux syscalls).
+                (when *aarch64-linux-mode*
+                  ;; Remap table for one-to-one cases (same arg shape).
+                  ;; Format: ((x64-num . aarch64-num) ...).
+                  (dolist (pair '(( 0 . 63)    ; read
+                                  ( 1 . 64)    ; write
+                                  ( 3 . 57)    ; close
+                                  ( 5 . 80)    ; fstat
+                                  ( 8 . 62)    ; lseek
+                                  ( 9 . 222)   ; mmap
+                                  (39 . 172)   ; getpid
+                                  (60 . 93)    ; exit
+                                  (93 . 93)    ; exit_group (idempotent)
+                                  (217 . 61))) ; getdents64
+                    ;; CMP x8, #x64-num; CSEL x8, #aarch64-num, x8, EQ
+                    (let ((from (car pair))
+                          (to   (cdr pair)))
+                      (a64-cmp-imm buf +a64-x8+ from)
+                      ;; Load target syscall # into x11.
+                      (a64-movz buf +a64-x11+ (logand to #xFFFF) 0)
+                      (when (> to #xFFFF)
+                        (a64-movk buf +a64-x11+ (logand (ash to -16) #xFFFF) 1))
+                      ;; CSEL x8, x11, x8, EQ — if x8 was `from`, x8 = `to`.
+                      (a64-emit buf (logior #x9A800000
+                                            (ash +a64-x8+ 16)
+                                            (ash +cc-eq+ 12)
+                                            (ash +a64-x11+ 5)
+                                            +a64-x8+)))))
+                (a64-svc buf 0)                       ; SVC #0
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1)) ; tag result
+               ((= code #x0503)
+                ;; Raw 3-arg Linux syscall — args passed untagged as-is.
+                ;;   V0=x0=syscall#(tagged), V1-V3 = raw args.
+                ;;   Output: V0=x0=result(raw, untagged).
+                (a64-asr-imm buf +a64-x8+ +a64-x0+ 1)  ; x8 = syscall# untag
+                (a64-mov-reg buf +a64-x0+ +a64-x1+)    ; x0 = arg1 raw
+                (a64-mov-reg buf +a64-x1+ +a64-x2+)    ; x1 = arg2 raw
+                (a64-mov-reg buf +a64-x2+ +a64-x3+)    ; x2 = arg3 raw
+                (a64-svc buf 0))
+               ((and *aarch64-linux-mode* (= code #x0505))
+                ;; LINUX-ALARM: AArch64 setitimer(ITIMER_REAL, &new, NULL).
+                ;; V0 = duration in seconds (tagged; 0 = clear).
+                ;; AArch64 generic ABI removed alarm(2); use setitimer (103).
+                ;; struct itimerval is 32 bytes:
+                ;;   it_interval.tv_sec  @ 0  = 0
+                ;;   it_interval.tv_usec @ 8  = 0
+                ;;   it_value.tv_sec     @ 16 = duration
+                ;;   it_value.tv_usec    @ 24 = 0
+                ;; We stage it at fixed BSS slot 0x10000280..0x100002A0.
+                ;; Default SIGALRM action is process termination, which is
+                ;; what we want for fork-file's per-file timeout — the
+                ;; child gets killed, parent wait4 returns, we move on.
+                (a64-asr-imm buf +a64-x10+ +a64-x0+ 1)  ; x10 = seconds untag
+                (a64-load-imm64 buf +a64-x9+ #x10000280)
+                (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)   ; it_interval.tv_sec
+                (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 8)   ; it_interval.tv_usec
+                (a64-str-unsigned buf +a64-x10+ +a64-x9+ 16)  ; it_value.tv_sec = N
+                (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 24)  ; it_value.tv_usec
+                (a64-mov-reg buf +a64-x1+ +a64-x9+)     ; new = &itimerval
+                (a64-movz buf +a64-x0+ 0 0)             ; which = ITIMER_REAL
+                (a64-movz buf +a64-x2+ 0 0)             ; old = NULL
+                (a64-movz buf +a64-x8+ 103 0)
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((and *aarch64-linux-mode* (= code #x0504))
+                ;; LINUX-MMAP-SHARED-PAGE: anonymous MAP_SHARED mmap.
+                ;; V0(x0) = size (tagged); result = mmap address (tagged).
+                ;; Equivalent to mmap(NULL, size, PROT_RW,
+                ;;   MAP_SHARED|MAP_ANONYMOUS, -1, 0) — 6-arg syscall.
+                ;; AArch64 mmap syscall # = 222.
+                (a64-asr-imm buf +a64-x1+ +a64-x0+ 1)   ; x1 = size
+                (a64-movz buf +a64-x0+ 0 0)             ; x0 = NULL
+                (a64-movz buf +a64-x2+ 3 0)             ; x2 = PROT_RW
+                (a64-movz buf +a64-x3+ #x21 0)          ; x3 = MAP_SHARED|MAP_ANON
+                ;; x4 = -1 (fd) via MOVN
+                (a64-emit buf (logior #x92800000 (ash 0 5) +a64-x4+))
+                (a64-movz buf +a64-x5+ 0 0)             ; x5 = offset
+                (a64-movz buf +a64-x8+ 222 0)
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))  ; tag result
+               ((and *aarch64-linux-mode* (= code #x0506))
+                ;; LINUX-OPENAT: AArch64 openat(AT_FDCWD, path, flags, mode).
+                ;;   Inputs: V1=path-addr(tagged), V2=flags(tagged), V3=mode(tagged).
+                ;;   Output: V0 = fd or -errno (tagged).
+                ;; AArch64 removed the legacy `open(2)` from the generic
+                ;; ABI; the replacement is `openat(2)` (syscall 56) with
+                ;; an extra `dirfd` arg (-100 = AT_FDCWD → relative to CWD).
+                ;; All five existing cl-fileio.lisp open paths funnel
+                ;; through `(syscall3 2 path flags mode)` — they instead
+                ;; emit trap 0x0506 on Linux/AArch64 builds (see
+                ;; cl-fileio override in build script).
+                ;;   x0 = -100 (AT_FDCWD)
+                ;;   x1 = untagged path-addr (V1 >> 1)
+                ;;   x2 = untagged flags     (V2 >> 1)
+                ;;   x3 = untagged mode      (V3 >> 1)
+                ;;   x8 = 56; SVC #0; LSL x0 by 1 to re-tag.
+                (a64-asr-imm buf +a64-x10+ +a64-x3+ 1)  ; x10 = mode
+                (a64-asr-imm buf +a64-x9+  +a64-x2+ 1)  ; x9  = flags
+                (a64-asr-imm buf +a64-x1+  +a64-x1+ 1)  ; x1  = path
+                ;; x0 = -100 (AT_FDCWD) — MOVN to load negative 16-bit.
+                ;; MOVN Xd, #imm16 = 0x92800000 | (imm16<<5) | Rd.
+                ;; -100 = ~99 → MOVN x0, #99.
+                (a64-emit buf (logior #x92800000 (ash 99 5) +a64-x0+))
+                (a64-mov-reg buf +a64-x2+ +a64-x9+)
+                (a64-mov-reg buf +a64-x3+ +a64-x10+)
+                (a64-movz buf +a64-x8+ 56 0)
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((and *aarch64-linux-mode* (= code #x0507))
+                ;; LINUX-UNLINKAT: AArch64 unlinkat(AT_FDCWD, path, 0).
+                ;; Caller: V1 = path-addr (tagged), V2/V3 ignored.
+                (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)   ; x1 = path
+                (a64-emit buf (logior #x92800000 (ash 99 5) +a64-x0+))  ; x0 = -100
+                (a64-movz buf +a64-x2+ 0 0)             ; x2 = 0 (flags)
+                (a64-movz buf +a64-x8+ 35 0)            ; unlinkat
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((and *aarch64-linux-mode* (= code #x0508))
+                ;; LINUX-NEWFSTATAT: stat(path, buf) via newfstatat(AT_FDCWD,
+                ;;   path, buf, AT_NO_AUTOMOUNT=0).  V1=path, V2=buf, V3 ignored.
+                (a64-asr-imm buf +a64-x9+ +a64-x2+ 1)   ; x9 = buf
+                (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)   ; x1 = path
+                (a64-emit buf (logior #x92800000 (ash 99 5) +a64-x0+))  ; x0 = -100
+                (a64-mov-reg buf +a64-x2+ +a64-x9+)     ; x2 = buf
+                (a64-movz buf +a64-x3+ 0 0)             ; x3 = 0 (flags)
+                (a64-movz buf +a64-x8+ 79 0)            ; newfstatat
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((and *aarch64-linux-mode* (= code #x0509))
+                ;; LINUX-MKDIRAT: mkdirat(AT_FDCWD, path, mode).  V1=path, V2=mode.
+                (a64-asr-imm buf +a64-x9+ +a64-x2+ 1)   ; x9 = mode
+                (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)   ; x1 = path
+                (a64-emit buf (logior #x92800000 (ash 99 5) +a64-x0+))  ; x0 = -100
+                (a64-mov-reg buf +a64-x2+ +a64-x9+)
+                (a64-movz buf +a64-x8+ 34 0)            ; mkdirat
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((and *aarch64-linux-mode* (= code #x050A))
+                ;; LINUX-RENAMEAT: renameat(AT_FDCWD, old, AT_FDCWD, new).
+                ;; V1=old, V2=new.
+                (a64-asr-imm buf +a64-x9+ +a64-x2+ 1)   ; x9 = new
+                (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)   ; x1 = old
+                (a64-emit buf (logior #x92800000 (ash 99 5) +a64-x0+))  ; x0 = AT_FDCWD
+                (a64-emit buf (logior #x92800000 (ash 99 5) +a64-x2+))  ; x2 = AT_FDCWD
+                (a64-mov-reg buf +a64-x3+ +a64-x9+)
+                (a64-movz buf +a64-x8+ 38 0)            ; renameat
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
                ((= code #x0510)
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
@@ -1588,6 +1822,101 @@
                 (a64-str-unsigned buf +a64-x18+ +a64-x17+ 8)
                 (a64-ldr-unsigned buf +a64-x18+ +a64-x16+ 16)
                 (a64-str-unsigned buf +a64-x18+ +a64-x17+ 16))
+               ((= code #x0530)
+                ;; COPY-OVERFLOW-ARGS — mirrors translate-x64.lisp:711.
+                ;; Read dynamic nargs from slot 0x10000150, then copy stack
+                ;; args 4..min(nargs,23) from caller's frame ([FP+80+(i-4)*8])
+                ;; into the callee's local frame slots ([FP + frame-slot-base
+                ;; + i*-8]) so emit-rest-prologue's cond ladder can stack-load
+                ;; them uniformly.  Without this trap, AArch64 hit the SVC
+                ;; fallback (sync exception → halt at boot 'B .') whenever a
+                ;; &rest function was called.  Confirmed cause of the
+                ;; AArch64-ANSI hang at make-package → %mapcar-…-designator →
+                ;; nreverse → rplacd (2-arg call to a &rest defun).
+                ;;
+                ;; Scratch: x9 (count, then temp), x10 (src ptr), x11 (dst ptr).
+                ;; x16/x17 used by load-imm64 sequences.  We DO NOT touch
+                ;; x12-x15 either, since the IR allocator skips them but
+                ;; the rest of the function still expects them stable.
+                ;;
+                ;; Layout (matches x64 cap of 24 total args):
+                ;;   load nargs (32-bit zero-extend to x9 — strip any noise
+                ;;             SET-NARGS writes only 16 bits).
+                ;;   cmp w9, #5; b.lt done            (no overflow)
+                ;;   cmp w9, #24; b.le nocap; mov w9, #24
+                ;;   sub w9, w9, #4
+                ;;   add x10, x29, #80   (src = FP + 80)
+                ;;   sub x11, x29, #96   (dst = FP - 96, slot 4 raw offset)
+                ;; loop:
+                ;;   cbz w9, done
+                ;;   ldr x16, [x10]; str x16, [x11]
+                ;;   add x10, x10, #8; sub x11, x11, #8; sub w9, w9, #1
+                ;;   b loop
+                ;; done:
+                (a64-load-imm64 buf +a64-x17+ #x10000150)
+                ;; ldr w9, [x17] — read 32-bit nargs (zero-extends to x9)
+                (a64-ldr-width buf 9 +a64-x17+ 0 2)
+                ;; cmp w9, #5  (32-bit subs-imm form: SF=0)
+                ;; Encoding: 31|30 28|24 22|21|imm12|Rn|Rd  for SUBS imm:
+                ;;   sf=0, op=1 (SUB), S=1 (set flags), 100010, sh=0, imm12, Rn, Rd=31(wzr)
+                ;; Easier: use existing helper.  a64-cmp-imm is sf=1; we need
+                ;; a 32-bit cmp for the zero-extended w9, but a 64-bit cmp
+                ;; gives the same result here (w9 only holds 32 bits).
+                (a64-cmp-imm buf 9 5)
+                ;; b.lt done — placeholder; back-patched after loop end.
+                (let ((blt-idx (a64-current-index buf)))
+                  (a64-emit buf 0)   ; B.LT placeholder
+                  ;; cmp w9, #24
+                  (a64-cmp-imm buf 9 24)
+                  ;; b.le nocap (skip "mov w9, 24")
+                  (let ((ble-idx (a64-current-index buf)))
+                    (a64-emit buf 0)   ; B.LE placeholder
+                    ;; movz w9, #24 — w9 = 24 (caps high nargs)
+                    (a64-movz buf 9 24 0)
+                    ;; nocap:
+                    (let ((nocap-idx (a64-current-index buf)))
+                      ;; patch ble → nocap
+                      (let* ((bo (* (- nocap-idx ble-idx) 4))
+                             (imm19 (logand (ash bo -2) #x7FFFF)))
+                        (setf (aref (a64-buffer-code buf) ble-idx)
+                              (logior #x54000000 (ash imm19 5) #b1101)))) ; LE
+                    ;; sub w9, w9, #4
+                    (a64-sub-imm buf 9 9 4)
+                    ;; add x10, x29, #80 — src ptr
+                    (a64-add-imm buf 10 +a64-x29+ 80)
+                    ;; sub x11, x29, #96 — dst ptr
+                    (a64-sub-imm buf 11 +a64-x29+ 96)
+                    ;; loop:
+                    (let ((loop-idx (a64-current-index buf)))
+                      ;; cbz w9, done — 32-bit CBZ
+                      (let ((cbz-idx (a64-current-index buf)))
+                        (a64-emit buf 0)   ; CBZ placeholder
+                        ;; ldr x16, [x10]
+                        (a64-ldr-unsigned buf +a64-x16+ 10 0)
+                        ;; str x16, [x11]
+                        (a64-str-unsigned buf +a64-x16+ 11 0)
+                        ;; add x10, x10, #8
+                        (a64-add-imm buf 10 10 8)
+                        ;; sub x11, x11, #8
+                        (a64-sub-imm buf 11 11 8)
+                        ;; sub w9, w9, #1
+                        (a64-sub-imm buf 9 9 1)
+                        ;; b loop
+                        (let* ((bo (* (- loop-idx (a64-current-index buf)) 4))
+                               (imm26 (logand (ash bo -2) #x3FFFFFF)))
+                          (a64-emit buf (logior #x14000000 imm26)))
+                        ;; done:
+                        (let ((done-idx (a64-current-index buf)))
+                          ;; patch CBZ → done
+                          (let* ((bo (* (- done-idx cbz-idx) 4))
+                                 (imm19 (logand (ash bo -2) #x7FFFF)))
+                            (setf (aref (a64-buffer-code buf) cbz-idx)
+                                  (logior #x34000000 (ash imm19 5) 9)))
+                          ;; patch initial B.LT → done
+                          (let* ((bo (* (- done-idx blt-idx) 4))
+                                 (imm19 (logand (ash bo -2) #x7FFFF)))
+                            (setf (aref (a64-buffer-code buf) blt-idx)
+                                  (logior #x54000000 (ash imm19 5) #b1011))))))))) ; LT
                (t
                 ;; Real CPU trap
                 (a64-svc buf code)))))
@@ -1611,18 +1940,32 @@
           ;; ---- PUSH Vs ----
           ((= op +op-push+)
            (let ((ps (ensure-src (vr 0) +a64-x16+)))
-             ;; STR Xs, [SP, #-8]!
-             (a64-str-pre buf ps +a64-sp+ -8)))
+             (cond
+               (*aarch64-stack-align-16*
+                ;; SUB SP, SP, #16 ; STR Xs, [SP].  Keeps SP 16-byte aligned
+                ;; for Linux EL0 SCTLR.SA stack-alignment-check.
+                (a64-sub-imm buf +a64-sp+ +a64-sp+ 16)
+                (a64-str-unsigned buf ps +a64-sp+ 0))
+               (t
+                ;; STR Xs, [SP, #-8]! — original bare-metal path.
+                (a64-str-pre buf ps +a64-sp+ -8)))))
 
           ;; ---- POP Vd ----
           ((= op +op-pop+)
            (let ((pd (a64-phys-reg (vr 0))))
-             (if pd
-                 ;; LDR Xd, [SP], #8
-                 (a64-ldr-post buf pd +a64-sp+ 8)
-                 (progn
-                   (a64-ldr-post buf +a64-x16+ +a64-sp+ 8)
-                   (store-dst +a64-x16+ (vr 0))))))
+             (cond
+               (*aarch64-stack-align-16*
+                ;; LDR Xd, [SP] ; ADD SP, SP, #16.
+                (let ((dest (or pd +a64-x16+)))
+                  (a64-ldr-unsigned buf dest +a64-sp+ 0)
+                  (a64-add-imm buf +a64-sp+ +a64-sp+ 16)
+                  (unless pd (store-dst +a64-x16+ (vr 0)))))
+               (t
+                (if pd
+                    (a64-ldr-post buf pd +a64-sp+ 8)
+                    (progn
+                      (a64-ldr-post buf +a64-x16+ +a64-sp+ 8)
+                      (store-dst +a64-x16+ (vr 0))))))))
 
           ;; ---- ADD Vd, Va, Vb ----
           ((= op +op-add+)
@@ -2080,14 +2423,27 @@
           ;; CMP x16, #1
           ;; CSET Vd, EQ
           ((= op +op-consp+)
+           ;; Produce Modus T (0xDEAD1009) when (low4 == 1), NIL (x26) else.
+           ;; The cset 0/1 form (previously here) violated the IR contract
+           ;; that boolean ops produce T/NIL — downstream code that did
+           ;; (car (consp x)) treated the raw 1 as a cons and SEGV'd.
+           ;; AArch64 CSEL Xd, Xn, Xm, cond  selects Xn if cond else Xm.
+           ;; Encoding 0x9A800000 | (Rm<<16) | (cond<<12) | (Rn<<5) | Rd.
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
-             ;; Load mask into x17 scratch
              (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf +a64-x16+ ps +a64-x17+)
              (a64-cmp-imm buf +a64-x16+ 1)
-             (a64-cset buf pd +cc-eq+)
+             ;; x18 = T literal 0xDEAD1009
+             (a64-movz buf +a64-x18+ #x1009 0)
+             (a64-movk buf +a64-x18+ #xDEAD 1)
+             ;; CSEL pd, x18, x26, EQ  →  pd = T if EQ else NIL
+             (a64-emit buf (logior #x9A800000
+                                   (ash +a64-x26+ 16)
+                                   (ash +cc-eq+ 12)
+                                   (ash +a64-x18+ 5)
+                                   pd))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -2100,7 +2456,14 @@
              (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf +a64-x16+ ps +a64-x17+)
              (a64-cmp-imm buf +a64-x16+ 1)
-             (a64-cset buf pd +cc-ne+)
+             (a64-movz buf +a64-x18+ #x1009 0)
+             (a64-movk buf +a64-x18+ #xDEAD 1)
+             ;; CSEL pd, x18, x26, NE  →  pd = T if not-EQ else NIL
+             (a64-emit buf (logior #x9A800000
+                                   (ash +a64-x26+ 16)
+                                   (ash +cc-ne+ 12)
+                                   (ash +a64-x18+ 5)
+                                   pd))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -2457,22 +2820,28 @@
            ;; (still room) skip the slow path; otherwise call the GC
            ;; trampoline if it's wired up.  Legacy BRK #1 retained as
            ;; a fallback for builds where no trampoline is registered.
+           ;;
+           ;; Bare-metal puts the heap at low physical addresses
+           ;; (0x09000000-0x0F800000) where signed and unsigned compares
+           ;; agree, so the historical B.LT (signed) sufficed.  Linux
+           ;; userspace puts the mmap'd heap at high addresses
+           ;; (~0x7FFF_xxxxxxxx) where the sign bit can flip mid-heap;
+           ;; B.LO (unsigned less-than) is the right form there.
            (a64-cmp-reg buf +a64-x24+ +a64-x25+)
-           (cond
-             (*aarch64-gc-trampoline-label*
-              ;; B.LT skip; BL gc-trampoline; skip:
-              (let ((skip-label (incf *mvm-label-counter*)))
-                (let ((idx (a64-current-index buf)))
-                  (a64-bcond buf +cc-lt+ 0)
-                  (a64-add-fixup buf idx skip-label :bcond))
-                (let ((idx (a64-current-index buf)))
-                  (a64-bl buf 0)
-                  (a64-add-fixup buf idx *aarch64-gc-trampoline-label* :bl))
-                (a64-set-label buf skip-label)))
-             (t
-              ;; Legacy: BRK #1 — wedges on AArch64 (no GC handler).
-              (a64-bcond buf +cc-lt+ 2)
-              (a64-brk buf 1))))
+           (let ((cc (if *aarch64-linux-mode* +cc-cc+ +cc-lt+)))
+             (cond
+               (*aarch64-gc-trampoline-label*
+                (let ((skip-label (incf *mvm-label-counter*)))
+                  (let ((idx (a64-current-index buf)))
+                    (a64-bcond buf cc 0)
+                    (a64-add-fixup buf idx skip-label :bcond))
+                  (let ((idx (a64-current-index buf)))
+                    (a64-bl buf 0)
+                    (a64-add-fixup buf idx *aarch64-gc-trampoline-label* :bl))
+                  (a64-set-label buf skip-label)))
+               (t
+                (a64-bcond buf cc 2)
+                (a64-brk buf 1)))))
 
           ;; ---- WRITE-BARRIER Vobj ----
           ;; Mark the card table entry dirty (simplified: just a DMB for now)
@@ -3203,8 +3572,17 @@
         ;; Both supported load-addrs (QEMU virt 0x40080000, RPi
         ;; 0x80000) are 16-byte aligned, so the constraint reduces
         ;; to (current-index mod 4) == 0.  Pad with NOPs.
+        ;;
+        ;; Exception: Linux/AArch64 (ELF wrap) prepends 120 bytes of
+        ;; ELF header before the native bytes — so the runtime VA is
+        ;; (load + 120 + native_offset).  120 mod 16 = 8, which means
+        ;; we need (native_offset mod 16 = 8) to land VAs on 16.
+        ;; *aarch64-fn-align-offset* (defaults to 0 = legacy bare-metal)
+        ;; carries that offset into the alignment loop.
         (when (gethash mvm-off fn-bc-offsets)
-          (loop while (/= 0 (mod (a64-current-index buf) 4))
+          (loop while (/= 0 (mod (+ (* (a64-current-index buf) 4)
+                                    *aarch64-fn-align-offset*)
+                                 16))
                 do (a64-emit buf #xD503201F)))  ; NOP
         ;; If this MVM offset has a label assigned (branch target),
         ;; record the native position for it now

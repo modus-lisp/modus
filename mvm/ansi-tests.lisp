@@ -1580,7 +1580,23 @@
   ;; Expected on x64: 'YES.  Observed on AArch64: 'NO.
   (handler-case
       (deftest 57120 (if 0 'YES 'NO) 'YES)
-    (t (c) (%record-test-fail-or-emit 57120))))
+    (t (c) (%record-test-fail-or-emit 57120)))
+  ;; 57200: member.1's shape — the scaffold-copy bug took out 49+ tests in
+  ;; member.lsp (and 17 in ldiff, 12 in mapcar, etc.) because cons-aux.lsp's
+  ;; (make-instance scaffold ...) returned NIL, then check-scaffold-copy
+  ;; tried to use NIL as a struct → SIGSEGV → file fork crashed before any
+  ;; test ran.  Fix: override make-scaffold-copy / check-scaffold-copy in
+  ;; build-aarch64-linux-ansi-test.lisp's "Aux overrides" section to use
+  ;; the defstruct ctor (make-scaffold) instead.
+  (handler-case
+      (let* ((x (copy-tree '(a b c d e f)))
+             (xcopy (make-scaffold-copy x))
+             (result (member 'c x)))
+        (deftest 57200
+          (and (eqt result (cddr x))
+               (check-scaffold-copy x xcopy))
+          t))
+    (t (c) (%record-test-fail-or-emit 57200))))
 
 (defun run-all-tests ()
   ;; Each runner wrapped in handler-case so an uncaught error in one

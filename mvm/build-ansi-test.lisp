@@ -3612,6 +3612,27 @@
 ;; is retired so callers see the real defun instead of the rewriter shim.)
 (defun make-array-with-checks (dim &rest kwargs)
   (apply #'make-array dim kwargs))
+;; make-scaffold-copy / check-scaffold-copy — cons-aux.lsp's versions
+;; use (make-instance scaffold ...) (CLOS-style) but Modus's defstruct
+;; doesn't auto-register as a CLOS class, so make-instance returns NIL
+;; and downstream check-scaffold-copy SIGSEGV's trying to use NIL as a
+;; struct.  Override with the defstruct-ctor (make-scaffold) versions.
+;; +114 ANSI tests on Linux/AArch64; same fix applies to bare-metal
+;; AArch64 / x64 to the extent the scaffold tests run there.
+(defun make-scaffold-copy (x)
+  (if (consp x)
+      (make-scaffold :node x
+                     :car (make-scaffold-copy (car x))
+                     :cdr (make-scaffold-copy (cdr x)))
+      (make-scaffold :node x :car nil :cdr nil)))
+(defun check-scaffold-copy (x xcopy)
+  (if (eq x (scaffold-node xcopy))
+      (if (consp x)
+          (if (check-scaffold-copy (car x) (scaffold-car xcopy))
+              (check-scaffold-copy (cdr x) (scaffold-cdr xcopy))
+              nil)
+          t)
+      nil))
 (defun union-with-check (x y &rest args)
   (apply #'union x y args))
 (defun nunion-with-copy (x y &rest args)

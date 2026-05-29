@@ -3702,6 +3702,29 @@
 ;; is retired so callers see the real defun instead of the rewriter shim.)
 (defun make-array-with-checks (dim &rest kwargs)
   (apply #'make-array dim kwargs))
+;; make-scaffold-copy / check-scaffold-copy — cons-aux.lsp's versions
+;; use (make-instance scaffold ...) (CLOS-style), but Modus's defstruct
+;; doesn't auto-register as a CLOS class so make-instance returns NIL.
+;; Override with the defstruct-ctor versions (same shape as
+;; ansi-bridge.lisp:296 but redefined here to win against cons-aux.lsp).
+;; Without this, member.lsp's first test crashes the file fork (50
+;; tests prestamped), and similarly for any cons-related file that
+;; tries to check scaffold copies (cons, cxr, copy-list, member,
+;; nth, last, butlast, etc.).
+(defun make-scaffold-copy (x)
+  (if (consp x)
+      (make-scaffold :node x
+                     :car (make-scaffold-copy (car x))
+                     :cdr (make-scaffold-copy (cdr x)))
+      (make-scaffold :node x :car nil :cdr nil)))
+(defun check-scaffold-copy (x xcopy)
+  (if (eq x (scaffold-node xcopy))
+      (if (consp x)
+          (if (check-scaffold-copy (car x) (scaffold-car xcopy))
+              (check-scaffold-copy (cdr x) (scaffold-cdr xcopy))
+              nil)
+          t)
+      nil))
 (defun union-with-check (x y &rest args)
   (apply #'union x y args))
 (defun nunion-with-copy (x y &rest args)

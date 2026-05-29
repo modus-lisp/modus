@@ -357,7 +357,7 @@
                         (t nil))))
     (cond
       ((null seq) nil)
-      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
        (%remove-list item seq eff-test-fn key-fn start-idx end-idx eff-count from-end))
       (t
@@ -378,7 +378,7 @@
       (setq i (+ i 1)))
     ;; Apply count: keep only the first/last N matched indices.
     (let ((to-drop indices))
-      (when count
+      (when (>= count 0)
         (when from-end
           ;; indices in reverse-traversal order (largest first); take first N
           (setq to-drop (subseq indices 0 (min count (length indices)))))
@@ -411,7 +411,7 @@
               (push i indices))))
         (setq i (+ i 1))))
     (let ((to-drop indices))
-      (when count
+      (when (>= count 0)
         (if from-end
             (setq to-drop (subseq indices 0 (min count (length indices))))
             (let ((rev (reverse indices)))
@@ -441,7 +441,7 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) nil)
-      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
        (%remove-if-list pred seq key-fn start-idx end-idx eff-count from-end))
       (t
@@ -458,7 +458,7 @@
       (setq cur (cdr cur))
       (setq i (+ i 1)))
     (let ((to-drop indices))
-      (when count
+      (when (>= count 0)
         (if from-end
             (setq to-drop (subseq indices 0 (min count (length indices))))
             (let ((rev (reverse indices)))
@@ -484,7 +484,7 @@
             (when (funcall pred v) (push i indices))))
         (setq i (+ i 1))))
     (let ((to-drop indices))
-      (when count
+      (when (>= count 0)
         (if from-end
             (setq to-drop (subseq indices 0 (min count (length indices))))
             (let ((rev (reverse indices)))
@@ -515,7 +515,7 @@
          (neg-pred (lambda (x) (not (funcall pred x)))))
     (cond
       ((null seq) nil)
-      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
        (%remove-if-list neg-pred seq key-fn start-idx end-idx eff-count from-end))
       (t
@@ -950,7 +950,7 @@
       ;; List + no positional/count kwargs → simple per-element transform.
       ;; Keep this fast path for the bulk of plain (substitute new old list)
       ;; calls so we don't do index-tracking overhead.
-      ((and (consp seq) (= start-idx 0) (null end-idx) (null eff-count)
+      ((and (consp seq) (= start-idx 0) (null end-idx) (< eff-count 0)
             (not from-end))
        (%seq-substitute-with
         (lambda (item)
@@ -1002,7 +1002,7 @@
          ;; Pick the right subset given :count and :from-end.
          (let ((selected
                  (cond
-                   ((null eff-count) matches)
+                   ((< eff-count 0) matches)
                    ;; from-end keeps the LAST count matches = leading from
                    ;; reverse-walk order.
                    (from-end
@@ -1030,7 +1030,7 @@
       (t
        (let ((copy (copy-seq seq)))
          (cond
-           ((and eff-count (= eff-count 0)) copy)
+           ((= eff-count 0) copy)
            (t
             (let* ((len (array-length copy))
                    (eff-end (if (and end-idx (< end-idx len)) end-idx len))
@@ -1043,7 +1043,7 @@
                   (let ((i (- eff-end 1)))
                     (loop
                       (when (< i start-idx) (return copy))
-                      (when (and n (= n 0)) (return copy))
+                      (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
                         (when string-p (setq elt (code-char elt)))
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
@@ -1051,12 +1051,12 @@
                                            (eql old cmp))))
                             (when match
                               (aset copy i store-new)
-                              (when n (setq n (- n 1)))))))
+                              (when (> n 0) (setq n (- n 1)))))))
                       (setq i (- i 1))))
                   (let ((i start-idx))
                     (loop
                       (when (>= i eff-end) (return copy))
-                      (when (and n (= n 0)) (return copy))
+                      (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
                         (when string-p (setq elt (code-char elt)))
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
@@ -1064,7 +1064,7 @@
                                            (eql old cmp))))
                             (when match
                               (aset copy i store-new)
-                              (when n (setq n (- n 1)))))))
+                              (when (> n 0) (setq n (- n 1)))))))
                       (setq i (+ i 1)))))))))))))
 
 (defun substitute-if (new pred seq &rest args)
@@ -1092,10 +1092,10 @@
                                   (or (null end-idx) (< idx end-idx))))
                   (v (if (and in-window key-fn) (funcall key-fn item) item))
                   (replace (and in-window
-                                (or (null n) (> n 0))
+                                (not (zerop n))
                                 (funcall pred v))))
              (setq result (cons (if replace new item) result))
-             (when replace (when n (setq n (- n 1)))))
+             (when replace (when (> n 0) (setq n (- n 1)))))
            (setq cur (cdr cur))
            (setq idx (+ idx 1)))))
       ;; List + :from-end → walk to collect matches, keep last :count of them.
@@ -1113,7 +1113,7 @@
          ;; from-end + count → leading from reverse-walk = last :count matches.
          (let ((selected
                  (cond
-                   ((null eff-count) matches)
+                   ((< eff-count 0) matches)
                    (t (let ((kept nil) (src matches) (k eff-count))
                         (loop (when (or (null src) (= k 0)) (return kept))
                           (setq kept (cons (car src) kept))
@@ -1127,7 +1127,7 @@
       (t
        (let ((copy (copy-seq seq)))
          (cond
-           ((and eff-count (= eff-count 0)) copy)
+           ((= eff-count 0) copy)
            (t
             (let* ((len (array-length copy))
                    (eff-end (if (and end-idx (< end-idx len)) end-idx len))
@@ -1140,24 +1140,24 @@
                   (let ((i (- eff-end 1)))
                     (loop
                       (when (< i start-idx) (return copy))
-                      (when (and n (= n 0)) (return copy))
+                      (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
                         (when string-p (setq elt (code-char elt)))
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (funcall pred cmp)
                             (aset copy i store-new)
-                            (when n (setq n (- n 1))))))
+                            (when (> n 0) (setq n (- n 1))))))
                       (setq i (- i 1))))
                   (let ((i start-idx))
                     (loop
                       (when (>= i eff-end) (return copy))
-                      (when (and n (= n 0)) (return copy))
+                      (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
                         (when string-p (setq elt (code-char elt)))
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (funcall pred cmp)
                             (aset copy i store-new)
-                            (when n (setq n (- n 1))))))
+                            (when (> n 0) (setq n (- n 1))))))
                       (setq i (+ i 1)))))))))))))
 
 (defun substitute-if-not (new pred seq &rest args)
@@ -1185,10 +1185,10 @@
                                   (or (null end-idx) (< idx end-idx))))
                   (v (if (and in-window key-fn) (funcall key-fn item) item))
                   (replace (and in-window
-                                (or (null n) (> n 0))
+                                (not (zerop n))
                                 (not (funcall pred v)))))
              (setq result (cons (if replace new item) result))
-             (when replace (when n (setq n (- n 1)))))
+             (when replace (when (> n 0) (setq n (- n 1)))))
            (setq cur (cdr cur))
            (setq idx (+ idx 1)))))
       ;; List + :from-end → match-collect, keep last :count matches.
@@ -1205,7 +1205,7 @@
            (setq i (+ i 1)))
          (let ((selected
                  (cond
-                   ((null eff-count) matches)
+                   ((< eff-count 0) matches)
                    (t (let ((kept nil) (src matches) (k eff-count))
                         (loop (when (or (null src) (= k 0)) (return kept))
                           (setq kept (cons (car src) kept))
@@ -1222,7 +1222,7 @@
        ;; trips the apply-of-rest + closure-capture fragility.
        (let ((copy (copy-seq seq)))
          (cond
-           ((and eff-count (= eff-count 0)) copy)
+           ((= eff-count 0) copy)
            (t
             (let* ((len (array-length copy))
                    (eff-end (if (and end-idx (< end-idx len)) end-idx len))
@@ -1235,24 +1235,24 @@
                   (let ((i (- eff-end 1)))
                     (loop
                       (when (< i start-idx) (return copy))
-                      (when (and n (= n 0)) (return copy))
+                      (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
                         (when string-p (setq elt (code-char elt)))
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (not (funcall pred cmp))
                             (aset copy i store-new)
-                            (when n (setq n (- n 1))))))
+                            (when (> n 0) (setq n (- n 1))))))
                       (setq i (- i 1))))
                   (let ((i start-idx))
                     (loop
                       (when (>= i eff-end) (return copy))
-                      (when (and n (= n 0)) (return copy))
+                      (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
                         (when string-p (setq elt (code-char elt)))
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (not (funcall pred cmp))
                             (aset copy i store-new)
-                            (when n (setq n (- n 1))))))
+                            (when (> n 0) (setq n (- n 1))))))
                       (setq i (+ i 1)))))))))))))
 
 ;;; Destructive substitute variants
@@ -1311,9 +1311,20 @@
         (setq cur (cddr cur))))
     (list count from-end start end test-fn test-not-fn key-fn)))
 
-;;; Effective count: nil if count is nil, else max(0, count)
+;;; Effective count: -1 (sentinel) if count is nil meaning "unlimited",
+;;; else max(0, count).
+;;;
+;;; AArch64 fixnum-0 / NIL collision: returning NIL for "unlimited" and
+;;; an integer for "bounded" meant downstream code did `(> n 0)`
+;;; or `(when n …)` to dispatch — both wrong for n=0 on AArch64 because
+;;; (null 0) returns T (fixnum 0 and NIL share the raw-0 bit pattern).
+;;; The -1 sentinel is reliably distinguishable from 0 via numeric
+;;; comparison `(< n 0)`.  See reference_aa64_fixnum_zero_nil.md and the
+;;; CLOS slot-0 fix in f1f6f0e for the same pattern.
 (defun %nsubst-effective-count (count)
-  (if (null count) nil (if (> count 0) count 0)))
+  (cond ((null count) -1)
+        ((> count 0) count)
+        (t 0)))
 
 (defun %nsubst-in-window-p (idx start-idx end-idx)
   "Return t if idx is in [start-idx, end-idx)."
@@ -1323,7 +1334,7 @@
 
 (defun %nsubst-list-core (new pred-fn seq count from-end start-idx end-idx)
   "Core list nsubstitute with start/end/count/from-end support."
-  ;; count: nil=unlimited, 0=nothing, positive=limit. Already normalized by caller.
+  ;; count: -1=unlimited, 0=nothing, positive=limit. Already normalized by caller (was nil for unlimited; switched to -1 sentinel for AArch64 fixnum-0/NIL collision — see %nsubst-effective-count).
   (if from-end
       ;; Backward: collect matching positions in [start-idx, end-idx), apply count from end.
       ;; ANSI: with :FROM-END T the PRED is called in REVERSE order, so
@@ -1351,7 +1362,10 @@
           (setq positions (nreverse positions)))
         ;; positions: largest index first
         ;; Take first count entries (= highest-indexed matches)
-        (let ((to-replace nil) (remaining (or count (length positions))) (pos-cur positions))
+        ;; count = -1 (unlimited sentinel) → take all matches.
+        (let ((to-replace nil)
+              (remaining (if (< count 0) (length positions) count))
+              (pos-cur positions))
           (loop
             (when (null pos-cur) (return nil))
             (when (<= remaining 0) (return nil))
@@ -1371,13 +1385,13 @@
       (let ((cur seq) (idx 0) (n count))
         (loop
           (when (null cur) (return seq))
-          (when (and n (= n 0)) (return seq))
+          (when (= n 0) (return seq))
           (let ((in-win (%nsubst-in-window-p idx start-idx end-idx)))
             (when in-win
               (let ((match (funcall pred-fn (car cur))))
                 (when match
                   (set-car cur new)
-                  (when n (setq n (- n 1)))))))
+                  (when (> n 0) (setq n (- n 1)))))))
           (setq idx (+ idx 1))
           (setq cur (cdr cur)))
         seq)))
@@ -1401,8 +1415,8 @@
          (pred-fn (if key-fn
                       (lambda (x) (funcall pred (funcall key-fn x)))
                       pred))
-         (eff-count (if (null count) nil (if (< count 0) 0 count))))
-    (if (or (null seq) (and eff-count (= eff-count 0)))
+         (eff-count (%nsubst-effective-count count)))
+    (if (or (null seq) (= eff-count 0))
         seq
         (if (consp seq)
             (%nsubst-list-core new pred-fn seq eff-count from-end start-idx end-idx)
@@ -1424,22 +1438,22 @@
                   (let ((i (- eff-end 1)))
                     (loop
                       (when (< i start-idx) (return seq))
-                      (when (and n (= n 0)) (return seq))
+                      (when (= n 0) (return seq))
                       (let ((elt (aref seq i)))
                         (when string-p (setq elt (code-char elt)))
                         (when (funcall pred-fn elt)
                           (aset seq i store-new)
-                          (when n (setq n (- n 1)))))
+                          (when (> n 0) (setq n (- n 1)))))
                       (setq i (- i 1))))
                   (let ((i start-idx))
                     (loop
                       (when (>= i eff-end) (return seq))
-                      (when (and n (= n 0)) (return seq))
+                      (when (= n 0) (return seq))
                       (let ((elt (aref seq i)))
                         (when string-p (setq elt (code-char elt)))
                         (when (funcall pred-fn elt)
                           (aset seq i store-new)
-                          (when n (setq n (- n 1)))))
+                          (when (> n 0) (setq n (- n 1)))))
                       (setq i (+ i 1))))))))))
 (defun nsubstitute-if-not (new pred seq &rest args)
   "Destructive substitute-if-not.
@@ -1455,19 +1469,19 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) seq)
-      ((and eff-count (= eff-count 0)) seq)
+      ((= eff-count 0) seq)
       ((consp seq)
        (let ((cur seq) (idx 0) (n eff-count))
          (loop
            (when (null cur) (return seq))
-           (when (and n (= n 0)) (return seq))
+           (when (= n 0) (return seq))
            (let* ((item (car cur))
                   (in-window (and (>= idx start-idx)
                                   (or (null end-idx) (< idx end-idx))))
                   (v (if (and in-window key-fn) (funcall key-fn item) item)))
              (when (and in-window (not (funcall pred v)))
                (set-car cur new)
-               (when n (setq n (- n 1)))))
+               (when (> n 0) (setq n (- n 1)))))
            (setq cur (cdr cur))
            (setq idx (+ idx 1)))))
       (t
@@ -1484,24 +1498,24 @@
              (let ((i (- eff-end 1)))
                (loop
                  (when (< i start-idx) (return seq))
-                 (when (and n (= n 0)) (return seq))
+                 (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
                    (when string-p (setq elt (code-char elt)))
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                      (when (not (funcall pred cmp))
                        (aset seq i store-new)
-                       (when n (setq n (- n 1))))))
+                       (when (> n 0) (setq n (- n 1))))))
                  (setq i (- i 1))))
              (let ((i start-idx))
                (loop
                  (when (>= i eff-end) (return seq))
-                 (when (and n (= n 0)) (return seq))
+                 (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
                    (when string-p (setq elt (code-char elt)))
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                      (when (not (funcall pred cmp))
                        (aset seq i store-new)
-                       (when n (setq n (- n 1))))))
+                       (when (> n 0) (setq n (- n 1))))))
                  (setq i (+ i 1))))))))))
 
 (defun nsubstitute (new old seq &rest args)
@@ -1526,7 +1540,7 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) seq)
-      ((and eff-count (= eff-count 0)) seq)
+      ((= eff-count 0) seq)
       ;; fp/displaced/adjustable wrapper: destructive operation on the
       ;; underlying array.  We route to the non-destructive substitute
       ;; (which already handles wrappers) and copy the result back via
@@ -1560,7 +1574,7 @@
              (let ((i (- eff-end 1)))
                (loop
                  (when (< i start-idx) (return seq))
-                 (when (and n (= n 0)) (return seq))
+                 (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
                    (when string-p (setq elt (code-char elt)))
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
@@ -1568,12 +1582,12 @@
                                       (eql old cmp))))
                        (when match
                          (aset seq i store-new)
-                         (when n (setq n (- n 1)))))))
+                         (when (> n 0) (setq n (- n 1)))))))
                  (setq i (- i 1))))
              (let ((i start-idx))
                (loop
                  (when (>= i eff-end) (return seq))
-                 (when (and n (= n 0)) (return seq))
+                 (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
                    (when string-p (setq elt (code-char elt)))
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
@@ -1581,7 +1595,7 @@
                                       (eql old cmp))))
                        (when match
                          (aset seq i store-new)
-                         (when n (setq n (- n 1)))))))
+                         (when (> n 0) (setq n (- n 1)))))))
                  (setq i (+ i 1))))))))))
 (defun count-if-not (pred seq &rest args)
   "Count elements of SEQ for which PRED is FALSE.  Honors :key, :start,
@@ -2270,7 +2284,7 @@
                         (t nil))))
     (cond
       ((null seq) nil)
-      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
        (%remove-list item seq eff-test-fn key-fn start-idx end-idx eff-count from-end))
       (t
@@ -2288,7 +2302,7 @@
          (eff-count (%nsubst-effective-count count)))
     (cond
       ((null seq) nil)
-      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
        (%remove-if-list pred seq key-fn start-idx end-idx eff-count from-end))
       (t
@@ -2306,7 +2320,7 @@
          (neg-pred (lambda (x) (not (funcall pred x)))))
     (cond
       ((null seq) nil)
-      ((and eff-count (= eff-count 0)) (if (consp seq) (copy-list seq) (copy-seq seq)))
+      ((= eff-count 0) (if (consp seq) (copy-list seq) (copy-seq seq)))
       ((consp seq)
        (%remove-if-list neg-pred seq key-fn start-idx end-idx eff-count from-end))
       (t

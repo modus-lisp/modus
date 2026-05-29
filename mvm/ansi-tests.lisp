@@ -1557,7 +1557,30 @@
       (let ((a (make-array 8 :initial-contents '(a b c d e a e f)
                              :fill-pointer t)))
         (deftest 57003 (aref a 5) 'a))
-    (t (c) (%record-test-fail-or-emit 57003))))
+    (t (c) (%record-test-fail-or-emit 57003)))
+  ;; ============================================================
+  ;; KNOWN UNFIXED BUG: AArch64 fixnum-0 / NIL bit-pattern collision
+  ;; ============================================================
+  ;; Bare-metal AArch64 + Linux/AArch64 set x26 (NIL) = raw 0.  Fixnum 0
+  ;; is also raw 0 (fixnums = value << 1, so 0 << 1 = 0).  Same bit
+  ;; pattern → (if 0 ...) takes the else branch; (null 0) returns T;
+  ;; (and 0 t) returns NIL.  Costs ~200-400 ANSI tests across counter-
+  ;; tracking primitives (substitute-if/count/find/delete with :count).
+  ;;
+  ;; Fix tried 2026-05-29: change x26 → 0xDEAD0001 (x64 convention).
+  ;; Hung at %init-packages because the runtime has many sites that
+  ;; assume raw-zero-memory == NIL (BSS-zeroed globals, hash-table empty
+  ;; buckets, alloc-obj zeroed slot defaults, etc.).  Reverted.
+  ;;
+  ;; Targeted fix needs to (a) pick a NIL value, (b) audit every site
+  ;; that writes raw 0 expecting NIL, (c) update :bnull / consp / atom
+  ;; to NIL-guard.  Out of scope for this PR.
+  ;;
+  ;; Probe 57120 = canonical reproducer: (if 0 'YES 'NO).
+  ;; Expected on x64: 'YES.  Observed on AArch64: 'NO.
+  (handler-case
+      (deftest 57120 (if 0 'YES 'NO) 'YES)
+    (t (c) (%record-test-fail-or-emit 57120))))
 
 (defun run-all-tests ()
   ;; Each runner wrapped in handler-case so an uncaught error in one

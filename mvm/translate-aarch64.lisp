@@ -2442,27 +2442,32 @@
              (a64-stur buf ps pd 7)))
 
           ;; ---- CONSP Vd, Vs ----
-          ;; Test low 4 bits for cons tag (1)
-          ;; AND x16, Vs, #0xF  →  use register-based: load 0xF, AND
-          ;; CMP x16, #1
-          ;; CSET Vd, EQ
+          ;; (consp NIL) MUST return NIL even though NIL=#xDEAD0001 has
+          ;; cons-tag 1.  Pre-check Vs == x26 (NIL); if so force x16=0
+          ;; so the cons-tag (1) test downstream fails.  Then test low
+          ;; 4 bits for cons tag.  Mirrors x64's NIL pre-check.
           ((= op +op-consp+)
-           ;; Produce Modus T (0xDEAD1009) when (low4 == 1), NIL (x26) else.
-           ;; The cset 0/1 form (previously here) violated the IR contract
-           ;; that boolean ops produce T/NIL — downstream code that did
-           ;; (car (consp x)) treated the raw 1 as a cons and SEGV'd.
-           ;; AArch64 CSEL Xd, Xn, Xm, cond  selects Xn if cond else Xm.
-           ;; Encoding 0x9A800000 | (Rm<<16) | (cond<<12) | (Rn<<5) | Rd.
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
+             ;; x16 = ps & 0xF.
              (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf +a64-x16+ ps +a64-x17+)
+             ;; CMP ps, x26; CSEL x16, XZR, x16, EQ.
+             ;; Encoding: Rd=Rn if cond else Rm.  Want: ps==x26 → x16=0,
+             ;; ps!=x26 → x16 unchanged.  Rn=XZR (selected when EQ),
+             ;; Rm=x16 (selected when NE).
+             (a64-cmp-reg buf ps +a64-x26+)
+             (a64-emit buf (logior #x9A800000
+                                   (ash +a64-x16+ 16)        ; Rm = x16
+                                   (ash +cc-eq+ 12)
+                                   (ash 31 5)                ; Rn = XZR
+                                   +a64-x16+))               ; Rd = x16
              (a64-cmp-imm buf +a64-x16+ 1)
              ;; x18 = T literal 0xDEAD1009
              (a64-movz buf +a64-x18+ #x1009 0)
              (a64-movk buf +a64-x18+ #xDEAD 1)
-             ;; CSEL pd, x18, x26, EQ  →  pd = T if EQ else NIL
+             ;; CSEL pd, x18, x26, EQ  →  pd = T if EQ else NIL.
              (a64-emit buf (logior #x9A800000
                                    (ash +a64-x26+ 16)
                                    (ash +cc-eq+ 12)
@@ -2472,17 +2477,28 @@
                (store-dst pd vd))))
 
           ;; ---- ATOM Vd, Vs ----
-          ;; Opposite of consp: tag != 1
+          ;; NIL IS an atom — but NIL=#xDEAD0001 has cons-tag 1, so the
+          ;; low-nibble test would mis-classify.  Same pre-check as
+          ;; consp: ps==NIL → x16=0 (not 1) so the NE-against-1 path
+          ;; below returns T (atom).
           ((= op +op-atom+)
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
              (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf +a64-x16+ ps +a64-x17+)
+             ;; CMP ps, x26; CSEL x16, XZR, x16, EQ — Rn=XZR (EQ-path),
+             ;; Rm=x16 (NE-path).
+             (a64-cmp-reg buf ps +a64-x26+)
+             (a64-emit buf (logior #x9A800000
+                                   (ash +a64-x16+ 16)        ; Rm = x16
+                                   (ash +cc-eq+ 12)
+                                   (ash 31 5)                ; Rn = XZR
+                                   +a64-x16+))               ; Rd = x16
              (a64-cmp-imm buf +a64-x16+ 1)
              (a64-movz buf +a64-x18+ #x1009 0)
              (a64-movk buf +a64-x18+ #xDEAD 1)
-             ;; CSEL pd, x18, x26, NE  →  pd = T if not-EQ else NIL
+             ;; CSEL pd, x18, x26, NE  →  pd = T if not-EQ else NIL.
              (a64-emit buf (logior #x9A800000
                                    (ash +a64-x26+ 16)
                                    (ash +cc-ne+ 12)

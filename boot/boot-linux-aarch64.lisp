@@ -296,14 +296,21 @@
   ;; gc_count = 0
   (emit-aarch64-u32 buf #xF900123F)   ; STR XZR, [x17, #32]
 
-  ;; x26 = NIL.  Bare-metal AArch64 uses NIL=0 (boot-aarch64.lisp line 174);
-  ;; that convention matches the :consp / :atom / etc. cset-based predicates
-  ;; in translate-aarch64.lisp which emit 0 for false and 1 for true.  An
-  ;; earlier draft set NIL=0xDEAD0001 (x64 convention), which made
-  ;; `(if (consp 5) T F)` return T because cset's 0 result wasn't EQ to NIL
-  ;; — that broke every (when (not (consp x)) …) loop terminator in the
-  ;; runtime (set-symbol-value, %mapcar-…, etc.).
-  (emit-aarch64-load-imm64 buf 26 0)
+  ;; x26 = NIL = #xDEAD0001 (matches x64's +nil-value+).  The original
+  ;; aa64 boot used NIL=0; that lined up with an early `cset`-based
+  ;; consp/atom which produced raw 0/1.  Those predicates have since
+  ;; been rewritten to emit `CSEL pd, x18(T), x26(NIL), cond` — they
+  ;; pull NIL from x26 directly, so changing x26's value just changes
+  ;; what NIL is, and they keep working.
+  ;;
+  ;; NIL=0 caused a structural bug: fixnum 0 has bit pattern 0 too, so
+  ;; `(null 0)` returned T and downstream tests like
+  ;; `(when count (decf count))` mistreated `:count 0` as `:count nil`.
+  ;; The same shape recurred at :end 0 (find/position), slot index 0
+  ;; (CLOS), and at every place we used `(null x)` to mean "absent
+  ;; sentinel" with x potentially-0.  Sentinel-substitution worked
+  ;; case by case but kept needing fresh patches; this fixes the root.
+  (emit-aarch64-load-imm64 buf 26 #xDEAD0001)
 
   ;; x29 (FP) = SP
   (emit-aarch64-u32 buf #x910003FD))

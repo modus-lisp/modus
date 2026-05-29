@@ -1540,6 +1540,10 @@
           (%with-standard-io-syntax
             (lambda () (let ((*package* (find-package "CL-TEST"))) ,test-form)))
           ,@expected)))
+    ;; (psetq) — empty form returns NIL (CLHS).
+    ((and (eq (car form) 'psetq) (null (cdr form)))
+     nil)
+
     ;; (psetq var1 val1 var2 val2 ...) → evaluate all values, then set all
     ;; Parallel setq: (let ((t1 v1) (t2 v2) ...) (setq var1 t1) (setq var2 t2) ...)
     ((and (eq (car form) 'psetq) (consp (cdr form)))

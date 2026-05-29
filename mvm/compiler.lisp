@@ -735,6 +735,15 @@
                         slot-specs)
              ,@body)))))
 
+  ;; WITH-COMPILATION-UNIT — `(with-compilation-unit (options...) body...)`
+  ;; Modus doesn't batch compiler warnings into units; CLHS only requires
+  ;; the body to evaluate normally and return its values.  Drop the
+  ;; options list (whatever it says, default-policy is identical) and
+  ;; emit `(progn body...)`.  Unblocks with-compilation-unit.{1..7} tests.
+  (mvm-define-macro "WITH-COMPILATION-UNIT"
+    (lambda (form)
+      `(progn ,@(cddr form))))
+
   ;; WITH-ACCESSORS — (with-accessors ((var accessor-name)*) instance body*)
   ;; Each spec is (VAR ACCESSOR-NAME); the var binds to a symbol-macro
   ;; that expands to (ACCESSOR-NAME INSTANCE), so SETF on the var

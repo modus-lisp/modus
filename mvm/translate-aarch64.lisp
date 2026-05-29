@@ -603,6 +603,50 @@
   "TST Xn, Xm  →  ANDS XZR, Xn, Xm"
   (a64-ands-reg buf +a64-xzr+ rn rm))
 
+;;; --- IEEE float (FP) instructions ---
+;;; Double-precision (FP64).  D0-D31 are FP regs; same number space as
+;;; X regs for register fields.  The float "object" layout matches x64
+;;; (mvm/translate-x64.lisp +op-fadd+): a 2-slot heap object with subtag
+;;; #x60, tagged pointer = raw+9; slot 0 = hi32 sign-extended<<1, slot 1
+;;; = lo32 zero-extended<<1.  Splitting into two tagged fixnums avoids
+;;; the low-bit collision with fixnum tag.
+
+(defun a64-fadd-d (buf dd dn dm)
+  "FADD Dd, Dn, Dm  (FP64 add)"
+  (a64-emit buf (logior #x1E602800 (ash dm 16) (ash dn 5) dd)))
+
+(defun a64-fsub-d (buf dd dn dm)
+  "FSUB Dd, Dn, Dm  (FP64 sub)"
+  (a64-emit buf (logior #x1E603800 (ash dm 16) (ash dn 5) dd)))
+
+(defun a64-fmul-d (buf dd dn dm)
+  "FMUL Dd, Dn, Dm  (FP64 mul)"
+  (a64-emit buf (logior #x1E600800 (ash dm 16) (ash dn 5) dd)))
+
+(defun a64-fdiv-d (buf dd dn dm)
+  "FDIV Dd, Dn, Dm  (FP64 div)"
+  (a64-emit buf (logior #x1E601800 (ash dm 16) (ash dn 5) dd)))
+
+(defun a64-fcmp-d (buf dn dm)
+  "FCMP Dn, Dm  (FP64 compare, sets NZCV)"
+  (a64-emit buf (logior #x1E602000 (ash dm 16) (ash dn 5))))
+
+(defun a64-scvtf-d-x (buf dd xn)
+  "SCVTF Dd, Xn  (signed int64 → double)"
+  (a64-emit buf (logior #x9E620000 (ash xn 5) dd)))
+
+(defun a64-fcvtzs-x-d (buf xd dn)
+  "FCVTZS Xd, Dn  (double → signed int64, truncate toward zero)"
+  (a64-emit buf (logior #x9E780000 (ash dn 5) xd)))
+
+(defun a64-fmov-d-x (buf dd xn)
+  "FMOV Dd, Xn  (move raw int64 bits → FP reg, no conversion)"
+  (a64-emit buf (logior #x9E670000 (ash xn 5) dd)))
+
+(defun a64-fmov-x-d (buf xd dn)
+  "FMOV Xd, Dn  (move raw FP reg bits → int64, no conversion)"
+  (a64-emit buf (logior #x9E660000 (ash dn 5) xd)))
+
 ;;; --- Shift (register) ---
 ;;; Variable shifts: LSLV/LSRV/ASRV encoded as data-processing (2 source)
 ;;; sf|0|0|11010110|Rm|001000|Rn|Rd  = LSLV
@@ -3228,6 +3272,168 @@
              (a64-mov-reg buf pd +a64-x27+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
+
+          ;; ============================================================
+          ;; IEEE float opcodes (FP64).  Mirror translate-x64.lisp.
+          ;;
+          ;; Float object layout:
+          ;;   tagged ptr = raw + 9 (obj tag)
+          ;;   [raw + 0]  header = #x260 (count=2 | subtag #x60)
+          ;;   [raw + 8]  unused (alignment padding)
+          ;;   [raw + 16] slot 0: hi32 sign-extended<<1 (tagged fixnum)
+          ;;   [raw + 24] slot 1: lo32 zero-extended<<1 (tagged fixnum)
+          ;; OBJ-REF idx*8+7 from tagged pointer reaches slot 0 at +7,
+          ;; slot 1 at +15.
+          ;;
+          ;; Used scratch: x9..x11 (volatile), D0/D1 (FP scratch).
+          ;; ============================================================
+
+          ;; Helper: load float object bits (Vs is tagged ptr) into D-reg.
+          ;; Generated inline for each opcode below.  Sequence:
+          ;;   LDUR x9,  [ps, #7]    ; tagged hi32<<1
+          ;;   LSR  x9,  x9, #1      ; untag (logical for hi32 sign bit handling — see split)
+          ;;   LSL  x9,  x9, #32     ; into upper half
+          ;;   LDUR x10, [ps, #15]   ; tagged lo32<<1
+          ;;   LSR  x10, x10, #1     ; untag
+          ;;   AND  x10, x10, #0xFFFFFFFF
+          ;;   ORR  x9,  x9, x10     ; combine into 64-bit float bit pattern
+          ;;   FMOV Dx,  x9          ; bits → FP reg
+          ;;
+          ;; NOTE on sign-extension: slot 0 was stored as (hi32 << 1)
+          ;; where hi32 was the upper 32 bits of the float's bit pattern.
+          ;; x64 uses SAR (arithmetic) then shifts to discard.  AArch64
+          ;; uses LSR (logical) since we'll mask anyway.  Both work.
+
+          ;; ---- FADD / FSUB / FMUL / FDIV Vd, Va, Vb ----
+          ((or (= op +op-fadd+) (= op +op-fsub+)
+               (= op +op-fmul+) (= op +op-fdiv+))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Load Va float bits → D0
+             (a64-ldur buf +a64-x9+  pa 7)
+             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
+             (a64-ldur buf +a64-x10+ pa 15)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
+             ;; AND x10, x10, #0xFFFFFFFF  via LSL 32 / LSR 32
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 0 +a64-x9+)             ; D0 ← Va bits
+             ;; Load Vb float bits → D1
+             (a64-ldur buf +a64-x9+  pb 7)
+             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
+             (a64-ldur buf +a64-x10+ pb 15)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 1 +a64-x9+)             ; D1 ← Vb bits
+             ;; Perform op: Dout ← D0 op D1
+             (cond ((= op +op-fadd+) (a64-fadd-d buf 0 0 1))
+                   ((= op +op-fsub+) (a64-fsub-d buf 0 0 1))
+                   ((= op +op-fmul+) (a64-fmul-d buf 0 0 1))
+                   (t                (a64-fdiv-d buf 0 0 1)))
+             ;; D0 bits → x9
+             (a64-fmov-x-d buf +a64-x9+ 0)
+             ;; Allocate fresh 2-slot float at x24 (alloc ptr).
+             ;; Header = (2<<8)|#x60 = #x260.
+             (a64-movz buf +a64-x10+ #x260 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             ;; Slot 0 = (hi32 sign-ext) << 1.  hi32 = x9 >>> 32 (arith).
+             (a64-asr-imm buf +a64-x10+ +a64-x9+ 32)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-stur buf +a64-x10+ +a64-x24+ 16)
+             ;; Slot 1 = (lo32 zero-ext) << 1.
+             (a64-lsl-imm buf +a64-x10+ +a64-x9+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-stur buf +a64-x10+ +a64-x24+ 24)
+             ;; Tagged result = x24 + 9; advance x24 by 32.
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 32)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- ITOF Vd, Vs ----
+          ;; Tagged integer (Vs<<1) → freshly-allocated float object.
+          ((= op +op-itof+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Untag: x9 = ps >> 1 (signed)
+             (a64-asr-imm buf +a64-x9+ ps 1)
+             ;; SCVTF D0, x9
+             (a64-scvtf-d-x buf 0 +a64-x9+)
+             ;; D0 bits → x9
+             (a64-fmov-x-d buf +a64-x9+ 0)
+             ;; Allocate 2-slot float (same tail as fadd)
+             (a64-movz buf +a64-x10+ #x260 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-asr-imm buf +a64-x10+ +a64-x9+ 32)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-stur buf +a64-x10+ +a64-x24+ 16)
+             (a64-lsl-imm buf +a64-x10+ +a64-x9+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-stur buf +a64-x10+ +a64-x24+ 24)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 32)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FTOI Vd, Vs ----
+          ;; Float object → tagged integer (truncate toward zero).
+          ((= op +op-ftoi+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Reassemble float bits → D0
+             (a64-ldur buf +a64-x9+  ps 7)
+             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
+             (a64-ldur buf +a64-x10+ ps 15)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             ;; FCVTZS x9, D0
+             (a64-fcvtzs-x-d buf +a64-x9+ 0)
+             ;; Tag as fixnum: x9 << 1
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FCMP Va, Vb ----
+          ;; Sets NZCV; subsequent :beq/:blt/:bgt operate on FP flags.
+          ((= op +op-fcmp+)
+           (let* ((pa (ensure-src (vr 0) +a64-x16+))
+                  (pb (ensure-src (vr 1) +a64-x17+)))
+             ;; Reassemble Va float bits → D0
+             (a64-ldur buf +a64-x9+  pa 7)
+             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
+             (a64-ldur buf +a64-x10+ pa 15)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             ;; Reassemble Vb float bits → D1
+             (a64-ldur buf +a64-x9+  pb 7)
+             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
+             (a64-ldur buf +a64-x10+ pb 15)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
+             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
+             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 1 +a64-x9+)
+             (a64-fcmp-d buf 0 1)))
 
           ;; ---- Unknown opcode ----
           (t

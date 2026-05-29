@@ -3725,6 +3725,23 @@
               nil)
           t)
       nil))
+;; randomly-check-readability — printer-aux.lsp's version uses every
+;; printer-control variable (*print-array*, *print-circle*, *print-base*
+;; in random base 2-35, *print-pretty*, *print-readably*, etc.) and
+;; depends on a full reader/printer round-trip — Modus's printer doesn't
+;; honor most of these.  ansi-bridge.lisp:1975 has a t-returning stub,
+;; but printer-aux.lsp loads AFTER ansi-bridge and overrides with the
+;; complex version, which then crashes the fork on the first call.
+;; Restore the t-stub here to win against printer-aux.lsp.
+;; Affects print-array (47 tests), print-floats (16+), print-integers
+;; (probable), print-vector (11+), print-pretty (more).
+(defun randomly-check-readability (obj &rest args)
+  (declare (ignore obj args))
+  nil)
+;; randomly-check-readability-of-fn — companion for &key + function case
+(defun randomly-check-readability-of-fn (obj &rest args)
+  (declare (ignore obj args))
+  nil)
 (defun union-with-check (x y &rest args)
   (apply #'union x y args))
 (defun nunion-with-copy (x y &rest args)

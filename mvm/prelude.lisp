@@ -1356,6 +1356,10 @@
    subsequent (setq *current-condition* c) inside %signal-type-error
    would re-enter set-symbol-value on the same corrupted alist and
    recurse to stack-overflow.  See reference_aarch64_te_recursion_fix.md."
+  ;; CLHS: (symbol-value nil) ≡ nil, (symbol-value 't) ≡ t — constants
+  ;; with no alist entry needed.  Without this, (aref nil 0) would fault.
+  (when (null name-or-hash) (return-from symbol-value nil))
+  (when (eq name-or-hash t) (return-from symbol-value t))
   (let ((key (if (integerp name-or-hash) name-or-hash
                  (aref name-or-hash 0)))
         (head (mem-ref #x10000080 :u64)))

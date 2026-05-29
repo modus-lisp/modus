@@ -462,12 +462,20 @@
           (setq cur (cdr cur)))))))
 
 (defun %clos-slot-index (cls slot-name)
-  "Return 0-based index of SLOT-NAME in cls, or nil if not found."
+  "Return 0-based index of SLOT-NAME in cls, or -1 if not found.
+   Uses a NEGATIVE sentinel (was nil) to avoid the AArch64 truthiness
+   collision: on AArch64, NIL register x26 = raw 0 and fixnum 0 also
+   has bit-pattern 0, so callers doing `(when (null idx) …slot-missing…)`
+   wrongly entered the not-found path for slot 0 (the first slot of
+   every class) — which then either signaled slot-missing or dereferenced
+   NIL.  See reference_aa64_fixnum_zero_nil.md.  Numeric comparisons
+   work correctly on fixnum 0 vs -1, so callers now use `(< idx 0)`
+   to detect the not-found case."
   (let ((slots (aref cls 2))
         (idx 0))
     (let ((cur slots))
       (loop
-        (when (null cur) (return nil))
+        (when (null cur) (return -1))
         (when (eq (car cur) slot-name) (return idx))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))))
@@ -539,7 +547,13 @@
           (return-from %slot-value
             (%dispatch-slot-unbound cls obj slot-name))))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx)
+      ;; AArch64 fixnum-0 / NIL bit-pattern collision (see
+      ;; reference_aa64_fixnum_zero_nil.md): `(null 0)` returns T on
+      ;; AArch64, so for slot 0 (first slot of every class) `(null idx)`
+      ;; was wrongly triggering slot-missing and crashing the fork.
+      ;; Use (not (integerp idx)) — the only non-integer return from
+      ;; %clos-slot-index is NIL (not found).
+      (when (< idx 0)
         (return-from %slot-value
           (%dispatch-slot-missing cls obj slot-name 'slot-value nil nil)))
       (let ((val (aref obj (+ 2 idx))))
@@ -565,7 +579,8 @@
       (%class-slot-set class-name slot-name new-val)
       (return-from set-slot-value new-val))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx)
+      ;; See %slot-value for the AArch64 fixnum-0/NIL rationale.
+      (when (< idx 0)
         (%dispatch-slot-missing cls obj slot-name 'setf new-val t)
         (return-from set-slot-value new-val))
       (aset obj (+ 2 idx) new-val)
@@ -581,7 +596,8 @@
     (when (%slot-class-owner class-name slot-name)
       (return-from %slot-boundp (%class-slot-bound-p class-name slot-name)))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx)
+      ;; See %slot-value for the AArch64 fixnum-0/NIL rationale.
+      (when (< idx 0)
         (return-from %slot-boundp
           (%dispatch-slot-missing cls obj slot-name 'slot-boundp nil nil)))
       ;; -999 is the unbound slot sentinel (fixnum guard prevents type error)
@@ -594,7 +610,8 @@
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from %slot-makunbound obj))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (when (null idx)
+      ;; See %slot-value for the AArch64 fixnum-0/NIL rationale.
+      (when (< idx 0)
         (%dispatch-slot-missing cls obj slot-name 'slot-makunbound nil nil)
         (return-from %slot-makunbound obj))
       ;; Use literal -999 to avoid SYMBOL-VALUE clobber in variable-index aset
@@ -608,7 +625,9 @@
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from %slot-exists-p nil))
     (let ((idx (%clos-slot-index cls slot-name)))
-      (if idx t nil))))
+      ;; See %slot-value for the AArch64 fixnum-0/NIL rationale —
+      ;; (if 0 t nil) returns nil on AArch64 (fixnum 0 == NIL bits).
+      (if (< idx 0) nil t))))
 
 ;; slot-missing dispatch
 ;; Methods stored as: (class-name . fn).  Class-name = T matches all

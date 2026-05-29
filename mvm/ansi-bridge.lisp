@@ -2423,7 +2423,11 @@
                  (slot-nm (%clos-initarg-to-slot class-name key)))
             (when (and slot-nm (not (member slot-nm set-slots)))
               (let ((idx (%clos-slot-index cls slot-nm)))
-                (when (and idx (< (+ 2 idx) inst-len))
+                ;; idx is -1 (not found) or 0..n-1 — use `(>= idx 0)`
+                ;; to filter not-found.  See %clos-slot-index docstring
+                ;; for the AArch64 rationale (the previous nil sentinel
+                ;; collided with fixnum 0 on slot 0).
+                (when (and (>= idx 0) (< (+ 2 idx) inst-len))
                   (aset instance (+ 2 idx) val)
                   (setq set-slots (cons slot-nm set-slots))))))
           (setq cur (cdr (cdr cur)))))
@@ -2612,7 +2616,9 @@
                  (slot-nm (%clos-initarg-to-slot new-name key)))
             (when (and slot-nm (not (member slot-nm set-slots)))
               (let ((idx (%clos-slot-index new-cls slot-nm)))
-                (when (and idx (< (+ 2 idx) inst-len))
+                ;; See %clos-slot-index docstring — idx is -1 (not found)
+                ;; or 0..n-1; use (>= idx 0) instead of truthiness.
+                (when (and (>= idx 0) (< (+ 2 idx) inst-len))
                   (aset instance (+ 2 idx) val)
                   (setq set-slots (cons slot-nm set-slots))))))
           (setq cur (cdr (cdr cur)))))

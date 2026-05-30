@@ -1807,13 +1807,22 @@
 ;;; ============================================================
 
 (defun %bit-op (op v1 v2 &optional result-vec)
-  "Apply bitwise OP element-wise to bit vectors V1 and V2."
+  "Apply bitwise OP element-wise to bit arrays V1 and V2.
+   When RESULT-VEC is unsupplied, allocate a fresh array with the
+   SAME SHAPE as V1 (multi-dim aware): bit-and.{12..16}/etc. compare
+   `(values … result)` to `#2a((…) (…))`-shaped expecteds, so a flat
+   vector return mismatches the expected even when the element data
+   is correct."
   (let ((len (min (array-length v1) (if v2 (array-length v2) (array-length v1)))))
-    (let ((result (if result-vec
-                      (if (eq result-vec t)
-                          v1  ; modify v1 in place
-                          result-vec)
-                      (make-array len))))
+    (let ((result (cond
+                    ((eq result-vec t) v1)              ; in-place into V1
+                    (result-vec result-vec)             ; user-supplied dest
+                    (t
+                     ;; Allocate same shape as v1.  If v1 is an MDA
+                     ;; (multi-dim or has :element-type 'bit), preserve
+                     ;; both via :dimensions + :element-type.
+                     (make-array (array-dimensions v1)
+                                 :element-type 'bit)))))
       (let ((i 0))
         (loop
           (when (>= i len) (return result))

@@ -1985,6 +1985,189 @@
                                  (imm19 (logand (ash bo -2) #x7FFFF)))
                             (setf (aref (a64-buffer-code buf) blt-idx)
                                   (logior #x54000000 (ash imm19 5) #b1011))))))))) ; LT
+               ((= code #x0520)
+                ;; INSTALL-SIGNAL-HANDLERS — AArch64 Linux.  Mirror of
+                ;; translate-x64.lisp trap #x0520.  Installs SIGSEGV(11),
+                ;; SIGBUS(7), SIGFPE(8), SIGILL(4) via rt_sigaction
+                ;; (syscall 134).  The handler is an embedded asm stub —
+                ;; NOT a Lisp function — because Lisp entry would allocate
+                ;; stack/GC, both unsafe in signal context.
+                ;;
+                ;; Stub semantics: if a handler-case is active (saved SP
+                ;; at #x10000180 != 0), pop the handler stack INLINE,
+                ;; restore SP/FP/PC, jump back with x0 = T (#xDEAD1009).
+                ;; Otherwise sys_exit(139).
+                ;;
+                ;; Branches inside the stub are manually patched (record
+                ;; index, emit placeholder, compute offset, patch in
+                ;; place) instead of using the fixup table — the fixup
+                ;; resolver may not run for this emit context.
+                ;;
+                ;; Without this trap, CAR/CDR on non-NIL non-cons (and
+                ;; other faulting fast-paths) propagate the SIGSEGV out
+                ;; to qemu's "uncaught target signal 11" handler and kill
+                ;; the fork — explaining the "uncatchable runtime EVAL
+                ;; SEGV" pattern that pre-stamped probes 56491-56493 and
+                ;; prestamped most of the documentation / defmethod /
+                ;; gensym test clusters.
+
+                ;; --- Branch past the embedded stub on this exec path ---
+                (let ((past-stub-b-idx (a64-current-index buf)))
+                  (a64-emit buf #x14000000)   ; B #0 — patched below.
+
+                  ;; ============================================================
+                  ;; Embedded signal handler stub.  Entry: x0=signum,
+                  ;; x1=siginfo*, x2=ucontext*.  We don't touch ucontext.
+                  ;; ============================================================
+                  (let ((stub-start-idx (a64-current-index buf)))
+
+                    ;; x9/x10/x11 = saved SP / FP / PC.
+                    (a64-load-imm64 buf +a64-x16+ #x10000180)
+                    (a64-ldur buf +a64-x9+  +a64-x16+ 0)
+                    (a64-ldur buf +a64-x10+ +a64-x16+ 8)
+                    (a64-ldur buf +a64-x11+ +a64-x16+ 16)
+
+                    ;; If x9 == 0, no handler active → exit path.
+                    ;; CBZ x9, #0 — patched to jump to exit-label.
+                    (let ((cbz-exit-idx (a64-current-index buf)))
+                      (a64-emit buf (logior #xB4000000 9))    ; CBZ x9
+
+                      ;; ---- Inline handler-stack pop ----
+                      ;; depth at #x10010000 ; frames at #x10010008 + depth*24.
+                      ;; Scratch: x12 = depth-addr, x13 = depth, x14 = frame
+                      ;; ptr, x15 = slot ptr (#x10000180), x16 = temp.
+                      (a64-load-imm64 buf +a64-x12+ #x10010000)
+                      (a64-ldur buf +a64-x13+ +a64-x12+ 0)
+                      (a64-load-imm64 buf +a64-x15+ #x10000180)
+                      ;; If depth == 0, write zeros to slot then skip.
+                      (let ((cbz-zero-idx (a64-current-index buf)))
+                        (a64-emit buf (logior #xB4000000 13))  ; CBZ x13
+
+                        ;; --- depth > 0 branch: depth--, copy frame ---
+                        (a64-sub-imm buf +a64-x13+ +a64-x13+ 1)
+                        (a64-str-unsigned buf +a64-x13+ +a64-x12+ 0)
+                        (a64-add-imm buf +a64-x14+ +a64-x12+ 8)        ; 0x10010008
+                        (a64-lsl-imm buf +a64-x16+ +a64-x13+ 4)        ; depth*16
+                        (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 0)
+                        (a64-lsl-imm buf +a64-x16+ +a64-x13+ 3)        ; depth*8
+                        (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 0)
+                        (a64-ldur buf +a64-x16+ +a64-x14+ 0)
+                        (a64-stur buf +a64-x16+ +a64-x15+ 0)
+                        (a64-ldur buf +a64-x16+ +a64-x14+ 8)
+                        (a64-stur buf +a64-x16+ +a64-x15+ 8)
+                        (a64-ldur buf +a64-x16+ +a64-x14+ 16)
+                        (a64-stur buf +a64-x16+ +a64-x15+ 16)
+                        ;; Jump past zero branch.
+                        (let ((b-after-pop-idx (a64-current-index buf)))
+                          (a64-emit buf #x14000000)             ; B #0
+
+                          ;; zero-depth target: write zeros to slot.
+                          (let ((zero-target-idx (a64-current-index buf)))
+                            (a64-stur buf +a64-xzr+ +a64-x15+ 0)
+                            (a64-stur buf +a64-xzr+ +a64-x15+ 8)
+                            (a64-stur buf +a64-xzr+ +a64-x15+ 16)
+
+                            ;; after-pop target: restore SP/FP, x0=T, BR PC.
+                            (let ((after-pop-idx (a64-current-index buf)))
+                              ;; mov sp, x9  →  ADD sp, x9, #0.
+                              (a64-add-imm buf +a64-sp+ +a64-x9+ 0)
+                              (a64-mov-reg buf +a64-x29+ +a64-x10+)
+                              ;; x0 = T = #xDEAD1009.
+                              (a64-movz buf +a64-x0+ #x1009 0)
+                              (a64-movk buf +a64-x0+ #xDEAD 1)
+                              ;; BR x11.
+                              (a64-emit buf (logior #xD61F0000 (ash +a64-x11+ 5)))
+
+                              ;; --- exit label: sys_exit(139) ---
+                              (let ((exit-label-idx (a64-current-index buf)))
+                                (a64-movz buf +a64-x0+ 139 0)
+                                (a64-movz buf +a64-x8+ 93 0)
+                                (a64-svc buf 0)
+
+                                ;; ============================================
+                                ;; Patch in-stub branches (instruction-offset
+                                ;; relative).  Note: B/CBZ imm fields are
+                                ;; signed; logand with mask clips correctly
+                                ;; for positive forward jumps used here.
+                                ;; ============================================
+
+                                ;; CBZ x9 → exit-label.
+                                (let* ((off (- exit-label-idx cbz-exit-idx))
+                                       (imm19 (logand off #x7FFFF))
+                                       (code (a64-buffer-code buf)))
+                                  (setf (aref code cbz-exit-idx)
+                                        (logior (aref code cbz-exit-idx)
+                                                (ash imm19 5))))
+                                ;; CBZ x13 → zero-depth target.
+                                (let* ((off (- zero-target-idx cbz-zero-idx))
+                                       (imm19 (logand off #x7FFFF))
+                                       (code (a64-buffer-code buf)))
+                                  (setf (aref code cbz-zero-idx)
+                                        (logior (aref code cbz-zero-idx)
+                                                (ash imm19 5))))
+                                ;; B (in depth-decrement branch) → after-pop.
+                                (let* ((off (- after-pop-idx b-after-pop-idx))
+                                       (imm26 (logand off #x3FFFFFF))
+                                       (code (a64-buffer-code buf)))
+                                  (setf (aref code b-after-pop-idx)
+                                        (logior (aref code b-after-pop-idx)
+                                                imm26)))
+
+                                ;; ============================================
+                                ;; Past stub — install handler.
+                                ;; ============================================
+                                (let ((past-stub-idx (a64-current-index buf)))
+
+                                  ;; Patch the initial "B past_stub" branch.
+                                  (let* ((off (- past-stub-idx past-stub-b-idx))
+                                         (imm26 (logand off #x3FFFFFF))
+                                         (code (a64-buffer-code buf)))
+                                    (setf (aref code past-stub-b-idx)
+                                          (logior (aref code past-stub-b-idx)
+                                                  imm26)))
+
+                                  ;; SUB sp, sp, #32 — reserve sigaction.
+                                  (a64-emit buf #xD10083FF)
+
+                                  ;; ADR x16, stub-start — sa_handler.
+                                  (let ((adr-idx (a64-current-index buf)))
+                                    (a64-emit buf (logior #x10000000 +a64-x16+))
+                                    (let* ((byte-off (* (- stub-start-idx adr-idx) 4))
+                                           (immlo (logand byte-off 3))
+                                           (immhi (logand (ash byte-off -2) #x7FFFF))
+                                           (code (a64-buffer-code buf)))
+                                      (setf (aref code adr-idx)
+                                            (logior (aref code adr-idx)
+                                                    (ash immlo 29)
+                                                    (ash #b10000 24)
+                                                    (ash immhi 5)))))
+                                  ;; STR x16, [sp, #0].
+                                  (a64-str-unsigned buf +a64-x16+ +a64-sp+ 0)
+
+                                  ;; sa_flags = SA_SIGINFO | SA_NODEFER = 0x40000004.
+                                  (a64-movz buf +a64-x16+ 4 0)
+                                  (a64-movk buf +a64-x16+ #x4000 1)
+                                  (a64-str-unsigned buf +a64-x16+ +a64-sp+ 8)
+
+                                  ;; sa_restorer = 0; sa_mask = 0.
+                                  (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 16)
+                                  (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 24)
+
+                                  ;; Install each signum via rt_sigaction.
+                                  (dolist (signum '(11 7 8 4))
+                                    (a64-movz buf +a64-x0+ signum 0)
+                                    (a64-add-imm buf +a64-x1+ +a64-sp+ 0)
+                                    (a64-movz buf +a64-x2+ 0 0)
+                                    (a64-movz buf +a64-x3+ 8 0)
+                                    (a64-movz buf +a64-x8+ 134 0)   ; rt_sigaction
+                                    (a64-svc buf 0))
+
+                                  ;; ADD sp, sp, #32 — free sigaction.
+                                  (a64-emit buf #x910083FF)
+
+                                  ;; V0 = NIL (x26).
+                                  (a64-mov-reg buf +a64-x0+ +a64-x26+)))))))))))
+
                (t
                 ;; Real CPU trap
                 (a64-svc buf code)))))

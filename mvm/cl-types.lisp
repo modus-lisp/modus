@@ -1596,11 +1596,16 @@
 (defun generic-add (a b)
   (cond
     ;; Bignum operands route through bignum-add (overflow-safe).
-    ;; Test bignum FIRST so a bignum-integer mix doesn't fall into the
-    ;; (integerp a) (integerp b) → %fixnum-+ trap (which would add raw
-    ;; pointer bits).
     ((or (bignump a) (bignump b)) (bignum-add a b))
-    ((and (integerp a) (integerp b)) (%fixnum-+ a b))
+    ;; Fixnum + fixnum: detect potential overflow by operand magnitude
+    ;; check (each fits in 61 bits → sum fits in 62-bit fixnum range).
+    ;; Larger operands route through bignum-add, which correctly
+    ;; promotes a + b that would have wrapped %fixnum-+ to a bignum.
+    ((and (integerp a) (integerp b))
+     (if (and (<= a 2305843009213693951) (>= a -2305843009213693952)
+              (<= b 2305843009213693951) (>= b -2305843009213693952))
+         (%fixnum-+ a b)
+         (bignum-add a b)))
     ((and (integerp a) (ratiop b))
      (%make-rat (%fixnum-+ (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
@@ -1609,10 +1614,7 @@
      (%make-rat (%fixnum-+ (%fixnum-* (aref a 0) (aref b 1))
                            (%fixnum-* (aref b 0) (aref a 1)))
                 (%fixnum-* (aref a 1) (aref b 1))))
-    ;; Complex: dispatch to complex-add (defined in cl-sequences.lisp)
     ((or (%complex-p a) (%complex-p b)) (complex-add a b))
-    ;; IEEE float fast path — uses SSE2 ADDSD via %float-add primop.
-    ;; Result is a float-typed value (subtag #x60) per CLHS contagion.
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%float-add (%any-to-float a) (%any-to-float b)))
     (t (%fixnum-+ a b))))

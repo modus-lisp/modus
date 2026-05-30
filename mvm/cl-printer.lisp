@@ -48,12 +48,55 @@
 ;;; Quotient may collapse to a fixnum.  D ≤ 36 so r-hi*2^31 stays well
 ;;; below 2^62 (no internal overflow).
 (defun %bignum-divmod-fixnum (n d)
+  "Divide bignum or fixnum N by positive fixnum D ≤ 36.
+   Returns (cons quotient remainder).  Handles big-bignum N via
+   limb-by-limb digit-recurrence (process limbs MSB-first, each limb
+   split into two 31-bit halves so half * (D*2^31) + previous-remainder
+   fits in a 62-bit fixnum)."
   (cond
     ((not (bignump n))
      (if (< n 0)
          (let* ((np (- 0 n)) (q (truncate np d)) (r (mod np d)))
            (if (= r 0) (cons (- 0 q) 0) (cons (- 0 (+ q 1)) (- d r))))
          (cons (truncate n d) (mod n d))))
+    ;; Big bignum: process limbs from MSB to LSB.  Each limb is 62-bit,
+    ;; split into two 31-bit halves so (r * 2^31 + half) fits in
+    ;; (D-1)*2^31 + (2^31-1) ≤ D*2^31 ≤ 36 * 2^31 ≈ 2^36.2 — well under 2^62.
+    ((and (bignump n) (big-bignum-p n))
+     (let ((sign (%bb-sign n))
+           (nlimbs (%bb-nlimbs n)))
+       (let ((quot-halves nil)   ; collected MSB-first as half-limbs
+             (r 0)
+             (i (- nlimbs 1)))
+         (loop (when (< i 0) (return nil))
+           (let* ((limb (%bb-limb n i))
+                  (hi (ash limb -31))
+                  (lo (logand limb 2147483647))
+                  ;; Process high half.
+                  (p1 (+ (* r 2147483648) hi))
+                  (q1 (truncate p1 d))
+                  (r1 (mod p1 d))
+                  ;; Process low half.
+                  (p2 (+ (* r1 2147483648) lo))
+                  (q2 (truncate p2 d))
+                  (r2 (mod p2 d)))
+             (setq quot-halves (cons q1 quot-halves))
+             (setq quot-halves (cons q2 quot-halves))
+             (setq r r2))
+           (setq i (- i 1)))
+         ;; quot-halves is MSB-first list of half-limbs.  Reverse to get
+         ;; LSB-first, then combine to 62-bit limbs.
+         (let* ((q-limbs (%halves-to-limbs (reverse quot-halves)))
+                (q-mag (%make-bb 1 q-limbs))
+                (q (if (= sign -1)
+                       (if (= r 0) (bignum-negate q-mag)
+                           ;; Floor-style: when remainder nonzero on
+                           ;; negative dividend, q = -(q+1), r = d-r.
+                           (bignum-negate (bignum-add q-mag 1)))
+                       q-mag))
+                (r-out (if (and (= sign -1) (> r 0)) (- d r) r)))
+           (cons q r-out)))))
+    ;; Small bignum: original 2-slot path.
     (t
      (let ((hi (bignum-hi n)))
        (if (< hi 0)
@@ -76,9 +119,6 @@
                   (r2 (mod partial2 d))
                   (q-lo (+ (ash q1 31) q2))
                   (q (if (= q-hi 0)
-                         ;; q-lo is already a fixnum (< 2^62 by construction);
-                         ;; do NOT route through bignum-to-fixnum-if-possible
-                         ;; which would read (aref) of a fixnum as a bignum.
                          q-lo
                          (bignum-to-fixnum-if-possible
                            (make-bignum (logand q-lo 4611686018427387903) q-hi)))))
@@ -89,7 +129,8 @@
 (defun %print-integer-in-base (n base stream)
   (cond
     ((bignump n)
-     (if (< (bignum-hi n) 0)
+     (if (or (and (big-bignum-p n) (= (%bb-sign n) -1))
+             (and (not (big-bignum-p n)) (< (bignum-hi n) 0)))
          (progn (%print-char 45 stream)
                 (%print-integer-in-base (bignum-negate n) base stream))
          (let ((digits nil) (tmp n))

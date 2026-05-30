@@ -1913,6 +1913,16 @@
 ;;; ANSI test helper functions (from ansi-aux.lsp, types-aux.lsp, etc.)
 ;;; ============================================================
 
+;; symbol< — variadic less-than comparator for symbols, used by SORT
+;; in the loop6 tests' `(sort (loop for x being the hash-key …) #'symbol<)`
+;; pattern.  ansi-aux.lsp defines it, but the build-side aux loader skips
+;; ansi-aux.lsp ("STRING is unbound" — `(map string …)` body parses as
+;; a variable reference at SBCL host eval time).  Adding it natively
+;; here unblocks loop.6.6..14 (+9) and any other test that hashes-into
+;; a sorted list of symbols.
+(defun symbol< (x &rest args)
+  (apply #'string< (symbol-name x) (mapcar #'symbol-name args)))
+
 (defun test-if-not-in-cl-package (str)
   "Stub — always return nil (symbol is in CL package)."
   nil)

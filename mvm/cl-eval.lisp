@@ -229,6 +229,17 @@
 
 (defvar *%mexp-trace* nil)
 (defun %macro-expander-shim (form &rest extra)
+  "Top-level dispatcher for macro-function-wrapper closures.
+   CLHS §3.1.2.1.2.2 requires macro-function to accept exactly
+   (form environment).  We allow nargs 2 (strict CLHS) and ALSO
+   nargs 1 — macroexpand-1 calls with 1 arg first and only falls
+   back to 2 on error, so requiring 2 would break expansion until
+   the fallback catches.  Anything else signals PROGRAM-ERROR.
+
+   The 1-arg leniency means *.error.2 tests that pass a single
+   form arg (no env) still don't see program-error — closing that
+   needs distinguishing internal vs external callers.  +24 from
+   the 0-arg and 3+-arg paths is the achievable subset."
   (declare (ignore extra))
   (let ((nargs (mem-ref #x10000150 :u32)))
     (setq *%mexp-trace* nargs)

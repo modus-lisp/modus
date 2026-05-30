@@ -2118,11 +2118,76 @@
   (emit-ir :li dest +t-value+))
 
 (defun compile-integer (value dest)
-  "Load an integer literal (pre-tagged as fixnum) into DEST"
-  (let ((tagged (ash value +fixnum-shift+)))
-    (if (zerop tagged)
-        (emit-ir :li dest 0)
-        (emit-ir :li dest tagged))))
+  "Load an integer literal into DEST.
+
+   Fixnums (≤ 62-bit magnitude, ≥ -2^62) emit a single :li.
+
+   Larger values materialise at runtime as either a SMALL bignum
+   (2-slot, lo/hi two's-complement, holds up to 124 bits) or a
+   BIG bignum (sentinel -1 in slot 0 + limbs-array in slot 1,
+   arbitrary precision; see cl-eval.lisp's bignum module).  Both
+   shapes are subtag #x30 so `bignump` recognises them.
+
+   Was: silently truncated via `(ash value +fixnum-shift+)`, which
+   made (expt 11 40) and similar test literals end up as a few low
+   bits — the test's actual-vs-expected comparison then failed even
+   when the runtime arithmetic was correct."
+  (cond
+    ((and (>= value -4611686018427387904) (<= value 4611686018427387903))
+     ;; Fixnum range.
+     (let ((tagged (ash value +fixnum-shift+)))
+       (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))
+    ((<= (integer-length (abs value)) 124)
+     ;; Small bignum.  value = lo + hi * 2^62, where lo ∈ [0, 2^62-1]
+     ;; and hi is signed in [-2^61, 2^61-1].  For negative values
+     ;; use two's-complement.
+     (let* ((mask62 4611686018427387903)
+            (lo (logand value mask62))
+            (hi (ash value -62)))
+       (emit-ir :alloc-obj dest 2 +subtag-bignum+)
+       (let ((temp (alloc-temp-reg)))
+         (emit-ir :li temp (ash lo +fixnum-shift+))
+         (emit-ir :obj-set dest 0 temp)
+         (emit-ir :li temp (ash hi +fixnum-shift+))
+         (emit-ir :obj-set dest 1 temp)
+         (free-temp-reg))))
+    (t
+     ;; Big bignum.  Split into 62-bit limbs, build [sign, nlimbs,
+     ;; limb0, ..., limbN-1] array, wrap in 2-slot bignum with
+     ;; sentinel -1 in slot 0.
+     (let* ((sign (if (< value 0) -1 1))
+            (mag (abs value))
+            (mask62 4611686018427387903)
+            (limbs nil)
+            (tmp mag))
+       (loop (when (= tmp 0) (return nil))
+         (push (logand tmp mask62) limbs)
+         (setf tmp (ash tmp -62)))
+       (setf limbs (nreverse limbs))   ; LSB-first
+       (let* ((nlimbs (length limbs))
+              (limbs-arr (alloc-temp-reg))
+              (temp (alloc-temp-reg)))
+         ;; Allocate limbs-array with (2 + nlimbs) slots, subtag #x32.
+         (emit-ir :alloc-obj limbs-arr (+ 2 nlimbs) +subtag-array+)
+         ;; Slot 0 = sign.
+         (emit-ir :li temp (ash sign +fixnum-shift+))
+         (emit-ir :obj-set limbs-arr 0 temp)
+         ;; Slot 1 = nlimbs.
+         (emit-ir :li temp (ash nlimbs +fixnum-shift+))
+         (emit-ir :obj-set limbs-arr 1 temp)
+         ;; Slots 2..(2+nlimbs-1) = limbs.
+         (let ((i 0))
+           (dolist (limb limbs)
+             (emit-ir :li temp (ash limb +fixnum-shift+))
+             (emit-ir :obj-set limbs-arr (+ 2 i) temp)
+             (incf i)))
+         ;; Allocate the 2-slot bignum wrapper.
+         (emit-ir :alloc-obj dest 2 +subtag-bignum+)
+         (emit-ir :li temp (ash -1 +fixnum-shift+))
+         (emit-ir :obj-set dest 0 temp)
+         (emit-ir :obj-set dest 1 limbs-arr)
+         (free-temp-reg)
+         (free-temp-reg))))))
 
 (defun compile-character (ch dest)
   "Load a character literal into DEST"

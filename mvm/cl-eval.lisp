@@ -215,6 +215,28 @@
        (if (and n (> (length n) 0)) n sym)))
     (t nil)))
 
+;;; CLHS §3.1.2.1.2.2: a macro function takes 2 args (form, environment).
+;;; Modus expanders use 1-arg `(lambda (form) ...)` internally, so the
+;;; user-facing macro-function call needs an arity-checking shim that
+;;; signals PROGRAM-ERROR for any other arity (0, 1, or 3+).
+;;;
+;;; Modus's closure global-cell limitation rules out
+;;;   (let ((real e)) (lambda (&rest a) ...real...))
+;;; — multiple wrappers would share the same %CELL-real (CLAUDE.md
+;;; "Mutable Closures").  Use the is-eql-p pattern: a top-level
+;;; dispatcher reads its captured expander from %get-cenv, and
+;;; %make-closure allocates a fresh env cons per macro-function call.
+
+(defvar *%mexp-trace* nil)
+(defun %macro-expander-shim (form &rest extra)
+  (declare (ignore extra))
+  (let ((nargs (mem-ref #x10000150 :u32)))
+    (setq *%mexp-trace* nargs)
+    (cond
+      ((or (= nargs 1) (= nargs 2))
+       (funcall (car (%get-cenv)) form))
+      (t (%signal-program-error)))))
+
 (defun macro-function (sym &rest env)
   "Return the macro expander function for SYM, or nil.
    1. *macro-function-table* (runtime-registered defmacros)
@@ -224,26 +246,37 @@
       runtime EVAL of forms containing DOLIST etc. crashes because
       they expand at COMPILE time only.
    3. %compiler-macro-p T-marker fallback for syms Modus's compiler
-      implements directly (PUSH/POP/COND for the COMPILED path)."
+      implements directly (PUSH/POP/COND for the COMPILED path).
+
+   Wraps the raw expander via %make-closure + %macro-expander-shim
+   so user-facing `(funcall (macro-function 'X) …)` with wrong arity
+   signals PROGRAM-ERROR per CLHS §3.1.2.1.2.2."
   (let ((key (%macro-sym-key sym)))
-    (cond
-      ((null key) nil)
-      ((and *macro-function-table* (gethash key *macro-function-table*)))
-      ;; Consult compile-time macro table (keyed by hash).  Returns the
-      ;; expander lambda directly — macroexpand-1 below funcalls it
-      ;; with (form nil) to expand.
-      ((and (boundp '*macro-table*) *macro-table*
-            (let ((h (cond ((stringp key) (compute-name-hash key))
-                           ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
-                           ((and (not (consp key)) (not (fixnump key))
-                                 (not (characterp key)))
-                            (aref key 0))
-                           (t 0))))
-              (and (> h 0) (gethash h *macro-table*)))))
-      ;; Compiler-macro fallback only fires on name-string lookups —
-      ;; %compiler-macro-p needs the string form (PUSH/POP/...).
-      ((and (stringp key) (%compiler-macro-p key)) t)
-      (t nil))))
+    (let ((raw
+           (cond
+             ((null key) nil)
+             ((and *macro-function-table* (gethash key *macro-function-table*)))
+             ((and (boundp '*macro-table*) *macro-table*
+                   (let ((h (cond ((stringp key) (compute-name-hash key))
+                                  ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
+                                  ((and (not (consp key)) (not (fixnump key))
+                                        (not (characterp key)))
+                                   (aref key 0))
+                                  (t 0))))
+                     (and (> h 0) (gethash h *macro-table*)))))
+             ((and (stringp key) (%compiler-macro-p key)) t)
+             (t nil))))
+      (cond
+        ((null raw) nil)
+        ((eq raw t) t)                                     ; compiler-macro marker
+        ;; Runtime-defmacro expanders are %interp-closures with their
+        ;; own (form env) dispatch via %call-interp-closure.  Wrapping
+        ;; them in a regular closure breaks that path — macroexpand-1
+        ;; would funcall the wrapper, which tries to funcall the
+        ;; %interp-closure as a normal function and SIGSEGV's.
+        ;; Return them raw; their arity is enforced separately.
+        ((%interp-closure-p raw) raw)
+        (t (%make-closure #'%macro-expander-shim (cons raw nil)))))))
 
 (defun set-macro-function (sym fn &rest env)
   "Install FN as the macro expander for SYM.  Accepts CL symbols, native

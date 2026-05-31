@@ -2146,13 +2146,7 @@
                      (setq individual (cons (car cur) individual))
                      (setq cur (cdr cur))))))))
     ;; Interp-closure dispatch — fast path for runtime-eval'd lambdas.
-    ;; Use %interp-closure-p (symbol-name compare) instead of eq so
-    ;; native-MVM-sym interp-closures from eval'd defmethod bodies
-    ;; route correctly.  Eq on the dual-symbol-representation
-    ;; misclassified them as ordinary funcall targets — the cons cell
-    ;; then got interpreted as a function pointer and SIGSEGV'd inside
-    ;; the heap.
-    (when (%interp-closure-p fn)
+    (when (and (consp fn) (eq (car fn) '%interp-closure))
       (return-from apply (%call-interp-closure fn all-args)))
     (let* ((a0 (and all-args (car all-args)))
            (r1 (and all-args (cdr all-args)))

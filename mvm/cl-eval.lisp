@@ -619,19 +619,8 @@
             nil))))
 
 (defun %interp-closure-p (x)
-  "True if X is an interpreted closure (cons with tag %INTERP-CLOSURE).
-   Compare by symbol-name, not eq.  %interp-closure conses built by
-   the eval defmethod path store a native MVM symbol in slot 0; the
-   `'%interp-closure' literal here resolves to a CL-symbol wrapper.
-   Eq returns NIL for those even though they share the name — see
-   CLAUDE.md \"Symbol identity\" known limitation.  Without this,
-   apply and %call-interp-closure both fall through to ordinary
-   funcall and SIGSEGV trying to execute the cons cell."
-  (and (consp x)
-       (symbolp (car x))
-       (let ((n (cond ((%cl-sym-p (car x)) (%cl-sym-name (car x)))
-                      (t (symbol-name (car x))))))
-         (and n (string= n "%INTERP-CLOSURE")))))
+  "True if X is an interpreted closure (cons with tag %INTERP-CLOSURE)."
+  (and (consp x) (eq (car x) '%interp-closure)))
 
 (defun %call-interp-closure (fn args)
   "Call an interpreted closure."

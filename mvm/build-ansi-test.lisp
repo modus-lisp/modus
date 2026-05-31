@@ -2742,10 +2742,14 @@
                             (cond
                               ((null id-num)
                                (format out "  (handler-case ~A (t (c) nil))~%" form-str))
-                              ;; Known uncatchable-hang tests
-                              ((or (and (>= id-num 13567) (<= id-num 13577))
-                                   (= id-num 25630))
-                               (format out "  (%test-crash-fail ~D) ; skipped: uncatchable hang~%" id-num))
+                              ;; Known uncatchable-hang skip list — kept empty.
+                              ;; The original 13567-13577 (floatp + floor.1-6)
+                              ;; and 25630 entries predated the SIGSEGV signal
+                              ;; handler and file-alarm-secs; revisiting showed
+                              ;; floatp 5/5 + floor.1-3 pass cleanly with no
+                              ;; hang.  Any reintroduced hang surfaces as a
+                              ;; FILE-WEDGE REASON=no-progress and can be
+                              ;; re-added here.
                               (t
                                (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%"
                                        form-str id-num)))))

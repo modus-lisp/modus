@@ -51,17 +51,43 @@
                   nil)))
       (if fn fn sym))))
 
+(defun %sym-name-or-hash (sym)
+  "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
+   - CL-symbol wrapper:    (NAME . HASH-of-NAME)
+   - String:               (STRING . HASH-of-STRING)
+   - Native MVM #x50 sym:  (\"\" . SLOT-0-HASH)   ; no recoverable name
+   - Native MVM #x53 kw:   (\"\" . SLOT-0-HASH)
+   Returns NIL for non-symbols.  The lookup tables index by both name
+   (when known) and hash; native symbols only carry the hash, so we use
+   that as the primary key in *native-sym-function-table*."
+  (cond
+    ((null sym) nil)
+    ((eq sym t) nil)
+    ((%cl-sym-p sym)
+     (let ((nm (%cl-sym-name sym)))
+       (when nm (cons nm (compute-name-hash nm)))))
+    ((stringp sym)
+     (cons sym (compute-name-hash sym)))
+    ((and (not (consp sym)) (not (fixnump sym)) (not (characterp sym))
+          (let ((st (obj-subtag sym))) (or (= st #x50) (= st #x53))))
+     (cons "" (aref sym 0)))
+    (t nil)))
+
 (defun symbol-function (sym)
-  "Return the function object for SYM, or signal undefined-function."
-  (let ((name (cond
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                (t nil))))
-    (when (null name)
+  "Return the function object for SYM, or signal undefined-function.
+   Looks up by name in *symbol-function-table*; native MVM symbols
+   (#x50/#x53) have no recoverable name and route through the hash-
+   keyed *native-sym-function-table* instead."
+  (let ((nh (%sym-name-or-hash sym)))
+    (when (null nh)
       (error "symbol-function: not a symbol"))
-    (let ((fn (if *symbol-function-table*
-                  (gethash name *symbol-function-table*)
-                  nil)))
+    (let* ((name (car nh))
+           (hash (cdr nh))
+           (fn (or (and (> (length name) 0)
+                        *symbol-function-table*
+                        (gethash name *symbol-function-table*))
+                   (and *native-sym-function-table*
+                        (gethash hash *native-sym-function-table*)))))
       (if fn
           fn
           (let ((c (%make-condition 'undefined-function (list :name sym))))
@@ -70,57 +96,61 @@
                 (progn (error "undefined function") nil)))))))
 
 (defun set-symbol-function (sym fn)
-  "Set the function cell of SYM to FN."
-  (let ((name (cond
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                (t nil))))
-    (when (null name)
+  "Set the function cell of SYM to FN.  Updates both the name-keyed
+   table (CL-symbol path) and the hash-keyed table (native MVM symbol
+   path) so subsequent (funcall sym …) — whatever flavor of symbol
+   gets passed at the call site — resolves to FN.
+
+   Previously errored when given a native MVM #x50/#x53 symbol because
+   %cl-sym-name returned NIL on those.  That meant runtime
+   (eval `(defgeneric NAME …)) silently failed for NAMEs that read as
+   native symbols (most of them), leaving no GF stub behind."
+  (let ((nh (%sym-name-or-hash sym)))
+    (when (null nh)
       (error "set-symbol-function: not a symbol"))
-    (unless *symbol-function-table*
-      (%sft-init))
-    (puthash name *symbol-function-table* fn)
-    ;; Mirror into the hash-keyed table so native MVM symbol funcall
-    ;; (which has no name string, only a hash) can see the update too.
-    (when *native-sym-function-table*
-      (puthash (compute-name-hash name) *native-sym-function-table* fn))
-    fn))
+    (let ((name (car nh))
+          (hash (cdr nh)))
+      (unless *symbol-function-table*
+        (%sft-init))
+      (when (> (length name) 0)
+        (puthash name *symbol-function-table* fn))
+      (when *native-sym-function-table*
+        (puthash hash *native-sym-function-table* fn))
+      fn)))
 
 (defun fboundp (sym)
-  "Return T if SYM has a function binding. Checks both the named CL
-   table and the native-symbol hash table for native MVM symbols
-   (which lack a recoverable name string)."
-  (cond
-    ((null sym) nil)
-    ((eq sym t) nil)
-    ((%cl-sym-p sym)
-     (let ((name (%cl-sym-name sym)))
-       (if (and *symbol-function-table*
-                (gethash name *symbol-function-table*))
-           t nil)))
-    ((stringp sym)
-     (if (and *symbol-function-table*
-              (gethash sym *symbol-function-table*))
-         t nil))
-    ;; Native MVM symbol (subtag #x50, 1 slot — hash only).
-    ((and (not (consp sym)) (not (fixnump sym))
-          (not (characterp sym)) (= (obj-subtag sym) 80))
-     (if (and *native-sym-function-table*
-              (gethash (aref sym 0) *native-sym-function-table*))
-         t nil))
-    (t nil)))
+  "Return T if SYM has a function binding.  Looks up via the unified
+   %sym-name-or-hash helper so all symbol flavors hit the right
+   storage tier — without this, set-symbol-function on a native MVM
+   symbol could install a fn that fboundp wouldn't see."
+  (let ((nh (%sym-name-or-hash sym)))
+    (when (null nh) (return-from fboundp nil))
+    (let ((name (car nh))
+          (hash (cdr nh)))
+      (cond
+        ((and (> (length name) 0)
+              *symbol-function-table*
+              (gethash name *symbol-function-table*)) t)
+        ((and *native-sym-function-table*
+              (gethash hash *native-sym-function-table*)) t)
+        (t nil)))))
 
 (defun fmakunbound (sym)
   "Remove the function binding of SYM.  Signals TYPE-ERROR if SYM is
-   not a symbol (CLHS — fmakunbound requires a function-name)."
-  (let ((name (cond
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                (t nil))))
-    (when (null name)
+   not a symbol (CLHS — fmakunbound requires a function-name).
+   Removes from both the name-keyed and hash-keyed tables — without
+   that, set-symbol-function on a native MVM symbol survives an
+   fmakunbound because the function lives in the hash-keyed table that
+   the name-only remhash couldn't reach."
+  (let ((nh (%sym-name-or-hash sym)))
+    (when (null nh)
       (error "fmakunbound: not a function name"))
-    (when *symbol-function-table*
-      (remhash name *symbol-function-table*)))
+    (let ((name (car nh))
+          (hash (cdr nh)))
+      (when (and (> (length name) 0) *symbol-function-table*)
+        (remhash name *symbol-function-table*))
+      (when *native-sym-function-table*
+        (remhash hash *native-sym-function-table*))))
   sym)
 
 (defun fdefinition (sym)
@@ -996,21 +1026,34 @@
               (options (cddr args))
               (combination nil))
          (dolist (opt options)
+           ;; Both keywords (:method-combination) and bare symbols
+           ;; (method-combination) match — Modus's symbol-name strips the
+           ;; leading colon, so the literal we compare against does too.
            (when (and (consp opt) (symbolp (car opt))
-                      (%eval-sym-eq (car opt) ":METHOD-COMBINATION"))
+                      (%eval-sym-eq (car opt) "METHOD-COMBINATION"))
              (setq combination (cadr opt))))
          ;; Pass lambda-list so %defmethod / find-method can validate
          ;; method-vs-GF arity congruence.
          (%defgeneric gf-name lambda-list combination)
          ;; Install runtime stub so (funcall sym ...) dispatches.
          (set-symbol-function gf-name (%make-gf-stub gf-name))
-         ;; Inline (:method ...) options — re-eval each as a defmethod form.
+         ;; Inline (:method ...) options — re-eval each as a defmethod
+         ;; form.  Same name-vs-keyword note as above.
          (dolist (opt options)
            (when (and (consp opt) (symbolp (car opt))
-                      (%eval-sym-eq (car opt) ":METHOD"))
+                      (%eval-sym-eq (car opt) "METHOD"))
              (%eval-in-env (cons 'defmethod (cons gf-name (cdr opt))) env)))
-         ;; Return the gf object.
-         (%find-gf gf-name)))
+         ;; Return the dispatch stub closure — typep'p as generic-function
+         ;; AND callable via funcall.  Returning the raw GF object (a
+         ;; 4-slot array) is what CLHS specifies in spirit, but the
+         ;; method-combination tests immediately funcall the result —
+         ;; on Modus that meant interpreting the array data as a
+         ;; function pointer and SIGSEGV-ing inside the heap (SEGV_ACCERR
+         ;; — calling data as code).  The stub closure is registered in
+         ;; *gf-stub-closures*, so (typep stub 'generic-function) → T
+         ;; and the funcall path resolves through the standard closure
+         ;; subtag #x52 dispatch.
+         (symbol-function gf-name)))
       ;; (defclass name supers slot-specs &rest options)
       ((%eval-sym-eq op "DEFCLASS")
        (let* ((class-name (car args))

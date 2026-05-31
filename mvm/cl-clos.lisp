@@ -1289,6 +1289,21 @@
 ;;; Standard method combination dispatch
 ;;; ============================================================
 
+(defun %qualifier-eq (q name)
+  "Compare a stored method qualifier Q against a literal symbol NAME by
+   symbol-name.  Modus has two symbol representations (compile-time
+   native MVM symbols and runtime CL-symbol wrappers).  A method
+   installed via (eval `(defmethod … :around …)) stores the qualifier
+   as a native symbol, while the dispatcher's literal `:around` here
+   resolves to a CL-symbol wrapper — eq returns NIL, so :around
+   methods used to be classified as primary and dropped by the
+   custom-combination filter.  Comparing names side-steps the
+   dual-symbol issue without paying lookup cost."
+  (and (symbolp q) (symbolp name)
+       (let ((nq (symbol-name q))
+             (nn (symbol-name name)))
+         (and nq nn (string= nq nn)))))
+
 (defun %gf-dispatch-standard (gf args applicable)
   "Standard method combination: :around > :before + primary + :after."
   (let ((around-methods nil)
@@ -1302,11 +1317,11 @@
         (let ((m (car cur)))
           (let ((q (%method-qualifier m)))
             (cond
-              ((eq q :around)
+              ((%qualifier-eq q :around)
                (setq around-methods (cons m around-methods)))
-              ((eq q :before)
+              ((%qualifier-eq q :before)
                (setq before-methods (cons m before-methods)))
-              ((eq q :after)
+              ((%qualifier-eq q :after)
                (setq after-methods (cons m after-methods)))
               ;; nil or primary
               (t
@@ -1409,9 +1424,18 @@
           (let ((m (car cur)))
             (let ((q (%method-qualifier m)))
               (cond
-                ((eq q :around)
+                ;; Compare qualifiers by symbol-name, not eq.  Modus has
+                ;; two symbol representations (compile-time native MVM
+                ;; symbols and runtime CL-symbol wrappers); a method
+                ;; installed via runtime (eval `(defgeneric (:method and …)))
+                ;; stores qualifier as the native MVM `and`, while the
+                ;; combination's `comb-name` was interned at boot through
+                ;; %init-method-combinations and is a CL-symbol — eq
+                ;; returns NIL even though both have name "AND".  See
+                ;; CLAUDE.md "Symbol identity" known limitation.
+                ((%qualifier-eq q :around)
                  (setq around-methods (cons m around-methods)))
-                ((eq q comb-name)
+                ((%qualifier-eq q comb-name)
                  (setq primary-methods (cons m primary-methods)))
                 ;; Primary methods with this combination also qualify
                 ((null q)

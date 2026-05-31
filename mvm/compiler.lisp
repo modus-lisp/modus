@@ -3176,13 +3176,33 @@
      (compile-character value dest))
     ((keywordp value)
      (compile-keyword value dest))
-    ;; Non-keyword symbol: intern at runtime to produce a real symbol object.
-    ;; Emits: LI V0, hash; CALL %INTERN-SYMBOL; MOV dest, VR
+    ;; Non-keyword symbol: intern at runtime to produce a real symbol
+    ;; object — tagged with its home package, the way the SBCL/CCL
+    ;; reader does it.  At SBCL build time we know both the symbol
+    ;; name (via normalize-name → name hash) AND its home package
+    ;; (via (package-name (symbol-package value))).  Pass both to
+    ;; %INTERN-SYMBOL-PKG so the runtime symbol carries its package
+    ;; from creation — no walk through *all-packages* later, no
+    ;; "lazy population" step.
+    ;;
+    ;; For uninterned symbols (e.g. an SBCL gensym from a rewriter)
+    ;; symbol-package returns NIL; we pass pkg-hash=0 which means
+    ;; "no home package" and the resulting Modus symbol has NIL in
+    ;; slot 1.
+    ;;
+    ;; Emits: LI V0, name-hash; LI V1, pkg-hash; CALL %INTERN-SYMBOL-PKG; MOV dest, VR
     ((symbolp value)
-     (emit-ir :li +vreg-v0+ (ash (normalize-name value) +fixnum-shift+))
-     (emit-ir :call "%INTERN-SYMBOL" 1)
-     (unless (= dest +vreg-vr+)
-       (emit-ir :mov dest +vreg-vr+)))
+     (let* ((pkg (symbol-package value))
+            (pkg-name (and pkg (package-name pkg)))
+            ;; pkg-hash = 0 means "no home package" (uninterned syms
+            ;; like SBCL gensyms produced by source rewriters).  The
+            ;; runtime treats 0 as "leave slot 1 NIL".
+            (pkg-hash (if pkg-name (compute-name-hash pkg-name) 0)))
+       (emit-ir :li +vreg-v0+ (ash (normalize-name value) +fixnum-shift+))
+       (emit-ir :li +vreg-v1+ (ash pkg-hash +fixnum-shift+))
+       (emit-ir :call "%INTERN-SYMBOL-PKG" 2)
+       (unless (= dest +vreg-vr+)
+         (emit-ir :mov dest +vreg-vr+))))
     ;; Cons cell: proper lists built iteratively, dotted pairs recursively
     ((consp value)
      ;; Safe proper-list check: walk list counting elements.

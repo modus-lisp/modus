@@ -87,7 +87,28 @@
 (defun %cl-sym-data (sym) sym)  ; legacy accessor — slots live directly on sym
 (defun %cl-sym-hash (sym) (aref sym 0))
 (defun %cl-sym-package (sym) (aref sym 1))
-(defun %cl-sym-name (sym) (aref sym 2))
+(defun %cl-sym-name (sym)
+  "Slot 2 holds the name string.  Compile-time `'foo' literals interned
+   via %INTERN-SYMBOL-PKG start with slot 2 empty (we don't pass the
+   string at intern time — only the hash, to keep the IR small) and
+   lazy-fill on first access by reverse-looking up the hash in the
+   build-time *SYM-NAME-TABLE*.  Caches the result by writing back to
+   slot 2 so subsequent calls are O(1).
+
+   Returns the cached value when slot 2 is already populated; \"\" when
+   no reverse-lookup table exists or the hash isn't in it (i.e. for
+   genuinely uninterned syms like un-stringified gensyms)."
+  (let ((cached (aref sym 2)))
+    (cond
+      ((and cached (stringp cached) (> (length cached) 0)) cached)
+      (t
+       (let ((tab (and (boundp '*sym-name-table*) *sym-name-table*)))
+         (let ((found (and tab (gethash (aref sym 0) tab))))
+           (cond
+             ((and found (stringp found))
+              (aset sym 2 found)
+              found)
+             (t ""))))))))
 
 (defun %cl-sym-set-package (sym pkg) (aset sym 1 pkg))
 

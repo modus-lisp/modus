@@ -1466,11 +1466,42 @@
 
 ;;; --- Initialize standard packages ---
 
+(defun %register-pkg-by-hash (pkg)
+  "Add PKG to the pkg-by-hash table at memory slot #x10000170 under
+   the hash of its primary name and every nickname.  Lets
+   %INTERN-SYMBOL-PKG resolve a package designator (a name-hash from
+   compile-quote) to the actual package object without walking
+   *all-packages*.  Idempotent — re-registering a package overwrites
+   previous entries.
+
+   The table lives at a fixed memory slot rather than a Lisp special
+   variable so %INTERN-SYMBOL-PKG can read it without triggering
+   recursive intern on the variable's name; see the comment in
+   prelude.lisp on %INIT-PKG-BY-HASH."
+  (when (and pkg (%pkg-p pkg))
+    (let ((tab (mem-ref #x10000170 :u64)))
+      (when (null tab)
+        (setq tab (make-hash-table))
+        (setf (mem-ref #x10000170 :u64) tab))
+      (let ((name (%pkg-name pkg)))
+        (when (and name (stringp name) (> (length name) 0))
+          (puthash (compute-name-hash name) tab pkg)))
+      (dolist (nick (%pkg-nicknames pkg))
+        (when (and nick (stringp nick) (> (length nick) 0))
+          (puthash (compute-name-hash nick) tab pkg))))))
+
 (defun %init-packages ()
   "Create standard CL packages."
   (setq *pkg-tag* 987654321)
   (setq *sym-tag* 123456789)
   (setq *all-packages* nil)
+  ;; The pkg-by-hash table at memory slot #x10000170 starts empty
+  ;; here; each make-package below adds its entry via
+  ;; %register-pkg-by-hash so compile-quote's per-symbol
+  ;; (intern-symbol-pkg HASH PKG-HASH) calls can resolve the package
+  ;; without walking *all-packages*.  Stored at a fixed mem slot
+  ;; (not a special var) to avoid recursive intern.
+  (%init-pkg-by-hash)
   ;; "LISP" is added alongside "CL" as a nickname.  The gcl ansi-test
   ;; suite (and many older CL programs) reference the standard package
   ;; via `'lisp`, e.g. cl-symbols-aux.lsp's
@@ -1481,8 +1512,11 @@
   ;; iterates nothing — every cl-symbols.lsp test fails GOT:T EXP:NIL.
   ;; "LISP" is an accepted historical nickname per CLHS.
   (make-package "COMMON-LISP" :nicknames (list "CL" "LISP") :use nil)
+  (%register-pkg-by-hash (find-package "COMMON-LISP"))
   (make-package "COMMON-LISP-USER" :nicknames (list "CL-USER") :use (list "CL"))
+  (%register-pkg-by-hash (find-package "COMMON-LISP-USER"))
   (make-package "KEYWORD" :use nil)
+  (%register-pkg-by-hash (find-package "KEYWORD"))
   (setq *package* (find-package "CL-USER"))
   ;; Set up test packages from packages00-aux.lsp
   (%defpackage-impl "FS-A" (list (list :use) (list :nicknames "FS-Q") (list :export "FOO")))
@@ -1494,6 +1528,11 @@
   (set-up-packages)
   ;; Create CL-TEST package for reader tests
   (make-package "CL-TEST" :use (list "CL"))
+  ;; Register every package now in *all-packages* so the pkg-by-hash
+  ;; table covers FS-A/B, DS1..4, CL-TEST, and any nicknames.  Walking
+  ;; *all-packages* once is cheaper than threading a register call
+  ;; through %defpackage-impl / set-up-packages.
+  (dolist (p *all-packages*) (%register-pkg-by-hash p))
   ;; Register every standard CL symbol as external in the COMMON-LISP
   ;; package. ANSI cl-symbols.lsp (978 tests) asserts each standard
   ;; name is :external; without this they all report :internal / nil.

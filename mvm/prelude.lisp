@@ -1431,40 +1431,86 @@
   (setf (mem-ref #x10000148 :u64) (make-hash-table)))
 
 (defun %intern-symbol (name-hash)
-  "Intern a symbol by name hash. Returns existing symbol if already interned.
-   Uses %make-symbol compiler builtin (ALLOC-OBJ subtag #x50) to allocate.
+  "Legacy 1-arg intern.  Delegates to %INTERN-SYMBOL-PKG with pkg-hash=0
+   (i.e. no known home package).  Kept for back-compat with anything
+   that interns a symbol without knowing its package — gensyms,
+   constructed names, the old read path before the reader started
+   passing *package*.  All `'foo' literals in source compile through
+   %INTERN-SYMBOL-PKG instead and arrive package-tagged."
+  (%intern-symbol-pkg name-hash 0))
 
-   GC-safety: %make-symbol can trigger GC, which moves the hash table
-   to to-space and updates the root slot at #x10000088.  We re-read
-   the root AFTER the allocation so the puthash writes into the live
-   to-space copy rather than the about-to-be-reclaimed from-space
-   copy.  Without this, future `'foo` references re-allocate a fresh
-   symbol, (eq 'foo 'foo) returns NIL, and CLOS marker checks
-   ((eq (aref instance 0) '%clos-instance)) misclassify."
-  ;; Slot 0x10000C80 tracks recursion depth (incr on entry, decr on exit).
-  ;; Previously capped at 100 to catch a runaway recursion through
-  ;; %signal-type-error (485b85f) and set-symbol-value (7df547f); both
-  ;; cycles are now broken structurally.  The remaining "deep stacks"
-  ;; that hit 100 are legitimate %condition-all-parents walks through
-  ;; deep class hierarchies (CONDITION-9/CONDITION-14 etc.), not real
-  ;; recursion bugs — the cap was a false-positive halt that wedged
-  ;; the suite at T:26316.  Cap removed; depth tracking stays so the
-  ;; per-test reset still bounds any future leak.
+(defun %intern-symbol-pkg (name-hash pkg-hash)
+  "Intern a symbol by NAME-HASH and stamp it with the package
+   identified by PKG-HASH.  Returns the canonical symbol object for
+   this NAME-HASH; multiple calls with the same name-hash return
+   `eq' results, matching SBCL/CCL semantics where every `'foo'
+   reference resolves to the same symbol.
+
+   The symbol is always 3-slot [hash, package, name].  Slot 1 holds
+   the home package (looked up in the pkg-by-hash table at memory
+   slot #x10000170 at boot time); PKG-HASH = 0 means `no home
+   package yet' (gensyms, partially-constructed symbols).  Slot 2
+   starts empty; SYMBOL-NAME reverse-looks it up via
+   *SYM-NAME-TABLE* and caches.
+
+   Compile-quote in mvm/compiler.lisp emits this call with the
+   compile-time package hash, so `(symbol-package 'car)' returns
+   COMMON-LISP without a package-walk — matching SBCL/CCL, where the
+   reader gives every symbol its home package at intern time.
+
+   Storage note: the pkg-by-hash table lives at a FIXED memory slot
+   (#x10000170), not as a Lisp special variable, so this function
+   doesn't reference `*pkg-by-hash*' as a quoted symbol — that would
+   recursively re-enter %INTERN-SYMBOL-PKG to intern the variable's
+   name, blowing the stack at boot.
+
+   GC-safety: %ALLOC-SYM3 can trigger GC, which moves the hash table
+   to to-space and updates the root slot at #x10000088.  Re-read the
+   root AFTER the allocation."
   (setf (mem-ref #x10000C80 :u64) (+ (mem-ref #x10000C80 :u64) 1))
   (let ((table (mem-ref #x10000088 :u64)))
     (let ((existing (gethash name-hash table)))
-      (if existing
-          (progn
-            (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
-            existing)
-          (let ((sym (%make-symbol)))
-            (aset sym 0 name-hash)
-            ;; Re-read the root — GC during %make-symbol may have moved
-            ;; the table object and updated the root slot.
-            (let ((live-table (mem-ref #x10000088 :u64)))
-              (puthash name-hash live-table sym))
-            (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
-            sym)))))
+      (cond
+        (existing
+         ;; Re-stamp the package if a known one is passed and the
+         ;; symbol's slot is still empty.  Lets the same symbol be
+         ;; created package-less first (via legacy %intern-symbol) and
+         ;; have its package filled in by a subsequent package-aware
+         ;; reference.  Only stamps if pkg-hash is non-zero AND the
+         ;; sym is the 3-slot shape AND slot 1 is currently NIL.
+         (when (and (> pkg-hash 0)
+                    (>= (array-length existing) 3)
+                    (null (aref existing 1)))
+           (let ((pkg-tab (mem-ref #x10000170 :u64)))
+             (when pkg-tab
+               (let ((pkg (gethash pkg-hash pkg-tab)))
+                 (when pkg (aset existing 1 pkg))))))
+         (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
+         existing)
+        (t
+         (let ((sym (%alloc-sym3)))
+           (aset sym 0 name-hash)
+           ;; Look up the home package.  pkg-hash=0 means none.
+           (let ((pkg nil))
+             (when (> pkg-hash 0)
+               (let ((pkg-tab (mem-ref #x10000170 :u64)))
+                 (when pkg-tab (setq pkg (gethash pkg-hash pkg-tab)))))
+             (aset sym 1 pkg))
+           (aset sym 2 "")    ; name — SYMBOL-NAME reverse-fills via *SYM-NAME-TABLE*
+           ;; Re-read the root — %ALLOC-SYM3 may have triggered GC.
+           (let ((live-table (mem-ref #x10000088 :u64)))
+             (puthash name-hash live-table sym))
+           (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
+           sym))))))
+
+;;; Pkg-by-hash root.  We DON'T use a Lisp special variable because
+;;; referencing `*pkg-by-hash*' from %INTERN-SYMBOL-PKG would recurse
+;;; to intern that variable's name and blow the stack at boot.  The
+;;; slot at #x10000170 holds a hash-table object; readers go through
+;;; (mem-ref #x10000170 :u64) and trust the GC to walk the slot as a
+;;; root (same convention as the symbol intern table at #x10000088).
+(defun %init-pkg-by-hash ()
+  (setf (mem-ref #x10000170 :u64) (make-hash-table)))
 
 (defun %intern-keyword (name-hash)
   "Intern a keyword by name hash.  Same shape as %INTERN-SYMBOL but uses

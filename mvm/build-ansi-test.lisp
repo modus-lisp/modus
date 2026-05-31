@@ -2754,15 +2754,23 @@
                   ;; defclass updates the registry) so a fork's run-ansi-X
                   ;; still populates the registry even if the parent's
                   ;; run-init-* pass somehow missed it.  Then calls each
-                  ;; chunk in order, each in its own handler-case so a
-                  ;; chunk crash doesn't kill later chunks.
-                  (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-                  (dolist (s init-list)
-                    (format out "  (handler-case ~A (t (c) nil))~%" s))
-                  (dolist (c (nreverse chunk-defs))
-                    (format out "  (handler-case (run-ansi-~A-chunk-~D) (t (c) nil))~%"
-                            (pathname-name file) c))
-                  (format out ")~%")))
+                  ;; chunk in order, gated on %chunk-crashed-p so we don't
+                  ;; re-enter a chunk that crashed its prologue in a previous
+                  ;; fork attempt.  The handler-case around the call records
+                  ;; a fresh crash (writes to the MAP_SHARED page and prints
+                  ;; CHUNK-CRASH for visibility) so the next fork attempt's
+                  ;; %chunk-crashed-p sees it.
+                  (let* ((file-name (pathname-name file))
+                         (file-hash (logand (modus.mvm::compute-name-hash
+                                              (string-upcase file-name))
+                                            #xFFFFFF)))
+                    (format out "(defun run-ansi-~A ()~%" file-name)
+                    (dolist (s init-list)
+                      (format out "  (handler-case ~A (t (c) nil))~%" s))
+                    (dolist (c (nreverse chunk-defs))
+                      (format out "  (%try-chunk ~S ~D ~D #'run-ansi-~A-chunk-~D)~%"
+                              file-name file-hash c file-name c))
+                    (format out ")~%"))))
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
                                  (get-output-stream-string out)))
@@ -3136,6 +3144,67 @@
                      ~%  (if (> *fork-shm-addr* 0)~
                      ~%      (mem-ref *fork-shm-addr* :u32)~
                      ~%      0))~
+                     ~%;; Chunk-crash bitmap.  Layout inside the 4K MAP_SHARED page:~
+                     ~%;;   offset 0  : u32 last-id (above)~
+                     ~%;;   offset 4  : u32 crashed-chunk count N~
+                     ~%;;   offset 8  : N x u32 entries.  Each entry packs~
+                     ~%;;               ((name-hash24) << 8) | chunk-num.~
+                     ~%;; Max 1020 entries.  Scan-on-lookup; appended on record.~
+                     ~%;; Lets dispatcher see (and skip) chunks that crashed the~
+                     ~%;; prologue in a previous fork attempt — without this, each~
+                     ~%;; uncatchable chunk-prologue crash wastes the full 4-retry~
+                     ~%;; no-progress budget before fork-file gives up on the file.~
+                     ~%;; defconstant init-form isn't necessarily run at boot;~
+                     ~%;; inline 4/8/1020 below to dodge any uninitialised-special~
+                     ~%;; surprise (defvar pitfall, item 7 in CLAUDE.md).~
+                     ~%(defun %chunk-key (file-hash chunk-num)~
+                     ~%  (logior (ash (logand file-hash 16777215) 8)~
+                     ~%          (logand chunk-num 255)))~
+                     ~%(defun %chunk-crashed-p (file-hash chunk-num)~
+                     ~%  (if (> *fork-shm-addr* 0)~
+                     ~%      (let* ((base *fork-shm-addr*)~
+                     ~%             (key  (%chunk-key file-hash chunk-num))~
+                     ~%             (n    (mem-ref (+ base 4) :u32))~
+                     ~%             (hit  nil))~
+                     ~%        (dotimes (j n)~
+                     ~%          (when (= (mem-ref (+ base 8 (* j 4)) :u32) key)~
+                     ~%            (setq hit t)))~
+                     ~%        hit)~
+                     ~%      nil))~
+                     ~%(defun %record-chunk-crash (file-name file-hash chunk-num)~
+                     ~%  (when (> *fork-shm-addr* 0)~
+                     ~%    (let* ((base *fork-shm-addr*)~
+                     ~%           (n    (mem-ref (+ base 4) :u32)))~
+                     ~%      (when (and (< n 1020)~
+                     ~%                 (not (%chunk-crashed-p file-hash chunk-num)))~
+                     ~%        (setf (mem-ref (+ base 8 (* n 4)) :u32)~
+                     ~%              (%chunk-key file-hash chunk-num))~
+                     ~%        (setf (mem-ref (+ base 4) :u32) (+ n 1)))))~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-string-serial \"CHUNK-CRASH FILE=\")~
+                     ~%  (write-string-serial file-name)~
+                     ~%  (write-string-serial \" CHUNK=\")~
+                     ~%  (print-dec chunk-num)~
+                     ~%  (write-char-serial 10))~
+                     ~%(defun %report-chunk-skip (file-name chunk-num)~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-string-serial \"CHUNK-SKIP FILE=\")~
+                     ~%  (write-string-serial file-name)~
+                     ~%  (write-string-serial \" CHUNK=\")~
+                     ~%  (print-dec chunk-num)~
+                     ~%  (write-char-serial 10))~
+                     ~%;; Per-chunk shared helper.  Dispatcher run-ansi-FILE emits one~
+                     ~%;; (%try-chunk \"FILE\" HASH N #'run-ansi-FILE-chunk-N) per chunk,~
+                     ~%;; keeping its native-code size proportional to the chunk count~
+                     ~%;; rather than the size of an inlined cond/handler-case block.~
+                     ~%;; (See CLAUDE.md known bug #5 — run-ansi-FILE growing past a~
+                     ~%;; threshold breaks other tests in the same defun.)~
+                     ~%(defun %try-chunk (file-name file-hash chunk-num thunk)~
+                     ~%  (cond~
+                     ~%    ((%chunk-crashed-p file-hash chunk-num)~
+                     ~%     (%report-chunk-skip file-name chunk-num))~
+                     ~%    (t (handler-case (funcall thunk)~
+                     ~%         (t (c) (%record-chunk-crash file-name file-hash chunk-num))))))~
                      ~%(defun %clear-fault-slots ()~
                      ~%  ;; Zero the SIGSEGV-handler diag slots so a FAIL caught~
                      ~%  ;; from a NON-SIGSEGV path (handler-case t-clause) doesn't~
@@ -3182,7 +3251,19 @@
                      ~%        (%record-test-fail i)~
                      ~%        (setq i (+ i 1))))))~
                      ~%(defvar *no-fork-debug* 0)~
-                     ~%(defun fork-file (first-id last-id thunk)~
+                     ~%(defun %report-file-wedge (file-name first-id last-id reason)~
+                     ~%  ;; Parent-side visibility: log when fork-file gives up on a~
+                     ~%  ;; file (no-progress cap, retry cap, or zero-test child exit).~
+                     ~%  ;; These are the wedges %try-chunk's child-side handler-case~
+                     ~%  ;; couldn't recover from — the actual \"still happening\" set.~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-string-serial \"FILE-WEDGE FILE=\")~
+                     ~%  (write-string-serial file-name)~
+                     ~%  (write-string-serial \" FIRST=\") (print-dec first-id)~
+                     ~%  (write-string-serial \" LAST=\")  (print-dec last-id)~
+                     ~%  (write-string-serial \" REASON=\") (write-string-serial reason)~
+                     ~%  (write-char-serial 10))~
+                     ~%(defun fork-file (file-name first-id last-id thunk)~
                      ~%  ;; DEBUG: when *no-fork-debug* is non-zero, run the thunk~
                      ~%  ;; directly in-process (no fork) so a hard crash propagates~
                      ~%  ;; to an attached debugger instead of being recovered by the~
@@ -3203,10 +3284,12 @@
                      ~%    (loop~
                      ~%      (when done (return nil))~
                      ~%      (when (>= tries *fork-retry-cap*)~
+                     ~%        (%report-file-wedge file-name first-id last-id \"retry-cap\")~
                      ~%        (%stamp-remaining-fails first-id last-id)~
                      ~%        (return nil))~
                      ~%      (when (>= no-progress *no-progress-cap*)~
                      ~%        ;; Init-crash or hang — don't burn alarm budget further.~
+                     ~%        (%report-file-wedge file-name first-id last-id \"no-progress\")~
                      ~%        (%stamp-remaining-fails first-id last-id)~
                      ~%        (return nil))~
                      ~%      (setq tries (+ tries 1))~
@@ -3252,6 +3335,7 @@
                      ~%                  ;; a no-op — bad compilation of TYPECASE/PPRINT/etc).~
                      ~%                  ;; Stamp all remaining so the chunk isn't silently lost.~
                      ~%                  ((and (= wstat 0) (= child-last 0) (> last-id 0))~
+                     ~%                   (%report-file-wedge file-name first-id last-id \"zero-tests\")~
                      ~%                   (%stamp-remaining-fails first-id last-id)~
                      ~%                   (setq done t))~
                      ~%                  ;; Child exited cleanly with progress — normal end.~
@@ -3293,9 +3377,11 @@
                            (cond
                              ((and first-id last-id)
                               (format s "  (when (%ansi-file-in-range ~D ~D)~%" first-id last-id)
-                              (format s "    (fork-file ~D ~D (lambda () (run-ansi-~A))))~%" first-id last-id name))
+                              (format s "    (fork-file ~S ~D ~D (lambda () (run-ansi-~A))))~%"
+                                      name first-id last-id name))
                              (t
-                              (format s "  (fork-file 0 0 (lambda () (run-ansi-~A)))~%" name))))))
+                              (format s "  (fork-file ~S 0 0 (lambda () (run-ansi-~A)))~%"
+                                      name name))))))
                      (format s ")~%"))))
 
 ;; Dump file → id-range map to /tmp so post-mortem analysis of a test

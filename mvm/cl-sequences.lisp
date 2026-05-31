@@ -1471,19 +1471,64 @@
       ((null seq) seq)
       ((= eff-count 0) seq)
       ((consp seq)
-       (let ((cur seq) (idx 0) (n eff-count))
-         (loop
-           (when (null cur) (return seq))
-           (when (= n 0) (return seq))
-           (let* ((item (car cur))
-                  (in-window (and (>= idx start-idx)
-                                  (or (null end-idx) (< idx end-idx))))
-                  (v (if (and in-window key-fn) (funcall key-fn item) item)))
-             (when (and in-window (not (funcall pred v)))
-               (set-car cur new)
-               (when (> n 0) (setq n (- n 1)))))
-           (setq cur (cdr cur))
-           (setq idx (+ idx 1)))))
+       (if from-end
+           ;; Backward path — copy to array for random access, scan from
+           ;; end down to start-idx, collect first COUNT match positions
+           ;; (those are the highest-indexed ones), then walk the list
+           ;; once forward and replace at those positions.  Mirrors
+           ;; %nsubst-list-core's backward branch with the predicate
+           ;; negated for the -IF-NOT variant.  Fixes
+           ;; nsubstitute-if-not-list.12/.18 and .order.1/.2 which
+           ;; exercised :count + :from-end together.
+           (let* ((len (length seq))
+                  (arr (make-array len)))
+             (let ((cur seq) (j 0))
+               (loop (when (null cur) (return nil))
+                 (aset arr j (car cur))
+                 (setq cur (cdr cur)) (setq j (+ j 1))))
+             (let ((positions nil)
+                   (k (- (if (and end-idx (< end-idx len)) end-idx len) 1))
+                   (lo start-idx))
+               (loop (when (< k lo) (return nil))
+                 (let* ((item (aref arr k))
+                        (v (if key-fn (funcall key-fn item) item)))
+                   (when (not (funcall pred v))
+                     (setq positions (cons k positions))))
+                 (setq k (- k 1)))
+               ;; positions: lowest-idx-first.  Want highest-idx-first
+               ;; so "take first COUNT" keeps the highest-indexed matches.
+               (setq positions (nreverse positions))
+               (let ((to-replace nil)
+                     (remaining (if (< eff-count 0) (length positions) eff-count))
+                     (pos-cur positions))
+                 (loop
+                   (when (null pos-cur) (return nil))
+                   (when (<= remaining 0) (return nil))
+                   (setq to-replace (cons (car pos-cur) to-replace))
+                   (setq remaining (- remaining 1))
+                   (setq pos-cur (cdr pos-cur)))
+                 (let ((cur2 seq) (idx2 0))
+                   (loop
+                     (when (null cur2) (return seq))
+                     (when (member idx2 to-replace)
+                       (set-car cur2 new))
+                     (setq idx2 (+ idx2 1))
+                     (setq cur2 (cdr cur2)))
+                   seq))))
+           ;; Forward path — original inlined loop.
+           (let ((cur seq) (idx 0) (n eff-count))
+             (loop
+               (when (null cur) (return seq))
+               (when (= n 0) (return seq))
+               (let* ((item (car cur))
+                      (in-window (and (>= idx start-idx)
+                                      (or (null end-idx) (< idx end-idx))))
+                      (v (if (and in-window key-fn) (funcall key-fn item) item)))
+                 (when (and in-window (not (funcall pred v)))
+                   (set-car cur new)
+                   (when (> n 0) (setq n (- n 1)))))
+               (setq cur (cdr cur))
+               (setq idx (+ idx 1))))))
       (t
        ;; Vector path inlined — mirror nsubstitute-if with negated pred.
        ;; Avoids (apply #'nsubstitute-if ...) trampoline.

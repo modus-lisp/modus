@@ -1409,15 +1409,6 @@
           (let ((m (car cur)))
             (let ((q (%method-qualifier m)))
               (cond
-                ;; Compare qualifiers by symbol-name, not eq.  Modus has
-                ;; two symbol representations (compile-time native MVM
-                ;; symbols and runtime CL-symbol wrappers); a method
-                ;; installed via runtime (eval `(defgeneric (:method and …)))
-                ;; stores qualifier as the native MVM `and`, while the
-                ;; combination's `comb-name` was interned at boot through
-                ;; %init-method-combinations and is a CL-symbol — eq
-                ;; returns NIL even though both have name "AND".  See
-                ;; CLAUDE.md "Symbol identity" known limitation.
                 ((eq q :around)
                  (setq around-methods (cons m around-methods)))
                 ((eq q comb-name)
@@ -1431,9 +1422,20 @@
       (setq primary-methods (nreverse primary-methods))
       (when (null primary-methods)
         (error "no applicable method for combination"))
-      ;; Compute the combined result
+      ;; Compute the combined result.
+      ;; &rest in the lambda list because call-next-method in an :around
+      ;; method does `(apply (%method-fn sentinel) actual-args)` —
+      ;; passing the GF's runtime args — and the standard run-primary
+      ;; (line ~1326) takes &rest for the same reason.  Without &rest
+      ;; here, calling combined-thunk with the GF args triggered an
+      ;; arity mismatch that surfaced as SIGSEGV inside the heap on
+      ;; defgeneric-method-combination.and.{4,5,6,7,8} — the
+      ;; user-pointed-out crashes.  The body ignores the runtime args
+      ;; and uses the captured `args` list (closed over the outer let),
+      ;; matching standard-method semantics for AROUND→primary chains.
       (let ((combined-thunk
-             (lambda ()
+             (lambda (&rest %ignored-actual-args)
+               (declare (ignore %ignored-actual-args))
                ;; If identity-with-one and only one method, call it directly
                (if (and identity-with-one (null (cdr primary-methods)))
                  (apply (%method-fn (car primary-methods)) args)

@@ -1363,21 +1363,46 @@
         (kwargs (cddr args)))
     ;; Parse keyword args
     (let ((start 0) (end nil) (preserve-whitespace nil)
-          (allow-other-keys nil))
-      ;; Process keyword arguments
+          (allow-other-keys nil)
+          (bad-key nil))
+      ;; First pass: determine the effective allow-other-keys.  CLHS
+      ;; 3.4.1.4.1.1: "value of :ALLOW-OTHER-KEYS is determined by the
+      ;; LEFTMOST occurrence … in the property list".  We bind aok-seen
+      ;; on first sight so a later :allow-other-keys t can't override
+      ;; an earlier :allow-other-keys nil.
+      (let ((kw-cur kwargs)
+            (aok-seen nil))
+        (loop
+          (when (null kw-cur) (return nil))
+          (when (and (not aok-seen) (eq (car kw-cur) :allow-other-keys))
+            (setq aok-seen t)
+            (when (cadr kw-cur) (setq allow-other-keys t)))
+          (setq kw-cur (cddr kw-cur))))
+      ;; Second pass: assign known kwargs and remember the first bad
+      ;; key (signalled at the end if allow-other-keys is still nil).
       (let ((kw-cur kwargs))
         (loop
           (when (null kw-cur) (return nil))
+          ;; Odd-length kwarg list — value missing.  CLHS 3.4.1.4.1:
+          ;; "if the number of keyword arguments and values is not
+          ;; equal" → program-error.  Detect (null (cdr kw-cur)) before
+          ;; (cadr) faults so we signal cleanly.
+          (when (null (cdr kw-cur))
+            (%signal-program-error)
+            (return nil))
           (let ((key (car kw-cur))
                 (val (cadr kw-cur)))
             (cond
-              ((eq key :start) (when (null start) nil) (setq start val))
-              ((eq key :end) (when (null end) nil) (setq end val))
-              ((eq key :preserve-whitespace)
-               (when (not preserve-whitespace) (setq preserve-whitespace val)))
-              ((eq key :allow-other-keys) (setq allow-other-keys val))
-              (t nil)))
+              ((eq key :start) (setq start val))
+              ((eq key :end) (setq end val))
+              ((eq key :preserve-whitespace) (setq preserve-whitespace val))
+              ((eq key :allow-other-keys) nil)
+              (t (when (null bad-key) (setq bad-key key)))))
           (setq kw-cur (cddr kw-cur))))
+      ;; If a bad keyword appeared and :allow-other-keys was not
+      ;; supplied (or was supplied as nil), signal program-error.
+      (when (and bad-key (not allow-other-keys))
+        (%signal-program-error))
       ;; Handle start/end
       (let ((actual-str (if (or (> start 0) end)
                             (%substring str start (if end end (length str)))

@@ -373,32 +373,38 @@ etc.) and `:obj-set` into the freshly allocated array. See `mvm/compiler.lisp`
 
 ### Function size in run-cl-loop-tests changes which sub-tests crash
 
-Adding too many `deftest` forms to `run-cl-loop-tests` makes some passing
-tests start crashing — even ones that have nothing to do with the new tests
-and were passing in a smaller version of the function. Some compile-state
-(register pressure? code buffer size? branch displacement limits?) silently
-flips at a threshold. Workaround: split big test runners into multiple defuns
-called sequentially.
+**Status 2026-05-31: NOT REPRODUCIBLE on x64 Linux.**  Verified via the
+`*fuzz-funcall-nops*` knob: building with `MODUS_FUZZ_FUNCALL_NOPS=64`
+(adds 64 NOPs at every compile-funcall, +200KB binary, ~50K perturbation
+sites) and running tests 14000..21999 against an unfuzzed baseline:
+873 fails vs 873 fails, **zero diff**.  Same result at fuzz=32 over the
+CLOS range 11000..12500: 213 vs 213, zero diff.  The cascade mechanism
+that defied diagnosis in 2026-05-03 is closed by the stack of fixes that
+landed after it:
 
-**Major source root-caused 2026-05-03**: `strip-declares` did not strip
-docstrings, so every `(defun name (...) "doc" body)` emitted ~14 bytes of
-x86 per character of docstring as an allocate-and-discard string in the
-function prologue (movabs + obj-set per char, plus alloc-obj for the
-header).  STRING-EQUAL with a 280-char docstring grew the function from
-1.8KB to 7KB of native code, and the 5KB downstream shift caused other
-crashes.  At the time, this was attributed to "nibble-1/9
-funcall-tag-collision edges" but that diagnosis was WRONG — fn pointers
-are now OR-3 tagged (low nibble = 3) and can't collide with cons (1) or
-object (9) tags.  The actual cascade mechanism for that incident is
-unclear; the docstring-stripping fix in `strip-declares` still saved
-1.3MB and +67 ANSI tests independent of the diagnosis.
+  - `OR-3` fn-pointer tagging (low nibble disjoint from cons/obj/char)
+  - `strip-declares` docstring strip (1.3MB removed, +67 ANSI)
+  - SIGSEGV signal handler that longjmps to nearest handler-case
+  - NIL=#xDEAD0001 with consp/atom pre-check (no fixnum-0 collision)
 
-Remaining layout fragility comes from genuine string/cons literal
-allocation in user code (each char is ~14 bytes of code, each cons
-element is several) plus the funcall-tag NOP alignment.  Adding 5KB
-of any code can still tip; future investigations should look for other
-silently-emitted bloat (notably `compile-quote` over large literals
-and `compile-keyword` patterns).
+If you re-encounter "adding a defun broke an unrelated test", repeat the
+fuzz experiment FIRST — set `MODUS_FUZZ_FUNCALL_NOPS=4` (or higher),
+rebuild, and run the same tests.  If results are bit-identical, layout
+shift is not the cause; look for a real semantic regression in the new
+code (compile-call WARN line, missing rewrite, name collision).
+
+The remaining x64 ANSI fails are TRUE implementation gaps (floats,
+ratios, complex, adjustable arrays, runtime EVAL of defmacro/setf, large
+arity apply, do-special-strings) — not layout artifacts.
+
+(Historical note from 2026-05-03 root-causing: `strip-declares` did not
+strip docstrings, so every `(defun name (…) "doc" body)` emitted ~14
+bytes of x86 per character of docstring as an allocate-and-discard
+string in the function prologue.  STRING-EQUAL with a 280-char docstring
+grew the function from 1.8KB to 7KB and the 5KB downstream shift caused
+other crashes.  The cascade mechanism was attributed to "nibble-1/9
+funcall-tag-collision" — wrong diagnosis but the fix saved 1.3MB and
++67 ANSI tests anyway.)
 
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 

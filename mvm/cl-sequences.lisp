@@ -2549,8 +2549,20 @@
   (funcall fn (make-array 5)))
 
 ;;; More CL functions
-(defun evenp (n) (zerop (logand n 1)))
-(defun oddp (n) (not (zerop (logand n 1))))
+(defun evenp (n)
+  "Even predicate.  Bignum-safe: the raw :and IR can't compare a heap
+   pointer's LSB to 1 (it ANDs the pointer's tag nibble), so a bignum
+   N routes through its low-limb instead.  Sign-magnitude bignums match
+   two's complement bit-for-bit on the LSB (low-limb LSB IS the parity
+   bit) so this works for negative bignums too."
+  (cond
+    ((bignump n) (zerop (logand (%bignum-low-limb n) 1)))
+    (t (zerop (logand n 1)))))
+
+(defun oddp (n)
+  (cond
+    ((bignump n) (not (zerop (logand (%bignum-low-limb n) 1))))
+    (t (not (zerop (logand n 1))))))
 (defun boundp (sym)
   "Per CLHS, BOUNDP returns T iff SYM has a value cell binding.
    Modus stores special-var values at fixed slot 0x10000080 (global

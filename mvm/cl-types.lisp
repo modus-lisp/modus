@@ -1665,6 +1665,46 @@
       (%make-rat (%fixnum-+ (aref x 0) (aref x 1)) (aref x 1))
       (%fixnum-+ x 1)))
 
+;;; --- Bignum-aware bit ops ---
+;;;
+;;; Modus's raw :and / :or / :xor IR mvm-bitwise-ANDs the tagged 64-bit
+;;; words.  That's correct for two tagged fixnums but garbage when
+;;; either operand is a heap-allocated bignum (the pointer's low 4
+;;; bits = object tag #x9; AND-ing them with a fixnum mask gives
+;;; pointer arithmetic).  generic-logand / -logior / -logxor route
+;;; bignum operands through a low-limb AND so `(logand bignum 1)` —
+;;; the body of evenp/oddp — returns the right parity once a future
+;;; emit-arith-pair revision wires the tag check into compile-logand.
+;;;
+;;; For now they are runtime-callable but not yet on any fast path; the
+;;; ANSI suite reaches them only via `apply #'logand`.  See
+;;; [[reference_overflow_promotion_ir]] for the larger plan.
+
+(defun generic-logand (a b)
+  (cond
+    ((and (integerp a) (integerp b)) (logand a b))
+    ((and (integerp a) (bignump b)) (bignum-logand-fixnum b a))
+    ((and (bignump a) (integerp b)) (bignum-logand-fixnum a b))
+    ((and (bignump a) (bignump b))  (bignum-logand-bignum a b))
+    (t (error "logand: bad type"))))
+
+(defun generic-logior (a b)
+  (cond
+    ((and (integerp a) (integerp b)) (logior a b))
+    ;; bignum ∨ small-fixnum-mask: the bignum's bits beyond f's width
+    ;; are untouched; bits inside f's width OR together.  When f fits
+    ;; in a single 62-bit limb we just OR f into the bignum's low limb.
+    ((and (integerp a) (bignump b)) (bignum-logior-fixnum b a))
+    ((and (bignump a) (integerp b)) (bignum-logior-fixnum a b))
+    (t (error "logior: NYI for bignum∨bignum"))))
+
+(defun generic-logxor (a b)
+  (cond
+    ((and (integerp a) (integerp b)) (logxor a b))
+    ((and (integerp a) (bignump b)) (bignum-logxor-fixnum b a))
+    ((and (bignump a) (integerp b)) (bignum-logxor-fixnum a b))
+    (t (error "logxor: NYI for bignum⊕bignum"))))
+
 ;;; ============================================================
 ;;; Float inspection helpers
 ;;; ============================================================

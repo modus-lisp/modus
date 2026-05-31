@@ -14,6 +14,10 @@
 (defvar *read-eval* nil)
 (defvar *read-default-float-format* nil)
 
+;; *features* — consulted by #+ / #- via %feature-present-p.  Initialised
+;; in %init-reader (defvar init-thunks don't run; see CLAUDE.md).
+(defvar *features* nil)
+
 ;;; --- Print variables (stubs for with-standard-io-syntax) ---
 
 (defvar *print-array* nil)
@@ -171,7 +175,10 @@
   (setq *print-pretty* nil)
   (setq *print-radix* nil)
   (setq *print-readably* nil)
-  (setq *print-right-margin* nil))
+  (setq *print-right-margin* nil)
+  ;; Default *features* — built-ins always present.  Tests can rebind
+  ;; via (let ((*features* …)) …) since *features* is dynamic.
+  (setq *features* (list :common-lisp :cl :ansi-cl :modus)))
 
 (defun %init-reader ()
   "Initialize reader. Must be called after %init-packages."
@@ -1175,31 +1182,72 @@
                (unread-char next stream)))))))))
 
 (defun %read-feature (stream include-if-present)
-  "Read #+feature or #-feature."
-  (let ((feature-expr (%read-internal stream t nil t))
-        (obj (%read-internal stream t nil t)))
-    ;; Check if feature is present
-    ;; For our purposes, we have COMMON-LISP, and not much else
-    (let ((present (%feature-present-p feature-expr)))
-      (if (eq present include-if-present) obj
-          ;; Suppressed — read and discard
-          (values)))))
+  "Read #+feature or #-feature.  CLHS 2.4.8.{17,18}: when the feature
+   test does NOT match, the next form is skipped (consumed under
+   *read-suppress*) and reading continues at the form after.  Returning
+   (values) here would make `(read-from-string \"#-cl :good\")` return
+   nil instead of recursing past the suppressed form.  When the test
+   matches, just read and return the next form."
+  (let* ((feature-expr (let ((*read-suppress* nil))
+                         (%read-internal stream t nil t)))
+         (present (%feature-present-p feature-expr)))
+    (cond
+      ((eq present include-if-present)
+       (%read-internal stream t nil t))
+      (t
+       ;; Skip the next form under *read-suppress*, then recursively
+       ;; read the form AFTER it — this is what makes
+       ;; `#-X foo bar` return `bar`.
+       (let ((*read-suppress* t))
+         (%read-internal stream t nil t))
+       (%read-internal stream t nil t)))))
+
+(defun %feature-name-eq (a b)
+  "Compare two feature designators.  CLHS says #+ matches with EQ on
+   symbols, so we compare via symbol-name to handle a test setting
+   `*features* = (:a :x :b)` while the source uses `#+X` (the symbol X
+   reads in package CL-TEST but should still match `:X`)."
+  (and (symbolp a) (symbolp b)
+       (string= (symbol-name a) (symbol-name b))))
 
 (defun %feature-present-p (expr)
-  "Check if a feature expression is present."
+  "Check if a feature expression EXPR matches *features*.
+   - Symbol/keyword: (member EXPR *features* :test name-eq).
+   - (AND …): all subforms present.
+   - (OR  …): any subform present.
+   - (NOT x): x not present.
+   Accepts both `:and`/`:or`/`:not` and `and`/`or`/`not` head symbols
+   so source written with either keyword or symbol heads matches per
+   the typical Lisp convention.  Always-on built-ins (`:common-lisp`,
+   `:cl`, `:ansi-cl`) match without consulting *features* — they are
+   the de-facto modus identity."
   (cond
-    ((eq expr :common-lisp) t)
-    ((eq expr :cl) t)
-    ((eq expr :ansi-cl) t)
-    ((and (consp expr) (eq (car expr) :and))
+    ((symbolp expr)
+     (or (%feature-name-eq expr :common-lisp)
+         (%feature-name-eq expr :cl)
+         (%feature-name-eq expr :ansi-cl)
+         (let ((cur *features*) (found nil))
+           (loop (when (or found (null cur)) (return found))
+             (when (%feature-name-eq expr (car cur)) (setq found t))
+             (setq cur (cdr cur))))))
+    ((and (consp expr)
+          (symbolp (car expr))
+          (or (%feature-name-eq (car expr) :and)
+              (%feature-name-eq (car expr) 'and)))
      (let ((all t))
        (dolist (sub (cdr expr)) (unless (%feature-present-p sub) (setq all nil)))
        all))
-    ((and (consp expr) (eq (car expr) :or))
+    ((and (consp expr)
+          (symbolp (car expr))
+          (or (%feature-name-eq (car expr) :or)
+              (%feature-name-eq (car expr) 'or)))
      (let ((any nil))
        (dolist (sub (cdr expr)) (when (%feature-present-p sub) (setq any t)))
        any))
-    ((and (consp expr) (eq (car expr) :not))
+    ((and (consp expr)
+          (symbolp (car expr))
+          (or (%feature-name-eq (car expr) :not)
+              (%feature-name-eq (car expr) 'not)))
      (not (%feature-present-p (cadr expr))))
     (t nil)))
 

@@ -2702,46 +2702,67 @@
                     (dolist (s init-list)
                       (format out "  (handler-case ~A (t (c) nil))~%" s)))
                 (format out ")~%")
-                (format out "(defun run-ansi-~A ()~%" (pathname-name file))
-                ;; run-ansi-X also re-runs init forms (idempotent — defclass
-                ;; updates the registry) so a fork's run-ansi-X still
-                ;; populates the registry even if the parent's run-init-*
-                ;; pass somehow missed it.
-                (dolist (s init-list)
-                  (format out "  (handler-case ~A (t (c) nil))~%" s)))
-              ;; Test forms — wrap EACH fork-test call in its own handler-case
-              ;; so a crash during parent-side arg-evaluation (vector literal,
-              ;; closure creation, etc.) of test N doesn't kill test N+1.
-              ;; On catch, call (%test-crash-fail <id>) which emits
-              ;; \"\\nFAIL <id>\\n\" so the sharded summary accounts for it.
-              ;; Using a helper function keeps the per-call code tiny.
-              ;; Wrap each run-test call in an outer handler-case that calls
-              ;; %test-crash-fail (defined in the runtime preamble below). This
-              ;; catches any crash during parent-side arg-evaluation that
-              ;; happens before run-test's own handler-case takes effect —
-              ;; especially closure construction and special var binding.
-              (dolist (tf (nreverse test-forms))
-                (let* ((form-str tf)
-                       (id-start (position #\Space form-str))
-                       (id-end (position #\Space form-str :start (1+ id-start)))
-                       (id-num (parse-integer form-str :start (1+ id-start) :end id-end :junk-allowed t)))
-                  (if id-num
-                      ;; Known uncatchable-hang tests that SIGALRM doesn't
-                      ;; kill cleanly (each wastes 45s per file alarm when
-                      ;; left alone).  The shm fork-recovery handles most
-                      ;; SIGSEGV-style crashes now, but these are true
-                      ;; infinite loops that consume wallclock until kill.
-                      ;; 13567..13577 = expt.18..28 + gcd.4 etc. (float /
-                      ;;                 random-iter hangs)
-                      ;; 25630       = typep.19 (typep.19-fn 1000)
-                      (cond
-                        ((or (and (>= id-num 13567) (<= id-num 13577))
-                             (= id-num 25630))
-                         (format out "  (%test-crash-fail ~D) ; skipped: uncatchable hang~%" id-num))
-                        (t
-                         (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%" form-str id-num)))
-                      (format out "  (handler-case ~A (t (c) nil))~%" form-str))))
-              (format out ")~%")
+                ;; Test forms — wrap EACH fork-test call in its own handler-case
+                ;; so a crash during parent-side arg-evaluation (vector literal,
+                ;; closure creation, etc.) of test N doesn't kill test N+1.
+                ;; On catch, call (%test-crash-fail <id>) which emits
+                ;; \"\\nFAIL <id>\\n\" so the sharded summary accounts for it.
+                ;;
+                ;; CHUNKING: when a file's per-test bodies are huge (loop /
+                ;; multiple-value-bind / handler-case nests — see times.lsp,
+                ;; expt.lsp, floor.lsp), packing them all into one
+                ;; run-ansi-FILE function tips the MVM compiler past some
+                ;; codegen threshold and the resulting fork crashes
+                ;; uncatchably BEFORE any T:N marker — losing every test
+                ;; in the file (times.lsp = 0 / 30 historically).  Split
+                ;; into chunks of +chunk-size+ tests each and have
+                ;; run-ansi-FILE call them in sequence.
+                (let ((chunk-size 8)
+                      (forms (nreverse test-forms))
+                      (chunk-num 0)
+                      (chunk-defs nil))
+                  ;; Emit run-ansi-FILE-CHUNK-N defuns first.  Each
+                  ;; handler-case calls the same %test-crash-fail helper as
+                  ;; the old monolithic emission did.
+                  (let ((remaining forms))
+                    (loop while remaining do
+                      (incf chunk-num)
+                      (let ((this-chunk (subseq remaining 0
+                                                (min chunk-size (length remaining)))))
+                        (setq remaining (subseq remaining (length this-chunk)))
+                        (push chunk-num chunk-defs)
+                        (format out "(defun run-ansi-~A-chunk-~D ()~%"
+                                (pathname-name file) chunk-num)
+                        (dolist (tf this-chunk)
+                          (let* ((form-str tf)
+                                 (id-start (position #\Space form-str))
+                                 (id-end (position #\Space form-str :start (1+ id-start)))
+                                 (id-num (parse-integer form-str :start (1+ id-start)
+                                                         :end id-end :junk-allowed t)))
+                            (cond
+                              ((null id-num)
+                               (format out "  (handler-case ~A (t (c) nil))~%" form-str))
+                              ;; Known uncatchable-hang tests
+                              ((or (and (>= id-num 13567) (<= id-num 13577))
+                                   (= id-num 25630))
+                               (format out "  (%test-crash-fail ~D) ; skipped: uncatchable hang~%" id-num))
+                              (t
+                               (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%"
+                                       form-str id-num)))))
+                        (format out ")~%"))))
+                  ;; Now the dispatcher.  Re-runs init forms (idempotent —
+                  ;; defclass updates the registry) so a fork's run-ansi-X
+                  ;; still populates the registry even if the parent's
+                  ;; run-init-* pass somehow missed it.  Then calls each
+                  ;; chunk in order, each in its own handler-case so a
+                  ;; chunk crash doesn't kill later chunks.
+                  (format out "(defun run-ansi-~A ()~%" (pathname-name file))
+                  (dolist (s init-list)
+                    (format out "  (handler-case ~A (t (c) nil))~%" s))
+                  (dolist (c (nreverse chunk-defs))
+                    (format out "  (handler-case (run-ansi-~A-chunk-~D) (t (c) nil))~%"
+                            (pathname-name file) c))
+                  (format out ")~%")))
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
                                  (get-output-stream-string out)))

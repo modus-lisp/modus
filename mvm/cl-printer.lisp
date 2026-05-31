@@ -84,9 +84,14 @@
              (setq quot-halves (cons q2 quot-halves))
              (setq r r2))
            (setq i (- i 1)))
-         ;; quot-halves is MSB-first list of half-limbs.  Reverse to get
-         ;; LSB-first, then combine to 62-bit limbs.
-         (let* ((q-limbs (%halves-to-limbs (reverse quot-halves)))
+         ;; Each iteration pushed HI then LO onto quot-halves; iterations
+         ;; ran MSB → LSB across input limbs.  After the final push, the
+         ;; FRONT of quot-halves is q[0].lo (LSB limb's low half), then
+         ;; q[0].hi, then q[1].lo, q[1].hi, …, q[n-1].lo, q[n-1].hi.
+         ;; That's already LSB-first with (lo, hi) per limb — exactly
+         ;; what %halves-to-limbs consumes.  Reversing was the bug that
+         ;; made (prin1 (expt 11 40)) etc. produce scrambled limbs.
+         (let* ((q-limbs (%halves-to-limbs quot-halves))
                 (q-mag (%make-bb 1 q-limbs))
                 (q (if (= sign -1)
                        (if (= r 0) (bignum-negate q-mag)

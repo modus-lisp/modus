@@ -1636,16 +1636,31 @@
 
 (defun ensure-generic-function (name &rest args)
   "Ensure generic function NAME exists.  ANSI: signals an error if NAME
-   names a special operator, macro, or ordinary (non-generic) function."
+   names a special operator, macro, or ordinary (non-generic) function.
+   Returns the GF object.
+
+   When NAME has no current GF, also installs a runtime dispatch stub
+   via set-symbol-function so `(funcall (symbol-function NAME) …)` and
+   `(typep #'NAME 'generic-function)` both work — EGF tests .4 and up
+   probe `(symbol-function f)` after a fresh EGF call and expect a
+   generic-function."
   (declare (ignore args))
   (let ((existing (%find-gf name)))
     (when existing
       (return-from ensure-generic-function existing))
-    ;; No GF yet — refuse if NAME is already bound to a non-GF function.
-    (when (and (fboundp name)
-               (not (%generic-function-p (fdefinition name))))
-      (error "ensure-generic-function: ~S already names a non-generic function" name))
-    (%defgeneric name nil nil)))
+    ;; No GF yet — refuse if NAME is already bound to a non-GF function,
+    ;; macro, or special operator.
+    (cond
+      ((and (symbolp name) (macro-function name))
+       (error "ensure-generic-function: ~S names a macro" name))
+      ((and (symbolp name) (special-operator-p name))
+       (error "ensure-generic-function: ~S names a special operator" name))
+      ((and (fboundp name)
+            (not (%generic-function-p (fdefinition name))))
+       (error "ensure-generic-function: ~S already names a non-generic function" name)))
+    (let ((gf (%defgeneric name nil nil)))
+      (set-symbol-function name (%make-gf-stub name))
+      gf)))
 
 ;;; ============================================================
 ;;; find-method / remove-method / add-method

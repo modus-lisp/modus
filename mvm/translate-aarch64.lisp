@@ -419,6 +419,8 @@
 (defconstant +cc-gt+ #xC)    ; signed greater than (Z=0 && N==V)
 (defconstant +cc-cs+ #x2)    ; carry set / unsigned >=
 (defconstant +cc-cc+ #x3)    ; carry clear / unsigned <
+(defconstant +cc-vs+ #x6)    ; overflow set (V=1) — signed overflow occurred
+(defconstant +cc-vc+ #x7)    ; overflow clear (V=0)
 (defconstant +cc-al+ #xE)    ; always
 
 ;;; --- ADD (shifted register) ---
@@ -2237,6 +2239,39 @@
              (a64-sub-reg buf pd pa pb 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
+
+          ;; ---- ADDS Vd, Va, Vb (sets V on signed overflow) ----
+          ((= op +op-adds+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-adds-reg buf pd pa pb 0 0)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- SUBS Vd, Va, Vb (sets V on signed overflow) ----
+          ((= op +op-subs+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-subs-reg buf pd pa pb 0 0)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- BVS off32 — branch if V flag set ----
+          ((= op +op-bvs+)
+           (let* ((mvm-offset (vr 0))
+                  (target-byte (+ (decoded-mvm-insn-offset insn)
+                                  (decoded-mvm-insn-size insn)
+                                  mvm-offset))
+                  (label (or (gethash target-byte mvm-to-native-label)
+                             (setf (gethash target-byte mvm-to-native-label)
+                                   (incf *mvm-label-counter*)))))
+             (let ((idx (a64-current-index buf)))
+               (a64-bcond buf +cc-vs+ 0)
+               (a64-add-fixup buf idx label :bcond))))
 
           ;; ---- MUL Vd, Va, Vb ----
           ;; Tagged fixnum multiply: Vd = (Va >> 1) * Vb

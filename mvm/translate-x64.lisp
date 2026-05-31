@@ -1059,6 +1059,28 @@
                (vb (third operands)))
            (emit-alu-rrr buf #'emit-sub-reg-reg vd va vb)))
 
+        ;; Overflow-detecting add/sub.  Same encoding as plain ADD/SUB
+        ;; on x86 — they already set OF — so we reuse the regular emit
+        ;; helper and rely on the very next MVM insn being :bvs.
+        ;; MOV/STR for spill writeback do not touch OF.
+        ((op= +op-adds+)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-add-reg-reg vd va vb)))
+
+        ((op= +op-subs+)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-sub-reg-reg vd va vb)))
+
+        ((op= +op-bvs+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :o label)))
+
         ((op= +op-mul+)
          ;; (mul Vd Va Vb) — tagged fixnum multiplication.
          ;;

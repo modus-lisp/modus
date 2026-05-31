@@ -38,6 +38,7 @@
    #:+op-cmp+ #:+op-test+
    #:+op-br+ #:+op-beq+ #:+op-bne+ #:+op-blt+ #:+op-bge+
    #:+op-ble+ #:+op-bgt+ #:+op-bnull+ #:+op-bnnull+
+   #:+op-adds+ #:+op-subs+ #:+op-bvs+
    #:+op-car+ #:+op-cdr+ #:+op-cons+ #:+op-setcar+ #:+op-setcdr+
    #:+op-consp+ #:+op-atom+
    #:+op-alloc-obj+ #:+op-obj-ref+ #:+op-obj-set+
@@ -84,6 +85,7 @@
    #:mvm-cmp #:mvm-test
    #:mvm-br #:mvm-beq #:mvm-bne #:mvm-blt #:mvm-bge
    #:mvm-ble #:mvm-bgt #:mvm-bnull #:mvm-bnnull
+   #:mvm-adds #:mvm-subs #:mvm-bvs
    #:mvm-car #:mvm-cdr #:mvm-cons #:mvm-setcar #:mvm-setcdr
    #:mvm-consp #:mvm-atom
    #:mvm-alloc-obj #:mvm-obj-ref #:mvm-obj-set
@@ -370,6 +372,11 @@
 (defconstant +op-itof+   #xC2)  ; (itof  Vd Vs)    - tagged integer → float object
 (defconstant +op-ftoi+   #xC3)  ; (ftoi  Vd Vs)    - float → tagged integer (truncate)
 (defconstant +op-fcmp+   #xC4)  ; (fcmp  Va Vb)    - sets flags (UCOMISD-style)
+;; Overflow-detecting integer arithmetic.  Same operand shape as their
+;; non-checking variants but SET the V (overflow) flag.  Pair with :bvs.
+(defconstant +op-adds+   #xC5)  ; (adds  Vd Va Vb) - Vd = Va+Vb, sets V on signed overflow
+(defconstant +op-subs+   #xC6)  ; (subs  Vd Va Vb) - Vd = Va-Vb, sets V on signed overflow
+(defconstant +op-bvs+    #xC7)  ; (bvs   off32)    - branch if V set (last :adds/:subs overflowed)
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -523,6 +530,9 @@
 (defopcode :itof  #xC2 (:reg :reg)      "Tagged integer → IEEE float object")
 (defopcode :ftoi  #xC3 (:reg :reg)      "IEEE float → tagged integer (truncate)")
 (defopcode :fcmp  #xC4 (:reg :reg)      "IEEE float compare (sets flags)")
+(defopcode :adds  #xC5 (:reg :reg :reg) "Add tagged fixnums, set V on signed overflow")
+(defopcode :subs  #xC6 (:reg :reg :reg) "Sub tagged fixnums, set V on signed overflow")
+(defopcode :bvs   #xC7 (:off32)         "Branch if last :adds/:subs overflowed")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -771,6 +781,11 @@
 (defun mvm-itof (buf vd vs)    (encode-instruction buf +op-itof+ vd vs))
 (defun mvm-ftoi (buf vd vs)    (encode-instruction buf +op-ftoi+ vd vs))
 (defun mvm-fcmp (buf va vb)    (encode-instruction buf +op-fcmp+ va vb))
+
+;; Overflow-detecting arithmetic — pair with mvm-bvs.
+(defun mvm-adds (buf vd va vb) (encode-instruction buf +op-adds+ vd va vb))
+(defun mvm-subs (buf vd va vb) (encode-instruction buf +op-subs+ vd va vb))
+(defun mvm-bvs  (buf offset)   (encode-instruction buf +op-bvs+  offset))
 
 ;; Bitwise
 (defun mvm-and (buf vd va vb)

@@ -6722,10 +6722,28 @@
    push/pop the V5..V(4+save-count-1) temps that are live in the
    *caller* — exactly the same pattern compile-call uses around its
    own :call.  Without this every (+ ratio …) inside an enclosing
-   computation that has temps in V5+ silently corrupted those temps."
-  (let* ((tag-temp   (alloc-temp-reg))
+   computation that has temps in V5+ silently corrupted those temps.
+
+   For :add and :sub the fast path uses the overflow-checking variant
+   (:adds / :subs) followed by :bvs to the slow path so signed overflow
+   on tagged fixnums promotes to GENERIC-ADD/GENERIC-SUBTRACT instead
+   of silently truncating into bignum-shaped corruption.  Because the
+   checked op writes the (truncated) result into dest before the V
+   check, we snapshot the original dest first and restore it before
+   the slow-path call."
+  ;; Overflow-promotion is DISABLED.  Wiring it in here regressed 10
+  ;; ANSI tests on x64 (minus.9, evenp.3, oddp.3, format-x.{1..12}) with
+  ;; zero wins — the only test where overflow could promote a fixnum to
+  ;; a bignum and recover a previous failure was masked by downstream
+  ;; bignum-incomplete code paths (logand/format on bignums).  The
+  ;; opcode infrastructure (:adds/:subs/:bvs IR + AArch64+x64 translator
+  ;; handlers) stays in place so a future emit-arith-pair revision can
+  ;; turn it back on once bignum-aware logand/printer paths land.
+  (let* ((checked-op nil)
+         (tag-temp   (alloc-temp-reg))
          (one-temp   (alloc-temp-reg))
          (slow-label (make-compiler-label))
+         (overflow-label (and checked-op (make-compiler-label)))
          (end-label  (make-compiler-label))
          ;; Snapshot caller-saved temps live BEFORE this call.
          ;; *temp-reg-counter* now includes our own two allocs;
@@ -6738,8 +6756,23 @@
     (emit-ir :test tag-temp one-temp)
     (emit-ir :bne  slow-label)
     ;; Fast path.
-    (emit-ir fast-op dest dest temp)
-    (emit-ir :br end-label)
+    (cond
+      (checked-op
+       ;; Save dest on the hardware stack so we can restore the un-
+       ;; truncated value before falling into the slow path.  PUSH/POP
+       ;; on both x86 and AArch64 are flag-preserving.
+       (emit-ir :push dest)
+       (emit-ir checked-op dest dest temp)
+       (emit-ir :bvs overflow-label)
+       ;; Success: drop the saved copy by popping into a dead temp.
+       (emit-ir :pop tag-temp)
+       (emit-ir :br end-label)
+       (emit-ir-label overflow-label)
+       (emit-ir :pop dest)             ; restore original a
+       (emit-ir :br slow-label))
+      (t
+       (emit-ir fast-op dest dest temp)
+       (emit-ir :br end-label)))
     ;; Slow path.
     (emit-ir-label slow-label)
     ;; Save caller-saved temps live in V5..V(4+save-count-1), skipping
@@ -7335,7 +7368,11 @@
 (defun compile-logand (args env dest)
   "Compile (logand args...).
    Flattens nested logand to prevent push/pop stack corruption.
-   Push/pop dest around each operand to survive function calls."
+   Push/pop dest around each operand to survive function calls.
+   Goes through emit-arith-pair so bignum operands route through
+   GENERIC-LOGAND (low-limb AND of bignum magnitude) instead of doing a
+   raw pointer-tag AND that returns garbage for `(logand bignum 1)`
+   bodies in evenp/oddp."
   (let ((flat-args (flatten-arith-args 'logand args)))
     (cond
       ((null flat-args)
@@ -7357,8 +7394,8 @@
 
 (defun compile-logior (args env dest)
   "Compile (logior args...).
-   Flattens nested logior to prevent push/pop stack corruption.
-   Push/pop dest around each operand to survive function calls."
+   Same emit-arith-pair routing as compile-logand — bignum operands fall
+   through to GENERIC-LOGIOR."
   (let ((flat-args (flatten-arith-args 'logior args)))
     (cond
       ((null flat-args)
@@ -7379,8 +7416,7 @@
 
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
-   Flattens nested logxor to prevent push/pop stack corruption.
-   Push/pop dest around each operand to survive function calls."
+   Same emit-arith-pair routing as compile-logand."
   (let ((flat-args (flatten-arith-args 'logxor args)))
     (cond
       ((null flat-args)
@@ -9568,6 +9604,8 @@
       (:aset  4)
       (:add   4)
       (:sub   4)
+      (:adds  4)
+      (:subs  4)
       (:mul   4)
       (:mul26lo 4)
       (:mul26hi 4)
@@ -9621,6 +9659,7 @@
       (:bge   5)
       (:ble   5)
       (:bgt   5)
+      (:bvs   5)
 
       ;; Branch-null: 1 opcode + 1 reg + 4 off32 = 6 bytes
       (:bnull  6)
@@ -9813,6 +9852,10 @@
            (mvm-add buf (second insn) (third insn) (fourth insn)))
           (:sub
            (mvm-sub buf (second insn) (third insn) (fourth insn)))
+          (:adds
+           (mvm-adds buf (second insn) (third insn) (fourth insn)))
+          (:subs
+           (mvm-subs buf (second insn) (third insn) (fourth insn)))
           (:mul
            (mvm-mul buf (second insn) (third insn) (fourth insn)))
           (:mul26lo
@@ -9936,6 +9979,13 @@
                   (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bgt buf rel-offset)))
+          (:bvs
+           (let* ((target-label (second insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 5))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-bvs buf rel-offset)))
 
           ;; ---- Branch-null (1 opcode + 1 reg + 4 off32 = 6 bytes) ----
           (:bnull

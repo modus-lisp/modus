@@ -753,25 +753,79 @@
            (eq name 'generic-function) (eq name 'class) (eq name 'built-in-class)
            (eq name 'structure-object) (eq name 'structure-class))))
 
+;;; Proxy-class cache.  find-class on a built-in or condition type used
+;;; to allocate a fresh 2-element vector every call, so
+;;; `(eq (find-class 'integer) (find-class 'integer))` was NIL — breaking
+;;; the find-class identity tests (find-class.{1,2,3,7,…}).  The cache is
+;;; an alist keyed by the type-name symbol; eq on the cdr is the
+;;; canonical proxy object.
+(defvar *class-proxy-cache* nil)
+
+(defun %get-class-proxy (name)
+  "Return the canonical class-proxy object for NAME, allocating exactly
+   one per name and stashing it in *class-proxy-cache* for future eq."
+  (let ((entry (assoc name *class-proxy-cache*)))
+    (cond
+      (entry (cdr entry))
+      (t
+       (let ((cls (make-array 2)))
+         (aset cls 0 '%class-proxy)
+         (aset cls 1 name)
+         (setq *class-proxy-cache* (cons (cons name cls) *class-proxy-cache*))
+         cls)))))
+
 (defun find-class (name &rest args)
   "Find class by name. Returns CLOS class descriptor, or a proxy object
-   for condition / built-in types so find-method specializers work."
+   for condition / built-in types so find-method specializers work.
+   Built-in proxies are cached so (eq (find-class N) (find-class N)) is T
+   per CLHS — the test suite has find-class.{1,2,3,7} that loop over
+   `*cl-types-that-are-classes-symbols*` and assert eq-identity."
   (let ((errorp (if args (car args) t)))
     ;; Check CLOS user-defined classes first
     (let ((clos-cls (%find-clos-class name)))
       (if clos-cls
           clos-cls
-          ;; Built-in types and condition types both get a proxy.
+          ;; Built-in types and condition types both get a cached proxy.
           (if (or (%cond-reg-find name)
                   (%builtin-class-name-p name))
-              (let ((cls (make-array 2)))
-                (aset cls 0 '%class-proxy)
-                (aset cls 1 name)
-                cls)
+              (%get-class-proxy name)
               ;; Not found
               (if errorp
                   (error "class not found")
                   nil))))))
+
+(defun set-find-class (&rest args)
+  "(setf (find-class NAME [ERRORP [ENV]]) VALUE).  Modus's SETF macro
+   rewrites the place to (set-find-class NAME [ERRORP [ENV]] VALUE), so
+   the actual class object is always the LAST argument; the optional
+   errorp / env arguments after NAME are accepted and ignored (per
+   CLHS — they affect read but not write).
+
+   When VALUE is NIL, removes NAME from the user-class registry — leaves
+   the proxy cache alone since you can't disassociate a built-in.
+   When VALUE is non-NIL, registers (or replaces) NAME → VALUE in
+   *clos-classes*."
+  (let* ((name (car args))
+         ;; The value is the last positional arg (n=1 → 2 args, n=2 → 3, …).
+         (value (car (last args))))
+    (cond
+      ((null value)
+       (let ((new-reg nil) (cur *clos-classes*))
+         (loop
+           (when (null cur) (return nil))
+           (unless (eq (car (car cur)) name)
+             (setq new-reg (cons (car cur) new-reg)))
+           (setq cur (cdr cur)))
+         (setq *clos-classes* new-reg)))
+      (t
+       (let ((new-reg nil) (cur *clos-classes*))
+         (loop
+           (when (null cur) (return nil))
+           (unless (eq (car (car cur)) name)
+             (setq new-reg (cons (car cur) new-reg)))
+           (setq cur (cdr cur)))
+         (setq *clos-classes* (cons (cons name value) new-reg)))))
+    value))
 
 (defun %class-proxy-p (obj)
   "Check if obj is a class proxy."

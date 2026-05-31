@@ -1056,7 +1056,9 @@
          (%register-clos-slot-info class-name
                                    (nreverse initarg-pairs)
                                    (nreverse initform-pairs))
-         class-name))
+         ;; CLHS 7.7: defclass returns the class object, not the name.
+         ;; find-class.15 etc. rely on (eq (eval `(defclass …)) (find-class …)).
+         (find-class class-name)))
       ;; COND
       ((%eval-sym-eq op "COND")
        (let ((cur args))

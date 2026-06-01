@@ -1142,16 +1142,27 @@
 ;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
 (defun eq (a b) (eq a b))
 (defun eql (a b)
-  "EQL — same as EQ for non-numbers/non-chars; for numbers, equal in type
-   AND value.  IEEE floats need explicit bit-equal since two
-   separately-allocated float objects with the same value are EQL per
-   CLHS but FAIL the inline (eql a b) identity opcode."
+  "EQL — same as EQ for non-numbers/non-chars; for numbers, equal in
+   type AND value.  Boxed numerics (IEEE floats subtag #x60, ratios
+   subtag #x33, bignums subtag #x30) allocate a fresh object per
+   literal/computation, so two copies with the same value satisfy
+   CLHS eql but fail the inline (eql a b) identity opcode.  Slot
+   compare them here.  Body uses `eq` (not `eql`) at the end so the
+   inline compile-eql can fall through into this defun without
+   infinite recursion."
   (cond
     ((eq a b) t)
     ((and (%ieee-float-p a) (%ieee-float-p b))
      (and (= (aref a 0) (aref b 0))
           (= (aref a 1) (aref b 1))))
-    (t (eql a b))))
+    ((and (ratiop a) (ratiop b))
+     (and (= (aref a 0) (aref b 0))
+          (= (aref a 1) (aref b 1))))
+    ((and (bignump a) (bignump b))
+     ;; Bignums also box per value.  numeric-equal-p handles all
+     ;; integer-typed combinations including bignum slot-compare.
+     (numeric-equal-p a b))
+    (t nil)))
 ;; Bare defuns for the primitive cons/car/cdr opcodes so #'cons /
 ;; #'car / #'cdr resolve to callable function objects (used by reduce
 ;; and similar tests like (reduce #'cons '(a b c))).

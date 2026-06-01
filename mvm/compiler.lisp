@@ -2101,9 +2101,16 @@
       ((and (vectorp form) (not (stringp form)))
        (compile-quote form dest))
 
-      ;; Ratio literal → convert to float, box as float object
+      ;; Ratio literal → 2-slot subtag-ratio object with the actual
+      ;; numerator/denominator.  Delegating to compile-quote keeps the
+      ;; runtime shape consistent with `(/ 4 3)` evaluating to a real
+      ;; ratio via exact-divide, so `(ratiop 1/2)`, `(numerator 4/3)`,
+      ;; and rt-equal against ratio literals all work.  Previously this
+      ;; floated the literal via `(compile-form (float form 1.0d0) …)`
+      ;; — silently shadowed by the same float-fallback in compile-quote
+      ;; until that path was split too.  Fixed 2026-06-01.
       ((typep form 'ratio)
-       (compile-form (float form 1.0d0) env dest))
+       (compile-quote form dest))
 
       ;; Complex number → compile as 0
       ((typep form 'complex)
@@ -2724,8 +2731,14 @@
       ((= op-name 511431138979586071) (when (arity-ok-p form 1 1 env dest) (compile-char-code (cadr form) env dest)))
       ((= op-name 632535660519644111) (when (arity-ok-p form 1 1 env dest) (compile-code-char (cadr form) env dest)))
 
-      ;; --- EQL (same as EQ for fixnums/chars/symbols) ---
-      ((= op-name 743927193407775751)      (compile-eq (cdr form) env dest))
+      ;; --- EQL ---
+      ;; Identity is the right answer for fixnums/chars/symbols/nil/t,
+      ;; but ratios and IEEE floats both box per literal/computation so
+      ;; (eql 4/3 4/3) and (eql 1.0 1.0) need slot-compare.  Inline an
+      ;; identity check, then on mismatch fall through to the runtime
+      ;; eql defun (cl-types.lisp:1144) which does the boxed-numeric
+      ;; slot compare.
+      ((= op-name 743927193407775751)      (compile-eql (cdr form) env dest))
       ;; NOTE: EQUAL (hash 777630921077348411) is NOT inlined as EQ — it's a
       ;; user-defined function (structural equality), dispatched via compile-call.
 
@@ -3232,8 +3245,24 @@
                (free-temp-reg))))
          ;; Short lists / dotted pairs: recursive
          (compile-cons `(quote ,(car value)) `(quote ,(cdr value)) nil dest)))
-    ;; Float/ratio: boxed float object, 2 slots = high32 + low32 IEEE bits
-    ((or (floatp value) (typep value 'ratio))
+    ;; Ratio literal: 2-slot subtag-ratio with num/den as tagged
+    ;; fixnums.  Previously this branch was merged with floatp and
+    ;; ratios were silently floated via (ieee-float-bits (float value
+    ;; 1.0d0)) — `(ratiop 1/2)` returned nil, `(numerator 4/3)`
+    ;; returned 1.333…, and any test that round-tripped a ratio
+    ;; literal hit value mismatches against runtime-produced ratios
+    ;; from exact-divide.  See compile-make-ratio + cl-types.lisp's
+    ;; %make-rat for the runtime shape.
+    ((typep value 'ratio)
+     (emit-ir :alloc-obj dest 2 +subtag-ratio+)
+     (let ((temp (alloc-temp-reg)))
+       (compile-integer (numerator value) temp)
+       (emit-ir :obj-set dest 0 temp)
+       (compile-integer (denominator value) temp)
+       (emit-ir :obj-set dest 1 temp)
+       (free-temp-reg)))
+    ;; Float literal: 2-slot boxed float = high32 + low32 IEEE bits.
+    ((floatp value)
      (let* ((bits (ieee-float-bits (float value 1.0d0)))
             (hi (ash bits -32))
             (lo (logand bits #xFFFFFFFF)))
@@ -7214,6 +7243,41 @@
           (compile-nil dest)
           (emit-ir :br end-label)
           ;; Equal: T
+          (emit-ir-label true-label)
+          (compile-t dest)
+          (emit-ir-label end-label)
+          (free-temp-reg)))))
+
+(defun compile-eql (args env dest)
+  "Compile (eql a b) — like EQ but with value-equal for boxed numbers
+   (ratios subtag #x33, IEEE floats subtag #x60, bignums subtag #x30).
+   Two literal 4/3 or 1.0 are separate objects; pointer equality
+   returns nil but CLHS eql contract returns T.  We inline the cheap
+   identity check, then on mismatch fall through to the runtime EQL
+   defun (cl-types.lisp:1144) which handles the slot compare.
+
+   The EQL defun body uses `eq` at the cond-tail (not `eql`) so this
+   inline can call it without infinite recursion."
+  (if (or (null args) (null (cdr args)) (cddr args))
+      (compile-form `(error "wrong number of arguments") env dest)
+      (destructuring-bind (a b) args
+        (let ((temp (alloc-temp-reg))
+              (true-label (make-compiler-label))
+              (end-label (make-compiler-label)))
+          (compile-form a env dest)
+          (emit-ir :push dest)
+          (compile-form b env temp)
+          (emit-ir :pop dest)
+          (emit-ir :cmp dest temp)
+          (emit-ir :beq true-label)
+          ;; Pointer-different: call EQL defun for the slot-compare slow path.
+          (emit-ir :mov +vreg-v0+ dest)
+          (emit-ir :mov +vreg-v1+ temp)
+          (emit-ir :set-nargs 2)
+          (emit-ir :call "EQL" 2)
+          (emit-ir :mov dest +vreg-vr+)
+          (emit-ir :br end-label)
+          ;; Identical: T
           (emit-ir-label true-label)
           (compile-t dest)
           (emit-ir-label end-label)

@@ -2836,6 +2836,21 @@
           (= (array-length n) 2))
      (let ((num (aref n 0)) (den (aref n 1)))
        (sqrt (if (= den 1) num (%make-rat num den)))))
+    ;; IEEE float input — Newton's method via %float-mul / -add / -div.
+    ;; Converges in ~4 iterations for typical inputs.  Without this
+    ;; branch (sqrt 4.0) fell through to (t 0).
+    ((%ieee-float-p n)
+     (cond
+       ((%float-zero-p n) n)
+       (t (let ((half (%float-div (%float-from-int 1) (%float-from-int 2)))
+                (x n))
+            ;; x_{i+1} = (x_i + n/x_i) / 2
+            (let ((i 0))
+              (loop
+                (when (>= i 8) (return x))
+                (setq x (%float-mul (%float-add x (%float-div n x)) half))
+                (setq i (+ i 1))))
+            x))))
     (t 0)))
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start &rest rest)

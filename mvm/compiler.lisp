@@ -207,6 +207,13 @@
    calls (callee names that no defun resolved) at the end of compilation.
    Set to nil to silence this output for clean build logs.")
 
+(defparameter *redefinition-log* nil
+  "List of (name old-loc new-loc) triples, one per silently-redefined
+   defun.  Pushed by mvm-compile-function.  Build scripts should print
+   the count + first few names so redefinitions aren't lost in the
+   per-form NOTE: stream — finding `numberp` was silently truncated to
+   `(integerp x)` (commit 79abc32) traced back to an audit of these.")
+
 (defparameter *compile-list-headed-fn-warn* t
   "When non-nil, compile-call prints `;; WARN compile-call:` to stderr
    for any callable form that's a list with non-LAMBDA head (e.g.
@@ -10142,13 +10149,15 @@
           (ir (cdr result)))
       ;; Record source location
       (setf (function-info-source-location info) *current-source-location*)
-      ;; Warn on redefinition with source locations
+      ;; Warn on redefinition with source locations + log for end-of-build summary.
       (let ((existing (gethash (function-info-name info) *functions*)))
         (when existing
-          (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
-                  (function-info-name info)
-                  (or (function-info-source-location existing) "?")
-                  (or *current-source-location* "?"))))
+          (let ((old-loc (or (function-info-source-location existing) "?"))
+                (new-loc (or *current-source-location* "?")))
+            (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
+                    (function-info-name info) old-loc new-loc)
+            (push (list (function-info-name info) old-loc new-loc)
+                  *redefinition-log*))))
       ;; Register in function table
       (setf (gethash (function-info-name info) *functions*) info)
       (push info *function-table*)

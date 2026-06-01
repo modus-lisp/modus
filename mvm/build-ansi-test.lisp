@@ -3953,4 +3953,21 @@
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
+    ;; Surface the per-defun "NOTE: redefining" stream as a single line
+    ;; so it can't get lost in the build noise.  Last-defun-wins means
+    ;; an unintended duplicate silently masks the earlier copy; a
+    ;; semantic regression (e.g. `(defun numberp (x) (integerp x))`
+    ;; replacing the correct version) is invisible unless you spot the
+    ;; NOTE: lines among ~50K lines of compile output.
+    (let ((n (length modus.mvm::*redefinition-log*)))
+      (when (> n 0)
+        (format t "~%REDEFINITIONS: ~D total~%" n)
+        (let ((sample (subseq (nreverse modus.mvm::*redefinition-log*)
+                              0 (min n 10))))
+          (dolist (entry sample)
+            (format t "  ~A  (~A → ~A)~%"
+                    (first entry) (second entry) (third entry))))
+        (when (> n 10)
+          (format t "  … ~D more.  Grep build output for \"NOTE: redefining\".~%"
+                  (- n 10)))))
     (format t "~%Run: ~A~%" path)))

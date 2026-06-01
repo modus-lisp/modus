@@ -3942,4 +3942,18 @@
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
+    ;; Surface defun redefinitions so semantic regressions like
+    ;; `numberp` silently truncated to `(integerp x)` (commit 79abc32)
+    ;; don't hide in 50K lines of per-form NOTE: stream.
+    (let ((n (length modus.mvm::*redefinition-log*)))
+      (when (> n 0)
+        (format t "~%REDEFINITIONS: ~D total~%" n)
+        (let ((sample (subseq (nreverse modus.mvm::*redefinition-log*)
+                              0 (min n 10))))
+          (dolist (entry sample)
+            (format t "  ~A  (~A → ~A)~%"
+                    (first entry) (second entry) (third entry))))
+        (when (> n 10)
+          (format t "  … ~D more.  Grep build output for \"NOTE: redefining\".~%"
+                  (- n 10)))))
     (format t "~%Run: ~A~%" path)))

@@ -3633,6 +3633,24 @@
   (setq most-negative-single-float   -3.4028235d38)
   (setq most-positive-short-float     3.4028235d38)
   (setq most-negative-short-float    -3.4028235d38)
+  ;; Long-float = double in Modus (single IEEE-double precision).  Without
+  ;; these setqs, expt.error.7 / expt.error.11 (and any other test that
+  ;; references most/least-positive-long-float) see NIL and crash before
+  ;; their handler-case wrapper can convert the fault to a signaled error.
+  (setq most-positive-long-float      1.7976931348623157d308)
+  (setq most-negative-long-float     -1.7976931348623157d308)
+  ;; Least-positive denormals — Modus emits IEEE-double bits via
+  ;; sb-kernel:double-float-{high,low}-bits at build time, so the
+  ;; subnormal pattern survives.  Used by expt.error.8-11 underflow
+  ;; tests and by the float-format type predicates.
+  (setq least-positive-double-float   5.0d-324)
+  (setq least-negative-double-float  -5.0d-324)
+  (setq least-positive-single-float   1.4d-45)
+  (setq least-negative-single-float  -1.4d-45)
+  (setq least-positive-short-float    1.4d-45)
+  (setq least-negative-short-float   -1.4d-45)
+  (setq least-positive-long-float     5.0d-324)
+  (setq least-negative-long-float    -5.0d-324)
 
   ;; Standard CL constants the ANSI test auxiliary files reference
   ;; (char-code-limit, call-arguments-limit, *-fixnum). Without these

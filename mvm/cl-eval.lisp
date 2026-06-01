@@ -2320,6 +2320,28 @@
       (t (values q-c r-c)))))
 (defun rem (n d) (- n (* (truncate n d) d)))
 (defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
+(defun %float-non-finite-p (f)
+  "True iff F is an IEEE float whose exponent is all-ones (±inf or NaN).
+   Used by expt to detect IEEE-double overflow without trapping MXCSR."
+  (and (%ieee-float-p f)
+       (let* ((hi (aref f 0))
+              (hi-u32 (logand hi 4294967295))
+              (exp-biased (logand (ash hi-u32 -20) 2047)))
+         (= exp-biased 2047))))
+
+(defun %float-zero-bits-p (f)
+  "True iff F is an IEEE float with all-zero exponent AND mantissa (±0.0).
+   Used by expt's underflow detection — if both operands were non-zero
+   but the product is zero, MULSD denormalized to zero (underflow)."
+  (and (%ieee-float-p f)
+       (let* ((hi (aref f 0))
+              (lo (aref f 1))
+              (hi-u32 (logand hi 4294967295))
+              (lo-u32 (logand lo 4294967295))
+              ;; Mask off the sign bit (bit 31 of hi).
+              (hi-nosign (logand hi-u32 2147483647)))
+         (and (= hi-nosign 0) (= lo-u32 0)))))
+
 (defun expt (base power)
   "Raise BASE to POWER.  Integer base/power uses bignum-mul so the
    result promotes to a bignum when fixnum range is exceeded —
@@ -2331,7 +2353,15 @@
    CLHS expt: (expt x 0) returns 1 of an appropriate type — if
    either operand is a float, the result is a float; if both are
    rational (including complex/integer), the result is integer 1.
-   Tests EXPT.3-6/18-27 hinge on the float-1 case."
+   Tests EXPT.3-6/18-27 hinge on the float-1 case.
+
+   Float-base/integer-power loops detect IEEE overflow (±inf
+   sentinel) and underflow (product is ±0.0 from non-zero operands)
+   after each multiplication and signal floating-point-overflow /
+   floating-point-underflow accordingly — required by EXPT.error.6,
+   .7, .10, .11.  EXPT.error.4, .5, .8, .9 use short/single-float
+   constants that don't trigger IEEE double overflow; those need
+   real format-distinct floats to pass."
   (cond
     ((= power 0)
      (cond
@@ -2346,7 +2376,18 @@
      (let ((r 1))
        (dotimes (i power r) (setq r (bignum-mul r base)))))
     ((and (integerp power) (> power 0))
-     (let ((r 1)) (dotimes (i power r) (setq r (* r base)))))
+     ;; Float-base × integer-positive-power.  Watch for IEEE
+     ;; overflow/underflow.
+     (let ((r 1) (base-zerop (and (%ieee-float-p base) (%float-zero-bits-p base))))
+       (dotimes (i power)
+         (setq r (* r base))
+         (when (%ieee-float-p r)
+           (cond
+             ((%float-non-finite-p r)
+              (error 'floating-point-overflow))
+             ((and (not base-zerop) (%float-zero-bits-p r))
+              (error 'floating-point-underflow)))))
+       r))
     ((and (integerp power) (< power 0))
      (exact-divide 1 (expt base (- 0 power))))
     ((ratiop power)

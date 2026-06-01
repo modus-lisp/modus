@@ -916,7 +916,114 @@
   (rt-run-test 2385 (handler-case (progn (cons) nil) (error (c) t)) t)
   (rt-run-test 2386 (handler-case (progn (cons 1 2 3) nil) (error (c) t)) t)
   (rt-run-test 2387 (handler-case (progn (car) nil) (error (c) t)) t)
-  (rt-run-test 2388 (handler-case (progn (car 1 2) nil) (error (c) t)) t))
+  (rt-run-test 2388 (handler-case (progn (car 1 2) nil) (error (c) t)) t)
+  ;; ----------------------------------------------------------------
+  ;; Number-comparison cluster regression tests (rt-run-test 3900..3949).
+  ;;
+  ;; These lock in four compiler fixes landed for the
+  ;; number-comparison.lsp wedge:
+  ;;
+  ;;   1. /= macro accepts 3+ args (falls through to ansi-bridge defun).
+  ;;   2. defun establishes implicit BLOCK <fname> so RETURN-FROM works
+  ;;      from inside a nested LOOP body — `/=`'s O(n²) inner loop uses
+  ;;      `(return-from /= nil)`.
+  ;;   3. compile-compare and the 3-arg comparison rewriter bind every
+  ;;      operand to a fresh gensym before pairwise check, so each
+  ;;      operand evaluates exactly once even when the AND short-
+  ;;      circuits.  Without this `(= (incf c1) (incf c2) (incf c3))`
+  ;;      runs c3=0 (=.ORDER.2 fails) and `(< a b c)` runs middle args
+  ;;      twice.
+  ;;   4. compile-form intercepts `(apply #'FN list)` where FN is a
+  ;;      known &rest function with required-count=0 and routes via
+  ;;      the static-rest sentinel — bypassing the cl-printer apply
+  ;;      defun's 20-rung ladder so any list length works.
+  ;;   5. #'<, #'>, #'<=, #'>=, #'=, #'/= resolve to the ansi-bridge
+  ;;      variadic defun (not the 2-arg %LT-FN wrappers), so
+  ;;      `(apply #'< (single-element-list))` returns T vacuously
+  ;;      instead of comparing against a stale V1.
+  (rt-run-test 3900 (= 1 1 1) t)
+  (rt-run-test 3901 (= 1 2 3) nil)
+  (rt-run-test 3902 (< 1 2 3) t)
+  (rt-run-test 3903 (< 1 3 2) nil)
+  (rt-run-test 3904 (> 3 2 1) t)
+  (rt-run-test 3905 (>= 3 3 2 1 1) t)
+  ;; /= macro / defun smoke.
+  (rt-run-test 3906 (/= 1 1) nil)
+  (rt-run-test 3907 (/= 1 2) t)
+  (rt-run-test 3908 (/= 1 2 3) t)
+  (rt-run-test 3909 (/= 1 1 2) nil) ; relies on RETURN-FROM /= working
+  ;; 3-arg comparison must evaluate each operand exactly once (CLHS).
+  ;; Without the gensym binding the middle arg runs twice for < and
+  ;; the last arg is skipped for = (and-short-circuit on NIL).
+  (rt-run-test 3910
+               (let ((c1 0) (c2 0) (c3 0))
+                 (= (progn (incf c1) 1) (progn (incf c2) 2) (progn (incf c3) 3))
+                 (list c1 c2 c3))
+               '(1 1 1))
+  (rt-run-test 3911
+               (let ((c1 0) (c2 0) (c3 0))
+                 (< (progn (incf c1) 1) (progn (incf c2) 2) (progn (incf c3) 3))
+                 (list c1 c2 c3))
+               '(1 1 1))
+  ;; The =.ORDER.2 / <.ORDER.3 shape, in-line.
+  (rt-run-test-mv 3912
+                  (multiple-value-list
+                   (let ((i 0) x y z)
+                     (values
+                      (= (progn (setf x (incf i)) 1)
+                         (progn (setf y (incf i)) 2)
+                         (progn (setf z (incf i)) 3))
+                      i x y z)))
+                  '(nil 3 1 2 3))
+  (rt-run-test-mv 3913
+                  (multiple-value-list
+                   (let ((i 0) u v w x y z)
+                     (values
+                      (<
+                       (progn (setf u (incf i)) 1)
+                       (progn (setf v (incf i)) 2)
+                       (progn (setf w (incf i)) 3)
+                       (progn (setf x (incf i)) 4)
+                       (progn (setf y (incf i)) 5)
+                       (progn (setf z (incf i)) 6))
+                      i u v w x y z)))
+                  '(t 6 1 2 3 4 5 6))
+  ;; CLHS §12.2: comparisons of zero or one arg return T vacuously.
+  ;; Single arg is still evaluated (for side effects + numeric type).
+  (rt-run-test 3914 (< -2) t)
+  (rt-run-test 3915 (< 5) t)
+  (rt-run-test 3916 (let ((i 0)) (< (progn (incf i) 5)) i) 1)
+  ;; #'< funcall — the wrapper used to be the fixed-arity %LT-FN
+  ;; which mis-handles 1-arg and 0-arg.  Now resolves to the
+  ;; variadic ansi-bridge defun.
+  (rt-run-test 3917 (funcall #'< -2) t)
+  (rt-run-test 3918 (funcall #'<) t)
+  (rt-run-test 3919 (apply #'< '(-2)) t)
+  ;; apply over a long list (beyond the cl-printer apply defun's
+  ;; 20-rung cond ladder).  The compile-time apply intercept builds
+  ;; the rest at runtime and passes V0=list + nargs-sentinel.
+  (rt-run-test 3920 (apply #'< (loop for i from 1 to 25 collect i)) t)
+  (rt-run-test 3921 (apply #'< (loop for i from 1 to 25 collect 17)) nil)
+  (rt-run-test 3922 (apply #'= (loop for i from 1 to 100 collect 7)) t)
+  ;; The =.7 / =.8 / <.7 / <=.7 shapes (apply over growing list).
+  (rt-run-test 3923
+               (let ((args nil) (result t))
+                 (loop for i from 1 to 50
+                       do (push 17 args)
+                       do (unless (apply #'= args) (setf result nil)))
+                 result)
+               t)
+  ;; (and (not (apply #'< 17s)) (apply #'< descending-negatives)).
+  (rt-run-test 3924
+               (let ((args (list 17)) (args2 nil) (result :ok))
+                 (loop for i from 2 to 30
+                       do (push 17 args)
+                       do (push (- i) args2)
+                       unless (and (not (apply #'< args))
+                                   (apply #'< args2))
+                       do (setf result (cons i (cons args (cons args2 nil)))))
+                 result)
+               :ok))
 
 (defun run-format-tests ()
   ;; format returns nil

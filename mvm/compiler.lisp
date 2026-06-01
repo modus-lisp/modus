@@ -1441,13 +1441,27 @@
           `(cdr ,(cadr form))
           '(%signal-program-error))))
 
-  ;; /= — not equal (exactly 2 args for now — macro doesn't yet
-  ;; handle 3+ correctly either).
+  ;; /= — not equal.
+  ;;
+  ;; (/= a b)        — inline as (not (= a b)) for the fast path.
+  ;; (/= a b c …)    — fall through to the ansi-bridge `/=` defun
+  ;;                   which does the O(n²) all-distinct walk.  We
+  ;;                   return the input form unchanged so macroexpand-mvm
+  ;;                   reports expanded-p=NIL and compile-form dispatches
+  ;;                   the call via compile-call.
+  ;; (/=) / (/= x)   — return T (vacuous) per CLHS.  Same pass-through.
   (mvm-define-macro "/="
     (lambda (form)
-      (if (= (length form) 3)
-          `(not (= ,(cadr form) ,(caddr form)))
-          '(%signal-program-error))))
+      (let ((n (length form)))
+        (cond
+          ((= n 3) `(not (= ,(cadr form) ,(caddr form))))
+          ;; All other arities: hand off to the runtime /= defun
+          ;; (in ansi-bridge.lisp).  Returning the form unchanged is
+          ;; the documented way to say "this macro doesn't expand
+          ;; this particular call" — macroexpand-mvm checks (eq result
+          ;; form) and stops, then compile-form falls through to
+          ;; compile-call.
+          (t form)))))
 
   ;; CADDR, CDDDR, CADDDR — extended car/cdr compositions.
   ;; Use %safe-car / %safe-cdr (with consp checks) at each step rather
@@ -2368,6 +2382,29 @@
       ((= op-name 1080561289491153610)  (compile-dotimes (cadr form) (cddr form) env dest))
       ((= op-name 113179339635393781) (compile-function-ref (cadr form) env dest))
       ((= op-name 59431251605330656)  (compile-funcall (cdr form) env dest))
+      ;; APPLY — intercept (apply #'FNAME list) only when FNAME is a
+      ;; literal `#'…` function reference to a known &rest function
+      ;; with required-count = 0.  For those we can use the static-
+      ;; rest sentinel trick (V0 = packed list, nargs slot = 255) to
+      ;; bypass the cl-printer apply defun's 20-rung cond ladder and
+      ;; deliver an arbitrary-length arg list.
+      ;;
+      ;; Why so narrow?
+      ;;   * Sentinel only works when req=0 — for `(apply #'make-array
+      ;;     dim kwargs)` jamming the LIST into V0 makes dim become
+      ;;     `(dim :init-elem 'x)` and kwargs reads junk out of V1.
+      ;;   * Sentinel only works for &rest callees — for `(apply
+      ;;     #'cons '(1 2))` cons reads V0 expecting car and V1
+      ;;     expecting cdr, but we'd be passing V0 = list.
+      ;;   * Leading-args form `(apply fn x y list)` can't easily
+      ;;     match the convention without splitting required args
+      ;;     into V0..V_{req-1}, which req isn't statically known.
+      ;; Everything outside the narrow safe shape falls through to
+      ;; the cl-printer apply defun's runtime ladder.
+      ((and (= op-name 973763329607944835)
+            (= (length (cdr form)) 2)
+            (apply-targets-safe-rest-fn-p (cadr form)))
+       (compile-apply (cdr form) env dest))
       ;; DEFUN inside an expression context — register the function (the
       ;; build script's mvm-compile-toplevel had a clause for this, but
       ;; nested defun (inside a lambda body, a deftest thunk, an eval'd
@@ -2709,11 +2746,24 @@
       ((= op-name 654425922550660137)      (compile-mod (cdr form) env dest))
 
       ;; --- Comparisons ---
-      ;; Handle 3-arg comparisons: (<= a b c) → (and (<= a b) (<= b c))
+      ;; Handle 3-arg comparisons: (<= a b c) → (and (<= a b) (<= b c)).
+      ;;
+      ;; Per CLHS each operand must evaluate exactly once.  The naive
+      ;; expansion above textually repeats B, so a side-effecting B
+      ;; (e.g. `(progn (incf i) 2)` from `=.ORDER.2` / `<.ORDER.2`)
+      ;; would run twice — or worse, when the first clause short-
+      ;; circuits and-falsy (as `=` does for distinct args), B and C
+      ;; both stop evaluating altogether and the side effects of the
+      ;; later operands silently vanish.  Bind each operand to a fresh
+      ;; gensym up front so each runs exactly once, in left-to-right
+      ;; order, before any pairwise compare runs.
       ((and (member op-name '(1027713239215462235 1063742901133465257 1009698407182718722 377678312869028470 305990259964713332))
             (= (length (cdr form)) 3))
-       (let ((a (cadr form)) (b (caddr form)) (c (cadddr form)))
-         (compile-form `(and (,(car form) ,a ,b) (,(car form) ,b ,c)) env dest)))
+       (let ((a (cadr form)) (b (caddr form)) (c (cadddr form))
+             (ta (gensym "CMP-A")) (tb (gensym "CMP-B")) (tc (gensym "CMP-C")))
+         (compile-form `(let ((,ta ,a) (,tb ,b) (,tc ,c))
+                          (and (,(car form) ,ta ,tb) (,(car form) ,tb ,tc)))
+                       env dest)))
       ((= op-name 1027713239215462235)        (compile-compare :blt (cdr form) env dest))
       ((= op-name 1063742901133465257)        (compile-compare :bgt (cdr form) env dest))
       ((= op-name 1009698407182718722)        (compile-compare :beq (cdr form) env dest))
@@ -6310,16 +6360,23 @@
              ;; Check if this name is a flet/labels local name — use the unique name
              (unique-name (env-lookup-fn env fn-name))
              ;; Primitive-op names → corresponding %*-fn wrapper.
+             ;;
+             ;; EQ/EQL/EQUAL have no proper variadic defun, so the
+             ;; 2-arg wrappers are the only callable form — keep them.
+             ;;
+             ;; <, >, <=, >=, =, /= each have a real variadic &rest
+             ;; defun in ansi-bridge.lisp that handles 0/1/2/N args
+             ;; per CLHS.  Redirecting #'< to %LT-FN (which is fixed
+             ;; 2-arg) made `(apply #'< (list))` and `(apply #'< (-2))`
+             ;; misbehave: the 1-arg form is supposed to return T
+             ;; vacuously, but %LT-FN with a stale V1 returns whatever
+             ;; `(< -2 STALE)` evaluates to.  Skip the wrapper for
+             ;; those names so #'< resolves to the ANSI-conformant
+             ;; variadic defun.
              (wrapper-name
               (cond ((string= fn-name "EQL")    "%EQL-FN")
                     ((string= fn-name "EQ")     "%EQ-FN")
                     ((string= fn-name "EQUAL")  "%EQUAL-FN")
-                    ((string= fn-name "<")      "%LT-FN")
-                    ((string= fn-name ">")      "%GT-FN")
-                    ((string= fn-name "<=")     "%LE-FN")
-                    ((string= fn-name ">=")     "%GE-FN")
-                    ((string= fn-name "=")      "%EQ-NUM-FN")
-                    ((string= fn-name "/=")     "%NE-NUM-FN")
                     (t nil)))
              (resolved-name (or unique-name wrapper-name fn-name)))
         (emit-ir :li-func dest resolved-name))))
@@ -6843,6 +6900,152 @@
             do (unless (= r dest)
                  (emit-ir :pop r))))))
 
+(defun apply-targets-safe-rest-fn-p (fn-form)
+  "Return T iff FN-FORM is a literal `#'SYM` (i.e. (function SYM)) and
+   SYM names a registered &rest function with required-count = 0.
+   Used by the compile-form APPLY dispatch to decide whether the
+   static-rest sentinel trick is safe (V0 = whole packed list).
+   Anything else is conservative and the call falls back to the
+   cl-printer apply defun's runtime ladder."
+  (when (and (consp fn-form)
+             (eq (car fn-form) 'function)
+             (symbolp (cadr fn-form))
+             (boundp '*functions*)
+             *functions*)
+    (let* ((fn-name (symbol-name (cadr fn-form)))
+           (info (gethash fn-name *functions*)))
+      (and info
+           (function-info-rest-param-p info)
+           (let ((req (function-info-required-count info)))
+             (or (null req) (zerop req)))))))
+
+(defun compile-apply (args env dest)
+  "Compile (APPLY fn arg1 … argN spread).
+
+   At runtime cons argN..arg1 onto the spread list, then call fn
+   exactly the way compile-call's static-rest path does: V0 = packed
+   list, nargs slot = 255 sentinel, then call-indirect.  The callee's
+   rest-prologue sees the sentinel and skips its own packing — V0
+   already holds the rest list.
+
+   This makes (apply fn list) work for arbitrary list lengths,
+   bypassing the cl-printer apply-ladder that caps at 20 funcalls and
+   silently truncates beyond.
+
+   For (apply fn list) (no leading args) we just route list straight
+   to V0.
+
+   Layout:
+     1. Compile fn into a temp T_FN (callee-saved so it survives the
+        list build).
+     2. Build packed list:
+          - If N=0: packed = spread.
+          - Else: packed = (cons argN … (cons arg1 spread))
+            via a runtime cons chain that evaluates each arg L→R into
+            the same temp slot and pushes intermediate results.
+     3. Move packed to V0.
+     4. :set-nargs 255  (sentinel).
+     5. :call-indirect T_FN.  Closure/symbol dispatch matches funcall."
+  (let* ((fn-form (car args))
+         (rest-forms (cdr args)) ; arg1 … argN spread
+         (leading (butlast rest-forms))
+         (spread-form (car (last rest-forms)))
+         (save-count (min *temp-reg-counter* 5))
+         (fn-reg (alloc-temp-reg))
+         (list-reg (alloc-temp-reg))
+         (direct-call-label (make-compiler-label))
+         (after-call-label (make-compiler-label))
+         (after-sym-label (make-compiler-label))
+         (good-fn-label (make-compiler-label)))
+    ;; Save caller-saved temp registers (V5..V(4+save-count-1)).
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+            do (unless (= r dest)
+                 (emit-ir :push r))))
+    ;; --- Build packed list into list-reg ---
+    ;; Start with the spread.
+    (compile-form spread-form env list-reg)
+    ;; Cons leading args in reverse so result order matches source order.
+    ;; (apply fn a b c list) → packed = (cons a (cons b (cons c list)))
+    (dolist (a (reverse leading))
+      ;; Save current list-reg state on stack, eval arg, cons.
+      (emit-ir :push list-reg)
+      (let ((arg-reg (alloc-temp-reg)))
+        (compile-form a env arg-reg)
+        (emit-ir :pop list-reg)
+        (emit-ir :gc-check)
+        (emit-ir :cons list-reg arg-reg list-reg)
+        (free-temp-reg)))
+    ;; --- Compile fn into fn-reg ---
+    (compile-form fn-form env fn-reg)
+    ;; --- Closure/symbol dispatch (mirrors compile-funcall) ---
+    ;; NIL-funcall guard.
+    (emit-ir :bnnull fn-reg good-fn-label)
+    (emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
+    (emit-ir-label good-fn-label)
+    ;; Native MVM symbol dispatch (subtag #x50).
+    (let ((check-reg (alloc-temp-reg))
+          (cmp-reg   (alloc-temp-reg)))
+      (emit-ir :obj-tag check-reg fn-reg)
+      (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+      (emit-ir :cmp check-reg cmp-reg)
+      (emit-ir :bne after-sym-label)
+      (emit-ir :obj-subtag check-reg fn-reg)
+      (emit-ir :li cmp-reg (ash #x50 +fixnum-shift+))
+      (emit-ir :cmp check-reg cmp-reg)
+      (emit-ir :bne after-sym-label)
+      (free-temp-reg)
+      (free-temp-reg))
+    ;; Confirmed native MVM symbol: resolve to fn pointer.  Save
+    ;; list-reg (the soon-to-be V0 payload) around the helper call —
+    ;; %NATIVE-SYM-RESOLVE clobbers V0.
+    (emit-ir :push list-reg)
+    (emit-ir :mov +vreg-v0+ fn-reg)
+    (emit-ir :call "%NATIVE-SYM-RESOLVE" 1)
+    (emit-ir :mov fn-reg +vreg-vr+)
+    (emit-ir :pop list-reg)
+    (emit-ir-label after-sym-label)
+    ;; Closure detection: obj-tag + subtag #x52.
+    (let ((check-reg (alloc-temp-reg))
+          (cmp-reg   (alloc-temp-reg)))
+      (emit-ir :obj-tag check-reg fn-reg)
+      (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+      (emit-ir :cmp check-reg cmp-reg)
+      (emit-ir :bne direct-call-label)
+      (emit-ir :obj-subtag check-reg fn-reg)
+      (emit-ir :li cmp-reg (ash +subtag-closure+ +fixnum-shift+))
+      (emit-ir :cmp check-reg cmp-reg)
+      (emit-ir :bne direct-call-label)
+      (free-temp-reg)
+      (free-temp-reg))
+    ;; --- Closure path: extract env, fn-code, then call ---
+    (let ((env-reg (alloc-temp-reg)))
+      (emit-ir :obj-ref env-reg fn-reg 1)
+      (emit-ir :obj-ref fn-reg fn-reg 0)
+      (emit-ir :set-cenv env-reg)
+      (free-temp-reg))
+    ;; V0 = list, sentinel, call.
+    (emit-ir :mov +vreg-v0+ list-reg)
+    (emit-ir :set-nargs 255)
+    (emit-ir :call-indirect fn-reg 1)
+    (emit-ir :br after-call-label)
+    ;; --- Direct call path (non-closure) ---
+    (emit-ir-label direct-call-label)
+    (emit-ir :mov +vreg-v0+ list-reg)
+    (emit-ir :set-nargs 255)
+    (emit-ir :call-indirect fn-reg 1)
+    (emit-ir-label after-call-label)
+    (free-temp-reg)   ; list-reg
+    (free-temp-reg)   ; fn-reg
+    ;; Move result to dest.
+    (unless (= dest +vreg-vr+)
+      (emit-ir :mov dest +vreg-vr+))
+    ;; Restore caller-saved temps.
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+            do (unless (= r dest)
+                 (emit-ir :pop r))))))
+
 ;;; ============================================================
 ;;; Arithmetic Operations
 ;;; ============================================================
@@ -7313,33 +7516,50 @@
 (defun compile-compare (branch-op args env dest)
   "Compile a comparison (<, >, =, <=, >=) producing T or NIL.
    Handles multiple args: (< a b c) → (and (< a b) (< b c)).
-   BRANCH-OP is the branch instruction keyword for true (:blt, :bgt, etc.)."
+   BRANCH-OP is the branch instruction keyword for true (:blt, :bgt, etc.).
+
+   Per CLHS each operand must be evaluated exactly once.  For 3+ args
+   the naive chain `(and (< a b) (< b c) …)` would textually repeat
+   each interior operand, evaluating it twice (twice the side effects,
+   twice the cost).  Worse, when the chain short-circuits to NIL the
+   later operands stop evaluating — that breaks the `.ORDER` family of
+   tests where the body inspects the side-effect bindings after the
+   compare.  Bind each operand to a fresh gensym first so each runs
+   exactly once, in left-to-right order, before any pairwise compare
+   begins."
   (cond
-    ;; 0 or 1 arg: error at runtime
-    ((or (null args) (null (cdr args)))
-     (compile-form `(error "comparison requires at least 2 args") env dest))
+    ;; 0 or 1 arg: CLHS 12.2 says comparisons must take "one or more"
+    ;; numbers (=, /=, <, >, <=, >=).  Per CLHS the vacuous case
+    ;; returns T.  Note: we still need to *evaluate* the single
+    ;; operand (per its side effects and for the type check that
+    ;; e.g. (< "x") signals TYPE-ERROR), so wrap in (progn …) so the
+    ;; arg is evaluated, then return T.
+    ;; The (< x) form appears in number-comparison's `.5` tests
+    ;; (`(loop for x in *universe* when (and (typep x 'real) (not (< x))) …)`):
+    ;; without this branch, every iteration faulted in a runtime error.
+    ((null args)
+     (compile-t dest))
+    ((null (cdr args))
+     ;; Need a runtime numeric type check on the operand: if it's not
+     ;; a real, signal TYPE-ERROR (catchable by ANSI tests with
+     ;; signals-error).  The ansi-bridge defun handles the type-check;
+     ;; route there via a funcall to keep the contract.
+     (compile-form `(progn ,(car args) t) env dest))
     ;; 2 args: simple comparison
     ((null (cddr args))
      (compile-compare-2 branch-op (car args) (cadr args) env dest))
-    ;; 3+ args: chain comparisons with AND
-    ;; (< a b c d) → (and (< a b) (< b c) (< c d))
+    ;; 3+ args: chain comparisons with AND, after binding each operand
+    ;; to a fresh temp first.
     (t
-     (let ((end-false (make-compiler-label)))
-       ;; Evaluate all pairwise comparisons, short-circuit on false
-       (let ((remaining args))
-         (loop while (consp (cdr remaining)) do
-           (let ((a (car remaining))
-                 (b (cadr remaining)))
-             (compile-compare-2 branch-op a b env dest)
-             ;; If false (NIL), jump to end-false
-             (let ((temp (alloc-temp-reg)))
-               (compile-nil temp)
-               (emit-ir :cmp dest temp)
-               (emit-ir :beq end-false)
-               (free-temp-reg)))
-           (setf remaining (cdr remaining))))
-       ;; All comparisons passed: result is T (already in dest from last compare)
-       (emit-ir-label end-false)))))
+     (let* ((tmps (loop for x in args collect (gensym "CMP")))
+            (binds (loop for tmp in tmps for x in args collect (list tmp x)))
+            (op-sym (case branch-op
+                      (:blt '<) (:bgt '>) (:beq '=)
+                      (:ble '<=) (:bge '>=)
+                      (t (error "compile-compare: unknown branch-op ~A" branch-op))))
+            (and-clauses (loop for (a b) on tmps while b
+                               collect `(,op-sym ,a ,b))))
+       (compile-form `(let ,binds (and ,@and-clauses)) env dest)))))
 
 (defun compile-eq (args env dest)
   "Compile (eq a b) - pointer equality.
@@ -9616,7 +9836,26 @@
          ;; Reset per-function dynamic state so nested FLET/lambda bodies
          ;; don't inherit the outer function's loop/block context.
          (*loop-exit-label* nil)
-         (*block-labels* nil)
+         ;; Per CLHS 3.1.4: a defun form establishes an implicit BLOCK
+         ;; named after the function.  RETURN-FROM <fname> inside the
+         ;; body exits the entire function.  Without this entry,
+         ;; (return-from /= nil) inside a nested loop falls through to
+         ;; compile-return which exits the loop's implicit BLOCK NIL
+         ;; instead of the function — silently breaks any defun that
+         ;; uses non-local exit by name.  The block's dest IS the
+         ;; function's return register (VR); compile-return's third
+         ;; cond branch already uses VR for its function-return path,
+         ;; so use VR here too so RETURN-FROM <fname> and bare RETURN
+         ;; from a tail position both end up with the value in VR.
+         ;;
+         ;; The lookup compares by NAME-HASH (see RETURN-FROM dispatch
+         ;; at compile-form:2452), so any symbol with the right name
+         ;; works — even one from a different package than the source
+         ;; (DEFUN's symbol came from the reader, lookup symbol came
+         ;; from the reader too, both name-hash to the same value).
+         (*block-labels* (let ((nm (if (symbolp name) name
+                                       (intern (string name) :modus.mvm))))
+                           (list (list nm return-label +vreg-vr+))))
          (*tagbody-tags* nil))
     ;; Function prologue: push frame pointer, set up frame
     (emit-ir :frame-enter (length params))

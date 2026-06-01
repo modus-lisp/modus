@@ -317,6 +317,49 @@
     ((eq case :downcase) (%ch-to-lower ch))
     (t ch)))
 
+;;; Escape policy under *print-escape* / *print-readably*.  A symbol
+;;; name needs an escape (per CLHS 22.1.3.2) when:
+;;;   (a) any alphabetic character is out of the readtable case —
+;;;       printing it verbatim would change interpretation on read, or
+;;;   (b) the first character is a digit — the name would parse as a
+;;;       number on read, or
+;;;   (c) the name is empty.
+;;; Under :preserve / :invert, alpha chars never need readtable-case
+;;; escapes (the readtable does no case folding); the leading-digit
+;;; rule still applies.  This predicate stays neutral about which
+;;; escape style (`\X` vs `|name|`) the caller chooses; the
+;;; print-symbols / prin1.symbol tests accept either.
+(defun %name-needs-rcase-escape-p (name rc)
+  (let ((len (array-length name)))
+    (cond
+      ((= len 0) t)
+      (t
+       (let ((needs nil) (i 0))
+         (loop
+           (when (or needs (= i len)) (return needs))
+           (let ((ch (aref name i)))
+             (when (and (= i 0) (>= ch 48) (<= ch 57))
+               (setq needs t))
+             (when (and (not needs) (%ch-alphap ch))
+               (cond ((eq rc :upcase)
+                      (when (%ch-lowerp ch) (setq needs t)))
+                     ((eq rc :downcase)
+                      (when (%ch-upperp ch) (setq needs t))))))
+           (setq i (+ i 1))))))))
+
+;;; Emit a symbol name wrapped in `|…|` when *print-escape* /
+;;; *print-readably* + the readtable-case combination would otherwise
+;;; lose information on read-back.  Falls through to the matrix
+;;; (no-escape) path when escape is off OR when no character needs it.
+(defun %print-symbol-name-maybe-escape (name stream case rc escape readably)
+  (cond
+    ((and (or escape readably) (%name-needs-rcase-escape-p name rc))
+     (%print-char 124 stream)  ; |
+     (%print-string-raw name stream)
+     (%print-char 124 stream)) ; |
+    (t
+     (%print-symbol-name-matrix name stream case rc))))
+
 ;;; Check if a symbol name needs escaping (contains special chars)
 (defun %sym-name-needs-escape-p (name)
   (let ((len (array-length name)) (i 0) (needs-escape nil))
@@ -345,8 +388,10 @@
                (not (characterp sym)) (not (stringp sym))
                (= (obj-subtag sym) 83))   ; #x53 keyword
       (%print-char 58 stream)             ; :
-      (let ((name (symbol-name sym)))
-        (%print-symbol-name-with-case name stream *print-case*))
+      (let* ((name (symbol-name sym))
+             (rt   *readtable*)
+             (rc   (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
+        (%print-symbol-name-maybe-escape name stream *print-case* rc escape readably))
       (return-from %print-symbol-to-stream nil))
     (let* ((cl-sym-p (%cl-sym-p sym))
            (name (if cl-sym-p (%cl-sym-name sym) (symbol-name sym)))
@@ -390,7 +435,9 @@
                   (or readably escape))
              (%print-char 35 stream) ; #
              (%print-char 58 stream) ; :
-             (%print-symbol-name-with-case name stream case))
+             (let* ((rt *readtable*)
+                    (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
+               (%print-symbol-name-maybe-escape name stream case rc escape readably)))
             ;; Package-qualified
             (need-qualifier
              (let ((pkg-name (if (%pkg-p pkg) (package-name pkg) "")))
@@ -404,10 +451,14 @@
                      (%print-char 58 stream)  ; :
                      (progn (%print-char 58 stream)  ; ::
                             (%print-char 58 stream))))
-               (%print-symbol-name-with-case name stream case)))
+               (let* ((rt *readtable*)
+                    (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
+               (%print-symbol-name-maybe-escape name stream case rc escape readably))))
             ;; No qualifier needed
             (t
-             (%print-symbol-name-with-case name stream case))))))))
+             (let* ((rt *readtable*)
+                    (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
+               (%print-symbol-name-maybe-escape name stream case rc escape readably)))))))))
 
 ;;; Check if symbol is external in package
 (defun %pkg-sym-external-p (pkg sym)

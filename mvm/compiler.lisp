@@ -3488,19 +3488,33 @@
    names to watch for."
   (cond
     ((not (consp form)) nil)
-    ;; (setq var val), (incf var ...), (decf var ...) — var is being mutated
+    ;; (setq var val), (setf var val), (incf var …), (decf var …),
+    ;; (push x var), (pop var), (pushnew x var) — all mutate `var`.
+    ;; Macro expansion happens AFTER cell-rewrite, so we have to spot
+    ;; these by source-form name here.  Push/pop are the common
+    ;; pattern in the map-into / mapcar-with-side-effects tests.
     ((and (consp form) (consp (cdr form))
           (let ((op (car form)))
             (or (and (symbolp op)
                      (or (string= (symbol-name op) "SETQ")
                          (string= (symbol-name op) "SETF")
                          (string= (symbol-name op) "INCF")
-                         (string= (symbol-name op) "DECF")))
+                         (string= (symbol-name op) "DECF")
+                         (string= (symbol-name op) "PUSH")
+                         (string= (symbol-name op) "POP")
+                         (string= (symbol-name op) "PUSHNEW")))
                 (and (integerp op) (= op 565254038635891948)))))  ; setq hash
-     (let ((var (cadr form))
-           (rest (apply #'append
-                        (mapcar (lambda (f) (collect-setq-vars-in-body f bound-vars))
-                                (cddr form)))))
+     (let* ((op (car form))
+            ;; PUSH and PUSHNEW: var is 2nd cdr-arg, not 1st (push expects
+            ;; (push value place); pop is (pop place)).
+            (var (cond ((and (symbolp op)
+                             (or (string= (symbol-name op) "PUSH")
+                                 (string= (symbol-name op) "PUSHNEW")))
+                        (caddr form))
+                       (t (cadr form))))
+            (rest (apply #'append
+                         (mapcar (lambda (f) (collect-setq-vars-in-body f bound-vars))
+                                 (cddr form)))))
        (if (and (symbolp var) (member var bound-vars :test #'name-equal))
            (adjoin var rest :test #'name-equal)
            rest)))
@@ -3560,6 +3574,16 @@
                         (and (integerp op) (= op 518921307293258709)))
                     nil)
                    (t
+                    ;; A compound `op` shows up when `form` is a binding pair
+                    ;; like `(F (LAMBDA …))` — the walker descends from
+                    ;; `(LET ((F (LAMBDA …))) …)` to its bindings list to that
+                    ;; pair, and the head `F` is read as `op`.  Without this
+                    ;; clause `op` itself is never scanned, the LAMBDA inside
+                    ;; the pair is invisible, and the boxed-var detection
+                    ;; misses every mutating lambda hidden in a let / let* /
+                    ;; flet / labels bindings list.  Probes 9761-9764, 9766
+                    ;; flipped FAIL → PASS with this one line.
+                    (when (consp op) (scan op in-lambda))
                     ;; cdr might be a symbol (dotted pair like (,X . D)) — guard
                     (let ((rest (cdr form)))
                       (loop while (consp rest) do
@@ -3699,6 +3723,32 @@
                          (- (car ,(cell-var-name var))
                             ,(cell-rewrite-form delta boxed-vars lambda-params)))
                 `(decf ,var ,(cell-rewrite-form delta boxed-vars lambda-params)))))
+         ;; (push value place) — if place is a boxed var, rewrite to
+         ;; (set-car %CELL-V (cons value (car %CELL-V))).  The map-into /
+         ;; mapcar-with-side-effects tests pass closures shaped exactly
+         ;; like `(lambda (x) (push x acc) x)` where acc is let-bound
+         ;; and boxed; without explicit rewriting here, push's
+         ;; macro-expansion sees the original (read-only) acc and the
+         ;; mutation is invisible to the outer scope.
+         ((and (symbolp op) (string= (symbol-name op) "PUSH"))
+          (let ((val (cadr form))
+                (var (caddr form)))
+            (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
+                `(set-car ,(cell-var-name var)
+                         (cons ,(cell-rewrite-form val boxed-vars lambda-params)
+                               (car ,(cell-var-name var))))
+                `(push ,(cell-rewrite-form val boxed-vars lambda-params)
+                       ,(cell-rewrite-form var boxed-vars lambda-params)))))
+         ;; (pop place) — if place is a boxed var, return (car (car %CELL))
+         ;; while updating it to (cdr (car %CELL)).  Wrap in a let so the
+         ;; old head is returned per CL semantics.
+         ((and (symbolp op) (string= (symbol-name op) "POP"))
+          (let ((var (cadr form)))
+            (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
+                `(let ((%popped (car (car ,(cell-var-name var)))))
+                   (set-car ,(cell-var-name var) (cdr (car ,(cell-var-name var))))
+                   %popped)
+                `(pop ,(cell-rewrite-form var boxed-vars lambda-params)))))
          ;; lambda — shadow boxed-vars with lambda params
          ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
               (and (integerp op) (= op 527981956251550024)))

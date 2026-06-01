@@ -2171,7 +2171,29 @@
            (a10 (and r10 (car r10)))
            (r11 (and r10 (cdr r10)))
            (a11 (and r11 (car r11)))
-           (r12 (and r11 (cdr r11))))
+           (r12 (and r11 (cdr r11)))
+           ;; Ladder extended 12 → 20 (2026-06-01) — funcall n=13..16
+           ;; verified working; apply truncating at 12 was blocking
+           ;; number-comparison `(apply #'= (N args))` tests and
+           ;; plus.8 `(apply #'+ args)` arithmetic.  Beyond 20 still
+           ;; truncates; a real %spread-call primitive remains the
+           ;; right long-term fix.
+           (a12 (and r12 (car r12)))
+           (r13 (and r12 (cdr r12)))
+           (a13 (and r13 (car r13)))
+           (r14 (and r13 (cdr r13)))
+           (a14 (and r14 (car r14)))
+           (r15 (and r14 (cdr r14)))
+           (a15 (and r15 (car r15)))
+           (r16 (and r15 (cdr r15)))
+           (a16 (and r16 (car r16)))
+           (r17 (and r16 (cdr r16)))
+           (a17 (and r17 (car r17)))
+           (r18 (and r17 (cdr r17)))
+           (a18 (and r18 (car r18)))
+           (r19 (and r18 (cdr r18)))
+           (a19 (and r19 (car r19)))
+           (r20 (and r19 (cdr r19))))
       (cond
         ((null all-args) (funcall fn))
         ((null r1) (funcall fn a0))
@@ -2186,7 +2208,15 @@
         ((null r10) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9))
         ((null r11) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10))
         ((null r12) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11))
-        (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11))))))
+        ((null r13) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12))
+        ((null r14) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13))
+        ((null r15) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14))
+        ((null r16) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15))
+        ((null r17) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16))
+        ((null r18) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17))
+        ((null r19) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18))
+        ((null r20) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19))
+        (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19))))))
 
 (defun terpri (&rest stream-arg)
   (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))

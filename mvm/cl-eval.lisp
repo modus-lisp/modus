@@ -2326,9 +2326,21 @@
    important for tests like (expt 10 20) = 10^20 ≈ 2^66 which
    silently truncated under plain (* r base) before.  Negative
    integer power returns 1/expt(base, -power) as a ratio.  Ratio
-   power approximated as exp(power * log base)."
+   power approximated as exp(power * log base).
+
+   CLHS expt: (expt x 0) returns 1 of an appropriate type — if
+   either operand is a float, the result is a float; if both are
+   rational (including complex/integer), the result is integer 1.
+   Tests EXPT.3-6/18-27 hinge on the float-1 case."
   (cond
-    ((= power 0) 1)
+    ((= power 0)
+     (cond
+       ;; Float base or float power → float 1.0.  Modus has a single
+       ;; IEEE precision so we don't model short/single/double/long
+       ;; separately; (float 1 anything) collapses to the same object.
+       ((or (%ieee-float-p base) (%ieee-float-p power))
+        (%float-from-int 1))
+       (t 1)))
     ((= power 1) base)
     ((and (integerp power) (> power 0) (integerp base))
      (let ((r 1))

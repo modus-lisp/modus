@@ -318,11 +318,47 @@
               count chunks)
       src)))
 
+(defun %scan-ansi-test-dir-host (dir)
+  "Walk every *.lsp file in DIR (one chapter directory) with the SBCL
+   reader and harvest symbol names, just like %scan-symbol-names-host but
+   from disk.  Used to ensure ANSI test-file symbols (e.g. literal
+   `'|XYZ|') have their names populated in *sym-name-table* so the
+   printer's SYMBOL-NAME doesn't return \"\" for them."
+  (let ((tbl (make-hash-table :test 'equal)))
+    (when (probe-file dir)
+      (dolist (f (directory (concatenate 'string dir "*.lsp")))
+        (handler-case
+            (let ((src (with-output-to-string (o)
+                         (with-open-file (s f :direction :input)
+                           (loop for line = (read-line s nil :eof)
+                                 until (eq line :eof)
+                                 do (write-line line o))))))
+              (let ((found (%scan-symbol-names-host src)))
+                (maphash (lambda (k v) (declare (ignore v))
+                           (setf (gethash k tbl) t))
+                         found)))
+          (error () nil))))
+    tbl))
+
 (defvar *sym-name-auto-source*
   (let ((tbl (make-hash-table :test 'equal)))
     (dolist (src (list *prelude-source* *gc-source* *rt-source*
                        *bridge-source* *test-source*))
       (let ((found (%scan-symbol-names-host src)))
+        (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
+                 found)))
+    ;; Also scan ANSI test files so test-only symbol literals (e.g.
+    ;; `'|XYZ|' from print-symbols.lsp) have their name strings in
+    ;; *SYM-NAME-TABLE* — otherwise SYMBOL-NAME returns "" for them
+    ;; and the printer emits empty output, failing CLHS §22.1.3.3
+    ;; symbol-printing tests.
+    (dolist (d '("/tmp/ansi-test/printer/"
+                 "/tmp/ansi-test/printer/format/"
+                 "/tmp/ansi-test/symbols/"
+                 "/tmp/ansi-test/packages/"
+                 "/tmp/ansi-test/reader/"
+                 "/tmp/ansi-test/auxiliary/"))
+      (let ((found (%scan-ansi-test-dir-host d)))
         (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
                  found)))
     (multiple-value-bind (src count chunks)

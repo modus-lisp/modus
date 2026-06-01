@@ -175,44 +175,147 @@
        (%print-decimal-to-stream base stream)
        (%print-char 114 stream))))  ; #Nr
 
-;;; Apply *print-case* to a symbol name character
-(defun %apply-print-case (ch case readtable-case)
-  ;; ch is a char code
-  ;; CL spec: interaction between readtable-case and *print-case*
-  ;; Simple approach: just apply *print-case* directly
-  (cond
-    ((eq case :upcase)
-     (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch))
-    ((eq case :downcase)
-     (if (and (>= ch 65) (<= ch 90)) (+ ch 32) ch))
-    ((eq case :capitalize)
-     ch)  ; handled per-word
-    (t ch)))  ; :preserve
+;;; Char-class predicates (use char codes; alpha test is ASCII-only,
+;;; which matches the rest of the printer/reader).
+(defun %ch-upperp (c) (and (>= c 65) (<= c 90)))
+(defun %ch-lowerp (c) (and (>= c 97) (<= c 122)))
+(defun %ch-alphap (c) (or (%ch-upperp c) (%ch-lowerp c)))
+(defun %ch-to-upper (c) (if (%ch-lowerp c) (- c 32) c))
+(defun %ch-to-lower (c) (if (%ch-upperp c) (+ c 32) c))
 
-;;; Print a symbol name applying *print-case*
+;;; Scan a name string and classify its case content.
+;;; Returns one of :all-upper, :all-lower, :mixed, :no-alpha.
+(defun %sym-name-case-class (name)
+  (let ((len (array-length name)) (i 0)
+        (has-upper nil) (has-lower nil))
+    (loop
+      (when (= i len) (return nil))
+      (let ((c (aref name i)))
+        (cond ((%ch-upperp c) (setq has-upper t))
+              ((%ch-lowerp c) (setq has-lower t))))
+      (setq i (+ i 1)))
+    (cond ((and has-upper has-lower) :mixed)
+          (has-upper :all-upper)
+          (has-lower :all-lower)
+          (t :no-alpha))))
+
+;;; Print a symbol name applying the (readtable-case × *print-case*)
+;;; matrix from CLHS §22.1.3.3.1.
+;;;
+;;; The pipeline is two-stage:
+;;;   1. Readtable-case decides, per character, whether that char "matches
+;;;      the readtable case" — only matching chars are touched by
+;;;      *print-case*; non-matching chars print verbatim.
+;;;      :preserve  → nothing matches (entire name verbatim).
+;;;      :invert    → if the whole name is one case, invert it and print;
+;;;                   otherwise print verbatim.  (Per CLHS: invert applies
+;;;                   *no* *print-case* transform at all — the inverted
+;;;                   characters are emitted as-is.)
+;;;      :upcase    → uppercase chars are "in case", lowercase pass through
+;;;      :downcase  → lowercase chars are "in case", uppercase pass through
+;;;   2. For :upcase / :downcase readtables, *print-case* maps the matching
+;;;      chars:
+;;;        :upcase     → uppercase
+;;;        :downcase   → lowercase
+;;;        :capitalize → first matching alpha of each "word" uppercase,
+;;;                      remaining matching alphas lowercase; word
+;;;                      boundaries fall on non-alphanumerics.
 (defun %print-symbol-name-with-case (name stream case)
-  (let ((len (array-length name)) (i 0))
-    (if (eq case :capitalize)
-        (let ((at-word-start t))
-          (loop
-            (when (= i len) (return nil))
-            (let ((ch (aref name i)))
-              (let ((alpha (and (>= ch 65)
-                                (or (<= ch 90)
-                                    (and (>= ch 97) (<= ch 122))))))
-                (if alpha
-                    (if at-word-start
-                        (progn
-                          (%print-char (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch) stream)
-                          (setq at-word-start nil))
-                        (%print-char (if (and (>= ch 65) (<= ch 90)) (+ ch 32) ch) stream))
-                    (progn (%print-char ch stream) (setq at-word-start t)))))
-            (setq i (+ i 1))))
-        (loop
-          (when (= i len) (return nil))
-          (let ((ch (aref name i)))
-            (%print-char (%apply-print-case ch case :upcase) stream))
-          (setq i (+ i 1))))))
+  (let ((rt *readtable*))
+    (let ((rc (if (and rt (readtablep rt))
+                  (readtable-case rt)
+                  :upcase)))
+      (%print-symbol-name-matrix name stream case rc))))
+
+;;; Core matrix driver.  Kept separate so callers that want to pass an
+;;; explicit readtable-case (e.g. uninterned-symbol path, or tests) can.
+(defun %print-symbol-name-matrix (name stream case rc)
+  (cond
+    ;; :preserve — every char verbatim
+    ((eq rc :preserve)
+     (%print-string-raw name stream))
+    ;; :invert — if name is monocase, invert it; otherwise verbatim.
+    ;; *print-case* has NO effect under :invert.
+    ((eq rc :invert)
+     (let ((class (%sym-name-case-class name)))
+       (cond
+         ((eq class :all-upper)
+          ;; Invert: upper → lower.  Non-alpha pass through.
+          (let ((len (array-length name)) (i 0))
+            (loop
+              (when (= i len) (return nil))
+              (%print-char (%ch-to-lower (aref name i)) stream)
+              (setq i (+ i 1)))))
+         ((eq class :all-lower)
+          (let ((len (array-length name)) (i 0))
+            (loop
+              (when (= i len) (return nil))
+              (%print-char (%ch-to-upper (aref name i)) stream)
+              (setq i (+ i 1)))))
+         (t  ; :mixed or :no-alpha — verbatim
+          (%print-string-raw name stream)))))
+    ;; :upcase or :downcase readtable.  Build per-char "in-readtable-case"
+    ;; predicate and stream out applying *print-case* to matching chars.
+    (t
+     (%print-name-with-rcase-and-pcase name stream case rc))))
+
+;;; Emit NAME applying *print-case* (CASE) to chars that match RC.
+;;; RC is :upcase or :downcase.
+;;;
+;;; In-case chars:
+;;;   :upcase rc → uppercase chars
+;;;   :downcase rc → lowercase chars
+;;;
+;;; Out-of-case chars pass through verbatim.
+(defun %print-name-with-rcase-and-pcase (name stream case rc)
+  (let ((len (array-length name)) (i 0)
+        (at-word-start t))
+    (loop
+      (when (= i len) (return nil))
+      (let* ((ch (aref name i))
+             (in-case
+               (cond ((eq rc :upcase)   (%ch-upperp ch))
+                     ((eq rc :downcase) (%ch-lowerp ch))
+                     (t nil))))
+        (if (not in-case)
+            ;; Out-of-case: print verbatim.  Word boundary rule for
+            ;; :capitalize — non-alphanumerics reset at-word-start.  An
+            ;; alpha that is out-of-case (the print folder doesn't touch
+            ;; it) still counts as a letter and prevents word-start reset.
+            (progn
+              (%print-char ch stream)
+              (when (eq case :capitalize)
+                (unless (or (%ch-alphap ch)
+                            (and (>= ch 48) (<= ch 57)))  ; digit
+                  (setq at-word-start t))))
+            ;; In-case char: apply *print-case*.
+            (progn
+              (cond
+                ((eq case :upcase)
+                 (%print-char (%ch-to-upper ch) stream))
+                ((eq case :downcase)
+                 (%print-char (%ch-to-lower ch) stream))
+                ((eq case :capitalize)
+                 (if at-word-start
+                     (progn
+                       (%print-char (%ch-to-upper ch) stream)
+                       (setq at-word-start nil))
+                     (%print-char (%ch-to-lower ch) stream)))
+                (t  ; defensive — treat unknown as upcase
+                 (%print-char (%ch-to-upper ch) stream)))
+              (when (eq case :capitalize)
+                (setq at-word-start nil)))))
+      (setq i (+ i 1)))))
+
+;;; Back-compat: %apply-print-case is called from the format-directive
+;;; code (~( ~)) for non-symbol case conversion.  Keep the simple
+;;; character-by-character transform; readtable-case has no role here
+;;; because the input isn't a symbol name.
+(defun %apply-print-case (ch case readtable-case)
+  (cond
+    ((eq case :upcase) (%ch-to-upper ch))
+    ((eq case :downcase) (%ch-to-lower ch))
+    (t ch)))
 
 ;;; Check if a symbol name needs escaping (contains special chars)
 (defun %sym-name-needs-escape-p (name)
@@ -278,9 +381,13 @@
                    nil)))
           (cond
             ;; Uninterned symbol: print #:name (but native-accessible
-            ;; symbols skip this branch)
+            ;; symbols skip this branch).  Per CLHS §22.1.3.2, the #:
+            ;; prefix is an escape — *print-escape* and *print-readably*
+            ;; gate it.  *print-gensym* only matters WHEN escape is on
+            ;; (it controls whether uninterned symbols are distinguished
+            ;; from interned ones in the readable representation).
             ((and (null pkg) (not native-accessible)
-                  (or gensym readably escape))
+                  (or readably escape))
              (%print-char 35 stream) ; #
              (%print-char 58 stream) ; :
              (%print-symbol-name-with-case name stream case))

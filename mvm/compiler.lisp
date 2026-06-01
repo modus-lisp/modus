@@ -1272,6 +1272,17 @@
              (rest (cddr form)))
         (cond
           ;; Long form: (defsetf accessor (vars...) (store-vars) body...)
+          ;; CLHS 5.1.1.2: body forms are MACROEXPANSION-time code that
+          ;; runs once with VARS bound to gensyms for the place-args and
+          ;; STORE-VARS bound to gensyms for the value-form; the body's
+          ;; return value IS the expansion, then wrapped in a let* so
+          ;; the actual args/value are evaluated exactly once
+          ;; left-to-right.  The previous implementation inlined the
+          ;; body forms directly — that worked only when the body was
+          ;; raw setter-call code; bodies that built the expansion via
+          ;; backquote produced a runtime LIST rather than calling the
+          ;; setter.  &optional / &rest / &key in the var lambda-list
+          ;; are not yet supported.
           ((and (consp rest) (consp (car rest)) (consp (cdr rest)) (consp (cadr rest)))
            (let ((vars (car rest))
                  (store-vars (cadr rest))
@@ -1279,19 +1290,35 @@
              ;; Strip docstring if first body element is a string
              (when (and (stringp (car body)) (cdr body))
                (setq body (cdr body)))
+             (when (some (lambda (v)
+                           (and (symbolp v) (member v lambda-list-keywords)))
+                         vars)
+               (error "MVM compiler defsetf long form: lambda-list keywords (~S) not yet supported"
+                      (remove-if-not (lambda (v)
+                                       (and (symbolp v)
+                                            (member v lambda-list-keywords)))
+                                     vars)))
              (mvm-define-setf-expander
                accessor
-               (let ((accessor-name accessor)
-                     (vars-list vars)
+               (let ((vars-list vars)
                      (store-list store-vars)
                      (body-forms body))
                  (lambda (place-args value-form)
-                   (declare (ignore accessor-name))
-                   ;; Bind vars to place-args, store-vars to value
-                   `(let* ,(append
-                             (mapcar #'list vars-list place-args)
-                             (mapcar #'list store-list (list value-form)))
-                      ,@body-forms))))
+                   (let* ((var-gensyms   (mapcar (lambda (v) (gensym (symbol-name v))) vars-list))
+                          (store-gensyms (mapcar (lambda (v) (gensym (symbol-name v))) store-list))
+                          ;; Compile a one-shot lambda whose params are
+                          ;; the original var/store-var names; calling
+                          ;; it with the gensyms makes every reference
+                          ;; in body resolve to a gensym, so a
+                          ;; backquoted body returns a real expansion
+                          ;; form rather than a runtime list-builder.
+                          (expansion
+                            (apply (eval `(lambda ,(append vars-list store-list)
+                                            ,@body-forms))
+                                   (append var-gensyms store-gensyms))))
+                     `(let* (,@(mapcar #'list var-gensyms place-args)
+                             ,@(mapcar #'list store-gensyms (list value-form)))
+                        ,expansion)))))
              `(quote ,accessor)))
           ;; Short form: (defsetf accessor setter-fn [doc])
           ((and (consp rest) (symbolp (car rest)))

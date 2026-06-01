@@ -1528,17 +1528,10 @@
   (write-string-serial "WARN:")
   (write-char-serial 10))
 
-;;; ============================================================
-;;; Format stub (bare-metal)
-;;; ============================================================
-;;;
-;;; Full CL format is not available on bare metal.
-;;; format with nil destination returns nil (no string construction).
-;;; format with t destination writes nothing (stub).
-
-(defun format (dest control-string)
-  "Format stub — on bare metal, does nothing. Returns nil."
-  nil)
+;; FORMAT lives in cl-printer.lisp.  A nil-stub at this location used
+;; to mask the real prelude FORMAT above (L1010); both are then masked
+;; in turn by cl-printer's.  Removed 2026-06-01 as part of the
+;; redefinition audit.
 
 ;;; ============================================================
 ;;; Type checking stubs

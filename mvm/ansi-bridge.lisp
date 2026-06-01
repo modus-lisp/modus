@@ -563,14 +563,9 @@
          (setq j (- j 1)))))
     (t (error "NREVERSE: ~S is not a sequence" seq))))
 
-(defun rplaca (cons obj)
-  (set-car cons obj)
-  cons)
-
-(defun rplacd (cons obj)
-  (set-cdr cons obj)
-  cons)
-
+;; RPLACA + RPLACD early simple versions removed 2026-06-01 — the
+;; strict-arity, type-checking copies at L3258/L3269 win and are the
+;; ANSI-conformant ones.
 (defun list (&rest args)
   "Return a list of all ARGS. Runtime function (list is also a compiler macro)."
   args)
@@ -774,14 +769,8 @@
       (setq tail (cons (car cur) tail))
       (setq cur (cdr cur)))))
 
-(defun nreconc (list tail)
-  (let ((cur list))
-    (loop
-      (when (null cur) (return tail))
-      (let ((next (cdr cur)))
-        (set-cdr cur tail)
-        (setq tail cur)
-        (setq cur next)))))
+;; NRECONC early simple version removed 2026-06-01 — strict-arity
+;; copy at L3284 wins.
 
 (defun butlast (list &rest n-arg)
   ;; ANSI: (butlast list &optional (n 1)). Extra args → program-error.
@@ -801,9 +790,8 @@
             (setq cur (cdr cur))
             (setq i (+ i 1))))))))
 
-(defun acons (key datum alist)
-  (cons (cons key datum) alist))
-
+;; ACONS early simple version removed 2026-06-01 — strict-arity
+;; copy at L3276+ wins.
 (defun pairlis (keys data &rest alist-arg)
   "PAIRLIS keys data &optional alist — extra args after ALIST are a
    program-error.  Per CLHS, KEYS and DATA must be lists of equal
@@ -2820,9 +2808,8 @@
   "Return internal run time units."
   0)
 
-(defun get-internal-real-time ()
-  "Return internal real time units."
-  0)
+;; GET-INTERNAL-REAL-TIME early stub removed 2026-06-01 — real
+;; syscall-based copy at L3388 wins.
 
 (defvar internal-time-units-per-second 1000)
 
@@ -2830,9 +2817,8 @@
   "Decode universal time into components."
   (values 0 0 0 1 1 2000 0 nil 0))
 
-(defun encode-universal-time (sec min hr day mon yr &optional tz)
-  "Encode universal time components."
-  0)
+;; ENCODE-UNIVERSAL-TIME early stub removed 2026-06-01 — strict-arity
+;; copy at L3381 wins.
 
 ;;; ============================================================
 ;;; Array Misc

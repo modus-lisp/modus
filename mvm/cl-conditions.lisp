@@ -545,13 +545,10 @@
   "Get the name of a restart."
   (if (consp restart) (car restart) nil))
 
-(defun invoke-restart (name &rest args)
-  "Invoke a restart by name."
-  (let ((r (find-restart name)))
-    (if r
-        (apply (cadr r) args)
-        (error "No restart named ~A" name))))
-
+;; INVOKE-RESTART early version dropped 2026-06-01 (redefinition
+;; audit) — the canonical definition lives at L677 and wires the
+;; restart-invocation handshake (*restart-case-result*,
+;; *restart-invoking-p*) the early version skipped.
 (defun invoke-restart-interactively (name)
   "Invoke a restart interactively (call its :interactive function for args)."
   (let ((r (find-restart name)))

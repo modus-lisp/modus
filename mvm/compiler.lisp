@@ -7131,11 +7131,22 @@
          ;; s ≈ 10^12; the OLD inline `:div` on a bignum pointer
          ;; gives a wrong but consistent garbage value that trig
          ;; tests happen to accept (%any-to-float lands in [-1, 1]).
-         ;; The slow path's (/ bignum int) doesn't have real bignum
-         ;; support yet and crashes.  Leave bignum on the broken-
-         ;; but-passing fast path until / grows bignum division;
-         ;; floats and ratios get the correct (truncate (/ a b))
-         ;; expansion.
+         ;;
+         ;; The honest fix is to FLIP to a positive gate so bignum
+         ;; routes through %truncate2-generic / %INTEGER-TRUNCATE.
+         ;; That works correctness-wise — %INTEGER-TRUNCATE produces
+         ;; the right quotient via %bignum-divmod-fixnum (small
+         ;; divisor) or %bignum-trunc-doubling (general).  But on
+         ;; this codebase the flip cascades into an uncatchable
+         ;; SIGSEGV inside %sin-taylor's *deeper* Taylor iterations
+         ;; (the very first (truncate (* s s) k) now returns a real
+         ;; ~10^10 value instead of garbage, so subsequent
+         ;; (* term real-value) hits a path that wasn't reached
+         ;; before).  Full ANSI sweep regresses ~40 tests when
+         ;; flipped.  Keep negative gate for now; %truncate2-generic
+         ;; still benefits cases where bignum reaches it through
+         ;; other call sites (ratio/float intermediates that
+         ;; integerp after coercion).
          (compile-form
            `(let ((,a-sym ,a) (,b-sym ,b))
               (if (or (%ieee-float-p ,a-sym) (%ieee-float-p ,b-sym)

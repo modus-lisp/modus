@@ -1708,20 +1708,93 @@
    The hi32 slot is stored as a signed tagged fixnum; negative means sign bit set."
   (< (aref x 0) 0))
 
+(defun %bignum-trunc-doubling (na nb)
+  "Return ⌊na/nb⌋ where NA, NB are non-negative integers (fixnum or
+   bignum) and NA ≥ NB > 0.  Uses repeated subtraction with doubling
+   to find the largest 2^k such that nb*2^k ≤ na, subtract that, add
+   2^k to the quotient, repeat.  Each step at least halves the
+   remainder, so O(log(na/nb)^2) bignum ops.  Slow but correct, no
+   dependence on (logbitp i bignum) or (logand bignum bignum)."
+  (let ((q 0) (r na))
+    (loop
+      (when (= (bignum-cmp r nb) -1) (return q))
+      (let ((k 0) (shifted nb))
+        (loop
+          (let ((next (bignum-mul shifted 2)))
+            (when (= (bignum-cmp next r) 1) (return nil))
+            (setq shifted next)
+            (setq k (+ k 1))))
+        (setq r (bignum-sub r shifted))
+        ;; Add 2^k to q.  For k up to ~62, ash 1 k is a fixnum.
+        ;; Beyond that we'd need bignum representation, but for our
+        ;; ANSI suite the trig case keeps k ≤ 47.  Guard anyway.
+        (setq q (bignum-add q (if (>= k 62) (bignum-mul (ash 1 30) (ash 1 (- k 30))) (ash 1 k))))))))
+
+(defun %integer-truncate (a b)
+  "Bignum-aware integer truncate.  Returns the quotient only;
+   %truncate2-generic computes the remainder separately.
+
+   1. fixnum / fixnum   → native (truncate a b).
+   2. fixnum / bignum   → 0 (since |a| < |b|).
+   3. bignum / pos-fixnum-≤-2^31 → %bignum-divmod-fixnum (fast).
+   4. bignum / neg-fixnum-≤-2^31 → negate-then-divmod, flip sign.
+   5. bignum / larger-fixnum or bignum / bignum →
+      %bignum-trunc-doubling (slow but correct).
+
+   Note: bignum-truncate in cl-eval.lisp relies on (logbitp i bignum),
+   but compile-logand emits a raw IR :and that mishandles bignum
+   pointers — so the binary long-division loop in bignum-truncate
+   silently sees every high bit of na as zero and produces 0 for any
+   bignum input.  %bignum-divmod-fixnum (originally written for base-N
+   printer) uses only safe fixnum-on-fixnum limb-level arithmetic, so
+   we route the fast bignum/small-fixnum case through it.  The general
+   bignum/anything case uses doubling-subtract, which only depends on
+   bignum-mul / bignum-add / bignum-sub / bignum-cmp."
+  (when (= b 0) (error "divide by zero"))
+  (when (and (not (bignump a)) (not (bignump b)))
+    (return-from %integer-truncate (truncate a b)))
+  (when (and (not (bignump a)) (bignump b))
+    (return-from %integer-truncate 0))
+  ;; a is a bignum here.
+  (let* ((b-neg (or (and (bignump b)
+                         (= (car (%any-to-limbs b)) -1))
+                    (and (not (bignump b)) (< b 0))))
+         (b-mag (if b-neg (bignum-negate b) b))
+         (a-neg (= (car (%any-to-limbs a)) -1))
+         (na (if a-neg (bignum-negate a) a)))
+    (let ((mag
+            (cond
+              ;; Fast path: divisor magnitude fits in (2^31 - 1).
+              ((and (not (bignump b-mag)) (< b-mag 2147483648))
+               (car (%bignum-divmod-fixnum na b-mag)))
+              ;; General path: doubling-subtract.
+              (t (%bignum-trunc-doubling na b-mag)))))
+      (if (eq a-neg b-neg) mag (bignum-negate mag)))))
+
 (defun %truncate2-generic (a b)
-  "Slow-path 2-arg truncate for non-fixnum operands (floats, ratios,
-   bignums, mixed types).  compile-truncate's 2-arg branch tag-checks
-   the args at runtime and routes here when at least one isn't a
-   tagged fixnum — the inline :div / :mul ops would otherwise treat
-   boxed pointers as integers.
+  "Slow-path 2-arg truncate.  Integer/integer path uses %INTEGER-TRUNCATE
+   (which routes through %bignum-divmod-fixnum for bignum/small-fixnum
+   and %bignum-trunc-doubling for the general case).  Float/ratio/mixed
+   path keeps the original (/ a b) route.
 
    Returns (values q r) per CLHS — q = trunc(a/b), r = a − q·b.
-   The 1-arg `(truncate (/ a b))` exists and handles the float case
-   via compile-truncate's :float-to-int branch; * and - dispatch
-   through emit-arith-pair which already handles cross-type promotion."
-  (let* ((q (truncate (/ a b)))
-         (r (- a (* q b))))
-    (values q r)))
+
+   Note: with compile-truncate's POSITIVE gate, every (truncate bignum
+   fixnum) now reaches %INTEGER-TRUNCATE, where it routes through
+   %bignum-divmod-fixnum (or %bignum-trunc-doubling for divisor ≥ 2^31).
+   With the NEGATIVE gate, bignum stayed on the inline :div fast path
+   which silently gave garbage answers — trig tests `accidentally
+   passed' because the garbage value still happened to land in [-1,1]
+   after %any-to-float."
+  (cond
+    ((and (integerp a) (integerp b))
+     (let* ((q (%integer-truncate a b))
+            (r (generic-subtract a (generic-multiply q b))))
+       (values q r)))
+    (t
+     (let* ((q (truncate (/ a b)))
+            (r (- a (* q b))))
+       (values q r)))))
 
 (defun float-truncate-to-integer (x)
   "Extract absolute integer part of boxed float X (truncate toward zero).

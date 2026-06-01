@@ -1708,6 +1708,21 @@
    The hi32 slot is stored as a signed tagged fixnum; negative means sign bit set."
   (< (aref x 0) 0))
 
+(defun %truncate2-generic (a b)
+  "Slow-path 2-arg truncate for non-fixnum operands (floats, ratios,
+   bignums, mixed types).  compile-truncate's 2-arg branch tag-checks
+   the args at runtime and routes here when at least one isn't a
+   tagged fixnum — the inline :div / :mul ops would otherwise treat
+   boxed pointers as integers.
+
+   Returns (values q r) per CLHS — q = trunc(a/b), r = a − q·b.
+   The 1-arg `(truncate (/ a b))` exists and handles the float case
+   via compile-truncate's :float-to-int branch; * and - dispatch
+   through emit-arith-pair which already handles cross-type promotion."
+  (let* ((q (truncate (/ a b)))
+         (r (- a (* q b))))
+    (values q r)))
+
 (defun float-truncate-to-integer (x)
   "Extract absolute integer part of boxed float X (truncate toward zero).
    For the REAL tests, only used with positive floats (0.0001) and

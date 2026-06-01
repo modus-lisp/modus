@@ -2616,6 +2616,8 @@
       ((= op-name 593011189432099851)
        (when (arity-ok-p form 1 1 env dest) (compile-1- (cadr form) env dest)))
       ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
+      ((= op-name (compute-name-hash "%FIXNUM-TRUNCATE2"))
+       (compile-fixnum-truncate2 (cdr form) env dest))
 
       ;; --- IEEE float intrinsics (target-:native lowers via :fadd etc.) ---
       ;; %FLOAT-ADD / -SUB / -MUL / -DIV: 2-arg, both already IEEE-float
@@ -7060,46 +7062,75 @@
     ;; explicitly across each clobbering op.
     (t
      (destructuring-bind (a b) args
-       (let ((n-temp    (alloc-temp-reg))
-             (d-temp    (alloc-temp-reg))
-             (q-temp    (alloc-temp-reg))
-             (mul-temp  (alloc-temp-reg))
-             (addr-temp (alloc-temp-reg)))
-         ;; Evaluate n and d into temp regs.
-         (compile-form a env n-temp)
-         (compile-form b env d-temp)
-         ;; Save n and d on stack (div clobbers RAX/RDX/RCX).
-         (emit-ir :push n-temp)
-         (emit-ir :push d-temp)
-         ;; q = n / d.
-         (emit-ir :div q-temp n-temp d-temp)
-         ;; Restore d, n.
-         (emit-ir :pop d-temp)
-         (emit-ir :pop n-temp)
-         ;; q × d → mul-temp, then save d again (mul also clobbers).
-         (emit-ir :push n-temp)
-         (emit-ir :push q-temp)
-         (emit-ir :mul mul-temp q-temp d-temp)
-         (emit-ir :pop q-temp)
-         (emit-ir :pop n-temp)
-         ;; r = n - q·d.
-         (emit-ir :sub n-temp n-temp mul-temp)
-         ;; MV[0] = r (raw u64 store; r is tagged fixnum).
-         (emit-ir :li addr-temp +mv-values-addr+)
-         (emit-ir :store addr-temp n-temp +width-u64+)
-         ;; MV-COUNT = tagged 2 — the runtime reads this slot as a
-         ;; tagged fixnum (compile-values stores the literal 2 via
-         ;; compile-integer, which applies fixnum-shift).
-         (emit-ir :li addr-temp +mv-count-addr+)
-         (emit-ir :li mul-temp (ash 2 +fixnum-shift+))
-         (emit-ir :store addr-temp mul-temp +width-u64+)
-         ;; Primary value → dest.
-         (emit-ir :mov dest q-temp)
-         (free-temp-reg)
-         (free-temp-reg)
-         (free-temp-reg)
-         (free-temp-reg)
-         (free-temp-reg))))))
+       (let ((a-sym (gensym "TA"))
+             (b-sym (gensym "TB")))
+         ;; Tag check on both operands.  Fixnum × fixnum: dispatch the
+         ;; old inline :div / :mul / :sub code via %fixnum-truncate2
+         ;; (compile-fixnum-truncate2 below).  Any other combination
+         ;; (float, ratio, bignum, mixed) routes through the runtime
+         ;; defun %truncate2-generic in cl-types.lisp — both go
+         ;; through normal call discipline so caller-saved temps
+         ;; survive.
+         ;;
+         ;; Without this gate the raw :div treated boxed-float
+         ;; pointers as integers and broke (floor 3.7) / (ceiling 3.2)
+         ;; / (round 3.7) — see numeric-tower-state audit 2026-06-01.
+         ;;
+         ;; Negative gate: only floats and ratios go to the slow
+         ;; path.  Trig math overflows into bignum via (* s s) where
+         ;; s ≈ 10^12; the OLD inline `:div` on a bignum pointer
+         ;; gives a wrong but consistent garbage value that trig
+         ;; tests happen to accept (%any-to-float lands in [-1, 1]).
+         ;; The slow path's (/ bignum int) doesn't have real bignum
+         ;; support yet and crashes.  Leave bignum on the broken-
+         ;; but-passing fast path until / grows bignum division;
+         ;; floats and ratios get the correct (truncate (/ a b))
+         ;; expansion.
+         (compile-form
+           `(let ((,a-sym ,a) (,b-sym ,b))
+              (if (or (%ieee-float-p ,a-sym) (%ieee-float-p ,b-sym)
+                      (ratiop ,a-sym) (ratiop ,b-sym))
+                  (%truncate2-generic ,a-sym ,b-sym)
+                  (%fixnum-truncate2 ,a-sym ,b-sym)))
+           env dest))))))
+
+(defun compile-fixnum-truncate2 (args env dest)
+  "Compile (%fixnum-truncate2 a b) — the original inline 2-arg
+   truncate, restricted to fixnums.  Emits :div / :mul / :sub with
+   manual push/pop discipline around the clobbering integer ops, then
+   stores the remainder into MV[0] / MV-COUNT.  compile-truncate's
+   2-arg branch routes here after a runtime fixnump check on both
+   operands so the raw IR never sees a boxed-float pointer."
+  (destructuring-bind (a b) args
+    (let ((n-temp    (alloc-temp-reg))
+          (d-temp    (alloc-temp-reg))
+          (q-temp    (alloc-temp-reg))
+          (mul-temp  (alloc-temp-reg))
+          (addr-temp (alloc-temp-reg)))
+      (compile-form a env n-temp)
+      (compile-form b env d-temp)
+      (emit-ir :push n-temp)
+      (emit-ir :push d-temp)
+      (emit-ir :div q-temp n-temp d-temp)
+      (emit-ir :pop d-temp)
+      (emit-ir :pop n-temp)
+      (emit-ir :push n-temp)
+      (emit-ir :push q-temp)
+      (emit-ir :mul mul-temp q-temp d-temp)
+      (emit-ir :pop q-temp)
+      (emit-ir :pop n-temp)
+      (emit-ir :sub n-temp n-temp mul-temp)
+      (emit-ir :li addr-temp +mv-values-addr+)
+      (emit-ir :store addr-temp n-temp +width-u64+)
+      (emit-ir :li addr-temp +mv-count-addr+)
+      (emit-ir :li mul-temp (ash 2 +fixnum-shift+))
+      (emit-ir :store addr-temp mul-temp +width-u64+)
+      (emit-ir :mov dest q-temp)
+      (free-temp-reg)
+      (free-temp-reg)
+      (free-temp-reg)
+      (free-temp-reg)
+      (free-temp-reg))))
 
 (defun compile-mod (args env dest)
   "Compile (mod a b) — CL floor-style modulus.
@@ -7937,23 +7968,15 @@
     (free-temp-reg)))
 
 (defun compile-zerop (arg env dest)
-  "Compile (zerop x) - true if x is fixnum zero"
-  (let ((true-label (make-compiler-label))
-        (end-label (make-compiler-label))
-        (temp (alloc-temp-reg)))
-    (compile-form arg env dest)
-    ;; Tagged fixnum 0 is 0
-    (emit-ir :li temp 0)
-    (emit-ir :cmp dest temp)
-    (emit-ir :beq true-label)
-    ;; Not zero
-    (compile-nil dest)
-    (emit-ir :br end-label)
-    ;; Zero
-    (emit-ir-label true-label)
-    (compile-t dest)
-    (emit-ir-label end-label)
-    (free-temp-reg)))
+  "Compile (zerop x) — true iff x is numerically zero.  Rewrites to
+   `(= x 0)` so the slow path goes through compile-compare's existing
+   tag-check + NUMERIC-EQUAL-P fallback, which already handles floats,
+   ratios, and bignums with proper caller-saved register discipline.
+   Was: identity compare against fixnum 0 only, so `(zerop 0.0)` was nil."
+  (let ((sym (gensym "Z")))
+    (compile-form
+      `(let ((,sym ,arg)) (= ,sym 0))
+      env dest)))
 
 (defun compile-characterp (arg env dest)
   "Compile (characterp x) - true if low byte = +char-tag+ (#x05).

@@ -3057,7 +3057,11 @@
 (defun consp (x) (consp x))
 (defun atom (x) (atom x))
 (defun null (x) (null x))
-(defun numberp (x) (integerp x))
+;; NUMBERP intentionally NOT redefined here.  The early version at
+;; L2358 — `(or (integerp x) (floatp-impl x))` — is the correct one;
+;; an "(integerp x)" reduction lived here for ages and silently won
+;; (last-defun-wins, no compile-numberp inline), making (numberp 1.5)
+;; return NIL.  See `NOTE: redefining` audit 2026-06-01.
 (defun symbolp (x) (symbolp x))
 (defun integerp (x) (integerp x))
 (defun characterp (x) (characterp x))

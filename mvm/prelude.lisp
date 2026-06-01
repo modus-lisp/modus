@@ -777,43 +777,12 @@
 ;;; Apply (limited: call with list of args, up to 4 args)
 ;;; ============================================================
 
-(defun apply (fn &rest spread)
-  "ANSI apply: (apply fn a1 a2 ... aN list) — call FN with the
-   spread args followed by the elements of the final LIST.
-   Special case: (apply fn list) is just (funcall fn list-elements)."
-  ;; Build the full arg list: (a1 a2 ... aN) ++ final-list
-  (let ((all-args
-         (if (null spread)
-             nil
-             (if (null (cdr spread))
-                 ;; (apply fn list) — spread = (list)
-                 (car spread)
-                 ;; (apply fn a1 a2 ... list) — append individual args + list
-                 (let ((individual nil) (cur spread))
-                   (loop
-                     (when (null (cdr cur))
-                       ;; last cur is the spread list; append it
-                       (return (append (nreverse individual) (car cur))))
-                     (setq individual (cons (car cur) individual))
-                     (setq cur (cdr cur))))))))
-    ;; Now dispatch on length of all-args (supports 0-8 args).
-    (let ((n (length all-args)))
-      (cond
-        ((= n 0) (funcall fn))
-        ((= n 1) (funcall fn (car all-args)))
-        ((= n 2) (funcall fn (car all-args) (cadr all-args)))
-        ((= n 3) (funcall fn (car all-args) (cadr all-args) (caddr all-args)))
-        ((= n 4) (funcall fn (car all-args) (cadr all-args) (caddr all-args) (cadddr all-args)))
-        ((= n 5) (funcall fn (nth 0 all-args) (nth 1 all-args) (nth 2 all-args)
-                          (nth 3 all-args) (nth 4 all-args)))
-        ((= n 6) (funcall fn (nth 0 all-args) (nth 1 all-args) (nth 2 all-args)
-                          (nth 3 all-args) (nth 4 all-args) (nth 5 all-args)))
-        ((= n 7) (funcall fn (nth 0 all-args) (nth 1 all-args) (nth 2 all-args)
-                          (nth 3 all-args) (nth 4 all-args) (nth 5 all-args)
-                          (nth 6 all-args)))
-        (t (funcall fn (nth 0 all-args) (nth 1 all-args) (nth 2 all-args)
-                       (nth 3 all-args) (nth 4 all-args) (nth 5 all-args)
-                       (nth 6 all-args) (nth 7 all-args)))))))
+;; APPLY lives in cl-printer.lisp.  It used to be defined here too —
+;; the bare-metal compiler's "last defun wins" rule meant the printer
+;; version silently overrode this one and extending this body did
+;; nothing.  Removed 2026-06-01; see [[reference_apply_cl_printer_override]].
+;; If you want to extend the ladder or add a `%spread-call` primitive,
+;; edit the cl-printer copy.
 
 ;;; ============================================================
 ;;; Format stub (for self-compilation — writes string to serial)

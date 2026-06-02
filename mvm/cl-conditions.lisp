@@ -143,59 +143,93 @@
    a list and don't want a runtime &rest reassembly."
   (apply 'make-condition type-designator initargs-list))
 
+(defun %initarg-key-eq (a b)
+  "Compare two initarg keys with cross-file native MVM symbol identity
+   tolerance.  eq first, then symbol-name-hash compare (slot-0 of the
+   symbol object) so initargs interned in different defining files
+   still match."
+  (or (eq a b)
+      (and (symbolp a) (not (null a)) (not (eq a t))
+           (symbolp b) (not (null b)) (not (eq b t))
+           (= (aref a 0) (aref b 0)))))
+
+(defun %initarg-in-list-p (key key-list)
+  "T iff KEY (hash-compared) appears in KEY-LIST."
+  (let ((cur key-list)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (when (%initarg-key-eq (car cur) key) (setq found t))
+      (setq cur (cdr cur)))
+    found))
+
 (defun make-condition (type-designator &rest initargs)
-  "Create a condition instance of the given type with initargs."
+  "Create a condition instance of the given type with initargs.
+
+   Slot value precedence (CLHS 7.1.2 / 9.1.2):
+   1. The FIRST user-supplied initarg whose key matches any of the
+      slot's :initarg names.  Walking the user's plist left-to-right
+      (not the slot's initarg list) fixes condition-{6,7,9}-slots where
+      multiple slots share initargs and the test passes :both-slots
+      ahead of :slot1/:slot2.
+   2. Default-initargs (plist of (key val key val …) from
+      (:default-initargs … in define-condition)) where key matches a
+      slot initarg.
+   3. The slot's own :initform (or :no-initform → slot stays unset).
+
+   default-initargs is treated as a PLIST per CLHS 7.1.4
+   (:default-initargs key form …); the prior code walked it as an alist
+   and silently missed every value."
   (let ((type-name (if (symbolp type-designator) type-designator nil)))
     (when (null type-name)
-      ;; Handle compound type designators (simplified)
       (setq type-name (if (consp type-designator) (cadr type-designator) type-designator)))
     (let ((entry (%cond-reg-find type-name)))
       (if (null entry)
-          ;; Unknown type — create minimal condition
           (let ((c (make-array 2)))
             (aset c 0 type-name)
             (aset c 1 nil)
             c)
-          ;; Known type
           (let ((all-slots (%collect-all-slots type-name))
                 (all-defaults (%collect-all-default-initargs type-name)))
-            ;; Build slot alist from initargs + defaults + initforms
             (let ((slot-alist nil))
-              ;; For each slot, find its value
               (dolist (slot-spec all-slots)
                 (let ((slot-name (car slot-spec))
                       (slot-initargs (cadr slot-spec))
-                      (slot-initform (caddr slot-spec)))
-                  ;; Check if any initarg matches
-                  (let ((val-found nil)
-                        (val nil))
-                    ;; Search in provided initargs (first match wins)
-                    (dolist (ia slot-initargs)
-                      (unless val-found
-                        (let ((pos (%plist-get initargs ia)))
-                          (when (not (eq pos :not-found))
-                            (setq val pos)
-                            (setq val-found t)))))
-                    ;; If not found in initargs, check default-initargs
-                    (unless val-found
-                      (dolist (da all-defaults)
-                        (unless val-found
-                          (dolist (ia slot-initargs)
-                            (unless val-found
-                              (when (eq (car da) ia)
-                                ;; Evaluate the initform (it's a thunk or value)
-                                (setq val (%eval-initform (cadr da)))
-                                (setq val-found t)))))))
-                    ;; If still not found, use slot's own initform
-                    (when (not val-found)
-                      (unless (eq slot-initform :no-initform)
-                        (setq val (%eval-initform slot-initform))
-                        (setq val-found t)))
-                    (setq slot-alist (cons (cons slot-name val) slot-alist)))))
-              (setq slot-alist (nreverse slot-alist))
+                      (slot-initform (caddr slot-spec))
+                      (val nil)
+                      (val-found nil))
+                  ;; (1) walk the USER's initargs in order; first match wins
+                  (let ((rest initargs))
+                    (loop
+                      (when (or val-found (null rest) (null (cdr rest)))
+                        (return nil))
+                      (let ((uk (car rest))
+                            (uv (cadr rest)))
+                        (when (%initarg-in-list-p uk slot-initargs)
+                          (setq val uv)
+                          (setq val-found t)))
+                      (setq rest (cddr rest))))
+                  ;; (2) default-initargs: PLIST (key1 val1 key2 val2 …)
+                  (unless val-found
+                    (let ((rest all-defaults))
+                      (loop
+                        (when (or val-found (null rest) (null (cdr rest)))
+                          (return nil))
+                        (let ((dk (car rest))
+                              (df (cadr rest)))
+                          (when (%initarg-in-list-p dk slot-initargs)
+                            (setq val (%eval-initform df))
+                            (setq val-found t)))
+                        (setq rest (cddr rest)))))
+                  ;; (3) slot :initform
+                  (unless val-found
+                    (unless (eq slot-initform :no-initform)
+                      (setq val (%eval-initform slot-initform))
+                      (setq val-found t)))
+                  (setq slot-alist (cons (cons slot-name val) slot-alist))))
               (let ((c (make-array 2)))
                 (aset c 0 type-name)
-                (aset c 1 slot-alist)
+                (aset c 1 (nreverse slot-alist))
                 c)))))))
 
 (defun %plist-get (plist key)
@@ -216,17 +250,31 @@
       (setq rest (cddr rest)))))
 
 (defun %eval-initform (form)
-  "Evaluate an initform.  Three shapes:
+  "Evaluate an initform.  Four shapes:
    - closure (subtag #x52): funcall it → user lambda from defclass-rewriter
    - (QUOTE x) cons: return x (literal value from define-condition rewriter
      which emits initforms inside a quoted list so values arrive wrapped)
-   - anything else: return as-is (already-evaluated literal)"
+   - other cons: tree-walking eval.  condition-{8,20} have
+     :initform (incf *counter*) / :default-initargs :i1 (incf *…*) — these
+     arrive at make-condition time as literal cons forms (since the
+     define-condition rewriter quotes the slot list rather than emitting
+     thunks the way defclass does).  Eval lets the side effects + counter
+     reads work as the tests expect.
+   - anything else: return as-is (literal value)."
   (cond
-    ((and (not (fixnump form)) (not (consp form)) (not (null form))
+    ((null form) nil)
+    ((fixnump form) form)
+    ((characterp form) form)
+    ((stringp form) form)
+    ((and (not (consp form))
           (= (obj-subtag form) #x52))     ; closure subtag → thunk
      (funcall form))
     ((and (consp form) (eq (car form) 'quote) (consp (cdr form)))
      (cadr form))
+    ((consp form)
+     ;; Wrap in handler-case so a missing eval feature degrades to NIL
+     ;; rather than killing the whole make-condition fork.
+     (handler-case (eval form) (t (c) (declare (ignore c)) nil)))
     (t form)))
 
 ;;; --- print-object for conditions ---
@@ -281,6 +329,25 @@
 
 (defun %init-condition-types ()
   "Register all standard CL condition types."
+  ;; defvar init-thunks aren't run on Modus boot (CLAUDE.md #7) — the
+  ;; variables are declared but their initial values are never assigned,
+  ;; so the default of NIL/garbage persists.  *handler-bind-effective-
+  ;; skip* is compared with `(>= frame-idx skip)`, and an uninitialised
+  ;; junk value made the skip count enormous — every handler was
+  ;; inhibited, muffle-warning never found a handler-bind handler, and
+  ;; warn.{1..3,5..11,19} all silently fell through.  Explicit setq
+  ;; here at boot fixes it.
+  (setq *handler-bind-effective-skip* 0)
+  (setq *handler-bind-stack* nil)
+  (setq *restart-stack* nil)
+  (setq *restart-frame-condition-map* nil)
+  (setq *restarts-being-invoked* nil)
+  (setq *restart-case-result* nil)
+  (setq *restart-invoking-p* nil)
+  (setq *current-condition* nil)
+  (setq *catch-active* nil)
+  (setq *catch-tag* nil)
+  (setq *catch-value* nil)
   ;; condition (root)
   (%define-condition 'condition nil nil nil nil)
   ;; serious-condition
@@ -417,6 +484,9 @@
            ;; Fallback
            (t (make-condition 'simple-error :format-control "error" :format-arguments nil)))))
     (setq *current-condition* cond-obj)
+    ;; Associate every currently-active restart frame with this condition
+    ;; (implicit with-condition-restarts per CLHS 9.1.4.2.5).
+    (%associate-active-restart-frames cond-obj)
     ;; Try handler-bind stack first
     (let ((handled (%signal-condition cond-obj)))
       (if handled
@@ -443,11 +513,47 @@
            (t nil))))
     (when cond-obj
       (setq *current-condition* cond-obj)
+      (%associate-active-restart-frames cond-obj)
       (%signal-condition cond-obj))
     nil))
 
+(defun %warning-type-name-p (sym)
+  "T iff SYM names a condition type that is a subtype of WARNING.
+   Used by warn to validate symbol designators (warn.12/13 — passing
+   'CONDITION or 'SIMPLE-CONDITION must signal TYPE-ERROR rather than
+   warn about a non-warning condition)."
+  (and sym (symbolp sym) (not (null sym)) (not (eq sym t))
+       (let ((entry (%cond-reg-find sym)))
+         (and entry (member 'warning (%condition-all-parents sym))))))
+
 (defun warn (datum &rest args)
-  "Signal a warning condition."
+  "Signal a warning condition with CLHS-conformant validation and
+   muffle-warning support.
+
+   Per CLHS WARN:
+   - datum may be a string + args, a symbol naming a warning subtype +
+     init-args, or a pre-built warning condition object (with no extra
+     args).  Anything else → TYPE-ERROR.
+   - A MUFFLE-WARNING restart is established around the signal.  If a
+     handler invokes it, warn returns NIL silently (warn.{1..3,5..11}).
+   - Otherwise the warning is reported to *error-output* and NIL returned.
+
+   Previously warn skipped validation entirely and never set up
+   muffle-warning, so handler-bind invocations of muffle-warning were
+   no-ops and the printed warning remained visible (warn.3 expected '' )."
+  ;; -------- Validate datum --------
+  (cond
+    ((%condition-p datum)
+     ;; Condition object — must be a warning subtype, and no extra args.
+     (when args (%signal-type-error) (return-from warn nil))
+     (unless (%condition-typep datum 'warning)
+       (%signal-type-error) (return-from warn nil)))
+    ((stringp datum) nil)
+    ((symbolp datum)
+     (unless (%warning-type-name-p datum)
+       (%signal-type-error) (return-from warn nil)))
+    (t (%signal-type-error) (return-from warn nil)))
+  ;; -------- Build condition --------
   (let ((cond-obj
          (cond
            ((%condition-p datum) datum)
@@ -455,13 +561,27 @@
             (make-condition 'simple-warning
                             :format-control datum
                             :format-arguments args))
-           ((symbolp datum)
-            (apply 'make-condition datum args))
-           (t (make-condition 'simple-warning :format-control "warning" :format-arguments nil)))))
+           ((symbolp datum) (apply 'make-condition datum args))
+           (t nil))))
+    (when (null cond-obj)
+      (return-from warn nil))
     (setq *current-condition* cond-obj)
-    (let ((handled (%signal-condition cond-obj)))
-      (unless handled
-        ;; Print warning to *error-output*
+    ;; -------- Signal under a MUFFLE-WARNING restart --------
+    ;; We reuse %with-restarts (the restart-case machinery) so the
+    ;; restart's wrapper does the setjmp/longjmp recovery for us — its
+    ;; handler-case wrapping the body catches the (error "throw") path
+    ;; that bare CATCH/%push-restarts couldn't unwind through reliably.
+    ;; The user fn just sets MUFFLED (a captured + mutated cell) and
+    ;; returns NIL; the wrapper longjmps to %with-restarts, which
+    ;; returns NIL.  After return we check MUFFLED to decide whether to
+    ;; print.
+    (let ((muffled nil))
+      (%with-restarts
+       (list (list 'muffle-warning
+                   (lambda () (setq muffled t) nil)
+                   "Skip the warning."))
+       (lambda () (%signal-condition cond-obj)))
+      (unless muffled
         (write-string-to-stream "WARNING: " *error-output*)
         (let ((fc (simple-condition-format-control cond-obj)))
           (when (stringp fc)
@@ -522,31 +642,89 @@
   (when *restart-stack*
     (setq *restart-stack* (cdr *restart-stack*))))
 
+;;; *restart-frame-condition-map* — alist of (FRAME . CONDITION).
+;;; Implements the CLHS 9.1.4.2.5 implicit-with-condition-restarts
+;;; semantics.  When ERROR / SIGNAL / WARN / CERROR is called inside
+;;; a restart-case, the active restart frames acquire an association
+;;; with the signaled condition.  FIND-RESTART (with a CONDITION arg)
+;;; then skips restarts whose frame is associated with a DIFFERENT
+;;; condition — that's how the OUTER restart-case's FOO is selected by
+;;; the OUTER handler in restart-case.{25..31} even though the INNER
+;;; restart-case has a FOO too: the inner FOO's frame is associated
+;;; with the original (inner) condition C1, not the (re-signaled) C2.
+;;; Keying on the FRAME (a `*restart-stack*` cell, list of restarts)
+;;; not on individual restarts so all restarts in one restart-case
+;;; share the same association.  Cleared by run-test failure path and
+;;; by %with-restarts longjmp recovery.
+(defvar *restart-frame-condition-map* nil)
+
+(defun %associate-active-restart-frames (cond-obj)
+  "On signal of COND-OBJ, associate every currently-active restart
+   frame (from `*restart-stack*`) with COND-OBJ, UNLESS that frame
+   already has an association (CLHS implicit-with-condition-restarts:
+   first signal that propagates through a restart-case wins).  Idempotent
+   on repeat-with-same-condition."
+  (when cond-obj
+    (let ((cur *restart-stack*))
+      (loop
+        (when (null cur) (return nil))
+        (let ((frame (car cur)))
+          (unless (assoc frame *restart-frame-condition-map* :test #'eq)
+            (setq *restart-frame-condition-map*
+                  (cons (cons frame cond-obj)
+                        *restart-frame-condition-map*))))
+        (setq cur (cdr cur))))))
+
+(defun %restart-applicable-for-condition-p (restart cond-obj)
+  "Per CLHS 9.1.4.2.5 + find-restart semantics: a restart is applicable
+   to COND-OBJ if it has no condition association, OR its association
+   is exactly COND-OBJ.  COND-OBJ NIL means no constraint (the
+   no-condition-arg branch of find-restart)."
+  (if (null cond-obj)
+      t
+      (let ((cur *restart-frame-condition-map*)
+            (frame-found nil)
+            (frame-cond nil))
+        (loop
+          (when (or frame-found (null cur)) (return nil))
+          (let ((entry (car cur)))
+            (when (member restart (car entry) :test #'eq)
+              (setq frame-found t)
+              (setq frame-cond (cdr entry))))
+          (setq cur (cdr cur)))
+        (if (not frame-found)
+            t   ; not in any associated frame → applicable
+            (eq frame-cond cond-obj)))))
+
 (defun compute-restarts (&optional condition)
-  "Return list of currently active restarts.  The CONDITION argument is
-   accepted for CLHS compatibility but not used for filtering — the
-   association registry that would make this meaningful regressed
-   restart-case.{23,24} and was removed (see commit history)."
-  (declare (ignore condition))
+  "Return list of currently active restarts — filtered by CONDITION
+   per CLHS: a restart is included if it is associated with CONDITION
+   or with no condition.  CONDITION NIL means include all."
   (let ((result nil))
     (dolist (frame *restart-stack*)
       (dolist (r frame)
-        (setq result (cons r result))))
+        (when (and (not (member r *restarts-being-invoked* :test #'eq))
+                   (%restart-applicable-for-condition-p r condition))
+          (setq result (cons r result)))))
     (nreverse result)))
 
 (defun find-restart (name &optional condition)
   "Find restart by name.  Per CLHS find-restart, NAME may be a symbol,
    string, or an existing restart object — for the latter, return it if
-   it is currently active, NIL otherwise.  CONDITION is accepted but
-   ignored — see compute-restarts."
-  ;; NOTE: return-from in MVM only exits the innermost loop (treated as return).
-  ;; Use a result variable and nested flag to exit properly.
-  (declare (ignore condition))
+   it is currently active, NIL otherwise.
+
+   CONDITION, when non-NIL, filters by association: restarts whose
+   frame is associated with a DIFFERENT condition are excluded.
+   restart-case.{25..31} need this — the OUTER restart-case's FOO is
+   selected by the OUTER handler-bind's handler even though the INNER
+   restart-case has a FOO too, because the inner FOO's frame is
+   associated with C1 (the original signal) and the OUTER handler is
+   looking for FOO associated with C2 (the re-signaled condition)."
   (let ((found nil)
-        ;; Detect "name is itself a restart object".  Restart objects are
-        ;; structured as conses present on *restart-stack* — we treat any
-        ;; cons whose cadr is a function as a candidate for the
-        ;; "find-restart of a restart returns itself if active" branch.
+        ;; Detect \"name is itself a restart object\".  Restart objects are
+        ;; conses present on *restart-stack* — we treat any cons whose
+        ;; cadr is a function as a candidate for the
+        ;; \"find-restart of a restart returns itself if active\" branch.
         ;; ANSI restart-bind.8 / compute-restarts.3 rely on this.
         (name-is-restart
          (and (consp name) (consp (cdr name)) (functionp (cadr name)))))
@@ -559,6 +737,7 @@
               (when (or found (null rs)) (return nil))
               (let ((r (car rs)))
                 (when (and (not (member r *restarts-being-invoked* :test #'eq))
+                           (%restart-applicable-for-condition-p r condition)
                            (cond
                              (name-is-restart (eq r name))
                              ((stringp name)
@@ -713,11 +892,17 @@
 (defun %with-handler-bind (handlers body-fn)
   "Install handler-bind handlers during body execution.
    HANDLERS is a list of (type fn) pairs.
-   BODY-FN is the body thunk."
+   BODY-FN is the body thunk.
+
+   multiple-value-prog1 preserves body-fn's full MV state; the prior
+   `(let ((result (funcall body-fn))) … result)` collapsed (values …)
+   to a single primary value.  warn.{1,2,5,6,7,8,9,10,11,19} place
+   `(values (multiple-value-list (warn …)) warned)` inside the
+   handler-bind body, so the 2nd value (warned) was being silently
+   dropped and the test expected `(NIL) T` saw only `(NIL)`."
   (setq *handler-bind-stack* (cons handlers *handler-bind-stack*))
-  (let ((result (funcall body-fn)))
-    (setq *handler-bind-stack* (cdr *handler-bind-stack*))
-    result))
+  (multiple-value-prog1 (funcall body-fn)
+    (setq *handler-bind-stack* (cdr *handler-bind-stack*))))
 
 ;;; --- restart-case implementation ---
 ;;; restart-case needs non-local exit from restart body back to restart-case frame.
@@ -737,88 +922,110 @@
 (defvar *restart-invoking-p* nil)
 
 (defun %with-restarts (restarts-spec body-fn)
-  "Establish RESTARTS-SPEC (list of (name fn report)) during BODY-FN.
-   Returns the body result, or the invoked restart's result.
-   Uses handler-case setjmp mechanism for non-local exit."
-  ;; Wrap each restart fn so it sets result and longjmps
-  (let ((wrapped (let ((result nil))
-                   (dolist (r restarts-spec)
-                     (let ((rname (car r))
-                           (rfn (cadr r))
-                           (report (caddr r)))
-                       (setq result (cons (list rname rfn report) result))))
-                   (nreverse result))))
-    (setq *restart-stack* (cons wrapped *restart-stack*))
-    ;; Use handler-case setjmp to catch the longjmp from invoke-restart.
-    ;; multiple-value-prog1 preserves the body-fn's MV state across the
-    ;; *restart-stack* pop — without it, restart-case.lsp 26103 silently
-    ;; dropped values 2..N from (values 'A 'B 'C 'D 'E 'F).
-    (handler-case
-        (multiple-value-prog1 (funcall body-fn)
-          (setq *restart-stack* (cdr *restart-stack*)))
-      (condition (c)
-        ;; Either a real error OR a restart invocation
-        (setq *restart-stack* (cdr *restart-stack*))
-        (if *restart-invoking-p*
-            (let ((r *restart-case-result*))
-              (setq *restart-invoking-p* nil)
-              (setq *restart-case-result* nil)
-              ;; *restarts-being-invoked* gets pushed by invoke-restart
-              ;; but the let binding is short-circuited by the longjmp;
-              ;; reset here so a later invoke-restart in this fork
-              ;; doesn't see stale entries.
-              (setq *restarts-being-invoked* nil)
-              ;; The restart fn's full multi-value list is stashed in R
-              ;; (see invoke-restart's multiple-value-list capture).
-              ;; values-list propagates the MV count back so the surrounding
-              ;; (handler-case (multiple-value-list ...)) form sees all of
-              ;; them — restart-case.{16,17} have (foo () (values 'a 'b ...))
-              ;; whose six values otherwise collapse to a single 'A.
-              (values-list r))
-            ;; Re-signal the condition (propagate error)
-            (progn
+  "Establish RESTARTS-SPEC (list of (name fn report)) during BODY-FN
+   with restart-case semantics: each restart cell carries a :case style
+   marker (5th element) so INVOKE-RESTART knows to stash the user fn's
+   multiple-value result and %hc-longjmp back to this handler-case
+   frame.
+
+   Why a marker instead of wrapping fn at install time?  Modus's auto-
+   closure capture of a non-mutated function-typed parameter in a
+   per-iteration dolist body sometimes produced wrappers whose captured
+   RFN read NIL at call time (restart-case.{23..31} regressed when the
+   wrap approach was tried).  Storing the user fn directly + marking
+   the style sidesteps the capture entirely.
+
+   multiple-value-prog1 preserves body-fn's MV state across the
+   *restart-stack* pop (without it, restart-case.lsp 26103 silently
+   collapsed (values 'A 'B 'C 'D 'E 'F) to 'A)."
+  (let ((wrapped nil))
+    (dolist (r restarts-spec)
+      (let ((rname  (car r))
+            (rfn    (cadr r))
+            (report (caddr r)))
+        (setq wrapped
+              (cons (list rname rfn report nil :case)
+                    wrapped))))
+    (let ((frame (nreverse wrapped)))
+      (setq *restart-stack* (cons frame *restart-stack*))
+      (handler-case
+          (multiple-value-prog1 (funcall body-fn)
+            (setq *restart-stack* (cdr *restart-stack*))
+            ;; Drop this frame's condition association on normal exit.
+            (when *restart-frame-condition-map*
+              (setq *restart-frame-condition-map*
+                    (remove frame *restart-frame-condition-map*
+                            :test (lambda (f e) (eq (car e) f))))))
+        (condition (c)
+          (declare (ignore c))
+          (setq *restart-stack* (cdr *restart-stack*))
+          ;; Reset *handler-bind-effective-skip* — it was bumped when a
+          ;; handler-bind handler was invoked during the body, and the
+          ;; subsequent longjmp short-circuited %signal-condition's
+          ;; saved-skip restore.  Leaving it elevated inhibits the next
+          ;; test's handler-bind handlers.
+          (setq *handler-bind-effective-skip* 0)
+          ;; Drop this frame's association as well.
+          (when *restart-frame-condition-map*
+            (setq *restart-frame-condition-map*
+                  (remove frame *restart-frame-condition-map*
+                          :test (lambda (f e) (eq (car e) f)))))
+          (if *restart-invoking-p*
+              (let ((r *restart-case-result*))
+                (setq *restart-invoking-p* nil)
+                (setq *restart-case-result* nil)
+                (setq *restarts-being-invoked* nil)
+                (values-list r))
               (if (%error-handler-active-p)
                   (%hc-longjmp)
                   (halt))))))))
 
-;;; Override invoke-restart to use longjmp for restart-case restarts
+;;; Override invoke-restart: dispatches on the restart cell's 5th
+;;; element.  If :case (set by %with-restarts), the cell came from a
+;;; restart-case form — we run the user fn, stash the MV result, and
+;;; %hc-longjmp back to the surrounding restart-case's setjmp frame.
+;;; Otherwise (restart-bind installs cells with no 5th element), we
+;;; just funcall the user fn and re-emit its values.
 (defun invoke-restart (name-or-restart &rest args)
-  "Invoke a restart by name or restart object.  When invoked from inside
-   a handler-case dynamic extent (the restart-case body is still active),
-   sets *restart-case-result* and longjmps to the restart-case's setjmp
-   frame.  When no handler-case is active (e.g. restart-bind alone), the
-   restart's body is called and its value is returned directly per CLHS
-   restart-bind semantics."
+  "Invoke a restart by name or restart object.
+
+   restart-case style (5th cell element = :CASE): the user fn runs to
+   completion in the dynamic context of invoke-restart, then we stash
+   its multiple-value list in *restart-case-result*, signal a synthetic
+   restart-invocation condition, and %hc-longjmp.  %with-restarts's
+   handler-case catches the longjmp and returns the stashed values.
+
+   restart-bind style (no :CASE marker): the user fn runs to completion
+   and we return its values directly.  If the user fn does a nonlocal
+   exit (THROW / RETURN-FROM the surrounding block), that unwind
+   happens during apply and the post-apply code below never runs."
   (let ((r (if (consp name-or-restart)
                name-or-restart
                (find-restart name-or-restart))))
     (if r
-        (let ((rfn (cadr r)))
+        (let ((rfn (cadr r))
+              (style (and (consp r) (consp (cdr r)) (consp (cddr r))
+                          (consp (cdddr r)) (nth 4 r))))
           ;; Mark this restart as in-progress so a recursive invoke-restart
           ;; in rfn's body finds the NEXT applicable restart instead of
           ;; looping on this one (restart-case.12).
           (setq *restarts-being-invoked* (cons r *restarts-being-invoked*))
-          ;; Capture the full MV list so (foo () (values 'a 'b ... 'f)) and
-          ;; (foo () (values)) flow through the longjmp -> values-list path
-          ;; without collapsing to a single primary value.  Without this,
-          ;; restart-case.{16,17} sees only the first value.
-          (let ((vals (multiple-value-list (apply rfn args))))
-            ;; Normal return from rfn: remove the in-progress marker.
-            (setq *restarts-being-invoked* (cdr *restarts-being-invoked*))
-            (if (%error-handler-active-p)
-                (progn
-                  ;; Store result and signal restart-invocation condition
-                  ;; so restart-case handler can recover it
-                  (setq *restart-case-result* vals)
-                  (setq *restart-invoking-p* t)
-                  ;; Create dummy condition so typep check in handler-case succeeds
-                  (let ((rc (make-array 2)))
-                    (aset rc 0 'restart-invocation)
-                    (aset rc 1 nil)
-                    (setq *current-condition* rc))
-                  (%hc-longjmp))
-                ;; No active frame — return vals as MV directly (restart-bind case).
-                (values-list vals))))
+          (cond
+            ((eq style :case)
+             ;; restart-case: run user fn, stash MV result, longjmp.
+             (let ((vals (multiple-value-list (apply rfn args))))
+               (setq *restart-case-result* vals)
+               (setq *restart-invoking-p* t)
+               (let ((rc (make-array 2)))
+                 (aset rc 0 'restart-invocation)
+                 (aset rc 1 nil)
+                 (setq *current-condition* rc))
+               (%hc-longjmp)))
+            (t
+             ;; restart-bind: run user fn, re-emit its values.
+             (let ((vals (multiple-value-list (apply rfn args))))
+               (setq *restarts-being-invoked* (cdr *restarts-being-invoked*))
+               (values-list vals)))))
         (error "No restart named ~A" name-or-restart))))
 
 (defun abort (&optional condition)

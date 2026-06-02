@@ -79,6 +79,50 @@
 
 (defun close (stream &rest args) t)
 
+;;; --- Stream subtype predicates ---
+;;; Used by typep dispatch (and directly callable from CL code) to
+;;; identify particular stream "shapes".  Each is parameterized on the
+;;; type-id stored at (cadr stream): 1=string-input, 2=string-output,
+;;; 3=echo, 4=two-way, 5=broadcast, 6=concatenated, 7=synonym,
+;;; 8=serial-io, 9=file.
+
+(defun string-stream-p (s)
+  "Return t if S is a string stream (input or output)."
+  (if (streamp s)
+      (let ((ty (%stream-type s)))
+        (if (= ty 1) t (if (= ty 2) t nil)))
+      nil))
+
+(defun broadcast-stream-p (s)
+  "Return t if S is a broadcast stream."
+  (if (streamp s)
+      (if (= (%stream-type s) 5) t nil)
+      nil))
+
+(defun concatenated-stream-p (s)
+  "Return t if S is a concatenated stream."
+  (if (streamp s)
+      (if (= (%stream-type s) 6) t nil)
+      nil))
+
+(defun echo-stream-p (s)
+  "Return t if S is an echo stream."
+  (if (streamp s)
+      (if (= (%stream-type s) 3) t nil)
+      nil))
+
+(defun synonym-stream-p (s)
+  "Return t if S is a synonym stream."
+  (if (streamp s)
+      (if (= (%stream-type s) 7) t nil)
+      nil))
+
+(defun two-way-stream-p (s)
+  "Return t if S is a two-way stream."
+  (if (streamp s)
+      (if (= (%stream-type s) 4) t nil)
+      nil))
+
 ;;; --- Standard stream variables ---
 ;;; These are defvar'd as nil above (before stream system exists).
 ;;; %init-streams creates actual stream objects and sets them.
@@ -102,7 +146,12 @@
 
 ;;; --- Stream constructors ---
 
-(defun make-string-output-stream ()
+(defun make-string-output-stream (&rest args)
+  "Create a string-output stream.  Per CLHS, accepts &key element-type;
+   we ignore it (all stream output is character-based) but accept any
+   keyword arguments so :element-type / :allow-other-keys forms compile.
+   Args are not validated against ANSI's strict program-error contract."
+  (declare (ignore args))
   (%make-stream 2 (cons nil nil)))
 
 (defun get-output-stream-string (stream)

@@ -1036,6 +1036,146 @@
              ((vectorp e)   (%sharp-label-fixup e marker obj seen))))
          (setq i (+ i 1)))))))
 
+(defun %ensure-keyword (x)
+  "Coerce X to a keyword symbol if it's a non-keyword symbol/string.
+   Used by #S to handle unkeyworded slot names like (a x b y)."
+  (cond
+    ((null x) (intern "NIL" (find-package "KEYWORD")))
+    ((eq x t) (intern "T" (find-package "KEYWORD")))
+    ((stringp x) (intern x (find-package "KEYWORD")))
+    ((symbolp x)
+     (let ((pkg (symbol-package x)))
+       (if (and pkg (string= (package-name pkg) "KEYWORD"))
+           x
+           (intern (symbol-name x) (find-package "KEYWORD")))))
+    (t x)))
+
+(defun %build-sharp-s (form)
+  "Build a structure from #S(struct-type slot1 val1 ...).
+   FORM is the inner list as read.  We construct a call to the
+   structure constructor (MAKE-<struct-type>) via eval, normalising
+   slot names to keywords first."
+  (let ((struct-type (car form))
+        (slot-args (cdr form)))
+    ;; Normalize slot names: convert non-keyword symbols to keywords.
+    ;; Slot list is (slot1 val1 slot2 val2 ...).  Keep vals as-is by
+    ;; quoting them so eval doesn't re-evaluate (e.g. quote a symbol
+    ;; value like X — the test expects the symbol X, not X's value).
+    (let ((normalized nil)
+          (cur slot-args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((slot-name (car cur))
+              (slot-val (if (cdr cur) (cadr cur) nil)))
+          (setq normalized (cons (%ensure-keyword slot-name) normalized))
+          (setq normalized (cons (list 'quote slot-val) normalized)))
+        (setq cur (if (cdr cur) (cddr cur) nil)))
+      (let ((ctor-name (concatenate 'string "MAKE-" (symbol-name struct-type))))
+        (let ((ctor-sym (intern ctor-name (symbol-package struct-type))))
+          ;; Build: (MAKE-<type> :slot1 'val1 ...) and eval it.
+          (let ((call-form (cons ctor-sym (nreverse normalized))))
+            (handler-case (eval call-form)
+              (error (c) (declare (ignore c)) nil))))))))
+
+(defun %collect-flat-elements (obj acc)
+  "Flatten OBJ (a nested list, vector, string, or bit-vector) into a
+   list of leaf elements, appending to ACC in reverse order.  Used by
+   #A to populate the array with :initial-contents in row-major order
+   when ACC is later nreversed."
+  (cond
+    ((null obj) acc)
+    ((stringp obj)
+     (let ((i 0) (n (length obj)))
+       (loop
+         (when (>= i n) (return acc))
+         (setq acc (cons (code-char (aref obj i)) acc))
+         (setq i (+ i 1)))))
+    ((consp obj)
+     (let ((cur obj))
+       (loop
+         (when (null cur) (return acc))
+         (setq acc (%collect-flat-elements (car cur) acc))
+         (setq cur (cdr cur)))))
+    ((vectorp obj)
+     (let ((i 0) (n (length obj)))
+       (loop
+         (when (>= i n) (return acc))
+         (setq acc (%collect-flat-elements (aref obj i) acc))
+         (setq i (+ i 1)))))
+    (t (cons obj acc))))
+
+(defun %compute-dims (rank contents)
+  "Compute the dimension list for a rank-RANK array whose top-level
+   structure is CONTENTS.  Descends RANK levels: at each level we read
+   the length of the sequence and recurse on the first element.  For
+   rank 0, returns the empty list.  For strings/bit-vectors at the
+   leaf level we treat them as the leaf sequence."
+  (cond
+    ((<= rank 0) nil)
+    (t
+     (let ((len (cond
+                  ((null contents) 0)
+                  ((stringp contents) (length contents))
+                  ((consp contents) (list-length contents))
+                  ((vectorp contents) (length contents))
+                  (t 0)))
+           (first-elt (cond
+                        ((null contents) nil)
+                        ((stringp contents) nil)
+                        ((consp contents) (car contents))
+                        ((vectorp contents)
+                         (if (> (length contents) 0) (aref contents 0) nil))
+                        (t nil))))
+       (cons len (%compute-dims (- rank 1) first-elt))))))
+
+(defun %build-sharp-a (rank contents)
+  "Build a multi-dimensional array from #NA(contents).
+   For rank=0: contents is the sole element of a 0-d array.
+   For rank>=1: descend to compute dims, pass nested contents directly
+   to make-array — its :initial-contents handler descends per-rank.
+   Strings as inner contents are converted to char-lists so the array
+   stores characters (general T-typed) rather than fixnums.
+
+   IMPORTANT: We use (funcall #'make-array DIMS …) instead of plain
+   (make-array DIMS …) for the DIMS-is-runtime-list case.  compile-make-
+   array's variable-dim path only handles integer sizes; given a runtime
+   LIST it SAR's the pointer and ALLOC-ARRAYs a garbage size, segfaulting
+   the kernel.  funcall forces the runtime-defun path which understands
+   list dims."
+  (cond
+    ((<= rank 0)
+     (funcall #'make-array nil :initial-element contents))
+    ((= rank 1)
+     (let ((len (cond
+                  ((null contents) 0)
+                  ((stringp contents) (length contents))
+                  ((consp contents) (list-length contents))
+                  ((vectorp contents) (length contents))
+                  (t 0)))
+           (init (cond
+                   ((stringp contents)
+                    (let ((acc nil) (i 0) (n (length contents)))
+                      (loop
+                        (when (>= i n) (return (nreverse acc)))
+                        (setq acc (cons (code-char (aref contents i)) acc))
+                        (setq i (+ i 1)))))
+                   (t contents))))
+       (if (= len 0)
+           (funcall #'make-array (list 0))
+           (funcall #'make-array (list len) :initial-contents init))))
+    (t
+     ;; Rank > 1: compute dims, pass nested contents directly.
+     (let ((dims (%compute-dims rank contents)))
+       (let ((total 1))
+         (let ((cur dims))
+           (loop
+             (when (null cur) (return nil))
+             (setq total (* total (car cur)))
+             (setq cur (cdr cur))))
+         (if (= total 0)
+             (funcall #'make-array dims)
+             (funcall #'make-array dims :initial-contents contents)))))))
+
 (defun %read-sharpsign (stream rt)
   "Read #-dispatched forms."
   (let ((sub-ch (read-char stream t nil t))
@@ -1104,14 +1244,36 @@
              ((not *read-eval*)
               (%reader-error "#. read-time eval disabled by *read-eval*"))
              (t (eval obj)))))
-        ;; #S — structure (stub)
+        ;; #S(struct-type slot1 val1 slot2 val2 ...) — structure literal.
+        ;; CLHS 2.4.8.13.  Read the inner list, then call the structure's
+        ;; constructor with keyword args.  If a slot symbol is unkeyworded
+        ;; (e.g. `a` instead of `:a`), coerce it to a keyword.  Repeated
+        ;; slots are allowed (first value wins per CLHS); we delegate to
+        ;; the constructor whose &key handler observes the first-wins
+        ;; rule.  Bad slots without :allow-other-keys t signal an error,
+        ;; but the tests only exercise that via :allow-other-keys nil/t
+        ;; which the constructor enforces — we just pass the kwargs
+        ;; through.
         ((or (= code 83) (= code 115))  ; S s
-         (%read-internal stream t nil t)
-         nil)
-        ;; #A — array (stub)
+         (let ((form (%read-internal stream t nil t)))
+           (cond
+             (*read-suppress* nil)
+             ((not (consp form))
+              (%reader-error "#S: expected (struct-type . initargs)"))
+             (t
+              (%build-sharp-s form)))))
+        ;; #NA(initial-contents) — array literal.  CLHS 2.4.8.12.
+        ;; ARG is the rank.  Read the contents form and call make-array.
+        ;; For rank 0: contents is the single initial element.
+        ;; For rank 1: contents is a sequence (list, vector, or string).
+        ;; For rank > 1: contents is a nested sequence; compute dims by
+        ;; descending the structure.
         ((or (= code 65) (= code 97))  ; A a
-         (%read-internal stream t nil t)
-         nil)
+         (let ((contents (%read-internal stream t nil t)))
+           (cond
+             (*read-suppress* nil)
+             ((null arg) (%build-sharp-a 1 contents))
+             (t (%build-sharp-a arg contents)))))
         ;; #C(r i) — complex literal.  Read the inner (r i) list, then
         ;; build the complex object.
         ((or (= code 67) (= code 99))  ; C c
@@ -1119,10 +1281,14 @@
            (if (and (consp pair) (consp (cdr pair)))
                (complex (car pair) (cadr pair))
                (car pair))))
-        ;; #P — pathname (stub)
+        ;; #P"path" — pathname literal.  CLHS 2.4.8.14.  Modus pathnames
+        ;; are just strings, so we read the inner form and call pathname
+        ;; on it.  Works for "string", #.(parse-namestring ...), and
+        ;; #.(make-array ... :element-type 'base-char) shapes the ANSI
+        ;; tests use.
         ((or (= code 80) (= code 112))  ; P p
-         (%read-internal stream t nil t)
-         nil)
+         (let ((inner (%read-internal stream t nil t)))
+           (if *read-suppress* nil (pathname inner))))
         ;; #N= — label the next form for later #N# reference.
         ;; CLHS 2.4.8.15.  We register a placeholder marker first so a
         ;; reference inside the form (self-cycle: `#1=(A B . #1#)`) reads

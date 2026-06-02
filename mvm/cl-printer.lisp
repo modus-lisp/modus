@@ -416,23 +416,46 @@
                       ;; Uninterned symbol
                       (if (or gensym readably) t nil))
                      (t
-                      ;; Check if symbol is accessible in current package
+                      ;; Check if symbol is accessible in current package.
+                      ;; First fast path: if the symbol's HOME package IS the
+                      ;; current package (by object identity OR by name —
+                      ;; nicknames let two `find-package` calls return distinct
+                      ;; package objects that share the same canonical name,
+                      ;; e.g. CL-USER vs COMMON-LISP-USER), it is accessible
+                      ;; without walking the package's internal/external
+                      ;; lists.  Catches the post-`%intern-symbol-pkg` case
+                      ;; where compile-quote sets the symbol's home package
+                      ;; via the pkg-tag but does not splice the symbol into
+                      ;; the package's internal slot.  Without it, every
+                      ;; `'FOO` printed while `*package*` is the symbol's own
+                      ;; home package falls through to `%pkg-find-sym` (a
+                      ;; linear walk that misses lazily-stamped symbols) and
+                      ;; emits a bogus `PKG::FOO` qualifier.
                       (let ((accessible nil))
-                        (when (%pkg-p cur-pkg)
-                          (let ((found (%pkg-find-sym name cur-pkg)))
-                            (when (and found (eq found sym))
-                              (setq accessible t))))
+                        (cond
+                          ((and (%pkg-p pkg) (%pkg-p cur-pkg)
+                                (or (eq pkg cur-pkg)
+                                    (let ((pn (package-name pkg))
+                                          (cn (package-name cur-pkg)))
+                                      (and (stringp pn) (stringp cn)
+                                           (string= pn cn)))))
+                           (setq accessible t))
+                          ((%pkg-p cur-pkg)
+                           (let ((found (%pkg-find-sym name cur-pkg)))
+                             (when (and found (eq found sym))
+                               (setq accessible t)))))
                         (not accessible))))
                    nil)))
           (cond
             ;; Uninterned symbol: print #:name (but native-accessible
-            ;; symbols skip this branch).  Per CLHS §22.1.3.2, the #:
-            ;; prefix is an escape — *print-escape* and *print-readably*
-            ;; gate it.  *print-gensym* only matters WHEN escape is on
-            ;; (it controls whether uninterned symbols are distinguished
-            ;; from interned ones in the readable representation).
+            ;; symbols skip this branch).  Per CLHS §22.1.6.3, the #:
+            ;; prefix is gated by *print-gensym* — when false, uninterned
+            ;; symbols are printed WITHOUT the #: prefix even though
+            ;; the result is not READably round-trippable.  *print-readably*
+            ;; T forces #: (round-trip mandatory).  *print-escape* alone is
+            ;; not enough; print.symbol.prefix.4 / .2 fail without this.
             ((and (null pkg) (not native-accessible)
-                  (or readably escape))
+                  (or readably (and escape gensym)))
              (%print-char 35 stream) ; #
              (%print-char 58 stream) ; :
              (let* ((rt *readtable*)
@@ -1356,12 +1379,15 @@
 ;;; Pad string to minimum column
 (defun %fmt-pad-aligned (str mincol colinc minpad padchar stream right-align)
   "Write STR padded to MINCOL using PADCHAR, with MINPAD minimum padding.
-   RIGHT-ALIGN: T puts padding first (~@A/~@S/~D-style). NIL puts string first."
+   RIGHT-ALIGN: T puts padding first (~@A/~@S/~D-style). NIL puts string first.
+   PADCHAR can be a character object (e.g. from `v` arg) or a code; ensured
+   to a code so `%print-char` gets a fixnum (was a bug: char object reaching
+   `write-char-to-stream` mis-emitted, producing wrong padding chars)."
   (let ((slen (if (stringp str) (array-length str) 0))
         (mc (if mincol mincol 0))
         (ci (if colinc colinc 1))
         (mp (if minpad minpad 0))
-        (pc (if padchar padchar 32)))
+        (pc (%ensure-char-code (if padchar padchar 32))))
     (let ((padding mp))
       ;; CLHS 22.3.5.1: MINPAD can be negative.  The grow loop must respect
       ;; that the only constraint is (>= slen+padding mincol); negative

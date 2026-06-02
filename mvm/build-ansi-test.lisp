@@ -2364,14 +2364,46 @@
                          (values t (car %whti-pair) (cdr %whti-pair))))))
             ,@body))))
 
-    ;; (with-package-iterator (next pkg symbols) body...)
-    ;; Stub: just run body with (next) returning nil
+    ;; (with-package-iterator (next pkg-or-pkgs &rest types) body...)
+    ;; Per CLHS 11.1.5.1.1: bind ITER-NAME so that each call returns
+    ;; (values more-p symbol access-type containing-package).  TYPES is
+    ;; some non-empty subset of (:internal :external :inherited).  The
+    ;; rewriter materialises the symbol list up-front and pops one
+    ;; entry per (next) call.
     ((and (eq (car form) 'with-package-iterator) (cdr form) (consp (cadr form)))
      (let* ((binding (cadr form))
             (iter-name (car binding))
-            (body (mapcar #'rewrite-reader-forms (cddr form))))
-       `(flet ((,iter-name () (values nil nil nil nil)))
-          ,@body)))
+            (pkg-form (cadr binding))
+            (types (cddr binding))
+            (body (mapcar #'rewrite-reader-forms (cddr form)))
+            (pkgs-var (gensym "WPI-PKGS"))
+            (entries-var (gensym "WPI-ENTRIES"))
+            (pk-var (gensym "WPI-PK"))
+            (e-var (gensym "WPI-E"))
+            (use-var (gensym "WPI-USE"))
+            (top-var (gensym "WPI-TOP")))
+       `(let* ((,pkgs-var (let ((__p ,pkg-form))
+                            (cond ((listp __p) (mapcar #'find-package __p))
+                                  ((or (stringp __p) (symbolp __p)) (list (find-package __p)))
+                                  (t (list __p)))))
+               (,entries-var nil))
+          (dolist (,pk-var ,pkgs-var)
+            ,@(when (member :internal types :test #'eq)
+                `((dolist (,e-var (%pkg-internal ,pk-var))
+                    (setq ,entries-var (cons (list (cdr ,e-var) :internal ,pk-var) ,entries-var)))))
+            ,@(when (member :external types :test #'eq)
+                `((dolist (,e-var (%pkg-external ,pk-var))
+                    (setq ,entries-var (cons (list (cdr ,e-var) :external ,pk-var) ,entries-var)))))
+            ,@(when (member :inherited types :test #'eq)
+                `((dolist (,use-var (%pkg-use-list ,pk-var))
+                    (dolist (,e-var (%pkg-external ,use-var))
+                      (setq ,entries-var (cons (list (cdr ,e-var) :inherited ,pk-var) ,entries-var)))))))
+          (flet ((,iter-name ()
+                   (cond ((null ,entries-var) (values nil nil nil nil))
+                         (t (let ((,top-var (car ,entries-var)))
+                              (setq ,entries-var (cdr ,entries-var))
+                              (values t (car ,top-var) (cadr ,top-var) (caddr ,top-var)))))))
+            ,@body))))
 
     ;; (catch-type-error form) → (handler-case form
     ;;                              (type-error (c) (declare (ignore c)) 'type-error)

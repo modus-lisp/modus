@@ -319,53 +319,30 @@
   *all-packages*)
 
 (defun find-package (name)
-  "Find package by name or nickname.
-
-   CL-TEST hidden alias: the build script reads ANSI test source with
-   *package*=CL-USER, so every `'foo' literal is stamped CL-USER at
-   compile time.  The original ANSI test source assumes the reader's
-   *package* was CL-TEST and asserts
-       (eqlt (symbol-package 'foo) (find-package :cl-test)).
-   We resolve \"CL-TEST\" specially HERE — without adding it to
-   CL-USER's nicknames list — so `(package-nicknames CL-USER)` still
-   returns the ANSI-expected `(\"CL-USER\")`.  The cl-symbols.lsp
-   suite has an explicit
-       (deftest common-lisp-user-package-nicknames
-         (package-nicknames (find-package \"COMMON-LISP-USER\"))
-         (\"CL-USER\"))
-   which would regress if we polluted the nicknames slot."
+  "Find package by name or nickname."
   (cond
     ((%pkg-p name) name)
     (t
-     (let ((name-str (%pkg-string-designator name)))
-       (when (and name-str (string-equal name-str "CL-TEST"))
-         (let ((clu (find-package-1 "COMMON-LISP-USER")))
-           (when clu (return-from find-package clu))))
-       (find-package-1 name-str)))))
-
-(defun find-package-1 (name-str)
-  "Internal find-package: walks *all-packages* matching primary name
-   then nicknames against NAME-STRING via string-equal.  Split out so
-   the public FIND-PACKAGE can short-circuit the CL-TEST alias check
-   without polluting CL-USER's nickname list."
-  (let ((cur *all-packages*))
-    (loop
-      (when (null cur) (return nil))
-      (let ((pkg (car cur)))
-        (when (%pkg-name pkg)
-          (when (string-equal (%pkg-name pkg) name-str)
-            (return pkg))
-          (let ((nicks (%pkg-nicknames pkg))
-                (found nil))
-            (let ((ncur nicks))
-              (loop
-                (when (null ncur) (return nil))
-                (when (string-equal (car ncur) name-str)
-                  (setq found t)
-                  (return nil))
-                (setq ncur (cdr ncur))))
-            (when found (return pkg)))))
-      (setq cur (cdr cur)))))
+     (let ((name-str (%pkg-string-designator name))
+           (cur *all-packages*))
+       (loop
+         (when (null cur) (return nil))
+         (let ((pkg (car cur)))
+           (when (%pkg-name pkg)
+             (when (string-equal (%pkg-name pkg) name-str)
+               (return pkg))
+             ;; Check nicknames
+             (let ((nicks (%pkg-nicknames pkg))
+                   (found nil))
+               (let ((ncur nicks))
+                 (loop
+                   (when (null ncur) (return nil))
+                   (when (string-equal (car ncur) name-str)
+                     (setq found t)
+                     (return nil))
+                   (setq ncur (cdr ncur))))
+               (when found (return pkg)))))
+         (setq cur (cdr cur)))))))
 
 (defun %make-package-object (name-string)
   "Allocate and initialize an empty package object."
@@ -382,17 +359,7 @@
 (defun make-package (name &rest args)
   "Create a new package with NAME.
    Per CLHS: signals PROGRAM-ERROR on odd-length plist or unknown
-   keyword unless :allow-other-keys is non-nil.
-
-   CL-TEST alias: find-package short-circuits \"CL-TEST\" lookups to
-   the CL-USER package, so cl-conditions:1669's
-       (make-package \"CL-TEST\" :use (list \"CL\"))
-   hits the existing-package branch below and returns CL-USER without
-   creating a second package.  This way (symbol-package 'foo) (which
-   is the CL-USER package — compile-time stamp from a CL-USER-read
-   test source) equals (find-package :cl-test).  Avoids polluting
-   CL-USER's nicknames list — cl-symbols.lsp asserts an exact
-   (\"CL-USER\") nickname list."
+   keyword unless :allow-other-keys is non-nil."
   (let ((name-str (%pkg-string-designator name))
         (nicknames nil)
         (use-list nil)
@@ -1303,12 +1270,7 @@
    cl-conditions.lisp) and again on demand from test code via
    the explicit ansi-aux helper.  Boot is the only place where we
    can guarantee set-macro-function has run before test code runs,
-   so this is also where we install the runtime DEFPACKAGE macro.
-
-   Note: ansi-aux's packages00-aux.lsp ALSO defines set-up-packages
-   (without our DEFPACKAGE macro registration); last-defun-wins makes
-   that one shadow ours.  Critical setup that must survive is hooked
-   into make-package instead (see CL-TEST alias)."
+   so this is also where we install the runtime DEFPACKAGE macro."
   (safely-delete-package "A")
   (safely-delete-package "B")
   (safely-delete-package "Q")

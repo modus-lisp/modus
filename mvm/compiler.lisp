@@ -1250,6 +1250,19 @@
                 ;; (setf (svref a i) v) → (aset a i v)
                 ((and (consp place) (name-eq (car place) "SVREF"))
                  `(aset ,(cadr place) ,(caddr place) ,value))
+                ;; (setf (the type place) v) → (setf place v).  The type
+                ;; declaration is informational; per CLHS 5.1.3 the inner
+                ;; place receives the new value with the declared type
+                ;; in scope.
+                ((and (consp place) (name-eq (car place) "THE")
+                      (= (length place) 3))
+                 `(setf ,(caddr place) ,value))
+                ;; (setf (values p1 p2 ...) form) → (multiple-value-setq
+                ;; (p1 p2 ...) form).  Per CLHS 5.1.2.3 each pi is updated
+                ;; with the corresponding return value from FORM; trailing
+                ;; pi without a value get NIL.
+                ((and (consp place) (name-eq (car place) "VALUES"))
+                 `(multiple-value-setq ,(cdr place) ,value))
                 ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
                 ;; Pass ALL place args plus the value (was only passing the
                 ;; first arg, which silently dropped the index in

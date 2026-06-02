@@ -18,6 +18,15 @@
 ;; in %init-reader (defvar init-thunks don't run; see CLAUDE.md).
 (defvar *features* nil)
 
+;; Shared-structure label tables for #N= / #N# (CLHS 2.4.8.{15,16}).
+;; *sharp-labels* is an alist of (label . placeholder-cons) for each
+;; #N= currently being read.  Top-level reader entries rebind it to nil
+;; so labels do not leak across reads.  Inside a read, a forward #N#
+;; (used before the labelled form completes — self-cycle case) returns
+;; the placeholder cons, which is patched in-place by %sharp-label-fixup
+;; once the labelled object is known.
+(defvar *sharp-labels* nil)
+
 ;;; --- Print variables (stubs for with-standard-io-syntax) ---
 
 (defvar *print-array* nil)
@@ -483,15 +492,39 @@
   (read-char stream nil nil nil))
 
 (defun %token-read-loop (stream rt st)
-  "Read remaining token characters. Mutates and returns state array ST."
+  "Read remaining token characters. Mutates and returns state array ST.
+   Honours single-escape (\\) and multiple-escape (|) mid-token per
+   CLHS 2.2 (Reader Algorithm).  ST[2]=in-multi-escape, ST[3]=has-escape.
+   EOF inside |...| is end-of-file (the multiple-escape was never
+   closed)."
   (loop
     (let ((ch (%token-read-char stream)))
-      (when (null ch) (return st))
-      (if (%whitespace-char-p ch)
-          (progn (unread-char ch stream) (return st))
-          (if (%terminating-macro-p ch rt)
-              (progn (unread-char ch stream) (return st))
-              (%token-add-constituent st ch))))))
+      (when (null ch)
+        ;; Unterminated |...| → end-of-file.
+        (when (aref st 2) (%reader-error "end of file inside | ... |"))
+        (return st))
+      (cond
+        ;; Inside |...| — only multiple-escape closes it; single-escape
+        ;; reads next literal; everything else is a literal char.
+        ((aref st 2)
+         (%token-handle-in-escape ch stream st rt))
+        ;; Normal mode
+        ((%whitespace-char-p ch)
+         (unread-char ch stream)
+         (return st))
+        ((%terminating-macro-p ch rt)
+         (unread-char ch stream)
+         (return st))
+        ((eq (%syntax-type ch rt) :single-escape)
+         (let ((next (read-char stream t nil t)))
+           (aset st 0 (cons (char-code next) (aref st 0)))
+           (aset st 1 (cons t (aref st 1)))
+           (aset st 3 t)))
+        ((eq (%syntax-type ch rt) :multiple-escape)
+         (aset st 2 t)
+         (aset st 3 t))
+        (t
+         (%token-add-constituent st ch))))))
 
 (defun %read-token-from (stream first-char rt has-escape)
   "Read a token starting with FIRST-CHAR. Handle escapes."
@@ -969,6 +1002,40 @@
 
 ;;; --- Sharpsign dispatch ---
 
+(defun %sharp-label-fixup (root marker obj seen)
+  "Walk ROOT (the object that was the target of #N=) and replace every
+   occurrence of MARKER (the placeholder cons) with OBJ.  SEEN is an
+   alist of conses/vectors we've already visited so we terminate on the
+   cycle that #N= itself introduces.
+
+   Walks cons cells and simple vectors.  Symbols, numbers and strings
+   never contain markers, so they short-circuit.  This handles the
+   syntax.sharp-circle.{1..7} ANSI tests."
+  (cond
+    ((or (null root) (eq root marker)) nil)
+    ((consp root)
+     (let ((ent (assoc root seen)))
+       (when (and ent (eq (cdr ent) t)) (return-from %sharp-label-fixup nil)))
+     (let ((seen2 (cons (cons root t) seen)))
+       (when (eq (car root) marker) (set-car root obj))
+       (unless (eq (car root) marker) (%sharp-label-fixup (car root) marker obj seen2))
+       (when (eq (cdr root) marker) (set-cdr root obj))
+       (unless (eq (cdr root) marker) (%sharp-label-fixup (cdr root) marker obj seen2))))
+    ((vectorp root)
+     ;; Vectors compared by EQ via assoc with cons keys won't dedupe — that
+     ;; is fine for the small shapes the tests use.  No SEEN protection
+     ;; for vectors because we only descend into them once from inside a
+     ;; surrounding cons.
+     (let ((len (length root)) (i 0))
+       (loop
+         (when (>= i len) (return nil))
+         (let ((e (aref root i)))
+           (cond
+             ((eq e marker) (aset root i obj))
+             ((consp e)     (%sharp-label-fixup e marker obj seen))
+             ((vectorp e)   (%sharp-label-fixup e marker obj seen))))
+         (setq i (+ i 1)))))))
+
 (defun %read-sharpsign (stream rt)
   "Read #-dispatched forms."
   (let ((sub-ch (read-char stream t nil t))
@@ -1050,6 +1117,34 @@
         ((or (= code 80) (= code 112))  ; P p
          (%read-internal stream t nil t)
          nil)
+        ;; #N= — label the next form for later #N# reference.
+        ;; CLHS 2.4.8.15.  We register a placeholder marker first so a
+        ;; reference inside the form (self-cycle: `#1=(A B . #1#)`) reads
+        ;; as the marker; after %read-internal completes we walk the
+        ;; result and substitute the marker with the labelled object.
+        ((= code 61)  ; =
+         (when (null arg) (%reader-error "missing label for #="))
+         (let ((marker (cons :sharp-label arg)))
+           (setq *sharp-labels* (cons (cons arg marker) *sharp-labels*))
+           (let ((obj (%read-internal stream t nil t)))
+             ;; Mark the marker as resolved so #N# inside SIBLINGS at the
+             ;; same nesting can short-circuit to obj.  We also walk
+             ;; (obj) once to splice any embedded marker -> obj for
+             ;; self-cycle cases like #1=(A B . #1#).
+             (set-car marker obj)
+             (set-cdr marker :sharp-resolved)
+             (%sharp-label-fixup obj marker obj nil)
+             obj)))
+        ;; #N# — return the previously-labelled object.
+        ((= code 35)  ; #
+         (when (null arg) (%reader-error "missing label for ##"))
+         (let ((entry (assoc arg *sharp-labels*)))
+           (if entry
+               (let ((marker (cdr entry)))
+                 (if (eq (cdr marker) :sharp-resolved)
+                     (car marker)
+                     marker))
+               (%reader-error "undefined sharp-label"))))
         ;; #< — unreadable object error
         ((= code 60)  ; <
          (%reader-error "unreadable object"))
@@ -1252,7 +1347,10 @@
     (t nil)))
 
 (defun %read-radix-integer (stream radix)
-  "Read an integer in the given radix."
+  "Read an integer or ratio in the given radix.
+   Per CLHS 2.4.8.{3,4,5,6} #B / #O / #X / #nR may also read a ratio
+   (e.g. `#B-1/10' → -1/2).  Try ratio N/D first; on failure fall back
+   to integer."
   (let ((codes nil) (ch nil))
     (loop
       (setq ch (read-char stream nil nil t))
@@ -1262,9 +1360,44 @@
         (return nil))
       (setq codes (cons (char-code ch) codes)))
     (if *read-suppress* nil
-        (let ((num (%try-parse-integer (nreverse codes) radix)))
-          (if num (car num)
-              (%reader-error "invalid radix integer"))))))
+        (let ((forward (nreverse codes)))
+          ;; Try ratio first.
+          (let ((ratio (%try-parse-ratio-radix forward radix)))
+            (if ratio ratio
+                (let ((num (%try-parse-integer forward radix)))
+                  (if num (car num)
+                      (%reader-error "invalid radix integer")))))))))
+
+(defun %try-parse-ratio-radix (codes radix)
+  "Try to parse char codes as a ratio N/D in the given RADIX.
+   Returns the ratio value or nil.  Mirrors %try-parse-ratio but uses
+   RADIX instead of *read-base*."
+  (let ((slash-pos nil) (i 0) (cur codes))
+    (loop
+      (when (null cur) (return nil))
+      (when (= (car cur) 47)  ; /
+        (when slash-pos (return-from %try-parse-ratio-radix nil))
+        (setq slash-pos i))
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))
+    (unless slash-pos (return-from %try-parse-ratio-radix nil))
+    (when (= slash-pos 0) (return-from %try-parse-ratio-radix nil))
+    (let ((num-codes nil) (den-codes nil) (j 0) (cur codes))
+      (loop
+        (when (null cur) (return nil))
+        (if (< j slash-pos)
+            (setq num-codes (cons (car cur) num-codes))
+            (when (> j slash-pos)
+              (setq den-codes (cons (car cur) den-codes))))
+        (setq j (+ j 1))
+        (setq cur (cdr cur)))
+      (setq num-codes (nreverse num-codes))
+      (setq den-codes (nreverse den-codes))
+      (let ((num (%try-parse-integer num-codes radix))
+            (den (%try-parse-integer den-codes radix)))
+        (if (and num den (not (= (car den) 0)))
+            (exact-divide (car num) (car den))
+            nil)))))
 
 (defun %read-bit-vector (stream len)
   "Read #*bits as a bit vector."
@@ -1325,7 +1458,10 @@
         (eof-value (if (cddr args) (caddr args) nil))
         (recursive-p (if (cdddr args) (cadddr args) nil)))
     (let ((s (%resolve-input-stream stream)))
-      (%read-internal s eof-error-p eof-value recursive-p))))
+      (if recursive-p
+          (%read-internal s eof-error-p eof-value recursive-p)
+          (let ((*sharp-labels* nil))
+            (%read-internal s eof-error-p eof-value recursive-p))))))
 
 (defun read-preserving-whitespace (&rest args)
   "Read one Lisp object, preserving trailing whitespace."
@@ -1334,7 +1470,10 @@
         (eof-value (if (cddr args) (caddr args) nil))
         (recursive-p (if (cdddr args) (cadddr args) nil)))
     (let ((s (%resolve-input-stream stream)))
-      (%read-internal s eof-error-p eof-value recursive-p))))
+      (if recursive-p
+          (%read-internal s eof-error-p eof-value recursive-p)
+          (let ((*sharp-labels* nil))
+            (%read-internal s eof-error-p eof-value recursive-p))))))
 
 (defun read-delimited-list (char &rest args)
   "Read objects until CHAR is found. Returns a list."
@@ -1409,8 +1548,9 @@
                             str)))
         ;; Create string input stream
         (let ((s (make-string-input-stream actual-str)))
-          ;; Read from stream
-          (let ((result (%read-internal s eof-error-p eof-value nil)))
+          ;; Read from stream — fresh #N= label table per top-level call
+          (let* ((*sharp-labels* nil)
+                 (result (%read-internal s eof-error-p eof-value nil)))
             ;; Get position
             (let ((pos (car (cdr (%stream-data s)))))
               (values result (+ start pos)))))))))

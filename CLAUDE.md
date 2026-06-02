@@ -94,12 +94,12 @@ runtime/        Runtime type system
 
 ## ANSI CL Conformance
 
-**Real numbers (single run, current state):**
-- Expected: ~17,700 tests
-- Ran: ~660
-- Passed: ~353 (53% of those that ran)
-- Failed: ~307
-- Lost: ~17,048 (fork crashed in a way the SIGSEGV handler couldn't recover)
+**Real numbers (current state, x64 Linux):**
+- Expected: 17,352 tests
+- Ran: 17,268
+- Passed: 14,633 (84.33% overall, 84.74% of those that ran)
+- Failed: 2,635
+- Lost-to-crash: 84
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw
@@ -127,7 +127,12 @@ Streams           ✓  9 stream types, read/write-char, string/file/broadcast/ec
 Reader            ✓  full read, readtable, #-dispatch, backquote, package qualifiers
 Printer           ✓  write with *print-* vars, 50+ format directives
 Conditions        ~  24 types, handler-case/bind, restart-case, signal/warn/cerror
-                     (handler-case has gaps — many ANSI tests crash forks)
+                     handler-case :no-error landed (commit 334cc83); handler-bind
+                     frame inhibition + restart-aware warn/cerror landed via the
+                     COND agent fleet.  Restart-case nested invoke + MV
+                     propagation landed (b09b978).  Remaining gaps: restart-bind
+                     return-from across closure body, with-condition-restarts
+                     condition→restart association, assert macro semantics.
 CLOS              ~  defclass, defgeneric, defmethod, standard method combination
                      :before/:after/:around, call-next-method, class precedence lists
                      (define-method-combination tests fail)
@@ -136,8 +141,11 @@ Eval/Compile/Load ✓  Tree-walking interpreter, load from file, macroexpand
 Closures          ✓  Mutable closures via heap-allocated cells
 unwind-protect    ✓  setjmp/longjmp, cleanup on both normal and error paths
 GC                ✓  Cheney semi-space copying collector
-Setf              ~  defsetf/define-setf-expander/get-setf-expansion/define-modify-macro
-                     register, but compile-time only (no runtime defsetf in eval)
+Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expander,
+                     get-setf-expansion, define-modify-macro register, but
+                     compile-time only (no runtime defsetf in eval).  setf (the
+                     type place) and setf (values ...) expand correctly via
+                     compile.lisp's SETF macro (commit f03d9f1).
 ~400+ CL functions implemented
 ```
 
@@ -328,7 +336,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 1. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
 2. **Variable-index ASET bug**: When `(aset arr idx val)` with a variable `idx` is a non-last form (`dest=nil`), the value may not load correctly. **Workaround**: `(let ((dummy (aset arr idx val))) body)` forces `dest=frame-slot`.
-3. **Symbol identity**: `%intern-symbol` sometimes creates duplicate objects for the same name-hash. Two symbols with identical hashes may be `eql` but not `eq`. Use `equal` for symbol comparison in critical paths.
+3. **Symbol identity — RESOLVED via unified intern (daa0763)**: `%intern-symbol-pkg` now stamps the home package at intern time and `compile-quote` routes every `'foo` literal through it.  `(eq 'foo 'foo)` holds across compile-time literal, runtime READ, and the CL-symbol wrapper / native MVM sym boundary.  When the user says "I thought we fixed symbol equality" they mean stop adding `string=`-on-symbol-name duct tape.  See `feedback_eq_works_on_symbols.md`.
 4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
 6. **Funcall tag — RESOLVED via OR-3**: Function pointers are explicitly tagged in `mvm-fn-addr` (translate-x64.lisp ~line 2794): `LEA + OR-3`.  Raw fn-code is NOP-padded so the low nibble is 0; OR-3 yields tagged fn pointers with low nibble `0x3` always.  Tags `cons=0x1`, `fn=0x3`, `char=0x5`, `obj=0x9` are mutually disjoint in the low nibble, so the historic "funcall-tag-collision" / "fn-addrs at vaddr ???05" classes are STRUCTURALLY impossible.  When bytecode shifts move function addresses, the OR-3 still produces a clean tag — predicate flips don't happen via tag-nibble accident.  Layout-shift cascades that appear during code changes have a different cause (TBD; likely branch-displacement limits, GC root-scan edges, or static-data alignment).

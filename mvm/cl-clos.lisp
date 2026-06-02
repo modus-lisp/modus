@@ -46,14 +46,6 @@
 ;; mc-object: list (name operator identity-with-one-argument)
 (defvar *method-combinations* nil)
 
-;; Default-primary registry: alist of (gf-name . symbol-naming-default-fn).
-;; Looked up by %gf-dispatch-standard when an applicable method list contains
-;; only auxiliary methods (:before / :after / :around).  Per CLHS, the
-;; standard system-supplied primary still runs in that case — fixing
-;; shared-initialize.7.x / 8.x, change-class.5.x and similar tests that
-;; would otherwise hit "no applicable primary method".
-(defvar *gf-default-primaries* nil)
-
 ;; Dynamic variable for call-next-method chain
 ;; Holds: list of (qualifier specializer-list . fn) remaining
 (defvar *%next-methods* nil)
@@ -1299,156 +1291,6 @@
     ;; Return the name (CLHS says define-method-combination returns the name)
     name))
 
-(defun %register-gf-default-primary (gf-name default-fn-sym)
-  "Register DEFAULT-FN-SYM as the standard primary fallback for GF-NAME.
-   When %gf-dispatch-standard finds no applicable primary method (only
-   :before / :after / :around), it consults this registry and applies
-   the named function to the runtime args list."
-  (let ((new-reg nil)
-        (cur *gf-default-primaries*))
-    (loop
-      (when (null cur) (return nil))
-      (when (not (eq (car (car cur)) gf-name))
-        (setq new-reg (cons (car cur) new-reg)))
-      (setq cur (cdr cur)))
-    (setq *gf-default-primaries*
-          (cons (cons gf-name default-fn-sym) new-reg)))
-  gf-name)
-
-(defun %gf-default-primary (gf-name)
-  "Look up the registered default-primary symbol for GF-NAME, or NIL."
-  (let ((cur *gf-default-primaries*))
-    (loop
-      (when (null cur) (return nil))
-      (when (eq (car (car cur)) gf-name)
-        (return (cdr (car cur))))
-      (setq cur (cdr cur)))))
-
-(defun %gf-name-is-p (gf-name target-name target-name-str)
-  "True iff GF-NAME refers to the symbol TARGET-NAME.  Uses both eq
-   and symbol-name string-equal because Modus's intern can produce
-   distinct symbol objects for the same name (CLAUDE.md: 'Two symbols
-   with identical hashes may be eql but not eq').  The same dual
-   compare is used by %find-mc — see its docstring."
-  (cond
-    ((eq gf-name target-name) t)
-    ((and (symbolp gf-name)
-          (string= (symbol-name gf-name) target-name-str)) t)
-    (t nil)))
-
-(defun %has-default-primary-p (gf-name)
-  "True iff GF-NAME has a registered default-primary fallback.  Driven
-   by a small symbol set rather than the *gf-default-primaries* alist
-   so the test is cheap and the supported set is visible at one spot."
-  (cond
-    ((%gf-name-is-p gf-name 'shared-initialize "SHARED-INITIALIZE")    t)
-    ((%gf-name-is-p gf-name 'change-class "CHANGE-CLASS")              t)
-    ((%gf-name-is-p gf-name 'initialize-instance "INITIALIZE-INSTANCE") t)
-    ((%gf-name-is-p gf-name 'reinitialize-instance "REINITIALIZE-INSTANCE") t)
-    ((%gf-name-is-p gf-name 'update-instance-for-different-class
-                    "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS")             t)
-    ((%gf-name-is-p gf-name 'update-instance-for-redefined-class
-                    "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")             t)
-    ((%gf-name-is-p gf-name 'print-object "PRINT-OBJECT")              t)
-    (t                                                                 nil)))
-
-(defun %dispatch-default-primary (gf-name args)
-  "Run the standard primary body for GF-NAME on ARGS, bypassing GF
-   dispatch.  Called from the synthetic primary built by
-   %gf-dispatch-standard when no user primary is applicable.
-
-   Dispatches on the GF name and calls the matching default helper in
-   ansi-bridge.lisp directly — those helpers internally bypass GF
-   dispatch so this can't loop back into %gf-dispatch-standard.
-
-   Uses %gf-name-is-p (eq + symbol-name string-equal) because Modus's
-   intern can produce distinct symbol objects for the same name."
-  (cond
-    ((%gf-name-is-p gf-name 'shared-initialize "SHARED-INITIALIZE")
-     (%shared-initialize-via-args args))
-    ((%gf-name-is-p gf-name 'change-class "CHANGE-CLASS")
-     (%change-class-via-args args))
-    ((%gf-name-is-p gf-name 'initialize-instance "INITIALIZE-INSTANCE")
-     (%initialize-instance-via-args args))
-    ((%gf-name-is-p gf-name 'reinitialize-instance "REINITIALIZE-INSTANCE")
-     (%reinitialize-instance-via-args args))
-    ((%gf-name-is-p gf-name 'update-instance-for-different-class
-                    "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS")
-     (%uifdc-via-args args))
-    ((%gf-name-is-p gf-name 'update-instance-for-redefined-class
-                    "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")
-     (%uifrc-via-args args))
-    ((%gf-name-is-p gf-name 'print-object "PRINT-OBJECT")
-     (%print-object-via-args args))
-    (t nil)))
-
-;; Default-primary trampolines.  Each forwards an args list (instance
-;; / new-class / etc., followed by initargs) to the matching default-fn
-;; in ansi-bridge.lisp without going through GF dispatch.  Defined as
-;; weak forward-references via top-level defun stubs — the real bodies
-;; are defined later via last-defun-wins; if ansi-bridge.lisp's
-;; %shared-initialize-default isn't loaded yet for some reason, the
-;; stub returns NIL rather than crashing.
-(defun %shared-initialize-via-args (args)
-  ;; (apply #'%shared-initialize-default args)
-  ;; %shared-initialize-default exists in ansi-bridge.lisp; here we
-  ;; spread by hand since (apply fn args) on a captured arg can lose
-  ;; trailing elements past the register-arg limit (CLAUDE.md known
-  ;; bug 7).  Same shape as %shared-init-default-spread.
-  (cond
-    ((null args) nil)
-    ((null (cdr args)) (%shared-initialize-default (car args) nil))
-    (t (%shared-init-default-spread args))))
-
-(defun %change-class-via-args (args)
-  (cond
-    ((null args) nil)
-    (t (%change-class-default-spread args))))
-
-(defun %initialize-instance-via-args (args)
-  (cond
-    ((null args) nil)
-    (t (apply #'%initialize-instance-default args))))
-
-(defun %reinitialize-instance-via-args (args)
-  (cond
-    ((null args) nil)
-    ;; reinitialize-instance default body lives in ansi-bridge.lisp;
-    ;; the canonical bypass path there is `reinitialize-instance` (see
-    ;; ansi-bridge:3035) which itself dispatches.  Instead, follow the
-    ;; same pattern as shared-initialize: instance + (t) covers the
-    ;; "init non-changed slots" semantics per CLHS.
-    (t (apply #'%shared-initialize-default
-              (car args) t (cdr args)))))
-
-(defun %uifdc-via-args (args)
-  (cond
-    ((null args) nil)
-    (t (apply #'%uifdc-default args))))
-
-(defun %uifrc-via-args (args)
-  (cond
-    ((null args) nil)
-    (t (apply #'%uifrc-default args))))
-
-(defun %print-object-via-args (args)
-  (cond
-    ((null args) nil)
-    (t (apply #'%print-object-default args))))
-
-(defun %synthetic-primary-closure-fn (&rest %actual-ignored)
-  "Top-level closure body for the synthetic primary built by
-   %gf-dispatch-standard when no user primary is applicable.
-   Reads (gf-name . (args . nil)) from %get-cenv and forwards to
-   %dispatch-default-primary.  Lives at top level so the closure
-   captures via heap cells (is-eql-p pattern) rather than the
-   broken naïve let-bound + funcall path."
-  (declare (ignore %actual-ignored))
-  (let* ((env (%get-cenv))
-         (gf-name (car env))
-         (args (car (cdr env))))
-    (%dispatch-default-primary gf-name args)))
-
 (defun %init-method-combinations ()
   "Register the nine ANSI-defined short-form method combinations:
    AND, OR, APPEND, LIST, MAX, MIN, NCONC, PROGN, +.
@@ -1456,19 +1298,7 @@
    semantics matches CLHS 7.6.6.4 (PROGN/AND/OR don't fold for one method,
    the rest do).  Without these, %gf-dispatch falls through to standard
    dispatch which silently calls primary methods on a custom-combination
-   GF — wrong per ANSI (DG-MC.APPEND.10/etc. should error out).
-
-   Also registers built-in default primaries for the standard CLOS GFs
-   (shared-initialize, initialize-instance, reinitialize-instance,
-   change-class).  Without these, a user-supplied :before/:after/:around
-   method WITHOUT a corresponding primary method causes
-   %gf-dispatch-standard to error 'no applicable primary method' — but
-   CLHS says the system-supplied primary still runs.  See
-   shared-initialize.7.x / 8.x / change-class.5.x / etc.
-
-   These initializations are called from kernel-main AFTER every defun
-   has been compiled, so (symbol-function 'NAME) succeeds at the lookup
-   site below."
+   GF — wrong per ANSI (DG-MC.APPEND.10/etc. should error out)."
   (%define-method-combination 'and    'and    t)
   (%define-method-combination 'or     'or     t)
   (%define-method-combination 'append 'append t)
@@ -1478,25 +1308,6 @@
   (%define-method-combination 'nconc  'nconc  t)
   (%define-method-combination 'progn  'progn  t)
   (%define-method-combination '+      '+      t)
-  ;; Default primaries: gf-name → SYMBOL naming the function that runs
-  ;; the standard primary for that GF when no user primary is
-  ;; applicable.  %gf-dispatch-standard calls (apply (symbol-function
-  ;; SYM) args) with the GF's runtime args.  The functions named here
-  ;; live in ansi-bridge.lisp (which loads after cl-clos.lisp) and MUST
-  ;; bypass GF dispatch internally — otherwise the fallback would
-  ;; re-enter %gf-dispatch-standard infinitely.
-  ;;
-  ;; %init-method-combinations is invoked from kernel-main AFTER every
-  ;; runtime defun has compiled, so symbol-function lookup at the
-  ;; fallback call site resolves correctly.
-  (%register-gf-default-primary 'shared-initialize        '%shared-initialize-default)
-  (%register-gf-default-primary 'change-class             '%change-class-default)
-  (%register-gf-default-primary 'initialize-instance      '%initialize-instance-default)
-  (%register-gf-default-primary 'update-instance-for-different-class
-                                '%uifdc-default)
-  (%register-gf-default-primary 'update-instance-for-redefined-class
-                                '%uifrc-default)
-  (%register-gf-default-primary 'print-object             '%print-object-default)
   nil)
 
 ;;; ============================================================
@@ -1670,40 +1481,8 @@
     ;; but we collected them in most-specific-first order, so reverse = least-specific-first
     ;; Actually CL spec: :after most specific last, so keep them reversed:
     ;; after-methods currently in most-specific-first; run least-specific-first
-    ;;
-    ;; CLHS standard method combination: the system-supplied primary
-    ;; runs even when the user has only added :before / :after / :around
-    ;; methods.  When no user primary is applicable, look up the GF's
-    ;; default-primary symbol and synthesize a method record that calls
-    ;; it with the runtime args.  This is what makes
-    ;; shared-initialize.7.x / 8.x pass — defmethod shared-initialize
-    ;; :before runs alongside the standard primary, not instead of it.
     (when (null primary-methods)
-      (let ((gf-name (%gf-name gf)))
-        ;; Hardwired fallbacks for the standard CLOS GFs.  When the GF
-        ;; has only auxiliary methods (:before / :after / :around) the
-        ;; CLHS-mandated system primary still runs — we synthesize a
-        ;; fake primary that delegates to a bypass helper in
-        ;; ansi-bridge.lisp (%shared-initialize-via-args et al).
-        ;;
-        ;; Closure representation: use the is-eql-p heap-cell pattern
-        ;; (%make-closure + top-level helper + %get-cenv) because the
-        ;; naïve (lambda ...) capture pattern breaks when the closure
-        ;; is let-bound + funcalled via a method record — see
-        ;; CLAUDE.md Known Bug "Closure-mutation: let-bound + funcall
-        ;; fails" and feedback_closure_mutation_let_bound.  Without
-        ;; this dodge the synthetic primary's captured gf-name / args
-        ;; were stale by the time run-primary did (apply method-fn
-        ;; args), and the fallback silently no-op'd — sweeps came
-        ;; back exactly == baseline.
-        (cond
-          ((%has-default-primary-p gf-name)
-           (let ((synthetic
-                  (%make-closure #'%synthetic-primary-closure-fn
-                                 (cons gf-name (cons args nil)))))
-             (setq primary-methods
-                   (list (%make-method nil '(t) synthetic)))))
-          (t (error "no applicable primary method")))))
+      (error "no applicable primary method"))
     ;; Build the effective method chain
     (let ((run-primary
            ;; Accept &rest so when the :around chain wraps run-primary in
@@ -2044,14 +1823,9 @@
    minimal exposure to that miscompile.
 
    Registers the stub in *gf-stub-closures* so %generic-function-p
-   recognizes (typep #'gf-name 'generic-function) → T.
-
-   Also records the reverse stub → gf-name mapping in *gf-fn-to-name*
-   so COMPUTE-APPLICABLE-METHODS / FIND-METHOD / ADD-METHOD /
-   REMOVE-METHOD can resolve the dispatch closure back to its GF
-   (defgeneric.35 / find-method.lsp etc.)."
+   recognizes (typep #'gf-name 'generic-function) → T."
   (let ((stub (lambda (&rest args) (%gf-dispatch gf-name args))))
-    (%register-gf-fn stub gf-name)
+    (%register-gf-fn stub)
     stub))
 
 ;;; ============================================================

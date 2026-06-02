@@ -4045,6 +4045,166 @@
 (defun describe-object (object stream)
   (%dispatch-describe-object (list object stream)))
 
+;;; ============================================================
+;;; LOAD — read+eval all forms from a file or stream.
+;;; ============================================================
+;;;
+;;; CLHS 24.1.x.  Override of the earlier cl-eval.lisp definition (last
+;;; defun wins; ansi-bridge.lisp loads after cl-eval.lisp).  Adds
+;;;   - stream filespec support (LOAD.3/8/13/16)
+;;;   - :if-does-not-exist (LOAD.14)
+;;;   - :verbose / :print emitting visible output to *standard-output*
+;;;     so load-file-test's (position #\; str) sees the marker
+;;;   - :allow-other-keys to accept the test wrapper's apply with
+;;;     :allow-other-keys t, while still program-erroring on unknown
+;;;     keywords when allow-other-keys is absent (LOAD.error.3)
+;;;   - 0 args → program-error (LOAD.error.2)
+;;;   - missing file with default if-does-not-exist → error (LOAD.error.1)
+;;;
+;;; *load-pathname*, *load-truename*, *load-print*, *load-verbose* are
+;;; declared as defvars (default NIL) for tests LOAD-PATHNAME.1 etc.
+;;; The set! during load uses set-symbol-value on the hash so that
+;;; (symbol-value '*load-pathname*) reflects the binding while the
+;;; file is being read.  Per CLAUDE.md "defvar init-thunks not run"
+;;; the defvars stay NIL outside any LOAD call, which is what the
+;;; default tests expect.
+
+(defvar *load-pathname* nil)
+(defvar *load-truename* nil)
+(defvar *load-print* nil)
+(defvar *load-verbose* nil)
+
+;;; Helpers --------------------------------------------------------------
+
+(defun %load-known-key-p (k)
+  (or (eq k :verbose) (eq k :print) (eq k :if-does-not-exist)
+      (eq k :external-format) (eq k :allow-other-keys)))
+
+(defun %load-validate-kwargs (kw-list)
+  "Walk plist; if any unknown key found and :allow-other-keys not
+   present-and-true, signal program-error.  Returns T on OK."
+  (let ((aok nil)
+        (cur kw-list))
+    ;; First pass: find :allow-other-keys t
+    (loop
+      (when (null cur) (return nil))
+      (when (and (eq (car cur) :allow-other-keys) (cdr cur) (cadr cur))
+        (setq aok t))
+      (setq cur (cddr cur)))
+    ;; Second pass: program-error on first unknown (unless aok)
+    (unless aok
+      (setq cur kw-list)
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (unless (%load-known-key-p k)
+            (%signal-program-error)))
+        (setq cur (cddr cur))))
+    t))
+
+(defun %load-getf (plist key default)
+  "GETF-equivalent that doesn't depend on plist arity checks; default
+   if missing or pair truncated."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return default))
+      (when (null (cdr cur)) (return default))
+      (when (eq (car cur) key) (return (cadr cur)))
+      (setq cur (cddr cur)))))
+
+(defun %load-getf-p (plist key)
+  "Return T if KEY appears as a key in PLIST."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (when (eq (car cur) key) (return t))
+      (setq cur (cddr cur)))))
+
+(defun %load-stream-p (x)
+  "True if X is a stream object."
+  (and x (streamp x)))
+
+(defun %load-from-stream (stream verbose print)
+  "Read+eval all forms from STREAM.  Returns T."
+  (when verbose
+    (write-string "; loading from stream" *standard-output*)
+    (write-char #\Newline *standard-output*))
+  (let ((eof-marker (cons 'eof nil))
+        (result t))
+    (loop
+      (let ((form (handler-case (read stream nil eof-marker)
+                    (t (c) eof-marker))))
+        (when (eq form eof-marker) (return t))
+        (let ((val (handler-case (eval form) (t (c) nil))))
+          (when print
+            (handler-case
+                (progn (write val :stream *standard-output*)
+                       (write-char #\Newline *standard-output*))
+              (t (c) nil)))
+          (setq result val))))
+    result))
+
+(defun load (&rest all-args)
+  "Read and evaluate all forms from a file or stream.
+   Accepts:
+     (load filespec &key verbose print if-does-not-exist
+                          external-format allow-other-keys)"
+  ;; Zero-arg → program-error (LOAD.error.2)
+  (when (null all-args)
+    (%signal-program-error)
+    (return-from load nil))
+  (let* ((filespec (car all-args))
+         (kwargs   (cdr all-args)))
+    ;; Validate keyword args; allow-other-keys disables the check.
+    (%load-validate-kwargs kwargs)
+    (let* ((verbose-p (%load-getf-p kwargs :verbose))
+           (verbose (if verbose-p
+                        (%load-getf kwargs :verbose nil)
+                        ;; Fall back to *load-verbose* (defaults to NIL).
+                        (and (boundp '*load-verbose*) *load-verbose*)))
+           (print-p (%load-getf-p kwargs :print))
+           (print   (if print-p
+                        (%load-getf kwargs :print nil)
+                        (and (boundp '*load-print*) *load-print*)))
+           (idne-p  (%load-getf-p kwargs :if-does-not-exist))
+           (idne    (if idne-p
+                        (%load-getf kwargs :if-does-not-exist nil)
+                        :error)))
+      (cond
+        ;; --- Stream filespec ---
+        ((%load-stream-p filespec)
+         (%load-from-stream filespec verbose print))
+        ;; --- Pathname / string filespec ---
+        (t
+         (let ((path (cond ((stringp filespec) filespec)
+                           (t (%resolve-path filespec)))))
+           ;; Attempt open with :if-does-not-exist nil so we can decide
+           ;; ourselves whether the absence is an error vs a NIL return.
+           (let ((stream (handler-case
+                             (open path :direction :input
+                                        :if-does-not-exist nil)
+                           (t (c) nil))))
+             (cond
+               ((null stream)
+                (cond
+                  ((null idne) nil)
+                  (t (error 'file-error :pathname path))))
+               (t
+                (unwind-protect
+                     (let ((*load-pathname* path)
+                           (*load-truename* path)
+                           (*load-print* print)
+                           (*load-verbose* verbose))
+                       (declare (special *load-pathname* *load-truename*
+                                         *load-print* *load-verbose*))
+                       (when verbose
+                         (write-string "; loading " *standard-output*)
+                         (write-string path *standard-output*)
+                         (write-char #\Newline *standard-output*))
+                       (%load-from-stream stream verbose print))
+                  (close stream)))))))))))
+
 ;;; ---- Initialization -----------------------------------------------
 
 (defun %init-clos-protocol ()

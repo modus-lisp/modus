@@ -431,7 +431,9 @@
 (defun remove-if (pred seq &rest args)
   "Honors :key/:start/:end/:count/:from-end. Drops elements where PRED is true.
    Inline pred-eval so we don't depend on closure capture across apply paths.
-   Overrides the simpler 2-arg version in prelude.lisp."
+   Overrides the simpler 2-arg version in prelude.lisp.
+   PRED accepts function designators (symbol or function)."
+  (setq pred (%resolve-fn pred))
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -504,7 +506,9 @@
   "Inverse of remove-if; forwards the same keyword args.  Inlined
    instead of `(apply #'remove-if (lambda (x) (not (funcall pred x)))
    seq args)' to dodge apply-of-rest fragility (see find-if-not /
-   position-if-not for the same pattern in commit 9c625ec)."
+   position-if-not for the same pattern in commit 9c625ec).
+   PRED accepts function designators (symbol or function)."
+  (setq pred (%resolve-fn pred))
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -523,23 +527,35 @@
 
 (defun count-if (pred seq &rest args)
   "Count elements of SEQ for which PRED is true. Honors :key, :start, :end, :from-end.
-   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates.
+   PRED and :key accept function designators (symbol or function).
+   Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
+   :allow-other-keys T) signals PROGRAM-ERROR."
+  (setq pred (%resolve-fn pred))
   (let ((key nil) (start 0) (end nil) (from-end nil) (a args)
-        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
+        (allow-other nil) (aok-set nil))
+    ;; Pre-scan for leftmost :allow-other-keys.
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
     (loop (when (null a) (return))
+      (when (null (cdr a)) (%signal-program-error))
       (cond ((eq (car a) :key)
-             (unless key-set (setq key (cadr a)) (setq key-set t))
-             (setq a (cddr a)))
+             (unless key-set (setq key (%resolve-fn (cadr a))) (setq key-set t)))
             ((eq (car a) :start)
-             (unless start-set (setq start (cadr a)) (setq start-set t))
-             (setq a (cddr a)))
+             (unless start-set (setq start (cadr a)) (setq start-set t)))
             ((eq (car a) :end)
-             (unless end-set (setq end (cadr a)) (setq end-set t))
-             (setq a (cddr a)))
+             (unless end-set (setq end (cadr a)) (setq end-set t)))
             ((eq (car a) :from-end)
-             (unless fe-set (setq from-end (cadr a)) (setq fe-set t))
-             (setq a (cddr a)))
-            (t (setq a (cdr a)))))
+             (unless fe-set (setq from-end (cadr a)) (setq fe-set t)))
+            ((eq (car a) :allow-other-keys) nil)
+            (t (unless allow-other (%signal-program-error))))
+      (setq a (cddr a)))
     (cond
       ((null seq) 0)
       ;; Wrapped vector — use length+wrapper-aref so fp/displaced/adj are honored
@@ -601,17 +617,18 @@
 
 (defun count (item seq &rest args)
   "Count occurrences of ITEM in SEQ. Honors :test, :test-not, :key,
-   :start, :end, :from-end."
+   :start, :end, :from-end.
+   :test/:test-not/:key accept function designators (symbol or function)."
   (%seq-subst-check-kwargs args)
   (let ((test nil) (key nil) (start 0) (end nil) (from-end nil) (a args))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key) (setq key (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :test) (setq test (%resolve-fn (cadr a))) (setq a (cddr a)))
+            ((eq (car a) :key) (setq key (%resolve-fn (cadr a))) (setq a (cddr a)))
             ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
             ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
             ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
             ((eq (car a) :test-not)
-             (let ((f (cadr a)))
+             (let ((f (%resolve-fn (cadr a))))
                (setq test (lambda (x y) (not (funcall f x y)))))
              (setq a (cddr a)))
             (t (setq a (cdr a)))))
@@ -769,7 +786,7 @@
         (setq scan (cddr scan))))
     (loop (when (null o) (return))
       (when (null (cdr o))
-        (error "string=: odd-length keyword arg list"))
+        (%signal-program-error))
       (let ((k (car o)))
         (cond ((eq k :start1) (setq s1 (cadr o)))
               ((eq k :end1)   (setq e1 (cadr o)))
@@ -777,7 +794,7 @@
               ((eq k :end2)   (setq e2 (cadr o)))
               ((eq k :allow-other-keys) nil)
               (allow-other nil)
-              (t (error "string=: bad keyword"))))
+              (t (%signal-program-error))))
       (setq o (cddr o)))
     (let* ((la (array-length sa))
            (lb (array-length sb))
@@ -1285,13 +1302,13 @@
       (loop
         (when (null cur) (return nil))
         (when (null (cdr cur))
-          (error "Odd-length keyword argument list"))
+          (%signal-program-error))
         (let ((k (car cur)))
           (unless (or allow
                       (eq k :from-end) (eq k :test) (eq k :test-not)
                       (eq k :count) (eq k :key) (eq k :start) (eq k :end)
                       (eq k :allow-other-keys))
-            (error "Unknown keyword argument: ~S" k)))
+            (%signal-program-error)))
         (setq cur (cddr cur)))))
   (let ((from-end nil) (test-fn nil) (test-not-fn nil)
         (count nil) (key-fn nil) (start 0) (end nil) (cur args)
@@ -1302,10 +1319,10 @@
       (let ((k (car cur)) (v (cadr cur)))
         (cond
           ((eq k :from-end) (unless fe-set (setq from-end v) (setq fe-set t)))
-          ((eq k :test) (unless test-set (setq test-fn v) (setq test-set t)))
-          ((eq k :test-not) (unless tn-set (setq test-not-fn v) (setq tn-set t)))
+          ((eq k :test) (unless test-set (setq test-fn (%resolve-fn v)) (setq test-set t)))
+          ((eq k :test-not) (unless tn-set (setq test-not-fn (%resolve-fn v)) (setq tn-set t)))
           ((eq k :count) (unless count-set (setq count v) (setq count-set t)))
-          ((eq k :key) (unless key-set (setq key-fn v) (setq key-set t)))
+          ((eq k :key) (unless key-set (setq key-fn (%resolve-fn v)) (setq key-set t)))
           ((eq k :start) (unless start-set (setq start v) (setq start-set t)))
           ((eq k :end) (unless end-set (setq end v) (setq end-set t))))
         (setq cur (cddr cur))))
@@ -1645,23 +1662,34 @@
 (defun count-if-not (pred seq &rest args)
   "Count elements of SEQ for which PRED is FALSE.  Honors :key, :start,
    :end, :from-end.  Equivalent to (count-if (complement pred) ...).
-   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates.
+   PRED and :key accept function designators (symbol or function).
+   Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
+   :allow-other-keys T) signals PROGRAM-ERROR."
+  (setq pred (%resolve-fn pred))
   (let ((key nil) (start 0) (end nil) (from-end nil) (a args)
-        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
+        (allow-other nil) (aok-set nil))
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
     (loop (when (null a) (return))
+      (when (null (cdr a)) (%signal-program-error))
       (cond ((eq (car a) :key)
-             (unless key-set (setq key (cadr a)) (setq key-set t))
-             (setq a (cddr a)))
+             (unless key-set (setq key (%resolve-fn (cadr a))) (setq key-set t)))
             ((eq (car a) :start)
-             (unless start-set (setq start (cadr a)) (setq start-set t))
-             (setq a (cddr a)))
+             (unless start-set (setq start (cadr a)) (setq start-set t)))
             ((eq (car a) :end)
-             (unless end-set (setq end (cadr a)) (setq end-set t))
-             (setq a (cddr a)))
+             (unless end-set (setq end (cadr a)) (setq end-set t)))
             ((eq (car a) :from-end)
-             (unless fe-set (setq from-end (cadr a)) (setq fe-set t))
-             (setq a (cddr a)))
-            (t (setq a (cdr a)))))
+             (unless fe-set (setq from-end (cadr a)) (setq fe-set t)))
+            ((eq (car a) :allow-other-keys) nil)
+            (t (unless allow-other (%signal-program-error))))
+      (setq a (cddr a)))
     (count-if (lambda (x) (not (funcall pred x)))
               seq
               :start start
@@ -2257,15 +2285,32 @@
 ;; ANSI: (tree-equal x y &key test test-not)
 ;; Recursive structural equality using TEST (default eql) for leaves.
 ;; Conses are equal iff cars are tree-equal AND cdrs are tree-equal.
+;; Per CLHS: signal PROGRAM-ERROR on odd-length plist or unknown keyword
+;; (with :allow-other-keys NIL/absent).  Leftmost (k v) pair wins on
+;; duplicates per §3.4.1.4.1.
 (defun tree-equal (a b &rest args)
-  (let ((test nil) (test-not nil) (cur args))
-    (loop
-      (when (null cur) (return nil))
-      (let ((k (car cur)) (v (cadr cur)))
-        (cond
-          ((eq k :test) (setq test v))
-          ((eq k :test-not) (setq test-not v))))
-      (setq cur (cddr cur)))
+  (let ((test nil) (test-not nil)
+        (test-set nil) (tn-set nil)
+        (allow-other-keys nil) (aok-set nil))
+    ;; First pass: scan for :allow-other-keys (leftmost wins).
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
+    ;; Validate + extract keyword args.
+    (let ((cur args))
+      (loop (when (null cur) (return))
+        (when (null (cdr cur)) (%signal-program-error))
+        (let ((k (car cur)) (v (cadr cur)))
+          (cond
+            ((eq k :test) (unless test-set (setq test (%resolve-fn v)) (setq test-set t)))
+            ((eq k :test-not) (unless tn-set (setq test-not (%resolve-fn v)) (setq tn-set t)))
+            ((eq k :allow-other-keys) nil)
+            (t (unless allow-other-keys (%signal-program-error)))))
+        (setq cur (cddr cur))))
     (when test-not
       (let ((tn test-not))
         (setq test (lambda (x y) (not (funcall tn x y))))))
@@ -2337,7 +2382,9 @@
 
 ;; delete-if: same body shape as remove-if without the apply trampoline.
 (defun delete-if (pred seq &rest args)
-  "Remove items satisfying PRED (destructive). Forwards keyword args."
+  "Remove items satisfying PRED (destructive). Forwards keyword args.
+   PRED accepts function designators (symbol or function)."
+  (setq pred (%resolve-fn pred))
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -2354,7 +2401,9 @@
        (%remove-if-vector pred seq key-fn start-idx end-idx eff-count from-end)))))
 
 (defun delete-if-not (pred seq &rest args)
-  "Remove items not satisfying PRED (destructive). Forwards keyword args."
+  "Remove items not satisfying PRED (destructive). Forwards keyword args.
+   PRED accepts function designators (symbol or function)."
+  (setq pred (%resolve-fn pred))
   (let* ((parsed (%nsubst-parse-args args))
          (count (car parsed))
          (from-end (cadr parsed))
@@ -2769,18 +2818,33 @@
 
 (defun find-if (predicate sequence &rest args)
   "Return the first element of SEQUENCE satisfying PREDICATE.
-   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs.
+   PREDICATE and :key accept function designators (symbol or function).
+   Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
+   :allow-other-keys T) signals PROGRAM-ERROR."
+  (setq predicate (%resolve-fn predicate))
   (let ((key nil) (start 0) (end nil) (from-end nil)
-        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
+        (allow-other nil) (aok-set nil))
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
+        (when (null (cdr cur)) (%signal-program-error))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :key)      (unless key-set    (setq key (%resolve-fn v))  (setq key-set t)))
             ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
             ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
-            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))
+            ((eq k :allow-other-keys) nil)
+            (t (unless allow-other (%signal-program-error)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2829,18 +2893,33 @@
   "Return the first element of SEQUENCE not satisfying PREDICATE.
    Inlined (rather than `(apply #'find-if (lambda ...) ...)') to dodge
    the documented apply-of-rest-through-sibling-defun fragility.
-   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs.
+   PREDICATE and :key accept function designators (symbol or function).
+   Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
+   :allow-other-keys T) signals PROGRAM-ERROR."
+  (setq predicate (%resolve-fn predicate))
   (let ((key nil) (start 0) (end nil) (from-end nil)
-        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
+        (allow-other nil) (aok-set nil))
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
+        (when (null (cdr cur)) (%signal-program-error))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :key)      (unless key-set    (setq key (%resolve-fn v))  (setq key-set t)))
             ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
             ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
-            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))
+            ((eq k :allow-other-keys) nil)
+            (t (unless allow-other (%signal-program-error)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2887,18 +2966,33 @@
 
 (defun position-if (predicate sequence &rest args)
   "Return the index of first element satisfying PREDICATE.
-   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+   Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs.
+   PREDICATE and :key accept function designators (symbol or function).
+   Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
+   :allow-other-keys T) signals PROGRAM-ERROR."
+  (setq predicate (%resolve-fn predicate))
   (let ((key nil) (start 0) (end nil) (from-end nil)
-        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
+        (allow-other nil) (aok-set nil))
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
+        (when (null (cdr cur)) (%signal-program-error))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :key)      (unless key-set    (setq key (%resolve-fn v))  (setq key-set t)))
             ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
             ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
-            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))
+            ((eq k :allow-other-keys) nil)
+            (t (unless allow-other (%signal-program-error)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
@@ -2947,18 +3041,33 @@
   "Return the index of first element not satisfying PREDICATE.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs.
    Inlined (rather than `(apply #'position-if (lambda ...) ...)') to
-   dodge the documented apply-of-rest-through-sibling-defun fragility."
+   dodge the documented apply-of-rest-through-sibling-defun fragility.
+   PREDICATE and :key accept function designators (symbol or function).
+   Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
+   :allow-other-keys T) signals PROGRAM-ERROR."
+  (setq predicate (%resolve-fn predicate))
   (let ((key nil) (start 0) (end nil) (from-end nil)
-        (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
+        (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
+        (allow-other nil) (aok-set nil))
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (null (cdr p)) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other (cadr p))
+          (setq aok-set t))
+        (setq p (cddr p))))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
+        (when (null (cdr cur)) (%signal-program-error))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :key)      (unless key-set    (setq key v)        (setq key-set t)))
+            ((eq k :key)      (unless key-set    (setq key (%resolve-fn v))  (setq key-set t)))
             ((eq k :start)    (unless start-set  (setq start v)      (setq start-set t)))
             ((eq k :end)      (unless end-set    (setq end v)        (setq end-set t)))
-            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))))
+            ((eq k :from-end) (unless fe-set     (setq from-end v)   (setq fe-set t)))
+            ((eq k :allow-other-keys) nil)
+            (t (unless allow-other (%signal-program-error)))))
         (setq cur (cddr cur))))
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))

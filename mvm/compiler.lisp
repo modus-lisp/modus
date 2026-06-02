@@ -2458,6 +2458,27 @@
                (when (or rest-pos synth-rest)
                  (setf (function-info-rest-param-p info) t)))))
          (compile-nil dest)))
+      ;; DEFMACRO inside an expression context.  Same fall-through trap
+      ;; as nested DEFUN: a `(defmacro foo (x) (list 'quote x))` inside a
+      ;; deftest body reached compile-call which treated DEFMACRO as a
+      ;; function call and tried to evaluate `(x)` at runtime, crashing
+      ;; the test.  Mirror the toplevel DEFMACRO handler below: build a
+      ;; host-side expander via (eval `(lambda (form) (destructuring-bind
+      ;; ,params (cdr form) ,@body))) and register it in the MVM macro
+      ;; table so subsequent compile-form passes in the same source see
+      ;; the macro.  Yields NIL into dest (defmacro's value isn't used in
+      ;; expression contexts).
+      ((= op-name 486374561508212106)   ; DEFMACRO
+       (let ((name (cadr form))
+             (params (caddr form))
+             (body (cdddr form)))
+         (when (and (stringp (car body)) (cdr body))
+           (setq body (cdr body)))
+         (let ((expander (eval `(lambda (form)
+                                  (destructuring-bind (,@params) (cdr form)
+                                    ,@body)))))
+           (mvm-define-macro (normalize-name name) expander))
+         (compile-nil dest)))
       ;; DEFVAR / DEFPARAMETER inside an expression context.  Same fall-
       ;; through trap as DEFUN: nested DEFVAR landed in compile-call as
       ;; a call to a function named "DEFVAR", evaluating BODY at runtime.

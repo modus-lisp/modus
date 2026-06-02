@@ -278,6 +278,48 @@
        (funcall (car (%get-cenv)) form))
       (t (%signal-program-error)))))
 
+(defun %interp-macro-shim (form &rest extra)
+  "Shim that wraps a runtime-defmacro %interp-closure so it can be
+   invoked as a regular function via the compiled funcall path.
+   `(macro-function 'sym)` returns one of these wrappers when sym's
+   macro expander is an %interp-closure (created by cl-eval.lisp's
+   DEFMACRO handler).  Without this wrapper, user-facing calls like
+   `(funcall (macro-function 'sym) form env)` would funcall a CL cons
+   and SEGV — the compiled funcall has no dispatch path for a
+   '%interp-closure marker.
+
+   CLHS arity: (form &optional env).  Anything else → program-error.
+   Macro expanders receive (cdr form) as their actual argument list
+   (the user wrote `(defmacro NAME (p1 p2) ...)` and sees `(p1 p2)`,
+   not the whole call form), so we strip the operator before calling
+   %call-interp-closure."
+  (declare (ignore extra))
+  (let ((nargs (mem-ref #x10000150 :u32)))
+    (cond
+      ((or (= nargs 1) (= nargs 2))
+       (%call-interp-closure (car (%get-cenv)) (cdr form)))
+      (t (%signal-program-error)))))
+
+(defun %raw-macro-expander (sym)
+  "Internal-only: return the raw expander stored for SYM, or NIL.
+   Bypasses the user-facing closure wrapping that macro-function
+   applies, so macroexpand-1 can dispatch on the raw shape
+   (%interp-closure vs compiled lambda)."
+  (let ((key (%macro-sym-key sym)))
+    (cond
+      ((null key) nil)
+      ((and *macro-function-table* (gethash key *macro-function-table*)))
+      ((and (boundp '*macro-table*) *macro-table*
+            (let ((h (cond ((stringp key) (compute-name-hash key))
+                           ((%cl-sym-p key) (compute-name-hash (%cl-sym-name key)))
+                           ((and (not (consp key)) (not (fixnump key))
+                                 (not (characterp key)))
+                            (aref key 0))
+                           (t 0))))
+              (and (> h 0) (gethash h *macro-table*)))))
+      ((and (stringp key) (%compiler-macro-p key)) t)
+      (t nil))))
+
 (defun macro-function (sym &rest env)
   "Return the macro expander function for SYM, or nil.
    1. *macro-function-table* (runtime-registered defmacros)
@@ -317,13 +359,14 @@
       (cond
         ((null raw) nil)
         ((eq raw t) t)                                     ; compiler-macro marker
-        ;; Runtime-defmacro expanders are %interp-closures with their
-        ;; own (form env) dispatch via %call-interp-closure.  Wrapping
-        ;; them in a regular closure breaks that path — macroexpand-1
-        ;; would funcall the wrapper, which tries to funcall the
-        ;; %interp-closure as a normal function and SIGSEGV's.
-        ;; Return them raw; their arity is enforced separately.
-        ((%interp-closure-p raw) raw)
+        ;; Runtime-defmacro expanders are %interp-closures.  Wrap via
+        ;; %interp-macro-shim so user-facing funcall sees a real closure
+        ;; object (subtag #x52) instead of the bare %interp-closure
+        ;; cons that the compiled funcall path can't dispatch on.
+        ;; macroexpand-1 below uses %raw-macro-expander directly to
+        ;; bypass this wrapper and call %call-interp-closure straight.
+        ((%interp-closure-p raw)
+         (%make-closure #'%interp-macro-shim (cons raw nil)))
         (t (%make-closure #'%macro-expander-shim (cons raw nil)))))))
 
 (defun set-macro-function (sym fn &rest env)
@@ -386,7 +429,10 @@
     ((and (consp form)
           (or (%cl-sym-p (car form))
               (%native-mvm-sym-p (car form))))
-     (let ((mf (macro-function (car form))))
+     ;; Use %raw-macro-expander, NOT macro-function — macro-function
+     ;; wraps interp-closures in a closure object so user-facing
+     ;; funcall works; we dispatch on the raw shape here.
+     (let ((mf (%raw-macro-expander (car form))))
        (cond
          ((null mf) (values form nil))
          ((eq mf t) (values form nil))   ; compiler-macro marker

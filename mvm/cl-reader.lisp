@@ -1093,11 +1093,17 @@
         ;; #* — bit vector
         ((= code 42)  ; *
          (%read-bit-vector stream arg))
-        ;; #. — read-time eval
+        ;; #. — read-time eval (CLHS 2.4.8.6).
+        ;;   *read-eval* nil → reader-error.
+        ;;   *read-suppress* t → swallow the form, return NIL.
+        ;;   else → eval the form and return the value.
         ((= code 46)  ; .
          (let ((obj (%read-internal stream t nil t)))
-           (if *read-suppress* nil
-               nil)))  ; stub: don't actually eval
+           (cond
+             (*read-suppress* nil)
+             ((not *read-eval*)
+              (%reader-error "#. read-time eval disabled by *read-eval*"))
+             (t (eval obj)))))
         ;; #S — structure (stub)
         ((or (= code 83) (= code 115))  ; S s
          (%read-internal stream t nil t)

@@ -1456,19 +1456,24 @@
 
   ;; /= — not equal.
   ;;
+  ;; (/=)            — CLHS 12.2 mandates "number+" (one or more)
+  ;;                   so 0-arg signals PROGRAM-ERROR.  `/=.ERROR.1`
+  ;;                   in ansi-tests asserts this.
+  ;; (/= a)          — vacuous T (single arg trivially distinct).
   ;; (/= a b)        — inline as (not (= a b)) for the fast path.
   ;; (/= a b c …)    — fall through to the ansi-bridge `/=` defun
   ;;                   which does the O(n²) all-distinct walk.  We
   ;;                   return the input form unchanged so macroexpand-mvm
   ;;                   reports expanded-p=NIL and compile-form dispatches
   ;;                   the call via compile-call.
-  ;; (/=) / (/= x)   — return T (vacuous) per CLHS.  Same pass-through.
   (mvm-define-macro "/="
     (lambda (form)
       (let ((n (length form)))
         (cond
+          ((= n 1) '(%signal-program-error))
+          ((= n 2) `(progn ,(cadr form) t)) ; single-arg vacuous, side effects run
           ((= n 3) `(not (= ,(cadr form) ,(caddr form))))
-          ;; All other arities: hand off to the runtime /= defun
+          ;; 4+ args: hand off to the runtime /= defun
           ;; (in ansi-bridge.lisp).  Returning the form unchanged is
           ;; the documented way to say "this macro doesn't expand
           ;; this particular call" — macroexpand-mvm checks (eq result
@@ -7541,22 +7546,15 @@
    exactly once, in left-to-right order, before any pairwise compare
    begins."
   (cond
-    ;; 0 or 1 arg: CLHS 12.2 says comparisons must take "one or more"
-    ;; numbers (=, /=, <, >, <=, >=).  Per CLHS the vacuous case
-    ;; returns T.  Note: we still need to *evaluate* the single
-    ;; operand (per its side effects and for the type check that
-    ;; e.g. (< "x") signals TYPE-ERROR), so wrap in (progn …) so the
-    ;; arg is evaluated, then return T.
-    ;; The (< x) form appears in number-comparison's `.5` tests
-    ;; (`(loop for x in *universe* when (and (typep x 'real) (not (< x))) …)`):
-    ;; without this branch, every iteration faulted in a runtime error.
+    ;; 0 args: CLHS 12.2 mandates "number+" (one or more) so 0-arg
+    ;; signals PROGRAM-ERROR — `=.ERROR.1` etc. assert this.
     ((null args)
-     (compile-t dest))
+     (compile-arity-error env dest))
+    ;; 1 arg: CLHS says single arg returns T vacuously.  Evaluate
+    ;; the operand first so side effects fire and a non-numeric
+    ;; operand still signals TYPE-ERROR — `.5` tests rely on that
+    ;; (`(loop for x in *universe* when (and (typep x 'real) (not (< x))) …)`).
     ((null (cdr args))
-     ;; Need a runtime numeric type check on the operand: if it's not
-     ;; a real, signal TYPE-ERROR (catchable by ANSI tests with
-     ;; signals-error).  The ansi-bridge defun handles the type-check;
-     ;; route there via a funcall to keep the contract.
      (compile-form `(progn ,(car args) t) env dest))
     ;; 2 args: simple comparison
     ((null (cddr args))
@@ -9866,9 +9864,21 @@
          ;; works — even one from a different package than the source
          ;; (DEFUN's symbol came from the reader, lookup symbol came
          ;; from the reader too, both name-hash to the same value).
-         (*block-labels* (let ((nm (if (symbolp name) name
-                                       (intern (string name) :modus.mvm))))
-                           (list (list nm return-label +vreg-vr+))))
+         ;; Per CLHS 3.1.4: a defun establishes an implicit BLOCK
+         ;; named after the function.  RETURN-FROM <fname> inside
+         ;; the body exits the entire function.  Without this entry,
+         ;; (return-from /= nil) inside a nested loop falls through
+         ;; to compile-return, finds the LOOP's implicit BLOCK NIL,
+         ;; exits the loop instead — silently breaking any defun
+         ;; that uses non-local exit by name (this was the /=.ORDER.2
+         ;; mystery before the fix).  Only register for SYMBOL-named
+         ;; defuns; flet/labels/lambda emit gensym strings the user
+         ;; never types, so RETURN-FROM <that-gensym> can't appear
+         ;; in source.  Block's dest is VR so RETURN-FROM <fname>
+         ;; lands in the function-return register.
+         (*block-labels* (if (symbolp name)
+                             (list (list name return-label +vreg-vr+))
+                             nil))
          (*tagbody-tags* nil))
     ;; Function prologue: push frame pointer, set up frame
     (emit-ir :frame-enter (length params))

@@ -1023,7 +1023,27 @@
                                    (apply #'< args2))
                        do (setf result (cons i (cons args (cons args2 nil)))))
                  result)
-               :ok))
+               :ok)
+  ;; Lock in (declare (special X)) at let-scope: outer body reads
+  ;; the LEXICAL binding (not the special slot), so `(let ((y x)) y)`
+  ;; sees the let-bound value.  This is the .ORDER family's preamble.
+  (rt-run-test 3925
+               (let ((x 'before))
+                 (declare (special x))
+                 (let ((y x))
+                   y))
+               'before)
+  ;; Lock in `(declare (special X))` for FLET formal params: the
+  ;; %g body reads x via dynamic binding installed by the param
+  ;; spill, so inline reads see the call-site value 'good.
+  (rt-run-test 3926
+               (let ((x 'bad))
+                 (declare (special x))
+                 (flet ((%g (x)
+                          (declare (special x))
+                          x))
+                   (%g 'good)))
+               'good))
 
 (defun run-format-tests ()
   ;; format returns nil

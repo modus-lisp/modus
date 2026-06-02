@@ -289,9 +289,16 @@
    3. %compiler-macro-p T-marker fallback for syms Modus's compiler
       implements directly (PUSH/POP/COND for the COMPILED path).
 
+   CLHS §macro-function: `(macro-function name &optional env)` takes
+   1 or 2 args; 3+ args must signal program-error so the ANSI
+   macro-function.error.2 (and similar) tests catch it.
+
    Wraps the raw expander via %make-closure + %macro-expander-shim
    so user-facing `(funcall (macro-function 'X) …)` with wrong arity
    signals PROGRAM-ERROR per CLHS §3.1.2.1.2.2."
+  ;; Arity check: CLHS allows 1 or 2 args.  Extra env args → program-error.
+  (when (and env (cdr env))
+    (%signal-program-error))
   (let ((key (%macro-sym-key sym)))
     (let ((raw
            (cond
@@ -324,13 +331,37 @@
    MVM #x50 symbols (keyed by symbol object itself when symbol-name is
    empty — Modus's native syms only carry a hash, no reverse name
    table), strings, and keywords.  Routes through %macro-sym-key for
-   consistent key extraction between set and get."
-  (let ((key (%macro-sym-key sym)))
-    (when key
-      (unless *macro-function-table*
-        (setq *macro-function-table* (make-hash-table)))
-      (puthash key *macro-function-table* fn)
-      fn)))
+   consistent key extraction between set and get.
+
+   CLHS allows `(setf (macro-function name &optional env) new-value)`
+   so the compiler-generated setter call shape is one of:
+     (set-macro-function SYM NEW)            ; 2-arg setf
+     (set-macro-function SYM ENV NEW)        ; 3-arg setf (env ignored)
+   The compiler's generic-setf expansion passes `place-args ... value`,
+   so a 3-arg call here has the FN in `fn` parameter slot but really
+   that's the user's ENV, with the real new-value living in (first env).
+   Detect that shape and re-route."
+  (cond
+    ;; 3-arg setf shape: (set-macro-function sym env new-value).
+    ;; Here `fn` is actually the env argument and `(car env)` is the new value.
+    ((and env (null (cdr env)))
+     (let ((real-fn (car env))
+           (key (%macro-sym-key sym)))
+       (when key
+         (unless *macro-function-table*
+           (setq *macro-function-table* (make-hash-table)))
+         (puthash key *macro-function-table* real-fn)
+         real-fn)))
+    ;; 2-arg shape (sym, fn) — the original contract.
+    ((null env)
+     (let ((key (%macro-sym-key sym)))
+       (when key
+         (unless *macro-function-table*
+           (setq *macro-function-table* (make-hash-table)))
+         (puthash key *macro-function-table* fn)
+         fn)))
+    ;; 4+ args — illegal.
+    (t (%signal-program-error))))
 
 ;;; ============================================================
 ;;; Macroexpand: walk macro calls
@@ -344,7 +375,12 @@
    arguments as (p1 p2), not the whole form.  For mvm-define-macro
    compiled expanders, call with (form) — single arg, since they're
    defined as (lambda (form) ...).  For full-CL macro fns, call with
-   (form nil)."
+   (form nil).
+
+   CLHS §macroexpand-1: `(macroexpand-1 form &optional env)`.  Calls
+   with 3+ args must signal program-error (macroexpand-1.error.2)."
+  (when (and env-arg (cdr env-arg))
+    (%signal-program-error))
   (cond
     ;; Recognise CL syms AND native MVM #x50 syms as macro heads.
     ((and (consp form)
@@ -367,7 +403,11 @@
     (t (values form nil))))
 
 (defun macroexpand (form &rest env-arg)
-  "Expand FORM repeatedly until not a macro call. Returns (values form expanded-p)."
+  "Expand FORM repeatedly until not a macro call. Returns (values form expanded-p).
+   CLHS §macroexpand: `(macroexpand form &optional env)`.  Calls with
+   3+ args must signal program-error (macroexpand.error.2)."
+  (when (and env-arg (cdr env-arg))
+    (%signal-program-error))
   (let ((any nil))
     (let ((cur form))
       (loop

@@ -827,6 +827,165 @@
            (disjoint (values t t))
            (t (values nil nil))))))))
 
+;; --- Array/string type-name canonicalisation for subtypep ---
+;;
+;; CLHS treats several names as equivalent for subtypep:
+;;   string ≡ (vector character) ≡ (array character (*))
+;;   base-string ≡ (vector base-char) ≡ (array base-char (*))
+;;   simple-string ≡ (simple-array character (*))
+;;   simple-base-string ≡ (simple-array base-char (*))
+;;   vector ≡ (array * (*))
+;;   simple-vector ≡ (simple-array t (*))
+;;   bit-vector ≡ (vector bit) ≡ (array bit (*))
+;;   simple-bit-vector ≡ (simple-array bit (*))
+;; %canonicalise-array-type rewrites these aliases into a normalised
+;; (HEAD ELT-TYPE DIMS) form so %subtypep-array can match them
+;; bidirectionally.  Returns NIL when the type isn't an array/string
+;; alias.
+
+(defun %canonicalise-array-type (tp)
+  "Rewrite array/vector aliases into canonical (HEAD ELT DIMS) form.
+   HEAD ∈ {array simple-array}, ELT is a type spec (or '*), DIMS is '*
+   or a list.  Returns NIL when not an array-family alias.
+
+   Per CLHS, (vector ...) is (array ... (*)).  We only canonicalise the
+   vector-family (vector / simple-vector / bit-vector / simple-bit-
+   vector); the string family (string / base-string / simple-string /
+   simple-base-string) is handled by dedicated clauses in %subtypep-impl
+   so that (string ⊆ (vector character)) returns NIL T (CLHS allows
+   them to be considered distinct in implementations that distinguish
+   character types — we mimic that to match the ANSI tests' expectation)
+   while ((vector character) ⊆ string) still returns T T."
+  (cond
+    ;; (vector ELT SIZE) — 1-D array
+    ((and (consp tp) (%typename-eq (car tp) 'vector))
+     (let ((elt (if (cdr tp) (cadr tp) '*))
+           (sz  (if (cddr tp) (caddr tp) '*)))
+       (list 'array
+             (if (or (eq elt t) (null elt) (%typename-eq elt '*)) '* elt)
+             (if (or (eq sz t) (null sz) (%typename-eq sz '*)) '(*) (list sz)))))
+    ((%typename-eq tp 'vector) '(array * (*)))
+    ;; (simple-vector SIZE)
+    ((and (consp tp) (%typename-eq (car tp) 'simple-vector))
+     (let ((sz (if (cdr tp) (cadr tp) '*)))
+       (list 'simple-array 't
+             (if (or (eq sz t) (null sz) (%typename-eq sz '*)) '(*) (list sz)))))
+    ((%typename-eq tp 'simple-vector) '(simple-array t (*)))
+    ;; (bit-vector SIZE)
+    ((and (consp tp) (%typename-eq (car tp) 'bit-vector))
+     (let ((sz (if (cdr tp) (cadr tp) '*)))
+       (list 'array 'bit
+             (if (or (eq sz t) (null sz) (%typename-eq sz '*)) '(*) (list sz)))))
+    ((%typename-eq tp 'bit-vector) '(array bit (*)))
+    ;; (simple-bit-vector SIZE)
+    ((and (consp tp) (%typename-eq (car tp) 'simple-bit-vector))
+     (let ((sz (if (cdr tp) (cadr tp) '*)))
+       (list 'simple-array 'bit
+             (if (or (eq sz t) (null sz) (%typename-eq sz '*)) '(*) (list sz)))))
+    ((%typename-eq tp 'simple-bit-vector) '(simple-array bit (*)))
+    ;; (base-string SIZE) ≡ (vector base-char SIZE)
+    ((and (consp tp) (%typename-eq (car tp) 'base-string))
+     (let ((sz (if (cdr tp) (cadr tp) '*)))
+       (list 'array 'base-char
+             (if (or (eq sz t) (null sz) (%typename-eq sz '*)) '(*) (list sz)))))
+    ((%typename-eq tp 'base-string) '(array base-char (*)))
+    ;; (simple-base-string SIZE) ≡ (simple-array base-char (SIZE))
+    ((and (consp tp) (%typename-eq (car tp) 'simple-base-string))
+     (let ((sz (if (cdr tp) (cadr tp) '*)))
+       (list 'simple-array 'base-char
+             (if (or (eq sz t) (null sz) (%typename-eq sz '*)) '(*) (list sz)))))
+    ((%typename-eq tp 'simple-base-string) '(simple-array base-char (*)))
+    (t nil)))
+
+(defun %array-alias-p (tp)
+  "True iff TP is one of the (vector …) / (simple-vector …) /
+   (bit-vector …) / (simple-bit-vector …) / (base-string …) /
+   (simple-base-string …) aliases (or bare symbols) that
+   %canonicalise-array-type rewrites.  STRING / SIMPLE-STRING are
+   excluded — they're CLHS-wider than (vector character) and are
+   handled by dedicated string clauses in %subtypep-impl."
+  (or (and (consp tp)
+           (or (%typename-eq (car tp) 'vector)
+               (%typename-eq (car tp) 'simple-vector)
+               (%typename-eq (car tp) 'bit-vector)
+               (%typename-eq (car tp) 'simple-bit-vector)
+               (%typename-eq (car tp) 'base-string)
+               (%typename-eq (car tp) 'simple-base-string)))
+      (%typename-eq tp 'vector)
+      (%typename-eq tp 'simple-vector)
+      (%typename-eq tp 'bit-vector)
+      (%typename-eq tp 'simple-bit-vector)
+      (%typename-eq tp 'base-string)
+      (%typename-eq tp 'simple-base-string)))
+
+(defun %string-type-p (tp)
+  "True iff TP is in the WIDE string family — 'string / 'simple-string
+   and their parametric (NAME SIZE) variants.  These are unions over
+   character subtypes (per CLHS 12.1.4.4) and are therefore wider than
+   (vector character) etc.  base-string / simple-base-string are
+   handled separately as direct aliases of (vector base-char) /
+   (simple-array base-char (*))."
+  (or (%typename-eq tp 'string)
+      (%typename-eq tp 'simple-string)
+      (and (consp tp)
+           (or (%typename-eq (car tp) 'string)
+               (%typename-eq (car tp) 'simple-string)))))
+
+(defun %base-string-type-p (tp)
+  "True iff TP is 'base-string / 'simple-base-string or their
+   (NAME SIZE) parametric variant — these are direct aliases of
+   (vector base-char) / (simple-array base-char (*))."
+  (or (%typename-eq tp 'base-string)
+      (%typename-eq tp 'simple-base-string)
+      (and (consp tp)
+           (or (%typename-eq (car tp) 'base-string)
+               (%typename-eq (car tp) 'simple-base-string)))))
+
+(defun %string-type-size (tp)
+  "Extract the size spec from a string-family type: '* if absent."
+  (cond
+    ((and (consp tp) (cdr tp))
+     (let ((sz (cadr tp)))
+       (cond
+         ((null sz) '*)
+         ((%typename-eq sz '*) '*)
+         ((eq sz t) '*)
+         (t sz))))
+    (t '*)))
+
+(defun %string-type-simple-p (tp)
+  "True iff TP is a 'simple-' string-family alias."
+  (let ((head (if (consp tp) (car tp) tp)))
+    (or (%typename-eq head 'simple-string)
+        (%typename-eq head 'simple-base-string))))
+
+(defun %char-array-type-p (tp)
+  "True iff TP is a compound array type whose element type is one of
+   the character family names.  Used to recognise (vector character),
+   (array base-char (*)), etc. as equivalents of the string family."
+  (and (consp tp)
+       (or (%typename-eq (car tp) 'array)
+           (%typename-eq (car tp) 'simple-array))
+       (cdr tp)
+       (%typename-character-elt-p (cadr tp))
+       ;; Dims must be 1-D or unspecified: '*, (size), nil
+       (let ((dims (if (cddr tp) (caddr tp) '*)))
+         (or (eq dims '*)
+             (%typename-eq dims '*)
+             (eq dims t)
+             (and (consp dims) (null (cdr dims)))))))
+
+(defun %char-array-type-size (tp)
+  "Extract size from a (array character (size)) / (array character N) /
+   etc. compound.  '* if unspecified."
+  (let ((dims (if (cddr tp) (caddr tp) '*)))
+    (cond
+      ((or (eq dims '*) (%typename-eq dims '*) (eq dims t)) '*)
+      ((and (consp dims) (null (cdr dims)))
+       (let ((c (car dims)))
+         (if (or (eq c '*) (%typename-eq c '*) (eq c t)) '* c)))
+      (t '*))))
+
 (defun %subtypep-impl (t1 t2)
   "Implementation of SUBTYPEP returning two values: SUB? VALID?"
   (cond
@@ -951,11 +1110,88 @@
        (cond
          (all-yes (values t t))
          (t (values nil nil)))))
+    ;; Array/vector alias canonicalisation: rewrite at most ONE side per
+    ;; invocation, then recurse — both sides get normalised before
+    ;; reaching the comparison clauses below.  String aliases are
+    ;; handled separately to preserve the asymmetric (string ⊄ vector
+    ;; character) relation the ANSI tests check for.
+    ((%array-alias-p t1)
+     (%subtypep-impl (%canonicalise-array-type t1) t2))
+    ((%array-alias-p t2)
+     (%subtypep-impl t1 (%canonicalise-array-type t2)))
+    ;; String-family subtype clauses.
+    ;;   1. (string A) ⊆ (string B) etc. — both are character arrays,
+    ;;      size A ⊆ size B (in our world without extended-char).  We
+    ;;      defer through the (array character (A)) representation.
+    ;;   2. (array character …) ⊆ (string …) — yes, char arrays satisfy
+    ;;      the string aliases.
+    ;;   3. (string …) ⊆ (array character …) — NO (string is wider per
+    ;;      CLHS: it's the union of char-element-typed arrays, not a
+    ;;      direct subtype of any specific element type).
+    ((and (%string-type-p t1) (%string-type-p t2))
+     ;; Both string aliases — check the size relation.  simple-string ⊆
+     ;; string but not vice versa; (string N) ⊆ (string M) iff N=M.
+     (let* ((sz1 (%string-type-size t1))
+            (sz2 (%string-type-size t2))
+            (simple1 (%string-type-simple-p t1))
+            (simple2 (%string-type-simple-p t2)))
+       (cond
+         ;; If t2 demands simple but t1 doesn't, fail.
+         ((and simple2 (not simple1)) (values nil t))
+         ;; Otherwise check size compatibility.
+         ((or (eq sz2 '*) (%typename-eq sz2 '*)) (values t t))
+         ((or (eq sz1 '*) (%typename-eq sz1 '*)) (values nil t))
+         ((and (integerp sz1) (integerp sz2) (= sz1 sz2)) (values t t))
+         (t (values nil t)))))
+    ;; (array CHAR-FAMILY …) ⊆ (string …) — char-array IS a string.
+    ((and (%char-array-type-p t1) (%string-type-p t2))
+     (let* ((dim1 (%char-array-type-size t1))
+            (sz2  (%string-type-size t2))
+            (head1 (car t1))
+            (simple2 (%string-type-simple-p t2)))
+       (cond
+         ((and simple2 (not (%typename-eq head1 'simple-array))) (values nil t))
+         ((or (eq sz2 '*) (%typename-eq sz2 '*)) (values t t))
+         ((or (eq dim1 '*) (%typename-eq dim1 '*)) (values nil t))
+         ((and (integerp dim1) (integerp sz2) (= dim1 sz2)) (values t t))
+         (t (values nil t)))))
+    ;; (string …) ⊆ (array CHAR-FAMILY …) — NIL T per CLHS string-vs-
+    ;; vector-of-character convention.  Strings can hold any char
+    ;; subtype, so they aren't a subset of any one elt-type.
+    ((and (%string-type-p t1) (%char-array-type-p t2))
+     (values nil t))
+    ;; (string …) ⊆ (array extended-char …) — NIL T (Modus has no
+    ;; extended-char, so any extended-char-array is the empty type,
+    ;; and non-empty strings don't fit there).
+    ((and (%string-type-p t1)
+          (consp t2)
+          (or (%typename-eq (car t2) 'array)
+              (%typename-eq (car t2) 'simple-array)
+              (%typename-eq (car t2) 'vector)
+              (%typename-eq (car t2) 'simple-vector))
+          (cdr t2)
+          (%typename-eq (cadr t2) 'extended-char))
+     (values nil t))
+    ;; Bare STRING / BASE-STRING etc. on one side, but bare ARRAY /
+    ;; SIMPLE-ARRAY on the other — both name "array" shapes.  STRING is
+    ;; a subtype of ARRAY (a string IS an array).  Conversely ARRAY is
+    ;; not subtype of STRING.
+    ((and (%string-type-p t1) (or (%typename-eq t2 'array)
+                                  (%typename-eq t2 'simple-array)))
+     (cond
+       ((%typename-eq t2 'simple-array)
+        (if (%string-type-simple-p t1) (values t t) (values nil t)))
+       (t (values t t))))
+    ((and (or (%typename-eq t1 'array) (%typename-eq t1 'simple-array))
+          (%string-type-p t2))
+     (values nil t))
     ;; (array ETYPE DIMS) ⊆ (array ETYPE2 DIMS2) — match ANSI rules
-    ((and (or (and (consp t1) (or (eq (car t1) 'array) (eq (car t1) 'simple-array)))
-              (eq t1 'array) (eq t1 'simple-array))
-          (or (and (consp t2) (or (eq (car t2) 'array) (eq (car t2) 'simple-array)))
-              (eq t2 'array) (eq t2 'simple-array)))
+    ((and (or (and (consp t1) (or (%typename-eq (car t1) 'array)
+                                  (%typename-eq (car t1) 'simple-array)))
+              (%typename-eq t1 'array) (%typename-eq t1 'simple-array))
+          (or (and (consp t2) (or (%typename-eq (car t2) 'array)
+                                  (%typename-eq (car t2) 'simple-array)))
+              (%typename-eq t2 'array) (%typename-eq t2 'simple-array)))
      (%subtypep-array t1 t2))
     ;; (cons A B) — compound CONS type.
     ((and (or (and (consp t1) (eq (car t1) 'cons)) (eq t1 'cons))
@@ -1043,12 +1279,16 @@
          (dims2 (%canon-array-dims (if (and rest2 (cdr rest2)) (cadr rest2) '*))))
     ;; Head subtype: simple-array ⊆ array
     (cond
-      ((and (eq head1 'array) (eq head2 'simple-array))
+      ((and (%typename-eq head1 'array) (%typename-eq head2 'simple-array))
        (values nil t))     ; non-simple-array isn't simple-array
+      ;; Element-type EXTENDED-CHAR is the empty type in Modus (we have
+      ;; no extended characters), so any (array extended-char …) is
+      ;; the empty type ⊆ anything = T, and any non-empty (array X …)
+      ;; ⊄ (array extended-char …) = NIL T.
+      ((%typename-eq et1 'extended-char) (values t t))
+      ((%typename-eq et2 'extended-char) (values nil t))
       (t
-       (let ((et-ok (or (and (or (eq et1 't) (eq et1 '*))
-                             (or (eq et2 't) (eq et2 '*)))
-                        (equal et1 et2))))
+       (let ((et-ok (%array-etype-equiv-p et1 et2)))
          (cond
            ((not et-ok) (values nil nil))
            ;; dims2 is * → any rank/dims accepted
@@ -1058,6 +1298,49 @@
            ;; Both are lists — pairwise check
            ((%dims-le-p dims1 dims2) (values t t))
            (t (values nil t))))))))
+
+(defun %array-etype-equiv-p (et1 et2)
+  "True iff array element-type specs ET1 and ET2 should be considered
+   equivalent for SUBTYPEP purposes.  CLHS allows wide latitude here
+   because element-type upgrading is implementation-defined; we equate:
+     - '* / T / (eql T) with each other.
+     - 'character / 'base-char / 'standard-char (Modus has only base
+       chars).
+     - 'bit with itself.
+     - Same compound type by EQUAL.
+   When ET1=T and ET2 is a non-* specific type (or vice versa) we
+   answer T (the test is meant to detect when the upgraded element
+   types are compatible — Modus upgrades everything to T)."
+  (cond
+    ((or (eq et1 '*) (%typename-eq et1 '*))
+     (or (eq et2 '*) (%typename-eq et2 '*) (eq et2 't) (%typename-eq et2 't)))
+    ((or (eq et1 't) (%typename-eq et1 't))
+     (or (eq et2 '*) (%typename-eq et2 '*) (eq et2 't) (%typename-eq et2 't)))
+    ((or (eq et2 '*) (%typename-eq et2 '*) (eq et2 't) (%typename-eq et2 't))
+     ;; ET1 is some specific non-* type, ET2 is T-like.  ARRAY of
+     ;; specific-type IS a subtype of ARRAY of T (specific upgrades to
+     ;; T), so this direction can be T — but we're called for the
+     ;; equality of upgraded types.  Modus upgrades nearly everything
+     ;; to T, so treat the inclusion as element-type-OK; the SUBTYPEP
+     ;; caller already handles the array-direction via dims walk.
+     t)
+    ;; Character family.
+    ((and (%typename-character-elt-p et1) (%typename-character-elt-p et2)) t)
+    ;; NIL element-type is the empty type — never matches anything
+    ;; except NIL itself.
+    ((and (or (null et1) (eq et1 'nil)) (or (null et2) (eq et2 'nil))) t)
+    ((or (null et1) (eq et1 'nil) (null et2) (eq et2 'nil)) nil)
+    ;; Same bare type name (handle symbol-identity duplicates).
+    ((and (symbolp et1) (symbolp et2) (%typename-eq et1 et2)) t)
+    ;; Same compound type (e.g. (unsigned-byte 8) vs (unsigned-byte 8)).
+    ((equal et1 et2) t)
+    (t nil)))
+
+(defun %typename-character-elt-p (e)
+  "True iff E is one of the character-family element-type names."
+  (or (%typename-eq e 'character)
+      (%typename-eq e 'base-char)
+      (%typename-eq e 'standard-char)))
 
 (defun %cons-arg-empty-p (a)
   "True if A as a CONS car/cdr type-spec is empty.  NIL (the type) is
@@ -2018,6 +2301,115 @@
            (not (null lit)) (not (eq lit t))
            (= (aref tn 0) (aref lit 0)))))
 
+;; --- Array typep helpers ---
+;;
+;; Modus stores multi-dim arrays in two shapes:
+;;   1. cons-wrapper MDA: (cons 9867654 (cons DIMS-LIST FLAT-DATA))
+;;      Possibly nested inside an adjustable wrapper (cons 8765432 ...).
+;;      Made by the build-time rewriter for (make-array '(N M ...) ...).
+;;   2. Native MDA (subtag #x34), seven-slot header object.
+;;      Made at runtime by %alloc-mda.  See mvm/cl-clos.lisp.
+;; Both report rank/dims via array-rank / array-dimensions and pass
+;; arrayp.  Plain 1-D vectors (subtag #x31 string, #x32 array) and the
+;; FP/displaced wrappers also pass arrayp; their rank is always 1.
+;;
+;; The typep clauses for (array …) / (vector …) / (simple-array …) /
+;; (simple-vector …) reuse those helpers so they accept any of these
+;; shapes uniformly.
+
+(defun %typep-array-elt-match-p (arr elt)
+  "True iff ARR's element-type satisfies the type spec ELT.
+   Modus upgrades nearly every element-type to T, so the only
+   distinctions we can make are:
+     - strings (subtag #x31 or MDA whose data is a string) hold base
+       chars only — they satisfy CHARACTER / BASE-CHAR / STANDARD-CHAR
+       and don't satisfy BIT / NUMBER / SYMBOL / T (since strings are
+       NOT T-vectors).
+     - bit-vectors (arrays of 0/1) satisfy BIT / INTEGER / UNSIGNED-BYTE
+       and don't satisfy CHARACTER.
+   For other arrays the element-type is T, so ELT = T / * / any
+   T-supertype matches.  '*' / NIL always pass.
+
+   Important: a string is NOT (vector T) / (vector *).  Strings have
+   element type CHARACTER, and (vector T) means strictly element-type
+   T.  So when ELT = T (explicit, not '*'), strings DON'T match.
+   When ELT = '*' (no constraint), anything matches."
+  (cond
+    ((or (null elt) (eq elt '*) (%typename-eq elt '*)) t)
+    ((stringp arr)
+     ;; Strings only really satisfy character-family element types.
+     ;; Importantly, ELT = T (explicit) is NOT a match — strings are
+     ;; element-type CHARACTER, not T.
+     (cond
+       ((%typename-eq elt 'character) t)
+       ((%typename-eq elt 'base-char) t)
+       ((%typename-eq elt 'standard-char) t)
+       ((%typename-eq elt 'extended-char) nil)
+       ((or (%typename-eq elt 't) (eq elt t)) nil)
+       ((or (%typename-eq elt 'bit) (%typename-eq elt 'fixnum)
+            (%typename-eq elt 'integer) (%typename-eq elt 'unsigned-byte)
+            (%typename-eq elt 'signed-byte) (%typename-eq elt 'number)
+            (%typename-eq elt 'symbol))
+        nil)
+       ;; (unsigned-byte n) / (signed-byte n) / (integer …) etc. compound
+       ;; on a string is false (string elt isn't an integer of any width).
+       ((and (consp elt)
+             (or (%typename-eq (car elt) 'unsigned-byte)
+                 (%typename-eq (car elt) 'signed-byte)
+                 (%typename-eq (car elt) 'integer)
+                 (%typename-eq (car elt) 'mod)
+                 (%typename-eq (car elt) 'bit)))
+        nil)
+       (t t)))
+    (t
+     ;; Non-string array.  ELT = T or T-equivalent matches.  CHARACTER
+     ;; on a non-string array doesn't (since the elt is T, not character).
+     (cond
+       ((or (eq elt t) (%typename-eq elt 't)) t)
+       ((or (%typename-eq elt 'character) (%typename-eq elt 'base-char)
+            (%typename-eq elt 'standard-char) (%typename-eq elt 'extended-char))
+        nil)
+       (t t)))))
+
+(defun %typep-array-dim-spec-match-p (actual spec)
+  "Per-dimension: is ACTUAL (an integer dimension) covered by SPEC?
+   SPEC may be '*' / T / an integer."
+  (cond
+    ((%typename-eq spec '*) t)
+    ((eq spec t) t)
+    ((integerp spec) (= spec actual))
+    (t nil)))
+
+(defun %typep-array-dims-match-p (arr dims-spec)
+  "True iff ARR's dimensions match DIMS-SPEC, where:
+     '*' / T             — any rank
+     integer N           — rank N (any dim sizes)
+     NIL                 — rank 0 only (Modus has none → NIL)
+     list of N specs     — rank N, each dim matches spec
+   The caller substitutes '*' for an absent dims-spec, so NIL here
+   means an explicit rank-0 request from the source.
+   ARR is any object that passed arrayp."
+  (cond
+    ((or (eq dims-spec '*) (%typename-eq dims-spec '*) (eq dims-spec t)) t)
+    ((null dims-spec)
+     ;; Explicit rank-0 request — Modus has no rank-0 arrays.
+     ;; (The "absent dims" case never reaches here; caller substituted '*.)
+     (= (array-rank arr) 0))
+    ((integerp dims-spec) (= dims-spec (array-rank arr)))
+    ((consp dims-spec)
+     ;; Walk both lists in parallel.  Must have same length (= same rank).
+     (let ((actual (array-dimensions arr)) (spec dims-spec) (ok t))
+       (loop
+         (when (or (and (null actual) (null spec)) (not ok))
+           (return ok))
+         (when (or (null actual) (null spec))
+           (setq ok nil) (return ok))
+         (unless (%typep-array-dim-spec-match-p (car actual) (car spec))
+           (setq ok nil))
+         (setq actual (cdr actual))
+         (setq spec (cdr spec)))))
+    (t nil)))
+
 (defun typep (obj type)
   "Extended typep supporting compound type specifiers."
   (cond
@@ -2079,6 +2471,29 @@
          ((%typename-eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
          ((%typename-eq tn 'bit-vector) (bit-vector-p obj))
          ((%typename-eq tn 'simple-bit-vector) (simple-bit-vector-p obj))
+         ;; Array/vector predicates: route through arrayp (which now
+         ;; recognises cons-wrappers and native MDA).  simple-vector
+         ;; requires non-string element type; simple-array tracks
+         ;; non-adjustable.  Modus mostly upgrades everything to T so
+         ;; the distinctions are coarse.
+         ((%typename-eq tn 'array) (arrayp obj))
+         ((%typename-eq tn 'simple-array)
+          (and (arrayp obj)
+               (not (and (consp obj) (eql (car obj) 8765432)))))
+         ((%typename-eq tn 'vector)
+          (and (arrayp obj) (= (array-rank obj) 1)))
+         ((%typename-eq tn 'simple-vector)
+          ;; CL: simple-vector = simple 1-D array of T.  In Modus the
+          ;; element type isn't tracked at the object level, so we
+          ;; can't strictly distinguish (vector T) from (vector bit) /
+          ;; (vector character) for arrays of 0/1 etc.  Reject strings
+          ;; (#x31, definitely char-element-typed) and adjustable
+          ;; wrappers but otherwise accept any 1-D arrayp.
+          (and (arrayp obj) (= (array-rank obj) 1)
+               (not (stringp obj))
+               (not (and (consp obj) (eql (car obj) 8765432)))))
+         ((%typename-eq tn 'sequence)
+          (or (null obj) (consp obj) (arrayp obj)))
          ((%typename-eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((%typename-eq tn 'signed-byte) (integerp obj))
          ((%typename-eq tn 'function) (or (functionp obj) (%generic-function-p obj)))
@@ -2202,47 +2617,41 @@
                (let ((sz (and (cdr type) (cadr type))))
                  (or (null sz) (%typename-eq sz '*) (eq sz t)
                      (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (vector elt-type size) / (simple-array elt-type dims)
-         ;; — vector/array with optional element-type and dimensions.
-         ;; dims interpretation per CLHS:
-         ;;   absent          — no constraint
-         ;;   '*              — any rank
-         ;;   integer         — 1D with that size
-         ;;   NIL / ()        — 0-rank (modus has none → NIL)
-         ;;   (n)             — 1D with size n (or '* for any)
-         ;;   (n m ...)       — multi-rank (modus 1D-only → NIL)
+         ;; (vector elt-type size) — vector with optional element-type
+         ;; and a single size dimension.  Vector is always rank-1.
          ((or (%typename-eq head 'vector)
-              (%typename-eq head 'simple-vector)
-              (%typename-eq head 'simple-array)
+              (%typename-eq head 'simple-vector))
+          (and (arrayp obj)
+               (= (array-rank obj) 1)
+               (%typep-array-elt-match-p
+                obj
+                (cond
+                  ((%typename-eq head 'simple-vector) 't)
+                  ((cdr type) (cadr type))
+                  (t '*)))
+               (let ((sz (cond
+                           ((%typename-eq head 'simple-vector)
+                            (if (cdr type) (cadr type) nil))
+                           ((cddr type) (caddr type))
+                           (t nil))))
+                 (cond
+                   ((null sz) t)
+                   ((%typename-eq sz '*) t)
+                   ((eq sz t) t)
+                   ((integerp sz) (= sz (array-length obj)))
+                   (t nil)))))
+         ;; (array elt dims) / (simple-array elt dims).  Dims spec:
+         ;;   absent / '* / T            — any rank
+         ;;   integer N                  — rank N
+         ;;   NIL                        — rank 0
+         ;;   list of N elements (or *)  — rank N with per-dim spec
+         ((or (%typename-eq head 'simple-array)
               (%typename-eq head 'array))
-          (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
-               (or (= (obj-subtag obj) #x31)   ; string
-                   (= (obj-subtag obj) #x32))  ; generic array
-               (cond
-                 ;; no dims spec
-                 ((null (cddr type)) t)
-                 (t
-                  (let ((dims (caddr type)))
-                    (cond
-                      ;; '* → any
-                      ((%typename-eq dims '*) t)
-                      ((eq dims t) t)
-                      ;; integer N → 1D length N
-                      ((integerp dims) (= dims (array-length obj)))
-                      ;; NIL → 0-rank (modus has none)
-                      ((null dims) nil)
-                      ;; list of dim-specs
-                      ((consp dims)
-                       (cond
-                         ;; (n) — 1D
-                         ((and (null (cdr dims)))
-                          (or (%typename-eq (car dims) '*)
-                              (eq (car dims) t)
-                              (and (integerp (car dims))
-                                   (= (car dims) (array-length obj)))))
-                         ;; multi-rank — modus is 1D only
-                         (t nil)))
-                      (t nil)))))))
+          (and (arrayp obj)
+               (%typep-array-elt-match-p
+                obj (if (cdr type) (cadr type) '*))
+               (%typep-array-dims-match-p
+                obj (if (cddr type) (caddr type) '*))))
          ;; (cons car-type cdr-type) — type-check both halves.
          ((%typename-eq head 'cons)
           (and (consp obj)

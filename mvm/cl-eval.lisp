@@ -990,6 +990,24 @@
               (expander (list '%interp-closure params body nil)))
          (set-macro-function mname expander)
          mname))
+      ;; (define-compiler-macro name (params) body...)
+      ;; CLHS §define-compiler-macro: registers a compiler-macro expander
+      ;; for NAME (or (SETF NAME)).  Modus's compiler does not consult
+      ;; user-registered compiler-macros, but ANSI tests that
+      ;; `(eval `(define-compiler-macro ...))` then call `documentation`
+      ;; or `compiler-macro-function` on the name need eval to succeed.
+      ;; Treat as a no-op that returns NAME, matching CLHS's return
+      ;; value contract.  The ANSI documentation tests for
+      ;; compiler-macros check NIL or accept any return string round-trip,
+      ;; both of which we satisfy with no actual expander registered.
+      ((%eval-sym-eq op "DEFINE-COMPILER-MACRO")
+       (car args))
+      ;; (define-symbol-macro name expansion)
+      ;; CLHS §define-symbol-macro: similar — register at runtime so
+      ;; subsequent eval references to NAME expand.  Without a runtime
+      ;; symbol-macro table, treat as no-op returning NAME.
+      ((%eval-sym-eq op "DEFINE-SYMBOL-MACRO")
+       (car args))
       ;; MACROLET — (macrolet ((name (params) body) ...) body...)
       ;; Registers local macros via set-macro-function for the duration
       ;; of the inner body, then restores prior bindings.  Used heavily

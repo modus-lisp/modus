@@ -962,10 +962,14 @@
             (rest     (cdddr form)))
        `(,(car form) ,name-arg ,pkg-arg
                      ,@(mapcar #'rewrite-package-iteration rest))))
-    ;; (ignore-errors form) → (handler-case form (error (c) nil))
+    ;; (ignore-errors form) → CLHS 9.1.5.3.1 returns the body's primary
+    ;; values on success and (values nil c) when c is the condition that
+    ;; caused the error.  The previous rewriter returned plain NIL,
+    ;; which broke ignore-errors.{4,5,6} that check for the captured
+    ;; condition as a second value.
     ((and (eq (car form) 'ignore-errors) (cdr form))
      (let ((body (rewrite-package-iteration (cadr form))))
-       `(handler-case ,body (error (c) nil))))
+       `(handler-case ,body (error (%ie-c) (values nil %ie-c)))))
     ;; (report-and-ignore-errors form) → form (ignore errors)
     ((eq (car form) 'report-and-ignore-errors)
      (rewrite-package-iteration (cadr form)))

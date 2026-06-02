@@ -3297,8 +3297,23 @@
 ;; defmacro and then immediately uses it.  Removed.
 
 (defun compiler-macro-function (name &optional env)
-  "Return compiler macro function for NAME (stub)."
-  nil)
+  "Return compiler macro function for NAME, or NIL.
+
+   Looks up *compiler-macro-function-table* — populated at runtime by
+   cl-eval's DEFINE-COMPILER-MACRO handler.  Wraps interp-closure
+   expanders via %interp-macro-shim so user-facing
+   `(funcall (compiler-macro-function ...) ...)` works through the
+   compiled funcall path (same fix as for macro-function +
+   runtime-defmacro)."
+  (declare (ignore env))
+  (let ((key (%macro-sym-key name)))
+    (let ((raw (and key *compiler-macro-function-table*
+                    (gethash key *compiler-macro-function-table*))))
+      (cond
+        ((null raw) nil)
+        ((%interp-closure-p raw)
+         (%make-closure #'%interp-macro-shim (cons raw nil)))
+        (t raw)))))
 
 ;;; ============================================================
 ;;; UPGRADED-COMPLEX-PART-TYPE

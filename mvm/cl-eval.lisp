@@ -184,6 +184,12 @@
 ;;; Macro table: maps macro-name-string → expander-function
 ;;; ============================================================
 (defvar *macro-function-table* nil)
+(defvar *compiler-macro-function-table* nil
+  "Hash-table: macro-name → %interp-closure expander, populated by
+   cl-eval's DEFINE-COMPILER-MACRO handler.  Consulted by
+   compiler-macro-function.  Distinct from *macro-function-table* so
+   that macro-function still returns NIL for compiler-macros that
+   don't double as regular macros.")
 
 (defvar *%compiler-macro-hashes* nil
   "Hash-set of name-hashes for CL macros that the modus compiler
@@ -1003,15 +1009,25 @@
       ;; (define-compiler-macro name (params) body...)
       ;; CLHS §define-compiler-macro: registers a compiler-macro expander
       ;; for NAME (or (SETF NAME)).  Modus's compiler does not consult
-      ;; user-registered compiler-macros, but ANSI tests that
-      ;; `(eval `(define-compiler-macro ...))` then call `documentation`
-      ;; or `compiler-macro-function` on the name need eval to succeed.
-      ;; Treat as a no-op that returns NAME, matching CLHS's return
-      ;; value contract.  The ANSI documentation tests for
-      ;; compiler-macros check NIL or accept any return string round-trip,
-      ;; both of which we satisfy with no actual expander registered.
+      ;; user-registered compiler-macros during compilation, but ANSI
+      ;; tests `(eval `(define-compiler-macro ,sym ...))` followed by
+      ;; `(compiler-macro-function sym)` need the expander stored so the
+      ;; lookup returns a function rather than NIL.  Register into
+      ;; *compiler-macro-function-table* — a separate registry from
+      ;; *macro-function-table* — so MACRO-FUNCTION still distinguishes
+      ;; "is a real macro" from "is just a compiler-macro hint".
+      ;; Returns NAME per CLHS's return-value contract.
       ((%eval-sym-eq op "DEFINE-COMPILER-MACRO")
-       (car args))
+       (let* ((mname (car args))
+              (params (cadr args))
+              (body (cddr args))
+              (expander (list '%interp-closure params body nil))
+              (key (%macro-sym-key mname)))
+         (when key
+           (unless *compiler-macro-function-table*
+             (setq *compiler-macro-function-table* (make-hash-table)))
+           (puthash key *compiler-macro-function-table* expander))
+         mname))
       ;; (define-symbol-macro name expansion)
       ;; CLHS §define-symbol-macro: similar — register at runtime so
       ;; subsequent eval references to NAME expand.  Without a runtime

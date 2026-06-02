@@ -3626,6 +3626,40 @@
          (apply #'append
                 (mapcar (lambda (f) (collect-setq-vars-in-body f inner-bound))
                         (cddr form))))))
+    ;; FLET / LABELS — each definition's body is a separate function whose
+    ;; params shadow outer bound-vars (just like a lambda body).  Without
+    ;; this branch, mutations of let-vars inside an flet/labels function
+    ;; body were invisible to vars-mutated-in-lambdas — its scanner only
+    ;; invoked this collector from the LAMBDA branch, so a setq nested in
+    ;; (FLET ((F () (SETQ B …))) …) was never observed.
+    ((and (consp form)
+          (or (and (symbolp (car form))
+                   (or (string= (symbol-name (car form)) "FLET")
+                       (string= (symbol-name (car form)) "LABELS")))
+              (and (integerp (car form)) (= (car form) 230909053785822708))   ; flet hash
+              (and (integerp (car form)) (= (car form) 176230696681611090)))) ; labels hash
+     (let ((defs (cadr form))
+           (rest-body (cddr form))
+           (results nil))
+       (when (consp defs)
+         (dolist (def defs)
+           (when (and (consp def) (consp (cdr def)))
+             (let* ((fparams (cadr def))
+                    (fparam-names (if (consp fparams)
+                                      (remove-if-not #'symbolp fparams)
+                                      nil))
+                    (inner-bound (remove-if (lambda (v)
+                                              (member v fparam-names :test #'name-equal))
+                                            bound-vars)))
+               (when inner-bound
+                 (dolist (f (cddr def))
+                   (dolist (v (collect-setq-vars-in-body f inner-bound))
+                     (setq results (adjoin v results :test #'name-equal)))))))))
+       ;; Outer body (after the defs list) still sees full bound-vars.
+       (dolist (f rest-body)
+         (dolist (v (collect-setq-vars-in-body f bound-vars))
+           (setq results (adjoin v results :test #'name-equal))))
+       results))
     (t
      ;; Recurse into all subforms (guard against dotted pairs)
      (let ((results nil)
@@ -3664,6 +3698,40 @@
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
                         (and (integerp op) (= op 113179339635393781)))
                     (scan (cadr form) in-lambda))
+                   ;; FLET / LABELS — each function body is a separate
+                   ;; function (compiled by mvm-compile-function-internal)
+                   ;; whose body can mutate enclosing let-vars exactly as a
+                   ;; lambda body can.  Treat each (name params fbody…)
+                   ;; like a lambda for boxed-var detection.
+                   ((or (and (symbolp op)
+                             (or (string= (symbol-name op) "FLET")
+                                 (string= (symbol-name op) "LABELS")))
+                        (and (integerp op) (= op 230909053785822708))   ; flet hash
+                        (and (integerp op) (= op 176230696681611090)))  ; labels hash
+                    (let ((defs (cadr form))
+                          (rest-body (cddr form)))
+                      (when (consp defs)
+                        (dolist (def defs)
+                          (when (and (consp def) (consp (cdr def)))
+                            (let* ((fparams (cadr def))
+                                   (fparam-names (if (consp fparams)
+                                                     (remove-if-not #'symbolp fparams)
+                                                     nil))
+                                   (visible-vars (remove-if
+                                                  (lambda (v)
+                                                    (member v fparam-names :test #'name-equal))
+                                                  let-vars)))
+                              (when visible-vars
+                                (dolist (v (collect-setq-vars-in-body
+                                            (cons 'progn (cddr def)) visible-vars))
+                                  (setq result (adjoin v result :test #'name-equal))))
+                              ;; Recurse for nested lambdas with shadowing
+                              (dolist (f (cddr def))
+                                (scan f t))))))
+                      ;; The outer body (after the defs list) is in the
+                      ;; same lexical scope as the FLET/LABELS form itself.
+                      (dolist (f rest-body)
+                        (scan f in-lambda))))
                    ;; skip quoted forms
                    ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
                         (and (integerp op) (= op 518921307293258709)))
@@ -3855,6 +3923,46 @@
             `(lambda ,(cadr form)
                ,@(mapcar (lambda (f) (cell-rewrite-form f inner-boxed params))
                          (cddr form)))))
+         ;; flet / labels — each definition's params shadow boxed-vars
+         ;; within that definition's body.  Without this branch the
+         ;; generic-case recursion was correct in spirit but treated each
+         ;; flet param like a free reference; that path happened to work
+         ;; because flet params are symbols not in boxed-vars.  The
+         ;; explicit branch protects against shadowing edge cases (e.g.
+         ;; an flet param NAMED the same as an outer boxed var) and
+         ;; documents the structural correspondence with LAMBDA.
+         ((or (and (symbolp op)
+                   (or (string= (symbol-name op) "FLET")
+                       (string= (symbol-name op) "LABELS")))
+              (and (integerp op) (= op 230909053785822708))   ; flet hash
+              (and (integerp op) (= op 176230696681611090)))  ; labels hash
+          (let* ((defs (cadr form))
+                 (rest-body (cddr form))
+                 (new-defs
+                  (mapcar
+                   (lambda (def)
+                     (if (and (consp def) (consp (cdr def)))
+                         (let* ((fname (car def))
+                                (fparams (cadr def))
+                                (fparam-names (if (consp fparams)
+                                                  (remove-if-not #'symbolp fparams)
+                                                  nil))
+                                (inner-boxed (remove-if
+                                              (lambda (v)
+                                                (member v fparam-names :test #'name-equal))
+                                              boxed-vars))
+                                (new-fbody
+                                 (mapcar (lambda (f)
+                                           (cell-rewrite-form f inner-boxed fparam-names))
+                                         (cddr def))))
+                           `(,fname ,fparams ,@new-fbody))
+                         def))
+                   defs))
+                 (new-rest
+                  (mapcar (lambda (f)
+                            (cell-rewrite-form f boxed-vars lambda-params))
+                          rest-body)))
+            `(,op ,new-defs ,@new-rest)))
          ;; quote — don't rewrite inside
          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
               (and (integerp op) (= op 518921307293258709)))
@@ -4430,6 +4538,177 @@
 ;;; Flet / Labels
 ;;; ============================================================
 
+(defun %flet-rewrite-calls (form local-names cell-names)
+  "Walk FORM, replacing every call (NAME args…) where NAME is in LOCAL-NAMES
+   with (FUNCALL (CAR CELL-NAME) args…), and every (FUNCTION NAME) with
+   (CAR CELL-NAME).  LOCAL-NAMES and CELL-NAMES are parallel lists.
+   Used by compile-flet's capture-aware transform to retarget intra-FLET
+   calls to the heap-cell-stored lambda closures.
+   Skips inside QUOTE forms.  Shadows any LOCAL-NAME re-bound by an inner
+   LAMBDA/LET/LET*/FLET/LABELS so a parameter named the same as an outer
+   local FLET function still resolves correctly."
+  (cond
+    ((null form) nil)
+    ((atom form) form)
+    (t
+     (let ((op (car form)))
+       (cond
+         ;; (quote ...) — leave as-is
+         ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+              (and (integerp op) (= op 518921307293258709)))
+          form)
+         ;; (function NAME) — if NAME is a local, replace with (car cell)
+         ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+              (and (integerp op) (= op 113179339635393781)))
+          (let ((arg (cadr form)))
+            (cond
+              ;; (function (lambda ...)) — walk inside the lambda's body,
+              ;; shadowing any local-names re-bound by the lambda params.
+              ((and (consp arg)
+                    (or (and (symbolp (car arg))
+                             (string= (symbol-name (car arg)) "LAMBDA"))
+                        (and (integerp (car arg))
+                             (= (car arg) 527981956251550024))))
+               (let* ((params (cadr arg))
+                      (pnames (if (consp params)
+                                  (remove-if-not #'symbolp params)
+                                  nil))
+                      (filtered (loop for n in local-names
+                                      for c in cell-names
+                                      unless (member n pnames :test #'name-equal)
+                                      collect (cons n c)))
+                      (new-locals (mapcar #'car filtered))
+                      (new-cells  (mapcar #'cdr filtered)))
+                 `(function (lambda ,params
+                              ,@(mapcar (lambda (f)
+                                          (%flet-rewrite-calls
+                                           f new-locals new-cells))
+                                        (cddr arg))))))
+              ;; (function NAME) — NAME is a local FLET function name?
+              ((and (symbolp arg)
+                    (member arg local-names :test #'name-equal))
+               (let ((cell (loop for n in local-names
+                                 for c in cell-names
+                                 when (name-equal n arg) return c)))
+                 `(car ,cell)))
+              (t form))))
+         ;; (lambda (params...) body...) — walk body with shadow
+         ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+              (and (integerp op) (= op 527981956251550024)))
+          (let* ((params (cadr form))
+                 (pnames (if (consp params) (remove-if-not #'symbolp params) nil))
+                 (filtered (loop for n in local-names
+                                 for c in cell-names
+                                 unless (member n pnames :test #'name-equal)
+                                 collect (cons n c)))
+                 (new-locals (mapcar #'car filtered))
+                 (new-cells  (mapcar #'cdr filtered)))
+            `(lambda ,params
+               ,@(mapcar (lambda (f)
+                           (%flet-rewrite-calls f new-locals new-cells))
+                         (cddr form)))))
+         ;; Nested FLET / LABELS — function names declared here SHADOW
+         ;; outer FLET names of the same name.  Drop the shadowed names
+         ;; from the local→cell map before walking inside; only the outer
+         ;; body of the nested form sees the shadow (per CL semantics).
+         ((or (and (symbolp op)
+                   (or (string= (symbol-name op) "FLET")
+                       (string= (symbol-name op) "LABELS")))
+              (and (integerp op) (= op 230909053785822708))
+              (and (integerp op) (= op 176230696681611090)))
+          (let* ((defs (cadr form))
+                 (rest-body (cddr form))
+                 (def-names (when (consp defs)
+                              (mapcar #'car defs)))
+                 (filtered (loop for n in local-names
+                                 for c in cell-names
+                                 unless (member n def-names :test #'name-equal)
+                                 collect (cons n c)))
+                 (new-locals (mapcar #'car filtered))
+                 (new-cells  (mapcar #'cdr filtered))
+                 ;; Each def's body is in scope of all the def names for
+                 ;; LABELS (mutual recursion), but only its params + outer
+                 ;; for FLET.  Both cases shadow OUTER same-named locals.
+                 (rewritten-defs
+                  (mapcar (lambda (def)
+                            (if (and (consp def) (consp (cdr def)))
+                                (let* ((dname (car def))
+                                       (dparams (cadr def))
+                                       (dpnames (if (consp dparams)
+                                                    (remove-if-not #'symbolp dparams)
+                                                    nil))
+                                       (def-filtered (loop for n in new-locals
+                                                           for c in new-cells
+                                                           unless (member n dpnames
+                                                                          :test #'name-equal)
+                                                           collect (cons n c)))
+                                       (def-locals (mapcar #'car def-filtered))
+                                       (def-cells  (mapcar #'cdr def-filtered)))
+                                  `(,dname ,dparams
+                                           ,@(mapcar (lambda (f)
+                                                       (%flet-rewrite-calls
+                                                        f def-locals def-cells))
+                                                     (cddr def))))
+                                def))
+                          defs)))
+            `(,op ,rewritten-defs
+                  ,@(mapcar (lambda (f)
+                              (%flet-rewrite-calls f new-locals new-cells))
+                            rest-body))))
+         ;; (NAME args…) — if NAME is a local FLET name, retarget to funcall.
+         ((and (symbolp op)
+               (member op local-names :test #'name-equal))
+          (let ((cell (loop for n in local-names
+                            for c in cell-names
+                            when (name-equal n op) return c)))
+            `(funcall (car ,cell)
+                      ,@(mapcar (lambda (f)
+                                  (%flet-rewrite-calls f local-names cell-names))
+                                (cdr form)))))
+         ;; General case: walk operator (compound) and arguments
+         (t
+          (cons (if (consp op)
+                    (%flet-rewrite-calls op local-names cell-names)
+                    op)
+                (let ((rest (cdr form))
+                      (out  nil))
+                  (loop while (consp rest) do
+                    (push (%flet-rewrite-calls (car rest) local-names cell-names)
+                          out)
+                    (setf rest (cdr rest)))
+                  (nreverse out)))))))))
+
+(defun %cell-name-p (sym)
+  "T if SYM is a cell-rewrite-emitted heap-cell name (%CELL-…), i.e. a
+   variable that the let cell-rewrite introduced for a boxed outer let
+   binding.  The capture-aware FLET/LABELS transform restricts itself to
+   these names so it doesn't break tests where an ordinary (non-cell)
+   capture would change semantics (e.g. lexical-vs-dynamic for declared
+   specials, snapshot-at-creation vs read-at-call for plain free vars)."
+  (and (symbolp sym)
+       (let ((nm (symbol-name sym)))
+         (and (>= (length nm) 6)
+              (string= nm "%CELL-" :end1 6)))))
+
+(defun %flet-functions-capture-vars-p (defs env)
+  "Return T if any function body in DEFS references a CELL variable (one
+   emitted by the let cell-rewrite — name prefix %CELL-) that's bound in
+   ENV's chain — i.e., the FLET/LABELS form needs closure semantics so the
+   captured cell propagates as a heap cell pointer.  Skips function-name
+   refs (mutual recursion targets) by walking only variable refs via
+   %collect-free-vars, and skips ordinary lexical/special captures so a
+   FLET whose body happens to read an outer let var isn't transformed
+   (which would change snapshot-at-creation semantics)."
+  (let ((any-cell-captures nil))
+    (dolist (def defs)
+      (when (and (consp def) (consp (cdr def)))
+        (let* ((fparams (cadr def))
+               (param-names (%extract-lambda-param-names fparams))
+               (free (%collect-free-vars-list (cddr def) param-names env nil)))
+          (when (some #'%cell-name-p free)
+            (setq any-cell-captures t)))))
+    any-cell-captures))
+
 (defun compile-flet (defs body env dest &optional labels-p)
   "Compile (flet ((name (params) body) ...) body).
    Each local function is compiled as a named global function with a UNIQUE
@@ -4437,7 +4716,76 @@
    The local name is mapped to the unique name in the env, so #'local-name
    references within the body resolve to the unique global name.
    LABELS-P: if true, local function bodies can reference other local names
-   (implements LABELS mutual recursion). If false (FLET), bodies see only parent env."
+   (implements LABELS mutual recursion). If false (FLET), bodies see only parent env.
+   If any function body has free-variable captures from the enclosing scope
+   (typical after the let cell-rewrite for outer mutated vars), transform the
+   form into a let-bound, heap-cell-stored set of closures so the closures
+   inherit captures via compile-lambda's closure-env machinery.  Heap cells
+   (not raw let slots) carry the lambda values so mutual recursion in LABELS
+   still works: each lambda body reads its target via (CAR CELL) at call
+   time, after every cell's car has been populated."
+  ;; Capture-aware transform: when any function body captures an outer
+  ;; binding, replace the FLET/LABELS with a LET that allocates one
+  ;; heap cell per local function name, then sets each cell's car to a
+  ;; #'(lambda …) form whose body (and the form's outer body) has all
+  ;; references to the local names rewritten to (FUNCALL (CAR cell) …)
+  ;; / (CAR cell).  The lambdas capture the cells (and any other free
+  ;; vars) via the normal compile-lambda closure path; intra-FLET
+  ;; mutual recursion still works because the cell pointer is constant
+  ;; while its car is mutated.
+  (when (and (consp defs) (%flet-functions-capture-vars-p defs env))
+    (let* ((local-names nil)
+           (cell-names  nil)
+           (defs-data   nil))
+      (dolist (def defs)
+        (when (and (consp def) (consp (cdr def)))
+          (let* ((name (car def))
+                 (base-name (cond ((symbolp name) (symbol-name name))
+                                  ((and (consp name) (eq (car name) 'setf))
+                                   (format nil "SETF-~A" (symbol-name (cadr name))))
+                                  (t (format nil "~A" name))))
+                 (cell-sym (intern (format nil "%FLETCELL-~A$$~D"
+                                           base-name (make-compiler-label))
+                                   :modus.mvm)))
+            (push name local-names)
+            (push cell-sym cell-names)
+            (push (list name (cadr def) (cddr def) cell-sym) defs-data))))
+      (setq local-names (nreverse local-names))
+      (setq cell-names  (nreverse cell-names))
+      (setq defs-data   (nreverse defs-data))
+      (let* ((let-bindings
+              (mapcar (lambda (c) `(,c (cons nil nil))) cell-names))
+             ;; In FLET, function bodies don't see local names (per CLHS).
+             ;; In LABELS, function bodies see all local names (mutual recursion).
+             (body-local-names (if labels-p local-names nil))
+             (body-cell-names  (if labels-p cell-names  nil))
+             (set-forms
+              (mapcar (lambda (d)
+                        (let* ((fparams (cadr d))
+                               (fbody   (caddr d))
+                               (cell    (cadddr d))
+                               (rewritten-body
+                                (mapcar (lambda (f)
+                                          (%flet-rewrite-calls
+                                           f body-local-names body-cell-names))
+                                        fbody)))
+                          `(set-car ,cell
+                                    (function (lambda ,fparams ,@rewritten-body)))))
+                      defs-data))
+             (rewritten-outer
+              (mapcar (lambda (f)
+                        (%flet-rewrite-calls f local-names cell-names))
+                      (strip-declares body))))
+        (return-from compile-flet
+          (compile-form
+           ;; Empty body: emit a trailing NIL so the let returns NIL (matching
+           ;; the original FLET's empty-body semantics — its compile-progn
+           ;; over an empty list yields NIL).  Without this the let returns
+           ;; the last set-car's value (the closure object).
+           `(let ,let-bindings
+              ,@set-forms
+              ,@(or rewritten-outer (list 'nil)))
+           env dest)))))
   ;; First pass: build flet-env with all name mappings
   (let ((flet-env env)
         (defs-info nil)) ; list of (name unique-name params fbody) for second pass

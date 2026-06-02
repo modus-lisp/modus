@@ -1409,68 +1409,59 @@
   (%intern-symbol-pkg name-hash 0))
 
 (defun %intern-symbol-pkg (name-hash pkg-hash)
-  "Intern a symbol by NAME-HASH and stamp it with the package
-   identified by PKG-HASH.  Returns the canonical symbol object for
-   this NAME-HASH; multiple calls with the same name-hash return
-   `eq' results, matching SBCL/CCL semantics where every `'foo'
-   reference resolves to the same symbol.
+  "Intern a symbol identified by (NAME-HASH, PKG-HASH).  Per CLHS
+   11.1.2 — see SYMBOLS_PLAN.md — symbol identity is per-package: the
+   same NAME-HASH in two different packages produces two distinct
+   symbol objects.  This is a reversal of the prior unified model
+   where `(eq cl-test::x ds4::x)' was T.
 
-   The symbol is always 3-slot [hash, package, name].  Slot 1 holds
-   the home package (looked up in the pkg-by-hash table at memory
-   slot #x10000170 at boot time); PKG-HASH = 0 means `no home
-   package yet' (gensyms, partially-constructed symbols).  Slot 2
-   starts empty; SYMBOL-NAME reverse-looks it up via
-   *SYM-NAME-TABLE* and caches.
+   Returns the canonical symbol for the (NAME-HASH, PKG-HASH) pair;
+   multiple calls with the same pair return `eq' results.
 
-   Compile-quote in mvm/compiler.lisp emits this call with the
-   compile-time package hash, so `(symbol-package 'car)' returns
-   COMMON-LISP without a package-walk — matching SBCL/CCL, where the
-   reader gives every symbol its home package at intern time.
+   The symbol is always 3-slot [hash, package, name].  PKG-HASH = 0
+   means `no home package' (uninterned gensyms): those still share by
+   NAME-HASH alone via the single-key path so that
+   `(eq (gensym) (gensym))' false but `(eq '#:G '#:G)' from the same
+   literal holds.
 
-   Storage note: the pkg-by-hash table lives at a FIXED memory slot
-   (#x10000170), not as a Lisp special variable, so this function
-   doesn't reference `*pkg-by-hash*' as a quoted symbol — that would
-   recursively re-enter %INTERN-SYMBOL-PKG to intern the variable's
-   name, blowing the stack at boot.
+   Storage: the symbol intern table at #x10000088 is keyed by a
+   composite of NAME-HASH and PKG-HASH.  pkg-hash=0 uses the bare
+   name-hash so the legacy uninterned path stays compatible.
 
    GC-safety: %ALLOC-SYM3 can trigger GC, which moves the hash table
    to to-space and updates the root slot at #x10000088.  Re-read the
    root AFTER the allocation."
   (setf (mem-ref #x10000C80 :u64) (+ (mem-ref #x10000C80 :u64) 1))
-  (let ((table (mem-ref #x10000088 :u64)))
-    (let ((existing (gethash name-hash table)))
-      (cond
-        (existing
-         ;; Re-stamp the package if a known one is passed and the
-         ;; symbol's slot is still empty.  Lets the same symbol be
-         ;; created package-less first (via legacy %intern-symbol) and
-         ;; have its package filled in by a subsequent package-aware
-         ;; reference.  Only stamps if pkg-hash is non-zero AND the
-         ;; sym is the 3-slot shape AND slot 1 is currently NIL.
-         (when (and (> pkg-hash 0)
-                    (>= (array-length existing) 3)
-                    (null (aref existing 1)))
-           (let ((pkg-tab (mem-ref #x10000170 :u64)))
-             (when pkg-tab
-               (let ((pkg (gethash pkg-hash pkg-tab)))
-                 (when pkg (aset existing 1 pkg))))))
-         (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
-         existing)
-        (t
-         (let ((sym (%alloc-sym3)))
-           (aset sym 0 name-hash)
-           ;; Look up the home package.  pkg-hash=0 means none.
-           (let ((pkg nil))
-             (when (> pkg-hash 0)
-               (let ((pkg-tab (mem-ref #x10000170 :u64)))
-                 (when pkg-tab (setq pkg (gethash pkg-hash pkg-tab)))))
-             (aset sym 1 pkg))
-           (aset sym 2 "")    ; name — SYMBOL-NAME reverse-fills via *SYM-NAME-TABLE*
-           ;; Re-read the root — %ALLOC-SYM3 may have triggered GC.
-           (let ((live-table (mem-ref #x10000088 :u64)))
-             (puthash name-hash live-table sym))
+  ;; Composite key: name-hash for no-package syms (legacy / uninterned),
+  ;; otherwise combine name-hash + pkg-hash so that the same name in two
+  ;; packages keys to two distinct slots.  Multiplier is a large prime;
+  ;; mod 2^62 keeps the result in fixnum range.
+  (let ((key (if (= pkg-hash 0)
+                 name-hash
+                 (logand (+ name-hash (* pkg-hash 2305843009213693951))
+                         #x3FFFFFFFFFFFFFFF))))
+    (let ((table (mem-ref #x10000088 :u64)))
+      (let ((existing (gethash key table)))
+        (cond
+          (existing
+           ;; Same (name, pkg) pair — return cached.
            (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
-           sym))))))
+           existing)
+          (t
+           (let ((sym (%alloc-sym3)))
+             (aset sym 0 name-hash)
+             ;; Look up the home package.  pkg-hash=0 means none.
+             (let ((pkg nil))
+               (when (> pkg-hash 0)
+                 (let ((pkg-tab (mem-ref #x10000170 :u64)))
+                   (when pkg-tab (setq pkg (gethash pkg-hash pkg-tab)))))
+               (aset sym 1 pkg))
+             (aset sym 2 "")    ; name — SYMBOL-NAME reverse-fills via *SYM-NAME-TABLE*
+             ;; Re-read the root — %ALLOC-SYM3 may have triggered GC.
+             (let ((live-table (mem-ref #x10000088 :u64)))
+               (puthash key live-table sym))
+             (setf (mem-ref #x10000C80 :u64) (- (mem-ref #x10000C80 :u64) 1))
+             sym)))))))
 
 ;;; Pkg-by-hash root.  We DON'T use a Lisp special variable because
 ;;; referencing `*pkg-by-hash*' from %INTERN-SYMBOL-PKG would recurse

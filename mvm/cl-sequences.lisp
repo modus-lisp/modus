@@ -2101,81 +2101,24 @@
                   (setq pos (+ pos 1))))))
            result))))))
 
-(defun %merge-result-length-spec (result-type)
-  "If RESULT-TYPE has the shape (vector * N) / (bit-vector N) / (string N) /
-   (simple-vector N) etc. — i.e. a compound sequence type with an integer
-   length spec — return that integer.  Otherwise NIL.
-
-   CLHS MERGE: the result is coerced to RESULT-TYPE; if a length is
-   specified and doesn't match the actual merged length, signal type-error."
-  (cond
-    ((not (consp result-type)) nil)
-    (t
-     ;; First integer-shaped element after the head is the length.
-     (let ((rest (cdr result-type)))
-       (loop
-         (when (null rest) (return nil))
-         (let ((x (car rest)))
-           (cond
-             ((integerp x) (return x))
-             (t (setq rest (cdr rest))))))))))
-
-(defun %merge-validate-result-type (result-type)
-  "Reject result-types that aren't real sequence subtypes.  CLHS MERGE
-   signals TYPE-ERROR when RESULT-TYPE doesn't denote a sequence (e.g.
-   'symbol).  Returns nil; signals type-error on bad input.  'null is
-   allowed here — it's checked later against the actual result length."
-  (cond
-    ((or (eq result-type 'null)
-         (eq result-type 'list) (eq result-type 'cons)
-         (eq result-type 'string) (eq result-type 'simple-string)
-         (eq result-type 'base-string) (eq result-type 'simple-base-string)
-         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector)
-         (eq result-type 'vector) (eq result-type 'simple-vector)
-         (eq result-type 'array)  (eq result-type 'simple-array)
-         (eq result-type 'sequence))
-     nil)
-    ((consp result-type)
-     (let ((head (car result-type)))
-       (cond ((or (eq head 'vector) (eq head 'simple-vector)
-                  (eq head 'array)  (eq head 'simple-array)
-                  (eq head 'bit-vector) (eq head 'simple-bit-vector)
-                  (eq head 'string) (eq head 'simple-string)
-                  (eq head 'base-string) (eq head 'simple-base-string))
-              nil)
-             (t (%signal-type-error)))))
-    (t (%signal-type-error))))
-
 (defun merge (result-type s1 s2 pred &rest args)
   "Merge two sorted sequences.  Honors RESULT-TYPE designator and :KEY.
    PRED can be a symbol (function name) or a function; symbol form is
-   resolved via SYMBOL-FUNCTION.
-
-   CLHS error contract:
-   - RESULT-TYPE must denote a sequence subtype; non-sequence types
-     (e.g. 'symbol) signal type-error.
-   - If RESULT-TYPE is a compound form with an integer length and the
-     merged length doesn't match, signal type-error.
-   - RESULT-TYPE 'null is only valid when the merged result is empty.
-   - Unknown keyword args (without :allow-other-keys T) and odd-length
-     plists signal program-error."
-  ;; Arity: pred is required — when callers pass fewer than 4 args
-  ;; (merge / (merge 'list) / (merge 'list X) / (merge 'list X Y)),
-  ;; pred is NIL.  CLHS calls this a program-error.
-  (when (null pred) (%signal-program-error))
-  ;; Validate kwargs: only :key and :allow-other-keys are recognized.
-  (%check-kw-allowed args '(:key :allow-other-keys))
-  ;; Validate result-type designator.
-  (%merge-validate-result-type result-type)
-  (let* ((key-fn (let ((cur args) (k nil) (k-set nil))
+   resolved via SYMBOL-FUNCTION.  Was: ignored &rest args entirely
+   (merge-test 17815 GOT raw concat instead of properly merged)."
+  (let* ((key-fn (let ((cur args) (k nil))
                    (loop (when (or (null cur) (null (cdr cur))) (return k))
-                     (when (and (not k-set) (eq (car cur) :key))
-                       (setq k (cadr cur)) (setq k-set t))
+                     (when (eq (car cur) :key) (setq k (cadr cur)))
                      (setq cur (cddr cur)))))
-         (pred-fn (%resolve-fn pred))
+         (pred-fn (cond
+                    ((functionp pred) pred)
+                    ((symbolp pred) (symbol-function pred))
+                    (t pred)))
          (kfn (cond
                 ((null key-fn) nil)
-                (t (%resolve-fn key-fn))))
+                ((functionp key-fn) key-fn)
+                ((symbolp key-fn) (symbol-function key-fn))
+                (t key-fn)))
          (r nil)
          (a (if (consp s1) s1 (coerce s1 'list)))
          (b (if (consp s2) s2 (coerce s2 'list))))
@@ -2188,17 +2131,8 @@
                               (if kfn (funcall kfn (car b)) (car b)))
                      (setq r (cons (car a) r)) (setq a (cdr a)))
                     (t (setq r (cons (car b) r)) (setq b (cdr b))))))
-          (kind (%concat-result-kind result-type))
-          (len-spec (%merge-result-length-spec result-type)))
-      ;; If the result-type pinned a length, validate it.
-      (when len-spec
-        (unless (= len-spec (length merged))
-          (%signal-type-error)))
+          (kind (%concat-result-kind result-type)))
       (cond
-        ((eq kind :null)
-         (when merged
-           (%signal-type-error))
-         nil)
         ((eq kind :list) merged)
         ((eq kind :string)
          (let ((n (length merged))
@@ -2237,70 +2171,34 @@
   "Fill SEQUENCE with ITEM. Honors :START and :END.  Strings store
    fixnum char-codes; coerce character ITEM to its char-code before
    aset so the stored value matches what literal strings hold.
-
-   Per CLHS 3.4.1.4.1.1.2: when a keyword appears more than once, the
-   LEFTMOST occurrence supplies the value.  This matters for
-   fill.order.4 etc. — every repeated :end / :start still evaluates
-   (so all increment side effects fire), but only the first sets the
-   actual bound.
-
    Per CLHS, signals PROGRAM-ERROR on odd plist or unknown keyword
    (unless :allow-other-keys is non-nil).  Type-error on non-sequence
    SEQ is handled by the (consp …) / (length …) dispatch below: if
-   SEQ is neither a cons nor a sequence, (length SEQ) signals.
-
-   Native multi-dim array (MDA) wrappers — returned by make-array
-   with :element-type other than T / character — are recognized via
-   ARRAYP and stored into the array branch, NOT the cons branch.
-   array-wrapper-p (fp / displaced / adjustable wrappers) also
-   bypasses the cons branch so the wrapper structure isn't clobbered
-   by set-car.  Was: every wrapper / MDA shape that appeared CONSP=T
-   to the dispatch (e.g. fp string with element-type unsigned-byte 8)
-   silently corrupted itself."
-  (let ((start 0) (end nil) (allow-other-keys nil) (aok-set nil)
-        (start-set nil) (end-set nil))
+   SEQ is neither a cons nor a sequence, (length SEQ) signals."
+  (let ((start 0) (end nil) (allow-other-keys nil) (aok-set nil))
     ;; Probe :allow-other-keys.  CLHS §3.4.1.4.1.1.2: when multiple
     ;; :allow-other-keys appear, the LEFTMOST supplies the value.
     (let ((p args))
       (loop (when (null p) (return))
-        (when (null (cdr p)) (return))
         (when (and (not aok-set) (eq (car p) :allow-other-keys))
-          (setq allow-other-keys (cadr p))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
           (setq aok-set t))
-        (setq p (cddr p))))
+        (setq p (cdr p))))
     (let ((a args))
       (loop (when (null a) (return))
         (when (null (cdr a)) (%signal-program-error))
-        (cond ((eq (car a) :start)
-               (unless start-set (setq start (cadr a)) (setq start-set t)))
-              ((eq (car a) :end)
-               (unless end-set (setq end (cadr a)) (setq end-set t)))
+        (cond ((eq (car a) :start) (setq start (cadr a)))
+              ((eq (car a) :end)   (setq end   (cadr a)))
               ((eq (car a) :allow-other-keys) nil)
               (t (unless allow-other-keys (%signal-program-error))))
         (setq a (cddr a))))
     ;; ANSI: :START must be a non-negative integer, :END NIL or non-negative integer.
     (unless (and (integerp start) (>= start 0))
-      (%signal-type-error))
+      (error "fill: :START must be a non-negative integer"))
     (unless (or (null end) (and (integerp end) (>= end 0)))
-      (%signal-type-error))
+      (error "fill: :END must be NIL or a non-negative integer"))
     (cond
       ((null seq) seq)
-      ;; Array wrappers (fp / displaced / adjustable) and native MDAs
-      ;; both look cons-shaped via consp on the outer cell but the
-      ;; underlying storage is an array we must aref/aset.  Route them
-      ;; to the array branch BEFORE the cons branch so set-car doesn't
-      ;; clobber the wrapper structure.
-      ((or (stringp seq) (arrayp seq)
-           (and (consp seq) (array-wrapper-p seq)))
-       (let* ((len (length seq))
-              (eff-end (if end end len))
-              (store-item (if (and (stringp seq) (characterp item))
-                              (char-code item)
-                              item))
-              (i start))
-         (loop (when (>= i eff-end) (return seq))
-           (aset seq i store-item)
-           (setq i (+ i 1)))))
       ((consp seq)
        (let ((cur seq) (i 0)
              (eff-end (if end end most-positive-fixnum)))
@@ -2310,7 +2208,17 @@
            (setq cur (cdr cur))
            (setq i (+ i 1)))
          seq))
-      (t (%signal-type-error)))))
+      ((or (stringp seq) (arrayp seq))
+       (let* ((len (length seq))
+              (eff-end (if end end len))
+              (store-item (if (and (stringp seq) (characterp item))
+                              (char-code item)
+                              item))
+              (i start))
+         (loop (when (>= i eff-end) (return seq))
+           (aset seq i store-item)
+           (setq i (+ i 1)))))
+      (t (error "fill: not a sequence")))))
 
 (defun map-into (result fn &rest seqs)
   "Apply FN to elements of SEQS, storing each result in successive
@@ -3364,224 +3272,4 @@
                     (setq result i)
                     (return i))))
             (setq i (+ i 1))))))))
-
-;;; ============================================================
-;;; SUBSEQ — override prelude's 1-D-only version.
-;;; ============================================================
-;;;
-;;; The prelude defun in prelude.lisp returns a plain array for every
-;;; non-cons sequence, which fails subseq-vector.7/.8/.9/.10 (an MDA
-;;; or wrapper input loses its rank/etype) and subseq-bit-vector.*
-;;; (a bit-vector input returns a general array, breaking EQUALP).
-;;; Also doesn't validate arity (subseq.error.3 expects program-error
-;;; on 4 args).  Strings can route through %make-string-array so the
-;;; result type-predicate (STRINGP) holds.
-
-(defun %subseq-from-list (lst start end)
-  "Build a list (reversed) from LST[start..end), then reverse.  END
-   nil means out to the end of the list."
-  (let ((result nil)
-        (cur (nthcdr start lst))
-        (i start)
-        (eff-end (if end end most-positive-fixnum)))
-    (loop
-      (when (or (null cur) (>= i eff-end)) (return (nreverse result)))
-      (setq result (cons (car cur) result))
-      (setq cur (cdr cur))
-      (setq i (+ i 1)))))
-
-(defun subseq (seq start &rest end-arg)
-  "Return a subsequence from START to END (END defaults to length).
-   Preserves the broad shape of SEQ:
-     list      → fresh list
-     string    → fresh string
-     bit-vector→ fresh bit-vector (general array, integer 0/1 elements)
-     array/MDA → fresh general array
-
-   CLHS 17.4.4 — when called with more than 3 args, signals
-   program-error (subseq.error.3 / 19323).  When START or END is out
-   of bounds for a sequence we tolerate it the same way the prelude
-   did (clamp).  The legacy 2-arg version of subseq also let `end =
-   NIL` mean `length seq`."
-  ;; Arity check — CLHS says (subseq seq) and (subseq seq i j k) are
-  ;; program-errors.  &rest packs the extras, so > 1 extra is too many.
-  (when (cdr end-arg) (%signal-program-error))
-  (let* ((end-explicit (car end-arg))
-         (seq-len (length seq))
-         (end (cond ((null end-explicit) seq-len)
-                    ((> end-explicit seq-len) seq-len)
-                    (t end-explicit)))
-         (real-start (cond ((< start 0) 0)
-                           ((> start end) end)
-                           (t start)))
-         (new-len (- end real-start)))
-    (cond
-      ;; Plain cons list.
-      ((consp seq)
-       ;; A consed shape can also be an array wrapper (fp/displaced/
-       ;; adjustable) — route those through aref like the array case.
-       (cond
-         ((array-wrapper-p seq)
-          (%subseq-array seq real-start new-len))
-         (t (%subseq-from-list seq real-start end))))
-      ;; NIL — empty sequence, subseq of empty is empty.
-      ((null seq) nil)
-      ;; String — preserve string-ness.
-      ((stringp seq) (%subseq-string seq real-start new-len))
-      ;; General array (plain array, MDA, bit-vector) — element-wise copy
-      ;; via aref/aset.
-      ((arrayp seq) (%subseq-array seq real-start new-len))
-      (t (%signal-type-error)))))
-
-(defun %subseq-string (s start new-len)
-  "Allocate a fresh string of NEW-LEN, copy S[start..start+new-len)."
-  (let ((result (%make-string-array new-len)) (i 0))
-    (loop (when (= i new-len) (return result))
-      (aset result i (aref s (+ start i)))
-      (setq i (+ i 1)))))
-
-(defun %subseq-array (a start new-len)
-  "Allocate a fresh array of NEW-LEN, copy A[start..start+new-len)
-   via aref so MDA / wrapper inputs read through their fast paths."
-  (let ((result (make-array new-len)) (i 0))
-    (loop (when (= i new-len) (return result))
-      (aset result i (aref a (+ start i)))
-      (setq i (+ i 1)))))
-
-;;; ============================================================
-;;; STRING= / STRING/= arity validation.
-;;; ============================================================
-;;;
-;;; CLHS: (string=) signals program-error (string=.error.1 / 16051),
-;;; same for string/=.error.1 (16057).  The defuns above accept
-;;; &rest so missing required args slip through; add an explicit
-;;; (when (null a) ...) on the first arg.  Note: NIL is a valid
-;;; string designator (resolves to "NIL"), so we have to distinguish
-;;; "caller passed no first arg" from "caller passed NIL" — which
-;;; we can't on the current calling convention.  Instead we re-check
-;;; the lambda-list shape: when the function is called with 0 args
-;;; the prologue still gives NIL for both A and B, but ARGS is
-;;; also NIL — which holds for the 2-arg call (string= "a" "b")
-;;; too, so it's NOT a reliable distinguisher.  The cleaner approach
-;;; is to wrap as (&rest all) and demand (>= (length all) 2), which
-;;; I'll override below for the error.1 cases.  Net effect on real
-;;; valid call sites is zero — they pass 2+ args.
-
-(defun string= (&rest all)
-  "ANSI STRING= — case-SENSITIVE element-wise compare.  See CLHS 17.4.2.
-   When fewer than 2 args supplied, signals program-error.
-
-   This shape replaces the (a b &rest options) defun above so callers
-   that omit required args get a real program-error per CLHS,
-   matching signals-error tests like string=.error.1 / 16051."
-  (when (or (null all) (null (cdr all))) (%signal-program-error))
-  (let ((a (car all)) (b (cadr all)) (options (cddr all)))
-    (let ((sa (%string-designator a))
-          (sb (%string-designator b))
-          (s1 0) (e1 nil) (s2 0) (e2 nil)
-          (allow-other nil) (aok-set nil)
-          (o options))
-      ;; Leftmost :allow-other-keys wins (CLHS 3.4.1.4.1.1.2).
-      (let ((scan options))
-        (loop (when (or (null scan) (null (cdr scan))) (return))
-          (when (and (not aok-set) (eq (car scan) :allow-other-keys))
-            (setq allow-other (cadr scan)) (setq aok-set t))
-          (setq scan (cddr scan))))
-      (loop (when (null o) (return))
-        (when (null (cdr o))
-          (%signal-program-error))
-        (let ((k (car o)))
-          (cond ((eq k :start1) (setq s1 (cadr o)))
-                ((eq k :end1)   (setq e1 (cadr o)))
-                ((eq k :start2) (setq s2 (cadr o)))
-                ((eq k :end2)   (setq e2 (cadr o)))
-                ((eq k :allow-other-keys) nil)
-                (allow-other nil)
-                (t (%signal-program-error))))
-        (setq o (cddr o)))
-      (let* ((la (array-length sa))
-             (lb (array-length sb))
-             (ee1 (or e1 la))
-             (ee2 (or e2 lb))
-             (len1 (- ee1 s1))
-             (len2 (- ee2 s2)))
-        (if (= len1 len2)
-            (let ((i 0))
-              (loop
-                (when (= i len1) (return t))
-                (unless (= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
-                (setq i (+ i 1))))
-            nil)))))
-
-(defun string/= (&rest all)
-  "Case-sensitive inequality.  Returns position of mismatch (in a's
-   coords) or NIL if equal.  See CLHS 17.4.2.  When fewer than 2
-   args supplied, signals program-error per
-   string/=.error.1 / 16057."
-  (when (or (null all) (null (cdr all))) (%signal-program-error))
-  (let ((a (car all)) (b (cadr all)) (args (cddr all)))
-    (let ((r (%str-cmp-core a b args nil)))
-      (when (or (eq (car r) :less) (eq (car r) :greater)) (cadr r)))))
-
-;;; STRING-EQUAL override — prelude.lisp defines it with (a b &rest args)
-;;; signature, no arity check.  Wrap as (&rest all) so the 0-arg case
-;;; (string-equal.error.1 / 16087) and bad-kwarg case
-;;; (string-equal.error.6 / 16087+5) both signal program-error per
-;;; CLHS 3.4.1.4.1.1.2 (leftmost :allow-other-keys wins).
-;;; Inlines its own bounds + kwarg walker rather than delegating to
-;;; %str-cmp-core, which lives in cl-eval.lisp and reads rightmost
-;;; truthy :allow-other-keys.
-(defun string-equal (&rest all)
-  "ANSI STRING-EQUAL — case-INSENSITIVE element-wise compare.  Honors
-   :start1/:end1/:start2/:end2 with CLHS semantics:
-   - leftmost :allow-other-keys wins,
-   - odd-length plist → program-error,
-   - unknown keyword without :allow-other-keys T → program-error,
-   - fewer than 2 positional args → program-error.
-
-   Returns T iff A and B, coerced to strings via %string-designator and
-   bracketed by start/end bounds, match element-wise after ASCII
-   case-folding."
-  (when (or (null all) (null (cdr all))) (%signal-program-error))
-  (let ((a (car all)) (b (cadr all)) (options (cddr all)))
-    (let ((sa (%string-designator a))
-          (sb (%string-designator b))
-          (s1 0) (e1 nil) (s2 0) (e2 nil)
-          (allow-other nil) (aok-set nil)
-          (o options))
-      ;; Leftmost :allow-other-keys wins (CLHS 3.4.1.4.1.1.2).
-      (let ((scan options))
-        (loop (when (or (null scan) (null (cdr scan))) (return))
-          (when (and (not aok-set) (eq (car scan) :allow-other-keys))
-            (setq allow-other (cadr scan)) (setq aok-set t))
-          (setq scan (cddr scan))))
-      (loop (when (null o) (return))
-        (when (null (cdr o)) (%signal-program-error))
-        (let ((k (car o)))
-          (cond ((eq k :start1) (setq s1 (cadr o)))
-                ((eq k :end1)   (setq e1 (cadr o)))
-                ((eq k :start2) (setq s2 (cadr o)))
-                ((eq k :end2)   (setq e2 (cadr o)))
-                ((eq k :allow-other-keys) nil)
-                (allow-other nil)
-                (t (%signal-program-error))))
-        (setq o (cddr o)))
-      (let* ((la (array-length sa))
-             (lb (array-length sb))
-             (ee1 (or e1 la))
-             (ee2 (or e2 lb))
-             (len1 (- ee1 s1))
-             (len2 (- ee2 s2)))
-        (if (= len1 len2)
-            (let ((i 0))
-              (loop
-                (when (= i len1) (return t))
-                (let ((ca (aref sa (+ s1 i)))
-                      (cb (aref sb (+ s2 i))))
-                  ;; ASCII case-fold A..Z (65..90) → a..z (97..122).
-                  (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
-                  (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
-                  (unless (= ca cb) (return nil)))
-                (setq i (+ i 1))))
-            nil)))))
 

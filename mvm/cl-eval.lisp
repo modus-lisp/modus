@@ -213,7 +213,17 @@
                     "DEFSTRUCT" "DEFTYPE" "DEFSETF" "DEFPACKAGE"
                     "HANDLER-CASE" "HANDLER-BIND" "RESTART-CASE"
                     "IGNORE-ERRORS" "UNWIND-PROTECT"
-                    "FLET" "LABELS" "PROG" "PROG*" "PROG1" "PROG2"))
+                    "FLET" "LABELS" "PROG" "PROG*" "PROG1" "PROG2"
+                    ;; CLHS §3.1.2.1.2.4: LAMBDA is also a macro.  The
+                    ;; ANSI eval-and-compile.lsp test (24577) walks the
+                    ;; canonical "is-a-macro" set:
+                    ;;   (LAMBDA DEFINE-COMPILER-MACRO DEFMACRO
+                    ;;    DEFINE-SYMBOL-MACRO DECLAIM)
+                    ;; and expects macro-function to return non-NIL for
+                    ;; every entry.  DEFMACRO is already covered; add
+                    ;; the rest so REMOVE-IF #'MACRO-FUNCTION → NIL.
+                    "LAMBDA" "DEFINE-COMPILER-MACRO" "DEFINE-SYMBOL-MACRO"
+                    "DECLAIM"))
       (puthash name ht t))
     (setq *%compiler-macro-hashes* ht)))
 

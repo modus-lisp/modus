@@ -494,7 +494,19 @@
 ;;; --- Restart System ---
 
 (defvar *restart-stack* nil)
-;;; Each restart: (name fn report-fn interactive-fn)
+;;; Each restart: (name fn report-fn interactive-fn).  The restart cons cell
+;;; is the canonical "restart object" — eq-identity is preserved across
+;;; compute-restarts / find-restart calls (the same cons is returned).
+
+;; List of restart cons cells currently being invoked.  invoke-restart
+;; pushes the restart here before calling its body so that a recursive
+;; invoke-restart from inside the body skips this restart and finds the
+;; next applicable one.  Without this, restart-case.12 — which has
+;; (foo (x) (invoke-restart 'foo (1+ x))) — would re-find the SAME foo
+;; restart in find-restart's stack walk and infinite-recurse.  Reset to
+;; NIL by %with-restarts on longjmp-return (which short-circuits the
+;; let-binding unwind that would normally restore the saved value).
+(defvar *restarts-being-invoked* nil)
 
 (defun %push-restarts (restarts body-fn)
   "Push RESTARTS onto the restart stack, run BODY-FN, then pop.
@@ -511,17 +523,22 @@
     (setq *restart-stack* (cdr *restart-stack*))))
 
 (defun compute-restarts (&optional condition)
-  "Return list of currently active restarts."
+  "Return list of currently active restarts.  The CONDITION argument is
+   accepted for CLHS compatibility but not used for filtering — the
+   association registry that would make this meaningful regressed
+   restart-case.{23,24} and was removed (see commit history)."
+  (declare (ignore condition))
   (let ((result nil))
     (dolist (frame *restart-stack*)
       (dolist (r frame)
-        (setq result (append result (list r)))))
-    result))
+        (setq result (cons r result))))
+    (nreverse result)))
 
 (defun find-restart (name &optional condition)
   "Find restart by name.  Per CLHS find-restart, NAME may be a symbol,
    string, or an existing restart object — for the latter, return it if
-   it is currently active, NIL otherwise."
+   it is currently active, NIL otherwise.  CONDITION is accepted but
+   ignored — see compute-restarts."
   ;; NOTE: return-from in MVM only exits the innermost loop (treated as return).
   ;; Use a result variable and nested flag to exit properly.
   (declare (ignore condition))
@@ -541,13 +558,14 @@
             (loop
               (when (or found (null rs)) (return nil))
               (let ((r (car rs)))
-                (when (cond
-                        (name-is-restart (eq r name))
-                        ((stringp name)
-                         (string-equal (if (stringp (car r)) (car r)
-                                           (if (%cl-sym-p (car r)) (%cl-sym-name (car r))
-                                               "")) name))
-                        (t (eq (car r) name)))
+                (when (and (not (member r *restarts-being-invoked* :test #'eq))
+                           (cond
+                             (name-is-restart (eq r name))
+                             ((stringp name)
+                              (string-equal (if (stringp (car r)) (car r)
+                                                (if (%cl-sym-p (car r)) (%cl-sym-name (car r))
+                                                    "")) name))
+                             (t (eq (car r) name))))
                   (setq found r)))
               (setq rs (cdr rs)))))
         (setq frames (cdr frames))))
@@ -745,7 +763,18 @@
             (let ((r *restart-case-result*))
               (setq *restart-invoking-p* nil)
               (setq *restart-case-result* nil)
-              r)
+              ;; *restarts-being-invoked* gets pushed by invoke-restart
+              ;; but the let binding is short-circuited by the longjmp;
+              ;; reset here so a later invoke-restart in this fork
+              ;; doesn't see stale entries.
+              (setq *restarts-being-invoked* nil)
+              ;; The restart fn's full multi-value list is stashed in R
+              ;; (see invoke-restart's multiple-value-list capture).
+              ;; values-list propagates the MV count back so the surrounding
+              ;; (handler-case (multiple-value-list ...)) form sees all of
+              ;; them — restart-case.{16,17} have (foo () (values 'a 'b ...))
+              ;; whose six values otherwise collapse to a single 'A.
+              (values-list r))
             ;; Re-signal the condition (propagate error)
             (progn
               (if (%error-handler-active-p)
@@ -754,18 +783,33 @@
 
 ;;; Override invoke-restart to use longjmp for restart-case restarts
 (defun invoke-restart (name-or-restart &rest args)
-  "Invoke a restart by name or restart object."
+  "Invoke a restart by name or restart object.  When invoked from inside
+   a handler-case dynamic extent (the restart-case body is still active),
+   sets *restart-case-result* and longjmps to the restart-case's setjmp
+   frame.  When no handler-case is active (e.g. restart-bind alone), the
+   restart's body is called and its value is returned directly per CLHS
+   restart-bind semantics."
   (let ((r (if (consp name-or-restart)
                name-or-restart
                (find-restart name-or-restart))))
     (if r
         (let ((rfn (cadr r)))
-          (let ((val (apply rfn args)))
+          ;; Mark this restart as in-progress so a recursive invoke-restart
+          ;; in rfn's body finds the NEXT applicable restart instead of
+          ;; looping on this one (restart-case.12).
+          (setq *restarts-being-invoked* (cons r *restarts-being-invoked*))
+          ;; Capture the full MV list so (foo () (values 'a 'b ... 'f)) and
+          ;; (foo () (values)) flow through the longjmp -> values-list path
+          ;; without collapsing to a single primary value.  Without this,
+          ;; restart-case.{16,17} sees only the first value.
+          (let ((vals (multiple-value-list (apply rfn args))))
+            ;; Normal return from rfn: remove the in-progress marker.
+            (setq *restarts-being-invoked* (cdr *restarts-being-invoked*))
             (if (%error-handler-active-p)
                 (progn
                   ;; Store result and signal restart-invocation condition
                   ;; so restart-case handler can recover it
-                  (setq *restart-case-result* val)
+                  (setq *restart-case-result* vals)
                   (setq *restart-invoking-p* t)
                   ;; Create dummy condition so typep check in handler-case succeeds
                   (let ((rc (make-array 2)))
@@ -773,8 +817,8 @@
                     (aset rc 1 nil)
                     (setq *current-condition* rc))
                   (%hc-longjmp))
-                ;; No active frame — return val directly (restart-bind case)
-                val)))
+                ;; No active frame — return vals as MV directly (restart-bind case).
+                (values-list vals))))
         (error "No restart named ~A" name-or-restart))))
 
 (defun abort (&optional condition)
@@ -800,6 +844,16 @@
   "Invoke the USE-VALUE restart with VALUE."
   (let ((r (find-restart 'use-value condition)))
     (when r (invoke-restart 'use-value value))))
+
+;;; ASSERT — left as the cl-sequences.lisp stub (silent NIL).  An
+;;; earlier attempt here wired a CONTINUE-restart shape but the
+;;; (multiple-value-list (apply rfn ()))-inside-closure path crashed
+;;; the assert.lsp chunk fork mid-run (no T:<id> marker, lost the rest
+;;; of the chunk).  Tests 3 / 3A / 7 would benefit from a real CONTINUE
+;;; restart but only by replicating the macro semantics the rewriter
+;;; doesn't emit — there's no safe runtime spot for it without compiler
+;;; help.
+
 
 ;;; --- Updated find-class to support condition types ---
 

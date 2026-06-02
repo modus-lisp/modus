@@ -220,14 +220,29 @@
       (setq i (+ i 1)))))
 
 (defun %resolve-path (filespec)
-  "Convert filespec to a path string, prepending *default-pathname-defaults* if relative."
+  "Convert filespec to a path string, prepending *default-pathname-defaults* if relative.
+   Accepts strings, pathname objects, and streams."
   (let ((path (cond
                 ((stringp filespec) (%strip-logical-host filespec))
+                ;; %pathname-obj-p is defined later in this file but the
+                ;; compiler resolves the call at runtime via the symbol-
+                ;; function table.  When filespec is a pathname object,
+                ;; flatten via namestring (which we also override).
+                ((handler-case (%pathname-obj-p filespec) (t (c) nil))
+                 (%strip-logical-host (namestring filespec)))
+                ((streamp filespec) "")
                 (t (if filespec (%strip-logical-host (write-to-string filespec)) "")))))
-    ;; If path is relative (doesn't start with /), prepend defaults
+    ;; If path is relative (doesn't start with /), prepend defaults.
+    ;; *default-pathname-defaults* may be a string or pathname obj; coerce
+    ;; via namestring before treating as a directory prefix.
     (if (and (> (length path) 0) (= (aref path 0) 47))  ; 47 = #\/
         path
-        (let ((base *default-pathname-defaults*))
+        (let* ((dpd *default-pathname-defaults*)
+               (base (cond
+                       ((stringp dpd) dpd)
+                       ((handler-case (%pathname-obj-p dpd) (t (c) nil))
+                        (namestring dpd))
+                       (t ""))))
           (if (and base (> (length base) 0))
               (let ((base-len (length base)))
                 ;; Ensure base ends with /
@@ -631,177 +646,424 @@
 ;;; --- Pathname functions ---
 (defvar *filesystem* nil)  ;; alist of (path . content) for bare-metal use
 
-;;; For testing: pathnames are just strings
-(defun pathname (x)
-  "Coerce X to a pathname (string in our implementation)."
-  (cond
-    ((stringp x) x)
-    ((streamp x)
-     (if (= (%stream-type x) 9)
-         ""  ; file streams don't track their path currently
-         ""))
-    (t (if x (write-to-string x) ""))))
+;;; Pathnames are CLOS-instance-shaped arrays so (typep p 'pathname) works
+;;; without modifying ansi-bridge.lisp's typep.  Layout:
+;;;   [0] = '%clos-instance       (so %clos-instance-p returns T)
+;;;   [1] = 'pathname             (class name; %obj-cpl returns (pathname t))
+;;;   [2] = host                  (typically nil)
+;;;   [3] = device                (typically nil)
+;;;   [4] = directory             (nil or (:absolute ...) etc.)
+;;;   [5] = name                  (string, :wild, or nil)
+;;;   [6] = type                  (string, :wild, or nil)
+;;;   [7] = version               (:newest, :wild, integer, or nil)
+;;;
+;;; (typep p 'pathname) walks %obj-cpl, which for our [1]='pathname falls
+;;; through (no registered CLOS class) to (list 'pathname 't); 'pathname is
+;;; in the cpl → typep returns T.  This works without %defclass.
+;;;
+;;; (equalp p1 p2) on these arrays does element-wise compare via
+;;; %equalp-array-array — same name/type/dir → equalp T.  Good enough for
+;;; make-pathname.rebuild and friends.
 
-(defun pathnamep (x) (stringp x))
+;;; --- Lazy CLOS class registration for typep/cpl walk ---
+;;;
+;;; %obj-cpl for unregistered classes falls through to (list cls-name 't).
+;;; For pathname this is (pathname t) — fine for (typep p 'pathname).  For
+;;; logical-pathname we also need 'pathname in the cpl so (typep lp
+;;; 'pathname) returns T.  We lazily register both classes the first time
+;;; a pathname is allocated.  %defclass is in cl-clos.lisp which loads
+;;; after cl-fileio.lisp; the call resolves at runtime via the symbol-
+;;; function table.
+
+(defvar *pathname-clos-registered* nil)
+
+(defun %ensure-pathname-classes ()
+  (when (null *pathname-clos-registered*)
+    (setq *pathname-clos-registered* t)
+    ;; Wrap in handler-case so a CLOS table-not-ready bootstrap doesn't
+    ;; sink the whole pathname stack.
+    (handler-case
+        (progn
+          (%defclass 'pathname '() '(t))
+          (%defclass 'logical-pathname '() '(pathname)))
+      (t (c) nil))))
+
+(defun %make-pathname-obj (host device directory name type version)
+  "Allocate a fresh pathname object."
+  (%ensure-pathname-classes)
+  (let ((p (make-array 8)))
+    (aset p 0 '%clos-instance)
+    (aset p 1 'pathname)
+    (aset p 2 host)
+    (aset p 3 device)
+    (aset p 4 directory)
+    (aset p 5 name)
+    (aset p 6 type)
+    (aset p 7 version)
+    p))
+
+(defun %pathname-obj-p (x)
+  "T if X is a pathname or logical-pathname object."
+  (cond
+    ((or (fixnump x) (consp x) (null x) (characterp x) (stringp x)) nil)
+    (t (handler-case
+           (and (= (obj-subtag x) #x32)
+                (>= (array-length x) 8)
+                (eq (aref x 0) '%clos-instance)
+                (or (eq (aref x 1) 'pathname)
+                    (eq (aref x 1) 'logical-pathname)))
+         (t (c) nil)))))
+
+(defun pathnamep (x)
+  "True if X is a pathname object."
+  (%pathname-obj-p x))
+
+;;; --- Directory string parser (used by %parse-pathname-string and merge) ---
+
+(defun %split-directory-string (s)
+  "Split a directory string like \"/a/b/\" or \"a/b/\" into
+   (:absolute \"a\" \"b\") or (:relative \"a\" \"b\").  Empty → nil."
+  (let ((len (length s)))
+    (cond
+      ((= len 0) nil)
+      (t
+       (let ((absolute (= (aref s 0) 47))
+             (parts nil)
+             (start (if (= (aref s 0) 47) 1 0))
+             (k 0))
+         (setq k start)
+         (let ((cur-start start))
+           (loop
+             (when (>= k len) (return nil))
+             (when (= (aref s k) 47)
+               (when (> k cur-start)
+                 (setq parts (cons (%substring s cur-start k) parts)))
+               (setq cur-start (+ k 1)))
+             (setq k (+ k 1)))
+           (when (> len cur-start)
+             (setq parts (cons (%substring s cur-start len) parts))))
+         (let ((rparts (nreverse parts)))
+           (cond
+             ((and absolute (null rparts)) (list :absolute))
+             (absolute (cons :absolute rparts))
+             ((null rparts) nil)
+             (t (cons :relative rparts)))))))))
+
+(defun %parse-pathname-string (s)
+  "Parse a namestring S into a pathname object.  Strips logical host prefix
+   (anything up to and including the first colon).  Splits directory parts
+   on '/', then the basename into name + type at the last '.'."
+  (let* ((stripped (%strip-logical-host s))
+         (len (length stripped))
+         (last-slash -1)
+         (i 0))
+    (loop
+      (when (>= i len) (return nil))
+      (when (= (aref stripped i) 47) (setq last-slash i))
+      (setq i (+ i 1)))
+    (let* ((basename (if (= last-slash -1)
+                         stripped
+                         (%substring stripped (+ last-slash 1) len)))
+           (dir-str (if (= last-slash -1)
+                        ""
+                        (%substring stripped 0 (+ last-slash 1))))
+           (blen (length basename))
+           (last-dot -1)
+           (j 0))
+      (loop
+        (when (>= j blen) (return nil))
+        (when (= (aref basename j) 46) (setq last-dot j))
+        (setq j (+ j 1)))
+      (let* ((nm (cond
+                   ((= blen 0) nil)
+                   ((= last-dot -1) basename)
+                   ((= last-dot 0) basename)
+                   (t (%substring basename 0 last-dot))))
+             (tp (cond
+                   ((= last-dot -1) nil)
+                   ((= last-dot (- blen 1)) nil)
+                   (t (%substring basename (+ last-dot 1) blen))))
+             (dir (%split-directory-string dir-str)))
+        (%make-pathname-obj nil nil dir nm tp nil)))))
+
+(defun %coerce-to-pathname (x)
+  "Return X as a pathname object (no-op if already one, parse if string)."
+  (cond
+    ((%pathname-obj-p x) x)
+    ((stringp x) (%parse-pathname-string x))
+    ((streamp x)
+     ;; File streams don't track their original path; return null pathname.
+     (%make-pathname-obj nil nil nil nil nil nil))
+    ((null x) (%make-pathname-obj nil nil nil nil nil nil))
+    (t (%make-pathname-obj nil nil nil nil nil nil))))
+
+(defun pathname (x)
+  "Coerce X to a pathname object."
+  (%coerce-to-pathname x))
+
+(defun pathname-host (x)
+  (let ((p (%coerce-to-pathname x)))
+    (aref p 2)))
+(defun pathname-device (x)
+  (let ((p (%coerce-to-pathname x)))
+    (aref p 3)))
+(defun pathname-directory (x)
+  (let ((p (%coerce-to-pathname x)))
+    (aref p 4)))
+(defun pathname-name (x)
+  (let ((p (%coerce-to-pathname x)))
+    (aref p 5)))
+(defun pathname-type (x)
+  (let ((p (%coerce-to-pathname x)))
+    (aref p 6)))
+(defun pathname-version (x)
+  (let ((p (%coerce-to-pathname x)))
+    (aref p 7)))
+
+;;; --- Namestring construction ---
+
+(defun %component-string (c)
+  "Convert a name/type component (string, :wild, nil) into its string form
+   for namestring construction.  :wild → \"*\", nil → \"\"."
+  (cond
+    ((null c) "")
+    ((stringp c) c)
+    ((eq c :wild) "*")
+    ((eq c :unspecific) "")
+    (t "")))
+
+(defun %directory-namestring-obj (dir)
+  "Convert a directory component to its string form."
+  (cond
+    ((null dir) "")
+    ((stringp dir) dir)
+    ((eq dir :wild) "*/")
+    ((eq dir :wild-inferiors) "**/")
+    ((consp dir)
+     (let ((rel (car dir))
+           (parts (cdr dir))
+           (result ""))
+       (when (eq rel :absolute)
+         (setq result "/"))
+       (dolist (p parts)
+         (cond
+           ((eq p :wild)
+            (setq result (concatenate-strings result "*"))
+            (setq result (concatenate-strings result "/")))
+           ((eq p :wild-inferiors)
+            (setq result (concatenate-strings result "**"))
+            (setq result (concatenate-strings result "/")))
+           ((eq p :up)
+            (setq result (concatenate-strings result "../")))
+           ((eq p :back)
+            (setq result (concatenate-strings result "../")))
+           ((stringp p)
+            (setq result (concatenate-strings result p))
+            (setq result (concatenate-strings result "/")))))
+       result))
+    (t "")))
 
 (defun namestring (x)
-  "Return the namestring of a pathname."
+  "Return the namestring of pathname X (a string)."
   (cond
     ((stringp x) x)
+    ((null x) "")
     ((streamp x) "")
+    ((%pathname-obj-p x)
+     (let* ((dir (aref x 4))
+            (name (aref x 5))
+            (type (aref x 6))
+            (dir-str (%directory-namestring-obj dir))
+            (name-str (%component-string name))
+            (type-str (%component-string type))
+            (result dir-str))
+       (setq result (concatenate-strings result name-str))
+       (when (and type (not (null type)) (not (eq type :unspecific)))
+         (setq result (concatenate-strings result "."))
+         (setq result (concatenate-strings result type-str)))
+       result))
     (t "")))
 
 (defun file-namestring (x)
-  "Return just the filename part of a pathname."
-  (let ((path (pathname x)))
-    (let ((len (length path))
-          (last-slash -1)
-          (i 0))
-      (loop
-        (when (>= i len) (return nil))
-        (when (= (aref path i) 47) (setq last-slash i))  ; 47 = /
-        (setq i (+ i 1)))
-      (if (= last-slash -1)
-          path
-          (%substring path (+ last-slash 1) len)))))
-
-(defun directory-namestring (x)
-  "Return just the directory part of a pathname."
-  (let ((path (pathname x)))
-    (let ((len (length path))
-          (last-slash -1)
-          (i 0))
-      (loop
-        (when (>= i len) (return nil))
-        (when (= (aref path i) 47) (setq last-slash i))
-        (setq i (+ i 1)))
-      (if (= last-slash -1)
-          ""
-          (%substring path 0 (+ last-slash 1))))))
-
-(defun host-namestring (x) "")
-(defun enough-namestring (x &rest args) (namestring x))
-
-(defun merge-pathnames (path &rest args)
-  "Merge a path with optional defaults."
-  (let ((p (namestring path))
-        (defaults (if args (namestring (car args)) *default-pathname-defaults*)))
-    (if (and (> (length p) 0) (= (aref p 0) 47))  ; absolute path
-        p
-        (let ((base (if defaults defaults "")))
-          (if (> (length base) 0)
-              (if (= (aref base (- (length base) 1)) 47)
-                  (concatenate-strings base p)
-                  (concatenate-strings base (concatenate-strings "/" p)))
-              p)))))
-
-(defun make-pathname (&rest args)
-  "Build a pathname from components."
-  (let ((dir nil) (name nil) (type nil) (host nil)
-        (cur args))
-    (loop
-      (when (null cur) (return nil))
-      (let ((key (car cur)) (val (cadr cur)))
-        (cond
-          ((eq key :directory) (setq dir val))
-          ((eq key :name) (setq name val))
-          ((eq key :type) (setq type val))
-          ((eq key :host) (setq host val))
-          ((eq key :device) nil)  ; ignore
-          ((eq key :version) nil)))
-      (setq cur (cddr cur)))
-    ;; Build path string from components
-    (let ((result ""))
-      (when dir
-        (cond
-          ((stringp dir)
-           (setq result dir)
-           (when (and (> (length dir) 0)
-                      (not (= (aref dir (- (length dir) 1)) 47)))
-             (setq result (concatenate-strings result "/"))))
-          ((consp dir)
-           ;; (:absolute "part1" "part2") or (:relative "part1")
-           (when (consp dir)
-             (let ((rel (car dir))
-                   (parts (cdr dir)))
-               (when (eq rel :absolute)
-                 (setq result "/"))
-               (dolist (p parts)
-                 (when (stringp p)
-                   (setq result (concatenate-strings result p))
-                   (setq result (concatenate-strings result "/")))))))))
-      (when name
-        (setq result (concatenate-strings result name)))
-      (when type
+  "Return just the filename part of a pathname X."
+  (let ((p (%coerce-to-pathname x)))
+    (let* ((name (aref p 5))
+           (type (aref p 6))
+           (name-str (%component-string name))
+           (type-str (%component-string type))
+           (result name-str))
+      (when (and type (not (null type)) (not (eq type :unspecific)))
         (setq result (concatenate-strings result "."))
-        (setq result (concatenate-strings result type)))
+        (setq result (concatenate-strings result type-str)))
       result)))
 
-(defun pathname-directory (x)
-  "Extract directory component."
-  (let ((path (namestring x)))
-    (let ((len (length path))
-          (last-slash -1)
-          (i 0))
-      (loop
-        (when (>= i len) (return nil))
-        (when (= (aref path i) 47) (setq last-slash i))
-        (setq i (+ i 1)))
-      (if (= last-slash -1)
-          nil
-          (list :absolute (%substring path 0 last-slash))))))
+(defun directory-namestring (x)
+  "Return just the directory part of a pathname X."
+  (let ((p (%coerce-to-pathname x)))
+    (%directory-namestring-obj (aref p 4))))
 
-(defun pathname-name (x)
-  "Extract file name (without extension)."
-  (let ((fname (file-namestring x)))
-    (let ((len (length fname))
-          (last-dot -1)
-          (i 0))
-      (loop
-        (when (>= i len) (return nil))
-        (when (= (aref fname i) 46) (setq last-dot i))  ; 46 = .
-        (setq i (+ i 1)))
-      (if (= last-dot -1)
-          fname
-          (%substring fname 0 last-dot)))))
+(defun host-namestring (x)
+  (declare (ignore x))
+  "")
 
-(defun pathname-type (x)
-  "Extract file extension."
-  (let ((fname (file-namestring x)))
-    (let ((len (length fname))
-          (last-dot -1)
-          (i 0))
-      (loop
-        (when (>= i len) (return nil))
-        (when (= (aref fname i) 46) (setq last-dot i))
-        (setq i (+ i 1)))
-      (if (= last-dot -1)
-          nil
-          (%substring fname (+ last-dot 1) len)))))
+(defun enough-namestring (x &rest args)
+  (declare (ignore args))
+  (namestring x))
 
-(defun pathname-host (x) nil)
-(defun pathname-device (x) nil)
-(defun pathname-version (x) :unspecific)
+;;; --- make-pathname ---
+
+(defun make-pathname (&rest args)
+  "Build a pathname from components.  Recognizes :host :device :directory
+   :name :type :version :defaults :case keys.  Defaults come from
+   :defaults if supplied (or nil for missing keys)."
+  (let ((host nil) (host-p nil)
+        (device nil) (device-p nil)
+        (directory nil) (directory-p nil)
+        (name nil) (name-p nil)
+        (type nil) (type-p nil)
+        (version nil) (version-p nil)
+        (defaults nil)
+        (cur args))
+    ;; First pass: read all args
+    (loop
+      (when (null cur) (return nil))
+      (let ((key (car cur))
+            (val (if (cdr cur) (cadr cur) nil)))
+        (cond
+          ((eq key :host) (setq host val) (setq host-p t))
+          ((eq key :device) (setq device val) (setq device-p t))
+          ((eq key :directory) (setq directory val) (setq directory-p t))
+          ((eq key :name) (setq name val) (setq name-p t))
+          ((eq key :type) (setq type val) (setq type-p t))
+          ((eq key :version) (setq version val) (setq version-p t))
+          ((eq key :defaults) (setq defaults val))
+          ((eq key :case) nil)   ; accepted, ignored
+          (t nil)))
+      (setq cur (cddr cur)))
+    ;; Apply defaults for missing components
+    (let ((dp (if defaults (%coerce-to-pathname defaults) nil)))
+      (when (and (not host-p) dp) (setq host (aref dp 2)))
+      (when (and (not device-p) dp) (setq device (aref dp 3)))
+      (when (and (not directory-p) dp) (setq directory (aref dp 4)))
+      (when (and (not name-p) dp) (setq name (aref dp 5)))
+      (when (and (not type-p) dp) (setq type (aref dp 6)))
+      (when (and (not version-p) dp) (setq version (aref dp 7))))
+    ;; Canonicalize directory.  Per CLHS 19.2.2.4.3, a :directory of :wild
+    ;; or :wild-inferiors must yield (:absolute :wild) or
+    ;; (:absolute :wild-inferiors) — the keyword alone isn't a valid
+    ;; directory component.  String directories are split at "/".
+    (cond
+      ((eq directory :wild) (setq directory '(:absolute :wild)))
+      ((eq directory :wild-inferiors) (setq directory '(:absolute :wild-inferiors)))
+      ((stringp directory) (setq directory (%split-directory-string directory))))
+    (%make-pathname-obj host device directory name type version)))
+
+;;; --- parse-namestring ---
 
 (defun parse-namestring (thing &rest args)
-  "Parse a namestring. Returns (values pathname position)."
-  (values (namestring thing) (length (namestring thing))))
+  "Parse a namestring.  Returns (values pathname position)."
+  (declare (ignore args))
+  (let ((p (%coerce-to-pathname thing)))
+    (values p (length (namestring p)))))
+
+;;; --- merge-pathnames ---
+
+(defun merge-pathnames (path &rest args)
+  "Merge a pathname with optional defaults.  Result is a pathname object.
+   Components missing in PATH are filled from DEFAULTS."
+  (let* ((p (%coerce-to-pathname path))
+         (defaults-arg (if args (car args) *default-pathname-defaults*))
+         (d (%coerce-to-pathname defaults-arg))
+         (host (or (aref p 2) (aref d 2)))
+         (device (or (aref p 3) (aref d 3)))
+         (p-dir (aref p 4))
+         (d-dir (aref d 4))
+         (directory
+          (cond
+            ((null p-dir) d-dir)
+            ;; Relative path: merge with defaults directory
+            ((and (consp p-dir) (eq (car p-dir) :relative)
+                  (consp d-dir))
+             (cond
+               ((eq (car d-dir) :absolute)
+                (append d-dir (cdr p-dir)))
+               (t p-dir)))
+            (t p-dir)))
+         (name (or (aref p 5) (aref d 5)))
+         (type (or (aref p 6) (aref d 6)))
+         (version (or (aref p 7) (aref d 7) :newest)))
+    (%make-pathname-obj host device directory name type version)))
+
+;;; --- wild-pathname-p ---
+;;;
+;;; CLHS: a pathname is wild if any of its non-host components is :wild
+;;; or :wild-inferiors.  When FIELD-KEY is supplied, only that field is
+;;; checked.  We also recognize a string component containing '*' or '?'
+;;; as wild for backward compatibility with string-based pathnames.
+
+(defun %component-wild-p (c)
+  "T if a single component value (string, :wild, etc.) is wild."
+  (cond
+    ((null c) nil)
+    ((eq c :wild) t)
+    ((eq c :wild-inferiors) t)
+    ((stringp c)
+     (let ((i 0) (len (length c)) (found nil))
+       (loop
+         (when (or found (>= i len)) (return found))
+         (let ((ch (aref c i)))
+           (when (or (= ch 42) (= ch 63))
+             (setq found t)))
+         (setq i (+ i 1)))
+       (if found t nil)))
+    (t nil)))
+
+(defun %directory-wild-p (dir)
+  "T if a directory component contains any wild markers."
+  (cond
+    ((null dir) nil)
+    ((eq dir :wild) t)
+    ((eq dir :wild-inferiors) t)
+    ((stringp dir) (%component-wild-p dir))
+    ((consp dir)
+     (let ((parts (cdr dir))
+           (found nil))
+       (dolist (p parts)
+         (when (%component-wild-p p)
+           (setq found t)))
+       found))
+    (t nil)))
 
 (defun wild-pathname-p (x &rest args)
-  "True if pathname X contains wild components (?, *, **).
-   FIELD-KEY (in args) restricts which field to check; we ignore it
-   and look at the whole namestring."
-  (declare (ignore args))
-  (let ((s (handler-case (namestring x) (t (c) nil))))
-    (when (null s) (return-from wild-pathname-p nil))
-    (let ((i 0) (len (length s)) (found nil))
-      (loop
-        (when (or found (>= i len)) (return found))
-        (let ((c (aref s i)))
-          (when (or (= c 42) (= c 63))   ; * or ?
-            (setq found t)))
-        (setq i (+ i 1)))
-      (if found t nil))))
+  "True if pathname X contains wild components.  Optional FIELD-KEY
+   restricts the check to one component (:host :device :directory :name
+   :type :version, or nil for any).  Per CLHS 19.2.2.4."
+  (let ((field (if args (car args) nil)))
+    ;; CLHS: extra args after field-key are an error.
+    (when (and args (cdr args)) (%signal-program-error))
+    (let ((p (handler-case (%coerce-to-pathname x) (t (c) nil))))
+      (when (null p) (return-from wild-pathname-p nil))
+      (cond
+        ((null field)
+         ;; Check all fields
+         (cond
+           ((%component-wild-p (aref p 2)) t)
+           ((%component-wild-p (aref p 3)) t)
+           ((%directory-wild-p (aref p 4)) t)
+           ((%component-wild-p (aref p 5)) t)
+           ((%component-wild-p (aref p 6)) t)
+           ((let ((v (aref p 7)))
+              (or (eq v :wild) (eq v :wild-inferiors))) t)
+           (t nil)))
+        ((eq field :host)      (if (%component-wild-p (aref p 2)) t nil))
+        ((eq field :device)    (if (%component-wild-p (aref p 3)) t nil))
+        ((eq field :directory) (if (%directory-wild-p (aref p 4)) t nil))
+        ((eq field :name)      (if (%component-wild-p (aref p 5)) t nil))
+        ((eq field :type)      (if (%component-wild-p (aref p 6)) t nil))
+        ((eq field :version)
+         (let ((v (aref p 7)))
+           (if (or (eq v :wild) (eq v :wild-inferiors)) t nil)))
+        (t nil)))))
 
 (defun %glob-match (pattern str)
   "Glob-match PATTERN against STR.  Supports ? (any char), *
@@ -858,9 +1120,65 @@
       to-wild
       source))
 (defun translate-logical-pathname (x) (pathname x))
-(defun logical-pathname (x) (pathname x))
-(defun logical-pathname-translations (host) nil)
-(defun user-homedir-pathname () "/root/")
+
+;;; Logical pathname.  Per CLHS 19.3.1, a logical pathname is a structured
+;;; object built from a namestring "HOST:DIR;NAME.TYPE.VERSION".  We
+;;; approximate: split on the first colon, store the prefix as host, and
+;;; parse the rest as a normal pathname.  The result has class-name
+;;; 'logical-pathname so (typep p 'logical-pathname) returns T.  Strings
+;;; without a host (e.g. "FOO.TXT") signal type-error.
+(defun logical-pathname (x)
+  "Coerce X to a logical-pathname object."
+  (cond
+    ((handler-case (%logical-pathname-p x) (t (c) nil)) x)
+    ((stringp x)
+     (let ((colon-idx (%find-colon x)))
+       (when (< colon-idx 0)
+         (error 'type-error :datum x :expected-type 'logical-pathname))
+       (%ensure-pathname-classes)
+       (let* ((host (%substring x 0 colon-idx))
+              (rest (%substring x (+ colon-idx 1) (length x)))
+              (p (%parse-pathname-string rest)))
+         (let ((q (make-array 8)))
+           (aset q 0 '%clos-instance)
+           (aset q 1 'logical-pathname)
+           (aset q 2 host)
+           (aset q 3 (aref p 3))
+           (aset q 4 (aref p 4))
+           (aset q 5 (aref p 5))
+           (aset q 6 (aref p 6))
+           (aset q 7 (aref p 7))
+           q))))
+    ((streamp x) (logical-pathname (namestring x)))
+    (t (error 'type-error :datum x :expected-type '(or string stream logical-pathname)))))
+
+(defun %find-colon (s)
+  "Return position of first ':' in S, or -1 if absent."
+  (let ((i 0) (len (length s)) (found -1))
+    (loop
+      (when (or (>= found 0) (>= i len)) (return found))
+      (when (= (aref s i) 58) (setq found i))
+      (setq i (+ i 1)))
+    found))
+
+(defun %logical-pathname-p (x)
+  "T if X is a logical-pathname object."
+  (cond
+    ((or (fixnump x) (consp x) (null x) (characterp x) (stringp x)) nil)
+    (t (handler-case
+           (and (= (obj-subtag x) #x32)
+                (>= (array-length x) 8)
+                (eq (aref x 0) '%clos-instance)
+                (eq (aref x 1) 'logical-pathname))
+         (t (c) nil)))))
+
+(defun logical-pathname-translations (host) (declare (ignore host)) nil)
+(defun user-homedir-pathname (&rest args)
+  "Return the user's home directory pathname.  Accepts an optional host
+   designator argument.  Per CLHS: must return a pathname (or NIL)."
+  ;; CLHS error.1: (user-homedir-pathname :unspecific nil) → program-error.
+  (when (and args (cdr args)) (%signal-program-error))
+  (%coerce-to-pathname "/root/"))
 
 ;;; --- probe-file ---
 (defun probe-file (x)

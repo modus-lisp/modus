@@ -22,7 +22,7 @@
 set -u
 
 SHARDS=${SHARDS:-32}
-BINARY=${BINARY:-/tmp/modus-ansi-test}
+BINARY=${BINARY:-/home/claude/modus/tmp/modus-ansi-test}
 FIRST=10001
 LAST=27709   # one past last test id
 

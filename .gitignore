@@ -25,3 +25,4 @@ nohup.out
 # Logs
 *.log
 .claude
+tmp/

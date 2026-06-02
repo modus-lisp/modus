@@ -1,9 +1,9 @@
 ;;;; build-ansi-test.lisp — Build ANSI CL test runner (Linux x86-64)
 ;;;;
-;;;; Produces /tmp/modus-ansi-test — runs ANSI CL conformance tests.
+;;;; Produces /home/claude/modus/tmp/modus-ansi-test — runs ANSI CL conformance tests.
 ;;;;
 ;;;; Usage: sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp
-;;;; Run:   /tmp/modus-ansi-test
+;;;; Run:   /home/claude/modus/tmp/modus-ansi-test
 ;;;;
 ;;;; Output: FAIL lines for each failing test, then summary: N/M PASS or FAIL
 ;;;; Exit code: 0 = all pass, >0 = number of failures
@@ -352,12 +352,12 @@
     ;; *SYM-NAME-TABLE* — otherwise SYMBOL-NAME returns "" for them
     ;; and the printer emits empty output, failing CLHS §22.1.3.3
     ;; symbol-printing tests.
-    (dolist (d '("/tmp/ansi-test/printer/"
-                 "/tmp/ansi-test/printer/format/"
-                 "/tmp/ansi-test/symbols/"
-                 "/tmp/ansi-test/packages/"
-                 "/tmp/ansi-test/reader/"
-                 "/tmp/ansi-test/auxiliary/"))
+    (dolist (d '("/home/claude/modus/tmp/ansi-test/printer/"
+                 "/home/claude/modus/tmp/ansi-test/printer/format/"
+                 "/home/claude/modus/tmp/ansi-test/symbols/"
+                 "/home/claude/modus/tmp/ansi-test/packages/"
+                 "/home/claude/modus/tmp/ansi-test/reader/"
+                 "/home/claude/modus/tmp/ansi-test/auxiliary/"))
       (let ((found (%scan-ansi-test-dir-host d)))
         (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
                  found)))
@@ -2878,7 +2878,7 @@
   "Transform an ANSI test auxiliary file into MVM-compatible source.
    Emits defun/defstruct/defvar/defparameter/defconstant forms into *ansi-aux-sources*.
    Skips CLOS methods, defgeneric, and forms that reference unsupported features."
-  (let ((path (concatenate 'string "/tmp/ansi-test/auxiliary/" filename)))
+  (let ((path (concatenate 'string "/home/claude/modus/tmp/ansi-test/auxiliary/" filename)))
     (when (member filename *ansi-aux-loaded* :test #'string=)
       (return-from load-ansi-aux nil))
     (unless (probe-file path)
@@ -3067,76 +3067,76 @@
 
 (format t "  aux sources: ~D chars~%" (length *ansi-aux-sources*))
 
-(load-ansi-chapter "/tmp/ansi-test/cons/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/cons/"
   '("acons.lsp" "adjoin.lsp" "append.lsp" "assoc-if-not.lsp" "assoc-if.lsp" "assoc.lsp" "atom.lsp" "butlast.lsp" "cons-test-01.lsp" "cons-test-03.lsp" "cons-test-05.lsp" "cons.lsp" "consp.lsp" "copy-alist.lsp" "copy-list.lsp" "copy-tree.lsp" "cxr.lsp" "endp.lsp" "get-properties.lsp" "getf.lsp" "intersection.lsp" "last.lsp" "ldiff.lsp" "list-length.lsp" "list.lsp" "listp.lsp" "load.lsp" "make-list.lsp" "mapc.lsp" "mapcan.lsp" "mapcar.lsp" "mapcon.lsp" "mapl.lsp" "maplist.lsp" "member-if-not.lsp" "member-if.lsp" "member.lsp" "nbutlast.lsp" "nconc.lsp" "nintersection.lsp" "nreconc.lsp" "nset-difference.lsp" "nset-exclusive-or.lsp" "nsublis.lsp" "nsubst-if-not.lsp" "nsubst-if.lsp" "nsubst.lsp" "nth.lsp" "nthcdr.lsp" "nunion.lsp" "pairlis.lsp" "pop.lsp" "push.lsp" "pushnew.lsp" "rassoc-if-not.lsp" "rassoc-if.lsp" "rassoc.lsp" "remf.lsp" "rest.lsp" "revappend.lsp" "rplaca.lsp" "rplacd.lsp" "set-difference.lsp" "set-exclusive-or.lsp" "sublis.lsp" "subsetp.lsp" "subst-if-not.lsp" "subst-if.lsp" "subst.lsp" "tailp.lsp" "tree-equal.lsp" "union.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/data-and-control-flow/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/data-and-control-flow/"
   '("and.lsp" "apply.lsp" "block.lsp" "call-arguments-limit.lsp" "case.lsp" "catch.lsp" "ccase.lsp" "compiled-function-p.lsp" "complement.lsp" "cond.lsp" "constantly.lsp" "ctypecase.lsp" "data-and-control-flow.lsp" "defconstant.lsp" "define-modify-macro.lsp" "define-setf-expander.lsp" "defparameter.lsp" "defsetf.lsp" "defun.lsp" "defvar.lsp" "destructuring-bind.lsp" "ecase.lsp" "eql.lsp" "equal.lsp" "equalp.lsp" "etypecase.lsp" "every.lsp" "fboundp.lsp" "fdefinition.lsp" "flet.lsp" "fmakunbound.lsp" "funcall.lsp" "function-lambda-expression.lsp" "function.lsp" "functionp.lsp" "get-setf-expansion.lsp" "identity.lsp" "if.lsp" "labels.lsp" "lambda-list-keywords.lsp" "lambda-parameters-limit.lsp" "let.lsp" "letstar.lsp" "load.lsp" "macrolet.lsp" "multiple-value-bind.lsp" "multiple-value-call.lsp" "multiple-value-list.lsp" "multiple-value-prog1.lsp" "multiple-value-setq.lsp" "nil.lsp" "not-and-null.lsp" "notany.lsp" "notevery.lsp" "nth-value.lsp" "or.lsp" "places.lsp" "prog.lsp" "prog1.lsp" "prog2.lsp" "progn.lsp" "progv.lsp" "psetf.lsp" "psetq.lsp" "return-from.lsp" "return.lsp" "rotatef.lsp" "shiftf.lsp" "some.lsp" "t.lsp" "tagbody.lsp" "typecase.lsp" "unless.lsp" "unwind-protect.lsp" "values-list.lsp" "values.lsp" "when.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/hash-tables/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/hash-tables/"
   '("clrhash.lsp" "gethash.lsp" "hash-table-count.lsp" "hash-table-p.lsp" "hash-table-rehash-size.lsp" "hash-table-rehash-threshold.lsp" "hash-table-size.lsp" "hash-table-test.lsp" "hash-table.lsp" "load.lsp" "make-hash-table.lsp" "maphash.lsp" "remhash.lsp" "sxhash.lsp" "with-hash-table-iterator.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/numbers/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/numbers/"
   '("abs.lsp" "acos.lsp" "acosh.lsp" "arithmetic-error.lsp" "ash.lsp" "asin.lsp" "asinh.lsp" "atan.lsp" "atanh.lsp" "boole.lsp" "byte.lsp" "ceiling.lsp" "cis.lsp" "complex.lsp" "complexp.lsp" "conjugate.lsp" "cos.lsp" "cosh.lsp" "decf.lsp" "deposit-field.lsp" "divide.lsp" "dpb.lsp" "epsilons.lsp" "evenp.lsp" "exp.lsp" "expt.lsp" "fceiling.lsp" "ffloor.lsp" "float.lsp" "floatp.lsp" "floor.lsp" "fround.lsp" "ftruncate.lsp" "gcd.lsp" "imagpart.lsp" "incf.lsp" "integer-length.lsp" "integerp.lsp" "isqrt.lsp" "lcm.lsp" "ldb.lsp" "load.lsp" "log.lsp" "logand.lsp" "logandc1.lsp" "logandc2.lsp" "logbitp.lsp" "logcount.lsp" "logeqv.lsp" "logior.lsp" "lognand.lsp" "lognor.lsp" "lognot.lsp" "logorc1.lsp" "logorc2.lsp" "logtest.lsp" "logxor.lsp" "make-random-state.lsp" "mask-field.lsp" "max.lsp" "min.lsp" "minus.lsp" "minusp.lsp" "number-comparison.lsp" "numberp.lsp" "numerator-denominator.lsp" "oddp.lsp" "oneminus.lsp" "oneplus.lsp" "parse-integer.lsp" "phase.lsp" "plus.lsp" "plusp.lsp" "random-state-p.lsp" "random.lsp" "rational.lsp" "rationalize.lsp" "rationalp.lsp" "real.lsp" "realp.lsp" "realpart.lsp" "round.lsp" "signum.lsp" "sin.lsp" "sinh.lsp" "sqrt.lsp" "tan.lsp" "tanh.lsp" "times.lsp" "truncate.lsp" "upgraded-complex-part-type.lsp" "zerop.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/symbols/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/symbols/"
   '("boundp.lsp" "cl-symbols.lsp" "copy-symbol.lsp" "gensym.lsp" "gentemp.lsp" "get.lsp" "keywordp.lsp" "load.lsp" "make-symbol.lsp" "makunbound.lsp" "remprop.lsp" "set.lsp" "special-operator-p.lsp" "symbol-function.lsp" "symbol-name.lsp" "symbolp.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/structures/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/structures/"
   '("load.lsp" "structure-00.lsp" "structures-01.lsp" "structures-02.lsp" "structures-03.lsp" "structures-04.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/strings/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/strings/"
   '("base-string.lsp" "char-schar.lsp" "load.lsp" "make-string.lsp" "nstring-capitalize.lsp" "nstring-downcase.lsp" "nstring-upcase.lsp" "simple-base-string.lsp" "simple-string-p.lsp" "simple-string.lsp" "string-capitalize.lsp" "string-comparisons.lsp" "string-downcase.lsp" "string-left-trim.lsp" "string-right-trim.lsp" "string-trim.lsp" "string-upcase.lsp" "string.lsp" "stringp.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/characters/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/characters/"
   '("char-compare.lsp" "character.lsp" "load.lsp" "name-char.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/sequences/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/sequences/"
   '("concatenate.lsp" "copy-seq.lsp" "count-if-not.lsp" "count-if.lsp" "count.lsp" "elt.lsp" "fill-strings.lsp" "fill.lsp" "find-if-not.lsp" "find-if.lsp" "find.lsp" "length.lsp" "load.lsp" "make-sequence.lsp" "map-into.lsp" "map.lsp" "merge.lsp" "mismatch.lsp" "nreverse.lsp" "nsubstitute-if-not.lsp" "nsubstitute-if.lsp" "nsubstitute.lsp" "position-if-not.lsp" "position-if.lsp" "position.lsp" "reduce.lsp" "remove-duplicates.lsp" "remove.lsp" "replace.lsp" "reverse.lsp" "search-bitvector.lsp" "search-list.lsp" "search-string.lsp" "search-vector.lsp" "sort.lsp" "stable-sort.lsp" "subseq.lsp" "substitute-if-not.lsp" "substitute-if.lsp" "substitute.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/arrays/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/arrays/"
   '("adjust-array.lsp" "adjustable-array-p.lsp" "aref.lsp" "array-as-class.lsp" "array-dimension.lsp" "array-dimensions.lsp" "array-displacement.lsp" "array-element-type.lsp" "array-has-fill-pointer-p.lsp" "array-in-bounds-p.lsp" "array-misc.lsp" "array-rank.lsp" "array-row-major-index.lsp" "array-t.lsp" "array-total-size.lsp" "array.lsp" "arrayp.lsp" "bit-and.lsp" "bit-andc1.lsp" "bit-andc2.lsp" "bit-eqv.lsp" "bit-ior.lsp" "bit-nand.lsp" "bit-nor.lsp" "bit-not.lsp" "bit-orc1.lsp" "bit-orc2.lsp" "bit-vector-p.lsp" "bit-vector.lsp" "bit-xor.lsp" "bit.lsp" "fill-pointer.lsp" "load.lsp" "make-array.lsp" "row-major-aref.lsp" "sbit.lsp" "simple-array-t.lsp" "simple-array.lsp" "simple-bit-vector-p.lsp" "simple-bit-vector.lsp" "simple-vector-p.lsp" "svref.lsp" "upgraded-array-element-type.lsp" "vector-pop.lsp" "vector-push-extend.lsp" "vector-push.lsp" "vector.lsp" "vectorp.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/iteration/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/iteration/"
   '("do.lsp" "dolist.lsp" "dostar.lsp" "dotimes.lsp" "load.lsp" "loop.lsp" "loop1.lsp" "loop10.lsp" "loop11.lsp" "loop12.lsp" "loop13.lsp" "loop14.lsp" "loop15.lsp" "loop16.lsp" "loop17.lsp" "loop2.lsp" "loop3.lsp" "loop4.lsp" "loop5.lsp" "loop6.lsp" "loop7.lsp" "loop8.lsp" "loop9.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/printer/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/printer/"
   '("copy-pprint-dispatch.lsp" "pprint-dispatch.lsp" "pprint-exit-if-list-exhausted.lsp" "pprint-fill.lsp" "pprint-indent.lsp" "pprint-linear.lsp" "pprint-logical-block.lsp" "pprint-newline.lsp" "pprint-tab.lsp" "pprint-tabular.lsp" "pprint.lsp" "prin1-to-string.lsp" "prin1.lsp" "princ-to-string.lsp" "princ.lsp" "print-array.lsp" "print-bit-vector.lsp" "print-characters.lsp" "print-complex.lsp" "print-cons.lsp" "print-floats.lsp" "print-integers.lsp" "print-length.lsp" "print-level.lsp" "print-lines.lsp" "print-pathname.lsp" "print-random-state.lsp" "print-ratios.lsp" "print-strings.lsp" "print-structure.lsp" "print-symbols.lsp" "print-unreadable-object.lsp" "print-vector.lsp" "print.lsp" "printer-control-vars.lsp" "write-to-string.lsp" "write.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/printer/format/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/printer/format/"
   '("format-a.lsp" "format-ampersand.lsp" "format-b.lsp" "format-brace.lsp" "format-c.lsp" "format-circumflex.lsp" "format-conditional.lsp" "format-d.lsp" "format-goto.lsp" "format-newline.lsp" "format-o.lsp" "format-p.lsp" "format-page.lsp" "format-paren.lsp" "format-percent.lsp" "format-question.lsp" "format-r.lsp" "format-s.lsp" "format-t.lsp" "format-tilde.lsp" "format-x.lsp" "formatter-c.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/streams/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/streams/"
   '("broadcast-stream-streams.lsp" "clear-input.lsp" "clear-output.lsp" "concatenated-stream-streams.lsp" "echo-stream-input-stream.lsp" "echo-stream-output-stream.lsp" "file-length.lsp" "file-position.lsp" "file-string-length.lsp" "finish-output.lsp" "force-output.lsp" "fresh-line.lsp" "get-output-stream-string.lsp" "input-stream-p.lsp" "interactive-stream-p.lsp" "listen.lsp" "load.lsp" "make-broadcast-stream.lsp" "make-concatenated-stream.lsp" "make-echo-stream.lsp" "make-string-input-stream.lsp" "make-string-output-stream.lsp" "make-synonym-stream.lsp" "make-two-way-stream.lsp" "open-stream-p.lsp" "open.lsp" "output-stream-p.lsp" "peek-char.lsp" "read-byte.lsp" "read-char-no-hang.lsp" "read-char.lsp" "read-line.lsp" "read-sequence.lsp" "stream-element-type.lsp" "stream-error-stream.lsp" "stream-external-format.lsp" "streamp.lsp" "synonym-stream-symbol.lsp" "terpri.lsp" "two-way-stream-input-stream.lsp" "two-way-stream-output-stream.lsp" "unread-char.lsp" "with-input-from-string.lsp" "with-open-file.lsp" "with-open-stream.lsp" "with-output-to-string.lsp" "write-char.lsp" "write-line.lsp" "write-sequence.lsp" "write-string.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/packages/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/packages/"
   '("defpackage.lsp" "delete-package.lsp" "do-all-symbols.lsp" "do-external-symbols.lsp" "do-symbols.lsp" "export.lsp" "find-all-symbols.lsp" "find-package.lsp" "find-symbol.lsp" "import.lsp" "in-package.lsp" "intern.lsp" "keyword.lsp" "list-all-packages.lsp" "load.lsp" "make-package.lsp" "package-error-package.lsp" "package-error.lsp" "package-name.lsp" "package-nicknames.lsp" "package-shadowing-symbols.lsp" "package-use-list.lsp" "package-used-by-list.lsp" "packagep.lsp" "rename-package.lsp" "shadow.lsp" "shadowing-import.lsp" "unexport.lsp" "unintern.lsp" "unuse-package.lsp" "use-package.lsp" "with-package-iterator.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/eval-and-compile/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/eval-and-compile/"
   '("compile.lsp" "compiler-macros.lsp" "constantp.lsp" "declaim.lsp" "declaration.lsp" "define-compiler-macro.lsp" "define-symbol-macro.lsp" "defmacro.lsp" "dynamic-extent.lsp" "eval-and-compile.lsp" "eval-when.lsp" "eval.lsp" "ignorable.lsp" "ignore.lsp" "lambda.lsp" "load.lsp" "locally.lsp" "macro-function.lsp" "macroexpand-1.lsp" "macroexpand.lsp" "optimize.lsp" "proclaim.lsp" "special.lsp" "symbol-macrolet.lsp" "the.lsp" "type.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/types-and-classes/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/types-and-classes/"
   '("class-precedence-lists.lsp" "coerce.lsp" "deftype.lsp" "load.lsp" "standard-generic-function.lsp" "subtypep-array.lsp" "subtypep-complex.lsp" "subtypep-cons.lsp" "subtypep-eql.lsp" "subtypep-float.lsp" "subtypep-function.lsp" "subtypep-integer.lsp" "subtypep-member.lsp" "subtypep-rational.lsp" "subtypep-real.lsp" "subtypep.lsp" "type-of.lsp" "typep.lsp" "types-and-class-2.lsp" "types-and-class.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/reader/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/reader/"
   '("copy-readtable.lsp" "dispatch-macro-characters.lsp" "get-macro-character.lsp" "load.lsp" "read-delimited-list.lsp" "read-from-string.lsp" "read-preserving-whitespace.lsp" "read-suppress.lsp" "read.lsp" "reader-test.lsp" "readtable-case.lsp" "readtablep.lsp" "set-macro-character.lsp" "set-syntax-from-char.lsp" "syntax-tokens.lsp" "syntax.lsp" "with-standard-io-syntax.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/environment/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/environment/"
   '("apropos-list.lsp" "apropos.lsp" "decode-universal-time.lsp" "describe.lsp" "disassemble.lsp" "documentation.lsp" "dribble.lsp" "ed.lsp" "encode-universal-time.lsp" "environment-functions.lsp" "get-internal-time.lsp" "get-universal-time.lsp" "inspect.lsp" "load.lsp" "room.lsp" "sleep.lsp" "time.lsp" "trace.lsp" "user-homedir-pathname.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/conditions/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/conditions/"
   '("abort.lsp" "assert.lsp" "cell-error-name.lsp" "cerror.lsp" "check-type.lsp" "compute-restarts.lsp" "condition.lsp" "continue.lsp" "define-condition.lsp" "error.lsp" "handler-bind.lsp" "handler-case.lsp" "ignore-errors.lsp" "invoke-debugger.lsp" "load.lsp" "make-condition.lsp" "muffle-warning.lsp" "restart-bind.lsp" "restart-case.lsp" "store-value.lsp" "use-value.lsp" "warn.lsp" "with-condition-restarts.lsp" "with-simple-restart.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/pathnames/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/pathnames/"
   '("directory-namestring.lsp" "enough-namestring.lsp" "file-namestring.lsp" "host-namestring.lsp" "load-logical-pathname-translations.lsp" "load.lsp" "logical-pathname-translations.lsp" "logical-pathname.lsp" "make-pathname.lsp" "merge-pathnames.lsp" "namestring.lsp" "parse-namestring.lsp" "pathname-device.lsp" "pathname-directory.lsp" "pathname-host.lsp" "pathname-match-p.lsp" "pathname-name.lsp" "pathname-type.lsp" "pathname-version.lsp" "pathname.lsp" "pathnamep.lsp" "pathnames.lsp" "translate-logical-pathname.lsp" "wild-pathname-p.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/system-construction/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/system-construction/"
   '("compile-file.lsp" "features.lsp" "load-file.lsp" "load.lsp" "modules.lsp" "with-compilation-unit.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/files/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/files/"
   '("delete-file.lsp" "directory.lsp" "ensure-directories-exist.lsp" "file-author.lsp" "file-error.lsp" "file-write-date.lsp" "load.lsp" "probe-file.lsp" "rename-file.lsp" "truename.lsp" ))
 
-(load-ansi-chapter "/tmp/ansi-test/objects/"
+(load-ansi-chapter "/home/claude/modus/tmp/ansi-test/objects/"
   '("add-method.lsp" "allocate-instance.lsp" "call-next-method.lsp" "change-class.lsp" "class-name.lsp" "class-of.lsp" "compute-applicable-methods.lsp" "defclass-01.lsp" "defclass-02.lsp" "defclass-03.lsp" "defclass-errors.lsp" "defclass-forward-reference.lsp" "defclass.lsp" "defgeneric-method-combination-and.lsp" "defgeneric-method-combination-append.lsp" "defgeneric-method-combination-aux.lsp" "defgeneric-method-combination-list.lsp" "defgeneric-method-combination-max.lsp" "defgeneric-method-combination-min.lsp" "defgeneric-method-combination-nconc.lsp" "defgeneric-method-combination-or.lsp" "defgeneric-method-combination-plus.lsp" "defgeneric-method-combination-progn.lsp" "defgeneric.lsp" "define-method-combination-long-form.lsp" "define-method-combination.lsp" "defmethod.lsp" "ensure-generic-function.lsp" "find-class.lsp" "find-method.lsp" "load.lsp" "make-instance.lsp" "make-instances-obsolete.lsp" "make-load-form-saving-slots.lsp" "make-load-form.lsp" "method-qualifiers.lsp" "next-method-p.lsp" "no-applicable-method.lsp" "no-next-method.lsp" "reinitialize-instance.lsp" "remove-method.lsp" "shared-initialize.lsp" "slot-boundp.lsp" "slot-exists-p.lsp" "slot-makunbound.lsp" "slot-missing.lsp" "slot-unbound.lsp" "slot-value.lsp" "unbound-slot.lsp" "update-instance-for-different-class.lsp" "with-accessors.lsp" "with-slots.lsp" ))
 
 ;; Generate run-real-ansi-tests that calls all file-level runners.
@@ -3623,7 +3623,7 @@
   (%init-clos-protocol)
 
   ;; Set default pathname defaults to the ANSI test sandbox directory
-  (setq *default-pathname-defaults* \"/tmp/ansi-test/sandbox/\")
+  (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
   ;; Init file I/O scratch buffers (defvar defaults not applied without init-all-globals)
   (setq *cstr-scratch* #x1DF00000)
@@ -4031,7 +4031,7 @@
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
-  (let ((path "/tmp/modus-ansi-test"))
+  (let ((path "/home/claude/modus/tmp/modus-ansi-test"))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

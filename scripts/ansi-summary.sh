@@ -1,5 +1,5 @@
 #!/bin/bash
-# ansi-summary.sh — run /tmp/modus-ansi-test and print a real pass/fail summary.
+# ansi-summary.sh — run /home/claude/modus/tmp/modus-ansi-test and print a real pass/fail summary.
 #
 # The harness emits, for every ANSI test:
 #   "+"                           — one byte per passing test (survives fork crashes)
@@ -15,10 +15,14 @@
 
 set -u
 
-OUT=$(mktemp)
-trap 'rm -f "$OUT"' EXIT
+# Keep raw per-test output around for post-mortem grep (the previous
+# mktemp + trap rm pattern wiped it at script exit and we lost data
+# every time the sweep was interrupted or someone wanted to re-summarise).
+TMPDIR="$(cd "$(dirname "$0")/.." && pwd)/tmp"
+mkdir -p "$TMPDIR"
+OUT="$TMPDIR/ansi-summary-raw.log"
 
-/tmp/modus-ansi-test > "$OUT" 2>&1
+/home/claude/modus/tmp/modus-ansi-test > "$OUT" 2>&1
 status=$?
 
 awk '

@@ -3432,7 +3432,34 @@
 (defun compile-handler-case (body-form clauses env dest)
   "Compile (handler-case body (type (var) handler-forms...))
    Uses setjmp/longjmp: saves state, runs body, catches errors.
-   Multi-clause: dispatches on *current-condition* type at runtime."
+   Multi-clause: dispatches on *current-condition* type at runtime.
+   CLHS 9.1.5.1.1: a single :no-error clause (if present) captures the
+   normal-completion values of body and replaces them with the value of
+   the clause body — does NOT run if body signals a condition matched
+   by another clause."
+  ;; Extract a :no-error clause if present.  Per CLHS the clause shape
+  ;; is (:no-error VAR-LIST &body FORMS); var-list may bind multiple
+  ;; values via multiple-value-bind.
+  (let ((no-error-clause nil)
+        (other-clauses nil))
+    (dolist (clause clauses)
+      (cond
+        ((and (consp clause) (consp (car clause))) nil)  ; skip malformed
+        ((and (consp clause) (keywordp (car clause))
+              (string= (symbol-name (car clause)) "NO-ERROR"))
+         (setf no-error-clause clause))
+        (t (push clause other-clauses))))
+    (setf other-clauses (nreverse other-clauses))
+    ;; If :no-error present, rewrite body to multiple-value-bind its
+    ;; result onto the no-error vars and run the clause's body.  If body
+    ;; signals, MVB never reaches and the condition propagates to the
+    ;; outer handler-case where the error-clauses dispatch as usual.
+    (when no-error-clause
+      (let ((var-list (cadr no-error-clause))
+            (ne-body (cddr no-error-clause)))
+        (setf body-form
+              `(multiple-value-bind ,var-list ,body-form ,@ne-body))))
+    (setf clauses other-clauses))
   ;; Find the first non-warning handler clause
   ;; Clauses: ((type (var) body...) ...)
   ;; Build a unified handler that dispatches on condition type

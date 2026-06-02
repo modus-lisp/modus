@@ -253,7 +253,8 @@
         (element-type 'character)
         (if-does-not-exist-set nil)
         (cur args))
-    ;; Parse keyword args from &rest
+    ;; Parse keyword args from &rest.  Unknown keywords signal
+    ;; program-error per CLHS (no &allow-other-keys on OPEN).
     (loop
       (when (null cur) (return nil))
       (let ((key (car cur))
@@ -265,38 +266,67 @@
            (setq if-does-not-exist val)
            (setq if-does-not-exist-set t))
           ((eq key :element-type) (setq element-type val))
-          ;; :external-format, :class, etc. — ignore
-          ))
+          ((eq key :external-format) nil)  ; accepted, ignored
+          ((eq key :allow-other-keys) nil) ; accepted, ignored
+          ((eq key :class) nil)            ; permitted impl extension
+          (t (error "open: unknown option ~A" key))))
       (setq cur (cddr cur)))
     ;; Apply ANSI defaults for :if-does-not-exist based on direction
+    ;; AND :if-exists per CLHS OPEN.  When :if-exists is :overwrite or
+    ;; :append, the default :if-does-not-exist is :error (because those
+    ;; modes inherently require an existing file).  Otherwise the
+    ;; direction-based defaults apply.
     (unless if-does-not-exist-set
       (cond
+        ((or (eq if-exists :overwrite) (eq if-exists :append))
+         (setq if-does-not-exist :error))
         ((eq direction :input)  (setq if-does-not-exist :error))
+        ((eq direction :probe)  (setq if-does-not-exist nil))
         ((eq direction :output) (setq if-does-not-exist :create))
         ((eq direction :io)     (setq if-does-not-exist :create))
         (t (setq if-does-not-exist nil))))
-    ;; Apply ANSI defaults for :if-exists based on direction
+    ;; Apply ANSI defaults for :if-exists based on direction.  CLHS:
+    ;; the default for :if-exists is :new-version when :element-type is
+    ;; '(unsigned-byte 8) or the file has a non-nil version; on Linux we
+    ;; have no version concept, so :new-version effectively means
+    ;; "replace existing".  For :direction :input we don't care.  Treat
+    ;; :new-version as :supersede for compat with all directions.
     (when (eq if-exists :new-version)
-      (cond
-        ((eq direction :input) (setq if-exists :overwrite))
-        (t nil)))  ; keep :new-version (means :supersede in our impl)
-    ;; Resolve path
+      (setq if-exists :supersede))
+    ;; Resolve path.  A wild pathname is not openable per CLHS 22.1.1.
+    ;; If wild-pathname-p errors (e.g. the path object is malformed),
+    ;; we let the underlying syscall path's error path handle it below.
+    (when (handler-case (wild-pathname-p filespec) (t (c) nil))
+      (error 'file-error :pathname filespec))
     (let ((path (%resolve-path filespec)))
-      ;; Determine open flags based on direction and options
+      ;; Determine open flags based on direction and options.
+      ;; All "file does not exist + :error" and "file exists + :error" /
+      ;; ":overwrite"/":append" with missing file must signal FILE-ERROR
+      ;; (CLHS 21.2 OPEN error description), not SIMPLE-ERROR — the
+      ;; signals-error-always tests in open.lsp pass the type as a hint
+      ;; but only require an ERROR to be signalled; using file-error
+      ;; keeps things semantically correct.
       (cond
-        ;; :probe — check existence, return nil if not found
+        ;; :probe — check existence.  If absent and :if-does-not-exist is
+        ;; :error, signal file-error; if :create, create empty file.
         ((eq direction :probe)
-         (if (%sys-stat-exists path)
-             (%make-file-stream-full -1 0)  ; dummy open stream
-             nil))
+         (cond
+           ((%sys-stat-exists path)
+            (%make-file-stream-full -1 0))  ; dummy "closed" file stream
+           ((eq if-does-not-exist :error)
+            (error 'file-error :pathname filespec))
+           ((eq if-does-not-exist :create)
+            (let ((fd (%sys-open-wronly path)))
+              (when (>= fd 0) (%sys-close fd)))
+            (%make-file-stream-full -1 0))
+           (t nil)))
         ;; :input — read-only
         ((eq direction :input)
          (let ((fd (%sys-open-rdonly path)))
            (if (< fd 0)
-               ;; File doesn't exist
                (cond
                  ((null if-does-not-exist) nil)
-                 (t (error "Cannot open ~A for input" path)))
+                 (t (error 'file-error :pathname filespec)))
                (%make-file-stream-full fd 0))))
         ;; :output — write
         ((eq direction :output)
@@ -307,55 +337,110 @@
               (cond
                 ((null if-exists) nil)
                 ((or (eq if-exists :error) (eq if-exists :new-version))
-                 (error "File ~A already exists" path))
-                ((or (eq if-exists :supersede) (eq if-exists :overwrite)
+                 (error 'file-error :pathname filespec))
+                ((or (eq if-exists :supersede)
                      (eq if-exists :rename-and-delete) (eq if-exists :rename))
                  (let ((fd (%sys-open-wronly path)))
                    (if (< fd 0)
-                       (error "Cannot open ~A for output" path)
+                       (error 'file-error :pathname filespec)
+                       (%make-file-stream-full fd 1))))
+                ((eq if-exists :overwrite)
+                 ;; :overwrite means open existing file without truncating.
+                 ;; O_WRONLY only (no O_CREAT, no O_TRUNC).
+                 (let ((fd (handler-case (syscall3 2 (%string-to-cstr path *cstr-scratch*) 1 0)
+                                         (t (c) -1))))
+                   (if (< fd 0)
+                       (error 'file-error :pathname filespec)
                        (%make-file-stream-full fd 1))))
                 ((eq if-exists :append)
                  (let ((fd (%sys-open-append path)))
                    (if (< fd 0)
-                       (error "Cannot open ~A for append" path)
+                       (error 'file-error :pathname filespec)
                        (%make-file-stream-full fd 1))))
                 (t (let ((fd (%sys-open-wronly path)))
                      (if (< fd 0)
-                         (error "Cannot open ~A for output" path)
+                         (error 'file-error :pathname filespec)
                          (%make-file-stream-full fd 1))))))
              ;; File doesn't exist
              (t
               (cond
                 ((null if-does-not-exist) nil)
                 ((eq if-does-not-exist :error)
-                 (error "File ~A does not exist" path))
+                 (error 'file-error :pathname filespec))
+                ;; :overwrite and :append require an existing file; per
+                ;; CLHS the missing-file path with these :if-exists modes
+                ;; defaults :if-does-not-exist to :error, so we should
+                ;; have errored above.  If the user explicitly set
+                ;; :if-does-not-exist to NIL or :create we still need to
+                ;; handle it — fall through to the create case.
                 (t (let ((fd (%sys-open-wronly path)))
                      (if (< fd 0)
-                         (error "Cannot create ~A" path)
+                         (error 'file-error :pathname filespec)
                          (%make-file-stream-full fd 1)))))))))
         ;; :io — read/write
         ((eq direction :io)
-         (let ((fd (%sys-open-rdwr path)))
-           (if (< fd 0)
-               (cond
-                 ((null if-does-not-exist) nil)
-                 (t (error "Cannot open ~A for io" path)))
-               (%make-file-stream-full fd 2))))
+         (let ((exists (%sys-stat-exists path)))
+           (cond
+             (exists
+              (cond
+                ((null if-exists) nil)
+                ((or (eq if-exists :error) (eq if-exists :new-version))
+                 (error 'file-error :pathname filespec))
+                (t (let ((fd (%sys-open-rdwr path)))
+                     (if (< fd 0)
+                         (error 'file-error :pathname filespec)
+                         (%make-file-stream-full fd 2))))))
+             (t
+              (cond
+                ((null if-does-not-exist) nil)
+                ((eq if-does-not-exist :error)
+                 (error 'file-error :pathname filespec))
+                (t (let ((fd (%sys-open-rdwr path)))
+                     (if (< fd 0)
+                         (error 'file-error :pathname filespec)
+                         (%make-file-stream-full fd 2)))))))))
         (t (error "Unknown :direction ~A" direction))))))
 
 ;;; --- close ---
+;;; *closed-streams* tracks non-file streams that have been closed.  File
+;;; streams record their closed state in the file-stream data layout
+;;; (fd=-1 + %fs-set-closed flag); we can't extend the data layout for the
+;;; other stream types without rewriting every existing %stream-data
+;;; consumer, so we keep a side table of (stream . t) cells.  Open-stream-p
+;;; below consults this list before falling back to the cl-streams default.
+(defvar *closed-streams* nil)
+
+(defun %stream-closed-p (s)
+  "T if STREAM has been recorded as closed in *closed-streams*."
+  (let ((cur *closed-streams*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car cur) s) (return t))
+      (setq cur (cdr cur)))))
+
+(defun %mark-stream-closed (s)
+  "Record S as closed.  Idempotent."
+  (unless (%stream-closed-p s)
+    (setq *closed-streams* (cons s *closed-streams*))))
+
 (defun close (stream &rest args)
-  "Close a stream. For file streams, closes the fd."
+  "Close a stream. For file streams, closes the fd; for all other stream
+   types, records the stream as closed so open-stream-p reports nil."
+  (declare (ignore args))
   (when (streamp stream)
-    (when (= (%stream-type stream) 9)
-      (let ((fd (%fs-fd stream)))
-        (when (>= fd 0)
-          ;; Flush output buffer if needed
-          (%fs-flush stream)
-          (%sys-close fd)
-          ;; Mark as closed by setting fd to -1
-          (set-car (%stream-data stream) -1)
-          (%fs-set-closed stream t)))))
+    (let ((ty (%stream-type stream)))
+      (cond
+        ((= ty 9)
+         (let ((fd (%fs-fd stream)))
+           (when (>= fd 0)
+             ;; Flush output buffer if needed
+             (%fs-flush stream)
+             (%sys-close fd)
+             ;; Mark as closed by setting fd to -1
+             (set-car (%stream-data stream) -1)
+             (%fs-set-closed stream t))))
+        (t
+         (%mark-stream-closed stream)))))
   t)
 
 ;;; Flush any pending output to file
@@ -478,6 +563,10 @@
 ;;; --- file-position ---
 (defun file-position (stream &rest args)
   "Get or set file position."
+  ;; CLHS: file-position takes stream + optional position designator
+  ;; (1 or 2 args total).  3+ args is a program-error.
+  (when (> (list-length args) 1)
+    (error "file-position: too many arguments"))
   (if (not (streamp stream))
       nil
       (let ((ty (%stream-type stream)))
@@ -487,11 +576,10 @@
              (if (< fd 0)
                  nil
                  (if (null args)
-                     ;; Get current position (account for buffered bytes)
-                     (let ((pos (%fs-pos stream))
-                           (blen (%fs-blen stream))
-                           (bpos (%fs-bpos stream)))
-                       (- (+ pos bpos) bpos))  ;; actual: pos minus unconsumed buffer
+                     ;; %fs-pos counts CONSUMED chars (read or written),
+                     ;; not the underlying lseek offset, so it already
+                     ;; reflects the logical position.
+                     (%fs-pos stream)
                      ;; Set position
                      (let ((newpos (car args)))
                        (cond
@@ -514,6 +602,28 @@
                           (%fs-set-blen stream 0)
                           t)
                          (t nil)))))))
+          ;; String-input: track position cell
+          ((= ty 1)
+           (let ((data (%stream-data stream)))
+             (let ((pos-cell (cdr data)))
+               (if (null args)
+                   (car pos-cell)
+                   (let ((newpos (car args)))
+                     (cond
+                       ((eq newpos :start) (set-car pos-cell 0) t)
+                       ((eq newpos :end)
+                        (set-car pos-cell (length (car data))) t)
+                       ((integerp newpos)
+                        (set-car pos-cell newpos) t)
+                       (t nil)))))))
+          ;; String-output: position == count of chars written so far.
+          ((= ty 2)
+           (if (null args)
+               (let ((chars (car (%stream-data stream))))
+                 (list-length chars))
+               ;; Cannot rewind a string-output stream (would require
+               ;; truncating the char-list); return nil per CLHS.
+               nil))
           ((= ty 7) ;; synonym
            (apply #'file-position (cons (symbol-value (%stream-data stream)) args)))
           (t (if args nil 0))))))
@@ -879,27 +989,67 @@
     result))
 
 ;;; --- read-byte (extended for file streams) ---
+;;; CLHS: 3 args max — stream + eof-error-p + eof-value.  More than 3 args
+;;; signals program-error so read-byte.error.6 (4-arg form) traps.
 (defun read-byte (stream &rest args)
   "Read one byte from stream."
+  (when (> (list-length args) 2)
+    (error "read-byte: too many arguments"))
   (let ((eof-error-p (if args (car args) t))
         (eof-value (if (cdr args) (cadr args) nil)))
     (let ((s (if (streamp stream) stream nil)))
       (if (null s)
-          (if eof-error-p (error "end of file") eof-value)
+          (error "read-byte: not a stream")
           (let ((ty (%stream-type s)))
             (cond
               ((= ty 9) (%fs-read-byte s eof-error-p eof-value))
+              ;; Echo stream: read from input, echo byte to output side.
+              ((= ty 3)
+               (let ((data (%stream-data s)))
+                 (let ((b (read-byte (car data) nil :eof-byte-sentinel-7770003)))
+                   (if (eq b :eof-byte-sentinel-7770003)
+                       (if eof-error-p (error "end of file") eof-value)
+                       (progn (write-byte b (cdr data)) b)))))
+              ;; Two-way: read from input side
+              ((= ty 4)
+               (read-byte (car (%stream-data s)) eof-error-p eof-value))
+              ;; Concatenated: read from first non-exhausted
+              ((= ty 6)
+               (let ((data (%stream-data s)))
+                 (let ((streams (car data)))
+                   (loop
+                     (when (null streams)
+                       (return (if eof-error-p (error "end of file") eof-value)))
+                     (let ((b (read-byte (car streams) nil :eof-byte-sentinel-7770003)))
+                       (if (eq b :eof-byte-sentinel-7770003)
+                           (progn
+                             (setq streams (cdr streams))
+                             (set-car data streams))
+                           (return b)))))))
+              ;; Synonym: delegate
+              ((= ty 7)
+               (read-byte (symbol-value (%stream-data s)) eof-error-p eof-value))
               (t (if eof-error-p (error "end of file") eof-value))))))))
 
 ;;; --- write-byte (extended for file streams) ---
 (defun write-byte (byte stream)
   "Write one byte to stream."
-  (if (streamp stream)
-      (let ((ty (%stream-type stream)))
-        (cond
-          ((= ty 9) (%fs-write-byte byte stream))
-          (t nil)))
-      nil)
+  (unless (streamp stream)
+    (error "write-byte: not a stream"))
+  (let ((ty (%stream-type stream)))
+    (cond
+      ((= ty 9) (%fs-write-byte byte stream))
+      ;; Echo: write to output side only (no input echo on the write path)
+      ((= ty 3) (write-byte byte (cdr (%stream-data stream))))
+      ;; Two-way: write to output side
+      ((= ty 4) (write-byte byte (cdr (%stream-data stream))))
+      ;; Broadcast: write to all
+      ((= ty 5)
+       (dolist (sub (%stream-data stream))
+         (write-byte byte sub)))
+      ;; Synonym: delegate
+      ((= ty 7) (write-byte byte (symbol-value (%stream-data stream))))
+      (t nil)))
   byte)
 
 ;;; Helper: concatenate two strings
@@ -1012,15 +1162,16 @@
                            (let ((ch (code-char (aref str pos))))
                              (set-car pos-cell (+ pos 1))
                              ch))))))))
-          ;; Echo stream: read from input, echo to output
+          ;; Echo stream: read from input, echo to output.
+          ;; %write-char-to-stream expects an integer CODE, not a
+          ;; character object.  ((= ty 2)) stores the value verbatim
+          ;; into the char-list, so a character object would corrupt
+          ;; get-output-stream-string output.
           ((= ty 3)
            (let ((data (%stream-data s)))
-             ;; Check for unread char on the echo stream itself
-             ;; Echo streams have data = (cons input output . unread-or-nil)
-             ;; Actually keep it simple: delegate to input stream
              (let ((ch (%read-char-from-stream (car data) eof-error-p eof-value)))
                (when (characterp ch)
-                 (%write-char-to-stream ch (cdr data)))
+                 (%write-char-to-stream (%ensure-char-code ch) (cdr data)))
                ch)))
           ;; Two-way stream: read from input side
           ((= ty 4)
@@ -1074,38 +1225,84 @@
 ;;; --- peek-char ---
 
 (defun peek-char (&rest args)
-  "Peek at next character. peek-type: nil=next char, t=skip whitespace, char=skip until char."
+  "Peek at next character. peek-type: nil=next char, t=skip whitespace, char=skip until char.
+
+   CLHS 21.1.4.1 echo-stream semantics: characters that are read are
+   echoed; characters that are pushed back onto the unread stack and not
+   echoed when subsequently unread.  Therefore peeked chars (which are
+   unread back onto the stream) are NOT echoed, but chars skipped over by
+   peek-char's t/char modes ARE echoed (because they were consumed and
+   then NOT pushed back).
+
+   We implement this by reading through the echo stream as usual (so skip
+   chars echo), then for the final peeked char we unread it onto the
+   echo stream's input side directly while ALSO undoing the trailing
+   echo from the string-output side via %echo-pop-last-char."
+  ;; CLHS: peek-type [stream [eof-error-p [eof-value [recursive-p]]]] —
+  ;; up to 5 args.  6+ args is a program-error.
+  (when (> (list-length args) 5)
+    (error "peek-char: too many arguments"))
   (let ((peek-type (if args (car args) nil))
         (stream-arg (if (cdr args) (cadr args) nil))
         (eof-error-p (if (cddr args) (caddr args) t))
         (eof-value (if (cdddr args) (cadddr args) nil)))
-    (let ((s (%resolve-input-stream stream-arg)))
-      (cond
-        ;; nil: just peek at next char
-        ((null peek-type)
-         (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
-           (when (characterp ch)
-             (unread-char ch s))
-           ch))
-        ;; t: skip whitespace, peek at first non-whitespace
-        ((eq peek-type t)
-         (loop
-           (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
-             (cond
-               ((not (characterp ch)) (return ch))
-               ((not (%whitespace-p ch))
-                (unread-char ch s)
-                (return ch))))))
-        ;; character: skip until that character
-        ((characterp peek-type)
-         (loop
-           (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
-             (cond
-               ((not (characterp ch)) (return ch))
-               ((char= ch peek-type)
-                (unread-char ch s)
-                (return ch))))))
-        (t nil)))))
+    (let ((resolved (%resolve-input-stream stream-arg)))
+      (let ((echo-p (and (streamp resolved) (= (%stream-type resolved) 3))))
+        (cond
+          ;; nil: just peek at next char.
+          ;; For echo streams, read from the input side directly so no
+          ;; echo occurs at all (the peeked char is not yet consumed by
+          ;; the echo stream's input).
+          ((null peek-type)
+           (let ((s (if echo-p (car (%stream-data resolved)) resolved)))
+             (let ((ch (%read-char-from-stream s eof-error-p eof-value)))
+               (when (characterp ch)
+                 (unread-char ch s))
+               ch)))
+          ;; t: skip whitespace, peek at first non-whitespace.
+          ;; Skipped chars DO echo (we read them through the echo path);
+          ;; the final peeked char does NOT echo (we undo it).
+          ((eq peek-type t)
+           (loop
+             (let ((ch (%read-char-from-stream resolved eof-error-p eof-value)))
+               (cond
+                 ((not (characterp ch)) (return ch))
+                 ((not (%whitespace-p ch))
+                  (cond
+                    (echo-p
+                     ;; Undo the trailing echo of the peeked char
+                     (%echo-pop-last-char (cdr (%stream-data resolved)))
+                     ;; Push back onto the input side (no echo on read)
+                     (unread-char ch (car (%stream-data resolved))))
+                    (t
+                     (unread-char ch resolved)))
+                  (return ch))))))
+          ;; character: skip until that character.
+          ((characterp peek-type)
+           (loop
+             (let ((ch (%read-char-from-stream resolved eof-error-p eof-value)))
+               (cond
+                 ((not (characterp ch)) (return ch))
+                 ((char= ch peek-type)
+                  (cond
+                    (echo-p
+                     (%echo-pop-last-char (cdr (%stream-data resolved)))
+                     (unread-char ch (car (%stream-data resolved))))
+                    (t
+                     (unread-char ch resolved)))
+                  (return ch))))))
+          (t nil))))))
+
+(defun %echo-pop-last-char (out-stream)
+  "Pop the most-recently-written char off OUT-STREAM if it is a
+   string-output stream.  Used by PEEK-CHAR on echo streams to undo the
+   final echo (the peeked-at character must not appear in the echo
+   output, per CLHS 21.1.4.1)."
+  (when (and (streamp out-stream) (= (%stream-type out-stream) 2))
+    (let ((data (%stream-data out-stream)))
+      (let ((chars (car data)))
+        (when (consp chars)
+          (set-car data (cdr chars)))))))
 
 (defun %whitespace-p (ch)
   "Check if character is whitespace."
@@ -1115,13 +1312,21 @@
 ;;; --- read-char-no-hang ---
 
 (defun read-char-no-hang (&rest args)
-  "Non-blocking read-char. For string streams, same as read-char."
+  "Non-blocking read-char.  For string-input, echo, two-way, concatenated,
+   and file streams we delegate to read-char-from-stream since input is
+   either immediately available (string buffer / file buffer / mem) or
+   the stream has reached EOF — there is no 'wait' state to skip."
   (let ((stream-arg (if args (car args) nil))
         (eof-error-p (if (cdr args) (cadr args) t))
         (eof-value (if (cddr args) (caddr args) nil)))
     (let ((s (%resolve-input-stream stream-arg)))
-      (if (and (streamp s) (= (%stream-type s) 1))
-          (%read-char-from-stream s eof-error-p eof-value)
+      (if (streamp s)
+          (let ((ty (%stream-type s)))
+            (cond
+              ;; Stream types that can produce data without blocking.
+              ((or (= ty 1) (= ty 3) (= ty 4) (= ty 6) (= ty 9))
+               (%read-char-from-stream s eof-error-p eof-value))
+              (t nil)))
           nil))))
 
 ;;; --- Core write-char ---
@@ -1171,4 +1376,22 @@
             (%write-char-to-stream code stream)
             ;; Legacy: old-style cons output stream (char-list . nil)
             (set-car stream (cons code (car stream)))))))
+
+;;; --- open-stream-p (override) ---
+;;; cl-streams.lisp's open-stream-p only inspects file streams (ty=9);
+;;; non-file streams were always reported as open even after CLOSE.  This
+;;; override consults the *closed-streams* side table populated by CLOSE
+;;; above, so make-string-output-stream.13, make-echo-stream.10 and the
+;;; other "close → open-stream-p → nil" deftests resolve correctly.
+;;; Last-defun-wins makes this the live definition since cl-fileio.lisp
+;;; loads after cl-streams.lisp.
+(defun open-stream-p (s)
+  (cond
+    ((not (streamp s)) nil)
+    ((= (%stream-type s) 9)
+     ;; File stream: open iff fd >= 0 (matches cl-streams.lisp).
+     (if (>= (%fs-fd s) 0) t nil))
+    (t
+     ;; Non-file streams: consult the side table.
+     (if (%stream-closed-p s) nil t))))
 

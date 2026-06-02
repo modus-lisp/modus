@@ -1542,9 +1542,12 @@
   "True if ARR has a fill pointer.
    Plain (cons fp underlying) → T.  (cons 8765432 (cons fp underlying)) → T.
    (cons 8765432 underlying) → NIL (adjustable but no fp).
+   (cons 9867654 (cons dims data)) → NIL (multi-dim wrapper, no fp).
    Native MDA #x34 → T iff %mda-fp slot is non-NIL."
   (cond
     ((%mda-p arr) (not (null (%mda-fp arr))))
+    ;; Multi-dim cons-wrapper has marker 9867654 in head — never has fp.
+    ((and (consp arr) (eql (car arr) 9867654)) nil)
     (t (let ((y (%fp-inner arr)))
          (if (consp y) (fixnump (car y)) nil)))))
 
@@ -1567,94 +1570,134 @@
 (defun vector-push (new-element vector)
   "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil.
    String underlying stores fixnum char-codes; coerce a character element
-   via char-code so subsequent (aref ...) returns the char correctly."
+   via char-code so subsequent (aref ...) returns the char correctly.
+   CLHS: signals type-error if VECTOR has no fill pointer.
+   Displaced-aware: writes at (+ fp offset) when MDA has a displaced-to slot."
   (cond
     ((%mda-p vector)
      ;; MDA fast path: read fp slot, write into data, advance fp.
-     (let ((fp (%mda-fp vector))
-           (arr (%mda-data vector)))
-       (when fp
-         (let ((len (array-length arr)))
-           (if (>= fp len)
-               nil
-               (let ((store-val (if (and (stringp arr) (characterp new-element))
-                                    (char-code new-element)
-                                    new-element)))
-                 (aset arr fp store-val)
-                 (%mda-set-fp vector (+ fp 1))
-                 fp))))))
-    (t (let ((vector (%fp-inner vector)))
-         (if (and (consp vector) (fixnump (car vector)))
-             (let ((fp (car vector))
-                   (arr (cdr vector)))
-               (let ((len (array-length arr)))
-                 (if (>= fp len)
-                     nil
-                     (let ((store-val (if (and (stringp arr) (characterp new-element))
-                                          (char-code new-element)
-                                          new-element)))
-                       (aset arr fp store-val)
-                       (set-car vector (+ fp 1))
-                       fp))))
-             nil)))))
+     (let ((fp (%mda-fp vector)))
+       (cond
+         ((null fp) (%signal-type-error))
+         (t (let* ((arr (%mda-data vector))
+                   (off (%mda-offset vector))
+                   (dims (%mda-dims vector))
+                   (cap (if (consp dims) (car dims) (array-length arr))))
+              (if (>= fp cap)
+                  nil
+                  (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                       (char-code new-element)
+                                       new-element)))
+                    (aset arr (+ fp off) store-val)
+                    (%mda-set-fp vector (+ fp 1))
+                    fp)))))))
+    (t (let ((inner (%fp-inner vector)))
+         (cond
+           ((and (consp inner) (fixnump (car inner)))
+            (let ((fp (car inner))
+                  (arr (cdr inner)))
+              (let ((len (array-length arr)))
+                (if (>= fp len)
+                    nil
+                    (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                         (char-code new-element)
+                                         new-element)))
+                      (aset arr fp store-val)
+                      (set-car inner (+ fp 1))
+                      fp)))))
+           (t (%signal-type-error)))))))
 
 (defun vector-push-extend (new-element vector &rest args)
   "Push NEW-ELEMENT onto VECTOR, extending if needed.  Character on
    string-backed vector is char-code-converted (vector-push-extend test
    20914 was storing tagged character into the string array → garbage
-   on later aref)."
+   on later aref).
+   CLHS: signals type-error if VECTOR has no fill pointer.
+   For displaced+adjustable arrays: when fp reaches declared dim, the
+   displacement is broken — fresh local backing is allocated and the
+   old contents are copied verbatim, per CLHS adjust-array semantics."
   (cond
     ((%mda-p vector)
-     ;; MDA fast path: handles fp + auto-extend on the data slot.
-     (let ((fp (%mda-fp vector))
-           (arr (%mda-data vector)))
-       (when fp
-         (let ((len (array-length arr)))
-           (when (>= fp len)
-             ;; Extend: create new array, copy old, replace in MDA data slot.
-             (let ((new-len (max (* len 2) (+ fp 1)))
-                   (new-arr nil))
-               (if (stringp arr)
-                   (setq new-arr (%make-string-array new-len))
-                   (setq new-arr (make-array new-len)))
-               (let ((i 0))
-                 (loop
-                   (when (>= i len) (return))
-                   (aset new-arr i (aref arr i))
-                   (setq i (+ i 1))))
-               (%prim-aset vector 6 new-arr)   ; %mda-data slot
-               (setq arr new-arr)))
-           (let ((store-val (if (and (stringp arr) (characterp new-element))
-                                (char-code new-element)
-                                new-element)))
-             (aset arr fp store-val))
-           (%mda-set-fp vector (+ fp 1))
-           fp))))
-    (t (let ((vector (%fp-inner vector)))
-         (if (and (consp vector) (fixnump (car vector)))
-             (let ((fp (car vector))
-                   (arr (cdr vector)))
-               (let ((len (array-length arr)))
-                 (when (>= fp len)
-                   (let ((new-len (max (* len 2) (+ fp 1)))
+     ;; MDA fast path: handles fp + auto-extend; displacement aware.
+     (let ((fp (%mda-fp vector)))
+       (cond
+         ((null fp) (%signal-type-error))
+         (t (let* ((arr (%mda-data vector))
+                   (disp (%mda-displaced vector))
+                   (off (%mda-offset vector))
+                   ;; Declared length: dim 0 (1-D fast path).
+                   (dims (%mda-dims vector))
+                   (cap (if (consp dims) (car dims) (array-length arr))))
+              (when (>= fp cap)
+                ;; Need to grow.  Use extension hint (first &rest arg if given)
+                ;; as the MINIMUM number of additional elements per CLHS.
+                ;; Default to 1, fall back to cap (2× growth) when that's larger.
+                (let* ((hint (cond ((and (consp args) (integerp (car args)) (> (car args) 0)) (car args))
+                                   (t 1)))
+                       (new-cap (max (+ cap hint) (+ fp 1) (* cap 2)))
+                       (str-p (or (stringp arr)
+                                  (and disp (stringp disp))))
+                       (new-arr (if str-p
+                                    (%make-string-array new-cap)
+                                    (make-array new-cap))))
+                  ;; Copy old visible contents (0..cap from old aref-routing)
+                  ;; through the MDA's current view so displacement is honored.
+                  (let ((i 0))
+                    (loop
+                      (when (>= i cap) (return))
+                      (let ((v (cond
+                                 (disp (aref arr (+ off i)))
+                                 (t (aref arr i)))))
+                        (aset new-arr i v))
+                      (setq i (+ i 1))))
+                  ;; Update MDA: data ← new-arr, displaced ← nil, offset ← 0,
+                  ;; dims ← (new-cap).  Adjusting dims keeps array-total-size
+                  ;; honest after the grow.
+                  (%prim-aset vector 6 new-arr)
+                  (%prim-aset vector 3 nil)
+                  (%prim-aset vector 4 0)
+                  (%prim-aset vector 1 (list new-cap))
+                  (setq arr new-arr)
+                  (setq disp nil)
+                  (setq off 0)
+                  (setq cap new-cap)))
+              ;; Now write at (fp + off) in the underlying.
+              (let* ((target-arr arr)
+                     (target-idx (+ fp off))
+                     (store-val (if (and (stringp target-arr) (characterp new-element))
+                                    (char-code new-element)
+                                    new-element)))
+                (aset target-arr target-idx store-val))
+              (%mda-set-fp vector (+ fp 1))
+              fp)))))
+    (t (let ((inner (%fp-inner vector)))
+         (cond
+           ((and (consp inner) (fixnump (car inner)))
+            (let ((fp (car inner))
+                  (arr (cdr inner)))
+              (let ((len (array-length arr)))
+                (when (>= fp len)
+                  (let* ((hint (cond ((and (consp args) (integerp (car args)) (> (car args) 0)) (car args))
+                                     (t 1)))
+                         (new-len (max (+ len hint) (+ fp 1) (* len 2)))
                          (new-arr nil))
-                     (if (stringp arr)
-                         (setq new-arr (%make-string-array new-len))
-                         (setq new-arr (make-array new-len)))
-                     (let ((i 0))
-                       (loop
-                         (when (>= i len) (return))
-                         (aset new-arr i (aref arr i))
-                         (setq i (+ i 1))))
-                     (set-cdr vector new-arr)
-                     (setq arr new-arr)))
-                 (let ((store-val (if (and (stringp arr) (characterp new-element))
-                                      (char-code new-element)
-                                      new-element)))
-                   (aset arr fp store-val))
-                 (set-car vector (+ fp 1))
-                 fp))
-             nil)))))
+                    (if (stringp arr)
+                        (setq new-arr (%make-string-array new-len))
+                        (setq new-arr (make-array new-len)))
+                    (let ((i 0))
+                      (loop
+                        (when (>= i len) (return))
+                        (aset new-arr i (aref arr i))
+                        (setq i (+ i 1))))
+                    (set-cdr inner new-arr)
+                    (setq arr new-arr)))
+                (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                     (char-code new-element)
+                                     new-element)))
+                  (aset arr fp store-val))
+                (set-car inner (+ fp 1))
+                fp)))
+           (t (%signal-type-error)))))))
 
 (defun vector-pop (vector)
   "Pop an element from VECTOR (with fill pointer)."

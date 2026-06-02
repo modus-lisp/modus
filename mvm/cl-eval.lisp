@@ -2098,12 +2098,33 @@
           ((eq (car r) :equal) (%str-equal-length a args))
           (t nil))))
 
-(defun char-upcase (c) (let ((code (%ensure-char-code c)))
-  (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
+;;; CLHS 13.1.4 — char predicates require a CHARACTER argument and signal
+;;; TYPE-ERROR on any non-character.  ANSI char-type-error-check
+;;; (char-aux.lsp) tests this for each via funcall over *universe*.
+;;; Without the guard, %ensure-char-code on a fixnum falls through and
+;;; the predicate returns nil garbage rather than signaling — the .3/.4
+;;; type-error-check tests then fail.
+;;;
+;;; NOTE: char-downcase intentionally OMITS this guard.  Adding a
+;;; (characterp c) check inside char-downcase causes a cascade crash in
+;;; digit-char-p.3/.5 (whose .body uses char-downcase) under fork
+;;; isolation.  The crash is reproducible at fuzz=4, so it's NOT a
+;;; layout shift — likely an interaction between the extended
+;;; char-downcase body size and the digit-char-p.body chunk compilation
+;;; threshold.  Pending a deeper fix, accept char-downcase.4 as a fail
+;;; in exchange for the +5 wins from char-upcase/upper/lower/etc.
+(defun char-upcase (c)
+  (unless (characterp c) (%signal-type-error))
+  (let ((code (%ensure-char-code c)))
+    (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
 (defun char-downcase (c) (let ((code (%ensure-char-code c)))
   (code-char (if (and (>= code 65) (<= code 90)) (+ code 32) code))))
-(defun upper-case-p (c) (let ((code (%ensure-char-code c))) (if (>= code 65) (<= code 90) nil)))
-(defun lower-case-p (c) (let ((code (%ensure-char-code c))) (if (>= code 97) (<= code 122) nil)))
+(defun upper-case-p (c)
+  (unless (characterp c) (%signal-type-error))
+  (let ((code (%ensure-char-code c))) (if (>= code 65) (<= code 90) nil)))
+(defun lower-case-p (c)
+  (unless (characterp c) (%signal-type-error))
+  (let ((code (%ensure-char-code c))) (if (>= code 97) (<= code 122) nil)))
 (defun both-case-p (c) (if (upper-case-p c) t (lower-case-p c)))
 (defun alpha-char-p (c) (both-case-p c))
 (defun digit-char-p (c &optional (radix 10))
@@ -2113,8 +2134,15 @@
           ((and (>= code 97) (<= code 122)) (let ((v (+ 10 (- code 97)))) (if (< v radix) v nil)))
           (t nil))))
 (defun alphanumericp (c) (or (alpha-char-p c) (digit-char-p c)))
-(defun graphic-char-p (c) (let ((code (%ensure-char-code c))) (and (>= code 32) (<= code 126))))
-(defun standard-char-p (c) (graphic-char-p c))
+(defun graphic-char-p (c)
+  (unless (characterp c) (%signal-type-error))
+  (let ((code (%ensure-char-code c))) (and (>= code 32) (<= code 126))))
+;;; CLHS standard-char-p: true for #\Newline and #\Space..#\~.  Newline
+;;; (code 10) is explicitly standard even though it's not "graphic".
+(defun standard-char-p (c)
+  (unless (characterp c) (%signal-type-error))
+  (let ((code (%ensure-char-code c)))
+    (if (= code 10) t (and (>= code 32) (<= code 126)))))
 (defun digit-char (weight &optional (radix 10))
   (if (< weight radix) (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight))) nil))
 (defun name-char (name)
@@ -2141,7 +2169,9 @@
       (t nil))))
 
 (defun char-name (c)
-  "Return the name of the character, or nil."
+  "Return the name of the character, or nil.  Signals TYPE-ERROR on
+   non-character per CLHS — required by char-name.5 (char-type-error-check)."
+  (unless (characterp c) (%signal-type-error))
   (let ((code (%ensure-char-code c)))
     (cond
       ((= code 32)  "Space")
@@ -2322,7 +2352,18 @@
       (when (eq (car cur) k) (return t))
       (setq cur (cdr cur)))))
 
-(defun char-int (c) (char-code c))
+;;; CLHS: char-int / char-code / char-name require a CHARACTER; signal
+;;; TYPE-ERROR on non-character input.  ANSI char-type-error-check
+;;; (char-aux.lsp) tests this via funcall on every non-char in *universe*.
+;;; Without the guard, char-code on a non-char SARs garbage and returns
+;;; a fixnum, so catch-type-error never trips and the .3/.4/.5 tests fail.
+(defun char-int (c)
+  (if (characterp c) (char-code c) (progn (%signal-type-error) 0)))
+;;; char-code defun: provides a callable for #'char-code (the inline form
+;;; intercepted in compile-compound-form has no fn-addr).  Body's
+;;; (char-code c) gets inlined by the compiler — no recursion.
+(defun char-code (c)
+  (if (characterp c) (char-code c) (progn (%signal-type-error) 0)))
 (defun code-char (n) (if (characterp n) n (code-char n)))
 
 ;;; Numeric

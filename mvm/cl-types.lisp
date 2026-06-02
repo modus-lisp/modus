@@ -2058,7 +2058,17 @@
          ((%typename-eq tn 'simple-base-string) (stringp obj))
          ((%typename-eq tn 'character) (characterp obj))
          ((%typename-eq tn 'base-char) (characterp obj))
-         ((%typename-eq tn 'standard-char) (characterp obj))
+         ;; CLHS: extended-char is disjoint from base-char.  Modus only
+         ;; has base characters, so this is always NIL.  extended-char.3
+         ;; verifies the disjointness.
+         ((%typename-eq tn 'extended-char) nil)
+         ;; CLHS: standard-char = #\Newline + #\Space..#\~ — narrower than
+         ;; character.  standard-char.5.body collects (typep c 'standard-char)
+         ;; where (standard-char-p c) is nil and expects empty list.
+         ((%typename-eq tn 'standard-char)
+          (and (characterp obj)
+               (let ((cc (char-code obj)))
+                 (if (= cc 10) t (and (>= cc 32) (<= cc 126))))))
          ((%typename-eq tn 'atom) (not (consp obj)))
          ((%typename-eq tn 't) t)
          ((%typename-eq tn 'nil) nil)

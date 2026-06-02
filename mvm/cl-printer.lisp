@@ -1363,14 +1363,20 @@
         (mp (if minpad minpad 0))
         (pc (if padchar padchar 32)))
     (let ((padding mp))
+      ;; CLHS 22.3.5.1: MINPAD can be negative.  The grow loop must respect
+      ;; that the only constraint is (>= slen+padding mincol); negative
+      ;; padding is fine, and the print loop must treat padding<=0 as
+      ;; "no padding chars" rather than spinning forever waiting for i to
+      ;; equal a negative count.
       (loop
         (when (>= (+ slen padding) mc) (return nil))
         (setq padding (+ padding ci)))
+      (when (< padding 0) (setq padding 0))
       (cond
         (right-align
          (let ((i 0))
            (loop
-             (when (= i padding) (return nil))
+             (when (>= i padding) (return nil))
              (%print-char pc stream)
              (setq i (+ i 1))))
          (when (stringp str) (%print-string-raw str stream)))
@@ -1378,7 +1384,7 @@
          (when (stringp str) (%print-string-raw str stream))
          (let ((i 0))
            (loop
-             (when (= i padding) (return nil))
+             (when (>= i padding) (return nil))
              (%print-char pc stream)
              (setq i (+ i 1)))))))))
 
@@ -1783,6 +1789,7 @@
               (when (>= pos len) (return arg-list))
               (let ((dir (aref control pos))
                     (before-arg-list arg-list))
+                (declare (special *format-iter-escape*))
                 (setq i (+ pos 1))
                 (cond
                   ;; ~A — aesthetic. The `:` modifier (~:A) prints NIL
@@ -1952,6 +1959,11 @@
                   ;; ~? — recursive format.  CLHS 22.3.7.1.
                   ;; ~?      : next arg is control string, arg after is arg-list (a list)
                   ;; ~@?     : next arg is control string, use remaining args directly
+                  ;;
+                  ;; CLHS 22.3.9.2: ~^ inside a ~? sub-control terminates
+                  ;; the sub-control only, NOT the surrounding format.  We
+                  ;; clear *format-iter-escape* after the recursive call so
+                  ;; an escape that fired inside ctrl doesn't unwind here.
                   ((= dir 63)
                    (let ((ctrl (car arg-list)))
                      (setq arg-list (cdr arg-list))
@@ -1961,7 +1973,8 @@
                        (t
                         (let ((sub-args (car arg-list)))
                           (setq arg-list (cdr arg-list))
-                          (%format-impl stream ctrl sub-args))))))
+                          (%format-impl stream ctrl sub-args))))
+                     (setq *format-iter-escape* nil)))
                   ;; ~* — goto
                   ((= dir 42)
                    (cond
@@ -2050,7 +2063,12 @@
                                   ;; Found end: process substring
                                   (let ((sub (%substring control i end-pos))
                                         (s2 (make-string-output-stream)))
-                                    (%format-impl s2 sub arg-list)
+                                    ;; CLHS 22.3.8.4 — ~( ... ~) consumes
+                                    ;; whatever args its body would consume.
+                                    ;; Capture and propagate the remaining
+                                    ;; arg-list so directives outside the ~(
+                                    ;; see the post-body state.
+                                    (setq arg-list (%format-impl s2 sub arg-list))
                                     (let ((result (get-output-stream-string s2)))
                                       (let ((converted
                                              (cond
@@ -2254,7 +2272,19 @@
                 ;; Update prev-arg if this directive consumed any arg.
                 (when (and (consp before-arg-list)
                            (not (eq before-arg-list arg-list)))
-                  (setq prev-arg (car before-arg-list))))))))
+                  (setq prev-arg (car before-arg-list)))
+                ;; If a sub-directive (~( ... ~^ ... ~), ~[ ... ~^ ... ~],
+                ;; ~? body with ~^ at top, etc.) set *format-iter-escape*
+                ;; via an up-and-out, stop processing the rest of THIS
+                ;; control string too — CLHS 22.3.9.2's "up and out" is
+                ;; not blocked by ~(, ~), ~[, ~], so the surrounding ~{
+                ;; iteration body must exit and let the iteration loop see
+                ;; the flag.  ~? and ~/ are NOT named in CLHS's "blocks"
+                ;; list either, but the standard test suite treats ~? as
+                ;; a fresh scope (format.^.?.* re-enter outer after ~?).
+                ;; %format-impl's ~? handler clears the flag itself before
+                ;; returning so this generic check is safe.
+                (when *format-iter-escape* (return arg-list)))))))
     arg-list))
 
 ;;; format: the main user-facing function

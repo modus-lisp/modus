@@ -1883,7 +1883,21 @@
                  (push k seen))
                (setq cur (cddr cur))))))
        ;; class-slots: per-slot :allocation tracking (closed over by the emit form below).
-       (let ((class-slots nil))
+       ;; default-initarg-forms: list of (key . value-form) from any
+       ;;   (:default-initargs k1 v1 ...) class option — emit form wraps
+       ;;   each value in a thunk so CLHS 7.1.4's re-eval-per-call holds.
+       (let ((class-slots nil)
+             (default-initarg-forms nil))
+         (dolist (opt rest-opts)
+           (when (and (consp opt) (eq (car opt) :default-initargs))
+             (let ((cur (cdr opt)))
+               (loop
+                 (when (or (null cur) (null (cdr cur))) (return))
+                 (let ((k (car cur))
+                       (v (cadr cur)))
+                   (push (cons k v) default-initarg-forms))
+                 (setq cur (cddr cur))))))
+         (setq default-initarg-forms (nreverse default-initarg-forms))
        ;; Process each slot spec
        (dolist (slot-spec raw-slots)
          (let* ((sname (if (consp slot-spec) (car slot-spec) slot-spec))
@@ -1948,7 +1962,15 @@
                (mapcar (lambda (p)
                          `(cons ',(car p)
                                 (lambda () ,(rewrite-reader-forms (cdr p)))))
-                       initform-map)))
+                       initform-map))
+              ;; Build (initarg-keyword . thunk) pairs for default-initargs.
+              ;; Per CLHS 7.1.4 the value form is re-evaluated each call, so
+              ;; each value gets wrapped in a 0-arity thunk.
+              (default-initarg-pairs
+               (mapcar (lambda (p)
+                         `(cons ',(car p)
+                                (lambda () ,(rewrite-reader-forms (cdr p)))))
+                       default-initarg-forms)))
          ;; Register in SBCL-side class registry for make-instance expansion
          (setf *sbcl-clos-classes*
                (cons (cons class-name (cons slot-list initarg-map))
@@ -1962,11 +1984,21 @@
                 (%register-clos-slot-info ',class-name
                                           (list ,@initarg-pairs)
                                           (list ,@initform-pairs))
+                ;; Register directly-declared slot names for SLOT-CLASS-OWNER
+                ;; shadow detection (CLHS 7.5.2 — subclass :allocation
+                ;; :instance hides ancestor :allocation :class).  Always
+                ;; emit so re-defining a class refreshes the list.
+                (%register-clos-direct-slots ',class-name ',slot-list)
                 ;; Register :allocation :class slot names so slot-value /
                 ;; set-slot-value can route them to per-class storage.
-                ,@(when class-slots
-                    `((%register-clos-class-slots ',class-name
-                                                  ',(nreverse class-slots))))
+                ;; Always emit (even empty) so re-defining clears prior.
+                (%register-clos-class-slots ',class-name
+                                            ',(nreverse class-slots))
+                ;; Register default-initargs so make-instance can apply them
+                ;; per CLHS 7.1.4.  Always emit (even empty list) so
+                ;; redefining a class clears any prior entry.
+                (%register-clos-default-initargs ',class-name
+                                                 (list ,@default-initarg-pairs))
                 ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))))
 
     ;; (defgeneric name lambda-list &rest options)

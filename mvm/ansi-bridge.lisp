@@ -2534,7 +2534,13 @@
   "ARGS is (instance slot-names &rest initargs) as a list.  Apply the
    initargs and initforms directly, bypassing the &rest re-pack path
    that loses trailing args.  Mirrors %shared-initialize-default's
-   semantics."
+   semantics.
+
+   Per CLHS 7.1.2, MAKE-INSTANCE produces a 'defaulted initialization
+   argument list' = the explicit initargs PLUS any default-initargs whose
+   keys aren't already supplied.  Default-initarg thunks are eval'd here
+   (CLHS 7.1.4 requires re-evaluation per call).  Default-initargs that
+   map to slots also suppress those slots' :initform (per CLHS 7.1.4)."
   (when (or (null args) (null (cdr args)))
     (return-from %shared-init-default-spread nil))
   (let* ((instance   (car args))
@@ -2546,9 +2552,30 @@
            (cls        (%find-clos-class class-name)))
       (when (null cls)
         (return-from %shared-init-default-spread instance))
+      ;; Step 1: apply explicit initargs (leftmost wins).
       (let ((set-slots (%shared-init-apply-initargs
                         instance class-name initargs nil)))
-        ;; Apply initforms for slots in slot-names that are still unbound.
+        ;; Step 2: walk default-initargs for the class (CPL-merged, most-
+        ;; specific first).  For each key NOT explicitly supplied in
+        ;; initargs, eval the thunk and apply it.  Default-initargs whose
+        ;; key maps to a slot suppress that slot's :initform via the
+        ;; set-slots accumulator.
+        (let ((di-entries (%clos-default-initargs-for-class class-name)))
+          (let ((cur di-entries))
+            (loop
+              (when (null cur) (return nil))
+              (let* ((entry (car cur))
+                     (k (car entry))
+                     (thunk (cdr entry))
+                     (explicit-supplied (%initargs-has-key-p initargs k)))
+                (unless explicit-supplied
+                  (let ((val (funcall thunk)))
+                    (let ((slot-nm (%clos-initarg-to-slot class-name k)))
+                      (when (and slot-nm (null (member slot-nm set-slots :test #'eq)))
+                        (set-slot-value instance slot-nm val)
+                        (setq set-slots (cons slot-nm set-slots)))))))
+              (setq cur (cdr cur)))))
+        ;; Step 3: apply initforms for slots in slot-names still unbound.
         (let ((sn (aref cls 2)) (idx 0))
           (loop
             (when (null sn) (return nil))
@@ -2571,6 +2598,28 @@
             (setq idx (+ idx 1))
             (setq sn (cdr sn))))
         instance))))
+
+(defun %initargs-has-key-p (initargs key)
+  "True iff INITARGS plist contains KEY.  Uses %clos-initarg-key-equal
+   so the cl-symbol and native-MVM-symbol shapes for :foo both compare
+   correctly (cross-file identity has historical fragility)."
+  (let ((cur initargs))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return nil))
+      (when (%clos-initarg-key-equal (car cur) key) (return t))
+      (setq cur (cdr (cdr cur))))))
+
+(defun %clos-initarg-key-equal (a b)
+  "Compare two initarg keys (keyword/symbols) per the same rules used
+   internally by %clos-initarg-lookup-1.  Robust against native-MVM
+   vs CL-symbol identity drift on the same name."
+  (cond
+    ((eq a b) t)
+    ((and (%native-mvm-sym-p a) (%native-mvm-sym-p b))
+     (= (%native-mvm-sym-hash a) (%native-mvm-sym-hash b)))
+    ((and (%cl-sym-p a) (%cl-sym-p b))
+     (string-equal (%cl-sym-name a) (%cl-sym-name b)))
+    (t nil)))
 
 (defun shared-initialize (&rest %sh-args)
   "SHARED-INITIALIZE generic function entry.  Falls through to

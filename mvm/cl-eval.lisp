@@ -961,9 +961,15 @@
               (body (cdr rest2)))
          ;; Build specializers list: T for plain var, class-name for (var class),
          ;; (eql VAL) for (var (eql expr)) — VAL is evaluated NOW in env.
+         ;; in-tail-section tracks whether we've passed &optional/&rest/&key/
+         ;; &aux — past that point, params are preserved as-is (e.g.
+         ;; (z :missing z-p) keeps the supplied-p binding) and NO
+         ;; specializer is added (CLHS 7.6.4 — specializers only on
+         ;; required positionals).
          (let ((specs nil)
                (params nil)
-               (cur sll))
+               (cur sll)
+               (in-tail-section nil))
            (loop
              (when (null cur) (return nil))
              (let ((p (car cur)))
@@ -975,9 +981,10 @@
                            (%eval-sym-eq p "&KEY")
                            (%eval-sym-eq p "&AUX")
                            (%eval-sym-eq p "&ALLOW-OTHER-KEYS")))
-                  ;; Keep collecting params (no specializer added) until end of sll.
-                  ;; Emit param keyword as a symbol in the params list so the
-                  ;; lambda we build below preserves it.
+                  (setq in-tail-section t)
+                  (setq params (cons p params)))
+                 (in-tail-section
+                  ;; After &optional/&key/&aux — preserve full param form.
                   (setq params (cons p params)))
                  ((consp p)
                   (let ((var (car p))
@@ -1004,20 +1011,32 @@
                      (m-shape   (%lambda-list-shape params)))
                  (unless (%method-ll-congruent-p gf-shape (length specs) m-shape)
                    (%signal-program-error)))))
-           ;; Build the method body as an interp-closure that captures env.
-           (let ((fn (list '%interp-closure params body env)))
-             ;; Ensure gf exists with a runtime stub installed under gf-name.
-             (when (null (%find-gf gf-name))
-               (%defgeneric gf-name nil nil))
-             (let ((fname (cond ((%cl-sym-p gf-name) (%cl-sym-name gf-name))
-                                ((stringp gf-name) gf-name)
-                                (t nil))))
-               (when fname
-                 (let ((existing (gethash fname *symbol-function-table*)))
-                   (when (null existing)
-                     (set-symbol-function gf-name (%make-gf-stub gf-name))))))
-             ;; Add the method to the gf and return it.
-             (%defmethod gf-name qualifier specs fn)))))
+           ;; CLHS 7.6.5: method body is implicitly enclosed in a block
+           ;; whose name is the generic function name (or, for (setf X)
+           ;; gf-names, the symbol X — block names can't be lists).
+           (let* ((block-name (cond ((symbolp gf-name) gf-name)
+                                    ((and (consp gf-name)
+                                          (consp (cdr gf-name))
+                                          (symbolp (cadr gf-name)))
+                                     (cadr gf-name))
+                                    (t nil)))
+                  (wrapped-body (if block-name
+                                    (list (cons 'block (cons block-name body)))
+                                    body)))
+             ;; Build the method body as an interp-closure that captures env.
+             (let ((fn (list '%interp-closure params wrapped-body env)))
+               ;; Ensure gf exists with a runtime stub installed under gf-name.
+               (when (null (%find-gf gf-name))
+                 (%defgeneric gf-name nil nil))
+               (let ((fname (cond ((%cl-sym-p gf-name) (%cl-sym-name gf-name))
+                                  ((stringp gf-name) gf-name)
+                                  (t nil))))
+                 (when fname
+                   (let ((existing (gethash fname *symbol-function-table*)))
+                     (when (null existing)
+                       (set-symbol-function gf-name (%make-gf-stub gf-name))))))
+               ;; Add the method to the gf and return it.
+               (%defmethod gf-name qualifier specs fn))))))
       ;; (defgeneric name lambda-list &rest options)
       ;; Options handled: :method-combination, :method (inline)
       ((%eval-sym-eq op "DEFGENERIC")
@@ -1055,50 +1074,86 @@
          ;; subtag #x52 dispatch.
          (symbol-function gf-name)))
       ;; (defclass name supers slot-specs &rest options)
+      ;; Per-slot options handled: :reader, :writer, :accessor, :initarg,
+      ;; :initform, :allocation.  Class-level options handled:
+      ;; (:default-initargs k1 v1 ...).  Match against the BARE name
+      ;; (no leading colon) because Modus's symbol-name strips the
+      ;; leading colon from keywords — same convention as the defgeneric
+      ;; handler's "METHOD-COMBINATION" match.
       ((%eval-sym-eq op "DEFCLASS")
        (let* ((class-name (car args))
               (supers (cadr args))
               (slot-specs (caddr args))
+              (rest-opts (cdddr args))
               (slot-names nil)
               (initarg-pairs nil)
-              (initform-pairs nil))
+              (initform-pairs nil)
+              (default-initarg-pairs nil)
+              (class-allocated-slots nil))
          (dolist (spec slot-specs)
            (let* ((sname (if (consp spec) (car spec) spec))
                   (opts (if (consp spec) (cdr spec) nil)))
              (setq slot-names (cons sname slot-names))
-             ;; Walk options: :reader/:writer/:accessor/:initarg/:initform
              (let ((cur opts))
                (loop
                  (when (null cur) (return nil))
                  (let ((key (car cur)) (val (cadr cur)))
                    (cond
-                     ((and (symbolp key) (%eval-sym-eq key ":READER"))
+                     ((and (symbolp key) (%eval-sym-eq key "ALLOCATION"))
+                      (when (and (symbolp val) (%eval-sym-eq val "CLASS"))
+                        (setq class-allocated-slots
+                              (cons sname class-allocated-slots))))
+                     ((and (symbolp key) (%eval-sym-eq key "READER"))
                       (let ((slot sname))
                         (set-symbol-function val
                                              (lambda (obj) (slot-value obj slot)))))
-                     ((and (symbolp key) (%eval-sym-eq key ":ACCESSOR"))
+                     ((and (symbolp key) (%eval-sym-eq key "ACCESSOR"))
                       (let ((slot sname))
                         (set-symbol-function val
-                                             (lambda (obj) (slot-value obj slot)))))
-                     ((and (symbolp key) (%eval-sym-eq key ":WRITER"))
+                                             (lambda (obj) (slot-value obj slot)))
+                        (let ((set-name
+                               (intern (concatenate 'string "SET-"
+                                                    (symbol-name val)))))
+                          (set-symbol-function set-name
+                                               (lambda (obj nv)
+                                                 (set-slot-value obj slot nv))))))
+                     ((and (symbolp key) (%eval-sym-eq key "WRITER"))
                       (let ((slot sname))
                         (set-symbol-function val
                                              (lambda (nv obj) (set-slot-value obj slot nv)))))
-                     ((and (symbolp key) (%eval-sym-eq key ":INITARG"))
+                     ((and (symbolp key) (%eval-sym-eq key "INITARG"))
                       (setq initarg-pairs (cons (cons val sname) initarg-pairs)))
-                     ((and (symbolp key) (%eval-sym-eq key ":INITFORM"))
-                      ;; Wrap the initform in a thunk that evals later in this env
+                     ((and (symbolp key) (%eval-sym-eq key "INITFORM"))
                       (let ((form val) (thunk-env env))
                         (setq initform-pairs
                               (cons (cons sname
                                           (lambda () (%eval-in-env form thunk-env)))
                                     initform-pairs))))))
                  (setq cur (cddr cur))))))
+         ;; Walk class-level (:default-initargs k1 v1 ...) per CLHS 7.1.4.
+         (dolist (opt rest-opts)
+           (when (and (consp opt) (symbolp (car opt))
+                      (%eval-sym-eq (car opt) "DEFAULT-INITARGS"))
+             (let ((cur (cdr opt)))
+               (loop
+                 (when (or (null cur) (null (cdr cur))) (return nil))
+                 (let ((dk (car cur))
+                       (dv (cadr cur)))
+                   (let ((form dv) (thunk-env env))
+                     (setq default-initarg-pairs
+                           (cons (cons dk
+                                       (lambda () (%eval-in-env form thunk-env)))
+                                 default-initarg-pairs))))
+                 (setq cur (cddr cur))))))
          (setq slot-names (nreverse slot-names))
          (%defclass class-name slot-names supers)
          (%register-clos-slot-info class-name
                                    (nreverse initarg-pairs)
                                    (nreverse initform-pairs))
+         (%register-clos-direct-slots class-name slot-names)
+         (%register-clos-class-slots class-name (nreverse class-allocated-slots))
+         (%register-clos-default-initargs class-name
+                                          (nreverse default-initarg-pairs))
          ;; CLHS 7.7: defclass returns the class object, not the name.
          ;; find-class.15 etc. rely on (eq (eval `(defclass …)) (find-class …)).
          (find-class class-name)))

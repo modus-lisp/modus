@@ -1225,7 +1225,10 @@
     (t (%print-string-raw last-word stream) (%print-string-raw "th" stream))))
 
 (defun %format-ordinal (n stream)
-  "Print N as English ordinal."
+  "Print N as English ordinal.
+   We split the cardinal form on the LAST space OR hyphen and feed
+   the trailing word into %ordinal-suffix, so e.g. \"twenty-one\" →
+   \"twenty-first\" and \"one hundred\" → \"one hundredth\"."
   (cond
     ((< n 0)
      (%print-string-raw "negative " stream)
@@ -1236,15 +1239,17 @@
      (let ((s (make-string-output-stream)))
        (%format-cardinal n s)
        (let ((cardinal (get-output-stream-string s)))
-         (let ((last-space -1) (i 0) (len (array-length cardinal)))
+         (let ((last-sep -1) (i 0) (len (array-length cardinal)))
            (loop
              (when (= i len) (return nil))
-             (when (= (aref cardinal i) 32) (setq last-space i))
+             (let ((c (aref cardinal i)))
+               (when (or (= c 32) (= c 45))    ; space or hyphen
+                 (setq last-sep i)))
              (setq i (+ i 1)))
-           (let ((prefix (if (= last-space -1) ""
-                             (%substring cardinal 0 (+ last-space 1))))
-                 (last-word (if (= last-space -1) cardinal
-                                (%substring cardinal (+ last-space 1) len))))
+           (let ((prefix (if (= last-sep -1) ""
+                             (%substring cardinal 0 (+ last-sep 1))))
+                 (last-word (if (= last-sep -1) cardinal
+                                (%substring cardinal (+ last-sep 1) len))))
              (%print-string-raw prefix stream)
              (%ordinal-suffix last-word stream))))))))
 
@@ -1910,14 +1915,23 @@
                        (when (= j count) (return nil))
                        (%print-char 10 stream)
                        (setq j (+ j 1)))))
-                  ;; ~& — fresh-line.  ~N& prints N newlines (N=0 prints none).
-                  ;; Without a prefix param, defaults to 1.
+                  ;; ~& — fresh-line.  CLHS 22.3.1.3:
+                  ;;   ~&    writes a newline iff not at the start of a line.
+                  ;;   ~N&   does ~& once, then writes (N-1) additional newlines.
+                  ;;         If N=0, writes nothing at all.
+                  ;; So at start-of-line, ~N& prints (N-1) newlines; otherwise N.
                   ((= dir 38)
-                   (let ((count (if param1 param1 1)) (j 0))
-                     (loop
-                       (when (>= j count) (return nil))
-                       (%print-char 10 stream)
-                       (setq j (+ j 1)))))
+                   (let ((count (if param1 param1 1)))
+                     (when (> count 0)
+                       ;; Fresh-line step first — only newline if not at BOL.
+                       (unless (%stream-at-bol-p stream)
+                         (%print-char 10 stream))
+                       ;; Then (count-1) further newlines.
+                       (let ((j 1))
+                         (loop
+                           (when (>= j count) (return nil))
+                           (%print-char 10 stream)
+                           (setq j (+ j 1)))))))
                   ;; ~~ — tilde
                   ((= dir 126)
                    (let ((count (if param1 param1 1)) (j 0))

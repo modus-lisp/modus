@@ -519,10 +519,20 @@
     result))
 
 (defun find-restart (name &optional condition)
-  "Find restart by name."
+  "Find restart by name.  Per CLHS find-restart, NAME may be a symbol,
+   string, or an existing restart object — for the latter, return it if
+   it is currently active, NIL otherwise."
   ;; NOTE: return-from in MVM only exits the innermost loop (treated as return).
   ;; Use a result variable and nested flag to exit properly.
-  (let ((found nil))
+  (declare (ignore condition))
+  (let ((found nil)
+        ;; Detect "name is itself a restart object".  Restart objects are
+        ;; structured as conses present on *restart-stack* — we treat any
+        ;; cons whose cadr is a function as a candidate for the
+        ;; "find-restart of a restart returns itself if active" branch.
+        ;; ANSI restart-bind.8 / compute-restarts.3 rely on this.
+        (name-is-restart
+         (and (consp name) (consp (cdr name)) (functionp (cadr name)))))
     (let ((frames *restart-stack*))
       (loop
         (when (or found (null frames)) (return nil))
@@ -531,11 +541,13 @@
             (loop
               (when (or found (null rs)) (return nil))
               (let ((r (car rs)))
-                (when (if (stringp name)
-                          (string-equal (if (stringp (car r)) (car r)
-                                            (if (%cl-sym-p (car r)) (%cl-sym-name (car r))
-                                                "")) name)
-                          (eq (car r) name))
+                (when (cond
+                        (name-is-restart (eq r name))
+                        ((stringp name)
+                         (string-equal (if (stringp (car r)) (car r)
+                                           (if (%cl-sym-p (car r)) (%cl-sym-name (car r))
+                                               "")) name))
+                        (t (eq (car r) name)))
                   (setq found r)))
               (setq rs (cdr rs)))))
         (setq frames (cdr frames))))
@@ -544,6 +556,25 @@
 (defun restart-name (restart)
   "Get the name of a restart."
   (if (consp restart) (car restart) nil))
+
+(defun %active-restart-p (obj)
+  "Return T if OBJ is an active restart structure — i.e. a cons currently
+   present on *restart-stack*.  Used by typep to identify the RESTART type.
+   ANSI compute-restarts.1/2 and restart-bind.8 do (typep r 'restart) on
+   freshly-collected restart objects, so we just check eq-identity with
+   any element of any frame."
+  (and (consp obj)
+       (let ((found nil) (frames *restart-stack*))
+         (loop
+           (when (or found (null frames)) (return found))
+           (let ((frame (car frames)))
+             (let ((rs frame))
+               (loop
+                 (when (or found (null rs)) (return found))
+                 (when (eq (car rs) obj) (setq found t))
+                 (setq rs (cdr rs)))))
+           (setq frames (cdr frames)))
+         found)))
 
 ;; INVOKE-RESTART early version dropped 2026-06-01 (redefinition
 ;; audit) — the canonical definition lives at L677 and wires the
@@ -562,18 +593,69 @@
 ;;; Non-unwinding handlers run in the dynamic context of the signal.
 ;;; Uses setjmp/longjmp for escape to outer blocks.
 
+;; *handler-bind-effective-skip* — count of handler-bind frames at the TOP
+;; of *handler-bind-stack* that should be SKIPPED on the next signal walk.
+;; Per CLHS 9.1.4.1: "if a handler accepts control... handlers that have
+;; been considered for the active condition are not considered when
+;; further signaling occurs during the dynamic extent of the handler".
+;;
+;; When a handler in frame K is invoked, all handlers in frames 0..K
+;; (most-recently-pushed end) are "considered" — they become invisible
+;; during the handler's body.  We approximate this by recording the
+;; frame index from which the active handler came, and skipping that
+;; many leading frames on subsequent %signal-condition calls during
+;; the body's dynamic extent.
+;;
+;; Tests: handler-bind.6, restart-case.25..31.  Without this:
+;; re-signaling the SAME or even a DIFFERENT condition from inside a
+;; handler re-invokes that handler -> infinite recursion (or wrong
+;; choice).
+(defvar *handler-bind-effective-skip* 0)
+
 (defun %signal-condition (cond-obj)
   "Walk the handler-bind stack and call matching handlers.
-   Returns T if a handler took control (threw/returned-from), NIL if none matched."
-  (let ((type-name (%condition-type-name cond-obj)))
-    (dolist (frame *handler-bind-stack*)
-      (dolist (handler frame)
-        (let ((htype (car handler))
-              (hfn (cadr handler)))
-          (when (%type-matches-condition-p htype cond-obj)
-            ;; Call the handler — if it returns normally, continue
-            ;; If it does a non-local exit (throw/return-from), we unwind
-            (funcall hfn cond-obj)))))
+   Returns NIL after all matching handlers return — caller (error/signal)
+   then longjmps if a handler-case is active.  If a handler does a
+   non-local exit, this function never returns.
+
+   Per CLHS, handlers that were considered before this handler are
+   inhibited during its body; we implement this by skipping the first
+   *handler-bind-effective-skip* frames of *handler-bind-stack*."
+  (let ((type-name (%condition-type-name cond-obj))
+        (cur *handler-bind-stack*)
+        (frame-idx 0)
+        (skip *handler-bind-effective-skip*))
+    (declare (ignore type-name))
+    ;; Skip the inhibited leading frames.
+    (loop
+      (when (or (null cur) (>= frame-idx skip)) (return nil))
+      (setq cur (cdr cur))
+      (setq frame-idx (+ frame-idx 1)))
+    ;; Walk remaining frames; for each, walk handlers and invoke matches.
+    (loop
+      (when (null cur) (return nil))
+      (let ((frame (car cur)))
+        (dolist (handler frame)
+          (let ((htype (car handler))
+                (hfn (cadr handler)))
+            (when (%type-matches-condition-p htype cond-obj)
+              ;; Bump the skip count to (frame-idx + 1) so handlers in
+              ;; THIS and inner frames are inhibited during the handler's
+              ;; body.  Restore on normal return so a later handler in
+              ;; the same loop sees the right scope.
+              (let ((saved *handler-bind-effective-skip*))
+                (setq *handler-bind-effective-skip* (+ frame-idx 1))
+                (let ((rv (funcall hfn cond-obj)))
+                  (declare (ignore rv))
+                  ;; Handler returned normally.  Per CLHS, after a handler
+                  ;; returns normally, the search "considers the next
+                  ;; applicable handler"; that's the next handler in this
+                  ;; frame, or one in an outer frame.  We do NOT lower
+                  ;; *handler-bind-effective-skip* past this frame, so the
+                  ;; just-invoked handler stays inhibited.
+                  (setq *handler-bind-effective-skip* saved)))))))
+      (setq cur (cdr cur))
+      (setq frame-idx (+ frame-idx 1)))
     nil))
 
 (defun %type-matches-condition-p (type-spec cond-obj)
@@ -1169,6 +1251,12 @@
          ((eq tn 'hash-table)    (hash-table-p obj))
          ((eq tn 'condition) (%condition-p obj))
          ((eq tn 'standard-object) (%clos-instance-p obj))
+         ;; Restart type: active restart frame element on *restart-stack*.
+         ;; The CL spec doesn't pin a representation; we treat anything
+         ;; currently bound as a restart (its identity is on the stack)
+         ;; as a (typep r 'restart) match.  compute-restarts.1/2,
+         ;; restart-bind.8 rely on this.
+         ((eq tn 'restart) (%active-restart-p obj))
          ;; Check if it's a condition type name
          (t (cond
               ((%cond-reg-find tn) (%condition-typep obj tn))

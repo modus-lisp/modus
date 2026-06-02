@@ -163,8 +163,30 @@
 
 (defun %pkg-string-designator (x)
   "Coerce a string designator to a string.
-   String -> string, character -> 1-char string, symbol -> symbol-name,
-   CL symbol -> name string."
+
+   Handles:
+     - string -> the string itself
+     - character -> 1-char string
+     - CL-symbol (3-slot #x50 with name slot) -> name string
+     - native MVM symbol (1-slot #x50, hash-only) -> symbol-name lookup
+       through *sym-name-table* / package symtabs
+     - native MVM keyword (#x53, hash-only) -> same lookup
+     - wrapper array (fill-pointer / displaced over string) -> materialize
+     - anything else -> empty string \"\"
+
+   The native-sym and keyword paths matter for the ANSI defpackage and
+   make-package suites: `'(\"H\" #:|H| #\\H)` in a test body becomes,
+   after Modus compile-quote interns the symbol, a list whose middle
+   element is a 1-slot native MVM sym (uninterned #:|H| collapses to
+   the interned 'H since hash-keyed intern can't distinguish them).
+   Similarly, options like `(:shadow ,s)` where `s` evaluates to a
+   keyword (`:|f|`) hand us a #x53 native object.  Without dispatching
+   on those subtags here, the designator collapses to \"\" and every
+   downstream intern / shadow / find-symbol lookup uses the empty
+   string as a name — which silently constructs broken symbols and
+   makes (equal (symbol-name sym) \"f\") fail.
+
+   Uses obj-subtag guards mirroring SYMBOL-NAME's predicate."
   (cond
     ((stringp x) x)
     ((characterp x)
@@ -172,9 +194,18 @@
        (aset s 0 (char-code x))
        s))
     ((%cl-sym-p x) (%cl-sym-name x))
-    ;; For wrapper arrays (fill-pointer / displaced)
+    ;; Native MVM sym (#x50) or keyword (#x53), 1-slot hash-only.
+    ;; Defer to SYMBOL-NAME which knows how to reverse-lookup the hash
+    ;; through *sym-name-table* and the package symtabs.
+    ((and (not (null x)) (not (eq x t)) (not (consp x))
+          (not (integerp x)) (not (characterp x))
+          (let ((st (obj-subtag x)))
+            (or (= st 80) (= st 83))))
+     (symbol-name x))
+    ;; Wrapper array (fill-pointer / displaced) — materialise to a flat
+    ;; string via WRAPPER-AREF.  Modus's print/string routines accept
+    ;; wrappers but our intern-by-name path needs a flat string.
     ((and (consp x) (stringp (cdr x)))
-     ;; Materialize wrapper to flat string
      (let ((len (wrapper-effective-length x)))
        (let ((s (%make-string-array len)))
          (dotimes (i len s) (aset s i (wrapper-aref x i))))))
@@ -838,8 +869,42 @@
 
 ;;; --- defpackage ---
 
+(defun %defpkg-pool-contains (pool s)
+  "True if string S (case-sensitive) is already in POOL (list of strings).
+   Used by %defpackage-impl's disjointness checks."
+  (let ((cur pool) (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (when (string= (car cur) s) (setq found t))
+      (setq cur (cdr cur)))))
+
+(defun %signal-package-error ()
+  "Runtime helper: signal a PACKAGE-ERROR condition for handler-case.
+   Mirrors %signal-program-error's shape — a 2-elt condition object with
+   the type symbol in slot 0.  Used by %defpackage-impl for nickname
+   conflicts (CLHS 11.1.1.1) and for disjointness violations whose CLHS
+   spec calls for PACKAGE-ERROR rather than PROGRAM-ERROR."
+  (let ((c (make-array 2)))
+    (aset c 0 'package-error)
+    (aset c 1 nil)
+    (setq *current-condition* c)
+    (if (%error-handler-active-p) (%hc-longjmp) nil)))
+
 (defun %defpackage-impl (name options)
-  "Create/modify a package with options (options is a list)."
+  "Create/modify a package with options (options is a list).
+
+   Implements the CLHS 11.1.1.1 options:
+     :nicknames, :documentation, :use, :shadow, :shadowing-import-from,
+     :import-from, :export, :intern, :size
+
+   Signals PROGRAM-ERROR for:
+     - duplicate :size or :documentation
+     - names in :shadow / :shadowing-import-from / :import-from / :intern
+       not disjoint (one symbol-name appearing in more than one of these)
+     - names in :export and :intern not disjoint
+   Signals PACKAGE-ERROR for:
+     - a nickname that already names (or is a nickname of) a different
+       existing package"
   (let ((name-str (%pkg-string-designator name))
         (nicknames nil)
         (use-list nil)
@@ -848,8 +913,11 @@
         (import-from nil)
         (shadow-names nil)
         (shadowing-import-from nil)
-        (intern-names nil))
-    ;; Parse options
+        (intern-names nil)
+        (size-seen nil)
+        (doc-seen nil)
+        (doc-string nil))
+    ;; --- Parse options ---
     (dolist (opt options)
       (when (consp opt)
         (let ((key (car opt)))
@@ -869,12 +937,71 @@
              (setq shadowing-import-from (cons (cdr opt) shadowing-import-from)))
             ((eq key :intern)
              (setq intern-names (append intern-names (cdr opt))))
-            ((eq key :documentation) nil)
+            ((eq key :documentation)
+             ;; Duplicate :documentation → program-error (CLHS).
+             (when doc-seen (%signal-program-error))
+             (setq doc-seen t)
+             (when (cdr opt) (setq doc-string (cadr opt))))
+            ((eq key :size)
+             ;; Duplicate :size → program-error (CLHS).  Value ignored
+             ;; otherwise — Modus packages don't pre-allocate symbol
+             ;; tables.
+             (when size-seen (%signal-program-error))
+             (setq size-seen t))
             (t nil)))))
-    ;; Delete existing package if any
+
+    ;; --- Disjointness pool 1: :shadow, :shadowing-import-from (sym
+    ;; names), :import-from (sym names), :intern.  CLHS 11.1.1.1 says
+    ;; these must be disjoint or a program-error is signalled.
+    (let ((pool nil))
+      (dolist (n shadow-names)
+        (let ((s (%pkg-string-designator n)))
+          (when (%defpkg-pool-contains pool s) (%signal-program-error))
+          (setq pool (cons s pool))))
+      (dolist (spec shadowing-import-from)
+        (dolist (n (cdr spec))
+          (let ((s (%pkg-string-designator n)))
+            (when (%defpkg-pool-contains pool s) (%signal-program-error))
+            (setq pool (cons s pool)))))
+      (dolist (spec import-from)
+        (dolist (n (cdr spec))
+          (let ((s (%pkg-string-designator n)))
+            (when (%defpkg-pool-contains pool s) (%signal-program-error))
+            (setq pool (cons s pool)))))
+      (dolist (n intern-names)
+        (let ((s (%pkg-string-designator n)))
+          (when (%defpkg-pool-contains pool s) (%signal-program-error))
+          (setq pool (cons s pool)))))
+
+    ;; --- Disjointness pool 2: :export and :intern must be disjoint.
+    (let ((pool nil))
+      (dolist (n intern-names)
+        (let ((s (%pkg-string-designator n)))
+          (setq pool (cons s pool))))
+      (dolist (n export-names)
+        (let ((s (%pkg-string-designator n)))
+          (when (%defpkg-pool-contains pool s) (%signal-program-error))
+          (setq pool (cons s pool)))))
+
+    ;; --- Nickname conflict: each nickname must not be the primary
+    ;; name or an existing nickname of any OTHER package.  (CLHS:
+    ;; defpackage may rename the package itself, but reusing some
+    ;; other package's nickname is a package-error.)  We resolve
+    ;; conflicts against find-package before the existing-package
+    ;; delete-and-recreate step below, since defpackage is allowed to
+    ;; replace ITS OWN earlier definition.
+    (dolist (nk nicknames)
+      (let ((nk-str (%pkg-string-designator nk)))
+        (let ((existing (find-package nk-str)))
+          (when (and existing
+                     (not (%pkg-string= (%pkg-name existing) name-str)))
+            (%signal-package-error)))))
+
+    ;; --- Delete existing same-name package if any ---
     (let ((existing (find-package name-str)))
       (when existing (safely-delete-package existing)))
-    ;; Create
+
+    ;; --- Build the package ---
     (let ((pkg (make-package name-str
                  :nicknames nicknames
                  :use (if use-provided use-list nil))))
@@ -907,6 +1034,11 @@
         (let ((sname-str (%pkg-string-designator sname)))
           (let ((sym (intern sname-str pkg)))
             (export sym pkg))))
+      ;; Documentation: store via the ANSI-bridge documentation registry
+      ;; so (documentation pkg t) returns the string.  Stored only when
+      ;; a non-nil value was supplied.
+      (when doc-string
+        (set-documentation pkg t doc-string))
       pkg)))
 
 ;;; --- in-package ---
@@ -1096,13 +1228,55 @@
 
 ;;; --- Test helper functions from packages00-aux ---
 
+(defun %register-defpackage-macro ()
+  "Install DEFPACKAGE as a runtime macro that expands to %DEFPACKAGE-IMPL.
+
+   Without this, `(eval `(defpackage ,n))` (heavily used by the ANSI
+   defpackage.lsp / make-package.lsp suites) signals UNDEFINED-FUNCTION:
+   Modus's build-time rewriter rewrites *literal* `(defpackage NAME …)`
+   forms at SBCL compile time, but the rewriter never sees the form
+   constructed at runtime via `(list 'defpackage n)`.  The runtime
+   macro fills that gap.
+
+   Expander shape: (lambda (name &rest options)
+                     (list '%defpackage-impl name (list 'quote options)))
+   built as an %interp-closure cons that set-macro-function recognises.
+
+   Key: we register under the literal string \"DEFPACKAGE\".
+   %macro-sym-key normalises CL syms and non-empty-name native MVM syms
+   down to a name string before consulting *macro-function-table*, so
+   passing the string here matches all symbol shapes the test code may
+   present to macroexpand-1.  Passing a native MVM sym would route
+   through (symbol-name sym), which at the moment %register-defpackage-macro
+   runs (called from %init-packages via set-up-packages, BEFORE
+   %init-sym-name-auto populates *sym-name-table*) returns \"\" — and
+   %macro-sym-key then falls back to the symbol object itself.  Later
+   when test code looks up the macro, *sym-name-table* IS populated,
+   so the lookup returns \"DEFPACKAGE\" and misses our by-symbol entry.
+   The string registration sidesteps that boot-order edge."
+  (let ((expander
+          (list '%interp-closure
+                '(name &rest options)
+                (list (list 'list (list 'quote '%defpackage-impl)
+                                  'name
+                                  (list 'list (list 'quote 'quote) 'options)))
+                nil)))
+    (set-macro-function "DEFPACKAGE" expander)))
+
 (defun set-up-packages ()
-  "Set up test packages A and B."
+  "Set up test packages A and B.
+
+   This runs once at boot (called from %init-packages in
+   cl-conditions.lisp) and again on demand from test code via
+   the explicit ansi-aux helper.  Boot is the only place where we
+   can guarantee set-macro-function has run before test code runs,
+   so this is also where we install the runtime DEFPACKAGE macro."
   (safely-delete-package "A")
   (safely-delete-package "B")
   (safely-delete-package "Q")
   (%defpackage-impl "A" (list (list :use) (list :nicknames "Q") (list :export "FOO")))
-  (%defpackage-impl "B" (list (list :use "A") (list :export "BAR"))))
+  (%defpackage-impl "B" (list (list :use "A") (list :export "BAR")))
+  (%register-defpackage-macro))
 
 ;;; Non-closure counter/collector for do-symbols traversal
 (defvar *%sym-count* 0)

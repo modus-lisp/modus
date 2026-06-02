@@ -21,6 +21,13 @@
 ;; Populated by %register-clos-slot-info from the SBCL-side defclass rewriter.
 (defvar *clos-slot-info* nil)
 
+;; Per-class default-initargs registry: alist
+;;   (class-name . initarg-thunks)
+;; initarg-thunks: list of (initarg-key . thunk-fn) pairs.  Per CLHS 7.1.4,
+;; the value form is re-evaluated each time make-instance is called, hence
+;; the 0-arity thunks.
+(defvar *clos-default-initargs* nil)
+
 ;; slot-unbound methods: list of (class-name slot-spec fn)
 ;; slot-spec: nil = any slot; symbol = that specific slot name
 (defvar *slot-unbound-methods* nil)
@@ -313,25 +320,65 @@
       (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
       (setq cur (cdr cur)))))
 
+;; Per-class directly-declared-slot-names registry: alist
+;;   (class-name . direct-slot-names).
+;; Records every slot a class directly declares (any allocation).  Needed
+;; so %slot-class-owner can detect when a subclass shadows an ancestor's
+;; :allocation :class slot with its own :allocation :instance declaration
+;; — CLHS 7.5.2: the most-specific class's allocation wins.
+(defvar *clos-direct-slots* nil)
+
+(defun %register-clos-direct-slots (class-name direct-slot-names)
+  "Register DIRECT-SLOT-NAMES as the slots CLASS-NAME directly declares
+   (any allocation).  Replaces any prior entry."
+  (let ((new-reg nil) (cur *clos-direct-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (not (eq (car (car cur)) class-name))
+        (setq new-reg (cons (car cur) new-reg)))
+      (setq cur (cdr cur)))
+    (setq *clos-direct-slots*
+          (cons (cons class-name direct-slot-names) new-reg)))
+  class-name)
+
+(defun %direct-slots-for (class-name)
+  "Return list of direct-slot-names for CLASS-NAME (any allocation)."
+  (let ((cur *clos-direct-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
 (defun %slot-class-owner (class-name slot-name)
   "Return the class-name in CLASS-NAME's CPL that declared SLOT-NAME
-   as :allocation :class — or NIL if no ancestor declares it as
-   class-allocated.  Used so subclass instances share the inherited
-   class slot's storage with their ancestor."
-  ;; First check direct.
-  (when (member slot-name (%class-slots-for class-name) :test #'eq)
-    (return-from %slot-class-owner class-name))
-  ;; Walk CPL.
+   as :allocation :class — or NIL if no class-allocation found, or NIL
+   if a more-specific class shadows an ancestor's :class allocation with
+   its own :instance declaration (CLHS 7.5.2).
+
+   Walk CPL most-specific first.  For each class:
+   - If class directly declares the slot AS :class → return class
+   - If class directly declares the slot AS :instance → return NIL
+     (shadowing — slot lives on the instance, no class storage)
+   - Otherwise continue walking."
   (let ((cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-class-owner nil))
-    (let ((cpl (aref cls 4)))
+    (let ((cpl (aref cls 4))
+          (result nil)
+          (decided nil))
       (let ((cur cpl))
         (loop
-          (when (null cur) (return nil))
-          (let ((cname (car cur)))
-            (when (member slot-name (%class-slots-for cname) :test #'eq)
-              (return cname)))
-          (setq cur (cdr cur)))))))
+          (when (or decided (null cur)) (return nil))
+          (let ((cn (car cur)))
+            (when (member slot-name (%direct-slots-for cn) :test #'eq)
+              (cond
+                ((member slot-name (%class-slots-for cn) :test #'eq)
+                 (setq result cn)
+                 (setq decided t))
+                (t
+                 ;; :instance at this class → no class storage above
+                 (setq decided t)))))
+          (setq cur (cdr cur))))
+      result)))
 
 (defun %class-slot-get (class-name slot-name default)
   "Return the class-shared value for SLOT-NAME on CLASS-NAME (resolves
@@ -460,6 +507,81 @@
           (let ((found (%clos-initform-thunk-1 (car cur) slot-name)))
             (when found (return found)))
           (setq cur (cdr cur)))))))
+
+;;; ============================================================
+;;; Default-initargs registry (per CLHS 7.1.4)
+;;; ============================================================
+;;; *clos-default-initargs* maps class-name → list of (initarg-key . thunk).
+;;; Per CLHS the value form is re-evaluated for each make-instance call —
+;;; we store a 0-arity thunk so the eval-each-time semantics is preserved.
+
+(defun %register-clos-default-initargs (class-name initarg-thunks)
+  "Register INITARG-THUNKS (list of (initarg-key . thunk) pairs) as the
+   :default-initargs of CLASS-NAME.  Always replaces — re-defining a
+   class with no default-initargs clears any prior entry."
+  (let ((new-reg nil) (cur *clos-default-initargs*))
+    (loop
+      (when (null cur) (return nil))
+      (when (not (eq (car (car cur)) class-name))
+        (setq new-reg (cons (car cur) new-reg)))
+      (setq cur (cdr cur)))
+    (setq *clos-default-initargs*
+          (cons (cons class-name initarg-thunks) new-reg)))
+  class-name)
+
+(defun %clos-default-initargs-1 (class-name)
+  "Return the directly-declared default-initarg thunks for CLASS-NAME
+   (no CPL walk).  Returns nil if none registered."
+  (let ((cur *clos-default-initargs*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %clos-default-initarg-key-in-p (key lst)
+  "True iff KEY (initarg keyword) is already in LST.  Uses hash/name
+   comparison so cross-file cl-sym vs native-MVM-sym shapes for the same
+   :foo compare correctly (eq alone is fragile across calls)."
+  (let ((cur lst))
+    (loop
+      (when (null cur) (return nil))
+      (let ((a (car cur)))
+        (when (cond
+                ((eq a key) t)
+                ((and (%native-mvm-sym-p a) (%native-mvm-sym-p key))
+                 (= (%native-mvm-sym-hash a) (%native-mvm-sym-hash key)))
+                ((and (%cl-sym-p a) (%cl-sym-p key))
+                 (string-equal (%cl-sym-name a) (%cl-sym-name key)))
+                (t nil))
+          (return t)))
+      (setq cur (cdr cur)))))
+
+(defun %clos-default-initargs-for-class (class-name)
+  "Return the combined default-initargs alist (initarg-key . thunk) for
+   CLASS-NAME walking its CPL.  Per CLHS 7.1.4, more-specific classes
+   win — when two classes in the CPL declare the same key, the
+   more-specific class's thunk is used.  Returns a fresh list in CPL
+   (most-specific first) order."
+  (let ((cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %clos-default-initargs-for-class nil))
+    (let ((seen-keys nil)
+          (result nil))
+      (let ((cur (aref cls 4)))
+        (loop
+          (when (null cur) (return nil))
+          (let* ((cn (car cur))
+                 (entries (%clos-default-initargs-1 cn)))
+            (let ((ec entries))
+              (loop
+                (when (null ec) (return nil))
+                (let* ((entry (car ec))
+                       (k (car entry)))
+                  (unless (%clos-default-initarg-key-in-p k seen-keys)
+                    (setq seen-keys (cons k seen-keys))
+                    (setq result (cons entry result))))
+                (setq ec (cdr ec)))))
+          (setq cur (cdr cur))))
+      (nreverse result))))
 
 (defun %clos-slot-index (cls slot-name)
   "Return 0-based index of SLOT-NAME in cls, or -1 if not found.
@@ -606,9 +728,17 @@
 
 (defun %slot-makunbound (obj slot-name)
   "Mark slot SLOT-NAME in OBJ as unbound.  Calls slot-missing for
-   nonexistent slots; either way returns OBJ."
-  (let ((cls (%find-clos-class (aref obj 1))))
+   nonexistent slots; either way returns OBJ.  Routes :allocation :class
+   slots to per-class storage so the shared slot is actually cleared
+   (otherwise slot-value would still return the class-bound value via
+   %class-slot-get — defeating class-0203/0207-style makunbound semantics)."
+  (let* ((class-name (aref obj 1))
+         (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-makunbound obj))
+    ;; Class-allocated slot? Remove the per-class storage entry.
+    (when (%slot-class-owner class-name slot-name)
+      (%class-slot-makunbound class-name slot-name)
+      (return-from %slot-makunbound obj))
     (let ((idx (%clos-slot-index cls slot-name)))
       ;; See %slot-value for the AArch64 fixnum-0/NIL rationale.
       (when (< idx 0)
@@ -617,6 +747,22 @@
       ;; Use literal -999 to avoid SYMBOL-VALUE clobber in variable-index aset
       (aset obj (+ 2 idx) -999)
       obj)))
+
+(defun %class-slot-makunbound (class-name slot-name)
+  "Remove the per-class storage entry for SLOT-NAME on CLASS-NAME (resolves
+   via the owning class in the CPL).  After this %class-slot-bound-p
+   returns NIL so slot-value will signal unbound-slot."
+  (let ((owner (%slot-class-owner class-name slot-name)))
+    (when owner
+      (let ((new-list nil) (cur *clos-class-slot-values*))
+        (loop
+          (when (null cur) (return nil))
+          (let ((entry (car cur)))
+            (unless (and (eq (car (car entry)) owner)
+                         (eq (cdr (car entry)) slot-name))
+              (setq new-list (cons entry new-list))))
+          (setq cur (cdr cur)))
+        (setq *clos-class-slot-values* new-list)))))
 
 (defun %slot-exists-p (obj slot-name)
   "True if OBJ has a slot named SLOT-NAME."

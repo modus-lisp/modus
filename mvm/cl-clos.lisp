@@ -1254,10 +1254,26 @@
 (defun %mc-identity-with-one (mc)  (aref mc 3))
 
 (defun %find-mc (name)
-  (let ((cur *method-combinations*))
+  "Look up a registered method combination by NAME.
+   Uses a symbol-name comparison instead of EQ because the runtime
+   intern table doesn't always unify non-keyword #x50 symbols by
+   eq (see MEMORY/feedback_eq_works_on_symbols caveats) — the
+   `'and` symbol the cl-eval defgeneric handler stashes in the GF's
+   combination slot may be a different object than the `'and`
+   %init-method-combinations registered at build time.  Falling
+   back to a name-equality probe makes the dispatch route to
+   %gf-dispatch-custom even when the two symbols are not EQ."
+  (let ((cur *method-combinations*)
+        (name-str (cond ((stringp name) name)
+                        ((symbolp name) (symbol-name name))
+                        (t nil))))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (let ((k (car (car cur))))
+        (when (or (eq k name)
+                  (and name-str (symbolp k)
+                       (string= (symbol-name k) name-str)))
+          (return (cdr (car cur)))))
       (setq cur (cdr cur)))))
 
 (defun %define-method-combination (name operator identity-with-one)
@@ -1557,12 +1573,19 @@
               (cond
                 ((eq q :around)
                  (setq around-methods (cons m around-methods)))
-                ((eq q comb-name)
+                ((or (eq q comb-name)
+                     (and (symbolp q) (symbolp comb-name)
+                          (string= (symbol-name q) (symbol-name comb-name))))
+                 ;; Symbol-name comparison covers the case where two
+                 ;; non-keyword symbols carry the same name but aren't
+                 ;; EQ (see %find-mc docstring for the cl-eval
+                 ;; intern-table caveat).
                  (setq primary-methods (cons m primary-methods)))
-                ;; Primary methods with this combination also qualify
-                ((null q)
-                 ;; Not allowed in custom combination — should error
-                 nil))))
+                ;; Primary methods with no qualifier (nil) are NOT
+                ;; valid for a custom short-form combination per
+                ;; CLHS 7.6.6.4 — silently drop them so the empty
+                ;; primary-methods branch below signals.
+                ((null q) nil))))
           (setq cur (cdr cur))))
       (setq around-methods  (nreverse around-methods))
       (setq primary-methods (nreverse primary-methods))
@@ -1579,77 +1602,120 @@
       ;; user-pointed-out crashes.  The body ignores the runtime args
       ;; and uses the captured `args` list (closed over the outer let),
       ;; matching standard-method semantics for AROUND→primary chains.
+      ;; combined-thunk: invoke applicable primary methods one at a time
+      ;; and short-circuit per the combination operator's semantics.
+      ;;
+      ;; Why inline per-method evaluation instead of collect-then-fold?
+      ;; CLHS 7.6.6.4 mandates the effective method behave as
+      ;;   (OP (call-method m1) (call-method m2) ...)
+      ;; which for AND / OR is short-circuiting — methods AFTER the
+      ;; first NIL (for AND) or first non-NIL (for OR) MUST NOT run.
+      ;; Tests defgeneric-method-combination.and.1 expect *x* = (3 4)
+      ;; for input 1 (only integer + rational push, AND sees NIL from
+      ;; rational and stops); the prior collect-then-fold incorrectly
+      ;; pushed 1 2 3 4 because all four methods ran.
+      ;;
+      ;; The previous lambda took &rest so call-next-method's
+      ;; `(apply sentinel actual-args)` wouldn't arity-mismatch.  We
+      ;; keep that shape — the body still ignores the runtime args and
+      ;; uses the captured `args` list from the outer let, matching
+      ;; standard-method semantics for AROUND->primary chains.
       (let ((combined-thunk
              (lambda (&rest %ignored-actual-args)
                (declare (ignore %ignored-actual-args))
-               ;; If identity-with-one and only one method, call it directly
+               ;; identity-with-one + single method: pass MV through.
                (if (and identity-with-one (null (cdr primary-methods)))
                  (apply (%method-fn (car primary-methods)) args)
-                 ;; Otherwise collect results and apply operator
-                 (let ((results nil)
-                       (cur primary-methods))
-                   (loop
-                     (when (null cur) (return nil))
-                     (setq results (cons (apply (%method-fn (car cur)) args) results))
-                     (setq cur (cdr cur)))
-                   ;; Inline fold instead of (apply operator results)
-                   ;; to avoid CALL-INDIRECT through symbol tagged pointer
-                   (let ((rl (nreverse results)))
-                     (cond
-                       ((eq operator '*)
-                        (let ((acc 1) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (* acc (car rcur)))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator '+)
-                        (let ((acc 0) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (+ acc (car rcur)))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'max)
-                        (let ((acc (car rl)) (rcur (cdr rl)))
-                          (loop (when (null rcur) (return acc))
-                                (when (> (car rcur) acc) (setq acc (car rcur)))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'min)
-                        (let ((acc (car rl)) (rcur (cdr rl)))
-                          (loop (when (null rcur) (return acc))
-                                (when (< (car rcur) acc) (setq acc (car rcur)))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'and)
-                        (let ((acc t) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (car rcur))
-                                (when (null acc) (return nil))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'or)
-                        (let ((acc nil) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (car rcur))
-                                (when acc (return acc))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'list)
-                        rl)
-                       ((eq operator 'append)
-                        (let ((acc nil) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (append acc (car rcur)))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'nconc)
-                        (let ((acc nil) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (nconc acc (car rcur)))
-                                (setq rcur (cdr rcur)))))
-                       ((eq operator 'progn)
-                        (let ((acc nil) (rcur rl))
-                          (loop (when (null rcur) (return acc))
-                                (setq acc (car rcur))
-                                (setq rcur (cdr rcur)))))
-                       (t (apply operator rl)))))))))
+                 ;; Multi-method: per-operator inline fold with the
+                 ;; short-circuit semantics the operator demands.
+                 (cond
+                   ((eq operator 'and)
+                    ;; Short-circuit on NIL; value is last non-NIL or NIL.
+                    (let ((acc t) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (apply (%method-fn (car cur)) args))
+                        (when (null acc) (return nil))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'or)
+                    ;; Short-circuit on truthy; value is first non-NIL or NIL.
+                    (let ((acc nil) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (apply (%method-fn (car cur)) args))
+                        (when acc (return acc))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'progn)
+                    ;; Run all, return last; matches (progn ...) semantics.
+                    (let ((acc nil) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (apply (%method-fn (car cur)) args))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'list)
+                    (let ((acc nil) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return (nreverse acc)))
+                        (setq acc (cons (apply (%method-fn (car cur)) args) acc))
+                        (setq cur (cdr cur)))))
+                   ((eq operator '+)
+                    (let ((acc 0) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (+ acc (apply (%method-fn (car cur)) args)))
+                        (setq cur (cdr cur)))))
+                   ((eq operator '*)
+                    (let ((acc 1) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (* acc (apply (%method-fn (car cur)) args)))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'max)
+                    (let ((acc (apply (%method-fn (car primary-methods)) args))
+                          (cur (cdr primary-methods)))
+                      (loop
+                        (when (null cur) (return acc))
+                        (let ((v (apply (%method-fn (car cur)) args)))
+                          (when (> v acc) (setq acc v)))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'min)
+                    (let ((acc (apply (%method-fn (car primary-methods)) args))
+                          (cur (cdr primary-methods)))
+                      (loop
+                        (when (null cur) (return acc))
+                        (let ((v (apply (%method-fn (car cur)) args)))
+                          (when (< v acc) (setq acc v)))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'append)
+                    (let ((acc nil) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (append acc (apply (%method-fn (car cur)) args)))
+                        (setq cur (cdr cur)))))
+                   ((eq operator 'nconc)
+                    (let ((acc nil) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return acc))
+                        (setq acc (nconc acc (apply (%method-fn (car cur)) args)))
+                        (setq cur (cdr cur)))))
+                   (t
+                    ;; Unknown operator -- fall back to collect-then-apply.
+                    (let ((results nil) (cur primary-methods))
+                      (loop
+                        (when (null cur) (return nil))
+                        (setq results (cons (apply (%method-fn (car cur)) args) results))
+                        (setq cur (cdr cur)))
+                      (apply operator (nreverse results)))))))))
         (if around-methods
-          ;; Around wraps combined
+          ;; Around wraps combined.  Modus's LET on a defvar doesn't create
+          ;; dynamic scope, so we have to use setq+save/restore around the
+          ;; call — same pattern as the standard run-primary path above.
+          ;; Without this, call-next-method inside an :around method reads
+          ;; the GLOBAL *%next-methods* (whatever the OUTER dispatch left
+          ;; it at) and gets the wrong chain — corrupting tests like
+          ;; AND.6 with two layered around methods.
           (let ((primary-sentinel (%make-method nil nil combined-thunk)))
-            (let ((*%next-methods*
+            (let ((next-chain
                    (let ((result nil)
                          (cur (cdr around-methods)))
                      (loop
@@ -1658,9 +1724,15 @@
                          (return nil))
                        (setq result (cons (car cur) result))
                        (setq cur (cdr cur)))
-                     (nreverse result)))
-                  (*%current-gf-args* args))
-              (apply (%method-fn (car around-methods)) args)))
+                     (nreverse result))))
+              (let ((saved-nm   *%next-methods*)
+                    (saved-args *%current-gf-args*))
+                (setq *%next-methods*    next-chain)
+                (setq *%current-gf-args* args)
+                (multiple-value-prog1
+                    (apply (%method-fn (car around-methods)) args)
+                  (setq *%next-methods*    saved-nm)
+                  (setq *%current-gf-args* saved-args)))))
           ;; No around
           (funcall combined-thunk))))))
 

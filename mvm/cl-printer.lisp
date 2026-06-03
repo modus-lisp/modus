@@ -2714,10 +2714,11 @@
 
 (defun %equalp-array-array (a b)
   "Element-wise equalp over two non-cons sequences (vectors or strings).
-   Uses array-length and aref/code-char so plain arrays, strings, and
-   bit-vectors all compare correctly."
-  (let ((la (array-length a))
-        (lb (array-length b)))
+   Uses LENGTH (fill-pointer aware) instead of ARRAY-LENGTH so a
+   fill-pointered vector compares against its logical length, not
+   its underlying storage size.  (equalp.11)"
+  (let ((la (length a))
+        (lb (length b)))
     (if (= la lb)
         (let ((i 0) (ok t))
           (loop

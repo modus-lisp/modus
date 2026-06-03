@@ -3671,22 +3671,67 @@
       (setq total (* total (car cur)))
       (setq rank (+ rank 1))
       (setq cur (cdr cur)))
-    ;; Walk kwargs into local vars.
+    ;; Kwarg validation per CLHS 3.4.1.4: odd-length arg list and
+    ;; unknown keywords (without :allow-other-keys T) signal
+    ;; program-error.  Leftmost :allow-other-keys wins per CLHS
+    ;; 3.4.1.4.1.  (make-array.error.2/3/4)
+    (let ((allow-other nil) (scan kwargs))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (eq (car scan) :allow-other-keys)
+          (unless allow-other
+            (setq allow-other (if (cadr scan) t :explicit-nil))))
+        (setq scan (cddr scan))))
+    (let ((leftmost-allow nil)
+          (leftmost-allow-set nil))
+      ;; CLHS 3.4.1.4.1: LEFTMOST :allow-other-keys value wins.
+      (let ((scan kwargs))
+        (loop (when (or (null scan) (null (cdr scan))) (return))
+          (when (and (eq (car scan) :allow-other-keys)
+                     (not leftmost-allow-set))
+            (setq leftmost-allow (and (cadr scan) t))
+            (setq leftmost-allow-set t))
+          (setq scan (cddr scan))))
+      (let ((vp kwargs))
+        (loop
+          (when (null vp) (return))
+          (when (null (cdr vp)) (%signal-program-error) (return))
+          (let ((k (car vp)))
+            (unless (member k '(:initial-element :initial-contents
+                                :fill-pointer :adjustable :element-type
+                                :displaced-to :displaced-index-offset
+                                :allow-other-keys))
+              (unless leftmost-allow
+                (%signal-program-error)
+                (return))))
+          (setq vp (cddr vp)))))
+    ;; Walk kwargs into local vars.  Per CLHS 3.4.1.4.1 the LEFTMOST
+    ;; occurrence of each keyword wins on duplicates — use *-set
+    ;; sentinels so a later (:initial-element a :initial-element b)
+    ;; pair doesn't overwrite the first value.  (make-array.keywords.8)
     (let ((ie-p nil) (ie nil) (ic-p nil) (ic nil)
-          (fp nil) (adj nil) (etype t)
-          (disp nil) (off 0)
+          (fp nil) (fp-set nil) (adj nil) (adj-set nil)
+          (etype t) (etype-set nil)
+          (disp nil) (disp-set nil) (off 0) (off-set nil)
           (rest kwargs))
       (loop (when (null rest) (return nil))
         (let ((k (car rest)) (v (cadr rest)))
           (cond
-            ((eq k :initial-element)        (setq ie-p t  ie v))
-            ((eq k :initial-contents)       (setq ic-p t  ic v))
+            ((eq k :initial-element)
+             (unless ie-p (setq ie-p t  ie v)))
+            ((eq k :initial-contents)
+             (unless ic-p (setq ic-p t  ic v)))
             ((eq k :fill-pointer)
-             (setq fp (cond ((eq v t) total) ((null v) nil) (t v))))
-            ((eq k :adjustable)             (setq adj v))
-            ((eq k :element-type)           (setq etype v))
-            ((eq k :displaced-to)           (setq disp v))
-            ((eq k :displaced-index-offset) (setq off  v))))
+             (unless fp-set
+               (setq fp-set t)
+               (setq fp (cond ((eq v t) total) ((null v) nil) (t v)))))
+            ((eq k :adjustable)
+             (unless adj-set (setq adj-set t adj v)))
+            ((eq k :element-type)
+             (unless etype-set (setq etype-set t etype v)))
+            ((eq k :displaced-to)
+             (unless disp-set (setq disp-set t disp v)))
+            ((eq k :displaced-index-offset)
+             (unless off-set (setq off-set t off v)))))
         (setq rest (cddr rest)))
       ;; Allocate + fill the flat data vector.
       ;; :element-type 'character / 'base-char → underlying is a string

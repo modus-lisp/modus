@@ -755,27 +755,87 @@
       (%eval-progn body new-env))))
 
 (defun %bind-params (params args env)
-  "Bind PARAMS to ARGS in ENV, handling &rest."
+  "Bind PARAMS to ARGS in ENV, handling &optional / &rest / &key / &aux.
+   Per CLHS 3.4.1 the lambda-list syntax is:
+     (required* [&optional optional*] [&rest var] [&key key* [&allow-other-keys]] [&aux aux*])
+   &key entries are :KEY-symbol designators; each may be (var [init [suppliedp]])
+   or just var.  &aux entries are (var [init]) and are NOT consumed from ARGS."
   (let ((new-env env)
         (ps params)
-        (as args))
+        (as args)
+        (rest-list nil))
     (loop
       (cond
         ((null ps) (return new-env))
-        ;; &rest parameter
+        ;; &rest parameter — bind to remainder of ARGS but keep walking
+        ;; so &key after &rest still binds normally.
         ((%eval-sym-eq (car ps) "&REST")
          (setq ps (cdr ps))
          (when ps
-           (setq new-env (%env-extend (car ps) as new-env)))
-         (return new-env))
-        ;; &optional parameter
+           (setq rest-list as)
+           (setq new-env (%env-extend (car ps) as new-env))
+           (setq ps (cdr ps))))
+        ;; &optional — fall through; subsequent positionals consume from AS
+        ;; with NIL fallback.
         ((%eval-sym-eq (car ps) "&OPTIONAL")
          (setq ps (cdr ps)))
-        ;; Regular parameter
-        (t
-         (setq new-env (%env-extend (car ps) (if as (car as) nil) new-env))
+        ;; &key — every remaining param (until &aux or end) is matched by
+        ;; :KEY-name in (rest-list or AS).
+        ((%eval-sym-eq (car ps) "&KEY")
          (setq ps (cdr ps))
-         (setq as (if as (cdr as) nil)))))))
+         (let ((kw-args (or rest-list as)))
+           (loop
+             (cond
+               ((null ps) (return new-env))
+               ((%eval-sym-eq (car ps) "&ALLOW-OTHER-KEYS")
+                (setq ps (cdr ps)))
+               ((%eval-sym-eq (car ps) "&AUX")
+                (return nil))   ; outer loop's &AUX clause picks up
+               (t
+                (let* ((spec (car ps))
+                       (var (if (consp spec) (car spec) spec))
+                       (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
+                       (keyname (if (consp spec) (symbol-name var) (symbol-name spec)))
+                       (value (let ((cur kw-args) (found nil) (val nil))
+                                (loop
+                                  (when (or found (null cur) (null (cdr cur))) (return val))
+                                  (let ((k (car cur)))
+                                    (when (and k (or (symbolp k) (%cl-sym-p k))
+                                               (string= (symbol-name k) keyname))
+                                      (setq val (cadr cur))
+                                      (setq found t)))
+                                  (setq cur (cddr cur))))))
+                  (setq new-env (%env-extend var
+                                             (or value (and init nil))   ; init evaluated later if no value
+                                             new-env))
+                  (when (and (null value) init)
+                    ;; Evaluate init form in the env we're building.
+                    (let ((v (%eval init new-env)))
+                      (setq new-env (%env-extend var v new-env))))
+                  (setq ps (cdr ps)))))))
+         (return new-env))
+        ;; &aux — bind each subsequent (var init) without consuming AS.
+        ((%eval-sym-eq (car ps) "&AUX")
+         (setq ps (cdr ps))
+         (loop
+           (when (null ps) (return new-env))
+           (let* ((spec (car ps))
+                  (var (if (consp spec) (car spec) spec))
+                  (init (if (and (consp spec) (cdr spec)) (cadr spec) nil)))
+             (setq new-env (%env-extend var (if init (%eval init new-env) nil) new-env))
+             (setq ps (cdr ps))))
+         (return new-env))
+        ;; Regular / &optional positional parameter
+        (t
+         (let* ((spec (car ps))
+                (var (if (consp spec) (car spec) spec))
+                (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
+                (val (cond (as (car as))
+                           (init (%eval init new-env))
+                           (t nil))))
+           (setq new-env (%env-extend var val new-env))
+           (setq ps (cdr ps))
+           (setq as (if as (cdr as) nil))))))))
 
 (defun %eval-function-form (name-or-lambda env)
   "Evaluate a #'x or (function x) form."

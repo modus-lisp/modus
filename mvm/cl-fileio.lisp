@@ -1173,6 +1173,17 @@
          (t (c) nil)))))
 
 (defun logical-pathname-translations (host) (declare (ignore host)) nil)
+
+(defun load-logical-pathname-translations (host)
+  "Stub: load translations for HOST.  Modus has no logical pathname
+   facility, so return NIL.  CLHS arity is exactly one — 0 or 2+ args
+   signal program-error (load-logical-pathname-translations.error.2/3),
+   handled by the defun's required-count check.  Per CLHS the call
+   may signal an error when HOST is not a known logical-pathname host
+   — return NIL silently for unknown hosts (consistent with the no-op
+   table)."
+  (declare (ignore host))
+  nil)
 (defun user-homedir-pathname (&rest args)
   "Return the user's home directory pathname.  Accepts an optional host
    designator argument.  Per CLHS: must return a pathname (or NIL)."

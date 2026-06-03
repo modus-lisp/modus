@@ -1572,11 +1572,18 @@
          (if (consp y) (fixnump (car y)) nil)))))
 
 (defun fill-pointer (arr)
-  "Return the fill pointer of ARR (NIL if none)."
+  "Return the fill pointer of ARR.  Per CLHS, signal type-error when
+   ARR has no fill pointer (rank>1 array, rank-0 array, plain vector
+   created without :fill-pointer, etc.) — required by the test
+   suite's signals-error wrappers."
   (cond
-    ((%mda-p arr) (%mda-fp arr))
+    ((%mda-p arr)
+     (let ((fp (%mda-fp arr)))
+       (if fp fp (progn (%signal-type-error) nil))))
     (t (let ((y (%fp-inner arr)))
-         (if (and (consp y) (fixnump (car y))) (car y) nil)))))
+         (if (and (consp y) (fixnump (car y)))
+             (car y)
+             (progn (%signal-type-error) nil))))))
 
 (defun set-fill-pointer (arr val)
   "Set fill pointer of ARR to VAL."

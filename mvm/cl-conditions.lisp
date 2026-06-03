@@ -1879,6 +1879,20 @@
   ;; *all-packages* once is cheaper than threading a register call
   ;; through %defpackage-impl / set-up-packages.
   (dolist (p *all-packages*) (%register-pkg-by-hash p))
+  ;; CL-TEST alias: find-package "CL-TEST" returns COMMON-LISP-USER per
+  ;; the make-package short-circuit at cl-packages.lisp ~line 421.  But
+  ;; CL-USER's nickname list is intentionally NOT polluted with
+  ;; "CL-TEST" (cl-symbols.lsp asserts (package-nicknames CL-USER) =
+  ;; ("CL-USER")).  Without an entry under hash("CL-TEST"), every
+  ;; CL-TEST::FOO symbol literal compiled by compile-quote (from ANSI
+  ;; test deftest bodies) lands with pkg=NIL at runtime — and the
+  ;; printer then emits "#:FOO" / "CL-TEST::FOO" garbage instead of
+  ;; the bare name.  Splice the alias hash here so the lookup wins
+  ;; without showing up via package-nicknames.
+  (let ((tab (mem-ref #x10000170 :u64))
+        (cl-user (find-package "COMMON-LISP-USER")))
+    (when (and tab cl-user)
+      (puthash (compute-name-hash "CL-TEST") tab cl-user)))
   ;; Register every standard CL symbol as external in the COMMON-LISP
   ;; package. ANSI cl-symbols.lsp (978 tests) asserts each standard
   ;; name is :external; without this they all report :internal / nil.

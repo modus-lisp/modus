@@ -1924,6 +1924,23 @@
              ((and (symbolp obj) (= (length (symbol-name obj)) 1))
               (code-char (aref (symbol-name obj) 0)))
              (t obj)))
+      ;; CONS: empty list isn't a CONS — CLHS requires type-error
+      ;; (coerce.error.4).  Non-NIL list passes through.
+      ((eq head 'cons)
+       (cond ((null obj) (%signal-type-error) nil)
+             ((consp obj) obj)
+             (t (%signal-type-error) nil)))
+      ;; FUNCTION designator — symbol → (symbol-function ...).
+      ;; (lambda …) source forms would need runtime EVAL of `(function
+      ;; (lambda …))`, which Modus's interpreter can't fully compile
+      ;; — leave that case for the default pass-through so callers
+      ;; that wrap `coerce` in `funcall` get a clean function-error
+      ;; instead of a SIGSEGV.  (coerce.21)
+      ((eq head 'function)
+       (cond ((functionp obj) obj)
+             ((and (symbolp obj) (fboundp obj))
+              (symbol-function obj))
+             (t obj)))
       ;; Default — pass through
       (t obj))))
 (defun mismatch (s1 s2 &rest args)

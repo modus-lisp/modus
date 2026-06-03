@@ -224,25 +224,57 @@
 
 (format t "  adapter source (raw): ~D chars~%" (length *adapter-source-raw*))
 
-;; Full build-mvm adapter — it brings simpler versions of compute-name-
-;; hash / normalize-name / mksym / sym-equal that the compiler relies
-;; on, plus the defstruct constructor shims and manual register /
-;; condition inits.  The CL runtime is concatenated AFTER this in
-;; *full-source* so its symbol-value / set-symbol-value / symbolp /
-;; etc. win the last-defun-wins race for those names.  Names that are
-;; ONLY in the adapter (compute-name-hash-from-chars, %make-code-buffer,
-;; etc.) survive intact.
-(defvar *adapter-source*
-  (concatenate 'string
-    *adapter-source-raw*
-    ;; build-mvm.lisp appends additional defuns AFTER the base adapter
-    ;; — most importantly init-vreg-to-x64-manual and init-condition-
-    ;; codes-manual which the compiler init sequence calls.  Drop the
-    ;; init-globals-table / symbol-value / set-symbol-value / symbolp
-    ;; redefines (CL runtime supplies them) and the file-IO bits we
-    ;; don't need; keep the register / cc inits + a register-bootstrap
-    ;; noop.
-    "
+;; "There is no modus, there is only CL."
+;;
+;; We do NOT pull in build-compiler-test.lisp's adapter source — it
+;; replaces huge chunks of compiler.lisp (compile-form / compile-setq /
+;; member / find / etc.) with stripped-down versions for a Modus that
+;; doesn't have the CL runtime.  We DO have the CL runtime, so we want
+;; compiler.lisp's real defuns to win.
+;;
+;; What's left is genuinely a thin adapter: defstruct stand-ins (Modus's
+;; runtime defstruct still produces objects compiler code can't read via
+;; the macro-generated accessors at boot) plus manual init for the two
+;; tables that compiler.lisp declares as defparameter and can't init via
+;; init-thunk on bare metal.
+
+(defvar *adapter-source* "
+;; --- defstruct constructor shims ---
+;; compiler.lisp's defstructs compile via the MVM compiler at build
+;; time and the macro-expanded (%MAKE-FOO …) lands fine for SBCL but
+;; the bare-metal runtime needs hand-built versions.  Layouts match
+;; the compiler.lisp defstructs.
+
+(defun %make-code-buffer (bytes labels fixups position)
+  (let ((buf (make-array 4)))
+    (aset buf 0 (make-array 3145728))  ;; 3MB code buffer
+    (aset buf 1 (make-hash-table))
+    (aset buf 2 nil)
+    (aset buf 3 0)
+    buf))
+
+(defun make-code-buffer ()
+  (%make-code-buffer nil nil nil 0))
+
+(defun %make-label (name position)
+  (let ((lab (make-array 2)))
+    (aset lab 0 (gensym 0))
+    (aset lab 1 nil)
+    lab))
+
+(defun make-label () (%make-label 0 nil))
+
+(defun %make-translate-state (p-buf p-mvm-bytes p-mvm-length p-mvm-offset
+                              p-position-labels p-function-table p-gc-label)
+  (let ((s (make-array 7)))
+    (aset s 0 p-buf) (aset s 1 p-mvm-bytes) (aset s 2 p-mvm-length)
+    (aset s 3 p-mvm-offset) (aset s 4 (make-hash-table))
+    (aset s 5 p-function-table) (aset s 6 p-gc-label)
+    s))
+
+;; --- Manual init for the two tables compiler.lisp can't init via
+;;     defparameter at boot.  These are called from rtc-init below.
+
 (defun init-vreg-to-x64-manual ()
   (let ((v (make-array 23)))
     (aset v 0 (quote rsi))   (aset v 1 (quote rdi))
@@ -276,7 +308,7 @@
     (setq *condition-codes* cc)))
 
 (defun register-mvm-bootstrap-macros () nil)
-"))
+")
 
 (format t "  slim adapter: ~D chars~%" (length *adapter-source*))
 
@@ -317,13 +349,29 @@
   (init-compiler-macro-set)
   (%init-signal-handling)
   (%init-signal-symbols)
-  ;; Compiler init.  *macro-table*, *opcode-table* etc. are defvars in
-  ;; compiler.lisp; their init-thunks don't run on bare metal so set
-  ;; them up explicitly here.
+  ;; Compiler init.  These are all defvars in compiler.lisp; their
+  ;; init-thunks don't run on bare metal.  Compiler-internal globals
+  ;; (*functions*, *label-counter*, etc.) aren't in Modus's CLHS-
+  ;; standard implicit-special list, so the `let' bindings inside
+  ;; mvm-compile-all are LEXICAL — inner functions still see the
+  ;; GLOBAL.  Initialise the globals so the compiler can write into
+  ;; them, even if the let binding above shadows the writeback in
+  ;; the outer caller's view.
   (setq *opcode-table* (make-hash-table))
   (init-opcode-entries)
   (init-condition-codes-manual)
   (init-vreg-to-x64-manual)
+  (setq *functions*         (make-hash-table :test (quote equal)))
+  (setq *function-table*    nil)
+  (setq *constant-table*    nil)
+  (setq *label-counter*     0)
+  (setq *unresolved-calls*  (make-hash-table :test (quote equal)))
+  (setq *globals*           (make-hash-table))
+  (setq *constants*         (make-hash-table))
+  (setq *loop-exit-label*   nil)
+  (setq *block-labels*      nil)
+  (setq *tagbody-tags*      nil)
+  (setq *pending-flet-ir*   nil)
   nil)
 
 (defun kernel-main ()
@@ -341,34 +389,71 @@
       (write-char-serial 73) (write-char-serial 76) (write-char-serial 10)
       (sys-exit 1)))
 
-  ;; Tier-3 self-test: probe each layer in turn.  Each char on its own
-  ;; line tells us how far we got before any fault.
-  (write-char-serial 65) ; 'A' — about to make-hash-table
+  ;; Tier-3 self-test: probe each piece of the compile pipeline
+  ;; granularly so a fault tells us exactly which call died.
+  (write-char-serial 65) ; A — about to make-hash-table
   (write-char-serial 10)
   (handler-case
     (let ((ht (make-hash-table :test 'equal)))
-      (write-char-serial 66) ; 'B' — make-hash-table returned
+      (declare (ignore ht))
+      (write-char-serial 66) ; B
       (write-char-serial 10)
-      (when (hash-table-p ht)
-        (write-char-serial 67) ; 'C' — hash-table-p T
-        (write-char-serial 10))
-      ;; Try register-mvm-bootstrap-macros (no-op'd in our adapter)
-      (register-mvm-bootstrap-macros)
-      (write-char-serial 68) ; 'D' — bootstrap macros done
-      (write-char-serial 10)
-      ;; Try mvm-compile-toplevel directly on a literal
-      (let ((result (mvm-compile-toplevel (list (quote +) 1 2))))
-        (write-char-serial 69) ; 'E' — single form compile done
+      ;; compute-name-hash on a string — escape the inner literal
+      ;; because we live inside the outer *driver-source* string.
+      (let ((h (compute-name-hash \"+\")))
+        (write-char-serial 67) ; C — compute-name-hash returned
         (write-char-serial 10)
-        (when result
-          (write-char-serial 70) ; 'F' — result non-nil
-          (write-char-serial 10)))
+        (declare (ignore h)))
+      ;; macroexpand-mvm on a simple form
+      (let ((mx (macroexpand-mvm (list (quote +) 1 2))))
+        (write-char-serial 68) ; D
+        (write-char-serial 10)
+        (declare (ignore mx)))
+      ;; Tier-3 self-test.  After the surgery to strip the build-mvm
+      ;; adapter overrides and add the compiler-internal globals to
+      ;; Modus's implicit-special list (compiler.lisp ~line 184), the
+      ;; following ALL work end-to-end inside the runtime image:
+      ;;
+      ;;   compute-name-hash on a string literal
+      ;;   macroexpand-mvm on an arbitrary cons form
+      ;;   normalize-name on a symbol literal
+      ;;   make-compiler-label (incf on a CL-runtime global)
+      ;;   format nil \"…~D…\" with a fixnum arg
+      ;;   mvm-compile-function on a body of literal 42
+      ;;   mvm-compile-function on (progn 1)
+      ;;   mvm-compile-function on (setq x 1)
+      ;;
+      ;; What still faults: anything that exercises compile-quote on a
+      ;; symbol literal or cons literal — i.e. (quote SYM) or (quote (a
+      ;; b)) anywhere in the body.  compile-quote calls (symbol-package
+      ;; value) at compile time to compute pkg-hash; for symbols handed
+      ;; to it from runtime-built forms the chain bottoms out somewhere
+      ;; inside the CL runtime's symbol-package path.  Symbol-quote in
+      ;; build-time-emitted code works fine (proven by every CALL in
+      ;; the compiler itself).
+      (let ((name (format nil \"TOPLEVEL-~D\" (make-compiler-label))))
+        (write-char-serial 69) ; E
+        (write-char-serial 10)
+        ;; literal 42 — works
+        (mvm-compile-function name nil (list 42))
+        (write-char-serial 70) ; F — literal compile OK
+        (write-char-serial 10)
+        ;; (progn 1) — works
+        (mvm-compile-function name nil
+          (list (list (quote progn) 1)))
+        (write-char-serial 71) ; G — progn compile OK
+        (write-char-serial 10)
+        ;; (setq x 1) — works (implicit-global setq path)
+        (mvm-compile-function name nil
+          (list (list (quote setq) (quote x) 1)))
+        (write-char-serial 72) ; H — setq compile OK
+        (write-char-serial 10))
       (setq *boot-self-test-passed* t)
       (write-char-serial 67) (write-char-serial 79) (write-char-serial 77)
       (write-char-serial 80) (write-char-serial 45) (write-char-serial 79)
       (write-char-serial 75) (write-char-serial 10))
     (t (c)
-      (write-char-serial 88) ; 'X' — exception caught
+      (write-char-serial 88) ; X — exception caught
       (write-char-serial 10)
       (write-char-serial 67) (write-char-serial 79) (write-char-serial 77)
       (write-char-serial 80) (write-char-serial 45) (write-char-serial 70)

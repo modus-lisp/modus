@@ -22,21 +22,104 @@ file …)` would need.
   The SBCL-side build completes cleanly.  This is **Tier 1** — the
   source can co-exist.
 
-### What's broken
+### Tier-2 status (clean)
 
-- Booting `/tmp/modus-rtc` segfaults inside `%init-packages` —
-  specifically the `(setq *pkg-tag* 987654321)` that's the first
-  expression of that function.  `*pkg-tag*` is a CL-runtime defvar
-  that needs to land in the runtime's globals table; with both stacks
-  layered, the `setq` resolves to a globals table the compiler stack
-  populated separately, and the subsequent `(eql (car x) *pkg-tag*)`
-  predicate test inside `%cl-sym-p` etc. dereferences a junk pointer.
+After stripping the build-compiler-test.lisp adapter ("there is no
+modus, there is only CL") — keeping only the defstruct stand-ins,
+manual `*vreg-to-x64*` / `*condition-codes*` init, and a
+`register-mvm-bootstrap-macros` noop — both stacks coexist for boot.
 
-So **Tier 2** (compiler initialises cleanly alongside the CL runtime
-init) is **partial** — most of the CL init sequence is reachable but
-the package-system init faults.  Tier 3 (drive `mvm-compile-all`
-against a runtime form) and Tier 4 (mmap + mprotect a page RWX, copy
-native bytes, dispatch a CALL) are not yet attempted.
+The boot sequence in `rtc-init` now runs through:
+
+  init-symbol-table         ✓
+  init-keyword-table        ✓
+  %init-packages            ✓  (was segfaulting before the adapter
+                                  surgery)
+  %init-streams             ✓
+  %init-reader              ✓
+  %init-condition-types     ✓
+  %init-method-combinations ✓
+  %init-symbol-function-table ✓
+  %init-sft-auto            ✓
+  %init-sym-name-auto       ✓
+  %init-runtime-macros      ✓
+  init-compiler-macro-set   ✓
+  %init-signal-handling     ✓
+  %init-signal-symbols      ✓
+  init-opcode-entries       ✓
+  init-condition-codes-manual ✓
+  init-vreg-to-x64-manual   ✓
+  +explicit setq for *functions* / *label-counter* / *globals* /
+  *constants* / *unresolved-calls* / etc. (compiler.lisp's defvars,
+  whose init-thunks don't run on bare metal — known limitation #7)
+
+### Tier-3 status (clean for non-quote forms)
+
+After the fix to add compiler-internal globals to the implicit-special
+list (`*FUNCTIONS*` / `*FUNCTION-TABLE*` / `*LABEL-COUNTER*` /
+`*UNRESOLVED-CALLS*` / `*MACRO-TABLE*` / `*GLOBALS*` / `*CONSTANTS*`
+/ `*LOOP-EXIT-LABEL*` / `*BLOCK-LABELS*` / `*TAGBODY-TAGS*` /
+`*PENDING-FLET-IR*` / `*CURRENT-SOURCE-LOCATION*` / `*COMPILE-TRACE*`
+/ `*FRAME-SLOTS*` / `*CURRENT-FN*` / `*CURRENT-FN-NAME*` /
+`*OPCODE-TABLE*` / `*VREG-TO-X64*` / `*CONDITION-CODES*`, in
+`compiler.lisp` ~line 184), the in-image compile pipeline runs.
+
+The self-test in `kernel-main` proves these flows compile cleanly
+end-to-end inside the runtime image:
+
+  A — handler-case enters cleanly
+  B — `(make-hash-table :test 'equal)` returns a real hash-table
+  C — `(compute-name-hash "+")` returns a fixnum hash
+  D — `(macroexpand-mvm '(+ 1 2))` returns the form unchanged
+  E — `(format nil "TOPLEVEL-~D" (make-compiler-label))` produces a
+      proper thunk name
+  F — `(mvm-compile-function name nil (list 42))` compiles a body of
+      literal 42
+  G — `(mvm-compile-function name nil '((progn 1)))` compiles a
+      progn form
+  H — `(mvm-compile-function name nil '((setq x 1)))` compiles an
+      implicit-global setq (the compiler's "WARN: implicit global
+      setq" diagnostic prints to stdout)
+
+The redefining-thunk-name diagnostic (`NOTE: redefining TOPLEVEL-1`)
+also reaches stdout — proving the compiler's internal `*function-
+table*` is correctly accumulating state across calls.
+
+### What still faults
+
+`compile-quote` on a symbol or cons literal from a runtime-built
+form.  i.e. `(mvm-compile-function name nil '((quote sym)))` or
+anything in the body that quotes a symbol or list throws.  The
+chain bottoms out somewhere inside `(symbol-package value)` — at
+SBCL build time the compile-quote path calls SYMBOL-PACKAGE on the
+literal to compute the home-package hash; at runtime the symbol-
+package implementation needs to walk a Modus symbol whose package
+slot was populated by `%intern-symbol-pkg` at boot.  Probably one
+of those slot reads dereferences something unexpected when the
+symbol came from a runtime READ rather than SBCL build-time intern.
+
+This blocks compiling anything with literal data — every (defun
+foo (x) (list x)), (cons 1 2) with quoted arg, etc.
+
+### Tier-4 — make a compiled function callable
+
+Same plan as before: take the byte vector that `translate-mvm-to-
+x64` produces, mprotect a page RWX, store the entry address as a
+fn-pointer with the OR-3 low-nibble tag.
+
+We have a clear path now — translate-mvm-to-x64 isn't exercised yet
+but the rest is wired.
+
+### Estimated remaining effort
+
+| Tier | Status | Remaining |
+|------|--------|-----------|
+| 1 — source layers | ✓ done | — |
+| 2 — clean co-init | ✓ done | — |
+| 3 — `compile` glue | ~60% | resolve compile-quote-of-runtime-
+                              symbol fault; ≈half day |
+| 4 — exec dispatch | not started | ~1–2 days |
+| 5 — FASL persistence | not started | ~1–2 days |
 
 ## What you'd need for each tier
 

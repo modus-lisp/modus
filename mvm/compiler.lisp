@@ -201,7 +201,25 @@
                         "*COMPILE-FILE-PATHNAME*" "*COMPILE-FILE-TRUENAME*"
                         "*COMPILE-PRINT*" "*COMPILE-VERBOSE*"
                         "*LOAD-PATHNAME*" "*LOAD-TRUENAME*"
-                        "*LOAD-PRINT*" "*LOAD-VERBOSE*"))
+                        "*LOAD-PRINT*" "*LOAD-VERBOSE*"
+                        ;; Compiler-internal dynamic bindings.  Treat
+                        ;; mvm-compile-all's outer let-bindings as
+                        ;; dynamic so inner compile-form / compile-call
+                        ;; calls see the per-invocation state via global
+                        ;; reads.  Without this they're lexical, the
+                        ;; inner calls dereference the global (which is
+                        ;; either NIL or whatever the previous compile
+                        ;; left behind), and the first hash-table
+                        ;; lookup faults.  See docs/runtime-compile.md.
+                        "*FUNCTIONS*" "*FUNCTION-TABLE*" "*CONSTANT-TABLE*"
+                        "*LABEL-COUNTER*" "*UNRESOLVED-CALLS*"
+                        "*MACRO-TABLE*" "*GLOBALS*" "*CONSTANTS*"
+                        "*LOOP-EXIT-LABEL*" "*BLOCK-LABELS*"
+                        "*TAGBODY-TAGS*" "*PENDING-FLET-IR*"
+                        "*CURRENT-SOURCE-LOCATION*" "*COMPILE-TRACE*"
+                        "*FRAME-SLOTS*" "*CURRENT-FN*" "*CURRENT-FN-NAME*"
+                        "*OPCODE-TABLE*" "*VREG-TO-X64*"
+                        "*CONDITION-CODES*"))
           (setf (gethash (compute-name-hash name) tab) t))
         (setq *clhs-standard-specials-hashes* tab)
         tab)))

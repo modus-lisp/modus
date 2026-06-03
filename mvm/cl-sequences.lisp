@@ -1732,16 +1732,74 @@
 (defun make-sequence (type size &rest args)
   "Make a sequence of TYPE and SIZE.  Supports :initial-element.
    Accepts compound type forms like (VECTOR), (VECTOR *), (VECTOR T 5)
-   by dispatching on the head symbol (CLHS 17.1.3)."
+   by dispatching on the head symbol (CLHS 17.1.3).  Class objects
+   (returned by FIND-CLASS) and class-proxies (from CLASS-OF) are
+   resolved to their NAME first.  Per CLHS, when the compound spec
+   pins a length (e.g. (VECTOR T 4)) and SIZE disagrees, the call
+   must signal type-error.  Unrecognised non-sequence type names
+   (SYMBOL, INTEGER, ...) likewise signal type-error."
+  ;; Resolve a class designator (class object or class-proxy) to its name
+  ;; so the dispatch below can match symbols uniformly.  Keeps callers
+  ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
+  (when (or (%clos-class-p type) (%class-proxy-p type))
+    (setq type (class-name type)))
   (let ((init nil) (a args)
         (head (if (consp type) (car type) type)))
+    ;; Pinned-length check: a (VECTOR ELT-TYPE N) / (STRING N) etc. that
+    ;; supplies an integer in the length slot must match SIZE.  Walking
+    ;; the spec here once avoids per-branch duplication.
+    (when (and (consp type) (consp (cdr type)))
+      (let* ((rest (cdr type))
+             (len-slot (cond
+                         ((or (eq head 'string) (eq head 'simple-string)
+                              (eq head 'base-string)
+                              (eq head 'simple-base-string)
+                              (eq head 'bit-vector)
+                              (eq head 'simple-bit-vector))
+                          (car rest))
+                         ((or (eq head 'vector) (eq head 'simple-vector)
+                              (eq head 'array) (eq head 'simple-array))
+                          (and (consp (cdr rest)) (cadr rest)))
+                         (t '*))))
+        (when (and (integerp len-slot) (not (= len-slot size)))
+          (%signal-type-error))))
     (loop (when (null a) (return))
       (when (eq (car a) :initial-element) (setq init (cadr a)) (return))
       (setq a (cddr a)))
+    ;; Kwarg validation: odd-length args list or unknown keyword
+    ;; (without :allow-other-keys T) signals program-error per CLHS
+    ;; 3.4.1.4.  Recognized keys: :initial-element, :allow-other-keys.
+    ;; (make-sequence.error.10/11/12/13)
+    (let ((p args) (allow-other nil))
+      (let ((scan args))
+        (loop (when (or (null scan) (null (cdr scan))) (return))
+          (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+            (setq allow-other t))
+          (setq scan (cddr scan))))
+      (loop
+        (when (null p) (return))
+        (when (null (cdr p)) (%signal-program-error) (return))
+        (let ((k (car p)))
+          (unless (or (eq k :initial-element)
+                      (eq k :allow-other-keys)
+                      allow-other)
+            (%signal-program-error)
+            (return)))
+        (setq p (cddr p))))
     (cond
-      ;; null: only valid for size 0; returns NIL
-      ((eq head 'null) (if (= size 0) nil (make-array size)))
-      ((or (eq head 'list) (eq head 'cons))
+      ;; null: only valid for size 0; non-zero size signals type-error
+      ;; (CLHS — NULL has cardinality 1, so size>0 doesn't fit).
+      ((eq head 'null)
+       (if (= size 0) nil (progn (%signal-type-error) nil)))
+      ;; cons: at least 1 element; size=0 signals type-error (CONS
+      ;; cardinality ≥ 1 — the empty list isn't a CONS).
+      ((eq head 'cons)
+       (if (= size 0)
+           (progn (%signal-type-error) nil)
+           (let ((r nil) (i 0))
+             (loop (when (= i size) (return r))
+               (setq r (cons init r)) (setq i (+ i 1))))))
+      ((eq head 'list)
        (let ((r nil) (i 0))
          (loop (when (= i size) (return r))
            (setq r (cons init r)) (setq i (+ i 1)))))
@@ -1759,11 +1817,19 @@
          (let ((i 0) (b (or init 0)))
            (loop (when (= i size) (return v))
              (aset v i b) (setq i (+ i 1))))))
-      (t  ;; Generic vector / array / sequence / null type fall-back.
-       ;; ALWAYS fill, even when init is NIL — caller asked for NIL
-       ;; explicitly; we shouldn't leave the default-zero in place.
-       ;; Use a sentinel keyword to detect whether :initial-element
-       ;; was actually passed vs. defaulted to NIL.
+      ;; Symbol / integer / function / etc. — KNOWN non-sequence built-in
+      ;; types.  CLHS demands type-error.  (make-sequence.error.1)
+      ((member head '(symbol integer function character keyword
+                      ratio rational complex number real
+                      hash-table package readtable stream pathname))
+       (%signal-type-error)
+       nil)
+      (t
+       ;; Generic vector / array / sequence fall-back: also catches
+       ;; class-proxy-derived names like 'standard-object that aren't
+       ;; in the head list above but represent runtime vector types.
+       ;; ALWAYS-fill via :initial-element-provided detection prevents
+       ;; the default-zero from leaking through.
        (let ((v (make-array size))
              (initial-provided (let ((found nil) (p args))
                                  (loop (when (null p) (return found))

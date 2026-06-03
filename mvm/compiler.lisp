@@ -162,6 +162,50 @@
 (defvar *globals* (make-hash-table :test 'eql)
   "Set of known global variable names (hash -> t)")
 
+(defvar *let-skip-implicit-specials* nil
+  "When T, compile-form's let/let* dispatch skips the implicit-special
+   detection for CLHS-standard earmuffs.  compile-let-with-specials
+   binds this to T around the recursive compile-form on its emitted
+   let* — otherwise the dispatch re-detects the same names and recurses
+   forever.")
+
+(defvar *clhs-standard-specials-hashes* nil
+  "Allowlist of CLHS-standard special-variable names (by name-hash).
+   Lazily populated by %ensure-clhs-specials-table on first
+   compile-let-dispatch.  Restricting implicit-special detection to
+   this list avoids the false positives that bit an earlier attempt
+   that marked every defvar'd name as special — user-source
+   `(let ((*x* 5)) ...)` for a defvar'd test helper would regress.
+   Only names CLHS *defines* as special belong here.")
+
+(defun %ensure-clhs-specials-table ()
+  (or *clhs-standard-specials-hashes*
+      (let ((tab (make-hash-table :test 'eql)))
+        (dolist (name '(;; Reader / printer state
+                        "*PACKAGE*" "*READTABLE*"
+                        "*PRINT-ARRAY*" "*PRINT-BASE*" "*PRINT-CASE*"
+                        "*PRINT-CIRCLE*" "*PRINT-ESCAPE*" "*PRINT-GENSYM*"
+                        "*PRINT-LENGTH*" "*PRINT-LEVEL*" "*PRINT-LINES*"
+                        "*PRINT-MISER-WIDTH*" "*PRINT-PPRINT-DISPATCH*"
+                        "*PRINT-PRETTY*" "*PRINT-RADIX*" "*PRINT-READABLY*"
+                        "*PRINT-RIGHT-MARGIN*"
+                        "*READ-BASE*" "*READ-DEFAULT-FLOAT-FORMAT*"
+                        "*READ-EVAL*" "*READ-SUPPRESS*"
+                        ;; Standard streams
+                        "*STANDARD-INPUT*" "*STANDARD-OUTPUT*" "*ERROR-OUTPUT*"
+                        "*TRACE-OUTPUT*" "*DEBUG-IO*" "*QUERY-IO*" "*TERMINAL-IO*"
+                        ;; Misc CL-standard specials
+                        "*FEATURES*" "*MODULES*" "*GENSYM-COUNTER*"
+                        "*RANDOM-STATE*" "*MACROEXPAND-HOOK*" "*BREAK-ON-SIGNALS*"
+                        "*DEBUGGER-HOOK*" "*DEFAULT-PATHNAME-DEFAULTS*"
+                        "*COMPILE-FILE-PATHNAME*" "*COMPILE-FILE-TRUENAME*"
+                        "*COMPILE-PRINT*" "*COMPILE-VERBOSE*"
+                        "*LOAD-PATHNAME*" "*LOAD-TRUENAME*"
+                        "*LOAD-PRINT*" "*LOAD-VERBOSE*"))
+          (setf (gethash (compute-name-hash name) tab) t))
+        (setq *clhs-standard-specials-hashes* tab)
+        tab)))
+
 (defvar *constants* (make-hash-table :test 'eql)
   "Map from constant name (hash) to compile-time value")
 
@@ -2355,15 +2399,47 @@
       ((= op-name 448736678201786992)       (compile-if (cdr form) env dest))
       ((= op-name 87505416312042891)    (compile-progn (cdr form) env dest))
       ((= op-name 347164158959663450)
-       (let ((specials (extract-special-vars (cddr form))))
+       (let* ((bindings (cadr form))
+              (body (cddr form))
+              (declared (extract-special-vars body))
+              (implicit
+                (if *let-skip-implicit-specials* nil
+                    (let ((acc nil))
+                      (dolist (b bindings)
+                        (let ((var (if (consp b) (car b) b)))
+                          (when (and (symbolp var)
+                                     (gethash (normalize-name var)
+                                              (%ensure-clhs-specials-table))
+                                     (not (member (symbol-name var) declared
+                                                  :key #'symbol-name
+                                                  :test #'string=)))
+                            (push var acc))))
+                      (nreverse acc))))
+              (specials (append declared implicit)))
          (if specials
-             (compile-let-with-specials (cadr form) (cddr form) specials env dest)
-             (compile-let (cadr form) (cddr form) env dest))))
+             (compile-let-with-specials bindings body specials env dest)
+             (compile-let bindings body env dest))))
       ((= op-name 115433002357585904)
-       (let ((specials (extract-special-vars (cddr form))))
+       (let* ((bindings (cadr form))
+              (body (cddr form))
+              (declared (extract-special-vars body))
+              (implicit
+                (if *let-skip-implicit-specials* nil
+                    (let ((acc nil))
+                      (dolist (b bindings)
+                        (let ((var (if (consp b) (car b) b)))
+                          (when (and (symbolp var)
+                                     (gethash (normalize-name var)
+                                              (%ensure-clhs-specials-table))
+                                     (not (member (symbol-name var) declared
+                                                  :key #'symbol-name
+                                                  :test #'string=)))
+                            (push var acc))))
+                      (nreverse acc))))
+              (specials (append declared implicit)))
          (if specials
-             (compile-let-with-specials (cadr form) (cddr form) specials env dest t)
-             (compile-let* (cadr form) (cddr form) env dest))))
+             (compile-let-with-specials bindings body specials env dest t)
+             (compile-let* bindings body env dest))))
       ((= op-name 565254038635891948)
        ;; CLHS 5.1.2.5: (setq var1 val1 var2 val2 ...) — multiple pairs allowed.
        ;; Compile all but the LAST pair with dest=ignored; LAST pair uses dest.
@@ -4101,19 +4177,21 @@
                          collect `(setf (mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64) ,sv)))))
       (if sequential
           ;; let* context: keep ALL bindings in original order, then save/set/restore specials
-          (compile-form
-            `(let* ,bindings
-               (let* ,save-bindings
-                 ,@set-forms
-                 (let ((%special-result (progn ,@stripped-body)))
-                   (let* ,mv-save-bindings
-                     ,@restore-forms
-                     ,@mv-restore-forms
-                     %special-result))))
-            env dest)
+          (let ((*let-skip-implicit-specials* t))
+            (compile-form
+              `(let* ,bindings
+                 (let* ,save-bindings
+                   ,@set-forms
+                   (let ((%special-result (progn ,@stripped-body)))
+                     (let* ,mv-save-bindings
+                       ,@restore-forms
+                       ,@mv-restore-forms
+                       %special-result))))
+              env dest))
           ;; let context: combine all bindings into a single let* to minimize nesting depth.
           ;; Order: regular bindings, special bindings, save bindings, then set+body+restore.
-          (let ((all-bindings (append bindings save-bindings)))
+          (let ((all-bindings (append bindings save-bindings))
+                (*let-skip-implicit-specials* t))
             (compile-form
               `(let* ,all-bindings
                  ,@set-forms

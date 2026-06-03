@@ -2629,7 +2629,10 @@
         (setq i (+ i 1))))))
 
 (defun read-line (&rest args)
-  "Read a line from a stream. Args: [stream [eof-error-p [eof-value [recursive-p]]]]"
+  "Read a line from a stream. Args: [stream [eof-error-p [eof-value [recursive-p]]]].
+   Per CLHS arity is at most 4 positional args — a 5th signals
+   program-error."
+  (when (> (length args) 4) (%signal-program-error))
   (let ((stream-arg (if args (car args) nil))
         (eof-error-p (if (cdr args) (cadr args) t))
         (eof-value (if (cddr args) (caddr args) nil)))

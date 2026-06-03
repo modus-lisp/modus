@@ -2587,10 +2587,26 @@
         (%write-char-to-stream code s)))
     saved-ch))
 
-(defun finish-output (&rest args) nil)
-(defun force-output (&rest args) nil)
-(defun clear-output (&rest args) nil)
-(defun clear-input (&rest args) nil)
+(defun finish-output (&rest args)
+  "CLHS: takes at most one argument (the stream).  Extra signal
+   program-error.  Modus's stub is a no-op otherwise."
+  (when (cdr args) (%signal-program-error))
+  nil)
+(defun force-output (&rest args)
+  "CLHS: takes at most one argument (the stream).  Extra signal
+   program-error.  Modus's stub is a no-op otherwise."
+  (when (cdr args) (%signal-program-error))
+  nil)
+(defun clear-output (&rest args)
+  "CLHS: takes at most one argument (the stream).  Extra signal
+   program-error.  Modus's stub is a no-op otherwise."
+  (when (cdr args) (%signal-program-error))
+  nil)
+(defun clear-input (&rest args)
+  "CLHS: takes at most one argument (the stream).  Extra positional
+   args signal program-error.  Modus's stub is a no-op otherwise."
+  (when (cdr args) (%signal-program-error))
+  nil)
 (defun listen (&rest args)
   "Check if input is available on stream."
   (let ((s (%resolve-input-stream (if args (car args) nil))))

@@ -421,6 +421,23 @@
   (setq *rt-registered-tests*
         (cons (list name thunk expected) *rt-registered-tests*)))
 
+(defun %install-runtime-cl-macros-late ()
+  "Re-attempt installing runtime CL macros after boot.  The compiled-
+   context install at boot-time has a stability bug — most macros
+   register cleanly, but ones whose bodies are wider (longer source
+   strings) trip an as-yet-undiagnosed condition flow inside
+   handler-case.  Calling the same loop from a non-boot context
+   (here, just before tests run) succeeds: same source forms, same
+   eval, but no failures.  Until the root cause is found, do the
+   install twice — boot gets the easy ones, this pass mops up the
+   rest."
+  (when (boundp '*modus-runtime-macros*)
+    (let ((forms *modus-runtime-macros*))
+      (loop
+        (when (null forms) (return nil))
+        (handler-case (eval (read-from-string (car forms))) (t (c) nil))
+        (setq forms (cdr forms))))))
+
 (defun %install-modus-test-aux-overrides ()
   "Replace ansi-aux.lsp's implementation-specific helper macros with
    Modus-friendly versions.
@@ -452,6 +469,10 @@
   ;; Install Modus-friendly signals-error (overwriting ansi-aux's
   ;; catch-based version) so .error.N tests behave correctly here.
   (%install-modus-test-aux-overrides)
+  ;; Mop up any runtime CL macros that the boot-time install missed
+  ;; (the compiled-context loop has a stability bug — see
+  ;; %install-runtime-cl-macros-late docstring).
+  (%install-runtime-cl-macros-late)
   (let ((all (nreverse *rt-registered-tests*))
         (pass 0) (fail 0) (crash 0))
     (setq *rt-registered-tests* nil)

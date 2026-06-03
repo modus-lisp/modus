@@ -41,9 +41,10 @@
 
 (format t "Reading source files...~%")
 
-(defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
-(defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
-(defvar *rt-source*      (mvm-text "mvm/rt.lisp"))
+(defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
+(defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
+(defvar *rt-source*       (mvm-text "mvm/rt.lisp"))
+(defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
 (defvar *bridge-source*
   (concatenate 'string
     (mvm-text "mvm/cl-sequences.lisp")
@@ -195,6 +196,12 @@
   ;; budget* defvars to 0 which immediately exhausts; we want a huge
   ;; budget so test names print fully.
   (setq *write-object-budget* 1000000)
+  ;; Runtime CL macros (when/unless/setf/incf/case/dolist/etc.) — must
+  ;; come AFTER init-all-globals so *modus-runtime-macros* has its
+  ;; defvar value before we walk it.  Outer handler-case in case a
+  ;; macro source string fails to parse (the install fn itself doesn't
+  ;; wrap — see %install-runtime-cl-macros docstring).
+  (handler-case (%install-runtime-cl-macros) (t (c) nil))
   (let ((path (%argv1)))
     (cond
       ((null path)
@@ -212,10 +219,11 @@
 ")
 
 (defvar *all-runtime-source*
-  (concatenate 'string *prelude-source* (string #\Newline)
-                       *gc-source* (string #\Newline)
-                       *rt-source* (string #\Newline)
-                       *bridge-source* (string #\Newline)
+  (concatenate 'string *prelude-source*  (string #\Newline)
+                       *gc-source*       (string #\Newline)
+                       *rt-source*       (string #\Newline)
+                       *rt-macros-source* (string #\Newline)
+                       *bridge-source*   (string #\Newline)
                        *driver-source*))
 
 (defvar *all-defun-names*
@@ -408,6 +416,8 @@
     *gc-source*
     (string #\Newline)
     *rt-source*
+    (string #\Newline)
+    *rt-macros-source*
     (string #\Newline)
     *bridge-source*
     (string #\Newline)

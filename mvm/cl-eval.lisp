@@ -2105,14 +2105,30 @@
 
 (defun %parse-start-end (args len)
   "Extract :start (default 0) and :end (default LEN, NIL→LEN) from ARGS.
-   Returns (cons start end)."
-  (let ((start 0) (end len) (a args))
+   Returns (cons start end).
+
+   Per CLHS 3.4.1.4: odd-length arg list signals program-error;
+   unknown keys (without :allow-other-keys T) signal program-error.
+   Recognised keys: :start :end :allow-other-keys.  Leftmost
+   :allow-other-keys value wins (3.4.1.4.1)."
+  (let ((start 0) (end len) (a args)
+        (allow-other nil) (allow-other-set nil))
+    ;; First pass: determine leftmost :allow-other-keys.
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (not allow-other-set))
+          (setq allow-other-set t)
+          (when (cadr scan) (setq allow-other t)))
+        (setq scan (cddr scan))))
     (loop
       (when (null a) (return nil))
-      (when (null (cdr a)) (return nil))
-      (cond
-        ((eq (car a) :start) (setq start (cadr a)))
-        ((eq (car a) :end)   (let ((e (cadr a))) (setq end (if (null e) len e)))))
+      (when (null (cdr a)) (%signal-program-error) (return nil))
+      (let ((k (car a)))
+        (cond
+          ((eq k :start) (setq start (cadr a)))
+          ((eq k :end)   (let ((e (cadr a))) (setq end (if (null e) len e))))
+          ((eq k :allow-other-keys) nil)
+          (t (unless allow-other (%signal-program-error) (return nil)))))
       (setq a (cddr a)))
     (cons start end)))
 

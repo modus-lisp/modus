@@ -3628,17 +3628,24 @@
 
 ;; replace: copy elements from one sequence to another
 (defun replace (seq1 seq2 &rest args)
-  "Destructively replace elements of SEQ1 with elements from SEQ2."
-  (let ((start1 0) (end1 nil) (start2 0) (end2 nil))
+  "Destructively replace elements of SEQ1 with elements from SEQ2.
+   Per CLHS 3.4.1.4: validates kwarg shape — odd-length / unknown
+   keys (without :allow-other-keys T) signal program-error."
+  (%check-kw-allowed args '(:start1 :end1 :start2 :end2))
+  ;; CLHS 3.4.1.4.1 leftmost-wins on duplicate kwargs — use *-set
+  ;; sentinels so a repeated :start1 / :end1 / :start2 / :end2 keeps
+  ;; the first value.  (replace.keywords.7)
+  (let ((start1 0) (end1 nil) (start2 0) (end2 nil)
+        (s1-set nil) (e1-set nil) (s2-set nil) (e2-set nil))
     (let ((cur args))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :start1) (setq start1 v))
-            ((eq k :end1) (setq end1 v))
-            ((eq k :start2) (setq start2 v))
-            ((eq k :end2) (setq end2 v))))
+            ((and (eq k :start1) (not s1-set)) (setq start1 v s1-set t))
+            ((and (eq k :end1)   (not e1-set)) (setq end1 v   e1-set t))
+            ((and (eq k :start2) (not s2-set)) (setq start2 v s2-set t))
+            ((and (eq k :end2)   (not e2-set)) (setq end2 v   e2-set t))))
         (setq cur (cddr cur))))
     (when (null end1) (setq end1 (length seq1)))
     (when (null end2) (setq end2 (length seq2)))

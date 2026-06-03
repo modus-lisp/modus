@@ -2043,10 +2043,18 @@
 
   ;; MAPHASH — inline when called with #'(lambda ...) to avoid closure mutation issues.
   ;; For non-lambda calls, expand to call %maphash-impl (the function version).
+  ;; Per CLHS MAPHASH takes exactly 2 args; 0/1/3+ signal program-error.
   (mvm-define-macro "MAPHASH"
     (lambda (form)
-      (let ((fn-form (cadr form))
-            (ht-form (caddr form)))
+      (let ((args (cdr form)))
+        (cond
+          ;; Arity check (maphash.error.1/2/3): wrong arg count → emit
+          ;; a runtime program-error call so signals-error catches.
+          ((not (and (consp args) (consp (cdr args)) (null (cddr args))))
+           '(%signal-program-error))
+          (t
+           (let ((fn-form (cadr form))
+                 (ht-form (caddr form)))
         ;; Detect (maphash #'(lambda (k v) body...) ht) pattern
         (if (and (consp fn-form)
                  (consp (cdr fn-form))
@@ -2077,7 +2085,7 @@
                          ,@body))
                      (setq ,cur-tmp (cdr ,cur-tmp))))))
             ;; Non-lambda: delegate to function version
-            `(%maphash-impl ,fn-form ,ht-form)))))
+            `(%maphash-impl ,fn-form ,ht-form))))))))
   )
 
 ;;; ============================================================

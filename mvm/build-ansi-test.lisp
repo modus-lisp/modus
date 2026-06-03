@@ -3776,26 +3776,6 @@
   (setq *type-list* nil)
   (setq *supertype-table* nil)
 
-  ;; ANSI aux helper character set constants.  ansi-aux.lsp's
-  ;; defparameters don't run their init-thunks under Modus
-  ;; (CLAUDE.md known limitation #7), so without explicit setqs every
-  ;; reference to +standard-chars+ / +alpha-chars+ etc. resolves to NIL
-  ;; and (map 'string #'char-upcase +alpha-chars+) returns nothing
-  ;; useful.  Only the alpha / digit subsets are referenced by the
-  ;; tests we care about today.  The inner double-quotes are escaped
-  ;; because this form lives inside the outer *driver-source* string.
-  (setq +alpha-chars+
-        \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\")
-  (setq +lower-case-chars+ (subseq +alpha-chars+ 0 26))
-  (setq +upper-case-chars+ (subseq +alpha-chars+ 26 52))
-  (setq +digit-chars+ \"0123456789\")
-  (setq +alphanumeric-chars+ (concatenate 'string +alpha-chars+ +digit-chars+))
-  (setq +standard-chars+ +alphanumeric-chars+)
-  (setq +base-chars+ +alphanumeric-chars+)
-  (setq +num-base-chars+ (length +base-chars+))
-  (setq +extended-digit-chars+
-        \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\")
-
   ;; Parse argv from BSS (boot stub writes argc/argv there).
   ;;   argv[1] → *skip-below*       (skip tests with id < N)
   ;;   argv[2] → *run-only-below*   (skip tests with id >= M)

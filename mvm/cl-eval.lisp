@@ -989,6 +989,41 @@
     (cond
       ;; QUOTE
       ((%eval-sym-eq op "QUOTE") (car args))
+      ;; FUNCALL — special-cased because there's no defun for funcall
+      ;; (the compiler emits it inline at every call site) and routing
+      ;; through %eval-funcall's SFT lookup would signal undefined-
+      ;; function.  Evaluate fn + args here and dispatch via
+      ;; %do-funcall, which handles interp-closures, compiled defuns,
+      ;; native MVM symbols, and &rest packing uniformly.
+      ((%eval-sym-eq op "FUNCALL")
+       (let* ((fn-val (%eval-in-env (car args) env))
+              (call-args (%eval-args (cdr args) env)))
+         (%do-funcall fn-val call-args)))
+      ;; APPLY — same shape as FUNCALL but the trailing arg is a list
+      ;; that gets spread.  Per CLHS (apply fn a b c rest-list) calls
+      ;; fn with args (a b c . rest-list) — i.e. leading args are
+      ;; consed onto rest-list to form the full arg list.
+      ((%eval-sym-eq op "APPLY")
+       (let* ((fn-val (%eval-in-env (car args) env))
+              (rest-forms (cdr args))
+              (n (length rest-forms))
+              (evaled (%eval-args rest-forms env))
+              (call-args
+               (cond
+                 ((= n 0) nil)
+                 ((= n 1) (car evaled))
+                 (t
+                  ;; All but the last are individual args; the last is
+                  ;; the spread list.  Walk and reverse-cons.
+                  (let ((leading nil) (cur evaled))
+                    (loop
+                      (when (null (cdr cur))
+                        (return (let ((acc (car cur)))
+                                  (dolist (x leading acc)
+                                    (setq acc (cons x acc))))))
+                      (setq leading (cons (car cur) leading))
+                      (setq cur (cdr cur))))))))
+         (%do-funcall fn-val call-args)))
       ;; IF
       ((%eval-sym-eq op "IF")
        (if (%eval-in-env (car args) env)

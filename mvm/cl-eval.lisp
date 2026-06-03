@@ -3449,7 +3449,37 @@
    Honors atomic and compound result types (list / string / vector /
    bit-vector / array / NULL, plus (vector ...) (string ...) etc.).
    Coerces each input seq to a list of (already-decoded) elements so a
-   string seq yields characters (via code-char), not raw integers."
+   string seq yields characters (via code-char), not raw integers.
+
+   Per CLHS 17.2.1: SIGNAL type-error when RESULT-TYPE is a known
+   non-sequence designator (SYMBOL, INTEGER, ...) or when a pinned-
+   length compound spec doesn't match the produced length.  Per CLHS
+   15.5: at least one sequence argument is required — zero seqs
+   signals program-error."
+  (when (null seqs) (%signal-program-error))
+  ;; Type-error on known non-sequence head + on pinned-length mismatch.
+  (when result-type
+    (let* ((head (if (consp result-type) (car result-type) result-type)))
+      (when (member head '(symbol integer function character keyword
+                           ratio rational complex number real
+                           hash-table package readtable stream pathname))
+        (%signal-type-error))
+      (when (and (consp result-type) (consp (cdr result-type)))
+        (let* ((rest (cdr result-type))
+               (produced (and seqs (length (car seqs))))
+               (len-slot (cond
+                           ((or (eq head 'string) (eq head 'simple-string)
+                                (eq head 'base-string)
+                                (eq head 'simple-base-string)
+                                (eq head 'bit-vector)
+                                (eq head 'simple-bit-vector))
+                            (car rest))
+                           ((or (eq head 'vector) (eq head 'simple-vector)
+                                (eq head 'array) (eq head 'simple-array))
+                            (and (consp (cdr rest)) (cadr rest)))
+                           (t '*))))
+          (when (and (integerp len-slot) produced (not (= len-slot produced)))
+            (%signal-type-error))))))
   (cond
     ((null result-type)
      (apply #'mapc fn seqs)

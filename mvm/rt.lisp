@@ -421,12 +421,37 @@
   (setq *rt-registered-tests*
         (cons (list name thunk expected) *rt-registered-tests*)))
 
+(defun %install-modus-test-aux-overrides ()
+  "Replace ansi-aux.lsp's implementation-specific helper macros with
+   Modus-friendly versions.
+
+   ansi-aux's signals-error is `(not (catch 0 ,form t))`, which relies
+   on the implementation translating errors into throws — that holds
+   for some Lisps but not Modus (catch and handler-case use the same
+   setjmp/longjmp mechanism but compile-time catch's handler re-raises
+   non-throw conditions per strict CL semantics).  Override with a
+   handler-case form that's correct everywhere.
+
+   Tests survive: the test thunks captured at deftest-expansion time
+   embed signals-error CALL FORMS (not the expanded macro), so once
+   we re-install the macro here the next runtime EVAL inside each
+   thunk picks up the new expander."
+  (set-macro-function 'signals-error
+    (eval '(lambda (form &rest ignored)
+             (declare (ignore ignored))
+             (list 'handler-case
+                   (list 'progn form 'nil)
+                   '(t (c) t))))))
+
 (defun rt-run-registered-tests ()
   "Walk *rt-registered-tests* in registration order (i.e. reverse the
    head-most-recent list) and run each thunk.  Compare its multiple-
    value return to expected via rt-equal.  Emit P:<id> / FAIL <id>
    lines compatible with the existing shard summary scripts.  Returns
    (values pass-count fail-count crash-count)."
+  ;; Install Modus-friendly signals-error (overwriting ansi-aux's
+  ;; catch-based version) so .error.N tests behave correctly here.
+  (%install-modus-test-aux-overrides)
   (let ((all (nreverse *rt-registered-tests*))
         (pass 0) (fail 0) (crash 0))
     (setq *rt-registered-tests* nil)
@@ -441,9 +466,9 @@
               ;; Route through %do-funcall — the test thunk is an
               ;; interp-closure from deftest's runtime expansion, and
               ;; compile-funcall's compiled dispatch doesn't handle that
-              ;; representation.  Single-value only for now; MV-returning
-              ;; tests will need (multiple-value-list (%do-funcall ...)).
-              (let ((actual (list (%do-funcall thunk nil))))
+              ;; representation.  Wrap in multiple-value-list to capture
+              ;; (values …) results — order.N tests rely on that.
+              (let ((actual (multiple-value-list (%do-funcall thunk nil))))
                 (if (rt-equal actual expected)
                     (progn
                       (setq pass (+ pass 1))

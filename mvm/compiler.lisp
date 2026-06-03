@@ -2555,6 +2555,14 @@
                                     ,@body)))))
            (mvm-define-macro (normalize-name name) expander))
          (compile-nil dest)))
+      ;; DEFSTRUCT inside an expression context.  Same fall-through trap
+      ;; as nested DEFUN / DEFMACRO.  Route through mvm-compile-toplevel
+      ;; which already knows how to process DEFSTRUCT — registers
+      ;; constructor / accessors / predicates / setters so subsequent
+      ;; calls in the same source resolve them.  Yields NIL into dest.
+      ((= op-name 347335033216607151)   ; DEFSTRUCT
+       (mvm-compile-toplevel form)
+       (compile-nil dest))
       ;; DEFVAR / DEFPARAMETER inside an expression context.  Same fall-
       ;; through trap as DEFUN: nested DEFVAR landed in compile-call as
       ;; a call to a function named "DEFVAR", evaluating BODY at runtime.

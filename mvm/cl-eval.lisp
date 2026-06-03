@@ -57,12 +57,33 @@
    - String:               (STRING . HASH-of-STRING)
    - Native MVM #x50 sym:  (\"\" . SLOT-0-HASH)   ; no recoverable name
    - Native MVM #x53 kw:   (\"\" . SLOT-0-HASH)
+   - (setf NAME) list:     (\"SETF-NAME\" . HASH-of-that)
+                           — CLHS 5.1.2: a function name is either a
+                           symbol or a list (setf symbol); the latter
+                           routes through the SET-NAME convention in
+                           Modus's function tables.
    Returns NIL for non-symbols.  The lookup tables index by both name
    (when known) and hash; native symbols only carry the hash, so we use
    that as the primary key in *native-sym-function-table*."
   (cond
     ((null sym) nil)
     ((eq sym t) nil)
+    ;; (setf NAME) function-name list — CLHS 5.1.2.
+    ((and (consp sym) (consp (cdr sym)) (null (cddr sym))
+          (let ((head (car sym)))
+            (and (or (symbolp head) (stringp head))
+                 (let ((hn (cond ((stringp head) head)
+                                 ((%cl-sym-p head) (%cl-sym-name head))
+                                 (t (symbol-name head)))))
+                   (and hn (string= hn "SETF")))))
+          (let ((inner (cadr sym)))
+            (or (symbolp inner) (stringp inner))))
+     (let* ((inner (cadr sym))
+            (inner-name (cond ((stringp inner) inner)
+                              ((%cl-sym-p inner) (%cl-sym-name inner))
+                              (t (symbol-name inner))))
+            (full (concatenate 'string "SETF-" inner-name)))
+       (cons full (compute-name-hash full))))
     ((%cl-sym-p sym)
      (let ((nm (%cl-sym-name sym)))
        (when nm (cons nm (compute-name-hash nm)))))

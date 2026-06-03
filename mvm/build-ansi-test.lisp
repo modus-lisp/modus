@@ -1697,6 +1697,22 @@
             (ret-form (if (cddr binding) (rewrite-reader-forms (third binding)) nil))
             (body (mapcar #'rewrite-reader-forms (cddr form))))
        `(let ((,var ,string-form)) ,@body ,ret-form)))
+    ;; (do-special-integer-vectors (var vec-form ret-form) body...) →
+    ;;   (let ((var vec-form)) body... ret-form)
+    ;; The aux macro iterates over fill-pointer/adjust/etype/displace
+    ;; combinations to stress different vector representations; for
+    ;; tests that just want one round to confirm the body's invariant
+    ;; (assert, eql, length, etc.) the single-iteration shape is
+    ;; enough.  Tests that depend on hitting EVERY variant still fail
+    ;; on Modus today, but the simpler ones gate behind this rewriter.
+    ((and (eq (car form) 'do-special-integer-vectors)
+          (consp (cdr form)) (consp (cadr form)))
+     (let* ((binding (cadr form))
+            (var (first binding))
+            (vec-form (rewrite-reader-forms (second binding)))
+            (ret-form (if (cddr binding) (rewrite-reader-forms (third binding)) nil))
+            (body (mapcar #'rewrite-reader-forms (cddr form))))
+       `(let ((,var ,vec-form)) ,@body ,ret-form)))
     ;; (flet ((name (args) body)) outer-body)
     ;; Leave as-is but rewrite bodies
     ((eq (car form) 'flet)

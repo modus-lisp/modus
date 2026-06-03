@@ -2097,7 +2097,39 @@
 
 (defun concatenate (result-type &rest seqs)
   "Concatenate sequences.  Recognises list / string / vector result
-   types (atomic and compound forms like (vector * *))."
+   types (atomic and compound forms like (vector * *)).
+
+   Per CLHS 17.2.1: type-error when RESULT-TYPE is a known
+   non-sequence designator (FIXNUM, SYMBOL, etc.) or when a
+   pinned-length compound spec doesn't match the produced length."
+  ;; Reject known non-sequence head types + check pinned-length match.
+  (let* ((head (if (consp result-type) (car result-type) result-type)))
+    (when (member head '(symbol integer fixnum function character keyword
+                         ratio rational complex number real
+                         hash-table package readtable stream pathname
+                         ;; SEQUENCE is the abstract parent — no concrete
+                         ;; representation, so concatenate signals.  (CLHS
+                         ;; 17.1: result must be a concrete subtype.)
+                         sequence))
+      (%signal-type-error))
+    (when (and (consp result-type) (consp (cdr result-type)))
+      (let* ((rest (cdr result-type))
+             (total 0)
+             (len-slot (cond
+                         ((or (eq head 'string) (eq head 'simple-string)
+                              (eq head 'base-string)
+                              (eq head 'simple-base-string)
+                              (eq head 'bit-vector)
+                              (eq head 'simple-bit-vector))
+                          (car rest))
+                         ((or (eq head 'vector) (eq head 'simple-vector)
+                              (eq head 'array) (eq head 'simple-array))
+                          (and (consp (cdr rest)) (cadr rest)))
+                         (t '*))))
+        (when (integerp len-slot)
+          (dolist (s seqs) (setq total (+ total (%concat-elt-count s))))
+          (when (not (= len-slot total))
+            (%signal-type-error))))))
   (let ((kind (%concat-result-kind result-type)))
     (cond
       ((eq kind :list)

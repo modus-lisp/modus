@@ -227,6 +227,14 @@
 (defvar *constants* (make-hash-table :test 'eql)
   "Map from constant name (hash) to compile-time value")
 
+(defvar *init-thunk-names* nil
+  "Names of auto-generated INIT-* thunks emitted by the DEFVAR /
+   DEFPARAMETER handlers in mvm-compile-toplevel.  init-all-globals
+   is auto-generated from THIS list, not from a name-prefix scan —
+   the prefix scan caught user-defined defuns like INIT-SYMBOL-TABLE
+   (a boot helper, not a defvar thunk) and re-called them at the
+   wrong time, breaking things.")
+
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
 
@@ -11257,10 +11265,11 @@
        ;; 2) Wrap value in let to avoid register clobber when value is
        ;; a function call (which would clobber V0 holding the hash).
        (when value
-         (let ((tmp-var (gensym "INIT-TMP")))
+         (let ((tmp-var (gensym "INIT-TMP"))
+               (thunk-name (format nil "INIT-~A" (symbol-name name))))
+           (push thunk-name *init-thunk-names*)
            (mvm-compile-function
-            (format nil "INIT-~A" (symbol-name name))
-            nil
+            thunk-name nil
             (list `(let ((,tmp-var ,value))
                      (set-symbol-value ,name-hash ,tmp-var))))))))
 
@@ -11272,10 +11281,11 @@
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
        (when value
-         (let ((tmp-var (gensym "INIT-TMP")))
+         (let ((tmp-var (gensym "INIT-TMP"))
+               (thunk-name (format nil "INIT-~A" (symbol-name name))))
+           (push thunk-name *init-thunk-names*)
            (mvm-compile-function
-            (format nil "INIT-~A" (symbol-name name))
-            nil
+            thunk-name nil
             (list `(let ((,tmp-var ,value))
                      (set-symbol-value ,name-hash ,tmp-var))))))))
 
@@ -11609,6 +11619,7 @@
         (*block-labels* nil)
         (*tagbody-tags* nil)
         (*pending-flet-ir* nil)
+        (*init-thunk-names* nil)
         (all-ir nil))
 
     ;; Register standard macros (cond, and, or) for this compilation
@@ -11667,16 +11678,23 @@
     ;; Reverse to get compilation order
     (setf all-ir (nreverse all-ir))
 
-    ;; Auto-generate init-all-globals: calls every INIT-* thunk
-    (let ((init-calls nil))
-      (dolist (entry all-ir)
-        (let ((name (function-info-name (car entry))))
-          (when (and (stringp name)
-                     (>= (length name) 5)
-                     (string= name "INIT-" :end1 5))
-            (format t "  init thunk: ~A~%" name)
-            (push (list (intern name :modus.mvm)) init-calls))))
-      (when init-calls
+    ;; Auto-generate init-all-globals: call every defvar/defparameter
+    ;; init thunk we recorded in *init-thunk-names* during phase 1.
+    ;; Each call is wrapped in a per-thunk handler-case so one failing
+    ;; init (a value form that references a not-yet-bound symbol)
+    ;; can't abort the rest.
+    ;;
+    ;; Earlier this scanned all-ir for any function whose name started
+    ;; with INIT- — that incorrectly included user-defined defuns
+    ;; like INIT-SYMBOL-TABLE, which then got re-called at the wrong
+    ;; time during init-all-globals and broke boot.
+    (when *init-thunk-names*
+      (let ((init-calls nil))
+        (dolist (thunk-name (nreverse *init-thunk-names*))
+          (format t "  init thunk: ~A~%" thunk-name)
+          (push `(handler-case (,(intern thunk-name :modus.mvm))
+                   (t (c) nil))
+                init-calls))
         (let* ((result (mvm-compile-toplevel
                          `(defun init-all-globals ()
                             ,@(nreverse init-calls))))

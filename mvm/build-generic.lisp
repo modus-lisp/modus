@@ -185,12 +185,16 @@
   (setq *rt-pass-count* 0)
   (setq *rt-fail-count* 0)
   (setq *rt-registered-tests* nil)
-  ;; Generous default; *write-object-budget* gates per-call output to
-  ;; avoid runaway prints (cycles, deep nesting).  Unset would be NIL,
-  ;; causing the budget arithmetic in write-object to silently corrupt
-  ;; output after the first symbol print.
-  (setq *write-object-budget* 1000000)
   (%install-deftest-macro)
+  ;; Run all built-in defvar init thunks.  Each is wrapped in
+  ;; handler-case at compile time so a thunk that references a not-yet-
+  ;; bound symbol can't kill the chain — see CLAUDE.md known limitation
+  ;; #7 history.  Most thunks succeed and we get init values for free.
+  (init-all-globals)
+  ;; AFTER init-all-globals — overrides defvar's init.  *write-object-
+  ;; budget* defvars to 0 which immediately exhausts; we want a huge
+  ;; budget so test names print fully.
+  (setq *write-object-budget* 1000000)
   (let ((path (%argv1)))
     (cond
       ((null path)

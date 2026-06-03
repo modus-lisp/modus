@@ -1037,7 +1037,30 @@
     obj))
 
 (defun write (obj &rest args)
-  "Write OBJ with keyword args controlling print vars."
+  "Write OBJ with keyword args controlling print vars.  Per CLHS
+   3.4.1.4 validates kwarg shape — odd-length / unknown keys
+   (without :allow-other-keys T) signal program-error."
+  ;; Leftmost-wins on :allow-other-keys per CLHS 3.4.1.4.1.
+  (let ((allow-other nil) (allow-other-set nil))
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (not allow-other-set))
+          (setq allow-other-set t)
+          (when (cadr scan) (setq allow-other t)))
+        (setq scan (cddr scan))))
+    (let ((vp args))
+      (loop
+        (when (null vp) (return))
+        (when (null (cdr vp)) (%signal-program-error) (return))
+        (let ((k (car vp)))
+          (unless (or (member k '(:stream :escape :base :radix :case :level :length
+                                  :circle :gensym :array :readably :pretty :lines
+                                  :miser-width :right-margin :pprint-dispatch
+                                  :allow-other-keys))
+                      allow-other)
+            (%signal-program-error)
+            (return)))
+        (setq vp (cddr vp)))))
   ;; Parse :stream keyword
   (let ((stream *standard-output*))
     (let ((rest args))

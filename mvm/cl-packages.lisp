@@ -746,7 +746,11 @@
 ;;; --- import ---
 
 (defun import (symbols &rest pkg-arg)
-  "Import SYMBOLS into PKG."
+  "Import SYMBOLS into PKG.  Per CLHS the call takes one or two args:
+   the symbol designator and an optional package.  Extra positional
+   args signal program-error.  (import.error.2)"
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
                       symbols

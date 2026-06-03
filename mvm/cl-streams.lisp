@@ -148,10 +148,26 @@
 
 (defun make-string-output-stream (&rest args)
   "Create a string-output stream.  Per CLHS, accepts &key element-type;
-   we ignore it (all stream output is character-based) but accept any
-   keyword arguments so :element-type / :allow-other-keys forms compile.
-   Args are not validated against ANSI's strict program-error contract."
-  (declare (ignore args))
+   we ignore the actual value (all stream output is character-based).
+   Validate the kwarg shape — odd-length / unknown keys (without
+   :allow-other-keys T) signal program-error per CLHS 3.4.1.4."
+  (let ((allow-other nil))
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+          (setq allow-other t))
+        (setq scan (cddr scan))))
+    (let ((vp args))
+      (loop
+        (when (null vp) (return))
+        (when (null (cdr vp)) (%signal-program-error) (return))
+        (let ((k (car vp)))
+          (unless (or (eq k :element-type)
+                      (eq k :allow-other-keys)
+                      allow-other)
+            (%signal-program-error)
+            (return)))
+        (setq vp (cddr vp)))))
   (%make-stream 2 (cons nil nil)))
 
 (defun get-output-stream-string (stream)

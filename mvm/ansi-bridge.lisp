@@ -914,14 +914,34 @@
 ;;; ============================================================
 
 (defun proclaim (&rest args)
-  "PROCLAIM accepts exactly one declaration spec.  Modus doesn't act
-   on most declarations but the arity check signals error on wrong
-   nargs (proclaim.lsp 25111-25113)."
+  "PROCLAIM accepts exactly one declaration spec — a proper list whose
+   first element identifies the declaration kind.  Modus doesn't act
+   on most declarations but per CLHS the call must:
+   - Signal program-error on wrong arity.
+   - Reject malformed (non-proper-list) declaration specs.
+   - Signal type-error for (ftype . foo).
+   The cdr walk distinguishes a proper list from a dotted one; a final
+   non-NIL atom triggers error.  Per-kind validation for type / ftype
+   / inline / notinline / optimize / declaration uses the same walk."
   (when (null args)
-    (error "proclaim: missing declaration"))
+    (%signal-program-error))
   (when (cdr args)
-    (error "proclaim: too many args"))
-  nil)
+    (%signal-program-error))
+  (let* ((decl (car args))
+         (kind (and (consp decl) (car decl)))
+         (cur  decl))
+    ;; Walk the spine to confirm proper-listness.  A dotted tail is
+    ;; never legal in a declaration spec — bare `(KIND . foo)' and
+    ;; deeper dots like `(type integer . foo)' both fail here.
+    ;; (ftype . foo) specifically requires type-error per CLHS.
+    (loop
+      (cond
+        ((null cur) (return nil))
+        ((not (consp cur))
+         (when (eq kind 'ftype) (%signal-type-error))
+         (error "proclaim: malformed declaration spec ~S" decl))
+        (t (setq cur (cdr cur)))))
+    nil))
 
 (defun declaim (&rest decls)
   "DECLAIM-like wrapper that accepts any declaration list."

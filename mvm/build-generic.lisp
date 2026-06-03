@@ -105,11 +105,103 @@
           (push (string-upcase (subseq text start end)) names)
           (setq pos end))))))
 
+;; Driver source is concatenated into the image AND scanned for
+;; defun / symbol names, so defuns added in the driver (sys-exit,
+;; %argv1, runtime-bq-expand, etc.) land in *symbol-function-table*
+;; just like the CL runtime ones.  Forward-declared here; the actual
+;; content lives below (section 4).  See the trailing setf-via-symbol-
+;; value-set trick to overwrite this without re-reading the file.
+(defvar *driver-source* "
+(defun sys-exit (code)
+  (let ((c code))
+    (syscall3 60 c 0 0)))
+(defun halt ()
+  (syscall3 60 1 0 0))
+(defun %rbq-sym-name-eq (sym name)
+  (and (symbolp sym) (string= (symbol-name sym) name)))
+(defun runtime-bq-expand (template)
+  (cond
+    ((null template) nil)
+    ((and (consp template) (%rbq-sym-name-eq (car template) \"COMMA\"))
+     (cadr template))
+    ((atom template) (list 'quote template))
+    (t (runtime-bq-expand-list template))))
+(defun runtime-bq-expand-list (lst)
+  (cond
+    ((null lst) (list 'quote nil))
+    ((not (consp lst)) (runtime-bq-expand lst))
+    (t
+     (let ((first (car lst)) (rest (cdr lst)))
+       (cond
+         ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-AT\"))
+          (list 'append2 (cadr first) (runtime-bq-expand-list rest)))
+         ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-DOT\"))
+          (list 'append2 (cadr first) (runtime-bq-expand-list rest)))
+         (t
+          (list 'cons (runtime-bq-expand first)
+                (runtime-bq-expand-list rest))))))))
+(defun %install-runtime-backquote ()
+  (set-macro-function 'backquote
+                      (eval '(lambda (template) (runtime-bq-expand template)))))
+(defun %argv-string-at (addr)
+  (let ((len 0))
+    (let ((i 0))
+      (loop
+        (let ((b (mem-ref (+ addr i) :u8)))
+          (when (= b 0) (return nil))
+          (setq i (+ i 1)))
+        (setq len i)))
+    (if (zerop len) nil
+        (let ((s (%make-string-array len)) (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (aset s i (mem-ref (+ addr i) :u8))
+            (setq i (+ i 1)))))))
+(defun %argv1 () (%argv-string-at #x10000208))
+(defun %argv2 () (%argv-string-at #x10000248))
+(defun %argc  () (mem-ref #x10000200 :u32))
+(defun kernel-main ()
+  (init-symbol-table)
+  (init-keyword-table)
+  (%init-packages)
+  (%init-streams)
+  (%init-reader)
+  (%init-condition-types)
+  (%init-method-combinations)
+  (%init-symbol-function-table)
+  (%init-sft-auto)
+  (setq *sym-name-table* (make-hash-table))
+  (%init-sym-name-auto)
+  (setq *macro-table* (make-hash-table))
+  (%init-runtime-macros)
+  (setq *cstr-scratch* #x1DF00000)
+  (setq *io-buf-addr*  #x1DE00000)
+  (%init-signal-handling)
+  (%init-signal-symbols)
+  (%init-make-load-form)
+  (%install-runtime-backquote)
+  (let ((path (%argv1)))
+    (cond
+      ((null path)
+       (write-string-serial \"usage: modus <script.lisp>\")
+       (write-char-serial 10)
+       (sys-exit 1))
+      (t
+       (handler-case
+           (progn (load path) (sys-exit 0))
+         (t (c)
+            (write-string-serial \"unhandled condition while loading: \")
+            (handler-case (write-string-serial path) (t (c) nil))
+            (write-char-serial 10)
+            (sys-exit 1)))))))
+")
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source* (string #\Newline)
                        *gc-source* (string #\Newline)
                        *rt-source* (string #\Newline)
-                       *bridge-source*))
+                       *bridge-source* (string #\Newline)
+                       *driver-source*))
 
 (defvar *all-defun-names*
   ;; Filter to names that look like valid CL identifiers.
@@ -174,8 +266,44 @@
                  do (when (char= (char text pos) #\\) (incf pos))
                     (incf pos))
            (incf pos))
+          ;; Sharp dispatch: #\X character literal, #| ... |# block
+          ;; comment, #(...) vector literal, #+/#- feature, etc.  Without
+          ;; this special-case, #\" / #\; / #\( etc. fool the string- and
+          ;; comment-skippers in the branches above and the scanner ends
+          ;; up consuming dozens of legitimate tokens as if they were
+          ;; inside a string.  In particular COMMA-AT on line 992 of
+          ;; cl-reader.lisp was being eaten by the bogus string-skip
+          ;; triggered by #\" on line 957.
+          ((char= c #\#)
+           (incf pos)
+           (when (< pos len)
+             (let ((next (char text pos)))
+               (cond
+                 ;; #\X — skip the backslash + next char (which may be
+                 ;; any single character) + any trailing word (e.g.
+                 ;; #\Newline / #\Space).
+                 ((char= next #\\)
+                  (incf pos)  ; past the backslash
+                  (when (< pos len) (incf pos))  ; the literal char
+                  ;; Multi-char names like Newline / Space / Tab — eat
+                  ;; the rest of the word.
+                  (loop while (and (< pos len)
+                                   (alphanumericp (char text pos)))
+                        do (incf pos)))
+                 ;; #| ... |# block comment
+                 ((char= next #\|)
+                  (incf pos)
+                  (loop while (and (< (1+ pos) len)
+                                   (not (and (char= (char text pos) #\|)
+                                             (char= (char text (1+ pos)) #\#))))
+                        do (incf pos))
+                  (when (< (1+ pos) len) (incf pos) (incf pos))))))
+           ;; Other # forms (#( vector, #+ feature, etc.) just fall
+           ;; through — the next iteration reads them as ordinary
+           ;; tokens.
+           )
           ((or (char= c #\() (char= c #\)) (char= c #\') (char= c #\`)
-               (char= c #\,) (char= c #\#))
+               (char= c #\,))
            (incf pos))
           (t
            ;; symbol token
@@ -248,83 +376,9 @@
     (format out ")~%")))
 
 ;;; ============================================================
-;;; 4. Driver — read argv[1], LOAD it, exit.
+;;; 4. Driver — moved to forward-declaration above so the scanner
+;;; picks up its defuns (sys-exit / runtime-bq-expand / etc.).
 ;;; ============================================================
-
-(defvar *driver-source* "
-(defun sys-exit (code)
-  (let ((c code))
-    (syscall3 60 c 0 0)))
-
-(defun halt ()
-  (syscall3 60 1 0 0))
-
-;; Read a null-terminated ASCII string at a fixed address (argv[1] /
-;; argv[2] buffers populated by the boot stub).  Returns NIL if the
-;; string is empty.
-(defun %argv-string-at (addr)
-  (let ((len 0))
-    ;; First pass: count bytes until null
-    (let ((i 0))
-      (loop
-        (let ((b (mem-ref (+ addr i) :u8)))
-          (when (= b 0) (return nil))
-          (setq i (+ i 1)))
-        (setq len i)))
-    (if (zerop len) nil
-        (let ((s (%make-string-array len)) (i 0))
-          (loop
-            (when (>= i len) (return s))
-            (aset s i (mem-ref (+ addr i) :u8))
-            (setq i (+ i 1)))))))
-
-(defun %argv1 () (%argv-string-at #x10000208))
-(defun %argv2 () (%argv-string-at #x10000248))
-(defun %argc  () (mem-ref #x10000200 :u32))
-
-(defun kernel-main ()
-  ;; CL runtime init.  defvar init-thunks don't run on bare metal so
-  ;; we explicitly setq any global the rest of the init sequence will
-  ;; reference (CLAUDE.md known limitation #7).
-  (init-symbol-table)
-  (init-keyword-table)
-  (%init-packages)
-  (%init-streams)
-  (%init-reader)
-  (%init-condition-types)
-  (%init-method-combinations)
-  (%init-symbol-function-table)
-  (%init-sft-auto)
-  (setq *sym-name-table* (make-hash-table))
-  (%init-sym-name-auto)
-  (setq *macro-table* (make-hash-table))
-  (%init-runtime-macros)
-  ;; *cstr-scratch* / *io-buf-addr* feed the file-IO syscall path; if
-  ;; their defvars are left NIL, %sys-open-rdonly faults via mem-ref
-  ;; on NIL before reaching the kernel.
-  (setq *cstr-scratch* #x1DF00000)
-  (setq *io-buf-addr*  #x1DE00000)
-  (%init-signal-handling)
-  (%init-signal-symbols)
-  (%init-make-load-form)
-
-  ;; Read argv[1].  If absent, print usage and exit.  Otherwise drive
-  ;; LOAD on it; any condition prints a message and exits non-zero.
-  (let ((path (%argv1)))
-    (cond
-      ((null path)
-       (write-string-serial \"usage: modus <script.lisp>\")
-       (write-char-serial 10)
-       (sys-exit 1))
-      (t
-       (handler-case
-           (progn (load path) (sys-exit 0))
-         (t (c)
-            (write-string-serial \"unhandled condition while loading: \")
-            (handler-case (write-string-serial path) (t (c) nil))
-            (write-char-serial 10)
-            (sys-exit 1)))))))
-")
 
 ;;; ============================================================
 ;;; 5. Assemble *full-source*

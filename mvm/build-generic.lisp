@@ -423,6 +423,15 @@
 
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)
+;; Boot preamble for linux-x64 ends 397 bytes into the file (ELF header
+;; + entry stub).  Native code starts there, so the fn-entry alignment
+;; loop must account for this offset — otherwise `:li-func` + OR-3 +
+;; CALL-IND's sub-3 lands one byte before the prologue.  When the
+;; preceding function's last byte happens to be RET (0xC3), the
+;; misaligned call returns immediately, leaving the caller's RAX
+;; intact (silently looks like the fn returned T or whatever else
+;; was in RAX).  See reference_append_funcall_bug.md.
+(setf modus.mvm.x64::*x64-native-code-offset* 397)
 
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))

@@ -2188,7 +2188,50 @@
   "Merge two sorted sequences.  Honors RESULT-TYPE designator and :KEY.
    PRED can be a symbol (function name) or a function; symbol form is
    resolved via SYMBOL-FUNCTION.  Was: ignored &rest args entirely
-   (merge-test 17815 GOT raw concat instead of properly merged)."
+   (merge-test 17815 GOT raw concat instead of properly merged).
+
+   Per CLHS 17.2.1: signal type-error when RESULT-TYPE is a non-
+   sequence designator (e.g. 'SYMBOL) or when a pinned-length
+   compound spec doesn't match the merged length.  Per CLHS 3.4.1.4:
+   odd-length kwarg list and unknown keys signal program-error;
+   recognised key is :key only."
+  ;; Kwarg validation: only :key (and :allow-other-keys) recognised.
+  (let ((scan args) (allow-other nil))
+    (loop (when (or (null scan) (null (cdr scan))) (return))
+      (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+        (setq allow-other t))
+      (setq scan (cddr scan)))
+    (let ((vp args))
+      (loop
+        (when (null vp) (return))
+        (when (null (cdr vp)) (%signal-program-error) (return))
+        (let ((k (car vp)))
+          (unless (or (eq k :key) (eq k :allow-other-keys) allow-other)
+            (%signal-program-error)
+            (return)))
+        (setq vp (cddr vp)))))
+  ;; Type-error on known non-sequence head + on pinned-length mismatch.
+  (let* ((head (if (consp result-type) (car result-type) result-type))
+         (merged-len (+ (length s1) (length s2))))
+    (when (member head '(symbol integer function character keyword
+                         ratio rational complex number real
+                         hash-table package readtable stream pathname))
+      (%signal-type-error))
+    (when (and (consp result-type) (consp (cdr result-type)))
+      (let* ((rest (cdr result-type))
+             (len-slot (cond
+                         ((or (eq head 'string) (eq head 'simple-string)
+                              (eq head 'base-string)
+                              (eq head 'simple-base-string)
+                              (eq head 'bit-vector)
+                              (eq head 'simple-bit-vector))
+                          (car rest))
+                         ((or (eq head 'vector) (eq head 'simple-vector)
+                              (eq head 'array) (eq head 'simple-array))
+                          (and (consp (cdr rest)) (cadr rest)))
+                         (t '*))))
+        (when (and (integerp len-slot) (not (= len-slot merged-len)))
+          (%signal-type-error)))))
   (let* ((key-fn (let ((cur args) (k nil))
                    (loop (when (or (null cur) (null (cdr cur))) (return k))
                      (when (eq (car cur) :key) (setq k (cadr cur)))

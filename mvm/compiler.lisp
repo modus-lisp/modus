@@ -889,6 +889,89 @@
             `(setq ,place (- ,place ,delta))
             `(setf ,place (- ,place ,delta))))))
 
+  ;; PSETQ — parallel SETQ.  Per CLHS 5.1.2.5 evaluate every value
+  ;; first, then assign all variables in parallel.  Bind values to
+  ;; gensyms before the setqs so a (psetq a b b a) swap is correct.
+  ;; Returns NIL.
+  (mvm-define-macro "PSETQ"
+    (lambda (form)
+      (let ((pairs (cdr form))
+            (bindings nil)
+            (assigns nil))
+        (loop while pairs do
+          (let* ((var (first pairs))
+                 (val (second pairs))
+                 (g (gensym "PSQ")))
+            (push (list g val) bindings)
+            (push (list 'setq var g) assigns)
+            (setq pairs (cddr pairs))))
+        `(let ,(nreverse bindings)
+           ,@(nreverse assigns)
+           nil))))
+
+  ;; PSETF — parallel SETF.  Same shape as PSETQ but each PLACE is a
+  ;; generalised setf place.  Returns NIL.
+  (mvm-define-macro "PSETF"
+    (lambda (form)
+      (let ((pairs (cdr form))
+            (bindings nil)
+            (assigns nil))
+        (loop while pairs do
+          (let* ((place (first pairs))
+                 (val (second pairs))
+                 (g (gensym "PSF")))
+            (push (list g val) bindings)
+            (push (list 'setf place g) assigns)
+            (setq pairs (cddr pairs))))
+        `(let ,(nreverse bindings)
+           ,@(nreverse assigns)
+           nil))))
+
+  ;; ROTATEF — rotate values among places.  Per CLHS 5.1.2.5
+  ;; (rotatef p1 p2 p3 ...) moves p1's value to p2, p2's to p3, ...,
+  ;; pn's back to p1.  Returns NIL.  Each place is read once into a
+  ;; gensym, then assigned from the next gensym in rotation.
+  (mvm-define-macro "ROTATEF"
+    (lambda (form)
+      (let ((places (cdr form)))
+        (cond
+          ((null places) nil)
+          ((null (cdr places)) nil)   ; one place: noop
+          (t
+           (let* ((gs (mapcar (lambda (p) (declare (ignore p)) (gensym "RTF"))
+                              places))
+                  (bindings (mapcar #'list gs places))
+                  ;; Rotate: place[i] <- gs[i+1], place[last] <- gs[0]
+                  (rotated-gs (append (cdr gs) (list (car gs))))
+                  (assigns (mapcar (lambda (place g) `(setf ,place ,g))
+                                   places rotated-gs)))
+             `(let* ,bindings
+                ,@assigns
+                nil)))))))
+
+  ;; SHIFTF — shift values through places.  Per CLHS 5.1.2.5
+  ;; (shiftf p1 p2 ... pN val) returns old p1, sets p1 <- p2, p2 <- p3,
+  ;; ..., p(N-1) <- pN, pN <- val.  Like ROTATEF but the LAST argument
+  ;; is a value, not a place, and the function returns p1's old value.
+  (mvm-define-macro "SHIFTF"
+    (lambda (form)
+      (let ((args (cdr form)))
+        (cond
+          ((null args) nil)
+          ((null (cdr args)) nil)   ; nothing to shift
+          (t
+           (let* ((places (butlast args))
+                  (final-val (car (last args)))
+                  (gs (mapcar (lambda (p) (declare (ignore p)) (gensym "SHF"))
+                              places))
+                  (bindings (mapcar #'list gs places))
+                  (next-vals (append (cdr gs) (list final-val)))
+                  (assigns (mapcar (lambda (place next) `(setf ,place ,next))
+                                   places next-vals)))
+             `(let* ,bindings
+                ,@assigns
+                ,(car gs))))))))
+
   ;; REMF → modify plist, return generalized boolean
   (mvm-define-macro "REMF"
     (lambda (form)
@@ -1934,10 +2017,13 @@
       nil))
 
   ;; MULTIPLE-VALUE-SETQ — (multiple-value-setq (v1 v2 ...) form)
-  ;; CLHS: assigns each var to the corresponding value of FORM; missing
-  ;; values become NIL; returns the primary value.  multiple-value-bind
-  ;; only creates new local bindings — those don't propagate the SET, so
-  ;; build a multiple-value-list and SETQ each var from it.
+  ;; CLHS 5.1.2.3: assigns each var to the corresponding value of FORM;
+  ;; missing values become NIL; returns the primary value.  Per CLHS
+  ;; "If [a var] is a symbol macro, the form is expanded as for setf",
+  ;; so use SETF rather than SETQ to handle symbol-macrolet-bound vars
+  ;; transparently.  multiple-value-bind only creates new local
+  ;; bindings — those don't propagate the SET — so build a
+  ;; multiple-value-list and SETF each var from its nth slot.
   (mvm-define-macro "MULTIPLE-VALUE-SETQ"
     (lambda (form)
       (let ((vars (cadr form))
@@ -1945,14 +2031,14 @@
             (tmp (gensym "MVS")))
         (cond
           ((null vars) val-form)
-          ((null (cdr vars)) `(setq ,(car vars) ,val-form))
+          ((null (cdr vars)) `(setf ,(car vars) ,val-form))
           (t
-           (let ((setqs nil) (i 0))
+           (let ((sets nil) (i 0))
              (dolist (v vars)
-               (push `(setq ,v (nth ,i ,tmp)) setqs)
+               (push `(setf ,v (nth ,i ,tmp)) sets)
                (incf i))
              `(let ((,tmp (multiple-value-list ,val-form)))
-                ,@(nreverse setqs)
+                ,@(nreverse sets)
                 (car ,tmp))))))))
 
   ;; MAPHASH — inline when called with #'(lambda ...) to avoid closure mutation issues.

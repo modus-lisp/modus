@@ -709,44 +709,67 @@
               (t (%print-md-array dims data stream level escape)))))))
       ;; Cons (list)
       ((consp obj)
-       ;; Check *print-level*
-       (if (and plev (not (null level)) (>= level plev))
-           (%print-char 35 stream)   ; #
-           (let ((next-level (if (null level) 1 (+ level 1))))
-             (%print-char 40 stream)  ; (
-             (%write-obj (car obj) stream next-level escape)
-             (let ((tail (cdr obj)) (count 1))
-               (loop
-                 (cond
-                   ((null tail) (return nil))
-                   ((and plen (>= count plen))
-                    (%print-string-raw " ..." stream)
-                    (return nil))
-                   ((consp tail)
-                    (%print-char 32 stream)  ; space
-                    (%write-obj (car tail) stream next-level escape)
-                    (setq tail (cdr tail))
-                    (setq count (+ count 1)))
-                   (t
-                    (%print-char 32 stream)  ; space
-                    (%print-char 46 stream)  ; .
-                    (%print-char 32 stream)  ; space
-                    (%write-obj tail stream next-level escape)
-                    (return nil)))))
-             (%print-char 41 stream))))  ; )
+       ;; Check *print-level*.  LEVEL is the current depth — nil from
+       ;; the top-level entry means "depth 0", not "ignore plev".  CLHS
+       ;; 22.1.3.4 says objects at depth N>=*print-level* print as #.
+       ;; (print-level.3 / .4 pass plev=0 and expect the top-level
+       ;; object itself to be elided.)
+       (cond
+         ((and plev (>= (or level 0) plev))
+          (%print-char 35 stream))   ; #
+         ;; *print-length* = 0: print "(...)" — don't show the car.
+         ;; Per CLHS 22.1.3.5 the elision marker stands in for the
+         ;; entire elided portion, including the first element.
+         ((and plen (= plen 0))
+          (%print-char 40 stream)    ; (
+          (%print-string-raw "..." stream)
+          (%print-char 41 stream))   ; )
+         (t
+          (let ((next-level (if (null level) 1 (+ level 1))))
+            (%print-char 40 stream)  ; (
+            (%write-obj (car obj) stream next-level escape)
+            (let ((tail (cdr obj)) (count 1))
+              (loop
+                (cond
+                  ((null tail) (return nil))
+                  ;; Dotted tail (non-nil atom) is the natural end of
+                  ;; the list — print " . TAIL" regardless of
+                  ;; *print-length*.  CLHS 22.1.3.5 counts cons-elements
+                  ;; only; the final dotted atom is not subject to
+                  ;; truncation.  (print-length.4 / .6)
+                  ((not (consp tail))
+                   (%print-char 32 stream)  ; space
+                   (%print-char 46 stream)  ; .
+                   (%print-char 32 stream)  ; space
+                   (%write-obj tail stream next-level escape)
+                   (return nil))
+                  ((and plen (>= count plen))
+                   (%print-string-raw " ..." stream)
+                   (return nil))
+                  (t
+                   (%print-char 32 stream)  ; space
+                   (%write-obj (car tail) stream next-level escape)
+                   (setq tail (cdr tail))
+                   (setq count (+ count 1))))))
+            (%print-char 41 stream)))))  ; )
       ;; Array/string (non-cons)
       ((arrayp obj)
-       (if (not parray)
-           ;; Print as unreadable
-           (progn
-             (%print-char 35 stream)
-             (%print-char 60 stream)
-             (%print-string-raw "Array" stream)
-             (%print-char 62 stream))
-           ;; Print #(...)
-           (let ((len (array-length obj)))
-             (%print-char 35 stream)
-             (%print-char 40 stream)   ; #(
+       (cond
+         ;; *print-level* elision applies to arrays too: at depth
+         ;; >= plev, print as "#" with no element walk.  (print-level.3)
+         ((and plev (>= (or level 0) plev))
+          (%print-char 35 stream))   ; #
+         ((not parray)
+          ;; Print as unreadable
+          (%print-char 35 stream)
+          (%print-char 60 stream)
+          (%print-string-raw "Array" stream)
+          (%print-char 62 stream))
+         (t
+          ;; Print #(...)
+          (let ((len (array-length obj)))
+            (%print-char 35 stream)
+            (%print-char 40 stream)   ; #(
              (let ((i 0))
                (loop
                  (when (= i len) (return nil))
@@ -757,7 +780,7 @@
                  (%write-obj (aref obj i) stream
                              (if (null level) 1 (+ level 1)) escape)
                  (setq i (+ i 1))))
-             (%print-char 41 stream))))  ; )
+             (%print-char 41 stream)))))  ; ) — close let, t, cond, arrayp
       ;; Anything else: #<type>
       (t
        (%print-char 35 stream)

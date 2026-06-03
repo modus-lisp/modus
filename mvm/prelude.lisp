@@ -927,9 +927,17 @@
         (write-string-serial obj)
         (write-char-serial 34))
        ((symbolp obj)
-        (write-char-serial 35) (write-char-serial 60) (write-char-serial 83)
-        (print-dec (aref obj 0))
-        (write-char-serial 62))
+        ;; Prefer the symbol's actual name when recoverable.  3-slot CL
+        ;; symbols carry the name string at slot 2; 1-slot native syms
+        ;; only carry a hash, fall back to the #<S<hash>> shape.
+        (let ((nm (handler-case (symbol-name obj) (t (c) nil))))
+          (cond
+            ((and (stringp nm) (> (array-length nm) 0))
+             (write-string-serial nm))
+            (t
+             (write-char-serial 35) (write-char-serial 60) (write-char-serial 83)
+             (print-dec (aref obj 0))
+             (write-char-serial 62)))))
        ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
              (= (obj-subtag obj) #x32))
         (write-char-serial 35) (write-char-serial 40)

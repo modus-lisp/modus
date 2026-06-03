@@ -391,3 +391,104 @@
         (write-char-serial 76)))
   (write-char-serial 10)
   *rt-fail-count*)
+
+;;; ============================================================
+;;; Unmodified-suite path: register-then-run
+;;; ============================================================
+;;;
+;;; ANSI suite source has (deftest NAME FORM &rest EXPECTED-VALUES) at
+;;; load time.  CL's RT treats deftest as a MACRO so EXPECTED-VALUES is
+;;; a literal, not evaluated.  rt-register-test stores (name thunk
+;;; expected) on *rt-registered-tests* without running.
+;;;
+;;; rt-run-registered-tests walks the registry, calls each thunk inside
+;;; a handler-case, compares to expected via rt-equal, and emits the
+;;; same P:<id> / FAIL <id> lines the build-time pipeline already emits
+;;; so any harness reading those stays compatible.
+;;;
+;;; The deftest defmacro itself is registered at boot via
+;;; %install-deftest-macro (called from kernel-main of any image that
+;;; supports the runtime-load path) — we can't define a defmacro from
+;;; source and have it reach the runtime macro table, since defmacros
+;;; in built source only register in the BUILD-TIME *macro-table*.
+
+(defvar *rt-registered-tests* nil
+  "List of registered tests, head-most-recent.
+   Each entry: (name thunk expected-list).")
+
+(defun rt-register-test (name thunk expected)
+  "Push a deftest registration."
+  (setq *rt-registered-tests*
+        (cons (list name thunk expected) *rt-registered-tests*)))
+
+(defun rt-run-registered-tests ()
+  "Walk *rt-registered-tests* in registration order (i.e. reverse the
+   head-most-recent list) and run each thunk.  Compare its multiple-
+   value return to expected via rt-equal.  Emit P:<id> / FAIL <id>
+   lines compatible with the existing shard summary scripts.  Returns
+   (values pass-count fail-count crash-count)."
+  (let ((all (nreverse *rt-registered-tests*))
+        (pass 0) (fail 0) (crash 0))
+    (setq *rt-registered-tests* nil)
+    (let ((cur all))
+      (loop
+        (when (null cur) (return nil))
+        (let ((entry (car cur)))
+          (let ((name (car entry))
+                (thunk (cadr entry))
+                (expected (caddr entry)))
+            (handler-case
+              ;; Route through %do-funcall — the test thunk is an
+              ;; interp-closure from deftest's runtime expansion, and
+              ;; compile-funcall's compiled dispatch doesn't handle that
+              ;; representation.  Single-value only for now; MV-returning
+              ;; tests will need (multiple-value-list (%do-funcall ...)).
+              (let ((actual (list (%do-funcall thunk nil))))
+                (if (rt-equal actual expected)
+                    (progn
+                      (setq pass (+ pass 1))
+                      (write-char-serial 10)
+                      (write-char-serial 80)    ; P
+                      (write-char-serial 58)    ; :
+                      (if (fixnump name) (print-dec name) (write-object name))
+                      (write-char-serial 10))
+                    (progn
+                      (setq fail (+ fail 1))
+                      (write-char-serial 10)
+                      (write-char-serial 70)    ; F
+                      (write-char-serial 65)    ; A
+                      (write-char-serial 73)    ; I
+                      (write-char-serial 76)    ; L
+                      (write-char-serial 32)    ; space
+                      (if (fixnump name) (print-dec name) (write-object name))
+                      (write-char-serial 10))))
+              (t (c)
+                 (setq crash (+ crash 1))
+                 (write-char-serial 10)
+                 (write-char-serial 67)    ; C
+                 (write-char-serial 82)    ; R
+                 (write-char-serial 65)    ; A
+                 (write-char-serial 83)    ; S
+                 (write-char-serial 72)    ; H
+                 (write-char-serial 32)    ; space
+                 (if (fixnump name) (print-dec name) (write-object name))
+                 (write-char-serial 10)))))
+        (setq cur (cdr cur))))
+    (values pass fail crash)))
+
+(defun %install-deftest-macro ()
+  "Register the runtime deftest macro: (deftest NAME FORM &rest EXPECTED)
+   expands to (rt-register-test 'NAME (lambda () FORM) '(EXPECTED...)).
+   This is the runtime macro path — built source's `(defmacro deftest ...)`
+   would only register in the compile-time *macro-table*, which doesn't
+   reach runtime EVAL.  Pattern mirrors %install-runtime-backquote.
+
+   Expander signature matches CL defmacro semantics (one param per macro
+   arg).  Modus's macroexpand-1 calls interp-closure expanders with
+   (cdr whole-form) — so &rest tail picks up the expected values."
+  (set-macro-function 'deftest
+    (eval '(lambda (name form-arg &rest expected)
+             (list 'rt-register-test
+                   (list 'quote name)
+                   (list 'lambda nil form-arg)
+                   (list 'quote expected))))))

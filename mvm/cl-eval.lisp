@@ -965,7 +965,12 @@
     (t form)))
 
 (defun %eval-sym-lookup (sym env)
-  "Look up value of SYM in ENV then globals."
+  "Look up value of SYM in ENV then globals.  Falls back to symbol-value
+   (the compiled-code hash store at #x10000080) when the eval-only alist
+   doesn't have an entry, so values written via compiled `setq` or
+   `defvar` from kernel-main are visible to runtime EVAL.  boundp uses
+   the same hash store, so without this fall-back boundp could be T
+   while a runtime read of the same symbol would signal unbound-variable."
   (let ((found-pair (%env-lookup sym env)))
     (if (car found-pair)
         (cdr found-pair)
@@ -975,11 +980,15 @@
               (let ((gv (%eval-global-get name)))
                 (if (car gv)
                     (cdr gv)
-                    ;; Not found: signal unbound-variable
-                    (let ((c2 (%make-condition 'unbound-variable (list :name sym))))
-                      (if (%error-handler-active-p)
-                          (%hc-longjmp)
-                          nil))))
+                    ;; Fall back to the compiled-code symbol-value store.
+                    ;; boundp checks this same store, so treating its
+                    ;; presence as "bound" keeps boundp / read consistent.
+                    (if (boundp sym)
+                        (symbol-value sym)
+                        (let ((c2 (%make-condition 'unbound-variable (list :name sym))))
+                          (if (%error-handler-active-p)
+                              (%hc-longjmp)
+                              nil)))))
               nil)))))
 
 (defun %eval-compound (form env)

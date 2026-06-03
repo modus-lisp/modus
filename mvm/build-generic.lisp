@@ -180,6 +180,17 @@
   (%init-signal-symbols)
   (%init-make-load-form)
   (%install-runtime-backquote)
+  ;; Init RT counters + registry (defvar init thunks don't run on bare metal)
+  (setq *rt-test-count* 0)
+  (setq *rt-pass-count* 0)
+  (setq *rt-fail-count* 0)
+  (setq *rt-registered-tests* nil)
+  ;; Generous default; *write-object-budget* gates per-call output to
+  ;; avoid runaway prints (cycles, deep nesting).  Unset would be NIL,
+  ;; causing the budget arithmetic in write-object to silently corrupt
+  ;; output after the first symbol print.
+  (setq *write-object-budget* 1000000)
+  (%install-deftest-macro)
   (let ((path (%argv1)))
     (cond
       ((null path)

@@ -683,25 +683,43 @@
 
 (defun %try-parse-float (codes)
   "Try to parse char codes as a float. Returns float or nil.
-   For MVM, we parse but return an integer approximation."
+   For MVM, we parse but return an integer approximation.
+
+   CL float literals: either a decimal point or an exponent marker
+   with at least one digit IN THE INT PART before the marker (so
+   `1s2' is a float, `s1' is the symbol S1).  The pre-scan tracks
+   whether the exponent marker was preceded by a digit; if not, the
+   token is not a float."
   ;; Simple float detection: contains . or exponent marker (e, s, f, d, l)
   ;; but not just a dot
-  (let ((has-dot nil) (has-exp nil) (len 0))
+  (let ((has-dot nil) (has-exp nil) (len 0) (saw-pre-exp-digit nil)
+        (saw-digit-yet nil))
     (let ((cur codes))
+      ;; Skip leading sign for the pre-scan.
+      (when (and cur (or (= (car cur) 45) (= (car cur) 43)))
+        (setq cur (cdr cur)))
       (loop
         (when (null cur) (return nil))
         (let ((code (car cur)))
           (when (= code 46) (setq has-dot t))
+          (when (and (>= code 48) (<= code 57))
+            (setq saw-digit-yet t))
           (when (or (= code 69) (= code 101)  ; E e
                     (= code 83) (= code 115)  ; S s
                     (= code 70) (= code 102)  ; F f
                     (= code 68) (= code 100)  ; D d
                     (= code 76) (= code 108)) ; L l
-            (setq has-exp t))
+            (setq has-exp t)
+            ;; Did we see a digit before this marker?  Without one
+            ;; the token isn't a CL float literal.
+            (setq saw-pre-exp-digit (or saw-pre-exp-digit saw-digit-yet)))
           (setq len (+ len 1)))
         (setq cur (cdr cur))))
     (when (and (not has-dot) (not has-exp)) (return-from %try-parse-float nil))
     (when (and (= len 1) has-dot) (return-from %try-parse-float nil))
+    ;; Exponent without a preceding int digit isn't a float (CL §2.3.2.2).
+    (when (and has-exp (not has-dot) (not saw-pre-exp-digit))
+      (return-from %try-parse-float nil))
     ;; Parse the float: integer-part.fraction-part[exponent]
     (let ((sign 1) (cur codes) (int-part 0) (frac-part 0) (frac-div 1)
           (exp-sign 1) (exp-part 0) (in-frac nil) (in-exp nil) (got-digit nil))

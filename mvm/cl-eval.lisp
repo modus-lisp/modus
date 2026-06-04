@@ -810,7 +810,7 @@
                                              new-env))
                   (when (and (null value) init)
                     ;; Evaluate init form in the env we're building.
-                    (let ((v (%eval init new-env)))
+                    (let ((v (%eval-in-env init new-env)))
                       (setq new-env (%env-extend var v new-env))))
                   (setq ps (cdr ps)))))))
          (return new-env))
@@ -822,7 +822,7 @@
            (let* ((spec (car ps))
                   (var (if (consp spec) (car spec) spec))
                   (init (if (and (consp spec) (cdr spec)) (cadr spec) nil)))
-             (setq new-env (%env-extend var (if init (%eval init new-env) nil) new-env))
+             (setq new-env (%env-extend var (if init (%eval-in-env init new-env) nil) new-env))
              (setq ps (cdr ps))))
          (return new-env))
         ;; Regular / &optional positional parameter
@@ -831,7 +831,7 @@
                 (var (if (consp spec) (car spec) spec))
                 (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
                 (val (cond (as (car as))
-                           (init (%eval init new-env))
+                           (init (%eval-in-env init new-env))
                            (t nil))))
            (setq new-env (%env-extend var val new-env))
            (setq ps (cdr ps))

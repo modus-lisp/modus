@@ -471,6 +471,18 @@
 ;; was in RAX).  See reference_append_funcall_bug.md.
 (setf modus.mvm.x64::*x64-native-code-offset* 397)
 
+;; Enable the GC trampoline: without this, every :alloc-obj advances R12
+;; unchecked and the heap walks past the mapped region in long-running
+;; sessions.  build-ansi-test / build-x64-modus-ansi-test set this; we
+;; need it too so the generic image survives ANSI sweeps.
+(setf modus.mvm.x64::*x64-gc-enabled* t)
+;; Bring R14 to the heap midpoint so GC actually fires before the
+;; from-space is exhausted.  Default leaves R14 at full heap end which
+;; means the gc-check `cmp r12, r14; jl skip` only triggers after
+;; allocation walked all the way to the end — too late for a Cheney
+;; copy that needs the other half free.
+(setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))
 

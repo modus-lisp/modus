@@ -1819,14 +1819,19 @@
              (set-macro-function key-name
                                  (list '%interp-closure params mbody env))))
          (handler-case
-             (let ((result (%eval-progn body env)))
-               ;; Restore prior bindings before returning
+             ;; multiple-value-prog1 preserves the body's full MV list when
+             ;; the let/result-binding pattern would otherwise drop all
+             ;; but the first value.  ANSI deftests like macrolet.1 wrap
+             ;; (values …) inside the macrolet body and expect both
+             ;; values to propagate out.
+             (multiple-value-prog1
+               (%eval-progn body env)
+               ;; Restore prior bindings.
                (dolist (s saved)
                  (let ((nm (car s)) (old (cdr s)))
                    (if old
                        (puthash nm *macro-function-table* old)
-                       (remhash nm *macro-function-table*))))
-               result)
+                       (remhash nm *macro-function-table*)))))
            (t (c)
              ;; Restore even on error
              (dolist (s saved)

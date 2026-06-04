@@ -2375,6 +2375,30 @@
                        (multiple-value-list (%eval-in-env (car args) env))
                        (list nil))))
          (%eval-escape-push nil (cons '%mvs vals))))
+      ;; CATCH — (catch TAG-FORM BODY...).  Evaluate TAG-FORM and run
+      ;; BODY in a handler that recovers a THROW whose tag is EQ to
+      ;; this CATCH's tag.  Tag is reused as the escape-stack key —
+      ;; arbitrary objects (typically symbols), not the BLOCK-name set
+      ;; %eval-escape-pop-if normally compares.
+      ((%eval-sym-eq op "CATCH")
+       (let ((tag (%eval-in-env (car args) env))
+             (body (cdr args)))
+         (handler-case
+           (%eval-progn body env)
+           (t (c)
+             (declare (ignore c))
+             (let ((val (%eval-escape-pop-if tag)))
+               (if (eq val :%eval-no-escape)
+                   (error "%eval-escape")
+                   (%eval-escape-return val)))))))
+      ;; THROW — (throw TAG-FORM VALUE-FORM).  Push (tag . (cons '%mvs mvs))
+      ;; onto escape stack so the surrounding CATCH with matching TAG
+      ;; recovers the value(s).  Multiple values via multiple-value-list
+      ;; for symmetry with RETURN.
+      ((%eval-sym-eq op "THROW")
+       (let ((tag (%eval-in-env (car args) env))
+             (vals (multiple-value-list (%eval-in-env (cadr args) env))))
+         (%eval-escape-push tag (cons '%mvs vals))))
       ;; LOOP — repeat body forever until RETURN (or RETURN-FROM nil)
       ;; escapes via the stack.  Body is treated as an implicit progn
       ;; with implicit (block nil) wrapping for RETURN to target.

@@ -198,6 +198,72 @@
   (multiple-value-bind (sub valid) (%subtypep-impl t1 t2)
     (values sub valid)))
 
+;;; ansi-aux.lsp's big defparameters at lines 508-731 don't get bound
+;;; during runtime-EVAL load — the chain hits an earlier form that
+;;; silently fails (init form raises unbound-variable, returns NIL,
+;;; defparameter assigns NIL).  Most types-and-classes tests reference
+;;; *subtype-table*, *disjoint-types-list*, *array-element-types*,
+;;; +fail-count-limit+, *mini-universe* — each unbound crashes a whole
+;;; test cluster.  Bind direct copies here.
+
+(defparameter +fail-count-limit+ 20)
+
+(defparameter *mini-universe* nil)
+
+(defparameter *disjoint-types-list*
+  '(cons symbol array
+    number character hash-table function readtable package
+    pathname stream random-state condition restart))
+
+(defparameter *array-element-types*
+  '(t (integer 0 0)
+      bit (unsigned-byte 8) (unsigned-byte 16)
+      (unsigned-byte 32) float short-float
+      single-float double-float long-float
+      nil character base-char symbol boolean null))
+
+(defparameter *subtype-table*
+  '((null symbol) (symbol t) (boolean symbol) (standard-object t)
+    (function t) (compiled-function function) (generic-function function)
+    (standard-generic-function generic-function) (class standard-object)
+    (built-in-class class) (structure-class class) (standard-class class)
+    (method standard-object) (standard-method method) (structure-object t)
+    (method-combination t) (condition t) (serious-condition condition)
+    (error serious-condition) (type-error error)
+    (simple-type-error type-error) (simple-condition condition)
+    (simple-type-error simple-condition) (parse-error error)
+    (hash-table t) (cell-error error) (unbound-slot cell-error)
+    (warning condition) (style-warning warning)
+    (storage-condition serious-condition) (simple-warning warning)
+    (simple-warning simple-condition) (keyword symbol)
+    (unbound-variable cell-error) (control-error error)
+    (program-error error) (undefined-function cell-error)
+    (package t) (package-error error) (random-state t) (number t)
+    (real number) (complex number) (signed-byte integer)
+    (integer signed-byte) (unsigned-byte signed-byte) (bit unsigned-byte)
+    (fixnum integer) (bignum integer) (bit fixnum)
+    (arithmetic-error error) (division-by-zero arithmetic-error)
+    (floating-point-invalid-operation arithmetic-error)
+    (floating-point-inexact arithmetic-error)
+    (floating-point-overflow arithmetic-error)
+    (floating-point-underflow arithmetic-error)
+    (character t) (base-char character) (standard-char base-char)
+    (extended-char character)
+    (sequence t) (list sequence) (null list) (null boolean) (cons list)
+    (array t) (simple-array array) (vector sequence) (vector array)
+    (string vector) (bit-vector vector) (simple-vector vector)
+    (simple-vector simple-array) (simple-bit-vector bit-vector)
+    (simple-bit-vector simple-array) (base-string string)
+    (simple-string string) (simple-string simple-array)
+    (simple-base-string base-string) (simple-base-string simple-string)
+    (pathname t) (logical-pathname pathname) (file-error error)
+    (stream t) (broadcast-stream stream) (concatenated-stream stream)
+    (echo-stream stream) (file-stream stream) (string-stream stream)
+    (synonym-stream stream) (two-way-stream stream)
+    (stream-error error) (end-of-file stream-error)
+    (print-not-readable error) (readtable t)
+    (reader-error parse-error) (reader-error stream-error)))
+
 ;;; DESTRUCTURING-BIND — runtime-EVAL doesn't have a compound branch
 ;;; for it.  Expand to a flat LET that binds each var via NTH lookup
 ;;; against the evaluated list (supports flat lambda-lists; &rest

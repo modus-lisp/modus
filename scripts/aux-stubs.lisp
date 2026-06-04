@@ -41,3 +41,46 @@
 ;;; undefined-function.  Cheap to redefine here as a safety net.
 
 (defun notnot (x) (not (not x)))
+
+;;; *initial-print-pprint-dispatch* / *print-pprint-dispatch* — Modus
+;;; has no real pretty-printer dispatch table, but many ANSI printer
+;;; tests rebind these via my-with-standard-io-syntax / def-pprint-test
+;;; (LET-bound to a "copy" of the initial dispatch).  Without these,
+;;; the LET binding evaluates its init form, hits unbound-variable,
+;;; and longjmps out — crashing every test in the file.  Defining them
+;;; to NIL is harmless: write/prin1 don't consult the dispatch table.
+
+(defvar *initial-print-pprint-dispatch* nil)
+(defvar *print-pprint-dispatch* nil)
+
+;;; my-with-standard-io-syntax — defined in ansi-aux.lsp at line 856, but
+;;; load there often stops before reaching it (an earlier
+;;; `(coerce ... string)` form with an unquoted type-name signals
+;;; undefined-variable, and `is-noncontiguous-sublist-of` uses extended
+;;; LOOP shapes Modus's runtime LOOP doesn't fully cover yet — each kills
+;;; further forms in the load's top-level loop).  Redefine here so the
+;;; def-print-test / def-pprint-test families can expand and run.
+
+(defmacro my-with-standard-io-syntax (&rest body)
+  `(let ((*package* (find-package "COMMON-LISP-USER"))
+         (*print-array* t)
+         (*print-base* 10)
+         (*print-case* :upcase)
+         (*print-circle* nil)
+         (*print-escape* t)
+         (*print-gensym* t)
+         (*print-length* nil)
+         (*print-level* nil)
+         (*print-lines* nil)
+         (*print-miser-width* nil)
+         (*print-pprint-dispatch* *initial-print-pprint-dispatch*)
+         (*print-pretty* nil)
+         (*print-radix* nil)
+         (*print-readably* t)
+         (*print-right-margin* nil)
+         (*read-base* 10)
+         (*read-default-float-format* 'single-float)
+         (*read-eval* t)
+         (*read-suppress* nil)
+         (*readtable* (copy-readtable nil)))
+     ,@body))

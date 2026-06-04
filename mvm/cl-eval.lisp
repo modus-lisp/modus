@@ -688,6 +688,54 @@
             (setq new-env (%env-extend var val new-env)))))
       (setq cur (cdr cur)))))
 
+;;; CLHS §3.1.2.1.2 — *earmuffs* convention.  A LET/LET* binding whose var
+;;; name begins and ends with `*` is treated as a SPECIAL (dynamic) binding:
+;;; the prior global value is saved, the global is set to the new value, the
+;;; body runs, and an unwind-protect restores the saved value on exit.
+;;; Without this, runtime-EVAL of a form like
+;;;   (let ((*print-base* 2)) (write 15))
+;;; would only extend the lexical env — compiled PRIN1 reads the global
+;;; *print-base* slot and would still see base 10.  Critical for the printer
+;;; / format / pretty-print test families (def-print-test → my-with-standard-
+;;; io-syntax binds 18+ *print-* and *read-* vars).
+
+(defun %earmuff-name-p (name)
+  "T if NAME is a string of length ≥2 starting AND ending with `*`."
+  (and (stringp name)
+       (>= (length name) 2)
+       (char= (char name 0) #\*)
+       (char= (char name (1- (length name))) #\*)))
+
+(defun %earmuff-var-p (sym)
+  "T if SYM is an *earmuffs* symbol — treat as special in LET/LET*."
+  (let ((n (%eval-sym-name sym)))
+    (and n (%earmuff-name-p n))))
+
+(defun %eval-save-special (sym)
+  "Return current global value of SYM by reading the SAME store
+   compiled code reads (symbol-value's hash-keyed alist at #x10000080).
+   Reading the eval-only alist would mis-restore — compiled defvars
+   like *print-base* are initialized into the hash alist but never
+   written to the eval-only alist, so a save/restore via the eval-only
+   alist sees :%unbound and restores to NIL, breaking output.  Caller
+   uses this with %eval-restore-special inside an unwind-protect."
+  (let ((nm (%eval-sym-name sym)))
+    (if nm (symbol-value (compute-name-hash nm)) nil)))
+
+(defun %eval-restore-special (sym saved)
+  "Restore a saved special-var value to BOTH the compiled-code hash
+   alist AND the eval-only alist (mirrors %eval-global-set's two-store
+   write so the next lookup is consistent)."
+  (let ((nm (%eval-sym-name sym)))
+    (when nm (%eval-global-set nm saved))))
+
+(defun %eval-set-special (sym value)
+  "Establish a fresh dynamic binding for SYM at VALUE.  Writes the
+   eval-alist + compiled-code symbol-value alist so any compiled
+   reader (e.g. compiled PRIN1 reading *print-base*) sees it."
+  (let ((nm (%eval-sym-name sym)))
+    (when nm (%eval-global-set nm value))))
+
 (defun %eval-args (arg-forms env)
   "Evaluate a list of argument forms."
   (let ((result nil)
@@ -1697,18 +1745,66 @@
            (if (cddr args) (%eval-in-env (caddr args) env) nil)))
       ;; PROGN
       ((%eval-sym-eq op "PROGN") (%eval-progn args env))
-      ;; LET
+      ;; LET — parallel bindings.  *earmuff* vars are dynamically bound
+      ;; (global save/set + unwind-protect restore); the rest extend the
+      ;; lexical env.  Critical so e.g. `(let ((*print-base* 2)) (write 15))`
+      ;; affects the compiled PRIN1 reader.
       ((%eval-sym-eq op "LET")
        (let ((bindings (car args))
              (body (cdr args)))
-         (let ((new-env (%eval-let-bindings bindings env env)))
-           (%eval-progn body new-env))))
-      ;; LET*
+         (let ((new-env env)
+               (specials nil)
+               (vb-list nil))
+           ;; Phase 1: evaluate all init forms in the OUTER env (parallel).
+           (let ((cur bindings))
+             (loop
+               (when (null cur) (return nil))
+               (let ((b (car cur)))
+                 (let ((var (if (consp b) (car b) b))
+                       (val-form (if (and (consp b) (cdr b)) (cadr b) nil)))
+                   (let ((val (%eval-in-env val-form env)))
+                     (push (cons var val) vb-list))))
+               (setq cur (cdr cur))))
+           (setq vb-list (nreverse vb-list))
+           ;; Phase 2: establish bindings — specials via global rebind,
+           ;; ordinary via lexical extend.
+           (dolist (vb vb-list)
+             (let ((sym (car vb))
+                   (val (cdr vb)))
+               (cond
+                 ((%earmuff-var-p sym)
+                  (push (cons sym (%eval-save-special sym)) specials)
+                  (%eval-set-special sym val))
+                 (t (setq new-env (%env-extend sym val new-env))))))
+           ;; Phase 3: run body; always restore specials on unwind.
+           (unwind-protect
+                (%eval-progn body new-env)
+             (dolist (sv specials)
+               (%eval-restore-special (car sv) (cdr sv)))))))
+      ;; LET* — sequential bindings; specials bind earlier so subsequent
+      ;; init forms see the prior special's new value.  CLHS 5.1.2.1.
       ((%eval-sym-eq op "LET*")
        (let ((bindings (car args))
              (body (cdr args)))
-         (let ((new-env (%eval-let*-bindings bindings env)))
-           (%eval-progn body new-env))))
+         (let ((new-env env)
+               (specials nil))
+           (let ((cur bindings))
+             (loop
+               (when (null cur) (return nil))
+               (let ((b (car cur)))
+                 (let ((var (if (consp b) (car b) b))
+                       (val-form (if (and (consp b) (cdr b)) (cadr b) nil)))
+                   (let ((val (%eval-in-env val-form new-env)))
+                     (cond
+                       ((%earmuff-var-p var)
+                        (push (cons var (%eval-save-special var)) specials)
+                        (%eval-set-special var val))
+                       (t (setq new-env (%env-extend var val new-env)))))))
+               (setq cur (cdr cur))))
+           (unwind-protect
+                (%eval-progn body new-env)
+             (dolist (sv specials)
+               (%eval-restore-special (car sv) (cdr sv)))))))
       ;; SETQ
       ((%eval-sym-eq op "SETQ")
        (let ((cur args))
@@ -2281,6 +2377,45 @@
        (unwind-protect
          (%eval-in-env (car args) env)
          (%eval-progn (cdr args) env)))
+      ;; WITH-OUTPUT-TO-STRING — (with-output-to-string (var) body...)
+      ;; Bind var to a fresh string-output-stream, run body, return collected string.
+      ;; The optional second spec slot is a target string (NYI; ignored — body just runs).
+      ;; If var is an *earmuff*, dynamic-bind it so compiled writers
+      ;; (e.g. (prin1 X) without explicit stream) see the new stream.
+      ((%eval-sym-eq op "WITH-OUTPUT-TO-STRING")
+       (let* ((spec (car args))
+              (var (car spec))
+              (body (cdr args))
+              (stream (make-string-output-stream)))
+         (cond
+           ((%earmuff-var-p var)
+            (let ((saved (%eval-save-special var)))
+              (%eval-set-special var stream)
+              (unwind-protect
+                   (%eval-progn body env)
+                (%eval-restore-special var saved))
+              (get-output-stream-string stream)))
+           (t
+            (%eval-progn body (%env-extend var stream env))
+            (get-output-stream-string stream)))))
+      ;; WITH-INPUT-FROM-STRING — (with-input-from-string (var string) body...)
+      ;; Bind var to a string-input-stream over the evaluated string, run body.
+      ((%eval-sym-eq op "WITH-INPUT-FROM-STRING")
+       (let* ((spec (car args))
+              (var (car spec))
+              (str-form (cadr spec))
+              (body (cdr args))
+              (str (%eval-in-env str-form env))
+              (stream (make-string-input-stream str)))
+         (cond
+           ((%earmuff-var-p var)
+            (let ((saved (%eval-save-special var)))
+              (%eval-set-special var stream)
+              (unwind-protect
+                   (%eval-progn body env)
+                (%eval-restore-special var saved))))
+           (t
+            (%eval-progn body (%env-extend var stream env))))))
       ;; FLET / LABELS
       ((%eval-sym-eq op "FLET")
        (let ((local-fns (car args))

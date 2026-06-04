@@ -2467,7 +2467,24 @@
            (a18 (and r18 (car r18)))
            (r19 (and r18 (cdr r18)))
            (a19 (and r19 (car r19)))
-           (r20 (and r19 (cdr r19))))
+           (r20 (and r19 (cdr r19)))
+           ;; Ladder extended 20 → 32 to match the &rest-rebuild cap
+           ;; raised in translate-x64.lisp + compiler.lisp.  Covers
+           ;; plus.8 / =.N / etc. up to 32-element arglists.  Beyond 32
+           ;; still truncates (compile-funcall's &rest list-build caps
+           ;; at 32 too).
+           (a20 (and r20 (car r20))) (r21 (and r20 (cdr r20)))
+           (a21 (and r21 (car r21))) (r22 (and r21 (cdr r21)))
+           (a22 (and r22 (car r22))) (r23 (and r22 (cdr r22)))
+           (a23 (and r23 (car r23))) (r24 (and r23 (cdr r23)))
+           (a24 (and r24 (car r24))) (r25 (and r24 (cdr r24)))
+           (a25 (and r25 (car r25))) (r26 (and r25 (cdr r25)))
+           (a26 (and r26 (car r26))) (r27 (and r26 (cdr r26)))
+           (a27 (and r27 (car r27))) (r28 (and r27 (cdr r27)))
+           (a28 (and r28 (car r28))) (r29 (and r28 (cdr r28)))
+           (a29 (and r29 (car r29))) (r30 (and r29 (cdr r29)))
+           (a30 (and r30 (car r30))) (r31 (and r30 (cdr r30)))
+           (a31 (and r31 (car r31))) (r32 (and r31 (cdr r31))))
       (cond
         ((null all-args) (funcall fn))
         ((null r1) (funcall fn a0))
@@ -2490,7 +2507,19 @@
         ((null r18) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17))
         ((null r19) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18))
         ((null r20) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19))
-        (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19))))))
+        ((null r21) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20))
+        ((null r22) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21))
+        ((null r23) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22))
+        ((null r24) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23))
+        ((null r25) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24))
+        ((null r26) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25))
+        ((null r27) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26))
+        ((null r28) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27))
+        ((null r29) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28))
+        ((null r30) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29))
+        ((null r31) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30))
+        ((null r32) (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))
+        (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))))))
 
 (defun terpri (&rest stream-arg)
   (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))

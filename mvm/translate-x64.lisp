@@ -716,9 +716,11 @@
               ;; Without this trap, emit-rest-prologue can only assemble
               ;; rest lists when nargs ≤ +max-reg-args+ (4) — beyond
               ;; that, callers (especially apply) silently truncate.
-              ;; Cap raised to 24 args (was 16) so loops over big arglist
-              ;; bodies and apply through &rest tails work.  Frame has
-              ;; 128 slots (1120 bytes), so 24 is well within bounds.
+              ;; Cap raised to 32 args (was 24).  Frame has 128 slots
+              ;; (1120 bytes) so 32 fits, and the per-defun &rest ladder
+              ;; that mirrors this cap stays close to original code
+              ;; size.  Going much higher blows the binary up (the
+              ;; ladder is unrolled per defun).
               ;;
               ;; Layout:
               ;;   src ptr = rbp + 16 + (i-4)*8  for arg i ≥ 4
@@ -758,12 +760,12 @@
                     (loop-label (make-label))
                     (nocap-label (make-label)))
                 (emit-jcc buf :l done-label)
-                ;; cmp eax, 24
-                (emit-bytes buf #x83 #xF8 #x18)
+                ;; cmp eax, 32
+                (emit-bytes buf #x83 #xF8 #x20)
                 ;; jle nocap
                 (emit-jcc buf :le nocap-label)
-                ;; mov eax, 24
-                (emit-bytes buf #xB8 #x18 #x00 #x00 #x00)
+                ;; mov eax, 32
+                (emit-bytes buf #xB8 #x20 #x00 #x00 #x00)
                 (emit-label buf nocap-label)
                 ;; sub eax, 4
                 (emit-bytes buf #x83 #xE8 #x04)

@@ -10421,12 +10421,10 @@
         ;; and the ladder's stack-load reads garbage from unmapped /
         ;; uninitialised local frame slots.
         (emit-ir :trap #x0530)
-        ;; Extended ladder: nargs = req+1 .. req+20.  Caps at +20 so
-        ;; the trap above (which itself caps at 24 total args) covers
-        ;; the worst case (req=4 + 20 rest = 24).  For req > 4 we
-        ;; clamp by what the trap could have copied (24 - req); for
-        ;; req <= 4 the full 20 cases apply.
-        (let ((max-k (min 20 (- 24 req)))
+        ;; Extended ladder: nargs = req+1 .. req+32.  The trap above
+        ;; caps at 32 total args, so max-k = 32 - req (no separate
+        ;; min — let req=0 funcs use the full 32 cases).
+        (let ((max-k (- 32 req))
               (cases nil))
           (loop for k from max-k downto 1
                 do (push k cases))

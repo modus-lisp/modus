@@ -75,6 +75,43 @@
                (list 'unless (list 'member vtmp place)
                      (list 'setf place (list 'cons vtmp place))))))"
 
+    ;; DO and DO* — sequential variable update (technically DO is
+    ;; supposed to be parallel; we approximate as sequential, which
+    ;; matches single-variable forms and most test patterns).
+    "(defmacro do (var-specs end-spec &rest body)
+       (let ((test (car end-spec))
+             (result-forms (cdr end-spec))
+             (vars nil)
+             (steps nil))
+         (let ((cur var-specs))
+           (loop (when (null cur) (return nil))
+             (let ((spec (car cur)))
+               (cond
+                 ((symbolp spec)
+                  (setq vars (cons (list spec nil) vars)))
+                 (t
+                  (setq vars (cons (list (car spec) (cadr spec)) vars))
+                  (when (cddr spec)
+                    (setq steps (cons (list (car spec) (caddr spec)) steps))))))
+             (setq cur (cdr cur))))
+         (let ((step-setqs nil)
+               (rev-steps (nreverse steps)))
+           (dolist (s rev-steps)
+             (setq step-setqs (cons (list 'setq (car s) (cadr s)) step-setqs)))
+           (setq step-setqs (nreverse step-setqs))
+           (let ((result-form (cond
+                                ((null result-forms) nil)
+                                ((null (cdr result-forms)) (car result-forms))
+                                (t (cons 'progn result-forms)))))
+             (list 'block 'nil
+                   (list 'let* (nreverse vars)
+                         (cons 'loop
+                               (cons (list 'when test (list 'return result-form))
+                                     (append body step-setqs)))))))))"
+
+    "(defmacro do* (var-specs end-spec &rest body)
+       (cons 'do (cons var-specs (cons end-spec body))))"
+
     "(defmacro dolist (spec &rest body)
        (let* ((var (car spec))
               (lst-form (cadr spec))

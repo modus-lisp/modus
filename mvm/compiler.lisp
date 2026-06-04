@@ -7515,6 +7515,35 @@
       (emit-ir :br after-call-label)
       ;; === Direct call path (non-closure) ===
       (emit-ir-label direct-call-label)
+      ;; IC slow path: detect interp-closure (cons-tagged fn) and route
+      ;; to per-arity helper that calls %do-funcall via the args-list
+      ;; convention.  Without this, (funcall ic-cons …) in compiled code
+      ;; (intersection :test, sort #'<, …) would SEGV on call-indirect
+      ;; to a cons addr.  The check + shift + helper-call only fires
+      ;; when fn IS a cons; cold path for normal funcall.  Capped at
+      ;; nargs ≤ 4 — the primary use case (:test/:key/:test-not) is
+      ;; always 1- or 2-arg, and the shift loop avoids V4..V7
+      ;; caller-save edge cases beyond that.
+      (when (<= nargs 4)
+        (let ((check-reg (alloc-temp-reg))
+              (cmp-reg   (alloc-temp-reg))
+              (not-ic-label (make-compiler-label)))
+          (emit-ir :obj-tag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +tag-cons+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-ic-label)
+          ;; cons fn → shift V0..V_{nargs-1} → V1..V_{nargs}, put fn → V0,
+          ;; call %FUNCALL-IC-<nargs> with (1+ nargs) args.
+          (loop for i from nargs downto 1
+                do (emit-ir :mov (+ +vreg-v0+ i) (+ +vreg-v0+ (- i 1))))
+          (emit-ir :mov +vreg-v0+ fn-call-reg)
+          (let ((helper-name (format nil "%FUNCALL-IC-~D" nargs)))
+            (emit-ir :set-nargs (1+ nargs))
+            (emit-ir :call helper-name (1+ nargs)))
+          (emit-ir :br after-call-label)
+          (emit-ir-label not-ic-label)
+          (free-temp-reg)   ; free cmp-reg
+          (free-temp-reg))) ; free check-reg
       (emit-ir :set-nargs nargs)
       (emit-ir :call-indirect fn-call-reg nargs)
       ;; === Join ===

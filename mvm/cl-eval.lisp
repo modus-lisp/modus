@@ -2364,6 +2364,53 @@
      (%call-interp-closure fn args))
     (t (%eval-call-fn fn args fn))))
 
+;;; Per-arity helpers for the compile-funcall IC slow path.
+;;; compile-funcall (compiler.lisp) emits a tag-check before its direct
+;;; call-indirect; if the fn is cons-tagged, it routes here instead of
+;;; SEGV'ing on the cons.  Each helper takes fn + N args and dispatches
+;;; via %call-interp-closure when fn is actually an IC.  Non-IC cons →
+;;; undefined-function signal (cons-as-fn is invalid).
+
+(defun %funcall-ic-0 (fn)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn nil)
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-1 (fn a)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a))
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-2 (fn a b)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a b))
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-3 (fn a b c)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a b c))
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-4 (fn a b c d)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a b c d))
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-5 (fn a b c d e)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a b c d e))
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-6 (fn a b c d e f)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a b c d e f))
+      (%signal-undefined-function)))
+
+(defun %funcall-ic-7 (fn a b c d e f g)
+  (if (%interp-closure-p fn)
+      (%call-interp-closure fn (list a b c d e f g))
+      (%signal-undefined-function)))
+
 (defun eval (form)
   "Evaluate FORM in the null lexical environment."
   (%eval-in-env form nil))

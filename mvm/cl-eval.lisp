@@ -927,7 +927,10 @@
 (defun %eval-escape-pop-if (tag)
   "If the top-of-stack escape's TAG matches, pop and return its value.
    Returns the special value :%eval-no-escape if no match — caller
-   should re-signal."
+   should re-signal.  Values pushed by RETURN / RETURN-FROM are stored
+   as (cons '%mvs mv-list); callers that propagate them should pass
+   the raw cons through %eval-escape-return so it surfaces multiple
+   values via (apply #'values …)."
   (cond
     ((and *%eval-escape-stack*
           (let ((top (car *%eval-escape-stack*)))
@@ -941,6 +944,15 @@
        val))
     (t :%eval-no-escape)))
 
+(defun %eval-escape-return (val)
+  "Surface VAL as the caller's return value.  When VAL is the
+   (cons '%mvs mv-list) marker from RETURN / RETURN-FROM, apply #'values
+   to unwrap multiple values; otherwise return VAL as-is."
+  (cond
+    ((and (consp val) (eq (car val) '%mvs))
+     (apply #'values (cdr val)))
+    (t val)))
+
 (defun %eval-block (name forms env)
   "Evaluate (block name forms...) with return-from support."
   (handler-case
@@ -951,7 +963,7 @@
         (if (eq val :%eval-no-escape)
             ;; Not for us — re-signal so an outer handler can catch.
             (error "%eval-escape")
-            val)))))
+            (%eval-escape-return val))))))
 
 ;;; ============================================================
 ;;; Extended LOOP at runtime EVAL
@@ -1174,37 +1186,55 @@
            (push (list :thereis (cadr rest)) body-actions)
            (setq rest (cddr rest)))
           ((or (%loop-kw= kw "WHEN") (%loop-kw= kw "IF"))
-           ;; (when TEST CLAUSE) — wrap the next action.
+           ;; (when TEST CLAUSE [AND CLAUSE]* [ELSE CLAUSE [AND CLAUSE]*] [END])
+           ;; CLHS §6.1.1.5.  The yes-branch (and optional no-branch)
+           ;; is a sequence of selectable-clauses joined by AND.
            (let* ((test (cadr rest))
-                  (rs (cddr rest))
-                  (sub (%loop-parse-one-action rs)))
-             ;; If the wrapped action is an :accum, make sure the
-             ;; accumulator cell exists (parse-one-action couldn't
-             ;; register it here).
-             (let ((action (car sub)))
-               (when (eq (car action) :accum)
-                 (let ((nm (cadr action)) (sk (caddr action)))
+                  (yes-pair (%loop-parse-branch (cddr rest)))
+                  (yes-acts (car yes-pair))
+                  (rs (cdr yes-pair))
+                  (no-acts nil))
+             (when (and rs (%loop-kw= (car rs) "ELSE"))
+               (let ((np (%loop-parse-branch (cdr rs))))
+                 (setq no-acts (car np))
+                 (setq rs (cdr np))))
+             (when (and rs (%loop-kw= (car rs) "END"))
+               (setq rs (cdr rs)))
+             ;; Register accumulator cells for any :accum action that
+             ;; appears in either branch (parse-one-action returns the
+             ;; record but doesn't touch the outer accums alist).
+             (dolist (a (append yes-acts no-acts))
+               (when (eq (car a) :accum)
+                 (let ((nm (cadr a)) (sk (caddr a)))
                    (unless (assoc nm accums)
                      (push (list nm sk (if (eq sk :sum) 0
                                             (if (eq sk :count) 0 nil)))
                            accums))
-                   (unless default-accum (setq default-accum nm))))
-               (push (list :when test action) body-actions))
-             (setq rest (cdr sub))))
+                   (unless default-accum (setq default-accum nm)))))
+             (push (list :when test yes-acts no-acts) body-actions)
+             (setq rest rs)))
           ((%loop-kw= kw "UNLESS")
            (let* ((test (cadr rest))
-                  (rs (cddr rest))
-                  (sub (%loop-parse-one-action rs)))
-             (let ((action (car sub)))
-               (when (eq (car action) :accum)
-                 (let ((nm (cadr action)) (sk (caddr action)))
+                  (yes-pair (%loop-parse-branch (cddr rest)))
+                  (yes-acts (car yes-pair))
+                  (rs (cdr yes-pair))
+                  (no-acts nil))
+             (when (and rs (%loop-kw= (car rs) "ELSE"))
+               (let ((np (%loop-parse-branch (cdr rs))))
+                 (setq no-acts (car np))
+                 (setq rs (cdr np))))
+             (when (and rs (%loop-kw= (car rs) "END"))
+               (setq rs (cdr rs)))
+             (dolist (a (append yes-acts no-acts))
+               (when (eq (car a) :accum)
+                 (let ((nm (cadr a)) (sk (caddr a)))
                    (unless (assoc nm accums)
                      (push (list nm sk (if (eq sk :sum) 0
                                             (if (eq sk :count) 0 nil)))
                            accums))
-                   (unless default-accum (setq default-accum nm))))
-               (push (list :unless test action) body-actions))
-             (setq rest (cdr sub))))
+                   (unless default-accum (setq default-accum nm)))))
+             (push (list :unless test yes-acts no-acts) body-actions)
+             (setq rest rs)))
           ((%loop-kw= kw "RETURN")
            (setq return-form (cadr rest))
            (setq rest (cddr rest)))
@@ -1221,30 +1251,91 @@
                    initial finally return-form env)))
 
 (defun %loop-parse-one-action (rest)
-  "Read one DO/COLLECT/SUM/COUNT/MIN/MAX action clause off REST.
-   Returns (cons action-record rest-after)."
+  "Read one DO/COLLECT/SUM/COUNT/MIN/MAX/APPEND/NCONC action clause off
+   REST, including optional `INTO NAME'.  Returns (cons action-record
+   rest-after).  Used inside WHEN/IF/UNLESS branches and ELSE branches —
+   handles the same INTO-naming that the top-level parser does so
+       (when (evenp x) collect x into evens)
+   names the right accumulator instead of defaulting to %loop-default-
+   collect."
   (let ((kw (car rest)))
     (cond
       ((or (%loop-kw= kw "DO") (%loop-kw= kw "DOING"))
        (cons (list :do (cadr rest)) (cddr rest)))
       ((or (%loop-kw= kw "COLLECT") (%loop-kw= kw "COLLECTING"))
-       (cons (list :accum '%loop-default-collect :collect (cadr rest))
-             (cddr rest)))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-collect) :collect expr)
+               rs)))
       ((%loop-kw= kw "SUM")
-       (cons (list :accum '%loop-default-sum :sum (cadr rest)) (cddr rest)))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-sum) :sum expr) rs)))
       ((%loop-kw= kw "COUNT")
-       (cons (list :accum '%loop-default-count :count (cadr rest)) (cddr rest)))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-count) :count expr) rs)))
       ((%loop-kw= kw "MINIMIZE")
-       (cons (list :accum '%loop-default-minimize :minimize (cadr rest))
-             (cddr rest)))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-minimize) :minimize expr)
+               rs)))
       ((%loop-kw= kw "MAXIMIZE")
-       (cons (list :accum '%loop-default-maximize :maximize (cadr rest))
-             (cddr rest)))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-maximize) :maximize expr)
+               rs)))
+      ((or (%loop-kw= kw "APPEND") (%loop-kw= kw "APPENDING"))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-append) :append expr)
+               rs)))
+      ((or (%loop-kw= kw "NCONC") (%loop-kw= kw "NCONCING"))
+       (let* ((expr (cadr rest))
+              (rs (cddr rest))
+              (into nil))
+         (when (and rs (%loop-kw= (car rs) "INTO"))
+           (setq into (cadr rs)) (setq rs (cddr rs)))
+         (cons (list :accum (or into '%loop-default-nconc) :nconc expr)
+               rs)))
       ((%loop-kw= kw "RETURN")
        (cons (list :return (cadr rest)) (cddr rest)))
       (t
        ;; Bare form = implicit DO.
        (cons (list :do kw) (cdr rest))))))
+
+(defun %loop-parse-branch (rest)
+  "Parse one action then any number of `AND' continuation actions
+   (CLHS §6.1.1.5 — `selectable-clause { and selectable-clause }*').
+   Returns (cons action-list rest-after).  Drives the WHEN / IF /
+   UNLESS / ELSE branch parser."
+  (let* ((first (%loop-parse-one-action rest))
+         (acts (list (car first)))
+         (rs (cdr first)))
+    (loop
+      (when (or (null rs) (not (%loop-kw= (car rs) "AND")))
+        (return (cons (nreverse acts) rs)))
+      (let ((nxt (%loop-parse-one-action (cdr rs))))
+        (push (car nxt) acts)
+        (setq rs (cdr nxt))))))
 
 (defun %loop-parse-for (rest)
   "Parse a FOR clause: returns (cons iter-record rest-after).
@@ -1414,7 +1505,7 @@
           (let ((val (%eval-escape-pop-if nil)))
             (if (eq val :%eval-no-escape)
                 (error "%eval-escape")
-                (return-from %loop-execute val)))))
+                (return-from %loop-execute (%eval-escape-return val))))))
       ;; finally — wrap in handler-case so a `(return X)` or
       ;; `(return-from NIL X)` form inside finally (the parenthesised
       ;; CLHS shape; the keyword-only `FINALLY RETURN form` shape was
@@ -1424,16 +1515,48 @@
       ;; `(loop ... finally (return t))` halts the runtime after the
       ;; final iteration prints because %eval-escape-push's signal
       ;; reaches no handler in this neighborhood.
+      ;;
+      ;; Bind every named INTO accumulator into fin-env so a finally
+      ;; body like `(return (values evens odds))` can reference the
+      ;; accumulator's user-given name.  Apply each accumulator's final
+      ;; transformation (nreverse for :collect, flatten for :append /
+      ;; :nconc) so the value the user sees matches what the loop would
+      ;; have returned via default-accum.
       (let ((fin-env env))
         (dolist (wb with-bindings)
           (setq fin-env (%env-extend (car wb) (cdr wb) fin-env)))
+        (dolist (a accums)
+          (let* ((nm (car a))
+                 (sk (cadr a))
+                 (cell (assoc nm acc-state))
+                 (raw (and cell (cdr cell)))
+                 ;; reverse (non-destructive) so the cell's stored list
+                 ;; survives untouched — the default-accum return path
+                 ;; below would otherwise see a partially-reversed list
+                 ;; and produce the wrong final value.
+                 (val (cond
+                        ((eq sk :collect) (reverse raw))
+                        ((eq sk :append)
+                         (let ((acc-list nil) (cur (reverse raw)))
+                           (loop
+                             (when (null cur) (return acc-list))
+                             (setq acc-list (append acc-list (car cur)))
+                             (setq cur (cdr cur)))))
+                        ((eq sk :nconc)
+                         (let ((acc-list nil) (cur (reverse raw)))
+                           (loop
+                             (when (null cur) (return acc-list))
+                             (setq acc-list (append acc-list (car cur)))
+                             (setq cur (cdr cur)))))
+                        (t raw))))
+            (setq fin-env (%env-extend nm val fin-env))))
         (handler-case
           (dolist (f finally) (%eval-in-env f fin-env))
           (t (c)
             (declare (ignore c))
             (let ((val (%eval-escape-pop-if nil)))
               (unless (eq val :%eval-no-escape)
-                (return-from %loop-execute val))
+                (return-from %loop-execute (%eval-escape-return val)))
               ;; not the escape we expect → re-signal
               (error "%eval-escape")))))
       ;; Resolve return value.
@@ -1568,11 +1691,24 @@
       ((eq kind :return)
        (%eval-escape-push nil (%eval-in-env (cadr act) env)))
       ((eq kind :when)
-       (when (%eval-in-env (cadr act) env)
-         (%loop-run-action (caddr act) env acc-state)))
+       ;; Shape: (:when test yes-actions no-actions).  yes-actions and
+       ;; no-actions are LISTS of action records (one per AND-joined
+       ;; clause).  no-actions is nil when no ELSE branch.
+       (let ((yes-acts (caddr act))
+             (no-acts (cadddr act)))
+         (cond
+           ((%eval-in-env (cadr act) env)
+            (dolist (a yes-acts) (%loop-run-action a env acc-state)))
+           (no-acts
+            (dolist (a no-acts) (%loop-run-action a env acc-state))))))
       ((eq kind :unless)
-       (unless (%eval-in-env (cadr act) env)
-         (%loop-run-action (caddr act) env acc-state)))
+       (let ((yes-acts (caddr act))
+             (no-acts (cadddr act)))
+         (cond
+           ((not (%eval-in-env (cadr act) env))
+            (dolist (a yes-acts) (%loop-run-action a env acc-state)))
+           (no-acts
+            (dolist (a no-acts) (%loop-run-action a env acc-state))))))
       ((eq kind :accum)
        (let* ((name (cadr act))
               (sub  (caddr act))
@@ -2220,17 +2356,25 @@
              (let ((val (%eval-escape-pop-if bname)))
                (if (eq val :%eval-no-escape)
                    (error "%eval-escape")
-                   val))))))
-      ;; RETURN-FROM — push (name . value) onto escape stack + signal
+                   (%eval-escape-return val)))))))
+      ;; RETURN-FROM — push (name . value) onto escape stack + signal.
+      ;; Capture multiple values via multiple-value-list so a form like
+      ;;     (return-from FOO (values a b c))
+      ;; carries all values; the escape-recovery side checks for the
+      ;; '%mvs marker and applies #'values to surface them.
       ((%eval-sym-eq op "RETURN-FROM")
        (let* ((name (car args))
               (val-form (cadr args))
-              (val (if (cdr args) (%eval-in-env val-form env) nil)))
-         (%eval-escape-push name val)))
+              (vals (if (cdr args)
+                        (multiple-value-list (%eval-in-env val-form env))
+                        (list nil))))
+         (%eval-escape-push name (cons '%mvs vals))))
       ;; RETURN — escape from the innermost block named NIL or LOOP
       ((%eval-sym-eq op "RETURN")
-       (let ((val (if args (%eval-in-env (car args) env) nil)))
-         (%eval-escape-push nil val)))
+       (let ((vals (if args
+                       (multiple-value-list (%eval-in-env (car args) env))
+                       (list nil))))
+         (%eval-escape-push nil (cons '%mvs vals))))
       ;; LOOP — repeat body forever until RETURN (or RETURN-FROM nil)
       ;; escapes via the stack.  Body is treated as an implicit progn
       ;; with implicit (block nil) wrapping for RETURN to target.
@@ -2254,7 +2398,7 @@
               (let ((val (%eval-escape-pop-if nil)))
                 (if (eq val :%eval-no-escape)
                     (error "%eval-escape")
-                    val)))))))
+                    (%eval-escape-return val))))))))
       ;; VALUES
       ((%eval-sym-eq op "VALUES")
        (let ((evaled (%eval-args args env)))

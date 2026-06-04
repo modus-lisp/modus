@@ -23,7 +23,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 MODUS_BIN=/tmp/modus
 TESTS_ROOT=/home/claude/modus-ref/ansi-test/tests
 RUNNER=$HERE/build-ansi-file-runner.sh
-OUT_DIR=${OUT_DIR:-/tmp/ansi-per-file}
+# Use a SHORT prefix to keep paths under Modus's 63-char argv[1] buffer
+# limit (boot-linux-x64.lisp ~line 266: `mov ecx, 63` then `rep movsb`).
+# Longer paths get truncated and modus errors on a `.li` instead of
+# `.lisp` extension.  TODO: expand the argv buffer in boot.
+OUT_DIR=${OUT_DIR:-/tmp/ap}
 mkdir -p "$OUT_DIR"
 
 # Collect all test files (non-aux, non-load)

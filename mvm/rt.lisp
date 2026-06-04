@@ -483,6 +483,14 @@
           (let ((name (car entry))
                 (thunk (cadr entry))
                 (expected (caddr entry)))
+            ;; Each test runs inside a fresh BLOCK / RETURN-FROM frame
+            ;; so a thunk that does (return X) or (return-from FOO Y)
+            ;; without an enclosing block lands here as a "?" rather
+            ;; than escaping past the handler-case below.  Clear the
+            ;; eval-escape stack before each test so a stale escape
+            ;; left over from a previous test's non-condition unwind
+            ;; doesn't poison the current one.
+            (setq *%eval-escape-stack* nil)
             (handler-case
               ;; Route through %do-funcall — the test thunk is an
               ;; interp-closure from deftest's runtime expansion, and

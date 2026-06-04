@@ -1356,11 +1356,27 @@
             (if (eq val :%eval-no-escape)
                 (error "%eval-escape")
                 (return-from %loop-execute val)))))
-      ;; finally
+      ;; finally — wrap in handler-case so a `(return X)` or
+      ;; `(return-from NIL X)` form inside finally (the parenthesised
+      ;; CLHS shape; the keyword-only `FINALLY RETURN form` shape was
+      ;; already stripped into return-form at parse time) escapes to
+      ;; the loop's return value instead of propagating uncaught past
+      ;; the loop's implicit (block nil) wrapping.  Without this wrap,
+      ;; `(loop ... finally (return t))` halts the runtime after the
+      ;; final iteration prints because %eval-escape-push's signal
+      ;; reaches no handler in this neighborhood.
       (let ((fin-env env))
         (dolist (wb with-bindings)
           (setq fin-env (%env-extend (car wb) (cdr wb) fin-env)))
-        (dolist (f finally) (%eval-in-env f fin-env)))
+        (handler-case
+          (dolist (f finally) (%eval-in-env f fin-env))
+          (t (c)
+            (declare (ignore c))
+            (let ((val (%eval-escape-pop-if nil)))
+              (unless (eq val :%eval-no-escape)
+                (return-from %loop-execute val))
+              ;; not the escape we expect → re-signal
+              (error "%eval-escape")))))
       ;; Resolve return value.
       (cond
         (return-form (%eval-in-env return-form env))

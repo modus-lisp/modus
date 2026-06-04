@@ -26,3 +26,6 @@ nohup.out
 *.log
 .claude
 tmp/
+
+/foo.*
+/tmp-*.lisp

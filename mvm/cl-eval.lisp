@@ -965,9 +965,16 @@
              (string-equal n "COUNT")
              (string-equal n "MINIMIZE")
              (string-equal n "MAXIMIZE")
+             (string-equal n "APPEND")
+             (string-equal n "APPENDING")
+             (string-equal n "NCONC")
+             (string-equal n "NCONCING")
              (string-equal n "WHEN")
              (string-equal n "IF")
              (string-equal n "UNLESS")
+             (string-equal n "ALWAYS")
+             (string-equal n "NEVER")
+             (string-equal n "THEREIS")
              (string-equal n "NAMED")
              (string-equal n "RETURN")))))
 
@@ -1083,6 +1090,41 @@
              (setq default-accum '%loop-default-maximize)
              (push (list :accum '%loop-default-maximize :maximize expr) body-actions)
              (setq rest rs)))
+          ((or (%loop-kw= kw "APPEND") (%loop-kw= kw "APPENDING"))
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest))
+                  (into nil))
+             (when (and rs (%loop-kw= (car rs) "INTO"))
+               (setq into (cadr rs)) (setq rs (cddr rs)))
+             (let ((name (or into '%loop-default-append)))
+               (unless (assoc name accums)
+                 (push (list name :append nil) accums))
+               (unless into (setq default-accum name))
+               (push (list :accum name :append expr) body-actions))
+             (setq rest rs)))
+          ((or (%loop-kw= kw "NCONC") (%loop-kw= kw "NCONCING"))
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest))
+                  (into nil))
+             (when (and rs (%loop-kw= (car rs) "INTO"))
+               (setq into (cadr rs)) (setq rs (cddr rs)))
+             (let ((name (or into '%loop-default-nconc)))
+               (unless (assoc name accums)
+                 (push (list name :nconc nil) accums))
+               (unless into (setq default-accum name))
+               (push (list :accum name :nconc expr) body-actions))
+             (setq rest rs)))
+          ((%loop-kw= kw "ALWAYS")
+           ;; (always TEST) — terminate-with-NIL if test ever fails;
+           ;; default-return T at end of loop.
+           (push (list :always (cadr rest)) body-actions)
+           (setq rest (cddr rest)))
+          ((%loop-kw= kw "NEVER")
+           (push (list :never (cadr rest)) body-actions)
+           (setq rest (cddr rest)))
+          ((%loop-kw= kw "THEREIS")
+           (push (list :thereis (cadr rest)) body-actions)
+           (setq rest (cddr rest)))
           ((or (%loop-kw= kw "WHEN") (%loop-kw= kw "IF"))
            ;; (when TEST CLAUSE) — wrap the next action.
            (let* ((test (cadr rest))
@@ -1328,8 +1370,35 @@
            (cond
              ((null acc) nil)
              ((eq (cadr acc) :collect) (nreverse (cdr cell)))
+             ((eq (cadr acc) :append)
+              ;; cell value is head-most-recent list of pushed lists;
+              ;; flatten via append on the reverse.
+              (let ((acc-list nil) (cur (nreverse (cdr cell))))
+                (loop
+                  (when (null cur) (return acc-list))
+                  (setq acc-list (append acc-list (car cur)))
+                  (setq cur (cdr cur)))))
+             ((eq (cadr acc) :nconc)
+              (let ((acc-list nil) (cur (nreverse (cdr cell))))
+                (loop
+                  (when (null cur) (return acc-list))
+                  (setq acc-list (nconc acc-list (car cur)))
+                  (setq cur (cdr cur)))))
              (t (cdr cell)))))
-        (t nil)))))
+        ;; If the loop ran to completion with no early-exit, return
+        ;; T for `always'/`never' clauses (CLHS §6.1.4.4), NIL
+        ;; otherwise.  We detect always/never presence by scanning
+        ;; body-actions.
+        (t (if (%loop-has-always-or-never body) t nil))))))
+
+(defun %loop-has-always-or-never (body)
+  (let ((cur body) (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (let ((k (car (car cur))))
+        (when (or (eq k :always) (eq k :never))
+          (setq found t)))
+      (setq cur (cdr cur)))))
 
 (defun %loop-step-cell (st env)
   "Advance one iteration-state cell and return (CONS NEW-ENV NIL)
@@ -1437,7 +1506,24 @@
              ((eq sub :minimize)
               (rplacd cell (if (null cur) val (if (< val cur) val cur))))
              ((eq sub :maximize)
-              (rplacd cell (if (null cur) val (if (> val cur) val cur)))))))))))
+              (rplacd cell (if (null cur) val (if (> val cur) val cur))))
+             ((eq sub :append)
+              ;; Push elements head-most-recent; reverse + flatten at end
+              (rplacd cell (cons val cur)))
+             ((eq sub :nconc)
+              (rplacd cell (cons val cur)))))))
+      ((eq kind :always)
+       ;; If test fails, the whole loop returns NIL via RETURN-FROM.
+       (unless (%eval-in-env (cadr act) env)
+         (%eval-escape-push nil nil)))
+      ((eq kind :never)
+       ;; If test ever succeeds, whole loop returns NIL.
+       (when (%eval-in-env (cadr act) env)
+         (%eval-escape-push nil nil)))
+      ((eq kind :thereis)
+       ;; If test yields non-NIL, whole loop returns that value.
+       (let ((v (%eval-in-env (cadr act) env)))
+         (when v (%eval-escape-push nil v)))))))
 
 ;;; We implement block/return-from by signalling a special condition.
 ;;; Since we can't easily do this without CLOS conditions, use a simpler

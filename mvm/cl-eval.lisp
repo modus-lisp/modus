@@ -1305,8 +1305,14 @@
                        iter-state)))
               ((eq kind :for-eq)
                (let ((init (caddr it)) (then (cadddr it)))
-                 (push (list :for-eq (cadr it)
-                             (%eval-in-env init env) then nil)
+                 ;; State shape: (:for-eq VAR CUR THEN FIRST-FLAG INIT).
+                 ;; INIT is preserved so the step path can re-evaluate it
+                 ;; each iteration when no THEN is supplied (CLHS 6.1.2.1.2).
+                 ;; Leave CUR as nil at build time — the first-iter step
+                 ;; evaluates INIT in the step-env (which has prior iter
+                 ;; clauses' vars bound), the only env where forms like
+                 ;; `for i2 = (1+ i)` can resolve `i`.
+                 (push (list :for-eq (cadr it) nil then nil init)
                        iter-state)))
               ((eq kind :while)
                (setq while-form (cadr it)))
@@ -1334,11 +1340,16 @@
               (let ((step-env env))
                 (dolist (wb with-bindings)
                   (setq step-env (%env-extend (car wb) (cdr wb) step-env)))
+                ;; Short-circuit on first iter that signals stop, so a
+                ;; later for-eq doesn't try to evaluate `init` in a
+                ;; step-env where the prior for-clause's var was never
+                ;; bound this iteration.
                 (dolist (st iter-state)
-                  (let ((res (%loop-step-cell st step-env)))
-                    (cond
-                      ((null res) (setq stopped t))
-                      (t (setq step-env (car res))))))
+                  (unless stopped
+                    (let ((res (%loop-step-cell st step-env)))
+                      (cond
+                        ((null res) (setq stopped t))
+                        (t (setq step-env (car res)))))))
                 (when stopped (return nil))
                 ;; While/until check.
                 (when while-form
@@ -1474,18 +1485,28 @@
        (let* ((var (cadr st))
               (cur (caddr st))
               (then (cadddr st))
-              (first-p (not (nth 4 st))))
+              (first-p (not (nth 4 st)))
+              (init (nth 5 st)))
          (cond
            (first-p
-            ;; mark not-first; var = cur (already set during build)
+            ;; Mark not-first.  First-iter VAR = INIT, evaluated NOW in
+            ;; step-env so prior for-clauses' vars are visible.
             (rplaca (cddddr st) t)
-            (cons (%env-extend var cur env) nil))
+            (let ((init-val (%eval-in-env init env)))
+              (rplaca (cddr st) init-val)
+              (cons (%env-extend var init-val env) nil)))
            (then
             (let ((env2 (%env-extend var cur env)))
               (let ((nx (%eval-in-env then env2)))
                 (rplaca (cddr st) nx)
                 (cons (%env-extend var nx env) nil))))
-           (t (cons (%env-extend var cur env) nil)))))
+           (t
+            ;; No THEN: re-evaluate INIT each iteration (CLHS 6.1.2.1.2).
+            ;; Same step-env so prior iter clauses' current bindings are
+            ;; visible to the init form.
+            (let ((nx (%eval-in-env init env)))
+              (rplaca (cddr st) nx)
+              (cons (%env-extend var nx env) nil))))))
       (t (cons env nil)))))
 
 (defun %loop-run-action (act env acc-state)

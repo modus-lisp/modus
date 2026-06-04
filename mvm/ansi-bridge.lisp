@@ -1594,6 +1594,21 @@
            (set-car y val))
          val))))
 
+(defun vector (&rest elements)
+  "CLHS: return a fresh simple-vector containing the args.
+   At compile time the VECTOR macro inlines `(let ((v (make-array N))) (aset v 0 a0) … v)';
+   this defun is the runtime fallback so `(vector …)' / `(apply #'vector …)' at
+   runtime EVAL works without crashing on missing-function."
+  (let* ((n (length elements))
+         (v (make-array n))
+         (i 0)
+         (cur elements))
+    (loop
+      (when (null cur) (return v))
+      (aset v i (car cur))
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))))
+
 (defun vector-push (new-element vector)
   "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil.
    String underlying stores fixnum char-codes; coerce a character element

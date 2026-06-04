@@ -3606,13 +3606,28 @@
     ;; but the actual mechanism still unknown).  Reverted; see
     ;; reference_constant_pool.md.
     ((stringp value)
-     (let ((n (length value)))
-       (emit-ir :alloc-obj dest n +subtag-string+)
-       (let ((temp (alloc-temp-reg)))
-         (dotimes (i n)
-           (emit-ir :li temp (ash (char-code (char value i)) +fixnum-shift+))
-           (emit-ir :obj-set dest i temp))
-         (free-temp-reg))))
+     ;; :obj-set encodes the slot index as imm8, so strings longer
+     ;; than 255 chars overflow — index 256 wraps to 0, index 257 to
+     ;; 1, etc., and the tail bytes silently overwrite the head.
+     ;; (Found via runtime-cl-macros.lisp's 277-char OR/SETF defmacro
+     ;; source strings: head 21 chars got replaced with tail 21
+     ;; chars, runtime read-from-string returned the corrupted prefix
+     ;; as the symbol OR alone, no defmacro form ever reached eval.)
+     ;; For long strings, route through the constant table — same
+     ;; path that handles arbitrary literal objects.
+     (cond
+       ((>= (length value) 256)
+        (let ((idx (length *constant-table*)))
+          (push value *constant-table*)
+          (emit-ir :li-const dest idx)))
+       (t
+        (let ((n (length value)))
+          (emit-ir :alloc-obj dest n +subtag-string+)
+          (let ((temp (alloc-temp-reg)))
+            (dotimes (i n)
+              (emit-ir :li temp (ash (char-code (char value i)) +fixnum-shift+))
+              (emit-ir :obj-set dest i temp))
+            (free-temp-reg))))))
     ;; Vector: allocate array object and fill with elements
     ((vectorp value)
      (let ((n (length value)))

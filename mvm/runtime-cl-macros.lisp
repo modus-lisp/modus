@@ -156,15 +156,11 @@
     "(defmacro with-standard-io-syntax (&rest body) (cons 'progn body))"))
 
 (defun %rt-install-one (src)
-  "Read SRC (a defmacro source string) and eval.  Handler-case wraps
-   the whole call but does NOT swallow errors — it just lets the
-   outer caller handle them (so a stable install chain doesn't get
-   stuck mid-way).  Wrapping each call in (handler-case ... (t (c) nil))
-   triggered a stability bug where installs 3+ stopped registering;
-   leaving errors un-caught here surfaces them at the install call
-   site, where the unrolled sequence in %install-runtime-cl-macros
-   skips past it."
+  "Read SRC (a defmacro source string) and eval.  Caller wraps in
+   handler-case if it wants resilience — wrapping each call here
+   triggered a stability bug where installs 3+ stopped registering."
   (eval (read-from-string src)))
+
 
 (defun %install-runtime-cl-macros ()
   "Eval each entry of *modus-runtime-macros* at boot.  The walks

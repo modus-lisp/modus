@@ -37,6 +37,11 @@ for f in $AUX/ansi-aux.lsp $AUX/cons-aux.lsp $AUX/numbers-aux.lsp \
   fi
 done
 
+# Stubs AFTER aux so they win via last-defun-wins (in particular
+# make-scaffold-copy / check-scaffold-copy — the official defstruct
+# versions fail at runtime EVAL and silently kill rt-run).
+echo "(load \"/home/claude/modus/scripts/aux-stubs.lisp\")" >> "$OUT"
+
 # Test files from each subdir, alphabetical, skipping load.lsp + *-aux.lsp.
 for subdir in $SUBDIRS; do
   if [ -d "$TESTS_ROOT/$subdir" ]; then

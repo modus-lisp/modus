@@ -343,7 +343,20 @@
                            (zerop (length token))
                            (every #'digit-char-p token))
                  (setf (gethash token seen) t)
-                 (push token result))))))))))
+                 (push token result))
+               ;; Also register a keyword token's bare name (without the
+               ;; leading colon).  compile-keyword uses (normalize-name
+               ;; KW) → hash of "FOO" (not ":FOO"); symbol-name at
+               ;; runtime looks up that hash in *sym-name-table*.
+               ;; Without this, keywords interned at build-time print
+               ;; as :|| because the colon-prefixed entry doesn't match.
+               (when (and (> (length token) 1)
+                          (char= (char token 0) #\:))
+                 (let ((bare (subseq token 1)))
+                   (unless (or (gethash bare seen)
+                               (zerop (length bare)))
+                     (setf (gethash bare seen) t)
+                     (push bare result))))))))))))
 
 (defvar *all-symbol-names* (scan-symbol-names *all-runtime-source*))
 

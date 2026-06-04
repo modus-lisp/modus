@@ -905,6 +905,540 @@
             (error "%eval-escape")
             val)))))
 
+;;; ============================================================
+;;; Extended LOOP at runtime EVAL
+;;; ============================================================
+;;;
+;;; The compile-time loop in mvm/compiler.lisp is a full implementation
+;;; of CL's extended LOOP.  At runtime EVAL we hand-roll a subset large
+;;; enough for the ANSI test suite's typical `(loop for x in list
+;;; [when/unless test] {collect|sum|count|do} expr)' patterns plus the
+;;; numeric variants `(loop for i from a to b by c …)' and
+;;; `(loop {while|until|repeat} test do body)'.
+;;;
+;;; What's covered:
+;;;   for VAR in LIST                            ; list iteration
+;;;   for VAR on LIST                            ; cdr-walk
+;;;   for VAR from N [{to|below|downto|above} M] [by S]   ; integer
+;;;   for VAR = INIT [then NEXT]                 ; recurrence
+;;;   for VAR across VECTOR                      ; vector iteration
+;;;   while TEST                                 ; pre-test
+;;;   until TEST                                 ; pre-test, inverted
+;;;   repeat N                                   ; count-down
+;;;   with VAR [= INIT]                          ; let-binding
+;;;   collect EXPR [into ACCUM]                  ; cons & nreverse
+;;;   sum EXPR [into ACCUM]
+;;;   count EXPR [into ACCUM]
+;;;   minimize / maximize EXPR
+;;;   when TEST {action}                         ; guard for one action
+;;;   unless TEST {action}                       ; guard, inverted
+;;;   do FORM                                    ; side effect
+;;;   return FORM                                ; early exit
+;;;   finally FORM
+;;;   initially FORM
+;;;
+;;; Not yet covered: hash-table iteration, package iteration, multiple
+;;; iteration clauses sharing one loop, named loops, named accumulators
+;;; with mismatched types, `as' as a synonym for `for', `if/then/else',
+;;; `always/never/thereis' termination clauses.  Those fall through to
+;;; the old simple-loop semantics (which will likely error) — extend
+;;; as new tests need them.
+
+(defun %loop-keyword-p (sym)
+  "True if SYM is a top-level extended-LOOP keyword.  Used to decide
+   whether `(loop X …)' is the new extended path or the old simple
+   `repeat body forever' path."
+  (let ((n (%eval-sym-name sym)))
+    (and n
+         (or (string-equal n "FOR")
+             (string-equal n "AS")
+             (string-equal n "WHILE")
+             (string-equal n "UNTIL")
+             (string-equal n "REPEAT")
+             (string-equal n "WITH")
+             (string-equal n "INITIALLY")
+             (string-equal n "DO")
+             (string-equal n "DOING")
+             (string-equal n "COLLECT")
+             (string-equal n "COLLECTING")
+             (string-equal n "SUM")
+             (string-equal n "COUNT")
+             (string-equal n "MINIMIZE")
+             (string-equal n "MAXIMIZE")
+             (string-equal n "WHEN")
+             (string-equal n "IF")
+             (string-equal n "UNLESS")
+             (string-equal n "NAMED")
+             (string-equal n "RETURN")))))
+
+(defun %loop-kw= (sym name)
+  "Symbol-name match without forcing intern semantics."
+  (and (symbolp sym)
+       (let ((n (%eval-sym-name sym))) (and n (string-equal n name)))))
+
+(defun %eval-extended-loop (clauses env)
+  "Parse and execute an extended-LOOP body.  CLAUSES is the cdr of the
+   user form (everything after the LOOP head)."
+  (let ((iters nil)         ; list of iter records, see %loop-make-iter
+        (accums nil)        ; list of (name kind state)
+        (default-accum nil) ; for un-named collects
+        (initial nil)
+        (finally nil)
+        (return-form nil)
+        (body-actions nil)  ; list of actions to run each iteration
+        (rest clauses))
+    ;; ---- Parse clauses ----
+    (loop
+      (when (null rest) (return nil))
+      (let ((kw (car rest)))
+        (cond
+          ((or (%loop-kw= kw "FOR") (%loop-kw= kw "AS"))
+           (let ((parsed (%loop-parse-for (cdr rest))))
+             (push (car parsed) iters)
+             (setq rest (cdr parsed))))
+          ((%loop-kw= kw "WITH")
+           ;; (with VAR [= INIT])
+           (let ((var (cadr rest))
+                 (rs (cddr rest))
+                 (init nil))
+             (when (and rs (%loop-kw= (car rs) "="))
+               (setq init (cadr rs))
+               (setq rs (cddr rs)))
+             ;; Treat as initially-bound let: prepend a setq.
+             (push (list :with var init) iters)
+             (setq rest rs)))
+          ((%loop-kw= kw "WHILE")
+           (push (list :while (cadr rest)) iters)
+           (setq rest (cddr rest)))
+          ((%loop-kw= kw "UNTIL")
+           (push (list :until (cadr rest)) iters)
+           (setq rest (cddr rest)))
+          ((%loop-kw= kw "REPEAT")
+           (let ((cnt-sym (gensym "RPT")))
+             (push (list :for-from cnt-sym 0 (cadr rest) nil :below 1) iters))
+           (setq rest (cddr rest)))
+          ((%loop-kw= kw "INITIALLY")
+           (push (cadr rest) initial)
+           (setq rest (cddr rest)))
+          ((%loop-kw= kw "FINALLY")
+           ;; FINALLY RETURN form OR FINALLY (DO form) OR FINALLY form
+           (let ((nx (cadr rest)))
+             (cond
+               ((%loop-kw= nx "RETURN")
+                (setq return-form (caddr rest))
+                (setq rest (cdddr rest)))
+               (t
+                (push nx finally)
+                (setq rest (cddr rest))))))
+          ((or (%loop-kw= kw "DO") (%loop-kw= kw "DOING"))
+           (push (list :do (cadr rest)) body-actions)
+           (setq rest (cddr rest)))
+          ((or (%loop-kw= kw "COLLECT") (%loop-kw= kw "COLLECTING"))
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest))
+                  (into nil))
+             (when (and rs (%loop-kw= (car rs) "INTO"))
+               (setq into (cadr rs)) (setq rs (cddr rs)))
+             (let ((name (or into '%loop-default-collect)))
+               (unless (assoc name accums)
+                 (push (list name :collect nil) accums))
+               (unless into (setq default-accum name))
+               (push (list :accum name :collect expr) body-actions))
+             (setq rest rs)))
+          ((%loop-kw= kw "SUM")
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest))
+                  (into nil))
+             (when (and rs (%loop-kw= (car rs) "INTO"))
+               (setq into (cadr rs)) (setq rs (cddr rs)))
+             (let ((name (or into '%loop-default-sum)))
+               (unless (assoc name accums)
+                 (push (list name :sum 0) accums))
+               (unless into (setq default-accum name))
+               (push (list :accum name :sum expr) body-actions))
+             (setq rest rs)))
+          ((%loop-kw= kw "COUNT")
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest))
+                  (into nil))
+             (when (and rs (%loop-kw= (car rs) "INTO"))
+               (setq into (cadr rs)) (setq rs (cddr rs)))
+             (let ((name (or into '%loop-default-count)))
+               (unless (assoc name accums)
+                 (push (list name :count 0) accums))
+               (unless into (setq default-accum name))
+               (push (list :accum name :count expr) body-actions))
+             (setq rest rs)))
+          ((%loop-kw= kw "MINIMIZE")
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest)))
+             (push (list '%loop-default-minimize :minimize nil) accums)
+             (setq default-accum '%loop-default-minimize)
+             (push (list :accum '%loop-default-minimize :minimize expr) body-actions)
+             (setq rest rs)))
+          ((%loop-kw= kw "MAXIMIZE")
+           (let* ((expr (cadr rest))
+                  (rs (cddr rest)))
+             (push (list '%loop-default-maximize :maximize nil) accums)
+             (setq default-accum '%loop-default-maximize)
+             (push (list :accum '%loop-default-maximize :maximize expr) body-actions)
+             (setq rest rs)))
+          ((or (%loop-kw= kw "WHEN") (%loop-kw= kw "IF"))
+           ;; (when TEST CLAUSE) — wrap the next action.
+           (let* ((test (cadr rest))
+                  (rs (cddr rest))
+                  (sub (%loop-parse-one-action rs)))
+             ;; If the wrapped action is an :accum, make sure the
+             ;; accumulator cell exists (parse-one-action couldn't
+             ;; register it here).
+             (let ((action (car sub)))
+               (when (eq (car action) :accum)
+                 (let ((nm (cadr action)) (sk (caddr action)))
+                   (unless (assoc nm accums)
+                     (push (list nm sk (if (eq sk :sum) 0
+                                            (if (eq sk :count) 0 nil)))
+                           accums))
+                   (unless default-accum (setq default-accum nm))))
+               (push (list :when test action) body-actions))
+             (setq rest (cdr sub))))
+          ((%loop-kw= kw "UNLESS")
+           (let* ((test (cadr rest))
+                  (rs (cddr rest))
+                  (sub (%loop-parse-one-action rs)))
+             (let ((action (car sub)))
+               (when (eq (car action) :accum)
+                 (let ((nm (cadr action)) (sk (caddr action)))
+                   (unless (assoc nm accums)
+                     (push (list nm sk (if (eq sk :sum) 0
+                                            (if (eq sk :count) 0 nil)))
+                           accums))
+                   (unless default-accum (setq default-accum nm))))
+               (push (list :unless test action) body-actions))
+             (setq rest (cdr sub))))
+          ((%loop-kw= kw "RETURN")
+           (setq return-form (cadr rest))
+           (setq rest (cddr rest)))
+          (t
+           ;; Unknown — best-effort: treat as a DO form.
+           (push (list :do kw) body-actions)
+           (setq rest (cdr rest))))))
+    (setq iters (nreverse iters))
+    (setq accums (nreverse accums))
+    (setq body-actions (nreverse body-actions))
+    (setq initial (nreverse initial))
+    (setq finally (nreverse finally))
+    (%loop-execute iters accums default-accum body-actions
+                   initial finally return-form env)))
+
+(defun %loop-parse-one-action (rest)
+  "Read one DO/COLLECT/SUM/COUNT/MIN/MAX action clause off REST.
+   Returns (cons action-record rest-after)."
+  (let ((kw (car rest)))
+    (cond
+      ((or (%loop-kw= kw "DO") (%loop-kw= kw "DOING"))
+       (cons (list :do (cadr rest)) (cddr rest)))
+      ((or (%loop-kw= kw "COLLECT") (%loop-kw= kw "COLLECTING"))
+       (cons (list :accum '%loop-default-collect :collect (cadr rest))
+             (cddr rest)))
+      ((%loop-kw= kw "SUM")
+       (cons (list :accum '%loop-default-sum :sum (cadr rest)) (cddr rest)))
+      ((%loop-kw= kw "COUNT")
+       (cons (list :accum '%loop-default-count :count (cadr rest)) (cddr rest)))
+      ((%loop-kw= kw "MINIMIZE")
+       (cons (list :accum '%loop-default-minimize :minimize (cadr rest))
+             (cddr rest)))
+      ((%loop-kw= kw "MAXIMIZE")
+       (cons (list :accum '%loop-default-maximize :maximize (cadr rest))
+             (cddr rest)))
+      ((%loop-kw= kw "RETURN")
+       (cons (list :return (cadr rest)) (cddr rest)))
+      (t
+       ;; Bare form = implicit DO.
+       (cons (list :do kw) (cdr rest))))))
+
+(defun %loop-parse-for (rest)
+  "Parse a FOR clause: returns (cons iter-record rest-after).
+   Recognised: in LIST | on LIST | from N [{to|below|downto|above} M]
+   [by S] | = INIT [then NEXT] | across VEC."
+  (let ((var (car rest))
+        (rs (cdr rest)))
+    (let ((kw (car rs)))
+      (cond
+        ((%loop-kw= kw "IN")
+         (cons (list :for-in var (cadr rs)) (cddr rs)))
+        ((%loop-kw= kw "ON")
+         (cons (list :for-on var (cadr rs)) (cddr rs)))
+        ((%loop-kw= kw "ACROSS")
+         (cons (list :for-across var (cadr rs)) (cddr rs)))
+        ((%loop-kw= kw "=")
+         (let ((init (cadr rs))
+               (tail (cddr rs))
+               (then nil))
+           (when (%loop-kw= (car tail) "THEN")
+             (setq then (cadr tail))
+             (setq tail (cddr tail)))
+           (cons (list :for-eq var init then) tail)))
+        ((%loop-kw= kw "FROM")
+         (let ((from (cadr rs))
+               (tail (cddr rs))
+               (bound nil) (bound-kind :to) (step 1))
+           (cond
+             ((%loop-kw= (car tail) "TO")
+              (setq bound (cadr tail))   (setq bound-kind :to)
+              (setq tail (cddr tail)))
+             ((%loop-kw= (car tail) "BELOW")
+              (setq bound (cadr tail))   (setq bound-kind :below)
+              (setq tail (cddr tail)))
+             ((%loop-kw= (car tail) "DOWNTO")
+              (setq bound (cadr tail))   (setq bound-kind :downto)
+              (setq tail (cddr tail)))
+             ((%loop-kw= (car tail) "ABOVE")
+              (setq bound (cadr tail))   (setq bound-kind :above)
+              (setq tail (cddr tail))))
+           (when (%loop-kw= (car tail) "BY")
+             (setq step (cadr tail))
+             (setq tail (cddr tail)))
+           (cons (list :for-from var from bound nil bound-kind step) tail)))
+        (t
+         ;; (for VAR) with no specifier — repeat forever with VAR bound to nil
+         (cons (list :for-eq var nil nil) rs))))))
+
+(defun %loop-execute (iters accums default-accum body initial finally
+                            return-form env)
+  "Run the parsed extended-LOOP.  All iteration state is held in a
+   list of mutable cons cells `iter-state' (one per iter spec) and a
+   list of accumulator cons cells `acc-state' (one per accum spec).
+   The env carries ONLY the user-facing variables (X for FOR X IN …,
+   WITH-bound vars, etc.) — we re-extend it each iteration so the
+   user's expression sees fresh values.
+
+   The state cells use shared shapes:
+     :for-in     (REMAINING-LIST)
+     :for-on     (REMAINING-LIST)
+     :for-across (INDEX VECTOR)
+     :for-from   (CURRENT-N BOUND-VAL BOUND-KIND STEP)
+     :for-eq     (THEN-FORM FIRST-ITER-P)
+     :with       — no state; binding done once
+   Accumulators:
+     :collect    head-most-recent reversed at end
+     :sum        running total
+     :count      running count
+     :min/:max   running extremum"
+  (let ((iter-state nil)    ; list of state cells (mutable)
+        (with-bindings nil) ; ((var . val) …) for WITH
+        (while-form nil)
+        (until-form nil))
+    ;; Build state cells.  Walk iters in parsed-source order.
+    (let ((cur iters))
+      (loop
+        (when (null cur) (return nil))
+        (let ((it (car cur)))
+          (let ((kind (car it)))
+            (cond
+              ((eq kind :with)
+               (let ((var (cadr it)) (init (caddr it)))
+                 (push (cons var (if init (%eval-in-env init env) nil))
+                       with-bindings)
+                 (push (list :with var) iter-state)))
+              ((eq kind :for-in)
+               (push (list :for-in (cadr it)
+                           (%eval-in-env (caddr it) env))
+                     iter-state))
+              ((eq kind :for-on)
+               (push (list :for-on (cadr it)
+                           (%eval-in-env (caddr it) env))
+                     iter-state))
+              ((eq kind :for-across)
+               (push (list :for-across (cadr it)
+                           0 (%eval-in-env (caddr it) env))
+                     iter-state))
+              ((eq kind :for-from)
+               (let ((from (%eval-in-env (caddr it) env))
+                     (bound-form (cadddr it))
+                     (bk (nth 5 it))
+                     (st (%eval-in-env (nth 6 it) env)))
+                 (push (list :for-from (cadr it) from
+                             (and bound-form (%eval-in-env bound-form env))
+                             bk st)
+                       iter-state)))
+              ((eq kind :for-eq)
+               (let ((init (caddr it)) (then (cadddr it)))
+                 (push (list :for-eq (cadr it)
+                             (%eval-in-env init env) then nil)
+                       iter-state)))
+              ((eq kind :while)
+               (setq while-form (cadr it)))
+              ((eq kind :until)
+               (setq until-form (cadr it))))))
+        (setq cur (cdr cur))))
+    (setq iter-state (nreverse iter-state))
+    (setq with-bindings (nreverse with-bindings))
+    ;; Build accumulator state — list of cons cells (NAME . VALUE).
+    (let ((acc-state (let ((acc nil))
+                       (dolist (a accums (nreverse acc))
+                         (push (cons (car a) (caddr a)) acc)))))
+      ;; Run initially with WITH bindings in scope.
+      (let ((iter-env env))
+        (dolist (wb with-bindings)
+          (setq iter-env (%env-extend (car wb) (cdr wb) iter-env)))
+        (dolist (f initial) (%eval-in-env f iter-env)))
+      ;; Main loop.
+      (handler-case
+          (let ((stopped nil))
+            (loop
+              (when stopped (return nil))
+              ;; Advance every iter.  Build a fresh env per iteration
+              ;; carrying the freshly-stepped user-facing vars + WITH.
+              (let ((step-env env))
+                (dolist (wb with-bindings)
+                  (setq step-env (%env-extend (car wb) (cdr wb) step-env)))
+                (dolist (st iter-state)
+                  (let ((res (%loop-step-cell st step-env)))
+                    (cond
+                      ((null res) (setq stopped t))
+                      (t (setq step-env (car res))))))
+                (when stopped (return nil))
+                ;; While/until check.
+                (when while-form
+                  (unless (%eval-in-env while-form step-env)
+                    (setq stopped t) (return nil)))
+                (when until-form
+                  (when (%eval-in-env until-form step-env)
+                    (setq stopped t) (return nil)))
+                ;; Body actions.
+                (dolist (act body)
+                  (%loop-run-action act step-env acc-state)))))
+        (t (c)
+          (declare (ignore c))
+          (let ((val (%eval-escape-pop-if nil)))
+            (if (eq val :%eval-no-escape)
+                (error "%eval-escape")
+                (return-from %loop-execute val)))))
+      ;; finally
+      (let ((fin-env env))
+        (dolist (wb with-bindings)
+          (setq fin-env (%env-extend (car wb) (cdr wb) fin-env)))
+        (dolist (f finally) (%eval-in-env f fin-env)))
+      ;; Resolve return value.
+      (cond
+        (return-form (%eval-in-env return-form env))
+        (default-accum
+         (let ((acc (assoc default-accum accums))
+               (cell (assoc default-accum acc-state)))
+           (cond
+             ((null acc) nil)
+             ((eq (cadr acc) :collect) (nreverse (cdr cell)))
+             (t (cdr cell)))))
+        (t nil)))))
+
+(defun %loop-step-cell (st env)
+  "Advance one iteration-state cell and return (CONS NEW-ENV NIL)
+   if a step was taken, NIL if the iter source is exhausted.
+
+   Each state cell carries a tag in its CAR and the iterator's user-
+   facing var in its CADR; the rest of the cell holds source state.
+   We mutate the cell in place with rplacd/rplaca where needed."
+  (let ((kind (car st)))
+    (cond
+      ((eq kind :with) (cons env nil))
+      ((eq kind :for-in)
+       (let ((var (cadr st)) (lst (caddr st)))
+         (if (null lst)
+             nil
+             (progn
+               (rplaca (cddr st) (cdr lst))   ; advance remaining
+               (cons (%env-extend var (car lst) env) nil)))))
+      ((eq kind :for-on)
+       (let ((var (cadr st)) (lst (caddr st)))
+         (if (null lst)
+             nil
+             (progn
+               (rplaca (cddr st) (cdr lst))
+               (cons (%env-extend var lst env) nil)))))
+      ((eq kind :for-across)
+       (let* ((var (cadr st))
+              (i (caddr st))
+              (vec (cadddr st))
+              (n (array-length vec)))
+         (if (>= i n)
+             nil
+             (progn
+               (rplaca (cddr st) (+ i 1))
+               (cons (%env-extend var (aref vec i) env) nil)))))
+      ((eq kind :for-from)
+       (let* ((var (cadr st))
+              (cur (caddr st))
+              (bound (cadddr st))
+              (bk (nth 4 st))
+              (step (nth 5 st))
+              (done
+               (cond
+                 ((null bound) nil)
+                 ((eq bk :to)     (> cur bound))
+                 ((eq bk :below)  (>= cur bound))
+                 ((eq bk :downto) (< cur bound))
+                 ((eq bk :above)  (<= cur bound))
+                 (t nil))))
+         (if done
+             nil
+             (let ((nx (if (or (eq bk :downto) (eq bk :above))
+                           (- cur step) (+ cur step))))
+               (rplaca (cddr st) nx)
+               (cons (%env-extend var cur env) nil)))))
+      ((eq kind :for-eq)
+       (let* ((var (cadr st))
+              (cur (caddr st))
+              (then (cadddr st))
+              (first-p (not (nth 4 st))))
+         (cond
+           (first-p
+            ;; mark not-first; var = cur (already set during build)
+            (rplaca (cddddr st) t)
+            (cons (%env-extend var cur env) nil))
+           (then
+            (let ((env2 (%env-extend var cur env)))
+              (let ((nx (%eval-in-env then env2)))
+                (rplaca (cddr st) nx)
+                (cons (%env-extend var nx env) nil))))
+           (t (cons (%env-extend var cur env) nil)))))
+      (t (cons env nil)))))
+
+(defun %loop-run-action (act env acc-state)
+  "Execute one body-action record.  ACC-STATE is the list of mutable
+   (NAME . VALUE) cells for the accumulators set up by %loop-execute;
+   :ACCUM actions rplacd the appropriate cell."
+  (let ((kind (car act)))
+    (cond
+      ((eq kind :do)
+       (%eval-in-env (cadr act) env))
+      ((eq kind :return)
+       (%eval-escape-push nil (%eval-in-env (cadr act) env)))
+      ((eq kind :when)
+       (when (%eval-in-env (cadr act) env)
+         (%loop-run-action (caddr act) env acc-state)))
+      ((eq kind :unless)
+       (unless (%eval-in-env (cadr act) env)
+         (%loop-run-action (caddr act) env acc-state)))
+      ((eq kind :accum)
+       (let* ((name (cadr act))
+              (sub  (caddr act))
+              (expr (cadddr act))
+              (val  (%eval-in-env expr env))
+              (cell (assoc name acc-state))
+              (cur  (and cell (cdr cell))))
+         (when cell
+           (cond
+             ((eq sub :collect)
+              (rplacd cell (cons val cur)))
+             ((eq sub :sum)
+              (rplacd cell (+ cur val)))
+             ((eq sub :count)
+              (when val (rplacd cell (+ cur 1))))
+             ((eq sub :minimize)
+              (rplacd cell (if (null cur) val (if (< val cur) val cur))))
+             ((eq sub :maximize)
+              (rplacd cell (if (null cur) val (if (> val cur) val cur)))))))))))
+
 ;;; We implement block/return-from by signalling a special condition.
 ;;; Since we can't easily do this without CLOS conditions, use a simpler
 ;;; approach: use a global stack of block return values.
@@ -1477,16 +2011,26 @@
       ;; escapes via the stack.  Body is treated as an implicit progn
       ;; with implicit (block nil) wrapping for RETURN to target.
       ((%eval-sym-eq op "LOOP")
-       (handler-case
-         (let ((dummy nil))
-           (declare (ignore dummy))
-           (loop (%eval-progn args env)))
-         (t (c)
-           (declare (ignore c))
-           (let ((val (%eval-escape-pop-if nil)))
-             (if (eq val :%eval-no-escape)
-                 (error "%eval-escape")
-                 val)))))
+       (cond
+         ;; Extended LOOP: first arg is a bare keyword symbol (for /
+         ;; while / until / repeat / with / collect / sum / count / do).
+         ;; Hand off to %eval-extended-loop, which parses the clauses
+         ;; and runs the iteration.  Simple LOOP (body of forms) keeps
+         ;; the old `repeat-until-return' semantics below.
+         ((and args (symbolp (car args))
+               (%loop-keyword-p (car args)))
+          (%eval-extended-loop args env))
+         (t
+          (handler-case
+            (let ((dummy nil))
+              (declare (ignore dummy))
+              (loop (%eval-progn args env)))
+            (t (c)
+              (declare (ignore c))
+              (let ((val (%eval-escape-pop-if nil)))
+                (if (eq val :%eval-no-escape)
+                    (error "%eval-escape")
+                    val)))))))
       ;; VALUES
       ((%eval-sym-eq op "VALUES")
        (let ((evaled (%eval-args args env)))

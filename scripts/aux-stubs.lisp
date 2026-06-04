@@ -186,6 +186,34 @@
                    clauses)
          (t (error "ETYPECASE: ~S not matched" ,g))))))
 
+;;; DESTRUCTURING-BIND — runtime-EVAL doesn't have a compound branch
+;;; for it.  Expand to a flat LET that binds each var via NTH lookup
+;;; against the evaluated list (supports flat lambda-lists; &rest
+;;; collects the tail).  Sufficient for the destructuring-bind tests
+;;; and Paul Dietz's aux helpers that use simple (a b c) shapes.
+
+(defmacro destructuring-bind (lambda-list expr &rest body)
+  (let ((g (gensym "DB"))
+        (i 0)
+        (bindings nil)
+        (cur lambda-list))
+    (loop
+      (when (null cur) (return nil))
+      (cond
+        ((or (eq (car cur) '&rest) (eq (car cur) '&body))
+         (push `(,(cadr cur) (nthcdr ,i ,g)) bindings)
+         (return nil))
+        ((eq (car cur) '&optional)
+         (setq cur (cdr cur)))
+        (t
+         (let ((var (car cur)))
+           (push `(,var (nth ,i ,g)) bindings)
+           (incf i)
+           (setq cur (cdr cur))))))
+    `(let ((,g ,expr))
+       (let* ,(nreverse bindings)
+         ,@body))))
+
 ;;; random-aux.lsp isn't in the per-file runner's aux list, so its
 ;;; helpers (random-fixnum, coin, rcase) are unbound when numbers /
 ;;; printer tests reference them.  Define minimal versions.

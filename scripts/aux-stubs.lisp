@@ -108,6 +108,50 @@
   (declare (ignore error-name))
   `(values (signals-error ,form nil) (signals-error ,form nil)))
 
+;;; +standard-chars+ / +code-chars+ / +base-chars+ and friends — defined
+;;; in ansi-aux.lsp lines 404-441 BUT the load typically stops before
+;;; reaching them (line 7's `(in-package :cl-test)` works but later
+;;; `(declaim (type ... ))` and `(declaim (special *similarity-list*))`
+;;; forms aren't part of Modus's runtime DECLAIM yet — DECLAIM is
+;;; runtime-EVALed and any unknown declaration aborts the current form,
+;;; killing forms after it in the same load).  Define the common ones
+;;; here so char-* and reader-* tests don't all crash on unbound
+;;; +standard-chars+ / +code-chars+ references.
+
+(defparameter +standard-chars+
+  ;; Trailing newline+space matches ansi-aux.lsp:404-407 but
+  ;; runtime EVAL of (string #\Newline) currently faults on this
+  ;; build, so we splice them via code-char into the string.
+  (let* ((base "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~!@#$%^&*()_+|\\=-`{}[]:\";'<>?,./")
+         (s (make-string (+ (length base) 2))))
+    (dotimes (i (length base)) (setf (char s i) (char base i)))
+    (setf (char s (length base)) (code-char 10))
+    (setf (char s (1+ (length base))) (code-char 32))
+    s))
+
+(defparameter +base-chars+
+  (concatenate 'string
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "<,>.?/\"':;[{]}~`!@#$%^&*()_-+= \\|"))
+
+(defparameter +num-base-chars+ (length +base-chars+))
+(defparameter +alpha-chars+ (subseq +standard-chars+ 0 52))
+(defparameter +lower-case-chars+ (subseq +alpha-chars+ 0 26))
+(defparameter +upper-case-chars+ (subseq +alpha-chars+ 26 52))
+(defparameter +alphanumeric-chars+ (subseq +standard-chars+ 0 62))
+(defparameter +digit-chars+ "0123456789")
+(defparameter +extended-digit-chars+
+  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+(defparameter +code-chars+
+  (let ((s (make-string 256)))
+    (dotimes (i 256) (setf (char s i) (code-char i)))
+    s))
+
+(defparameter +rev-code-chars+ (reverse +code-chars+))
+
 ;;; random-aux.lsp isn't in the per-file runner's aux list, so its
 ;;; helpers (random-fixnum, coin, rcase) are unbound when numbers /
 ;;; printer tests reference them.  Define minimal versions.

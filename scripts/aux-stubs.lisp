@@ -84,3 +84,54 @@
          (*read-suppress* nil)
          (*readtable* (copy-readtable nil)))
      ,@body))
+
+;;; with-standard-io-syntax — the CL standard.  Modus's compiler rewrites
+;;; this when compiling test files, but runtime-EVAL of def-pprint-test
+;;; expansions invokes it through eval.  Same shape as my-with-standard-
+;;; io-syntax above.
+
+(defmacro with-standard-io-syntax (&rest body)
+  `(my-with-standard-io-syntax ,@body))
+
+;;; signals-error — ansi-aux.lsp's defmacro at line 262 wraps the body in
+;;; (not (catch 0 form t)) which does NOT actually catch CL errors — it
+;;; catches THROW to tag 0 only.  The build-ansi-test.lisp rewriter
+;;; converts it at compile time to a real handler-case, but our per-file
+;;; runner uses the generic /tmp/modus build with no rewrite — runtime
+;;; EVAL would inherit the broken catch-0 version.  Override here.
+
+(defmacro signals-error (form &rest ignore)
+  (declare (ignore ignore))
+  `(handler-case (progn ,form nil) (t (c) (declare (ignore c)) t)))
+
+(defmacro signals-error-always (form error-name)
+  (declare (ignore error-name))
+  `(values (signals-error ,form nil) (signals-error ,form nil)))
+
+;;; random-aux.lsp isn't in the per-file runner's aux list, so its
+;;; helpers (random-fixnum, coin, rcase) are unbound when numbers /
+;;; printer tests reference them.  Define minimal versions.
+
+(defun random-fixnum ()
+  (- (random (* 2 most-positive-fixnum)) most-positive-fixnum))
+
+(defun coin (&optional (n 2))
+  (zerop (random n)))
+
+(defmacro rcase (&rest clauses)
+  (let* ((total 0))
+    (dolist (cl clauses) (incf total (car cl)))
+    (let ((g (gensym)))
+      `(let ((,g (random ,total)))
+         (cond
+           ,@(let ((acc 0)
+                   (out nil))
+               (dolist (cl clauses)
+                 (incf acc (car cl))
+                 (push `((< ,g ,acc) ,@(cdr cl)) out))
+               (nreverse out)))))))
+
+;;; random-from-seq — random element from a sequence.
+(unless (fboundp 'random-from-seq)
+  (defun random-from-seq (seq)
+    (elt seq (random (length seq)))))

@@ -152,6 +152,40 @@
 
 (defparameter +rev-code-chars+ (reverse +code-chars+))
 
+;;; ECASE / TYPECASE / ETYPECASE — runtime-EVAL has no compound branch
+;;; for these and there's no macro registration either.  Expand to the
+;;; CLHS canonical shape so runtime EVAL hits CASE / IF chains it does
+;;; know about.
+
+(defmacro ecase (keyform &rest clauses)
+  (let ((g (gensym "ECASE")))
+    `(let ((,g ,keyform))
+       (case ,g
+         ,@clauses
+         (t (error "ECASE: ~S not matched" ,g))))))
+
+(defmacro typecase (keyform &rest clauses)
+  (let ((g (gensym "TC")))
+    `(let ((,g ,keyform))
+       (cond
+         ,@(mapcar (lambda (cl)
+                     (let ((type (car cl))
+                           (body (cdr cl)))
+                       (cond
+                         ((or (eq type 'otherwise) (eq type t))
+                          `(t ,@body))
+                         (t `((typep ,g ',type) ,@body)))))
+                   clauses)))))
+
+(defmacro etypecase (keyform &rest clauses)
+  (let ((g (gensym "ETC")))
+    `(let ((,g ,keyform))
+       (cond
+         ,@(mapcar (lambda (cl)
+                     `((typep ,g ',(car cl)) ,@(cdr cl)))
+                   clauses)
+         (t (error "ETYPECASE: ~S not matched" ,g))))))
+
 ;;; random-aux.lsp isn't in the per-file runner's aux list, so its
 ;;; helpers (random-fixnum, coin, rcase) are unbound when numbers /
 ;;; printer tests reference them.  Define minimal versions.

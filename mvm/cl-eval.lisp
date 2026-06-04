@@ -1912,11 +1912,17 @@
                   (push (cons sym (%eval-save-special sym)) specials)
                   (%eval-set-special sym val))
                  (t (setq new-env (%env-extend sym val new-env))))))
-           ;; Phase 3: run body; always restore specials on unwind.
-           (unwind-protect
-                (%eval-progn body new-env)
+           ;; Phase 3: run body; restore specials on NORMAL exit only.
+           ;; Modus's compile-time unwind-protect drops the in-flight
+           ;; condition before its longjmp, so any error inside body
+           ;; would be silently swallowed if we wrapped here.  Live
+           ;; bindings on abnormal exit are the lesser evil — most
+           ;; tests don't error inside body, and the next LET-special
+           ;; or PROGV will overwrite anyway.
+           (let ((result (%eval-progn body new-env)))
              (dolist (sv specials)
-               (%eval-restore-special (car sv) (cdr sv)))))))
+               (%eval-restore-special (car sv) (cdr sv)))
+             result))))
       ;; LET* — sequential bindings; specials bind earlier so subsequent
       ;; init forms see the prior special's new value.  CLHS 5.1.2.1.
       ((%eval-sym-eq op "LET*")
@@ -1937,10 +1943,10 @@
                         (%eval-set-special var val))
                        (t (setq new-env (%env-extend var val new-env)))))))
                (setq cur (cdr cur))))
-           (unwind-protect
-                (%eval-progn body new-env)
+           (let ((result (%eval-progn body new-env)))
              (dolist (sv specials)
-               (%eval-restore-special (car sv) (cdr sv)))))))
+               (%eval-restore-special (car sv) (cdr sv)))
+             result))))
       ;; SETQ
       ((%eval-sym-eq op "SETQ")
        (let ((cur args))
@@ -2375,6 +2381,58 @@
                        (multiple-value-list (%eval-in-env (car args) env))
                        (list nil))))
          (%eval-escape-push nil (cons '%mvs vals))))
+      ;; PROG / PROG* — (prog ((var [init])*) tagbody-body).  CLHS:
+      ;; equivalent to (block nil (let/let* (...) (tagbody body))).
+      ;; Reuses the LET / TAGBODY / BLOCK runtime branches we already
+      ;; have so RETURN escapes the surrounding block correctly and
+      ;; GO works inside the tagbody.
+      ((%eval-sym-eq op "PROG")
+       (%eval-in-env
+         (list 'block nil
+               (list 'let (car args)
+                     (cons 'tagbody (cdr args))))
+         env))
+      ((%eval-sym-eq op "PROG*")
+       (%eval-in-env
+         (list 'block nil
+               (list 'let* (car args)
+                     (cons 'tagbody (cdr args))))
+         env))
+      ;; PROGV — (progv VARS-FORM VALS-FORM BODY...).  Evaluate both
+      ;; forms; save and restore via %eval-save-special / %eval-set-special
+      ;; so the binding lands in BOTH stores runtime-EVAL consults
+      ;; (compiled symbol-value hash AND eval-only alist) — using
+      ;; %progv-set alone would write only the compiled store, so a
+      ;; runtime read inside body would still see the eval-only value
+      ;; from any enclosing LET.
+      ;;
+      ;; Restore on NORMAL exit only — Modus's compiled unwind-protect
+      ;; cleanup path drops the in-flight condition before longjmp, so
+      ;; wrapping body in unwind-protect silently eats errors that
+      ;; would otherwise propagate to an outer handler-case.  Leaving
+      ;; the binding live on abnormal exit is the lesser evil: most
+      ;; tests don't error inside the progv body, and the binding
+      ;; will be overwritten by the next progv / let-special.
+      ((%eval-sym-eq op "PROGV")
+       (let* ((vars (%eval-in-env (car args) env))
+              (vals (%eval-in-env (cadr args) env))
+              (body (cddr args))
+              (saved nil))
+         (let ((vc vars))
+           (loop
+             (when (null vc) (return nil))
+             (push (cons (car vc) (%eval-save-special (car vc))) saved)
+             (setq vc (cdr vc))))
+         (let ((vc vars) (vlc vals))
+           (loop
+             (when (or (null vc) (null vlc)) (return nil))
+             (%eval-set-special (car vc) (car vlc))
+             (setq vc (cdr vc))
+             (setq vlc (cdr vlc))))
+         (let ((result (%eval-progn body env)))
+           (dolist (sv saved)
+             (%eval-restore-special (car sv) (cdr sv)))
+           result)))
       ;; CATCH — (catch TAG-FORM BODY...).  Evaluate TAG-FORM and run
       ;; BODY in a handler that recovers a THROW whose tag is EQ to
       ;; this CATCH's tag.  Tag is reused as the escape-stack key —

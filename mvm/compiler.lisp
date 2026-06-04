@@ -3622,6 +3622,16 @@
           (emit-ir :li-const dest idx)))
        (t
         (let ((n (length value)))
+          ;; GC check BEFORE the alloc.  Without it, every quoted string
+          ;; literal in a hot path (e.g. `(%eval-sym-eq op "QUOTE")` in
+          ;; %eval-compound) allocates a fresh string per call and R12
+          ;; walks past the heap limit, SEGV'ing in alloc-obj itself.
+          ;; The in-process signal handler longjmps the SEGV to the
+          ;; nearest handler-case, so the test framework reports CRASH —
+          ;; a Cheney GC cascade hidden behind 1600 layout-shift-induced
+          ;; SEGVs in the substitute-if sequences sweep, confirmed via
+          ;; gdb at %EVAL-COMPOUND+228.
+          (emit-ir :gc-check)
           (emit-ir :alloc-obj dest n +subtag-string+)
           (let ((temp (alloc-temp-reg)))
             (dotimes (i n)

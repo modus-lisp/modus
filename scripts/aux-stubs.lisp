@@ -186,6 +186,18 @@
                    clauses)
          (t (error "ETYPECASE: ~S not matched" ,g))))))
 
+;;; subtypep — ansi-aux.lsp line 337 clobbers Modus's real two-value
+;;; subtypep with `(derivedp (symbol-value type1) (symbol-value type2))`,
+;;; which (a) calls the unbound function DERIVEDP, and (b) wrongly
+;;; evaluates type SYMBOLS via symbol-value as if they were globals.
+;;; Result: every runtime-EVAL subtypep call throws %eval-escape.
+;;; Restore via the internal %subtypep-impl that Modus's compiled
+;;; subtypep wraps.
+
+(defun subtypep (t1 t2)
+  (multiple-value-bind (sub valid) (%subtypep-impl t1 t2)
+    (values sub valid)))
+
 ;;; DESTRUCTURING-BIND — runtime-EVAL doesn't have a compound branch
 ;;; for it.  Expand to a flat LET that binds each var via NTH lookup
 ;;; against the evaluated list (supports flat lambda-lists; &rest

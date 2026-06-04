@@ -2488,6 +2488,64 @@
       ;; EVAL-WHEN (always eval)
       ((%eval-sym-eq op "EVAL-WHEN")
        (%eval-progn (cdr args) env))
+      ;; HANDLER-BIND — (handler-bind ((TYPE FN-FORM)*) BODY*)
+      ;; Mirrors build-ansi-test.lisp's compile-time rewrite into a
+      ;; %with-handler-bind call.  Each binding's FN-FORM is evaluated
+      ;; in the surrounding env to produce the handler closure; the body
+      ;; runs inside a thunk so %with-handler-bind can establish the
+      ;; restart frame around it.
+      ((%eval-sym-eq op "HANDLER-BIND")
+       (let* ((bindings (car args))
+              (body (cdr args))
+              (binding-pairs nil))
+         (dolist (b bindings)
+           (let ((type (car b))
+                 (fn (%eval-in-env (cadr b) env)))
+             (push (list type fn) binding-pairs)))
+         (setq binding-pairs (nreverse binding-pairs))
+         (cond
+           ((null binding-pairs) (%eval-progn body env))
+           (t (%with-handler-bind
+                binding-pairs
+                (list '%interp-closure nil body env))))))
+      ;; WITH-SIMPLE-RESTART — same as the build rewrite (just the body).
+      ;; A full impl would establish a named ABORT-style restart; tests
+      ;; that just rely on body's value pass with this stub.
+      ((%eval-sym-eq op "WITH-SIMPLE-RESTART")
+       (%eval-progn (cdr args) env))
+      ;; RESTART-CASE — (restart-case PROTECTED-FORM (NAME (ARGS) [:report …] BODY)*)
+      ;; Mirrors build-ansi-test.lisp's compile-time rewrite into a
+      ;; %with-restarts call.  Compiled %with-restarts handles the
+      ;; runtime restart frame + INVOKE-RESTART dispatch directly; we
+      ;; just hand it lists of (NAME interp-closure REPORT) and a
+      ;; thunk that evaluates PROTECTED-FORM in the current env.
+      ((%eval-sym-eq op "RESTART-CASE")
+       (let* ((protected-form (car args))
+              (clauses (cdr args))
+              (restart-cells nil))
+         (dolist (clause clauses)
+           (let* ((rname (car clause))
+                  (cl-args (cadr clause))
+                  (rest-opts (cddr clause))
+                  (body nil))
+             ;; Skip :report / :interactive / :test options until we
+             ;; hit a non-keyword head — the rest is the body.
+             (let ((done nil))
+               (loop
+                 (when done (return nil))
+                 (cond
+                   ((null rest-opts) (setq done t))
+                   ((keywordp (car rest-opts))
+                    (setq rest-opts (cddr rest-opts)))
+                   (t (setq body rest-opts) (setq done t)))))
+             (push (list rname
+                         (list '%interp-closure cl-args body env)
+                         nil)
+                   restart-cells)))
+         (setq restart-cells (nreverse restart-cells))
+         (%with-restarts
+           restart-cells
+           (list '%interp-closure nil (list protected-form) env))))
       ;; HANDLER-CASE — evaluate body; on error, find a matching handler
       ;; clause and evaluate its body with the condition bound to the var.
       ;; Clauses look like (TYPE (VAR) BODY...) or (TYPE () BODY...).

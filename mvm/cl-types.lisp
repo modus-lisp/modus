@@ -1611,6 +1611,11 @@
 (defun rem (n d)
   ;; CL: rem = n - d * (truncate n d)
   (multiple-value-bind (q r) (truncate n d) (declare (ignore q)) r))
+
+;; ash and lognot are inline opcodes at compile time but have no defun
+;; fallback for runtime EVAL.  Wrap so SFT lookup finds them.
+(defun ash (n s) (ash n s))
+(defun lognot (n) (lognot n))
 ;; ANSI: for n>=0, count 1-bits.  For n<0, count 0-bits in two's
 ;; complement — equivalently, count 1-bits of (lognot n) = -1-n.
 (defun logcount (n)

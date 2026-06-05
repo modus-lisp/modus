@@ -2720,7 +2720,9 @@
                 (%eval-restore-special var saved))))
            (t
             (%eval-progn body (%env-extend var stream env))))))
-      ;; FLET / LABELS
+      ;; FLET / LABELS — per CLHS §6.1.1.4 each definition's body is
+      ;; implicitly wrapped in (block NAME ...) so (return-from NAME ...)
+      ;; from inside the body escapes to that function's call.
       ((%eval-sym-eq op "FLET")
        (let ((local-fns (car args))
              (body (cdr args)))
@@ -2729,8 +2731,9 @@
              (let ((fname (car def))
                    (params (cadr def))
                    (fbody (cddr def)))
-               (let ((fn (list '%interp-closure params fbody new-env)))
-                 (setq new-env (%env-extend fname fn new-env)))))
+               (let ((wrapped-body (list (cons 'block (cons fname fbody)))))
+                 (let ((fn (list '%interp-closure params wrapped-body new-env)))
+                   (setq new-env (%env-extend fname fn new-env))))))
            (%eval-progn body new-env))))
       ((%eval-sym-eq op "LABELS")
        (let ((local-fns (car args))
@@ -2741,9 +2744,10 @@
              (let ((fname (car def))
                    (params (cadr def))
                    (fbody (cddr def)))
-               (let ((fn (list '%interp-closure params fbody nil)))
-                 ;; Will fix env pointer below
-                 (setq new-env (%env-extend fname fn new-env)))))
+               (let ((wrapped-body (list (cons 'block (cons fname fbody)))))
+                 (let ((fn (list '%interp-closure params wrapped-body nil)))
+                   ;; Will fix env pointer below
+                   (setq new-env (%env-extend fname fn new-env))))))
            ;; Update each closure to point to new-env
            (let ((cur new-env))
              (loop

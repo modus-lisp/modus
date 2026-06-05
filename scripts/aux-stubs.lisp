@@ -400,6 +400,40 @@
 ;;; collects the tail).  Sufficient for the destructuring-bind tests
 ;;; and Paul Dietz's aux helpers that use simple (a b c) shapes.
 
+;;; PSETQ / PSETF — parallel assignment.  Not in runtime EVAL's
+;;; compound branches.  Expand to a let-temp-then-setq chain so the
+;;; rhs forms all evaluate before any lhs is written.
+
+;;; MULTIPLE-VALUE-PROG1 — like PROG1 but preserve all values from
+;;; the first form across the subsequent body's side effects.
+
+(defmacro multiple-value-prog1 (first-form &rest body)
+  (let ((g (gensym "MVP1")))
+    `(let ((,g (multiple-value-list ,first-form)))
+       ,@body
+       (apply #'values ,g))))
+
+(defmacro psetq (&rest args)
+  (let ((pairs (loop while args
+                     collect (let ((var (pop args))
+                                   (val (pop args)))
+                               (list (gensym (string var)) var val)))))
+    `(let ,(mapcar (lambda (p) (list (car p) (caddr p))) pairs)
+       ,@(mapcar (lambda (p) (list 'setq (cadr p) (car p))) pairs)
+       nil)))
+
+(defmacro psetf (&rest args)
+  ;; Simplified: same shape as PSETQ — works for variable places.
+  ;; Pure-place (aref / nth / car) PSETFs that need a setf-expansion
+  ;; aren't covered here.
+  (let ((pairs (loop while args
+                     collect (let ((place (pop args))
+                                   (val (pop args)))
+                               (list (gensym) place val)))))
+    `(let ,(mapcar (lambda (p) (list (car p) (caddr p))) pairs)
+       ,@(mapcar (lambda (p) (list 'setf (cadr p) (car p))) pairs)
+       nil)))
+
 (defmacro destructuring-bind (lambda-list expr &rest body)
   (let ((g (gensym "DB"))
         (i 0)

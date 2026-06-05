@@ -1534,6 +1534,83 @@
         (loop (when (null cur) (return r))
               (setq r (/ r (car cur)))
               (setq cur (cdr cur))))))
+
+;; truncate / floor / ceiling / round / mod / rem — all opcode-only at
+;; compile time with no defun fallback, so runtime EVAL of (truncate
+;; 17 5) errored with %eval-escape.  Compiled callers still use the
+;; inline opcodes; these defuns serve the SFT-routed runtime path.
+
+(defun truncate (n &rest rest)
+  (cond
+    ((null rest) (truncate n))
+    (t (truncate n (car rest)))))
+
+;; floor / ceiling / round / mod / rem aren't compile-time intercepted
+;; the way truncate is, so a defun that recursed by name would loop
+;; forever.  Compute via truncate (which IS intercepted, so inside the
+;; compiled body the compiler emits the :div / :mod opcode directly).
+
+(defun floor (n &rest rest)
+  (cond
+    ((null rest)
+     ;; 1-arg: same as 2-arg with d=1; truncate already truncates toward
+     ;; negative infinity for negative integers because q = truncate
+     ;; toward zero — adjust when n itself is the non-integer.  For
+     ;; integers floor = truncate.
+     (truncate n))
+    (t
+     (let ((d (car rest)))
+       (multiple-value-bind (q r) (truncate n d)
+         ;; truncate is toward zero; floor is toward negative infinity.
+         ;; If r != 0 and (sign r) != (sign d), q = q - 1, r = r + d.
+         (if (and (not (= r 0))
+                  (if (< d 0) (> r 0) (< r 0)))
+             (values (- q 1) (+ r d))
+             (values q r)))))))
+
+(defun ceiling (n &rest rest)
+  (cond
+    ((null rest) (truncate n))
+    (t
+     (let ((d (car rest)))
+       (multiple-value-bind (q r) (truncate n d)
+         ;; ceiling = toward positive infinity.  If r != 0 and signs of
+         ;; r and d agree, q = q + 1, r = r - d.
+         (if (and (not (= r 0))
+                  (if (< d 0) (< r 0) (> r 0)))
+             (values (+ q 1) (- r d))
+             (values q r)))))))
+
+(defun round (n &rest rest)
+  (cond
+    ((null rest) (truncate n))
+    (t
+     (let ((d (car rest)))
+       (multiple-value-bind (q r) (truncate n d)
+         ;; round to nearest, ties to even.  |r| compared to |d|/2.
+         (let ((abs-r (if (< r 0) (- r) r))
+               (abs-d (if (< d 0) (- d) d)))
+           (cond
+             ;; |r| > |d|/2: round away from zero
+             ((> (* 2 abs-r) abs-d)
+              (if (if (< d 0) (> r 0) (< r 0))
+                  (values (- q 1) (+ r d))
+                  (values (+ q 1) (- r d))))
+             ;; |r| < |d|/2: keep truncation
+             ((< (* 2 abs-r) abs-d) (values q r))
+             ;; tie: round to even q
+             (t (if (oddp q)
+                    (if (< r 0) (values (- q 1) (+ r d))
+                        (values (+ q 1) (- r d)))
+                    (values q r))))))))))
+
+(defun mod (n d)
+  ;; CL: mod = n - d * (floor n d)
+  (multiple-value-bind (q r) (floor n d) (declare (ignore q)) r))
+
+(defun rem (n d)
+  ;; CL: rem = n - d * (truncate n d)
+  (multiple-value-bind (q r) (truncate n d) (declare (ignore q)) r))
 ;; ANSI: for n>=0, count 1-bits.  For n<0, count 0-bits in two's
 ;; complement — equivalently, count 1-bits of (lognot n) = -1-n.
 (defun logcount (n)

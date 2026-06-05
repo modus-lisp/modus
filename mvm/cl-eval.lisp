@@ -1404,6 +1404,33 @@
          ;; (for VAR) with no specifier — repeat forever with VAR bound to nil
          (cons (list :for-eq var nil nil) rs))))))
 
+(defun %loop-bind-pattern (pat val env)
+  "Extend ENV binding PAT to VAL.  PAT may be a symbol (regular bind)
+   or a cons (destructuring on a list — `(for (q r) = vals)` and
+   similar).  Destructuring walks the pattern and matches NTH of VAL;
+   nested patterns descend recursively.  Supports the flat list
+   shapes the ANSI loop tests use and no further."
+  (cond
+    ((null pat) env)
+    ((symbolp pat) (%env-extend pat val env))
+    ((consp pat)
+     ;; Destructure: walk pat and val in parallel.  Treat trailing
+     ;; dotted tail as &rest binding.
+     (let ((p pat) (v val) (new-env env))
+       (loop
+         (cond
+           ((null p) (return new-env))
+           ((consp p)
+            (setq new-env (%loop-bind-pattern (car p)
+                                              (if (consp v) (car v) nil)
+                                              new-env))
+            (setq p (cdr p))
+            (setq v (if (consp v) (cdr v) nil)))
+           ;; Dotted tail: bind to remaining value
+           (t (setq new-env (%loop-bind-pattern p v new-env))
+              (return new-env))))))
+    (t env)))
+
 (defun %loop-execute (iters accums default-accum body initial finally
                             return-form env)
   "Run the parsed extended-LOOP.  All iteration state is held in a
@@ -1685,19 +1712,19 @@
             (rplaca (cddddr st) t)
             (let ((init-val (%eval-in-env init env)))
               (rplaca (cddr st) init-val)
-              (cons (%env-extend var init-val env) nil)))
+              (cons (%loop-bind-pattern var init-val env) nil)))
            (then
-            (let ((env2 (%env-extend var cur env)))
+            (let ((env2 (%loop-bind-pattern var cur env)))
               (let ((nx (%eval-in-env then env2)))
                 (rplaca (cddr st) nx)
-                (cons (%env-extend var nx env) nil))))
+                (cons (%loop-bind-pattern var nx env) nil))))
            (t
             ;; No THEN: re-evaluate INIT each iteration (CLHS 6.1.2.1.2).
             ;; Same step-env so prior iter clauses' current bindings are
             ;; visible to the init form.
             (let ((nx (%eval-in-env init env)))
               (rplaca (cddr st) nx)
-              (cons (%env-extend var nx env) nil))))))
+              (cons (%loop-bind-pattern var nx env) nil))))))
       (t (cons env nil)))))
 
 (defun %loop-run-action (act env acc-state)

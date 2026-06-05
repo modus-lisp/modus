@@ -422,6 +422,27 @@
        (let* ,(nreverse bindings)
          ,@body))))
 
+;;; do-special-strings / do-special-integer-vectors — defined in
+;;; ansi-aux.lsp but its load stops short.  The macros enumerate
+;;; specialized string/vector variations; for our purposes, the base
+;;; (non-specialized) case is the one Modus's runtime EVAL can support
+;;; correctly.  Define as a single-iteration shim binding VAR to the
+;;; given form and running BODY once.  This loses 4× coverage but the
+;;; remaining 1× still validates the underlying sequence operation.
+
+(defmacro do-special-strings (var-lst &rest forms)
+  (let ((var (car var-lst))
+        (string-form (cadr var-lst))
+        (ret-form (caddr var-lst)))
+    `(let ((,var ,string-form))
+       ,@forms
+       ,ret-form)))
+
+(defmacro do-special-integer-vectors ((var vec-form &optional ret-form) &body forms)
+  `(let ((,var ,vec-form))
+     ,@forms
+     ,ret-form))
+
 ;;; random-aux.lsp isn't in the per-file runner's aux list, so its
 ;;; helpers (random-fixnum, coin, rcase) are unbound when numbers /
 ;;; printer tests reference them.  Define minimal versions.

@@ -1205,7 +1205,38 @@
 ;;; ============================================================
 
 (defun compile-and-load (form) nil)
-(defun compile (name &rest args) name)
+
+;;; compile shadow — ansi-bridge.lisp loads AFTER cl-eval.lisp, so this
+;;; defun wins via last-defun.  Replicate cl-eval.lisp:2883's logic
+;;; (the previous stub `(defun compile (name &rest args) name)' silently
+;;; shadowed it, breaking every `(funcall (compile nil '(lambda ...)) ...)'
+;;; pattern — the misc.lsp test file's entire 460 tests crashed because
+;;; compile returned NIL).
+(defun compile (name &rest args)
+  "Compile NAME (or lambda-expression in DEF).  For (compile nil
+   '(lambda ...)) return an interpreted closure; for (compile NAME)
+   return the SFT-looked-up compiled function."
+  (let ((def (if args (car args) nil)))
+    (cond
+      ((and (null name) def)
+       (let ((form (if (and (consp def) (eq (car def) 'quote))
+                       (cadr def)
+                       def)))
+         (if (and (consp form)
+                  (or (eq (car form) 'lambda)
+                      (and (symbolp (car form))
+                           (string-equal (symbol-name (car form)) "LAMBDA"))))
+             (values (list '%interp-closure (cadr form) (cddr form) nil)
+                     nil nil)
+             (values def nil nil))))
+      (name
+       (let ((fn (if (and (boundp '*symbol-function-table*)
+                          *symbol-function-table*)
+                     (gethash (if (symbolp name) (symbol-name name) name)
+                              *symbol-function-table*)
+                     nil)))
+         (values (or fn name) nil nil)))
+      (t (values nil nil nil)))))
 
 ;;; ============================================================
 ;;; check-equivalence — types-and-classes test helper

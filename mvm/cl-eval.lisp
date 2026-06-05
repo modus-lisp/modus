@@ -840,10 +840,14 @@
                ((%eval-sym-eq (car ps) "&AUX")
                 (return nil))   ; outer loop's &AUX clause picks up
                (t
+                ;; Spec shapes: var | (var [init [supplied-p]]).
                 (let* ((spec (car ps))
                        (var (if (consp spec) (car spec) spec))
                        (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
+                       (supplied-p-var (if (and (consp spec) (cdr spec) (cddr spec))
+                                           (caddr spec) nil))
                        (keyname (if (consp spec) (symbol-name var) (symbol-name spec)))
+                       (found-flag nil)
                        (value (let ((cur kw-args) (found nil) (val nil))
                                 (loop
                                   (when (or found (null cur) (null (cdr cur))) (return val))
@@ -851,15 +855,24 @@
                                     (when (and k (or (symbolp k) (%cl-sym-p k))
                                                (string= (symbol-name k) keyname))
                                       (setq val (cadr cur))
-                                      (setq found t)))
+                                      (setq found t)
+                                      (setq found-flag t)))
                                   (setq cur (cddr cur))))))
-                  (setq new-env (%env-extend var
-                                             (or value (and init nil))   ; init evaluated later if no value
-                                             new-env))
-                  (when (and (null value) init)
-                    ;; Evaluate init form in the env we're building.
-                    (let ((v (%eval-in-env init new-env)))
-                      (setq new-env (%env-extend var v new-env))))
+                  ;; Bind var: use the matched value when found, else init
+                  ;; evaluated in the partial env (so later defaults can
+                  ;; reference earlier params).
+                  (cond
+                    (found-flag
+                     (setq new-env (%env-extend var value new-env)))
+                    (init
+                     (setq new-env (%env-extend var
+                                                (%eval-in-env init new-env)
+                                                new-env)))
+                    (t (setq new-env (%env-extend var nil new-env))))
+                  ;; Bind the supplied-p flag if the spec named one.
+                  (when supplied-p-var
+                    (setq new-env (%env-extend supplied-p-var
+                                               found-flag new-env)))
                   (setq ps (cdr ps)))))))
          (return new-env))
         ;; &aux — bind each subsequent (var init) without consuming AS.
@@ -874,14 +887,21 @@
              (setq ps (cdr ps))))
          (return new-env))
         ;; Regular / &optional positional parameter
+        ;; &optional spec shapes: var | (var [init [supplied-p]])
         (t
          (let* ((spec (car ps))
                 (var (if (consp spec) (car spec) spec))
                 (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
+                (supplied-p-var (if (and (consp spec) (cdr spec) (cddr spec))
+                                    (caddr spec) nil))
+                (have-arg as)
                 (val (cond (as (car as))
                            (init (%eval-in-env init new-env))
                            (t nil))))
            (setq new-env (%env-extend var val new-env))
+           (when supplied-p-var
+             (setq new-env (%env-extend supplied-p-var
+                                        (if have-arg t nil) new-env)))
            (setq ps (cdr ps))
            (setq as (if as (cdr as) nil))))))))
 

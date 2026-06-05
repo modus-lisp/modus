@@ -198,6 +198,136 @@
   (multiple-value-bind (sub valid) (%subtypep-impl t1 t2)
     (values sub valid)))
 
+;;; Symbol-identity workaround for CL inheritance.  At boot the CL-USER
+;;; package has its own internal LIST symbol (and a few others) — distinct
+;;; from CL::LIST — because compile-time-quoted `'list' literals from
+;;; some compiler-installed runtime macro source interned in CL-USER
+;;; before %export-standard-cl-symbols ran.  Runtime READ of `'list'
+;;; with *package*=CL-USER then returns CL-USER::LIST, but compiled
+;;; functions (MERGE, COERCE, CONCATENATE) hold CL::LIST in their
+;;; `(eq result-type 'list)' tests.  (eq cl-user::list cl::list) = NIL
+;;; → every (coerce x 'list) / (merge 'list …) fails at runtime EVAL.
+;;;
+;;; Force the inheritance path by unintern'ing the CL-USER duplicates
+;;; AFTER re-running %export-standard-cl-symbols.  Now future runtime
+;;; READ in CL-USER finds these names :INHERITED → returns CL::LIST
+;;; → matches compiled callers.
+
+(handler-case (%export-standard-cl-symbols) (t (c) (declare (ignore c)) nil))
+(dolist (pkg-name '("COMMON-LISP-USER" "CL-TEST"))
+  (let ((pkg (find-package pkg-name)))
+    (when pkg
+      (dolist (name '("LIST" "VECTOR" "STRING" "ARRAY" "CONS" "SYMBOL"
+                      "NULL" "BIT-VECTOR" "SIMPLE-VECTOR" "SIMPLE-STRING"
+                      "SIMPLE-BIT-VECTOR" "BASE-STRING" "SIMPLE-BASE-STRING"
+                      "SIMPLE-ARRAY" "NUMBER" "INTEGER" "FIXNUM" "BIGNUM"
+                      "FLOAT" "DOUBLE-FLOAT" "SINGLE-FLOAT" "SHORT-FLOAT"
+                      "LONG-FLOAT" "RATIONAL" "RATIO" "REAL" "COMPLEX"
+                      "CHARACTER" "STANDARD-CHAR" "BASE-CHAR" "EXTENDED-CHAR"
+                      "SEQUENCE" "HASH-TABLE" "PACKAGE" "STREAM" "FUNCTION"
+                      "PATHNAME" "BOOLEAN" "KEYWORD"))
+        (let ((s (find-symbol name pkg)))
+          (when (and s (eq (symbol-package s) pkg))
+            (handler-case (unintern s pkg) (t (c) (declare (ignore c)) nil))))))))
+
+;;; %concat-result-kind override — compiled MERGE / CONCATENATE / MAP
+;;; dispatch on result-type via `(eq RESULT-TYPE 'list)' against
+;;; compile-time-interned symbols in CL.  Runtime READ in CL-USER
+;;; interns "LIST" as a fresh CL-USER::LIST symbol (the package system
+;;; doesn't follow CL inheritance for this name — open Modus bug;
+;;; "CONS" / "STRING" / "VECTOR" / "SYMBOL" all resolve correctly).
+;;; Every (eq RT 'list) test fails → MERGE returns TYPE-ERROR for
+;;; (merge 'list ...) at runtime EVAL.  Compare by symbol-name instead.
+
+(defun %concat-result-kind (result-type)
+  (cond
+    ((null result-type) :null)
+    ((symbolp result-type)
+     (let ((n (symbol-name result-type)))
+       (cond
+         ((string= n "NULL") :null)
+         ((or (string= n "LIST") (string= n "CONS")) :list)
+         ((or (string= n "STRING") (string= n "SIMPLE-STRING")
+              (string= n "BASE-STRING") (string= n "SIMPLE-BASE-STRING"))
+          :string)
+         ((or (string= n "BIT-VECTOR") (string= n "SIMPLE-BIT-VECTOR"))
+          :bit-vector)
+         (t :vector))))
+    ((consp result-type)
+     (let ((head (car result-type)))
+       (if (symbolp head)
+           (let ((n (symbol-name head)))
+             (cond
+               ((or (string= n "BIT-VECTOR") (string= n "SIMPLE-BIT-VECTOR"))
+                :bit-vector)
+               ((or (string= n "STRING") (string= n "SIMPLE-STRING")
+                    (string= n "BASE-STRING") (string= n "SIMPLE-BASE-STRING"))
+                :string)
+               (t :vector)))
+           :vector)))
+    (t :vector)))
+
+;;; merge override — the compiled merge captures a direct call to the
+;;; compiled %concat-result-kind, so overriding the latter at runtime
+;;; doesn't reach compiled callers.  Re-defining merge here forces the
+;;; SFT to point at this defun; runtime EVAL of (merge 'list ...)
+;;; comes here and dispatches by symbol-name instead of eq.
+
+(defun merge (result-type s1 s2 pred &rest args)
+  (let ((key-fn nil)
+        (vp args))
+    (loop
+      (when (or (null vp) (null (cdr vp))) (return))
+      (when (eq (car vp) :key) (setq key-fn (cadr vp)))
+      (setq vp (cddr vp)))
+    (let* ((pred-fn (cond ((functionp pred) pred)
+                          ((symbolp pred) (symbol-function pred))
+                          (t pred)))
+           (kfn (cond ((null key-fn) nil)
+                      ((functionp key-fn) key-fn)
+                      ((symbolp key-fn) (symbol-function key-fn))
+                      (t key-fn)))
+           ;; Coerce 'list at runtime EVAL is broken by the symbol-identity
+           ;; issue.  AREF isn't bound at runtime EVAL either (inline-only
+           ;; opcode in compiled code), so use ELT for the vector→list
+           ;; conversion.
+           (a (if (consp s1)
+                  s1
+                  (let ((tmp nil) (n (length s1)) (i 0))
+                    (loop (when (= i n) (return (nreverse tmp)))
+                      (setq tmp (cons (elt s1 i) tmp))
+                      (setq i (1+ i))))))
+           (b (if (consp s2)
+                  s2
+                  (let ((tmp nil) (n (length s2)) (i 0))
+                    (loop (when (= i n) (return (nreverse tmp)))
+                      (setq tmp (cons (elt s2 i) tmp))
+                      (setq i (1+ i))))))
+           (r nil))
+      (let ((merged
+              (loop
+                (cond ((null a) (return (nreconc r b)))
+                      ((null b) (return (nreconc r a)))
+                      ((funcall pred-fn
+                                (if kfn (funcall kfn (car a)) (car a))
+                                (if kfn (funcall kfn (car b)) (car b)))
+                       (setq r (cons (car a) r)) (setq a (cdr a)))
+                      (t (setq r (cons (car b) r)) (setq b (cdr b))))))
+            (kind (%concat-result-kind result-type)))
+        (cond
+          ((eq kind :list) merged)
+          ((eq kind :string)
+           (let* ((n (length merged))
+                  (cur merged)
+                  (s (make-string n))
+                  (i 0))
+             (loop (when (= i n) (return s))
+               (setf (char s i) (let ((c (car cur)))
+                                  (if (characterp c) c (code-char c))))
+               (setq cur (cdr cur))
+               (setq i (1+ i)))))
+          (t (make-array (length merged) :initial-contents merged)))))))
+
 ;;; ansi-aux.lsp's big defparameters at lines 508-731 don't get bound
 ;;; during runtime-EVAL load — the chain hits an earlier form that
 ;;; silently fails (init form raises unbound-variable, returns NIL,

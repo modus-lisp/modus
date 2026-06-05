@@ -340,6 +340,26 @@
 
 (defparameter *mini-universe* nil)
 
+;;; Standard CL numeric constants Modus doesn't ship.  PI is referenced
+;;; pervasively in numbers/sin.lsp etc.; the limit constants are read
+;;; by typep-array.lsp and various sequence tests.  Without these the
+;;; reference signals unbound-variable and cascades the rest of the
+;;; deftest body to CRASH.
+
+(unless (boundp 'pi)
+  (defparameter pi 3.141592653589793))
+
+(unless (boundp 'array-rank-limit)
+  (defparameter array-rank-limit 65535))
+(unless (boundp 'array-dimension-limit)
+  (defparameter array-dimension-limit (expt 2 30)))
+(unless (boundp 'array-total-size-limit)
+  (defparameter array-total-size-limit (expt 2 30)))
+(unless (boundp 'char-code-limit)
+  (defparameter char-code-limit 1114112))   ; #x110000 — Unicode
+(unless (boundp '*modules*)
+  (defparameter *modules* nil))
+
 (defparameter *disjoint-types-list*
   '(cons symbol array
     number character hash-table function readtable package

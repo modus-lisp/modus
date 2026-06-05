@@ -36,8 +36,8 @@
 (defvar *%trig-pi/2*       1570796327)  ; π/2 * K
 
 (defun %as-scaled-int (x)
-  "Convert X (integer, ratio, or 2-slot float-shape) to a fixnum scaled
-   by *%trig-precision* (K).  Returns the scaled integer."
+  "Convert X (integer, ratio, 2-slot float-shape, or IEEE float) to a
+   fixnum scaled by *%trig-precision* (K).  Returns the scaled integer."
   (let ((k *%trig-precision*))
     (cond
       ((integerp x) (* x k))
@@ -47,6 +47,58 @@
             (= (obj-subtag x) #x32) (= (array-length x) 2))
        (let ((n (aref x 0)) (d (aref x 1)))
          (if (= d 1) (* n k) (truncate (* n k) d))))
+      ;; IEEE float (subtag #x60, 2-slot).  Compute scaled = round(x * K)
+      ;; directly from the float bits (sign|exp(11)|mantissa(52)) so we
+      ;; never build a giant intermediate bignum.  Going through
+      ;; %ieee-float-to-rat → bignum-truncate is correct in theory but
+      ;; bignum-truncate gives precision-wrong results for 80-bit-class
+      ;; intermediates that the float→rat conversion produces.
+      ;;
+      ;; Algorithm: for x with biased exponent E and mantissa M (with
+      ;; implicit leading 1), the value is (1 + M/2^52) * 2^(E-1023).
+      ;; scaled = (2^52 + M) * K * 2^(E-1023) / 2^52
+      ;;        = (2^52 + M) * K  shifted by (E-1075)
+      ;; For 0 ≤ E-1075 we shift left (multiply by 2); for negative we
+      ;; shift right (integer division by 2).  All arithmetic stays in
+      ;; fixnum range when K ≤ 1e9 and |x| ≤ 8 — the Taylor inputs we
+      ;; reduce mod 2π.
+      ((and (not (fixnump x)) (not (consp x)) (not (null x))
+            (not (characterp x))
+            (= (obj-subtag x) #x60))
+       (let* ((hi (aref x 0))
+              (lo (aref x 1))
+              (hi-u32 (logand hi 4294967295))
+              (lo-u32 (logand lo 4294967295))
+              (sign-bit (logand (ash hi-u32 -31) 1))
+              (exp-bits (logand (ash hi-u32 -20) 2047))
+              (mantissa-hi (logand hi-u32 1048575))
+              (mantissa (logior (ash mantissa-hi 32) lo-u32))
+              (raw-sign (if (zerop sign-bit) 1 -1)))
+         (cond
+           ;; Zero / subnormal — treat as 0.
+           ((zerop exp-bits) 0)
+           ;; Inf / NaN — return 0 (Modus doesn't represent these).
+           ((= exp-bits 2047) 0)
+           (t
+            ;; Compute truncate(k * (1 + mantissa/2^52)) = k + truncate(k*m/2^52)
+            ;; Split m into m_hi*2^26 + m_lo so k*m fits in two fixnum
+            ;; products (k≤2^30, each half≤2^26 → k*half ≤ 2^56 < 2^62).
+            (let* ((m-hi (ash mantissa -26))
+                   (m-lo (logand mantissa 67108863))   ; (2^26 - 1)
+                   ;; k*m / 2^52 = k*m_hi/2^26 + k*m_lo/2^52
+                   (term-hi (truncate (* k m-hi) 67108864))    ; /2^26
+                   (term-lo (truncate (* k m-lo) 4503599627370496))  ; /2^52
+                   (base (+ k term-hi term-lo))   ; ~= k*(1+m/2^52)
+                   (shift (- exp-bits 1023)))     ; final 2^shift scale
+              (cond
+                ((>= shift 0)
+                 (if (> shift 30) 0    ; |x| > 2^30 — out of fixnum range
+                     (* raw-sign (ash base shift))))
+                (t
+                 (let ((nshift (- 0 shift)))
+                   (if (>= nshift 64)
+                       0   ; |x| < 2^-64 — effectively zero
+                       (* raw-sign (ash base (- 0 nshift))))))))))))
       (t 0))))
 
 (defun %scaled-result (s)
@@ -1471,6 +1523,17 @@
         (loop (when (null rest) (return r))
               (setq r (* r (car rest)))
               (setq rest (cdr rest))))))
+
+;; `/` is compile-time intrinsic but had no callable defun, so #'/ /
+;; (apply #'/ ...) / runtime-EVAL of (/ a b) all failed.  Compiled
+;; callers still use the inline opcode (compile-div); this defun only
+;; serves the SFT-routed runtime path.
+(defun / (a &rest rest)
+  (if (null rest) (/ 1 a)
+      (let ((r a) (cur rest))
+        (loop (when (null cur) (return r))
+              (setq r (/ r (car cur)))
+              (setq cur (cdr cur))))))
 ;; ANSI: for n>=0, count 1-bits.  For n<0, count 0-bits in two's
 ;; complement — equivalently, count 1-bits of (lognot n) = -1-n.
 (defun logcount (n)

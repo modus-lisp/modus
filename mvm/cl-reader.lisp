@@ -681,6 +681,45 @@
                               t))
                       (return-from %try-parse-integer nil)))))))))
 
+;;; The name `%make-float` is intercepted by Modus's compiler as a
+;;; primop that allocates a 1-slot uninitialized float object (see
+;;; compile-make-float in compiler.lisp ~line 9640).  The 6-arg defun
+;;; below NEVER ran from compiled callers — the parser's call site
+;;; emitted the alloc primop with no init, returning a 1-slot float
+;;; that displayed as 0.0.  Every runtime-EVAL literal float read as
+;;; 0.0 with %ieee-float-p = NIL, so generic-add fell to the fixnum
+;;; path and produced garbage bit-pattern arithmetic.
+;;;
+;;; Rename the constructor to `%build-float-from-parts` so the
+;;; compiler emits a normal call instead of the primop shortcut.
+
+(defun %build-float-from-parts (sign int-part frac-part frac-div exp-sign exp-part)
+  "Create a real IEEE-bit boxed float (subtag #x60) from parsed components.
+   value = sign * (int-part + frac-part/frac-div) * 10^(exp-sign*exp-part)
+   Built via SSE2 %float-from-int + %float-div, so the result is a true
+   #x60 IEEE float that :fadd/:fmul/:fcmp can operate on natively and the
+   printer's IEEE-decoder can format."
+  (let ((mantissa (+ (* int-part frac-div) frac-part))
+        (divisor frac-div)
+        (exp-val (* exp-sign exp-part)))
+    ;; Apply decimal exponent: positive → multiply mantissa, negative → multiply divisor.
+    (let ((i 0))
+      (loop
+        (when (>= i exp-val) (return nil))
+        (setq mantissa (* mantissa 10))
+        (setq i (+ i 1))))
+    (let ((i 0))
+      (loop
+        (when (>= i (- 0 exp-val)) (return nil))
+        (setq divisor (* divisor 10))
+        (setq i (+ i 1))))
+    ;; Convert num/den → IEEE via SSE2.
+    (let ((signed-mant (* sign mantissa)))
+      (if (= divisor 1)
+          (%float-from-int signed-mant)
+          (%float-div (%float-from-int signed-mant)
+                      (%float-from-int divisor))))))
+
 (defun %try-parse-float (codes)
   "Try to parse char codes as a float. Returns float or nil.
    For MVM, we parse but return an integer approximation.
@@ -757,37 +796,10 @@
             (t (return-from %try-parse-float nil))))
         (setq cur (cdr cur)))
       (unless got-digit (return-from %try-parse-float nil))
-      ;; Build a boxed float
-      ;; Simple approach: compute as (* sign (+ int-part (/ frac-part frac-div)) * 10^exp)
-      ;; For now, return the boxed float via %make-float
-      (%make-float sign int-part frac-part frac-div exp-sign exp-part))))
-
-(defun %make-float (sign int-part frac-part frac-div exp-sign exp-part)
-  "Create a real IEEE-bit boxed float (subtag #x60) from parsed components.
-   value = sign * (int-part + frac-part/frac-div) * 10^(exp-sign*exp-part)
-   Built via SSE2 %float-from-int + %float-div, so the result is a true
-   #x60 IEEE float that :fadd/:fmul/:fcmp can operate on natively and the
-   printer's IEEE-decoder can format."
-  (let ((mantissa (+ (* int-part frac-div) frac-part))
-        (divisor frac-div)
-        (exp-val (* exp-sign exp-part)))
-    ;; Apply decimal exponent: positive → multiply mantissa, negative → multiply divisor.
-    (let ((i 0))
-      (loop
-        (when (>= i exp-val) (return nil))
-        (setq mantissa (* mantissa 10))
-        (setq i (+ i 1))))
-    (let ((i 0))
-      (loop
-        (when (>= i (- 0 exp-val)) (return nil))
-        (setq divisor (* divisor 10))
-        (setq i (+ i 1))))
-    ;; Convert num/den → IEEE via SSE2.
-    (let ((signed-mant (* sign mantissa)))
-      (if (= divisor 1)
-          (%float-from-int signed-mant)
-          (%float-div (%float-from-int signed-mant)
-                      (%float-from-int divisor))))))
+      ;; Build a boxed float.  Use the rename'd builder — `%make-float'
+      ;; is the compiler primop that allocates an uninitialized 1-slot
+      ;; float, NOT a defun call.
+      (%build-float-from-parts sign int-part frac-part frac-div exp-sign exp-part))))
 
 (defun %tag-as-float (arr)
   "Tag an array as a float object (subtag #x60 = 96).

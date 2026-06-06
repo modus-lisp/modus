@@ -406,6 +406,16 @@
   (defparameter array-total-size-limit 16384))
 (unless (boundp 'char-code-limit)
   (defparameter char-code-limit 1114112))   ; #x110000 — Unicode
+(unless (boundp 'lambda-list-keywords)
+  (defparameter lambda-list-keywords
+    '(&allow-other-keys &aux &body &environment
+      &key &optional &rest &whole)))
+(unless (boundp 'lambda-parameters-limit)
+  (defparameter lambda-parameters-limit 4096))
+(unless (boundp 'call-arguments-limit)
+  (defparameter call-arguments-limit 4096))
+(unless (boundp 'multiple-values-limit)
+  (defparameter multiple-values-limit 64))
 (unless (boundp '*modules*)
   (defparameter *modules* nil))
 

@@ -874,7 +874,12 @@
                     (setq new-env (%env-extend supplied-p-var
                                                found-flag new-env)))
                   (setq ps (cdr ps)))))))
-         (return new-env))
+         ;; If the inner loop stopped because it hit &AUX, leave ps at
+         ;; &AUX and let the outer loop pick it up.  If it stopped at
+         ;; (null ps), the next outer iter's (null ps) branch returns.
+         ;; Either way: don't return here — falling through continues
+         ;; the outer loop.
+         )
         ;; &aux — bind each subsequent (var init) without consuming AS.
         ((%eval-sym-eq (car ps) "&AUX")
          (setq ps (cdr ps))

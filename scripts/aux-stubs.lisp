@@ -349,12 +349,16 @@
 (unless (boundp 'pi)
   (defparameter pi 3.141592653589793))
 
+;; ARRAY-RANK-LIMIT is exactly at the CLHS-required minimum (8) because
+;; the ANSI suite uses it as a loop bound — `(min 16 array-rank-limit)`
+;; and `(min array-rank-limit 128)' — and large values blow the 30-sec
+;; per-file ceiling on subtypep-array.lsp etc.
 (unless (boundp 'array-rank-limit)
-  (defparameter array-rank-limit 65535))
+  (defparameter array-rank-limit 8))
 (unless (boundp 'array-dimension-limit)
-  (defparameter array-dimension-limit (expt 2 30)))
+  (defparameter array-dimension-limit 16384))
 (unless (boundp 'array-total-size-limit)
-  (defparameter array-total-size-limit (expt 2 30)))
+  (defparameter array-total-size-limit 16384))
 (unless (boundp 'char-code-limit)
   (defparameter char-code-limit 1114112))   ; #x110000 — Unicode
 (unless (boundp '*modules*)

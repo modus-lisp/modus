@@ -186,6 +186,18 @@
                    clauses)
          (t (error "ETYPECASE: ~S not matched" ,g))))))
 
+;;; CCASE / CTYPECASE — like ECASE / ETYPECASE but the body of the
+;;; signalled error offers a STORE-VALUE restart in real CL.  Runtime
+;;; EVAL has no restart machinery for those — degrade to ECASE / ETYPECASE
+;;; so the dispatch still works and matched cases pass; unmatched cases
+;;; signal an error rather than restart.
+
+(defmacro ccase (keyform &rest clauses)
+  `(ecase ,keyform ,@clauses))
+
+(defmacro ctypecase (keyform &rest clauses)
+  `(etypecase ,keyform ,@clauses))
+
 ;;; subtypep — ansi-aux.lsp line 337 clobbers Modus's real two-value
 ;;; subtypep with `(derivedp (symbol-value type1) (symbol-value type2))`,
 ;;; which (a) calls the unbound function DERIVEDP, and (b) wrongly
@@ -459,26 +471,12 @@
        nil)))
 
 (defmacro destructuring-bind (lambda-list expr &rest body)
-  (let ((g (gensym "DB"))
-        (i 0)
-        (bindings nil)
-        (cur lambda-list))
-    (loop
-      (when (null cur) (return nil))
-      (cond
-        ((or (eq (car cur) '&rest) (eq (car cur) '&body))
-         (push `(,(cadr cur) (nthcdr ,i ,g)) bindings)
-         (return nil))
-        ((eq (car cur) '&optional)
-         (setq cur (cdr cur)))
-        (t
-         (let ((var (car cur)))
-           (push `(,var (nth ,i ,g)) bindings)
-           (incf i)
-           (setq cur (cdr cur))))))
-    `(let ((,g ,expr))
-       (let* ,(nreverse bindings)
-         ,@body))))
+  ;; Expand to (apply (lambda LAMBDA-LIST BODY) EXPR) so Modus's existing
+  ;; %bind-params handles &optional / &rest / &key / supplied-p / &aux
+  ;; for free.  Doesn't handle nested cons patterns the way real ANSI
+  ;; destructuring does, but covers the common &optional / &key shapes
+  ;; the suite uses pervasively (destructuring-bind.5–.16 etc.).
+  `(apply (lambda ,lambda-list ,@body) ,expr))
 
 ;;; do-special-strings / do-special-integer-vectors — defined in
 ;;; ansi-aux.lsp but its load stops short.  The macros enumerate

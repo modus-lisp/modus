@@ -8583,54 +8583,32 @@
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
    Positive count = left shift, negative = right shift.
-   Handles both constant and variable shift counts."
-  (compile-form value-form env dest)
+
+   Small constant counts (≤ 30) use the inline :shl/:sar path; the
+   result is guaranteed to fit in a 63-bit fixnum so overflow is
+   impossible.  Larger constant counts and all variable counts go
+   through runtime `bignum-ash' so the result promotes to a bignum
+   when it doesn't fit.  Without this, `(ash 1 80)' silently wrapped
+   to 65536 — format-d/b/o/x tests doing `(ash 1 (+ 2 (random 80)))'
+   built broken universe values that cascaded into wrong test
+   outcomes.  See feedback_correctness_over_regression."
   (cond
-    ;; Constant shift count
-    ((integerp count-form)
+    ;; Small constant shift (≤ 30 bits left, any right) — inline.
+    ((and (integerp count-form) (<= count-form 30))
+     (compile-form value-form env dest)
      (if (>= count-form 0)
-         ;; Left shift
          (emit-ir :shl dest dest count-form)
-         ;; Right shift, then fix tag
          (progn
            (emit-ir :sar dest dest (- count-form))
-           ;; AND with ~1 to ensure fixnum tag (low bit 0)
            (let ((temp (alloc-temp-reg)))
              (emit-ir :li temp -2)
              (emit-ir :and dest dest temp)
              (free-temp-reg)))))
-    ;; Variable shift count
+    ;; Large constant or variable count — call bignum-ash so we
+    ;; promote to bignum on overflow.  Slower (a real call) but
+    ;; correct for arbitrary shift sizes.
     (t
-     (check-arith-nesting 'ash count-form)
-     (let ((count-reg (alloc-temp-reg))
-           (pos-label (make-compiler-label))
-           (neg-label (make-compiler-label))
-           (done-label (make-compiler-label))
-           (*arith-push-depth* (1+ *arith-push-depth*)))
-       ;; Push/pop dest around count evaluation to survive function calls
-       (emit-ir :push dest)
-       (compile-form count-form env count-reg)
-       (emit-ir :pop dest)
-       ;; Untag both: sar by 1
-       (emit-ir :sar dest dest 1)
-       (emit-ir :sar count-reg count-reg 1)
-       ;; Test sign of count
-       (let ((zero-reg (alloc-temp-reg)))
-         (emit-ir :li zero-reg 0)
-         (emit-ir :cmp count-reg zero-reg)
-         (free-temp-reg))
-       (emit-ir :bge pos-label)
-       ;; Negative (right shift): negate count, sar
-       (emit-ir :neg count-reg count-reg)
-       (emit-ir :sar-var dest dest count-reg)
-       (emit-ir :br done-label)
-       ;; Positive (left shift): shl
-       (emit-ir-label pos-label)
-       (emit-ir :shl-var dest dest count-reg)
-       ;; Done: re-tag
-       (emit-ir-label done-label)
-       (emit-ir :shl dest dest 1)
-       (free-temp-reg)))))
+     (compile-call 'bignum-ash (list value-form count-form) env dest))))
 
 (defun compile-ldb (bytespec value-form env dest)
   "Compile (ldb (byte size pos) value) - extract bit field.

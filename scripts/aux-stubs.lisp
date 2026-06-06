@@ -186,6 +186,39 @@
                    clauses)
          (t (error "ETYPECASE: ~S not matched" ,g))))))
 
+;;; ROTATEF / SHIFTF — destructive multi-place assignment.  Same scope
+;;; as PSETQ — variable places only; setf-expander places aren't
+;;; handled because runtime EVAL has no get-setf-expansion path.
+;;; Sufficient for the test patterns that use plain symbols.
+
+(defmacro rotatef (&rest places)
+  (cond
+    ((null places) nil)
+    ((null (cdr places)) nil)
+    (t
+     (let ((tmps (loop for p in places collect (gensym))))
+       `(let ,(loop for tmp in tmps for p in places collect (list tmp p))
+          ,@(let ((rotated-tmps (append (cdr tmps) (list (car tmps)))))
+              (loop for p in places for r in rotated-tmps
+                    collect (list 'setf p r)))
+          nil)))))
+
+(defmacro shiftf (&rest places-and-value)
+  (cond
+    ((or (null places-and-value) (null (cdr places-and-value)))
+     (error "shiftf needs at least 2 args"))
+    (t
+     (let* ((places (butlast places-and-value))
+            (final-value (car (last places-and-value)))
+            (tmps (loop for p in places collect (gensym)))
+            (final-tmp (gensym)))
+       `(let (,@(loop for tmp in tmps for p in places collect (list tmp p))
+              (,final-tmp ,final-value))
+          ,@(let ((shifted (append (cdr tmps) (list final-tmp))))
+              (loop for p in places for s in shifted
+                    collect (list 'setf p s)))
+          ,(car tmps))))))
+
 ;;; CCASE / CTYPECASE — like ECASE / ETYPECASE but the body of the
 ;;; signalled error offers a STORE-VALUE restart in real CL.  Runtime
 ;;; EVAL has no restart machinery for those — degrade to ECASE / ETYPECASE

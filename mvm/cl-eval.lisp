@@ -1143,7 +1143,10 @@
                   (into nil))
              (when (and rs (%loop-kw= (car rs) "INTO"))
                (setq into (cadr rs)) (setq rs (cddr rs)))
-             (let ((name (or into '%loop-default-sum)))
+             ;; Share one accumulator with COUNT per CLHS 6.1.3.3 when
+             ;; no :INTO — sum and count both belong to the numeric
+             ;; accumulator group (loop10 82/83).
+             (let ((name (or into '%loop-default-numeric)))
                (unless (assoc name accums)
                  (push (list name :sum 0) accums))
                (unless into (setq default-accum name))
@@ -1155,7 +1158,7 @@
                   (into nil))
              (when (and rs (%loop-kw= (car rs) "INTO"))
                (setq into (cadr rs)) (setq rs (cddr rs)))
-             (let ((name (or into '%loop-default-count)))
+             (let ((name (or into '%loop-default-numeric)))
                (unless (assoc name accums)
                  (push (list name :count 0) accums))
                (unless into (setq default-accum name))
@@ -1164,16 +1167,22 @@
           ((%loop-kw= kw "MINIMIZE")
            (let* ((expr (cadr rest))
                   (rs (cddr rest)))
-             (push (list '%loop-default-minimize :minimize nil) accums)
-             (setq default-accum '%loop-default-minimize)
-             (push (list :accum '%loop-default-minimize :minimize expr) body-actions)
+             ;; Share one accumulator with MAXIMIZE so paired clauses
+             ;; (CLHS 6.1.3.3) update a single running extremum — when
+             ;; both appear without :INTO the final value is min/max of
+             ;; all per-iter samples interleaved.
+             (unless (assoc '%loop-default-extremum accums)
+               (push (list '%loop-default-extremum :minimize nil) accums))
+             (setq default-accum '%loop-default-extremum)
+             (push (list :accum '%loop-default-extremum :minimize expr) body-actions)
              (setq rest rs)))
           ((%loop-kw= kw "MAXIMIZE")
            (let* ((expr (cadr rest))
                   (rs (cddr rest)))
-             (push (list '%loop-default-maximize :maximize nil) accums)
-             (setq default-accum '%loop-default-maximize)
-             (push (list :accum '%loop-default-maximize :maximize expr) body-actions)
+             (unless (assoc '%loop-default-extremum accums)
+               (push (list '%loop-default-extremum :maximize nil) accums))
+             (setq default-accum '%loop-default-extremum)
+             (push (list :accum '%loop-default-extremum :maximize expr) body-actions)
              (setq rest rs)))
           ((or (%loop-kw= kw "APPEND") (%loop-kw= kw "APPENDING"))
            (let* ((expr (cadr rest))
@@ -1315,7 +1324,9 @@
               (into nil))
          (when (and rs (%loop-kw= (car rs) "INTO"))
            (setq into (cadr rs)) (setq rs (cddr rs)))
-         (cons (list :accum (or into '%loop-default-minimize) :minimize expr)
+         ;; Share one extremum accumulator with MAXIMIZE when no :INTO,
+         ;; per CLHS 6.1.3.3 — paired clauses update one running value.
+         (cons (list :accum (or into '%loop-default-extremum) :minimize expr)
                rs)))
       ((%loop-kw= kw "MAXIMIZE")
        (let* ((expr (cadr rest))
@@ -1323,7 +1334,7 @@
               (into nil))
          (when (and rs (%loop-kw= (car rs) "INTO"))
            (setq into (cadr rs)) (setq rs (cddr rs)))
-         (cons (list :accum (or into '%loop-default-maximize) :maximize expr)
+         (cons (list :accum (or into '%loop-default-extremum) :maximize expr)
                rs)))
       ((or (%loop-kw= kw "APPEND") (%loop-kw= kw "APPENDING"))
        (let* ((expr (cadr rest))

@@ -5275,6 +5275,18 @@
              (= (normalize-name (car rest)) 729509721274984859))
     (cons (cadr rest) (cddr rest))))
 
+(defun %loop-try-bare-type (rest)
+  "If REST starts with a bare type symbol followed by another loop kw
+   (CLHS bare-type shorthand for accumulator OF-TYPE — `sum i fixnum'
+   etc.), return (typespec . new-rest).  Else NIL.  Only fires when
+   the FOLLOWING token is itself a loop keyword so we don't eat a
+   value expression."
+  (when (and rest (cdr rest) (symbolp (car rest))
+             (not (cl-loop-keyword-p (car rest)))
+             (symbolp (cadr rest))
+             (cl-loop-keyword-p (cadr rest)))
+    (cons (car rest) (cdr rest))))
+
 (defun %loop-try-into (rest)
   "If REST starts with INTO var [type-or-OF-TYPE], return
    (var TYPE-SPEC . new-rest-after).  TYPE-SPEC is NIL if not given.
@@ -6016,6 +6028,11 @@
                (when ot
                  (setf type-spec (car ot))
                  (setf rest (cdr ot))))
+             ;; CLHS bare-type shorthand: `sum i fixnum' (no OF-TYPE).
+             (let ((bt (%loop-try-bare-type rest)))
+               (when bt
+                 (unless type-spec (setf type-spec (car bt)))
+                 (setf rest (cdr bt))))
              (let ((iv (%loop-try-into rest)))
                (when iv
                  (setf rest (cddr iv))
@@ -6038,6 +6055,10 @@
                (when ot
                  (setf type-spec (car ot))
                  (setf rest (cdr ot))))
+             (let ((bt (%loop-try-bare-type rest)))
+               (when bt
+                 (unless type-spec (setf type-spec (car bt)))
+                 (setf rest (cdr bt))))
              (let ((iv (%loop-try-into rest)))
                (when iv
                  (setf rest (cddr iv))
@@ -6331,10 +6352,27 @@
          ;; For each acc-spec, compute its destination var. INTO uses the
          ;; user-named symbol so FINALLY can read it; without INTO, a gensym
          ;; backs the LOOP's return value.  :anon-cond uses its embedded var.
-         (acc-vars (mapcar (lambda (a)
-                             (cond ((eq (car a) :anon-cond) (cadr a))
-                                   (t (or (%loop-acc-into-var a) (gensym "ACC")))))
-                           accs))
+         ;;
+         ;; Anonymous (no INTO) accumulators in the SAME group SHARE one
+         ;; gensym per CLHS 6.1.3.3 — paired clauses update a single
+         ;; running value across iters.  Groups:
+         ;;   - :maximize / :minimize  (extremum) — loop10 61
+         ;;   - :sum / :count          (numeric)  — loop10 82/83
+         (acc-vars
+          (let ((shared-extremum nil)
+                (shared-numeric nil))
+            (mapcar (lambda (a)
+                      (cond ((eq (car a) :anon-cond) (cadr a))
+                            ((%loop-acc-into-var a)
+                             (%loop-acc-into-var a))
+                            ((member (car a) '(:maximize :minimize))
+                             (or shared-extremum
+                                 (setq shared-extremum (gensym "EXTACC"))))
+                            ((member (car a) '(:sum :count))
+                             (or shared-numeric
+                                 (setq shared-numeric (gensym "NUMACC"))))
+                            (t (gensym "ACC"))))
+                    accs)))
          ;; Picks "the" return-value acc (first non-INTO acc with a value).
          ;; Used only when there's exactly one anonymous accumulator and the
          ;; LOOP's own value should be its accumulated value.  :anon-cond is
@@ -6365,13 +6403,18 @@
     ;; Accumulator bindings (always/thereis don't need one).
     ;; :maximize/:minimize start at NIL — the body sets initial value on
     ;; first iteration via (if (null acc) val (max acc val)).
-    (let ((i -1))
+    ;; Shared acc-vars (from grouping anonymous :sum/:count or
+    ;; :max/:min) appear multiple times in acc-vars — bind once.
+    (let ((i -1) (bound-vars nil))
       (dolist (acc accs)
         (incf i)
-        (when (member (car acc) '(:collect :collect-when :sum :count :append
-                                  :nconc :maximize :minimize))
-          (push (list (nth i acc-vars) (%loop-acc-typed-init-value acc))
-                bindings))))
+        (let ((av (nth i acc-vars)))
+          (when (and (member (car acc) '(:collect :collect-when :sum :count :append
+                                         :nconc :maximize :minimize))
+                     (not (member av bound-vars)))
+            (push av bound-vars)
+            (push (list av (%loop-acc-typed-init-value acc))
+                  bindings)))))
 
     ;; Process iterations
     (dolist (iter iters)

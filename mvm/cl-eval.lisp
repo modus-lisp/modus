@@ -1486,14 +1486,14 @@
                            0 (%eval-in-env (caddr it) env))
                      iter-state))
               ((eq kind :for-from)
-               (let ((from (%eval-in-env (caddr it) env))
-                     (bound-form (cadddr it))
-                     (bk (nth 5 it))
-                     (st (%eval-in-env (nth 6 it) env)))
-                 (push (list :for-from (cadr it) from
-                             (and bound-form (%eval-in-env bound-form env))
-                             bk st)
-                       iter-state)))
+               ;; Defer evaluation of FROM/BOUND/STEP forms to first-iter
+               ;; step time.  Prior for-clauses' vars (e.g. `for i ...
+               ;; for j from 2 to i`) are only bound in step-env.  State
+               ;; shape: (:for-from VAR CUR BOUND-VAL BK STEP FROM-F
+               ;; BOUND-F STEP-F FIRST-P).
+               (push (list :for-from (cadr it) nil nil (nth 5 it) nil
+                           (caddr it) (cadddr it) (nth 6 it) nil)
+                     iter-state))
               ((eq kind :for-eq)
                (let ((init (caddr it)) (then (cadddr it)))
                  ;; State shape: (:for-eq VAR CUR THEN FIRST-FLAG INIT).
@@ -1686,24 +1686,38 @@
                (cons (%env-extend var (aref vec i) env) nil)))))
       ((eq kind :for-from)
        (let* ((var (cadr st))
-              (cur (caddr st))
-              (bound (cadddr st))
               (bk (nth 4 st))
-              (step (nth 5 st))
-              (done
-               (cond
-                 ((null bound) nil)
-                 ((eq bk :to)     (> cur bound))
-                 ((eq bk :below)  (>= cur bound))
-                 ((eq bk :downto) (< cur bound))
-                 ((eq bk :above)  (<= cur bound))
-                 (t nil))))
-         (if done
-             nil
-             (let ((nx (if (or (eq bk :downto) (eq bk :above))
-                           (- cur step) (+ cur step))))
-               (rplaca (cddr st) nx)
-               (cons (%env-extend var cur env) nil)))))
+              (first-p (not (nth 9 st))))
+         (when first-p
+           ;; Evaluate FROM / BOUND / STEP forms now, in step-env, so
+           ;; prior for-clauses' vars are visible.  Default STEP to 1
+           ;; when no BY clause was given.
+           (let ((from-f (nth 6 st))
+                 (bound-f (nth 7 st))
+                 (step-f (nth 8 st)))
+             (rplaca (cddr st) (%eval-in-env from-f env))
+             (rplaca (cdddr st)
+                     (and bound-f (%eval-in-env bound-f env)))
+             (rplaca (nthcdr 5 st)
+                     (if step-f (%eval-in-env step-f env) 1))
+             (rplaca (nthcdr 9 st) t)))
+         (let* ((cur (caddr st))
+                (bound (cadddr st))
+                (step (nth 5 st))
+                (done
+                 (cond
+                   ((null bound) nil)
+                   ((eq bk :to)     (> cur bound))
+                   ((eq bk :below)  (>= cur bound))
+                   ((eq bk :downto) (< cur bound))
+                   ((eq bk :above)  (<= cur bound))
+                   (t nil))))
+           (if done
+               nil
+               (let ((nx (if (or (eq bk :downto) (eq bk :above))
+                             (- cur step) (+ cur step))))
+                 (rplaca (cddr st) nx)
+                 (cons (%env-extend var cur env) nil))))))
       ((eq kind :for-eq)
        (let* ((var (cadr st))
               (cur (caddr st))

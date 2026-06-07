@@ -8046,13 +8046,19 @@
     ;; 0 args or 3+ args: signal error at runtime
     ((or (null args) (cddr args))
      (compile-form `(error "TRUNCATE requires 1 or 2 arguments") env dest))
-    ;; 1-arg form: IEEE float → integer (SSE2 CVTTSD2SI); else
-    ;; existing rational-form path via float-truncate-to-integer.
+    ;; 1-arg form: integer → itself; IEEE float → SSE2 CVTTSD2SI;
+    ;; legacy boxed float → float-truncate-to-integer.
+    ;; The (integerp %tv) gate keeps (truncate 100) from falling into
+    ;; the float path that aref's slot 0 of a fixnum and crashes.
+    ;; integerp also matches bignum.
     ((null (cdr args))
      (compile-form `(let ((%tv ,(car args)))
-                      (if (%ieee-float-p %tv)
-                          (%float-to-int %tv)
-                          (float-truncate-to-integer %tv)))
+                      (cond
+                        ((integerp %tv) %tv)
+                        ((%ieee-float-p %tv) (%float-to-int %tv))
+                        ((ratiop %tv)
+                         (truncate (aref %tv 0) (aref %tv 1)))
+                        (t (float-truncate-to-integer %tv))))
                     env dest))
     ;; 2-arg form: (truncate a b) → quotient q = a÷b toward zero plus
     ;; remainder r = a − q·b (CL spec returns 2 values).  Tests use

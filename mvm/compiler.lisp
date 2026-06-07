@@ -178,6 +178,14 @@
    `(let ((*x* 5)) ...)` for a defvar'd test helper would regress.
    Only names CLHS *defines* as special belong here.")
 
+(defvar *clhs-extra-specials* nil
+  "Per-file allowlist of additional special-variable name strings,
+   populated by build-ansi-test.lisp from `(declaim (special X))`
+   forms it sees before stripping them.  ANSI test files use
+   declaim to mark their own dynamic vars (most commonly *x*) so
+   methods inside `(eval '(defgeneric …))` see the binding from
+   the surrounding `(let ((*x* …)) …)`.")
+
 (defun %ensure-clhs-specials-table ()
   (or *clhs-standard-specials-hashes*
       (let ((tab (make-hash-table :test 'eql)))
@@ -2528,8 +2536,11 @@
                       (dolist (b bindings)
                         (let ((var (if (consp b) (car b) b)))
                           (when (and (symbolp var)
-                                     (gethash (normalize-name var)
-                                              (%ensure-clhs-specials-table))
+                                     (or (gethash (normalize-name var)
+                                                  (%ensure-clhs-specials-table))
+                                         (member (symbol-name var)
+                                                 *clhs-extra-specials*
+                                                 :test #'string=))
                                      (not (member (symbol-name var) declared
                                                   :key #'symbol-name
                                                   :test #'string=)))
@@ -2549,8 +2560,11 @@
                       (dolist (b bindings)
                         (let ((var (if (consp b) (car b) b)))
                           (when (and (symbolp var)
-                                     (gethash (normalize-name var)
-                                              (%ensure-clhs-specials-table))
+                                     (or (gethash (normalize-name var)
+                                                  (%ensure-clhs-specials-table))
+                                         (member (symbol-name var)
+                                                 *clhs-extra-specials*
+                                                 :test #'string=))
                                      (not (member (symbol-name var) declared
                                                   :key #'symbol-name
                                                   :test #'string=)))

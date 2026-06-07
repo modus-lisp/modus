@@ -3000,6 +3000,20 @@
               ;; the rest of the file's defuns.
               (handler-case
               (when (consp form)
+                ;; Process (declaim (special VAR ...)) before stripping so
+                ;; the names get added to the file-local special-var set;
+                ;; otherwise (let ((*x* ...)) ...) inside the file binds
+                ;; *x* lexically and method bodies (interp-closures from
+                ;; runtime eval) read the global instead — dgmc.* tests
+                ;; all use *x* this way.
+                (when (and (eq (car form) 'declaim) (consp (cdr form)))
+                  (dolist (decl (cdr form))
+                    (when (and (consp decl) (eq (car decl) 'special))
+                      (dolist (var (cdr decl))
+                        (when (symbolp var)
+                          (pushnew (symbol-name var)
+                                   modus.mvm::*clhs-extra-specials*
+                                   :test #'string=))))))
                 ;; Skip forms that can't compile on MVM or reference SBCL internals:
                 ;; defgeneric, defmethod, eval-when, declaim, proclaim, compile-and-load
                 (when (member (car form) '(defgeneric defmethod eval-when declaim proclaim

@@ -7795,10 +7795,9 @@
   ;; ANSI tests on x64 (minus.9, evenp.3, oddp.3, format-x.{1..12}) with
   ;; zero wins — the only test where overflow could promote a fixnum to
   ;; a bignum and recover a previous failure was masked by downstream
-  ;; bignum-incomplete code paths (logand/format on bignums).  The
-  ;; opcode infrastructure (:adds/:subs/:bvs IR + AArch64+x64 translator
-  ;; handlers) stays in place so a future emit-arith-pair revision can
-  ;; turn it back on once bignum-aware logand/printer paths land.
+  ;; bignum-incomplete code paths (logand/format on bignums).
+  ;; :mul promotion was also attempted but breaks interp-closures
+  ;; in a way I couldn't isolate; left disabled until investigated.
   (let* ((checked-op nil)
          (tag-temp   (alloc-temp-reg))
          (one-temp   (alloc-temp-reg))

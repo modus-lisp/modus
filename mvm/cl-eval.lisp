@@ -1996,10 +1996,16 @@
            ;; bindings on abnormal exit are the lesser evil — most
            ;; tests don't error inside body, and the next LET-special
            ;; or PROGV will overwrite anyway.
-           (let ((result (%eval-progn body new-env)))
+           ;;
+           ;; Capture MV around the restore-specials loop: each call to
+           ;; %eval-restore-special invokes set-symbol-value which
+           ;; clobbers the MV buffer.  Without this, `(let ((*x* …))
+           ;; (declare (special *x*)) (values 1 2 3 4))' returned only
+           ;; the primary value — dgmc.* tests all use this shape.
+           (let ((result (multiple-value-list (%eval-progn body new-env))))
              (dolist (sv specials)
                (%eval-restore-special (car sv) (cdr sv)))
-             result))))
+             (values-list result)))))
       ;; LET* — sequential bindings; specials bind earlier so subsequent
       ;; init forms see the prior special's new value.  CLHS 5.1.2.1.
       ((%eval-sym-eq op "LET*")
@@ -2020,10 +2026,13 @@
                         (%eval-set-special var val))
                        (t (setq new-env (%env-extend var val new-env)))))))
                (setq cur (cdr cur))))
-           (let ((result (%eval-progn body new-env)))
+           ;; Same MV-preservation as LET above: capture all values
+           ;; around the restore loop so set-symbol-value calls don't
+           ;; clobber the MV buffer.
+           (let ((result (multiple-value-list (%eval-progn body new-env))))
              (dolist (sv specials)
                (%eval-restore-special (car sv) (cdr sv)))
-             result))))
+             (values-list result)))))
       ;; SETQ
       ((%eval-sym-eq op "SETQ")
        (let ((cur args))
@@ -2506,10 +2515,11 @@
              (%eval-set-special (car vc) (car vlc))
              (setq vc (cdr vc))
              (setq vlc (cdr vlc))))
-         (let ((result (%eval-progn body env)))
+         ;; Same MV-preservation: set-symbol-value clobbers MV buffer.
+         (let ((result (multiple-value-list (%eval-progn body env))))
            (dolist (sv saved)
              (%eval-restore-special (car sv) (cdr sv)))
-           result)))
+           (values-list result))))
       ;; CATCH — (catch TAG-FORM BODY...).  Evaluate TAG-FORM and run
       ;; BODY in a handler that recovers a THROW whose tag is EQ to
       ;; this CATCH's tag.  Tag is reused as the escape-stack key —

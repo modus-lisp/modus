@@ -1553,11 +1553,13 @@
 (defun floor (n &rest rest)
   (cond
     ((null rest)
-     ;; 1-arg: same as 2-arg with d=1; truncate already truncates toward
-     ;; negative infinity for negative integers because q = truncate
-     ;; toward zero — adjust when n itself is the non-integer.  For
-     ;; integers floor = truncate.
-     (truncate n))
+     ;; 1-arg: integer is itself.  Ratio must route through 2-arg
+     ;; floor on num/denom so the toward-negative-infinity adjustment
+     ;; fires.  Plain (truncate ratio) goes toward zero, giving the
+     ;; wrong direction for negative ratios.
+     (cond ((integerp n) n)
+           ((ratiop n) (floor (aref n 0) (aref n 1)))
+           (t (truncate n))))
     (t
      (let ((d (car rest)))
        (multiple-value-bind (q r) (truncate n d)
@@ -1570,7 +1572,10 @@
 
 (defun ceiling (n &rest rest)
   (cond
-    ((null rest) (truncate n))
+    ((null rest)
+     (cond ((integerp n) n)
+           ((ratiop n) (ceiling (aref n 0) (aref n 1)))
+           (t (truncate n))))
     (t
      (let ((d (car rest)))
        (multiple-value-bind (q r) (truncate n d)
@@ -1583,7 +1588,10 @@
 
 (defun round (n &rest rest)
   (cond
-    ((null rest) (truncate n))
+    ((null rest)
+     (cond ((integerp n) n)
+           ((ratiop n) (round (aref n 0) (aref n 1)))
+           (t (truncate n))))
     (t
      (let ((d (car rest)))
        (multiple-value-bind (q r) (truncate n d)
@@ -2055,12 +2063,12 @@
 
 (defun generic-multiply (a b)
   (cond
-    ;; Bignum-aware: route integer/bignum products through bignum-mul so
-    ;; (* 10^10 10^10) → 10^20 bignum rather than silent fixnum wraparound.
-    ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b))
-          (or (bignump a) (bignump b)))
+    ;; Integer/integer: route through bignum-mul which has a 31-bit
+    ;; fast path AND promotes to bignum on overflow.  The naked
+    ;; %fixnum-* silently wrapped `(* 2^60 2^60) -> 0' for products
+    ;; that exceed 63 bits.
+    ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b)))
      (bignum-mul a b))
-    ((and (integerp a) (integerp b)) (%fixnum-* a b))
     ((and (integerp a) (ratiop b))
      (%make-rat (%fixnum-* a (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))

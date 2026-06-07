@@ -7913,7 +7913,14 @@
    (ratios, complex, IEEE floats) route through GENERIC-MULTIPLY for
    the right semantics.  Previously inlined :mul unconditionally
    which silently multiplied object-pointers for complex/ratio
-   operands — fixnum-pointer-as-integer overflow producing garbage."
+   operands — fixnum-pointer-as-integer overflow producing garbage.
+
+   TODO: fixnum × fixnum overflow (e.g. `(* 2^60 2^60) -> 0') still
+   wraps silently.  Routing the fast path through GENERIC-MULTIPLY
+   unconditionally has been tried and broke interp-closure dispatch
+   in a way I haven't yet isolated; leaving the fast :mul in place
+   for now and noting the gap.  generic-multiply itself does promote
+   via bignum-mul so the slow path is correct."
   (cond
     ((null args) (compile-integer 1 dest))
     ((null (cdr args)) (compile-form (car args) env dest))
@@ -8028,11 +8035,8 @@
 
 (defun compile-1+ (arg env dest)
   "Compile (1+ x) -> add tagged 1 (which is 2).
-   Tried rerouting via (+ x 1) for ratio dispatch, regressed 2 tests
-   via layout-shift; the underlying ratio-aware-1+ behaviour is still
-   needed for floor.7-fn etc., but the per-call-site size growth
-   hurts more than the correctness gain right now.  Revisit when
-   layout-stability lands."
+   TODO: ratio operands are silently corrupted via :inc on a pointer;
+   replace with type-dispatch when a non-recursive path is available."
   (compile-form arg env dest)
   (emit-ir :inc dest))
 

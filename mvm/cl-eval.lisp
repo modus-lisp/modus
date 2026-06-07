@@ -3987,11 +3987,29 @@
          (exp (* power (log base)))))))
 (defun isqrt (n) (if (<= n 0) 0 (let ((x n)) (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
   (when (>= x1 x) (return x)) (setq x x1))))))
-(defun gcd (a &optional b) (if (null b) (abs a)
-  (let ((a (abs a)) (b (abs b))) (loop (when (zerop b) (return a)) (let ((r (rem a b))) (setq a b) (setq b r))))))
-(defun lcm (&rest args) (if (null args) 1 (if (null (cdr args)) (abs (car args))
-  (let ((a (car args)) (b (cadr args)))
-    (if (or (zerop a) (zerop b)) 0 (abs (truncate (* a b) (gcd a b))))))))
+(defun gcd (&rest args)
+  ;; CLHS: (gcd) -> 0, (gcd n) -> |n|, (gcd a b ...) -> fold pairwise.
+  (cond
+    ((null args) 0)
+    ((null (cdr args)) (abs (car args)))
+    (t (let ((acc (abs (car args))) (rest (cdr args)))
+         (loop (when (null rest) (return acc))
+               (let ((b (abs (car rest))))
+                 (loop (when (zerop b) (return))
+                       (let ((r (rem acc b))) (setq acc b) (setq b r))))
+               (setq rest (cdr rest)))))))
+(defun lcm (&rest args)
+  ;; CLHS: (lcm) -> 1, (lcm n) -> |n|, (lcm a b ...) -> fold pairwise.
+  (cond
+    ((null args) 1)
+    ((null (cdr args)) (abs (car args)))
+    (t (let ((acc (abs (car args))) (rest (cdr args)))
+         (loop (when (null rest) (return acc))
+               (let ((b (abs (car rest))))
+                 (setq acc (if (or (zerop acc) (zerop b))
+                               0
+                               (abs (truncate (* acc b) (gcd acc b))))))
+               (setq rest (cdr rest)))))))
 
 ;;; Type predicates
 (defun numberp (x) (or (integerp x) (floatp-impl x)))
@@ -4635,14 +4653,18 @@
    via N-limb sign-magnitude schoolbook (see %mul-limbs-mag).  Returns
    the most compact representation: fixnum if it fits in 63-bit signed
    range, small bignum (≤ 124 bits) if it fits there, otherwise a
-   big bignum.  Picks the appropriate form via %make-bb's normalisation."
+   big bignum.  Picks the appropriate form via %make-bb's normalisation.
+
+   Fast path uses %fixnum-* directly (not *) so we don't recurse —
+   compile-mul routes every * through generic-multiply which calls
+   bignum-mul on integers."
   ;; Fast path: both fixnum and 31-bit-safe.
   (when (and (not (bignump a)) (not (bignump b)))
     (let* ((aa (if (< a 0) (- 0 a) a))
            (bb (if (< b 0) (- 0 b) b))
            (max 2147483647))   ; 2^31 - 1
       (when (and (<= aa max) (<= bb max))
-        (return-from bignum-mul (* a b)))))
+        (return-from bignum-mul (%fixnum-* a b)))))
   ;; General path: convert both to sign+limbs, multiply magnitudes,
   ;; combine sign, normalise via %make-bb.
   (let* ((ap (%any-to-limbs a))

@@ -809,9 +809,21 @@
   arr)
 
 (defun %interpret-token (chars all-escaped has-escape rt)
-  "Interpret a token as a number, symbol, or package-qualified symbol."
+  "Interpret a token as a number, symbol, or package-qualified symbol.
+   CLHS 2.3.3: a token consisting solely of unescaped dots is reserved
+   — `.', `..', `...' etc. signal a reader-error.  (`.' is consumed by
+   the cons-dot mechanism in list reading; reaching %interpret-token
+   means we're parsing a standalone token.)"
   ;; Apply readtable case to get the final character codes
   (let ((cased-chars (%apply-readtable-case chars all-escaped rt)))
+    ;; Reject all-dots tokens when there are no escapes.
+    (when (and (not has-escape) cased-chars)
+      (let ((only-dots t) (cur cased-chars))
+        (loop (when (null cur) (return nil))
+              (unless (= (car cur) 46) (setq only-dots nil) (return nil))
+              (setq cur (cdr cur)))
+        (when only-dots
+          (%reader-error "token consisting only of dots is reserved"))))
     ;; If no escapes, try as number first
     (if (not has-escape)
         (let ((num (%try-parse-integer cased-chars *read-base*)))
@@ -1602,7 +1614,10 @@
             nil)))))
 
 (defun %read-bit-vector (stream len)
-  "Read #*bits as a bit vector."
+  "Read #*bits as a bit vector.  Per CLHS 2.4.8.4: if LEN > actual
+   length, the LAST supplied bit is repeated to fill.  When
+   *read-suppress* is T, any character is consumed without error
+   and the result is NIL."
   (let ((bits nil) (ch nil))
     (loop
       (setq ch (read-char stream nil nil t))
@@ -1611,6 +1626,10 @@
         (unread-char ch stream)
         (return nil))
       (cond
+        ;; Suppress mode: consume any character without recording or
+        ;; signaling.  This matches CLHS 2.4.4.5 — the entire body of
+        ;; a suppressed read is parsed permissively.
+        (*read-suppress* nil)
         ((eql ch #\0) (setq bits (cons 0 bits)))
         ((eql ch #\1) (setq bits (cons 1 bits)))
         (t (%reader-error "invalid bit vector character"))))
@@ -1618,13 +1637,20 @@
         (let ((bit-list (nreverse bits)))
           (let ((actual-len (list-length bit-list)))
             (let ((vec-len (if len len actual-len)))
-              (let ((v (make-array vec-len))
+              ;; CLHS: when LEN > supplied count, the LAST bit repeats.
+              ;; (CLHS 2.4.8.4 — "the last bit ... is used to fill".)
+              ;; When no bits were supplied at all and LEN > 0, the
+              ;; behavior is implementation-defined; fill with 0.
+              (let ((fill-bit (if bit-list
+                                  (car (last bit-list))
+                                  0))
+                    (v (make-array vec-len))
                     (i 0) (cur bit-list))
                 (loop
                   (when (>= i vec-len) (return nil))
                   (if cur
                       (progn (aset v i (car cur)) (setq cur (cdr cur)))
-                      (aset v i 0))
+                      (aset v i fill-bit))
                   (setq i (+ i 1)))
                 v)))))))
 

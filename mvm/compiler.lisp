@@ -8000,11 +8000,13 @@
     (compile-form `(error "/ requires at least one argument") env dest)
     (return-from compile-div nil))
   (if (null (cdr args))
-      ;; (/ x) — recip; integer → ratio, float → 1.0/x, else %idiv-trunc.
+      ;; (/ x) — recip; integer → ratio, float → 1.0/x, ratio → swap,
+      ;; else %idiv-trunc.
       (compile-form `(let ((%dv ,(car args)))
                        (cond ((integerp %dv) (exact-divide 1 %dv))
                              ((%ieee-float-p %dv)
                               (%float-div (%float-from-int 1) %dv))
+                             ((ratiop %dv) (%rational-divide 1 %dv))
                              (t (%idiv-trunc 1 %dv))))
                     env dest)
       ;; (/ a b …) — pairwise; per-step rational/float dispatch.
@@ -8019,6 +8021,8 @@
                                     (%ieee-float-p ,b-sym))
                                 (%float-div (%any-to-float ,a-sym)
                                             (%any-to-float ,b-sym)))
+                               ((or (ratiop ,a-sym) (ratiop ,b-sym))
+                                (%rational-divide ,a-sym ,b-sym))
                                (t (%idiv-trunc ,a-sym ,b-sym)))))))
         (compile-form acc env dest))))
 

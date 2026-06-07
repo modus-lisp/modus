@@ -1909,6 +1909,18 @@
       (%idiv-trunc a b)
       (%make-rat a b)))
 
+(defun %rational-divide (a b)
+  "Divide A by B where at least one is a ratio (other may be ratio or
+   integer).  Cross-multiply (na*db)/(da*nb), normalise via %make-rat.
+   exact-divide handles the int/int case; this fills the ratio gap so
+   (/ 5/2 3) -> 5/6 instead of garbage from %idiv-trunc on the raw
+   ratio pointer."
+  (let ((na (if (ratiop a) (aref a 0) a))
+        (da (if (ratiop a) (aref a 1) 1))
+        (nb (if (ratiop b) (aref b 0) b))
+        (db (if (ratiop b) (aref b 1) 1)))
+    (%make-rat (* na db) (* da nb))))
+
 (defun generic-negate (x)
   "Negate X (integer or ratio)."
   (if (ratiop x)

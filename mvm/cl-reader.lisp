@@ -866,10 +866,16 @@
       (setq den-codes (nreverse den-codes))
       (let ((num (%try-parse-integer num-codes *read-base*))
             (den (%try-parse-integer den-codes *read-base*)))
-        (if (and num den (not (= (car den) 0)))
-            ;; Return ratio as (cons numerator denominator) tagged with ratio-tag
-            (exact-divide (car num) (car den))
-            nil)))))
+        (cond
+          ;; Well-formed ratio: build it via exact-divide.
+          ((and num den (not (= (car den) 0)))
+           (exact-divide (car num) (car den)))
+          ;; Both halves parse as integers but denominator is zero —
+          ;; CLHS 2.3.2.2 says this is a reader-error, not a symbol.
+          ((and num den (= (car den) 0))
+           (%reader-error "ratio with zero denominator"))
+          ;; Otherwise: not a ratio.  Caller falls through to symbol.
+          (t nil))))))
 
 (defun %interpret-symbol-token (cased-chars &optional all-escaped)
   "Interpret char codes as a symbol, handling package qualifiers.
@@ -1018,15 +1024,32 @@
 
 ;;; --- Backquote/comma reader ---
 
+;;; A comma is only legal inside a backquote.  *backquote-depth*
+;;; counts how many backquotes are currently open; each comma
+;;; consumes one level.  When the reader sees a comma at depth 0 it
+;;; signals a reader-error per CLHS 2.4.6.1.  Tracked dynamically so
+;;; nested reads (e.g. `(foo ,(bar ',baz))) see the right depth.
+(defvar *backquote-depth* 0)
+
 (defun %read-backquote (stream)
   "Read a backquote expression."
-  (let ((obj (%read-internal stream t nil t)))
-    (if *read-suppress* nil
-        (list 'backquote obj))))
+  (declare (special *backquote-depth*))
+  (let ((*backquote-depth* (+ *backquote-depth* 1)))
+    (declare (special *backquote-depth*))
+    (let ((obj (%read-internal stream t nil t)))
+      (if *read-suppress* nil
+          (list 'backquote obj)))))
 
 (defun %read-comma (stream)
-  "Read a comma expression (inside backquote)."
-  (let ((next (read-char stream t nil t)))
+  "Read a comma expression.  Outside of a backquote (depth=0) this
+   is a reader-error per CLHS 2.4.6.1."
+  (declare (special *backquote-depth*))
+  (when (<= *backquote-depth* 0)
+    (unless *read-suppress*
+      (%reader-error "comma outside of a backquote")))
+  (let ((*backquote-depth* (- *backquote-depth* 1))
+        (next (read-char stream t nil t)))
+    (declare (special *backquote-depth*))
     (cond
       ((eql next #\@)
        (let ((obj (%read-internal stream t nil t)))

@@ -1519,8 +1519,14 @@
    *read-suppress*) and reading continues at the form after.  Returning
    (values) here would make `(read-from-string \"#-cl :good\")` return
    nil instead of recursing past the suppressed form.  When the test
-   matches, just read and return the next form."
-  (let* ((feature-expr (let ((*read-suppress* nil))
+   matches, just read and return the next form.
+
+   CLHS 24.1.2.1.1: feature names in #+ / #- expressions are treated
+   as belonging to the keyword package — `#+X' tests for `:X', not
+   for whatever package `X' was read in.  We bind *package* to
+   :keyword so the inner read interns feature names as keywords."
+  (let* ((feature-expr (let ((*read-suppress* nil)
+                             (*package* (find-package "KEYWORD")))
                          (%read-internal stream t nil t)))
          (present (%feature-present-p feature-expr)))
     (cond
@@ -1535,12 +1541,18 @@
        (%read-internal stream t nil t)))))
 
 (defun %feature-name-eq (a b)
-  "Compare two feature designators.  CLHS says #+ matches with EQ on
-   symbols, so we compare via symbol-name to handle a test setting
-   `*features* = (:a :x :b)` while the source uses `#+X` (the symbol X
-   reads in package CL-TEST but should still match `:X`)."
+  "Compare two feature designators per CLHS 24.1.2.1.1 / 26.1.2.
+   With the keyword-package read of #+ / #- (see %read-feature) the
+   LHS is always a keyword.  *features* may contain keywords or
+   symbols.  Match by EQ when both sides are keywords; otherwise
+   match when names agree only if BOTH sides belong to the keyword
+   package — a non-keyword symbol in *features* (test sets
+   *features* = '(X) with X interned in cl-test) does NOT satisfy
+   #+X per CL semantics."
   (and (symbolp a) (symbolp b)
-       (string= (symbol-name a) (symbol-name b))))
+       (or (eq a b)
+           (and (keywordp a) (keywordp b)
+                (string= (symbol-name a) (symbol-name b))))))
 
 (defun %feature-present-p (expr)
   "Check if a feature expression EXPR matches *features*.

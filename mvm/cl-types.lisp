@@ -1912,10 +1912,14 @@
 
 (defun exact-divide (a b)
   "Divide A by B.  Integer if exact, tagged ratio otherwise.
+   When either operand is a ratio, route through %rational-divide so
+   (exact-divide 1 1/2) returns 2 instead of garbage from %idiv-trunc
+   on the raw ratio pointer.
    Uses %idiv-trunc directly so a recursive call to / can't reach back here."
-  (if (= (mod a b) 0)
-      (%idiv-trunc a b)
-      (%make-rat a b)))
+  (cond
+    ((or (ratiop a) (ratiop b)) (%rational-divide a b))
+    ((= (mod a b) 0) (%idiv-trunc a b))
+    (t (%make-rat a b))))
 
 (defun %rational-divide (a b)
   "Divide A by B where at least one is a ratio (other may be ratio or

@@ -9742,6 +9742,12 @@
     (compile-form env-form env env-temp)
     (emit-ir :push env-temp)
     (free-temp-reg))
+  ;; GC check before the 32-byte object allocation.  Without this, if R12
+  ;; sits within 32 bytes of R14 (alloc limit), the header write at [R12]
+  ;; and the subsequent obj-sets land past the heap; slot-0/slot-1 reads
+  ;; later return whatever the kernel reused that memory for (often
+  ;; another heap address — see DGMC.AND.4 SEGV trace).
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 2 +subtag-closure+)
   (let ((slot-temp (alloc-temp-reg)))
     (emit-ir :pop slot-temp)                  ; env

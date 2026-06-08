@@ -2963,6 +2963,42 @@
       (%call-interp-closure fn (list a b c d e f g))
       (%signal-undefined-function)))
 
+;;; ============================================================
+;;; %FUNCALL-GF-N — funcall a GF struct (subtag #x32, slot 0 =
+;;; '%generic-function).  compile-funcall routes (funcall gf-struct …)
+;;; here when the closure subtag check fails but the obj-subtag is
+;;; #x32.  Without this, calling the GF struct as a function
+;;; SEGV'd inside the heap (the GF array pointer SUB-3'd lands in
+;;; heap data, which is mapped PROT_RW — DGMC.AND.4+ cluster).
+;;; Each helper verifies slot 0 then forwards to %gf-dispatch via
+;;; the gf-name in slot 1.  Non-GF arrays signal undefined-function.
+;;; ============================================================
+
+(defun %funcall-gf-0 (fn)
+  (if (%gf-p fn)
+      (%gf-dispatch (%gf-name fn) nil)
+      (%signal-undefined-function)))
+
+(defun %funcall-gf-1 (fn a)
+  (if (%gf-p fn)
+      (%gf-dispatch (%gf-name fn) (list a))
+      (%signal-undefined-function)))
+
+(defun %funcall-gf-2 (fn a b)
+  (if (%gf-p fn)
+      (%gf-dispatch (%gf-name fn) (list a b))
+      (%signal-undefined-function)))
+
+(defun %funcall-gf-3 (fn a b c)
+  (if (%gf-p fn)
+      (%gf-dispatch (%gf-name fn) (list a b c))
+      (%signal-undefined-function)))
+
+(defun %funcall-gf-4 (fn a b c d)
+  (if (%gf-p fn)
+      (%gf-dispatch (%gf-name fn) (list a b c d))
+      (%signal-undefined-function)))
+
 (defun eval (form)
   "Evaluate FORM in the null lexical environment."
   (%eval-in-env form nil))

@@ -7616,6 +7616,38 @@
           (free-temp-reg)   ; free fn-save
           (free-temp-reg)   ; free cmp-reg
           (free-temp-reg))) ; free check-reg
+      ;; GF struct dispatch: if fn is object-tag + subtag #x32 (array),
+      ;; route to %FUNCALL-GF-N helper which verifies slot 0 is
+      ;; '%generic-function and dispatches via %gf-dispatch.  Without
+      ;; this, `(funcall gf-struct …)` (e.g. the value returned by
+      ;; `(eval '(defgeneric NAME …))` after build-time rewriting) fell
+      ;; through to call-indirect and SEGV'd inside the heap.
+      ;; DGMC.AND.4+ cluster fix, 2026-06-08.
+      (when (<= nargs 4)
+        (let ((check-reg (alloc-temp-reg))
+              (cmp-reg   (alloc-temp-reg))
+              (fn-save   (alloc-temp-reg))
+              (not-gf-label (make-compiler-label)))
+          (emit-ir :obj-tag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-gf-label)
+          (emit-ir :obj-subtag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +subtag-array+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-gf-label)
+          (emit-ir :mov fn-save fn-call-reg)
+          (loop for i from nargs downto 1
+                do (emit-ir :mov (+ +vreg-v0+ i) (+ +vreg-v0+ (- i 1))))
+          (emit-ir :mov +vreg-v0+ fn-save)
+          (let ((helper-name (format nil "%FUNCALL-GF-~D" nargs)))
+            (emit-ir :set-nargs (1+ nargs))
+            (emit-ir :call helper-name (1+ nargs)))
+          (emit-ir :br after-call-label)
+          (emit-ir-label not-gf-label)
+          (free-temp-reg)
+          (free-temp-reg)
+          (free-temp-reg)))
       (emit-ir :set-nargs nargs)
       (emit-ir :call-indirect fn-call-reg nargs)
       ;; === Join ===

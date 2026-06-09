@@ -1450,11 +1450,27 @@
        (let ((stream-expr (cond ((null stream-raw) '*standard-output*)
                                 ((eq stream-raw t) '*terminal-io*)
                                 (t stream-raw))))
-         `(progn
-            ,@(when prefix `((write-string ,prefix ,stream-expr)))
-            ,@(or body `((write ,list-arg :stream ,stream-expr)))
-            ,@(when suffix `((write-string ,suffix ,stream-expr)))
-            nil))))
+         ;; CLHS: when OBJECT is non-nil and not a list, write it directly
+         ;; via WRITE, skipping prefix/suffix.  Only emit prefix/suffix when
+         ;; OBJECT is a list.  PPLB.16 has val=9 with :prefix/:suffix and
+         ;; expects bare "9", not "[9]".  When body is provided, use it;
+         ;; when empty, write the list-arg.
+         (if (or prefix suffix)
+             ;; Need runtime listp check.  Inline the expression — the
+             ;; rewriter has no per-form temporary it can bind without
+             ;; risking shadowing (gensyms confuse SBCL serialization in
+             ;; this codepath; tested and reverted).  Evaluating list-arg
+             ;; multiple times is acceptable per CLHS for the test forms,
+             ;; which use either literals or simple variables.
+             `(progn
+                ,@(when prefix `((when (listp ,list-arg) (write-string ,prefix ,stream-expr))))
+                ,@(or body `((write ,list-arg :stream ,stream-expr)))
+                ,@(when suffix `((when (listp ,list-arg) (write-string ,suffix ,stream-expr))))
+                nil)
+             ;; No prefix/suffix → just body or write list-arg
+             `(progn
+                ,@(or body `((write ,list-arg :stream ,stream-expr)))
+                nil)))))
     ;; (pprint-exit-if-list-exhausted) → stub
     ((and (eq (car form) 'pprint-exit-if-list-exhausted) (null (cdr form)))
      nil)

@@ -3415,6 +3415,16 @@
                      ~%  ;; terminal skip value can't silently suppress this chunk's tests.~
                      ~%  (when (and (> first-id 0) (> *skip-below* first-id))~
                      ~%    (setq *skip-below* first-id))~
+                     ~%  ;; Clear chunk-crash bitmap at start of each file.  %chunk-key~
+                     ~%  ;; packs (file-hash & 0xFFFFFF) << 8 | (chunk-num & 0xFF), so~
+                     ~%  ;; across a full sweep two files' chunks collide and innocent~
+                     ~%  ;; chunks of later files get silently SKIPPED via %report-chunk-skip,~
+                     ~%  ;; then stamped FAIL by %stamp-remaining-fails when fork-file gives up.~
+                     ~%  ;; Only THIS file's retries need the bitmap; reset between files.~
+                     ~%  ;; (Diagnosed 2026-06-09: SUBTYPEP cluster 30 fails in isolation vs~
+                     ~%  ;; 503 in full sweep — the gap was almost entirely false-skip stamps.)~
+                     ~%  (when (> *fork-shm-addr* 0)~
+                     ~%    (setf (mem-ref (+ *fork-shm-addr* 4) :u32) 0))~
                      ~%  (let ((saved-skip *skip-below*)~
                      ~%        (done nil)~
                      ~%        (tries 0)~

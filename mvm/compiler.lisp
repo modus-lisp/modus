@@ -1424,6 +1424,32 @@
                 ;; pi without a value get NIL.
                 ((and (consp place) (name-eq (car place) "VALUES"))
                  `(multiple-value-setq ,(cdr place) ,value))
+                ;; (setf (symbol-value SYM) V) → set-symbol-value expects a
+                ;; name-hash, not a symbol object.  Compute the hash from
+                ;; the symbol name at runtime.  Without this, the generic
+                ;; fallback emitted (SET-SYMBOL-VALUE SYM V) which stuffed
+                ;; the symbol object into the globals-alist as a key,
+                ;; making subsequent symbol-value lookups by name miss.
+                ;; Unlocks PSETF.29 and similar.
+                ((and (consp place) (name-eq (car place) "SYMBOL-VALUE"))
+                 `(set-symbol-value
+                    (cond ((integerp ,(cadr place)) ,(cadr place))
+                          ((stringp ,(cadr place))
+                           (compute-name-hash ,(cadr place)))
+                          (t (compute-name-hash (symbol-name ,(cadr place)))))
+                    ,value))
+                ;; (setf (row-major-aref A I) V) → (aset A I V).  CLHS
+                ;; says row-major-aref accesses a flat 1-D view; Modus's
+                ;; aref/aset already handle 1-D access by index.  Unlocks
+                ;; PSETF.38, plus setf-of-row-major-aref tests.
+                ((and (consp place) (name-eq (car place) "ROW-MAJOR-AREF"))
+                 `(aset ,(cadr place) ,(caddr place) ,value))
+                ;; (setf (fdefinition X) V) → (set-fdefinition X V).
+                ;; (setf (macro-function X) V) → (set-macro-function X V).
+                ;; (setf (symbol-function X) V) → (set-symbol-function X V).
+                ;; These already work via the generic fallback because the
+                ;; SET-X defuns exist (cl-eval.lisp:200, 5088, 5090).  Keep
+                ;; the fallback path; no explicit intercept needed.
                 ;; Generic accessor: (setf (foo-bar a1 ... aN) v) → (set-foo-bar a1 ... aN v)
                 ;; Pass ALL place args plus the value (was only passing the
                 ;; first arg, which silently dropped the index in

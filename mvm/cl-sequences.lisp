@@ -2333,7 +2333,12 @@
    (unless :allow-other-keys is non-nil).  Type-error on non-sequence
    SEQ is handled by the (consp …) / (length …) dispatch below: if
    SEQ is neither a cons nor a sequence, (length SEQ) signals."
-  (let ((start 0) (end nil) (allow-other-keys nil) (aok-set nil))
+  (let ((start 0) (end nil) (allow-other-keys nil) (aok-set nil)
+        ;; CLHS §3.4.1.4.1.1.2 (leftmost wins) — track whether each kwarg
+        ;; has been set already so we don't overwrite the leftmost binding.
+        ;; fill.order.4 has six `:end` repetitions and the test passes only
+        ;; when the FIRST one (3) sticks.
+        (start-set nil) (end-set nil))
     ;; Probe :allow-other-keys.  CLHS §3.4.1.4.1.1.2: when multiple
     ;; :allow-other-keys appear, the LEFTMOST supplies the value.
     (let ((p args))
@@ -2345,8 +2350,10 @@
     (let ((a args))
       (loop (when (null a) (return))
         (when (null (cdr a)) (%signal-program-error))
-        (cond ((eq (car a) :start) (setq start (cadr a)))
-              ((eq (car a) :end)   (setq end   (cadr a)))
+        (cond ((eq (car a) :start)
+               (unless start-set (setq start (cadr a)) (setq start-set t)))
+              ((eq (car a) :end)
+               (unless end-set (setq end (cadr a)) (setq end-set t)))
               ((eq (car a) :allow-other-keys) nil)
               (t (unless allow-other-keys (%signal-program-error))))
         (setq a (cddr a))))

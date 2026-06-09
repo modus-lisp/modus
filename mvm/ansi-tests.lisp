@@ -1794,6 +1794,30 @@
   (handler-case (run-clos-diag-tests) (t (c) nil))
   (handler-case (run-clos-smoke-tests) (t (c) nil)))
 
+;; Override ansi-aux.lsp test helpers that use `(apply #'fill … &rest)`.
+;; The aux version goes through load-ansi-aux's rewriter pipeline
+;; (rewrite-package-iteration, rewrite-eval-quote, rewrite-earmuff-specials,
+;; rewrite-reader-forms, rewrite-multi-arg-apply) which mangles the body
+;; — `(apply fn req-arg &rest-list)` ends up returning a kwarg symbol as a
+;; single value instead of the helper's `(values …)`.  Tests in
+;; ansi-tests.lisp source bypass that pipeline (just strip-in-package),
+;; so re-defining the helpers here lets last-defun-wins point calls at
+;; clean copies.  Root cause is in one of the rewriter passes; until
+;; that's narrowed, overrides are the targeted fix.
+;; Unlocks ARRAY-STRING-FILL.1..5, ARRAY-UNSIGNED-BYTE8-FILL.1..10,
+;; FILL.ORDER.4.
+(defun array-string-fill-test-fn (a &rest fill-args)
+  (setq a (copy-seq a))
+  (let ((b (apply #'fill a fill-args)))
+    (values (eqt a b) b)))
+
+(defun array-unsigned-byte-fill-test-fn (byte-size &rest fill-args)
+  (let* ((a (make-array '(5) :element-type (list 'unsigned-byte byte-size)
+                        :initial-contents '(1 2 3 4 5)))
+         (b (apply #'fill a fill-args)))
+    (values (eqt a b)
+            (map 'list #'identity a))))
+
 (defun run-stream-debug-tests ()
   ;; Stream type system
   (deftest 9801 (streamp (make-string-output-stream)) t)

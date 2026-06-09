@@ -3740,6 +3740,11 @@
   (setq *fail-cap* 2000)
   (setq *file-alarm-secs* 45)
   (setq *wstatus-addr* #x100001A0)
+  ;; gensym-counter/gentemp-counter defvars don't run init at boot.
+  ;; Without these, gensym produces same-named symbols (format runs
+  ;; with N=NIL).  Two gensyms hash-collide in symbol-function table.
+  (setq *gensym-counter* 0)
+  (setq *gentemp-counter* 0)
 
   ;; Float constants from ansi-bridge — defvars don't run their init
   ;; thunks (per CLAUDE.md), so without these explicit setqs every

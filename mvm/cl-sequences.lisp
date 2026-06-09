@@ -814,10 +814,19 @@
    coords) or NIL if equal.  Honors :start1/:end1/:start2/:end2."
   (let ((r (%str-cmp-core a b args nil)))
     (when (or (eq (car r) :less) (eq (car r) :greater)) (cadr r))))
-;;; constantly: captures value. Use global cell.
-(defvar *constantly-value* nil)
-(defun %constantly-impl (&rest args) *constantly-value*)
-(defun constantly (value) (setq *constantly-value* value) #'%constantly-impl)
+;;; constantly: real closure capturing VALUE via %make-closure pattern.
+;;; The prior version used a single global *constantly-value* — every
+;;; subsequent (constantly X) clobbered the value seen by ALL prior
+;;; closures, including those installed via (setf (fdefinition g) c).
+;;; PSETF.25 (and many other tests using two distinct constantly
+;;; closures) returned the latest value for both.  Pattern from
+;;; cl-clos.lisp's %synthetic-primary-closure-fn / %gf-stub-closure-fn:
+;;; a top-level fn reads its captured arg from (%get-cenv).
+(defun %constantly-closure-fn (&rest args)
+  (declare (ignore args))
+  (car (%get-cenv)))
+(defun constantly (value)
+  (%make-closure #'%constantly-closure-fn (cons value nil)))
 ;;; Closure support functions for is-eql-p / is-not-eql-p.
 ;;; These load the captured env from CLOSURE-ENV-ADDR (#x10000140), which
 ;;; funcall stores when it detects a closure object (tag=object,

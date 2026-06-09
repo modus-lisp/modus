@@ -97,10 +97,9 @@ runtime/        Runtime type system
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,352 tests
 - Ran: 17,268
-- Passed: 14,791 (85.24% overall, 85.66% of those that ran)
-- Failed: 2,477
+- Passed: 14,792 (85.25% overall, 85.66% of those that ran)
+- Failed: 2,476
 - Lost-to-crash: 84
-- (Reverted commit 35ce14a's listp guard — fixed PPLB.16 in isolation but caused -8 ANSI/+11 lost-to-crash in the sweep.  Cause unknown; likely the `(if (or prefix suffix) ...)` branching emitted forms that the per-form handler-case in load-ansi-aux couldn't handle.)
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

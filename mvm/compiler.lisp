@@ -9744,17 +9744,20 @@
 
 (defun compile-make-float (dest)
   "Compile (%make-float) — allocate a 1-slot object with float subtag."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 1 +subtag-float+))
 
 (defun compile-make-symbol (dest)
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
    Returns an uninitialized symbol object; caller stores name-hash in slot 0."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 1 +subtag-symbol+))
 
 (defun compile-make-keyword-obj (dest)
   "Compile (%make-keyword-obj) — allocate a 1-slot object with keyword subtag
    (#x53).  Returns an uninitialized keyword object; caller stores name-hash
    in slot 0.  Used by %INTERN-KEYWORD."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 1 +subtag-keyword+))
 
 (defun compile-alloc-sym3 (dest)
@@ -9763,6 +9766,7 @@
    CL symbol allocator to build a full package-aware symbol with slots
    [hash, package, name] without going through make-array (which would
    give subtag #x32 and require a header rewrite)."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 3 +subtag-symbol+))
 
 (defun compile-alloc-mda-raw (dest)
@@ -9772,6 +9776,7 @@
        [0:rank 1:dims 2:fp 3:displaced-to 4:disp-offset 5:etype 6:data].
    Phase 1 of native multi-dim array support; see
    project_multidim_arrays.md."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 7 +subtag-mda+))
 
 (defun compile-make-closure (fn-form env-form env dest)
@@ -9816,12 +9821,14 @@
 
 (defun compile-make-bignum (dest)
   "Compile (%make-bignum) — allocate a 2-slot object with bignum subtag."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 2 +subtag-bignum+))
 
 (defun compile-make-ratio (dest)
   "Compile (%make-ratio) — allocate a 2-slot object with ratio subtag.
    Slot 0 = numerator, slot 1 = denominator (both tagged fixnums).
    Used by the runtime / and rational-arithmetic helpers."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 2 +subtag-ratio+))
 
 (defun compile-ratiop (arg env dest)

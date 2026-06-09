@@ -1587,10 +1587,20 @@
              (values q r)))))))
 
 (defun round (n &rest rest)
+  ;; CLHS: round takes &optional divisor — extra args should signal.
+  ;; ROUND.error.2: (round 1.0 1 nil) → program-error.
+  (when (and (consp rest) (consp (cdr rest)))
+    (%signal-program-error))
   (cond
     ((null rest)
-     (cond ((integerp n) n)
-           ((ratiop n) (round (aref n 0) (aref n 1)))
+     (cond ((integerp n) (values n 0))
+           ((ratiop n)
+            ;; CL: (round 1/2) → 0, 1/2 — remainder is the ratio
+            ;; difference, NOT the integer truncate remainder.  Compute
+            ;; quotient via integer round, then remainder = n - q.
+            (multiple-value-bind (q r) (round (aref n 0) (aref n 1))
+              (declare (ignore r))
+              (values q (- n q))))
            (t (truncate n))))
     (t
      (let ((d (car rest)))

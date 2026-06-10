@@ -3130,6 +3130,15 @@
       ;; NOTE: EQUAL (hash 777630921077348411) is NOT inlined as EQ — it's a
       ;; user-defined function (structural equality), dispatched via compile-call.
 
+      ;; --- %GET-NARGS — read the caller-supplied arg count (tagged
+      ;; fixnum) from the nargs convention slot.  Must be the first form
+      ;; evaluated in a function body (before any nested call overwrites
+      ;; the slot).  Used by &optional supplied-p binding. ---
+      ((= op-name 291167260277925928)
+       (let ((d (or dest (alloc-temp-reg))))
+         (emit-ir :get-nargs d)
+         (unless dest (free-temp-reg))))
+
       ;; --- Memory Operations (2-arg) ---
       ((= op-name 900047298083458158)  (when (arity-ok-p form 2 2 env dest) (compile-mem-ref (cadr form) (caddr form) env dest)))
       ((= op-name 61397303667544258)   (when (arity-ok-p form 2 2 env dest) (compile-setf (cadr form) (caddr form) env dest)))
@@ -10190,7 +10199,13 @@
   ;; Arity check (narrow): if called with 0 args on a function with
   ;; required-count > 0, signal PROGRAM-ERROR. Catches the common
   ;; (F) ansi-test pattern without disturbing other calls.
-  (let ((static-rest-pack nil))
+  ;; TRUE-NARGS holds the count the *caller* actually wrote, before any
+  ;; &optional NIL-padding.  When padding fires we set it so :set-nargs
+  ;; reports the real count — the callee's supplied-p / &optional
+  ;; prologue reads it via :get-nargs and must distinguish an explicit
+  ;; trailing NIL from a missing arg.  nil here means "use (length args)".
+  (let ((static-rest-pack nil)
+        (true-nargs nil))
     (when (and (symbolp fn) (boundp '*functions*) *functions*)
       (let* ((fn-name (symbol-name fn))
              ;; Check for flet/labels name mapping
@@ -10227,8 +10242,10 @@
                      ;; :set-nargs 255 sentinel so the callee can see it.
                      (setf static-rest-pack t)))))
               (t
-               ;; Pad with NIL for missing &optional parameters
+               ;; Pad with NIL for missing &optional parameters.  Record
+               ;; the true (pre-pad) count so :set-nargs stays honest.
                (when (and param-count (< nargs param-count))
+                 (setf true-nargs nargs)
                  (setf args (append args (make-list (- param-count nargs)))))))))))
   (let ((nargs (length args))
         ;; Save the current temp count BEFORE arg evaluation.
@@ -10280,7 +10297,10 @@
     ;; can't accidentally satisfy the prologue's checks.
     (if static-rest-pack
         (emit-ir :set-nargs 255)
-        (emit-ir :set-nargs (min nargs 254)))
+        ;; Report the TRUE caller arg count (pre-pad) when padding fired,
+        ;; else the actual nargs.  The callee's supplied-p / &optional
+        ;; prologue reads this to tell explicit-NIL from missing.
+        (emit-ir :set-nargs (min (or true-nargs nargs) 254)))
     ;; Emit the call
     (cond
       ;; Direct call to named function
@@ -10400,9 +10420,13 @@
         ((eq p '&allow-other-keys) (setq allow-other-keys t))  ; track
         ((eq mode :required) (push p required))
         ((eq mode :optional)
+         ;; Preserve the full triple (name default supplied-p).  The
+         ;; supplied-p var (caddr) is consumed by the supplied-p-aware
+         ;; fallback path below; dropping it (the old (car cadr) form)
+         ;; silently lost &optional supplied-p semantics.
          (if (consp p)
-             (push (list (car p) (cadr p)) optional)
-             (push (list p nil) optional)))
+             (push (list (car p) (cadr p) (caddr p)) optional)
+             (push (list p nil nil) optional)))
         ((eq mode :key)
          ;; Store full triple (name default supplied-p).  Custom-keyword
          ;; form ((:kw var) ...) is not handled — treat its car as name.
@@ -10503,24 +10527,70 @@
                                       (when (caddr k) (push (caddr k) acc))))))
               (optional-start (when optional (length required)))
               (optional-count (length optional))
+              (req-count (length required))
+              ;; Any &optional spec names a supplied-p var?  Then we must
+              ;; capture the true caller arg count (compile-call's
+              ;; truthful :set-nargs) and derive supplied-p / defaults
+              ;; from it — a NIL-padded optional is indistinguishable
+              ;; from an explicitly-passed NIL by value alone.
+              (opt-has-supplied (some (lambda (o) (and (consp o) (cddr o))) optional))
               (new-body body))
          (when auxes
            (setf new-body `((let* ,auxes ,@new-body))))
-         (let ((defaults nil))
-           (dolist (opt optional)
-             (when (cadr opt)
-               (push `(when (null ,(car opt))
-                        (setq ,(car opt) ,(cadr opt)))
-                     defaults)))
-           (dolist (k keys)
-             (when (cadr k)
-               (push `(when (null ,(car k))
-                        (setq ,(car k) ,(cadr k)))
-                     defaults))
-             (when (caddr k)
-               (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) defaults)))
-           (when defaults
-             (setf new-body (append (nreverse defaults) new-body))))
+         (cond
+           ;; --- supplied-p-aware &optional path ---
+           (opt-has-supplied
+            (let ((nargs-var (gensym "%NARGS"))
+                  (sup-bindings nil)
+                  (defaults nil))
+              (loop for opt in optional
+                    for i from 0
+                    for idx = (+ req-count i)
+                    for var = (car opt)
+                    for default = (cadr opt)
+                    for sup = (and (consp opt) (cddr opt) (caddr opt))
+                    do
+                    ;; supplied = (> nargs idx)  (idx is 0-based slot)
+                    (when sup
+                      (push (list sup (list '> nargs-var idx)) sup-bindings))
+                    ;; default applies iff NOT supplied
+                    (when default
+                      (push (if sup
+                                `(unless ,sup (setq ,var ,default))
+                                `(unless (> ,nargs-var ,idx) (setq ,var ,default)))
+                            defaults)))
+              ;; &key defaults (combined &optional + &key fallback) keep
+              ;; the legacy null-check behavior.
+              (dolist (k keys)
+                (when (cadr k)
+                  (push `(when (null ,(car k)) (setq ,(car k) ,(cadr k))) defaults))
+                (when (caddr k)
+                  (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) defaults)))
+              (setf new-body
+                    `((let* ((,nargs-var (%get-nargs))
+                             ,@(nreverse sup-bindings))
+                        ;; touch nargs-var so it isn't dead-stripped when
+                        ;; only defaults (no sup vars) reference it.
+                        ,nargs-var
+                        ,@(nreverse defaults)
+                        ,@new-body)))))
+           ;; --- legacy null-check path (no &optional supplied-p) ---
+           (t
+            (let ((defaults nil))
+              (dolist (opt optional)
+                (when (cadr opt)
+                  (push `(when (null ,(car opt))
+                           (setq ,(car opt) ,(cadr opt)))
+                        defaults)))
+              (dolist (k keys)
+                (when (cadr k)
+                  (push `(when (null ,(car k))
+                           (setq ,(car k) ,(cadr k)))
+                        defaults))
+                (when (caddr k)
+                  (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) defaults)))
+              (when defaults
+                (setf new-body (append (nreverse defaults) new-body))))))
          (list new-params new-body optional-start optional-count nil))))))
 
 ;;; ============================================================

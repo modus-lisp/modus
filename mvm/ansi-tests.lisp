@@ -2096,6 +2096,11 @@
 (defun %diag-dg-fn5 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn5 %gf-args))
 (defun %diag-dg-fn6 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn6 %gf-args))
 
+;; Named defun with &optional supplied-p — Target 1c (compile-call path).
+(defun %diag-opt-sup (x &optional (z nil z-p)) (list x z (notnot z-p)))
+;; Instrumented: return the raw nargs the callee sees (compile-call path).
+(defun %diag-opt-narg (x &optional z) (list x z (%get-nargs)))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -2434,6 +2439,38 @@
                                     'setup-ok)))
                   (error nil :outer-err))
                 'setup-ok)
+  ;; ============================================================
+  ;; &optional supplied-p probes (9871-9878) — Target 1.
+  ;; ============================================================
+  ;; Direct compiled defun w/ &optional supplied-p.
+  (run-test 9871
+    (lambda () (funcall (lambda (x &optional (z nil z-p)) (list x z (notnot z-p))) 'q))
+    '(q nil nil))
+  (run-test 9872
+    (lambda () (funcall (lambda (x &optional (z nil z-p)) (list x z (notnot z-p))) 'q nil))
+    '(q nil t))
+  (run-test 9873
+    (lambda () (funcall (lambda (x &optional (z nil z-p)) (list x z (notnot z-p))) 'q 5))
+    '(q 5 t))
+  ;; Raw %get-nargs probe: a function returning (%get-nargs) should see
+  ;; the true caller count (tagged fixnum) — Target 1a/1b.
+  (run-test 9875
+    (lambda () (funcall (lambda (a &optional b c) (declare (ignore a b c)) (%get-nargs)) 'p 'q))
+    2)
+  ;; Named defun &optional supplied-p (compile-call path) — Target 1c.
+  (run-test 9876
+    (lambda () (%diag-opt-sup 'p))
+    '(p nil nil))
+  (run-test 9877
+    (lambda () (%diag-opt-sup 'p nil))
+    '(p nil t))
+  (run-test 9878
+    (lambda () (%diag-opt-sup 'p 9))
+    '(p 9 t))
+  ;; Truthful nargs through the NIL-pad path — Target 1a.  The first
+  ;; call pads (1 real arg → param-count 2) but reports nargs=1.
+  (run-test 9879 (lambda () (%diag-opt-narg 'p)) '(p nil 1))
+  (run-test 9880 (lambda () (%diag-opt-narg 'p nil)) '(p nil 2))
   ;; ============================================================
   ;; defgeneric machinery probes (9830-9846) — replicate the broken
   ;; sub-expressions of objects/defgeneric.lsp's functionality tests

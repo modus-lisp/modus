@@ -720,7 +720,9 @@
               ;; (1120 bytes) so 32 fits, and the per-defun &rest ladder
               ;; that mirrors this cap stays close to original code
               ;; size.  Going much higher blows the binary up (the
-              ;; ladder is unrolled per defun).
+              ;; ladder is unrolled per defun) — raising to 50 cost
+              ;; +30MB and regressed -7 ANSI via layout shift (measured
+              ;; 2026-06-10), so it stays at 32.
               ;;
               ;; Layout:
               ;;   src ptr = rbp + 16 + (i-4)*8  for arg i ≥ 4

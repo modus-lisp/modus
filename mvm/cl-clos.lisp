@@ -1678,32 +1678,46 @@
     ;; it with the runtime args.  This is what makes
     ;; shared-initialize.7.x / 8.x pass — defmethod shared-initialize
     ;; :before runs alongside the standard primary, not instead of it.
-    (when (null primary-methods)
-      (let ((gf-name (%gf-name gf)))
-        ;; Hardwired fallbacks for the standard CLOS GFs.  When the GF
-        ;; has only auxiliary methods (:before / :after / :around) the
-        ;; CLHS-mandated system primary still runs — we synthesize a
-        ;; fake primary that delegates to a bypass helper in
-        ;; ansi-bridge.lisp (%shared-initialize-via-args et al).
-        ;;
-        ;; Closure representation: use the is-eql-p heap-cell pattern
-        ;; (%make-closure + top-level helper + %get-cenv) because the
-        ;; naïve (lambda ...) capture pattern breaks when the closure
-        ;; is let-bound + funcalled via a method record — see
-        ;; CLAUDE.md Known Bug "Closure-mutation: let-bound + funcall
-        ;; fails" and feedback_closure_mutation_let_bound.  Without
-        ;; this dodge the synthetic primary's captured gf-name / args
-        ;; were stale by the time run-primary did (apply method-fn
-        ;; args), and the fallback silently no-op'd — sweeps came
-        ;; back exactly == baseline.
-        (cond
-          ((%has-default-primary-p gf-name)
-           (let ((synthetic
-                  (%make-closure #'%synthetic-primary-closure-fn
-                                 (cons gf-name (cons args nil)))))
-             (setq primary-methods
-                   (list (%make-method nil '(t) synthetic)))))
-          (t (error "no applicable primary method")))))
+    (let ((gf-name (%gf-name gf)))
+      ;; Hardwired fallbacks for the standard CLOS GFs.  When the GF
+      ;; has only auxiliary methods (:before / :after / :around) the
+      ;; CLHS-mandated system primary still runs — we synthesize a
+      ;; fake primary that delegates to a bypass helper in
+      ;; ansi-bridge.lisp (%shared-initialize-via-args et al).
+      ;;
+      ;; Closure representation: use the is-eql-p heap-cell pattern
+      ;; (%make-closure + top-level helper + %get-cenv) because the
+      ;; naïve (lambda ...) capture pattern breaks when the closure
+      ;; is let-bound + funcalled via a method record — see
+      ;; CLAUDE.md Known Bug "Closure-mutation: let-bound + funcall
+      ;; fails" and feedback_closure_mutation_let_bound.  Without
+      ;; this dodge the synthetic primary's captured gf-name / args
+      ;; were stale by the time run-primary did (apply method-fn
+      ;; args), and the fallback silently no-op'd — sweeps came
+      ;; back exactly == baseline.
+      (cond
+        ((null primary-methods)
+         (cond
+           ((%has-default-primary-p gf-name)
+            (let ((synthetic
+                   (%make-closure #'%synthetic-primary-closure-fn
+                                  (cons gf-name (cons args nil)))))
+              (setq primary-methods
+                    (list (%make-method nil '(t) synthetic)))))
+           (t (error "no applicable primary method"))))
+        ;; User primaries exist AND the GF has a system-supplied
+        ;; default primary: append a synthetic tail method so
+        ;; CALL-NEXT-METHOD from the least-specific user primary
+        ;; reaches the standard behavior (CLHS 7.6.6.2 — the
+        ;; system primary on standard-object is always least
+        ;; specific; change-class.6.x relies on this).
+        ((%has-default-primary-p gf-name)
+         (let ((synthetic
+                (%make-closure #'%synthetic-primary-closure-fn
+                               (cons gf-name (cons args nil)))))
+           (setq primary-methods
+                 (append primary-methods
+                         (list (%make-method nil '(t) synthetic))))))))
     ;; Build the effective method chain
     (let ((run-primary
            ;; Accept &rest so when the :around chain wraps run-primary in

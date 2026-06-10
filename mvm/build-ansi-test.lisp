@@ -1481,16 +1481,24 @@
        `(%set-readtable-case ,rt-arg ,val)))
     ;; (setf (slot-value obj slot) val) → (set-slot-value obj slot val)
     ;; Must handle before the generic setf fallthrough (MVM setf macro only passes 1 arg)
+    ;; Multi-pair SETF: (setf (slot-value o 'a) 1 (slot-value o 'b) 16)
+    ;; previously dropped every pair after the first — change-class.2.3's
+    ;; second slot silently stayed unbound.  Recurse on the remaining
+    ;; pairs as a fresh (setf ...) form wrapped in progn.
     ((and (eq (car form) 'setf)
           (consp (cdr form))
           (consp (cadr form))
           (eq (car (cadr form)) 'slot-value)
           (cddr form))
      (let ((place (cadr form))
-           (val (rewrite-reader-forms (caddr form))))
+           (val (rewrite-reader-forms (caddr form)))
+           (more (cdddr form)))
        (let ((obj (rewrite-reader-forms (cadr place)))
              (slot (rewrite-reader-forms (caddr place))))
-         `(set-slot-value ,obj ,slot ,val))))
+         (if more
+             `(progn (set-slot-value ,obj ,slot ,val)
+                     ,(rewrite-reader-forms `(setf ,@more)))
+             `(set-slot-value ,obj ,slot ,val)))))
     ;; (setf (symbol-function sym) fn) → (set-symbol-function sym fn)
     ((and (eq (car form) 'setf)
           (consp (cdr form))
@@ -2863,11 +2871,24 @@
                                ;; init thunks aren't run; same applies here).
                                ;; We keep the top-level write so any compile-time
                                ;; side effects stay in place.
+                               ;;
+                               ;; %defmethod: the defmethod rewriter emits a BARE
+                               ;; (%defmethod 'gf ...) form (defclass wraps its
+                               ;; registrations in progn, so those flow through
+                               ;; emit-sub into init-forms — defmethod didn't).
+                               ;; Bare top-level %defmethod therefore NEVER ran:
+                               ;; user methods on CHANGE-CLASS /
+                               ;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS etc. were
+                               ;; silently unregistered, so :before/:after/
+                               ;; primary methods in change-class.lsp and
+                               ;; u-i-f-d-c.lsp never fired.  Route them into
+                               ;; init-forms so run-init-FILE registers them.
                                (write-string s out)
                                (terpri out)
                                (queue-defvar-setq form)
                                (when (and (consp form)
-                                          (eq (car form) '%defpackage-impl))
+                                          (member (car form)
+                                                  '(%defpackage-impl %defmethod)))
                                  (push s init-forms))))))))))
               ;; Emit run-init-X — a separate function holding ONLY the init
               ;; forms (defclass / defmethod / setq for defvar's value, etc.).
@@ -4180,7 +4201,7 @@
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
-  (let ((path "/home/claude/modus/tmp/modus-ansi-test"))
+  (let ((path (namestring (merge-pathnames "tmp/modus-ansi-test" cl-user::*modus-base*))))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

@@ -2702,99 +2702,146 @@
     (%signal-program-error))
   (%dispatch-shared-init %sh-args))
 
-(defun %change-class-default (instance new-class &rest initargs)
-  "Default method body for CHANGE-CLASS.
-   Mutates INSTANCE in place (preserves identity) so EQ holds.
+(defun %change-class-validate-initargs (new-name initargs)
+  "CLHS 7.1.2-style initarg validity check for CHANGE-CLASS.
+   Signals PROGRAM-ERROR on a malformed plist (odd length, non-symbol
+   key) and ERROR on an initarg that doesn't initialize any slot of
+   NEW-NAME, unless :allow-other-keys is true (LEFTMOST occurrence
+   wins per CLHS 7.1.4 — change-class.1.10)."
+  (let ((aok-seen nil) (aok nil) (bad-key nil) (bad-key-p nil) (cur initargs))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (%signal-program-error))
+      (let ((key (car cur)) (val (car (cdr cur))))
+        (when (not (or (symbolp key) (%cl-sym-p key)))
+          (%signal-program-error))
+        (cond
+          ((%clos-initarg-key-equal key ':allow-other-keys)
+           (when (not aok-seen)
+             (setq aok-seen t)
+             (setq aok val)))
+          (t
+           (when (null (%clos-initarg-to-slot new-name key))
+             (setq bad-key key)
+             (setq bad-key-p t)))))
+      (setq cur (cdr (cdr cur))))
+    (when (and bad-key-p (not aok))
+      (error "change-class: invalid initarg ~S for class ~S"
+             bad-key new-name))
+    nil))
 
-   Limitations vs full ANSI:
-   - No update-instance-for-different-class hook is invoked.
-   - If NEW-CLASS has more slots than the underlying array allocates,
-     trailing slots may be inaccessible (we cap at the array size).
-   - :allocation :class is treated as :instance — class-shared slots
-     not implemented.
-   - allow-other-keys checking not enforced."
-  (when (null instance) (return-from %change-class-default instance))
-  (when (not (%clos-instance-p instance)) (return-from %change-class-default instance))
+(defun %change-class-impl (instance new-class initargs)
+  "Standard primary method body for CHANGE-CLASS (CLHS 7.2.1/7.2.2).
+   INITARGS is a proper list (not &rest) so arbitrary-length initarg
+   lists arrive untruncated.  Mutates INSTANCE in place (preserves EQ
+   identity).
+
+   Per CLHS 7.2.1:
+   - slots local in the new class that existed in the old class
+     (local OR shared) retain their values by NAME
+   - slots not in the new class disappear
+   - newly added local slots start unbound; their initforms run via
+     the UPDATE-INSTANCE-FOR-DIFFERENT-CLASS default primary
+     (shared-initialize semantics on the added slots)
+   - slots shared in the new class are left to per-class storage
+   - a copy of the original instance is passed as PREVIOUS to
+     UPDATE-INSTANCE-FOR-DIFFERENT-CLASS, dispatched as a real GF so
+     user methods (primary / :before / :after) run
+
+   Remaining limitation: if NEW-CLASS has more slots than the backing
+   array allocates, trailing slots are capped at the array size."
+  (when (null instance) (return-from %change-class-impl instance))
+  (when (not (%clos-instance-p instance)) (return-from %change-class-impl instance))
   ;; Resolve new-class to a class object
   (let ((new-cls (cond
                    ((symbolp new-class) (%find-clos-class new-class))
                    ((%clos-class-p new-class) new-class)
                    (t nil))))
-    (when (null new-cls) (return-from %change-class-default instance))
+    (when (null new-cls) (return-from %change-class-impl instance))
     (let* ((new-name (aref new-cls 1))
            (new-slot-names (aref new-cls 2))
            (old-name (aref instance 1))
            (old-cls (%find-clos-class old-name))
            (old-slot-names (if old-cls (aref old-cls 2) nil))
-           (inst-len (array-length instance))
-           ;; First, snapshot old slot values keyed by slot name (alist)
-           (old-values nil))
-      ;; Snapshot old values (incl. unbound sentinel -999)
-      (let ((sn old-slot-names) (idx 0))
-        (loop
-          (when (null sn) (return nil))
-          (when (< (+ 2 idx) inst-len)
-            (setq old-values (cons (cons (car sn) (aref instance (+ 2 idx)))
-                                   old-values)))
-          (setq idx (+ idx 1))
-          (setq sn (cdr sn))))
-      ;; Mutate instance to its new class
-      (aset instance 1 new-name)
-      ;; Fill new slot positions: copy from old if same name, else apply
-      ;; initform if available, else mark unbound (-999).
-      (let ((sn new-slot-names) (idx 0))
-        (loop
-          (when (null sn) (return nil))
-          (when (< (+ 2 idx) inst-len)
-            (let* ((nm (car sn))
-                   ;; Look up old value for this slot name
-                   (old-pair (let ((cur old-values) (found nil))
+           (inst-len (array-length instance)))
+      ;; ---- 1. Validate the initarg plist (before any mutation) ----
+      (%change-class-validate-initargs new-name initargs)
+      ;; ---- 2. Snapshot PREVIOUS: copy with the old class + values ----
+      (let ((previous (make-array inst-len)))
+        (let ((i 0))
+          (loop
+            (when (>= i inst-len) (return nil))
+            (let ((dummy (aset previous i (aref instance i))))
+              dummy)
+            (setq i (+ i 1))))
+        ;; ---- 3. Snapshot old slot values keyed by name ----
+        ;; Entry: (name . (bound . value)).  Shared-in-old slots read
+        ;; through the old class's storage — CLHS 7.2.1: values of slots
+        ;; shared in Cfrom and local in Cto are retained.
+        (let ((old-values nil))
+          (let ((sn old-slot-names) (idx 0))
+            (loop
+              (when (null sn) (return nil))
+              (let* ((nm (car sn))
+                     (owner (%slot-class-owner old-name nm)))
+                (cond
+                  (owner
+                   (if (%class-slot-bound-p old-name nm)
+                       (setq old-values
+                             (cons (cons nm (cons t (%class-slot-get old-name nm nil)))
+                                   old-values))
+                       (setq old-values
+                             (cons (cons nm (cons nil nil)) old-values))))
+                  ((< (+ 2 idx) inst-len)
+                   (let* ((v (aref instance (+ 2 idx)))
+                          (unbound (and (fixnump v) (= v -999))))
+                     (if unbound
+                         (setq old-values
+                               (cons (cons nm (cons nil nil)) old-values))
+                         (setq old-values
+                               (cons (cons nm (cons t v)) old-values)))))
+                  (t nil)))
+              (setq idx (+ idx 1))
+              (setq sn (cdr sn))))
+          ;; ---- 4. Mutate instance to its new class + remap values ----
+          (aset instance 1 new-name)
+          (let ((sn new-slot-names) (idx 0))
+            (loop
+              (when (null sn) (return nil))
+              (when (< (+ 2 idx) inst-len)
+                (let* ((nm (car sn))
+                       (shared-new (%slot-class-owner new-name nm))
+                       (pair (let ((cur old-values) (found nil))
                                (loop
                                  (when (null cur) (return found))
                                  (when (eq (car (car cur)) nm)
                                    (setq found (car cur))
                                    (return found))
-                                 (setq cur (cdr cur)))))
-                   (had-old (not (null old-pair)))
-                   (old-val (if had-old (cdr old-pair) -999))
-                   (was-unbound (and (fixnump old-val) (= old-val -999))))
-              (cond
-                ;; Slot exists in both, and was bound — keep it
-                ((and had-old (not was-unbound))
-                 (aset instance (+ 2 idx) old-val))
-                ;; Slot exists in both but was unbound — leave unbound
-                ;; (do NOT apply new class's initform per ANSI)
-                ((and had-old was-unbound)
-                 (aset instance (+ 2 idx) -999))
-                (t
-                 ;; Slot only in new class: try initform from new-class
-                 (let ((thunk (%clos-initform-thunk new-name nm)))
-                   (if thunk
-                     (aset instance (+ 2 idx) (funcall thunk))
-                     ;; No initform — leave unbound
-                     (aset instance (+ 2 idx) -999)))))))
-          (setq idx (+ idx 1))
-          (setq sn (cdr sn))))
-      ;; Apply :initargs on top — they override.
-      ;; Per ANSI: when an initarg appears multiple times, the LEFTMOST wins.
-      ;; Track which slots we've already set so later duplicates don't overwrite.
-      (let ((set-slots nil)
-            (cur initargs))
-        (loop
-          (when (null cur) (return nil))
-          (when (null (cdr cur)) (return nil))
-          (let* ((key (car cur))
-                 (val (car (cdr cur)))
-                 (slot-nm (%clos-initarg-to-slot new-name key)))
-            (when (and slot-nm (not (member slot-nm set-slots)))
-              (let ((idx (%clos-slot-index new-cls slot-nm)))
-                ;; See %clos-slot-index docstring — idx is -1 (not found)
-                ;; or 0..n-1; use (>= idx 0) instead of truthiness.
-                (when (and (>= idx 0) (< (+ 2 idx) inst-len))
-                  (aset instance (+ 2 idx) val)
-                  (setq set-slots (cons slot-nm set-slots))))))
-          (setq cur (cdr (cdr cur)))))
-      instance)))
+                                 (setq cur (cdr cur))))))
+                  (cond
+                    ;; Shared in the new class: value lives in per-class
+                    ;; storage; the instance cell is unused.  Old local
+                    ;; value is NOT transferred (CLHS 7.2.1 — only
+                    ;; local-in-new slots retain values).
+                    (shared-new
+                     (aset instance (+ 2 idx) -999))
+                    ;; Local in new + existed bound in old: retain.
+                    ((and pair (car (cdr pair)))
+                     (aset instance (+ 2 idx) (cdr (cdr pair))))
+                    ;; Existed-but-unbound or newly added: unbound.
+                    ;; Added slots get initforms in %uifdc-default.
+                    (t
+                     (aset instance (+ 2 idx) -999)))))
+              (setq idx (+ idx 1))
+              (setq sn (cdr sn))))
+          ;; ---- 5. UPDATE-INSTANCE-FOR-DIFFERENT-CLASS (real GF) ----
+          (%dispatch-uifdc (cons previous (cons instance initargs)))
+          instance)))))
+
+(defun %change-class-default (instance new-class &rest initargs)
+  "Default method body for CHANGE-CLASS — thin &rest wrapper over
+   %change-class-impl (which takes the initargs as a list)."
+  (%change-class-impl instance new-class initargs))
 
 (defun %dispatch-change-class (args)
   "Inline dispatch for CHANGE-CLASS — direct call to default unless GF
@@ -2808,21 +2855,21 @@
         (%change-class-default-spread args))))
 
 (defun %change-class-default-spread (args)
-  "Spread args list to %change-class-default by name (no funcall-on-symbol)."
-  (let ((n (length args)))
-    (cond
-      ((= n 0) (%change-class-default nil nil))
-      ((= n 1) (%change-class-default (car args) nil))
-      ((= n 2) (%change-class-default (car args) (cadr args)))
-      ((= n 3) (%change-class-default (car args) (cadr args) (caddr args)))
-      ((= n 4) (%change-class-default (car args) (cadr args) (caddr args)
-                                      (cadddr args)))
-      (t (%change-class-default (car args) (cadr args) (caddr args)
-                                (cadddr args) (cadddr (cdr args)))))))
+  "ARGS is (instance new-class &rest initargs) as a list.  Pass the
+   initargs tail straight through to %change-class-impl — the previous
+   by-arity ladder capped at 5 elements and silently truncated longer
+   initarg lists (change-class.1.10 passes 8)."
+  (cond
+    ((or (null args) (null (cdr args))) (%signal-program-error))
+    (t (%change-class-impl (car args) (car (cdr args)) (cdr (cdr args))))))
 
 (defun change-class (&rest %cc-args)
   "CHANGE-CLASS generic function entry.  Falls through to
-   %change-class-default unless user methods were defined."
+   %change-class-default unless user methods were defined.
+   CLHS: requires at least 2 args (instance + new-class) —
+   change-class.error.1/.2 expect PROGRAM-ERROR."
+  (when (or (null %cc-args) (null (cdr %cc-args)))
+    (%signal-program-error))
   (%dispatch-change-class %cc-args))
 
 ;; UPDATE-INSTANCE-FOR-REDEFINED-CLASS and UPDATE-INSTANCE-FOR-
@@ -4120,8 +4167,54 @@
 ;;; up.  ANSI requires these to be GFs.
 
 (defun %uifdc-default (previous current &rest initargs)
-  (declare (ignore initargs previous))
-  current)
+  "Default primary for UPDATE-INSTANCE-FOR-DIFFERENT-CLASS (CLHS 7.7.2):
+   equivalent to (apply #'shared-initialize current added-slots initargs)
+   where added-slots are the local slots of CURRENT's class that did not
+   exist in PREVIOUS's class.  Implemented directly (initarg application
+   leftmost-wins + initforms for still-unbound added slots) rather than
+   through the shared-initialize spread path, which also runs
+   :default-initargs — those must NOT apply on change-class."
+  (when (or (null current) (not (%clos-instance-p current)))
+    (return-from %uifdc-default current))
+  (let* ((new-name (aref current 1))
+         (new-cls (%find-clos-class new-name))
+         (old-name (if (and previous (%clos-instance-p previous))
+                       (aref previous 1)
+                       nil))
+         (old-cls (if old-name (%find-clos-class old-name) nil))
+         (old-slot-names (if old-cls (aref old-cls 2) nil)))
+    (when (null new-cls) (return-from %uifdc-default current))
+    ;; Added slots: local in the new class, absent from the old class.
+    (let ((added nil))
+      (let ((sn (aref new-cls 2)))
+        (loop
+          (when (null sn) (return nil))
+          (let ((nm (car sn)))
+            (when (and (null (member nm old-slot-names :test #'eq))
+                       (null (%slot-class-owner new-name nm)))
+              (setq added (cons nm added))))
+          (setq sn (cdr sn))))
+      ;; 1. Apply initargs (leftmost wins) — they may set ANY slot of
+      ;;    the new class, not just added ones (change-class.1.5).
+      (let ((set-slots (%shared-init-apply-initargs
+                        current new-name initargs nil)))
+        ;; 2. Initforms for added slots still unbound + not initarg-set.
+        (let ((cur added))
+          (loop
+            (when (null cur) (return nil))
+            (let* ((nm (car cur))
+                   (already (member nm set-slots :test #'eq))
+                   (idx (%clos-slot-index new-cls nm))
+                   (unbound (if (>= idx 0)
+                                (let ((v (aref current (+ 2 idx))))
+                                  (and (fixnump v) (= v -999)))
+                                nil)))
+              (when (and (null already) unbound)
+                (let ((thunk (%clos-initform-thunk new-name nm)))
+                  (when thunk
+                    (set-slot-value current nm (funcall thunk))))))
+            (setq cur (cdr cur))))))
+    current))
 
 (defun %dispatch-uifdc (args)
   (let ((gf (%find-gf 'update-instance-for-different-class)))
@@ -4508,9 +4601,20 @@
                                      (%native-mvm-sym-p tn))
                                 (= (%native-mvm-sym-hash cur)
                                    (%native-mvm-sym-hash tn)))
+                               ;; Compare 3-slot CL syms by NAME-HASH
+                               ;; (slot 0), NOT by %cl-sym-name string —
+                               ;; names lazy-resolve through
+                               ;; *SYM-NAME-TABLE*, which only covers
+                               ;; symbols harvested from a few chapter
+                               ;; dirs.  For two class names absent from
+                               ;; the table (e.g. CHANGE-CLASS-CLASS-01A
+                               ;; vs -01B from objects/), %cl-sym-name
+                               ;; returned "" for BOTH sides and
+                               ;; (string-equal "" "") made TYPEP match
+                               ;; EVERY class — change-class.1.x failed
+                               ;; on (typep obj 'other-class) → T.
                                ((and (%cl-sym-p cur) (%cl-sym-p tn))
-                                (string-equal (%cl-sym-name cur)
-                                              (%cl-sym-name tn)))
+                                (= (%cl-sym-hash cur) (%cl-sym-hash tn)))
                                (t nil))
                          (setq found t) (return found)))
                      (setq c (cdr c))))))

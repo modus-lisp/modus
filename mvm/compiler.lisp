@@ -4369,10 +4369,22 @@
            (temp-vars
              (mapcar (lambda (s) (gensym (concatenate 'string "SPECTMP-" (symbol-name s))))
                      specials))
+           ;; Sets only for specials that actually have a binding in THIS
+           ;; let — a (declare (special *y*)) with no binding form is just
+           ;; a dynamic-access declaration; emitting a set would clobber
+           ;; the global with an unbound temp's value (caught in the
+           ;; b3f22df merge — the agent's LET-path fix had this filter).
            (set-forms
-             (mapcar (lambda (spec tmp)
-                       `(set-symbol-value ,(normalize-name spec) ,tmp))
-                     specials temp-vars))
+             (let ((acc nil))
+               (mapc (lambda (spec tmp)
+                       (when (find (symbol-name spec) special-bindings
+                                   :key (lambda (b)
+                                          (symbol-name (if (consp b) (car b) b)))
+                                   :test #'string=)
+                         (push `(set-symbol-value ,(normalize-name spec) ,tmp)
+                               acc)))
+                     specials temp-vars)
+               (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
                        `(set-symbol-value ,(normalize-name spec) ,sv))

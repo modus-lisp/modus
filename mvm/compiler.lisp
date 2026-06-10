@@ -2692,7 +2692,16 @@
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
                (when (or rest-pos synth-rest)
-                 (setf (function-info-rest-param-p info) t)))))
+                 (setf (function-info-rest-param-p info) t)))
+             ;; CRITICAL: queue the IR for emission.  mvm-compile-function
+             ;; registers the function-info (so call sites resolve and
+             ;; link) but the toplevel driver only emits IR it receives
+             ;; via mvm-compile-toplevel's return or *pending-flet-ir*.
+             ;; Without this push the nested defun's bytecode was silently
+             ;; dropped — the registered name pointed at a zero-length
+             ;; stub, and every BY-NAME call to it returned immediately
+             ;; with stale VR (probes 9850/9853, dg-mc.N.10/.11 GOT:T).
+             (push result *pending-flet-ir*)))
          (compile-nil dest)))
       ;; DEFMACRO inside an expression context.  Same fall-through trap
       ;; as nested DEFUN: a `(defmacro foo (x) (list 'quote x))` inside a
@@ -2721,7 +2730,18 @@
       ;; constructor / accessors / predicates / setters so subsequent
       ;; calls in the same source resolve them.  Yields NIL into dest.
       ((= op-name 347335033216607151)   ; DEFSTRUCT
-       (mvm-compile-toplevel form)
+       ;; Queue the returned IR like the nested-DEFUN path above —
+       ;; mvm-compile-toplevel returns (:multi-result (info . ir) …) for
+       ;; defstruct; dropping it left every nested-defstruct accessor a
+       ;; zero-length stub (same silent void-call class as 9850/9853).
+       (let ((result (mvm-compile-toplevel form)))
+         (cond
+           ((and (consp result) (eq (car result) :multi-result))
+            (dolist (sub (cdr result))
+              (when (and (consp sub) (car sub) (cdr sub))
+                (push sub *pending-flet-ir*))))
+           ((and (consp result) (car result) (cdr result))
+            (push result *pending-flet-ir*))))
        (compile-nil dest))
       ;; DEFVAR / DEFPARAMETER inside an expression context.  Same fall-
       ;; through trap as DEFUN: nested DEFVAR landed in compile-call as
@@ -4321,7 +4341,16 @@
    On entry: save old values, set new values.
    On exit: restore old values, preserving multiple-value state.
    When SEQUENTIAL is true (let* context), all bindings are kept in original
-   order to preserve sequential dependencies (e.g. from multiple-value-bind)."
+   order to preserve sequential dependencies (e.g. from multiple-value-bind).
+
+   CRITICAL (2026-06-10, probe 9862): the special variable must NOT get a
+   lexical binding in the emitted let* — body references would resolve to
+   that lexical slot, shadowing the global the set-forms wrote.  Methods
+   and callees that setq the special wrote the global while the body read
+   its stale lexical copy (dg-mc.N.1 *x* always read as NIL).  Each
+   special binding's init is therefore bound to a gensym TEMP; the
+   set-form reads the temp; the special name stays lexically unbound so
+   every body reference compiles as a global (dynamic) access."
   (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
          (save-vars (mapcar (lambda (s) (gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))
@@ -4335,17 +4364,15 @@
              (mapcar (lambda (sv spec)
                        (list sv `(symbol-value ,(normalize-name spec))))
                      save-vars specials))
-           (set-forms
-             (mapcar (lambda (spec)
-                       ;; Find the corresponding binding by name
-                       (let* ((spec-name (symbol-name spec))
-                              (binding (find spec-name special-bindings
-                                            :key (lambda (b)
-                                                   (symbol-name (if (consp b) (car b) b)))
-                                            :test #'string=))
-                              (val-var (if (consp binding) (car binding) binding)))
-                         `(set-symbol-value ,(normalize-name spec) ,val-var)))
+           ;; Per-special TEMP names — carry the init value without
+           ;; creating a lexical binding under the special's own name.
+           (temp-vars
+             (mapcar (lambda (s) (gensym (concatenate 'string "SPECTMP-" (symbol-name s))))
                      specials))
+           (set-forms
+             (mapcar (lambda (spec tmp)
+                       `(set-symbol-value ,(normalize-name spec) ,tmp))
+                     specials temp-vars))
            (restore-forms
              (mapcar (lambda (sv spec)
                        `(set-symbol-value ,(normalize-name spec) ,sv))
@@ -4368,32 +4395,62 @@
                    (loop for i from 0 below n-mv-slots
                          for sv in mv-save-vars
                          collect `(setf (mem-ref ,(+ +mv-values-addr+ (* i 8)) :u64) ,sv)))))
-      (if sequential
-          ;; let* context: keep ALL bindings in original order, then save/set/restore specials
-          (let ((*let-skip-implicit-specials* t))
-            (compile-form
-              `(let* ,bindings
-                 (let* ,save-bindings
+      ;; Rename each special binding (VAR INIT) to (SPECTMP-VAR INIT) so
+      ;; the special name never becomes a lexical variable.  SET-FORMS
+      ;; read the temps (paired positionally with SPECIALS).
+      (let ((renamed-bindings
+              (mapcar (lambda (b)
+                        (let ((var (if (consp b) (car b) b))
+                              (init (if (consp b) (cadr b) nil)))
+                          (let ((pos (position (symbol-name var) special-names
+                                               :test #'string=)))
+                            (if pos
+                                (list (nth pos temp-vars) init)
+                                b))))
+                      bindings)))
+        (if sequential
+            ;; let* context: bindings keep original order so sequential
+            ;; init dependencies hold.  For a special, the dynamic
+            ;; binding must be visible to LATER inits (CLHS let*), so
+            ;; each special's set-symbol-value is interleaved right
+            ;; after its temp via a dummy binding.
+            (let ((*let-skip-implicit-specials* t)
+                  (seq-bindings
+                    (mapcan (lambda (b rb)
+                              (let ((var (if (consp b) (car b) b)))
+                                (let ((pos (position (symbol-name var) special-names
+                                                     :test #'string=)))
+                                  (if pos
+                                      (list rb
+                                            (list (gensym "SPECSET")
+                                                  `(set-symbol-value
+                                                    ,(normalize-name (nth pos specials))
+                                                    ,(nth pos temp-vars))))
+                                      (list rb)))))
+                            bindings renamed-bindings)))
+              (compile-form
+                `(let* ,save-bindings
+                   (let* ,seq-bindings
+                     (let ((%special-result (progn ,@stripped-body)))
+                       (let* ,mv-save-bindings
+                         ,@restore-forms
+                         ,@mv-restore-forms
+                         %special-result))))
+                env dest))
+            ;; let context: combine renamed bindings + save bindings into a
+            ;; single let* (inits can't see each other — temps are gensyms),
+            ;; then set the globals, run body, restore.
+            (let ((all-bindings (append renamed-bindings save-bindings))
+                  (*let-skip-implicit-specials* t))
+              (compile-form
+                `(let* ,all-bindings
                    ,@set-forms
                    (let ((%special-result (progn ,@stripped-body)))
                      (let* ,mv-save-bindings
                        ,@restore-forms
                        ,@mv-restore-forms
-                       %special-result))))
-              env dest))
-          ;; let context: combine all bindings into a single let* to minimize nesting depth.
-          ;; Order: regular bindings, special bindings, save bindings, then set+body+restore.
-          (let ((all-bindings (append bindings save-bindings))
-                (*let-skip-implicit-specials* t))
-            (compile-form
-              `(let* ,all-bindings
-                 ,@set-forms
-                 (let ((%special-result (progn ,@stripped-body)))
-                   (let* ,mv-save-bindings
-                     ,@restore-forms
-                     ,@mv-restore-forms
-                     %special-result)))
-              env dest))))))
+                       %special-result)))
+                env dest)))))))
 
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
@@ -11380,13 +11437,22 @@
     (unless (eq expanded form)
       (return-from mvm-compile-toplevel (mvm-compile-toplevel expanded))))
   (cond
-    ;; (progn form*) at top level — process each sub-form
+    ;; (progn form*) at top level — process each sub-form.  Collect ALL
+    ;; sub-results into :multi-result: the previous keep-last-only logic
+    ;; dropped the IR of every defun but the final one in
+    ;; (progn (defun a …) (defun b …)) — a's name registered but its
+    ;; bytecode never emitted, so calls to it were void no-ops (same
+    ;; class as the nested-DEFUN *pending-flet-ir* leak, probes 9850/9853).
     ((and (consp form) (name-eq (car form) "PROGN"))
-     (let ((last-result nil))
+     (let ((subs nil))
        (dolist (sub-form (cdr form))
-         (let ((result (mvm-compile-toplevel sub-form)))
-           (when result (setf last-result result))))
-       last-result))
+         (let ((r (mvm-compile-toplevel sub-form)))
+           (cond
+             ((and (consp r) (eq (car r) :multi-result))
+              (dolist (s (cdr r)) (push s subs)))
+             ((and (consp r) (car r) (cdr r))
+              (push r subs)))))
+       (if subs (cons :multi-result (nreverse subs)) nil)))
 
     ;; (defun name (params) body...)
     ;; Also handles (defun (setf name) (params) body...) → compile as "SETF-NAME"
@@ -11480,11 +11546,20 @@
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms
-    ;; MVM treats all compilation situations as :execute
+    ;; MVM treats all compilation situations as :execute.
+    ;; Collect sub-results into :multi-result — discarding them dropped
+    ;; the IR of any defun inside eval-when (registered name, zero-length
+    ;; stub, void by-name calls; same class as the nested-DEFUN leak).
     ((and (consp form) (name-eq (car form) "EVAL-WHEN"))
-     (dolist (subform (cddr form))
-       (mvm-compile-toplevel subform))
-     nil)
+     (let ((subs nil))
+       (dolist (subform (cddr form))
+         (let ((r (mvm-compile-toplevel subform)))
+           (cond
+             ((and (consp r) (eq (car r) :multi-result))
+              (dolist (s (cdr r)) (push s subs)))
+             ((and (consp r) (car r) (cdr r))
+              (push r subs)))))
+       (if subs (cons :multi-result (nreverse subs)) nil)))
 
     ;; (defconstant name value)
     ((and (consp form) (name-eq (car form) "DEFCONSTANT"))

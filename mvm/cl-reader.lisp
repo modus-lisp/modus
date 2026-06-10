@@ -169,9 +169,7 @@
   (setq *read-base* 10)
   (setq *read-suppress* nil)
   (setq *read-eval* t)
-  ;; CLHS §22.1.1.3: default is SINGLE-FLOAT, not NIL.  WSIS-15 expects
-  ;; (with-standard-io-syntax *read-default-float-format*) → single-float.
-  (setq *read-default-float-format* 'single-float)
+  (setq *read-default-float-format* nil)
   (setq *print-array* t)
   (setq *print-base* 10)
   (setq *print-case* :upcase)
@@ -1833,7 +1831,6 @@
         (saved-read-base *read-base*)
         (saved-read-suppress *read-suppress*)
         (saved-read-eval *read-eval*)
-        (saved-read-default-float-format *read-default-float-format*)
         (saved-print-base *print-base*)
         (saved-print-case *print-case*)
         (saved-print-escape *print-escape*)
@@ -1853,9 +1850,6 @@
     (setq *read-base* 10)
     (setq *read-suppress* nil)
     (setq *read-eval* t)
-    ;; CLHS §22.1.1.3: in standard io syntax, *read-default-float-format*
-    ;; is SINGLE-FLOAT.  Was missing from the save/restore list.
-    (setq *read-default-float-format* 'single-float)
     (setq *print-array* t)
     (setq *print-base* 10)
     (setq *print-case* :upcase)
@@ -1882,7 +1876,6 @@
             (setq *read-base* saved-read-base)
             (setq *read-suppress* saved-read-suppress)
             (setq *read-eval* saved-read-eval)
-            (setq *read-default-float-format* saved-read-default-float-format)
             (setq *print-base* saved-print-base)
             (setq *print-case* saved-print-case)
             (setq *print-escape* saved-print-escape)
@@ -1903,7 +1896,6 @@
       (setq *read-base* saved-read-base)
       (setq *read-suppress* saved-read-suppress)
       (setq *read-eval* saved-read-eval)
-      (setq *read-default-float-format* saved-read-default-float-format)
       (setq *print-base* saved-print-base)
       (setq *print-case* saved-print-case)
       (setq *print-escape* saved-print-escape)

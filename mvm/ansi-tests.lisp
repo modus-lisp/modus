@@ -2791,6 +2791,14 @@
   (run-test 9985 (lambda () (%cl-sym-p 'abc)) 'nil)
   (run-test 9986 (lambda () (let ((*print-gensym* nil)) (format nil "~S" (make-symbol "ZZ")))) "ZZ")
   (run-test 9987 (lambda () (format nil "~A" 'abc)) "ABC")
+  ;; format-d/o/x crash diagnosis: nested-control + formatter shapes
+  (run-test 9988 (lambda () (format nil (format nil "~~~dd" 8) 42)) "      42")
+  (run-test 9989 (lambda () (format nil "~@d" 5)) "+5")
+  (run-test 9990 (lambda () (let ((fn (formatter "~D"))) (formatter-call-to-string fn 42))) "42")
+  (run-test 9991 (lambda () (format nil "~v,'0d" 5 42)) "00042")
+  (run-test 9992 (lambda () (format nil (format nil "~~~d,'~cd" 6 #\*) 42)) "****42")
+  (run-test 9993 (lambda () (format nil "~:d" -1234567)) "-1,234,567")
+  (run-test 9994 (lambda () (let ((fn (formatter "~v,vd"))) (formatter-call-to-string fn 6 #\Space 42))) "    42")
   )
 
 ;;; ============================================================

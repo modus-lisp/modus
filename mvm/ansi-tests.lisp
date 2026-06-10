@@ -2315,6 +2315,49 @@
                    (list (funcall fn y) *dgmc-probe-x*))))
           (list (%pf 1) (%pf 'q)))))
     '((a (1 4)) (a (1))))
+  ;; 9864 — closure-env content check: does the flet-transformed lambda
+  ;; actually receive the captured FN?  Returns what the closure sees.
+  ;; If this fails (GOT NIL or garbage truthiness), the let-bound-
+  ;; closure env propagation is broken BEFORE any dispatch happens.
+  (run-test 9864
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p34 '(x) nil)
+                  (%defmethod 'dg-probe-p34 'nil (list 't) (lambda (x) 'ok))
+                  (%find-gf 'dg-probe-p34))))
+        (flet ((%pf () fn))
+          (notnot (%gf-p (%pf))))))
+    't)
+  ;; 9865 — minimal documented broken shape (map-into class): let-bound
+  ;; capturing lambda + funcall, no flet involved.
+  (run-test 9865
+    (lambda ()
+      (let ((v 'captured))
+        (let ((c (lambda () v)))
+          (funcall c))))
+    'captured)
+  ;; 9866 — same but the captured value is a GF object and the closure
+  ;; funcalls it (9855 minus the flet machinery).
+  (run-test 9866
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p36 '(x) nil)
+                  (%defmethod 'dg-probe-p36 'nil (list 't) (lambda (x) 'ok36))
+                  (%find-gf 'dg-probe-p36))))
+        (let ((c (lambda (y) (funcall fn y))))
+          (funcall c 5))))
+    'ok36)
+  ;; 9867 — flet calling the local by NAME (not via #'/funcall) with a
+  ;; captured var — the exact %pf call shape the dg-mc tests use.
+  (run-test 9867
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p37 '(x) nil)
+                  (%defmethod 'dg-probe-p37 'nil (list 't) (lambda (x) 'ok37))
+                  (%find-gf 'dg-probe-p37))))
+        (flet ((%pf (y) (funcall fn y)))
+          (list (%pf 1) (%pf 2)))))
+    '(ok37 ok37))
   ;; Inline-defun-in-lambda crash pattern (CLAUDE.md "nested defun w/
   ;; %gf-dispatch body in funcall thunk"; bisected via probes 9792-9816
   ;; on 2026-05-04, those probes deleted to avoid noise).

@@ -2358,6 +2358,35 @@
         (flet ((%pf (y) (funcall fn y)))
           (list (%pf 1) (%pf 2)))))
     '(ok37 ok37))
+  ;; 9868-9870 — triangulate 9864/9865: 9865 (bare lambda, let-bound)
+  ;; passes while the flet transform's shape fails.  The transform
+  ;; creates the closure INSIDE set-car's argument list — if
+  ;; compile-make-closure's emission clobbers already-loaded arg
+  ;; registers (alloc-scratch class, cf. 7f7bae5), the cell arg is
+  ;; garbage and (car cell) later reads NIL.
+  ;; 9868 — manual flet-transform replication: set-car + #'(lambda).
+  (run-test 9868
+    (lambda ()
+      (let ((v 'x68))
+        (let ((cell (cons nil nil)))
+          (set-car cell (function (lambda () v)))
+          (funcall (car cell)))))
+    'x68)
+  ;; 9869 — same with a BARE lambda in set-car's args.
+  (run-test 9869
+    (lambda ()
+      (let ((v 'x69))
+        (let ((cell (cons nil nil)))
+          (set-car cell (lambda () v))
+          (funcall (car cell)))))
+    'x69)
+  ;; 9870 — #'(lambda) capture, let-bound (no cell, no call-arg position).
+  (run-test 9870
+    (lambda ()
+      (let ((v 'x70))
+        (let ((c (function (lambda () v))))
+          (funcall c))))
+    'x70)
   ;; Inline-defun-in-lambda crash pattern (CLAUDE.md "nested defun w/
   ;; %gf-dispatch body in funcall thunk"; bisected via probes 9792-9816
   ;; on 2026-05-04, those probes deleted to avoid noise).
@@ -2380,14 +2409,17 @@
   ;;     of run-clos-diag-tests (init phase, before fork)
   ;;   - FAIL: same on SECOND run (per-fork run, after init)
   ;;
-  ;; The function being called from the nested defun body matters
-  ;; (%gf-dispatch fails, %find-gf/%defmethod don't), and the failure
-  ;; only manifests on re-execution of the surrounding context.
-  ;; Hypothesis: nested compilation of a defun whose body emits a
-  ;; multi-arg :call ir-op leaves *symbol-function-table* lookup state
-  ;; in a way that the OUTER lambda's :li-func resolution sees stale
-  ;; addresses on re-entry.  Not pinned down yet — leaves DG-MC.*
-  ;; tests at the failure baseline.
+  ;; RESOLVED 2026-06-10 (see reference_ir_drop_bug_class): the
+  ;; nested-DEFUN compile path registered the function-info but DROPPED
+  ;; the returned IR — bytecode never emitted, so by-name calls hit a
+  ;; zero-length stub and returned stale VR.  The 2026-05-04 hypothesis
+  ;; above (symbol-table state on re-entry) was wrong; the "first run
+  ;; passed" observation was the EAGER deftest path evaluating args
+  ;; inline, the "second run failed" was the thunk path.  Fixed by
+  ;; pushing the result onto *pending-flet-ir* (commit 88385f6), plus
+  ;; the same drain for nested DEFSTRUCT / toplevel EVAL-WHEN / toplevel
+  ;; PROGN (which kept only the LAST sub-form's IR).  Probes 9850/9853
+  ;; lock in the regression.
   (deftest 9795 (handler-case
                   (funcall (lambda ()
                              (progn (defun %diag-il-x (a) (%gf-dispatch '%diag-il-x a))

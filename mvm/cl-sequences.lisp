@@ -1850,11 +1850,47 @@
              (loop (when (= i size) (return nil))
                (aset v i init) (setq i (+ i 1)))))
          v)))))
+(defun %coerce-canon-head (head)
+  "Canonicalize a type-head symbol to the Modus built-in type symbol of
+   the same NAME.  Type specifiers are compared by name (CLHS), but a
+   type-head read in a foreign package (e.g. UIOP/UTILITY::VECTOR, when
+   define-package's inheritance hasn't exposed CL:VECTOR) is a distinct
+   object from Modus's compiled 'VECTOR, so `(eq head 'vector)` fails and
+   coerce silently returns OBJ unchanged.  Re-key by name so the downstream
+   EQ checks match regardless of the head symbol's home package."
+  (if (and head (not (consp head)) (not (stringp head))
+           (not (integerp head)) (not (characterp head))
+           (symbolp head))
+      (let ((n (symbol-name head)))
+        (cond
+          ((null n) head)
+          ((string= n "LIST") 'list)
+          ((string= n "VECTOR") 'vector)
+          ((string= n "SIMPLE-VECTOR") 'simple-vector)
+          ((string= n "ARRAY") 'array)
+          ((string= n "SIMPLE-ARRAY") 'simple-array)
+          ((string= n "STRING") 'string)
+          ((string= n "SIMPLE-STRING") 'simple-string)
+          ((string= n "BASE-STRING") 'base-string)
+          ((string= n "SIMPLE-BASE-STRING") 'simple-base-string)
+          ((string= n "CHARACTER") 'character)
+          ((string= n "BIT-VECTOR") 'bit-vector)
+          ((string= n "SIMPLE-BIT-VECTOR") 'simple-bit-vector)
+          ((string= n "FLOAT") 'float)
+          ((string= n "SINGLE-FLOAT") 'single-float)
+          ((string= n "DOUBLE-FLOAT") 'double-float)
+          ((string= n "SHORT-FLOAT") 'short-float)
+          ((string= n "LONG-FLOAT") 'long-float)
+          ((string= n "COMPLEX") 'complex)
+          ((string= n "FUNCTION") 'function)
+          (t head)))
+      head))
+
 (defun coerce (obj type)
   "Convert OBJ to TYPE per CLHS 4.7.  Handles list/vector/string/
    character/symbol/bit-vector and their compound forms like
    (vector *) / (vector * 2) / (simple-string)."
-  (let ((head (if (consp type) (car type) type)))
+  (let ((head (%coerce-canon-head (if (consp type) (car type) type))))
     (cond
       ((or (eq type t) (eq type 'common-lisp:t)) obj)
       ;; List

@@ -190,13 +190,85 @@
     "(defmacro check-type (place type &rest args) nil)"
     "(defmacro ignore-errors (&rest body)
        (list 'handler-case (cons 'progn body) (list t (list 'c) (list 'values nil 'c))))"
-    "(defmacro with-standard-io-syntax (&rest body) (cons 'progn body))"))
+    "(defmacro with-standard-io-syntax (&rest body) (cons 'progn body))"
+
+    ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc]).
+    ;; Defines NAME as a macro: (name place a b …) => (setf place (fn place a b …)).
+    ;; We ignore the lambda-list's structure and capture all post-place args
+    ;; via &rest, which covers the `(&rest args)' shape ASDF's APPENDF uses.
+    "(defmacro define-modify-macro (name lambda-list fn &rest doc)
+       (list 'defmacro name (list 'place '&rest 'args)
+             (list 'list (list 'quote 'setf) 'place
+                   (list 'list* (list 'quote fn) 'place 'args))))"
+
+    ;; DESTRUCTURING-BIND — expand to (apply (lambda PATTERN BODY) EXPR).
+    ;; %bind-params handles &optional/&rest/&key/&aux AND dotted tails, so
+    ;; the apply-lambda trick covers ASDF's `(destructuring-bind (car . cdr)
+    ;; form …)' (a dotted macro-style lambda list).
+    "(defmacro destructuring-bind (pattern expr &rest body)
+       (list 'apply (cons 'lambda (cons pattern body)) expr))"
+
+    ;; DO-SYMBOLS / DO-EXTERNAL-SYMBOLS / DO-ALL-SYMBOLS — package
+    ;; iteration.  Mirror compiler.lisp's mvm-define-macro expansions so
+    ;; runtime EVAL of these (used heavily by uiop/package:ensure-package)
+    ;; materializes accessible symbols via %do-*-symbols-fn then walks.
+    "(defmacro do-symbols (spec &rest body)
+       (let ((var (car spec))
+             (pkg (if (cdr spec) (cadr spec) '*package*))
+             (result (and (cddr spec) (caddr spec)))
+             (syms (gensym \"DS\")) (cur (gensym \"DSC\")))
+         (list 'block nil
+           (list 'let (list (list syms nil))
+             (list '%do-symbols-fn
+                   (list 'lambda (list var) (list 'setq syms (list 'cons var syms)))
+                   pkg)
+             (list 'let (list (list cur syms))
+               (list 'loop
+                 (list 'when (list 'null cur) (list 'return result))
+                 (list 'let (list (list var (list 'car cur)))
+                   (cons 'progn body))
+                 (list 'setq cur (list 'cdr cur))))))))"
+
+    "(defmacro do-external-symbols (spec &rest body)
+       (let ((var (car spec))
+             (pkg (if (cdr spec) (cadr spec) '*package*))
+             (result (and (cddr spec) (caddr spec)))
+             (syms (gensym \"DES\")) (cur (gensym \"DESC\")))
+         (list 'block nil
+           (list 'let (list (list syms nil))
+             (list '%do-external-symbols-fn
+                   (list 'lambda (list var) (list 'setq syms (list 'cons var syms)))
+                   pkg)
+             (list 'let (list (list cur syms))
+               (list 'loop
+                 (list 'when (list 'null cur) (list 'return result))
+                 (list 'let (list (list var (list 'car cur)))
+                   (cons 'progn body))
+                 (list 'setq cur (list 'cdr cur))))))))"
+
+    "(defmacro do-all-symbols (spec &rest body)
+       (let ((var (car spec))
+             (result (and (cdr spec) (cadr spec)))
+             (syms (gensym \"DAS\")) (cur (gensym \"DASC\")))
+         (list 'block nil
+           (list 'let (list (list syms nil))
+             (list '%do-all-symbols-fn
+                   (list 'lambda (list var) (list 'setq syms (list 'cons var syms))))
+             (list 'let (list (list cur syms))
+               (list 'loop
+                 (list 'when (list 'null cur) (list 'return result))
+                 (list 'let (list (list var (list 'car cur)))
+                   (cons 'progn body))
+                 (list 'setq cur (list 'cdr cur))))))))"))
 
 (defun %rt-install-one (src)
   "Read SRC (a defmacro source string) and eval.  Caller wraps in
    handler-case if it wants resilience — wrapping each call here
-   triggered a stability bug where installs 3+ stopped registering."
-  (eval (read-from-string src)))
+   triggered a stability bug where installs 3+ stopped registering.
+   A NIL SRC (unrolled (nth k) past the list end) is a no-op so the
+   unroll can safely overshoot the current entry count."
+  (when src
+    (eval (read-from-string src))))
 
 
 (defun %install-runtime-cl-macros ()
@@ -239,4 +311,12 @@
       (%rt-install-one (nth 23 lst))
       (%rt-install-one (nth 24 lst))
       (%rt-install-one (nth 25 lst))
-      (%rt-install-one (nth 26 lst)))))
+      (%rt-install-one (nth 26 lst))
+      (%rt-install-one (nth 27 lst))
+      (%rt-install-one (nth 28 lst))
+      (%rt-install-one (nth 29 lst))
+      (%rt-install-one (nth 30 lst))
+      (%rt-install-one (nth 31 lst))
+      (%rt-install-one (nth 32 lst))
+      (%rt-install-one (nth 33 lst))
+      (%rt-install-one (nth 34 lst)))))

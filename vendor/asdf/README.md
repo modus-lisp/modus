@@ -17,3 +17,16 @@ one pass gives the full landscape of what breaks.
 Do NOT reformat or hand-edit asdf.lisp; Modus-side fixes belong in the
 runtime, and unavoidable shims belong in gauntlet-shims.lisp loaded
 before it.
+
+## Vendor patches
+
+Implementation-detection lists in asdf.lisp enumerate every supported CL
+and `(error "ASDF is not supported …")` otherwise.  Modus pushes `:modus`
+onto `*features*`, so we add `modus` to those lists.  Each edit is the
+minimal token insertion (the upstream line is otherwise verbatim):
+
+- line ~810 `#-(or abcl allegro … sbcl scl xcl)` guarding the
+  "ASDF is not supported on your implementation" error → added `modus`.
+
+Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
+same way as the gauntlet reaches them, and record them here.

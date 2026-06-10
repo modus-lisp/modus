@@ -807,7 +807,7 @@ UNINTERN -- Remove symbols here from PACKAGE."
   #+(or mcl cmucl) (:shadow #:user-homedir-pathname))
 (in-package :uiop/common-lisp)
 
-#-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mkcl sbcl scl xcl)
+#-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mkcl modus sbcl scl xcl)
 (error "ASDF is not supported on your implementation. Please help us port it.")
 
 ;; (declaim (optimize (speed 1) (debug 3) (safety 3))) ; DON'T: trust implementation defaults.

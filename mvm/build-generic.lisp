@@ -120,27 +120,53 @@
   (syscall3 60 1 0 0))
 (defun %rbq-sym-name-eq (sym name)
   (and (symbolp sym) (string= (symbol-name sym) name)))
-(defun runtime-bq-expand (template)
+;; Level-tracking backquote expander.  LEVEL counts open backquotes
+;; whose commas are still pending; the entry from the macro is LEVEL 1.
+;; A COMMA at LEVEL 1 unquotes (its expr stays live); a COMMA at deeper
+;; LEVEL is data that drops one level — this is what makes the classic
+;; `,',x / `,,x tunnelling work (a `(... `(... ,',def ...)) form).  A
+;; nested BACKQUOTE bumps the level by one for its template.
+(defun runtime-bq-expand (template) (%rbq template 1))
+(defun %rbq (template level)
   (cond
     ((null template) nil)
-    ((and (consp template) (%rbq-sym-name-eq (car template) \"COMMA\"))
-     (cadr template))
     ((atom template) (list 'quote template))
-    (t (runtime-bq-expand-list template))))
-(defun runtime-bq-expand-list (lst)
+    ;; nested COMMA
+    ((%rbq-sym-name-eq (car template) \"COMMA\")
+     (if (= level 1)
+         (cadr template)
+         (list 'list (list 'quote 'comma) (%rbq (cadr template) (- level 1)))))
+    ((%rbq-sym-name-eq (car template) \"COMMA-AT\")
+     (if (= level 1)
+         (cadr template)
+         (list 'list (list 'quote 'comma-at) (%rbq (cadr template) (- level 1)))))
+    ((%rbq-sym-name-eq (car template) \"COMMA-DOT\")
+     (if (= level 1)
+         (cadr template)
+         (list 'list (list 'quote 'comma-dot) (%rbq (cadr template) (- level 1)))))
+    ;; nested BACKQUOTE — descend one deeper level, rebuild the marker
+    ((%rbq-sym-name-eq (car template) \"BACKQUOTE\")
+     (list 'list (list 'quote 'backquote) (%rbq (cadr template) (+ level 1))))
+    (t (%rbq-list template level))))
+(defun %rbq-list (lst level)
   (cond
     ((null lst) (list 'quote nil))
-    ((not (consp lst)) (runtime-bq-expand lst))
+    ((not (consp lst)) (%rbq lst level))
+    ;; a dotted/atom whole-form COMMA tail like `(a . ,b)
+    ((%rbq-sym-name-eq (car lst) \"COMMA\")
+     (if (= level 1)
+         (cadr lst)
+         (%rbq lst level)))
     (t
      (let ((first (car lst)) (rest (cdr lst)))
        (cond
-         ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-AT\"))
-          (list 'append2 (cadr first) (runtime-bq-expand-list rest)))
-         ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-DOT\"))
-          (list 'append2 (cadr first) (runtime-bq-expand-list rest)))
+         ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-AT\") (= level 1))
+          (list 'append2 (cadr first) (%rbq-list rest level)))
+         ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-DOT\") (= level 1))
+          (list 'append2 (cadr first) (%rbq-list rest level)))
          (t
-          (list 'cons (runtime-bq-expand first)
-                (runtime-bq-expand-list rest))))))))
+          (list 'cons (%rbq first level)
+                (%rbq-list rest level))))))))
 (defun %install-runtime-backquote ()
   (set-macro-function 'backquote
                       (eval '(lambda (template) (runtime-bq-expand template)))))
@@ -488,7 +514,7 @@
 
 (let ((image (build-image :target :linux-x64
                           :source-text cl-user::*full-source*)))
-  (let ((path "/tmp/modus"))
+  (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_GENERIC_OUT") "/tmp/modus")))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

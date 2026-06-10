@@ -2184,12 +2184,47 @@
 ;;; coerce extensions
 ;;; ============================================================
 
+(defun %coerce-canon-head (head)
+  "Canonicalize a type-head symbol to the Modus built-in type symbol of
+   the same NAME.  A type-head read in a foreign package (e.g.
+   UIOP/UTILITY::VECTOR, when define-package inheritance hasn't exposed
+   CL:VECTOR) is a distinct object from Modus's compiled 'VECTOR, so
+   `(eq head 'vector)` fails and coerce silently returns OBJECT unchanged.
+   Type specifiers compare by name (CLHS), so re-key by name."
+  (if (and head (not (consp head)) (not (stringp head))
+           (not (integerp head)) (not (characterp head))
+           (symbolp head))
+      (let ((n (symbol-name head)))
+        (cond
+          ((null n) head)
+          ((string= n "LIST") 'list)
+          ((string= n "VECTOR") 'vector)
+          ((string= n "SIMPLE-VECTOR") 'simple-vector)
+          ((string= n "ARRAY") 'array)
+          ((string= n "SIMPLE-ARRAY") 'simple-array)
+          ((string= n "STRING") 'string)
+          ((string= n "SIMPLE-STRING") 'simple-string)
+          ((string= n "BASE-STRING") 'base-string)
+          ((string= n "SIMPLE-BASE-STRING") 'simple-base-string)
+          ((string= n "CHARACTER") 'character)
+          ((string= n "BIT-VECTOR") 'bit-vector)
+          ((string= n "SIMPLE-BIT-VECTOR") 'simple-bit-vector)
+          ((string= n "FLOAT") 'float)
+          ((string= n "SINGLE-FLOAT") 'single-float)
+          ((string= n "DOUBLE-FLOAT") 'double-float)
+          ((string= n "SHORT-FLOAT") 'short-float)
+          ((string= n "LONG-FLOAT") 'long-float)
+          ((string= n "COMPLEX") 'complex)
+          ((string= n "FUNCTION") 'function)
+          (t head)))
+      head))
+
 (defun coerce (object result-type)
   "Coerce OBJECT to RESULT-TYPE.  Accepts compound type forms like
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
-  (let ((result-type (if (consp result-type) (car result-type) result-type)))
+  (let ((result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type))))
   (cond
     ((eq result-type 'list)
      (cond

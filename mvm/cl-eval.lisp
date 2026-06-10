@@ -608,6 +608,15 @@
   "Add (sym . val) binding to front of ENV."
   (cons (cons sym val) env))
 
+(defun %env-extend-pair (pair env)
+  "Add the EXISTING binding cons PAIR (sym . val) to front of ENV.
+   Unlike %env-extend, no fresh cons is made for the binding — so a
+   SETQ that mutates the binding via set-cdr persists through every
+   env built on this same PAIR.  Used for LOOP :WITH vars, whose
+   value must survive re-extension across iterations (CLHS 6.1.1.3
+   — a WITH var is bound once and mutable in the body)."
+  (cons pair env))
+
 ;;; ============================================================
 ;;; Eval -- tree-walking interpreter
 ;;; ============================================================
@@ -827,13 +836,26 @@
     (loop
       (cond
         ((null ps) (return new-env))
-        ;; &rest parameter — bind to remainder of ARGS but keep walking
-        ;; so &key after &rest still binds normally.
-        ((%eval-sym-eq (car ps) "&REST")
+        ;; Dotted lambda-list tail — `(a b . rest)` binds REST to the
+        ;; remaining ARGS, exactly like &rest.  DESTRUCTURING-BIND and
+        ;; macro lambda-lists (e.g. ASDF's
+        ;; `(destructuring-bind (car . cdr) form …)`) use this shape.
+        ((and ps (not (consp ps)))
+         (setq new-env (%env-extend ps as new-env))
+         (return new-env))
+        ;; &rest / &body parameter — bind to remainder of ARGS but keep
+        ;; walking so &key after &rest still binds normally.  &body is a
+        ;; synonym for &rest in macro lambda-lists (CLHS 3.4.4) and ASDF's
+        ;; with-upgradability uses `((&optional) &body body)`.
+        ((or (%eval-sym-eq (car ps) "&REST") (%eval-sym-eq (car ps) "&BODY"))
          (setq ps (cdr ps))
          (when ps
            (setq rest-list as)
-           (setq new-env (%env-extend (car ps) as new-env))
+           ;; The &rest var may itself be a destructuring pattern.
+           (let ((rvar (car ps)))
+             (if (consp rvar)
+                 (setq new-env (%loop-bind-pattern rvar as new-env))
+                 (setq new-env (%env-extend rvar as new-env))))
            (setq ps (cdr ps))))
         ;; &optional — fall through; subsequent positionals consume from AS
         ;; with NIL fallback.
@@ -903,6 +925,23 @@
              (setq new-env (%env-extend var (if init (%eval-in-env init new-env) nil) new-env))
              (setq ps (cdr ps))))
          (return new-env))
+        ;; Nested destructuring pattern in a (macro) lambda-list — a cons
+        ;; whose CAR is itself a list or a lambda-list keyword can't be an
+        ;; &optional (var init) spec; it's a sub-pattern destructured
+        ;; against the corresponding ARG.  Covers ASDF's
+        ;; `((&optional) &body body)` (the empty (&optional) pattern
+        ;; consumes one arg and binds nothing useful).
+        ((and (consp (car ps))
+              (let ((h (car (car ps))))
+                (or (consp h)
+                    (and (or (symbolp h) (%cl-sym-p h))
+                         (let ((n (symbol-name h)))
+                           (and n (> (length n) 0)
+                                (char= (char n 0) #\&)))))))
+         (let ((pat (car ps)))
+           (setq new-env (%loop-bind-pattern pat (if as (car as) nil) new-env))
+           (setq ps (cdr ps))
+           (setq as (if as (cdr as) nil))))
         ;; Regular / &optional positional parameter
         ;; &optional spec shapes: var | (var [init [supplied-p]])
         (t
@@ -1249,14 +1288,13 @@
              ;; Register accumulator cells for any :accum action that
              ;; appears in either branch (parse-one-action returns the
              ;; record but doesn't touch the outer accums alist).
-             (dolist (a (append yes-acts no-acts))
-               (when (eq (car a) :accum)
-                 (let ((nm (cadr a)) (sk (caddr a)))
-                   (unless (assoc nm accums)
-                     (push (list nm sk (if (eq sk :sum) 0
-                                            (if (eq sk :count) 0 nil)))
-                           accums))
-                   (unless default-accum (setq default-accum nm)))))
+             (dolist (a (%loop-collect-accums (append yes-acts no-acts)))
+               (let ((nm (cadr a)) (sk (caddr a)))
+                 (unless (assoc nm accums)
+                   (push (list nm sk (if (eq sk :sum) 0
+                                          (if (eq sk :count) 0 nil)))
+                         accums))
+                 (unless default-accum (setq default-accum nm))))
              (push (list :when test yes-acts no-acts) body-actions)
              (setq rest rs)))
           ((%loop-kw= kw "UNLESS")
@@ -1271,14 +1309,13 @@
                  (setq rs (cdr np))))
              (when (and rs (%loop-kw= (car rs) "END"))
                (setq rs (cdr rs)))
-             (dolist (a (append yes-acts no-acts))
-               (when (eq (car a) :accum)
-                 (let ((nm (cadr a)) (sk (caddr a)))
-                   (unless (assoc nm accums)
-                     (push (list nm sk (if (eq sk :sum) 0
-                                            (if (eq sk :count) 0 nil)))
-                           accums))
-                   (unless default-accum (setq default-accum nm)))))
+             (dolist (a (%loop-collect-accums (append yes-acts no-acts)))
+               (let ((nm (cadr a)) (sk (caddr a)))
+                 (unless (assoc nm accums)
+                   (push (list nm sk (if (eq sk :sum) 0
+                                          (if (eq sk :count) 0 nil)))
+                         accums))
+                 (unless default-accum (setq default-accum nm))))
              (push (list :unless test yes-acts no-acts) body-actions)
              (setq rest rs)))
           ((%loop-kw= kw "RETURN")
@@ -1295,6 +1332,25 @@
     (setq finally (nreverse finally))
     (%loop-execute iters accums default-accum body-actions
                    initial finally return-form env)))
+
+(defun %loop-collect-accums (acts)
+  "Walk a list of action records, descending into nested :when/:unless
+   records, and return the flat list of :accum records found.  The
+   top-level WHEN/UNLESS handlers register an INTO cell for each — a
+   nested conditional (else-when ladder) buries its accumulators one
+   or more levels down, so a flat scan would miss them."
+  (let ((out nil) (stack (list acts)))
+    (loop
+      (when (null stack) (return (nreverse out)))
+      (let ((cur (car stack)))
+        (setq stack (cdr stack))
+        (dolist (a cur)
+          (cond
+            ((eq (car a) :accum) (push a out))
+            ((or (eq (car a) :when) (eq (car a) :unless))
+             ;; record shape: (:when test yes-acts no-acts)
+             (push (caddr a) stack)
+             (when (cadddr a) (push (cadddr a) stack)))))))))
 
 (defun %loop-parse-one-action (rest)
   "Read one DO/COLLECT/SUM/COUNT/MIN/MAX/APPEND/NCONC action clause off
@@ -1366,6 +1422,26 @@
                rs)))
       ((%loop-kw= kw "RETURN")
        (cons (list :return (cadr rest)) (cddr rest)))
+      ;; Nested conditional inside a branch — the CLHS `selectable-clause'
+      ;; can itself be a WHEN/IF/UNLESS form, which is how the common
+      ;; `when A do X else when B do Y else do Z' ladder is written.
+      ;; Parse it recursively into a :when / :unless action record that
+      ;; %loop-run-action already understands, returning the accumulator
+      ;; sub-actions so the caller can register their INTO cells.
+      ((or (%loop-kw= kw "WHEN") (%loop-kw= kw "IF") (%loop-kw= kw "UNLESS"))
+       (let* ((negate (%loop-kw= kw "UNLESS"))
+              (test (cadr rest))
+              (yes-pair (%loop-parse-branch (cddr rest)))
+              (yes-acts (car yes-pair))
+              (rs (cdr yes-pair))
+              (no-acts nil))
+         (when (and rs (%loop-kw= (car rs) "ELSE"))
+           (let ((np (%loop-parse-branch (cdr rs))))
+             (setq no-acts (car np))
+             (setq rs (cdr np))))
+         (when (and rs (%loop-kw= (car rs) "END"))
+           (setq rs (cdr rs)))
+         (cons (list (if negate :unless :when) test yes-acts no-acts) rs)))
       (t
        ;; Bare form = implicit DO.
        (cons (list :do kw) (cdr rest))))))
@@ -1385,14 +1461,53 @@
         (push (car nxt) acts)
         (setq rs (cdr nxt))))))
 
+(defun %loop-hash-keys (ht)
+  "Return a fresh list of HT's keys (for LOOP being hash-keys)."
+  (let ((acc nil))
+    (maphash (lambda (k v) (declare (ignore v)) (setq acc (cons k acc))) ht)
+    acc))
+
+(defun %loop-hash-values (ht)
+  "Return a fresh list of HT's values (for LOOP being hash-values)."
+  (let ((acc nil))
+    (maphash (lambda (k v) (declare (ignore k)) (setq acc (cons v acc))) ht)
+    acc))
+
 (defun %loop-parse-for (rest)
   "Parse a FOR clause: returns (cons iter-record rest-after).
    Recognised: in LIST | on LIST | from N [{to|below|downto|above} M]
-   [by S] | = INIT [then NEXT] | across VEC."
+   [by S] | = INIT [then NEXT] | across VEC |
+   being {the|each} {hash-keys|hash-values} {of|in} HT."
   (let ((var (car rest))
         (rs (cdr rest)))
     (let ((kw (car rs)))
       (cond
+        ;; BEING {THE|EACH} {HASH-KEY[S]|HASH-VALUE[S]} {OF|IN} HT.
+        ;; (Symbol iteration variants are handled elsewhere.)  We strip
+        ;; the optional USING clause that may trail HT.
+        ((%loop-kw= kw "BEING")
+         (let ((tail (cdr rs)))
+           ;; skip THE / EACH
+           (when (or (%loop-kw= (car tail) "THE") (%loop-kw= (car tail) "EACH"))
+             (setq tail (cdr tail)))
+           (let ((what (car tail))
+                 (after (cdr tail)))
+             ;; skip OF / IN
+             (when (or (%loop-kw= (car after) "OF") (%loop-kw= (car after) "IN"))
+               (setq after (cdr after)))
+             (let ((ht-form (car after))
+                   (rest2 (cdr after)))
+               ;; optional USING (hash-value V) / (hash-key K) — skip it.
+               (when (%loop-kw= (car rest2) "USING")
+                 (setq rest2 (cddr rest2)))
+               (cond
+                 ((or (%loop-kw= what "HASH-KEY") (%loop-kw= what "HASH-KEYS"))
+                  (cons (list :for-in var (list '%loop-hash-keys ht-form)) rest2))
+                 ((or (%loop-kw= what "HASH-VALUE") (%loop-kw= what "HASH-VALUES"))
+                  (cons (list :for-in var (list '%loop-hash-values ht-form)) rest2))
+                 (t
+                  ;; Unsupported BEING target — degrade to empty iteration.
+                  (cons (list :for-in var nil) rest2)))))))
         ((%loop-kw= kw "IN")
          (cons (list :for-in var (cadr rs)) (cddr rs)))
         ((%loop-kw= kw "ON")
@@ -1542,7 +1657,7 @@
       ;; Run initially with WITH bindings in scope.
       (let ((iter-env env))
         (dolist (wb with-bindings)
-          (setq iter-env (%env-extend (car wb) (cdr wb) iter-env)))
+          (setq iter-env (%env-extend-pair wb iter-env)))
         (dolist (f initial) (%eval-in-env f iter-env)))
       ;; Main loop.
       (handler-case
@@ -1553,7 +1668,7 @@
               ;; carrying the freshly-stepped user-facing vars + WITH.
               (let ((step-env env))
                 (dolist (wb with-bindings)
-                  (setq step-env (%env-extend (car wb) (cdr wb) step-env)))
+                  (setq step-env (%env-extend-pair wb step-env)))
                 ;; Short-circuit on first iter that signals stop, so a
                 ;; later for-eq doesn't try to evaluate `init` in a
                 ;; step-env where the prior for-clause's var was never
@@ -1599,7 +1714,7 @@
       ;; have returned via default-accum.
       (let ((fin-env env))
         (dolist (wb with-bindings)
-          (setq fin-env (%env-extend (car wb) (cdr wb) fin-env)))
+          (setq fin-env (%env-extend-pair wb fin-env)))
         (dolist (a accums)
           (let* ((nm (car a))
                  (sk (cadr a))
@@ -1689,14 +1804,17 @@
              nil
              (progn
                (rplaca (cddr st) (cdr lst))   ; advance remaining
-               (cons (%env-extend var (car lst) env) nil)))))
+               ;; VAR may be a destructuring pattern, e.g.
+               ;; `(for (kw . args) in alist)` — bind via the pattern
+               ;; walker so a cons VAR destructures the element.
+               (cons (%loop-bind-pattern var (car lst) env) nil)))))
       ((eq kind :for-on)
        (let ((var (cadr st)) (lst (caddr st)))
          (if (null lst)
              nil
              (progn
                (rplaca (cddr st) (cdr lst))
-               (cons (%env-extend var lst env) nil)))))
+               (cons (%loop-bind-pattern var lst env) nil)))))
       ((eq kind :for-across)
        (let* ((var (cadr st))
               (i (caddr st))

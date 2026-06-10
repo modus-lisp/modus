@@ -16,7 +16,7 @@
 (defvar *g-fail-n* 0)
 (defvar *g-tick* 0)
 
-(let ((s (open "/home/claude/modus/vendor/asdf/asdf.lisp" :direction :input)))
+(let ((s (open "/home/claude/modus/.claude/worktrees/agent-a69a0a5d9add61f11/vendor/asdf/asdf.lisp" :direction :input)))
   (loop
     (let ((form (handler-case (read s nil :%gauntlet-eof)
                   (t (c) :%gauntlet-readerr))))

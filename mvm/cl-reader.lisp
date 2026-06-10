@@ -373,14 +373,38 @@
         nil)))
 
 (defun %read-internal (stream eof-error-p eof-value recursive-p)
-  "Internal read function."
-  (let ((ch (%read-skip-whitespace stream)))
-    (if (null ch)
-        (if eof-error-p (%reader-error "end of file during read") eof-value)
-        (let ((macro-fn (%read-check-macro ch)))
-          (if macro-fn
-              (%read-macro-dispatch-simple macro-fn ch stream *readtable*)
-              (%read-as-token ch stream *readtable*))))))
+  "Internal read function.
+
+   No-value protocol (2026-06-10): reader macros that produce nothing —
+   #+/#- with a failed feature test, #| |# block comments — return the
+   :%rdr-no-value% sentinel instead of recursively reading the next
+   form.  The old recursion broke whenever the suppressed form was the
+   LAST element of a list: the recursive read hit the closing paren and
+   signaled (uiop is full of trailing #+clisp/#+clozure elements).
+   Here we LOOP past no-value results; when the next char is a close
+   paren we return the sentinel so %read-list/%read-vector/
+   read-delimited-list can drop it and close normally; at EOF we honor
+   eof-error-p/eof-value, so toplevel callers never see the sentinel."
+  (loop
+    (let ((ch (%read-skip-whitespace stream)))
+      (when (null ch)
+        (return (if eof-error-p (%reader-error "end of file during read") eof-value)))
+      (let* ((macro-fn (%read-check-macro ch))
+             (result (if macro-fn
+                         (%read-macro-dispatch-simple macro-fn ch stream *readtable*)
+                         (%read-as-token ch stream *readtable*))))
+        (if (eq result :%rdr-no-value%)
+            (let ((next (%read-skip-whitespace stream)))
+              (cond
+                ((null next)
+                 (return (if eof-error-p
+                             (%reader-error "end of file during read")
+                             eof-value)))
+                ((eql next #\))
+                 (unread-char next stream)
+                 (return :%rdr-no-value%))
+                (t (unread-char next stream))))
+            (return result))))))
 
 (defun %read-after-ws2 (ch stream eof-error-p eof-value)
   "Dispatch after whitespace skip."
@@ -923,15 +947,26 @@
            (let ((sym-name (%substring name-str sym-start len))
                  (pkg (find-package pkg-name)))
              (if (null pkg)
-                 (%reader-error "package not found")
-                 (if double-colon
-                     ;; pkg::sym — internal access, just intern
-                     (intern sym-name pkg)
-                     ;; pkg:sym — external access
-                     (multiple-value-bind (sym status) (find-symbol sym-name pkg)
-                       (if sym sym
-                           ;; Not found — intern anyway for robustness
-                           (intern sym-name pkg))))))))))))
+                 ;; CLHS 2.3.2 + 2.4.8.17: under *read-suppress* token
+                 ;; interpretation is suppressed — an unknown package
+                 ;; must NOT signal.  ASDF/uiop rely on this constantly:
+                 ;; #+clisp (system::setf-function …) must skip cleanly
+                 ;; on non-clisp.  Result is discarded, NIL suffices.
+                 (if *read-suppress*
+                     nil
+                     (%reader-error "package not found"))
+                 ;; Both pkg::sym and pkg:sym intern directly.  The
+                 ;; single-colon branch MUST NOT call (find-symbol name
+                 ;; pkg): cl-reader compiles before cl-packages, so that
+                 ;; call site bound against prelude's 1-arg find-symbol
+                 ;; and compile-call baked an UNCONDITIONAL arity
+                 ;; program-error into the branch (last-defun-wins fixes
+                 ;; addresses at link, not compile-time arity decisions).
+                 ;; Every single-colon read — even cl:car — signaled.
+                 ;; intern is find-or-create, which matches the previous
+                 ;; intended fallback ("intern anyway for robustness");
+                 ;; strict external-only enforcement is deferred.
+                 (intern sym-name pkg)))))))))
 
 ;;; --- List reader ---
 
@@ -980,15 +1015,19 @@
                (unread-char next stream)
                (unread-char ch stream)
                (let ((obj (%read-internal stream t nil t)))
-                 (when (not *read-suppress*)
+                 (when (and (not *read-suppress*)
+                            (not (eq obj :%rdr-no-value%)))
                    (let ((new-cons (list obj)))
                      (if tail (progn (set-cdr tail new-cons) (setq tail new-cons))
                          (progn (setq result new-cons) (setq tail new-cons))))))))))
-        ;; Not close paren and not dot — unread and read an object
+        ;; Not close paren and not dot — unread and read an object.
+        ;; :%rdr-no-value% elements (trailing #+failed-form / #|comment|#
+        ;; before the close paren) are dropped — see %read-internal.
         (when (not (eql ch #\.))
           (unread-char ch stream)
           (let ((obj (%read-internal stream t nil t)))
-            (when (not *read-suppress*)
+            (when (and (not *read-suppress*)
+                       (not (eq obj :%rdr-no-value%)))
               (let ((new-cons (list obj)))
                 (if tail (progn (set-cdr tail new-cons) (setq tail new-cons))
                     (progn (setq result new-cons) (setq tail new-cons)))))))))))
@@ -1271,10 +1310,12 @@
         ;; #: — uninterned symbol
         ((= code 58)  ; :
          (%read-uninterned-symbol stream rt))
-        ;; #| — block comment
+        ;; #| — block comment: no-value sentinel (see %read-internal).
+        ;; The old recursive read broke on `(foo #|c|#)` — trailing
+        ;; comment before the close paren.
         ((= code 124) ; |
          (%skip-block-comment stream)
-         (%read-internal stream t nil nil))
+         :%rdr-no-value%)
         ;; #+ — feature read
         ((= code 43)  ; +
          (%read-feature stream t))
@@ -1434,10 +1475,12 @@
                             (aset v i last-elt))
                         (setq i (+ i 1)))
                       (return v)))))))
-        ;; Read element
+        ;; Read element — drop :%rdr-no-value% (trailing #+failed /
+        ;; #|comment|# before the close paren; see %read-internal).
         (unread-char ch stream)
         (let ((obj (%read-internal stream t nil t)))
-          (setq elements (cons obj elements)))))))
+          (unless (eq obj :%rdr-no-value%)
+            (setq elements (cons obj elements))))))))
 
 (defun %read-character (stream)
   "Read #\\ character."
@@ -1529,12 +1572,14 @@
       ((eq present include-if-present)
        (%read-internal stream t nil t))
       (t
-       ;; Skip the next form under *read-suppress*, then recursively
-       ;; read the form AFTER it — this is what makes
-       ;; `#-X foo bar` return `bar`.
+       ;; Skip the next form under *read-suppress*, then return the
+       ;; no-value sentinel.  %read-internal's loop continues to the
+       ;; following form (making `#-X foo bar` return `bar`) and the
+       ;; list readers drop the sentinel when the suppressed form was
+       ;; the last element before a close paren.
        (let ((*read-suppress* t))
          (%read-internal stream t nil t))
-       (%read-internal stream t nil t)))))
+       :%rdr-no-value%))))
 
 (defun %feature-name-eq (a b)
   "Compare two feature designators.  CLHS says #+ matches with EQ on
@@ -1747,10 +1792,12 @@
             (unless (%whitespace-char-p ch) (return nil)))
           (when (eql ch char)
             (return (nreverse result)))
-          ;; Read an object
+          ;; Read an object — drop :%rdr-no-value% sentinel elements
+          ;; (trailing suppressed forms; see %read-internal).
           (unread-char ch s)
           (let ((obj (%read-internal s t nil t)))
-            (setq result (cons obj result))))))))
+            (unless (eq obj :%rdr-no-value%)
+              (setq result (cons obj result)))))))))
 
 (defun read-from-string (str &rest args)
   "Read one Lisp object from STR."

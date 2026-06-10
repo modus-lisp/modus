@@ -3791,8 +3791,8 @@
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
   ;; Init file I/O scratch buffers (defvar defaults not applied without init-all-globals)
-  (setq *cstr-scratch* #x1DF00000)
-  (setq *io-buf-addr*  #x1DE00000)
+  (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
+  (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
   (setq *scratch-mmapped* nil)
   (setq *filesystem* nil)
 

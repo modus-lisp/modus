@@ -2144,6 +2144,22 @@
 (defun %diag-or-bc (a &optional (b 1) &rest c) (declare (ignore a)) (list b c))
 (defun %diag-or-ac (a &optional (b 1) &rest c) (declare (ignore b)) (list a c))
 
+;;; CLOS initform-environment capture probe classes (Target 1b).
+;;; class-11 shape: initform reads a LEXICAL var captured at defclass time.
+(let ((probe-lex-x 77))
+  (defclass probe-lex-class ()
+    ((s1 :initform probe-lex-x :initarg :s1))))
+;;; class-12 shape: initform calls an FLET-local fn captured at defclass time.
+(flet ((probe-flet-f () 'flet-val))
+  (defclass probe-flet-class ()
+    ((s1 :initform (probe-flet-f) :initarg :s1))))
+;;; class-21 shape: default-initargs with value forms, two slots aliased by
+;;; multiple :initarg.
+(defclass probe-di-class ()
+  ((s1 :initarg :s1 :initarg :s1b)
+   (s2 :initarg :s1b :initarg :s2))
+  (:default-initargs :s1 99 :s1b 88))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -2837,6 +2853,33 @@
   (run-test 9934 (lambda () (%diag-or-ab 'x)) '(x 1))
   (run-test 9935 (lambda () (%diag-or-bc 'x)) '(1 nil))
   (run-test 9936 (lambda () (%diag-or-ac 'x)) '(x nil))
+  ;; Target 1b: initform-environment capture (defclass-01 class-11/12/21).
+  ;; 9937 — lexical let capture: initform reads probe-lex-x (=77).
+  (run-test 9937 (lambda () (slot-value (make-instance 'probe-lex-class) 's1)) 77)
+  ;; 9938 — initarg overrides the lexical initform.
+  (run-test 9938 (lambda () (slot-value (make-instance 'probe-lex-class :s1 5) 's1)) 5)
+  ;; 9939 — flet-local fn capture: initform calls probe-flet-f.
+  (run-test 9939 (lambda () (slot-value (make-instance 'probe-flet-class) 's1)) 'flet-val)
+  ;; 9940/9941 — default-initargs applied to aliased slots (class-21 shape).
+  (run-test 9940 (lambda () (slot-value (make-instance 'probe-di-class) 's1)) 99)
+  (run-test 9941 (lambda () (slot-value (make-instance 'probe-di-class) 's2)) 88)
+  ;; 9942 — supplied initarg suppresses the default-initarg form.
+  (run-test 9942 (lambda () (slot-value (make-instance 'probe-di-class :s1 7) 's1)) 7)
+  ;; 9943/9944 — multi-slot initarg (class-21.4 shape): :s1b names BOTH s1 and
+  ;; s2 (s1 has :initarg :s1b, s2 has :initarg :s1b).  Supplying :s1b 'y sets
+  ;; both slots; the :s1 default-initarg must NOT then override s1.
+  (run-test 9943 (lambda () (slot-value (make-instance 'probe-di-class :s1b 'y) 's1)) 'y)
+  (run-test 9944 (lambda () (slot-value (make-instance 'probe-di-class :s1b 'y) 's2)) 'y)
+  ;; 9945 — bare shared-initialize must NOT apply default-initargs (CLHS
+  ;; 7.1.4): allocate-instance + (shared-initialize obj t) leaves s1/s2 the
+  ;; default-initarg-only slots UNBOUND (probe-di-class slots have no
+  ;; :initform, only default-initargs, so they stay unbound).
+  (run-test 9945
+    (lambda ()
+      (let ((obj (allocate-instance (find-class 'probe-di-class))))
+        (shared-initialize obj t)
+        (notnot (slot-boundp obj 's1))))
+    'nil)
   )
 
 ;;; ============================================================

@@ -28,6 +28,12 @@
 ;; the 0-arity thunks.
 (defvar *clos-default-initargs* nil)
 
+;; T only while a MAKE-INSTANCE entry path runs SHARED-INITIALIZE, so the
+;; default-initargs get applied.  Bare SHARED-INITIALIZE / REINITIALIZE-
+;; INSTANCE leave it NIL (defvar default — see CLAUDE.md item 7) so they do
+;; NOT apply default-initargs (CLHS 7.1.4).
+(defvar *clos-applying-defaults* nil)
+
 ;; slot-unbound methods: list of (class-name slot-spec fn)
 ;; slot-spec: nil = any slot; symbol = that specific slot name
 (defvar *slot-unbound-methods* nil)
@@ -515,6 +521,46 @@
             (when found (return found)))
           (setq cur (cdr cur)))))))
 
+(defun %clos-initarg-lookup-all-1 (class-name initarg-key acc)
+  "Collect ALL slot-names INITARG-KEY maps to in just CLASS-NAME's initarg
+   map (no super walk), prepending onto ACC.  Per CLHS 7.1.4 a single
+   initarg may initialize several slots (e.g. slot s1 and s2 both declare
+   :initarg :s1b) — every such slot must be set."
+  (let ((info (%clos-slot-info-for class-name)))
+    (when (null info) (return-from %clos-initarg-lookup-all-1 acc))
+    (let ((cur (car info)))
+      (loop
+        (when (null cur) (return acc))
+        (let* ((entry (car cur))
+               (stored-key (car entry)))
+          (when (cond
+                  ((eq stored-key initarg-key) t)
+                  ((and (%native-mvm-sym-p stored-key)
+                        (%native-mvm-sym-p initarg-key))
+                   (= (%native-mvm-sym-hash stored-key)
+                      (%native-mvm-sym-hash initarg-key)))
+                  ((and (%cl-sym-p stored-key) (%cl-sym-p initarg-key))
+                   (string-equal (%cl-sym-name stored-key)
+                                 (%cl-sym-name initarg-key)))
+                  (t nil))
+            (let ((sn (cdr entry)))
+              (when (null (member sn acc :test #'eq))
+                (setq acc (cons sn acc))))))
+        (setq cur (cdr cur))))))
+
+(defun %clos-initarg-to-slots (class-name initarg-key)
+  "Map INITARG-KEY to the LIST of all slot-names it initializes, walking
+   the class's CPL.  CLHS 7.1.4: one initarg may set several slots."
+  (let ((acc (%clos-initarg-lookup-all-1 class-name initarg-key nil)))
+    (let ((cls (%find-clos-class class-name)))
+      (when cls
+        (let ((cur (cdr (aref cls 4))))
+          (loop
+            (when (null cur) (return nil))
+            (setq acc (%clos-initarg-lookup-all-1 (car cur) initarg-key acc))
+            (setq cur (cdr cur))))))
+    (nreverse acc)))
+
 (defun %clos-initform-thunk-1 (class-name slot-name)
   "Look up initform thunk for SLOT-NAME on just CLASS-NAME (no super walk)."
   (let ((info (%clos-slot-info-for class-name)))
@@ -653,7 +699,10 @@
     (t
      (let* ((class-or-name (car args))
             (initargs (cdr args))
-            (inst (%make-instance class-or-name)))
+            (inst (%make-instance class-or-name))
+            ;; make-instance applies default-initargs (CLHS 7.1.4); bind
+            ;; the flag so the shared-initialize default body picks them up.
+            (*clos-applying-defaults* t))
        (when (null inst) (return-from make-instance nil))
        (%dispatch-initialize-instance (cons inst initargs))
        inst))))

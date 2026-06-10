@@ -2659,16 +2659,22 @@
           (when (null (cdr cur)) (return nil))
           (let* ((key (car cur))
                  (val (car (cdr cur)))
-                 (slot-nm (%clos-initarg-to-slot class-name key)))
-            (when (and slot-nm (not (member slot-nm set-slots)))
-              (let ((idx (%clos-slot-index cls slot-nm)))
-                ;; idx is -1 (not found) or 0..n-1 — use `(>= idx 0)`
-                ;; to filter not-found.  See %clos-slot-index docstring
-                ;; for the AArch64 rationale (the previous nil sentinel
-                ;; collided with fixnum 0 on slot 0).
-                (when (and (>= idx 0) (< (+ 2 idx) inst-len))
-                  (aset instance (+ 2 idx) val)
-                  (setq set-slots (cons slot-nm set-slots))))))
+                 ;; CLHS 7.1.4: one initarg may name several slots.
+                 (slots (%clos-initarg-to-slots class-name key)))
+            (let ((sc slots))
+              (loop
+                (when (null sc) (return nil))
+                (let ((slot-nm (car sc)))
+                  (when (not (member slot-nm set-slots))
+                    (let ((idx (%clos-slot-index cls slot-nm)))
+                      ;; idx is -1 (not found) or 0..n-1 — use `(>= idx 0)`
+                      ;; to filter not-found.  See %clos-slot-index docstring
+                      ;; for the AArch64 rationale (the previous nil sentinel
+                      ;; collided with fixnum 0 on slot 0).
+                      (when (and (>= idx 0) (< (+ 2 idx) inst-len))
+                        (aset instance (+ 2 idx) val)
+                        (setq set-slots (cons slot-nm set-slots))))))
+                (setq sc (cdr sc)))))
           (setq cur (cdr (cdr cur)))))
       ;; 2. Then apply initforms for slots in slot-names that are still unbound.
       (let ((sn slot-list) (idx 0))
@@ -2713,10 +2719,17 @@
       (when (or (null cur) (null (cdr cur))) (return acc))
       (let* ((key (car cur))
              (val (car (cdr cur)))
-             (slot-nm (%clos-initarg-to-slot class-name key)))
-        (when (and slot-nm (null (member slot-nm acc :test #'eq)))
-          (set-slot-value instance slot-nm val)
-          (setq acc (cons slot-nm acc))))
+             ;; CLHS 7.1.4: one initarg may name several slots; set ALL of
+             ;; them (leftmost initarg wins per slot via the acc guard).
+             (slots (%clos-initarg-to-slots class-name key)))
+        (let ((sc slots))
+          (loop
+            (when (null sc) (return nil))
+            (let ((slot-nm (car sc)))
+              (when (null (member slot-nm acc :test #'eq))
+                (set-slot-value instance slot-nm val)
+                (setq acc (cons slot-nm acc))))
+            (setq sc (cdr sc)))))
       (setq cur (cdr (cdr cur))))))
 
 (defun %shared-init-default-spread (args)
@@ -2749,21 +2762,37 @@
         ;; initargs, eval the thunk and apply it.  Default-initargs whose
         ;; key maps to a slot suppress that slot's :initform via the
         ;; set-slots accumulator.
-        (let ((di-entries (%clos-default-initargs-for-class class-name)))
-          (let ((cur di-entries))
-            (loop
-              (when (null cur) (return nil))
-              (let* ((entry (car cur))
-                     (k (car entry))
-                     (thunk (cdr entry))
-                     (explicit-supplied (%initargs-has-key-p initargs k)))
-                (unless explicit-supplied
-                  (let ((val (funcall thunk)))
-                    (let ((slot-nm (%clos-initarg-to-slot class-name k)))
-                      (when (and slot-nm (null (member slot-nm set-slots :test #'eq)))
-                        (set-slot-value instance slot-nm val)
-                        (setq set-slots (cons slot-nm set-slots)))))))
-              (setq cur (cdr cur)))))
+        ;;
+        ;; CLHS 7.1.4: default-initargs are part of MAKE-INSTANCE's
+        ;; "defaulted initialization argument list" — they are NOT applied
+        ;; by a bare SHARED-INITIALIZE / REINITIALIZE-INSTANCE call.  Only
+        ;; the make-instance entry paths bind *clos-applying-defaults* to T
+        ;; (shared-initialize.2.1: (shared-initialize obj t) must leave slot
+        ;; c — whose only initform source is (:default-initargs :c 100) —
+        ;; UNBOUND).
+        (when *clos-applying-defaults*
+          (let ((di-entries (%clos-default-initargs-for-class class-name)))
+            (let ((cur di-entries))
+              (loop
+                (when (null cur) (return nil))
+                (let* ((entry (car cur))
+                       (k (car entry))
+                       (thunk (cdr entry))
+                       (explicit-supplied (%initargs-has-key-p initargs k)))
+                  (unless explicit-supplied
+                    (let ((val (funcall thunk))
+                          ;; CLHS 7.1.4: a default-initarg's key may name
+                          ;; several slots; set ALL still-unset ones.
+                          (slots (%clos-initarg-to-slots class-name k)))
+                      (let ((sc slots))
+                        (loop
+                          (when (null sc) (return nil))
+                          (let ((slot-nm (car sc)))
+                            (when (null (member slot-nm set-slots :test #'eq))
+                              (set-slot-value instance slot-nm val)
+                              (setq set-slots (cons slot-nm set-slots))))
+                          (setq sc (cdr sc)))))))
+                (setq cur (cdr cur))))))
         ;; Step 3: apply initforms for slots in slot-names still unbound.
         (let ((sn (aref cls 2)) (idx 0))
           (loop

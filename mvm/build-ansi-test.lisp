@@ -2467,8 +2467,11 @@
             (class-arg (rewrite-reader-forms class-arg-raw))
             (rest-args (cddr form)))
        (if (null rest-args)
-           ;; No initargs: still want initforms applied.
-           `(let ((%clos-make-instance-tmp (%make-instance ,class-arg)))
+           ;; No initargs: still want initforms applied.  Bind
+           ;; *clos-applying-defaults* T so default-initargs apply (CLHS
+           ;; 7.1.4) — distinguishing make-instance from bare shared-init.
+           `(let ((%clos-make-instance-tmp (%make-instance ,class-arg))
+                  (*clos-applying-defaults* t))
               (%shared-init-default-spread
                 (list %clos-make-instance-tmp t))
               %clos-make-instance-tmp)
@@ -2477,7 +2480,8 @@
            ;; initforms for any unset slots.  Values are recursively
            ;; rewritten so quoted/embedded forms still resolve correctly.
            (let ((rewritten-args (mapcar #'rewrite-reader-forms rest-args)))
-             `(let ((%clos-make-instance-tmp (%make-instance ,class-arg)))
+             `(let ((%clos-make-instance-tmp (%make-instance ,class-arg))
+                    (*clos-applying-defaults* t))
                 (%shared-init-default-spread
                   (list %clos-make-instance-tmp t ,@rewritten-args))
                 %clos-make-instance-tmp)))))
@@ -2743,6 +2747,35 @@
                           (incf n)))
                       (setf start (+ pos (length hu)))))))))
     (error () 0)))
+
+(defun %form-has-clos-reg-p (form)
+  "True if FORM's tree contains a CLOS / package registration call that the
+   defclass / defgeneric / defmethod / defpackage rewriters emit.  Used to
+   decide whether a top-level (let …)/(flet …)-wrapped form must be hoisted
+   into run-init-FILE so its lexical-capturing initform thunks actually run."
+  (cond
+    ((consp form)
+     (if (member (car form)
+                 '(%defclass %register-clos-slot-info %register-clos-direct-slots
+                   %register-clos-class-slots %register-clos-default-initargs
+                   %defgeneric %defmethod %define-condition %defpackage-impl
+                   %register-gf-fn))
+         t
+         (or (%form-has-clos-reg-p (car form))
+             (%form-has-clos-reg-p (cdr form)))))
+    (t nil)))
+
+(defun %form-has-nested-defun-p (form)
+  "True if FORM's tree contains a (defun …) — used to keep let/flet-wrapped
+   defclasses with :reader/:writer/:accessor (which expand to nested defuns)
+   on the top-level write path rather than hoisting into a runtime let."
+  (cond
+    ((consp form)
+     (if (eq (car form) 'defun)
+         t
+         (or (%form-has-nested-defun-p (car form))
+             (%form-has-nested-defun-p (cdr form)))))
+    (t nil)))
 
 (defun load-ansi-chapter (dir files)
   "Transform ANSI test files from DIR into MVM-compatible source.
@@ -3141,6 +3174,37 @@
                            (let ((body (if (eq (car form) 'eval-when)
                                            (cddr form) (cdr form))))
                              (dolist (sub body) (emit-sub sub)))
+                         (if (and (consp form)
+                                  ;; A lexical-binding wrapper around CLOS
+                                  ;; registrations, e.g.
+                                  ;;   (let ((x 7)) (defclass c () ((s :initform x))))
+                                  ;;   (flet ((%f () 'x)) (defclass c () ((s :initform (%f)))))
+                                  ;; The defclass rewriter expands the inner
+                                  ;; defclass to (progn (%defclass ..) (%register-clos-slot-info ..) ..)
+                                  ;; whose initform thunks capture the wrapper's
+                                  ;; lexical vars.  Written as a TOP-LEVEL form it
+                                  ;; would never run (bare metal: toplevel thunks
+                                  ;; don't auto-execute), so the class went
+                                  ;; unregistered (defclass-01 class-11/12).  Push
+                                  ;; the WHOLE wrapper into init-forms so run-init-FILE
+                                  ;; executes it and the captures resolve at runtime.
+                                  (member (car form)
+                                          '(let let* flet labels locally
+                                            symbol-macrolet macrolet))
+                                  (%form-has-clos-reg-p form)
+                                  ;; A reader/writer/accessor expands to a
+                                  ;; nested (defun …); hoisting it into a
+                                  ;; runtime let would NOT define a global fn.
+                                  ;; Skip such forms (none of the targeted
+                                  ;; defclass-01 let/flet cases have readers).
+                                  (not (%form-has-nested-defun-p (cdr form))))
+                             (let ((s (handler-case (format nil "~S" form)
+                                        (error () nil))))
+                               (when (and s
+                                          (not (search "#<" s))
+                                          (not (search "&ENVIRONMENT" s))
+                                          (not (search "STRUCT-TEST-" s)))
+                                 (push s init-forms)))
                            (let ((s (handler-case (format nil "~S" form)
                                       (error () nil))))
                              (when (and s
@@ -3172,7 +3236,7 @@
                                (when (and (consp form)
                                           (member (car form)
                                                   '(%defpackage-impl %defmethod)))
-                                 (push s init-forms))))))))))
+                                 (push s init-forms)))))))))))
               ;; Emit run-init-X — a separate function holding ONLY the init
               ;; forms (defclass / defmethod / setq for defvar's value, etc.).
               ;; run-real-ansi-tests now calls all run-init-* in the PARENT

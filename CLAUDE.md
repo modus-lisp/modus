@@ -96,10 +96,10 @@ runtime/        Runtime type system
 
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,352 tests
-- Ran: 17,257
-- Passed: 14,917 (85.97% overall, 86.44% of those that ran)
-- Failed: 2,340
-- Lost-to-crash: 95
+- Ran: 17,258
+- Passed: 14,973 (86.29% overall, 86.76% of those that ran)
+- Failed: 2,285
+- Lost-to-crash: 94
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

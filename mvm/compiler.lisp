@@ -2369,9 +2369,15 @@
       ((typep form 'ratio)
        (compile-quote form dest))
 
-      ;; Complex number → compile as 0
+      ;; Complex literal #c(r i) → runtime (complex r i) call building the
+      ;; 3-slot %complex-marker array (cl-sequences.lisp).  Previously
+      ;; compiled as integer 0 — so `(funcall gf #c(1.0 2.0))` dispatched
+      ;; the INTEGER/RATIONAL methods (dg-mc.N.6/.8: the :around
+      ;; ((x rational)) matched a "complex" argument).  The realpart/
+      ;; imagpart components are SBCL numbers that compile as ordinary
+      ;; literals (fixnum / boxed float / ratio).
       ((typep form 'complex)
-       (compile-integer 0 dest))
+       (compile-form `(complex ,(realpart form) ,(imagpart form)) env dest))
 
       ;; Unrecognized — warn and compile as nil
       (t
@@ -5079,23 +5085,33 @@
               (string= nm "%CELL-" :end1 6)))))
 
 (defun %flet-functions-capture-vars-p (defs env)
-  "Return T if any function body in DEFS references a CELL variable (one
-   emitted by the let cell-rewrite — name prefix %CELL-) that's bound in
-   ENV's chain — i.e., the FLET/LABELS form needs closure semantics so the
-   captured cell propagates as a heap cell pointer.  Skips function-name
-   refs (mutual recursion targets) by walking only variable refs via
-   %collect-free-vars, and skips ordinary lexical/special captures so a
-   FLET whose body happens to read an outer let var isn't transformed
-   (which would change snapshot-at-creation semantics)."
-  (let ((any-cell-captures nil))
+  "Return T if any function body in DEFS references a variable bound in
+   ENV's chain — the FLET/LABELS needs closure semantics so the captured
+   value reaches the local function.  Skips function-name refs (mutual
+   recursion targets) by walking only variable refs via
+   %collect-free-vars.
+
+   HISTORY (2026-06-10, probes 9864/9867): this used to fire ONLY for
+   %CELL- prefixed vars (cell-rewrite artifacts), on the theory that
+   transforming ordinary lexical captures 'would change
+   snapshot-at-creation semantics'.  That theory had it backwards: the
+   untransformed path compiled the local function as a plain GLOBAL
+   function, so the captured var compiled as a global symbol-value read
+   — NIL for any lexical var.  (let ((fn …)) (flet ((%pf (y)
+   (funcall fn y))) …) called %pf with fn=NIL and died on
+   undefined-function — dg-mc.N.1/.2/.3's crash, map-into's 26 fails.
+   Snapshot-at-creation IS the correct CL semantics for captures that
+   aren't mutated afterwards, and mutation-shared vars are already
+   %CELL- boxed by the let cell-rewrite before this runs."
+  (let ((any-captures nil))
     (dolist (def defs)
       (when (and (consp def) (consp (cdr def)))
         (let* ((fparams (cadr def))
                (param-names (%extract-lambda-param-names fparams))
                (free (%collect-free-vars-list (cddr def) param-names env nil)))
-          (when (some #'%cell-name-p free)
-            (setq any-cell-captures t)))))
-    any-cell-captures))
+          (when free
+            (setq any-captures t)))))
+    any-captures))
 
 (defun compile-flet (defs body env dest &optional labels-p)
   "Compile (flet ((name (params) body) ...) body).

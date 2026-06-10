@@ -548,7 +548,14 @@
 ;;; ============================================================
 
 (defstruct mvm-buffer
-  (bytes (make-array 67108864 :element-type '(unsigned-byte 8)))  ; 64MB fixed-size, position tracks fill
+  ;; 128MB fixed-size, position tracks fill.  Raised from 64MB
+  ;; 2026-06-10: the flet capture-transform fix turns every capturing
+  ;; flet/labels into closure functions, growing the ANSI image's
+  ;; native code past the old cap (INVALID-ARRAY-INDEX at 67108864 in
+  ;; wrap-in-elf64-le).  Linux x64 layout headroom: image loads at
+  ;; 0x400000; even 128MB tops out at ~0x8400000, well below the BSS
+  ;; block at 0x10000000.
+  (bytes (make-array 134217728 :element-type '(unsigned-byte 8)))
   (labels (make-hash-table :test 'eql))     ; label-id → position
   (fixups nil)                               ; list of (position label-id offset-from)
   (position 0))

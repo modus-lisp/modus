@@ -102,6 +102,11 @@
     ((ratiop obj)      'ratio)
     ;; float check — floatp-impl checks for float objects
     ((floatp-impl obj) 'float)
+    ;; complex: 3-slot %complex-marker array (cl-sequences.lisp).
+    ;; Without this case complex args fell through to standard-object
+    ;; and GF methods specialized on COMPLEX / NUMBER never matched
+    ;; (dg-mc.N.6/.8 once complex literals stopped compiling as 0).
+    ((%complex-p obj)  'complex)
     ((consp obj)       'cons)
     (t 'standard-object)))
 
@@ -1800,9 +1805,15 @@
   (let ((comb-name (%mc-name mc))
         (operator (%mc-operator mc))
         (identity-with-one (%mc-identity-with-one mc)))
-    ;; Collect :around and comb-name-qualified methods
+    ;; Collect :around and comb-name-qualified methods.  Any OTHER
+    ;; qualifier (including NIL/unqualified) on an APPLICABLE method is
+    ;; invalid for a short-form combination — CLHS 7.6.6.4 requires the
+    ;; CALL to signal (dg-mc.append.13: a `nonsense`-qualified method
+    ;; only errors for argument classes where it's applicable; calls
+    ;; that don't reach it return normally).
     (let ((around-methods nil)
-          (primary-methods nil))
+          (primary-methods nil)
+          (invalid-methods nil))
       (let ((cur applicable))
         (loop
           (when (null cur) (return nil))
@@ -1819,12 +1830,11 @@
                  ;; EQ (see %find-mc docstring for the cl-eval
                  ;; intern-table caveat).
                  (setq primary-methods (cons m primary-methods)))
-                ;; Primary methods with no qualifier (nil) are NOT
-                ;; valid for a custom short-form combination per
-                ;; CLHS 7.6.6.4 — silently drop them so the empty
-                ;; primary-methods branch below signals.
-                ((null q) nil))))
+                (t
+                 (setq invalid-methods (cons m invalid-methods))))))
           (setq cur (cdr cur))))
+      (when invalid-methods
+        (error "invalid method qualifier for method combination"))
       (setq around-methods  (nreverse around-methods))
       (setq primary-methods (nreverse primary-methods))
       ;; :most-specific-last — reverse the primary order (collected

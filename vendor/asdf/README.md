@@ -31,34 +31,75 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of commit acf0850)
+## Gauntlet frontier (as of 2026-06-10)
 
-Reaches form 26 (uiop/utility section), 1 fail + a downstream read desync.
-Both stem from the SAME root: form 11 (`define-package :uiop/common-lisp`)
-fails inside its `:use-reexport :common-lisp` path.
+Reaches form 11 (`define-package :uiop/common-lisp`); fails there and the
+reader desyncs (form 12 = `(in-package :uiop/common-lisp)` READ-ERRORs
+because form 11's mid-execution fault corrupts global package state).
 
-- **FAILFORM 11 — reexport `&REST`**: `ensure-package`'s reexport loop
-  re-exports every external CL symbol.  `find-symbol* "&REST" pkg` SIGNALS
-  because `&REST` is INTERNAL (not external) in Modus's COMMON-LISP package,
-  so it isn't inherited by a use-CL package and find-symbol* hits its
-  error path.  Root: `%install-runtime-cl-macros` (macro lambda-lists
-  contain `&rest`) re-interns `&REST` into CL as internal AFTER
-  `%export-standard-cl-symbols` ran, clobbering its :external status.
-  Re-running `%export-standard-cl-symbols` late fixes `&REST`'s status —
-  BUT then the reexport proceeds further and the symbol-rehoming /
-  shadowing-import machinery (rehome-symbol, nuke-symbol, ensure-symbol
-  recycle) corrupts reader state -> READ-ERROR after form 11.  So the
-  real work is making define-package's full reexport+rehome path correct,
-  not just the `&REST` status.  `&BODY`/`&OPTIONAL`/`&KEY`/`&AUX` are
-  already :external and reexport fine.
+### `&REST` :internal status — FIXED (shared layer)
 
-- **READ-ERROR after form 26**: a cascade of the above — uiop/utility
-  `:use`s uiop/common-lisp, whose half-built reexport leaves symbol
-  resolution inconsistent.  Form 27 (`ensure-function`/`access-at`) reads
-  fine in isolation but desyncs in cumulative state.  Likely resolves once
-  form 11 succeeds.
+The first sub-blocker was that `find-symbol* "&REST"` signalled because
+`&REST` was :INTERNAL (not :external) in Modus's COMMON-LISP package.
+`%export-standard-cl-symbols` exports it at boot, but a later boot-time
+read of a `&rest`-bearing form demotes it back to :internal (every OTHER
+lambda-list keyword — `&BODY`/`&OPTIONAL`/`&KEY`/`&AUX`/`&WHOLE`/
+`&ALLOW-OTHER-KEYS`/`&ENVIRONMENT` — stays :external; only `&REST` flips).
+The exact demotion site was not pinned down, but the fix is idempotent:
+**`%install-runtime-cl-macros` (mvm/runtime-cl-macros.lisp) now re-runs
+`%export-standard-cl-symbols` at its tail.**  It runs at the end of boot in
+BOTH build-generic and build-ansi-test, so `&REST` is now :external
+everywhere (also a latent ANSI-conformance fix — CLHS requires it).
+Verified: `(find-symbol "&REST" 'cl)` => `:external`.
 
-### Runtime-EVAL interp bug found (not yet fixed)
+### TRUE NEXT BLOCKER — fault during `define-package` reexport (allocation/GC layer)
+
+With `&REST` fixed, form 11's `:use-reexport :common-lisp` path now runs
+further and faults.  The fault is NOT in the package layer — every uiop
+helper (`import*`, `export*`, `ensure-imported`, `find-symbol*`) works
+correctly over all 979 CL externals in isolation; Modus's own
+`intern`+`export` over all 979 into a CL-using package works too.  The
+fault appears only **cumulatively**, at ~symbol 404, with `(%gc-count)`
+still 0.  The signalled "condition" is a wild 2-element vector whose
+slot 0 is a corrupted pointer printed `#<?N>` (N varies run-to-run: 47,
+79, 111, 255) — the signature of heap corruption / a stale pointer, i.e.
+an allocation/GC bug, NOT a Lisp-level error.
+
+Minimal reproducer (no uiop needed), in `mvm/gc.lisp`/translator terms:
+
+```lisp
+;; <generic-binary> this.lisp
+(handler-case
+    (let ((i 0))
+      (loop (when (>= i 30000) (return :ok))
+            (make-string 20000)            ; ~460MB total -> crosses GC midpoint
+            (setq i (+ i 1))))
+  (t (c) (write-string-serial "CAUGHT")))
+(write-object (%gc-count))                 ; => 1, then a fault was caught
+```
+
+Result: `gc-count` increments to exactly **1** (the Cheney copy completes
+and bumps the counter at gc.lisp:327), THEN a fault is signalled and
+caught.  So GC's copy finishes but **resumption faults** — a live root
+(env / args / `*%eval-escape-stack*` / a large object near a space
+boundary) was not forwarded, leaving a stale from-space pointer that
+faults on next deref.  Notes:
+  - With small allocations (`make-string 1000`) the first several GCs
+    survive (probe reached gc=4); with large objects (`make-string 20000`)
+    the FIRST GC faults.  Suggests the Cheney copy of large objects (or
+    objects landing near the from/to boundary) is the trigger.
+  - The `define-package` fault shows `gc-count`=0 at the crash, so it may
+    be a SECOND, distinct bug: an `alloc-obj`-without-preceding-`gc-check`
+    site (cf. MEMORY `reference_make_closure_gc_check`) that writes past
+    R14 and corrupts an object header.  Both live in the GC / translate-x64
+    layer (off-limits to the packages agent) and should be handed to the
+    compiler/translator track.
+
+This is the wall: until GC survives a collection triggered from inside a
+loaded script's call graph, define-package's 979-symbol reexport cannot
+complete and will corrupt global state when it faults mid-way.
+
+### Runtime-EVAL interp bug (still open, lower priority)
 
 `(let ((x ..)) (tagbody BODY))` as the **last form inside a simple `loop`**
 infinite-loops (the loop restarts instead of continuing).  Worked around in
@@ -66,3 +107,10 @@ the do-symbols runtime macros by using `progn` instead of `tagbody` for the
 body, but the underlying `%eval` LOOP/LET/TAGBODY interaction in
 mvm/cl-eval.lisp should be root-caused (it breaks any runtime `do-symbols`
 whose body uses `go`).
+
+### Gauntlet runner improvements
+
+`gauntlet.lisp` now: (1) points at THIS worktree's asdf.lisp, and (2) on
+FAILFORM, prints the condition (type-name + format-control if it's a
+recognised `%condition-p`, else the raw object) after ` :: ` so the
+failure mode is visible without a separate probe.

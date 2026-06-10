@@ -16,7 +16,8 @@
 (defvar *g-fail-n* 0)
 (defvar *g-tick* 0)
 
-(let ((s (open "/home/claude/modus/.claude/worktrees/agent-a69a0a5d9add61f11/vendor/asdf/asdf.lisp" :direction :input)))
+;; Relative to CWD (run from the worktree root) so this is worktree-agnostic.
+(let ((s (open "vendor/asdf/asdf.lisp" :direction :input)))
   (loop
     (let ((form (handler-case (read s nil :%gauntlet-eof)
                   (t (c) :%gauntlet-readerr))))
@@ -55,6 +56,17 @@
                                     (list (car form) (cadr form))
                                     (car form))
                                 form))
+              (write-string-serial " :: ")
+              (handler-case
+                  (if (%condition-p c)
+                      (progn
+                        (write-object (%condition-type-name c))
+                        (write-string-serial " | ")
+                        (handler-case
+                            (write-object (simple-condition-format-control c))
+                          (t (c2) (write-string-serial "<no-fc>"))))
+                      (write-object c))
+                (t (c2) (write-string-serial "<err>")))
               (terpri)))))))
   (close s))
 

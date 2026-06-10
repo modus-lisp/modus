@@ -351,4 +351,14 @@
       (%rt-install-one (nth 37 lst))
       (%rt-install-one (nth 38 lst))
       (%rt-install-one (nth 39 lst))
-      (%rt-install-one (nth 40 lst)))))
+      (%rt-install-one (nth 40 lst))))
+  ;; Re-assert standard CL symbol exports.  %init-packages exports them
+  ;; at boot, but a subsequent boot-time read of a &rest-bearing form
+  ;; demotes CL:&REST from :external back to :internal (other lambda-list
+  ;; keywords stay :external).  CLHS requires &REST be :external in
+  ;; COMMON-LISP; an :internal &REST is not inherited by use-CL packages,
+  ;; so uiop's define-package :use-reexport path — which find-symbol*'s
+  ;; every CL external — signals on &REST.  Re-running the export is
+  ;; idempotent (only ever promotes :internal -> :external for the
+  ;; standard names) and leaves reader / package state otherwise intact.
+  (handler-case (%export-standard-cl-symbols) (t (c) nil)))

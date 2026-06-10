@@ -192,6 +192,32 @@
        (list 'handler-case (cons 'progn body) (list t (list 'c) (list 'values nil 'c))))"
     "(defmacro with-standard-io-syntax (&rest body) (cons 'progn body))"
 
+    ;; TYPECASE / ETYPECASE — expand to (let ((g KEY)) (cond ((typep g 'T1) ...) ...)).
+    ;; Each clause's type spec is quoted and tested with TYPEP.  An OTHERWISE/T
+    ;; clause becomes the cond's (t …).  ETYPECASE adds a type-error fallthrough.
+    ;; uiop/package's reify-package uses (etypecase pkg ((eql (find-package :cl)) …)).
+    "(defmacro typecase (key &rest clauses)
+       (let ((g (gensym \"TC\")))
+         (list 'let (list (list g key))
+               (cons 'cond
+                 (mapcar (lambda (cl)
+                           (let ((ty (car cl)) (body (cdr cl)))
+                             (if (or (eq ty t) (and (symbolp ty) (string= (symbol-name ty) \"OTHERWISE\")))
+                                 (cons t body)
+                                 (cons (list 'typep g (list 'quote ty)) body))))
+                         clauses)))))"
+
+    "(defmacro etypecase (key &rest clauses)
+       (let ((g (gensym \"ETC\")))
+         (list 'let (list (list g key))
+               (append
+                 (cons 'cond
+                   (mapcar (lambda (cl)
+                             (let ((ty (car cl)) (body (cdr cl)))
+                               (cons (list 'typep g (list 'quote ty)) body)))
+                           clauses))
+                 (list (list t (list 'error \"ETYPECASE: no clause matches\")))))))"
+
     ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc]).
     ;; Defines NAME as a macro: (name place a b …) => (setf place (fn place a b …)).
     ;; We ignore the lambda-list's structure and capture all post-place args
@@ -319,4 +345,10 @@
       (%rt-install-one (nth 31 lst))
       (%rt-install-one (nth 32 lst))
       (%rt-install-one (nth 33 lst))
-      (%rt-install-one (nth 34 lst)))))
+      (%rt-install-one (nth 34 lst))
+      (%rt-install-one (nth 35 lst))
+      (%rt-install-one (nth 36 lst))
+      (%rt-install-one (nth 37 lst))
+      (%rt-install-one (nth 38 lst))
+      (%rt-install-one (nth 39 lst))
+      (%rt-install-one (nth 40 lst)))))

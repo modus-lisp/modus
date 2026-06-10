@@ -2190,10 +2190,26 @@
    UIOP/UTILITY::VECTOR, when define-package inheritance hasn't exposed
    CL:VECTOR) is a distinct object from Modus's compiled 'VECTOR, so
    `(eq head 'vector)` fails and coerce silently returns OBJECT unchanged.
-   Type specifiers compare by name (CLHS), so re-key by name."
+   Type specifiers compare by name (CLHS), so re-key by name.
+
+   Pass Modus's OWN type symbols (and the EQ-recognised built-ins)
+   through untouched so the compiled hot path is byte-for-byte unchanged
+   — only re-key a symbol that the downstream EQ checks would miss
+   (i.e. NOT already EQ to the built-in literal of its name)."
   (if (and head (not (consp head)) (not (stringp head))
            (not (integerp head)) (not (characterp head))
-           (symbolp head))
+           (symbolp head)
+           ;; already a recognised built-in literal → leave as-is
+           (not (eq head 'list)) (not (eq head 'vector))
+           (not (eq head 'simple-vector)) (not (eq head 'array))
+           (not (eq head 'simple-array)) (not (eq head 'string))
+           (not (eq head 'simple-string)) (not (eq head 'base-string))
+           (not (eq head 'simple-base-string)) (not (eq head 'character))
+           (not (eq head 'bit-vector)) (not (eq head 'simple-bit-vector))
+           (not (eq head 'float)) (not (eq head 'single-float))
+           (not (eq head 'double-float)) (not (eq head 'short-float))
+           (not (eq head 'long-float)) (not (eq head 'complex))
+           (not (eq head 'function)))
       (let ((n (symbol-name head)))
         (cond
           ((null n) head)

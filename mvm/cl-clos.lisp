@@ -3508,8 +3508,16 @@
           ((eq k :initial-contents)        (setq init-contents v))))
       (setq cur (cddr cur)))
     (let* ((old-data (%mda-data a))
+           ;; Logical length / displacement offset of the array's CURRENT
+           ;; view.  For a displaced source, old-data is the displaced-to
+           ;; target and we must apply %mda-offset when copying, reading at
+           ;; most the source array's own declared dim-0 (not the larger
+           ;; target's length).  adjust-array.11 / .adjustable.11.
+           (old-off  (if (%mda-displaced a) (%mda-offset a) 0))
+           (old-dim0 (let ((d (%mda-dims a))) (if (consp d) (car d) (array-length old-data))))
            (old-len  (array-length old-data))
-           (str-data (stringp old-data))
+           (str-data (or (stringp old-data)
+                         (and (%mda-displaced a) (stringp (%mda-displaced a)))))
            ;; Allocate new data of exactly new-size (preserve elt type).
            (new-data (cond
                        (displaced-to nil)
@@ -3533,18 +3541,17 @@
                (store (if (and str-data (characterp init-elem))
                           (char-code init-elem) init-elem)))
            (loop (when (>= i new-size) (return))
-             (let ((si i))
-               (if (< si old-len)
-                   (aset new-data i (aref old-data si))
-                   (aset new-data i store)))
+             (if (< i old-dim0)
+                 (aset new-data i (aref old-data (+ old-off i)))
+                 (aset new-data i store))
              (setq i (+ i 1))))
          (%prim-aset a 6 new-data)
          (%prim-aset a 3 nil) (%prim-aset a 4 0))
         (t
          (let ((i 0))
            (loop (when (>= i new-size) (return))
-             (when (< i old-len)
-               (aset new-data i (aref old-data i)))
+             (when (< i old-dim0)
+               (aset new-data i (aref old-data (+ old-off i))))
              (setq i (+ i 1))))
          (%prim-aset a 6 new-data)
          (%prim-aset a 3 nil) (%prim-aset a 4 0)))

@@ -2704,10 +2704,22 @@
          (let* ((rest-pos (position '&rest params))
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))
-                (req-end  (or rest-pos opt-pos key-pos (length params)))
+                ;; req-end = number of REQUIRED params = position of the
+                ;; FIRST lambda-list marker.  Must be the MINIMUM of the
+                ;; marker positions, not (or rest opt key) — for
+                ;; (a &optional (b 1) &rest c) opt-pos=1 < rest-pos=3, but
+                ;; the old `or` returned rest-pos=3, so required-count was 3
+                ;; and the &optional/&rest prologues mis-counted args.
+                (req-end  (let ((ps (remove nil (list rest-pos opt-pos key-pos))))
+                            (if ps (reduce #'min ps) (length params))))
                 (pp (preprocess-params params body t)) ; nested defun &key ON
                 (synth-rest (nth 4 pp))
-                (eff-rest-slot (or rest-pos synth-rest)))
+                ;; Prefer the preprocessed rest slot (5th value) — it is
+                ;; computed from the NEW param list (no &-markers) and is
+                ;; correct for &optional/&key+&rest combos.  rest-pos counts
+                ;; markers in the ORIGINAL list and is only a fallback when
+                ;; preprocess returned nil (pure-&rest unchanged path).
+                (eff-rest-slot (or synth-rest rest-pos)))
            (let ((result (mvm-compile-function name (car pp) (cadr pp)
                                                eff-rest-slot (caddr pp) (cadddr pp))))
              (let ((info (car result)))
@@ -4899,7 +4911,8 @@
          (opt-start     (caddr pp))
          (opt-count     (cadddr pp))
          (synth-rest    (nth 4 pp))
-         (rest-slot     (or rest-pos synth-rest))
+         ;; Prefer preprocessed rest slot (correct for opt/key+rest combos).
+         (rest-slot     (or synth-rest rest-pos))
          (captured-vars
            (reverse
              (%collect-free-vars-list actual-body
@@ -5243,10 +5256,13 @@
              (rest-pos (position '&rest params))
              (key-pos  (position '&key params))
              (opt-pos  (position '&optional params))
-             (req-end  (or rest-pos opt-pos key-pos (length params)))
+             ;; req-end = first marker position (minimum), not (or …).
+             (req-end  (let ((ps (remove nil (list rest-pos opt-pos key-pos))))
+                         (if ps (reduce #'min ps) (length params))))
              (pp (preprocess-params params fbody t)) ; flet/labels &key ON
              (synth-rest (nth 4 pp))
-             (eff-rest-slot (or rest-pos synth-rest))
+             ;; Prefer preprocessed rest slot (correct for opt/key+rest).
+             (eff-rest-slot (or synth-rest rest-pos))
              (result (mvm-compile-function-internal unique-name (car pp) (cadr pp) body-env eff-rest-slot (caddr pp) (cadddr pp)))
              (info (car result)))
         (declare (ignore local-key))
@@ -10474,6 +10490,7 @@
         (keys nil)          ; list of (name default supplied-p-or-nil)
         (auxes nil)
         (has-rest nil)
+        (rest-var nil)      ; the explicit &rest variable (fallback path)
         (has-key nil)
         (allow-other-keys nil))
     ;; Parse parameter list
@@ -10509,8 +10526,12 @@
              (push (list (car p) (cadr p)) auxes)
              (push (list p nil) auxes)))
         ((eq mode :rest)
-         ;; &rest param — just treat as regular param for now
-         (push p required))))
+         ;; &rest param — capture the variable separately.  The fallback
+         ;; path appends it to the END of new-params (after required +
+         ;; optional + key vars) so its slot index matches the rest
+         ;; prologue's expectation; the pure-no-transform path (no
+         ;; optional/key/aux) also returns it as a trailing slot.
+         (setq rest-var p))))
     (setf required (nreverse required))
     (setf optional (nreverse optional))
     (setf keys (nreverse keys))
@@ -10519,8 +10540,12 @@
     (cond
       ((and (null optional) (null keys) (null auxes) (not has-rest))
        (list params body nil 0 nil))
-      ;; --- Real &key path: keys present, no &optional, no explicit &rest ---
-      ((and allow-key-transform has-key (null optional) (not has-rest))
+      ;; --- Real &key path: keys present, no &optional.  An explicit
+      ;; &rest is OK now — it binds to the SAME synthesized catch var
+      ;; (the full trailing plist), and keys are extracted from it.
+      ;; This is the common (&rest args &key ...) shape used by helper
+      ;; functions like make-pathname-test. ---
+      ((and allow-key-transform has-key (null optional))
        (let* ((kw-rest (intern (format nil "%KW-REST-~D"
                                         (incf *kw-rest-counter*))
                                :modus.mvm))
@@ -10528,7 +10553,10 @@
               (rest-slot (length required))
               ;; Build let* bindings: for each key, a found-flag, the
               ;; value (default-aware), and optionally the supplied-p var.
-              (bindings nil))
+              ;; When an explicit &rest var is present, bind it FIRST to
+              ;; the full catch-var plist so key extractions below still
+              ;; reference kw-rest (not the user rest var).
+              (bindings (when rest-var (list (list rest-var kw-rest)))))
          (dolist (k keys)
            ;; (car k) is the key's name spec.  Normally a symbol (FOO →
            ;; keyword :FOO, variable FOO).  CLHS also allows the
@@ -10585,13 +10613,27 @@
            (list new-params new-body nil 0 rest-slot))))
       ;; --- Fallback: old positional behavior for other combinations ---
       (t
-       (let* ((new-params (append required
+       (let* ((key-params
+                ;; keys: name + supplied-p (positional, legacy)
+                (let ((acc nil))
+                  (dolist (k keys (nreverse acc))
+                    (push (car k) acc)
+                    (when (caddr k) (push (caddr k) acc)))))
+              ;; Explicit &rest variable goes at the END (after required +
+              ;; optional + key vars).  Its slot index is the length of
+              ;; everything before it — returned as the 5th value so the
+              ;; defun/lambda driver wires emit-rest-prologue to the right
+              ;; slot.  Previously the rest var was folded into REQUIRED
+              ;; (wrong order, treated as a required positional), so
+              ;; (a &optional (b 1) &rest c) bound c to a single arg and
+              ;; left b unset.
+              (rest-base (+ (length required) (length optional)
+                            (length key-params)))
+              (new-params (append required
                                   (mapcar #'car optional)
-                                  ;; keys: name + supplied-p (positional, legacy)
-                                  (let ((acc nil))
-                                    (dolist (k keys (nreverse acc))
-                                      (push (car k) acc)
-                                      (when (caddr k) (push (caddr k) acc))))))
+                                  key-params
+                                  (when rest-var (list rest-var))))
+              (fb-rest-slot (when (and has-rest rest-var) rest-base))
               (optional-start (when optional (length required)))
               (optional-count (length optional))
               (req-count (length required))
@@ -10658,7 +10700,7 @@
                   (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) defaults)))
               (when defaults
                 (setf new-body (append (nreverse defaults) new-body))))))
-         (list new-params new-body optional-start optional-count nil))))))
+         (list new-params new-body optional-start optional-count fb-rest-slot))))))
 
 ;;; ============================================================
 ;;; Phase 2.5: Internal Function Compilation
@@ -11868,12 +11910,57 @@
                   (push `(defun ,(intern ctor-fn-name :modus.mvm) ,params
                            (,internal-ctor-sym ,@params))
                         forms-to-compile)))
-               ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — positional in given order.
-               ;; &OPTIONAL / &REST / &KEY lambda-list markers in arg-spec pass
-               ;; through.  For an &OPTIONAL slot we emit (P-SLOT SLOT-DEFAULT)
-               ;; so a call with fewer args than the optional list still gets
-               ;; each slot's declared default value rather than NIL/0.
+               ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — BOA lambda-list.
+               ;; The lambda-list variables ARE slot names (CLHS 3.4.6).  We
+               ;; emit a defun whose parameter list IS the BOA arg-spec
+               ;; verbatim (slot names as variables) so Modus's lambda-list
+               ;; compiler handles &optional/&rest/&key/&aux including
+               ;; supplied-p and custom-keyword forms.  The body then calls
+               ;; the internal ctor with each slot: a slot bound by the
+               ;; lambda-list passes its variable; an unmentioned slot passes
+               ;; its declared default.
                ((consp arg-spec)
+                (let* ((slot-name-eq2
+                        (lambda (a b)
+                          (or (eq a b)
+                              (and (symbolp a) (symbolp b)
+                                   (string= (symbol-name a) (symbol-name b))))))
+                       (mode2 :required)
+                       ;; Collect the set of slot-named variables bound by the
+                       ;; BOA lambda-list (required / optional / rest / key /
+                       ;; aux).  Custom-keyword ((:kw var) ...) binds VAR.
+                       (bound-vars nil))
+                  (dolist (s arg-spec)
+                    (cond
+                      ((and (symbolp s) (>= (length (symbol-name s)) 1)
+                            (char= (char (symbol-name s) 0) #\&))
+                       (let ((nm (symbol-name s)))
+                         (cond ((string= nm "&OPTIONAL") (setq mode2 :optional))
+                               ((string= nm "&REST")     (setq mode2 :rest))
+                               ((string= nm "&KEY")      (setq mode2 :key))
+                               ((string= nm "&AUX")      (setq mode2 :aux)))))
+                      (t
+                       ;; Extract the variable name for this entry.
+                       (let ((v (cond
+                                  ((symbolp s) s)
+                                  ;; (var default ...) or ((:kw var) default ...)
+                                  ((and (consp s) (consp (car s))) (cadr (car s)))
+                                  ((consp s) (car s))
+                                  (t nil))))
+                         (when (and v (symbolp v))
+                           (push v bound-vars))))))
+                  (let* ((call-args
+                          (loop for slot in slot-names
+                                for default in slot-defaults
+                                collect
+                                (let ((bv (find slot bound-vars
+                                                :test slot-name-eq2)))
+                                  (if bv bv default)))))
+                    (push `(defun ,(intern ctor-fn-name :modus.mvm) ,arg-spec
+                             (,internal-ctor-sym ,@call-args))
+                          forms-to-compile))))
+               ;; Old normalize path retained but unreachable (kept for ref).
+               ((and nil (consp arg-spec))
                 ;; Normalize arg-spec entries — each becomes one of:
                 ;;   :marker / SYMBOL    — &OPTIONAL/&REST/&KEY keyword
                 ;;   (:plain SLOT-SYM)   — required positional

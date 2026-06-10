@@ -4488,6 +4488,13 @@
 
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
+;; Arity-baking audit: when MODUS_ARITY_AUDIT is set, record every
+;; compile-time arity-error and re-check it against the final *functions*
+;; table after the image is built.  Off by default (zero overhead).
+(when #+sbcl (sb-ext:posix-getenv "MODUS_ARITY_AUDIT") #-sbcl nil
+  (setf modus.mvm::*arity-audit-enabled* t)
+  (setf modus.mvm::*arity-audit-log* nil))
+
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
   ;; MODUS_ANSI_OUT env var overrides the output path so agent worktrees
   ;; can keep build outputs inside their own tmp/ (avoids "Text file
@@ -4518,4 +4525,7 @@
         (when (> n 10)
           (format t "  … ~D more.  Grep build output for \"NOTE: redefining\".~%"
                   (- n 10)))))
+    ;; Arity-baking audit dump (only when MODUS_ARITY_AUDIT set).
+    (when modus.mvm::*arity-audit-enabled*
+      (modus.mvm::audit-arity-baking *standard-output*))
     (format t "~%Run: ~A~%" path)))

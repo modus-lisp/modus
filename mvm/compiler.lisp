@@ -351,6 +351,21 @@
 (defvar *current-source-location* nil
   "Current source location string, set by mvm-compile-all for each form.")
 
+(defvar *arity-audit-log* nil
+  "Audit trail of compile-time arity errors emitted by compile-call.
+   Each entry is a list (CALLER CALLEE NARGS REQ PARAM-COUNT HAS-REST
+   SRC-LOC).  Because compile-call bakes the arity decision from the
+   *functions* state AT THAT MOMENT (last-defun-wins fixes only the
+   address later), a call site can be stamped with a program-error
+   against an early prelude defun even though the FINAL defun of the
+   same name would accept it.  audit-arity-baking re-checks every entry
+   against the final *functions* table and reports the false victims.")
+
+(defvar *arity-audit-enabled* nil
+  "When non-nil, compile-call records each arity-error it emits into
+   *arity-audit-log* for the post-build audit.  Off by default (zero
+   overhead); build scripts set it before compilation when auditing.")
+
 ;;; ============================================================
 ;;; Structures
 ;;; ============================================================
@@ -8596,6 +8611,44 @@
    from within a dispatch branch."
   (compile-form '(%signal-program-error) env dest))
 
+(defun audit-arity-baking (&optional (stream *error-output*))
+  "Re-check every entry in *arity-audit-log* against the FINAL state of
+   *functions*.  Reports call sites where the early-baked arity error
+   would NOT fire against the final defun's arity — i.e. last-defun-wins
+   replaced the function with a wider/narrower signature after the call
+   was already compiled to an unconditional program-error.  These are
+   the real victims (cf. cl-reader's (find-symbol name pkg) vs prelude's
+   1-arg find-symbol).  Returns the list of victim entries."
+  (let ((victims nil)
+        (total (length *arity-audit-log*)))
+    (dolist (entry (reverse *arity-audit-log*))
+      (destructuring-bind (caller callee nargs req param-count has-rest src) entry
+        (declare (ignore req param-count has-rest))
+        (let ((final (gethash callee *functions*)))
+          (when final
+            (let ((f-req   (function-info-required-count final))
+                  (f-pc    (function-info-param-count final))
+                  (f-rest  (function-info-rest-param-p final)))
+              ;; Would the FINAL signature accept NARGS?
+              (let ((accepts
+                     (and (or (null f-req) (>= nargs f-req))
+                          (or f-rest (null f-pc) (zerop f-pc)
+                              (<= nargs f-pc)))))
+                (when accepts
+                  (push (list caller callee nargs f-req f-pc f-rest src)
+                        victims))))))))
+    (setf victims (nreverse victims))
+    (format stream "~&;; === ARITY-BAKING AUDIT ===~%")
+    (format stream ";; ~D arity-error call sites recorded; ~D would be ~
+                    accepted by the FINAL defun (real victims):~%"
+            total (length victims))
+    (dolist (v victims)
+      (destructuring-bind (caller callee nargs f-req f-pc f-rest src) v
+        (format stream ";;   ~A -> ~A  nargs=~D  final[req=~A pc=~A rest=~A]  @~A~%"
+                caller callee nargs f-req f-pc f-rest src)))
+    (format stream ";; === END ARITY-BAKING AUDIT ===~%")
+    victims))
+
 (defun arity-ok-p (form min-args max-args env dest)
   "Return T if FORM has [min-args..max-args] arguments (after the head).
    If wrong, emit compile-arity-error and return NIL. Used by inline
@@ -10219,6 +10272,11 @@
             (cond
               ;; Too few required args: arity error.
               ((and req (> req 0) (< nargs req))
+               (when *arity-audit-enabled*
+                 (push (list (or *current-function-name* "?") resolved-fn-name
+                             nargs req param-count has-rest
+                             *current-source-location*)
+                       *arity-audit-log*))
                (compile-arity-error env dest)
                (return-from compile-call))
               ;; Too many args for a non-rest function with a known
@@ -10226,6 +10284,11 @@
               ;; is populated and audited call sites pass correct args.
               ((and (not has-rest) param-count (> param-count 0)
                     (> nargs param-count))
+               (when *arity-audit-enabled*
+                 (push (list (or *current-function-name* "?") resolved-fn-name
+                             nargs req param-count has-rest
+                             *current-source-location*)
+                       *arity-audit-log*))
                (compile-arity-error env dest)
                (return-from compile-call))
               (has-rest

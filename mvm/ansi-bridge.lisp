@@ -4854,7 +4854,21 @@
                         ((null sz)
                          (and (not (eq wrapped-dims :no-wrapper))
                               (null wrapped-dims)))
-                        ((integerp sz) (= sz (array-length obj)))
+                        ;; Integer third element: for VECTOR / SIMPLE-VECTOR
+                        ;; it's the SIZE ((vector elt N) ≡ length N); for
+                        ;; ARRAY / SIMPLE-ARRAY it's the RANK ((array elt N)
+                        ;; ≡ rank N) per CLHS.  This clause only sees non-MDA
+                        ;; objects (MDAs handled above), so rank is 1 for
+                        ;; vectors/strings, 0 only for the empty wrapped-dims.
+                        ;; (array t 1) on a vector → T; (array t 0) → NIL.
+                        ((integerp sz)
+                         (if (or (eq head 'vector) (eq head 'simple-vector))
+                             (= sz (array-length obj))
+                             (cond
+                               ((eq wrapped-dims :no-wrapper) (= sz 1))
+                               ((consp wrapped-dims) (= sz (length wrapped-dims)))
+                               ((null wrapped-dims) (= sz 0))
+                               (t (= sz 1)))))
                         ((consp sz)
                          (cond
                            ((null (cdr sz))

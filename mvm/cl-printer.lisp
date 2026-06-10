@@ -553,6 +553,23 @@
        (%print-char 41 stream)  ; )
        cur))))
 
+;;; Like %print-md-array but starts reading FLAT-DATA at START (for
+;;; displaced MDAs: START = %mda-offset into the displaced-to target).
+(defun %print-md-array-offset (dims flat-data start stream level escape)
+  (%print-char 35 stream)  ; #
+  (let ((rank 0) (d dims))
+    (loop (when (null d) (return nil))
+      (setq rank (+ rank 1))
+      (setq d (cdr d)))
+    (%print-decimal-to-stream rank stream))
+  (%print-char 65 stream)  ; A
+  (cond
+    ((null dims)
+     (%write-obj (aref flat-data start) stream
+                 (if (null level) 1 (+ level 1)) escape))
+    (t
+     (%print-md-array-rec dims flat-data start stream level escape))))
+
 ;;; Main printer: print OBJ to STREAM respecting all *print-* variables
 ;;; LEVEL: current nesting level (nil = not tracking)
 ;;; ESCAPE: current escape setting
@@ -705,8 +722,11 @@
                                          (aref data i)))
                          (setq i (+ i 1)))
                        (%write-obj tmp stream level escape)))))
-              ;; Rank 0 or rank ≥ 2: full multi-dim emitter.
-              (t (%print-md-array dims data stream level escape)))))))
+              ;; Rank 0 or rank ≥ 2: full multi-dim emitter.  Honor
+              ;; displacement: data slot holds the displaced-to target and
+              ;; %mda-offset is the starting row-major index into it.
+              (t (let ((off (if (%mda-displaced obj) (%mda-offset obj) 0)))
+                   (%print-md-array-offset dims data off stream level escape))))))))
       ;; Cons (list)
       ((consp obj)
        ;; Check *print-level*.  LEVEL is the current depth — nil from

@@ -357,7 +357,12 @@
                  "/home/claude/modus/tmp/ansi-test/symbols/"
                  "/home/claude/modus/tmp/ansi-test/packages/"
                  "/home/claude/modus/tmp/ansi-test/reader/"
-                 "/home/claude/modus/tmp/ansi-test/auxiliary/"))
+                 "/home/claude/modus/tmp/ansi-test/auxiliary/"
+                 ;; objects/: CLOS-only literals like the keyword
+                 ;; :ARGUMENT-PRECEDENCE-ORDER otherwise have no
+                 ;; reverse name (SYMBOL-NAME returns "") and defeat
+                 ;; %validate-defgeneric-options' option matching.
+                 "/home/claude/modus/tmp/ansi-test/objects/"))
       (let ((found (%scan-ansi-test-dir-host d)))
         (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
                  found)))
@@ -1308,15 +1313,6 @@
          ,dc-rewritten
          ,@(nreverse tests)))))
 
-;; Dispatch defuns hoisted out of defgeneric expansions (see the
-;; defgeneric clause below).  Nested (defun NAME …) inside a deftest
-;; thunk compiles, but a by-name call to it from the same thunk is a
-;; void no-op (probes 9850/9853, 2026-06-10) — so the rewriter collects
-;; the dispatch defuns here and load-ansi-chapter emits them at top
-;; level before each file's test forms.  *hoisted-gf-names* dedupes
-;; across re-defgenerics of the same name (the defun body is identical).
-(defvar *hoisted-gf-defuns* nil)
-(defvar *hoisted-gf-names* nil)
 
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
@@ -2068,7 +2064,18 @@
             (lambda-list (caddr form))
             (options (cdddr form))
             (combination nil)
+            (apo nil)
             (inline-methods nil))
+       ;; Guard: gf-name must be a symbol or (setf SYM) — NOT a comma
+       ;; struct from a quasiquoted (defgeneric ,sym ...) inside (eval
+       ;; `...).  Backquoted defgeneric is a runtime form that must hit
+       ;; the cl-eval.lisp DEFGENERIC handler (which does the CLHS
+       ;; macro/special-operator/ordinary-fn name checks —
+       ;; defgeneric.error.1/2/3).  Same guard as the defmethod
+       ;; rewriter below.
+       (unless (or (symbolp gf-name)
+                   (and (consp gf-name) (eq (car gf-name) 'setf)))
+         (return-from rewrite-reader-forms form))
        (dolist (opt options)
          (when (consp opt)
            (cond
@@ -2081,10 +2088,27 @@
                     (if (eq (caddr opt) :most-specific-last)
                         (cons (cadr opt) :most-specific-last)
                         (cadr opt))))
+             ((eq (car opt) :argument-precedence-order)
+              (setq apo (cdr opt)))
              ((eq (car opt) :method)
               (push opt inline-methods)))))
-       ;; Build method-add forms for inline :method options
-       (let* ((method-counter 0)
+       ;; Simplified options for the runtime validator: keep option
+       ;; heads + structural args, drop method BODIES and doc strings
+       ;; (the validator only needs lambda-list shapes / counts).
+       (let* ((simplified-options
+               (mapcar (lambda (opt)
+                         (cond
+                           ((not (consp opt)) opt)
+                           ((eq (car opt) :method)
+                            (let ((rest (cdr opt)))
+                              (loop while (and rest (symbolp (car rest))
+                                               (not (listp (car rest))))
+                                    do (pop rest))
+                              (list :method (car rest))))
+                           ((eq (car opt) :documentation) (list :documentation))
+                           (t opt)))
+                       options))
+              (method-counter 0)
               (method-forms
                (mapcar (lambda (mopt)
                          ;; mopt = (:method [qualifier] specialized-ll body...)
@@ -2097,7 +2121,18 @@
                                 (rest2 (if has-qualifier (cdr rest) rest))
                                 (sll (car rest2))
                                 (body (cdr rest2))
-                                ;; Specializers from specialized lambda list
+                                ;; Required params = everything before the first
+                                ;; lambda-list keyword.  (The old remove-if kept
+                                ;; &optional/&key params too, so every optional
+                                ;; var became a bogus T specializer and tripped
+                                ;; %defmethod's CLHS 7.6.4 specializer-count
+                                ;; check — defgeneric.8/9/10+ all program-error'd
+                                ;; at definition time.)
+                                (required (loop for p in sll
+                                                until (and (symbolp p)
+                                                           (member p lambda-list-keywords))
+                                                collect p))
+                                ;; Specializers from the required params only
                                 (specs
                                  (mapcar (lambda (p)
                                            (cond
@@ -2107,45 +2142,140 @@
                                                   `(list 'eql ,(rewrite-reader-forms (cadr spec)))
                                                   `',spec)))
                                              (t ''t)))
-                                         (remove-if (lambda (p)
-                                                       (and (symbolp p)
-                                                            (member p '(&optional &rest &key &aux &allow-other-keys))))
-                                                     sll)))
-                                (params (mapcar (lambda (p) (if (consp p) (car p) p)) sll))
+                                         required))
+                                ;; Params: strip specializers from required
+                                ;; params; keep &optional/&key/&aux entries
+                                ;; INTACT (defaults + supplied-p vars — the old
+                                ;; (car p) flattening silently dropped defaults,
+                                ;; so (y 10) bound y to NIL).  Default forms get
+                                ;; the same reader-form rewriting as the body.
+                                (params
+                                 (let* ((seen-amp nil)
+                                        (base
+                                         (mapcar (lambda (p)
+                                                   (cond
+                                                     ((and (symbolp p)
+                                                           (member p lambda-list-keywords))
+                                                      (setq seen-amp t)
+                                                      p)
+                                                     ((not seen-amp)
+                                                      (if (consp p) (car p) p))
+                                                     ((and (consp p) (cdr p))
+                                                      (cons (car p)
+                                                            (cons (rewrite-reader-forms (cadr p))
+                                                                  (cddr p))))
+                                                     (t p)))
+                                                 sll)))
+                                   ;; CLHS 7.6.5: keyword validity for a GF
+                                   ;; call is checked against the UNION of
+                                   ;; the GF's and the applicable methods'
+                                   ;; keys (%gf-check-keys does that at
+                                   ;; dispatch).  The method LAMBDA itself
+                                   ;; must therefore be lenient — without
+                                   ;; &allow-other-keys, the compiled &key
+                                   ;; binder's %validate-kw-list signaled on
+                                   ;; keys belonging to OTHER methods
+                                   ;; (defgeneric.14/28/29 crashes).  Insert
+                                   ;; it after the &key section (before &aux
+                                   ;; if present).
+                                   (if (and (member '&key base)
+                                            (not (member '&allow-other-keys base)))
+                                       (let ((aux-tail (member '&aux base)))
+                                         (if aux-tail
+                                             (append (ldiff base aux-tail)
+                                                     '(&allow-other-keys)
+                                                     aux-tail)
+                                             (append base '(&allow-other-keys))))
+                                       base)))
+                                ;; Lambda-list SHAPE for runtime key-checking
+                                ;; meta ((x number) → x, ((:bar foo) 'a) → (:bar foo))
+                                (meta-ll (mapcar (lambda (p)
+                                                   (if (and (consp p)
+                                                            (not (and (symbolp (car p))
+                                                                      (member (car p) lambda-list-keywords))))
+                                                       (car p)
+                                                       p))
+                                                 sll))
+                                ;; CLHS 7.6.5: method bodies are wrapped in a
+                                ;; BLOCK named after the GF (defgeneric.7's
+                                ;; return-from).  Only wrap when the body
+                                ;; actually mentions RETURN-FROM — a BLOCK
+                                ;; around a (values ...) tail risks collapsing
+                                ;; multiple values in the MVM compiler.
+                                (block-name (if (and (consp gf-name)
+                                                     (eq (car gf-name) 'setf))
+                                                (cadr gf-name)
+                                                gf-name))
+                                (needs-block
+                                 (let ((stack (list body)) (found nil))
+                                   (loop while stack do
+                                     (let ((f (pop stack)))
+                                       (cond
+                                         ((eq f 'return-from)
+                                          (setq found t) (setq stack nil))
+                                         ((consp f)
+                                          (push (car f) stack)
+                                          (push (cdr f) stack)))))
+                                   found))
                                 (rewritten-body (mapcar #'rewrite-reader-forms body)))
-                           `(%defmethod ',gf-name ',(if qualifier qualifier nil)
+                           `(%defgeneric-method ',gf-name ',(if qualifier qualifier nil)
                                         (list ,@specs)
-                                        (lambda ,params ,@rewritten-body))))
+                                        (lambda ,params
+                                          ,@(if needs-block
+                                                `((block ,block-name ,@rewritten-body))
+                                                rewritten-body))
+                                        ',meta-ll)))
                        (nreverse inline-methods))))
-         ;; HOIST the dispatch defun to top level (2026-06-10).  When the
-         ;; defgeneric sits inside a deftest thunk (every DG-MC.* test),
-         ;; the nested (defun NAME …) compiles via compile-form's
-         ;; nested-DEFUN path — and a subsequent BY-NAME call to it from
-         ;; the same thunk is a void no-op: the call contributes no value
-         ;; and VR keeps the previous form's value (probes 9850/9853/9856,
-         ;; 2026-06-10 — dg-mc.N.10/.11 returned T instead of :ERROR
-         ;; because dispatch never ran).  Defun semantics are global, so
-         ;; hoisting is also simply the correct compilation: the defun is
-         ;; collected here and emitted at top level by load-ansi-chapter
-         ;; (see *hoisted-gf-defuns* drain at the emission loop).
-         (let ((name-key (format nil "~S" gf-name)))
-           (unless (member name-key *hoisted-gf-names* :test #'string=)
-             (push name-key *hoisted-gf-names*)
-             (push `(defun ,gf-name (&rest %gf-args)
-                      (%gf-dispatch ',gf-name %gf-args))
-                   *hoisted-gf-defuns*)))
          `(progn
+            ;; CLHS option validation FIRST — program-error on duplicate /
+            ;; unknown options, bad :argument-precedence-order, or inline
+            ;; methods not congruent with the lambda-list.
+            (%validate-defgeneric-options ',gf-name ',lambda-list
+                                          ',simplified-options)
             (%defgeneric ',gf-name ',lambda-list ',(if combination combination nil))
-            ;; Register the (now top-level) dispatch defun's fn-addr so
+            ,@(when apo
+                `((%gf-set-arg-precedence ',gf-name ',apo ',lambda-list)))
+            (defun ,gf-name (&rest %gf-args)
+              (%gf-dispatch ',gf-name %gf-args))
+            ;; (defgeneric (setf X) ...): also emit the SET-X alias the
+            ;; compiler's generic-setf expansion calls for unknown places
+            ;; — (setf (X args...) v) compiles to (SET-X args... v), but
+            ;; the CLHS (setf X) function signature is (NEW-VALUE args...),
+            ;; so the alias rotates the value to the front (defgeneric.33).
+            ,@(when (and (consp gf-name) (eq (car gf-name) 'setf)
+                         (symbolp (cadr gf-name)))
+                (let ((alias (intern (format nil "SET-~A"
+                                             (symbol-name (cadr gf-name)))
+                                     (symbol-package (cadr gf-name)))))
+                  `((defun ,alias (&rest %gf-args)
+                      (%gf-dispatch ',gf-name
+                                    (cons (car (last %gf-args))
+                                          (butlast %gf-args)))))))
+            ;; Register the dispatch defun's fn-addr so
             ;; (typep #',gf-name 'generic-function) → T (cl-clos.lisp's
-            ;; %generic-function-p consults *gf-stub-closures*).
-            ;; handler-case retained for robustness of (function ,gf-name)
-            ;; resolution order across chunks.
-            (handler-case (%register-gf-fn (function ,gf-name)) (t (c) nil))
+            ;; %generic-function-p consults *gf-stub-closures*), and record
+            ;; the fn → name mapping so COMPUTE-APPLICABLE-METHODS /
+            ;; FIND-METHOD / DOCUMENTATION can resolve it back to the GF.
+            ;; handler-case wrap: when defgeneric is INSIDE a lambda body
+            ;; (eg DG-MC tests inline both defgeneric and the test call),
+            ;; (function ,gf-name) at build time may resolve to 0 because
+            ;; the just-defined defun isn't visible to the function-ref
+            ;; compiler.  Don't take the whole lambda down with us.
+            (handler-case (%register-gf-fn (function ,gf-name) ',gf-name)
+              (t (c) nil))
             ,@method-forms
-            ;; ANSI: defgeneric returns the GF object so callers like
-            ;; (defparameter *gf* (defgeneric foo (x))) capture it.
-            (%find-gf ',gf-name)))))
+            ;; ANSI: defgeneric returns the GF.  Return the dispatch
+            ;; DEFUN (#'NAME, registered → name above, so it typep's as
+            ;; generic-function) rather than the raw GF struct: a real
+            ;; function pointer is funcall/apply-able at ANY arity,
+            ;; whereas compile-funcall's GF-struct path caps at 4 args
+            ;; (defgeneric.14/22/28 do 5-8-arg funcalls on the value).
+            ;; %dg-gf-callable falls back to the GF struct when the
+            ;; (function NAME) registration resolved to 0 (defgeneric
+            ;; nested inside a lambda body).  Single plain call — no
+            ;; handler-case/let in value position, which miscompiled in
+            ;; let-initializer contexts.
+            (%dg-gf-callable ',gf-name)))))
 
     ;; (define-method-combination name &rest options)
     ;; Short form: (define-method-combination name :operator op :documentation ... :identity-with-one-argument t)
@@ -2568,6 +2698,9 @@
 ;; Load real ANSI test files (if available)
 (defvar *ansi-aux-sources* "")       ; auxiliary/helper files (loaded before test files)
 (defvar *real-ansi-sources* "")
+(defvar *hoisted-gf-defuns* (make-hash-table :test 'equal)
+  "Printed forms of GF dispatch defuns already hoisted to top level
+   from inside deftest thunks — dedup set (one copy per defun).")
 (defvar *ansi-test-counter* 10000)
 (defvar *ansi-file-names* nil)
 ;; Per-file test ID ranges, list of (name first-id last-id).
@@ -2715,19 +2848,7 @@
               )
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
-              ;; Drain dispatch defuns hoisted out of this file's
-              ;; defgeneric expansions (rewrite-reader-forms collected
-              ;; them during the passes above).  Emitted at top level so
-              ;; by-name calls inside test thunks resolve to a real
-              ;; global function — the thunk-nested defun + by-name call
-              ;; combination is a void no-op (probes 9850/9853).
-              (dolist (hd (nreverse *hoisted-gf-defuns*))
-                (let ((hd-s (handler-case (format nil "~S" hd) (error () nil))))
-                  (when (and hd-s (not (search "#<" hd-s)))
-                    (write-string hd-s out)
-                    (terpri out))))
-              (setf *hoisted-gf-defuns* nil)
-              (dolist (form forms)
+(dolist (form forms)
                 (cond
                   ((and (consp form) (eq (car form) 'deftest))
                    (let* ((rest-after-name (cddr form))
@@ -2742,6 +2863,41 @@
                      (setf *ansi-test-counter* (1+ *ansi-test-counter*))
                      (let ((test-id *ansi-test-counter*))
                        (format t "      ~D = ~A~%" test-id name)
+                       ;; Hoist GF dispatch defuns nested inside the test
+                       ;; form (from rewritten inline defgenerics) to top
+                       ;; level.  Defuns nested in a deftest thunk are NOT
+                       ;; visible to compile-call's name resolution, so a
+                       ;; named call like (DEFGENERIC.FUN.1 'D 'E 'F) in
+                       ;; the same thunk compiled into garbage that
+                       ;; returned its last argument (defgeneric.1/8/31/32
+                       ;; GOT (... F) / B / X).  A top-level copy gives the
+                       ;; name a real compile-time address; the nested
+                       ;; original is harmless.
+                       (labels ((hoist-gf-defuns (f)
+                                  (when (consp f)
+                                    (if (and (eq (car f) 'defun)
+                                             (consp (cdr f))
+                                             (consp (cddr f))
+                                             (consp (cdddr f))
+                                             (consp (car (cdddr f)))
+                                             (eq (car (car (cdddr f)))
+                                                 '%gf-dispatch))
+                                        (let ((s (handler-case
+                                                     (format nil "~S" f)
+                                                   (error () nil))))
+                                          ;; Dedup — the same GF dispatch
+                                          ;; defun appears in many tests;
+                                          ;; one top-level copy suffices.
+                                          (when (and s
+                                                     (not (gethash s *hoisted-gf-defuns*)))
+                                            (setf (gethash s *hoisted-gf-defuns*) t)
+                                            (write-string s out)
+                                            (terpri out)))
+                                        (progn
+                                          (hoist-gf-defuns (car f))
+                                          (hoist-gf-defuns (cdr f)))))))
+                         (handler-case (hoist-gf-defuns test-form)
+                           (error () nil)))
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
@@ -2953,7 +3109,7 @@
                               ;; FILE-WEDGE REASON=no-progress and can be
                               ;; re-added here.
                               (t
-                               (format out "  (handler-case ~A (t (c) (%test-crash-fail ~D)))~%"
+                               (format out "  (handler-case ~A (t (c) (%test-crash-fail-c ~D c)))~%"
                                        form-str id-num)))))
                         (format out ")~%"))))
                   ;; Now the dispatcher.  Re-runs init forms (idempotent —
@@ -3346,6 +3502,15 @@
                      ~%;; the handler triggers a cascade that kills the whole file's fork — losing~
                      ~%;; every remaining test.~
                      ~%(defun %test-crash-fail (id) (%record-test-fail id))~
+                     ~%;; Variant that also prints the caught condition (class + slots)~
+                     ~%;; so a bare \"FAIL <id>\" from a thunk-level signal is debuggable.~
+                     ~%(defun %test-crash-fail-c (id c)~
+                     ~%  (%record-test-fail id)~
+                     ~%  (write-string-serial \"  COND:\")~
+                     ~%  (setq *write-object-budget* 80)~
+                     ~%  (handler-case (write-object c) (t (e) nil))~
+                     ~%  (write-char-serial 10)~
+                     ~%  nil)~
                      ~%;; Shared-memory slot for parent/child recovery.~
                      ~%;; *fork-shm-addr* holds a tagged mmap'd address (4K page)~
                      ~%;; mapped with MAP_SHARED|MAP_ANONYMOUS so writes from the~
@@ -3442,14 +3607,14 @@
                      ~%  (%fork-set-last-id id)~
                      ~%  (%clear-fault-slots)~
                      ~%  (handler-case (rt-run-test id (funcall thunk) expected)~
-                     ~%    (t (c) (%record-test-fail id))))~
+                     ~%    (t (c) (%test-crash-fail-c id c))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
                      ~%  (%fork-set-last-id id)~
                      ~%  (%clear-fault-slots)~
                      ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
-                     ~%    (t (c) (%record-test-fail id))))~
+                     ~%    (t (c) (%test-crash-fail-c id c))))~
                      ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~
                      ~%(defvar *wstatus-addr* #x100001A0)~
                      ~%;; Per-FILE fork: parent forks, child runs the file's run-ansi-X~
@@ -3624,7 +3789,17 @@
 ;; Dump file → id-range map to /tmp so post-mortem analysis of a test
 ;; run can map T:/FAIL ids back to source files. Small side effect;
 ;; useful for lost-test hunts.
-(with-open-file (s "/tmp/ansi-file-ranges.txt" :direction :output :if-exists :supersede)
+;; When MODUS_ANSI_OUT is set (agent worktree builds), keep the debug
+;; dumps next to the binary instead of shared /tmp — a parallel session's
+;; build otherwise clobbers them mid-investigation.
+(defvar *build-dump-dir*
+  (let ((out #+sbcl (sb-ext:posix-getenv "MODUS_ANSI_OUT")))
+    (if out
+        (directory-namestring out)
+        "/tmp/")))
+
+(with-open-file (s (concatenate 'string *build-dump-dir* "ansi-file-ranges.txt")
+                   :direction :output :if-exists :supersede)
   (dolist (entry (reverse *ansi-file-ranges*))
     (format s "~D ~D ~A~%" (second entry) (or (third entry) -1) (first entry))))
 
@@ -3636,9 +3811,10 @@
 (format t "  real-ansi: ~D chars~%" (length *real-ansi-sources*))
 
 ;; Dump generated sources for debugging
-(with-open-file (s "/tmp/real-ansi-gen.lisp" :direction :output :if-exists :supersede)
+(with-open-file (s (concatenate 'string *build-dump-dir* "real-ansi-gen.lisp")
+                   :direction :output :if-exists :supersede)
   (write-string *real-ansi-sources* s))
-(format t "  dumped: /tmp/real-ansi-gen.lisp~%")
+(format t "  dumped: ~Areal-ansi-gen.lisp~%" *build-dump-dir*)
 
 ;;; ============================================================
 ;;; 3. Strip in-package forms from source text
@@ -3663,6 +3839,108 @@
 (setf *test-source*    (strip-in-package *test-source*))
 (setf *ansi-aux-sources*  (strip-in-package *ansi-aux-sources*))
 (setf *real-ansi-sources* (strip-in-package *real-ansi-sources*))
+
+;;; ============================================================
+;;; 3b. Test-source defun/defmacro registration
+;;;
+;;; The %init-sft-auto scan (Gap A) covers prelude/gc/rt/bridge only, so
+;;; test-file defuns (e.g. defgeneric.lsp's defgeneric-testfn-01) are
+;;; invisible to FBOUNDP / SYMBOL-FUNCTION at runtime, and test-file
+;;; defmacros are invisible to MACRO-FUNCTION.  defgeneric.error.1/2
+;;; (and any eval-path test referencing test helpers by name) need
+;;; both.  Line-scan the CONVERTED sources (comments are not preserved
+;;; by conversion, and only top-level forms start at column 0) and emit
+;;; %init-test-defs: puthash "NAME" → #'NAME into the SFT + name-hashes
+;;; into *%extra-macro-names*.
+;;; ============================================================
+
+(defun %scan-top-level-def-names (source-str def-kind)
+  "Collect names of top-level (DEF-KIND NAME ...) forms in SOURCE-STR
+   by line prefix.  DEF-KIND is \"defun\" or \"defmacro\".  Only plain
+   symbol names are kept (no (setf X), no |odd| names)."
+  (let ((names nil)
+        (prefix (concatenate 'string "(" def-kind " ")))
+    (with-input-from-string (s source-str)
+      (loop for line = (read-line s nil nil)
+            while line
+            do (let ((ll (string-downcase line)))
+                 (when (and (> (length ll) (length prefix))
+                            (string= prefix (subseq ll 0 (length prefix))))
+                   (let* ((start (length prefix))
+                          (end (or (position-if
+                                    (lambda (ch)
+                                      (member ch '(#\Space #\Tab #\( #\))))
+                                    line :start start)
+                                   (length line)))
+                          (name (string-upcase (subseq line start end))))
+                     (when (and (> (length name) 0)
+                                (every (lambda (ch)
+                                         (or (alphanumericp ch)
+                                             (member ch '(#\- #\+ #\* #\/ #\%
+                                                          #\. #\< #\> #\=
+                                                          #\! #\? #\_ #\&))))
+                                       name))
+                       (push name names)))))))
+    (nreverse names)))
+
+(defvar *test-defs-auto-source*
+  (let* ((combined (concatenate 'string *ansi-aux-sources*
+                                (string #\Newline)
+                                *real-ansi-sources*))
+         (fn-names (remove-if
+                    (lambda (n)
+                      ;; Generated runner scaffolding — registering the
+                      ;; thousands of run-ansi-FILE-chunk-N defuns bloats
+                      ;; the image for zero eval-path value.
+                      (or (and (>= (length n) 9)
+                               (string= "RUN-ANSI-" (subseq n 0 9)))
+                          (and (>= (length n) 9)
+                               (string= "RUN-INIT-" (subseq n 0 9)))
+                          (and (>= (length n) 9)
+                               (string= "TOPLEVEL-" (subseq n 0 9)))))
+                    (%scan-top-level-def-names combined "defun")))
+         (macro-names (%scan-top-level-def-names combined "defmacro"))
+         (seen (make-hash-table :test 'equal))
+         (uniq-fns (let ((rev nil))
+                     ;; last-occurrence order, matching last-defun-wins
+                     (dolist (n (reverse fn-names))
+                       (unless (gethash n seen)
+                         (setf (gethash n seen) t)
+                         (push n rev)))
+                     rev))
+         (uniq-macros (remove-duplicates macro-names :test #'equal))
+         (n-chunks 0))
+    (let ((out (with-output-to-string (o)
+                 (let ((cur uniq-fns))
+                   (loop
+                     (when (null cur) (return))
+                     (incf n-chunks)
+                     (format o "(defun %init-test-sft-~D ()~%" n-chunks)
+                     (format o "  (let ((ht *symbol-function-table*))~%")
+                     (let ((k 0))
+                       (loop
+                         (when (or (null cur) (>= k 120)) (return))
+                         (format o "    (puthash ~S ht #'~A)~%"
+                                 (car cur) (car cur))
+                         (setq cur (cdr cur))
+                         (incf k)))
+                     (format o "    nil))~%")))
+                 (format o "(defun %init-test-defs ()~%")
+                 (let ((c 0))
+                   (loop
+                     (incf c)
+                     (when (> c n-chunks) (return))
+                     (format o "  (%init-test-sft-~D)~%" c)))
+                 (format o "  (setq *%extra-macro-names* (make-hash-table))~%")
+                 (dolist (mn uniq-macros)
+                   (format o "  (puthash ~D *%extra-macro-names* t)~%"
+                           (modus.mvm::compute-name-hash mn)))
+                 (format o "  (when *native-sym-function-table*~%")
+                 (format o "    (%nsft-populate-from *symbol-function-table*))~%")
+                 (format o "  nil)~%"))))
+      (format t "  test defs: ~D defuns / ~D macros across ~D chunk(s)~%"
+              (length uniq-fns) (length uniq-macros) n-chunks)
+      out)))
 
 ;;; ============================================================
 ;;; 4. Driver source (sys-exit + kernel-main)
@@ -3759,6 +4037,11 @@
   ;; (all 74 of them) are available to macroexpand-1 and %eval-compound
   ;; at runtime, so LOAD'd .lsp suite files can macroexpand correctly.
   (%init-runtime-macros)
+
+  ;; Register test-source defuns (fboundp/symbol-function) and defmacro
+  ;; names (macro-function) — defgeneric.error.1/2 and any eval-path
+  ;; test that references test-file helpers by name.
+  (%init-test-defs)
 
   ;; Build the compiler-macro name set so MACRO-FUNCTION reports T for
   ;; PUSH/POP/COND/etc. that the modus compiler implements directly.
@@ -4077,6 +4360,11 @@
     ;; 6. Real ANSI test files
     *real-ansi-sources*
     (string #\Newline)
+    ;; 6b. Auto-generated %init-test-defs: register test-source defuns
+    ;;     in the SFT (fboundp/symbol-function) and test-source defmacro
+    ;;     name-hashes in *%extra-macro-names* (macro-function).
+    *test-defs-auto-source*
+    (string #\Newline)
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count
     ;; so kernel-main can print EXP:N before running tests.
@@ -4201,7 +4489,11 @@
 (format t "~%Compiling test runner (~D chars)...~%" (length cl-user::*full-source*))
 
 (let ((image (build-image :target :linux-x64 :source-text cl-user::*full-source*)))
-  (let ((path (namestring (merge-pathnames "tmp/modus-ansi-test" cl-user::*modus-base*))))
+  ;; MODUS_ANSI_OUT env var overrides the output path so agent worktrees
+  ;; can keep build outputs inside their own tmp/ (avoids "Text file
+  ;; busy" collisions with sweeps running the parent repo's binary).
+  (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_ANSI_OUT")
+                  "/home/claude/modus/tmp/modus-ansi-test")))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

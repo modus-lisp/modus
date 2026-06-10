@@ -78,8 +78,20 @@
     ((eq type-name 'complex)   '(complex number t))
     ((eq type-name 'number)    '(number t))
     ((eq type-name 'string)    '(string vector array sequence t))
-    ((eq type-name 'vector)    '(vector array sequence t))
-    ((eq type-name 'array)     '(array t))
+    ;; VECTOR/ARRAY CPLs append STRUCTURE-OBJECT + STANDARD-OBJECT:
+    ;; Modus struct instances are markerless plain arrays (defstruct
+    ;; emits bare make-array), indistinguishable from vectors.  Before
+    ;; %type-of-for-dispatch knew about vectors at all, BOTH dispatched
+    ;; as STANDARD-OBJECT — so make-load-form's STRUCTURE-OBJECT /
+    ;; STANDARD-OBJECT methods matched struct objects.  Keeping those
+    ;; in the CPL (after the array classes) preserves that matching
+    ;; while letting (y array)/(y vector) specializers work
+    ;; (defgeneric.33).
+    ((eq type-name 'vector)
+     '(vector array sequence structure-object standard-object t))
+    ((eq type-name 'array)
+     '(array structure-object standard-object t))
+    ((eq type-name 'condition) '(condition standard-object t))
     ((eq type-name 'cons)      '(cons list sequence t))
     ((eq type-name 'list)      '(list sequence t))
     ((eq type-name 'null)      '(null symbol list sequence t))
@@ -108,6 +120,17 @@
     ;; (dg-mc.N.6/.8 once complex literals stopped compiling as 0).
     ((%complex-p obj)  'complex)
     ((consp obj)       'cons)
+    ;; conditions — detectable via the condition-type registry; their
+    ;; CPL keeps STANDARD-OBJECT so methods that matched under the old
+    ;; blanket fallback still match (make-load-form.6/9).
+    ((%condition-p obj) 'condition)
+    ;; vectors / arrays — without these every array dispatched as
+    ;; STANDARD-OBJECT, so methods specialized on (y array) / (y vector)
+    ;; were never applicable (defgeneric.33).  CLOS instances never
+    ;; reach here (%obj-cpl handles them first); struct instances DO
+    ;; (markerless arrays) — see %builtin-cpl's vector/array entries.
+    ((vectorp obj)     'vector)
+    ((arrayp obj)      'array)
     (t 'standard-object)))
 
 (defun %obj-class-name (obj)
@@ -1044,12 +1067,15 @@
    %defgeneric) so %defmethod / find-method can validate method
    congruence (CLHS 7.6.4).  NIL means unknown — auto-created GFs
    from a leading %defmethod skip the check."
-  (let ((gf (make-array 5)))
+  (let ((gf (make-array 8)))
     (aset gf 0 '%generic-function)
     (aset gf 1 name)
     (aset gf 2 nil)  ; methods-alist
     (aset gf 3 nil)  ; method-combination name
     (aset gf 4 nil)  ; lambda-list (NIL = unknown)
+    (aset gf 5 nil)  ; methods added by a DEFGENERIC form (CLHS removal)
+    (aset gf 6 nil)  ; :argument-precedence-order as arg-index list
+    (aset gf 7 nil)  ; method-meta alist: (method . (key rest aok keynames))
     gf))
 
 (defun %gf-p (x)
@@ -1072,6 +1098,36 @@
 (defun %gf-set-combination (gf c) (aset gf 3 c))
 (defun %gf-set-lambda-list (gf ll)
   (when (>= (array-length gf) 5) (aset gf 4 ll)))
+
+;; Slot 5: methods added by a DEFGENERIC form for NAME.  CLHS DEFGENERIC:
+;; redefining a GF removes the methods the PREVIOUS defgeneric form added
+;; (but keeps DEFMETHOD-added ones).  Guarded reads for old 5-slot GFs.
+(defun %gf-defgeneric-methods (gf)
+  (if (>= (array-length gf) 6) (aref gf 5) nil))
+(defun %gf-set-defgeneric-methods (gf ms)
+  (when (>= (array-length gf) 6) (aset gf 5 ms)))
+
+;; Slot 6: :argument-precedence-order, stored as a list of required-arg
+;; INDICES (e.g. (1 0) for (:argument-precedence-order y x) on (x y)).
+(defun %gf-apo (gf)
+  (if (>= (array-length gf) 7) (aref gf 6) nil))
+(defun %gf-set-apo (gf v)
+  (when (>= (array-length gf) 7) (aset gf 6 v)))
+
+;; Slot 7: method-meta alist mapping method-record → (has-key has-rest
+;; aok key-name-strings), harvested from the method's full lambda-list.
+;; Used by %gf-check-keys for CLHS 7.6.5 keyword validity checking.
+(defun %gf-method-meta (gf)
+  (if (>= (array-length gf) 8) (aref gf 7) nil))
+(defun %gf-set-method-meta (gf v)
+  (when (>= (array-length gf) 8) (aset gf 7 v)))
+(defun %gf-method-meta-for (gf m)
+  "Meta entry for method record M on GF, or NIL."
+  (let ((cur (%gf-method-meta gf)))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) m) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
 
 (defun %lambda-list-required-count (ll)
   "Count required parameters in lambda-list LL — items before any
@@ -1160,12 +1216,239 @@
          (eq (and (or g-rest g-key) t)
              (and (or m-rest m-key) t)))))
 
+;;; ============================================================
+;;; DEFGENERIC option validation (CLHS macro DEFGENERIC + 7.6.4)
+;;; ============================================================
+
+(defun %dg-param-name (p)
+  "Name string of a lambda-list element.  Handles native MVM symbols,
+   CL-symbol wrappers (which are conses), and the (var ...) /
+   ((:key var) ...) list shapes — recursing on the head."
+  (cond
+    ((null p) "")
+    ((symbolp p) (symbol-name p))
+    ((consp p) (%dg-param-name (car p)))
+    (t "")))
+
+(defun %dg-amp-p (p)
+  "True iff P is a lambda-list keyword (&optional / &rest / &key /...)."
+  (and (symbolp p)
+       (let ((n (symbol-name p)))
+         (and (stringp n) (> (length n) 0) (char= (char n 0) #\&)))))
+
+(defun %dg-string-member (s lst)
+  "True iff string S is STRING= to some element of LST (strings)."
+  (let ((cur lst))
+    (loop
+      (when (null cur) (return nil))
+      (when (string= s (car cur)) (return t))
+      (setq cur (cdr cur)))))
+
+(defun %lambda-list-key-names (ll)
+  "Names (strings) of the keyword parameters declared after &KEY in LL.
+   ((:bar foo) ...) shapes yield the exposed key name (BAR)."
+  (let ((mode nil) (names nil) (cur ll))
+    (loop
+      (when (null cur) (return (nreverse names)))
+      (let ((p (car cur)))
+        (cond
+          ((%lambda-list-keyword-p p "&KEY") (setq mode t))
+          ((%dg-amp-p p)
+           (unless (%lambda-list-keyword-p p "&ALLOW-OTHER-KEYS")
+             (setq mode nil)))
+          (mode (setq names (cons (%dg-param-name p) names)))))
+      (setq cur (cdr cur)))))
+
+(defun %dg-method-ll (mopt)
+  "Specialized lambda-list of a (:method ...) defgeneric option — the
+   first list element after the head, skipping qualifier symbols.
+   CL-symbol-wrapper qualifiers (conses) are NOT mistaken for the ll."
+  (let ((cur (cdr mopt)))
+    (loop
+      (when (null cur) (return nil))
+      (let ((x (car cur)))
+        (when (or (null x) (and (consp x) (not (%cl-sym-p x))))
+          (return x)))
+      (setq cur (cdr cur)))))
+
+(defun %dg-congruent-p (gf-ll m-ll)
+  "CLHS 7.6.4 congruence between a GF lambda-list and a method's
+   specialized lambda-list: same required count, same optional count,
+   matching &rest/&key acceptance, and the method accepts every keyword
+   name the GF declares (explicitly, via &allow-other-keys, or via
+   &rest without &key)."
+  (let ((g (%lambda-list-shape gf-ll))
+        (m (%lambda-list-shape m-ll)))
+    (let ((g-req  (nth 0 g)) (g-opt (nth 1 g))
+          (g-rest (nth 2 g)) (g-key (nth 3 g))
+          (m-req  (nth 0 m)) (m-opt (nth 1 m))
+          (m-rest (nth 2 m)) (m-key (nth 3 m)) (m-aok (nth 4 m)))
+      (cond
+        ((not (= m-req g-req)) nil)
+        ((not (= m-opt g-opt)) nil)
+        ((not (eq (if (or g-rest g-key) t nil)
+                  (if (or m-rest m-key) t nil)))
+         nil)
+        ;; Keyword-name acceptance (rule 4).  Only binds when the GF
+        ;; declares &key and the method uses &key without
+        ;; &allow-other-keys (a &rest-only method accepts everything).
+        ((and g-key m-key (not m-aok))
+         (let ((g-names (%lambda-list-key-names gf-ll))
+               (m-names (%lambda-list-key-names m-ll))
+               (ok t)
+               (cur nil))
+           (setq cur g-names)
+           (loop
+             (when (null cur) (return nil))
+             (unless (%dg-string-member (car cur) m-names)
+               (setq ok nil))
+             (setq cur (cdr cur)))
+           ok))
+        (t t)))))
+
+(defun %dg-sym-eq (a b)
+  "Lambda-list element identity: EQ first (same quoted form → same
+   interned symbol), then non-empty name STRING= as a cross-flavor
+   fallback.  Robust against native MVM syms whose names aren't in
+   *sym-name-table* (SYMBOL-NAME returns \"\")."
+  (or (eq a b)
+      (let ((na (%dg-param-name a))
+            (nb (%dg-param-name b)))
+        (and (> (length na) 0) (string= na nb)))))
+
+(defun %dg-member-sym (x lst)
+  "Member via %dg-sym-eq."
+  (let ((cur lst))
+    (loop
+      (when (null cur) (return nil))
+      (when (%dg-sym-eq x (car cur)) (return t))
+      (setq cur (cdr cur)))))
+
+(defun %dg-required-params (ll)
+  "Required parameter SYMBOLS (heads) of lambda-list LL —
+   identity-preserving so callers can compare with EQ."
+  (let ((acc nil) (cur ll))
+    (loop
+      (when (null cur) (return (nreverse acc)))
+      (let ((p (car cur)))
+        (when (%dg-amp-p p) (return (nreverse acc)))
+        (setq acc (cons (if (and (consp p) (not (%cl-sym-p p)))
+                            (car p)
+                            p)
+                        acc)))
+      (setq cur (cdr cur)))))
+
+(defun %dg-check-apo (lambda-list apo)
+  "CLHS DEFGENERIC: :argument-precedence-order must name each required
+   parameter of LAMBDA-LIST exactly once and nothing else.  Signals
+   PROGRAM-ERROR on violation.  Comparison is EQ-based (with name
+   fallback) so it works even when symbol names aren't recoverable."
+  (let ((req (%dg-required-params lambda-list)))
+    (let ((seen nil) (count 0) (cur apo))
+      (loop
+        (when (null cur) (return nil))
+        (let ((a (car cur)))
+          (unless (%dg-member-sym a req)
+            (%signal-program-error))
+          (when (%dg-member-sym a seen)
+            (%signal-program-error))
+          (setq seen (cons a seen))
+          (setq count (+ count 1)))
+        (setq cur (cdr cur)))
+      (unless (= count (length req))
+        (%signal-program-error)))))
+
+(defun %validate-defgeneric-options (gf-name lambda-list options)
+  "CLHS DEFGENERIC validation, signaled as PROGRAM-ERROR:
+   - unknown options (defgeneric.error.6)
+   - repeated singleton options (:documentation etc. — error.5)
+   - bad :argument-precedence-order (error.4 / error.8)
+   - inline :method lambda-lists not congruent with LAMBDA-LIST
+     (error.9-19, CLHS 7.6.4)."
+  (let ((apo-seen 0) (doc-seen 0) (mc-seen 0) (gfc-seen 0) (mcl-seen 0)
+        (cur options))
+    (loop
+      (when (null cur) (return nil))
+      (let ((opt (car cur)))
+        (let ((nm (if (and (consp opt) (symbolp (car opt)))
+                      (symbol-name (car opt))
+                      nil)))
+          (cond
+            ((null nm) (%signal-program-error))
+            ;; Name unrecoverable (native MVM symbol whose name isn't in
+            ;; *sym-name-table*) — can't classify the option; be lenient
+            ;; rather than mis-reporting it as unknown.
+            ((string= nm "") nil)
+            ((string= nm "METHOD")
+             (unless (%dg-congruent-p lambda-list (%dg-method-ll opt))
+               (%signal-program-error)))
+            ((string= nm "ARGUMENT-PRECEDENCE-ORDER")
+             (setq apo-seen (+ apo-seen 1))
+             (when (> apo-seen 1) (%signal-program-error))
+             (%dg-check-apo lambda-list (cdr opt)))
+            ((string= nm "DOCUMENTATION")
+             (setq doc-seen (+ doc-seen 1))
+             (when (> doc-seen 1) (%signal-program-error)))
+            ((string= nm "METHOD-COMBINATION")
+             (setq mc-seen (+ mc-seen 1))
+             (when (> mc-seen 1) (%signal-program-error)))
+            ((string= nm "GENERIC-FUNCTION-CLASS")
+             (setq gfc-seen (+ gfc-seen 1))
+             (when (> gfc-seen 1) (%signal-program-error)))
+            ((string= nm "METHOD-CLASS")
+             (setq mcl-seen (+ mcl-seen 1))
+             (when (> mcl-seen 1) (%signal-program-error)))
+            ((string= nm "DECLARE") nil)
+            (t (%signal-program-error)))))
+      (setq cur (cdr cur))))
+  nil)
+
+(defun %gf-set-arg-precedence (gf-name apo lambda-list)
+  "Record :argument-precedence-order on GF-NAME's gf as a list of
+   required-argument indices (used by %method-more-specific-p)."
+  (let ((gf (%find-gf gf-name)))
+    (when gf
+      (let ((req (%dg-required-params lambda-list))
+            (idxs nil)
+            (cur apo))
+        (loop
+          (when (null cur) (return nil))
+          (let ((a (car cur))
+                (pos nil))
+            (let ((i 0) (rcur req))
+              (loop
+                (when (null rcur) (return nil))
+                (when (%dg-sym-eq a (car rcur)) (setq pos i) (return nil))
+                (setq i (+ i 1))
+                (setq rcur (cdr rcur))))
+            (when pos (setq idxs (cons pos idxs))))
+          (setq cur (cdr cur)))
+        (%gf-set-apo gf (nreverse idxs))))))
+
+(defun %gf-record-method-meta (gf m method-ll)
+  "Stash key-acceptance meta for method record M on GF, harvested from
+   METHOD-LL: (has-key has-rest aok key-name-strings)."
+  (when (and gf m)
+    (let ((shape (%lambda-list-shape method-ll))
+          (keys (%lambda-list-key-names method-ll)))
+      (let ((meta (list (nth 3 shape) (nth 2 shape) (nth 4 shape) keys)))
+        (%gf-set-method-meta gf (cons (cons m meta)
+                                      (%gf-method-meta gf)))))))
+
 (defun %find-gf (name)
-  "Find generic function by name."
+  "Find generic function by name.  (setf X) function names are LISTS —
+   each quoted occurrence is a distinct cons, so EQ never matches across
+   call sites; compare those structurally by their inner symbol."
   (let ((cur *generic-functions*))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (let ((k (car (car cur))))
+        (when (or (eq k name)
+                  (and (consp k) (consp name)
+                       (not (%cl-sym-p k)) (not (%cl-sym-p name))
+                       (consp (cdr k)) (consp (cdr name))
+                       (eq (car (cdr k)) (car (cdr name)))))
+          (return (cdr (car cur)))))
       (setq cur (cdr cur)))))
 
 (defun %defgeneric (name lambda-list combination)
@@ -1177,6 +1460,39 @@
   (let ((existing (%find-gf name)))
     (cond
       (existing
+       (when lambda-list
+         ;; CLHS DEFGENERIC redefinition: methods added by the PREVIOUS
+         ;; defgeneric form are removed (defgeneric.31/32); methods added
+         ;; by DEFMETHOD survive.
+         (let ((dg-methods (%gf-defgeneric-methods existing)))
+           (when dg-methods
+             (let ((kept nil) (cur (%gf-methods existing)))
+               (loop
+                 (when (null cur) (return nil))
+                 (let ((m (car cur))
+                       (drop nil))
+                   (let ((dcur dg-methods))
+                     (loop
+                       (when (null dcur) (return nil))
+                       (when (eq m (car dcur)) (setq drop t) (return nil))
+                       (setq dcur (cdr dcur))))
+                   (unless drop (setq kept (cons m kept))))
+                 (setq cur (cdr cur)))
+               (%gf-set-methods existing (nreverse kept))))
+           (%gf-set-defgeneric-methods existing nil))
+         ;; Surviving (DEFMETHOD-added) methods must be congruent with
+         ;; the new lambda-list (defgeneric.error.22): specializer count
+         ;; must equal the new required-parameter count.
+         (let ((req (%lambda-list-required-count lambda-list))
+               (cur (%gf-methods existing)))
+           (loop
+             (when (null cur) (return nil))
+             (unless (= (length (%method-specializers (car cur))) req)
+               (%signal-program-error))
+             (setq cur (cdr cur))))
+         ;; A redefinition resets :argument-precedence-order (the new
+         ;; form re-establishes it via %gf-set-arg-precedence if given).
+         (%gf-set-apo existing nil))
        (%gf-set-combination existing combination)
        ;; Only update lambda-list when we actually got one — don't clear
        ;; an existing declaration with an implicit auto-create call.
@@ -1240,6 +1556,35 @@
             (setq cur (cdr cur))))
         (%gf-set-methods gf (cons new-method (nreverse filtered))))
       new-method)))
+
+(defun %dg-gf-callable (gf-name)
+  "Value of a DEFGENERIC form: the registered dispatch fn for GF-NAME
+   (callable at any arity — compile-funcall's GF-struct path caps at 4
+   args) when one is recorded in *gf-fn-to-name*, else the GF struct."
+  (let ((found nil))
+    (let ((cur *gf-fn-to-name*))
+      (loop
+        (when (null cur) (return nil))
+        (when (eq (cdr (car cur)) gf-name)
+          (setq found (car (car cur)))
+          (return nil))
+        (setq cur (cdr cur))))
+    (if (and found (not (eql found 0)))
+        found
+        (%find-gf gf-name))))
+
+(defun %defgeneric-method (gf-name qualifier specializers fn method-ll)
+  "Add an inline (:method ...) from a DEFGENERIC form.  Like %defmethod
+   but (a) records the method as defgeneric-owned so a redefinition of
+   the GF removes it (CLHS DEFGENERIC), and (b) stashes key-acceptance
+   meta from METHOD-LL for CLHS 7.6.5 keyword checking."
+  (let ((m (%defmethod gf-name qualifier specializers fn)))
+    (let ((gf (%find-gf gf-name)))
+      (when gf
+        (%gf-set-defgeneric-methods
+         gf (cons m (%gf-defgeneric-methods gf)))
+        (%gf-record-method-meta gf m method-ll)))
+    m))
 
 ;;; ============================================================
 ;;; Method Combination (short form)
@@ -1599,10 +1944,71 @@
         (setq a (cdr a))))
     score))
 
+(defun %spec-rank (spec arg)
+  "Rank of specializer SPEC for argument ARG: lower = more specific.
+   (eql v) = -1, class = its position in ARG's CPL, T / not-in-CPL =
+   10000.  Mirrors the matching rules of %method-specificity."
+  (cond
+    ((and (consp spec) (eq (car spec) 'eql)) -1)
+    ((eq spec 't) 10000)
+    (t
+     (let ((cpl (%obj-cpl arg))
+           (pos 0)
+           (found nil))
+       (let ((c cpl))
+         (loop
+           (when (null c) (return nil))
+           (when (eq (car c) spec) (setq found t) (return nil))
+           (setq pos (+ pos 1))
+           (setq c (cdr c))))
+       (if found pos 10000)))))
+
+(defun %dg-nth-or-t (n lst)
+  "NTH that falls back to the symbol T past the end of LST — missing
+   specializer positions rank as T (least specific)."
+  (let ((cur lst) (i 0))
+    (loop
+      (when (null cur) (return 't))
+      (when (= i n) (return (car cur)))
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))))
+
+(defun %method-more-specific-p (m1 m2 args apo)
+  "CLHS 7.6.6.1.2: T iff M1 is strictly more specific than M2 for ARGS.
+   Specializers are compared POSITION BY POSITION (lexicographically),
+   in argument-precedence order when APO (a list of arg indices) is
+   non-NIL, left-to-right otherwise.  The old sum-of-scores comparator
+   got two-arg cases like defgeneric.3 backwards."
+  (let ((s1 (%method-specializers m1))
+        (s2 (%method-specializers m2))
+        (idxs apo))
+    (when (null idxs)
+      ;; Build (0 1 ... n-1) for left-to-right comparison.
+      (let ((n (length args))
+            (acc nil))
+        (let ((i (- n 1)))
+          (loop
+            (when (< i 0) (return nil))
+            (setq acc (cons i acc))
+            (setq i (- i 1))))
+        (setq idxs acc)))
+    (let ((cur idxs))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (let ((r1 (%spec-rank (%dg-nth-or-t k s1) (%dg-nth-or-t k args)))
+                (r2 (%spec-rank (%dg-nth-or-t k s2) (%dg-nth-or-t k args))))
+            (when (< r1 r2) (return t))
+            (when (> r1 r2) (return nil))))
+        (setq cur (cdr cur))))))
+
 (defun %collect-applicable-methods (gf args)
-  "Return all applicable methods sorted most-specific first."
+  "Return all applicable methods sorted most-specific first.
+   Sorting is the CLHS lexicographic specializer comparison
+   (%method-more-specific-p), honoring :argument-precedence-order."
   (let ((methods (%gf-methods gf))
-        (applicable nil))
+        (applicable nil)
+        (apo (%gf-apo gf)))
     ;; Collect applicable
     (let ((cur methods))
       (loop
@@ -1611,14 +2017,13 @@
           (when (%specializers-match-p (%method-specializers m) args)
             (setq applicable (cons m applicable))))
         (setq cur (cdr cur))))
-    ;; Sort by specificity (insertion sort — usually few methods)
+    ;; Insertion sort, most-specific first (usually few methods)
     (let ((sorted nil))
       (let ((cur applicable))
         (loop
           (when (null cur) (return nil))
-          (let ((m (car cur))
-                (score (%method-specificity (car cur) args)))
-            ;; Insert m into sorted in correct position
+          (let ((m (car cur)))
+            ;; Insert m into sorted before the first method it beats
             (let ((new-sorted nil)
                   (inserted nil)
                   (prev sorted))
@@ -1628,9 +2033,9 @@
                     (setq new-sorted (nreverse new-sorted))
                     (setq new-sorted (nreverse (cons m new-sorted))))
                   (return nil))
-                (let ((pm (car prev))
-                      (pm-score (%method-specificity (car prev) args)))
-                  (if (and (not inserted) (< score pm-score))
+                (let ((pm (car prev)))
+                  (if (and (not inserted)
+                           (%method-more-specific-p m pm args apo))
                     (progn
                       (setq new-sorted (cons m new-sorted))
                       (setq new-sorted (cons pm new-sorted))
@@ -1992,6 +2397,72 @@
 ;;; Main dispatch entry point
 ;;; ============================================================
 
+(defun %gf-check-keys (gf args applicable)
+  "CLHS 7.6.5: when the GF's lambda-list mentions &KEY (and not
+   &ALLOW-OTHER-KEYS), each keyword argument must be accepted by the GF
+   or by some applicable method.  :ALLOW-OTHER-KEYS <true> at the call
+   site disables the check.  Methods with &ALLOW-OTHER-KEYS, &REST
+   without &KEY, or unknown lambda-lists (no meta) make the call
+   lenient.  Signals PROGRAM-ERROR on an invalid keyword
+   (defgeneric.error.20/21)."
+  (let ((ll (%gf-lambda-list gf)))
+    (when ll
+      (let ((shape (%lambda-list-shape ll)))
+        (when (and (nth 3 shape) (not (nth 4 shape)))
+          ;; Skip required + optional args to reach the keyword portion.
+          (let ((skip (+ (nth 0 shape) (nth 1 shape)))
+                (kp args))
+            (let ((i 0))
+              (loop
+                (when (or (null kp) (>= i skip)) (return nil))
+                (setq kp (cdr kp))
+                (setq i (+ i 1))))
+            (when kp
+              ;; Call-site :allow-other-keys — leftmost occurrence wins.
+              (let ((aok-seen nil) (aok-val nil))
+                (let ((cur kp))
+                  (loop
+                    (when (or (null cur) (null (cdr cur))) (return nil))
+                    (let ((k (car cur)))
+                      (when (and (not aok-seen) (symbolp k)
+                                 (string= (symbol-name k)
+                                          "ALLOW-OTHER-KEYS"))
+                        (setq aok-seen t)
+                        (setq aok-val (car (cdr cur)))))
+                    (setq cur (cdr (cdr cur)))))
+                (unless (and aok-seen aok-val)
+                  ;; Valid names = GF keys + applicable methods' keys.
+                  (let ((valid (%lambda-list-key-names ll))
+                        (lenient nil))
+                    (let ((mcur applicable))
+                      (loop
+                        (when (null mcur) (return nil))
+                        (let ((meta (%gf-method-meta-for gf (car mcur))))
+                          (cond
+                            ((null meta) (setq lenient t))
+                            ((nth 2 meta) (setq lenient t))
+                            ((and (nth 1 meta) (not (nth 0 meta)))
+                             (setq lenient t))
+                            (t
+                             (let ((c (nth 3 meta)))
+                               (loop
+                                 (when (null c) (return nil))
+                                 (setq valid (cons (car c) valid))
+                                 (setq c (cdr c)))))))
+                        (setq mcur (cdr mcur))))
+                    (unless lenient
+                      (let ((cur kp))
+                        (loop
+                          (when (null cur) (return nil))
+                          (let ((k (car cur)))
+                            (let ((kn (if (symbolp k) (symbol-name k) nil)))
+                              (when (null kn) (%signal-program-error))
+                              (unless (or (string= kn "ALLOW-OTHER-KEYS")
+                                          (%dg-string-member kn valid))
+                                (%signal-program-error))))
+                          (setq cur (cdr (cdr cur))))))))))))))
+    nil))
+
 (defun %gf-dispatch (name args)
   "Dispatch generic function NAME with ARGS.
    The combination slot holds either a bare combination name (symbol)
@@ -2005,6 +2476,8 @@
       (when (null applicable)
         ;; Try no-applicable-method hook
         (error "no applicable method"))
+      ;; CLHS 7.6.5 keyword validity (no-op unless the GF declares &KEY).
+      (%gf-check-keys gf args applicable)
       (let* ((comb-raw (%gf-combination gf))
              (comb-name (if (consp comb-raw) (car comb-raw) comb-raw))
              (msl (and (consp comb-raw)
@@ -2142,7 +2615,12 @@
   (declare (ignore args))
   (let ((existing (%find-gf name)))
     (when existing
-      (return-from ensure-generic-function existing))
+      ;; Return the same callable a DEFGENERIC for NAME returned (the
+      ;; registered dispatch fn / stub) so (eqlt (defgeneric ...)
+      ;; (ensure-generic-function name)) holds — EGF.7/9/10/12/13
+      ;; compare with EQL.  Falls back to the GF struct when no
+      ;; callable was registered.
+      (return-from ensure-generic-function (%dg-gf-callable name)))
     ;; No GF yet — refuse if NAME is already bound to a non-GF function,
     ;; macro, or special operator.
     (cond
@@ -2155,7 +2633,9 @@
        (error "ensure-generic-function: ~S already names a non-generic function" name)))
     (let ((gf (%defgeneric name nil nil)))
       (set-symbol-function name (%make-gf-stub name))
-      gf)))
+      ;; Same callable-return contract as the existing-GF branch.
+      (let ((callable (%dg-gf-callable name)))
+        (if callable callable gf)))))
 
 ;;; ============================================================
 ;;; find-method / remove-method / add-method
@@ -2237,30 +2717,36 @@
 
 (defun remove-method (gf method)
   "Remove METHOD from GF.  Accepts either a GF-array or the dispatch
-   closure (#'name) via *gf-fn-to-name* reverse-lookup."
-  (unless (%gf-p gf)
-    (let ((real (%fn-to-gf gf)))
-      (when real (setq gf real))))
-  (when (%gf-p gf)
-    (let ((new-methods nil)
-          (cur (%gf-methods gf)))
-      (loop
-        (when (null cur) (return nil))
-        (when (not (eq (car cur) method))
-          (setq new-methods (cons (car cur) new-methods)))
-        (setq cur (cdr cur)))
-      (%gf-set-methods gf (nreverse new-methods))))
-  gf)
+   closure / fn (#'name) via *gf-fn-to-name* reverse-lookup.  Returns
+   the GF AS PASSED (CLHS: returns the generic function) — callers like
+   remove-method.1 compare the return value with EQ against the
+   designator they passed in."
+  (let ((orig gf))
+    (unless (%gf-p gf)
+      (let ((real (%fn-to-gf gf)))
+        (when real (setq gf real))))
+    (when (%gf-p gf)
+      (let ((new-methods nil)
+            (cur (%gf-methods gf)))
+        (loop
+          (when (null cur) (return nil))
+          (when (not (eq (car cur) method))
+            (setq new-methods (cons (car cur) new-methods)))
+          (setq cur (cdr cur)))
+        (%gf-set-methods gf (nreverse new-methods))))
+    orig))
 
 (defun add-method (gf method)
   "Add METHOD to GF.  Accepts either a GF-array or the dispatch
-   closure (#'name) via *gf-fn-to-name* reverse-lookup."
-  (unless (%gf-p gf)
-    (let ((real (%fn-to-gf gf)))
-      (when real (setq gf real))))
-  (when (%gf-p gf)
-    (%gf-set-methods gf (cons method (%gf-methods gf))))
-  gf)
+   closure / fn (#'name) via *gf-fn-to-name* reverse-lookup.  Returns
+   the GF AS PASSED (same contract as REMOVE-METHOD)."
+  (let ((orig gf))
+    (unless (%gf-p gf)
+      (let ((real (%fn-to-gf gf)))
+        (when real (setq gf real))))
+    (when (%gf-p gf)
+      (%gf-set-methods gf (cons method (%gf-methods gf))))
+    orig))
 
 (defun method-qualifiers (m)
   "Return qualifiers of METHOD M."

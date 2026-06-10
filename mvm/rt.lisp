@@ -325,7 +325,7 @@
         (write-char-serial 32)   ; space
         (write-object name)
         ;; Print actual value for first 5 failures — bounded.
-        (when (< *rt-fail-count* 50)
+        (when (< *rt-fail-count* 60)
           (write-char-serial 32)   ; space
           (write-string-serial "GOT:")
           (setq *write-object-budget* 200)
@@ -359,7 +359,7 @@
         (write-char-serial 76)
         (write-char-serial 32)
         (write-object name)
-        (when (< *rt-fail-count* 50)
+        (when (< *rt-fail-count* 60)
           (write-char-serial 32)
           (write-string-serial "GOT:")
           (setq *write-object-budget* 200)

@@ -218,6 +218,13 @@
    at boot via init-compiler-macro-set.  MACRO-FUNCTION consults this
    so it reports a non-NIL value for PUSH/POP/COND/etc.")
 
+(defvar *%extra-macro-names* nil
+  "Hash-set of name-hashes for macros DEFMACRO'd at build time in test
+   sources (compile-time-only — no runtime expander).  MACRO-FUNCTION
+   consults it so (macro-function 'test-file-macro) reports T, e.g.
+   defgeneric.error.2's check that a macro name can't be made generic.
+   NOT consulted by %raw-macro-expander — there is no expander.")
+
 (defun init-compiler-macro-set ()
   "Build *%compiler-macro-hashes* — an EQUAL hash-table whose keys are
    the dual-FNV-1a hashes of compiler-known CL macro names.  Keep this
@@ -392,6 +399,11 @@
                                   (t 0))))
                      (and (> h 0) (gethash h *macro-table*)))))
              ((and (stringp key) (%compiler-macro-p key)) t)
+             ;; Build-time test-source defmacros (no runtime expander —
+             ;; report T so MACRO-FUNCTION is truthful about macro-ness).
+             ((and (stringp key) *%extra-macro-names*
+                   (gethash (compute-name-hash key) *%extra-macro-names*))
+              t)
              (t nil))))
       (cond
         ((null raw) nil)
@@ -2276,8 +2288,12 @@
                    (let ((existing (gethash fname *symbol-function-table*)))
                      (when (null existing)
                        (set-symbol-function gf-name (%make-gf-stub gf-name))))))
-               ;; Add the method to the gf and return it.
-               (%defmethod gf-name qualifier specs fn))))))
+               ;; Add the method to the gf and return it.  Record
+               ;; key-acceptance meta from the full lambda-list so
+               ;; %gf-check-keys (CLHS 7.6.5) can validate keywords.
+               (let ((m (%defmethod gf-name qualifier specs fn)))
+                 (%gf-record-method-meta (%find-gf gf-name) m params)
+                 m))))))
       ;; (defgeneric name lambda-list &rest options)
       ;; Options handled: :method-combination, :method (inline)
       ((%eval-sym-eq op "DEFGENERIC")
@@ -2285,6 +2301,27 @@
               (lambda-list (cadr args))
               (options (cddr args))
               (combination nil))
+         ;; CLHS: a name bound to a macro / special operator / ordinary
+         ;; function cannot be made generic — PROGRAM-ERROR
+         ;; (defgeneric.error.1/2/3).  Only checked when no GF exists
+         ;; yet (redefinition of an existing GF is fine — its dispatch
+         ;; defun/stub IS fbound).
+         (when (null (%find-gf gf-name))
+           (let ((symish (or (%cl-sym-p gf-name)
+                             (and (symbolp gf-name)
+                                  (not (consp gf-name))))))
+             (when symish
+               (when (macro-function gf-name)
+                 (%signal-program-error))
+               (when (special-operator-p gf-name)
+                 (%signal-program-error))
+               (when (and (fboundp gf-name)
+                          (not (%generic-function-p (fdefinition gf-name))))
+                 (%signal-program-error)))))
+         ;; CLHS option validation: unknown/repeated options, bad
+         ;; :argument-precedence-order, incongruent inline :method
+         ;; lambda-lists — PROGRAM-ERROR (defgeneric.error.4-19).
+         (%validate-defgeneric-options gf-name lambda-list options)
          (dolist (opt options)
            ;; Both keywords (:method-combination) and bare symbols
            ;; (method-combination) match — Modus's symbol-name strips the
@@ -2302,14 +2339,26 @@
          ;; Pass lambda-list so %defmethod / find-method can validate
          ;; method-vs-GF arity congruence.
          (%defgeneric gf-name lambda-list combination)
+         ;; :argument-precedence-order — store as arg-index list for
+         ;; %method-more-specific-p.
+         (dolist (opt options)
+           (when (and (consp opt) (symbolp (car opt))
+                      (%eval-sym-eq (car opt) "ARGUMENT-PRECEDENCE-ORDER"))
+             (%gf-set-arg-precedence gf-name (cdr opt) lambda-list)))
          ;; Install runtime stub so (funcall sym ...) dispatches.
          (set-symbol-function gf-name (%make-gf-stub gf-name))
          ;; Inline (:method ...) options — re-eval each as a defmethod
-         ;; form.  Same name-vs-keyword note as above.
+         ;; form.  Same name-vs-keyword note as above.  Record each
+         ;; resulting method as defgeneric-owned so a redefinition
+         ;; removes it (CLHS DEFGENERIC).
          (dolist (opt options)
            (when (and (consp opt) (symbolp (car opt))
                       (%eval-sym-eq (car opt) "METHOD"))
-             (%eval-in-env (cons 'defmethod (cons gf-name (cdr opt))) env)))
+             (let ((m (%eval-in-env (cons 'defmethod (cons gf-name (cdr opt))) env)))
+               (let ((gf (%find-gf gf-name)))
+                 (when (and gf m (consp m))
+                   (%gf-set-defgeneric-methods
+                    gf (cons m (%gf-defgeneric-methods gf))))))))
          ;; Return the dispatch stub closure — typep'p as generic-function
          ;; AND callable via funcall.  Returning the raw GF object (a
          ;; 4-slot array) is what CLHS specifies in spirit, but the

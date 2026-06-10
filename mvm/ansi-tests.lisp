@@ -2087,6 +2087,14 @@
 ;; Special used by dg-mc probes 9862/9863 (defvar defaults to NIL at
 ;; boot — CLAUDE.md item 7 — which is exactly the value we want).
 (defvar *dgmc-probe-x* nil)
+;; Dispatch defuns for the defgeneric diag probes (9830-9846) — mirror
+;; the build rewriter's (defun NAME (&rest a) (%gf-dispatch 'NAME a)).
+(defun %diag-dg-fn1 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn1 %gf-args))
+(defun %diag-dg-fn2 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn2 %gf-args))
+(defun %diag-dg-fn3 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn3 %gf-args))
+(defun %diag-dg-fn4 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn4 %gf-args))
+(defun %diag-dg-fn5 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn5 %gf-args))
+(defun %diag-dg-fn6 (&rest %gf-args) (%gf-dispatch '%diag-dg-fn6 %gf-args))
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
@@ -2426,6 +2434,102 @@
                                     'setup-ok)))
                   (error nil :outer-err))
                 'setup-ok)
+  ;; ============================================================
+  ;; defgeneric machinery probes (9830-9846) — replicate the broken
+  ;; sub-expressions of objects/defgeneric.lsp's functionality tests
+  ;; against the runtime CLOS internals directly.
+  ;; ============================================================
+  ;; fn1: 3-required-arg GF, one t/t/t method (defgeneric.1 shape)
+  (%defgeneric '%diag-dg-fn1 '(x y z) nil)
+  (handler-case (%register-gf-fn (function %diag-dg-fn1) '%diag-dg-fn1)
+    (t (c) nil))
+  (%defgeneric-method '%diag-dg-fn1 nil (list 't 't 't)
+                      (lambda (x y z) (block %diag-dg-fn1 (list x y z)))
+                      '(x y z))
+  (let ((fn (function %diag-dg-fn1)))
+    (deftest 9830 (notnot (typep fn 'generic-function)) t)
+    (deftest 9831 (notnot (typep fn 'standard-generic-function)) t)
+    (deftest 9832 (funcall fn 'a 'b 'c) '(a b c))
+    (deftest 9833 (apply fn 1 2 3 nil) '(1 2 3))
+    (deftest 9834 (apply fn (list 4 5 6)) '(4 5 6))
+    (deftest 9835 (mapcar fn '(1 2) '(3 4) '(5 6)) '((1 3 5) (2 4 6)))
+    (deftest 9836 (%diag-dg-fn1 'd 'e 'f) '(d e f)))
+  ;; fn2: 0-arg GF returning multiple values (defgeneric.5/6 shape)
+  (%defgeneric '%diag-dg-fn2 '() nil)
+  (handler-case (%register-gf-fn (function %diag-dg-fn2) '%diag-dg-fn2)
+    (t (c) nil))
+  ;; NOTE: no BLOCK wrap here — block-around-(values ...) is suspected
+  ;; of collapsing MV in the MVM compiler; 9847 is the block control.
+  (%defgeneric-method '%diag-dg-fn2 nil (list)
+                      (lambda () (values 'a 'b 'c))
+                      '())
+  (let ((fn (function %diag-dg-fn2)))
+    (deftest 9837 (multiple-value-list (funcall fn)) '(a b c))
+    (deftest 9838 (multiple-value-list (apply fn nil)) '(a b c))
+    (deftest 9839 (multiple-value-list (%diag-dg-fn2)) '(a b c)))
+  ;; fn3: &optional with defaults (defgeneric.9 shape)
+  (%defgeneric '%diag-dg-fn3 '(x &optional y z) nil)
+  (%defgeneric-method '%diag-dg-fn3 nil (list 't)
+                      (lambda (x &optional (y 10) (z 20))
+                        (block %diag-dg-fn3 (list x y z)))
+                      '(x &optional y z))
+  (deftest 9840 (%diag-dg-fn3 1) '(1 10 20))
+  (deftest 9841 (%diag-dg-fn3 1 2) '(1 2 20))
+  ;; fn4: &key with default (defgeneric.11/16 shape)
+  (%defgeneric '%diag-dg-fn4 '(x &key) nil)
+  (%defgeneric-method '%diag-dg-fn4 nil (list 't)
+                      (lambda (x &key (foo 'a))
+                        (block %diag-dg-fn4 (list x foo)))
+                      '(x &key foo))
+  (deftest 9842 (%diag-dg-fn4 1) '(1 a))
+  (deftest 9843 (%diag-dg-fn4 1 :foo 2) '(1 2))
+  ;; fn5: &aux (defgeneric.23 shape)
+  (%defgeneric '%diag-dg-fn5 '(x) nil)
+  (%defgeneric-method '%diag-dg-fn5 nil (list 't)
+                      (lambda (x &aux (y (1+ x)))
+                        (block %diag-dg-fn5 (list x y)))
+                      '(x &aux y))
+  (deftest 9844 (%diag-dg-fn5 1) '(1 2))
+  ;; 9844b shape lives in 9846; this one drives the GF-STRUCT funcall
+  ;; path (%FUNCALL-GF-3) with an invalid key and a plain ERROR clause —
+  ;; the exact defgeneric.error.20 shape (its signals-error catches
+  ;; ERROR, so program-error must match an ERROR clause).
+  (deftest 9849 (handler-case
+                  (progn (funcall (%find-gf '%diag-dg-fn4) 1 :bar 2) nil)
+                  (error (c) :err))
+                :err)
+  ;; fn6: two-method left-to-right specificity (defgeneric.3 shape):
+  ;; (t symbol) vs (symbol t) on ('a 'b) — leftmost arg decides, the
+  ;; (symbol t) method must win and return (b a).
+  (%defgeneric '%diag-dg-fn6 '(x y) nil)
+  (%defgeneric-method '%diag-dg-fn6 nil (list 't 'symbol)
+                      (lambda (x y) (block %diag-dg-fn6 (list x y)))
+                      '(x y))
+  (%defgeneric-method '%diag-dg-fn6 nil (list 'symbol 't)
+                      (lambda (x y) (block %diag-dg-fn6 (list y x)))
+                      '(x y))
+  (deftest 9845 (%diag-dg-fn6 'a 'b) '(b a))
+  ;; key-check: invalid key on a strict &key GF must program-error
+  ;; (defgeneric.error.20 shape)
+  (deftest 9846 (handler-case (%diag-dg-fn4 1 :bar 2)
+                  (program-error (c) :pgm-err)
+                  (error (c) :other-err))
+                :pgm-err)
+  ;; 9847: BLOCK + (values ...) control — does a block wrapper collapse
+  ;; multiple values on normal fallthrough?
+  (deftest 9847 (multiple-value-list
+                 (funcall (lambda () (block %diag-blk (values 1 2 3)))))
+                '(1 2 3))
+  ;; 9848: test-source defun/defmacro registration (%init-test-defs) —
+  ;; fboundp must see defgeneric.lsp's defgeneric-testfn-01, and
+  ;; macro-function must see defgeneric-testmacro-02.
+  (deftest 9848 (list (notnot (fboundp 'defgeneric-testfn-01))
+                      (notnot (macro-function 'defgeneric-testmacro-02)))
+                '(t t))
+  ;; (9849 repurposed above: GF-struct funcall key-check.  The previous
+  ;; 9849 — runtime (eval (defgeneric <ordinary-fn>)) → program-error —
+  ;; PASSED on 2026-06-10 and was retired to stay within the 9830-9849
+  ;; probe ID budget.)
   ;; Inside-the-box probes
   (deftest 9775 (consp *gf-stub-closures*) t)
   (deftest 9776 (notnot (member (function %clos-diag-reader) *gf-stub-closures*)) t)

@@ -83,6 +83,13 @@
    ANSI tests reference it by name (e.g. via def-print-test templates)."
   (if (rt-equal a b) t nil))
 
+(defun string=t (s1 s2 &rest args)
+  "ansi-aux's string=t (T/NIL-normalized STRING=).  ansi-aux.lsp is
+   skipped wholesale at build (read-time #. error), so without this the
+   defgeneric.2 documentation checks called an undefined function."
+  (declare (ignore args))
+  (if (string= s1 s2) t nil))
+
 (defun notnot (x)
   (if x t nil))
 
@@ -1864,8 +1871,31 @@
 
 (defvar *documentation-strings* nil)
 
+(defun %doc-type-normalize (doc-type)
+  "CLHS: for function objects, doc-types T and FUNCTION address the same
+   documentation — (setf (documentation fn 'function) s) must be visible
+   to (documentation fn t) (defgeneric.2).  Normalize FUNCTION → T so
+   both use one storage key."
+  (if (and doc-type (symbolp doc-type)
+           (string= (symbol-name doc-type) "FUNCTION"))
+      t
+      doc-type))
+
+(defun %doc-key-eq (x k)
+  "Documentation-registry key identity.  Function-ish objects (compiled
+   fns, closures, interp-closure conses) compare by EQ — EQUAL on two
+   structurally-identical interp-closures from DIFFERENT (eval (defun
+   ...)) calls wrongly unified their doc entries
+   (documentation.function.function.1).  Names (symbols, (setf foo)
+   lists) keep structural EQUAL."
+  (if (or (functionp x)
+          (and (consp x) (eq (car x) '%interp-closure)))
+      (eq x k)
+      (equal x k)))
+
 (defun documentation (x doc-type)
   "Look up doc string for X under DOC-TYPE, or NIL."
+  (setq doc-type (%doc-type-normalize doc-type))
   (let ((key (cons x doc-type))
         (cur *documentation-strings*)
         (found nil))
@@ -1873,13 +1903,14 @@
       (when (or found (null cur)) (return found))
       (when (and (consp (car cur)) (consp (car (car cur)))
                  (let ((k (car (car cur))))
-                   (and (equal (car k) x) (eq (cdr k) doc-type))))
+                   (and (%doc-key-eq x (car k)) (eq (cdr k) doc-type))))
         (setq found (cdr (car cur))))
       (setq cur (cdr cur)))))
 
 (defun set-documentation (x doc-type string)
   "Install STRING as the doc for (X . DOC-TYPE) in
    *documentation-strings*, replacing any prior entry."
+  (setq doc-type (%doc-type-normalize doc-type))
   (let ((key (cons x doc-type))
         (cur *documentation-strings*)
         (acc nil)
@@ -1889,7 +1920,7 @@
       (let ((entry (car cur)))
         (let ((k (car entry)))
           (cond
-            ((and (consp k) (equal (car k) x) (eq (cdr k) doc-type))
+            ((and (consp k) (%doc-key-eq x (car k)) (eq (cdr k) doc-type))
              (setq acc (cons (cons key string) acc))
              (setq replaced t))
             (t (setq acc (cons entry acc))))))
@@ -1897,6 +1928,32 @@
     (unless replaced (setq acc (cons (cons key string) acc)))
     (setq *documentation-strings* acc))
   string)
+
+;;; ============================================================
+;;; set-apply — receiver for (setf (apply #'aref arr subs...) v)
+;;; ============================================================
+
+(defun set-apply (fn &rest stuff)
+  "CLHS 5.1.2.5: (setf (apply #'aref array subscripts) new-value).
+   The compiler's generic-setf expansion for an unknown place head
+   compiles (setf (apply F a1 .. an tail) V) into
+   (SET-APPLY F a1 .. an tail V).  Only the #'AREF shape with a single
+   subscript (1-D arrays) is supported — the only shape the ANSI suite
+   exercises (defgeneric.33).  Returns NEW-VALUE per SETF semantics."
+  (declare (ignore fn))
+  (let ((value (car (last stuff)))
+        (apply-args (butlast stuff)))
+    (let ((spread (butlast apply-args))
+          (tail (car (last apply-args))))
+      (let ((all (append spread tail)))
+        (let ((arr (car all))
+              (subs (cdr all)))
+          (when (and arr subs (null (cdr subs)))
+            ;; Variable-index ASET as non-last form needs the let-dummy
+            ;; workaround (CLAUDE.md MVM limitation #2).
+            (let ((dummy (aset arr (car subs) value)))
+              dummy))
+          value)))))
 
 ;;; ============================================================
 ;;; classes-are-disjoint — type test helper
@@ -3084,11 +3141,24 @@
   symbol)
 
 (defun special-operator-p (symbol)
-  "Return T if SYMBOL is a special operator."
-  (member symbol '(let let* if progn setq quote lambda defun defmacro
-                   block return-from tagbody go catch throw unwind-protect
-                   eval-when locally progv multiple-value-call
-                   multiple-value-prog1 load-time-value the declare)))
+  "Return T if SYMBOL is a special operator.  The eq-member check covers
+   same-package literals; the symbol-name fallback covers cross-package
+   symbols (CLHS 11.1.2 per-package interning means a CL-TEST-package
+   'LET is not EQ to ours) against the canonical CLHS Figure 3-2 set."
+  (or (member symbol '(let let* if progn setq quote lambda defun defmacro
+                       block return-from tagbody go catch throw unwind-protect
+                       eval-when locally progv multiple-value-call
+                       multiple-value-prog1 load-time-value the declare))
+      (and (symbolp symbol)
+           (let ((n (symbol-name symbol)))
+             (and (stringp n) (> (length n) 0)
+                  (%dg-string-member
+                   n '("BLOCK" "CATCH" "EVAL-WHEN" "FLET" "FUNCTION" "GO"
+                       "IF" "LABELS" "LET" "LET*" "LOAD-TIME-VALUE"
+                       "LOCALLY" "MACROLET" "MULTIPLE-VALUE-CALL"
+                       "MULTIPLE-VALUE-PROG1" "PROGN" "PROGV" "QUOTE"
+                       "RETURN-FROM" "SETQ" "SYMBOL-MACROLET" "TAGBODY"
+                       "THE" "THROW" "UNWIND-PROTECT")))))))
 
 (defun compiled-function-p (x)
   "Return T if X is a compiled function."

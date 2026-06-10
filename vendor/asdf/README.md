@@ -31,11 +31,41 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of 2026-06-10)
+## Gauntlet frontier (as of 2026-06-10, after GC-root fix)
 
-Reaches form 11 (`define-package :uiop/common-lisp`); fails there and the
-reader desyncs (form 12 = `(in-package :uiop/common-lisp)` READ-ERRORs
-because form 11's mid-execution fault corrupts global package state).
+Reaches form **26** with **fails=0** (define-package for UIOP/PACKAGE,
+UIOP/COMMON-LISP and UIOP/UTILITY all complete; INPKG markers print for
+forms 2/12/17).  New frontier is a `READ-ERROR after form 26` — a reader
+desync that is NOT GC-related (separate track).
+
+### RESOLVED — GC fault during `define-package` reexport (was the #1 blocker)
+
+The fault during form 11's `:use-reexport :common-lisp` (979-symbol loop,
+crash at ~symbol 404 with a wild `#<?N>` condition) was a **missing GC
+root**.  The Cheney trampoline's root scan (mvm/translate-x64.lisp,
+`emit-gc-trampoline`) scanned the globals alist (`0x10000080`) and the
+symbol intern table (`0x10000088`) but **not** two other BSS-resident
+heap roots:
+
+  - `0x10000148` — the **keyword intern table** (`init-keyword-table` /
+    `%intern-keyword`).
+  - `0x10000170` — the **package-by-hash table** (`%init-pkg-by-hash` /
+    `%intern-symbol-pkg`).
+
+Both are heap hash-tables whose root slot the GC must forward.  `define-
+package`'s reexport interns ~979 symbols and many keywords through the
+interpreter; that allocation crosses the GC midpoint (~448MB through the
+interp) and fires a real collection.  After the copy completed (gc-count
+→ 1) the keyword/pkg tables still pointed into the now-dead from-space, so
+the next `%intern-keyword` / `keywordp` deref read a stale pointer and
+faulted — the wild `#<?N>` "condition" was that corrupted pointer.
+
+Fix: scan both slots in the trampoline root set (two extra
+`mov rax, imm; call scan_word` pairs).  Verified with an early-GC debug
+build (`MODUS_GC_R14=<bytes>` knob in build-generic.lisp): the README's
+minimal `make-string` reproducer survives 50+ collections, keyword `eq`
+identity holds across GC, and the gauntlet advances 11 → 26.  ANSI gate:
+15,251 → 15,260 passed, 122 → 112 lost-to-crash.
 
 ### `&REST` :internal status — FIXED (shared layer)
 

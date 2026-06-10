@@ -226,6 +226,14 @@
   (let ((fp (%gc-forward-slot #x10000080 from-start from-size free-ptr)))
     ;; The symbol intern table head pointer
     (setq fp (%gc-forward-slot #x10000088 from-start from-size fp))
+    ;; The keyword intern table (0x10000148) and package-by-hash table
+    ;; (0x10000170) are ALSO heap roots — both are hash-tables interned
+    ;; into during runtime EVAL.  Missing them stranded keywords/symbols
+    ;; in dead from-space after a collection, faulting the next deref.
+    ;; (This mirrors the x64 inline trampoline fix in translate-x64.lisp;
+    ;; keep the two root sets in sync.)
+    (setq fp (%gc-forward-slot #x10000148 from-start from-size fp))
+    (setq fp (%gc-forward-slot #x10000170 from-start from-size fp))
     fp))
 
 ;;; ============================================================

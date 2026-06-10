@@ -508,6 +508,18 @@
 ;; allocation walked all the way to the end — too late for a Cheney
 ;; copy that needs the other half free.
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; Debug knob: MODUS_GC_R14=<hex-or-dec bytes> forces R14 to a small offset
+;; so GC fires early (fast repro of GC-from-runtime-EVAL faults).  Leaves
+;; the from/to semispaces 448MB apart (unchanged), only moves the trigger.
+#+sbcl
+(let ((dbg (sb-ext:posix-getenv "MODUS_GC_R14")))
+  (when (and dbg (> (length dbg) 0))
+    (let ((v (parse-integer dbg :radix (if (and (> (length dbg) 1)
+                                                (char= (char dbg 0) #\#))
+                                           16 10)
+                            :start (if (char= (char dbg 0) #\#) 1 0))))
+      (setf modus.mvm::*linux-x64-r14-offset* v)
+      (format t "~%[DEBUG] R14 offset forced to ~X (GC fires early)~%" v))))
 
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))

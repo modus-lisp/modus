@@ -3487,6 +3487,18 @@
     ;; Symbol table at 0x10000088
     (emit-mov-reg-imm buf 'rax #x10000088)
     (emit-call buf scan-word-label)
+    ;; Keyword intern table at 0x10000148 (init-keyword-table / %intern-keyword).
+    ;; A heap hash-table root: without scanning it, any keyword interned
+    ;; before a collection becomes a stale from-space pointer and the next
+    ;; KEYWORDP / keyword deref faults.  %intern-keyword re-reads this slot
+    ;; after each alloc expecting the GC to have forwarded it.
+    (emit-mov-reg-imm buf 'rax #x10000148)
+    (emit-call buf scan-word-label)
+    ;; Package-by-hash table at 0x10000170 (%init-pkg-by-hash / %intern-symbol-pkg).
+    ;; Same convention as the symbol intern table — a heap hash-table whose
+    ;; root slot the GC must forward.
+    (emit-mov-reg-imm buf 'rax #x10000170)
+    (emit-call buf scan-word-label)
 
     ;; ---- Cheney scan loop ----
     ;; R10 = scan pointer (starts at to_start)

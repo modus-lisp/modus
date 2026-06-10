@@ -2678,15 +2678,43 @@
   (deftest 9131 (safe-eval (lambda () (car 0)))  :crashed)
   (deftest 9132 (safe-eval (lambda () (cdr 42))) :crashed)
   (deftest 9133 (safe-eval (lambda () (car 42))) :crashed)
-  ;; --- Band 2a float-native trig smoke probes (9881-9885) ---
+  ;; --- Band 2a float-native trig smoke probes (9973-9977) ---
   ;; Kept minimal: these don't go through approx= (which crashes the
   ;; parent diag chunk for reasons unrelated to the trig rewrite — the
   ;; real ANSI cos/sin/tan/etc. ranges exercise approx= fine).
-  (run-test 9881 (lambda () (floatp (%float-from-int 5))) 't)
-  (run-test 9882 (lambda () (floatp (%fpi))) 't)
-  (run-test 9883 (lambda () (%float-to-int (%float-add (%fl 79) (%f-half)))) 79)
-  (run-test 9884 (lambda () (floatp (%trig-reduce-f (%fl 500)))) 't)
-  (run-test 9885 (lambda () (floatp (cos 0.0))) 't)
+  (run-test 9973 (lambda () (floatp (%float-from-int 5))) 't)
+  (run-test 9974 (lambda () (floatp (%fpi))) 't)
+  (run-test 9975 (lambda () (%float-to-int (%float-add (%fl 79) (%f-half)))) 79)
+  (run-test 9976 (lambda () (floatp (%trig-reduce-f (%fl 500)))) 't)
+  (run-test 9977 (lambda () (floatp (cos 0.0))) 't)  ;; ===== Band 2b array probes =====
+  ;; rank-2 MDA: %mda-p?  rank?  fill-pointer should signal.
+  (let ((m (make-array '(2 3))))
+    (run-test 9881 (lambda () (notnot (%mda-p m))) 't)
+    (run-test 9882 (lambda () (array-rank m)) '2)
+    (run-test 9883 (lambda () (%mda-fp m)) 'nil)
+    (run-test 9884 (lambda () (handler-case (progn (fill-pointer m) nil) (error (c) t))) 't))
+  ;; #2a reader literal
+  (run-test 9885 (lambda () (notnot (%mda-p #2a((a b c)(d e f))))) 't)
+  (run-test 9886 (lambda () (array-rank #2a((a b c)(d e f)))) '2)
+  (run-test 9887 (lambda () (handler-case (progn (fill-pointer #2a((a b c)(d e f))) nil) (error (c) t))) 't)
+  ;; adjustable flag tracking
+  (let ((a (make-array 5 :adjustable t))
+        (b (make-array 5)))
+    (run-test 9888 (lambda () (notnot (adjustable-array-p a))) 't)
+    (run-test 9889 (lambda () (adjustable-array-p b)) 'nil))
+  ;; typep of native MDA against compound array specs
+  (let ((m (make-array '(3 2))))
+    (run-test 9890 (lambda () (arrayp m)) 't)
+    (run-test 9891 (lambda () (array-rank m)) '2)
+    (run-test 9892 (lambda () (array-dimensions m)) '(3 2))
+    (run-test 9893 (lambda () (notnot (typep m '(array t (* *))))) 't)
+    (run-test 9894 (lambda () (notnot (typep m '(array t 2)))) 't)
+    (run-test 9895 (lambda () (notnot (typep m '(array *)))) 't)
+    (run-test 9896 (lambda () (notnot (%typep-array-elt-match-p m 't))) 't)
+    (run-test 9897 (lambda () (notnot (%typep-array-dims-match-p m '(* *)))) 't)
+    (run-test 9898 (lambda () (notnot (typep m 'array))) 't)
+    (run-test 9899 (lambda () (notnot (arrayp m))) 't)
+    (run-test 9900 (lambda () (notnot (typep m '(simple-array t (* *))))) 't))
   )
 
 ;;; ============================================================

@@ -2668,16 +2668,19 @@
     (t nil)))
 
 ;; Convert a literal 0-dim or N-dim SBCL array into a Modus
-;; runtime-construction form using the multi-dim wrapper convention
-;; (cons 9867654 (cons DIMS FLAT-ARR)). Recursively rewrites elements
-;; so nested array literals also become constructions. 1-D vectors and
-;; strings are returned unchanged — their printed form round-trips through
-;; the Modus reader as a real array/string.
+;; runtime-construction form building a NATIVE MDA (subtag #x34) via
+;; %alloc-mda, so %mda-p / array-rank / fill-pointer / typep see it as a
+;; real multi-dim array (legacy (cons 9867654 ...) wrappers don't satisfy
+;; %mda-p, which broke array-t / fill-pointer.error reader-literal tests).
+;; Recursively rewrites elements so nested array literals also become
+;; native MDAs.  1-D vectors and strings are returned unchanged — their
+;; printed form round-trips through the Modus reader as a real array/string.
 (defun %mdrewrite-array-literals (form)
   (cond
     ((and (arrayp form) (not (stringp form))
           (or (= (array-rank form) 0) (> (array-rank form) 1)))
      (let* ((dims  (array-dimensions form))
+            (rank  (array-rank form))
             (total (array-total-size form))
             (sz    (if (= total 0) 1 total))
             (asets (loop for i below total
@@ -2685,11 +2688,10 @@
                            (let ((v (%mdrewrite-array-literals
                                      (row-major-aref form i))))
                              `(aset %md-tmp ,i ',v)))))
-       `(cons 9867654
-              (cons ',dims
+       `(%alloc-mda ,rank ',dims nil nil 0 t
                     (let ((%md-tmp (make-array ,sz)))
                       ,@asets
-                      %md-tmp)))))
+                      %md-tmp))))
     ((consp form)
      (cons (%mdrewrite-array-literals (car form))
            (%mdrewrite-array-literals (cdr form))))

@@ -4764,6 +4764,54 @@
                (let ((sz (and (cdr type) (cadr type))))
                  (or (null sz) (eq sz '*) (eq sz t)
                      (and (integerp sz) (= sz (array-length obj)))))))
+         ;; Native MDA (subtag #x34): the legacy clause below only knows
+         ;; the #x31/#x32 vector subtags and the 9867654/8765432 cons
+         ;; wrappers, so a native multi-dim array (e.g. a #2a(...) reader
+         ;; literal, now built via %alloc-mda) falls through to NIL.
+         ;; Handle it here using array-rank / array-dimensions, which both
+         ;; understand MDA.  Covers (array ELT DIMS) and (vector ELT SIZE).
+         ((and (or (eq head 'vector) (eq head 'simple-vector)
+                   (eq head 'simple-array) (eq head 'array))
+               (%mda-p obj))
+          (let ((et   (and (cdr type) (cadr type)))
+                (dims (and (cddr type) (caddr type)))
+                (dims-given (and (cddr type) t)))
+            (and
+             ;; vector / simple-vector require rank 1
+             (if (or (eq head 'vector) (eq head 'simple-vector))
+                 (= (array-rank obj) 1)
+                 t)
+             ;; element-type: MDA-with-string-data → character family;
+             ;; otherwise element type is T.
+             (let ((str (%mda-stringp obj)))
+               (cond
+                 ((or (null et) (eq et '*)) t)
+                 ((eq et t) (not str))
+                 ((or (eq et 'character) (eq et 'base-char)
+                      (eq et 'standard-char)) str)
+                 ((eq et 'bit) nil)
+                 (t (not str))))
+             ;; dimension spec
+             (cond
+               ((not dims-given) t)
+               ((eq dims '*) t)
+               ((eq dims t) t)
+               ((null dims) (= (array-rank obj) 0))
+               ((integerp dims) (= dims (array-rank obj)))
+               ((consp dims)
+                (let ((actual (array-dimensions obj)) (spec dims) (ok t))
+                  (loop
+                    (when (or (and (null actual) (null spec)) (not ok))
+                      (return ok))
+                    (when (or (null actual) (null spec))
+                      (setq ok nil) (return ok))
+                    (let ((ad (car actual)) (sd (car spec)))
+                      (unless (or (eq sd '*) (eq sd t)
+                                  (and (integerp sd) (= sd ad)))
+                        (setq ok nil)))
+                    (setq actual (cdr actual))
+                    (setq spec (cdr spec)))))
+               (t nil)))))
          ((or (eq head 'vector) (eq head 'simple-vector)
               (eq head 'simple-array) (eq head 'array))
           (let ((wrapped-dims

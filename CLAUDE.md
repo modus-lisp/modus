@@ -96,10 +96,10 @@ runtime/        Runtime type system
 
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,415 tests (adjust-array.lsp now loads; +63 to the denominator)
-- Ran: 17,320
-- Passed: 15,235 (87.48% overall, 87.96% of those that ran)
-- Failed: 2,085
-- Lost-to-crash: 95
+- Ran: 17,317
+- Passed: 15,249 (87.56% overall, 88.06% of those that ran)
+- Failed: 2,070
+- Lost-to-crash: 98
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

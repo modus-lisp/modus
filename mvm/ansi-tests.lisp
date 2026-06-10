@@ -20,12 +20,38 @@
               (if (my-equal (car a) (car b))
                   (my-equal (cdr a) (cdr b))
                   nil)
-              nil)
+              ;; A is a cons but B isn't — B may be an array wrapped value
+              ;; that rt-equal can peel (fp/displaced/adjustable wrapper or
+              ;; native MDA).  Delegate to rt-equal for the array-ish cases.
+              (if (rt-arrayish-p b) (if (rt-equal a b) t nil) nil))
           (if (stringp a)
               (if (stringp b)
                   (string-equal a b)
-                  nil)
-              nil))))
+                  (if (rt-arrayish-p b) (if (rt-equal a b) t nil) nil))
+              ;; A is neither cons nor string.  If either side is an array /
+              ;; MDA / array-wrapper, defer to rt-equal which compares
+              ;; element-wise (and peels native MDAs to their visible data).
+              ;; Plain (make-array ...) results and #na reader literals land
+              ;; here — my-equal previously returned NIL for all of them, so
+              ;; (equalpt (make-array '(2 3) ...) #2a(...)) was always NIL.
+              (if (or (rt-arrayish-p a) (rt-arrayish-p b))
+                  (if (rt-equal a b) t nil)
+                  nil)))))
+
+(defun rt-arrayish-p (x)
+  "True if X is a plain array, native MDA, or one of the cons-shaped array
+   wrappers (fp / displaced / adjustable) that rt-equal knows how to peel.
+   Used by my-equal to decide whether to fall back to rt-equal for
+   array comparison without pulling in its deep if-chain on the common
+   cons/string/eql paths."
+  (cond
+    ((fixnump x) nil)
+    ((null x) nil)
+    ((stringp x) t)
+    ((consp x)
+     (or (eql (car x) 8765432) (eql (car x) 9867654)
+         (rt-fp-array-wrapper-p x) (rt-disp-array-wrapper-p x)))
+    (t (rt-arrayp x))))
 
 
 ;;; ============================================================
@@ -2715,6 +2741,32 @@
     (run-test 9898 (lambda () (notnot (typep m 'array))) 't)
     (run-test 9899 (lambda () (notnot (arrayp m))) 't)
     (run-test 9900 (lambda () (notnot (typep m '(simple-array t (* *))))) 't))
+  ;; make-array zero/multi-dim + equalpt probes
+  (run-test 9908 (lambda () (array-dimensions (make-array '(0 0)))) '(0 0))
+  (run-test 9909 (lambda () (array-dimensions (read-from-string "#2a()"))) '(0 0))
+  (run-test 9913 (lambda () (notnot (equalpt (make-array '(0 0)) (read-from-string "#2a()")))) 't)
+  (run-test 9914 (lambda () (array-dimensions (make-array '(2 3) :initial-contents '((a b c) (d e f))))) '(2 3))
+  (run-test 9915 (lambda () (aref (make-array '(2 3) :initial-contents '((a b c) (d e f))) 1 2)) 'f)
+  (run-test 9916 (lambda () (notnot (equalpt (make-array '(2 3) :initial-contents '((a b c) (d e f))) (read-from-string "#2a((a b c)(d e f))")))) 't)
+  ;; equalpt MDA debugging
+  (run-test 9917 (lambda () (length (make-array '(0 0)))) '0)
+  (run-test 9918 (lambda () (array-length (read-from-string "#2a()"))) '0)
+  (run-test 9919 (lambda () (length (read-from-string "#2a((a b c)(d e f))"))) '6)
+  (run-test 9923 (lambda () (array-length (make-array '(2 3) :initial-contents '((a b c) (d e f))))) '6)
+  (run-test 9924 (lambda () (notnot (rt-equal (make-array '(2 3) :initial-contents '((a b c)(d e f))) (read-from-string "#2a((a b c)(d e f))")))) 't)
+  (run-test 9925 (lambda () (aref (read-from-string "#2a((a b c)(d e f))") 0 0)) 'a)
+  (run-test 9926 (lambda () (%mda-dims (read-from-string "#2a((a b c)(d e f))"))) '(2 3))
+  (run-test 9927 (lambda () (array-length (rt-mda-visible-data (make-array '(0 0))))) '0)
+  (run-test 9928 (lambda () (notnot (%mda-p (make-array '(0 0))))) 't)
+  (run-test 9929 (lambda () (notnot (%mda-p (read-from-string "#2a()")))) 't)
+  (run-test 9935 (lambda () (notnot (rt-array-equal (make-array 0) (make-array 0)))) 't)
+  (run-test 9953 (lambda () (length (rt-mda-visible-data (make-array '(0 0))))) '0)
+  (run-test 9954 (lambda () (notnot (rt-equal (make-array '(0 0)) (read-from-string "#2a()")))) 't)
+  (run-test 9955 (lambda () (notnot (rt-equal (make-array '(0 0)) (make-array '(0 0))))) 't)
+  (run-test 9956 (lambda () (notnot (rt-equal (rt-mda-visible-data (make-array '(0 0))) (rt-mda-visible-data (read-from-string "#2a()"))))) 't)
+  (run-test 9957 (lambda () (%mda-rank (read-from-string "#2a()"))) '2)
+  (run-test 9958 (lambda () (%mda-dims (make-array '(0 0)))) '(0 0))
+  (run-test 9959 (lambda () (%mda-dims (read-from-string "#2a()"))) '(0 0))
   )
 
 ;;; ============================================================

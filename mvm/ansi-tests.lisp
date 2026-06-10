@@ -2127,6 +2127,23 @@
 ;; Instrumented: return the raw nargs the callee sees (compile-call path).
 (defun %diag-opt-narg (x &optional z) (list x z (%get-nargs)))
 
+;; &optional + &rest coordination — structures-03 BOA constructor shapes.
+;; (a &optional (b 1) &rest c): the static-rest pre-pack used to split at
+;; required-count and swallow the optional into the rest list (probes
+;; 9995-9998).
+(defun %diag-opt-rest (a &optional (b 1) &rest c) (list a b c))
+;; (&optional a b &rest c): all optionals before rest.
+(defun %diag-opt-rest2 (&optional a b &rest c) (list a b c))
+;; Component isolation probes for the nargs==required default case.
+(defun %diag-or-a (a &optional (b 1) &rest c) (declare (ignore b c)) a)
+(defun %diag-or-b (a &optional (b 1) &rest c) (declare (ignore a c)) b)
+(defun %diag-or-c (a &optional (b 1) &rest c) (declare (ignore a b)) c)
+(defun %diag-or-n (a &optional (b 1) &rest c) (declare (ignore a b c)) (%get-nargs))
+;; Localize the (list a b c) clobber: does (list a b) work?  (list b c)?
+(defun %diag-or-ab (a &optional (b 1) &rest c) (declare (ignore c)) (list a b))
+(defun %diag-or-bc (a &optional (b 1) &rest c) (declare (ignore a)) (list b c))
+(defun %diag-or-ac (a &optional (b 1) &rest c) (declare (ignore b)) (list a c))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -2799,6 +2816,27 @@
   (run-test 9992 (lambda () (format nil (format nil "~~~d,'~cd" 6 #\*) 42)) "****42")
   (run-test 9993 (lambda () (format nil "~:d" -1234567)) "-1,234,567")
   (run-test 9994 (lambda () (let ((fn (formatter "~v,vd"))) (formatter-call-to-string fn 6 #\Space 42))) "    42")
+  ;; &optional + &rest static-pack coordination (structures-03 BOA shapes,
+  ;; e.g. sbt-12-con = (a &optional (b 1) &rest c)).  compile-call no longer
+  ;; static-packs when the callee has &optional params — it falls through to
+  ;; the truthful-nargs dynamic rest+optional prologues.  9996/9997/9998 pass.
+  ;; 9995 (all-defaulted, body (list a b c)) is a KNOWN-FAIL: the args pass
+  ;; correctly (every component + 2-arg combo below passes) but the 3-element
+  ;; (list a b c) call in a &rest callee at nargs==required hits a SEPARATE,
+  ;; pre-existing temp clobber in the nested static-rest cons build.
+  (run-test 9995 (lambda () (%diag-opt-rest 'x))        '(x 1 nil))
+  (run-test 9996 (lambda () (%diag-opt-rest 'x 'y))     '(x y nil))
+  (run-test 9997 (lambda () (%diag-opt-rest 'x 'y 1 2 3)) '(x y (1 2 3)))
+  (run-test 9998 (lambda () (%diag-opt-rest2 'p 'q 1 2)) '(p q (1 2)))
+  ;; Component isolation proving arg-passing is correct (9995's fail is the
+  ;; 3-arg list build, not the &optional+&rest coordination).
+  (run-test 9930 (lambda () (%diag-or-a 'x)) 'x)
+  (run-test 9931 (lambda () (%diag-or-b 'x)) '1)
+  (run-test 9932 (lambda () (%diag-or-c 'x)) 'nil)
+  (run-test 9933 (lambda () (%diag-or-n 'x)) '1)
+  (run-test 9934 (lambda () (%diag-or-ab 'x)) '(x 1))
+  (run-test 9935 (lambda () (%diag-or-bc 'x)) '(1 nil))
+  (run-test 9936 (lambda () (%diag-or-ac 'x)) '(x nil))
   )
 
 ;;; ============================================================

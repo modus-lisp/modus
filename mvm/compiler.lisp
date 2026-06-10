@@ -378,7 +378,8 @@
   stack-frame-size ; number of stack slots used
   source-location ; string describing where defined (e.g. "form#123")
   rest-param-p    ; T if function has &rest parameter
-  required-count) ; number of required params (before &rest)
+  required-count  ; number of required params (before &rest)
+  optional-count) ; number of &optional params (between required and &rest)
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -10311,6 +10312,24 @@
                        *arity-audit-log*))
                (compile-arity-error env dest)
                (return-from compile-call))
+              ;; &rest WITH &optional params: the callee's slot layout is
+              ;; required + optional + rest.  The static pre-pack below
+              ;; splits at REQ and conses everything after it — which would
+              ;; swallow the &optional params into the rest list and leave
+              ;; the optional slots stale.  Worse, the :set-nargs 255
+              ;; sentinel makes emit-optional-prologue NIL-init all the
+              ;; optionals.  So when the callee has &optional params, DON'T
+              ;; static-pack: fall through to the truthful-nargs path so the
+              ;; callee's dynamic emit-rest-prologue + emit-optional-prologue
+              ;; build the rest list (from slot[rest-slot=req+optcount]..)
+              ;; and keep the supplied optionals.  This handles BOA shapes
+              ;; like (a &optional (b 1) &rest c) (structures-03 sbt-12).
+              ((and has-rest
+                    (let ((oc (function-info-optional-count fn-info)))
+                      (and oc (> oc 0))))
+               ;; nothing to do: leave args as-is, no sentinel.  The callee's
+               ;; dynamic rest prologue caps at req+32 args, ample for these.
+               nil)
               (has-rest
                (when (>= nargs req)
                  (let ((required-args (subseq args 0 req))
@@ -11679,13 +11698,23 @@
                 (key-pos  (position '&key params))
                 (req-end  (or rest-pos opt-pos key-pos (length params)))
                 (pp (preprocess-params params body t))  ; toplevel defun: allow &key transform
-                ;; 5th value: synthesized &key-rest slot (nil unless the
-                ;; real-&key transform fired).  Prefer it over rest-pos.
+                ;; 5th value: the POST-preprocess rest slot — either the
+                ;; synthesized &key-rest slot (real-&key transform) or the
+                ;; fallback explicit-&rest slot (required+optional+key count).
+                ;; PREFER it over rest-pos: rest-pos is the index of the
+                ;; &rest *token* in the raw lambda list, which counts the
+                ;; &optional/&key marker tokens and so disagrees with the
+                ;; real slot whenever &optional precedes &rest (e.g.
+                ;; (a &optional b &rest c): rest-pos=3 but real slot=2).
                 (synth-rest (nth 4 pp))
-                (eff-rest-slot (or rest-pos synth-rest)))
+                (eff-rest-slot (or synth-rest rest-pos)))
            (let ((result (mvm-compile-function name (car pp) (cadr pp) eff-rest-slot (caddr pp) (cadddr pp))))
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
+               ;; Record the &optional count (4th value of preprocess-params)
+               ;; so compile-call's static-rest pre-pack can tell whether the
+               ;; callee has &optional params between required and &rest.
+               (setf (function-info-optional-count info) (cadddr pp))
                ;; Mark rest-param-p when there's an explicit &rest OR a
                ;; synthesized &key-rest, so compile-call packs trailing
                ;; args into a list for the callee's extraction prologue.

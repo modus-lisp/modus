@@ -2710,6 +2710,40 @@
 ;; so init-forms in unrelated files don't run (many crash the parent).
 (defvar *ansi-file-ranges* nil)
 
+(defun %count-source-deftests (path)
+  "Count deftest-family forms in the RAW source text at PATH by scanning
+   for an opening paren immediately followed by a deftest-family head.
+   Text-based (no reader) so it still works when the file has a form the
+   host reader can't parse — that's exactly the case the BUILD-SKIP audit
+   needs to detect.  Conservative: matches `(deftest`, `(def-print-test`,
+   etc. with the paren and head adjacent (ANSI test files always write
+   them that way).  Overcounts slightly if those tokens appear inside a
+   string or comment, which is acceptable for an advisory report."
+  (handler-case
+      (let ((text (with-output-to-string (o)
+                    (with-open-file (s path :direction :input)
+                      (loop for line = (read-line s nil :eof)
+                            until (eq line :eof)
+                            do (write-line line o)))))
+            (heads '("(deftest" "(def-print-test" "(def-pprint-test"
+                     "(def-format-test" "(def-ppblock-test"
+                     "(def-adjust-array-test" "(def-adjust-array-fp-test"))
+            (n 0))
+        (let ((up (string-upcase text)))
+          (dolist (h heads n)
+            (let ((hu (string-upcase h)) (start 0))
+              (loop (let ((pos (search hu up :start2 start)))
+                      (when (null pos) (return))
+                      ;; require a delimiter after the head so (deftest-foo
+                      ;; doesn't match (deftest
+                      (let ((after (+ pos (length hu))))
+                        (when (or (>= after (length up))
+                                  (member (char up after)
+                                          '(#\Space #\Tab #\Newline #\Return #\()))
+                          (incf n)))
+                      (setf start (+ pos (length hu)))))))))
+    (error () 0)))
+
 (defun load-ansi-chapter (dir files)
   "Transform ANSI test files from DIR into MVM-compatible source.
    Skips files that cause read errors."
@@ -2718,7 +2752,9 @@
       (let ((path (concatenate 'string dir file)))
         (when (probe-file path)
           (format t "  Transforming: ~A~%" file)
-          (let ((forms nil))
+          (let ((forms nil)
+                (read-truncated nil)   ; T if a read error stopped us before EOF
+                (read-err nil))        ; the read error condition, for the report
             (with-open-file (s path :direction :input)
               ;; *read-eval* T so `#.(make-array …)` literals (adjust-array.lsp
               ;; form 54+, print-*.lsp, etc.) read cleanly.  The build env sets
@@ -2736,11 +2772,83 @@
                 ;; plain deftests before it were being lost.  On a read error
                 ;; we keep the forms read so far and stop (the remaining text
                 ;; belongs to the unreadable form).
-                (handler-case
-                    (loop (let ((form (read s nil :eof)))
-                            (when (eq form :eof) (return))
-                            (push form forms)))
-                  (error () nil))))
+                ;; Per-form read with RECOVERY.  Two mechanisms:
+                ;;  (1) Eval defun/defmacro forms as they are read, so a later
+                ;;      `#.(symbol-function 'foo)` / `#.(find-class …)` form
+                ;;      can reference a helper defined earlier in the SAME file
+                ;;      (handler-bind.lsp form 9 referenced a defun from form 8;
+                ;;      the host reader hadn't eval'd it yet → undefined-fn →
+                ;;      whole tail of the file lost).  Guarded — a defun whose
+                ;;      body the host can't compile is skipped, not fatal.
+                ;;  (2) On a read error, record it but try to RESYNC to the
+                ;;      next top-level form (a line beginning with "(") and keep
+                ;;      reading, instead of dropping every remaining test.  This
+                ;;      recovers files whose ONE bad form (undefined package in
+                ;;      a `#.`, etc.) sits in the middle (make-load-form-saving-
+                ;;      slots.lsp, handler-bind.lsp).  A file whose bad form runs
+                ;;      to EOF (adjust-array.lsp's giant loop) simply stops.
+                (labels ((eval-defs (form)
+                           (when (and (consp form)
+                                      ;; defpackage/make-package too: a later
+                                      ;; form may reference a package-qualified
+                                      ;; symbol (mlfss line 132 uses
+                                      ;; cl-test-mlfss-package:a as a slot name);
+                                      ;; the host reader needs the package to
+                                      ;; exist when it reads that token.
+                                      (member (car form)
+                                              '(defun defmacro defpackage make-package)))
+                             (handler-case (eval form) (error () nil))))
+                         (resync ()
+                           ;; Discard the rest of the current (unreadable) line
+                           ;; then skip forward until a line starts with "(".
+                           (read-line s nil :eof)
+                           (loop
+                             (let ((c (peek-char nil s nil :eof)))
+                               (cond ((eq c :eof) (return :eof))
+                                     ((char= c #\() (return :ok))
+                                     (t (read-line s nil :eof)))))))
+                  (loop
+                    (let ((form (handler-case (read s nil :eof)
+                                  (error (e)
+                                    (unless read-truncated
+                                      (setf read-truncated t read-err e))
+                                    (if (eq (resync) :eof) :eof :resynced)))))
+                      (cond ((eq form :eof) (return))
+                            ((eq form :resynced) nil) ; skipped a bad form; continue
+                            (t (eval-defs form)
+                               (push form forms))))))))
+            ;; BUILD-SKIP audit: count deftest-family forms in the RAW source
+            ;; text and compare to what we actually read.  A fully-skipped
+            ;; file (0 forms) or a read-truncated file silently drops every
+            ;; test after the truncation point — these used to vanish with no
+            ;; trace (dgmc-aux: zero-test chunk; adjust-array.lsp: read error).
+            ;; The report makes both visible so a recoverable skip can be
+            ;; fixed (per-form read recovery) instead of silently lost.
+            (let* ((raw-deftests (%count-source-deftests path))
+                   (read-deftests
+                     (count-if (lambda (f)
+                                 (and (consp f)
+                                      (member (car f)
+                                              '(deftest def-print-test def-pprint-test
+                                                def-format-test def-ppblock-test
+                                                def-adjust-array-test
+                                                def-adjust-array-fp-test))))
+                               forms)))
+              (declare (ignorable read-deftests))
+              (cond
+                ((null forms)
+                 (format t "  BUILD-SKIP ~A: 0 forms read (file fully skipped, ~D deftest(s) in source lost)~%"
+                         file raw-deftests))
+                (read-truncated
+                 ;; A read error stopped us mid-file: every form after the
+                 ;; offending one is silently dropped.  This is the high-signal
+                 ;; case (adjust-array.lsp's giant loop, package-undefined #.
+                 ;; reads in loop7/mlfss).  BUILD-WARN on the small
+                 ;; macro-expansion gaps (deftest count off by 1-2) is noise,
+                 ;; so only report genuine truncations.
+                 (format t "  BUILD-SKIP ~A: read TRUNCATED — ~D form(s) read, ~D/~D raw deftest(s) recovered; lost the rest [~A]~%"
+                         file (length forms) read-deftests raw-deftests
+                         (handler-case (format nil "~A" read-err) (error () "?"))))))
             (push (pathname-name file) *ansi-file-names*)
             ;; Snapshot the test-id counter on entry so we can record the
             ;; file's [first .. last] test-id range after processing.

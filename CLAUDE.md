@@ -95,11 +95,11 @@ runtime/        Runtime type system
 ## ANSI CL Conformance
 
 **Real numbers (current state, x64 Linux):**
-- Expected: 17,415 tests (adjust-array.lsp now loads; +63 to the denominator)
-- Ran: 17,317
-- Passed: 15,249 (87.56% overall, 88.06% of those that ran)
-- Failed: 2,070
-- Lost-to-crash: 98
+- Expected: 17,465 tests (recovered files keep entering the denominator)
+- Ran: 17,343
+- Passed: 15,251 (87.32% overall, 87.94% of those that ran)
+- Failed: 1,970
+- Lost-to-crash: 122 (newly recovered files' crashing tests now counted)
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

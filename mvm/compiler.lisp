@@ -8243,7 +8243,11 @@
      (compile-form `(let ((%tv ,(car args)))
                       (cond
                         ((integerp %tv) %tv)
-                        ((%ieee-float-p %tv) (%float-to-int %tv))
+                        ;; Float / ratio: q toward zero, remainder = n - q
+                        ;; (CLHS returns 2 values).  %trunc1-generic
+                        ;; produces the FLOAT remainder for IEEE floats so
+                        ;; (multiple-value-list (truncate 5.5)) → (5 0.5).
+                        ((%ieee-float-p %tv) (%trunc1-generic %tv))
                         ((ratiop %tv)
                          (truncate (aref %tv 0) (aref %tv 1)))
                         (t (float-truncate-to-integer %tv))))

@@ -4150,6 +4150,10 @@
   (setq array-total-size-limit  (ash 1 24))    ; 16M elements
   (setq array-dimension-limit   (ash 1 24))    ; 16M per dim
   (setq array-rank-limit        256)
+  ;; PI constant (defconstant init thunks don't run at boot).  Many trig
+  ;; tests compute (coerce (/ pi 2) 'single-float) as an input; without
+  ;; this PI is NIL and (/ pi 2) faults.
+  (setq pi 3.141592653589793d0)
   (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
                                    &optional &rest &whole))
   (setq lambda-parameters-limit 256)

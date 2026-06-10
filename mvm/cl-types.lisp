@@ -30,185 +30,171 @@
 ;;; (%make-float-raw num K) — a float-shaped rational.
 ;;; ============================================================
 
-(defvar *%trig-precision* 1000000000)  ; K = 10^9
-(defvar *%trig-pi*         3141592653)  ; π * K
-(defvar *%trig-2pi*        6283185307)  ; 2π * K
-(defvar *%trig-pi/2*       1570796327)  ; π/2 * K
+(defvar *%trig-precision* 1000000000)  ; K = 10^9 (legacy, exp/log still use)
+(defvar *%trig-pi*         3141592653)  ; π * K (legacy)
+(defvar *%trig-2pi*        6283185307)  ; 2π * K (legacy)
+(defvar *%trig-pi/2*       1570796327)  ; π/2 * K (legacy)
 
-(defun %as-scaled-int (x)
-  "Convert X (integer, ratio, 2-slot float-shape, or IEEE float) to a
-   fixnum scaled by *%trig-precision* (K).  Returns the scaled integer."
-  (let ((k *%trig-precision*))
-    (cond
-      ((integerp x) (* x k))
-      ((ratiop x) (truncate (* (ratio-numerator x) k)
-                            (ratio-denominator x)))
-      ((and (not (fixnump x)) (not (consp x)) (not (null x))
-            (= (obj-subtag x) #x32) (= (array-length x) 2))
-       (let ((n (aref x 0)) (d (aref x 1)))
-         (if (= d 1) (* n k) (truncate (* n k) d))))
-      ;; IEEE float (subtag #x60, 2-slot).  Compute scaled = round(x * K)
-      ;; directly from the float bits (sign|exp(11)|mantissa(52)) so we
-      ;; never build a giant intermediate bignum.  Going through
-      ;; %ieee-float-to-rat → bignum-truncate is correct in theory but
-      ;; bignum-truncate gives precision-wrong results for 80-bit-class
-      ;; intermediates that the float→rat conversion produces.
-      ;;
-      ;; Algorithm: for x with biased exponent E and mantissa M (with
-      ;; implicit leading 1), the value is (1 + M/2^52) * 2^(E-1023).
-      ;; scaled = (2^52 + M) * K * 2^(E-1023) / 2^52
-      ;;        = (2^52 + M) * K  shifted by (E-1075)
-      ;; For 0 ≤ E-1075 we shift left (multiply by 2); for negative we
-      ;; shift right (integer division by 2).  All arithmetic stays in
-      ;; fixnum range when K ≤ 1e9 and |x| ≤ 8 — the Taylor inputs we
-      ;; reduce mod 2π.
-      ((and (not (fixnump x)) (not (consp x)) (not (null x))
-            (not (characterp x))
-            (= (obj-subtag x) #x60))
-       (let* ((hi (aref x 0))
-              (lo (aref x 1))
-              (hi-u32 (logand hi 4294967295))
-              (lo-u32 (logand lo 4294967295))
-              (sign-bit (logand (ash hi-u32 -31) 1))
-              (exp-bits (logand (ash hi-u32 -20) 2047))
-              (mantissa-hi (logand hi-u32 1048575))
-              (mantissa (logior (ash mantissa-hi 32) lo-u32))
-              (raw-sign (if (zerop sign-bit) 1 -1)))
-         (cond
-           ;; Zero / subnormal — treat as 0.
-           ((zerop exp-bits) 0)
-           ;; Inf / NaN — return 0 (Modus doesn't represent these).
-           ((= exp-bits 2047) 0)
-           (t
-            ;; Compute truncate(k * (1 + mantissa/2^52)) = k + truncate(k*m/2^52)
-            ;; Split m into m_hi*2^26 + m_lo so k*m fits in two fixnum
-            ;; products (k≤2^30, each half≤2^26 → k*half ≤ 2^56 < 2^62).
-            (let* ((m-hi (ash mantissa -26))
-                   (m-lo (logand mantissa 67108863))   ; (2^26 - 1)
-                   ;; k*m / 2^52 = k*m_hi/2^26 + k*m_lo/2^52
-                   (term-hi (truncate (* k m-hi) 67108864))    ; /2^26
-                   (term-lo (truncate (* k m-lo) 4503599627370496))  ; /2^52
-                   (base (+ k term-hi term-lo))   ; ~= k*(1+m/2^52)
-                   (shift (- exp-bits 1023)))     ; final 2^shift scale
-              (cond
-                ((>= shift 0)
-                 (if (> shift 30) 0    ; |x| > 2^30 — out of fixnum range
-                     (* raw-sign (ash base shift))))
-                (t
-                 (let ((nshift (- 0 shift)))
-                   (if (>= nshift 64)
-                       0   ; |x| < 2^-64 — effectively zero
-                       (* raw-sign (ash base (- 0 nshift))))))))))))
-      (t 0))))
+;;; ============================================================
+;;; IEEE-float-native transcendentals (2026-06-10, Band 2a)
+;;;
+;;; The old K-scaled-rational Taylor path crashed for |x| ≳ 100:
+;;; (* s s) with s = x*1e9 overflowed fixnums into bignums, and
+;;; bignum-truncate inside the Taylor loop SIGSEGV'd / hung.  Now we
+;;; do ALL the arithmetic in IEEE doubles via the %float-* primops
+;;; (SSE2 on x64), with a clean argument reduction mod 2π.  This is
+;;; both faster and more accurate, and never leaves fixnum range.
+;;; ============================================================
 
-(defun %scaled-result (s)
-  "Wrap a scaled-by-K integer S as a (num . den) float-shape."
-  (%make-float-raw s *%trig-precision*))
+(defun %fl (n)
+  "Tagged integer N → IEEE double."
+  (%float-from-int n))
 
-(defun %trig-reduce (s)
-  "Reduce scaled angle S into (-π, π] by repeated subtraction.  S is
-   already an integer scaled by K."
-  (let ((pi-k *%trig-pi*) (two-pi-k *%trig-2pi*))
-    (loop (cond ((> s pi-k) (setq s (- s two-pi-k)))
-                ((<= s (- 0 pi-k)) (setq s (+ s two-pi-k)))
-                (t (return s))))))
+;; Double-precision constants, built from full-precision decimal
+;; rationals via %float-div (defvars don't auto-init at boot, so we
+;; recompute on each call — cheap, two itof + one fdiv).
+(defun %fpi ()    (%float-div (%fl 3141592653589793) (%fl 1000000000000000)))   ; π
+(defun %f2pi ()   (%float-div (%fl 6283185307179586) (%fl 1000000000000000)))   ; 2π
+(defun %fpi/2 ()  (%float-div (%fl 1570796326794897) (%fl 1000000000000000)))   ; π/2
+(defun %f-one ()  (%fl 1))
+(defun %f-half () (%float-div (%fl 1) (%fl 2)))
 
-(defun %sin-taylor (s)
-  "Compute sin(s/K) using Taylor series, return scaled-by-K integer.
-   s = scaled angle (integer in fixnum range).  Uses 10 terms which
-   gives ~9 digit precision for |s| ≤ π."
-  (let* ((k *%trig-precision*)
-         (s (%trig-reduce s))
-         ;; result = s - s^3/6 + s^5/120 - s^7/5040 + ...
-         (acc s)
-         (term s))   ; current term, scaled by K
-    (let ((n 1))
-      (loop
-        (when (> n 19) (return acc))
-        ;; term := -term * (s/K) * (s/K) / ((n+1)*(n+2))
-        ;; To stay in fixnum range: term := truncate(-term*s*s / (K*K * (n+1)*(n+2)))
-        (setq term (truncate (- 0 (* term (truncate (* s s) k))) (* k (* (+ n 1) (+ n 2)))))
-        (setq acc (+ acc term))
-        (when (and (< (abs term) 10)) (return acc))
-        (setq n (+ n 2))))))
+(defun %float-lt-p (a b)
+  "True if double A < double B.  Computes A-B and tests its sign bit;
+   if A-B is exactly 0 (not negative) return NIL."
+  (let ((d (%float-sub a b)))
+    (and (float-negative-p d) (not (%float-zero-p d)))))
 
-(defun %cos-taylor (s)
-  "Compute cos(s/K) using Taylor series."
-  (let* ((k *%trig-precision*)
-         (s (%trig-reduce s))
-         (acc k)    ; cos(0) = 1, scaled
-         (term k))  ; current term
-    (let ((n 0))
-      (loop
-        (when (> n 18) (return acc))
-        (setq term (truncate (- 0 (* term (truncate (* s s) k))) (* k (* (+ n 1) (+ n 2)))))
-        (setq acc (+ acc term))
-        (when (and (< (abs term) 10)) (return acc))
-        (setq n (+ n 2))))))
+(defun %float-neg (a) (%float-sub (%fl 0) a))
+
+(defun %float-abs (a) (if (float-negative-p a) (%float-neg a) a))
+
+(defun %float-round-to-int (a)
+  "Round double A to the nearest integer (returns a tagged integer).
+   Uses truncate(a + 0.5*sign)."
+  (if (float-negative-p a)
+      (%float-to-int (%float-sub a (%f-half)))
+      (%float-to-int (%float-add a (%f-half)))))
+
+(defun %trig-reduce-f (x)
+  "Reduce double angle X into approximately [-π, π] by subtracting an
+   integer multiple of 2π.  Returns a double."
+  (let* ((two-pi (%f2pi))
+         ;; n = round(x / 2π)
+         (n (%float-round-to-int (%float-div x two-pi))))
+    (%float-sub x (%float-mul (%fl n) two-pi))))
+
+(defun %sin-poly-f (r)
+  "sin(r) for r already reduced to ~[-π,π], via Taylor series in
+   doubles: r - r^3/3! + r^5/5! - ...  Converges to full double
+   precision in ~11 terms for |r| ≤ π."
+  (let* ((r2 (%float-mul r r))
+         (term r)              ; current term r^(2n+1)/(2n+1)!
+         (acc r)
+         (n 1))
+    (loop
+      (when (> n 14) (return acc))
+      ;; term *= -r^2 / ((2n)(2n+1))
+      (let ((denom (%fl (* (* 2 n) (+ (* 2 n) 1)))))
+        (setq term (%float-neg (%float-div (%float-mul term r2) denom))))
+      (setq acc (%float-add acc term))
+      (setq n (+ n 1)))))
+
+(defun %cos-poly-f (r)
+  "cos(r) for r reduced to ~[-π,π], via Taylor series in doubles:
+   1 - r^2/2! + r^4/4! - ..."
+  (let* ((r2 (%float-mul r r))
+         (term (%f-one))       ; current term r^(2n)/(2n)!
+         (acc (%f-one))
+         (n 1))
+    (loop
+      (when (> n 14) (return acc))
+      ;; term *= -r^2 / ((2n-1)(2n))
+      (let ((denom (%fl (* (- (* 2 n) 1) (* 2 n)))))
+        (setq term (%float-neg (%float-div (%float-mul term r2) denom))))
+      (setq acc (%float-add acc term))
+      (setq n (+ n 1)))))
+
+(defun %sin-f (x)
+  "sin of double X (full-range)."
+  (%sin-poly-f (%trig-reduce-f x)))
+
+(defun %cos-f (x)
+  "cos of double X (full-range)."
+  (%cos-poly-f (%trig-reduce-f x)))
 
 (defun sin (x)
-  "Sine.  Exact 0 for integer 0; IEEE float result for other inputs.
-   Taylor series runs in K-scaled rationals internally then %any-to-float
-   converts to IEEE."
+  "Sine.  Exact integer 0 for integer 0; IEEE float result otherwise."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (%any-to-float (%scaled-result (%sin-taylor (%as-scaled-int x)))))))
+    (t (%sin-f (%any-to-float x)))))
 
 (defun cos (x)
-  "Cosine.  Exact 1 for integer 0; IEEE float result otherwise."
+  "Cosine.  Exact integer 1 for integer 0; IEEE float result otherwise."
   (cond
     ((and (integerp x) (= x 0)) 1)
-    (t (%any-to-float (%scaled-result (%cos-taylor (%as-scaled-int x)))))))
+    (t (%cos-f (%any-to-float x)))))
 
 (defun tan (x)
   "Tangent = sin/cos.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (let* ((s (%as-scaled-int x))
-              (sn (%sin-taylor s))
-              (cs (%cos-taylor s)))
-         (if (= cs 0)
-             0
-             (%any-to-float (%make-float-raw sn cs)))))))
+    (t (let* ((xf (%any-to-float x))
+              (r (%trig-reduce-f xf))
+              (sn (%sin-poly-f r))
+              (cs (%cos-poly-f r)))
+         (%float-div sn cs)))))
 
-(defun %exp-taylor (s)
-  "Compute exp(s/K) using Taylor series.  Reduce |s| by halving if
-   large: exp(s) = exp(s/2)^2."
-  (let ((k *%trig-precision*))
-    (cond
-      ((> (abs s) k)
-       ;; |x| > 1 — reduce
-       (let ((half (%exp-taylor (truncate s 2))))
-         (truncate (* half half) k)))
-      (t
-       (let ((acc k) (term k))
-         (let ((n 1))
-           (loop
-             (when (> n 30) (return acc))
-             (setq term (truncate (* term s) (* k n)))
-             (setq acc (+ acc term))
-             (when (< (abs term) 10) (return acc))
-             (setq n (+ n 1)))))))))
+(defun %exp-f (x)
+  "exp of double X via range-reduction + Taylor.  exp(x)=exp(x/2)^2
+   keeps the Taylor argument in [-~1,1] for fast convergence; recursion
+   depth ~log2|x| (≤ ~11 for |x| ≤ ~700, beyond which exp overflows
+   IEEE double anyway)."
+  (if (%float-lt-p (%f-one) (%float-abs x))
+      (let ((half (%exp-f (%float-div x (%fl 2)))))
+        (%float-mul half half))
+      ;; |x| ≤ 1: 1 + x + x^2/2! + ...
+      (let ((term (%f-one)) (acc (%f-one)) (n 1))
+        (loop
+          (when (> n 18) (return acc))
+          (setq term (%float-div (%float-mul term x) (%fl n)))
+          (setq acc (%float-add acc term))
+          (setq n (+ n 1))))))
 
 (defun exp (x)
-  "e^x.  Exact 1 for integer 0; IEEE float result otherwise."
+  "e^x.  Exact integer 1 for integer 0; IEEE float result otherwise."
   (cond
     ((and (integerp x) (= x 0)) 1)
-    (t (%any-to-float (%scaled-result (%exp-taylor (%as-scaled-int x)))))))
+    (t (%exp-f (%any-to-float x)))))
 
-(defun %log-newton (s)
-  "Compute log(s/K) by Newton iteration on f(y) = exp(y) - s/K = 0.
-   y_{n+1} = y_n - 1 + s / (K * exp(y_n))."
-  (let* ((k *%trig-precision*)
-         (y k))                    ; initial guess y = 1
-    (let ((iter 0))
+(defun %log-f (x)
+  "Natural log of double X (X > 0).  Reduce x = m·2^e with m in [1,2)
+   by repeated halving/doubling, accumulating e·ln2, then Newton on
+   the residual: y_{n+1} = y_n + x/exp(y_n) - 1 converges to ln(m)."
+  (let ((ln2 (%float-div (%fl 693147180559945) (%fl 1000000000000000)))   ; ln 2
+        (e 0)
+        (m x)
+        (two (%fl 2))
+        (half (%float-div (%fl 1) (%fl 2))))
+    ;; bring m into [0.5, 2): halve while ≥2, double while <0.5
+    (loop
+      (when (not (%float-lt-p two m)) (return nil))   ; m < 2
+      (when (numeric-equal-p m two) (return nil))
+      (setq m (%float-mul m half))
+      (setq e (+ e 1)))
+    (loop
+      (when (not (%float-lt-p m (%float-div (%fl 1) two))) (return nil)) ; m >= 0.5
+      (setq m (%float-mul m two))
+      (setq e (- e 1)))
+    ;; Newton for ln(m), m in [0.5,2), 30 iters
+    (let ((y (%float-sub m (%f-one)))   ; initial guess m-1
+          (i 0))
       (loop
-        (when (> iter 40) (return y))
-        (let* ((ey (%exp-taylor y))
-               (delta (- (truncate (* s k) ey) k)))
-          (when (< (abs delta) 10) (return y))
-          (setq y (+ y delta))
-          (setq iter (+ iter 1)))))))
+        (when (> i 30) (return nil))
+        (let ((ey (%exp-f y)))
+          (setq y (%float-add y (%float-sub (%float-div m ey) (%f-one)))))
+        (setq i (+ i 1)))
+      (%float-add y (%float-mul (%fl e) ln2)))))
 
 (defun log (x &optional base)
   "Natural log (or log to BASE if supplied).  Domain x > 0; returns
@@ -217,106 +203,135 @@
   (when (and (integerp x) (= x 1)
              (or (null base) (and (integerp base) (>= base 2))))
     (return-from log 0))
-  (let* ((s (%as-scaled-int x)))
-    (when (<= s 0) (return-from log 0))
-    (let ((ln-x (%log-newton s)))
+  (let ((xf (%any-to-float x)))
+    (when (or (float-negative-p xf) (%float-zero-p xf)) (return-from log 0))
+    (let ((ln-x (%log-f xf)))
       (if (null base)
-          (%any-to-float (%scaled-result ln-x))
-          ;; log_b(x) = log(x) / log(b)
-          (let ((ln-b (%log-newton (%as-scaled-int base))))
-            (if (= ln-b 0) 0 (%any-to-float (%make-float-raw ln-x ln-b))))))))
+          ln-x
+          (let ((ln-b (%log-f (%any-to-float base))))
+            (if (%float-zero-p ln-b) 0 (%float-div ln-x ln-b)))))))
 
 (defun cosh (x)
   "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 1)
-    (t (let* ((s (%as-scaled-int x))
-              (ep (%exp-taylor s))
-              (em (%exp-taylor (- 0 s))))
-         (%any-to-float (%scaled-result (truncate (+ ep em) 2)))))))
+    (t (let* ((xf (%any-to-float x))
+              (ep (%exp-f xf))
+              (em (%exp-f (%float-neg xf))))
+         (%float-div (%float-add ep em) (%fl 2))))))
 
 (defun sinh (x)
   "Hyperbolic sine.  sinh(x) = (exp(x) - exp(-x))/2.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (let* ((s (%as-scaled-int x))
-              (ep (%exp-taylor s))
-              (em (%exp-taylor (- 0 s))))
-         (%any-to-float (%scaled-result (truncate (- ep em) 2)))))))
+    (t (let* ((xf (%any-to-float x))
+              (ep (%exp-f xf))
+              (em (%exp-f (%float-neg xf))))
+         (%float-div (%float-sub ep em) (%fl 2))))))
 
 (defun tanh (x)
   "Hyperbolic tangent = sinh/cosh.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (let* ((s (%as-scaled-int x))
-              (ep (%exp-taylor s))
-              (em (%exp-taylor (- 0 s)))
-              (num (- ep em))
-              (den (+ ep em)))
-         (if (= den 0) 0 (%any-to-float (%make-float-raw num den)))))))
+    (t (let* ((xf (%any-to-float x))
+              (ep (%exp-f xf))
+              (em (%exp-f (%float-neg xf))))
+         (%float-div (%float-sub ep em) (%float-add ep em))))))
 
-(defun %asin-taylor (s)
-  "asin(s/K) via Taylor series for |s/K| ≤ 1.
-   asin(x) = x + x^3/6 + 3x^5/40 + 15x^7/336 + ..."
-  (let* ((k *%trig-precision*))
-    (when (> (abs s) k) (return-from %asin-taylor 0))   ; out of domain
-    (let ((acc s) (term s) (n 1))
-      (loop
-        (when (> n 30) (return acc))
-        ;; term[n+2] = term[n] * (2n-1)*(2n+1) * s^2 / (K^2 * (2n)(2n+2))
-        ;; Equivalently coefficient ratio.
-        (let ((num-mult (* (- (* 2 n) 1) (+ (* 2 n) 1)))
-              (den-mult (* (* 2 n) (+ (* 2 n) 2))))
-          (setq term (truncate (* (truncate (* term (truncate (* s s) k)) k) num-mult)
-                               den-mult)))
-        (setq acc (+ acc term))
-        (when (< (abs term) 10) (return acc))
-        (setq n (+ n 1))))))
+(defun %sqrt-f (x)
+  "sqrt of double X (X ≥ 0) via Newton: y = (y + x/y)/2."
+  (cond
+    ((%float-zero-p x) x)
+    (t (let ((y x) (i 0) (half (%float-div (%fl 1) (%fl 2))))
+         (loop
+           (when (> i 40) (return y))
+           (setq y (%float-mul (%float-add y (%float-div x y)) half))
+           (setq i (+ i 1)))))))
+
+(defun %asin-f (x)
+  "asin of double X for |X| ≤ 1, via atan(x/sqrt(1-x^2)).  For |X|=1
+   returns ±π/2 directly."
+  (let ((one (%f-one)) (ax (%float-abs x)))
+    (cond
+      ((%float-lt-p one ax) (%fl 0))             ; out of domain → 0
+      ((numeric-equal-p ax one)
+       (if (float-negative-p x) (%float-neg (%fpi/2)) (%fpi/2)))
+      (t (let* ((x2 (%float-mul x x))
+                (denom (%sqrt-f (%float-sub one x2))))
+           (%atan-f (%float-div x denom)))))))
+
+(defun %atan-f (x)
+  "atan of double X via series with range reduction.  For |x| > 1 use
+   atan(x) = sign·π/2 - atan(1/x).  For |x| ≤ small use the Taylor
+   series; otherwise the half-angle identity
+   atan(x) = 2·atan(x/(1+sqrt(1+x^2))) shrinks |x| < ~0.42 first."
+  (let ((ax (%float-abs x)) (one (%f-one)))
+    (cond
+      ;; |x| > 1: reduce to reciprocal
+      ((%float-lt-p one ax)
+       (let ((r (%atan-f (%float-div one ax)))
+             (pi2 (%fpi/2)))
+         (if (float-negative-p x)
+             (%float-sub (%float-neg pi2) (%float-neg r))
+             (%float-sub pi2 r))))
+      (t
+       ;; |x| ≤ 1: half-angle reduce until small, then Taylor.
+       ;; t = x / (1 + sqrt(1+x^2)) = tan(theta/2); atan(x)=2*atan(t).
+       (let* ((s (%sqrt-f (%float-add one (%float-mul x x))))
+              (u (%float-div x (%float-add one s)))   ; |u| ≤ ~0.414
+              (u2 (%float-mul u u))
+              (term u) (acc u) (n 1))
+         (loop
+           (when (> n 30) (return nil))
+           ;; term *= -u^2; add term/(2n+1)
+           (setq term (%float-neg (%float-mul term u2)))
+           (setq acc (%float-add acc (%float-div term (%fl (+ (* 2 n) 1)))))
+           (when (%float-lt-p (%float-abs term) (%float-div (%fl 1) (%fl 1000000000000000)))
+             (return nil))
+           (setq n (+ n 1)))
+         (%float-mul (%fl 2) acc))))))
 
 (defun asin (x)
-  "Arc sine via Taylor.  Domain |x| ≤ 1.  IEEE float result."
+  "Arc sine.  Domain |x| ≤ 1.  IEEE float result."
   (cond
     ((and (integerp x) (= x 0)) 0)
-    (t (%any-to-float (%scaled-result (%asin-taylor (%as-scaled-int x)))))))
+    (t (%asin-f (%any-to-float x)))))
 
 (defun acos (x)
   "Arc cosine = π/2 - asin(x).  IEEE float result."
   (cond
     ((and (integerp x) (= x 1)) 0)
-    ((and (integerp x) (= x 0)) (%any-to-float (%scaled-result *%trig-pi/2*)))
-    (t (%any-to-float
-        (%scaled-result (- *%trig-pi/2* (%asin-taylor (%as-scaled-int x))))))))
+    ((and (integerp x) (= x 0)) (%fpi/2))
+    (t (%float-sub (%fpi/2) (%asin-f (%any-to-float x))))))
 
 (defun atan (x &optional y)
-  "Arc tangent.  Two-arg form: atan(y, x) for full quadrant.
-   One-arg: atan(x) via series.  Uses atan(x) = asin(x/sqrt(1+x^2))."
+  "Arc tangent.  One-arg: atan(x).  Two-arg (atan y x): full-quadrant
+   angle of the point (x, y) — result in (-π, π]."
   (cond
     (y
-     ;; Two-arg atan(y, x): we treat the first arg as Y here per ANSI:
-     ;; (atan y x).  Note ANSI param order: (atan number &optional divisor).
-     ;; So x = number=Y/X factor, y = divisor=X.  Just compute Y/X via asin.
-     ;; Approximation: only correct for quadrant 1 (x>0).
-     (let ((ratio-scaled (truncate (* (%as-scaled-int x) *%trig-precision*)
-                                   (%as-scaled-int y))))
-       (atan (%make-float-raw ratio-scaled *%trig-precision*))))
+     (let ((yf (%any-to-float x))     ; CLHS (atan number divisor): number=y
+           (xf (%any-to-float y)))    ; divisor=x
+       (cond
+         ((%float-zero-p xf)
+          (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
+                ((%float-zero-p yf) (%fl 0))
+                (t (%fpi/2))))
+         ((float-negative-p xf)
+          ;; x<0: atan(y/x) ± π
+          (let ((base (%atan-f (%float-div yf xf))))
+            (if (float-negative-p yf)
+                (%float-sub base (%fpi))
+                (%float-add base (%fpi)))))
+         (t (%atan-f (%float-div yf xf))))))
     ((and (integerp x) (= x 0)) 0)
-    (t
-     (let* ((s (%as-scaled-int x))
-            (k *%trig-precision*)
-            (s2 (truncate (* s s) k))                  ; x^2
-            (one-plus-s2 (+ k s2))
-            (sqrt-arg (isqrt (* one-plus-s2 k)))       ; sqrt(1+x^2), scaled by K
-            (ratio (truncate (* s k) sqrt-arg)))
-       (%any-to-float (%scaled-result (%asin-taylor ratio)))))))
+    (t (%atan-f (%any-to-float x)))))
 
 (defun phase (x)
   "Phase of x.  For real x: 0 if x≥0, π if x<0.  IEEE float for π case."
-  (let ((pi-float (%any-to-float (%scaled-result *%trig-pi*))))
-    (cond
-      ((integerp x) (if (>= x 0) 0 pi-float))
-      ((ratiop x) (if (>= (ratio-numerator x) 0) 0 pi-float))
-      (t (let ((s (%as-scaled-int x)))
-           (if (>= s 0) 0 pi-float))))))
+  (cond
+    ((integerp x) (if (>= x 0) 0 (%fpi)))
+    ((ratiop x) (if (>= (ratio-numerator x) 0) 0 (%fpi)))
+    (t (if (float-negative-p (%any-to-float x)) (%fpi) 0))))
 
 (defun cis (x)
   "cis(x) = cos(x) + i*sin(x) — modus has no complex type, so return cos(x)
@@ -1540,6 +1555,14 @@
 ;; 17 5) errored with %eval-escape.  Compiled callers still use the
 ;; inline opcodes; these defuns serve the SFT-routed runtime path.
 
+(defun %trunc1-generic (n)
+  "1-arg truncate of an IEEE float N → (values q r) where q = trunc(n)
+   toward zero (a tagged integer) and r = n - q (a FLOAT).  CLHS
+   requires 2 values; the compiler's truncate intercept routes the
+   float case here so (multiple-value-list (truncate 5.5)) → (5 0.5)."
+  (let ((q (%float-to-int n)))
+    (values q (generic-subtract n q))))
+
 (defun truncate (n &rest rest)
   (cond
     ((null rest) (truncate n))
@@ -1559,6 +1582,13 @@
      ;; wrong direction for negative ratios.
      (cond ((integerp n) n)
            ((ratiop n) (floor (aref n 0) (aref n 1)))
+           ;; Float: q = ⌊n⌋ (toward -inf), r = n - q (a FLOAT in [0,1)).
+           ((%ieee-float-p n)
+            (let* ((tz (%float-to-int n))          ; toward zero
+                   (q (if (and (float-negative-p n)
+                               (not (numeric-equal-p (%float-from-int tz) n)))
+                          (- tz 1) tz)))
+              (values q (generic-subtract n q))))
            (t (truncate n))))
     (t
      (let ((d (car rest)))
@@ -1575,6 +1605,13 @@
     ((null rest)
      (cond ((integerp n) n)
            ((ratiop n) (ceiling (aref n 0) (aref n 1)))
+           ;; Float: q = ⌈n⌉ (toward +inf), r = n - q (a FLOAT in (-1,0]).
+           ((%ieee-float-p n)
+            (let* ((tz (%float-to-int n))
+                   (q (if (and (not (float-negative-p n))
+                               (not (numeric-equal-p (%float-from-int tz) n)))
+                          (+ tz 1) tz)))
+              (values q (generic-subtract n q))))
            (t (truncate n))))
     (t
      (let ((d (car rest)))
@@ -1601,6 +1638,17 @@
             (multiple-value-bind (q r) (round (aref n 0) (aref n 1))
               (declare (ignore r))
               (values q (- n q))))
+           ;; Float: round to nearest, ties to even.  q = nearest int,
+           ;; r = n - q (a FLOAT).
+           ((%ieee-float-p n)
+            (let* ((fl (floor n))                  ; lower integer
+                   (frac (generic-subtract n fl))  ; float in [0,1)
+                   (half (%float-div (%float-from-int 1) (%float-from-int 2)))
+                   (q (cond
+                        ((numeric-value-less-p frac half) fl)        ; <0.5
+                        ((numeric-value-less-p half frac) (+ fl 1))  ; >0.5
+                        (t (if (oddp fl) (+ fl 1) fl)))))            ; tie→even
+              (values q (generic-subtract n q))))
            (t (truncate n))))
     (t
      (let ((d (car rest)))

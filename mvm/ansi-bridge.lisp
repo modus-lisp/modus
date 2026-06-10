@@ -1100,17 +1100,19 @@
 ;;; ============================================================
 
 (defun approx= (x y &rest eps-arg)
-  "Approximate equality for floats. Uses relative epsilon."
-  (let ((eps (if eps-arg (car eps-arg) 1.0d-4)))
-    (let ((ax (if (< x 0.0d0) (- 0.0d0 x) x))
-          (ay (if (< y 0.0d0) (- 0.0d0 y) y)))
-      (let ((denom (if (> ax ay) ax ay)))
-        (if (= denom 0.0d0)
-            (let ((diff (- x y)))
-              (<= (if (< diff 0.0d0) (- 0.0d0 diff) diff) eps))
-            (let ((diff (- x y)))
-              (let ((rdiff (if (< diff 0.0d0) (- 0.0d0 diff) diff)))
-                (<= rdiff (* eps denom)))))))))
+  "Approximate equality for floats — matches ansi-aux's
+   (<= (abs (/ (- x y) (max (abs x) 1))) eps).  The denominator is
+   floored at 1.0 so that when x≈0 and y is tiny (e.g. cos(π/2)≈6e-17
+   vs 0.0) the comparison uses an absolute tolerance — required by the
+   ANSI trig approx= tests.  All arithmetic stays in doubles to avoid
+   the float/integer mixed-compare path."
+  (let ((eps (if eps-arg (car eps-arg) 1.0d-4))
+        (one 1.0d0))
+    (let ((ax (if (< x 0.0d0) (- 0.0d0 x) x)))
+      (let ((denom (if (< one ax) ax one)))
+        (let ((diff (- x y)))
+          (let ((adiff (if (< diff 0.0d0) (- 0.0d0 diff) diff)))
+            (<= adiff (* eps denom))))))))
 
 ;;; ============================================================
 ;;; random-from-seq — pick random element from a sequence
@@ -2545,21 +2547,27 @@
 ;;; the ANSI test suite asks about (integer/integer pairs).
 ;;; ============================================================
 
+;;; CLHS: ffloor/fceiling/ftruncate/fround return the quotient as a
+;;; FLOAT (of the same format as the argument, or single-float if the
+;;; argument is rational).  The second value is the remainder.  Modus
+;;; coerces the integer quotient back to a float; the remainder keeps
+;;; the type the underlying floor/etc. produced (integer for
+;;; integer/integer args, float for float args).
 (defun ftruncate (n &optional (d 1))
-  (let ((q (truncate n d)))
-    (values q (- n (* q d)))))
+  (multiple-value-bind (q r) (truncate n d)
+    (values (%any-to-float q) r)))
 
 (defun ffloor (n &optional (d 1))
-  (let ((q (floor n d)))
-    (values q (- n (* q d)))))
+  (multiple-value-bind (q r) (floor n d)
+    (values (%any-to-float q) r)))
 
 (defun fceiling (n &optional (d 1))
-  (let ((q (ceiling n d)))
-    (values q (- n (* q d)))))
+  (multiple-value-bind (q r) (ceiling n d)
+    (values (%any-to-float q) r)))
 
 (defun fround (n &optional (d 1))
-  (let ((q (round n d)))
-    (values q (- n (* q d)))))
+  (multiple-value-bind (q r) (round n d)
+    (values (%any-to-float q) r)))
 
 ;;; ============================================================
 ;;; CLOS MOP Stubs

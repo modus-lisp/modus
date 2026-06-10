@@ -2678,6 +2678,15 @@
   (deftest 9131 (safe-eval (lambda () (car 0)))  :crashed)
   (deftest 9132 (safe-eval (lambda () (cdr 42))) :crashed)
   (deftest 9133 (safe-eval (lambda () (car 42))) :crashed)
+  ;; --- Band 2a float-native trig smoke probes (9881-9885) ---
+  ;; Kept minimal: these don't go through approx= (which crashes the
+  ;; parent diag chunk for reasons unrelated to the trig rewrite — the
+  ;; real ANSI cos/sin/tan/etc. ranges exercise approx= fine).
+  (run-test 9881 (lambda () (floatp (%float-from-int 5))) 't)
+  (run-test 9882 (lambda () (floatp (%fpi))) 't)
+  (run-test 9883 (lambda () (%float-to-int (%float-add (%fl 79) (%f-half)))) 79)
+  (run-test 9884 (lambda () (floatp (%trig-reduce-f (%fl 500)))) 't)
+  (run-test 9885 (lambda () (floatp (cos 0.0))) 't)
   )
 
 ;;; ============================================================

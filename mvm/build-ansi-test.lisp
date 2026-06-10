@@ -3571,9 +3571,16 @@
                      ;; init for ALL files crashes the parent (some defmethod
                      ;; init forms apparently SIGSEGV unrecoverably even with
                      ;; handler-case wrapping).
+                     ;; defgeneric-method-combination-aux added 2026-06-10:
+                     ;; the file holds ONLY dgmc-class-01..07 defclass forms
+                     ;; (zero tests), and because each test file runs in its
+                     ;; own fork no other file's init could provide them —
+                     ;; dg-mc.N.7 funcalled methods specialized on classes
+                     ;; that never existed and died on no-applicable-method.
                      (dolist (name *ansi-file-names*)
-                       (when (and (>= (length name) 9)
-                                  (string= (subseq name 0 9) "defclass-"))
+                       (when (or (and (>= (length name) 9)
+                                      (string= (subseq name 0 9) "defclass-"))
+                                 (string= name "defgeneric-method-combination-aux"))
                          (format s "  (handler-case (run-init-~A) (t (c) nil))~%" name)))
                      ;; Phase 2: forks per file.
                      (let ((by-name nil))

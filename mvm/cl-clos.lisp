@@ -873,6 +873,19 @@
   (setq *slot-missing-methods*
         (cons (cons class-name fn) *slot-missing-methods*)))
 
+(defun %clos-sym-name-eq (a b)
+  "True if class-name symbols A and B denote the same name, robust to
+   native-MVM-sym vs CL-sym identity drift across init-form / test
+   boundaries (same name/hash, different object).  NOT a substitute for
+   EQ on genuinely distinct symbols — callers eq-check first."
+  (cond
+    ((eq a b) t)
+    ((and (%native-mvm-sym-p a) (%native-mvm-sym-p b))
+     (= (%native-mvm-sym-hash a) (%native-mvm-sym-hash b)))
+    ((and (%cl-sym-p a) (%cl-sym-p b))
+     (string-equal (%cl-sym-name a) (%cl-sym-name b)))
+    (t nil)))
+
 (defun %dispatch-slot-missing (cls obj slot-name op new-val new-val-p)
   "Call the most-specific slot-missing method for OBJ's class.  When
    no user method is registered, fall through to the documented default
@@ -884,7 +897,14 @@
         (when (null cur) (return nil))
         (let ((m (car cur)))
           (let ((m-class (car m)) (m-fn (cdr m)))
-            (when (or (eq m-class t) (eq m-class class-name))
+            ;; Robust class match: a method registered from a different
+            ;; top-level init-form may hold a different symbol OBJECT for the
+            ;; same class name (native-MVM-sym vs CL-sym drift across the
+            ;; defmethod-rewrite / %defclass boundary).  Compare by name/hash
+            ;; as well as eq so the user slot-missing method actually fires.
+            (when (or (eq m-class t)
+                      (eq m-class class-name)
+                      (%clos-sym-name-eq m-class class-name))
               (when (null best-fn) (setq best-fn m-fn)))))
         (setq cur (cdr cur))))
     (if best-fn

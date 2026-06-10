@@ -2160,6 +2160,20 @@
    (s2 :initarg :s1b :initarg :s2))
   (:default-initargs :s1 99 :s1b 88))
 
+;;; slot-exists-p probe class: bare-symbol slot + :allocation variants
+;;; (mirrors slot-exists-p-class-01).
+(defclass probe-sep-class ()
+  (sa (sb :allocation :class) (sc :allocation :instance)))
+
+;;; slot-missing probe: user method on a class (mirrors slot-missing-class-01).
+(defparameter *probe-sm-var* nil)
+(defclass probe-sm-class () (a b c))
+(defmethod slot-missing ((class t) (obj probe-sm-class)
+                         (slot-name t) (operation t)
+                         &optional (new-value nil new-value-p))
+  (setf *probe-sm-var*
+        (list slot-name operation new-value (notnot new-value-p))))
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -2880,6 +2894,30 @@
         (shared-initialize obj t)
         (notnot (slot-boundp obj 's1))))
     'nil)
+  ;; 9946-9949 — slot-exists-p on allocate-instance'd instance (Target 4).
+  (run-test 9946 (lambda () (notnot (%clos-instance-p (allocate-instance (find-class 'probe-sep-class))))) 't)
+  (run-test 9947 (lambda () (notnot (slot-exists-p (allocate-instance (find-class 'probe-sep-class)) 'sa))) 't)
+  (run-test 9948 (lambda () (notnot (slot-exists-p (allocate-instance (find-class 'probe-sep-class)) 'sc))) 't)
+  (run-test 9949 (lambda () (slot-exists-p (allocate-instance (find-class 'probe-sep-class)) 'nope)) 'nil)
+  ;; 9950 — does %clos-slot-index find bare-symbol slot sa? (-1 = not found)
+  (run-test 9950 (lambda () (let ((cls (%find-clos-class 'probe-sep-class))) (if (and cls (>= (%clos-slot-index cls 'sa) 0)) t nil))) 't)
+  ;; 9951/9952 — user slot-missing method fires on a missing slot (Target 4).
+  (run-test 9951 (lambda () (setq *probe-sm-var* nil) (slot-value (make-instance 'probe-sm-class) 'foo)) '(foo slot-value nil nil))
+  (run-test 9952 (lambda () (setq *probe-sm-var* nil) (slot-value (make-instance 'probe-sm-class) 'foo) *probe-sm-var*) '(foo slot-value nil nil))
+  ;; 9180 — with-slots SETF writes back to the slot (Target 4: with-slots.8).
+  (run-test 9180
+    (lambda ()
+      (let ((obj (make-instance 'probe-di-class :s1 'x :s2 'y)))
+        (with-slots (s1 s2) obj
+          (setf s1 'p)
+          (list s1 s2 (slot-value obj 's1)))))
+    '(p y p))
+  ;; 9181 — with-slots SETQ also writes back (symbol-macrolet → setf).
+  (run-test 9181
+    (lambda ()
+      (let ((obj (make-instance 'probe-di-class :s1 'x :s2 'y)))
+        (with-slots (s1) obj (setq s1 'q) (slot-value obj 's1))))
+    'q)
   )
 
 ;;; ============================================================

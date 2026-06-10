@@ -2491,42 +2491,25 @@
     ;; (slot-makunbound obj slot) → (slot-makunbound obj slot) — already defined
 
     ;; (with-slots (slot-bindings...) obj body...)
-    ;; → let bindings using slot-value
+    ;; Keep the WITH-SLOTS head intact and let compiler.lisp's WITH-SLOTS
+    ;; macro expand it via SYMBOL-MACROLET (so SETF/SETQ on a slot var
+    ;; writes back to the slot).  The old rewriter here expanded to a plain
+    ;; (let ((var (slot-value …))) …), making var a non-place local — reads
+    ;; worked but (setf a 'p)/(setq a 'p) silently mutated the local instead
+    ;; of the slot (with-slots.8/9/11/12/13 GOT the right setf RETURN but the
+    ;; slot stayed unchanged).  Only rewrite the obj-form and body subforms.
     ((and (eq (car form) 'with-slots) (cddr form))
-     (let* ((slot-entries (cadr form))
-            (obj-form (rewrite-reader-forms (caddr form)))
-            (body (mapcar #'rewrite-reader-forms (cdddr form)))
-            ;; Use a fixed obj var name (no gensym — must survive ~S print/read)
-            (obj-var '%with-slots-obj)
-            (bindings
-             (mapcar (lambda (entry)
-                       (if (consp entry)
-                           ;; (var slot-name)
-                           `(,(car entry) (slot-value ,obj-var ',(cadr entry)))
-                           ;; bare slot-name
-                           `(,entry (slot-value ,obj-var ',entry))))
-                     slot-entries)))
-       `(let ((,obj-var ,obj-form))
-          (let ,bindings
-            ,@body))))
+     `(with-slots ,(cadr form)
+        ,(rewrite-reader-forms (caddr form))
+        ,@(mapcar #'rewrite-reader-forms (cdddr form))))
 
     ;; (with-accessors (accessor-bindings...) obj body...)
-    ;; → let bindings using accessor functions
+    ;; Same rationale: defer to compiler.lisp's WITH-ACCESSORS symbol-macrolet
+    ;; macro so SETF on an accessor var routes through (setf (acc obj) v).
     ((and (eq (car form) 'with-accessors) (cddr form))
-     (let* ((acc-entries (cadr form))
-            (obj-form (rewrite-reader-forms (caddr form)))
-            (body (mapcar #'rewrite-reader-forms (cdddr form)))
-            (obj-var '%with-accessors-obj)
-            (bindings
-             (mapcar (lambda (entry)
-                       ;; entry = (var accessor-fn)
-                       (if (consp entry)
-                           `(,(car entry) (,(cadr entry) ,obj-var))
-                           `(,entry (,entry ,obj-var))))
-                     acc-entries)))
-       `(let ((,obj-var ,obj-form))
-          (let ,bindings
-            ,@body))))
+     `(with-accessors ,(cadr form)
+        ,(rewrite-reader-forms (caddr form))
+        ,@(mapcar #'rewrite-reader-forms (cdddr form))))
 
     ;; (with-open-file (var filespec &rest opts) body...)
     ;; → (let ((var (open filespec opts...))) (unwind-protect (progn body) (when var (close var))))

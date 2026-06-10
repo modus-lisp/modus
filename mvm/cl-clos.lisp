@@ -1778,8 +1778,11 @@
 ;;; Custom method combination dispatch (short form)
 ;;; ============================================================
 
-(defun %gf-dispatch-custom (gf args applicable mc)
-  "Short-form method combination: collect qualifying methods and apply operator."
+(defun %gf-dispatch-custom (gf args applicable mc &optional msl)
+  "Short-form method combination: collect qualifying methods and apply
+   operator.  MSL non-nil = :most-specific-last — primary methods run
+   in reverse (least-specific-first) order; :around ordering is
+   unaffected (CLHS 7.6.6.4)."
   (let ((comb-name (%mc-name mc))
         (operator (%mc-operator mc))
         (identity-with-one (%mc-identity-with-one mc)))
@@ -1810,6 +1813,10 @@
           (setq cur (cdr cur))))
       (setq around-methods  (nreverse around-methods))
       (setq primary-methods (nreverse primary-methods))
+      ;; :most-specific-last — reverse the primary order (collected
+      ;; most-specific-first above).  Arounds keep their order.
+      (when msl
+        (setq primary-methods (reverse primary-methods)))
       (when (null primary-methods)
         (error "no applicable method for combination"))
       ;; Compute the combined result.
@@ -1962,7 +1969,11 @@
 ;;; ============================================================
 
 (defun %gf-dispatch (name args)
-  "Dispatch generic function NAME with ARGS."
+  "Dispatch generic function NAME with ARGS.
+   The combination slot holds either a bare combination name (symbol)
+   or (NAME . :MOST-SPECIFIC-LAST) when the defgeneric supplied the
+   ordering option — primaries then run least-specific-first per
+   CLHS 7.6.6.4 (the :around chain ordering is NOT affected)."
   (let ((gf (%find-gf name)))
     (when (null gf)
       (error "undefined generic function"))
@@ -1970,12 +1981,17 @@
       (when (null applicable)
         ;; Try no-applicable-method hook
         (error "no applicable method"))
-      (let ((comb-name (%gf-combination gf)))
+      (let* ((comb-raw (%gf-combination gf))
+             (comb-name (if (consp comb-raw) (car comb-raw) comb-raw))
+             (msl (and (consp comb-raw)
+                       (let ((o (cdr comb-raw)))
+                         (and (symbolp o)
+                              (string= (symbol-name o) "MOST-SPECIFIC-LAST"))))))
         (if comb-name
           ;; Custom method combination
           (let ((mc (%find-mc comb-name)))
             (if mc
-              (%gf-dispatch-custom gf args applicable mc)
+              (%gf-dispatch-custom gf args applicable mc msl)
               ;; Unknown combination — fall through to standard
               (%gf-dispatch-standard gf args applicable)))
           ;; Standard method combination

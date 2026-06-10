@@ -1308,6 +1308,16 @@
          ,dc-rewritten
          ,@(nreverse tests)))))
 
+;; Dispatch defuns hoisted out of defgeneric expansions (see the
+;; defgeneric clause below).  Nested (defun NAME …) inside a deftest
+;; thunk compiles, but a by-name call to it from the same thunk is a
+;; void no-op (probes 9850/9853, 2026-06-10) — so the rewriter collects
+;; the dispatch defuns here and load-ansi-chapter emits them at top
+;; level before each file's test forms.  *hoisted-gf-names* dedupes
+;; across re-defgenerics of the same name (the defun body is identical).
+(defvar *hoisted-gf-defuns* nil)
+(defvar *hoisted-gf-names* nil)
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -2055,7 +2065,14 @@
          (when (consp opt)
            (cond
              ((eq (car opt) :method-combination)
-              (setq combination (cadr opt)))
+              ;; (:method-combination NAME [:most-specific-last]) — encode
+              ;; the ordering as (NAME . :MOST-SPECIFIC-LAST) so
+              ;; %gf-dispatch can reverse the primary order.
+              ;; :most-specific-first is the default and stays bare.
+              (setq combination
+                    (if (eq (caddr opt) :most-specific-last)
+                        (cons (cadr opt) :most-specific-last)
+                        (cadr opt))))
              ((eq (car opt) :method)
               (push opt inline-methods)))))
        ;; Build method-add forms for inline :method options
@@ -2092,18 +2109,30 @@
                                         (list ,@specs)
                                         (lambda ,params ,@rewritten-body))))
                        (nreverse inline-methods))))
+         ;; HOIST the dispatch defun to top level (2026-06-10).  When the
+         ;; defgeneric sits inside a deftest thunk (every DG-MC.* test),
+         ;; the nested (defun NAME …) compiles via compile-form's
+         ;; nested-DEFUN path — and a subsequent BY-NAME call to it from
+         ;; the same thunk is a void no-op: the call contributes no value
+         ;; and VR keeps the previous form's value (probes 9850/9853/9856,
+         ;; 2026-06-10 — dg-mc.N.10/.11 returned T instead of :ERROR
+         ;; because dispatch never ran).  Defun semantics are global, so
+         ;; hoisting is also simply the correct compilation: the defun is
+         ;; collected here and emitted at top level by load-ansi-chapter
+         ;; (see *hoisted-gf-defuns* drain at the emission loop).
+         (let ((name-key (format nil "~S" gf-name)))
+           (unless (member name-key *hoisted-gf-names* :test #'string=)
+             (push name-key *hoisted-gf-names*)
+             (push `(defun ,gf-name (&rest %gf-args)
+                      (%gf-dispatch ',gf-name %gf-args))
+                   *hoisted-gf-defuns*)))
          `(progn
             (%defgeneric ',gf-name ',lambda-list ',(if combination combination nil))
-            (defun ,gf-name (&rest %gf-args)
-              (%gf-dispatch ',gf-name %gf-args))
-            ;; Register the dispatch defun's fn-addr so
+            ;; Register the (now top-level) dispatch defun's fn-addr so
             ;; (typep #',gf-name 'generic-function) → T (cl-clos.lisp's
             ;; %generic-function-p consults *gf-stub-closures*).
-            ;; handler-case wrap: when defgeneric is INSIDE a lambda body
-            ;; (eg DG-MC tests inline both defgeneric and the test call),
-            ;; (function ,gf-name) at build time may resolve to 0 because
-            ;; the just-defined defun isn't visible to the function-ref
-            ;; compiler.  Don't take the whole lambda down with us.
+            ;; handler-case retained for robustness of (function ,gf-name)
+            ;; resolution order across chunks.
             (handler-case (%register-gf-fn (function ,gf-name)) (t (c) nil))
             ,@method-forms
             ;; ANSI: defgeneric returns the GF object so callers like
@@ -2678,6 +2707,18 @@
               )
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
               (format out "~%;; === ~A ===~%" file)
+              ;; Drain dispatch defuns hoisted out of this file's
+              ;; defgeneric expansions (rewrite-reader-forms collected
+              ;; them during the passes above).  Emitted at top level so
+              ;; by-name calls inside test thunks resolve to a real
+              ;; global function — the thunk-nested defun + by-name call
+              ;; combination is a void no-op (probes 9850/9853).
+              (dolist (hd (nreverse *hoisted-gf-defuns*))
+                (let ((hd-s (handler-case (format nil "~S" hd) (error () nil))))
+                  (when (and hd-s (not (search "#<" hd-s)))
+                    (write-string hd-s out)
+                    (terpri out))))
+              (setf *hoisted-gf-defuns* nil)
               (dolist (form forms)
                 (cond
                   ((and (consp form) (eq (car form) 'deftest))

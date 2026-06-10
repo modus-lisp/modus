@@ -2084,6 +2084,10 @@
 ;; properly and (function ...) lookups resolve.
 (defun %diag-mc-append-1 (&rest %gf-args) (%gf-dispatch '%diag-mc-append-1 %gf-args))
 
+;; Special used by dg-mc probes 9862/9863 (defvar defaults to NIL at
+;; boot — CLAUDE.md item 7 — which is exactly the value we want).
+(defvar *dgmc-probe-x* nil)
+
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
   ;; Test: interning works: same symbol twice should be eq
@@ -2127,6 +2131,190 @@
   (%defmethod '%diag-mc-append-1 'nil (list 't) (lambda (x) '(a)))
   (deftest 9790 (notnot (%find-gf '%diag-mc-append-1)) t)
   (deftest 9791 (handler-case (%diag-mc-append-1 'x) (error nil :err)) :err)
+  ;; DG-MC thunk-context probes (2026-06-10, IDs 9850-9863; first cut at
+  ;; 9820-9827 collided with the file-probe deftests).  9785/9790/9791
+  ;; PASS while every dg-mc.N test with the same primitives FAILS — the
+  ;; ANSI tests' defgeneric expansion executes inside a run-test THUNK.
+  ;; Round-1 findings (single execution each, NOT a re-run issue):
+  ;;   - combination slot + %find-mc resolve fine in-thunk (9851/9852 P)
+  ;;   - funcall of the GF object dispatches custom correctly (9854 GOT:B)
+  ;;   - calling the thunk-NESTED DEFUN by name returns NO value — VR
+  ;;     keeps the previous form's value (9850 GOT:arg, 9853 GOT:gf-obj,
+  ;;     9856 GOT:method-record).  The nested-defun call is a void no-op.
+  ;; Expected values are QUOTED — run-test is an eager function.
+  ;;
+  ;; 9850 — and.10 shape: nil-qualified method on custom-combination GF,
+  ;; called BY NAME (thunk-nested defun).  :error if dispatch + the
+  ;; nested-defun call both work.
+  (run-test 9850
+    (lambda ()
+      (progn
+        (progn (%defgeneric 'dg-probe-p20 '(x) 'and)
+               (defun dg-probe-p20 (&rest %gf-args)
+                 (%gf-dispatch 'dg-probe-p20 %gf-args))
+               (handler-case (%register-gf-fn (function dg-probe-p20)) (t (c) nil))
+               (%defmethod 'dg-probe-p20 'nil (list 't) (lambda (x) t))
+               (%find-gf 'dg-probe-p20))
+        (handler-case (dg-probe-p20 'a) (error () :error))))
+    ':error)
+  ;; 9851 — combination-slot visibility from inside a thunk.
+  (run-test 9851
+    (lambda ()
+      (progn
+        (%defgeneric 'dg-probe-p21 '(x) 'and)
+        (notnot (%gf-combination (%find-gf 'dg-probe-p21)))))
+    't)
+  ;; 9852 — %find-mc resolution from inside a thunk.
+  (run-test 9852
+    (lambda ()
+      (progn
+        (%defgeneric 'dg-probe-p22 '(x) 'and)
+        (notnot (%find-mc (%gf-combination (%find-gf 'dg-probe-p22))))))
+    't)
+  ;; 9853 — discriminating value via BY-NAME call: custom AND fold gives
+  ;; B; standard dispatch gives T; nested-defun void-call gives the
+  ;; stale previous value (the GF object).
+  (run-test 9853
+    (lambda ()
+      (progn
+        (progn (%defgeneric 'dg-probe-p23 '(x) 'and)
+               (defun dg-probe-p23 (&rest %gf-args)
+                 (%gf-dispatch 'dg-probe-p23 %gf-args))
+               (%defmethod 'dg-probe-p23 'and (list 'integer) (lambda (x) t))
+               (%defmethod 'dg-probe-p23 'and (list 't) (lambda (x) 'b))
+               (%find-gf 'dg-probe-p23))
+        (dg-probe-p23 5)))
+    'b)
+  ;; 9854 — same dispatch through FUNCALL of the let-bound GF object.
+  (run-test 9854
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p24 '(x) 'and)
+                  (%defmethod 'dg-probe-p24 'and (list 'integer) (lambda (x) t))
+                  (%defmethod 'dg-probe-p24 'and (list 't) (lambda (x) 'b))
+                  (%find-gf 'dg-probe-p24))))
+        (funcall fn 5)))
+    'b)
+  ;; 9855 — flet wrapper around the funcall (dg-mc.and.1 %f shape minus
+  ;; the special-variable LET).
+  (run-test 9855
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p25 '(x) 'and)
+                  (%defmethod 'dg-probe-p25 'and (list 'integer) (lambda (x) t))
+                  (%defmethod 'dg-probe-p25 'and (list 't) (lambda (x) 'b))
+                  (%find-gf 'dg-probe-p25))))
+        (flet ((%pf (y) (funcall fn y)))
+          (list (%pf 5) (%pf 'z)))))
+    '(b b))
+  ;; 9856 — cross-package specializer identity via BY-NAME call (kept
+  ;; for continuity; conflated with the nested-defun bug, see 9857).
+  (run-test 9856
+    (lambda ()
+      (let ((int-sym (intern "INTEGER" (find-package "CL-USER"))))
+        (%defgeneric 'dg-probe-p26 '(x) nil)
+        (%defmethod 'dg-probe-p26 'nil (list int-sym) (lambda (x) 'ifound))
+        (%defmethod 'dg-probe-p26 'nil (list 't) (lambda (x) 'b))
+        (funcall (%find-gf 'dg-probe-p26) 5)))
+    'ifound)
+  ;; 9857 — first-party 'integer specializer control via funcall.
+  (run-test 9857
+    (lambda ()
+      (progn
+        (%defgeneric 'dg-probe-p27 '(x) nil)
+        (%defmethod 'dg-probe-p27 'nil (list 'integer) (lambda (x) 'ifound))
+        (%defmethod 'dg-probe-p27 'nil (list 't) (lambda (x) 'b))
+        (funcall (%find-gf 'dg-probe-p27) 5)))
+    'ifound)
+  ;; 9858 — and.7 replication: user-defined dgmc-probe classes (diamond),
+  ;; 4 and-methods, funcall through values + multiple-value-list.
+  (%defclass 'dgmc-probe-c1 'nil 'nil)
+  (%defclass 'dgmc-probe-c2 'nil '(dgmc-probe-c1))
+  (%defclass 'dgmc-probe-c3 'nil '(dgmc-probe-c1))
+  (%defclass 'dgmc-probe-c4 'nil '(dgmc-probe-c2 dgmc-probe-c3))
+  (run-test-mv 9858
+    (lambda ()
+      (multiple-value-list
+       (let ((fn (progn
+                   (%defgeneric 'dg-probe-p28 '(x) 'and)
+                   (%defmethod 'dg-probe-p28 'and (list 'dgmc-probe-c4) (lambda (x) 'c))
+                   (%defmethod 'dg-probe-p28 'and (list 'dgmc-probe-c3) (lambda (x) 'b))
+                   (%defmethod 'dg-probe-p28 'and (list 'dgmc-probe-c2) (lambda (x) nil))
+                   (%defmethod 'dg-probe-p28 'and (list 'dgmc-probe-c1) (lambda (x) 'a))
+                   (%find-gf 'dg-probe-p28))))
+         (values (funcall fn (%make-instance 'dgmc-probe-c1))
+                 (funcall fn (%make-instance 'dgmc-probe-c2))
+                 (funcall fn (%make-instance 'dgmc-probe-c3))
+                 (funcall fn (%make-instance 'dgmc-probe-c4))))))
+    '(a nil a nil))
+  ;; 9859 — user-class dispatch, single method, funcall: isolates
+  ;; user-class CPL matching from the fold.
+  (run-test 9859
+    (lambda ()
+      (progn
+        (%defgeneric 'dg-probe-p29 '(x) nil)
+        (%defmethod 'dg-probe-p29 'nil (list 'dgmc-probe-c1) (lambda (x) 'hit))
+        (funcall (%find-gf 'dg-probe-p29) (%make-instance 'dgmc-probe-c2))))
+    'hit)
+  ;; 9860 — and.6-lite: one :around with call-next-method wrapping the
+  ;; and-fold.  Input 0 (integer): around(rational) matches, fold gives
+  ;; (and a d) = d, so result is (foo d).
+  (run-test 9860
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p30 '(x) 'and)
+                  (%defmethod 'dg-probe-p30 ':around (list 'rational)
+                              (lambda (x) (list 'foo (call-next-method))))
+                  (%defmethod 'dg-probe-p30 'and (list 'integer) (lambda (x) 'a))
+                  (%defmethod 'dg-probe-p30 'and (list 't) (lambda (x) 'd))
+                  (%find-gf 'dg-probe-p30))))
+        (funcall fn 0)))
+    '(foo d))
+  ;; 9861 — MV propagation through a custom-combination :around
+  ;; (and.8 shape): around returns (values a b c).
+  (run-test-mv 9861
+    (lambda ()
+      (multiple-value-list
+       (let ((fn (progn
+                   (%defgeneric 'dg-probe-p31 '(x) 'and)
+                   (%defmethod 'dg-probe-p31 ':around (list 'integer)
+                               (lambda (x) (values 'a 'b 'c)))
+                   (%defmethod 'dg-probe-p31 'and (list 't) (lambda (x) 'z))
+                   (%find-gf 'dg-probe-p31))))
+         (funcall fn 10))))
+    '(a b c))
+  ;; 9862 — and.1's special-variable shape: let-rebound special pushed
+  ;; from method lambdas.  *dgmc-probe-x* defvar'd at top level.
+  (run-test 9862
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p32 '(x) 'and)
+                  (%defmethod 'dg-probe-p32 'and (list 'integer)
+                              (lambda (x) (setq *dgmc-probe-x* (cons 4 *dgmc-probe-x*)) t))
+                  (%defmethod 'dg-probe-p32 'and (list 't)
+                              (lambda (x) (setq *dgmc-probe-x* (cons 1 *dgmc-probe-x*)) 'a))
+                  (%find-gf 'dg-probe-p32))))
+        (let ((*dgmc-probe-x* nil))
+          (declare (special *dgmc-probe-x*))
+          (list (funcall fn 1) *dgmc-probe-x*))))
+    '(a (1 4)))
+  ;; 9863 — full and.1 %f shape: flet wrapper + inner special LET,
+  ;; called twice.  Crash detector for the and.1/.2/.3 setup-crash mode.
+  (run-test 9863
+    (lambda ()
+      (let ((fn (progn
+                  (%defgeneric 'dg-probe-p33 '(x) 'and)
+                  (%defmethod 'dg-probe-p33 'and (list 'integer)
+                              (lambda (x) (setq *dgmc-probe-x* (cons 4 *dgmc-probe-x*)) t))
+                  (%defmethod 'dg-probe-p33 'and (list 't)
+                              (lambda (x) (setq *dgmc-probe-x* (cons 1 *dgmc-probe-x*)) 'a))
+                  (%find-gf 'dg-probe-p33))))
+        (flet ((%pf (y)
+                 (let ((*dgmc-probe-x* nil))
+                   (declare (special *dgmc-probe-x*))
+                   (list (funcall fn y) *dgmc-probe-x*))))
+          (list (%pf 1) (%pf 'q)))))
+    '((a (1 4)) (a (1))))
   ;; Inline-defun-in-lambda crash pattern (CLAUDE.md "nested defun w/
   ;; %gf-dispatch body in funcall thunk"; bisected via probes 9792-9816
   ;; on 2026-05-04, those probes deleted to avoid noise).

@@ -2291,7 +2291,14 @@
            ;; leading colon, so the literal we compare against does too.
            (when (and (consp opt) (symbolp (car opt))
                       (%eval-sym-eq (car opt) "METHOD-COMBINATION"))
-             (setq combination (cadr opt))))
+             ;; (:method-combination NAME [:most-specific-last]) — encode
+             ;; the ordering as (NAME . :MOST-SPECIFIC-LAST), mirroring
+             ;; the build-time rewriter; %gf-dispatch reverses primaries.
+             (setq combination
+                   (if (and (consp (cddr opt)) (symbolp (caddr opt))
+                            (%eval-sym-eq (caddr opt) "MOST-SPECIFIC-LAST"))
+                       (cons (cadr opt) ':most-specific-last)
+                       (cadr opt)))))
          ;; Pass lambda-list so %defmethod / find-method can validate
          ;; method-vs-GF arity congruence.
          (%defgeneric gf-name lambda-list combination)

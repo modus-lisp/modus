@@ -2720,10 +2720,27 @@
           (format t "  Transforming: ~A~%" file)
           (let ((forms nil))
             (with-open-file (s path :direction :input)
-              (let ((*package* (find-package :cl-user)))
-                (loop (let ((form (read s nil :eof)))
-                        (when (eq form :eof) (return))
-                        (push form forms)))))
+              ;; *read-eval* T so `#.(make-array …)` literals (adjust-array.lsp
+              ;; form 54+, print-*.lsp, etc.) read cleanly.  The build env sets
+              ;; *read-eval* NIL globally for safety, which made the WHOLE
+              ;; adjust-array.lsp abort with "can't read #. while *READ-EVAL*
+              ;; is NIL" — losing all ~78 ADJUST-ARRAY tests.  These #. forms
+              ;; only construct arrays/pathnames at read time; safe to eval.
+              (let ((*package* (find-package :cl-user))
+                    (*read-eval* t))
+                ;; Read per-form, catching a read error (END-OF-FILE / reader
+                ;; error) so a single un-readable form doesn't drop the WHOLE
+                ;; file.  adjust-array.lsp wraps its string/base-char variants
+                ;; in one giant `(loop ... for forms = `( …many deftests… )
+                ;; do (eval …))' form that the host reader chokes on; the 53
+                ;; plain deftests before it were being lost.  On a read error
+                ;; we keep the forms read so far and stop (the remaining text
+                ;; belongs to the unreadable form).
+                (handler-case
+                    (loop (let ((form (read s nil :eof)))
+                            (when (eq form :eof) (return))
+                            (push form forms)))
+                  (error () nil))))
             (push (pathname-name file) *ansi-file-names*)
             ;; Snapshot the test-id counter on entry so we can record the
             ;; file's [first .. last] test-id range after processing.

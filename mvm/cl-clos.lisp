@@ -3400,6 +3400,96 @@
              (values (cdr a) (cdr (car a)))
              (values nil 0))))))
 
+(defun %mda-nd-total (dims)
+  "Product of DIMS (a dimension list)."
+  (let ((total 1) (cur dims))
+    (loop (when (null cur) (return total))
+      (setq total (* total (car cur)))
+      (setq cur (cdr cur)))))
+
+(defun %mda-nd-index-in-bounds (subs dims)
+  "T iff every sub in SUBS is < its corresponding dim in DIMS."
+  (let ((s subs) (d dims) (ok t))
+    (loop (when (or (null s) (null d) (not ok)) (return ok))
+      (when (>= (car s) (car d)) (setq ok nil))
+      (setq s (cdr s)) (setq d (cdr d)))))
+
+(defun %mda-nd-next-subs (subs dims)
+  "Increment the multi-subscript SUBS (a list) odometer-style against DIMS.
+   Returns the next subs list, or NIL when the odometer wraps (done).
+   Both SUBS and DIMS are same-length lists; least-significant is rightmost."
+  (let ((rsubs (reverse subs)) (rdims (reverse dims))
+        (carry 1) (out nil))
+    (loop (when (null rsubs) (return nil))
+      (let ((v (+ (car rsubs) carry)) (d (car rdims)))
+        (if (>= v d)
+            (progn (setq out (cons 0 out)) (setq carry 1))
+            (progn (setq out (cons v out)) (setq carry 0))))
+      (setq rsubs (cdr rsubs)) (setq rdims (cdr rdims)))
+    (if (= carry 1) nil out)))
+
+(defun %adjust-mda-nd (a new-dims args)
+  "Adjust a rank≥2 MDA to NEW-DIMS, in place (eq holds — MDA headers are
+   mutable).  Per CLHS, elements at multi-subscripts in-bounds for BOTH the
+   old and new arrays are retained; the rest get :initial-element (or are
+   left default).  Honors :initial-contents (row-major flatten) and
+   :initial-element.  Displacement/fill-pointer on rank≥2 not handled."
+  (let ((init-elem :unset) (init-contents :unset) (etype :unset)
+        (cur args))
+    (loop (when (null cur) (return nil))
+      (let ((k (car cur)) (v (cadr cur)))
+        (cond
+          ((eq k :initial-element)  (setq init-elem v))
+          ((eq k :initial-contents) (setq init-contents v))
+          ((eq k :element-type)     (setq etype v))))
+      (setq cur (cddr cur)))
+    (let* ((old-dims (%mda-dims a))
+           (old-data (%mda-data a))
+           (str-data (stringp old-data))
+           (new-total (%mda-nd-total new-dims))
+           (sz (if (= new-total 0) 1 new-total))
+           (new-data (cond
+                       ((and (not (eq etype :unset))
+                             (or (eq etype 'character) (eq etype 'base-char)))
+                        (%make-string-array sz))
+                       (str-data (%make-string-array sz))
+                       (t (make-array sz)))))
+      (cond
+        ;; :initial-contents — flatten nested lists row-major into new-data.
+        ((not (eq init-contents :unset))
+         (%mda-fill-contents-flat new-data init-contents new-dims))
+        (t
+         ;; Walk every new multi-subscript; copy old value when in-bounds for
+         ;; old, else fill with init-elem (when given).
+         (let ((subs nil) (nd new-dims))
+           ;; initialise subs to all-zeros of new rank
+           (loop (when (null nd) (return nil))
+             (setq subs (cons 0 subs)) (setq nd (cdr nd)))
+           (setq subs (reverse subs))
+           (when (> new-total 0)
+             (let ((ni 0))
+               (loop
+                 (let ((val (cond
+                              ((%mda-nd-index-in-bounds subs old-dims)
+                               (apply #'%aref-multi a subs))
+                              ((not (eq init-elem :unset))
+                               (if (and str-data (characterp init-elem))
+                                   (char-code init-elem) init-elem))
+                              (t (if str-data 0 nil)))))
+                   (aset new-data ni val))
+                 (setq ni (+ ni 1))
+                 (let ((nxt (%mda-nd-next-subs subs new-dims)))
+                   (when (null nxt) (return nil))
+                   (setq subs nxt))))))))
+      ;; Commit: data ← new-data, dims ← new-dims, rank ← length, drop
+      ;; displacement (we materialised fresh storage).
+      (%prim-aset a 6 new-data)
+      (%prim-aset a 1 new-dims)
+      (%prim-aset a 0 (length new-dims))
+      (%prim-aset a 3 nil)
+      (%prim-aset a 4 0)
+      a)))
+
 (defun %adjust-mda-1d (a new-size args)
   "Adjust a rank-1 MDA in place: realloc data when growing, copy old
    contents, honor :initial-element / :initial-contents / :fill-pointer
@@ -3460,12 +3550,19 @@
          (%prim-aset a 3 nil) (%prim-aset a 4 0)))
       ;; Update dims slot to reflect the new size (rank stays 1).
       (%prim-aset a 1 (list new-size))
-      ;; Update fp if requested
-      (cond
-        ((eq fp-arg :unset) nil)
-        ((eq fp-arg t) (%mda-set-fp a new-size))
-        ((null fp-arg) (%mda-set-fp a nil))
-        (t (%mda-set-fp a fp-arg)))
+      ;; Update fp per CLHS adjust-array.  :fill-pointer nil / unsupplied
+      ;; RETAINS the array's existing fill pointer (clamped to new size) —
+      ;; it does NOT clear it.  t sets fp to new size.  An integer sets it
+      ;; explicitly.  adjust-array.6 / .adjustable.6: (adjust-array fp3-array
+      ;; 4 :fill-pointer nil) keeps fp = 3.
+      (let ((old-fp (%mda-fp a)))
+        (cond
+          ((eq fp-arg t) (%mda-set-fp a new-size))
+          ((or (eq fp-arg :unset) (null fp-arg))
+           ;; Retain existing fp, clamped so it never exceeds new size.
+           (when old-fp
+             (%mda-set-fp a (if (> old-fp new-size) new-size old-fp))))
+          (t (%mda-set-fp a fp-arg))))
       a)))
 
 (defun adjust-array (a new-size &rest args)
@@ -3476,9 +3573,17 @@
    Handles :displaced-to, :displaced-index-offset, :fill-pointer,
    :initial-element, :initial-contents.
 
-   Native MDA: always-adjustable; delegate to %adjust-mda-1d (currently
-   1-D only — multi-dim adjust would need to reshape dims).
+   Native MDA: always-adjustable.  Rank 0/1 → %adjust-mda-1d; rank ≥ 2 →
+   %adjust-mda-nd (reshape dims, preserve common multi-indices per CLHS).
    "
+  ;; Multi-dim MDA: NEW-SIZE is a dims list with length ≥ 2 — must be
+  ;; handled BEFORE the (car new-size) collapse below (which would drop
+  ;; all but dim 0).  adjust-array.21/22/23.  Only plain reshape (no
+  ;; displaced-to) is supported.
+  (when (and (%mda-p a) (consp new-size) (consp (cdr new-size))
+             (>= (%mda-rank a) 2)
+             (not (member :displaced-to args)))
+    (return-from adjust-array (%adjust-mda-nd a new-size args)))
   (when (consp new-size) (setq new-size (car new-size)))
   (when (%mda-p a)
     (let ((rank (%mda-rank a)))

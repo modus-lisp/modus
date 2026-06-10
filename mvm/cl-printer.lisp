@@ -412,8 +412,12 @@
                    ;; Need qualifier if symbol not accessible in current pkg
                    (cond
                      (native-accessible nil)
+                     ;; Native MVM symbol literal not found by the linear
+                     ;; %pkg-find-sym walk: it is still interned (compile
+                     ;; literal), so print it bare — no qualifier, no #:.
+                     ((and (null pkg) (not cl-sym-p)) nil)
                      ((null pkg)
-                      ;; Uninterned symbol
+                      ;; Genuinely uninterned CL symbol (make-symbol/gensym)
                       (if (or gensym readably) t nil))
                      (t
                       ;; Check if symbol is accessible in current package.
@@ -454,7 +458,17 @@
             ;; the result is not READably round-trippable.  *print-readably*
             ;; T forces #: (round-trip mandatory).  *print-escape* alone is
             ;; not enough; print.symbol.prefix.4 / .2 fail without this.
-            ((and (null pkg) (not native-accessible)
+            ;;
+            ;; CRITICAL: only CL-symbols (make-symbol / gensym give pkg=nil)
+            ;; are genuinely uninterned.  A NATIVE MVM symbol is always a
+            ;; compile-quote / read literal that IS interned in some package
+            ;; — it merely lacks a package slot, so `pkg` is nil and the
+            ;; %pkg-find-sym linear walk can miss it (lazily-stamped syms).
+            ;; Printing such a literal as `#:NAME` was wrong: format-s.7/44/…
+            ;; expect `(format nil "~S" 'ABC)` → "ABC", not "#:ABC".  Gate
+            ;; the #: branch on cl-sym-p so native literals fall through to
+            ;; the no-qualifier branch.
+            ((and cl-sym-p (null pkg) (not native-accessible)
                   (or readably (and escape gensym)))
              (%print-char 35 stream) ; #
              (%print-char 58 stream) ; :

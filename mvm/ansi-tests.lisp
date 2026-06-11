@@ -3017,6 +3017,33 @@
                              (sym (read-from-string str)))
                         (list (symbol-name sym)
                               (notnot (eql sym (find-symbol "a")))))))) '("a" t))
+  ;; escaped.1 loop-shape probes
+  (run-test 9270 (lambda () (symbol-name (read-from-string (concatenate 'string "\\" (string #\a))))) "a")
+  (run-test 9271 (lambda () (let ((c #\a)) (let ((s0 (string c))) (let ((s (concatenate 'string "\\" s0))) (symbol-name (read-from-string s)))))) "a")
+  (run-test 9272 (lambda () (string= (symbol-name (read-from-string "\\a")) "a")) 't)
+  (run-test 9273 (lambda () (string (char "abc" 0))) "a")
+  ;; full escaped.1 loop over +standard-chars+
+  (run-test 9274 (lambda ()
+                   (loop for c across +standard-chars+
+                         for s0 = (string c)
+                         for s = (concatenate 'string "\\" s0)
+                         for sym = (read-from-string s)
+                         unless (and (symbolp sym)
+                                     (string= (symbol-name sym) s0))
+                         collect (list c s0 s)))
+                 'nil)
+  (run-test 9275 (lambda () (symbol-name (read-from-string "\\\\"))) "\\")
+  (run-test 9276 (lambda () (symbol-name (read-from-string "\\|"))) "|")
+  (run-test 9277 (lambda () (symbol-name (read-from-string "\\("))) "(")
+  (run-test 9278 (lambda () (symbol-name (read-from-string "\\A"))) "A")
+  (run-test 9279 (lambda () (string= (symbol-name (read-from-string "\\A")) "A")) 't)
+  (run-test 9280 (lambda () (length (symbol-name (read-from-string "\\A")))) 1)
+  (run-test 9281 (lambda () (char-code (char (symbol-name (read-from-string "\\A")) 0))) 65)
+  (run-test 9282 (lambda () (readtable-case *readtable*)) ':upcase)
+  (run-test 9283 (lambda () (car (%apply-readtable-case (list 65) (list t) *readtable*))) 65)
+  (run-test 9284 (lambda () (car (%apply-readtable-case (list 65) (list nil) *readtable*))) 65)
+  (run-test 9285 (lambda () (char-code (char (symbol-name (read-from-string "A")) 0))) 65)
+  (run-test 9286 (lambda () (char-code (char (symbol-name (read-from-string "|A|")) 0))) 65)
   )
 
 ;;; ============================================================

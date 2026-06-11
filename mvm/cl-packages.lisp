@@ -691,16 +691,33 @@
                                      (key (logand (+ name-hash
                                                      (* pkg-hash 2305843009213693951))
                                                   #x3FFFFFFFFFFFFFFF))
+                                     ;; compute-name-hash UPPERCASES before
+                                     ;; hashing, so "A" and "a" share KEY.
+                                     ;; Only reuse a globally-keyed symbol when
+                                     ;; its actual name matches case-sensitively
+                                     ;; — otherwise it's a hash collision and we
+                                     ;; must mint a fresh symbol (whose
+                                     ;; within-package identity is then carried
+                                     ;; by the package symtab, checked first on
+                                     ;; the next intern).  Without this, reading
+                                     ;; "\\A" / "|A|" returned the pre-interned
+                                     ;; "a" symbol (symbol-name "a"), breaking
+                                     ;; syntax.escaped.* and case round-trips.
                                      (existing
                                        (let ((g (mem-ref #x10000088 :u64)))
-                                         (and g (gethash key g))))
+                                         (let ((e (and g (gethash key g))))
+                                           (and e (string= (symbol-name e) name-str) e))))
                                      (sym (or existing
                                               (let ((s (%make-cl-symbol name-str)))
                                                 (%cl-sym-set-package s pkg)
                                                 ;; Re-read after alloc — GC may
-                                                ;; have moved the table.
+                                                ;; have moved the table.  Only
+                                                ;; claim the KEY slot if it is
+                                                ;; free; a colliding-case name
+                                                ;; that already owns it keeps it.
                                                 (let ((g (mem-ref #x10000088 :u64)))
-                                                  (when g (puthash key g s)))
+                                                  (when (and g (not (gethash key g)))
+                                                    (puthash key g s)))
                                                 s))))
                                 (%pkg-set-internal pkg
                                   (%symtab-add (%pkg-internal pkg) name-str sym))

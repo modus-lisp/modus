@@ -96,10 +96,10 @@ runtime/        Runtime type system
 
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,465 tests (recovered files keep entering the denominator)
-- Ran: 17,361
-- Passed: 15,349 (87.88% overall, 88.41% of those that ran)
-- Failed: 1,908
-- Lost-to-crash: 104
+- Ran: 17,345
+- Passed: 15,350 (87.89% overall, 88.50% of those that ran)
+- Failed: 1,875
+- Lost-to-crash: 120 (sweep overlapped defstruct-seat activity; crash markers identical to baseline)
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

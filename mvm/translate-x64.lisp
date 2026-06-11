@@ -3499,6 +3499,48 @@
     ;; root slot the GC must forward.
     (emit-mov-reg-imm buf 'rax #x10000170)
     (emit-call buf scan-word-label)
+    ;; NOTE: the pre-interned signal-condition symbols at 0xCA0/0xCA8/0xCB0
+    ;; (%init-signal-symbols: 'TYPE-ERROR / 'PROGRAM-ERROR /
+    ;; 'UNDEFINED-FUNCTION) are deliberately NOT scanned here.  In the
+    ;; native-symbol builds these are NOT heap conses ((consp 'type-error)
+    ;; => NIL) — they are interned NATIVE MVM symbols already kept alive
+    ;; (and forwarded) via the symbol intern table at 0x10000088.  An
+    ;; experiment that added three scan_word calls for these slots
+    ;; regressed the ASDF gauntlet from form 44 to form 36 with byte-size-
+    ;; matched idempotent padding scans reaching form 44 — proving the
+    ;; corruption was the SCAN SEMANTICS, not layout shift.  Forwarding
+    ;; them a second time (they alias entries the symtab scan already
+    ;; relocated, and may be referenced by raw untagged keys in the
+    ;; symbol-function table) breaks those aliases.  Leave them unscanned.
+    ;; Multiple-value return buffer: MV-COUNT (tagged fixnum) at 0x10000090,
+    ;; the (count-1) "extra" values at 0x10000098, 0x100000A0... .  These
+    ;; words can hold heap pointers (a cons/string/symbol returned as a
+    ;; secondary value) that %values-list / multiple-value-* read AFTER an
+    ;; allocating step — e.g. %values-list conses each element, and the
+    ;; cons alloc can trigger GC mid-read, stranding the not-yet-read
+    ;; extras.  Scan exactly the live extras: count-1 words from 0x10000098,
+    ;; only when count>=2.  RDI = slot addr, R10 = remaining (both survive
+    ;; scan_word/copy_object, which preserve RDI/R10).
+    (let ((mv-loop (make-label))
+          (mv-done (make-label)))
+      ;; R10 = (mem[0x10000090] >> 1) - 1  =  number of extra values
+      (emit-mov-reg-imm buf 'rax #x10000090)
+      (emit-mov-reg-mem buf 'r10 'rax 0)         ; r10 = tagged count
+      (emit-shr-reg-imm buf 'r10 1)              ; untag -> raw count
+      (emit-sub-reg-imm buf 'r10 1)              ; r10 = count - 1 (extras)
+      ;; if extras <= 0, nothing to scan (SUB sets SF/ZF: jle when <=0)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :le mv-done)
+      ;; RDI = 0x10000098 (first extra value slot)
+      (emit-mov-reg-imm buf 'rdi #x10000098)
+      (emit-label buf mv-loop)
+      (emit-mov-reg-reg buf 'rax 'rdi)           ; rax = slot addr
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 8)              ; next slot
+      (emit-sub-reg-imm buf 'r10 1)              ; remaining--
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :g mv-loop)
+      (emit-label buf mv-done))
 
     ;; ---- Cheney scan loop ----
     ;; R10 = scan pointer (starts at to_start)

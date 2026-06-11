@@ -234,6 +234,27 @@
     ;; keep the two root sets in sync.)
     (setq fp (%gc-forward-slot #x10000148 from-start from-size fp))
     (setq fp (%gc-forward-slot #x10000170 from-start from-size fp))
+    ;; NOTE: the pre-interned signal-condition symbols at 0xCA0/0xCA8/0xCB0
+    ;; (%init-signal-symbols) are deliberately NOT scanned: they are
+    ;; interned native MVM symbols already forwarded via the symbol intern
+    ;; table at 0x10000088, and double-forwarding them regressed the x64
+    ;; ASDF gauntlet (form 44 -> 36, byte-size-matched padding reached 44).
+    ;; Keep the x64 trampoline and this Lisp-side scan in sync — see the
+    ;; matching note in emit-gc-trampoline (translate-x64.lisp).
+    ;; Multiple-value return buffer extras at 0x10000098+.  MV-COUNT at
+    ;; 0x10000090 is a tagged fixnum; the live extras are (count-1) words
+    ;; from 0x10000098.  These can hold heap pointers (secondary values)
+    ;; read after an allocating step (e.g. %values-list conses each
+    ;; element), so a collection mid-read strands the unread extras.
+    ;; Scan exactly count-1 words, only when count>=2.
+    (let ((count (ash (%gc-read64 #x10000090) -1)))
+      (when (>= count 2)
+        (let ((i 0))
+          (loop
+            (when (>= i (- count 1)) (return))
+            (setq fp (%gc-forward-slot (+ #x10000098 (* i 8))
+                                       from-start from-size fp))
+            (setq i (+ i 1))))))
     fp))
 
 ;;; ============================================================

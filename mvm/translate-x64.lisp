@@ -3241,6 +3241,10 @@
   "When non-nil, emit GC trampoline and wire gc-check to call it.
    Set by Linux x64 builds that include gc.lisp.")
 
+(defvar *x64-gc-debug* nil
+  "When non-nil, the native GC trampoline writes diagnostic bytes to fd 1
+   at entry/exit (see emit-gc-dbg-char).  Build-time knob only.")
+
 (defvar *x64-native-code-offset* 0
   "Byte offset from load-address where native code begins in the final image.
    For linux-x64: ELF-header(120) + boot-code(192) + JMP(5) = 317 = 0x13D.
@@ -3407,6 +3411,27 @@
     (emit-bytes buf #xC3))                           ; ret
   (format t "  Handler-stack helpers emitted (push/pop)~%"))
 
+(defun emit-gc-dbg-char (buf ch)
+  "DEBUG (gated by *x64-gc-debug*): write byte CH to fd 1, preserving all
+   registers used by the GC trampoline.  syscall clobbers RCX/R11 plus the
+   arg regs; we push/pop everything we touch."
+  (when *x64-gc-debug*
+    ;; Save every reg the write syscall touches.
+    (emit-push buf 'rax) (emit-push buf 'rdi) (emit-push buf 'rsi)
+    (emit-push buf 'rdx) (emit-push buf 'rcx) (emit-push buf 'r11)
+    ;; Put the byte in a scratch stack slot so RSI can point at it.
+    (emit-bytes buf #x48 #x83 #xEC #x08)            ; sub rsp, 8
+    (emit-bytes buf #x48 #xC7 #x04 #x24)            ; mov qword [rsp], imm32
+    (emit-u32 buf ch)
+    (emit-bytes buf #x48 #x89 #xE6)                 ; mov rsi, rsp (buf)
+    (emit-bytes buf #x48 #xC7 #xC7 #x01 #x00 #x00 #x00) ; mov rdi, 1 (fd)
+    (emit-bytes buf #x48 #xC7 #xC2 #x01 #x00 #x00 #x00) ; mov rdx, 1 (len)
+    (emit-bytes buf #x48 #xC7 #xC0 #x01 #x00 #x00 #x00) ; mov rax, 1 (sys_write)
+    (emit-bytes buf #x0F #x05)                      ; syscall
+    (emit-bytes buf #x48 #x83 #xC4 #x08)            ; add rsp, 8
+    (emit-pop buf 'r11) (emit-pop buf 'rcx) (emit-pop buf 'rdx)
+    (emit-pop buf 'rsi) (emit-pop buf 'rdi) (emit-pop buf 'rax)))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -3428,6 +3453,7 @@
         (restore-label (make-label)))
 
     (emit-label buf gc-trampoline-label)
+    (emit-gc-dbg-char buf #x5B)          ; '[' — trampoline entry
 
     ;; ---- Save all caller registers ----
     (emit-push buf 'rax)
@@ -3457,6 +3483,7 @@
     (emit-u32 buf #x10000050)
     (emit-add-reg-reg buf 'rcx 'rbx)             ; rcx = from_start + space_size
 
+    (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
     ;; ---- Scan stack roots ----
     ;; Walk from RBP (saved RSP) to stack_base
     ;; RDI = current scan address
@@ -3479,6 +3506,7 @@
       (emit-add-reg-imm buf 'rdi 8)
       (emit-jmp buf stack-loop)
       (emit-label buf stack-done))
+    (emit-gc-dbg-char buf #x73)          ; 's' — stack scan done
 
     ;; ---- Scan globals roots ----
     ;; Globals alist at 0x10000080
@@ -3541,6 +3569,7 @@
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :g mv-loop)
       (emit-label buf mv-done))
+    (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv)
 
     ;; ---- Cheney scan loop ----
     ;; R10 = scan pointer (starts at to_start)
@@ -3559,6 +3588,7 @@
       (emit-add-reg-imm buf 'r10 8)
       (emit-jmp buf cheney-loop)
       (emit-label buf cheney-done))
+    (emit-gc-dbg-char buf #x63)          ; 'c' — cheney scan done
 
     ;; ---- Swap semispaces ----
     ;; new from_start = old to_start
@@ -3671,6 +3701,7 @@
     (let ((copy-cons (make-label))
           (copy-obj (make-label))
           (copy-fwd (make-label))
+          (copy-bogus (make-label))
           (copy-done (make-label)))
       ;; Determine type from tag
       (emit-mov-reg-reg buf 'rdx 'rax)           ; rdx = tagged ptr
@@ -3741,6 +3772,35 @@
       (emit-shl-reg-imm buf 'r8 3)               ; * 8
       (emit-add-reg-imm buf 'r8 15)              ; + 15
       (emit-and-reg-imm buf 'r8 -16)             ; & ~15 (align to 16)
+      ;; ---- Conservative-scan sanity guard (CRITICAL) ----
+      ;; The stack-root scan is conservative: it treats ANY stack word with
+      ;; low nibble 1/9 that lands in [from_start, from_end) as a heap
+      ;; pointer.  Dead stack slots (garbage left by prior deeper calls), and
+      ;; the uninitialised payload words of fresh make-string/make-array
+      ;; objects scanned during the Cheney phase, can coincidentally satisfy
+      ;; this and point at a NON-object.  Its first word, read as a "header",
+      ;; yields a bogus element count; the old code then `rep movsq`'d that
+      ;; bogus size, either running off to-space (re-entering GC / corrupting
+      ;; the trampoline's return chain — gdb-free repro `[ p X [ ! p s r c ]`)
+      ;; or silently double-copying and corrupting a live root on the 2nd GC
+      ;; (held let-vars vanished, the gauntlet's define-package reexport died
+      ;; mid-loop).
+      ;;
+      ;; INVARIANT: a real object lives ENTIRELY within from-space, i.e.
+      ;;   from_start <= raw_addr  (already checked by scan_word) AND
+      ;;   raw_addr + size <= from_end (RCX).
+      ;; This single bound subsumes the "size <= space_size" check (any
+      ;; in-from-space object with a sane end has a sane size) and also
+      ;; catches the absurd-size case (raw_addr + huge_size overruns RCX, no
+      ;; 64-bit wrap since raw_addr ~2^47 and size <= 2^52).  If the bound
+      ;; fails this is NOT a real object: bail via copy-bogus, returning the
+      ;; original tagged ptr unchanged (scan_word rewrites the dead slot to
+      ;; itself — a no-op; the from-space bytes are untouched).
+      ;; RAX is free here (header already consumed into R8), so no spill:
+      (emit-mov-reg-reg buf 'rax 'rsi)           ; rax = raw addr
+      (emit-add-reg-reg buf 'rax 'r8)            ; rax = raw addr + size
+      (emit-cmp-reg-reg buf 'rax 'rcx)           ; raw_addr+size vs from_end
+      (emit-jcc buf :a copy-bogus)               ; > from_end? not a real object — bail
       ;; Copy R8 bytes from RSI to R13 using REP MOVSQ
       ;; Save RDI and RCX (used by caller for stack scan / from_end)
       (emit-push buf 'rdi)
@@ -3770,6 +3830,14 @@
       ;; Restore caller's RCX and RDI
       (emit-pop buf 'rcx)
       (emit-pop buf 'rdi)
+      (emit-jmp buf copy-done)
+
+      ;; ---- Bogus object: not a real heap object (conservative-scan false
+      ;; positive).  Return the original tagged ptr unchanged in RAX so the
+      ;; caller (scan_word) rewrites the dead stack slot to itself.  No copy,
+      ;; no forwarding-pointer write — the from-space bytes are untouched. ----
+      (emit-label buf copy-bogus)
+      (emit-mov-reg-reg buf 'rax 'rdx)            ; rax = original tagged ptr
       (emit-label buf copy-done)
       ;; RAX = new tagged pointer
       (emit-ret buf))
@@ -3790,6 +3858,7 @@
     (emit-pop buf 'rdi)
     (emit-pop buf 'rsi)
     (emit-pop buf 'rax)
+    (emit-gc-dbg-char buf #x5D)          ; ']' — trampoline exit (after restore)
     (emit-ret buf)))
 
 (defun translate-mvm-to-x64 (bytecode function-table)

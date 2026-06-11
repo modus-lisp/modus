@@ -520,6 +520,10 @@
                             :start (if (char= (char dbg 0) #\#) 1 0))))
       (setf modus.mvm::*linux-x64-r14-offset* v)
       (format t "~%[DEBUG] R14 offset forced to ~X (GC fires early)~%" v))))
+#+sbcl
+(when (let ((d (sb-ext:posix-getenv "MODUS_GC_DEBUG"))) (and d (> (length d) 0)))
+  (setf modus.mvm.x64::*x64-gc-debug* t)
+  (format t "~%[DEBUG] GC trampoline debug bytes enabled~%"))
 
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))

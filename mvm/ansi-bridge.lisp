@@ -915,6 +915,41 @@
 (defvar *positive-integers*
   (list 1 2 7 42 100 most-positive-fixnum))
 
+;;; Character-set constants from ansi-aux.lsp (which Modus skips at load
+;;; time, so these names would otherwise be unbound → NIL).  The format
+;;; ~D/~O/~X randomized padding tests do
+;;;   (random-from-seq +standard-chars+)
+;;; for the pad character; with +standard-chars+ NIL the pad char is
+;;; garbage and every padding assertion fails.  defvar init-thunks do not
+;;; run at boot, so these are ALSO setq'd in build-ansi-test's kernel-main.
+(defvar +standard-chars+
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~!@#$%^&*()_+|\\=-`{}[]:\";'<>?,./
+ ")
+(defvar +base-chars+
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<,>.?/\"':;[{]}~`!@#$%^&*()_-+= \\|")
+(defvar +num-base-chars+ 96)
+(defvar +alpha-chars+
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+(defvar +alphanumeric-chars+
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+;;; defvar init-thunks don't run at boot, so the constants above default
+;;; to NIL.  kernel-main calls %init-standard-chars to bind them.  Keeping
+;;; the literals in this real source file (not the driver-source string)
+;;; avoids triple-level escaping of the embedded quote/backslash/newline.
+(defun %init-standard-chars ()
+  (setq +standard-chars+
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~!@#$%^&*()_+|\\=-`{}[]:\";'<>?,./
+ ")
+  (setq +base-chars+
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<,>.?/\"':;[{]}~`!@#$%^&*()_-+= \\|")
+  (setq +num-base-chars+ 96)
+  (setq +alpha-chars+
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+  (setq +alphanumeric-chars+
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+  +standard-chars+)
+
 
 ;;; ============================================================
 ;;; PROCLAIM / DECLAIM — stub that respects arity

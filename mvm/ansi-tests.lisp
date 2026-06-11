@@ -2918,6 +2918,12 @@
       (let ((obj (make-instance 'probe-di-class :s1 'x :s2 'y)))
         (with-slots (s1) obj (setq s1 'q) (slot-value obj 's1))))
     'q)
+  ;; +standard-chars+ regression locks (9230..9231) — the format ~D/~O/~X
+  ;; randomized padding tests pick their pad char via
+  ;; (random-from-seq +standard-chars+); without %init-standard-chars
+  ;; (called in kernel-main) it is NIL and every padding assertion fails.
+  (run-test 9230 (lambda () (notnot (stringp +standard-chars+))) 't)
+  (run-test 9231 (lambda () (notnot (characterp (random-from-seq +standard-chars+)))) 't)
   )
 
 ;;; ============================================================

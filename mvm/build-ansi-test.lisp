@@ -4355,6 +4355,14 @@
   (setq *type-list* nil)
   (setq *supertype-table* nil)
 
+  ;; Character-set constants from ansi-aux.lsp (skipped at load time).
+  ;; defvar init-thunks don't run at boot.  Done in a helper in
+  ;; ansi-bridge.lisp (%init-standard-chars) so the literal strings —
+  ;; which contain double-quotes, backslashes and a newline — live in a
+  ;; real source file rather than inside this driver-source string (where
+  ;; they would need triple-level escaping and broke the SBCL reader).
+  (%init-standard-chars)
+
   ;; Parse argv from BSS (boot stub writes argc/argv there).
   ;;   argv[1] → *skip-below*       (skip tests with id < N)
   ;;   argv[2] → *run-only-below*   (skip tests with id >= M)

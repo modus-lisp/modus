@@ -31,26 +31,105 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of 2026-06-11, after reader char/uninterned + runtime DEFTYPE)
+## Gauntlet frontier (as of 2026-06-11, after GC copy_object bounds guard 6eed02a/be4e12c)
 
-All `with-upgradability` bodies up to the GC wall now EVAL cleanly.
-Forms 34/36/40 (the `define-condition` `with-upgradability` bodies in
-uiop/utility and uiop/version) previously `%eval-escape`d — runtime EVAL
-had no DEFINE-CONDITION branch — and now PASS (see RESOLVED section
-below).  An eval-walk that touches only the live forms (no extra
-per-form instrumentation) reaches **form 42** (`(in-package :uiop/os)`),
-with form 41's `(define-package :uiop/os …)` succeeding and `(%gc-count)`
-advancing 1→2 across it.
+The gauntlet runner now reaches **form 54** deterministically and stops
+with `READ-ERROR after form 54`.  Two non-fatal `FAILFORM`s precede it —
+forms 43 and 44 (the uiop/os `with-upgradability` bodies) signal
+`SIMPLE-ERROR "%eval-escape"` but are caught, so the march continues to
+the hard read-error at 54.  See the two diagnosis sections below.
 
-The remaining wall is the documented **GC / heap-corruption frontier** in
-the form-41..55 range (define-package 979-symbol reexports + heavy
-forms), and is off-limits to the runtime-EVAL track: *any* extra
-per-form allocation near it (a `write-string-serial`/`print-dec` tick, an
-accumulating fails list, printing a read condition) shifts or hard-crashes
-the run — the classic heap-corruption signature.  The gauntlet runner's
-own ticking therefore still stops silently around form 41; an
-uninstrumented walk gets to 42.  Hand the GC/heap-corruption frontier to
-the compiler/translator/GC track.
+### Form 54→55 READ-ERROR — GC/heap-corruption during `#.` read-eval (compiler/translator/GC track)
+
+Diagnosed 2026-06-11.  The hard stop is a **`READER-ERROR` signalled
+during the read of form 55**, the uiop/filesystem `directory*` defun
+whose body contains
+`(append keys '#.(or #+allegro … #+sbcl (when (find-symbol* …) …)))`.
+Evidence this is heap-corruption / a stale GC root, NOT a reader-logic
+gap (so it belongs to the GC/translator track, not reader/eval/packages):
+
+  - Form 55 reads **fine in isolation** (extracted to its own file and
+    read after eval'ing forms 1-54 from asdf.lisp in the same process) —
+    `head=WITH-UPGRADABILITY`, all 16 sub-defuns parse.
+  - From the **live continuous stream** (after eval'ing forms 1-54 from
+    the SAME open stream) the next `read` signals a genuine
+    `READER-ERROR` (caught by a `(reader-error (c) …)` clause, so it is
+    NOT a mislabeled SEGV-fault array).
+  - Binding `*read-suppress*` = T immediately before that read — which
+    **disables the `#.` read-eval** (the suppress branch in
+    `%read-sharpsign`'s `#.` handler returns NIL without `(eval obj)`) —
+    makes the live read **succeed**.  So the fault is in executing the
+    `#.` eval mid-read, while the reader's partial form is in flight.
+  - The exact `#.` body (`(or #+(or clozure digitool) … #+sbcl (when
+    (find-symbol* :resolve-symlinks '#:sb-impl nil) …))`) evals to NIL
+    **fine standalone**, even from the post-form-54 live heap state, and
+    `find-symbol*` is defined and works.  Allocating `#.` forms mid-list
+    (`(a b #.(progn (make-array 5000) 99) c d)`) also read correctly in
+    isolation.
+  - **Deterministic across GC thresholds** (`MODUS_GC_R14` 20MB → 2GB,
+    same form-54 stop) — so it is not a "GC fires at the wrong moment"
+    timing race; it is a stale-pointer / mis-forwarded-root defect that
+    the `#.` eval's allocation surfaces.
+  - **Layout-sensitive** (the classic heap-corruption signature): adding
+    one `(setq …)` line to `%reader-error` and rebuilding moved the
+    frontier — a minimal probe loop then read form 55 OK, while the
+    gauntlet runner (different per-form allocation) still stopped at 54.
+
+Confirmed in-domain primitives that are all correct (don't re-chase):
+plain `read-char` across many 4096-byte buffer refills reproduces the raw
+file byte-for-byte to 80 000 bytes; `unread-char` immediately after read
+across buffer boundaries round-trips; multi-char `#\Name` and `#:foo`
+uninterned literals (bare, in lists, and under suppress) all read; the
+`#+feature` skip and nested `#+(or …)` skips all read.
+
+Hand-off: the next allocation site to audit is the `#.` path —
+`%read-sharpsign` (mvm/cl-reader.lisp ~1439) calls `(eval obj)` while the
+reader's in-progress list accumulator and the file-stream's heap `buf`
+string are live.  If either is not a GC root during that eval (or the
+translator's GC root-scan misses the reader's C-stack temporaries), an
+allocation inside the evaled form forwards everything else but strands
+the reader's partial state → the next deref signals.  This matches the
+translate-x64.lisp comment (~line 3530) that scan-semantics changes move
+the gauntlet between forms 36/44, and the older define-package GC-fault
+section below.  **Off-limits to the reader/eval/packages seat.**
+
+### OPEN — forms 43/44 `%eval-escape` leak from `(featurep …)` (reader/eval track)
+
+Non-fatal (caught; the march continues to form 54) but a real
+runtime-EVAL bug in cl-eval.lisp.  Diagnosed 2026-06-11.
+
+Form 43 (uiop/os `with-upgradability`) defines `featurep`, the `os-*-p`
+predicates, `detect-os`, the `os-cond` macro, then ends with a top-level
+`(detect-os)` call (sub 10).  That call signals `SIMPLE-ERROR
+"%eval-escape"`.  Bisected: `detect-os` → `os-unix-p` → **`(featurep
+:unix)` itself leaks**, and `(featurep :unix)` takes only the first
+`cond` clause `((atom x) (and (member x *features*) t))` — `(member :unix
+*features*)` evaluates to NIL fine on its own.
+
+Key signal: `*%eval-escape-stack*` is **length 0** both before and after
+the failing `(featurep :unix)` call, yet the error is `(error
+"%eval-escape")`.  That is the *re-raise* path in `%eval-block` /
+`%eval-loop` (cl-eval.lisp ~1045): `%eval-escape-pop-if` returned
+`:%eval-no-escape` (no matching catcher on an empty stack) and the
+handler re-signalled.  So some construct INSIDE the real `featurep`
+performs a RETURN-FROM / RETURN / GO whose target block/tag is not the
+one the runtime-EVAL `cond`/`and` lowering set up — a tag-mismatch in the
+`cond`→block/return-from (or `and`→short-circuit) runtime lowering.
+
+Could NOT reproduce with hand-written reconstructions: a plain `(defun fp
+(x &optional (*features* *features*)) (cond ((atom x) (and (member x
+*features*) t)) …))` with the full 5-clause cond (incl. `assert`,
+`some #'fp`, `every #'fp`, `parameter-error`) evals `(fp :unix)` → NIL
+cleanly.  The difference is that the REAL `featurep` is defined via
+`with-upgradability` → `defun*` → `(progn (fmakunbound 'featurep)
+(declaim (notinline featurep)) (defun featurep …))` inside an
+`(eval-when (:compile-toplevel :load-toplevel :execute) …)`.  The
+`defun*`/`declaim`/`fmakunbound`/`eval-when` shapes each reproduce-clean
+in isolation too, so the trigger is the *combination* as eval'd through
+the live form-43 walk.  Next step: dump the macroexpansion of the real
+loaded `featurep` (it may be wrapped in an extra block whose name the
+inner `cond`/`and` return-from doesn't match) and trace which
+`%eval-escape-push`/re-raise fires.  In the reader/eval/packages domain.
 
 ### RESOLVED — `define-condition` `%eval-escape` at runtime (forms 34/36/40) (2026-06-11)
 

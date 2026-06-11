@@ -1493,8 +1493,10 @@
               (progn
                 (when next (unread-char next stream))
                 ch)
-              ;; Multi-character name
-              (let ((name-chars (list (char-code ch) (char-code next))))
+              ;; Multi-character name.  Accumulate reversed (chars are
+              ;; consed onto the front), so seed with NEXT then CH so the
+              ;; final nreverse yields CH NEXT ... in source order.
+              (let ((name-chars (list (char-code next) (char-code ch))))
                 (loop
                   (let ((c (read-char stream nil nil t)))
                     (when (or (null c) (%whitespace-char-p c)
@@ -1520,7 +1522,9 @@
   "Read #:symbol — uninterned symbol."
   (let ((ch (read-char stream nil nil t)))
     (when (null ch) (%reader-error "end of file reading #:"))
-    (unread-char ch stream)
+    ;; %read-token-from consumes CH as the first char and reads the REST
+    ;; from the stream — do NOT unread CH, or it is processed twice and the
+    ;; first char of the name is doubled (#:foo -> FFOO).
     (let ((obj (%read-token-from stream ch rt nil)))
       ;; obj would be interned — we need to make uninterned version
       ;; Extract name from the interned result

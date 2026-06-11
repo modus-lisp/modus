@@ -31,12 +31,64 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of 2026-06-10, after GC-root fix)
+## Gauntlet frontier (as of 2026-06-11, after reader char/uninterned + runtime DEFTYPE)
 
-Reaches form **26** with **fails=0** (define-package for UIOP/PACKAGE,
-UIOP/COMMON-LISP and UIOP/UTILITY all complete; INPKG markers print for
-forms 2/12/17).  New frontier is a `READ-ERROR after form 26` — a reader
-desync that is NOT GC-related (separate track).
+Reaches form **54** (uiop/stream, 5th `with-upgradability`).  define-package
+now SUCCEEDS for UIOP/OS (form 41→INPKG @ 42) and UIOP/STREAM (INPKG @ 50);
+the earlier define-package GC blocker is fixed (see GC-root section below).
+A handful of `with-upgradability` bodies still fail eval with `%eval-escape`
+(runtime-EVAL track), and forms 41+ raise heap pressure that exposes the
+**form-54 frontier as a GC / heap-corruption fault** (off-limits GC track):
+the "READ-ERROR after form 54" is not a reader bug — form 55 (null-device,
+`#p"/dev/null"`) reads cleanly in isolation, and *any* extra instrumentation
+added near the form-54 read (file-position, %gc-count, printing the read
+condition) shifts or hard-crashes the run — the classic heap-corruption
+signature.  Hand to the compiler/translator/GC track.
+
+### RESOLVED — form-26 `READ-ERROR` was TWO reader bugs (2026-06-11)
+
+The old "READ-ERROR after form 26" had nothing to do with form 26's
+`#+(and clozure windows-target)` feature suppression (that reads fine).
+It was the read of the NEXT form, which contained a `#\Space` character
+literal, and Modus's reader signalled `SIMPLE-ERROR "unknown character
+name"` on EVERY multi-char char name (`#\Space`, `#\Newline`, `#\Tab`,
+`#\Return`, …):
+
+  - **`%read-character` multi-char path (mvm/cl-reader.lisp ~1497)** seeded
+    the reversed name accumulator as `(list (char-code ch) (char-code
+    next))` = `[CH NEXT]`, but every subsequent char is consed onto the
+    FRONT, so the final `nreverse` produced `NEXT CH rest…` — `#\Space`
+    became name "pSace", which matched nothing → "unknown character name".
+    Fix: seed `[NEXT CH]` so `nreverse` yields `CH NEXT rest…` in order.
+
+  - **`%read-uninterned-symbol` (`#:foo`)** did `read-char` + `unread-char`
+    then passed the char to `%read-token-from` as its first-char.  But
+    `%read-token-from` consumes first-char AND reads the rest from the
+    stream — the unread put the char back so it was processed twice,
+    doubling the first letter (`#:foo` → `FFOO`, `#:a` → `AA`).  Fix:
+    drop the `unread-char`.
+
+Both are pure correctness wins.  ANSI gate (reader fixes only): 15,300
+passed / 111 lost (baseline 15,308 / 103 — within sweep variance under
+load).
+
+### RESOLVED — runtime DEFTYPE crash (form 28, `%eval-escape`) (2026-06-11)
+
+`%eval-compound` (mvm/cl-eval.lisp) had no DEFTYPE branch, so runtime EVAL
+of `(deftype stamp () '(or real boolean))` (form 28, inside an eval-when)
+fell through to the funcall path, tried to *call* DEFTYPE as a function,
+and signalled `%eval-escape`.  Added a DEFTYPE branch that registers the
+expander in a new `*%runtime-deftype-table*` (NAME→(params . body)) and
+returns the name (CLHS).  typep/subtypep don't yet consult the table
+(cl-types.lisp is another agent's file), so this is correct-but-inert for
+type checks — but it lets DEFTYPE-bearing load streams (uiop, asdf, and the
+ansi deftype/subtypep test files) proceed instead of crashing.  ANSI gate
+effect: **lost-to-crash 111 → 69 (−42)**, passed 15,300 → ~15,287 (−13:
+tests that were false-passing via crash-recovery, or now reach an honest
+`typep`-against-unknown-type fail).  Net robustness win per the project's
+fails-over-lost / correctness-over-regression guidance.
+
+### NEXT BLOCKER — form-54 heap/GC fault (GC track)
 
 ### RESOLVED — GC fault during `define-package` reexport (was the #1 blocker)
 

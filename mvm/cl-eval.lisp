@@ -23,6 +23,11 @@
 ;;; Populated by mirroring *symbol-function-table* into hash keys.
 (defvar *native-sym-function-table* nil)
 
+;; Runtime DEFTYPE expander table: NAME-STRING -> (params . body).
+;; Populated by %eval-compound's DEFTYPE branch; allocated lazily (defvar
+;; init-thunks don't run at boot — CLAUDE.md item 7).
+(defvar *%runtime-deftype-table* nil)
+
 (defun %nsft-init ()
   (setq *native-sym-function-table* (make-hash-table)))
 
@@ -2224,6 +2229,24 @@
              (val (%eval-in-env (cadr args) env)))
          (%eval-set-global vname val)
          vname))
+      ;; DEFTYPE — register a type expander keyed by name and return the
+      ;; name (as CLHS specifies).  Modus's typep/subtypep don't yet
+      ;; consult this table, but real-world code (uiop, asdf) DEFTYPEs at
+      ;; load time and only relies on the form not erroring; storing the
+      ;; (params . body) lets a later typep enhancement expand it.  Without
+      ;; this branch DEFTYPE fell through to the funcall path and signalled
+      ;; %eval-escape (DEFTYPE is not a function).
+      ((%eval-sym-eq op "DEFTYPE")
+       (let ((tname (car args))
+             (params (cadr args))
+             (body (cddr args)))
+         (let ((name-str (%eval-sym-name tname)))
+           (when name-str
+             (unless *%runtime-deftype-table*
+               (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
+             (puthash name-str *%runtime-deftype-table*
+                      (cons params body))))
+         tname))
       ;; DEFMACRO — register an expander so subsequent forms in this
       ;; eval / load stream macroexpand through it.  The expander is
       ;; stored as a plain %interp-closure with the user's lambda-list

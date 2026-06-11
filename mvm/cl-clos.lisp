@@ -285,21 +285,34 @@
                           (setq seen (cons n seen))
                           (setq acc (cons n acc)))))))))
             (nreverse acc))))
-    (let ((cls (make-array 5)))
-      (aset cls 0 '%clos-class)
-      (aset cls 1 name)
-      (aset cls 2 effective-slots)
-      (aset cls 3 supers)
-      (aset cls 4 cpl)
-      ;; Remove old entry if exists, then add new
-      (let ((new-registry nil)
-            (cur *clos-classes*))
-        (loop
-          (when (null cur) (return nil))
-          (when (not (eq (car (car cur)) name))
-            (setq new-registry (cons (car cur) new-registry)))
-          (setq cur (cdr cur)))
-        (setq *clos-classes* (cons (cons name cls) new-registry)))
+    ;; CLHS 4.3.6: redefining a class must preserve the class object's
+    ;; identity — (eq (find-class N) (find-class N)) stays T and any cobj
+    ;; captured before the redefine still denotes the same (now updated)
+    ;; class.  So when NAME is already registered, MUTATE the existing
+    ;; array in place rather than allocating a fresh one.
+    (let ((cls (%find-clos-class name)))
+      (if (and cls (%clos-class-p cls))
+          (progn
+            (aset cls 2 effective-slots)
+            (aset cls 3 supers)
+            (aset cls 4 cpl))
+          (progn
+            (setq cls (make-array 5))
+            (aset cls 0 '%clos-class)
+            (aset cls 1 name)
+            (aset cls 2 effective-slots)
+            (aset cls 3 supers)
+            (aset cls 4 cpl)
+            ;; Remove any stale entry (different array object for same
+            ;; name) then add the fresh one.
+            (let ((new-registry nil)
+                  (cur *clos-classes*))
+              (loop
+                (when (null cur) (return nil))
+                (when (not (eq (car (car cur)) name))
+                  (setq new-registry (cons (car cur) new-registry)))
+                (setq cur (cdr cur)))
+              (setq *clos-classes* (cons (cons name cls) new-registry)))))
       name)))
 
 (defun %find-clos-class (name)

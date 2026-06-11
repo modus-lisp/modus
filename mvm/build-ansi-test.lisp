@@ -2053,7 +2053,14 @@
                 ;; redefining a class clears any prior entry.
                 (%register-clos-default-initargs ',class-name
                                                  (list ,@default-initarg-pairs))
-                ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))))))))
+                ,@(mapcar #'rewrite-reader-forms (nreverse extra-defuns))
+                ;; CLHS 7.7: defclass evaluates to the class object (so
+                ;; (eval '(defclass …)) and the rewritten (eval-quote
+                ;; unwrap) hand back something class-name / eqt can use).
+                ;; class-redefinition.1/2 etc. assert (class-name cobj)
+                ;; and (eqt cobj1 cobj3); the progn previously returned the
+                ;; last registration's value (NIL).
+                (find-class ',class-name nil)))))))
 
     ;; (defgeneric name lambda-list &rest options)
     ;; → (%defgeneric 'name 'lambda-list combination)

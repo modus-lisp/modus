@@ -33,17 +33,47 @@ same way as the gauntlet reaches them, and record them here.
 
 ## Gauntlet frontier (as of 2026-06-11, after reader char/uninterned + runtime DEFTYPE)
 
-Reaches form **54** (uiop/stream, 5th `with-upgradability`).  define-package
-now SUCCEEDS for UIOP/OS (form 41→INPKG @ 42) and UIOP/STREAM (INPKG @ 50);
-the earlier define-package GC blocker is fixed (see GC-root section below).
-A handful of `with-upgradability` bodies still fail eval with `%eval-escape`
-(runtime-EVAL track), and forms 41+ raise heap pressure that exposes the
-**form-54 frontier as a GC / heap-corruption fault** (off-limits GC track):
-the "READ-ERROR after form 54" is not a reader bug — form 55 (null-device,
-`#p"/dev/null"`) reads cleanly in isolation, and *any* extra instrumentation
-added near the form-54 read (file-position, %gc-count, printing the read
-condition) shifts or hard-crashes the run — the classic heap-corruption
-signature.  Hand to the compiler/translator/GC track.
+All `with-upgradability` bodies up to the GC wall now EVAL cleanly.
+Forms 34/36/40 (the `define-condition` `with-upgradability` bodies in
+uiop/utility and uiop/version) previously `%eval-escape`d — runtime EVAL
+had no DEFINE-CONDITION branch — and now PASS (see RESOLVED section
+below).  An eval-walk that touches only the live forms (no extra
+per-form instrumentation) reaches **form 42** (`(in-package :uiop/os)`),
+with form 41's `(define-package :uiop/os …)` succeeding and `(%gc-count)`
+advancing 1→2 across it.
+
+The remaining wall is the documented **GC / heap-corruption frontier** in
+the form-41..55 range (define-package 979-symbol reexports + heavy
+forms), and is off-limits to the runtime-EVAL track: *any* extra
+per-form allocation near it (a `write-string-serial`/`print-dec` tick, an
+accumulating fails list, printing a read condition) shifts or hard-crashes
+the run — the classic heap-corruption signature.  The gauntlet runner's
+own ticking therefore still stops silently around form 41; an
+uninstrumented walk gets to 42.  Hand the GC/heap-corruption frontier to
+the compiler/translator/GC track.
+
+### RESOLVED — `define-condition` `%eval-escape` at runtime (forms 34/36/40) (2026-06-11)
+
+`%eval-compound` (mvm/cl-eval.lisp) had no DEFINE-CONDITION branch, so
+runtime EVAL of the `with-upgradability` bodies that `define-condition`
+(form 34 `simple-style-warning`/`style-warn`, form 36
+`not-implemented-error`/`parameter-error`, form 40 the
+`deprecated-function-*` cluster) fell through to the funcall path and
+signalled `SIMPLE-ERROR "%eval-escape"` (define-condition is not a
+function).  The compile-time expander is an `mvm-define-macro` SBCL-side
+lambda that can't cross into the image, so the runtime macro table only
+knew the *name*.
+
+Fix: added a DEFINE-CONDITION branch dispatching to a new
+`%runtime-define-condition` helper that mirrors the compiler.lisp
+expander — parses slot-specs into `(name (initargs) initform)`
+descriptors, collects `:reader`/`:accessor` names, evaluates a
+`(:report (lambda …))` to a real interp-closure (so the registry holds a
+callable), then calls `%define-condition` and defines the reader/accessor
+functions via `(defun NAME (c) (%condition-slot c 'SLOT))`.  Verified in
+isolation: simple parents, `:initarg`+`:reader`, and `:report` lambda all
+register and dispatch correctly; `make-condition`/`%condition-typep`/
+slot readers work on the registered types.
 
 ### RESOLVED — form-26 `READ-ERROR` was TWO reader bugs (2026-06-11)
 

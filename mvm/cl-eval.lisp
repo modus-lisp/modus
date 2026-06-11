@@ -2043,6 +2043,70 @@
                               nil)))))
               nil)))))
 
+(defun %runtime-define-condition (form env)
+  "Runtime EVAL of (define-condition NAME (PARENT…) (SLOT…) OPTION…).
+   Mirrors compiler.lisp's mvm-define-macro \"DEFINE-CONDITION\" expansion,
+   but builds the registration data directly (no quote/expand round-trip)
+   and EVALs the :report lambda so the registry holds a real callable.
+   Reader/accessor slots become interp-closure defuns.  Returns NAME."
+  (let* ((name        (cadr form))
+         (parents     (or (caddr form) '(condition)))
+         (slot-specs  (cadddr form))
+         (options     (cddddr form))
+         (slot-descriptors nil)
+         (reader-pairs nil))     ; list of (reader-name . slot-name)
+    ;; Parse each slot-spec into a descriptor (name (initargs) initform)
+    ;; and collect reader/accessor names.
+    (dolist (spec slot-specs)
+      (if (atom spec)
+          (push (list spec nil :no-initform) slot-descriptors)
+          (let ((sname (car spec))
+                (opts (cdr spec))
+                (initargs nil)
+                (initform :no-initform))
+            (loop
+              (when (null opts) (return))
+              (let ((k (car opts)) (v (cadr opts)))
+                (cond
+                  ((eq k :initarg) (setq initargs (append initargs (list v))))
+                  ((eq k :initform) (setq initform v))
+                  ((or (eq k :reader) (eq k :accessor))
+                   (push (cons v sname) reader-pairs))))
+              (setq opts (cddr opts)))
+            (push (list sname initargs initform) slot-descriptors))))
+    (setq slot-descriptors (nreverse slot-descriptors))
+    (setq reader-pairs (nreverse reader-pairs))
+    ;; Find :report / :default-initargs options.
+    (let ((default-initargs nil)
+          (report-fn nil)
+          (cur options))
+      (loop
+        (when (null cur) (return))
+        (let ((o (car cur)))
+          (when (consp o)
+            (cond
+              ((eq (car o) :default-initargs) (setq default-initargs (cdr o)))
+              ((eq (car o) :report)
+               (let ((r (cadr o)))
+                 (cond
+                   ;; (:report (lambda (c s) …)) — eval to a closure
+                   ((and (consp r) (%eval-sym-eq (car r) "LAMBDA"))
+                    (setq report-fn (%eval-in-env r env)))
+                   ;; (:report name) — named reporter function
+                   ((symbolp r) (setq report-fn r))
+                   ;; (:report "string")
+                   ((stringp r) (setq report-fn r)))))))
+          (setq cur (cdr cur))))
+      ;; Register the type.
+      (%define-condition name parents slot-descriptors default-initargs report-fn)
+      ;; Define reader/accessor functions.
+      (dolist (rp reader-pairs)
+        (%eval-in-env
+          (list 'defun (car rp) (list 'c)
+                (list '%condition-slot 'c (list 'quote (cdr rp))))
+          env))
+      name)))
+
 (defun %eval-compound (form env)
   "Evaluate a compound (list) form."
   (let ((op (car form))
@@ -2247,6 +2311,14 @@
              (puthash name-str *%runtime-deftype-table*
                       (cons params body))))
          tname))
+      ;; DEFINE-CONDITION — register a condition type at runtime EVAL.
+      ;; The compile-time mvm-define-macro expander can't cross into the
+      ;; image (SBCL-side lambda), so runtime EVAL of uiop/asdf's
+      ;; (define-condition …) inside with-upgradability bodies fell through
+      ;; to the funcall path and signalled %eval-escape.  See
+      ;; %runtime-define-condition.
+      ((%eval-sym-eq op "DEFINE-CONDITION")
+       (%runtime-define-condition form env))
       ;; DEFMACRO — register an expander so subsequent forms in this
       ;; eval / load stream macroexpand through it.  The expander is
       ;; stored as a plain %interp-closure with the user's lambda-list

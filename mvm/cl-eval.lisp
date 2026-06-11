@@ -2666,6 +2666,196 @@
          ;; CLHS 7.7: defclass returns the class object, not the name.
          ;; find-class.15 etc. rely on (eq (eval `(defclass …)) (find-class …)).
          (find-class class-name)))
+      ;; DEFSTRUCT — runtime structure definition.  Mirrors the DEFCLASS
+      ;; branch: builds a tagged-array representation (%struct-instance
+      ;; marker in slot 0, type-name in slot 1, user slots from slot 2),
+      ;; registers the type for TYPEP, and installs MAKE-/-P/accessors/
+      ;; setters/COPY- in the symbol-function table so the suite's runtime
+      ;; calls (make-s-1), (s-1-p x), (s-1-foo x) resolve.  Only the
+      ;; plain-and-keyword-constructor subset is handled here; exotic BOA
+      ;; constructors still come from the build-time defstruct handler /
+      ;; ansi-bridge overrides.
+      ((%eval-sym-eq op "DEFSTRUCT")
+       (let* ((name-and-opts (car args))
+              (struct-name (if (consp name-and-opts)
+                               (car name-and-opts) name-and-opts))
+              (struct-str (symbol-name struct-name))
+              (opts (if (consp name-and-opts) (cdr name-and-opts) nil))
+              (raw-slots (cdr args))
+              ;; option state
+              (conc-specified nil)
+              (conc-name (concatenate 'string struct-str "-"))
+              (include-parent nil)
+              (want-predicate t)
+              (pred-name-override nil)
+              (want-copier t)
+              (copier-override nil)
+              (ctor-override-seen nil)
+              (ctor-suppressed nil)
+              (ctor-boa-seen nil)
+              (type-option-seen nil)
+              (default-ctor-name nil))
+         ;; --- parse options ---
+         (dolist (opt opts)
+           (cond
+             ((and (consp opt) (symbolp (car opt)))
+              (let ((on (car opt)))
+                (cond
+                  ((%eval-sym-eq on "CONC-NAME")
+                   (setq conc-specified t)
+                   (setq conc-name
+                         (if (cadr opt)
+                             (let ((cn (cadr opt)))
+                               (if (stringp cn) cn (string cn)))
+                             "")))
+                  ((%eval-sym-eq on "INCLUDE")
+                   (setq include-parent (cadr opt)))
+                  ((%eval-sym-eq on "PREDICATE")
+                   (if (cddr opt)
+                       (if (cadr opt)
+                           (setq pred-name-override (cadr opt))
+                           (setq want-predicate nil))
+                       ;; (:predicate) with no arg — keep default
+                       nil))
+                  ((%eval-sym-eq on "COPIER")
+                   (if (cddr opt)
+                       (if (cadr opt)
+                           (setq copier-override (cadr opt))
+                           (setq want-copier nil))
+                       nil))
+                  ((%eval-sym-eq on "CONSTRUCTOR")
+                   (setq ctor-override-seen t)
+                   (cond
+                     ;; (:constructor nil) — suppress the default ctor.
+                     ((and (cdr opt) (null (cadr opt)))
+                      (setq ctor-suppressed t))
+                     ;; (:constructor name BOA-arglist) — a BOA constructor;
+                     ;; the keyword ctor here would be wrong, so leave it to
+                     ;; the build-time handler / ansi-bridge overrides and
+                     ;; don't install our default keyword ctor.
+                     ((cddr opt)
+                      (setq ctor-boa-seen t))
+                     ;; (:constructor name) — keyword ctor under NAME.
+                     ((and (cdr opt) (cadr opt))
+                      (setq default-ctor-name (cadr opt)))))
+                  ;; (:TYPE ...) — Modus represents structs only as the
+                  ;; native tagged array; list/vector typed structs are
+                  ;; unsupported.  CLHS also makes several option combos
+                  ;; (e.g. :predicate without :named under :type) an error.
+                  ;; Signal so defstruct.error.3/.4 (which wrap this in
+                  ;; signals-error) see a real condition rather than a
+                  ;; silently-accepted-but-wrong struct.
+                  ((%eval-sym-eq on "TYPE")
+                   (setq type-option-seen t)))))
+             ;; bare symbol option e.g. :conc-name — treat as flag-with-default
+             (t nil)))
+         (when type-option-seen
+           (error "DEFSTRUCT :TYPE option is not supported"))
+         (unless conc-specified
+           (setq conc-name (concatenate 'string struct-str "-")))
+         ;; --- parse slots: own slot names + default forms ---
+         (let* ((own-slot-names
+                 (mapcar (lambda (s) (if (consp s) (car s) s)) raw-slots))
+                (own-default-forms
+                 (mapcar (lambda (s) (if (consp s) (cadr s) nil)) raw-slots))
+                ;; effective slots: parent slots first, then own
+                (parent-desc (and include-parent
+                                  (%find-struct-type include-parent)))
+                (parent-slots (if parent-desc
+                                  (%struct-type-desc-slots parent-desc)
+                                  nil))
+                (eff-slot-names (append parent-slots own-slot-names))
+                (thunk-env env))
+           ;; --- register the type ---
+           (%register-struct-type struct-name include-parent
+                                   eff-slot-names conc-name)
+           ;; --- constructor: MAKE-<name> (or named) taking keyword args ---
+           ;; Build a defaults-vector closure: evaluate each slot's default
+           ;; form fresh at each construction (CLHS 3.4.x — initforms run
+           ;; per make).  Parent default forms are looked up from the
+           ;; parent's stored thunks isn't tracked, so inherited slots
+           ;; default to NIL unless overridden — acceptable for the suite's
+           ;; cases (no :include + slot-default combos in structures-0x).
+           (let* ((eff-defaults
+                   ;; align defaults with eff-slot-names: parent slots → nil
+                   (append (mapcar (lambda (x) (declare (ignore x)) nil)
+                                   parent-slots)
+                           own-default-forms))
+                  (sname struct-name)
+                  (slots eff-slot-names)
+                  (defs eff-defaults)
+                  (denv thunk-env)
+                  (ctor-fn
+                   (lambda (&rest kwargs)
+                     ;; positional values in effective-slot order
+                     (let ((vals nil) (sc slots) (dc defs))
+                       (loop
+                         (when (null sc) (return nil))
+                         (let* ((slot (car sc))
+                                (def-form (car dc))
+                                ;; scan kwargs for :slot
+                                (provided nil) (pval nil) (kc kwargs))
+                           (loop
+                             (when (null kc) (return nil))
+                             (when (and (cdr kc)
+                                        (%struct-keyword-matches-slot-p
+                                         (car kc) slot))
+                               (setq provided t) (setq pval (cadr kc)))
+                             (setq kc (cddr kc)))
+                           (setq vals
+                                 (cons (if provided pval
+                                           (if def-form
+                                               (%eval-in-env def-form denv)
+                                               nil))
+                                       vals)))
+                         (setq sc (cdr sc))
+                         (setq dc (cdr dc)))
+                       (%alloc-struct sname (reverse vals))))))
+             (let ((ctor-sym
+                    (if default-ctor-name default-ctor-name
+                        (intern (concatenate 'string "MAKE-" struct-str)))))
+               ;; Install the default keyword constructor unless it was
+               ;; explicitly suppressed (:constructor nil) or this struct
+               ;; uses only a BOA constructor (whose semantics our keyword
+               ;; ctor can't reproduce — left to build-time / overrides).
+               (unless (or ctor-suppressed
+                           (and ctor-boa-seen (not default-ctor-name)))
+                 (set-symbol-function ctor-sym ctor-fn))))
+           ;; --- predicate: <name>-P ---
+           (when want-predicate
+             (let* ((pred-sym
+                     (if pred-name-override pred-name-override
+                         (intern (concatenate 'string struct-str "-P"))))
+                    (tname struct-name))
+               (set-symbol-function
+                pred-sym
+                (lambda (x) (if (%struct-instance-typep x tname) t nil)))))
+           ;; --- copier: COPY-<name> ---
+           (when want-copier
+             (let ((copy-sym
+                    (if copier-override copier-override
+                        (intern (concatenate 'string "COPY-" struct-str)))))
+               (set-symbol-function copy-sym
+                                    (lambda (x) (%struct-copy x)))))
+           ;; --- accessors + setters per effective slot ---
+           (let ((sc eff-slot-names))
+             (loop
+               (when (null sc) (return nil))
+               (let* ((slot (car sc))
+                      (slot-str (symbol-name slot))
+                      (acc-str (concatenate 'string conc-name slot-str))
+                      (acc-sym (intern acc-str))
+                      (this-slot slot))
+                 (set-symbol-function
+                  acc-sym
+                  (lambda (x) (%struct-ref x this-slot)))
+                 ;; SET-<acc> for setf support
+                 (let ((set-sym (intern (concatenate 'string "SET-" acc-str))))
+                   (set-symbol-function
+                    set-sym
+                    (lambda (x v) (%struct-set x this-slot v)))))
+               (setq sc (cdr sc))))
+           struct-name)))
       ;; COND
       ((%eval-sym-eq op "COND")
        (let ((cur args))

@@ -666,6 +666,30 @@
        (%print-char 32 stream)   ; space
        (%write-obj (aref obj 2) stream level escape)
        (%print-char 41 stream))  ; )
+      ;; Struct instance — slot-0 = '%struct-instance, slot-1 = type-name,
+      ;; user slots from slot-2.  Print #S(TYPE-NAME :SLOT1 v1 :SLOT2 v2 …)
+      ;; per CLHS 22.1.3.12.  Detect BEFORE the generic array printer.
+      ((%struct-instance-p obj)
+       (%print-char 35 stream)   ; #
+       (%print-char 83 stream)   ; S
+       (%print-char 40 stream)   ; (
+       (let* ((tname (%struct-type-name obj))
+              (desc (%find-struct-type tname))
+              (slots (if desc (%struct-type-desc-slots desc) nil)))
+         (%write-obj tname stream level escape)
+         (let ((i 0) (cur slots))
+           (loop
+             (when (null cur) (return nil))
+             (%print-char 32 stream)   ; space
+             ;; slot keyword — intern :SLOTNAME in the KEYWORD package
+             (let ((kw (intern (symbol-name (car cur)) (find-package "KEYWORD"))))
+               (%write-obj kw stream level escape))
+             (%print-char 32 stream)
+             (%write-obj (aref obj (+ 2 i)) stream
+                         (if (null level) 1 (+ level 1)) escape)
+             (setq i (+ i 1))
+             (setq cur (cdr cur)))))
+       (%print-char 41 stream))  ; )
       ;; String  (also matches fp-wrapped strings — wrapper-aware stringp
       ;; reports T for them.  Use LENGTH (fill-pointer aware) instead of
       ;; ARRAY-LENGTH so the printed form respects the fp truncation.)

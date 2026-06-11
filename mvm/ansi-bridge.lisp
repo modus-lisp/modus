@@ -4782,6 +4782,16 @@
          ((eq tn 'standard-object) (%clos-instance-p obj))
          ((eq tn 'restart) (%active-restart-p obj))
          (t (cond
+              ;; Struct instance — when OBJ is a struct, decide membership
+              ;; from the instance's own slot-1 type-name (and :include
+              ;; ancestry).  This works WITHOUT a registered descriptor for
+              ;; TN: the compile-time defstruct registration thunk may not
+              ;; have run at boot, but the instance still carries its type.
+              ;; structure-1-1 / structure-1-4 depend on this.
+              ((%struct-instance-p obj) (%struct-instance-named-p obj tn))
+              ;; Registered struct type — fall back to the registry walk
+              ;; (covers (typep non-struct 'struct-type) → NIL too).
+              ((%find-struct-type tn) (%struct-instance-typep obj tn))
               ((%cond-reg-find tn) (%condition-typep obj tn))
               ((%clos-instance-p obj)
                (let ((cpl (%obj-cpl obj))

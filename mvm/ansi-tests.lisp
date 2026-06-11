@@ -3044,6 +3044,38 @@
   (run-test 9284 (lambda () (car (%apply-readtable-case (list 65) (list nil) *readtable*))) 65)
   (run-test 9285 (lambda () (char-code (char (symbol-name (read-from-string "A")) 0))) 65)
   (run-test 9286 (lambda () (char-code (char (symbol-name (read-from-string "|A|")) 0))) 65)
+  ;; --- runtime DEFSTRUCT probes (9784-9799) ---
+  ;; Exercise the cl-eval.lisp DEFSTRUCT branch exactly as the structures
+  ;; suite does: eval a defstruct form, then eval calls to the generated
+  ;; constructor / predicate / accessor.
+  (run-test 9784 (lambda () (progn (eval '(defstruct ds-probe-a foo bar))
+                                   (notnot (eval '(ds-probe-a-p (make-ds-probe-a)))))) 't)
+  (run-test 9785 (lambda () (eval '(ds-probe-a-foo (make-ds-probe-a :foo 7)))) 7)
+  (run-test 9786 (lambda () (eval '(ds-probe-a-bar (make-ds-probe-a :bar 9)))) 9)
+  (run-test 9787 (lambda () (notnot (eval '(typep (make-ds-probe-a) 'ds-probe-a)))) 't)
+  (run-test 9788 (lambda () (eval '(typep 5 'ds-probe-a))) 'nil)
+  (run-test 9789 (lambda () (eval '(ds-probe-a-p 42))) 'nil)
+  (run-test 9790 (lambda () (eval '(ds-probe-a-p (make-array 3)))) 'nil)
+  ;; accessor SETF round-trip
+  (run-test 9791 (lambda () (eval '(let ((s (make-ds-probe-a)))
+                                     (setf (ds-probe-a-foo s) 11)
+                                     (ds-probe-a-foo s)))) 11)
+  ;; slot default forms evaluated per-construction
+  (run-test 9792 (lambda () (progn (eval '(defstruct ds-probe-b (x 3) (y (+ 1 4))))
+                                   (eval '(ds-probe-b-y (make-ds-probe-b))))) 5)
+  (run-test 9793 (lambda () (eval '(ds-probe-b-x (make-ds-probe-b)))) 3)
+  ;; copier
+  (run-test 9794 (lambda () (eval '(let ((s (make-ds-probe-a :foo 1)))
+                                     (ds-probe-a-foo (copy-ds-probe-a s))))) 1)
+  ;; :include parent chain — child is-a parent
+  (run-test 9795 (lambda () (progn (eval '(defstruct ds-probe-p pa))
+                                   (eval '(defstruct (ds-probe-c (:include ds-probe-p)) ca))
+                                   (notnot (eval '(typep (make-ds-probe-c) 'ds-probe-p))))) 't)
+  (run-test 9796 (lambda () (notnot (eval '(typep (make-ds-probe-c) 'ds-probe-c)))) 't)
+  (run-test 9797 (lambda () (eval '(typep (make-ds-probe-p) 'ds-probe-c))) 'nil)
+  ;; inherited accessor on child
+  (run-test 9798 (lambda () (eval '(ds-probe-c-pa (make-ds-probe-c :pa 8)))) 8)
+  (run-test 9799 (lambda () (eval '(ds-probe-c-ca (make-ds-probe-c :ca 4)))) 4)
   )
 
 ;;; ============================================================

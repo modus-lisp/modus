@@ -11886,16 +11886,35 @@
          (setf ctor-params (loop for s in slot-names
                                  collect (intern (format nil "P-~A" (symbol-name s))
                                                  :modus.mvm)))
+         ;; Tagged struct layout: slot 0 = '%struct-instance marker,
+         ;; slot 1 = type-name, slots 2.. = user slot values.  This lets
+         ;; the predicate and TYPEP distinguish struct instances from
+         ;; plain arrays (structure-1-x).  The type-name is emitted as a
+         ;; quoted symbol so it interns to the same object the suite's
+         ;; `'struct-name' type-spec resolves to.
          (setf ctor-body
-               `(let ((obj (make-array ,nslots)))
+               `(let ((obj (make-array ,(+ 2 nslots))))
+                  (aset obj 0 (quote %struct-instance))
+                  (aset obj 1 (quote ,struct-name))
                   ,@(loop for i from 0
                           for p in ctor-params
-                          collect `(aset obj ,i ,p))
+                          collect `(aset obj ,(+ 2 i) ,p))
                   obj))
          (push `(defun ,(intern internal-ctor-name :modus.mvm)
                     ,ctor-params
                   ,ctor-body)
                forms-to-compile)
+         ;; NOTE: no runtime %register-struct-type toplevel form is emitted
+         ;; here.  Toplevel thunks don't auto-run on bare metal / in this
+         ;; harness (CLAUDE.md item 7), so the registration would be dead
+         ;; weight that only grows the image (a ~100KB growth here shifts
+         ;; downstream code enough to re-position a latent infinite-loop
+         ;; wedge in the trig tests — COS.12 etc.).  The predicate and
+         ;; TYPEP are registry-INDEPENDENT (they read the instance's own
+         ;; slot-1 type-name via %struct-instance-named-p), so compile-time
+         ;; structs need no registry entry for the direct-type case.  The
+         ;; runtime-EVAL DEFSTRUCT path (cl-eval.lisp) DOES register, which
+         ;; covers :include ancestry for the #S / runtime-defstruct cases.
 
          ;; Register macro for keyword-arg constructor
          (let ((slot-kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
@@ -12084,11 +12103,11 @@
                                     (format nil "~A~A" conc-name (symbol-name slot))
                                     (format nil "~A" (symbol-name slot)))))
                   (push `(defun ,(intern acc-name :modus.mvm) (obj)
-                           (aref obj ,i))
+                           (aref obj ,(+ 2 i)))
                         forms-to-compile)
                   (let ((setter-name (format nil "SET-~A" acc-name)))
                     (push `(defun ,(intern setter-name :modus.mvm) (obj val)
-                             (aset obj ,i val)
+                             (aset obj ,(+ 2 i) val)
                              val)
                           forms-to-compile)
                     (let ((setter-sym (intern setter-name :modus.mvm)))
@@ -12100,19 +12119,24 @@
                         (setf (gethash setf-key *macro-table*)
                               setter-sym))))))
 
-       ;; Copier
+       ;; Copier — copy all slots including the 2-slot marker prefix.
        (let ((copy-name (format nil "COPY-~A" struct-str)))
          (push `(defun ,(intern copy-name :modus.mvm) (obj)
-                  (let ((new (make-array ,nslots)))
-                    ,@(loop for i from 0 below nslots
+                  (let ((new (make-array ,(+ 2 nslots))))
+                    ,@(loop for i from 0 below (+ 2 nslots)
                             collect `(aset new ,i (aref obj ,i)))
                     new))
                forms-to-compile))
 
-       ;; Type predicate
+       ;; Type predicate — checks the slot-0 marker and that the instance's
+       ;; slot-1 type-name is NAME (or, via the runtime registry, a subtype
+       ;; of NAME for :include).  Registry-independent for the common
+       ;; no-include case: %struct-instance-named-p compares slot-1 by hash
+       ;; without needing a registered descriptor, so it works even when the
+       ;; boot-time registration thunk didn't run.
        (let ((pred-name (format nil "~A-P" struct-str)))
          (push `(defun ,(intern pred-name :modus.mvm) (obj)
-                  (arrayp obj))
+                  (if (%struct-instance-named-p obj (quote ,struct-name)) t nil))
                forms-to-compile))
 
        ;; Compile all generated forms

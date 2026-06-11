@@ -130,11 +130,14 @@
     ;; CPL keeps STANDARD-OBJECT so methods that matched under the old
     ;; blanket fallback still match (make-load-form.6/9).
     ((%condition-p obj) 'condition)
+    ;; struct instances carry a %struct-instance marker in slot 0; their
+    ;; most-specific "class" is their struct type-name.  Must precede the
+    ;; vector/array cases (a struct instance is a #x32 array).
+    ((%struct-instance-p obj) (%struct-type-name obj))
     ;; vectors / arrays — without these every array dispatched as
     ;; STANDARD-OBJECT, so methods specialized on (y array) / (y vector)
     ;; were never applicable (defgeneric.33).  CLOS instances never
-    ;; reach here (%obj-cpl handles them first); struct instances DO
-    ;; (markerless arrays) — see %builtin-cpl's vector/array entries.
+    ;; reach here (%obj-cpl handles them first).
     ((vectorp obj)     'vector)
     ((arrayp obj)      'array)
     (t 'standard-object)))
@@ -322,6 +325,182 @@
       (when (null cur) (return nil))
       (when (eq (car (car cur)) name) (return (cdr (car cur))))
       (setq cur (cdr cur)))))
+
+;;; ============================================================
+;;; DEFSTRUCT — runtime structure type support
+;;; ============================================================
+;;;
+;;; A struct instance is a heap array shaped exactly like a CLOS
+;;; instance so the GC, ARRAYP, and the dispatch machinery all keep
+;;; working:
+;;;   slot [0] = '%struct-instance   (marker, distinct from %clos-instance)
+;;;   slot [1] = type-name           (symbol; the most specific struct type)
+;;;   slot [2..] = user slot values  (in effective-slot order)
+;;;
+;;; The registry maps a struct type's NAME-HASH to a descriptor array:
+;;;   #(name-hash type-name parent-name slot-names conc-name)
+;;; where slot-names is the EFFECTIVE slot list (own + inherited, parent
+;;; slots first per CLHS 3.4.5).  Keying by name-hash (not eq on the
+;;; symbol object) keeps the lookup robust across the native-MVM-sym /
+;;; CL-sym-wrapper boundary — the same reason the condition registry
+;;; and the SFT key by hash.
+(defvar *struct-types* nil)
+
+(defun %struct-type-desc-hash (d)   (aref d 0))
+(defun %struct-type-desc-name (d)   (aref d 1))
+(defun %struct-type-desc-parent (d) (aref d 2))
+(defun %struct-type-desc-slots (d)  (aref d 3))
+(defun %struct-type-desc-conc (d)   (aref d 4))
+
+(defun %struct-name-hash (name)
+  "Return the canonical hash key for a struct type NAME (any symbol
+   flavor) or NIL if NAME isn't a symbol."
+  (let ((nh (%sym-name-or-hash name)))
+    (if nh (cdr nh) nil)))
+
+(defun %find-struct-type (name)
+  "Return the struct-type descriptor for NAME (a symbol), or NIL."
+  (let ((key (%struct-name-hash name)))
+    (if (null key) nil
+      (let ((cur *struct-types*))
+        (loop
+          (when (null cur) (return nil))
+          (when (= (car (car cur)) key) (return (cdr (car cur))))
+          (setq cur (cdr cur)))))))
+
+(defun %register-struct-type (name parent-name slot-names conc-name)
+  "Register (or redefine) struct type NAME.  PARENT-NAME is the :include
+   parent (or NIL).  SLOT-NAMES is the EFFECTIVE slot list.  Returns NAME."
+  (let* ((key (%struct-name-hash name))
+         (desc (make-array 5)))
+    (aset desc 0 key)
+    (aset desc 1 name)
+    (aset desc 2 parent-name)
+    (aset desc 3 slot-names)
+    (aset desc 4 conc-name)
+    ;; Drop any stale entry with the same key, then prepend.
+    (let ((new-reg nil) (cur *struct-types*))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (= (car (car cur)) key))
+          (setq new-reg (cons (car cur) new-reg)))
+        (setq cur (cdr cur)))
+      (setq *struct-types* (cons (cons key desc) new-reg)))
+    name))
+
+(defun %struct-instance-p (x)
+  "True if X is a struct instance array (slot-0 = '%struct-instance)."
+  (if (or (fixnump x) (consp x) (null x)) nil
+    (if (= (obj-subtag x) #x32)
+      (if (>= (array-length x) 2)
+        (eq (aref x 0) '%struct-instance)
+        nil)
+      nil)))
+
+(defun %struct-type-name (x)
+  "Return the type-name of struct instance X (slot 1)."
+  (aref x 1))
+
+(defun %struct-type-ancestor-p (type-name ancestor-name)
+  "True if struct type TYPE-NAME is, or descends (via :include) from,
+   ANCESTOR-NAME.  Compares by name-hash so symbol-flavor doesn't matter."
+  (let ((target (%struct-name-hash ancestor-name))
+        (cur-name type-name))
+    (if (null target) nil
+      (let ((result nil))
+        (loop
+          (when (null cur-name) (return result))
+          (let ((ch (%struct-name-hash cur-name)))
+            (when (and ch (= ch target)) (setq result t) (return result)))
+          (let ((desc (%find-struct-type cur-name)))
+            (if (null desc)
+                (return result)
+                (setq cur-name (%struct-type-desc-parent desc)))))))))
+
+(defun %struct-instance-typep (x type-name)
+  "True if struct instance X is of struct type TYPE-NAME (or a subtype)."
+  (if (not (%struct-instance-p x)) nil
+    (%struct-type-ancestor-p (%struct-type-name x) type-name)))
+
+(defun %struct-instance-named-p (x type-name)
+  "True if X is a struct instance whose own type-name is TYPE-NAME, OR
+   (via the registry) a subtype of TYPE-NAME.  Registry-independent for
+   the direct-type case: compares slot-1 to TYPE-NAME by hash so the
+   predicate works even when the boot-time %register-struct-type thunk
+   for this type didn't run."
+  (if (not (%struct-instance-p x)) nil
+    (let ((th (%struct-name-hash (%struct-type-name x)))
+          (nh (%struct-name-hash type-name)))
+      (cond
+        ((and th nh (= th nh)) t)
+        ((%struct-type-ancestor-p (%struct-type-name x) type-name) t)
+        (t nil)))))
+
+(defun %alloc-struct (type-name slot-values)
+  "Allocate a struct instance of TYPE-NAME with SLOT-VALUES (a list in
+   effective-slot order)."
+  (let* ((n (length slot-values))
+         (inst (make-array (+ 2 n))))
+    (aset inst 0 '%struct-instance)
+    (aset inst 1 type-name)
+    (let ((i 0) (cur slot-values))
+      (loop
+        (when (null cur) (return nil))
+        ;; force dest=frame-slot for variable-index aset (CLAUDE.md item 2)
+        (let ((dummy (aset inst (+ 2 i) (car cur)))) dummy)
+        (setq i (+ i 1))
+        (setq cur (cdr cur))))
+    inst))
+
+(defun %struct-slot-index (type-name slot-name)
+  "0-based index of SLOT-NAME within TYPE-NAME's effective slots, or -1."
+  (let ((desc (%find-struct-type type-name)))
+    (if (null desc) -1
+      (let ((slots (%struct-type-desc-slots desc))
+            (target (%struct-name-hash slot-name))
+            (i 0) (result -1))
+        (if (null target) -1
+          (progn
+            (let ((cur slots))
+              (loop
+                (when (null cur) (return nil))
+                (let ((sh (%struct-name-hash (car cur))))
+                  (when (and sh (= sh target)) (setq result i) (return nil)))
+                (setq i (+ i 1))
+                (setq cur (cdr cur))))
+            result))))))
+
+(defun %struct-keyword-matches-slot-p (kw slot-name)
+  "True if constructor keyword KW (a keyword like :FOO, or any symbol)
+   names struct slot SLOT-NAME.  Compares by name string so the keyword
+   (#x53, KEYWORD package) and the slot symbol (CL-TEST package) match
+   despite differing package hashes."
+  (let ((kn (symbol-name kw))
+        (sn (symbol-name slot-name)))
+    (if (and kn sn (> (length kn) 0) (string= kn sn)) t nil)))
+
+(defun %struct-ref (x slot-name)
+  "Read SLOT-NAME from struct instance X."
+  (let ((idx (%struct-slot-index (%struct-type-name x) slot-name)))
+    (if (< idx 0) nil (aref x (+ 2 idx)))))
+
+(defun %struct-set (x slot-name val)
+  "Write VAL to SLOT-NAME of struct instance X.  Returns VAL."
+  (let ((idx (%struct-slot-index (%struct-type-name x) slot-name)))
+    (when (>= idx 0)
+      (let ((dummy (aset x (+ 2 idx) val))) dummy))
+    val))
+
+(defun %struct-copy (x)
+  "Shallow-copy struct instance X."
+  (let* ((n (array-length x))
+         (new (make-array n))
+         (i 0))
+    (loop
+      (when (= i n) (return nil))
+      (let ((dummy (aset new i (aref x i)))) dummy)
+      (setq i (+ i 1)))
+    new))
 
 (defun %register-clos-slot-info (class-name initarg-map initform-map)
   "Register per-slot initarg→slot mapping and initform thunks for CLASS-NAME.

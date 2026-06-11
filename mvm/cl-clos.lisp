@@ -163,6 +163,13 @@
     ;; standard-class in their CPL.
     ((%clos-class-p obj)
      '(standard-class class standard-object t))
+    ;; Struct instance: type-name chain + STRUCTURE-OBJECT STANDARD-OBJECT T.
+    ;; Must precede the builtin-cpl fallback — %type-of-for-dispatch returns
+    ;; the bare struct type-name, and %builtin-cpl's default would drop the
+    ;; structure-object/standard-object tail that make-load-form's default
+    ;; method (and any STRUCTURE-OBJECT specializer) dispatches on.
+    ((%struct-instance-p obj)
+     (%struct-cpl obj))
     (t
      (%builtin-cpl (%type-of-for-dispatch obj)))))
 
@@ -421,6 +428,33 @@
   "True if struct instance X is of struct type TYPE-NAME (or a subtype)."
   (if (not (%struct-instance-p x)) nil
     (%struct-type-ancestor-p (%struct-type-name x) type-name)))
+
+(defun %struct-cpl (x)
+  "CPL for struct instance X: its own type-name, then each registered
+   :include ancestor, then STRUCTURE-OBJECT STANDARD-OBJECT T.  The
+   structure-object / standard-object tail preserves the pre-marker
+   behavior where struct instances (markerless arrays) matched a default
+   make-load-form method specialized on STRUCTURE-OBJECT / STANDARD-OBJECT
+   (make-load-form.struct.02 etc.).  The leading type-name chain lets
+   struct-type method specializers work once the registry knows the type."
+  (let ((chain nil) (cur (%struct-type-name x)))
+    ;; Walk own type + :include ancestors (registry-dependent; the
+    ;; compile-time defstruct path doesn't register, so chain is usually
+    ;; just the single own type-name — that's fine, the tail still matches).
+    (loop
+      (when (null cur) (return nil))
+      (setq chain (cons cur chain))
+      (let ((desc (%find-struct-type cur)))
+        (if (null desc)
+            (setq cur nil)
+            (setq cur (%struct-type-desc-parent desc)))))
+    ;; chain is now most-general .. most-specific; reverse to specific-first
+    (let ((cpl '(structure-object standard-object t)) (c chain))
+      (loop
+        (when (null c) (return nil))
+        (setq cpl (cons (car c) cpl))
+        (setq c (cdr c)))
+      cpl)))
 
 (defun %struct-instance-named-p (x type-name)
   "True if X is a struct instance whose own type-name is TYPE-NAME, OR

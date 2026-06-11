@@ -869,9 +869,14 @@
 
 (defvar *slot-missing-methods* nil)
 
-(defun %add-slot-missing-method (class-name fn)
+(defun %add-slot-missing-method (class-name fn &optional (slot-eql :any) (op-eql :any))
+  "Register a slot-missing method.  SLOT-EQL / OP-EQL are :any (no
+   constraint) or a 1-element list (VALUE) giving an eql-specializer on
+   the slot-name / operation argument.  Entry shape:
+   (class-name slot-eql op-eql . fn)."
   (setq *slot-missing-methods*
-        (cons (cons class-name fn) *slot-missing-methods*)))
+        (cons (cons class-name (cons slot-eql (cons op-eql fn)))
+              *slot-missing-methods*)))
 
 (defun %clos-sym-name-eq (a b)
   "True if class-name symbols A and B denote the same name, robust to
@@ -891,12 +896,16 @@
    no user method is registered, fall through to the documented default
    of erroring on slot-value / setf and returning NIL on the others."
   (let ((class-name (aref cls 1))
-        (best-fn nil))
+        (best-fn nil)         ; most-specific applicable, eql-specialized
+        (best-any-fn nil))    ; class-only fallback (slot-eql/op-eql = :any)
     (let ((cur *slot-missing-methods*))
       (loop
         (when (null cur) (return nil))
         (let ((m (car cur)))
-          (let ((m-class (car m)) (m-fn (cdr m)))
+          (let ((m-class (car m))
+                (m-slot-eql (cadr m))
+                (m-op-eql   (caddr m))
+                (m-fn       (cdddr m)))
             ;; Robust class match: a method registered from a different
             ;; top-level init-form may hold a different symbol OBJECT for the
             ;; same class name (native-MVM-sym vs CL-sym drift across the
@@ -905,14 +914,27 @@
             (when (or (eq m-class t)
                       (eq m-class class-name)
                       (%clos-sym-name-eq m-class class-name))
-              (when (null best-fn) (setq best-fn m-fn)))))
+              ;; Honor eql-specializers on slot-name / operation.  :any =
+              ;; no constraint; (VALUE) = must eql VALUE.
+              (let ((slot-ok (or (eq m-slot-eql :any)
+                                 (eql (car m-slot-eql) slot-name)))
+                    (op-ok   (or (eq m-op-eql :any)
+                                 (eql (car m-op-eql) op))))
+                (when (and slot-ok op-ok)
+                  (if (and (eq m-slot-eql :any) (eq m-op-eql :any))
+                      ;; class-only method — record as fallback only
+                      (when (null best-any-fn) (setq best-any-fn m-fn))
+                      ;; eql-specialized and applicable — most specific
+                      (when (null best-fn) (setq best-fn m-fn))))))))
         (setq cur (cdr cur))))
-    (if best-fn
-      (if new-val-p
-        (funcall best-fn cls obj slot-name op new-val)
-        (funcall best-fn cls obj slot-name op))
-      ;; Default slot-missing errors regardless of op (per CLHS).
-      (error "no slot named ~S in class ~S" slot-name class-name))))
+    (let ((fn (or best-fn best-any-fn)))
+      (if fn
+        ;; The rewriter emits a fixed 6-param method (… new-value supplied-p)
+        ;; so we always pass both — MVM's &optional default for a missing
+        ;; arg reads stack garbage, so we never rely on it.
+        (funcall fn cls obj slot-name op new-val (and new-val-p t))
+        ;; Default slot-missing errors regardless of op (per CLHS).
+        (error "no slot named ~S in class ~S" slot-name class-name)))))
 
 ;; slot-unbound dispatch
 ;; Methods stored as: (class-name slot-spec fn)

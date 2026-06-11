@@ -2369,14 +2369,46 @@
              (if (and (consp obj-spec) (consp (cdr obj-spec)))
                  (cadr obj-spec)
                  t))
+            ;; eql-specializers on slot-name / operation (CLHS lets
+            ;; slot-missing methods specialize on the slot-name and
+            ;; operation, e.g. (slot-name (eql 'not-there)).  Extract the
+            ;; eql value so dispatch only fires the method when applicable;
+            ;; otherwise an eql-specialized method (registered last, so at
+            ;; the front of the registry) shadows the class-only method.
+            ;; Form is `((eql 'X))' → spec=(EQL (QUOTE X)) → value X.
+            (slot-eql (if (and (consp slot-spec) (consp (cadr slot-spec))
+                               (eq (car (cadr slot-spec)) 'eql))
+                          (list (cadr (cadr (cadr slot-spec))))
+                          :any))
+            (op-eql   (if (and (consp op-spec) (consp (cadr op-spec))
+                               (eq (car (cadr op-spec)) 'eql))
+                          (list (cadr (cadr (cadr op-spec))))
+                          :any))
+            ;; new-value / supplied-p params.  rest-spec is
+            ;; (&optional (new-value nil new-value-p)) or (&optional new-value).
+            ;; MVM's funcall doesn't apply &optional defaults reliably when
+            ;; fewer args are supplied (the slot reads stack garbage), so we
+            ;; emit a FIXED 6-param signature and have %dispatch-slot-missing
+            ;; always pass both new-value and the supplied-p flag explicitly.
+            (nv-spec (cond ((and rest-spec (eq (car rest-spec) '&optional))
+                            (cadr rest-spec))
+                           (t nil)))
+            (nv-param (cond ((consp nv-spec) (car nv-spec))
+                            (nv-spec nv-spec)
+                            (t (intern "NEW-VALUE" :cl-user))))
+            (nvp-param (if (and (consp nv-spec) (consp (cddr nv-spec)))
+                           (caddr nv-spec)
+                           (intern "%SM-NEW-VALUE-P" :cl-user)))
             (rewritten-body (mapcar #'rewrite-reader-forms body))
             (fn-name (intern (format nil "%SLOT-MISSING-METHOD-~D"
                                      (incf *slot-unbound-method-counter*))
                              :cl-user)))
        `(progn
-          (defun ,fn-name (,class-param ,obj-param ,slot-param ,op-param ,@rest-spec)
+          (defun ,fn-name (,class-param ,obj-param ,slot-param ,op-param
+                           ,nv-param ,nvp-param)
             ,@rewritten-body)
-          (%add-slot-missing-method ',obj-class #',fn-name))))
+          (%add-slot-missing-method ',obj-class #',fn-name
+                                    ',slot-eql ',op-eql))))
 
     ;; (defmethod name [qualifier] specialized-lambda-list body...)
     ;; → (%defmethod 'name qualifier '(specializers) (lambda params body))

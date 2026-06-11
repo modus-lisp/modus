@@ -4776,6 +4776,8 @@
          ((eq tn 'method) (%standard-method-p obj))
          ((eq tn 'method-combination) (%mc-p obj))
          ((eq tn 'hash-table)    (hash-table-p obj))
+         ((eq tn 'readtable)     (readtablep obj))
+         ((eq tn 'random-state)  (random-state-p obj))
          ((eq tn 'condition) (%condition-p obj))
          ((eq tn 'standard-object) (%clos-instance-p obj))
          ((eq tn 'restart) (%active-restart-p obj))

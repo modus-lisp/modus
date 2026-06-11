@@ -2924,6 +2924,99 @@
   ;; (called in kernel-main) it is NIL and every padding assertion fails.
   (run-test 9230 (lambda () (notnot (stringp +standard-chars+))) 't)
   (run-test 9231 (lambda () (notnot (characterp (random-from-seq +standard-chars+)))) 't)
+  ;; Reader-cluster probes (9240..).
+  (run-test 9240 (lambda () (notnot (typep (copy-readtable) 'readtable))) 't)
+  (run-test 9241 (lambda () (notnot (typep *readtable* 'readtable))) 't)
+  (run-test 9242 (lambda () (typep 5 'readtable)) 'nil)
+  ;; get-macro-character returns a real function for standard chars
+  (run-test 9243 (lambda () (notnot (functionp (get-macro-character #\()))) 't)
+  (run-test 9244 (lambda () (notnot (functionp (get-macro-character #\#)))) 't)
+  (run-test 9245 (lambda () (multiple-value-bind (f ntp) (get-macro-character #\#)
+                              (declare (ignore f)) (notnot ntp))) 't)
+  ;; escaped-symbol case preservation: \a → name "a"
+  (run-test 9246 (lambda () (symbol-name (read-from-string "\\a"))) "a")
+  (run-test 9247 (lambda () (symbol-name (read-from-string "\\A"))) "A")
+  ;; reader-error type for malformed input
+  (run-test 9248 (lambda () (handler-case (read-from-string ")") (reader-error (c) :good) (error (c) :bad))) ':good)
+  ;; %reader-error builds a reader-error-typed condition
+  (run-test 9249 (lambda () (handler-case (%reader-error "x") (reader-error (c) :good) (error (c) :bad))) ':good)
+  (run-test 9250 (lambda () (typep (make-condition 'reader-error :format-control "x") 'reader-error)) 't)
+  ;; user dispatch macro with undefined sub-char → reader-error
+  (run-test 9251 (lambda ()
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (handler-case (read-from-string "!aX")
+                       (reader-error (c) :good) (error (c) :bad)))) ':good)
+  ;; Replicate make-dispatch-macro-character.3 exactly: coerced string +
+  ;; with-standard-io-syntax wrapping.
+  (run-test 9252 (lambda ()
+                   (%with-standard-io-syntax
+                    (lambda ()
+                      (let ((*readtable* (copy-readtable nil)))
+                        (make-dispatch-macro-character #\!)
+                        (handler-case (read-from-string (coerce (list #\! #\a #\X) 'string))
+                          (reader-error (c) :good) (error (c) :bad)))))) ':good)
+  ;; Narrow 9252: which factor breaks dispatch?  coerce vs literal, wsis vs not.
+  (run-test 9254 (lambda ()  ; coerce string, no wsis
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (handler-case (read-from-string (coerce (list #\! #\a #\X) 'string))
+                       (reader-error (c) :good) (error (c) :bad)))) ':good)
+  (run-test 9255 (lambda ()  ; what condition type is actually signalled?
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (handler-case (read-from-string "!aX")
+                       (t (c) (%condition-type-name c))))) 'reader-error)
+  (run-test 9256 (lambda ()  ; is ! actually a macro char on the copy?
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (multiple-value-bind (f ntp) (get-macro-character #\!)
+                       (declare (ignore ntp)) (notnot f)))) 't)
+  (run-test 9257 (lambda ()  ; does get-dispatch-table find ! sub-table?
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (notnot (%get-dispatch-table #\! *readtable*)))) 't)
+  ;; standard #aX undefined sub-char on a copy — reader-error?
+  (run-test 9258 (lambda ()
+                   (let ((*readtable* (copy-readtable nil)))
+                     (handler-case (read-from-string "#%X")
+                       (reader-error (c) :good) (t (c) (%condition-type-name c))))) ':good)
+  ;; does %get-dispatch-table return an array we can aref after deep copy?
+  (run-test 9259 (lambda ()
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (let ((tbl (%get-dispatch-table #\! *readtable*)))
+                       (list (arrayp tbl) (array-length tbl) (null (aref tbl 65)))))) '(t 128 t))
+  ;; call %read-user-dispatch path symptoms: read just "!a" (EOF after)
+  (run-test 9260 (lambda ()
+                   (let ((*readtable* (copy-readtable nil)))
+                     (make-dispatch-macro-character #\!)
+                     (handler-case (values (read-from-string "!aX"))
+                       (reader-error (c) :rerr)
+                       (type-error (c) :terr)
+                       (t (c) :other)))) ':rerr)
+  ;; set-syntax-from-char.single-escape.1 single iter c=#\a from #\\
+  (run-test 9261 (lambda ()
+                   (%with-standard-io-syntax
+                    (lambda ()
+                      (let ((*readtable* (copy-readtable nil))
+                            (*package* (find-package :cl-test)))
+                        (list (set-syntax-from-char #\a #\\)
+                              (read-from-string (concatenate 'string (list #\a #\Z)))))))) '(t |Z|))
+  ;; what syntax-type does `a' have after set-syntax-from-char a \?
+  (run-test 9262 (lambda ()
+                   (let ((*readtable* (copy-readtable nil)))
+                     (set-syntax-from-char #\a #\\)
+                     (%syntax-type #\a *readtable*))) ':single-escape)
+  ;; replicate read-symbol.11 single iteration for c=#\a (escaped)
+  (run-test 9253 (lambda ()
+                   (%with-standard-io-syntax
+                    (lambda ()
+                      (let* ((*package* (find-package :cl-test))
+                             (str (make-array 2 :element-type 'character :initial-contents (list #\\ #\a)))
+                             (sym (read-from-string str)))
+                        (list (symbol-name sym)
+                              (notnot (eql sym (find-symbol "a")))))))) '("a" t))
   )
 
 ;;; ============================================================

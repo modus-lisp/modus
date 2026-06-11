@@ -84,8 +84,10 @@
     (aset macros 59 (cons :semicolon nil))  ; ;
     ;; # is non-terminating macro character
     (aset macros 35 (cons :sharpsign t))    ; #
-    ;; Set up dispatch table for #
-    (let ((sharp-table (make-array 128)))
+    ;; Set up dispatch table for # (NIL-filled — make-array doesn't
+    ;; zero-init, and get-dispatch-macro-character / user
+    ;; set-dispatch-macro-character read these slots directly).
+    (let ((sharp-table (%make-nil-array-128)))
       (setq dispatch (list (cons 35 sharp-table))))
     ;; Store in data array
     (aset data 0 :upcase)
@@ -117,6 +119,20 @@
       (when (>= i 128) (return nil))
       (aset dst i (aref src i))
       (setq i (+ i 1)))))
+
+(defun %make-nil-array-128 ()
+  "Allocate a 128-slot array explicitly NIL-filled.  The bare make-array
+   primitive does NOT zero-initialise, so a fresh dispatch sub-table
+   carried heap garbage in its slots; %read-user-dispatch then (aref'd a
+   non-NIL non-function value and funcall'd it → type-error instead of
+   the CLHS reader-error for an undefined dispatch sub-char."
+  (let ((a (make-array 128))
+        (i 0))
+    (loop
+      (when (>= i 128) (return nil))
+      (aset a i nil)
+      (setq i (+ i 1)))
+    a))
 
 (defun %copy-macro-entry (entry)
   "Deep-copy a macro table entry."
@@ -156,8 +172,12 @@
         (aset to-data 0 (aref from-data 0))
         (%copy-macro-table (aref from-data 1) (aref to-data 1))
         (%copy-array-128 (aref from-data 3) (aref to-data 3))
-        ;; Share dispatch tables (shallow) — avoids cons-in-loop issue
-        (aset to-data 2 (aref from-data 2)))
+        ;; DEEP-copy dispatch tables so SET-DISPATCH-MACRO-CHARACTER on a
+        ;; copy can't mutate *standard-readtable*'s `#' sub-table (which
+        ;; would wedge every later reader test inheriting from the
+        ;; standard).  Each source sub-table is now NIL-filled, so the
+        ;; full 128-slot copy carries no heap garbage.
+        (aset to-data 2 (%copy-dispatch-tables from-rt)))
       result)))
 
 ;;; Readtable globals (initialized by %init-reader)
@@ -198,6 +218,59 @@
 
 ;;; --- Macro character API ---
 
+;;; Standard reader-macro functions with the CLHS (stream char) signature.
+;;; The macro table stores keyword placeholders (:lparen etc.) for the
+;;; standard chars and %read-macro-dispatch-simple dispatches on them.
+;;; But GET-MACRO-CHARACTER must return a genuine function per CLHS
+;;; (the ANSI tests check (functionp (car vals))), so these wrappers
+;;; bridge the keyword placeholders to real funcallable objects.  If a
+;;; test installs one of these via SET-MACRO-CHARACTER, the dispatcher's
+;;; (or (functionp fn) ...) branch funcalls it with (stream char).
+(defun %rmf-lparen (stream char)
+  (declare (ignore char))
+  (%read-list stream *readtable* t))
+(defun %rmf-rparen (stream char)
+  (declare (ignore stream char))
+  (%reader-error "unmatched close parenthesis"))
+(defun %rmf-quote (stream char)
+  (declare (ignore char))
+  (let ((obj (%read-internal stream t nil t)))
+    (if *read-suppress* nil (list 'quote obj))))
+(defun %rmf-string (stream char)
+  (declare (ignore char))
+  (%read-string stream))
+(defun %rmf-backquote (stream char)
+  (declare (ignore char))
+  (%read-backquote stream))
+(defun %rmf-comma (stream char)
+  (declare (ignore char))
+  (%read-comma stream))
+(defun %rmf-semicolon (stream char)
+  (declare (ignore char))
+  (%skip-line-comment stream)
+  :%rdr-no-value%)
+(defun %rmf-sharpsign (stream char)
+  (declare (ignore char))
+  (%read-sharpsign stream *readtable*))
+
+(defun %macro-keyword-to-fn (kw)
+  "Translate a standard macro-char keyword placeholder to its
+   reader-macro function so GET-MACRO-CHARACTER returns a real function."
+  (cond
+    ((eq kw :lparen) #'%rmf-lparen)
+    ((eq kw :rparen) #'%rmf-rparen)
+    ((eq kw :quote) #'%rmf-quote)
+    ((eq kw :string) #'%rmf-string)
+    ((eq kw :backquote) #'%rmf-backquote)
+    ((eq kw :comma) #'%rmf-comma)
+    ((eq kw :semicolon) #'%rmf-semicolon)
+    ((eq kw :sharpsign) #'%rmf-sharpsign)
+    ;; :dispatch has no single function; CLHS says a dispatching macro
+    ;; character's function is implementation-defined but must be a
+    ;; function — reuse the sharpsign reader shape.
+    ((eq kw :dispatch) #'%rmf-sharpsign)
+    (t kw)))
+
 (defun get-macro-character (char &rest args)
   "Get the macro function and non-terminating-p for CHAR."
   (let ((rt (if args (if (car args) (car args) *standard-readtable*) *readtable*)))
@@ -206,7 +279,11 @@
           (values nil nil)
           (let ((entry (aref (%rt-macros rt) code)))
             (if (consp entry)
-                (values (car entry) (cdr entry))
+                (let ((fn (car entry)))
+                  ;; Map keyword placeholders to real functions; user
+                  ;; functions/symbols pass through unchanged (the cond's
+                  ;; default branch returns FN as-is).
+                  (values (%macro-keyword-to-fn fn) (cdr entry)))
                 (values nil nil)))))))
 
 (defun set-macro-character (char fn &rest args)
@@ -238,14 +315,16 @@
       ;; Set as macro character
       (when (< code 128)
         (aset (%rt-macros rt) code (cons :dispatch non-term-p)))
-      ;; Create dispatch sub-table if not exists
+      ;; Create dispatch sub-table if not exists (NIL-filled — see
+      ;; %make-nil-array-128).
       (unless (%get-dispatch-table char rt)
         (aset (%rt-data rt) 2
-              (cons (cons code (make-array 128)) (%rt-dispatch rt)))))
+              (cons (cons code (%make-nil-array-128)) (%rt-dispatch rt)))))
     t))
 
 (defun get-dispatch-macro-character (disp-char sub-char &rest args)
-  "Get the dispatch function for DISP-CHAR SUB-CHAR."
+  "Get the dispatch function for DISP-CHAR SUB-CHAR.  CLHS: signals an
+   error if DISP-CHAR is not a dispatching macro character in RT."
   (let ((rt (if args (if (car args) (car args) *standard-readtable*) *readtable*)))
     (let ((sub-table (%get-dispatch-table disp-char rt)))
       (if sub-table
@@ -253,7 +332,9 @@
             (if (< code 128)
                 (aref sub-table code)
                 nil))
-          nil))))
+          ;; Not a dispatching macro character → error (get-dispatch-
+          ;; macro-character.1 collects any char that does NOT error).
+          (error "get-dispatch-macro-character: not a dispatching macro character")))))
 
 (defun set-dispatch-macro-character (disp-char sub-char fn &rest args)
   "Set the dispatch function for DISP-CHAR SUB-CHAR."
@@ -314,8 +395,15 @@
 ;;; --- Core reader implementation ---
 
 (defun %reader-error (msg)
-  "Signal a reader error."
-  (error msg))
+  "Signal a READER-ERROR condition (CLHS 23 / 49.1).  Many ANSI reader
+   tests wrap reads in (handler-case ... (reader-error (c) :good)); the
+   old (error msg) signalled a SIMPLE-ERROR which those handlers missed,
+   so malformed input surfaced as :bad / uncaught instead of :good.
+   Build a condition of type READER-ERROR carrying MSG as its
+   format-control so the message still prints."
+  (error (make-condition 'reader-error
+                         :format-control msg
+                         :format-arguments nil)))
 
 
 (defun %read-skip-whitespace (stream)
@@ -428,6 +516,11 @@
     ((eq fn :backquote) (%read-backquote stream))
     ((eq fn :comma) (%read-comma stream))
     ((eq fn :sharpsign) (%read-sharpsign stream rt))
+    ;; A char given semicolon syntax via set-syntax-from-char reaches the
+    ;; dispatcher (the literal `;' is consumed earlier in skip-whitespace).
+    ;; Skip to end of line and yield the no-value sentinel so the
+    ;; %read-internal loop reads the next form, matching `;'-comment semantics.
+    ((eq fn :semicolon) (%skip-line-comment stream) :%rdr-no-value%)
     ((eq fn :dispatch) (%read-user-dispatch ch stream rt))
     ((or (functionp fn) (%cl-sym-p fn))
      (let ((result (funcall fn stream ch)))

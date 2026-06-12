@@ -31,13 +31,63 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of 2026-06-12, after the form-54 reader + %eval-escape re-raise fixes)
+## Gauntlet frontier (as of 2026-06-12, after the form-94 reader + runtime-DEFSETF + macro-branch fixes)
 
-The gauntlet runner now reaches **form 94** (uiop/lisp-build) and stops
-with `READ-ERROR after form 94` — a NEW, separate reader frontier (byte
-~287566).  Forms that still `FAILFORM` along the way: 43 (detect-os, see
-below), 44 + 56 (runtime DEFSETF gap), 87 (`NOT-IMPLEMENTED-ERROR` in
-uiop/image).  All are caught and the march continues.
+The gauntlet runner now **reads ALL 243 toplevel forms** of asdf.lisp —
+`GAUNTLET DONE forms=243` with NO `READ-ERROR`.  The reader frontier is
+GONE; what remains is purely runtime-EVAL failures (caught, the march
+continues).  Three fixes this seat:
+
+1. **Form-94 `READ-ERROR` FIXED — consing-dot under `*read-suppress*`.**
+   `%read-list`'s consing-dot branch (mvm/cl-reader.lisp) signalled a
+   spurious `"dot at start of list"` reader-error whenever a *legal*
+   dotted list appeared inside a feature-suppressed form, because under
+   `*read-suppress*` the list elements are NOT accumulated (`result`
+   stays nil), so the "is result empty?" guard fired wrongly.  uiop/lisp-
+   build's `#+clozure … (destructuring-bind (fun . more) …)` tripped it
+   and desynced the stream.  Fix: skip the empty-result check while
+   suppressing.  Gauntlet form 94 → 243 (whole file reads).
+
+2. **Forms 44/56 runtime DEFSETF — FIXED.**  `%eval-compound`
+   (mvm/cl-eval.lisp) had no DEFSETF branch, so `(defsetf getenv (x)
+   (val) …)` fell through to funcall and `%eval-escape`'d.  Added a
+   runtime DEFSETF branch (short + CLHS long form) that registers a
+   descriptor in `*setf-expanders*` via `%register-setf-expander`; the
+   runtime SETF macro (runtime-cl-macros.lisp) and `get-setf-expansion`
+   now consult it via `%find-setf-expander` + the new
+   `%apply-setf-expander` (descriptors avoid the closure-cell
+   limitation).  Form 44 now PASSES.
+
+3. **Runtime-DEFMACRO dispatch — FIXED (the keystone for the read-through).**
+   `%eval-compound`'s macro-call branch looked up the expander via
+   `macro-function`, which WRAPS the raw `%interp-closure` in a
+   user-facing closure object (subtag #x52) — that wrapper is not an
+   `%interp-closure`, so it fell to the `(funcall mf form)` path and
+   CRASHED (the shim expects the macro's args, not the whole form).  Any
+   runtime-`defmacro`'d macro invoked through eval (uiop's
+   `DEFINE-PACKAGE`, `WITH-UPGRADABILITY`, etc.) hit this.  Fix: use
+   `%raw-macro-expander` (mirroring `macroexpand-1`) to get the bare
+   expander before dispatching on `%interp-closure-p`.
+
+Forms that still `FAILFORM` (all caught, runtime-EVAL gaps — NOT reader):
+  - **43 / 87** — detect-os "can't detect this OS" + uiop/image
+    `NOT-IMPLEMENTED-ERROR`; both expected (no `:unix` in *features*).
+  - **56** — uiop/pathname with-upgradability `%eval-escape` (pre-existing).
+  - **49, 58, 67, 80, 88, 224, 227, 231, 234, 237-239** — `DEFINE-PACKAGE`
+    `%eval-escape`.  Fix #3 makes define-package *actually run* (instead
+    of crashing in the wrapper-funcall path); it now creates the package
+    (the `INPKG` markers still appear) but `ensure-package`'s body escapes
+    /hangs deep in the runtime-EVAL `do-symbols` over the 978-symbol CL
+    package + the `(loop … :being :the :hash-keys …)` reexport loop.  This
+    is the **define-package / runtime-EVAL track** (separate, large
+    effort) — NOT a reader bug.  In baseline these "passed" only because
+    define-package was crashing earlier and never completing; the new
+    FAILFORMs are honest.
+  - **223 / 226 / 242** — `ETYPECASE: no clause matches` (runtime
+    etypecase gap).
+  - **233 / 236** — `WITH-ASDF-DEPRECATION` macroexpand crash.
+  - **241** — `FORMATTED-SYSTEM-DEFINITION-ERROR` (asdf component
+    designator validation — a real asdf error, honest).
 
 **The old form-54 `READ-ERROR` is FIXED** (commit 1b3edd3) — it was NOT a
 GC/`#.` issue at all.  See "Form 54→55 READ-ERROR — RESOLVED" below.

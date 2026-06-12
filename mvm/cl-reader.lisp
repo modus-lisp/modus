@@ -1095,8 +1095,17 @@
             (cond
               ((null next) (%reader-error "end of file after dot"))
               ((or (%whitespace-char-p next) (eql next #\)) (%terminating-macro-p next rt))
-               ;; It's the consing dot
-               (when (null result) (%reader-error "dot at start of list"))
+               ;; It's the consing dot.  Under *read-suppress* the list
+               ;; elements are NOT accumulated (result stays nil even
+               ;; after reading items — see the (not *read-suppress*)
+               ;; guards below), so the "dot at start of list" check must
+               ;; be skipped while suppressing; otherwise a perfectly
+               ;; legal dotted list inside a feature-suppressed form
+               ;; (e.g. uiop/lisp-build's `#+clozure … (destructuring-bind
+               ;; (fun . more) …)`) signals a spurious reader-error and
+               ;; desyncs the stream.
+               (when (and (null result) (not *read-suppress*))
+                 (%reader-error "dot at start of list"))
                (unread-char next stream)
                (let ((cdr-val (%read-internal stream t nil t)))
                  ;; Skip whitespace and read closing paren

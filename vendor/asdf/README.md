@@ -31,24 +31,61 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of 2026-06-12, after the GC heap-overshoot guard fix)
+## Gauntlet frontier (as of 2026-06-12, after the form-54 reader + %eval-escape re-raise fixes)
 
-The gauntlet runner reaches **form 54** and stops with `READ-ERROR after
-form 54`.  Two non-fatal `FAILFORM`s precede it — forms 43 and 44 (the
-uiop/os `with-upgradability` bodies) signal `SIMPLE-ERROR "%eval-escape"`
-(reader/eval track, still open) but are caught, so the march continues
-through uiop/pathname (form 50) to the read-error at 54.
+The gauntlet runner now reaches **form 94** (uiop/lisp-build) and stops
+with `READ-ERROR after form 94` — a NEW, separate reader frontier (byte
+~287566).  Forms that still `FAILFORM` along the way: 43 (detect-os, see
+below), 44 + 56 (runtime DEFSETF gap), 87 (`NOT-IMPLEMENTED-ERROR` in
+uiop/image).  All are caught and the march continues.
 
-**The form-54 boundary is no longer a GC/heap-corruption crash.**  The
-deterministic 2nd-GC fault that defined this frontier was a gc-check
-post-alloc OVERSHOOT running off the end of the mmap'd heap in the second
-Cheney semispace (NOT a missing root — see the RESOLVED section below);
-fixed by a 16 MB heap guard band in `boot/boot-linux-x64.lisp`.  The
-remaining form-54 `READ-ERROR` is a genuine reader/eval issue (a 2-GC
-`#.` read-eval now reproduces clean standalone), now in the reader/eval
-track.
+**The old form-54 `READ-ERROR` is FIXED** (commit 1b3edd3) — it was NOT a
+GC/`#.` issue at all.  See "Form 54→55 READ-ERROR — RESOLVED" below.
 
-### Form 54→55 READ-ERROR — GC/heap-corruption during `#.` read-eval (compiler/translator/GC track)
+**The forms 43/44 `%eval-escape` leak is FIXED** (commit ae1e140) — it was
+an error-MASKING bug in the runtime escape handlers, not a cond/and
+lowering tag mismatch.  See "forms 43/44 — RESOLVED" below.
+
+(The earlier 16 MB heap guard band in `boot/boot-linux-x64.lisp` removed
+the GC-overshoot crash class and is unrelated to either of these.)
+
+### Form 54→55 READ-ERROR — RESOLVED 2026-06-12 (commit 1b3edd3): `;'-comment-before-consing-dot reader bug
+
+**The `#.` / GC framing below was a complete red herring.**  The form-54
+boundary was a pure reader bug with no GC, no `#.`, no heap corruption.
+
+`%read-list`'s inline whitespace-skip loop (mvm/cl-reader.lisp) skipped
+only `%whitespace-char-p` chars, not `;' LINE COMMENTS.  When a `;'-comment
+sat immediately before a CONSING DOT, the `;' fell through to the
+fall-through `%read-internal` call, whose `%read-skip-whitespace` DID skip
+the comment AND the following whitespace, landing on the lone `.', which
+`%read-internal` then read as a token — a reader-error (consing-dot
+context is only recognised inside `%read-list`, not `%read-internal`).
+
+The trigger form was NOT `directory*` (that's a later form) but the
+uiop/pathname `subpathname` `with-upgradability` (the form read right
+after form 54), whose `pathname-root` / `pathname-host-pathname` defuns
+end with exactly this shape:
+
+    (make-pathname :directory '(:absolute) … :defaults pathname
+                   ;; host device, and on scl, *some*
+                   ;; scheme-specific parts: port username password
+                   . #.(or #+scl '(:parameters nil :query nil :fragment nil)))
+
+Minimal repro (no GC, no `#.`): `(a 1 ;c\n . tail)` -> READER-ERROR.
+`*read-suppress*`=T "fixing" it was a coincidence — suppress changes the
+fall-through path, not because `#.` eval was the culprit.
+
+Fix: `%read-list` now skips `;' line comments in its own whitespace loop
+(`((eql ch #\;) (%skip-line-comment stream))`), so the consing-dot branch
+fires.  Gauntlet advances form 54 -> form 94.  ANSI 15,360 -> 15,376,
+markers flat.  `%read-skip-whitespace`, `%read-after-ws2`, and the
+`:semicolon` dispatch already handled comments; only the `%read-list`
+inline loop had the gap.
+
+----- (original, now-DISPROVEN `#.`/GC notes preserved below) -----
+
+### Form 54→55 READ-ERROR — GC/heap-corruption during `#.` read-eval (compiler/translator/GC track) [DISPROVEN]
 
 Diagnosed 2026-06-11.  The hard stop is a **`READER-ERROR` signalled
 during the read of form 55**, the uiop/filesystem `directory*` defun
@@ -215,7 +252,50 @@ positive.  **Off-limits to the reader/eval/packages seat — this is a GC
 root-set / calling-convention defect, surfaced by any GC with a live
 lexical local, of which the gauntlet `#.` eval is one instance.**
 
-### OPEN — forms 43/44 `%eval-escape` leak from `(featurep …)` (reader/eval track)
+### RESOLVED 2026-06-12 (commit ae1e140) — forms 43/44 `%eval-escape` was error-MASKING, not a cond/and lowering bug
+
+The "tag-mismatch in cond→block lowering" theory below was WRONG.  The
+real bug: the `handler-case` wrappers around BLOCK / extended-LOOP /
+simple-LOOP / CATCH / TAGBODY in mvm/cl-eval.lisp caught EVERY condition,
+consulted `*%eval-escape-stack*` via `%eval-escape-pop-if`, and on an
+empty / non-matching stack re-signalled a GENERIC `(error "%eval-escape")`
+— **discarding the original condition object**.  So any genuine
+`(error …)` signalled inside a loop/block/catch/tagbody body (or a loop's
+FINALLY) was masked: its true type/message became `SIMPLE-ERROR
+"%eval-escape"`, and the empty-stack signature in the prior notes was
+just "this real error pushed no escape descriptor".
+
+uiop's `detect-os` ends with `(loop* … :finally (return (or o (error
+"…neither Unix nor Windows…"))))`.  On Modus *features* lacks `:unix`, so
+all `os-*-p` return NIL, `o` stays NIL, and the FINALLY `(error …)` fires
+— a LEGITIMATE ASDF "can't detect this OS" error that the masking turned
+into the mysterious empty-stack `%eval-escape`.  (NB the bisect that
+blamed `(featurep :unix)` was misled by the masking — `featurep` itself
+is correct; the leak was detect-os's finally-error.)
+
+Fix: all six escape handlers now re-raise the caught condition C itself
+(`(error c)`) when `%eval-escape-pop-if` returns `:%eval-no-escape`,
+instead of a fresh "%eval-escape".  Escape propagation is preserved: when
+C IS a deeper `%eval-escape-push`'s condition, its escape value is still
+on the stack and the outer handler pops it.  detect-os now FAILFORMs with
+its real "Congratulations for trying ASDF on an operating system…" message
+(honest + catchable).  ANSI 15,360 -> 15,376 passed, lost-to-crash
+119 -> 56 (errors that died silently are now caught), markers flat (4/30).
+
+Still-open follow-ups in the uiop/os region (NOT this bug):
+  - **Form 44/56 = runtime DEFSETF gap.**  `%eval-compound` has no DEFSETF
+    branch, so `(defsetf getenv (x) (val) …)` falls through to funcall and
+    escapes.  A runtime DEFSETF branch (mirroring the DEFTYPE /
+    DEFINE-CONDITION ones, registering into the existing `*setf-expanders*`
+    via `%register-setf-expander`) would clear forms 44 & 56.
+  - **detect-os PASS would need `:unix` in `*features*`.**  Tried it
+    (cl-reader.lisp `%init-reader`); it makes form 43 PASS but activates
+    `#+unix` branches in uiop/filesystem (forms 50-58) that Modus can't
+    handle, producing a form-58 runtime cascade (the gauntlet's `*g-form-n*`
+    got stuck advancing).  REVERTED — net negative.  Revisit only with the
+    `#+unix`-path gaps closed.
+
+----- (original, now-DISPROVEN "cond/and lowering" notes preserved below) -----
 
 Non-fatal (caught; the march continues to form 54) but a real
 runtime-EVAL bug in cl-eval.lisp.  Diagnosed 2026-06-11.

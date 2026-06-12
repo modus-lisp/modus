@@ -31,13 +31,22 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
-## Gauntlet frontier (as of 2026-06-11, after GC copy_object bounds guard 6eed02a/be4e12c)
+## Gauntlet frontier (as of 2026-06-12, after the GC heap-overshoot guard fix)
 
-The gauntlet runner now reaches **form 54** deterministically and stops
-with `READ-ERROR after form 54`.  Two non-fatal `FAILFORM`s precede it —
-forms 43 and 44 (the uiop/os `with-upgradability` bodies) signal
-`SIMPLE-ERROR "%eval-escape"` but are caught, so the march continues to
-the hard read-error at 54.  See the two diagnosis sections below.
+The gauntlet runner reaches **form 54** and stops with `READ-ERROR after
+form 54`.  Two non-fatal `FAILFORM`s precede it — forms 43 and 44 (the
+uiop/os `with-upgradability` bodies) signal `SIMPLE-ERROR "%eval-escape"`
+(reader/eval track, still open) but are caught, so the march continues
+through uiop/pathname (form 50) to the read-error at 54.
+
+**The form-54 boundary is no longer a GC/heap-corruption crash.**  The
+deterministic 2nd-GC fault that defined this frontier was a gc-check
+post-alloc OVERSHOOT running off the end of the mmap'd heap in the second
+Cheney semispace (NOT a missing root — see the RESOLVED section below);
+fixed by a 16 MB heap guard band in `boot/boot-linux-x64.lisp`.  The
+remaining form-54 `READ-ERROR` is a genuine reader/eval issue (a 2-GC
+`#.` read-eval now reproduces clean standalone), now in the reader/eval
+track.
 
 ### Form 54→55 READ-ERROR — GC/heap-corruption during `#.` read-eval (compiler/translator/GC track)
 
@@ -81,6 +90,49 @@ file byte-for-byte to 80 000 bytes; `unread-char` immediately after read
 across buffer boundaries round-trips; multi-char `#\Name` and `#:foo`
 uninterned literals (bare, in lists, and under suppress) all read; the
 `#+feature` skip and nested `#+(or …)` skips all read.
+
+#### 2026-06-12 RESOLVED — it was NOT a missing root; it was a gc-check OVERSHOOT off the end of the mmap (commit on aarch64-ansi-timeout)
+
+The "missing root" framing below was a **red herring**.  Instrumenting the
+native GC trampoline (entry/exit trace bytes + per-GC dumps of R12, R14,
+from_start, space_size, the saved-register slots, and the faulting RIP/si_addr
+captured by the SIGSEGV stub) proved:
+
+  - The GC copy/swap/bounds are correct; **all** roots (stack scan, the 12
+    saved-register slots, globals, symtab, keyword + pkg-by-hash tables, MV
+    extras) are forwarded.  No saved-reg slot is ever left pointing into the old
+    from-space after a collection (verified with a post-GC `!`-if-stale probe —
+    zero hits).  The interp `env` was never actually lost.
+  - The deterministic fault is in **`MAKE-STRING` itself** (symmap'd RIP), writing
+    at **`heap_end + 0`** — i.e. ONE PAGE PAST the end of the 896 MB mmap.
+  - Cause: the gc-check is POST-allocation (`alloc … ; cmp r12,r14 ; jb skip ; call
+    gc`).  R12 overshoots R14 (= the space's `from_end`) by one-or-more objects
+    before the next check fires the collector — ~33 KB observed for the interp's
+    make-string loop.  The two Cheney semispaces were sized to fill the **entire**
+    mmap (`midpoint + space_size ≈ 0x37FFFE00`, heap end `0x38000000`, only 0x200
+    bytes of slack).  In the FIRST space an overshoot lands in the (mapped) second
+    space and is harmless; in the SECOND space it runs off the mapping → SIGSEGV
+    mid-write.  That is why it only died on the **second** GC, was value-type
+    independent (the env was fine; the *allocator* crashed), survived in a global
+    (globals don't change allocation pressure), and was layout-sensitive (adding
+    loop-body code shifts where R12 lands relative to heap_end).
+
+Fix (`boot/boot-linux-x64.lisp`): add a 16 MB guard band to the mmap'd heap
+(`+linux-x64-gc-guard+`), so the second semispace's `from_end` has far more
+mapped slack than any inter-check overshoot.  Semispace midpoint/size are
+unchanged; only the mapping is larger.
+
+Verified: the README's minimal `fsc` reproducer now prints `car=111 gc=1`; the
+`(a b #.(progn (make-string…)(loop … make-string …) 99) c d)` two-GC `#.`
+read-eval reads cleanly; `dotimes`/`loop`/recursion variants all survive.
+Shared boot file ⇒ build-ansi-test gets the fix too.  ANSI gate: 15,355 →
+**15,360 passed**, lost-to-crash flat (~118→119), no FILE-WEDGE/CHUNK-CRASH rise.
+Gauntlet: now cleanly reaches uiop/pathname (form 50) and stops at the
+**form-54 READ-ERROR**, which is a SEPARATE, genuine reader/eval issue (the `#.`
+crash class is gone — a 2-GC `#.` reproduces clean standalone), so form 54 is
+now in the reader/eval track, not GC.
+
+----- (original, now-disproven "missing root" notes preserved below) -----
 
 #### 2026-06-12 update — narrowed to a MISSING-ROOT for a LEXICAL local across GC
 

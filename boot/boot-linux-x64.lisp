@@ -12,9 +12,21 @@
 
 (defconstant +linux-x64-load-addr+ #x400000)    ; Traditional Linux x64 load address
 (defconstant +linux-x64-heap-addr+ #x10000000)  ; Heap start (same as bare-metal)
-(defconstant +linux-x64-heap-size+ #x38000000)  ; 896MB heap
-(defconstant +linux-x64-heap-alloc-start+ #x200)  ; Offset from heap base to first allocatable byte
+;; The two Cheney semispaces are [0x200, midpoint) and [midpoint, midpoint+space_size).
+;; The SECOND semispace's from_end = midpoint + space_size ≈ 2*midpoint ≈ 0x37FFFE00.
+;; The mmap'd region MUST extend past that by a guard band, because the gc-check
+;; is POST-allocation: R12 (alloc ptr) overshoots R14 (= from_end) by one or more
+;; objects before the next check fires the collector (~33 KB observed for the
+;; interp's make-string loop).  In the FIRST space that overshoot lands in the
+;; (mapped) second space and is harmless; in the SECOND space, without a guard it
+;; runs off the end of the mapping and SIGSEGVs mid-write — the deterministic
+;; "interp value lost across the 2nd GC" fault was make-string writing at
+;; heap_end+0 on the overshoot of the second collection.  16 MB of guard past the
+;; second from_end is far more than any plausible inter-check overshoot.
+(defconstant +linux-x64-gc-guard+ #x1000000)    ; 16MB guard past the 2nd semispace
 (defconstant +linux-x64-gc-midpoint+ #x1C000000)  ; Midpoint offset from heap base (from/to boundary)
+(defconstant +linux-x64-heap-size+ (+ #x38000000 +linux-x64-gc-guard+))  ; 896MB + 16MB guard
+(defconstant +linux-x64-heap-alloc-start+ #x200)  ; Offset from heap base to first allocatable byte
 
 ;; When GC is enabled, R14 = midpoint (GC fires at half heap).
 ;; When GC is disabled, R14 = full heap size (no GC trigger).

@@ -525,6 +525,11 @@
   (setf modus.mvm.x64::*x64-gc-debug* t)
   (format t "~%[DEBUG] GC trampoline debug bytes enabled~%"))
 
+#+sbcl
+(let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+  (when (and sm (> (length sm) 0))
+    (setf modus.mvm::*write-symmap-path* sm)))
+
 (format t "~%Compiling generic image (~D chars)...~%"
         (length cl-user::*full-source*))
 

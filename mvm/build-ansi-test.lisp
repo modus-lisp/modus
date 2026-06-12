@@ -1314,6 +1314,85 @@
          ,@(nreverse tests)))))
 
 
+(defun dmc-parse-group-spec (spec)
+  "Parse a long-form method-group specifier SPEC into
+   (values group-var patterns order-form required-form).
+   SPEC = (group-var qualifier-pattern... [:order O] [:required R]
+           [:description D]).  Patterns run from after GROUP-VAR up to the
+   first keyword.  ORDER/REQUIRED default forms preserve CLHS defaults
+   (:most-specific-first, NIL)."
+  (let* ((group-var (car spec))
+         (rest (cdr spec))
+         (patterns nil)
+         (order-form '':most-specific-first)
+         (required-form 'nil))
+    ;; Collect patterns until the first keyword.
+    (loop while (and rest (not (keywordp (car rest))))
+          do (push (car rest) patterns) (pop rest))
+    (setq patterns (nreverse patterns))
+    ;; Parse keyword options.
+    (loop while rest
+          do (let ((k (car rest)) (v (cadr rest)))
+               (cond
+                 ((eq k :order) (setq order-form v))
+                 ((eq k :required) (setq required-form v))
+                 ((eq k :description) nil)  ; ignored — doc only
+                 (t nil))
+               (setq rest (cddr rest))))
+    (values group-var patterns order-form required-form)))
+
+(defun rewrite-dmc-long-form (mc-name options)
+  "Rewrite a long-form DEFINE-METHOD-COMBINATION into a registration of a
+   builder closure.  OPTIONS = (lambda-list method-group-specs . body).
+
+   The builder, given the applicable methods and the combination's runtime
+   args, partitions the methods into the declared groups (signalling on a
+   method that matches no group, or an empty :required group), binds the
+   combination lambda-list params + the group vars, and evaluates BODY to
+   produce the effective-method form."
+  (let* ((lambda-list (car options))
+         (group-specs  (cadr options))
+         (body-and-aux (cddr options))
+         ;; Skip (:arguments ...) / (:generic-function ...) option forms and
+         ;; declarations at the head of the body; keep the rest as BODY.
+         (body
+          (let ((b body-and-aux))
+            (loop while (and b (consp (car b))
+                             (member (car (car b))
+                                     '(:arguments :generic-function declare)))
+                  do (pop b))
+            b))
+         ;; Per-group parsed records + the group-var binding list.
+         (group-rec-forms nil)
+         (group-var-bindings nil)
+         (gi 0))
+    (dolist (spec group-specs)
+      (multiple-value-bind (gv patterns order-form required-form)
+          (dmc-parse-group-spec spec)
+        (push `(list (quote ,patterns) ,order-form ,required-form)
+              group-rec-forms)
+        (push `(,gv (%dmc-nth %dmc-groups ,gi)) group-var-bindings)
+        (incf gi)))
+    (setq group-rec-forms (nreverse group-rec-forms))
+    (setq group-var-bindings (nreverse group-var-bindings))
+    ;; Build the registration form.  The inner lambda binds the combination
+    ;; params from %dmc-cargs via APPLY (handles &optional/&key/&rest); its
+    ;; body partitions and binds the group vars, then runs BODY.
+    `(%define-method-combination-long
+      (quote ,mc-name)
+      (function
+       (lambda (%dmc-applicable %dmc-cargs)
+         (apply
+          (function
+           (lambda ,lambda-list
+             (let* ((%dmc-group-recs (list ,@group-rec-forms))
+                    (%dmc-groups
+                     (%dmc-partition-groups %dmc-applicable %dmc-group-recs))
+                    ,@group-var-bindings)
+               ,@(if body body (list nil)))))
+          %dmc-cargs)))
+      ,(length group-specs))))
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -2087,14 +2166,20 @@
          (when (consp opt)
            (cond
              ((eq (car opt) :method-combination)
-              ;; (:method-combination NAME [:most-specific-last]) — encode
-              ;; the ordering as (NAME . :MOST-SPECIFIC-LAST) so
-              ;; %gf-dispatch can reverse the primary order.
-              ;; :most-specific-first is the default and stays bare.
-              (setq combination
-                    (if (eq (caddr opt) :most-specific-last)
-                        (cons (cadr opt) :most-specific-last)
-                        (cadr opt))))
+              ;; (:method-combination NAME [args...]) — three encodings:
+              ;;  - bare NAME (no args): the symbol NAME
+              ;;  - short form with :most-specific-last: (NAME . :MOST-SPECIFIC-LAST)
+              ;;  - long form with combination args: (NAME arg1 arg2 ...)
+              ;;    so %gf-dispatch-custom-long can read (cdr comb-raw) as the
+              ;;    combination args list and APPLY them to the builder's
+              ;;    lambda-list.
+              (let ((cargs (cddr opt)))
+                (setq combination
+                      (cond
+                        ((null cargs) (cadr opt))
+                        ((and (null (cdr cargs)) (eq (car cargs) :most-specific-last))
+                         (cons (cadr opt) :most-specific-last))
+                        (t (cons (cadr opt) cargs))))))
              ((eq (car opt) :argument-precedence-order)
               (setq apo (cdr opt)))
              ((eq (car opt) :method)
@@ -2285,23 +2370,36 @@
             (%dg-gf-callable ',gf-name)))))
 
     ;; (define-method-combination name &rest options)
-    ;; Short form: (define-method-combination name :operator op :documentation ... :identity-with-one-argument t)
+    ;; SHORT form: (define-method-combination name :operator op
+    ;;               :documentation ... :identity-with-one-argument t)
+    ;;   — the args after NAME start with a keyword, or there are none.
+    ;; LONG form:  (define-method-combination name (lambda-list)
+    ;;               ((group-var qualifier-pattern... [:order o] [:required r]
+    ;;                 [:description d]) ...)
+    ;;               [(:arguments ...)] [(:generic-function ...)]
+    ;;               [declarations] [doc] body...)
+    ;;   — the first arg after NAME is the combination lambda-list (a list
+    ;;     or NIL), never a keyword.
     ((and (eq (car form) 'define-method-combination) (cdr form))
      (let* ((mc-name (cadr form))
-            (options (cddr form))
-            (operator mc-name)
-            (identity-with-one nil))
-       (let ((cur options))
-         (loop
-           (when (null cur) (return))
-           (let ((key (car cur)) (val (cadr cur)))
-             (cond
-               ((eq key :operator) (setq operator val))
-               ((eq key :identity-with-one-argument) (setq identity-with-one val))
-               ((eq key :documentation) nil)  ; ignored
-               (t nil)))
-           (setq cur (cddr cur))))
-       `(%define-method-combination ',mc-name ',operator ,identity-with-one)))
+            (options (cddr form)))
+       (if (or (null options) (keywordp (car options)))
+           ;; ---- SHORT FORM ----
+           (let ((operator mc-name)
+                 (identity-with-one nil))
+             (let ((cur options))
+               (loop
+                 (when (null cur) (return))
+                 (let ((key (car cur)) (val (cadr cur)))
+                   (cond
+                     ((eq key :operator) (setq operator val))
+                     ((eq key :identity-with-one-argument) (setq identity-with-one val))
+                     ((eq key :documentation) nil)  ; ignored
+                     (t nil)))
+                 (setq cur (cddr cur))))
+             `(%define-method-combination ',mc-name ',operator ,identity-with-one))
+           ;; ---- LONG FORM ----
+           (rewrite-dmc-long-form mc-name options))))
 
     ;; (defmethod slot-unbound (...) body...) → defun + %add-slot-unbound-method
     ;; Specializer on obj (2nd param) by class name and slot-name (3rd param)

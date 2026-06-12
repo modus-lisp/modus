@@ -1966,6 +1966,305 @@
     ;; Return the name (CLHS says define-method-combination returns the name)
     name))
 
+;;; ============================================================
+;;; Method Combination (long form)
+;;; ============================================================
+;;;
+;;; A long-form combination is stored as a 5-slot array, distinct from the
+;;; 4-slot short-form mc so %mc-long-p can tell them apart while both live
+;;; in the single *method-combinations* registry (%find-mc finds either):
+;;;   slot [0] = '%method-combination-long  (marker)
+;;;   slot [1] = name
+;;;   slot [2] = builder-fn   — fn (applicable-methods combination-args) →
+;;;                             effective-method FORM.  The builder does the
+;;;                             method-group partition (so :order / :required
+;;;                             forms evaluate in the combination's lexical
+;;;                             scope), binds the group vars + the combination
+;;;                             lambda-list params, and runs the body, which
+;;;                             returns the emf form.
+;;;   slot [3] = nparams      — number of required combination lambda-list
+;;;                             params (for arity validation against the
+;;;                             defgeneric :method-combination args)
+;;;   slot [4] = doc          — documentation string or NIL
+(defun %make-mc-long (name builder-fn nparams doc)
+  (let ((mc (make-array 5)))
+    (aset mc 0 '%method-combination-long)
+    (aset mc 1 name)
+    (aset mc 2 builder-fn)
+    (aset mc 3 nparams)
+    (aset mc 4 doc)
+    mc))
+
+(defun %mc-long-p (x)
+  (if (or (fixnump x) (consp x) (null x)) nil
+    (if (= (obj-subtag x) #x32)
+      (if (>= (array-length x) 1)
+        (eq (aref x 0) '%method-combination-long)
+        nil)
+      nil)))
+
+(defun %mc-long-name (mc)    (aref mc 1))
+(defun %mc-long-builder (mc) (aref mc 2))
+(defun %mc-long-nparams (mc) (aref mc 3))
+
+(defun %define-method-combination-long (name builder-fn nparams)
+  "Register a long-form method combination NAME.  BUILDER-FN, given the
+   applicable methods and the combination args, returns the effective
+   method FORM.  Returns NAME (CLHS)."
+  (let ((mc (%make-mc-long name builder-fn nparams nil)))
+    (let ((new-reg nil)
+          (cur *method-combinations*))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (eq (car (car cur)) name))
+          (setq new-reg (cons (car cur) new-reg)))
+        (setq cur (cdr cur)))
+      (setq *method-combinations* (cons (cons name mc) new-reg)))
+    name))
+
+;;; --- Method-group qualifier-pattern matching ---
+;;;
+;;; A group specifier lists one or more qualifier patterns.  Per CLHS
+;;; 7.6.6.2:
+;;;   *            matches ANY method (used for the catch-all group)
+;;;   ()  / nil    matches an UNQUALIFIED method (qualifier list is empty)
+;;;   (sym)        matches a method with exactly that one qualifier
+;;;   sym          (bare symbol) means "single qualifier = sym"
+;;; Modus stores a method's qualifier as a single value (nil = unqualified,
+;;; or a symbol like FOO / :AROUND).  We match accordingly.
+(defun %dmc-qual-pattern-matches-p (pattern method-qualifier)
+  "True if PATTERN (one qualifier-pattern from a method-group spec) matches
+   a method whose stored qualifier is METHOD-QUALIFIER (nil = unqualified)."
+  (cond
+    ;; * matches everything.
+    ((and (symbolp pattern) (not (null pattern))
+          (string= (symbol-name pattern) "*")) t)
+    ;; nil / () pattern matches an unqualified method.
+    ((null pattern) (null method-qualifier))
+    ;; (sym) list pattern — single qualifier match.
+    ((consp pattern)
+     (and (null (cdr pattern))
+          (not (null method-qualifier))
+          (symbolp method-qualifier)
+          (symbolp (car pattern))
+          (string= (symbol-name (car pattern)) (symbol-name method-qualifier))))
+    ;; bare symbol pattern — single qualifier match.
+    ((and (symbolp pattern) (not (null method-qualifier))
+          (symbolp method-qualifier))
+     (string= (symbol-name pattern) (symbol-name method-qualifier)))
+    (t nil)))
+
+(defun %dmc-method-matches-group-p (patterns method)
+  "True if METHOD matches any of PATTERNS (a method-group's qualifier
+   patterns)."
+  (let ((q (%method-qualifier method))
+        (cur patterns))
+    (loop
+      (when (null cur) (return nil))
+      (when (%dmc-qual-pattern-matches-p (car cur) q) (return t))
+      (setq cur (cdr cur)))))
+
+(defun %dmc-apply-order (methods order)
+  "Order a group's METHODS per ORDER.  METHODS arrive most-specific-first
+   (the order %collect-applicable-methods produced).  :most-specific-last
+   reverses; anything else keeps most-specific-first."
+  (cond
+    ((null order) methods)
+    ((and (symbolp order)
+          (string= (symbol-name order) "MOST-SPECIFIC-LAST"))
+     (reverse methods))
+    (t methods)))
+
+;;; --- Effective-method-form evaluation ---
+;;;
+;;; The builder body returns an effective-method FORM built from the
+;;; selected method objects.  Rather than route that form through the full
+;;; runtime evaluator (the embedded method records are conses that EVAL
+;;; would try to call), %dmc-eval-emf interprets the limited sublanguage
+;;; the long-form bodies use: VECTOR, LIST, CALL-METHOD, MAKE-METHOD,
+;;; QUOTE, PROGN, AND, OR, plus self-evaluating leaves.
+
+;; Holds the generic function's runtime arguments while a long-form
+;; effective method runs, so CALL-METHOD invokes each method with the
+;; original GF args (CLHS 7.6.6.1 — a method is run on the GF args).
+;; make-method-wrapped fns ignore args; ordinary methods need them.
+;; defvar default NIL (CLAUDE.md item 7); %gf-dispatch-custom-long sets it
+;; with save/restore (Modus LET doesn't dynamically bind a defvar).
+(defvar *%dmc-call-args* nil)
+
+(defun %dmc-emf-call-method (method)
+  "Invoke METHOD (a method record) with the current GF args (held in
+   *%dmc-call-args*) for CALL-METHOD inside an effective-method form."
+  (let ((fn (%method-fn method)))
+    (apply fn *%dmc-call-args*)))
+
+(defun %dmc-eval-emf (form)
+  "Interpret an effective-method FORM produced by a long-form combination
+   body.  Supports VECTOR / LIST / CALL-METHOD / MAKE-METHOD / QUOTE /
+   PROGN / AND / OR and self-evaluating leaves."
+  (cond
+    ((null form) nil)
+    ((not (consp form)) form)
+    (t
+     (let ((head (car form)))
+       (cond
+         ((not (symbolp head))
+          ;; Non-symbol head — a method record or other datum; pass through.
+          form)
+         ((string= (symbol-name head) "QUOTE")
+          (cadr form))
+         ((string= (symbol-name head) "CALL-METHOD")
+          ;; (call-method METHOD [next-methods]) — METHOD is an embedded
+          ;; method record (literal), not a sub-form to evaluate.
+          (%dmc-emf-call-method (cadr form)))
+         ((string= (symbol-name head) "MAKE-METHOD")
+          ;; (make-method FORM) → a method record wrapping FORM; when the
+          ;; surrounding emf call-methods it, FORM is evaluated.
+          (make-method (cadr form)))
+         ((string= (symbol-name head) "VECTOR")
+          (%dmc-list-to-vector (%dmc-eval-emf-args (cdr form))))
+         ((string= (symbol-name head) "LIST")
+          (%dmc-eval-emf-args (cdr form)))
+         ((string= (symbol-name head) "PROGN")
+          (let ((vals (%dmc-eval-emf-args (cdr form))) (last nil) (c nil))
+            (setq c vals)
+            (loop (when (null c) (return last))
+                  (setq last (car c)) (setq c (cdr c)))))
+         ((string= (symbol-name head) "AND")
+          (let ((c (cdr form)) (acc t))
+            (loop (when (null c) (return acc))
+                  (setq acc (%dmc-eval-emf (car c)))
+                  (when (null acc) (return nil))
+                  (setq c (cdr c)))))
+         ((string= (symbol-name head) "OR")
+          (let ((c (cdr form)) (acc nil))
+            (loop (when (null c) (return acc))
+                  (setq acc (%dmc-eval-emf (car c)))
+                  (when acc (return acc))
+                  (setq c (cdr c)))))
+         (t
+          ;; Unknown operator — fall back to the general evaluator.
+          (eval form)))))))
+
+(defun %dmc-eval-emf-args (forms)
+  "Evaluate each form in FORMS via %dmc-eval-emf, returning a fresh list."
+  (let ((acc nil) (cur forms))
+    (loop
+      (when (null cur) (return (nreverse acc)))
+      (setq acc (cons (%dmc-eval-emf (car cur)) acc))
+      (setq cur (cdr cur)))))
+
+(defun %dmc-list-to-vector (lst)
+  "Build a simple-vector from list LST."
+  (let* ((n (length lst))
+         (v (make-array n))
+         (i 0)
+         (cur lst))
+    (loop
+      (when (null cur) (return v))
+      (let ((dummy (aset v i (car cur)))) dummy)
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))))
+
+;;; --- Method-group partition (CLHS 7.6.6.2) ---
+;;;
+;;; GROUP-RECS is a list of (patterns order required-p) — one per method
+;;; group, in declaration order.  Each APPLICABLE method is assigned to the
+;;; FIRST group whose patterns match it.  A method matching no group is an
+;;; error.  A :required group left empty is an error.  Returns the list of
+;;; per-group ordered method lists (parallel to GROUP-RECS).
+(defun %dmc-group-rec-patterns (r) (car r))
+(defun %dmc-group-rec-order (r)    (cadr r))
+(defun %dmc-group-rec-required (r) (caddr r))
+
+(defun %dmc-partition-groups (applicable group-recs)
+  "Partition APPLICABLE methods into the method groups GROUP-RECS.  Signals
+   an error on a method matching no group, or an empty :required group.
+   Returns a list of ordered method-lists (one per group)."
+  ;; Build per-group accumulators (most-specific-first preserved by walking
+  ;; APPLICABLE in order and appending).  We collect reversed then nreverse.
+  (let ((rev-lists nil) (gr group-recs))
+    ;; Initialize one empty accumulator per group.
+    (loop (when (null gr) (return nil))
+          (setq rev-lists (cons nil rev-lists))
+          (setq gr (cdr gr)))
+    (setq rev-lists (nreverse rev-lists))   ; list of NILs, parallel to recs
+    ;; Assign each applicable method to its first matching group.
+    (let ((cur applicable))
+      (loop
+        (when (null cur) (return nil))
+        (let ((m (car cur)) (gi 0) (placed nil) (recs group-recs) (accs rev-lists))
+          (loop
+            (when (or placed (null recs)) (return nil))
+            (when (%dmc-method-matches-group-p (%dmc-group-rec-patterns (car recs)) m)
+              ;; Prepend m onto this group's accumulator (in-place via nth).
+              (%dmc-nth-cons-push accs gi m)
+              (setq placed t))
+            (setq gi (+ gi 1))
+            (setq recs (cdr recs)))
+          (when (null placed)
+            (error "method matches no method-combination group")))
+        (setq cur (cdr cur))))
+    ;; Finalize: reverse each accumulator (we pushed → reversed), apply
+    ;; :order, and check :required.
+    (let ((result nil) (recs group-recs) (accs rev-lists))
+      (loop
+        (when (null recs) (return (nreverse result)))
+        (let* ((methods (nreverse (car accs)))
+               (rec (car recs)))
+          (when (and (%dmc-group-rec-required rec) (null methods))
+            (error "required method-combination group is empty"))
+          (setq result (cons (%dmc-apply-order methods (%dmc-group-rec-order rec))
+                             result)))
+        (setq recs (cdr recs))
+        (setq accs (cdr accs))))))
+
+;; Because Modus's mutable-closure cells are global, we can't reliably
+;; mutate a captured per-group accumulator inside the partition loop.  We
+;; instead keep the accumulators in a single list and splice via index.
+;; %dmc-nth-cons-push prepends VAL to the GI-th element of the list ACCS,
+;; mutating that cons in place with setf-of-car.
+(defun %dmc-nth-cons-push (accs gi val)
+  "Prepend VAL onto (nth GI ACCS), mutating the GI-th cons of ACCS."
+  (let ((cur accs) (i 0))
+    (loop
+      (when (= i gi) (return nil))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    (setf (car cur) (cons val (car cur))))
+  accs)
+
+(defun %dmc-nth (lst n)
+  "0-based nth element of LST (local helper to avoid relying on global nth
+   semantics during dispatch)."
+  (let ((cur lst) (i 0))
+    (loop
+      (when (null cur) (return nil))
+      (when (= i n) (return (car cur)))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))))
+
+;;; --- Long-form dispatch ---
+(defun %gf-dispatch-custom-long (gf args applicable mc)
+  "Long-form method combination dispatch.  Runs the combination's builder
+   (which partitions APPLICABLE into method groups, binds params + group
+   vars, and returns the effective-method FORM) then interprets that form.
+   Binds *%dmc-call-args* to ARGS (save/restore — Modus LET doesn't
+   dynamically bind a defvar) so CALL-METHOD runs each method on the GF's
+   own arguments."
+  (let* ((comb-raw (%gf-combination gf))
+         (cargs (if (consp comb-raw) (cdr comb-raw) nil))
+         (builder (%mc-long-builder mc))
+         (saved-args *%dmc-call-args*))
+    (setq *%dmc-call-args* args)
+    (let ((emf (funcall builder applicable cargs)))
+      ;; emf is built before any method runs; partition errors propagate
+      ;; here (caught by the test's handler-case).  Restore on normal exit;
+      ;; an error unwinds straight past (the next dispatch re-sets it).
+      (let ((result (%dmc-eval-emf emf)))
+        (setq *%dmc-call-args* saved-args)
+        result))))
+
 (defun %register-gf-default-primary (gf-name default-fn-sym)
   "Register DEFAULT-FN-SYM as the standard primary fallback for GF-NAME.
    When %gf-dispatch-standard finds no applicable primary method (only
@@ -2804,10 +3103,16 @@
         (if comb-name
           ;; Custom method combination
           (let ((mc (%find-mc comb-name)))
-            (if mc
-              (%gf-dispatch-custom gf args applicable mc msl)
-              ;; Unknown combination — fall through to standard
-              (%gf-dispatch-standard gf args applicable)))
+            (cond
+              ((null mc)
+               ;; Unknown combination — fall through to standard
+               (%gf-dispatch-standard gf args applicable))
+              ;; Long-form combination: route to the long dispatcher, which
+              ;; partitions APPLICABLE into method groups and runs the body.
+              ((%mc-long-p mc)
+               (%gf-dispatch-custom-long gf args applicable mc))
+              (t
+               (%gf-dispatch-custom gf args applicable mc msl))))
           ;; Standard method combination
           (%gf-dispatch-standard gf args applicable))))))
 

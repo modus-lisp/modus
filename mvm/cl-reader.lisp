@@ -1067,12 +1067,22 @@
   "Read a list until closing paren."
   (let ((result nil) (tail nil) (dotted nil))
     (loop
-      ;; Skip whitespace
+      ;; Skip whitespace AND line comments.  Comments must be skipped HERE
+      ;; (not delegated to %read-internal) so that a `;'-comment appearing
+      ;; immediately before a consing dot — e.g. `(a b ;c\n . tail)' in uiop's
+      ;; pathname-root/pathname-host-pathname — lands the loop directly on the
+      ;; `.' and triggers the consing-dot branch below.  Without this the `;'
+      ;; fell through to %read-internal, whose %read-skip-whitespace consumed
+      ;; the comment AND the trailing whitespace, then tried to read the lone
+      ;; `.' as a token and signalled a reader-error (dot context lost).
       (let ((ch nil))
         (loop
           (setq ch (read-char stream nil nil t))
           (when (null ch) (%reader-error "end of file reading list"))
-          (unless (%whitespace-char-p ch) (return nil)))
+          (cond
+            ((%whitespace-char-p ch) nil)               ; keep skipping
+            ((eql ch #\;) (%skip-line-comment stream))  ; skip comment, keep going
+            (t (return nil))))
         ;; Check for close paren
         (when (eql ch #\))
           (if *read-suppress*

@@ -82,16 +82,86 @@ across buffer boundaries round-trips; multi-char `#\Name` and `#:foo`
 uninterned literals (bare, in lists, and under suppress) all read; the
 `#+feature` skip and nested `#+(or …)` skips all read.
 
-Hand-off: the next allocation site to audit is the `#.` path —
-`%read-sharpsign` (mvm/cl-reader.lisp ~1439) calls `(eval obj)` while the
-reader's in-progress list accumulator and the file-stream's heap `buf`
-string are live.  If either is not a GC root during that eval (or the
-translator's GC root-scan misses the reader's C-stack temporaries), an
-allocation inside the evaled form forwards everything else but strands
-the reader's partial state → the next deref signals.  This matches the
-translate-x64.lisp comment (~line 3530) that scan-semantics changes move
-the gauntlet between forms 36/44, and the older define-package GC-fault
-section below.  **Off-limits to the reader/eval/packages seat.**
+#### 2026-06-12 update — narrowed to a MISSING-ROOT for a LEXICAL local across GC
+
+The `#.`/reader framing above is a red herring: the same fault reproduces
+with **no reader and no `#.`** at all.  The minimal deterministic
+reproducer (3/3 runs, ~11s) is just **a live value held in a lexical
+binding across an allocation loop that triggers one GC**:
+
+```lisp
+;; /tmp/modus this.lisp  — process dies (nothing printed), deterministic
+(defun fsc ()
+  (let ((keep (cons 111 222)) (i 0))
+    (loop (when (>= i 16000) (return nil))   ; ~640MB of make-string → 1 GC
+          (make-string 5000) (setq i (+ i 1)))
+    keep))                                    ; keep is corrupt after the GC
+(let ((r (fsc))) (write-string-serial "car=")(print-dec (car r)))
+```
+
+`keep` can even be a **fixnum** (`(let ((keep 999) …))`) — the value type
+is irrelevant, so it is NOT a value-forwarding bug.  It faults during the
+loop's GC and the resumed body can't deref `keep`.
+
+**Decisive test — global survives, lexical local does not:**
+
+```lisp
+(defvar *keep* nil) (setq *keep* (cons 111 222))
+(let ((i 0)) (loop (when (>= i 16000) (return nil)) (make-string 5000) (setq i (+ i 1))))
+(print-dec (car *keep*))      ;; => 111, gc=1  — SURVIVES
+```
+
+Holding the identical cons in a **global** (rooted via the globals alist
+at `0x10000080`, which the trampoline scans) survives the GC perfectly.
+Holding it in a **lexical local** loses it.  A false-forward (the
+conservative-scan hazard) would corrupt the global too — it does not.
+**Therefore this is a MISSING ROOT specific to the lexical-binding path,
+not a false-forward and not fresh-payload garbage.**
+
+Ruled out this session (don't re-chase):
+
+  - **R15 is NOT a gap.**  R15 is the dedicated NIL-constant register
+    (`mov r15, 0xDEAD0001` in boot-linux-x64.lisp ~L348; VN in the vreg
+    map).  The trampoline omits it from its 12-reg save set, but that is
+    correct — it always holds NIL, never a heap root.  Adding R15 to the
+    save/scan/restore set (built + tested) does NOT fix the fault.
+  - **The trampoline's save/scan/restore set is otherwise complete.**  It
+    saves rax,rsi,rdi,r8,r9,rbx,rcx,rdx,r10,r11,r13,rbp; that is exactly
+    the allocatable GP vregs V0–V8 + RAX(VR) + R13.  Push order and the
+    reversed pop order MATCH (verified register-by-register).  Spilled
+    vregs V9–V15 live in stack frame slots and the stack scan ([RBP,
+    stack_base)) covers them.
+  - **Zero-initialising fresh alloc payloads is NOT the fix.**  Built
+    alloc-obj / alloc-array / alloc-string payload-zeroing (inline MOV loop
+    for small obj; R11 byte-index countdown loop for dynamic array/string;
+    `mov [r12+r11],0` verified correct via objdump).  alloc-obj-only is
+    behaviourally identical to baseline (gc-count matches) but does NOT fix
+    the missing-root fault (the live local is still lost).  The
+    array/string variants additionally PERTURB GC firing (gc-count 1 → 0 on
+    the discard-result burn loop) for an unresolved reason — do NOT ship
+    payload-zeroing for array/string without root-causing that
+    interaction.  All reverted; tree is clean.
+
+Hand-off — where the missing root must be: the corrupted value lives in a
+lexical binding, reachable only through the interpreter's `env` alist
+(`%env-extend` conses) threaded as the `env` argument through the
+`%eval`/`%eval-progn`/simple-`LOOP` (`(loop (%eval-progn args env))`,
+cl-eval.lisp ~L3022) call chain.  Those are COMPILED native frames, so
+`env` should be a scanned stack/register root — yet the GC loses it while
+the globals-alist root survives.  Next steps for the GC seat: (1) confirm
+whether `env` at the make-string GC instant sits in a frame slot the stack
+scan reaches, or in a transient register window (e.g. spilled to an
+RSP-relative slot BELOW the trampoline's captured RBP, i.e. in red-zone /
+outgoing-arg territory the `[RBP, stack_base)` walk skips); (2) check the
+stack-scan START — it begins at the trampoline's RBP (= RSP after its
+pushes); any live root pushed by the CALLER as an outgoing argument below
+the `call gc_trampoline` return address but above RBP is in range, but a
+value the compiler parked at `[RSP-8]` (red zone) before the gc-check call
+would be BELOW RBP and unscanned.  The deterministic (not layout-flaky)
+nature points at a systematic such slot, not a coincidental false
+positive.  **Off-limits to the reader/eval/packages seat — this is a GC
+root-set / calling-convention defect, surfaced by any GC with a live
+lexical local, of which the gauntlet `#.` eval is one instance.**
 
 ### OPEN — forms 43/44 `%eval-escape` leak from `(featurep …)` (reader/eval track)
 

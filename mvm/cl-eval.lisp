@@ -1038,11 +1038,13 @@
   (handler-case
     (%eval-progn forms env)
     (t (c)
-      (declare (ignore c))
       (let ((val (%eval-escape-pop-if name)))
         (if (eq val :%eval-no-escape)
-            ;; Not for us — re-signal so an outer handler can catch.
-            (error "%eval-escape")
+            ;; Not one of our RETURN-FROM escapes — re-raise the ORIGINAL
+            ;; condition C (a genuine error signalled inside the block) so
+            ;; an outer handler sees its real type/message instead of a
+            ;; masked "%eval-escape".
+            (error c)
             (%eval-escape-return val))))))
 
 ;;; ============================================================
@@ -1695,10 +1697,15 @@
                 (dolist (act body)
                   (%loop-run-action act step-env acc-state)))))
         (t (c)
-          (declare (ignore c))
           (let ((val (%eval-escape-pop-if nil)))
             (if (eq val :%eval-no-escape)
-                (error "%eval-escape")
+                ;; Not one of our RETURN/RETURN-FROM escapes — it's a
+                ;; genuine error signalled inside the loop body (e.g. uiop
+                ;; detect-os's `(error "…")' when no OS feature matches).
+                ;; Re-raise the ORIGINAL condition C so its real type and
+                ;; message reach the caller's handler, instead of masking
+                ;; it as a generic "%eval-escape" SIMPLE-ERROR.
+                (error c)
                 (return-from %loop-execute (%eval-escape-return val))))))
       ;; finally — wrap in handler-case so a `(return X)` or
       ;; `(return-from NIL X)` form inside finally (the parenthesised
@@ -1747,12 +1754,14 @@
         (handler-case
           (dolist (f finally) (%eval-in-env f fin-env))
           (t (c)
-            (declare (ignore c))
             (let ((val (%eval-escape-pop-if nil)))
               (unless (eq val :%eval-no-escape)
                 (return-from %loop-execute (%eval-escape-return val)))
-              ;; not the escape we expect → re-signal
-              (error "%eval-escape")))))
+              ;; not one of our escapes → re-raise the ORIGINAL condition C
+              ;; (a real `(error …)' in the FINALLY clause, e.g. detect-os's
+              ;; no-OS error), preserving its type/message rather than
+              ;; masking it as a generic "%eval-escape".
+              (error c)))))
       ;; Resolve return value.
       (cond
         (return-form (%eval-in-env return-form env))
@@ -2902,10 +2911,10 @@
          (handler-case
            (%eval-progn body env)
            (t (c)
-             (declare (ignore c))
              (let ((val (%eval-escape-pop-if bname)))
                (if (eq val :%eval-no-escape)
-                   (error "%eval-escape")
+                   ;; genuine error inside the block — re-raise original C
+                   (error c)
                    (%eval-escape-return val)))))))
       ;; RETURN-FROM — push (name . value) onto escape stack + signal.
       ;; Capture multiple values via multiple-value-list so a form like
@@ -2989,10 +2998,10 @@
          (handler-case
            (%eval-progn body env)
            (t (c)
-             (declare (ignore c))
              (let ((val (%eval-escape-pop-if tag)))
                (if (eq val :%eval-no-escape)
-                   (error "%eval-escape")
+                   ;; genuine error inside the catch body — re-raise original C
+                   (error c)
                    (%eval-escape-return val)))))))
       ;; THROW — (throw TAG-FORM VALUE-FORM).  Push (tag . (cons '%mvs mvs))
       ;; onto escape stack so the surrounding CATCH with matching TAG
@@ -3021,10 +3030,10 @@
               (declare (ignore dummy))
               (loop (%eval-progn args env)))
             (t (c)
-              (declare (ignore c))
               (let ((val (%eval-escape-pop-if nil)))
                 (if (eq val :%eval-no-escape)
-                    (error "%eval-escape")
+                    ;; genuine error inside the simple-LOOP body — re-raise C
+                    (error c)
                     (%eval-escape-return val))))))))
       ;; VALUES
       ((%eval-sym-eq op "VALUES")
@@ -3068,7 +3077,6 @@
                  ;; Fell off end — exit TAGBODY normally
                  (return nil))
                (t (c)
-                 (declare (ignore c))
                  ;; Did the escape target one of OUR tags?  Pop only
                  ;; if matched, resume from that label.
                  (cond
@@ -3095,8 +3103,9 @@
                             (return nil))
                           (setq sub (cdr sub))))))
                    (t
-                    ;; Not for us — re-signal
-                    (error "%eval-escape"))))))
+                    ;; Not one of our GO tags — re-raise the original
+                    ;; condition C (a genuine error inside the tagbody).
+                    (error c))))))
            nil)))
       ;; GO — push tag onto escape stack and signal
       ((%eval-sym-eq op "GO")

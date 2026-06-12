@@ -2328,6 +2328,40 @@
       ;; %runtime-define-condition.
       ((%eval-sym-eq op "DEFINE-CONDITION")
        (%runtime-define-condition form env))
+      ;; DEFSETF — register a SETF expander at runtime EVAL.  The
+      ;; compile-time mvm-define-macro "DEFSETF" expander is an SBCL-side
+      ;; lambda that can't cross into the image, so the runtime macro
+      ;; table only knew the name; (defsetf NAME …) fell through to the
+      ;; funcall path and signalled %eval-escape (uiop's (defsetf getenv
+      ;; (x) (val) …) — gauntlet forms 44/56).  Store a descriptor in
+      ;; *setf-expanders* that the runtime SETF macro and
+      ;; get-setf-expansion consult via %find-setf-expander /
+      ;; %apply-setf-expander.  CLHS short + long forms:
+      ;;   (defsetf NAME setter-fn [doc])
+      ;;   (defsetf NAME (var…) (store-var…) body…)
+      ((%eval-sym-eq op "DEFSETF")
+       (let* ((accessor (car args))
+              (rest     (cdr args)))
+         (cond
+           ;; Long form: (defsetf NAME (vars…) (store-vars…) body…)
+           ((and (consp rest) (consp (car rest))
+                 (consp (cdr rest)) (consp (cadr rest)))
+            (let ((vars       (car rest))
+                  (store-vars (cadr rest))
+                  (body       (cddr rest)))
+              ;; Strip a leading docstring.
+              (when (and (stringp (car body)) (cdr body))
+                (setq body (cdr body)))
+              (%register-setf-expander
+               accessor
+               (cons :long (cons vars (cons store-vars body))))))
+           ;; Short form: (defsetf NAME setter-fn [doc])
+           ((and (consp rest)
+                 (or (%cl-sym-p (car rest)) (%native-mvm-sym-p (car rest))
+                     (%native-sym-p (car rest))))
+            (%register-setf-expander accessor (cons :short (car rest))))
+           (t nil))
+         accessor))
       ;; DEFMACRO — register an expander so subsequent forms in this
       ;; eval / load stream macroexpand through it.  The expander is
       ;; stored as a plain %interp-closure with the user's lambda-list
@@ -3295,17 +3329,23 @@
       ;; Macro call (CL sym or native MVM sym).  Must be checked BEFORE
       ;; the function-call branches: macros do not evaluate their args.
       ;; ONLY fires for a CALLABLE expander — runtime DEFMACRO stores
-      ;; an %interp-closure here.  macro-function returns T (a marker)
-      ;; for built-in compiler-macros like PUSH/POP/COND that the modus
-      ;; compiler implements directly; those are NOT expandable at
-      ;; runtime via funcall (would `(funcall T form nil)` → crash).
-      ;; For T markers, fall through to the function-call path; eval
-      ;; will then error with undefined-function, which the suite
-      ;; expects when it eval's a form that's only a compiler macro.
+      ;; an %interp-closure here.  Use %RAW-MACRO-EXPANDER, NOT
+      ;; macro-function: macro-function WRAPS the raw %interp-closure in a
+      ;; user-facing closure object (subtag #x52, via %interp-macro-shim)
+      ;; so `(funcall (macro-function 'X) form env)` works — but that
+      ;; wrapper is NOT an %interp-closure, so it would fall to the
+      ;; `(funcall mf form)` branch below and crash (the shim expects the
+      ;; macro's *args*, not the whole form).  This bug surfaced via
+      ;; uiop's runtime-DEFMACRO'd DEFINE-PACKAGE.  %raw-macro-expander
+      ;; returns the bare expander, mirroring macroexpand-1.
+      ;; A raw T marker means a compiler-only macro (PUSH/POP/COND/…)
+      ;; with no runtime expander — fall through to the function-call
+      ;; path; eval then errors with undefined-function, which the suite
+      ;; expects when it evals a form that's only a compiler macro.
       ((and (or (%cl-sym-p op) (%native-mvm-sym-p op))
-            (let ((mf (macro-function op)))
+            (let ((mf (%raw-macro-expander op)))
               (and mf (not (eq mf t)))))
-       (let* ((mf (macro-function op))
+       (let* ((mf (%raw-macro-expander op))
               (expanded (cond
                           ((%interp-closure-p mf)
                            (%call-interp-closure mf args))
@@ -5500,12 +5540,69 @@
   name)
 
 (defun %find-setf-expander (name)
-  "Return expander-fn registered for NAME via defsetf, or NIL."
+  "Return expander descriptor registered for NAME via DEFSETF, or NIL.
+   The value is a descriptor list — see %apply-setf-expander — NOT a
+   raw funcall'able lambda (Modus's closure-cell limitation makes a
+   captured-variable lambda per defsetf unreliable)."
   (let ((cur *setf-expanders*))
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) name) (return (cdr (car cur))))
       (setq cur (cdr cur)))))
+
+(defun %apply-setf-expander (descriptor place-args value-form)
+  "Expand a runtime DEFSETF place: DESCRIPTOR is what %find-setf-expander
+   returned.  PLACE-ARGS is the list of (already-form) place arguments;
+   VALUE-FORM is the new-value form.  Returns the expansion form.
+
+   Descriptors:
+     (:short . SETTER-SYM)
+        → (SETTER-SYM place-args... value-form)
+     (:long VARS STORE-VARS . BODY)        ; CLHS 5.1.1.2 long form
+        → (let* ((g-var1 pa1) … (g-store value-form))
+             <body evaluated with VARS→g-vars, STORE-VARS→g-stores>)"
+  (let ((kind (car descriptor)))
+    (cond
+      ((eq kind :short)
+       (let ((setter (cdr descriptor)))
+         (cons setter (append place-args (list value-form)))))
+      ((eq kind :long)
+       (let* ((vars        (cadr descriptor))
+              (store-vars   (caddr descriptor))
+              (body         (cdddr descriptor))
+              (var-gensyms   (mapcar (lambda (v)
+                                       (declare (ignore v))
+                                       (gensym "DSV"))
+                                     vars))
+              (store-gensyms (mapcar (lambda (v)
+                                       (declare (ignore v))
+                                       (gensym "DSS"))
+                                     store-vars))
+              ;; Evaluate the body with VARS bound to the var gensyms and
+              ;; STORE-VARS bound to the store gensyms — its return value
+              ;; IS the expansion (CLHS: body runs at macroexpansion time).
+              (expand-env nil))
+         (let ((vc vars) (gc var-gensyms))
+           (loop (when (null vc) (return nil))
+                 (setq expand-env (%env-extend (car vc) (car gc) expand-env))
+                 (setq vc (cdr vc)) (setq gc (cdr gc))))
+         (let ((sc store-vars) (gc store-gensyms))
+           (loop (when (null sc) (return nil))
+                 (setq expand-env (%env-extend (car sc) (car gc) expand-env))
+                 (setq sc (cdr sc)) (setq gc (cdr gc))))
+         (let ((expansion (%eval-progn body expand-env))
+               (bindings nil))
+           ;; (let* ((g-var pa) … (g-store value-form)) expansion)
+           (let ((gc var-gensyms) (pc place-args))
+             (loop (when (or (null gc) (null pc)) (return nil))
+                   (push (list (car gc) (car pc)) bindings)
+                   (setq gc (cdr gc)) (setq pc (cdr pc))))
+           (when store-gensyms
+             (push (list (car store-gensyms) value-form) bindings))
+           (list 'let* (nreverse bindings) expansion))))
+      (t
+       ;; Unknown descriptor shape — fall back to generic SET-accessor.
+       nil))))
 
 (defun get-setf-expansion (place &optional env)
   "Return five values: temp-vars, temp-vals, store-vars, store-form,
@@ -5534,9 +5631,9 @@
             (expander (and (symbolp accessor) (%find-setf-expander accessor))))
        (cond
          (expander
-          ;; User defsetf — call the expander with the temp vars.
+          ;; User defsetf — expand via the registered descriptor.
           (values temps args (list g)
-                  (funcall expander temps g)
+                  (%apply-setf-expander expander temps g)
                   (cons accessor temps)))
          (t
           ;; Fall through to (setf …) — the compiler's SETF macro will

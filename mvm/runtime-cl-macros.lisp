@@ -49,7 +49,11 @@
               ((eq acc 'first) (list 'rplaca (car args) value))
               ((eq acc 'rest) (list 'rplacd (car args) value))
               ((eq acc 'nth) (list 'rplaca (list 'nthcdr (car args) (cadr args)) value))
-              (t nil))))
+              (t
+               (let ((d (%find-setf-expander acc)))
+                 (if d
+                     (%apply-setf-expander d args value)
+                     nil))))))
          (t nil)))"
 
     "(defmacro incf (place &rest delta)

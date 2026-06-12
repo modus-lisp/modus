@@ -96,10 +96,12 @@ runtime/        Runtime type system
 
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,465 tests (recovered files keep entering the denominator)
-- Ran: 17,347
-- Passed: 15,355 (87.92% overall, 88.52% of those that ran)
-- Failed: 1,874
-- Lost-to-crash: 118
+- Ran: 17,403
+- Passed: 15,384 (88.08% overall, 88.40% of those that ran)
+- Failed: 2,019
+- Lost-to-crash: 62 (was 118 — the GC heap guard band c9c6278 recovered 56
+  crash-lost tests; most now run and fail honestly, which is why Failed
+  rose from 1,874 while Passed gained +29)
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

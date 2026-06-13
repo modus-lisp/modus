@@ -1487,6 +1487,10 @@
                 nil)
   (deftest 9723 (funcall (%cond-complement #'eql) 'a 'a) nil)
   (deftest 9724 (funcall (%cond-complement-rest #'eql) 'a 'a) nil)
+  ;; write-to-string repeated-keyword leftmost-wins (CLHS 3.4.1.4):
+  ;; (write-to-string 4 :base 10 :base 2) ⇒ base 10 ⇒ "4" (not "100").
+  (deftest 9725 (write-to-string 4 :base 10 :base 2) "4")
+  (deftest 9726 (write-to-string 7 :base 2 :base 10) "111")
   ;; signals-error on tree-equal arity
   (deftest 9730 (handler-case (progn (tree-equal) nil) (error (c) t)) t)
   (deftest 9731 (handler-case (progn (tree-equal '(a b)) nil) (error (c) t)) t)

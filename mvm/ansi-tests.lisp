@@ -2259,6 +2259,26 @@
     (deftest 9754 (eq k :test) t)
     (deftest 9755 (string= (symbol-name k) "TEST") t)
     (deftest 9756 (eq (symbol-package k) (find-package "KEYWORD")) t))
+  ;; ===== CASE-family probes 9560-9579 (Fable: ECASE/CCASE/CTYPECASE) =====
+  ;; typep sanity used by ETYPECASE/CTYPECASE catch-all clauses.
+  (run-test 9560 (lambda () (typep 1 'symbol)) 'nil)
+  (run-test 9561 (lambda () (typep 1 't)) 't)
+  (run-test 9562 (lambda () (etypecase 1 (symbol 'a) (t 'b))) 'b)
+  (run-test 9563 (lambda () (etypecase 1 (integer))) 'nil)
+  (run-test 9564 (lambda () (ctypecase 1 (symbol 'a) (t 'b))) 'b)
+  ;; ECASE positive-match + empty-body + list-keys.
+  (run-test 9565 (lambda () (ecase 'b (a 1) (b 2) (c 3))) '2)
+  (run-test 9566 (lambda () (ecase 'b ((a z) 1) ((y b w) 2) ((b c) 3))) '2)
+  (run-test 9567 (lambda () (ecase 'a (a) (b 'b))) 'nil)
+  (run-test 9568 (lambda () (ecase nil ((nil) 'a))) 'a)
+  ;; ECASE no-match → handler-case sees the signalled error → :err.
+  (run-test 9569 (lambda () (handler-case (ecase 'z (a 1) (b 2)) (error () :err))) ':err)
+  (run-test 9570 (lambda () (handler-case (ecase 'z (t 1)) (error () :err))) ':err)
+  ;; CCASE no-match also signals.
+  (run-test 9571 (lambda () (handler-case (ccase 'z (a 1) (b 2)) (error () :err))) ':err)
+  ;; ETYPECASE no-match signals.
+  (run-test 9572 (lambda () (handler-case (etypecase 1 (symbol 'a)) (error () :err))) ':err)
+  ;; ===== end CASE-family probes =====
   ;; CLOS gf-typep probes (2026-05-04): %register-gf-fn + typep should
   ;; recognise both ordinary symbol fn-names and (setf NAME) forms.
   ;; Renumbered 9770-4 to dodge ID collisions with deftests 9760-2 elsewhere.

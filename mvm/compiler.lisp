@@ -900,10 +900,35 @@
                                  (t `((eql ,tmp ',keys) ,@effective-body)))))
                            clauses))))))
 
-  ;; ECASE → CASE (same behavior for now; no error on mismatch)
+  ;; ECASE → LET + COND + EQL, signalling TYPE-ERROR on no-match.
+  ;; Unlike CASE, T and OTHERWISE are NOT special in ECASE — they are
+  ;; ordinary key designators (CLHS 5.3 "ecase").  A single (non-list)
+  ;; NIL key designates the EMPTY set of keys, so it can never match.
+  ;; On fall-through there is no default clause: we signal a TYPE-ERROR
+  ;; via %signal-type-error (returns NIL when no handler is active, same
+  ;; as the other compiler error helpers).
   (mvm-define-macro "ECASE"
     (lambda (form)
-      `(case ,@(cdr form))))
+      (let ((keyform (cadr form))
+            (clauses (cddr form))
+            (tmp (gensym "ECASE")))
+        `(let ((,tmp ,keyform))
+           (cond ,@(let ((out nil))
+                     (dolist (clause clauses)
+                       (let* ((keys (car clause))
+                              (body (cdr clause))
+                              (effective-body (or body '(nil))))
+                         (cond
+                           ;; (() ...) or single NIL key — empty keyset,
+                           ;; never matches; emit nothing.
+                           ((null keys) nil)
+                           ((listp keys)
+                            (push `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
+                                    ,@effective-body)
+                                  out))
+                           (t (push `((eql ,tmp ',keys) ,@effective-body) out)))))
+                     (nreverse out))
+                 (t (%signal-type-error)))))))
 
   ;; DOLIST → LET + LOOP.  Per CLHS body is an implicit tagbody.
   (mvm-define-macro "DOLIST"
@@ -3575,17 +3600,34 @@
                              clauses)))
           env dest)))
 
-      ;; ETYPECASE — like typecase but signals error on no match
-      ((= op-name 152261594881962774)
-       (compile-form `(typecase ,(cadr form) ,@(cddr form)) env dest))
+      ;; ETYPECASE / CTYPECASE — like TYPECASE but signal TYPE-ERROR on
+      ;; no-match (there is no implicit default).  A literal (t ...) or
+      ;; (otherwise ...) clause is still a legitimate catch-all here, since
+      ;; T / OTHERWISE name the universal type.  We build LET+COND like the
+      ;; TYPECASE macro, then append a (t (%signal-type-error)) fall-through.
+      ;; CTYPECASE is restartable in full CL; we degrade it to the
+      ;; ETYPECASE signalling behaviour (CLAUDE.md documented pattern).
+      ((or (= op-name 152261594881962774)    ; ETYPECASE
+           (= op-name 575883593470696800))   ; CTYPECASE
+       (let ((key-form (cadr form))
+             (clauses (cddr form))
+             (tmp (gensym "ETC")))
+         (compile-form
+          `(let ((,tmp ,key-form))
+             (cond ,@(mapcar (lambda (clause)
+                               (let* ((type (car clause))
+                                      (body (cdr clause))
+                                      (effective-body (or body '(nil))))
+                                 `((typep ,tmp ',type) ,@effective-body)))
+                             clauses)
+                   (t (%signal-type-error))))
+          env dest)))
 
-      ;; CTYPECASE — like typecase but restartable (simplified to etypecase)
-      ((= op-name 575883593470696800)
-       (compile-form `(typecase ,(cadr form) ,@(cddr form)) env dest))
-
-      ;; CCASE — like case but restartable (simplified to case)
+      ;; CCASE — like CASE but signals TYPE-ERROR on no-match (restartable
+      ;; in full CL; degraded to the ECASE signalling behaviour per the
+      ;; CLAUDE.md documented pattern).  T / OTHERWISE are ordinary keys.
       ((= op-name 53423618847963656)
-       (compile-form `(case ,(cadr form) ,@(cddr form)) env dest))
+       (compile-form `(ecase ,(cadr form) ,@(cddr form)) env dest))
 
       ;; --- Function Call (default) ---
       ;; Declaration no-ops (compile to nil). The runtime doesn't

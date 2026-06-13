@@ -200,6 +200,9 @@
               (setq i (+ i 1)))))))))
 
 (defun make-string-input-stream (str &rest args)
+  ;; CLHS: (make-string-input-stream string &optional start end).
+  ;; A 4th positional argument is a program-error.
+  (when (cddr args) (%signal-program-error))
   (let ((start (if args (car args) 0))
         (end (if (cdr args) (cadr args) nil)))
     (let ((actual-str (if (or (> start 0) end)

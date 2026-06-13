@@ -2242,6 +2242,58 @@
   ;; is the compiler return-from-across-closure gap (compiler.lisp owns
   ;; *block-labels* lexical-jump return-from), NOT a cl-conditions bug.
   ;; ==== end CND probe block 9700-9719 ====
+  ;; ==== Fable probe block 9520-9539: cross-unit RETURN-FROM / THROW ====
+  ;; The run-test eager-THUNK path: the whole form is compiled as a closure
+  ;; body, and the return-from / throw lives inside a NESTED lambda handler.
+  ;; That is a cross-compilation-unit non-local exit.  Same forms PASS as
+  ;; deftest probes (9700/9703) but FAILED here pre-fix — that asymmetry IS
+  ;; the cross-unit return-from bug (compiler.lisp *nonlocal-blocks*).
+  (run-test 9520 (lambda ()
+                   (block foo
+                     (funcall (lambda () (return-from foo 42)))
+                     99))
+            '42)
+  (run-test 9521 (lambda ()
+                   (catch 'tag
+                     (funcall (lambda () (throw 'tag 42)))
+                     99))
+            '42)
+  (run-test 9522 (lambda ()
+                   (block foo
+                     (handler-bind ((error (lambda (c) (declare (ignore c))
+                                             (return-from foo 'good))))
+                       (error "an error"))))
+            ''good)
+  (run-test 9523 (lambda ()
+                   (block foo
+                     (handler-bind ((error #'(lambda (c) (declare (ignore c))
+                                               (return-from foo 'good))))
+                       (error "an error"))))
+            ''good)
+  ;; nested blocks same name → innermost resolves:
+  (run-test 9524 (lambda ()
+                   (block foo
+                     (block foo
+                       (funcall (lambda () (return-from foo 1))))
+                     2))
+            '2)
+  ;; unwind-protect cleanup must still run on cross-unit non-local exit:
+  (run-test 9525 (lambda ()
+                   (let ((acc nil))
+                     (block foo
+                       (unwind-protect
+                            (funcall (lambda () (return-from foo (setq acc (cons 'b acc)))))
+                         (setq acc (cons 'a acc))))
+                     acc))
+            ''(a b))
+  ;; flet handler doing return-from (handler-bind.10 shape):
+  (run-test 9526 (lambda ()
+                   (block done
+                     (flet ((%succeed (c) (declare (ignore c)) (return-from done 'good)))
+                       (handler-bind ((simple-condition #'%succeed))
+                         (signal "x")))))
+            ''good)
+  ;; ==== end Fable probe block 9520-9539 ====
   ;; Test: interning works: same symbol twice should be eq
   (let ((s1 (%intern-symbol (ash 12345 1)))
         (s2 (%intern-symbol (ash 12345 1))))

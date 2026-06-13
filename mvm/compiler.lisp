@@ -150,6 +150,34 @@
 (defvar *block-labels* nil
   "Alist of (name . exit-label) for block/return-from")
 
+;; Cross-unit (closure-boundary) BLOCK / RETURN-FROM support.
+;;
+;; *block-labels* is RESET by mvm-compile-function-internal so a
+;; RETURN-FROM compiled inside a (lambda …) body never finds an
+;; enclosing BLOCK's exit label — it silently fell back to a
+;; function-level return, so a handler closure that did
+;; (return-from foo …) just returned normally from the LAMBDA instead
+;; of doing the non-local exit CLHS requires (handler-bind / restart
+;; handlers, mapcar callbacks, etc.).
+;;
+;; *nonlocal-blocks* is a parallel alist of (NAME-HASH TAG-VALUE)
+;; that is NOT reset across the function/lambda boundary, so it
+;; survives into nested closures.  A BLOCK whose body contains a
+;; cross-unit RETURN-FROM to it establishes a runtime CATCH frame keyed
+;; by a unique TAG-VALUE (reusing the *catch-tag*/*catch-value*/
+;; *catch-active* + (error …)/handler-case throw machinery).  A
+;; cross-unit RETURN-FROM that finds its target here emits a THROW to
+;; that tag, which unwinds (running unwind-protect cleanups) to the
+;; BLOCK's catch frame.
+(defvar *nonlocal-blocks* nil
+  "Alist of (name-hash tag-value) for cross-unit block/return-from")
+
+;; Monotonic counter producing unique CATCH tags for non-local blocks.
+;; The tag is a large fixnum literal so EQL comparison in the catch
+;; handler is unambiguous and it can never collide with a user CATCH tag.
+(defvar *nonlocal-block-tag-counter* 0
+  "Counter for generating unique non-local BLOCK catch tags")
+
 (defvar *tagbody-tags* nil
   "Alist of (tag . label) for tagbody/go")
 
@@ -2830,8 +2858,15 @@
       ;; branch directly to that block's exit.  Compiles the value into the
       ;; BLOCK's own dest (saved in the entry) so the value reaches the
       ;; block's exit-label even when RETURN-FROM is nested deep inside
-      ;; intermediate compile-form contexts (e.g. let bindings).  Falls back
-      ;; to compile-return when name isn't a known block.
+      ;; intermediate compile-form contexts (e.g. let bindings).
+      ;;
+      ;; Priority: (1) lexical *block-labels* — same compilation unit, the
+      ;; fast direct branch.  (2) *nonlocal-blocks* — the target BLOCK is
+      ;; in an OUTER compilation unit (we are inside a lambda/closure whose
+      ;; mvm-compile-function-internal reset *block-labels*); emit a THROW
+      ;; to the block's runtime CATCH tag for a proper non-local exit that
+      ;; runs intervening unwind-protect cleanups and propagates the value.
+      ;; (3) compile-return fallback (BLOCK NIL / loop / function).
       ((= op-name 102326962717880022)
        (let* ((bname (cadr form))
               (entry (assoc bname *block-labels*
@@ -2840,13 +2875,20 @@
                                         (and (symbolp a) (symbolp b)
                                              (= (normalize-name a)
                                                 (normalize-name b))))))))
-         (if entry
-             ;; entry = (name label block-dest).  Use block-dest so the
-             ;; value lands where the BLOCK form expects to read it from.
-             (progn
-               (compile-form (caddr form) env (caddr entry))
-               (emit-ir :br (cadr entry)))
-             (compile-return (caddr form) env dest))))
+         (cond
+           (entry
+            ;; entry = (name label block-dest).  Use block-dest so the
+            ;; value lands where the BLOCK form expects to read it from.
+            (compile-form (caddr form) env (caddr entry))
+            (emit-ir :br (cadr entry)))
+           ;; Cross-unit: BLOCK lives in an enclosing function/lambda.
+           ((assoc (normalize-name bname) *nonlocal-blocks* :test #'=)
+            (let ((tag-val (cadr (assoc (normalize-name bname)
+                                        *nonlocal-blocks* :test #'=))))
+              ;; (throw TAG-VAL value) — CATCH frame at the BLOCK catches.
+              (compile-form (cons 'throw (cons tag-val (cddr form)))
+                            env dest)))
+           (t (compile-return (caddr form) env dest)))))
       ;; VALUES — return multiple values
       ((= op-name 419785975474686239)
        (compile-values (cdr form) env dest))
@@ -7159,14 +7201,118 @@
 ;;; Block / Tagbody / Go
 ;;; ============================================================
 
+(defun %form-op-is (form hash sym-name)
+  "T if FORM is a cons whose operator matches HASH (integer) or SYM-NAME."
+  (and (consp form)
+       (let ((op (car form)))
+         (or (and (integerp op) (= op hash))
+             (and (symbolp op) (= (normalize-name op) hash))
+             (and (symbolp op) (string= (symbol-name op) sym-name))))))
+
+(defun %return-from-escapes-block-p (body block-hash crossed-lambda shadowed)
+  "Scan BODY (a list of forms) for a RETURN-FROM (or RETURN if BLOCK-HASH
+   is 0, the NIL block) targeting BLOCK-HASH that lives INSIDE a lambda
+   boundary (CROSSED-LAMBDA true) and is NOT shadowed by an inner BLOCK of
+   the same name (SHADOWED).  Such a return-from cannot be reached by the
+   lexical *block-labels* jump after mvm-compile-function-internal resets
+   it, so the enclosing BLOCK must install a runtime catch frame.
+
+   Conservative: walks all subforms, tracking lambda crossings and inner
+   re-binding of the block name (a shadowing inner BLOCK suppresses the
+   catch frame for that subtree)."
+  (let ((found nil))
+    (labels ((walk (form xl sh)
+               (when (and (not found) (consp form))
+                 (cond
+                   ;; quote — opaque, never a return-from
+                   ((%form-op-is form 518921307293258709 "QUOTE") nil)
+                   ;; an inner BLOCK with the same name shadows ours for
+                   ;; its body (RETURN-FROM there targets the inner block).
+                   ((%form-op-is form 1062346144843286510 "BLOCK")
+                    (let ((inner-sh (or sh
+                                        (= (normalize-name (cadr form))
+                                           block-hash))))
+                      (let ((cur (cddr form)))
+                        (loop while (consp cur) do
+                          (walk (car cur) xl inner-sh)
+                          (setq cur (cdr cur))))))
+                   ;; lambda — body crosses a compilation-unit boundary
+                   ((%form-op-is form 527981956251550024 "LAMBDA")
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do
+                        (walk (car cur) t sh)
+                        (setq cur (cdr cur)))))
+                   ;; (function (lambda ...)) — recurse with the lambda case
+                   ((%form-op-is form 113179339635393781 "FUNCTION")
+                    (walk (cadr form) xl sh))
+                   ;; RETURN-FROM <name> — check target + lambda boundary
+                   ((%form-op-is form 102326962717880022 "RETURN-FROM")
+                    (when (and xl (not sh)
+                               (= (normalize-name (cadr form)) block-hash))
+                      (setq found t))
+                    (walk (caddr form) xl sh))
+                   ;; RETURN (== return-from NIL) — only for the NIL block.
+                   ((%form-op-is form 732905726022713733 "RETURN")
+                    (when (and xl (not sh) (= block-hash 0))
+                      (setq found t))
+                    (walk (cadr form) xl sh))
+                   ;; generic: walk every element (improper-list safe)
+                   (t
+                    (let ((cur form))
+                      (loop while (consp cur) do
+                        (walk (car cur) xl sh)
+                        (setq cur (cdr cur)))))))))
+      (let ((cur body))
+        (loop while (consp cur) do
+          (walk (car cur) crossed-lambda shadowed)
+          (setq cur (cdr cur)))))
+    found))
+
 (defun compile-block (name body env dest)
   "Compile (block name forms...).  Stores (NAME LABEL DEST) in
    *block-labels* so RETURN-FROM compiled deep inside the block body can
-   write its value into the block's own dest before branching to exit."
-  (let* ((exit-label (make-compiler-label))
-         (*block-labels* (cons (list name exit-label dest) *block-labels*)))
-    (compile-progn body env dest)
-    (emit-ir-label exit-label)))
+   write its value into the block's own dest before branching to exit.
+
+   When the body contains a RETURN-FROM to this block from INSIDE a lambda
+   (a cross-compilation-unit non-local exit — e.g. a handler-bind handler
+   closure, a mapcar callback), the lexical *block-labels* jump is
+   unreachable (mvm-compile-function-internal resets *block-labels* at the
+   lambda boundary).  In that case we install a runtime CATCH frame: the
+   block body is wrapped in (catch TAG body…) and the cross-unit
+   RETURN-FROM (see the RETURN-FROM dispatch in compile-form) emits a
+   THROW to that tag.
+
+   When a catch frame is established, ALL return-from to this block route
+   through the THROW (we do NOT register a lexical *block-labels* entry):
+   a lexical :br out of the middle of the catch's handler-case would skip
+   its setjmp-frame teardown and corrupt the handler-case stack."
+  (let* ((name-hash (if name (normalize-name name) 0)))
+    (if (%return-from-escapes-block-p body name-hash nil nil)
+        ;; Cross-unit escape possible: establish a runtime catch frame.
+        ;; Every RETURN-FROM to this block (same- OR cross-unit) becomes a
+        ;; THROW to TAG-VAL, which unwinds (running unwind-protect
+        ;; cleanups) to the CATCH frame this block wraps the body in.
+        (let* ((tag-val (progn
+                          (incf *nonlocal-block-tag-counter*)
+                          ;; Large base so it can't collide with a small
+                          ;; user CATCH tag fixnum.
+                          (+ 700000000 *nonlocal-block-tag-counter*)))
+               ;; Cross-unit entry: survives the lambda boundary because
+               ;; *nonlocal-blocks* is NOT reset by
+               ;; mvm-compile-function-internal.
+               (*nonlocal-blocks* (cons (list name-hash tag-val)
+                                        *nonlocal-blocks*)))
+          ;; Compile (catch TAG-VAL body...) into the block's dest.  CATCH
+          ;; expands to a handler-case that, on a matching THROW, returns
+          ;; *catch-value*; on a non-matching throw it re-signals so an
+          ;; outer catch/block handles it.
+          (compile-form (cons 'catch (cons tag-val body)) env dest))
+        ;; No cross-unit escape: plain lexical block (fast path).
+        (let* ((exit-label (make-compiler-label))
+               (*block-labels* (cons (list name exit-label dest)
+                                     *block-labels*)))
+          (compile-progn body env dest)
+          (emit-ir-label exit-label)))))
 
 (defun %tagbody-tag-p (x)
   "CLHS: tagbody tags are symbols OR integers (or any atom other than

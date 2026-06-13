@@ -819,6 +819,39 @@
   "True if X is an interpreted closure (cons with tag %INTERP-CLOSURE)."
   (and (consp x) (eq (car x) '%interp-closure)))
 
+(defun %return-from-name-match-p (name block-name)
+  "True if RETURN-FROM target NAME refers to BLOCK-NAME.  Both may be
+   native MVM syms (compare by name) or CL syms / lists (setf names)."
+  (cond
+    ((and (consp name) (consp block-name))
+     ;; (setf foo) names — match on the foo part by name.
+     (and (cdr name) (cdr block-name)
+          (let ((n1 (%eval-sym-name (cadr name)))
+                (n2 (%eval-sym-name (cadr block-name))))
+            (and n1 n2 (string-equal n1 n2)))))
+    ((or (consp name) (consp block-name)) nil)
+    (t (let ((n1 (%eval-sym-name name))
+             (n2 (%eval-sym-name block-name)))
+         (and n1 n2 (string-equal n1 n2))))))
+
+(defun %body-returns-from-p (body block-name)
+  "Conservatively scan BODY (a form or list of forms) for a
+   (RETURN-FROM BLOCK-NAME …) anywhere in the tree, so DEFUN can decide
+   whether the function's implicit BLOCK must be materialised.  Walks
+   conses; ignores quoted data only at the QUOTE-head level."
+  (cond
+    ((not (consp body)) nil)
+    ;; (return-from NAME …) with a matching NAME?
+    ((and (%eval-sym-eq (car body) "RETURN-FROM")
+          (consp (cdr body))
+          (%return-from-name-match-p (cadr body) block-name))
+     t)
+    ;; Don't descend into (quote …) literal data.
+    ((%eval-sym-eq (car body) "QUOTE") nil)
+    ;; Otherwise recurse car + cdr.
+    (t (or (%body-returns-from-p (car body) block-name)
+           (%body-returns-from-p (cdr body) block-name)))))
+
 (defun %call-interp-closure (fn args)
   "Call an interpreted closure."
   ;; fn = (%interp-closure params body env)
@@ -2276,7 +2309,21 @@
              (params (cadr args))
              (body (cddr args)))
          (let ((name-str (%eval-sym-name fname)))
-           (let ((fn (list '%interp-closure params body nil)))
+           ;; CLHS 3.1.2.1.3 / 5.3 DEFUN: the body is enclosed in an
+           ;; implicit BLOCK whose name is the function name (the CADR for
+           ;; a (SETF foo) name).  Without this, a `(return-from foo …)`
+           ;; in the body escapes with no catcher → empty escape stack →
+           ;; the spurious SIMPLE-ERROR "%eval-escape".  Only wrap the
+           ;; stored body in a `(block BLOCK-NAME orig-body…)` form when
+           ;; the body actually contains a RETURN-FROM to that block — so
+           ;; the vast majority of functions keep the original zero-extra-
+           ;; allocation call path (the block's handler-case + escape-
+           ;; stack machinery runs per call, which is GC-timing-sensitive).
+           (let* ((block-name (if (consp fname) (cadr fname) fname))
+                  (wrapped (if (%body-returns-from-p body block-name)
+                               (list (cons 'block (cons block-name body)))
+                               body))
+                  (fn (list '%interp-closure params wrapped nil)))
              (when name-str
                (unless *symbol-function-table* (%sft-init))
                (puthash name-str *symbol-function-table* fn)

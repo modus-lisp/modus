@@ -3085,6 +3085,39 @@
   (run-test 9798 (lambda () (eval '(ds-probe-c-pa (make-ds-probe-c :pa 8)))) 8)
   (run-test 9799 (lambda () (eval '(ds-probe-c-ca (make-ds-probe-c :ca 4)))) 4)
 
+  ;; --- runtime-DEFUN implicit BLOCK / RETURN-FROM (9780-9783) ---
+  ;; CLHS 5.3 / 3.1.2.1.3: DEFUN wraps its body in an implicit BLOCK named
+  ;; after the function, so (return-from FN …) in the body exits the
+  ;; function.  Under runtime EVAL the stored body must materialise that
+  ;; block, else the escape unwinds past its catcher to an empty escape
+  ;; stack and signals the spurious SIMPLE-ERROR "%eval-escape".  These
+  ;; drive the EVAL'd-DEFUN path (mvm/cl-eval.lisp %eval-compound DEFUN +
+  ;; %body-returns-from-p).  Without the fix all four signalled
+  ;; "%eval-escape"; the uiop merge-pathnames*/featurep cluster depends on
+  ;; this (it opens with `(when (null x) (return-from fn …))`).
+  (run-test 9780
+            (lambda ()
+              (eval '(defun rf-probe-1 (x) (when (null x) (return-from rf-probe-1 :was-null)) :not-null))
+              (eval '(rf-probe-1 nil)))
+            ':was-null)
+  (run-test 9781
+            (lambda () (eval '(rf-probe-1 5)))
+            ':not-null)
+  ;; return-from carrying a value form, deep inside a DOLIST
+  (run-test 9782
+            (lambda ()
+              (eval '(defun rf-probe-2 (lst)
+                       (dolist (e lst) (when (eq e :stop) (return-from rf-probe-2 :found)))
+                       :none))
+              (eval '(rf-probe-2 '(:a :b :stop :c))))
+            ':found)
+  ;; return-from multiple values
+  (run-test 9783
+            (lambda ()
+              (eval '(defun rf-probe-3 (x) (when x (return-from rf-probe-3 (values 1 2 3))) (values 9 9)))
+              (multiple-value-list (eval '(rf-probe-3 t))))
+            '(1 2 3))
+
   ;; --- define-method-combination probes (9600-9612) ---
   ;; The define-method-combination / defgeneric / defmethod MACROS are
   ;; build-time-only rewrites (no runtime-EVAL lowering), so these probes

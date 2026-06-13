@@ -31,6 +31,57 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
+### 2026-06-13 — DEFUN implicit-BLOCK / RETURN-FROM `%eval-escape` FIXED (one genuine control-flow component of the define-package cluster)
+
+The README claim below ("DEFINE-PACKAGE `%eval-escape` is a GC keyword-
+corruption RACE, **not** a runtime-EVAL bug") is **partly wrong**.  After the
+alloc-obj/alloc-array zero-init GC fixes landed (gauntlet 158→44), the
+define-package `%eval-escape` cluster is STILL present (forms 41/49/58/67/80/
+…).  Bisected to a genuine, GC-independent **runtime-EVAL control-flow bug**:
+
+  - `%eval-compound`'s DEFUN branch (mvm/cl-eval.lisp) stored the function
+    body RAW and ran it via `%call-interp-closure` → `%eval-progn` with **no
+    implicit BLOCK**.  CLHS 5.3 / 3.1.2.1.3 require DEFUN to enclose the body
+    in a BLOCK named after the function.  So any `(return-from FN …)` in the
+    body of a *runtime-EVAL'd* defun unwound past its (nonexistent) catcher to
+    an empty `*%eval-escape-stack*` → the spurious `SIMPLE-ERROR "%eval-escape"`.
+  - **Minimal deterministic reproducer (no GC, no asdf):**
+    ```lisp
+    (eval '(defun f (x) (when (null x) (return-from f :was-null)) :not-null))
+    (eval '(f nil))   ; => "%eval-escape"  (should be :WAS-NULL)
+    ```
+  - uiop's `merge-pathnames*`, `featurep`, and dozens of other uiop/asdf
+    functions open with exactly `(when (null x) (return-from fn …))`, so this
+    one bug escaped from the FIRST define-package's `ensure-package` body
+    (form 41's `*wild-path* = (merge-pathnames* …)` defparameter), tripping
+    the whole cluster.
+  - **Fix:** DEFUN now scans the body (`%body-returns-from-p`, allocation-free
+    tree walk) and, only when a matching `(return-from FN …)` is present,
+    wraps the stored body in a single `(block FN orig-body…)` form so the
+    existing runtime BLOCK / RETURN-FROM machinery catches the escape.  Most
+    functions (no self-targeted return-from) keep the zero-extra-cost call
+    path.  Verified: the reproducer above → `:WAS-NULL`; `(merge-pathnames*
+    nil "b")` / `(merge-pathnames* "a" nil)` / `normalize-pathname-directory-
+    component` all run instead of escaping.  Regression probes 9780-9783 in
+    `run-clos-diag-tests` (mvm/ansi-tests.lisp).
+
+  - **The remaining merge-pathnames* "a"/"b" escape is a SEPARATE gap:**
+    runtime-EVAL has **no ECASE / ETYPECASE** branch (they signal "undefined
+    function" / "no clause matches") and **funcall of an flet/labels-local
+    function value** (`(funcall #'local …)`) is unimplemented.  Both block the
+    non-null merge-pathnames* path and are independent of this control-flow fix.
+
+  - **Gauntlet caveat (the GC bug is NOT closed):** the define-package cluster
+    cascades on a still-open GC heap-corruption (the `reference_keyword_gc_race`
+    residual — alloc-string size/zeroing). The cascade point is dominated by
+    **binary-layout noise**: an apples-to-apples experiment (same source tree,
+    `%body-returns-from-p` present but DISABLED) cascaded at form 88, while the
+    fix ENABLED cascaded at form 226 (repro8 minimal-alloc replay) — i.e. the
+    fix pushes the cascade LATER, not earlier.  The committed "243/44" baseline
+    was a *different* (lucky-layout) binary.  So judge this fix by the minimal
+    reproducer + ANSI markers, NOT the gauntlet form-count, which is GC-noise
+    until the alloc-string corruption is fixed (GC/translator seat).
+
 ## Gauntlet frontier (as of 2026-06-12, after the form-94 reader + runtime-DEFSETF + macro-branch fixes)
 
 The gauntlet runner now **reads ALL 243 toplevel forms** of asdf.lisp —

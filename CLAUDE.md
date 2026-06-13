@@ -357,15 +357,20 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## Known Bugs
 
-### Mutable Closures — Global Cell Limitation
+### Mutable Closures — Global Cell Limitation (RESOLVED)
 
-The cell-boxing for captured+mutated variables uses global cells (`%CELL-varname`).
-Multiple closures from the SAME source function share the same global cell. This breaks
-`(let ((closures ...)) (mapcar #'(lambda (x) (push x acc)) items))` patterns where
-the lambda is created once but `acc` should be independent per call.
+This is FIXED (verified 2026-06-13, probes 9740-9744). `compile-let`/`compile-let*`
+now allocate each captured+mutated variable's cell as a **local `let`-binding**
+`%CELL-V = (cons init nil)` — fresh per `let` execution — and `compile-lambda`
+captures the cons pointer by value into the closure env. There is no global-cell
+fallback path left in compiler.lisp. Multiple closures from the same source lambda
+get independent accumulators; `(mapcar #'(lambda (x) (push x acc)) items)` and
+two-counters-from-one-`make-counter` both work.
 
-Heap-allocated closure cells (`is-eql-p` pattern) work around this for specific
-functions. Full fix: allocate a fresh cons cell per closure creation in compile-lambda.
+(Historical: the old scheme used `setq`-based global cells `%CELL-varname` shared
+across closures from one source lambda. Replaced by the let-binding scheme in an
+undocumented prior commit; the map-into cluster fails that were blamed on this are
+actually `cl-sequences.lisp` fill-pointer / bit-vector-store bugs.)
 
 ### Vector-literal symbol elements (FIXED)
 

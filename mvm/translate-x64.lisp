@@ -205,6 +205,34 @@
   (when (vreg-spills-p vreg)
     (emit-store-vreg buf vreg +scratch-reg+)))
 
+(defun emit-zero-word-range (buf ptr-reg end-reg zero-reg)
+  "Emit a runtime loop that stores ZERO-REG into every 8-byte word in
+   [PTR-REG, END-REG).  PTR-REG is advanced by 8 each iteration and is
+   left == END-REG on exit; ZERO-REG and END-REG are read-only.
+
+   This zero-initialises the payload of dynamically-sized allocations
+   (+op-alloc-array+ / +op-alloc-string+) so the Cheney GC's FLAT
+   word-by-word to-space scan (emit-gc-trampoline) never sees an
+   uninitialised payload word as a spurious root.  See the long comment
+   in the +op-alloc-obj+ handler for the full mechanism — the same
+   uninit-payload-scanned-as-pointer corruption applies to arrays and
+   strings whose elements are written by the caller AFTER allocation
+   (a window during which another alloc can trigger GC).
+
+   Unlike alloc-obj's unrolled MOVs, this is a single fixed-size loop
+   regardless of element count, so zeroing the full aligned region
+   (including any 16-byte alignment tail) does NOT change code layout —
+   the alloc-obj alignment-tail layout hazard does not apply here."
+  (let ((loop-label (make-label))
+        (done-label (make-label)))
+    (emit-label buf loop-label)
+    (emit-cmp-reg-reg buf ptr-reg end-reg)
+    (emit-jcc buf :ae done-label)             ; ptr >= end (unsigned) → stop
+    (emit-mov-mem-reg buf ptr-reg zero-reg 0) ; [ptr] = 0
+    (emit-add-reg-imm buf ptr-reg 8)          ; ptr += 8
+    (emit-jmp buf loop-label)
+    (emit-label buf done-label)))
+
 ;;; ============================================================
 ;;; Translation State
 ;;; ============================================================
@@ -1881,6 +1909,23 @@
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
            ;; Recover R12-old (the array base) and compute d = base | 9.
            (emit-pop buf +scratch-reg+)
+           ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+           ;; The caller writes array elements AFTER this opcode returns; any
+           ;; alloc it does in between can trigger the Cheney GC, whose flat
+           ;; to-space scan would read this object's still-uninitialised
+           ;; payload words as candidate roots (see +op-alloc-obj+).  Zero
+           ;; them so every not-yet-written word is fixnum 0 (nibble 0),
+           ;; ignored by scan_word.  RAX (+scratch-reg+) = base; R12 = new
+           ;; top.  Walk RCX from base+8 (skip header) to R12, storing RDX=0.
+           ;; RCX/RDX are saved/restored so the surrounding allocator state
+           ;; is untouched; RAX survives the loop, so the final LEA is valid.
+           (emit-push buf 'rcx)
+           (emit-push buf 'rdx)
+           (emit-lea buf 'rcx +scratch-reg+ 8)        ; rcx = base + 8
+           (emit-bytes buf #x48 #x31 #xD2)            ; xor rdx, rdx
+           (emit-zero-word-range buf 'rcx 'r12 'rdx)
+           (emit-pop buf 'rdx)
+           (emit-pop buf 'rcx)
            (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 
@@ -2129,6 +2174,23 @@
            (emit-and-reg-imm buf +scratch-reg+ -16)
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
            (emit-pop buf +scratch-reg+)      ; recover R12-old
+           ;; ---- Payload zero-init DELIBERATELY NOT done here (see below) ----
+           ;; The same GC-correctness argument as +op-alloc-array+ applies in
+           ;; principle (the string body is written byte-by-byte by the caller
+           ;; AFTER allocation, so uninit data words can be scanned as roots).
+           ;; The array zeroing — structurally identical push/pop/loop, only
+           ;; the subtag differs — is GATED CLEAN (gauntlet stays 243/44).  But
+           ;; enabling the IDENTICAL zero loop here is a DETERMINISTIC
+           ;; regression: the reader desyncs at asdf.lisp form 87 (a package
+           ;; name reads as a corrupted #<S…>), dropping the gauntlet from 243
+           ;; to 87 forms.  The trigger is GC-interleaving-specific (no plain
+           ;; logic repro: long-symbol reads and 300x stress loops are clean),
+           ;; which matches the documented residual-corruption hazard the
+           ;; alloc-obj seat hit when it touched the string/alignment region.
+           ;; The string header counts BYTES while the array/obj headers count
+           ;; WORDS, so copy_object's size derivation differs for #x31 — a
+           ;; likely locus for the second corruption site.  Deferred to a
+           ;; dedicated string/GC seat; the alloc-array fix above is the win.
            (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 

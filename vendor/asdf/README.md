@@ -31,6 +31,43 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
+### 2026-06-13 — runtime-EVAL ECASE / CCASE / CTYPECASE FIXED (gauntlet form 56 → 226; back half of asdf.lisp first visible)
+
+`merge-pathname-directory-component` (uiop/pathname) uses **ECASE**, and
+runtime-EVAL had no ECASE branch — `(eval '(ecase 2 (1 :a) (2 :b)))`
+escaped via `%eval-escape` (ecase fell through to the funcall path).  uiop's
+`merge-pathnames*` calls it, so the gauntlet halted DETERMINISTICALLY at
+**form 56** (the escape unwound the survey runner — no `GAUNTLET DONE`).
+
+Fix (mvm/runtime-cl-macros.lisp): added ECASE, CCASE, CTYPECASE macros
+mirroring the existing CASE / TYPECASE / ETYPECASE expansions.
+`%eval-compound` does NOT special-case any case form (only COND/WHEN/UNLESS
+are inlined), so these dispatch through the runtime macro path — no
+cl-eval.lisp branch was needed (verified by test).
+  - **ECASE** = CASE machinery (eql per key, key-lists via OR), no
+    T/OTHERWISE clause, final `(t (error "ECASE: no clause matches"))`
+    instead of returning NIL.
+  - **CCASE** degrades to an ECASE-like signal (store-and-retry not modeled).
+  - **CTYPECASE** = ETYPECASE machinery with a no-match error (correctable
+    retry degraded — same CCASE→ECASE degrade pattern).
+
+**Result:** form 56 PASSES.  Gauntlet now runs to `GAUNTLET DONE forms=226
+fails=127` (READ-ERROR after form 226).  Forms 57-86 run clean; the
+dominant fail cluster (forms 87-226) is the known **DEFINE-PACKAGE
+`%eval-escape` GC keyword-corruption cascade** (documented below — GC seat
+domain).  No regression of forms 1-55 (form 43 detect-os is the expected
+"can't detect OS" error).  Regression probes 9613-9619 in
+`run-clos-diag-tests` (mvm/ansi-tests.lisp).
+
+NOTE on observing the frontier: the gauntlet's sparse `tick>=50` only
+flushes serial output every 50 forms, so a plain run looks like it stops at
+form 43 (output buffered) when it has actually completed.  Lower the tick
+threshold (`sed 's/(>= \*g-tick\* 50)/(>= *g-tick* 1)/'`) to see per-form
+progress and the real `GAUNTLET DONE` line.
+
+The remaining merge-pathnames* `(funcall #'flet-local …)` gap noted below
+is the OTHER half — independent of this ECASE fix and still open.
+
 ### 2026-06-13 — DEFUN implicit-BLOCK / RETURN-FROM `%eval-escape` FIXED (one genuine control-flow component of the define-package cluster)
 
 The README claim below ("DEFINE-PACKAGE `%eval-escape` is a GC keyword-

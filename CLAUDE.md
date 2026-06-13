@@ -94,11 +94,25 @@ runtime/        Runtime type system
 
 ## ANSI CL Conformance
 
-**Real numbers (current state, x64 Linux):**
+**Real numbers — last RELIABLE full sweep (x64 Linux, commit b2ae056):**
 - Expected: 17,465 tests (recovered files keep entering the denominator)
 - Ran: 17,421
 - Passed: 15,386 (88.10% overall, 88.32% of those that ran; two-sample
   confirm 15,378/15,386)
+
+**UNCOUNTED batch on top (tip 1a279f6, 2026-06-13):** a large fan-out landed
+many cluster-gated fixes on top of b2ae056 — cerror(+1), compiler-ecase-signal
+(+2), streams(+2), numeric rational/subtypep(+6), map-into fp-vector(+10),
+file-io composite-stream+pathname(+7), packages-intern, reader-position, clos-egf
+(+2), **cross-unit RETURN-FROM/BLOCK via runtime CATCH frame (b50f758, ≥40 tests
+— handler-bind/restart cluster)**, typep-symbol+rationalize+ACOS-hang (+8).  Each
+was cluster-gated +N/−0; return-from validated by probes 9520/9521 PASS + healthy
+block/catch/handler-bind ranges; ACOS hang gone.  A reliable FULL headline re-count
+is PENDING a quiet box — the single-process full sweep (a) hangs in post-ANSI
+custom probes 100000+ so ansi-summary.sh never prints its summary, and (b)
+range-mode `./binary 10001 27708` loses ~2000 tests to intra-range stalls.  Best
+partial signal: of-run pass rate 90.0% (up from 88.5%).  DO NOT trust a full count
+until measured on a fully idle box via ansi-summary.sh that completes.
 - Failed: 2,035
 - Lost-to-crash: 44
 - Crash markers (timing-IMMUNE gate): FILE-WEDGE=30, CHUNK-CRASH=0 (was 4).

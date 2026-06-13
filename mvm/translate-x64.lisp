@@ -1793,15 +1793,48 @@
                 (count (second operands))
                 (subtag (third operands))
                 (d (dest-phys-or-scratch vd))
-                (header (logior (ash count 8) subtag)))
+                (header (logior (ash count 8) subtag))
+                (alloc-bytes (logand (+ (* (+ count 2) 8) 15) (lognot 15))))
            ;; Write header
            (emit-mov-reg-imm buf +scratch-reg+ header)
            (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+           ;; The Cheney scan (emit-gc-trampoline) is a FLAT word-by-word walk
+           ;; from to_start..free_ptr that calls scan_word on EVERY word — it
+           ;; does NOT respect object headers.  So any uninitialised payload
+           ;; word (the +8 padding slot and the data slots) that a callsite has
+           ;; not yet written is scanned as a potential root.  If such a garbage
+           ;; word has low nibble 1/9 and lands in [from_start, from_end),
+           ;; copy_object treats it as a live pointer, reads its target's first
+           ;; word as a "header", and (if the size guard passes) writes a
+           ;; forwarding pointer into that RANDOM from-space location —
+           ;; clobbering whatever real object lives there.  This is the
+           ;; allocation-pressure-dependent "#<?N>" heap corruption (a live
+           ;; condition / keyword object's header overwritten mid-load).
+           ;; Allocators that fill every slot before the next gc-check are safe,
+           ;; but %intern-keyword / %make-symbol / %make-float / closures alloc
+           ;; then run MORE allocating code (aset, puthash, cons) before slot-0
+           ;; is written, opening the window.  Zeroing the payload makes every
+           ;; not-yet-written word a fixnum 0 (nibble 0), which scan_word
+           ;; ignores.  Header is at +0; the payload words are the +8 padding
+           ;; word and the COUNT data words (offsets +16.. ) — COUNT+1 words.
+           ;; (The 16-byte alignment-tail word that exists for odd COUNT is
+           ;; deliberately left alone: zeroing it as well shifted code layout
+           ;; enough to re-expose a SEPARATE residual corruption site near the
+           ;; ASDF/BUNDLE forms — a contiguous define-package cascade returned
+           ;; — whereas zeroing exactly the logical payload broke the cascade
+           ;; cleanly.  The tail word is beyond the object's data and is a
+           ;; lower-risk follow-up; see the handoff.)  RAX (= +scratch-reg+)
+           ;; held the header and is free now; the LEA for d happens after.
+           (emit-bytes buf #x31 #xC0)               ; xor eax, eax  (rax = 0)
+           (let ((off 8))
+             (dotimes (i (+ count 1))
+               (emit-mov-mem-reg buf 'r12 'rax off)  ; mov [r12+off], rax
+               (incf off 8)))
            ;; Result = R12 | object-tag
            (emit-lea buf d 'r12 #x09)
            ;; Advance alloc pointer: (count+2)*8, aligned to 16
-           (let ((alloc-bytes (logand (+ (* (+ count 2) 8) 15) (lognot 15))))
-             (emit-add-reg-imm buf 'r12 alloc-bytes))
+           (emit-add-reg-imm buf 'r12 alloc-bytes)
            (maybe-store-scratch buf vd)))
 
         ((op= +op-alloc-array+)

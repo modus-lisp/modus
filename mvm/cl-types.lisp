@@ -2150,13 +2150,26 @@
    - modus rational-form float (subtag #x32, 2 slots) — same as ratio,
      produced by transcendentals (sin/cos/etc.) and the literal-float
      reader path before the SSE2 %float-from-int rewrite landed.
-   Complex inputs and anything else are returned unchanged."
+   - complex (3-slot #x32 array [%complex-marker r i]) — coerce the REAL
+     part.  Modus has no complex tower, so transcendentals (acos/asin/
+     atan etc.) of a complex argument operate on the realpart instead of
+     feeding the raw array pointer into the float primops as garbage
+     bits.  Without this guard, (acos (complex x1 x2)) reinterpreted the
+     array tag as a double, and the %atan-f |x|>1 reciprocal recursion
+     could fail to converge below 1 → non-termination (acos.4 hang).
+   Anything else is returned unchanged."
   (cond
     ((%ieee-float-p n) n)
     ((integerp n) (%float-from-int n))
     ((ratiop n)
      (%float-div (%float-from-int (aref n 0))
                  (%float-from-int (aref n 1))))
+    ;; Complex array: [%complex-marker r i] (3 slots, subtag #x32).
+    ((and (not (fixnump n)) (not (consp n)) (not (null n))
+          (not (characterp n))
+          (= (obj-subtag n) #x32) (>= (array-length n) 3)
+          (eq (aref n 0) '%complex-marker))
+     (%any-to-float (aref n 1)))
     ;; Modus rational-form float: 2-slot array with subtag #x32
     ((and (not (fixnump n)) (not (consp n)) (not (null n))
           (not (characterp n))

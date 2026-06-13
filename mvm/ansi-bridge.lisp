@@ -3739,10 +3739,15 @@
                     (setq x x1)))))))
 
 ;;; RATIONALIZE — strict 1-arg arity (last-defun-wins)
+;; RATIONALIZE — for IEEE doubles RATIONAL already yields the simplest
+;; exact value (binary fraction in lowest terms), so RATIONALIZE delegates
+;; to RATIONAL.  This shadows cl-types.lisp's (rationalize n) because
+;; ansi-bridge loads later; the old stub returned N unchanged, so the
+;; exact cl-types impl was dead and (rationalize 1.5) returned 1.5.
 (defun rationalize (n &rest extra)
   (if extra
       (%program-error "rationalize requires exactly 1 argument")
-      n))
+      (rational n)))
 
 ;;; FORCE-OUTPUT — check for too many args (accepts 0 or 1)
 (defun force-output (&rest args)
@@ -4744,8 +4749,13 @@
          ((eq tn 'cons) (consp obj))
          ((eq tn 'list) (or (null obj) (consp obj)))
          ((eq tn 'null) (null obj))
-         ((eq tn 'symbol) (or (null obj) (eq obj t) (%cl-sym-p obj) (integerp obj)
-                              (symbolp obj)))
+         ;; NB: the old branch had `(integerp obj)` — a leftover from when
+         ;; native MVM symbols were bare hash fixnums.  It made
+         ;; (typep 1 'symbol) → T and broke typecase.2/.3, ctypecase.3,
+         ;; etypecase.3.  Dropped.  NIL and T must still be reported as
+         ;; symbols (CLHS) — keep them explicit since the live symbolp
+         ;; here doesn't reliably cover NIL in this build.
+         ((eq tn 'symbol) (or (null obj) (eq obj t) (symbolp obj)))
          ((eq tn 'string) (stringp obj))
          ((eq tn 'simple-string) (stringp obj))
          ((eq tn 'base-string) (stringp obj))
@@ -4757,7 +4767,7 @@
          ((eq tn 't) t)
          ((eq tn 'nil) nil)
          ((eq tn 'boolean) (or (null obj) (eq obj t)))
-         ((eq tn 'bit) (or (= obj 0) (= obj 1)))
+         ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
          ((eq tn 'array)         (or (arrayp obj) (stringp obj)))

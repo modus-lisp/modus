@@ -89,6 +89,89 @@ Forms that still `FAILFORM` (all caught, runtime-EVAL gaps — NOT reader):
   - **241** — `FORMATTED-SYSTEM-DEFINITION-ERROR` (asdf component
     designator validation — a real asdf error, honest).
 
+### DEFINE-PACKAGE `%eval-escape` ROOT-CAUSED 2026-06-13 — it is a GC
+keyword-corruption RACE, **not** a runtime-EVAL LOOP / do-symbols / symbol-name
+logic bug.  (GC / translator seat — off-limits to reader/eval/packages.)
+
+The whole `DEFINE-PACKAGE` FAILFORM cascade (forms 58, 67, 80, 88, …, 226 — the
+single largest cluster, ~150 of the 158 caught fails) is ONE bug.  Once the
+first `define-package` (form 58, `:uiop/filesystem`) corrupts state, every later
+`with-upgradability` / `in-package` / `define-package` in that package escapes
+too — a pure cascade off one defect.
+
+**Bisected to the real escape site (reproducers below):**
+
+1. `ensure-package`'s `(loop … :being :the :hash-keys :of exported …)` and its
+   surrounding logic are CORRECT.  A minimal `(uiop/package::ensure-package
+   "X" :use nil :export nil)` and a hand-written hash-keys loop both run fine
+   *in isolation*.  The earlier README claim of a "quadratic / non-terminating
+   do-symbols / hash-keys reexport loop" is WRONG — there is no hang.
+
+2. The escape is `%eval-extended-loop` → `%loop-parse-for` → `%loop-kw=` →
+   `%eval-sym-name` (mvm/cl-eval.lisp) called on the loop keyword `:being`
+   (and `:hash-keys`).  `%eval-sym-name` reaches the #x53 branch and calls
+   `symbol-name`, whose keyword path does `(aref sym 0)` to read the name-hash.
+   That read intermittently **escapes** (caught as `SIMPLE-ERROR "%eval-escape"`
+   — actually an array-bounds longjmp), so `%loop-kw=` returns NIL, the FOR
+   clause mis-parses, and the loop's RETURN/GO escapes with no catcher.
+
+3. **The keyword object `:being` itself is corrupt after the asdf load.**
+   `keywordp :being` ⇒ T (the #x53 subtag byte survives) but `(aref :being 0)`
+   inside `symbol-name` faults (element-count / slot-0 clobbered).  Decisive
+   asymmetry: keywords that appear in Modus's OWN source (e.g. `:the`, in
+   `*sym-name-table*`) survive; keywords first interned at RUNTIME by asdf
+   (`:being`, `:hash-keys` — NOT in `*sym-name-table*`, confirmed
+   `(gethash (compute-name-hash "BEING") *sym-name-table*)` ⇒ NIL) get
+   corrupted.  Their names are only recoverable via the `%native-mvm-sym-name-
+   lookup` package-walk fallback, which works pre-asdf.
+
+4. **It is NON-DETERMINISTIC run-to-run** (same binary, same form-count load:
+   sometimes `:being` is fine, sometimes corrupt — gc-count 2–3 at the test
+   point).  Plain GC with no asdf does NOT corrupt runtime-interned keywords
+   (verified: read `:zzqqxx`, survive 3+ collections).  The corruption needs
+   asdf's allocation-heavy `ensure-package` (interning ~239 keywords + hundreds
+   of CL-symbols into package symtabs) to drive a collection at the wrong
+   moment.  This is the **same GC heap-corruption race class** documented at
+   length below (overshoot off the semispace / a lost root for a heap object
+   allocated through the interp), surfaced here on keyword objects.
+
+**Minimal reproducer** (deterministic-ish; runs in the generic binary):
+
+```lisp
+(%install-runtime-cl-macros)
+(let ((pn 0) (s (open "vendor/asdf/asdf.lisp")))     ; load forms 1..66
+  (loop (let ((f (handler-case (read s nil :eof) (t (c) :eof))))
+          (when (or (eq f :eof) (>= pn 67)) (return))
+          (setq pn (+ pn 1)) (handler-case (eval f) (t (c) nil)))))
+(handler-case (symbol-name :being) (t (c) (write-string-serial "ESC")))  ; intermittently ESC
+(handler-case (%eval-sym-name :being) (t (c) (write-string-serial "ESC"))) ; ditto
+```
+
+**Attempted (and reverted) fix this seat — the gc-check audit:** several
+`compile-make-X` sites emit a bare `:alloc-obj` with NO preceding `:gc-check`
+(`:alloc-obj` only bumps R12 + writes the header; it does NOT bound-check R12
+against R14).  This is exactly the `reference_make_closure_gc_check` class.
+Added `:gc-check` before the alloc in `compile-make-keyword-obj`,
+`compile-alloc-sym3`, `compile-make-float`, `compile-make-symbol`,
+`compile-alloc-mda-raw`, `compile-make-bignum`, `compile-make-ratio`,
+`compile-make-array-1d` (constant path), and the two bignum-literal sites
+(mvm/compiler.lisp).  This is a *correct, conservative* fix for the bug class
+and should land — but it did NOT close THIS keyword-corruption race (gauntlet
+still 158 fails), so the clobber comes from a different allocator OR is a
+GC-forwarding defect specific to keyword objects (the victim, not the
+overshooter).  REVERTED here only because it's cross-domain (compiler/GC, not my
+owned files) and I could not complete an ANSI gate within budget to confirm no
+regression — the GC seat should re-apply it as part of the audit and gate it.
+
+**Next steps for the GC seat:** (a) re-apply the gc-check audit above and gate;
+(b) instrument the native trampoline (MODUS_GC_DEBUG) during the form-58
+`ensure-package` to catch the collection that clobbers a runtime-interned
+keyword's header/count — confirm whether it's an overshoot write or an
+unforwarded keyword-table entry; (c) the keyword intern table at #x10000148 IS
+scanned, but verify its runtime-ADDED entries (asdf's 239 keywords) survive a
+collection that fires *mid-intern* (the `aset kw 0 hash` + `puthash` window in
+`%intern-keyword`, mvm/prelude.lisp).
+
 **The old form-54 `READ-ERROR` is FIXED** (commit 1b3edd3) — it was NOT a
 GC/`#.` issue at all.  See "Form 54→55 READ-ERROR — RESOLVED" below.
 

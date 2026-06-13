@@ -43,12 +43,19 @@
       (let ((ty (%stream-type s)))
         (cond
           ((= ty 1) t)   ;; string-input
+          ((= ty 2) nil) ;; string-output
           ((= ty 3) t)   ;; echo (input+output)
           ((= ty 4) t)   ;; two-way (input+output)
+          ((= ty 5) nil) ;; broadcast (output only)
           ((= ty 6) t)   ;; concatenated (input)
-          ((= ty 7) t)   ;; synonym (depends on target, assume both)
+          ;; synonym: delegate to the symbol-value target stream.
+          ((= ty 7)
+           (let ((target (symbol-value (%stream-data s))))
+             (if (streamp target) (input-stream-p target) nil)))
           ((= ty 8) t)   ;; serial-io (both)
-          ((= ty 9) t)   ;; file stream (both)
+          ((= ty 9)      ;; file stream: input or io direction
+           (let ((d (%fs-dir s)))
+             (if (eq d :output) nil t)))
           (t nil)))
       nil))
 
@@ -56,13 +63,20 @@
   (if (streamp s)
       (let ((ty (%stream-type s)))
         (cond
+          ((= ty 1) nil) ;; string-input
           ((= ty 2) t)   ;; string-output
           ((= ty 3) t)   ;; echo (input+output)
           ((= ty 4) t)   ;; two-way (input+output)
           ((= ty 5) t)   ;; broadcast (output)
-          ((= ty 7) t)   ;; synonym
+          ((= ty 6) nil) ;; concatenated (input only)
+          ;; synonym: delegate to the symbol-value target stream.
+          ((= ty 7)
+           (let ((target (symbol-value (%stream-data s))))
+             (if (streamp target) (output-stream-p target) nil)))
           ((= ty 8) t)   ;; serial-io (both)
-          ((= ty 9) t)   ;; file stream (both)
+          ((= ty 9)      ;; file stream: output or io direction
+           (let ((d (%fs-dir s)))
+             (if (eq d :input) nil t)))
           (t nil)))
       nil))
 
@@ -74,7 +88,7 @@
           t)
       nil))
 (defun stream-element-type (s) (quote character))
-(defun stream-external-format (s) (quote default))
+(defun stream-external-format (s) :default)
 (defun interactive-stream-p (s) nil)
 
 (defun close (stream &rest args) t)

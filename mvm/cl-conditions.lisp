@@ -590,7 +590,17 @@
     nil))
 
 (defun cerror (continue-format datum &rest args)
-  "Signal a correctable error."
+  "Signal a correctable error.
+
+   Per CLHS CERROR, a CONTINUE restart is established around the signal.
+   If a handler invokes it (directly, or via the CONTINUE function),
+   cerror returns NIL and control resumes after the cerror form
+   (cerror.6).  We reuse %with-restarts (the restart-case machinery,
+   :case style) so the restart's wrapper does the setjmp/longjmp
+   recovery — identical to how WARN establishes MUFFLE-WARNING.
+
+   The condition is built once and signalled inside the restart body so
+   the active CONTINUE restart is visible to handler-bind handlers."
   (let ((cond-obj
          (cond
            ((%condition-p datum) datum)
@@ -600,9 +610,21 @@
             (apply 'make-condition datum args))
            (t (make-condition 'simple-error :format-control "error" :format-arguments nil)))))
     (setq *current-condition* cond-obj)
-    (let ((handled (%signal-condition cond-obj)))
-      (if handled
+    (%associate-active-restart-frames cond-obj)
+    ;; Signal under a CONTINUE restart.  If no handler invokes CONTINUE
+    ;; (or otherwise transfers control), %signal-condition returns and we
+    ;; fall through to the normal unhandled-error path.
+    (let ((continued nil))
+      (%with-restarts
+       (list (list 'continue
+                   (lambda () (setq continued t) nil)
+                   continue-format))
+       (lambda ()
+         (%associate-active-restart-frames cond-obj)
+         (%signal-condition cond-obj)))
+      (if continued
           nil
+          ;; Unhandled: behave like ERROR (longjmp to handler-case or halt).
           (if (%error-handler-active-p)
               (%hc-longjmp)
               (progn

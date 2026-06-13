@@ -2184,6 +2184,64 @@
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
+  ;; ==== CND agent probe block 9700-9719 (conditions cluster) ====
+  ;; Self-contained reproducers for cl-conditions.lisp behaviour.
+  ;; handler-bind handler doing a non-local exit:
+  (deftest 9700 (block foo
+                  (handler-bind ((error (lambda (c) (declare (ignore c))
+                                          (return-from foo 'good))))
+                    (error "an error")))
+                good)
+  (deftest 9701 (catch 'done
+                  (handler-bind ((error (lambda (c) (declare (ignore c))
+                                          (throw 'done 'good))))
+                    (error "an error")))
+                good)
+  ;; nil type never matches; error type does (handler-bind.15):
+  (deftest 9702 (catch 'done
+                  (handler-bind ((nil (lambda (c) (declare (ignore c))
+                                        (throw 'done 'bad)))
+                                 (error (lambda (c) (declare (ignore c))
+                                          (throw 'done 'good))))
+                    (error "an error")))
+                good)
+  ;; Same as 9700 but with #'(lambda ...) sharp-quote (ANSI test shape):
+  (deftest 9703 (block foo
+                  (handler-bind ((error #'(lambda (c) (declare (ignore c))
+                                            (return-from foo 'good))))
+                    (error "an error")))
+                good)
+  ;; handler-bind.10 shape: flet-local handlers w/ return-from + simple-condition:
+  (deftest 9704 (block done
+                  (flet ((%foo () (signal "A simple condition"))
+                         (%succeed (c) (declare (ignore c)) (return-from done 'good))
+                         (%fail (c) (declare (ignore c)) (return-from done 'bad)))
+                    (handler-bind ((error #'%fail)
+                                   (simple-condition #'%succeed))
+                      (%foo))))
+                good)
+  ;; Reproduce the ANSI path: call %with-handler-bind directly (the
+  ;; build-script rewrite target), handler does return-from out of block:
+  (deftest 9705 (block foo
+                  (%with-handler-bind
+                   (list (list 'error (lambda (c) (declare (ignore c))
+                                        (return-from foo 'good))))
+                   (lambda () (error "an error"))))
+                good)
+  ;; %with-handler-bind with throw:
+  (deftest 9706 (catch 'done
+                  (%with-handler-bind
+                   (list (list 'error (lambda (c) (declare (ignore c))
+                                        (throw 'done 'good))))
+                   (lambda () (error "an error"))))
+                good)
+  ;; NOTE: the ANSI handler-bind.5-16 / restart non-local-exit cluster
+  ;; fails ONLY in the run-test eager-THUNK context (return-from / throw
+  ;; out of a handler closure when wrapped by run-test's outer
+  ;; handler-case) — the same forms PASS as deftest probes above.  That
+  ;; is the compiler return-from-across-closure gap (compiler.lisp owns
+  ;; *block-labels* lexical-jump return-from), NOT a cl-conditions bug.
+  ;; ==== end CND probe block 9700-9719 ====
   ;; Test: interning works: same symbol twice should be eq
   (let ((s1 (%intern-symbol (ash 12345 1)))
         (s2 (%intern-symbol (ash 12345 1))))

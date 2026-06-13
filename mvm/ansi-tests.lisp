@@ -3622,19 +3622,28 @@
                  (funcall (lambda () (throw 'tag 42)))
                  99)))
     42)
+  ;; handler-bind handler doing a cross-unit return-from.  We call the
+  ;; runtime helper %with-handler-bind directly (the form `handler-bind`
+  ;; is only rewritten to %with-handler-bind by the build's reader for
+  ;; ANSI .lsp files, NOT for first-party ansi-tests.lisp — a raw
+  ;; (handler-bind …) here would compile as an undefined function call).
+  ;; This is exactly the shape handler-bind.5-16 / restart-case.19-34
+  ;; exercise and the primary >=40-ANSI target.
   (rt-run-test 9522
     (funcall (lambda ()
                (block foo
-                 (handler-bind ((error (lambda (c) (declare (ignore c))
-                                         (return-from foo 'good))))
-                   (error "an error")))))
+                 (%with-handler-bind
+                  (list (list 'error (lambda (c) (declare (ignore c))
+                                       (return-from foo 'good))))
+                  (lambda () (error "an error"))))))
     'good)
   (rt-run-test 9523
     (funcall (lambda ()
-               (block foo
-                 (handler-bind ((error #'(lambda (c) (declare (ignore c))
-                                           (return-from foo 'good))))
-                   (error "an error")))))
+               (catch 'done
+                 (%with-handler-bind
+                  (list (list 'error (lambda (c) (declare (ignore c))
+                                       (throw 'done 'good))))
+                  (lambda () (error "an error"))))))
     'good)
   ;; nested blocks same name → innermost resolves:
   (rt-run-test 9524
@@ -3654,13 +3663,14 @@
                      (setq acc (cons 'a acc))))
                  acc)))
     '(a b))
-  ;; flet handler doing return-from (handler-bind.10 shape):
+  ;; flet handler doing cross-unit return-from (handler-bind.10 shape):
   (rt-run-test 9526
     (funcall (lambda ()
                (block done
                  (flet ((%succeed (c) (declare (ignore c)) (return-from done 'good)))
-                   (handler-bind ((simple-condition #'%succeed))
-                     (signal "x"))))))
+                   (%with-handler-bind
+                    (list (list 'simple-condition #'%succeed))
+                    (lambda () (signal "x")))))))
     'good)
   ;; ==== end Fable probe block 9520-9539 ====
 

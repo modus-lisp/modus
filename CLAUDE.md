@@ -96,17 +96,23 @@ runtime/        Runtime type system
 
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,465 tests (recovered files keep entering the denominator)
-- Ran: 17,394
-- Passed: 15,397 (88.16% overall, 88.52% of those that ran)
-- Failed: 1,997
-- Lost-to-crash: 71 (NOTE: lost-to-crash is wall-clock-NOISY in the single-
-  process full run — the same files wedge but which tests inside a wedged
-  fork get lost shifts with timing.  The timing-IMMUNE metric is the crash
-  markers FILE-WEDGE=30 / CHUNK-CRASH=4, identical to the prior gate.  Passed
-  15,397 is flat-within-noise vs the prior 15,409; the GC alloc-obj zero-init
-  fix 2faad76 is a CORRECTNESS/structural win, not an ANSI-count mover —
-  its payoff is the gauntlet (define-package cascade 158→44) and eliminating
-  a whole heap-corruption class.  Sweep-to-sweep noise ~±10 on Passed.)
+- Ran: 17,421
+- Passed: 15,386 (88.10% overall, 88.32% of those that ran; two-sample
+  confirm 15,378/15,386)
+- Failed: 2,035
+- Lost-to-crash: 44
+- Crash markers (timing-IMMUNE gate): FILE-WEDGE=30, CHUNK-CRASH=0 (was 4).
+  NOTE: judge regressions by CRASH MARKERS + passed, NOT raw lost-to-crash
+  (wall-clock noisy).  Passed swing vs the prior 15,397 is the CHUNK-CRASH
+  4→0 reshuffle (recovered chunks now RUN and mostly fail, so ran rose
+  17,395→17,421 while passed is flat-within-noise).  This rotation's wins are
+  CORRECTNESS/structural, not ANSI-count movers: GC alloc-obj + alloc-array
+  zero-init (2faad76/8a76e16 — eliminated a whole Cheney-flat-scan heap-
+  corruption class) and runtime-DEFUN implicit-BLOCK (062edd4 — return-from
+  stops escaping to empty stack).  Payoff is the gauntlet: define-package
+  cascade GONE, frontier 158-fail-cascade → clean deterministic stop at
+  form 56 (runtime ECASE gap).  Sweep noise ~±10-15 on Passed (wider when
+  CHUNK-CRASH count changes).
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

@@ -3224,6 +3224,32 @@
 ;;; ensure-generic-function
 ;;; ============================================================
 
+(defun %egf-plist-get (args key-name)
+  "Scan keyword-arg plist ARGS for the keyword whose symbol-name is
+   KEY-NAME (string), returning its value or NIL.  Keyword comparison is
+   by symbol-name so it is robust regardless of symbol-object identity."
+  (let ((cur args) (result nil) (found nil))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return nil))
+      (let ((k (car cur)))
+        (when (and (not found) (symbolp k) (not (null k))
+                   (string= (symbol-name k) key-name))
+          (setq result (car (cdr cur)))
+          (setq found t)))
+      (setq cur (cdr (cdr cur))))
+    result))
+
+(defun %egf-plist-has-p (args key-name)
+  "True iff the keyword named KEY-NAME (string) appears in plist ARGS."
+  (let ((cur args) (found nil))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return found))
+      (let ((k (car cur)))
+        (when (and (symbolp k) (not (null k))
+                   (string= (symbol-name k) key-name))
+          (setq found t) (return found)))
+      (setq cur (cdr (cdr cur))))))
+
 (defun ensure-generic-function (name &rest args)
   "Ensure generic function NAME exists.  ANSI: signals an error if NAME
    names a special operator, macro, or ordinary (non-generic) function.
@@ -3233,31 +3259,60 @@
    via set-symbol-function so `(funcall (symbol-function NAME) …)` and
    `(typep #'NAME 'generic-function)` both work — EGF tests .4 and up
    probe `(symbol-function f)` after a fresh EGF call and expect a
-   generic-function."
-  (declare (ignore args))
-  (let ((existing (%find-gf name)))
-    (when existing
-      ;; Return the same callable a DEFGENERIC for NAME returned (the
-      ;; registered dispatch fn / stub) so (eqlt (defgeneric ...)
-      ;; (ensure-generic-function name)) holds — EGF.7/9/10/12/13
-      ;; compare with EQL.  Falls back to the GF struct when no
-      ;; callable was registered.
-      (return-from ensure-generic-function (%dg-gf-callable name)))
-    ;; No GF yet — refuse if NAME is already bound to a non-GF function,
-    ;; macro, or special operator.
-    (cond
-      ((and (symbolp name) (macro-function name))
-       (error "ensure-generic-function: ~S names a macro" name))
-      ((and (symbolp name) (special-operator-p name))
-       (error "ensure-generic-function: ~S names a special operator" name))
-      ((and (fboundp name)
-            (not (%generic-function-p (fdefinition name))))
-       (error "ensure-generic-function: ~S already names a non-generic function" name)))
-    (let ((gf (%defgeneric name nil nil)))
-      (set-symbol-function name (%make-gf-stub name))
-      ;; Same callable-return contract as the existing-GF branch.
-      (let ((callable (%dg-gf-callable name)))
-        (if callable callable gf)))))
+   generic-function.
+
+   Honors the :lambda-list and :argument-precedence-order keyword args:
+   - On an EXISTING gf that already has methods, an incongruent
+     :lambda-list (different required-arg count) signals an error
+     (EGF.5/.6).
+   - :argument-precedence-order is applied to the gf's dispatch order
+     (EGF.8)."
+  (let ((ll (%egf-plist-get args "LAMBDA-LIST"))
+        (apo (%egf-plist-get args "ARGUMENT-PRECEDENCE-ORDER"))
+        (ll-given (%egf-plist-has-p args "LAMBDA-LIST")))
+    (let ((existing (%find-gf name)))
+      (when existing
+        ;; CLHS: a supplied :lambda-list must be congruent with the
+        ;; existing gf (same required-arg count) when methods exist.
+        (when ll-given
+          (let ((decl-ll (%gf-lambda-list existing))
+                (methods (%gf-methods existing)))
+            (when (and decl-ll methods)
+              (unless (= (%lambda-list-required-count ll)
+                         (%lambda-list-required-count decl-ll))
+                (%signal-program-error)))
+            ;; Adopt the supplied lambda-list (CLHS allows reconfiguring).
+            (%gf-set-lambda-list existing ll)))
+        ;; Apply :argument-precedence-order to dispatch ordering.
+        (when apo
+          (let ((eff-ll (if ll ll (%gf-lambda-list existing))))
+            (when eff-ll
+              (%gf-set-arg-precedence name apo eff-ll))))
+        ;; Return the same callable a DEFGENERIC for NAME returned (the
+        ;; registered dispatch fn / stub) so (eqlt (defgeneric ...)
+        ;; (ensure-generic-function name)) holds — EGF.7/9/10/12/13
+        ;; compare with EQL.  Falls back to the GF struct when no
+        ;; callable was registered.
+        (return-from ensure-generic-function (%dg-gf-callable name)))
+      ;; No GF yet — refuse if NAME is already bound to a non-GF function,
+      ;; macro, or special operator.
+      (cond
+        ((and (symbolp name) (macro-function name))
+         (error "ensure-generic-function: ~S names a macro" name))
+        ((and (symbolp name) (special-operator-p name))
+         (error "ensure-generic-function: ~S names a special operator" name))
+        ((and (fboundp name)
+              (not (%generic-function-p (fdefinition name))))
+         (error "ensure-generic-function: ~S already names a non-generic function" name)))
+      (let ((gf (%defgeneric name nil nil)))
+        (set-symbol-function name (%make-gf-stub name))
+        ;; Record a supplied :lambda-list so a later incongruent EGF call
+        ;; (once methods exist) can be detected (EGF.5/.6).
+        (when ll-given (%gf-set-lambda-list gf ll))
+        (when (and apo ll) (%gf-set-arg-precedence name apo ll))
+        ;; Same callable-return contract as the existing-GF branch.
+        (let ((callable (%dg-gf-callable name)))
+          (if callable callable gf))))))
 
 ;;; ============================================================
 ;;; find-method / remove-method / add-method

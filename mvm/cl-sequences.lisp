@@ -2434,45 +2434,73 @@
   "Apply FN to elements of SEQS, storing each result in successive
    positions of RESULT. Stops at the shortest of RESULT and SEQS.
 
-   array-wrapper-p check precedes consp so fp/displaced/adjustable
-   wrappers route to aref/aset (NOT set-car on the wrapper's cons cell
-   which would clobber the fill-pointer).  Was breaking map-into tests
-   like 17697 on fp-wrapped strings."
-  (let* ((result-len (length result))
-         (wrap-p (and (consp result) (array-wrapper-p result)))
-         (cons-p (and (consp result) (not wrap-p)))
-         (n (let ((m result-len))
+   CLHS map-into semantics for vectors:
+   - The maximum number of elements stored is the ARRAY-TOTAL-SIZE of the
+     result vector (NOT its current fill pointer — a 6-element fp=3 vector
+     can take up to 6 mapped values).  We therefore measure capacity with
+     ARRAY-TOTAL-SIZE, not LENGTH (LENGTH returns the fill pointer).
+   - When the result has a fill pointer, it is set to the number of
+     elements actually mapped.
+
+   Result-shape dispatch:
+   - cons (a real list, NOT an array wrapper): set-car down the spine.
+   - everything array-ish (plain vector, fp/displaced/adjustable cons
+     wrapper, native MDA, bit/char specialised): store via the generic
+     ASET, which already routes each wrapper/MDA flavour correctly.  The
+     array-wrapper-p check precedes consp so fp/displaced/adjustable
+     wrappers route to aset (NOT set-car on the wrapper's cons cell which
+     would clobber the fill-pointer)."
+  (let* ((cons-p (and (consp result) (not (array-wrapper-p result))))
+         ;; CLHS: (map-into nil …) returns NIL immediately (the empty list
+         ;; result has zero capacity).  NIL is not consp, so without this
+         ;; guard cap would route to ARRAY-TOTAL-SIZE → type-error.
+         (nil-p (null result))
+         ;; Capacity: 0 for the empty-list result, list-length for cons
+         ;; results, ARRAY-TOTAL-SIZE for any array-ish result (handles
+         ;; fp/MDA where LENGTH = fill ptr).
+         (cap (cond (nil-p 0)
+                    (cons-p (length result))
+                    (t (array-total-size result))))
+         (n (let ((m cap))
               (dolist (s seqs m)
                 (let ((sl (length s)))
-                  (when (< sl m) (setq m sl)))))))
+                  (when (< sl m) (setq m sl))))))
+         ;; Character store: ASET on a STRING wants a char-code, but ASET
+         ;; on an MDA/wrapper char-array accepts the character object.
+         (str-p (stringp result)))
     (if (null seqs)
         (let ((i 0))
-          (loop (when (>= i result-len) (return result))
+          (loop (when (>= i n) (return))
             (let ((v (funcall fn)))
               (cond
                 (cons-p (set-car (nthcdr i result) v))
-                (wrap-p (aset result i
-                              (if (and (stringp result) (characterp v))
-                                  (char-code v) v)))
-                (t (aset result i
-                         (if (and (stringp result) (characterp v))
-                             (char-code v) v)))))
+                ;; Variable-index ASET as a non-last form: wrap in LET to
+                ;; force dest=frame-slot (CLAUDE.md "Variable-index ASET").
+                (t (let ((dummy (aset result i
+                                      (if (and str-p (characterp v))
+                                          (char-code v) v))))
+                     dummy))))
             (setq i (+ i 1))))
         (let ((i 0))
-          (loop (when (>= i n) (return result))
+          (loop (when (>= i n) (return))
             (let ((args (let ((r nil) (sr (reverse seqs)))
                           (dolist (s sr r)
                             (setq r (cons (elt s i) r))))))
               (let ((v (apply fn args)))
                 (cond
                   (cons-p (set-car (nthcdr i result) v))
-                  (wrap-p (aset result i
-                                (if (and (stringp result) (characterp v))
-                                    (char-code v) v)))
-                  (t (aset result i
-                           (if (and (stringp result) (characterp v))
-                               (char-code v) v))))))
-            (setq i (+ i 1)))))))
+                  (t (let ((dummy (aset result i
+                                        (if (and str-p (characterp v))
+                                            (char-code v) v))))
+                       dummy)))))
+            (setq i (+ i 1)))))
+    ;; CLHS: set fill pointer to number of elements mapped, if present.
+    ;; Guard with (not cons-p): a plain list like (6 2 3) has a fixnum
+    ;; car, so array-has-fill-pointer-p / %fp-inner would mis-classify it
+    ;; as an fp-wrapper and set-car position 0 — corrupting the result.
+    (when (and (not cons-p) (not nil-p) (array-has-fill-pointer-p result))
+      (set-fill-pointer result n))
+    result))
 
 ;;; Sequence predicates.  Avoid `(apply #'every pred seq more)' — apply
 ;;; through a sibling &rest defun is documented as fragile.  Dispatch

@@ -3394,6 +3394,63 @@
   (run-test 9657 (lambda () (multiple-value-list (subtypep* '(rational 10 20) '(real 11)))) '(nil t))
   (run-test 9658 (lambda () (multiple-value-list (subtypep* '(rational * 10) '(rational * 9)))) '(nil t))
   (run-test 9659 (lambda () (multiple-value-list (subtypep* '(rational 0 10) '(integer * 10)))) '(nil t))
+  ;; ============================================================
+  ;; MAP-INTO probes (9680-9699) — Claude Fable 5 seat
+  ;; fill-pointer update + bit-vector store
+  ;; ============================================================
+  ;; fp-array wrapper shape: make-array :initial-element :fill-pointer
+  (run-test 9680
+    (lambda () (let ((a (make-array 6 :initial-element 'x :fill-pointer 3)))
+                 (array-has-fill-pointer-p a)))
+    't)
+  ;; fp-array from make-array :fill-pointer is a NATIVE MDA, NOT a cons
+  ;; wrapper — so map-into must dispatch via array-total-size / aset /
+  ;; set-fill-pointer, not the consp/set-car list path.
+  (run-test 9681
+    (lambda () (let ((a (make-array 6 :initial-element 'x :fill-pointer 3)))
+                 (consp a)))
+    'nil)
+  ;; map-into fewer than fp → fp becomes count
+  (run-test 9682
+    (lambda () (let ((a (make-array 6 :initial-element 'x :fill-pointer 3)))
+                 (map-into a #'identity '(1 2))
+                 (fill-pointer a)))
+    2)
+  (run-test 9683
+    (lambda () (let ((a (make-array 6 :initial-element 'x :fill-pointer 3)))
+                 (map-into a #'identity '(1 2 3 4 5))
+                 (fill-pointer a)))
+    5)
+  ;; map-into with no seqs fills to total length, fp = length
+  (run-test 9684
+    (lambda () (let ((a (make-array 6 :initial-element 'x :fill-pointer 3)))
+                 (map-into a #'(lambda () 'y))
+                 (fill-pointer a)))
+    6)
+  ;; bit-vector store
+  (run-test 9685
+    (lambda () (let ((v (copy-seq #*0100110)))
+                 (map-into v #'identity '(0 1 1 1 0 0 1))
+                 v))
+    #*0111001)
+  (run-test 9686
+    (lambda () (let ((v (make-array '(8) :initial-contents '(0 1 0 0 1 1 0 1)
+                                    :fill-pointer 4 :element-type 'bit)))
+                 (map-into v #'(lambda () 1))
+                 (fill-pointer v)))
+    8)
+  ;; map-into nil returns nil immediately (CLHS) — guards against the
+  ;; array-total-size type-error crash on the empty-list result.
+  (run-test 9688
+    (lambda () (map-into nil #'identity '(1 2 3)))
+    'nil)
+  ;; map-into into a string with fewer source chars sets fp to count.
+  (run-test 9689
+    (lambda () (let ((a (make-array 6 :initial-element #\x
+                                    :element-type 'character :fill-pointer 3)))
+                 (map-into a #'identity "abcd")
+                 (fill-pointer a)))
+    4)
   )
 
 ;;; ============================================================

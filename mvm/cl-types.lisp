@@ -1968,6 +1968,41 @@
 ;; the intrinsic, so the compiled function is just the inline tag check.
 (defun ratiop (x) (ratiop x))
 
+;; RATIONALP — true for any integer (fixnum/bignum) or ratio.  cl-eval's
+;; earlier (defun rationalp (x) (integerp x)) missed ratios; cl-types
+;; loads after cl-eval so this definition wins.
+(defun rationalp (x)
+  (or (integerp x) (bignump x) (ratiop x)))
+
+;; RATIONAL — convert a real to an EXACT rational.  Floats decode to the
+;; exact rational they represent (IEEE doubles are binary fractions, so
+;; this is always an integer or a power-of-two-denominator ratio).
+;; Integers and ratios pass through unchanged.  cl-clos's
+;; (defun rational (n) n) stub returned the float verbatim, so
+;; (eql (rational 5.0) 5) was NIL; this exact decode fixes that.
+(defun rational (n)
+  (cond
+    ((integerp n) n)
+    ((bignump n) n)
+    ((ratiop n) n)
+    ((%ieee-float-p n) (%ieee-float-to-rat n))
+    ;; modus rational-form float: 2-slot #x32 array num/den
+    ((and (not (fixnump n)) (not (consp n)) (not (null n))
+          (not (characterp n))
+          (= (obj-subtag n) #x32) (= (array-length n) 2))
+     (let ((num (aref n 0)) (den (aref n 1)))
+       (if (= den 1) num (%make-rat num den))))
+    (t n)))
+
+;; RATIONALIZE — for IEEE doubles RATIONAL already yields the simplest
+;; exact value (binary fraction in lowest terms), so RATIONALIZE delegates
+;; to RATIONAL.  NOTE: ansi-bridge.lisp loads AFTER cl-types and defines
+;; its own (rationalize n &rest extra) that returns N unchanged, which
+;; WINS over this one.  Left here so a future load-order change picks the
+;; exact version up; the real fix is a HANDOFF to whoever owns
+;; ansi-bridge.lisp (see final report).
+(defun rationalize (n) (rational n))
+
 (defun exact-divide (a b)
   "Divide A by B.  Integer if exact, tagged ratio otherwise.
    When either operand is a ratio, route through %rational-divide so

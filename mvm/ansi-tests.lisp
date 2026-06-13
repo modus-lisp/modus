@@ -3370,6 +3370,23 @@
     'setup-ok)
   (run-test 9611 (lambda () (%gf-dispatch 'pdmc-gf-3 (list 0 0))) #(7 8 z))
   (run-test 9612 (lambda () (%gf-dispatch 'pdmc-gf-3 (list 1 0))) #(7 8 z a))
+
+  ;; === FABLE numeric/type cluster probes (9640-9659) ===
+  ;; rational / rationalp / rationalize exactness + exact rat<->float compare
+  (run-test 9640 (lambda () (rational 5.0)) 5)
+  (run-test 9641 (lambda () (rational 0.5)) 1/2)
+  (run-test 9642 (lambda () (eql (rational (float 7 1.0)) 7)) t)
+  (run-test 9643 (lambda () (rationalp 1/2)) t)
+  (run-test 9644 (lambda () (rationalp 3)) t)
+  (run-test 9645 (lambda () (rationalp 1.5)) nil)
+  (run-test 9646 (lambda () (rationalp "x")) nil)
+  (run-test 9647 (lambda () (= 1/2 0.5)) t)
+  (run-test 9648 (lambda () (= 0.5 1/2)) t)
+  (run-test 9649 (lambda () (= 1/4 0.25)) t)
+  (run-test 9650 (lambda () (= (rational 0.25) 1/4)) t)
+  (run-test 9651 (lambda () (eql (rational (float 100 1.0)) 100)) t)
+  (run-test 9652 (lambda () (rationalize 0.5)) 1/2)
+  (run-test 9653 (lambda () (float (rational 0.25) 1.0)) 0.25)
   )
 
 ;;; ============================================================

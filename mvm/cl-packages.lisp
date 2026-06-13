@@ -719,6 +719,19 @@
                                                   (when (and g (not (gethash key g)))
                                                     (puthash key g s)))
                                                 s))))
+                                ;; A reused EXISTING symbol may have been
+                                ;; created earlier (by %INTERN-SYMBOL-PKG at
+                                ;; read/compile time, or a 'foo literal) BEFORE
+                                ;; package PKG existed — its package slot is then
+                                ;; NIL even though its composite key already
+                                ;; binds it to PKG.  Adopt PKG as its home now,
+                                ;; so (symbol-package (intern "FOO" pkg)) and the
+                                ;; find-symbol.12 / import.* third value
+                                ;; (package-name (symbol-package sym)) are PKG,
+                                ;; not NIL.
+                                (when (and (%cl-sym-p sym)
+                                           (null (%cl-sym-package sym)))
+                                  (%cl-sym-set-package sym pkg))
                                 (%pkg-set-internal pkg
                                   (%symtab-add (%pkg-internal pkg) name-str sym))
                                 (values sym nil))))))))))))

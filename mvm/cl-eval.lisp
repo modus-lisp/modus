@@ -5536,19 +5536,31 @@
     (when (null end2) (setq end2 (length seq2)))
     (let ((n1 (- end1 start1))
           (n2 (- end2 start2)))
-      (let ((count (if (< n1 n2) n1 n2))
-            (i 0))
-        (loop
-          (when (= i count) (return seq1))
-          (let ((src-elem (if (listp seq2)
-                              (nth (+ start2 i) seq2)
-                              (aref seq2 (+ start2 i)))))
-            (if (listp seq1)
-                (setf (nth (+ start1 i) seq1) src-elem)
-                (if (stringp seq1)
-                    (aset seq1 (+ start1 i) (if (characterp src-elem) (char-code src-elem) src-elem))
-                    (aset seq1 (+ start1 i) src-elem))))
-          (setq i (+ i 1)))))))
+      (let ((count (if (< n1 n2) n1 n2)))
+        ;; CLHS REPLACE: when SEQ1 and SEQ2 are the same object and the
+        ;; source/destination regions overlap, the result is as if the
+        ;; whole source window were copied to a temporary first.  We always
+        ;; materialise the source window into a fresh list, then store from
+        ;; it — overlap-safe regardless of shape (replace.7/9/24/...).
+        (let ((src (let ((r nil) (j (+ start2 count)))
+                     (loop
+                       (when (<= j start2) (return r))
+                       (setq j (- j 1))
+                       (setq r (cons (if (listp seq2)
+                                         (nth j seq2)
+                                         (aref seq2 j))
+                                     r))))))
+          (let ((i 0) (cur src))
+            (loop
+              (when (= i count) (return seq1))
+              (let ((src-elem (car cur)))
+                (if (listp seq1)
+                    (setf (nth (+ start1 i) seq1) src-elem)
+                    (if (stringp seq1)
+                        (aset seq1 (+ start1 i) (if (characterp src-elem) (char-code src-elem) src-elem))
+                        (aset seq1 (+ start1 i) src-elem))))
+              (setq cur (cdr cur))
+              (setq i (+ i 1)))))))))
 
 ;; Adjustable arrays
 (defun adjustable-array-p (array)

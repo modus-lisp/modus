@@ -272,6 +272,15 @@
          (if fn fn v))))
     (t v)))
 
+(defun %require-sequence (seq)
+  "Signal a type-error unless SEQ is a sequence (list, string, array, or
+   array-wrapper).  CLHS requires FIND/POSITION/COUNT/etc. to type-error
+   on a non-sequence SEQUENCE argument (e.g. a bare symbol)."
+  (unless (or (null seq) (listp seq) (stringp seq) (arrayp seq)
+              (array-wrapper-p seq))
+    (error "sequence function: not a sequence"))
+  seq)
+
 (defun parse-test-key (args)
   "Parse :test and :key keyword args. Returns (test-fn . key-fn).
    test-fn may be NIL — callers should use inline `eql` in that case
@@ -620,16 +629,27 @@
    :start, :end, :from-end.
    :test/:test-not/:key accept function designators (symbol or function)."
   (%seq-subst-check-kwargs args)
-  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil) (a args))
+  ;; CLHS: SEQ must be a sequence — type-error otherwise.
+  (unless (or (null seq) (listp seq) (stringp seq) (arrayp seq) (array-wrapper-p seq))
+    (error "count: not a sequence"))
+  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil) (a args)
+        ;; CLHS §3.4.1.4.1: leftmost occurrence of a repeated keyword wins.
+        (test-set nil) (key-set nil) (start-set nil) (end-set nil) (fe-set nil))
     (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test (%resolve-fn (cadr a))) (setq a (cddr a)))
-            ((eq (car a) :key) (setq key (%resolve-fn (cadr a))) (setq a (cddr a)))
-            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end) (setq end (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :test)
+             (unless test-set (setq test (%resolve-fn (cadr a)) test-set t)) (setq a (cddr a)))
+            ((eq (car a) :key)
+             (unless key-set (setq key (%resolve-fn (cadr a)) key-set t)) (setq a (cddr a)))
+            ((eq (car a) :start)
+             (unless start-set (setq start (cadr a) start-set t)) (setq a (cddr a)))
+            ((eq (car a) :end)
+             (unless end-set (setq end (cadr a) end-set t)) (setq a (cddr a)))
+            ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a) fe-set t)) (setq a (cddr a)))
             ((eq (car a) :test-not)
-             (let ((f (%resolve-fn (cadr a))))
-               (setq test (lambda (x y) (not (funcall f x y)))))
+             (unless test-set
+               (let ((f (%resolve-fn (cadr a))))
+                 (setq test (lambda (x y) (not (funcall f x y))) test-set t)))
              (setq a (cddr a)))
             (t (setq a (cdr a)))))
     ;; count-if's iteration already presents string elements as CHARACTERS
@@ -2157,6 +2177,14 @@
                          ;; 17.1: result must be a concrete subtype.)
                          sequence))
       (%signal-type-error))
+    ;; NULL is the (empty) sequence type containing only NIL.  An empty
+    ;; concatenation yields NIL; a non-empty one is a type-error.
+    (when (eq head 'null)
+      (let ((total 0))
+        (dolist (s seqs) (setq total (+ total (%concat-elt-count s))))
+        (if (= total 0)
+            (return-from concatenate nil)
+            (%signal-type-error))))
     (when (and (consp result-type) (consp (cdr result-type)))
       (let* ((rest (cdr result-type))
              (total 0)
@@ -2255,7 +2283,14 @@
                ((consp s)
                 (dolist (c s)
                   (aset result pos c) (setq pos (+ pos 1))))
-               (t  ;; string or vector
+               ((stringp s)
+                ;; String slots hold fixnum char-codes; a VECTOR result must
+                ;; receive CHARACTER objects (concatenate-vector.X expects
+                ;; #\a not 97).
+                (dotimes (i (array-length s))
+                  (aset result pos (code-char (aref s i)))
+                  (setq pos (+ pos 1))))
+               (t  ;; vector
                 (dotimes (i (array-length s))
                   (aset result pos (aref s i))
                   (setq pos (+ pos 1))))))
@@ -2294,6 +2329,12 @@
                          ratio rational complex number real
                          hash-table package readtable stream pathname))
       (%signal-type-error))
+    ;; NULL is the type containing only NIL — a valid (empty) sequence
+    ;; designator.  Merging a non-empty result into NULL is a type-error.
+    (when (eq head 'null)
+      (if (= merged-len 0)
+          (return-from merge nil)
+          (%signal-type-error)))
     (when (and (consp result-type) (consp (cdr result-type)))
       (let* ((rest (cdr result-type))
              (len-slot (cond
@@ -2361,7 +2402,9 @@
                (setq cur (cdr cur)) (setq i (+ i 1))))))))))
 
 (defun replace (s1 s2 &rest args)
-  "Replace elements of S1 with elements from S2."
+  "Replace elements of S1 with elements from S2.
+   NOTE: this definition is SHADOWED by the one in cl-eval.lisp (loaded
+   later → last-defun-wins).  The active overlap-safe version lives there."
   (%check-kw-allowed args '(:start1 :end1 :start2 :end2))
   (let ((len (if (< (length s1) (length s2)) (length s1) (length s2))))
     (dotimes (i len)
@@ -2666,9 +2709,11 @@
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
-         (from-end nil) (a args))
+         (from-end nil) (fe-set nil) (a args))
+    ;; CLHS §3.4.1.4.1: leftmost occurrence of a repeated keyword wins.
     (loop (when (null a) (return))
-      (cond ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a) fe-set t)) (setq a (cddr a)))
             (t (setq a (cdr a)))))
     (cond
       ((null seq) nil)
@@ -2933,9 +2978,11 @@
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
-         (from-end nil) (a args))
+         (from-end nil) (fe-set nil) (a args))
+    ;; CLHS §3.4.1.4.1: leftmost occurrence of a repeated keyword wins.
     (loop (when (null a) (return))
-      (cond ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
+      (cond ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a) fe-set t)) (setq a (cddr a)))
             (t (setq a (cdr a)))))
     (cond
       ((null seq) nil)
@@ -2976,6 +3023,7 @@
    :test-not is the negation of :test.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
   (%seq-subst-check-kwargs args)
+  (%require-sequence sequence)
   (let ((test nil) (test-not nil) (key nil)
         (start 0) (end nil) (from-end nil)
         (test-set nil) (tn-set nil) (key-set nil)
@@ -3061,6 +3109,7 @@
    Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
    :allow-other-keys T) signals PROGRAM-ERROR."
   (setq predicate (%resolve-fn predicate))
+  (%require-sequence sequence)
   (let ((key nil) (start 0) (end nil) (from-end nil)
         (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
         (allow-other nil) (aok-set nil))
@@ -3136,6 +3185,7 @@
    Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
    :allow-other-keys T) signals PROGRAM-ERROR."
   (setq predicate (%resolve-fn predicate))
+  (%require-sequence sequence)
   (let ((key nil) (start 0) (end nil) (from-end nil)
         (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
         (allow-other nil) (aok-set nil))
@@ -3209,6 +3259,7 @@
    Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
    :allow-other-keys T) signals PROGRAM-ERROR."
   (setq predicate (%resolve-fn predicate))
+  (%require-sequence sequence)
   (let ((key nil) (start 0) (end nil) (from-end nil)
         (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
         (allow-other nil) (aok-set nil))
@@ -3284,6 +3335,7 @@
    Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
    :allow-other-keys T) signals PROGRAM-ERROR."
   (setq predicate (%resolve-fn predicate))
+  (%require-sequence sequence)
   (let ((key nil) (start 0) (end nil) (from-end nil)
         (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
         (allow-other nil) (aok-set nil))
@@ -3355,6 +3407,7 @@
    Supports :test/:test-not/:key/:start/:end/:from-end.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicates."
   (%seq-subst-check-kwargs args)
+  (%require-sequence sequence)
   (let ((test nil) (test-not nil) (key nil)
         (start 0) (end nil) (from-end nil)
         (test-set nil) (tn-set nil) (key-set nil)

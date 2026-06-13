@@ -2062,7 +2062,44 @@
   (deftest 9486 (if (typep '(a) 'symbol) t nil) nil)
   (deftest 9487 (if (typep 1 'single-float) t nil) nil)
   (deftest 9488 (rationalize 1.5) (exact-divide 3 2))
-  (deftest 9489 (rationalize 2) 2))
+  (deftest 9489 (rationalize 2) 2)
+  ;; ==== Fable seq-diag probe block 9440-9459 ====
+  ;; replace with self+overlapping ranges (CLHS: copy as-if-via-temp)
+  ;; replace: basic non-self, no bounds
+  (deftest 9440 (let ((x (list 'a 'b 'c 'd 'e 'f)))
+                  (replace x (list 1 2 3)) x)
+    (1 2 3 d e f))
+  ;; replace: non-self with all four bounds
+  (deftest 9441 (let ((x (list 'a 'b 'c 'd 'e 'f)) (y (list 1 2 3 4 5 6)))
+                  (replace x y :start1 1 :end1 4 :start2 0 :end2 3) x)
+    (a 1 2 3 e f))
+  ;; replace: self overlapping (CLHS copy-as-if-via-temp)
+  (deftest 9442 (let ((x (list 'a 'b 'c 'd 'e 'f)))
+                  (replace x x :start1 1 :end1 4 :start2 0 :end2 3) x)
+    (a a b c e f))
+  ;; replace: self-overlap on a string
+  (deftest 9449 (let ((x (copy-seq "abcdef")))
+                  (replace x x :start1 1 :end1 4 :start2 0 :end2 3) x)
+    "aabcef")
+  ;; count :key leftmost-wins
+  (deftest 9443 (count 2 '(1 2 3 2 5) :key #'identity :key #'1+) 2)
+  ;; count type-error on non-sequence
+  (deftest 9444 (handler-case (progn (count 'a 1) nil) (error (c) t)) t)
+  ;; merge result-type NULL with empty inputs -> nil
+  (deftest 9445 (merge 'null nil nil #'<) nil)
+  ;; merge result doesn't fit NULL -> error
+  (deftest 9446 (handler-case (progn (merge 'null (list 1 2 3) (list 4 5 6) #'<) nil) (error (c) t)) t)
+  ;; concatenate NULL empty -> nil
+  (deftest 9447 (concatenate 'null nil nil) nil)
+  ;; concatenate vector with string preserves characters
+  (deftest 9448 (concatenate 'vector nil "ab" '(x y)) #(#\a #\b x y))
+  ;; remove-duplicates :from-end leftmost-wins
+  (deftest 9450 (remove-duplicates '(1 2 3 4 2 7 8 1 5) :from-end t :from-end nil)
+    (1 2 3 4 7 8 5))
+  ;; find on non-sequence -> type-error
+  (deftest 9451 (handler-case (progn (find 'a 'b) nil) (error (c) t)) t)
+  ;; position on non-sequence -> type-error
+  (deftest 9452 (handler-case (progn (position 'a 'b) nil) (error (c) t)) t))
 
 ;;; ============================================================
 ;;; Reader tests (Layer 2)

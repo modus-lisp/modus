@@ -68,6 +68,27 @@ progress and the real `GAUNTLET DONE` line.
 The remaining merge-pathnames* `(funcall #'flet-local …)` gap noted below
 is the OTHER half — independent of this ECASE fix and still open.
 
+**Binary-scope caveat (important for anyone adding ANSI probes):** the
+runtime ECASE/CCASE/CTYPECASE live in `mvm/runtime-cl-macros.lisp`, which is
+loaded ONLY by `build-generic.lisp`.  `build-ansi-test.lisp` does NOT load
+that file, so `*modus-runtime-macros*` is UNBOUND in the ANSI-test binary and
+`%install-runtime-cl-macros-late` (rt.lisp, called before the suite runs) is
+a no-op for these.  The ANSI binary's compiled data-and-control ECASE tests
+use `compiler.lisp`'s build-time `ECASE→CASE` macro instead (which has its
+own "no error on mismatch" gap — out of scope here).  Consequently a
+`(run-test … (eval '(ecase …)))` probe in `ansi-tests.lisp` CANNOT exercise
+the runtime macro in the ANSI binary and will spuriously FAIL — so the
+regression is locked by the **gauntlet** (build-generic) and the minimal
+reproducer, NOT by an ANSI probe.  Gate the runtime macros on build-generic.
+
+**Run-to-run variance in the define-package region:** the gauntlet's
+post-form-56 frontier oscillates between `GAUNTLET DONE forms=243 fails=57`
+(whole file reads) and `READ-ERROR after form 226` / `forms=226 fails=127`,
+same binary.  This is the documented GC keyword-corruption cascade noise
+(forms 87-226, all `WITH-UPGRADABILITY`/`DEFINE-PACKAGE`/`IN-PACKAGE`
+`%eval-escape`) — NOT an ECASE artifact.  What is stable across runs: form 56
+PASSES, forms 57-86 run clean, form 43 is the expected detect-os error.
+
 ### 2026-06-13 — DEFUN implicit-BLOCK / RETURN-FROM `%eval-escape` FIXED (one genuine control-flow component of the define-package cluster)
 
 The README claim below ("DEFINE-PACKAGE `%eval-escape` is a GC keyword-

@@ -3118,42 +3118,21 @@
               (multiple-value-list (eval '(rf-probe-3 t))))
             '(1 2 3))
 
-  ;; --- runtime-EVAL ECASE / CCASE / CTYPECASE probes (9613-9619) ---
-  ;; runtime-cl-macros.lisp gained ECASE/CCASE/CTYPECASE (mirroring the
-  ;; existing CASE/TYPECASE/ETYPECASE macros).  ECASE = CASE + type-error on
-  ;; no-match (no T/OTHERWISE); CCASE degrades to ECASE-like signal; CTYPECASE
-  ;; degrades to ETYPECASE-like signal.  uiop's merge-pathname-directory-
-  ;; component uses ECASE; gauntlet form 56 depends on this.
-  (run-test 9613
-            (lambda () (eval '(ecase 2 (1 :a) (2 :b) (3 :c))))
-            ':b)
-  ;; ECASE key-list clause
-  (run-test 9614
-            (lambda () (eval '(ecase 3 ((1 2) :lo) ((3 4) :hi))))
-            ':hi)
-  ;; ECASE no-match signals (caught → sentinel, NOT %eval-escape through us)
-  (run-test 9615
-            (lambda () (handler-case (eval '(ecase 9 (1 :a) (2 :b)))
-                         (t (c) :signalled)))
-            ':signalled)
-  ;; CCASE matching clause returns the value
-  (run-test 9616
-            (lambda () (eval '(ccase 5 (4 :four) (5 :five))))
-            ':five)
-  ;; CCASE no-match signals
-  (run-test 9617
-            (lambda () (handler-case (eval '(ccase 0 (1 :a)))
-                         (t (c) :signalled)))
-            ':signalled)
-  ;; CTYPECASE matching clause
-  (run-test 9618
-            (lambda () (eval '(ctypecase "x" (integer :i) (string :s))))
-            ':s)
-  ;; CTYPECASE no-match signals
-  (run-test 9619
-            (lambda () (handler-case (eval '(ctypecase 9 (string :s) (cons :c)))
-                         (t (c) :signalled)))
-            ':signalled)
+  ;; --- runtime-EVAL ECASE / CCASE / CTYPECASE (gauntlet form 56) ---
+  ;; ECASE/CCASE/CTYPECASE were added to runtime-cl-macros.lisp (mirroring
+  ;; the existing CASE/TYPECASE/ETYPECASE) so runtime EVAL of (ecase …) stops
+  ;; %eval-escape'ing; uiop's merge-pathname-directory-component uses ECASE
+  ;; and the asdf gauntlet halted at form 56 until this landed.
+  ;;
+  ;; These have NO ANSI-binary probe here on purpose: build-ansi-test.lisp
+  ;; does not load runtime-cl-macros.lisp, so `*modus-runtime-macros*` is
+  ;; unbound and the runtime ECASE/CCASE/CTYPECASE definitions are simply not
+  ;; present in this binary (the compiled ANSI data-and-control tests use
+  ;; compiler.lisp's build-time ECASE instead).  The regression for the
+  ;; runtime path is locked by the asdf gauntlet (form 56 PASS → GAUNTLET
+  ;; DONE) on the build-generic binary, plus the minimal reproducer in
+  ;; vendor/asdf/README.md:  (eval '(ecase 2 (1 :a) (2 :b))) ⇒ :B and
+  ;; (eval '(ecase 9 (1 :a))) signals instead of escaping.
 
   ;; --- define-method-combination probes (9600-9612) ---
   ;; The define-method-combination / defgeneric / defmethod MACROS are

@@ -961,8 +961,30 @@
 ;;; --- parse-namestring ---
 
 (defun parse-namestring (thing &rest args)
-  "Parse a namestring.  Returns (values pathname position)."
-  (declare (ignore args))
+  "Parse a namestring.  Returns (values pathname position).
+   Lambda list: thing &optional host default-pathname &key start end
+   junk-allowed.  The keyword tail is validated so a malformed call
+   (unknown key, dangling key, non-integer :start/:end) signals an error
+   per CLHS — Modus does not otherwise honor host/start/end positioning."
+  ;; Skip the two positional optionals (host, default-pathname); the rest
+  ;; are keyword/value pairs.
+  (let ((kw (cddr args)))
+    (loop
+      (when (null kw) (return nil))
+      (let ((key (car kw)))
+        (cond
+          ((or (eq key :start) (eq key :end))
+           (when (null (cdr kw))
+             (error "parse-namestring: missing value for ~S" key))
+           (let ((v (cadr kw)))
+             (when (and v (not (integerp v)))
+               (error "parse-namestring: ~S must be an integer, got ~S" key v))))
+          ((eq key :junk-allowed)
+           (when (null (cdr kw))
+             (error "parse-namestring: missing value for :junk-allowed")))
+          (t
+           (error "parse-namestring: unknown keyword argument ~S" key))))
+      (setq kw (cddr kw))))
   (let ((p (%coerce-to-pathname thing)))
     (values p (length (namestring p)))))
 
@@ -973,6 +995,8 @@
    Components missing in PATH are filled from DEFAULTS."
   (let* ((p (%coerce-to-pathname path))
          (defaults-arg (if args (car args) *default-pathname-defaults*))
+         ;; default-version is the optional 3rd argument; CLHS default :newest.
+         (default-version (if (cdr args) (cadr args) :newest))
          (d (%coerce-to-pathname defaults-arg))
          (host (or (aref p 2) (aref d 2)))
          (device (or (aref p 3) (aref d 3)))
@@ -989,9 +1013,18 @@
                 (append d-dir (cdr p-dir)))
                (t p-dir)))
             (t p-dir)))
-         (name (or (aref p 5) (aref d 5)))
+         (p-name (aref p 5))
+         (name (or p-name (aref d 5)))
          (type (or (aref p 6) (aref d 6)))
-         (version (or (aref p 7) (aref d 7) :newest)))
+         ;; CLHS 19.2.3 version rule: pathname's version if non-nil; else if
+         ;; pathname has no name, defaults's version (falling through to
+         ;; default-version when defaults's version is also nil, matching
+         ;; the nil≈:newest normalization implementations use); else
+         ;; default-version.
+         (version (cond
+                    ((aref p 7) (aref p 7))
+                    ((null p-name) (or (aref d 7) default-version))
+                    (t default-version))))
     (%make-pathname-obj host device directory name type version)))
 
 ;;; --- wild-pathname-p ---

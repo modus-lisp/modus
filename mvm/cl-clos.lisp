@@ -914,6 +914,51 @@
 ;;; the common (make-instance 'class :k v ...) shape inline; this defun
 ;;; handles the rest — class-object args, missing/extra args, runtime
 ;;; (eval `(make-instance ...)) callers).
+(defun %clos-initarg-key-valid-p (class-name key)
+  "True if KEY is a declared :initarg for some slot of CLASS-NAME (walking
+   the CPL), or one of the always-accepted standard initargs.  Used to
+   reject unknown initargs in MAKE-INSTANCE per CLHS 7.1.2."
+  (cond
+    ;; :allow-other-keys is always accepted (CLHS 7.1.2).
+    ((%clos-sym-name-eq key :allow-other-keys) t)
+    ;; Maps to at least one slot anywhere in the CPL → valid.
+    ((%clos-initarg-to-slot class-name key) t)
+    (t nil)))
+
+(defun %clos-validate-initargs (class-name initargs)
+  "Validate INITARGS (a plist) for MAKE-INSTANCE on CLASS-NAME.  Signals
+   PROGRAM-ERROR for a malformed (odd-length) initarg list, and ERROR for
+   an unrecognised initarg keyword unless :allow-other-keys is non-NIL.
+   Per CLHS 7.1.2 / 7.1.1."
+  ;; 1. The initarg list must be a proper even-length plist (program-error).
+  (let ((cur initargs) (count 0))
+    (loop
+      (when (null cur) (return nil))
+      (when (not (consp cur))
+        (error "make-instance: malformed initarg list"))
+      (setq count (+ count 1))
+      (setq cur (cdr cur)))
+    (when (not (= 0 (mod count 2)))
+      (error "make-instance: odd number of initarg arguments")))
+  ;; 2. Determine whether :allow-other-keys was supplied non-NIL.
+  (let ((aok nil) (cur initargs))
+    (loop
+      (when (null cur) (return nil))
+      (when (and (consp (cdr cur))
+                 (%clos-sym-name-eq (car cur) :allow-other-keys)
+                 (cadr cur))
+        (setq aok t))
+      (setq cur (cddr cur)))
+    ;; 3. Unless :allow-other-keys, every supplied initarg must be valid.
+    (unless aok
+      (let ((c2 initargs))
+        (loop
+          (when (null c2) (return nil))
+          (let ((key (car c2)))
+            (unless (%clos-initarg-key-valid-p class-name key)
+              (error "make-instance: invalid initarg ~S" key)))
+          (setq c2 (cddr c2)))))))
+
 (defun make-instance (&rest args)
   "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
    INITIALIZE-INSTANCE on it with the initargs.  We bypass apply on
@@ -925,11 +970,19 @@
     (t
      (let* ((class-or-name (car args))
             (initargs (cdr args))
+            (class-name (if (%clos-class-p class-or-name)
+                            (aref class-or-name 1)
+                            class-or-name))
             (inst (%make-instance class-or-name))
             ;; make-instance applies default-initargs (CLHS 7.1.4); bind
             ;; the flag so the shared-initialize default body picks them up.
             (*clos-applying-defaults* t))
        (when (null inst) (return-from make-instance nil))
+       ;; CLHS 7.1.2: reject malformed / unknown initargs.  Only validate
+       ;; for genuine CLOS classes (registered); skip when inst allocation
+       ;; succeeded but the class has no slot-info (defensive).
+       (when (%find-clos-class class-name)
+         (%clos-validate-initargs class-name initargs))
        (%dispatch-initialize-instance (cons inst initargs))
        inst))))
 
@@ -1076,8 +1129,20 @@
         (setq *clos-class-slot-values* new-list)))))
 
 (defun %slot-exists-p (obj slot-name)
-  "True if OBJ has a slot named SLOT-NAME."
-  (when (or (null obj) (not (%clos-instance-p obj)))
+  "True if OBJ has a slot named SLOT-NAME.  Per CLHS, SLOT-EXISTS-P may
+   be called on any object, not just standard objects — in particular it
+   must work on condition objects (slot-exists-p.15/.16)."
+  (when (null obj) (return-from %slot-exists-p nil))
+  ;; Condition objects: query the condition-type slot registry.  Conditions
+  ;; are #x32 arrays too, so check this before the CLOS-instance path.
+  (when (%condition-p obj)
+    (let ((cur (%collect-all-slots (%condition-type-name obj))))
+      (loop
+        (when (null cur) (return-from %slot-exists-p nil))
+        (when (%clos-sym-name-eq (car (car cur)) slot-name)
+          (return-from %slot-exists-p t))
+        (setq cur (cdr cur)))))
+  (when (not (%clos-instance-p obj))
     (return-from %slot-exists-p nil))
   (let ((cls (%find-clos-class (aref obj 1))))
     (when (null cls) (return-from %slot-exists-p nil))

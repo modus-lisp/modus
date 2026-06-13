@@ -3645,18 +3645,19 @@
                    (funcall (lambda () (return-from foo 1))))
                  2)))
     2)
-  ;; flet handler doing cross-unit return-from (handler-bind.10 shape):
-  (rt-run-test 9526
-    (funcall (lambda ()
-               (block done
-                 (flet ((%succeed (c) (declare (ignore c)) (return-from done 'good)))
-                   (%with-handler-bind
-                    (list (list 'simple-condition #'%succeed))
-                    (lambda () (signal "x")))))))
-    'good)
-  ;; The remaining two shapes are NOT yet handled and are wrapped in
-  ;; handler-case so a crash FAILs the probe instead of aborting the
-  ;; whole custom suite.  Follow-ups (see compiler.lisp commentary):
+  ;; The remaining shapes are NOT yet handled.  9526 returns NIL (clean
+  ;; FAIL, no crash); 9525/9523 crash, so they are wrapped in handler-case
+  ;; to FAIL as :crashed instead of SIGSEGV-aborting the custom suite.
+  ;; Follow-ups (see compiler.lisp commentary):
+  ;;   9526 — flet/labels-local handler doing a cross-unit return-from
+  ;;          (handler-bind.10 shape).  %return-from-escapes-block-p only
+  ;;          treats LAMBDA / (FUNCTION (LAMBDA …)) as unit boundaries, not
+  ;;          FLET/LABELS bodies, so the BLOCK gets no catch frame and the
+  ;;          return-from falls through to a function-return → NIL.  A
+  ;;          flet-aware detection was tried but regressed UNWIND-PROTECT
+  ;;          .6-8 / FLET.52 / LABELS.27 (the same unwind-protect+%nlx-throw
+  ;;          interaction as 9525) and was reverted; needs the 9525 fix
+  ;;          first.
   ;;   9525 — unwind-protect cleanup on a cross-unit %nlx-throw: the
   ;;          %hc-longjmp must land in the intervening unwind-protect
   ;;          setjmp frame, run cleanup, then re-longjmp to the BLOCK's
@@ -3667,6 +3668,16 @@
   ;;          way so restart-case internals are unperturbed), which
   ;;          re-enters the signal walk.  A %nlx-style direct longjmp for
   ;;          user THROW-from-handler is the eventual fix.
+  (rt-run-test 9526
+    (handler-case
+        (funcall (lambda ()
+                   (block done
+                     (flet ((%succeed (c) (declare (ignore c)) (return-from done 'good)))
+                       (%with-handler-bind
+                        (list (list 'simple-condition #'%succeed))
+                        (lambda () (signal "x")))))))
+      (t (c) (declare (ignore c)) :crashed))
+    'good)
   (rt-run-test 9525
     (handler-case
         (funcall (lambda ()

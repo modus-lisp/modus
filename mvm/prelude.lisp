@@ -1459,10 +1459,33 @@
            (let ((sym (%alloc-sym3)))
              (aset sym 0 name-hash)
              ;; Look up the home package.  pkg-hash=0 means none.
+             ;;
+             ;; A NON-zero pkg-hash means compile-quote knew this literal's
+             ;; home package at build time — it is a genuine interned
+             ;; symbol, never a gensym (those pass pkg-hash=0).  But the
+             ;; build-host package may not have a runtime counterpart in
+             ;; the pkg-by-hash table: ANSI-test deftest bodies and our own
+             ;; source are READ into host packages like MODUS.MVM /
+             ;; COMMON-LISP-USER, only some of which are registered.  When
+             ;; the lookup misses, leaving slot 1 NIL is WRONG: the printer
+             ;; then treats the symbol as uninterned and emits `#:NAME`
+             ;; (format-s, print-cons, print-array all expect bare `NAME`).
+             ;; So a known-but-unresolved home package falls back to the
+             ;; default user package (CL-USER) — the symbol IS interned,
+             ;; just in a package whose hash we don't carry.  Genuine
+             ;; uninterned symbols keep slot 1 = NIL via the pkg-hash=0
+             ;; branch; keywords never reach here (they intern through
+             ;; %INTERN-KEYWORD).
              (let ((pkg nil))
                (when (> pkg-hash 0)
                  (let ((pkg-tab (mem-ref #x10000170 :u64)))
-                   (when pkg-tab (setq pkg (gethash pkg-hash pkg-tab)))))
+                   (when pkg-tab
+                     (setq pkg (gethash pkg-hash pkg-tab))
+                     (when (null pkg)
+                       ;; Unresolved known package — default to CL-USER,
+                       ;; looked up from the same table by its canonical
+                       ;; name hash (self-heals if registration changes).
+                       (setq pkg (gethash 26532410810097741 pkg-tab))))))
                (aset sym 1 pkg))
              (aset sym 2 "")    ; name — SYMBOL-NAME reverse-fills via *SYM-NAME-TABLE*
              ;; Re-read the root — %ALLOC-SYM3 may have triggered GC.

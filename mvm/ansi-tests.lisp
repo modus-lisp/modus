@@ -2204,6 +2204,14 @@
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
+  ;; ==== FABLE symbol-package probe block 9460-9479 ====
+  (run-test 9460 (lambda () (if (symbol-package 'abc) t nil)) 't)
+  (run-test 9461 (lambda () (format nil "~S" 'abc)) "ABC")
+  (run-test 9462 (lambda () (format nil "~A" 'abc)) "ABC")
+  (run-test 9463 (lambda () (if (symbol-package (make-symbol "ABC")) t nil)) 'nil)
+  (run-test 9464 (lambda () (format nil "~S" (make-symbol "ZQ"))) "#:ZQ")
+  (run-test 9465 (lambda () (eq 'foo 'foo)) 't)
+  ;; ==== end FABLE probe block 9460-9479 ====
   ;; ==== CND agent probe block 9700-9719 (conditions cluster) ====
   ;; Self-contained reproducers for cl-conditions.lisp behaviour.
   ;; handler-bind handler doing a non-local exit:

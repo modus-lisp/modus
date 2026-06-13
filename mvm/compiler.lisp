@@ -7273,6 +7273,28 @@
                       (loop while (consp cur) do
                         (walk (car cur) t sh)
                         (setq cur (cdr cur)))))
+                   ;; flet / labels — each local function body is compiled
+                   ;; as its OWN unit (mvm-compile-function-internal resets
+                   ;; *block-labels*), so a RETURN-FROM to an enclosing
+                   ;; BLOCK inside a local function is cross-unit.  Walk the
+                   ;; function bodies with the lambda flag set, and also
+                   ;; walk the flet/labels body forms (still in the current
+                   ;; unit — flag unchanged).
+                   ((or (%form-op-is form 230909053785822708 "FLET")
+                        (%form-op-is form 176230696681611090 "LABELS"))
+                    (let ((defs (cadr form)))
+                      (let ((cur defs))
+                        (loop while (consp cur) do
+                          ;; each def = (name (args) body...) — body crosses
+                          (let ((bcur (cddr (car cur))))
+                            (loop while (consp bcur) do
+                              (walk (car bcur) t sh)
+                              (setq bcur (cdr bcur))))
+                          (setq cur (cdr cur)))))
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do
+                        (walk (car cur) xl sh)
+                        (setq cur (cdr cur)))))
                    ;; (function (lambda ...)) — recurse with the lambda case
                    ((%form-op-is form 113179339635393781 "FUNCTION")
                     (walk (cadr form) xl sh))

@@ -3645,16 +3645,6 @@
                    (funcall (lambda () (return-from foo 1))))
                  2)))
     2)
-  ;; unwind-protect cleanup must still run on cross-unit non-local exit:
-  (rt-run-test 9525
-    (funcall (lambda ()
-               (let ((acc nil))
-                 (block foo
-                   (unwind-protect
-                        (funcall (lambda () (return-from foo (setq acc (cons 'b acc)))))
-                     (setq acc (cons 'a acc))))
-                 acc)))
-    '(a b))
   ;; flet handler doing cross-unit return-from (handler-bind.10 shape):
   (rt-run-test 9526
     (funcall (lambda ()
@@ -3664,14 +3654,39 @@
                     (list (list 'simple-condition #'%succeed))
                     (lambda () (signal "x")))))))
     'good)
-  ;; catch/throw THROUGH a handler-bind handler (placed last — see note):
+  ;; The remaining two shapes are NOT yet handled and are wrapped in
+  ;; handler-case so a crash FAILs the probe instead of aborting the
+  ;; whole custom suite.  Follow-ups (see compiler.lisp commentary):
+  ;;   9525 — unwind-protect cleanup on a cross-unit %nlx-throw: the
+  ;;          %hc-longjmp must land in the intervening unwind-protect
+  ;;          setjmp frame, run cleanup, then re-longjmp to the BLOCK's
+  ;;          catch.  Currently crashes (the cleanup/relongjmp interaction
+  ;;          with the nested-lambda protected form is unresolved).
+  ;;   9523 — user (throw 'done …) performed FROM a handler-bind handler:
+  ;;          user THROW still routes through (error "throw") (kept that
+  ;;          way so restart-case internals are unperturbed), which
+  ;;          re-enters the signal walk.  A %nlx-style direct longjmp for
+  ;;          user THROW-from-handler is the eventual fix.
+  (rt-run-test 9525
+    (handler-case
+        (funcall (lambda ()
+                   (let ((acc nil))
+                     (block foo
+                       (unwind-protect
+                            (funcall (lambda () (return-from foo (setq acc (cons 'b acc)))))
+                         (setq acc (cons 'a acc))))
+                     acc)))
+      (t (c) (declare (ignore c)) :crashed))
+    '(a b))
   (rt-run-test 9523
-    (funcall (lambda ()
-               (catch 'done
-                 (%with-handler-bind
-                  (list (list 'error (lambda (c) (declare (ignore c))
-                                       (throw 'done 'good))))
-                  (lambda () (error "an error"))))))
+    (handler-case
+        (funcall (lambda ()
+                   (catch 'done
+                     (%with-handler-bind
+                      (list (list 'error (lambda (c) (declare (ignore c))
+                                           (throw 'done 'good))))
+                      (lambda () (error "an error"))))))
+      (t (c) (declare (ignore c)) :crashed))
     'good)
   ;; ==== end Fable probe block 9520-9539 ====
 

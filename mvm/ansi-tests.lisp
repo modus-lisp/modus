@@ -3591,57 +3591,66 @@
   ;; executes — verified on parent c4bbfca; deftest 9090 / run-test 9560
   ;; never print there, independent of this change).
   ;;
-  ;; The run-test eager-THUNK path compiles the whole form as a CLOSURE
-  ;; body, and the return-from / throw lives inside a NESTED lambda
-  ;; handler — a cross-compilation-unit non-local exit.  Pre-fix these
-  ;; silently returned normally from the LAMBDA (no escape); the
-  ;; *nonlocal-blocks* runtime CATCH-frame fix in compiler.lisp makes
+  ;; Each FORM is wrapped (funcall (lambda () FORM)) so the BLOCK / CATCH
+  ;; compiles INSIDE a lambda body and the inner return-from / throw is a
+  ;; cross-compilation-unit non-local exit.  We use rt-run-test (not the
+  ;; fork-wrapper run-test, whose %fork-set-last-id helper is a no-op only
+  ;; inside a child fork) so these print T:/P: in the parent custom phase.
+  ;; Pre-fix these silently returned normally from the LAMBDA (no escape);
+  ;; the *nonlocal-blocks* runtime CATCH-frame fix in compiler.lisp makes
   ;; them escape correctly.
-  (run-test 9520 (lambda ()
-                   (block foo
-                     (funcall (lambda () (return-from foo 42)))
-                     99))
-            '42)
-  (run-test 9521 (lambda ()
-                   (catch 'tag
-                     (funcall (lambda () (throw 'tag 42)))
-                     99))
-            '42)
-  (run-test 9522 (lambda ()
-                   (block foo
-                     (handler-bind ((error (lambda (c) (declare (ignore c))
-                                             (return-from foo 'good))))
-                       (error "an error"))))
-            ''good)
-  (run-test 9523 (lambda ()
-                   (block foo
-                     (handler-bind ((error #'(lambda (c) (declare (ignore c))
-                                               (return-from foo 'good))))
-                       (error "an error"))))
-            ''good)
+  (rt-run-test 9520
+    (funcall (lambda ()
+               (block foo
+                 (funcall (lambda () (return-from foo 42)))
+                 99)))
+    42)
+  (rt-run-test 9521
+    (funcall (lambda ()
+               (catch 'tag
+                 (funcall (lambda () (throw 'tag 42)))
+                 99)))
+    42)
+  (rt-run-test 9522
+    (funcall (lambda ()
+               (block foo
+                 (handler-bind ((error (lambda (c) (declare (ignore c))
+                                         (return-from foo 'good))))
+                   (error "an error")))))
+    'good)
+  (rt-run-test 9523
+    (funcall (lambda ()
+               (block foo
+                 (handler-bind ((error #'(lambda (c) (declare (ignore c))
+                                           (return-from foo 'good))))
+                   (error "an error")))))
+    'good)
   ;; nested blocks same name → innermost resolves:
-  (run-test 9524 (lambda ()
-                   (block foo
-                     (block foo
-                       (funcall (lambda () (return-from foo 1))))
-                     2))
-            '2)
+  (rt-run-test 9524
+    (funcall (lambda ()
+               (block foo
+                 (block foo
+                   (funcall (lambda () (return-from foo 1))))
+                 2)))
+    2)
   ;; unwind-protect cleanup must still run on cross-unit non-local exit:
-  (run-test 9525 (lambda ()
-                   (let ((acc nil))
-                     (block foo
-                       (unwind-protect
-                            (funcall (lambda () (return-from foo (setq acc (cons 'b acc)))))
-                         (setq acc (cons 'a acc))))
-                     acc))
-            ''(a b))
+  (rt-run-test 9525
+    (funcall (lambda ()
+               (let ((acc nil))
+                 (block foo
+                   (unwind-protect
+                        (funcall (lambda () (return-from foo (setq acc (cons 'b acc)))))
+                     (setq acc (cons 'a acc))))
+                 acc)))
+    '(a b))
   ;; flet handler doing return-from (handler-bind.10 shape):
-  (run-test 9526 (lambda ()
-                   (block done
-                     (flet ((%succeed (c) (declare (ignore c)) (return-from done 'good)))
-                       (handler-bind ((simple-condition #'%succeed))
-                         (signal "x")))))
-            ''good)
+  (rt-run-test 9526
+    (funcall (lambda ()
+               (block done
+                 (flet ((%succeed (c) (declare (ignore c)) (return-from done 'good)))
+                   (handler-bind ((simple-condition #'%succeed))
+                     (signal "x"))))))
+    'good)
   ;; ==== end Fable probe block 9520-9539 ====
 
   ;; --- make-instance + slot-value ---

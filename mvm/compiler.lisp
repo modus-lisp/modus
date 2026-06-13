@@ -2885,8 +2885,11 @@
            ((assoc (normalize-name bname) *nonlocal-blocks* :test #'=)
             (let ((tag-val (cadr (assoc (normalize-name bname)
                                         *nonlocal-blocks* :test #'=))))
-              ;; (throw TAG-VAL value) — CATCH frame at the BLOCK catches.
-              (compile-form (cons 'throw (cons tag-val (cddr form)))
+              ;; (%nlx-throw TAG-VAL value) — the BLOCK's CATCH frame
+              ;; catches.  %nlx-throw (not THROW) so the handler-bind-safe
+              ;; %hc-longjmp path is used without perturbing user THROW /
+              ;; restart-case internals.
+              (compile-form (cons '%nlx-throw (cons tag-val (cddr form)))
                             env dest)))
            (t (compile-return (caddr form) env dest)))))
       ;; VALUES — return multiple values
@@ -3610,22 +3613,35 @@
                      (error %c-cnd)))))
           env dest)))
 
-      ;; THROW — (throw tag value) — set globals, unwind to the nearest
-      ;; CATCH (a handler-case frame established by CATCH or by a BLOCK
-      ;; that takes a runtime catch frame for a cross-unit RETURN-FROM).
-      ;;
-      ;; When a handler-case frame is active we longjmp DIRECTLY via
-      ;; %hc-longjmp instead of routing through (error "throw").  Going
-      ;; through `error` re-enters %signal-condition and walks the
-      ;; handler-bind stack — fatal when the THROW is performed FROM
-      ;; inside a handler-bind handler (the classic cross-unit
-      ;; RETURN-FROM-out-of-a-handler shape): the re-entrant signal walk
-      ;; corrupted the handler/setjmp state and SEGV'd.  %hc-longjmp skips
-      ;; the signal machinery and jumps straight to the catch frame, which
-      ;; checks *catch-tag* and either captures the value or re-signals to
-      ;; an outer frame.  Falls back to (error "throw") when no
-      ;; handler-case is active (matches the historical behaviour).
+      ;; THROW — (throw tag value) — set globals, signal error to unwind
+      ;; to the nearest CATCH. The (error ...) call longjmps out.
       ((= op-name 679248612953119241)
+       (let ((tag-form (cadr form))
+             (val-form (caddr form)))
+         (compile-form
+          `(progn
+             (setq *catch-tag* ,tag-form)
+             (setq *catch-value* ,val-form)
+             (setq *catch-active* t)
+             (error "throw"))
+          env dest)))
+
+      ;; %NLX-THROW — (%nlx-throw tag value) — internal non-local-exit
+      ;; throw for cross-unit RETURN-FROM.  Identical to THROW except it
+      ;; longjmps DIRECTLY via %hc-longjmp when a handler-case frame is
+      ;; active, instead of routing through (error "throw").  Going
+      ;; through `error` re-enters %signal-condition and walks the
+      ;; handler-bind stack — fatal when the exit is performed FROM inside
+      ;; a handler-bind handler (the classic RETURN-FROM-out-of-a-handler
+      ;; shape): the re-entrant signal walk corrupted the handler/setjmp
+      ;; state and SEGV'd.  %hc-longjmp skips the signal machinery and
+      ;; unwinds (running intervening unwind-protect cleanups, which share
+      ;; the same setjmp stack) to the BLOCK's catch frame, which checks
+      ;; *catch-tag* and either captures the value or re-signals outward.
+      ;; This is a SEPARATE op from user-visible THROW so that the change
+      ;; does NOT alter restart-case / catch internals that rely on the
+      ;; full (error "throw") signal path.
+      ((= op-name 655266345339067571)   ; (compute-name-hash "%NLX-THROW")
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form

@@ -975,9 +975,19 @@
     ((and (eq (car form) 'ignore-errors) (cdr form))
      (let ((body (rewrite-package-iteration (cadr form))))
        `(handler-case ,body (error (%ie-c) (values nil %ie-c)))))
-    ;; (report-and-ignore-errors form) → form (ignore errors)
+    ;; (report-and-ignore-errors form...) → (progn form...) (ignore errors)
+    ;; report-and-ignore-errors takes a BODY (multiple forms), not a single
+    ;; form.  The old (cadr form) kept only the FIRST body form and silently
+    ;; dropped the rest — so a setup block like
+    ;;   (report-and-ignore-errors (defvar *c* (define-method-combination ..))
+    ;;                             (defgeneric g ..) (defmethod g ..) ..)
+    ;; registered only the defvar; the defgeneric + every defmethod vanished,
+    ;; leaving the GF undefined at dispatch time (define-method-combination
+    ;; 01/04 returned all-NIL).  Wrap the whole body in PROGN so emit-sub
+    ;; flattens each form into run-init-FILE.  Error-ignoring isn't needed in
+    ;; the build (each init-form is already wrapped in its own handler-case).
     ((eq (car form) 'report-and-ignore-errors)
-     (rewrite-package-iteration (cadr form)))
+     (cons 'progn (mapcar #'rewrite-package-iteration (cdr form))))
     ;; (return-from block-name value) - need to rewrite body
     ((eq (car form) 'return-from)
      `(return-from ,(cadr form) ,@(mapcar #'rewrite-package-iteration (cddr form))))

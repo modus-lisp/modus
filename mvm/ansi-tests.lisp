@@ -2174,31 +2174,13 @@
   (setf *probe-sm-var*
         (list slot-name operation new-value (notnot new-value-p))))
 
-;;; define-method-combination probes (Target: method-combination cluster).
-;;; Short form: TIMES = multiplicative combination.
-(define-method-combination pdmc-times :operator * :identity-with-one-argument t)
-(defgeneric pdmc-gf-1 (x) (:method-combination pdmc-times))
-(defmethod pdmc-gf-1 pdmc-times ((x integer)) 2)
-(defmethod pdmc-gf-1 pdmc-times ((x rational)) 3)
-(defmethod pdmc-gf-1 pdmc-times ((x real)) 5)
-
-;;; Long form: collect each method's value into a vector, most-specific-first.
-(defparameter *pdmc-long-name*
-  (define-method-combination pdmc-long nil ((method-list *))
-    `(vector ,@(mapcar #'(lambda (m) `(call-method ,m)) method-list))))
-(defgeneric pdmc-gf-2 (x y) (:method-combination pdmc-long))
-(defmethod pdmc-gf-2 ((x (eql 1)) (y integer)) 'a)
-(defmethod pdmc-gf-2 ((x integer) (y (eql 2))) 'b)
-(defmethod pdmc-gf-2 ((x integer) (y integer)) 'z)
-
-;;; Long form with :order :most-specific-last + lambda-list params.
-(defparameter *pdmc-long2-name*
-  (define-method-combination pdmc-long2 (p1 p2)
-      ((method-list * :order :most-specific-last))
-    `(vector ',p1 ',p2 ,@(mapcar #'(lambda (m) `(call-method ,m)) method-list))))
-(defgeneric pdmc-gf-3 (x y) (:method-combination pdmc-long2 7 8))
-(defmethod pdmc-gf-3 ((x (eql 1)) (y integer)) 'a)
-(defmethod pdmc-gf-3 ((x integer) (y integer)) 'z)
+;;; define-method-combination probes are registered INSIDE
+;;; run-clos-diag-tests via the runtime EVAL path (IDs 9811-9820
+;;; below).  Top-level defgeneric/defmethod/define-method-combination
+;;; forms do NOT auto-run on bare metal (CLAUDE.md item 7) — their
+;;; effects must fire through (eval '(...)) at test time, which is
+;;; exactly how the real ANSI define-method-combination*.lsp tests
+;;; (suite IDs 27088-27154) drive their setup.
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
@@ -3103,22 +3085,93 @@
   (run-test 9798 (lambda () (eval '(ds-probe-c-pa (make-ds-probe-c :pa 8)))) 8)
   (run-test 9799 (lambda () (eval '(ds-probe-c-ca (make-ds-probe-c :ca 4)))) 4)
 
-  ;; --- define-method-combination probes ---
-  ;; Short-form combination dispatch (TIMES = multiplicative).
-  (run-test 9811 (lambda () (pdmc-gf-1 6)) 30)    ; integer*rational*real = 2*3*5
-  (run-test 9812 (lambda () (pdmc-gf-1 1/2)) 15)  ; rational*real = 3*5
-  ;; Long form returns the name.
-  (run-test 9813 (lambda () *pdmc-long-name*) 'pdmc-long)
+  ;; --- define-method-combination probes (9600-9612) ---
+  ;; The define-method-combination / defgeneric / defmethod MACROS are
+  ;; build-time-only rewrites (no runtime-EVAL lowering), so these probes
+  ;; drive the dispatch code through the same %-level registration API the
+  ;; rewriter emits (mirrors the dg-mc probes at 9850+).  The real ANSI
+  ;; suite (IDs 27088-27154) exercises the macro path end-to-end.
+  ;; IDs 9811-9820 previously used here collided with the
+  ;; string-input-stream deftests; renumbered into the free 9600 block.
+
+  ;; Short-form: TIMES = multiplicative (operator *, identity-with-one).
+  (run-test 9600
+    (lambda ()
+      (progn
+        (%define-method-combination 'pdmc-times '* t)
+        (%defgeneric 'pdmc-gf-1 '(x) 'pdmc-times)
+        (%defmethod 'pdmc-gf-1 'pdmc-times (list 'integer)  (lambda (x) (declare (ignore x)) 2))
+        (%defmethod 'pdmc-gf-1 'pdmc-times (list 'rational) (lambda (x) (declare (ignore x)) 3))
+        (%defmethod 'pdmc-gf-1 'pdmc-times (list 'real)     (lambda (x) (declare (ignore x)) 5))
+        'setup-ok))
+    'setup-ok)
+  ;; 6 is integer+rational+real → 2*3*5 = 30.
+  (run-test 9601 (lambda () (%gf-dispatch 'pdmc-gf-1 (list 6))) 30)
+  ;; 1/2 is rational+real (not integer) → 3*5 = 15.
+  (run-test 9602 (lambda () (%gf-dispatch 'pdmc-gf-1 (list 1/2))) 15)
+
+  ;; Long form: collect each method's value into a vector (most-specific
+  ;; first).  Builder mirrors rewrite-dmc-long-form's output: one method
+  ;; group with the * pattern, body returns (vector (call-method m)...).
+  (run-test 9603
+    (lambda ()
+      (progn
+        (%define-method-combination-long
+         'pdmc-long
+         (function
+          (lambda (%applicable %cargs)
+            (declare (ignore %cargs))
+            (let* ((recs (list (list (list '*) ':most-specific-first nil)))
+                   (groups (%dmc-partition-groups %applicable recs))
+                   (method-list (%dmc-nth groups 0)))
+              (cons 'vector
+                    (mapcar (lambda (m) (list 'call-method m)) method-list)))))
+         0)
+        (%defgeneric 'pdmc-gf-2 '(x y) 'pdmc-long)
+        (%defmethod 'pdmc-gf-2 'nil (list (list 'eql 1) 'integer)  (lambda (x y) (declare (ignore x y)) 'a))
+        (%defmethod 'pdmc-gf-2 'nil (list 'integer (list 'eql 2))  (lambda (x y) (declare (ignore x y)) 'b))
+        (%defmethod 'pdmc-gf-2 'nil (list 'integer 'integer)       (lambda (x y) (declare (ignore x y)) 'z))
+        'setup-ok))
+    'setup-ok)
+  ;; Long form registration returns the combination name (CLHS).
+  (run-test 9604 (lambda () (%find-mc 'pdmc-long) (notnot (%mc-long-p (%find-mc 'pdmc-long)))) 't)
   ;; Long-form dispatch builds a vector of method values, most-specific-first.
-  (run-test 9814 (lambda () (pdmc-gf-2 0 0)) #(z))
-  (run-test 9815 (lambda () (pdmc-gf-2 1 0)) #(a z))
-  (run-test 9816 (lambda () (pdmc-gf-2 0 2)) #(b z))
-  (run-test 9817 (lambda () (pdmc-gf-2 1 2)) #(a b z))
-  ;; A method matching no group signals an error.
-  (run-test 9818 (lambda () (handler-case (pdmc-gf-2 nil nil) (error () :caught))) ':caught)
-  ;; Long form with :order :most-specific-last + params spread from defgeneric.
-  (run-test 9819 (lambda () (pdmc-gf-3 0 0)) #(7 8 z))
-  (run-test 9820 (lambda () (pdmc-gf-3 1 0)) #(7 8 z a))
+  (run-test 9605 (lambda () (%gf-dispatch 'pdmc-gf-2 (list 0 0))) #(z))
+  (run-test 9606 (lambda () (%gf-dispatch 'pdmc-gf-2 (list 1 0))) #(a z))
+  (run-test 9607 (lambda () (%gf-dispatch 'pdmc-gf-2 (list 0 2))) #(b z))
+  (run-test 9608 (lambda () (%gf-dispatch 'pdmc-gf-2 (list 1 2))) #(a b z))
+  ;; A method matching no group signals an error (no applicable / no group).
+  (run-test 9609
+    (lambda () (handler-case (%gf-dispatch 'pdmc-gf-2 (list 'p 'q)) (error () :caught)))
+    ':caught)
+
+  ;; Long form with :order :most-specific-last + lambda-list params (7 8)
+  ;; spread from the combination args.  Builder reverses the group and
+  ;; prepends the two params.
+  (run-test 9610
+    (lambda ()
+      (progn
+        (%define-method-combination-long
+         'pdmc-long2
+         (function
+          (lambda (%applicable %cargs)
+            (let* ((p1 (%dmc-nth %cargs 0))
+                   (p2 (%dmc-nth %cargs 1))
+                   (recs (list (list (list '*) ':most-specific-last nil)))
+                   (groups (%dmc-partition-groups %applicable recs))
+                   (method-list (%dmc-nth groups 0)))
+              (cons 'vector
+                    (cons (list 'quote p1)
+                          (cons (list 'quote p2)
+                                (mapcar (lambda (m) (list 'call-method m)) method-list)))))))
+         2)
+        (%defgeneric 'pdmc-gf-3 '(x y) (cons 'pdmc-long2 (list 7 8)))
+        (%defmethod 'pdmc-gf-3 'nil (list (list 'eql 1) 'integer) (lambda (x y) (declare (ignore x y)) 'a))
+        (%defmethod 'pdmc-gf-3 'nil (list 'integer 'integer)      (lambda (x y) (declare (ignore x y)) 'z))
+        'setup-ok))
+    'setup-ok)
+  (run-test 9611 (lambda () (%gf-dispatch 'pdmc-gf-3 (list 0 0))) #(7 8 z))
+  (run-test 9612 (lambda () (%gf-dispatch 'pdmc-gf-3 (list 1 0))) #(7 8 z a))
   )
 
 ;;; ============================================================

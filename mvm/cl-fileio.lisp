@@ -1506,19 +1506,31 @@
           ;; Two-way stream: read from input side
           ((= ty 4)
            (%read-char-from-stream (car (%stream-data s)) eof-error-p eof-value))
-          ;; Concatenated stream: read from first non-exhausted stream
+          ;; Synonym stream: resolve target symbol's value and delegate.
+          ((= ty 7)
+           (let ((target (%stream-data s)))
+             (let ((target-stream (cond ((symbolp target) (symbol-value target))
+                                        ((stringp target) (symbol-value (intern target)))
+                                        (t target))))
+               (%read-char-from-stream target-stream eof-error-p eof-value))))
+          ;; Concatenated stream: read from first non-exhausted stream.
+          ;; cdr of %stream-data holds a pushed-back (unread) char, if any.
           ((= ty 6)
            (let ((data (%stream-data s)))
-             (let ((streams (car data)))
-               (loop
-                 (when (null streams)
-                   (return (if eof-error-p nil eof-value)))
-                 (let ((ch (%read-char-from-stream (car streams) nil :eof-sentinel-7770002)))
-                   (if (eq ch :eof-sentinel-7770002)
-                       (progn
-                         (setq streams (cdr streams))
-                         (set-car data streams))
-                       (return ch)))))))
+             ;; Honor any pushed-back char first.
+             (let ((unread (cdr data)))
+               (if unread
+                   (progn (set-cdr data nil) unread)
+                   (let ((streams (car data)))
+                     (loop
+                       (when (null streams)
+                         (return (if eof-error-p (error "end of file") eof-value)))
+                       (let ((ch (%read-char-from-stream (car streams) nil :eof-sentinel-7770002)))
+                         (if (eq ch :eof-sentinel-7770002)
+                             (progn
+                               (setq streams (cdr streams))
+                               (set-car data streams))
+                             (return ch)))))))))
           ;; File stream
           ((= ty 9)
            (%fs-read-char s eof-error-p eof-value))
@@ -1545,6 +1557,17 @@
             ((= ty 4)
              ;; Two-way: unread on input side
              (unread-char ch (car (%stream-data s))))
+            ((= ty 6)
+             ;; Concatenated: store pushed-back char in cdr of data.
+             (set-cdr (%stream-data s) ch))
+            ((= ty 7)
+             ;; Synonym: delegate to target stream.
+             (let ((target (%stream-data s)))
+               (let ((target-stream (cond ((symbolp target) (symbol-value target))
+                                          ((stringp target) (symbol-value (intern target)))
+                                          (t target))))
+                 (when (streamp target-stream)
+                   (unread-char ch target-stream)))))
             ((= ty 9)
              ;; File stream: push back by decrementing bpos
              (let ((bpos (%fs-bpos s)))

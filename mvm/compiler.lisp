@@ -7273,6 +7273,32 @@
                       (loop while (consp cur) do
                         (walk (car cur) t sh)
                         (setq cur (cdr cur)))))
+                   ;; flet / labels — each local function body is compiled
+                   ;; as its OWN unit (mvm-compile-function-internal resets
+                   ;; *block-labels*), so a RETURN-FROM to an enclosing
+                   ;; BLOCK inside a local function is cross-unit.  Walk the
+                   ;; function bodies with the lambda flag set, and also
+                   ;; walk the flet/labels body forms (still in the current
+                   ;; unit — flag unchanged).  This was reverted once
+                   ;; (f06aca0) because it exposed unwind-protect / cross-
+                   ;; unit-GO regressions; %block-runtime-catch-unsafe-p
+                   ;; (consulted in compile-block) now gates those out, so
+                   ;; the legitimate flet/labels cross-unit wins
+                   ;; (FLET.4/4A, LABELS.4/4A/6) land without the breakage.
+                   ((or (%form-op-is form 230909053785822708 "FLET")
+                        (%form-op-is form 176230696681611090 "LABELS"))
+                    (let ((cur (cadr form)))
+                      (loop while (consp cur) do
+                        ;; each def = (name (args) body...) — body crosses
+                        (let ((bcur (cddr (car cur))))
+                          (loop while (consp bcur) do
+                            (walk (car bcur) t sh)
+                            (setq bcur (cdr bcur))))
+                        (setq cur (cdr cur))))
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do
+                        (walk (car cur) xl sh)
+                        (setq cur (cdr cur)))))
                    ;; (function (lambda ...)) — recurse with the lambda case
                    ((%form-op-is form 113179339635393781 "FUNCTION")
                     (walk (cadr form) xl sh))
@@ -7299,6 +7325,64 @@
           (setq cur (cdr cur)))))
     found))
 
+(defun %block-runtime-catch-unsafe-p (body)
+  "Return T if establishing a runtime CATCH frame around BODY (the wrap
+   compile-block uses for a cross-unit RETURN-FROM) would conflict with
+   another setjmp-based non-local-exit construct in the same dynamic
+   extent.  Two disqualifiers, both rooted in the runtime's SINGLE shared
+   setjmp-slot stack (cl-conditions.lisp notes handler-case / restart-case
+   / unwind-protect can't nest arbitrarily):
+
+     (a) UNWIND-PROTECT anywhere in the body.  Our THROW's longjmp must
+         traverse unwind-protect's own setjmp error-path; with the shared
+         slot an inner unwind-protect's re-longjmp lands on OUR catch frame
+         instead of the next enclosing unwind-protect, skipping outer
+         cleanups (unwind-protect.6/7/8 regressed when the block was
+         wrapped unconditionally).
+
+     (b) A cross-unit GO — a (go ...) inside a function-creating form
+         (lambda / flet / labels).  That GO is a DIFFERENT non-local exit
+         not lowered at runtime (flet.52 / labels.27); wrapping the block
+         perturbs its pre-existing (coincidentally-working) lowering.
+
+   When either is present the block stays on the ORIGINAL fast path — the
+   cross-unit return-from keeps its old (function-return) lowering, no
+   worse than before, while the common cross-unit RETURN-FROM-through-
+   lambda/flet/labels wins are preserved for everything else."
+  (let ((found nil))
+    (labels ((walk (form in-fn)
+               (when (and (not found) (consp form))
+                 (cond
+                   ((%form-op-is form 518921307293258709 "QUOTE") nil)
+                   ((%form-op-is form 446290548490879374 "UNWIND-PROTECT")
+                    (setq found t))
+                   ((and in-fn (%form-op-is form 609179962647778703 "GO"))
+                    (setq found t))
+                   ((%form-op-is form 527981956251550024 "LAMBDA")
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do (walk (car cur) t)
+                            (setq cur (cdr cur)))))
+                   ((or (%form-op-is form 230909053785822708 "FLET")
+                        (%form-op-is form 176230696681611090 "LABELS"))
+                    (let ((cur (cadr form)))
+                      (loop while (consp cur) do
+                        (let ((bcur (cddr (car cur))))
+                          (loop while (consp bcur) do (walk (car bcur) t)
+                                (setq bcur (cdr bcur))))
+                        (setq cur (cdr cur))))
+                    (let ((cur (cddr form)))
+                      (loop while (consp cur) do (walk (car cur) in-fn)
+                            (setq cur (cdr cur)))))
+                   ((%form-op-is form 113179339635393781 "FUNCTION")
+                    (walk (cadr form) in-fn))
+                   (t (let ((cur form))
+                        (loop while (consp cur) do (walk (car cur) in-fn)
+                              (setq cur (cdr cur)))))))))
+      (let ((cur body))
+        (loop while (consp cur) do (walk (car cur) nil)
+              (setq cur (cdr cur)))))
+    found))
+
 (defun compile-block (name body env dest)
   "Compile (block name forms...).  Stores (NAME LABEL DEST) in
    *block-labels* so RETURN-FROM compiled deep inside the block body can
@@ -7318,7 +7402,15 @@
    a lexical :br out of the middle of the catch's handler-case would skip
    its setjmp-frame teardown and corrupt the handler-case stack."
   (let* ((name-hash (if name (normalize-name name) 0)))
-    (if (%return-from-escapes-block-p body name-hash nil nil)
+    (if (and (%return-from-escapes-block-p body name-hash nil nil)
+             ;; ...but only when the catch frame can nest safely.  An
+             ;; UNWIND-PROTECT or a cross-unit GO in the body shares the
+             ;; runtime's single setjmp-slot stack with our catch frame and
+             ;; corrupts outer cleanup / GO lowering — keep those blocks on
+             ;; the lexical fast path (the cross-unit return-from keeps its
+             ;; prior behaviour, no regression).  See
+             ;; %block-runtime-catch-unsafe-p.
+             (not (%block-runtime-catch-unsafe-p body)))
         ;; Cross-unit escape possible: establish a runtime catch frame.
         ;; Every RETURN-FROM to this block (same- OR cross-unit) becomes a
         ;; THROW to TAG-VAL, which unwinds (running unwind-protect

@@ -1971,8 +1971,27 @@
           ;; Read from stream — fresh #N= label table per top-level call
           (let* ((*sharp-labels* nil)
                  (result (%read-internal s eof-error-p eof-value nil)))
-            ;; Get position
-            (let ((pos (car (cdr (%stream-data s)))))
+            ;; Get position.  CLHS 23.2 read-from-string: the second value
+            ;; is the index of the first character not read.  Modus's token
+            ;; reader UNREADS whatever char terminated the token — the
+            ;; string-input stream advanced its pos counter past that char
+            ;; but stashed it in the unread slot (cddr of stream-data)
+            ;; without decrementing pos, so the raw pos over-counts by one.
+            ;;
+            ;; The CL correction differs by delimiter kind:
+            ;;   - whitespace delimiter IS consumed by READ (it is the
+            ;;     atom terminator and discarded) → no correction; CL
+            ;;     reports the index AFTER the whitespace (`"abc   "` → 4).
+            ;;   - a terminating macro char (e.g. `(`, or one installed via
+            ;;     set-macro-character) is NOT consumed — it must remain for
+            ;;     the next read → subtract 1 so the index points AT it
+            ;;     (`"!?"` with `?` a macro char → 1).
+            (let* ((data (%stream-data s))
+                   (pos (car (cdr data)))
+                   (pending (cdr (cdr data))))
+              (when (and pending (characterp pending)
+                         (not (%whitespace-char-p pending)))
+                (setq pos (- pos 1)))
               (values result (+ start pos)))))))))
 
 ;;; --- Make-symbol (uninterned) ---

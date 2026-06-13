@@ -161,6 +161,34 @@
            (list 'let (list (list kv key))
                  (cons 'cond (nreverse acc))))))"
 
+    ;; ECASE / CCASE — like CASE but signal an error when no clause matches
+    ;; instead of returning NIL (CLHS 5.3).  No T/OTHERWISE clause is allowed,
+    ;; so every key list becomes an (or (eql ...) ...) test and the cond ends
+    ;; with a (t (error ...)) fallthrough.  CCASE is a correctable error in
+    ;; full CL (store-value + retry); minimally we degrade it to an ECASE-like
+    ;; signal (matching the CLAUDE.md CCASE→ECASE degrade pattern).
+    "(defmacro ecase (key &rest clauses)
+       (let ((kv (gensym \"ECASE\")))
+         (let ((acc nil) (cur clauses))
+           (loop
+             (when (null cur) (return nil))
+             (let ((clause (car cur)))
+               (let ((tst (car clause)) (body (cdr clause)))
+                 (if (consp tst)
+                     (let ((tests nil) (vs tst))
+                       (loop (when (null vs) (return nil))
+                         (setq tests (cons (list 'eql kv (list 'quote (car vs))) tests))
+                         (setq vs (cdr vs)))
+                       (setq acc (cons (cons (cons 'or (nreverse tests)) body) acc)))
+                     (setq acc (cons (cons (list 'eql kv (list 'quote tst)) body) acc)))))
+             (setq cur (cdr cur)))
+           (setq acc (cons (list t (list 'error \"ECASE: no clause matches\")) acc))
+           (list 'let (list (list kv key))
+                 (cons 'cond (nreverse acc))))))"
+
+    "(defmacro ccase (key &rest clauses)
+       (cons 'ecase (cons key clauses)))"
+
     "(defmacro prog1 (first &rest rest)
        (let ((tmp (gensym \"P1\")))
          (list 'let (list (list tmp first))
@@ -221,6 +249,20 @@
                                (cons (list 'typep g (list 'quote ty)) body)))
                            clauses))
                  (list (list t (list 'error \"ETYPECASE: no clause matches\")))))))"
+
+    ;; CTYPECASE — like ETYPECASE but a correctable (store-and-retry) error in
+    ;; full CL.  Minimally we degrade it to an ETYPECASE-like signal on no
+    ;; match (mirroring the CCASE→ECASE degrade); no retry/store-value yet.
+    "(defmacro ctypecase (key &rest clauses)
+       (let ((g (gensym \"CTC\")))
+         (list 'let (list (list g key))
+               (append
+                 (cons 'cond
+                   (mapcar (lambda (cl)
+                             (let ((ty (car cl)) (body (cdr cl)))
+                               (cons (list 'typep g (list 'quote ty)) body)))
+                           clauses))
+                 (list (list t (list 'error \"CTYPECASE: no clause matches\")))))))"
 
     ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc]).
     ;; Defines NAME as a macro: (name place a b …) => (setf place (fn place a b …)).

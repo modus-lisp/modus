@@ -3118,6 +3118,43 @@
               (multiple-value-list (eval '(rf-probe-3 t))))
             '(1 2 3))
 
+  ;; --- runtime-EVAL ECASE / CCASE / CTYPECASE probes (9613-9619) ---
+  ;; runtime-cl-macros.lisp gained ECASE/CCASE/CTYPECASE (mirroring the
+  ;; existing CASE/TYPECASE/ETYPECASE macros).  ECASE = CASE + type-error on
+  ;; no-match (no T/OTHERWISE); CCASE degrades to ECASE-like signal; CTYPECASE
+  ;; degrades to ETYPECASE-like signal.  uiop's merge-pathname-directory-
+  ;; component uses ECASE; gauntlet form 56 depends on this.
+  (run-test 9613
+            (lambda () (eval '(ecase 2 (1 :a) (2 :b) (3 :c))))
+            ':b)
+  ;; ECASE key-list clause
+  (run-test 9614
+            (lambda () (eval '(ecase 3 ((1 2) :lo) ((3 4) :hi))))
+            ':hi)
+  ;; ECASE no-match signals (caught → sentinel, NOT %eval-escape through us)
+  (run-test 9615
+            (lambda () (handler-case (eval '(ecase 9 (1 :a) (2 :b)))
+                         (t (c) :signalled)))
+            ':signalled)
+  ;; CCASE matching clause returns the value
+  (run-test 9616
+            (lambda () (eval '(ccase 5 (4 :four) (5 :five))))
+            ':five)
+  ;; CCASE no-match signals
+  (run-test 9617
+            (lambda () (handler-case (eval '(ccase 0 (1 :a)))
+                         (t (c) :signalled)))
+            ':signalled)
+  ;; CTYPECASE matching clause
+  (run-test 9618
+            (lambda () (eval '(ctypecase "x" (integer :i) (string :s))))
+            ':s)
+  ;; CTYPECASE no-match signals
+  (run-test 9619
+            (lambda () (handler-case (eval '(ctypecase 9 (string :s) (cons :c)))
+                         (t (c) :signalled)))
+            ':signalled)
+
   ;; --- define-method-combination probes (9600-9612) ---
   ;; The define-method-combination / defgeneric / defmethod MACROS are
   ;; build-time-only rewrites (no runtime-EVAL lowering), so these probes

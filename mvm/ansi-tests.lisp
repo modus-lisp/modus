@@ -2481,6 +2481,77 @@
         (let ((c (function (lambda () v))))
           (funcall c))))
     'x70)
+  ;; ========================================================
+  ;; Probes 9740-9749 — mutable-closure / cell-boxing shapes
+  ;; (CLAUDE.md "Mutable Closures — Global Cell Limitation").
+  ;; FINDING (this rotation): the documented "global cell" bug is
+  ;; ALREADY FIXED.  compile-let / compile-let* box each captured+
+  ;; mutated var as a LOCAL let-binding %CELL-V = (cons init nil)
+  ;; (mvm/compiler.lisp ~4530 / ~4631), NOT a global cell.  The cell
+  ;; is therefore fresh per let-execution and captured BY VALUE into
+  ;; each closure's env (compile-lambda ~4964).  Multiple closures
+  ;; built from the SAME source lambda get INDEPENDENT accumulators.
+  ;; cell-var-name is name-derived but that's harmless: each cell is a
+  ;; distinct lexical binding and the closure snapshots the cons
+  ;; pointer at creation.  These probes lock the contract so a future
+  ;; regression to a global-cell scheme is caught.  The real map-into
+  ;; cluster fails (17602-17621) are map-into FILL-POINTER / multi-seq
+  ;; semantics in cl-sequences.lisp, NOT closure cells.
+  ;; ========================================================
+  ;; 9740 — single accumulating closure via mapcar over a let-bound acc.
+  ;; One cell, run per element; map-into / push-accumulator shape.
+  (run-test 9740
+    (lambda ()
+      (let ((acc nil))
+        (mapcar (lambda (x) (push x acc)) '(1 2 3))
+        acc))
+    '(3 2 1))
+  ;; 9741 — TWO independent accumulating closures from the SAME source
+  ;; lambda (the builder is one lambda expression, invoked twice, each
+  ;; call gets a FRESH let-bound acc).  If the cell is global/shared,
+  ;; the second counter sees the first's increments.
+  (run-test 9741
+    (lambda ()
+      (flet ((make-counter ()
+               (let ((n 0))
+                 (lambda () (setq n (+ n 1)) n))))
+        (let ((c1 (make-counter))
+              (c2 (make-counter)))
+          (funcall c1) (funcall c1)   ; c1 → 1, 2
+          (funcall c2)                ; c2 → 1 (independent)
+          (list (funcall c1) (funcall c2)))))
+    '(3 2))
+  ;; 9742 — same shape but accumulating a list via push; two builders.
+  (run-test 9742
+    (lambda ()
+      (flet ((make-acc ()
+               (let ((lst nil))
+                 (lambda (x) (push x lst) lst))))
+        (let ((a (make-acc))
+              (b (make-acc)))
+          (funcall a 1) (funcall a 2)
+          (funcall b 9)
+          (list (funcall a 3) (funcall b 8)))))
+    '((3 2 1) (8 9)))
+  ;; 9743 — closure returned from a plain (let ...) builder invoked
+  ;; through a labels recursion; two instances must stay independent.
+  (run-test 9743
+    (lambda ()
+      (labels ((mk (start)
+                 (let ((s start))
+                   (lambda (d) (setq s (+ s d)) s))))
+        (let ((p (mk 10)) (q (mk 100)))
+          (funcall p 1) (funcall q 1)
+          (list (funcall p 2) (funcall q 2)))))
+    '(13 103))
+  ;; 9744 — single closure, repeated invocation, decf path.
+  (run-test 9744
+    (lambda ()
+      (let ((n 5))
+        (let ((c (lambda () (decf n) n)))
+          (funcall c) (funcall c)
+          (list (funcall c) n))))
+    '(2 2))
   ;; Inline-defun-in-lambda crash pattern (CLAUDE.md "nested defun w/
   ;; %gf-dispatch body in funcall thunk"; bisected via probes 9792-9816
   ;; on 2026-05-04, those probes deleted to avoid noise).

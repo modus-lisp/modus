@@ -3637,14 +3637,6 @@
                                        (return-from foo 'good))))
                   (lambda () (error "an error"))))))
     'good)
-  (rt-run-test 9523
-    (funcall (lambda ()
-               (catch 'done
-                 (%with-handler-bind
-                  (list (list 'error (lambda (c) (declare (ignore c))
-                                       (throw 'done 'good))))
-                  (lambda () (error "an error"))))))
-    'good)
   ;; nested blocks same name → innermost resolves:
   (rt-run-test 9524
     (funcall (lambda ()
@@ -3671,6 +3663,15 @@
                    (%with-handler-bind
                     (list (list 'simple-condition #'%succeed))
                     (lambda () (signal "x")))))))
+    'good)
+  ;; catch/throw THROUGH a handler-bind handler (placed last — see note):
+  (rt-run-test 9523
+    (funcall (lambda ()
+               (catch 'done
+                 (%with-handler-bind
+                  (list (list 'error (lambda (c) (declare (ignore c))
+                                       (throw 'done 'good))))
+                  (lambda () (error "an error"))))))
     'good)
   ;; ==== end Fable probe block 9520-9539 ====
 

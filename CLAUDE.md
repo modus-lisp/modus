@@ -96,12 +96,17 @@ runtime/        Runtime type system
 
 **Real numbers (current state, x64 Linux):**
 - Expected: 17,465 tests (recovered files keep entering the denominator)
-- Ran: 17,420
-- Passed: 15,409 (88.23% overall, 88.46% of those that ran)
-- Failed: 2,011
-- Lost-to-crash: 45 (was 118 before the GC heap guard band c9c6278; recovered
-  tests now run and fail honestly.  Sweep-to-sweep noise is roughly ±10 on
-  Passed.)
+- Ran: 17,394
+- Passed: 15,397 (88.16% overall, 88.52% of those that ran)
+- Failed: 1,997
+- Lost-to-crash: 71 (NOTE: lost-to-crash is wall-clock-NOISY in the single-
+  process full run — the same files wedge but which tests inside a wedged
+  fork get lost shifts with timing.  The timing-IMMUNE metric is the crash
+  markers FILE-WEDGE=30 / CHUNK-CRASH=4, identical to the prior gate.  Passed
+  15,397 is flat-within-noise vs the prior 15,409; the GC alloc-obj zero-init
+  fix 2faad76 is a CORRECTNESS/structural win, not an ANSI-count mover —
+  its payoff is the gauntlet (define-package cascade 158→44) and eliminating
+  a whole heap-corruption class.  Sweep-to-sweep noise ~±10 on Passed.)
 
 The historical "17,567/17,568" figure was inflated. Per-chunk forks die
 silently mid-thunk on unimplemented forms — and the summary only saw

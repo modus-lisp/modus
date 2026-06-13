@@ -1491,6 +1491,11 @@
   ;; (write-to-string 4 :base 10 :base 2) ⇒ base 10 ⇒ "4" (not "100").
   (deftest 9725 (write-to-string 4 :base 10 :base 2) "4")
   (deftest 9726 (write-to-string 7 :base 2 :base 10) "111")
+  ;; #\Space is a graphic char ⇒ prin1 prints "#\ " (not "#\Space") when
+  ;; not *print-readably* (CLHS 22.1.3.2 / print.char.4).
+  (deftest 9727 (let ((*print-readably* nil)) (prin1-to-string #\Space)) "#\\ ")
+  (deftest 9728 (prin1-to-string #\Newline) "#\\Newline")
+  (deftest 9729 (let ((*print-readably* t)) (prin1-to-string #\Space)) "#\\Space")
   ;; signals-error on tree-equal arity
   (deftest 9730 (handler-case (progn (tree-equal) nil) (error (c) t)) t)
   (deftest 9731 (handler-case (progn (tree-equal '(a b)) nil) (error (c) t)) t)

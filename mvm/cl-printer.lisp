@@ -628,7 +628,15 @@
              (%print-char 35 stream)   ; #
              (%print-char 92 stream)   ; backslash
              (cond
-               ((= code 32)  (%print-string-raw "Space" stream))
+               ;; Space (32) is a GRAPHIC character (CLHS graphic-char-p of
+               ;; #\Space is T).  Per CLHS 22.1.3.2 a graphic standard char
+               ;; prints as "#\<char>" — so #\Space ⇒ "#\ " when not printing
+               ;; *print-readably*.  Under *print-readably* keep the name so
+               ;; the form round-trips unambiguously (trailing-whitespace).
+               ((= code 32)
+                (if preadably
+                    (%print-string-raw "Space" stream)
+                    (%print-char 32 stream)))
                ((= code 10)  (%print-string-raw "Newline" stream))
                ((= code 9)   (%print-string-raw "Tab" stream))
                ((= code 13)  (%print-string-raw "Return" stream))

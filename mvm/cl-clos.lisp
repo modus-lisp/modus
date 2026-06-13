@@ -3352,6 +3352,10 @@
    CLHS: specializers length must match GF's required-parameter count.
    Validate against the GF's stored lambda-list when available
    (find-method.lsp 27115/27116)."
+  ;; CLHS lambda-list is (gf qualifiers specializers &optional errorp): a
+  ;; second trailing argument is a program-error (find-method.error.4).
+  (when (and (consp args) (consp (cdr args)))
+    (%signal-program-error))
   (let ((errorp (if args (car args) t)))
     ;; Resolve fn-pointer to real gf-array if needed.
     (unless (%gf-p gf)

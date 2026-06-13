@@ -2796,6 +2796,27 @@
             ((= ty 4) (listen (car (%stream-data s))))
             ;; Echo: check input side
             ((= ty 3) (listen (car (%stream-data s))))
+            ;; Synonym: resolve the target symbol's value and delegate.
+            ;; (mirrors %read-char-from-stream's ty 7 resolution).  Without
+            ;; this case make-synonym-stream.3 + the listen variants of
+            ;; make-concatenated-stream.28/.30 fell to the (t nil) default.
+            ((= ty 7)
+             (let ((target (%stream-data s)))
+               (let ((target-stream (cond ((symbolp target) (symbol-value target))
+                                          ((stringp target) (symbol-value (intern target)))
+                                          (t target))))
+                 (listen target-stream))))
+            ;; Concatenated: T if a pushed-back char exists, else if any
+            ;; remaining constituent stream has input available.
+            ((= ty 6)
+             (let ((data (%stream-data s)))
+               (if (cdr data)
+                   t
+                   (let ((streams (car data)) (found nil))
+                     (loop
+                       (when (null streams) (return found))
+                       (when (listen (car streams)) (setq found t) (return t))
+                       (setq streams (cdr streams)))))))
             ;; File stream: check if buffer has data
             ((= ty 9)
              (let ((bpos (%fs-bpos s))

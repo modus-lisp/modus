@@ -2174,23 +2174,37 @@
            (emit-and-reg-imm buf +scratch-reg+ -16)
            (emit-add-reg-reg buf 'r12 +scratch-reg+)
            (emit-pop buf +scratch-reg+)      ; recover R12-old
-           ;; ---- Payload zero-init DELIBERATELY NOT done here (see below) ----
-           ;; The same GC-correctness argument as +op-alloc-array+ applies in
-           ;; principle (the string body is written byte-by-byte by the caller
-           ;; AFTER allocation, so uninit data words can be scanned as roots).
-           ;; The array zeroing — structurally identical push/pop/loop, only
-           ;; the subtag differs — is GATED CLEAN (gauntlet stays 243/44).  But
-           ;; enabling the IDENTICAL zero loop here is a DETERMINISTIC
-           ;; regression: the reader desyncs at asdf.lisp form 87 (a package
-           ;; name reads as a corrupted #<S…>), dropping the gauntlet from 243
-           ;; to 87 forms.  The trigger is GC-interleaving-specific (no plain
-           ;; logic repro: long-symbol reads and 300x stress loops are clean),
-           ;; which matches the documented residual-corruption hazard the
-           ;; alloc-obj seat hit when it touched the string/alignment region.
-           ;; The string header counts BYTES while the array/obj headers count
-           ;; WORDS, so copy_object's size derivation differs for #x31 — a
-           ;; likely locus for the second corruption site.  Deferred to a
-           ;; dedicated string/GC seat; the alloc-array fix above is the win.
+           ;; ---- Payload zero-init DELIBERATELY NOT done here ----
+           ;; ROOT-CAUSE UPDATE (Fable5 string/GC seat): the prior "string
+           ;; headers count BYTES" hypothesis is FALSE.  Strings store one
+           ;; char-code per 8-byte WORD (compile-quote / %codes-to-string fill
+           ;; via :obj-set / aset), so the element count IS a word count and
+           ;; alloc-string's `(count+2)*8` advance AGREES exactly with
+           ;; copy_object's `(count+2)*8` copy size (emit-gc-trampoline).  There
+           ;; is NO byte/word size disagreement — copy is correct for #x31.
+           ;;
+           ;; A clean layout-isolation probe (emit the identical push/pop/loop
+           ;; instructions but zero an EMPTY range — `lea rcx,[r12]`) keeps the
+           ;; gauntlet at 243/44, while the REAL zeroing collapses it to 87.
+           ;; So the regression is the FUNCTIONAL zeroing of string CONTENT,
+           ;; NOT layout shift and NOT a GC-scan/size bug (disproving the prior
+           ;; seat's "fix the size accounting first" plan — there's nothing to
+           ;; fix there).  Runtime size-gating localised TWO independent
+           ;; functional regressions:
+           ;;   - zeroing the 4096-word file read buffer (%make-string-array
+           ;;     4096 in %make-file-stream-full, cl-fileio.lisp) corrupts the
+           ;;     package-name symbol read at gauntlet form 80; and
+           ;;   - zeroing only SHORT strings still desyncs the reader by form
+           ;;     ~125.
+           ;; Both are reader/heap-content interactions exposed by turning the
+           ;; payload garbage into NUL (char-code 0), not GC-root false-
+           ;; positives, and neither reproduces under plain read/alloc stress.
+           ;; Root-causing the desync needs a MODUS_GC_DEBUG-traced build; until
+           ;; then the safe state is byte-identical-to-baseline (no zeroing, no
+           ;; added instructions → no layout shift).  The residual #<?90> at
+           ;; gauntlet 233/236 (corrupted-subtag objects) survives and is a
+           ;; SEPARATE site — it is present at baseline with string-zero OFF, so
+           ;; it is not caused by un-zeroed string bodies.  See handoff.
            (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 

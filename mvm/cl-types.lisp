@@ -571,26 +571,62 @@
        (cond
          ((%range-contains-p sup-lo sup-hi sub-lo sub-hi)
           (values t t))
-         ;; Same head, range not contained → definite no
-         ((eq sub-head sup-head)
+         ;; Range NOT contained, sup-head ⊇ sub-head: every element of SUB
+         ;; lives on the real number line that SUP's range subsets, so a
+         ;; sub-value below sup-lo or above sup-hi is a witness NOT in SUP
+         ;; → DEFINITE no — PROVIDED sub's range is non-empty.  This covers
+         ;; same-head ((rational 10 20) ⊄ (rational 11)) AND cross-head
+         ;; ((rational 10 20) ⊄ (real 11)) cases uniformly.
+         ((%num-range-nonempty-p sub-lo sub-hi)
           (values nil t))
-         ;; Different heads, sup has narrower range — can't be sure for compound mismatch.
-         ;; Conservative: if sub is unbounded but sup is bounded → no
-         ((and (eq (car sub-lo) ':neg-inf) (eq (car sub-hi) ':pos-inf)
-               (or (not (eq (car sup-lo) ':neg-inf))
-                   (not (eq (car sup-hi) ':pos-inf))))
-          (values nil t))
-         (t (values nil nil))))
+         ;; sub range provably empty (lo > hi) ⇒ it is NIL ⊆ anything.
+         (t (values t t))))
       ;; sup-head is not supertype of sub-head — but maybe sub-head is supertype of sup
       (t
        ;; e.g. (subtypep 'integer 'fixnum) — if sub-head ⊃ sup-head, definite NO
        ;; only if sub is unbounded or covers more than sup.
        (cond
          ((%numeric-supertype-p sub-head sup-head)
-          ;; sub broader than sup at head level — must be NO unless ranges
-          ;; restrict sub to fit within sup.  Be conservative: NIL NIL.
-          (values nil nil))
+          ;; sub broader than sup at head level (e.g. RATIONAL ⊄ INTEGER):
+          ;; a RATIONAL / REAL / FLOAT range that spans more than a single
+          ;; integer point necessarily contains a value the narrower
+          ;; (integer-like) SUP cannot hold → DEFINITE no.  When sub's range
+          ;; is a single integer point we can't be sure → (NIL NIL).
+          (if (%num-range-multi-point-p sub-head sub-lo sub-hi)
+              (values nil t)
+              (values nil nil)))
          (t (values nil nil)))))))
+
+(defun %num-range-nonempty-p (lo hi)
+  "Canonicalised bounds LO/HI: does the range contain at least one real?
+   Unbounded on either side ⇒ non-empty.  Both finite ⇒ compare; an open
+   bound at an equal value makes the range empty/degenerate."
+  (let ((lk (car lo)) (hk (car hi)))
+    (cond
+      ((or (eq lk ':neg-inf) (eq hk ':pos-inf)) t)
+      (t (let ((lv (cdr lo)) (hv (cdr hi)))
+           (cond
+             ;; both closed: non-empty iff lv <= hv
+             ((and (eq lk ':closed) (eq hk ':closed)) (numeric-<= lv hv))
+             ;; at least one open: non-empty iff lv < hv (reals are dense)
+             (t (numeric-value-less-p lv hv))))))))
+
+(defun %num-range-multi-point-p (head lo hi)
+  "True if the SUB range (head HEAD, canonicalised bounds LO/HI) provably
+   contains more than one DISTINCT real that an integer-like supertype
+   could not all hold — i.e. SUB has a non-integer witness.  For a dense
+   type (rational/real/float) any range that is unbounded, or whose finite
+   endpoints differ, spans infinitely many non-integers → multi-point.  A
+   degenerate single-point range (lo = hi, both closed) is treated as
+   non-multi (could be a lone integer)."
+  (declare (ignore head))
+  (let ((lk (car lo)) (hk (car hi)))
+    (cond
+      ((or (eq lk ':neg-inf) (eq hk ':pos-inf)) t)
+      (t (let ((lv (cdr lo)) (hv (cdr hi)))
+           ;; distinct finite endpoints (or any open bound) ⇒ dense interior
+           (or (not (and (eq lk ':closed) (eq hk ':closed)))
+               (numeric-value-less-p lv hv)))))))
 
 ;; --- Type-name lattice (non-numeric portion) ---
 ;; List of (sub super) edges; transitive closure handled by walker.

@@ -3387,6 +3387,13 @@
   (run-test 9651 (lambda () (eql (rational (float 100 1.0)) 100)) t)
   (run-test 9652 (lambda () (rationalize 0.5)) 1/2)
   (run-test 9653 (lambda () (float (rational 0.25) 1.0)) 0.25)
+  ;; subtypep* range-disjointness probes — must return (NIL T) "definite no"
+  (run-test 9654 (lambda () (multiple-value-list (subtypep* '(rational 10 20) '(rational 11)))) '(nil t))
+  (run-test 9655 (lambda () (multiple-value-list (subtypep* '(rational 10 20) '(rational (10))))) '(nil t))
+  (run-test 9656 (lambda () (multiple-value-list (subtypep* '(rational 10 (21)) '(integer 10)))) '(nil t))
+  (run-test 9657 (lambda () (multiple-value-list (subtypep* '(rational 10 20) '(real 11)))) '(nil t))
+  (run-test 9658 (lambda () (multiple-value-list (subtypep* '(rational * 10) '(rational * 9)))) '(nil t))
+  (run-test 9659 (lambda () (multiple-value-list (subtypep* '(rational 0 10) '(integer * 10)))) '(nil t))
   )
 
 ;;; ============================================================

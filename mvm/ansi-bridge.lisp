@@ -1014,21 +1014,24 @@
         (when (and (eq (car scan) :allow-other-keys) (cadr scan))
           (setq allow-other t))
         (setq scan (cddr scan))))
-    ;; Parse keyword args with validation
-    (loop
-      (when (null a) (return))
-      (when (null (cdr a))
-        (error "parse-integer: odd-length keyword arg list"))
-      (let ((k (car a)) (v (cadr a)))
-        (cond
-          ((eq k :start)       (setq start v))
-          ((eq k :end)         (setq end v))
-          ((eq k :radix)       (setq radix v))
-          ((eq k :junk-allowed)(setq junk-allowed v))
-          ((eq k :allow-other-keys) nil)
-          (allow-other nil)
-          (t (error "parse-integer: bad keyword"))))
-      (setq a (cddr a)))
+    ;; Parse keyword args with validation.  CLHS 7.1.1: for repeated
+    ;; keywords the LEFTMOST value is used (parse-integer.23/.24/.35/.36),
+    ;; so a key already seen is not overwritten.
+    (let ((saw-start nil) (saw-end nil) (saw-radix nil) (saw-junk nil))
+      (loop
+        (when (null a) (return))
+        (when (null (cdr a))
+          (error "parse-integer: odd-length keyword arg list"))
+        (let ((k (car a)) (v (cadr a)))
+          (cond
+            ((eq k :start)       (unless saw-start (setq start v saw-start t)))
+            ((eq k :end)         (unless saw-end   (setq end v saw-end t)))
+            ((eq k :radix)       (unless saw-radix (setq radix v saw-radix t)))
+            ((eq k :junk-allowed)(unless saw-junk  (setq junk-allowed v saw-junk t)))
+            ((eq k :allow-other-keys) nil)
+            (allow-other nil)
+            (t (error "parse-integer: bad keyword"))))
+        (setq a (cddr a))))
     (let ((len (length string)))
       (when (null end) (setq end len))
       ;; Skip leading whitespace
@@ -1038,7 +1041,9 @@
           ;; %prim-aref → raw char CODE (public aref returns a CHARACTER
           ;; since e159986; this code compares against fixnum codes).
           (let ((c (%prim-aref string i)))
-            (when (and (not (= c 32)) (not (= c 9)) (not (= c 10)))
+            ;; CL whitespace[2]: Space 32, Tab 9, Newline 10, Page 12, Return 13.
+            (when (and (not (= c 32)) (not (= c 9)) (not (= c 10))
+                       (not (= c 12)) (not (= c 13)))
               (return)))
           (setq i (+ i 1)))
         ;; Check for sign
@@ -1076,7 +1081,8 @@
                 (loop
                   (when (>= j end) (return))
                   (let ((c (%prim-aref string j)))
-                    (when (and (not (= c 32)) (not (= c 9)) (not (= c 10)))
+                    (when (and (not (= c 32)) (not (= c 9)) (not (= c 10))
+                               (not (= c 12)) (not (= c 13)))
                       (error "parse-integer: junk after digits")))
                   (setq j (+ j 1)))
                 (setq i j)))

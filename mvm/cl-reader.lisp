@@ -13,6 +13,16 @@
 (defvar *read-suppress* nil)
 (defvar *read-eval* nil)
 (defvar *read-default-float-format* nil)
+;; CLHS 2.2 step 9 / 23.1: a single whitespace char that *terminates* a
+;; token is DISCARDED by `read`/`read-from-string` but PRESERVED (unread)
+;; by `read-preserving-whitespace`.  %token-read-loop consults the GLOBAL
+;; value of this var.  defvar init-thunks don't run at boot (CLAUDE.md), so
+;; the quiescent value is NIL ("discard"); the reader entry points setq it
+;; explicitly: `read`/`read-from-string` → NIL, read-preserving-whitespace
+;; → T, and read-from-string honours its :preserve-whitespace kwarg.  Not
+;; in the compiler's special-var allowlist, so `let` of it would bind
+;; lexically — callers mutate+restore the global with setq.
+(defvar *reader-preserve-ws* nil)
 
 ;; *features* — consulted by #+ / #- via %feature-present-p.  Initialised
 ;; in %init-reader (defvar init-thunks don't run; see CLAUDE.md).
@@ -577,7 +587,11 @@
   "Handle a char in normal (non-escape) mode. Returns :done if token ended, nil otherwise."
   (cond
     ((%whitespace-char-p ch)
-     (unread-char ch stream)
+     ;; CLHS 2.2 step 9: terminating whitespace is unread only when the
+     ;; caller wants whitespace preserved (read-preserving-whitespace or
+     ;; a recursive read).  Plain `read`/`read-from-string` discards it.
+     (when *reader-preserve-ws*
+       (unread-char ch stream))
      :done)
     ((%terminating-macro-p ch rt)
      (unread-char ch stream)
@@ -625,9 +639,13 @@
         ;; reads next literal; everything else is a literal char.
         ((aref st 2)
          (%token-handle-in-escape ch stream st rt))
-        ;; Normal mode
+        ;; Normal mode.  CLHS 2.2 step 9: a single whitespace char that
+        ;; terminates a token is DISCARDED by plain read/read-from-string
+        ;; and UNREAD only when whitespace is being preserved (recursive
+        ;; read or read-preserving-whitespace).
         ((%whitespace-char-p ch)
-         (unread-char ch stream)
+         (when *reader-preserve-ws*
+           (unread-char ch stream))
          (return st))
         ((%terminating-macro-p ch rt)
          (unread-char ch stream)
@@ -1878,8 +1896,18 @@
     (let ((s (%resolve-input-stream stream)))
       (if recursive-p
           (%read-internal s eof-error-p eof-value recursive-p)
+          ;; Non-recursive read: discard the single terminating whitespace
+          ;; (CLHS 2.2 step 9 / 23.1.2).  *reader-preserve-ws* is consulted
+          ;; deep in %token-read-loop, which reads the GLOBAL — and the
+          ;; let-binding of a non-allowlisted special is lexical here, so
+          ;; mutate the global via setq.  The default/quiescent value is
+          ;; NIL, so a non-local exit (reader-error) leaving it at NIL is
+          ;; harmless — no unwind-protect needed on the discard path.
           (let ((*sharp-labels* nil))
-            (%read-internal s eof-error-p eof-value recursive-p))))))
+            (setq *reader-preserve-ws* nil)
+            (let ((result (%read-internal s eof-error-p eof-value recursive-p)))
+              (setq *reader-preserve-ws* nil)
+              result))))))
 
 (defun read-preserving-whitespace (&rest args)
   "Read one Lisp object, preserving trailing whitespace."
@@ -1888,10 +1916,20 @@
         (eof-value (if (cddr args) (caddr args) nil))
         (recursive-p (if (cdddr args) (cadddr args) nil)))
     (let ((s (%resolve-input-stream stream)))
-      (if recursive-p
-          (%read-internal s eof-error-p eof-value recursive-p)
-          (let ((*sharp-labels* nil))
-            (%read-internal s eof-error-p eof-value recursive-p))))))
+      ;; Preserve the terminating whitespace (CLHS 23.1.2 / 2.2 step 9).
+      ;; The token loop reads the GLOBAL *reader-preserve-ws*, so mutate it
+      ;; (a let-binding of this non-allowlisted special is lexical here).
+      ;; No unwind-protect: a non-local exit (reader-error/eof) leaving the
+      ;; global at T is harmless — `read`/`read-from-string` setq it back to
+      ;; their own value on entry, and wrapping the read in unwind-protect
+      ;; perturbs how the signal-handler longjmp reports eof/program-error.
+      (setq *reader-preserve-ws* t)
+      (let ((result (if recursive-p
+                        (%read-internal s eof-error-p eof-value recursive-p)
+                        (let ((*sharp-labels* nil))
+                          (%read-internal s eof-error-p eof-value recursive-p)))))
+        (setq *reader-preserve-ws* nil)
+        result))))
 
 (defun read-delimited-list (char &rest args)
   "Read objects until CHAR is found. Returns a list."
@@ -1968,9 +2006,19 @@
                             str)))
         ;; Create string input stream
         (let ((s (make-string-input-stream actual-str)))
-          ;; Read from stream — fresh #N= label table per top-level call
+          ;; Read from stream — fresh #N= label table per top-level call.
+          ;; Discard the terminating whitespace unless :preserve-whitespace
+          ;; was requested (CLHS 23.2 read-from-string).  The token loop
+          ;; reads the GLOBAL *reader-preserve-ws*, so setq+restore it (a
+          ;; let-binding of this non-allowlisted special is lexical here).
           (let* ((*sharp-labels* nil)
-                 (result (%read-internal s eof-error-p eof-value nil)))
+                 (saved-preserve *reader-preserve-ws*)
+                 (result (progn
+                           (setq *reader-preserve-ws*
+                                 (if preserve-whitespace t nil))
+                           (let ((r (%read-internal s eof-error-p eof-value nil)))
+                             (setq *reader-preserve-ws* saved-preserve)
+                             r))))
             ;; Get position.  CLHS 23.2 read-from-string: the second value
             ;; is the index of the first character not read.  Modus's token
             ;; reader UNREADS whatever char terminated the token — the
@@ -1989,8 +2037,11 @@
             (let* ((data (%stream-data s))
                    (pos (car (cdr data)))
                    (pending (cdr (cdr data))))
-              (when (and pending (characterp pending)
-                         (not (%whitespace-char-p pending)))
+              ;; Any UNREAD char (macro terminator, or — when preserving —
+              ;; whitespace) over-counts pos by one; back up to point AT it.
+              ;; A discarded whitespace terminator leaves no pending char,
+              ;; so pos already points past it (CLHS `"abc   "` → 4).
+              (when (and pending (characterp pending))
                 (setq pos (- pos 1)))
               (values result (+ start pos)))))))))
 

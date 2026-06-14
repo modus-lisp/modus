@@ -2248,6 +2248,43 @@
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
+  ;; ==== FABLE-READER probe block 9340-9347 (terminating-whitespace) ====
+  ;; CLHS 2.2 step 9 / 23.1.2: a single whitespace char that TERMINATES a
+  ;; token is DISCARDED by plain read / read-from-string, but PRESERVED
+  ;; (unread) by read-preserving-whitespace.  Regression for the
+  ;; cl-reader.lisp *reader-preserve-ws* fix.
+  ;; read discards the space → next read-char sees X:
+  (run-test 9340 (lambda () (char-code
+                             (with-input-from-string (s ":ABC X")
+                               (read s) (read-char s)))) 88)   ; #\X
+  ;; two spaces: read consumes one, the second remains:
+  (run-test 9341 (lambda () (char-code
+                             (with-input-from-string (s ":ABC  X")
+                               (read s) (read-char s)))) 32)   ; #\Space
+  ;; a non-whitespace terminating macro char is NEVER discarded:
+  (run-test 9342 (lambda () (char-code
+                             (with-input-from-string (s ":ABC(")
+                               (read s) (read-char s)))) 40)   ; #\(
+  ;; read-preserving-whitespace KEEPS the terminating space:
+  (run-test 9343 (lambda () (char-code
+                             (with-input-from-string (s ":ABC X")
+                               (read-preserving-whitespace s) (read-char s)))) 32)
+  ;; read-from-string position after a whitespace-terminated token points
+  ;; PAST the consumed whitespace ("abc   " → 4):
+  (run-test 9344 (lambda () (nth-value 1 (read-from-string "abc   "))) 4)
+  ;; ... but with :preserve-whitespace it points AT the whitespace:
+  (run-test 9345 (lambda () (nth-value 1
+                             (read-from-string "abc def" t nil
+                                               :preserve-whitespace t))) 3)
+  ;; a non-whitespace terminator (the X) is preserved either way → pos 7:
+  (run-test 9346 (lambda () (nth-value 1 (read-from-string "(1 2 3)X"))) 7)
+  ;; read-suppress unaffected: ".." reads as NIL without a reader-error:
+  (run-test 9347 (lambda () (let ((saved *read-suppress*))
+                              (setq *read-suppress* t)
+                              (let ((r (read-from-string "..")))
+                                (setq *read-suppress* saved)
+                                r))) nil)
+  ;; ==== end FABLE-READER probe block ====
   ;; ==== FABLE symbol-package probe block 9460-9479 ====
   (run-test 9460 (lambda () (if (symbol-package 'abc) t nil)) 't)
   (run-test 9461 (lambda () (format nil "~S" 'abc)) "ABC")

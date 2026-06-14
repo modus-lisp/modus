@@ -541,6 +541,7 @@
    Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
    :allow-other-keys T) signals PROGRAM-ERROR."
   (setq pred (%resolve-fn pred))
+  (%require-sequence seq)
   (let ((key nil) (start 0) (end nil) (from-end nil) (a args)
         (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
         (allow-other nil) (aok-set nil))
@@ -1696,6 +1697,7 @@
    Per CLHS 3.4.1.4: odd-length plist or unknown keyword (without
    :allow-other-keys T) signals PROGRAM-ERROR."
   (setq pred (%resolve-fn pred))
+  (%require-sequence seq)
   (let ((key nil) (start 0) (end nil) (from-end nil) (a args)
         (key-set nil) (start-set nil) (end-set nil) (fe-set nil)
         (allow-other nil) (aok-set nil))

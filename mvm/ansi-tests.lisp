@@ -2099,7 +2099,10 @@
   ;; find on non-sequence -> type-error
   (deftest 9451 (handler-case (progn (find 'a 'b) nil) (error (c) t)) t)
   ;; position on non-sequence -> type-error
-  (deftest 9452 (handler-case (progn (position 'a 'b) nil) (error (c) t)) t))
+  (deftest 9452 (handler-case (progn (position 'a 'b) nil) (error (c) t)) t)
+  ;; count-if / count-if-not on non-sequence -> type-error
+  (deftest 9453 (handler-case (progn (count-if #'identity 1) nil) (error (c) t)) t)
+  (deftest 9454 (handler-case (progn (count-if-not #'identity 1) nil) (error (c) t)) t))
 
 ;;; ============================================================
 ;;; Reader tests (Layer 2)

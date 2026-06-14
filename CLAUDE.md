@@ -301,6 +301,17 @@ eq holds: `(eq (read-from-string ":FOO") :foo)` is T.  Regression tests
 Objects have 8-byte header + 8-byte padding + data. Data starts at raw+16 (not raw+8).
 OBJ-REF/OBJ-SET offset formula: `idx*8 + 7` (accounts for tag 9 and 16-byte header).
 
+### String element access (CONFORMANT as of e159986, 2026-06-14)
+Strings store char CODES in their slots, but PUBLIC `aref`/`elt`/`row-major-aref`/
+`char`/`schar` on a string return a **CHARACTER** (`(aref "abc" 0)` → `#\a`, not 97),
+and `(setf (aref s i) ch)` accepts a CHARACTER and stores its code. This is CL-
+conformant. Internal code that needs the raw CODE must use `%prim-aref`/`%prim-aset`
+(NOT public `aref`). compile-aref wraps string reads in `code-char` (gated by
+`%prim-stringp`/`%wrapper-stringp`); compile-aset coerces char→code for string dests.
+WARNING: compiled `(code-char X)` is a raw shift-and-tag primop with NO `characterp`
+guard — calling it on an already-character double-encodes (garbage). So never
+`code-char` a value already read via public `aref`.
+
 ### CL Symbol Layout
 CL symbols: `(cons *sym-tag* #<array [hash, package, name]>)` where *sym-tag* = 123456789.
 `%cl-sym-p` checks `(eql (car x) *sym-tag*)`. Package is array slot 1. Name is slot 2.

@@ -2462,9 +2462,20 @@
         ((and (= sc 1) (>= a 1))  (return-from numeric-value-less-p nil))  ; a>=1, 0<b<1
         ((and (= sc -1) (<= a -1)) (return-from numeric-value-less-p t))   ; a<=-1, -1<b<0
         ((and (= sc -1) (>= a 0)) (return-from numeric-value-less-p nil)))))
-  ;; IEEE-float either side: coerce to rational and recurse.  Without
-  ;; this, < on IEEE-bit floats falls through and returns NIL, breaking
-  ;; (< 1.0 2.0) and friends.
+  ;; BOTH IEEE floats: compare natively via %float-lt-p (SSE2 SUBSD +
+  ;; sign-bit test).  The old path coerced each operand to an exact
+  ;; rational (num/den with den = 2^52) and cross-multiplied —
+  ;; num_a*den_b ≈ 2^104 overflows modus's 63-bit fixnums into bignums
+  ;; and either wraps to garbage or hangs bignum-mul.  That's why
+  ;; (< 1.2 1.3) returned NIL and 14015+ hung.  %float-lt-p is exact,
+  ;; allocation-free, and never leaves float range.
+  (when (and (%ieee-float-p a) (%ieee-float-p b))
+    (return-from numeric-value-less-p (%float-lt-p a b)))
+  ;; IEEE-float on exactly one side (mixed with a small ratio/integer):
+  ;; coerce to rational and recurse.  Safe because the int/ratio side
+  ;; keeps the cross-products small; the dangerous float×float case is
+  ;; handled above.  Without this, < on IEEE-bit floats falls through
+  ;; and returns NIL, breaking (< 1.0 2.0) and friends.
   (when (or (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-value-less-p
       (numeric-value-less-p (%coerce-numeric a) (%coerce-numeric b))))
@@ -2543,6 +2554,13 @@
       (cond
         ((= sc 0) (return-from numeric-equal-p (= a 0)))
         ((or (= sc 1) (= sc -1)) (return-from numeric-equal-p nil)))))
+  ;; BOTH IEEE floats: compare natively (a = b iff neither a<b nor b<a).
+  ;; The coerce-to-rat path below cross-multiplies den ≈ 2^52 operands
+  ;; (num_a*den_b ≈ 2^104), overflowing fixnums into bignums and
+  ;; hanging — same wedge as numeric-value-less-p.
+  (when (and (%ieee-float-p a) (%ieee-float-p b))
+    (return-from numeric-equal-p
+      (not (or (%float-lt-p a b) (%float-lt-p b a)))))
   (when (or (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-equal-p
       (numeric-equal-p (%coerce-numeric a) (%coerce-numeric b))))

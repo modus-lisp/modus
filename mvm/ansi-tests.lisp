@@ -1501,6 +1501,22 @@
   (deftest 9731 (handler-case (progn (tree-equal '(a b)) nil) (error (c) t)) t)
   (deftest 9732 (tree-equal '(1 2) '(1 2)) t)
   (deftest 9733 (tree-equal '(1 2) '(1 3)) nil)
+  ;; Float comparison regression (9287-9289).  The old numeric-value-
+  ;; less-p / numeric-equal-p coerced two IEEE floats to exact rationals
+  ;; (den ≈ 2^52) then cross-multiplied (num_a*den_b ≈ 2^104), which
+  ;; overflowed modus's 63-bit fixnums into bignums and either wrapped to
+  ;; garbage (so (< 1.2 1.3) returned NIL) or hung bignum-mul.  Now
+  ;; float×float routes through the native %float-lt-p (SSE2 SUBSD +
+  ;; sign bit).  Mixed int/float still goes via the small-ratio coerce.
+  (deftest 9287 (list (< 1.2 1.3) (> 1.3 1.2) (<= 1.2 1.2)
+                      (>= 1.3 1.2) (= 1.2 1.2) (= 1.2 1.3))
+    (list t t t t t nil))
+  (deftest 9288 (list (< 1 1.5) (< 1.5 2) (< -1.5 0.0)
+                      (> 0.0 -1.5) (= 1 1.0) (< 1.0 1.0))
+    (list t t t t t nil))
+  (deftest 9289 (and (< 0.1 0.2 0.3) (not (< 0.3 0.2))
+                     (= 2.0 2.0) (>= 1.3 1.3 1.2))
+    t)
   ;; Regression: typep symbol-name dispatch.  9752 used to FAIL because
   ;; (typep* 'standard-method 'symbol) compared the user's 'symbol to
   ;; cl-types.lisp's 'symbol via raw eq, which missed when the bare-metal

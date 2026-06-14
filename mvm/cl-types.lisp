@@ -18,8 +18,17 @@
     obj))
 
 (defun %float-zero-p (x)
-  "Return T if float X has numerator 0."
-  (= (aref x 0) 0))
+  "Return T if IEEE-bits float X is zero — POSITIVE OR NEGATIVE zero.
+   X is a 2-slot (#x60) boxed double: slot 0 = hi 32 bits (sign|exp|
+   mantissa-hi), slot 1 = lo 32 bits.  A double is zero iff exponent == 0,
+   mantissa == 0; the SIGN bit may be set (-0.0).  The old test
+   `(= (aref x 0) 0)` only matched +0.0 (hi == 0) and reported -0.0
+   (hi == #x80000000, the sign bit) as non-zero, which made %float-lt-p
+   treat -0.0 - 0.0 = -0.0 as a strict negative → numeric-equal-p 0.0 -0.0
+   returned NIL → subtypep-float signed-zero range subset checks failed.
+   Mask off the sign bit before comparing the hi slot."
+  (and (= (logand (aref x 0) #x7FFFFFFF) 0)
+       (= (logand (aref x 1) #xFFFFFFFF) 0)))
 
 ;;; ============================================================
 ;;; Transcendental functions — rational approximations via Taylor

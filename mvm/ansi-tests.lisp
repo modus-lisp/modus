@@ -1517,6 +1517,18 @@
   (deftest 9289 (and (< 0.1 0.2 0.3) (not (< 0.3 0.2))
                      (= 2.0 2.0) (>= 1.3 1.3 1.2))
     t)
+  ;; signed-zero subtypep-float regression locks (Claude Fable 5).
+  ;; %float-zero-p tested (= (aref x 0) 0) — the hi32 slot — which is the
+  ;; SIGN bit for -0.0 (#x80000000), so it reported -0.0 as non-zero.
+  ;; That made %float-lt-p treat -0.0 - 0.0 = -0.0 as strictly negative,
+  ;; so numeric-equal-p 0.0 -0.0 was NIL and the 20 subtypep-float signed-
+  ;; zero range-subset tests (25068.. e.g. (float -0.0 *) ⊆ (float 0.0 *))
+  ;; regressed from (T T) to (NIL T).  Fixed by masking the sign bit.
+  (deftest 9290 (%float-zero-p -0.0) t)
+  (deftest 9291 (numeric-equal-p 0.0 -0.0) t)
+  (deftest 9292 (numeric-<= 0.0 -0.0) t)
+  (deftest 9293 (multiple-value-list (subtypep* '(float -0.0 *) '(float 0.0 *))) (list t t))
+  (deftest 9294 (multiple-value-list (subtypep* '(short-float -0.0 *) '(short-float 0.0 *))) (list t t))
   ;; Regression: typep symbol-name dispatch.  9752 used to FAIL because
   ;; (typep* 'standard-method 'symbol) compared the user's 'symbol to
   ;; cl-types.lisp's 'symbol via raw eq, which missed when the bare-metal

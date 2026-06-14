@@ -2326,6 +2326,23 @@
                       (let ((s (prin1-to-string 'cl:car)))
                         (if (or (string= s "CAR") (string= s "COMMON-LISP:CAR")) t s)))
                t)
+  ;; bar-syntax case preservation: '|x| has name "x" (reader must NOT upcase)
+  (rt-run-test 9056 (symbol-name '|x|) "x")
+  (rt-run-test 9057 (symbol-name (read-from-string "|x|")) "x")
+  ;; runtime (setf (readtable-case *readtable*) ...) must affect prin1.
+  ;; This mirrors prin1.symbol.fn from print-symbols.lsp exactly.
+  (rt-run-test 9058
+    (eval '(let ((*readtable* (copy-readtable nil)) (*print-escape* t)
+                 (*print-readably* nil))
+             (setf (readtable-case *readtable*) :upcase)
+             (let ((s (prin1-to-string '|x|)))
+               (if (or (string= s "|x|") (string= s "\\x")) t s))))
+    t)
+  (rt-run-test 9059
+    (eval '(let ((*readtable* (copy-readtable nil)) (*print-escape* nil))
+             (setf (readtable-case *readtable*) :downcase)
+             (princ-to-string '|X|)))
+    "X")
   (rt-run-test 9125 (substitute #\x #\a "banana") "bxnxnx")
   (rt-run-test 9126 (sort (copy-seq "dbca") #'char<) "abcd")
   (rt-run-test 9128 (reverse "abc") "cba")

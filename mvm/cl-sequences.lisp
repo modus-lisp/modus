@@ -17,7 +17,7 @@
        ;; Wrapped vector — peel via array-wrapper-p / wrapper-aref
        ((and (consp seq) (array-wrapper-p seq))
         (let* ((len (length seq))
-               (string-p (stringp seq))
+               (string-p (%wrapper-stringp seq))
                (i 0))
           (loop
             (when (>= i len) (return nil))
@@ -97,7 +97,7 @@
        ;; Determine string-ness by checking the underlying storage type.
        ((and (consp seq) (array-wrapper-p seq))
         (let* ((len (length seq))
-               (string-p (stringp seq))
+               (string-p (%wrapper-stringp seq))
                (i 0))
           (loop
             (when (>= i len) (return t))
@@ -571,7 +571,7 @@
       ;; Wrapped vector — use length+wrapper-aref so fp/displaced/adj are honored
       ((and (consp seq) (array-wrapper-p seq))
        (let* ((n 0)
-              (string-p (stringp seq))
+              (string-p (%wrapper-stringp seq))
               (eff-end (if end end (length seq))))
          (if from-end
              (let ((i (- eff-end 1)))
@@ -768,7 +768,7 @@
     ;; Array wrapper (adj/fp/displaced/multi-dim) — peel via wrapper-aref
     ((and (consp seq) (array-wrapper-p seq))
      (let ((v (%wrapper-aref seq idx)))
-       (if (and (stringp seq) (integerp v)) (code-char v) v)))
+       (if (and (%wrapper-stringp seq) (integerp v)) (code-char v) v)))
     ((consp seq)
      (when (>= idx (length seq)) (error "elt: index out of range"))
      (nth idx seq))
@@ -2249,7 +2249,7 @@
                ;; Wrapped vector — use length/wrapper-aref
                ((and (consp s) (array-wrapper-p s))
                 (let ((n (length s)) (i 0)
-                      (string-p (stringp s)))
+                      (string-p (%wrapper-stringp s)))
                   (loop
                     (when (>= i n) (return nil))
                     (let ((raw (%wrapper-aref s i)))
@@ -2282,7 +2282,7 @@
                ;; Wrapped vector — use length/wrapper-aref
                ((and (consp s) (array-wrapper-p s))
                 (let ((n (length s)) (i 0)
-                      (string-p (stringp s)))
+                      (string-p (%wrapper-stringp s)))
                   (loop
                     (when (>= i n) (return nil))
                     (let ((raw (%wrapper-aref s i)))
@@ -3061,7 +3061,7 @@
       ((and (consp sequence) (array-wrapper-p sequence))
        (let ((len (length sequence))
              (result nil)
-             (string-p (stringp sequence)))
+             (string-p (%wrapper-stringp sequence)))
          (when (null end) (setq end len))
          (let ((i start))
            (loop
@@ -3149,7 +3149,7 @@
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
        (let ((len (length sequence)) (result nil)
-             (string-p (stringp sequence)))
+             (string-p (%wrapper-stringp sequence)))
          (when (null end) (setq end len))
          (let ((i start))
            (loop
@@ -3225,7 +3225,7 @@
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
        (let ((len (length sequence)) (result nil)
-             (string-p (stringp sequence)))
+             (string-p (%wrapper-stringp sequence)))
          (when (null end) (setq end len))
          (let ((i start))
            (loop
@@ -3299,7 +3299,7 @@
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
        (let ((len (length sequence)) (result nil)
-             (string-p (stringp sequence)))
+             (string-p (%wrapper-stringp sequence)))
          (when (null end) (setq end len))
          (let ((i start))
            (loop
@@ -3375,7 +3375,7 @@
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
        (let ((len (length sequence)) (result nil)
-             (string-p (stringp sequence)))
+             (string-p (%wrapper-stringp sequence)))
          (when (null end) (setq end len))
          (let ((i start))
            (loop
@@ -3446,7 +3446,7 @@
     (cond
       ((and (consp sequence) (array-wrapper-p sequence))
        (let ((len (length sequence)) (result nil)
-             (string-p (stringp sequence)))
+             (string-p (%wrapper-stringp sequence)))
          (when (null end) (setq end len))
          (let ((i start))
            (loop
@@ -3549,7 +3549,7 @@
                  ((null seq) nil)
                  ((and (consp seq) (array-wrapper-p seq))
                   (let* ((raw (%wrapper-aref seq i)))
-                    (if (and (stringp seq) (integerp raw)) (code-char raw) raw)))
+                    (if (and (%wrapper-stringp seq) (integerp raw)) (code-char raw) raw)))
                  ((consp seq) (nth i seq))
                  ((stringp seq) (aref seq i))   ; AREF→char already
                  (t (aref seq i)))))

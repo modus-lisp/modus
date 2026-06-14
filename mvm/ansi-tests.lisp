@@ -2264,6 +2264,48 @@
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
+  ;; ==== SEQ AREF probes (9120-9134) placed FIRST so they run before
+  ;; any later diag divergence (the tail of this fn is pre-broken). ====
+  (rt-run-test 9120 (let ((a nil))
+                      (map nil #'(lambda (x) (push x a)) "abc") a)
+               '(#\c #\b #\a))
+  (rt-run-test 9121 (find #\a "aabacedafa" :test-not #'char-equal
+                          :start 0 :end 5 :from-end t)
+               #\c)
+  (rt-run-test 9122 (find #\c "abcdef") #\c)
+  (rt-run-test 9123 (count #\a "abcaba") 3)
+  (rt-run-test 9124 (position #\a "abcaba" :from-end t) 5)
+  (rt-run-test 9125 (substitute #\x #\a "banana") "bxnxnx")
+  (rt-run-test 9126 (sort (copy-seq "dbca") #'char<) "abcd")
+  (rt-run-test 9128 (reverse "abc") "cba")
+  (rt-run-test 9129 (map 'string #'char-upcase "abc") "ABC")
+  (rt-run-test 9130 (remove #\a "banana") "bnn")
+  (rt-run-test 9131 (remove-duplicates "abcabc") "abc")
+  (rt-run-test 9132 (fill (copy-seq "abcd") #\x) "xxxx")
+  (rt-run-test 9133 (mismatch "abcde" "abXde") 2)
+  (rt-run-test 9134 (search "cd" "abcdef") 2)
+  ;; fill-pointered character array: find each char (find-string.25 shape)
+  (rt-run-test 9135 (let ((s (make-array '(10) :initial-contents "abcdefghij"
+                                         :element-type 'character
+                                         :fill-pointer 5)))
+                      (find #\a s))
+               #\a)
+  (rt-run-test 9136 (let ((s (make-array '(10) :initial-contents "abcdefghij"
+                                         :element-type 'character
+                                         :fill-pointer 5)))
+                      (length s))
+               5)
+  (rt-run-test 9137 (let ((s (make-array '(10) :initial-contents "abcdefghij"
+                                         :element-type 'character
+                                         :fill-pointer 5)))
+                      (array-wrapper-p s))
+               t)
+  (rt-run-test 9138 (let ((s (make-array '(10) :initial-contents "abcdefghij"
+                                         :element-type 'character
+                                         :fill-pointer 5)))
+                      (%wrapper-stringp s))
+               t)
+  ;; ==== end SEQ AREF probes ====
   ;; TEMP float-print probes (Fable float-printer mission)
   (run-test 9232 (lambda () (prin1-to-string 1.2)) "1.2")
   (run-test 9233 (lambda () (prin1-to-string 0.6)) "0.6")

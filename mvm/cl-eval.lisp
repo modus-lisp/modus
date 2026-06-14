@@ -3196,6 +3196,18 @@
        (%eval-in-env (cadr args) env))
       ;; DECLARE (ignore)
       ((%eval-sym-eq op "DECLARE") nil)
+      ;; DECLAIM / PROCLAIM — global declarations are no-ops at runtime.
+      ;; Without these, runtime-EVAL of a (declaim (ftype …)) form (common
+      ;; in uiop's eval-when bootstrap, e.g. asdf.lisp's ensure-exported
+      ;; ftype declaim that sits BETWEEN two defuns in one eval-when) falls
+      ;; through to the funcall path, %eval-escape's with an empty stack,
+      ;; and aborts the whole eval-when progn — so ensure-package and every
+      ;; later define-package never gets defined.  CLHS: DECLAIM/PROCLAIM
+      ;; affect compilation/declaration context only; at runtime the tree-
+      ;; walking interpreter ignores type/ftype/inline/optimize declarations,
+      ;; so returning NIL is conformant for our purposes.
+      ((%eval-sym-eq op "DECLAIM") nil)
+      ((%eval-sym-eq op "PROCLAIM") nil)
       ;; LOCALLY (just eval body)
       ((%eval-sym-eq op "LOCALLY")
        (%eval-progn args env))

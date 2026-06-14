@@ -3299,6 +3299,20 @@
       (let ((obj (make-instance 'probe-di-class :s1 'x :s2 'y)))
         (with-slots (s1) obj (setq s1 'q) (slot-value obj 's1))))
     'q)
+  ;; 9182..9184 — runtime-EVAL of DECLAIM / PROCLAIM must be a quiet no-op
+  ;; (not %eval-escape).  uiop's package bootstrap puts a (declaim (ftype …))
+  ;; BETWEEN two defuns inside one eval-when; if DECLAIM escaped it aborted
+  ;; the whole eval-when progn, so ensure-package / define-package never got
+  ;; defined (the ASDF gauntlet keystone).  See cl-eval.lisp %eval-compound.
+  (run-test 9182
+    (lambda () (eval '(declaim (ftype (function (t t) t) some-undefined-fn))))
+    'nil)
+  (run-test 9183
+    (lambda () (eval '(progn (declaim (inline foo) (optimize (speed 3))) :ok)))
+    ':ok)
+  (run-test 9184
+    (lambda () (eval '(proclaim '(special *some-undefined-special*))))
+    'nil)
   ;; +standard-chars+ regression locks (9230..9231) — the format ~D/~O/~X
   ;; randomized padding tests pick their pad char via
   ;; (random-from-seq +standard-chars+); without %init-standard-chars

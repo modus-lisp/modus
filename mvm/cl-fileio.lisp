@@ -50,7 +50,9 @@
         (i 0))
     (loop
       (when (>= i len) (return nil))
-      (setf (mem-ref (+ addr i) :u8) (aref str i))
+      ;; %prim-aref: raw char-CODE (public AREF lifts string elems to
+      ;; CHARACTERs since e159986; mem-ref :u8 needs the fixnum byte).
+      (setf (mem-ref (+ addr i) :u8) (%prim-aref str i))
       (setq i (+ i 1)))
     ;; Null terminator
     (setf (mem-ref (+ addr len) :u8) 0)
@@ -214,7 +216,7 @@
         (i 0))
     (loop
       (when (>= i len) (return path))
-      (when (= (aref path i) 58)  ; 58 = ':'
+      (when (= (%prim-aref path i) 58)  ; 58 = ':'  (raw code; AREF lifts to char)
         ;; Found colon — strip everything up to and including it
         (return (%substring path (+ i 1) len)))
       (setq i (+ i 1)))))
@@ -235,7 +237,7 @@
     ;; If path is relative (doesn't start with /), prepend defaults.
     ;; *default-pathname-defaults* may be a string or pathname obj; coerce
     ;; via namestring before treating as a directory prefix.
-    (if (and (> (length path) 0) (= (aref path 0) 47))  ; 47 = #\/
+    (if (and (> (length path) 0) (= (%prim-aref path 0) 47))  ; 47 = #\/  (raw code)
         path
         (let* ((dpd *default-pathname-defaults*)
                (base (cond
@@ -246,7 +248,7 @@
           (if (and base (> (length base) 0))
               (let ((base-len (length base)))
                 ;; Ensure base ends with /
-                (if (= (aref base (- base-len 1)) 47)
+                (if (= (%prim-aref base (- base-len 1)) 47)
                     (concatenate-strings base path)
                     (concatenate-strings base (concatenate-strings "/" path))))
               path)))))
@@ -479,8 +481,10 @@
         (let ((bpos (%fs-bpos stream))
               (blen (%fs-blen stream)))
           (if (< bpos blen)
-              ;; Buffer has data
-              (let ((ch (code-char (aref (%fs-buf stream) bpos))))
+              ;; Buffer has data.  %prim-aref: the buffer is a STRING, and
+              ;; public AREF now lifts string elements to CHARACTERs (e159986);
+              ;; we need the raw char-CODE here so code-char encodes it once.
+              (let ((ch (code-char (%prim-aref (%fs-buf stream) bpos))))
                 (%fs-set-bpos stream (+ bpos 1))
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 ch)
@@ -497,7 +501,10 @@
                           (i 0))
                       (loop
                         (when (>= i n) (return nil))
-                        (let ((dummy (aset buf i (mem-ref (+ io-addr i) :u8))))
+                        ;; %prim-aset: store the raw byte CODE into the string
+                        ;; buffer (public ASET would coerce a CHARACTER, but we
+                        ;; have a fixnum code) — see e159986.
+                        (let ((dummy (%prim-aset buf i (mem-ref (+ io-addr i) :u8))))
                           (setq i (+ i 1))))
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
@@ -523,7 +530,9 @@
         (let ((bpos (%fs-bpos stream))
               (blen (%fs-blen stream)))
           (if (< bpos blen)
-              (let ((b (aref (%fs-buf stream) bpos)))
+              ;; %prim-aref: read the raw byte CODE (string AREF lifts to a
+              ;; CHARACTER now — e159986 — but read-byte must return a fixnum).
+              (let ((b (%prim-aref (%fs-buf stream) bpos)))
                 (%fs-set-bpos stream (+ bpos 1))
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 b)
@@ -538,7 +547,8 @@
                           (i 0))
                       (loop
                         (when (>= i n) (return nil))
-                        (let ((dummy (aset buf i (mem-ref (+ io-addr i) :u8))))
+                        ;; %prim-aset: raw byte CODE into the string buffer.
+                        (let ((dummy (%prim-aset buf i (mem-ref (+ io-addr i) :u8))))
                           (setq i (+ i 1))))
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
@@ -1522,7 +1532,11 @@
                        (if (>= pos (length str))
                            ;; EOF
                            (if eof-error-p (error "end of file") eof-value)
-                           (let ((ch (code-char (aref str pos))))
+                           ;; %prim-aref: raw char-CODE (public AREF lifts to a
+                           ;; CHARACTER since e159986; code-char must encode the
+                           ;; raw code exactly once — feeding it a character
+                           ;; double-encodes and corrupts read-from-string).
+                           (let ((ch (code-char (%prim-aref str pos))))
                              (set-car pos-cell (+ pos 1))
                              ch))))))))
           ;; Echo stream: read from input, echo to output.

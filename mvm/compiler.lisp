@@ -6757,8 +6757,7 @@
          (let ((var (loop-iter-var iter))
                (idx (loop-iter-list-var iter))
                (arr (loop-iter-step-form iter))
-               (lim (gensym "ACROSSLIM"))
-               (raw (gensym "ACROSSRAW")))
+               (lim (gensym "ACROSSLIM")))
            (push (list arr (loop-iter-init-form iter)) bindings)
            (push (list idx 0) bindings)
            (push (list var nil) bindings)
@@ -6768,10 +6767,12 @@
            ;; so we don't pay the wrapper-peel cost per element.
            (push (list lim `(length ,arr)) bindings)
            (push `(if (>= ,idx ,lim) (return nil)) test-forms)
-           ;; Strings store raw u8 char-codes; convert to characters per ANSI
-           ;; when iterating across a string. Other arrays keep raw element.
-           (push `(setq ,var (let ((,raw (aref ,arr ,idx)))
-                               (if (stringp ,arr) (code-char ,raw) ,raw)))
+           ;; Public AREF already returns a CHARACTER for strings (conformant
+           ;; as of e159986) and the raw element for other arrays, so no
+           ;; code-char wrap is needed.  Wrapping a value that is ALREADY a
+           ;; character double-encodes (code-char is an unguarded shift-and-tag
+           ;; primop) — that produced #<?0> garbage in (loop for c across STR).
+           (push `(setq ,var (aref ,arr ,idx))
                  init-stmts)
            (push `(setq ,idx (1+ ,idx)) step-stmts)))
 

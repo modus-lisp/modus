@@ -462,7 +462,12 @@
       t)))
 
 (defun rename-package (pkg new-name &rest new-nicknames-arg)
-  "Rename PKG to NEW-NAME with optional new nicknames."
+  "Rename PKG to NEW-NAME with optional new nicknames.  CLHS:
+   (package new-name &optional new-nicknames) — a fourth positional
+   arg (i.e. more than one rest element) signals program-error
+   (rename-package.error.3)."
+  (when (and new-nicknames-arg (cdr new-nicknames-arg))
+    (%signal-program-error))
   (let ((p (%resolve-package pkg))
         (new-nicks (if new-nicknames-arg (car new-nicknames-arg) nil)))
     (when p
@@ -605,7 +610,11 @@
 
 (defun find-symbol (name &rest pkg-arg)
   "Find symbol named NAME in package PKG.
-   Returns (values symbol status) or (values nil nil)."
+   Returns (values symbol status) or (values nil nil).
+   CLHS: one or two args; a third positional arg signals program-error
+   (find-symbol.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (name-str (%pkg-string-designator name)))
     (if (null pkg)
@@ -634,7 +643,11 @@
 
 (defun intern (name &rest pkg-arg)
   "Intern symbol named NAME in package PKG.
-   Returns (values symbol status)."
+   Returns (values symbol status).
+   CLHS: one or two args; a third positional arg signals program-error
+   (intern.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (name-str (%pkg-string-designator name)))
     (if (null pkg)
@@ -739,7 +752,10 @@
 ;;; --- export / unexport ---
 
 (defun export (symbols &rest pkg-arg)
-  "Export SYMBOLS from PKG."
+  "Export SYMBOLS from PKG.  CLHS: a third positional arg signals
+   program-error (export.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
                       symbols
@@ -757,7 +773,10 @@
     t))
 
 (defun unexport (symbols &rest pkg-arg)
-  "Unexport SYMBOLS from PKG (move to internal)."
+  "Unexport SYMBOLS from PKG (move to internal).  CLHS: a third
+   positional arg signals program-error (unexport.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
                       symbols
@@ -797,7 +816,10 @@
 ;;; --- unintern ---
 
 (defun unintern (sym &rest pkg-arg)
-  "Remove SYM from PKG."
+  "Remove SYM from PKG.  CLHS: a third positional arg signals
+   program-error (unintern.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (name-str (symbol-name sym))
         (removed nil))
@@ -828,7 +850,10 @@
           (cons using-pkg (%pkg-used-by to-use)))))))
 
 (defun use-package (packages &rest pkg-arg)
-  "Add PACKAGES to the use-list of PKG."
+  "Add PACKAGES to the use-list of PKG.  CLHS: a third positional arg
+   signals program-error (use-package.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (pkg-list (if (and (consp packages) (not (%pkg-p packages)))
                       packages
@@ -838,7 +863,10 @@
     t))
 
 (defun unuse-package (packages &rest pkg-arg)
-  "Remove PACKAGES from the use-list of PKG."
+  "Remove PACKAGES from the use-list of PKG.  CLHS: a third positional
+   arg signals program-error (unuse-package.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (pkg-list (if (and (consp packages) (not (%pkg-p packages)))
                       packages
@@ -855,7 +883,10 @@
 ;;; --- shadow / shadowing-import ---
 
 (defun shadow (names &rest pkg-arg)
-  "Create shadowing symbols in PKG."
+  "Create shadowing symbols in PKG.  CLHS: a third positional arg
+   signals program-error (shadow.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (name-list (if (or (stringp names) (%cl-sym-p names) (characterp names))
                        (list names)
@@ -880,7 +911,10 @@
     t))
 
 (defun shadowing-import (symbols &rest pkg-arg)
-  "Import SYMBOLS into PKG as shadowing symbols."
+  "Import SYMBOLS into PKG as shadowing symbols.  CLHS: a third
+   positional arg signals program-error (shadowing-import.error.2)."
+  (when (and pkg-arg (cdr pkg-arg))
+    (%signal-program-error))
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (sym-list (if (and (consp symbols) (not (%cl-sym-p symbols)))
                       symbols

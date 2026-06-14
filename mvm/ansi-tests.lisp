@@ -3133,6 +3133,11 @@
   (run-test 9992 (lambda () (format nil (format nil "~~~d,'~cd" 6 #\*) 42)) "****42")
   (run-test 9993 (lambda () (format nil "~:d" -1234567)) "-1,234,567")
   (run-test 9994 (lambda () (let ((fn (formatter "~v,vd"))) (formatter-call-to-string fn 6 #\Space 42))) "    42")
+  ;; ~v~ / ~#~ tilde-count: format vs formatter divergence (format-tilde 23651/23652)
+  (run-test 9320 (lambda () (format nil "~V~" 5)) "~~~~~")
+  (run-test 9321 (lambda () (format nil "~v~" 5)) "~~~~~")
+  (run-test 9322 (lambda () (let ((fn (formatter "~v~")) (s (make-string-output-stream))) (funcall fn s 5 'a) (get-output-stream-string s))) "~~~~~")
+  (run-test 9323 (lambda () (format nil (formatter "~10r") 123)) "123")
   ;; &optional + &rest static-pack coordination (structures-03 BOA shapes,
   ;; e.g. sbt-12-con = (a &optional (b 1) &rest c)).  compile-call no longer
   ;; static-packs when the callee has &optional params — it falls through to

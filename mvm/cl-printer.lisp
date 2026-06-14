@@ -1852,6 +1852,13 @@
 ;;; Returns remaining args (for use by formatter)
 (defun %format-impl (stream control args)
   "Core format. Returns remaining unused args."
+  ;; CLHS 22.3: a format control may be a FUNCTION (the result of FORMATTER)
+  ;; instead of a string.  When so, it consumes the stream + args and returns
+  ;; the unused tail — exactly the formatter-closure contract.  Detect and
+  ;; delegate before touching array-length (which would read garbage off a
+  ;; closure object).
+  (when (functionp control)
+    (return-from %format-impl (apply control stream args)))
   (let ((len (array-length control))
         (i 0)
         (arg-list args)
@@ -2380,14 +2387,19 @@
                                     (t param3)))
                           (should-escape
                            (cond
+                             ;; ~N,M,K^ — escape iff N <= M <= K.  Use NUMBERP
+                             ;; (not INTEGERP) so BIGNUM params (e.g. from
+                             ;; ~0,v,v^ with (1+ most-positive-fixnum)) are
+                             ;; accepted — the compiled INTEGERP primitive is
+                             ;; fixnum-only, and <= is bignum-aware.
                              (p3
-                              (and (integerp p1) (integerp p2) (integerp p3)
+                              (and (numberp p1) (numberp p2) (numberp p3)
                                    (<= p1 p2) (<= p2 p3)))
                              (p2
-                              (and (integerp p1) (integerp p2)
+                              (and (numberp p1) (numberp p2)
                                    (= p1 p2)))
                              (p1
-                              (and (integerp p1) (= p1 0)))
+                              (and (numberp p1) (= p1 0)))
                              ;; ~:^ — escape if outer iteration list exhausted.
                              ;; CLHS 22.3.9.2: ~:^ checks the list passed to ~:{,
                              ;; not the inner sublist passed to the body.

@@ -2264,6 +2264,15 @@
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
+  ;; TEMP float-print probes (Fable float-printer mission)
+  (run-test 9232 (lambda () (prin1-to-string 1.2)) "1.2")
+  (run-test 9233 (lambda () (prin1-to-string 0.6)) "0.6")
+  (run-test 9234 (lambda () (prin1-to-string 1.5)) "1.5")
+  (run-test 9235 (lambda () (prin1-to-string 100.0)) "100.0")
+  (run-test 9236 (lambda () (prin1-to-string 3.14)) "3.14")
+  (run-test 9237 (lambda () (prin1-to-string 0.1)) "0.1")
+  (run-test 9238 (lambda () (prin1-to-string (/ 1.0 3.0))) "0.3333333333333333")
+  (run-test 9239 (lambda () (prin1-to-string 1.0e10)) "1.0e10")
   ;; ==== FABLE-READER probe block 9340-9347 (terminating-whitespace) ====
   ;; CLHS 2.2 step 9 / 23.1.2: a single whitespace char that TERMINATES a
   ;; token is DISCARDED by plain read / read-from-string, but PRESERVED

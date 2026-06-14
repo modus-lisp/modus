@@ -924,6 +924,157 @@
               (dolist (digit (reverse lst))
                 (%print-char (+ 48 digit) stream)))))))
 
+;;; ------------------------------------------------------------------
+;;; Dragon4 free-format shortest round-trip float printer (CLHS 22.1.3.1.3)
+;;;
+;;; Given a positive IEEE value as MANT * 2^EXP (MANT,EXP integers, MANT
+;;; the significand from %ieee-float-decode-bits), produce the SHORTEST
+;;; sequence of decimal digits D1 D2 ... Dn together with an integer K
+;;; such that  value = 0.D1D2...Dn * 10^K  and reading that decimal back
+;;; reproduces the SAME float.  This is the Steele & White / Dragon4
+;;; free-format algorithm (FPP2).
+;;;
+;;; PRECISION HANDLING: Modus stores every float as an IEEE double (subtag
+;;; #x60), but its reader yields single-float-precision values (the source
+;;; literal 1.2 becomes the double-widened single 1.2f0 = 1.2000000476...).
+;;; A double-precision shortest decimal of that value would be the long
+;;; "1.2000000476837158" string.  To recover "1.2" we first STRIP trailing
+;;; zero bits from the significand: a widened single has >=29 trailing zero
+;;; bits, so stripping leaves <=24 significant bits and the half-ulp gaps
+;;; used by Dragon4 become the SINGLE-float gaps — exactly the precision at
+;;; which the value round-trips.  A genuine 53-bit double (e.g. an epsilon
+;;; constant) has no trailing zeros, so stripping is a no-op and full
+;;; double precision is preserved.
+;;; ------------------------------------------------------------------
+
+(defun %float-bit-length (n)
+  "Number of significant bits in non-negative integer N (0 -> 0)."
+  (let ((c 0) (tmp n))
+    (loop
+      (when (= tmp 0) (return nil))
+      (setq tmp (ash tmp -1))
+      (setq c (+ c 1)))
+    c))
+
+(defun %dragon4-digits (mant exp)
+  "MANT * 2^EXP with MANT>0 (MANT the 53-bit IEEE-double significand).
+   Returns (cons digit-list k) where the value equals 0.<digits> * 10^k
+   and the digit list is the shortest decimal that round-trips to this
+   float.  The half-ulp gaps are taken at the float's TRUE precision: a
+   value whose low 29 significand bits are all zero is exactly a single
+   float, so it is reduced to a 24-bit significand and the shortest
+   decimal at single precision is emitted (1.2 -> \"1.2\"); a genuine
+   53-bit double (nonzero low 29 bits, e.g. an epsilon constant or a
+   runtime quotient) keeps full precision."
+  (let ((f mant) (e exp) (p 53))
+    ;; Detect single precision: low 29 bits (= 52-23) all zero means this
+    ;; double is exactly representable as a 24-bit single.  Reduce so the
+    ;; ulp/half-gap reflect single precision.  Genuine doubles keep p=53.
+    (when (and (>= (%float-bit-length f) 53)
+               (= (logand f 536870911) 0))   ; 536870911 = (1<<29)-1
+      (setq f (ash f -29))
+      (setq e (+ e 29))
+      (setq p 24))
+    (let* ((f-is-pow2 (= f (ash 1 (- p 1))))
+           (r 0) (s 0) (m+ 0) (m- 0))
+      ;; FPP2 scaling: set up R/S/M+/M- per Steele&White.  When the
+      ;; significand is an exact power of two the gap to the next-lower
+      ;; float is half the gap to the next-higher one (asymmetric).
+      (if (>= e 0)
+          (let ((be (ash 1 e)))
+            (if (not f-is-pow2)
+                (progn (setq r (* f be 2)) (setq s 2)
+                       (setq m+ be) (setq m- be))
+                (progn (setq r (* f be 4)) (setq s 4)
+                       (setq m+ (* be 2)) (setq m- be))))
+          (let ((se (ash 1 (- 0 e))))
+            (if (not f-is-pow2)
+                (progn (setq r (* f 2)) (setq s (* se 2))
+                       (setq m+ 1) (setq m- 1))
+                (progn (setq r (* f 4)) (setq s (* se 4))
+                       (setq m+ 2) (setq m- 1)))))
+      ;; Estimate/scale K so that (R + M+)/S is in [1/10, 1).
+      (let ((k 0))
+        (loop
+          (when (not (> (+ r m+) s)) (return nil))
+          (setq s (* s 10))
+          (setq k (+ k 1)))
+        (loop
+          (when (not (< (* (+ r m+) 10) s)) (return nil))
+          (setq r (* r 10)) (setq m+ (* m+ 10)) (setq m- (* m- 10))
+          (setq k (- k 1)))
+        ;; Generate digits.
+        (let ((digits nil) (done nil))
+          (loop
+            (when done (return nil))
+            (setq r (* r 10)) (setq m+ (* m+ 10)) (setq m- (* m- 10))
+            (let* ((d (truncate r s))
+                   (nr (mod r s)))
+              (setq r nr)
+              (let ((low (< r m-))
+                    (high (> (+ r m+) s)))
+                (if (or low high)
+                    (let ((dd (cond
+                                ((and low (not high)) d)
+                                ((and high (not low)) (+ d 1))
+                                ((not (> (* r 2) s)) d)
+                                (t (+ d 1)))))
+                      (setq digits (cons dd digits))
+                      (setq done t))
+                    (setq digits (cons d digits))))))
+          (cons (reverse digits) k))))))
+
+(defun %print-float-digits (digits k stream)
+  "Render DIGITS (list of 0-9 ints) with decimal point so that value =
+   0.<digits> * 10^K, choosing positional vs exponential per the CL free
+   format.  Assumes sign already emitted and DIGITS non-empty."
+  (let ((ndig (length digits)))
+    (cond
+      ;; Positional notation when -2 <= k <= 7 (matches the common CL printer
+      ;; threshold: 1000000.0 positional, 1.0e7 exponential; 0.001 positional,
+      ;; 1.0e-4 exponential).
+      ((and (>= k -2) (<= k 7))
+       (cond
+         ((<= k 0)
+          ;; 0.<zeros><digits>
+          (%print-char 48 stream)   ; 0
+          (%print-char 46 stream)   ; .
+          (let ((z (- 0 k)))
+            (loop (when (<= z 0) (return nil))
+                  (%print-char 48 stream) (setq z (- z 1))))
+          (dolist (d digits) (%print-char (+ 48 d) stream)))
+         ((>= k ndig)
+          ;; <digits><zeros>.0
+          (dolist (d digits) (%print-char (+ 48 d) stream))
+          (let ((z (- k ndig)))
+            (loop (when (<= z 0) (return nil))
+                  (%print-char 48 stream) (setq z (- z 1))))
+          (%print-char 46 stream)   ; .
+          (%print-char 48 stream))  ; 0
+         (t
+          ;; first k digits, '.', rest
+          (let ((i 0))
+            (dolist (d digits)
+              (when (= i k) (%print-char 46 stream))
+              (%print-char (+ 48 d) stream)
+              (setq i (+ i 1)))))))
+      (t
+       ;; Exponential: D.DDDDe<exp>, exp = k-1.
+       (let ((first t))
+         (dolist (d digits)
+           (%print-char (+ 48 d) stream)
+           (when first
+             (%print-char 46 stream)   ; .
+             (setq first nil))))
+       ;; If only one digit, we printed "D." — add trailing 0.
+       (when (= ndig 1) (%print-char 48 stream))
+       (%print-char 101 stream)   ; e
+       (let ((ex (- k 1)))
+         (when (< ex 0)
+           (%print-char 45 stream)   ; -
+           (setq ex (- 0 ex)))
+         (%print-decimal-to-stream ex stream))))))
+
 (defun float-to-string (f)
   "Convert boxed float to printed decimal representation.
    Handles both IEEE-bit subtag #x60 floats (produced by reader,
@@ -935,18 +1086,30 @@
         (subtag (obj-subtag f)))
     (cond
       ((= subtag 96)
-       ;; Real IEEE #x60: decode bits, route through (num,den) decimal.
-       (let* ((nd (%ieee-to-num-den f))
-              (signed (car nd))
-              (den    (cdr nd))
-              (neg    (< signed 0))
-              (num    (if neg (- 0 signed) signed)))
-         (when neg (%print-char 45 s))
-         (let ((int-part (if (= den 0) 0 (truncate num den)))
-               (frac-num (if (= den 0) 0 (mod num den))))
-           (%print-decimal-to-stream int-part s)
-           (%print-char 46 s)   ; .
-           (%print-fraction-digits frac-num den s))))
+       ;; Real IEEE #x60: decode bits, render via Dragon4 free-format.
+       (let* ((decoded (%ieee-float-decode-bits f))
+              (sign (car decoded))
+              (mant (cadr decoded))
+              (e    (caddr decoded))
+              (neg  (< sign 0)))
+         (cond
+           ;; ±0.0
+           ((or (eq mant :infinity) (eq mant :nan) (= mant 0))
+            (when neg (%print-char 45 s))
+            (cond
+              ((eq mant :infinity)
+               ;; No reader syntax; emit a recognizable token.
+               (%print-string-raw "#.float-infinity" s))
+              ((eq mant :nan)
+               (%print-string-raw "#.float-nan" s))
+              (t
+               (%print-char 48 s) (%print-char 46 s) (%print-char 48 s))))
+           (t
+            (when neg (%print-char 45 s))
+            (let* ((dk (%dragon4-digits mant e))
+                   (digits (car dk))
+                   (k      (cdr dk)))
+              (%print-float-digits digits k s))))))
       (t
        ;; Legacy [signed-mant, divisor] rational-form (subtag #x32).
        (let* ((smant (aref f 0))

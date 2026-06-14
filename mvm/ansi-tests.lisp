@@ -2102,7 +2102,11 @@
   (deftest 9452 (handler-case (progn (position 'a 'b) nil) (error (c) t)) t)
   ;; count-if / count-if-not on non-sequence -> type-error
   (deftest 9453 (handler-case (progn (count-if #'identity 1) nil) (error (c) t)) t)
-  (deftest 9454 (handler-case (progn (count-if-not #'identity 1) nil) (error (c) t)) t))
+  (deftest 9454 (handler-case (progn (count-if-not #'identity 1) nil) (error (c) t)) t)
+  ;; sort on a string with :key presents elements as characters
+  (deftest 9455 (sort (copy-seq "10011101") #'char<
+                      :key #'(lambda (c) (if (eql c #\0) #\1 #\0)))
+    "11111000"))
 
 ;;; ============================================================
 ;;; Reader tests (Layer 2)

@@ -890,19 +890,25 @@
 (defun %sort-vector (seq pred key)
   ;; Insertion sort over a vector, in-place.  Walk i from 1 to len-1;
   ;; for each, slide it left while predicate(i, j-1) holds.
-  (let ((len (array-length seq)))
+  ;; STRING seqs store fixnum char-codes; present elements to PRED/KEY as
+  ;; CHARACTER objects (so e.g. (sort "..." #'char< :key ...) works), then
+  ;; store the swapped char-codes back.
+  (let ((len (array-length seq))
+        (str-p (stringp seq)))
     (let ((i 1))
       (loop
         (when (>= i len) (return seq))
         (let ((j i))
           (loop
             (when (= j 0) (return nil))
-            (let* ((a (aref seq j))
-                   (b (aref seq (- j 1)))
+            (let* ((ra (aref seq j))
+                   (rb (aref seq (- j 1)))
+                   (a (if str-p (code-char ra) ra))
+                   (b (if str-p (code-char rb) rb))
                    (av (if key (funcall key a) a))
                    (bv (if key (funcall key b) b)))
               (if (funcall pred av bv)
-                  (progn (aset seq j b) (aset seq (- j 1) a)
+                  (progn (aset seq j rb) (aset seq (- j 1) ra)
                          (setq j (- j 1)))
                   (return nil)))))
         (setq i (+ i 1))))))

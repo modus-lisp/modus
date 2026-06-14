@@ -1711,12 +1711,29 @@
                     (values q r))))))))))
 
 (defun mod (n d)
-  ;; CL: mod = n - d * (floor n d)
-  (multiple-value-bind (q r) (floor n d) (declare (ignore q)) r))
+  ;; CL: mod = n - d * (floor n d).
+  ;; Integer/integer (incl. BIGNUM) routes through %truncate2-generic so
+  ;; the bignum case uses %integer-truncate (bignum-safe long division)
+  ;; instead of the compiler-intercepted 2-arg truncate, whose inline
+  ;; :div treats bignum pointers as fixnums (garbage / SIGSEGV).  This is
+  ;; the path gcd-impl → mod hits when reducing power-of-two ratios from
+  ;; (rational <tiny-float>), which used to HANG the =.18/.19 tests.
+  (if (and (integerp n) (integerp d))
+      (multiple-value-bind (q r) (%truncate2-generic n d)
+        (declare (ignore q))
+        ;; truncate-remainder → floor-remainder adjustment
+        (if (and (not (= r 0))
+                 (if (< d 0) (> r 0) (< r 0)))
+            (generic-add r d)
+            r))
+      (multiple-value-bind (q r) (floor n d) (declare (ignore q)) r)))
 
 (defun rem (n d)
-  ;; CL: rem = n - d * (truncate n d)
-  (multiple-value-bind (q r) (truncate n d) (declare (ignore q)) r))
+  ;; CL: rem = n - d * (truncate n d).
+  (if (and (integerp n) (integerp d))
+      (multiple-value-bind (q r) (%truncate2-generic n d)
+        (declare (ignore q)) r)
+      (multiple-value-bind (q r) (truncate n d) (declare (ignore q)) r)))
 
 ;; ash and lognot are inline opcodes at compile time but have no defun
 ;; fallback for runtime EVAL.  Wrap so SFT lookup finds them.
@@ -1972,30 +1989,73 @@
 ;;; Exact division and rational arithmetic for ANSI tests
 ;;; ============================================================
 
+(defun %int-neg-p (x)
+  "True if integer X (fixnum or bignum) is negative."
+  (if (bignump x) (< (bignum-hi x) 0) (< x 0)))
+
+(defun %int-abs (x)
+  "Absolute value of integer X (fixnum or bignum)."
+  (if (%int-neg-p x) (generic-negate-int x) x))
+
+(defun %int-zerop (x)
+  "True if integer X (fixnum or bignum) equals zero."
+  (if (bignump x) (= (bignum-cmp x 0) 0) (= x 0)))
+
+(defun %int-rem (a b)
+  "Remainder of A÷B truncated toward zero (sign of A), bignum-safe.
+   Avoids the compiler-intercepted MOD/TRUNCATE, whose inline expansion
+   `(* (truncate a b) b)` does a fixnum :mul that SILENTLY WRAPS when the
+   product overflows 63 bits (overflow-promotion is disabled in
+   emit-arith-pair) — that wrap is what made gcd over power-of-two
+   bignums loop forever / crash.  Here every step uses the bignum-aware
+   %integer-truncate / generic-multiply / generic-subtract."
+  (let* ((q (%integer-truncate a b))
+         (r (generic-subtract a (generic-multiply q b))))
+    r))
+
 (defun gcd-impl (a b)
-  "Greatest common divisor (Euclidean algorithm)."
-  (let ((a (if (< a 0) (- 0 a) a))
-        (b (if (< b 0) (- 0 b) b)))
-    (loop (when (= b 0) (return a))
-      (let ((r (mod a b))) (setq a b) (setq b r)))))
+  "Greatest common divisor (Euclidean algorithm).  Bignum-safe: uses
+   %int-abs / %int-zerop and a bignum-aware remainder (%int-rem) so gcd
+   over power-of-two bignums (from (rational <tiny-float>)) terminates
+   and never touches the overflow-wrapping fixnum MOD/TRUNCATE path."
+  (let ((a (%int-abs a))
+        (b (%int-abs b)))
+    (loop (when (%int-zerop b) (return a))
+      (let ((r (%int-rem a b))) (setq a b) (setq b r)))))
 
 ;; Tagged ratio object (subtag #x33) — slot 0 = numerator, slot 1 = denominator.
 (defun make-ratio-obj (num den)
   (let ((r (%make-ratio))) (aset r 0 num) (aset r 1 den) r))
 
+(defun %rat-exact-div (a b)
+  "Exact integer quotient A/B (B divides A).  Bignum-safe: routes bignum
+   operands through %integer-truncate (bignum long division) rather than
+   the raw %idiv-trunc :div primop, which treats a bignum pointer as a
+   fixnum and returns garbage / SIGSEGVs.  Fixnum/fixnum stays on the
+   fast %idiv-trunc path."
+  (if (or (bignump a) (bignump b))
+      (%integer-truncate a b)
+      (%idiv-trunc a b)))
+
 (defun %make-rat (num den)
   "Build a normalised rational from NUM/DEN.  Reduces by gcd, lifts the sign
    into the numerator, collapses to an integer when DEN=1.  Used by every
    path that introduces a ratio so callers never need to re-normalise.
-   Uses %idiv-trunc to avoid recursing through / (which itself routes
-   non-exact divisions back here)."
+   Bignum-safe division via %rat-exact-div: when NUM or DEN is a bignum
+   (e.g. (rational <tiny-float>) yields den = 2^105), the gcd-quotient
+   must use %integer-truncate, NOT the raw %idiv-trunc :div which
+   garbages bignum pointers and HANGS / crashes the =.18/.19 tests."
   (let* ((g (gcd-impl num den))
-         (n (%idiv-trunc num g))
-         (d (%idiv-trunc den g)))
-    (when (< d 0)
-      (setq n (- 0 n))
+         (n (%rat-exact-div num g))
+         (d (%rat-exact-div den g)))
+    (when (and (not (bignump d)) (< d 0))
+      (setq n (generic-negate-int n))
       (setq d (- 0 d)))
-    (if (= d 1) n (make-ratio-obj n d))))
+    (if (and (not (bignump d)) (= d 1)) n (make-ratio-obj n d))))
+
+(defun generic-negate-int (x)
+  "Negate integer X (fixnum or bignum)."
+  (if (bignump x) (bignum-negate x) (- 0 x)))
 
 (defun ratio-numerator (x) (aref x 0))
 (defun ratio-denominator (x) (aref x 1))

@@ -8625,10 +8625,27 @@
          ;; still benefits cases where bignum reaches it through
          ;; other call sites (ratio/float intermediates that
          ;; integerp after coercion).
+         ;; POSITIVE gate for BIGNUM (2026-06-14, Fable): bignum operands
+         ;; route to %truncate2-generic alongside float/ratio.  The old
+         ;; NEGATIVE gate sent (truncate bignum X) to %fixnum-truncate2's
+         ;; raw :div, which treats the bignum pointer as a fixnum →
+         ;; garbage quotient or SIGSEGV.  This is the root of the =.18 /
+         ;; =.19 number-comparison HANGS: (rational <tiny-float>) builds a
+         ;; 2^105-denominator ratio, %make-rat's gcd-reduce calls (mod
+         ;; bignum fixnum) → compile-mod's inline (truncate bignum fixnum)
+         ;; → crash/garbage → the comparison never terminates cleanly.
+         ;; The historical worry that flipping cascades a SIGSEGV in the
+         ;; K-scaled %sin-taylor loop is STALE: sin/cos were rewritten to
+         ;; all-IEEE-double arithmetic (cl-types.lisp %sin-poly-f /
+         ;; %cos-poly-f) and no longer (truncate (* s s) k) into bignum.
+         ;; %truncate2-generic → %integer-truncate handles bignum/bignum
+         ;; and bignum/fixnum via %bignum-divmod-fixnum (small divisor) /
+         ;; %bignum-trunc-doubling (general), all bignum-safe.
          (compile-form
            `(let ((,a-sym ,a) (,b-sym ,b))
               (if (or (%ieee-float-p ,a-sym) (%ieee-float-p ,b-sym)
-                      (ratiop ,a-sym) (ratiop ,b-sym))
+                      (ratiop ,a-sym) (ratiop ,b-sym)
+                      (bignump ,a-sym) (bignump ,b-sym))
                   (%truncate2-generic ,a-sym ,b-sym)
                   (%fixnum-truncate2 ,a-sym ,b-sym)))
            env dest))))))

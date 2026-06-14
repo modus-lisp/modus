@@ -3913,6 +3913,40 @@
     'foo)
   ;; ==== end Fable conditions re-census probes 9540-9559 ====
 
+  ;; ==== Fable number-comparison hang probes 9200-9217 ====
+  ;; These lock in the bignum-safe rational/gcd path that used to HANG the
+  ;; number-comparison =.18/.19 (and <,>,<=,>=,/=.17-19) tests: (rational
+  ;; <tiny-float>) builds a 2^105-denominator ratio whose gcd-reduction
+  ;; drove (mod bignum fixnum) → (truncate bignum fixnum) into the inline
+  ;; fixnum :div that garbages bignum pointers (crash/never-terminate).
+  ;; Fixed by (a) compile-truncate routing bignum operands to
+  ;; %truncate2-generic (probe 9237), (b) gcd-impl/%make-rat using
+  ;; bignum-safe division (probes 9213/9214/9206).
+  (rt-run-test 9200 (integerp (expt 10 1000)) t)
+  (rt-run-test 9204 (integerp (truncate most-positive-double-float)) t)
+  (rt-run-test 9205 (rationalp (rational 1.0d0)) t)
+  (rt-run-test 9210 (integerp (ash 1 105)) t)
+  (rt-run-test 9211 (integerp (ash 1 1075)) t)
+  (rt-run-test 9232 (= (%bignum-trunc-doubling (ash 1 105) (ash 1 52)) (ash 1 53)) t)
+  (rt-run-test 9233 (integerp (%integer-truncate (ash 1 105) (ash 1 52))) t)
+  (rt-run-test 9234 (multiple-value-bind (q r) (%truncate2-generic (ash 1 105) (ash 1 52)) (= r 0)) t)
+  (rt-run-test 9237 (= (truncate (ash 1 105) (ash 1 52)) (ash 1 53)) t)
+  (rt-run-test 9213 (= (gcd-impl (ash 1 52) (ash 1 105)) (ash 1 52)) t)
+  (rt-run-test 9214 (rationalp (%make-rat (ash 1 52) (ash 1 105))) t)
+  (rt-run-test 9215 (rationalp (%ieee-float-to-rat double-float-negative-epsilon)) t)
+  (rt-run-test 9206 (rationalp (rational double-float-negative-epsilon)) t)
+  (rt-run-test 9207 (rationalp (rational single-float-negative-epsilon)) t)
+  (rt-run-test 9208 (= 1.0d0 (+ (rational 1.0d0) (/ (rational double-float-negative-epsilon) 2))) nil)
+  (rt-run-test 9260 (ratiop (rational double-float-negative-epsilon)) t)
+  (rt-run-test 9261 (integerp (rational 1.0d0)) t)
+  (rt-run-test 9262 (= (rational 1.0d0) 1) t)
+  (rt-run-test 9263 (ratiop (/ (rational double-float-negative-epsilon) 2)) t)
+  (rt-run-test 9264 (ratiop (- (rational 1.0d0) (/ (rational double-float-negative-epsilon) 2))) t)
+  (rt-run-test 9265 (= 1.0d0 (- (rational 1.0d0) (/ (rational double-float-negative-epsilon) 2))) nil)
+  (rt-run-test 9266 (numberp (decode-float double-float-negative-epsilon)) t)
+  (rt-run-test 9267 (let ((e (nth-value 1 (decode-float double-float-negative-epsilon)))) (integerp e)) t)
+  ;; ==== end number-comparison hang probes ====
+
   ;; --- make-instance + slot-value ---
   (deftest 5001 (let ((c (make-instance 'smoke-circle :name "ring" :radius 5)))
                   (slot-value c 'name)) "ring")

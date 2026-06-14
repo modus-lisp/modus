@@ -10464,8 +10464,16 @@
    Routes wrapper inputs through %wrapper-aref.  Multi-subscript
    forms go via compile-aref-form below."
   (let ((g-arr (gensym "AREFA"))
-        (g-idx (gensym "AREFI")))
+        (g-idx (gensym "AREFI"))
+        (g-raw (gensym "AREFR")))
     (compile-form
+     ;; CL conformance: (aref STRING i) must return a CHARACTER, not the
+     ;; raw char-CODE.  All three storage shapes (native MDA char-data,
+     ;; cons-wrapped string, plain primitive string) read a fixnum byte
+     ;; from the underlying u8 store; wrap that byte in CODE-CHAR when the
+     ;; array is string-typed.  Non-string arrays keep returning the raw
+     ;; element unchanged.  %prim-aref / %wrapper-aref / %aref-multi stay
+     ;; raw — only this public front-end applies the code→char lift.
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
         (cond
           ;; MDA fast path — single-sub on an MDA is just an aref of
@@ -10473,10 +10481,16 @@
           ;; handles the displaced case).
           ((%mda-p ,g-arr)
            (let ((disp (%mda-displaced ,g-arr)))
-             (if disp
-                 (%aref-multi ,g-arr ,g-idx)
-                 (%prim-aref (%mda-data ,g-arr) ,g-idx))))
-          ((consp ,g-arr) (%wrapper-aref ,g-arr ,g-idx))
+             (let ((,g-raw (if disp
+                               (%aref-multi ,g-arr ,g-idx)
+                               (%prim-aref (%mda-data ,g-arr) ,g-idx))))
+               (if (%prim-stringp (%mda-data ,g-arr))
+                   (code-char ,g-raw)
+                   ,g-raw))))
+          ((consp ,g-arr)
+           (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
+             (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
+          ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
           (t (%prim-aref ,g-arr ,g-idx))))
      env dest)))
 
@@ -10492,13 +10506,13 @@
          (subs (cdr args)))
     (cond
       ((null subs)
-       ;; 0-sub aref on a 0-dim MDA → slot 0 of data.  Compile as
-       ;; (%aref-multi arr) so the runtime helper handles all cases.
-       (compile-form `(%aref-multi ,arr) env dest))
+       ;; 0-sub aref on a 0-dim MDA → slot 0 of data.  %aref-multi-public
+       ;; lifts a string-MDA element to a CHARACTER (CL conformance).
+       (compile-form `(%aref-multi-public ,arr) env dest))
       ((null (cdr subs))
        (compile-aref arr (car subs) env dest))
       (t
-       (compile-form `(%aref-multi ,arr ,@subs) env dest)))))
+       (compile-form `(%aref-multi-public ,arr ,@subs) env dest)))))
 
 (defun compile-aset (arr-form idx-form val-form env dest)
   "Compile (aset array index value) — the single-subscript fast path.
@@ -10506,17 +10520,35 @@
    forms go via compile-aset-form below."
   (let ((g-arr (gensym "ASETA"))
         (g-idx (gensym "ASETI"))
-        (g-val (gensym "ASETV")))
+        (g-val (gensym "ASETV"))
+        (g-sto (gensym "ASETS")))
     (compile-form
-     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
+     ;; CL conformance mirror of compile-aref: (setf (aref STRING i) ch)
+     ;; accepts a CHARACTER and stores its char-CODE into the u8 store,
+     ;; returning the original character.  For string-typed arrays we
+     ;; coerce a character value to its code before the primitive store;
+     ;; a non-character value (a raw code from internal callers) passes
+     ;; through unchanged so existing code-storing call sites still work.
+     ;; Pre-compute the value to store: for a string-typed destination a
+     ;; CHARACTER value is coerced to its char-CODE (mirrors compile-aref's
+     ;; code→char lift); everything else stores unchanged.  %aset-store-val
+     ;; (cl-clos.lisp) does the string-ness test once so the branch
+     ;; structure below stays identical to the pre-change fast path (the
+     ;; SETF-AREF evaluation-order tests are sensitive to extra temps).
+     ;; ASET returns the value actually stored; for the char case that is
+     ;; the code, but CLHS (setf aref) returns the original value — so we
+     ;; bind ,g-val and return it explicitly only when we coerced.
+     `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form)
+             (,g-sto (%aset-store-val ,g-arr ,g-val)))
         (cond
           ((%mda-p ,g-arr)
            (let ((disp (%mda-displaced ,g-arr)))
              (if disp
-                 (%aset-multi ,g-arr ,g-val ,g-idx)
-                 (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-val))))
-          ((consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-val))
-          (t (%prim-aset ,g-arr ,g-idx ,g-val))))
+                 (%aset-multi ,g-arr ,g-sto ,g-idx)
+                 (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-sto)))
+           ,g-val)
+          ((consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
+          (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val)))
      env dest)))
 
 (defun compile-aset-form (form env dest)

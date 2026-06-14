@@ -338,9 +338,13 @@
    as the real part (lossy but matches our (complex r) → r convention)."
   (cos x))
 (defun integer (n) n)  ; not a real CL function but used as type coercion
-(defun set-schar (str idx ch) (aset str idx (char-code ch)) ch)
-(defun schar (str idx) (code-char (aref str idx)))
-(defun char (str idx) (code-char (aref str idx)))
+;; Public AREF/ASET now apply the string code↔char lift themselves, so
+;; CHAR/SCHAR just forward (no extra code-char) and SET-SCHAR lets ASET
+;; coerce the character to its code.  Wrapped strings are handled by the
+;; aref/aset wrapper trampolines.
+(defun set-schar (str idx ch) (aset str idx ch) ch)
+(defun schar (str idx) (aref str idx))
+(defun char (str idx) (aref str idx))
 (defun symbol-plist (sym) nil)
 ; fboundp defined in Layer 8 above
 (defun fill-pointer (vec)

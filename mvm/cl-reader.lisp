@@ -1023,7 +1023,7 @@
       ;; Find first UNESCAPED colon
       (loop
         (when (>= i len) (return nil))
-        (when (and (= (aref name-str i) 58)
+        (when (and (= (%prim-aref name-str i) 58)   ; raw code: 58 = #\:
                    (not (and esc-cur (car esc-cur))))
           (setq colon-pos i)
           (return nil))
@@ -1052,7 +1052,7 @@
          (let ((pkg-name (%substring name-str 0 colon-pos))
                (sym-start (+ colon-pos 1)))
            ;; Check for double colon
-           (when (and (< sym-start len) (= (aref name-str sym-start) 58))
+           (when (and (< sym-start len) (= (%prim-aref name-str sym-start) 58))
              (setq double-colon t)
              (setq sym-start (+ sym-start 1)))
            (let ((sym-name (%substring name-str sym-start len))
@@ -1322,7 +1322,7 @@
      (let ((i 0) (n (length obj)))
        (loop
          (when (>= i n) (return acc))
-         (setq acc (cons (code-char (aref obj i)) acc))
+         (setq acc (cons (aref obj i) acc))   ; AREF→char already
          (setq i (+ i 1)))))
     ((consp obj)
      (let ((cur obj))
@@ -1391,7 +1391,7 @@
                     (let ((acc nil) (i 0) (n (length contents)))
                       (loop
                         (when (>= i n) (return (nreverse acc)))
-                        (setq acc (cons (code-char (aref contents i)) acc))
+                        (setq acc (cons (aref contents i) acc))   ; AREF→char already
                         (setq i (+ i 1)))))
                    (t contents))))
        (if (= len 0)

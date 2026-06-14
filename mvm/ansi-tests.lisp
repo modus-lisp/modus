@@ -2998,6 +2998,33 @@
         (sym '%clos-instance))
     (aset a 0 sym)
     (deftest 9093 (eq (aref a 0) '%clos-instance) t))
+  ;; ==== String AREF/ELT/ROW-MAJOR-AREF → CHARACTER conformance probes ====
+  ;; (aref / elt / row-major-aref / svref on a STRING must return a
+  ;;  CHARACTER, not the raw char-code; (setf (aref s i) ch) accepts a
+  ;;  character and returns it.)  See the char-aref conformance change.
+  (deftest 9280 (aref "abc" 0) #\a)
+  (deftest 9281 (characterp (aref "abc" 1)) t)
+  (deftest 9282 (char "abc" 2) #\c)
+  (deftest 9283 (schar "abc" 0) #\a)
+  (deftest 9284 (elt "xyz" 1) #\y)
+  (deftest 9285 (characterp (elt "xyz" 2)) t)
+  (deftest 9286 (row-major-aref "def" 2) #\f)
+  (deftest 9287 (let ((s (copy-seq "abc"))) (setf (aref s 0) #\Z) (aref s 0)) #\Z)
+  (deftest 9288 (let ((s (copy-seq "abc"))) (setf (aref s 1) #\Q) s) "aQc")
+  (deftest 9289 (setf (aref (copy-seq "abc") 0) #\Z) #\Z)
+  (deftest 9290 (let ((s (copy-seq "abc"))) (setf (char s 2) #\Z) s) "abZ")
+  ;; aref result is a real character usable by char functions
+  (deftest 9291 (char-upcase (aref "abc" 0)) #\A)
+  (deftest 9292 (char= (aref "abc" 0) #\a) t)
+  (deftest 9293 (position #\b "abc") 1)
+  (deftest 9294 (find #\c "abc") #\c)
+  ;; non-string arrays unaffected — still return the raw element
+  (deftest 9295 (let ((a (make-array 2))) (aset a 0 99) (aref a 0)) 99)
+  ;; string round-trips through printer / string ops
+  (deftest 9296 (string-upcase "abc") "ABC")
+  (deftest 9297 (string= "abc" "abc") t)
+  (deftest 9298 (subseq "hello" 1 3) "el")
+  (deftest 9299 (coerce (list #\a #\b) 'string) "ab")
   ;; Test 1: %defclass creates a class
   (%defclass 'diag-class-01 '(x y z) nil)
   (let ((cls (%find-clos-class 'diag-class-01)))

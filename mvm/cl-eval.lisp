@@ -3948,7 +3948,8 @@
     ((null chars) nil)
     ((stringp chars)
      (let ((r nil) (n (array-length chars)))
-       (dotimes (i n) (setq r (cons (aref chars (- (- n 1) i)) r)))
+       ;; AREF on a string now yields a CHARACTER — normalize to code.
+       (dotimes (i n) (setq r (cons (%ensure-char-code (aref chars (- (- n 1) i))) r)))
        r))
     ((consp chars)
      (let ((cur chars) (head nil) (tail nil))
@@ -4003,7 +4004,7 @@
            (start (car be)) (end (cdr be))
            (result (%make-string-array len)))
       (dotimes (i len)
-        (let ((ch (aref s i)))
+        (let ((ch (%ensure-char-code (aref s i))))
           (if (and (>= i start) (< i end) (lower-case-p (code-char ch)))
               (aset result i (- ch 32))
               (aset result i ch))))
@@ -4017,7 +4018,7 @@
            (start (car be)) (end (cdr be))
            (result (%make-string-array len)))
       (dotimes (i len)
-        (let ((ch (aref s i)))
+        (let ((ch (%ensure-char-code (aref s i))))
           (if (and (>= i start) (< i end) (upper-case-p (code-char ch)))
               (aset result i (+ ch 32))
               (aset result i ch))))
@@ -4033,7 +4034,7 @@
       (let ((i 0) (in-word nil))
         (loop
           (when (>= i len) (return result))
-          (let ((ch (aref s i)))
+          (let ((ch (%ensure-char-code (aref s i))))
             (if (and (>= i start) (< i end))
                 (if (alphanumericp (code-char ch))
                     (if in-word
@@ -4055,7 +4056,8 @@
         (s (%string-coerce str)))
     (let ((start 0) (len (array-length s)))
       (loop (when (>= start len) (return ""))
-        (unless (member (aref s start) char-list) (return))
+        ;; char-list holds codes; AREF on a string yields a CHARACTER.
+        (unless (member (%ensure-char-code (aref s start)) char-list) (return))
         (setq start (+ start 1)))
       (if (= start 0) s
           (let ((result (%make-string-array (- len start))))
@@ -4068,7 +4070,7 @@
         (s (%string-coerce str)))
     (let ((end (array-length s)))
       (loop (when (<= end 0) (return ""))
-        (unless (member (aref s (- end 1)) char-list) (return))
+        (unless (member (%ensure-char-code (aref s (- end 1))) char-list) (return))
         (setq end (- end 1)))
       (if (= end (array-length s)) s
           (let ((result (%make-string-array end)))
@@ -4131,8 +4133,8 @@
     (let ((m nil) (result nil))
       (loop
         (when (or m (>= i mn)) (return))
-        (let ((ca (aref sa (+ s1 i)))
-              (cb (aref sb (+ s2 i))))
+        (let ((ca (%ensure-char-code (aref sa (+ s1 i))))
+              (cb (%ensure-char-code (aref sb (+ s2 i)))))
           (when fold-p
             (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
             (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32))))
@@ -5398,7 +5400,9 @@
                           ((stringp s)
                            (let ((res nil) (i (- (length s) 1)))
                              (loop (when (< i 0) (return res))
-                               (setq res (cons (code-char (aref s i)) res))
+                               ;; AREF already yields a CHARACTER for strings;
+                               ;; compiled code-char would re-shift it.
+                               (setq res (cons (aref s i) res))
                                (setq i (- i 1)))))
                           ;; Native MDA: walk via length (fp-aware) + aref.
                           ((%mda-p s)

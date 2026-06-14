@@ -1102,7 +1102,7 @@
            (len (length object)))
        (loop
          (when (>= i len) (return))
-         (setq hash (logxor hash (aref object i)))
+         (setq hash (logxor hash (%ensure-char-code (aref object i))))
          (setq hash (logand (* hash 16777619) #xFFFFFFFF))
          (setq i (+ i 1)))
        hash))
@@ -2321,7 +2321,7 @@
         (let ((len (length object)) (result nil) (i 0))
           (loop
             (when (>= i len) (return (nreverse result)))
-            (setq result (cons (code-char (aref object i)) result))
+            (setq result (cons (aref object i) result))   ; AREF→char already
             (setq i (+ i 1)))))
        ((arrayp object)
         (let ((len (array-length object)) (result nil) (i 0))
@@ -2392,7 +2392,7 @@
      (if (floatp-impl object) (truncate object) object))
     ((eq result-type 'character)
      (if (integerp object) (code-char object)
-         (if (stringp object) (code-char (aref object 0))
+         (if (stringp object) (aref object 0)   ; AREF→char already
              object)))
     ((eq result-type 'function)
      ;; CLHS: a symbol or lambda expression coerces to a function.  A
@@ -4317,7 +4317,7 @@
          (i 0))
     (loop
       (when (>= i lim) (return a))
-      (aset a i (code-char (aref s i)))
+      (aset a i (aref s i))   ; AREF→char already
       (setq i (+ i 1)))))
 
 (defun %make-string-fill-char (n ch)

@@ -706,8 +706,10 @@
           (let ((i 0))
             (loop
               (when (= i slen1) (return t))
-              (let ((ca (aref a (+ s1 i)))
-                    (cb (aref b (+ s2 i))))
+              ;; AREF on a string now yields a CHARACTER; normalize to a
+              ;; raw code for the case-fold + numeric compare.
+              (let ((ca (%ensure-char-code (aref a (+ s1 i))))
+                    (cb (%ensure-char-code (aref b (+ s2 i)))))
                 (when (and (>= ca 65) (<= ca 90)) (setq ca (+ ca 32)))
                 (when (and (>= cb 65) (<= cb 90)) (setq cb (+ cb 32)))
                 (unless (= ca cb) (return nil)))
@@ -794,7 +796,9 @@
         (i 0))
     (loop
       (when (= i len) (return nil))
-      (write-char-serial (aref str i))
+      ;; write-char-serial wants a raw char-CODE; read the byte directly via
+      ;; %prim-aref (public AREF now lifts string elements to characters).
+      (write-char-serial (%prim-aref str i))
       (setq i (+ i 1)))))
 
 (defun print-dec (n)
@@ -1583,7 +1587,7 @@
         (i 0))
     (loop
       (when (>= i len) (return nil))
-      (let ((c (aref name-string i)))
+      (let ((c (%prim-aref name-string i)))   ; raw char-CODE for arithmetic hash
         ;; Uppercase if lowercase ASCII letter (matches string-upcase
         ;; path in build-time version).
         (when (and (>= c 97) (<= c 122))
@@ -1631,9 +1635,13 @@
           (setq result (cons (car cur) result))
           (setq cur (cdr cur))
           (setq i (+ i 1))))
-      ;; Array: copy elements
-      (let ((len (- end start))
-            (result (make-array (- end start))))
+      ;; Array: copy elements.  Preserve string-ness so (subseq "abc" 1)
+      ;; returns a STRING, not a general char-vector (aref/aset now move
+      ;; characters; %make-string-array keeps the result string-typed).
+      (let* ((len (- end start))
+             (result (if (stringp seq)
+                         (%make-string-array len)
+                         (make-array len))))
         (let ((i 0))
           (loop
             (when (= i len) (return result))

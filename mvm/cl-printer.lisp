@@ -15,7 +15,11 @@
   (let ((len (length str)) (i 0))
     (loop
       (when (= i len) (return nil))
-      (%print-char (aref str i) stream)
+      ;; %print-char wants a raw char-CODE.  Public AREF now lifts string
+      ;; elements to characters (and peels fp/adj/displaced wrappers), so
+      ;; char-code converts back.  %ensure-char-code tolerates either a
+      ;; character or a stray fixnum element.
+      (%print-char (%ensure-char-code (aref str i)) stream)
       (setq i (+ i 1)))))
 
 ;;; Write a decimal integer (always base 10).  Routes bignums through
@@ -190,7 +194,7 @@
         (has-upper nil) (has-lower nil))
     (loop
       (when (= i len) (return nil))
-      (let ((c (aref name i)))
+      (let ((c (%prim-aref name i)))   ; raw code for %ch-* classifiers
         (cond ((%ch-upperp c) (setq has-upper t))
               ((%ch-lowerp c) (setq has-lower t))))
       (setq i (+ i 1)))
@@ -244,13 +248,13 @@
           (let ((len (array-length name)) (i 0))
             (loop
               (when (= i len) (return nil))
-              (%print-char (%ch-to-lower (aref name i)) stream)
+              (%print-char (%ch-to-lower (%prim-aref name i)) stream)
               (setq i (+ i 1)))))
          ((eq class :all-lower)
           (let ((len (array-length name)) (i 0))
             (loop
               (when (= i len) (return nil))
-              (%print-char (%ch-to-upper (aref name i)) stream)
+              (%print-char (%ch-to-upper (%prim-aref name i)) stream)
               (setq i (+ i 1)))))
          (t  ; :mixed or :no-alpha — verbatim
           (%print-string-raw name stream)))))
@@ -272,7 +276,7 @@
         (at-word-start t))
     (loop
       (when (= i len) (return nil))
-      (let* ((ch (aref name i))
+      (let* ((ch (%prim-aref name i))   ; raw code for %ch-* / %print-char
              (in-case
                (cond ((eq rc :upcase)   (%ch-upperp ch))
                      ((eq rc :downcase) (%ch-lowerp ch))
@@ -337,7 +341,7 @@
        (let ((needs nil) (i 0))
          (loop
            (when (or needs (= i len)) (return needs))
-           (let ((ch (aref name i)))
+           (let ((ch (%prim-aref name i)))   ; raw code
              (when (and (= i 0) (>= ch 48) (<= ch 57))
                (setq needs t))
              (when (and (not needs) (%ch-alphap ch))
@@ -366,7 +370,7 @@
     (when (= len 0) (return-from %sym-name-needs-escape-p t))
     (loop
       (when (= i len) (return needs-escape))
-      (let ((ch (aref name i)))
+      (let ((ch (%prim-aref name i)))   ; raw code
         (when (or (= ch 32) (= ch 40) (= ch 41) (= ch 34) (= ch 39)
                   (= ch 96) (= ch 44) (= ch 59) (= ch 35) (= ch 92)
                   (= ch 124) (= ch 58) (= ch 9) (= ch 10) (= ch 13))
@@ -708,7 +712,8 @@
              (let ((len (length obj)) (i 0))
                (loop
                  (when (= i len) (return nil))
-                 (let ((ch (aref obj i)))
+                 ;; ch as a raw CODE (public AREF now returns characters).
+                 (let ((ch (%ensure-char-code (aref obj i))))
                    (when (or (= ch 34) (= ch 92))
                      (%print-char 92 stream))  ; escape " and backslash
                    (%print-char ch stream))
@@ -1235,12 +1240,12 @@
   "Parse optional integer at POS in STR. Returns (value . new-pos)."
   (if (>= pos end)
       (cons nil pos)
-      (let ((ch (aref str pos)) (neg nil) (n 0) (found nil))
+      (let ((ch (%prim-aref str pos)) (neg nil) (n 0) (found nil))   ; raw codes
         (when (= ch 45) ; -
           (setq neg t) (setq pos (+ pos 1)))
         (loop
           (when (>= pos end) (return nil))
-          (let ((d (aref str pos)))
+          (let ((d (%prim-aref str pos)))
             (when (or (< d 48) (> d 57)) (return nil))
             (setq n (+ (* n 10) (- d 48)))
             (setq found t)
@@ -1388,7 +1393,7 @@
          (let ((last-sep -1) (i 0) (len (array-length cardinal)))
            (loop
              (when (= i len) (return nil))
-             (let ((c (aref cardinal i)))
+             (let ((c (%prim-aref cardinal i)))   ; raw code
                (when (or (= c 32) (= c 45))    ; space or hyphen
                  (setq last-sep i)))
              (setq i (+ i 1)))
@@ -1584,13 +1589,13 @@
   (let ((pos start) (depth 1) (result nil))
     (loop
       (when (or result (>= pos len)) (return result))
-      (if (/= (aref control pos) 126)
+      (if (/= (%prim-aref control pos) 126)
           (setq pos (+ pos 1))
           ;; Found ~ — scan past parameters and modifiers to the directive char.
           (let ((p (+ pos 1)))
             (loop
               (when (>= p len) (return nil))
-              (let ((c (aref control p)))
+              (let ((c (%prim-aref control p)))
                 (cond
                   ;; ' (apostrophe) consumes the next char as a literal param
                   ((= c 39)
@@ -1604,7 +1609,7 @@
                    (setq p (+ p 1)))
                   (t (return nil)))))
             (when (>= p len) (return result))
-            (let ((dch (aref control p)))
+            (let ((dch (%prim-aref control p)))
               (cond
                 ((= dch 123) (setq depth (+ depth 1)) (setq pos (+ p 1)))
                 ((= dch 125)
@@ -1621,7 +1626,7 @@
   (let ((p (+ close-pos 1)) (saw-colon nil))
     (loop
       (when (>= p len) (return saw-colon))
-      (let ((c (aref control p)))
+      (let ((c (%prim-aref control p)))
         (cond
           ((= c 58) (setq saw-colon t) (setq p (+ p 1)))   ; :
           ((= c 125) (return saw-colon))                    ; }
@@ -1640,7 +1645,7 @@
   (let ((p (+ close-pos 1)))
     (loop
       (when (>= p len) (return len))
-      (let ((c (aref control p)))
+      (let ((c (%prim-aref control p)))
         (cond
           ((= c 125) (return (+ p 1)))                       ; }
           ((or (= c 58) (= c 64)                             ; : @
@@ -1868,7 +1873,7 @@
         (prev-arg nil))
     (loop
       (when (>= i len) (return arg-list))
-      (let ((ch (aref control i)))
+      (let ((ch (%prim-aref control i)))
         (if (not (= ch 126))  ; not ~
             (progn
               (%print-char ch stream)
@@ -1882,7 +1887,7 @@
               (let ((params nil) (pcount 0))
                 (loop
                   (when (>= pos len) (return nil))
-                  (let ((c (aref control pos)))
+                  (let ((c (%prim-aref control pos)))
                     (cond
                       ;; v or V: next argument as parameter
                       ((or (= c 118) (= c 86))
@@ -1891,23 +1896,23 @@
                        (setq pos (+ pos 1))
                        (setq pcount (+ pcount 1))
                        ;; check for comma
-                       (when (and (< pos len) (= (aref control pos) 44))
+                       (when (and (< pos len) (= (%prim-aref control pos) 44))
                          (setq pos (+ pos 1))))
                       ;; # : remaining arg count
                       ((= c 35)
                        (setq params (cons (length arg-list) params))
                        (setq pos (+ pos 1))
                        (setq pcount (+ pcount 1))
-                       (when (and (< pos len) (= (aref control pos) 44))
+                       (when (and (< pos len) (= (%prim-aref control pos) 44))
                          (setq pos (+ pos 1))))
                       ;; ' : character parameter
                       ((= c 39)  ; '
                        (setq pos (+ pos 1))
                        (when (< pos len)
-                         (setq params (cons (aref control pos) params))
+                         (setq params (cons (%prim-aref control pos) params))
                          (setq pos (+ pos 1))
                          (setq pcount (+ pcount 1)))
-                       (when (and (< pos len) (= (aref control pos) 44))
+                       (when (and (< pos len) (= (%prim-aref control pos) 44))
                          (setq pos (+ pos 1))))
                       ;; Integer parameter (supports leading + or -)
                       ((or (= c 43) (= c 45) (and (>= c 48) (<= c 57)))
@@ -1917,7 +1922,7 @@
                          (setq pos (cdr pr))
                          (setq pcount (+ pcount 1)))
                        ;; skip comma
-                       (when (and (< pos len) (= (aref control pos) 44))
+                       (when (and (< pos len) (= (%prim-aref control pos) 44))
                          (setq pos (+ pos 1))))
                       ;; Comma alone: nil parameter
                       ((= c 44)
@@ -1936,14 +1941,14 @@
               ;; Parse modifiers : and @
               (loop
                 (when (>= pos len) (return nil))
-                (let ((c (aref control pos)))
+                (let ((c (%prim-aref control pos)))
                   (cond
                     ((= c 58) (setq colonp t) (setq pos (+ pos 1)))   ; :
                     ((= c 64) (setq atp t) (setq pos (+ pos 1)))       ; @
                     (t (return nil)))))
               ;; Directive character
               (when (>= pos len) (return arg-list))
-              (let ((dir (aref control pos))
+              (let ((dir (%prim-aref control pos))
                     (before-arg-list arg-list))
                 (declare (special *format-iter-escape*))
                 (setq i (+ pos 1))
@@ -2198,7 +2203,7 @@
                    (unless colonp
                      (loop
                        (when (>= i len) (return nil))
-                       (let ((wc (aref control i)))
+                       (let ((wc (%prim-aref control i)))
                          (when (not (or (= wc 32) (= wc 9) (= wc 10) (= wc 13)))
                            (return nil)))
                        (setq i (+ i 1)))))
@@ -2210,8 +2215,8 @@
                      (let ((end-pos i) (depth 1))
                        (loop
                          (when (>= end-pos len) (return nil))
-                         (when (= (aref control end-pos) 126)
-                           (let ((nc (if (< (+ end-pos 1) len) (aref control (+ end-pos 1)) 0)))
+                         (when (= (%prim-aref control end-pos) 126)
+                           (let ((nc (if (< (+ end-pos 1) len) (%prim-aref control (+ end-pos 1)) 0)))
                              (cond
                                ((or (= nc 40) (= nc 41)) ; nested (  )
                                 (setq depth (if (= nc 40) (+ depth 1) (- depth 1)))
@@ -2241,7 +2246,7 @@
                                                       (let ((first-done nil) (k 0))
                                                         (loop
                                                           (when (= k (array-length result)) (return nil))
-                                                          (let ((c (aref result k)))
+                                                          (let ((c (%prim-aref result k)))   ; raw code
                                                             (let ((upper (and (>= c 65) (<= c 90)))
                                                                   (lower (and (>= c 97) (<= c 122))))
                                                               (cond
@@ -2277,13 +2282,13 @@
                          (when (>= pos2 len)
                            (setq sections (cons (%substring control start pos2) sections))
                            (return nil))
-                         (if (/= (aref control pos2) 126)
+                         (if (/= (%prim-aref control pos2) 126)
                              (setq pos2 (+ pos2 1))
                              ;; At ~: scan past parameters/modifiers to directive char.
                              (let ((p (+ pos2 1)) (saw-colon nil))
                                (loop
                                  (when (>= p len) (return nil))
-                                 (let ((c (aref control p)))
+                                 (let ((c (%prim-aref control p)))
                                    (cond
                                      ((= c 39)  ; ' literal-char param
                                       (setq p (+ p 1))
@@ -2299,7 +2304,7 @@
                                      (t (return nil)))))
                                (if (>= p len)
                                    (setq pos2 p)
-                                   (let ((nc (aref control p)))
+                                   (let ((nc (%prim-aref control p)))
                                      (cond
                                        ((= nc 91) (setq depth (+ depth 1)) (setq pos2 (+ p 1)))
                                        ((= nc 93)
@@ -2421,7 +2426,7 @@
                    (let ((fn-start i) (fn-end i))
                      (loop
                        (when (>= fn-end len) (return nil))
-                       (when (= (aref control fn-end) 47) (return nil))
+                       (when (= (%prim-aref control fn-end) 47) (return nil))
                        (setq fn-end (+ fn-end 1)))
                      (setq i (+ fn-end 1))
                      ;; Skip arg
@@ -2692,13 +2697,13 @@
           (let ((i start))
             (loop
               (when (>= i eff-end) (return nil))
-              (%write-char-to-stream (aref str i) s)
+              (%write-char-to-stream (%ensure-char-code (aref str i)) s)
               (setq i (+ i 1))))
           ;; Serial fallback only handles whole-string writes; emulate.
           (let ((i start))
             (loop
               (when (>= i eff-end) (return nil))
-              (write-char-serial (aref str i))
+              (write-char-serial (%ensure-char-code (aref str i)))
               (setq i (+ i 1)))))))
   str)
 
@@ -2743,14 +2748,14 @@
             (let ((i start))
               (loop
                 (when (>= i eff-end) (return nil))
-                (%write-char-to-stream (aref str i) s)
+                (%write-char-to-stream (%ensure-char-code (aref str i)) s)
                 (setq i (+ i 1))))
             (%write-char-to-stream 10 s))
           (progn
             (let ((i start))
               (loop
                 (when (>= i eff-end) (return nil))
-                (write-char-serial (aref str i))
+                (write-char-serial (%ensure-char-code (aref str i)))
                 (setq i (+ i 1))))
             (write-char-serial 10)))))
   str)
@@ -2923,7 +2928,7 @@
       (loop
         (when (>= i actual-end) (return seq))
         (if (stringp seq)
-            (%write-char-to-stream (aref seq i) s)
+            (%write-char-to-stream (%ensure-char-code (aref seq i)) s)
             (if (streamp s)
                 (%fs-write-byte (aref seq i) s)
                 (write-char-serial (aref seq i))))
@@ -2932,8 +2937,9 @@
 
 (defun %equalp-array-elt (seq i)
   "Read element i from seq (vector or string) — coerce string bytes to chars."
-  (let ((v (aref seq i)))
-    (if (stringp seq) (code-char v) v)))
+  ;; AREF already yields a CHARACTER for strings (compiled code-char would
+  ;; re-shift an already-character value), so just return it.
+  (aref seq i))
 
 (defun %equalp-array-array (a b)
   "Element-wise equalp over two non-cons sequences (vectors or strings).

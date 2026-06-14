@@ -38,8 +38,8 @@
                 (string-p (stringp seq)))
             (loop
               (when (>= i len) (return nil))
-              (let* ((raw (aref seq i))
-                     (elem (if string-p (code-char raw) raw))
+              (let* ((raw (aref seq i))         ; AREF→char already for strings
+                     (elem raw)
                      (result (funcall fn elem)))
                 (when result (return result)))
               (setq i (+ i 1)))))))
@@ -116,8 +116,8 @@
                 (string-p (stringp seq)))
             (loop
               (when (>= i len) (return t))
-              (let* ((raw (aref seq i))
-                     (elem (if string-p (code-char raw) raw)))
+              (let* ((raw (aref seq i))         ; AREF→char already for strings
+                     (elem raw))
                 (when (null (funcall fn elem)) (return nil)))
               (setq i (+ i 1)))))))
     ;; Two-sequence fast path for two LISTS (skip if either is non-list,
@@ -414,7 +414,7 @@
       (loop
         (when (>= i eff-end) (return nil))
         (let ((elt (aref vec i)))
-          (when string-p (setq elt (code-char elt)))
+          ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
           (let ((v (if key-fn (funcall key-fn elt) elt)))
             (when (if test-fn (funcall test-fn item v) (eql item v))
               (push i indices))))
@@ -490,7 +490,7 @@
       (loop
         (when (>= i eff-end) (return nil))
         (let ((elt (aref vec i)))
-          (when string-p (setq elt (code-char elt)))
+          ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
           (let ((v (if key-fn (funcall key-fn elt) elt)))
             (when (funcall pred v) (push i indices))))
         (setq i (+ i 1))))
@@ -774,8 +774,11 @@
      (nth idx seq))
     ((or (stringp seq) (arrayp seq))
      (when (>= idx (length seq)) (error "elt: index out of range"))
-     (let ((v (aref seq idx)))
-       (if (stringp seq) (code-char v) v)))
+     ;; Public AREF already lifts string elements to CHARACTERs; return it
+     ;; directly.  (Compiled (code-char X) is the raw shift-and-tag primop
+     ;; with no characterp guard, so wrapping an already-character value
+     ;; double-encodes it — the "BBBBBB" bug.)
+     (aref seq idx))
     (t (error "elt: not a sequence"))))
 (defun %string-designator (x)
   "Coerce a string designator (string, character, or symbol) to a string."
@@ -827,7 +830,8 @@
           (let ((i 0))
             (loop
               (when (= i len1) (return t))
-              (unless (= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
+              ;; AREF on strings now yields CHARACTERs — compare via char=.
+              (unless (char= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
               (setq i (+ i 1))))
           nil))))
 (defun string/= (a b &rest args)
@@ -901,10 +905,10 @@
         (let ((j i))
           (loop
             (when (= j 0) (return nil))
-            (let* ((ra (aref seq j))
+            (let* ((ra (aref seq j))          ; AREF→char already for strings
                    (rb (aref seq (- j 1)))
-                   (a (if str-p (code-char ra) ra))
-                   (b (if str-p (code-char rb) rb))
+                   (a ra)
+                   (b rb)
                    (av (if key (funcall key a) a))
                    (bv (if key (funcall key b) b)))
               (if (funcall pred av bv)
@@ -954,7 +958,7 @@
            (out (%make-string-array (array-length seq))))
        (let ((i 0))
          (loop (when (= i len) (return out))
-           (let ((v (funcall transform (code-char (aref seq i)))))
+           (let ((v (funcall transform (aref seq i))))   ; AREF→char already
              (aset out i (if (characterp v) (char-code v) v)))
            (setq i (+ i 1))))))
     (t  ;; plain array
@@ -1098,7 +1102,7 @@
                       (when (< i start-idx) (return copy))
                       (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (let ((match (if test-fn (funcall test-fn old cmp)
                                            (eql old cmp))))
@@ -1111,7 +1115,7 @@
                       (when (>= i eff-end) (return copy))
                       (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (let ((match (if test-fn (funcall test-fn old cmp)
                                            (eql old cmp))))
@@ -1195,7 +1199,7 @@
                       (when (< i start-idx) (return copy))
                       (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (funcall pred cmp)
                             (aset copy i store-new)
@@ -1206,7 +1210,7 @@
                       (when (>= i eff-end) (return copy))
                       (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (funcall pred cmp)
                             (aset copy i store-new)
@@ -1290,7 +1294,7 @@
                       (when (< i start-idx) (return copy))
                       (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (not (funcall pred cmp))
                             (aset copy i store-new)
@@ -1301,7 +1305,7 @@
                       (when (>= i eff-end) (return copy))
                       (when (= n 0) (return copy))
                       (let ((elt (aref copy i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                           (when (not (funcall pred cmp))
                             (aset copy i store-new)
@@ -1493,7 +1497,7 @@
                       (when (< i start-idx) (return seq))
                       (when (= n 0) (return seq))
                       (let ((elt (aref seq i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (when (funcall pred-fn elt)
                           (aset seq i store-new)
                           (when (> n 0) (setq n (- n 1)))))
@@ -1503,7 +1507,7 @@
                       (when (>= i eff-end) (return seq))
                       (when (= n 0) (return seq))
                       (let ((elt (aref seq i)))
-                        (when string-p (setq elt (code-char elt)))
+                        ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                         (when (funcall pred-fn elt)
                           (aset seq i store-new)
                           (when (> n 0) (setq n (- n 1)))))
@@ -1598,7 +1602,7 @@
                  (when (< i start-idx) (return seq))
                  (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
-                   (when string-p (setq elt (code-char elt)))
+                   ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                      (when (not (funcall pred cmp))
                        (aset seq i store-new)
@@ -1609,7 +1613,7 @@
                  (when (>= i eff-end) (return seq))
                  (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
-                   (when string-p (setq elt (code-char elt)))
+                   ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                      (when (not (funcall pred cmp))
                        (aset seq i store-new)
@@ -1674,7 +1678,7 @@
                  (when (< i start-idx) (return seq))
                  (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
-                   (when string-p (setq elt (code-char elt)))
+                   ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                      (let ((match (if test-fn (funcall test-fn old cmp)
                                       (eql old cmp))))
@@ -1687,7 +1691,7 @@
                  (when (>= i eff-end) (return seq))
                  (when (= n 0) (return seq))
                  (let ((elt (aref seq i)))
-                   (when string-p (setq elt (code-char elt)))
+                   ;; AREF already yields a CHARACTER for strings (compiled code-char re-shifts)
                    (let ((cmp (if key-fn (funcall key-fn elt) elt)))
                      (let ((match (if test-fn (funcall test-fn old cmp)
                                       (eql old cmp))))
@@ -1930,7 +1934,7 @@
           (let ((acc nil) (i (- (length obj) 1)))
             (loop
               (when (< i 0) (return acc))
-              (setq acc (cons (code-char (aref obj i)) acc))
+              (setq acc (cons (aref obj i) acc))   ; AREF→char already
               (setq i (- i 1)))))
          ((or (arrayp obj) (and (consp obj) (array-wrapper-p obj)))
           (let ((acc nil) (i (- (length obj) 1)))
@@ -1958,7 +1962,7 @@
                  (v (make-array n))
                  (i 0))
             (loop (when (= i n) (return v))
-              (aset v i (code-char (aref obj i)))
+              (aset v i (aref obj i))   ; AREF→char already
               (setq i (+ i 1)))))
          (t obj)))
       ;; String / simple-string / base-string
@@ -1993,9 +1997,9 @@
        (cond ((characterp obj) obj)
              ((integerp obj) (code-char obj))
              ((and (stringp obj) (= (length obj) 1))
-              (code-char (aref obj 0)))
+              (aref obj 0))   ; AREF→char already
              ((and (symbolp obj) (= (length (symbol-name obj)) 1))
-              (code-char (aref (symbol-name obj) 0)))
+              (aref (symbol-name obj) 0))
              (t obj)))
       ;; CONS: empty list isn't a CONS — CLHS requires type-error
       ;; (coerce.error.4).  Non-NIL list passes through.
@@ -2296,7 +2300,7 @@
                 ;; receive CHARACTER objects (concatenate-vector.X expects
                 ;; #\a not 97).
                 (dotimes (i (array-length s))
-                  (aset result pos (code-char (aref s i)))
+                  (aset result pos (aref s i))   ; AREF→char already
                   (setq pos (+ pos 1))))
                (t  ;; vector
                 (dotimes (i (array-length s))
@@ -3100,9 +3104,10 @@
            (loop
              (when (= i end) (return result))
              (let* ((raw (aref sequence i))
-                    ;; String slots hold fixnum char-codes; present as
-                    ;; characters so (eql item #\X) works.
-                    (elem (if string-p (code-char raw) raw)))
+                    ;; AREF already yields a CHARACTER for strings, so
+                    ;; present it directly (compiled code-char would
+                    ;; re-shift an already-character value).
+                    (elem raw))
                (let ((test-val (if key (funcall key elem) elem)))
                  (when (if test (funcall test item test-val) (eql item test-val))
                    (if from-end
@@ -3546,7 +3551,7 @@
                   (let* ((raw (%wrapper-aref seq i)))
                     (if (and (stringp seq) (integerp raw)) (code-char raw) raw)))
                  ((consp seq) (nth i seq))
-                 ((stringp seq) (code-char (aref seq i)))
+                 ((stringp seq) (aref seq i))   ; AREF→char already
                  (t (aref seq i)))))
       (when (null end1) (setq end1 (length seq1)))
       (when (null end2) (setq end2 (length seq2)))

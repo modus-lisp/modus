@@ -3748,7 +3748,7 @@
   (let ((i start))
     (loop
       (when (>= i end) (return str))
-      (let ((ch (aref str i)))
+      (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (when (lower-case-p (code-char ch))
           (aset str i (- ch 32))))
       (setq i (+ i 1)))))
@@ -3758,7 +3758,7 @@
   (let ((i start))
     (loop
       (when (>= i end) (return str))
-      (let ((ch (aref str i)))
+      (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (when (upper-case-p (code-char ch))
           (aset str i (+ ch 32))))
       (setq i (+ i 1)))))
@@ -3768,7 +3768,7 @@
   (let ((i start) (in-word nil))
     (loop
       (when (>= i end) (return str))
-      (let ((ch (aref str i)))
+      (let ((ch (%ensure-char-code (aref str i))))   ; AREF→char; want raw code
         (if (alphanumericp (code-char ch))
             (if in-word
                 (when (upper-case-p (code-char ch))
@@ -4018,6 +4018,21 @@
     ;; behavior where multi-sub forms got the trailing subs dropped).
     (t (if (consp a) (%wrapper-aref a (car subs)) (%prim-aref a (car subs))))))
 
+(defun %aref-multi-public (a &rest subs)
+  "Public multi-subscript AREF: like %aref-multi but lifts a string-typed
+   element (raw char-CODE in the u8 store) to a CHARACTER, matching the
+   single-subscript public AREF.  Used by compile-aref-form for the 0-sub
+   and ≥2-sub cases.  Non-string arrays return the raw element unchanged."
+  (let ((raw (apply #'%aref-multi a subs))
+        ;; String-ness: native MDA with string data, cons-wrapped string,
+        ;; or a plain string passed straight through %aref-multi.
+        (str-p (cond
+                 ((%mda-p a) (%prim-stringp (%mda-data a)))
+                 ((consp a) (%wrapper-stringp a))
+                 ((not (fixnump a)) (%prim-stringp a))
+                 (t nil))))
+    (if (and str-p (integerp raw)) (code-char raw) raw)))
+
 (defun %aset-multi (a val &rest subs)
   "Multi-subscript ASET.  Value-first (val before subs) to make the
    &rest binding clean.  Compile-time dispatcher rearranges
@@ -4031,20 +4046,26 @@
                    ((null dims) 0)
                    ((null (cdr subs)) (car subs))
                    (t (%mda-row-major-index dims subs))))
-            (disp (%mda-displaced a)))
+            (disp (%mda-displaced a))
+            ;; (setf (aref STRING-MDA …) ch): coerce a CHARACTER to its
+            ;; char-CODE before the u8 store (mirrors single-sub ASET).
+            (sto (if (and (characterp val) (%prim-stringp (%mda-data a)))
+                     (char-code val) val)))
        (if disp
            (let ((off (%mda-offset a)))
              (if (%mda-p disp)
-                 (apply #'%aset-multi disp val (+ idx off) nil)
-                 (%prim-aset disp (+ idx off) val)))
-           (%prim-aset (%mda-data a) idx val))
+                 (apply #'%aset-multi disp sto (+ idx off) nil)
+                 (%prim-aset disp (+ idx off) sto)))
+           (%prim-aset (%mda-data a) idx sto))
        val))
     ;; Non-MDA single-sub.
     ((null (cdr subs))
-     (if (consp a) (%wrapper-aset a (car subs) val) (%prim-aset a (car subs) val))
+     (let ((sto (%aset-store-val a val)))
+       (if (consp a) (%wrapper-aset a (car subs) sto) (%prim-aset a (car subs) sto)))
      val)
     (t
-     (if (consp a) (%wrapper-aset a (car subs) val) (%prim-aset a (car subs) val))
+     (let ((sto (%aset-store-val a val)))
+       (if (consp a) (%wrapper-aset a (car subs) sto) (%prim-aset a (car subs) sto)))
      val)))
 
 (defun array-dimension (a n)
@@ -4680,6 +4701,22 @@
                 (setq i (+ i 1))))
             x))))
     (t 0)))
+(defun %aset-store-val (arr val)
+  "Compute the raw value to store via ASET for destination array ARR.
+   Public (setf (aref STRING i) ch) accepts a CHARACTER; the underlying
+   u8 store holds char-CODES, so coerce a character VAL to its code when
+   ARR is string-typed (plain, cons-wrapped, or native MDA with string
+   data).  Non-string destinations — and non-character values (raw codes
+   from internal callers) — store unchanged.  Mirror of compile-aref's
+   code→char lift on the read side."
+  (if (characterp val)
+      (cond
+        ((consp arr) (if (%wrapper-stringp arr) (char-code val) val))
+        ((%mda-p arr) (if (%prim-stringp (%mda-data arr)) (char-code val) val))
+        ((%prim-stringp arr) (char-code val))
+        (t val))
+      val))
+
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start &rest rest)
   "Destructively replace seq[start..end] with val.  Returns seq.

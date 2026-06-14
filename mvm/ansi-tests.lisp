@@ -3940,6 +3940,64 @@
   (rt-run-test 9169 (pathname-match-p "x" "*") t)
   ;; ==== end cl-fileio probes 9160-9169 ====
 
+  ;; ==== Fable reader re-census probes 9180-9219 ====
+  ;; Self-contained reader behaviour, package-independent where possible.
+  ;; read-from-string returns (value position).
+  (rt-run-test 9180 (read-from-string "123") 123)
+  (rt-run-test 9181 (multiple-value-bind (v n) (read-from-string "123") (declare (ignore v)) n) 3)
+  (rt-run-test 9182 (read-from-string "(1 2 3)") '(1 2 3))
+  (rt-run-test 9183 (read-from-string "#(1 2 3)") #(1 2 3))
+  (rt-run-test 9184 (read-from-string "\"abc\"") "abc")
+  (rt-run-test 9185 (length (read-from-string "\"abc\"")) 3)
+  ;; #\ character name reading
+  (rt-run-test 9186 (read-from-string "#\\a") #\a)
+  (rt-run-test 9187 (read-from-string "#\\Space") #\Space)
+  (rt-run-test 9188 (read-from-string "#\\Newline") #\Newline)
+  (rt-run-test 9189 (char-code (read-from-string "#\\Tab")) 9)
+  (rt-run-test 9190 (char-code (read-from-string "#\\Return")) 13)
+  (rt-run-test 9191 (read-from-string "#\\A") #\A)
+  (rt-run-test 9192 (char= (read-from-string "#\\1") #\1) t)
+  ;; #* bit-vector
+  (rt-run-test 9193 (read-from-string "#*101") #*101)
+  (rt-run-test 9194 (length (read-from-string "#*1011")) 4)
+  ;; #b #o #x #r radix
+  (rt-run-test 9195 (read-from-string "#b1010") 10)
+  (rt-run-test 9196 (read-from-string "#o17") 15)
+  (rt-run-test 9197 (read-from-string "#xFF") 255)
+  (rt-run-test 9198 (read-from-string "#3r210") 21)
+  ;; peek-char / read-char / unread-char on string streams
+  (rt-run-test 9199 (with-input-from-string (s "abc") (peek-char nil s)) #\a)
+  (rt-run-test 9200 (with-input-from-string (s "abc") (read-char s) (read-char s)) #\b)
+  (rt-run-test 9201 (with-input-from-string (s "abc") (read-char s) (unread-char #\x s) (read-char s)) #\x)
+  (rt-run-test 9202 (with-input-from-string (s "ab cd") (read-line s)) "ab cd")
+  ;; parse-integer
+  (rt-run-test 9203 (parse-integer "123") 123)
+  (rt-run-test 9204 (parse-integer "  -42  " :junk-allowed t) -42)
+  (rt-run-test 9205 (parse-integer "FF" :radix 16) 255)
+  (rt-run-test 9206 (multiple-value-bind (v n) (parse-integer "123abc" :junk-allowed t) (declare (ignore v)) n) 3)
+  (rt-run-test 9207 (parse-integer "10" :radix 2) 2)
+  (rt-run-test 9208 (parse-integer "+5") 5)
+  ;; read-delimited-list
+  (rt-run-test 9209 (with-input-from-string (s "1 2 3 )") (read-delimited-list #\) s)) '(1 2 3))
+  ;; quote / backquote
+  (rt-run-test 9210 (read-from-string "'x") '(quote x))
+  (rt-run-test 9211 (car (read-from-string "`(a ,b)")) (car '`(a ,b)))
+  ;; dotted pair
+  (rt-run-test 9212 (read-from-string "(1 . 2)") '(1 . 2))
+  ;; nested
+  (rt-run-test 9213 (read-from-string "(a (b c) d)") '(a (b c) d))
+  ;; #:uninterned symbol name
+  (rt-run-test 9214 (symbol-name (read-from-string "#:abc")) "ABC")
+  (rt-run-test 9215 (symbol-package (read-from-string "#:abc")) nil)
+  ;; readtablep / copy-readtable
+  (rt-run-test 9216 (notnot (readtablep *readtable*)) t)
+  (rt-run-test 9217 (notnot (readtablep (copy-readtable nil))) t)
+  ;; #. read-eval
+  (rt-run-test 9218 (read-from-string "#.(+ 1 2)") 3)
+  ;; negative / float token
+  (rt-run-test 9219 (read-from-string "-17") -17)
+  ;; ==== end reader probes 9180-9219 ====
+
   ;; ==== Fable conditions re-census probes 9540-9559 ====
   ;; NOTE: signal/warn HANDLER-INVOCATION cannot be probed reliably HERE —
   ;; the diag pass runs rt-run-test back-to-back with no handler-case reset

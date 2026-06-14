@@ -1035,14 +1035,16 @@
       (let ((i start))
         (loop
           (when (>= i end) (return))
-          (let ((c (aref string i)))
+          ;; %prim-aref → raw char CODE (public aref returns a CHARACTER
+          ;; since e159986; this code compares against fixnum codes).
+          (let ((c (%prim-aref string i)))
             (when (and (not (= c 32)) (not (= c 9)) (not (= c 10)))
               (return)))
           (setq i (+ i 1)))
         ;; Check for sign
         (let ((sign 1))
           (when (< i end)
-            (let ((c (aref string i)))
+            (let ((c (%prim-aref string i)))
               (cond
                 ((= c 43) (setq i (+ i 1)))  ; +
                 ((= c 45) (setq sign -1) (setq i (+ i 1))))))  ; -
@@ -1051,7 +1053,7 @@
                 (digit-count 0))
             (loop
               (when (>= i end) (return))
-              (let* ((c (aref string i))
+              (let* ((c (%prim-aref string i))
                      (digit
                       (cond
                         ((and (>= c 48) (<= c 57)) (- c 48))   ; 0-9
@@ -1073,7 +1075,7 @@
               (let ((j i))
                 (loop
                   (when (>= j end) (return))
-                  (let ((c (aref string j)))
+                  (let ((c (%prim-aref string j)))
                     (when (and (not (= c 32)) (not (= c 9)) (not (= c 10)))
                       (error "parse-integer: junk after digits")))
                   (setq j (+ j 1)))

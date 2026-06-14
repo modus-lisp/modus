@@ -1,0 +1,2 @@
+(write-string-serial "PROBE-1-LOADED;")
+(defvar *probe-1-val* (+ 40 2))

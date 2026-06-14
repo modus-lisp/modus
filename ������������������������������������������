@@ -1,0 +1,1 @@
+(defvar *probe-fmt-val* "X=42")

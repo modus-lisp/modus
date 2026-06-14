@@ -1,0 +1,8 @@
+(defvar *probe-suite-entries* nil)
+(defun probe-record (name form expected)
+  (setq *probe-suite-entries*
+        (cons (list name form expected) *probe-suite-entries*)))
+(defmacro probe-deftest (name form expected)
+  (list (quote probe-record) (list (quote quote) name) (list (quote quote) form) (list (quote quote) expected)))
+(probe-deftest p-add (+ 1 2) 3)
+(probe-deftest p-list (list 'a 'b 'c) (a b c))

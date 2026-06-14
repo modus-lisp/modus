@@ -3482,15 +3482,54 @@
         (%gf-set-methods gf (nreverse new-methods))))
     orig))
 
+(defun %method-meta-anywhere (method)
+  "Find the key-acceptance meta (has-key has-rest aok keynames) for
+   METHOD on ANY registered GF (the method may have been REMOVE-METHOD'd
+   from its original GF, but its meta entry survives there).  Returns
+   the meta list or NIL if unknown."
+  (let ((cur *generic-functions*))
+    (loop
+      (when (null cur) (return nil))
+      (let* ((gf (cdr (car cur)))
+             (meta (%gf-method-meta-for gf method)))
+        (when meta (return meta)))
+      (setq cur (cdr cur)))))
+
 (defun add-method (gf method)
   "Add METHOD to GF.  Accepts either a GF-array or the dispatch
    closure / fn (#'name) via *gf-fn-to-name* reverse-lookup.  Returns
-   the GF AS PASSED (same contract as REMOVE-METHOD)."
+   the GF AS PASSED (same contract as REMOVE-METHOD).
+
+   CLHS ADD-METHOD signals an error when:
+   - METHOD is already attached to another generic function
+     (add-method.error.1);
+   - METHOD's lambda-list is not congruent with GF's (CLHS 7.6.4):
+     the specializer count must equal GF's required-parameter count
+     (add-method.error.2/.3/.7), and if GF has neither &rest nor &key
+     then METHOD must accept no &key either (add-method.error.8)."
   (let ((orig gf))
     (unless (%gf-p gf)
       (let ((real (%fn-to-gf gf)))
         (when real (setq gf real))))
     (when (%gf-p gf)
+      ;; 1. Already on another GF?  method-generic-function walks the
+      ;;    registry; if it finds a *different* GF holding METHOD, error.
+      (let ((owner (method-generic-function method)))
+        (when (and owner (not (eq owner gf)))
+          (error "add-method: method already belongs to a generic function")))
+      ;; 2. Congruence: specializer count must equal GF required count.
+      (let ((decl-ll (%gf-lambda-list gf)))
+        (when decl-ll
+          (let ((req-count (%lambda-list-required-count decl-ll))
+                (spec-count (length (%method-specializers method))))
+            (unless (= spec-count req-count)
+              (error "add-method: lambda lists not congruent (specializer count)"))
+            ;; If GF accepts no &rest/&key, the method must not accept &key.
+            (unless (%lambda-list-has-rest-or-key decl-ll)
+              (let ((meta (%method-meta-anywhere method)))
+                ;; meta = (has-key has-rest aok keynames)
+                (when (and meta (or (nth 0 meta) (nth 1 meta)))
+                  (error "add-method: lambda lists not congruent (&key/&rest)")))))))
       (%gf-set-methods gf (cons method (%gf-methods gf))))
     orig))
 

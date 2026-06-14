@@ -2931,6 +2931,27 @@
    CLHS: requires at least 2 args (instance + slot-names)."
   (when (or (null %sh-args) (null (cdr %sh-args)))
     (%signal-program-error))
+  ;; CLHS: the second argument is the slot-names designator — either T (all
+  ;; slots), NIL (no slots), or a proper list of slot-name symbols.  A
+  ;; non-T, non-list atom (e.g. the keyword :A in shared-initialize.error.3)
+  ;; is a type-error.  Also reject an improper / non-symbol-keyed initargs
+  ;; plist (odd length, etc.) per shared-initialize.error.4.
+  (let ((slot-names (car (cdr %sh-args)))
+        (initargs (cdr (cdr %sh-args))))
+    (when (and slot-names (not (eq slot-names t)) (not (consp slot-names)))
+      (%signal-type-error))
+    ;; initargs must form a proper, even-length plist whose keys are symbols
+    ;; (keywords or symbols).  A non-symbol key like the list (A B C) in
+    ;; shared-initialize.error.4 is a PROGRAM-ERROR (CLHS 7.1.2).
+    (let ((cur initargs))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (consp cur)) (%signal-program-error))
+        (when (null (cdr cur)) (%signal-program-error))  ; odd-length
+        (let ((key (car cur)))
+          (when (not (or (symbolp key) (%cl-sym-p key)))
+            (%signal-program-error)))
+        (setq cur (cdr (cdr cur))))))
   (%dispatch-shared-init %sh-args))
 
 (defun %change-class-validate-initargs (new-name initargs)

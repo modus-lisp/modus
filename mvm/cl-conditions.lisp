@@ -338,6 +338,7 @@
   ;; warn.{1..3,5..11,19} all silently fell through.  Explicit setq
   ;; here at boot fixes it.
   (setq *handler-bind-effective-skip* 0)
+  (setq *signal-walk-depth* 0)
   (setq *handler-bind-stack* nil)
   (setq *restart-stack* nil)
   (setq *restart-frame-condition-map* nil)
@@ -469,6 +470,7 @@
 
 (defun error (msg &rest args)
   "Signal an error with a condition object."
+  (%heal-handler-bind-skip)
   (let ((cond-obj
          (cond
            ;; Already a condition
@@ -501,6 +503,7 @@
 
 (defun signal (datum &rest args)
   "Signal a condition without requiring handling."
+  (%heal-handler-bind-skip)
   (let ((cond-obj
          (cond
            ((%condition-p datum) datum)
@@ -541,6 +544,7 @@
    Previously warn skipped validation entirely and never set up
    muffle-warning, so handler-bind invocations of muffle-warning were
    no-ops and the printed warning remained visible (warn.3 expected '' )."
+  (%heal-handler-bind-skip)
   ;; -------- Validate datum --------
   (cond
     ((%condition-p datum)
@@ -601,6 +605,7 @@
 
    The condition is built once and signalled inside the restart body so
    the active CONTINUE restart is visible to handler-bind handlers."
+  (%heal-handler-bind-skip)
   (let ((cond-obj
          (cond
            ((%condition-p datum) datum)
@@ -800,12 +805,22 @@
 ;; restart-invocation handshake (*restart-case-result*,
 ;; *restart-invoking-p*) the early version skipped.
 (defun invoke-restart-interactively (name)
-  "Invoke a restart interactively (call its :interactive function for args)."
+  "Invoke a restart interactively: compute its argument list via the
+   restart's :interactive function (or NIL if none), then invoke the
+   restart with those args — routing through INVOKE-RESTART so the
+   restart-case :CASE longjmp handshake fires (restart-case.32..34).
+
+   The interactive function, when present, is stored in cell slot 3
+   (cadddr); %with-restarts cells are (NAME FN REPORT INTERACTIVE :CASE),
+   so an absent :interactive leaves slot 3 NIL and the restart runs with
+   no args."
   (let ((r (find-restart name)))
     (if r
-        (let ((interactive-fn (cadddr r)))
-          (let ((iargs (if interactive-fn (funcall interactive-fn) nil)))
-            (apply (cadr r) iargs)))
+        (let* ((interactive-fn (cadddr r))
+               (iargs (if (and interactive-fn (functionp interactive-fn))
+                          (funcall interactive-fn)
+                          nil)))
+          (apply #'invoke-restart r iargs))
         (error "No restart named ~A" name))))
 
 ;;; --- Handler-Bind System ---
@@ -830,6 +845,16 @@
 ;; handler re-invokes that handler -> infinite recursion (or wrong
 ;; choice).
 (defvar *handler-bind-effective-skip* 0)
+
+;; *signal-walk-depth* — how many %signal-condition activations are live on
+;; the C stack right now.  Bumped on entry, dropped on NORMAL exit.  A
+;; handler that exits non-locally skips the drop, so this can read stale-
+;; nonzero after an escaped handler — that is precisely why
+;; %heal-handler-bind-skip ALSO resets it to 0 whenever the handler-bind
+;; stack is empty (no frames ⇒ no live handler ⇒ depth must be 0).  Between
+;; that baseline reset and the fresh-signal heal, a leaked skip can never
+;; survive into an unrelated signal.
+(defvar *signal-walk-depth* 0)
 
 (defun %signal-condition (cond-obj)
   "Walk the handler-bind stack and call matching handlers.
@@ -860,19 +885,25 @@
             (when (%type-matches-condition-p htype cond-obj)
               ;; Bump the skip count to (frame-idx + 1) so handlers in
               ;; THIS and inner frames are inhibited during the handler's
-              ;; body.  Restore on normal return so a later handler in
-              ;; the same loop sees the right scope.
-              (let ((saved *handler-bind-effective-skip*))
+              ;; body, and bump *signal-walk-depth* so a fresh signal can
+              ;; tell it is running inside an active handler.  setq
+              ;; save/restore (NOT let-binding the specials): let-binding a
+              ;; special across the handler made a THROW out of the handler
+              ;; SIGSEGV the whole process (the let-unwind + %nlx/throw
+              ;; interaction — same crash class as probe 9565), which turned
+              ;; throw-from-handler tests from clean fails into chunk-killing
+              ;; hard crashes.  setq leaks on a non-local exit, but that leak
+              ;; is repaired at the next fresh-signal entry by
+              ;; %heal-handler-bind-skip.
+              (let ((saved *handler-bind-effective-skip*)
+                    (saved-depth *signal-walk-depth*))
                 (setq *handler-bind-effective-skip* (+ frame-idx 1))
-                (let ((rv (funcall hfn cond-obj)))
-                  (declare (ignore rv))
-                  ;; Handler returned normally.  Per CLHS, after a handler
-                  ;; returns normally, the search "considers the next
-                  ;; applicable handler"; that's the next handler in this
-                  ;; frame, or one in an outer frame.  We do NOT lower
-                  ;; *handler-bind-effective-skip* past this frame, so the
-                  ;; just-invoked handler stays inhibited.
-                  (setq *handler-bind-effective-skip* saved)))))))
+                (setq *signal-walk-depth* (+ saved-depth 1))
+                (funcall hfn cond-obj)
+                ;; Handler returned normally — restore so a later handler
+                ;; in this same loop sees the right scope.
+                (setq *signal-walk-depth* saved-depth)
+                (setq *handler-bind-effective-skip* saved))))))
       (setq cur (cdr cur))
       (setq frame-idx (+ frame-idx 1)))
     nil))
@@ -921,10 +952,51 @@
    to a single primary value.  warn.{1,2,5,6,7,8,9,10,11,19} place
    `(values (multiple-value-list (warn …)) warned)` inside the
    handler-bind body, so the 2nd value (warned) was being silently
-   dropped and the test expected `(NIL) T` saw only `(NIL)`."
+   dropped and the test expected `(NIL) T` saw only `(NIL)`.
+
+   NON-LOCAL EXIT RESTORE: a handler that exits non-locally (return-from
+   out of %signal-condition — handler-bind.5/6/11/12) used to skip the
+   trailing pop AND %signal-condition's skip-restore, leaving BOTH
+   *handler-bind-stack* and *handler-bind-effective-skip* elevated past
+   this (now-unwound) frame.  Every SUBSEQUENT signal then skipped real
+   leading handler frames → its handlers were silently never invoked
+   (the warn.* / handler-bind.* / restart-case.* false-NIL cascade: one
+   escaping-handler test poisoned the rest of the chunk).
+
+   Fix: setq-push the frame (LET-binding the special instead crashes the
+   cross-unit return-from path — let-restore through %nlx-throw re-triggers
+   the open 9525 crash class).  The non-local-exit leak of
+   *handler-bind-stack* / *handler-bind-effective-skip* / *signal-walk-depth*
+   is repaired at the NEXT fresh-signal entry by %heal-handler-bind-skip
+   (called from error/signal/warn/cerror), which detects the stale state
+   and rewinds it.  See that function for the detection logic."
   (setq *handler-bind-stack* (cons handlers *handler-bind-stack*))
   (multiple-value-prog1 (funcall body-fn)
     (setq *handler-bind-stack* (cdr *handler-bind-stack*))))
+
+(defun %heal-handler-bind-skip ()
+  "Reset *handler-bind-effective-skip* to 0 when NOT inside an active
+   handler's dynamic extent.  A handler that performed a non-local exit
+   out of %signal-condition (handler-bind.5/6/11/12 return-from/throw
+   shapes) leaves skip elevated, which would inhibit the leading frames of
+   the NEXT, unrelated signal — its applicable handlers would silently not
+   run (the warn.* / handler-bind.* / restart-case.* false-NIL cascade
+   where one escaping-handler test poisons the rest of the chunk).
+
+   *signal-walk-depth* tracks how many %signal-condition frames are
+   currently on the C stack.  At a FRESH signal (depth 0) any nonzero skip
+   is necessarily stale leakage → reset to 0.  A genuine re-signal from
+   inside an active handler runs at depth>0 with the considered frames
+   still inhibited, so we leave skip untouched there (handler-bind.6,
+   restart-case.25..31 keep their inhibition)."
+  ;; Baseline: an empty handler-bind stack means no handler can possibly be
+  ;; active, so any leaked depth/skip from a previously-escaped handler is
+  ;; cleared here.  This converts a stale depth back to 0 before the
+  ;; fresh-signal check below.
+  (when (null *handler-bind-stack*)
+    (setq *signal-walk-depth* 0))
+  (when (= *signal-walk-depth* 0)
+    (setq *handler-bind-effective-skip* 0)))
 
 ;;; --- restart-case implementation ---
 ;;; restart-case needs non-local exit from restart body back to restart-case frame.

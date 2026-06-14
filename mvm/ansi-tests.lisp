@@ -3767,6 +3767,49 @@
     'good)
   ;; ==== end Fable probe block 9520-9539 ====
 
+  ;; ==== Fable conditions re-census probes 9540-9559 ====
+  ;; NOTE: signal/warn HANDLER-INVOCATION cannot be probed reliably HERE —
+  ;; the diag pass runs rt-run-test back-to-back with no handler-case reset
+  ;; between probes, and the escaping-handler probes above (9522/9523/9526)
+  ;; leak *handler-bind-effective-skip* (the open return-from sub-cases skip
+  ;; the restore), poisoning any later signal probe in the SAME pass.  In
+  ;; the real ANSI chunks each test IS handler-case-wrapped, so
+  ;; %heal-handler-bind-skip (cl-conditions.lisp) rewinds the leak at the
+  ;; next fresh-signal entry once the handler-bind stack drains — that is
+  ;; what recovered warn.2..11 (FAIL→PASS, conditions range 215→223 P).
+  ;; The probes below are therefore restricted to LEAK-IMMUNE facts.
+
+  ;; type-match basics (the handler-bind matcher building blocks)
+  (rt-run-test 9540 (notnot (typep (make-condition 'simple-condition :format-control "x") 'condition)) t)
+  (rt-run-test 9541 (notnot (typep (make-condition 'simple-warning :format-control "x") 'warning)) t)
+  (rt-run-test 9542 (notnot (%type-matches-condition-p 'condition (make-condition 'simple-condition :format-control "x"))) t)
+
+  ;; warn returns NIL regardless of handler invocation.
+  (rt-run-test 9543 (multiple-value-list (warn "muffled-or-not")) '(nil))
+
+  ;; restart-case.32 shape: invoke-restart-interactively with no
+  ;; :interactive option routes through invoke-restart's :CASE longjmp
+  ;; (previously invoke-restart-interactively funcalled the restart fn
+  ;; directly, bypassing the longjmp handshake).
+  (rt-run-test 9544
+    (%with-restarts
+     (list (list 'foo (lambda () 'good) nil))
+     (lambda () (invoke-restart-interactively 'foo)))
+    'good)
+  ;; compute-restarts returns the active restarts.
+  (rt-run-test 9545
+    (%with-restarts
+     (list (list 'foo (lambda () 'a) nil) (list 'bar (lambda () 'b) nil))
+     (lambda () (length (compute-restarts))))
+    2)
+  ;; find-restart by name; restart-name reads it back.
+  (rt-run-test 9546
+    (%with-restarts
+     (list (list 'foo (lambda () 'a) nil))
+     (lambda () (restart-name (find-restart 'foo))))
+    'foo)
+  ;; ==== end Fable conditions re-census probes 9540-9559 ====
+
   ;; --- make-instance + slot-value ---
   (deftest 5001 (let ((c (make-instance 'smoke-circle :name "ring" :radius 5)))
                   (slot-value c 'name)) "ring")

@@ -3556,9 +3556,18 @@
          (init-form (cons 'progn init-pairs)))
     (values creation-form init-form)))
 
-(defun set-find-class (name class)
-  "Set the class for NAME (stub)."
-  nil)
+;; NOTE: set-find-class is implemented in cl-conditions.lisp (it mutates
+;; *clos-classes*).  An earlier stub HERE shadowed it via last-defun-wins,
+;; silently dropping every (setf (find-class NAME) …).  Removed so the real
+;; one wins.
+
+(defun set-class-name (cls new-name)
+  "(setf (class-name CLS) NEW-NAME) per CLHS 4.3.6.  Mutate the class
+   object's name slot in place and return NEW-NAME.  The SETF macro's
+   generic fallback rewrites (setf (class-name c) v) → (set-class-name c v)."
+  (when (%clos-class-p cls)
+    (let ((dummy (aset cls 1 new-name))) dummy))
+  new-name)
 
 ;;; ============================================================
 ;;; DESCRIBE, APROPOS (stubs)

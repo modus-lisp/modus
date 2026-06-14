@@ -5395,35 +5395,38 @@
                            (t '*))))
           (when (and (integerp len-slot) produced (not (= len-slot produced)))
             (%signal-type-error))))))
-  (cond
+  ;; Coerce each seq to a list of typed elements.  Strings →
+  ;; list of characters (so MAP 'VECTOR #'IDENTITY "abc" →
+  ;; #(#\a #\b #\c), not #(97 98 99)).  Shared by both the NIL
+  ;; (for-effect) and collecting branches so MAP NIL iterates ANY
+  ;; sequence (string / vector / bit-vector / MDA), not just lists.
+  (let* ((seqs-as-lists
+           (mapcar (lambda (s)
+                     (cond
+                       ((null s) nil)
+                       ((consp s) s)
+                       ((stringp s)
+                        (let ((res nil) (i (- (length s) 1)))
+                          (loop (when (< i 0) (return res))
+                            ;; AREF already yields a CHARACTER for strings;
+                            ;; compiled code-char would re-shift it.
+                            (setq res (cons (aref s i) res))
+                            (setq i (- i 1)))))
+                       ;; Native MDA: walk via length (fp-aware) + aref.
+                       ((%mda-p s)
+                        (let ((res nil) (i (- (length s) 1)))
+                          (loop (when (< i 0) (return res))
+                            (setq res (cons (aref s i) res))
+                            (setq i (- i 1)))))
+                       (t (coerce s 'list))))
+                   seqs)))
+   (cond
     ((null result-type)
-     (apply #'mapc fn seqs)
+     ;; For-effect over the coerced lists (handles all sequence kinds).
+     (apply #'mapc fn seqs-as-lists)
      nil)
     (t
      (let* ((kind (%concat-result-kind result-type))
-            ;; Coerce each seq to a list of typed elements.  Strings →
-            ;; list of characters (so MAP 'VECTOR #'IDENTITY "abc" →
-            ;; #(#\a #\b #\c), not #(97 98 99)).
-            (seqs-as-lists
-              (mapcar (lambda (s)
-                        (cond
-                          ((null s) nil)
-                          ((consp s) s)
-                          ((stringp s)
-                           (let ((res nil) (i (- (length s) 1)))
-                             (loop (when (< i 0) (return res))
-                               ;; AREF already yields a CHARACTER for strings;
-                               ;; compiled code-char would re-shift it.
-                               (setq res (cons (aref s i) res))
-                               (setq i (- i 1)))))
-                          ;; Native MDA: walk via length (fp-aware) + aref.
-                          ((%mda-p s)
-                           (let ((res nil) (i (- (length s) 1)))
-                             (loop (when (< i 0) (return res))
-                               (setq res (cons (aref s i) res))
-                               (setq i (- i 1)))))
-                          (t (coerce s 'list))))
-                      seqs))
             (lst (apply #'mapcar fn seqs-as-lists))
             (n (length lst)))
        (cond
@@ -5439,7 +5442,7 @@
           (let ((v (make-array n)) (i 0) (cur lst))
             (loop (when (= i n) (return v))
               (aset v i (car cur))
-              (setq cur (cdr cur)) (setq i (+ i 1))))))))))
+              (setq cur (cdr cur)) (setq i (+ i 1)))))))))))
 ;; functionp identifies callable values.  In MVM these are:
 ;;   - raw fn-addrs from #'foo  (low bit 0 with our nibble alignment)
 ;;   - closure objects (subtag #x52)

@@ -3996,7 +3996,83 @@
   (rt-run-test 9218 (read-from-string "#.(+ 1 2)") 3)
   ;; negative / float token
   (rt-run-test 9219 (read-from-string "-17") -17)
-  ;; ==== end reader probes 9180-9219 ====
+  ;; parse-integer radix decode (a-z, A-Z) — parse-integer.16 shape
+  (rt-run-test 9220 (parse-integer "z0" :radix 36) 1260)
+  (rt-run-test 9221 (parse-integer "Z0" :radix 36) 1260)
+  (rt-run-test 9222 (parse-integer "a0" :radix 11) 110)
+  ;; CL whitespace 12 (Page) / 13 (Return) skipped — parse-integer.7/.8
+  (rt-run-test 9223 (parse-integer (concatenate 'string (string (code-char 12)) "0" (string (code-char 12)))) 0)
+  (rt-run-test 9224 (parse-integer (concatenate 'string (string (code-char 13)) "999" (string (code-char 13)))) 999)
+  ;; leftmost-wins on repeated keywords — parse-integer.23/.35/.36
+  (rt-run-test 9225 (parse-integer "a1234b" :start 2 :end 4 :end nil) 23)
+  (rt-run-test 9226 (parse-integer "1234" :end 3 :end 1) 123)
+  (rt-run-test 9227 (parse-integer "1234" :end nil :end 3) 1234)
+  ;; dot-token reading (syntax.dot-token.*): escaped dot → symbol named "."
+  (rt-run-test 9228 (symbol-name (read-from-string "\\.")) ".")
+  (rt-run-test 9229 (multiple-value-bind (v n) (read-from-string "\\.") (declare (ignore v)) n) 2)
+  (rt-run-test 9230 (symbol-name (read-from-string ".\\.")) "..")
+  (rt-run-test 9231 (symbol-name (read-from-string "\\..")) "..")
+  (rt-run-test 9232 (symbol-name (read-from-string "..\\.")) "...")
+  (rt-run-test 9233 (symbol-name (read-from-string ".||")) ".")
+  (rt-run-test 9234 (multiple-value-bind (v n) (read-from-string ".||") (declare (ignore v)) n) 3)
+  ;; lone/multi dot should be an error (read inside a list context normally;
+  ;; bare "." or ".." at top level is undefined/error)
+  (rt-run-test 9235 (handler-case (progn (read-from-string "..") :no-err) (error (c) :err)) :err)
+  ;; #| |# block comment (syntax.sharp-bar.*) — value+position
+  (rt-run-test 9236 (read-from-string "#||#1") 1)
+  (rt-run-test 9237 (multiple-value-bind (v n) (read-from-string "#||#1") (declare (ignore v)) n) 5)
+  (rt-run-test 9238 (read-from-string "#| #| |# |#1") 1)
+  (rt-run-test 9239 (multiple-value-bind (v n) (read-from-string "#| #| |# |#1") (declare (ignore v)) n) 12)
+  (rt-run-test 9240 (read-from-string "#| ; |#1") 1)
+  (rt-run-test 9241 (read-from-string "#| ( |#1") 1)
+  (rt-run-test 9242 (read-from-string "#| # |#1") 1)
+  (rt-run-test 9243 (read-from-string "#| .. |#1") 1)
+  ;; #+/#- feature conditionals (syntax.sharp-plus.*)
+  (rt-run-test 9244 (read-from-string "#+(or) 1 2") 2)
+  (rt-run-test 9245 (read-from-string "#-(or) 1 2") 1)
+  (rt-run-test 9246 (read-from-string "(#+(or) 1 2)") '(2))
+  (rt-run-test 9247 (read-from-string "(#-(or) 1 2)") '(1 2))
+  (rt-run-test 9248 (read-from-string "#+(and) 1 2") 1)
+  ;; single-escape at EOF (syntax.single-escape-eof.*) should error
+  (rt-run-test 9249 (handler-case (progn (read-from-string "\\") :no-err) (error (c) :err)) :err)
+  ;; sharp-plus with *features* bound (syntax.sharp-plus.* exact shapes)
+  (rt-run-test 9250 (let ((*features* nil)) (read-from-string "#+X :bad :good")) :good)
+  (rt-run-test 9251 (let ((*features* '(:a :x :b))) (read-from-string "#+X :good :bad")) :good)
+  (rt-run-test 9252 (let ((*features* '(:a :x :b))) (read-from-string "#+:x :good :bad")) :good)
+  (rt-run-test 9253 (let ((*features* '(:a :x :b))) (read-from-string "#+(and):good :bad")) :good)
+  (rt-run-test 9254 (let ((*features* '(:a :x :b))) (read-from-string "#+(or) :bad :good")) :good)
+  (rt-run-test 9255 (let ((*features* nil)) (read-from-string "#+(not x) :good :bad")) :good)
+  (rt-run-test 9256 (let ((*features* '(:x))) (read-from-string "#+(not x) :bad :good")) :good)
+  (rt-run-test 9257 (let ((*features* '(:a :x :b))) (read-from-string "#+(and a b) :good :bad")) :good)
+  (rt-run-test 9258 (let ((*features* '(:a :x :b))) (read-from-string "#+(or c d) :bad :good")) :good)
+  ;; position values
+  (rt-run-test 9259 (multiple-value-bind (v n) (let ((*features* nil)) (read-from-string "#+X :bad :good")) (declare (ignore v)) n) 14)
+  ;; Replicate def-syntax-test wrapper: with-standard-io-syntax + *package*.
+  (rt-run-test 9260 (with-standard-io-syntax (let ((*features* nil)) (read-from-string "#+X :bad :good"))) :good)
+  (rt-run-test 9261 (with-standard-io-syntax (let ((*features* '(:a :x :b))) (read-from-string "#+X :good :bad"))) :good)
+  (rt-run-test 9262 (with-standard-io-syntax (read-from-string "#||#1")) 1)
+  (rt-run-test 9263 (with-standard-io-syntax (read-from-string "#+(or) 1 2")) 2)
+  ;; The syntax.lsp sharp-c.1 EXPECTED form is #.(complex 1 1); if complex
+  ;; or #. read-eval crashes the file load aborts (60-test contiguous block
+  ;; sharp-c..sharp-bar lost).  Isolate which: reader #. vs complex fn.
+  (rt-run-test 9264 (handler-case (progn (complex 1 1) :ok) (error (c) :err)) :ok)
+  (rt-run-test 9265 (handler-case (progn (read-from-string "#.(complex 1 1)") :ok) (error (c) :err)) :ok)
+  (rt-run-test 9266 (handler-case (progn (read-from-string "#c(1 1)") :ok) (error (c) :err)) :ok)
+  ;; set-syntax-from-char.single-escape.1 shape (one iteration, c=#\a → \):
+  (rt-run-test 9267
+    (with-standard-io-syntax
+     (let ((*readtable* (copy-readtable nil)))
+       (list (set-syntax-from-char #\a #\\)
+             (read-from-string (concatenate 'string (list #\a #\Z))))))
+    '(t |aZ|))
+  ;; set-syntax-from-char.right-paren shape: make #\a a close-paren → error
+  (rt-run-test 9268
+    (with-standard-io-syntax
+     (let ((*readtable* (copy-readtable nil)))
+       (set-syntax-from-char #\a #\))
+       (handler-case (progn (read-from-string "a") :no) (error (c) :good))))
+    :good)
+  ;; ==== end reader probes 9180-9268 ====
 
   ;; ==== Fable conditions re-census probes 9540-9559 ====
   ;; NOTE: signal/warn HANDLER-INVOCATION cannot be probed reliably HERE —

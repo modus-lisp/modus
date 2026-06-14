@@ -2275,7 +2275,32 @@
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
-  (let ((result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type))))
+  (let* ((orig-type result-type)
+         ;; Explicit length from a compound array/vector/string spec like
+         ;; (vector * 4) / (simple-string 5) — third element (or second for
+         ;; string specs).  NIL or '* means unconstrained.
+         (spec-len
+           (and (consp orig-type)
+                (let ((head (car orig-type)) (rest (cdr orig-type)))
+                  (cond
+                    ;; (vector elt-type len) / (array elt-type (len)) family:
+                    ;; length is the 3rd element
+                    ((and (or (eq head 'vector) (eq head 'simple-vector)
+                              (eq head 'array) (eq head 'simple-array))
+                          (consp rest) (consp (cdr rest)))
+                     (let ((l (car (cdr rest))))
+                       (cond ((integerp l) l)
+                             ((and (consp l) (integerp (car l))) (car l))
+                             (t nil))))
+                    ;; (string len) / (simple-string len) etc: length is 2nd
+                    ((and (or (eq head 'string) (eq head 'simple-string)
+                              (eq head 'base-string) (eq head 'simple-base-string)
+                              (eq head 'bit-vector) (eq head 'simple-bit-vector))
+                          (consp rest) (integerp (car rest)))
+                     (car rest))
+                    (t nil)))))
+         (result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type)))
+         (%cv
   (cond
     ((eq result-type 'list)
      (cond
@@ -2369,7 +2394,33 @@
      (if (integerp object) (code-char object)
          (if (stringp object) (code-char (aref object 0))
              object)))
+    ((eq result-type 'function)
+     ;; CLHS: a symbol or lambda expression coerces to a function.  A
+     ;; symbol with no global function definition signals an error.
+     (cond
+       ((functionp object) object)
+       ((and (consp object) (symbolp (car object))
+             (string= (symbol-name (car object)) "LAMBDA"))
+        ;; (lambda ...) expression → interpreted closure (null lexenv)
+        (list '%interp-closure (cadr object) (cddr object) nil))
+       ((symbolp object)
+        (let ((fn (and (fboundp object) (symbol-function object))))
+          (if fn fn (progn (%signal-undefined-function) nil))))
+       (t (%signal-type-error) nil)))
+    ((eq result-type 'cons)
+     ;; CONS is not a valid coercion result-type unless OBJECT is already
+     ;; a cons (CLHS 4.2.1: coerce identity when already of the type).
+     ;; (coerce nil 'cons), (coerce x 'cons) for non-cons → TYPE-ERROR.
+     (if (consp object) object (progn (%signal-type-error) nil)))
     (t object))))
+  ;; CLHS: if RESULT-TYPE specifies an explicit length, OBJECT must be
+  ;; coercible to a sequence of exactly that length, else TYPE-ERROR.
+  ;; The cond above ignores the length; validate it here on the result.
+    (if (and spec-len
+             (or (stringp %cv) (arrayp %cv) (consp %cv) (null %cv))
+             (not (eql (length %cv) spec-len)))
+        (progn (%signal-type-error) nil)
+        %cv)))
 
 ;;; ============================================================
 ;;; C*R Extensions (4-deep)

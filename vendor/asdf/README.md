@@ -31,6 +31,76 @@ minimal token insertion (the upstream line is otherwise verbatim):
 Add future implementation-type lists (uiop/os, uiop/lisp-build, etc.) the
 same way as the gauntlet reaches them, and record them here.
 
+### 2026-06-14 — e159986 string-AREF fallout + DECLAIM + runtime-macro install FIXED (gauntlet 25→226, early uiop define-package chain now PASSES) [commit 98095d2]
+
+**Three independent bugs, one was the literal blocker the prior GC seat
+mis-attributed.**  The `reference_keyword_gc_race` memory said the
+define-package blocker was "runtime-eval define-package gap (NOT GC)" — the
+*conclusion* (runtime-eval) was right, the gap was deeper than the keyword
+print-name miss it suspected.
+
+1. **`e159986` (string AREF→CHARACTER) broke ALL file I/O AND
+   read-from-string.**  `%fs-read-char`, `%fs-read-byte`, `%string-to-cstr`,
+   and the **string-input-stream read-char** (cl-fileio.lisp:~1535) all did
+   `(aref str i)` expecting the raw char-CODE, then `code-char`'d it —
+   DOUBLE-ENCODING every byte.  Symptom: the generic binary could not
+   `load` ANY script ("unhandled condition while loading: …" on even an
+   empty file), and `read-from-string` corrupted lists (a 4-element list
+   read as length 3 with garbage symbols).  Fixed by switching those
+   internal accessors to `%prim-aref` / `%prim-aset` (raw codes) — the
+   exact pattern CLAUDE.md's "String element access" note prescribes.
+   **NB this same regression still affects the cl-fileio glob matcher
+   (line ~1139, `(= (aref pattern pi) (aref str si))` vs ASCII codes) and
+   the namestring/pathname string-parsing sites (~730-948) — a broad
+   pathname-conformance regression an owner of cl-fileio should sweep.**
+
+2. **Knock-on: `%install-runtime-cl-macros` registered ZERO of its 39
+   macros**, because it does `(eval (read-from-string defmacro-src))` and
+   read-from-string was corrupt.  `do-symbols` / `do-external-symbols` /
+   `do-all-symbols` (used by ensure-package) only "worked" when they
+   coincided with a `%eval-compound` builtin — they don't, so they
+   `%eval-escape`'d.  With the read fix, `install-count` went 0→39.
+
+3. **`DECLAIM` / `PROCLAIM` had no `%eval-compound` branch** → fell to the
+   funcall path and `%eval-escape`'d.  uiop/package's big eval-when puts a
+   `(declaim (ftype …) ensure-exported)` BETWEEN two defuns; the escape
+   aborted the eval-when progn, so `ensure-package` and every later
+   define-package was never defined.  Added DECLAIM/PROCLAIM = NIL no-op
+   branches (cl-eval.lisp).  This was the keystone.
+
+**Result:** forms 1-106 run; UIOP/COMMON-LISP, UTILITY, VERSION, OS,
+PATHNAME, FILESYSTEM, STREAM, IMAGE, LISP-BUILD define-packages all
+complete (INPKG markers + not in FAILFORM list).  GAUNTLET DONE forms=226
+fails=26 (was READ-ERROR after form 25).
+
+**NEW FRONTIER = form 107 (`define-package UIOP/CONFIGURATION`) — back to
+GC corruption, and now PRECISELY localized (GC/translator seat):**
+`ensure-package` with a `:use` of a *large* package (uiop/common-lisp,
+978 externals) escapes in `ensure-inherited`.  Bisected to the smoking
+gun: **after the bootstrap loads ~80 forms and 4 GCs fire, `(macroexpand-1
+'(setf (gethash k h) v))` returns NIL instead of `(puthash k h v)`**, so
+the `setf` runtime macro's `((eq acc 'gethash) …)` branch silently fails
+and the whole expansion yields NIL → the caller `%eval-escape`s.  The
+`setf` macro is intact for symbol places (`(setf x 9)`→`(SETQ X 9)` still
+works) — only the *place-head `eq` dispatch* breaks.  Decisive evidence
+this is heap corruption of symbol/closure literals (NOT a logic bug):
+  - `gc-count = 4` at the failure point; works fine through form 79
+    (3 GCs), breaks at form 80+.
+  - `(symbol-name (car (read-from-string "(gethash k h)")))` returns "" —
+    the read `gethash` symbol's NAME slot is clobbered post-GC — yet
+    `(eq that-sym 'gethash)` is still T.
+  - `(macroexpand-1 '(setf (car x) 9))` outright CRASHES post-bootstrap.
+  - `puthash` called DIRECTLY works; only the `setf`→`puthash` macro
+    expansion (which lives in an `%interp-closure` captured at install
+    time, whose captured `'gethash`/`'car` literals get
+    forwarded/corrupted by a collection) fails.
+This is the same Cheney-scan / forwarding race documented at length below
+and in `reference_keyword_gc_race` — now reproduced on the `setf` macro
+closure's captured symbol literals.  **It is OFF-LIMITS to the
+reader/eval/packages seat.**  Minimal repro: load asdf.lisp forms 1..90
+in the generic binary, then `(macroexpand-1 '(setf (gethash "k" h) 9))`
+→ NIL (should be `(PUTHASH "k" H 9)`).
+
 ### 2026-06-13 — runtime-EVAL ECASE / CCASE / CTYPECASE FIXED (gauntlet form 56 → 226; back half of asdf.lisp first visible)
 
 `merge-pathname-directory-component` (uiop/pathname) uses **ECASE**, and

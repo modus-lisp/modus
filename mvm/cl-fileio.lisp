@@ -730,6 +730,17 @@
 
 ;;; --- Directory string parser (used by %parse-pathname-string and merge) ---
 
+;; NB (e159986 string-AREF): %split-directory-string and
+;; %parse-pathname-string below still use PUBLIC (aref s i) — i.e. they
+;; compare a CHARACTER against the raw code 47/46.  That comparison is
+;; technically wrong CL (char vs int), but converting these two to
+;; %prim-aref (which makes pathname-name/type/directory CL-correct)
+;; cascades uiop's pathname arithmetic into failure: the ASDF gauntlet
+;; regresses 226→100 (uiop/launch-program define-package onward, latent
+;; uiop-path gap exposed by correct parsing).  The glob matcher,
+;; %find-colon, %component-wild-p, ensure-directories-exist and
+;; %c-string-at WERE converted (gauntlet held at 226).  Re-converting the
+;; namestring parser is gated on first closing the downstream uiop gap.
 (defun %split-directory-string (s)
   "Split a directory string like \"/a/b/\" or \"a/b/\" into
    (:absolute \"a\" \"b\") or (:relative \"a\" \"b\").  Empty → nil."
@@ -1054,7 +1065,7 @@
      (let ((i 0) (len (length c)) (found nil))
        (loop
          (when (or found (>= i len)) (return found))
-         (let ((ch (aref c i)))
+         (let ((ch (%prim-aref c i)))  ; raw code: 42 = #\*, 63 = #\?
            (when (or (= ch 42) (= ch 63))
              (setq found t)))
          (setq i (+ i 1)))
@@ -1121,7 +1132,7 @@
          (let ((all-star t) (j pi))
            (loop
              (when (>= j pl) (return nil))
-             (unless (= (aref pattern j) 42) (setq all-star nil))
+             (unless (= (%prim-aref pattern j) 42) (setq all-star nil))  ; 42 = #\* (raw code)
              (setq j (+ j 1)))
            (return (if all-star t nil))))
         ((>= pi pl)
@@ -1131,12 +1142,14 @@
                (setq pi (+ star-pos 1))
                (setq star-si (+ star-si 1))
                (setq si star-si))))
-        ((= (aref pattern pi) 42)   ; *
+        ;; %prim-aref: raw char-CODE compares (42 = #\*, 63 = #\?); the
+        ;; char↔char compare must use the same representation on both sides.
+        ((= (%prim-aref pattern pi) 42)   ; *
          (setq star-pos pi)
          (setq star-si si)
          (setq pi (+ pi 1)))
-        ((or (= (aref pattern pi) 63)   ; ?
-             (= (aref pattern pi) (aref str si)))
+        ((or (= (%prim-aref pattern pi) 63)   ; ?
+             (= (%prim-aref pattern pi) (%prim-aref str si)))
          (setq pi (+ pi 1))
          (setq si (+ si 1)))
         ((>= star-pos 0)
@@ -1200,7 +1213,7 @@
   (let ((i 0) (len (length s)) (found -1))
     (loop
       (when (or (>= found 0) (>= i len)) (return found))
-      (when (= (aref s i) 58) (setq found i))
+      (when (= (%prim-aref s i) 58) (setq found i))  ; 58 = #\:  (raw code)
       (setq i (+ i 1)))
     found))
 
@@ -1276,7 +1289,7 @@
           (i 1))
       (loop
         (when (>= i len) (return nil))
-        (when (= (aref path i) 47)  ; /
+        (when (= (%prim-aref path i) 47)  ; 47 = #\/  (raw code)
           (let ((dir (%substring path 0 i)))
             (%sys-mkdir dir 493)))  ; 493 = 0755
         (setq i (+ i 1)))
@@ -1332,7 +1345,9 @@
     (let ((s (%make-string-array len)) (i 0))
       (loop
         (when (>= i len) (return s))
-        (aset s i (mem-ref (+ addr i) :u8))
+        ;; %prim-aset: store the raw byte CODE into the string buffer
+        ;; (public ASET coerces a CHARACTER; we have a fixnum) — see e159986.
+        (%prim-aset s i (mem-ref (+ addr i) :u8))
         (setq i (+ i 1))))))
 
 (defun directory (x &rest args)

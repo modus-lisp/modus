@@ -3870,6 +3870,34 @@
     'good)
   ;; ==== end Fable probe block 9520-9539 ====
 
+  ;; ==== Fable cl-fileio string-AREF fallout probes 9160-9169 ====
+  ;; e159986 made public AREF on a string return a CHARACTER.  cl-fileio's
+  ;; wild/glob matcher (%component-wild-p / %glob-match) read string
+  ;; elements as raw char-CODEs (compared to 42=#\* 63=#\? 58=#\:).  They
+  ;; were converted to %prim-aref so the comparisons see fixnum codes, not
+  ;; CHARACTERs.  Pre-fix the lifted-then-compared-as-int values never
+  ;; matched, so glob match / wild detection always returned NIL.  Placed
+  ;; in the reliable smoke block (NOT run-clos-diag-tests, whose body is
+  ;; pre-broken on the tip).
+  ;;
+  ;; NB: the %parse-pathname-string / %split-directory-string namestring
+  ;; parser was DELIBERATELY left on public AREF (char↔int compare) — see
+  ;; the cl-fileio comment block there.  Converting it to %prim-aref makes
+  ;; pathname-name/type/directory CL-correct but cascades uiop pathname
+  ;; arithmetic into failure (ASDF gauntlet 226→100), an unrelated latent
+  ;; uiop-path gap.  Probes here only cover the SHIPPED clusters.
+  (rt-run-test 9160 (pathname-match-p "abc.txt" "a*.txt") t)
+  (rt-run-test 9161 (pathname-match-p "abc.txt" "a?c.txt") t)
+  (rt-run-test 9162 (pathname-match-p "abc.txt" "x*.txt") nil)
+  (rt-run-test 9163 (pathname-match-p "foo" "f??") t)
+  (rt-run-test 9164 (pathname-match-p "foo.lisp" "*.lisp") t)
+  (rt-run-test 9165 (pathname-match-p "foo.fasl" "*.lisp") nil)
+  (rt-run-test 9166 (notnot (wild-pathname-p "a*b")) t)
+  (rt-run-test 9167 (wild-pathname-p "plain") nil)
+  (rt-run-test 9168 (notnot (wild-pathname-p "a?b")) t)
+  (rt-run-test 9169 (pathname-match-p "x" "*") t)
+  ;; ==== end cl-fileio probes 9160-9169 ====
+
   ;; ==== Fable conditions re-census probes 9540-9559 ====
   ;; NOTE: signal/warn HANDLER-INVOCATION cannot be probed reliably HERE —
   ;; the diag pass runs rt-run-test back-to-back with no handler-case reset

@@ -3518,33 +3518,42 @@
    Modus doesn't have a FASL emitter, but tests probe the SHAPE of
    the return values, and the values themselves must be valid forms."
   (declare (ignore environment))
+  ;; Only handle standard CLOS instances here.  Structs reach this via a
+  ;; different (positional) representation whose allocate-instance round-trip
+  ;; isn't reconstructable through the test's SUBST path yet — leave them to
+  ;; the (values nil nil) fallback (deferred; see make-load-form handoff).
   (when (or (null object) (not (%clos-instance-p object)))
     (return-from make-load-form-saving-slots (values nil nil)))
   (let* ((class-name (aref object 1))
          (cls (%find-clos-class class-name))
-         (slots (cond ((null slot-names)
-                       (if cls (aref cls 2) nil))
-                      ((eq slot-names t)
-                       (if cls (aref cls 2) nil))
-                      (t slot-names)))
+         (slots (cond
+                  ;; explicit :slot-names list (and not T) → use as given
+                  ((and slot-names (not (eq slot-names t))) slot-names)
+                  ;; CLOS: all slots from the class slot list
+                  (cls (aref cls 2))
+                  (t nil)))
          (creation-form
            (list 'allocate-instance (list 'find-class (list 'quote class-name))))
+         ;; Per CLHS 3.2.4.4 / make-load-form-saving-slots: the init-form
+         ;; references the OBJECT directly so the FASL emitter (here, the
+         ;; ANSI test via SUBST NEWOBJ OBJECT) can rewrite it to operate on
+         ;; the freshly-created instance.  Only BOUND slots get a setter —
+         ;; unbound slots must stay unbound after reconstruction.  Use a
+         ;; direct SET-SLOT-VALUE call rather than the SETF macro: runtime-
+         ;; EVAL of (setf (slot-value …) …) doesn't take effect, whereas the
+         ;; direct setter does.
          (init-pairs
            (let ((acc nil) (cur slots))
              (loop
                (when (null cur) (return (nreverse acc)))
-               (let* ((sname (car cur))
-                      (val (handler-case (slot-value object sname) (t (c) nil))))
-                 (setq acc (cons (list 'setf
-                                       (list 'slot-value 'obj (list 'quote sname))
-                                       (list 'quote val))
-                                 acc)))
+               (let ((sname (car cur)))
+                 (when (handler-case (%slot-boundp object sname) (t (c) nil))
+                   (let ((val (handler-case (%slot-value object sname) (t (c) nil))))
+                     (setq acc (cons (list 'set-slot-value
+                                           object (list 'quote sname) (list 'quote val))
+                                     acc)))))
                (setq cur (cdr cur)))))
-         (init-form (cons 'progn (cons (list 'let
-                                             (list (list 'obj creation-form))
-                                             (cons 'progn init-pairs)
-                                             'obj)
-                                       nil))))
+         (init-form (cons 'progn init-pairs)))
     (values creation-form init-form)))
 
 (defun set-find-class (name class)

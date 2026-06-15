@@ -1417,6 +1417,86 @@
                         (if (slot-exists-p o 'zz) t nil)))
     '(t t nil))
   ;; ----------------------------------------------------------------
+  ;; 8690-8693 — NEXT-METHOD-P built-in-type subtype dispatch
+  ;; (next-method-p.1/.3).  An (x integer) primary's call-next-method
+  ;; chain must include the (x number) primary (integer <: number).
+  ;; Mirror the suite's (eval '(defmethod ...)) setup so the methods
+  ;; register at RUNTIME, then dispatch and read *%next-methods* via
+  ;; next-method-p.
+  (progn
+    (eval '(progn
+             (%defgeneric 'probe-nmp-gf1 '(x) nil)
+             (%defmethod 'probe-nmp-gf1 nil '(integer)
+                         (lambda (x) (declare (ignore x)) (if (next-method-p) t nil)))
+             (%defmethod 'probe-nmp-gf1 nil '(number)
+                         (lambda (x) (declare (ignore x)) 'foo))
+             (%defmethod 'probe-nmp-gf1 nil '(symbol)
+                         (lambda (x) (declare (ignore x)) (if (next-method-p) t nil)))))
+    nil)
+  ;; integer arg: (integer) primary has (number) as next → next-method-p T
+  (deftest 8690 (%gf-dispatch 'probe-nmp-gf1 (list 10)) t)
+  ;; symbol arg: only (symbol) applies, no next → next-method-p nil
+  (deftest 8692 (%gf-dispatch 'probe-nmp-gf1 (list 'a)) nil)
+  ;; 8697-8699 — next-method-p arity: (next-method-p X) must
+  ;; program-error.  Test the function directly + through eval.
+  (deftest 8697
+    (handler-case (progn (next-method-p nil) :NO-ERROR)
+      (program-error (c) :PE)
+      (t (c) :OTHER))
+    :PE)
+  (deftest 8698
+    (handler-case (progn (next-method-p) :OK)
+      (t (c) :ERR))
+    :OK)
+  (deftest 8699
+    (handler-case (progn (eval '(next-method-p nil)) :NO-ERROR)
+      (program-error (c) :PE)
+      (t (c) :OTHER))
+    :PE)
+  ;; 8684-8687 — make-instance initarg validation (make-instance.error.2/3).
+  ;; Odd initarg plist → program-error; unknown initarg → error.
+  ;; Probe class registered via eval so slot-info exists.
+  (progn (eval '(defclass mi-probe-c2 () ((a :initarg :a) (b :initarg :b))))
+         nil)
+  ;; odd initarg plist via eval → program-error
+  (deftest 8684
+    (handler-case (progn (eval '(make-instance 'mi-probe-c2 :a)) :NO-ERROR)
+      (program-error (c) :PE)
+      (t (c) :OTHER))
+    :PE)
+  ;; unknown initarg via eval → error (any)
+  (deftest 8685
+    (handler-case (progn (eval '(make-instance 'mi-probe-c2 :z 1)) :NO-ERROR)
+      (error (c) :ERR))
+    :ERR)
+  ;; valid initargs → instance (no error)
+  (deftest 8686
+    (handler-case (progn (eval '(make-instance 'mi-probe-c2 :a 1 :b 2)) :OK)
+      (t (c) :ERR))
+    :OK)
+  ;; unknown initarg via find-class → error
+  (deftest 8687
+    (handler-case
+        (progn (eval '(make-instance (find-class 'mi-probe-c2) :z 1)) :NO-ERROR)
+      (error (c) :ERR))
+    :ERR)
+  ;; ----------------------------------------------------------------
+  ;; 8694/8696 — defclass.forward-ref: (eval (defclass C (FWD) nil))
+  ;; with an undefined super FWD returns a class object; instances of
+  ;; the forward-referencing class satisfy typep on the class name.
+  (deftest 8694
+    (let ((c1 (gensym)) (c2 (gensym)))
+      (let ((class1 (eval (list 'defclass c1 (list c2) nil))))
+        (if (%clos-class-p class1) t nil)))
+    t)
+  (deftest 8696
+    (let ((c1 (gensym)) (c2 (gensym)))
+      (eval (list 'defclass c1 (list c2) nil))
+      (eval (list 'defclass c2 nil nil))
+      (let ((i1 (make-instance c1)))
+        (if (typep i1 c1) t nil)))
+    t)
+  ;; ----------------------------------------------------------------
   ;; Probes 8980-8981: prove the RUNTIME-EVAL path resolves a let-bound
   ;; VARIABLE passed to make-package / find-package, instead of treating
   ;; it as a literal designator.  print-symbols 22207/22212/22213 fail

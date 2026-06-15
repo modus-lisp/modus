@@ -2743,10 +2743,25 @@
            ;; initforms for any unset slots.  Values are recursively
            ;; rewritten so quoted/embedded forms still resolve correctly.
            (let ((rewritten-args (mapcar #'rewrite-reader-forms rest-args)))
-             `(let ((%clos-make-instance-tmp (%make-instance ,class-arg))
-                    (*clos-applying-defaults* t))
+             ;; CLHS 7.1.2: validate the initarg plist — odd-length plist →
+             ;; program-error (make-instance.error.2), unknown initarg →
+             ;; error (make-instance.error.3/.4).  The runtime make-instance
+             ;; fn does this, but the compiled expansion bypasses it, so call
+             ;; the designator-accepting validator here.  The initarg VALUE
+             ;; forms may have side effects (order-of-evaluation tests), so
+             ;; bind the plist ONCE into %clos-mi-initargs and reuse it for
+             ;; both validation and the spread — never re-evaluate.
+             ;; Bind the class designator ONCE too — class-arg may have
+             ;; side effects ((prog1 'name (incf i)) in make-instance.order.3),
+             ;; so evaluating it for both %make-instance and validation would
+             ;; double-count.
+             `(let* ((%clos-mi-class ,class-arg)
+                     (%clos-make-instance-tmp (%make-instance %clos-mi-class))
+                     (%clos-mi-initargs (list ,@rewritten-args))
+                     (*clos-applying-defaults* t))
+                (%clos-validate-initargs-d %clos-mi-class %clos-mi-initargs)
                 (%shared-init-default-spread
-                  (list %clos-make-instance-tmp t ,@rewritten-args))
+                  (cons %clos-make-instance-tmp (cons t %clos-mi-initargs)))
                 %clos-make-instance-tmp)))))
 
     ;; (slot-value obj slot) → (slot-value obj slot) — already defined at runtime

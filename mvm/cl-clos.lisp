@@ -932,30 +932,63 @@
     ((%clos-initarg-to-slot class-name key) t)
     (t nil)))
 
+(defun %clos-validate-initargs-d (class-or-name initargs)
+  "Like %clos-validate-initargs but accepts a class designator (name
+   symbol OR class object).  Used by the compiled make-instance
+   expansion, which may pass a (find-class …) result.  Resolves the
+   class-name, then validates only when the class is registered."
+  (let ((class-name (if (%clos-class-p class-or-name)
+                        (aref class-or-name 1)
+                        class-or-name)))
+    (when (%find-clos-class class-name)
+      (%clos-validate-initargs class-name initargs))))
+
 (defun %clos-validate-initargs (class-name initargs)
   "Validate INITARGS (a plist) for MAKE-INSTANCE on CLASS-NAME.  Signals
    PROGRAM-ERROR for a malformed (odd-length) initarg list, and ERROR for
    an unrecognised initarg keyword unless :allow-other-keys is non-NIL.
    Per CLHS 7.1.2 / 7.1.1."
-  ;; 1. The initarg list must be a proper even-length plist (program-error).
+  ;; 1. The initarg list must be a proper even-length plist.  CLHS 7.1.2:
+  ;; a malformed / odd-length initarg list is a PROGRAM-ERROR
+  ;; (make-instance.error.2), not a plain simple-error.
   (let ((cur initargs) (count 0))
     (loop
       (when (null cur) (return nil))
       (when (not (consp cur))
-        (error "make-instance: malformed initarg list"))
+        (%signal-program-error))
       (setq count (+ count 1))
       (setq cur (cdr cur)))
     (when (not (= 0 (mod count 2)))
-      (error "make-instance: odd number of initarg arguments")))
-  ;; 2. Determine whether :allow-other-keys was supplied non-NIL.
-  (let ((aok nil) (cur initargs))
+      (%signal-program-error)))
+  ;; 2. Determine whether :allow-other-keys is non-NIL.  CLHS 7.1.2: a
+  ;; supplied :allow-other-keys in the CALL takes precedence; if absent
+  ;; from the call, a :default-initargs :allow-other-keys on the class
+  ;; (or an ancestor) supplies it (class-24.2: :nonsense is allowed
+  ;; because the default-initarg sets :allow-other-keys t).  An explicit
+  ;; :allow-other-keys nil in the call overrides the default (class-24.3).
+  (let ((aok nil)
+        (aok-supplied nil)
+        (cur initargs))
     (loop
       (when (null cur) (return nil))
       (when (and (consp (cdr cur))
-                 (%clos-sym-name-eq (car cur) :allow-other-keys)
-                 (cadr cur))
-        (setq aok t))
+                 (%clos-sym-name-eq (car cur) :allow-other-keys))
+        (setq aok-supplied t)
+        (when (cadr cur) (setq aok t)))
       (setq cur (cddr cur)))
+    ;; Not in the call?  Consult the class's combined default-initargs.
+    (when (not aok-supplied)
+      (let ((dis (%clos-default-initargs-for-class class-name)))
+        (let ((dc dis))
+          (loop
+            (when (null dc) (return nil))
+            (let ((entry (car dc)))
+              (when (%clos-sym-name-eq (car entry) :allow-other-keys)
+                ;; entry = (key . thunk); evaluate the thunk for its value.
+                (let ((v (funcall (cdr entry))))
+                  (when v (setq aok t)))
+                (return nil)))
+            (setq dc (cdr dc))))))
     ;; 3. Unless :allow-other-keys, every supplied initarg must be valid.
     (unless aok
       (let ((c2 initargs))
@@ -3326,8 +3359,11 @@
             (setq *%next-methods* saved-nm)
             (setq *%current-gf-args* saved-args)))))))
 
-(defun next-method-p ()
-  "True if there is a next method available."
+(defun next-method-p (&rest args)
+  "True if there is a next method available.  NEXT-METHOD-P takes no
+   arguments (CLHS 7.6.6.2); calling it with any is a program-error
+   (next-method-p.error.1)."
+  (when args (%signal-program-error))
   (not (null *%next-methods*)))
 
 ;;; ============================================================

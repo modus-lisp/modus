@@ -5122,7 +5122,24 @@
          ((eq tn 'readtable)     (readtablep obj))
          ((eq tn 'random-state)  (random-state-p obj))
          ((eq tn 'condition) (%condition-p obj))
-         ((eq tn 'standard-object) (%clos-instance-p obj))
+         ;; A CLOS class object is itself an instance of STANDARD-OBJECT
+         ;; (and CLASS / STANDARD-CLASS / METAOBJECT / T).  CLHS 4.3.7.
+         ((eq tn 'standard-object) (or (%clos-instance-p obj)
+                                       (%clos-class-p obj)))
+         ((eq tn 'class) (%clos-class-p obj))
+         ;; STANDARD-CLASS only for user (defclass) classes — those whose
+         ;; CPL (slot 4) includes STANDARD-OBJECT.  Built-in classes that
+         ;; happen to be registered as %clos-class arrays (e.g. a proxy
+         ;; promoted for PATHNAME) do NOT have STANDARD-OBJECT in their CPL,
+         ;; so they are correctly excluded — prevents
+         ;; all-standard-classes-are-subtypes-of-standard-object from
+         ;; collecting LOGICAL-PATHNAME / PATHNAME.
+         ((eq tn 'standard-class)
+          (and (%clos-class-p obj)
+               (and (member 'standard-object (aref obj 4)) t)))
+         ((eq tn 'built-in-class) nil)
+         ((eq tn 'structure-class) nil)
+         ((eq tn 'metaobject) (%clos-class-p obj))
          ((eq tn 'restart) (%active-restart-p obj))
          (t (cond
               ;; Struct instance — when OBJ is a struct, decide membership

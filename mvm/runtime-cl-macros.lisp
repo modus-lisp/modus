@@ -407,4 +407,19 @@
   ;; every CL external — signals on &REST.  Re-running the export is
   ;; idempotent (only ever promotes :internal -> :external for the
   ;; standard names) and leaves reader / package state otherwise intact.
-  (handler-case (%export-standard-cl-symbols) (t (c) nil)))
+  (handler-case (%export-standard-cl-symbols) (t (c) nil))
+  ;; Advertise the host platform in *features* so ASDF/UIOP's detect-os
+  ;; recognises Modus as a Unix.  The generic (build-generic.lisp) binary
+  ;; runs as a Linux ELF process, so :unix and :linux are accurate.
+  ;; Without :unix, UIOP's os-unix-p returns NIL and detect-os signals
+  ;; "Congratulations for trying ASDF on an operating system that is
+  ;; neither Unix, nor Windows…".  pushnew-style guarded so repeated
+  ;; installs stay idempotent.
+  (handler-case
+      (progn
+        (when (boundp '*features*)
+          (unless (member :unix *features*)
+            (setq *features* (cons :unix *features*)))
+          (unless (member :linux *features*)
+            (setq *features* (cons :linux *features*)))))
+    (t (c) nil)))

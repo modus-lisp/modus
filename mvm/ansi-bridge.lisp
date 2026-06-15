@@ -4162,6 +4162,62 @@
          (%find-clos-class (aref x 1)))
         (t nil))))
 
+;;; TYPE-OF (CLHS) — replaces the prelude NIL stub.  The prelude's
+;;; (defun type-of (obj) nil) made (typep x (type-of x)) NIL for every
+;;; object → type-of.3 collected the whole *universe*, and type-of.6/.7
+;;; returned NIL instead of the struct/class name.  We return a type
+;;; specifier that the OBJECT is a member of (CLHS req 1.a) and that is a
+;;; subtype of its class (req via type-of.4) — leaning on the existing
+;;; most-specific-builtin-class dispatch so the result is always a name
+;;; TYPEP recognises.
+(defun type-of (obj)
+  (cond
+    ((null obj) 'null)
+    ((eq obj t)  'boolean)
+    ;; CLOS instance — proper class name if the name still names the class
+    ;; (find-class round-trips), otherwise the class OBJECT itself
+    ;; (type-of.8 / .9 after (setf (class-name c) nil) / (setf (find-class
+    ;; 'n) nil)).  CLHS 4.3.7: type-of returns the class when it has no
+    ;; proper name.
+    ((%clos-instance-p obj)
+     (let* ((cname (aref obj 1))
+            (cls   (and cname (%find-clos-class cname))))
+       (if (and cls cname (eq (find-class cname nil) cls))
+           cname
+           ;; No proper name — return the class object (class-of).
+           (if cls cls (or cname 'standard-object)))))
+    ;; Struct instance — its struct type name.
+    ((%struct-instance-p obj) (%struct-type-name obj))
+    ;; Condition — its condition type name.
+    ((%condition-p obj) (%condition-type-name obj))
+    ;; A CLOS class object is itself an instance of STANDARD-CLASS.
+    ((%clos-class-p obj) 'standard-class)
+    ;; Integers: CLHS says an (integer low high) spec is fine, but a bare
+    ;; recognisable supertype name also satisfies req 1.a + the subtypep
+    ;; checks.  Use FIXNUM / BIGNUM (TYPEP accepts both as INTEGER here).
+    ((fixnump obj)
+     (cond ((or (eql obj 0) (eql obj 1)) 'bit)
+           (t 'fixnum)))
+    ((ratiop obj)      'ratio)
+    ((floatp-impl obj) 'single-float)
+    ((%complex-p obj)  'complex)
+    ((characterp obj)
+     ;; standard-char for the printing ASCII range, else character.
+     (let ((code (char-code obj)))
+       (if (and (>= code 32) (< code 127)) 'standard-char 'character)))
+    ((stringp obj) (list 'simple-base-string (length obj)))
+    ((%generic-function-p obj) 'standard-generic-function)
+    ((functionp obj) 'function)
+    ((consp obj) 'cons)
+    ((hash-table-p obj) 'hash-table)
+    ((packagep obj) 'package)
+    ((readtablep obj) 'readtable)
+    ((random-state-p obj) 'random-state)
+    ((symbolp obj) (if (keywordp obj) 'keyword 'symbol))
+    ((vectorp obj) 'simple-vector)
+    ((arrayp obj) 'array)
+    (t t)))
+
 ;;; SLOT-VALUE — strict 2-arg arity
 (defun slot-value (obj slot-name &rest extra)
   (if extra

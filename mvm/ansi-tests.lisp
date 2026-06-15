@@ -2535,7 +2535,19 @@
   ;; Test read-from-string returns position
   (deftest 9999
     (multiple-value-list (read-from-string "123  "))
-    (list 123 4)))
+    (list 123 4))
+  ;; type-of regression locks (CLHS 4.3.7 / type-of.3): every object is of
+  ;; its own type-of, and key scalars report a recognisable type name.
+  (deftest 8620 (notnot (typep nil (type-of nil))) t)
+  (deftest 8621 (notnot (typep t (type-of t))) t)
+  (deftest 8622 (notnot (typep 0 (type-of 0))) t)
+  (deftest 8623 (notnot (typep 100 (type-of 100))) t)
+  (deftest 8624 (notnot (typep #\a (type-of #\a))) t)
+  (deftest 8625 (notnot (typep "abc" (type-of "abc"))) t)
+  (deftest 8626 (notnot (typep 1.0 (type-of 1.0))) t)
+  (deftest 8627 (notnot (typep '(1 2) (type-of '(1 2)))) t)
+  (deftest 8628 (notnot (typep 'foo (type-of 'foo))) t)
+  (deftest 8629 (type-of nil) 'null))
 
 ;;; Regression: &key parameter handling (compiler.lisp preprocess-params).
 ;;; Pre-fix nunion-with-copy (x y &key test test-not) compiled as if its

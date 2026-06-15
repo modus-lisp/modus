@@ -1447,6 +1447,21 @@
           %dmc-cargs)))
       ,(length group-specs))))
 
+(defun %pplb-body-iterates-p (forms)
+  "T if FORMS (the original, not-yet-rewritten body of a
+   pprint-logical-block) reference pprint-pop or
+   pprint-exit-if-list-exhausted anywhere in their tree.  Used to pick
+   between the simple (prefix/body/suffix) and full (begin/catch/end)
+   expansions."
+  (cond
+    ((symbolp forms)
+     (or (eq forms 'pprint-pop)
+         (eq forms 'pprint-exit-if-list-exhausted)))
+    ((consp forms)
+     (or (%pplb-body-iterates-p (car forms))
+         (%pplb-body-iterates-p (cdr forms))))
+    (t nil)))
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -1571,6 +1586,12 @@
     ;; bound, (c) suffix is written, (d) when body is empty, the list-arg is
     ;; written.  That's enough to pass PPRINT-LOGICAL-BLOCK.1..N which were
     ;; failing previously because the rewriter dropped everything but body.
+    ;; Real implementation: each logical block establishes a CATCH '%pp-tag
+    ;; frame plus dynamic state (*%pp-list* / *%pp-count* / *%pp-stream* /
+    ;; *%pp-listp* / *%pp-level*) that the runtime helpers %pprint-pop-fn and
+    ;; %pprint-exit-fn read.  pprint-pop / pprint-exit-if-list-exhausted are
+    ;; expanded to those helpers (below).  Honors *print-level* ("#") and
+    ;; *print-length* ("...").  See cl-printer.lisp for the helpers.
     ((and (eq (car form) 'pprint-logical-block)
           (cdr form) (consp (cadr form)))
      (let* ((binding (cadr form))
@@ -1578,28 +1599,79 @@
             (list-arg (rewrite-reader-forms (second binding)))
             (kwlist (cddr binding))
             (body (mapcar #'rewrite-reader-forms (cddr form)))
-            (prefix nil) (suffix nil))
+            (prefix nil) (per-line nil) (suffix nil)
+            (have-prefix nil) (have-per-line nil))
        (let ((kw kwlist))
          (loop (when (or (null kw) (null (cdr kw))) (return))
            (let ((k (car kw)) (v (rewrite-reader-forms (cadr kw))))
-             (cond ((eq k :prefix) (setq prefix v))
-                   ((eq k :per-line-prefix) (setq prefix v))
+             (cond ((eq k :prefix) (setq prefix v have-prefix t))
+                   ((eq k :per-line-prefix) (setq per-line v have-per-line t))
                    ((eq k :suffix) (setq suffix v))))
            (setq kw (cddr kw))))
        (let ((stream-expr (cond ((null stream-raw) '*standard-output*)
                                 ((eq stream-raw t) '*terminal-io*)
-                                (t stream-raw))))
-         `(progn
-            ,@(when prefix `((write-string ,prefix ,stream-expr)))
-            ,@(or body `((write ,list-arg :stream ,stream-expr)))
-            ,@(when suffix `((write-string ,suffix ,stream-expr)))
-            nil))))
-    ;; (pprint-exit-if-list-exhausted) → stub
+                                (t stream-raw)))
+             (svar (gensym "PPS")))
+         ;; CLHS: supplying BOTH :prefix and :per-line-prefix is an error.
+         ;; %pprint-lb-begin pushes block state on *%pp-ctx*; the body runs
+         ;; inside CATCH '%pp-tag (so pprint-pop / pprint-exit can escape it);
+         ;; %pprint-lb-end writes the suffix and pops — balanced on both
+         ;; normal and thrown exit.  *print-level* depth = (length *%pp-ctx*)
+         ;; at block entry → "#" when it meets/exceeds *print-level*.
+         ;; Does the body iterate the block list?  (pprint-pop /
+         ;; pprint-exit-if-list-exhausted appear in the ORIGINAL, not-yet-
+         ;; rewritten body — they're rewritten to %pprint-pop-fn /
+         ;; %pprint-exit-fn.)  Only then do we need the begin/catch/end
+         ;; state machine.  The simple branch (write prefix; body; write
+         ;; suffix) is far less code, so it compiles cleanly even deep
+         ;; inside the giant per-file run-ansi-FOO function.
+         (let ((iterates (%pplb-body-iterates-p (cddr form))))
+           (if (and have-prefix have-per-line)
+               `(error "pprint-logical-block: both :prefix and :per-line-prefix supplied")
+               (if iterates
+                   ;; Full state-machine form.
+                   `(let ((,svar (%resolve-output-stream ,stream-expr)))
+                      (declare (special *print-level*))
+                      (if (let ((lvl *print-level*))
+                            (and lvl (integerp lvl) (>= (length *%pp-ctx*) lvl)))
+                          (write-string "#" ,svar)
+                          (let ((,svar (%pprint-lb-begin
+                                        ,svar ,list-arg
+                                        ,(if have-prefix prefix nil)
+                                        ,(if have-per-line per-line nil))))
+                            (catch '%pp-tag
+                              ,@(or body `((write ,list-arg :stream ,svar))))
+                            (%pprint-lb-end ,svar ,suffix)))
+                      nil)
+                   ;; Simple form: write prefix, run body, write suffix —
+                   ;; deliberately as close to the old lean stub as possible
+                   ;; (raw stream, no helper calls / LET / DECLARE) so it
+                   ;; compiles cleanly deep inside the giant per-file
+                   ;; run-ansi-FOO function.  CLHS: prefix/suffix omitted when
+                   ;; the block object is not a list — guarded inline by
+                   ;; %pp-list-arg-p.  *print-level* "#" truncation: depth is
+                   ;; tracked by %pp-level-deep-p / a bump of *%pp-level*
+                   ;; around the body (setq save/restore keeps it lean).
+                   `(if (%pp-level-deep-p)
+                        (write-string "#" ,stream-expr)
+                        (progn
+                          (setq *%pp-level* (+ 1 (or *%pp-level* 0)))
+                          ,@(when (or have-prefix have-per-line)
+                              `((when (%pp-list-arg-p ,list-arg)
+                                  (write-string ,(if have-prefix prefix per-line)
+                                                ,stream-expr))))
+                          ,@(or body `((write ,list-arg :stream ,stream-expr)))
+                          ,@(when suffix
+                              `((when (%pp-list-arg-p ,list-arg)
+                                  (write-string ,suffix ,stream-expr))))
+                          (setq *%pp-level* (- (or *%pp-level* 1) 1))
+                          nil))))))))
+    ;; (pprint-exit-if-list-exhausted) → runtime helper (throws to %pp-tag)
     ((and (eq (car form) 'pprint-exit-if-list-exhausted) (null (cdr form)))
-     nil)
-    ;; (pprint-pop) → (pop *pprint-list*)
+     '(%pprint-exit-fn))
+    ;; (pprint-pop) → runtime helper
     ((and (eq (car form) 'pprint-pop) (null (cdr form)))
-     nil)
+     '(%pprint-pop-fn))
     ;; (setf (readtable-case rt) val) → (%set-readtable-case rt val)
     ((and (eq (car form) 'setf)
           (consp (cdr form))

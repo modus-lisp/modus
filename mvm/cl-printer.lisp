@@ -1339,6 +1339,147 @@
     (%write-char-to-stream 32 stream)  ; trailing space
     obj))
 
+;;; ============================================================
+;;; Pretty-printer core: pprint-logical-block / pprint-pop /
+;;; pprint-exit-if-list-exhausted machinery.
+;;;
+;;; The innermost block's state lives at the head of *%pp-ctx*, a
+;;; stack of state arrays #(stream list count listp).  The
+;;; pprint-logical-block macro (expanded by the build-side rewriter
+;;; in build-ansi-test.lisp) calls %pprint-lb-begin to push a fresh
+;;; state, runs the body inside a CATCH '%pp-tag, then calls
+;;; %pprint-lb-end to pop — so there is no fragile rebinding of
+;;; multiple non-CLHS specials.  pprint-pop / pprint-exit read the
+;;; head state via the helpers below.
+;;;
+;;;   state slot 0  resolved output stream
+;;;   state slot 1  remaining list being iterated by pprint-pop
+;;;   state slot 2  number of elements already popped (or :DONE for atoms)
+;;;   state slot 3  T when the block object was a list (vs atom)
+;;; ============================================================
+
+(defvar *%pp-ctx* nil)    ; stack of block-state arrays
+(defvar *%pp-level* 0)    ; current nesting depth (for *print-level*)
+
+(defun %pp-check-string (x)
+  "Signal a type-error unless X is a string (or NIL, meaning default)."
+  (when (and x (not (stringp x)))
+    (%signal-type-error))
+  x)
+
+(defun %pp-list-arg-p (obj)
+  "T if OBJ is a proper-or-dotted list (cons) or NIL — i.e. pprint-pop
+   should iterate it.  A non-list object is written as-is by the block
+   and pprint-pop returns it once."
+  (or (null obj) (consp obj)))
+
+(defun %pp-level-deep-p ()
+  "T when the current logical-block nesting depth (*%pp-level*) has met
+   or exceeded *print-level* — i.e. this block prints as '#'."
+  (declare (special *print-level*))
+  (let ((lvl *print-level*)
+        (d (or *%pp-level* 0)))
+    (and lvl (integerp lvl) (>= d lvl))))
+
+(defun %pplb-write-prefix (stream obj prefix per-line-prefix)
+  "Simple-form prefix writer.  CLHS: the prefix/suffix are written only
+   when OBJ is a list (cons or NIL); for a non-list OBJ they are omitted
+   and OBJ is printed directly.  Always validates the string args."
+  (%pp-check-string prefix)
+  (%pp-check-string per-line-prefix)
+  (when (%pp-list-arg-p obj)
+    (let ((p (or prefix per-line-prefix)))
+      (when (and p (> (length p) 0))
+        (write-string p stream))))
+  nil)
+
+(defun %pplb-write-suffix (stream obj suffix)
+  "Simple-form suffix writer (see %pplb-write-prefix)."
+  (%pp-check-string suffix)
+  (when (and (%pp-list-arg-p obj) suffix (> (length suffix) 0))
+    (write-string suffix stream))
+  nil)
+
+(defun %pprint-lb-begin (stream list prefix per-line-prefix)
+  "Begin a logical block: validate (per-line-)prefix, push a fresh state
+   onto *%pp-ctx*, write the prefix, and return the resolved stream."
+  (%pp-check-string prefix)
+  (%pp-check-string per-line-prefix)
+  (let ((s (%resolve-output-stream stream))
+        (st (make-array 4)))
+    (aset st 0 s)
+    (aset st 1 list)
+    (aset st 2 0)
+    (aset st 3 (%pp-list-arg-p list))
+    (setq *%pp-ctx* (cons st *%pp-ctx*))
+    (let ((p (or prefix per-line-prefix)))
+      (when (and p (> (length p) 0))
+        (write-string p s)))
+    s))
+
+(defun %pprint-lb-end (stream suffix)
+  "End a logical block: write SUFFIX and pop the block state."
+  (%pp-check-string suffix)
+  (when (and suffix (> (length suffix) 0))
+    (write-string suffix stream))
+  (when *%pp-ctx* (setq *%pp-ctx* (cdr *%pp-ctx*)))
+  nil)
+
+(defun %pprint-pop-fn ()
+  "pprint-pop: return the next element of the current logical block's
+   list, honoring *print-length*.  For a non-list block object, return
+   it once.  Writes the dotted '. tail' or '...' marker and throws to
+   %pp-tag when iteration must stop."
+  (declare (special *print-length*))
+  (let ((st (car *%pp-ctx*)))
+    (if (null st)
+        nil
+        (let ((stream (aref st 0))
+              (plen *print-length*))
+          (if (not (aref st 3))
+              ;; Block object was an atom: yield it once.
+              (let ((cnt (aref st 2)))
+                (if (eq cnt :done)
+                    nil
+                    (progn (aset st 2 :done) (aref st 1))))
+              ;; Block object is a (possibly dotted) list.
+              (let ((lst (aref st 1))
+                    (cnt (aref st 2)))
+                (cond
+                  ;; *print-length* exhausted: emit "..." and exit.
+                  ((and plen (integerp plen) (>= cnt plen))
+                   (write-string "..." stream)
+                   (throw '%pp-tag nil))
+                  ;; Proper end of list: nothing left.
+                  ((null lst) nil)
+                  ;; Dotted tail: write " . <atom>" and exit.
+                  ((not (consp lst))
+                   (write-string " . " stream)
+                   (%write-obj lst stream nil t)
+                   (throw '%pp-tag nil))
+                  ;; Normal element.
+                  (t
+                   (aset st 1 (cdr lst))
+                   (aset st 2 (+ cnt 1))
+                   (car lst)))))))))
+
+(defun %pprint-exit-fn ()
+  "pprint-exit-if-list-exhausted: throw to %pp-tag when the current
+   block's list is exhausted, or *print-length* reached (emitting
+   '...').  Returns NIL otherwise."
+  (declare (special *print-length*))
+  (let ((st (car *%pp-ctx*)))
+    (when (and st (aref st 3))
+      (let ((lst (aref st 1))
+            (cnt (aref st 2))
+            (plen *print-length*))
+        (cond
+          ((null lst) (throw '%pp-tag nil))
+          ((and plen (integerp plen) (>= cnt plen))
+           (write-string "..." (aref st 0))
+           (throw '%pp-tag nil))))))
+  nil)
+
 (defun pprint (obj &rest stream-arg)
   "Pretty-print OBJ (stub: same as prin1 + newline)."
   (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))

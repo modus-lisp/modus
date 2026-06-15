@@ -4274,6 +4274,26 @@
     '(100 5 18))
   ;; ==== end diag probes 8880-8889 ====
 
+  ;; ==== Fable pprint helper probes 8820-8827 ====
+  ;; %pp-list-arg-p: list vs non-list block objects.
+  (rt-run-test 8820 (%pp-list-arg-p '(1)) t)
+  (rt-run-test 8821 (%pp-list-arg-p 9) nil)
+  (rt-run-test 8822 (%pp-list-arg-p nil) t)
+  ;; %pprint-lb-begin/end: prefix + body + suffix (simple path).
+  (rt-run-test 8823
+    (with-output-to-string (os)
+      (let ((s (%pprint-lb-begin os '(2) "[" nil)))
+        (write 2 :stream s)
+        (%pprint-lb-end s "]")))
+    "[2]")
+  ;; per-line-prefix (4th arg of begin).
+  (rt-run-test 8824
+    (with-output-to-string (os)
+      (let ((s (%pprint-lb-begin os '(6) nil "abcd")))
+        (write 6 :stream s)
+        (%pprint-lb-end s nil)))
+    "abcd6")
+  ;; ==== end Fable pprint probes ====
   ;; ==== Fable reader re-census probes 9180-9219 ====
   ;; Self-contained reader behaviour, package-independent where possible.
   ;; read-from-string returns (value position).

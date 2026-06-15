@@ -3504,6 +3504,44 @@
   (setq boole-orc2 15)
   t)
 
+(defun %cl-constant-variable-name-p (name)
+  "T if NAME (a string) names one of CL's standard constant variables
+   (CLHS Figure 3-2 + the BOOLE-* set).  Used by the constantp override
+   below so (constantp 'boole-and) → T per CLHS (these symbols name
+   defconstants, but Modus declares them with defvar and has no
+   defconstant registry that constantp can consult)."
+  (or (string= name "BOOLE-1") (string= name "BOOLE-2")
+      (string= name "BOOLE-AND") (string= name "BOOLE-ANDC1")
+      (string= name "BOOLE-ANDC2") (string= name "BOOLE-C1")
+      (string= name "BOOLE-C2") (string= name "BOOLE-CLR")
+      (string= name "BOOLE-EQV") (string= name "BOOLE-IOR")
+      (string= name "BOOLE-NAND") (string= name "BOOLE-NOR")
+      (string= name "BOOLE-ORC1") (string= name "BOOLE-ORC2")
+      (string= name "BOOLE-SET") (string= name "BOOLE-XOR")))
+
+(defun constantp (form &rest env)
+  "True if FORM is a constant per CLHS.  Extends the cl-packages.lisp
+   version (this defun wins via last-defun load order) to also recognise
+   the symbols that name CL's standard constant variables — without this,
+   (constantp 'boole-and) returned NIL because Modus tracks defconstant
+   only as plain defvars."
+  (declare (ignore env))
+  (cond
+    ((null form) t)              ; NIL
+    ((eq form t) t)              ; T
+    ((numberp form) t)
+    ((characterp form) t)
+    ((stringp form) t)
+    ((keywordp form) t)          ; native keyword (subtag #x53)
+    ((symbolp form)
+     (if (%cl-sym-p form)
+         (or (keywordp form)
+             (%cl-constant-variable-name-p (symbol-name form)))
+         ;; Native MVM symbol: match by name too.
+         (%cl-constant-variable-name-p (symbol-name form))))
+    ((and (consp form) (eq (car form) 'quote)) t)
+    (t nil)))
+
 (defun boole (op a b)
   "Perform bitwise logical operation OP on integers A and B."
   (cond

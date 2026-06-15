@@ -2551,7 +2551,26 @@
   (deftest 8640 (notnot (floatp-impl 1.0)) t)
   (deftest 8641 (notnot (complexp (coerce 1.0 'complex))) t)
   (deftest 8642 (realpart (coerce 1.0 'complex)) 1.0)
-  (deftest 8643 (floatp-impl (imagpart (coerce 1.0 'complex))) t))
+  (deftest 8643 (floatp-impl (imagpart (coerce 1.0 'complex))) t)
+  ;; deftype expansion probes
+  (deftest 8650
+    (progn (eval '(deftype my-small () '(integer 0 10)))
+           (notnot (typep 5 'my-small)))
+    t)
+  (deftest 8651
+    (progn (eval '(deftype my-small2 () '(integer 0 10)))
+           (typep 20 'my-small2))
+    nil)
+  ;; Parameterized user deftype expansion in TYPEP (non-backquote body —
+  ;; backquote-in-runtime-eval is a separate cl-eval gap).
+  (deftest 8652
+    (progn (eval '(deftype my-rng2 (x) (list 'integer 0 x)))
+           (notnot (typep 3 '(my-rng2 4))))
+    t)
+  (deftest 8653
+    (progn (eval '(deftype my-rng3 (x) (list 'integer 0 x)))
+           (typep 9 '(my-rng3 4)))
+    nil))
 
 ;;; Regression: &key parameter handling (compiler.lisp preprocess-params).
 ;;; Pre-fix nunion-with-copy (x y &key test test-not) compiled as if its

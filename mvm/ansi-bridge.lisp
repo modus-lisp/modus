@@ -5112,6 +5112,36 @@
 ;;; stream-subtype clauses inserted at the top of the symbol-name branch.
 ;;; cl-streams.lisp owns the predicates (STRING-STREAM-P etc).
 
+;;; ---- user DEFTYPE expansion ----------------------------------------
+;;; Runtime (eval '(deftype NAME (params) body)) stores (params . body)
+;;; in *%runtime-deftype-table* keyed by the upcased NAME string (see
+;;; cl-eval.lisp).  TYPEP / SUBTYPEP did not consult it, so a user
+;;; deftype used as a type specifier always fell through to NIL/unknown.
+;;; %expand-deftype binds the deftype params (a full lambda-list with
+;;; &optional/&key) to the *unevaluated* type arguments and evaluates the
+;;; body to the expanded type specifier, which the caller re-checks.
+(defun %deftype-lookup (head)
+  "If HEAD names a user deftype, return its (params . body); else NIL."
+  (and *%runtime-deftype-table*
+       (symbolp head)
+       (let ((nm (%eval-sym-name head)))
+         (and nm (gethash nm *%runtime-deftype-table*)))))
+
+(defun %expand-deftype (type)
+  "Expand a user-deftype TYPE specifier (symbol or (name arg…)) to its
+   underlying type specifier, or NIL if TYPE is not a user deftype."
+  (let* ((head (if (consp type) (car type) type))
+         (args (if (consp type) (cdr type) nil))
+         (entry (%deftype-lookup head)))
+    (if (null entry)
+        nil
+        (let* ((params (car entry))
+               (body   (cdr entry))
+               ;; Bind params to the *unevaluated* type args.  &optional
+               ;; defaults and &key all flow through %bind-params.
+               (env (%bind-params params args nil)))
+          (%eval-progn body env)))))
+
 (defun typep (obj type)
   (when (or (eq type 'values)
             (and (consp type)
@@ -5254,6 +5284,10 @@
                                (t nil))
                          (setq found t) (return found)))
                      (setq c (cdr c))))))
+              ;; User DEFTYPE name used as an atomic type specifier —
+              ;; expand it and re-check (deftype.7/.9+ define (sym) types).
+              ((%deftype-lookup tn)
+               (typep obj (%expand-deftype tn)))
               (t nil))))))
     ((%class-proxy-p type)
      (typep obj (%class-proxy-name type)))
@@ -5463,6 +5497,10 @@
                           (typep (car obj) car-type))
                       (or (null cdr-type) (eq cdr-type '*) (eq cdr-type t)
                           (typep (cdr obj) cdr-type))))))
+         ;; Compound user DEFTYPE — (deftype-name arg…); expand with the
+         ;; args bound and re-check (deftype.9-.18 parameterized types).
+         ((%deftype-lookup head)
+          (typep obj (%expand-deftype type)))
          (t (if (%cond-reg-find head)
                 (%condition-typep obj head)
                 nil)))))))

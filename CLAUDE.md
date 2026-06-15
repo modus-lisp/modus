@@ -389,7 +389,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## Known Bugs
 
-### Mutable Closures — Global Cell Limitation (MOSTLY resolved; context-sensitive residual)
+### Mutable Closures — Global Cell Limitation (RESOLVED)
 
 This is FIXED (verified 2026-06-13, probes 9740-9744). `compile-let`/`compile-let*`
 now allocate each captured+mutated variable's cell as a **local `let`-binding**
@@ -404,15 +404,28 @@ across closures from one source lambda. Replaced by the let-binding scheme in an
 undocumented prior commit; the map-into cluster fails that were blamed on this are
 actually `cl-sequences.lisp` fill-pointer / bit-vector-store bugs.)
 
-**CONTEXT-SENSITIVE RESIDUAL (2026-06-15):** the cell-box is NOT shared between
-sibling closures in SOME compilation contexts.  Reproducer: `(let ((warned nil))
-(handler-bind ((warning (lambda (c) (setf warned t) (muffle-warning c)))) (warn
-"x")) warned)` compiles CORRECTLY in run-regression-tests but WRONG in the
-auto-generated `run-ansi-warn-chunk-1` (handler + body get different `%CELL-WARNED`
-boxes).  Causes warn.lsp 8/19 (WARN.1-11/.19).  NOT funcall-NOP layout (fuzz=8
-identical).  Fix needs `compile-let`/`vars-mutated-in-lambdas` IR dump comparison
-between the two contexts.  A correctness bug beyond warn (any chunk with
-handler-mutates-captured-var).
+**The "context-sensitive residual" hypothesis was WRONG (disproven 2026-06-15,
+fixed in 3c034b8).**  The warn cluster's 8/19 was NEVER a cell-capture bug.
+Driving the real compiler in SBCL on both the standalone form and the 2-sibling
+chunk shape shows the handler closure captures `%CELL-WARNED` CORRECTLY in both
+(`captured=(%CELL-WARNED)`, `env-has-cell=T` both).  The actual defect was a
+RUNTIME handler-bind state leak crossing the harness's per-file forks: an
+escaping handler (return-from/throw/muffle — the throw-from-handler probes
+9523/9526) skips both `%signal-condition`'s skip/walk-depth restore AND
+`%with-handler-bind`'s frame pop; the leaked frame keeps `*handler-bind-stack*`
+non-null, which blocks `%heal-handler-bind-skip` (it only rewinds skip on a NULL
+stack), so elevated skip silently inhibits the next signal's leading handler
+frames.  A custom probe escaping a handler in the PARENT process poisons every
+subsequently-forked ANSI file → warn.1 (the FIRST warn test) fails on an
+apparently-clean slate.  The runtime-data tell: failures were the LEADING block
+(warn.1-11) with later tests passing — the opposite of a cascade, and warn.3
+PRINTED instead of muffling (handler never ran).  Fix: `%reset-signal-state` at
+each `run-test`/`run-test-mv` boundary (per-test isolation).  Gate: warn 8->18,
+conditions band +23, zero regressions, 9xxx probes bit-identical.  The proper
+escape-safe pop in `%with-handler-bind` remains blocked by the open 9525
+unwind-protect+%nlx-throw SIGSEGV, so REAL programs (not just the test harness)
+can still hit the leak after an escaping handler — that's the residual, a
+condition-system robustness bug, NOT a compiler cell-capture bug.
 
 ### Vector-literal symbol elements (FIXED)
 

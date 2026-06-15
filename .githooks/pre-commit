@@ -1,0 +1,22 @@
+#!/bin/sh
+# Reject staged additions whose pathnames contain bytes outside printable
+# ASCII.  Such names (e.g. the stray probe scratch files with 0x82/0x02 bytes
+# accidentally committed in 9996380) are invalid UTF-8 and cannot be checked
+# out on macOS (APFS/HFS+ require valid UTF-8 filenames), breaking the repo
+# for anyone on a Mac.  See CLAUDE.md / repo history.
+
+# -z gives NUL-separated, UNQUOTED (raw-byte) pathnames so we can inspect them.
+bad=$(git diff --cached --name-only -z --diff-filter=AR \
+      | tr '\0' '\n' \
+      | LC_ALL=C grep -nP '[^\x20-\x7e]')
+
+if [ -n "$bad" ]; then
+    echo "pre-commit: refusing to commit pathname(s) with non-printable-ASCII bytes:" >&2
+    echo "$bad" | LC_ALL=C sed 's/[^[:print:]]/?/g' >&2
+    echo "" >&2
+    echo "These names are typically invalid UTF-8 and break checkout on macOS." >&2
+    echo "If this is a stray test/probe artifact, delete it; do not commit it." >&2
+    exit 1
+fi
+
+exit 0

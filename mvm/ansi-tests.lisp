@@ -1384,6 +1384,13 @@
         (setq i (+ i 1))))))
 
 (defun run-regression-tests ()
+  ;; 8420-8429 — compile-time #nA array literal in quoted data must
+  ;; rebuild a real MDA (subtag #x34), not garbage.  Root cause of the
+  ;; bit-and/bit-ior 2D cluster: compile-quote's MDA branch (compiler.lisp).
+  (deftest 8420 (aref (make-array '(2 2) :element-type 'bit :initial-element 0) 0 0) 0)
+  (deftest 8427 (if (%mda-p (car '(#2a((0 1)(0 1))))) t nil) t)
+  (deftest 8428 (write-to-string (car '(#2a((0 1)(0 1))))) "#2A((0 1) (0 1))")
+  (deftest 8429 (let ((x '(#2a((0 1)(0 1))))) (if (consp x) (if (%mda-p (car x)) :mda (car x)) :notcons)) :mda)
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)

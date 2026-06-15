@@ -4034,11 +4034,49 @@
          (unless (= dest arr-slot)
            (emit-ir :mov dest arr-slot))
          (free-temp-reg))))
+    ;; Multi-dim (rank /= 1) or 0-rank array literal (e.g. #2A((0 1)(0 1))
+    ;; read by the SBCL host reader).  The (vectorp value) branch above
+    ;; only handles rank-1 vectors; a rank-2+ SBCL array falls through to
+    ;; the constant-table branch which can't serialize it into a Modus
+    ;; MDA — the quoted expected `'(#2A(...) ...)` then evaluates to
+    ;; garbage (0), failing every bit-array / 2D-array ANSI test whose
+    ;; expected values contain a #nA literal.  Rewrite the SBCL array
+    ;; into a (make-array DIMS :initial-contents NESTED [:element-type bit])
+    ;; form and compile it through the proven runtime make-array/%alloc-mda
+    ;; path (probes 8420-8429).  This produces a real subtag-#x34 MDA that
+    ;; rt-equal compares element-wise against the runtime bit-op result.
+    ((arrayp value)
+     (let* ((dims (array-dimensions value))
+            (bit-p (subtypep (array-element-type value) 'bit))
+            (contents (%quote-array->nested-contents value)))
+       (compile-form
+        (if bit-p
+            `(make-array ',dims :element-type 'bit :initial-contents ',contents)
+            `(make-array ',dims :initial-contents ',contents))
+        nil dest)))
     ;; Other: use constant table
     (t
      (let ((idx (length *constant-table*)))
        (push value *constant-table*)
        (emit-ir :li-const dest idx)))))
+
+(defun %quote-array->nested-contents (arr)
+  "Convert a (possibly multi-dimensional) host (SBCL) array into a nested
+   list of its elements in row-major order, shaped to match
+   ARRAY-DIMENSIONS.  Used by compile-quote to rebuild an MDA literal via
+   make-array's :initial-contents.  Rank 0 → the lone scalar element."
+  (let ((dims (array-dimensions arr)))
+    (labels ((build (idx-prefix remaining-dims)
+               (if (null remaining-dims)
+                   ;; Fully indexed — fetch the scalar element.
+                   (apply #'aref arr idx-prefix)
+                   (let ((n (car remaining-dims)) (acc nil))
+                     (dotimes (i n)
+                       (push (build (append idx-prefix (list i))
+                                    (cdr remaining-dims))
+                             acc))
+                     (nreverse acc)))))
+      (build nil dims))))
 
 ;;; ============================================================
 ;;; Handler-Case (setjmp/longjmp error catching)

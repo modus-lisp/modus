@@ -1387,6 +1387,38 @@
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)
+  ;; ----------------------------------------------------------------
+  ;; Probes 8980-8981: prove the RUNTIME-EVAL path resolves a let-bound
+  ;; VARIABLE passed to make-package / find-package, instead of treating
+  ;; it as a literal designator.  print-symbols 22207/22212/22213 fail
+  ;; NOT because of cl-eval but because the build-time
+  ;; rewrite-package-iteration (build-ansi-test.lisp ~L942) stringifies
+  ;; the bare variable `pkg-name` into the string "PKG-NAME" BEFORE
+  ;; compilation — so the generated thunk makes a package literally named
+  ;; "PKG-NAME".  These probes route through (eval '...) → cl-eval's
+  ;; %eval-funcall → %eval-args, which DOES evaluate the variable in the
+  ;; let env, so they PASS — isolating the defect to the harness rewriter,
+  ;; not cl-eval.  (Placed before 9050; a pre-existing uncatchable abort
+  ;; between 9030 and 9050 stops later deftests in this runner from firing.)
+  ;;
+  ;; NB: the write-to-string :gensym / package-qualifier behaviour these
+  ;; print-symbols tests also exercise is a cl-printer.lisp matter, not
+  ;; cl-eval — verified identical COMPILED vs EVAL (both drop #:/qualifier
+  ;; under :escape nil / :gensym t).  Owned by the printer seat.
+  (deftest 8980
+    (handler-case
+        (eval '(let ((n "RT-PKG-PROBE-8980"))
+                 (let ((p (make-package n)))
+                   (prog1 (package-name p) (delete-package n)))))
+      (t (c) :CRASHED))
+    "RT-PKG-PROBE-8980")
+  (deftest 8981
+    (handler-case
+        (eval '(let ((n "RT-PKG-PROBE-8981"))
+                 (let ((p (make-package n)))
+                   (prog1 (notnot (find-package n)) (delete-package p)))))
+      (t (c) :CRASHED))
+    t)
   ;; Probes for find-if + :from-end (find-if-list.4 reports 2; should be 6).
   (deftest 9700 (find-if #'evenp '(1 2 4 8 3 1 6 7) :from-end t) 6)
   (deftest 9701 (find-if #'evenp '(1 2 4 8 3 1 6 7)) 2)

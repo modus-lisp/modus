@@ -173,12 +173,34 @@
                   (cons a d)))
             tree))))
 
-(defun mapl (fn list)
-  (let ((cur list))
-    (loop
-      (when (null cur) (return list))
-      (funcall fn cur)
-      (setq cur (cdr cur)))))
+(defun mapl (fn list &rest more-lists)
+  "ANSI variadic MAPL: call FN on successive sublists (tails) of the lists,
+   for side effects; return the first LIST.  Fast paths for 1/2/3 lists
+   avoid apply-of-rest fragility (mirrors mapcar)."
+  (cond
+    ((null more-lists)
+     (let ((cur list))
+       (loop
+         (when (null cur) (return list))
+         (funcall fn cur)
+         (setq cur (cdr cur)))))
+    ((null (cdr more-lists))
+     (let ((c1 list) (c2 (car more-lists)))
+       (loop
+         (when (or (null c1) (null c2)) (return list))
+         (funcall fn c1 c2)
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)))))
+    ((null (cddr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (c3 (cadr more-lists)))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return list))
+         (funcall fn c1 c2 c3)
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    (t (let ((lists (cons list more-lists)))
+         (loop
+           (when (some #'null lists) (return list))
+           (apply fn lists)
+           (setq lists (mapcar1 #'cdr lists)))))))
 
 (defun mapcon (fn list &rest more-lists)
   "ANSI variadic mapcon. Fast paths for 1/2/3 lists avoid apply-of-rest
@@ -246,12 +268,63 @@
            (setq result (nconc result r)))
          (setq lists (mapcar1 #'cdr lists)))))))
 
-(defun maplist (fn list)
-  (let ((result nil) (cur list))
-    (loop
-      (when (null cur) (return (nreverse result)))
-      (setq result (cons (funcall fn cur) result))
-      (setq cur (cdr cur)))))
+(defun maplist (fn list &rest more-lists)
+  "ANSI variadic MAPLIST: collect (FN sublist1 sublist2 ...) over successive
+   tails.  Fast paths for 1/2/3 lists avoid apply-of-rest fragility."
+  (cond
+    ((null more-lists)
+     (let ((result nil) (cur list))
+       (loop
+         (when (null cur) (return (nreverse result)))
+         (setq result (cons (funcall fn cur) result))
+         (setq cur (cdr cur)))))
+    ((null (cdr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2)) (return (nreverse result)))
+         (setq result (cons (funcall fn c1 c2) result))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)))))
+    ((null (cddr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (c3 (cadr more-lists)) (result nil))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return (nreverse result)))
+         (setq result (cons (funcall fn c1 c2 c3) result))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    (t (let ((result nil) (lists (cons list more-lists)))
+         (loop
+           (when (some #'null lists) (return (nreverse result)))
+           (setq result (cons (apply fn lists) result))
+           (setq lists (mapcar1 #'cdr lists)))))))
+
+;; Variadic MAPC override (prelude.lisp defines a single-list version;
+;; cl-sequences loads later so this wins).  Calls FN on successive
+;; elements of all lists for side effects; returns the first LIST.
+;; Iteration stops at the shortest list.  Fast paths for 1/2/3 lists.
+(defun mapc (fn list &rest more-lists)
+  (cond
+    ((null more-lists)
+     (let ((cur list))
+       (loop
+         (when (null cur) (return list))
+         (funcall fn (car cur))
+         (setq cur (cdr cur)))))
+    ((null (cdr more-lists))
+     (let ((c1 list) (c2 (car more-lists)))
+       (loop
+         (when (or (null c1) (null c2)) (return list))
+         (funcall fn (car c1) (car c2))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)))))
+    ((null (cddr more-lists))
+     (let ((c1 list) (c2 (car more-lists)) (c3 (cadr more-lists)))
+       (loop
+         (when (or (null c1) (null c2) (null c3)) (return list))
+         (funcall fn (car c1) (car c2) (car c3))
+         (setq c1 (cdr c1)) (setq c2 (cdr c2)) (setq c3 (cdr c3)))))
+    (t (let ((lists (cons list more-lists)))
+         (loop
+           (when (some #'null lists) (return list))
+           (apply fn (mapcar1 #'car lists))
+           (setq lists (mapcar1 #'cdr lists)))))))
 
 (defun %resolve-fn (v)
   "If V is a symbol, return its symbol-function (so e.g. :test 'equal

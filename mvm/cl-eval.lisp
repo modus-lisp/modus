@@ -1094,19 +1094,73 @@
      (apply #'values (cdr val)))
     (t val)))
 
+(defun %eval-escape-snapshot ()
+  "Return the current *%eval-escape-stack* cons as a snapshot marker.
+   Capture this BEFORE evaluating a construct's body; pass it to
+   %eval-escape-unwind on the error-reraise path so any descriptor
+   pushed-but-not-consumed during the failed body eval is discarded.
+
+   Why this is safe: an escape (RETURN-FROM/RETURN/GO/THROW) pushes a
+   descriptor and IMMEDIATELY signals \"%eval-escape\"; the nearest
+   matching catcher pops it.  So during normal execution the stack only
+   ever holds descriptors at-or-below the dynamically enclosing catchers'
+   snapshots.  When a GENUINE (non-escape) error C propagates through a
+   catcher, anything ABOVE that catcher's snapshot is therefore a stale
+   descriptor stranded by an escape whose own catcher was skipped because
+   C unwound past it first.  Truncating back to the snapshot reclaims
+   exactly those strays without disturbing legitimately-pending outer
+   escapes (which live at or below the snapshot)."
+  *%eval-escape-stack*)
+
+(defun %eval-escape-error-p (c)
+  "T iff condition C is the host \"%eval-escape\" SIMPLE-ERROR that the
+   tree-walker uses to lower a non-local exit (RETURN-FROM/GO/THROW/RETURN).
+   When such a condition is in flight, the top-of-*%eval-escape-stack*
+   descriptor is LIVE — an escape heading to an outer catcher — and MUST
+   NOT be reclaimed by %eval-escape-unwind.  Only a GENUINE error
+   propagating past a catcher leaves stranded descriptors to reclaim."
+  (and (%condition-p c)
+       (let ((fc (handler-case (simple-condition-format-control c)
+                   (t (c2) (declare (ignore c2)) nil))))
+         (and (stringp fc) (string= fc "%eval-escape")))))
+
+(defun %eval-escape-unwind (snap c)
+  "When a GENUINE error C (NOT an in-flight %eval-escape) is being
+   re-raised past a catcher, restore *%eval-escape-stack* to SNAP,
+   discarding any descriptors an escape stranded above it while C unwound
+   past that escape's own catcher.  No-op if C IS a live %eval-escape (its
+   descriptor is heading to an outer catcher) or the stack is already
+   at-or-below SNAP."
+  (unless (%eval-escape-error-p c)
+    (let ((cur *%eval-escape-stack*))
+      ;; Walk from the head; if we reach SNAP, the head..SNAP region is
+      ;; the set of strays — drop them by resetting to SNAP.  If we don't
+      ;; reach SNAP (stack already shorter), leave it untouched.
+      (loop
+        (when (eq cur snap)
+          (setq *%eval-escape-stack* snap)
+          (return nil))
+        (when (null cur)
+          ;; SNAP no longer on the stack (it was consumed) — don't grow it
+          ;; back; leave the current (shorter) stack as-is.
+          (return nil))
+        (setq cur (cdr cur))))))
+
 (defun %eval-block (name forms env)
   "Evaluate (block name forms...) with return-from support."
-  (handler-case
-    (%eval-progn forms env)
-    (t (c)
-      (let ((val (%eval-escape-pop-if name)))
-        (if (eq val :%eval-no-escape)
-            ;; Not one of our RETURN-FROM escapes — re-raise the ORIGINAL
-            ;; condition C (a genuine error signalled inside the block) so
-            ;; an outer handler sees its real type/message instead of a
-            ;; masked "%eval-escape".
-            (error c)
-            (%eval-escape-return val))))))
+  (let ((snap (%eval-escape-snapshot)))
+    (handler-case
+      (%eval-progn forms env)
+      (t (c)
+        (let ((val (%eval-escape-pop-if name)))
+          (if (eq val :%eval-no-escape)
+              ;; Not one of our RETURN-FROM escapes — re-raise the ORIGINAL
+              ;; condition C (a genuine error signalled inside the block) so
+              ;; an outer handler sees its real type/message instead of a
+              ;; masked "%eval-escape".  First discard any descriptor an
+              ;; inner escape stranded while C unwound past its catcher.
+              (progn (%eval-escape-unwind snap c) (error c))
+              (%eval-escape-return val)))))))
 
 ;;; ============================================================
 ;;; Extended LOOP at runtime EVAL
@@ -1665,7 +1719,9 @@
   (let ((iter-state nil)    ; list of state cells (mutable)
         (with-bindings nil) ; ((var . val) …) for WITH
         (while-form nil)
-        (until-form nil))
+        (until-form nil)
+        ;; Snapshot for escape-stack cleanup on real-error re-raise.
+        (loop-snap (%eval-escape-snapshot)))
     ;; Build state cells.  Walk iters in parsed-source order.
     (let ((cur iters))
       (loop
@@ -1765,8 +1821,10 @@
                 ;; detect-os's `(error "…")' when no OS feature matches).
                 ;; Re-raise the ORIGINAL condition C so its real type and
                 ;; message reach the caller's handler, instead of masking
-                ;; it as a generic "%eval-escape" SIMPLE-ERROR.
-                (error c)
+                ;; it as a generic "%eval-escape" SIMPLE-ERROR.  First
+                ;; discard any descriptor an inner escape stranded while
+                ;; C unwound past its catcher.
+                (progn (%eval-escape-unwind loop-snap c) (error c))
                 (return-from %loop-execute (%eval-escape-return val))))))
       ;; finally — wrap in handler-case so a `(return X)` or
       ;; `(return-from NIL X)` form inside finally (the parenthesised
@@ -1821,7 +1879,9 @@
               ;; not one of our escapes → re-raise the ORIGINAL condition C
               ;; (a real `(error …)' in the FINALLY clause, e.g. detect-os's
               ;; no-OS error), preserving its type/message rather than
-              ;; masking it as a generic "%eval-escape".
+              ;; masking it as a generic "%eval-escape".  Discard any
+              ;; descriptor an inner escape stranded first.
+              (%eval-escape-unwind loop-snap c)
               (error c)))))
       ;; Resolve return value.
       (cond
@@ -3035,14 +3095,16 @@
       ;; BLOCK
       ((%eval-sym-eq op "BLOCK")
        (let ((bname (car args))
-             (body (cdr args)))
+             (body (cdr args))
+             (block-snap (%eval-escape-snapshot)))
          (handler-case
            (%eval-progn body env)
            (t (c)
              (let ((val (%eval-escape-pop-if bname)))
                (if (eq val :%eval-no-escape)
-                   ;; genuine error inside the block — re-raise original C
-                   (error c)
+                   ;; genuine error inside the block — discard any
+                   ;; stranded descriptor, then re-raise original C
+                   (progn (%eval-escape-unwind block-snap c) (error c))
                    (%eval-escape-return val)))))))
       ;; RETURN-FROM — push (name . value) onto escape stack + signal.
       ;; Capture multiple values via multiple-value-list so a form like
@@ -3122,14 +3184,16 @@
       ;; %eval-escape-pop-if normally compares.
       ((%eval-sym-eq op "CATCH")
        (let ((tag (%eval-in-env (car args) env))
-             (body (cdr args)))
+             (body (cdr args))
+             (catch-snap (%eval-escape-snapshot)))
          (handler-case
            (%eval-progn body env)
            (t (c)
              (let ((val (%eval-escape-pop-if tag)))
                (if (eq val :%eval-no-escape)
-                   ;; genuine error inside the catch body — re-raise original C
-                   (error c)
+                   ;; genuine error inside the catch body — discard any
+                   ;; stranded descriptor, then re-raise original C
+                   (progn (%eval-escape-unwind catch-snap c) (error c))
                    (%eval-escape-return val)))))))
       ;; THROW — (throw TAG-FORM VALUE-FORM).  Push (tag . (cons '%mvs mvs))
       ;; onto escape stack so the surrounding CATCH with matching TAG
@@ -3153,16 +3217,18 @@
                (%loop-keyword-p (car args)))
           (%eval-extended-loop args env))
          (t
-          (handler-case
-            (let ((dummy nil))
-              (declare (ignore dummy))
-              (loop (%eval-progn args env)))
-            (t (c)
-              (let ((val (%eval-escape-pop-if nil)))
-                (if (eq val :%eval-no-escape)
-                    ;; genuine error inside the simple-LOOP body — re-raise C
-                    (error c)
-                    (%eval-escape-return val))))))))
+          (let ((sloop-snap (%eval-escape-snapshot)))
+            (handler-case
+              (let ((dummy nil))
+                (declare (ignore dummy))
+                (loop (%eval-progn args env)))
+              (t (c)
+                (let ((val (%eval-escape-pop-if nil)))
+                  (if (eq val :%eval-no-escape)
+                      ;; genuine error inside the simple-LOOP body —
+                      ;; discard any stranded descriptor, then re-raise C
+                      (progn (%eval-escape-unwind sloop-snap c) (error c))
+                      (%eval-escape-return val)))))))))
       ;; VALUES
       ((%eval-sym-eq op "VALUES")
        (let ((evaled (%eval-args args env)))
@@ -3192,7 +3258,8 @@
       ;; are lists.  GO signals via the escape stack with tag = the
       ;; go-target-symbol; TAGBODY catches and resumes from that label.
       ((%eval-sym-eq op "TAGBODY")
-       (let ((tags-and-forms args))
+       (let ((tags-and-forms args)
+             (tb-snap (%eval-escape-snapshot)))
          (let ((start tags-and-forms))
            (loop
              (handler-case
@@ -3233,6 +3300,9 @@
                    (t
                     ;; Not one of our GO tags — re-raise the original
                     ;; condition C (a genuine error inside the tagbody).
+                    ;; Discard any descriptor an inner escape stranded
+                    ;; while C unwound past its catcher.
+                    (%eval-escape-unwind tb-snap c)
                     (error c))))))
            nil)))
       ;; GO — push tag onto escape stack and signal

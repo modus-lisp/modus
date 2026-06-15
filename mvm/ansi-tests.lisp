@@ -4368,6 +4368,96 @@
                       (lambda () (error "an error"))))))
       (t (c) (declare (ignore c)) :crashed))
     'good)
+  ;; ==== Probe block 8440-8447: RUNTIME-EVAL escape-stack PUSH-side leak.
+  ;; A GENUINE error unwinding through a BLOCK/CATCH/TAGBODY/LOOP catcher
+  ;; must NOT leave behind a descriptor that an in-flight escape stranded
+  ;; while the error unwound past that escape's own catcher.  Each probe
+  ;; evals a form that combines (a) a non-local exit and (b) a real error,
+  ;; then evals a SECOND simple form: if the first stranded a descriptor,
+  ;; the second eval's first inner HANDLER-CASE re-propagates the spurious
+  ;; SIMPLE-ERROR "%eval-escape" instead of returning its value.  Fix:
+  ;; %eval-escape-unwind on every catcher's re-raise path + EVAL resets the
+  ;; escape stack at the top-level boundary (cl-eval.lisp).  This is the
+  ;; UIOP ensure-package / asdf-gauntlet form-118 leak class on the PUSH
+  ;; side (the prior 8500-block covered the swallow/POP side).
+  ;;
+  ;; 8440: a real error fires AFTER a return-from pushed nothing — the
+  ;; block re-raises cleanly; the next eval is unaffected.
+  (rt-run-test 8440
+    (handler-case
+        (progn
+          (handler-case (eval '(block b (error "boom") (return-from b 1)))
+            (t (c) (declare (ignore c)) nil))
+          (eval '(handler-case (+ 1 2) (error (e) -1))))
+      (t (c) (declare (ignore c)) :crashed))
+    3)
+  ;; 8441: dolist body hits a real error mid-iteration (implicit block nil
+  ;; + tagbody).  Next eval must be clean.
+  (rt-run-test 8441
+    (handler-case
+        (progn
+          (handler-case
+              (eval '(dolist (x (list 1 2 3)) (error "mid-iter")))
+            (t (c) (declare (ignore c)) nil))
+          (eval '(handler-case (* 6 7) (error (e) -1))))
+      (t (c) (declare (ignore c)) :crashed))
+    42)
+  ;; 8442: extended LOOP collect whose body errors.  Next eval clean.
+  (rt-run-test 8442
+    (handler-case
+        (progn
+          (handler-case
+              (eval '(loop for x in (list 1 2 3) collect (error "x")))
+            (t (c) (declare (ignore c)) nil))
+          (eval '(handler-case (- 50 8) (error (e) -1))))
+      (t (c) (declare (ignore c)) :crashed))
+    42)
+  ;; 8443: catch whose body errors (not a throw to this tag).  Next clean.
+  (rt-run-test 8443
+    (handler-case
+        (progn
+          (handler-case
+              (eval '(catch 'tg (error "no-throw")))
+            (t (c) (declare (ignore c)) nil))
+          (eval '(handler-case (+ 40 2) (error (e) -1))))
+      (t (c) (declare (ignore c)) :crashed))
+    42)
+  ;; 8444: a legitimate return-from STILL works (no over-eager cleanup).
+  (rt-run-test 8444
+    (handler-case
+        (eval '(block b (return-from b 42) 99))
+      (t (c) (declare (ignore c)) :crashed))
+    42)
+  ;; 8445: tagbody GO still works after the unwind discipline change.
+  (rt-run-test 8445
+    (handler-case
+        (eval '(let ((n 0))
+                 (tagbody
+                    (go skip)
+                    (setq n 100)
+                  skip
+                    (setq n 7))
+                 n))
+      (t (c) (declare (ignore c)) :crashed))
+    7)
+  ;; 8446: nested blocks — inner real error, outer return-from after the
+  ;; inner is handled.  Verifies cleanup is scoped, not global.
+  (rt-run-test 8446
+    (handler-case
+        (eval '(block outer
+                 (handler-case (eval '(block inner (error "e")))
+                   (error (c) nil))
+                 (return-from outer :ok)))
+      (t (c) (declare (ignore c)) :crashed))
+    :ok)
+  ;; 8447: a real (non-escape) error inside a block body is still seen as
+  ;; that error (its type preserved), not masked as %eval-escape.
+  (rt-run-test 8447
+    (handler-case
+        (eval '(block b (car 5)))
+      (type-error (c) :type-err)
+      (t (c) (declare (ignore c)) :other-err))
+    :type-err)
   ;; ==== Probe block 8500-8504: RUNTIME-EVAL %eval-escape leak across a
   ;; non-target HANDLER-CASE / IGNORE-ERRORS (cl-eval.lisp HANDLER-CASE
   ;; branch).  These drive the tree-walking evaluator via (eval …) — the

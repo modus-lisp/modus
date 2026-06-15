@@ -2591,8 +2591,12 @@
              ;; Build the method body as an interp-closure that captures env.
              (let ((fn (list '%interp-closure params wrapped-body env)))
                ;; Ensure gf exists with a runtime stub installed under gf-name.
+               ;; CLHS 7.6.4: when DEFMETHOD implicitly creates the GF, derive
+               ;; the GF lambda-list from the method's so the GF knows its
+               ;; required-arg count + variadic shape — %gf-check-arity then
+               ;; rejects wrong-arity calls (defmethod.error.13/.14/.15).
                (when (null (%find-gf gf-name))
-                 (%defgeneric gf-name nil nil))
+                 (%defgeneric gf-name (%derive-gf-ll-from-method params) nil))
                (let ((fname (cond ((%cl-sym-p gf-name) (%cl-sym-name gf-name))
                                   ((stringp gf-name) gf-name)
                                   (t nil))))

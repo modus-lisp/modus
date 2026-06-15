@@ -3222,6 +3222,62 @@
                           (setq cur (cdr (cdr cur))))))))))))))
     nil))
 
+(defun %derive-gf-ll-from-method (params)
+  "Derive an implicit generic-function lambda-list from a method's
+   lambda-list PARAMS (CLHS 7.6.4).  Only the SHAPE matters for arity
+   checking: keep the required parameter names, and if the method has
+   any &optional/&rest/&key, give the GF a compatible variadic tail
+   (&optional o1 o2 … for each optional, plus &rest for open-endedness
+   when the method has &rest/&key).  Method-only &aux is dropped (it is
+   not part of the congruence-relevant lambda list)."
+  (let ((required nil)
+        (optionals nil)
+        (has-rest-or-key nil)
+        (mode :required)
+        (cur params))
+    (loop
+      (when (null cur) (return nil))
+      (let ((p (car cur)))
+        (cond
+          ((%lambda-list-keyword-p p "&OPTIONAL") (setq mode :optional))
+          ((%lambda-list-keyword-p p "&REST")
+           (setq mode :rest) (setq has-rest-or-key t))
+          ((%lambda-list-keyword-p p "&BODY")
+           (setq mode :rest) (setq has-rest-or-key t))
+          ((%lambda-list-keyword-p p "&KEY")
+           (setq mode :key) (setq has-rest-or-key t))
+          ((%lambda-list-keyword-p p "&AUX") (setq mode :aux))
+          ((%lambda-list-keyword-p p "&ALLOW-OTHER-KEYS") nil)
+          (t
+           (cond
+             ((eq mode :required)
+              (setq required (cons (if (consp p) (car p) p) required)))
+             ((eq mode :optional)
+              (setq optionals (cons (if (consp p) (car p) p) optionals)))))))
+      (setq cur (cdr cur)))
+    (let ((ll (nreverse required)))
+      (when optionals
+        (setq ll (append ll (cons '&optional (nreverse optionals)))))
+      (when has-rest-or-key
+        (setq ll (append ll (list '&rest '%gf-derived-rest))))
+      ll)))
+
+(defun %gf-check-arity (gf args)
+  "CLHS 7.6.4: a call to a generic function must supply at least as many
+   args as the GF has required parameters, and — unless the GF lambda-
+   list has &optional/&rest/&key — exactly that many.  A mismatch is a
+   PROGRAM-ERROR (defmethod.error.13/.14/.15: the implicitly-created GF
+   from a lone DEFMETHOD enforces its (x) / (x &key) shape).  Skipped
+   when the GF has no declared lambda-list (auto-create case, shape
+   unknown)."
+  (let ((ll (%gf-lambda-list gf)))
+    (when ll
+      (let ((req (%lambda-list-required-count ll))
+            (variadic (%lambda-list-has-rest-or-key ll))
+            (n (length args)))
+        (when (< n req) (%signal-program-error))
+        (when (and (not variadic) (> n req)) (%signal-program-error))))))
+
 (defun %gf-dispatch (name args)
   "Dispatch generic function NAME with ARGS.
    The combination slot holds either a bare combination name (symbol)
@@ -3231,6 +3287,10 @@
   (let ((gf (%find-gf name)))
     (when (null gf)
       (error "undefined generic function"))
+    ;; CLHS 7.6.4: validate the supplied arg count against the GF's
+    ;; required-parameter count BEFORE method selection — too few/many
+    ;; required args is a program-error, not a no-applicable-method.
+    (%gf-check-arity gf args)
     (let ((applicable (%collect-applicable-methods gf args)))
       (when (null applicable)
         ;; Try no-applicable-method hook

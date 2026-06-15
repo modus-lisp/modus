@@ -1480,6 +1480,30 @@
         (progn (eval '(make-instance (find-class 'mi-probe-c2) :z 1)) :NO-ERROR)
       (error (c) :ERR))
     :ERR)
+  ;; 8681-8683 — GF call arity (defmethod.error.13): a lone DEFMETHOD
+  ;; implicitly creates a GF whose required-arg count is derived from
+  ;; the method LL; calling with too few/many required args is a
+  ;; program-error.  Variadic GFs (&key) accept extra args.
+  (deftest 8681
+    (let ((sym (gensym)))
+      (eval (list 'defmethod sym (list (list 'x 't)) 'x))
+      (list (handler-case (progn (eval (list sym)) :NO)
+              (program-error (c) :PE) (t (c) :OTHER))
+            (handler-case (progn (eval (list sym 1 2)) :NO)
+              (program-error (c) :PE) (t (c) :OTHER))))
+    '(:PE :PE))
+  (deftest 8682
+    (let ((sym (gensym)))
+      (eval (list 'defmethod sym (list (list 'x 't)) 'x))
+      ;; correct arity → no error
+      (handler-case (progn (eval (list sym 42)) :OK) (t (c) :ERR)))
+    :OK)
+  (deftest 8683
+    (let ((sym (gensym)))
+      ;; GF with &key accepts extra (keyword) args without arity error
+      (eval (list 'defmethod sym (list (list 'x 't) '&key) 'x))
+      (handler-case (progn (eval (list sym 1 :a 2)) :OK) (t (c) :ARITYERR)))
+    :OK)
   ;; ----------------------------------------------------------------
   ;; 8694/8696 — defclass.forward-ref: (eval (defclass C (FWD) nil))
   ;; with an undefined super FWD returns a class object; instances of

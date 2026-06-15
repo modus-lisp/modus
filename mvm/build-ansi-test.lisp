@@ -3971,6 +3971,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (%fork-set-last-id id)~
                      ~%  (%clear-fault-slots)~
+                     ~%  (%reset-signal-state)~
                      ~%  (handler-case (rt-run-test id (funcall thunk) expected)~
                      ~%    (t (c) (%test-crash-fail-c id c))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
@@ -3978,6 +3979,7 @@
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test-mv nil))~
                      ~%  (%fork-set-last-id id)~
                      ~%  (%clear-fault-slots)~
+                     ~%  (%reset-signal-state)~
                      ~%  (handler-case (rt-run-test-mv id (funcall thunk) expecteds)~
                      ~%    (t (c) (%test-crash-fail-c id c))))~
                      ~%;; wait4 wstatus buffer — 8 bytes past handler-case slots.~

@@ -998,6 +998,37 @@
   (when (= *signal-walk-depth* 0)
     (setq *handler-bind-effective-skip* 0)))
 
+(defun %reset-signal-state ()
+  "Reset the handler-bind / signal / restart globals to a clean baseline.
+
+   An escaping handler (return-from / throw / muffle shapes — e.g.
+   handler-bind.5/6/11/12, the throw-from-handler probes) skips both
+   %signal-condition's manual restore of *handler-bind-effective-skip* /
+   *signal-walk-depth* AND %with-handler-bind's frame pop, because the
+   only escape-safe wrappers (unwind-protect / let-bound special restore)
+   re-trigger the still-open 9525 unwind-protect+%nlx-throw SIGSEGV, so
+   the leak is repaired lazily by %heal-handler-bind-skip instead.  But
+   %heal only rewinds skip once the handler-bind stack has DRAINED to
+   NULL — and the leaked frame keeps it non-null, so the elevated skip
+   silently inhibits the leading handler frames of the NEXT signal.  In
+   the ANSI harness this poisons across forks: a custom probe that
+   escapes a handler in the PARENT leaves elevated skip that every
+   subsequently-forked file inherits, so warn.1 (the FIRST warn test)
+   fails on an apparently-clean slate — its handler is inhibited, never
+   sets `warned`, never muffles.
+
+   Called at each test boundary (run-test / run-test-mv) so every ANSI
+   test starts from a clean condition-system baseline, exactly the per-
+   test isolation a conforming rt harness provides.  Does NOT touch the
+   *catch-* slots (handler-case's own setjmp machinery, set up AFTER
+   this call in run-test)."
+  (setq *handler-bind-stack* nil)
+  (setq *handler-bind-effective-skip* 0)
+  (setq *signal-walk-depth* 0)
+  (setq *restart-stack* nil)
+  (setq *restart-frame-condition-map* nil)
+  (setq *restarts-being-invoked* nil))
+
 ;;; --- restart-case implementation ---
 ;;; restart-case needs non-local exit from restart body back to restart-case frame.
 ;;; We use the setjmp/longjmp mechanism (same as handler-case) with a global result store.

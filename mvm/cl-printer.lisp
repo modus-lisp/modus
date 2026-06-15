@@ -2779,6 +2779,9 @@
         (t (funcall fn a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 a25 a26 a27 a28 a29 a30 a31))))))
 
 (defun terpri (&rest stream-arg)
+  ;; CLHS: terpri takes at most one arg (the stream).  Extra positional
+  ;; args signal program-error.  (terpri.error.1)
+  (when (cdr stream-arg) (%signal-program-error))
   (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))
     (if (and (streamp s) (not (= (%stream-type s) 8)))
         (%write-char-to-stream 10 s)
@@ -2787,6 +2790,9 @@
 
 (defun fresh-line (&rest stream-arg)
   "Write newline only if not at beginning of line. Returns nil if at BOL, non-nil otherwise."
+  ;; CLHS: fresh-line takes at most one arg (the stream).  Extra positional
+  ;; args signal program-error.  (fresh-line.error.1)
+  (when (cdr stream-arg) (%signal-program-error))
   (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))
     (if (and (streamp s) (not (= (%stream-type s) 8)))
         (if (%stream-at-bol-p s)
@@ -2930,6 +2936,9 @@
 
 (defun write-char (ch &rest stream-arg)
   "Write character CH to stream. Stream designator: nil=*standard-output*, t=*terminal-io*."
+  ;; CLHS: write-char takes char + optional stream — at most one trailing
+  ;; arg.  A 3rd positional arg signals program-error.  (write-char.error.2)
+  (when (cdr stream-arg) (%signal-program-error))
   (let ((saved-ch ch))
     (let ((code (%ensure-char-code saved-ch)))
       (let ((s (if stream-arg
@@ -2960,6 +2969,9 @@
   nil)
 (defun listen (&rest args)
   "Check if input is available on stream."
+  ;; CLHS: listen takes at most one arg (the stream).  Extra positional
+  ;; args signal program-error.  (listen.error.1/2)
+  (when (cdr args) (%signal-program-error))
   (let ((s (%resolve-input-stream (if args (car args) nil))))
     (if (streamp s)
         (let ((ty (%stream-type s)))
@@ -3057,21 +3069,58 @@
                     (setq i (+ i 1)))
                   (values str (if found-newline nil (if hit-eof t nil)))))))))))
 
+(defun %input-stream-reads-chars-p (stream)
+  "Return T if STREAM is a CHARACTER input stream (its elements are
+   characters), NIL if it is a binary/byte stream.  Used by read-sequence
+   to decide whether to read CHARACTERs or bytes — CLHS specifies the
+   element type comes from the STREAM, not the destination sequence.
+   In Modus all composite streams (string-input, echo, two-way,
+   concatenated, synonym, serial) are character streams; only file
+   streams can be binary, and STREAM-ELEMENT-TYPE reports their type."
+  (let ((s (%resolve-input-stream stream)))
+    (if (streamp s)
+        (let ((ty (%stream-type s)))
+          (if (= ty 9)
+              ;; File stream: trust stream-element-type (CHARACTER vs a
+              ;; byte type).  Modus currently reports CHARACTER for all
+              ;; file streams; if binary tracking lands, this picks it up.
+              (let ((et (stream-element-type s)))
+                (if (eq et 'character) t nil))
+              ;; All other composite stream types are character streams.
+              t))
+        ;; Non-stream designator resolved to a serial/terminal fallback —
+        ;; treat as character.
+        t)))
+
 ;;; read-sequence: read N elements from stream into seq starting at start
+;;;
+;;; CLHS: the element type read is determined by the STREAM, not by SEQ.
+;;; A character stream yields CHARACTERs; a binary stream yields integers.
+;;; The old code keyed off (stringp seq) and so always read BYTES into a
+;;; general (non-string) vector — wrong for (read-sequence #(...) char-stream),
+;;; which must store CHARACTER objects (make-two-way-stream.11,
+;;; read-sequence.list/vector tests).  Now we dispatch on the resolved
+;;; stream's element-type: char streams read via %read-char-from-stream and
+;;; store the CHARACTER (string dests coerce to code via aset); byte streams
+;;; read via %fs-read-byte.
 (defun read-sequence (seq stream &rest args)
   "Read elements from STREAM into SEQ. Returns end position."
   (let ((start (if args (car args) 0))
         (end (if (cdr args) (cadr args) nil)))
     (let ((actual-end (if end end (length seq)))
-          (i start))
+          (i start)
+          (in (%resolve-input-stream stream))
+          (char-stream (%input-stream-reads-chars-p stream)))
       (loop
         (when (>= i actual-end) (return i))
-        (if (stringp seq)
-            (let ((ch (%read-char-from-stream
-                       (%resolve-input-stream stream) nil :eof-sentinel-7770002)))
+        (if char-stream
+            (let ((ch (%read-char-from-stream in nil :eof-sentinel-7770002)))
               (if (eq ch :eof-sentinel-7770002)
                   (return i)
-                  (aset seq i (char-code ch))))
+                  ;; aset coerces a CHARACTER to its code for string dests
+                  ;; (CLHS string element access) and stores the CHARACTER
+                  ;; object unchanged into a general vector.
+                  (aset seq i ch)))
             (let ((b (if (streamp stream)
                          (%fs-read-byte stream nil :eof-sentinel-7770002)
                          :eof-sentinel-7770002)))

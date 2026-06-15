@@ -1175,8 +1175,12 @@
         (error "No restart named ~A" name-or-restart))))
 
 (defun abort (&optional condition)
-  "Invoke the ABORT restart."
-  (invoke-restart 'abort))
+  "Invoke the ABORT restart.  Per CLHS, if no ABORT restart is active
+   (associated with CONDITION when supplied), signal a CONTROL-ERROR."
+  (let ((r (find-restart 'abort condition)))
+    (if r
+        (invoke-restart r)
+        (error 'control-error))))
 
 (defun continue (&optional condition)
   "Invoke the CONTINUE restart."
@@ -1184,9 +1188,13 @@
     (when r (invoke-restart r))))
 
 (defun muffle-warning (&optional condition)
-  "Invoke the MUFFLE-WARNING restart."
+  "Invoke the MUFFLE-WARNING restart.  Per CLHS, if no MUFFLE-WARNING
+   restart is active (associated with CONDITION when supplied), signal a
+   CONTROL-ERROR."
   (let ((r (find-restart 'muffle-warning condition)))
-    (when r (invoke-restart r))))
+    (if r
+        (invoke-restart r)
+        (error 'control-error))))
 
 (defun store-value (value &optional condition)
   "Invoke the STORE-VALUE restart with VALUE."

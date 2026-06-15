@@ -1843,31 +1843,13 @@
                                   (nreverse vars) (nreverse tmps))))
          `(let ,bindings ,@assignments nil))))
 
-    ;; (psetf place1 val1 place2 val2 ...) → evaluate all values, then set all
-    ;; For simple (psetf var val) cases at least
-    ((and (eq (car form) 'psetf) (consp (cdr form)))
-     (let* ((pairs (cdr form))
-            (places nil)
-            (vals nil)
-            (tmps nil))
-       (let ((p pairs))
-         (loop
-           (when (null p) (return))
-           (push (rewrite-reader-forms (car p)) places)
-           (push (rewrite-reader-forms (cadr p)) vals)
-           (push (intern (format nil "%PSETF-TMP-~D" (length places))) tmps)
-           (setq p (cddr p))))
-       (let* ((rtmps (nreverse tmps))
-              (rplaces (nreverse places))
-              (rvals (nreverse vals))
-              (bindings (mapcar #'list rtmps rvals))
-              ;; Generate setf assignments using tmp vars
-              (assignments (mapcar (lambda (place tmp)
-                                     (if (symbolp place)
-                                         `(setq ,place ,tmp)
-                                         `(setf ,place ,tmp)))
-                                   rplaces rtmps)))
-         `(let ,bindings ,@assignments nil))))
+    ;; (psetf ...) — NO rewrite.  The MVM compiler's PSETF macro now
+    ;; expands places via mvm-place-expansion (CLHS 5.1.1.1: each place
+    ;; subform evaluated exactly once, left-to-right, value forms
+    ;; interleaved), which the old %PSETF-TMP rewriter got wrong — it
+    ;; bound all VALUES first, re-evaluating place subforms and reordering
+    ;; them relative to the value forms (broke psetf.order.{1,2}).  Pass
+    ;; the form through so the real compiler macro handles it.
 
     ;; (multiple-value-bind* (vars...) form &body body)
     ;; → (let ((tmp (multiple-value-list form)))

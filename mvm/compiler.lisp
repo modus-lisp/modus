@@ -141,6 +141,70 @@
                  (t nil))))
     (and h (gethash h *setf-expanders*))))
 
+;; Place expansion for read-modify-write macros (INCF/DECF/PUSH/PUSHNEW).
+;; CLHS 5.1.1.1: every subform of a place is evaluated exactly once, left
+;; to right, and the read (access) and write (store) share those evaluated
+;; subforms.  Returns three values:
+;;   BINDINGS  — list of (gensym subform) let*-bindings that evaluate the
+;;               place's argument subforms once, in order.
+;;   ACCESS    — a form reading the place's current value via the gensyms.
+;;   WRITER    — a function of one value-form returning the store form that
+;;               writes that value into the place via the gensyms.
+;; For accessors with a known special SETF expansion (car/cdr/aref/svref/
+;; row-major-aref/nth/gethash) we wire the matching reader/writer directly;
+;; everything else uses read=(op gs...) write=(SET-OP gs... value), matching
+;; the generic fallback in the SETF macro.  This guarantees subforms aren't
+;; re-evaluated by the surrounding (setf place (+ place delta)) shape.
+(defun mvm-place-expansion (place)
+  (cond
+    ((symbolp place)
+     (values nil place (lambda (v) `(setq ,place ,v))))
+    ((not (consp place))
+     (values nil place (lambda (v) (declare (ignore v)) place)))
+    ((name-eq (car place) "THE")
+     ;; (the type place) — TYPE not evaluated; recurse on inner place.
+     (mvm-place-expansion (caddr place)))
+    (t
+     (let* ((op (car place))
+            (args (cdr place))
+            (gs (mapcar (lambda (a) (declare (ignore a)) (gensym "PLC")) args))
+            (bindings (mapcar #'list gs args)))
+       (cond
+         ;; Accessors that mutate their CONTAINER in place (so the store
+         ;; never reassigns a place-variable): safe to bind every subform
+         ;; to a gensym evaluated once, and read/write through them.
+         ((name-eq op "CAR")
+          (values bindings (cons 'car gs) (lambda (v) `(set-car ,@gs ,v))))
+         ((name-eq op "CDR")
+          (values bindings (cons 'cdr gs) (lambda (v) `(set-cdr ,@gs ,v))))
+         ((or (name-eq op "AREF") (name-eq op "SVREF")
+              (name-eq op "ROW-MAJOR-AREF"))
+          ;; ASET with a variable index as a non-last form (dest=nil) can
+          ;; drop the store (compiler limitation #2).  Force dest=frame-slot
+          ;; by binding the result so the store always materialises — this
+          ;; matters when several aset stores run in sequence (psetf/rotatef).
+          (values bindings (cons 'aref gs)
+                  (lambda (v)
+                    (let ((dg (gensym "AST")))
+                      `(let ((,dg (aset ,@gs ,v))) ,dg)))))
+         ((name-eq op "NTH")
+          (values bindings (cons 'nth gs)
+                  (lambda (v) `(set-car (nthcdr ,(first gs) ,(second gs)) ,v))))
+         ((name-eq op "GETHASH")
+          (values bindings (cons 'gethash gs)
+                  (lambda (v) `(puthash ,(first gs) ,(second gs) ,v))))
+         (t
+          ;; Unknown / special accessor whose SETF expansion may REASSIGN
+          ;; the place's first argument (getf, ldb, symbol-value, …).  We
+          ;; cannot safely gensym-bind those subforms, so do NOT bind any:
+          ;; return the place unchanged and route the store through the
+          ;; full SETF macro.  This re-evaluates the place subforms (as the
+          ;; pre-existing `(setf place (op …))` shape always did) but keeps
+          ;; SETF's special handlers and avoids breaking place-variable
+          ;; reassignment.  CLHS once-only is not honoured for these, but
+          ;; it wasn't before either; correctness of the store wins.
+          (values nil place (lambda (v) `(setf ,place ,v)))))))))
+
 (defvar *label-counter* 0
   "Monotonic counter for generating unique labels")
 
@@ -974,23 +1038,35 @@
                      (tagbody ,@body)
                      (setq ,tmp (cdr ,tmp))))))))))
 
-  ;; INCF → SETQ + +
+  ;; INCF → place read-modify-write.  CLHS: subforms of PLACE evaluated
+  ;; once left-to-right; per CLtS 5.1.3 the DELTA is evaluated before the
+  ;; place's current value is read (SBCL expands to (+ delta access)).
   (mvm-define-macro "INCF"
     (lambda (form)
       (let ((place (cadr form))
-            (delta (or (caddr form) 1)))
+            (delta (if (cddr form) (caddr form) 1)))
         (if (symbolp place)
-            `(setq ,place (+ ,place ,delta))
-            `(setf ,place (+ ,place ,delta))))))
+            `(setq ,place (+ ,delta ,place))
+            (multiple-value-bind (bindings access writer)
+                (mvm-place-expansion place)
+              `(let* ,bindings
+                 ,(funcall writer `(+ ,delta ,access))))))))
 
-  ;; DECF → SETQ + -
+  ;; DECF → place read-modify-write.  (- access delta): the result is
+  ;; access - delta, but per CLtS 5.1.3 delta evaluates first.  Bind delta
+  ;; to a temp so its evaluation precedes the access read.
   (mvm-define-macro "DECF"
     (lambda (form)
       (let ((place (cadr form))
-            (delta (or (caddr form) 1)))
+            (delta (if (cddr form) (caddr form) 1)))
         (if (symbolp place)
-            `(setq ,place (- ,place ,delta))
-            `(setf ,place (- ,place ,delta))))))
+            (let ((dg (gensym "DEC")))
+              `(let ((,dg ,delta)) (setq ,place (- ,place ,dg))))
+            (multiple-value-bind (bindings access writer)
+                (mvm-place-expansion place)
+              (let ((dg (gensym "DEC")))
+                `(let* (,@bindings (,dg ,delta))
+                   ,(funcall writer `(- ,access ,dg)))))))))
 
   ;; PSETQ — parallel SETQ.  Per CLHS 5.1.2.5 evaluate every value
   ;; first, then assign all variables in parallel.  Bind values to
@@ -1012,28 +1088,38 @@
            ,@(nreverse assigns)
            nil))))
 
-  ;; PSETF — parallel SETF.  Same shape as PSETQ but each PLACE is a
-  ;; generalised setf place.  Returns NIL.
+  ;; PSETF — parallel SETF.  CLHS 5.1.2.5: for each (place value) pair,
+  ;; evaluate the place subforms and the value form left-to-right; only
+  ;; after ALL are evaluated are the stores performed (in parallel).
+  ;; Use the place expansion so each place's subforms fire exactly once
+  ;; and in order, interleaved with the value forms.  Returns NIL.
   (mvm-define-macro "PSETF"
     (lambda (form)
       (let ((pairs (cdr form))
-            (bindings nil)
-            (assigns nil))
+            (all-bindings nil)    ; collected in source order (reversed)
+            (writers nil))        ; (writer . value-gensym) in source order (reversed)
         (loop while pairs do
-          (let* ((place (first pairs))
-                 (val (second pairs))
-                 (g (gensym "PSF")))
-            (push (list g val) bindings)
-            (push (list 'setf place g) assigns)
-            (setq pairs (cddr pairs))))
-        `(let ,(nreverse bindings)
-           ,@(nreverse assigns)
+          (let ((place (first pairs))
+                (val (second pairs)))
+            (multiple-value-bind (bindings access writer)
+                (mvm-place-expansion place)
+              (declare (ignore access))
+              (let ((vg (gensym "PSV")))
+                ;; place subforms first (left-to-right), then the value.
+                (dolist (b bindings) (push b all-bindings))
+                (push (list vg val) all-bindings)
+                (push (cons writer vg) writers))))
+          (setq pairs (cddr pairs)))
+        `(let* ,(nreverse all-bindings)
+           ,@(mapcar (lambda (wv) (funcall (car wv) (cdr wv)))
+                     (nreverse writers))
            nil))))
 
   ;; ROTATEF — rotate values among places.  Per CLHS 5.1.2.5
   ;; (rotatef p1 p2 p3 ...) moves p1's value to p2, p2's to p3, ...,
-  ;; pn's back to p1.  Returns NIL.  Each place is read once into a
-  ;; gensym, then assigned from the next gensym in rotation.
+  ;; pn's back to p1.  Returns NIL.  Each place's subforms are evaluated
+  ;; once left-to-right; the current values are read into gensyms, then
+  ;; the rotated values are stored.
   (mvm-define-macro "ROTATEF"
     (lambda (form)
       (let ((places (cdr form)))
@@ -1041,21 +1127,32 @@
           ((null places) nil)
           ((null (cdr places)) nil)   ; one place: noop
           (t
-           (let* ((gs (mapcar (lambda (p) (declare (ignore p)) (gensym "RTF"))
-                              places))
-                  (bindings (mapcar #'list gs places))
-                  ;; Rotate: place[i] <- gs[i+1], place[last] <- gs[0]
-                  (rotated-gs (append (cdr gs) (list (car gs))))
-                  (assigns (mapcar (lambda (place g) `(setf ,place ,g))
-                                   places rotated-gs)))
-             `(let* ,bindings
-                ,@assigns
-                nil)))))))
+           (let ((all-bindings nil)   ; reversed source order
+                 (accs nil)           ; access forms in order (reversed)
+                 (wrs nil))           ; writers in order (reversed)
+             (dolist (place places)
+               (multiple-value-bind (bindings access writer)
+                   (mvm-place-expansion place)
+                 (dolist (b bindings) (push b all-bindings))
+                 (push access accs)
+                 (push writer wrs)))
+             (let* ((accs (nreverse accs))
+                    (wrs (nreverse wrs))
+                    ;; read current values into gensyms (in order)
+                    (vgs (mapcar (lambda (a) (declare (ignore a)) (gensym "RTV"))
+                                 accs))
+                    (read-binds (mapcar #'list vgs accs))
+                    ;; rotate: place[i] <- vgs[i+1], place[last] <- vgs[0]
+                    (rotated (append (cdr vgs) (list (car vgs))))
+                    (stores (mapcar (lambda (w v) (funcall w v)) wrs rotated)))
+               `(let* (,@(nreverse all-bindings) ,@read-binds)
+                  ,@stores
+                  nil))))))))
 
   ;; SHIFTF — shift values through places.  Per CLHS 5.1.2.5
   ;; (shiftf p1 p2 ... pN val) returns old p1, sets p1 <- p2, p2 <- p3,
   ;; ..., p(N-1) <- pN, pN <- val.  Like ROTATEF but the LAST argument
-  ;; is a value, not a place, and the function returns p1's old value.
+  ;; is a value, not a place, and the macro returns p1's old value.
   (mvm-define-macro "SHIFTF"
     (lambda (form)
       (let ((args (cdr form)))
@@ -1063,17 +1160,28 @@
           ((null args) nil)
           ((null (cdr args)) nil)   ; nothing to shift
           (t
-           (let* ((places (butlast args))
-                  (final-val (car (last args)))
-                  (gs (mapcar (lambda (p) (declare (ignore p)) (gensym "SHF"))
-                              places))
-                  (bindings (mapcar #'list gs places))
-                  (next-vals (append (cdr gs) (list final-val)))
-                  (assigns (mapcar (lambda (place next) `(setf ,place ,next))
-                                   places next-vals)))
-             `(let* ,bindings
-                ,@assigns
-                ,(car gs))))))))
+           (let ((places (butlast args))
+                 (final-val (car (last args)))
+                 (all-bindings nil)
+                 (accs nil)
+                 (wrs nil))
+             (dolist (place places)
+               (multiple-value-bind (bindings access writer)
+                   (mvm-place-expansion place)
+                 (dolist (b bindings) (push b all-bindings))
+                 (push access accs)
+                 (push writer wrs)))
+             (let* ((accs (nreverse accs))
+                    (wrs (nreverse wrs))
+                    (vgs (mapcar (lambda (a) (declare (ignore a)) (gensym "SHV"))
+                                 accs))
+                    (read-binds (mapcar #'list vgs accs))
+                    ;; p[i] <- vgs[i+1], p[last] <- final-val
+                    (next-vals (append (cdr vgs) (list final-val)))
+                    (stores (mapcar (lambda (w v) (funcall w v)) wrs next-vals)))
+               `(let* (,@(nreverse all-bindings) ,@read-binds)
+                  ,@stores
+                  ,(car vgs)))))))))
 
   ;; REMF → modify plist, return generalized boolean
   (mvm-define-macro "REMF"
@@ -1087,13 +1195,19 @@
                (car ,result))
             `(car (%remf ,place ,indicator))))))
 
-  ;; PUSHNEW → adjoin + setq
+  ;; PUSHNEW → adjoin + store.  ITEM first, then place subforms once.
   (mvm-define-macro "PUSHNEW"
     (lambda (form)
       (let ((item (cadr form))
             (place (caddr form))
             (kwargs (cdddr form)))
-        `(setq ,place (adjoin ,item ,place ,@kwargs)))))
+        (if (symbolp place)
+            `(setq ,place (adjoin ,item ,place ,@kwargs))
+            (multiple-value-bind (bindings access writer)
+                (mvm-place-expansion place)
+              (let ((ig (gensym "PNI")))
+                `(let* ((,ig ,item) ,@bindings)
+                   ,(funcall writer `(adjoin ,ig ,access ,@kwargs)))))))))
 
   ;; PLUSP → (> x 0)
   ;; PLUSP/MINUSP/ABS/LOGNOT all take exactly one argument. Without
@@ -1167,16 +1281,23 @@
     (lambda (form)
       `(defvar ,(cadr form) ,(caddr form))))
 
-  ;; PUSH → (setq place (cons val place))
+  ;; PUSH → (setq place (cons val place)).  CLHS: ITEM evaluated first,
+  ;; then the place subforms once, then store.  For compound places use
+  ;; the place expansion so subforms aren't re-evaluated.
   (mvm-define-macro "PUSH"
     (lambda (form)
       (let ((val (cadr form))
             (place (caddr form)))
         (if (symbolp place)
             `(setq ,place (cons ,val ,place))
-            `(setf ,place (cons ,val ,place))))))
+            (multiple-value-bind (bindings access writer)
+                (mvm-place-expansion place)
+              (let ((ig (gensym "PSH")))
+                `(let* ((,ig ,val) ,@bindings)
+                   ,(funcall writer `(cons ,ig ,access)))))))))
 
-  ;; POP → extract car, advance cdr
+  ;; POP → extract car, advance cdr.  Compound places: read once via the
+  ;; expansion, write the cdr back through the same gensyms.
   (mvm-define-macro "POP"
     (lambda (form)
       (let ((place (cadr form))
@@ -1185,9 +1306,12 @@
             `(let ((,tmp (car ,place)))
                (setq ,place (cdr ,place))
                ,tmp)
-            `(let ((,tmp (car ,place)))
-               (setf ,place (cdr ,place))
-               ,tmp)))))
+            (multiple-value-bind (bindings access writer)
+                (mvm-place-expansion place)
+              (let ((ag (gensym "POA")))
+                `(let* (,@bindings (,ag ,access))
+                   ,(funcall writer `(cdr ,ag))
+                   (car ,ag))))))))
 
   ;; NTH-VALUE → (nth N (multiple-value-list FORM))
   ;; Implemented as a macro because FORM must be evaluated in a
@@ -1471,6 +1595,24 @@
                           ,dt   ; touch DT so the binding isn't dead-stripped
                           (puthash ,kt ,ht ,value)))
                      `(puthash ,(cadr place) ,(caddr place) ,value)))
+                ;; (setf (getf plist ind) val) → reassign the plist variable
+                ;; with the value spliced in (set-getf returns the new list).
+                ;; Mirrors the build-time rewriter so PSETF/SHIFTF/ROTATEF
+                ;; expansions that emit (setf (getf …) …) at COMPILE time —
+                ;; after the read-time rewriter has run — still work.
+                ((and (consp place) (name-eq (car place) "GETF"))
+                 (if (symbolp (cadr place))
+                     `(setq ,(cadr place)
+                            (set-getf ,(cadr place) ,(caddr place) ,value))
+                     `(set-getf ,(cadr place) ,(caddr place) ,value)))
+                ;; (setf (ldb spec n) val) → (setq n (dpb val spec n)) when N
+                ;; is a variable; otherwise the dpb result for nested places.
+                ((and (consp place) (name-eq (car place) "LDB"))
+                 (if (symbolp (caddr place))
+                     `(setq ,(caddr place)
+                            (dpb ,value ,(cadr place) ,(caddr place)))
+                     `(setf ,(caddr place)
+                            (dpb ,value ,(cadr place) ,(caddr place)))))
                 ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
                 ((and (consp place) (name-eq (car place) "MEM-REF"))
                  `(%setf-mem-ref ,place ,value))

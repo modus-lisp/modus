@@ -1773,12 +1773,23 @@
 ;; Polymorphic membership helper used by the set ops below — returns T
 ;; iff some element of LST matches ITEM-KEY under TEST-FN/KEY-FN.
 ;; Uses inline `eql` when test-fn is nil because #'eql isn't callable.
-(defun %set-member-p (item-key lst test-fn key-fn)
+;;
+;; SWAP controls the argument order passed to TEST-FN.  CLHS requires the
+;; set ops to call the test with (test list1-elem list2-elem) and NOT to
+;; reverse them (union.28-31, nunion.* lock this in).  For intersection /
+;; subsetp the outer loop walks list1, so ITEM-KEY is the list1 element and
+;; V (from LST=list2) is the list2 element — swap=nil gives (test l1 l2).
+;; For union the result LST is built from list1 while ITEM-KEY comes from
+;; list2, so swap=t restores (test l1-elem l2-elem) = (test v item-key).
+(defun %set-member-p (item-key lst test-fn key-fn &optional swap)
   (let ((cur lst) (found nil))
     (loop
       (when (or found (null cur)) (return found))
       (let ((v (if key-fn (funcall key-fn (car cur)) (car cur))))
-        (when (if test-fn (funcall test-fn item-key v) (eql item-key v))
+        (when (if test-fn
+                  (if swap (funcall test-fn v item-key)
+                      (funcall test-fn item-key v))
+                  (eql item-key v))
           (setq found t)))
       (setq cur (cdr cur)))))
 
@@ -1799,7 +1810,7 @@
          (r (copy-list l1)))
     (dolist (item l2 r)
       (let ((item-key (if key-fn (funcall key-fn item) item)))
-        (unless (%set-member-p item-key r test-fn key-fn)
+        (unless (%set-member-p item-key r test-fn key-fn t)
           (setq r (cons item r)))))))
 
 (defun union (l1 l2 &rest args) (%union-impl l1 l2 args))

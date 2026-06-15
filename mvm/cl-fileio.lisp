@@ -177,18 +177,26 @@
           (mem-ref (+ buf-addr 48) :u32)))))
 
 ;;; File stream constructor and accessors
-;;; Data = (fd dir pos buf buf-pos buf-len closed)
-;;; Encoded as a cons chain: (fd . (dir . (pos . (buf . (buf-pos . (buf-len . closed))))))
+;;; Data = (fd dir pos buf buf-pos buf-len closed elt-type)
+;;; Encoded as a cons chain:
+;;;   (fd . (dir . (pos . (buf . (buf-pos . (buf-len . (closed . elt-type)))))))
+;;; The final two-element tail (closed . elt-type) is a proper cons so
+;;; elt-type lives at the very last cdr.  elt-type is the :element-type the
+;;; file was opened with (a symbol like CHARACTER or a type specifier such
+;;; as (UNSIGNED-BYTE 8)).  stream-element-type reports it; binary streams
+;;; let read-sequence read BYTES (via %input-stream-reads-chars-p).
 
-(defun %make-file-stream-full (fd dir)
-  "Create a file stream with given fd and direction (0=in, 1=out, 2=io)."
-  (let ((buf (%make-string-array 4096)))
+(defun %make-file-stream-full (fd dir &rest et)
+  "Create a file stream with given fd and direction (0=in, 1=out, 2=io).
+   Optional ET arg is the :element-type (defaults to CHARACTER)."
+  (let ((buf (%make-string-array 4096))
+        (elt-type (if et (car et) 'character)))
     (%make-stream 9
-      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 nil)))))))))
+      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons nil elt-type))))))))))
 
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
-  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 t))))))))
+  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons t (quote character))))))))))
 
 (defun %fs-fd      (s) (car  (%stream-data s)))
 (defun %fs-dir     (s) (cadr (%stream-data s)))
@@ -199,12 +207,16 @@
 (defun %fs-bpos    (s) (car  (cddr (cddr (%stream-data s)))))
 (defun %fs-blen-cell (s) (cdr (cddr (cddr (%stream-data s)))))
 (defun %fs-blen    (s) (car  (cdr (cddr (cddr (%stream-data s))))))
-(defun %fs-closed  (s) (cdr  (cdr (cddr (cddr (%stream-data s))))))
+;;; closed flag now lives in the CAR of the final two-element tail cell.
+(defun %fs-closed-cell (s) (cdr (cdr (cddr (cddr (%stream-data s))))))
+(defun %fs-closed  (s) (car (cdr (cdr (cddr (cddr (%stream-data s)))))))
+;;; element-type lives in the CDR of that same final tail cell.
+(defun %fs-element-type (s) (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))
 
 (defun %fs-set-pos  (s v) (set-car (cddr (%stream-data s)) v))
 (defun %fs-set-bpos (s v) (set-car (cddr (cddr (%stream-data s))) v))
 (defun %fs-set-blen (s v) (set-car (cdr (cddr (cddr (%stream-data s)))) v))
-(defun %fs-set-closed (s v) (set-cdr (cdr (cddr (cddr (%stream-data s)))) v))
+(defun %fs-set-closed (s v) (set-car (cdr (cdr (cddr (cddr (%stream-data s))))) v))
 
 ;;; *default-pathname-defaults* — base directory for relative pathnames
 (defvar *default-pathname-defaults* "")
@@ -344,7 +356,7 @@
                (cond
                  ((null if-does-not-exist) nil)
                  (t (error 'file-error :pathname filespec)))
-               (%make-file-stream-full fd 0))))
+               (%make-file-stream-full fd 0 element-type))))
         ;; :output — write
         ((eq direction :output)
          (let ((exists (%sys-stat-exists path)))
@@ -360,7 +372,7 @@
                  (let ((fd (%sys-open-wronly path)))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 1))))
+                       (%make-file-stream-full fd 1 element-type))))
                 ((eq if-exists :overwrite)
                  ;; :overwrite means open existing file without truncating.
                  ;; O_WRONLY only (no O_CREAT, no O_TRUNC).
@@ -368,16 +380,16 @@
                                          (t (c) -1))))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 1))))
+                       (%make-file-stream-full fd 1 element-type))))
                 ((eq if-exists :append)
                  (let ((fd (%sys-open-append path)))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 1))))
+                       (%make-file-stream-full fd 1 element-type))))
                 (t (let ((fd (%sys-open-wronly path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 1))))))
+                         (%make-file-stream-full fd 1 element-type))))))
              ;; File doesn't exist
              (t
               (cond
@@ -393,7 +405,7 @@
                 (t (let ((fd (%sys-open-wronly path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 1)))))))))
+                         (%make-file-stream-full fd 1 element-type)))))))))
         ;; :io — read/write
         ((eq direction :io)
          (let ((exists (%sys-stat-exists path)))
@@ -406,7 +418,7 @@
                 (t (let ((fd (%sys-open-rdwr path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 2))))))
+                         (%make-file-stream-full fd 2 element-type))))))
              (t
               (cond
                 ((null if-does-not-exist) nil)
@@ -415,7 +427,7 @@
                 (t (let ((fd (%sys-open-rdwr path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 2)))))))))
+                         (%make-file-stream-full fd 2 element-type)))))))))
         (t (error "Unknown :direction ~A" direction))))))
 
 ;;; --- close ---
@@ -1604,6 +1616,9 @@
 
 (defun unread-char (ch &rest args)
   "Push back a character onto a stream."
+  ;; CLHS: (unread-char character &optional input-stream) — at most one
+  ;; trailing arg.  A second positional arg is a program-error.
+  (when (cdr args) (%signal-program-error))
   (let ((stream-arg (if args (car args) nil)))
     (let ((s (%resolve-input-stream stream-arg)))
       (when (streamp s)
@@ -1731,6 +1746,10 @@
    and file streams we delegate to read-char-from-stream since input is
    either immediately available (string buffer / file buffer / mem) or
    the stream has reached EOF — there is no 'wait' state to skip."
+  ;; CLHS: (read-char-no-hang &optional input-stream eof-error-p eof-value
+  ;; recursive-p) — at most four args.  A fifth positional arg is a
+  ;; program-error.
+  (when (cddddr args) (%signal-program-error))
   (let ((stream-arg (if args (car args) nil))
         (eof-error-p (if (cdr args) (cadr args) t))
         (eof-value (if (cddr args) (caddr args) nil)))

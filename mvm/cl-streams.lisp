@@ -87,7 +87,18 @@
           (if (>= (%fs-fd s) 0) t nil)
           t)
       nil))
-(defun stream-element-type (s) (quote character))
+(defun stream-element-type (s)
+  ;; For file streams (type 9) report the :element-type the stream was
+  ;; opened with (CHARACTER vs a byte type like (UNSIGNED-BYTE 8)).  All
+  ;; other stream types are character streams.  %fs-element-type lives in
+  ;; cl-fileio.lisp and is resolved at runtime via the symbol-function
+  ;; table (same as %fs-fd above).
+  (if (streamp s)
+      (if (= (%stream-type s) 9)
+          (let ((et (%fs-element-type s)))
+            (if et et (quote character)))
+          (quote character))
+      (quote character)))
 (defun stream-external-format (s) :default)
 (defun interactive-stream-p (s) nil)
 

@@ -65,6 +65,11 @@
 (defvar *%next-methods* nil)
 ;; Dynamic variable for current method's args (for call-next-method with no args)
 (defvar *%current-gf-args* nil)
+;; Dynamic variable for the GF object currently being dispatched.  Set at the
+;; top of each %gf-dispatch-* entry so CALL-NEXT-METHOD with replacement args
+;; can recompute the applicable-method set and enforce CLHS 7.6.6.2 (the new
+;; argument set must yield the same ordered applicable methods).
+(defvar *%current-gf* nil)
 
 ;;; ============================================================
 ;;; Built-in class precedence hierarchy
@@ -2842,6 +2847,10 @@
 
 (defun %gf-dispatch-standard (gf args applicable)
   "Standard method combination: :around > :before + primary + :after."
+  ;; Record the GF being dispatched so CALL-NEXT-METHOD can recompute the
+  ;; applicable-method set on replacement args (CLHS 7.6.6.2).  Save/restore
+  ;; for nested GF calls from within method bodies.
+  (setq *%current-gf* gf)
   (let ((around-methods nil)
         (before-methods nil)
         (primary-methods nil)
@@ -2945,6 +2954,7 @@
                           (saved-args *%current-gf-args*))
                       (setq *%next-methods* (cdr primary-methods))
                       (setq *%current-gf-args* args)
+                      (setq *%current-gf* gf)
                       (let ((rl (multiple-value-list
                                  (apply (%method-fn (car primary-methods)) args))))
                         (setq *%next-methods* saved-nm)
@@ -2981,6 +2991,7 @@
                   (saved-args *%current-gf-args*))
               (setq *%next-methods*    next-chain)
               (setq *%current-gf-args* args)
+              (setq *%current-gf* gf)
               (multiple-value-prog1
                   (apply (%method-fn (car around-methods)) args)
                 (setq *%next-methods*    saved-nm)
@@ -3448,6 +3459,18 @@
 ;;; call-next-method / next-method-p
 ;;; ============================================================
 
+(defun %applicable-sets-eq (a b)
+  "True if applicable-method lists A and B are the same ordered set of
+   method records (element-wise EQ, same length).  Used to enforce CLHS
+   7.6.6.2 in CALL-NEXT-METHOD."
+  (let ((ca a) (cb b))
+    (loop
+      (cond
+        ((and (null ca) (null cb)) (return t))
+        ((or (null ca) (null cb))  (return nil))
+        ((not (eq (car ca) (car cb))) (return nil))
+        (t (setq ca (cdr ca)) (setq cb (cdr cb)))))))
+
 (defun call-next-method (&rest new-args)
   "Call the next method in the applicable method list.
    Uses setq+save/restore around the inner call so the rebinding
@@ -3457,6 +3480,18 @@
    multiple-value-prog1 preserves the next method's MV state so
    (call-next-method) inside a chain of methods returning (values …)
    produces those values, not just the primary."
+  ;; CLHS 7.6.6.2: when CALL-NEXT-METHOD is given replacement arguments,
+  ;; the ordered set of applicable methods for the new arguments must be
+  ;; the same as for the original generic-function arguments; otherwise an
+  ;; error is signaled.  We recompute both applicable lists from the GF
+  ;; recorded by the dispatcher (*%current-gf*) and compare them as ordered
+  ;; method-record lists (EQ on the records — they come from the same GF's
+  ;; method table, so identity is a sound ordered-set comparison).
+  (when (and new-args *%current-gf* (%gf-p *%current-gf*))
+    (let ((orig-set (%collect-applicable-methods *%current-gf* *%current-gf-args*))
+          (new-set  (%collect-applicable-methods *%current-gf* new-args)))
+      (unless (%applicable-sets-eq orig-set new-set)
+        (error "call-next-method: changed arguments yield a different set of applicable methods"))))
   (let ((next *%next-methods*))
     (if (null next)
       (error "no next method")

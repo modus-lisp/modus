@@ -1416,6 +1416,24 @@
                         (if (slot-exists-p o 'rca) t nil)
                         (if (slot-exists-p o 'zz) t nil)))
     '(t t nil))
+  ;; 8640-8649 — SLOT-EXISTS-P on ALLOCATE-INSTANCE output w/ :allocation slots
+  ;; (slot-exists-p.1-.6).  Mirror the suite: defclass w/ (b :allocation :class)
+  ;; (c :allocation :instance), allocate-instance, then slot-exists-p.
+  (eval '(defclass probe-sep-alloc ()
+           (a (b :allocation :class) (c :allocation :instance))))
+  (deftest 8640 (if (%find-clos-class 'probe-sep-alloc) t nil) t)
+  (deftest 8641 (let ((cls (%find-clos-class 'probe-sep-alloc)))
+                  (if cls (aref cls 2) :no-class))
+    '(a b c))
+  (deftest 8642 (if (%clos-instance-p (allocate-instance (find-class 'probe-sep-alloc))) t nil) t)
+  (deftest 8643 (let ((o (allocate-instance (find-class 'probe-sep-alloc))))
+                  (if (slot-exists-p o 'a) t nil)) t)
+  (deftest 8644 (let ((o (allocate-instance (find-class 'probe-sep-alloc))))
+                  (if (slot-exists-p o 'b) t nil)) t)
+  (deftest 8645 (let ((o (allocate-instance (find-class 'probe-sep-alloc))))
+                  (if (slot-exists-p o 'c) t nil)) t)
+  (deftest 8646 (let ((o (allocate-instance (find-class 'probe-sep-alloc))))
+                  (if (slot-exists-p o 'd) t nil)) nil)
   ;; ----------------------------------------------------------------
   ;; 8690-8693 — NEXT-METHOD-P built-in-type subtype dispatch
   ;; (next-method-p.1/.3).  An (x integer) primary's call-next-method

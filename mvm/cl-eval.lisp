@@ -182,6 +182,18 @@
 (defun fdefinition (sym)
   "Return the function definition of SYM.
    For generic functions, returns the GF object."
+  ;; CLHS: fdefinition is defined for macros (returns the macro's expander
+  ;; function) and for special operators its consequences are merely
+  ;; undefined — it must NOT signal undefined-function the way it would for
+  ;; a never-fbound symbol.  symbol-function below errors for cond/setq/etc.
+  ;; (they live in no function table), so intercept macros & special
+  ;; operators first.  (fdefinition.2 (fdefinition 'cond), fdefinition.3
+  ;; (fdefinition 'setq).)
+  (let ((mf (macro-function sym)))
+    (when mf (return-from fdefinition mf)))
+  (when (and (or (%cl-sym-p sym) (%native-sym-p sym))
+             (special-operator-p sym))
+    (return-from fdefinition sym))
   (let ((name (cond
                 ((%cl-sym-p sym) (%cl-sym-name sym))
                 ((stringp sym) sym)

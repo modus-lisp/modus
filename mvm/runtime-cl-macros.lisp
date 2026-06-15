@@ -421,5 +421,17 @@
           (unless (member :unix *features*)
             (setq *features* (cons :unix *features*)))
           (unless (member :linux *features*)
-            (setq *features* (cons :linux *features*)))))
+            (setq *features* (cons :linux *features*)))
+          ;; Advertise :modus so UIOP recognises this implementation.  The
+          ;; vendored asdf.lisp guards its "ASDF is not supported on your
+          ;; implementation" hard error with
+          ;;   #-(or abcl … mkcl modus sbcl scl xcl) (error …)
+          ;; so without :modus that error fires (and, more importantly, UIOP's
+          ;; per-impl dispatch has no Modus branch to land on).  :modus selects
+          ;; the generic fall-throughs.  Note: :modus is NOT a Genera/SBCL
+          ;; impersonation — those features carry working-but-wrong reader
+          ;; branches (e.g. :genera reexports FUTURE-COMMON-LISP, which Modus
+          ;; lacks); :modus only suppresses the unsupported-impl error.
+          (unless (member :modus *features*)
+            (setq *features* (cons :modus *features*)))))
     (t (c) nil)))

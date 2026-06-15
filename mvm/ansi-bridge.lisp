@@ -3212,26 +3212,196 @@
 ;;; Trigonometric and Transcendental Functions
 ;;; ============================================================
 
-(defun atanh (x)
+;; Strict 1-arg arity (CLHS): (atanh), (atanh 1.0 1.0) etc. signal
+;; PROGRAM-ERROR.  The &rest extra guard mirrors integerp/isqrt above.
+(defun atanh (x &rest extra)
   "Inverse hyperbolic tangent."
   ;; atanh(x) = 0.5 * ln((1+x)/(1-x))
-  (* 0.5 (log (/ (+ 1.0 (float x)) (- 1.0 (float x))))))
+  (if extra
+      (%program-error "atanh requires exactly 1 argument")
+      (* 0.5 (log (/ (+ 1.0 (float x)) (- 1.0 (float x)))))))
 
-(defun asinh (x)
+(defun asinh (x &rest extra)
   "Inverse hyperbolic sine."
   ;; asinh(x) = ln(x + sqrt(x^2 + 1))
-  (let ((fx (float x)))
-    (log (+ fx (sqrt (+ (* fx fx) 1.0))))))
+  (if extra
+      (%program-error "asinh requires exactly 1 argument")
+      (let ((fx (float x)))
+        (log (+ fx (sqrt (+ (* fx fx) 1.0)))))))
 
-(defun acosh (x)
+(defun acosh (x &rest extra)
   "Inverse hyperbolic cosine."
   ;; acosh(x) = ln(x + sqrt(x^2 - 1))
-  (let ((fx (float x)))
-    (log (+ fx (sqrt (- (* fx fx) 1.0))))))
+  (if extra
+      (%program-error "acosh requires exactly 1 argument")
+      (let ((fx (float x)))
+        (log (+ fx (sqrt (- (* fx fx) 1.0)))))))
 
 ;; conjugate lives in cl-sequences.lisp — the stub here returned the
 ;; arg unchanged and shadowed the real implementation that handles
 ;; (complex r i) properly.
+
+;;; ============================================================
+;;; Transcendental / math arity guards (CLHS 12.2)
+;;; ============================================================
+;;; The implementations of sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/
+;;; exp/sqrt/abs live in cl-types.lisp / cl-clos.lisp / cl-eval.lisp with
+;;; a single required parameter (atan: one &optional), so calling them with
+;;; surplus positional arguments — e.g. (sin 0.0 0.0), (exp 0 0 0),
+;;; (abs 0 0) — was silently accepted (extra args dropped) instead of
+;;; signalling PROGRAM-ERROR per CLHS.  ansi-bridge loads LAST, so these
+;;; overrides win the last-defun-wins race.  Each delegates to the same
+;;; %-helpers the home defun uses (NOT to the public name), so there is no
+;;; recursion and the numeric result is bit-identical to the home version.
+;;; Tests: sin.error / cos.error / … / exp.error / sqrt.error / abs.error.
+
+(defun sin (x &rest extra)
+  (if extra
+      (%program-error "sin requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (%sin-f (%any-to-float x))))))
+
+(defun cos (x &rest extra)
+  (if extra
+      (%program-error "cos requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 1)
+            (t (%cos-f (%any-to-float x))))))
+
+(defun tan (x &rest extra)
+  (if extra
+      (%program-error "tan requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (let* ((xf (%any-to-float x))
+                      (r (%trig-reduce-f xf))
+                      (sn (%sin-poly-f r))
+                      (cs (%cos-poly-f r)))
+                 (%float-div sn cs))))))
+
+(defun asin (x &rest extra)
+  (if extra
+      (%program-error "asin requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (%asin-f (%any-to-float x))))))
+
+(defun acos (x &rest extra)
+  (if extra
+      (%program-error "acos requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 1)) 0)
+            ((and (integerp x) (= x 0)) (%fpi/2))
+            (t (%float-sub (%fpi/2) (%asin-f (%any-to-float x)))))))
+
+;; atan accepts 1 or 2 args (atan x) / (atan y x); 3+ is the error case.
+(defun atan (x &optional y &rest extra)
+  (if extra
+      (%program-error "atan accepts at most 2 arguments")
+      (cond
+        (y
+         (let ((yf (%any-to-float x))     ; CLHS (atan number divisor): number=y
+               (xf (%any-to-float y)))    ; divisor=x
+           (cond
+             ((%float-zero-p xf)
+              (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
+                    ((%float-zero-p yf) (%fl 0))
+                    (t (%fpi/2))))
+             ((float-negative-p xf)
+              (let ((base (%atan-f (%float-div yf xf))))
+                (if (float-negative-p yf)
+                    (%float-sub base (%fpi))
+                    (%float-add base (%fpi)))))
+             (t (%atan-f (%float-div yf xf))))))
+        ((and (integerp x) (= x 0)) 0)
+        (t (%atan-f (%any-to-float x))))))
+
+(defun sinh (x &rest extra)
+  (if extra
+      (%program-error "sinh requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (let* ((xf (%any-to-float x))
+                      (ep (%exp-f xf))
+                      (em (%exp-f (%float-neg xf))))
+                 (%float-div (%float-sub ep em) (%fl 2)))))))
+
+(defun cosh (x &rest extra)
+  (if extra
+      (%program-error "cosh requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 1)
+            (t (let* ((xf (%any-to-float x))
+                      (ep (%exp-f xf))
+                      (em (%exp-f (%float-neg xf))))
+                 (%float-div (%float-add ep em) (%fl 2)))))))
+
+(defun tanh (x &rest extra)
+  (if extra
+      (%program-error "tanh requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (let* ((xf (%any-to-float x))
+                      (ep (%exp-f xf))
+                      (em (%exp-f (%float-neg xf))))
+                 (%float-div (%float-sub ep em) (%float-add ep em)))))))
+
+(defun exp (x &rest extra)
+  (if extra
+      (%program-error "exp requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 1)
+            (t (%exp-f (%any-to-float x))))))
+
+;; ABS — strict 1-arg.  (abs 0 0) / (abs 0 nil nil) → PROGRAM-ERROR.
+;; Body copies the cl-eval.lisp impl (complex magnitude via sqrt; else
+;; sign-flip).  sqrt below is this file's override (terminating).
+(defun abs (n &rest extra)
+  (if extra
+      (%program-error "abs requires exactly 1 argument")
+      (cond
+        ((complexp n)
+         (let ((r (realpart n)) (i (imagpart n)))
+           (sqrt (+ (* r r) (* i i)))))
+        ((< n 0) (- 0 n))
+        (t n))))
+
+;; SQRT — strict 1-arg.  (sqrt 0 nil) → PROGRAM-ERROR.  Body copies the
+;; cl-clos.lisp impl verbatim (integer/ratio/boxed-float/IEEE branches);
+;; the boxed-float branch self-recurses through this override, which
+;; terminates because the recursion target is an integer or ratio.
+(defun sqrt (n &rest extra)
+  (if extra
+      (%program-error "sqrt requires exactly 1 argument")
+      (cond
+        ((integerp n)
+         (when (< n 0) (error "sqrt of negative"))
+         (let ((s (isqrt n)))
+           (if (= (* s s) n)
+               s
+               (let* ((K 10000)
+                      (scaled (* n K K))
+                      (approx (isqrt scaled)))
+                 (%make-rat approx K)))))
+        ((ratiop n)
+         (let* ((num (ratio-numerator n))
+                (den (ratio-denominator n)))
+           (when (< num 0) (error "sqrt of negative"))
+           (let ((s (isqrt (* num den))))
+             (if (= (* s s) (* num den))
+                 (%make-rat s den)
+                 (let* ((K 10000)
+                        (approx (isqrt (* num den K K))))
+                   (%make-rat approx (* den K)))))))
+        ((and (not (fixnump n)) (not (consp n)) (not (null n))
+              (= (obj-subtag n) #x32)
+              (= (array-length n) 2))
+         (let ((num (aref n 0)) (den (aref n 1)))
+           (sqrt (if (= den 1) num (%make-rat num den)))))
+        ((%ieee-float-p n)
+         (cond
+           ((%float-zero-p n) n)
+           (t (let ((half (%float-div (%float-from-int 1) (%float-from-int 2)))
+                    (x n))
+                (let ((i 0))
+                  (loop
+                    (when (>= i 8) (return x))
+                    (setq x (%float-mul (%float-add x (%float-div n x)) half))
+                    (setq i (+ i 1))))
+                x))))
+        (t 0))))
 
 ;;; ============================================================
 ;;; BOOLE

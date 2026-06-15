@@ -3177,6 +3177,17 @@
                 (setq kp (cdr kp))
                 (setq i (+ i 1))))
             (when kp
+              ;; CLHS 3.5.1.6: the keyword portion must be a proper
+              ;; even-length plist — an odd trailing keyword (e.g.
+              ;; (gf 1 :y) with no value) is a program-error
+              ;; (defmethod.error.15).
+              (let ((klen 0) (kc kp))
+                (loop
+                  (when (null kc) (return nil))
+                  (setq klen (+ klen 1))
+                  (setq kc (cdr kc)))
+                (when (not (= 0 (mod klen 2)))
+                  (%signal-program-error)))
               ;; Call-site :allow-other-keys — leftmost occurrence wins.
               (let ((aok-seen nil) (aok-val nil))
                 (let ((cur kp))
@@ -3232,7 +3243,9 @@
    not part of the congruence-relevant lambda list)."
   (let ((required nil)
         (optionals nil)
-        (has-rest-or-key nil)
+        (has-rest nil)
+        (has-key nil)
+        (has-aok nil)
         (mode :required)
         (cur params))
     (loop
@@ -3241,13 +3254,13 @@
         (cond
           ((%lambda-list-keyword-p p "&OPTIONAL") (setq mode :optional))
           ((%lambda-list-keyword-p p "&REST")
-           (setq mode :rest) (setq has-rest-or-key t))
+           (setq mode :rest) (setq has-rest t))
           ((%lambda-list-keyword-p p "&BODY")
-           (setq mode :rest) (setq has-rest-or-key t))
+           (setq mode :rest) (setq has-rest t))
           ((%lambda-list-keyword-p p "&KEY")
-           (setq mode :key) (setq has-rest-or-key t))
+           (setq mode :key) (setq has-key t))
           ((%lambda-list-keyword-p p "&AUX") (setq mode :aux))
-          ((%lambda-list-keyword-p p "&ALLOW-OTHER-KEYS") nil)
+          ((%lambda-list-keyword-p p "&ALLOW-OTHER-KEYS") (setq has-aok t))
           (t
            (cond
              ((eq mode :required)
@@ -3258,8 +3271,16 @@
     (let ((ll (nreverse required)))
       (when optionals
         (setq ll (append ll (cons '&optional (nreverse optionals)))))
-      (when has-rest-or-key
-        (setq ll (append ll (list '&rest '%gf-derived-rest))))
+      ;; CLHS 7.6.4: the GF lambda-list must contain &rest / &key when the
+      ;; method does, so the GF is variadic AND so %gf-check-keys (which
+      ;; only activates when the GF declares &KEY) runs keyword validation
+      ;; against the applicable methods' accepted keys (defmethod.error.14/.15).
+      (cond
+        (has-key
+         (setq ll (append ll (list '&key)))
+         (when has-aok (setq ll (append ll (list '&allow-other-keys)))))
+        (has-rest
+         (setq ll (append ll (list '&rest '%gf-derived-rest)))))
       ll)))
 
 (defun %gf-check-arity (gf args)

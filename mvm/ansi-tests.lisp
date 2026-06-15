@@ -1500,9 +1500,9 @@
     :OK)
   (deftest 8683
     (let ((sym (gensym)))
-      ;; GF with &key accepts extra (keyword) args without arity error
-      (eval (list 'defmethod sym (list (list 'x 't) '&key) 'x))
-      (handler-case (progn (eval (list sym 1 :a 2)) :OK) (t (c) :ARITYERR)))
+      ;; GF with &key a accepts the :a keyword without arity error
+      (eval (list 'defmethod sym (list (list 'x 't) '&key 'a) 'x))
+      (handler-case (progn (eval (list sym 1 :a 2)) :OK) (t (c) :KEYERR)))
     :OK)
   ;; ----------------------------------------------------------------
   ;; 8694/8696 — defclass.forward-ref: (eval (defclass C (FWD) nil))

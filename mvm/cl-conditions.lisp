@@ -17,9 +17,24 @@
 ;;; alist: (name parents slot-specs default-initargs report-fn)
 
 (defun %cond-reg-find (name)
-  "Find condition type descriptor by name."
-  (let ((entry (assoc name *condition-type-registry*)))
-    entry))
+  "Find condition type descriptor by name.  Compares by EQ first, then by
+   symbol-name-hash (slot-0 of the symbol object) so a cross-file native
+   MVM symbol that drifted from the one used at DEFINE-CONDITION time still
+   resolves.  Mirrors %condition-slot / %initarg-key-eq hash-robustness;
+   raw ASSOC missed drifted type names → all-NIL condition lookups."
+  (let ((nhash (and (symbolp name) (not (null name)) (not (eq name t))
+                    (aref name 0)))
+        (cur *condition-type-registry*))
+    (loop
+      (when (null cur) (return nil))
+      (let ((entry (car cur)))
+        (when (consp entry)
+          (let ((k (car entry)))
+            (when (or (eq k name)
+                      (and nhash (symbolp k) (not (null k)) (not (eq k t))
+                           (= (aref k 0) nhash)))
+              (return entry)))))
+      (setq cur (cdr cur)))))
 
 (defun %cond-reg-parents (entry) (cadr entry))
 (defun %cond-reg-slots (entry) (caddr entry))
@@ -49,7 +64,7 @@
     (if (= (obj-subtag obj) #x32)
         (if (= (array-length obj) 2)
             (let ((type-name (aref obj 0)))
-              (if (assoc type-name *condition-type-registry*) t nil))
+              (if (%cond-reg-find type-name) t nil))
             nil)
         nil)))
 
@@ -99,7 +114,13 @@
   (if (not (%condition-p cond)) nil
     (let ((cond-type (%condition-type-name cond)))
       (let ((ancestors (%condition-all-parents cond-type)))
-        (if (member type-name ancestors) t nil)))))
+        ;; Hash-robust membership: a TYPE-NAME passed from a different
+        ;; defining file may have drifted from the native MVM symbol
+        ;; stored in the registry/ancestor list.  %initarg-in-list-p
+        ;; compares by EQ then symbol-name-hash, like the rest of the
+        ;; condition lookups, so the subtype check doesn't spuriously
+        ;; return NIL under symbol drift.
+        (if (%initarg-in-list-p type-name ancestors) t nil)))))
 
 (defun %collect-all-slots (name)
   "Collect all slot specs for a type including inherited slots.

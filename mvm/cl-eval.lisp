@@ -3233,9 +3233,23 @@
       ;; LOAD-TIME-VALUE (eval now)
       ((%eval-sym-eq op "LOAD-TIME-VALUE")
        (%eval-in-env (car args) env))
-      ;; EVAL-WHEN (always eval)
+      ;; EVAL-WHEN — (eval-when (SITUATION*) BODY*)
+      ;; The runtime tree-walking interpreter IS the `eval` processing path
+      ;; (CLHS 3.2.3.1 "not-compile-time"), never compile-file top-level
+      ;; processing.  Per CLHS, when an EVAL-WHEN is evaluated by EVAL the
+      ;; body runs iff :EXECUTE (or the deprecated EVAL) is among the
+      ;; situations; :COMPILE-TOPLEVEL / :LOAD-TOPLEVEL (and deprecated
+      ;; COMPILE / LOAD) alone do NOT trigger evaluation here.  Empty/absent
+      ;; situations → NIL.
       ((%eval-sym-eq op "EVAL-WHEN")
-       (%eval-progn (cdr args) env))
+       (let ((situations (car args))
+             (run nil))
+         (dolist (s situations)
+           (when (or (%eval-sym-eq s "EXECUTE") (%eval-sym-eq s "EVAL"))
+             (setq run t)))
+         (if run
+             (%eval-progn (cdr args) env)
+             nil)))
       ;; HANDLER-BIND — (handler-bind ((TYPE FN-FORM)*) BODY*)
       ;; Mirrors build-ansi-test.lisp's compile-time rewrite into a
       ;; %with-handler-bind call.  Each binding's FN-FORM is evaluated

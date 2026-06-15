@@ -3560,10 +3560,23 @@
                          :fn-names (compile-env-fn-names env))))
            (compile-progn sm-body new-env dest))))
 
-      ;; EVAL-WHEN — (eval-when (situations) forms...) → compile body when :execute present
-      ;; In our compiler there's no compile vs load distinction, always execute
+      ;; EVAL-WHEN — (eval-when (situations) forms...)
+      ;; This is the NON-top-level path (compile-form).  Per CLHS 3.2.3.1,
+      ;; a non-top-level EVAL-WHEN is equivalent to a PROGN of the body iff
+      ;; :EXECUTE (or the deprecated EVAL) is among the situations; with
+      ;; only :COMPILE-TOPLEVEL / :LOAD-TOPLEVEL (or deprecated COMPILE /
+      ;; LOAD), or no situations, it evaluates to NIL.  (Top-level
+      ;; processing is handled separately in mvm-compile-toplevel, where MVM
+      ;; collapses compile/load to a single execute phase.)
       ((= op-name 1086924202144944840)
-       (compile-progn (cddr form) env dest))
+       (let ((situations (cadr form))
+             (run nil))
+         (dolist (s situations)
+           (when (or (name-eq s "EXECUTE") (name-eq s "EVAL"))
+             (setq run t)))
+         (if run
+             (compile-progn (cddr form) env dest)
+             (compile-form nil env dest))))
 
       ;; PROGV — (progv vars vals body...) — dynamic binding.
       ;; Evaluate vars-form, then vals-form, save current values,

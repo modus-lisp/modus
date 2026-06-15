@@ -346,9 +346,11 @@
     (t (if (float-negative-p (%any-to-float x)) (%fpi) (%fl 0)))))
 
 (defun cis (x)
-  "cis(x) = cos(x) + i*sin(x) — modus has no complex type, so return cos(x)
-   as the real part (lossy but matches our (complex r) → r convention)."
-  (cos x))
+  "cis(x) = e^(i*x) = cos(x) + i*sin(x).  Build a real complex object so
+   complexp/realpart/imagpart hold; the imaginary part is a float so the
+   (complex r 0.0) → real simplification does NOT collapse it (except when
+   sin x is exactly the rational 0, which is the correct degenerate case)."
+  (complex (cos x) (sin x)))
 (defun integer (n) n)  ; not a real CL function but used as type coercion
 ;; Public AREF/ASET now apply the string code↔char lift themselves, so
 ;; CHAR/SCHAR just forward (no extra code-char) and SET-SCHAR lets ASET
@@ -1564,6 +1566,12 @@
      ;; Bignums also box per value.  numeric-equal-p handles all
      ;; integer-typed combinations including bignum slot-compare.
      (numeric-equal-p a b))
+    ((and (%complex-p a) (%complex-p b))
+     ;; CLHS: (eql c1 c2) iff realparts are eql AND imagparts are eql.
+     ;; Recurse through eql so each part's own type+value rule applies
+     ;; (floats slot-compare, integers identity).
+     (and (eql (%complex-real a) (%complex-real b))
+          (eql (%complex-imag a) (%complex-imag b))))
     (t nil)))
 ;; Bare defuns for the primitive cons/car/cdr opcodes so #'cons /
 ;; #'car / #'cdr resolve to callable function objects (used by reduce

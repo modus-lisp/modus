@@ -4606,19 +4606,26 @@
                   (aset data i (if (and str-data (characterp v)) (char-code v) v)))
                 (setq i (+ i 1)))))
            (t data))))
-      ;; Multi-dim: recurse into each sub-list.
+      ;; Multi-dim: recurse into each sub-row.  CONTENTS may be a list OR
+      ;; a vector (e.g. a fill-pointer vector — MAKE-ARRAY.21).
       (t
-       (let ((cur contents)
-             (sub-size 1))
+       (let ((sub-size 1))
          ;; size of each "row" = product of remaining dims
          (let ((d (cdr dims)))
            (loop (when (null d) (return nil))
              (setq sub-size (* sub-size (car d)))
              (setq d (cdr d))))
-         (loop (when (null cur) (return data))
-           (%mda-fill-contents-sub data i (car cur) (cdr dims))
-           (setq i (+ i sub-size))
-           (setq cur (cdr cur)))
+         (if (consp contents)
+             (let ((cur contents))
+               (loop (when (null cur) (return data))
+                 (%mda-fill-contents-sub data i (car cur) (cdr dims))
+                 (setq i (+ i sub-size))
+                 (setq cur (cdr cur))))
+             (let ((len (length contents)) (j 0))
+               (loop (when (>= j len) (return data))
+                 (%mda-fill-contents-sub data i (elt contents j) (cdr dims))
+                 (setq i (+ i sub-size))
+                 (setq j (+ j 1)))))
          data)))))
 
 (defun %mda-fill-contents-sub (data offset sub-contents sub-dims)
@@ -4629,22 +4636,47 @@
     ((null sub-dims)
      (aset data offset sub-contents))
     ((null (cdr sub-dims))
-     (let ((cur sub-contents) (i offset))
-       (loop (when (null cur) (return data))
-         (aset data i (car cur))
-         (setq cur (cdr cur))
-         (setq i (+ i 1)))))
+     ;; Last dim: SUB-CONTENTS is a flat sequence — list OR vector/string.
+     ;; CLHS allows any sequence at any level of :initial-contents, so a
+     ;; row may be e.g. #(a b c) (MAKE-ARRAY.18/.20/.21).  The old code
+     ;; assumed a list and CAR'd a vector → crash.
+     (let ((str-data (stringp data)))
+       (if (consp sub-contents)
+           (let ((cur sub-contents) (i offset))
+             (loop (when (null cur) (return data))
+               (let ((v (car cur)))
+                 (aset data i (if (and str-data (characterp v)) (char-code v) v)))
+               (setq cur (cdr cur))
+               (setq i (+ i 1))))
+           ;; Vector / string row.
+           (let ((len (length sub-contents)) (j 0) (i offset))
+             (loop (when (>= j len) (return data))
+               (let ((v (elt sub-contents j)))
+                 (aset data i (cond
+                                (str-data (if (characterp v) (char-code v) v))
+                                (t v))))
+               (setq j (+ j 1))
+               (setq i (+ i 1)))))))
     (t
-     (let ((cur sub-contents) (i offset)
+     ;; Interior dim: SUB-CONTENTS is a sequence of sub-rows — list OR
+     ;; vector.  Recurse into each, advancing by the row's flat size.
+     (let ((i offset)
            (sub-size 1))
        (let ((d (cdr sub-dims)))
          (loop (when (null d) (return nil))
            (setq sub-size (* sub-size (car d)))
            (setq d (cdr d))))
-       (loop (when (null cur) (return data))
-         (%mda-fill-contents-sub data i (car cur) (cdr sub-dims))
-         (setq i (+ i sub-size))
-         (setq cur (cdr cur)))))))
+       (if (consp sub-contents)
+           (let ((cur sub-contents))
+             (loop (when (null cur) (return data))
+               (%mda-fill-contents-sub data i (car cur) (cdr sub-dims))
+               (setq i (+ i sub-size))
+               (setq cur (cdr cur))))
+           (let ((len (length sub-contents)) (j 0))
+             (loop (when (>= j len) (return data))
+               (%mda-fill-contents-sub data i (elt sub-contents j) (cdr sub-dims))
+               (setq i (+ i sub-size))
+               (setq j (+ j 1)))))))))
 
 (defun %make-array-fill-init (n init)
   "Allocate a fresh general array of size N and fill every slot with INIT."

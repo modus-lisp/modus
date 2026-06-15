@@ -756,16 +756,17 @@
 ;;; --- Directory string parser (used by %parse-pathname-string and merge) ---
 
 ;; NB (e159986 string-AREF): %split-directory-string and
-;; %parse-pathname-string below still use PUBLIC (aref s i) — i.e. they
-;; compare a CHARACTER against the raw code 47/46.  That comparison is
-;; technically wrong CL (char vs int), but converting these two to
-;; %prim-aref (which makes pathname-name/type/directory CL-correct)
-;; cascades uiop's pathname arithmetic into failure: the ASDF gauntlet
-;; regresses 226→100 (uiop/launch-program define-package onward, latent
-;; uiop-path gap exposed by correct parsing).  The glob matcher,
-;; %find-colon, %component-wild-p, ensure-directories-exist and
-;; %c-string-at WERE converted (gauntlet held at 226).  Re-converting the
-;; namestring parser is gated on first closing the downstream uiop gap.
+;; %parse-pathname-string compare characters against the raw slash/dot
+;; codes 47/46.  Public (aref s i) now lifts a string element to a
+;; CHARACTER, so we wrap it in (char-code ...) — CL-correct and the same
+;; numeric comparison as %prim-aref, but going through the lifted char so
+;; it also works on wrapper strings.  This makes pathname-name / -type /
+;; -directory parse correctly (slashes and the basename dot are found).
+;; WARNING (build-generic / ASDF gauntlet only): correct parsing here
+;; exposes a latent uiop pathname-arithmetic gap downstream; if the
+;; gauntlet regresses (226→~100 at uiop/launch-program define-package),
+;; that is the downstream gap, not this fix.  The ANSI binary wants the
+;; correct parse (truename / user-homedir-pathname / pathname-name tests).
 (defun %split-directory-string (s)
   "Split a directory string like \"/a/b/\" or \"a/b/\" into
    (:absolute \"a\" \"b\") or (:relative \"a\" \"b\").  Empty → nil."
@@ -773,15 +774,15 @@
     (cond
       ((= len 0) nil)
       (t
-       (let ((absolute (= (aref s 0) 47))
+       (let ((absolute (= (char-code (aref s 0)) 47))
              (parts nil)
-             (start (if (= (aref s 0) 47) 1 0))
+             (start (if (= (char-code (aref s 0)) 47) 1 0))
              (k 0))
          (setq k start)
          (let ((cur-start start))
            (loop
              (when (>= k len) (return nil))
-             (when (= (aref s k) 47)
+             (when (= (char-code (aref s k)) 47)
                (when (> k cur-start)
                  (setq parts (cons (%substring s cur-start k) parts)))
                (setq cur-start (+ k 1)))
@@ -805,7 +806,7 @@
          (i 0))
     (loop
       (when (>= i len) (return nil))
-      (when (= (aref stripped i) 47) (setq last-slash i))
+      (when (= (char-code (aref stripped i)) 47) (setq last-slash i))
       (setq i (+ i 1)))
     (let* ((basename (if (= last-slash -1)
                          stripped
@@ -818,7 +819,7 @@
            (j 0))
       (loop
         (when (>= j blen) (return nil))
-        (when (= (aref basename j) 46) (setq last-dot j))
+        (when (= (char-code (aref basename j)) 46) (setq last-dot j))
         (setq j (+ j 1)))
       (let* ((nm (cond
                    ((= blen 0) nil)
@@ -952,9 +953,31 @@
   (declare (ignore x))
   "")
 
+(defun %string-prefix-p (pfx s)
+  "T if string S begins with string PFX."
+  (let ((pl (length pfx)) (sl (length s)))
+    (if (> pl sl)
+        nil
+        (let ((i 0) (ok t))
+          (loop
+            (when (>= i pl) (return ok))
+            (unless (= (char-code (aref pfx i)) (char-code (aref s i)))
+              (setq ok nil) (return nil))
+            (setq i (+ i 1)))))))
+
 (defun enough-namestring (x &rest args)
-  (declare (ignore args))
-  (namestring x))
+  "CLHS: return the shortest namestring that, relative to DEFAULTS,
+   identifies the same file as X.  If X's namestring begins with the
+   DEFAULTS directory prefix, strip it (so a file in the default
+   directory reduces to its file-namestring)."
+  (let* ((full (namestring x))
+         (defaults (if args (car args) *default-pathname-defaults*))
+         (dir (handler-case (directory-namestring defaults) (t (c) ""))))
+    (cond
+      ((and dir (stringp dir) (> (length dir) 0)
+            (%string-prefix-p dir full))
+       (%substring full (length dir) (length full)))
+      (t full))))
 
 ;;; --- make-pathname ---
 

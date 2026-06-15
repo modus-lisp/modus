@@ -210,16 +210,35 @@
               (setq cur (cdr cur))
               (setq i (+ i 1)))))))))
 
+(defun %sis-normalize-string (str)
+  "Coerce STR (which may be a fill-pointer / displaced / adjustable wrapper
+   string, i.e. a cons-based array wrapper) into a fresh SIMPLE string of
+   its logical length.  The string-input read path uses %prim-aref for
+   speed, which only works on a real string object — a cons wrapper would
+   be read as cons memory (garbage / crash).  Simple strings pass through
+   unchanged."
+  (if (and (consp str) (%wrapper-stringp str))
+      (let* ((n (length str))
+             (s (%make-string-array n))
+             (i 0))
+        (loop
+          (when (>= i n) (return s))
+          ;; %wrapper-aref returns the raw char CODE; %prim-aset stores it.
+          (%prim-aset s i (%wrapper-aref str i))
+          (setq i (+ i 1))))
+      str))
+
 (defun make-string-input-stream (str &rest args)
   ;; CLHS: (make-string-input-stream string &optional start end).
   ;; A 4th positional argument is a program-error.
   (when (cddr args) (%signal-program-error))
-  (let ((start (if args (car args) 0))
-        (end (if (cdr args) (cadr args) nil)))
-    (let ((actual-str (if (or (> start 0) end)
-                          (%substring str start (if end end (length str)))
-                          str)))
-      (%make-stream 1 (cons actual-str (cons 0 nil))))))
+  (let ((str (%sis-normalize-string str)))
+    (let ((start (if args (car args) 0))
+          (end (if (cdr args) (cadr args) nil)))
+      (let ((actual-str (if (or (> start 0) end)
+                            (%substring str start (if end end (length str)))
+                            str)))
+        (%make-stream 1 (cons actual-str (cons 0 nil)))))))
 
 (defun %string-input-stream-pos (stream)
   "Return the current read position of a string-input stream.  Used by

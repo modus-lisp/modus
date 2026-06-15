@@ -1544,6 +1544,23 @@
   (deftest 8661 (let ((c (complex -1.0 0.0))) (eql c (signum c))) t)
   (deftest 8662 (eql (cis 0.0) (complex 1.0 0.0)) t)
   (deftest 8663 (eql (phase 0) 0.0) t)
+  ;; Probes 8700-8705: make-string-input-stream over fill-pointer /
+  ;; displaced wrapper strings (CLHS — should respect the logical length).
+  ;; %sis-normalize-string copies the wrapper into a simple string so the
+  ;; %prim-aref read path doesn't index cons memory.
+  (deftest 8700 (make-array 6 :element-type 'character
+                            :initial-contents "abcdef" :fill-pointer 4)
+    "abcd")
+  (deftest 8701 (length (make-array 6 :element-type 'character
+                                    :initial-contents "abcdef" :fill-pointer 4))
+    4)
+  ;; pathname parsing of namestrings — name/type/directory must be CL-correct
+  ;; (the char-code(aref) fix in %parse-pathname-string / %split-directory).
+  (deftest 8710 (pathname-name (pathname "/root/")) nil)
+  (deftest 8711 (pathname-type (pathname "/root/")) nil)
+  (deftest 8713 (pathname-name (pathname "/a/b.txt")) "b")
+  (deftest 8714 (pathname-type (pathname "/a/b.txt")) "txt")
+  (deftest 8716 (pathname-name (pathname "rel.lisp")) "rel")
   ;; ----------------------------------------------------------------
   ;; Probes 8980-8981: prove the RUNTIME-EVAL path resolves a let-bound
   ;; VARIABLE passed to make-package / find-package, instead of treating

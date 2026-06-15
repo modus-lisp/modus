@@ -3346,6 +3346,17 @@
          (handler-case
            (%eval-in-env body-form env)
            (t (c)
+             ;; In-flight %eval-escape (BLOCK/RETURN-FROM/GO/THROW/RETURN)?
+             ;; A non-local exit whose target is OUTSIDE this handler-case
+             ;; signals via *%eval-escape-stack* + (error "%eval-escape").
+             ;; HANDLER-CASE must NOT treat that as a real condition — its
+             ;; (error ...)/(t ...)/condition clauses would swallow the escape,
+             ;; leaving the descriptor stranded on the stack and silently
+             ;; dropping the non-local exit (the UIOP ensure-package
+             ;; %eval-escape leak — also hit via IGNORE-ERRORS, which expands
+             ;; to HANDLER-CASE).  Re-propagate so the matching BLOCK / CATCH /
+             ;; TAGBODY / LOOP pops its own descriptor.
+             (when *%eval-escape-stack* (error c))
              (let ((found nil) (result nil))
                (dolist (cl clauses)
                  (unless found

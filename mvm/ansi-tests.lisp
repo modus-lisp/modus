@@ -4368,6 +4368,62 @@
                       (lambda () (error "an error"))))))
       (t (c) (declare (ignore c)) :crashed))
     'good)
+  ;; ==== Probe block 8500-8504: RUNTIME-EVAL %eval-escape leak across a
+  ;; non-target HANDLER-CASE / IGNORE-ERRORS (cl-eval.lisp HANDLER-CASE
+  ;; branch).  These drive the tree-walking evaluator via (eval …) — the
+  ;; UIOP ensure-package / asdf gauntlet form-118 %eval-escape leak class.
+  ;; Pre-fix HANDLER-CASE's (t (c) …) caught the in-flight %eval-escape
+  ;; (a SIMPLE-ERROR) and ran a matching ERROR/T clause, stranding the
+  ;; escape descriptor on *%eval-escape-stack* and silently dropping the
+  ;; RETURN-FROM.  Fix: re-propagate when *%eval-escape-stack* is non-empty
+  ;; so the matching BLOCK pops its own descriptor.  IGNORE-ERRORS expands
+  ;; to HANDLER-CASE, so it is covered too.
+  (rt-run-test 8500
+    (handler-case
+        (eval '(block b
+                 (handler-case (return-from b :escaped)
+                   (error (c) :wrongly-caught))
+                 :fell-through))
+      (t (c) (declare (ignore c)) :crashed))
+    :escaped)
+  ;; IGNORE-ERRORS expands to HANDLER-CASE with a (t (c) …) clause — the
+  ;; widest swallow.  Test that exact expansion directly so the probe does
+  ;; not depend on the runtime IGNORE-ERRORS macro being installed in the
+  ;; ANSI-binary custom-test phase (it is only installed in the gauntlet via
+  ;; %install-runtime-cl-macros).
+  (rt-run-test 8501
+    (handler-case
+        (eval '(block b
+                 (handler-case (return-from b :ie-escaped)
+                   (t (c) :ie-wrongly-caught))
+                 :ie-fell-through))
+      (t (c) (declare (ignore c)) :crashed))
+    :ie-escaped)
+  (rt-run-test 8502
+    (handler-case
+        (eval '(block b
+                 (flet ((f () (handler-case (return-from b :deep)
+                                (error (c) :hc-caught))))
+                   (f))
+                 :t8502-fell))
+      (t (c) (declare (ignore c)) :crashed))
+    :deep)
+  ;; Sequential sanity: a return-from across a handler-case leaves the
+  ;; escape stack clean so the next eval is unaffected.
+  (rt-run-test 8503
+    (handler-case
+        (eval '(+ (block c (handler-case (return-from c 10) (error (e) 0)))
+                  20))
+      (t (c) (declare (ignore c)) :crashed))
+    30)
+  ;; A REAL error inside a handler-case body (no escape in flight) must
+  ;; STILL be handled, not re-propagated — guards against over-eager
+  ;; re-propagation by the new escape-stack check.
+  (rt-run-test 8504
+    (handler-case
+        (eval '(handler-case (error "boom") (error (c) :handled)))
+      (t (c) (declare (ignore c)) :crashed))
+    :handled)
   ;; Regression for the compile-symbolp immediate-T fix.  A GF with
   ;; SYMBOL / INTEGER / T methods, dispatched over args of each shape.
   ;; The universal (T) specializer + a symbol/integer arg exercises the

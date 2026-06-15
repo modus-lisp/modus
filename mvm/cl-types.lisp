@@ -336,11 +336,14 @@
     (t (%atan-f (%any-to-float x)))))
 
 (defun phase (x)
-  "Phase of x.  For real x: 0 if x≥0, π if x<0.  IEEE float for π case."
+  "Phase of x.  Per CLHS the result of PHASE is always a float: 0-valued
+   float for nonnegative reals (rationals contagion to single-float zero,
+   which modus represents as its IEEE double 0.0), and (float) π for
+   negative reals."
   (cond
-    ((integerp x) (if (>= x 0) 0 (%fpi)))
-    ((ratiop x) (if (>= (ratio-numerator x) 0) 0 (%fpi)))
-    (t (if (float-negative-p (%any-to-float x)) (%fpi) 0))))
+    ((integerp x) (if (>= x 0) (%fl 0) (%fpi)))
+    ((ratiop x) (if (>= (ratio-numerator x) 0) (%fl 0) (%fpi)))
+    (t (if (float-negative-p (%any-to-float x)) (%fpi) (%fl 0)))))
 
 (defun cis (x)
   "cis(x) = cos(x) + i*sin(x) — modus has no complex type, so return cos(x)

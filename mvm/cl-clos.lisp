@@ -1354,7 +1354,21 @@
   (error 'unbound-slot :name slot-name :instance obj))
 
 (defun class-name (cls)
-  "Return the name of class CLS."
+  "Return the name of class CLS.
+
+   CLASS-NAME is a standard generic function (CLHS), so a user may add
+   methods to it — e.g. (defmethod class-name ((x my-class)) 'silly).
+   When such a user method is applicable to CLS, dispatch to it; this
+   covers class-name.2 where the arg is an INSTANCE, not a class object.
+   The builtin behaviour (read slot-1 of a class / class-proxy) is the
+   fallback when no user method applies, which is the common internal
+   path and avoids dispatch overhead on every class-object call."
+  (let ((gf (%find-gf 'class-name)))
+    (when (and gf (%gf-p gf) (%gf-methods gf))
+      (let ((applicable (%collect-applicable-methods gf (list cls))))
+        (when applicable
+          (return-from class-name
+            (%gf-dispatch-standard gf (list cls) applicable))))))
   (if (%clos-class-p cls)
     (aref cls 1)
     (if (%class-proxy-p cls)

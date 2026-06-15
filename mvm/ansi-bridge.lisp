@@ -3517,15 +3517,19 @@
       (string= name "BOOLE-EQV") (string= name "BOOLE-IOR")
       (string= name "BOOLE-NAND") (string= name "BOOLE-NOR")
       (string= name "BOOLE-ORC1") (string= name "BOOLE-ORC2")
-      (string= name "BOOLE-SET") (string= name "BOOLE-XOR")))
+      (string= name "BOOLE-SET") (string= name "BOOLE-XOR")
+      (string= name "PI")))
 
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS.  Extends the cl-packages.lisp
    version (this defun wins via last-defun load order) to also recognise
    the symbols that name CL's standard constant variables — without this,
    (constantp 'boole-and) returned NIL because Modus tracks defconstant
-   only as plain defvars."
-  (declare (ignore env))
+   only as plain defvars.  CONSTANTP is (form &optional environment); a
+   third positional arg is a program-error (constantp.error.2)."
+  ;; Arity: at most one optional ENVIRONMENT arg.
+  (when (and env (cdr env))
+    (%signal-program-error))
   (cond
     ((null form) t)              ; NIL
     ((eq form t) t)              ; T

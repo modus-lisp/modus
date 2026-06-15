@@ -2990,15 +2990,19 @@
             (setq vp (cddr vp)))))))
   (let ((stream-arg (if args (car args) nil))
         (start 0)
-        (end nil))
-    ;; Parse keyword args from args[1..] (post-stream).
+        (start-set nil)
+        (end nil)
+        (end-set nil))
+    ;; Parse keyword args from args[1..] (post-stream).  CLHS 3.4.1.4:
+    ;; when a keyword appears more than once, the LEFTMOST occurrence
+    ;; supplies the value (write-string.10).
     (let ((cur (if args (cdr args) nil)))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :start) (setq start v))
-            ((eq k :end)   (setq end v))))
+            ((eq k :start) (unless start-set (setq start v) (setq start-set t)))
+            ((eq k :end)   (unless end-set (setq end v) (setq end-set t)))))
         (setq cur (cddr cur))))
     (let* ((s (%resolve-output-stream stream-arg))
            (len (length str))
@@ -3195,7 +3199,9 @@
         (if (and hit-eof (null chars))
             ;; EOF with nothing read
             (if eof-error-p
-                (values eof-value t)
+                ;; CLHS: signal END-OF-FILE when eof-error-p is true and
+                ;; no chars were read before EOF (read-line.error.2-4).
+                (error 'end-of-file :stream s)
                 (values eof-value t))
             ;; Build string from collected chars
             (let ((result-chars (nreverse chars)))

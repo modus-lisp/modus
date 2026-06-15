@@ -1670,6 +1670,37 @@
          (eq (and (or g-rest g-key) t)
              (and (or m-rest m-key) t)))))
 
+(defun %method-accepts-gf-keys-p (gf-ll method-ll)
+  "CLHS 7.6.4: if the GF lambda-list names keyword parameters after &KEY,
+   each must be accepted by the method — explicitly in the method's &KEY
+   list, or via &ALLOW-OTHER-KEYS, or via &REST-without-&KEY.  Returns
+   NIL when some GF key is unaccepted (defmethod.error.10)."
+  (let ((gf-shape (%lambda-list-shape gf-ll))
+        (m-shape  (%lambda-list-shape method-ll)))
+    ;; GF declares no &key names to enforce → trivially OK.
+    (if (not (nth 3 gf-shape))
+        t
+        (cond
+          ;; Method has &allow-other-keys → accepts anything.
+          ((nth 4 m-shape) t)
+          ;; Method has &rest but not &key → accepts any keyword.
+          ((and (nth 2 m-shape) (not (nth 3 m-shape))) t)
+          ;; Method has no &key (and no &rest) → accepts nothing extra:
+          ;; OK only if the GF named no keys (handled above).
+          ((not (nth 3 m-shape)) nil)
+          ;; Both have &key: every GF key name must be in the method's.
+          (t
+           (let ((gf-keys (%lambda-list-key-names gf-ll))
+                 (m-keys  (%lambda-list-key-names method-ll))
+                 (ok t))
+             (let ((cur gf-keys))
+               (loop
+                 (when (null cur) (return nil))
+                 (unless (%dg-string-member (car cur) m-keys)
+                   (setq ok nil) (return nil))
+                 (setq cur (cdr cur))))
+             ok))))))
+
 ;;; ============================================================
 ;;; DEFGENERIC option validation (CLHS macro DEFGENERIC + 7.6.4)
 ;;; ============================================================

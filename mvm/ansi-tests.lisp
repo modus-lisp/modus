@@ -1480,6 +1480,23 @@
         (progn (eval '(make-instance (find-class 'mi-probe-c2) :z 1)) :NO-ERROR)
       (error (c) :ERR))
     :ERR)
+  ;; 8679 — defmethod-vs-GF &key congruence (defmethod.error.10): a GF
+  ;; declared (x &key z) requires every method accept :z; a method with
+  ;; bare &key (no z, no &allow-other-keys) must signal program-error.
+  ;; A method WITH &key z (or &allow-other-keys) is congruent.
+  (deftest 8679
+    (let ((sym (gensym)))
+      (eval (list 'defgeneric sym (list 'x '&key 'z)))
+      (list
+       ;; bare &key (missing z) → program-error
+       (handler-case (progn (eval (list 'defmethod sym
+                                        (list (list 'x 't) '&key) 'x)) :NO)
+         (program-error (c) :PE) (t (c) :OTHER))
+       ;; &key z → congruent, no error
+       (handler-case (progn (eval (list 'defmethod sym
+                                        (list (list 'x 't) '&key 'z) 'x)) :OK)
+         (t (c) :ERR))))
+    '(:PE :OK))
   ;; 8681-8683 — GF call arity (defmethod.error.13): a lone DEFMETHOD
   ;; implicitly creates a GF whose required-arg count is derived from
   ;; the method LL; calling with too few/many required args is a

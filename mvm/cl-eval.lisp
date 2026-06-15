@@ -2572,9 +2572,14 @@
            ;; CLHS 7.6.4 congruence: method LL shape vs GF declared LL.
            (let ((gf (%find-gf gf-name)))
              (when (and gf (%gf-lambda-list gf))
-               (let ((gf-shape  (%lambda-list-shape (%gf-lambda-list gf)))
-                     (m-shape   (%lambda-list-shape params)))
-                 (unless (%method-ll-congruent-p gf-shape (length specs) m-shape)
+               (let ((gf-ll (%gf-lambda-list gf)))
+                 (let ((gf-shape (%lambda-list-shape gf-ll))
+                       (m-shape  (%lambda-list-shape params)))
+                   (unless (%method-ll-congruent-p gf-shape (length specs) m-shape)
+                     (%signal-program-error)))
+                 ;; Beyond shape: each keyword named in the GF's &key list
+                 ;; must be accepted by the method (defmethod.error.10).
+                 (unless (%method-accepts-gf-keys-p gf-ll params)
                    (%signal-program-error)))))
            ;; CLHS 7.6.5: method body is implicitly enclosed in a block
            ;; whose name is the generic function name (or, for (setf X)

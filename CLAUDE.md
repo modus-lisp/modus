@@ -94,11 +94,18 @@ runtime/        Runtime type system
 
 ## ANSI CL Conformance
 
-**Real numbers — last RELIABLE full sweep (x64 Linux, commit b2ae056):**
-- Expected: 17,465 tests (recovered files keep entering the denominator)
-- Ran: 17,421
-- Passed: 15,386 (88.10% overall, 88.32% of those that ran; two-sample
-  confirm 15,378/15,386)
+**Real numbers — HARD per-file name-stable comparison (x64 Linux, 2026-06-15):**
+- HEAD passed: **16,489 / 17,465 = 94.4%** (tip 9c6151f)
+- NET vs base b2ae056: **+825** (same 32-shard method both sides; base=15,664 this run)
+- MEASUREMENT NOTE: ID-based cross-build diffs are INVALID (corpus grows mid-
+  session → IDs shift).  Compare by FILE NAME via each build's own
+  tmp/ansi-file-ranges.txt → per-file pass counts (see tmp/perfile.sh).  The
+  per-file ABSOLUTE count has ~±200 run-to-run variance (timeout-600 shards);
+  the NET (same-run apples-to-apples) is the reliable metric.  The old
+  single-process "88.10%/15,386" was an UNDERCOUNT (~500 tests lost to
+  hangs/timeouts) — base was really ~91%.
+- Remaining real regressions (~25): warn −11 (handler-bind/signal boundary,
+  NOT closure cells), make-string-input-stream −3, union/nunion −2, scattered −1s.
 
 **UNCOUNTED batch on top (tip 1a279f6, 2026-06-13):** a large fan-out landed
 many cluster-gated fixes on top of b2ae056 — cerror(+1), compiler-ecase-signal

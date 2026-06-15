@@ -2307,6 +2307,16 @@
                           (consp rest) (integerp (car rest)))
                      (car rest))
                     (t nil)))))
+         ;; CLHS allows RESULT-TYPE to be a class object (e.g.
+         ;; (coerce x (find-class 'vector))).  Normalize a CLOS class or
+         ;; built-in class-proxy to its name symbol first so the head
+         ;; dispatch below sees 'vector etc.
+         (result-type (cond
+                        ((and (not (consp result-type)) (not (symbolp result-type))
+                              (or (%clos-class-p result-type)
+                                  (%class-proxy-p result-type)))
+                         (class-name result-type))
+                        (t result-type)))
          (result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type)))
          (%cv
   (cond
@@ -2364,7 +2374,11 @@
               (setq i (+ i 1))))))
        ((null object) (%make-string-array 0))
        (t object)))
-    ((or (eq result-type 'vector) (eq result-type 'simple-vector))
+    ((or (eq result-type 'vector) (eq result-type 'simple-vector)
+         ;; Bit-vectors in Modus are plain arrays of 0/1 (bit-vector-p
+         ;; tests element values), so coercing a list/vector/bit-vector to
+         ;; BIT-VECTOR is the same flatten-to-array path as VECTOR.
+         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector))
      (cond
        ;; Wrapped vector — flatten to plain vector of effective length
        ((and (consp object) (array-wrapper-p object))
@@ -2399,9 +2413,18 @@
     ((eq result-type 'integer)
      (if (floatp-impl object) (truncate object) object))
     ((eq result-type 'character)
-     (if (integerp object) (code-char object)
-         (if (stringp object) (aref object 0)   ; AREF→char already
-             object)))
+     ;; CLHS: object must be a character designator — a character, a
+     ;; string of length 1, or a symbol whose name has length 1.
+     (cond
+       ((characterp object) object)
+       ((integerp object) (code-char object))
+       ((stringp object) (aref object 0))            ; AREF→char already
+       ((symbolp object)                             ; symbol → its 1-char name
+        (let ((nm (symbol-name object)))
+          (if (and (stringp nm) (= (length nm) 1))
+              (aref nm 0)
+              (progn (%signal-type-error) nil))))
+       (t object)))
     ((eq result-type 'function)
      ;; CLHS: a symbol or lambda expression coerces to a function.  A
      ;; symbol with no global function definition signals an error.
@@ -3290,27 +3313,32 @@
             ((and (integerp x) (= x 0)) (%fpi/2))
             (t (%float-sub (%fpi/2) (%asin-f (%any-to-float x)))))))
 
-;; atan accepts 1 or 2 args (atan x) / (atan y x); 3+ is the error case.
-(defun atan (x &optional y &rest extra)
-  (if extra
-      (%program-error "atan accepts at most 2 arguments")
-      (cond
-        (y
-         (let ((yf (%any-to-float x))     ; CLHS (atan number divisor): number=y
-               (xf (%any-to-float y)))    ; divisor=x
-           (cond
-             ((%float-zero-p xf)
-              (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
-                    ((%float-zero-p yf) (%fl 0))
-                    (t (%fpi/2))))
-             ((float-negative-p xf)
-              (let ((base (%atan-f (%float-div yf xf))))
-                (if (float-negative-p yf)
-                    (%float-sub base (%fpi))
-                    (%float-add base (%fpi)))))
-             (t (%atan-f (%float-div yf xf))))))
-        ((and (integerp x) (= x 0)) 0)
-        (t (%atan-f (%any-to-float x))))))
+;; atan accepts 1 or 2 args (atan x) / (atan y x); 0 or 3+ is the error
+;; case.  Use a plain &rest dispatch (NOT &optional+&rest, whose
+;; optional-populated call convention miscompiles in Modus) so the 2-arg
+;; (atan y x) form binds correctly.
+(defun atan (&rest args)
+  (let ((n (length args)))
+    (cond
+      ((= n 1)
+       (let ((x (car args)))
+         (cond ((and (integerp x) (= x 0)) 0)
+               (t (%atan-f (%any-to-float x))))))
+      ((= n 2)
+       (let ((yf (%any-to-float (car args)))     ; CLHS (atan number divisor)
+             (xf (%any-to-float (car (cdr args))))) ; number=y, divisor=x
+         (cond
+           ((%float-zero-p xf)
+            (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
+                  ((%float-zero-p yf) (%fl 0))
+                  (t (%fpi/2))))
+           ((float-negative-p xf)
+            (let ((base (%atan-f (%float-div yf xf))))
+              (if (float-negative-p yf)
+                  (%float-sub base (%fpi))
+                  (%float-add base (%fpi)))))
+           (t (%atan-f (%float-div yf xf))))))
+      (t (%program-error "atan requires 1 or 2 arguments")))))
 
 (defun sinh (x &rest extra)
   (if extra
@@ -3717,10 +3745,35 @@
    Modus doesn't have a FASL emitter, but tests probe the SHAPE of
    the return values, and the values themselves must be valid forms."
   (declare (ignore environment))
-  ;; Only handle standard CLOS instances here.  Structs reach this via a
-  ;; different (positional) representation whose allocate-instance round-trip
-  ;; isn't reconstructable through the test's SUBST path yet — leave them to
-  ;; the (values nil nil) fallback (deferred; see make-load-form handoff).
+  ;; DEFSTRUCT instances use a positional array representation (slot-0 =
+  ;; '%struct-instance, slot-1 = type-name, slots 2+ = field values).  The
+  ;; creation-form reconstructs the whole struct in one shot via
+  ;; %ALLOC-STRUCT — which when EVAL'd yields a fresh struct whose CLASS-OF
+  ;; is EQ to the original's (both resolve to the same struct class proxy
+  ;; keyed by type-name).  Because every slot value is embedded in the
+  ;; creation-form, the initialization-form is an empty (PROGN); the test's
+  ;; SUBST NEWOBJ OBJECT then has nothing to rewrite, which is fine.
+  (when (%struct-instance-p object)
+    (let* ((type-name (%struct-type-name object))
+           (n-slots (- (array-length object) 2))   ; slots 2+ are fields
+           ;; Read field values straight out of the instance array (slots
+           ;; 2..len-1, in effective-slot order — same order %ALLOC-STRUCT
+           ;; writes them back).  Build the positional value list literally
+           ;; so the creation-form is (%alloc-struct 'NAME '(v0 v1 ...)) —
+           ;; a single QUOTE survives runtime EVAL cleanly (a (LIST …) form
+           ;; depends on runtime LIST + nested QUOTE, which proved fragile).
+           (vals
+             (let ((acc nil) (i (- n-slots 1)))
+               (loop
+                 (when (< i 0) (return acc))
+                 (setq acc (cons (aref object (+ 2 i)) acc))
+                 (setq i (- i 1)))))
+           (creation-form
+             (list '%alloc-struct (list 'quote type-name) (list 'quote vals)))
+           (init-form (list 'progn)))
+      (return-from make-load-form-saving-slots
+        (values creation-form init-form))))
+  ;; Only standard CLOS instances reach the slot-by-slot path below.
   (when (or (null object) (not (%clos-instance-p object)))
     (return-from make-load-form-saving-slots (values nil nil)))
   (let* ((class-name (aref object 1))

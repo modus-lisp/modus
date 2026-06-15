@@ -1580,6 +1580,56 @@
   (deftest 8852 (< (abs (- (log 0.5) -0.6931471)) 0.01) t)          ; log 0.5
   (deftest 8853 (< (abs (- (log 0.1) -2.3025850)) 0.05) t)          ; log 0.1
   (deftest 8854 (< (abs (- (exp -0.0) 1.0)) 0.0001) t)              ; exp -0.0 (signed zero)
+  ;; --- 8855-8859: math arity guards (Fable 5) ---
+  (deftest 8855 (handler-case (progn (sin 0.0 0.0) :no-error)
+                  (program-error (c) :ok) (error (c) :other-error)) :ok)
+  (deftest 8856 (handler-case (progn (sqrt 4 nil) :no-error)
+                  (program-error (c) :ok) (error (c) :other-error)) :ok)
+  (deftest 8857 (handler-case (progn (abs 1 2) :no-error)
+                  (program-error (c) :ok) (error (c) :other-error)) :ok)
+  (deftest 8858 (handler-case (progn (atan 1 1 1) :no-error)
+                  (program-error (c) :ok) (error (c) :other-error)) :ok)
+  ;; (atan y x) 2-arg form still works (returns ~0 for atan(0,1)).
+  (deftest 8859 (handler-case (let ((v (atan 0.0 1.0)))
+                                (if (< (abs v) 0.001) :ok :bad))
+                  (error (c) :err)) :ok)
+  ;; --- 8860-8863: struct make-load-form-saving-slots roundtrip (Fable 5) ---
+  ;; %ALLOC-STRUCT creation-form reconstructs the struct; CLASS-OF EQ; slot
+  ;; value preserved through the eval'd creation-form.  Uses the scaffold
+  ;; struct's NODE slot (avoids the car/cdr accessor-name shadowing).  All
+  ;; probes are handler-case wrapped so a crash reports :ERR rather than
+  ;; aborting the regression chain.
+  (deftest 8860   ; mlfss returns two values for a struct
+      (handler-case
+          (let* ((obj (make-scaffold :node 7 :car 8 :cdr 9))
+                 (forms (multiple-value-list (make-load-form-saving-slots obj))))
+            (length forms))
+        (error (c) :err))
+      2)
+  (deftest 8861   ; eval creation-form → fresh struct of same type
+      (handler-case
+          (let* ((obj (make-scaffold :node 7 :car 8 :cdr 9))
+                 (forms (multiple-value-list (make-load-form-saving-slots obj)))
+                 (newobj (eval (first forms))))
+            (scaffold-p newobj))
+        (error (c) :err))
+      t)
+  (deftest 8862   ; CLASS-OF obj eqt CLASS-OF newobj
+      (handler-case
+          (let* ((obj (make-scaffold :node 7 :car 8 :cdr 9))
+                 (forms (multiple-value-list (make-load-form-saving-slots obj)))
+                 (newobj (eval (first forms))))
+            (if (eqt (class-of obj) (class-of newobj)) :eq :neq))
+        (error (c) :err))
+      :eq)
+  (deftest 8863   ; NODE slot value preserved through the roundtrip
+      (handler-case
+          (let* ((obj (make-scaffold :node 42 :car 1 :cdr 2))
+                 (forms (multiple-value-list (make-load-form-saving-slots obj)))
+                 (newobj (eval (first forms))))
+            (scaffold-node newobj))
+        (error (c) :err))
+      42)
   ;; Regression: typep symbol-name dispatch.  9752 used to FAIL because
   ;; (typep* 'standard-method 'symbol) compared the user's 'symbol to
   ;; cl-types.lisp's 'symbol via raw eq, which missed when the bare-metal

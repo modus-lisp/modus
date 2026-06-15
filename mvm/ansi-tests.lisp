@@ -1561,6 +1561,25 @@
   (deftest 9292 (numeric-<= 0.0 -0.0) t)
   (deftest 9293 (multiple-value-list (subtypep* '(float -0.0 *) '(float 0.0 *))) (list t t))
   (deftest 9294 (multiple-value-list (subtypep* '(short-float -0.0 *) '(short-float 0.0 *))) (list t t))
+  ;; --- 8840-8859: transcendental edge-case probes (Fable 5) ---
+  ;; Verify the signed-zero / %float-zero-p fix did NOT break the real-
+  ;; input transcendental math (asinh/exp/log/sqrt over the reals).  All
+  ;; compare to a tolerance via < so the result is a clean T/NIL.
+  (deftest 8840 (< (abs (- (sqrt 5.0) 2.2360679)) 0.001) t)         ; sqrt of float
+  (deftest 8841 (< (abs (- (log 0.236068) -1.444035)) 0.01) t)      ; log of <1 float
+  (deftest 8842 (< (abs (- (log 2.0) 0.6931471)) 0.001) t)          ; log 2
+  (deftest 8843 (< (abs (- (exp 1.0) 2.7182818)) 0.001) t)          ; exp 1
+  (deftest 8844 (< (abs (- (exp -1.0) 0.3678794)) 0.001) t)         ; exp negative
+  (deftest 8845 (< (abs (- (asinh 2.0) 1.4436354)) 0.01) t)         ; asinh positive
+  (deftest 8846 (< (abs (- (asinh -2.0) -1.4436354)) 0.01) t)       ; asinh NEGATIVE
+  (deftest 8847 (< (abs (- (asinh 0.5) 0.4812118)) 0.01) t)         ; asinh fractional
+  (deftest 8848 (< (abs (- (asinh -0.5) -0.4812118)) 0.01) t)       ; asinh neg fractional
+  (deftest 8849 (< (abs (- (acosh 2.0) 1.3169579)) 0.01) t)         ; acosh
+  (deftest 8850 (< (abs (- (atanh 0.5) 0.5493061)) 0.01) t)         ; atanh
+  (deftest 8851 (< (abs (- (atanh -0.5) -0.5493061)) 0.01) t)       ; atanh neg
+  (deftest 8852 (< (abs (- (log 0.5) -0.6931471)) 0.01) t)          ; log 0.5
+  (deftest 8853 (< (abs (- (log 0.1) -2.3025850)) 0.05) t)          ; log 0.1
+  (deftest 8854 (< (abs (- (exp -0.0) 1.0)) 0.0001) t)              ; exp -0.0 (signed zero)
   ;; Regression: typep symbol-name dispatch.  9752 used to FAIL because
   ;; (typep* 'standard-method 'symbol) compared the user's 'symbol to
   ;; cl-types.lisp's 'symbol via raw eq, which missed when the bare-metal

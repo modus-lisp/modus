@@ -2080,9 +2080,19 @@
                     (if (boundp sym)
                         (symbol-value sym)
                         (let ((c2 (%make-condition 'unbound-variable (list :name sym))))
-                          (if (%error-handler-active-p)
-                              (%hc-longjmp)
-                              nil)))))
+                          ;; Publish the condition so a handler-case
+                          ;; (cell-error (c) …) / (unbound-variable (c) …)
+                          ;; matches the right type and CELL-ERROR-NAME
+                          ;; sees the :name slot (cell-error-name.1).
+                          ;; Also run the handler-bind stack first.
+                          (setq *current-condition* c2)
+                          (%associate-active-restart-frames c2)
+                          (let ((handled (%signal-condition c2)))
+                            (if handled
+                                nil
+                                (if (%error-handler-active-p)
+                                    (%hc-longjmp)
+                                    nil)))))))
               nil)))))
 
 (defun %runtime-define-condition (form env)
@@ -3469,11 +3479,18 @@
                                   nil)))
                       (if mf
                           (%eval-in-env (funcall mf (cons sym args) nil) env)
-                          ;; Undefined function
+                          ;; Undefined function — publish + run handler-bind
+                          ;; so (cell-error (c) (cell-error-name c)) matches
+                          ;; and carries the :name slot (cell-error-name.2).
                           (let ((c (%make-condition 'undefined-function (list :name sym))))
-                            (if (%error-handler-active-p)
-                                (%hc-longjmp)
-                                nil)))))))))))
+                            (setq *current-condition* c)
+                            (%associate-active-restart-frames c)
+                            (let ((handled (%signal-condition c)))
+                              (if handled
+                                  nil
+                                  (if (%error-handler-active-p)
+                                      (%hc-longjmp)
+                                      nil)))))))))))))
 
 (defun %do-funcall (fn args)
   "Call FN with ARGS list."

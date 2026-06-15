@@ -1968,7 +1968,51 @@
                         (and (char= c1 #\H) (char= c2 #\i)))))
                 t)
   (deftest 9824 (let ((s (open "/tmp/ansi-test-probe.txt" :direction :input)))
-                  (if s (let ((len (file-length s))) (close s) len) nil)) 2))
+                  (if s (let ((len (file-length s))) (close s) len) nil)) 2)
+  ;; --- streams seat regression probes (composite-stream dispatch in
+  ;; cl-streams.lisp).  These lock in behaviour that is correct in the
+  ;; current build; the remaining stream-range ANSI fails are cross-file
+  ;; (read-sequence char/byte in cl-printer; echo-EOF-value echo in
+  ;; cl-fileio).  See final report.
+  ;; read-char-no-hang through an echo stream (MAKE-ECHO-STREAM.7 shape)
+  (deftest 9831 (let* ((is (make-string-input-stream "foo"))
+                       (os (make-string-output-stream))
+                       (s (make-echo-stream is os)))
+                  (coerce (list (read-char-no-hang s nil #\z)
+                                (read-char-no-hang s nil #\z)
+                                (read-char-no-hang s nil #\z)
+                                (read-char-no-hang s nil #\z))
+                          'string)) "fooz")
+  ;; echo-stream echoes the real chars (not the trailing EOF read) when the
+  ;; reads stop at EOF
+  (deftest 9837 (let* ((is (make-string-input-stream "foo"))
+                       (os (make-string-output-stream))
+                       (s (make-echo-stream is os)))
+                  (read-char-no-hang s nil #\z)
+                  (read-char-no-hang s nil #\z)
+                  (read-char-no-hang s nil #\z)
+                  (get-output-stream-string os)) "foo")
+  ;; echo via plain read-char
+  (deftest 9838 (let* ((is (make-string-input-stream "foo"))
+                       (os (make-string-output-stream))
+                       (s (make-echo-stream is os)))
+                  (read-char s) (read-char s) (read-char s)
+                  (get-output-stream-string os)) "foo")
+  ;; concatenated read-char across two string-input streams
+  (deftest 9835 (let* ((a (make-string-input-stream "ab"))
+                       (b (make-string-input-stream "cd"))
+                       (s (make-concatenated-stream a b)))
+                  (coerce (list (read-char s) (read-char s)
+                                (read-char s) (read-char s))
+                          'string)) "abcd")
+  ;; broadcast write goes to all components
+  (deftest 9836 (let* ((o1 (make-string-output-stream))
+                       (o2 (make-string-output-stream))
+                       (b (make-broadcast-stream o1 o2)))
+                  (write-string "hi" b)
+                  (list (get-output-stream-string o1)
+                        (get-output-stream-string o2)))
+                (list "hi" "hi")))
 
 (defun run-typep-debug-tests ()
   ;; Basic typep tests

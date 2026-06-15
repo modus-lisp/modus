@@ -3479,6 +3479,31 @@
 (defvar boole-orc1 14)
 (defvar boole-orc2 15)
 
+(defun %init-boole-constants ()
+  "defvar init-thunks don't run at boot (see CLAUDE.md limitation #7), so the
+   16 BOOLE-* constants above default to NIL.  Tests reference e.g. BOOLE-AND
+   directly as a value (boole.4, boole.order.1) AND pass it to BOOLE, where a
+   NIL op fell through to the (t 0) clause — every result came back 0.  Set the
+   distinct integer values explicitly; called once from kernel-main, mirroring
+   %init-standard-chars."
+  (setq boole-clr 0)
+  (setq boole-set 1)
+  (setq boole-1 2)
+  (setq boole-2 3)
+  (setq boole-c1 4)
+  (setq boole-c2 5)
+  (setq boole-and 6)
+  (setq boole-ior 7)
+  (setq boole-xor 8)
+  (setq boole-eqv 9)
+  (setq boole-nand 10)
+  (setq boole-nor 11)
+  (setq boole-andc1 12)
+  (setq boole-andc2 13)
+  (setq boole-orc1 14)
+  (setq boole-orc2 15)
+  t)
+
 (defun boole (op a b)
   "Perform bitwise logical operation OP on integers A and B."
   (cond

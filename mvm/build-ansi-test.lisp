@@ -4643,6 +4643,11 @@
   ;; they would need triple-level escaping and broke the SBCL reader).
   (%init-standard-chars)
 
+  ;; BOOLE-* constants (16 distinct integers).  defvar init-thunks don't run
+  ;; at boot, so without this BOOLE-AND etc. are NIL and (boole boole-and a b)
+  ;; falls through to (t 0) — every boole result was 0.
+  (%init-boole-constants)
+
   ;; Parse argv from BSS (boot stub writes argc/argv there).
   ;;   argv[1] → *skip-below*       (skip tests with id < N)
   ;;   argv[2] → *run-only-below*   (skip tests with id >= M)

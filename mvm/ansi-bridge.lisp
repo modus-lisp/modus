@@ -615,15 +615,11 @@
         ((consp x) nil)
         (t (error "endp: argument is not a list"))))
 
-(defun tree-equal (a b)
-  (if (eql a b) t
-    (if (consp a)
-      (if (consp b)
-        (if (tree-equal (car a) (car b))
-          (tree-equal (cdr a) (cdr b))
-          nil)
-        nil)
-      nil)))
+;; NOTE: tree-equal lives in cl-sequences.lisp with full &key support
+;; (:test / :test-not / :allow-other-keys, leftmost-wins, program-error on
+;; bad keys).  The old 2-arg stub here SHADOWED it (ansi-bridge loads last),
+;; dropping all the :test variants and keyword/error tests.  Removed so the
+;; complete version wins.
 
 (defun copy-tree (tree)
   (if (consp tree)

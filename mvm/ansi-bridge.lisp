@@ -2443,6 +2443,21 @@
      ;; a cons (CLHS 4.2.1: coerce identity when already of the type).
      ;; (coerce nil 'cons), (coerce x 'cons) for non-cons → TYPE-ERROR.
      (if (consp object) object (progn (%signal-type-error) nil)))
+    ((eq result-type 'complex)
+     ;; CLHS coerce/COMPLEX: a rational stays a rational (a rational IS of
+     ;; type COMPLEX since (complex rational 0) = rational), but a FLOAT
+     ;; becomes a true #C(float 0.0) — float contagion forbids the collapse
+     ;; to a real that (complex r 0) does for rationals.  coerce.18/.19/.20.
+     (cond
+       ((%complex-p object) object)
+       ((floatp-impl object)
+        (let ((c (make-array 3)))
+          (aset c 0 '%complex-marker)
+          (aset c 1 object)
+          (aset c 2 (float 0))
+          c))
+       ((or (integerp object) (ratiop object)) object)
+       (t (progn (%signal-type-error) nil))))
     (t object))))
   ;; CLHS: if RESULT-TYPE specifies an explicit length, OBJECT must be
   ;; coercible to a sequence of exactly that length, else TYPE-ERROR.

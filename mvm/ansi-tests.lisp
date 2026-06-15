@@ -2547,7 +2547,11 @@
   (deftest 8626 (notnot (typep 1.0 (type-of 1.0))) t)
   (deftest 8627 (notnot (typep '(1 2) (type-of '(1 2)))) t)
   (deftest 8628 (notnot (typep 'foo (type-of 'foo))) t)
-  (deftest 8629 (type-of nil) 'null))
+  (deftest 8629 (type-of nil) 'null)
+  (deftest 8640 (notnot (floatp-impl 1.0)) t)
+  (deftest 8641 (notnot (complexp (coerce 1.0 'complex))) t)
+  (deftest 8642 (realpart (coerce 1.0 'complex)) 1.0)
+  (deftest 8643 (floatp-impl (imagpart (coerce 1.0 'complex))) t))
 
 ;;; Regression: &key parameter handling (compiler.lisp preprocess-params).
 ;;; Pre-fix nunion-with-copy (x y &key test test-not) compiled as if its

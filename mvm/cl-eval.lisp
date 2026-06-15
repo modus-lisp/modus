@@ -182,7 +182,17 @@
       (when (and (> (length name) 0) *symbol-function-table*)
         (remhash name *symbol-function-table*))
       (when *native-sym-function-table*
-        (remhash hash *native-sym-function-table*))))
+        (remhash hash *native-sym-function-table*))
+      ;; Also clear any RUNTIME-registered macro binding (defmacro via
+      ;; runtime EVAL lands in *macro-function-table*).  Without this an
+      ;; (fmakunbound g) after (eval `(defmacro ,g () nil)) leaves the
+      ;; macro live, so fboundp — which now reports macros — stays T.
+      ;; (fmakunbound.3.)  We do NOT touch the compile-time *macro-table*
+      ;; (built-in COND/WHEN/… expanders), only the per-symbol runtime
+      ;; registry.
+      (when *macro-function-table*
+        (let ((mkey (%macro-sym-key sym)))
+          (when mkey (remhash mkey *macro-function-table*))))))
   sym)
 
 (defun fdefinition (sym)

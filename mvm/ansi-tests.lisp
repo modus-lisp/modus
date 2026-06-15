@@ -1537,6 +1537,13 @@
       (let ((i1 (make-instance c1)))
         (if (typep i1 c1) t nil)))
     t)
+  ;; Probes 8660-8663: numeric complex regression locks (numeric seat).
+  ;; CIS returns a true complex; EQL slot-compares complexes; SIGNUM of a
+  ;; unit-modulus complex is the complex itself (rational + float forms).
+  (deftest 8660 (let ((c (complex 3/5 4/5))) (eql c (signum c))) t)
+  (deftest 8661 (let ((c (complex -1.0 0.0))) (eql c (signum c))) t)
+  (deftest 8662 (eql (cis 0.0) (complex 1.0 0.0)) t)
+  (deftest 8663 (eql (phase 0) 0.0) t)
   ;; ----------------------------------------------------------------
   ;; Probes 8980-8981: prove the RUNTIME-EVAL path resolves a let-bound
   ;; VARIABLE passed to make-package / find-package, instead of treating

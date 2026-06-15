@@ -2535,10 +2535,22 @@
 ;;; ============================================================
 
 (defun signum (x)
-  "Return -1, 0, or 1 based on sign of X. Works for float too."
-  (if (floatp-impl x)
-      (if (< x 0.0) -1.0 (if (> x 0.0) 1.0 0.0))
-      (if (< x 0) -1 (if (> x 0) 1 0))))
+  "Return the sign of X.  For reals: -1, 0, or 1 (float-contagious for
+   floats).  For complex X: x / |x|, which preserves the phase and has
+   modulus 1 (or x itself when x is 0).  CLHS: (signum x) ≡ (if (zerop x)
+   x (/ x (abs x)))."
+  (cond
+    ((complexp x)
+     (let ((r (realpart x)) (i (imagpart x)))
+       (if (and (zerop r) (zerop i))
+           x
+           ;; magnitude inline (the &rest-wrapped public ABS crashes when
+           ;; handed a heap complex object); sqrt of sum of squares.
+           (let ((mag (sqrt (+ (* r r) (* i i)))))
+             (complex (/ r mag) (/ i mag))))))
+    ((floatp-impl x)
+     (if (< x 0.0) -1.0 (if (> x 0.0) 1.0 0.0)))
+    (t (if (< x 0) -1 (if (> x 0) 1 0)))))
 
 (defun float-exponent (x)
   "Return the exponent of FLOAT X (like nth value of decode-float)."

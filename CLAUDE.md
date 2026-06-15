@@ -389,7 +389,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## Known Bugs
 
-### Mutable Closures — Global Cell Limitation (RESOLVED)
+### Mutable Closures — Global Cell Limitation (MOSTLY resolved; context-sensitive residual)
 
 This is FIXED (verified 2026-06-13, probes 9740-9744). `compile-let`/`compile-let*`
 now allocate each captured+mutated variable's cell as a **local `let`-binding**
@@ -403,6 +403,16 @@ two-counters-from-one-`make-counter` both work.
 across closures from one source lambda. Replaced by the let-binding scheme in an
 undocumented prior commit; the map-into cluster fails that were blamed on this are
 actually `cl-sequences.lisp` fill-pointer / bit-vector-store bugs.)
+
+**CONTEXT-SENSITIVE RESIDUAL (2026-06-15):** the cell-box is NOT shared between
+sibling closures in SOME compilation contexts.  Reproducer: `(let ((warned nil))
+(handler-bind ((warning (lambda (c) (setf warned t) (muffle-warning c)))) (warn
+"x")) warned)` compiles CORRECTLY in run-regression-tests but WRONG in the
+auto-generated `run-ansi-warn-chunk-1` (handler + body get different `%CELL-WARNED`
+boxes).  Causes warn.lsp 8/19 (WARN.1-11/.19).  NOT funcall-NOP layout (fuzz=8
+identical).  Fix needs `compile-let`/`vars-mutated-in-lambdas` IR dump comparison
+between the two contexts.  A correctness bug beyond warn (any chunk with
+handler-mutates-captured-var).
 
 ### Vector-literal symbol elements (FIXED)
 

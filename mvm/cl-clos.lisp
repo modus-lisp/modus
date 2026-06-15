@@ -2560,11 +2560,17 @@
              ;; path).  Budget at slot 0x10000C60 caps prints to
              ;; prevent flood + Heisenberg; kernel-main initializes
              ;; it to 5 (defvar init-thunks don't run on bare metal).
-             ;; Gated on symbolp on both sides so we skip T/NIL/
-             ;; conses/etc. that wouldn't have name-hashes anyway.
+             ;; Gated on symbolp on both sides so we skip conses/etc.
+             ;; that wouldn't have name-hashes anyway.  NOTE: T and NIL
+             ;; ARE symbols (symbolp now correctly returns T for the
+             ;; immediates) but they have NO slot-0 hash — (aref t 0) /
+             ;; (aref nil 0) would deref the immediate as a heap pointer
+             ;; and SEGV.  Exclude them explicitly before the aref.
              (let ((budget (mem-ref #x10000C60 :u64)))
                (when (and (> budget 0)
                           (symbolp c) (symbolp spec)
+                          (not (null c)) (not (eq c t))
+                          (not (null spec)) (not (eq spec t))
                           (= (aref c 0) (aref spec 0)))
                  (write-string-serial "EQ-COLL hash=")
                  (print-dec (aref spec 0))

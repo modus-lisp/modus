@@ -1630,7 +1630,19 @@
                   (setq x (+ x 1))
                   (setq x (+ x 1))
                   x)
-                30))
+                30)
+
+  ;; SYMBOLP on the T / NIL immediates — both are SYMBOLS per CLHS.
+  ;; Regression for the compile-symbolp immediate-T fix (T's #xDEAD1009
+  ;; low nibble collided with +tag-object+, evading the subtag check).
+  (deftest 9031 (symbolp t)        t)
+  (deftest 9032 (symbolp nil)      t)
+  (deftest 9033 (symbolp 'foo)     t)
+  (deftest 9034 (symbolp :kw)      t)
+  (deftest 9035 (symbolp 5)        nil)
+  (deftest 9036 (symbolp "x")      nil)
+  (deftest 9037 (symbolp #\a)      nil)
+  (deftest 9038 (symbolp '(1))     nil))
 
   ;; unwind-protect with multiple values (gentemp-style)
   (deftest 9050
@@ -4010,6 +4022,22 @@
                       (lambda () (error "an error"))))))
       (t (c) (declare (ignore c)) :crashed))
     'good)
+  ;; Regression for the compile-symbolp immediate-T fix.  A GF with
+  ;; SYMBOL / INTEGER / T methods, dispatched over args of each shape.
+  ;; The universal (T) specializer + a symbol/integer arg exercises the
+  ;; %specializer-matches-p CPL walk, which used to (aref t 0) a T
+  ;; immediate once (symbolp t) correctly returned T — guarded now.
+  ;; (Was :CRASHED with the symbolp fix but no clos guard; PASS with both.)
+  (rt-run-test 9539
+    (handler-case
+        (let ((f 'egf-probe-z))
+          (let ((fn (eval `(defgeneric ,f (x)
+                             (:method ((x symbol)) (list x :a))
+                             (:method ((x integer)) (list x :b))
+                             (:method ((x t)) (list x :c))))))
+            (mapcar fn '(x 2 3/2))))
+      (t (c) (declare (ignore c)) :crashed))
+    '((x :a) (2 :b) (3/2 :c)))
   ;; ==== end Fable probe block 9520-9539 ====
 
   ;; ==== Fable cl-fileio string-AREF fallout probes 9160-9169 ====

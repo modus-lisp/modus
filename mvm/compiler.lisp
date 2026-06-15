@@ -9355,6 +9355,18 @@
         (temp  (alloc-temp-reg))
         (temp2 (alloc-temp-reg)))
     (compile-form arg env dest)
+    ;; T and NIL are SYMBOLS in CL (CLHS), but they are IMMEDIATES, not heap
+    ;; objects with subtag #x50/#x53 — so the obj-tag/obj-subtag path below
+    ;; would misclassify them (and worse, dereference the immediate as a heap
+    ;; pointer).  Catch both immediates up front.
+    ;; NIL immediate (low nibble = cons tag, so the obj-tag check fails it).
+    (emit-ir :bnull dest true-label)
+    ;; T immediate (+t-value+ #xDEAD1009 — low nibble #x9 collides with
+    ;; +tag-object+, so the obj-tag check below would WRONGLY pass it through
+    ;; to obj-subtag, reading garbage from a non-pointer).  Compare directly.
+    (emit-ir :li temp2 +t-value+)
+    (emit-ir :cmp dest temp2)
+    (emit-ir :beq true-label)
     ;; Tag check: obj?
     (emit-ir :obj-tag temp dest)
     (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))

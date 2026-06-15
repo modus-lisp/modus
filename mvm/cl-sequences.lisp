@@ -860,9 +860,16 @@
     ((characterp x) (let ((s (%make-string-array 1)))
                       (aset s 0 (char-code x))
                       s))
-    ((%cl-sym-p x) (%cl-sym-name x))
     ((null x) "NIL")
     ((eq x t) "T")
+    ((%cl-sym-p x) (%cl-sym-name x))
+    ;; Native MVM symbols (#x50) and keywords (#x53) are NOT %cl-sym-p
+    ;; (that checks the cons-wrapper car); route them through symbol-name,
+    ;; which resolves the hash → name via *sym-name-table* / package walk.
+    ;; A quoted literal symbol designator like '|abc| arrives as a native
+    ;; #x50 sym, so without this STRING= '|abc| "abc" coerced the symbol
+    ;; OBJECT (garbage) instead of its name.
+    ((symbolp x) (symbol-name x))
     (t x)))                      ; fallthrough — might be a wrapper
 
 (defun string= (a b &rest options)
@@ -876,10 +883,16 @@
         (s1 0) (e1 nil) (s2 0) (e2 nil)
         (allow-other nil)
         (o options))
+    ;; :allow-other-keys is LEFTMOST-wins (CLHS 3.4.1.4): the value of the
+    ;; FIRST occurrence governs.  STRING=.ERROR.6 passes
+    ;; ":allow-other-keys nil :allow-other-keys t :foo bar" — the leading
+    ;; nil means :foo is illegal and must signal program-error, even though
+    ;; a later :allow-other-keys is t.
     (let ((scan options))
       (loop (when (or (null scan) (null (cdr scan))) (return))
-        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
-          (setq allow-other t))
+        (when (eq (car scan) :allow-other-keys)
+          (when (cadr scan) (setq allow-other t))
+          (return))
         (setq scan (cddr scan))))
     (loop (when (null o) (return))
       (when (null (cdr o))

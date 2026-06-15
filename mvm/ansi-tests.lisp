@@ -2360,6 +2360,12 @@
   ;; Test string reading
   (deftest 9994 (read-from-string "\"hello\"") "hello")
   ;; Keyword test skipped — MVM keyword handling needs investigation
+  ;; #C(...) under *read-suppress* must yield NIL, not a complex object
+  ;; (CLHS 2.3.6 / 2.4.8.17).  Lock the read-suppress dispatch fix.
+  (deftest 8720 (let ((*read-suppress* t)) (read-from-string "#c(1 1)")) nil)
+  (deftest 8721 (let ((*read-suppress* t)) (read-from-string "#C(2 3)")) nil)
+  ;; Control: non-suppressed #c still reads a complex (real part only here)
+  (deftest 8722 (let ((*read-suppress* nil)) (read-from-string "#c(5 0)")) 5)
   ;; Test copy-readtable
   (deftest 9996 (readtablep (copy-readtable)) t)
   (deftest 9998 (eq *readtable* (copy-readtable)) nil)

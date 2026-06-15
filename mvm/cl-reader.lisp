@@ -1514,9 +1514,11 @@
         ;; build the complex object.
         ((or (= code 67) (= code 99))  ; C c
          (let ((pair (%read-internal stream t nil t)))
-           (if (and (consp pair) (consp (cdr pair)))
-               (complex (car pair) (cadr pair))
-               (car pair))))
+           (cond
+             (*read-suppress* nil)
+             ((and (consp pair) (consp (cdr pair)))
+              (complex (car pair) (cadr pair)))
+             (t (car pair)))))
         ;; #P"path" — pathname literal.  CLHS 2.4.8.14.  Modus pathnames
         ;; are just strings, so we read the inner form and call pathname
         ;; on it.  Works for "string", #.(parse-namestring ...), and

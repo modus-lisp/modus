@@ -847,13 +847,45 @@
 ;; Convert SBCL symbols/keywords used as package designators to strings
 ;; so MVM can handle them (MVM symbols are name-hashes, not printable)
 (defun %stringify-pkg-designator (x)
-  "Convert a keyword or symbol package designator to a string."
+  "Convert a package-designator LITERAL source-form to a string.
+   Handles: string/character literals, keyword literals (:foo), and
+   quoted-symbol literals ('foo i.e. (quote foo)).  A bare unquoted symbol
+   is a VARIABLE reference at runtime and is returned unchanged."
   (cond
     ((stringp x) x)
     ((characterp x) (string x))
     ((keywordp x) (symbol-name x))
+    ;; quoted-symbol literal: (quote foo) → \"FOO\"
+    ((and (consp x) (eq (car x) 'quote) (consp (cdr x)) (symbolp (cadr x)))
+     (symbol-name (cadr x)))
+    ;; A bare unquoted symbol is a variable — leave it alone.
+    (t x)))
+
+(defun %stringify-defpackage-name (x)
+  "Stringify a DEFPACKAGE name — an UNEVALUATED string-designator position,
+   so a bare symbol IS a literal name (CLHS: not a form).  Distinct from
+   %stringify-pkg-designator which leaves bare symbols (runtime variables)
+   alone in function-call argument position."
+  (cond
+    ((stringp x) x)
+    ((characterp x) (string x))
+    ((and (consp x) (eq (car x) 'quote) (consp (cdr x)) (symbolp (cadr x)))
+     (symbol-name (cadr x)))
     ((symbolp x) (symbol-name x))
     (t x)))
+
+(defun %pkg-designator-literal-p (x)
+  "True iff X (a source form in package-designator position) is a genuine
+   LITERAL designator: a string literal, a character literal, a keyword
+   literal (:foo), or a quoted symbol ('foo i.e. (quote foo)).  A BARE
+   unquoted symbol is a VARIABLE reference (evaluate at runtime) and is
+   NOT a literal — return NIL so the rewriter leaves it untouched."
+  (or (stringp x)
+      (characterp x)
+      (keywordp x)
+      (and (consp x) (eq (car x) 'quote) (consp (cdr x)) (symbolp (cadr x))
+           ;; 'nil / 't are not package names
+           (not (member (cadr x) '(nil t))))))
 
 ;; Rewrite do-symbols/do-external-symbols/do-all-symbols/with-package-iterator
 ;; These are macros in CL that SBCL expands to SBCL-internal code.
@@ -931,14 +963,26 @@
     ;; (defpackage name option...) → (%defpackage-impl name '(option...))
     ;; Options are bare lists like (:use) that would be evaluated as forms.
     ;; Convert to a single quoted list of options.
+    ;; In DEFPACKAGE the NAME is an UNEVALUATED string-designator (CLHS: the
+    ;; defpackage name is a literal, not a form), so a bare symbol here IS a
+    ;; literal name and must be stringified — unlike the function-call branches
+    ;; below where a bare symbol is a runtime variable.
     ((and (eq (car form) 'defpackage) (cdr form))
-     (let ((name (rewrite-package-iteration (%stringify-pkg-designator (cadr form))))
+     (let ((name (rewrite-package-iteration (%stringify-defpackage-name (cadr form))))
            (options (cddr form)))
        `(%defpackage-impl ,name (quote ,options))))
     ;; Package functions with keyword/symbol designator args → stringify.
     ;; INTERN and FIND-SYMBOL are EXCLUDED here: their first arg is the
     ;; string NAME (not a package designator), and their optional second
     ;; arg is the package — handled separately just below.
+    ;; NOTE: only a genuine package-designator LITERAL is stringified here —
+    ;; a keyword (:foo) or a quoted symbol ('foo).  A *bare unquoted symbol*
+    ;; in package-arg position is a VARIABLE REFERENCE in conformant CL (e.g.
+    ;; (let ((pkg-name "P")) (make-package pkg-name) ...)) and MUST be left
+    ;; alone so it is evaluated at runtime.  Stringifying it would corrupt the
+    ;; test (make-package would create a package literally named "PKG-NAME").
+    ;; The underlying make-package/intern-with-a-runtime-variable path works in
+    ;; cl-eval, so no rewrite is needed for variables.
     ((and (member (car form) '(make-package find-package delete-package
                                safely-delete-package rename-package
                                use-package unuse-package
@@ -948,20 +992,20 @@
                                package-use-list package-used-by-list
                                package-shadowing-symbols))
           (cdr form)
-          (or (keywordp (cadr form)) (and (symbolp (cadr form)) (not (member (cadr form) '(nil t p sym pkg s))))))
+          (%pkg-designator-literal-p (cadr form)))
      (let ((str-arg (%stringify-pkg-designator (cadr form))))
        `(,(car form) ,str-arg ,@(mapcar #'rewrite-package-iteration (cddr form)))))
     ;; (intern NAME [PACKAGE]) / (find-symbol NAME [PACKAGE]) — only the
     ;; SECOND arg may need stringification; the first is a runtime string
     ;; and must be left alone (was the cause of the FORMATTER-TEST-NAME-STRING
     ;; macroexpansion bug — see commit log).
+    ;; Only the SECOND arg (the PACKAGE designator) may be stringified, and
+    ;; only when it is a LITERAL (keyword or quoted symbol) — never a bare
+    ;; unquoted symbol (a runtime variable).  See note above.
     ((and (member (car form) '(intern find-symbol))
           (consp (cdr form))
           (consp (cddr form))
-          (let ((p (caddr form)))
-            (or (keywordp p)
-                (and (symbolp p)
-                     (not (member p '(nil t p sym pkg s)))))))
+          (%pkg-designator-literal-p (caddr form)))
      (let* ((name-arg (rewrite-package-iteration (cadr form)))
             (pkg-arg  (%stringify-pkg-designator (caddr form)))
             (rest     (cdddr form)))

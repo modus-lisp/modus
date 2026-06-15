@@ -296,12 +296,21 @@
 (defun packagep (x) (%pkg-p x))
 
 (defun package-name (pkg)
+  ;; CLHS: PKG is a package designator.  A string/symbol/character that
+  ;; names no existing package, or a non-designator (integer), is an
+  ;; error — package-name.5/.6/.6a accept type-error or package-error.
   (let ((p (%resolve-package pkg)))
-    (if p (%pkg-name p) nil)))
+    (if p
+        (%pkg-name p)
+        (%signal-type-error))))
 
 (defun package-nicknames (pkg)
+  ;; CLHS: as package-name — a non-package designator signals type-error
+  ;; (package-nicknames.9/.9a: (package-nicknames 10) => type-error).
   (let ((p (%resolve-package pkg)))
-    (if p (%pkg-nicknames p) nil)))
+    (if p
+        (%pkg-nicknames p)
+        (%signal-type-error))))
 
 (defun package-use-list (pkg)
   (let ((p (%resolve-package pkg)))
@@ -623,6 +632,21 @@
         (let ((ext-entry (%symtab-find (%pkg-external pkg) name-str)))
           (if ext-entry
               (values (cdr ext-entry) :external)
+            ;; KEYWORD package: `:foo' literals from compiled code are
+            ;; minted via %INTERN-KEYWORD into the keyword table at
+            ;; #x10000148 (keyed by name-hash) but are NOT added to the
+            ;; KEYWORD package external symtab.  So a keyword that exists
+            ;; in the running image is "present" in KEYWORD per CLHS, yet
+            ;; the symtab scan above misses it.  Consult the keyword table
+            ;; by hash; if present, return it :external (find-symbol.10).
+            ;; A name never minted as a keyword (find-symbol.4) is absent
+            ;; from the table → falls through to (values nil nil).
+            (let ((kw-existing
+                    (and (eq pkg (find-package "KEYWORD"))
+                         (let ((kt (mem-ref #x10000148 :u64)))
+                           (and kt (gethash (compute-name-hash name-str) kt))))))
+            (if kw-existing
+                (values kw-existing :external)
               ;; Check internal symbols
               (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
                 (if int-entry
@@ -639,7 +663,7 @@
                         (setq use (cdr use)))
                       (if found
                           (values found :inherited)
-                          (values nil nil))))))))))
+                          (values nil nil))))))))))))
 
 (defun intern (name &rest pkg-arg)
   "Intern symbol named NAME in package PKG.

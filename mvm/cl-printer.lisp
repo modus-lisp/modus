@@ -1139,8 +1139,41 @@
   (%write-obj obj stream nil nil))
 
 ;;; write-to-string: return printed representation as string
+(defun %write-kwargs-valid-p (args)
+  "Validate a write/write-to-string keyword tail per CLHS 3.4.1.4:
+   even length, every key a recognised printer keyword (unless
+   :allow-other-keys is non-nil).  Signals PROGRAM-ERROR via the caller
+   when invalid.  Returns T when OK, NIL when invalid."
+  (let ((allow-other nil) (allow-other-set nil))
+    ;; First scan for an :allow-other-keys non-nil (leftmost wins).
+    (let ((scan args))
+      (loop
+        (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (not allow-other-set))
+          (setq allow-other-set t)
+          (when (cadr scan) (setq allow-other t)))
+        (setq scan (cddr scan))))
+    (let ((rest args))
+      (loop
+        (when (null rest) (return t))
+        ;; Odd-length tail ⇒ malformed plist ⇒ program-error.
+        (when (null (cdr rest)) (return nil))
+        (let ((k (car rest)))
+          (unless (or allow-other
+                      (eq k :escape) (eq k :base) (eq k :radix) (eq k :case)
+                      (eq k :level) (eq k :length) (eq k :circle) (eq k :gensym)
+                      (eq k :array) (eq k :readably) (eq k :stream)
+                      (eq k :pretty) (eq k :lines) (eq k :miser-width)
+                      (eq k :right-margin) (eq k :pprint-dispatch)
+                      (eq k :allow-other-keys))
+            (return nil)))
+        (setq rest (cddr rest))))))
+
 (defun write-to-string (obj &rest args)
   "Return string representation of OBJ. Keyword args override *print-* vars."
+  ;; CLHS: a malformed (odd-length) or unrecognised keyword tail signals
+  ;; PROGRAM-ERROR (write-to-string.error.2/3).
+  (unless (%write-kwargs-valid-p args) (%signal-program-error))
   (let ((s (make-string-output-stream)))
     ;; Parse keyword args
     (let ((escape *print-escape*)

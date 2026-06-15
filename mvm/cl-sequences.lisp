@@ -3650,3 +3650,74 @@
                     (return i))))
             (setq i (+ i 1))))))))
 
+;;; reduce — override of prelude.lisp's reduce.  The prelude version
+;;; parsed repeated keywords RIGHTMOST-wins (each match overwrote the
+;;; prior value).  CLHS 3.4.1.4.1 requires LEFTMOST-wins: the first
+;;; occurrence of a repeated keyword is the one that takes effect.
+;;; (reduce #'cons '(1 2 3) :from-end t :from-end nil
+;;;         :initial-value nil :initial-value 'a) => (1 2 3)
+;;; because :from-end t and :initial-value nil (the leftmost ones) win.
+(defun reduce (fn seq &rest args)
+  "Fold FN over SEQ (list or vector). Honors :initial-value, :from-end,
+   :start, :end, :key.  Repeated keywords: leftmost wins (CLHS 3.4.1.4.1)."
+  (%check-kw-allowed args '(:initial-value :from-end :start :end :key))
+  (let ((init :no-init) (init-given nil)
+        (from-end nil) (start 0) (end nil) (key nil)
+        ;; per-keyword "seen" flags so the FIRST occurrence wins
+        (fe-set nil) (start-set nil) (end-set nil) (key-set nil)
+        (a args))
+    (loop (when (null a) (return))
+      (cond ((eq (car a) :initial-value)
+             (unless init-given (setq init (cadr a) init-given t))
+             (setq a (cddr a)))
+            ((eq (car a) :from-end)
+             (unless fe-set (setq from-end (cadr a) fe-set t)) (setq a (cddr a)))
+            ((eq (car a) :start)
+             (unless start-set (setq start (cadr a) start-set t)) (setq a (cddr a)))
+            ((eq (car a) :end)
+             (unless end-set (setq end (cadr a) end-set t)) (setq a (cddr a)))
+            ((eq (car a) :key)
+             (unless key-set (setq key (cadr a) key-set t)) (setq a (cddr a)))
+            (t (setq a (cdr a)))))
+    (let* ((elts (let ((lst nil) (i 0)
+                       (eff-end (if end end (if seq (length seq) 0))))
+                   (cond
+                     ((and (consp seq) (array-wrapper-p seq))
+                      (loop (when (>= i eff-end) (return nil))
+                        (when (>= i start)
+                          (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
+                            (setq lst (cons v lst))))
+                        (setq i (+ i 1))))
+                     ((or (null seq) (consp seq))
+                      (let ((cur seq))
+                        (loop (when (null cur) (return nil))
+                          (when (and (>= i start) (< i eff-end))
+                            (let ((v (if key (funcall key (car cur)) (car cur))))
+                              (setq lst (cons v lst))))
+                          (setq cur (cdr cur))
+                          (setq i (+ i 1)))))
+                     (t
+                      (loop (when (>= i eff-end) (return nil))
+                        (when (>= i start)
+                          (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
+                            (setq lst (cons v lst))))
+                        (setq i (+ i 1)))))
+                   (nreverse lst))))
+      (cond
+        ((and (null elts) init-given) init)
+        ((null elts) (funcall fn))
+        ((and (null (cdr elts)) (not init-given)) (car elts))
+        (from-end
+         (let* ((rev (reverse elts))
+                (acc (if init-given init (car rev)))
+                (cur (if init-given rev (cdr rev))))
+           (loop (when (null cur) (return acc))
+             (setq acc (funcall fn (car cur) acc))
+             (setq cur (cdr cur)))))
+        (t
+         (let* ((acc (if init-given init (car elts)))
+                (cur (if init-given elts (cdr elts))))
+           (loop (when (null cur) (return acc))
+             (setq acc (funcall fn acc (car cur)))
+             (setq cur (cdr cur)))))))))
+

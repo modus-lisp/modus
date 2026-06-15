@@ -1299,20 +1299,30 @@
                         *print-array* *print-readably*))
       (%write-obj obj stream nil (if readably t escape)))))
 
-(defun prin1 (obj &rest stream-arg)
-  (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))
-        (*print-escape* t))
-    (declare (special *print-escape*))
-    (%write-obj obj stream nil t)
-    obj))
+(defun prin1 (&rest all)
+  ;; CLHS: prin1 takes (object &optional output-stream).  Missing OBJECT
+  ;; or a 3rd arg signals PROGRAM-ERROR (prin1.error.1/2).
+  (when (or (null all) (cddr all)) (%signal-program-error))
+  (let ((obj (car all))
+        (stream-arg (cdr all)))
+    (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))
+          (*print-escape* t))
+      (declare (special *print-escape*))
+      (%write-obj obj stream nil t)
+      obj)))
 
-(defun princ (obj &rest stream-arg)
-  (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))
-        (*print-escape* nil)
-        (*print-readably* nil))
-    (declare (special *print-escape* *print-readably*))
-    (%write-obj obj stream nil nil)
-    obj))
+(defun princ (&rest all)
+  ;; CLHS: princ takes (object &optional output-stream).  Missing OBJECT
+  ;; or a 3rd arg signals PROGRAM-ERROR (princ.error.1/2).
+  (when (or (null all) (cddr all)) (%signal-program-error))
+  (let ((obj (car all))
+        (stream-arg (cdr all)))
+    (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))
+          (*print-escape* nil)
+          (*print-readably* nil))
+      (declare (special *print-escape* *print-readably*))
+      (%write-obj obj stream nil nil)
+      obj)))
 
 (defun write (obj &rest args)
   "Write OBJ with keyword args controlling print vars.  Per CLHS
@@ -1363,14 +1373,19 @@
         (%write-to-stream-with-keys obj s (nreverse filtered-args))))
     obj))
 
-(defun print (obj &rest stream-arg)
-  (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))
-        (*print-escape* t))
-    (declare (special *print-escape*))
-    (%write-char-to-stream 10 stream)  ; newline first
-    (%write-obj obj stream nil t)
-    (%write-char-to-stream 32 stream)  ; trailing space
-    obj))
+(defun print (&rest all)
+  ;; CLHS: print takes (object &optional output-stream).  Missing OBJECT
+  ;; or a 3rd arg signals PROGRAM-ERROR (print.error.1/2).
+  (when (or (null all) (cddr all)) (%signal-program-error))
+  (let ((obj (car all))
+        (stream-arg (cdr all)))
+    (let ((stream (%resolve-output-stream (if stream-arg (car stream-arg) nil)))
+          (*print-escape* t))
+      (declare (special *print-escape*))
+      (%write-char-to-stream 10 stream)  ; newline first
+      (%write-obj obj stream nil t)
+      (%write-char-to-stream 32 stream)  ; trailing space
+      obj)))
 
 ;;; ============================================================
 ;;; Pretty-printer core: pprint-logical-block / pprint-pop /

@@ -159,6 +159,12 @@
               (gethash name *symbol-function-table*)) t)
         ((and *native-sym-function-table*
               (gethash hash *native-sym-function-table*)) t)
+        ;; CLHS: fboundp is also true when SYM names a macro (DEFUN, WHEN,
+        ;; COND, …) or a special operator (IF, SETQ, …) — not only an
+        ;; ordinary function.  Without this, (fboundp 'defun) was NIL.
+        ;; (fboundp.3 (fboundp 'defun) — a macro.)
+        ((macro-function sym) t)
+        ((special-operator-p sym) t)
         (t nil)))))
 
 (defun fmakunbound (sym)

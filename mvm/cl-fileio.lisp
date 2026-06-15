@@ -535,7 +535,20 @@
 
 ;;; --- File stream read-byte ---
 (defun %fs-read-byte (stream eof-error-p eof-value)
-  "Read one byte from a file stream."
+  "Read one byte from a file stream.  If STREAM is a composite stream
+   (two-way / echo / concatenated / synonym) wrapping a binary file
+   sub-stream, delegate to the public READ-BYTE, which resolves to the
+   active underlying file stream.  This lets read-sequence's byte path
+   (cl-printer) read BYTES through a composite stream whose
+   stream-element-type is a byte type — make-concatenated-stream.22-24,
+   make-two-way-stream.12/.13."
+  (let ((ty (if (streamp stream) (%stream-type stream) 9)))
+    (if (or (= ty 3) (= ty 4) (= ty 6) (= ty 7))
+        (read-byte stream eof-error-p eof-value)
+        (%fs-read-byte-raw stream eof-error-p eof-value))))
+
+(defun %fs-read-byte-raw (stream eof-error-p eof-value)
+  "Read one byte directly from a type-9 file stream's buffer."
   (let ((fd (%fs-fd stream)))
     (if (< fd 0)
         (if eof-error-p (error "end of file") eof-value)
@@ -564,7 +577,7 @@
                           (setq i (+ i 1))))
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
-                      (%fs-read-byte stream eof-error-p eof-value)))))))))
+                      (%fs-read-byte-raw stream eof-error-p eof-value)))))))))
 
 ;;; --- File stream write-byte ---
 (defun %fs-write-byte (byte stream)

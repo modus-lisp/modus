@@ -4112,6 +4112,70 @@
   (rt-run-test 9169 (pathname-match-p "x" "*") t)
   ;; ==== end cl-fileio probes 9160-9169 ====
 
+  ;; ==== diag: binary file-stream element-type + read-sequence (8880-8889) ==
+  ;; 8880: stream-element-type reports the byte type OPEN was given.
+  (rt-run-test 8880
+    (let ((s (open "tmpdiag.dat" :direction :output
+                   :element-type '(unsigned-byte 8) :if-exists :supersede)))
+      (write-byte 7 s) (write-byte 9 s) (close s)
+      (let ((is (open "tmpdiag.dat" :direction :input
+                      :element-type '(unsigned-byte 8))))
+        (let ((et (stream-element-type is))) (close is) et)))
+    '(unsigned-byte 8))
+  ;; 8881: %input-stream-reads-chars-p NIL for a binary file stream.
+  (rt-run-test 8881
+    (let ((is (open "tmpdiag.dat" :direction :input
+                    :element-type '(unsigned-byte 8))))
+      (let ((r (%input-stream-reads-chars-p is))) (close is) (notnot r)))
+    nil)
+  ;; 8882: read-sequence BYTES directly from a binary file stream.
+  (rt-run-test 8882
+    (let ((is (open "tmpdiag.dat" :direction :input
+                    :element-type '(unsigned-byte 8)))
+          (x (vector nil nil nil nil)))
+      (let ((n (read-sequence x is))) (close is) (list n (aref x 0) (aref x 1))))
+    '(2 7 9))
+  ;; 8883: read-sequence BYTES through a TWO-WAY stream over a binary file.
+  (rt-run-test 8883
+    (let ((is (open "tmpdiag.dat" :direction :input
+                    :element-type '(unsigned-byte 8)))
+          (os (open "tmpdiag2.dat" :direction :output
+                    :element-type '(unsigned-byte 8) :if-exists :supersede))
+          (x (vector nil nil nil nil)))
+      (let ((tw (make-two-way-stream is os)))
+        (let ((n (read-sequence x tw)))
+          (close is) (close os)
+          (list n (aref x 0) (aref x 1)))))
+    '(2 7 9))
+  ;; 8884: multiple-value-list of (values (read-sequence x s) x) — the
+  ;; exact shape the make-two-way / make-concatenated binary tests use.
+  (rt-run-test 8884
+    (let ((is (open "tmpdiag.dat" :direction :input
+                    :element-type '(unsigned-byte 8))))
+      (let ((r (multiple-value-list
+                 (let ((x (vector nil nil nil nil)))
+                   (values (read-sequence x is) x)))))
+        (close is) r))
+    '(2 #(7 9 nil nil)))
+  ;; 8887: write-sequence of bytes THROUGH a two-way stream to a binary
+  ;; output file, then read them back — the make-two-way-stream.12/.13
+  ;; write half.
+  (rt-run-test 8887
+    (let ((is (open "tmpdiag.dat" :direction :input
+                    :element-type '(unsigned-byte 8)))
+          (os (open "tmpdiag3.dat" :direction :output
+                    :element-type '(unsigned-byte 8) :if-exists :supersede)))
+      (let ((tw (make-two-way-stream is os)))
+        (write-sequence (vector 100 5 18) tw)
+        (close is) (close os))
+      (let ((rs (open "tmpdiag3.dat" :direction :input
+                      :element-type '(unsigned-byte 8)))
+            (y (vector nil nil nil)))
+        (read-sequence y rs) (close rs)
+        (list (aref y 0) (aref y 1) (aref y 2))))
+    '(100 5 18))
+  ;; ==== end diag probes 8880-8889 ====
+
   ;; ==== Fable reader re-census probes 9180-9219 ====
   ;; Self-contained reader behaviour, package-independent where possible.
   ;; read-from-string returns (value position).

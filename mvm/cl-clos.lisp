@@ -906,7 +906,14 @@
     (let ((cur slots))
       (loop
         (when (null cur) (return -1))
-        (when (eq (car cur) slot-name) (return idx))
+        ;; Use name/hash-robust equality (not raw EQ): a class defined at
+        ;; runtime-EVAL time interns its slot-name symbols as one object,
+        ;; while a query symbol arriving from a *different* compilation unit
+        ;; (e.g. map-slot-exists-p* walking a quoted list in ansi-bridge, or
+        ;; an eval'd test body) can be a distinct native-MVM-sym / CL-sym
+        ;; wrapper with the SAME name+hash.  Mirrors the condition-slot path
+        ;; and %collect-all-slots, which already key by name/hash.
+        (when (%clos-sym-name-eq (car cur) slot-name) (return idx))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))))
 
@@ -1128,20 +1135,52 @@
           (setq cur (cdr cur)))
         (setq *clos-class-slot-values* new-list)))))
 
+(defun %cond-type-name-of (obj)
+  "If OBJ is structurally a condition instance (a 2-element #x32 array whose
+   slot-0 is a non-NIL symbol that names a registered condition type), return
+   that registry type-name; else NIL.  Matches the type-name by NAME/HASH
+   (not raw EQ) so a condition built via (make-condition 'X) in an eval'd test
+   body still resolves to the registry entry that an init-form's
+   define-condition created under a DIFFERENT native-MVM-sym / CL-sym object.
+   %condition-p / %cond-reg-find use raw EQ assoc and miss that drift, which
+   poisoned slot-exists-p.15/.16 (all-NIL)."
+  (when (or (fixnump obj) (consp obj) (null obj)) (return-from %cond-type-name-of nil))
+  (when (not (= (obj-subtag obj) #x32)) (return-from %cond-type-name-of nil))
+  (when (not (= (array-length obj) 2)) (return-from %cond-type-name-of nil))
+  (let ((tn (aref obj 0)))
+    (when (or (null tn) (not (symbolp tn))) (return-from %cond-type-name-of nil))
+    (let ((cur *condition-type-registry*))
+      (loop
+        (when (null cur) (return-from %cond-type-name-of nil))
+        (let ((reg-name (car (car cur))))
+          (when (%clos-sym-name-eq reg-name tn)
+            (return-from %cond-type-name-of reg-name)))
+        (setq cur (cdr cur))))))
+
 (defun %slot-exists-p (obj slot-name)
   "True if OBJ has a slot named SLOT-NAME.  Per CLHS, SLOT-EXISTS-P may
    be called on any object, not just standard objects — in particular it
    must work on condition objects (slot-exists-p.15/.16)."
   (when (null obj) (return-from %slot-exists-p nil))
   ;; Condition objects: query the condition-type slot registry.  Conditions
-  ;; are #x32 arrays too, so check this before the CLOS-instance path.
-  (when (%condition-p obj)
-    (let ((cur (%collect-all-slots (%condition-type-name obj))))
-      (loop
-        (when (null cur) (return-from %slot-exists-p nil))
-        (when (%clos-sym-name-eq (car (car cur)) slot-name)
-          (return-from %slot-exists-p t))
-        (setq cur (cdr cur)))))
+  ;; are #x32 arrays too, so check this before the CLOS-instance path.  Use a
+  ;; NAME/HASH-robust registry resolve (%cond-type-name-of) rather than
+  ;; %condition-p, which would miss a drifted type-name symbol and report
+  ;; every slot as absent.
+  (let ((cond-tn (%cond-type-name-of obj)))
+    (when cond-tn
+      (let ((cur (%collect-all-slots cond-tn)))
+        (loop
+          (when (null cur) (return-from %slot-exists-p nil))
+          (when (%clos-sym-name-eq (car (car cur)) slot-name)
+            (return-from %slot-exists-p t))
+          (setq cur (cdr cur))))))
+  ;; Struct objects: SLOT-EXISTS-P must work on structure instances too
+  ;; (slot-exists-p.11-.14).  Structs are #x32 arrays with slot-0 =
+  ;; '%struct-instance; query the struct-type effective slot list by hash.
+  (when (%struct-instance-p obj)
+    (return-from %slot-exists-p
+      (>= (%struct-slot-index (%struct-type-name obj) slot-name) 0)))
   (when (not (%clos-instance-p obj))
     (return-from %slot-exists-p nil))
   (let ((cls (%find-clos-class (aref obj 1))))

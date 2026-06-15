@@ -1387,6 +1387,35 @@
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)
+  ;; 8780-8784 — SLOT-EXISTS-P on CONDITION objects (slot-exists-p.15/.16).
+  ;; Register a condition at RUNTIME (mirrors the .lsp init-form path that
+  ;; the per-file harness runs for define-condition).  %slot-exists-p now
+  ;; resolves the condition type by NAME/HASH via %cond-type-name-of so a
+  ;; drifted type-name symbol (make-condition in an eval'd body vs the
+  ;; init-form's define-condition) still finds the registry slots.
+  (progn
+    (%define-condition 'probe-rt-cond nil
+                       (list (list 'rca nil :no-initform)
+                             (list 'rcb nil :no-initform))
+                       nil nil)
+    (%define-condition 'probe-rt-cond2 (list 'probe-rt-cond)
+                       (list (list 'rcc nil :no-initform))
+                       nil nil)
+    nil)
+  (deftest 8780 (if (%cond-type-name-of (make-condition 'probe-rt-cond)) t nil) t)
+  (deftest 8781 (if (slot-exists-p (make-condition 'probe-rt-cond) 'rca) t nil) t)
+  (deftest 8782 (if (slot-exists-p (make-condition 'probe-rt-cond) 'zz) t nil) nil)
+  (deftest 8783 (let ((o (make-condition 'probe-rt-cond)))
+                  (list (if (slot-exists-p o 'rca) t nil)
+                        (if (slot-exists-p o 'rcb) t nil)
+                        (if (slot-exists-p o 'zz) t nil)))
+    '(t t nil))
+  ;; inherited slots through the condition parent chain
+  (deftest 8784 (let ((o (make-condition 'probe-rt-cond2)))
+                  (list (if (slot-exists-p o 'rcc) t nil)
+                        (if (slot-exists-p o 'rca) t nil)
+                        (if (slot-exists-p o 'zz) t nil)))
+    '(t t nil))
   ;; ----------------------------------------------------------------
   ;; Probes 8980-8981: prove the RUNTIME-EVAL path resolves a let-bound
   ;; VARIABLE passed to make-package / find-package, instead of treating

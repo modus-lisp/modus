@@ -3930,6 +3930,15 @@
       (emit-jcc buf :b sw-not-ptr)
       (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= from_end?
       (emit-jcc buf :ae sw-not-ptr)
+      ;; MCGC: reject unless RAX is a recorded object start (same gate as the
+      ;; cons path).  The Cheney scan walks copied objects' payload FLATLY and
+      ;; calls scan_word on every word; a payload word that coincidentally
+      ;; carries object tag 9 and lands in from-space would otherwise be
+      ;; "copied" as a phantom object.  Every real object start has its bit set
+      ;; (alloc sites in stage 2 + set-copy-bit on survivors), so this only
+      ;; rejects false positives.
+      (when (mcgc-collector-on-p)
+        (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr))
       ;; In from-space. Call copy_object.
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)

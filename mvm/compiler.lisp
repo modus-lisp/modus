@@ -7535,6 +7535,24 @@
                           (loop while (consp bcur) do
                             (walk (car bcur) t sh)
                             (setq bcur (cdr bcur))))
+                        ;; The parameter list's &optional/&key/&aux DEFAULT
+                        ;; init-forms are evaluated INSIDE the local function
+                        ;; (Modus inlines them into the prologue), so a
+                        ;; RETURN-FROM in a default also crosses the unit
+                        ;; boundary — it targets the ENCLOSING block, not the
+                        ;; function's implicit one (CLHS 3.4.1: param defaults
+                        ;; lie outside the function's implicit block).  Walk
+                        ;; the default forms with the lambda flag set so
+                        ;; FLET.4/4A install the runtime catch frame.
+                        (let ((pcur (cadr (car cur))))
+                          (loop while (consp pcur) do
+                            (when (consp (car pcur))
+                              ;; (var default [supplied-p]) or ((:kw var) default)
+                              (let ((dcur (cdr (car pcur))))
+                                (loop while (consp dcur) do
+                                  (walk (car dcur) t sh)
+                                  (setq dcur (cdr dcur)))))
+                            (setq pcur (cdr pcur))))
                         (setq cur (cdr cur))))
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do

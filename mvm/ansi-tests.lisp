@@ -1460,6 +1460,28 @@
   (rt-run-test 8304 (flet ((%f (&key) 'good)) (%f)) 'good)
   (rt-run-test 8305 (labels ((%f (&key) 'good)) (%f :allow-other-keys nil)) 'good)
   (rt-run-test 8306 (labels ((%f (&key &allow-other-keys) 'good)) (%f :a 1)) 'good)
+  ;; 8307-8312 — RETURN-FROM in a flet/labels parameter DEFAULT escapes to
+  ;; the ENCLOSING block, not the local fn's implicit block (CLHS 3.4.1:
+  ;; param init-forms lie outside the function's implicit block).
+  ;; flet.4 / flet.4a / labels.4 / labels.4a / labels.6.
+  (rt-run-test 8307
+    (block %f (flet ((%f (&optional (x (return-from %f :good))) nil)) (%f) :bad))
+    :good)
+  (rt-run-test 8308
+    (block %f (flet ((%f (&key (x (return-from %f :good))) nil)) (%f) :bad))
+    :good)
+  (rt-run-test 8309
+    (block %f (labels ((%f (&optional (x (return-from %f :good))) nil)) (%f) :bad))
+    :good)
+  (rt-run-test 8310
+    (block %f (labels ((%f (&key (x (return-from %f :good))) nil)) (%f) :bad))
+    :good)
+  (rt-run-test 8311
+    (block %f (labels ((%f (&aux (x (return-from %f 10))) 20)) (%f) :bad))
+    10)
+  (rt-run-test 8312
+    (block %f (flet ((%f (&aux (x (return-from %f 10))) 20)) (%f) :bad))
+    10)
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)

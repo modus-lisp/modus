@@ -102,7 +102,27 @@ from/to address split.
 - alloc_space_parity flips each GC (1↔2).  "Live in new space" = descriptor
   space == current alloc_space_parity OR pinned OR pin-count>0.
 
-## Allocator — SIZE-AWARE pre-check (the protocol change)
+## Allocator — REFINED: per-run GUARD shrinks the per-site change (PREFERRED)
+The naive "size-aware pre-check at EVERY alloc site" is invasive and bug-prone.
+Better factoring, exploiting that the current post-write gc-check + a guard
+already works:
+- Refill sets R14 = run_end - GUARD (GUARD = 64 KiB = 16 pages).  Any object
+  whose size <= GUARD keeps the CURRENT "write, advance R12, post-write
+  gc-check (R12>=R14 → refill)" protocol UNCHANGED — an overshoot of <= GUARD
+  lands in the last 16 pages of the SAME run (still free pages of this run,
+  never the next pinned/foreign page).  cons, float, and small constant-size
+  :alloc-obj (the vast majority) need ZERO per-site change.
+- Only objects that can EXCEED GUARD need an explicit pre-check + a contiguous
+  run: array / string (runtime count) and any :alloc-obj with constant size >
+  GUARD (rare).  Those compute size → ensure R12+size <= real run_end → else
+  refill_big (find/split a run >= size contiguous bytes; GC+retry; else OOM).
+- Net: the pre-check touches only array/string (+ a guarded constant check on
+  big alloc-obj).  The hot path stays byte-for-byte the legacy fast path; only
+  R14's value changes (guarded).  GUARD must be >= the largest no-check object;
+  enforce by routing > GUARD through the big path.
+This is the implementation plan for stage 4's allocator.
+
+## Allocator — SIZE-AWARE pre-check (original framing; superseded by GUARD above)
 The contiguous bump does "write object, THEN gc-check" — safe only because a
 16 MiB guard absorbs overshoot.  With pages, overshoot would scribble into the
 next page (possibly PINNED or another generation) → corruption.  So flip to

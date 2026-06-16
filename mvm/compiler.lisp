@@ -11168,9 +11168,15 @@
     (setf optional (nreverse optional))
     (setf keys (nreverse keys))
     (setf auxes (nreverse auxes))
-    ;; If no &optional, &key, &rest, or &aux, return unchanged
+    ;; If no &optional, &key, &rest, or &aux, return unchanged.
+    ;; NB: HAS-KEY (a bare `&key` marker, even with zero key VARS as in
+    ;; (&key) or (&key &allow-other-keys)) must NOT take this path — the
+    ;; &key transform below has to fire so `&KEY` isn't left as a literal
+    ;; positional parameter (which crashes the prologue) and so the
+    ;; caller's plist is validated / accepts :ALLOW-OTHER-KEYS.
     (cond
-      ((and (null optional) (null keys) (null auxes) (not has-rest))
+      ((and (null optional) (null keys) (null auxes)
+            (not has-rest) (not has-key))
        (list params body nil 0 nil))
       ;; --- Real &key path: keys present, no &optional.  An explicit
       ;; &rest is OK now — it binds to the SAME synthesized catch var

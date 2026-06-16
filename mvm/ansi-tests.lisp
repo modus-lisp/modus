@@ -1450,6 +1450,16 @@
                       `(setq x (quote ,(list a w)))))
         (%m a1 a2)))
     '((a2) (%m a1 a2)))
+  ;; 8300-8311 — flet/labels &key keyword-validation probes (this seat).
+  ;; flet.57: :allow-other-keys nil is always accepted even with no
+  ;; declared keys (it is a permitted indicator per CLHS 3.4.1.4).
+  (rt-run-test 8300 (flet ((%f (&key) 'good)) (%f :allow-other-keys nil)) 'good)
+  (rt-run-test 8301 (flet ((%f (&key) 'good)) (%f :allow-other-keys t)) 'good)
+  (rt-run-test 8302 (flet ((%f (&key) 'good)) (%f :allow-other-keys t :a 1 :b 2)) 'good)
+  (rt-run-test 8303 (flet ((%f (&key &allow-other-keys) 'good)) (%f :a 1 :b 2)) 'good)
+  (rt-run-test 8304 (flet ((%f (&key) 'good)) (%f)) 'good)
+  (rt-run-test 8305 (labels ((%f (&key) 'good)) (%f :allow-other-keys nil)) 'good)
+  (rt-run-test 8306 (labels ((%f (&key &allow-other-keys) 'good)) (%f :a 1)) 'good)
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)

@@ -47,6 +47,26 @@
 (defconstant +x64-cons-base+     #x04000000)      ; 64MB - cons space
 (defconstant +x64-general-base+  #x05000000)      ; 80MB - general heap
 
+;; Mostly-Copying GC (MCGC) metadata for bare-metal x64.  The Cheney
+;; semispaces live in [0x10001000, 0x1DFFF000); the MCGC metadata region
+;; is placed ABOVE the heap at 0x1E000000.  Through stages 1-2 the old
+;; collector still runs and these config words are unused/write-only;
+;; they keep the bare-metal image building and ready for stage 3.
+;; Config-word BSS slots match boot-linux-x64 (+mcgc-cfg-*+ there).
+(defconstant +x64-mcgc-data-base+  #x10001000)    ; first allocatable data byte
+(defconstant +x64-mcgc-data-end+   #x1DFFF000)    ; one past data region
+(defconstant +x64-mcgc-meta-base+  #x1E000000)    ; metadata region base
+(defconstant +x64-mcgc-page-size+  #x1000)
+(defconstant +x64-mcgc-page-count+
+  (truncate (- +x64-mcgc-data-end+ +x64-mcgc-data-base+) +x64-mcgc-page-size+))
+(defconstant +x64-mcgc-descriptor-base+ +x64-mcgc-meta-base+)
+(defconstant +x64-mcgc-bitmap-base+
+  (logand (+ +x64-mcgc-descriptor-base+ +x64-mcgc-page-count+ 63) (lognot 63)))
+(defconstant +x64-mcgc-freelist-base+
+  (logand (+ +x64-mcgc-bitmap-base+
+             (truncate (- +x64-mcgc-data-end+ +x64-mcgc-data-base+) (* 16 8)) 63)
+          (lognot 63)))
+
 ;; Per-CPU structures
 (defconstant +x64-percpu-base+   #x360000)        ; Per-CPU data area
 (defconstant +x64-percpu-stride+ #x40)            ; 64 bytes per CPU
@@ -404,6 +424,26 @@
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x00800000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+
+    ;; ---- MCGC config words (bare-metal: physical addresses) ----
+    ;; Mirror boot-linux-x64's config block so the bare-metal image carries
+    ;; the same metadata layout.  Stages 1-2: written, unused by old GC.
+    (flet ((mcgc-store (slot val)
+             ;; mov rdi, slot ; mov rax, val ; mov [rdi], rax
+             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+             (mvm-emit-u32 buf slot) (mvm-emit-u32 buf 0)
+             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
+             (mvm-emit-u32 buf (logand val #xFFFFFFFF))
+             (mvm-emit-u32 buf (logand (ash val -32) #xFFFFFFFF))
+             (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)))
+      (mcgc-store #x10000E00 +x64-mcgc-data-base+)        ; page_base
+      (mcgc-store #x10000E08 +x64-mcgc-page-count+)       ; page_count
+      (mcgc-store #x10000E10 +x64-mcgc-descriptor-base+)  ; descriptor
+      (mcgc-store #x10000E18 +x64-mcgc-bitmap-base+)      ; bitmap
+      (mcgc-store #x10000E20 +x64-mcgc-freelist-base+)    ; freelist
+      (mcgc-store #x10000E28 0)                           ; freelist_count
+      (mcgc-store #x10000E30 0)                           ; alloc_page
+      (mcgc-store #x10000E38 +x64-mcgc-data-end+))        ; data_end
 
     ;; RBP = frame pointer (same as RSP initially)
     ;; mov rbp, rsp

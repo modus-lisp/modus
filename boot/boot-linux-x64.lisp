@@ -25,8 +25,54 @@
 ;; second from_end is far more than any plausible inter-check overshoot.
 (defconstant +linux-x64-gc-guard+ #x1000000)    ; 16MB guard past the 2nd semispace
 (defconstant +linux-x64-gc-midpoint+ #x1C000000)  ; Midpoint offset from heap base (from/to boundary)
-(defconstant +linux-x64-heap-size+ (+ #x38000000 +linux-x64-gc-guard+))  ; 896MB + 16MB guard
+(defconstant +linux-x64-heap-data-size+ (+ #x38000000 +linux-x64-gc-guard+))  ; 896MB + 16MB guard
 (defconstant +linux-x64-heap-alloc-start+ #x200)  ; Offset from heap base to first allocatable byte
+
+;;; ------------------------------------------------------------
+;;; Mostly-Copying (Bartlett) GC metadata region (MCGC).
+;;;
+;;; A 16 MiB metadata region is APPENDED to the heap mmap, immediately
+;;; after the existing data region.  Layout within the region (offsets
+;;; from MCGC-META-OFFSET, all relative to the mmap base):
+;;;   descriptor array : 1 byte / 4 KiB page  (state 0=free/1=live/2=pinned)
+;;;   object-start bmap : 1 bit / 16-byte granule over the data region
+;;;   free-list stack   : u32 page-index per slot
+;;; The kernel relies on MAP_ANON zero-fill for the descriptor/bitmap/
+;;; free-list arrays — the boot stub only stores the small CONFIG WORDS
+;;; (raw addresses + sizes) into the BSS so the trampoline/allocator can
+;;; find the arrays.  Through MCGC stages 1-2 the old Cheney collector
+;;; still runs UNCHANGED over the two semispaces; the metadata is built
+;;; but unused (stage 1) / write-only (stage 2).
+;;; ------------------------------------------------------------
+(defconstant +mcgc-page-size+ #x1000)           ; 4 KiB pages
+(defconstant +mcgc-page-count+ (truncate +linux-x64-heap-data-size+ +mcgc-page-size+)) ; pages over the data region
+(defconstant +mcgc-descriptor-size+ +mcgc-page-count+)  ; 1 byte/page
+;; Object-start bitmap: 1 bit / 16-byte granule = data_size/16/8 bytes.
+(defconstant +mcgc-bitmap-size+ (truncate +linux-x64-heap-data-size+ (* 16 8)))
+(defconstant +mcgc-freelist-size+ (* +mcgc-page-count+ 4))  ; u32 per page index
+(defconstant +mcgc-meta-size+ #x1000000)        ; 16 MiB metadata region (ample)
+;; Offsets (from mmap base) of the metadata arrays, each 64-byte aligned.
+(defconstant +mcgc-meta-offset+ +linux-x64-heap-data-size+) ; metadata starts right after data
+(defconstant +mcgc-descriptor-offset+ +mcgc-meta-offset+)
+(defconstant +mcgc-bitmap-offset+
+  (logand (+ +mcgc-descriptor-offset+ +mcgc-descriptor-size+ 63) (lognot 63)))
+(defconstant +mcgc-freelist-offset+
+  (logand (+ +mcgc-bitmap-offset+ +mcgc-bitmap-size+ 63) (lognot 63)))
+;; Full mmap = data region + metadata region.
+(defconstant +linux-x64-heap-size+ (+ +linux-x64-heap-data-size+ +mcgc-meta-size+))
+
+;;; MCGC config-word slots in the fixed BSS block (zero-init by the ELF
+;;; loader; the boot stub overwrites with mmap-relative raw addresses).
+;;; Placed at 0x10000E00.. — a verified-free 256-byte BSS gap above the
+;;; signal-handler scratch (0x10000C30-0xC80) and below 0x10000FF0.
+(defconstant +mcgc-cfg-page-base+      #x10000E00)  ; raw addr, first data byte
+(defconstant +mcgc-cfg-page-count+     #x10000E08)  ; number of pages
+(defconstant +mcgc-cfg-descriptor+     #x10000E10)  ; raw addr of descriptor array
+(defconstant +mcgc-cfg-bitmap+         #x10000E18)  ; raw addr of object-start bitmap
+(defconstant +mcgc-cfg-freelist+       #x10000E20)  ; raw addr of free-list stack
+(defconstant +mcgc-cfg-freelist-count+ #x10000E28)  ; current free page count
+(defconstant +mcgc-cfg-alloc-page+     #x10000E30)  ; current alloc page index
+(defconstant +mcgc-cfg-data-end+       #x10000E38)  ; raw addr one past data region
 
 ;; When GC is enabled, R14 = midpoint (GC fires at half heap).
 ;; When GC is disabled, R14 = full heap size (no GC trigger).
@@ -356,6 +402,38 @@
   (emit-bytes buf #x48 #xC7 #x04 #x25)           ; mov qword [abs32], imm32
   (emit-le32 buf #x10000060)
   (emit-le32 buf 0)
+
+  ;; ---- MCGC config words (mmap base still in RAX) ----
+  ;; Store raw mmap-relative addresses + sizes for the mostly-copying
+  ;; collector's metadata arrays.  Through stages 1-2 these are written
+  ;; but the old Cheney GC ignores them.  The descriptor / bitmap /
+  ;; free-list arrays are MAP_ANON zero-filled — no init needed here.
+  (flet ((store-base+off (slot off)
+           ;; mov rcx, rax ; add rcx, off ; mov [slot], rcx
+           (emit-bytes buf #x48 #x89 #xC1)          ; mov rcx, rax
+           (emit-bytes buf #x48 #x81 #xC1)          ; add rcx, imm32
+           (emit-le32 buf off)
+           (emit-bytes buf #x48 #x89 #x0C #x25)     ; mov [abs32], rcx
+           (emit-le32 buf slot))
+         (store-imm (slot val)
+           ;; mov rcx, imm32(zero-ext via mov ecx) won't sign-ext for the
+           ;; full 64; use movabs rcx, imm64 to be safe for large sizes.
+           (emit-bytes buf #x48 #xB9)               ; movabs rcx, imm64
+           (emit-le64 buf val)
+           (emit-bytes buf #x48 #x89 #x0C #x25)     ; mov [abs32], rcx
+           (emit-le32 buf slot)))
+    ;; page_base = mmap_base + alloc_start (first allocatable data byte)
+    (store-base+off +mcgc-cfg-page-base+ +linux-x64-heap-alloc-start+)
+    ;; data_end = mmap_base + data_size
+    (store-base+off +mcgc-cfg-data-end+  +linux-x64-heap-data-size+)
+    ;; descriptor / bitmap / freelist array bases
+    (store-base+off +mcgc-cfg-descriptor+ +mcgc-descriptor-offset+)
+    (store-base+off +mcgc-cfg-bitmap+     +mcgc-bitmap-offset+)
+    (store-base+off +mcgc-cfg-freelist+   +mcgc-freelist-offset+)
+    ;; page_count, freelist_count (0 until stage-3 builds the list), alloc_page (0)
+    (store-imm +mcgc-cfg-page-count+      +mcgc-page-count+)
+    (store-imm +mcgc-cfg-freelist-count+  0)
+    (store-imm +mcgc-cfg-alloc-page+      0))
 
   ;; R15 = NIL
   (emit-bytes buf #x49 #xBF)                      ; mov r15, imm64

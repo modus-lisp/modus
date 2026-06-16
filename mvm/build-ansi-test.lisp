@@ -1900,11 +1900,20 @@
                                          nil)))
             ,@body))))
 
-    ;; (symbol-macrolet bindings body...) → (progn body...) with substitution
-    ;; For reader tests, skip symbol-macrolet (too complex to handle generally)
+    ;; (symbol-macrolet ((name expansion)*) body...) — PRESERVE the wrapper
+    ;; and recurse the rewriter into the body.  The compiler's
+    ;; SYMBOL-MACROLET handler (mvm/compiler.lisp) extends the compile-env
+    ;; with :symbol-macro bindings, so variable references and SETF on the
+    ;; names expand correctly (incl. nested shadowing and lexical-var
+    ;; references).  The previous `(progn body…)` rewrite DROPPED the
+    ;; bindings entirely — every symbol-macro name then compiled as an
+    ;; unbound variable returning NIL (symbol-macrolet.4 nested shadowing,
+    ;; .5 lexical-ref, etc.).  We do NOT rewrite the expansion forms (they
+    ;; are places/lexical refs the compiler resolves), only the body.
     ((eq (car form) 'symbol-macrolet)
-     (let ((body (mapcar #'rewrite-reader-forms (cddr form))))
-       `(progn ,@body)))
+     (let ((bindings (cadr form))
+           (body (mapcar #'rewrite-reader-forms (cddr form))))
+       `(symbol-macrolet ,bindings ,@body)))
     ;; (macrolet (bindings...) body...) — PRESERVE the macrolet wrapper AND
     ;; pre-expand local-macro calls in the body with a CLHS-correct macro
     ;; lambda-list expander.

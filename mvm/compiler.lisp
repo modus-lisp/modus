@@ -867,6 +867,55 @@
                  *macro-table*)
         expander))
 
+(defun build-macrolet-expander (mparams mbody)
+  "Build a compile-time macro expander for a MACROLET local macro with
+   macro lambda-list MPARAMS and body MBODY.  Returns a one-arg function
+   (form) → expansion.
+
+   Macro lambda-lists differ from ordinary ones (CLHS 3.4.4): a leading
+   &WHOLE var binds the ENTIRE macro form (including the operator), and
+   &ENVIRONMENT var (allowed anywhere) binds the macro environment.  An
+   ordinary DESTRUCTURING-BIND against (cdr form) would bind &WHOLE to the
+   argument list only — wrong per CLHS.  Here we hoist &WHOLE and
+   &ENVIRONMENT out, bind &WHOLE to the whole form and &ENVIRONMENT to NIL
+   (no compile-time environment object is threaded through MACROEXPAND-1-MVM),
+   and destructure the remaining pattern against (cdr form).  The remaining
+   pattern still supports nested destructuring / &optional / &rest / &key
+   via the host DESTRUCTURING-BIND."
+  (let ((whole-var nil)
+        (env-var nil)
+        (rest-params nil))
+    ;; Hoist leading &WHOLE var.
+    (when (and (consp mparams)
+               (symbolp (car mparams))
+               (string= (symbol-name (car mparams)) "&WHOLE"))
+      (setf whole-var (cadr mparams))
+      (setf mparams (cddr mparams)))
+    ;; Strip &ENVIRONMENT var (anywhere); collect the rest.  (A literal
+    ;; dotted tail in a macro lambda-list is exceedingly rare in the ANSI
+    ;; macrolet tests; if present, the host DESTRUCTURING-BIND handles the
+    ;; un-stripped form below as a fallback path.)
+    (let ((p mparams))
+      (loop while (consp p) do
+        (let ((elt (car p)))
+          (if (and (symbolp elt)
+                   (string= (symbol-name elt) "&ENVIRONMENT"))
+              (progn (setf env-var (cadr p))
+                     (setf p (cddr p)))
+              (progn (push elt rest-params)
+                     (setf p (cdr p))))))
+      (setf rest-params (nreverse rest-params)))
+    ;; Rebuild the destructuring pattern.
+    (let* ((bindings (append
+                      (when whole-var (list (list whole-var 'form)))
+                      (when env-var (list (list env-var nil)))))
+           (db-form `(destructuring-bind (,@rest-params) (cdr form)
+                       ,@mbody)))
+      (eval `(lambda (form)
+               (let ,bindings
+                 (declare (ignorable ,@(mapcar #'car bindings)))
+                 ,db-form))))))
+
 (defun register-mvm-bootstrap-macros ()
   "Register standard CL macros needed to compile *runtime-functions*."
   ;; COND → nested IF
@@ -3072,9 +3121,7 @@
                   (mparams (cadr mdef))
                   (mbody (cddr mdef))
                   (old (gethash mname *macro-table*))
-                  (expander (eval `(lambda (form)
-                                     (destructuring-bind (,@mparams) (cdr form)
-                                       ,@mbody)))))
+                  (expander (build-macrolet-expander mparams mbody)))
              (push (cons mname old) saved-macros)
              (mvm-define-macro mname expander)))
          ;; Compile body

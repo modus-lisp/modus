@@ -1462,6 +1462,36 @@
          (%pplb-body-iterates-p (cdr forms))))
     (t nil)))
 
+(defun %build-reader-macrolet-expander (mparams mbody)
+  "Build a one-arg (form)->expansion expander for a MACROLET local macro,
+   honouring macro lambda-list semantics (CLHS 3.4.4): a leading &WHOLE var
+   binds the WHOLE macro form, an &ENVIRONMENT var (anywhere) binds NIL, and
+   the remaining pattern destructures (cdr form) — supporting nested
+   destructuring / &optional / &rest / &key via the host DESTRUCTURING-BIND.
+   Used by rewrite-reader-forms to pre-expand local-macro calls that appear
+   inside generalized-variable places (rotatef/incf/pop/...), which must be
+   expanded before the compiler's modify-macro analysis runs.  Mirrors
+   modus.mvm::build-macrolet-expander but kept local to the build script."
+  (let ((whole-var nil) (env-var nil) (rest-params nil))
+    (when (and (consp mparams) (symbolp (car mparams))
+               (string= (symbol-name (car mparams)) "&WHOLE"))
+      (setf whole-var (cadr mparams))
+      (setf mparams (cddr mparams)))
+    (let ((p mparams))
+      (loop while (consp p) do
+        (let ((elt (car p)))
+          (if (and (symbolp elt) (string= (symbol-name elt) "&ENVIRONMENT"))
+              (progn (setf env-var (cadr p)) (setf p (cddr p)))
+              (progn (push elt rest-params) (setf p (cdr p))))))
+      (setf rest-params (nreverse rest-params)))
+    (let* ((bindings (append (when whole-var (list (list whole-var 'form)))
+                             (when env-var (list (list env-var nil)))))
+           (db-form `(destructuring-bind (,@rest-params) (cdr form) ,@mbody)))
+      (eval `(lambda (form)
+               (let ,bindings
+                 (declare (ignorable ,@(mapcar #'car bindings)))
+                 ,db-form))))))
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -1875,41 +1905,77 @@
     ((eq (car form) 'symbol-macrolet)
      (let ((body (mapcar #'rewrite-reader-forms (cddr form))))
        `(progn ,@body)))
-    ;; (macrolet (bindings...) body...) → expand macros in body, then rewrite
-    ;; Build SBCL-side expanders to substitute macro calls in body
+    ;; (macrolet (bindings...) body...) — PRESERVE the macrolet wrapper AND
+    ;; pre-expand local-macro calls in the body with a CLHS-correct macro
+    ;; lambda-list expander.
+    ;;
+    ;; Why both?  Two distinct test populations:
+    ;;   1. macrolet.lsp's &WHOLE / &ENVIRONMENT / nested-destructuring tests —
+    ;;      need the WRAPPER so the compiler's compile-macrolet (which builds a
+    ;;      correct expander via build-macrolet-expander) handles them.  The
+    ;;      old build-side expander used an ORDINARY lambda-list `(lambda
+    ;;      ,args …)`, erroring on &WHOLE/&ENVIRONMENT; the error was swallowed
+    ;;      AND the wrapper was replaced by `(progn …)`, so the local macro
+    ;;      compiled to a bare NIL-returning call.
+    ;;   2. places/rotatef/incf/pop/… tests that use a local macro INSIDE a
+    ;;      generalized-variable place, e.g.
+    ;;        (macrolet ((%m (z) z)) (rotatef (expand-in-current-env (%m x)) y))
+    ;;      The modify-macro analyses its place argument before the compiler's
+    ;;      macroexpansion runs, so the place macro must already be expanded
+    ;;      (%m x) → x at build time, else the place is unrecognised.
+    ;; Pre-expanding here (with a &WHOLE-aware expander so it can't error out)
+    ;; satisfies (2); keeping the wrapper satisfies (1).  Pre-expansion is a
+    ;; semantic no-op for (1) — those tests reference the local macro only in
+    ;; ordinary (already-handled) positions.
     ((eq (car form) 'macrolet)
      (let* ((bindings (cadr form))
             (body (cddr form))
+            ;; Only pre-expand local macros with a SIMPLE ordinary lambda-list
+            ;; (plain required vars: no &WHOLE/&ENVIRONMENT/&REST/&KEY/&OPTIONAL
+            ;; and no nested-destructuring sub-patterns).  These are the
+            ;; place-macro shapes like (%m (z) z) used inside rotatef/incf/pop
+            ;; that must be expanded before modify-macro analysis.  Complex
+            ;; macro lambda-lists (incl. &WHOLE, which can re-emit its own
+            ;; whole form and loop expand-one) are left to the preserved
+            ;; wrapper + compile-macrolet — pre-expanding them here would
+            ;; either error or recurse to the depth cap producing garbage.
             (expanders
              (mapcan (lambda (b)
-                       (handler-case
-                         (let* ((name (car b))
-                                (args (cadr b))
-                                (forms (cddr b))
-                                (fn (eval `(lambda ,args ,@forms))))
-                           (list (cons name fn)))
-                         (error () nil)))
+                       (let ((args (cadr b)))
+                         (if (and (listp args)
+                                  (every (lambda (a)
+                                           (and (symbolp a)
+                                                (not (and (> (length (symbol-name a)) 0)
+                                                          (char= (char (symbol-name a) 0) #\&)))))
+                                         args))
+                             (handler-case
+                               (list (cons (car b)
+                                           (%build-reader-macrolet-expander
+                                            args (cddr b))))
+                               (error () nil))
+                             nil)))
                      bindings))
             (expanded-body
              (if expanders
                  (labels ((expand-one (f depth)
                             (cond
-                              ((> depth 50) f)  ; depth limit to prevent infinite loops
+                              ((> depth 50) f)
                               ((atom f) f)
-                              ((and (consp f) (assoc (car f) expanders))
+                              ((and (consp f) (symbolp (car f))
+                                    (assoc (car f) expanders))
                                (let* ((expander (cdr (assoc (car f) expanders)))
                                       (result (handler-case
-                                                (apply expander (cdr f))
+                                                (funcall expander f)
                                                 (error () f))))
-                                 ;; Only recurse if result changed and still a macro call
                                  (if (equal result f)
                                      (mapcar-dotted (lambda (x) (expand-one x (1+ depth))) f)
                                      (expand-one result (1+ depth)))))
                               (t (mapcar-dotted (lambda (x) (expand-one x depth)) f)))))
                    (mapcar (lambda (x) (expand-one x 0)) body))
-                 body)))
-       (let ((rewritten (mapcar #'rewrite-reader-forms expanded-body)))
-         `(progn ,@rewritten))))
+                 body))
+            (rewritten-body (mapcar #'rewrite-reader-forms expanded-body)))
+       ;; Keep the wrapper so compile-macrolet sees the local macros too.
+       `(macrolet ,bindings ,@rewritten-body)))
     ;; (do-special-strings (var string-form ret-form) body...) → (let ((var string-form)) body... ret-form)
     ((and (eq (car form) 'do-special-strings) (consp (cdr form)) (consp (cadr form)))
      (let* ((binding (cadr form))

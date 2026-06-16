@@ -1391,6 +1391,21 @@
   (deftest 8427 (if (%mda-p (car '(#2a((0 1)(0 1))))) t nil) t)
   (deftest 8428 (write-to-string (car '(#2a((0 1)(0 1))))) "#2A((0 1) (0 1))")
   (deftest 8429 (let ((x '(#2a((0 1)(0 1))))) (if (consp x) (if (%mda-p (car x)) :mda (car x)) :notcons)) :mda)
+  ;; 8400-8419 — macrolet local-binding seat regression locks.
+  ;; &WHOLE binds the WHOLE macro form (CLHS 3.4.4), not the arg list.
+  (rt-run-test-mv 8401
+    (multiple-value-list
+     (let ((x nil))
+       (macrolet ((%m (&whole w arg) `(progn (setq x (quote ,w)) ,arg)))
+         (values (%m 1) x))))
+    '(1 (%m 1)))
+  ;; &WHOLE combined with &REST.
+  (rt-run-test 8402
+    (let ((x nil))
+      (macrolet ((%m (&whole w b &rest a) (declare (ignore b))
+                      `(setq x (quote ,(list a w)))))
+        (%m a1 a2)))
+    '((a2) (%m a1 a2)))
   ;; Multi-arg + (was documented as broken, debunked)
   (deftest 9000 (+ 60 5 7) 72)
   (deftest 9001 (+ 1 2 3 4 5) 15)

@@ -366,6 +366,42 @@ Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd hea
 
 `scan_word` saves/restores RDX (stack_base) around copy_object calls.
 
+### Conservative-root validation collector (x64, landed ace1544 + 810a975)
+
+The Cheney collector is now hardened by an **object-start bitmap** (1 bit /
+16-byte granule, MAP_ANON zero-filled, config words at 0x10000E00..; built in
+`boot-linux-x64.lisp`, maintained in `translate-x64.lisp`).  Every allocation
+site sets its start-bit (cons/`:alloc-obj`/array/string/float/sap — and since
+`:alloc-obj` is the universal object allocator, that also covers closures,
+bignums, ratios, hash-tables).  `scan_word` REJECTS any root candidate whose
+tag-stripped address is not a recorded object start; `copy_object` then runs
+only on real starts.
+
+This kills the catastrophic corruption class: a conservative stack word
+aliasing a from-space address used to make `copy_object` stamp a forwarding
+pointer over MID-OBJECT data (the header-less cons path had no validation).
+Provably safe — Modus has no interior pointers and fixnums (low bit 0) can't
+alias tags 1/9, so a candidate pointing at a non-start is *guaranteed* a false
+positive.  This is NOT pin-in-place: everything still copies; the gate only
+filters ambiguous roots.  (Pinning would additionally cover a raw scratch word
+exactly aliasing a live object's BASE — a narrow, non-corrupting case; deferred
+pending a decision on whether it's worth the page-pool allocator.)
+
+**Point (c)** (810a975): after the semispace swap, `REP STOSB`-clears the
+reclaimed from-space's bitmap sub-range (byte-exact; the per-semispace bitmap
+boundary at space_size/128 isn't 8-aligned).  Without it the bitmap saturated
+and the gate decayed to a no-op over many GCs — still corrupting long runs.
+Payoff: the asdf gauntlet went from a form-49 saturation-corruption stop (a
+FALSE `UNDEFINED-FUNCTION` on `define-package UIOP/PATHNAME`) to a CLEAN
+form-98 completion (the 2 remaining fails are real NOT-IMPLEMENTED gaps like
+`with-upgradability`, not GC).  Verified **net +134 ANSI / 0 real regressions**
+— the apparent −210 was a 600s shard-timeout truncation in the alloc-heavy
+printer/format cluster; sub-sharding that range at 900s recovered reg=0.
+**Judge GC ANSI by SUB-SHARDED comm-diff, never a single coarse shard.**
+Build knobs: `*mcgc-collector-enabled*` / `*mcgc-bitmap-enabled*` (default
+`:follow-gc`, tied to `*x64-gc-enabled*`).  Known cost: the per-alloc BTS
+sequence slows alloc-heavy code (optimizable follow-up).
+
 Functions are NOP-aligned to avoid addresses ending in 0x1 (cons tag collision
 with closure-aware funcall dispatch). See `*x64-native-code-offset*`.
 

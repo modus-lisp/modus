@@ -1654,14 +1654,34 @@
                      `(setq ,(cadr place)
                             (set-getf ,(cadr place) ,(caddr place) ,value))
                      `(set-getf ,(cadr place) ,(caddr place) ,value)))
-                ;; (setf (ldb spec n) val) → (setq n (dpb val spec n)) when N
-                ;; is a variable; otherwise the dpb result for nested places.
+                ;; (setf (ldb spec n) val) → store (dpb val spec n) back
+                ;; into the integer place, but RETURN val (CLHS: setf
+                ;; yields the newly-stored value, NOT the updated place).
+                ;; Bind val to a temp so it's evaluated exactly once and
+                ;; returned after the store.
                 ((and (consp place) (name-eq (car place) "LDB"))
-                 (if (symbolp (caddr place))
-                     `(setq ,(caddr place)
-                            (dpb ,value ,(cadr place) ,(caddr place)))
-                     `(setf ,(caddr place)
-                            (dpb ,value ,(cadr place) ,(caddr place)))))
+                 (let ((vt (gensym "LDBV")))
+                   `(let ((,vt ,value))
+                      ,(if (symbolp (caddr place))
+                           `(setq ,(caddr place)
+                                  (dpb ,vt ,(cadr place) ,(caddr place)))
+                           `(setf ,(caddr place)
+                                  (dpb ,vt ,(cadr place) ,(caddr place))))
+                      ,vt)))
+                ;; (setf (mask-field spec n) val) → store (deposit-field
+                ;; val spec n) back into the integer place, RETURN val.
+                ;; deposit-field replaces the spec'd byte of n with the
+                ;; corresponding bits of val (CLHS).  Same return-newval
+                ;; contract as LDB.
+                ((and (consp place) (name-eq (car place) "MASK-FIELD"))
+                 (let ((vt (gensym "MFV")))
+                   `(let ((,vt ,value))
+                      ,(if (symbolp (caddr place))
+                           `(setq ,(caddr place)
+                                  (deposit-field ,vt ,(cadr place) ,(caddr place)))
+                           `(setf ,(caddr place)
+                                  (deposit-field ,vt ,(cadr place) ,(caddr place))))
+                      ,vt)))
                 ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
                 ((and (consp place) (name-eq (car place) "MEM-REF"))
                  `(%setf-mem-ref ,place ,value))

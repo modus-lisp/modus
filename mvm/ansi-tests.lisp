@@ -1408,6 +1408,14 @@
   (deftest 8247 (mod 1000000000000000000 999999999) 1)
   (deftest 8248 (truncate 4611686018427387903 1000003) 4611672183410)
   (deftest 8249 (mod 4611686018427387903 1000003) 837673)
+  ;; 8250-8259 — (setf (ldb ...)/(mask-field ...)) must RETURN the
+  ;; newly-stored value (CLHS), not the updated integer place.
+  (deftest 8250 (let ((x 0)) (setf (ldb (byte 4 1) x) -1)) -1)
+  (deftest 8251 (let ((x 0)) (setf (ldb (byte 4 1) x) -1) x) 30)
+  (deftest 8252 (let ((x 0)) (setf (mask-field (byte 4 1) x) -1)) -1)
+  (deftest 8253 (let ((x 0)) (setf (mask-field (byte 4 1) x) -1) x) 30)
+  (deftest 8254 (let ((x 255)) (setf (ldb (byte 4 0) x) 10)) 10)
+  (deftest 8255 (let ((x 255)) (setf (ldb (byte 4 0) x) 10) x) 250)
   ;; 8320-8329 — EQUALP semantics probes (equalpt routing + hash-tables).
   (deftest 8320 (equalpt #\a #\A) t)
   (deftest 8321 (+ 1 1) 2)

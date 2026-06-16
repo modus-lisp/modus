@@ -3277,6 +3277,50 @@
   (emit-ret buf))
 
 ;;; ============================================================
+;;; Precise-GC: per-function max used frame slot
+;;; ============================================================
+;;;
+;;; The conservative GC stack scan (emit-gc-trampoline) treats any stack
+;;; word with a heap-pointer tag as a root.  The dominant false-positive
+;;; source is the DEAD TAIL of each fixed-size 1120-byte frame: a function
+;;; reserves 128 local slots ([RBP-96-8i]) but uses only N, so the tail
+;;; [RBP-1120, RBP-96-8N) holds stale garbage from returned deeper calls.
+;;; compute-max-frame-slot determines N statically so the trampoline can
+;;; SKIP that tail (provably safe: frame F never wrote those slots).
+
+(defun compute-max-frame-slot (bytes offset length)
+  "Decode the MVM instructions of one function and return (1+ max-slot-index)
+   over all VFP frame-slot accesses (obj-ref/obj-set with Vobj = +vreg-vfp+),
+   clamped to [0,128].  Returns 0 if the function uses no frame slots.
+   This is the count of LIVE frame slots; slots [count,128) are the dead tail."
+  (let ((pos offset)
+        (limit (+ offset length))
+        (max-idx -1))
+    (loop while (< pos limit)
+          do (let* ((decoded (decode-instruction bytes pos))
+                    (opcode (car decoded))
+                    (operands (cadr decoded))
+                    (new-pos (cddr decoded)))
+               (cond
+                 ;; (obj-ref Vd Vobj idx) -- vobj=operands[1], idx=operands[2]
+                 ((= opcode +op-obj-ref+)
+                  (when (and (>= (length operands) 3)
+                             (= (second operands) +vreg-vfp+))
+                    (let ((idx (third operands)))
+                      (when (> idx max-idx) (setf max-idx idx)))))
+                 ;; (obj-set Vobj idx Vs) -- vobj=operands[0], idx=operands[1]
+                 ((= opcode +op-obj-set+)
+                  (when (and (>= (length operands) 2)
+                             (= (first operands) +vreg-vfp+))
+                    (let ((idx (second operands)))
+                      (when (> idx max-idx) (setf max-idx idx))))))
+               (setf pos new-pos)))
+    (let ((count (1+ max-idx)))            ; -1 -> 0 when no frame slots used
+      (cond ((< count 0) 0)
+            ((> count 128) 128)
+            (t count)))))
+
+;;; ============================================================
 ;;; Single Function Translation
 ;;; ============================================================
 
@@ -3593,22 +3637,92 @@
     (emit-add-reg-reg buf 'rcx 'rbx)             ; rcx = from_start + space_size
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
-    ;; ---- Scan stack roots ----
-    ;; Walk from RBP (saved RSP) to stack_base
-    ;; RDI = current scan address
-    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp  (start of stack)
-    (let ((stack-loop (make-label))
-          (stack-done (make-label)))
+    ;; ---- Scan stack roots (conservative flat scan + dead-tail SKIP) ----
+    ;; Walk from RBP (saved RSP) up to stack_base, scanning every word — EXCEPT
+    ;; the dead tail of each mutator frame.  A function reserves a fixed 1120-byte
+    ;; frame (128 local slots at [rbp-96-8i]) but uses only N; the unused tail
+    ;; [rbp-1120, rbp-96-8N) holds STALE garbage from returned deeper calls and
+    ;; can never be a live root of that frame.  Skipping it removes the dominant
+    ;; conservative-scan false-positive class WITHOUT dropping any real root: the
+    ;; push/pop temp gaps BETWEEN frames, used slots, saved regs, and return
+    ;; addresses are all still scanned exactly as before.
+    ;;
+    ;; State carried across scan_word/copy_object (which preserve RDI and R10,
+    ;; clobber RAX/RSI/RDX[restored]/R8/R9/R11/R13/RBX[from_start]/RCX[from_end]):
+    ;;   RDI = scan cursor   RDX = stack_base   R10 = FRAME (current mutator RBP)
+    ;; Scratch used only WITHIN one iteration before the scan_word call:
+    ;;   RAX, R8, R9, R11.
+    ;;
+    ;; The marker N for a frame lives at [FRAME-16] (emit-function-prologue leaves
+    ;; -16/-24/-32 unwritten; the per-function marker store writes N there).  If N
+    ;; is out of [0,128] (a non-Modus boot frame with no marker), the dead tail is
+    ;; treated as EMPTY — we never skip on a bad marker.
+    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp  (scan cursor = saved RSP)
+    (let ((stack-loop  (make-label))
+          (stack-done  (make-label))
+          (sk-advance  (make-label))
+          (sk-disable  (make-label))
+          (sk-in-frame (make-label))
+          (sk-do-scan  (make-label)))
       ;; RDX = stack_base
       (emit-bytes buf #x48 #x8B #x14 #x25)       ; mov rdx, [abs32]
       (emit-u32 buf #x10000058)
+      ;; R10 = FRAME = [rbp] = the mutator's RBP (RBP was pushed last, so it is
+      ;; the lowest pushed word = [rsp] = [rbp_tramp]).
+      (emit-mov-reg-mem buf 'r10 'rdi 0)          ; r10 = [rdi] = mutator RBP
+      ;; Validate the first FRAME: must be 0 < rbp_tramp < FRAME < stack_base.
+      ;; Otherwise disable skipping (set FRAME = stack_base => no dead tails).
+      (emit-cmp-reg-reg buf 'r10 'rdi)           ; FRAME <= rbp_tramp ?
+      (emit-jcc buf :be sk-disable)
+      (emit-cmp-reg-reg buf 'r10 'rdx)           ; FRAME >= stack_base ?
+      (emit-jcc buf :ae sk-disable)
+      (emit-jmp buf stack-loop)
+      (emit-label buf sk-disable)
+      (emit-mov-reg-reg buf 'r10 'rdx)           ; FRAME = stack_base (skipping disabled)
 
       (emit-label buf stack-loop)
       (emit-cmp-reg-reg buf 'rdi 'rdx)           ; rdi >= stack_base?
       (emit-jcc buf :ae stack-done)
-      ;; Load the stack word
-      (emit-mov-reg-mem buf 'rax 'rdi 0)          ; rax = [rdi]
-      ;; Call scan_word subroutine (rax = addr of word to scan)
+      ;; --- advance FRAME while the cursor has reached/passed the frame base ---
+      (emit-label buf sk-advance)
+      (emit-cmp-reg-reg buf 'rdi 'r10)           ; rdi < FRAME ?
+      (emit-jcc buf :b sk-in-frame)               ; below frame base: this frame owns its tail
+      ;; rdi >= FRAME: climb to the parent frame = [FRAME]
+      (emit-mov-reg-mem buf 'r8 'r10 0)          ; r8 = parent = [FRAME]
+      (emit-cmp-reg-reg buf 'r8 'r10)            ; parent <= FRAME ? (non-monotonic/broken)
+      (emit-jcc buf :be sk-do-scan)               ; broken chain: stop climbing, just scan
+      (emit-cmp-reg-reg buf 'r8 'rdx)            ; parent >= stack_base ?
+      (emit-jcc buf :ae sk-do-scan)               ; past the top frame: just scan
+      (emit-mov-reg-reg buf 'r10 'r8)            ; FRAME = parent
+      (emit-jmp buf sk-advance)
+      ;; --- rdi is below FRAME: test membership in FRAME's dead tail ---
+      (emit-label buf sk-in-frame)
+      (emit-cmp-reg-reg buf 'r10 'rdx)           ; FRAME == stack_base (disabled)?
+      (emit-jcc buf :ae sk-do-scan)
+      (emit-mov-reg-mem buf 'r8 'r10 -16)        ; r8 = N (live-slot marker)
+      (emit-cmp-reg-imm buf 'r8 0)               ; N < 0 ? (signed)
+      (emit-jcc buf :l sk-do-scan)                ; garbage marker -> empty tail
+      (emit-cmp-reg-imm buf 'r8 128)             ; N > 128 ?
+      (emit-jcc buf :g sk-do-scan)                ; garbage marker -> empty tail
+      ;; dead-tail TOP (exclusive) = FRAME - 96 - 8N  -> r11
+      (emit-shl-reg-imm buf 'r8 3)               ; r8 = 8N
+      (emit-mov-reg-reg buf 'r11 'r10)
+      (emit-sub-reg-imm buf 'r11 96)
+      (emit-sub-reg-reg buf 'r11 'r8)            ; r11 = FRAME-96-8N
+      ;; dead-tail BOTTOM (inclusive) = FRAME - 1120 -> r9
+      (emit-mov-reg-reg buf 'r9 'r10)
+      (emit-sub-reg-imm buf 'r9 1120)            ; r9 = FRAME-1120
+      ;; in dead tail iff  r9 <= rdi < r11
+      (emit-cmp-reg-reg buf 'rdi 'r9)            ; rdi < bottom ?
+      (emit-jcc buf :b sk-do-scan)                ; below tail: live (saved regs / parent gap)
+      (emit-cmp-reg-reg buf 'rdi 'r11)           ; rdi >= top ?
+      (emit-jcc buf :ae sk-do-scan)               ; at/above top: live local slot
+      ;; rdi is INSIDE the dead tail: skip the cursor to the top, do NOT scan.
+      (emit-mov-reg-reg buf 'rdi 'r11)           ; rdi = dead-tail top
+      (emit-jmp buf stack-loop)                   ; re-check loop bound
+
+      (emit-label buf sk-do-scan)
+      ;; Scan the word at [rdi].
       (emit-bytes buf #x48 #x89 #xF8)            ; mov rax, rdi  (addr of the word)
       (emit-call buf scan-word-label)
       ;; Advance to next word
@@ -4033,6 +4147,14 @@
                  (emit-label buf fn-label)
                  ;; Emit prologue
                  (emit-function-prologue buf)
+                 ;; Precise-GC marker: store the count of LIVE frame slots into
+                 ;; the free reserved word [rbp-16] (the prologue never writes
+                 ;; -16/-24/-32).  The GC trampoline reads this to skip each
+                 ;; frame's dead tail [rbp-1120, rbp-96-8N) during the stack
+                 ;; scan.  Encoded as `mov qword [rbp-16], imm32` = 48 C7 45 F0.
+                 (let ((live-slots (compute-max-frame-slot bytecode offset length)))
+                   (emit-bytes buf #x48 #xC7 #x45 #xF0)
+                   (emit-u32 buf live-slots))
                  ;; If length=0 (orphaned stub with no bytecode), emit an immediate
                  ;; epilogue+ret so we don't fall through into the next function.
                  (when (zerop length)

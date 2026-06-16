@@ -4742,6 +4742,21 @@
         (%pprint-lb-end s nil)))
     "abcd6")
   ;; ==== end Fable pprint probes ====
+  ;; ==== uaet probes 8260-8275 ====
+  (rt-run-test 8260 (subtypep 'bit 'bit) t)
+  (rt-run-test 8261 (subtypep 'character 'character) t)
+  (rt-run-test 8262 (subtypep 'base-char 'character) t)
+  (rt-run-test 8263 (subtypep 'boolean t) t)
+  (rt-run-test 8264 (upgraded-array-element-type 'bit) 'bit)
+  (rt-run-test 8265 (upgraded-array-element-type 'character) 'character)
+  (rt-run-test 8266 (upgraded-array-element-type 'base-char) 'character)
+  (rt-run-test 8267 (upgraded-array-element-type 'fixnum) t)
+  ;; simple-vector-p must reject strings, char/bit arrays and rank-0/MDA.
+  (rt-run-test 8270 (simple-vector-p (vector 'a 'b 'c)) t)
+  (rt-run-test 8271 (simple-vector-p "abcdef") nil)
+  (rt-run-test 8272 (simple-vector-p (make-array '(10) :element-type 'character)) nil)
+  (rt-run-test 8273 (simple-vector-p (make-array '(10) :element-type 'bit)) nil)
+  (rt-run-test 8275 (simple-vector-p (make-array '(10))) t)
   ;; ==== Fable reader re-census probes 9180-9219 ====
   ;; Self-contained reader behaviour, package-independent where possible.
   ;; read-from-string returns (value position).

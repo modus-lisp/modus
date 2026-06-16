@@ -2608,9 +2608,68 @@
          ((stringp a) (list (array-length a)))
          (t (error "ARRAY-DIMENSIONS: ~S is not an array" a)))))))
 
-(defun upgraded-array-element-type (type)
-  "Return the upgraded element type (simplified to T for all)."
-  t)
+(defun upgraded-array-element-type (type &optional environment)
+  "Return the upgraded element type Modus actually uses for arrays of TYPE.
+   Per CLHS 15.1.2.1: BIT upgrades to BIT, CHARACTER/BASE-CHAR upgrade to
+   CHARACTER (Modus stores all chars uniformly), NIL upgrades to NIL, and
+   everything else upgrades to T (Modus stores general elements as tagged
+   words)."
+  (declare (ignore environment))
+  (cond
+    ;; NIL element type — array that can hold no objects.
+    ((null type) nil)
+    ;; BIT — Modus stores bit-vectors specialized to BIT.
+    ((eq type 'bit) 'bit)
+    ;; (UNSIGNED-BYTE 1) is type-equivalent to BIT.
+    ((equal type '(unsigned-byte 1)) 'bit)
+    ((equal type '(integer 0 1)) 'bit)
+    ((equal type '(mod 2)) 'bit)
+    ;; Character element types upgrade to CHARACTER.
+    ((or (eq type 'character)
+         (eq type 'base-char)
+         (eq type 'standard-char)
+         (eq type 'extended-char))
+     'character)
+    ;; Everything else is stored as a general (T) element.
+    (t t)))
+
+(defun simple-vector-p (x)
+  "T iff X is a SIMPLE-VECTOR — a one-dimensional, non-displaced array of
+   element-type T with no fill pointer and not adjustable.  Strings, bit
+   arrays, character arrays, multi-dimensional arrays, rank-0 arrays and
+   fill-pointered / displaced vectors are NOT simple-vectors.
+
+   NB: Modus stores a literal bit-vector (#*0110) and a general fixnum
+   vector identically, so (simple-vector-p #*0110) cannot be distinguished
+   here and conservatively returns T — a representational limitation, not a
+   logic bug.  Bit / character arrays built via MAKE-ARRAY with an explicit
+   :element-type DO carry that type (MDA header slot 5 / string subtag) and
+   are correctly rejected."
+  (cond
+    ((null x) nil)
+    ((eq x t) nil)
+    ((fixnump x) nil)
+    ((consp x) nil)
+    ((characterp x) nil)
+    ;; Strings (incl. MAKE-ARRAY :element-type character/base-char, whose
+    ;; data is a subtag-#x31 string) are not simple-vectors.
+    ((stringp x) nil)
+    ;; Native multi-dim header: only rank-1, T-element, plain vectors qualify.
+    ((%mda-p x)
+     (and (eql (%mda-rank x) 1)
+          (null (%mda-fp x))
+          (null (%mda-displaced x))
+          (let ((et (%mda-etype x)))
+            (or (eq et t) (null et)))))
+    ;; Plain 1-D MVM array (subtag #x32), element-type T → simple vector.
+    ((arrayp x) t)
+    (t nil)))
+
+(defun simple-bit-vector-p (x)
+  "T iff X is a simple bit-vector.  Modus represents a bit-vector as a
+   1-D array whose elements are all 0/1 (no distinct subtag), so this is
+   BIT-VECTOR-P (every Modus bit-vector is simple)."
+  (bit-vector-p x))
 
 ;;; ============================================================
 ;;; Property Lists (GET / REMPROP)

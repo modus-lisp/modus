@@ -3865,6 +3865,40 @@
     (emit-u32 buf #x10000050)
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
+    ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----
+    ;; RBX = old from_start: the semispace just fully evacuated by this
+    ;; collection.  It is now dead (everything live was copied out) and about to
+    ;; sit idle as to_start until the NEXT collection copies survivors into it.
+    ;; Its object-start bits are stale.  Clear them now so that — two collections
+    ;; hence, when this region is copied into and then scanned as from-space —
+    ;; only CURRENT-generation object starts validate in scan_word.  Without this
+    ;; the bitmap monotonically saturates (every granule that EVER held a start
+    ;; stays set), and the conservative-root gate decays toward a no-op, slowly
+    ;; re-admitting the false-positive forward-stamp corruption it exists to stop.
+    ;; With it, each region's bitmap at scan time is exactly {survivors copied in
+    ;; by the preceding GC} ∪ {allocations since} — sharp forever.
+    ;;
+    ;; Byte-exact REP STOSB (not STOSQ): the two semispaces' bitmap sub-ranges
+    ;; are byte-adjacent at space_size/128, which is NOT 8-aligned, so a qword
+    ;; clear would bleed into the sibling semispace's still-live bits.
+    ;;   dest  = bitmap_base + (rbx - page_base) >> 7
+    ;;   count = space_size >> 7  bytes   (1 bit / 16-byte granule, /8 = /128)
+    ;; RAX/RCX/RDI were all pushed at trampoline entry and are restored below.
+    (when (mcgc-collector-on-p)
+      (emit-bytes buf #xFC)                          ; cld (forward STOS)
+      (emit-mov-reg-reg buf 'rax 'rbx)               ; rax = old from_start
+      (emit-bytes buf #x48 #x2B #x04 #x25)           ; sub rax, [page_base]
+      (emit-u32 buf +mcgc-cfg-page-base-addr+)
+      (emit-shr-reg-imm buf 'rax 7)                  ; rax = byte offset into bitmap
+      (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
+      (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+      (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
+      (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
+      (emit-u32 buf #x10000050)
+      (emit-shr-reg-imm buf 'rcx 7)                  ; rcx = byte count = space_size/128
+      (emit-bytes buf #x31 #xC0)                     ; xor eax, eax  (AL = fill 0)
+      (emit-bytes buf #xF3 #xAA))                    ; rep stosb
+
     ;; ---- Increment GC count ----
     (emit-bytes buf #x48 #xFF #x04 #x25)          ; inc qword [0x10000060]
     (emit-u32 buf #x10000060)

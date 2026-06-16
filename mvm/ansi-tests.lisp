@@ -1394,6 +1394,20 @@
         (setq i (+ i 1))))))
 
 (defun run-regression-tests ()
+  ;; 8240-8259 — large-fixnum mod/truncate/rem: remainder must come from
+  ;; the hardware IDIV (RDX), not from r = n - (truncate n d)*d.  (* 1e9
+  ;; 1e9) = 10^18 (a fixnum, < most-positive-fixnum).  Reference values
+  ;; computed with Python: 10^18 = 7*Q+1, 10^18 mod 999999937 = 3969.
+  (deftest 8240 (mod (* 1000000000 1000000000) 7) 1)
+  (deftest 8241 (rem (* 1000000000 1000000000) 7) 1)
+  (deftest 8242 (mod (* 1000000000 1000000000) 999999937) 3969)
+  (deftest 8243 (truncate (* 1000000000 1000000000) 999999937) 1000000063)
+  (deftest 8244 (nth-value 1 (truncate (* 1000000000 1000000000) 999999937)) 3969)
+  (deftest 8245 (mod (- (* 1000000000 1000000000)) 7) 6)   ; CL mod: sign of d
+  (deftest 8246 (rem (- (* 1000000000 1000000000)) 7) -1)  ; CL rem: sign of n
+  (deftest 8247 (mod 1000000000000000000 999999999) 1)
+  (deftest 8248 (truncate 4611686018427387903 1000003) 4611672183410)
+  (deftest 8249 (mod 4611686018427387903 1000003) 837673)
   ;; 8320-8329 — EQUALP semantics probes (equalpt routing + hash-tables).
   (deftest 8320 (equalpt #\a #\A) t)
   (deftest 8321 (+ 1 1) 2)

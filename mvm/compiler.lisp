@@ -8911,35 +8911,41 @@
 
 (defun compile-fixnum-truncate2 (args env dest)
   "Compile (%fixnum-truncate2 a b) — the original inline 2-arg
-   truncate, restricted to fixnums.  Emits :div / :mul / :sub with
-   manual push/pop discipline around the clobbering integer ops, then
-   stores the remainder into MV[0] / MV-COUNT.  compile-truncate's
-   2-arg branch routes here after a runtime fixnump check on both
-   operands so the raw IR never sees a boxed-float pointer."
+   truncate, restricted to fixnums.  Quotient q via :div and remainder
+   r via :mod — BOTH taken straight from the hardware IDIV (RAX=q,
+   RDX=r), NOT from r = a − q·b.  The old subtract-multiply form
+   computed q·b with an inline :mul that SILENTLY WRAPPED past 63 bits
+   whenever the product exceeded fixnum range (e.g. (truncate 10^18 7)
+   → q·b ≈ 10^18 overflows), producing a garbage remainder and hanging
+   the gcd/lcm test loops that reduce via raw (mod big x).  IDIV's RDX
+   already holds the exact truncate-remainder, so no wide multiply is
+   needed.  Stores the remainder into MV[0] / MV-COUNT.  compile-
+   truncate's 2-arg branch routes here after a runtime fixnump check on
+   both operands so the raw IR never sees a boxed-float pointer."
   (destructuring-bind (a b) args
     (let ((n-temp    (alloc-temp-reg))
           (d-temp    (alloc-temp-reg))
           (q-temp    (alloc-temp-reg))
-          (mul-temp  (alloc-temp-reg))
+          (r-temp    (alloc-temp-reg))
           (addr-temp (alloc-temp-reg)))
       (compile-form a env n-temp)
       (compile-form b env d-temp)
+      ;; quotient: :div clobbers RAX/RDX/RCX, so save operands around it
       (emit-ir :push n-temp)
       (emit-ir :push d-temp)
       (emit-ir :div q-temp n-temp d-temp)
       (emit-ir :pop d-temp)
       (emit-ir :pop n-temp)
-      (emit-ir :push n-temp)
+      ;; remainder: :mod also clobbers RAX/RDX/RCX; save q across it.
       (emit-ir :push q-temp)
-      (emit-ir :mul mul-temp q-temp d-temp)
+      (emit-ir :mod r-temp n-temp d-temp)
       (emit-ir :pop q-temp)
-      (emit-ir :pop n-temp)
-      (emit-ir :sub n-temp n-temp mul-temp)
+      ;; MV[0] = remainder, MV-COUNT = 2
       (emit-ir :li addr-temp +mv-values-addr+)
-      (emit-ir :store addr-temp n-temp +width-u64+)
+      (emit-ir :store addr-temp r-temp +width-u64+)
       (emit-ir :li addr-temp +mv-count-addr+)
-      (emit-ir :li mul-temp (ash 2 +fixnum-shift+))
-      (emit-ir :store addr-temp mul-temp +width-u64+)
+      (emit-ir :li r-temp (ash 2 +fixnum-shift+))
+      (emit-ir :store addr-temp r-temp +width-u64+)
       (emit-ir :mov dest q-temp)
       (free-temp-reg)
       (free-temp-reg)
@@ -8949,9 +8955,17 @@
 
 (defun compile-mod (args env dest)
   "Compile (mod a b) — CL floor-style modulus.
-   :mod IR is truncate-rem (sign of n), so (mod -5 3) would yield -2.
-   CL mod returns r with sign(r)=sign(d), so we expand inline as the
-   trunc-rem then adjust if sign mismatch."
+   The truncate-remainder r is taken from the SECOND value of
+   (truncate n d), which routes through %fixnum-truncate2 (hardware
+   IDIV → RDX) for fixnums and %truncate2-generic (bignum-safe long
+   division) for bignum/ratio/float.  CL mod returns r with
+   sign(r)=sign(d), so we adjust if the trunc-rem sign mismatches d.
+
+   The OLD expansion recomputed r = n − (truncate n d)·d, and that
+   inline :mul of (truncate n d)·d SILENTLY WRAPPED past 63 bits for
+   large fixnums (e.g. (mod 10^18 7)) → wrong remainder → the gcd/lcm
+   test loops' raw (mod big x) HUNG forever.  Reading the second value
+   of truncate avoids the wide multiply entirely."
   (destructuring-bind (a b) args
     (let ((n-sym (gensym "MN"))
           (d-sym (gensym "MD"))
@@ -8959,7 +8973,7 @@
       (compile-form
         `(let* ((,n-sym ,a)
                 (,d-sym ,b)
-                (,r-sym (- ,n-sym (* (truncate ,n-sym ,d-sym) ,d-sym))))
+                (,r-sym (nth-value 1 (truncate ,n-sym ,d-sym))))
            (if (and (not (zerop ,r-sym)) (not (eq (< ,r-sym 0) (< ,d-sym 0))))
                (+ ,r-sym ,d-sym)
                ,r-sym))

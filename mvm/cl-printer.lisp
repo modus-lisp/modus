@@ -501,17 +501,21 @@
                     (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase)))
                (%print-symbol-name-maybe-escape name stream case rc escape readably)))))))))
 
-;;; Check if symbol is external in package
+;;; Check if symbol is external in package.
+;;; The external table is the per-package SYMTAB, an ALIST of
+;;; (name-string . symbol) pairs (see cl-packages.lisp %symtab-add) — NOT
+;;; a plain list of symbols.  The previous `(dolist (s ext-list) (%cl-sym-p
+;;; s) …)` treated each alist CONS as a symbol, so %cl-sym-p was NIL for
+;;; every entry and the predicate always returned NIL — an EXPORTED symbol
+;;; of another package then printed with `::` instead of `:`
+;;; (print.symbol.prefix.9).  Use the symtab's own name-keyed lookup.
 (defun %pkg-sym-external-p (pkg sym)
-  (let ((name (%cl-sym-name sym)))
-    (if (%pkg-p pkg)
-        (let ((ext-list (%pkg-external pkg)))
-          (let ((found nil))
-            (dolist (s ext-list)
-              (when (and (%cl-sym-p s) (string-equal (%cl-sym-name s) name))
-                (setq found t)))
-            found))
-        nil)))
+  (if (%pkg-p pkg)
+      (let ((name (if (%cl-sym-p sym) (%cl-sym-name sym) (symbol-name sym))))
+        (and name
+             (%symtab-find (%pkg-external pkg) name)
+             t))
+      nil))
 
 ;;; Find symbol in package (non-closure version)
 (defvar *%find-sym-name* nil)

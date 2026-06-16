@@ -2633,6 +2633,27 @@
     ;; Everything else is stored as a general (T) element.
     (t t)))
 
+(defun empirical-subtypep (type1 type2)
+  "ANSI ansi-aux helper (ansi-aux.lsp is SKIPPED by Modus, so this is
+   stubbed here).  Returns T iff TYPE1 appears to be a subtype of TYPE2.
+
+   Per the Dietz definition: first ask the real SUBTYPEP via SUBTYPEP*.
+   If SUBTYPEP returned a *definite* answer (second value T) use it
+   directly.  Otherwise fall back to scanning *UNIVERSE*: every element
+   that is of TYPE1 must also be of TYPE2.  This always returns T when
+   TYPE1 is genuinely a subtype of TYPE2, and only returns T spuriously
+   when the *UNIVERSE* sample happens not to distinguish the two types —
+   exactly the documented behaviour of the reference helper.
+
+   Critically this must NOT over-return T for a definite non-subtype:
+   when SUBTYPEP is definite-NIL we return that NIL, never falling through
+   to the (looser) universe scan."
+  (multiple-value-bind (sub good) (subtypep* type1 type2)
+    (if good
+        sub
+        (loop for e in *universe*
+              always (or (not (typep e type1)) (typep e type2))))))
+
 (defun simple-vector-p (x)
   "T iff X is a SIMPLE-VECTOR — a one-dimensional, non-displaced array of
    element-type T with no fill pointer and not adjustable.  Strings, bit

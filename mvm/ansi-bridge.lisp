@@ -229,14 +229,16 @@
         (make-array n :adjustable t :initial-contents ic)
         (make-array n :adjustable t))))
 
+(defun %gcd-euclid (a b)
+  "Mod-based Euclid on two NON-NEGATIVE integers; O(log) recursion depth."
+  (if (= b 0) a (%gcd-euclid b (mod a b))))
+
 (defun my-gcd (x y)
-  "ansi-aux/gcd-aux: educational gcd via Euclid.  CL's GCD already
-   handles bignums, this just gives the suite a separate entry point."
-  (cond ((< x 0) (my-gcd (- x) y))
-        ((< y 0) (my-gcd x (- y)))
-        ((<= x y)
-         (if (= x 0) y (my-gcd x (- y x))))
-        (t (my-gcd y x))))
+  "ansi-aux/gcd-aux: mod-based Euclid gcd.  Result is non-negative per
+   CLHS GCD.  Terminates fast even for large random fixnum pairs (the old
+   subtractive `(my-gcd x (- y x))` recursed ~10^18 times → gcd.4/.6/.7
+   and lcm.4-.7 HUNG)."
+  (%gcd-euclid (abs x) (abs y)))
 
 (defun my-lcm (x y)
   "ansi-aux/gcd-aux: lcm via gcd."

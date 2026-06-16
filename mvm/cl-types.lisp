@@ -3118,9 +3118,15 @@
       (setq i (+ i 1)))))
 
 (defun bit-vector-p (x)
-  "T if X is a bit-vector — an array whose elements are all 0 or 1.
-   Empty arrays count as bit-vectors."
-  (and (arrayp x) (not (stringp x)) (%array-bits-only-p x)))
+  "T if X is a bit-vector — a ONE-DIMENSIONAL array whose elements are all
+   0 or 1.  Multi-dimensional bit arrays (e.g. (make-array '(2 2)
+   :element-type 'bit)) are NOT bit-vectors, so require rank 1.  NB: a 1D
+   bit array built by MAKE-ARRAY is an %mda-p object of rank 1, so test
+   ARRAY-RANK rather than (not %mda-p).  Empty arrays count as bit-vectors."
+  (and (arrayp x)
+       (not (stringp x))
+       (= (array-rank x) 1)
+       (%array-bits-only-p x)))
 
 (defun simple-bit-vector-p (x)
   "T if X is a simple bit-vector."

@@ -234,6 +234,48 @@
     (emit-label buf done-label)))
 
 ;;; ============================================================
+;;; Mostly-Copying GC — object-start bitmap maintenance
+;;; ============================================================
+;;; Config-word BSS slots (must match boot-linux-x64.lisp +mcgc-cfg-*+):
+;;;   0x10000E00 page_base   0x10000E18 bitmap_base
+(defconstant +mcgc-cfg-page-base-addr+ #x10000E00)
+(defconstant +mcgc-cfg-bitmap-addr+    #x10000E18)
+
+(defun emit-mcgc-set-start-bit (buf addr-reg)
+  "Set the MCGC object-start bitmap bit for the object whose RAW start
+   address is in ADDR-REG (a tagged-pointer's untagged base — i.e. the
+   value of R12 at the moment the header was written).  No-op unless
+   *mcgc-bitmap-enabled*.
+
+   Bitmap = 1 bit / 16-byte granule.  granule = (addr - page_base) >> 4.
+   Set bit GRANULE counting from bitmap_base using BTS [base], idx — the
+   x86 BTS with a register bit-index and memory base addresses bits
+   beyond the first qword, so no manual byte/bit split is needed.
+
+   Preserves ALL registers (saves/restores RAX, RCX, RDX); ADDR-REG is
+   read-only and must NOT be one of RAX/RCX/RDX (callers pass R12 or a
+   callee-saved reg, or copy first)."
+  (when (mcgc-bitmap-on-p)
+    (when (member addr-reg '(rax rcx rdx))
+      (error "emit-mcgc-set-start-bit: ADDR-REG must not be RAX/RCX/RDX"))
+    (emit-push buf 'rax)
+    (emit-push buf 'rcx)
+    (emit-push buf 'rdx)
+    ;; RAX = addr - page_base
+    (emit-mov-reg-reg buf 'rax addr-reg)
+    (emit-bytes buf #x48 #x2B #x04 #x25)          ; sub rax, [abs32] (page_base)
+    (emit-u32 buf +mcgc-cfg-page-base-addr+)
+    (emit-shr-reg-imm buf 'rax 4)                 ; rax = granule index
+    ;; RCX = bitmap_base
+    (emit-bytes buf #x48 #x8B #x0C #x25)          ; mov rcx, [abs32] (bitmap_base)
+    (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+    ;; BTS [rcx], rax  — set bit number RAX counting from [rcx]
+    (emit-bytes buf #x48 #x0F #xAB #x01)          ; bts [rcx], rax
+    (emit-pop buf 'rdx)
+    (emit-pop buf 'rcx)
+    (emit-pop buf 'rax)))
+
+;;; ============================================================
 ;;; Translation State
 ;;; ============================================================
 
@@ -1693,6 +1735,8 @@
                  (progn
                    (emit-load-vreg buf vb +scratch-reg+)
                    (emit-mov-mem-reg buf 'r12 +scratch-reg+ 8))))
+           ;; MCGC object-start bit (R12 still = cons base).
+           (emit-mcgc-set-start-bit buf 'r12)
            ;; Result = R12 + 1 (cons tag)
            (emit-lea buf d 'r12 1)
            ;; Advance alloc pointer
@@ -1859,6 +1903,8 @@
              (dotimes (i (+ count 1))
                (emit-mov-mem-reg buf 'r12 'rax off)  ; mov [r12+off], rax
                (incf off 8)))
+           ;; MCGC object-start bit (R12 still = object base).
+           (emit-mcgc-set-start-bit buf 'r12)
            ;; Result = R12 | object-tag
            (emit-lea buf d 'r12 #x09)
            ;; Advance alloc pointer: (count+2)*8, aligned to 16
@@ -1897,6 +1943,10 @@
            (emit-or-reg-imm buf +scratch-reg+ #x32)  ; array subtag
            ;; Write header at [R12] (R12 still points to array base).
            (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; MCGC object-start bit (R12 still = array base; the helper
+           ;; saves/restores RAX so the header value it holds is irrelevant
+           ;; — it is overwritten by the count pop on the next line).
+           (emit-mcgc-set-start-bit buf 'r12)
            ;; Restore count, compute allocation size.
            (emit-pop buf +scratch-reg+)
            ;; size = (count + 2) << 3, aligned to 16
@@ -2061,6 +2111,8 @@
            (emit-shl-reg-imm buf 'rdx 1)
            (emit-mov-mem-reg buf 'r12 'rdx 24)
 
+           ;; MCGC object-start bit (R12 still = float base).
+           (emit-mcgc-set-start-bit buf 'r12)
            ;; Result tagged pointer = R12 + 9; advance R12 by 32 bytes.
            (let ((d (dest-phys-or-scratch vd)))
              (emit-lea buf d 'r12 9)
@@ -2089,6 +2141,8 @@
            (emit-shr-reg-imm buf 'rdx 32)
            (emit-shl-reg-imm buf 'rdx 1)
            (emit-mov-mem-reg buf 'r12 'rdx 24)
+           ;; MCGC object-start bit (R12 still = float base).
+           (emit-mcgc-set-start-bit buf 'r12)
            (let ((d (dest-phys-or-scratch vd)))
              (emit-lea buf d 'r12 9)
              (emit-add-reg-imm buf 'r12 32)
@@ -2167,6 +2221,8 @@
            (emit-shl-reg-imm buf +scratch-reg+ 8)
            (emit-or-reg-imm buf +scratch-reg+ #x31)  ; STRING subtag
            (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; MCGC object-start bit (R12 still = string base).
+           (emit-mcgc-set-start-bit buf 'r12)
            (emit-pop buf +scratch-reg+)      ; restore count
            (emit-add-reg-imm buf +scratch-reg+ 2)
            (emit-shl-reg-imm buf +scratch-reg+ 3)
@@ -2575,6 +2631,8 @@
          ;; Result = R12 | 1, R12 += 16
          (let* ((vd (first operands))
                 (d (dest-phys-or-scratch vd)))
+           ;; MCGC object-start bit (R12 = cons base before advance).
+           (emit-mcgc-set-start-bit buf 'r12)
            (emit-mov-reg-reg buf d 'r12)
            (emit-or-reg-imm buf d 1)      ; tag as cons
            (emit-add-reg-imm buf 'r12 16)  ; advance alloc pointer
@@ -2629,6 +2687,8 @@
              (emit-load-vreg buf vaddr 'rax)
              (setf pa 'rax))
            (emit-mov-mem-reg buf 'r12 pa 8)
+           ;; MCGC object-start bit (R12 still = SAP base).
+           (emit-mcgc-set-start-bit buf 'r12)
            ;; Result = R12 | 0x09 (object tag)
            (emit-lea buf d 'r12 #x09)
            ;; Advance alloc pointer by 16 (header + 1 data word, already 16-aligned)
@@ -3353,6 +3413,24 @@
 (defvar *x64-gc-debug* nil
   "When non-nil, the native GC trampoline writes diagnostic bytes to fd 1
    at entry/exit (see emit-gc-dbg-char).  Build-time knob only.")
+
+(defvar *mcgc-bitmap-enabled* :follow-gc
+  "Controls whether allocation sites set the mostly-copying GC's
+   object-start bitmap bit for each freshly-allocated object (MCGC stage
+   2+).  Through stage 2 the bit is WRITE-ONLY (the old Cheney collector
+   ignores it); stage 3's collector consumes it to validate conservative
+   roots.
+
+   Value :FOLLOW-GC (the default) ties bitmap emission to
+   *x64-gc-enabled* — every x64 GC-enabled build (all of which init the
+   MCGC config words via boot-linux-x64 / boot-x64) gets the bitmap, and
+   no GC-less build (fixpoint, plain build-mvm) does, so those stay
+   byte-identical.  T / NIL force on / off.")
+
+(defun mcgc-bitmap-on-p ()
+  (if (eq *mcgc-bitmap-enabled* :follow-gc)
+      *x64-gc-enabled*
+      *mcgc-bitmap-enabled*))
 
 (defvar *x64-native-code-offset* 0
   "Byte offset from load-address where native code begins in the final image.

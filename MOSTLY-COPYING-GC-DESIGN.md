@@ -140,6 +140,19 @@ next page (possibly PINNED or another generation) → corruption.  So flip to
   one LEA+CMP+JA (not-taken) per alloc.  gc-check opcode keeps working for
   back-compat but the pinning allocator drives off the per-site pre-check.
 
+## CONSTRAINT: init in Lisp, never grow the boot preamble
+The linux-x64 boot preamble size is load-bearing: `*x64-native-code-offset*`
+is hardcoded per build script (351 in build-ansi-test) and drives the
+function-entry NOP-alignment (keeps fn starts off nibble 0x1).  Adding bytes to
+boot/boot-linux-x64.lisp WITHOUT bumping that offset mis-aligns functions →
+deterministic NIL-deref crashes (learned the hard way, stage 3a).  Therefore:
+the run-free-list / descriptor / pin-count CONTENT init is done in LISP runtime
+code (an init defun run early in kernel-main, reading the config-word ADDRESSES
+boot already stores from stages 1-2: page_base 0xE00, page_count 0xE08,
+descriptor 0xE10, bitmap 0xE18, freelist 0xE20, freelist_count 0xE28,
+alloc_page 0xE30, data_end 0xE38).  Boot stays byte-for-byte as stages 1-2 left
+it.  Use %poke/mem-ref-style primitives from Lisp.
+
 ## Free list = list of RUNS, not single pages
 A single-page free-list can't serve a >4 KiB object without a contiguous-run
 scan.  Keep a free-list of (start_page, n_pages) RUNS.  At boot: one run

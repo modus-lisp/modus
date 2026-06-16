@@ -3421,12 +3421,36 @@
           nil)
       nil))
 
+(defun %equalp-struct-struct (a b)
+  "EQUALP for two struct instances (CLHS: structures are EQUALP iff they
+   are of the same type and corresponding slots are EQUALP).  Struct
+   instances are subtag-#x32 arrays: slot 0 = '%struct-instance marker,
+   slot 1 = type-name symbol, slots 2.. = user slot values.  Compare the
+   type by NAME-HASH (robust across native-MVM-sym / CL-sym-wrapper) and
+   then the user slots element-wise."
+  (let ((ha (%struct-name-hash (%struct-type-name a)))
+        (hb (%struct-name-hash (%struct-type-name b))))
+    (if (and ha hb (= ha hb))
+        (let ((la (array-length a))
+              (lb (array-length b)))
+          (if (= la lb)
+              (let ((i 2) (ok t))
+                (loop
+                  (when (or (not ok) (= i la)) (return ok))
+                  (unless (equalp-impl (aref a i) (aref b i))
+                    (setq ok nil))
+                  (setq i (+ i 1))))
+              nil))
+        nil)))
+
 (defun equalp-impl (a b)
   (if (eql a b) t
     (if (and (characterp a) (characterp b))
         (char-equal a b)
       (if (and (%equalp-strict-ht-p a) (%equalp-strict-ht-p b))
           (%equalp-hash-table a b)
+      (if (and (%struct-instance-p a) (%struct-instance-p b))
+          (%equalp-struct-struct a b)
       (if (consp a)
           (if (consp b)
               (if (equalp-impl (car a) (car b))
@@ -3443,5 +3467,5 @@
               (if (and (or (stringp a) (arrayp a))
                        (or (stringp b) (arrayp b)))
                   (%equalp-array-array a b)
-                  nil)))))))
+                  nil))))))))
 

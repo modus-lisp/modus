@@ -89,9 +89,15 @@
 ;; wrappers (fp/displaced/adjustable/native-MDA) that equalp-impl's plain
 ;; ARRAYP test doesn't peel — rt-arrayish-p detects exactly those.
 (defun equalpt (a b)
-  (if (or (rt-arrayish-p a) (rt-arrayish-p b))
-      (if (my-equal a b) t nil)
-      (if (equalp a b) t nil)))
+  ;; Struct instances are subtag-#x32 arrays, so rt-arrayish-p reports T
+  ;; for them — but my-equal has no struct-slot semantics.  Route structs
+  ;; (and instances) to the real EQUALP (equalp-impl), which compares them
+  ;; by type + slot-wise.  (equalp.16)
+  (if (or (%struct-instance-p a) (%struct-instance-p b))
+      (if (equalp a b) t nil)
+    (if (or (rt-arrayish-p a) (rt-arrayish-p b))
+        (if (my-equal a b) t nil)
+        (if (equalp a b) t nil))))
 
 (defun notnot (x)
   "Coerce to boolean: nil → nil, anything else → t."
@@ -1450,6 +1456,29 @@
                       (h2 (make-hash-table :test 'eq)))
                   (setf (gethash 'a h1) 1)
                   (if (equalp h1 h2) t nil)) nil)
+  ;; 8180-8189 — equalp residual probes (gensym keys / instances)
+  (deftest 8180 (let ((g1 (gensym)) (g2 (gensym)))
+                  (if (equalp-impl g1 g2) t nil)) nil)
+  (deftest 8181 (let ((h1 (make-hash-table :test 'equalp))
+                      (h2 (make-hash-table :test 'equalp)))
+                  (setf (gethash (gensym "A") h1) t)
+                  (setf (gethash (gensym "A") h2) t)
+                  (if (equalp h1 h2) t nil)) nil)
+  (deftest 8182 (let ((s (symbol-name (gensym)))) (if (stringp s) t nil)) t)
+  ;; 8183-8186 — struct equalp (cl-printer %equalp-struct-struct)
+  (deftest 8183 (progn (eval '(defstruct prb83 a b c))
+                       (let ((s1 (eval '(make-prb83 :a 1 :b 2 :c #\a)))
+                             (s2 (eval '(make-prb83 :a 1.0 :b 2.0 :c #\A))))
+                         (if (equalp-impl s1 s2) t nil))) t)
+  (deftest 8184 (let ((s1 (eval '(make-prb83 :a 1 :b 2 :c #\a))))
+                  (if (%struct-instance-p s1) t nil)) t)
+  (deftest 8185 (let ((s1 (eval '(make-prb83 :a 1 :b 2 :c #\a))))
+                  (array-length s1)) 5)
+  ;; Cross-type structs must NOT be equalp (different struct types).
+  (deftest 8186 (progn (eval '(defstruct prb86 a b c))
+                       (let ((s1 (eval '(make-prb83 :a 1 :b 2 :c #\a)))
+                             (s3 (eval '(make-prb86 :a 1 :b 2 :c #\a))))
+                         (if (equalp-impl s1 s3) t nil))) nil)
   ;; 8420-8429 — compile-time #nA array literal in quoted data must
   ;; rebuild a real MDA (subtag #x34), not garbage.  Root cause of the
   ;; bit-and/bit-ior 2D cluster: compile-quote's MDA branch (compiler.lisp).

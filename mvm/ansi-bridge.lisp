@@ -241,9 +241,12 @@
   (%gcd-euclid (abs x) (abs y)))
 
 (defun my-lcm (x y)
-  "ansi-aux/gcd-aux: lcm via gcd."
-  (when (< x 0) (setq x (- x)))
-  (when (< y 0) (setq y (- y)))
+  "ansi-aux/gcd-aux: lcm via gcd.  Uses (abs ...) → generic-negate-int so
+   MOST-NEGATIVE-FIXNUM (-2^62) promotes to the bignum +2^62 instead of
+   wrapping to itself (the plain (- x) below WRAPPED, feeding a negative
+   `magnitude' into the bignum machinery → lcm.4/.6/.7 crash)."
+  (setq x (abs x))
+  (setq y (abs y))
   (if (or (= x 0) (= y 0)) 0
       (/ (* x y) (my-gcd x y))))
 
@@ -3488,7 +3491,11 @@
         ((complexp n)
          (let ((r (realpart n)) (i (imagpart n)))
            (sqrt (+ (* r r) (* i i)))))
-        ((< n 0) (- 0 n))
+        ;; generic-negate-int → %safe-fixnum-negate handles
+        ;; MOST-NEGATIVE-FIXNUM (-2^62): plain (- 0 n) WRAPS it back to
+        ;; itself (still negative), and the resulting bad "magnitude"
+        ;; crashed gcd/lcm.4/.6/.7.  Also covers negative bignum inputs.
+        ((< n 0) (generic-negate-int n))
         (t n))))
 
 ;; SQRT — strict 1-arg.  (sqrt 0 nil) → PROGRAM-ERROR.  Body copies the

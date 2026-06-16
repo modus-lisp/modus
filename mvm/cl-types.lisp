@@ -2084,9 +2084,22 @@
       (setq d (- 0 d)))
     (if (and (not (bignump d)) (= d 1)) n (make-ratio-obj n d))))
 
+;; Boundary-safe fixnum negate.  `(- 0 n)` is the compiler's inline
+;; :sub which does NOT overflow-promote, so negating MOST-NEGATIVE-FIXNUM
+;; (= -2^62) silently WRAPS to itself (still negative) instead of yielding
+;; the bignum +2^62.  Every gcd/lcm/abs path over random-fixnum operands
+;; eventually negates a near-±2^62 value; the wrap fed a still-negative
+;; "magnitude" into the Euclid loop → the %int-rem / bignum machinery
+;; SIGSEGV'd (gcd.4/.6/.7, lcm.4/.6/.7).  Special-case the one fixnum whose
+;; negation escapes the fixnum range; +2^62 = small-bignum (lo=0, hi=1).
+(defun %safe-fixnum-negate (n)
+  (if (= n -4611686018427387904)
+      (make-bignum 0 1)
+      (- 0 n)))
+
 (defun generic-negate-int (x)
   "Negate integer X (fixnum or bignum)."
-  (if (bignump x) (bignum-negate x) (- 0 x)))
+  (if (bignump x) (bignum-negate x) (%safe-fixnum-negate x)))
 
 (defun ratio-numerator (x) (aref x 0))
 (defun ratio-denominator (x) (aref x 1))
@@ -2159,9 +2172,10 @@
 
 (defun generic-negate (x)
   "Negate X (integer or ratio)."
-  (if (ratiop x)
-      (make-ratio-obj (- 0 (aref x 0)) (aref x 1))
-      (- 0 x)))
+  (cond
+    ((ratiop x) (make-ratio-obj (generic-negate-int (aref x 0)) (aref x 1)))
+    ((bignump x) (bignum-negate x))
+    (t (%safe-fixnum-negate x))))
 
 ;; Slow-path runtime helpers — compile-add/sub/mul's tag-check hits these
 ;; when at least one operand isn't a fixnum.  We cannot use plain +/-/*

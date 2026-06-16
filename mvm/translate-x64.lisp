@@ -3452,6 +3452,48 @@
       *x64-gc-enabled*
       *mcgc-collector-enabled*))
 
+(defvar *mcgc-pinning-enabled* nil
+  "MCGC stage 3-4: the page-pinning mostly-copying collector (FFI/IO +
+   Bartlett conservative-root pinning).  DEFAULT NIL — when off, the
+   allocator and collector are EXACTLY the validation Cheney collector
+   (mcgc-collector-on-p), so the binary is behavior-identical to canonical.
+   When T, alloc sites emit the size-aware page pre-check (`emit-mcgc-
+   ensure-room`) instead of the post-write gc-check model, refilling R12/R14
+   from the run-free-list, and the collector runs the page-based phases.
+   Requires *x64-gc-enabled* + the stage 1-2 bitmap/metadata.  Force T only
+   in a pinning build/test; canonical stays NIL until stage 4 passes the gate.")
+
+(defun mcgc-pinning-on-p ()
+  (and *mcgc-pinning-enabled* *x64-gc-enabled*))
+
+;;; Additional MCGC config-word slots for stage 3-4 (page pinning).  These
+;;; extend the 0x10000E00.. block initialised by boot-linux-x64.lisp.  The
+;;; run-free-list is an array of (start_page:u32, n_pages:u32) entries at
+;;; +mcgc-cfg-freelist+ (base from stage 1); freelist_count counts ENTRIES.
+(defconstant +mcgc-cfg-freelist-base-addr+  #x10000E20)  ; raw addr of run-free-list
+(defconstant +mcgc-cfg-freelist-count-addr+ #x10000E28)  ; # of run entries
+(defconstant +mcgc-cfg-alloc-page-addr+     #x10000E30)  ; current alloc page index
+(defconstant +mcgc-cfg-data-end-addr+       #x10000E38)  ; raw addr one past data region
+(defconstant +mcgc-cfg-descriptor-addr+     #x10000E10)  ; raw addr of page descriptor array
+(defconstant +mcgc-cfg-page-count-addr+     #x10000E08)  ; total page count
+
+(defun emit-mcgc-ensure-room (buf size-reg)
+  "MCGC stage-3 size-aware allocation pre-check.  SIZE-REG holds the byte
+   size of the object about to be written at [R12].  If R12+size would cross
+   R14 (the end of the current free run/page), CALL the refill trampoline
+   (pop/split a run from the run-free-list, or GC then retry) which resets
+   R12/R14 to a run with >= size bytes.  No-op unless mcgc-pinning-on-p.
+
+   Emitted BEFORE the object is written (unlike the legacy post-write
+   gc-check) because a page pool cannot absorb overshoot — the next page may
+   be pinned or another generation.  SIZE-REG must not be RAX (the refill
+   path's scratch) — callers pass a dedicated reg or a constant via the
+   imm variant below.  Preserves all registers except as the refill ABI says."
+  (declare (ignore buf size-reg))
+  ;; Wired into alloc sites in stage 3b; refill trampoline emitted with the
+  ;; GC trampoline.  Placeholder so the infrastructure compiles cleanly.
+  nil)
+
 (defvar *x64-native-code-offset* 0
   "Byte offset from load-address where native code begins in the final image.
    For linux-x64: ELF-header(120) + boot-code(192) + JMP(5) = 317 = 0x13D.

@@ -430,10 +430,25 @@
     (store-base+off +mcgc-cfg-descriptor+ +mcgc-descriptor-offset+)
     (store-base+off +mcgc-cfg-bitmap+     +mcgc-bitmap-offset+)
     (store-base+off +mcgc-cfg-freelist+   +mcgc-freelist-offset+)
-    ;; page_count, freelist_count (0 until stage-3 builds the list), alloc_page (0)
+    ;; page_count, freelist_count (1 run at boot — see below), alloc_page (0)
     (store-imm +mcgc-cfg-page-count+      +mcgc-page-count+)
-    (store-imm +mcgc-cfg-freelist-count+  0)
+    (store-imm +mcgc-cfg-freelist-count+  1)
     (store-imm +mcgc-cfg-alloc-page+      0))
+
+  ;; ---- MCGC stage 3a: seed the run-free-list with ONE run = all pages ----
+  ;; The run-free-list is an array of (start_page:u32, n_pages:u32) entries at
+  ;; mmap_base + +mcgc-freelist-offset+.  At boot every page is free, so a
+  ;; single run {start_page=0, n_pages=page_count} covers the whole data
+  ;; region.  freelist_count (set to 1 above) counts ENTRIES.  Unused until the
+  ;; stage-4 page collector consumes it (the legacy Cheney path ignores it), so
+  ;; this is additive and behavior-identical with pinning off.  RAX = mmap_base.
+  (emit-bytes buf #x48 #x89 #xC1)                 ; mov rcx, rax
+  (emit-bytes buf #x48 #x81 #xC1)                 ; add rcx, imm32 (freelist offset)
+  (emit-le32 buf +mcgc-freelist-offset+)
+  (emit-bytes buf #xC7 #x01)                      ; mov dword [rcx], imm32
+  (emit-le32 buf 0)                               ;   run[0].start_page = 0
+  (emit-bytes buf #xC7 #x41 #x04)                 ; mov dword [rcx+4], imm32
+  (emit-le32 buf +mcgc-page-count+)               ;   run[0].n_pages = page_count
 
   ;; R15 = NIL
   (emit-bytes buf #x49 #xBF)                      ; mov r15, imm64

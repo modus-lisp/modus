@@ -4757,6 +4757,16 @@
   (rt-run-test 8272 (simple-vector-p (make-array '(10) :element-type 'character)) nil)
   (rt-run-test 8273 (simple-vector-p (make-array '(10) :element-type 'bit)) nil)
   (rt-run-test 8275 (simple-vector-p (make-array '(10))) t)
+  ;; ==== empirical-subtypep aux helper contract (8200-8207) ====
+  ;; Definite subtype → T; definite non-subtype → must NOT over-return T.
+  (rt-run-test 8200 (notnot (empirical-subtypep 'bit 'integer)) t)
+  (rt-run-test 8201 (empirical-subtypep 'integer 'bit) nil)
+  (rt-run-test 8202 (notnot (empirical-subtypep 'base-char 'character)) t)
+  (rt-run-test 8203 (notnot (empirical-subtypep 'bit (upgraded-array-element-type 'bit))) t)
+  (rt-run-test 8204 (notnot (empirical-subtypep (upgraded-array-element-type 'bit) 'bit)) t)
+  (rt-run-test 8205 (notnot (empirical-subtypep 'character (upgraded-array-element-type 'character))) t)
+  (rt-run-test 8206 (empirical-subtypep 'character 'cons) nil)
+  (rt-run-test 8207 (notnot (empirical-subtypep 'fixnum t)) t)
   ;; ==== Fable reader re-census probes 9180-9219 ====
   ;; Self-contained reader behaviour, package-independent where possible.
   ;; read-from-string returns (value position).

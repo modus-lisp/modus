@@ -71,3 +71,96 @@ Phase 3 — RECLAIM: any page still marked free-candidate (not live, not pinned,
   worklist handles both; the pinned-page check on each field is the crux.
 - Large objects spanning >1 page: a pinned large object pins ALL its pages.
   alloc-array of a huge array must mark every page it covers.
+
+---
+
+# Stages 3-4 detailed design (page-pinning, the durable FFI/IO + Bartlett goal)
+
+STATUS: stages 1 (metadata) + 2 (bitmap) banked.  Stage "2.5" = the
+conservative-root VALIDATION collector (ace1544 + point-c 810a975): the
+contiguous Cheney copier hardened by the object-start bitmap gate.  That
+ELIMINATED the corruption class and is the default-on production collector.
+Stages 3-4 below add true PAGE PINNING (objects whose page is pinned never
+move) so FFI/IO can hand a stable heap address to DMA / foreign code, and so
+ambiguous conservative roots PIN (strictly safer than the current rejection).
+All of stage 3-4 lives behind `*mcgc-pinning-enabled*` (default NIL); canonical
+stays on the validation collector until pinning passes the gate.
+
+## Why a contiguous copier cannot pin (the forcing function)
+Cheney evacuates the ENTIRE from-space; it cannot leave one object behind.
+Pinning therefore requires PAGE granularity: a page can be excluded from
+evacuation.  This is Bartlett "mostly-copying": per-page SPACE ids, not a
+from/to address split.
+
+## Page model
+- Heap data region stays ONE contiguous mmap (so addresses don't shift).
+- 4 KiB logical page grid; descriptor byte per page:
+    bit0-1 space: 0=free, else generation parity (current vs prior alloc space)
+    bit2   pinned-this-GC (transient; recomputed every GC from conservative roots)
+    (persistent FFI pins live in a SEPARATE per-page u16 pin-count array, NOT
+     the descriptor, because they must survive the per-GC descriptor reset.)
+- alloc_space_parity flips each GC (1↔2).  "Live in new space" = descriptor
+  space == current alloc_space_parity OR pinned OR pin-count>0.
+
+## Allocator — SIZE-AWARE pre-check (the protocol change)
+The contiguous bump does "write object, THEN gc-check" — safe only because a
+16 MiB guard absorbs overshoot.  With pages, overshoot would scribble into the
+next page (possibly PINNED or another generation) → corruption.  So flip to
+"ensure-room(size) BEFORE write":
+- R12 = bump ptr; R14 = end of current free RUN (= first byte of the next
+  non-current-alloc-space page, or heap end).  A run is >=1 consecutive pages
+  all in the alloc space, no pin interruptions.
+- Each alloc site emits, before writing: `LEA tmp,[R12+size]; CMP tmp,R14;
+  JA refill_size`.  size is a compile-time constant for cons/obj/float (fold
+  the LEA disp) and a runtime value for array/string (ADD tmp, computed_size).
+- `refill(size)`: pop a free RUN of >= size bytes from the run-free-list (see
+  below); set R12=run_start, R14=run_end; mark the run's pages alloc-space.
+  If no run fits → GC; retry; if still none → true OOM.
+- This is the ONLY control-flow change to the fast path; the common case adds
+  one LEA+CMP+JA (not-taken) per alloc.  gc-check opcode keeps working for
+  back-compat but the pinning allocator drives off the per-site pre-check.
+
+## Free list = list of RUNS, not single pages
+A single-page free-list can't serve a >4 KiB object without a contiguous-run
+scan.  Keep a free-list of (start_page, n_pages) RUNS.  At boot: one run
+covering the whole data region.  Refill splits a run (take head, push back the
+remainder).  GC REBUILDS the run-free-list from the descriptor array in one
+linear pass (coalescing consecutive free pages) — O(page_count), once per GC,
+cheap vs the copy work.
+
+## Collector (phases) — driven only when *mcgc-pinning-enabled*
+P0  flip alloc_space_parity; do NOT touch descriptors yet.
+P1  PIN: conservative stack scan.  For each word landing in the data region,
+    mark its page's transient-pinned bit AND promote that page's descriptor to
+    the NEW alloc space (so it's retained in place).  No bitmap lookup needed
+    to pin — pinning a page on a garbage word only over-retains one page for
+    one GC (safe).  Also: every page with pin-count>0 (persistent FFI) is
+    promoted + treated as a gray root source.
+P2  COPY/SCAN worklist (Cheney-style over a scan queue of gray objects):
+    - precise roots (globals, symtab, keyword table, MV extras) forward into
+      fresh COPY pages (popped from the run-free-list, marked new-space).
+    - scan each gray object's fields: if target page is pinned/persistent →
+      keep address (no forward); else forward (copy to a copy page) + update.
+    - pinned objects are gray roots scanned IN PLACE.  Set object-start bit for
+      copied survivors in their new page.
+P3  RECLAIM: descriptor pass — any page NOT in the new alloc space and pin-
+    count==0 → free; clear its bitmap bits.  Rebuild run-free-list (coalesce).
+    No semispace flip.  R12/R14 = refill from the rebuilt free-list.
+
+## Explicit pin API (FFI/IO)
+- `%pin-object(obj)`: for each page the object covers, pin-count++ ; returns the
+  (now stable) raw address.  `%unpin-object(obj)`: pin-count-- per page.
+- `with-pinned-objects` macro = unwind-protected pin/unpin.  Pins survive GCs
+  (pin-count array isn't reset).  GC P1/P2 honor pin-count>0.
+- Large object: pin/unpin every page in [obj_start, obj_start+size).
+
+## Build/verify order (each behind the flag; gate = SUB-SHARDED ANSI parity +
+## gauntlet determinism; stage 4 also a PIN STRESS test)
+3a. Run-free-list + boot init (whole-region run).  No allocator change yet
+    (validation collector still runs).  Gate: ANSI identical (dead code).
+3b. Size-aware pre-check allocator + refill from run-free-list, BUT collector
+    still the validation Cheney over the contiguous region treated as one run
+    (no pinning yet).  This is the landmine; verify to PARITY before P-pinning.
+4.  Page-based mostly-copying collector (phases P0-P3) + explicit pin API.
+    Gate: GREEN ANSI + gauntlet robust + a pin-stress probe (allocate, pin,
+    force N GCs, assert address stable + contents intact + unpin reclaims).

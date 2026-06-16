@@ -3993,6 +3993,13 @@
       (emit-bytes buf #x4C #x89 #xEA)            ; mov rdx, r13
       (emit-or-reg-imm buf 'rdx #x0F)            ; rdx = r13 | 0xF
       (emit-mov-mem-reg buf 'rsi 'rdx 0)          ; [rsi] = forward ptr
+      ;; MCGC: set the object-start bit for the survivor at its NEW
+      ;; (to-space) location (R13 = raw dest start, not yet advanced) so
+      ;; the next collection — when to-space becomes from-space — validates
+      ;; this object as a real start.  R13 is not RAX/RDX/R8, and the helper
+      ;; saves/restores RAX/RDX/R8 (RAX=new tagged ptr, RDX=forward word).
+      (when (mcgc-collector-on-p)
+        (emit-mcgc-set-copy-bit buf 'r13))
       ;; Advance free pointer
       (emit-add-reg-imm buf 'r13 16)
       (emit-jmp buf copy-done)
@@ -4064,6 +4071,12 @@
       (emit-push buf 'rcx)
       ;; Save old R13 (start of dest) for new tagged pointer
       (emit-push buf 'r13)
+      ;; MCGC: set the object-start bit for the survivor at its NEW dest
+      ;; (R13 = raw dest start, still pristine before REP MOVSQ advances
+      ;; RDI).  R13 is not RAX/RDX/R8; the helper saves/restores RAX/RDX/R8
+      ;; (R8 = size, RDX = tagged source) and leaves RDI/RCX untouched.
+      (when (mcgc-collector-on-p)
+        (emit-mcgc-set-copy-bit buf 'r13))
       ;; Set up REP MOVSQ: RSI=source, RDI=dest, RCX=count
       (emit-bytes buf #x4C #x89 #xEF)            ; mov rdi, r13 (dest)
       (emit-mov-reg-reg buf 'rcx 'r8)

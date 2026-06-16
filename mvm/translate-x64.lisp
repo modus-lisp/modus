@@ -3432,6 +3432,26 @@
       *x64-gc-enabled*
       *mcgc-bitmap-enabled*))
 
+(defvar *mcgc-collector-enabled* :follow-gc
+  "Controls the MCGC stage-3 collector enhancements to the x64 GC
+   trampoline:
+     (a) scan_word validates a candidate pointer against the object-start
+         bitmap before treating it as a heap reference — a word whose
+         from-space target is NOT a recorded object start is rejected
+         (kills the conservative false-positive forward-garbage class);
+     (b) copy_object SETS the object-start bit for each survivor in
+         to-space;
+     (c) the trampoline CLEARS the bitmap bits covering the (now-free)
+         old from-space at the end of each collection, so stale bits do
+         not validate phantom roots on the next GC.
+   :FOLLOW-GC ties it to *x64-gc-enabled* (and hence requires the bitmap
+   writes of stage 2 and the config words of stage 1).  T / NIL force.")
+
+(defun mcgc-collector-on-p ()
+  (if (eq *mcgc-collector-enabled* :follow-gc)
+      *x64-gc-enabled*
+      *mcgc-collector-enabled*))
+
 (defvar *x64-native-code-offset* 0
   "Byte offset from load-address where native code begins in the final image.
    For linux-x64: ELF-header(120) + boot-code(192) + JMP(5) = 317 = 0x13D.
@@ -3618,6 +3638,53 @@
     (emit-bytes buf #x48 #x83 #xC4 #x08)            ; add rsp, 8
     (emit-pop buf 'r11) (emit-pop buf 'rcx) (emit-pop buf 'rdx)
     (emit-pop buf 'rsi) (emit-pop buf 'rdi) (emit-pop buf 'rax)))
+
+(defun emit-mcgc-validate-or-jump (buf addr-reg reject-label)
+  "MCGC stage-3 scan_word gate.  ADDR-REG holds a RAW (tag-stripped)
+   from-space address that passed the from-space bounds check.  If the
+   object-start bitmap bit for that address is CLEAR (i.e. the address is
+   not a recorded object start — a conservative false positive or an
+   interior pointer), jump to REJECT-LABEL.  Otherwise fall through.
+
+   ADDR-REG must be RAX (the value scan_word already holds there).  Uses
+   RDX and R8 as temps (saved/restored); preserves RAX/RBX/RCX/RSI/R13.
+
+   granule = (addr - page_base) >> 4 ; CF = BT [bitmap_base], granule."
+  (unless (eq addr-reg 'rax)
+    (error "emit-mcgc-validate-or-jump: ADDR-REG must be RAX"))
+  (emit-push buf 'rdx)
+  (emit-push buf 'r8)
+  (emit-mov-reg-reg buf 'rdx 'rax)
+  (emit-bytes buf #x48 #x2B #x14 #x25)              ; sub rdx, [abs32] (page_base)
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rdx 4)                     ; rdx = granule index
+  (emit-bytes buf #x4C #x8B #x04 #x25)              ; mov r8, [abs32] (bitmap_base)
+  (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+  (emit-bytes buf #x49 #x0F #xA3 #x10)              ; bt [r8], rdx  (CF=bit)
+  (emit-pop buf 'r8)
+  (emit-pop buf 'rdx)
+  (emit-jcc buf :nc reject-label))                  ; bit clear → reject
+
+(defun emit-mcgc-set-copy-bit (buf addr-reg)
+  "MCGC stage-3: set the object-start bitmap bit for a survivor COPIED to
+   to-space, whose RAW start address is in ADDR-REG (must not be one of
+   the temps RAX/RDX/R8 — copy_object passes R13's old value via a
+   caller-chosen reg).  Saves/restores RAX, RDX, R8."
+  (when (member addr-reg '(rax rdx r8))
+    (error "emit-mcgc-set-copy-bit: ADDR-REG must not be RAX/RDX/R8"))
+  (emit-push buf 'rax)
+  (emit-push buf 'rdx)
+  (emit-push buf 'r8)
+  (emit-mov-reg-reg buf 'rdx addr-reg)
+  (emit-bytes buf #x48 #x2B #x14 #x25)              ; sub rdx, [abs32] (page_base)
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rdx 4)                     ; granule
+  (emit-bytes buf #x4C #x8B #x04 #x25)              ; mov r8, [abs32] (bitmap_base)
+  (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+  (emit-bytes buf #x49 #x0F #xAB #x10)              ; bts [r8], rdx
+  (emit-pop buf 'r8)
+  (emit-pop buf 'rdx)
+  (emit-pop buf 'rax))
 
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
@@ -3842,6 +3909,9 @@
       (emit-jcc buf :b sw-not-ptr)
       (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= from_end?
       (emit-jcc buf :ae sw-not-ptr)
+      ;; MCGC: reject unless RAX is a recorded object start.
+      (when (mcgc-collector-on-p)
+        (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr))
       ;; In from-space. RSI = tagged cons ptr. Call copy_object.
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)

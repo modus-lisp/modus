@@ -1782,19 +1782,14 @@
        (if (symbolp (cadr place))
            `(setq ,(cadr place) (set-getf ,plist-form ,ind-form ,val-form))
            `(set-getf ,plist-form ,ind-form ,val-form))))
-    ;; (setf (ldb spec n) val) → (setq n (dpb val spec n))
-    ((and (eq (car form) 'setf)
-          (consp (cdr form))
-          (consp (cadr form))
-          (eq (car (cadr form)) 'ldb)
-          (cddr form))
-     (let* ((place (cadr form))
-            (bytespec (rewrite-reader-forms (cadr place)))
-            (int-form (rewrite-reader-forms (caddr place)))
-            (val-form (rewrite-reader-forms (caddr form))))
-       (if (symbolp (caddr place))
-           `(setq ,(caddr place) (dpb ,val-form ,bytespec ,int-form))
-           `(dpb ,val-form ,bytespec ,int-form))))
+    ;; NOTE: (setf (ldb spec n) val) is NO LONGER rewritten here.  The old
+    ;; rewriter expanded to `(setq n (dpb val spec n))`, which RETURNS the
+    ;; updated place (n) rather than VAL — violating CLHS (setf yields the
+    ;; newly-stored value).  ldb.place.1/.2 expect the VALUE.  The compiler's
+    ;; SETF macro (compiler.lisp ~1662) now handles (setf (ldb …)) correctly
+    ;; (binds val to a temp, stores via dpb, returns val) and also covers the
+    ;; non-symbol place case via a nested (setf place (dpb …)).  Let the test
+    ;; source flow through to it untouched.
     ;; (setf (values v1 v2 ...) expr) → (multiple-value-setq (v1 v2 ...) expr)
     ((and (eq (car form) 'setf)
           (consp (cdr form))

@@ -20,7 +20,20 @@
 (let ((s (open "vendor/asdf/asdf.lisp" :direction :input)))
   (loop
     (let ((form (handler-case (read s nil :%gauntlet-eof)
-                  (t (c) :%gauntlet-readerr))))
+                  (t (c)
+                     (write-string-serial "READPOS ")
+                     (print-dec (file-position s))
+                     (write-string-serial " :: ")
+                     (handler-case
+                         (if (%condition-p c)
+                             (progn (write-object (%condition-type-name c))
+                                    (write-string-serial " | ")
+                                    (handler-case (write-object (simple-condition-format-control c))
+                                      (t (c2) (write-string-serial "<no-fc>"))))
+                             (write-object c))
+                       (t (c2) (write-string-serial "<err>")))
+                     (terpri)
+                     :%gauntlet-readerr))))
       (cond
         ((eq form :%gauntlet-eof) (return))
         ((eq form :%gauntlet-readerr)
@@ -67,6 +80,13 @@
                           (t (c2) (write-string-serial "<no-fc>"))))
                       (write-object c))
                 (t (c2) (write-string-serial "<err>")))
+              ;; Name of the missing function / unbound variable, if any.
+              (handler-case
+                  (let ((nm (cell-error-name c)))
+                    (when nm
+                      (write-string-serial " NAME=")
+                      (write-object nm)))
+                (t (c2) nil))
               (terpri)))))))
   (close s))
 

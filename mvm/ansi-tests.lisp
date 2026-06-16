@@ -79,9 +79,19 @@
 ;; Override ansi-bridge's equalpt (which used rt-equal).  rt-equal's deep
 ;; if-chain trips a register-allocation issue when called from inside
 ;; lambda bodies that ALSO contain large let-with-specials forms — the
-;; very pattern emitted by def-print-test for every PRINT.* test.  Using
-;; my-equal here matches equalt and dodges the crash.
-(defun equalpt (a b) (if (my-equal a b) t nil))
+;; very pattern emitted by def-print-test for every PRINT.* test.
+;;
+;; EQUALP is case-insensitive on chars/strings, type-insensitive on numbers,
+;; and has dedicated hash-table semantics — none of which my-equal models.
+;; Route to the REAL equalp (cl-printer's equalp-impl), which now covers
+;; chars (char-equal), nested char lists, numeric =, arrays (fp-aware), and
+;; hash-tables.  my-equal stays the fallback ONLY for the cons-shaped array
+;; wrappers (fp/displaced/adjustable/native-MDA) that equalp-impl's plain
+;; ARRAYP test doesn't peel — rt-arrayish-p detects exactly those.
+(defun equalpt (a b)
+  (if (or (rt-arrayish-p a) (rt-arrayish-p b))
+      (if (my-equal a b) t nil)
+      (if (equalp a b) t nil)))
 
 (defun notnot (x)
   "Coerce to boolean: nil → nil, anything else → t."
@@ -1384,6 +1394,30 @@
         (setq i (+ i 1))))))
 
 (defun run-regression-tests ()
+  ;; 8320-8329 — EQUALP semantics probes (equalpt routing + hash-tables).
+  (deftest 8320 (equalpt #\a #\A) t)
+  (deftest 8321 (+ 1 1) 2)
+  (deftest 8327 (if (consp (list 1 2)) t nil) t)
+  (deftest 8328 (if (hash-table-p (list 1 2)) t nil) nil)
+  (deftest 8329 (if (equalp-impl 1 1) t nil) t)
+  (deftest 8330 (if (equalp-impl 1 2) t nil) nil)
+  (deftest 8331 (if (equalp-impl nil nil) t nil) t)
+  (deftest 8332 (if (equalp-impl (cons 1 2) (cons 1 2)) t nil) t)
+  (deftest 8333 (if (equalp 9 9) t nil) t)
+  (deftest 8334 (if (equalp-impl (list 1 2) (list 1 2)) t nil) t)
+  (deftest 8335 (if (equalpt (list #\a #\b) (list #\A #\B)) t nil) t)
+  (deftest 8322 (equalpt (list #\a #\b) (list #\A #\C)) nil)
+  (deftest 8323 (equalp 3 3.0) t)
+  (deftest 8324 (equalp 3 4) nil)
+  (deftest 8325 (let ((h1 (make-hash-table :test 'equalp))
+                      (h2 (make-hash-table :test 'equalp)))
+                  (setf (gethash 'a h1) #\a)
+                  (setf (gethash 'a h2) #\A)
+                  (if (equalp h1 h2) t nil)) t)
+  (deftest 8326 (let ((h1 (make-hash-table :test 'eq))
+                      (h2 (make-hash-table :test 'eq)))
+                  (setf (gethash 'a h1) 1)
+                  (if (equalp h1 h2) t nil)) nil)
   ;; 8420-8429 — compile-time #nA array literal in quoted data must
   ;; rebuild a real MDA (subtag #x34), not garbage.  Root cause of the
   ;; bit-and/bit-ior 2D cluster: compile-quote's MDA branch (compiler.lisp).

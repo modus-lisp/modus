@@ -3365,10 +3365,64 @@
             (setq i (+ i 1))))
         nil)))
 
+(defun %equalp-strict-ht-p (x)
+  "True ONLY for a MODERN tagged hash-table (cons alist (cons %ht-tag meta)).
+   Plain HASH-TABLE-P also accepts the LEGACY (cons alist nil) shape, which
+   is indistinguishable from an ordinary 1-element list like (2) — using it
+   in EQUALP-IMPL would misclassify list tails as hash-tables and crash when
+   %equalp-hash-table iterated their non-alist contents.  EQUALP only needs
+   to recognise tables built by MAKE-HASH-TABLE, which are always modern."
+  (and (consp x)
+       (let ((c (cdr x)))
+         (and (consp c) (eql (car c) (%ht-tag))))))
+
+(defun %equalp-ht-key-eq (test ka kb)
+  "Compare two hash keys under TEST (a test designator EQ/EQL/EQUAL/EQUALP)."
+  (if (eql test 'eq) (eq ka kb)
+    (if (eql test 'eql) (eql ka kb)
+      (if (eql test 'equal) (equal ka kb)
+        (if (eql test 'equalp) (equalp-impl ka kb)
+          (eql ka kb))))))
+
+(defun %equalp-ht-find-value (test key alist)
+  "Search ALIST (list of (k . v)) for KEY under TEST.  Returns the matching
+   (k . v) pair, or NIL if no key matches."
+  (let ((cur alist) (hit nil))
+    (loop
+      (when (or hit (null cur)) (return hit))
+      (let ((pair (car cur)))
+        (when (%equalp-ht-key-eq test key (car pair))
+          (setq hit pair)))
+      (setq cur (cdr cur)))))
+
+(defun %equalp-hash-table (a b)
+  "EQUALP for two hash-tables (CLHS 3.2.4.7 / equalp spec): same TEST, same
+   entry count, and every key in A has a key in B (matched under the test)
+   whose value is EQUALP to A's value."
+  (if (eql (hash-table-test a) (hash-table-test b))
+      (if (= (hash-table-count a) (hash-table-count b))
+          (let ((test (hash-table-test a))
+                (b-pairs (car b))
+                (cur (car a))
+                (ok t))
+            (loop
+              (when (or (not ok) (null cur)) (return ok))
+              (let* ((pa (car cur))
+                     (pb (%equalp-ht-find-value test (car pa) b-pairs)))
+                (if pb
+                    (unless (equalp-impl (cdr pa) (cdr pb))
+                      (setq ok nil))
+                    (setq ok nil)))
+              (setq cur (cdr cur))))
+          nil)
+      nil))
+
 (defun equalp-impl (a b)
   (if (eql a b) t
     (if (and (characterp a) (characterp b))
         (char-equal a b)
+      (if (and (%equalp-strict-ht-p a) (%equalp-strict-ht-p b))
+          (%equalp-hash-table a b)
       (if (consp a)
           (if (consp b)
               (if (equalp-impl (car a) (car b))
@@ -3385,5 +3439,5 @@
               (if (and (or (stringp a) (arrayp a))
                        (or (stringp b) (arrayp b)))
                   (%equalp-array-array a b)
-                  nil))))))
+                  nil)))))))
 

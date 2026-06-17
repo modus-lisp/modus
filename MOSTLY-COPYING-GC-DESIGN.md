@@ -215,3 +215,59 @@ P3  RECLAIM: descriptor pass — any page NOT in the new alloc space and pin-
 4.  Page-based mostly-copying collector (phases P0-P3) + explicit pin API.
     Gate: GREEN ANSI + gauntlet robust + a pin-stress probe (allocate, pin,
     force N GCs, assert address stable + contents intact + unpin reclaims).
+
+---
+
+# STAGE 4b STATUS — LANDED (page machinery, NO pinning yet)
+
+Commits 6a5dfb7 + 11098ae on mcgc-pinning.  All behind *mcgc-pinning-enabled*
+(default NIL); MODUS_MCGC_PINNING=1 enables for a test build.
+
+What landed (translate-x64.lisp, emit-page-gc-trampoline):
+- Lazy init IN COLLECTOR ASSEMBLY (per the CORRECTION): first collection
+  anchors the page grid at page_base, splits the data region into TWO equal
+  page-runs, seeds the run-free-list with the second half, marks the first
+  half live.  No boot-preamble growth, no Lisp mem-ref init.
+- Allocator: kept the legacy POST-WRITE gc-check (re-routed to the page-GC
+  trampoline under pinning).  No size-aware pre-check needed at 4b: each run
+  is ~456 MB and the 64 KiB GUARD absorbs any single-object overshoot into
+  free pages of the same run.  emit-mcgc-ensure-room is wired+ready but
+  un-called (it's for 4c when runs fragment under pins).
+- Collector = TWO-SPACE copying over the page pool: evacuate the alloc run
+  (from-space) into a fresh to-run popped from the free-list (reusing the
+  proven Cheney scan_word/copy_object + object-start-bitmap gate), then free
+  the old run, rebuild the free-list as the freed run, mark the to-run live,
+  make it the new alloc run (R12=free ptr, R14=to_end-GUARD).
+- New BSS scratch 0x10000E40..0x10000E70 (run/to/from start+end, init-done),
+  all ELF-BSS zero-init, none written by boot (preamble unchanged).
+- Helpers: emit-mov-reg-abs / -abs-reg / -abs-imm32, fill-descriptor-range
+  (REP STOSB), clear-bitmap-range.
+
+Bugs found + fixed during 4b:
+- reg-info not exported from :modus.asm → used reg-code/reg-extended-p.
+- RECLAIM RCX-CLOBBER: clear-bitmap-range clobbers RAX/RCX/RDI but the
+  free-list rebuild read from_end from RCX → garbage n_pages → next GC popped
+  an insane to-run → fault/GC-reentry.  Fixed by stashing from bounds to BSS
+  and computing the rebuild entry before any clobbering helper.
+
+Gates PASSED (x64 Linux):
+- FLAG-OFF byte-identical to canonical (same md5) — fully inert when off.
+- ANSI sub-shard parity 10001-11000: reg 0 / gain 0.
+- Gauntlet 5/5 BYTE-IDENTICAL (md5 907cef43), all reach GAUNTLET DONE
+  forms=107 fails=2 — 9 forms BEYOND flag-off's form 98, same 2 real
+  NOT-IMPLEMENTED fails.  (Form-59/103 variance seen earlier was 300s-timeout
+  truncation under external-tenant load, NOT corruption — 400s clean runs are
+  deterministic.)
+- GC-stress probe (keep a root across several forced GCs): survives intact.
+- FULL-BAND parity 10001-27708: see commit / sweep log (pending at time of
+  writing this note).
+
+STILL TODO:
+- 4c: conservative-root + persistent (pin-count array) pinning.  The 4b
+  collector's address-range from-space test must become descriptor-based, and
+  to-space allocation page-wise (skip pinned pages); emit-mcgc-ensure-room
+  then drives array/string refill once runs fragment.  %gc-collect under
+  pinning still routes to the Cheney trampoline (only gc-check reroutes) — 4c
+  must point explicit collection at the page collector too.
+- 4d: %pin/%unpin/with-pinned-objects API + pin-stress (address stable across
+  N GCs, contents intact, unpin reclaims).

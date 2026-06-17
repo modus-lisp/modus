@@ -140,7 +140,25 @@ next page (possibly PINNED or another generation) → corruption.  So flip to
   one LEA+CMP+JA (not-taken) per alloc.  gc-check opcode keeps working for
   back-compat but the pinning allocator drives off the per-site pre-check.
 
-## CONSTRAINT: init in Lisp, never grow the boot preamble
+## CORRECTION: init in COLLECTOR ASSEMBLY (lazy first-run), not Lisp, not boot
+Two failed approaches, both root-caused:
+1. Boot-asm init grows the preamble → breaks *x64-native-code-offset* alignment
+   → deterministic NIL-deref crashes.  (stage 3a, reverted)
+2. Lisp init via mem-ref FAILS: `:u64` mem-ref loads/stores are RAW (no fixnum
+   tag), but the mem-ref ADDRESS operand always SHR-1's (expects a tagged
+   fixnum).  So a `:u64`-loaded pointer cannot be fed back as a mem-ref address
+   — it gets half-untagged → SIGSEGV.  gc.lisp only ever uses CONSTANT addresses
+   as mem-ref addresses and round-trips VALUES via `:u64`; it never derefs a
+   loaded pointer in Lisp.  (stage 4a, reverted)
+CONCLUSION: do the run-free-list / descriptor seed in the COLLECTOR ASSEMBLY,
+lazily on the first page-collection (a "if freelist_count==0, seed it" preamble
+in the trampoline), where raw addresses are natural and no tagging applies.
+This couples init with the collector — stage 4 is therefore ONE assembly
+increment (init + page allocator + page collector), verified together, not
+sub-divisible into small Lisp steps.  The boot preamble stays byte-for-byte as
+stages 1-2 left it.
+
+## (obsolete) CONSTRAINT: init in Lisp, never grow the boot preamble
 The linux-x64 boot preamble size is load-bearing: `*x64-native-code-offset*`
 is hardcoded per build script (351 in build-ansi-test) and drives the
 function-entry NOP-alignment (keeps fn starts off nibble 0x1).  Adding bytes to

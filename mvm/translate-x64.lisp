@@ -4706,12 +4706,35 @@
     ;; ================= Pop a to-run from the free-list =================
     ;; Mark its pages descriptor=3 so scan_word never treats them as copy
     ;; sources (they ARE the destination).  R13 = to_start (bump ptr).
+    ;; Pick the LARGEST free run (not the last): the last entry can be tiny
+    ;; once pinned pages fragment the free region, overflowing the to-run.
+    ;; r10 = count ; rdi = base ; rsi = best_idx ; r11 = best_n ; rax = i
     (emit-mov-reg-abs buf 'r10 +mcgc-cfg-freelist-count-addr+)
-    (emit-sub-reg-imm buf 'r10 1)
     (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
-    (emit-bytes buf #x4A #x8D #x3C #xD7)         ; lea rdi, [rdi + r10*8]
+    (emit-bytes buf #x48 #x31 #xF6)              ; xor rsi, rsi (best_idx=0)
+    (emit-bytes buf #x4D #x31 #xDB)              ; xor r11, r11 (best_n=0)
+    (emit-bytes buf #x48 #x31 #xC0)              ; xor rax, rax (i=0)
+    (let ((mx-loop (make-label)) (mx-done (make-label)) (mx-next (make-label)))
+      (emit-label buf mx-loop)
+      (emit-cmp-reg-reg buf 'rax 'r10) (emit-jcc buf :ae mx-done)
+      (emit-bytes buf #x44 #x8B #x44 #xC7 #x04)  ; mov r8d, [rdi+rax*8+4]  (n_pages[i])
+      (emit-bytes buf #x45 #x39 #xD8)            ; cmp r8d, r11d
+      (emit-jcc buf :be mx-next)                 ; n <= best_n -> skip
+      (emit-bytes buf #x45 #x89 #xC3)            ; mov r11d, r8d (best_n=n)
+      (emit-mov-reg-reg buf 'rsi 'rax)           ; best_idx=i
+      (emit-label buf mx-next)
+      (emit-add-reg-imm buf 'rax 1) (emit-jmp buf mx-loop)
+      (emit-label buf mx-done))
+    (emit-bytes buf #x48 #x8D #x3C #xF7)         ; lea rdi, [rdi + rsi*8]  (&best entry)
     (emit-bytes buf #x8B #x07)                   ; mov eax, [rdi]   (start_page)
     (emit-bytes buf #x44 #x8B #x47 #x04)         ; mov r8d, [rdi+4] (n_pages)
+    (when *x64-gc-debug*  ; [DEBUG] to-run n_pages magnitude: U if <256 (tiny -> overflow risk) else u
+      (emit-push buf 'rax)
+      (emit-bytes buf #x41 #x81 #xF8 #x00 #x01 #x00 #x00)  ; cmp r8d, 256
+      (let ((sm (make-label)) (af (make-label)))
+        (emit-jcc buf :b sm) (emit-gc-dbg-char buf #x75) (emit-jmp buf af)
+        (emit-label buf sm) (emit-gc-dbg-char buf #x55) (emit-label buf af))
+      (emit-pop buf 'rax))
     (emit-shl-reg-imm buf 'rax +mcgc-page-shift+)
     (emit-bytes buf #x48 #x03 #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; add rax,[page_base]
     (emit-mov-abs-reg buf +mcgc-cfg-to-start-addr+ 'rax)
@@ -4734,7 +4757,13 @@
         (emit-jcc buf :b lo) (emit-gc-dbg-char buf #x45) (emit-jmp buf af)
         (emit-label buf lo) (emit-gc-dbg-char buf #x7A) (emit-label buf af))
       (emit-pop buf 'rdx) (emit-pop buf 'rax))
-    (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10) ; pop
+    ;; swap-remove the chosen entry (rsi=best_idx) with the last (r10-1):
+    ;; copy last entry over best slot, then freelist_count = count-1.
+    (emit-sub-reg-imm buf 'r10 1)                ; r10 = last_idx = count-1
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-freelist-base-addr+)
+    (emit-bytes buf #x4A #x8B #x14 #xD0)         ; mov rdx, [rax + r10*8]  (last entry)
+    (emit-bytes buf #x48 #x89 #x14 #xF0)         ; mov [rax + rsi*8], rdx  (overwrite best)
+    (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10) ; freelist_count = count-1
     ;; mark to-run pages descriptor=3
     (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
     (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)

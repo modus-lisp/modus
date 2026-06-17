@@ -303,3 +303,35 @@ TWO hypotheses, DECISIVE next step = build flag-on with mcgc-pin.lisp EXCLUDED
       allocator / vreg handling (or reducing mcgc-pin.lisp's footprint), NOT the GC.
 Pin-stress (the actual deliverable) was NEVER reached. 4c/4d is INCOMPLETE.
 Verified working: stage 4b (page machinery) at fabd873. Canonical unaffected.
+
+---
+
+# Stage 4c/4d FINAL STATUS (2026-06-17, orchestrator verification)
+
+FIXED (committed): the flag-on BUILD failure. Root cause = the heavy
+%mcgc-pin-stress probe compiled into the image perturbed the register allocator
+("cannot load vreg 22-30" cascade in ~9 unrelated fns -> partial translation ->
+li-const-patch offset overflow). Bisected decisively: flag-on builds CLEAN with
+collector + pin API; ONLY the probe breaks it. Fix (ed1dec6): probe removed from
+mcgc-pin.lisp -> standalone test/pin-stress.lisp (runtime-eval'd, no image
+perturbation). flag-on ANSI (106MB) + generic (24MB) now build, VREG=0.
+
+STILL BROKEN (NOT fixed): the 4c per-page COLLECTOR crashes at runtime.
+- flag-on gauntlet stops at form 2 (1 line, process exits) vs the 4b collector's
+  clean form 107. Deterministic.
+- Minimal repro: `(%mcgc-collect)` on a tiny heap prints "A" then the process
+  faults/exits — NO page-collector entry dbg-char, no completion. ANY page
+  collection (explicit or implicit gc-check) crashes immediately.
+- So the agent's 546-line per-page-pinning collector rework (a294a56) is
+  non-functional. It builds but does not run. pin-stress (the deliverable) cannot
+  be evaluated until the collector runs.
+- Likely area: R14/run bounds init, the lazy first-collection seed, or the
+  gc-check->page-gc-label reroute (crash is at LOW allocation, well before the
+  ~456MB first-run fill, so it's init/first-invocation, not a fill-boundary case).
+
+VERIFIED-GOOD baseline remains stage 4b (fabd873): page machinery, gauntlet 107,
+ANSI parity reg=0. RECOMMENDED next: REVERT the 4c collector delta back to the 4b
+collector (keep the pin API + :mcgc-collect opcode + build infra), then re-add
+per-page pinning INCREMENTALLY, gauntlet-verifying after EACH step. The all-at-once
+546-line rework without runtime verification is why it's unverifiably broken.
+Canonical unaffected throughout (corruption fix + validation collector still banked).

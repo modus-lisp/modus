@@ -3446,6 +3446,14 @@
          (emit-ir :get-nargs d)
          (unless dest (free-temp-reg))))
 
+      ;; --- MCGC explicit page collection (force a page GC under pinning) ---
+      ;; (%mcgc-collect) -> emit :mcgc-collect IR.  translate-x64 turns it into
+      ;; an unconditional CALL to the page-GC trampoline when pinning is on,
+      ;; else a no-op.  Lets the pin-stress probe force a full collection.
+      ((= op-name 921463927867368627)
+       (emit-ir :mcgc-collect)
+       (when dest (emit-ir :li dest +nil-value+)))
+
       ;; --- Memory Operations (2-arg) ---
       ((= op-name 900047298083458158)  (when (arity-ok-p form 2 2 env dest) (compile-mem-ref (cadr form) (caddr form) env dest)))
       ((= op-name 61397303667544258)   (when (arity-ok-p form 2 2 env dest) (compile-setf (cadr form) (caddr form) env dest)))
@@ -11938,6 +11946,8 @@
            (mvm-sti buf))
           (:gc-check
            (mvm-gc-check buf))
+          (:mcgc-collect
+           (mvm-mcgc-collect buf))
           (:yield
            (mvm-yield buf))
           (:set-mv-count

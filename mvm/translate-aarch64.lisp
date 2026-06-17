@@ -3145,6 +3145,11 @@
                 (a64-bcond buf cc 2)
                 (a64-brk buf 1)))))
 
+          ;; ---- MCGC-COLLECT (no operands) ----
+          ;; Page pinning is x64-only; on aarch64 this is a no-op (no page pool).
+          ((= op +op-mcgc-collect+)
+           (a64-nop buf))
+
           ;; ---- WRITE-BARRIER Vobj ----
           ;; Mark the card table entry dirty (simplified: just a DMB for now)
           ((= op +op-write-barrier+)

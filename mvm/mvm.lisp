@@ -46,7 +46,7 @@
    #:+op-aref+ #:+op-aset+ #:+op-array-len+
    #:+op-load+ #:+op-store+ #:+op-fence+
    #:+op-call+ #:+op-call-ind+ #:+op-ret+ #:+op-tailcall+
-   #:+op-alloc-cons+ #:+op-gc-check+ #:+op-write-barrier+
+   #:+op-alloc-cons+ #:+op-gc-check+ #:+op-write-barrier+ #:+op-mcgc-collect+
    #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-atomic-xchg+
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
@@ -94,7 +94,7 @@
    #:+op-alloc-array+ #:mvm-alloc-array
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
-   #:mvm-alloc-cons #:mvm-gc-check #:mvm-write-barrier
+   #:mvm-alloc-cons #:mvm-gc-check #:mvm-write-barrier #:mvm-mcgc-collect
    #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-atomic-xchg
    #:mvm-io-read #:mvm-io-write #:mvm-halt
    #:mvm-cli #:mvm-sti #:mvm-percpu-ref #:mvm-percpu-set
@@ -316,6 +316,7 @@
 (defconstant +op-alloc-cons+    #x88)  ; (alloc-cons Vd) - 1 reg
 (defconstant +op-gc-check+      #x89)  ; (gc-check) - no operands
 (defconstant +op-write-barrier+ #x8A)  ; (write-barrier Vobj) - 1 reg
+(defconstant +op-mcgc-collect+  #x8B)  ; (mcgc-collect) - no operands; force a page GC
 
 ;; Actor/concurrency
 (defconstant +op-save-ctx+    #x90)  ; (save-ctx) - no operands
@@ -482,6 +483,7 @@
 (defopcode :alloc-cons    #x88 (:reg)         "Bump-allocate cons cell")
 (defopcode :gc-check      #x89 ()             "Check allocation limit, GC if needed")
 (defopcode :write-barrier #x8A (:reg)         "Mark card table dirty")
+(defopcode :mcgc-collect  #x8B ()             "Force a page GC (MCGC pinning); nop if pinning off")
 
 ;; Actor/concurrency
 (defopcode :save-ctx    #x90 (:reg)           "Save actor context (addr in reg, result in reg)")
@@ -935,6 +937,9 @@
 
 (defun mvm-gc-check (buf)
   (encode-instruction buf +op-gc-check+))
+
+(defun mvm-mcgc-collect (buf)
+  (encode-instruction buf +op-mcgc-collect+))
 
 (defun mvm-write-barrier (buf vobj)
   (encode-instruction buf +op-write-barrier+ vobj))

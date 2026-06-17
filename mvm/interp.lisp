@@ -602,6 +602,7 @@
              (setf pc npc)))
 
           (#.+op-gc-check+ nil) ; no-op in interpreter
+          (#.+op-mcgc-collect+ nil) ; no-op in interpreter (no page pool)
 
           (#.+op-write-barrier+
            (multiple-value-bind (_vobj npc) (fetch-reg bc pc)

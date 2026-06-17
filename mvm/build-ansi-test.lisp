@@ -37,6 +37,17 @@
 
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
+;; MCGC stage-4d pin API + pin-stress probe.  Included ONLY when
+;; MODUS_MCGC_PINNING=1 — flag-off builds omit it entirely so the flag-off
+;; binary stays byte-identical to canonical.
+(defvar *mcgc-pin-source*
+  (let ((v (sb-ext:posix-getenv "MODUS_MCGC_PINNING")))
+    (if (and v (plusp (length v)) (not (string= v "0")))
+        ;; include a leading+trailing newline so the surrounding concatenate
+        ;; needs NO extra separator (keeps flag-off byte-identical: "" below).
+        (concatenate 'string (string #\Newline)
+                     (mvm-text "mvm/mcgc-pin.lisp") (string #\Newline))
+        "")))
 (defvar *rt-source*      (mvm-text "mvm/rt.lisp"))
 (defvar *bridge-source*
   (concatenate 'string
@@ -153,6 +164,7 @@
   (let ((all-names (append
                      (%scan-defun-names-host *prelude-source*)
                      (%scan-defun-names-host *gc-source*)
+                     (%scan-defun-names-host *mcgc-pin-source*)
                      (%scan-defun-names-host *rt-source*)
                      (%scan-defun-names-host *bridge-source*))))
     (multiple-value-bind (src count chunks)
@@ -342,7 +354,7 @@
 
 (defvar *sym-name-auto-source*
   (let ((tbl (make-hash-table :test 'equal)))
-    (dolist (src (list *prelude-source* *gc-source* *rt-source*
+    (dolist (src (list *prelude-source* *gc-source* *mcgc-pin-source* *rt-source*
                        *bridge-source* *test-source*))
       (let ((found (%scan-symbol-names-host src)))
         (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
@@ -4764,6 +4776,9 @@
     ;; 1b. GC (Cheney copying collector)
     *gc-source*
     (string #\Newline)
+    ;; 1c. MCGC pin API + pin-stress probe ("" unless pinning build; carries
+    ;; its own newlines so flag-off adds ZERO bytes here)
+    *mcgc-pin-source*
     ;; 2. RT harness (deftest, do-tests)
     *rt-source*
     (string #\Newline)

@@ -43,6 +43,14 @@
 
 (defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
+;; MCGC stage-4d pin API + pin-stress probe.  Included ONLY when
+;; MODUS_MCGC_PINNING=1; flag-off omits it (byte-identical to canonical).
+(defvar *mcgc-pin-source*
+  (let ((v (sb-ext:posix-getenv "MODUS_MCGC_PINNING")))
+    (if (and v (plusp (length v)) (not (string= v "0")))
+        (concatenate 'string (string #\Newline)
+                     (mvm-text "mvm/mcgc-pin.lisp") (string #\Newline))
+        "")))
 (defvar *rt-source*       (mvm-text "mvm/rt.lisp"))
 (defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
 (defvar *bridge-source*
@@ -247,6 +255,7 @@
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *gc-source*       (string #\Newline)
+                       *mcgc-pin-source*
                        *rt-source*       (string #\Newline)
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
@@ -454,6 +463,7 @@
     (string #\Newline)
     *gc-source*
     (string #\Newline)
+    *mcgc-pin-source*
     *rt-source*
     (string #\Newline)
     *rt-macros-source*

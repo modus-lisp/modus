@@ -525,6 +525,14 @@
         (and v (plusp (length v)) (not (string= v "0"))))
   (setf modus.mvm.x64::*mcgc-pinning-enabled* t)
   (format t "~&;; MCGC PAGE-PINNING ENABLED (test build)~%"))
+;; Test knob: MODUS_MCGC_TORUN_CAP=<pages> caps each to-run segment so the
+;; copy_object refill / to-run-chain path is exercised on ordinary workloads.
+#+sbcl
+(let ((cap (sb-ext:posix-getenv "MODUS_MCGC_TORUN_CAP")))
+  (when (and cap (> (length cap) 0))
+    (setf modus.mvm.x64::*mcgc-torun-cap-pages* (parse-integer cap))
+    (format t "~&;; MCGC TO-RUN SEGMENT CAP = ~D pages (refill stress)~%"
+            modus.mvm.x64::*mcgc-torun-cap-pages*)))
 ;; Debug knob: MODUS_GC_R14=<hex-or-dec bytes> forces R14 to a small offset
 ;; so GC fires early (fast repro of GC-from-runtime-EVAL faults).  Leaves
 ;; the from/to semispaces 448MB apart (unchanged), only moves the trigger.

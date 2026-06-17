@@ -3482,6 +3482,14 @@
 (defun mcgc-pinning-on-p ()
   (and *mcgc-pinning-enabled* *x64-gc-enabled*))
 
+(defvar *mcgc-torun-cap-pages* 0
+  "TEST KNOB (0 = off).  When > 0, every to-run SEGMENT the collector pops is
+   capped at this many pages, with the run's remainder put back on the free-list.
+   Tiny segments force frequent copy_object refills, so an ordinary workload
+   exercises the to-run-chain / refill path deterministically (no need to
+   engineer real pin fragmentation).  Set via MODUS_MCGC_TORUN_CAP=<pages> in a
+   pinning build.  Does nothing unless mcgc-pinning is on.")
+
 ;;; Additional MCGC config-word slots for stage 3-4 (page pinning).  These
 ;;; extend the 0x10000E00.. block initialised by boot-linux-x64.lisp.  The
 ;;; run-free-list is an array of (start_page:u32, n_pages:u32) entries at
@@ -3510,6 +3518,19 @@
 (defconstant +mcgc-cfg-pincount-addr+  #x10000E78)  ; raw addr: per-page u32 PERSISTENT pin-count array
 (defconstant +mcgc-cfg-scan-cursor-addr+ #x10000E80) ; raw addr: pinned-page scan cursor (transient)
 (defconstant +mcgc-cfg-pin-init-addr+  #x10000E88)  ; 0 until pincount base computed (lazy)
+
+;;; Stage-4e to-run REFILL: the collector evacuates survivors into a chain of
+;;; to-run SEGMENTS, not one contiguous run.  When copy_object's bump ptr (R13)
+;;; hits the current segment's end, it pops ANOTHER free run as the next segment
+;;; (the "refill") so survivors that exceed the largest single free run (heavy
+;;; pin fragmentation) no longer overflow + corrupt.  seg[i] is a 16-byte pair
+;;; {start:u64, fill:u64}; the pair array lives just past the pin-count array in
+;;; the MAP_ANON metadata slack (base computed at lazy-init).
+(defconstant +mcgc-cfg-seg-arr-addr+   #x10000E90)  ; raw base of seg[] {start,fill} pair array
+(defconstant +mcgc-cfg-seg-count-addr+ #x10000E98)  ; # active to-run segments this GC
+(defconstant +mcgc-cfg-oom-addr+       #x10000EA0)  ; set to 1 if a refill found no free run (true OOM)
+(defconstant +mcgc-cfg-uncap-addr+     #x10000EA8)  ; one-shot: next establish ignores the to-run cap
+(defconstant +mcgc-max-segments+ 4096)              ; seg[] capacity (64 KiB of metadata slack)
 
 (defconstant +mcgc-page-shift+ 12)                  ; 4 KiB pages
 (defconstant +mcgc-page-bytes+ #x1000)              ; 4 KiB
@@ -4561,7 +4582,9 @@
   (let ((copy-label (make-label))
         (scan-word-label (make-label))
         (restore-label (make-label))
-        (init-done-label (make-label)))
+        (init-done-label (make-label))
+        (establish-label (make-label))   ; pop/establish a to-run segment
+        (refill-label (make-label)))     ; finalize current seg + establish next
     (emit-label buf page-gc-label)
     (emit-gc-dbg-char buf #x7B)          ; '{' — page-GC entry
 
@@ -4622,6 +4645,14 @@
     (emit-mov-abs-imm32 buf +mcgc-cfg-init-done-addr+ 1)
     (emit-label buf init-done-label)
     (emit-mcgc-pincount-init buf)   ; idempotent; covers %pin before first GC
+    ;; seg[] pair-array base = pincount_base + page_count*4 (just past the
+    ;; per-page pin-count array in the MAP_ANON metadata slack).  Idempotent —
+    ;; both operands are constant config words.  Stored once; persists in BSS.
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-pincount-addr+)
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-page-count-addr+)
+    (emit-shl-reg-imm buf 'rcx 2)                ; page_count * 4 (u32 pin-counts)
+    (emit-add-reg-reg buf 'rax 'rcx)
+    (emit-mov-abs-reg buf +mcgc-cfg-seg-arr-addr+ 'rax)
     (emit-gc-dbg-char buf #x4C)          ; 'L' — lazy-init done [DEBUG]
 
     ;; ================= Whole-region from-bounds =================
@@ -4703,71 +4734,15 @@
     (emit-gc-dbg-char buf #x50)          ; 'P' — pin phase done
     (emit-mcgc-count-pinned-dbg buf #x61)   ; 'a' count pinned after P1b [DEBUG]
 
-    ;; ================= Pop a to-run from the free-list =================
-    ;; Mark its pages descriptor=3 so scan_word never treats them as copy
-    ;; sources (they ARE the destination).  R13 = to_start (bump ptr).
-    ;; Pick the LARGEST free run (not the last): the last entry can be tiny
-    ;; once pinned pages fragment the free region, overflowing the to-run.
-    ;; r10 = count ; rdi = base ; rsi = best_idx ; r11 = best_n ; rax = i
-    (emit-mov-reg-abs buf 'r10 +mcgc-cfg-freelist-count-addr+)
-    (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
-    (emit-bytes buf #x48 #x31 #xF6)              ; xor rsi, rsi (best_idx=0)
-    (emit-bytes buf #x4D #x31 #xDB)              ; xor r11, r11 (best_n=0)
-    (emit-bytes buf #x48 #x31 #xC0)              ; xor rax, rax (i=0)
-    (let ((mx-loop (make-label)) (mx-done (make-label)) (mx-next (make-label)))
-      (emit-label buf mx-loop)
-      (emit-cmp-reg-reg buf 'rax 'r10) (emit-jcc buf :ae mx-done)
-      (emit-bytes buf #x44 #x8B #x44 #xC7 #x04)  ; mov r8d, [rdi+rax*8+4]  (n_pages[i])
-      (emit-bytes buf #x45 #x39 #xD8)            ; cmp r8d, r11d
-      (emit-jcc buf :be mx-next)                 ; n <= best_n -> skip
-      (emit-bytes buf #x45 #x89 #xC3)            ; mov r11d, r8d (best_n=n)
-      (emit-mov-reg-reg buf 'rsi 'rax)           ; best_idx=i
-      (emit-label buf mx-next)
-      (emit-add-reg-imm buf 'rax 1) (emit-jmp buf mx-loop)
-      (emit-label buf mx-done))
-    (emit-bytes buf #x48 #x8D #x3C #xF7)         ; lea rdi, [rdi + rsi*8]  (&best entry)
-    (emit-bytes buf #x8B #x07)                   ; mov eax, [rdi]   (start_page)
-    (emit-bytes buf #x44 #x8B #x47 #x04)         ; mov r8d, [rdi+4] (n_pages)
-    (when *x64-gc-debug*  ; [DEBUG] to-run n_pages magnitude: U if <256 (tiny -> overflow risk) else u
-      (emit-push buf 'rax)
-      (emit-bytes buf #x41 #x81 #xF8 #x00 #x01 #x00 #x00)  ; cmp r8d, 256
-      (let ((sm (make-label)) (af (make-label)))
-        (emit-jcc buf :b sm) (emit-gc-dbg-char buf #x75) (emit-jmp buf af)
-        (emit-label buf sm) (emit-gc-dbg-char buf #x55) (emit-label buf af))
-      (emit-pop buf 'rax))
-    (emit-shl-reg-imm buf 'rax +mcgc-page-shift+)
-    (emit-bytes buf #x48 #x03 #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; add rax,[page_base]
-    (emit-mov-abs-reg buf +mcgc-cfg-to-start-addr+ 'rax)
-    (emit-mov-reg-reg buf 'r13 'rax)             ; R13 = free ptr = to_start
-    (emit-shl-reg-imm buf 'r8 +mcgc-page-shift+)
-    (emit-add-reg-reg buf 'r8 'rax)
-    (emit-mov-abs-reg buf +mcgc-cfg-to-end-addr+ 'r8)
-    (when *x64-gc-debug*  ; [DEBUG] to-run start/end region: S/E = high (overlaps survivors), s/z = low
-      (emit-push buf 'rax) (emit-push buf 'rdx)
-      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
-      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-page-base-addr+)
-      (emit-bytes buf #x48 #x81 #xC2 #x00 #x00 #x00 #x1C)  ; add rdx, 0x1C000000
-      (emit-cmp-reg-reg buf 'rax 'rdx)
-      (let ((lo (make-label)) (af (make-label)))
-        (emit-jcc buf :b lo) (emit-gc-dbg-char buf #x53) (emit-jmp buf af)
-        (emit-label buf lo) (emit-gc-dbg-char buf #x73) (emit-label buf af))
-      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-end-addr+)
-      (emit-cmp-reg-reg buf 'rax 'rdx)
-      (let ((lo (make-label)) (af (make-label)))
-        (emit-jcc buf :b lo) (emit-gc-dbg-char buf #x45) (emit-jmp buf af)
-        (emit-label buf lo) (emit-gc-dbg-char buf #x7A) (emit-label buf af))
-      (emit-pop buf 'rdx) (emit-pop buf 'rax))
-    ;; swap-remove the chosen entry (rsi=best_idx) with the last (r10-1):
-    ;; copy last entry over best slot, then freelist_count = count-1.
-    (emit-sub-reg-imm buf 'r10 1)                ; r10 = last_idx = count-1
-    (emit-mov-reg-abs buf 'rax +mcgc-cfg-freelist-base-addr+)
-    (emit-bytes buf #x4A #x8B #x14 #xD0)         ; mov rdx, [rax + r10*8]  (last entry)
-    (emit-bytes buf #x48 #x89 #x14 #xF0)         ; mov [rax + rsi*8], rdx  (overwrite best)
-    (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10) ; freelist_count = count-1
-    ;; mark to-run pages descriptor=3
-    (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
-    (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
-    (emit-mcgc-fill-descriptor-range buf 'rax 'rdx 3 'r8)
+    ;; ================= Establish the FIRST to-run segment =================
+    ;; Reset the per-GC segment chain, then pop a to-run via establish-segment
+    ;; (find-largest-free-run + mark descriptor=3 + append seg[0] + set
+    ;; to_start/to_end/R13).  Survivors that later exceed this segment trigger
+    ;; copy_object's refill (pop another free run as seg[1], seg[2], ...), so a
+    ;; fragmented free region can no longer overflow the destination.
+    (emit-mov-abs-imm32 buf +mcgc-cfg-seg-count-addr+ 0)   ; segments this GC
+    (emit-mov-abs-imm32 buf +mcgc-cfg-oom-addr+ 0)         ; OOM flag clear
+    (emit-call buf establish-label)                        ; sets to_start/to_end/R13, seg[0]
     (emit-mcgc-count-pinned-dbg buf #x62)   ; 'b' count pinned after to-run pop [DEBUG]
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — about to scan roots
@@ -4838,18 +4813,74 @@
     (emit-gc-dbg-char buf #x47)          ; 'G' — gray (pinned) scan done
     (emit-mcgc-count-state-dbg buf 3 #x54)   ; 'T' state-3 before reclaim [DEBUG]
 
-    ;; ================= P2c: Cheney-drain the to-run =================
-    (emit-mov-reg-abs buf 'r10 +mcgc-cfg-to-start-addr+)
-    (let ((cheney-loop (make-label)) (cheney-done (make-label)))
-      (emit-label buf cheney-loop)
+    ;; ================= P2c: segmented Cheney-drain the to-run chain =========
+    ;; R10 = scan_ptr, R11 = scan_seg (both preserved by scan_word).  Scan each
+    ;; segment [seg[i].start, limit) where limit = seg[i].fill for a non-last
+    ;; segment (finalized at the overflow that moved off it) or the live bump
+    ;; ptr R13 for the last.  copy_object always appends to the LAST segment and
+    ;; the chain grows (seg_count++) on refill, so the scan follows new segments
+    ;; as they appear.  Done when scan_seg is the last segment and scan_ptr has
+    ;; caught up to R13 with no further growth.
+    (emit-bytes buf #x4D #x31 #xDB)             ; xor r11, r11   (scan_seg = 0)
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-seg-arr-addr+)
+    (emit-mov-reg-mem buf 'r10 'rax 0)          ; scan_ptr = seg[0].start
+    (when *x64-gc-debug*                         ; [DEBUG] 'Z' if scan starts empty
       (emit-cmp-reg-reg buf 'r10 'r13)
-      (emit-jcc buf :ae cheney-done)
-      (emit-bytes buf #x4C #x89 #xD0)            ; mov rax, r10
+      (let ((zok (make-label)))
+        (emit-jcc buf :b zok) (emit-gc-dbg-char buf #x5A) (emit-label buf zok)))
+    (let ((sc-loop (make-label)) (sc-done (make-label))
+          (sc-last (make-label)) (sc-scan (make-label)))
+      (emit-label buf sc-loop)
+      ;; last_idx = seg_count - 1
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-seg-count-addr+)
+      (emit-sub-reg-imm buf 'rax 1)
+      (emit-cmp-reg-reg buf 'r11 'rax)
+      (emit-jcc buf :e sc-last)
+      ;; NON-last segment: limit = seg[scan_seg].fill
+      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-seg-arr-addr+)
+      (emit-mov-reg-reg buf 'rsi 'r11)
+      (emit-shl-reg-imm buf 'rsi 4)             ; scan_seg * 16
+      (emit-add-reg-reg buf 'rdx 'rsi)          ; rdx = &seg[scan_seg]
+      (emit-mov-reg-mem buf 'rsi 'rdx 8)        ; rsi = seg[scan_seg].fill
+      (emit-cmp-reg-reg buf 'r10 'rsi)
+      (emit-jcc buf :b sc-scan)                 ; scan_ptr < fill -> scan a word
+      ;; finished this segment -> advance scan to the next segment's start
+      (emit-add-reg-imm buf 'r11 1)
+      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-seg-arr-addr+)
+      (emit-mov-reg-reg buf 'rsi 'r11)
+      (emit-shl-reg-imm buf 'rsi 4)
+      (emit-add-reg-reg buf 'rdx 'rsi)
+      (emit-mov-reg-mem buf 'r10 'rdx 0)        ; scan_ptr = seg[scan_seg].start
+      (emit-jmp buf sc-loop)
+      ;; LAST segment: limit = live bump ptr R13
+      (emit-label buf sc-last)
+      (emit-cmp-reg-reg buf 'r10 'r13)
+      (emit-jcc buf :ae sc-done)                ; caught up -> drain complete
+      (emit-label buf sc-scan)
+      (emit-bytes buf #x4C #x89 #xD0)           ; mov rax, r10
       (emit-call buf scan-word-label)
       (emit-add-reg-imm buf 'r10 8)
-      (emit-jmp buf cheney-loop)
-      (emit-label buf cheney-done))
+      (emit-jmp buf sc-loop)
+      (emit-label buf sc-done))
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney done
+
+    ;; ============== Ensure the post-GC alloc run has guard headroom ==========
+    ;; After the (possibly multi-segment) drain, R13 is the live bump ptr in the
+    ;; LAST to-run segment, which becomes the new alloc run.  If a refill chain
+    ;; left that segment nearly full (room <= 2*guard), allocation would cross
+    ;; R14 = to_end-guard immediately and re-trigger GC forever.  Pop ONE more
+    ;; (empty) segment via refill so the alloc run starts fresh with full room.
+    ;; (No-op in the common single-segment case: a freshly popped to-run is far
+    ;; larger than 2*guard, so have-room is taken.)  refill OOM (no free run)
+    ;; leaves R13/to_end as-is — genuine heap exhaustion, nothing more to do.
+    (let ((have-room (make-label)))
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-end-addr+)
+      (emit-sub-reg-reg buf 'rax 'r13)            ; room = to_end - R13
+      (emit-cmp-reg-imm buf 'rax (* 2 +mcgc-guard-bytes+))
+      (emit-jcc buf :a have-room)                 ; room > 2*guard -> fine
+      (emit-mov-abs-imm32 buf +mcgc-cfg-uncap-addr+ 1) ; alloc run wants a LARGE (uncapped) run
+      (emit-call buf refill-label)                ; finalize last seg + pop fresh one
+      (emit-label buf have-room))
 
     ;; ================= P3: RECLAIM + rebuild free-list =================
     ;; Descriptor pass over [0, page_count): translate states for next GC.
@@ -4953,6 +4984,10 @@
     (emit-bytes buf #x4D #x89 #xEC)             ; mov r12, r13
     (emit-mov-reg-reg buf 'r14 'rdx)            ; r14 = to_end
     (emit-sub-reg-imm buf 'r14 +mcgc-guard-bytes+)
+    (when *x64-gc-debug*                         ; [DEBUG] '<' if no room post-GC (r12 >= r14)
+      (emit-cmp-reg-reg buf 'r12 'r14)
+      (let ((rok (make-label)))
+        (emit-jcc buf :b rok) (emit-gc-dbg-char buf #x3C) (emit-label buf rok)))
 
     (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf #x10000060) ; gc_count++
     (emit-jmp buf restore-label)
@@ -5028,7 +5063,8 @@
     (emit-gc-dbg-char buf #x43)          ; 'C' copy_object entry [DEBUG]
     (let ((copy-cons (make-label)) (copy-obj (make-label))
           (copy-fwd (make-label)) (copy-bogus (make-label))
-          (copy-done (make-label)))
+          (copy-done (make-label))
+          (cons-room (make-label)) (obj-room (make-label)))
       (emit-mov-reg-reg buf 'rdx 'rax)
       (emit-and-reg-imm buf 'rax #x0F)
       (emit-cmp-reg-imm buf 'rax 1)
@@ -5043,6 +5079,20 @@
       (emit-and-reg-imm buf 'r8 #x0F)
       (emit-cmp-reg-imm buf 'r8 #x0F)
       (emit-jcc buf :e copy-fwd)
+      ;; DEST overflow?  r13+16 > to_end -> refill (pop next to-run segment).
+      ;; rsi(source)/rdx(orig tagged source) survive refill; OOM -> bogus.
+      (emit-mov-reg-reg buf 'rax 'r13)
+      (emit-add-reg-imm buf 'rax 16)
+      (emit-mov-reg-abs buf 'r8 +mcgc-cfg-to-end-addr+)
+      (emit-cmp-reg-reg buf 'rax 'r8)
+      (emit-jcc buf :be cons-room)
+      (emit-call buf refill-label)
+      (emit-mov-reg-reg buf 'rax 'r13)
+      (emit-add-reg-imm buf 'rax 16)
+      (emit-mov-reg-abs buf 'r8 +mcgc-cfg-to-end-addr+)
+      (emit-cmp-reg-reg buf 'rax 'r8)
+      (emit-jcc buf :a copy-bogus)               ; still over after refill = OOM
+      (emit-label buf cons-room)
       (emit-mov-reg-mem buf 'rax 'rsi 0)
       (emit-bytes buf #x49 #x89 #x45 #x00)        ; mov [r13], rax
       (emit-mov-reg-mem buf 'rax 'rsi 8)
@@ -5077,7 +5127,7 @@
       (emit-shl-reg-imm buf 'r8 3)
       (emit-add-reg-imm buf 'r8 15)
       (emit-and-reg-imm buf 'r8 -16)
-      ;; sanity: raw + size <= to_end else bogus (dest bound, not data_end)
+      ;; sanity: SOURCE raw + size <= data_end else bogus (corrupt source guard)
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-add-reg-reg buf 'rax 'r8)
       (emit-push buf 'rdx)
@@ -5085,6 +5135,20 @@
       (emit-cmp-reg-reg buf 'rax 'rdx)
       (emit-pop buf 'rdx)
       (emit-jcc buf :a copy-bogus)
+      ;; DEST overflow?  r13+size > to_end  <=>  r13 > to_end-size  -> refill.
+      ;; ONLY RAX is free here: rsi(source)/r8(size)/rdx(orig tagged source) are
+      ;; live, and RCX must stay = from_end (scan_word's range bound, which
+      ;; copy_object is contracted to preserve — do NOT clobber it).
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-end-addr+)
+      (emit-sub-reg-reg buf 'rax 'r8)            ; rax = to_end - size
+      (emit-cmp-reg-reg buf 'r13 'rax)
+      (emit-jcc buf :be obj-room)                ; r13 <= to_end-size -> room
+      (emit-call buf refill-label)
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-end-addr+)
+      (emit-sub-reg-reg buf 'rax 'r8)
+      (emit-cmp-reg-reg buf 'r13 'rax)
+      (emit-jcc buf :a copy-bogus)               ; still over after refill = OOM
+      (emit-label buf obj-room)
       (emit-push buf 'rdi)
       (emit-push buf 'rcx)
       (emit-push buf 'r13)
@@ -5110,6 +5174,128 @@
       (emit-mov-reg-reg buf 'rax 'rdx)
       (emit-label buf copy-done)
       (emit-ret buf))
+
+    ;; ===========================================================
+    ;; SUBROUTINE: refill — the current (last) to-run segment is full.  Finalize
+    ;; its fill point (= R13) and establish the NEXT segment (pop another free
+    ;; run).  Called from copy_object; preserves all regs except R13 (which
+    ;; establish-segment resets to the new segment's bump start).  On true OOM
+    ;; (no free run) establish sets the OOM flag and leaves R13/to_end unchanged,
+    ;; so copy_object's post-refill recheck routes the object to copy-bogus.
+    ;; ===========================================================
+    (emit-label buf refill-label)
+    (emit-gc-dbg-char buf #x21)          ; '!' — refill entry [DEBUG]
+    (emit-push buf 'rax) (emit-push buf 'rcx) (emit-push buf 'rdx)
+    ;; seg[seg_count-1].fill = R13
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-seg-arr-addr+)
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-seg-count-addr+)
+    (emit-sub-reg-imm buf 'rcx 1)
+    (emit-shl-reg-imm buf 'rcx 4)               ; (seg_count-1)*16
+    (emit-add-reg-reg buf 'rax 'rcx)            ; rax = &seg[seg_count-1]
+    (emit-bytes buf #x4C #x89 #x68 #x08)        ; mov [rax+8], r13   (.fill = R13)
+    (emit-pop buf 'rdx) (emit-pop buf 'rcx) (emit-pop buf 'rax)
+    (emit-call buf establish-label)
+    (emit-ret buf)
+
+    ;; ===========================================================
+    ;; SUBROUTINE: establish-segment — pop the LARGEST free run, mark its pages
+    ;; descriptor=3, append it as the next to-run segment (seg[seg_count].start),
+    ;; and set to_start/to_end/R13 to it.  Preserves all regs except R13.  When
+    ;; *mcgc-torun-cap-pages* > 0 (test knob) each segment is capped to that many
+    ;; pages with the remainder put back on the free-list, so the refill path is
+    ;; exercised on ordinary workloads.  No free run (or seg[] full) -> OOM flag.
+    ;; ===========================================================
+    (emit-label buf establish-label)
+    (emit-push buf 'rax) (emit-push buf 'rcx) (emit-push buf 'rdx)
+    (emit-push buf 'rsi) (emit-push buf 'rdi) (emit-push buf 'r8)
+    (emit-push buf 'r9)  (emit-push buf 'r10) (emit-push buf 'r11)
+    (let ((es-oom (make-label)) (es-done (make-label))
+          (es-mxloop (make-label)) (es-mxnext (make-label)) (es-mxdone (make-label))
+          (es-takeall (make-label)) (es-havetake (make-label))
+          (cap *mcgc-torun-cap-pages*))
+      ;; seg[] full?  seg_count >= MAX_SEG -> OOM
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-seg-count-addr+)
+      (emit-cmp-reg-imm buf 'rax +mcgc-max-segments+)
+      (emit-jcc buf :ae es-oom)
+      ;; find largest free run: r10=count, rdi=base, rsi=best_idx, r11=best_n, rcx=i
+      (emit-mov-reg-abs buf 'r10 +mcgc-cfg-freelist-count-addr+)
+      (emit-bytes buf #x4D #x85 #xD2)            ; test r10, r10
+      (emit-jcc buf :e es-oom)
+      (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
+      (emit-bytes buf #x48 #x31 #xF6)            ; xor rsi, rsi   (best_idx)
+      (emit-bytes buf #x4D #x31 #xDB)            ; xor r11, r11   (best_n)
+      (emit-bytes buf #x48 #x31 #xC9)            ; xor rcx, rcx   (i)
+      (emit-label buf es-mxloop)
+      (emit-cmp-reg-reg buf 'rcx 'r10) (emit-jcc buf :ae es-mxdone)
+      (emit-bytes buf #x44 #x8B #x44 #xCF #x04)  ; mov r8d, [rdi+rcx*8+4]  (n_pages[i])
+      (emit-bytes buf #x45 #x39 #xD8)            ; cmp r8d, r11d
+      (emit-jcc buf :be es-mxnext)
+      (emit-bytes buf #x45 #x89 #xC3)            ; mov r11d, r8d   (best_n)
+      (emit-mov-reg-reg buf 'rsi 'rcx)           ; best_idx = i
+      (emit-label buf es-mxnext)
+      (emit-add-reg-imm buf 'rcx 1) (emit-jmp buf es-mxloop)
+      (emit-label buf es-mxdone)
+      ;; rdx = &entry = base + best_idx*8 ; eax = start_page ; r11 = best_n ; r9 = take
+      (emit-bytes buf #x48 #x8D #x14 #xF7)       ; lea rdx, [rdi + rsi*8]
+      (emit-bytes buf #x8B #x02)                 ; mov eax, [rdx]   (start_page)
+      (when (> cap 0)
+        ;; one-shot uncap (ensure-room alloc segment wants a LARGE run): if the
+        ;; uncap flag is set, clear it and full-take regardless of cap.
+        (emit-mov-reg-abs buf 'r9 +mcgc-cfg-uncap-addr+)
+        (emit-bytes buf #x4D #x85 #xC9)                      ; test r9, r9
+        (let ((do-cap (make-label)))
+          (emit-jcc buf :e do-cap)
+          (emit-mov-abs-imm32 buf +mcgc-cfg-uncap-addr+ 0)   ; clear one-shot
+          (emit-jmp buf es-takeall)
+          (emit-label buf do-cap))
+        ;; best_n <= cap -> full take ; else take=cap and shrink entry in place
+        (emit-bytes buf #x41 #x81 #xFB) (emit-u32 buf cap)   ; cmp r11d, cap
+        (emit-jcc buf :be es-takeall)
+        (emit-mov-reg-imm buf 'r9 cap)                       ; take = cap
+        (emit-bytes buf #x81 #x02) (emit-u32 buf cap)        ; add dword [rdx], cap   (start_page += cap)
+        (emit-bytes buf #x81 #x6A #x04) (emit-u32 buf cap)   ; sub dword [rdx+4], cap (n_pages -= cap)
+        (emit-jmp buf es-havetake))
+      ;; full-take: take = best_n ; swap-remove entry with the last
+      (emit-label buf es-takeall)
+      (emit-bytes buf #x45 #x89 #xD9)            ; mov r9d, r11d   (take = best_n)
+      (emit-sub-reg-imm buf 'r10 1)              ; r10 = last_idx
+      (emit-bytes buf #x4E #x8B #x04 #xD7)       ; mov r8, [rdi + r10*8]  (last entry)
+      (emit-bytes buf #x4C #x89 #x02)            ; mov [rdx], r8          (overwrite best)
+      (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10)
+      (emit-label buf es-havetake)
+      ;; start_addr = page_base + start_page<<12   (eax = start_page)
+      (emit-shl-reg-imm buf 'rax +mcgc-page-shift+)
+      (emit-bytes buf #x48 #x03 #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; add rax,[page_base]
+      (emit-mov-abs-reg buf +mcgc-cfg-to-start-addr+ 'rax)
+      ;; end_addr = start_addr + take<<12   (r9 = take)
+      (emit-mov-reg-reg buf 'rdx 'r9)
+      (emit-shl-reg-imm buf 'rdx +mcgc-page-shift+)
+      (emit-add-reg-reg buf 'rdx 'rax)           ; rdx = end_addr
+      (emit-mov-abs-reg buf +mcgc-cfg-to-end-addr+ 'rdx)
+      ;; mark descriptor [start,end)=3  (fill clobbers rax/rcx/rdi; args rsi=start, rdx=end)
+      (emit-mov-reg-reg buf 'rsi 'rax)           ; rsi = start
+      (emit-mcgc-fill-descriptor-range buf 'rsi 'rdx 3 'r8)
+      ;; append segment: idx = seg_count ; seg[idx].start = to_start ; seg_count = idx+1
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-seg-arr-addr+)
+      (emit-mov-reg-abs buf 'rcx +mcgc-cfg-seg-count-addr+)
+      (emit-mov-reg-reg buf 'rdx 'rcx)
+      (emit-shl-reg-imm buf 'rdx 4)              ; idx*16
+      (emit-add-reg-reg buf 'rax 'rdx)           ; rax = &seg[idx]
+      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-start-addr+)
+      (emit-mov-mem-reg buf 'rax 'rdx 0)         ; seg[idx].start = to_start
+      (emit-add-reg-imm buf 'rcx 1)
+      (emit-mov-abs-reg buf +mcgc-cfg-seg-count-addr+ 'rcx)
+      ;; R13 = to_start  (bump ptr for the new segment)
+      (emit-mov-reg-abs buf 'r13 +mcgc-cfg-to-start-addr+)
+      (emit-jmp buf es-done)
+      (emit-label buf es-oom)
+      (emit-mov-abs-imm32 buf +mcgc-cfg-oom-addr+ 1)
+      (emit-gc-dbg-char buf #x58)          ; 'X' — refill OOM (no free run / seg[] full)
+      (emit-label buf es-done))
+    (emit-pop buf 'r11) (emit-pop buf 'r10) (emit-pop buf 'r9)
+    (emit-pop buf 'r8)  (emit-pop buf 'rdi) (emit-pop buf 'rsi)
+    (emit-pop buf 'rdx) (emit-pop buf 'rcx) (emit-pop buf 'rax)
+    (emit-ret buf)
 
     ;; ---- Restore ----
     (emit-label buf restore-label)

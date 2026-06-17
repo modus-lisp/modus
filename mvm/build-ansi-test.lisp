@@ -4982,6 +4982,13 @@
         (and v (plusp (length v)) (not (string= v "0"))))
   (setf modus.mvm.x64::*mcgc-pinning-enabled* t)
   (format t "~&;; MCGC PAGE-PINNING ENABLED (test build)~%"))
+;; Test knob: MODUS_MCGC_TORUN_CAP=<pages> caps each to-run segment to exercise
+;; the copy_object refill / to-run-chain path on ordinary workloads.
+(let ((cap (sb-ext:posix-getenv "MODUS_MCGC_TORUN_CAP")))
+  (when (and cap (> (length cap) 0))
+    (setf modus.mvm.x64::*mcgc-torun-cap-pages* (parse-integer cap))
+    (format t "~&;; MCGC TO-RUN SEGMENT CAP = ~D pages (refill stress)~%"
+            modus.mvm.x64::*mcgc-torun-cap-pages*)))
 
 ;; Compiler-parameter env-var bridge.
 ;;

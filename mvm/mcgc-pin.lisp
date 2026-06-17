@@ -1,12 +1,16 @@
-;;;; mcgc-pin.lisp — MCGC stage-4d persistent PIN API + pin-stress probe.
+;;;; mcgc-pin.lisp — MCGC stage-4d persistent PIN API.
 ;;;;
 ;;;; Included ONLY in pinning builds (MODUS_MCGC_PINNING=1).  Flag-off builds
 ;;;; do NOT compile this file, so the flag-off binary stays byte-identical to
 ;;;; canonical.  Provides:
 ;;;;   %pin-object / %unpin-object  — persistent per-page pin-count API.
 ;;;;   %pin-object-addr             — pin + return stable raw byte address (FFI).
-;;;;   %mcgc-pin-stress             — the deliverable probe (allocate, pin,
-;;;;                                  force GCs, assert address stable + intact).
+;;;;
+;;;; NOTE: the pin-stress probe lives in a STANDALONE script (test/pin-stress.lisp,
+;;;; run via the generic binary), NOT here.  Compiling a heavy probe function into
+;;;; the image perturbed the register allocator and broke unrelated functions'
+;;;; translation ("cannot load vreg N" cascade) — a latent translator fragility.
+;;;; The runtime-eval'd script avoids it entirely.
 ;;;;
 ;;;; Addressing rule (CLHS-style mem-ref trap): every address fed to mem-ref is
 ;;;; either a CONSTANT config slot or a clean fixnum-range computed integer.  We
@@ -90,72 +94,3 @@
         (mem-ref (+ (%mcgc-pincount-base) (* (ash (- raw page-base) -12) 4)) :u32)
         0)))
 
-;;; ------------------------------------------------------------
-;;; PIN-STRESS probe (the stage-4 deliverable).
-;;; ------------------------------------------------------------
-;;; Build a 4-slot vector, fill it with a known pattern, PIN it, capture its
-;;; raw address, then churn the heap + force several explicit page collections
-;;; while the object stays live ONLY through the pin (we drop the lexical ref by
-;;; overwriting locals) — wait: to truly test pinning we keep one lexical ref so
-;;; the test can re-check contents, but ALSO verify the address didn't change.
-;;; A pinned object's address must be IDENTICAL before and after N GCs, and its
-;;; contents intact.  Then %unpin and confirm a subsequent GC can move/reclaim.
-
-(defun %mcgc-churn (n)
-  "Allocate ~N conses to push the alloc pointer and provoke heap traffic."
-  (let ((acc nil) (i 0))
-    (loop
-      (when (>= i n) (return))
-      (setq acc (cons i acc))
-      (setq i (+ i 1)))
-    ;; return the length so the work isn't dead-code-eliminated
-    (length acc)))
-
-;; A GLOBAL holding the pinned test object.  A global is a PRECISE root, so
-;; the page collector would normally FORWARD (move) the object — unless its
-;; page is pinned via the persistent pin-count.  This isolates the persistent
-;; pin path from conservative stack pinning.
-(defvar *mcgc-pin-test-obj* nil)
-
-(defun %mcgc-force-gc-clean ()
-  "Churn the heap and force a page collection in a stack frame that does NOT
-   reference *mcgc-pin-test-obj* — so the only thing keeping it pinned is the
-   persistent pin-count (not a conservative stack pointer)."
-  (%mcgc-churn 30000)
-  (%mcgc-collect)
-  (%mcgc-churn 30000)
-  (%mcgc-collect))
-
-(defun %mcgc-pin-stress ()
-  "Stage-4 pin-stress deliverable.  Returns a list of result keywords.
-   PASS when it contains :ADDR-STABLE :CONTENTS-OK :PINCOUNT-1 :UNPINNED-0.
-   The object is held ONLY through a global (precise root, normally moved) and
-   pinned via the persistent pin-count; a forced GC from a clean frame must
-   leave its address + contents untouched."
-  (let ((v (make-array 4)) (results nil))
-    (setf (aref v 0) 111) (setf (aref v 1) 222)
-    (setf (aref v 2) 333) (setf (aref v 3) 444)
-    (setq *mcgc-pin-test-obj* v)
-    (let ((addr0 (%pin-object-addr v)))
-      ;; drop the local view: from here only the global + pin-count keep it.
-      (setq v nil)
-      (%mcgc-force-gc-clean)
-      (%mcgc-force-gc-clean)
-      (let* ((obj *mcgc-pin-test-obj*)
-             (addr1 (%mcgc-obj-raw-addr obj)))
-        (if (= addr0 addr1)
-            (setq results (cons :addr-stable results))
-            (setq results (cons :addr-MOVED results)))
-        (if (and (= (aref obj 0) 111) (= (aref obj 1) 222)
-                 (= (aref obj 2) 333) (= (aref obj 3) 444))
-            (setq results (cons :contents-ok results))
-            (setq results (cons :contents-CORRUPT results)))
-        (if (= (%mcgc-page-pincount obj) 1)
-            (setq results (cons :pincount-1 results))
-            (setq results (cons :pincount-WRONG results)))
-        ;; unpin -> count 0 -> page reclaimable
-        (%unpin-object obj)
-        (if (= (%mcgc-page-pincount obj) 0)
-            (setq results (cons :unpinned-0 results))
-            (setq results (cons :unpin-FAILED results)))
-        results))))

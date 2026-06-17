@@ -2640,8 +2640,13 @@
 
         ((op= +op-gc-check+)
          ;; Check R12 (alloc ptr) against R14 (alloc limit)
-         ;; If R12 >= R14, call GC (or NOP if no GC configured)
-         (let ((gc-lbl (translate-state-gc-label state)))
+         ;; If R12 >= R14, call GC (or NOP if no GC configured).
+         ;; Under pinning the call routes to the page-GC trampoline (which
+         ;; refills R12/R14 from the rebuilt free-list); otherwise the legacy
+         ;; Cheney trampoline.  Same post-write semantics: the <= GUARD
+         ;; overshoot for small objects lands in free pages of the same run.
+         (let* ((page-lbl (and (mcgc-pinning-on-p) (mcgc-page-gc-label)))
+                (gc-lbl (or page-lbl (translate-state-gc-label state))))
            (when gc-lbl
              (let ((skip-label (make-label)))
                (emit-cmp-reg-reg buf 'r12 'r14)
@@ -3477,22 +3482,65 @@
 (defconstant +mcgc-cfg-descriptor-addr+     #x10000E10)  ; raw addr of page descriptor array
 (defconstant +mcgc-cfg-page-count-addr+     #x10000E08)  ; total page count
 
-(defun emit-mcgc-ensure-room (buf size-reg)
-  "MCGC stage-3 size-aware allocation pre-check.  SIZE-REG holds the byte
-   size of the object about to be written at [R12].  If R12+size would cross
-   R14 (the end of the current free run/page), CALL the refill trampoline
-   (pop/split a run from the run-free-list, or GC then retry) which resets
-   R12/R14 to a run with >= size bytes.  No-op unless mcgc-pinning-on-p.
+;;; Stage-4 page-collector scratch words (ELF BSS, zero-init; NOT written by
+;;; boot, so they read 0 until the collector's lazy-init seeds them).  Verified
+;;; free above the 0x10000E00 config block (0x10000E40..0x10000EFF unused).
+(defconstant +mcgc-cfg-run-start-addr+ #x10000E40)  ; raw addr: start of current alloc run
+(defconstant +mcgc-cfg-run-end-addr+   #x10000E48)  ; raw addr: one past current alloc run
+(defconstant +mcgc-cfg-to-start-addr+  #x10000E50)  ; raw addr: to-run start (this GC)
+(defconstant +mcgc-cfg-to-end-addr+    #x10000E58)  ; raw addr: to-run end   (this GC)
+(defconstant +mcgc-cfg-init-done-addr+ #x10000E60)  ; 0 until collector lazy-init ran
 
-   Emitted BEFORE the object is written (unlike the legacy post-write
-   gc-check) because a page pool cannot absorb overshoot — the next page may
-   be pinned or another generation.  SIZE-REG must not be RAX (the refill
-   path's scratch) — callers pass a dedicated reg or a constant via the
-   imm variant below.  Preserves all registers except as the refill ABI says."
-  (declare (ignore buf size-reg))
-  ;; Wired into alloc sites in stage 3b; refill trampoline emitted with the
-  ;; GC trampoline.  Placeholder so the infrastructure compiles cleanly.
-  nil)
+(defconstant +mcgc-page-shift+ 12)                  ; 4 KiB pages
+(defconstant +mcgc-guard-bytes+ #x10000)            ; 64 KiB overshoot guard (16 pages)
+
+(defun emit-mcgc-ensure-room (buf size-reg)
+  "MCGC stage-4 size-aware allocation pre-check for objects that can EXCEED
+   the GUARD (array/string with a runtime element count).  SIZE-REG holds the
+   byte size of the object about to be written at [R12].  If R12+size would
+   cross R14 (the guarded end of the current alloc run), CALL the page-GC
+   trampoline (which copies survivors + refills R12/R14 from the rebuilt
+   free-list to a fresh run) and retry once.  No-op unless mcgc-pinning-on-p.
+
+   Emitted BEFORE the object is written: a page pool cannot absorb overshoot
+   beyond the GUARD.  SIZE-REG must be a callee-saved reg the caller already
+   holds (alloc-array/string keep the size in +scratch-reg+=RAX before the
+   advance; we read it, but must not clobber it across the GC call, so we
+   stash it).  Preserves ALL registers.
+
+   GUARD note: small constant-size objects (cons/obj/float/sap, all <= GUARD)
+   do NOT call this — they keep the legacy post-write gc-check, which under
+   pinning routes to the same page-GC trampoline.  Their <= GUARD overshoot
+   lands in the last 16 free pages of the SAME run, never the next region."
+  (when (mcgc-pinning-on-p)
+    (let ((ok (make-label))
+          (retry (make-label)))
+      ;; We need: if (R12 + size) > R14 -> GC ; then re-check (one retry).
+      ;; size lives in SIZE-REG (RAX for array/string).  Preserve it across GC.
+      (emit-label buf retry)
+      (emit-push buf 'rax)                       ; save size (if SIZE-REG=RAX, saved here)
+      (when (not (eq size-reg 'rax))
+        (emit-mov-reg-reg buf 'rax size-reg))    ; rax = size
+      (emit-add-reg-reg buf 'rax 'r12)           ; rax = R12 + size  (prospective end)
+      (emit-cmp-reg-reg buf 'rax 'r14)           ; end vs guarded run end
+      (emit-jcc buf :be ok)                       ; end <= R14 -> room, fall through
+      ;; Not enough room: pop the saved size, run the page GC, retry.
+      (emit-pop buf 'rax)                         ; restore size into RAX
+      (when (not (eq size-reg 'rax))
+        (emit-mov-reg-reg buf size-reg 'rax))    ; restore SIZE-REG
+      (let ((gc (mcgc-page-gc-label)))
+        (when gc (emit-call buf gc)))
+      (emit-jmp buf retry)
+      (emit-label buf ok)
+      (emit-pop buf 'rax)                         ; restore size
+      (when (not (eq size-reg 'rax))
+        (emit-mov-reg-reg buf size-reg 'rax)))))
+
+;;; The page-GC trampoline label is created per-translation-unit (like the
+;;; Cheney gc-trampoline-label) and stashed here so alloc sites / gc-check
+;;; can reach it without threading it through translate-state.
+(defvar *mcgc-page-gc-label* nil)
+(defun mcgc-page-gc-label () *mcgc-page-gc-label*)
 
 (defvar *x64-native-code-offset* 0
   "Byte offset from load-address where native code begins in the final image.
@@ -4216,6 +4264,425 @@
     (emit-gc-dbg-char buf #x5D)          ; ']' — trampoline exit (after restore)
     (emit-ret buf)))
 
+;;; ============================================================
+;;; MCGC stage-4 page-collector helper emitters
+;;; ============================================================
+
+(defun emit-mov-reg-abs (buf reg slot)
+  "REG = qword [SLOT] (absolute 32-bit address)."
+  ;; REX.W (+ REX.R if reg is r8-r15) ; opcode 8B ; modrm reg=reg, rm=100 (SIB) ; SIB 25 ; disp32
+  (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+  (emit-byte buf #x8B)
+  (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+  (emit-byte buf #x25)
+  (emit-u32 buf slot))
+
+(defun emit-mov-abs-reg (buf slot reg)
+  "qword [SLOT] = REG (absolute 32-bit address)."
+  (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+  (emit-byte buf #x89)
+  (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+  (emit-byte buf #x25)
+  (emit-u32 buf slot))
+
+(defun emit-mov-abs-imm32 (buf slot imm)
+  "qword [SLOT] = sign-extended imm32."
+  (emit-bytes buf #x48 #xC7 #x04 #x25)
+  (emit-u32 buf slot)
+  (emit-u32 buf imm))
+
+(defun emit-mcgc-fill-descriptor-range (buf start-addr-reg end-addr-reg val zero-reg)
+  "Set descriptor[page] = VAL (a byte 0/1/2) for every page whose data byte is
+   in [START-ADDR-REG, END-ADDR-REG).  Clobbers RAX, RCX, RDI.  START/END
+   read-only via copy.  Descriptor address of page p = descriptor_base + p,
+   where p = (addr - page_base) >> 12.  We iterate addr by page_size, computing
+   the descriptor byte address = descriptor_base + ((addr-page_base)>>12)."
+  (declare (ignore zero-reg))
+  (let ((loop-lbl (make-label))
+        (done-lbl (make-label)))
+    ;; RAX = start addr (copy), RCX = end addr (copy)
+    (emit-mov-reg-reg buf 'rax start-addr-reg)
+    (emit-mov-reg-reg buf 'rcx end-addr-reg)
+    (emit-label buf loop-lbl)
+    (emit-cmp-reg-reg buf 'rax 'rcx)
+    (emit-jcc buf :ae done-lbl)
+    ;; rdi = (rax - page_base) >> 12  + descriptor_base
+    (emit-mov-reg-reg buf 'rdi 'rax)
+    (emit-bytes buf #x48 #x2B #x3C #x25)          ; sub rdi, [page_base]
+    (emit-u32 buf +mcgc-cfg-page-base-addr+)
+    (emit-shr-reg-imm buf 'rdi +mcgc-page-shift+) ; rdi = page index
+    (emit-bytes buf #x48 #x03 #x3C #x25)          ; add rdi, [descriptor_base]
+    (emit-u32 buf +mcgc-cfg-descriptor-addr+)
+    ;; byte [rdi] = VAL
+    (emit-bytes buf #xC6 #x07 (logand val #xFF))  ; mov byte [rdi], imm8
+    ;; rax += page_size
+    (emit-bytes buf #x48 #x05)                     ; add rax, imm32
+    (emit-u32 buf (ash 1 +mcgc-page-shift+))
+    (emit-jmp buf loop-lbl)
+    (emit-label buf done-lbl)))
+
+(defun emit-mcgc-clear-bitmap-range (buf start-addr-reg end-addr-reg)
+  "Byte-clear the object-start bitmap covering data range [START,END).
+   bitmap byte offset of addr A = (A - page_base) >> 7  (1 bit / 16 bytes).
+   Uses REP STOSB.  Clobbers RAX, RCX, RDI.  Range endpoints are page-aligned
+   (multiples of 4096), so (A-page_base)>>7 is a whole byte and the two
+   semispace-half bitmaps never share a byte at a page boundary."
+  ;; rdi = bitmap_base + ((start - page_base) >> 7)
+  (emit-mov-reg-reg buf 'rax start-addr-reg)
+  (emit-bytes buf #x48 #x2B #x04 #x25)            ; sub rax, [page_base]
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rax 7)                   ; byte offset into bitmap
+  (emit-mov-reg-abs buf 'rdi +mcgc-cfg-bitmap-addr+)
+  (emit-add-reg-reg buf 'rdi 'rax)                ; rdi = dest
+  ;; rcx = (end - start) >> 7  bytes
+  (emit-mov-reg-reg buf 'rcx end-addr-reg)
+  (emit-sub-reg-reg buf 'rcx start-addr-reg)
+  (emit-shr-reg-imm buf 'rcx 7)
+  (emit-bytes buf #xFC)                            ; cld
+  (emit-bytes buf #x31 #xC0)                       ; xor eax, eax
+  (emit-bytes buf #xF3 #xAA))                      ; rep stosb
+
+(defun emit-page-gc-trampoline (buf page-gc-label)
+  "MCGC stage-4 page-based collector (no pinning yet — stage 4b).
+
+   Model: the data region is treated as a pool of 4 KiB pages.  Between
+   collections, allocation bumps R12 within a single contiguous RUN
+   ([run_start,run_end), tracked in BSS words); R14 = run_end - GUARD so the
+   legacy post-write gc-check fires before overshoot can leave the run.  On
+   collection we evacuate the run (= from-space) into a fresh to-run popped
+   from the run-free-list, reusing the proven Cheney copy/scan logic (R13 =
+   bump ptr into the to-run; RBX/RCX = from bounds).  Afterwards the old run's
+   pages are freed and the free-list is rebuilt as the single freed run; the
+   to-run becomes the new alloc run.  This is two-space copying over the page
+   pool — a faithful stepping stone whose plumbing (descriptor marking,
+   free-list pop/rebuild, page math, lazy init) stage 4c reuses to add pinning.
+
+   Register convention mirrors emit-gc-trampoline:
+     RBX = from_start, RCX = from_end, R13 = free ptr (to-run bump),
+     RBP  = saved RSP for the stack scan.  R12/R14 reset on exit."
+  (let ((copy-label (make-label))
+        (scan-word-label (make-label))
+        (restore-label (make-label))
+        (init-done-label (make-label)))
+    (emit-label buf page-gc-label)
+    (emit-gc-dbg-char buf #x7B)          ; '{' — page-GC entry
+
+    ;; ---- Save all caller registers (same set/order as Cheney) ----
+    (emit-push buf 'rax) (emit-push buf 'rsi) (emit-push buf 'rdi)
+    (emit-push buf 'r8)  (emit-push buf 'r9)  (emit-push buf 'rbx)
+    (emit-push buf 'rcx) (emit-push buf 'rdx) (emit-push buf 'r10)
+    (emit-push buf 'r11) (emit-push buf 'r13) (emit-push buf 'rbp)
+    (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp
+
+    ;; ================= Lazy init (first collection) =================
+    ;; Anchor the page grid at page_base (= from_start, page-aligned to itself)
+    ;; and split the whole data region into TWO equal page-runs.  We do NOT
+    ;; reuse the Cheney midpoint (mmap_base+0x1C000000) for the run boundary:
+    ;; that point is 0x200 below a page boundary relative to page_base, so its
+    ;; page-index math would be fractional.  Instead:
+    ;;   total = (data_end - page_base) >> 12      (whole region, pages)
+    ;;   half  = total >> 1
+    ;;   run0  = [page_base, page_base + half*4096)   (initial alloc run)
+    ;;   run1  = [page_base + half*4096, page_base + 2*half*4096)  (free pool)
+    ;; The boot stub already bumped R12 up to ~midpoint before this first GC;
+    ;; since half*4096 > the midpoint offset, R12 is safely inside run0, so the
+    ;; pre-init bump is consistent with the run we now record.
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-init-done-addr+)
+    (emit-bytes buf #x48 #x85 #xC0)             ; test rax, rax
+    (emit-jcc buf :ne init-done-label)
+    ;; RBX = page_base (run0 start)
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-page-base-addr+)
+    (emit-mov-abs-reg buf +mcgc-cfg-run-start-addr+ 'rbx)
+    ;; r9 = half (pages) = ((data_end - page_base) >> 12) >> 1
+    (emit-mov-reg-abs buf 'r9 +mcgc-cfg-data-end-addr+)
+    (emit-sub-reg-reg buf 'r9 'rbx)             ; r9 = data_end - page_base (bytes)
+    (emit-shr-reg-imm buf 'r9 +mcgc-page-shift+) ; r9 = total pages
+    (emit-shr-reg-imm buf 'r9 1)                ; r9 = half pages
+    ;; half_bytes -> r8 ; run0_end = page_base + half_bytes
+    (emit-mov-reg-reg buf 'r8 'r9)
+    (emit-shl-reg-imm buf 'r8 +mcgc-page-shift+) ; r8 = half_bytes
+    (emit-mov-reg-reg buf 'rcx 'rbx)
+    (emit-add-reg-reg buf 'rcx 'r8)             ; rcx = run0_end
+    (emit-mov-abs-reg buf +mcgc-cfg-run-end-addr+ 'rcx)
+    ;; seed free-list with run1 = [run0_end .. run0_end + half_bytes):
+    ;;   start_page = (run0_end - page_base) >> 12  = half  (r9)
+    ;;   n_pages    = half  (r9)
+    (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
+    (emit-bytes buf #x44 #x89 #x0F)             ; mov [rdi], r9d   (start_page=half)
+    (emit-bytes buf #x44 #x89 #x4F #x04)        ; mov [rdi+4], r9d (n_pages=half)
+    (emit-mov-abs-imm32 buf +mcgc-cfg-freelist-count-addr+ 1)
+    ;; mark run0 live (state 1): [page_base, run0_end)
+    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 1 'r8)
+    (emit-mov-abs-imm32 buf +mcgc-cfg-init-done-addr+ 1)
+    (emit-label buf init-done-label)
+
+    ;; ================= From-space bounds =================
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-run-start-addr+)   ; RBX = from_start
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-run-end-addr+)     ; RCX = from_end
+
+    ;; ================= Pop a to-run from the free-list =================
+    ;; Take the last entry (the other half).  to_start = page_base +
+    ;; (start_page<<12); R13 = to_start (free ptr).  Stash to_start/to_end
+    ;; in BSS (survive scan_word/copy_object).
+    (emit-mov-reg-abs buf 'r10 +mcgc-cfg-freelist-count-addr+)
+    (emit-sub-reg-imm buf 'r10 1)                ; r10 = count-1 (index of top run)
+    (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
+    ;; rdi += r10*8  (entry addr)
+    (emit-bytes buf #x4A #x8D #x3C #xD7)         ; lea rdi, [rdi + r10*8]
+    ;; eax = start_page (u32, zero-ext) ; r8d = n_pages
+    (emit-bytes buf #x8B #x07)                   ; mov eax, [rdi]
+    (emit-bytes buf #x44 #x8B #x47 #x04)         ; mov r8d, [rdi+4]
+    ;; to_start = page_base + (start_page<<12)
+    (emit-shl-reg-imm buf 'rax +mcgc-page-shift+)
+    (emit-bytes buf #x48 #x03 #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; add rax,[page_base]
+    (emit-mov-abs-reg buf +mcgc-cfg-to-start-addr+ 'rax)
+    (emit-mov-reg-reg buf 'r13 'rax)             ; R13 = free ptr = to_start
+    ;; to_end = to_start + (n_pages<<12)
+    (emit-shl-reg-imm buf 'r8 +mcgc-page-shift+)
+    (emit-add-reg-reg buf 'r8 'rax)
+    (emit-mov-abs-reg buf +mcgc-cfg-to-end-addr+ 'r8)
+    ;; pop the run: freelist_count = r10 (count-1)
+    (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10)
+
+    (emit-gc-dbg-char buf #x70)          ; 'p' — about to scan roots
+
+    ;; ================= Scan roots (identical to Cheney) =================
+    ;; Stack: walk RBP..stack_base
+    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp
+    (let ((stack-loop (make-label)) (stack-done (make-label)))
+      (emit-mov-reg-abs buf 'rdx #x10000058)     ; rdx = stack_base
+      (emit-label buf stack-loop)
+      (emit-cmp-reg-reg buf 'rdi 'rdx)
+      (emit-jcc buf :ae stack-done)
+      (emit-bytes buf #x48 #x89 #xF8)            ; mov rax, rdi (addr of word)
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 8)
+      (emit-jmp buf stack-loop)
+      (emit-label buf stack-done))
+    ;; Globals / symtab / keyword / pkg-by-hash
+    (emit-mov-reg-imm buf 'rax #x10000080) (emit-call buf scan-word-label)
+    (emit-mov-reg-imm buf 'rax #x10000088) (emit-call buf scan-word-label)
+    (emit-mov-reg-imm buf 'rax #x10000148) (emit-call buf scan-word-label)
+    (emit-mov-reg-imm buf 'rax #x10000170) (emit-call buf scan-word-label)
+    ;; MV extras (count-1 words from 0x10000098)
+    (let ((mv-loop (make-label)) (mv-done (make-label)))
+      (emit-mov-reg-imm buf 'rax #x10000090)
+      (emit-mov-reg-mem buf 'r10 'rax 0)
+      (emit-shr-reg-imm buf 'r10 1)
+      (emit-sub-reg-imm buf 'r10 1)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :le mv-done)
+      (emit-mov-reg-imm buf 'rdi #x10000098)
+      (emit-label buf mv-loop)
+      (emit-mov-reg-reg buf 'rax 'rdi)
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 8)
+      (emit-sub-reg-imm buf 'r10 1)
+      (emit-cmp-reg-imm buf 'r10 0)
+      (emit-jcc buf :g mv-loop)
+      (emit-label buf mv-done))
+    (emit-gc-dbg-char buf #x72)          ; 'r' — roots done
+
+    ;; ================= Cheney scan over the to-run =================
+    ;; R10 = scan ptr starts at to_start.
+    (emit-mov-reg-abs buf 'r10 +mcgc-cfg-to-start-addr+)
+    (let ((cheney-loop (make-label)) (cheney-done (make-label)))
+      (emit-label buf cheney-loop)
+      (emit-cmp-reg-reg buf 'r10 'r13)
+      (emit-jcc buf :ae cheney-done)
+      (emit-bytes buf #x4C #x89 #xD0)            ; mov rax, r10
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'r10 8)
+      (emit-jmp buf cheney-loop)
+      (emit-label buf cheney-done))
+    (emit-gc-dbg-char buf #x63)          ; 'c' — cheney done
+
+    ;; ================= Reclaim + rebuild =================
+    ;; Free the old from-run pages (descriptor -> 0) and clear its bitmap.
+    ;; RBX = from_start, RCX = from_end (still intact: scan_word preserves them).
+    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 0 'r8)
+    (emit-mcgc-clear-bitmap-range buf 'rbx 'rcx)
+    ;; Rebuild the free-list as the single freed run [from_start, from_end).
+    ;;   start_page = (from_start - page_base) >> 12 ; n_pages = (end-start)>>12
+    (emit-mov-reg-reg buf 'rax 'rbx)
+    (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; sub rax,[page_base]
+    (emit-shr-reg-imm buf 'rax +mcgc-page-shift+)        ; rax = start_page
+    (emit-mov-reg-reg buf 'rdx 'rcx)
+    (emit-sub-reg-reg buf 'rdx 'rbx)
+    (emit-shr-reg-imm buf 'rdx +mcgc-page-shift+)        ; rdx = n_pages
+    (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
+    (emit-bytes buf #x89 #x07)                  ; mov [rdi], eax
+    (emit-bytes buf #x89 #x57 #x04)             ; mov [rdi+4], edx
+    (emit-mov-abs-imm32 buf +mcgc-cfg-freelist-count-addr+ 1)
+    ;; Mark the to-run live (state 1): [to_start, to_end).
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
+    (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
+    (emit-mcgc-fill-descriptor-range buf 'rax 'rdx 1 'r8)
+    ;; The to-run becomes the new alloc run.
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
+    (emit-mov-abs-reg buf +mcgc-cfg-run-start-addr+ 'rax)
+    (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
+    (emit-mov-abs-reg buf +mcgc-cfg-run-end-addr+ 'rdx)
+    ;; R12 = free ptr (R13) ; R14 = to_end - GUARD.
+    (emit-bytes buf #x4D #x89 #xEC)             ; mov r12, r13
+    (emit-mov-reg-reg buf 'r14 'rdx)            ; r14 = to_end
+    (emit-sub-reg-imm buf 'r14 +mcgc-guard-bytes+)
+
+    ;; gc_count++
+    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf #x10000060)
+    (emit-jmp buf restore-label)
+
+    ;; ===========================================================
+    ;; SUBROUTINE: scan_word  (RAX = addr of word) — to_run = R13/RBX/RCX as
+    ;; in Cheney; from bounds RBX..RCX.  Validated by the object-start bitmap.
+    ;; ===========================================================
+    (emit-label buf scan-word-label)
+    (emit-push buf 'rdx)
+    (emit-push buf 'rax)
+    (let ((sw-not-ptr (make-label)) (sw-done (make-label))
+          (sw-is-cons (make-label)) (sw-is-obj (make-label)))
+      (emit-mov-reg-mem buf 'rsi 'rax 0)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax #x0F)
+      (emit-cmp-reg-imm buf 'rax 1)
+      (emit-jcc buf :e sw-is-cons)
+      (emit-cmp-reg-imm buf 'rax 9)
+      (emit-jcc buf :e sw-is-obj)
+      (emit-jmp buf sw-not-ptr)
+      ;; cons
+      (emit-label buf sw-is-cons)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax -16)
+      (emit-cmp-reg-reg buf 'rax 'rbx)
+      (emit-jcc buf :b sw-not-ptr)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
+      (emit-jcc buf :ae sw-not-ptr)
+      (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-call buf copy-label)
+      (emit-pop buf 'rsi)
+      (emit-mov-mem-reg buf 'rsi 'rax 0)
+      (emit-push buf 'rsi)
+      (emit-jmp buf sw-done)
+      ;; obj
+      (emit-label buf sw-is-obj)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax -16)
+      (emit-cmp-reg-reg buf 'rax 'rbx)
+      (emit-jcc buf :b sw-not-ptr)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
+      (emit-jcc buf :ae sw-not-ptr)
+      (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-call buf copy-label)
+      (emit-pop buf 'rsi)
+      (emit-mov-mem-reg buf 'rsi 'rax 0)
+      (emit-push buf 'rsi)
+      (emit-jmp buf sw-done)
+      (emit-label buf sw-not-ptr)
+      (emit-label buf sw-done)
+      (emit-pop buf 'rax)
+      (emit-pop buf 'rdx)
+      (emit-ret buf))
+
+    ;; ===========================================================
+    ;; SUBROUTINE: copy_object (RAX = tagged from-ptr) -> RAX new tagged ptr.
+    ;; R13 (free ptr) advanced; forwarding ptr left in from-space; survivor's
+    ;; object-start bit set in the to-run.  Identical to the Cheney copier.
+    ;; ===========================================================
+    (emit-label buf copy-label)
+    (let ((copy-cons (make-label)) (copy-obj (make-label))
+          (copy-fwd (make-label)) (copy-bogus (make-label))
+          (copy-done (make-label)))
+      (emit-mov-reg-reg buf 'rdx 'rax)
+      (emit-and-reg-imm buf 'rax #x0F)
+      (emit-cmp-reg-imm buf 'rax 1)
+      (emit-jcc buf :e copy-cons)
+      (emit-jmp buf copy-obj)
+      ;; cons
+      (emit-label buf copy-cons)
+      (emit-mov-reg-reg buf 'rsi 'rdx)
+      (emit-and-reg-imm buf 'rsi -16)
+      (emit-mov-reg-mem buf 'rax 'rsi 0)
+      (emit-mov-reg-reg buf 'r8 'rax)
+      (emit-and-reg-imm buf 'r8 #x0F)
+      (emit-cmp-reg-imm buf 'r8 #x0F)
+      (emit-jcc buf :e copy-fwd)
+      (emit-mov-reg-mem buf 'rax 'rsi 0)
+      (emit-bytes buf #x49 #x89 #x45 #x00)        ; mov [r13], rax
+      (emit-mov-reg-mem buf 'rax 'rsi 8)
+      (emit-bytes buf #x49 #x89 #x45 #x08)        ; mov [r13+8], rax
+      (emit-bytes buf #x4C #x89 #xE8)             ; mov rax, r13
+      (emit-or-reg-imm buf 'rax 1)
+      (emit-bytes buf #x4C #x89 #xEA)             ; mov rdx, r13
+      (emit-or-reg-imm buf 'rdx #x0F)
+      (emit-mov-mem-reg buf 'rsi 'rdx 0)
+      (emit-mcgc-set-copy-bit buf 'r13)
+      (emit-add-reg-imm buf 'r13 16)
+      (emit-jmp buf copy-done)
+      ;; forwarded
+      (emit-label buf copy-fwd)
+      (emit-and-reg-imm buf 'rax -16)
+      (emit-mov-reg-reg buf 'r8 'rdx)
+      (emit-and-reg-imm buf 'r8 #x0F)
+      (emit-or-reg-reg buf 'rax 'r8)
+      (emit-jmp buf copy-done)
+      ;; object
+      (emit-label buf copy-obj)
+      (emit-mov-reg-reg buf 'rsi 'rdx)
+      (emit-and-reg-imm buf 'rsi -16)
+      (emit-mov-reg-mem buf 'rax 'rsi 0)
+      (emit-mov-reg-reg buf 'r8 'rax)
+      (emit-and-reg-imm buf 'r8 #x0F)
+      (emit-cmp-reg-imm buf 'r8 #x0F)
+      (emit-jcc buf :e copy-fwd)
+      (emit-mov-reg-reg buf 'r8 'rax)
+      (emit-shr-reg-imm buf 'r8 8)
+      (emit-add-reg-imm buf 'r8 2)
+      (emit-shl-reg-imm buf 'r8 3)
+      (emit-add-reg-imm buf 'r8 15)
+      (emit-and-reg-imm buf 'r8 -16)
+      ;; sanity: raw + size <= from_end (RCX) else bogus
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-add-reg-reg buf 'rax 'r8)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
+      (emit-jcc buf :a copy-bogus)
+      (emit-push buf 'rdi)
+      (emit-push buf 'rcx)
+      (emit-push buf 'r13)
+      (emit-mcgc-set-copy-bit buf 'r13)
+      (emit-bytes buf #x4C #x89 #xEF)             ; mov rdi, r13
+      (emit-mov-reg-reg buf 'rcx 'r8)
+      (emit-shr-reg-imm buf 'rcx 3)
+      (emit-bytes buf #xF3 #x48 #xA5)             ; rep movsq
+      (emit-bytes buf #x49 #x89 #xFD)             ; mov r13, rdi
+      (emit-pop buf 'rax)                          ; rax = old r13 (dest start)
+      (emit-or-reg-imm buf 'rax 9)
+      (emit-mov-reg-reg buf 'rsi 'rdx)
+      (emit-and-reg-imm buf 'rsi -16)
+      (emit-mov-reg-reg buf 'rdx 'rax)
+      (emit-and-reg-imm buf 'rdx -16)
+      (emit-or-reg-imm buf 'rdx #x0F)
+      (emit-mov-mem-reg buf 'rsi 'rdx 0)
+      (emit-pop buf 'rcx)
+      (emit-pop buf 'rdi)
+      (emit-jmp buf copy-done)
+      ;; bogus
+      (emit-label buf copy-bogus)
+      (emit-mov-reg-reg buf 'rax 'rdx)
+      (emit-label buf copy-done)
+      (emit-ret buf))
+
+    ;; ---- Restore ----
+    (emit-label buf restore-label)
+    (emit-mov-reg-reg buf 'rsp 'rbp)
+    (emit-pop buf 'rbp) (emit-pop buf 'r13) (emit-pop buf 'r11)
+    (emit-pop buf 'r10) (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+    (emit-pop buf 'rbx) (emit-pop buf 'r9)  (emit-pop buf 'r8)
+    (emit-pop buf 'rdi) (emit-pop buf 'rsi) (emit-pop buf 'rax)
+    (emit-gc-dbg-char buf #x7D)          ; '}' — page-GC exit
+    (emit-ret buf)))
+
 (defun translate-mvm-to-x64 (bytecode function-table)
   "Translate MVM bytecode to x86-64 native code.
    BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.
@@ -4238,6 +4705,10 @@
          (fn-offset-to-label (make-hash-table :test 'eql))
          ;; GC trampoline label (pre-allocated so all translate-states can use it)
          (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
+         ;; MCGC stage-4 page-collector trampoline label (only when pinning on).
+         ;; Stashed in *mcgc-page-gc-label* so gc-check / ensure-room sites can
+         ;; reach it during instruction translation below.
+         (page-gc-label (when (mcgc-pinning-on-p) (make-label)))
          ;; Handler-stack helpers (push/pop the per-fork stack at #x10000400)
          (handler-push-lbl (make-label))
          (handler-pop-lbl  (make-label))
@@ -4245,6 +4716,8 @@
          (gc-collect-entry (when *x64-gc-enabled*
                              (find "%GC-COLLECT" function-table
                                    :key #'first :test #'string-equal))))
+    ;; Publish the page-GC label so gc-check / ensure-room emit calls to it.
+    (setf *mcgc-page-gc-label* page-gc-label)
     ;; Allocate a label for each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -4325,6 +4798,11 @@
       (when (and gc-trampoline-label gc-collect-label)
         (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
         (format t "  GC trampoline emitted, %GC-COLLECT wired~%"))
+      ;; Emit the MCGC stage-4 page collector (only when pinning is enabled;
+      ;; flag-off layout is byte-identical since this is skipped entirely).
+      (when page-gc-label
+        (emit-page-gc-trampoline buf page-gc-label)
+        (format t "  MCGC page-GC trampoline emitted (pinning build)~%"))
       ;; Emit handler-stack helpers (push/pop) used by SETJMP/CLEAR-HANDLER
       ;; traps to support nested handler-cases without clobbering the
       ;; parent's setjmp frame.

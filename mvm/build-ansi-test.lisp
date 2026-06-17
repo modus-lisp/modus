@@ -4960,6 +4960,14 @@
 ;; misidentified as cons/object pointers by compile-funcall.
 (setf modus.mvm.x64::*x64-native-code-offset* 351)
 
+;; MCGC page-pinning test knob (stage 4).  OFF by default — canonical stays on
+;; the validation Cheney collector.  Set MODUS_MCGC_PINNING=1 for a pinning
+;; test build.  When OFF the binary MUST be byte-identical to canonical.
+(when (let ((v (sb-ext:posix-getenv "MODUS_MCGC_PINNING")))
+        (and v (plusp (length v)) (not (string= v "0"))))
+  (setf modus.mvm.x64::*mcgc-pinning-enabled* t)
+  (format t "~&;; MCGC PAGE-PINNING ENABLED (test build)~%"))
+
 ;; Compiler-parameter env-var bridge.
 ;;
 ;; Each entry maps a MODUS_* env var to a defparameter symbol in

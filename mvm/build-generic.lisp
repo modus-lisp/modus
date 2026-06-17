@@ -508,6 +508,13 @@
 ;; allocation walked all the way to the end — too late for a Cheney
 ;; copy that needs the other half free.
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; MCGC page-pinning test knob (stage 4).  OFF by default.  MODUS_MCGC_PINNING=1
+;; enables the page-pool allocator + page collector for a pinning test build.
+#+sbcl
+(when (let ((v (sb-ext:posix-getenv "MODUS_MCGC_PINNING")))
+        (and v (plusp (length v)) (not (string= v "0"))))
+  (setf modus.mvm.x64::*mcgc-pinning-enabled* t)
+  (format t "~&;; MCGC PAGE-PINNING ENABLED (test build)~%"))
 ;; Debug knob: MODUS_GC_R14=<hex-or-dec bytes> forces R14 to a small offset
 ;; so GC fires early (fast repro of GC-from-runtime-EVAL faults).  Leaves
 ;; the from/to semispaces 448MB apart (unchanged), only moves the trigger.

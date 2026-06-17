@@ -4393,6 +4393,7 @@
    as temps (saved/restored); RAW-ADDR-REG must not be RAX/RDX."
   (when (member raw-addr-reg '(rax rdx))
     (error "emit-mcgc-mark-page-pinned: RAW-ADDR-REG must not be RAX/RDX"))
+  (emit-gc-dbg-char buf #x4D)          ; 'M' mark-page-pinned [DEBUG]
   (emit-push buf 'rax)
   (emit-push buf 'rdx)
   ;; rdx = page index = (addr - page_base) >> 12
@@ -4476,6 +4477,52 @@
     (emit-pop buf 'r8)
     (emit-pop buf 'rdx)
     (emit-label buf after)))
+
+(defun emit-mcgc-count-state-dbg (buf val ch)
+  "DEBUG: emit CH once per 8192 pages whose descriptor byte == VAL."
+  (when *x64-gc-debug*
+    (emit-push buf 'rax) (emit-push buf 'rdx) (emit-push buf 'rdi) (emit-push buf 'r8) (emit-push buf 'r9)
+    (let ((kl (make-label)) (kd (make-label)) (ks (make-label)) (ke (make-label)))
+      (emit-bytes buf #x48 #x31 #xFF)            ; xor rdi,rdi (page idx)
+      (emit-bytes buf #x4D #x31 #xC9)            ; xor r9,r9 (match count)
+      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-page-count-addr+)
+      (emit-mov-reg-abs buf 'r8 +mcgc-cfg-descriptor-addr+)
+      (emit-label buf kl)
+      (emit-cmp-reg-reg buf 'rdi 'rdx) (emit-jcc buf :ae kd)
+      (emit-bytes buf #x41 #x8A #x04 #x38)       ; mov al, [r8+rdi]
+      (emit-bytes buf #x3C (logand val #xFF))    ; cmp al, val
+      (emit-jcc buf :ne ks)
+      (emit-bytes buf #x49 #xFF #xC1)            ; inc r9
+      (emit-bytes buf #x49 #x81 #xF9 #x00 #x20 #x00 #x00) ; cmp r9, 8192
+      (emit-jcc buf :ne ks)
+      (emit-bytes buf #x4D #x31 #xC9)            ; xor r9,r9
+      (emit-gc-dbg-char buf ch)
+      (emit-label buf ks)
+      (emit-bytes buf #x48 #xFF #xC7)            ; inc rdi
+      (emit-jmp buf kl)
+      (emit-label buf kd))
+    (emit-pop buf 'r9) (emit-pop buf 'r8) (emit-pop buf 'rdi) (emit-pop buf 'rdx) (emit-pop buf 'rax)))
+
+
+(defun emit-mcgc-count-pinned-dbg (buf ch)
+  "DEBUG (gated): emit byte CH once for each page whose descriptor bit2 (4) is
+   set.  Clobbers RAX/RDX/RDI/R8 (saved/restored)."
+  (when *x64-gc-debug*
+    (emit-push buf 'rax) (emit-push buf 'rdx) (emit-push buf 'rdi) (emit-push buf 'r8)
+    (let ((cnt-loop (make-label)) (cnt-done (make-label)) (cnt-skip (make-label)))
+      (emit-bytes buf #x48 #x31 #xFF)            ; xor rdi, rdi (page idx)
+      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-page-count-addr+)
+      (emit-mov-reg-abs buf 'r8 +mcgc-cfg-descriptor-addr+)
+      (emit-label buf cnt-loop)
+      (emit-cmp-reg-reg buf 'rdi 'rdx) (emit-jcc buf :ae cnt-done)
+      (emit-bytes buf #x41 #xF6 #x04 #x38 #x04)  ; test byte [r8+rdi], 4
+      (emit-jcc buf :e cnt-skip)
+      (emit-gc-dbg-char buf ch)
+      (emit-label buf cnt-skip)
+      (emit-add-reg-imm buf 'rdi 1) (emit-jmp buf cnt-loop)
+      (emit-label buf cnt-done))
+    (emit-pop buf 'r8) (emit-pop buf 'rdi) (emit-pop buf 'rdx) (emit-pop buf 'rax)))
+
 
 (defun emit-page-gc-trampoline (buf page-gc-label)
   "MCGC stage-4c/4d WHOLE-REGION page-based MOSTLY-COPYING collector WITH PINNING.
@@ -4654,6 +4701,7 @@
       (emit-jmp buf sp-loop)
       (emit-label buf sp-done))
     (emit-gc-dbg-char buf #x50)          ; 'P' — pin phase done
+    (emit-mcgc-count-pinned-dbg buf #x61)   ; 'a' count pinned after P1b [DEBUG]
 
     ;; ================= Pop a to-run from the free-list =================
     ;; Mark its pages descriptor=3 so scan_word never treats them as copy
@@ -4671,11 +4719,27 @@
     (emit-shl-reg-imm buf 'r8 +mcgc-page-shift+)
     (emit-add-reg-reg buf 'r8 'rax)
     (emit-mov-abs-reg buf +mcgc-cfg-to-end-addr+ 'r8)
+    (when *x64-gc-debug*  ; [DEBUG] to-run start/end region: S/E = high (overlaps survivors), s/z = low
+      (emit-push buf 'rax) (emit-push buf 'rdx)
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
+      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-page-base-addr+)
+      (emit-bytes buf #x48 #x81 #xC2 #x00 #x00 #x00 #x1C)  ; add rdx, 0x1C000000
+      (emit-cmp-reg-reg buf 'rax 'rdx)
+      (let ((lo (make-label)) (af (make-label)))
+        (emit-jcc buf :b lo) (emit-gc-dbg-char buf #x53) (emit-jmp buf af)
+        (emit-label buf lo) (emit-gc-dbg-char buf #x73) (emit-label buf af))
+      (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-end-addr+)
+      (emit-cmp-reg-reg buf 'rax 'rdx)
+      (let ((lo (make-label)) (af (make-label)))
+        (emit-jcc buf :b lo) (emit-gc-dbg-char buf #x45) (emit-jmp buf af)
+        (emit-label buf lo) (emit-gc-dbg-char buf #x7A) (emit-label buf af))
+      (emit-pop buf 'rdx) (emit-pop buf 'rax))
     (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10) ; pop
     ;; mark to-run pages descriptor=3
     (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
     (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
     (emit-mcgc-fill-descriptor-range buf 'rax 'rdx 3 'r8)
+    (emit-mcgc-count-pinned-dbg buf #x62)   ; 'b' count pinned after to-run pop [DEBUG]
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — about to scan roots
     ;; Reload from bounds (RBX/RCX) for scan_word.
@@ -4724,6 +4788,7 @@
       (emit-bytes buf #x41 #xF6 #x04 #x00 #x04)            ; test byte [r8+rax], 4
       (emit-pop buf 'r11) (emit-pop buf 'rsi)
       (emit-jcc buf :e pg-skip)
+      (emit-gc-dbg-char buf #x67)          ; 'g' pinned page found in gray scan [DEBUG]
       (emit-mov-reg-reg buf 'rdi 'rsi)                     ; rdi = page start
       (emit-mov-reg-reg buf 'r9 'rsi)
       (emit-add-reg-imm buf 'r9 +mcgc-page-bytes+)         ; r9 = page end
@@ -4742,6 +4807,7 @@
       (emit-jmp buf pg-loop)
       (emit-label buf pg-done))
     (emit-gc-dbg-char buf #x47)          ; 'G' — gray (pinned) scan done
+    (emit-mcgc-count-state-dbg buf 3 #x54)   ; 'T' state-3 before reclaim [DEBUG]
 
     ;; ================= P2c: Cheney-drain the to-run =================
     (emit-mov-reg-abs buf 'r10 +mcgc-cfg-to-start-addr+)
@@ -4814,7 +4880,7 @@
       (emit-label buf fl-loop)
       (emit-cmp-reg-reg buf 'rsi 'r9)
       (emit-jcc buf :ae fl-done)
-      (emit-bytes buf #x42 #x8A #x04 #x30)       ; mov al, [r8+rsi]
+      (emit-bytes buf #x41 #x8A #x04 #x30)       ; mov al, [r8+rsi]  FIXED (was #x42=REX.X -> wrongly [rax+r14])
       (emit-bytes buf #x84 #xC0)                 ; test al, al
       (emit-jcc buf :e fl-free)
       ;; NON-free page: flush an open run if any
@@ -4848,6 +4914,7 @@
       (emit-label buf fl-no-run)
       (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10))
     (emit-gc-dbg-char buf #x52)          ; 'R' — reclaim+rebuild done
+    (emit-mcgc-count-state-dbg buf 1 #x4B)   ; 'K' state-1 after reclaim [DEBUG]
 
     ;; ================= New alloc run = the to-run =================
     (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
@@ -4887,7 +4954,9 @@
       (emit-jcc buf :b sw-not-ptr)
       (emit-cmp-reg-reg buf 'rax 'rcx)
       (emit-jcc buf :ae sw-not-ptr)
+      (emit-gc-dbg-char buf #x44)          ; 'D' cons examined [DEBUG]
       (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
+      (emit-gc-dbg-char buf #x45)          ; 'E' cons validate passed [DEBUG]
       (emit-mcgc-not-copyable-or-jump buf 'rax sw-not-ptr) ; keep addr if !=1
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)
@@ -4903,7 +4972,9 @@
       (emit-jcc buf :b sw-not-ptr)
       (emit-cmp-reg-reg buf 'rax 'rcx)
       (emit-jcc buf :ae sw-not-ptr)
+      (emit-gc-dbg-char buf #x65)          ; 'e' obj examined [DEBUG]
       (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
+      (emit-gc-dbg-char buf #x46)          ; 'F' obj validate passed [DEBUG]
       (emit-mcgc-not-copyable-or-jump buf 'rax sw-not-ptr)
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)
@@ -4925,6 +4996,7 @@
     ;; so a runaway size is still caught.
     ;; ===========================================================
     (emit-label buf copy-label)
+    (emit-gc-dbg-char buf #x43)          ; 'C' copy_object entry [DEBUG]
     (let ((copy-cons (make-label)) (copy-obj (make-label))
           (copy-fwd (make-label)) (copy-bogus (make-label))
           (copy-done (make-label)))

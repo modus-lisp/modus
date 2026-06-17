@@ -4478,39 +4478,23 @@
     (emit-label buf after)))
 
 (defun emit-page-gc-trampoline (buf page-gc-label)
-  "MCGC stage-4c/4d WHOLE-REGION page-based MOSTLY-COPYING collector WITH PINNING.
+  "MCGC stage-4 page-based collector (no pinning yet — stage 4b).
 
-   Bartlett page pool over the WHOLE data region (no two-run split for the
-   collector — that was 4b).  Descriptor byte per 4 KiB page:
-     0 = free
-     1 = live  (from-space candidate — copyable)
-     3 = to-run (this GC's copy destination — kept, not a copy source)
-     bit2 (|4) = pinned-this-GC (live+pinned = 5)
-   Persistent FFI pins live in the separate per-page u32 pin-count array
-   (+mcgc-cfg-pincount-addr+), which survives the per-GC descriptor reset.
-
-   Phases:
-     P0   clear transient pinned bits region-wide (descriptor &= ~4).
-     P1a  pin pages with persistent pin-count>0 (descriptor |= 4).
-     P1b  conservative stack scan: every word hitting a recorded object START
-          in a live page marks that page pinned.  (No forward, no rewrite —
-          pinned objects keep their address.)  Stack-only-reachable non-pinned
-          objects are thus RETAINED in place via their pinned page (the Bartlett
-          guarantee), so the stack is NOT a copy root.
-     P2   pop a to-run from the free-list (mark its pages descriptor=3).  Forward
-          PRECISE roots (globals/symtab/keyword/pkg/MV) into the to-run.  Scan
-          every PINNED page's objects in place (gray roots).  Cheney-drain the
-          to-run.  scan_word forwards a target ONLY if descriptor[page]==1
-          (live, not pinned/to-run/free); else it keeps the address.
-     P3   descriptor pass: live-copyable pages (state 1, evacuated) -> free +
-          clear bitmap; pinned pages (5) -> live (1), clear pinned bit, keep
-          bitmap; to-run pages (3) -> live (1) (the survivors' home).  Rebuild
-          the run-free-list (coalesce free pages).  The to-run becomes the new
-          alloc run.  No semispace flip.
+   Model: the data region is treated as a pool of 4 KiB pages.  Between
+   collections, allocation bumps R12 within a single contiguous RUN
+   ([run_start,run_end), tracked in BSS words); R14 = run_end - GUARD so the
+   legacy post-write gc-check fires before overshoot can leave the run.  On
+   collection we evacuate the run (= from-space) into a fresh to-run popped
+   from the run-free-list, reusing the proven Cheney copy/scan logic (R13 =
+   bump ptr into the to-run; RBX/RCX = from bounds).  Afterwards the old run's
+   pages are freed and the free-list is rebuilt as the single freed run; the
+   to-run becomes the new alloc run.  This is two-space copying over the page
+   pool — a faithful stepping stone whose plumbing (descriptor marking,
+   free-list pop/rebuild, page math, lazy init) stage 4c reuses to add pinning.
 
    Register convention mirrors emit-gc-trampoline:
-     RBX = page_base, RCX = data_end (whole-region from-bounds), R13 = to-run
-     bump ptr, RBP = saved RSP.  R12/R14 reset on exit."
+     RBX = from_start, RCX = from_end, R13 = free ptr (to-run bump),
+     RBP  = saved RSP for the stack scan.  R12/R14 reset on exit."
   (let ((copy-label (make-label))
         (scan-word-label (make-label))
         (restore-label (make-label))
@@ -4526,158 +4510,96 @@
     (emit-bytes buf #x48 #x89 #xE5)              ; mov rbp, rsp
 
     ;; ================= Lazy init (first collection) =================
-    ;; Anchor the page grid; mark the whole alloc-so-far region [page_base,
-    ;; run_end) live (state 1); seed the free-list with the REST of the region
-    ;; [run_end, data_end).  (The boot stub bumped R12 to ~midpoint; run_end is
-    ;; recorded as that midpoint so already-allocated objects are all live.)
+    ;; Anchor the page grid at page_base (= from_start, page-aligned to itself)
+    ;; and split the whole data region into TWO equal page-runs.  We do NOT
+    ;; reuse the Cheney midpoint (mmap_base+0x1C000000) for the run boundary:
+    ;; that point is 0x200 below a page boundary relative to page_base, so its
+    ;; page-index math would be fractional.  Instead:
+    ;;   total = (data_end - page_base) >> 12      (whole region, pages)
+    ;;   half  = total >> 1
+    ;;   run0  = [page_base, page_base + half*4096)   (initial alloc run)
+    ;;   run1  = [page_base + half*4096, page_base + 2*half*4096)  (free pool)
+    ;; The boot stub already bumped R12 up to ~midpoint before this first GC;
+    ;; since half*4096 > the midpoint offset, R12 is safely inside run0, so the
+    ;; pre-init bump is consistent with the run we now record.
     (emit-mov-reg-abs buf 'rax +mcgc-cfg-init-done-addr+)
     (emit-bytes buf #x48 #x85 #xC0)             ; test rax, rax
     (emit-jcc buf :ne init-done-label)
-    ;; RBX = page_base ; record run_start = page_base
+    ;; RBX = page_base (run0 start)
     (emit-mov-reg-abs buf 'rbx +mcgc-cfg-page-base-addr+)
     (emit-mov-abs-reg buf +mcgc-cfg-run-start-addr+ 'rbx)
-    ;; run0_end = page_base + half_bytes (same split point as 4b: the boot R12 is
-    ;; below it, so all pre-init allocations are inside [page_base, run0_end)).
+    ;; r9 = half (pages) = ((data_end - page_base) >> 12) >> 1
     (emit-mov-reg-abs buf 'r9 +mcgc-cfg-data-end-addr+)
-    (emit-sub-reg-reg buf 'r9 'rbx)
-    (emit-shr-reg-imm buf 'r9 +mcgc-page-shift+)
+    (emit-sub-reg-reg buf 'r9 'rbx)             ; r9 = data_end - page_base (bytes)
+    (emit-shr-reg-imm buf 'r9 +mcgc-page-shift+) ; r9 = total pages
     (emit-shr-reg-imm buf 'r9 1)                ; r9 = half pages
+    ;; half_bytes -> r8 ; run0_end = page_base + half_bytes
     (emit-mov-reg-reg buf 'r8 'r9)
     (emit-shl-reg-imm buf 'r8 +mcgc-page-shift+) ; r8 = half_bytes
     (emit-mov-reg-reg buf 'rcx 'rbx)
     (emit-add-reg-reg buf 'rcx 'r8)             ; rcx = run0_end
     (emit-mov-abs-reg buf +mcgc-cfg-run-end-addr+ 'rcx)
-    ;; mark [page_base, run0_end) live (state 1)
-    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 1 'r8)
-    ;; mark [run0_end, data_end) free (state 0) — explicit (MAP_ANON is already
-    ;; 0, but be robust).  Then the free-list rebuild below will pick it up; but
-    ;; we also seed it now so the FIRST to-run pop has a run.
-    (emit-mov-reg-abs buf 'rdx +mcgc-cfg-data-end-addr+)
-    (emit-mcgc-fill-descriptor-range buf 'rcx 'rdx 0 'r8)
-    ;; seed free-list: one run [half .. total) pages.
-    ;;   start_page = half (r9) ; n_pages = total - half
-    (emit-mov-reg-abs buf 'rax +mcgc-cfg-data-end-addr+)
-    (emit-mov-reg-abs buf 'r11 +mcgc-cfg-page-base-addr+)
-    (emit-sub-reg-reg buf 'rax 'r11)
-    (emit-shr-reg-imm buf 'rax +mcgc-page-shift+) ; rax = total pages
-    (emit-sub-reg-reg buf 'rax 'r9)              ; rax = total - half = n_pages
+    ;; seed free-list with run1 = [run0_end .. run0_end + half_bytes):
+    ;;   start_page = (run0_end - page_base) >> 12  = half  (r9)
+    ;;   n_pages    = half  (r9)
     (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
     (emit-bytes buf #x44 #x89 #x0F)             ; mov [rdi], r9d   (start_page=half)
-    (emit-bytes buf #x89 #x47 #x04)             ; mov [rdi+4], eax (n_pages)
+    (emit-bytes buf #x44 #x89 #x4F #x04)        ; mov [rdi+4], r9d (n_pages=half)
     (emit-mov-abs-imm32 buf +mcgc-cfg-freelist-count-addr+ 1)
-    (emit-mcgc-pincount-init buf)
+    ;; mark run0 live (state 1): [page_base, run0_end)
+    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 1 'r8)
     (emit-mov-abs-imm32 buf +mcgc-cfg-init-done-addr+ 1)
     (emit-label buf init-done-label)
-    (emit-mcgc-pincount-init buf)   ; idempotent; covers %pin before first GC
 
-    ;; ================= Whole-region from-bounds =================
-    ;; RBX = page_base, RCX = data_end.  These are the bounds for scan_word's
-    ;; cheap "is this a heap data address" range gate; the descriptor byte then
-    ;; decides copyable / pinned / to-run.
-    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-page-base-addr+)
-    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-data-end-addr+)
-    (emit-mov-abs-reg buf +mcgc-cfg-from-start-addr+ 'rbx)
-    (emit-mov-abs-reg buf +mcgc-cfg-from-end-addr+   'rcx)
-
-    ;; ================= P0: clear transient pinned bits region-wide =========
-    ;; descriptor[p] &= ~4 for p in [0, page_count).  Inline byte loop.
-    (let ((p0-loop (make-label)) (p0-done (make-label)))
-      (emit-mov-reg-abs buf 'rdi +mcgc-cfg-descriptor-addr+)
-      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-page-count-addr+) ; rdx = count
-      (emit-label buf p0-loop)
-      (emit-bytes buf #x48 #x85 #xD2)                       ; test rdx, rdx
-      (emit-jcc buf :e p0-done)
-      (emit-bytes buf #x80 #x27 #xFB)                       ; and byte [rdi], ~4
-      (emit-add-reg-imm buf 'rdi 1)
-      (emit-sub-reg-imm buf 'rdx 1)
-      (emit-jmp buf p0-loop)
-      (emit-label buf p0-done))
-
-    ;; ================= P1a: pin pages with persistent pin-count > 0 =========
-    (let ((p1-loop (make-label)) (p1-done (make-label)) (p1-skip (make-label)))
-      (emit-bytes buf #x48 #x31 #xC0)            ; xor rax, rax  (page idx)
-      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-page-count-addr+)
-      (emit-label buf p1-loop)
-      (emit-cmp-reg-reg buf 'rax 'rdx)
-      (emit-jcc buf :ae p1-done)
-      (emit-mov-reg-abs buf 'rsi +mcgc-cfg-pincount-addr+)
-      (emit-bytes buf #x83 #x3C #x86 #x00)       ; cmp dword [rsi+rax*4], 0
-      (emit-jcc buf :e p1-skip)
-      (emit-mov-reg-abs buf 'rdi +mcgc-cfg-descriptor-addr+)
-      (emit-bytes buf #x80 #x0C #x07 #x04)       ; or byte [rdi+rax], 4
-      (emit-label buf p1-skip)
-      (emit-add-reg-imm buf 'rax 1)
-      (emit-jmp buf p1-loop)
-      (emit-label buf p1-done))
-
-    ;; ================= P1b: PIN via conservative stack scan =================
-    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp
-    (let ((sp-loop (make-label)) (sp-done (make-label)) (sp-next (make-label))
-          (sp-cand (make-label)))
-      (emit-mov-reg-abs buf 'rdx #x10000058)     ; rdx = stack_base
-      (emit-label buf sp-loop)
-      (emit-cmp-reg-reg buf 'rdi 'rdx)
-      (emit-jcc buf :ae sp-done)
-      (emit-mov-reg-mem buf 'rsi 'rdi 0)
-      (emit-mov-reg-reg buf 'rax 'rsi)
-      (emit-and-reg-imm buf 'rax #x0F)
-      (emit-cmp-reg-imm buf 'rax 1)
-      (emit-jcc buf :e sp-cand)
-      (emit-cmp-reg-imm buf 'rax 9)
-      (emit-jcc buf :ne sp-next)
-      (emit-label buf sp-cand)
-      (emit-mov-reg-reg buf 'rax 'rsi)
-      (emit-and-reg-imm buf 'rax -16)
-      (emit-cmp-reg-reg buf 'rax 'rbx)           ; < page_base?
-      (emit-jcc buf :b sp-next)
-      (emit-cmp-reg-reg buf 'rax 'rcx)           ; >= data_end?
-      (emit-jcc buf :ae sp-next)
-      ;; only pin a page that is currently a LIVE copyable page (state 1):
-      ;; pinning a free/to-run page is meaningless; a stack word into a free
-      ;; page is a stale false positive.  Reuse the object-start gate, then
-      ;; require descriptor==1 before pinning.
-      (emit-mcgc-validate-or-jump buf 'rax sp-next)
-      (emit-mcgc-not-copyable-or-jump buf 'rax sp-next) ; skip if not state==1
-      (emit-mov-reg-reg buf 'rsi 'rax)
-      (emit-mcgc-mark-page-pinned buf 'rsi)
-      (emit-label buf sp-next)
-      (emit-add-reg-imm buf 'rdi 8)
-      (emit-jmp buf sp-loop)
-      (emit-label buf sp-done))
-    (emit-gc-dbg-char buf #x50)          ; 'P' — pin phase done
+    ;; ================= From-space bounds =================
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-run-start-addr+)   ; RBX = from_start
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-run-end-addr+)     ; RCX = from_end
 
     ;; ================= Pop a to-run from the free-list =================
-    ;; Mark its pages descriptor=3 so scan_word never treats them as copy
-    ;; sources (they ARE the destination).  R13 = to_start (bump ptr).
+    ;; Take the last entry (the other half).  to_start = page_base +
+    ;; (start_page<<12); R13 = to_start (free ptr).  Stash to_start/to_end
+    ;; in BSS (survive scan_word/copy_object).
     (emit-mov-reg-abs buf 'r10 +mcgc-cfg-freelist-count-addr+)
-    (emit-sub-reg-imm buf 'r10 1)
+    (emit-sub-reg-imm buf 'r10 1)                ; r10 = count-1 (index of top run)
     (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
+    ;; rdi += r10*8  (entry addr)
     (emit-bytes buf #x4A #x8D #x3C #xD7)         ; lea rdi, [rdi + r10*8]
-    (emit-bytes buf #x8B #x07)                   ; mov eax, [rdi]   (start_page)
-    (emit-bytes buf #x44 #x8B #x47 #x04)         ; mov r8d, [rdi+4] (n_pages)
+    ;; eax = start_page (u32, zero-ext) ; r8d = n_pages
+    (emit-bytes buf #x8B #x07)                   ; mov eax, [rdi]
+    (emit-bytes buf #x44 #x8B #x47 #x04)         ; mov r8d, [rdi+4]
+    ;; to_start = page_base + (start_page<<12)
     (emit-shl-reg-imm buf 'rax +mcgc-page-shift+)
     (emit-bytes buf #x48 #x03 #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; add rax,[page_base]
     (emit-mov-abs-reg buf +mcgc-cfg-to-start-addr+ 'rax)
     (emit-mov-reg-reg buf 'r13 'rax)             ; R13 = free ptr = to_start
+    ;; to_end = to_start + (n_pages<<12)
     (emit-shl-reg-imm buf 'r8 +mcgc-page-shift+)
     (emit-add-reg-reg buf 'r8 'rax)
     (emit-mov-abs-reg buf +mcgc-cfg-to-end-addr+ 'r8)
-    (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10) ; pop
-    ;; mark to-run pages descriptor=3
-    (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
-    (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
-    (emit-mcgc-fill-descriptor-range buf 'rax 'rdx 3 'r8)
+    ;; pop the run: freelist_count = r10 (count-1)
+    (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10)
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — about to scan roots
-    ;; Reload from bounds (RBX/RCX) for scan_word.
-    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-from-start-addr+)
-    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-from-end-addr+)
 
-    ;; ================= P2a: forward PRECISE roots into the to-run ===========
+    ;; ================= Scan roots (identical to Cheney) =================
+    ;; Stack: walk RBP..stack_base
+    (emit-bytes buf #x48 #x89 #xEF)              ; mov rdi, rbp
+    (let ((stack-loop (make-label)) (stack-done (make-label)))
+      (emit-mov-reg-abs buf 'rdx #x10000058)     ; rdx = stack_base
+      (emit-label buf stack-loop)
+      (emit-cmp-reg-reg buf 'rdi 'rdx)
+      (emit-jcc buf :ae stack-done)
+      (emit-bytes buf #x48 #x89 #xF8)            ; mov rax, rdi (addr of word)
+      (emit-call buf scan-word-label)
+      (emit-add-reg-imm buf 'rdi 8)
+      (emit-jmp buf stack-loop)
+      (emit-label buf stack-done))
+    ;; Globals / symtab / keyword / pkg-by-hash
     (emit-mov-reg-imm buf 'rax #x10000080) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000088) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000148) (emit-call buf scan-word-label)
     (emit-mov-reg-imm buf 'rax #x10000170) (emit-call buf scan-word-label)
+    ;; MV extras (count-1 words from 0x10000098)
     (let ((mv-loop (make-label)) (mv-done (make-label)))
       (emit-mov-reg-imm buf 'rax #x10000090)
       (emit-mov-reg-mem buf 'r10 'rax 0)
@@ -4694,47 +4616,10 @@
       (emit-cmp-reg-imm buf 'r10 0)
       (emit-jcc buf :g mv-loop)
       (emit-label buf mv-done))
-    (emit-gc-dbg-char buf #x72)          ; 'r' — precise roots done
+    (emit-gc-dbg-char buf #x72)          ; 'r' — roots done
 
-    ;; ================= P2b: scan PINNED pages' objects (gray roots) =========
-    ;; For each page whose descriptor pinned bit (4) is set, scan all granules
-    ;; of that page via scan_word (forwarding any non-pinned references).  RDI/R9
-    ;; are loop vars (preserved by scan_word); RSI = page cursor.
-    (let ((pg-loop (make-label)) (pg-done (make-label)) (pg-skip (make-label))
-          (wd-loop (make-label)) (wd-done (make-label)))
-      (emit-mov-reg-reg buf 'rsi 'rbx)           ; rsi = page_base
-      (emit-mov-reg-abs buf 'r11 +mcgc-cfg-from-end-addr+)
-      (emit-label buf pg-loop)
-      (emit-cmp-reg-reg buf 'rsi 'r11)
-      (emit-jcc buf :ae pg-done)
-      (emit-push buf 'rsi) (emit-push buf 'r11)
-      (emit-mov-reg-reg buf 'rax 'rsi)
-      (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+)
-      (emit-shr-reg-imm buf 'rax +mcgc-page-shift+)        ; rax = page idx
-      (emit-mov-reg-abs buf 'r8 +mcgc-cfg-descriptor-addr+)
-      (emit-bytes buf #x41 #xF6 #x04 #x00 #x04)            ; test byte [r8+rax], 4
-      (emit-pop buf 'r11) (emit-pop buf 'rsi)
-      (emit-jcc buf :e pg-skip)
-      (emit-mov-reg-reg buf 'rdi 'rsi)                     ; rdi = page start
-      (emit-mov-reg-reg buf 'r9 'rsi)
-      (emit-add-reg-imm buf 'r9 +mcgc-page-bytes+)         ; r9 = page end
-      (emit-label buf wd-loop)
-      (emit-cmp-reg-reg buf 'rdi 'r9)
-      (emit-jcc buf :ae wd-done)
-      (emit-mov-reg-reg buf 'rax 'rdi)
-      (emit-call buf scan-word-label)
-      (emit-add-reg-imm buf 'rdi 8)
-      (emit-jmp buf wd-loop)
-      (emit-label buf wd-done)
-      (emit-mov-reg-reg buf 'rsi 'rdi)                     ; rsi = page end
-      (emit-jmp buf pg-loop)
-      (emit-label buf pg-skip)
-      (emit-add-reg-imm buf 'rsi +mcgc-page-bytes+)
-      (emit-jmp buf pg-loop)
-      (emit-label buf pg-done))
-    (emit-gc-dbg-char buf #x47)          ; 'G' — gray (pinned) scan done
-
-    ;; ================= P2c: Cheney-drain the to-run =================
+    ;; ================= Cheney scan over the to-run =================
+    ;; R10 = scan ptr starts at to_start.
     (emit-mov-reg-abs buf 'r10 +mcgc-cfg-to-start-addr+)
     (let ((cheney-loop (make-label)) (cheney-done (make-label)))
       (emit-label buf cheney-loop)
@@ -4747,115 +4632,55 @@
       (emit-label buf cheney-done))
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney done
 
-    ;; ================= P3: RECLAIM + rebuild free-list =================
-    ;; Descriptor pass over [0, page_count): translate states for next GC.
-    ;;   state 1 (live, evacuated) -> 0 (free) + clear page bitmap
-    ;;   state 3 (to-run survivors) -> 1 (live)
-    ;;   state 5 (live+pinned)      -> 1 (live), keep bitmap
-    ;; Cursor RSI = page data addr, R11 = data_end; RAX = page idx.
-    (let ((rc-loop (make-label)) (rc-done (make-label))
-          (rc-torun (make-label)) (rc-free (make-label))
-          (rc-advance (make-label)))
-      (emit-mov-reg-abs buf 'rsi +mcgc-cfg-from-start-addr+) ; page_base
-      (emit-mov-reg-abs buf 'r11 +mcgc-cfg-from-end-addr+)   ; data_end
-      (emit-label buf rc-loop)
-      (emit-cmp-reg-reg buf 'rsi 'r11)
-      (emit-jcc buf :ae rc-done)
-      (emit-mov-reg-reg buf 'rax 'rsi)
-      (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+)
-      (emit-shr-reg-imm buf 'rax +mcgc-page-shift+)        ; rax = page idx
-      (emit-mov-reg-abs buf 'r8 +mcgc-cfg-descriptor-addr+)
-      (emit-bytes buf #x41 #x8A #x14 #x00)                 ; mov dl, [r8+rax]
-      ;; pinned? (bit2 set) -> live(1)
-      (emit-bytes buf #xF6 #xC2 #x04)                      ; test dl, 4
-      (emit-jcc buf :ne rc-torun)                          ; pinned -> set live 1
-      ;; to-run (==3)? -> live(1)
-      (emit-bytes buf #x80 #xFA #x03)                      ; cmp dl, 3
-      (emit-jcc buf :e rc-torun)
-      ;; live copyable (==1)? -> free(0) + clear bitmap
-      (emit-bytes buf #x80 #xFA #x01)                      ; cmp dl, 1
-      (emit-jcc buf :e rc-free)
-      ;; free (0) or other -> leave as-is (free)
-      (emit-jmp buf rc-advance)
-      (emit-label buf rc-free)
-      (emit-bytes buf #x41 #xC6 #x04 #x00 #x00)            ; mov byte [r8+rax],0
-      (emit-push buf 'rsi) (emit-push buf 'r11)
-      (emit-mov-reg-reg buf 'rdx 'rsi)
-      (emit-add-reg-imm buf 'rdx +mcgc-page-bytes+)
-      (emit-mcgc-clear-bitmap-range buf 'rsi 'rdx)
-      (emit-pop buf 'r11) (emit-pop buf 'rsi)
-      (emit-jmp buf rc-advance)
-      (emit-label buf rc-torun)
-      (emit-bytes buf #x41 #xC6 #x04 #x00 #x01)            ; mov byte [r8+rax],1
-      (emit-label buf rc-advance)
-      (emit-add-reg-imm buf 'rsi +mcgc-page-bytes+)
-      (emit-jmp buf rc-loop)
-      (emit-label buf rc-done))
-    ;; Rebuild the run-free-list from a full descriptor scan, coalescing
-    ;; consecutive FREE pages (descriptor==0) into (start_page,n_pages) runs.
-    (let ((fl-loop (make-label)) (fl-done (make-label))
-          (fl-free (make-label)) (fl-advance (make-label))
-          (fl-after-flush (make-label)) (fl-no-run (make-label)))
-      (emit-bytes buf #x48 #x31 #xF6)            ; xor rsi, rsi  (page idx 0)
-      (emit-mov-reg-abs buf 'r9 +mcgc-cfg-page-count-addr+)
-      (emit-bytes buf #x4D #x31 #xD2)            ; xor r10, r10  (entry count 0)
-      (emit-mov-reg-imm buf 'r11 #xFFFFFFFFFFFFFFFF) ; r11 = -1 (no current run)
-      (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
-      (emit-mov-reg-abs buf 'r8  +mcgc-cfg-descriptor-addr+)
-      (emit-label buf fl-loop)
-      (emit-cmp-reg-reg buf 'rsi 'r9)
-      (emit-jcc buf :ae fl-done)
-      (emit-bytes buf #x42 #x8A #x04 #x30)       ; mov al, [r8+rsi]
-      (emit-bytes buf #x84 #xC0)                 ; test al, al
-      (emit-jcc buf :e fl-free)
-      ;; NON-free page: flush an open run if any
-      (emit-bytes buf #x49 #x83 #xFB #xFF)       ; cmp r11, -1
-      (emit-jcc buf :e fl-after-flush)
-      (emit-bytes buf #x4A #x8D #x04 #xD7)       ; lea rax, [rdi + r10*8]
-      (emit-bytes buf #x44 #x89 #x18)            ; mov [rax], r11d
-      (emit-mov-reg-reg buf 'rdx 'rsi)
-      (emit-sub-reg-reg buf 'rdx 'r11)
-      (emit-bytes buf #x89 #x50 #x04)            ; mov [rax+4], edx
-      (emit-add-reg-imm buf 'r10 1)
-      (emit-mov-reg-imm buf 'r11 #xFFFFFFFFFFFFFFFF)
-      (emit-label buf fl-after-flush)
-      (emit-jmp buf fl-advance)
-      (emit-label buf fl-free)
-      (emit-bytes buf #x49 #x83 #xFB #xFF)       ; cmp r11, -1
-      (emit-jcc buf :ne fl-advance)
-      (emit-mov-reg-reg buf 'r11 'rsi)           ; open run
-      (emit-label buf fl-advance)
-      (emit-add-reg-imm buf 'rsi 1)
-      (emit-jmp buf fl-loop)
-      (emit-label buf fl-done)
-      (emit-bytes buf #x49 #x83 #xFB #xFF)       ; cmp r11, -1
-      (emit-jcc buf :e fl-no-run)
-      (emit-bytes buf #x4A #x8D #x04 #xD7)       ; lea rax, [rdi + r10*8]
-      (emit-bytes buf #x44 #x89 #x18)            ; mov [rax], r11d
-      (emit-mov-reg-reg buf 'rdx 'r9)
-      (emit-sub-reg-reg buf 'rdx 'r11)
-      (emit-bytes buf #x89 #x50 #x04)            ; mov [rax+4], edx
-      (emit-add-reg-imm buf 'r10 1)
-      (emit-label buf fl-no-run)
-      (emit-mov-abs-reg buf +mcgc-cfg-freelist-count-addr+ 'r10))
-    (emit-gc-dbg-char buf #x52)          ; 'R' — reclaim+rebuild done
-
-    ;; ================= New alloc run = the to-run =================
+    ;; ================= Reclaim + rebuild =================
+    ;; RBX = from_start, RCX = from_end (scan_word/copy_object preserve them).
+    ;; The descriptor fill / bitmap clear helpers clobber RAX/RCX/RDI, so stash
+    ;; the from bounds to BSS scratch FIRST and drive all reclaim steps off the
+    ;; stash (computing the rebuild values BEFORE any clobbering helper runs).
+    (emit-mov-abs-reg buf +mcgc-cfg-from-start-addr+ 'rbx)
+    (emit-mov-abs-reg buf +mcgc-cfg-from-end-addr+   'rcx)
+    ;; Compute the freed-run free-list entry NOW (from RBX/RCX, still intact)
+    ;; and write it; later clobbers don't affect already-stored values.
+    ;;   start_page = (from_start - page_base) >> 12 ; n_pages = (end-start)>>12
+    (emit-mov-reg-reg buf 'rax 'rbx)
+    (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; sub rax,[page_base]
+    (emit-shr-reg-imm buf 'rax +mcgc-page-shift+)        ; rax = start_page
+    (emit-mov-reg-reg buf 'rdx 'rcx)
+    (emit-sub-reg-reg buf 'rdx 'rbx)
+    (emit-shr-reg-imm buf 'rdx +mcgc-page-shift+)        ; rdx = n_pages
+    (emit-mov-reg-abs buf 'rdi +mcgc-cfg-freelist-base-addr+)
+    (emit-bytes buf #x89 #x07)                  ; mov [rdi], eax
+    (emit-bytes buf #x89 #x57 #x04)             ; mov [rdi+4], edx
+    (emit-mov-abs-imm32 buf +mcgc-cfg-freelist-count-addr+ 1)
+    ;; Now free the from-run pages (descriptor -> 0) and clear its bitmap.
+    ;; Reload bounds from the stash (helpers clobber RAX/RCX/RDI).
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-from-start-addr+)
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-from-end-addr+)
+    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 0 'r8)
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-from-start-addr+)
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-from-end-addr+)
+    (emit-mcgc-clear-bitmap-range buf 'rbx 'rcx)
+    ;; Mark the to-run live (state 1): [to_start, to_end).
+    (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
+    (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
+    (emit-mcgc-fill-descriptor-range buf 'rax 'rdx 1 'r8)
+    ;; The to-run becomes the new alloc run.
     (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
     (emit-mov-abs-reg buf +mcgc-cfg-run-start-addr+ 'rax)
     (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)
     (emit-mov-abs-reg buf +mcgc-cfg-run-end-addr+ 'rdx)
+    ;; R12 = free ptr (R13) ; R14 = to_end - GUARD.
     (emit-bytes buf #x4D #x89 #xEC)             ; mov r12, r13
     (emit-mov-reg-reg buf 'r14 'rdx)            ; r14 = to_end
     (emit-sub-reg-imm buf 'r14 +mcgc-guard-bytes+)
 
-    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf #x10000060) ; gc_count++
+    ;; gc_count++
+    (emit-bytes buf #x48 #xFF #x04 #x25) (emit-u32 buf #x10000060)
     (emit-jmp buf restore-label)
 
     ;; ===========================================================
-    ;; SUBROUTINE: scan_word (RAX = addr of word).  from-range RBX..RCX (whole
-    ;; region); a target is FORWARDED iff its descriptor==1, else its address is
-    ;; kept.  Preserves RBX/RCX/R13/RDI/R10/R11/RBP; clobbers RAX/RSI/RDX/R8.
+    ;; SUBROUTINE: scan_word  (RAX = addr of word) — to_run = R13/RBX/RCX as
+    ;; in Cheney; from bounds RBX..RCX.  Validated by the object-start bitmap.
     ;; ===========================================================
     (emit-label buf scan-word-label)
     (emit-push buf 'rdx)
@@ -4879,7 +4704,6 @@
       (emit-cmp-reg-reg buf 'rax 'rcx)
       (emit-jcc buf :ae sw-not-ptr)
       (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
-      (emit-mcgc-not-copyable-or-jump buf 'rax sw-not-ptr) ; keep addr if !=1
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)
       (emit-pop buf 'rsi)
@@ -4895,7 +4719,6 @@
       (emit-cmp-reg-reg buf 'rax 'rcx)
       (emit-jcc buf :ae sw-not-ptr)
       (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
-      (emit-mcgc-not-copyable-or-jump buf 'rax sw-not-ptr)
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)
       (emit-pop buf 'rsi)
@@ -4910,10 +4733,8 @@
 
     ;; ===========================================================
     ;; SUBROUTINE: copy_object (RAX = tagged from-ptr) -> RAX new tagged ptr.
-    ;; The copy DEST is the to-run (R13).  copy_object only ever runs on a
-    ;; descriptor==1 source (gated by scan_word).  The to_end bound check uses
-    ;; +mcgc-cfg-to-end-addr+ (the to-run end), NOT RCX (which is data_end here),
-    ;; so a runaway size is still caught.
+    ;; R13 (free ptr) advanced; forwarding ptr left in from-space; survivor's
+    ;; object-start bit set in the to-run.  Identical to the Cheney copier.
     ;; ===========================================================
     (emit-label buf copy-label)
     (let ((copy-cons (make-label)) (copy-obj (make-label))
@@ -4967,13 +4788,10 @@
       (emit-shl-reg-imm buf 'r8 3)
       (emit-add-reg-imm buf 'r8 15)
       (emit-and-reg-imm buf 'r8 -16)
-      ;; sanity: raw + size <= to_end else bogus (dest bound, not data_end)
+      ;; sanity: raw + size <= from_end (RCX) else bogus
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-add-reg-reg buf 'rax 'r8)
-      (emit-push buf 'rdx)
-      (emit-mov-reg-abs buf 'rdx +mcgc-cfg-data-end-addr+)
-      (emit-cmp-reg-reg buf 'rax 'rdx)
-      (emit-pop buf 'rdx)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
       (emit-jcc buf :a copy-bogus)
       (emit-push buf 'rdi)
       (emit-push buf 'rcx)
@@ -5010,6 +4828,7 @@
     (emit-pop buf 'rdi) (emit-pop buf 'rsi) (emit-pop buf 'rax)
     (emit-gc-dbg-char buf #x7D)          ; '}' — page-GC exit
     (emit-ret buf)))
+
 (defun translate-mvm-to-x64 (bytecode function-table)
   "Translate MVM bytecode to x86-64 native code.
    BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.

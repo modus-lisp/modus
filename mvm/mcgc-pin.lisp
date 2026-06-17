@@ -25,13 +25,22 @@
 (defconstant +mcgc-pin-cfg-page-count+  #x10000E08)  ; number of pages
 (defconstant +mcgc-pin-cfg-freelist+    #x10000E20)  ; raw addr of run-free-list
 
+(defun %mcgc-cfg-uval (slot)
+  "Read a u64 config word as a CLEAN fixnum value.  (mem-ref slot :u64) returns
+   the RAW bits in the result register with NO fixnum shift, so its Lisp VALUE
+   is (raw >> 1) — half the true value.  Shifting left by 1 recovers the true
+   byte-address / count, matching %mcgc-obj-raw-addr's scale so address
+   arithmetic + mem-ref work.  (Without this the persistent %pin path read the
+   pin-count array at a half-address and SIGSEGV'd.)"
+  (ash (mem-ref slot :u64) 1))
+
 (defun %mcgc-pincount-base ()
   "Raw byte address of the per-page u32 pin-count array.
    pincount_base = freelist_base + page_count*4 (the array lives just past the
    run-free-list in the MAP_ANON-zeroed metadata region).  Both operands come
    from constant config slots, so the result is a clean fixnum address."
-  (+ (mem-ref +mcgc-pin-cfg-freelist+ :u64)
-     (* (mem-ref +mcgc-pin-cfg-page-count+ :u64) 4)))
+  (+ (%mcgc-cfg-uval +mcgc-pin-cfg-freelist+)
+     (* (%mcgc-cfg-uval +mcgc-pin-cfg-page-count+) 4)))
 
 (defun %mcgc-obj-raw-addr (obj)
   "Raw byte address of heap object OBJ (cons or object).  Proven tagged->raw
@@ -54,7 +63,7 @@
   "Add DELTA (+1 / -1) to the pin-count of every page OBJ covers.  Returns the
    object's raw byte address.  No-op (still returns the address) when the page
    metadata isn't initialised (page_base==0)."
-  (let ((page-base (mem-ref +mcgc-pin-cfg-page-base+ :u64))
+  (let ((page-base (%mcgc-cfg-uval +mcgc-pin-cfg-page-base+))
         (raw (%mcgc-obj-raw-addr obj)))
     (when (> page-base 0)
       (let* ((size (%mcgc-obj-size obj))
@@ -88,7 +97,7 @@
 
 (defun %mcgc-page-pincount (obj)
   "Pin-count of the page containing OBJ's start (diagnostic)."
-  (let ((page-base (mem-ref +mcgc-pin-cfg-page-base+ :u64))
+  (let ((page-base (%mcgc-cfg-uval +mcgc-pin-cfg-page-base+))
         (raw (%mcgc-obj-raw-addr obj)))
     (if (> page-base 0)
         (mem-ref (+ (%mcgc-pincount-base) (* (ash (- raw page-base) -12) 4)) :u32)

@@ -335,3 +335,45 @@ collector (keep the pin API + :mcgc-collect opcode + build infra), then re-add
 per-page pinning INCREMENTALLY, gauntlet-verifying after EACH step. The all-at-once
 546-line rework without runtime verification is why it's unverifiably broken.
 Canonical unaffected throughout (corruption fix + validation collector still banked).
+
+---
+
+# STAGE 4 COMPLETE (2026-06-17): page-pinning GC works, verified.
+
+The per-page mostly-copying (Bartlett) collector is functionally complete behind
+*mcgc-pinning-enabled* (default NIL; flag-off builds are BYTE-IDENTICAL to
+canonical — md5 916804619904332f43cec375e99d4601).
+
+FOUR collector bugs were found + fixed (orchestrator, via the MODUS_GC_R14
+small-run forced-collection method + gated phase/count debug chars; gdb is
+blocked by ptrace in the sandbox):
+  1. (321eeb3) lazy-init RCX clobber: the 2nd descriptor fill used RCX left 0 by
+     the 1st fill's REP STOSB -> wild write -> the "gauntlet form 2" SEGV.
+  2. (fc2afd7) free-list rebuild descriptor read mis-encoded #x42(REX.X)=
+     [rax+r14] instead of #x41(REX.B)=[r8+rsi] -> every page read the same byte
+     (0) -> whole region coalesced into one "free" run -> next to-run overwrote
+     everything + cleared all pins.
+  3. (2de5398) to-run pop took the LAST free-list entry, which goes tiny as pins
+     fragment the free region -> survivor overflow.  Fix: pop the LARGEST run.
+  4. (4a1f5b5) persistent %pin pin-count addressing: (mem-ref slot :u64) returns
+     raw bits (Lisp value = raw>>1, half) but %mcgc-obj-raw-addr yields the true
+     byte address -> half-address SEGV.  %mcgc-cfg-uval rescales (ash ... 1).
+
+VERIFIED (small-R14 build, heavy collection):
+  - colforce2: a live object SURVIVES forced page collections INTACT.
+  - conservative pinning: a stack-referenced object's ADDRESS is STABLE across
+    collections (STABLE=1 INTACT=1) — the synchronous-FFI guarantee.
+  - persistent %pin-object / %unpin-object: PIN-STABLE=1, pin-count 0->1->0 — the
+    async-DMA guarantee (hold a stable raw address across GCs with no stack ref).
+  - ASDF gauntlet runs to form 226 (the full survey) DETERMINISTICALLY under
+    hundreds of pinning collections (md5-identical x3).  Validation collector
+    reached 98; pinning reaches 226.
+Regressions: test/pin-stress.lisp, test/addr-stable.lisp.
+
+RESIDUALS (non-blocking; the feature is gated OFF):
+  - explicit (%mcgc-collect) opcode path still faults; implicit (gc-check)
+    collection works, so all the above is via implicit collection.
+  - to-run refill on exhaustion: pick-largest fits the gauntlet, but a workload
+    whose survivors exceed the largest single free run would overflow; the
+    durable fix is copy_object popping another free run when R13 hits to_end.
+  - gated debug instrumentation (*x64-gc-debug*, phase/count chars) retained.

@@ -3490,6 +3490,8 @@
 (defconstant +mcgc-cfg-to-start-addr+  #x10000E50)  ; raw addr: to-run start (this GC)
 (defconstant +mcgc-cfg-to-end-addr+    #x10000E58)  ; raw addr: to-run end   (this GC)
 (defconstant +mcgc-cfg-init-done-addr+ #x10000E60)  ; 0 until collector lazy-init ran
+(defconstant +mcgc-cfg-from-start-addr+ #x10000E68) ; raw addr: from-run start (reclaim)
+(defconstant +mcgc-cfg-from-end-addr+   #x10000E70) ; raw addr: from-run end   (reclaim)
 
 (defconstant +mcgc-page-shift+ 12)                  ; 4 KiB pages
 (defconstant +mcgc-guard-bytes+ #x10000)            ; 64 KiB overshoot guard (16 pages)
@@ -4294,32 +4296,30 @@
 (defun emit-mcgc-fill-descriptor-range (buf start-addr-reg end-addr-reg val zero-reg)
   "Set descriptor[page] = VAL (a byte 0/1/2) for every page whose data byte is
    in [START-ADDR-REG, END-ADDR-REG).  Clobbers RAX, RCX, RDI.  START/END
-   read-only via copy.  Descriptor address of page p = descriptor_base + p,
-   where p = (addr - page_base) >> 12.  We iterate addr by page_size, computing
-   the descriptor byte address = descriptor_base + ((addr-page_base)>>12)."
+   read-only via copy.  The descriptor array is one byte per page, indexed by
+   page = (addr - page_base) >> 12, so a contiguous data range maps to a
+   CONTIGUOUS descriptor byte range [descriptor_base+start_page,
+   descriptor_base+end_page) — filled with a single REP STOSB (O(pages) bytes,
+   but ~100x faster than a per-page interpreted loop)."
   (declare (ignore zero-reg))
-  (let ((loop-lbl (make-label))
-        (done-lbl (make-label)))
-    ;; RAX = start addr (copy), RCX = end addr (copy)
-    (emit-mov-reg-reg buf 'rax start-addr-reg)
-    (emit-mov-reg-reg buf 'rcx end-addr-reg)
-    (emit-label buf loop-lbl)
-    (emit-cmp-reg-reg buf 'rax 'rcx)
-    (emit-jcc buf :ae done-lbl)
-    ;; rdi = (rax - page_base) >> 12  + descriptor_base
-    (emit-mov-reg-reg buf 'rdi 'rax)
-    (emit-bytes buf #x48 #x2B #x3C #x25)          ; sub rdi, [page_base]
-    (emit-u32 buf +mcgc-cfg-page-base-addr+)
-    (emit-shr-reg-imm buf 'rdi +mcgc-page-shift+) ; rdi = page index
-    (emit-bytes buf #x48 #x03 #x3C #x25)          ; add rdi, [descriptor_base]
-    (emit-u32 buf +mcgc-cfg-descriptor-addr+)
-    ;; byte [rdi] = VAL
-    (emit-bytes buf #xC6 #x07 (logand val #xFF))  ; mov byte [rdi], imm8
-    ;; rax += page_size
-    (emit-bytes buf #x48 #x05)                     ; add rax, imm32
-    (emit-u32 buf (ash 1 +mcgc-page-shift+))
-    (emit-jmp buf loop-lbl)
-    (emit-label buf done-lbl)))
+  ;; rax = start_page = (start - page_base) >> 12
+  (emit-mov-reg-reg buf 'rax start-addr-reg)
+  (emit-bytes buf #x48 #x2B #x04 #x25)             ; sub rax, [page_base]
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rax +mcgc-page-shift+)
+  ;; rcx = end_page = (end - page_base) >> 12  ; then rcx = count = end_page - start_page
+  (emit-mov-reg-reg buf 'rcx end-addr-reg)
+  (emit-bytes buf #x48 #x2B #x0C #x25)             ; sub rcx, [page_base]
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rcx +mcgc-page-shift+)
+  (emit-sub-reg-reg buf 'rcx 'rax)                 ; rcx = page count
+  ;; rdi = descriptor_base + start_page
+  (emit-mov-reg-abs buf 'rdi +mcgc-cfg-descriptor-addr+)
+  (emit-add-reg-reg buf 'rdi 'rax)
+  ;; al = VAL ; rep stosb
+  (emit-bytes buf #xFC)                            ; cld
+  (emit-bytes buf #xB0 (logand val #xFF))          ; mov al, imm8
+  (emit-bytes buf #xF3 #xAA))                      ; rep stosb
 
 (defun emit-mcgc-clear-bitmap-range (buf start-addr-reg end-addr-reg)
   "Byte-clear the object-start bitmap covering data range [START,END).
@@ -4498,11 +4498,14 @@
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney done
 
     ;; ================= Reclaim + rebuild =================
-    ;; Free the old from-run pages (descriptor -> 0) and clear its bitmap.
-    ;; RBX = from_start, RCX = from_end (still intact: scan_word preserves them).
-    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 0 'r8)
-    (emit-mcgc-clear-bitmap-range buf 'rbx 'rcx)
-    ;; Rebuild the free-list as the single freed run [from_start, from_end).
+    ;; RBX = from_start, RCX = from_end (scan_word/copy_object preserve them).
+    ;; The descriptor fill / bitmap clear helpers clobber RAX/RCX/RDI, so stash
+    ;; the from bounds to BSS scratch FIRST and drive all reclaim steps off the
+    ;; stash (computing the rebuild values BEFORE any clobbering helper runs).
+    (emit-mov-abs-reg buf +mcgc-cfg-from-start-addr+ 'rbx)
+    (emit-mov-abs-reg buf +mcgc-cfg-from-end-addr+   'rcx)
+    ;; Compute the freed-run free-list entry NOW (from RBX/RCX, still intact)
+    ;; and write it; later clobbers don't affect already-stored values.
     ;;   start_page = (from_start - page_base) >> 12 ; n_pages = (end-start)>>12
     (emit-mov-reg-reg buf 'rax 'rbx)
     (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; sub rax,[page_base]
@@ -4514,6 +4517,14 @@
     (emit-bytes buf #x89 #x07)                  ; mov [rdi], eax
     (emit-bytes buf #x89 #x57 #x04)             ; mov [rdi+4], edx
     (emit-mov-abs-imm32 buf +mcgc-cfg-freelist-count-addr+ 1)
+    ;; Now free the from-run pages (descriptor -> 0) and clear its bitmap.
+    ;; Reload bounds from the stash (helpers clobber RAX/RCX/RDI).
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-from-start-addr+)
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-from-end-addr+)
+    (emit-mcgc-fill-descriptor-range buf 'rbx 'rcx 0 'r8)
+    (emit-mov-reg-abs buf 'rbx +mcgc-cfg-from-start-addr+)
+    (emit-mov-reg-abs buf 'rcx +mcgc-cfg-from-end-addr+)
+    (emit-mcgc-clear-bitmap-range buf 'rbx 'rcx)
     ;; Mark the to-run live (state 1): [to_start, to_end).
     (emit-mov-reg-abs buf 'rax +mcgc-cfg-to-start-addr+)
     (emit-mov-reg-abs buf 'rdx +mcgc-cfg-to-end-addr+)

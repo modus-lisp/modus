@@ -4777,8 +4777,24 @@
     ;; For each page whose descriptor pinned bit (4) is set, scan all granules
     ;; of that page via scan_word (forwarding any non-pinned references).  RDI/R9
     ;; are loop vars (preserved by scan_word); RSI = page cursor.
+    ;; Gray scan walks only RECORDED OBJECT STARTS (object-start bitmap), not
+    ;; every word.  A pinned page can carry a stale UNALLOCATED tail (no start
+    ;; bits): the page got pinned while partially filled and was then KEPT in
+    ;; place, so on a later GC its tail still holds leftover bytes that can alias
+    ;; from-space objects.  Word-scanning that tail forwarded garbage as a gray
+    ;; root — the latent LAYOUT-SENSITIVE corruption (which partial page is
+    ;; pinned + what stale bytes it holds shifts with image layout; the heisenbug
+    ;; that made "adding a defun break an unrelated test" for the pinning path).
+    ;; For each start, scan [start, next-start) = the object's full extent; the
+    ;; last object on a page (no next start before page end) is capped to one
+    ;; granule (correct for the common cons; KNOWN LIMITATION — a LARGE object as
+    ;; the very last live object on a pinned page would under-scan its tail
+    ;; fields.  Harden with per-object sizing if a workload ever needs it; the
+    ;; asdf gauntlet is byte-identical with the cap).
     (let ((pg-loop (make-label)) (pg-done (make-label)) (pg-skip (make-label))
-          (wd-loop (make-label)) (wd-done (make-label)))
+          (gobj-loop (make-label)) (gobj-skip (make-label)) (page-done (make-label))
+          (gend-loop (make-label)) (gend-next (make-label)) (gend-have (make-label))
+          (gend-cap (make-label)) (gword-loop (make-label)) (gword-done (make-label)))
       (emit-mov-reg-reg buf 'rsi 'rbx)           ; rsi = page_base
       (emit-mov-reg-abs buf 'r11 +mcgc-cfg-from-end-addr+)
       (emit-label buf pg-loop)
@@ -4793,18 +4809,45 @@
       (emit-pop buf 'r11) (emit-pop buf 'rsi)
       (emit-jcc buf :e pg-skip)
       (emit-gc-dbg-char buf #x67)          ; 'g' pinned page found in gray scan [DEBUG]
-      (emit-mov-reg-reg buf 'rdi 'rsi)                     ; rdi = page start
+      (emit-mov-reg-reg buf 'rdi 'rsi)                     ; rdi = cursor = page start
       (emit-mov-reg-reg buf 'r9 'rsi)
       (emit-add-reg-imm buf 'r9 +mcgc-page-bytes+)         ; r9 = page end
-      (emit-label buf wd-loop)
+      (emit-label buf gobj-loop)
       (emit-cmp-reg-reg buf 'rdi 'r9)
-      (emit-jcc buf :ae wd-done)
+      (emit-jcc buf :ae page-done)
+      (emit-mov-reg-reg buf 'rax 'rdi)                     ; rax = cursor (validate wants RAX)
+      (emit-mcgc-validate-or-jump buf 'rax gobj-skip)      ; not a start -> skip granule
+      ;; rdi is an object start.  Find object end r10 = next start (or page end).
+      (emit-mov-reg-reg buf 'r10 'rdi)
+      (emit-add-reg-imm buf 'r10 16)                       ; r10 = rdi + 1 granule
+      (emit-label buf gend-loop)
+      (emit-cmp-reg-reg buf 'r10 'r9)
+      (emit-jcc buf :ae gend-cap)                          ; reached page end -> cap last object
+      (emit-mov-reg-reg buf 'rax 'r10)
+      (emit-mcgc-validate-or-jump buf 'rax gend-next)      ; r10 not a start -> keep looking
+      (emit-jmp buf gend-have)                             ; r10 is a start -> object ends here
+      (emit-label buf gend-next)
+      (emit-add-reg-imm buf 'r10 16)
+      (emit-jmp buf gend-loop)
+      (emit-label buf gend-cap)
+      (emit-mov-reg-reg buf 'r10 'rdi)                     ; last object: cap to one granule
+      (emit-add-reg-imm buf 'r10 16)                       ;   (skip the stale unallocated tail)
+      (emit-label buf gend-have)
+      ;; scan words [rdi, r10), advancing rdi (preserved by scan_word)
+      (emit-label buf gword-loop)
+      (emit-cmp-reg-reg buf 'rdi 'r10)
+      (emit-jcc buf :ae gword-done)
       (emit-mov-reg-reg buf 'rax 'rdi)
       (emit-call buf scan-word-label)
       (emit-add-reg-imm buf 'rdi 8)
-      (emit-jmp buf wd-loop)
-      (emit-label buf wd-done)
-      (emit-mov-reg-reg buf 'rsi 'rdi)                     ; rsi = page end
+      (emit-jmp buf gword-loop)
+      (emit-label buf gword-done)
+      (emit-jmp buf gobj-loop)                             ; rdi = r10 = next region
+      (emit-label buf gobj-skip)
+      (emit-add-reg-imm buf 'rdi 16)                       ; skip non-start granule
+      (emit-jmp buf gobj-loop)
+      (emit-label buf page-done)
+      (emit-mov-reg-reg buf 'rsi 'rdi)                     ; rsi = page end (rdi reached r9)
       (emit-jmp buf pg-loop)
       (emit-label buf pg-skip)
       (emit-add-reg-imm buf 'rsi +mcgc-page-bytes+)

@@ -271,3 +271,35 @@ STILL TODO:
   must point explicit collection at the page collector too.
 - 4d: %pin/%unpin/with-pinned-objects API + pin-stress (address stable across
   N GCs, contents intact, unpin reclaims).
+
+---
+
+# Stage 4c/4d STATUS (2026-06-17): committed WIP does NOT build flag-on
+
+Orchestrator verification of the 4c/4d WIP (commit a294a56):
+- GATING OK: flag-OFF builds byte-identical to canonical (md5
+  916804619904332f43cec375e99d4601). mcgc-pin.lisp + :mcgc-collect opcode are
+  correctly pinning-only.
+- FLAG-ON BUILD FAILS: register-allocation cascade. ~9 complex functions
+  (%ensure-pathname-classes, %init-symbol-function-table, list-all-packages,
+  %heal-handler-bind-skip, %signals-error-stub, %get-plist-ht,
+  %init-make-load-form, ...) hit `MVM x64: cannot load vreg 22..30` (emit-load-vreg:
+  vreg neither phys-mapped nor spilled) → "giving up on translator, using partial
+  result" → APPLY-LI-CONST-PATCHES writes at offset 15419015 into the 2382192-byte
+  native array (the offset is ~the 15.7M SOURCE size → a partial-result base/units
+  confusion) → Unhandled INVALID-ARRAY-INDEX-ERROR, build dies. flag-on ANSI binary
+  is a truncated 18MB (0 passes); flag-on generic exits 1.
+- flag-OFF has NONE of these vreg warnings → the cascade is flag-on-specific.
+- 4c did NOT wire ensure-room into alloc sites and did NOT change the reg-map /
+  scratch set, so it is NOT a per-alloc-site register grab.
+
+ROOT CAUSE is the vreg cascade (the li-const-patch crash is a downstream symptom).
+TWO hypotheses, DECISIVE next step = build flag-on with mcgc-pin.lisp EXCLUDED
+(flag on, skip the pin-source include):
+  (a) cascade PERSISTS → the flag's EMISSION change (gc-check page reroute / the
+      546-line collector altering some global the per-function allocator reads).
+  (b) cascade VANISHES → adding mcgc-pin.lisp's functions shifts vreg NUMBERING or
+      image size past a translator capacity; the real fix is in the MVM register
+      allocator / vreg handling (or reducing mcgc-pin.lisp's footprint), NOT the GC.
+Pin-stress (the actual deliverable) was NEVER reached. 4c/4d is INCOMPLETE.
+Verified working: stage 4b (page machinery) at fabd873. Canonical unaffected.

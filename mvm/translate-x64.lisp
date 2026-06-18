@@ -5178,6 +5178,43 @@
       (emit-cmp-reg-reg buf 'rax 'rdx)
       (emit-pop buf 'rdx)
       (emit-jcc buf :a copy-bogus)
+      ;; PAGE-PAD the destination so a COPIED object never STRADDLES a page
+      ;; boundary.  This keeps per-page pinning EXACT: a pinned (kept-in-place)
+      ;; object then lives wholly within its own page(s) and cannot "infect" the
+      ;; next page.  Without it, bump-allocated survivors cross page boundaries
+      ;; constantly, so pinning one object's page transitively keeps the whole
+      ;; contiguous run (each boundary-crossing object pins the next page) ->
+      ;; over-retention -> to-run exhaustion -> copy_object OOM returns stale
+      ;; pointers -> corruption.  That straddle "infection" is the root of the
+      ;; layout-sensitive pinning corruption (root-caused 2026-06-18: a 7-slot
+      ;; array straddling pages 0x4b/0x4c, head pinned for a page-mate, tail
+      ;; reclaimed+reused).  If page(R13) != page(R13+size-1), bump R13 to the next
+      ;; page boundary; the gap left behind is harmless — P2c scans the to-run
+      ;; word-by-word and scan_word filters non-pointers, and reclaim keeps the
+      ;; to-run page.  An object > page_bytes still spans pages, but contiguously
+      ;; from a page-aligned start (bounded to that one object, non-infectious).
+      ;; Conses (16B / 16-aligned, page bounds 16-aligned) never straddle, so only
+      ;; this obj path pads.  RAX scratch; RDI saved/restored.  Done BEFORE the
+      ;; to_end check so refill (which resets R13 to a page-aligned segment start)
+      ;; composes correctly.
+      (emit-push buf 'rdi)
+      (emit-mov-reg-reg buf 'rax 'r13)
+      (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; sub rax,[page_base]
+      (emit-shr-reg-imm buf 'rax +mcgc-page-shift+)        ; rax = page(R13)
+      (emit-mov-reg-reg buf 'rdi 'r13)
+      (emit-add-reg-reg buf 'rdi 'r8)
+      (emit-sub-reg-imm buf 'rdi 1)
+      (emit-bytes buf #x48 #x2B #x3C #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; sub rdi,[page_base]
+      (emit-shr-reg-imm buf 'rdi +mcgc-page-shift+)        ; rdi = page(R13+size-1)
+      (emit-cmp-reg-reg buf 'rax 'rdi)
+      (let ((no-pad (make-label)))
+        (emit-jcc buf :e no-pad)                           ; same page -> no padding
+        (emit-add-reg-imm buf 'rax 1)
+        (emit-shl-reg-imm buf 'rax +mcgc-page-shift+)
+        (emit-bytes buf #x48 #x03 #x04 #x25) (emit-u32 buf +mcgc-cfg-page-base-addr+) ; add rax,[page_base]
+        (emit-mov-reg-reg buf 'r13 'rax)                   ; R13 = next page boundary
+        (emit-label buf no-pad))
+      (emit-pop buf 'rdi)
       ;; DEST overflow?  r13+size > to_end  <=>  r13 > to_end-size  -> refill.
       ;; ONLY RAX is free here: rsi(source)/r8(size)/rdx(orig tagged source) are
       ;; live, and RCX must stay = from_end (scan_word's range bound, which

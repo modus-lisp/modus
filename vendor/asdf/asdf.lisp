@@ -1948,7 +1948,8 @@ use getenvp to return NIL in such a case."
                 (ccl:%get-cstring value))))
     #+mkcl (#.(or (find-symbol* 'getenv :si nil) (find-symbol* 'getenv :mk-ext nil)) x)
     #+sbcl (sb-ext:posix-getenv x)
-    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mkcl sbcl scl xcl)
+    #+modus nil ;; Modus: no environment access yet — return NIL (variable unset).  See README.md.
+    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mkcl modus sbcl scl xcl)
     (not-implemented-error 'getenv))
 
   (defsetf getenv (x) (val)
@@ -4603,7 +4604,8 @@ depending on whether *LISP-INTERACTION* is set, enter debugger or die"
     #+mkcl (loop :for i :from 0 :below (mkcl:argc) :collect (mkcl:argv i))
     #+sbcl sb-ext:*posix-argv*
     #+xcl system:*argv*
-    #-(or abcl allegro clasp clisp clozure cmucl ecl gcl genera lispworks mcl mkcl sbcl scl xcl)
+    #+modus nil ;; Modus: no command-line/argv access yet — return NIL (no args).  See README.md.
+    #-(or abcl allegro clasp clisp clozure cmucl ecl gcl genera lispworks mcl mkcl modus sbcl scl xcl)
     (not-implemented-error 'raw-command-line-arguments))
 
   (defun command-line-arguments (&optional (arguments (raw-command-line-arguments)))

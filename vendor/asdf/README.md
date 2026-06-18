@@ -819,3 +819,18 @@ whose body uses `go`).
 FAILFORM, prints the condition (type-name + format-control if it's a
 recognised `%condition-p`, else the raw object) after ` :: ` so the
 failure mode is visible without a separate probe.
+
+## Modus implementation-support patches (#+modus)
+
+`:modus` is in `*features*` (set in mvm/runtime-cl-macros.lisp).  uiop's per-impl
+dispatch has no Modus branch, so the following sites were given a `#+modus`
+graceful fallback (and `modus` added to their `#-(or …)` exclusion) so they
+return a sane value instead of signalling `not-implemented-error`:
+
+- `getenv` → NIL (no environment access yet; variable treated as unset).
+- `raw-command-line-arguments` → NIL (no argv access yet; no args).
+
+These unblock the image-restore-hook setup run at load time (asdf.lisp ~4848,
+`register-image-restore-hook` with default `call-now-p` t calls
+`setup-temporary-directory`/`setup-command-line-arguments`).  Replace the NILs
+with real Modus primitives if/when environment + argv access lands.

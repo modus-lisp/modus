@@ -512,6 +512,10 @@
 ;; sessions.  build-ansi-test / build-x64-modus-ansi-test set this; we
 ;; need it too so the generic image survives ANSI sweeps.
 (setf modus.mvm.x64::*x64-gc-enabled* t)
+;; Linux-x64 layout: enable the CONS-KIND bitmap (GC correctness fix for the
+;; cons-tagged-scratch symbol-truncation bug).  The kind-bitmap base delta is
+;; a boot-linux-x64 layout constant, so the master flag is Linux-only for now.
+(setf modus.mvm.x64::*mcgc-kind-bitmap-enabled* t)
 ;; Bring R14 to the heap midpoint so GC actually fires before the
 ;; from-space is exhausted.  Default leaves R14 at full heap end which
 ;; means the gc-check `cmp r12, r14; jl skip` only triggers after
@@ -549,6 +553,14 @@
 (when (let ((d (sb-ext:posix-getenv "MODUS_GC_DEBUG"))) (and d (> (length d) 0)))
   (setf modus.mvm.x64::*x64-gc-debug* t)
   (format t "~%[DEBUG] GC trampoline debug bytes enabled~%"))
+;; A/B knob: MODUS_MCGC_KINDCHECK=0 keeps the cons-kind bitmap SET side
+;; (image layout ~unchanged) but DISABLES the scan_word reject, to prove the
+;; CHECK — not incidental layout shift — restores correctness.  Default on.
+#+sbcl
+(let ((kc (sb-ext:posix-getenv "MODUS_MCGC_KINDCHECK")))
+  (when (and kc (string= kc "0"))
+    (setf modus.mvm.x64::*mcgc-kind-check-enabled* nil)
+    (format t "~%[DEBUG] MCGC cons-kind CHECK disabled (set side still on)~%")))
 
 #+sbcl
 (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))

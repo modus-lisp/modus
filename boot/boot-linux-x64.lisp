@@ -50,7 +50,9 @@
 ;; Object-start bitmap: 1 bit / 16-byte granule = data_size/16/8 bytes.
 (defconstant +mcgc-bitmap-size+ (truncate +linux-x64-heap-data-size+ (* 16 8)))
 (defconstant +mcgc-freelist-size+ (* +mcgc-page-count+ 4))  ; u32 per page index
-(defconstant +mcgc-meta-size+ #x1000000)        ; 16 MiB metadata region (ample)
+(defconstant +mcgc-meta-size+ #x1800000)        ; 24 MiB metadata region (ample;
+                                                ; holds descriptor + object-start
+                                                ; bitmap + freelist + cons-kind bitmap)
 ;; Offsets (from mmap base) of the metadata arrays, each 64-byte aligned.
 (defconstant +mcgc-meta-offset+ +linux-x64-heap-data-size+) ; metadata starts right after data
 (defconstant +mcgc-descriptor-offset+ +mcgc-meta-offset+)
@@ -58,6 +60,25 @@
   (logand (+ +mcgc-descriptor-offset+ +mcgc-descriptor-size+ 63) (lognot 63)))
 (defconstant +mcgc-freelist-offset+
   (logand (+ +mcgc-bitmap-offset+ +mcgc-bitmap-size+ 63) (lognot 63)))
+;; Cons-kind bitmap: a SECOND object-start-sized bitmap (1 bit / 16-byte
+;; granule) marking which starts are CONSES (vs objects).  scan_word
+;; cross-checks a candidate's TAG against it so a conservative scratch word
+;; aliasing a live object's BASE with the wrong tag can't be copied as the
+;; wrong type.  Its runtime base is derived as [+mcgc-cfg-bitmap-addr+] +
+;; modus.mvm.x64::+mcgc-kindbitmap-delta+ (no extra boot config word, so no
+;; boot-preamble growth / *x64-native-code-offset* bump).  The two asserts
+;; below pin that delta to the real layout.
+(defconstant +mcgc-kindbitmap-offset+
+  (logand (+ +mcgc-freelist-offset+ +mcgc-freelist-size+ 63) (lognot 63)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (assert (= (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+)
+             modus.mvm.x64::+mcgc-kindbitmap-delta+)
+          () "cons-kind bitmap delta ~X != translate-x64 +mcgc-kindbitmap-delta+ ~X"
+          (- +mcgc-kindbitmap-offset+ +mcgc-bitmap-offset+)
+          modus.mvm.x64::+mcgc-kindbitmap-delta+)
+  (assert (<= (+ +mcgc-kindbitmap-offset+ +mcgc-bitmap-size+)
+              (+ +mcgc-meta-offset+ +mcgc-meta-size+))
+          () "cons-kind bitmap overruns the metadata region"))
 ;; Full mmap = data region + metadata region.
 (defconstant +linux-x64-heap-size+ (+ +linux-x64-heap-data-size+ +mcgc-meta-size+))
 

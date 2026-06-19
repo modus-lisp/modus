@@ -241,6 +241,24 @@
 (defconstant +mcgc-cfg-page-base-addr+ #x10000E00)
 (defconstant +mcgc-cfg-bitmap-addr+    #x10000E18)
 
+(defconstant +mcgc-kindbitmap-delta+   #x804000
+  "Byte offset from the object-start bitmap base to the CONS-KIND bitmap
+   base.  Both bitmaps are +mcgc-bitmap-size+ bytes (1 bit / 16-byte
+   granule); the kind bitmap lives in the metadata region just past the
+   run-free-list.  Its base = [+mcgc-cfg-bitmap-addr+] + this delta, so no
+   extra boot config word (and hence no boot-preamble growth / no
+   *x64-native-code-offset* bump) is needed.  The exact value is ASSERTED
+   against the real metadata layout in boot-linux-x64.lisp; if the heap
+   sizing ever changes the build fails loudly there.
+
+   KIND BIT semantics: SET = the start at this granule is a CONS; CLEAR =
+   it is an OBJECT (or not a start — gated by the object-start bitmap).
+   Only cons allocations / cons survivor-copies set it; object starts leave
+   it 0.  scan_word cross-checks a candidate's TAG against this bit so a
+   conservative scratch word that aliases a live object's BASE with the
+   WRONG tag (e.g. symbol_base|1) can no longer be copied as the wrong type
+   — the bug that truncated a 40-byte symbol into a 16-byte cons.")
+
 (defun emit-mcgc-set-start-bit (buf addr-reg)
   "Set the MCGC object-start bitmap bit for the object whose RAW start
    address is in ADDR-REG (a tagged-pointer's untagged base — i.e. the
@@ -1737,6 +1755,9 @@
                    (emit-mov-mem-reg buf 'r12 +scratch-reg+ 8))))
            ;; MCGC object-start bit (R12 still = cons base).
            (emit-mcgc-set-start-bit buf 'r12)
+           ;; ...and the CONS-KIND bit (this start IS a cons) — out-of-line
+           ;; CALL (5B) to the shared setter, which reads R12.
+           (emit-mcgc-call-cons-bit buf)
            ;; Result = R12 + 1 (cons tag)
            (emit-lea buf d 'r12 1)
            ;; Advance alloc pointer
@@ -2633,6 +2654,9 @@
                 (d (dest-phys-or-scratch vd)))
            ;; MCGC object-start bit (R12 = cons base before advance).
            (emit-mcgc-set-start-bit buf 'r12)
+           ;; ...and the CONS-KIND bit (this start IS a cons) — out-of-line
+           ;; CALL (5B) to the shared setter, which reads R12.
+           (emit-mcgc-call-cons-bit buf)
            (emit-mov-reg-reg buf d 'r12)
            (emit-or-reg-imm buf d 1)      ; tag as cons
            (emit-add-reg-imm buf 'r12 16)  ; advance alloc pointer
@@ -3468,6 +3492,37 @@
       *x64-gc-enabled*
       *mcgc-collector-enabled*))
 
+(defvar *mcgc-kind-bitmap-enabled* nil
+  "MASTER gate for the CONS-KIND bitmap feature (the fix for the symbol-
+   truncation-via-cons-tagged-scratch corruption).  DEFAULT NIL.
+
+   The kind bitmap lives at [+mcgc-cfg-bitmap-addr+] + +mcgc-kindbitmap-delta+
+   (#x804000) — a LINUX-x64 layout constant (boot-linux-x64.lisp asserts it).
+   Bare-metal x64 (boot-x64.lisp, e.g. build-x64-modus-ansi-test) lays the
+   metadata out DIFFERENTLY, so that delta is wrong there.  Until the base is
+   made layout-agnostic (a config word filled by each boot, or a lazy compute
+   from page_count/freelist_base like emit-mcgc-pincount-init), the feature is
+   gated ON only by the Linux builds (build-generic / build-ansi-test).  When
+   NIL, NO kind-bitmap code is emitted (set / check / clear), so non-Linux
+   x64 and GC-less builds are byte-identical to before this change.")
+
+(defun mcgc-kind-bitmap-on-p ()
+  "Kind-bitmap SET + CLEAR side: requires the object-start bitmap AND the
+   master flag.  When this is on, cons alloc/copy sites mark cons starts and
+   point-(c) clears the kind bits with the reclaimed range."
+  (and (mcgc-bitmap-on-p) *mcgc-kind-bitmap-enabled*))
+
+(defvar *mcgc-kind-check-enabled* t
+  "Sub-gate for the scan_word CONS-KIND cross-check (the two
+   emit-mcgc-cons-kind-or-jump calls), only meaningful when
+   *mcgc-kind-bitmap-enabled*.  T (default) = reject a candidate whose
+   pointer tag disagrees with the granule's cons/object kind bit.  NIL keeps
+   the SET side + clear but skips ONLY the reject — an A/B proving the CHECK
+   (not incidental layout shift) restores correctness.")
+
+(defun mcgc-kind-check-on-p ()
+  (and (mcgc-kind-bitmap-on-p) *mcgc-kind-check-enabled*))
+
 (defvar *mcgc-pinning-enabled* nil
   "MCGC stage 3-4: the page-pinning mostly-copying collector (FFI/IO +
    Bartlett conservative-root pinning).  DEFAULT NIL — when off, the
@@ -3584,6 +3639,14 @@
 ;;; can reach it without threading it through translate-state.
 (defvar *mcgc-page-gc-label* nil)
 (defun mcgc-page-gc-label () *mcgc-page-gc-label*)
+
+;;; Label of the shared out-of-line cons-kind-bit setter (emit-mcgc-cons-bit-
+;;; subroutine).  Published here so the cons alloc sites (+op-cons+ /
+;;; +op-alloc-cons+) can CALL it instead of inlining the ~40-byte BTS
+;;; sequence at every cons (~190k sites).  Created + published only when
+;;; (mcgc-bitmap-on-p); NIL otherwise (GC-less builds stay byte-identical).
+(defvar *mcgc-cons-bit-label* nil)
+(defun mcgc-cons-bit-label () *mcgc-cons-bit-label*)
 
 (defvar *x64-native-code-offset* 0
   "Byte offset from load-address where native code begins in the final image.
@@ -3819,6 +3882,95 @@
   (emit-pop buf 'rdx)
   (emit-pop buf 'rax))
 
+(defun emit-mcgc-cons-bit-subroutine (buf label)
+  "Emit (once) the shared out-of-line CONS-KIND-bit setter.
+   Input: R12 = raw cons base (exactly what the cons alloc sites hold).
+   Sets the cons-kind bit for that granule; PRESERVES ALL registers (uses
+   RAX/RCX/RDX internally, saved/restored) and does NOT modify R12.  Cons
+   alloc sites CALL this (5 bytes) instead of inlining ~40 bytes each."
+  (emit-label buf label)
+  (emit-push buf 'rax)
+  (emit-push buf 'rcx)
+  (emit-push buf 'rdx)
+  (emit-mov-reg-reg buf 'rax 'r12)
+  (emit-bytes buf #x48 #x2B #x04 #x25)          ; sub rax, [page_base]
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rax 4)                 ; granule
+  (emit-bytes buf #x48 #x8B #x0C #x25)          ; mov rcx, [bitmap_base]
+  (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+  (emit-bytes buf #x48 #x81 #xC1)               ; add rcx, imm32 (kind delta)
+  (emit-u32 buf +mcgc-kindbitmap-delta+)
+  (emit-bytes buf #x48 #x0F #xAB #x01)          ; bts [rcx], rax
+  (emit-pop buf 'rdx)
+  (emit-pop buf 'rcx)
+  (emit-pop buf 'rax)
+  (emit-ret buf))
+
+(defun emit-mcgc-call-cons-bit (buf)
+  "At a CONS alloc site (R12 = cons base), CALL the shared cons-kind-bit
+   subroutine (emit-mcgc-cons-bit-subroutine) to mark the granule as a cons
+   start.  Out-of-line keeps the per-cons cost to one 5-byte CALL.  No-op
+   unless (mcgc-kind-bitmap-on-p) (so non-Linux-x64 / GC-less builds stay
+   byte-identical)."
+  (when (mcgc-kind-bitmap-on-p)
+    (emit-call buf (mcgc-cons-bit-label))))
+
+(defun emit-mcgc-set-cons-bit-copy (buf addr-reg)
+  "Set the CONS-KIND bitmap bit for a CONS survivor COPIED to to-space
+   (RAW dest start in ADDR-REG, e.g. R13).  Mirrors emit-mcgc-set-copy-bit
+   (saves RAX/RDX/R8, preserves RCX=from_end and the other GC live regs);
+   ADDR-REG must not be RAX/RDX/R8.  No-op unless (mcgc-kind-bitmap-on-p)."
+  (when (mcgc-kind-bitmap-on-p)
+    (when (member addr-reg '(rax rdx r8))
+      (error "emit-mcgc-set-cons-bit-copy: ADDR-REG must not be RAX/RDX/R8"))
+    (emit-push buf 'rax)
+    (emit-push buf 'rdx)
+    (emit-push buf 'r8)
+    (emit-mov-reg-reg buf 'rdx addr-reg)
+    (emit-bytes buf #x48 #x2B #x14 #x25)          ; sub rdx, [page_base]
+    (emit-u32 buf +mcgc-cfg-page-base-addr+)
+    (emit-shr-reg-imm buf 'rdx 4)                 ; granule
+    (emit-bytes buf #x4C #x8B #x04 #x25)          ; mov r8, [bitmap_base]
+    (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+    (emit-bytes buf #x49 #x81 #xC0)               ; add r8, imm32 (kind delta)
+    (emit-u32 buf +mcgc-kindbitmap-delta+)
+    (emit-bytes buf #x49 #x0F #xAB #x10)          ; bts [r8], rdx
+    (emit-pop buf 'r8)
+    (emit-pop buf 'rdx)
+    (emit-pop buf 'rax)))
+
+(defun emit-mcgc-cons-kind-or-jump (buf addr-reg want-cons reject-label)
+  "scan_word kind cross-check.  ADDR-REG (must be RAX) = a RAW from-space
+   address already validated as a recorded object start.  Reads the CONS-
+   KIND bit for that granule and rejects a TAG/KIND mismatch:
+     WANT-CONS = T   (caller saw a cons-tagged candidate): reject (jump
+                      REJECT-LABEL) if the bit is CLEAR — the start is an
+                      OBJECT, so the cons tag is a conservative false
+                      positive (the symbol_base|1 truncation bug).
+     WANT-CONS = NIL (caller saw an object-tagged candidate): reject if the
+                      bit is SET — the start is a CONS, so the object tag is
+                      a false positive (the symmetric case).
+   Uses RDX and R8 as temps (saved/restored); preserves RAX/RBX/RCX/RSI/R13.
+   Kind bitmap base = [bitmap_base] + +mcgc-kindbitmap-delta+."
+  (unless (eq addr-reg 'rax)
+    (error "emit-mcgc-cons-kind-or-jump: ADDR-REG must be RAX"))
+  (emit-push buf 'rdx)
+  (emit-push buf 'r8)
+  (emit-mov-reg-reg buf 'rdx 'rax)
+  (emit-bytes buf #x48 #x2B #x14 #x25)              ; sub rdx, [page_base]
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rdx 4)                     ; granule
+  (emit-bytes buf #x4C #x8B #x04 #x25)              ; mov r8, [bitmap_base]
+  (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+  (emit-bytes buf #x49 #x81 #xC0)                   ; add r8, imm32 (kind delta)
+  (emit-u32 buf +mcgc-kindbitmap-delta+)
+  (emit-bytes buf #x49 #x0F #xA3 #x10)              ; bt [r8], rdx  (CF = cons-kind bit)
+  (emit-pop buf 'r8)
+  (emit-pop buf 'rdx)
+  (if want-cons
+      (emit-jcc buf :nc reject-label)               ; cons tag but bit clear (object) → reject
+      (emit-jcc buf :c reject-label)))              ; object tag but bit set (cons) → reject
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -4031,6 +4183,28 @@
       (emit-shr-reg-imm buf 'rcx 7)                  ; rcx = byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax  (AL = fill 0)
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
+    ;; Clear the CONS-KIND bitmap for the SAME reclaimed range.  Without this
+    ;; a granule reused cons->object across cycles keeps a stale cons-kind
+    ;; bit, and scan_word would then REJECT the object's real obj-tagged root
+    ;; (kind=cons mismatch) → dangling.  Separately gated (Linux-x64 only)
+    ;; from the start-bitmap clear above.  dest = bitmap_base + kind_delta +
+    ;; (rbx-page_base)>>7.
+    (when (mcgc-kind-bitmap-on-p)
+      (emit-bytes buf #xFC)                          ; cld
+      (emit-mov-reg-reg buf 'rax 'rbx)               ; rax = old from_start
+      (emit-bytes buf #x48 #x2B #x04 #x25)           ; sub rax, [page_base]
+      (emit-u32 buf +mcgc-cfg-page-base-addr+)
+      (emit-shr-reg-imm buf 'rax 7)                  ; byte offset into bitmap
+      (emit-bytes buf #x48 #x8B #x3C #x25)           ; mov rdi, [bitmap_base]
+      (emit-u32 buf +mcgc-cfg-bitmap-addr+)
+      (emit-bytes buf #x48 #x81 #xC7)                ; add rdi, imm32 (kind delta)
+      (emit-u32 buf +mcgc-kindbitmap-delta+)
+      (emit-bytes buf #x48 #x01 #xC7)                ; add rdi, rax  (rdi = dest)
+      (emit-bytes buf #x48 #x8B #x0C #x25)           ; mov rcx, [space_size]
+      (emit-u32 buf #x10000050)
+      (emit-shr-reg-imm buf 'rcx 7)                  ; byte count = space_size/128
+      (emit-bytes buf #x31 #xC0)                     ; xor eax, eax
+      (emit-bytes buf #xF3 #xAA))                    ; rep stosb
 
     ;; ---- Increment GC count ----
     (emit-bytes buf #x48 #xFF #x04 #x25)          ; inc qword [0x10000060]
@@ -4078,7 +4252,13 @@
       (emit-jcc buf :ae sw-not-ptr)
       ;; MCGC: reject unless RAX is a recorded object start.
       (when (mcgc-collector-on-p)
-        (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr))
+        (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
+        ;; ...AND unless that start is actually a CONS.  A conservative
+        ;; scratch word holding object_base|1 (cons tag on an object's base)
+        ;; passes the start gate but must NOT be copied as a 16-byte cons —
+        ;; that truncates the object and strands its real obj-tagged ref.
+        (when (mcgc-kind-check-on-p)
+          (emit-mcgc-cons-kind-or-jump buf 'rax t sw-not-ptr)))
       ;; In from-space. RSI = tagged cons ptr. Call copy_object.
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)
@@ -4105,7 +4285,13 @@
       ;; (alloc sites in stage 2 + set-copy-bit on survivors), so this only
       ;; rejects false positives.
       (when (mcgc-collector-on-p)
-        (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr))
+        (emit-mcgc-validate-or-jump buf 'rax sw-not-ptr)
+        ;; ...AND unless that start is actually an OBJECT (cons-kind bit
+        ;; clear).  Symmetric to the cons path: a scratch word holding
+        ;; cons_base|9 (object tag on a cons's base) must not be copied as a
+        ;; variable-size object — it would read a cons car as a header.
+        (when (mcgc-kind-check-on-p)
+          (emit-mcgc-cons-kind-or-jump buf 'rax nil sw-not-ptr)))
       ;; In from-space. Call copy_object.
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-call buf copy-label)
@@ -4175,7 +4361,12 @@
       ;; this object as a real start.  R13 is not RAX/RDX/R8, and the helper
       ;; saves/restores RAX/RDX/R8 (RAX=new tagged ptr, RDX=forward word).
       (when (mcgc-collector-on-p)
-        (emit-mcgc-set-copy-bit buf 'r13))
+        (emit-mcgc-set-copy-bit buf 'r13)
+        ;; This survivor is a CONS — mark its kind bit so the next GC's
+        ;; scan_word accepts cons-tagged refs to it and rejects object-tagged
+        ;; ones.  (Object survivors leave the kind bit 0; the bitmap is
+        ;; cleared for the reclaimed region in point-(c) each cycle.)
+        (emit-mcgc-set-cons-bit-copy buf 'r13))
       ;; Advance free pointer
       (emit-add-reg-imm buf 'r13 16)
       (emit-jmp buf copy-done)
@@ -5412,6 +5603,10 @@
          ;; Stashed in *mcgc-page-gc-label* so gc-check / ensure-room sites can
          ;; reach it during instruction translation below.
          (page-gc-label (when (mcgc-pinning-on-p) (make-label)))
+         ;; Shared cons-kind-bit setter label (only when the kind bitmap is
+         ;; emitted).  Created here so cons alloc sites can forward-CALL it;
+         ;; body emitted after the functions.
+         (cons-bit-label (when (mcgc-kind-bitmap-on-p) (make-label)))
          ;; Handler-stack helpers (push/pop the per-fork stack at #x10000400)
          (handler-push-lbl (make-label))
          (handler-pop-lbl  (make-label))
@@ -5421,6 +5616,8 @@
                                    :key #'first :test #'string-equal))))
     ;; Publish the page-GC label so gc-check / ensure-room emit calls to it.
     (setf *mcgc-page-gc-label* page-gc-label)
+    ;; Publish the cons-kind-bit setter label so cons alloc sites CALL it.
+    (setf *mcgc-cons-bit-label* cons-bit-label)
     ;; Allocate a label for each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -5501,6 +5698,9 @@
       (when (and gc-trampoline-label gc-collect-label)
         (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
         (format t "  GC trampoline emitted, %GC-COLLECT wired~%"))
+      ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).
+      (when cons-bit-label
+        (emit-mcgc-cons-bit-subroutine buf cons-bit-label))
       ;; Emit the MCGC stage-4 page collector (only when pinning is enabled;
       ;; flag-off layout is byte-identical since this is skipped entirely).
       (when page-gc-label

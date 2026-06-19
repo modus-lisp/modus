@@ -4966,6 +4966,9 @@
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)
 (setf modus.mvm.x64::*x64-gc-enabled* t)
+;; Linux-x64 layout: enable the CONS-KIND bitmap GC correctness fix (Linux-
+;; only for now — the kind-bitmap base delta is a boot-linux-x64 constant).
+(setf modus.mvm.x64::*mcgc-kind-bitmap-enabled* t)
 ;; Set R14 to midpoint so GC fires at half heap
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
 ;; Set native code offset for funcall alignment:
@@ -5025,6 +5028,15 @@
             (setf (symbol-value sym) parsed)
             (format t "~%PARAM: ~A = ~S (from ~A)~%"
                     sym-name parsed var-name)))))))
+
+;; A/B knob (var lives in :modus.mvm.x64, so it's outside the bridge table):
+;; MODUS_MCGC_KINDCHECK=0 builds the layout-matched BASELINE — keeps the cons-
+;; kind bitmap SET side but DISABLES the scan_word reject — so a same-run
+;; comm-diff vs the default (check on) isolates the GC fix from layout shift.
+(let ((kc (sb-ext:posix-getenv "MODUS_MCGC_KINDCHECK")))
+  (when (and kc (string= kc "0"))
+    (setf modus.mvm.x64::*mcgc-kind-check-enabled* nil)
+    (format t "~%[DEBUG] MCGC cons-kind CHECK disabled (set side still on)~%")))
 
 ;; Runtime NARGS check on fixed-arity defuns.  CLHS says calling a
 ;; function with the wrong number of arguments signals PROGRAM-ERROR;

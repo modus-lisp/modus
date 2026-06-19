@@ -1033,14 +1033,25 @@
       (let ((params (cadr name-or-lambda))
             (body (cddr name-or-lambda)))
         (list '%interp-closure params body env))
-      ;; (function name) → look up compiled function
-      (let ((name (%eval-sym-name name-or-lambda)))
-        (if name
-            (let ((fn (if *symbol-function-table*
-                          (gethash name *symbol-function-table*)
-                          nil)))
-              (or fn (error "undefined function")))
-            name-or-lambda))))
+      ;; (function name): check the LOCAL function environment (FLET/LABELS)
+      ;; FIRST — CLHS §3.1.2.1.2.3 — then fall back to the global function
+      ;; table.  FLET/LABELS bind each local function into ENV (via
+      ;; %env-extend, keyed by the function-name symbol) as an %interp-closure,
+      ;; exactly like %eval-funcall resolves a local CALL.  Without this,
+      ;; #'local-fn (e.g. (position-if #'separatorp ...) inside uiop's
+      ;; SPLIT-STRING) errored "undefined function" — and in runtime EVAL that
+      ;; abort is non-local and corrupts in-flight state (e.g. an open LOAD
+      ;; stream), which was the ASDF-gauntlet form-109 wall.
+      (let ((local (%env-lookup name-or-lambda env)))
+        (if (and (car local) (%interp-closure-p (cdr local)))
+            (cdr local)
+            (let ((name (%eval-sym-name name-or-lambda)))
+              (if name
+                  (let ((fn (if *symbol-function-table*
+                                (gethash name *symbol-function-table*)
+                                nil)))
+                    (or fn (error "undefined function")))
+                  name-or-lambda))))))
 
 ;;; Block / Return-from / Loop / Return / Tagbody / Go for runtime eval.
 ;;;

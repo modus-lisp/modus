@@ -3455,7 +3455,18 @@
                                   (%env-extend (car lambda-list) c env)
                                   env)))
                          (setq result (%eval-progn clause-body new-env)))))))
-               result)))))
+               ;; ANSI (CLHS 9.1.4.1): if NO clause type matched, HANDLER-CASE
+               ;; must DECLINE — the condition keeps propagating to an outer
+               ;; handler.  The outer compiled (t (c) ...) above catches EVERY
+               ;; condition so we can inspect/dispatch it, so a no-match must
+               ;; RE-SIGNAL rather than fall through to NIL.  Returning NIL here
+               ;; silently swallowed conditions (e.g. an UNDEFINED-FUNCTION
+               ;; raised inside an inner handler-case that only names TYPE-ERROR
+               ;; never reached the outer UNDEFINED-FUNCTION clause) — the
+               ;; ASDF-gauntlet form-109 corruption: uiop wraps pathname ops in
+               ;; handler-case/ignore-errors that swallowed a deep undefined-fn,
+               ;; cascading on the leaked NIL.
+               (if found result (error c)))))))
       ;; UNWIND-PROTECT
       ((%eval-sym-eq op "UNWIND-PROTECT")
        (unwind-protect

@@ -1155,7 +1155,12 @@
    verified via CHECK-PARSES first (see that function's docstring)."
   (let ((forms nil)
         (lines nil)
-        (line-count 1))
+        (line-count 1)
+        ;; Read in :MODUS.MVM so #.<reader-eval> of MVM constants (interp.lisp's
+        ;; (#.+op-nop+ ...) case keys) resolves in the package where load-mvm
+        ;; bound them.  Symbols are name-hashed by the compiler (package-
+        ;; independent), so this doesn't change how the cl-* runtime compiles.
+        (*package* (or (find-package :modus.mvm) *package*)))
     (with-input-from-string (stream source-text)
       (loop
         (let ((pos (file-position stream)))
@@ -1184,8 +1189,14 @@
    late-cond-branch'."
   (handler-case
       (with-open-file (f path)
-        (loop for next = (read f nil :eof)
-              until (eq next :eof)))
+        ;; Read in :MODUS.MVM so #.<reader-eval> of MVM constants (e.g.
+        ;; interp.lisp's (#.+op-nop+ ...) case keys) resolves the symbol in
+        ;; the package where load-mvm bound it, not the build script's
+        ;; CL-USER.  Forms are discarded (this only checks parens), so the
+        ;; package choice is harmless for the non-#. first-party files.
+        (let ((*package* (or (find-package :modus.mvm) *package*)))
+          (loop for next = (read f nil :eof)
+                until (eq next :eof))))
     (error (e)
       (error "check-parses: ~A failed to parse: ~A" path e))))
 

@@ -1,7 +1,11 @@
 # Plan: One Value Representation Everywhere (and it is Common Lisp)
 
-Status: DRAFT / north-star (2026-06-20). Large; staged. Nothing here is started
-beyond the Stage 1–3 self-hosting proof (see "Already done").
+Status: IN PROGRESS (2026-06-20). WS0 decided ((A) raw words). WS1 well underway:
+val↔word boundary (committed), runtime-call bridge, cons/list alignment, and the
+**GC-safe register file** are done and validated (incl. a list-build-under-early-GC
+stress test). eval2 now runs a real CL subset (arithmetic, if/let/progn, recursion,
+cons/list structure, native runtime calls with fixnum+list args) **GC-safely**.
+Remaining WS1: general objects (strings/vectors). Then WS2/WS3/WS4.
 
 ## Thesis
 

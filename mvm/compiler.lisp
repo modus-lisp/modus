@@ -692,8 +692,19 @@
   (push (list :label label-id) *ir-buffer*))
 
 (defun get-ir-instructions ()
-  "Return the IR instructions in forward order"
-  (nreverse *ir-buffer*))
+  "Return the IR instructions in forward order.
+   Clears *ir-buffer* after extracting: nreverse is DESTRUCTIVE and leaves
+   the original head cons as a dangling 1-element remnant (the trailing RET).
+   On the host that remnant is harmless because each function rebinds
+   *ir-buffer* fresh via let*, but when the compiler runs IN-IMAGE (self-
+   hosted eval) that per-function let* binding does not always isolate the
+   global, so the remnant leaks a spurious leading RET into the NEXT compiled
+   function — whose entry point then RETs immediately.  Explicitly nil'ing the
+   buffer makes every extraction leave a clean slate.  (Host output is
+   unchanged: the returned IR is identical and the nil is overwritten by the
+   next function's let* binding.)"
+  (prog1 (nreverse *ir-buffer*)
+    (setf *ir-buffer* nil)))
 
 ;;; ============================================================
 ;;; Environment Operations

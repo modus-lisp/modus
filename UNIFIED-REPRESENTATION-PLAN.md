@@ -1,11 +1,14 @@
 # Plan: One Value Representation Everywhere (and it is Common Lisp)
 
-Status: IN PROGRESS (2026-06-20). WS0 decided ((A) raw words). WS1 well underway:
-val↔word boundary (committed), runtime-call bridge, cons/list alignment, and the
-**GC-safe register file** are done and validated (incl. a list-build-under-early-GC
-stress test). eval2 now runs a real CL subset (arithmetic, if/let/progn, recursion,
-cons/list structure, native runtime calls with fixnum+list args) **GC-safely**.
-Remaining WS1: general objects (strings/vectors). Then WS2/WS3/WS4.
+Status: IN PROGRESS (2026-06-20). WS0 decided ((A) raw words). **WS1 essentially
+complete**: val↔word boundary (committed), runtime-call bridge, cons/list alignment,
+the **GC-safe register file** (validated by a list-build-under-early-GC stress test),
+and strings/vectors opcodes — all done. eval2 runs a real CL subset (arithmetic,
+if/let/progn, recursion, cons/list structure, strings/vectors, native runtime calls
+with fixnum+list args) **GC-safely**. Two scoped boundary follow-ups remain: (a) a
+pre-existing *compiler* codegen edge (variable index after a literal-array build),
+and (b) cross-bridge NATIVE-layout objects (strings/vectors/floats to native fns) —
+a uniform "native object layout in the interpreter" piece. Then WS2/WS3/WS4.
 
 ## Thesis
 

@@ -3636,6 +3636,17 @@
       ;; compile-stringp.  They emit the raw opcodes directly without testing
       ;; for fp/displaced/adjustable wrappers.  Use these only when the arg
       ;; is known not to be a wrapper.
+      ;; Value<->word reinterpret (unified-representation WS1: the value/raw-word
+      ;; boundary for an aligned interpreter / JIT).  A value V occupies native
+      ;; word W; the integer of magnitude W has native representation W<<1, so
+      ;; %val->word = SHL 1 and %word->val = SHR 1.  Runtime is tag-driven, so
+      ;; the shifted bits carry their own tag (fixnum/cons/object) — this is a
+      ;; pure reinterpret, no type guard.  (eval2 already does %word->val for
+      ;; fixnums as (ash r -1); these generalize it to pointers.)
+      ((= op-name (compute-name-hash "%VAL->WORD"))
+       (compile-val-to-word (cdr form) env dest))
+      ((= op-name (compute-name-hash "%WORD->VAL"))
+       (compile-word-to-val (cdr form) env dest))
       ((= op-name (compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
       ((= op-name (compute-name-hash "%PRIM-ARRAYP"))
@@ -10226,6 +10237,20 @@
   "Compile (sap-address sap) — extract raw address from SAP."
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :sap-addr dest +vreg-v0+))
+
+(defun compile-val-to-word (args env dest)
+  "Compile (%val->word v) — reinterpret value V's native word as an integer.
+   V occupies native word W; the integer of magnitude W has native form W<<1.
+   So SHL by 1.  No type guard: works for fixnum/cons/object alike."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :shl dest +vreg-v0+ +fixnum-shift+))
+
+(defun compile-word-to-val (args env dest)
+  "Compile (%word->val w) — reinterpret integer W's magnitude as a value's
+   native word (inverse of %val->word): SHR by 1.  Runtime is tag-driven, so the
+   shifted bits carry their own tag and become the right kind of value."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :shr dest +vreg-v0+ +fixnum-shift+))
 
 ;; --- Serial Console ---
 

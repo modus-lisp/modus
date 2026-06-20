@@ -1972,28 +1972,31 @@
           '(%signal-program-error))))
 
   ;; PUSH — (push item place) → (setq place (cons item place))
+  ;; PUSH/POP/DECF — must expand via SETF, not SETQ: SETQ only assigns to a
+  ;; symbol, so on a non-symbol place (e.g. (mvm-stack state)) the old SETQ
+  ;; expansion silently no-op'd.  CLHS defines push/pop/incf/decf in terms of
+  ;; SETF.  (For a symbol place SETF lowers to SETQ — identical output.)
   (mvm-define-macro "PUSH"
     (lambda (form)
       (let ((item (cadr form))
             (place (caddr form)))
-        `(setq ,place (cons ,item ,place)))))
+        `(setf ,place (cons ,item ,place)))))
 
-  ;; POP — (pop place) → (prog1 (car place) (setq place (cdr place)))
-  ;; Since we don't have prog1, use let
+  ;; POP — (pop place) → (let ((tmp (car place))) (setf place (cdr place)) tmp)
   (mvm-define-macro "POP"
     (lambda (form)
       (let ((place (cadr form))
             (tmp (gensym "POP")))
         `(let ((,tmp (car ,place)))
-           (setq ,place (cdr ,place))
+           (setf ,place (cdr ,place))
            ,tmp))))
 
-  ;; DECF — (decf place [delta]) → (setq place (- place delta))
+  ;; DECF — (decf place [delta]) → (setf place (- place delta))
   (mvm-define-macro "DECF"
     (lambda (form)
       (let ((place (cadr form))
             (delta (or (caddr form) 1)))
-        `(setq ,place (- ,place ,delta)))))
+        `(setf ,place (- ,place ,delta)))))
 
   ;; PROG1 — evaluate forms, return first
   (mvm-define-macro "PROG1"

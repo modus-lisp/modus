@@ -12532,11 +12532,16 @@
                ((name-eq opt-name "CONC-NAME")
                 (setf conc-name-specified t)
                 (setf conc-name (if (cadr opt)
-                                    ;; cadr opt may be a symbol or a string
+                                    ;; cadr opt may be a symbol or a string.
+                                    ;; CLHS: an explicitly-supplied conc-name is
+                                    ;; a string designator used VERBATIM as the
+                                    ;; prefix — no hyphen is appended (the hyphen
+                                    ;; is only part of the DEFAULT, name+"-").
+                                    ;; (:conc-name foo-) → prefix "FOO-".
                                     (let ((cn (cadr opt)))
                                       (if (stringp cn)
                                           cn
-                                          (format nil "~A-" (symbol-name cn))))
+                                          (symbol-name cn)))
                                     nil)))  ; (:conc-name nil) → no prefix
                ((name-eq opt-name "INCLUDE")
                 (setf include-parent (cadr opt)))

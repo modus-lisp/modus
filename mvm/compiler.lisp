@@ -208,6 +208,15 @@
 (defvar *label-counter* 0
   "Monotonic counter for generating unique labels")
 
+(defvar *mvm-emit-halves* nil
+  "When true, integer/bignum literals emit their tagged-word LI immediate as
+   two 32-bit halves (:li-halves) instead of `(:li (ash value 1))`.  Bound to T
+   only by the in-image eval2 path: there `(ash value 1)` overflows the 62-bit
+   fixnum range for |value| >= 2^61 and triggers lossy in-image bignum-word
+   arithmetic.  On the host (native builds) it stays NIL, so compile-integer
+   emits the exact same :li IR as before — native translators see no new opcode
+   and output is byte-identical.")
+
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")
 
@@ -791,6 +800,46 @@
   (let ((hi (sb-kernel:double-float-high-bits f))
         (lo (sb-kernel:double-float-low-bits f)))
     (logior (ash hi 32) (logand lo #xFFFFFFFF))))
+
+;; Read the high/low 32 IEEE bits of a float SEPARATELY — never forming the
+;; full 64-bit integer.  In-image, a float ≥ 2.0 has hi ≥ #x40000000, so the
+;; combined `(ash hi 32)` lands ≥ 2^62 and Modus's bignum-range ASH is lossy
+;; (it drops low-order bits) — silently corrupting the literal's bits at
+;; compile time.  Splitting into two 32-bit halves keeps both ≤ #xFFFFFFFF,
+;; well inside fixnum range.  Host versions use sb-kernel; the in-image
+;; overrides (build-generic.lisp *stage2-float-override*) read the boxed
+;; float's slots directly via %prim-aref.
+(defun ieee-float-hi32 (f)
+  (logand (sb-kernel:double-float-high-bits (float f 1.0d0)) #xFFFFFFFF))
+(defun ieee-float-lo32 (f)
+  (logand (sb-kernel:double-float-low-bits (float f 1.0d0)) #xFFFFFFFF))
+
+;; Bignum-literal decomposition helpers — split so the in-image build can
+;; override them (build-generic.lisp *stage2-bignum-override*) to READ the
+;; already-built bignum object's slots directly instead of recomputing.  The
+;; recompute path uses `(logand value mask62)`, but the compiled `logand`
+;; primop is a raw machine AND of the two tagged WORDS; for a bignum operand
+;; (a heap pointer) that yields garbage.  `ash value -62` is similarly
+;; unreliable into bignum range.  On the host these primitives work on real
+;; bignums, so the host versions keep computing.  See ieee-float-hi32 for the
+;; sibling float case.
+(defun %lit-bignum-big-p (value)
+  "T if VALUE needs the limbs-array (big) bignum shape rather than 2-slot."
+  (> (integer-length (abs value)) 124))
+(defun %lit-bn-lo (value)
+  "Low 62-bit limb (slot 0) of a small bignum VALUE."
+  (logand value 4611686018427387903))
+(defun %lit-bn-hi (value)
+  "High signed part (slot 1) of a small bignum VALUE."
+  (ash value -62))
+(defun %lit-bb-sign (value) (if (< value 0) -1 1))
+(defun %lit-bb-nlimbs (value)
+  (let ((mag (abs value)) (n 0))
+    (loop (when (= mag 0) (return n))
+          (setf mag (ash mag -62)) (incf n))))
+(defun %lit-bb-limb (value k)
+  "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
+  (logand (ash (abs value) (* -62 k)) 4611686018427387903))
 
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
@@ -2688,6 +2737,27 @@
   "Load T into DEST"
   (emit-ir :li dest +t-value+))
 
+(defun emit-li-tagged (dest value)
+  "Emit a load of VALUE's tagged word (value<<1) into DEST.
+
+   Native/host path (*mvm-emit-halves* NIL): exactly `(:li dest (ash value 1))`
+   as before — byte-identical, no new opcode for the translators.
+
+   In-image eval2 path (*mvm-emit-halves* T): emit :li-halves with the two
+   32-bit halves of the tagged word computed by FIXNUM-SAFE ops, so we never
+   form (value<<1) as a single in-image integer (it overflows the 62-bit fixnum
+   range for |value| >= 2^61, where bignum-word ASH/LOGAND are lossy).
+     lo32 = (value's low 31 bits) << 1   (word bit 0 is always 0)
+     hi32 = (value >> 31) masked to 32 bits   (arithmetic, sign-extends)
+   Both stay <= #xFFFFFFFF and the intermediate (ash value -31) is in
+   [-2^31, 2^31-1] — all safely in fixnum range."
+  (if *mvm-emit-halves*
+      (emit-ir :li-halves dest
+               (* (logand value #x7FFFFFFF) 2)
+               (logand (ash value -31) #xFFFFFFFF))
+      (let ((tagged (ash value +fixnum-shift+)))
+        (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged)))))
+
 (defun compile-integer (value dest)
   "Load an integer literal into DEST.
 
@@ -2705,60 +2775,55 @@
    when the runtime arithmetic was correct."
   (cond
     ((and (>= value -4611686018427387904) (<= value 4611686018427387903))
-     ;; Fixnum range.
-     (let ((tagged (ash value +fixnum-shift+)))
-       (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))
-    ((<= (integer-length (abs value)) 124)
+     ;; Fixnum range.  emit-li-tagged keeps the host path as `(:li (ash value 1))`
+     ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the
+     ;; top/bottom bit of the fixnum range — e.g. most-positive/negative-fixnum).
+     (emit-li-tagged dest value))
+    ((not (%lit-bignum-big-p value))
      ;; Small bignum.  value = lo + hi * 2^62, where lo ∈ [0, 2^62-1]
      ;; and hi is signed in [-2^61, 2^61-1].  For negative values
-     ;; use two's-complement.
-     (let* ((mask62 4611686018427387903)
-            (lo (logand value mask62))
-            (hi (ash value -62)))
+     ;; use two's-complement.  lo/hi read via helpers so the in-image
+     ;; build reads the already-built bignum's slots (the raw `logand`
+     ;; primop garbles bignum-pointer operands).
+     (let* ((lo (%lit-bn-lo value))
+            (hi (%lit-bn-hi value)))
        (emit-ir :alloc-obj dest 2 +subtag-bignum+)
        (let ((temp (alloc-temp-reg)))
-         (emit-ir :li temp (ash lo +fixnum-shift+))
+         (emit-li-tagged temp lo)        ; lo ∈ [0, 2^62-1] — overflows in-image
          (emit-ir :obj-set dest 0 temp)
-         (emit-ir :li temp (ash hi +fixnum-shift+))
+         (emit-li-tagged temp hi)
          (emit-ir :obj-set dest 1 temp)
          (free-temp-reg))))
     (t
      ;; Big bignum.  Split into 62-bit limbs, build [sign, nlimbs,
      ;; limb0, ..., limbN-1] array, wrap in 2-slot bignum with
-     ;; sentinel -1 in slot 0.
-     (let* ((sign (if (< value 0) -1 1))
-            (mag (abs value))
-            (mask62 4611686018427387903)
-            (limbs nil)
-            (tmp mag))
-       (loop (when (= tmp 0) (return nil))
-         (push (logand tmp mask62) limbs)
-         (setf tmp (ash tmp -62)))
-       (setf limbs (nreverse limbs))   ; LSB-first
-       (let* ((nlimbs (length limbs))
-              (limbs-arr (alloc-temp-reg))
-              (temp (alloc-temp-reg)))
-         ;; Allocate limbs-array with (2 + nlimbs) slots, subtag #x32.
-         (emit-ir :alloc-obj limbs-arr (+ 2 nlimbs) +subtag-array+)
-         ;; Slot 0 = sign.
-         (emit-ir :li temp (ash sign +fixnum-shift+))
-         (emit-ir :obj-set limbs-arr 0 temp)
-         ;; Slot 1 = nlimbs.
-         (emit-ir :li temp (ash nlimbs +fixnum-shift+))
-         (emit-ir :obj-set limbs-arr 1 temp)
-         ;; Slots 2..(2+nlimbs-1) = limbs.
-         (let ((i 0))
-           (dolist (limb limbs)
-             (emit-ir :li temp (ash limb +fixnum-shift+))
-             (emit-ir :obj-set limbs-arr (+ 2 i) temp)
-             (incf i)))
-         ;; Allocate the 2-slot bignum wrapper.
-         (emit-ir :alloc-obj dest 2 +subtag-bignum+)
-         (emit-ir :li temp (ash -1 +fixnum-shift+))
-         (emit-ir :obj-set dest 0 temp)
-         (emit-ir :obj-set dest 1 limbs-arr)
-         (free-temp-reg)
-         (free-temp-reg))))))
+     ;; sentinel -1 in slot 0.  sign/nlimbs/limb via helpers so the
+     ;; in-image build reads the already-built big-bignum's data array.
+     (let* ((sign (%lit-bb-sign value))
+            (nlimbs (%lit-bb-nlimbs value))
+            (limbs-arr (alloc-temp-reg))
+            (temp (alloc-temp-reg)))
+       ;; Allocate limbs-array with (2 + nlimbs) slots, subtag #x32.
+       (emit-ir :alloc-obj limbs-arr (+ 2 nlimbs) +subtag-array+)
+       ;; Slot 0 = sign.
+       (emit-li-tagged temp sign)
+       (emit-ir :obj-set limbs-arr 0 temp)
+       ;; Slot 1 = nlimbs.
+       (emit-li-tagged temp nlimbs)
+       (emit-ir :obj-set limbs-arr 1 temp)
+       ;; Slots 2..(2+nlimbs-1) = limbs (LSB-first).
+       (let ((i 0))
+         (loop (when (>= i nlimbs) (return nil))
+           (emit-li-tagged temp (%lit-bb-limb value i))  ; limb ∈ [0, 2^62-1]
+           (emit-ir :obj-set limbs-arr (+ 2 i) temp)
+           (incf i)))
+       ;; Allocate the 2-slot bignum wrapper.
+       (emit-ir :alloc-obj dest 2 +subtag-bignum+)
+       (emit-li-tagged temp -1)
+       (emit-ir :obj-set dest 0 temp)
+       (emit-ir :obj-set dest 1 limbs-arr)
+       (free-temp-reg)
+       (free-temp-reg)))))
 
 (defun compile-character (ch dest)
   "Load a character literal into DEST"
@@ -4059,9 +4124,10 @@
        (free-temp-reg)))
     ;; Float literal: 2-slot boxed float = high32 + low32 IEEE bits.
     ((floatp value)
-     (let* ((bits (ieee-float-bits (float value 1.0d0)))
-            (hi (ash bits -32))
-            (lo (logand bits #xFFFFFFFF)))
+     ;; Read hi/lo as SEPARATE 32-bit halves — never combine into a 64-bit
+     ;; integer (lossy in-image for floats ≥ 2.0; see ieee-float-hi32).
+     (let* ((hi (ieee-float-hi32 value))
+            (lo (ieee-float-lo32 value)))
        (emit-ir :alloc-obj dest 2 +subtag-float+)
        (let ((temp (alloc-temp-reg)))
          ;; Slot 0 = high 32 bits (tagged fixnum, always fits)
@@ -10248,10 +10314,14 @@
 
 (defun compile-word-to-val (args env dest)
   "Compile (%word->val w) — reinterpret integer W's magnitude as a value's
-   native word (inverse of %val->word): SHR by 1.  Runtime is tag-driven, so the
-   shifted bits carry their own tag and become the right kind of value."
+   native word (inverse of %val->word): SAR by 1.  Must be ARITHMETIC (sign-
+   extending): %val->word of a NEGATIVE fixnum value sets the word's sign bit,
+   and a logical :shr would drop it — turning every negative word back into a
+   bogus positive (-5 read back as 2^62-5).  All non-fixnum values (cons/object
+   pointers, heap addresses < 2^48) have clear top bits, so :sar matches the old
+   :shr for them; only negative fixnums change, and they were the broken case."
   (compile-form (car args) env +vreg-v0+)
-  (emit-ir :shr dest +vreg-v0+ +fixnum-shift+))
+  (emit-ir :sar dest +vreg-v0+ +fixnum-shift+))
 
 ;; --- Serial Console ---
 
@@ -11886,6 +11956,7 @@
 
       ;; Load immediate: 1 opcode + 1 reg + 8 imm64 = 10 bytes
       (:li    10)
+      (:li-halves 10)
       (:li-const 10)
       ;; li-func now emits FN-ADDR (1 opcode + 1 reg + 4 imm32 = 6 bytes)
       (:li-func 6)
@@ -12157,6 +12228,11 @@
           ;; ---- Load Immediate ----
           (:li
            (mvm-li buf (second insn) (third insn)))
+          (:li-halves
+           ;; Load a 64-bit immediate supplied as two 32-bit halves (lo, hi).
+           ;; Same wire bytes as :li for the combined word; used by the integer/
+           ;; bignum literal path to avoid forming value<<1 as one in-image int.
+           (mvm-li-halves buf (second insn) (third insn) (fourth insn)))
           (:li-const
            ;; Load tagged address of constant-pool[idx].  The translator
            ;; emits a placeholder absolute load; image-assembly patches it

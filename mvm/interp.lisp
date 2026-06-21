@@ -18,8 +18,14 @@
 (defconstant +tag-fixnum+ 0)
 (defconstant +tag-cons+   1)
 (defconstant +tag-object+ 9)
-(defconstant +mvm-nil+ 0)
-(defconstant +mvm-t+   2)  ; tagged fixnum 1
+;; NIL/T immediates must match the COMPILER's representation (compiler.lisp
+;; +nil-value+ #xDEAD0001 / +t-value+ #xDEAD1009), not the obsolete 0/2 fixnum
+;; model.  Truthiness is "not NIL": every value except #xDEAD0001 (and host
+;; Lisp NIL) is true.  Comparison opcodes in the compiler build their T as
+;; (nil | 8) = #xDEAD0009 — also non-NIL, so truthy.  mvm-nil-p must therefore
+;; key on #xDEAD0001 exactly.
+(defconstant +mvm-nil+ #xDEAD0001)
+(defconstant +mvm-t+   #xDEAD1009)
 
 (declaim (inline tag-fixnum untag-fixnum mvm-nil-p mvm-boolean))
 (defun tag-fixnum (n) (ash n 1))
@@ -27,7 +33,36 @@
 (defun mvm-nil-p (val) (or (null val) (eql val +mvm-nil+)))
 (defun mvm-boolean (b) (if b +mvm-t+ +mvm-nil+))
 
+;; GC-safe register access (unified representation, WS1).  The interpreter
+;; operates on RAW WORDS, but storing a raw pointer-word as a Lisp integer hides
+;; it from the moving collector (it looks like a fixnum) -> stale after a
+;; collection.  Fix: the regs vector slots hold REAL VALUES (so GC traces/updates
+;; pointers normally, no collector changes), and these accessors convert with the
+;; single-shift reinterprets: reg-get returns the slot value's raw word,
+;; reg-set stores a raw word as the value it denotes.  Round-trips for fixnum,
+;; cons, object, nil, t.  (Transient fast-path MASK words become bogus pointer
+;; values briefly, but are consumed before the next allocation, so no GC scans
+;; them; the conservative kind-bitmap gate also rejects such non-object-starts.)
+(declaim (inline reg-get reg-set))
+(defun reg-get (regs v) (%val->word (svref regs v)))
+(defun reg-set (regs v w) (setf (svref regs v) (%word->val w)))
+
 ;;; Interpreter state
+
+(defparameter *mvm-trace* nil)  ; when non-nil, mvm-interpret prints each opcode
+
+;; Runtime-call bridge (unified-representation WS1): CALL targets at or above this
+;; base are not in-module bytecode offsets but indices into the interpreter's
+;; RUNTIME-TABLE (synthetic-offset -> native function name).  op-call funcalls the
+;; real native function with %word->val'd args — the no-marshalling path proven in
+;; WS1.0.  Base is far above any real eval2 module size and fits in a u32.
+(defconstant +mvm-runtime-call-base+ #x40000000)
+
+(defun %mvm-resolve-runtime-fn (name)
+  "Resolve a native function by NAME (string) via the symbol-function table."
+  (and (boundp '*symbol-function-table*)
+       *symbol-function-table*
+       (gethash name *symbol-function-table*)))
 
 (defconstant +num-vregs+ 23)
 
@@ -41,7 +76,13 @@
   (call-stack nil :type list)
   (percpu  (make-hash-table :test 'eql))
   (interrupts-enabled t :type boolean)
-  (io-ports (make-hash-table :test 'eql)))
+  (io-ports (make-hash-table :test 'eql))
+  ;; Calling-convention registers (native: RAX=nargs, a closure-env reg, and
+  ;; the MV-COUNT slot).  Modeled as state fields so set/get-nargs, set/get-cenv,
+  ;; and set-mv-count have somewhere to live.
+  (nargs    0)
+  (cenv     nil)
+  (mv-count 1))
 
 (declaim (inline vref vset))
 (defun vref (state reg) (svref (mvm-regs state) reg))
@@ -65,19 +106,31 @@
   (dotimes (i (ash 1 width))
     (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))
 
-;;; Object representation (vector: slot 0 = header, slots 1..N = data)
-
-(defun make-mvm-object (size subtag)
-  (let ((obj (make-array (+ 1 size) :initial-element 0)))
-    (setf (svref obj 0) (logior (ash subtag 8) +tag-object+))
-    obj))
-
-(defun mvm-obj-tag-val (obj) (logand (svref obj 0) #xF))
-(defun mvm-obj-subtag-val (obj) (logand (ash (svref obj 0) -8) #xFF))
+;;; Object representation — REAL native CL objects (no simulation).  The
+;;; interpreter is itself native code, so it allocates native objects and
+;;; reads/writes their slots with the native slot primitives %prim-aref /
+;;; %prim-aset / %prim-array-length (these compile to obj-ref/aref/etc. that run
+;;; NATIVELY, not back through this interpreter).  So strings, vectors, floats,
+;;; ratios, bignums are all REAL CL objects that cross the native bridge.
+(defun %alloc-native (size subtag)
+  "Allocate a native object of SIZE slots with SUBTAG (the alloc-obj/-array/
+   -string opcodes route here).  Fixed-size numeric boxes use their typed
+   allocators; arrays/strings take the runtime size."
+  (cond ((= subtag #x31) (make-string size :initial-element #\Space)) ; string
+        ((= subtag #x32) (make-array size :initial-element nil))      ; simple-vector
+        ((= subtag #x60) (%make-float2))   ; 2-slot boxed float
+        ((= subtag #x33) (%make-ratio))    ; 2-slot ratio (num . den)
+        ((= subtag #x30) (%make-bignum))   ; 2-slot bignum header (limbs in a slot)
+        (t (make-array size :initial-element nil))))
+;; Slot ref/set/len via the NATIVE primitives.  %prim-aref returns the raw slot
+;; (char CODE for a string), %prim-aset stores it; uniform across object types.
+(defun %obj-elt-ref (obj idx) (%prim-aref obj idx))
+(defun %obj-elt-set (obj idx val) (%prim-aset obj idx val))
+(defun %obj-elt-len (obj) (%prim-array-length obj))
 
 ;;; Bytecode fetch helpers
 
-(declaim (inline fetch-byte fetch-reg fetch-u16 fetch-s32 fetch-u32 fetch-u64))
+(declaim (inline fetch-byte fetch-reg fetch-u16 fetch-s32 fetch-u32 fetch-u64 fetch-li-value))
 
 (defun fetch-byte (bc pc)
   (values (aref bc pc) (1+ pc)))
@@ -100,11 +153,49 @@
           (+ pc 4)))
 
 (defun fetch-u64 (bc pc)
-  (let ((lo (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
-                    (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24)))
-        (hi (logior (aref bc (+ pc 4)) (ash (aref bc (+ pc 5)) 8)
-                    (ash (aref bc (+ pc 6)) 16) (ash (aref bc (+ pc 7)) 24))))
-    (values (logior lo (ash hi 32)) (+ pc 8))))
+  ;; Reconstruct the 8-byte little-endian immediate as a SIGNED 64-bit value
+  ;; held as a native (possibly negative) fixnum.  The old form
+  ;; `(logior lo (ash hi 32))` formed an UNSIGNED value: for any immediate with
+  ;; the high word's bit 31 set (every negative tagged literal — word's hi32 =
+  ;; #xFFFFFFFF — and large positives), `(ash hi 32)` lands >= 2^62 where
+  ;; Modus's bignum-range ASH is lossy, so the immediate read back as garbage
+  ;; (negative fixnum literals like -5 became 2^62-ish).  Interpreting hi as
+  ;; signed and combining with `+`/`*` keeps the common case (hi = 0 or
+  ;; #xFFFFFFFF, i.e. |value| < 2^31) entirely in fixnum range and yields the
+  ;; correct signed word, which `%word->val` (a single arithmetic SHR) then
+  ;; turns back into the right value.
+  (let* ((lo (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
+                     (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24)))
+         (hi (logior (aref bc (+ pc 4)) (ash (aref bc (+ pc 5)) 8)
+                     (ash (aref bc (+ pc 6)) 16) (ash (aref bc (+ pc 7)) 24)))
+         (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi)))
+    (values (+ lo (* hi-signed 4294967296)) (+ pc 8))))
+
+(defun fetch-li-value (bc pc)
+  "Read an 8-byte little-endian LI immediate (a tagged WORD W = value<<1) and
+   return %word->val(W) = floor(W/2) DIRECTLY — without ever forming W itself.
+   W can reach +/-2^63 for a boundary fixnum (|value| >= 2^61); forming it would
+   overflow the in-image 62-bit fixnum range, and fetch-u64's `(* hi-signed
+   2^32)` would then hit the broken in-image bignum MULTIPLY.  Computing the
+   value as `(ash lo -1) + hi_signed*2^31` keeps every term in fixnum range:
+   hi_signed in [-2^31, 2^31-1] so hi_signed*2^31 in [-2^62, 2^62-2^31], and
+   floor(W/2) = floor(lo/2) + hi_signed*2^31.  Matches %word->val(W) (arith SHR)
+   exactly for the full fixnum-value range; for small words (chars, pointers,
+   normal fixnums) it is identical to the old fetch-u64 + %word->val path."
+  (let* ((lo (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
+                     (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24)))
+         (hi (logior (aref bc (+ pc 4)) (ash (aref bc (+ pc 5)) 8)
+                     (ash (aref bc (+ pc 6)) 16) (ash (aref bc (+ pc 7)) 24)))
+         (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi)))
+    ;; hi-signed*2^31 stays in fixnum range EXCEPT when hi-signed = -2^31
+    ;; (the only 32-bit value of magnitude 2^31): then the product is -2^62 and
+    ;; computing it in-image overflows/SEGVs (2^62 isn't a fixnum).  That case is
+    ;; exactly most-negative-fixnum territory; use the baked min-fixnum literal
+    ;; (compiled correctly at host build time) plus the low half instead.
+    (values (if (= hi-signed -2147483648)
+                (+ (ash lo -1) -4611686018427387904)
+                (+ (ash lo -1) (* hi-signed 2147483648)))
+            (+ pc 8))))
 
 ;;; Conditions
 
@@ -125,20 +216,40 @@
 ;;; The Main Interpreter
 ;;; ============================================================
 
-(defun mvm-interpret (bytecode &key (entry-point 0) function-table)
+(defun mvm-interpret (bytecode &key (entry-point 0) function-table runtime-table
+                                    (return-raw t))
   "Execute MVM bytecode starting at ENTRY-POINT.
-   Returns the value in VR when RET or HALT is reached."
+   When RET or HALT is reached, return VR.  RETURN-RAW (default T, for callers
+   that re-tag the result themselves via `(ash result -1)`) returns the RAW WORD
+   %val->word(VR); pass RETURN-RAW NIL to get VR's VALUE directly — needed for
+   boundary fixnums (|value| >= 2^61) whose word exceeds the in-image 62-bit
+   fixnum range, so %val->word (and the caller's later %word->val) would overflow.
+   RUNTIME-TABLE (optional, synthetic-offset -> native fn name string) routes
+   CALLs to functions outside the bytecode module to a direct native funcall."
   (let* ((state (make-mvm-state))
          (bc bytecode) (pc entry-point) (len (length bc))
          (ftab (or function-table (vector)))
          (regs (mvm-regs state)))
     (declare (type fixnum pc len) (type simple-vector regs) (ignorable ftab))
-    (setf (svref regs +vreg-vn+) nil)
-    (setf (svref regs +vreg-vpc+) pc)
+    (reg-set regs +vreg-vn+ +mvm-nil+)  ; VN holds the canonical NIL immediate
+    (reg-set regs +vreg-vpc+ pc)
 
     (loop
+      ;; Re-load regs from the state each iteration: the compiled in-image
+      ;; interpreter may cache `regs` in a register, but a GC during
+      ;; interpretation copies the regs array and only updates the live root
+      ;; (the state's slot) — a cached local would go stale and svref/setf
+      ;; would read/write the dead from-space copy.  Reading mvm-regs fresh
+      ;; each step always sees the current copy.  (Host SBCL is unaffected;
+      ;; this is belt-and-suspenders there.)
+      (setf regs (mvm-regs state))
       (when (or (mvm-halted state) (>= pc len))
-        (return (svref regs +vreg-vr+)))
+        (return (if return-raw
+                    (reg-get regs +vreg-vr+)        ; raw word (caller re-tags)
+                    (svref regs +vreg-vr+))))       ; value directly (boundary-safe)
+      (when *mvm-trace*
+        (format t "  TRACE pc=~D op=~D flags=~S vr=~S~%"
+                pc (aref bc pc) (mvm-flags state) (reg-get regs +vreg-vr+)))
       (let ((opcode (aref bc pc)))
         (setf pc (1+ pc))
         (case opcode
@@ -147,36 +258,67 @@
           (#.+op-nop+ nil)
           (#.+op-break+ (break "MVM BREAK at PC ~D" (1- pc)))
           (#.+op-trap+
-           ;; TRAP code:u16 — function prologue sentinel emitted by the compiler.
-           ;; The low 8 bits encode param-count; the high 8 bits encode local-count.
-           ;; Allocate a frame object in VFP with enough slots for params + locals.
+           ;; TRAP code:u16 multiplexes several compiler pseudo-ops:
+           ;;   code  < #x100  : FRAME-ENTER  (code = param count) — allocate frame
+           ;;   #x100..#x1FF   : FRAME-ALLOC  (extend stack for locals)
+           ;;   #x200..#x2FF   : FRAME-FREE   (pop locals)
+           ;;   #x0310         : RDTSC
+           ;; The interpreter's frame is a single over-allocated array set up at
+           ;; FRAME-ENTER, so FRAME-ALLOC/FRAME-FREE are no-ops.  (The earlier bug:
+           ;; treating FRAME-ALLOC as FRAME-ENTER re-allocated a fresh frame mid-
+           ;; function, wiping VFP and any spilled locals -> stack-load read 0.)
            (multiple-value-bind (code npc) (fetch-u16 bc pc)
              (cond
                ((= code #x0310)
-                ;; RDTSC: Read timestamp counter — return fake value in interpreter
-                (setf (svref regs +vreg-vr+) 0)
+                ;; RDTSC: fake value in interpreter
+                (reg-set regs +vreg-vr+ 0)
+                (setf pc npc))
+               ((>= code #x100)
+                ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
                 (setf pc npc))
                (t
+                ;; FRAME-ENTER: allocate a generously-sized frame so all locals
+                ;; that later FRAME-ALLOCs would add still fit.
                 (let* ((params (logand code #xFF))
-                       (locals (ash code -8))
-                       (frame-size (+ params locals 4)))   ; extra slots for safety
-                  (setf (svref regs +vreg-vfp+)
-                        (make-array frame-size :initial-element 0)))
+                       (frame-size (+ params 64)))
+                  (reg-set regs +vreg-vfp+
+                        (%val->word (make-array frame-size :initial-element 0))))
                 (setf pc npc)))))
 
           ;; --- Data Movement ---
           (#.+op-mov+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (svref regs vd) (svref regs vs)) (setf pc npc2))))
+               (reg-set regs vd (reg-get regs vs)) (setf pc npc2))))
 
           (#.+op-li+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (multiple-value-bind (imm npc2) (fetch-u64 bc npc)
-               (setf (svref regs vd) imm) (setf pc npc2))))
+             ;; Peek the high 32 bits to choose the load path WITHOUT forming the
+             ;; full word.  |word| < 2^62 (the normal case: small fixnums, the
+             ;; tag-check mask `1`, char/pointer immediates) goes through the
+             ;; reg-set / %word->val path, which keeps the value<->word round-trip
+             ;; exact so the WORD-domain ops (:or/:test/:and via reg-get) see the
+             ;; right bits.  |word| >= 2^62 means a boundary fixnum literal whose
+             ;; word overflows the in-image fixnum range — fetch-li-value returns
+             ;; %word->val(word) DIRECTLY (overflow-free), stored as the value.
+             (let* ((hi (logior (aref bc (+ npc 4)) (ash (aref bc (+ npc 5)) 8)
+                                (ash (aref bc (+ npc 6)) 16) (ash (aref bc (+ npc 7)) 24)))
+                    (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi)))
+               (if (or (>= hi-signed #x40000000) (< hi-signed #x-40000000))
+                   (multiple-value-bind (val npc2) (fetch-li-value bc npc)
+                     (setf (svref regs vd) val) (setf pc npc2))
+                   (multiple-value-bind (imm npc2) (fetch-u64 bc npc)
+                     (reg-set regs vd imm) (setf pc npc2))))))
 
+          ;; PUSH/POP store real VALUES on mvm-stack (not raw words) so the GC
+          ;; traces/updates pushed pointers — same GC-safety reason as the regs
+          ;; vector.  (A pushed float/cons raw-word integer would be invisible to
+          ;; the collector and go stale across an allocation, e.g. when building
+          ;; several boxed-float args.)
           (#.+op-push+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
+             ;; regs already hold real VALUES — push the value directly (the
+             ;; old %word->val∘reg-get round-trip overflowed for boundary fixnums).
              (push (svref regs vs) (mvm-stack state)) (setf pc npc)))
 
           (#.+op-pop+
@@ -190,23 +332,23 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd) (+ (svref regs va) (svref regs vb)))
+                 (reg-set regs vd (+ (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-sub+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd) (- (svref regs va) (svref regs vb)))
+                 (reg-set regs vd (- (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-mul+ ; untag, multiply, re-tag
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (tag-fixnum (* (untag-fixnum (svref regs va))
-                                      (untag-fixnum (svref regs vb)))))
+                 (reg-set regs vd
+                       (tag-fixnum (* (untag-fixnum (reg-get regs va))
+                                      (untag-fixnum (reg-get regs vb)))))
                  (setf pc npc3)))))
 
           (#.+op-mul26lo+
@@ -214,9 +356,9 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((product (* (untag-fixnum (svref regs va))
-                                   (untag-fixnum (svref regs vb)))))
-                   (setf (svref regs vd) (tag-fixnum (logand product #x3FFFFFF))))
+                 (let ((product (* (untag-fixnum (reg-get regs va))
+                                   (untag-fixnum (reg-get regs vb)))))
+                   (reg-set regs vd (tag-fixnum (logand product #x3FFFFFF))))
                  (setf pc npc3)))))
 
           (#.+op-mul26hi+
@@ -224,9 +366,9 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((product (* (untag-fixnum (svref regs va))
-                                   (untag-fixnum (svref regs vb)))))
-                   (setf (svref regs vd) (tag-fixnum (ash product -26))))
+                 (let ((product (* (untag-fixnum (reg-get regs va))
+                                   (untag-fixnum (reg-get regs vb)))))
+                   (reg-set regs vd (tag-fixnum (ash product -26))))
                  (setf pc npc3)))))
 
           (#.+op-mul64lo+
@@ -234,8 +376,8 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (logand (* (svref regs va) (svref regs vb))
+                 (reg-set regs vd
+                       (logand (* (reg-get regs va) (reg-get regs vb))
                                #xFFFFFFFFFFFFFFFF))
                  (setf pc npc3)))))
 
@@ -244,8 +386,8 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (ash (* (svref regs va) (svref regs vb)) -64))
+                 (reg-set regs vd
+                       (ash (* (reg-get regs va) (reg-get regs vb)) -64))
                  (setf pc npc3)))))
 
           (#.+op-acc128+
@@ -253,13 +395,13 @@
            (multiple-value-bind (vaddr npc) (fetch-reg bc pc)
              (multiple-value-bind (vlo npc2) (fetch-reg bc npc)
                (multiple-value-bind (vhi npc3) (fetch-reg bc npc2)
-                 (let* ((addr (svref regs vaddr))
+                 (let* ((addr (reg-get regs vaddr))
                         (cur-lo (mem-read state addr 3))
                         (cur-hi (mem-read state (+ addr 8) 3))
-                        (sum-lo (+ cur-lo (svref regs vlo)))
+                        (sum-lo (+ cur-lo (reg-get regs vlo)))
                         (carry (if (> sum-lo #xFFFFFFFFFFFFFFFF) 1 0))
                         (new-lo (logand sum-lo #xFFFFFFFFFFFFFFFF))
-                        (new-hi (logand (+ cur-hi (svref regs vhi) carry)
+                        (new-hi (logand (+ cur-hi (reg-get regs vhi) carry)
                                         #xFFFFFFFFFFFFFFFF)))
                    (mem-write state addr new-lo 3)
                    (mem-write state (+ addr 8) new-hi 3))
@@ -269,99 +411,99 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((b (untag-fixnum (svref regs vb))))
+                 (let ((b (untag-fixnum (reg-get regs vb))))
                    (when (zerop b) (error "MVM: division by zero at PC ~D" (1- pc)))
-                   (setf (svref regs vd)
-                         (tag-fixnum (truncate (untag-fixnum (svref regs va)) b))))
+                   (reg-set regs vd
+                         (tag-fixnum (truncate (untag-fixnum (reg-get regs va)) b))))
                  (setf pc npc3)))))
 
           (#.+op-mod+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((b (untag-fixnum (svref regs vb))))
+                 (let ((b (untag-fixnum (reg-get regs vb))))
                    (when (zerop b) (error "MVM: modulus by zero at PC ~D" (1- pc)))
-                   (setf (svref regs vd)
-                         (tag-fixnum (mod (untag-fixnum (svref regs va)) b))))
+                   (reg-set regs vd
+                         (tag-fixnum (mod (untag-fixnum (reg-get regs va)) b))))
                  (setf pc npc3)))))
 
           (#.+op-neg+ ; -(a<<1) = (-a)<<1
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (svref regs vd) (- (svref regs vs))) (setf pc npc2))))
+               (reg-set regs vd (- (reg-get regs vs))) (setf pc npc2))))
 
           (#.+op-inc+ ; tagged +1 = raw +2
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (incf (svref regs vd) 2) (setf pc npc)))
+             (incf (reg-get regs vd) 2) (setf pc npc)))
 
           (#.+op-dec+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (decf (svref regs vd) 2) (setf pc npc)))
+             (decf (reg-get regs vd) 2) (setf pc npc)))
 
           ;; --- Bitwise ---
           (#.+op-and+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd) (logand (svref regs va) (svref regs vb)))
+                 (reg-set regs vd (logand (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-or+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd) (logior (svref regs va) (svref regs vb)))
+                 (reg-set regs vd (logior (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-xor+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd) (logxor (svref regs va) (svref regs vb)))
+                 (reg-set regs vd (logxor (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-shl+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (setf (svref regs vd)
-                       (tag-fixnum (ash (untag-fixnum (svref regs vs)) amt)))
+                 (reg-set regs vd
+                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs)) amt)))
                  (setf pc npc3)))))
 
           (#.+op-shr+ ; logical shift right
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (let* ((u (untag-fixnum (svref regs vs)))
+                 (let* ((u (untag-fixnum (reg-get regs vs)))
                         (shifted (if (>= u 0) (ash u (- amt))
                                      (ash (logand u #xFFFFFFFFFFFFFFFF) (- amt)))))
-                   (setf (svref regs vd) (tag-fixnum shifted)))
+                   (reg-set regs vd (tag-fixnum shifted)))
                  (setf pc npc3)))))
 
           (#.+op-sar+ ; arithmetic shift right
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (amt npc3) (fetch-byte bc npc2)
-                 (setf (svref regs vd)
-                       (tag-fixnum (ash (untag-fixnum (svref regs vs)) (- amt))))
+                 (reg-set regs vd
+                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs)) (- amt))))
                  (setf pc npc3)))))
 
           (#.+op-shlv+ ; shift left by register
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (vc npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (tag-fixnum (ash (untag-fixnum (svref regs vs))
-                                       (untag-fixnum (svref regs vc)))))
+                 (reg-set regs vd
+                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs))
+                                       (untag-fixnum (reg-get regs vc)))))
                  (setf pc npc3)))))
 
           (#.+op-sarv+ ; arithmetic shift right by register
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (vc npc3) (fetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (tag-fixnum (ash (untag-fixnum (svref regs vs))
-                                       (- (untag-fixnum (svref regs vc))))))
+                 (reg-set regs vd
+                       (tag-fixnum (ash (untag-fixnum (reg-get regs vs))
+                                       (- (untag-fixnum (reg-get regs vc))))))
                  (setf pc npc3)))))
 
           (#.+op-ldb+ ; bit field extract
@@ -369,16 +511,16 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (pos npc3) (fetch-byte bc npc2)
                  (multiple-value-bind (size npc4) (fetch-byte bc npc3)
-                   (setf (svref regs vd)
+                   (reg-set regs vd
                          (tag-fixnum (ldb (byte size pos)
-                                         (untag-fixnum (svref regs vs)))))
+                                         (untag-fixnum (reg-get regs vs)))))
                    (setf pc npc4))))))
 
           ;; --- Comparison ---
           (#.+op-cmp+
            (multiple-value-bind (va npc) (fetch-reg bc pc)
              (multiple-value-bind (vb npc2) (fetch-reg bc npc)
-               (let ((a (svref regs va)) (b (svref regs vb)))
+               (let ((a (reg-get regs va)) (b (reg-get regs vb)))
                  (setf (mvm-flags state)
                        (cond ((and (integerp a) (integerp b))
                               (cond ((= a b) :eq) ((< a b) :lt) (t :gt)))
@@ -389,8 +531,8 @@
           (#.+op-test+
            (multiple-value-bind (va npc) (fetch-reg bc pc)
              (multiple-value-bind (vb npc2) (fetch-reg bc npc)
-               (let ((r (if (and (integerp (svref regs va)) (integerp (svref regs vb)))
-                            (logand (svref regs va) (svref regs vb)) 0)))
+               (let ((r (if (and (integerp (reg-get regs va)) (integerp (reg-get regs vb)))
+                            (logand (reg-get regs va) (reg-get regs vb)) 0)))
                  (setf (mvm-flags state)
                        (cond ((zerop r) :eq) ((< r 0) :lt) (t :gt))))
                (setf pc npc2))))
@@ -427,21 +569,31 @@
           (#.+op-bnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
              (multiple-value-bind (off npc2) (fetch-s32 bc npc)
-               (setf pc (if (mvm-nil-p (svref regs vs)) (+ npc2 off) npc2)))))
+               (setf pc (if (mvm-nil-p (reg-get regs vs)) (+ npc2 off) npc2)))))
 
           (#.+op-bnnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
              (multiple-value-bind (off npc2) (fetch-s32 bc npc)
-               (setf pc (if (not (mvm-nil-p (svref regs vs))) (+ npc2 off) npc2)))))
+               (setf pc (if (not (mvm-nil-p (reg-get regs vs))) (+ npc2 off) npc2)))))
 
           ;; --- List Operations ---
+          ;; --- List ops, ALIGNED MODEL (unified representation) ---
+          ;; Registers hold RAW WORDS.  Reinterpret to a real value with
+          ;; %word->val, do the NATIVE list op on the real (shared-heap) object,
+          ;; and %val->word the result back to a raw word.  So a cons the
+          ;; interpreter builds IS a real native cons holding real values —
+          ;; directly usable by native runtime functions, no marshalling.
+          ;; (mvm-boolean already returns the raw word of t/nil, so consp/atom
+          ;; store it directly.)  GC-SAFE: reg-get/reg-set keep regs slots holding
+          ;; real VALUES, so the moving collector traces+updates held pointers
+          ;; (validated by the list-build-under-early-GC stress test).
           (#.+op-car+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (let ((v (svref regs vs)))
                  (setf (svref regs vd)
                        (cond ((consp v) (car v))
-                             ((mvm-nil-p v) nil)
+                             ((null v) nil)
                              (t (error 'mvm-type-error :operation "CAR"
                                        :expected "cons or nil" :got v)))))
                (setf pc npc2))))
@@ -452,7 +604,7 @@
                (let ((v (svref regs vs)))
                  (setf (svref regs vd)
                        (cond ((consp v) (cdr v))
-                             ((mvm-nil-p v) nil)
+                             ((null v) nil)
                              (t (error 'mvm-type-error :operation "CDR"
                                        :expected "cons or nil" :got v)))))
                (setf pc npc2))))
@@ -462,7 +614,7 @@
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
                  (let ((cell (cons (svref regs va) (svref regs vb))))
-                   (push cell (mvm-heap state))
+                   (push cell (mvm-heap state))      ; keep alive (anti-collection)
                    (setf (svref regs vd) cell))
                  (setf pc npc3)))))
 
@@ -487,13 +639,13 @@
           (#.+op-consp+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (svref regs vd) (mvm-boolean (consp (svref regs vs))))
+               (reg-set regs vd (mvm-boolean (consp (%word->val (reg-get regs vs)))))
                (setf pc npc2))))
 
           (#.+op-atom+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (svref regs vd) (mvm-boolean (atom (svref regs vs))))
+               (reg-set regs vd (mvm-boolean (atom (%word->val (reg-get regs vs)))))
                (setf pc npc2))))
 
           ;; --- Object Operations ---
@@ -501,19 +653,66 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (size npc2) (fetch-u16 bc npc)
                (multiple-value-bind (subtag npc3) (fetch-byte bc npc2)
-                 (let ((obj (make-mvm-object size subtag)))
+                 (let ((obj (%alloc-native size subtag)))
                    (push obj (mvm-heap state))
-                   (setf (svref regs vd) obj))
+                   (reg-set regs vd (%val->word obj)))
                  (setf pc npc3)))))
+
+          ;; Arrays / strings / objects — REAL native CL objects.  Allocate via
+          ;; %alloc-native; slot access via the native %prim-aref/%prim-aset/
+          ;; %prim-array-length (which run natively, not back through here).  So
+          ;; these objects cross the native bridge to real CL functions.
+          (#.+op-alloc-array+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
+               (let ((obj (make-array (%word->val (reg-get regs vcount)) :initial-element nil)))
+                 (push obj (mvm-heap state))
+                 (reg-set regs vd (%val->word obj)))
+               (setf pc npc2))))
+
+          (#.+op-alloc-string+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (let ((obj (make-string (%word->val (reg-get regs vs)) :initial-element #\Space)))
+                 (push obj (mvm-heap state))
+                 (reg-set regs vd (%val->word obj)))
+               (setf pc npc2))))
+
+          (#.+op-aref+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 ;; regs hold real VALUES — move them directly (svref).  The old
+                 ;; `(%word->val (reg-get ...))` round-trip (value->word->value)
+                 ;; overflowed the in-image fixnum range for boundary-magnitude
+                 ;; element values (e.g. a small-bignum's lo limb 2^62-k).
+                 (let ((obj (svref regs vobj))
+                       (idx (svref regs vidx)))
+                   (setf (svref regs vd) (%obj-elt-ref obj idx)))
+                 (setf pc npc3)))))
+
+          (#.+op-aset+
+           (multiple-value-bind (vobj npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
+                 (let ((obj (svref regs vobj))
+                       (idx (svref regs vidx)))
+                   (%obj-elt-set obj idx (svref regs vs)))
+                 (setf pc npc3)))))
+
+          (#.+op-array-len+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
+               (let ((obj (svref regs vobj)))
+                 (setf (svref regs vd) (%obj-elt-len obj)))
+               (setf pc npc2))))
 
           (#.+op-obj-ref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
                (multiple-value-bind (idx npc3) (fetch-byte bc npc2)
                  (let ((obj (svref regs vobj)))
-                   (unless (vectorp obj)
-                     (error 'mvm-type-error :operation "OBJ-REF" :expected "object" :got obj))
-                   (setf (svref regs vd) (svref obj (1+ idx))))
+                   (setf (svref regs vd) (%obj-elt-ref obj idx)))
                  (setf pc npc3)))))
 
           (#.+op-obj-set+
@@ -521,28 +720,25 @@
              (multiple-value-bind (idx npc2) (fetch-byte bc npc)
                (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
                  (let ((obj (svref regs vobj)))
-                   (unless (vectorp obj)
-                     (error 'mvm-type-error :operation "OBJ-SET" :expected "object" :got obj))
-                   (setf (svref obj (1+ idx)) (svref regs vs)))
+                   (%obj-elt-set obj idx (svref regs vs)))
                  (setf pc npc3)))))
 
           (#.+op-obj-tag+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (let ((obj (svref regs vs)))
-                 (setf (svref regs vd)
+               (let ((obj (%word->val (reg-get regs vs))))
+                 (reg-set regs vd
                        (tag-fixnum (cond ((consp obj) +tag-cons+)
-                                         ((vectorp obj) (mvm-obj-tag-val obj))
                                          ((integerp obj) +tag-fixnum+)
-                                         (t 0)))))
+                                         (t +tag-object+)))))  ; native object
                (setf pc npc2))))
 
           (#.+op-obj-subtag+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (let ((obj (svref regs vs)))
-                 (setf (svref regs vd)
-                       (tag-fixnum (if (vectorp obj) (mvm-obj-subtag-val obj) 0))))
+               ;; native subtag extraction via the obj-subtag primop
+               (let ((obj (%word->val (reg-get regs vs))))
+                 (reg-set regs vd (tag-fixnum (obj-subtag obj))))
                (setf pc npc2))))
 
           ;; --- Raw Memory ---
@@ -550,16 +746,16 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vaddr npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
-                 (let ((addr (svref regs vaddr)))
+                 (let ((addr (reg-get regs vaddr)))
                    (when (integerp addr) (setf addr (untag-fixnum addr)))
-                   (setf (svref regs vd) (mem-read state addr width)))
+                   (reg-set regs vd (mem-read state addr width)))
                  (setf pc npc3)))))
 
           (#.+op-store+
            (multiple-value-bind (vaddr npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
-                 (let ((addr (svref regs vaddr)) (val (svref regs vs)))
+                 (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
                    (when (integerp addr) (setf addr (untag-fixnum addr)))
                    (when (integerp val) (setf val (untag-fixnum val)))
                    (mem-write state addr val width))
@@ -570,12 +766,31 @@
           ;; --- Function Calling ---
           (#.+op-call+
            (multiple-value-bind (target npc) (fetch-u32 bc pc)
-             (push (cons npc (mvm-stack state)) (mvm-call-stack state))
-             (setf pc (if (< target (length ftab)) (aref ftab target) target))))
+             (if (and runtime-table (>= target +mvm-runtime-call-base+))
+                 ;; Runtime native call: funcall the real function inline with
+                 ;; %word->val'd args (raw words -> real values, no marshalling),
+                 ;; store %val->word of the result in VR, continue after the CALL.
+                 (let* ((name (gethash target runtime-table))
+                        (fn (%mvm-resolve-runtime-fn name))
+                        (nargs (mvm-nargs state)))
+                   (if fn
+                       (let ((args nil))
+                         ;; regs hold real VALUES — pass them directly (the old
+                         ;; %word->val∘reg-get round-trip overflowed for a
+                         ;; boundary-fixnum arg/result).
+                         (dotimes (i nargs)
+                           (push (svref regs (- nargs 1 i)) args))
+                         (setf (svref regs +vreg-vr+) (apply fn args)))
+                       (reg-set regs +vreg-vr+ +mvm-nil+))
+                   (setf pc npc))
+                 ;; In-module call: push return frame, jump to the bytecode.
+                 (progn
+                   (push (cons npc (mvm-stack state)) (mvm-call-stack state))
+                   (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
 
           (#.+op-call-ind+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
-             (let ((target (svref regs vs)))
+             (let ((target (reg-get regs vs)))
                (push (cons npc (mvm-stack state)) (mvm-call-stack state))
                (if (integerp target)
                    (setf pc (untag-fixnum target))
@@ -598,7 +813,7 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (let ((cell (cons nil nil)))
                (push cell (mvm-heap state))
-               (setf (svref regs vd) cell))
+               (reg-set regs vd (%val->word cell)))   ; store the cons's raw word
              (setf pc npc)))
 
           (#.+op-gc-check+ nil) ; no-op in interpreter
@@ -609,6 +824,23 @@
              (declare (ignore _vobj))
              (setf pc npc)))
 
+          ;; --- Calling convention (nargs / closure-env / MV-count) ---
+          (#.+op-set-nargs+
+           (multiple-value-bind (n npc) (fetch-byte bc pc)
+             (setf (mvm-nargs state) n) (setf pc npc)))
+          (#.+op-get-nargs+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (reg-set regs vd (tag-fixnum (mvm-nargs state))) (setf pc npc)))
+          (#.+op-set-cenv+
+           (multiple-value-bind (vs npc) (fetch-reg bc pc)
+             (setf (mvm-cenv state) (reg-get regs vs)) (setf pc npc)))
+          (#.+op-get-cenv+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (reg-set regs vd (mvm-cenv state)) (setf pc npc)))
+          (#.+op-set-mv-count+
+           (multiple-value-bind (n npc) (fetch-byte bc pc)
+             (setf (mvm-mv-count state) n) (setf pc npc)))
+
           ;; --- Actor / Concurrency ---
           (#.+op-save-ctx+
            (push (copy-seq regs) (mvm-stack state)))
@@ -617,7 +849,7 @@
            (let ((saved (pop (mvm-stack state))))
              (when (and saved (typep saved 'simple-vector))
                (replace regs saved)
-               (setf pc (svref regs +vreg-vpc+)))))
+               (setf pc (reg-get regs +vreg-vpc+)))))
 
           (#.+op-yield+ nil) ; preemption: no-op
 
@@ -625,10 +857,10 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vaddr npc2) (fetch-reg bc npc)
                (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
-                 (let* ((addr (svref regs vaddr))
+                 (let* ((addr (reg-get regs vaddr))
                         (old (gethash addr (mvm-memory state) 0)))
-                   (setf (svref regs vd) old)
-                   (setf (gethash addr (mvm-memory state)) (svref regs vs)))
+                   (reg-set regs vd old)
+                   (setf (gethash addr (mvm-memory state)) (reg-get regs vs)))
                  (setf pc npc3)))))
 
           ;; --- I/O and System ---
@@ -637,7 +869,7 @@
              (multiple-value-bind (port npc2) (fetch-u16 bc npc)
                (multiple-value-bind (_w npc3) (fetch-byte bc npc2)
                  (declare (ignore _w))
-                 (setf (svref regs vd) (gethash port (mvm-io-ports state) 0))
+                 (reg-set regs vd (gethash port (mvm-io-ports state) 0))
                  (setf pc npc3)))))
 
           (#.+op-io-write+
@@ -645,7 +877,7 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (_w npc3) (fetch-byte bc npc2)
                  (declare (ignore _w))
-                 (let ((val (svref regs vs)))
+                 (let ((val (reg-get regs vs)))
                    (case port
                      (0 (if (integerp val)     ; debug print
                             (format *standard-output* "~D" (untag-fixnum val))
@@ -666,19 +898,19 @@
           (#.+op-percpu-ref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (offset npc2) (fetch-u16 bc npc)
-               (setf (svref regs vd) (gethash offset (mvm-percpu state) 0))
+               (reg-set regs vd (gethash offset (mvm-percpu state) 0))
                (setf pc npc2))))
 
           (#.+op-percpu-set+
            (multiple-value-bind (offset npc) (fetch-u16 bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (setf (gethash offset (mvm-percpu state)) (svref regs vs))
+               (setf (gethash offset (mvm-percpu state)) (reg-get regs vs))
                (setf pc npc2))))
 
           (otherwise
            (error "MVM: unknown opcode #x~2,'0X at PC ~D" opcode (1- pc)))))
 
-      (setf (svref regs +vreg-vpc+) pc))))
+      (reg-set regs +vreg-vpc+ pc))))
 
 ;;; ============================================================
 ;;; Helper: Run a Function by Index

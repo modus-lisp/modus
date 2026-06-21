@@ -75,7 +75,7 @@
    #:mvm-emit-label #:mvm-emit-branch-to-label #:mvm-fixup-labels
    ;; Instruction constructors
    #:mvm-nop #:mvm-break
-   #:mvm-mov #:mvm-li #:mvm-li-const #:mvm-push #:mvm-pop
+   #:mvm-mov #:mvm-li #:mvm-li-halves #:mvm-li-const #:mvm-push #:mvm-pop
    #:mvm-add #:mvm-sub #:mvm-mul #:mvm-div #:mvm-mod
    #:mvm-neg #:mvm-inc #:mvm-dec
    #:mvm-fadd #:mvm-fsub #:mvm-fmul #:mvm-fdiv
@@ -741,6 +741,18 @@
 
 (defun mvm-li (buf vd imm64)
   (encode-instruction buf +op-li+ vd imm64))
+
+(defun mvm-li-halves (buf vd lo32 hi32)
+  "Emit an op-li whose 8-byte immediate is given as two 32-bit halves (LO then
+   HI, little-endian) instead of one 64-bit integer.  Byte-identical to mvm-li
+   for the combined word, but the caller never forms (value<<1) as a single
+   integer — which overflows the in-image 62-bit fixnum range (and triggers
+   lossy bignum-word arithmetic) for |value| >= 2^61.  See compiler.lisp
+   emit-li-tagged."
+  (mvm-emit-byte buf +op-li+)
+  (mvm-emit-reg buf vd)
+  (mvm-emit-u32 buf lo32)
+  (mvm-emit-u32 buf hi32))
 
 (defun mvm-li-const (buf vd idx)
   "Emit a li-const instruction (load tagged addr of constant-pool[idx]).

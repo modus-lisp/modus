@@ -5,10 +5,14 @@ complete**: val↔word boundary (committed), runtime-call bridge, cons/list alig
 the **GC-safe register file** (validated by a list-build-under-early-GC stress test),
 and strings/vectors opcodes — all done. eval2 runs a real CL subset (arithmetic,
 if/let/progn, recursion, cons/list structure, strings/vectors, native runtime calls
-with fixnum+list args) **GC-safely**. Two scoped boundary follow-ups remain: (a) a
-pre-existing *compiler* codegen edge (variable index after a literal-array build),
-and (b) cross-bridge NATIVE-layout objects (strings/vectors/floats to native fns) —
-a uniform "native object layout in the interpreter" piece. Then WS2/WS3/WS4.
+with fixnum+list args) **GC-safely**. Both boundary follow-ups worked through:
+(a) the variable-index bug was an *interpreter* gap (frame-alloc/free treated as
+frame-enter, wiping the frame) — fixed, and it unlocks any local-spilling
+function; (b) cross-bridge **strings** now work (real make-string objects; native
+length/char/string-upcase on eval2-built strings; conformant aref). Remaining:
+native-layout VECTORS + the numeric tower (bignum/float/ratio) — needs
+make-mvm-object as a distinguishable type and ripples into the numeric opcodes.
+Then WS2/WS3/WS4.
 
 ## Thesis
 

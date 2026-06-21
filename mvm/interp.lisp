@@ -343,12 +343,17 @@
                  (setf pc npc3)))))
 
           (#.+op-mul+
-           ;; regs hold real VALUES.  Route through GENERIC-MULTIPLY (-> bignum-mul)
-           ;; so a product exceeding the fixnum range PROMOTES to a bignum instead
-           ;; of wrapping mod 2^63 — the native fast `:mul` opcode (untag-one IMUL)
-           ;; silently truncates on overflow, so we must not use it here.  Operands
-           ;; are fixnums (the tag-check routed non-fixnums to the slow path);
-           ;; bignum-mul has a fixnum fast path so small products stay cheap.
+           ;; RAW tagged multiply (wraps) — building block for %fixnum-*.
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (reg-set regs vd
+                       (tag-fixnum (* (untag-fixnum (reg-get regs va))
+                                      (untag-fixnum (reg-get regs vb)))))
+                 (setf pc npc3)))))
+
+          (#.+op-mul-checked+
+           ;; High-level `*`: promote on overflow via GENERIC-MULTIPLY.
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)

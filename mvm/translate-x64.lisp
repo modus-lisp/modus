@@ -1214,6 +1214,70 @@
                      (emit-pop buf tmp)))))
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-mul-checked+)
+         ;; Tagged * with bignum overflow promotion.  Multiply in R13 (saved;
+         ;; not free) so va/vb vregs stay intact for the slow path.  On signed
+         ;; overflow, call GENERIC-MULTIPLY(va,vb) -> bignum.
+         ;;
+         ;; CALLER-SAVE: GENERIC-MULTIPLY is a full Lisp call that clobbers ALL
+         ;; caller-saved registers (V0=rsi V1=rdi V2=r8 V3=r9 V5=rcx V6=rdx
+         ;; V7=r10 V8=r11) and may trigger GC.  The register allocator does NOT
+         ;; know this inline slow path makes a call, so it never spills live
+         ;; vregs around it.  We therefore save/restore every caller-saved GP
+         ;; reg + rbx(V4) here — the correct ABI for an inline call that may
+         ;; fire on a genuine user-level overflow mid-expression with live
+         ;; vregs.  (r12/r14/r15 are global alloc/heap regs the callee
+         ;; preserves; GC scans our pushed copies as roots and forwards them,
+         ;; so stack save is correct.)  NB: the historic "implicit global
+         ;; <param>" compiler corruption was NOT a caller-save gap — it was the
+         ;; intern composite-key `(* pkg-hash 2^61-1)` promoting to a bignum
+         ;; (lossy in-image logand); fixed in cl-packages.lisp / prelude.lisp
+         ;; by switching that site to %fixnum-* (raw wrapping :mul).
+         (let* ((vd (first operands)) (va (second operands)) (vb (third operands))
+                (d (dest-phys-or-scratch vd))
+                (gm-label *x64-genmul-label*))
+           (cond
+             (gm-label
+              (let ((done (make-label)))
+                (emit-push buf 'r13)
+                (emit-load-vreg buf va 'r13)
+                (emit-sar-reg-imm buf 'r13 1)
+                (let ((pb (vreg-phys vb)))
+                  (if pb (emit-imul-reg-reg buf 'r13 pb)
+                      (progn (emit-push buf 'rax) (emit-load-vreg buf vb 'rax)
+                             (emit-imul-reg-reg buf 'r13 'rax) (emit-pop buf 'rax))))
+                (emit-jcc buf :no done)
+                ;; --- overflow slow path: GENERIC-MULTIPLY(va, vb) ---
+                ;; Save ALL caller-saved GP regs + rbx (V4) before loading args.
+                ;; 1 (r13) + 9 here = 10 pushes = 80 bytes -> 16-aligned at call.
+                (emit-push buf 'rsi) (emit-push buf 'rdi)
+                (emit-push buf 'r8)  (emit-push buf 'r9)
+                (emit-push buf 'rcx) (emit-push buf 'rdx)
+                (emit-push buf 'r10) (emit-push buf 'r11)
+                (emit-push buf 'rbx)
+                (emit-load-vreg buf va 'rsi)           ; arg0 = va (still intact)
+                (emit-load-vreg buf vb 'rdi)           ; arg1 = vb
+                (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
+                (emit-call buf gm-label)
+                (emit-mov-reg-reg buf 'r13 'rax)       ; result -> r13
+                (emit-pop buf 'rbx)
+                (emit-pop buf 'r11) (emit-pop buf 'r10)
+                (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+                (emit-pop buf 'r9)  (emit-pop buf 'r8)
+                (emit-pop buf 'rdi) (emit-pop buf 'rsi)
+                (emit-label buf done)
+                (emit-mov-reg-reg buf d 'r13)
+                (emit-pop buf 'r13)
+                (maybe-store-scratch buf vd)))
+             (t
+              (emit-load-vreg buf va d) (emit-sar-reg-imm buf d 1)
+              (let ((pb (vreg-phys vb)))
+                (if pb (emit-imul-reg-reg buf d pb)
+                    (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                      (emit-push buf tmp) (emit-load-vreg buf vb tmp)
+                      (emit-imul-reg-reg buf d tmp) (emit-pop buf tmp))))
+              (maybe-store-scratch buf vd)))))
+
         ((op= +op-mul26lo+)
          ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
          ;; On x64: untag both, IMUL (64-bit result is enough), AND 0x3FFFFFF, retag
@@ -3640,6 +3704,8 @@
 (defvar *mcgc-page-gc-label* nil)
 (defun mcgc-page-gc-label () *mcgc-page-gc-label*)
 
+(defvar *x64-genmul-label* nil)  ; GENERIC-MULTIPLY label for op-mul-checked
+
 ;;; Label of the shared out-of-line cons-kind-bit setter (emit-mcgc-cons-bit-
 ;;; subroutine).  Published here so the cons alloc sites (+op-cons+ /
 ;;; +op-alloc-cons+) can CALL it instead of inlining the ~40-byte BTS
@@ -5627,6 +5693,10 @@
                (setf (aref fn-labels i) label)
                (setf (gethash name fn-map) label)
                (setf (gethash offset fn-offset-to-label) label)))
+    (setf *x64-genmul-label*
+          (loop for entry in function-table
+                when (string-equal (first entry) "GENERIC-MULTIPLY")
+                  return (gethash (second entry) fn-offset-to-label)))
     ;; Find the label for %gc-collect
     (let ((gc-collect-label (when gc-collect-entry
                               (gethash (second gc-collect-entry)

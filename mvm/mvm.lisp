@@ -31,7 +31,7 @@
    ;; Opcodes
    #:+op-nop+ #:+op-break+
    #:+op-mov+ #:+op-li+ #:+op-li-const+ #:+op-push+ #:+op-pop+
-   #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-div+ #:+op-mod+
+   #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-mul-checked+ #:+op-div+ #:+op-mod+
    #:+op-neg+ #:+op-inc+ #:+op-dec+
    #:+op-and+ #:+op-or+ #:+op-xor+
    #:+op-shl+ #:+op-shr+ #:+op-sar+ #:+op-shlv+ #:+op-sarv+ #:+op-ldb+
@@ -76,7 +76,7 @@
    ;; Instruction constructors
    #:mvm-nop #:mvm-break
    #:mvm-mov #:mvm-li #:mvm-li-halves #:mvm-li-const #:mvm-push #:mvm-pop
-   #:mvm-add #:mvm-sub #:mvm-mul #:mvm-div #:mvm-mod
+   #:mvm-add #:mvm-sub #:mvm-mul #:mvm-mul-checked #:mvm-div #:mvm-mod
    #:mvm-neg #:mvm-inc #:mvm-dec
    #:mvm-fadd #:mvm-fsub #:mvm-fmul #:mvm-fdiv
    #:mvm-itof #:mvm-ftoi #:mvm-fcmp
@@ -343,6 +343,7 @@
 (defconstant +op-mul64lo+  #xAA)  ; (mul64lo Vd Va Vb) - low 64 bits of Va*Vb, raw
 (defconstant +op-mul64hi+  #xAB)  ; (mul64hi Vd Va Vb) - high 64 bits of Va*Vb, raw
 (defconstant +op-acc128+   #xAC)  ; (acc128 Vaddr Vlo Vhi) - mem128[Vaddr] += Vhi:Vlo
+(defconstant +op-mul-checked+ #xAD)  ; tagged * with bignum overflow promotion
 
 ;; SAP (System Area Pointer) — raw address wrapper for FFI
 (defconstant +op-sap-new+    #xB0)  ; (sap-new Vd Vaddr) - alloc SAP, store raw addr
@@ -507,6 +508,7 @@
 (defopcode :mul64lo  #xAA (:reg :reg :reg)        "Low 64 bits of raw multiply")
 (defopcode :mul64hi  #xAB (:reg :reg :reg)        "High 64 bits of raw multiply")
 (defopcode :acc128   #xAC (:reg :reg :reg)        "128-bit accumulate: mem[Va] += Vc:Vb")
+(defopcode :mul-checked #xAD (:reg :reg :reg)     "Multiply, promote to bignum on overflow")
 
 ;; SAP (System Area Pointer) operations
 (defopcode :sap-new    #xB0 (:reg :reg)              "Allocate SAP with raw address")
@@ -777,6 +779,9 @@
 
 (defun mvm-mul (buf vd va vb)
   (encode-instruction buf +op-mul+ vd va vb))
+
+(defun mvm-mul-checked (buf vd va vb)
+  (encode-instruction buf +op-mul-checked+ vd va vb))
 
 (defun mvm-div (buf vd va vb)
   (encode-instruction buf +op-div+ vd va vb))

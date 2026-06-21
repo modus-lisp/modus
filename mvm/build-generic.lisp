@@ -184,6 +184,12 @@
           :no-entry))))
 ;; Single-expression convenience.
 (defun eval2 (form) (eval2-forms (list form)))
+;; Multiply overflow promotion regression probes (compiled native mul-checked).
+(defun %nat-mul-20 () (* 10000000000 10000000000))    ; bignum 10^20
+(defun %nat-mul-small () (* 12345 678))               ; fixnum 8369910
+;; Runtime EVAL of a defun-with-param then call it; guards the intern
+;; composite-key %fixnum-* fix.  Expect 6.
+(defun %s2-defun-add () (eval2-forms (list (list (quote defun) (quote g) (list (quote y)) (list (quote +) (quote y) 1)) (list (quote g) 5))))
 ;; Direct emit+fetch round-trip probe for a u64 immediate (isolates the
 ;; bytecode encoder/decoder from compile-integer).
 (defun %ws1-u64rt (imm)

@@ -725,8 +725,13 @@
                               ;; (intern "FOO" *package*).
                               (let* ((name-hash (compute-name-hash name-str))
                                      (pkg-hash (compute-name-hash (%pkg-name pkg)))
+                                     ;; %fixnum-* (raw wrapping :mul), NOT * —
+                                     ;; plain * promotes overflow to a bignum and
+                                     ;; in-image (logand <bignum> mask) is lossy,
+                                     ;; yielding an inconsistent intern key (must
+                                     ;; match prelude %INTERN-SYMBOL-PKG exactly).
                                      (key (logand (+ name-hash
-                                                     (* pkg-hash 2305843009213693951))
+                                                     (%fixnum-* pkg-hash 2305843009213693951))
                                                   #x3FFFFFFFFFFFFFFF))
                                      ;; compute-name-hash UPPERCASES before
                                      ;; hashing, so "A" and "a" share KEY.

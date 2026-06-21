@@ -8820,7 +8820,7 @@
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
-         (emit-arith-pair :mul "GENERIC-MULTIPLY" dest temp)
+         (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp)
          (free-temp-reg))))))
 
 (defun compile-mul26lo (args env dest)
@@ -11921,6 +11921,7 @@
       (:adds  4)
       (:subs  4)
       (:mul   4)
+      (:mul-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
       (:mul64lo 4)
@@ -12175,6 +12176,8 @@
            (mvm-subs buf (second insn) (third insn) (fourth insn)))
           (:mul
            (mvm-mul buf (second insn) (third insn) (fourth insn)))
+          (:mul-checked
+           (mvm-mul-checked buf (second insn) (third insn) (fourth insn)))
           (:mul26lo
            (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
           (:mul26hi

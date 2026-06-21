@@ -3607,6 +3607,7 @@
       ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
       ((= op-name 735635543474837196)   (compile-make-ratio dest))   ; %make-ratio
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
+      ((= op-name (compute-name-hash "%MAKE-FLOAT2")) (compile-make-float2 dest))
       ;; --- Closure construction ---
       ;; (%make-closure fn env) -> tag-object / subtag-0x52, 2 slots.
       ;; Replaces (cons #'fn env) for closure object creation. The
@@ -10593,6 +10594,13 @@
 (defun compile-make-float (dest)
   "Compile (%make-float) — allocate a 1-slot object with float subtag."
   (emit-ir :alloc-obj dest 1 +subtag-float+))
+
+(defun compile-make-float2 (dest)
+  "Compile (%make-float2) — allocate a 2-slot boxed float (hi/lo IEEE words).
+   Matches the float-literal shape; used by the self-hosted interpreter to build
+   a real native float instead of a simulated object."
+  (emit-ir :gc-check)
+  (emit-ir :alloc-obj dest 2 +subtag-float+))
 
 (defun compile-make-symbol (dest)
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.

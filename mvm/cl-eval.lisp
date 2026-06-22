@@ -940,13 +940,22 @@
                ((%eval-sym-eq (car ps) "&AUX")
                 (return nil))   ; outer loop's &AUX clause picks up
                (t
-                ;; Spec shapes: var | (var [init [supplied-p]]).
+                ;; Spec shapes: var | (var [init [supplied-p]]) |
+                ;; ((:keyword var) [init [supplied-p]]).  The last form
+                ;; (CLHS 3.4.1) names the keyword indicator explicitly,
+                ;; separate from the bound variable.  Mirror the compile-
+                ;; time path (preprocess-params): when (car spec) is itself
+                ;; a cons, it is (kw-indicator var) and the keyword name
+                ;; comes from that indicator, not from VAR.
                 (let* ((spec (car ps))
-                       (var (if (consp spec) (car spec) spec))
+                       (named (and (consp spec) (consp (car spec))))
+                       (var (if named (cadr (car spec))
+                                (if (consp spec) (car spec) spec)))
+                       (kw-spec (if named (car (car spec)) spec))
                        (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
                        (supplied-p-var (if (and (consp spec) (cdr spec) (cddr spec))
                                            (caddr spec) nil))
-                       (keyname (if (consp spec) (symbol-name var) (symbol-name spec)))
+                       (keyname (symbol-name kw-spec))
                        (found-flag nil)
                        (value (let ((cur kw-args) (found nil) (val nil))
                                 (loop

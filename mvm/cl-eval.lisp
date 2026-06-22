@@ -5858,15 +5858,24 @@
 ;;; eval boundaries.
 ;;; ============================================================
 
-(defvar *setf-expanders* nil
+;; NOTE: a SEPARATE variable from compiler.lisp's *setf-expanders*, which is
+;; a HASH-TABLE keyed by name-hash for COMPILE-TIME defsetf.  Modus's last-
+;; defun-wins / shared-global model makes both defvars name the same global
+;; cell, so reusing *setf-expanders* here made %register-setf-expander walk
+;; the compiler's hash-table object as an alist via (car (car cur)) →
+;; TYPE-ERROR.  That TYPE-ERROR is exactly the gauntlet's form-44
+;; `#(#<?NNN> NIL)` failure (uiop (defsetf getenv (x) (val) …) — which then
+;; aborts the whole block so getenvp is never defined → the form 87/109
+;; cascade).  Keep the runtime alist in its own cell.
+(defvar *runtime-setf-expanders* nil
   "Alist (accessor-name . expander-fn) for user-defined SETF places.
    The expander-fn takes (place-args value-form) and returns a Lisp
    form that performs the assignment.")
 
 (defun %register-setf-expander (name fn)
-  "Add NAME → FN to *setf-expanders*, replacing any prior entry."
+  "Add NAME → FN to *runtime-setf-expanders*, replacing any prior entry."
   (let ((found nil)
-        (cur *setf-expanders*)
+        (cur *runtime-setf-expanders*)
         (acc nil))
     (loop
       (when (null cur) (return nil))
@@ -5877,7 +5886,7 @@
         (t (setq acc (cons (car cur) acc))))
       (setq cur (cdr cur)))
     (unless found (setq acc (cons (cons name fn) acc)))
-    (setq *setf-expanders* acc))
+    (setq *runtime-setf-expanders* acc))
   name)
 
 (defun %find-setf-expander (name)
@@ -5885,7 +5894,7 @@
    The value is a descriptor list — see %apply-setf-expander — NOT a
    raw funcall'able lambda (Modus's closure-cell limitation makes a
    captured-variable lambda per defsetf unreliable)."
-  (let ((cur *setf-expanders*))
+  (let ((cur *runtime-setf-expanders*))
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) name) (return (cdr (car cur))))

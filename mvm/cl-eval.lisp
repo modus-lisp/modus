@@ -1637,6 +1637,22 @@
                   (cons (list :for-in var (list '%loop-hash-keys ht-form)) rest2))
                  ((or (%loop-kw= what "HASH-VALUE") (%loop-kw= what "HASH-VALUES"))
                   (cons (list :for-in var (list '%loop-hash-values ht-form)) rest2))
+                 ((or (%loop-kw= what "SYMBOL") (%loop-kw= what "SYMBOLS"))
+                  (cons (list :for-in var
+                              (list '%loop-collect-symbols (or ht-form '*package*)))
+                        rest2))
+                 ((or (%loop-kw= what "EXTERNAL-SYMBOL")
+                      (%loop-kw= what "EXTERNAL-SYMBOLS"))
+                  (cons (list :for-in var
+                              (list '%loop-collect-external-symbols
+                                    (or ht-form '*package*)))
+                        rest2))
+                 ((or (%loop-kw= what "PRESENT-SYMBOL")
+                      (%loop-kw= what "PRESENT-SYMBOLS"))
+                  (cons (list :for-in var
+                              (list '%loop-collect-present-symbols
+                                    (or ht-form '*package*)))
+                        rest2))
                  (t
                   ;; Unsupported BEING target — degrade to empty iteration.
                   (cons (list :for-in var nil) rest2)))))))

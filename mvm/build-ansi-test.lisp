@@ -437,6 +437,18 @@
   (:intern "X" "Y" "Z")
   (:import-from "DS2" "F"))
 (defpackage "CL-TEST" (:use "CL"))
+;; LISP package: the Paul Dietz suite (e.g. iteration/loop7.lsp) refers to
+;; standard operators as `lisp:intern`, `lisp:export`, etc.  SBCL has no
+;; LISP package, so reading those files used to TRUNCATE at the first
+;; `lisp:`-qualified form — silently dropping the package-setup forms
+;; (intern/export of the symbols the test then iterates).  Define LISP as
+;; a CL-using package that re-exports every external CL symbol, so
+;; `lisp:intern` reads as (and is EQ to) `cl:intern`.
+(ignore-errors (delete-package "LISP"))
+(defpackage "LISP" (:use "CL"))
+(let ((lisp-pkg (find-package "LISP")))
+  (do-external-symbols (s (find-package "CL"))
+    (export s lisp-pkg)))
 
 ;; SBCL-side CLOS class registry for make-instance initarg expansion
 ;; Each entry: (class-name slot-names . initarg-map)
@@ -3445,7 +3457,7 @@
                            (push test-str test-forms))))))
                   ((and (consp form) (member (car form)
                           '(defharmless def-fold-test def-macro-test
-                            in-package declaim))) nil)
+                            declaim))) nil)
                   (t
                    ;; For progn forms (from rewritten defclass/defmethod/defgeneric):
                    ;; - defun sub-forms → top-level (compiled as global functions)
@@ -3560,7 +3572,25 @@
                                (queue-defvar-setq form)
                                (when (and (consp form)
                                           (member (car form)
-                                                  '(%defpackage-impl %defmethod)))
+                                                  '(%defpackage-impl %defmethod
+                                                    ;; Package-mutation SETUP forms
+                                                    ;; (make-package/intern/export/
+                                                    ;; in-package …) written at top
+                                                    ;; level otherwise run only as
+                                                    ;; bare-metal toplevel thunks,
+                                                    ;; which never execute — so the
+                                                    ;; package is never created or
+                                                    ;; populated and `loop for x being
+                                                    ;; the symbols of PKG` (loop7)
+                                                    ;; iterates an empty/absent pkg.
+                                                    ;; Route them into run-init-FILE.
+                                                    make-package in-package
+                                                    delete-package
+                                                    safely-delete-package
+                                                    rename-package use-package
+                                                    unuse-package export unexport
+                                                    import unintern intern shadow
+                                                    shadowing-import)))
                                  (push s init-forms)))))))))))
               ;; Emit run-init-X — a separate function holding ONLY the init
               ;; forms (defclass / defmethod / setq for defvar's value, etc.).

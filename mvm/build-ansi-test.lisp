@@ -981,8 +981,12 @@
                 (let ((,var (car ,cur-var)))
                   ,@real-body)
                 (setq ,cur-var (cdr ,cur-var))))))))
-    ;; (with-package-iterator ...) — stub: just return 0
-    ((eq (car form) 'with-package-iterator)
+    ;; (with-package-iterator ...) — RETIRED stub.  Was `0`, which clobbered
+    ;; every with-package-iterator form to a body-less literal 0 *before* the
+    ;; real, complete handler in rewrite-reader-forms (~line 2909) could see
+    ;; it.  Disabled (matching the retired do-symbols branches above) so the
+    ;; form falls through to that handler.
+    ((and nil (eq (car form) 'with-package-iterator))
      0)
     ;; (defpackage name option...) → (%defpackage-impl name '(option...))
     ;; Options are bare lists like (:use) that would be evaluated as forms.
@@ -3736,11 +3740,78 @@
         ;; tree-walking rewriters can hit (car comma-struct) and
         ;; type-error.  Without the per-form catch the WHOLE file is
         ;; dropped from the aux source.
+        (setf forms (nreverse forms))
+        ;; Expand aux-defined macros BEFORE the rewriters run.  Some aux
+        ;; helpers are defuns whose body is a call to a macro defined in the
+        ;; SAME aux file — e.g. package-aux.lsp's
+        ;;   (defun with-package-iterator-internal (packages)
+        ;;     (test-with-package-iterator packages :internal))
+        ;; where TEST-WITH-PACKAGE-ITERATOR is a defmacro that expands into a
+        ;; literal WITH-PACKAGE-ITERATOR form.  The WITH-PACKAGE-ITERATOR
+        ;; rewriter (in rewrite-reader-forms) only fires on a *literal*
+        ;; with-package-iterator head, so if the form is still hidden behind
+        ;; the helper macro at rewrite time, it is never rewritten and the
+        ;; emitted MVM source calls an unknown macro → NIL at runtime.  Eval
+        ;; this file's own defmacros first, then macroexpand the remaining
+        ;; forms so the hidden constructs surface for the rewriters.
+        (dolist (form forms)
+          (when (and (consp form) (eq (car form) 'defmacro))
+            (handler-case (eval form) (error () nil))))
+        ;; Expand a TOP-LEVEL aux-macro call appearing as a defun body form.
+        ;; Narrowly targets the helper-defun pattern
+        ;;   (defun f (...) (AUX-MACRO ...))
+        ;; e.g. package-aux.lsp's with-package-iterator-internal, whose body
+        ;; (test-with-package-iterator ...) expands into a literal
+        ;; with-package-iterator form the rewriter then handles.  A full
+        ;; recursive macroexpand-all blows the host stack on the large
+        ;; deeply-nested aux forms, so we only expand each body form's own
+        ;; head (repeatedly, until it is no longer a host macro call) — no
+        ;; descent into sub-forms.  defmacro templates are left untouched.
+        ;;
+        ;; CRITICAL: only expand AUX-DEFINED macros (interned in CL-USER),
+        ;; NOT standard CL macros.  Expanding a CL macro (loop/cond/when/...)
+        ;; would splice SBCL-internal forms (sb-loop, tagbody, ...) into the
+        ;; emitted MVM source and corrupt those aux defuns — the MVM compiler
+        ;; has its own macros and must receive the surface form.  An aux macro
+        ;; like TEST-WITH-PACKAGE-ITERATOR lives in CL-USER; CL:LOOP lives in
+        ;; COMMON-LISP, so the home-package gate cleanly separates them.
+        (flet ((aux-macro-p (sym)
+                 (and (symbolp sym)
+                      (macro-function sym)
+                      (let ((p (symbol-package sym)))
+                        (and p (string= (package-name p) "COMMON-LISP-USER")))))
+               (defining-form-p (sym)
+                 (member sym '(quote defmacro defun defstruct deftype
+                               defparameter defvar defconstant
+                               defclass defgeneric defmethod))))
+          (flet ((expand-head (f)
+                 (handler-case
+                     (let ((g f) (guard 0))
+                       (loop
+                         (when (or (not (consp g)) (not (symbolp (car g)))
+                                   (>= guard 50)
+                                   (defining-form-p (car g))
+                                   (not (aux-macro-p (car g))))
+                           (return g))
+                         (let ((ex (macroexpand-1 g)))
+                           (when (eq ex g) (return g))
+                           (setf g ex)
+                           (incf guard))))
+                   (error () f))))
+          (setf forms
+                (mapcar (lambda (form)
+                          (if (and (consp form) (eq (car form) 'defun))
+                              (handler-case
+                                  (list* 'defun (cadr form) (caddr form)
+                                         (mapcar #'expand-head (cdddr form)))
+                                (error () form))
+                              form))
+                        forms))))
         (flet ((mapcar-safe (fn lst)
                  (mapcar (lambda (f) (handler-case (funcall fn f)
                                        (error () f)))
                          lst)))
-          (setf forms (mapcar-safe #'rewrite-package-iteration (nreverse forms)))
+          (setf forms (mapcar-safe #'rewrite-package-iteration forms))
           ;; rewrite-make-array-* RETIRED (two-pass / aux path) — native MDA
           ;; + runtime make-array + MDA-aware rt-equal/printer handle the
           ;; unmodified test forms.

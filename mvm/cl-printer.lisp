@@ -1904,17 +1904,63 @@
   (%fmt-pad-aligned str mincol colinc minpad padchar stream
                     (and opts (eq (car opts) :right-align))))
 
-;;; Format ~T: tabulate
-(defun %fmt-tabulate (colnum colinc stream)
-  (let ((cn (if colnum colnum 1))
-        (ci (if colinc colinc 1)))
-    ;; We don't track column position, so just emit spaces to next tab stop
-    ;; Simplified: emit cn spaces
-    (let ((i 0))
-      (loop
-        (when (= i cn) (return nil))
-        (%print-char 32 stream)
-        (setq i (+ i 1))))))
+;;; Current output column of a string-output stream (type 2).  Returns the
+;;; number of chars written since the last newline, or NIL if the column is
+;;; not recoverable (non-string-output stream).  A type-2 stream stores its
+;;; output as a REVERSED char-code list in (car (%stream-data stream)) — the
+;;; head is the most-recently-written char — so walking forward from the head
+;;; until a newline (code 10) yields the count of chars on the current line.
+(defun %stream-column (stream)
+  (if (and (streamp stream) (= (%stream-type stream) 2))
+      (let ((p (car (%stream-data stream)))
+            (col 0))
+        (loop
+          (when (null p) (return col))
+          (when (= (car p) 10) (return col))
+          (setq col (+ col 1))
+          (setq p (cdr p))))
+      nil))
+
+;;; Emit N spaces to STREAM.
+(defun %fmt-emit-spaces (n stream)
+  (let ((i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (%print-char 32 stream)
+      (setq i (+ i 1)))))
+
+;;; Format ~T: tabulate (CLHS 22.3.6.1).
+;;;   colnum default 1, colinc default 1.
+;;;   ~:T (colonp) inside a logical block moves relative to the block; outside
+;;;     one (which is all we support) it is a no-op.
+;;;   ~@T (atp) is relative: advance to col+colnum, then round up to a multiple
+;;;     of colinc.
+;;;   plain ~T is absolute: pad to column colnum; if already at/past it, pad to
+;;;     the next multiple of colinc past colnum.
+(defun %fmt-tabulate (colnum colinc atp colonp stream)
+  (if colonp
+      nil  ; ~:T outside a logical block: no-op
+      (let ((cn (if colnum colnum 1))
+            (ci (if colinc colinc 1))
+            (col (%stream-column stream)))
+        (cond
+          ;; Column not recoverable: best-effort, emit colnum spaces.
+          ((null col)
+           (%fmt-emit-spaces cn stream))
+          ;; Relative (~@T): advance cn, round up to next multiple of ci.
+          (atp
+           (let ((new (+ col cn)))
+             (when (and ci (> ci 0))
+               (let ((r (mod new ci)))
+                 (when (> r 0) (setq new (+ new (- ci r))))))
+             (%fmt-emit-spaces (- new col) stream)))
+          ;; Absolute (~T): pad to column cn, else to next colinc stop past cn.
+          (t
+           (if (< col cn)
+               (%fmt-emit-spaces (- cn col) stream)
+               (when (and ci (> ci 0))
+                 (let ((r (mod (- col cn) ci)))
+                   (%fmt-emit-spaces (- ci r) stream)))))))))
 
 ;;; ~^ inside ~{ ~} sets *format-iter-escape* to t — the inner %format-impl
 ;;; returns immediately and the iteration helper checks the flag to break out
@@ -2472,7 +2518,7 @@
                        (setq j (+ j 1)))))
                   ;; ~T — tabulate
                   ((or (= dir 84) (= dir 116))
-                   (%fmt-tabulate param1 param2 stream))
+                   (%fmt-tabulate param1 param2 atp colonp stream))
                   ;; ~? — recursive format.  CLHS 22.3.7.1.
                   ;; ~?      : next arg is control string, arg after is arg-list (a list)
                   ;; ~@?     : next arg is control string, use remaining args directly

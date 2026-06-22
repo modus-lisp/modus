@@ -3986,6 +3986,43 @@
 (load-ansi-aux "define-condition-aux.lsp")
 (load-ansi-aux "defclass-aux.lsp")
 
+;; Re-establish the build's form-producing def-pprint-test (and the
+;; def-ppblock-test that expands into it) AFTER aux loading.  printer-aux.lsp
+;; (loaded above) defines def-pprint-test with a &key default
+;; `(package (find-package "CL-TEST"))` — the default is EVALUATED at
+;; macroexpand time, so `,package` splices a live `#<PACKAGE "CL-TEST">`
+;; object into the deftest.  That `#<` print then trips the unreadable-object
+;; filter in load-ansi-chapter, silently dropping every def-pprint-test in
+;; format-t.lsp (and any other file expanded with that macro) — the whole
+;; file then forks to a zero-tests FILE-WEDGE.  Our version (defined far
+;; above) keeps the package as the FORM `(find-package "CL-TEST")`, which
+;; round-trips through the Modus reader.
+(eval '(defmacro def-pprint-test (name form expected-value &rest keys)
+        (let ((margin (getf keys :margin 100))
+              (miser (getf keys :miser nil))
+              (circle (getf keys :circle nil))
+              (len (getf keys :len nil))
+              (pretty (getf keys :pretty t))
+              (escape (getf keys :escape nil))
+              (readably (getf keys :readably nil))
+              (package (or (getf keys :package) '(find-package "CL-TEST"))))
+          `(deftest ,name
+             (%with-standard-io-syntax
+              (lambda ()
+                (let ((*print-pretty* ,pretty)
+                      (*print-escape* ,escape)
+                      (*print-readably* ,readably)
+                      (*print-right-margin* ,margin)
+                      (*package* ,package)
+                      (*print-length* ,len)
+                      (*print-miser-width* ,miser)
+                      (*print-circle* ,circle))
+                  (declare (special *print-pretty* *print-escape* *print-readably*
+                                    *print-right-margin* *package* *print-length*
+                                    *print-miser-width* *print-circle*))
+                  ,form)))
+             ,expected-value))))
+
 (format t "  aux sources: ~D chars~%" (length *ansi-aux-sources*))
 
 (load-ansi-chapter "/home/claude/modus/tmp/ansi-test/cons/"

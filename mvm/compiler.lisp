@@ -8314,16 +8314,27 @@
     ;; ---------------------------------------------------------------
     (emit-ir-label error-label)
 
-    ;; Clear the handler so errors in cleanup propagate outward.
-    (emit-ir :trap #x0512)
+    ;; NOTE: do NOT clear-handler (#x0512) here.  The longjmp that landed us
+    ;; in this error path (TRAP #x0511 / SIGSEGV stub) has ALREADY popped the
+    ;; per-fork handler stack, so [#x10000180] now holds the ENCLOSING frame.
+    ;; A second pop here was a double-pop that discarded the real target frame,
+    ;; so an in-flight non-local exit (THROW / cross-unit RETURN-FROM / GO)
+    ;; that must thread THROUGH this unwind-protect lost its destination and
+    ;; crashed.  With the enclosing frame already current, cleanup errors
+    ;; correctly propagate one level out, and the re-issued longjmp below
+    ;; targets the correct enclosing handler.
 
     ;; Run cleanup forms; their return values are discarded.
     ;; Use +vreg-vr+, NOT +vreg-vn+: see comment in the normal path above.
     (dolist (cf cleanup-forms)
       (compile-form cf env +vreg-vr+))
 
-    ;; Re-propagate the original error to the enclosing handler.
-    ;; *current-condition* still holds the condition that was raised.
+    ;; RE-ARM / continue the in-flight non-local exit: re-issue the longjmp
+    ;; toward the SAME pending target.  *catch-tag*/*catch-value*/*catch-active*
+    ;; (set by THROW / %nlx-throw) and *current-condition* survive across the
+    ;; cleanup forms above, so the enclosing CATCH / handler-case frame
+    ;; receives the original target and value.  If cleanup itself performed an
+    ;; NLX it already longjmped (superseding this one) and we never reach here.
     (emit-ir :trap #x0511)                        ; longjmp (does not return)
     (emit-ir :mov dest +vreg-vn+)                 ; unreachable; keeps dest valid
 

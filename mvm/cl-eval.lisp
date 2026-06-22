@@ -1832,6 +1832,15 @@
               (let ((step-env env))
                 (dolist (wb with-bindings)
                   (setq step-env (%env-extend-pair wb step-env)))
+                ;; Pre-bind every iteration var's PRIOR value so a step
+                ;; form may forward-reference a var introduced by a LATER
+                ;; FOR clause (CLHS-legal `:for prev = nil :then c
+                ;; :for c :across vec`).  Cells then re-extend with their
+                ;; freshly-stepped value, which shadows the prior binding.
+                (dolist (st iter-state)
+                  (let ((cb (%loop-cell-cur-binding st)))
+                    (when cb
+                      (setq step-env (%env-extend (car cb) (cdr cb) step-env)))))
                 ;; Short-circuit on first iter that signals stop, so a
                 ;; later for-eq doesn't try to evaluate `init` in a
                 ;; step-env where the prior for-clause's var was never
@@ -1885,6 +1894,14 @@
       (let ((fin-env env))
         (dolist (wb with-bindings)
           (setq fin-env (%env-extend-pair wb fin-env)))
+        ;; Bind every iteration var to its FINAL value so a FINALLY body
+        ;; (or `FINALLY (RETURN ...)`) can reference loop vars after the
+        ;; loop ends — CLHS keeps loop variables in scope through FINALLY.
+        ;; e.g. (loop :for c :across s :finally (return (digit-char-p c))).
+        (dolist (st iter-state)
+          (let ((cb (%loop-cell-cur-binding st)))
+            (when cb
+              (setq fin-env (%env-extend (car cb) (cdr cb) fin-env)))))
         (dolist (a accums)
           (let* ((nm (car a))
                  (sk (cadr a))
@@ -1925,7 +1942,18 @@
               (error c)))))
       ;; Resolve return value.
       (cond
-        (return-form (%eval-in-env return-form env))
+        (return-form
+         ;; `FINALLY RETURN form` (keyword shape): the form may reference
+         ;; loop variables, which remain in scope per CLHS.  Re-extend a
+         ;; fresh env with WITH bindings + each iteration var's final value.
+         (let ((rf-env env))
+           (dolist (wb with-bindings)
+             (setq rf-env (%env-extend-pair wb rf-env)))
+           (dolist (st iter-state)
+             (let ((cb (%loop-cell-cur-binding st)))
+               (when cb
+                 (setq rf-env (%env-extend (car cb) (cdr cb) rf-env)))))
+           (%eval-in-env return-form rf-env)))
         (default-accum
          (let ((acc (assoc default-accum accums))
                (cell (assoc default-accum acc-state)))
@@ -1961,6 +1989,37 @@
         (when (or (eq k :always) (eq k :never))
           (setq found t)))
       (setq cur (cdr cur)))))
+
+(defun %loop-cell-cur-binding (st)
+  "Return (VAR . CURRENT-VALUE) for the iteration var of state cell ST as
+   it was bound at the END of the PREVIOUS iteration, or NIL if the var
+   has no current value yet (first iteration, before this cell stepped).
+
+   Used to pre-extend the per-iteration step-env with every loop var's
+   prior value BEFORE any cell steps, so a step form may forward-reference
+   a var introduced by a later FOR clause — e.g. CLHS-legal
+     (loop :for prev = nil :then c :for c :across vec ...)
+   where PREV's `:then c` reads C, bound by the later `:for c :across`.
+   Without this, sequential cell-by-cell env threading leaves C unbound
+   when PREV's THEN form runs (PREV is stepped first)."
+  (let ((kind (car st)))
+    (cond
+      ((eq kind :for-eq)
+       ;; CUR is (caddr st); valid once the first-flag (nth 4 st) is set.
+       (when (nth 4 st)
+         (let ((var (cadr st)))
+           (when (symbolp var) (cons var (caddr st))))))
+      ((eq kind :for-from)
+       ;; CUR is (caddr st); valid once first-p flag (nth 9 st) is set.
+       (when (nth 9 st)
+         (cons (cadr st) (caddr st))))
+      ((eq kind :for-across)
+       ;; Index (caddr st) points at the NEXT element; the currently-bound
+       ;; value is vec[i-1] once i>0.
+       (let ((i (caddr st)) (vec (cadddr st)))
+         (when (and (integerp i) (> i 0))
+           (cons (cadr st) (aref vec (- i 1))))))
+      (t nil))))
 
 (defun %loop-step-cell (st env)
   "Advance one iteration-state cell and return (CONS NEW-ENV NIL)

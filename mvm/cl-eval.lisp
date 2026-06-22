@@ -951,7 +951,11 @@
                        (named (and (consp spec) (consp (car spec))))
                        (var (if named (cadr (car spec))
                                 (if (consp spec) (car spec) spec)))
-                       (kw-spec (if named (car (car spec)) spec))
+                       ;; Non-named keyword indicator is the VAR symbol (not
+                       ;; the whole spec cons — (symbol-name '(b 3)) is garbage
+                       ;; and silently un-binds (b 3)-style &key specs, which
+                       ;; broke defmethod &key value binding).
+                       (kw-spec (if named (car (car spec)) var))
                        (init (if (and (consp spec) (cdr spec)) (cadr spec) nil))
                        (supplied-p-var (if (and (consp spec) (cdr spec) (cddr spec))
                                            (caddr spec) nil))

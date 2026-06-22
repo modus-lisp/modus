@@ -4302,13 +4302,17 @@
 ;; arg head, or unknown key (unless :allow-other-keys T precedes it).
 (defun %parse-str-cmp-bounds (args)
   (let ((s1 0) (e1 nil) (s2 0) (e2 nil) (o args) (allow-other nil))
-    ;; Pre-scan for :allow-other-keys T so callers can opt out of the
-    ;; strict check.  Modus has no real keyword-validation framework
-    ;; so this is the minimum CLHS requires.
+    ;; Pre-scan for :allow-other-keys.  CLHS 3.4.1.4: the value of the
+    ;; FIRST (leftmost) occurrence governs.  So stop at the first
+    ;; :allow-other-keys — a later ":allow-other-keys t" must NOT override
+    ;; a leading ":allow-other-keys nil" (string-*.error.6 passes
+    ;; ":allow-other-keys nil :allow-other-keys t :foo bar" and expects a
+    ;; program-error because the leading nil makes :foo illegal).
     (let ((scan args))
       (loop (when (or (null scan) (null (cdr scan))) (return))
-        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
-          (setq allow-other t))
+        (when (eq (car scan) :allow-other-keys)
+          (when (cadr scan) (setq allow-other t))
+          (return))
         (setq scan (cddr scan))))
     (loop (when (null o) (return))
       (when (null (cdr o))

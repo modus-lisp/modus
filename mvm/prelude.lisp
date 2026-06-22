@@ -678,11 +678,15 @@
    Honors :START1/:END1/:START2/:END2 — internal 2-arg callers still
    work (args is NIL, bounds default to full strings)."
   (let* ((s1 0) (e1 nil) (s2 0) (e2 nil) (o args) (allow-other nil))
-    ;; Pre-scan for :allow-other-keys T.
+    ;; Pre-scan for :allow-other-keys — LEFTMOST-wins (CLHS 3.4.1.4): the
+    ;; value of the FIRST occurrence governs, so stop at the first one.
+    ;; string-equal.error.6 passes ":allow-other-keys nil :allow-other-keys
+    ;; t :foo bar" and expects a program-error (leading nil => :foo illegal).
     (let ((scan args))
       (loop (when (or (null scan) (null (cdr scan))) (return))
-        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
-          (setq allow-other t))
+        (when (eq (car scan) :allow-other-keys)
+          (when (cadr scan) (setq allow-other t))
+          (return))
         (setq scan (cddr scan))))
     (loop (when (null o) (return))
       (when (null (cdr o))

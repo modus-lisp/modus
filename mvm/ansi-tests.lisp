@@ -2815,6 +2815,71 @@
 
 ;;; CLOS diagnostics
 (defun run-clos-diag-tests ()
+  ;; ==== DEFMACRO probes (9560-9569) — isolate the defmacro cluster crash ====
+  ;; 9560: compiled nested DEFMACRO should return the macro NAME, not NIL.
+  (rt-run-test 9560
+    (eq (defmacro dmprobe-1 (x y) `(list 1 ,x 2 ,y 3)) 'dmprobe-1)
+    t)
+  ;; 9561: macro-function should be set after the compiled DEFMACRO.
+  (rt-run-test 9561 (notnot (macro-function 'dmprobe-1)) t)
+  ;; 9562: runtime EVAL of the compiled macro expands+evals correctly.
+  ;; 9565: is the raw expander present (compiled lambda, not interp-closure)?
+  (rt-run-test 9565 (notnot (%raw-macro-expander 'dmprobe-1)) t)
+  ;; 9566: does macroexpand-1 produce the expansion (no crash)?
+  (rt-run-test 9566 (handler-case (macroexpand-1 '(dmprobe-1 (quote a) (quote b)))
+                      (t (c) :crashed))
+               '(list 1 (quote a) 2 (quote b) 3))
+  (rt-run-test 9562 (handler-case (eval `(dmprobe-1 'a 'b)) (t (c) :crashed))
+               '(1 a 2 b 3))
+  ;; 9563: macro-function of DEFMACRO funcalled w/ no args → program-error.
+  (rt-run-test 9563
+    (handler-case (progn (funcall (macro-function 'defmacro)) nil)
+      (error (c) t))
+    t)
+  ;; 9564: &whole macro (defmacro.6 shape).
+  (rt-run-test 9564
+    (progn (defmacro dmprobe-6 (&whole w arg) `(list ',w ',arg))
+           (eval `(dmprobe-6 x)))
+    '((dmprobe-6 x) x))
+  ;; 9570: defmacro.2 — return-from in macro body.
+  (rt-run-test 9570
+    (progn (defmacro dmprobe-2 (x y) (return-from dmprobe-2 `(cons ,x ,y)))
+           (eval `(dmprobe-2 'a 'b)))
+    '(a . b))
+  ;; 9571: defmacro.4 — &optional with default + special declare in body.
+  (rt-run-test 9571
+    (let ((y :good))
+      (declare (special y))
+      (defmacro dmprobe-4 (&optional (x y))
+        (declare (special y))
+        x)
+      (macroexpand-1 '(dmprobe-4)))
+    :good)
+  ;; 9572: defmacro.5 — declares + docstring + body.
+  (rt-run-test 9572
+    (progn (defmacro dmprobe-5 () (declare) (declare) "a doc" (declare) t)
+           (eval `(dmprobe-5)))
+    t)
+  ;; 9574/9575: defmacro.error.2/.3 — funcall macro-function of DEFMACRO
+  ;; with 1 / 3 args (should signal, not SIGSEGV).
+  (rt-run-test 9574
+    (handler-case (progn (funcall (macro-function 'defmacro)
+                                  '(defmacro nonexistent-macro ())) nil)
+      (error (c) t))
+    t)
+  (rt-run-test 9575
+    (handler-case (progn (funcall (macro-function 'defmacro)
+                                  '(defmacro nonexistent-macro ()) nil nil) nil)
+      (error (c) t))
+    t)
+  ;; 9573: defmacro.3 — lexical macro fn (closure over x).
+  (rt-run-test 9573
+    (let (fn)
+      (let ((x 0))
+        (setq fn #'(lambda (n) (setq x n)))
+        (defmacro dmprobe-3 () `',x))
+      (list (eval '(dmprobe-3)) (funcall fn 'a) (eval '(dmprobe-3))))
+    '(0 a a))
   ;; ==== SEQ AREF probes (9120-9134) placed FIRST so they run before
   ;; any later diag divergence (the tail of this fn is pre-broken). ====
   (rt-run-test 9120 (let ((a nil))

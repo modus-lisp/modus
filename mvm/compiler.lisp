@@ -3096,11 +3096,69 @@
              (body (cdddr form)))
          (when (and (stringp (car body)) (cdr body))
            (setq body (cdr body)))
-         (let ((expander (eval `(lambda (form)
-                                  (destructuring-bind (,@params) (cdr form)
-                                    ,@body)))))
-           (mvm-define-macro (normalize-name name) expander))
-         (compile-nil dest)))
+         ;; Macro lambda-lists can lead with &whole VAR and/or carry
+         ;; &environment VAR.  destructuring-bind itself does NOT accept
+         ;; &environment, and &whole must bind to the WHOLE call form (not
+         ;; (cdr form)).  Split them out here so the expander binds them
+         ;; explicitly and destructures the REST against (cdr form).
+         ;;   whole-var  = the &whole binding symbol (or NIL)
+         ;;   env-var    = the &environment binding symbol (or NIL)
+         ;;   d-params   = params with &whole/&environment removed
+         (let ((whole-var nil) (env-var nil) (d-params nil) (rest params))
+           ;; Leading &whole VAR
+           (when (and (consp rest) (symbolp (car rest))
+                      (name-eq (car rest) "&WHOLE"))
+             (setq whole-var (cadr rest))
+             (setq rest (cddr rest)))
+           ;; Scan remainder for &environment VAR (may appear anywhere).
+           (let ((acc nil) (cur rest))
+             (loop
+               (when (null cur) (return))
+               (if (and (symbolp (car cur)) (name-eq (car cur) "&ENVIRONMENT"))
+                   (progn (setq env-var (cadr cur)) (setq cur (cddr cur)))
+                   (progn (push (car cur) acc) (setq cur (cdr cur)))))
+             (setq d-params (nreverse acc)))
+           ;; (1) Compile-time registration so OTHER forms in this same
+           ;; compilation unit that USE the macro can expand against it.
+           (let ((expander
+                  (eval `(lambda (form)
+                           (let* (,@(when whole-var `((,whole-var form)))
+                                  ,@(when env-var `((,env-var nil))))
+                             (declare (ignorable ,@(when whole-var (list whole-var))
+                                                 ,@(when env-var (list env-var))))
+                             (destructuring-bind (,@d-params) (cdr form)
+                               ,@body))))))
+             (mvm-define-macro (normalize-name name) expander))
+         ;; (2) RUNTIME registration + return-the-name.  An ANSI deftest
+         ;; like defmacro.1 does `(eq (defmacro NAME (..) ..) 'NAME)` and
+         ;; then `(eval '(NAME ..))`, so the compiled nested DEFMACRO must
+         ;; (a) return the macro NAME (not NIL) and (b) install a runtime
+         ;; expander into *macro-function-table* so a later runtime EVAL of
+         ;; `(NAME ..)` can macroexpand it.  Without it the EVAL falls
+         ;; through to a call on an undefined function and SIGSEGVs (sank
+         ;; the whole defmacro chunk).
+         ;;
+         ;; The expander we register is a *compiled* `(lambda (form)
+         ;; (destructuring-bind PARAMS (cdr form) BODY))` — NOT a runtime
+         ;; %interp-closure.  This matters: the macro BODY almost always
+         ;; contains a backquote (`(list ,x ..)`), and the runtime EVAL
+         ;; (%eval-compound) has no backquote handler, so an %interp-closure
+         ;; expander would crash trying to "call" QUASIQUOTE.  A compiled
+         ;; lambda has its backquote expanded by THIS compiler.  cl-eval's
+         ;; macro-dispatch (and macroexpand-1) call a non-interp-closure
+         ;; expander as `(funcall mf form)`, which is exactly this lambda's
+         ;; contract.
+           (compile-form
+            `(progn
+               (set-macro-function ',name
+                                   (function
+                                    (lambda (mform)
+                                      (let* (,@(when whole-var `((,whole-var mform)))
+                                             ,@(when env-var `((,env-var nil))))
+                                        (destructuring-bind (,@d-params) (cdr mform)
+                                          ,@body)))))
+               ',name)
+            env dest))))
       ;; DEFSTRUCT inside an expression context.  Same fall-through trap
       ;; as nested DEFUN / DEFMACRO.  Route through mvm-compile-toplevel
       ;; which already knows how to process DEFSTRUCT — registers

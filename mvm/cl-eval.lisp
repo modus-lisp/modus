@@ -898,7 +898,16 @@
   (let ((new-env env)
         (ps params)
         (as args)
-        (rest-list nil))
+        (rest-list nil)
+        ;; Section tracker (CLHS 3.4.1): we start in the REQUIRED section.
+        ;; A cons in the REQUIRED section is a nested sub-pattern to
+        ;; destructure (`(level)` -> bind LEVEL to the CAR of the arg);
+        ;; the SAME cons shape in the &optional/&key section is a
+        ;; (var init [supplied-p]) spec.  These are syntactically
+        ;; ambiguous, so the nested-required branch below must ONLY fire
+        ;; while IN-REQUIRED.  Cleared by the first
+        ;; &optional/&rest/&body/&key/&aux marker.
+        (in-required t))
     (loop
       (cond
         ((null ps) (return new-env))
@@ -914,6 +923,7 @@
         ;; synonym for &rest in macro lambda-lists (CLHS 3.4.4) and ASDF's
         ;; with-upgradability uses `((&optional) &body body)`.
         ((or (%eval-sym-eq (car ps) "&REST") (%eval-sym-eq (car ps) "&BODY"))
+         (setq in-required nil)
          (setq ps (cdr ps))
          (when ps
            (setq rest-list as)
@@ -926,10 +936,12 @@
         ;; &optional — fall through; subsequent positionals consume from AS
         ;; with NIL fallback.
         ((%eval-sym-eq (car ps) "&OPTIONAL")
+         (setq in-required nil)
          (setq ps (cdr ps)))
         ;; &key — every remaining param (until &aux or end) is matched by
         ;; :KEY-name in (rest-list or AS).
         ((%eval-sym-eq (car ps) "&KEY")
+         (setq in-required nil)
          (setq ps (cdr ps))
          (let ((kw-args (or rest-list as)))
            (loop
@@ -995,6 +1007,7 @@
          )
         ;; &aux — bind each subsequent (var init) without consuming AS.
         ((%eval-sym-eq (car ps) "&AUX")
+         (setq in-required nil)
          (setq ps (cdr ps))
          (loop
            (when (null ps) (return new-env))
@@ -1004,6 +1017,26 @@
              (setq new-env (%env-extend var (if init (%eval-in-env init new-env) nil) new-env))
              (setq ps (cdr ps))))
          (return new-env))
+        ;; Nested REQUIRED sub-pattern in a (macro) lambda-list — a cons
+        ;; in the REQUIRED section (before any &optional/&rest/&key/&aux)
+        ;; is NEVER an (var init) spec; it is a sub-lambda-list to
+        ;; destructure against the corresponding ARG (CLHS 3.4.4.1).
+        ;; e.g. with-deprecation's `((level) &body definitions)`: the
+        ;; first arg `(version-deprecation ...)` must be destructured so
+        ;; LEVEL = (version-deprecation ...), NOT the whole 1-elt list.
+        ;; SECTION-AWARENESS is load-bearing: the same `(level)` shape in
+        ;; the &optional/&key section means `(var init)` and must fall to
+        ;; the positional `(t ...)` branch — so this branch is gated on
+        ;; IN-REQUIRED.  Recurse via %bind-params (not %loop-bind-pattern)
+        ;; so the sub-pattern may itself contain &optional/&rest/&key.
+        ((and in-required (consp (car ps)))
+         (let ((subpat (car ps))
+               (subarg (if as (car as) nil)))
+           (setq new-env (%bind-params subpat
+                                       (if (consp subarg) subarg nil)
+                                       new-env))
+           (setq ps (cdr ps))
+           (setq as (if as (cdr as) nil))))
         ;; Nested destructuring pattern in a (macro) lambda-list — a cons
         ;; whose CAR is itself a list or a lambda-list keyword can't be an
         ;; &optional (var init) spec; it's a sub-pattern destructured

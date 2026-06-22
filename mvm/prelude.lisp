@@ -1681,3 +1681,29 @@
       (when (= i n) (return result))
       (setq result (cons initial-element result))
       (setq i (+ i 1)))))
+
+;;; UIOP/OS environment-variable helpers.
+;;;
+;;; UIOP (vendor/asdf/asdf.lisp) defines GETENV and GETENVP inside a single
+;;; (with-upgradability () (defun getenv …) (defsetf getenv …) (defun getenvp …))
+;;; form.  Under runtime EVAL that whole form ABORTS on the (defsetf getenv …)
+;;; — leaving GETENVP undefined — so every later UIOP form that calls GETENVP
+;;; (detect-os, default-temporary-directory, argv0, configuration probing, …)
+;;; signals UNDEFINED-FUNCTION (asdf gauntlet FAILFORM 87 / 109).  Pre-defining
+;;; them here in the image makes them available regardless of whether that form
+;;; completes, and matches UIOP's own #+modus behaviour: Modus has no
+;;; environment access yet, so GETENV returns NIL and GETENVP therefore returns
+;;; NIL.  If runtime EVAL of the UIOP form ever succeeds it re-installs
+;;; identical-behaving definitions (last-defun-wins).
+(defun getenv (x)
+  "Query the environment, as in C getenv.  Modus has no environment access
+   yet, so this always returns NIL (the variable is treated as unset)."
+  (declare (ignorable x))
+  nil)
+
+(defun getenvp (x)
+  "Predicate: returns the named environment variable's value when it is
+   present and non-empty, else NIL.  See GETENV — on Modus the environment
+   is empty, so this is always NIL."
+  (let ((g (getenv x)))
+    (and g (stringp g) (> (length g) 0) g)))

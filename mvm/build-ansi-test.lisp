@@ -2107,6 +2107,8 @@
                               (rest-opts (cddr clause))
                               ;; Extract :report, :interactive, :test options
                               (report-opt nil)
+                              (interactive-opt nil)
+                              (test-opt nil)
                               (body-forms nil))
                          ;; Separate options from body
                          (let ((remaining rest-opts))
@@ -2120,25 +2122,36 @@
                                 (setf report-opt (cadr remaining))
                                 (setf remaining (cddr remaining)))
                                ((eq (car remaining) :interactive)
+                                (setf interactive-opt (cadr remaining))
                                 (setf remaining (cddr remaining)))
                                ((eq (car remaining) :test)
+                                (setf test-opt (cadr remaining))
                                 (setf remaining (cddr remaining)))
                                (t
                                 (setf body-forms remaining)
                                 (return)))))
-                         (let* ((body (mapcar #'rewrite-reader-forms body-forms))
-                                (fn-form `(lambda ,args ,@body))
-                                (report-form
-                                 (cond
-                                   ((null report-opt) nil)
-                                   ((stringp report-opt) `',report-opt)
-                                   ((symbolp report-opt) `#',report-opt)
-                                   ((and (consp report-opt) (eq (car report-opt) 'lambda))
-                                    report-opt)
-                                   (t nil))))
-                           (if report-form
-                               `(list ',rname ,fn-form ,report-form)
-                               `(list ',rname ,fn-form nil)))))
+                         ;; Coerce an option value (symbol / lambda / string)
+                         ;; into a form yielding a function (or string for
+                         ;; :report).  Used for :report, :interactive, :test.
+                         (flet ((opt-fn-form (opt allow-string)
+                                  (cond
+                                    ((null opt) nil)
+                                    ((and allow-string (stringp opt)) `',opt)
+                                    ((symbolp opt) `#',opt)
+                                    ((and (consp opt) (eq (car opt) 'lambda)) opt)
+                                    ((and (consp opt) (eq (car opt) 'function)) opt)
+                                    (t (rewrite-reader-forms opt)))))
+                           (let* ((body (mapcar #'rewrite-reader-forms body-forms))
+                                  (fn-form `(lambda ,args ,@body))
+                                  (report-form (opt-fn-form report-opt t))
+                                  (interactive-form (opt-fn-form interactive-opt nil))
+                                  (test-form (opt-fn-form test-opt nil)))
+                             ;; Cell shape passed to %with-restarts:
+                             ;; (NAME FN REPORT INTERACTIVE TEST).  %with-restarts
+                             ;; re-wraps as (NAME FN REPORT INTERACTIVE TEST :CASE).
+                             ;; Trailing NILs are harmless.
+                             `(list ',rname ,fn-form ,report-form
+                                    ,interactive-form ,test-form)))))
                      clauses)))
        `(%with-restarts (list ,@restart-forms) (lambda () ,protected-form))))
     ;; (restart-bind bindings body...)

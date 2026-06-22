@@ -752,7 +752,8 @@
     (dolist (frame *restart-stack*)
       (dolist (r frame)
         (when (and (not (member r *restarts-being-invoked* :test #'eq))
-                   (%restart-applicable-for-condition-p r condition))
+                   (%restart-applicable-for-condition-p r condition)
+                   (%restart-test-passes-p r condition))
           (setq result (cons r result)))))
     (nreverse result)))
 
@@ -786,6 +787,7 @@
               (let ((r (car rs)))
                 (when (and (not (member r *restarts-being-invoked* :test #'eq))
                            (%restart-applicable-for-condition-p r condition)
+                           (%restart-test-passes-p r condition)
                            (cond
                              (name-is-restart (eq r name))
                              ((stringp name)
@@ -801,6 +803,43 @@
 (defun restart-name (restart)
   "Get the name of a restart."
   (if (consp restart) (car restart) nil))
+
+(defun %restart-cell-p (obj)
+  "Recognise a restart-case restart cell —
+   (NAME FN REPORT INTERACTIVE TEST :CASE) — for the printer.  Requires a
+   function in slot 1 and a trailing :CASE marker so ordinary user lists
+   are not misclassified.  (restart-bind cells lack the :CASE marker and
+   are not printed specially.)"
+  (and (consp obj)
+       (consp (cdr obj))
+       (functionp (cadr obj))
+       (let ((cur (cddr obj)) (last-elt nil))
+         (loop
+           (when (not (consp cur)) (return nil))
+           (setq last-elt (car cur))
+           (setq cur (cdr cur)))
+         (eq last-elt :case))))
+
+(defun %restart-test-fn (r)
+  "Return the :TEST function of restart cell R, or NIL if none.
+   restart-case cells from %with-restarts are
+   (NAME FN REPORT INTERACTIVE TEST :CASE); TEST is the 5th element, but
+   only when a :CASE marker follows it (older 5-element cells have :CASE
+   in that 5th slot and no test)."
+  (and (consp r)
+       (let ((tail (cddddr r)))   ; (TEST :CASE) for case cells with a test
+         (and (consp tail) (consp (cdr tail))
+              (eq (cadr tail) :case)
+              (car tail)))))
+
+(defun %restart-test-passes-p (r condition)
+  "Apply restart R's :TEST predicate (if any) to CONDITION.  A restart
+   with no test always applies; a test that returns NIL excludes it.
+   Per CLHS, find-restart with no condition calls the test with NIL."
+  (let ((test (%restart-test-fn r)))
+    (if (and test (functionp test))
+        (funcall test condition)
+        t)))
 
 (defun %active-restart-p (obj)
   "Return T if OBJ is an active restart structure — i.e. a cons currently
@@ -1088,9 +1127,18 @@
     (dolist (r restarts-spec)
       (let ((rname  (car r))
             (rfn    (cadr r))
-            (report (caddr r)))
+            (report (caddr r))
+            ;; 4th / 5th spec elements: :interactive fn and :test fn
+            ;; (build-ansi-test.lisp's restart-case macro now threads
+            ;; these through; older 3-element specs leave them NIL).
+            (interactive (cadddr r))
+            (test (car (cddddr r))))
         (setq wrapped
-              (cons (list rname rfn report nil :case)
+              ;; Cell layout: (NAME FN REPORT INTERACTIVE TEST :CASE).
+              ;; invoke-restart-interactively reads INTERACTIVE (cadddr);
+              ;; find-restart consults TEST (5th); invoke-restart keys the
+              ;; :CASE style marker off the LAST element.
+              (cons (list rname rfn report interactive test :case)
                     wrapped))))
     (let ((frame (nreverse wrapped)))
       (setq *restart-stack* (cons frame *restart-stack*))
@@ -1150,8 +1198,13 @@
                (find-restart name-or-restart))))
     (if r
         (let ((rfn (cadr r))
+              ;; :CASE style is marked by a :CASE element anywhere past the
+              ;; (NAME FN REPORT …) prefix.  %with-restarts now appends an
+              ;; INTERACTIVE + TEST slot before the marker, so its index is
+              ;; no longer fixed at 4 — detect by membership.
               (style (and (consp r) (consp (cdr r)) (consp (cddr r))
-                          (consp (cdddr r)) (nth 4 r))))
+                          (consp (cdddr r))
+                          (if (member :case (cddddr r)) :case nil))))
           ;; Mark this restart as in-progress so a recursive invoke-restart
           ;; in rfn's body finds the NEXT applicable restart instead of
           ;; looping on this one (restart-case.12).

@@ -729,6 +729,23 @@
       ;; (1-slot subtag #x50, hash only).  symbolp recognises all four.
       ((symbolp obj)
        (%print-symbol-to-stream obj stream))
+      ;; Restart object — a restart-case cell
+      ;; (NAME FN REPORT INTERACTIVE TEST :CASE).  Per CLHS 9.1.4.2.3 a
+      ;; restart prints, when *print-escape* is NIL, using its :report
+      ;; (a string or a function of one stream arg) or, failing that, its
+      ;; NAME.  Detect BEFORE the generic cons printer so the restart
+      ;; doesn't print as a raw list.
+      ((%restart-cell-p obj)
+       (if escape
+           (progn
+             (%print-string-raw "#<RESTART " stream)
+             (%write-obj (car obj) stream level nil)
+             (%print-char 62 stream))    ; >
+           (let ((report (caddr obj)))
+             (cond
+               ((stringp report) (%print-string-raw report stream))
+               ((functionp report) (funcall report stream))
+               (t (%write-obj (car obj) stream level nil))))))
       ;; Adjustable wrapper: (cons 8765432 inner) — peel and recurse
       ((and (consp obj) (eql (car obj) 8765432) (consp (cdr obj)))
        (%write-obj (cdr obj) stream level escape))

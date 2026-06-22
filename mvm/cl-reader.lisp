@@ -1276,6 +1276,7 @@
   (cond
     ((null x) (intern "NIL" (find-package "KEYWORD")))
     ((eq x t) (intern "T" (find-package "KEYWORD")))
+    ((characterp x) (intern (string x) (find-package "KEYWORD")))
     ((stringp x) (intern x (find-package "KEYWORD")))
     ((symbolp x)
      (let ((pkg (symbol-package x)))
@@ -1296,13 +1297,20 @@
     ;; quoting them so eval doesn't re-evaluate (e.g. quote a symbol
     ;; value like X — the test expects the symbol X, not X's value).
     (let ((normalized nil)
+          (seen nil)
           (cur slot-args))
+      ;; CLHS 3.4.1.4: for duplicate slot keys, the LEFTMOST occurrence
+      ;; wins.  We dedup here because the constructor's &key handling is
+      ;; last-wins, the opposite of what #S requires.
       (loop
         (when (null cur) (return nil))
-        (let ((slot-name (car cur))
-              (slot-val (if (cdr cur) (cadr cur) nil)))
-          (setq normalized (cons (%ensure-keyword slot-name) normalized))
-          (setq normalized (cons (list 'quote slot-val) normalized)))
+        (let* ((slot-name (car cur))
+               (slot-val (if (cdr cur) (cadr cur) nil))
+               (kw (%ensure-keyword slot-name)))
+          (unless (member kw seen)
+            (setq seen (cons kw seen))
+            (setq normalized (cons kw normalized))
+            (setq normalized (cons (list 'quote slot-val) normalized))))
         (setq cur (if (cdr cur) (cddr cur) nil)))
       (let ((ctor-name (concatenate 'string "MAKE-" (symbol-name struct-type))))
         (let ((ctor-sym (intern ctor-name (symbol-package struct-type))))

@@ -220,6 +220,11 @@
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")
 
+(defvar *loop-exit-uwp-seq* 0
+  "UNWIND-PROTECT depth (%uwp-current-seq) active where *loop-exit-label*
+   was established, so a RETURN out of the loop that crosses an
+   unwind-protect runs that cleanup before branching to the loop exit.")
+
 (defvar *block-labels* nil
   "Alist of (name . exit-label) for block/return-from")
 
@@ -253,6 +258,37 @@
 
 (defvar *tagbody-tags* nil
   "Alist of (tag . label) for tagbody/go")
+
+;; -------------------------------------------------------------------
+;; Lexical UNWIND-PROTECT cleanup stack (NLX-through-unwind-protect).
+;;
+;; A lexical non-local exit — RETURN-FROM / RETURN / GO that compiles to
+;; a direct :br to an enclosing BLOCK exit-label or TAGBODY tag — must
+;; first run the cleanup of every UNWIND-PROTECT it jumps OUT of
+;; (innermost first, CLHS 5.2) AND pop each of those u-p setjmp frames
+;; off the runtime handler stack (TRAP #x0512).  The old fast path
+;; emitted a bare :br, skipping both: cleanups were lost AND the leaked
+;; setjmp frame at 0x10000180 held a stale RSP that a later longjmp/
+;; signal could land on (the canonical
+;;   (block b (unwind-protect (return-from b 1) CLEANUP))  case where
+;; CLEANUP did not run in source order / the continuation after the block
+;; was skipped).
+;;
+;; *uwp-cleanups* is a list of records (SEQ-ID ENV . CLEANUP-FORMS),
+;; innermost first.  compile-unwind-protect CONSes a fresh record (with
+;; a unique increasing SEQ-ID) while compiling its protected form, then
+;; unbinds it for the cleanup forms and everything after.
+;;
+;; Each lexical exit TARGET (a BLOCK exit-label, a TAGBODY tag) records
+;; the SEQ-ID of the innermost u-p that was active WHEN THE TARGET WAS
+;; ESTABLISHED (0 if none) via %uwp-current-seq.  At exit time we run
+;; (and pop) every u-p record whose SEQ-ID is GREATER than the target's
+;; — i.e. every u-p entered between the target and the exit point.
+(defvar *uwp-cleanups* nil
+  "Stack of active UNWIND-PROTECT cleanup records (SEQ-ID ENV . FORMS), innermost first.")
+
+(defvar *uwp-seq-counter* 0
+  "Monotonic counter assigning a unique depth id to each UNWIND-PROTECT.")
 
 (defvar *function-return-label* nil
   "Label for early return from function body (return outside loop)")
@@ -3225,10 +3261,14 @@
                                                 (normalize-name b))))))))
          (cond
            (entry
-            ;; entry = (name label block-dest).  Use block-dest so the
-            ;; value lands where the BLOCK form expects to read it from.
-            (compile-form (caddr form) env (caddr entry))
-            (emit-ir :br (cadr entry)))
+            ;; entry = (name label block-dest target-seq).  Use block-dest
+            ;; so the value lands where the BLOCK form expects to read it.
+            ;; Evaluate the result form FIRST (current dynamic env), then
+            ;; run the cleanup of every unwind-protect this RETURN-FROM
+            ;; jumps OUT of (innermost first, CLHS 5.2), preserving the
+            ;; value across those cleanups, then branch to the block exit.
+            (%compile-lexical-exit (caddr form) (caddr entry)
+                                   (or (cadddr entry) 0) (cadr entry) env))
            ;; Cross-unit: BLOCK lives in an enclosing function/lambda.
            ((assoc (normalize-name bname) *nonlocal-blocks* :test #'=)
             (let ((tag-val (cadr (assoc (normalize-name bname)
@@ -3852,6 +3892,11 @@
        (if *loop-exit-label*
            (progn
              (compile-nil dest)
+             ;; Run intervening unwind-protect cleanups on the way out.
+             (when (%uwp-pending-above *loop-exit-uwp-seq*)
+               (emit-ir :push dest)
+               (%emit-uwp-unwind-to *loop-exit-uwp-seq*)
+               (emit-ir :pop dest))
              (emit-ir :br *loop-exit-label*))
            (compile-nil dest)))
 
@@ -5880,10 +5925,12 @@
       (let* ((loop-label (make-compiler-label))
              (exit-label (make-compiler-label))
              (*loop-exit-label* exit-label)
+             (*loop-exit-uwp-seq* (%uwp-current-seq))
              (*block-labels*
                (if *suppress-loop-block-nil*
                    *block-labels*
-                   (cons (list nil exit-label dest) *block-labels*))))
+                   (cons (list nil exit-label dest (%uwp-current-seq))
+                         *block-labels*))))
         ;; Loop entry
         (emit-ir-label loop-label)
         ;; Compile loop body
@@ -7633,16 +7680,30 @@
     (cond
       (block-entry
        (let ((exit-label (cadr block-entry))
-             (block-dest (caddr block-entry)))
-         (compile-form value env block-dest)
-         (unless (= dest block-dest)
-           (emit-ir :mov dest block-dest))
-         (emit-ir :br exit-label)))
+             (block-dest (caddr block-entry))
+             (target-seq (or (cadddr block-entry) 0)))
+         ;; Run intervening unwind-protect cleanups (innermost first) on
+         ;; the way out, preserving the value — same as RETURN-FROM.  The
+         ;; old (mov dest block-dest) was dead (we :br away immediately);
+         ;; the value lands in block-dest where the BLOCK expects it.
+         (%compile-lexical-exit value block-dest target-seq exit-label env)))
       (*loop-exit-label*
        (compile-form value env dest)
+       ;; Run intervening unwind-protect cleanups on the way out of the loop.
+       (when (%uwp-pending-above *loop-exit-uwp-seq*)
+         (emit-ir :push dest)
+         (%emit-uwp-unwind-to *loop-exit-uwp-seq*)
+         (emit-ir :pop dest))
        (emit-ir :br *loop-exit-label*))
       (*function-return-label*
        (compile-form value env +vreg-vr+)
+       ;; Function-level early return: unwind ALL u-ps active in this unit
+       ;; (target-seq 0 — the cleanup stack is reset to nil at the
+       ;; function boundary, so this runs only function-local u-ps).
+       (when (%uwp-pending-above 0)
+         (emit-ir :push +vreg-vr+)
+         (%emit-uwp-unwind-to 0)
+         (emit-ir :pop +vreg-vr+))
        (emit-ir :br *function-return-label*))
       (t
        (error "MVM compiler: RETURN outside of BLOCK NIL, LOOP, or function")))))
@@ -7658,6 +7719,66 @@
          (or (and (integerp op) (= op hash))
              (and (symbolp op) (= (normalize-name op) hash))
              (and (symbolp op) (string= (symbol-name op) sym-name))))))
+
+(defun %uwp-current-seq ()
+  "SEQ-ID of the innermost currently-active UNWIND-PROTECT, or 0 if none.
+   A lexical exit TARGET records this when it is ESTABLISHED so the exit
+   emitter knows which u-p cleanups lie between the target and an exit."
+  (if *uwp-cleanups* (car (car *uwp-cleanups*)) 0))
+
+(defun %uwp-pending-above (target-seq)
+  "T if any active UNWIND-PROTECT has SEQ-ID > TARGET-SEQ (i.e. a lexical
+   exit to TARGET-SEQ's depth would cross at least one u-p cleanup)."
+  (and *uwp-cleanups*
+       (> (car (car *uwp-cleanups*)) target-seq)))
+
+(defun %emit-uwp-unwind-to (target-seq)
+  "Emit, in innermost-first order, the cleanup of every active
+   UNWIND-PROTECT whose SEQ-ID is GREATER than TARGET-SEQ — i.e. each u-p
+   entered between the lexical exit target and this exit point.  For each
+   such u-p we (1) TRAP #x0512 to pop its setjmp frame off the runtime
+   handler stack (matching the normal/error path order so a cleanup error
+   propagates to the OUTER handler, not back into this u-p), then (2)
+   compile its cleanup forms (results discarded, into +vreg-vr+ — NEVER
+   +vreg-vn+, which is the fixed NIL register; see compile-unwind-protect).
+
+   This is the missing teardown the old bare-:br fast path skipped: it
+   restores CLHS 5.2 cleanup-runs-on-NLX and pops the leaked setjmp frame.
+   Cleanups are emitted with *uwp-cleanups* progressively POPPED so a
+   cleanup form that itself performs a lexical exit only unwinds the
+   still-pending (outer) u-ps, never itself."
+  (let ((cursor *uwp-cleanups*))
+    (loop while (and cursor (> (car (car cursor)) target-seq))
+          do (let* ((rec (car cursor))
+                    (cl-env (cadr rec))
+                    (cl-forms (cddr rec))
+                    (*uwp-cleanups* (cdr cursor)))
+               ;; Pop the setjmp frame first (mirrors normal/error path so a
+               ;; cleanup error propagates to the OUTER handler, not back to
+               ;; this u-p's own — now-defunct — frame).
+               (emit-ir :trap #x0512)
+               (dolist (cf cl-forms)
+                 (compile-form cf cl-env +vreg-vr+)))
+             (setq cursor (cdr cursor)))))
+
+(defun %compile-lexical-exit (value-form value-dest target-seq exit-label env)
+  "Compile a lexical non-local exit (RETURN-FROM / RETURN to a BLOCK whose
+   exit-label is reachable in this unit):
+     1. evaluate VALUE-FORM into VALUE-DEST (the block's dest) in the
+        current dynamic environment;
+     2. run the cleanup of every UNWIND-PROTECT entered between the target
+        (TARGET-SEQ) and here, innermost first, preserving the value;
+     3. :br to EXIT-LABEL.
+   When no intervening u-p exists this is exactly the old fast path (no
+   push/pop, no extra emission)."
+  (compile-form value-form env value-dest)
+  (when (%uwp-pending-above target-seq)
+    ;; Cross at least one u-p: preserve the result across cleanup forms
+    ;; (which run arbitrary code and clobber regs), then restore.
+    (emit-ir :push value-dest)
+    (%emit-uwp-unwind-to target-seq)
+    (emit-ir :pop value-dest))
+  (emit-ir :br exit-label))
 
 (defun %return-from-escapes-block-p (body block-hash crossed-lambda shadowed)
   "Scan BODY (a list of forms) for a RETURN-FROM (or RETURN if BLOCK-HASH
@@ -7868,8 +7989,14 @@
           ;; outer catch/block handles it.
           (compile-form (cons 'catch (cons tag-val body)) env dest))
         ;; No cross-unit escape: plain lexical block (fast path).
+        ;; Record the current UNWIND-PROTECT depth (%uwp-current-seq) in the
+        ;; block entry so a RETURN-FROM that jumps out of an intervening
+        ;; unwind-protect runs that u-p's cleanup (and pops its setjmp
+        ;; frame) before the :br — the entry's 4th element is consumed by
+        ;; the RETURN-FROM lexical branch / compile-return.
         (let* ((exit-label (make-compiler-label))
-               (*block-labels* (cons (list name exit-label dest)
+               (*block-labels* (cons (list name exit-label dest
+                                           (%uwp-current-seq))
                                      *block-labels*)))
           (compile-progn body env dest)
           (emit-ir-label exit-label)))))
@@ -7885,16 +8012,24 @@
    per CLHS 5.6.1.2; the previous symbol-only check silently treated
    integer tags as forms — so `(tagbody 10 (return-from blk x))` after
    `(go 10)` never had a label for 10 to jump to."
-  (let ((*tagbody-tags* nil))
+  ;; Each tag entry is (TAG LABEL . TARGET-SEQ): TARGET-SEQ is the
+  ;; UNWIND-PROTECT depth (%uwp-current-seq) active at the TAGBODY's own
+  ;; level (where the tags live).  A (go tag) deep inside an
+  ;; unwind-protect in the body unwinds every u-p whose seq exceeds this
+  ;; — running their cleanups and popping their setjmp frames — before
+  ;; branching to the tag (CLHS 5.2).
+  (let ((*tagbody-tags* nil)
+        (tb-seq (%uwp-current-seq)))
     ;; First pass: collect tags and create labels
     (dolist (item body)
       (when (%tagbody-tag-p item)
-        (push (cons item (make-compiler-label)) *tagbody-tags*)))
+        (push (cons item (cons (make-compiler-label) tb-seq))
+              *tagbody-tags*)))
     ;; Second pass: compile
     (dolist (item body)
       (if (%tagbody-tag-p item)
           ;; It's a tag: emit label
-          (emit-ir-label (cdr (assoc item *tagbody-tags* :test #'eql)))
+          (emit-ir-label (cadr (assoc item *tagbody-tags* :test #'eql)))
           ;; It's a form: compile it
           (compile-form item env dest)))
     ;; Tagbody returns nil
@@ -7910,7 +8045,10 @@
         (format t "  WARN: unknown GO tag ~A~%" tag)
         (compile-nil dest)
         (return-from compile-go)))
-    (emit-ir :br (cdr entry))))
+    ;; entry = (TAG LABEL . TARGET-SEQ).  Run intervening unwind-protect
+    ;; cleanups before branching (GO carries no value, so no push/pop).
+    (%emit-uwp-unwind-to (cddr entry))
+    (emit-ir :br (cadr entry))))
 
 ;;; ============================================================
 ;;; Dotimes
@@ -8257,8 +8395,18 @@
     ;; NORMAL PATH: protected form returned without error
     ;; ---------------------------------------------------------------
 
-    ;; Compile the protected form; primary result lands in dest.
-    (compile-form protected-form env dest)
+    ;; Register this u-p on the lexical cleanup stack so a RETURN-FROM /
+    ;; RETURN / GO compiled INSIDE the protected form that branches out of
+    ;; this u-p (a direct :br to an enclosing BLOCK/TAGBODY target) runs
+    ;; THESE cleanup forms and pops THIS setjmp frame before it leaves.
+    ;; See *uwp-cleanups* / %emit-uwp-unwind-to.  The record is scoped to
+    ;; the protected form ONLY — the cleanup forms below run with it
+    ;; already popped (an exit inside cleanup must not re-enter cleanup).
+    (let* ((my-seq (incf *uwp-seq-counter*))
+           (*uwp-cleanups* (cons (list* my-seq env cleanup-forms)
+                                 *uwp-cleanups*)))
+      ;; Compile the protected form; primary result lands in dest.
+      (compile-form protected-form env dest))
 
     ;; Preserve primary result across cleanup forms (which may clobber regs).
     (emit-ir :push dest)
@@ -11796,9 +11944,16 @@
          ;; in source.  Block's dest is VR so RETURN-FROM <fname>
          ;; lands in the function-return register.
          (*block-labels* (if (symbolp name)
-                             (list (list name return-label +vreg-vr+))
+                             (list (list name return-label +vreg-vr+ 0))
                              nil))
-         (*tagbody-tags* nil))
+         (*tagbody-tags* nil)
+         ;; NLX-through-unwind-protect: u-ps in an ENCLOSING unit are not
+         ;; reachable by a lexical :br from inside this lambda/defun (the
+         ;; cross-unit exit goes through the runtime catch/throw path), so
+         ;; reset the cleanup stack at the compilation-unit boundary —
+         ;; exactly like *block-labels* / *tagbody-tags*.
+         (*uwp-cleanups* nil)
+         (*loop-exit-uwp-seq* 0))
     ;; Function prologue: push frame pointer, set up frame
     (emit-ir :frame-enter (length params))
 
@@ -13049,8 +13204,11 @@
         (*globals* (make-hash-table :test 'eql))
         (*constants* (make-hash-table :test 'eql))
         (*loop-exit-label* nil)
+        (*loop-exit-uwp-seq* 0)
         (*block-labels* nil)
         (*tagbody-tags* nil)
+        (*uwp-cleanups* nil)
+        (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
         (*init-thunk-names* nil)
         (all-ir nil))

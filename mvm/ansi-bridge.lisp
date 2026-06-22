@@ -5379,6 +5379,14 @@
        (let ((nm (%eval-sym-name head)))
          (and nm (gethash nm *%runtime-deftype-table*)))))
 
+(defun %subtypep-deftype-head-p (type)
+  "True iff TYPE's head (the symbol itself when atomic, or (car TYPE)
+   when compound) names a user DEFTYPE registered in
+   *%runtime-deftype-table*.  Used by %subtypep-result to decide whether
+   to expand TYPE before applying the built-in subtype lattice."
+  (let ((head (if (consp type) (car type) type)))
+    (and (symbolp head) (%deftype-lookup head) t)))
+
 (defun %expand-deftype (type)
   "Expand a user-deftype TYPE specifier (symbol or (name arg…)) to its
    underlying type specifier, or NIL if TYPE is not a user deftype."

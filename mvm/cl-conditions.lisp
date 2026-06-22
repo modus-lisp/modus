@@ -1460,6 +1460,19 @@
     ((eq t2 't) (cons t t))
     ;; Same name as itself
     ((and (symbolp t1) (symbolp t2) (eq t1 t2)) (cons t t))
+    ;; User DEFTYPE on either side — expand to the underlying type
+    ;; specifier and recurse (deftype.9-.13, .16-.19).  An atomic deftype
+    ;; name (e.g. SYM) or a compound (SYM arg…) both route through
+    ;; %expand-deftype.  Guarded by %subtypep-deftype-head-p so we only
+    ;; rewrite names actually registered in *%runtime-deftype-table* —
+    ;; built-in type names and CLOS classes fall through to the lattice
+    ;; paths below.  %expand-deftype may return NIL (the type NIL, e.g.
+    ;; deftype.18's empty body, or deftype.13's (&rest args)->NIL), which
+    ;; the recursion's trivial NIL clauses handle.
+    ((%subtypep-deftype-head-p t1)
+     (%subtypep-result (%expand-deftype t1) t2))
+    ((%subtypep-deftype-head-p t2)
+     (%subtypep-result t1 (%expand-deftype t2)))
     ;; Route compound types to the richer cl-types.lisp impl FIRST.
     ;; Detected by: either side is a compound (consp) — catches
     ;; (not X), (and ...), (or ...), (member ...), (integer L H), etc.

@@ -3674,9 +3674,56 @@
 
 (defvar internal-time-units-per-second 1000)
 
-(defun decode-universal-time (ut &optional tz)
-  "Decode universal time into components."
-  (values 0 0 0 1 1 2000 0 nil 0))
+(defun %leap-year-p (year)
+  (and (= 0 (mod year 4))
+       (or (not (= 0 (mod year 100)))
+           (= 0 (mod year 400)))))
+
+(defun %days-in-month (month year)
+  (cond
+    ((= month 2) (if (%leap-year-p year) 29 28))
+    ((or (= month 4) (= month 6) (= month 9) (= month 11)) 30)
+    (t 31)))
+
+;;; Decode a non-negative day count (days since 1900-01-01) into
+;;; (values year month date).
+(defun %decode-days (days)
+  (let ((year 1900))
+    ;; Advance whole years.
+    (loop
+      (let ((yd (if (%leap-year-p year) 366 365)))
+        (if (>= days yd)
+            (progn (setq days (- days yd)) (setq year (+ year 1)))
+            (return))))
+    ;; Advance whole months within YEAR.
+    (let ((month 1))
+      (loop
+        (let ((md (%days-in-month month year)))
+          (if (>= days md)
+              (progn (setq days (- days md)) (setq month (+ month 1)))
+              (return))))
+      (values year month (+ days 1)))))
+
+(defun decode-universal-time (ut &rest rest)
+  "Decode universal time UT (seconds since 1900-01-01 00:00:00 GMT) into
+   (values second minute hour date month year day daylight-p zone) per
+   CLHS 25.1.4.3.  REST may hold an optional time-zone TZ; >1 extra arg
+   is a program-error.  Modus has no real TZ database, so when TZ is
+   omitted we use GMT (zone 0, daylight nil) for a round-trippable result."
+  (when (cdr rest)
+    (%program-error "decode-universal-time accepts at most 2 arguments"))
+  (let* ((tz (if (consp rest) (car rest) 0))
+         ;; Local time = UT - zone*3600.
+         (local (- ut (* tz 3600)))
+         (secs-of-day (mod local 86400))
+         (days (floor (- local secs-of-day) 86400))
+         (second (mod secs-of-day 60))
+         (minute (mod (floor secs-of-day 60) 60))
+         (hour (floor secs-of-day 3600))
+         ;; 1900-01-01 is a Monday = day-of-week 0.
+         (day (mod days 7)))
+    (multiple-value-bind (year month date) (%decode-days days)
+      (values second minute hour date month year day nil tz))))
 
 ;; ENCODE-UNIVERSAL-TIME early stub removed 2026-06-01 — strict-arity
 ;; copy at L3381 wins.
@@ -4307,9 +4354,30 @@
 
 ;;; ENCODE-UNIVERSAL-TIME — strict 6-7 arg arity
 (defun encode-universal-time (second minute hour date month year &rest more)
+  "Encode a decoded time into universal time (seconds since 1900-01-01
+   00:00:00 GMT) per CLHS 25.1.4.3.  MORE may hold an optional time-zone
+   ZONE; when omitted, GMT (zone 0) is assumed (Modus has no TZ DB)."
   (if (cdr more)
       (%program-error "encode-universal-time requires 6 or 7 arguments")
-      0))
+      (let ((zone (if more (car more) 0)))
+        ;; Days from 1900-01-01 to YEAR-01-01.
+        (let ((days 0) (y 1900))
+          (loop while (< y year) do
+            (setq days (+ days (if (%leap-year-p y) 366 365)))
+            (setq y (+ y 1)))
+          ;; Days from YEAR-01-01 to YEAR-MONTH-01.
+          (let ((m 1))
+            (loop while (< m month) do
+              (setq days (+ days (%days-in-month m year)))
+              (setq m (+ m 1))))
+          ;; Add day-of-month (1-indexed).
+          (setq days (+ days (- date 1)))
+          ;; Local seconds + zone offset back to GMT.
+          (+ (* days 86400)
+             (* hour 3600)
+             (* minute 60)
+             second
+             (* zone 3600))))))
 ;;; GET-INTERNAL-REAL-TIME — uses Linux time(2) (syscall 201) when
 ;;; available, falls back to a monotonic counter.
 (defvar *%irt-counter* 0)

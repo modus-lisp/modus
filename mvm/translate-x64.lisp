@@ -1278,6 +1278,54 @@
                       (emit-imul-reg-reg buf d tmp) (emit-pop buf tmp))))
               (maybe-store-scratch buf vd)))))
 
+        ((op= +op-add-checked+)
+         ;; Tagged + with bignum overflow promotion.  tag(a)+tag(b)=2(a+b)=tag(a+b)
+         ;; directly (no untag needed); ADD sets OF iff a+b leaves fixnum range.
+         ;; Sum into R13 (saved) so va/vb vregs stay intact for the slow call.
+         ;; Same full caller-save ABI as op-mul-checked (GENERIC-ADD is a full
+         ;; Lisp call that clobbers all caller-saved regs and may GC).
+         (let* ((vd (first operands)) (va (second operands)) (vb (third operands))
+                (d (dest-phys-or-scratch vd))
+                (ga-label *x64-genadd-label*))
+           (cond
+             (ga-label
+              (let ((done (make-label)))
+                (emit-push buf 'r13)
+                (emit-load-vreg buf va 'r13)
+                (let ((pb (vreg-phys vb)))
+                  (if pb (emit-add-reg-reg buf 'r13 pb)
+                      (progn (emit-push buf 'rax) (emit-load-vreg buf vb 'rax)
+                             (emit-add-reg-reg buf 'r13 'rax) (emit-pop buf 'rax))))
+                (emit-jcc buf :no done)
+                ;; --- overflow slow path: GENERIC-ADD(va, vb) ---
+                (emit-push buf 'rsi) (emit-push buf 'rdi)
+                (emit-push buf 'r8)  (emit-push buf 'r9)
+                (emit-push buf 'rcx) (emit-push buf 'rdx)
+                (emit-push buf 'r10) (emit-push buf 'r11)
+                (emit-push buf 'rbx)
+                (emit-load-vreg buf va 'rsi)
+                (emit-load-vreg buf vb 'rdi)
+                (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
+                (emit-call buf ga-label)
+                (emit-mov-reg-reg buf 'r13 'rax)
+                (emit-pop buf 'rbx)
+                (emit-pop buf 'r11) (emit-pop buf 'r10)
+                (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+                (emit-pop buf 'r9)  (emit-pop buf 'r8)
+                (emit-pop buf 'rdi) (emit-pop buf 'rsi)
+                (emit-label buf done)
+                (emit-mov-reg-reg buf d 'r13)
+                (emit-pop buf 'r13)
+                (maybe-store-scratch buf vd)))
+             (t
+              (emit-load-vreg buf va d)
+              (let ((pb (vreg-phys vb)))
+                (if pb (emit-add-reg-reg buf d pb)
+                    (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                      (emit-push buf tmp) (emit-load-vreg buf vb tmp)
+                      (emit-add-reg-reg buf d tmp) (emit-pop buf tmp))))
+              (maybe-store-scratch buf vd)))))
+
         ((op= +op-mul26lo+)
          ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
          ;; On x64: untag both, IMUL (64-bit result is enough), AND 0x3FFFFFF, retag
@@ -3705,6 +3753,7 @@
 (defun mcgc-page-gc-label () *mcgc-page-gc-label*)
 
 (defvar *x64-genmul-label* nil)  ; GENERIC-MULTIPLY label for op-mul-checked
+(defvar *x64-genadd-label* nil)  ; GENERIC-ADD label for op-add-checked
 
 ;;; Label of the shared out-of-line cons-kind-bit setter (emit-mcgc-cons-bit-
 ;;; subroutine).  Published here so the cons alloc sites (+op-cons+ /
@@ -5696,6 +5745,10 @@
     (setf *x64-genmul-label*
           (loop for entry in function-table
                 when (string-equal (first entry) "GENERIC-MULTIPLY")
+                  return (gethash (second entry) fn-offset-to-label)))
+    (setf *x64-genadd-label*
+          (loop for entry in function-table
+                when (string-equal (first entry) "GENERIC-ADD")
                   return (gethash (second entry) fn-offset-to-label)))
     ;; Find the label for %gc-collect
     (let ((gc-collect-label (when gc-collect-entry

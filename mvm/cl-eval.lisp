@@ -4933,7 +4933,7 @@
              ;; carry into hi.  Same logic as %bignum-negate-parts.
              (if (= lo 0)
                  (make-bignum 0 hi)
-                 (make-bignum (+ 1 (logxor lo 4611686018427387903))
+                 (make-bignum (%fixnum-+ 1 (logxor lo 4611686018427387903))
                               (- hi 1)))
              (bignum-to-fixnum-if-possible (make-bignum lo hi)))))
       ;; 3+ limbs: allocate a big-bignum.
@@ -4974,9 +4974,9 @@
           ;; Negative — two's complement to sign-magnitude.
           (if (= lo 0)
               (cons -1 (list 0 (- 0 hi)))
-              (let* ((m-lo (+ 1 (logxor lo 4611686018427387903)))
+              (let* ((m-lo (%fixnum-+ 1 (logxor lo 4611686018427387903)))
                      (m-hi (- (logxor hi -1) 0))   ; ~hi
-                     (m-hi+1 (+ m-hi (if (= m-lo 4611686018427387904) 1 0)))
+                     (m-hi+1 (%fixnum-+ m-hi (if (= m-lo 4611686018427387904) 1 0)))
                      (m-lo-clamped (logand m-lo 4611686018427387903)))
                 (cons -1 (list m-lo-clamped m-hi+1))))))))
     ((< n 0) (cons -1 (list (- 0 n))))
@@ -5020,7 +5020,7 @@
         (return (nreverse result)))
       (let* ((a (if xs (car xs) 0))
              (b (if ys (car ys) 0))
-             (sum (+ a b carry))
+             (sum (%fixnum-+ (%fixnum-+ a b) carry))
              ;; Detect carry: tagged add wraps to negative iff sum ≥ 2^62.
              (limb (logand sum 4611686018427387903))
              (next-carry (if (< sum 0) 1 0)))
@@ -5069,7 +5069,7 @@
              (b (if ys (car ys) 0))
              (diff (- a b borrow))
              (limb (if (< diff 0)
-                       (+ diff 4611686018427387904)   ; +2^62
+                       (%fixnum-+ diff 4611686018427387904)   ; +2^62
                        diff))
              (next-borrow (if (< diff 0) 1 0)))
         (setq result (cons limb result))
@@ -5095,7 +5095,7 @@
     (loop (when (null cur) (return (nreverse result)))
       (let* ((lo (car cur))
              (hi (if (cdr cur) (cadr cur) 0))
-             (limb (+ lo (ash hi 31))))
+             (limb (%fixnum-+ lo (ash hi 31))))
         (setq result (cons limb result))
         (setq cur (if (cdr cur) (cddr cur) nil))))))
 
@@ -5124,7 +5124,7 @@
                   (let ((pos (+ i j)))
                     (loop (when (= carry 0) (return nil))
                       (let* ((cur (aref out pos))
-                             (sum (+ cur carry))
+                             (sum (%fixnum-+ cur carry))
                              (lo (logand sum 2147483647))
                              (newcarry (ash sum -31)))
                         (aset out pos lo)
@@ -5135,7 +5135,7 @@
                    (prod (* ai bj))
                    (pos (+ i j))
                    (cur (aref out pos))
-                   (sum (+ cur prod carry))
+                   (sum (%fixnum-+ (%fixnum-+ cur prod) carry))
                    (lo (logand sum 2147483647))
                    (newcarry (ash sum -31)))
               (aset out pos lo)
@@ -5154,9 +5154,9 @@
       (ash n 1)))
 (defun %shl1-bignum (lo hi)
   (make-bignum (logand (ash lo 1) 4611686018427387903)
-               (+ (ash hi 1) (ash lo -61))))
+               (%fixnum-+ (ash hi 1) (ash lo -61))))
 (defun %shr1-bignum (lo hi)
-  (make-bignum (+ (ash lo -1) (logand (ash hi 61) 4611686018427387903))
+  (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi 61) 4611686018427387903))
                (ash hi -1)))
 (defun bignum-ash (n count)
   "Arithmetic shift N by COUNT bits, promoting to bignum on left-shift
@@ -5191,7 +5191,7 @@
   "Convert fixnum N to (lo . hi) bignum parts."
   (if (>= n 0)
       (cons n 0)
-      (cons (+ n 4611686018427387904) -1)))
+      (cons (%fixnum-+ n 4611686018427387904) -1)))
 
 (defun bignum-add (a b)
   "Add A and B, where either may be a fixnum, small bignum, or big
@@ -5225,19 +5225,19 @@
                    (%fixnum-to-bignum-parts a)))
            (bp (if (bignump b) (cons (bignum-lo b) (bignum-hi b))
                    (%fixnum-to-bignum-parts b))))
-       (let ((sum-lo (+ (car ap) (car bp))))
+       (let ((sum-lo (%fixnum-+ (car ap) (car bp))))
          (let ((carry (if (< sum-lo 0) 1 0))
                (lo (logand sum-lo 4611686018427387903)))
-           (let ((sum-hi (+ (+ (cdr ap) (cdr bp)) carry)))
+           (let ((sum-hi (%fixnum-+ (%fixnum-+ (cdr ap) (cdr bp)) carry)))
              (bignum-to-fixnum-if-possible (make-bignum lo sum-hi)))))))))
 
 (defun %bignum-negate-parts (lo hi)
   "Negate bignum with parts lo,hi. Two's complement: invert + add 1."
   (if (= lo 0)
       ;; No overflow: ~0 + 1 = 2^62, carry into hi
-      (make-bignum 0 (+ (logxor hi -1) 1))
+      (make-bignum 0 (%fixnum-+ (logxor hi -1) 1))
       ;; ~lo + 1 < 2^62 when lo > 0, so no carry
-      (make-bignum (+ 1 (logxor lo 4611686018427387903)) (logxor hi -1))))
+      (make-bignum (%fixnum-+ 1 (logxor lo 4611686018427387903)) (logxor hi -1))))
 
 (defun bignum-negate (n)
   "Negate N (fixnum or bignum)."
@@ -5424,10 +5424,10 @@
      (let ((lo (bignum-lo n)) (hi (bignum-hi n)))
        (if (< hi 0)
            ;; Negative: negate via two's complement.
-           (let ((neg-lo (+ 1 (logxor lo 4611686018427387903)))
+           (let ((neg-lo (%fixnum-+ 1 (logxor lo 4611686018427387903)))
                  (neg-hi (logxor hi -1)))
              (cond ((>= neg-lo 4611686018427387904)
-                    (list 1 0 (+ neg-hi 1)))
+                    (list 1 0 (%fixnum-+ neg-hi 1)))
                    (t (list -1 neg-lo neg-hi))))
            (list 1 lo hi))))
     ((< n 0) (list -1 (- 0 n) 0))

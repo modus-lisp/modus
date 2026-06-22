@@ -335,6 +335,15 @@
                  (reg-set regs vd (+ (reg-get regs va) (reg-get regs vb)))
                  (setf pc npc3)))))
 
+          (#.+op-add-checked+
+           ;; High-level `+`: promote on overflow via GENERIC-ADD.
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (generic-add (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+
           (#.+op-sub+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)

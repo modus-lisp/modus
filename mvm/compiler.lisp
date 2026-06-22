@@ -8763,7 +8763,7 @@
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
-         (emit-arith-pair :add "GENERIC-ADD" dest temp)
+         (emit-arith-pair :add-checked "GENERIC-ADD" dest temp)
          (free-temp-reg))))))
 
 (defun compile-sub (args env dest)
@@ -11922,6 +11922,7 @@
       (:subs  4)
       (:mul   4)
       (:mul-checked 4)
+      (:add-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
       (:mul64lo 4)
@@ -12178,6 +12179,8 @@
            (mvm-mul buf (second insn) (third insn) (fourth insn)))
           (:mul-checked
            (mvm-mul-checked buf (second insn) (third insn) (fourth insn)))
+          (:add-checked
+           (mvm-add-checked buf (second insn) (third insn) (fourth insn)))
           (:mul26lo
            (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
           (:mul26hi

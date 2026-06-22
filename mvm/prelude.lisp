@@ -1447,14 +1447,14 @@
   ;; Composite key: name-hash for no-package syms (legacy / uninterned),
   ;; otherwise combine name-hash + pkg-hash so that the same name in two
   ;; packages keys to two distinct slots.  Multiplier is a large prime;
-  ;; mod 2^62 keeps the result in fixnum range.  MUST use %fixnum-* (raw,
-  ;; wrapping :mul): plain * now promotes on overflow to a BIGNUM, and
-  ;; in-image (logand <bignum> mask) is lossy — that produced an
+  ;; mod 2^62 keeps the result in fixnum range.  MUST use %fixnum-+ / %fixnum-*
+  ;; (raw, wrapping :add / :mul): plain + and * now promote on overflow to a
+  ;; BIGNUM, and in-image (logand <bignum> mask) is lossy — that produced an
   ;; inconsistent intern key and symbols failed to resolve ("implicit
   ;; global <param>").  The mask makes the wraparound irrelevant.
   (let ((key (if (= pkg-hash 0)
                  name-hash
-                 (logand (+ name-hash (%fixnum-* pkg-hash 2305843009213693951))
+                 (logand (%fixnum-+ name-hash (%fixnum-* pkg-hash 2305843009213693951))
                          #x3FFFFFFFFFFFFFFF))))
     (let ((table (mem-ref #x10000088 :u64)))
       (let ((existing (gethash key table)))

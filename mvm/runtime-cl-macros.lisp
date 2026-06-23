@@ -238,17 +238,6 @@
            (cons 'let (cons (list (list vals (list 'multiple-value-list form)))
                             (append (nreverse acc) (list (car vars))))))))"
 
-    ;; NTH-VALUE — must expand at RUNTIME EVAL so FORM is evaluated in a
-    ;; multiple-values context.  The cl-clos.lisp runtime defun is broken
-    ;; for n>=1 (it reads the MV buffer AFTER it's been reset to 1 by the
-    ;; funcall machinery, and only the primary survives as an ordinary
-    ;; argument), so plain (nth-value 1 (values 10 20 30)) returned NIL.
-    ;; Registering it as a real runtime macro makes the eval dispatcher's
-    ;; macro branch win over the defun and gives MACRO-FUNCTION a proper
-    ;; arity-checking wrapper (nth-value.error.1-3).
-    "(defmacro nth-value (n form)
-       (list 'nth n (list 'multiple-value-list form)))"
-
     "(defmacro return (&rest args)
        (list 'return-from nil (if args (car args) nil)))"
 

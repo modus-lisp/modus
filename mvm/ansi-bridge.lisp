@@ -1074,7 +1074,9 @@
             (when (= digit-count 0)
               (if junk-allowed
                   (return-from parse-integer (values nil i))
-                  (error "parse-integer: no digits")))
+                  (error (make-condition 'parse-error
+                                         :format-control "parse-integer: no digits"
+                                         :format-arguments nil))))
             ;; Check trailing chars: skip trailing whitespace, then check
             ;; if anything non-whitespace remains.
             (unless junk-allowed
@@ -1084,7 +1086,9 @@
                   (let ((c (%prim-aref string j)))
                     (when (and (not (= c 32)) (not (= c 9)) (not (= c 10))
                                (not (= c 12)) (not (= c 13)))
-                      (error "parse-integer: junk after digits")))
+                      (error (make-condition 'parse-error
+                                             :format-control "parse-integer: junk after digits"
+                                             :format-arguments nil))))
                   (setq j (+ j 1)))
                 (setq i j)))
             (values (* sign result) i)))))))

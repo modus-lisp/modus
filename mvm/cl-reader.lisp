@@ -807,14 +807,26 @@
                       (t
                        (setq n (+ (* n base) digit))))
                     (setq got-digit t) (setq cur (cdr cur)))
-                  ;; Check for trailing dot (integer token like "123.")
+                  ;; Check for trailing dot (integer token like "123.").
+                  ;; CLHS 2.3.1: a token of digits with a single trailing dot
+                  ;; is ALWAYS decimal regardless of *read-base*.  Re-parse the
+                  ;; digits (without the dot) in base 10.  If any digit is not
+                  ;; a valid decimal digit (e.g. "1F."), this returns NIL and
+                  ;; the token falls through to be read as a symbol.
                   (if (and (= code 46) (null (cdr cur)) got-digit)
                       (return-from %try-parse-integer
-                        (cons (if (or (bignump n) (= sign 1))
-                                  (if (= sign 1) n (bignum-sub 0 n))
-                                  (- 0 n))
-                              t))
+                        (%try-parse-integer (%codes-drop-last codes) 10))
                       (return-from %try-parse-integer nil)))))))))
+
+(defun %codes-drop-last (codes)
+  "Return a fresh list of CODES with its final element removed.
+   Used by %try-parse-integer to strip a trailing decimal dot."
+  (let ((acc nil) (cur codes))
+    (loop
+      (when (or (null cur) (null (cdr cur)))
+        (return (nreverse acc)))
+      (setq acc (cons (car cur) acc))
+      (setq cur (cdr cur)))))
 
 ;;; The name `%make-float` is intercepted by Modus's compiler as a
 ;;; primop that allocates a 1-slot uninitialized float object (see

@@ -337,21 +337,24 @@
 (defvar *%mexp-trace* nil)
 (defun %macro-expander-shim (form &rest extra)
   "Top-level dispatcher for macro-function-wrapper closures.
-   CLHS §3.1.2.1.2.2 requires macro-function to accept exactly
-   (form environment).  We allow nargs 2 (strict CLHS) and ALSO
-   nargs 1 — macroexpand-1 calls with 1 arg first and only falls
-   back to 2 on error, so requiring 2 would break expansion until
-   the fallback catches.  Anything else signals PROGRAM-ERROR.
+   CLHS §3.1.2.1.2.2 requires a macro function to be called with
+   exactly two arguments (the whole macro-call form and an
+   environment object).  Calling it with any other number of
+   arguments signals PROGRAM-ERROR — this is what the ANSI
+   `X.ERROR.1/2/3` tests check (0, 1 and 3+ args respectively).
 
-   The 1-arg leniency means *.error.2 tests that pass a single
-   form arg (no env) still don't see program-error — closing that
-   needs distinguishing internal vs external callers.  +24 from
-   the 0-arg and 3+-arg paths is the achievable subset."
+   This is safe because NO internal caller funcalls the wrapper
+   with 1 arg: macroexpand-1 and the runtime-EVAL macro dispatch
+   both go through %RAW-MACRO-EXPANDER (the bare expander), never
+   the user-facing wrapper, and MACROEXPAND funcalls it with
+   (form nil) = 2 args.  Tightening 1-arg to PROGRAM-ERROR unlocks
+   the `X.ERROR.2` test across every macro (WHEN/UNLESS/CASE/
+   TYPECASE/COND/PSETQ/NTH-VALUE/MULTIPLE-VALUE-SETQ/…)."
   (declare (ignore extra))
   (let ((nargs (mem-ref #x10000150 :u32)))
     (setq *%mexp-trace* nargs)
     (cond
-      ((or (= nargs 1) (= nargs 2))
+      ((= nargs 2)
        (funcall (car (%get-cenv)) form))
       (t (%signal-program-error)))))
 
@@ -373,7 +376,11 @@
   (declare (ignore extra))
   (let ((nargs (mem-ref #x10000150 :u32)))
     (cond
-      ((or (= nargs 1) (= nargs 2))
+      ;; Exactly 2 args (form env) per CLHS §3.1.2.1.2.2.  No internal
+      ;; caller funcalls this wrapper with 1 arg (macroexpand-1 and
+      ;; runtime-EVAL dispatch use %RAW-MACRO-EXPANDER), so rejecting
+      ;; 1-arg as program-error makes the X.ERROR.2 tests pass.
+      ((= nargs 2)
        (%call-interp-closure (car (%get-cenv)) (cdr form)))
       (t (%signal-program-error)))))
 

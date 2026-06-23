@@ -1087,12 +1087,44 @@
 
 (defun make-hash-table (&rest options)
   "Create a hash table.  Honoring OPTIONS (`&key TEST SIZE
-   REHASH-SIZE REHASH-THRESHOLD`) is delegated to make-hash-table-args
-   when any options were supplied; the no-arg path returns the cheap
-   legacy (cons nil nil) shape that all internal callers rely on."
+   REHASH-SIZE REHASH-THRESHOLD`) is delegated to make-hash-table-args.
+   The no-arg path builds a %HT-TAG-tagged table (alist still in the CAR,
+   so internal callers that car/set-car the alist are unaffected) so
+   HASH-TABLE-P can distinguish a real hash-table from an arbitrary cons.
+   The TEST slot is NIL (not the symbol EQL) — INIT-SYMBOL-TABLE calls this
+   at the very first instruction of boot, before the symbol intern table
+   exists, so quoting 'EQL here would intern into an uninitialised table
+   and fault.  HASH-TABLE-TEST maps a NIL test slot to EQL."
   (if (null options)
-      (cons nil nil)
+      (cons nil (cons (%ht-tag) (cons nil (cons 2 (cons 1 16)))))
       (make-hash-table-args options)))
+
+(defun %ht-keytest (ht)
+  "Return the key-comparator FUNCTION for HT's stored :TEST.
+
+   Reads the raw test slot of the metadata directly (NOT via
+   HASH-TABLE-TEST) and dispatches.  This is on the GETHASH/PUTHASH hot
+   path and runs DURING %INTERN-SYMBOL-PKG at the very first instruction
+   of boot — so the NIL-test fast path (every 0-arg / legacy table, incl.
+   the symbol intern table itself) must return EQL WITHOUT quoting any
+   symbol.  Quoting 'EQL here would call %INTERN-SYMBOL-PKG → GETHASH →
+   %HT-KEYTEST → ... infinite recursion → stack overflow at boot.
+   Symbol comparison (which interns 'EQ/'EQUAL/'EQUALP) is reached only
+   for explicit-:TEST tables, all created after the symbol table exists.
+
+   The NIL fast path returns %EQUAL-FN — NOT %EQL-FN — to exactly match
+   the historical hardcoded-EQUAL behavior of every 0-arg / legacy table.
+   Several internal 0-arg tables key on STRINGS (e.g. *MACRO-FUNCTION-
+   TABLE* via %MACRO-SYM-KEY, the SFT name strings) and would MISS under
+   EQL.  This is strictly no worse than the pre-fix behavior, and only
+   explicit-:TEST tables get the newly-correct EQ/EQL/EQUALP dispatch."
+  (let ((m (%ht-meta ht)))
+    (let ((tn (if m (car m) nil)))
+      (cond ((null tn)        (function %equal-fn)) ; 0-arg / legacy: EQUAL
+            ((eq tn 'eq)      (function %eq-fn))
+            ((eq tn 'eql)     (function %eql-fn))
+            ((eq tn 'equalp)  (function equalp))
+            (t                (function %equal-fn))))))
 
 (defun gethash (key ht &optional default)
   "Look up KEY in hash table HT.  Returns (values value present-p);
@@ -1101,12 +1133,13 @@
    inside the search loop and call `values' once at the tail — calling
    `values' inside `return' was losing the second value (loop+return
    appears to clobber MV-count on its way out)."
-  (let ((found-pair nil))
+  (let ((found-pair nil)
+        (cmp (%ht-keytest ht)))
     (let ((cur (car ht)))
       (loop
         (when (null cur) (return nil))
         (let ((pair (car cur)))
-          (when (equal (car pair) key)
+          (when (funcall cmp (car pair) key)
             (setq found-pair pair)
             (return nil)))
         (setq cur (cdr cur))))
@@ -1116,24 +1149,26 @@
 
 (defun puthash (key ht value)
   "Set KEY to VALUE in hash table HT. Returns VALUE."
-  (let ((cur (car ht)))
+  (let ((cur (car ht))
+        (cmp (%ht-keytest ht)))
     (loop
       (when (null cur)
         (let ((new-pair (cons key value)))
           (set-car ht (cons new-pair (car ht))))
         (return value))
       (let ((pair (car cur)))
-        (when (equal (car pair) key)
+        (when (funcall cmp (car pair) key)
           (set-cdr pair value)
           (return value)))
       (setq cur (cdr cur)))))
 
 (defun remhash (key ht)
   "Remove KEY from hash table HT. Returns T if removed, NIL otherwise."
-  (let ((entries (car ht)))
+  (let ((entries (car ht))
+        (cmp (%ht-keytest ht)))
     (if (null entries)
         nil
-        (if (equal (car (car entries)) key)
+        (if (funcall cmp (car (car entries)) key)
             (progn
               (set-car ht (cdr entries))
               t)
@@ -1141,7 +1176,7 @@
                   (cur (cdr entries)))
               (loop
                 (when (null cur) (return nil))
-                (when (equal (car (car cur)) key)
+                (when (funcall cmp (car (car cur)) key)
                   (set-cdr prev (cdr cur))
                   (return t))
                 (setq prev cur)
@@ -1175,17 +1210,20 @@
 
 (defun hash-table-p (ht)
   "True iff HT is a hash-table created by MAKE-HASH-TABLE.
-   Recognizes both the legacy (cons alist nil) and the modern
-   (cons alist (cons %ht-tag meta)) shapes."
+   Requires the (cons alist (cons %ht-tag meta)) shape — every table
+   MAKE-HASH-TABLE now produces (incl. the 0-arg path) is tagged, so an
+   arbitrary cons such as (cons X nil) or a 1-element list no longer
+   false-positives."
   (and (consp ht)
        (let ((c (cdr ht)))
-         (or (null c)                              ; legacy
-             (and (consp c) (eql (car c) (%ht-tag)))))))
+         (and (consp c) (eql (car c) (%ht-tag))))))
 
 (defun hash-table-test (ht)
   "Return the test designator for HT — one of EQ EQL EQUAL EQUALP.
-   Legacy 0-arg tables report EQL (the ANSI default)."
-  (let ((m (%ht-meta ht))) (if m (car m) 'eql)))
+   0-arg tables carry a NIL test slot (see MAKE-HASH-TABLE) and report
+   EQL (the ANSI default)."
+  (let ((m (%ht-meta ht)))
+    (if (and m (car m)) (car m) 'eql)))
 
 (defun hash-table-rehash-size (ht)
   "Return the rehash-size of HT (default 2)."

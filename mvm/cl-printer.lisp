@@ -2272,6 +2272,249 @@
            (setq count (+ count 1)))
          (cons new-i rest-args))))))
 
+;;; ~<...~> justification helpers (CLHS 22.3.5.2, simple justification only).
+;;; We deliberately do NOT implement the ~:; column-overflow clause or the
+;;; logical-block / pretty-printer variant — those tests stay failing.
+
+(defun %format-find-close-angle (control start len)
+  "Scan CONTROL from START for the matching ~> (respecting nested ~<...~>).
+   Skips parameters (digits, comma, -, V/v, #, '<char>) and modifiers (:, @)
+   between ~ and the directive char.  Returns the position of the ~ in the
+   ~> pair, or NIL if not found."
+  (let ((pos start) (depth 1) (result nil))
+    (loop
+      (when (or result (>= pos len)) (return result))
+      (if (/= (%prim-aref control pos) 126)
+          (setq pos (+ pos 1))
+          (let ((p (+ pos 1)))
+            (loop
+              (when (>= p len) (return nil))
+              (let ((c (%prim-aref control p)))
+                (cond
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p len) (setq p (+ p 1))))
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 58) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (return nil)))))
+            (when (>= p len) (return result))
+            (let ((dch (%prim-aref control p)))
+              (cond
+                ((= dch 60) (setq depth (+ depth 1)) (setq pos (+ p 1)))
+                ((= dch 62)
+                 (setq depth (- depth 1))
+                 (if (= depth 0)
+                     (setq result pos)
+                     (setq pos (+ p 1))))
+                (t (setq pos (+ p 1))))))))))
+
+(defun %format-close-angle-end (control close-pos len)
+  "Return the position immediately after the closing >.  CLOSE-POS points
+   to the ~ in ~>.  Scans forward through any modifiers/params to land just
+   past the >."
+  (let ((p (+ close-pos 1)))
+    (loop
+      (when (>= p len) (return len))
+      (let ((c (%prim-aref control p)))
+        (cond
+          ((= c 62) (return (+ p 1)))
+          ((or (= c 58) (= c 64)
+               (and (>= c 48) (<= c 57))
+               (= c 45) (= c 44) (= c 118) (= c 86)
+               (= c 35) (= c 39))
+           (setq p (+ p 1)))
+          (t (return (+ p 1))))))))
+
+(defun %format-split-segments (body)
+  "Split a justification BODY string on top-level ~; (code 59), respecting
+   nesting of ~<...~> and ~{...~} and skipping params/modifiers/'<char>
+   when scanning past each ~.  Returns a list of segment substrings."
+  (let ((len (array-length body))
+        (segs nil)
+        (seg-start 0)
+        (pos 0))
+    (loop
+      (when (>= pos len)
+        (setq segs (cons (%substring body seg-start len) segs))
+        (return (%reverse-list segs)))
+      (if (/= (%prim-aref body pos) 126)
+          (setq pos (+ pos 1))
+          ;; ~ — scan past params/modifiers to the directive char.
+          (let ((p (+ pos 1)) (dch nil))
+            (loop
+              (when (>= p len) (return nil))
+              (let ((c (%prim-aref body p)))
+                (cond
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p len) (setq p (+ p 1))))
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 58) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (setq pos len))
+              ((= dch 59)  ; ~; top-level segment separator
+               (setq segs (cons (%substring body seg-start pos) segs))
+               (setq pos (+ p 1))
+               (setq seg-start pos))
+              ;; Nested ~<...~> or ~{...~}: skip to matching close so an
+              ;; inner ~; doesn't split us.
+              ((= dch 60)
+               (let ((close (%format-find-close-angle body (+ p 1) len)))
+                 (if close
+                     (setq pos (%format-close-angle-end body close len))
+                     (setq pos len))))
+              ((= dch 123)
+               (let ((close (%format-find-close-brace body (+ p 1) len)))
+                 (if close
+                     (setq pos (%format-close-brace-end body close len))
+                     (setq pos len))))
+              (t (setq pos (+ p 1)))))))))
+
+(defun %reverse-list (lst)
+  (let ((r nil) (p lst))
+    (loop
+      (when (null p) (return r))
+      (setq r (cons (car p) r))
+      (setq p (cdr p)))))
+
+(defun %format-justify (stream body arg-list colonp atp param1 param2 param3 param4)
+  "Render a simple ~<...~> justification.  BODY is the substring between
+   ~< and ~>.  Returns the remaining arg-list.
+   PARAM1=mincol(0) PARAM2=colinc(1) PARAM3=minpad(0) PARAM4=padchar(#\\Space).
+   Honors ~^ (escape in segment k drops segments k..N)."
+  (declare (special *format-iter-escape*))
+  (let* ((mincol (if param1 param1 0))
+         (colinc (if param2 param2 1))
+         (minpad (if param3 param3 0))
+         (padcode (%ensure-char-code (if param4 param4 32)))
+         (segs (%format-split-segments body))
+         (rendered nil)   ; reversed list of segment strings (kept ones)
+         (args arg-list)
+         (escaped nil))
+    (when (or (null colinc) (= colinc 0)) (setq colinc 1))
+    ;; Render each segment, threading args.  ~^ in a segment drops it and
+    ;; all following segments.
+    (let ((p segs))
+      (loop
+        (when (or (null p) escaped) (return nil))
+        (let ((s (make-string-output-stream)))
+          (setq *format-iter-escape* nil)
+          (setq args (%format-impl s (car p) args))
+          (if *format-iter-escape*
+              (progn (setq *format-iter-escape* nil) (setq escaped t))
+              (setq rendered (cons (get-output-stream-string s) rendered))))
+        (setq p (cdr p))))
+    (let* ((kept (%reverse-list rendered))
+           (nsegs (length kept))
+           (text-len 0))
+      (let ((k kept))
+        (loop
+          (when (null k) (return nil))
+          (setq text-len (+ text-len (array-length (car k))))
+          (setq k (cdr k))))
+      ;; Number of inter-segment gaps that receive padding.
+      ;; N segments → N-1 internal gaps; : adds a leading gap, @ a trailing.
+      (let* ((internal-gaps (if (> nsegs 1) (- nsegs 1) 0))
+             ;; GAPS = number of padding insertion points used for
+             ;; distributing the justification padding.
+             (gaps (cond
+                     ((= nsegs 1)
+                      (cond ((and colonp atp) 2)
+                            (colonp 1)
+                            (atp 1)
+                            (t 1)))   ; default: pad before (right justify)
+                     (t (+ internal-gaps
+                           (if colonp 1 0)
+                           (if atp 1 0)))))
+             ;; MINPAD-GAPS = number of gaps that get at least MINPAD chars.
+             ;; CLHS 22.3.5.2: minpad is a minimum BETWEEN segments — it does
+             ;; NOT apply to the lone right-justify pad point of a single
+             ;; segment with no : or @ modifier (format.justify.8).  A :
+             ;; (leading) or @ (trailing) gap does count.
+             (minpad-gaps (cond
+                            ((= nsegs 1)
+                             (+ (if colonp 1 0) (if atp 1 0)))
+                            (t (+ internal-gaps
+                                  (if colonp 1 0)
+                                  (if atp 1 0))))))
+        ;; CLHS 22.3.5.2: field width = smallest value of the form
+        ;; mincol + k*colinc (k >= 0) that is >= text + minpad*minpad-gaps.
+        (let ((needed (+ text-len (* minpad minpad-gaps)))
+              (total mincol))
+          (loop
+            (when (>= total needed) (return nil))
+            (setq total (+ total colinc)))
+          (let* ((pad-total (- total text-len))
+                 (gapn gaps))
+            (when (< pad-total 0) (setq pad-total 0))
+            (when (= gapn 0) (setq gapn 1))
+            ;; Distribute pad-total across gapn gaps, extra to leftmost gaps.
+            (let* ((base (%floordiv pad-total gapn))
+                   (extra (- pad-total (* base gapn))))
+              (%format-emit-justified stream kept nsegs colonp atp
+                                      base extra padcode))))))
+    args))
+
+(defun %floordiv (a b)
+  (if (= b 0) 0 (truncate a b)))
+
+(defun %format-emit-pad (n code stream)
+  (let ((i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (%print-char code stream)
+      (setq i (+ i 1)))))
+
+(defun %format-emit-justified (stream segs nsegs colonp atp base extra padcode)
+  "Emit the kept SEGS interleaved with padding gaps.  BASE is the base pad
+   per gap; EXTRA gaps get one more (leftmost-first).  Gap layout:
+     nsegs=1: one gap, placed before/after/both per : @.
+     nsegs>1: internal gaps (nsegs-1), plus a leading gap if :, trailing if @."
+  ;; gap-sizes computed on the fly; we track which gap index we're at.
+  (let ((gap-idx 0))
+    (flet ((gap-size ()
+             (let ((sz base))
+               (when (< gap-idx extra) (setq sz (+ sz 1)))
+               (setq gap-idx (+ gap-idx 1))
+               sz)))
+      (cond
+        ((= nsegs 0)
+         ;; No segments (e.g. ~<~>): one gap; emit base+extra padding.
+         (%format-emit-pad (+ base extra) padcode stream))
+        ((= nsegs 1)
+         (let ((seg (car segs)))
+           (cond
+             ((and colonp atp)
+              (%format-emit-pad (gap-size) padcode stream)
+              (%print-string-raw seg stream)
+              (%format-emit-pad (gap-size) padcode stream))
+             (atp
+              (%print-string-raw seg stream)
+              (%format-emit-pad (gap-size) padcode stream))
+             (t  ; colonp or plain: pad before (right justify)
+              (%format-emit-pad (gap-size) padcode stream)
+              (%print-string-raw seg stream)))))
+        (t
+         ;; Leading gap if colonp.
+         (when colonp (%format-emit-pad (gap-size) padcode stream))
+         (let ((p segs) (first t))
+           (loop
+             (when (null p) (return nil))
+             (when (not first)
+               (%format-emit-pad (gap-size) padcode stream))
+             (%print-string-raw (car p) stream)
+             (setq first nil)
+             (setq p (cdr p))))
+         ;; Trailing gap if atp.
+         (when atp (%format-emit-pad (gap-size) padcode stream)))))))
+
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)
 (defun %format-impl (stream control args)
@@ -2785,6 +3028,25 @@
                                (let ((selected (nth default-idx sections)))
                                  (when selected
                                    (setq arg-list (%format-impl stream selected arg-list))))))))))))
+                  ;; ~<...~> — justification (CLHS 22.3.5.2, simple variant).
+                  ;; Params: mincol(0), colinc(1), minpad(0), padchar(#\Space).
+                  ;; We do NOT support the ~:; column-overflow clause or the
+                  ;; logical-block/pretty-printer variant.
+                  ((= dir 60)
+                   (let ((close (%format-find-close-angle control i len)))
+                     (if (null close)
+                         ;; No matching ~> — echo the directive literally.
+                         (progn (%print-char 126 stream) (%print-char dir stream))
+                         (let ((body (%substring control i close))
+                               (new-i (%format-close-angle-end control close len)))
+                           (setq arg-list
+                                 (%format-justify stream body arg-list
+                                                  colonp atp
+                                                  param1 param2 param3 param4))
+                           (setq i new-i)))))
+                  ;; ~> — close justification (consumed by ~< handler; no-op
+                  ;; if reached standalone)
+                  ((= dir 62) nil)
                   ;; ~{ ~} — iteration (with optional :, @, or :@ flags)
                   ((= dir 123)
                    (let ((new-i-and-args

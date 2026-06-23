@@ -2381,6 +2381,8 @@
   ;; bignump is checked BEFORE integerp: a bignum satisfies integerp, so the
   ;; old (integerp a)(integerp b) first-clause matched bignum operands and ran
   ;; the raw inline (logand a b) on tagged heap pointers -> garbage.
+  ;; TOTAL: every bignum combination (incl. negatives) routes through the
+  ;; two's-complement engine; only fixnum∧fixnum takes the raw fast path.
   (cond
     ((and (bignump a) (bignump b)) (bignum-logand-bignum a b))
     ((bignump a) (bignum-logand-fixnum a b))
@@ -2390,10 +2392,9 @@
 
 (defun generic-logior (a b)
   (cond
-    ((and (bignump a) (bignump b)) (error "logior: NYI for bignum∨bignum"))
-    ;; bignum ∨ small-fixnum-mask: the bignum's bits beyond f's width
-    ;; are untouched; bits inside f's width OR together.  When f fits
-    ;; in a single 62-bit limb we just OR f into the bignum's low limb.
+    ((and (bignump a) (bignump b)) (bignum-logior-bignum a b))
+    ;; bignum ∨ fixnum: two's-complement engine handles negatives and any
+    ;; mask width totally (was a low-limb-only stub before).
     ((bignump a) (bignum-logior-fixnum a b))
     ((bignump b) (bignum-logior-fixnum b a))
     ((and (integerp a) (integerp b)) (logior a b))
@@ -2401,7 +2402,7 @@
 
 (defun generic-logxor (a b)
   (cond
-    ((and (bignump a) (bignump b)) (error "logxor: NYI for bignum⊕bignum"))
+    ((and (bignump a) (bignump b)) (bignum-logxor-bignum a b))
     ((bignump a) (bignum-logxor-fixnum a b))
     ((bignump b) (bignum-logxor-fixnum b a))
     ((and (integerp a) (integerp b)) (logxor a b))

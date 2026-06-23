@@ -5401,50 +5401,139 @@
     ((big-bignum-p b) (%bb-limb b 0))
     (t (bignum-lo b))))
 
-(defun bignum-logand-fixnum (b f)
-  "Compute (logand b f) where B is a bignum and F is a fixnum mask."
+;;; --- Total two's-complement bitwise engine ---
+;;;
+;;; CLHS defines logand/logior/logxor on negative integers as if operating
+;;; on infinite two's-complement bit strings.  Modus stores bignums in
+;;; SIGN-MAGNITUDE form, so we convert each operand to a finite two's-
+;;; complement limb vector (LSB-first, 62-bit limbs), apply the op
+;;; limb-by-limb (each limb carries 62 real bits, so a plain fixnum
+;;; logand/logior/logxor on the limb is exact), then convert the result
+;;; back to a sign-magnitude bignum/fixnum via %make-bb.  This is TOTAL —
+;;; it never errors on any integer pair, positive or negative, fixnum or
+;;; bignum, mixed width.
+
+;;; NB: the limb mask 2^62-1 is written as the LITERAL 4611686018427387903
+;;; throughout this engine — Modus does NOT run defconstant/defvar init
+;;; thunks at boot (CLAUDE.md limitation #7), so a named constant would
+;;; read NIL at runtime and silently corrupt every limb op.
+
+(defun %sign-to-tc (sm width)
+  "Convert SM = (sign . mag-limbs-LSB-first) to a two's-complement limb
+   list of exactly WIDTH limbs (each in [0, 2^62-1]), sign-extended.
+   Positive: pad magnitude with 0 limbs.  Negative: invert each limb and
+   add 1 (two's complement), pad with 0 BEFORE inverting so the high
+   limbs become mask (all-ones) after inversion."
+  (let* ((sign (car sm))
+         (mag (cdr sm))
+         ;; Pad magnitude to WIDTH limbs with zeros (LSB-first).
+         (padded (let ((acc nil) (cur mag) (i 0))
+                   (loop (when (>= i width) (return (nreverse acc)))
+                     (setq acc (cons (if cur (car cur) 0) acc))
+                     (when cur (setq cur (cdr cur)))
+                     (setq i (+ i 1))))))
+    (if (= sign -1)
+        ;; Two's complement = invert all limbs, then add 1.  Invert a
+        ;; 62-bit limb L as (mask - L) — a plain fixnum subtraction of two
+        ;; values ≤ mask, no overflow, no max-fixnum boundary hazard
+        ;; (raw %fixnum-+ on values reaching exactly max-fixnum proved
+        ;; unreliable here).  The +1 carry is handled by the PROVEN
+        ;; %add-limbs-mag, then truncated back to WIDTH limbs.
+        (let ((inverted (let ((acc nil) (cur padded))
+                          (loop (when (null cur) (return (nreverse acc)))
+                            (setq acc (cons (- 4611686018427387903 (car cur)) acc))
+                            (setq cur (cdr cur))))))
+          (%take-limbs (%add-limbs-mag inverted (list 1)) width))
+        padded)))
+
+(defun %take-limbs (lst n)
+  "Return the first N limbs of LST (LSB-first), padding with 0 if short."
+  (let ((acc nil) (cur lst) (i 0))
+    (loop (when (>= i n) (return (nreverse acc)))
+      (setq acc (cons (if cur (car cur) 0) acc))
+      (when cur (setq cur (cdr cur)))
+      (setq i (+ i 1)))))
+
+(defun %tc-sign-limb (sm)
+  "The infinite sign-extension limb for SM: 0 if non-negative, else mask."
+  (if (= (car sm) -1) 4611686018427387903 0))
+
+(defun %tc-to-integer (tc-limbs neg)
+  "Convert a two's-complement limb list TC-LIMBS (LSB-first, 62-bit) back
+   to a sign-magnitude integer.  NEG is non-nil iff the result is
+   negative (the op's sign-extension limb was mask).  Positive: limbs ARE
+   the magnitude.  Negative: magnitude = (invert + 1)."
+  (if neg
+      ;; Negative two's complement -> magnitude = ~tc + 1.  Invert via
+      ;; (mask - limb) then add 1 with the proven %add-limbs-mag.
+      (let ((inverted (let ((acc nil) (cur tc-limbs))
+                        (loop (when (null cur) (return (nreverse acc)))
+                          (setq acc (cons (- 4611686018427387903 (car cur)) acc))
+                          (setq cur (cdr cur))))))
+        (%make-bb -1 (%add-limbs-mag inverted (list 1))))
+      (%make-bb 1 tc-limbs)))
+
+(defun %limb-op (op x y)
+  "Apply OP (0=and, 1=ior, 2=xor) to two 62-bit limb fixnums X, Y.  Both
+   are non-negative tagged fixnums, so the raw compiled logand/logior/
+   logxor is exact (no bignum pointers involved).  An explicit dispatch
+   on a fixnum tag avoids funcall-ing a primop (logand has no callable
+   function object — the compiler inlines it)."
   (cond
-    ((= f 0) 0)
-    ;; For a positive bignum + small positive mask the result is just
-    ;; (low-limb AND mask).
-    (t (logand (%bignum-low-limb b) f))))
+    ((= op 0) (logand x y))
+    ((= op 1) (logior x y))
+    (t (logxor x y))))
+
+(defun %generic-bitwise (a b op)
+  "Apply OP (0=and, 1=ior, 2=xor) to integers A and B as if on infinite
+   two's-complement bit strings.  Returns a normalized integer.  TOTAL:
+   never errors on any integer pair."
+  (let* ((sa (%any-to-limbs a))
+         (sb (%any-to-limbs b))
+         (la (length (cdr sa)))
+         (lb (length (cdr sb)))
+         ;; +1 guard limb so the sign-extension limb is materialized and
+         ;; the result's sign is captured even when both inputs are the
+         ;; same width with high bit set.
+         (width (+ 1 (if (> la lb) la lb)))
+         (ta (%sign-to-tc sa width))
+         (tb (%sign-to-tc sb width))
+         (sign-a (%tc-sign-limb sa))
+         (sign-b (%tc-sign-limb sb))
+         (result-sign-limb (%limb-op op sign-a sign-b))
+         (neg (= result-sign-limb 4611686018427387903))
+         (out nil) (xs ta) (ys tb))
+    (loop (when (null xs) (return nil))
+      (setq out (cons (%limb-op op (car xs) (car ys)) out))
+      (setq xs (cdr xs))
+      (setq ys (cdr ys)))
+    (%tc-to-integer (nreverse out) neg)))
+
+(defun bignum-logand-fixnum (b f)
+  "Compute (logand b f) where B is a bignum and F is a fixnum.  Total:
+   routes through the two's-complement engine for correctness with
+   negative operands and wide masks."
+  (%generic-bitwise b f 0))
 
 (defun bignum-logand-bignum (a b)
-  "Stub — full bignum-AND not implemented; defer to fixnum-collapsed lo limb."
-  (logand (%bignum-low-limb a) (%bignum-low-limb b)))
+  "Total bignum∧bignum via the two's-complement engine."
+  (%generic-bitwise a b 0))
 
 (defun bignum-logior-fixnum (b f)
-  "Compute (logior b f) for bignum B and small fixnum F.  When F fits in
-   one limb (≤ 62 bits) the high limbs of B are unchanged; OR F into the
-   low limb and rebuild."
-  (cond
-    ((= f 0) b)
-    ((big-bignum-p b)
-     ;; Rebuild limbs with the low one ORed.
-     (let* ((sign (%bb-sign b))
-            (limbs (%bb-limbs-list b))
-            (new (cons (logior (car limbs) f) (cdr limbs))))
-       (%make-bb sign new)))
-    (t
-     ;; Small bignum: OR into lo only when sign positive; for negative
-     ;; values the magnitude representation diverges from two's
-     ;; complement above the LSB, so we just return the bignum unchanged
-     ;; for now (correctness gap acknowledged — see comment above).
-     (let ((lo (bignum-lo b)) (hi (bignum-hi b)))
-       (bignum-to-fixnum-if-possible (make-bignum (logior lo f) hi))))))
+  "Compute (logior b f) for bignum B and fixnum F.  Total."
+  (%generic-bitwise b f 1))
+
+(defun bignum-logior-bignum (a b)
+  "Total bignum∨bignum via the two's-complement engine."
+  (%generic-bitwise a b 1))
 
 (defun bignum-logxor-fixnum (b f)
-  "Compute (logxor b f) for bignum B and small fixnum F."
-  (cond
-    ((= f 0) b)
-    ((big-bignum-p b)
-     (let* ((sign (%bb-sign b))
-            (limbs (%bb-limbs-list b))
-            (new (cons (logxor (car limbs) f) (cdr limbs))))
-       (%make-bb sign new)))
-    (t
-     (let ((lo (bignum-lo b)) (hi (bignum-hi b)))
-       (bignum-to-fixnum-if-possible (make-bignum (logxor lo f) hi))))))
+  "Compute (logxor b f) for bignum B and fixnum F.  Total."
+  (%generic-bitwise b f 2))
+
+(defun bignum-logxor-bignum (a b)
+  "Total bignum⊕bignum via the two's-complement engine."
+  (%generic-bitwise a b 2))
 
 (defun bignum-sub (a b)
   "Subtract B from A."

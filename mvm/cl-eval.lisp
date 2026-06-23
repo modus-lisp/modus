@@ -5194,7 +5194,13 @@
              (b (if ys (car ys) 0))
              (diff (- a b borrow))
              (limb (if (< diff 0)
-                       (%fixnum-+ diff 4611686018427387904)   ; +2^62
+                       ;; diff + 2^62, fixnum-safe: 4611686018427387904 (2^62)
+                       ;; is a BIGNUM literal (one past fixnum max), so the raw
+                       ;; %fixnum-+ primop read its heap pointer as garbage and
+                       ;; corrupted every borrowing limb.  (logand diff 2^62-1)
+                       ;; equals diff+2^62 for diff in [-(2^62-1),-1] and stays
+                       ;; a fixnum — mirrors %add-limbs-mag's mask idiom.
+                       (logand diff 4611686018427387903)
                        diff))
              (next-borrow (if (< diff 0) 1 0)))
         (setq result (cons limb result))
@@ -5316,7 +5322,9 @@
   "Convert fixnum N to (lo . hi) bignum parts."
   (if (>= n 0)
       (cons n 0)
-      (cons (%fixnum-+ n 4611686018427387904) -1)))
+      ;; Same 2^62-bignum-literal bug as %sub-limbs-mag: use the fixnum-safe
+      ;; mask form (logand n 2^62-1) = n + 2^62 for negative fixnum n.
+      (cons (logand n 4611686018427387903) -1)))
 
 (defun bignum-add (a b)
   "Add A and B, where either may be a fixnum, small bignum, or big

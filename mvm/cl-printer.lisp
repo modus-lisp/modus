@@ -2384,6 +2384,90 @@
       (setq r (cons (car p) r))
       (setq p (cdr p)))))
 
+(defun %format-has-wpi-toplevel (control start end)
+  "Return T if CONTROL[START,END) contains a top-level ~W (87/119),
+   ~_ (95), or ~I (73/105) directive.  Skips parameters/modifiers and
+   '<char>, and skips past nested ~<...~> and ~{...~} bodies so an inner
+   directive doesn't trip the scan.  Used to enforce CLHS 22.3.5.2:
+   ~W/~_/~I are not permitted in a justification context."
+  (let ((pos start) (found nil))
+    (loop
+      (when (or found (>= pos end)) (return found))
+      (if (/= (%prim-aref control pos) 126)
+          (setq pos (+ pos 1))
+          ;; ~ — scan past params/modifiers to the directive char.
+          (let ((p (+ pos 1)) (dch nil))
+            (loop
+              (when (>= p end) (return nil))
+              (let ((c (%prim-aref control p)))
+                (cond
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p end) (setq p (+ p 1))))
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 58) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (setq pos end))
+              ;; ~W / ~_ / ~I — the prohibited directives.
+              ((or (= dch 87) (= dch 119) (= dch 95) (= dch 73) (= dch 105))
+               (setq found t))
+              ;; Skip past nested ~<...~> so an inner directive is ignored.
+              ((= dch 60)
+               (let ((close (%format-find-close-angle control (+ p 1) end)))
+                 (if close
+                     (setq pos (%format-close-angle-end control close end))
+                     (setq pos end))))
+              ;; Skip past nested ~{...~}.
+              ((= dch 123)
+               (let ((close (%format-find-close-brace control (+ p 1) end)))
+                 (if close
+                     (setq pos (%format-close-brace-end control close end))
+                     (setq pos end))))
+              (t (setq pos (+ p 1)))))))))
+
+(defun %format-body-has-colon-semi (body)
+  "Return T if justification BODY contains a top-level ~:; segment
+   separator (the colon-semicolon clause of CLHS 22.3.5.2).  Skips
+   params/'<char> and nested ~<...~>/~{...~} bodies."
+  (let ((len (array-length body)) (pos 0) (found nil))
+    (loop
+      (when (or found (>= pos len)) (return found))
+      (if (/= (%prim-aref body pos) 126)
+          (setq pos (+ pos 1))
+          (let ((p (+ pos 1)) (dch nil) (sawcolon nil))
+            (loop
+              (when (>= p len) (return nil))
+              (let ((c (%prim-aref body p)))
+                (cond
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p len) (setq p (+ p 1))))
+                  ((= c 58) (setq sawcolon t) (setq p (+ p 1)))
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (setq pos len))
+              ((and (= dch 59) sawcolon) (setq found t))
+              ((= dch 60)
+               (let ((close (%format-find-close-angle body (+ p 1) len)))
+                 (if close
+                     (setq pos (%format-close-angle-end body close len))
+                     (setq pos len))))
+              ((= dch 123)
+               (let ((close (%format-find-close-brace body (+ p 1) len)))
+                 (if close
+                     (setq pos (%format-close-brace-end body close len))
+                     (setq pos len))))
+              (t (setq pos (+ p 1)))))))))
+
 (defun %format-justify (stream body arg-list colonp atp param1 param2 param3 param4)
   "Render a simple ~<...~> justification.  BODY is the substring between
    ~< and ~>.  Returns the remaining arg-list.
@@ -3039,6 +3123,16 @@
                          (progn (%print-char 126 stream) (%print-char dir stream))
                          (let ((body (%substring control i close))
                                (new-i (%format-close-angle-end control close len)))
+                           ;; CLHS 22.3.5.2: ~W, ~_, and ~I are not permitted
+                           ;; in a justification context.  It is an error for
+                           ;; such a directive to appear directly in the body,
+                           ;; or — when the body uses a ~:; column-overflow
+                           ;; clause — anywhere in the same format control.
+                           (when (or (%format-has-wpi-toplevel body 0
+                                        (array-length body))
+                                     (and (%format-body-has-colon-semi body)
+                                          (%format-has-wpi-toplevel control 0 len)))
+                             (error "~~W, ~~_, and ~~I are not permitted in a justification (~~<...~~>) context."))
                            (setq arg-list
                                  (%format-justify stream body arg-list
                                                   colonp atp

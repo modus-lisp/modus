@@ -65,7 +65,7 @@
               ;; stored value, not the updated place).  Bind v to a temp so
               ;; it is evaluated once and returned after the store.
               ((eq acc 'ldb)
-               (let ((vt (gensym "LDBV")))
+               (let ((vt (gensym \"LDBV\")))
                  (list 'let (list (list vt value))
                        (list 'setf (cadr args)
                              (list 'dpb vt (car args) (cadr args)))
@@ -74,7 +74,7 @@
               ;; n) back into the integer place n, RETURN v.  Same
               ;; return-newval contract as LDB.
               ((eq acc 'mask-field)
-               (let ((vt (gensym "MFV")))
+               (let ((vt (gensym \"MFV\")))
                  (list 'let (list (list vt value))
                        (list 'setf (cadr args)
                              (list 'deposit-field vt (car args) (cadr args)))

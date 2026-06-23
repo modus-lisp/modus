@@ -4926,7 +4926,7 @@
                (setq rest (cdr rest)))))))
 
 ;;; Type predicates
-(defun numberp (x) (or (integerp x) (floatp-impl x)))
+(defun numberp (x) (or (integerp x) (floatp-impl x) (ratiop x) (%complex-p x)))
 (defun realp (x)
   "T iff X is a real number (integer, float, or rational).  Explicitly
    rejects complex numbers — modus's %complex-p check first since

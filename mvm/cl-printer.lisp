@@ -2328,6 +2328,120 @@
            (setq p (+ p 1)))
           (t (return (+ p 1))))))))
 
+(defun %format-close-angle-colon-p (control close-pos len)
+  "Return T if the ~> close at CLOSE-POS (the ~ position) had a colon
+   modifier — i.e. it was actually ~:>.  CLHS 22.3.5.2: ~:> closes a
+   logical-block (~<...~:>) rather than a simple justification (~<...~>)."
+  (let ((p (+ close-pos 1)) (saw-colon nil))
+    (loop
+      (when (>= p len) (return saw-colon))
+      (let ((c (%prim-aref control p)))
+        (cond
+          ((= c 58) (setq saw-colon t) (setq p (+ p 1)))   ; :
+          ((= c 62) (return saw-colon))                    ; >
+          ;; Skip params/at: digits, -, comma, V, #, ', @
+          ((or (and (>= c 48) (<= c 57))
+               (= c 45) (= c 44) (= c 118) (= c 86)
+               (= c 35) (= c 64)
+               (= c 39))
+           (setq p (+ p 1)))
+          (t (return saw-colon)))))))
+
+(defun %format-segment-has-directive (seg)
+  "Return T if the prefix/suffix segment SEG contains any ~-directive.
+   CLHS 22.3.5.2: the prefix and suffix of a logical block (~<...~:>) must
+   be literal — any embedded directive is an error.  A bare ~ at the very
+   end is treated as non-directive (the close ~ never appears here)."
+  (let ((len (array-length seg)) (pos 0) (found nil))
+    (loop
+      (when (or found (>= pos len)) (return found))
+      (if (= (%prim-aref seg pos) 126)
+          (setq found t)
+          (setq pos (+ pos 1))))))
+
+(defun %format-control-has-lb (control start end)
+  "Return T if CONTROL[START,END) contains a top-level ~<...~:> logical
+   block (a ~< whose matching close is a ~:>).  Skips nested ~<...~> and
+   ~{...~} bodies so only the outermost level is examined."
+  (let ((pos start) (found nil))
+    (loop
+      (when (or found (>= pos end)) (return found))
+      (if (/= (%prim-aref control pos) 126)
+          (setq pos (+ pos 1))
+          (let ((p (+ pos 1)) (dch nil))
+            (loop
+              (when (>= p end) (return nil))
+              (let ((c (%prim-aref control p)))
+                (cond
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p end) (setq p (+ p 1))))
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 58) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (setq pos end))
+              ((= dch 60)
+               (let ((close (%format-find-close-angle control (+ p 1) end)))
+                 (if close
+                     (progn
+                       (when (%format-close-angle-colon-p control close end)
+                         (setq found t))
+                       (setq pos (%format-close-angle-end control close end)))
+                     (setq pos end))))
+              ((= dch 123)
+               (let ((close (%format-find-close-brace control (+ p 1) end)))
+                 (if close
+                     (setq pos (%format-close-brace-end control close end))
+                     (setq pos end))))
+              (t (setq pos (+ p 1)))))))))
+
+(defun %format-control-has-colonsemi-justify (control start end)
+  "Return T if CONTROL[START,END) contains a top-level ~<...~> simple
+   justification (NON-colon close) whose body contains a top-level ~:;
+   column-overflow clause.  CLHS 22.3.5.2: such a justify may not co-occur
+   in the same control with ~W/~_/~I/~:T/~<...~:>."
+  (let ((pos start) (found nil))
+    (loop
+      (when (or found (>= pos end)) (return found))
+      (if (/= (%prim-aref control pos) 126)
+          (setq pos (+ pos 1))
+          (let ((p (+ pos 1)) (dch nil))
+            (loop
+              (when (>= p end) (return nil))
+              (let ((c (%prim-aref control p)))
+                (cond
+                  ((= c 39)
+                   (setq p (+ p 1))
+                   (when (< p end) (setq p (+ p 1))))
+                  ((or (and (>= c 48) (<= c 57))
+                       (= c 45) (= c 44)
+                       (= c 118) (= c 86)
+                       (= c 35) (= c 58) (= c 64))
+                   (setq p (+ p 1)))
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (setq pos end))
+              ((= dch 60)
+               (let ((close (%format-find-close-angle control (+ p 1) end)))
+                 (if close
+                     (progn
+                       (when (and (not (%format-close-angle-colon-p control close end))
+                                  (%format-body-has-colon-semi
+                                   (%substring control (+ p 1) close)))
+                         (setq found t))
+                       (setq pos (%format-close-angle-end control close end)))
+                     (setq pos end))))
+              ((= dch 123)
+               (let ((close (%format-find-close-brace control (+ p 1) end)))
+                 (if close
+                     (setq pos (%format-close-brace-end control close end))
+                     (setq pos end))))
+              (t (setq pos (+ p 1)))))))))
+
 (defun %format-split-segments (body)
   "Split a justification BODY string on top-level ~; (code 59), respecting
    nesting of ~<...~> and ~{...~} and skipping params/modifiers/'<char>
@@ -2467,6 +2581,64 @@
                      (setq pos (%format-close-brace-end body close len))
                      (setq pos len))))
               (t (setq pos (+ p 1)))))))))
+
+(defun %format-logical-block (stream body arg-list colonp atp)
+  "Render a ~<...~:> logical block (CLHS 22.3.5.2), Tier-1 (margin 100, so
+   no fill/linear/miser column engine — ~_/~I are no-ops and this reduces to
+   prefix + body + suffix concatenation).
+
+   COLONP = the ~:< open modifier (colon-default prefix/suffix \"(\"/\")\");
+   ATP    = the ~@< open modifier (iterate the WHOLE arg-list rather than a
+            single list arg).
+
+   BODY is split on top-level ~; into 1-3 segments:
+     1 seg  → (body)                — prefix/suffix default
+     2 segs → (prefix body)         — explicit prefix, suffix default
+     3 segs → (prefix body suffix)  — both explicit
+   An explicit (possibly empty) prefix/suffix segment overrides the colon
+   default.  Returns the remaining (unconsumed) arg-list."
+  (let* ((segs (%format-split-segments body))
+         (nsegs (length segs))
+         (prefix nil) (suffix nil) (inner nil))
+    (cond
+      ((>= nsegs 3)
+       (setq prefix (nth 0 segs))
+       (setq inner (nth 1 segs))
+       (setq suffix (nth 2 segs)))
+      ((= nsegs 2)
+       (setq prefix (nth 0 segs))
+       (setq inner (nth 1 segs)))
+      (t
+       (setq inner (if segs (car segs) ""))))
+    ;; CLHS: prefix/suffix segments must be literal — embedded directives err.
+    (when (and prefix (%format-segment-has-directive prefix))
+      (error "Logical-block (~~<...~~:>) prefix must not contain directives."))
+    (when (and suffix (%format-segment-has-directive suffix))
+      (error "Logical-block (~~<...~~:>) suffix must not contain directives."))
+    ;; ~@< iterates over the WHOLE remaining arg-list; otherwise the block
+    ;; consumes exactly one arg which must be a list.  CLHS 22.3.5.2: in the
+    ;; non-~@< case, if that arg is a non-list atom it is printed with ~A and
+    ;; the prefix/suffix/body are skipped entirely.
+    (if atp
+        (progn
+          ;; Apply colon defaults only when the segment is absent.
+          (when (and colonp (null prefix)) (setq prefix "("))
+          (when (and colonp (null suffix)) (setq suffix ")"))
+          (when prefix (%print-string-raw prefix stream))
+          (setq arg-list (%format-impl stream inner arg-list))
+          (when suffix (%print-string-raw suffix stream)))
+        (let ((sub (car arg-list)))
+          (setq arg-list (cdr arg-list))
+          (if (and sub (not (consp sub)))
+              ;; Non-list atom: ~A it, no prefix/suffix.
+              (princ-to-stream sub stream)
+              (progn
+                (when (and colonp (null prefix)) (setq prefix "("))
+                (when (and colonp (null suffix)) (setq suffix ")"))
+                (when prefix (%print-string-raw prefix stream))
+                (%format-impl stream inner sub)
+                (when suffix (%print-string-raw suffix stream))))))
+    arg-list))
 
 (defun %format-justify (stream body arg-list colonp atp param1 param2 param3 param4)
   "Render a simple ~<...~> justification.  BODY is the substring between
@@ -3112,31 +3284,49 @@
                                (let ((selected (nth default-idx sections)))
                                  (when selected
                                    (setq arg-list (%format-impl stream selected arg-list))))))))))))
-                  ;; ~<...~> — justification (CLHS 22.3.5.2, simple variant).
-                  ;; Params: mincol(0), colinc(1), minpad(0), padchar(#\Space).
-                  ;; We do NOT support the ~:; column-overflow clause or the
-                  ;; logical-block/pretty-printer variant.
+                  ;; ~<...~> — justification (simple variant) OR
+                  ;; ~<...~:> — logical block (CLHS 22.3.5.2).  The close
+                  ;; modifier selects: a colon on the close (~:>) means the
+                  ;; logical-block variant; a plain ~> means simple justify.
+                  ;; Params (justify only): mincol(0) colinc(1) minpad(0) pad(#\Space).
                   ((= dir 60)
                    (let ((close (%format-find-close-angle control i len)))
                      (if (null close)
                          ;; No matching ~> — echo the directive literally.
                          (progn (%print-char 126 stream) (%print-char dir stream))
-                         (let ((body (%substring control i close))
-                               (new-i (%format-close-angle-end control close len)))
-                           ;; CLHS 22.3.5.2: ~W, ~_, and ~I are not permitted
-                           ;; in a justification context.  It is an error for
-                           ;; such a directive to appear directly in the body,
-                           ;; or — when the body uses a ~:; column-overflow
-                           ;; clause — anywhere in the same format control.
-                           (when (or (%format-has-wpi-toplevel body 0
-                                        (array-length body))
-                                     (and (%format-body-has-colon-semi body)
-                                          (%format-has-wpi-toplevel control 0 len)))
-                             (error "~~W, ~~_, and ~~I are not permitted in a justification (~~<...~~>) context."))
-                           (setq arg-list
-                                 (%format-justify stream body arg-list
-                                                  colonp atp
-                                                  param1 param2 param3 param4))
+                         (let* ((body (%substring control i close))
+                                (new-i (%format-close-angle-end control close len))
+                                (lb (%format-close-angle-colon-p control close len)))
+                           ;; CLHS 22.3.5.2 cross-directive errors (apply to
+                           ;; both variants, scanned over the whole control):
+                           ;; a ~<...~:;...~> simple-justify may not co-occur
+                           ;; with a ~<...~:> logical block in the same string.
+                           (when (and (%format-control-has-lb control 0 len)
+                                      (%format-control-has-colonsemi-justify control 0 len))
+                             (error "~~<...~~:;...~~> may not co-occur with ~~<...~~:> in one control."))
+                           (if lb
+                               ;; Logical-block variant (~<...~:>).
+                               (setq arg-list
+                                     (%format-logical-block stream body arg-list
+                                                            colonp atp))
+                               ;; Simple justification (~<...~>).
+                               (progn
+                                 ;; ~W, ~_, ~I are not permitted in a justify
+                                 ;; context (directly, or — with a ~:; clause —
+                                 ;; anywhere in the control).  A nested logical
+                                 ;; block (~<...~:>) inside a justify is also an
+                                 ;; error (format.logical-block.error.25).
+                                 (when (or (%format-has-wpi-toplevel body 0
+                                              (array-length body))
+                                           (and (%format-body-has-colon-semi body)
+                                                (%format-has-wpi-toplevel control 0 len))
+                                           (%format-control-has-lb body 0
+                                              (array-length body)))
+                                   (error "~~W, ~~_, ~~I, or a nested logical block are not permitted in a justification (~~<...~~>) context."))
+                                 (setq arg-list
+                                       (%format-justify stream body arg-list
+                                                        colonp atp
+                                                        param1 param2 param3 param4))))
                            (setq i new-i)))))
                   ;; ~> — close justification (consumed by ~< handler; no-op
                   ;; if reached standalone)

@@ -2801,44 +2801,102 @@
       (t
        (%remove-if-vector neg-pred seq key-fn start-idx end-idx eff-count from-end)))))
 
-(defun delete-duplicates (seq &rest args)
-  "Remove duplicate items (destructive). Honors :test/:key/:from-end.
-   Inlined (rather than `(apply #'remove-duplicates seq args)') to dodge
-   apply-of-rest fragility — same body as remove-duplicates, since we
-   don't truly mutate seq in place anyway (we cons a fresh result list)."
-  (let* ((parsed (parse-test-key args))
-         (test-fn (car parsed))
-         (key-fn (cdr parsed))
-         (from-end nil) (fe-set nil) (a args))
-    ;; CLHS §3.4.1.4.1: leftmost occurrence of a repeated keyword wins.
+(defun %dup-parse-bounds (args)
+  "Parse :from-end / :start / :end from a remove/delete-duplicates arglist.
+   Returns (from-end start end-or-nil).  Per CLHS §3.4.1.4.1 the LEFTMOST
+   occurrence of a repeated keyword supplies the value.  :start defaults to
+   0, :end to NIL (meaning the sequence length)."
+  (let ((from-end nil) (fe-set nil)
+        (start 0) (start-set nil)
+        (end nil) (end-set nil)
+        (a args))
     (loop (when (null a) (return))
       (cond ((eq (car a) :from-end)
              (unless fe-set (setq from-end (cadr a) fe-set t)) (setq a (cddr a)))
-            (t (setq a (cdr a)))))
+            ((eq (car a) :start)
+             (unless start-set (setq start (or (cadr a) 0) start-set t)) (setq a (cddr a)))
+            ((eq (car a) :end)
+             (unless end-set (setq end (cadr a) end-set t)) (setq a (cddr a)))
+            ((null (cdr a)) (return))
+            (t (setq a (cddr a)))))
+    (list from-end start end)))
+
+(defun %dups-keep-list (seq test-fn key-fn from-end start end)
+  "Core list dedup honoring :start/:end.  Elements outside [start,end) are
+   always retained and do NOT participate in duplicate comparison.  Within
+   the window: without FROM-END keep the LAST occurrence of each group; with
+   FROM-END keep the FIRST.  Result preserves original order."
+  (let ((eff-end (if end end (length seq)))
+        (r nil) (cur seq) (i 0))
+    (loop
+      (when (null cur) (return (nreverse r)))
+      (let* ((item (car cur))
+             (in-window (and (>= i start) (< i eff-end)))
+             (keep t))
+        (when in-window
+          (let ((item-key (if key-fn (funcall key-fn item) item)))
+            ;; Scan the OTHER window elements for a duplicate.  Default
+            ;; (not from-end): a later dup -> drop this one (keep last).
+            ;; from-end: an earlier dup -> drop this one (keep first).
+            ;; Terminate the inner scan with a flag (no nested LOOP RETURN).
+            (let ((cur2 seq) (j 0) (scanning t))
+              (loop
+                (when (or (null cur2) (not scanning)) (return))
+                (when (and (/= j i) (>= j start) (< j eff-end)
+                           (if from-end (< j i) (> j i)))
+                  (let ((v (if key-fn (funcall key-fn (car cur2)) (car cur2))))
+                    (when (if test-fn (funcall test-fn item-key v) (eql item-key v))
+                      (setq keep nil) (setq scanning nil))))
+                (setq cur2 (cdr cur2))
+                (setq j (+ j 1))))))
+        (when keep (setq r (cons item r))))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))))
+
+(defun %dups-keep-vector (vec test-fn key-fn from-end start end)
+  "Core vector/string dedup honoring :start/:end.  Implemented by lifting the
+   vector into a plain list, running the proven list dedup core (%dups-keep-
+   list — the same path lists use), then rebuilding the original sequence
+   type.  AREF already yields a CHARACTER for string elements and ASET coerces
+   a CHARACTER back to a code for string destinations, so the same rebuild
+   loop produces either a general vector or a string."
+  (let* ((len (array-length vec))
+         (string-p (stringp vec))
+         ;; Snapshot elements into a list (preserves AREF char semantics).
+         (as-list (let ((acc nil) (i len))
+                    (loop
+                      (when (= i 0) (return acc))
+                      (setq i (- i 1))
+                      (setq acc (cons (aref vec i) acc)))))
+         ;; Dedup via the list core (CLHS-correct :start/:end/:from-end).
+         (kept (%dups-keep-list as-list test-fn key-fn from-end start end))
+         (out-len (length kept))
+         (out (if string-p (%make-string-array out-len) (make-array out-len)))
+         (cur kept) (j 0))
+    (loop
+      (when (null cur) (return out))
+      (let ((dummy (aset out j (car cur))))
+        (setq dummy dummy))
+      (setq j (+ j 1))
+      (setq cur (cdr cur)))))
+
+(defun delete-duplicates (seq &rest args)
+  "Remove duplicate items (destructive). Honors :test/:key/:from-end and
+   :start/:end on lists, vectors, and strings.  We don't truly mutate in
+   place (we cons / build a fresh result), which is conformant — DELETE-
+   DUPLICATES is permitted to either modify or return a fresh sequence."
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (bounds (%dup-parse-bounds args))
+         (from-end (car bounds))
+         (start (cadr bounds))
+         (end (caddr bounds)))
     (cond
       ((null seq) nil)
-      ((consp seq)
-       (if from-end
-           (let ((r nil))
-             (dolist (item seq (nreverse r))
-               (let ((item-key (if key-fn (funcall key-fn item) item)))
-                 (unless (some (lambda (x)
-                                 (let ((v (if key-fn (funcall key-fn x) x)))
-                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
-                               r)
-                   (setq r (cons item r))))))
-           (let ((r nil) (cur seq))
-             (loop
-               (when (null cur) (return (nreverse r)))
-               (let* ((item (car cur))
-                      (item-key (if key-fn (funcall key-fn item) item))
-                      (rest-tail (cdr cur)))
-                 (unless (some (lambda (x)
-                                 (let ((v (if key-fn (funcall key-fn x) x)))
-                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
-                               rest-tail)
-                   (setq r (cons item r))))
-               (setq cur (cdr cur))))))
+      ((consp seq) (%dups-keep-list seq test-fn key-fn from-end start end))
+      ((or (stringp seq) (arrayp seq))
+       (%dups-keep-vector seq test-fn key-fn from-end start end))
       (t seq))))
 
 (defun pushnew-fn (item place)
@@ -3078,39 +3136,15 @@
   (let* ((parsed (parse-test-key args))
          (test-fn (car parsed))
          (key-fn (cdr parsed))
-         (from-end nil) (fe-set nil) (a args))
-    ;; CLHS §3.4.1.4.1: leftmost occurrence of a repeated keyword wins.
-    (loop (when (null a) (return))
-      (cond ((eq (car a) :from-end)
-             (unless fe-set (setq from-end (cadr a) fe-set t)) (setq a (cddr a)))
-            (t (setq a (cdr a)))))
+         (bounds (%dup-parse-bounds args))
+         (from-end (car bounds))
+         (start (cadr bounds))
+         (end (caddr bounds)))
     (cond
       ((null seq) nil)
-      ((consp seq)
-       (if from-end
-           ;; Keep first occurrence — walk forward
-           (let ((r nil))
-             (dolist (item seq (nreverse r))
-               (let ((item-key (if key-fn (funcall key-fn item) item)))
-                 (unless (some (lambda (x)
-                                 (let ((v (if key-fn (funcall key-fn x) x)))
-                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
-                               r)
-                   (setq r (cons item r))))))
-           ;; Default: keep last occurrence of each — walk forward,
-           ;; remove element if a duplicate appears LATER in seq.
-           (let ((r nil) (cur seq))
-             (loop
-               (when (null cur) (return (nreverse r)))
-               (let* ((item (car cur))
-                      (item-key (if key-fn (funcall key-fn item) item))
-                      (rest-tail (cdr cur)))
-                 (unless (some (lambda (x)
-                                 (let ((v (if key-fn (funcall key-fn x) x)))
-                                   (if test-fn (funcall test-fn item-key v) (eql item-key v))))
-                               rest-tail)
-                   (setq r (cons item r))))
-               (setq cur (cdr cur))))))
+      ((consp seq) (%dups-keep-list seq test-fn key-fn from-end start end))
+      ((or (stringp seq) (arrayp seq))
+       (%dups-keep-vector seq test-fn key-fn from-end start end))
       (t seq))))
 
 ;;; ===================================================

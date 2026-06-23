@@ -3508,23 +3508,22 @@
       (cond
         ((integerp n)
          (when (< n 0) (error "sqrt of negative"))
+         ;; Perfect square -> exact integer; otherwise a FLOAT (CLHS: sqrt
+         ;; of a non-square rational returns an irrational => float).
          (let ((s (isqrt n)))
            (if (= (* s s) n)
                s
-               (let* ((K 10000)
-                      (scaled (* n K K))
-                      (approx (isqrt scaled)))
-                 (%make-rat approx K)))))
+               (%sqrt-f (%any-to-float n)))))
         ((ratiop n)
          (let* ((num (ratio-numerator n))
                 (den (ratio-denominator n)))
            (when (< num 0) (error "sqrt of negative"))
            (let ((s (isqrt (* num den))))
              (if (= (* s s) (* num den))
+                 ;; Perfect square numerator*denominator -> exact ratio s/den.
                  (%make-rat s den)
-                 (let* ((K 10000)
-                        (approx (isqrt (* num den K K))))
-                   (%make-rat approx (* den K)))))))
+                 ;; Non-perfect square -> FLOAT.
+                 (%sqrt-f (%any-to-float n))))))
         ((and (not (fixnump n)) (not (consp n)) (not (null n))
               (= (obj-subtag n) #x32)
               (= (array-length n) 2))

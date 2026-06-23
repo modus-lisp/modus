@@ -4885,7 +4885,11 @@
               (error 'floating-point-underflow)))))
        r))
     ((and (integerp power) (< power 0))
-     (exact-divide 1 (expt base (- 0 power))))
+     ;; Use generic / (NOT exact-divide, which does (mod a b) and so 0/0's
+     ;; on a float divisor) so (expt FLOAT NEG-INT) yields a float and
+     ;; (expt INT/RATIO NEG-INT) yields an integer/ratio.  Also fixes
+     ;; scale-float = (* float (expt 2.0d0 int)).
+     (/ 1 (expt base (- 0 power))))
     ((ratiop power)
      ;; Approximate via exp(power * log base) — uses our rational
      ;; Taylor-series transcendentals.

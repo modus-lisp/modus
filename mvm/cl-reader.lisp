@@ -1656,6 +1656,9 @@
                     ((string-equal name-str "Backspace") (code-char 8))
                     ((string-equal name-str "Nul") (code-char 0))
                     ((string-equal name-str "Null") (code-char 0))
+                    ((string-equal name-str "Escape") (code-char 27))
+                    ((string-equal name-str "Altmode") (code-char 27))
+                    ((string-equal name-str "Delete") (code-char 127))
                     (t (%reader-error "unknown character name"))))))))))
 
 (defun %read-uninterned-symbol (stream rt)

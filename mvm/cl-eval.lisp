@@ -4533,7 +4533,7 @@
           ((and (>= code 65) (<= code 90)) (let ((v (+ 10 (- code 65)))) (if (< v radix) v nil)))
           ((and (>= code 97) (<= code 122)) (let ((v (+ 10 (- code 97)))) (if (< v radix) v nil)))
           (t nil))))
-(defun alphanumericp (c) (or (alpha-char-p c) (digit-char-p c)))
+(defun alphanumericp (c) (if (or (alpha-char-p c) (digit-char-p c)) t nil))
 (defun graphic-char-p (c)
   (unless (characterp c) (%signal-type-error))
   (let ((code (%ensure-char-code c))) (and (>= code 32) (<= code 126))))

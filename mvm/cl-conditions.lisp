@@ -1814,7 +1814,7 @@
             ok))
          ((eq head 'not)
           (not (typep obj (cadr type))))
-         ((eq head 'satisfies) nil)
+         ((eq head 'satisfies) (and (funcall (cadr type) obj) t))
          ((eq head 'unsigned-byte)
           (and (integerp obj) (>= obj 0)
                (< obj (ash 1 (cadr type)))))

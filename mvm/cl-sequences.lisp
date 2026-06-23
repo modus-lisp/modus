@@ -983,7 +983,9 @@
   ;; STRING seqs store fixnum char-codes; present elements to PRED/KEY as
   ;; CHARACTER objects (so e.g. (sort "..." #'char< :key ...) works), then
   ;; store the swapped char-codes back.
-  (let ((len (array-length seq))
+  ;; Use fill-pointer-aware LENGTH (not raw ARRAY-LENGTH) so a vector with a
+  ;; fill pointer sorts only its active prefix, not the whole backing store.
+  (let ((len (length seq))
         (str-p (stringp seq)))
     (let ((i 1))
       (loop

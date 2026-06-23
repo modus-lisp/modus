@@ -2378,29 +2378,34 @@
 ;;; [[reference_overflow_promotion_ir]] for the larger plan.
 
 (defun generic-logand (a b)
+  ;; bignump is checked BEFORE integerp: a bignum satisfies integerp, so the
+  ;; old (integerp a)(integerp b) first-clause matched bignum operands and ran
+  ;; the raw inline (logand a b) on tagged heap pointers -> garbage.
   (cond
+    ((and (bignump a) (bignump b)) (bignum-logand-bignum a b))
+    ((bignump a) (bignum-logand-fixnum a b))
+    ((bignump b) (bignum-logand-fixnum b a))
     ((and (integerp a) (integerp b)) (logand a b))
-    ((and (integerp a) (bignump b)) (bignum-logand-fixnum b a))
-    ((and (bignump a) (integerp b)) (bignum-logand-fixnum a b))
-    ((and (bignump a) (bignump b))  (bignum-logand-bignum a b))
     (t (error "logand: bad type"))))
 
 (defun generic-logior (a b)
   (cond
-    ((and (integerp a) (integerp b)) (logior a b))
+    ((and (bignump a) (bignump b)) (error "logior: NYI for bignum∨bignum"))
     ;; bignum ∨ small-fixnum-mask: the bignum's bits beyond f's width
     ;; are untouched; bits inside f's width OR together.  When f fits
     ;; in a single 62-bit limb we just OR f into the bignum's low limb.
-    ((and (integerp a) (bignump b)) (bignum-logior-fixnum b a))
-    ((and (bignump a) (integerp b)) (bignum-logior-fixnum a b))
-    (t (error "logior: NYI for bignum∨bignum"))))
+    ((bignump a) (bignum-logior-fixnum a b))
+    ((bignump b) (bignum-logior-fixnum b a))
+    ((and (integerp a) (integerp b)) (logior a b))
+    (t (error "logior: bad type"))))
 
 (defun generic-logxor (a b)
   (cond
+    ((and (bignump a) (bignump b)) (error "logxor: NYI for bignum⊕bignum"))
+    ((bignump a) (bignum-logxor-fixnum a b))
+    ((bignump b) (bignum-logxor-fixnum b a))
     ((and (integerp a) (integerp b)) (logxor a b))
-    ((and (integerp a) (bignump b)) (bignum-logxor-fixnum b a))
-    ((and (bignump a) (integerp b)) (bignum-logxor-fixnum a b))
-    (t (error "logxor: NYI for bignum⊕bignum"))))
+    (t (error "logxor: bad type"))))
 
 ;;; ============================================================
 ;;; Float inspection helpers
@@ -3022,7 +3027,7 @@
          ((%typename-eq head 'not)
           (not (typep obj (cadr type))))
          ;; (satisfies pred)
-         ((%typename-eq head 'satisfies) nil)  ; can't call arbitrary predicates
+         ((%typename-eq head 'satisfies) (and (funcall (cadr type) obj) t))
          ;; (unsigned-byte n) — integer in [0, 2^n - 1]
          ((%typename-eq head 'unsigned-byte)
           (and (integerp obj) (>= obj 0)

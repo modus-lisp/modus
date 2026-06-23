@@ -49,6 +49,36 @@
               ((eq acc 'first) (list 'rplaca (car args) value))
               ((eq acc 'rest) (list 'rplacd (car args) value))
               ((eq acc 'nth) (list 'rplaca (list 'nthcdr (car args) (cadr args)) value))
+              ;; (setf (svref a i) v) → (aset a i v)
+              ((eq acc 'svref) (cons 'aset (append args (list value))))
+              ;; (setf (getf plist ind) v) → reassign the plist place with
+              ;; the value spliced in; set-getf returns the new list.  When
+              ;; the place is a bare symbol we (setq sym (set-getf ...)),
+              ;; otherwise leave the set-getf call as the expansion.
+              ((eq acc 'getf)
+               (if (symbolp (car args))
+                   (list 'setq (car args)
+                         (list 'set-getf (car args) (cadr args) value))
+                   (list 'set-getf (car args) (cadr args) value)))
+              ;; (setf (ldb spec n) v) → store (dpb v spec n) back into the
+              ;; integer place n, but RETURN v (CLHS: setf yields the newly
+              ;; stored value, not the updated place).  Bind v to a temp so
+              ;; it is evaluated once and returned after the store.
+              ((eq acc 'ldb)
+               (let ((vt (gensym "LDBV")))
+                 (list 'let (list (list vt value))
+                       (list 'setf (cadr args)
+                             (list 'dpb vt (car args) (cadr args)))
+                       vt)))
+              ;; (setf (mask-field spec n) v) → store (deposit-field v spec
+              ;; n) back into the integer place n, RETURN v.  Same
+              ;; return-newval contract as LDB.
+              ((eq acc 'mask-field)
+               (let ((vt (gensym "MFV")))
+                 (list 'let (list (list vt value))
+                       (list 'setf (cadr args)
+                             (list 'deposit-field vt (car args) (cadr args)))
+                       vt)))
               (t
                (let ((d (%find-setf-expander acc)))
                  (if d

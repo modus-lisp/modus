@@ -1840,7 +1840,18 @@
       (let ((pair (car cur)))
         (funcall fn (car pair) (cdr pair)))
       (setq cur (cdr cur)))))
-(defun array-element-type (a) t)
+(defun array-element-type (a)
+  "Return the element type the array A is specialized to (CLHS 15.2.13).
+   For a native multi-dim/specialized array (MDA) consult its stored
+   element-type slot — already the upgraded type (BIT / CHARACTER / T).
+   For a string, the upgraded element type is CHARACTER.  All other
+   general arrays/vectors store tagged words → T.  Defensive on
+   non-arrays: returns T rather than erroring (callers like typep
+   probe loosely)."
+  (cond
+    ((%mda-p a) (upgraded-array-element-type (%mda-etype a)))
+    ((stringp a) 'character)
+    (t t)))
 (defun check-type-error (fn args) nil)
 (defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))
 (defun %make-array-ic (size contents)

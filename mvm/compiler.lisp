@@ -2345,6 +2345,41 @@
                    (tagbody ,@body))
                  (setq ,cur (cdr ,cur)))))))))
 
+  ;; WITH-PACKAGE-ITERATOR — (with-package-iterator (MNAME PKG-OR-PKGS . TYPES)
+  ;;                            decls body...)   [CLHS 11.1.5.1.1]
+  ;;
+  ;; Materialise the (symbol access-type containing-package) triples for
+  ;; the requested symbol-types up front via %collect-package-symbols
+  ;; (cl-packages.lisp), then bind MNAME via FLET so each (MNAME) call
+  ;; returns (values more-p symbol access-type pkg) and (values nil nil
+  ;; nil nil) once exhausted.  TYPES is a non-empty subset of
+  ;; (:internal :external :inherited) — passed quoted so the helper sees
+  ;; the keyword list, not evaluated forms.
+  ;;
+  ;; This mirrors the build-side rewrite (build-ansi-test.lisp ~2938) but
+  ;; lives in *macro-table*, which both the compiler AND runtime EVAL /
+  ;; macroexpand consult — so macro-hidden and runtime-constructed WPI
+  ;; forms now expand (the rewriter only saw literal source forms).
+  ;; %collect-package-symbols additionally honours shadowing for the
+  ;; :inherited case, which the bare rewriter omitted.
+  (mvm-define-macro "WITH-PACKAGE-ITERATOR"
+    (lambda (form)
+      (let* ((binding   (cadr form))
+             (mname     (car binding))
+             (pkg-form  (cadr binding))
+             (types     (cddr binding))
+             (body      (cddr form))
+             (entries   (gensym "WPI-ENTRIES"))
+             (top       (gensym "WPI-TOP")))
+        `(let ((,entries (%collect-package-symbols ,pkg-form ',types)))
+           (flet ((,mname ()
+                    (if (null ,entries)
+                        (values nil nil nil nil)
+                        (let ((,top (car ,entries)))
+                          (setq ,entries (cdr ,entries))
+                          (values t (car ,top) (cadr ,top) (caddr ,top))))))
+             ,@body)))))
+
   ;; DEFINE-CONDITION — (define-condition NAME (PARENT…) (SLOT-SPEC…)
   ;;                                       [(:default-initargs …)] [(:report …)] …)
   ;;

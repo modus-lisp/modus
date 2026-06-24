@@ -1106,8 +1106,10 @@
   (let ((s (make-string-output-stream))
         (subtag (obj-subtag f)))
     (cond
-      ((= subtag 96)
-       ;; Real IEEE #x60: decode bits, render via Dragon4 free-format.
+      ((and (>= subtag 96) (<= subtag 99))   ; #x60..#x63 — all IEEE-payload floats
+       ;; Real IEEE float: decode bits, render via Dragon4 free-format.
+       ;; (Per-type precision + exponent marker land in N1.5; this gate
+       ;;  just ensures single/short/long subtags decode like double.)
        (let* ((decoded (%ieee-float-decode-bits f))
               (sign (car decoded))
               (mant (cadr decoded))

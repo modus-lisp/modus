@@ -2199,11 +2199,77 @@
 ;;; effectively a rational with limited precision anyway.
 
 (defun %ieee-float-p (x)
-  "True if X is an IEEE-bits boxed float (subtag #x60, 2 slots)."
+  "True if X is an IEEE-bits boxed float, 2 slots.  Numeric tower N1
+   (approach B+): all four CL float types share the 64-bit IEEE payload
+   but carry distinct subtags for type identity — #x60 double-float,
+   #x61 single-float, #x62 short-float, #x63 long-float.  This keystone
+   predicate gates EVERY float arithmetic path, so it must accept all
+   four; the subtag only matters to typep/type-of/contagion."
   (and (not (fixnump x)) (not (consp x)) (not (null x))
        (not (characterp x))
-       (= (obj-subtag x) #x60)
+       (let ((st (obj-subtag x)))
+         (and (>= st #x60) (<= st #x63)))
        (= (array-length x) 2)))
+
+(defun %float-declared-type (x)
+  "The declared CL float type of IEEE float X, from its subtag."
+  (let ((st (obj-subtag x)))
+    (cond ((= st #x61) 'single-float)
+          ((= st #x62) 'short-float)
+          ((= st #x63) 'long-float)
+          (t           'double-float))))   ; #x60
+
+(defun single-float-p (x)
+  (and (%ieee-float-p x)
+       (let ((st (obj-subtag x))) (or (= st #x61) (= st #x62)))))
+
+(defun double-float-p (x)
+  (and (%ieee-float-p x)
+       (let ((st (obj-subtag x))) (or (= st #x60) (= st #x63)))))
+
+(defun %make-typed-float (hi lo type)
+  "Build a 2-slot IEEE float with the subtag for declared TYPE, payload
+   HI/LO (the same hi32/lo32 fixnum representation existing floats use).
+   Dispatches to the per-subtag alloc primops (compiler.lisp)."
+  (cond
+    ((eq type 'single-float) (let ((o (%make-single2))) (aset o 0 hi) (aset o 1 lo) o))
+    ((eq type 'short-float)  (let ((o (%make-short2)))  (aset o 0 hi) (aset o 1 lo) o))
+    ((eq type 'long-float)   (let ((o (%make-long2)))   (aset o 0 hi) (aset o 1 lo) o))
+    (t                       (let ((o (%make-float2)))  (aset o 0 hi) (aset o 1 lo) o))))
+
+(defun %round-to-single (f)
+  "Round the IEEE-double payload of float F to single-float (24-bit)
+   precision, round-to-nearest-even, returning a SINGLE-FLOAT-tagged
+   (#x61) object whose payload is the nearest single value re-expressed
+   as a 64-bit double (low 29 mantissa bits zero — what the Dragon4
+   printer path expects).  Zero / subnormal / inf / nan pass through
+   retagged (not rounded).  HI stored sign-extended to match the SSE2
+   float-store convention (translate-x64.lisp)."
+  (let* ((hi   (logand (aref f 0) 4294967295))
+         (lo   (logand (aref f 1) 4294967295))
+         (sign (logand (ash hi -31) 1))
+         (exp  (logand (ash hi -20) 2047))
+         (mant (logior (ash (logand hi 1048575) 32) lo)))   ; 52-bit fraction
+    (if (or (= exp 0) (= exp 2047))
+        (%make-typed-float (aref f 0) (aref f 1) 'single-float)
+        (let* ((keep (ash mant -29))                 ; top 23 fraction bits
+               (rem  (logand mant 536870911))        ; low 29 bits (2^29-1)
+               (half 268435456)                      ; 2^28
+               (roundup (or (> rem half)
+                            (and (= rem half) (= (logand keep 1) 1))))
+               (keep2 (if roundup (+ keep 1) keep))
+               (exp2 exp))
+          (when (= keep2 8388608)                    ; carry out of 23-bit fraction
+            (setq keep2 0)
+            (setq exp2 (+ exp 1)))
+          (let* ((nmant (if (>= exp2 2047) 0 (ash keep2 29)))  ; overflow→inf (frac 0)
+                 (fexp  (if (>= exp2 2047) 2047 exp2))
+                 (nhi-u (logior (ash sign 31)
+                                (ash fexp 20)
+                                (logand (ash nmant -32) 1048575)))
+                 (nlo-u (logand nmant 4294967295))
+                 (nhi   (if (>= nhi-u 2147483648) (- nhi-u 4294967296) nhi-u)))
+            (%make-typed-float nhi nlo-u 'single-float))))))
 
 (defun %ieee-float-to-rat (x)
   "Decode IEEE 64-bit double bits (modus encoding) to an exact rational.

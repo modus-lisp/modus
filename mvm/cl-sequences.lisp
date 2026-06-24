@@ -803,11 +803,14 @@
           list)))))
 
 (defun floatp-impl (x)
-  "Check if x is a boxed float (subtag #x60)."
+  "Check if x is a boxed float — any of the four float subtags
+   #x60..#x63 (double/single/short/long; numeric tower N1).  Means
+   'any float'; do NOT narrow it (arithmetic dispatch keys off it)."
   (if (fixnump x) nil
     (if (consp x) nil
       (if (null x) nil
-        (= (obj-subtag x) 96)))))  ; #x60 = 96
+        (let ((st (obj-subtag x)))
+          (and (>= st 96) (<= st 99)))))))  ; #x60..#x63
 
 (defun float-equal (a b)
   "Compare two boxed floats by hi32/lo32 slots."

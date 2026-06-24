@@ -67,6 +67,15 @@
 ;; compile-time and reader-parsed keyword references.
 (defconstant +subtag-keyword+ #x53)
 (defconstant +subtag-float+  #x60)
+;; Float type-identity subtags (numeric tower N1, approach B+): all four
+;; share the 2-slot 64-bit IEEE payload (so :fadd/:fcmp/Dragon4 are
+;; unchanged — they read bits, never the subtag).  The subtag carries
+;; only the DECLARED CL float type so typep/type-of/contagion can
+;; distinguish them.  #x60 stays double-float (preserves the boot image
+;; and every existing literal).
+(defconstant +subtag-single-float+ #x61)
+(defconstant +subtag-short-float+  #x62)
+(defconstant +subtag-long-float+   #x63)
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
 (defconstant +nil-value+ #xDEAD0001)
@@ -3806,6 +3815,9 @@
       ((= op-name 735635543474837196)   (compile-make-ratio dest))   ; %make-ratio
       ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
       ((= op-name (compute-name-hash "%MAKE-FLOAT2")) (compile-make-float2 dest))
+      ((= op-name (compute-name-hash "%MAKE-SINGLE2")) (compile-make-single2 dest))
+      ((= op-name (compute-name-hash "%MAKE-SHORT2")) (compile-make-short2 dest))
+      ((= op-name (compute-name-hash "%MAKE-LONG2")) (compile-make-long2 dest))
       ;; --- Closure construction ---
       ;; (%make-closure fn env) -> tag-object / subtag-0x52, 2 slots.
       ;; Replaces (cons #'fn env) for closure object creation. The
@@ -10923,6 +10935,23 @@
    a real native float instead of a simulated object."
   (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 2 +subtag-float+))
+
+(defun compile-make-single2 (dest)
+  "Compile (%make-single2) — allocate a 2-slot boxed float tagged
+   single-float (#x61).  Same 64-bit IEEE payload as %make-float2; caller
+   stores hi/lo.  See numeric tower N1 (approach B+)."
+  (emit-ir :gc-check)
+  (emit-ir :alloc-obj dest 2 +subtag-single-float+))
+
+(defun compile-make-short2 (dest)
+  "Compile (%make-short2) — 2-slot boxed float tagged short-float (#x62)."
+  (emit-ir :gc-check)
+  (emit-ir :alloc-obj dest 2 +subtag-short-float+))
+
+(defun compile-make-long2 (dest)
+  "Compile (%make-long2) — 2-slot boxed float tagged long-float (#x63)."
+  (emit-ir :gc-check)
+  (emit-ir :alloc-obj dest 2 +subtag-long-float+))
 
 (defun compile-make-symbol (dest)
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.

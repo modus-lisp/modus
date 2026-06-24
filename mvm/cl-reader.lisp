@@ -199,7 +199,7 @@
   (setq *read-base* 10)
   (setq *read-suppress* nil)
   (setq *read-eval* t)
-  (setq *read-default-float-format* nil)
+  (setq *read-default-float-format* 'single-float)  ; CLHS default (numeric tower N1)
   (setq *print-array* t)
   (setq *print-base* 10)
   (setq *print-case* :upcase)
@@ -840,12 +840,33 @@
 ;;; Rename the constructor to `%build-float-from-parts` so the
 ;;; compiler emits a normal call instead of the primop shortcut.
 
-(defun %build-float-from-parts (sign int-part frac-part frac-div exp-sign exp-part)
-  "Create a real IEEE-bit boxed float (subtag #x60) from parsed components.
+(defun %float-marker-class (code)
+  "Map an exponent-marker char CODE to the float type class it denotes
+   (numeric tower N1).  short-float==single-float, long-float==double-float."
+  (cond ((or (= code 83) (= code 115)) :single)   ; s S (short)
+        ((or (= code 70) (= code 102)) :single)   ; f F
+        ((or (= code 68) (= code 100)) :double)   ; d D
+        ((or (= code 76) (= code 108)) :double)   ; l L (long)
+        (t :default)))                            ; e E — use *read-default-float-format*
+
+(defun %resolve-float-type (marker)
+  "Resolve a float MARKER class (:single / :double / :default) to the CL
+   float type symbol, consulting *read-default-float-format* for :default."
+  (cond ((eq marker :single) 'single-float)
+        ((eq marker :double) 'double-float)
+        (t (let ((d *read-default-float-format*))
+             (cond ((eq d 'double-float) 'double-float)
+                   ((eq d 'long-float)   'double-float)
+                   ;; nil / single-float / short-float / anything else → single
+                   (t 'single-float))))))
+
+(defun %build-float-from-parts (sign int-part frac-part frac-div exp-sign exp-part &rest type-arg)
+  "Create a real IEEE-bit boxed float from parsed components.
    value = sign * (int-part + frac-part/frac-div) * 10^(exp-sign*exp-part)
-   Built via SSE2 %float-from-int + %float-div, so the result is a true
-   #x60 IEEE float that :fadd/:fmul/:fcmp can operate on natively and the
-   printer's IEEE-decoder can format."
+   TYPE-ARG optionally carries the declared float type ('single-float
+   default per CLHS, or 'double-float).  Built via SSE2 %float-from-int +
+   %float-div as a #x60 double payload; single results are rounded to
+   24-bit and retagged #x61 via %round-to-single (numeric tower N1)."
   (let ((mantissa (+ (* int-part frac-div) frac-part))
         (divisor frac-div)
         (exp-val (* exp-sign exp-part)))
@@ -860,12 +881,18 @@
         (when (>= i (- 0 exp-val)) (return nil))
         (setq divisor (* divisor 10))
         (setq i (+ i 1))))
-    ;; Convert num/den → IEEE via SSE2.
-    (let ((signed-mant (* sign mantissa)))
-      (if (= divisor 1)
-          (%float-from-int signed-mant)
-          (%float-div (%float-from-int signed-mant)
-                      (%float-from-int divisor))))))
+    ;; Convert num/den → IEEE via SSE2 (a #x60 double payload).
+    (let* ((signed-mant (* sign mantissa))
+           (raw (if (= divisor 1)
+                    (%float-from-int signed-mant)
+                    (%float-div (%float-from-int signed-mant)
+                                (%float-from-int divisor))))
+           (type (if type-arg (car type-arg) 'single-float)))
+      ;; Single (the CLHS default) rounds to 24-bit + retags #x61; double
+      ;; keeps the full #x60 payload.
+      (if (eq type 'double-float)
+          raw
+          (%round-to-single raw)))))
 
 (defun %try-parse-float (codes)
   "Try to parse char codes as a float. Returns float or nil.
@@ -908,7 +935,8 @@
       (return-from %try-parse-float nil))
     ;; Parse the float: integer-part.fraction-part[exponent]
     (let ((sign 1) (cur codes) (int-part 0) (frac-part 0) (frac-div 1)
-          (exp-sign 1) (exp-part 0) (in-frac nil) (in-exp nil) (got-digit nil))
+          (exp-sign 1) (exp-part 0) (in-frac nil) (in-exp nil) (got-digit nil)
+          (marker :default))   ; exponent-marker class (numeric tower N1)
       ;; Sign
       (when (and cur (= (car cur) 45)) (setq sign -1) (setq cur (cdr cur)))
       (when (and cur (= (car cur) 43)) (setq cur (cdr cur)))
@@ -933,6 +961,7 @@
              (if in-exp (return-from %try-parse-float nil))
              (setq in-exp t)
              (setq in-frac nil)
+             (setq marker (%float-marker-class code))   ; record float type (numeric tower N1)
              ;; Check for exponent sign
              (when (cdr cur)
                (let ((next-code (cadr cur)))
@@ -946,7 +975,8 @@
       ;; Build a boxed float.  Use the rename'd builder — `%make-float'
       ;; is the compiler primop that allocates an uninitialized 1-slot
       ;; float, NOT a defun call.
-      (%build-float-from-parts sign int-part frac-part frac-div exp-sign exp-part))))
+      (%build-float-from-parts sign int-part frac-part frac-div exp-sign exp-part
+                               (%resolve-float-type marker)))))
 
 (defun %tag-as-float (arr)
   "Tag an array as a float object (subtag #x60 = 96).

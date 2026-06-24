@@ -3742,9 +3742,23 @@
   (let ((name (%eval-sym-name sym)))
     (if (null name)
         nil
-        ;; First check local env for function binding
+        ;; First check local env for function binding.
+        ;; CLHS 3.1.2.1.2: operator position resolves in the FUNCTION
+        ;; namespace.  FLET/LABELS bind local functions into the SAME ENV
+        ;; alist as LET variables, so an unguarded name match lets a
+        ;; variable that happens to share a global function's name shadow
+        ;; the function.  UIOP's DIRECTORY-PATHNAME-P does exactly this:
+        ;;   (let ((pathname (pathname pathname))) ...)
+        ;; where PATHNAME is both the bound variable and #'pathname.  The
+        ;; unguarded lookup found the variable (a pathname object) and
+        ;; %do-funcall'd it; a #x32 array routes through GF dispatch and
+        ;; destructively aborts (uncatchable — skips handler-case), which
+        ;; corrupted the open LOAD stream and was the ASDF-gauntlet
+        ;; form-109 wall.  Only accept the local binding when its value is
+        ;; an %interp-closure (what FLET/LABELS store) — mirroring the
+        ;; #'name guard already in %eval-function-form.
         (let ((local (%env-lookup sym env)))
-          (if (car local)
+          (if (and (car local) (%interp-closure-p (cdr local)))
               (let ((fn (cdr local)))
                 (let ((evaled-args (%eval-args args env)))
                   (%do-funcall fn evaled-args)))

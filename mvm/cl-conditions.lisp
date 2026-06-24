@@ -1424,6 +1424,13 @@
       (and (eq sub 'rational) (member super '(real number)))
       (and (member sub '(short-float single-float double-float long-float float))
            (member super '(float real number)))
+      ;; Numeric tower N1 float aliasing: short-float==single-float and
+      ;; long-float==double-float are mutually subtypes; single-float and
+      ;; double-float stay DISTINCT (single is NOT a subtype of double).
+      (and (member sub '(short-float single-float))
+           (member super '(short-float single-float)))
+      (and (member sub '(double-float long-float))
+           (member super '(double-float long-float)))
       (and (eq sub 'real) (eq super 'number))
       (and (eq sub 'complex) (eq super 'number))
       (and (member sub '(unsigned-byte signed-byte))

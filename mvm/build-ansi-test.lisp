@@ -4773,20 +4773,25 @@
   ;; test that funcalls DECODE-FLOAT on one of them used to loop
   ;; forever inside its sig-normalization until SIGALRM killed the
   ;; whole fork (losing every later test in the file).
+  ;; Numeric tower N1: single/short constants are wrapped in
+  ;; %round-to-single so they are genuinely SINGLE-FLOAT-typed (#x61),
+  ;; reader-independent — (typep single-float-epsilon 'single-float) => T,
+  ;; and the epsilon binary-search tests converge to the right value.
+  ;; double/long constants stay #x60 double.
   (setq double-float-epsilon          2.220446049250313d-16)
-  (setq single-float-epsilon          1.1920929d-7)
-  (setq short-float-epsilon           1.1920929d-7)
+  (setq single-float-epsilon          (%round-to-single 1.1920929d-7))
+  (setq short-float-epsilon           (%round-to-single 1.1920929d-7))
   (setq long-float-epsilon            2.220446049250313d-16)
   (setq double-float-negative-epsilon 1.1102230246251565d-16)
-  (setq single-float-negative-epsilon 5.9604645d-8)
-  (setq short-float-negative-epsilon  5.9604645d-8)
+  (setq single-float-negative-epsilon (%round-to-single 5.9604645d-8))
+  (setq short-float-negative-epsilon  (%round-to-single 5.9604645d-8))
   (setq long-float-negative-epsilon   1.1102230246251565d-16)
   (setq most-positive-double-float    1.7976931348623157d308)
   (setq most-negative-double-float   -1.7976931348623157d308)
-  (setq most-positive-single-float    3.4028235d38)
-  (setq most-negative-single-float   -3.4028235d38)
-  (setq most-positive-short-float     3.4028235d38)
-  (setq most-negative-short-float    -3.4028235d38)
+  (setq most-positive-single-float    (%round-to-single 3.4028235d38))
+  (setq most-negative-single-float    (%round-to-single -3.4028235d38))
+  (setq most-positive-short-float     (%round-to-single 3.4028235d38))
+  (setq most-negative-short-float     (%round-to-single -3.4028235d38))
   ;; Long-float = double in Modus (single IEEE-double precision).  Without
   ;; these setqs, expt.error.7 / expt.error.11 (and any other test that
   ;; references most/least-positive-long-float) see NIL and crash before
@@ -4799,10 +4804,10 @@
   ;; tests and by the float-format type predicates.
   (setq least-positive-double-float   5.0d-324)
   (setq least-negative-double-float  -5.0d-324)
-  (setq least-positive-single-float   1.4d-45)
-  (setq least-negative-single-float  -1.4d-45)
-  (setq least-positive-short-float    1.4d-45)
-  (setq least-negative-short-float   -1.4d-45)
+  (setq least-positive-single-float   (%round-to-single 1.4d-45))
+  (setq least-negative-single-float   (%round-to-single -1.4d-45))
+  (setq least-positive-short-float    (%round-to-single 1.4d-45))
+  (setq least-negative-short-float    (%round-to-single -1.4d-45))
   (setq least-positive-long-float     5.0d-324)
   (setq least-negative-long-float    -5.0d-324)
 

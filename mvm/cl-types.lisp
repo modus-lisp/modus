@@ -503,14 +503,15 @@
     ((eq sup 'fixnum) (eq sub 'bit))
     ((eq sup 'float) (or (eq sub 'single-float) (eq sub 'double-float)
                          (eq sub 'short-float) (eq sub 'long-float)))
-    ;; CLHS 12.1.4.4: an implementation that lacks any of the float types
-    ;; must consider them equivalent in the sense of SUBTYPEP.  Modus has
-    ;; one IEEE double-precision representation behind all four names, so
-    ;; (SUBTYPEP 'SHORT-FLOAT 'SINGLE-FLOAT) etc. all return T.
-    ((or (eq sup 'single-float) (eq sup 'double-float)
-         (eq sup 'short-float) (eq sup 'long-float))
-     (or (eq sub 'single-float) (eq sub 'double-float)
-         (eq sub 'short-float) (eq sub 'long-float)))
+    ;; Numeric tower N1: Modus now distinguishes single from double, with
+    ;; the standard aliasing short-float==single-float and
+    ;; long-float==double-float (CLHS 12.1.4.4 lets equal formats collapse).
+    ;; So single/short are mutually subtypes, double/long are mutually
+    ;; subtypes, but single is NOT a subtype of double (and vice versa).
+    ((or (eq sup 'single-float) (eq sup 'short-float))
+     (if (or (eq sub 'single-float) (eq sub 'short-float)) t nil))
+    ((or (eq sup 'double-float) (eq sup 'long-float))
+     (if (or (eq sub 'double-float) (eq sub 'long-float)) t nil))
     (t nil)))
 
 (defun %sub-default-low (head)
@@ -557,6 +558,30 @@
          (sup-range (%parse-num-range sup-type))
          (sub-lo (car sub-range)) (sub-hi (cdr sub-range))
          (sup-lo (car sup-range)) (sup-hi (cdr sup-range)))
+    ;; Numeric tower N1: collapse the float-type aliases so the head/range
+    ;; comparison treats them as identical — short-float==single-float and
+    ;; long-float==double-float.  (single-float stays distinct from
+    ;; double-float.)  Without this, (subtypep 'short-float 'single-float)
+    ;; reaches the range path with mismatched heads → spurious (NIL T).
+    (when (eq sub-head 'short-float) (setq sub-head 'single-float))
+    (when (eq sub-head 'long-float)  (setq sub-head 'double-float))
+    (when (eq sup-head 'short-float) (setq sup-head 'single-float))
+    (when (eq sup-head 'long-float)  (setq sup-head 'double-float))
+    ;; Two BARE float-type symbols carry no compound bounds, so resolve
+    ;; them via the head lattice directly and skip the range machinery —
+    ;; whose default float bounds depend on the most/least-*-float
+    ;; constants (NIL on images that don't init them).  Covers the alias
+    ;; cases (single==short, double==long → T) and the new distinction
+    ;; (single vs double → NIL) without touching compound float ranges.
+    (when (and (symbolp sub-type) (symbolp sup-type)
+               (or (eq sub-head 'single-float) (eq sub-head 'double-float)
+                   (eq sub-head 'float))
+               (or (eq sup-head 'single-float) (eq sup-head 'double-float)
+                   (eq sup-head 'float)))
+      (return-from %sub-numeric-range
+        (cond ((eq sub-head sup-head) (values t t))
+              ((%numeric-supertype-p sup-head sub-head) (values t t))
+              (t (values nil t)))))
     ;; Integer-bound normalization: (:open . N) where N is integer is
     ;; equivalent to (:closed . N±1) when BOTH sides are integer types.
     ;; Lets `(integer (9)) ≡ (integer 10)` show as ranges containing each

@@ -1339,13 +1339,21 @@
 ;;; float/number utility stubs
 ;;; ============================================================
 
+(defun %single-typed-p (float)
+  "T if FLOAT's declared type is single-float or short-float (24-bit)."
+  (and (floatp-impl float)
+       (let ((ty (%float-declared-type float)))
+         (or (eq ty 'single-float) (eq ty 'short-float)))))
+
 (defun float-digits (float)
-  "Return number of digits in float significand (53 for double-precision)."
-  53)
+  "Number of radix-2 digits in FLOAT's significand: 24 single/short,
+   53 double/long (numeric tower N1)."
+  (if (%single-typed-p float) 24 53))
 
 (defun float-precision (float)
-  "Return precision (significant digits) of float."
-  (if (= float 0.0d0) 0 53))
+  "Precision (significant bits) of FLOAT: 0 for a zero, else 24/53 by type."
+  (if (= float 0.0d0) 0
+      (if (%single-typed-p float) 24 53)))
 
 (defun float-sign (float &rest float2-arg)
   "Return a float with magnitude of float2 and sign of float."
@@ -4437,7 +4445,7 @@
      (cond ((or (eql obj 0) (eql obj 1)) 'bit)
            (t 'fixnum)))
     ((ratiop obj)      'ratio)
-    ((floatp-impl obj) 'single-float)
+    ((floatp-impl obj) (%float-declared-type obj))  ; declared float type (numeric tower N1)
     ((%complex-p obj)  'complex)
     ((characterp obj)
      ;; standard-char for the printing ASCII range, else character.
@@ -5438,10 +5446,14 @@
          ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
          ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
          ((eq tn 'float) (floatp-impl obj))
-         ((eq tn 'single-float) (floatp-impl obj))
-         ((eq tn 'double-float) (floatp-impl obj))
-         ((eq tn 'short-float) (floatp-impl obj))
-         ((eq tn 'long-float) (floatp-impl obj))
+         ;; Per-type identity by declared subtag (numeric tower N1).  Modus
+         ;; uses the standard SBCL aliasing short-float==single-float and
+         ;; long-float==double-float, so single-float-p/double-float-p
+         ;; (which accept the alias subtags) implement all four predicates.
+         ((eq tn 'single-float) (single-float-p obj))
+         ((eq tn 'short-float)  (single-float-p obj))
+         ((eq tn 'double-float) (double-float-p obj))
+         ((eq tn 'long-float)   (double-float-p obj))
          ((eq tn 'ratio) (ratiop obj))
          ((eq tn 'cons) (consp obj))
          ((eq tn 'list) (or (null obj) (consp obj)))

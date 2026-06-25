@@ -9201,16 +9201,17 @@
         (compile-form acc env dest))))
 
 (defun compile-1+ (arg env dest)
-  "Compile (1+ x) -> add tagged 1 (which is 2).
-   TODO: ratio operands are silently corrupted via :inc on a pointer;
-   replace with type-dispatch when a non-recursive path is available."
-  (compile-form arg env dest)
-  (emit-ir :inc dest))
+  "Compile (1+ x) as (+ x 1) — CLHS 12.2.  Routes through the :add-checked
+   fast path, which detects non-fixnum operands (ratio / bignum / float /
+   complex) and fixnum overflow and falls to GENERIC-ADD.  The old raw :inc
+   added tagged 1 directly to whatever was in DEST, corrupting a heap-object
+   pointer (ratio/bignum/float) and silently wrapping at MOST-POSITIVE-FIXNUM."
+  (compile-add (list arg 1) env dest))
 
 (defun compile-1- (arg env dest)
-  "Compile (1- x) -> subtract tagged 1 (which is 2)."
-  (compile-form arg env dest)
-  (emit-ir :dec dest))
+  "Compile (1- x) as (- x 1) — CLHS 12.2.  Routes through GENERIC-SUBTRACT
+   for non-fixnum / overflow operands (see compile-1+)."
+  (compile-sub (list arg 1) env dest))
 
 (defun compile-truncate (args env dest)
   "Compile (truncate a) or (truncate a b).

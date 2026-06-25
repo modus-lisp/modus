@@ -5054,17 +5054,24 @@
 (defun numerator (r) r)
 (defun denominator (r) 1)
 (defun float (n &optional proto)
-  "Convert N to a float.  Integer → IEEE double via %float-from-int;
-   ratio → num/den as IEEE double; existing float → unchanged.
-   PROTO ignored (modus only has one float type)."
-  (declare (ignore proto))
-  (cond
-    ((%ieee-float-p n) n)
-    ((integerp n) (%float-from-int n))
-    ((ratiop n)
-     (%float-div (%float-from-int (aref n 0))
-                 (%float-from-int (aref n 1))))
-    (t n)))
+  "Convert N to a float (CLHS).  With no PROTO: an existing float is
+   returned unchanged, otherwise N becomes a SINGLE-FLOAT (the CLHS
+   default).  With PROTO: the result has PROTO's float format."
+  (let ((f (cond
+             ((%ieee-float-p n) n)
+             ((integerp n) (%float-from-int n))
+             ((ratiop n)
+              (%float-div (%float-from-int (aref n 0))
+                          (%float-from-int (aref n 1))))
+             (t n))))
+    (cond
+      ((not (%ieee-float-p f)) f)
+      (proto (if (double-float-p proto)
+                 (%make-typed-float (aref f 0) (aref f 1) 'double-float)
+                 (%round-to-single f)))
+      ;; No prototype: keep an existing float's format; coerce others to single.
+      ((%ieee-float-p n) n)
+      (t (%round-to-single f)))))
 (defun rational (n) n)
 (defun rationalize (n) n)
 

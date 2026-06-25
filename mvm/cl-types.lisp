@@ -216,9 +216,12 @@
     (when (or (float-negative-p xf) (%float-zero-p xf)) (return-from log 0))
     (let ((ln-x (%log-f xf)))
       (if (null base)
-          ln-x
+          (%irr-result ln-x x)
           (let ((ln-b (%log-f (%any-to-float base))))
-            (if (%float-zero-p ln-b) 0 (%float-div ln-x ln-b)))))))
+            (if (%float-zero-p ln-b)
+                0
+                (%as-result-float (%float-div ln-x ln-b)
+                                  (%float-result-type x base))))))))
 
 (defun cosh (x)
   "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2.  IEEE float result."
@@ -2296,6 +2299,25 @@
                  (nhi   (if (>= nhi-u 2147483648) (- nhi-u 4294967296) nhi-u)))
             (%make-typed-float nhi nlo-u 'single-float))))))
 
+(defun %float-result-type (a b)
+  "CL float contagion (CLHS 12.1.4.4): the result float format is the
+   widest among the float operands.  short/single/rational don't widen
+   past single; a double or long operand forces double.  At least one of
+   A/B is already a float when this is called from the float branch."
+  (if (or (double-float-p a) (double-float-p b)) 'double-float 'single-float))
+
+(defun %as-result-float (r type)
+  "Retag the #x60 double-payload result R to contagion TYPE: round to
+   single-float precision when TYPE is single-float, else leave R double."
+  (if (eq type 'single-float) (%round-to-single r) r))
+
+(defun %irr-result (r x)
+  "Format contagion for a 1-arg irrational/transcendental fn: the #x60
+   double-payload result R takes single-float format unless the ORIGINAL
+   argument X is a double/long float.  Per CLHS a rational argument to an
+   irrational function yields a single-float result."
+  (if (double-float-p x) r (%round-to-single r)))
+
 (defun %ieee-float-to-rat (x)
   "Decode IEEE 64-bit double bits (modus encoding) to an exact rational.
    Layout: sign|11-bit exponent|52-bit mantissa.  Value = (-1)^sign *
@@ -2404,7 +2426,8 @@
                 (%fixnum-* (aref a 1) (aref b 1))))
     ((or (%complex-p a) (%complex-p b)) (complex-add a b))
     ((or (%ieee-float-p a) (%ieee-float-p b))
-     (%float-add (%any-to-float a) (%any-to-float b)))
+     (%as-result-float (%float-add (%any-to-float a) (%any-to-float b))
+                       (%float-result-type a b)))
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
@@ -2425,7 +2448,8 @@
     ((or (%complex-p a) (%complex-p b)) (complex-mul a b))
     ;; IEEE float fast path — SSE2 MULSD via %float-mul primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
-     (%float-mul (%any-to-float a) (%any-to-float b)))
+     (%as-result-float (%float-mul (%any-to-float a) (%any-to-float b))
+                       (%float-result-type a b)))
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
@@ -2444,7 +2468,8 @@
     ((or (%complex-p a) (%complex-p b)) (complex-sub a b))
     ;; IEEE float fast path — SSE2 SUBSD via %float-sub primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
-     (%float-sub (%any-to-float a) (%any-to-float b)))
+     (%as-result-float (%float-sub (%any-to-float a) (%any-to-float b))
+                       (%float-result-type a b)))
     (t (%fixnum-- a b))))
 
 (defun generic-1+ (x)

@@ -2420,9 +2420,19 @@
     ((or (eq result-type 'float) (eq result-type 'double-float)
          (eq result-type 'single-float) (eq result-type 'short-float)
          (eq result-type 'long-float))
-     (if (integerp object)
-         (float object)
-         object))
+     ;; CLHS: coerce to a specific float format converts to THAT format;
+     ;; coerce to FLOAT keeps an existing float's format, else single.
+     ;; Use %any-to-float (EXACT #x60 double payload) — NOT the public
+     ;; FLOAT fn, which now rounds to single by default and would make
+     ;; (coerce big-int 'double-float) lose 28 mantissa bits.
+     (let ((f (%any-to-float object)))
+       (cond
+         ((not (%ieee-float-p f)) f)
+         ((or (eq result-type 'double-float) (eq result-type 'long-float))
+          (%make-typed-float (aref f 0) (aref f 1) 'double-float))
+         ((eq result-type 'float)
+          (if (%ieee-float-p object) object (%round-to-single f)))
+         (t (%round-to-single f)))))    ; single-float / short-float
     ((eq result-type 'integer)
      (if (floatp-impl object) (truncate object) object))
     ((eq result-type 'character)
@@ -3402,13 +3412,13 @@
   (if extra
       (%program-error "sin requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 0)
-            (t (%sin-f (%any-to-float x))))))
+            (t (%irr-result (%sin-f (%any-to-float x)) x)))))
 
 (defun cos (x &rest extra)
   (if extra
       (%program-error "cos requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 1)
-            (t (%cos-f (%any-to-float x))))))
+            (t (%irr-result (%cos-f (%any-to-float x)) x)))))
 
 (defun tan (x &rest extra)
   (if extra
@@ -3418,20 +3428,20 @@
                       (r (%trig-reduce-f xf))
                       (sn (%sin-poly-f r))
                       (cs (%cos-poly-f r)))
-                 (%float-div sn cs))))))
+                 (%irr-result (%float-div sn cs) x))))))
 
 (defun asin (x &rest extra)
   (if extra
       (%program-error "asin requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 0)
-            (t (%asin-f (%any-to-float x))))))
+            (t (%irr-result (%asin-f (%any-to-float x)) x)))))
 
 (defun acos (x &rest extra)
   (if extra
       (%program-error "acos requires exactly 1 argument")
       (cond ((and (integerp x) (= x 1)) 0)
-            ((and (integerp x) (= x 0)) (%fpi/2))
-            (t (%float-sub (%fpi/2) (%asin-f (%any-to-float x)))))))
+            ((and (integerp x) (= x 0)) (%round-to-single (%fpi/2)))
+            (t (%irr-result (%float-sub (%fpi/2) (%asin-f (%any-to-float x))) x)))))
 
 ;; atan accepts 1 or 2 args (atan x) / (atan y x); 0 or 3+ is the error
 ;; case.  Use a plain &rest dispatch (NOT &optional+&rest, whose
@@ -3443,21 +3453,23 @@
       ((= n 1)
        (let ((x (car args)))
          (cond ((and (integerp x) (= x 0)) 0)
-               (t (%atan-f (%any-to-float x))))))
+               (t (%irr-result (%atan-f (%any-to-float x)) x)))))
       ((= n 2)
-       (let ((yf (%any-to-float (car args)))     ; CLHS (atan number divisor)
-             (xf (%any-to-float (car (cdr args))))) ; number=y, divisor=x
-         (cond
-           ((%float-zero-p xf)
-            (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
-                  ((%float-zero-p yf) (%fl 0))
-                  (t (%fpi/2))))
-           ((float-negative-p xf)
-            (let ((base (%atan-f (%float-div yf xf))))
-              (if (float-negative-p yf)
-                  (%float-sub base (%fpi))
-                  (%float-add base (%fpi)))))
-           (t (%atan-f (%float-div yf xf))))))
+       (let* ((ya (car args)) (xa (car (cdr args)))
+              (yf (%any-to-float ya))             ; CLHS (atan number divisor)
+              (xf (%any-to-float xa))             ; number=y, divisor=x
+              (r (cond
+                   ((%float-zero-p xf)
+                    (cond ((float-negative-p yf) (%float-neg (%fpi/2)))
+                          ((%float-zero-p yf) (%fl 0))
+                          (t (%fpi/2))))
+                   ((float-negative-p xf)
+                    (let ((base (%atan-f (%float-div yf xf))))
+                      (if (float-negative-p yf)
+                          (%float-sub base (%fpi))
+                          (%float-add base (%fpi)))))
+                   (t (%atan-f (%float-div yf xf))))))
+         (%as-result-float r (%float-result-type ya xa))))
       (t (%program-error "atan requires 1 or 2 arguments")))))
 
 (defun sinh (x &rest extra)
@@ -3467,7 +3479,7 @@
             (t (let* ((xf (%any-to-float x))
                       (ep (%exp-f xf))
                       (em (%exp-f (%float-neg xf))))
-                 (%float-div (%float-sub ep em) (%fl 2)))))))
+                 (%irr-result (%float-div (%float-sub ep em) (%fl 2)) x))))))
 
 (defun cosh (x &rest extra)
   (if extra
@@ -3476,7 +3488,7 @@
             (t (let* ((xf (%any-to-float x))
                       (ep (%exp-f xf))
                       (em (%exp-f (%float-neg xf))))
-                 (%float-div (%float-add ep em) (%fl 2)))))))
+                 (%irr-result (%float-div (%float-add ep em) (%fl 2)) x))))))
 
 (defun tanh (x &rest extra)
   (if extra
@@ -3485,13 +3497,13 @@
             (t (let* ((xf (%any-to-float x))
                       (ep (%exp-f xf))
                       (em (%exp-f (%float-neg xf))))
-                 (%float-div (%float-sub ep em) (%float-add ep em)))))))
+                 (%irr-result (%float-div (%float-sub ep em) (%float-add ep em)) x))))))
 
 (defun exp (x &rest extra)
   (if extra
       (%program-error "exp requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 1)
-            (t (%exp-f (%any-to-float x))))))
+            (t (%irr-result (%exp-f (%any-to-float x)) x)))))
 
 ;; ABS — strict 1-arg.  (abs 0 0) / (abs 0 nil nil) → PROGRAM-ERROR.
 ;; Body copies the cl-eval.lisp impl (complex magnitude via sqrt; else
@@ -3525,7 +3537,8 @@
          (let ((s (isqrt n)))
            (if (= (* s s) n)
                s
-               (%sqrt-f (%any-to-float n)))))
+               ;; Irrational sqrt of a rational -> single-float (CLHS).
+               (%round-to-single (%sqrt-f (%any-to-float n))))))
         ((ratiop n)
          (let* ((num (ratio-numerator n))
                 (den (ratio-denominator n)))
@@ -3534,8 +3547,8 @@
              (if (= (* s s) (* num den))
                  ;; Perfect square numerator*denominator -> exact ratio s/den.
                  (%make-rat s den)
-                 ;; Non-perfect square -> FLOAT.
-                 (%sqrt-f (%any-to-float n))))))
+                 ;; Non-perfect square -> single-float (rational arg, CLHS).
+                 (%round-to-single (%sqrt-f (%any-to-float n)))))))
         ((and (not (fixnump n)) (not (consp n)) (not (null n))
               (= (obj-subtag n) #x32)
               (= (array-length n) 2))
@@ -3551,7 +3564,8 @@
                     (when (>= i 8) (return x))
                     (setq x (%float-mul (%float-add x (%float-div n x)) half))
                     (setq i (+ i 1))))
-                x))))
+                ;; Preserve the argument's float format (single vs double).
+                (%irr-result x n)))))
         (t 0))))
 
 ;;; ============================================================

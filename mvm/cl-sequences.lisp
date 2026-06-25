@@ -747,9 +747,16 @@
 ;;; Function wrappers for compiler builtins (needed for apply/#')
 ;;; The compiler uses XOR/AND/OR opcodes for inline (logxor a b) etc.
 ;;; but #'logxor needs a real function object.
-(defun %logxor2 (a b) (logxor a b))
-(defun %logand2 (a b) (logand a b))
-(defun %logior2 (a b) (logior a b))
+;; Route the funcall/apply helpers through the bignum-aware generic engine.
+;; A bare (logand a b) here is the COMPILED raw :and intrinsic, which is
+;; garbage when an operand is a bignum POINTER — so #'logand / (apply #'logand
+;; ...) silently produced wrong results on bignums.  generic-logand checks
+;; bignump first and routes to the two's-complement engine; only fixnum∧fixnum
+;; takes the raw fast path (no recursion: that inner (logand a b) is the
+;; intrinsic, not this helper).
+(defun %logxor2 (a b) (generic-logxor a b))
+(defun %logand2 (a b) (generic-logand a b))
+(defun %logior2 (a b) (generic-logior a b))
 
 (defun logxor (&rest args)
   "Variadic logxor function for use with apply/#'."

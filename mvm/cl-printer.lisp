@@ -2812,6 +2812,152 @@
          ;; Trailing gap if atp.
          (when atp (%format-emit-pad (gap-size) padcode stream)))))))
 
+;;; ============================================================
+;;; ~F fixed-format floating point (CLHS 22.3.3.1)
+;;; ============================================================
+
+(defun %pow10 (n)
+  "10^N as an exact rational (a ratio when N<0)."
+  (if (>= n 0)
+      (expt 10 n)
+      (%make-rat 1 (expt 10 (- 0 n)))))
+
+(defun %fmt-real-to-rat (x)
+  "Exact rational value of real X (integer / ratio / IEEE float)."
+  (cond ((integerp x) x)
+        ((%ieee-float-p x) (%ieee-float-to-rat x))
+        (t x)))                              ; ratio is already rational
+
+(defun %decimal-digit-count (n)
+  "Number of decimal digits in non-negative integer N (0 -> 1)."
+  (if (= n 0)
+      1
+      (let ((c 0) (m n))
+        (loop (when (= m 0) (return c))
+              (setq m (truncate m 10))
+              (setq c (+ c 1))))))
+
+(defun %print-zero-padded (n width s)
+  "Print non-negative integer N in decimal to stream S, left-padded with
+   '0' to at least WIDTH characters."
+  (let ((dc (%decimal-digit-count n)))
+    (when (< dc width)
+      (let ((i 0))
+        (loop (when (>= i (- width dc)) (return nil))
+              (%print-char 48 s) (setq i (+ i 1)))))
+    (%print-decimal-to-stream n s)))
+
+(defun %format-f-core (x d scale atp)
+  "Return the core ~F rendering of real X as a string: optional sign, the
+   integer part, a '.', and the fraction.  D = fixed number of fraction
+   digits (NIL = shortest round-trip, >=1 digit).  SCALE = decimal scale
+   factor k (value printed is X*10^scale).  ATP forces a leading '+'."
+  (let* ((rat (%fmt-real-to-rat x))
+         ;; Sign from the float's sign BIT (so -0.0 prints "-0.0"); the
+         ;; rational of -0.0 is plain 0 and would lose the sign.
+         (neg (if (%ieee-float-p x)
+                  (< (car (%ieee-float-decode-bits x)) 0)
+                  (< rat 0)))
+         (arat (if (< rat 0) (- 0 rat) rat))
+         (s (make-string-output-stream)))
+    (cond (neg (%print-char 45 s))            ; -
+          (atp (%print-char 43 s)))           ; +
+    (if d
+        ;; Fixed D decimals: round(|x| * 10^(d+scale)) to an integer, then
+        ;; split off the last D digits as the fraction.
+        (let* ((p (+ d scale))
+               (scaled (round (* arat (%pow10 p))))
+               (tens (expt 10 d))
+               (ipart (truncate scaled tens))
+               (fpart (- scaled (* ipart tens))))
+          (%print-decimal-to-stream ipart s)
+          (%print-char 46 s)                  ; .
+          (when (> d 0) (%print-zero-padded fpart d s)))
+        ;; Shortest round-trip digits, positional, >=1 fraction digit.
+        (let* ((dec (%ieee-float-decode-bits (%fmt-x-as-float x)))
+               (mant (cadr dec)) (e (caddr dec)))
+          (if (or (eq mant :infinity) (eq mant :nan) (= mant 0))
+              (progn (%print-char 48 s) (%print-char 46 s) (%print-char 48 s))
+              (let* ((dk (%dragon4-digits mant e))
+                     (digits (car dk))
+                     (k (+ (cdr dk) scale)))
+                (%format-f-positional digits k s)))))
+    (get-output-stream-string s)))
+
+(defun %fmt-x-as-float (x)
+  "Coerce real X to an IEEE float for shortest-digit rendering."
+  (if (%ieee-float-p x) x (%any-to-float x)))
+
+(defun %format-f-positional (digits k s)
+  "Write DIGITS (0-9 ints) positionally to stream S with value 0.<digits>*10^k,
+   always fixed notation, always at least one digit after the point."
+  (let ((ndig (length digits)))
+    (cond
+      ((<= k 0)
+       (%print-char 48 s) (%print-char 46 s)   ; 0.
+       (let ((z (- 0 k)))
+         (loop (when (<= z 0) (return nil))
+               (%print-char 48 s) (setq z (- z 1))))
+       (dolist (d digits) (%print-char (+ 48 d) s)))
+      ((>= k ndig)
+       (dolist (d digits) (%print-char (+ 48 d) s))
+       (let ((z (- k ndig)))
+         (loop (when (<= z 0) (return nil))
+               (%print-char 48 s) (setq z (- z 1))))
+       (%print-char 46 s) (%print-char 48 s))  ; .0
+      (t
+       (let ((i 0))
+         (dolist (d digits)
+           (when (= i k) (%print-char 46 s))
+           (%print-char (+ 48 d) s)
+           (setq i (+ i 1))))))))
+
+(defun %format-fixed-float (x w d scale ovf pad atp stream)
+  "~w,d,k,ovf,padF — emit X in fixed format right-justified in width W.
+   Drops the leading 0 before the point to help fit W; if still too wide and
+   OVF is supplied, emits W copies of OVF."
+  (let* ((scale (if scale scale 0))
+         (core (%format-f-core x d scale atp))
+         (padc (if pad pad 32)))             ; default pad = space
+    (if (not w)
+        (%print-string-raw core stream)
+        (let ((len (length core)))
+          ;; Leading-zero drop: if too wide and core is "0.xxx" or "-0."/"+0.",
+          ;; remove the 0 before the decimal point to try to fit W.
+          (when (> len w)
+            (let* ((dotpos (%string-find-char core 46))
+                   (zpos (if (and dotpos (> dotpos 0)) (- dotpos 1) -1)))
+              (when (and (>= zpos 0)
+                         (= (char-code (char core zpos)) 48)
+                         (or (= zpos 0)
+                             (let ((c (char-code (char core (- zpos 1)))))
+                               (or (= c 45) (= c 43)))))  ; preceded by sign or start
+                (setq core (%string-delete-at core zpos))
+                (setq len (- len 1)))))
+          (if (and ovf (> len w))
+              (let ((i 0)) (loop (when (>= i w) (return nil))
+                                 (%print-char ovf stream) (setq i (+ i 1))))
+              (progn
+                (when (< len w)
+                  (let ((i 0)) (loop (when (>= i (- w len)) (return nil))
+                                     (%print-char padc stream) (setq i (+ i 1)))))
+                (%print-string-raw core stream)))))))
+
+(defun %string-find-char (str ch)
+  "Index of first char CH (code) in STR, or NIL."
+  (let ((n (length str)) (i 0))
+    (loop (when (>= i n) (return nil))
+          (when (= (char-code (char str i)) ch) (return i))
+          (setq i (+ i 1)))))
+
+(defun %string-delete-at (str pos)
+  "Copy of STR with the char at POS removed."
+  (let ((n (length str)) (s (make-string-output-stream)) (i 0))
+    (loop (when (>= i n) (return nil))
+          (unless (= i pos) (%print-char (char-code (char str i)) s))
+          (setq i (+ i 1)))
+    (get-output-stream-string s)))
+
 ;;; Main format implementation
 ;;; Returns remaining args (for use by formatter)
 (defun %format-impl (stream control args)
@@ -3002,6 +3148,19 @@
                                       colonp atp stream))
                        (t
                         (%format-cardinal n stream)))))
+                  ;; ~F — fixed-format float. ~w,d,k,overflowchar,padcharF
+                  ((or (= dir 70) (= dir 102))
+                   (let ((n (car arg-list)))
+                     (setq arg-list (cdr arg-list))
+                     (if (or (integerp n) (ratiop n) (%ieee-float-p n))
+                         (%format-fixed-float n param1 param2 param3
+                                              param4 param5 atp stream)
+                         ;; Non-real arg: ~F prints it as if by ~A (CLHS 22.3.3.1).
+                         (let ((s (make-string-output-stream))
+                               (*print-escape* nil))
+                           (declare (special *print-escape*))
+                           (%write-obj n s nil nil)
+                           (%print-string-raw (get-output-stream-string s) stream)))))
                   ;; ~C — character
                   ((or (= dir 67) (= dir 99))
                    (let ((c (car arg-list)))

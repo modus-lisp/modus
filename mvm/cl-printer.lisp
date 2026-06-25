@@ -977,21 +977,27 @@
       (setq c (+ c 1)))
     c))
 
-(defun %dragon4-digits (mant exp)
+(defun %dragon4-digits (mant exp &rest prec-arg)
   "MANT * 2^EXP with MANT>0 (MANT the 53-bit IEEE-double significand).
    Returns (cons digit-list k) where the value equals 0.<digits> * 10^k
    and the digit list is the shortest decimal that round-trips to this
-   float.  The half-ulp gaps are taken at the float's TRUE precision: a
-   value whose low 29 significand bits are all zero is exactly a single
-   float, so it is reduced to a 24-bit significand and the shortest
-   decimal at single precision is emitted (1.2 -> \"1.2\"); a genuine
-   53-bit double (nonzero low 29 bits, e.g. an epsilon constant or a
-   runtime quotient) keeps full precision."
-  (let ((f mant) (e exp) (p 53))
-    ;; Detect single precision: low 29 bits (= 52-23) all zero means this
-    ;; double is exactly representable as a 24-bit single.  Reduce so the
-    ;; ulp/half-gap reflect single precision.  Genuine doubles keep p=53.
-    (when (and (>= (%float-bit-length f) 53)
+   float.  PREC-ARG (optional) is the TRUE precision in bits — 24 for a
+   single, 53 for a double — taken from the float's subtag (N1.5 typed
+   floats).  When omitted, falls back to a heuristic: a value whose low 29
+   significand bits are all zero is GUESSED to be a single (1.2 -> \"1.2\").
+   The heuristic is WRONG for a large double that happens to have a short
+   significand (e.g. 2^50, a power of two), which is why callers should pass
+   the real precision; a genuine 53-bit double then keeps full precision."
+  (let* ((f mant) (e exp) (p 53)
+         (prec (and prec-arg (car prec-arg)))
+         (want-single (if prec
+                          (= prec 24)
+                          (and (>= (%float-bit-length f) 53)
+                               (= (logand f 536870911) 0)))))
+    ;; Reduce to a 24-bit significand only when single precision is wanted
+    ;; AND the low 29 bits are actually zero (true for any real single).
+    (when (and want-single
+               (>= (%float-bit-length f) 53)
                (= (logand f 536870911) 0))   ; 536870911 = (1<<29)-1
       (setq f (ash f -29))
       (setq e (+ e 29))
@@ -1168,7 +1174,7 @@
                  (when mk (%print-char mk s) (%print-char 48 s))))))
            (t
             (when neg (%print-char 45 s))
-            (let* ((dk (%dragon4-digits mant e))
+            (let* ((dk (%dragon4-digits mant e (if (single-float-p f) 24 53)))
                    (digits (car dk))
                    (k      (cdr dk)))
               (%print-float-digits digits k s (%float-print-marker f)))))))
@@ -2874,11 +2880,12 @@
           (%print-char 46 s)                  ; .
           (when (> d 0) (%print-zero-padded fpart d s)))
         ;; Shortest round-trip digits, positional, >=1 fraction digit.
-        (let* ((dec (%ieee-float-decode-bits (%fmt-x-as-float x)))
+        (let* ((fobj (%fmt-x-as-float x))
+               (dec (%ieee-float-decode-bits fobj))
                (mant (cadr dec)) (e (caddr dec)))
           (if (or (eq mant :infinity) (eq mant :nan) (= mant 0))
               (progn (%print-char 48 s) (%print-char 46 s) (%print-char 48 s))
-              (let* ((dk (%dragon4-digits mant e))
+              (let* ((dk (%dragon4-digits mant e (if (single-float-p fobj) 24 53)))
                      (digits (car dk))
                      (k (+ (cdr dk) scale)))
                 (%format-f-positional digits k s)))))
@@ -2912,6 +2919,20 @@
            (%print-char (+ 48 d) s)
            (setq i (+ i 1))))))))
 
+(defun %fmt-real-negative-p (x)
+  "Sign-aware negativity: a float's sign BIT (so -0.0 counts), else value<0."
+  (if (%ieee-float-p x)
+      (< (car (%ieee-float-decode-bits x)) 0)
+      (< x 0)))
+
+(defun %round-real-to-decimals (x scale deff)
+  "Exact rational of X*10^scale rounded to DEFF decimal places (sign kept)."
+  (let* ((rat (%fmt-real-to-rat x))
+         (srat (* rat (%pow10 scale)))
+         (tens (%pow10 deff))
+         (scaled (round (* srat tens))))      ; nearest integer, ties to even
+    (if (= scaled 0) 0 (%make-rat scaled tens))))
+
 (defun %format-fixed-float (x w d scale ovf pad atp stream)
   "~w,d,k,ovf,padF — emit X in fixed format right-justified in width W.
    Drops the leading 0 before the point to help fit W; if still too wide and
@@ -2919,6 +2940,20 @@
   (let* ((scale (if scale scale 0))
          (core (%format-f-core x d scale atp))
          (padc (if pad pad 32)))             ; default pad = space
+    ;; CLHS 22.3.3.1: when D is omitted and the shortest form overflows W,
+    ;; reduce the fraction to the largest D (>=0) that fits, rounding the
+    ;; value; a reduced-to-zero fraction still prints one digit (1.1 -> "1.0").
+    (when (and w (null d) (> (length core) w))
+      (let* ((asrat (let ((r (%fmt-real-to-rat x)))
+                      (* (if (< r 0) (- 0 r) r) (%pow10 scale))))
+             (ipart (truncate asrat))
+             (intdigits (if (= ipart 0) 1 (%decimal-digit-count ipart)))
+             (sw (if (or (%fmt-real-negative-p x) atp) 1 0))
+             (deff (- w sw intdigits 1)))
+        (when (< deff 0) (setq deff 0))
+        (let ((rcore (%format-f-core (%round-real-to-decimals x scale deff)
+                                     nil 0 atp)))
+          (when (<= (length rcore) (length core)) (setq core rcore)))))
     (if (not w)
         (%print-string-raw core stream)
         (let ((len (length core)))

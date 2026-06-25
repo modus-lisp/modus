@@ -854,9 +854,12 @@
    float type symbol, consulting *read-default-float-format* for :default."
   (cond ((eq marker :single) 'single-float)
         ((eq marker :double) 'double-float)
-        (t (let ((d *read-default-float-format*))
-             (cond ((eq d 'double-float) 'double-float)
-                   ((eq d 'long-float)   'double-float)
+        (t (let* ((d  *read-default-float-format*)
+                  ;; Compare by NAME: user code may bind the default to a
+                  ;; CL-TEST/CL symbol that isn't EQ to this file's literal.
+                  (dn (if (symbolp d) (symbol-name d) "SINGLE-FLOAT")))
+             (cond ((string= dn "DOUBLE-FLOAT") 'double-float)
+                   ((string= dn "LONG-FLOAT")   'double-float)
                    ;; nil / single-float / short-float / anything else → single
                    (t 'single-float))))))
 

@@ -2299,6 +2299,20 @@
                  (nhi   (if (>= nhi-u 2147483648) (- nhi-u 4294967296) nhi-u)))
             (%make-typed-float nhi nlo-u 'single-float))))))
 
+(defun %coerce-float-to-type (f type)
+  "Produce a float of declared TYPE from IEEE float F, with the correct
+   precision: 24-bit (round-to-single) for single/short, 53-bit (the full
+   double payload) for double/long.  TYPE's subtag is applied verbatim so
+   (float i 0.0s0) yields a real short-float (#x65), not a single (#x64)."
+  (cond
+    ((or (eq type 'double-float) (eq type 'long-float))
+     (%make-typed-float (aref f 0) (aref f 1) type))
+    (t                                   ; single / short: round to 24-bit
+     (let ((s (%round-to-single f)))     ; #x64, 24-bit-rounded payload
+       (if (eq type 'single-float)
+           s
+           (%make-typed-float (aref s 0) (aref s 1) type))))))   ; retag short
+
 (defun %float-result-type (a b)
   "CL float contagion (CLHS 12.1.4.4): the result float format is the
    widest among the float operands.  short/single/rational don't widen

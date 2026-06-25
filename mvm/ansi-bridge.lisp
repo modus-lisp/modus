@@ -2428,11 +2428,10 @@
      (let ((f (%any-to-float object)))
        (cond
          ((not (%ieee-float-p f)) f)
-         ((or (eq result-type 'double-float) (eq result-type 'long-float))
-          (%make-typed-float (aref f 0) (aref f 1) 'double-float))
          ((eq result-type 'float)
           (if (%ieee-float-p object) object (%round-to-single f)))
-         (t (%round-to-single f)))))    ; single-float / short-float
+         ;; single/short/double/long → exact subtag + correct precision.
+         (t (%coerce-float-to-type f result-type)))))
     ((eq result-type 'integer)
      (if (floatp-impl object) (truncate object) object))
     ((eq result-type 'character)

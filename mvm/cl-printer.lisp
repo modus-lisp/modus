@@ -1045,10 +1045,14 @@
                     (setq digits (cons d digits))))))
           (cons (reverse digits) k))))))
 
-(defun %print-float-digits (digits k stream)
+(defun %print-float-digits (digits k stream marker)
   "Render DIGITS (list of 0-9 ints) with decimal point so that value =
    0.<digits> * 10^K, choosing positional vs exponential per the CL free
-   format.  Assumes sign already emitted and DIGITS non-empty."
+   format.  Assumes sign already emitted and DIGITS non-empty.  MARKER is
+   the exponent-marker char code used when the float's declared type differs
+   from *read-default-float-format* (forces a `<marker>0' suffix even in
+   positional notation, per CLHS 22.1.3.1.3); NIL means the type matches the
+   default — plain `e' and no positional suffix."
   (let ((ndig (length digits)))
     (cond
       ;; Positional notation when -2 <= k <= 7 (matches the common CL printer
@@ -1078,9 +1082,13 @@
             (dolist (d digits)
               (when (= i k) (%print-char 46 stream))
               (%print-char (+ 48 d) stream)
-              (setq i (+ i 1)))))))
+              (setq i (+ i 1))))))
+       ;; Type differs from default → append marker + 0 exponent (1.0d0).
+       (when marker
+         (%print-char marker stream)
+         (%print-char 48 stream)))   ; 0
       (t
-       ;; Exponential: D.DDDDe<exp>, exp = k-1.
+       ;; Exponential: D.DDDD<marker><exp>, exp = k-1.
        (let ((first t))
          (dolist (d digits)
            (%print-char (+ 48 d) stream)
@@ -1089,12 +1097,40 @@
              (setq first nil))))
        ;; If only one digit, we printed "D." — add trailing 0.
        (when (= ndig 1) (%print-char 48 stream))
-       (%print-char 101 stream)   ; e
+       (%print-char (if marker marker 101) stream)   ; marker or `e'
        (let ((ex (- k 1)))
          (when (< ex 0)
            (%print-char 45 stream)   ; -
            (setq ex (- 0 ex)))
          (%print-decimal-to-stream ex stream))))))
+
+(defun %float-width-class (name)
+  "Modus aliases short==single and long==double in VALUE, so a float and the
+   default format are the SAME printed format when they share a width class.
+   NAME is a float-type symbol-name string."
+  (if (or (string= name "DOUBLE-FLOAT") (string= name "LONG-FLOAT"))
+      :double
+      :single))
+
+(defun %float-print-marker (f)
+  "Exponent-marker char code for float F per CLHS 22.1.3.1.3: NIL when F's
+   format matches *read-default-float-format* (print bare / plain e), else
+   the type-specific marker (s/f/d/l).  Compares by WIDTH CLASS, not exact
+   type name: short==single and long==double in Modus, so e.g. a single value
+   prints bare when the default is short-float.  *read-default-float-format*
+   is bound by user code to a symbol that need not be EQ to a literal here,
+   so name-based comparison is required."
+  (let* ((ty   (%float-declared-type f))
+         (tyn  (symbol-name ty))
+         (def  *read-default-float-format*)
+         (defn (if (symbolp def) (symbol-name def) "SINGLE-FLOAT")))
+    (if (eq (%float-width-class tyn) (%float-width-class defn))
+        nil
+        (cond ((eq ty 'single-float) 102)   ; f
+              ((eq ty 'short-float)  115)   ; s
+              ((eq ty 'double-float) 100)   ; d
+              ((eq ty 'long-float)   108)   ; l
+              (t 100)))))
 
 (defun float-to-string (f)
   "Convert boxed float to printed decimal representation.
@@ -1126,13 +1162,16 @@
               ((eq mant :nan)
                (%print-string-raw "#.float-nan" s))
               (t
-               (%print-char 48 s) (%print-char 46 s) (%print-char 48 s))))
+               ;; 0.0 — with a type marker when type != default (0.0d0 etc.)
+               (%print-char 48 s) (%print-char 46 s) (%print-char 48 s)
+               (let ((mk (%float-print-marker f)))
+                 (when mk (%print-char mk s) (%print-char 48 s))))))
            (t
             (when neg (%print-char 45 s))
             (let* ((dk (%dragon4-digits mant e))
                    (digits (car dk))
                    (k      (cdr dk)))
-              (%print-float-digits digits k s))))))
+              (%print-float-digits digits k s (%float-print-marker f)))))))
       (t
        ;; Legacy [signed-mant, divisor] rational-form (subtag #x32).
        (let* ((smant (aref f 0))

@@ -4283,9 +4283,18 @@
     ((floatp value)
      ;; Read hi/lo as SEPARATE 32-bit halves — never combine into a 64-bit
      ;; integer (lossy in-image for floats ≥ 2.0; see ieee-float-hi32).
+     ;; SUBTAG carries the CL float TYPE so a literal `1.0f0' / `1.0' reads
+     ;; back as a single (#x64) and `1.0d0' as a double (#x60), matching the
+     ;; runtime reader (N1).  SBCL aliases short→single and long→double, so
+     ;; only single vs double is distinguishable here; the IEEE payload of a
+     ;; single already has its low 29 mantissa bits zero (24-bit precision),
+     ;; so the same hi/lo bits serve both subtags.
      (let* ((hi (ieee-float-hi32 value))
-            (lo (ieee-float-lo32 value)))
-       (emit-ir :alloc-obj dest 2 +subtag-float+)
+            (lo (ieee-float-lo32 value))
+            (subtag (if (typep value 'single-float)
+                        +subtag-single-float+      ; #x64
+                        +subtag-float+)))          ; #x60 double
+       (emit-ir :alloc-obj dest 2 subtag)
        (let ((temp (alloc-temp-reg)))
          ;; Slot 0 = high 32 bits (tagged fixnum, always fits)
          (emit-ir :li temp (ash hi +fixnum-shift+))

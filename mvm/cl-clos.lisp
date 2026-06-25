@@ -5066,9 +5066,9 @@
              (t n))))
     (cond
       ((not (%ieee-float-p f)) f)
-      (proto (if (double-float-p proto)
-                 (%make-typed-float (aref f 0) (aref f 1) 'double-float)
-                 (%round-to-single f)))
+      ;; Prototype supplied: result has PROTO's exact float format
+      ;; (short/single/double/long) at the right precision.
+      (proto (%coerce-float-to-type f (%float-declared-type proto)))
       ;; No prototype: keep an existing float's format; coerce others to single.
       ((%ieee-float-p n) n)
       (t (%round-to-single f)))))

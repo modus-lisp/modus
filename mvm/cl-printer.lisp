@@ -1106,7 +1106,7 @@
   (let ((s (make-string-output-stream))
         (subtag (obj-subtag f)))
     (cond
-      ((and (>= subtag 96) (<= subtag 99))   ; #x60..#x63 — all IEEE-payload floats
+      ((or (= subtag 96) (and (>= subtag 100) (<= subtag 102)))   ; #x60 + #x64..#x66 IEEE-payload floats
        ;; Real IEEE float: decode bits, render via Dragon4 free-format.
        ;; (Per-type precision + exponent marker land in N1.5; this gate
        ;;  just ensures single/short/long subtags decode like double.)

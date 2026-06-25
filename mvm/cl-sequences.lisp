@@ -810,7 +810,7 @@
     (if (consp x) nil
       (if (null x) nil
         (let ((st (obj-subtag x)))
-          (and (>= st 96) (<= st 99)))))))  ; #x60..#x63
+          (or (= st 96) (and (>= st 100) (<= st 102))))))))  ; #x60 + #x64..#x66 (skip #x61-63: mvm-module etc.)
 
 (defun float-equal (a b)
   "Compare two boxed floats by hi32/lo32 slots."

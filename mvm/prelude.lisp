@@ -969,7 +969,7 @@
         (write-char-serial 35) (write-char-serial 92)
         (write-char-serial (char-code obj)))
        ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
-             (let ((st (obj-subtag obj))) (and (>= st #x60) (<= st #x63))))
+             (let ((st (obj-subtag obj))) (or (= st #x60) (and (>= st #x64) (<= st #x66)))))
         ;; Boxed IEEE float (any of #x60..#x63: double/single/short/long;
         ;; numeric tower N1) — print integer-part.fractional-part by
         ;; decoding mantissa/exponent.  Approximation: split via

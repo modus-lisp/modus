@@ -73,9 +73,16 @@
 ;; only the DECLARED CL float type so typep/type-of/contagion can
 ;; distinguish them.  #x60 stays double-float (preserves the boot image
 ;; and every existing literal).
-(defconstant +subtag-single-float+ #x61)
-(defconstant +subtag-short-float+  #x62)
-(defconstant +subtag-long-float+   #x63)
+;; single/short/long use #x64/#x65/#x66 — NOT the adjacent #x61/#x62/#x63:
+;; runtime/tags.lisp already assigns #x61 = +subtag-mvm-module+ (an object
+;; WITH pointer slots the GC follows).  A single-float at #x61 was scanned
+;; as an mvm-module → its raw IEEE bit-slots followed as pointers → a
+;; corrupted funcall (RIP=0xDEAD1004) crashing float-arithmetic GC cycles.
+;; #x64..#x66 are unassigned.  The float predicates therefore match
+;; #x60 + #x64..#x66 and SKIP #x61..#x63.
+(defconstant +subtag-single-float+ #x64)
+(defconstant +subtag-short-float+  #x65)
+(defconstant +subtag-long-float+   #x66)
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
 (defconstant +nil-value+ #xDEAD0001)

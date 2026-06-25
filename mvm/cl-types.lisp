@@ -2233,24 +2233,24 @@
   (and (not (fixnump x)) (not (consp x)) (not (null x))
        (not (characterp x))
        (let ((st (obj-subtag x)))
-         (and (>= st #x60) (<= st #x63)))
+         (or (= st #x60) (and (>= st #x64) (<= st #x66))))
        (= (array-length x) 2)))
 
 (defun %float-declared-type (x)
   "The declared CL float type of IEEE float X, from its subtag."
   (let ((st (obj-subtag x)))
-    (cond ((= st #x61) 'single-float)
-          ((= st #x62) 'short-float)
-          ((= st #x63) 'long-float)
+    (cond ((= st #x64) 'single-float)
+          ((= st #x65) 'short-float)
+          ((= st #x66) 'long-float)
           (t           'double-float))))   ; #x60
 
 (defun single-float-p (x)
   (and (%ieee-float-p x)
-       (let ((st (obj-subtag x))) (or (= st #x61) (= st #x62)))))
+       (let ((st (obj-subtag x))) (or (= st #x64) (= st #x65)))))
 
 (defun double-float-p (x)
   (and (%ieee-float-p x)
-       (let ((st (obj-subtag x))) (or (= st #x60) (= st #x63)))))
+       (let ((st (obj-subtag x))) (or (= st #x60) (= st #x66)))))
 
 (defun %make-typed-float (hi lo type)
   "Build a 2-slot IEEE float with the subtag for declared TYPE, payload

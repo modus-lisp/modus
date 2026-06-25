@@ -405,6 +405,38 @@ sequence slows alloc-heavy code (optimizable follow-up).
 Functions are NOP-aligned to avoid addresses ending in 0x1 (cons tag collision
 with closure-aware funcall dispatch). See `*x64-native-code-offset*`.
 
+### Crash triage: it's almost never the GC — default elsewhere
+
+The collector is hardened (fuzz-closed layout-dependence, conservative-root
+object-start + cons-kind validation, guard band, zero-init alloc).  When a
+new change crashes, do **not** conclude "GC fragility / out of scope" — that
+verdict has been wrong every time it's been reached.  Bisect to the real
+cause, which is almost always one of:
+- **A subtag collision** — a new object subtag reusing one already assigned
+  in `runtime/tags.lisp` (e.g. single-float at `#x61` == `+subtag-mvm-module+`:
+  the collector scanned the float's raw IEEE bit-slots as mvm-module pointers
+  → corrupted a live fn → `RIP=0xDEAD1004`).  **ALWAYS check `runtime/tags.lisp`
+  before claiming a free subtag.**  See [[reference_float_subtag_collision]].
+- **MVM caller-save clobber** — a live reg-COPY destroyed across an added call
+  (see [[reference_mvm_caller_save_bug]]).
+- **A missing `:gc-check` before `:alloc-obj`** (see [[reference_make_closure_gc_check]]),
+  or a real logic bug in the new code.
+
+Method that works:
+1. **Reproduce deterministically.** A crash that reproduces every run is NOT a
+   GC race.  "Crashes on the ANSI image, clean on the generic binary" usually
+   just means the generic binary runs GC-OFF (R14 = full heap, no trigger);
+   the ANSI image sets R14 = midpoint.  Force GC on the generic binary with
+   `MODUS_GC_R14=<small>` (e.g. 262144) for a fast repro.
+2. **`RIP=0xDEADxxxx` as the program counter** = a corrupted/NIL FUNCTION
+   pointer was *called* (control transfer), not a data deref — i.e. heap
+   corruption of a live fn/closure, which is exactly what scanning raw
+   non-pointer slots (float bits, etc.) as pointers produces.
+3. **Bisect the trigger**: calls-only-no-alloc → isolates caller-save; same
+   object at a different subtag value → isolates a subtag collision; etc.
+   A subagent reporting "GC fragility, out of scope" should be sent back to
+   bisect to determinism first.
+
 The image (especially fixpoint-ssh with networking) can grow past 0x400000. The fn table
 at the end of the image must not overlap the globals or stack. Build scripts assert this.
 

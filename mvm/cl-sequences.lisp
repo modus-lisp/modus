@@ -2984,12 +2984,20 @@
 
 ;;; Numeric
 (defun logbitp (index integer)
-  "True if bit INDEX of INTEGER is 1."
-  (not (zerop (logand integer (ash 1 index)))))
+  "True if bit INDEX of INTEGER (two's complement) is 1.  A bit at or beyond
+   INTEGER-LENGTH is the sign bit — 0 for a non-negative integer, 1 for a
+   negative one — so we never compute 2^index for a huge INDEX (which would
+   build an astronomically large bignum and hang, e.g.
+   (logbitp most-positive-fixnum 0))."
+  (if (>= index (integer-length integer))
+      (< integer 0)
+      (not (zerop (logand integer (ash 1 index))))))
 
 (defun integer-length (n)
-  "Number of bits needed to represent N."
-  (let ((x (abs n)) (len 0))
+  "CLHS 12.2: the number of bits in N's two's-complement representation,
+   excluding the sign.  For a NEGATIVE N this is the bit length of -(N+1),
+   not of (abs N) — e.g. (integer-length -1) = 0, (integer-length -2) = 1."
+  (let ((x (if (< n 0) (- (- 0 n) 1) n)) (len 0))
     (loop (when (zerop x) (return len))
       (setq x (ash x -1)) (setq len (+ len 1)))))
 

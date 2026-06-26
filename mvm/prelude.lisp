@@ -1875,6 +1875,36 @@
                             (logand h2 #x3FFFFFFF))))
       (if (zerop combined) 1 combined))))
 
+(defun name-eq (sym name-string)
+  "Runtime version of MODUS.HASH:NAME-EQ — true iff SYM's name matches
+   NAME-STRING (case-insensitively, via the dual-FNV-1a hash).
+
+   This MUST exist at runtime: the compiler's SETF macro expander
+   (compiler.lisp ~1707) — which is extracted and compiled into the
+   image so runtime EVAL can macroexpand SETF — dispatches every place
+   type with `(name-eq (car place) \"CAR\"/\"GETHASH\"/...)`.  Without a
+   runtime NAME-EQ the call resolved to %UNRESOLVED-FN (→ NIL), so NO
+   place branch matched and `(setf (gethash k h) v)` fell through to the
+   broken generic `SET-<accessor>` fallback (which errored), making
+   runtime-EVAL `(setf (gethash k h) v)` signal instead of storing.
+
+   Mirrors %EVAL-SYM-EQ: native MVM symbols (subtag #x50, single hash
+   slot) carry only a hash — SYMBOL-NAME may return \"\" for them — so we
+   compare the stored hash slot DIRECTLY to (compute-name-hash NAME-STRING).
+   CL symbols (3-slot) and the gensym/string cases go through SYMBOL-NAME."
+  (cond
+    ((null sym) nil)
+    ((eq sym t) nil)
+    ((consp sym) nil)
+    ((characterp sym) nil)
+    ((%cl-sym-p sym)
+     (let ((n (symbol-name sym)))
+       (and n (eql (compute-name-hash n) (compute-name-hash name-string)))))
+    ((%native-mvm-sym-p sym)
+     (eql (aref sym 0) (compute-name-hash name-string)))
+    ((integerp sym) nil)
+    (t nil)))
+
 (defun intern (name &rest pkg-arg)
   "Intern stub — returns the name hash on bare metal.
    ANSI's intern is (string &optional package). Use &rest here so the

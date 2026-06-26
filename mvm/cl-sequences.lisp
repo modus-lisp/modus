@@ -3019,19 +3019,27 @@
 
 (defun complex (r &optional i)
   "Create a complex number with REAL=r and IMAGINARY=i (default 0).
-   Per CLHS, (complex r 0) is rational-equivalent — modus collapses to
-   r in that case since we don't have a separate (complex rational)
-   vs (complex float) distinction.  When i ≠ 0 a real 3-slot array
-   is built so realpart/imagpart/conjugate can pull the components."
+   CLHS 12.1.5.3: (complex rational 0) collapses to the rational R — a
+   rational complex with a zero rational imaginary part IS that rational.
+   But (complex float ...) is ALWAYS a genuine complex object, and float
+   contagion coerces BOTH parts to a float when either part is a float:
+   (complex 1.0) => #C(1.0 0.0), (complex 1 2.0) => #C(1.0 2.0).  Only the
+   all-rational, exactly-zero-imaginary case collapses to a real."
   (let ((i (or i 0)))
     (cond
-      ((and (integerp i) (= i 0)) r)
+      ;; All-rational with a zero imaginary part → collapse to R.
+      ((and (rationalp r) (rationalp i) (= i 0)) r)
       (t
-       (let ((c (make-array 3)))
-         (aset c 0 '%complex-marker)
-         (aset c 1 r)
-         (aset c 2 i)
-         c)))))
+       ;; Float contagion: if either part is a float, coerce both to float.
+       (let ((rf r) (im i))
+         (when (or (%ieee-float-p r) (%ieee-float-p i))
+           (setq rf (%any-to-float r))
+           (setq im (%any-to-float i)))
+         (let ((c (make-array 3)))
+           (aset c 0 '%complex-marker)
+           (aset c 1 rf)
+           (aset c 2 im)
+           c))))))
 
 (defun realpart (x)
   (cond
@@ -3039,8 +3047,11 @@
     (t x)))
 
 (defun imagpart (x)
+  ;; CLHS: imagpart of a REAL is (* 0 x) — a rational 0 for rationals, but
+  ;; a same-format float ZERO for floats (e.g. (imagpart 1.0) => 0.0).
   (cond
     ((%complex-p x) (aref x 2))
+    ((%ieee-float-p x) (%irr-result (%float-sub x x) x))
     (t 0)))
 
 (defun conjugate (x)
@@ -3050,6 +3061,12 @@
     (t x)))
 
 (defun complexp (x) (%complex-p x))
+
+(defun %complex-abs (z)
+  "Magnitude of complex Z = sqrt(realpart^2 + imagpart^2).  Used by the
+   compiler's ABS macro for the complex case (and by abs's defun)."
+  (sqrt (+ (* (realpart z) (realpart z))
+           (* (imagpart z) (imagpart z)))))
 
 ;;; Complex arithmetic.  Use modus's existing rational + / - / * routes
 ;;; so the resulting (real, imag) parts come back in their natural form

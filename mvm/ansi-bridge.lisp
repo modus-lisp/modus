@@ -3502,6 +3502,12 @@
   (if extra
       (%program-error "exp requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 1)
+            ;; Complex argument: e^(a+bi) = e^a (cos b + i sin b).
+            ((%complex-p x)
+             (let* ((a (realpart x)) (b (imagpart x))
+                    (ea (%exp-f (%any-to-float a))))
+               (complex (%float-mul ea (%cos-f (%any-to-float b)))
+                        (%float-mul ea (%sin-f (%any-to-float b))))))
             (t (%irr-result (%exp-f (%any-to-float x)) x)))))
 
 ;; ABS — strict 1-arg.  (abs 0 0) / (abs 0 nil nil) → PROGRAM-ERROR.
@@ -3525,29 +3531,52 @@
 ;; cl-clos.lisp impl verbatim (integer/ratio/boxed-float/IEEE branches);
 ;; the boxed-float branch self-recurses through this override, which
 ;; terminates because the recursion target is an integer or ratio.
+;; Complex sqrt via the algebraic formula.  For z = a + bi:
+;;   m = |z| = sqrt(a^2 + b^2)
+;;   sqrt(z) = sqrt((m+a)/2) + sign(b)*sqrt((m-a)/2) i
+;; (when b = 0 and a < 0 this degenerates to the pure-imaginary branch).
+;; Inputs ar/ai are arbitrary reals; the result parts are floats.  FMT is
+;; the argument that drives single-vs-double contagion (rational => single).
+(defun %complex-sqrt (ar ai fmt)
+  (let* ((af (%any-to-float ar))
+         (bf (%any-to-float ai))
+         (m  (%sqrt-f (%float-add (%float-mul af af) (%float-mul bf bf))))
+         (half (%float-div (%f-one) (%fl 2)))
+         (rp (%sqrt-f (%float-mul (%float-add m af) half)))
+         (ip (%sqrt-f (%float-mul (%float-sub m af) half))))
+    (when (float-negative-p bf) (setq ip (%float-neg ip)))
+    (complex (%irr-result rp fmt) (%irr-result ip fmt))))
+
 (defun sqrt (n &rest extra)
   (if extra
       (%program-error "sqrt requires exactly 1 argument")
       (cond
+        ;; Complex argument -> complex sqrt.
+        ((%complex-p n) (%complex-sqrt (realpart n) (imagpart n) n))
         ((integerp n)
-         (when (< n 0) (error "sqrt of negative"))
-         ;; Perfect square -> exact integer; otherwise a FLOAT (CLHS: sqrt
-         ;; of a non-square rational returns an irrational => float).
-         (let ((s (isqrt n)))
-           (if (= (* s s) n)
-               s
-               ;; Irrational sqrt of a rational -> single-float (CLHS).
-               (%round-to-single (%sqrt-f (%any-to-float n))))))
+         (cond
+           ;; Negative real -> pure-imaginary complex (CLHS): single-float.
+           ((< n 0) (%complex-sqrt n 0 n))
+           ;; Perfect square -> exact integer; otherwise a FLOAT (CLHS: sqrt
+           ;; of a non-square rational returns an irrational => float).
+           (t
+            (let ((s (isqrt n)))
+              (if (= (* s s) n)
+                  s
+                  ;; Irrational sqrt of a rational -> single-float (CLHS).
+                  (%round-to-single (%sqrt-f (%any-to-float n))))))))
         ((ratiop n)
          (let* ((num (ratio-numerator n))
                 (den (ratio-denominator n)))
-           (when (< num 0) (error "sqrt of negative"))
-           (let ((s (isqrt (* num den))))
-             (if (= (* s s) (* num den))
-                 ;; Perfect square numerator*denominator -> exact ratio s/den.
-                 (%make-rat s den)
-                 ;; Non-perfect square -> single-float (rational arg, CLHS).
-                 (%round-to-single (%sqrt-f (%any-to-float n)))))))
+           (cond
+             ((< num 0) (%complex-sqrt n 0 n))
+             (t
+              (let ((s (isqrt (* num den))))
+                (if (= (* s s) (* num den))
+                    ;; Perfect square numerator*denominator -> exact ratio s/den.
+                    (%make-rat s den)
+                    ;; Non-perfect square -> single-float (rational arg, CLHS).
+                    (%round-to-single (%sqrt-f (%any-to-float n)))))))))
         ((and (not (fixnump n)) (not (consp n)) (not (null n))
               (= (obj-subtag n) #x32)
               (= (array-length n) 2))
@@ -3556,6 +3585,8 @@
         ((%ieee-float-p n)
          (cond
            ((%float-zero-p n) n)
+           ;; Negative float -> pure-imaginary complex, same float format.
+           ((float-negative-p n) (%complex-sqrt n 0 n))
            (t (let ((half (%float-div (%float-from-int 1) (%float-from-int 2)))
                     (x n))
                 (let ((i 0))

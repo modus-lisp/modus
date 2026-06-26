@@ -206,22 +206,43 @@
       (%float-add y (%float-mul (%fl e) ln2)))))
 
 (defun log (x &optional base)
-  "Natural log (or log to BASE if supplied).  Domain x > 0; returns
-   0 for x ≤ 0 (modus doesn't have complex logs)."
+  "Natural log (or log to BASE if supplied).  CLHS: (log z) for a complex
+   z (or a NEGATIVE real, whose principal log is complex) is
+   (complex (log (abs z)) (phase z)); positive reals stay real."
   ;; Exact 0 for x = 1.
   (when (and (integerp x) (= x 1)
              (or (null base) (and (integerp base) (>= base 2))))
     (return-from log 0))
+  ;; Base form: (log x b) = (/ (log x) (log b)).  Recurse so the complex
+  ;; / negative cases of each sub-log are handled uniformly, then divide.
+  (when base
+    (return-from log
+      (let ((lx (log x)) (lb (log base)))
+        (cond
+          ((or (%complex-p lx) (%complex-p lb)) (complex-div lx lb))
+          ((%float-zero-p (%any-to-float lb)) 0)
+          (t (%as-result-float (%float-div (%any-to-float lx) (%any-to-float lb))
+                               (%float-result-type x base)))))))
+  ;; 1-arg natural log.
+  ;; Complex argument, or a negative real (principal branch is complex):
+  ;; (log z) = (complex (0.5 * log(a^2+b^2)) (atan b a)) where z = a+bi.
+  ;; Computed with raw float ops (no ABS recursion) so a negative float
+  ;; argument doesn't route through the integer-only generic-negate-int.
+  (when (or (%complex-p x)
+            (and (not (%complex-p x))
+                 (let ((xf (%any-to-float x)))
+                   (and (float-negative-p xf) (not (%float-zero-p xf))))))
+    (return-from log
+      (let* ((a (%any-to-float (realpart x)))
+             (b (%any-to-float (imagpart x)))
+             (mag2 (%float-add (%float-mul a a) (%float-mul b b)))
+             (re (%float-mul (%float-div (%f-one) (%fl 2)) (%log-f mag2)))
+             (im (atan (imagpart x) (realpart x))))
+        (complex (%irr-result re x) im))))
   (let ((xf (%any-to-float x)))
-    (when (or (float-negative-p xf) (%float-zero-p xf)) (return-from log 0))
+    (when (%float-zero-p xf) (return-from log 0))
     (let ((ln-x (%log-f xf)))
-      (if (null base)
-          (%irr-result ln-x x)
-          (let ((ln-b (%log-f (%any-to-float base))))
-            (if (%float-zero-p ln-b)
-                0
-                (%as-result-float (%float-div ln-x ln-b)
-                                  (%float-result-type x base))))))))
+      (%irr-result ln-x x))))
 
 (defun cosh (x)
   "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2.  IEEE float result."
@@ -344,6 +365,8 @@
    which modus represents as its IEEE double 0.0), and (float) π for
    negative reals."
   (cond
+    ;; Complex a+bi: phase = atan(b, a) (full -pi..pi range).
+    ((%complex-p x) (atan (imagpart x) (realpart x)))
     ((integerp x) (if (>= x 0) (%fl 0) (%fpi)))
     ((ratiop x) (if (>= (ratio-numerator x) 0) (%fl 0) (%fpi)))
     (t (if (float-negative-p (%any-to-float x)) (%fpi) (%fl 0)))))
@@ -2543,9 +2566,11 @@
 ;;; ============================================================
 
 (defun float-negative-p (x)
-  "Check if boxed float X has negative sign bit.
-   The hi32 slot is stored as a signed tagged fixnum; negative means sign bit set."
-  (< (aref x 0) 0))
+  "Check if boxed float X has its IEEE sign bit set.  The hi32 slot may be
+   stored SIGNED (negative fixnum) by the arithmetic path or UNSIGNED
+   (0..2^32-1) by the reader's single-float literal path, so test bit 31
+   directly after masking to 32 bits rather than relying on fixnum sign."
+  (= (logand (ash (logand (aref x 0) 4294967295) -31) 1) 1))
 
 (defun %bignum-trunc-doubling (na nb)
   "Return ⌊na/nb⌋ where NA, NB are non-negative integers (fixnum or
@@ -2783,6 +2808,15 @@
    Tagged-ratio aware: ratios are normalised so num/den uniquely
    represents value, hence componentwise compare is sufficient.
    IEEE float: coerce to rational and recurse."
+  ;; Complex operands (CLHS =): (= z1 z2) iff realparts = AND imagparts =.
+  ;; A complex vs a real R equals iff imagpart is 0 and realpart = R.
+  ;; Gated on (not fixnump) BOTH so the hot fixnum-compare path never pays
+  ;; the %complex-p type-walk — a fixnum is never a complex.
+  (when (and (not (fixnump a)) (not (fixnump b))
+             (or (%complex-p a) (%complex-p b)))
+    (return-from numeric-equal-p
+      (and (numeric-equal-p (realpart a) (realpart b))
+           (numeric-equal-p (imagpart a) (imagpart b)))))
   ;; IEEE-float vs integer fast path — avoid coerce-to-rat for the
   ;; common 0.0/integer 0 case (avoids bignum overflow on small floats).
   (when (and (%ieee-float-p a) (integerp b))

@@ -1425,8 +1425,13 @@
     (lambda (form)
       (if (= (length form) 2)
           (let ((tmp (gensym "ABS")))
+            ;; Complex argument: magnitude = sqrt(realpart^2 + imagpart^2),
+            ;; routed through the %complex-abs helper.  Fixnum/real fast path
+            ;; otherwise: sign-flip when negative.
             `(let ((,tmp ,(cadr form)))
-               (if (< ,tmp 0) (- 0 ,tmp) ,tmp)))
+               (if (%complex-p ,tmp)
+                   (%complex-abs ,tmp)
+                   (if (< ,tmp 0) (- 0 ,tmp) ,tmp))))
           '(%signal-program-error))))
 
   ;; PROG1 → LET + body + return first value

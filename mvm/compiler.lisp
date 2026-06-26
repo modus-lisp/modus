@@ -3635,6 +3635,11 @@
       ((= op-name 245376457710419216)   (compile-logand (cdr form) env dest))
       ((= op-name 444641700551290191)   (compile-logior (cdr form) env dest))
       ((= op-name 91997575206662710)   (compile-logxor (cdr form) env dest))
+      ;; %word-log{and,ior,xor}: raw tagged-word bitwise (no dispatch/error),
+      ;; used by generic-log*'s non-integer fallback.
+      ((= op-name 971449395863493638)   (compile-word-logand (cdr form) env dest))
+      ((= op-name 643978041343708313)   (compile-word-logior (cdr form) env dest))
+      ((= op-name 256699368442599680)   (compile-word-logxor (cdr form) env dest))
       ((= op-name 498596602025227109)      (when (arity-ok-p form 2 2 env dest) (compile-ash (cadr form) (caddr form) env dest)))
       ((= op-name 707618725562015373)      (when (arity-ok-p form 2 2 env dest) (compile-ldb (cadr form) (caddr form) env dest)))
 
@@ -9148,6 +9153,42 @@
     (compile-form (cadr args) env temp)
     (emit-ir :pop dest)
     (emit-ir :mul64hi dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-word-logand (args env dest)
+  "Compile (%word-logand a b) — RAW :and of the two tagged words, NO type
+   dispatch and NO error.  Used by generic-logand's non-integer fallback to
+   replicate the historical tolerant raw :and behaviour (format/printer code
+   ANDs occasionally-NIL flags) without re-entering compile-logand's
+   tag-checked path (which would recurse)."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :and dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-word-logior (args env dest)
+  "Compile (%word-logior a b) — RAW :or of the two tagged words.  See
+   compile-word-logand."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :or dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-word-logxor (args env dest)
+  "Compile (%word-logxor a b) — RAW :xor of the two tagged words.  See
+   compile-word-logand."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :xor dest dest temp)
     (free-temp-reg)))
 
 (defun compile-acc128 (args env dest)

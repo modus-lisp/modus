@@ -2541,7 +2541,11 @@
     ((bignump a) (bignum-logand-fixnum a b))
     ((bignump b) (bignum-logand-fixnum b a))
     ((and (integerp a) (integerp b)) (logand a b))
-    (t (error "logand: bad type"))))
+    ;; Non-integer operand (NIL/char/etc.): replicate the historical raw :and
+    ;; on the tagged words rather than erroring.  compile-logand routes ANY
+    ;; low-bit-set operand here (chars/NIL look the same as bignums to the
+    ;; fixnum tag check), and printer/format code ANDs occasionally-NIL flags.
+    (t (%word-logand a b))))
 
 (defun generic-logior (a b)
   (cond
@@ -2551,7 +2555,7 @@
     ((bignump a) (bignum-logior-fixnum a b))
     ((bignump b) (bignum-logior-fixnum b a))
     ((and (integerp a) (integerp b)) (logior a b))
-    (t (error "logior: bad type"))))
+    (t (%word-logior a b))))
 
 (defun generic-logxor (a b)
   (cond
@@ -2559,7 +2563,7 @@
     ((bignump a) (bignum-logxor-fixnum a b))
     ((bignump b) (bignum-logxor-fixnum b a))
     ((and (integerp a) (integerp b)) (logxor a b))
-    (t (error "logxor: bad type"))))
+    (t (%word-logxor a b))))
 
 ;;; ============================================================
 ;;; Float inspection helpers

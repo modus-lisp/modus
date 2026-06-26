@@ -9794,7 +9794,10 @@
            (emit-ir :push dest)
            (compile-form arg env temp)
            (emit-ir :pop dest)
-           (emit-ir :and dest dest temp)
+           ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
+           ;; (the now-fast two's-complement engine).  Raw :and on a bignum
+           ;; pointer returned garbage.
+           (emit-arith-pair :and "GENERIC-LOGAND" dest temp)
            (free-temp-reg)))))))
 
 (defun compile-logior (args env dest)
@@ -9816,7 +9819,7 @@
            (emit-ir :push dest)
            (compile-form arg env temp)
            (emit-ir :pop dest)
-           (emit-ir :or dest dest temp)
+           (emit-arith-pair :or "GENERIC-LOGIOR" dest temp)
            (free-temp-reg)))))))
 
 (defun compile-logxor (args env dest)
@@ -9837,7 +9840,7 @@
            (emit-ir :push dest)
            (compile-form arg env temp)
            (emit-ir :pop dest)
-           (emit-ir :xor dest dest temp)
+           (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
            (free-temp-reg)))))))
 
 (defun compile-ash (value-form count-form env dest)

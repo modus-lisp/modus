@@ -5059,10 +5059,12 @@
    default).  With PROTO: the result has PROTO's float format."
   (let ((f (cond
              ((%ieee-float-p n) n)
-             ((integerp n) (%float-from-int n))
+             ;; %bignum-to-float (cl-types): cvtsi2sd on a bignum POINTER
+             ;; yields garbage magnitude — broke (float 2^70 1d0) round-trip.
+             ((integerp n) (%bignum-to-float n))
              ((ratiop n)
-              (%float-div (%float-from-int (aref n 0))
-                          (%float-from-int (aref n 1))))
+              (%float-div (%bignum-to-float (aref n 0))
+                          (%bignum-to-float (aref n 1))))
              (t n))))
     (cond
       ((not (%ieee-float-p f)) f)

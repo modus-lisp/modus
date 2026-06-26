@@ -2402,6 +2402,34 @@
        (if (= d 1) n (%make-rat n d))))
     (t x)))
 
+(defun %bignum-to-float (n)
+  "Convert an integer N (fixnum OR bignum) to an IEEE double.  The bare
+   %float-from-int primop is cvtsi2sd on a 62-bit fixnum; handed a bignum
+   it converts the heap POINTER bits → garbage (e.g. ~6.5e13 for a 1e20
+   bignum, which broke (float (rational x) x) round-trip — rational.3).
+   For a bignum, fold the sign-magnitude limbs (LSB-first, each <2^62)
+   MSB-first as floats: acc = acc*2^62 + limb.  Bit-exact whenever the
+   magnitude has ≤53 significant bits (every value the ANSI round-trip
+   tests feed in came FROM a double); correctly-rounded-per-step otherwise."
+  (if (not (bignump n))
+      (%float-from-int n)
+      (let* ((sm   (%any-to-limbs n))           ; (sign . limbs LSB-first)
+             (sign (car sm))
+             (rev  (let ((acc nil) (cur (cdr sm)))
+                     (loop (when (null cur) (return acc))
+                       (setq acc (cons (car cur) acc))
+                       (setq cur (cdr cur)))))   ; MSB-first
+             (acc  (%float-from-int 0))
+             (b31  (%float-from-int 2147483648)) ; 2^31 (2^62 is a bignum literal)
+             (base (%float-mul b31 b31))         ; 2^62 as a double
+             (cur  rev))
+        (loop
+          (when (null cur) (return nil))
+          (setq acc (%float-add (%float-mul acc base)
+                                (%float-from-int (car cur))))
+          (setq cur (cdr cur)))
+        (if (= sign -1) (%float-sub (%float-from-int 0) acc) acc))))
+
 (defun %any-to-float (n)
   "Coerce any numeric N to an IEEE float object via the SSE2-backed
    %float-from-int / %float-div primops.  Handles:
@@ -2421,10 +2449,10 @@
    Anything else is returned unchanged."
   (cond
     ((%ieee-float-p n) n)
-    ((integerp n) (%float-from-int n))
+    ((integerp n) (%bignum-to-float n))         ; bignum-safe, NOT raw cvtsi2sd
     ((ratiop n)
-     (%float-div (%float-from-int (aref n 0))
-                 (%float-from-int (aref n 1))))
+     (%float-div (%bignum-to-float (aref n 0))
+                 (%bignum-to-float (aref n 1))))
     ;; Complex array: [%complex-marker r i] (3 slots, subtag #x32).
     ((and (not (fixnump n)) (not (consp n)) (not (null n))
           (not (characterp n))
@@ -2438,8 +2466,8 @@
      (let ((num (aref n 0)) (den (aref n 1)))
        (cond
          ((= den 0) (%float-from-int 0))
-         ((= den 1) (%float-from-int num))
-         (t (%float-div (%float-from-int num) (%float-from-int den))))))
+         ((= den 1) (%bignum-to-float num))
+         (t (%float-div (%bignum-to-float num) (%bignum-to-float den))))))
     (t n)))
 
 (defun generic-add (a b)

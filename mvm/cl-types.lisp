@@ -1817,7 +1817,9 @@
     (loop
       (when (zerop x) (return c))
       (when (oddp x) (setq c (+ c 1)))
-      (setq x (ash x -1)))))
+      ;; bignum-ash, NOT the inline (ash x -1) — that :sar's a big-bignum heap
+      ;; pointer (limitation 8).  bignum-ash is correct for fixnum AND bignum x.
+      (setq x (bignum-ash x -1)))))
 (defun %remf (plist indicator)
   "Remove property INDICATOR from PLIST. Returns (removed-p . new-plist)."
   (cond

@@ -2696,21 +2696,101 @@
                 (when suffix (%print-string-raw suffix stream))))))
     arg-list))
 
+(defun %format-justify-overflow-width (body)
+  "If the FIRST top-level segment of justification BODY is terminated by a
+   ~:; (colon-semicolon, the CLHS 22.3.5.3 line-overflow clause) rather than a
+   plain ~;, return the WIDTH parameter of that ~:; (its second param) — or
+   T when the ~:; carries no width param (meaning 'use the line width').
+   Return NIL when the body has no leading ~:; overflow clause.
+
+   Scans the first ~-directive that is a top-level `;' (59); if it had a `:'
+   modifier it is the overflow clause.  Nested ~<...~> / ~{...~} are skipped so
+   an inner ~; / ~:; does not match.  Honors V/# only as literal placeholders
+   (returns T for a non-literal width since we cannot resolve the arg here)."
+  (let ((len (array-length body)) (pos 0) (result :none))
+    (loop
+      (when (or (not (eq result :none)) (>= pos len)) (return (if (eq result :none) nil result)))
+      (if (/= (%prim-aref body pos) 126)
+          (setq pos (+ pos 1))
+          (let ((p (+ pos 1)) (dch nil) (sawcolon nil)
+                (cur 0) (have-cur nil) (pidx 0) (width nil))
+            (loop
+              (when (>= p len) (return nil))
+              (let ((c (%prim-aref body p)))
+                (cond
+                  ((= c 39)            ; '<char> — char param
+                   (setq p (+ p 1))
+                   (when (< p len) (setq p (+ p 1)))
+                   (when (= pidx 1) (setq width t))
+                   (setq pidx (+ pidx 1)) (setq have-cur nil))
+                  ((and (>= c 48) (<= c 57))   ; digit
+                   (setq cur (+ (* cur 10) (- c 48)))
+                   (setq have-cur t) (setq p (+ p 1)))
+                  ((= c 44)            ; , — param separator
+                   (when (and (= pidx 1) have-cur) (setq width cur))
+                   (setq pidx (+ pidx 1)) (setq cur 0) (setq have-cur nil)
+                   (setq p (+ p 1)))
+                  ((or (= c 118) (= c 86) (= c 35))  ; V / # — runtime param
+                   (when (= pidx 1) (setq width t))
+                   (setq pidx (+ pidx 1)) (setq have-cur nil) (setq p (+ p 1)))
+                  ((= c 58) (setq sawcolon t) (setq p (+ p 1)))   ; :
+                  ((= c 64) (setq p (+ p 1)))                     ; @
+                  ((= c 45) (setq p (+ p 1)))                     ; -
+                  (t (setq dch c) (return nil)))))
+            (cond
+              ((null dch) (setq pos len))
+              ;; First top-level `;' decides: ~:; → overflow clause.
+              ((= dch 59)
+               (when (and (= pidx 1) have-cur) (setq width cur))
+               (if sawcolon
+                   (setq result (if width width t))
+                   (setq result nil)))
+              ;; Skip nested ~<...~> / ~{...~} so their inner ~; is ignored.
+              ((= dch 60)
+               (let ((close (%format-find-close-angle body (+ p 1) len)))
+                 (if close
+                     (setq pos (%format-close-angle-end body close len))
+                     (setq pos len))))
+              ((= dch 123)
+               (let ((close (%format-find-close-brace body (+ p 1) len)))
+                 (if close
+                     (setq pos (%format-close-brace-end body close len))
+                     (setq pos len))))
+              (t (setq pos (+ p 1)))))))))
+
 (defun %format-justify (stream body arg-list colonp atp param1 param2 param3 param4)
   "Render a simple ~<...~> justification.  BODY is the substring between
    ~< and ~>.  Returns the remaining arg-list.
    PARAM1=mincol(0) PARAM2=colinc(1) PARAM3=minpad(0) PARAM4=padchar(#\\Space).
    Honors ~^ (escape in segment k drops segments k..N)."
-  (declare (special *format-iter-escape*))
+  (declare (special *format-iter-escape* *print-right-margin*))
   (let* ((mincol (if param1 param1 0))
          (colinc (if param2 param2 1))
          (minpad (if param3 param3 0))
          (padcode (%ensure-char-code (if param4 param4 32)))
          (segs (%format-split-segments body))
+         ;; CLHS 22.3.5.3: when the FIRST clause is terminated by ~:; it is the
+         ;; line-overflow indicator, NOT a justified segment.  It is printed only
+         ;; if the line would overflow; its ~spare,width:; WIDTH (or the line
+         ;; width when absent) bounds the justified content.  We have no true
+         ;; column engine (Tier-1, margin 100), so we approximate: render the
+         ;; remaining clauses, and emit the overflow prefix iff their combined
+         ;; text length reaches WIDTH.
+         (overflow-w (%format-justify-overflow-width body))
+         (overflow-prefix nil)
          (rendered nil)   ; reversed list of segment strings (kept ones)
          (args arg-list)
          (escaped nil))
     (when (or (null colinc) (= colinc 0)) (setq colinc 1))
+    ;; Pop the overflow-indicator clause off the front and render it; the
+    ;; justification math below then runs over the REMAINING clauses only.
+    (when (and overflow-w segs)
+      (let ((s (make-string-output-stream)))
+        (setq *format-iter-escape* nil)
+        (setq args (%format-impl s (car segs) args))
+        (setq *format-iter-escape* nil)
+        (setq overflow-prefix (get-output-stream-string s)))
+      (setq segs (cdr segs)))
     ;; Render each segment, threading args.  ~^ in a segment drops it and
     ;; all following segments.
     (let ((p segs))
@@ -2731,6 +2811,19 @@
           (when (null k) (return nil))
           (setq text-len (+ text-len (array-length (car k))))
           (setq k (cdr k))))
+      ;; Emit the line-overflow indicator (the leading ~:; clause) BEFORE the
+      ;; justified content, but only when the content reaches the overflow
+      ;; width.  WIDTH = T means "use the line width" (no explicit param), for
+      ;; which we use *print-right-margin* (defaulting to a wide line) so short
+      ;; content never trips it.  With an explicit numeric WIDTH (e.g. ~0,3:;)
+      ;; the prefix fires once the content is at least that wide.
+      (when overflow-prefix
+        (let* ((rm *print-right-margin*)
+               (w (cond ((integerp overflow-w) overflow-w)
+                        ((integerp rm) rm)
+                        (t 72))))
+          (when (>= text-len w)
+            (%print-string-raw overflow-prefix stream))))
       ;; Number of inter-segment gaps that receive padding.
       ;; N segments → N-1 internal gaps; : adds a leading gap, @ a trailing.
       (let* ((internal-gaps (if (> nsegs 1) (- nsegs 1) 0))

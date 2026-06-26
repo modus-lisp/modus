@@ -2644,6 +2644,7 @@
      3 segs → (prefix body suffix)  — both explicit
    An explicit (possibly empty) prefix/suffix segment overrides the colon
    default.  Returns the remaining (unconsumed) arg-list."
+  (declare (special *format-iter-escape*))
   (let* ((segs (%format-split-segments body))
          (nsegs (length segs))
          (prefix nil) (suffix nil) (inner nil))
@@ -2672,7 +2673,13 @@
           (when (and colonp (null prefix)) (setq prefix "("))
           (when (and colonp (null suffix)) (setq suffix ")"))
           (when prefix (%print-string-raw prefix stream))
+          ;; CLHS 22.3.5.2: a ~^ inside the block terminates the block body
+          ;; but the prefix/suffix are STILL printed and the ENCLOSING format
+          ;; continues normally.  Save/clear the iter-escape flag so it does
+          ;; not leak out and abort the surrounding ~{...~} / outer block.
+          (setq *format-iter-escape* nil)
           (setq arg-list (%format-impl stream inner arg-list))
+          (setq *format-iter-escape* nil)
           (when suffix (%print-string-raw suffix stream)))
         (let ((sub (car arg-list)))
           (setq arg-list (cdr arg-list))
@@ -2683,7 +2690,9 @@
                 (when (and colonp (null prefix)) (setq prefix "("))
                 (when (and colonp (null suffix)) (setq suffix ")"))
                 (when prefix (%print-string-raw prefix stream))
+                (setq *format-iter-escape* nil)
                 (%format-impl stream inner sub)
+                (setq *format-iter-escape* nil)
                 (when suffix (%print-string-raw suffix stream))))))
     arg-list))
 

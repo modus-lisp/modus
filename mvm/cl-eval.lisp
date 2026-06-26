@@ -5314,35 +5314,152 @@
 (defun %shr1-bignum (lo hi)
   (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi 61) 4611686018427387903))
                (ash hi -1)))
+
+;;; --- Limb-list shift helpers (LSB-first 62-bit limbs) ---
+;;;
+;;; The old %shl1-bignum / %shr1-bignum operated on a SMALL bignum's
+;;; (lo . hi) 2-slot parts and never promoted to a big bignum.  For any
+;;; magnitude >= 124 bits the bignum becomes a BIG bignum whose slot 0 is
+;;; the -1 sentinel and slot 1 a limbs-array pointer; reading those via
+;;; bignum-lo/bignum-hi treated the sentinel/pointer as numeric parts and
+;;; silently corrupted (ash 1 200) into a bogus small bignum (big-bignum-p
+;;; NIL, magnitude lost).  bignum-truncate's `(bignum-ash r 1)` inner loop
+;;; inherited the same corruption for any >124-bit dividend.  These helpers
+;;; shift the full LSB-first limb list, so %make-bb promotes correctly.
+
+(defun %shl1-limbs-mag (mag)
+  "Shift an LSB-first limb list MAG left by exactly ONE bit.  Uses only
+   constant `ash` so it never re-enters bignum-ash (a variable-count `ash`
+   would).  Returns a new LSB-first limb list.  NB: never forms `(ash v 1)`
+   on a full 62-bit limb — that would overflow the 63-bit fixnum tag; we
+   split off the top bit first."
+  (let ((acc nil) (cur mag) (carry 0))
+    (loop (when (null cur)
+            (when (> carry 0) (setq acc (cons carry acc)))
+            (return (nreverse acc)))
+      (let* ((v (car cur))
+             (top (ash v -61))                       ; bit 61 -> carries out
+             (low61 (logand v 2305843009213693951))  ; v & (2^61-1)
+             ;; (low61 << 1) <= 2^62-2 (safe fixnum), OR the incoming carry bit.
+             (lo (logior (ash low61 1) carry)))
+        (setq acc (cons lo acc))
+        (setq carry top)
+        (setq cur (cdr cur))))))
+
+(defun %shr1-limbs-mag (mag)
+  "Shift an LSB-first limb list MAG right by exactly ONE bit (logical).
+   Constant shifts only.  Returns a new LSB-first limb list."
+  ;; Walk MSB-first (reverse) so the bit shifted out of a higher limb feeds
+  ;; the low bit of the next-lower limb.
+  (let ((rev (reverse mag)) (acc nil) (carry 0))
+    (loop (when (null rev) (return acc))   ; acc already LSB-first here
+      (let* ((v (car rev))
+             ;; carry is 0 or 2^61 (the bit shifted out of the higher limb,
+             ;; landing at bit 61 of this limb).
+             (hi (logior (ash v -1) carry))
+             (nxt (logand v 1)))           ; this limb's low bit -> next-lower
+        (setq acc (cons hi acc))
+        ;; 2^61 literal (not `(ash 1 61)` which would re-enter bignum-ash).
+        (setq carry (if (= nxt 1) 2305843009213693952 0))
+        (setq rev (cdr rev))))))
+
+(defun %shl-limbs-mag (mag count)
+  "Left-shift an LSB-first limb list MAG by COUNT bits (COUNT >= 0).
+   Whole-limb part prepends zero limbs; the residual bits are applied one
+   at a time (constant-shift, no bignum-ash re-entry)."
+  (let* ((whole (truncate count 62))
+         (bits (- count (* whole 62)))
+         ;; Residual sub-limb shift, one bit at a time.
+         (shifted (let ((cur mag) (i 0))
+                    (loop (when (>= i bits) (return cur))
+                      (setq cur (%shl1-limbs-mag cur))
+                      (setq i (+ i 1))))))
+    (if (= whole 0)
+        shifted
+        (let ((zeros nil) (i 0))
+          (loop (when (>= i whole) (return nil))
+            (setq zeros (cons 0 zeros))
+            (setq i (+ i 1)))
+          (append zeros shifted)))))
+
+(defun %shr-limbs-mag (mag count)
+  "Logical right-shift an LSB-first limb list MAG by COUNT bits (>= 0).
+   Drops whole low limbs, then applies the residual bits one at a time."
+  (let* ((whole (truncate count 62))
+         (bits (- count (* whole 62)))
+         (dropped (let ((cur mag) (i 0))
+                    (loop (when (or (>= i whole) (null cur)) (return cur))
+                      (setq cur (cdr cur))
+                      (setq i (+ i 1))))))
+    (let ((cur dropped) (i 0))
+      (loop (when (>= i bits) (return cur))
+        (setq cur (%shr1-limbs-mag cur))
+        (setq i (+ i 1))))))
+
+(defun %limbs-any-low-bits-p (mag count)
+  "True if any of the low COUNT bits of the magnitude MAG (LSB-first
+   62-bit limbs) is set.  Used for the floor-correction of an arithmetic
+   right shift of a negative integer."
+  (let* ((whole (truncate count 62))
+         (bits (- count (* whole 62)))
+         (found nil) (cur mag) (i 0))
+    ;; Any nonzero limb fully inside the dropped WHOLE limbs.
+    (loop (when (or (>= i whole) (null cur) found) (return nil))
+      (when (not (= (car cur) 0)) (setq found t))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    ;; Plus the low BITS of the next limb.  Build the (2^bits - 1) mask via a
+    ;; constant-shift doubling loop so we never re-enter variable-count ash.
+    (when (and (not found) (> bits 0) cur)
+      (let ((mask 0) (j 0))
+        (loop (when (>= j bits) (return nil))
+          (setq mask (%fixnum-+ (ash mask 1) 1))
+          (setq j (+ j 1)))
+        (when (not (= (logand (car cur) mask) 0)) (setq found t))))
+    found))
+
 (defun bignum-ash (n count)
-  "Arithmetic shift N by COUNT bits, promoting to bignum on left-shift
-   overflow.  All recursion-free: the fixnum negative-count branch uses
-   literal `(ash result -1)` so compile-ash takes its CONSTANT path
-   (inline :sar) — never re-enters bignum-ash.  Safe to wire from
-   compile-ash's variable-count slow path."
+  "Arithmetic shift N by COUNT bits.  Left shifts (COUNT > 0) promote
+   through the full LSB-first limb list so values past 124 bits become
+   proper big bignums.  Right shifts (COUNT < 0) implement floor toward
+   negative infinity for negative N (CLHS ash semantics)."
   (cond
     ((= count 0) n)
     ((> count 0)
-     (let ((result n) (remaining count))
-       (loop (when (= remaining 0) (return result))
-         (setq result (if (bignump result)
-                          (%shl1-bignum (bignum-lo result) (bignum-hi result))
-                          (%shl1-fixnum result)))
-         (setq remaining (- remaining 1)))))
-    ((bignump n)
-     (let ((result n) (remaining (- 0 count)))
-       (loop (when (= remaining 0) (return (bignum-to-fixnum-if-possible result)))
-         (setq result (%shr1-bignum (bignum-lo result) (bignum-hi result)))
-         (setq remaining (- remaining 1)))))
+     ;; Left shift: route the full sign+limbs through the limb machinery so
+     ;; the result promotes to fixnum / small / big bignum correctly via
+     ;; %make-bb.  (The old %shl1-bignum 2-slot loop never promoted past a
+     ;; small bignum and corrupted any value >= 124 bits.)
+     (let* ((sm (%any-to-limbs n))
+            (sign (car sm))
+            (mag (cdr sm)))
+       (%make-bb sign (%shl-limbs-mag mag count))))
     (t
-     ;; Fixnum + negative count.  Inline SAR loop with LITERAL -1 so
-     ;; compile-ash routes to constant fast path (no recursion).
-     (let ((result n) (k (- 0 count)))
-       ;; Cap shift at 63 — anything more zeros (or sign-fills) fixnum.
-       (when (> k 63) (setq k 63))
-       (loop (when (= k 0) (return result))
-         (setq result (ash result -1))
-         (setq k (- k 1)))))))
+     ;; Right shift by (- count) bits = floor(n / 2^(-count)).
+     (let ((k (- 0 count)))
+       (cond
+         ((not (bignump n))
+          ;; Fixnum: native arithmetic right shift via literal -1 SAR loop
+          ;; (compile-ash constant fast path, no recursion).
+          (let ((result n))
+            (when (> k 63) (setq k 63))
+            (loop (when (= k 0) (return result))
+              (setq result (ash result -1))
+              (setq k (- k 1)))))
+         (t
+          ;; Bignum: operate on sign+limbs.
+          (let* ((sm (%any-to-limbs n))
+                 (sign (car sm))
+                 (mag (cdr sm))
+                 (shifted (%shr-limbs-mag mag k)))
+            (if (= sign -1)
+                ;; Negative: floor.  magnitude(floor) = ceil(|n| / 2^k)
+                ;; = (|n| >> k) + 1 iff any low k bits were set.
+                (let ((m (if (%limbs-any-low-bits-p mag k)
+                             (%add-limbs-mag shifted (list 1))
+                             shifted)))
+                  (%make-bb -1 m))
+                (%make-bb 1 shifted)))))))))
 (defun %fixnum-to-bignum-parts (n)
   "Convert fixnum N to (lo . hi) bignum parts."
   (if (>= n 0)

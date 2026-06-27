@@ -17,16 +17,21 @@ generic-add hit `%fixnum-+` on two pointers → garbage).  Added the three
 subtags → **50→64 agree**, entire float cluster (arith, comparisons, floatp,
 cons/list of floats, truncate) now matches native.  Lesson: in-image probes that
 compared raw bits MASKED this; the oracle's type-strict diff exposed it.
-Remaining oracle diverges (4 of 71): **symbols** (the WS2 blocker, below);
-`max`/`min` (a COMPILER-WIDE 2-arg-macro limitation — `(max 1 2 3)`→2 in BOTH
-native-compiled and eval2; only the tree-walker's variadic defun gives 3; fixing
-it touches the ANSI build); `mod`/float-`/` (runtime-fn bridging gaps).
+**Symbols FIXED (e235397) — they were NEVER a representation split.** eval2
+`(quote foo)` returned a junk `#:||` (empty name, not `eq`), which looked like a
+WS2 two-representation problem.  It wasn't: replicating compile-quote's exact
+computation natively (`%intern-symbol-pkg` of the name+pkg hash) gives `("FOO" T)`
+— symbols are unified.  The bug was eval2 CODEGEN: compile-quote's symbol case
+(and compile-keyword) hand-emit `:li name-hash; :li pkg-hash; :call
+%INTERN-SYMBOL-PKG 2` with NO `:set-nargs`.  Native fixed-arg fns ignore nargs
+(ANSI fine), but the interp's runtime-call bridge pulls `(mvm-nargs)` args from the
+register file — stale nargs → wrong args → empty symbol.  Fixed by emitting
+`:set-nargs` (gated on `*mvm-emit-halves*`, native byte-identical).  Oracle 64→66.
 
-**WS2 symbol blocker — now precisely characterized.** eval2 `(quote foo)` returns
-a NATIVE MVM symbol (`#x50`, interned by name-hash via `%INTERN-SYMBOL-PKG`) with
-an EMPTY name and NOT `eq` to the reader's `FOO` — because the reader registers
-the name in the CL-symbol-wrapper table, not `*sym-name-table*`, and the wrapper
-vs native-`#x50` are two different representations.  Unifying them is WS2.
+Remaining oracle diverges (2 of 71), neither an eval2 bug: `max`/`min` (a
+COMPILER-WIDE 2-arg-macro limitation — `(max 1 2 3)`→2 in BOTH native-compiled and
+eval2; only the tree-walker's variadic defun gives 3); `mod`/float-`/` (runtime-fn
+bridging gaps).  Plus 2 tw-err = tree-walker `aref` gaps, not eval2.
 
 Then WS2/WS3/WS4.
 

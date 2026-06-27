@@ -118,7 +118,16 @@
    allocators; arrays/strings take the runtime size."
   (cond ((= subtag #x31) (make-string size :initial-element #\Space)) ; string
         ((= subtag #x32) (make-array size :initial-element nil))      ; simple-vector
-        ((= subtag #x60) (%make-float2))   ; 2-slot boxed float
+        ((= subtag #x60) (%make-float2))   ; 2-slot boxed double-float
+        ;; N1 typed floats: the float-literal compiler emits #x64 for a SINGLE
+        ;; (which is what `1.5' is under *read-default-float-format*=single),
+        ;; #x65 short, #x66 long.  Without these the #x64 alloc fell through to
+        ;; the (t ...) make-array fallback → a #x32 simple-vector holding the
+        ;; raw hi/lo words: floatp NIL, generic-add hit %fixnum-+ on two
+        ;; pointers (garbage), every float diverged from native (WS4 oracle).
+        ((= subtag #x64) (%make-single2))  ; 2-slot boxed single-float
+        ((= subtag #x65) (%make-short2))   ; 2-slot boxed short-float
+        ((= subtag #x66) (%make-long2))    ; 2-slot boxed long-float
         ((= subtag #x33) (%make-ratio))    ; 2-slot ratio (num . den)
         ((= subtag #x30) (%make-bignum))   ; 2-slot bignum header (limbs in a slot)
         (t (make-array size :initial-element nil))))

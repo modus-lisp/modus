@@ -785,7 +785,16 @@
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
                  (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
                    (when (integerp addr) (setf addr (untag-fixnum addr)))
-                   (when (integerp val) (setf val (untag-fixnum val)))
+                   ;; mem-ref :u64 (width 3) is RAW — no tag shift (CLHS-aligned
+                   ;; with the native mem-ref).  Storing the untagged value here
+                   ;; while op-load %word->val's on read gave a one-SAR asymmetry
+                   ;; that corrupted the multiple-value slots (#x10000090/98): the
+                   ;; MV-count 2 read back as 1, so values/multiple-value-list/
+                   ;; nth-value/MOD saw only the primary (WS4 oracle).  Keep the
+                   ;; untag for :u8/:u32 (width<3), which want the raw low bytes;
+                   ;; store the WORD (reg-get) for :u64 so op-load's %word->val
+                   ;; round-trips it (works for fixnum AND pointer MV values).
+                   (when (and (< width 3) (integerp val)) (setf val (untag-fixnum val)))
                    (mem-write state addr val width))
                  (setf pc npc3)))))
 

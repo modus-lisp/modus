@@ -791,6 +791,51 @@
 
           (#.+op-fence+ nil) ; memory barrier: no-op
 
+          ;; --- IEEE float arithmetic ---
+          ;; Operands are REAL native float objects stored directly in the
+          ;; register file (op-alloc-obj stores via reg-set∘%val->word, a
+          ;; round-trip identity), so read them with raw svref and delegate to
+          ;; the native %float-* primops (SSE2 in this compiled interp); store
+          ;; the result float the same way op-alloc-obj does.  Without these,
+          ;; (/ 1.0 4.0) — which compiles to %float-div (the FDIV opcode), not a
+          ;; GENERIC-DIV bridge call like + / * — errored in eval2 (WS4 oracle).
+          (#.+op-fadd+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (reg-set regs vd (%val->word (%float-add (svref regs va) (svref regs vb))))
+                 (setf pc npc3)))))
+          (#.+op-fsub+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (reg-set regs vd (%val->word (%float-sub (svref regs va) (svref regs vb))))
+                 (setf pc npc3)))))
+          (#.+op-fmul+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (reg-set regs vd (%val->word (%float-mul (svref regs va) (svref regs vb))))
+                 (setf pc npc3)))))
+          (#.+op-fdiv+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (reg-set regs vd (%val->word (%float-div (svref regs va) (svref regs vb))))
+                 (setf pc npc3)))))
+          (#.+op-itof+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (reg-set regs vd (%val->word (%float-from-int (svref regs vs))))
+               (setf pc npc2))))
+          (#.+op-ftoi+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               ;; %float-to-int returns an integer VALUE; %val->word so reg-set's
+               ;; %word->val round-trips it (like the fixnum-arith opcodes).
+               (reg-set regs vd (%val->word (%float-to-int (svref regs vs))))
+               (setf pc npc2))))
+
           ;; --- Function Calling ---
           (#.+op-call+
            (multiple-value-bind (target npc) (fetch-u32 bc pc)
@@ -806,6 +851,13 @@
                          ;; regs hold real VALUES — pass them directly (the old
                          ;; %word->val∘reg-get round-trip overflowed for a
                          ;; boundary-fixnum arg/result).
+                         ;; NOTE: only the PRIMARY value crosses the bridge.
+                         ;; eval2's multiple-value mechanism (values/nth-value via
+                         ;; the MV-slot convention) is not yet wired in the interp
+                         ;; — `(nth-value 1 (values 10 20))` is NIL even without a
+                         ;; bridge call — so MOD (compile-mod uses (nth-value 1
+                         ;; (truncate ..))) stays NIL in eval2.  Fixing it is eval2
+                         ;; MV infrastructure, not a bridge-populate (WS4 oracle).
                          (dotimes (i nargs)
                            (push (svref regs (- nargs 1 i)) args))
                          (setf (svref regs +vreg-vr+) (apply fn args)))

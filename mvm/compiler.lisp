@@ -1397,7 +1397,11 @@
           `(logxor ,(cadr form) -1)
           '(%signal-program-error))))
 
-  ;; MAX → IF + comparison
+  ;; MAX → IF + comparison.  2-arg case kept byte-identical (the common path —
+  ;; no native layout shift); 3+ args fold LEFT into nested 2-arg max so
+  ;; (max 1 2 3) = 3 instead of silently dropping args past the 2nd.  The
+  ;; accumulator sub-max is let-bound (evaluated once); the trailing arg keeps
+  ;; the pre-existing 2-arg double-eval (acceptable, unchanged behavior).
   (mvm-define-macro "MAX"
     (lambda (form)
       (cond
@@ -1405,20 +1409,26 @@
          ;; (max) — CLHS requires at least one arg, signal program-error.
          '(error "MAX requires at least one argument"))
         ((null (cddr form)) (cadr form))
-        (t (let ((tmp (gensym "MAX")))
-             `(let ((,tmp ,(cadr form)))
-                (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form))))))))
+        ((null (cdddr form))                               ; exactly 2 args
+         (let ((tmp (gensym "MAX")))
+           `(let ((,tmp ,(cadr form)))
+              (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form)))))
+        (t                                                 ; 3+ args
+         `(max (max ,(cadr form) ,(caddr form)) ,@(cdddr form))))))
 
-  ;; MIN → IF + comparison
+  ;; MIN → IF + comparison (same structure as MAX).
   (mvm-define-macro "MIN"
     (lambda (form)
       (cond
         ((null (cdr form))
          '(error "MIN requires at least one argument"))
         ((null (cddr form)) (cadr form))
-        (t (let ((tmp (gensym "MIN")))
-             `(let ((,tmp ,(cadr form)))
-                (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form))))))))
+        ((null (cdddr form))                               ; exactly 2 args
+         (let ((tmp (gensym "MIN")))
+           `(let ((,tmp ,(cadr form)))
+              (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form)))))
+        (t                                                 ; 3+ args
+         `(min (min ,(cadr form) ,(caddr form)) ,@(cdddr form))))))
 
   ;; ABS → IF + negate
   (mvm-define-macro "ABS"

@@ -141,6 +141,15 @@
                  (setq all-ir (cons (cons (car sub) (cdr sub)) all-ir)))))
             (t (when (and (car result) (cdr result))
                  (setq all-ir (cons (cons (car result) (cdr result)) all-ir)))))))
+      ;; Drain *pending-flet-ir*: captureless lambdas, flet/labels bodies, and
+      ;; nested defuns register their (info . ir) here instead of returning it
+      ;; from mvm-compile-toplevel.  Without emitting these, a `#'(lambda ...)`
+      ;; (funcall lambda) would resolve its li-func to an UN-OFFSET function and
+      ;; jump to bytecode 0 → infinite recursion.  Append so they get Pass-1
+      ;; offsets and Pass-2 bytecode like any other function.
+      (dolist (pend *pending-flet-ir*)
+        (when (and (consp pend) (car pend) (cdr pend))
+          (setq all-ir (cons pend all-ir))))
       (setq all-ir (reverse all-ir)))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     (setq buf (make-mvm-buffer :bytes (make-array 65536)))
@@ -157,16 +166,25 @@
     ;; (a native function in the image).  Register a synthetic stub at a high
     ;; offset so emit resolves the CALL there; the interpreter's runtime-table
     ;; maps that offset back to the name and funcalls the native fn (WS1 bridge).
+    ;; LI-FUNC (#'NAME / (function NAME)) to an out-of-module name is also a
+    ;; runtime reference: the FN-ADDR opcode reads function-info-bytecode-offset,
+    ;; so registering the name at a runtime stub offset lets the interp's
+    ;; op-FN-ADDR map that offset back to the name and load the REAL native
+    ;; function OBJECT.  The subsequent CALL-INDIRECT then bridge-calls it —
+    ;; this is the higher-order eval2 path (funcall/apply/mapcar #'NAME).
     (dolist (e all-ir)
       (dolist (insn (cdr e))
-        (when (and (eq (car insn) :call)
-                   (not (gethash (cadr insn) *functions*)))
-          (let* ((name (cadr insn))
-                 (info (make-function-info :name name :bytecode-offset rt-next
-                                           :bytecode-length 0)))
-            (setf (gethash name *functions*) info)
-            (setf (gethash rt-next rt-table) name)
-            (setq rt-next (+ rt-next 1))))))
+        ;; The fn NAME is operand 1 for :call ((:call name nargs)) but operand 2
+        ;; for :li-func ((:li-func dest name)) — pick the right slot per op.
+        (let ((name (cond ((eq (car insn) :call) (cadr insn))
+                          ((eq (car insn) :li-func) (caddr insn))
+                          (t nil))))
+          (when (and name (stringp name) (not (gethash name *functions*)))
+            (let ((info (make-function-info :name name :bytecode-offset rt-next
+                                            :bytecode-length 0)))
+              (setf (gethash name *functions*) info)
+              (setf (gethash rt-next rt-table) name)
+              (setq rt-next (+ rt-next 1)))))))
     ;; Pass 2: emit (CALLs resolve to in-module OR synthetic offsets via *functions*).
     (dolist (e all-ir)
       (let* ((ir (cdr e)) (lp (compute-label-positions ir)))

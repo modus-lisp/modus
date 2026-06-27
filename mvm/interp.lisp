@@ -764,9 +764,18 @@
           (#.+op-obj-subtag+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               ;; native subtag extraction via the obj-subtag primop
+               ;; native subtag extraction via the obj-subtag primop.  A native
+               ;; FUNCTION object (resolved by op-FN-ADDR for #'NAME) is a
+               ;; callable whose representation the raw obj-subtag primop does
+               ;; not read cleanly here, so report its subtag (#x51 function)
+               ;; directly.  This lets funcall's dispatch correctly skip the
+               ;; symbol(#x50)/closure(#x52)/array(#x32) branches and fall
+               ;; through to CALL-INDIRECT, which bridge-calls it (higher-order
+               ;; eval2: funcall/apply/mapcar #'NAME).
                (let ((obj (%word->val (reg-get regs vs))))
-                 (reg-set regs vd (tag-fixnum (obj-subtag obj))))
+                 (reg-set regs vd (tag-fixnum (if (functionp obj)
+                                                  #x51
+                                                  (obj-subtag obj)))))
                (setf pc npc2))))
 
           ;; --- Raw Memory ---
@@ -884,13 +893,57 @@
                    (push (cons npc (mvm-stack state)) (mvm-call-stack state))
                    (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
 
+          (#.+op-fn-addr+
+           ;; (fn-addr Vd target:imm32) — load a callable for #'NAME / (function
+           ;; NAME) / a captureless lambda.  The target is either:
+           ;;   - a RUNTIME stub offset (>= runtime-call-base): #'NAME of a
+           ;;     native function.  Resolve the name to the REAL native function
+           ;;     OBJECT and store it directly in the slot (the alloc-obj store
+           ;;     convention: reg-set∘%val->word = identity), so CALL-INDIRECT's
+           ;;     functionp branch bridge-calls it.  This is the higher-order
+           ;;     eval2 path (funcall/apply/mapcar #'NAME).
+           ;;   - an in-module bytecode OFFSET: a captureless lambda or a defun
+           ;;     compiled in THIS thunk.  Store the offset as a plain fixnum
+           ;;     value so CALL-INDIRECT's integer branch jumps to the bytecode.
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (target npc2) (fetch-u32 bc npc)
+               (if (and runtime-table (>= target +mvm-runtime-call-base+))
+                   (let* ((name (gethash target runtime-table))
+                          (fn (and name (%mvm-resolve-runtime-fn name))))
+                     (if (functionp fn)
+                         (reg-set regs vd (%val->word fn))
+                         (reg-set regs vd +mvm-nil+)))
+                   (setf (svref regs vd) target))
+               (setf pc npc2))))
+
           (#.+op-call-ind+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
-             (let ((target (reg-get regs vs)))
-               (push (cons npc (mvm-stack state)) (mvm-call-stack state))
-               (if (integerp target)
-                   (setf pc (untag-fixnum target))
-                   (error "MVM: CALL-IND with non-integer target ~S" target)))))
+             ;; Read the raw stored VALUE (svref), not reg-get: a FN-ADDR to an
+             ;; out-of-module name stores a real native function OBJECT directly
+             ;; in the slot (the alloc-obj store convention), and reg-get's
+             ;; %val->word would SHL-1 that object into garbage.  An in-module
+             ;; FN-ADDR stores the bytecode OFFSET as a tagged fixnum value.
+             (let ((target (svref regs vs)))
+               (cond
+                 ;; Higher-order eval2 bridge: a resolved native function object
+                 ;; (#'+ , #'1+ , #'< , a %*-FN wrapper, etc.).  funcall/apply/
+                 ;; mapcar all route through here.  Pull nargs args (V0..) from
+                 ;; the register file exactly as op-CALL's runtime bridge does and
+                 ;; store the primary result in VR; do NOT push a return frame
+                 ;; (the call completes natively, control returns inline).
+                 ((functionp target)
+                  (let ((nargs (mvm-nargs state))
+                        (args nil))
+                    (dotimes (i nargs)
+                      (push (svref regs (- nargs 1 i)) args))
+                    (setf (svref regs +vreg-vr+) (apply target args))
+                    (setf pc npc)))
+                 ;; In-module bytecode offset (a fixnum value): jump to it.
+                 ((integerp target)
+                  (push (cons npc (mvm-stack state)) (mvm-call-stack state))
+                  (setf pc target))
+                 (t
+                  (error "MVM: CALL-IND with non-callable target ~S" target))))))
 
           (#.+op-ret+
            (if (mvm-call-stack state)

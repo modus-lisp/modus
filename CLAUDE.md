@@ -491,10 +491,16 @@ apparently-clean slate.  The runtime-data tell: failures were the LEADING block
 PRINTED instead of muffling (handler never ran).  Fix: `%reset-signal-state` at
 each `run-test`/`run-test-mv` boundary (per-test isolation).  Gate: warn 8->18,
 conditions band +23, zero regressions, 9xxx probes bit-identical.  The proper
-escape-safe pop in `%with-handler-bind` remains blocked by the open 9525
-unwind-protect+%nlx-throw SIGSEGV, so REAL programs (not just the test harness)
-can still hit the leak after an escaping handler — that's the residual, a
-condition-system robustness bug, NOT a compiler cell-capture bug.
+escape-safe pop in `%with-handler-bind` is now LANDED (279f2cc, 2026-06-27):
+once 9525 was fixed (7a56022, NLX threads through unwind-protect cleanups) the
+pop could be wrapped in `unwind-protect` (lexical-save + setq-restore; do NOT
+dynamically rebind the special).  The stack now always drains, so
+`%heal-handler-bind-skip` rewinds the leaked skip at the next fresh signal and
+REAL programs are fixed too — not just the harness.  Gate +1, 0 condition-
+chapter regressions, CHUNK-CRASH 15->0.  `%reset-signal-state`/`%heal` remain
+as defense-in-depth.  STILL latent: `%push-restarts` (restart-bind) has the
+identical bare-setq leak; the one-line unwind-protect fix is correct but gated
+-4 pure layout churn with no corpus gain, so deferred until layout-neutral.
 
 ### Vector-literal symbol elements (FIXED)
 

@@ -1030,9 +1030,23 @@
    is repaired at the NEXT fresh-signal entry by %heal-handler-bind-skip
    (called from error/signal/warn/cerror), which detects the stale state
    and rewinds it.  See that function for the detection logic."
-  (setq *handler-bind-stack* (cons handlers *handler-bind-stack*))
-  (multiple-value-prog1 (funcall body-fn)
-    (setq *handler-bind-stack* (cdr *handler-bind-stack*))))
+  ;; ESCAPE-SAFE POP (2026-06-26): wrap the pop in UNWIND-PROTECT so the frame
+  ;; is removed on BOTH normal exit AND any non-local exit (return-from / throw
+  ;; / muffle out of a handler).  The bare setq-pop above leaked the frame on
+  ;; escape; the leaked frame kept *handler-bind-stack* non-null, which blocked
+  ;; %heal-handler-bind-skip (it only rewinds skip on a NULL stack) → the next
+  ;; signal's leading handlers stayed inhibited (the warn/handler-bind/restart-
+  ;; case cross-test poison).  The unwind-protect form was historically blocked
+  ;; by the 9525 unwind-protect+%nlx-throw SIGSEGV — fixed in 7a56022 (NLX now
+  ;; threads through cleanups).  Save the PRIOR stack in a LEXICAL local and
+  ;; restore to it; do NOT dynamically rebind the special (that still crosses
+  ;; the let-unwind/%nlx hazard the docstring warns about).  unwind-protect
+  ;; preserves the protected form's full MV state, so multiple-value-prog1 is
+  ;; no longer needed.
+  (let ((prev-stack *handler-bind-stack*))
+    (setq *handler-bind-stack* (cons handlers prev-stack))
+    (unwind-protect (funcall body-fn)
+      (setq *handler-bind-stack* prev-stack))))
 
 (defun %heal-handler-bind-skip ()
   "Reset *handler-bind-effective-skip* to 0 when NOT inside an active

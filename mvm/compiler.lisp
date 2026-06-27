@@ -2936,7 +2936,10 @@
    Now we route through %INTERN-KEYWORD just like compile-quote routes
    non-keyword symbols through %INTERN-SYMBOL.  Same eq guarantee
    (interned per name-hash) but real symbol-typed objects."
-  (emit-ir :li +vreg-v0+ (ash (normalize-name kw) +fixnum-shift+))
+  ;; emit-li-tagged: byte-identical native, :li-halves in eval2 (see the symbol
+  ;; case in compile-quote — raw :li corrupts a ~60-bit name-hash in-image).
+  (emit-li-tagged +vreg-v0+ (normalize-name kw))
+  (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge needs nargs (see compile-quote symbol case)
   (emit-ir :call "%INTERN-KEYWORD" 1)
   (unless (= dest +vreg-vr+)
     (emit-ir :mov dest +vreg-vr+)))
@@ -4246,8 +4249,21 @@
             ;; like SBCL gensyms produced by source rewriters).  The
             ;; runtime treats 0 as "leave slot 1 NIL".
             (pkg-hash (if pkg-name (compute-name-hash pkg-name) 0)))
-       (emit-ir :li +vreg-v0+ (ash (normalize-name value) +fixnum-shift+))
-       (emit-ir :li +vreg-v1+ (ash pkg-hash +fixnum-shift+))
+       ;; emit-li-tagged (NOT raw :li): byte-identical in the native/host path
+       ;; (*mvm-emit-halves* NIL), but in the in-image eval2 path it emits
+       ;; :li-halves so we never form (name-hash<<1) as one in-image integer.
+       ;; A ~60-bit FNV name-hash<<1 routed through the raw :li -> mvm-emit-u64
+       ;; split (logand/ash of the formed word) corrupted the hash, so eval2's
+       ;; quoted symbols interned a junk #:|| (empty name, not eq) — WS4 oracle.
+       (emit-li-tagged +vreg-v0+ (normalize-name value))
+       (emit-li-tagged +vreg-v1+ pkg-hash)
+       ;; eval2 ONLY: the interp's runtime-call bridge pulls (mvm-nargs) args
+       ;; from the register file, so this MANUAL call needs nargs set (the
+       ;; normal compile-call path emits :set-nargs; native fixed-arg fns just
+       ;; read V0/V1 and ignore nargs, so the native path is byte-identical
+       ;; without it).  Without this, eval2's quoted symbols interned with stale
+       ;; nargs -> wrong args -> empty #:|| symbol (WS4 oracle).
+       (when *mvm-emit-halves* (emit-ir :set-nargs 2))
        (emit-ir :call "%INTERN-SYMBOL-PKG" 2)
        (unless (= dest +vreg-vr+)
          (emit-ir :mov dest +vreg-vr+))))

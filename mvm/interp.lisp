@@ -775,7 +775,12 @@
              (multiple-value-bind (vaddr npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
                  (let ((addr (reg-get regs vaddr)))
-                   (when (integerp addr) (setf addr (untag-fixnum addr)))
+                   ;; compile-mem-ref already untags the address (:shr addr 1),
+                   ;; so the reg holds the raw address VALUE.  reg-get's %val->word
+                   ;; restores the full address word; do NOT untag again (that
+                   ;; extra halving collapsed adjacent 8-byte slots to 2-byte
+                   ;; physical spacing, corrupting the MV-VALUES region — every
+                   ;; secondary's high 32 bits got the next slot's value).
                    (reg-set regs vd (mem-read state addr width)))
                  (setf pc npc3)))))
 
@@ -784,7 +789,9 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (multiple-value-bind (width npc3) (fetch-byte bc npc2)
                  (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
-                   (when (integerp addr) (setf addr (untag-fixnum addr)))
+                   ;; See op-load: the address is already untagged by compile-
+                   ;; mem-ref's :shr; reg-get restores its word — do NOT untag
+                   ;; again (the extra halving collapsed MV slot spacing 4x).
                    ;; mem-ref :u64 (width 3) is RAW — no tag shift (CLHS-aligned
                    ;; with the native mem-ref).  Storing the untagged value here
                    ;; while op-load %word->val's on read gave a one-SAR asymmetry

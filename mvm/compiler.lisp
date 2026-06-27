@@ -8460,13 +8460,46 @@
   "Compile (multiple-value-list form).
    Resets MV count to 1 before evaluating form (so plain single-value expressions
    produce a 1-element list), then evaluates form (which may override count with
-   its actual MV count), then calls %mv-to-list to collect all values into a list."
-  (let ((tmp (gensym "MV")))
+   its actual MV count), then collects all values into a list by reading the MV
+   count/slots INLINE (a count-driven loop), instead of calling the %mv-to-list
+   helper.
+
+   Why inline rather than (%mv-to-list ...): eval2 (compile->MVM-bytecode->
+   interpret) resolves %mv-to-list as a RUNTIME-BRIDGE native call (target
+   >= +mvm-runtime-call-base+), so the interp's op-CALL bridge runs the REAL
+   native %mv-to-list, which reads REAL memory at the MV slots — but eval2's
+   own (values ...) writes the interp's SIMULATED memory (op-store/op-load ->
+   mvm-memory hash).  The bridged helper therefore never saw the count/values
+   eval2 wrote and returned only the primary; multiple-value-list / nth-value /
+   mod all collapsed to the single value.  Inlining the SAME loop %mv-to-list
+   uses keeps the slot reads in bytecode, so they hit eval2's simulated memory
+   (consistent with how compile-values writes and compile-multiple-value-bind
+   reads).  Native compilation is unaffected: the inlined reads compile to the
+   identical real-memory mem-refs %mv-to-list did.  The expansion is one loop
+   (NOT a per-value unroll), so it stays compact at every call site."
+  (let ((pri (gensym "MVPRI"))
+        (cnt (gensym "MVC"))
+        (res (gensym "MVR"))
+        (i   (gensym "MVI")))
     (compile-form
      `(progn
-        ;; Reset count to 1 so single-valued expressions produce (list val)
+        ;; Reset count to 1 so single-valued expressions produce (list val).
         (setf (mem-ref ,+mv-count-addr+ :u64) 1)
-        (let ((,tmp ,form)) (%mv-to-list ,tmp)))
+        ;; Evaluate form FIRST (it sets the MV count + secondary slots), capturing
+        ;; the primary value before reading the count.
+        (let ((,pri ,form))
+          (let ((,cnt (mem-ref ,+mv-count-addr+ :u64)))
+            (if (zerop ,cnt)
+                nil
+                (if (= ,cnt 1)
+                    (cons ,pri nil)
+                    ;; Read secondaries [0 .. cnt-2] back-to-front so they prepend
+                    ;; in order, then cons the primary on front.
+                    (let ((,res nil) (,i (- ,cnt 2)))
+                      (loop
+                        (when (< ,i 0) (return (cons ,pri ,res)))
+                        (setq ,res (cons (mem-ref (+ ,+mv-values-addr+ (* ,i 8)) :u64) ,res))
+                        (setq ,i (- ,i 1)))))))))
      env dest)))
 
 (defun compile-unwind-protect (protected-form cleanup-forms env dest)

@@ -876,16 +876,36 @@
                          ;; regs hold real VALUES — pass them directly (the old
                          ;; %word->val∘reg-get round-trip overflowed for a
                          ;; boundary-fixnum arg/result).
-                         ;; NOTE: only the PRIMARY value crosses the bridge.
-                         ;; eval2's multiple-value mechanism (values/nth-value via
-                         ;; the MV-slot convention) is not yet wired in the interp
-                         ;; — `(nth-value 1 (values 10 20))` is NIL even without a
-                         ;; bridge call — so MOD (compile-mod uses (nth-value 1
-                         ;; (truncate ..))) stays NIL in eval2.  Fixing it is eval2
-                         ;; MV infrastructure, not a bridge-populate (WS4 oracle).
                          (dotimes (i nargs)
                            (push (svref regs (- nargs 1 i)) args))
-                         (setf (svref regs +vreg-vr+) (apply fn args)))
+                         ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
+                         ;; multi-valued fns (floor/truncate/round/rem returning a
+                         ;; quotient AND remainder) write their secondaries to the
+                         ;; REAL MV slots, which eval2 never reads — eval2 reads the
+                         ;; SIMULATED MV slots (the mvm-memory hash, where compile-
+                         ;; values / multiple-value-bind store via op-store and read
+                         ;; via op-load).  So capture ALL return values here and
+                         ;; mirror them into the simulated slots using the SAME word
+                         ;; encoding op-store uses for :u64 (the WORD = %val->word of
+                         ;; the value): mem-write count to +mv-count-addr+ and each
+                         ;; secondary's word to +mv-values-addr+ + i*8.  The primary
+                         ;; still goes in VR (single-value calls write count=1, so the
+                         ;; non-MV path is unchanged).  Constants are interp-local
+                         ;; (the compiler loads after interp, so its +mv-*-addr+
+                         ;; defconstants aren't in scope here) — use the raw addrs.
+                         (let* ((vals (multiple-value-list (apply fn args)))
+                                (nvals (length vals)))
+                           (setf (svref regs +vreg-vr+) (car vals))
+                           ;; count slot (#x10000090) holds the WORD of the fixnum
+                           ;; count — match a normal (setf (mem-ref ... :u64) n),
+                           ;; which stores (reg-get) = %val->word of the fixnum.
+                           (mem-write state #x10000090 (%val->word nvals) 3)
+                           ;; secondaries (value 1+) -> #x10000098 + i*8, as words.
+                           (let ((i 0))
+                             (dolist (v (cdr vals))
+                               (mem-write state (+ #x10000098 (* i 8))
+                                          (%val->word v) 3)
+                               (incf i)))))
                        (reg-set regs +vreg-vr+ +mvm-nil+))
                    (setf pc npc))
                  ;; In-module call: push return frame, jump to the bytecode.

@@ -1,17 +1,33 @@
 # Plan: One Value Representation Everywhere (and it is Common Lisp)
 
-Status: IN PROGRESS (2026-06-20). WS0 decided ((A) raw words). **WS1 essentially
-complete**: val↔word boundary (committed), runtime-call bridge, cons/list alignment,
-the **GC-safe register file** (validated by a list-build-under-early-GC stress test),
-and strings/vectors opcodes — all done. eval2 runs a real CL subset (arithmetic,
-if/let/progn, recursion, cons/list structure, strings/vectors, native runtime calls
-with fixnum+list args) **GC-safely**. Both boundary follow-ups worked through:
-(a) the variable-index bug was an *interpreter* gap (frame-alloc/free treated as
-frame-enter, wiping the frame) — fixed, and it unlocks any local-spilling
-function; (b) cross-bridge **strings** now work (real make-string objects; native
-length/char/string-upcase on eval2-built strings; conformant aref). Remaining:
-native-layout VECTORS + the numeric tower (bignum/float/ratio) — needs
-make-mvm-object as a distinguishable type and ripples into the numeric opcodes.
+Status: IN PROGRESS (2026-06-27). WS0 decided ((A) raw words). **WS1 essentially
+complete**: val↔word boundary, runtime-call bridge, cons/list alignment, the
+**GC-safe register file** (validated under early-GC stress), strings/vectors, and
+the numeric tower.
+
+**WS4 ORACLE STARTED (2026-06-27).** Built an eval2-vs-tree-walker differential
+oracle (`/home/claude/oracle.lisp`: a 71-form corpus, type-strict `eval ↔
+eval2` diff, runs under any generic binary via `load`).  First run found the
+"full numeric tower" claim did NOT hold when a value crosses back to native:
+50/71 agree.  Root cause + fix (commit c5378ff): the interp's `%alloc-native`
+only mapped float subtag `#x60` (double); the N1 typed-float subtags `#x64`
+single / `#x65` short / `#x66` long fell through to the `make-array` fallback,
+so a float literal became a `#x32` simple-vector of raw hi/lo words (floatp NIL;
+generic-add hit `%fixnum-+` on two pointers → garbage).  Added the three
+subtags → **50→64 agree**, entire float cluster (arith, comparisons, floatp,
+cons/list of floats, truncate) now matches native.  Lesson: in-image probes that
+compared raw bits MASKED this; the oracle's type-strict diff exposed it.
+Remaining oracle diverges (4 of 71): **symbols** (the WS2 blocker, below);
+`max`/`min` (a COMPILER-WIDE 2-arg-macro limitation — `(max 1 2 3)`→2 in BOTH
+native-compiled and eval2; only the tree-walker's variadic defun gives 3; fixing
+it touches the ANSI build); `mod`/float-`/` (runtime-fn bridging gaps).
+
+**WS2 symbol blocker — now precisely characterized.** eval2 `(quote foo)` returns
+a NATIVE MVM symbol (`#x50`, interned by name-hash via `%INTERN-SYMBOL-PKG`) with
+an EMPTY name and NOT `eq` to the reader's `FOO` — because the reader registers
+the name in the CL-symbol-wrapper table, not `*sym-name-table*`, and the wrapper
+vs native-`#x50` are two different representations.  Unifying them is WS2.
+
 Then WS2/WS3/WS4.
 
 ## Thesis

@@ -1880,8 +1880,14 @@
                 ;; first arg, which silently dropped the index in
                 ;; (setf (char s i) ch) → (set-char s ch) and similar).
                 ((consp place)
+                 ;; Intern the SET-<accessor> symbol into MODUS.MVM when that
+                 ;; package resolves (build-time SBCL), else *package*.  In-image
+                 ;; eval2 has NO MODUS.MVM package, so the old hardcoded
+                 ;; `(intern … :modus.mvm)` returned NIL → the expansion became
+                 ;; `(NIL place-args value)`, calling NIL: every defstruct
+                 ;; (setf (NAME-slot s) v) silently no-op'd / PROGRAM-ERROR'd.
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                       :modus.mvm)))
+                                       (or (find-package "MODUS.MVM") *package*))))
                    `(,setter ,@(cdr place) ,value)))))))))
 
   ;; DEFSETF — register a setf expander.
@@ -4929,6 +4935,19 @@
     ;; reference EQ within one compile, which is all cell indirection needs."
     (intern (concatenate 'string "%CELL-" base)
             (or (find-package "MODUS.MVM") *package*))))
+
+(defun %defstruct-intern (name)
+  "Intern NAME for a DEFSTRUCT-generated symbol (constructor / accessor /
+   setter / predicate names AND the synthetic P-<slot> constructor params).
+   Build-time SBCL resolves MODUS.MVM; in-image eval2 does NOT (the package
+   table isn't populated — `(find-package \"MODUS.MVM\")` is NIL), so the old
+   hardcoded `(intern name :modus.mvm)` interned into NIL → returned NIL.  A
+   NIL parameter symbol made the constructor a `(defun … (NIL NIL …))` whose
+   slot-fill `(aset obj i NIL-param)` always stored NIL — every struct came
+   back with NIL user slots (accessors NIL, predicate NIL, kwargs lost).  Fall
+   back to *package* (which IS MODUS.MVM during a normal compile), mirroring
+   cell-var-name."
+  (intern name (or (find-package "MODUS.MVM") *package*)))
 
 (defun cell-rewrite-form (form boxed-vars &optional (lambda-params nil))
   "Rewrite FORM to use cell indirection for BOXED-VARS.
@@ -13141,8 +13160,8 @@
              (ctor-params nil)
              (ctor-body nil))
          (setf ctor-params (loop for s in slot-names
-                                 collect (intern (format nil "P-~A" (symbol-name s))
-                                                 :modus.mvm)))
+                                 collect (%defstruct-intern
+                                          (format nil "P-~A" (symbol-name s)))))
          ;; Tagged struct layout: slot 0 = '%struct-instance marker,
          ;; slot 1 = type-name, slots 2.. = user slot values.  This lets
          ;; the predicate and TYPEP distinguish struct instances from
@@ -13157,7 +13176,7 @@
                           for p in ctor-params
                           collect `(aset obj ,(+ 2 i) ,p))
                   obj))
-         (push `(defun ,(intern internal-ctor-name :modus.mvm)
+         (push `(defun ,(%defstruct-intern internal-ctor-name)
                     ,ctor-params
                   ,ctor-body)
                forms-to-compile)
@@ -13176,7 +13195,7 @@
          ;; Register macro for keyword-arg constructor
          (let ((slot-kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
                (defaults slot-defaults)
-               (internal-ctor-sym (intern internal-ctor-name :modus.mvm)))
+               (internal-ctor-sym (%defstruct-intern internal-ctor-name)))
            (mvm-define-macro ctor-name
              (lambda (form)
                (let ((args (cdr form))
@@ -13199,20 +13218,20 @@
            (let* ((ctor-sym (car nc))
                   (ctor-fn-name (symbol-name ctor-sym))
                   (arg-spec (cdr nc))
-                  (internal-ctor-sym (intern internal-ctor-name :modus.mvm)))
+                  (internal-ctor-sym (%defstruct-intern internal-ctor-name)))
              (cond
                ;; (:CONSTRUCTOR foo NIL) — 0-arg ctor using slot defaults
                ((null arg-spec)
-                (push `(defun ,(intern ctor-fn-name :modus.mvm) ()
+                (push `(defun ,(%defstruct-intern ctor-fn-name) ()
                          (,internal-ctor-sym ,@slot-defaults))
                       forms-to-compile))
                ;; (:CONSTRUCTOR foo) — positional in struct slot order
                ((eq arg-spec :default)
                 (let ((params (loop for s in slot-names
-                                    collect (intern (format nil "P-~A"
-                                                            (symbol-name s))
-                                                    :modus.mvm))))
-                  (push `(defun ,(intern ctor-fn-name :modus.mvm) ,params
+                                    collect (%defstruct-intern
+                                             (format nil "P-~A"
+                                                     (symbol-name s))))))
+                  (push `(defun ,(%defstruct-intern ctor-fn-name) ,params
                            (,internal-ctor-sym ,@params))
                         forms-to-compile)))
                ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — BOA lambda-list.
@@ -13261,7 +13280,7 @@
                                 (let ((bv (find slot bound-vars
                                                 :test slot-name-eq2)))
                                   (if bv bv default)))))
-                    (push `(defun ,(intern ctor-fn-name :modus.mvm) ,arg-spec
+                    (push `(defun ,(%defstruct-intern ctor-fn-name) ,arg-spec
                              (,internal-ctor-sym ,@call-args))
                           forms-to-compile))))
                ;; Old normalize path retained but unreachable (kept for ref).
@@ -13304,9 +13323,9 @@
                            (case (car n)
                              (:marker (cadr n))
                              (:plain
-                              (intern (format nil "P-~A"
-                                              (symbol-name (cadr n)))
-                                      :modus.mvm))
+                              (%defstruct-intern
+                               (format nil "P-~A"
+                                       (symbol-name (cadr n)))))
                              (:opt
                               (let* ((sym (cadr n))
                                      (explicit (caddr n))
@@ -13315,9 +13334,9 @@
                                                                        :test slot-name-eq)))
                                                     (if pos (nth pos slot-defaults) nil))
                                                   explicit))
-                                     (pname (intern (format nil "P-~A"
-                                                            (symbol-name sym))
-                                                    :modus.mvm)))
+                                     (pname (%defstruct-intern
+                                             (format nil "P-~A"
+                                                     (symbol-name sym)))))
                                 (list pname default)))))
                          normalized))
                        (params-syms
@@ -13348,7 +13367,7 @@
                               (let ((pos (position slot arg-spec-slots
                                                    :test slot-name-eq)))
                                 (if pos (nth pos arg-spec-syms) default)))))
-                  (push `(defun ,(intern ctor-fn-name :modus.mvm) ,params
+                  (push `(defun ,(%defstruct-intern ctor-fn-name) ,params
                            (,internal-ctor-sym ,@call-args))
                         forms-to-compile))))))
          )  ; close the (let ((ctor-name ...) ...)) ctor block
@@ -13359,15 +13378,15 @@
              do (let ((acc-name (if conc-name
                                     (format nil "~A~A" conc-name (symbol-name slot))
                                     (format nil "~A" (symbol-name slot)))))
-                  (push `(defun ,(intern acc-name :modus.mvm) (obj)
+                  (push `(defun ,(%defstruct-intern acc-name) (obj)
                            (aref obj ,(+ 2 i)))
                         forms-to-compile)
                   (let ((setter-name (format nil "SET-~A" acc-name)))
-                    (push `(defun ,(intern setter-name :modus.mvm) (obj val)
+                    (push `(defun ,(%defstruct-intern setter-name) (obj val)
                              (aset obj ,(+ 2 i) val)
                              val)
                           forms-to-compile)
-                    (let ((setter-sym (intern setter-name :modus.mvm)))
+                    (let ((setter-sym (%defstruct-intern setter-name)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
                         (mvm-define-macro setf-key
                           (lambda (form)
@@ -13378,7 +13397,7 @@
 
        ;; Copier — copy all slots including the 2-slot marker prefix.
        (let ((copy-name (format nil "COPY-~A" struct-str)))
-         (push `(defun ,(intern copy-name :modus.mvm) (obj)
+         (push `(defun ,(%defstruct-intern copy-name) (obj)
                   (let ((new (make-array ,(+ 2 nslots))))
                     ,@(loop for i from 0 below (+ 2 nslots)
                             collect `(aset new ,i (aref obj ,i)))
@@ -13388,12 +13407,40 @@
        ;; Type predicate — checks the slot-0 marker and that the instance's
        ;; slot-1 type-name is NAME (or, via the runtime registry, a subtype
        ;; of NAME for :include).  Registry-independent for the common
-       ;; no-include case: %struct-instance-named-p compares slot-1 by hash
-       ;; without needing a registered descriptor, so it works even when the
-       ;; boot-time registration thunk didn't run.
+       ;; no-include case.
+       ;;
+       ;; The direct-type check is INLINED in bytecode (an object array whose
+       ;; slot-0 is the '%struct-instance marker and slot-1 is EQ to NAME)
+       ;; rather than delegating to the native %struct-instance-named-p.  Under
+       ;; eval2 the predicate body runs as bytecode while the native helper is
+       ;; reached through the runtime bridge — across that boundary the helper's
+       ;; own `'%struct-instance` marker / NAME literals are NOT eq to the ones
+       ;; the eval2 constructor stored (they were interned in different
+       ;; contexts), so the native helper returned NIL for a perfectly valid
+       ;; eval2 struct.  Inlining keeps the whole comparison in one bytecode
+       ;; module where symbol identity holds (probe: `(eq (aref s 1) 'NAME)` is
+       ;; T).  The AOT/native image runs the SAME inlined bytecode, so the
+       ;; comparison is symbol-eq there too — no behavior change.  The native
+       ;; %struct-instance-typep fallback is retained for the :include /
+       ;; registry subtype case (registry-dependent; only matters when the
+       ;; boot-time registration thunk DID run for an ancestor).
        (let ((pred-name (format nil "~A-P" struct-str)))
-         (push `(defun ,(intern pred-name :modus.mvm) (obj)
-                  (if (%struct-instance-named-p obj (quote ,struct-name)) t nil))
+         (push `(defun ,(%defstruct-intern pred-name) (obj)
+                  (if (if (fixnump obj) nil
+                        (if (consp obj) nil
+                          (if (null obj) nil
+                            (if (= (obj-subtag obj) #x32)
+                              (if (>= (array-length obj) 2)
+                                (if (eq (aref obj 0) (quote %struct-instance))
+                                    (if (eq (aref obj 1) (quote ,struct-name))
+                                        t
+                                        ;; not a direct match — try the registry
+                                        ;; (:include ancestor) via the native helper
+                                        (%struct-instance-typep obj (quote ,struct-name)))
+                                    nil)
+                                nil)
+                              nil))))
+                      t nil))
                forms-to-compile))
 
        ;; Compile all generated forms

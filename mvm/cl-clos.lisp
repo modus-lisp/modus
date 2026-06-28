@@ -821,6 +821,32 @@
             (when found (return found)))
           (setq cur (cdr cur)))))))
 
+(defun %clos-initform-alist (class-name)
+  "Return a list of (slot-name . thunk) for every slot of CLASS-NAME (and
+   its supers via the CPL) that has an initform.  Most-specific entry wins
+   per slot (direct class shadows ancestor).  Used by the eval2 MAKE-INSTANCE
+   expansion to apply initforms IN BYTECODE — funcalling each thunk at the
+   top eval2 level rather than from deep inside native %shared-init-apply-
+   initargs, which SIGSEGV'd when the thunk is a re-entrant interp trampoline
+   (the aset-destination/value GC-eval-order hazard on the native side)."
+  (let* ((cname (if (%clos-class-p class-name) (aref class-name 1) class-name))
+         (cls (if (%clos-class-p class-name)
+                  class-name
+                  (%find-clos-class class-name))))
+    (when (null cls) (return-from %clos-initform-alist nil))
+    (setq class-name cname)
+    (let ((slots (aref cls 2))
+          (acc nil))
+      (let ((cur slots))
+        (loop
+          (when (null cur) (return nil))
+          (let* ((sname (car cur))
+                 (thunk (%clos-initform-thunk class-name sname)))
+            (when thunk
+              (setq acc (cons (cons sname thunk) acc))))
+          (setq cur (cdr cur))))
+      (nreverse acc))))
+
 ;;; ============================================================
 ;;; Default-initargs registry (per CLHS 7.1.4)
 ;;; ============================================================

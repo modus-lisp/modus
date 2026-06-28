@@ -1881,11 +1881,13 @@
                 ;; (setf (char s i) ch) → (set-char s ch) and similar).
                 ((consp place)
                  ;; Intern the SET-<accessor> symbol into MODUS.MVM when that
-                 ;; package resolves (build-time SBCL), else *package*.  In-image
-                 ;; eval2 has NO MODUS.MVM package, so the old hardcoded
-                 ;; `(intern … :modus.mvm)` returned NIL → the expansion became
-                 ;; `(NIL place-args value)`, calling NIL: every defstruct
-                 ;; (setf (NAME-slot s) v) silently no-op'd / PROGRAM-ERROR'd.
+                 ;; package resolves (build-time SBCL), else *package* (which IS
+                 ;; MODUS.MVM during a normal compile).  In-image eval2 has NO
+                 ;; MODUS.MVM package, so the old hardcoded `(intern … :modus.mvm)`
+                 ;; returned NIL → the expansion became `(NIL place-args value)`,
+                 ;; a call to NIL: every defstruct/CLOS (setf (NAME-slot s) v)
+                 ;; silently no-op'd / PROGRAM-ERROR'd.  Same fallback pattern as
+                 ;; cell-var-name.
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
                                        (or (find-package "MODUS.MVM") *package*))))
                    `(,setter ,@(cdr place) ,value)))))))))
@@ -2615,6 +2617,214 @@
                      (setq ,cur-tmp (cdr ,cur-tmp))))))
             ;; Non-lambda: delegate to function version
             `(%maphash-impl ,fn-form ,ht-form))))))))
+
+  ;; ===========================================================
+  ;; CORE CLOS for eval2 (the compile-then-interpret path).
+  ;;
+  ;; eval2-forms compiles via mvm-compile-toplevel (NOT the build-ansi-test
+  ;; SBCL-side rewriter), so DEFCLASS/DEFGENERIC/DEFMETHOD/MAKE-INSTANCE were
+  ;; never recognised — they compiled as ordinary calls to UNDEFINED-FUNCTION,
+  ;; and the class/slot/accessor symbol args read as "implicit global"
+  ;; variables.  These macros expand each form to the SAME native runtime
+  ;; back-end calls (%defclass / %register-clos-* / %make-instance /
+  ;; %shared-init-default-spread / %defgeneric / %defmethod / %gf-dispatch)
+  ;; that the tree-walker's CLOS handlers (cl-eval.lisp) and the build-ansi
+  ;; rewriter both target — so eval2 shares one CLOS registry and dispatch.
+  ;;
+  ;; SCOPE: CORE single-dispatch — :initarg/:initform/:accessor/:reader/
+  ;; :writer slot options, make-instance, slot-value, subclass typep, and
+  ;; defgeneric/defmethod with class-name + T + (eql v) specializers.
+  ;; DEFERRED (left to the build-ansi rewriter / tree-walker, NOT expanded
+  ;; here): :allocation :class, :default-initargs, :method-combination,
+  ;; :argument-precedence-order, inline (:method ...) options, defclass
+  ;; structural-error signalling, initarg plist validation.
+
+  ;; MAKE-INSTANCE — (make-instance 'class &rest initargs)
+  ;; → alloc the instance, apply explicit initargs via the spread helper
+  ;; (slot-names NIL = initargs only, NO native initform funcall), then
+  ;; apply each remaining slot's :initform IN BYTECODE.
+  ;;
+  ;; WHY initforms run in bytecode and not via %shared-init-default-spread's
+  ;; T slot-names path: that native helper's step-2 does
+  ;; `(aset instance idx (funcall thunk))` with the destination computed
+  ;; before the value.  For an eval2 class the thunk is a re-entrant interp
+  ;; trampoline, so (funcall thunk) recurses into mvm-interpret (may GC) —
+  ;; the native aset then wrote to a stale instance pointer → SIGSEGV.
+  ;; Funcalling each thunk at the TOP eval2 level (like a working
+  ;; mapcar-over-an-eval2-lambda) and applying via set-slot-value avoids the
+  ;; deep-native re-entrancy.  CLHS: initforms apply only to slots not set by
+  ;; an initarg, so the %slot-boundp guard skips initarg-supplied slots.
+  (mvm-define-macro "MAKE-INSTANCE"
+    (lambda (form)
+      (if (null (cdr form))
+          ;; (make-instance) with no class designator is a PROGRAM-ERROR
+          ;; (a required arg is missing — make-instance.error.1/.5).  The old
+          ;; macro fell through to (%make-instance nil) → NIL, silently
+          ;; succeeding; base's function path raised on (null args).
+          '(%signal-program-error)
+      (let ((class-arg (cadr form))
+            (initargs  (cddr form))
+            (tmp   (gensym "MI-INST"))
+            (cls   (gensym "MI-CLS"))
+            (iargs (gensym "MI-IARGS"))
+            (cname (gensym "MI-CNAME"))
+            (pair  (gensym "MI-PAIR")))
+        ;; CLHS 7.1.2: validate the initarg plist BEFORE allocating — an
+        ;; odd-length plist is a PROGRAM-ERROR (make-instance.error.2) and an
+        ;; unrecognised initarg is an ERROR (make-instance.error.3).  The old
+        ;; macro skipped straight to %make-instance, so the auto-extracted
+        ;; runtime macro made (eval '(make-instance c :a)) silently succeed —
+        ;; regressing probes 8684/8685/8687.  Validating first also avoids the
+        ;; stale-instance hazard the rest of this macro guards against, since
+        ;; there is no live instance pointer yet if validation GCs.
+        `(let* ((,cls   ,class-arg)
+                (,iargs (list ,@initargs))
+                (,cname (if (%clos-class-p ,cls) (aref ,cls 1) ,cls)))
+           ;; An odd-length initarg plist is ALWAYS a program-error (CLHS
+           ;; 7.1.2 / make-instance.error.2), independent of whether the
+           ;; class is registered at runtime — so this check must run even
+           ;; when %find-clos-class can't resolve a build-time-registered
+           ;; class.  The class-gated call below adds the unknown-initarg
+           ;; check (make-instance.error.3/.4), which DOES need slot info.
+           (when (oddp (length ,iargs)) (%signal-program-error))
+           (when (%find-clos-class ,cname)
+             (%clos-validate-initargs ,cname ,iargs))
+           (let ((,tmp (%make-instance ,cls)))
+             (%shared-init-default-spread (list* ,tmp nil ,iargs))
+             (dolist (,pair (%clos-initform-alist ,cls))
+               (unless (%slot-boundp ,tmp (car ,pair))
+                 (set-slot-value ,tmp (car ,pair) (funcall (cdr ,pair)))))
+             ,tmp))))))
+
+  ;; DEFGENERIC — (defgeneric name lambda-list &rest options)
+  ;; → register the GF + a dispatch defun NAME that funnels through
+  ;; %gf-dispatch (mirrors the build-time expansion, which embeds NAME as a
+  ;; literal so there's no capture).  Inline (:method ...) / combination
+  ;; options are DEFERRED.
+  (mvm-define-macro "DEFGENERIC"
+    (lambda (form)
+      (let* ((gf-name (cadr form))
+             (lambda-list (caddr form))
+             (args-var (gensym "GF-ARGS")))
+        `(progn
+           (%defgeneric ',gf-name ',lambda-list nil)
+           (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
+           ',gf-name))))
+
+  ;; DEFMETHOD — (defmethod name [qualifier] specialized-lambda-list body...)
+  ;; → (%defmethod 'name qualifier '(specializers) (lambda (params) body))
+  ;; Parses a leading symbol qualifier, then the specialized lambda list:
+  ;; (var class) → class-name specializer; (var (eql v)) → (eql v) with v
+  ;; evaluated at registration; plain var → T.  Tail params (&optional/&rest/
+  ;; &key/&aux and beyond) are kept verbatim with no specializer.  Also emits
+  ;; a defun NAME dispatch stub when no defgeneric preceded it (DEFMETHOD
+  ;; implicitly creates the GF, CLHS 7.6.4).
+  (mvm-define-macro "DEFMETHOD"
+    (lambda (form)
+      (let* ((gf-name (cadr form))
+             (rest (cddr form))
+             ;; leading symbol (not a list) is a method qualifier
+             (has-qual (and rest (symbolp (car rest)) (car rest)))
+             (qualifier (if has-qual (car rest) nil))
+             (rest2 (if has-qual (cdr rest) rest))
+             (sll (car rest2))
+             (body (cdr rest2))
+             (specs nil)
+             (params nil)
+             (in-tail nil)
+             (args-var (gensym "M-ARGS")))
+        (dolist (p sll)
+          (cond
+            ((and (symbolp p)
+                  (member (symbol-name p)
+                          '("&OPTIONAL" "&REST" "&KEY" "&AUX" "&ALLOW-OTHER-KEYS")
+                          :test #'string=))
+             (setq in-tail t)
+             (setq params (cons p params)))
+            (in-tail
+             (setq params (cons p params)))
+            ((consp p)
+             (let ((var (car p)) (spec (cadr p)))
+               (setq params (cons var params))
+               (if (and (consp spec) (symbolp (car spec))
+                        (string= (symbol-name (car spec)) "EQL"))
+                   ;; (eql v) — evaluate v at registration via a quoted-list
+                   ;; cons so the runtime specializer is (eql <value>).
+                   (setq specs (cons `(list 'eql ,(cadr spec)) specs))
+                   (setq specs (cons `',spec specs))))
+             )
+            (t
+             (setq params (cons p params))
+             (setq specs (cons ''t specs)))))
+        (setq params (nreverse params))
+        (setq specs (nreverse specs))
+        `(progn
+           ;; Ensure a dispatch defun exists (implicit GF creation).  Last
+           ;; defun-wins, so a real defgeneric earlier still governs; this
+           ;; only matters when defmethod appears with no defgeneric.
+           (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
+           (%defmethod ',gf-name ',qualifier (list ,@specs)
+                       (lambda ,params ,@body))))))
+
+  ;; DEFCLASS — (defclass name (supers...) (slot-specs...) &rest options)
+  ;; → %defclass + %register-clos-slot-info (initargs + initform thunks)
+  ;;   + reader/accessor/writer defuns.  Class options DEFERRED.
+  (mvm-define-macro "DEFCLASS"
+    (lambda (form)
+      (let* ((class-name (cadr form))
+             (supers (caddr form))
+             (slot-specs (cadddr form))
+             (slot-names nil)
+             (initarg-pairs nil)    ; (cons :kw 'slot) forms
+             (initform-pairs nil)   ; (cons 'slot (lambda () form)) forms
+             (extra-defuns nil))
+        (dolist (spec slot-specs)
+          (let* ((sname (if (consp spec) (car spec) spec))
+                 (opts (if (consp spec) (cdr spec) nil)))
+            (setq slot-names (cons sname slot-names))
+            (let ((cur opts))
+              (loop
+                (when (null cur) (return nil))
+                (let ((key (car cur)) (val (cadr cur)))
+                  (cond
+                    ((and (symbolp key) (string= (symbol-name key) "READER"))
+                     (setq extra-defuns
+                           (cons `(defun ,val (obj) (slot-value obj ',sname))
+                                 extra-defuns)))
+                    ((and (symbolp key) (string= (symbol-name key) "WRITER"))
+                     (setq extra-defuns
+                           (cons `(defun ,val (nv obj) (set-slot-value obj ',sname nv))
+                                 extra-defuns)))
+                    ((and (symbolp key) (string= (symbol-name key) "ACCESSOR"))
+                     ;; reader NAME + setter SET-NAME (what compiler.lisp's
+                     ;; SETF fallback emits for (setf (NAME obj) v)).
+                     (setq extra-defuns
+                           (cons `(defun ,val (obj) (slot-value obj ',sname))
+                                 extra-defuns))
+                     (let ((set-name (intern (concatenate 'string "SET-"
+                                                          (symbol-name val))
+                                             (or (find-package "MODUS.MVM") *package*))))
+                       (setq extra-defuns
+                             (cons `(defun ,set-name (obj nv)
+                                      (set-slot-value obj ',sname nv))
+                                   extra-defuns))))
+                    ((and (symbolp key) (string= (symbol-name key) "INITARG"))
+                     (setq initarg-pairs
+                           (cons `(cons ',val ',sname) initarg-pairs)))
+                    ((and (symbolp key) (string= (symbol-name key) "INITFORM"))
+                     (setq initform-pairs
+                           (cons `(cons ',sname (lambda () ,val))
+                                 initform-pairs)))))
+                (setq cur (cddr cur))))))
+        (setq slot-names (nreverse slot-names))
+        `(progn
+           (%defclass ',class-name ',slot-names ',supers)
+           (%register-clos-slot-info ',class-name
+                                     (list ,@(nreverse initarg-pairs))
+                                     (list ,@(nreverse initform-pairs)))
+           (%register-clos-direct-slots ',class-name ',slot-names)
+           ,@(nreverse extra-defuns)
+           (find-class ',class-name nil)))))
   )
 
 ;;; ============================================================

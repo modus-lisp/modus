@@ -3011,6 +3011,14 @@
       ((gethash (normalize-name name) *globals*)
        (let ((hash (normalize-name name)))
          (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         ;; eval2 bridge reads (mvm-nargs) args; a manual :call needs an
+         ;; explicit :set-nargs or the bridge pulls a STALE count and the
+         ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
+         ;; under eval2 (this is what blocked handler-case's *current-condition*
+         ;; type-dispatch, WS3).  Native fixed-arg SYMBOL-VALUE ignores nargs,
+         ;; so this is byte-identical for the ANSI build — gated on
+         ;; *mvm-emit-halves* (T only in build-generic.lisp / eval2; OFF for ANSI).
+         (when *mvm-emit-halves* (emit-ir :set-nargs 1))
          (emit-ir :call "SYMBOL-VALUE" 1)
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+))))
@@ -3020,6 +3028,7 @@
        (setf (gethash (normalize-name name) *globals*) t)
        (let ((hash (normalize-name name)))
          (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge nargs
          (emit-ir :call "SYMBOL-VALUE" 1)
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+)))))))
@@ -5427,6 +5436,13 @@
          (emit-ir :push dest)
          (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
          (emit-ir :pop +vreg-v1+)
+         ;; eval2 bridge needs an explicit :set-nargs (see the SYMBOL-VALUE
+         ;; read site) — otherwise a bare global setq under eval2 passes a
+         ;; stale arg count to native SET-SYMBOL-VALUE and writes nothing /
+         ;; wrong (e.g. native error's (setq *current-condition* c) never
+         ;; landing where eval2's handler-case reads it).  Native ignores
+         ;; nargs → byte-identical for ANSI (gated on *mvm-emit-halves*).
+         (when *mvm-emit-halves* (emit-ir :set-nargs 2))
          (emit-ir :call "SET-SYMBOL-VALUE" 2)
          ;; Result is in VR, move back to dest if needed
          (unless (= dest +vreg-vr+)
@@ -5439,6 +5455,7 @@
          (emit-ir :push dest)
          (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
          (emit-ir :pop +vreg-v1+)
+         (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; eval2 bridge nargs
          (emit-ir :call "SET-SYMBOL-VALUE" 2)
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+)))))))

@@ -82,7 +82,30 @@
   ;; and set-mv-count have somewhere to live.
   (nargs    0)
   (cenv     nil)
-  (mv-count 1))
+  (mv-count 1)
+  ;; handler-case / catch / throw setjmp-longjmp stack.  Each entry is a
+  ;; "jmp-buf": the bytecode resume-PC for the matching SETJMP (TRAP #x0510)
+  ;; plus the snapshot of dynamic interp state to restore on LONGJMP (TRAP
+  ;; #x0511 / a host condition signalled by a bridged `error`/`throw` call).
+  ;; LONGJMP pops the top entry, restores the snapshot, sets pc to resume-PC
+  ;; and VR to a non-NIL marker so the handler-case's `:bnnull` takes the
+  ;; handler path (mirroring the native setjmp's non-zero return).
+  (handlers nil :type list))
+
+;; A jmp-buf saved by SETJMP (TRAP #x0510): everything the interpreter needs to
+;; resume the handler-case body's setjmp point after a LONGJMP.  pc is the
+;; bytecode offset of the instruction AFTER the setjmp trap (where the native
+;; code does `mov dest,VR; bnnull dest,handler`); the rest is dynamic interp
+;; state captured so the unwind restores the operand stack / call frames / the
+;; calling-convention scratch registers to exactly the setjmp-time values.
+(defstruct (mvm-jmpbuf (:conc-name mvm-jb-))
+  (pc         0   :type fixnum)
+  (stack      nil :type list)
+  (call-stack nil :type list)
+  (vfp        0)
+  (nargs      0)
+  (cenv       nil)
+  (mv-count   1))
 
 (declaim (inline vref vset))
 (defun vref (state reg) (svref (mvm-regs state) reg))
@@ -235,6 +258,24 @@
 ;;; The Main Interpreter
 ;;; ============================================================
 
+(defun %mvm-longjmp-restore (state)
+  "Perform an MVM LONGJMP: pop the nearest jmp-buf saved by SETJMP (TRAP #x0510),
+   restore the dynamic interp state it captured, set VR to a non-NIL marker so
+   the handler-case's BNNULL takes the handler path, and RETURN the bytecode
+   resume-PC the loop should jump to.  Returns NIL when no handler frame is
+   active (an unbalanced longjmp — the caller re-signals)."
+  (let ((jb (pop (mvm-handlers state))))
+    (when jb
+      (setf (mvm-stack state) (mvm-jb-stack jb))
+      (setf (mvm-call-stack state) (mvm-jb-call-stack jb))
+      (setf (mvm-nargs state) (mvm-jb-nargs jb))
+      (setf (mvm-cenv state) (mvm-jb-cenv jb))
+      (setf (mvm-mv-count state) (mvm-jb-mv-count jb))
+      (let ((regs (mvm-regs state)))
+        (setf (svref regs +vreg-vfp+) (mvm-jb-vfp jb))
+        (reg-set regs +vreg-vr+ +mvm-t+))
+      (mvm-jb-pc jb))))
+
 (defun mvm-interpret (bytecode &key (entry-point 0) function-table runtime-table
                                     (return-raw t))
   "Execute MVM bytecode starting at ENTRY-POINT.
@@ -269,8 +310,16 @@
       (when *mvm-trace*
         (format t "  TRACE pc=~D op=~D flags=~S vr=~S~%"
                 pc (aref bc pc) (mvm-flags state) (reg-get regs +vreg-vr+)))
-      (let ((opcode (aref bc pc)))
+      (let ((opcode (aref bc pc))
+            ;; %lj — set non-NIL by the condition handler below when a host
+            ;; condition signalled DURING this opcode (a bridged `error`/`throw`
+            ;; native call) must be converted into an MVM LONGJMP to the nearest
+            ;; active handler-case frame.  Performed AFTER the handler-case
+            ;; unwinds the host stack back here, so the loop's pc/regs locals
+            ;; (in the enclosing let*) survive and can be redirected.
+            (%lj nil))
         (setf pc (1+ pc))
+        (handler-case
         (case opcode
 
           ;; --- NOP / BREAK / TRAP ---
@@ -291,6 +340,44 @@
                ((= code #x0310)
                 ;; RDTSC: fake value in interpreter
                 (reg-set regs +vreg-vr+ 0)
+                (setf pc npc))
+               ;; --- handler-case / catch / throw setjmp-longjmp ---
+               ;; SETJMP (#x0510): push a jmp-buf recording the resume-PC (npc,
+               ;; the instruction right after this trap, where the compiled
+               ;; handler-case does `mov dest,VR; bnnull dest,handler`) plus a
+               ;; snapshot of the dynamic interp state.  VR := 0 (NIL marker)
+               ;; so the BNNULL falls through to the body (the native "setjmp
+               ;; returned 0 = normal entry" path).
+               ((= code #x0510)
+                (push (make-mvm-jmpbuf
+                       :pc npc
+                       :stack (mvm-stack state)
+                       :call-stack (mvm-call-stack state)
+                       :vfp (svref regs +vreg-vfp+)
+                       :nargs (mvm-nargs state)
+                       :cenv (mvm-cenv state)
+                       :mv-count (mvm-mv-count state))
+                      (mvm-handlers state))
+                (reg-set regs +vreg-vr+ +mvm-nil+)
+                (setf pc npc))
+               ;; LONGJMP (#x0511): pop the nearest jmp-buf, restore its dynamic
+               ;; state, jump pc back to the setjmp's resume-PC, and set VR to a
+               ;; non-NIL marker so the BNNULL there takes the HANDLER path
+               ;; (mirroring the native "setjmp returned non-zero").  With no
+               ;; handler active this is an unbalanced longjmp — signal so the
+               ;; outer eval2-forms handler reports it (matches native: a longjmp
+               ;; with a zeroed jmp-buf slot is undefined / a crash).
+               ((= code #x0511)
+                (let ((rpc (%mvm-longjmp-restore state)))
+                  (if rpc
+                      (progn (setf regs (mvm-regs state)) (setf pc rpc))
+                      (error "MVM LONGJMP (TRAP #x0511) with no active handler-case"))))
+               ;; CLEAR-HANDLER (#x0512): the body completed normally — pop the
+               ;; jmp-buf so a later error doesn't unwind to this (now exited)
+               ;; frame.  Pure pop; PC just advances.
+               ((= code #x0512)
+                (when (mvm-handlers state)
+                  (pop (mvm-handlers state)))
                 (setf pc npc))
                ((>= code #x100)
                 ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
@@ -1138,7 +1225,22 @@
                (setf pc npc2))))
 
           (otherwise
-           (error "MVM: unknown opcode #x~2,'0X at PC ~D" opcode (1- pc)))))
+           (error "MVM: unknown opcode #x~2,'0X at PC ~D" opcode (1- pc))))
+          ;; A bridged native `error`/`throw` (op-call into the runtime `error`
+          ;; / `%signal-condition` fn) signals a real host CL condition here.
+          ;; If a handler-case frame is active, capture the condition and
+          ;; convert it to a LONGJMP (done below, after the unwind); otherwise
+          ;; re-signal so eval2-forms' outer handler reports :interp-err (an
+          ;; uncaught error / unmatched throw, matching native semantics).
+          (error (c)
+            (if (mvm-handlers state)
+                (setf %lj c)
+                (error c))))
+        (when %lj
+          (let ((rpc (%mvm-longjmp-restore state)))
+            (when rpc
+              (setf regs (mvm-regs state))
+              (setf pc rpc)))))
 
       (reg-set regs +vreg-vpc+ pc))))
 

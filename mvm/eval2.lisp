@@ -17,6 +17,20 @@
   ;; binding the compiler's compile-integer reads).  Native builds never call
   ;; eval2-forms, so the global stays NIL there.
   (setq *mvm-emit-halves* t)
+  ;; LAZY opcode-table init.  encode-instruction (mvm.lisp) reads *opcode-table*
+  ;; for each instruction's operand spec during Pass-2 emit; with a NIL table
+  ;; (the ANSI image skips init-all-globals, so the defparameter init thunk
+  ;; never ran) every operand is silently DROPPED → corrupt bytecode → garbage
+  ;; result.  Create + populate here, on first eval2 use, NOT at boot: a
+  ;; permanent populated *opcode-table* GC root shifts GC timing enough to
+  ;; surface a latent crash elsewhere (GET-INTERNAL-RUN-TIME.2 / 0xDEAD0004),
+  ;; and eval2 is dead code until the WS3 flip, so lazy keeps the normal image's
+  ;; live set identical to baseline.  Skips when already populated (the generic
+  ;; image, or a 2nd eval2 call).  NB %populate-opcode-table's `setf gethash`
+  ;; no-ops on a NIL table, so the table MUST be created first.
+  (unless (and *opcode-table* (> (hash-table-count *opcode-table*) 0))
+    (setq *opcode-table* (make-hash-table :test (quote eql)))
+    (%populate-opcode-table))
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)

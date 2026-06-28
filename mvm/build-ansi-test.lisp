@@ -4931,6 +4931,24 @@
   (when (> (mem-ref #x10000200 :u32) 2)
     (setq *run-only-below* (%parse-decimal-at-fixed-248)))
 
+  ;; WS3 in-image eval2 self-check (sentinel: argv1 = 888888).  Compiles a form
+  ;; to MVM bytecode and interprets it INSIDE this image — proves the
+  ;; self-hosted compiler+interpreter work end-to-end (eval2-forms lazily inits
+  ;; *opcode-table* on first use).  Reachable only via `binary 888888 999999`;
+  ;; no normal test id is 888888, so normal runs are unaffected (eval2 dead code).
+  (when (eql *skip-below* 888888)
+    (write-string-serial \"E2SMOKE-START\") (write-char-serial 10)
+    (write-string-serial \"add=\")
+    (print-dec (eval2 (quote (+ 1 2)))) (write-char-serial 10)
+    (write-string-serial \"sqr=\")
+    (print-dec (eval2 (quote (let ((x 5)) (* x x))))) (write-char-serial 10)
+    ;; NOTE: multi-form (defun + cross-form call) currently HANGS in the ANSI
+    ;; image — the defun-registration path needs another uninitialized global
+    ;; beyond *opcode-table* (it completes under full init-all-globals).  That
+    ;; narrowing is task #122 follow-up; omitted here so the self-check can't hang.
+    (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
+    (sys-exit 0))
+
   ;; Initialize FRAGILITY DIAG eq-collision budget at slot 0x10000C60
   ;; (cl-clos.lisp's %specializer-matches-p reads/decrements this).
   (setf (mem-ref #x10000C60 :u64) 5)

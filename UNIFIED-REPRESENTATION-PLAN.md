@@ -1,7 +1,24 @@
 # Plan: One Value Representation Everywhere (and it is Common Lisp)
 
-Status: IN PROGRESS (2026-06-27). WS0 decided ((A) raw words). **WS1 essentially
-complete**: val↔word boundary, runtime-call bridge, cons/list alignment, the
+Status: IN PROGRESS (2026-06-28). WS0 decided ((A) raw words). **WS1 COMPLETE.**
+**WS-line REORDERED 2026-06-28: WS3 = retire the tree-walker (interp-as-eval,
+the near milestone — needs no JIT); WS4 = the JIT (perf destination).** See those
+sections.
+
+**WS1/oracle MILESTONE (2026-06-28): eval2 is a correct, broad CL-subset
+interpreter — 116-form oracle at 115/116 agree, DIVERGE 0, E2-UNSUP 0.** The lone
+non-agree is a TREE-WALKER aref gap (eval2 is more capable there).  Over a
+~2-day push, eval2 went from "floats return garbage" to handling: the full
+numeric tower, single/short/long floats, symbols/keywords (confirmed UNIFIED — not
+a separate rep), multiple values (values/m-v-list/m-v-bind/nth-value), floor/round/
+rem secondaries, higher-order calls (funcall/apply/mapcar #'NAME), closures with
+capture+mutation, catch/throw, handler-case, unwind-protect, AND native HOFs over
+eval2 lambdas (re-entrant interpreter trampoline).  Commits 3f51e4b..f5e7375.  Full
+detail + per-fix root causes in memory `reference_ws4_eval2_oracle`.  NEXT: WS3 —
+wire the eval2 interpreter in as `eval` behind the oracle and retire the tree-walker.
+
+--- (earlier WS1 status, retained for the record) ---
+WS1 essentials: val↔word boundary, runtime-call bridge, cons/list alignment, the
 **GC-safe register file** (validated under early-GC stress), strings/vectors, and
 the numeric tower.
 
@@ -258,35 +275,54 @@ shared-heap property end to end.
   worth unifying or is acceptable internal machinery.
 - Produce a checklist in `DIVERGENCE.md` (one entry per format, with status).
 
-### WS3 — Eval as JIT (the destination; mandatory per Philosophy)
-- **JIT** — in-image `compile-form` (have it, Stage 2) + in-image `translate-x64`
-  + executable mmap (W^X) + cache flush. Generated code calls runtime functions
-  by **real address**, shares the heap ⇒ perfect CL semantics and acceptable
-  performance from portable state.
-- The **aligned interpreter** from WS1 is the bootstrap/interim eval *and* a
-  permanent fallback (for slow paths, or arches before their JIT backend lands).
-  With the format aligned it is a first-class option, not a dead end.
-- Either way, no marshalling, because WS1/WS2 made the format uniform.
-- Do x64-linux first; the portable state means other arches reuse the same
-  bytecode/heap and only need their `translate-*` backend wired to the in-image
-  JIT path.
-
-### WS4 — Retire the tree-walker
-- Wire `eval`/`load` to the chosen mechanism (JIT or aligned interpreter).
+### WS3 — Retire the tree-walker (interpreter-as-eval, oracle-gated)  ← REORDERED, now the near milestone
+(Was WS4.  Promoted ahead of the JIT 2026-06-28: retiring the tree-walker needs
+NO JIT — the aligned eval2 INTERPRETER is correct enough to be the production
+`eval`, so this is the cheaper, critical-path milestone; the JIT (WS4) is a pure
+performance layer on top.)
+- Wire `eval`/`load` to the eval2 INTERPRET path (`eval2-forms` → `mvm-interpret`).
 - Run the existing tree-walker as a **differential oracle** over ANSI + the
-  ASDF gauntlet; fix every divergence until the new eval ≥ tree-walker.
+  ASDF gauntlet; fix every divergence until the new eval ≥ tree-walker.  (The
+  WS4 oracle already exists — `/home/claude/oracle.lisp`, 116 forms: eval2 at
+  115/116 agree, DIVERGE 0, E2-UNSUP 0.  Widen it to conditions / defstruct /
+  CLOS / errors / macros before the cutover.)
 - Delete `mvm/cl-eval.lisp` (the divergent second CL semantics) and its
-  scaffolding.
+  scaffolding once the new eval ≥ tree-walker everywhere.
+- Note: the eval2 interpreter is faster than the AST tree-walker (bytecode vs
+  walk) but slower than native — acceptable for the cutover; the JIT (WS4) is
+  the perf upgrade.
+
+### WS4 — Eval as JIT (the performance destination)  ← REORDERED (was WS3)
+- **The hard 80% (code generation) already exists**: `translate-mvm-to-x64
+  (bytecode function-table)` (translate-x64.lisp) compiles the whole OS for 9
+  arches; `eval2-forms` already produces the IR it consumes.  The JIT feeds that
+  IR to the translator instead of the interpreter.
+- New work (the 20% — runtime plumbing): (a) a runtime **PROT_EXEC code region**
+  (the heap is PROT_RW only) — mmap/mprotect on Linux, reserved region on bare
+  metal, + I-cache flush on ARM; (b) **runtime call-relocation** — patch
+  cross-function CALLs with the real already-loaded runtime addresses (resolvable
+  via `%mvm-resolve-runtime-fn` / `*symbol-function-table*`) — the one genuinely
+  new algorithm; (c) a small **entry trampoline** (the native-HOF trampoline
+  pattern, calling native instead of re-entering the interp); (d) wire an
+  `eval2-forms` variant that translate→write-to-exec→call.
+- GC is free: the translator emits the same gc-check+alloc (R12/R14) all runtime
+  code uses, and the conservative stack scan covers JIT'd frames.
+- Estimate: medium — comparable to the eval2-completion work, NOT a from-scratch
+  JIT.  Spike `(+ 1 2)`→native→call first; call-relocation is the main risk.
+- Do x64-linux first; other arches reuse the bytecode/heap and only need their
+  `translate-*` backend wired to the JIT path.  The aligned interpreter (WS3)
+  stays as the permanent fallback for slow paths / arches before their backend.
 
 ## Sequencing & dependencies
 ```
-WS0 (decide A/B) ─▶ WS1 (align interpreter) ─┬─▶ WS3 (eval: JIT or aligned interp)
-                                             └─▶ WS4 (oracle, delete tree-walker)
-WS2 (other formats) runs in parallel; symbols (WS2) gate full conformance but
-not the eval milestone.
+WS0 (decide A/B) ─▶ WS1 (align interpreter) ─▶ WS3 (interp-as-eval, oracle, delete tree-walker)
+                                             ─▶ WS4 (JIT — perf, layered on WS3's eval2 pipeline)
+WS2 (other formats) runs in parallel; symbols (WS2) were CONFIRMED already unified
+(not a separate rep — see reference_ws4_eval2_oracle), so they don't gate the eval line.
 ```
-WS1 is the keystone — it both removes the marshalling wall and unblocks a clean
-interpreter-as-eval; WS3's JIT is the long-term performance answer.
+WS1 is the keystone (removes the marshalling wall + unblocks interpreter-as-eval).
+WS3 (interp-as-eval) is the near milestone — retire the tree-walker; WS4's JIT is
+the long-term performance answer and is de-risked by the existing translator.
 
 ## Already done (reusable; not wasted)
 - **Stage 2 — compiler self-hosted into the image.** `compile-form` /

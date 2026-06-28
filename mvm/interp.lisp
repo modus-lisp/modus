@@ -255,6 +255,90 @@
                                  (mvm-type-error-got c)))))
 
 ;;; ============================================================
+;;; Native-HOF re-entrancy trampoline
+;;; ============================================================
+;;;
+;;; The hard eval2 gap: a NATIVE higher-order function (mapcar/reduce/…) that
+;;; funcalls an eval2 lambda VALUE.  funcall/apply/mapcar of #'NAME already
+;;; work (the value is a real native fn the bridge funcalls), and an IN-module
+;;; (funcall (lambda …) x) works (op-call-ind jumps within the same interpret
+;;; loop).  But when an in-module bytecode lambda ESCAPES to native code — its
+;;; value is handed to native mapcar via the op-CALL bridge's raw svref — native
+;;; mapcar's `(funcall it elt)` gets an in-module bytecode OFFSET (a fixnum) or a
+;;; #x52 closure whose slot-0 is such an offset.  Native funcall can't run
+;;; bytecode → the call fails.
+;;;
+;;; Fix: when an eval2 lambda value crosses to native code (only at the op-CALL /
+;;; op-CALL-IND runtime bridges), wrap it in a TRAMPOLINE — a real native Modus
+;;; closure that, when funcalled with args, RE-ENTERS mvm-interpret on the SAME
+;;; bytecode at the lambda's offset (with the args marshalled into a fresh
+;;; register file and the closure env restored).  The interpreter is itself
+;;; native code, so a nested mvm-interpret call is plain recursion; registers and
+;;; the operand/call stacks are per-call (fresh state), while the heap and the
+;;; real native objects the lambda manipulates are shared.
+;;;
+;;; Only the value ESCAPING to native is wrapped — the in-module op-CALL-IND
+;;; jump path and funcall's closure (#x52 set-cenv) path are untouched, so the
+;;; working (funcall (lambda …) x) and capturing-closure cases keep their fast
+;;; in-loop dispatch.
+
+(defun %mvm-make-trampoline (bc ftab rt offset env lam-offsets)
+  "Return a native Modus closure that re-enters mvm-interpret at OFFSET (a
+   bytecode entry) on BC with FTAB/RT, marshalling its call args into a fresh
+   register file and restoring the closure ENV (NIL for a captureless lambda).
+   Native HOFs (mapcar/reduce/…) funcall this exactly like any other function.
+   LAM-OFFSETS is threaded through so a lambda that itself escapes a lambda to a
+   native HOF (nested mapcar) keeps working on the re-entry."
+  (lambda (&rest args)
+    (mvm-interpret bc :entry-point offset
+                      :function-table ftab :runtime-table rt
+                      :return-raw nil
+                      :initial-args args :initial-cenv env
+                      :lambda-offsets lam-offsets)))
+
+(defun %mvm-lambda-offset-p (n lam-offsets)
+  "True if integer N is the bytecode entry offset of an eval2 LAMBDA / CLOSURE
+   function (as recorded in the LAM-OFFSETS hash, keyed by offset).  Built in
+   eval2-forms from the functions whose names carry the `$$LAMBDA` / `$$CLOSURE`
+   marker — i.e. ONLY genuine lambda bodies, never the %eval2-thunk, helper
+   defuns, or the function at offset 0.  This is what makes a BARE in-module
+   offset (a captureless lambda's fn-addr value) safely distinguishable from an
+   ordinary fixnum DATA argument at the native bridge: a data integer like 0 / 1
+   / 2 (loop counters, indices) is never a lambda entry, so it is left alone.
+   (The earlier ftab-membership test was unsafe: ftab[0] = 0, so the integer 0
+   collided with the first function's offset and got wrapped, breaking loops.)"
+  (and (integerp n) lam-offsets
+       (gethash n lam-offsets)))
+
+(defun %mvm-wrap-escaping (v bc ftab rt lam-offsets)
+  "If V is an eval2 lambda value about to cross to NATIVE code, wrap it in a
+   trampoline so native funcall can invoke it.  Two escaping shapes:
+     - a #x52 CLOSURE object whose slot-0 is a LAMBDA bytecode offset: wrap
+       (slot0 offset, slot1 env).  This is the CAPTURING escaped lambda —
+       `(mapcar (lambda (x) (+ x k)) …)` where k is captured.
+     - a BARE LAMBDA bytecode OFFSET (a fixnum in LAM-OFFSETS): a CAPTURELESS
+       escaped lambda — `(mapcar (lambda (x) (* x 10)) …)`.  op-FN-ADDR stored
+       its offset as a plain fixnum (so the in-module call-indirect path jumps
+       to it); wrap it with NIL env.
+     - everything else (data fixnums, conses, strings, real native fns, etc.)
+       passes through unchanged."
+  (cond
+    ;; #x52 closure with a lambda offset in slot 0 → capturing lambda.
+    ;; NB: native functionp is TRUE for a #x52 closure object, so this MUST be
+    ;; checked WITHOUT a functionp guard — gate on cons/integer only.  A genuine
+    ;; native function (#'NAME) is NOT a tagged object, so obj-subtag reads
+    ;; garbage on it; requiring slot-0 to be a recorded LAMBDA offset rejects
+    ;; such a false #x52 read.
+    ((and v (not (consp v)) (not (integerp v))
+          (= (obj-subtag v) #x52)
+          (%mvm-lambda-offset-p (%prim-aref v 0) lam-offsets))
+     (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))
+    ;; Bare lambda offset → captureless lambda.
+    ((%mvm-lambda-offset-p v lam-offsets)
+     (%mvm-make-trampoline bc ftab rt v nil lam-offsets))
+    (t v)))
+
+;;; ============================================================
 ;;; The Main Interpreter
 ;;; ============================================================
 
@@ -277,7 +361,8 @@
       (mvm-jb-pc jb))))
 
 (defun mvm-interpret (bytecode &key (entry-point 0) function-table runtime-table
-                                    (return-raw t))
+                                    (return-raw t) initial-args initial-cenv
+                                    lambda-offsets)
   "Execute MVM bytecode starting at ENTRY-POINT.
    When RET or HALT is reached, return VR.  RETURN-RAW (default T, for callers
    that re-tag the result themselves via `(ash result -1)`) returns the RAW WORD
@@ -285,7 +370,20 @@
    boundary fixnums (|value| >= 2^61) whose word exceeds the in-image 62-bit
    fixnum range, so %val->word (and the caller's later %word->val) would overflow.
    RUNTIME-TABLE (optional, synthetic-offset -> native fn name string) routes
-   CALLs to functions outside the bytecode module to a direct native funcall."
+   CALLs to functions outside the bytecode module to a direct native funcall.
+
+   INITIAL-ARGS / INITIAL-CENV (re-entrancy support, the native-HOF-over-an-
+   eval2-lambda path): when a native higher-order function (mapcar/reduce/…)
+   funcalls an eval2 lambda VALUE that escaped to native code, the escaping
+   value is a trampoline closure (see %mvm-make-trampoline) that RE-ENTERS this
+   interpreter at the lambda's bytecode offset.  INITIAL-ARGS is the list of
+   call arguments — they are loaded into V0..Vn (the normal arg registers) and
+   NARGS is set, exactly as an in-module CALL caller would set them, so the
+   lambda's frame-enter prologue spills them into its frame.  INITIAL-CENV is
+   the closure env (slot 1 of a #x52 closure) so a CAPTURING escaped lambda can
+   resolve its captured vars via op-get-cenv.  The args are VALUES (the native
+   funcall passes real values) so they are stored with raw svref, matching the
+   in-module call convention (op-call's bridge reads args via svref too)."
   (let* ((state (make-mvm-state))
          (bc bytecode) (pc entry-point) (len (length bc))
          (ftab (or function-table (vector)))
@@ -293,6 +391,25 @@
     (declare (type fixnum pc len) (type simple-vector regs) (ignorable ftab))
     (reg-set regs +vreg-vn+ +mvm-nil+)  ; VN holds the canonical NIL immediate
     (reg-set regs +vreg-vpc+ pc)
+    ;; Re-entry arg marshalling: store each initial arg VALUE into V0..Vn and
+    ;; set NARGS, then set the closure env.  Mirrors what a normal CALL caller
+    ;; does (args in V0..V3 via push/pop, :set-nargs) so the callee's
+    ;; frame-enter / &rest prologue see them.
+    (when initial-args
+      (let ((i 0))
+        (dolist (a initial-args)
+          (when (< (+ +vreg-v0+ i) +num-vregs+)
+            (setf (svref regs (+ +vreg-v0+ i)) a))
+          (setf i (+ i 1)))
+        (setf (mvm-nargs state) i)))
+    ;; The closure-env register is stored as a WORD (op-set-cenv does
+    ;; `reg-get` = %val->word) and read back as a VALUE (op-get-cenv does
+    ;; `reg-set` = %word->val).  INITIAL-CENV is a VALUE (slot 1 of the #x52
+    ;; closure), so encode it to a word here to match the round-trip op-get-cenv
+    ;; will perform — otherwise the captured-var extraction reads a corrupted
+    ;; env (a TYPE-ERROR / wrong value).
+    (when initial-cenv
+      (setf (mvm-cenv state) (%val->word initial-cenv)))
 
     (loop
       ;; Re-load regs from the state each iteration: the compiled in-image
@@ -997,9 +1114,17 @@
                        (let ((args nil))
                          ;; regs hold real VALUES — pass them directly (the old
                          ;; %word->val∘reg-get round-trip overflowed for a
-                         ;; boundary-fixnum arg/result).
+                         ;; boundary-fixnum arg/result).  Wrap any escaping eval2
+                         ;; lambda value (a #x52 closure-over-offset, or a bare
+                         ;; in-module offset) in a re-entrant trampoline so a
+                         ;; NATIVE higher-order callee (mapcar/reduce/…) can
+                         ;; funcall it — %mvm-wrap-escaping passes everything else
+                         ;; through unchanged.
                          (dotimes (i nargs)
-                           (push (svref regs (- nargs 1 i)) args))
+                           (push (%mvm-wrap-escaping (svref regs (- nargs 1 i))
+                                                     bc ftab runtime-table
+                                                     lambda-offsets)
+                                 args))
                          ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
                          ;; multi-valued fns (floor/truncate/round/rem returning a
                          ;; quotient AND remainder) write their secondaries to the
@@ -1101,8 +1226,15 @@
                  ((functionp target)
                   (let ((nargs (mvm-nargs state))
                         (args nil))
+                    ;; Wrap any escaping eval2 lambda arg in a trampoline (see
+                    ;; op-CALL's bridge) so a native HOF reached via funcall/
+                    ;; apply (e.g. (apply #'mapcar (list lambda list))) can
+                    ;; funcall it.
                     (dotimes (i nargs)
-                      (push (svref regs (- nargs 1 i)) args))
+                      (push (%mvm-wrap-escaping (svref regs (- nargs 1 i))
+                                                bc ftab runtime-table
+                                                lambda-offsets)
+                            args))
                     (setf (svref regs +vreg-vr+) (apply target args))
                     (setf pc npc)))
                  (t

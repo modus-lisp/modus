@@ -194,10 +194,25 @@
         (setq entry (function-info-bytecode-offset (car e)))))
     (let ((bc (mvm-buffer-used-bytes buf)))
       (if entry
-          (let ((fn-table (make-array (length all-ir))) (i 0))
-            (dolist (e all-ir) (aset fn-table i (function-info-bytecode-offset (car e))) (setq i (+ i 1)))
+          (let ((fn-table (make-array (length all-ir))) (i 0)
+                ;; LAMBDA-OFFSETS: the bytecode entry offsets of in-module LAMBDA /
+                ;; CLOSURE bodies (named *$$LAMBDA* / *$$CLOSURE* by compile-lambda).
+                ;; The interp's native-bridge uses this to recognise an eval2 lambda
+                ;; VALUE escaping to a native higher-order fn (mapcar/reduce/…) and
+                ;; wrap it in a re-entrant trampoline.  Keyed by offset; ONLY genuine
+                ;; lambda bodies are recorded (never the %eval2-thunk / helper defuns
+                ;; / the fn at offset 0), so an ordinary fixnum DATA argument — a loop
+                ;; counter 0/1/2, an index — is never mistaken for a callable.
+                (lam-offsets (make-hash-table)))
+            (dolist (e all-ir)
+              (aset fn-table i (function-info-bytecode-offset (car e)))
+              (setq i (+ i 1))
+              (let ((nm (string (function-info-name (car e)))))
+                (when (or (search \"$$LAMBDA\" nm) (search \"$$CLOSURE\" nm))
+                  (puthash (function-info-bytecode-offset (car e)) lam-offsets t))))
             (handler-case (mvm-interpret bc :entry-point entry :function-table fn-table
-                                         :runtime-table rt-table :return-raw nil)
+                                         :runtime-table rt-table :return-raw nil
+                                         :lambda-offsets lam-offsets)
               (error (e) (list :interp-err e))))
           :no-entry))))
 ;; Single-expression convenience.

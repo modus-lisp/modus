@@ -186,12 +186,32 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 ### What's Missing for Quicklisp
 
 ```
-[ ] Runtime compile (source → bytecode → native at runtime)
+[~] Runtime compile (source → bytecode → interpret): self-hosts now.  The MVM
+    compiler + bytecode interpreter + eval2 are compiled INTO the image (the
+    generic oracle image always; the ANSI image as of efa91ea — WS3 P0).
+    `eval2` = compile a form to MVM bytecode + run it via mvm-interpret, in
+    the image, at runtime.  Still DEAD CODE in the ANSI image (production
+    `eval` routes to the tree-walker); WS3 flips that.  bytecode→native at
+    runtime (the JIT) is WS4.
 [ ] compile-file → FASL
 [ ] Full numeric tower (arbitrary bignums, ratios, full floats, complex)
 [ ] Setf machinery (defsetf, define-setf-expander)
 [✓] Everything else
 ```
+
+### Self-hosting (WS3): retiring the tree-walker
+
+Modus has two evaluators.  The tree-walker (`%eval-in-env`, cl-eval.lisp) is
+what production `eval`/`load` use.  **eval2** (`eval2-forms`, mvm/eval2.lisp)
+compiles a form to MVM bytecode and runs it through `mvm-interpret`
+(interp.lisp).  eval2 reached parity-or-better than the tree-walker on the
+broad + CLOS oracles, and as of efa91ea the compiler+interpreter+eval2 are
+self-hosted in the ANSI image (build-ansi-test.lisp's `*compiler-in-image-source*`,
+mirroring build-generic.lisp's STAGE-1/STAGE-2 blocks).  Plan: prove full-corpus
+parity via an in-image differential gate, flip `eval`/`load` to eval2 behind a
+flag, then delete the tree-walker.  The interpret-vs-JIT back-end choice is made
+after a perf spike (interpretation models memory as a hash-table → slow; the
+gauntlet is time-bounded).  See /home/claude/.claude/plans/hazy-dazzling-deer.md.
 
 ## Build Commands
 

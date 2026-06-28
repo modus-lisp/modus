@@ -76,6 +76,57 @@
     (mvm-text "mvm/ansi-bridge.lisp")))
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
+;;; --- WS3: self-host the MVM compiler in the image (eval2 foundation) ---
+;;; Replicates build-generic.lisp's STAGE-1 (ISA + bytecode interpreter) and
+;;; STAGE-2 (compiler + in-image float-bit override + opcode table + eval2)
+;;; source blocks so the ANSI image can compile-and-interpret a form at
+;;; runtime.  At this stage eval2 is DEAD CODE (nothing routes to it); the
+;;; 32-shard gate must stay unchanged.  Order matters: loaded AFTER
+;;; *bridge-source* (needs %prim-aref, the CL runtime) — see *full-source*.
+(defvar *isa-source*      (mvm-text "mvm/mvm.lisp"))      ; opcode/vreg constants + structs
+(defvar *interp-source*   (mvm-text "mvm/interp.lisp"))   ; mvm-interpret (bytecode executor)
+(defvar *compiler-image-source* (mvm-text "mvm/compiler.lisp")) ; the 3-phase MVM compiler
+(defvar *eval2-source*    (mvm-text "mvm/eval2.lisp"))    ; eval2-forms / eval2
+;; In-image override of the host-only ieee-float-* / bignum-literal helpers
+;; (compiler.lisp uses sb-kernel:double-float-*).  Appended AFTER the compiler
+;; source so it wins (last-defun).  Verbatim from build-generic.lisp.
+(defvar *stage2-float-override* "
+(defun ieee-float-bits (f)
+  (logior (ash (logand (%prim-aref f 0) 4294967295) 32)
+          (logand (%prim-aref f 1) 4294967295)))
+(defun ieee-float-hi32 (f) (logand (%prim-aref f 0) 4294967295))
+(defun ieee-float-lo32 (f) (logand (%prim-aref f 1) 4294967295))
+(defun %lit-bignum-big-p (value) (big-bignum-p value))
+(defun %lit-bn-lo (value) (bignum-lo value))
+(defun %lit-bn-hi (value) (bignum-hi value))
+(defun %lit-bb-sign (value) (%bb-sign value))
+(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
+(defun %lit-bb-limb (value k) (%bb-limb value k))
+")
+;; Generated boot-time populator for *opcode-table* (the host *opcode-table*
+;; is populated when mvm.lisp/compiler.lisp load host-side for macro scanning).
+(defvar *opcode-table-init-source*
+  (with-output-to-string (s)
+    (format s "(defun %~A-opcode-table ()~%" "populate")
+    (maphash (lambda (code info)
+               (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                       code code
+                       (modus.mvm::opcode-info-name info)
+                       (modus.mvm::opcode-info-operands info)
+                       (modus.mvm::opcode-info-description info)))
+             modus.mvm::*opcode-table*)
+    (format s "  t)~%")
+    (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%")))
+;; The assembled self-host block, spliced into *full-source* after the bridge.
+(defvar *compiler-in-image-source*
+  (concatenate 'string
+    *isa-source*      (string #\Newline)
+    *interp-source*   (string #\Newline)
+    *compiler-image-source* (string #\Newline)
+    *stage2-float-override* (string #\Newline)
+    *opcode-table-init-source* (string #\Newline)
+    *eval2-source*    (string #\Newline)))
+
 ;;; --- Gap A: symbol-function table auto-registration ---
 ;;;
 ;;; cl-eval.lisp's %init-sft-list is a hand-curated allowlist (~229
@@ -4940,6 +4991,10 @@
     (string #\Newline)
     ;; 3. ANSI bridge (helpers, stubs, missing functions)
     *bridge-source*
+    (string #\Newline)
+    ;; 3b. WS3: MVM compiler + interpreter + eval2 self-hosted in the image
+    ;; (DEAD CODE until eval routing flips — gate must stay unchanged).
+    *compiler-in-image-source*
     (string #\Newline)
     ;; 4. ANSI auxiliary files (scaffold, helpers used by test files)
     ;;    Loaded BEFORE test-source so that test-source can override

@@ -16,13 +16,33 @@
 ;;; ============================================================
 
 (defstruct code-buffer
-  (bytes (make-array 100663296 :element-type '(unsigned-byte 8)))  ; 96MB fixed-size, use position tracking
+  ;; Initial 96MB; grows on demand (see %code-buffer-ensure).  A fixed
+  ;; size used to overflow once the emitted image got large (e.g. the
+  ;; ANSI corpus plus the self-hosted MVM compiler): emit-byte's aset
+  ;; would index past the array and raise INVALID-ARRAY-INDEX-ERROR,
+  ;; which the translator's retry loop then masked into a truncated
+  ;; image + a bogus li-const patch offset.  The real ceiling is the
+  ;; rel32 branch range asserted in emit-s32, not this buffer.
+  (bytes (make-array 100663296 :element-type '(unsigned-byte 8)))
   (labels (make-hash-table :test 'eq))      ; label -> position
   (fixups nil)                              ; list of (position label offset-size)
   (position 0))
 
+(defun %code-buffer-ensure (buf pos)
+  "Ensure BUF's byte array can hold index POS.  Grows (doubling) and
+   copies the existing bytes when the current array is too small."
+  (let* ((bytes (code-buffer-bytes buf))
+         (cap (length bytes)))
+    (when (>= pos cap)
+      (let ((new-cap cap))
+        (loop while (>= pos new-cap) do (setf new-cap (* new-cap 2)))
+        (let ((new-bytes (make-array new-cap :element-type '(unsigned-byte 8))))
+          (replace new-bytes bytes :end1 cap)
+          (setf (code-buffer-bytes buf) new-bytes))))))
+
 (defun emit-byte (buf byte)
   (let ((pos (code-buffer-position buf)))
+    (%code-buffer-ensure buf pos)
     (setf (aref (code-buffer-bytes buf) pos) (ldb (byte 8 0) byte))
     (setf (code-buffer-position buf) (+ pos 1))))
 

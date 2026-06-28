@@ -380,7 +380,25 @@
                         "*CURRENT-SOURCE-LOCATION*" "*COMPILE-TRACE*"
                         "*FRAME-SLOTS*" "*CURRENT-FN*" "*CURRENT-FN-NAME*"
                         "*OPCODE-TABLE*" "*VREG-TO-X64*"
-                        "*CONDITION-CODES*"))
+                        "*CONDITION-CODES*"
+                        ;; mvm-compile-function-internal's per-function
+                        ;; let* bindings.  These MUST dynamic-bind so a
+                        ;; NESTED compile (compile-lambda → mvm-compile-
+                        ;; function-internal for a capturing closure, or a
+                        ;; runtime nested DEFUN) properly SAVES/RESTORES the
+                        ;; enclosing function's value.  Without *IR-BUFFER*
+                        ;; here, Modus's self-hosted compiler treated it as
+                        ;; LEXICAL: the inner function's let*=nil never
+                        ;; isolated the GLOBAL emit-ir target, and the
+                        ;; inner get-ir-instructions' (setf *ir-buffer* nil)
+                        ;; WIPED the enclosing thunk's IR (frame-enter +
+                        ;; everything emitted before the lambda) — eval2 of
+                        ;; a capturing closure then ran a frame-less thunk
+                        ;; that STACK-LOADed a 0 VFP → SIGSEGV (WS4 oracle).
+                        "*IR-BUFFER*" "*TEMP-REG-COUNTER*"
+                        "*CURRENT-FUNCTION-NAME*" "*FUNCTION-RETURN-LABEL*"
+                        "*UWP-CLEANUPS*" "*LOOP-EXIT-UWP-SEQ*"
+                        "*ARITH-PUSH-DEPTH*"))
           (setf (gethash (compute-name-hash name) tab) t))
         (setq *clhs-standard-specials-hashes* tab)
         tab)))
@@ -4899,7 +4917,18 @@
   (let ((base (cond ((symbolp var) (symbol-name var))
                     ((stringp var) var)
                     (t (format nil "~A" var)))))
-    (intern (concatenate 'string "%CELL-" base) :modus.mvm)))
+    ;; Intern into MODUS.MVM when that package is resolvable (build-time
+    ;; SBCL host), else fall back to *package* — which IS MODUS.MVM during
+    ;; a normal compile.  CRITICAL for self-hosted / in-image eval (eval2):
+    ;; there `(find-package "MODUS.MVM")` returns NIL (the package table
+    ;; isn't populated in-image), so the old `(intern name :modus.mvm)`
+    ;; returned NIL — the cell-rewrite then produced `(car NIL)` / `(set-car
+    ;; NIL …)`, compile-lambda saw NO captured var (NIL isn't a variable),
+    ;; emitted a captureless raw fn-addr, and the closure body's setcar on a
+    ;; NIL "cell" SIGSEGV'd.  The fallback keeps the binding symbol and every
+    ;; reference EQ within one compile, which is all cell indirection needs."
+    (intern (concatenate 'string "%CELL-" base)
+            (or (find-package "MODUS.MVM") *package*))))
 
 (defun cell-rewrite-form (form boxed-vars &optional (lambda-params nil))
   "Rewrite FORM to use cell indirection for BOXED-VARS.

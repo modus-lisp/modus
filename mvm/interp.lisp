@@ -130,6 +130,16 @@
         ((= subtag #x66) (%make-long2))    ; 2-slot boxed long-float
         ((= subtag #x33) (%make-ratio))    ; 2-slot ratio (num . den)
         ((= subtag #x30) (%make-bignum))   ; 2-slot bignum header (limbs in a slot)
+        ;; Closure (#x52): compile-make-closure emits `alloc-obj 2 #x52` then
+        ;; obj-set slot 0 = fn-addr, slot 1 = env.  Allocate a REAL closure
+        ;; object (not the make-array fallback) so op-obj-subtag reports #x52
+        ;; — funcall's dispatch checks subtag #x52 to take the set-cenv +
+        ;; call-indirect closure path.  A make-array (#x32) here made every
+        ;; CAPTURING lambda fall through to the direct-call path (subtag !=
+        ;; #x52) → empty/NIL result (WS4 oracle).  The placeholder slots are
+        ;; overwritten by the following obj-sets; %prim-aset is uniform across
+        ;; object types.
+        ((= subtag #x52) (%make-closure 0 nil))
         (t (make-array size :initial-element nil))))
 ;; Slot ref/set/len via the NATIVE primitives.  %prim-aref returns the raw slot
 ;; (char CODE for a string), %prim-aset stores it; uniform across object types.
@@ -764,18 +774,43 @@
           (#.+op-obj-subtag+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               ;; native subtag extraction via the obj-subtag primop.  A native
-               ;; FUNCTION object (resolved by op-FN-ADDR for #'NAME) is a
-               ;; callable whose representation the raw obj-subtag primop does
-               ;; not read cleanly here, so report its subtag (#x51 function)
-               ;; directly.  This lets funcall's dispatch correctly skip the
-               ;; symbol(#x50)/closure(#x52)/array(#x32) branches and fall
-               ;; through to CALL-INDIRECT, which bridge-calls it (higher-order
-               ;; eval2: funcall/apply/mapcar #'NAME).
-               (let ((obj (%word->val (reg-get regs vs))))
-                 (reg-set regs vd (tag-fixnum (if (functionp obj)
-                                                  #x51
-                                                  (obj-subtag obj)))))
+               ;; native subtag extraction via the obj-subtag primop.
+               ;;
+               ;; Two callable representations cross this opcode and they need
+               ;; DIFFERENT subtags so funcall's dispatch routes them correctly:
+               ;;   - a native CLOSURE object (subtag #x52), built by
+               ;;     compile-make-closure / %make-closure for a CAPTURING
+               ;;     lambda — funcall must take the set-cenv + call-indirect
+               ;;     closure path, which is gated on subtag #x52.
+               ;;   - a bare native FUNCTION (a raw fn-addr resolved by
+               ;;     op-FN-ADDR for #'NAME / a captureless lambda) — NOT a
+               ;;     tagged object, so the raw obj-subtag primop reads garbage;
+               ;;     report #x51 so funcall skips sym/closure/array and falls
+               ;;     through to CALL-INDIRECT's bridge.
+               ;; The earlier `(if (functionp obj) #x51 …)` collapsed BOTH to
+               ;; #x51 because native functionp is true for a #x52 closure too,
+               ;; so every CAPTURING lambda fell out of the closure path → the
+               ;; funcall returned NIL (WS4 oracle).  Fix: prefer the real
+               ;; obj-subtag for genuine OBJECTS (tag = object); only the
+               ;; non-object callable (raw fn-addr) gets the #x51 fallback.
+               (let* ((obj (%word->val (reg-get regs vs)))
+                      (raw-st (obj-subtag obj))
+                      (st (cond
+                            ;; A native CLOSURE object reads a clean #x52 from
+                            ;; the obj-subtag primop — keep it so funcall takes
+                            ;; the closure (set-cenv) path.  Checked BEFORE the
+                            ;; functionp arm: native functionp is true for a
+                            ;; #x52 closure too, and the old `functionp→#x51`
+                            ;; ordering swallowed every CAPTURING lambda.
+                            ((= raw-st #x52) #x52)
+                            ;; A bare native FUNCTION (raw fn-addr from #'NAME /
+                            ;; captureless lambda) is NOT a tagged object, so
+                            ;; obj-subtag's read above is garbage — report #x51
+                            ;; so funcall falls through to CALL-INDIRECT's
+                            ;; native bridge (funcall/apply/mapcar #'NAME).
+                            ((functionp obj) #x51)
+                            (t raw-st))))
+                 (reg-set regs vd (tag-fixnum st)))
                (setf pc npc2))))
 
           ;; --- Raw Memory ---
@@ -909,8 +944,16 @@
                        (reg-set regs +vreg-vr+ +mvm-nil+))
                    (setf pc npc))
                  ;; In-module call: push return frame, jump to the bytecode.
+                 ;; SAVE VFP (the caller's frame array) in the frame: the
+                 ;; callee's frame-enter overwrites VFP with a fresh array and
+                 ;; nothing restored it, so after the callee RET the caller
+                 ;; read its OWN locals through the callee's frame → a local
+                 ;; re-read after a call returned NIL (the accumulator
+                 ;; `(funcall f) (funcall f)` lost f on the 2nd read).  op-ret
+                 ;; restores VFP from the frame.
                  (progn
-                   (push (cons npc (mvm-stack state)) (mvm-call-stack state))
+                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+))
+                         (mvm-call-stack state))
                    (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
 
           (#.+op-fn-addr+
@@ -945,6 +988,23 @@
              ;; FN-ADDR stores the bytecode OFFSET as a tagged fixnum value.
              (let ((target (svref regs vs)))
                (cond
+                 ;; In-module bytecode offset (a plain integer): jump to it.
+                 ;; MUST be checked BEFORE the functionp branch: a closure's
+                 ;; fn-slot (and a captureless lambda's li-func) stores the
+                 ;; closure/lambda's in-module bytecode OFFSET as a small
+                 ;; integer, and functionp's code-range heuristic returns T
+                 ;; for such a small integer — so the old functionp-first
+                 ;; order routed every in-module closure call into the native
+                 ;; bridge `(apply <offset> args)` → SIGSEGV (the offset is
+                 ;; not a real function).  A genuine resolved native function
+                 ;; OBJECT (the #'NAME bridge target) is NOT integerp, so it
+                 ;; correctly falls through to the functionp branch below.
+                 ;; Save VFP in the frame (see op-CALL) so a local re-read in
+                 ;; the caller after this call survives the callee's frame.
+                 ((integerp target)
+                  (push (list npc (mvm-stack state) (svref regs +vreg-vfp+))
+                        (mvm-call-stack state))
+                  (setf pc target))
                  ;; Higher-order eval2 bridge: a resolved native function object
                  ;; (#'+ , #'1+ , #'< , a %*-FN wrapper, etc.).  funcall/apply/
                  ;; mapcar all route through here.  Pull nargs args (V0..) from
@@ -958,18 +1018,19 @@
                       (push (svref regs (- nargs 1 i)) args))
                     (setf (svref regs +vreg-vr+) (apply target args))
                     (setf pc npc)))
-                 ;; In-module bytecode offset (a fixnum value): jump to it.
-                 ((integerp target)
-                  (push (cons npc (mvm-stack state)) (mvm-call-stack state))
-                  (setf pc target))
                  (t
                   (error "MVM: CALL-IND with non-callable target ~S" target))))))
 
           (#.+op-ret+
            (if (mvm-call-stack state)
                (let ((frame (pop (mvm-call-stack state))))
-                 (setf pc (car frame))
-                 (setf (mvm-stack state) (cdr frame)))
+                 ;; frame = (return-pc saved-stack saved-vfp).  Restore the
+                 ;; caller's PC, operand stack AND frame pointer — the last
+                 ;; so a local re-read in the caller after this call sees the
+                 ;; caller's frame, not the (now-dead) callee's.
+                 (setf pc (first frame))
+                 (setf (mvm-stack state) (second frame))
+                 (setf (svref regs +vreg-vfp+) (third frame)))
                (setf (mvm-halted state) t)))
 
           (#.+op-tailcall+

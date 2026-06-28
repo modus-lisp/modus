@@ -452,7 +452,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 3. **Symbol identity — per-package (CLHS 11.1.2) via SYMBOLS_PLAN phase 1 (a1327d6)**: `%intern-symbol-pkg` and `intern` both key the global intern table by a composite of NAME-HASH and PKG-HASH.  Within-package `(eq 'foo 'foo)` holds (covers compile-time literal vs runtime READ vs the CL-symbol-wrapper / native-MVM-sym boundary within a single package).  Cross-package `(eq cl-test::x ds4::x)` returns **NIL** — CL-correct, was previously T under the daa0763 unified model.  See SYMBOLS_PLAN.md.
 4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
 5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-6. **Funcall tag — RESOLVED via OR-3**: Function pointers are explicitly tagged in `mvm-fn-addr` (translate-x64.lisp ~line 2794): `LEA + OR-3`.  Raw fn-code is NOP-padded so the low nibble is 0; OR-3 yields tagged fn pointers with low nibble `0x3` always.  Tags `cons=0x1`, `fn=0x3`, `char=0x5`, `obj=0x9` are mutually disjoint in the low nibble, so the historic "funcall-tag-collision" / "fn-addrs at vaddr ???05" classes are STRUCTURALLY impossible.  When bytecode shifts move function addresses, the OR-3 still produces a clean tag — predicate flips don't happen via tag-nibble accident.  Layout-shift cascades that appear during code changes have a different cause (TBD; likely branch-displacement limits, GC root-scan edges, or static-data alignment).
+6. **Funcall tag — RESOLVED via OR-3**: Function pointers are explicitly tagged in `mvm-fn-addr` (translate-x64.lisp ~line 2794): `LEA + OR-3`.  Raw fn-code is NOP-padded so the low nibble is 0; OR-3 yields tagged fn pointers with low nibble `0x3` always.  Tags `cons=0x1`, `fn=0x3`, `char=0x5`, `obj=0x9` are mutually disjoint in the low nibble, so the historic "funcall-tag-collision" / "fn-addrs at vaddr ???05" classes are STRUCTURALLY impossible.  When bytecode shifts move function addresses, the OR-3 still produces a clean tag — predicate flips don't happen via tag-nibble accident.  A change that appears to break something via "code movement" has a real semantic cause; bisect to it (see "Layout shift broke an unrelated test" below).
 7. **defvar init-thunks not run**: `(defvar *foo* 42)` declares `*foo*` but does NOT set it to 42 at boot — `init-all-globals` is skipped. Defvars default to NIL. Initialize required values explicitly via setq in an init function (e.g. `*pkg-tag*`, `*sym-tag*` set in `%init-packages`). Predicates that compare against an uninitialized tag with `(eql (car x) *tag*)` will return T for *any* cons-with-NIL-car — see `%pkg-p` history.
 8. **`compile-ash` inlines `:shl`/`:sar` for small constant counts (≤30) WITHOUT a fixnum tag check — corrupts a BIGNUM value.** `(ash bignum-val small-const-count)` shifts the raw tagged word, which is right for a fixnum (low bit 0) but mangles a bignum pointer (tag 0x9): `(ash (ash 1 200) -1)` :sar's the heap address to garbage, `(ash 2^200 -200)` returns a bogus fixnum. Variable-count and large-constant-count ash already route to runtime `bignum-ash` (correct). The bignum-ash runtime fix (9463e26) makes `(ash 1 N)` produce a CORRECT big bignum, which then SURFACES this latent compiler bug in any code that shifts those bignums by a small constant — `%print-integer-in-base`-adjacent format-runtime paths (format-d/o/x/b chunk-crashes), `gcd.5`/`logcount.7-8` (`(ash 1 200/300)` bounds → big-bignum operands → `(ash x -1)`). **FIX IS A COMPILER CHANGE but every attempt so far BROKE the harness's SIGSEGV-handler longjmp recovery** (a previously-recoverable pre-existing crash in nunion/modules went fatal; the 4x code-size blowup of the source-expansion `(if (fixnump g) (%ash-fixnum-raw g k) (bignum-ash g k))` is the suspected trigger — possibly fn-table/branch-displacement). The individual ash results were CORRECT (probes 9920-9925 passed); only harness recovery regressed. A recovery-safe fix is the open follow-up. Workaround for now: route through `bignum-ash` explicitly when a value may be a bignum.
 
@@ -527,40 +527,22 @@ proper element loads (`%INTERN-SYMBOL` for symbols, fixnum loads for ints,
 etc.) and `:obj-set` into the freshly allocated array. See `mvm/compiler.lisp`
 ~line 1444. Regression: `ansi-tests.lisp` deftests 3091/3092.
 
-### Function size in run-cl-loop-tests changes which sub-tests crash
+### "Layout shift broke an unrelated test" — it almost never did
 
-**Status 2026-05-31: NOT REPRODUCIBLE on x64 Linux.**  Verified via the
-`*fuzz-funcall-nops*` knob: building with `MODUS_FUZZ_FUNCALL_NOPS=64`
-(adds 64 NOPs at every compile-funcall, +200KB binary, ~50K perturbation
-sites) and running tests 14000..21999 against an unfuzzed baseline:
-873 fails vs 873 fails, **zero diff**.  Same result at fuzz=32 over the
-CLOS range 11000..12500: 213 vs 213, zero diff.  The cascade mechanism
-that defied diagnosis in 2026-05-03 is closed by the stack of fixes that
-landed after it:
+This verdict has been wrong every time it's been reached.  Adding/resizing a
+function does NOT flip unrelated tests on x64 Linux: the OR-3 fn-tagging +
+SIGSEGV handler + NIL=#xDEAD0001 fixes closed that class, and a fuzz sweep
+(`MODUS_FUZZ_FUNCALL_NOPS=64`, ~50K perturbation sites) over 8000 tests
+produced **zero diff** vs baseline.  When a change appears to break something
+unrelated, the cause is a real semantic regression — bisect to it.  Almost
+always one of: an auto-extracted runtime macro now shadowing a validating
+runtime function (the eval2-CLOS make-instance case), a missing rewrite, a
+name collision (last-defun-wins), a subtag collision, or a missing gc-check.
 
-  - `OR-3` fn-pointer tagging (low nibble disjoint from cons/obj/char)
-  - `strip-declares` docstring strip (1.3MB removed, +67 ANSI)
-  - SIGSEGV signal handler that longjmps to nearest handler-case
-  - NIL=#xDEAD0001 with consp/atom pre-check (no fixnum-0 collision)
-
-If you re-encounter "adding a defun broke an unrelated test", repeat the
-fuzz experiment FIRST — set `MODUS_FUZZ_FUNCALL_NOPS=4` (or higher),
-rebuild, and run the same tests.  If results are bit-identical, layout
-shift is not the cause; look for a real semantic regression in the new
-code (compile-call WARN line, missing rewrite, name collision).
-
-The remaining x64 ANSI fails are TRUE implementation gaps (floats,
-ratios, complex, adjustable arrays, runtime EVAL of defmacro/setf, large
-arity apply, do-special-strings) — not layout artifacts.
-
-(Historical note from 2026-05-03 root-causing: `strip-declares` did not
-strip docstrings, so every `(defun name (…) "doc" body)` emitted ~14
-bytes of x86 per character of docstring as an allocate-and-discard
-string in the function prologue.  STRING-EQUAL with a 280-char docstring
-grew the function from 1.8KB to 7KB and the 5KB downstream shift caused
-other crashes.  The cascade mechanism was attributed to "nibble-1/9
-funcall-tag-collision" — wrong diagnosis but the fix saved 1.3MB and
-+67 ANSI tests anyway.)
+If you still suspect layout, the fuzz knob settles it in one build: set
+`MODUS_FUZZ_FUNCALL_NOPS=4`, rebuild, rerun the same range.  Bit-identical
+results ⇒ not layout; go find the semantic bug.  (Do this before, not after,
+spending hours on a "fragility" theory.)
 
 ## Fixpoint Build (`mvm/build-fixpoint.lisp`)
 

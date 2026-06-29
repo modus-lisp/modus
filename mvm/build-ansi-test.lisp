@@ -403,10 +403,21 @@
           (error () nil))))
     tbl))
 
-(defvar *sym-name-auto-source*
+;; Builds the %init-sym-name-auto source from EXTRA-SOURCES (a list of source
+;; strings to scan in addition to the always-scanned first-party + ANSI-test
+;; symbols).  Factored into a function so it can be called AFTER *driver-source*
+;; is defined — the driver carries quoted symbol literals (e.g. the eval2
+;; self-check's `(defun sq …)`) whose names SYMBOL-NAME must be able to recover;
+;; without scanning the driver those symbols reverse-map to "" and eval2's
+;; defun-registration keys every such function under the empty string → name
+;; collision → in-module cross-call resolves to the wrong (last) function →
+;; infinite self-recursion.  (Reader-interned symbols already work via the
+;; package-symtab fallback; this closes the build-literal gap.)
+(defun %build-sym-name-auto-source (extra-sources)
   (let ((tbl (make-hash-table :test 'equal)))
-    (dolist (src (list *prelude-source* *gc-source* *mcgc-pin-source* *rt-source*
-                       *bridge-source* *test-source*))
+    (dolist (src (append (list *prelude-source* *gc-source* *mcgc-pin-source*
+                               *rt-source* *bridge-source* *test-source*)
+                         extra-sources))
       (let ((found (%scan-symbol-names-host src)))
         (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
                  found)))
@@ -434,6 +445,10 @@
       (format t "  sym-name auto-init: ~D unique symbol names across ~D chunk(s)~%"
               count chunks)
       src)))
+
+;; Forward declaration; the real value is computed after *driver-source* is
+;; defined (so the driver's quoted symbols get scanned) — see the SETQ below.
+(defvar *sym-name-auto-source* nil)
 
 ;; SBCL-level stubs for functions called during macro expansion
 (defun notnot (x) (not (not x)))
@@ -4942,10 +4957,14 @@
     (print-dec (eval2 (quote (+ 1 2)))) (write-char-serial 10)
     (write-string-serial \"sqr=\")
     (print-dec (eval2 (quote (let ((x 5)) (* x x))))) (write-char-serial 10)
-    ;; NOTE: multi-form (defun + cross-form call) currently HANGS in the ANSI
-    ;; image — the defun-registration path needs another uninitialized global
-    ;; beyond *opcode-table* (it completes under full init-all-globals).  That
-    ;; narrowing is task #122 follow-up; omitted here so the self-check can't hang.
+    ;; Multi-form defun + cross-form call: SQ is defined, then called.  The
+    ;; in-module CALL (sq 7) resolves bytecode->bytecode via *functions* keyed by
+    ;; SQ's SYMBOL-NAME; this exercises the full self-hosted defun-registration +
+    ;; cross-call path.  (SQ's name is recoverable because the driver source is
+    ;; now scanned into *sym-name-table* — see %build-sym-name-auto-source.)
+    (write-string-serial \"defcall=\")
+    (print-dec (eval2-forms (list (quote (defun sq (x) (* x x))) (quote (sq 7)))))
+    (write-char-serial 10)
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 
@@ -4990,6 +5009,12 @@
 ;;; ============================================================
 ;;; 5. Assemble full source
 ;;; ============================================================
+
+;; Now that *driver-source* exists, build the sym-name reverse table INCLUDING
+;; the driver's quoted symbols (so the in-image eval2 self-check's `(defun sq
+;; …)` and any other driver literal has a recoverable SYMBOL-NAME).
+(setq *sym-name-auto-source*
+      (%build-sym-name-auto-source (list *driver-source*)))
 
 (format t "~%Assembling full source...~%")
 

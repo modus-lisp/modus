@@ -8932,10 +8932,20 @@
           (free-temp-reg)))
       (loop for i from (1- reg-count) downto 0
             do (emit-ir :pop (+ +vreg-v0+ i)))
-      ;; When nargs=0, V0 retains stale value from caller context.
-      ;; Clear V0 to nil so callee receives a clean first argument slot.
-      (when (= nargs 0)
-        (emit-ir :mov +vreg-v0+ +vreg-vn+)))
+      ;; NIL-fill the UNUSED register-arg slots V[reg-count..3].  A funcall
+      ;; with fewer args than the callee's required-param count would
+      ;; otherwise leave the missing positional params reading STALE caller
+      ;; register values (garbage).  When that garbage is a heap pointer the
+      ;; callee dereferences it and faults/escapes — the WS3 eval2 E2-UNSUP
+      ;; cluster: `(funcall MAPC #'APPEND)` (1 arg, MAPC needs `fn list`) read
+      ;; a stale V1 for `list`, sometimes NIL (returns cleanly), sometimes a
+      ;; bad pointer (uncatchable escape).  Clearing V[reg-count..3] to NIL
+      ;; makes a too-few-args call DETERMINISTIC — missing positional params
+      ;; read NIL — matching the "missing required params default NIL"
+      ;; semantics and killing the garbage-pointer escape class.  (The old
+      ;; code only cleared V0 at nargs=0; V1..V3 at 0<nargs<4 stayed stale.)
+      (loop for i from (min nargs +max-reg-args+) below +max-reg-args+
+            do (emit-ir :mov (+ +vreg-v0+ i) +vreg-vn+)))
     ;; Pop function address (on top of overflow args) and call indirect.
     ;; Supports closures: fn may be either a raw code address (fixnum-like)
     ;; or a closure OBJECT (tag=object, subtag=#x52, 2 slots [fn-addr env-list]).

@@ -5197,6 +5197,23 @@
     (eval2 (quote (defun pg (y) (+ (pf y) 1))))
     (write-string-serial \"persist-fwd=\")
     (print-dec (handler-case (eval2 (quote (pg 2))) (t (c) -1))) (write-char-serial 10)
+    ;; WS3 DEFPACKAGE probe (asdf-gauntlet form-11 blocker): eval2 of a
+    ;; (defpackage …) form must create a READER-VISIBLE package, so a later
+    ;; (find-package …) — the tree-walker / reader path — resolves it.  Before
+    ;; the *eval2-runtime-p* DEFPACKAGE routing, eval2 skipped defpackage to a
+    ;; no-op and dpkg-find was 0 (NIL).  Expect 1.
+    (eval2 (quote (defpackage e2pkg (:use) (:export \"ZAP\"))))
+    (write-string-serial \"dpkg-find=\")
+    (print-dec (handler-case (if (find-package \"E2PKG\") 1 0) (t (c) -1)))
+    (write-char-serial 10)
+    ;; The package must also be usable: intern a symbol and confirm its package.
+    (write-string-serial \"dpkg-intern=\")
+    (print-dec (handler-case
+                   (if (eq (find-package \"E2PKG\")
+                           (symbol-package (intern \"HELLO\" \"E2PKG\")))
+                       1 0)
+                 (t (c) -1)))
+    (write-char-serial 10)
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 

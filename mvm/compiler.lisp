@@ -233,6 +233,16 @@
    emits the exact same :li IR as before — native translators see no new opcode
    and output is byte-identical.")
 
+(defvar *eval2-runtime-p* nil
+  "When true, mvm-compile-toplevel is running INSIDE the image on behalf of
+   eval2 (runtime EVAL), not host-side at build time.  Bound to T (via setq,
+   not let — see *mvm-emit-halves* for why compiled let of a special is
+   unreliable in-image) only by eval2-forms.  Used to route DEFPACKAGE (and
+   other package side-effecting forms) to their runtime impl (%defpackage-impl)
+   so eval2 of `(defpackage …)` creates a reader-visible package, matching the
+   tree-walker.  At build time it stays NIL, so the host build's DEFPACKAGE
+   no-op is byte-identical to before.")
+
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")
 
@@ -1722,6 +1732,23 @@
       (let ((test (cadr form))
             (body (cddr form)))
         `(if ,test nil (progn ,@body)))))
+
+  ;; DEFPACKAGE → %defpackage-impl (RUNTIME / eval2 only).
+  ;; At BUILD time the package system is SBCL-side, so we must NOT register
+  ;; this (the host build's DEFPACKAGE stays a no-op → byte-identical image).
+  ;; Under eval2 (*eval2-runtime-p* set by eval2-forms before this runs), the
+  ;; form is wrapped in %eval2-thunk and compiled as a NESTED expression, so a
+  ;; toplevel-only clause never sees it — a macro is the only path that fires
+  ;; in both the toplevel and nested compile-form positions.  Expands to the
+  ;; same %defpackage-impl call the tree-walker's runtime DEFPACKAGE macro
+  ;; emits (cl-packages.lisp:%register-defpackage-macro), so eval2 of
+  ;; `(defpackage …)` creates a reader-visible package in *all-packages*.
+  (when *eval2-runtime-p*
+    (mvm-define-macro "DEFPACKAGE"
+      (lambda (form)
+        (list '%defpackage-impl
+              (list 'quote (cadr form))
+              (list 'quote (cddr form))))))
 
   ;; VECTOR → (let ((v (make-array N))) (aset v 0 a0) ... v)
   (mvm-define-macro "VECTOR"
@@ -13479,7 +13506,11 @@
             (list `(let ((,tmp-var ,value))
                      (set-symbol-value ,name-hash ,tmp-var))))))))
 
-    ;; (defpackage ...) — skip, package system is SBCL-side only
+    ;; (defpackage ...) — at BUILD time the package system is SBCL-side only,
+    ;; so skip (byte-identical host build).  Under eval2 a runtime DEFPACKAGE
+    ;; macro (register-mvm-bootstrap-macros, gated on *eval2-runtime-p*)
+    ;; expands this to %defpackage-impl before it ever reaches this clause, so
+    ;; this remains a pure build-time no-op.
     ((and (consp form) (name-eq (car form) "DEFPACKAGE"))
      nil)
 

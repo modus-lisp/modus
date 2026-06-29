@@ -17,6 +17,12 @@
   ;; binding the compiler's compile-integer reads).  Native builds never call
   ;; eval2-forms, so the global stays NIL there.
   (setq *mvm-emit-halves* t)
+  ;; Mark in-image runtime compilation so mvm-compile-toplevel routes package
+  ;; side-effecting forms (DEFPACKAGE) to their runtime impl instead of the
+  ;; build-time no-op.  setq (not let): compiled let of a special is unreliable
+  ;; in-image (same reason as *mvm-emit-halves* above).  Native builds never
+  ;; call eval2-forms, so the global stays NIL at build time.
+  (setq *eval2-runtime-p* t)
   ;; LAZY opcode-table init.  encode-instruction (mvm.lisp) reads *opcode-table*
   ;; for each instruction's operand spec during Pass-2 emit; with a NIL table
   ;; (the ANSI image skips init-all-globals, so the defparameter init thunk

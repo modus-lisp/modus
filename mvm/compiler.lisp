@@ -2699,17 +2699,116 @@
   ;; DEFGENERIC — (defgeneric name lambda-list &rest options)
   ;; → register the GF + a dispatch defun NAME that funnels through
   ;; %gf-dispatch (mirrors the build-time expansion, which embeds NAME as a
-  ;; literal so there's no capture).  Inline (:method ...) / combination
-  ;; options are DEFERRED.
+  ;; literal so there's no capture).  Handles inline (:method ...) options,
+  ;; (:method-combination NAME [opt]) and (:argument-precedence-order ...) so
+  ;; eval2 reaches the same runtime CLOS registry the tree-walker does.
+  ;; (%defgeneric / %defmethod / %gf-dispatch / method combinations are all
+  ;; defined in the image, so this expands to ordinary calls.)
   (mvm-define-macro "DEFGENERIC"
     (lambda (form)
       (let* ((gf-name (cadr form))
              (lambda-list (caddr form))
+             (options (cdddr form))
+             (combination nil)
+             (apo nil)
+             (inline-methods nil)
              (args-var (gensym "GF-ARGS")))
-        `(progn
-           (%defgeneric ',gf-name ',lambda-list nil)
-           (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
-           ',gf-name))))
+        ;; Scan options for :method-combination / :argument-precedence-order /
+        ;; (:method ...) — documentation and others are ignored (eval2 has no
+        ;; runtime option validator; the tree-walker remains the reference for
+        ;; option-error tests).
+        (dolist (opt options)
+          (when (consp opt)
+            (cond
+              ((eq (car opt) :method-combination)
+               ;; (:method-combination NAME [args...]) — three encodings (see
+               ;; the SBCL-side rewriter): bare NAME, (NAME . :most-specific-last),
+               ;; or (NAME arg1 arg2 ...) for long-form combination args.
+               (let ((cargs (cddr opt)))
+                 (setq combination
+                       (cond
+                         ((null cargs) (cadr opt))
+                         ((and (null (cdr cargs))
+                               (eq (car cargs) :most-specific-last))
+                          (cons (cadr opt) :most-specific-last))
+                         (t (cons (cadr opt) cargs))))))
+              ((eq (car opt) :argument-precedence-order)
+               (setq apo (cdr opt)))
+              ((eq (car opt) :method)
+               (setq inline-methods (cons opt inline-methods))))))
+        (setq inline-methods (nreverse inline-methods))
+        ;; Build a %defgeneric-method form for each inline (:method ...).
+        ;; Parses [qualifier] specialized-lambda-list body... like DEFMETHOD.
+        (let ((method-forms
+               (mapcar
+                (lambda (mopt)
+                  ;; mopt = (:method [qualifier] specialized-ll body...)
+                  (let* ((rest (cdr mopt))
+                         (has-qual (and rest (cdr rest)
+                                        (symbolp (car rest))))
+                         (qualifier (if has-qual (car rest) nil))
+                         (rest2 (if has-qual (cdr rest) rest))
+                         (sll (car rest2))
+                         (body (cdr rest2))
+                         (specs nil)
+                         (params nil)
+                         (meta-ll nil)
+                         (in-tail nil))
+                    (dolist (p sll)
+                      (cond
+                        ((and (symbolp p)
+                              (member (symbol-name p)
+                                      '("&OPTIONAL" "&REST" "&KEY" "&AUX"
+                                        "&ALLOW-OTHER-KEYS")
+                                      :test #'string=))
+                         (setq in-tail t)
+                         (setq params (cons p params))
+                         (setq meta-ll (cons p meta-ll)))
+                        (in-tail
+                         (setq params (cons p params))
+                         (setq meta-ll (cons p meta-ll)))
+                        ((consp p)
+                         (let ((var (car p)) (spec (cadr p)))
+                           (setq params (cons var params))
+                           (setq meta-ll (cons var meta-ll))
+                           (if (and (consp spec) (symbolp (car spec))
+                                    (string= (symbol-name (car spec)) "EQL"))
+                               (setq specs (cons `(list 'eql ,(cadr spec)) specs))
+                               (setq specs (cons `',spec specs)))))
+                        (t
+                         (setq params (cons p params))
+                         (setq meta-ll (cons p meta-ll))
+                         (setq specs (cons ''t specs)))))
+                    ;; CLHS 7.6.5: the method lambda must be lenient about keys
+                    ;; belonging to OTHER applicable methods — add
+                    ;; &allow-other-keys after &key if the user didn't.
+                    (when (and (member "&KEY" params
+                                       :test (lambda (s p)
+                                               (and (symbolp p)
+                                                    (string= s (symbol-name p)))))
+                               (not (member "&ALLOW-OTHER-KEYS" params
+                                            :test (lambda (s p)
+                                                    (and (symbolp p)
+                                                         (string= s (symbol-name p)))))))
+                      (setq params (cons '&allow-other-keys params)))
+                    (setq params (nreverse params))
+                    (setq specs (nreverse specs))
+                    (setq meta-ll (nreverse meta-ll))
+                    `(%defgeneric-method ',gf-name
+                                         ',(if qualifier qualifier nil)
+                                         (list ,@specs)
+                                         (lambda ,params ,@body)
+                                         ',meta-ll)))
+                inline-methods)))
+          `(progn
+             (%defgeneric ',gf-name ',lambda-list
+                          ',(if combination combination nil))
+             ,@(when apo
+                 `((%gf-set-arg-precedence ',gf-name ',apo ',lambda-list)))
+             (defun ,gf-name (&rest ,args-var)
+               (%gf-dispatch ',gf-name ,args-var))
+             ,@method-forms
+             ',gf-name)))))
 
   ;; DEFMETHOD — (defmethod name [qualifier] specialized-lambda-list body...)
   ;; → (%defmethod 'name qualifier '(specializers) (lambda (params) body))
@@ -2765,6 +2864,104 @@
            (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
            (%defmethod ',gf-name ',qualifier (list ,@specs)
                        (lambda ,params ,@body))))))
+
+  ;; DEFINE-METHOD-COMBINATION — (define-method-combination name &rest options)
+  ;; SHORT form: (define-method-combination name :operator op
+  ;;               :identity-with-one-argument b :documentation d)
+  ;;   — args after NAME start with a keyword (or there are none).
+  ;; LONG form:  (define-method-combination name (lambda-list)
+  ;;               ((group-var qualifier-pattern... [:order o] [:required r]
+  ;;                 [:description d]) ...)
+  ;;               [(:arguments ...)] [(:generic-function ...)] [decls] body...)
+  ;;   — first arg after NAME is the combination lambda-list (a list or NIL).
+  ;; Registers via %define-method-combination / %define-method-combination-long
+  ;; (both in the image); %gf-dispatch consults the registry.  Mirrors the
+  ;; SBCL-side rewriter so eval2 reaches the same runtime registry.
+  (mvm-define-macro "DEFINE-METHOD-COMBINATION"
+    (lambda (form)
+      (let* ((mc-name (cadr form))
+             (options (cddr form)))
+        (if (or (null options) (keywordp (car options)))
+            ;; ---- SHORT FORM ----
+            (let ((operator mc-name)
+                  (identity-with-one nil)
+                  (cur options))
+              (loop
+                (when (null cur) (return nil))
+                (let ((key (car cur)) (val (cadr cur)))
+                  (cond
+                    ((eq key :operator) (setq operator val))
+                    ((eq key :identity-with-one-argument)
+                     (setq identity-with-one val))
+                    (t nil)))
+                (setq cur (cddr cur)))
+              `(%define-method-combination ',mc-name ',operator
+                                           ,identity-with-one))
+            ;; ---- LONG FORM ----
+            (let* ((lambda-list (car options))
+                   (group-specs (cadr options))
+                   (body-and-aux (cddr options))
+                   ;; Skip (:arguments ...) / (:generic-function ...) /
+                   ;; (declare ...) at the head; the rest is BODY.
+                   (body (let ((b body-and-aux))
+                           (loop
+                             (when (null b) (return nil))
+                             (unless (and (consp (car b))
+                                          (member (car (car b))
+                                                  '(:arguments :generic-function
+                                                    declare)
+                                                  :test #'eq))
+                               (return nil))
+                             (setq b (cdr b)))
+                           b))
+                   (group-rec-forms nil)
+                   (group-var-bindings nil)
+                   (gi 0))
+              (dolist (spec group-specs)
+                ;; Parse (group-var qual-pattern... [:order o] [:required r]
+                ;;        [:description d]).
+                (let ((group-var (car spec))
+                      (rest (cdr spec))
+                      (patterns nil)
+                      (order-form '':most-specific-first)
+                      (required-form 'nil))
+                  (loop
+                    (when (or (null rest) (keywordp (car rest))) (return nil))
+                    (setq patterns (cons (car rest) patterns))
+                    (setq rest (cdr rest)))
+                  (setq patterns (nreverse patterns))
+                  (loop
+                    (when (null rest) (return nil))
+                    (let ((k (car rest)) (v (cadr rest)))
+                      (cond
+                        ((eq k :order) (setq order-form v))
+                        ((eq k :required) (setq required-form v))
+                        (t nil)))
+                    (setq rest (cddr rest)))
+                  (setq group-rec-forms
+                        (cons `(list ',patterns ,order-form ,required-form)
+                              group-rec-forms))
+                  (setq group-var-bindings
+                        (cons `(,group-var (%dmc-nth %dmc-groups ,gi))
+                              group-var-bindings))
+                  (setq gi (1+ gi))))
+              (setq group-rec-forms (nreverse group-rec-forms))
+              (setq group-var-bindings (nreverse group-var-bindings))
+              `(%define-method-combination-long
+                ',mc-name
+                (function
+                 (lambda (%dmc-applicable %dmc-cargs)
+                   (apply
+                    (function
+                     (lambda ,lambda-list
+                       (let* ((%dmc-group-recs (list ,@group-rec-forms))
+                              (%dmc-groups
+                               (%dmc-partition-groups %dmc-applicable
+                                                      %dmc-group-recs))
+                              ,@group-var-bindings)
+                         ,@(if body body (list nil)))))
+                    %dmc-cargs)))
+                ,(length group-specs)))))))
 
   ;; DEFCLASS — (defclass name (supers...) (slot-specs...) &rest options)
   ;; → %defclass + %register-clos-slot-info (initargs + initform thunks)

@@ -49,12 +49,33 @@
         (global-offset 0)
         (entry nil)
         (rt-table (make-hash-table))
-        (rt-next #x40000000))
+        (rt-next #x40000000)
+        ;; WS3 def persistence: names of top-level user DEFUNs in FORMS.  Each is
+        ;; compiled as a real module function and, after the module builds,
+        ;; installed as a re-entrant interp trampoline in the global function
+        ;; tables — so a LATER (eval2 …) call OR the tree-walker can call it.
+        ;; Without this every (eval2 '(defun f …)) discarded f (closed-world
+        ;; module), so no multi-form program (asdf/load/REPL) could run on eval2.
+        (persist-names (let ((ns nil))
+                         (dolist (f forms)
+                           (when (and (consp f) (symbolp (car f))
+                                      (string-equal (symbol-name (car f)) "DEFUN")
+                                      (symbolp (cadr f)))
+                             (setq ns (cons (string (cadr f)) ns))))
+                         ns)))
     (register-mvm-bootstrap-macros)
     ;; Split: last form is the expression; preceding forms are definitions.
+    ;; A TRAILING defun is moved into the module definitions (so it gets a real
+    ;; module function + offset to install a trampoline for) and the thunk
+    ;; returns its NAME (matching real defun's value), instead of being wrapped
+    ;; as a nested defun that compiles in-module and yields NIL.
     (let* ((rforms (reverse forms))
-           (expr (car rforms))
-           (defs (reverse (cdr rforms)))
+           (last-form (car rforms))
+           (last-defun-p (and (consp last-form) (symbolp (car last-form))
+                              (string-equal (symbol-name (car last-form)) "DEFUN")
+                              (symbolp (cadr last-form))))
+           (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
+           (defs (if last-defun-p forms (reverse (cdr rforms))))
            (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr)))))
       (dolist (f toplevel)
         (let ((result (mvm-compile-toplevel f)))
@@ -145,6 +166,33 @@
                 (when (and (or (search \"$$LAMBDA\" nm) (search \"$$CLOSURE\" nm))
                            (not (eql off 0)))
                   (puthash off lam-offsets t))))
+            ;; WS3 def persistence: install each top-level user DEFUN as a
+            ;; re-entrant interp trampoline in BOTH global function tables —
+            ;; *symbol-function-table* by NAME (the eval2 native-call bridge's
+            ;; %mvm-resolve-runtime-fn key) and *native-sym-function-table* by
+            ;; HASH (symbol-function / funcall key).  The trampoline closes over
+            ;; BC so the module bytecode stays GC-alive; fn-table + lam-offsets
+            ;; are fully built by now; env = NIL (a top-level defun captures
+            ;; nothing).  A later (eval2 …) call OR the tree-walker now resolves f.
+            (when persist-names
+              (dolist (e all-ir)
+                (let ((pn (string (function-info-name (car e)))))
+                  (when (member pn persist-names :test (function string=))
+                    (let ((tramp (%mvm-make-trampoline
+                                   bc fn-table rt-table
+                                   (function-info-bytecode-offset (car e))
+                                   nil lam-offsets)))
+                      ;; puthash signature is (KEY HT VALUE) — store the
+                      ;; trampoline as the VALUE under PN / its name-hash.  (The
+                      ;; earlier `(puthash pn tramp <table>)` had HT and VALUE
+                      ;; swapped, so the closure was treated as the hash table and
+                      ;; nothing was actually stored — every later resolve of PF
+                      ;; returned NIL, so the trampoline never ran.)
+                      (when (boundp (quote *symbol-function-table*))
+                        (puthash pn *symbol-function-table* tramp))
+                      (when (boundp (quote *native-sym-function-table*))
+                        (puthash (compute-name-hash pn)
+                                 *native-sym-function-table* tramp)))))))
             (handler-case (mvm-interpret bc :entry-point entry :function-table fn-table
                                          :runtime-table rt-table :return-raw nil
                                          :lambda-offsets lam-offsets)

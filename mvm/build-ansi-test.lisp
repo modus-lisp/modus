@@ -5182,6 +5182,21 @@
     (write-string-serial \"defcall=\")
     (print-dec (eval2-forms (list (quote (defun sq (x) (* x x))) (quote (sq 7)))))
     (write-char-serial 10)
+    ;; WS3 PERSISTENCE probe: define PF in one eval2 call, then call it from a
+    ;; SEPARATE eval2 call and via the tree-walker.  Both must resolve PF (=36/45)
+    ;; — proving top-level defun persistence (the asdf-gauntlet / flip keystone).
+    (eval2 (quote (defun pf (x) (* x 9))))
+    (write-string-serial \"persist-call=\")
+    (print-dec (handler-case (eval2 (quote (pf 4))) (t (c) -1))) (write-char-serial 10)
+    (write-string-serial \"persist-tw=\")
+    (print-dec (handler-case (funcall (quote pf) 5) (t (c) -1))) (write-char-serial 10)
+    ;; Multi-call persistence: a 3rd, separate eval2 call must still resolve PF.
+    (write-string-serial \"persist-call3=\")
+    (print-dec (handler-case (eval2 (quote (pf 7))) (t (c) -1))) (write-char-serial 10)
+    ;; Forward ref: a SECOND persisted defun (PG) whose body CALLS PF.
+    (eval2 (quote (defun pg (y) (+ (pf y) 1))))
+    (write-string-serial \"persist-fwd=\")
+    (print-dec (handler-case (eval2 (quote (pg 2))) (t (c) -1))) (write-char-serial 10)
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 

@@ -4594,6 +4594,21 @@
                      ~%    ((and (symbolp a) (symbolp b))~
                      ~%     (if (eql a b) t (string= (symbol-name a) (symbol-name b))))~
                      ~%    ((or (symbolp a) (symbolp b)) (eql a b))~
+                     ~%    ;; Plain (non-string) vectors: recurse element-wise with the~
+                     ~%    ;; SAME cross-evaluator symbol-name tolerance the cons case uses.~
+                     ~%    ;; rt-equal compares vector elements with EQL, which is a FALSE~
+                     ~%    ;; divergence for symbol elements (eval re-interns result symbols~
+                     ~%    ;; in a different table slot than eval2) — e.g. nsubstitute-vector~
+                     ~%    ;; returning #(B B B C): identical PRINT, eql-distinct symbols.~
+                     ~%    ((and (vectorp a) (vectorp b)~
+                     ~%          (not (stringp a)) (not (stringp b)))~
+                     ~%     (let ((la (array-length a)) (lb (array-length b)))~
+                     ~%       (if (eql la lb)~
+                     ~%           (let ((i 0) (ok t))~
+                     ~%             (loop (when (>= i la) (return ok))~
+                     ~%               (unless (%e2-eq (aref a i) (aref b i)) (setq ok nil) (return nil))~
+                     ~%               (setq i (+ i 1))))~
+                     ~%           nil)))~
                      ~%    (t (rt-equal a b))))~
                      ~%(defun %e2-show (v)~
                      ~%  (setq *write-object-budget* 60)~

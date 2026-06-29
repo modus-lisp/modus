@@ -132,9 +132,19 @@
             (dolist (e all-ir)
               (aset fn-table i (function-info-bytecode-offset (car e)))
               (setq i (+ i 1))
-              (let ((nm (string (function-info-name (car e)))))
-                (when (or (search \"$$LAMBDA\" nm) (search \"$$CLOSURE\" nm))
-                  (puthash (function-info-bytecode-offset (car e)) lam-offsets t))))
+              (let ((nm (string (function-info-name (car e))))
+                    (off (function-info-bytecode-offset (car e))))
+                ;; NEVER record offset 0: at the native bridge a DATA fixnum 0
+                ;; argument (make-list 0 / member 0 / (- 10 j)=0 in nsubstitute's
+                ;; bounds loops) is indistinguishable from a lambda-at-offset-0,
+                ;; and wrapping it into a #x52 trampoline corrupted the callee
+                ;; (make-list \"non-negative fixnum\", remove returned input
+                ;; unchanged).  %mvm-lambda-offset-p has the matching read-side
+                ;; guard; data-0 priority is correct since the first module
+                ;; function is always a non-lambda (defun / %EVAL2-THUNK).
+                (when (and (or (search \"$$LAMBDA\" nm) (search \"$$CLOSURE\" nm))
+                           (not (eql off 0)))
+                  (puthash off lam-offsets t))))
             (handler-case (mvm-interpret bc :entry-point entry :function-table fn-table
                                          :runtime-table rt-table :return-raw nil
                                          :lambda-offsets lam-offsets)

@@ -306,8 +306,23 @@
    ordinary fixnum DATA argument at the native bridge: a data integer like 0 / 1
    / 2 (loop counters, indices) is never a lambda entry, so it is left alone.
    (The earlier ftab-membership test was unsafe: ftab[0] = 0, so the integer 0
-   collided with the first function's offset and got wrapped, breaking loops.)"
-  (and (integerp n) lam-offsets
+   collided with the first function's offset and got wrapped, breaking loops.)
+
+   N=0 GUARD (WS3, nsubstitute/remove cluster): the comment above CLAIMED offset
+   0 is never a recorded lambda, but empirically it can be — a bridge call with
+   a DATA argument whose VALUE is fixnum 0 (`(make-list 0)`, `(member 0 …)`,
+   `(identity 0)`, and the `(- 10 j)` / `(- j i)` zero results that flow into
+   make-list/make-array in nsubstitute's bounds-loop tests) was wrapped into a
+   #x52 trampoline, so the native callee saw a CLOSURE where it expected the
+   integer 0: make-list → \"size must be a non-negative fixnum\", member/remove →
+   `(eql <trampoline> elt)` never matched (so remove returned its input
+   UNCHANGED), identity → returned the trampoline.  A data fixnum 0 is far more
+   common than a lambda body legitimately at module offset 0, and excluding it is
+   safe: eval2-forms reserves offset 0 for the first named defun / the
+   %EVAL2-THUNK, ordered BEFORE the drained $$LAMBDA / $$CLOSURE bodies (which
+   therefore always get offsets > 0).  eval2-forms also no longer records 0 in
+   lam-offsets; this guard is the matching defense at the read side."
+  (and (integerp n) (not (eql n 0)) lam-offsets
        (gethash n lam-offsets)))
 
 (defun %mvm-wrap-escaping (v bc ftab rt lam-offsets)

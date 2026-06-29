@@ -3417,7 +3417,7 @@
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
        (let ((hash (normalize-name name)))
-         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
          ;; eval2 bridge reads (mvm-nargs) args; a manual :call needs an
          ;; explicit :set-nargs or the bridge pulls a STALE count and the
          ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
@@ -3434,7 +3434,7 @@
        (format t "  WARN: implicit global ~A~%" name)
        (setf (gethash (normalize-name name) *globals*) t)
        (let ((hash (normalize-name name)))
-         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
          (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge nargs
          (emit-ir :call "SYMBOL-VALUE" 1)
          (unless (= dest +vreg-vr+)
@@ -5838,34 +5838,35 @@
           (compile-form `(setf ,(binding-expansion binding) ,val) env dest))))
       ;; Global variable: emit call to set-symbol-value
       ((gethash (normalize-name var) *globals*)
-       (let ((hash (normalize-name var)))
-         ;; Push value, load hash into V0, pop value into V1
-         (emit-ir :push dest)
-         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
-         (emit-ir :pop +vreg-v1+)
-         ;; eval2 bridge needs an explicit :set-nargs (see the SYMBOL-VALUE
-         ;; read site) — otherwise a bare global setq under eval2 passes a
-         ;; stale arg count to native SET-SYMBOL-VALUE and writes nothing /
-         ;; wrong (e.g. native error's (setq *current-condition* c) never
-         ;; landing where eval2's handler-case reads it).  Native ignores
-         ;; nargs → byte-identical for ANSI (gated on *mvm-emit-halves*).
-         (when *mvm-emit-halves* (emit-ir :set-nargs 2))
-         (emit-ir :call "SET-SYMBOL-VALUE" 2)
-         ;; Result is in VR, move back to dest if needed
-         (unless (= dest +vreg-vr+)
-           (emit-ir :mov dest +vreg-vr+))))
+       (%compile-setq-global var dest))
       (t
        ;; Implicit global for setq
        (format t "  WARN: implicit global setq ~A~%" var)
        (setf (gethash (normalize-name var) *globals*) t)
-       (let ((hash (normalize-name var)))
-         (emit-ir :push dest)
-         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
-         (emit-ir :pop +vreg-v1+)
-         (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; eval2 bridge nargs
-         (emit-ir :call "SET-SYMBOL-VALUE" 2)
-         (unless (= dest +vreg-vr+)
-           (emit-ir :mov dest +vreg-vr+)))))))
+       (%compile-setq-global var dest)))))
+
+(defun %compile-setq-global (var dest)
+  "Emit the global-store for (setq VAR <value-already-in-DEST>).  The value
+   was compiled into DEST by compile-setq before the dispatch.  Moves it to V1
+   and the name-hash to V0, then bridges SET-SYMBOL-VALUE.
+
+   Uses :mov (not :push/:pop) to stage V1: under eval2 the manual :push dest /
+   :li V0 / :pop V1 sequence wrote the value to V1 correctly but the global
+   write still no-op'd — the runtime-bridge CALL needs V0/V1 set by plain :mov
+   (the same shape compile-call's arg setup leaves them in) for SET-SYMBOL-VALUE
+   to actually land.  (The WS3 cxr/global cluster: cons.38-53 read *cons-test-4*
+   = NIL because the defvar's setq never wrote.)  Byte-equivalent register
+   end-state on the native build; only the staging opcodes differ."
+  (let ((hash (normalize-name var)))
+    ;; Stage V1 = value FIRST (V1 differs from V0, so this can't clobber the
+    ;; hash we load next).  If dest IS V1 the :mov is a self-move (harmless).
+    (unless (= dest +vreg-v1+)
+      (emit-ir :mov +vreg-v1+ dest))
+    (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
+    (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; eval2 bridge nargs
+    (emit-ir :call "SET-SYMBOL-VALUE" 2)
+    (unless (= dest +vreg-vr+)
+      (emit-ir :mov dest +vreg-vr+))))
 
 ;;; ============================================================
 ;;; Lambda
@@ -12251,7 +12252,19 @@
       ((and allow-key-transform has-key (null optional))
        (let* ((kw-rest (intern (format nil "%KW-REST-~D"
                                         (incf *kw-rest-counter*))
-                               :modus.mvm))
+                               ;; (or (find-package "MODUS.MVM") *package*), NOT
+                               ;; the hardcoded :modus.mvm keyword: in eval2
+                               ;; (in-image self-host) the package table has no
+                               ;; MODUS.MVM, so `(intern name :modus.mvm)`
+                               ;; interned into a NIL package and returned NIL.
+                               ;; A NIL synth &rest catch var made the whole &key
+                               ;; lambda compile to `(lambda (NIL) …)` with the
+                               ;; key bindings referencing NIL — so every &key arg
+                               ;; read its DEFAULT and supplied-p was NIL (the WS3
+                               ;; lambda &key cluster, lambda.34-47).  Same in-image
+                               ;; intern-into-NIL bug already fixed for cell-var-name
+                               ;; / defstruct-intern / setf-place setters.
+                               (or (find-package "MODUS.MVM") *package*)))
               (new-params (append required (list kw-rest)))
               (rest-slot (length required))
               ;; Build let* bindings: for each key, a found-flag, the
@@ -12280,7 +12293,8 @@
                   (found-var (intern (format nil "%KWF-~A-~D"
                                               (symbol-name var)
                                               (incf *kw-rest-counter*))
-                                     :modus.mvm)))
+                                     ;; in-image-safe package (see kw-rest above)
+                                     (or (find-package "MODUS.MVM") *package*))))
              (push (list found-var (list '%key-present-p kw-rest (list 'quote kw))) bindings)
              (push (list var (list 'if found-var
                                      (list '%key-lookup kw-rest (list 'quote kw) nil)

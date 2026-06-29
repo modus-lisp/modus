@@ -3134,6 +3134,20 @@
 ;; so init-forms in unrelated files don't run (many crash the parent).
 (defvar *ansi-file-ranges* nil)
 
+;;; --- WS3 Phase 1: differential gate (eval vs eval2) ---
+;; MODUS_EVAL2_DIFF=1 → ALSO emit, per test, an (id . actual-form) capture into
+;; a separate *e2diff-sources* block and run the tree-walker-vs-eval2 differential
+;; gate (run-real-e2diff) INSTEAD of the normal run-real-ansi-tests.  When the
+;; flag is unset the whole block below is dead/empty and the produced binary is
+;; byte-identical to a normal build (verified flag-off).
+(defvar *eval2-diff-mode*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_EVAL2_DIFF") #-sbcl nil))
+    (and v (plusp (length v)) (not (string= v "0")))))
+;; Accumulated emitted source for the e2diff chunk fns + run-e2diff-FILE fns.
+(defvar *e2diff-sources* "")
+;; Per-file accumulator of (id . actual-form) captured this file; reset per file.
+(defvar *e2diff-forms* nil)
+
 (defun %count-source-deftests (path)
   "Count deftest-family forms in the RAW source text at PATH by scanning
    for an opening paren immediately followed by a deftest-family head.
@@ -3303,6 +3317,8 @@
                          file (length forms) read-deftests raw-deftests
                          (handler-case (format nil "~A" read-err) (error () "?"))))))
             (push (pathname-name file) *ansi-file-names*)
+            ;; WS3 P1: reset the per-file differential capture accumulator.
+            (setf *e2diff-forms* nil)
             ;; Snapshot the test-id counter on entry so we can record the
             ;; file's [first .. last] test-id range after processing.
             (let ((file-first-id (1+ *ansi-test-counter*)))
@@ -3478,6 +3494,33 @@
                                           (hoist-gf-defuns (cdr f)))))))
                          (handler-case (hoist-gf-defuns test-form)
                            (error () nil)))
+                       ;; WS3 Phase 1 differential capture: stash (id . actual)
+                       ;; where ACTUAL = the cooked test-form (the form deftest
+                       ;; evaluates).  Rendered later as (%e2diff ID (quote ...)).
+                       ;; Same unreadable-object filters as test-str — a form
+                       ;; that prints #<FUNCTION ...> can't round-trip through
+                       ;; the in-image reader so it's not capturable.
+                       (when *eval2-diff-mode*
+                         (let ((e2form-str
+                                (handler-case
+                                  (let ((cooked
+                                         (if (%md-contains-array-literal-p test-form)
+                                             (%mdrewrite-array-literals test-form)
+                                             test-form)))
+                                    (format nil "~S" cooked))
+                                  (error () nil))))
+                           (when (and e2form-str
+                                      (not (search "#<FUNCTION" e2form-str))
+                                      (not (search "#<CLASS" e2form-str))
+                                      (not (search "#<BUILT-IN-CLASS" e2form-str))
+                                      (not (search "#<PACKAGE" e2form-str))
+                                      (not (search "#<SB-" e2form-str))
+                                      (not (search "#<STANDARD" e2form-str))
+                                      (not (search "#<STRUCTURE" e2form-str))
+                                      (not (search "#<CLOSURE" e2form-str))
+                                      (not (search "&ENVIRONMENT" e2form-str))
+                                      (not (search "STRUCT-TEST-" e2form-str)))
+                             (push (cons test-id e2form-str) *e2diff-forms*))))
                        (let ((test-str (handler-case
                                          (cond
                                            ((= (length expected) 1)
@@ -3704,6 +3747,15 @@
                 ;; in the file (times.lsp = 0 / 30 historically).  Split
                 ;; into chunks of +chunk-size+ tests each and have
                 ;; run-ansi-FILE call them in sequence.
+                ;;
+                ;; WS3 P1: in diff mode we run ONLY the e2diff runners, so SKIP
+                ;; the normal run-ansi-FILE/chunk emission entirely — the diff
+                ;; image otherwise carries BOTH the run-test thunks AND the
+                ;; (quote FORM) e2diff literals, doubling the corpus footprint
+                ;; and overflowing the fixed 128MB MVM bytecode buffer.  (The
+                ;; companion run-real-ansi-tests dispatcher is likewise skipped
+                ;; below; the driver calls run-real-e2diff instead.)
+                (unless *eval2-diff-mode*
                 (let ((chunk-size 8)
                       (forms (nreverse test-forms))
                       (chunk-num 0)
@@ -3761,7 +3813,51 @@
                     (dolist (c (nreverse chunk-defs))
                       (format out "  (%try-chunk ~S ~D ~D #'run-ansi-~A-chunk-~D)~%"
                               file-name file-hash c file-name c))
-                    (format out ")~%"))))
+                    (format out ")~%"))))  ; close let* + let chunk-size + unless diff-mode
+                ;; WS3 P1 differential gate: emit a parallel run-e2diff-FILE
+                ;; that, after the SAME init-forms as run-ansi-FILE, calls
+                ;; (%e2diff ID '(actual)) for every captured test.  Chunked +
+                ;; %try-chunk-wrapped like the normal run (huge files blow MVM
+                ;; codegen otherwise / a chunk-prologue crash mustn't lose the
+                ;; whole file).  Only emitted under MODUS_EVAL2_DIFF.
+                (when *eval2-diff-mode*
+                  (let ((e2out (make-string-output-stream))
+                        (e2forms (nreverse *e2diff-forms*))  ; (id . form-str)
+                        (e2chunk-size 8)
+                        (e2chunk-num 0)
+                        (e2chunk-defs nil)
+                        (file-name (pathname-name file))
+                        (file-hash (logand (modus.mvm::compute-name-hash
+                                             (string-upcase (pathname-name file)))
+                                           #xFFFFFF)))
+                    ;; Leading newline so this file's block separates from the
+                    ;; preceding *real-ansi-sources* content (no separator in
+                    ;; *full-source*, keeping flag-off byte-identical).
+                    (format e2out "~%;; === e2diff ~A ===~%" file-name)
+                    (let ((remaining e2forms))
+                      (loop while remaining do
+                        (incf e2chunk-num)
+                        (let ((this-chunk (subseq remaining 0
+                                                  (min e2chunk-size (length remaining)))))
+                          (setq remaining (subseq remaining (length this-chunk)))
+                          (push e2chunk-num e2chunk-defs)
+                          (format e2out "(defun run-e2diff-~A-chunk-~D ()~%"
+                                  file-name e2chunk-num)
+                          (dolist (pair this-chunk)
+                            (format e2out
+                                    "  (handler-case (%e2diff ~D (quote ~A)) (t (c) (%e2-chunk-fail ~D c)))~%"
+                                    (car pair) (cdr pair) (car pair)))
+                          (format e2out ")~%"))))
+                    (format e2out "(defun run-e2diff-~A ()~%" file-name)
+                    (dolist (s init-list)
+                      (format e2out "  (handler-case ~A (t (c) nil))~%" s))
+                    (dolist (c (nreverse e2chunk-defs))
+                      (format e2out "  (%try-chunk ~S ~D ~D #'run-e2diff-~A-chunk-~D)~%"
+                              file-name file-hash c file-name c))
+                    (format e2out ")~%")
+                    (setf *e2diff-sources*
+                          (concatenate 'string *e2diff-sources*
+                                       (get-output-stream-string e2out))))))
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
                                  (get-output-stream-string out)))
@@ -4471,6 +4567,73 @@
                      ~%                  ;; Child exited cleanly with progress — normal end.~
                      ~%                  (t (setq done t))))))))~
                      ~%    (setq *skip-below* saved-skip)))~%")
+                   ;; WS3 P1 differential-gate runtime helpers — only under the
+                   ;; flag, so flag-off *real-ansi-sources* (and thus the binary)
+                   ;; is byte-identical to baseline.  These call eval (tree-walker)
+                   ;; and eval2 (interpreter) and emit the inventory markers.
+                   (if *eval2-diff-mode*
+                       (format nil "~
+                     ~%;; ===== WS3 Phase 1: differential gate (eval vs eval2) =====~
+                     ~%(defvar *e2-tw-threw* (list :tw-threw))~
+                     ~%(defvar *e2-e2-threw* (list :e2-threw))~
+                     ~%;; Structural compare TOLERANT of cross-evaluator symbol~
+                     ~%;; identity: eval and eval2 re-intern result symbols in~
+                     ~%;; different table slots, so a raw EQL on `(A . B)` reports~
+                     ~%;; a FALSE divergence even when both trees are identical.~
+                     ~%;; So: symbols compared by SYMBOL-NAME, numbers by EQL,~
+                     ~%;; strings by STRING=, conses recurse, and everything else~
+                     ~%;; (floats / arrays / fill-pointer & MDA wrappers / chars)~
+                     ~%;; delegates to the harness's robust rt-equal.~
+                     ~%(defun %e2-eq (a b)~
+                     ~%  (cond~
+                     ~%    ((and (numberp a) (numberp b)) (eql a b))~
+                     ~%    ((and (stringp a) (stringp b)) (string= a b))~
+                     ~%    ((and (consp a) (consp b))~
+                     ~%     (and (%e2-eq (car a) (car b)) (%e2-eq (cdr a) (cdr b))))~
+                     ~%    ((or (consp a) (consp b)) nil)~
+                     ~%    ((and (symbolp a) (symbolp b))~
+                     ~%     (if (eql a b) t (string= (symbol-name a) (symbol-name b))))~
+                     ~%    ((or (symbolp a) (symbolp b)) (eql a b))~
+                     ~%    (t (rt-equal a b))))~
+                     ~%(defun %e2-show (v)~
+                     ~%  (setq *write-object-budget* 60)~
+                     ~%  (handler-case (write-object v) (t (c) (write-string-serial \"?\"))))~
+                     ~%;; Run FORM through BOTH evaluators; classify; one line out.~
+                     ~%;; E2-UNSUP=eval2 signalled.  TW-THREW (tree-walker errored)~
+                     ~%;; is SKIPPED (not an eval2 gap).  E2-DIVERGE=both returned~
+                     ~%;; but values differ.  P-DIFF=agree (for the agree count).~
+                     ~%(defun %e2diff (id form)~
+                     ~%  (when (< id *skip-below*) (return-from %e2diff nil))~
+                     ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*))~
+                     ~%    (return-from %e2diff nil))~
+                     ~%  (%fork-set-last-id id)~
+                     ~%  (%clear-fault-slots)~
+                     ~%  (%reset-signal-state)~
+                     ~%  (let ((tw (handler-case (eval form) (t (c) *e2-tw-threw*)))~
+                     ~%        (e2 (handler-case (eval2 form) (t (c) *e2-e2-threw*))))~
+                     ~%    (cond~
+                     ~%      ((eq e2 *e2-e2-threw*)~
+                     ~%       (cond~
+                     ~%         ((eq tw *e2-tw-threw*) nil)~
+                     ~%         (t (write-char-serial 10)~
+                     ~%            (write-string-serial \"E2-UNSUP \") (print-dec id)~
+                     ~%            (write-char-serial 10))))~
+                     ~%      ((eq tw *e2-tw-threw*) nil)~
+                     ~%      ((%e2-eq e2 tw)~
+                     ~%       (write-char-serial 10)~
+                     ~%       (write-string-serial \"P-DIFF \") (print-dec id)~
+                     ~%       (write-char-serial 10))~
+                     ~%      (t~
+                     ~%       (write-char-serial 10)~
+                     ~%       (write-string-serial \"E2-DIVERGE \") (print-dec id)~
+                     ~%       (write-string-serial \" e2=\") (%e2-show e2)~
+                     ~%       (write-string-serial \" tw=\") (%e2-show tw)~
+                     ~%       (write-char-serial 10)))))~
+                     ~%(defun %e2-chunk-fail (id c)~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-string-serial \"E2-UNSUP \") (print-dec id)~
+                     ~%  (write-char-serial 10) nil)~%")
+                       "")
                    (with-output-to-string (s)
                      ;; Helper: return T iff the active shard range [skip..run-only)
                      ;; overlaps [first..last]. Run-only=0 means "no upper bound".
@@ -4479,6 +4642,14 @@
                      (format s "      (if (< last *skip-below*) nil (if (>= first *run-only-below*) nil t))~%")
                      (format s "      t))~%")
                      (format s "~%(defun run-real-ansi-tests ()~%")
+                     ;; WS3 P1: in diff mode the normal run-ansi-FILE runners
+                     ;; aren't emitted, so this dispatcher would reference
+                     ;; undefined fns.  Emit a NO-OP body — the driver calls
+                     ;; run-real-e2diff instead.  The normal-mode body (Phase 1
+                     ;; + Phase 2) is generated only when NOT in diff mode.
+                     (if *eval2-diff-mode*
+                         (format s "  nil~%")
+                       (progn
                      ;; Phase 1 (PARENT): run init-forms for the defclass-*
                      ;; files so *clos-classes* gets the cross-referenced
                      ;; class definitions (class-01, class-02, etc.) before
@@ -4518,8 +4689,39 @@
                                       name first-id last-id name))
                              (t
                               (format s "  (fork-file ~S 0 0 (lambda () (run-ansi-~A)))~%"
-                                      name name))))))
-                     (format s ")~%"))))
+                                      name name))))))))  ; close format+cond+let*+dolist+let by-name + progn + if diff-mode
+                     (format s ")~%")
+                     ;; WS3 P1: parallel differential dispatcher.  Same per-file
+                     ;; fork + range-gating as run-real-ansi-tests, but forks
+                     ;; run-e2diff-FILE (which itself runs the file's init forms
+                     ;; then the %e2diff chunks).  Only emitted under the flag —
+                     ;; the run-e2diff-* fns don't exist otherwise.
+                     (when *eval2-diff-mode*
+                       (format s "~%(defun run-real-e2diff ()~%")
+                       ;; Same conservative parent-side init (defclass-* +
+                       ;; dgmc-aux) as run-real-ansi-tests so cross-file class
+                       ;; refs resolve.
+                       (dolist (name *ansi-file-names*)
+                         (when (or (and (>= (length name) 9)
+                                        (string= (subseq name 0 9) "defclass-"))
+                                   (string= name "defgeneric-method-combination-aux"))
+                           (format s "  (handler-case (run-init-~A) (t (c) nil))~%" name)))
+                       (let ((by-name nil))
+                         (dolist (entry *ansi-file-ranges*)
+                           (push entry by-name))
+                         (dolist (name *ansi-file-names*)
+                           (let* ((entry (find name by-name :test #'string= :key #'car))
+                                  (first-id (if entry (second entry) nil))
+                                  (last-id  (if entry (third  entry) nil)))
+                             (cond
+                               ((and first-id last-id)
+                                (format s "  (when (%ansi-file-in-range ~D ~D)~%" first-id last-id)
+                                (format s "    (fork-file ~S ~D ~D (lambda () (run-e2diff-~A))))~%"
+                                        name first-id last-id name))
+                               (t
+                                (format s "  (fork-file ~S 0 0 (lambda () (run-e2diff-~A)))~%"
+                                        name name))))))
+                       (format s ")~%")))))
 
 ;; Dump file → id-range map to /tmp so post-mortem analysis of a test
 ;; run can map T:/FAIL ids back to source files. Small side effect;
@@ -5152,6 +5354,13 @@
     ;; 6. Real ANSI test files
     *real-ansi-sources*
     (string #\Newline)
+    ;; 6a2. WS3 P1 differential per-file runners (run-e2diff-FILE + chunks).
+    ;;      "" unless MODUS_EVAL2_DIFF — flag-off adds ZERO bytes (the source
+    ;;      already begins with its own newline per file, so no separator is
+    ;;      needed here).  Calls into %e2diff / %try-chunk / run-init-FILE (all
+    ;;      in *real-ansi-sources*); MVM resolves calls by name so definition
+    ;;      order is irrelevant.
+    *e2diff-sources*
     ;; 6b. Auto-generated %init-test-defs: register test-source defuns
     ;;     in the SFT (fboundp/symbol-function) and test-source defmacro
     ;;     name-hashes in *%extra-macro-names* (macro-function).
@@ -5160,15 +5369,35 @@
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count
     ;; so kernel-main can print EXP:N before running tests.
-    (let* ((tag "~~ANSI-EXP-TOTAL~~")
-           (tag-pos (search tag *driver-source*))
+    ;; WS3 P1: under MODUS_EVAL2_DIFF, redirect the production test driver call
+    ;; (run-real-ansi-tests) to the differential gate (run-real-e2diff) — same
+    ;; per-file fork + range-gating, but emits E2-DIVERGE/E2-UNSUP/P-DIFF.  A
+    ;; plain string swap so the flag-off driver is byte-identical.
+    (flet ((str-sub (needle replacement str)
+             (let ((p (search needle str)))
+               (if p
+                   (concatenate 'string
+                                (subseq str 0 p) replacement
+                                (subseq str (+ p (length needle))))
+                   str))))
+    (let* ((drv (if *eval2-diff-mode*
+                    ;; Redirect the production driver to the differential gate:
+                    ;; swap run-real-ansi-tests→run-real-e2diff AND skip the slow
+                    ;; eval-heavy custom probe suite (run-all-tests) which would
+                    ;; otherwise dominate wall time before the ANSI corpus runs.
+                    (str-sub "(run-all-tests)" ""
+                      (str-sub "(run-real-ansi-tests)" "(run-real-e2diff)"
+                               *driver-source*))
+                    *driver-source*))
+           (tag "~~ANSI-EXP-TOTAL~~")
+           (tag-pos (search tag drv))
            (count (- *ansi-test-counter* 10000)))
       (if tag-pos
           (concatenate 'string
-                       (subseq *driver-source* 0 tag-pos)
+                       (subseq drv 0 tag-pos)
                        (princ-to-string count)
-                       (subseq *driver-source* (+ tag-pos (length tag))))
-          *driver-source*))))
+                       (subseq drv (+ tag-pos (length tag))))
+          drv)))))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 (format t "  ANSI tests: ~D~%" (- *ansi-test-counter* 10000))

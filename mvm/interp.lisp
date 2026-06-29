@@ -339,6 +339,51 @@
     (t v)))
 
 ;;; ============================================================
+;;; Native-call argument collection (register file + overflow stack)
+;;; ============================================================
+
+(defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets)
+  "Collect the NARGS arguments for a native bridge call, in order
+   (arg0 arg1 … arg{nargs-1}), wrapping any escaping eval2 lambda value.
+
+   The MVM calling convention places the FIRST 4 args (compiler.lisp's
+   +max-reg-args+ — hardcoded 4 here because that constant is defined in
+   compiler.lisp, which loads AFTER interp.lisp) in registers V0..V3.  Args
+   with index >= 4 are OVERFLOW: compile-call / compile-funcall :push them
+   onto the mvm-stack (top of stack = arg4, next below = arg5, …) just
+   before the :call / :call-indirect.  The original bridge read EVERY arg
+   from regs[0..nargs-1], so for nargs>4 it read STALE register slots for
+   args 4+ — every native fn bridge-called from eval2 with >=5 args got
+   garbage for its 5th+ argument (the assoc/member/adjoin/remove/… clusters:
+   the keyword validators saw garbage where :allow-other-keys / :test / :key
+   should be → spurious PROGRAM-ERROR returned as a value).  Read the
+   overflow args from the mvm-stack here (non-destructively — the caller's
+   post-call POP cleanup still drains them)."
+  (let ((args nil))
+    ;; Prepend the overflow args FIRST in reverse (arg{nargs-1} … arg4) so the
+    ;; final list begins arg0..arg3 (added below) then arg4..arg{nargs-1}.
+    (when (> nargs 4)
+      (let ((over (- nargs 4))
+            (rev nil)
+            (s (mvm-stack state)))
+        ;; Walk the top OVER stack cells: car=arg4, cadr=arg5, …  Collect into
+        ;; REV so rev = (arg{nargs-1} … arg4).
+        (dotimes (i over)
+          (setq rev (cons (car s) rev))
+          (setq s (cdr s)))
+        ;; rev = (arg{nargs-1} … arg4); prepend each (wrapped) → args now =
+        ;; (arg4 … arg{nargs-1}).
+        (dolist (v rev)
+          (push (%mvm-wrap-escaping v bc ftab rt lam-offsets) args))))
+    ;; Prepend the register args (indices min(nargs,4)-1 … 0) so they lead.
+    (let ((i (- (if (> nargs 4) 4 nargs) 1)))
+      (loop
+        (when (< i 0) (return))
+        (push (%mvm-wrap-escaping (svref regs i) bc ftab rt lam-offsets) args)
+        (setq i (- i 1))))
+    args))
+
+;;; ============================================================
 ;;; The Main Interpreter
 ;;; ============================================================
 
@@ -1111,20 +1156,21 @@
                         (fn (%mvm-resolve-runtime-fn name))
                         (nargs (mvm-nargs state)))
                    (if fn
-                       (let ((args nil))
-                         ;; regs hold real VALUES — pass them directly (the old
-                         ;; %word->val∘reg-get round-trip overflowed for a
-                         ;; boundary-fixnum arg/result).  Wrap any escaping eval2
-                         ;; lambda value (a #x52 closure-over-offset, or a bare
-                         ;; in-module offset) in a re-entrant trampoline so a
-                         ;; NATIVE higher-order callee (mapcar/reduce/…) can
-                         ;; funcall it — %mvm-wrap-escaping passes everything else
-                         ;; through unchanged.
-                         (dotimes (i nargs)
-                           (push (%mvm-wrap-escaping (svref regs (- nargs 1 i))
-                                                     bc ftab runtime-table
-                                                     lambda-offsets)
-                                 args))
+                       (let ((args
+                              ;; regs hold real VALUES — pass them directly (the
+                              ;; old %word->val∘reg-get round-trip overflowed for
+                              ;; a boundary-fixnum arg/result).  %mvm-collect-call-
+                              ;; args reads args 0..3 from V0..V3 and args 4+ from
+                              ;; the mvm-stack (overflow), wrapping any escaping
+                              ;; eval2 lambda value (a #x52 closure-over-offset or
+                              ;; a bare in-module offset) in a re-entrant
+                              ;; trampoline so a NATIVE higher-order callee
+                              ;; (mapcar/reduce/…) can funcall it.  Pre-fix this
+                              ;; read regs[0..nargs-1] only, so a >4-arg native
+                              ;; call got garbage for its 5th+ arg.
+                              (%mvm-collect-call-args state regs nargs
+                                                      bc ftab runtime-table
+                                                      lambda-offsets)))
                          ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
                          ;; multi-valued fns (floor/truncate/round/rem returning a
                          ;; quotient AND remainder) write their secondaries to the
@@ -1224,17 +1270,17 @@
                  ;; store the primary result in VR; do NOT push a return frame
                  ;; (the call completes natively, control returns inline).
                  ((functionp target)
-                  (let ((nargs (mvm-nargs state))
-                        (args nil))
-                    ;; Wrap any escaping eval2 lambda arg in a trampoline (see
-                    ;; op-CALL's bridge) so a native HOF reached via funcall/
-                    ;; apply (e.g. (apply #'mapcar (list lambda list))) can
-                    ;; funcall it.
-                    (dotimes (i nargs)
-                      (push (%mvm-wrap-escaping (svref regs (- nargs 1 i))
-                                                bc ftab runtime-table
-                                                lambda-offsets)
-                            args))
+                  (let* ((nargs (mvm-nargs state))
+                         ;; Read args 0..3 from V0..V3 and args 4+ from the
+                         ;; mvm-stack overflow (see op-CALL's bridge + %mvm-
+                         ;; collect-call-args).  Wraps any escaping eval2 lambda
+                         ;; arg in a trampoline so a native HOF reached via
+                         ;; funcall/apply (e.g. (apply #'mapcar (list lambda
+                         ;; list))) can funcall it.  Pre-fix this read
+                         ;; regs[0..nargs-1] only → garbage for the 5th+ arg.
+                         (args (%mvm-collect-call-args state regs nargs
+                                                       bc ftab runtime-table
+                                                       lambda-offsets)))
                     (setf (svref regs +vreg-vr+) (apply target args))
                     (setf pc npc)))
                  (t

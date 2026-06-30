@@ -5124,22 +5124,56 @@
    names to watch for."
   (cond
     ((not (consp form)) nil)
-    ;; (setq var val), (setf var val), (incf var …), (decf var …),
-    ;; (push x var), (pop var), (pushnew x var) — all mutate `var`.
-    ;; Macro expansion happens AFTER cell-rewrite, so we have to spot
-    ;; these by source-form name here.  Push/pop are the common
-    ;; pattern in the map-into / mapcar-with-side-effects tests.
+    ;; (setq p1 v1 p2 v2 …), (setf p1 v1 p2 v2 …), (psetq …), (psetf …) —
+    ;; MULTI-PLACE assignment.  Each EVEN-positioned arg (0th, 2nd, …, counting
+    ;; from the first arg after the op) is a place; every one of them mutates a
+    ;; var.  The old code only inspected (cadr form) — the FIRST place — so
+    ;; `(setf a x b y)` boxed only `a`, leaving `b` captured BY VALUE in any
+    ;; enclosing closure.  An unboxed captured var is copied by value into each
+    ;; closure's env-list, so `b`'s mutation became invisible to sibling
+    ;; closures / initform thunks (the shared-initialize eval2 divergence;
+    ;; the tree-walker uses real shared frames so it didn't manifest there).
+    ;; Scan ALL places, and recurse into ALL value forms (and into non-symbol
+    ;; places, which may contain nested mutating subforms).
     ((and (consp form) (consp (cdr form))
           (let ((op (car form)))
             (or (and (symbolp op)
                      (or (string= (symbol-name op) "SETQ")
                          (string= (symbol-name op) "SETF")
-                         (string= (symbol-name op) "INCF")
-                         (string= (symbol-name op) "DECF")
-                         (string= (symbol-name op) "PUSH")
-                         (string= (symbol-name op) "POP")
-                         (string= (symbol-name op) "PUSHNEW")))
+                         (string= (symbol-name op) "PSETQ")
+                         (string= (symbol-name op) "PSETF")))
                 (and (integerp op) (= op 565254038635891948)))))  ; setq hash
+     (let ((args (cdr form))
+           (result nil)
+           (i 0))
+       (loop while (consp args) do
+         (let ((arg (car args)))
+           (if (evenp i)
+               ;; place position
+               (cond
+                 ((and (symbolp arg) (member arg bound-vars :test #'name-equal))
+                  (setq result (adjoin arg result :test #'name-equal)))
+                 (t ;; non-symbol place — recurse for nested mutations
+                  (dolist (v (collect-setq-vars-in-body arg bound-vars))
+                    (setq result (adjoin v result :test #'name-equal)))))
+               ;; value position — recurse
+               (dolist (v (collect-setq-vars-in-body arg bound-vars))
+                 (setq result (adjoin v result :test #'name-equal)))))
+         (setq i (+ i 1))
+         (setq args (cdr args)))
+       result))
+    ;; (incf var …), (decf var …), (push x var), (pop var), (pushnew x var)
+    ;; — single-place mutations.  Macro expansion happens AFTER cell-rewrite,
+    ;; so we have to spot these by source-form name here.  Push/pop are the
+    ;; common pattern in the map-into / mapcar-with-side-effects tests.
+    ((and (consp form) (consp (cdr form))
+          (let ((op (car form)))
+            (and (symbolp op)
+                 (or (string= (symbol-name op) "INCF")
+                     (string= (symbol-name op) "DECF")
+                     (string= (symbol-name op) "PUSH")
+                     (string= (symbol-name op) "POP")
+                     (string= (symbol-name op) "PUSHNEW")))))
      (let* ((op (car form))
             ;; PUSH and PUSHNEW: var is 2nd cdr-arg, not 1st (push expects
             ;; (push value place); pop is (pop place)).
@@ -5424,15 +5458,67 @@
     (t
      (let ((op (car form)))
        (cond
-         ;; (setq var expr) — if var is boxed, use setcar
+         ;; (psetq p1 v1 …) / (psetf p1 v1 …) — PARALLEL multi-place: all
+         ;; values are evaluated BEFORE any assignment.  We added these to the
+         ;; boxed-var detector, so they must be rewritten here too or the
+         ;; generic recursion would mangle a boxed place into the illegal form
+         ;; (psetq (car %CELL-V) …).  Bind every rewritten value to a temp in a
+         ;; LET (parallel evaluation), then assign each place from its temp —
+         ;; boxed places via set-car, others via a single-pair setq/setf.
+         ((or (and (symbolp op) (string= (symbol-name op) "PSETQ"))
+              (and (symbolp op) (string= (symbol-name op) "PSETF")))
+          (let* ((psetf-p (string= (symbol-name op) "PSETF"))
+                 (args (cdr form))
+                 (lets nil)
+                 (sets nil))
+            (loop while (consp args) do
+              (let ((place (car args))
+                    (val   (cadr args))
+                    (tmp   (gensym "PSET-TMP")))
+                (push `(,tmp ,(cell-rewrite-form val boxed-vars lambda-params)) lets)
+                (push
+                 (if (and (symbolp place) (member place boxed-vars :test #'name-equal))
+                     `(set-car ,(cell-var-name place) ,tmp)
+                     (if psetf-p
+                         `(setf ,(cell-rewrite-form place boxed-vars lambda-params) ,tmp)
+                         `(setq ,place ,tmp)))
+                 sets))
+              (setq args (cddr args)))
+            `(let ,(nreverse lets) ,@(nreverse sets) nil)))
+         ;; (setq p1 v1 p2 v2 …) / (setf p1 v1 p2 v2 …) — MULTI-PLACE.  Each
+         ;; place→value pair is rewritten independently: a boxed-symbol place
+         ;; becomes (set-car %CELL-V <rewritten-val>); any other place stays a
+         ;; single-pair (setq var val) / (setf place val) with both sides
+         ;; rewritten.  The OLD SETQ handler took only (cadr)/(caddr) — for a
+         ;; multi-pair setq it silently DROPPED every pair after the first, and
+         ;; there was NO setf handler at all so a multi-place setf's later boxed
+         ;; places were never converted to set-car (they read/wrote the stale
+         ;; by-value capture).  Emitting a PROGN of single-pair forms preserves
+         ;; left-to-right SETQ/SETF evaluation order.
          ((or (and (symbolp op) (string= (symbol-name op) "SETQ"))
-              (and (integerp op) (= op 565254038635891948)))
-          (let ((var (cadr form))
-                (val (caddr form)))
-            (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
-                `(set-car ,(cell-var-name var)
-                         ,(cell-rewrite-form val boxed-vars lambda-params))
-                `(setq ,var ,(cell-rewrite-form val boxed-vars lambda-params)))))
+              (and (integerp op) (= op 565254038635891948))
+              (and (symbolp op) (string= (symbol-name op) "SETF")))
+          (let* ((setf-p (and (symbolp op) (string= (symbol-name op) "SETF")))
+                 (args (cdr form))
+                 (pairs nil))
+            (loop while (consp args) do
+              (let ((place (car args))
+                    (val   (cadr args)))
+                (push
+                 (if (and (symbolp place) (member place boxed-vars :test #'name-equal))
+                     `(set-car ,(cell-var-name place)
+                               ,(cell-rewrite-form val boxed-vars lambda-params))
+                     (if setf-p
+                         `(setf ,(cell-rewrite-form place boxed-vars lambda-params)
+                                ,(cell-rewrite-form val boxed-vars lambda-params))
+                         `(setq ,place
+                                ,(cell-rewrite-form val boxed-vars lambda-params))))
+                 pairs))
+              (setq args (cddr args)))
+            (setq pairs (nreverse pairs))
+            (cond ((null pairs) nil)
+                  ((null (cdr pairs)) (car pairs))
+                  (t `(progn ,@pairs)))))
          ;; (incf var delta) — if var is boxed, rewrite to setcar + car + +
          ((and (symbolp op) (string= (symbol-name op) "INCF"))
           (let ((var (cadr form))

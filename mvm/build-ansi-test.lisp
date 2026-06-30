@@ -102,6 +102,34 @@
 (defun %lit-bb-sign (value) (%bb-sign value))
 (defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
 (defun %lit-bb-limb (value k) (%bb-limb value k))
+;; In-image override of %GLOBAL-NAME-KEY (the SYMBOL-VALUE / SET-SYMBOL-VALUE
+;; alist key the eval2 compiler emits for a GLOBAL variable read/write).  The
+;; host/native version is NORMALIZE-NAME = compute-name-hash(symbol-name sym).
+;; In the image, symbol-name reverse-resolves a native #x50/#x53 sym via the
+;; build-generated *sym-name-table*, which only covers SCANNED sources.  A
+;; symbol from an UNSCANNED ANSI test dir (e.g. *cons-test-4* from cons/cxr.lsp)
+;; has no reverse entry, so symbol-name returns \"\" and compute-name-hash(\"\")
+;; is a CONSTANT wrong key — eval2's global read then missed the store (keyed
+;; by the symbol's REAL reader/setq-assigned hash) and returned NIL, so the cxr
+;; tests cons.38-53 signalled inside CAAAAR..CDDDDR (E2-UNSUP) where the tree-
+;; walker (which keys symbol-value by the symbol's stored hash slot) returned
+;; the value.  Read the symbol object's stored hash (slot 0) directly here --
+;; authoritative and always present.  SCOPE: global var read/write key ONLY;
+;; compile-quote symbol interning still uses NORMALIZE-NAME, so quoted-symbol
+;; identity (and the type-name registry it feeds) is untouched.
+(defun %global-name-key (sym)
+  (cond
+    ((integerp sym) sym)
+    ((symbolp sym)
+     (let ((h (cond
+                ((null sym) nil) ((eq sym t) nil)
+                ((fixnump sym) nil) ((characterp sym) nil)
+                ((stringp sym) nil) ((consp sym) nil)
+                (t (let ((st (obj-subtag sym)))
+                     (if (or (= st 80) (= st 83)) (aref sym 0) nil))))))
+       (if h h (normalize-name sym))))
+    ((stringp sym) (compute-name-hash sym))
+    (t 0)))
 ")
 ;; Generated boot-time populator for *opcode-table* (the host *opcode-table*
 ;; is populated when mvm.lisp/compiler.lisp load host-side for macro scanning).

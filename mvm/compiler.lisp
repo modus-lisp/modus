@@ -930,6 +930,23 @@
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
 
+(defun %global-name-key (sym)
+  "Name-hash KEY used for the runtime SYMBOL-VALUE / SET-SYMBOL-VALUE alist
+   (keyed at #x10000080).  Identical to NORMALIZE-NAME on the host (and for
+   the native build, where *mvm-emit-halves* is NIL and this is byte-for-byte
+   NORMALIZE-NAME).  The in-image eval2 build OVERRIDES this (see
+   build-ansi-test.lisp's stage-2 block) to read a native symbol's STORED
+   hash slot directly: a symbol whose name isn't in the build's reverse
+   *sym-name-table* (e.g. *cons-test-4* from the unscanned cons/ test dir)
+   has SYMBOL-NAME = \"\", so NORMALIZE-NAME would compute compute-name-hash(\"\")
+   — a constant WRONG key that misses the store (keyed by the symbol's real
+   reader/setq-assigned hash).  That made eval2's global READ return NIL where
+   the tree-walker (which keys symbol-value by the stored hash) returned the
+   value — the WS3 cxr/global cluster (cons.38-53).  Scoped to the GLOBAL
+   variable read/write key only (NOT compile-quote symbol interning) so it
+   can't perturb quoted-symbol identity elsewhere."
+  (normalize-name sym))
+
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -3443,7 +3460,7 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
-       (let ((hash (normalize-name name)))
+       (let ((hash (%global-name-key name)))
          (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
          ;; eval2 bridge reads (mvm-nargs) args; a manual :call needs an
          ;; explicit :set-nargs or the bridge pulls a STALE count and the
@@ -3460,7 +3477,7 @@
        ;; Implicit global — treat as dynamic variable (auto-register)
        (format t "  WARN: implicit global ~A~%" name)
        (setf (gethash (normalize-name name) *globals*) t)
-       (let ((hash (normalize-name name)))
+       (let ((hash (%global-name-key name)))
          (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
          (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge nargs
          (emit-ir :call "SYMBOL-VALUE" 1)
@@ -5884,7 +5901,7 @@
    to actually land.  (The WS3 cxr/global cluster: cons.38-53 read *cons-test-4*
    = NIL because the defvar's setq never wrote.)  Byte-equivalent register
    end-state on the native build; only the staging opcodes differ."
-  (let ((hash (normalize-name var)))
+  (let ((hash (%global-name-key var)))
     ;; Stage V1 = value FIRST (V1 differs from V0, so this can't clobber the
     ;; hash we load next).  If dest IS V1 the :mov is a self-move (harmless).
     (unless (= dest +vreg-v1+)

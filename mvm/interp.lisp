@@ -556,6 +556,36 @@
                 (when (mvm-handlers state)
                   (pop (mvm-handlers state)))
                 (setf pc npc))
+               ;; OVERFLOW-ARG COPY (#x0530): the &rest / &key prologue's
+               ;; counterpart of the native trap that copies args 4..nargs-1
+               ;; from the caller's stack into the callee's local frame slots
+               ;; 4..nargs-1, so the rest-prologue cond ladder can stack-load
+               ;; them by the same index it uses for args 0..3.  On native this
+               ;; is the x64 trap 0x0530; in the interpreter the overflow args
+               ;; live on the mvm-stack (top = arg4, next = arg5, …, exactly as
+               ;; %mvm-collect-call-args reads them) and the local frame is the
+               ;; VFP simple-vector.  Without this, a &rest/&key lambda CALLED
+               ;; WITH >4 ARGS built its rest list from un-spilled (zero/stale)
+               ;; frame slots 4+, so the 5th+ keyword/value was lost — the WS3
+               ;; eval2 lambda &key cluster (lambda.33/35/36/44-49: any >4-arg
+               ;; &key call returned NIL / spurious "unknown keyword" for the
+               ;; args past the register window).  The copy is non-destructive
+               ;; (the caller's post-call POP cleanup still drains the stack).
+               ((= code #x0530)
+                (let* ((nargs (mvm-nargs state))
+                       (vfp (svref regs +vreg-vfp+))
+                       ;; Cap at 32 total args — matches emit-rest-prologue's
+                       ;; ladder (req+32) and the native trap's bound.
+                       (top (if (> nargs 32) 32 nargs))
+                       (s (mvm-stack state))
+                       (i 4))
+                  (loop
+                    (when (or (>= i top) (null s)) (return))
+                    ;; mvm-stack top = arg4; walk down for arg5, arg6, …
+                    (%obj-elt-set vfp i (car s))
+                    (setq s (cdr s))
+                    (setq i (1+ i))))
+                (setf pc npc))
                ((>= code #x100)
                 ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
                 (setf pc npc))

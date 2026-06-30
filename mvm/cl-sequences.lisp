@@ -1893,6 +1893,19 @@
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
   (when (or (%clos-class-p type) (%class-proxy-p type))
     (setq type (class-name type)))
+  ;; SIZE must be a non-negative integer (CLHS: make-sequence size = "a
+  ;; non-negative integer").  Validate before any length comparison or
+  ;; element-filling loop.  This also guards the eval2 / compiled-call path:
+  ;; when make-sequence is called with the SIZE argument missing (e.g. the
+  ;; arity-error test (make-sequence 'list)), the compiled-call convention
+  ;; leaves a garbage value in the SIZE slot; without this check the
+  ;; list/vector fill loops `(loop (when (= i size) ...) ...)` never reach
+  ;; their bound and spin forever.  Signaling here makes the missing-arg case
+  ;; raise a (sub-)error that handler-case/signals-error catches — matching
+  ;; the tree-walker's program-error — instead of hanging.
+  (unless (and (integerp size) (>= size 0))
+    (%signal-type-error)
+    (return-from make-sequence nil))
   (let ((init nil) (a args)
         (head (if (consp type) (car type) type)))
     ;; Pinned-length check: a (VECTOR ELT-TYPE N) / (STRING N) etc. that

@@ -606,12 +606,22 @@
   class-name)
 
 (defun %class-slots-for (class-name)
-  "Return list of class-allocated slot names for CLASS-NAME (no CPL walk)."
+  "Return list of class-allocated slot names for CLASS-NAME (no CPL walk).
+   TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
+   byte-identical), name-hash fallback for the eval2 class-name boundary."
   (let ((cur *clos-class-slots*))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
-      (setq cur (cdr cur)))))
+      (when (eq (car (car cur)) class-name)
+        (return-from %class-slots-for (cdr (car cur))))
+      (setq cur (cdr cur))))
+  (let ((cur *clos-class-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq (car (car cur)) class-name)
+        (return-from %class-slots-for (cdr (car cur))))
+      (setq cur (cdr cur))))
+  nil)
 
 ;; Per-class directly-declared-slot-names registry: alist
 ;;   (class-name . direct-slot-names).
@@ -635,12 +645,22 @@
   class-name)
 
 (defun %direct-slots-for (class-name)
-  "Return list of direct-slot-names for CLASS-NAME (any allocation)."
+  "Return list of direct-slot-names for CLASS-NAME (any allocation).
+   TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
+   byte-identical), name-hash fallback for the eval2 class-name boundary."
   (let ((cur *clos-direct-slots*))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
-      (setq cur (cdr cur)))))
+      (when (eq (car (car cur)) class-name)
+        (return-from %direct-slots-for (cdr (car cur))))
+      (setq cur (cdr cur))))
+  (let ((cur *clos-direct-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq (car (car cur)) class-name)
+        (return-from %direct-slots-for (cdr (car cur))))
+      (setq cur (cdr cur))))
+  nil)
 
 (defun %slot-class-owner (class-name slot-name)
   "Return the class-name in CLASS-NAME's CPL that declared SLOT-NAME
@@ -723,12 +743,33 @@
           (setq cur (cdr cur)))))))
 
 (defun %clos-slot-info-for (class-name)
-  "Return (initarg-map . initform-map) for CLASS-NAME, or nil."
+  "Return (initarg-map . initform-map) for CLASS-NAME, or nil.
+
+   TWO PASSES, mirroring %find-clos-class.  Pass 1 is the historical
+   exact-EQ scan: on the native / tree-walker path the query symbol IS eq
+   to the one %register-clos-slot-info stored, so this is byte-identical to
+   the old single-pass body — no behavior change for that path.  Pass 2
+   (slot-0 name-hash via %clos-sym-name-eq) runs ONLY when eq found nothing
+   — that is exactly the eval2 boundary, where %defclass/%register stored a
+   native-MVM-sym class name while eval2's in-image %INTERN-SYMBOL handed us
+   a non-eq CL-sym-wrapper for the same literal.  Without pass 2 the initarg
+   /initform maps were invisible under eval2, so MAKE-INSTANCE rejected every
+   (valid) initarg as 'invalid initarg' and SHARED-INITIALIZE ran no
+   initforms — every slot stayed -999 (make-instance / make-load-form-saving-
+   slots / shared-initialize eval2 divergences)."
   (let ((cur *clos-slot-info*))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
-      (setq cur (cdr cur)))))
+      (when (eq (car (car cur)) class-name)
+        (return-from %clos-slot-info-for (cdr (car cur))))
+      (setq cur (cdr cur))))
+  (let ((cur *clos-slot-info*))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq (car (car cur)) class-name)
+        (return-from %clos-slot-info-for (cdr (car cur))))
+      (setq cur (cdr cur))))
+  nil)
 
 (defun %clos-initarg-lookup-1 (class-name initarg-key)
   "Look up INITARG-KEY in the initarg-map of just this CLASS-NAME
@@ -890,12 +931,22 @@
 
 (defun %clos-default-initargs-1 (class-name)
   "Return the directly-declared default-initarg thunks for CLASS-NAME
-   (no CPL walk).  Returns nil if none registered."
+   (no CPL walk).  Returns nil if none registered.
+   TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
+   byte-identical), name-hash fallback for the eval2 class-name boundary."
   (let ((cur *clos-default-initargs*))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) class-name) (return (cdr (car cur))))
-      (setq cur (cdr cur)))))
+      (when (eq (car (car cur)) class-name)
+        (return-from %clos-default-initargs-1 (cdr (car cur))))
+      (setq cur (cdr cur))))
+  (let ((cur *clos-default-initargs*))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq (car (car cur)) class-name)
+        (return-from %clos-default-initargs-1 (cdr (car cur))))
+      (setq cur (cdr cur))))
+  nil)
 
 (defun %clos-default-initarg-key-in-p (key lst)
   "True iff KEY (initarg keyword) is already in LST.  Uses hash/name

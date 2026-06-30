@@ -2881,6 +2881,21 @@
     (when (null class-name) (return-from allocate-instance nil))
     (%make-instance class-name)))
 
+(defun %slot-name-member (nm slot-names)
+  "Name-robust membership of slot-name NM in the list SLOT-NAMES.  Uses
+   %clos-sym-name-eq (slot-0 hash) rather than EQL: SLOT-NAMES arriving
+   from an eval2-evaluated test body (e.g. (shared-initialize obj '(a c)))
+   are interned by eval2's in-image %INTERN-SYMBOL into objects that are
+   NOT eql to the class's natively-registered slot-name symbols, so the
+   old plain (member nm slot-names) silently missed every slot under
+   eval2 — shared-initialize then applied no initforms (slots stayed
+   -999, the shared-initialize eval2 divergence cluster)."
+  (let ((cur slot-names))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq nm (car cur)) (return t))
+      (setq cur (cdr cur)))))
+
 (defun %shared-initialize-default (instance slot-names &rest initargs)
   "Default method body for SHARED-INITIALIZE.
    Per ANSI:
@@ -2931,7 +2946,7 @@
                    (already-set (member nm set-slots))
                    (covered (cond ((eq slot-names t) t)
                                   ((null slot-names) nil)
-                                  (t (member nm slot-names))))
+                                  (t (%slot-name-member nm slot-names))))
                    (cur-val (aref instance (+ 2 idx)))
                    (was-unbound (and (fixnump cur-val) (= cur-val -999))))
               (when (and (not already-set) covered was-unbound)
@@ -3047,7 +3062,7 @@
                    (already-set (member nm set-slots :test #'eq))
                    (covered (cond ((eq slot-names t) t)
                                   ((null slot-names) nil)
-                                  (t (member nm slot-names :test #'eq))))
+                                  (t (%slot-name-member nm slot-names))))
                    ;; Class-allocated slot? Check via per-class storage.
                    (class-slot (%slot-class-owner class-name nm))
                    (was-unbound

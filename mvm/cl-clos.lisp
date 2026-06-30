@@ -331,12 +331,32 @@
       name)))
 
 (defun %find-clos-class (name)
-  "Return class descriptor for NAME, or nil."
+  "Return class descriptor for NAME, or nil.
+
+   TWO PASSES.  Pass 1 is the historical EXACT-EQ scan: for the native /
+   tree-walker path the test/init symbol IS eq to the one %defclass stored,
+   so this returns the same entry base did — byte-identical, no behavior
+   change, and no risk of a fuzzy match returning a stale different-flavor
+   duplicate ahead of the real entry (which corrupted user-class SUBTYPEP
+   when the lookup was fuzzy-first).  Pass 2 (NAME-HASH) runs ONLY when eq
+   found nothing — that is exactly the eval2 boundary, where %defclass
+   stored a native-MVM-sym and eval2's in-image %INTERN-SYMBOL produced a
+   non-eq CL-sym-wrapper for the same source literal (FIND-CLASS otherwise
+   errored 'class not found' under eval2).  Mirrors the hash robustness of
+   %find-struct-type / the condition registry, but kept strictly secondary."
   (let ((cur *clos-classes*))
     (loop
       (when (null cur) (return nil))
-      (when (eq (car (car cur)) name) (return (cdr (car cur))))
-      (setq cur (cdr cur)))))
+      (when (eq (car (car cur)) name)
+        (return-from %find-clos-class (cdr (car cur))))
+      (setq cur (cdr cur))))
+  (let ((cur *clos-classes*))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq (car (car cur)) name)
+        (return-from %find-clos-class (cdr (car cur))))
+      (setq cur (cdr cur))))
+  nil)
 
 ;;; ============================================================
 ;;; DEFSTRUCT — runtime structure type support
@@ -1272,17 +1292,62 @@
         (cons (cons class-name (cons slot-eql (cons op-eql fn)))
               *slot-missing-methods*)))
 
+(defun %sym-obj-50-p (x)
+  "True if X is a subtag-#x50 symbol object (native-MVM-sym OR CL-sym-
+   wrapper).  Slot 0 of such an object is its compute-name-hash."
+  (and (not (consp x)) (not (fixnump x)) (not (characterp x)) (not (null x))
+       (not (eq x t))
+       (= (obj-subtag x) #x50)))
+
 (defun %clos-sym-name-eq (a b)
   "True if class-name symbols A and B denote the same name, robust to
    native-MVM-sym vs CL-sym identity drift across init-form / test
    boundaries (same name/hash, different object).  NOT a substitute for
-   EQ on genuinely distinct symbols — callers eq-check first."
+   EQ on genuinely distinct symbols — callers eq-check first.
+
+   Both flavors of class-name symbol are subtag-#x50 objects whose slot 0
+   is the SAME compute-name-hash of the name (%native-mvm-sym-hash and
+   %cl-sym-hash are both (aref s 0)).  Comparing that stored slot-0 hash is
+   a single flavor-independent identity key that closes the eval2 boundary:
+   %defclass / DEFCLASS-macro stored the class name as a native-MVM-sym,
+   while eval2's in-image %INTERN-SYMBOL produces a CL-sym-wrapper for the
+   SAME source literal `'cls-name`.  They are not eq, but share slot 0, so
+   the MIXED case now matches — FIND-CLASS used to error 'class not found'
+   for every shared-initialize / slot-exists-p / make-instance test under
+   eval2.
+
+   This deliberately does NOT canonicalise via the resolved NAME (the old
+   string-equal / %sym-name-or-hash path).  A compile-time-literal CL-sym
+   interned with only a hash lazy-reverse-looks-up the build-time
+   *SYM-NAME-TABLE* and returns \"\" when the hash isn't there — exactly the
+   runtime-loaded tac-3 / eval2 classes.  (string-equal \"\" \"\") and
+   (compute-name-hash \"\") then collapse EVERY such symbol into one
+   equivalence class, making %find-clos-class return a wrong/oversized class
+   so user-class SUBTYPEP regressed (tac-3.3/.4/.5/.6/.13/.14/.15 went
+   (NIL T)->(T T)).  The slot-0 hash is always present and distinct, so it
+   has neither failure mode."
   (cond
     ((eq a b) t)
-    ((and (%native-mvm-sym-p a) (%native-mvm-sym-p b))
-     (= (%native-mvm-sym-hash a) (%native-mvm-sym-hash b)))
-    ((and (%cl-sym-p a) (%cl-sym-p b))
-     (string-equal (%cl-sym-name a) (%cl-sym-name b)))
+    ;; Both are subtag-#x50 symbol objects — native-MVM-sym (1 slot) OR
+    ;; CL-sym-wrapper (>=3 slots).  In BOTH layouts slot 0 is the same
+    ;; compute-name-hash of the symbol name (see %native-mvm-sym-hash /
+    ;; %cl-sym-hash, both = (aref s 0)), so the stored slot-0 hash is a
+    ;; flavor-independent identity key.  This is what closes the eval2
+    ;; boundary: a class stored as a native-MVM-sym vs the in-image
+    ;; %INTERN-SYMBOL CL-sym-wrapper for the same literal share slot 0.
+    ;;
+    ;; We MUST NOT canonicalise via the resolved NAME (the old
+    ;; string-equal / %sym-name-or-hash path): for compile-time-literal
+    ;; CL-syms interned with only a hash, %cl-sym-name lazy-reverse-looks-
+    ;; up the build-time *SYM-NAME-TABLE* and returns "" when the hash
+    ;; isn't there (exactly the eval2 / runtime-loaded tac-3 classes).
+    ;; string-equal "" "" — and compute-name-hash "" — then collapse EVERY
+    ;; such symbol into one equivalence class, so %find-clos-class returns
+    ;; a wrong/oversized class and user-class SUBTYPEP regresses
+    ;; (tac-3.3/.4/.5/.6/.13/.14/.15 went (NIL T)->(T T)).  The slot-0
+    ;; hash is always present and distinct, so it has neither failure mode.
+    ((and (%sym-obj-50-p a) (%sym-obj-50-p b))
+     (= (aref a 0) (aref b 0)))
     (t nil)))
 
 (defun %dispatch-slot-missing (cls obj slot-name op new-val new-val-p)

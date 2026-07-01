@@ -2852,7 +2852,14 @@
              (defun ,gf-name (&rest ,args-var)
                (%gf-dispatch ',gf-name ,args-var))
              ,@method-forms
-             ',gf-name)))))
+             ;; CLHS: DEFGENERIC returns the generic-function OBJECT (the GF
+             ;; struct), NOT the name symbol.  The tree-walker's DEFGENERIC
+             ;; handler (cl-eval.lisp) returns (%dg-gf-callable gf-name); eval2
+             ;; must match so `(funcall (defgeneric g …) …)` — the GF struct in
+             ;; a variable — dispatches via compile-funcall's #x32 struct path.
+             ;; Returning ',gf-name (the symbol) here diverged: funcalling the
+             ;; struct works, funcalling the bare symbol did not round-trip.
+             (%dg-gf-callable ',gf-name))))))
 
   ;; DEFMETHOD — (defmethod name [qualifier] specialized-lambda-list body...)
   ;; → (%defmethod 'name qualifier '(specializers) (lambda (params) body))

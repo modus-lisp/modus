@@ -452,7 +452,15 @@
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
   ;; restart-invocation — internal type used by restart-case mechanism
-  (%define-condition 'restart-invocation '(condition) nil nil nil))
+  (%define-condition 'restart-invocation '(condition) nil nil nil)
+  ;; %rc-invocation — internal marker for eval2's bytecode restart-case
+  ;; (compile-restart-case).  A subtype of ERROR so the MVM interpreter's
+  ;; per-opcode (error (c)) longjmp bridge (interp.lisp) catches the
+  ;; invoke-restart %hc-longjmp and redirects it into the bytecode
+  ;; restart-case handler frame — where it is fully consumed (it never
+  ;; reaches user handlers, which the bytecode restart-case's t-clause
+  ;; catches first).
+  (%define-condition '%rc-invocation '(error) nil nil nil))
 
 ;;; --- frob-simple-condition helpers (for ANSI tests) ---
 
@@ -1120,6 +1128,95 @@
 (defvar *restart-case-result* nil)
 (defvar *restart-invoking-p* nil)
 
+;;; --- restart-case bytecode helpers (WS3 / eval2) -------------------
+;;; compile-restart-case (mvm/compiler.lisp) keeps restart-case IN BYTECODE
+;;; (a compiler special form using handler-case's setjmp) instead of routing
+;;; through the native %with-restarts bridge — which corrupts mvm-interpret's
+;;; loop state on return.  But the restart REGISTRY (*restart-stack*) and the
+;;; invoke handshake state (*restart-invoking-p* / *restart-case-result*) are
+;;; special globals whose bytecode SYMBOL-VALUE key (eval2's stored-hash) can
+;;; differ from the key NATIVE invoke-restart uses.  So the bytecode side must
+;;; NOT touch those specials directly; it calls these NATIVE helpers, which
+;;; read/write the specials in native code — the same code invoke-restart runs
+;;; — guaranteeing one consistent view of the restart stack + handshake.
+
+(defvar *rc-invoked-restart* nil
+  "The restart-case restart cell that INVOKE-RESTART last fired (a :BC-CASE
+   cell).  The bytecode restart-case handler reads its clause INDEX to
+   dispatch to the matching clause body.")
+
+(defun %rc-enter (restarts-spec)
+  "Push one restart-case frame (built from RESTARTS-SPEC, a list of
+   (NAME REPORT INTERACTIVE TEST)) onto *restart-stack* and return the
+   frame cons.  Cell layout (NAME NIL REPORT INTERACTIVE TEST :BC-CASE IDX):
+   the FN slot is NIL because the clause body runs in BYTECODE after the
+   longjmp (compile-restart-case), not via a native (apply fn) — a bytecode
+   lambda can't be called from native invoke-restart.  The :BC-CASE marker
+   routes invoke-restart to its stash-args-and-longjmp branch.  IDX is the
+   clause's positional index; the bytecode handler dispatches on it (a
+   fixnum — robust across the native boundary, unlike user-symbol eq)."
+  (let ((wrapped nil)
+        (idx 0))
+    (dolist (r restarts-spec)
+      (let ((rname  (car r))
+            (report (cadr r))
+            (interactive (caddr r))
+            (test (cadddr r)))
+        (setq wrapped
+              (cons (list rname nil report interactive test :bc-case idx)
+                    wrapped))
+        (setq idx (+ idx 1))))
+    (let ((frame (nreverse wrapped)))
+      (setq *restart-stack* (cons frame *restart-stack*))
+      frame)))
+
+(defun %rc-invoked-index ()
+  "Positional clause INDEX of the last-fired :BC-CASE restart (7th cell
+   element), or -1.  The bytecode restart-case handler dispatches on it."
+  (if (and *rc-invoked-restart* (consp (cddddr *rc-invoked-restart*)))
+      (let ((tail (cddddr *rc-invoked-restart*)))
+        ;; tail = (TEST :BC-CASE IDX) → idx is caddr.
+        (if (consp (cddr tail)) (caddr tail) -1))
+      -1))
+
+(defun %rc-invoked-args ()
+  "Argument LIST passed to the last INVOKE-RESTART (:BC-CASE)."
+  *restart-case-result*)
+
+(defun %rc-exit (frame)
+  "Pop FRAME off *restart-stack* (normal restart-case exit) and drop its
+   condition association."
+  (setq *restart-stack* (cdr *restart-stack*))
+  (when *restart-frame-condition-map*
+    (setq *restart-frame-condition-map*
+          (remove frame *restart-frame-condition-map*
+                  :test (lambda (f e) (eq (car e) f)))))
+  nil)
+
+(defun %rc-invoked-p ()
+  "T iff a restart was just invoked (INVOKE-RESTART set the flag)."
+  (if *restart-invoking-p* t nil))
+
+(defun %rc-clear-invoke ()
+  "Clear the invoke handshake state after the bytecode restart-case handler
+   has read the invoked restart + args and is about to run the clause body."
+  (setq *restart-invoking-p* nil)
+  (setq *restart-case-result* nil)
+  (setq *rc-invoked-restart* nil)
+  (setq *restarts-being-invoked* nil)
+  nil)
+
+(defun %rc-catch-cleanup (frame)
+  "Handler-side cleanup shared with %with-restarts: pop FRAME, reset the
+   handler-bind skip that a longjmp short-circuited, drop the association."
+  (setq *restart-stack* (cdr *restart-stack*))
+  (setq *handler-bind-effective-skip* 0)
+  (when *restart-frame-condition-map*
+    (setq *restart-frame-condition-map*
+          (remove frame *restart-frame-condition-map*
+                  :test (lambda (f e) (eq (car e) f)))))
+  nil)
+
 (defun %with-restarts (restarts-spec body-fn)
   "Establish RESTARTS-SPEC (list of (name fn report)) during BODY-FN
    with restart-case semantics: each restart cell carries a :case style
@@ -1215,15 +1312,38 @@
               ;; :CASE style is marked by a :CASE element anywhere past the
               ;; (NAME FN REPORT …) prefix.  %with-restarts now appends an
               ;; INTERACTIVE + TEST slot before the marker, so its index is
-              ;; no longer fixed at 4 — detect by membership.
+              ;; no longer fixed at 4 — detect by membership.  :BC-CASE marks
+              ;; a restart-case cell built by the eval2 compiler special form
+              ;; (compile-restart-case): its clause BODY runs in BYTECODE after
+              ;; the longjmp, so invoke-restart must NOT try to call rfn (which
+              ;; would be a bytecode lambda native code can't invoke) — it just
+              ;; stashes the invoke ARGS + the invoked cell and longjmps.
               (style (and (consp r) (consp (cdr r)) (consp (cddr r))
                           (consp (cdddr r))
-                          (if (member :case (cddddr r)) :case nil))))
+                          (cond ((member :bc-case (cddddr r)) :bc-case)
+                                ((member :case (cddddr r)) :case)
+                                (t nil)))))
           ;; Mark this restart as in-progress so a recursive invoke-restart
           ;; in rfn's body finds the NEXT applicable restart instead of
           ;; looping on this one (restart-case.12).
           (setq *restarts-being-invoked* (cons r *restarts-being-invoked*))
           (cond
+            ((eq style :bc-case)
+             ;; eval2 restart-case: stash the invoke ARGS + invoked cell; the
+             ;; bytecode restart-case handler runs the matching clause body.
+             ;; *current-condition* is a %RC-INVOCATION (an ERROR subtype) so
+             ;; the interpreter's per-opcode (error (c)) longjmp bridge catches
+             ;; the %hc-longjmp and redirects into the bytecode restart-case
+             ;; frame (a plain restart-invocation, subtype of CONDITION not
+             ;; ERROR, would slip past that bridge and escape).
+             (setq *restart-case-result* args)
+             (setq *rc-invoked-restart* r)
+             (setq *restart-invoking-p* t)
+             (let ((rc (make-array 2)))
+               (aset rc 0 '%rc-invocation)
+               (aset rc 1 nil)
+               (setq *current-condition* rc))
+             (%hc-longjmp))
             ((eq style :case)
              ;; restart-case: run user fn, stash MV result, longjmp.
              (let ((vals (multiple-value-list (apply rfn args))))

@@ -3851,6 +3851,10 @@
       ;; HANDLER-CASE — setjmp/longjmp error catching
       ((= op-name 362314411895974678)
        (compile-handler-case (cadr form) (cddr form) env dest))
+      ;; RESTART-CASE — bytecode setjmp/longjmp (stays in the interpreter;
+      ;; does NOT route through the native %with-restarts bridge under eval2)
+      ((= op-name 791633373928082865)
+       (compile-restart-case (cadr form) (cddr form) env dest))
       ;; IGNORE-ERRORS — compile body only
       ((= op-name 1140402238842668217)
        (compile-progn (cdr form) env dest))
@@ -5040,6 +5044,153 @@
           (emit-ir-label handler-label)
           (compile-form cond-form env dest)
           (emit-ir-label end-label)))))
+
+;;; ============================================================
+;;; restart-case  (special form — stays IN BYTECODE)
+;;; ============================================================
+;;;
+;;; restart-case is normally a build-time / tree-walker macro that
+;;; expands to (%with-restarts SPEC (lambda () BODY)).  %with-restarts
+;;; is a NATIVE function that re-enters mvm-interpret via (funcall
+;;; body-fn); RETURNING from that native bridge back into the bytecode
+;;; interpreter corrupts mvm-interpret's callee-saved loop state (the
+;;; nested native handler-case's setjmp/RBX save-restore perturbs the
+;;; cached state/pc), so under eval2 a restart-case returns garbage even
+;;; on a plain NORMAL exit — independent of any longjmp.
+;;;
+;;; To make eval2 correct we compile restart-case as a SPECIAL FORM whose
+;;; expansion establishes the restart frame via native %rc-* helpers and wraps
+;;; the protected body in the compiler's own HANDLER-CASE special form for the
+;;; catch.  handler-case compiles to an IN-BYTECODE setjmp (TRAP #x0510) — the
+;;; same mechanism invoke-restart's %hc-longjmp targets — so the protected
+;;; body, the restart escape and the RETURN never leave the bytecode
+;;; interpreter.  The restart cells carry a :BC-CASE marker (cl-conditions.lisp
+;;; %rc-enter); invoke-restart's :BC-CASE branch stashes the invoke ARGS (NOT a
+;;; result — the clause body is a bytecode closure native code can't call),
+;;; sets *restart-invoking-p*, sets *current-condition* to a %RC-INVOCATION
+;;; (an ERROR subtype, so the interpreter's per-opcode (error (c)) bridge
+;;; catches the longjmp and redirects it into THIS bytecode frame), and
+;;; %hc-longjmps.  This handler then reads the invoked clause index + args and
+;;; runs that clause body IN BYTECODE.
+;;;
+;;; The NATIVE build + the tree-walker are unaffected: they never reach this
+;;; compiler path — in NON-diff mode build-ansi-test.lisp still rewrites
+;;; restart-case to (%with-restarts …) (the native run-ansi-* runners depend
+;;; on it), and cl-eval.lisp's tree-walker calls %with-restarts directly.
+;;; Only the in-image compiler (eval2 / self-host) sees restart-case as a form
+;;; to compile, and this special form intercepts it before it can fall through
+;;; to a bogus function call.
+(defun compile-restart-case (protected-form clauses env dest)
+  "Compile (restart-case PROTECTED (NAME (ARGS) [:report R] [:interactive I]
+   [:test T] . BODY) ...) entirely in bytecode.
+
+   The restart REGISTRY (*restart-stack*) and the invoke handshake state are
+   managed by NATIVE %rc-* helpers (so bytecode + native invoke-restart share
+   one view).  The clause BODY runs in BYTECODE after the longjmp — NOT via a
+   native (apply fn), because the clause is a bytecode closure native code
+   cannot call.  invoke-restart stashes the invoke ARGS + the invoked cell
+   (:BC-CASE branch) and %hc-longjmps; this handler reads which clause fired
+   (%rc-invoked-index) and dispatches to the matching clause body with the
+   invoke args bound."
+  ;; No restart clauses (restart-case.1/.2/.3): the form is just the protected
+  ;; form — no restart can be invoked, so establish no frame/handler and
+  ;; compile the body directly.  This also PRESERVES its multiple values
+  ;; (a value-collapsing let-wrap would drop them).
+  (when (null clauses)
+    (return-from compile-restart-case
+      (compile-form protected-form env dest)))
+  (let ((cell-forms nil)          ; (list 'NAME REPORT INTERACTIVE TEST) forms
+        (parsed nil))             ; (rname arglist body-forms) per clause
+    (dolist (clause clauses)
+      (let* ((rname (car clause))
+             (arglist (cadr clause))
+             (rest-opts (cddr clause))
+             (report-opt nil)
+             (interactive-opt nil)
+             (test-opt nil)
+             (body-forms nil))
+        ;; Separate leading keyword options from the clause body.
+        (let ((remaining rest-opts))
+          (loop
+            (when (or (null remaining) (not (keywordp (car remaining))))
+              (setf body-forms remaining)
+              (return))
+            (cond
+              ((eq (car remaining) :report)
+               (setf report-opt (cadr remaining))
+               (setf remaining (cddr remaining)))
+              ((eq (car remaining) :interactive)
+               (setf interactive-opt (cadr remaining))
+               (setf remaining (cddr remaining)))
+              ((eq (car remaining) :test)
+               (setf test-opt (cadr remaining))
+               (setf remaining (cddr remaining)))
+              (t (setf body-forms remaining) (return)))))
+        ;; Coerce an option value into a form yielding a function (or a
+        ;; string for :report).  Mirrors build-ansi-test's opt-fn-form.
+        (flet ((opt-fn-form (opt allow-string)
+                 (cond
+                   ((null opt) nil)
+                   ((and allow-string (stringp opt)) (list 'quote opt))
+                   ((symbolp opt) (list 'function opt))
+                   ((and (consp opt) (eq (car opt) 'lambda)) opt)
+                   ((and (consp opt) (eq (car opt) 'function)) opt)
+                   (t opt))))
+          (let ((report-form (opt-fn-form report-opt t))
+                (interactive-form (opt-fn-form interactive-opt nil))
+                (test-form (opt-fn-form test-opt nil)))
+            ;; Cell spec (NAME REPORT INTERACTIVE TEST) — %rc-enter builds the
+            ;; (NAME NIL REPORT INTERACTIVE TEST :BC-CASE) cell (no FN slot).
+            (push (list 'list (list 'quote rname)
+                        report-form interactive-form test-form)
+                  cell-forms)
+            (push (list rname arglist body-forms) parsed)))))
+    (setf cell-forms (nreverse cell-forms))
+    (setf parsed (nreverse parsed))
+    ;; Build the clause dispatch that runs in the bytecode handler after an
+    ;; invoke-restart longjmp: match (%rc-invoked-index) against each clause's
+    ;; positional index, bind its lambda-list to (%rc-invoked-args), run body.
+    (let ((frame-var (gensym "RCFRAME"))
+          (cnd-var   (gensym "RCCND"))
+          (res-var   (gensym "RCRES"))
+          (args-var  (gensym "RCARGS"))
+          (idx-var   (gensym "RCIDX")))
+      (let ((dispatch-clauses nil)
+            (idx 0))
+        (dolist (p parsed)
+          (let ((arglist (cadr p))
+                (body-forms (caddr p)))
+            ;; (eql idx N) → (apply (lambda ARGLIST . BODY) invoke-args).
+            ;; Dispatch by positional INDEX (fixnum) not restart NAME: a user
+            ;; restart symbol loses EQ crossing the native %rc-enter boundary,
+            ;; but a fixnum index compares reliably.
+            (push (list `(eql ,idx-var ,idx)
+                        `(apply (lambda ,arglist ,@body-forms) ,args-var))
+                  dispatch-clauses)
+            (setf idx (+ idx 1))))
+        (setf dispatch-clauses (nreverse dispatch-clauses))
+        (compile-form
+         `(let ((,frame-var (%rc-enter (list ,@cell-forms))))
+            (handler-case
+                (let ((,res-var ,protected-form))
+                  (%rc-exit ,frame-var)
+                  ,res-var)
+              (t (,cnd-var)
+                ,cnd-var
+                (%rc-catch-cleanup ,frame-var)
+                (if (%rc-invoked-p)
+                    ;; A restart-case restart fired: read which clause (index)
+                    ;; + the invoke args, clear the handshake, run that body.
+                    (let ((,idx-var (%rc-invoked-index))
+                          (,args-var (%rc-invoked-args)))
+                      (%rc-clear-invoke)
+                      (cond ,@dispatch-clauses (t nil)))
+                    ;; A real condition escaped the body — re-signal it so it
+                    ;; propagates to the enclosing handler (or aborts if none).
+                    (if (%error-handler-active-p)
+                        (error ,cnd-var)
+                        (halt))))))
+         env dest)))))
 
 ;;; ============================================================
 ;;; If

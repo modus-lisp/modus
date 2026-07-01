@@ -1614,6 +1614,11 @@
                  (declare (ignorable ,@(mapcar #'car bindings)))
                  ,db-form))))))
 
+;; Forward declaration: *eval2-diff-mode* is defined (from MODUS_EVAL2_DIFF)
+;; further down, but rewrite-reader-forms references it to gate the RESTART-CASE
+;; rewrite (raw special form in diff mode; %with-restarts otherwise).
+(defvar *eval2-diff-mode*)
+
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
   (cond
@@ -2189,6 +2194,47 @@
            `(%with-handler-bind (list ,@binding-forms) (lambda () ,@body))
            `(progn ,@body))))
     ;; (restart-case form &rest clauses)
+    ;; DIFF MODE (eval2 gate): leave RESTART-CASE RAW (only rewrite subforms)
+    ;; so eval2 compiles it via the compile-restart-case SPECIAL FORM, keeping
+    ;; it IN BYTECODE instead of routing through the native %with-restarts
+    ;; bridge (which corrupts mvm-interpret's loop state on return).  The
+    ;; tree-walker (cl-eval.lisp) handles raw restart-case too, so the diff
+    ;; gate's `eval` side stays correct.
+    ;; NON-DIFF MODE (native production build): keep the historical rewrite to
+    ;; (%with-restarts …) — the native run-ansi-* runners rely on it and the
+    ;; existing restart-case tests pass through it; not touching that path
+    ;; keeps the native ANSI gate byte-for-byte unchanged.
+    ((and (eq (car form) 'restart-case) (cdr form) *eval2-diff-mode*)
+     (let* ((protected-form (rewrite-reader-forms (cadr form)))
+            (clauses (cddr form))
+            (new-clauses
+             (mapcar (lambda (clause)
+                       (let* ((rname (first clause))
+                              (arglist (second clause))
+                              (rest-opts (cddr clause))
+                              (opts nil)
+                              (body-forms nil))
+                         ;; Preserve leading :report/:interactive/:test options
+                         ;; verbatim; rewrite only the clause BODY forms.
+                         (let ((remaining rest-opts))
+                           (loop
+                             (when (or (null remaining)
+                                       (not (keywordp (car remaining))))
+                               (setf body-forms remaining)
+                               (return))
+                             (cond
+                               ((member (car remaining)
+                                        '(:report :interactive :test))
+                                (setf opts (append opts
+                                                   (list (car remaining)
+                                                         (cadr remaining))))
+                                (setf remaining (cddr remaining)))
+                               (t (setf body-forms remaining) (return)))))
+                         `(,rname ,arglist ,@opts
+                                  ,@(mapcar #'rewrite-reader-forms body-forms))))
+                     clauses)))
+       `(restart-case ,protected-form ,@new-clauses)))
+    ;; (restart-case form &rest clauses)  [NON-DIFF: rewrite to %with-restarts]
     ;; → (%with-restarts restarts-list (lambda () form))
     ;; Each clause: (name (args) &key interactive test report . body)
     ((and (eq (car form) 'restart-case) (cdr form))

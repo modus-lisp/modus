@@ -12666,68 +12666,79 @@
               ;; left b unset.
               (rest-base (+ (length required) (length optional)
                             (length key-params)))
+              ;; #142 CLHS §3.4.1: an &optional init form is evaluated in an
+              ;; environment where the params to its LEFT are bound but the
+              ;; param ITSELF is not yet bound — so a default that references
+              ;; its own name (`(&optional (x (1+ x)))`) must see the OUTER
+              ;; lexical `x`, not the shadowing param.  The old scheme bound
+              ;; the optional param as a real slot and then `(setq x default)`
+              ;; ran with `x` already shadowing the outer binding → `(1+ NIL)`.
+              ;; Fix: give each optional slot a GENSYM name (that's what the
+              ;; caller fills and emit-optional-prologue NIL-pads), then rebind
+              ;; the user name in a let* whose init is `(if supplied gensym
+              ;; default)`.  In a let*, the default for slot N evaluates with
+              ;; the earlier user names already bound and its OWN name still
+              ;; referring to the outer binding — exactly the CLHS scoping.
+              ;; This mirrors the &key let* path above.
+              (opt-gensyms (mapcar (lambda (o)
+                                     (declare (ignore o))
+                                     (gensym "%OPT"))
+                                   optional))
               (new-params (append required
-                                  (mapcar #'car optional)
+                                  opt-gensyms
                                   key-params
                                   (when rest-var (list rest-var))))
               (fb-rest-slot (when (and has-rest rest-var) rest-base))
               (optional-start (when optional (length required)))
               (optional-count (length optional))
               (req-count (length required))
-              ;; Any &optional spec names a supplied-p var?  Then we must
-              ;; capture the true caller arg count (compile-call's
-              ;; truthful :set-nargs) and derive supplied-p / defaults
-              ;; from it — a NIL-padded optional is indistinguishable
-              ;; from an explicitly-passed NIL by value alone.
-              (opt-has-supplied (some (lambda (o) (and (consp o) (cddr o))) optional))
               (new-body body))
          (when auxes
            (setf new-body `((let* ,auxes ,@new-body))))
          (cond
-           ;; --- supplied-p-aware &optional path ---
-           (opt-has-supplied
+           ;; --- &optional present: gensym slots + let* rebind (CLHS scope) ---
+           (optional
             (let ((nargs-var (gensym "%NARGS"))
-                  (sup-bindings nil)
-                  (defaults nil))
+                  (opt-bindings nil)   ; (user-name init) pairs for the let*
+                  (key-defaults nil))
               (loop for opt in optional
+                    for g in opt-gensyms
                     for i from 0
                     for idx = (+ req-count i)
                     for var = (car opt)
                     for default = (cadr opt)
                     for sup = (and (consp opt) (cddr opt) (caddr opt))
                     do
-                    ;; supplied = (> nargs idx)  (idx is 0-based slot)
+                    ;; supplied = (> nargs idx)  (idx is 0-based slot).  Bind
+                    ;; the user name: if the caller supplied this slot, take
+                    ;; the gensym's value; else evaluate the default in the
+                    ;; current let* scope (own name still refers to outer).
+                    (push (list var
+                                (if default
+                                    `(if (> ,nargs-var ,idx) ,g ,default)
+                                    g))
+                          opt-bindings)
+                    ;; supplied-p var comes AFTER its param (CLHS left-to-right).
                     (when sup
-                      (push (list sup (list '> nargs-var idx)) sup-bindings))
-                    ;; default applies iff NOT supplied
-                    (when default
-                      (push (if sup
-                                `(unless ,sup (setq ,var ,default))
-                                `(unless (> ,nargs-var ,idx) (setq ,var ,default)))
-                            defaults)))
-              ;; &key defaults (combined &optional + &key fallback) keep
-              ;; the legacy null-check behavior.
+                      (push (list sup (list '> nargs-var idx)) opt-bindings)))
+              ;; &key defaults (combined &optional + &key fallback) keep the
+              ;; legacy null-check behavior; key params are still real slots.
               (dolist (k keys)
                 (when (cadr k)
-                  (push `(when (null ,(car k)) (setq ,(car k) ,(cadr k))) defaults))
+                  (push `(when (null ,(car k)) (setq ,(car k) ,(cadr k))) key-defaults))
                 (when (caddr k)
-                  (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) defaults)))
+                  (push `(when (null ,(caddr k)) (setq ,(caddr k) nil)) key-defaults)))
               (setf new-body
                     `((let* ((,nargs-var (%get-nargs))
-                             ,@(nreverse sup-bindings))
-                        ;; touch nargs-var so it isn't dead-stripped when
-                        ;; only defaults (no sup vars) reference it.
+                             ,@(nreverse opt-bindings))
+                        ;; touch nargs-var so it isn't dead-stripped when no
+                        ;; default/supplied references it.
                         ,nargs-var
-                        ,@(nreverse defaults)
+                        ,@(nreverse key-defaults)
                         ,@new-body)))))
-           ;; --- legacy null-check path (no &optional supplied-p) ---
+           ;; --- no &optional: legacy null-check path for &key fallback ---
            (t
             (let ((defaults nil))
-              (dolist (opt optional)
-                (when (cadr opt)
-                  (push `(when (null ,(car opt))
-                           (setq ,(car opt) ,(cadr opt)))
-                        defaults)))
               (dolist (k keys)
                 (when (cadr k)
                   (push `(when (null ,(car k))

@@ -3217,6 +3217,12 @@
 (defvar *eval2-diff-mode*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_EVAL2_DIFF") #-sbcl nil))
     (and v (plusp (length v)) (not (string= v "0")))))
+;; WS3 flip build flag: MODUS_USE_EVAL2 → boot with production EVAL/LOAD routed
+;; to eval2 (the ~~USE-EVAL2-INIT~~ marker in kernel-main becomes (setq
+;; *use-eval2* t)).  Off (default) → the marker becomes NIL, byte-identical.
+(defvar *use-eval2-build*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_USE_EVAL2") #-sbcl nil))
+    (and v (plusp (length v)) (not (string= v "0")))))
 ;; Accumulated emitted source for the e2diff chunk fns + run-e2diff-FILE fns.
 (defvar *e2diff-sources* "")
 ;; Per-file accumulator of (id . actual-form) captured this file; reset per file.
@@ -5193,6 +5199,11 @@
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)
+  ;; WS3 flip: production EVAL/LOAD → eval2 when the MODUS_USE_EVAL2 build flag
+  ;; is set (the assembler replaces this marker with `(setq *use-eval2* t)`;
+  ;; flag-off → replaced with `nil`, byte-identical to before).  Placed after
+  ;; all runtime init so eval2's deps (packages/keywords/streams/reader) exist.
+  ~~USE-EVAL2-INIT~~
   ;; ansi-aux-macros.lsp's NORMALLY macro: (if *should-always-be-true*
   ;; form (should-never-be-called)). NIL here → every CATCH-TYPE-ERROR /
   ;; NORMALLY-wrapped form expands to a call to an undefined function,
@@ -5501,7 +5512,7 @@
                                 (subseq str 0 p) replacement
                                 (subseq str (+ p (length needle))))
                    str))))
-    (let* ((drv (if *eval2-diff-mode*
+    (let* ((drv0 (if *eval2-diff-mode*
                     ;; Redirect the production driver to the differential gate:
                     ;; swap run-real-ansi-tests→run-real-e2diff AND skip the slow
                     ;; eval-heavy custom probe suite (run-all-tests) which would
@@ -5510,6 +5521,12 @@
                       (str-sub "(run-real-ansi-tests)" "(run-real-e2diff)"
                                *driver-source*))
                     *driver-source*))
+           ;; WS3 flip: replace ~~USE-EVAL2-INIT~~ with the boot setq when the
+           ;; MODUS_USE_EVAL2 build flag is set; else replace with NIL so the
+           ;; flag-off driver is byte-identical to before the flip infra.
+           (drv (str-sub "~~USE-EVAL2-INIT~~"
+                         (if *use-eval2-build* "(setq *use-eval2* t)" "nil")
+                         drv0))
            (tag "~~ANSI-EXP-TOTAL~~")
            (tag-pos (search tag drv))
            (count (- *ansi-test-counter* 10000)))

@@ -3881,9 +3881,21 @@
       (%gf-dispatch (%gf-name fn) (list a b c d))
       (%signal-undefined-function)))
 
+(defvar *use-eval2* nil
+  "WS3 flip flag.  When T, production EVAL/LOAD route to eval2 (compile the
+   form to MVM bytecode + interpret) instead of the tree-walker %eval-in-env.
+   Default NIL = tree-walker (behaviour-identical to before the flip).  Set to
+   T at boot by the MODUS_USE_EVAL2 build flag (the ~~USE-EVAL2-INIT~~ slot in
+   kernel-main) to test the flip.  Defvar defaults NIL (no boot init-thunk), so
+   OFF is the safe default and LOAD flips automatically because it calls EVAL.")
+
 (defun eval (form)
-  "Evaluate FORM in the null lexical environment."
-  (%eval-in-env form nil))
+  "Evaluate FORM in the null lexical environment.
+   Routes to eval2 (MVM compile+interpret) when *use-eval2* (the WS3 flip),
+   else the tree-walker %eval-in-env."
+  (if *use-eval2*
+      (eval2 form)
+      (%eval-in-env form nil)))
 
 ;;; ============================================================
 ;;; Compile: return proper 3 values

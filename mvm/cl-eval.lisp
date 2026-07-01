@@ -2907,17 +2907,20 @@
                  (when (and gf m (consp m))
                    (%gf-set-defgeneric-methods
                     gf (cons m (%gf-defgeneric-methods gf))))))))
-         ;; Return the dispatch stub closure — typep'p as generic-function
-         ;; AND callable via funcall.  Returning the raw GF object (a
-         ;; 4-slot array) is what CLHS specifies in spirit, but the
-         ;; method-combination tests immediately funcall the result —
-         ;; on Modus that meant interpreting the array data as a
-         ;; function pointer and SIGSEGV-ing inside the heap (SEGV_ACCERR
-         ;; — calling data as code).  The stub closure is registered in
-         ;; *gf-stub-closures*, so (typep stub 'generic-function) → T
-         ;; and the funcall path resolves through the standard closure
-         ;; subtag #x52 dispatch.
-         (symbol-function gf-name)))
+         ;; Return the GENERIC-FUNCTION OBJECT (the GF struct) — CLHS says
+         ;; DEFGENERIC returns the generic-function object, and %dg-gf-callable
+         ;; (the value the build-rewritten `(eval '(defgeneric …))` path also
+         ;; returns) is that same struct.  Returning the struct HERE keeps the
+         ;; two DEFGENERIC value paths consistent so ENSURE-GENERIC-FUNCTION
+         ;; eql-identity holds: egf.7-13 use `(eval `(defgeneric ,f …))`
+         ;; (BACKQUOTE — NOT build-rewritten, so it hits THIS handler), then
+         ;; check `(eqlt fn (ensure-generic-function f …))`.  Both now return
+         ;; %find-gf's stable struct.  Formerly this returned the stub closure
+         ;; (symbol-function), which SIGSEGV'd when funcalled >4 args and broke
+         ;; eql vs %dg-gf-callable — the >4-arg GF-struct funcall is now handled
+         ;; in compile-funcall (struct slot-8 stub closure), so the struct is
+         ;; safely funcallable at any arity.
+         (%dg-gf-callable gf-name)))
       ;; (defclass name supers slot-specs &rest options)
       ;; Per-slot options handled: :reader, :writer, :accessor, :initarg,
       ;; :initform, :allocation.  Class-level options handled:

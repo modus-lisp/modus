@@ -1682,7 +1682,7 @@
    %defgeneric) so %defmethod / find-method can validate method
    congruence (CLHS 7.6.4).  NIL means unknown — auto-created GFs
    from a leading %defmethod skip the check."
-  (let ((gf (make-array 8)))
+  (let ((gf (make-array 9)))
     (aset gf 0 '%generic-function)
     (aset gf 1 name)
     (aset gf 2 nil)  ; methods-alist
@@ -1691,6 +1691,14 @@
     (aset gf 5 nil)  ; methods added by a DEFGENERIC form (CLHS removal)
     (aset gf 6 nil)  ; :argument-precedence-order as arg-index list
     (aset gf 7 nil)  ; method-meta alist: (method . (key rest aok keynames))
+    ;; Slot 8: a &rest dispatch stub `(lambda (&rest a) (%gf-dispatch NAME a))`.
+    ;; compile-funcall's GF-struct path loads THIS slot and call-indirects it,
+    ;; so `(funcall gf-struct …)` in COMPILED code works at ANY arity (>4 args
+    ;; too) — the stub's &rest prologue packs reg+stack args, with NO fragile
+    ;; per-arity register shuffle in the compiler.  The stub is EQ-recorded in
+    ;; *gf-fn-to-name* by %make-gf-stub so %generic-function-p / find-method
+    ;; can reverse-map it.
+    (aset gf 8 (%make-gf-stub name))
     gf))
 
 (defun %gf-p (x)
@@ -2084,7 +2092,20 @@
 (defun %find-gf (name)
   "Find generic function by name.  (setf X) function names are LISTS —
    each quoted occurrence is a distinct cons, so EQ never matches across
-   call sites; compare those structurally by their inner symbol."
+   call sites; compare those structurally by their inner symbol.
+
+   TWO PASSES, mirroring %find-clos-class (c6eaa47) and the slot accessors
+   (d7d27e8).  Pass 1 is the historical EXACT-EQ (+ setf-list structural)
+   scan: for the native / tree-walker path the lookup symbol IS eq to the
+   one %defgeneric stored, so this returns the same entry base did — byte-
+   identical, no behavior change.  Pass 2 (NAME-HASH via %clos-sym-name-eq
+   on the symbol's stored slot-0 hash, NOT symbol-name which returns \"\" for
+   runtime-interned syms) runs ONLY when eq found nothing — exactly the
+   eval2 boundary, where %defgeneric stored a native-MVM-sym and eval2's
+   in-image %INTERN-SYMBOL produced a non-eq CL-sym-wrapper for the same
+   source literal.  Kept strictly secondary and gated on plain-symbol NAME
+   (never a setf-list) so it can't fuzzy-collapse distinct (setf X) names.
+   Required for ENSURE-GENERIC-FUNCTION eql-identity across the boundary."
   (let ((cur *generic-functions*))
     (loop
       (when (null cur) (return nil))
@@ -2094,8 +2115,18 @@
                        (not (%cl-sym-p k)) (not (%cl-sym-p name))
                        (consp (cdr k)) (consp (cdr name))
                        (eq (car (cdr k)) (car (cdr name)))))
-          (return (cdr (car cur)))))
-      (setq cur (cdr cur)))))
+          (return-from %find-gf (cdr (car cur)))))
+      (setq cur (cdr cur))))
+  (when (not (consp name))
+    (let ((cur *generic-functions*))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car (car cur))))
+          (when (and (not (consp k))
+                     (%clos-sym-name-eq k name))
+            (return-from %find-gf (cdr (car cur)))))
+        (setq cur (cdr cur)))))
+  nil)
 
 (defun %defgeneric (name lambda-list combination)
   "Register or update a generic function.
@@ -2204,20 +2235,17 @@
       new-method)))
 
 (defun %dg-gf-callable (gf-name)
-  "Value of a DEFGENERIC form: the registered dispatch fn for GF-NAME
-   (callable at any arity — compile-funcall's GF-struct path caps at 4
-   args) when one is recorded in *gf-fn-to-name*, else the GF struct."
-  (let ((found nil))
-    (let ((cur *gf-fn-to-name*))
-      (loop
-        (when (null cur) (return nil))
-        (when (eq (cdr (car cur)) gf-name)
-          (setq found (car (car cur)))
-          (return nil))
-        (setq cur (cdr cur))))
-    (if (and found (not (eql found 0)))
-        found
-        (%find-gf gf-name))))
+  "Value of a DEFGENERIC form: the GENERIC-FUNCTION OBJECT (the GF struct)
+   for GF-NAME.  CLHS says DEFGENERIC returns the generic-function object;
+   the native dispatch-fn stub (formerly returned from *gf-fn-to-name*) was
+   an implementation detail that eval2's interpreter cannot funcall — it
+   misses %find-gf and errors 'undefined generic function'.  The GF struct
+   is %generic-function-p / functionp and funcalls via the %FUNCALL-GF-N ->
+   %gf-dispatch path (with trap-#x0530 handling the >4-arg overflow), so
+   returning it is BOTH more ANSI-conformant and eval2-safe.  This also
+   gives ENSURE-GENERIC-FUNCTION eql-identity: DEFGENERIC and a later
+   ENSURE-GENERIC-FUNCTION of the same name return the SAME struct."
+  (%find-gf gf-name))
 
 (defun %defgeneric-method (gf-name qualifier specializers fn method-ll)
   "Add an inline (:method ...) from a DEFGENERIC form.  Like %defmethod

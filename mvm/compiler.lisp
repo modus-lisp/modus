@@ -9452,6 +9452,45 @@
           (free-temp-reg)
           (free-temp-reg)
           (free-temp-reg)))
+      ;; GF struct dispatch at >4 args: the per-arity %FUNCALL-GF-N shuffle
+      ;; above only covers nargs≤4 (its arg-prepend register loop can't reach
+      ;; stack-resident overflow args).  For nargs>4 we CANNOT shuffle; instead
+      ;; load the GF's &rest dispatch stub CLOSURE from struct slot 8 and invoke
+      ;; it via the CLOSURE-calling convention (set-cenv from the closure's env
+      ;; slot, then call the closure fn-addr).  The args stay EXACTLY in place
+      ;; (V0..V3 + stack); the stub's &rest prologue packs them.  This makes
+      ;; `(funcall gf-struct …)` work at any arity in compiled code
+      ;; (defgeneric.14/15/21/22/27/28, ensure-generic-function.7-13 each
+      ;; funcall a GF at 5-6 args).  A non-GF #x32 array falls through to the
+      ;; shared call-indirect on the original fn (funcalling a plain array is
+      ;; undefined anyway).
+      (when (> nargs 4)
+        (let ((check-reg (alloc-temp-reg))
+              (cmp-reg   (alloc-temp-reg))
+              (env-reg   (alloc-temp-reg))
+              (not-gf-label (make-compiler-label)))
+          (emit-ir :obj-tag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-gf-label)
+          (emit-ir :obj-subtag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +subtag-array+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-gf-label)
+          ;; fn-call-reg = GF struct; load slot 8 = &rest stub closure.
+          (emit-ir :obj-ref fn-call-reg fn-call-reg 8)
+          ;; Invoke via the closure convention: slot 1 = env-list (→ R13),
+          ;; slot 0 = fn-addr.  Mirrors the === Closure path === above.
+          (emit-ir :obj-ref env-reg fn-call-reg 1)
+          (emit-ir :obj-ref fn-call-reg fn-call-reg 0)
+          (emit-ir :set-cenv env-reg)
+          (emit-ir :set-nargs nargs)
+          (emit-ir :call-indirect fn-call-reg nargs)
+          (emit-ir :br after-call-label)
+          (emit-ir-label not-gf-label)
+          (free-temp-reg)
+          (free-temp-reg)
+          (free-temp-reg)))
       (emit-ir :set-nargs nargs)
       (emit-ir :call-indirect fn-call-reg nargs)
       ;; === Join ===

@@ -357,9 +357,27 @@
 ;;; Native-call argument collection (register file + overflow stack)
 ;;; ============================================================
 
-(defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets)
+(defun %mvm-store-fn-name-p (name)
+  "True if NAME is a STORAGE-SINK native bridge fn — one that merely STORES its
+   lambda argument (into a global cell / the symbol-function table) rather than
+   CALLING it.  Such an argument must NOT be trampoline-wrapped: the wrap turns
+   an in-module eval2 lambda (offset / #x52 closure) into a NATIVE trampoline
+   closure, whose slot-0 is a native fn-addr — NOT a bytecode offset.  eval2's
+   own funcall CLOSURE path call-indirects slot-0 as a bytecode offset, so a
+   stored-then-eval2-funcalled trampoline jumps to a bogus PC and returns stale
+   VR (= the fn itself: `(eq (funcall stored) stored)` was T).  Storing the RAW
+   eval2 representation instead lets a later eval2 funcall dispatch it via the
+   normal in-module offset/closure path (the same path a direct funcall uses).
+   Comparison is by NAME string (case-insensitive) since NAME is the runtime-
+   table key the eval2 compiler emitted for the CALL."
+  (and (stringp name)
+       (or (string-equal name "SET-SYMBOL-VALUE")
+           (string-equal name "SET-SYMBOL-FUNCTION"))))
+
+(defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets &optional no-wrap)
   "Collect the NARGS arguments for a native bridge call, in order
-   (arg0 arg1 … arg{nargs-1}), wrapping any escaping eval2 lambda value.
+   (arg0 arg1 … arg{nargs-1}), wrapping any escaping eval2 lambda value
+   (unless NO-WRAP — set for storage-sink fns, see %mvm-store-fn-name-p).
 
    The MVM calling convention places the FIRST 4 args (compiler.lisp's
    +max-reg-args+ — hardcoded 4 here because that constant is defined in
@@ -389,12 +407,14 @@
         ;; rev = (arg{nargs-1} … arg4); prepend each (wrapped) → args now =
         ;; (arg4 … arg{nargs-1}).
         (dolist (v rev)
-          (push (%mvm-wrap-escaping v bc ftab rt lam-offsets) args))))
+          (push (if no-wrap v (%mvm-wrap-escaping v bc ftab rt lam-offsets)) args))))
     ;; Prepend the register args (indices min(nargs,4)-1 … 0) so they lead.
     (let ((i (- (if (> nargs 4) 4 nargs) 1)))
       (loop
         (when (< i 0) (return))
-        (push (%mvm-wrap-escaping (svref regs i) bc ftab rt lam-offsets) args)
+        (push (if no-wrap (svref regs i)
+                  (%mvm-wrap-escaping (svref regs i) bc ftab rt lam-offsets))
+              args)
         (setq i (- i 1))))
     args))
 
@@ -1215,7 +1235,8 @@
                               ;; call got garbage for its 5th+ arg.
                               (%mvm-collect-call-args state regs nargs
                                                       bc ftab runtime-table
-                                                      lambda-offsets)))
+                                                      lambda-offsets
+                                                      (%mvm-store-fn-name-p name))))
                          ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
                          ;; multi-valued fns (floor/truncate/round/rem returning a
                          ;; quotient AND remainder) write their secondaries to the

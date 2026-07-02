@@ -54,10 +54,12 @@
    (vector-push*.error, defmethod.error, signals-error helpers) failed under
    the WS3 flip.  Callers that want the capture behaviour (the e2diff gate)
    wrap eval2 in their own handler-case."
-  (mvm-interpret (car tuple) :entry-point (cadr tuple)
-                 :function-table (caddr tuple)
-                 :runtime-table (cadddr tuple) :return-raw nil
-                 :lambda-offsets (car (cddddr tuple))))
+  (%mvm-wrap-escaping-result
+    (mvm-interpret (car tuple) :entry-point (cadr tuple)
+                   :function-table (caddr tuple)
+                   :runtime-table (cadddr tuple) :return-raw nil
+                   :lambda-offsets (car (cddddr tuple)))
+    (car tuple) (caddr tuple) (cadddr tuple) (car (cddddr tuple))))
 
 (defun eval2-forms (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
@@ -277,9 +279,15 @@
             ;; Conditions PROPAGATE (see %eval2-run-tuple): production EVAL
             ;; must let an error signalled by the form reach the caller's
             ;; handler-case instead of returning (:interp-err e) as a value.
-            (mvm-interpret bc :entry-point entry :function-table fn-table
-                           :runtime-table rt-table :return-raw nil
-                           :lambda-offsets lam-offsets))
+            ;; The RESULT is wrapped when it is an in-module #x52 lambda
+            ;; closure (see %mvm-wrap-escaping-result) so `(eval '#'(lambda
+            ;; ...))` hands back a natively-funcallable, per-call-distinct
+            ;; function object.
+            (%mvm-wrap-escaping-result
+              (mvm-interpret bc :entry-point entry :function-table fn-table
+                             :runtime-table rt-table :return-raw nil
+                             :lambda-offsets lam-offsets)
+              bc fn-table rt-table lam-offsets))
           :no-entry))))
   )
 ;; Single-expression convenience.

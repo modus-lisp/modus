@@ -587,6 +587,34 @@
     ((= (obj-subtag sym) #x50) (aref sym 0))
     (t nil)))
 
+(defun %runtime-register-deftype (tname params body)
+  "eval2 DEFTYPE expansion target (compiler.lisp, *eval2-runtime-p* gated).
+   Registers the expander in *%runtime-deftype-table* — the SAME registry
+   the tree-walker's DEFTYPE handler (below, in %eval-in-env) writes and
+   ansi-bridge.lisp's %deftype-lookup / %expand-deftype (typep/subtypep)
+   consult.  Returns TNAME per CLHS."
+  (let ((name-str (%eval-sym-name tname)))
+    (when name-str
+      (unless *%runtime-deftype-table*
+        (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
+      (puthash name-str *%runtime-deftype-table*
+               (cons params body))))
+  tname)
+
+(defun %runtime-register-compiler-macro (mname params body)
+  "eval2 DEFINE-COMPILER-MACRO expansion target (compiler.lisp,
+   *eval2-runtime-p* gated).  Registers an %interp-closure expander in
+   *compiler-macro-function-table* — the SAME registry the tree-walker's
+   DEFINE-COMPILER-MACRO handler writes and COMPILER-MACRO-FUNCTION
+   consults.  Returns MNAME per CLHS."
+  (let ((expander (list '%interp-closure params body nil))
+        (key (%macro-sym-key mname)))
+    (when key
+      (unless *compiler-macro-function-table*
+        (setq *compiler-macro-function-table* (make-hash-table)))
+      (puthash key *compiler-macro-function-table* expander))
+    mname))
+
 (defun %eval-set-global (sym value)
   "Set the global value of SYM in BOTH the eval-only name-string alist
    AND the compiled-code globals alist (hash-keyed at #x10000080) so

@@ -1839,7 +1839,43 @@
       (lambda (form)
         (list '%defpackage-impl
               (list 'quote (cadr form))
-              (list 'quote (cddr form))))))
+              (list 'quote (cddr form)))))
+    ;; DEFTYPE (RUNTIME / eval2 only — same rationale as DEFPACKAGE above):
+    ;; register the expander in the SAME *%runtime-deftype-table* the
+    ;; tree-walker's DEFTYPE handler uses, so typep/subtypep's
+    ;; %deftype-lookup / %expand-deftype (ansi-bridge.lisp) see it.  Without
+    ;; this, eval2 compiled (deftype ...) as an undefined-function call —
+    ;; the deftype.7/.8/.16-.18 + documentation.symbol.type.3 flip residue.
+    ;; Returns the NAME (identity-preserved via the eval2 quote pool, so
+    ;; (eq (eval `(deftype ,sym ...)) sym) holds).
+    (mvm-define-macro "DEFTYPE"
+      (lambda (form)
+        (list '%runtime-register-deftype
+              (list 'quote (cadr form))
+              (list 'quote (caddr form))
+              (list 'quote (cdddr form)))))
+    ;; DEFCONSTANT (RUNTIME / eval2 only): mirror the tree-walker's handler —
+    ;; evaluate the value and set the global via %eval-set-global (both the
+    ;; eval-only alist AND compiled code's hash-keyed store), return the name.
+    ;; The build-time toplevel DEFCONSTANT clause (mvm-compile-toplevel) never
+    ;; sees the eval2 shape: the form compiles NESTED inside %eval2-thunk.
+    (mvm-define-macro "DEFCONSTANT"
+      (lambda (form)
+        (list 'progn
+              (list '%eval-set-global
+                    (list 'quote (cadr form))
+                    (caddr form))
+              (list 'quote (cadr form)))))
+    ;; DEFINE-COMPILER-MACRO (RUNTIME / eval2 only): register the expander in
+    ;; the SAME *compiler-macro-function-table* the tree-walker's handler
+    ;; uses, so COMPILER-MACRO-FUNCTION / (documentation x 'compiler-macro)
+    ;; resolve it.  Returns the NAME per CLHS.
+    (mvm-define-macro "DEFINE-COMPILER-MACRO"
+      (lambda (form)
+        (list '%runtime-register-compiler-macro
+              (list 'quote (cadr form))
+              (list 'quote (caddr form))
+              (list 'quote (cdddr form))))))
 
   ;; VECTOR → (let ((v (make-array N))) (aset v 0 a0) ... v)
   (mvm-define-macro "VECTOR"
@@ -6507,7 +6543,24 @@
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
           (push result *pending-flet-ir*)
-          (emit-ir :li-func dest lambda-name))
+          (if *eval2-runtime-p*
+              ;; eval2 (in-image runtime compile) ONLY: materialize even a
+              ;; CAPTURELESS lambda as a #x52 closure (env = NIL) instead of
+              ;; the bare :li-func bytecode-offset fixnum.  A bare offset
+              ;; VALUE is indistinguishable from ordinary integer DATA, so
+              ;; (a) two different (eval `#'(lambda ...)) results with the
+              ;; same module shape were EQUAL — colliding in EQUAL-keyed
+              ;; registries (documentation.function.t.5 returned an EARLIER
+              ;; test's doc string), and (b) the value couldn't be safely
+              ;; wrapped at the eval2 return boundary (a data fixnum result
+              ;; aliasing a lambda offset would wrap).  As a #x52 object the
+              ;; value is unambiguous: compile-funcall's closure dispatch
+              ;; handles it in-module, %mvm-wrap-escaping's #x52 branch wraps
+              ;; it at the native bridge, and %mvm-wrap-escaping-result wraps
+              ;; it when returned from eval2.  Native builds keep the bare
+              ;; fn-addr (byte-identical).
+              (compile-make-closure (list 'function lambda-name) 'nil env dest)
+              (emit-ir :li-func dest lambda-name)))
         ;; Has captures: build closure object (cons fn-addr env-list).
         ;; The closure function loads captured values from CLOSURE-ENV-ADDR
         ;; at entry (set by funcall before calling).

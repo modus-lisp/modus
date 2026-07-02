@@ -353,6 +353,23 @@
      (%mvm-make-trampoline bc ftab rt v nil lam-offsets))
     (t v)))
 
+(defun %mvm-wrap-escaping-result (v bc ftab rt lam-offsets)
+  "Wrap an eval2 RESULT value (the thunk's return) that is an in-module
+   #x52 lambda closure in a re-entrant trampoline, so the value production
+   EVAL hands back is natively funcallable and IDENTITY-DISTINCT per call.
+   Unlike the bridge-arg wrapper (%mvm-wrap-escaping), a BARE integer is
+   NEVER wrapped here: eval results are ordinary data far more often than
+   captureless-lambda offsets, and under *eval2-runtime-p* compile-lambda
+   materializes captureless lambdas as #x52 closures, so the raw-offset
+   shape doesn't escape as a result value.  Everything except a
+   #x52-with-recorded-lambda-offset passes through unchanged."
+  (if (and v (not (consp v)) (not (integerp v))
+           (= (obj-subtag v) #x52)
+           (%mvm-lambda-offset-p (%prim-aref v 0) lam-offsets))
+      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
+                            lam-offsets)
+      v))
+
 ;;; ============================================================
 ;;; Native-call argument collection (register file + overflow stack)
 ;;; ============================================================

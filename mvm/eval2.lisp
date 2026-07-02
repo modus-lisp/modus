@@ -16,6 +16,43 @@
    the reuse site) instead of (make-array 65536) every call — mvm-buffer-used-
    bytes copies the bytecode out before the next call, so nothing retains it.")
 
+(defvar *eval2-cache* nil
+  "PERF Round 2 (compile-caching): EQUAL hash, FORMS → (bc entry fn-table
+   rt-table lam-offsets) — the compiled MVM module for those forms.  eval2 of a
+   tiny form is ~26x compile-bound; the harness/asdf re-eval the same forms
+   constantly, so caching the compiled bytecode skips the whole ~15M-cycle
+   compile and pays only ~0.6M interpret.  Re-interpreting the cached bytecode
+   is correct: the RESULT depends on live runtime state, not the cache.  bc is a
+   COPY (mvm-buffer-used-bytes) so it's safe despite *eval2-buffer* reuse.")
+
+(defun %eval2-cacheable-p (forms)
+  "T unless any top-level form is a DEF* / IN-PACKAGE / EVAL-WHEN whose FIRST
+   compile has side effects (macro/trampoline/package registration) that a
+   cache HIT would skip.  Those always take the full (uncached) compile path;
+   plain expressions — the bulk of harness evals — are cached."
+  (dolist (f forms t)
+    (when (and (consp f) (symbolp (car f)))
+      (let ((n (symbol-name (car f))))
+        (when (or (string-equal n \"DEFUN\") (string-equal n \"DEFMACRO\")
+                  (string-equal n \"DEFPACKAGE\") (string-equal n \"IN-PACKAGE\")
+                  (string-equal n \"DEFVAR\") (string-equal n \"DEFPARAMETER\")
+                  (string-equal n \"DEFCONSTANT\") (string-equal n \"DEFSTRUCT\")
+                  (string-equal n \"DEFCLASS\") (string-equal n \"DEFGENERIC\")
+                  (string-equal n \"DEFMETHOD\") (string-equal n \"DEFTYPE\")
+                  (string-equal n \"DEFINE-CONDITION\") (string-equal n \"DEFSETF\")
+                  (string-equal n \"DEFINE-SYMBOL-MACRO\") (string-equal n \"MACROLET\")
+                  (string-equal n \"DEFINE-METHOD-COMBINATION\")
+                  (string-equal n \"EVAL-WHEN\"))
+          (return-from %eval2-cacheable-p nil))))))
+
+(defun %eval2-run-tuple (tuple)
+  "Interpret a cached compiled module tuple (bc entry fn-table rt-table lam-offsets)."
+  (handler-case (mvm-interpret (car tuple) :entry-point (cadr tuple)
+                               :function-table (caddr tuple)
+                               :runtime-table (cadddr tuple) :return-raw nil
+                               :lambda-offsets (car (cddddr tuple)))
+    (error (e) (list :interp-err e))))
+
 (defun eval2-forms (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
@@ -42,6 +79,16 @@
   (unless (and *opcode-table* (> (hash-table-count *opcode-table*) 0))
     (setq *opcode-table* (make-hash-table :test (quote eql)))
     (%populate-opcode-table))
+  ;; PERF Round 2 (compile-caching): if these FORMS are cacheable (no side-
+  ;; effecting DEF*) and already compiled, re-interpret the cached module and
+  ;; skip the whole compile pipeline.  Checked BEFORE the big let so a hit pays
+  ;; none of the setup/hash-alloc cost either.
+  (let ((%cacheable (%eval2-cacheable-p forms)))
+    (when %cacheable
+      (unless *eval2-cache*
+        (setq *eval2-cache* (make-hash-table :test (quote equal))))
+      (let ((%hit (gethash forms *eval2-cache*)))
+        (when %hit (return-from eval2-forms (%eval2-run-tuple %hit)))))
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)
@@ -215,10 +262,17 @@
                       (when (boundp (quote *native-sym-function-table*))
                         (puthash (compute-name-hash pn)
                                  *native-sym-function-table* tramp)))))))
+            ;; PERF Round 2: cache the compiled module for these forms so a
+            ;; later eval2 of the same forms skips the whole compile.  bc is a
+            ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
+            (when %cacheable
+              (setf (gethash forms *eval2-cache*)
+                    (list bc entry fn-table rt-table lam-offsets)))
             (handler-case (mvm-interpret bc :entry-point entry :function-table fn-table
                                          :runtime-table rt-table :return-raw nil
                                          :lambda-offsets lam-offsets)
               (error (e) (list :interp-err e))))
           :no-entry))))
+  )
 ;; Single-expression convenience.
 (defun eval2 (form) (eval2-forms (list form)))

@@ -243,6 +243,39 @@
    tree-walker.  At build time it stays NIL, so the host build's DEFPACKAGE
    no-op is byte-identical to before.")
 
+;;; eval2 QUOTE constant pool (in-image ONLY — *eval2-runtime-p* gated).
+;;;
+;;; CLHS: QUOTE returns ITS OBJECT.  The tree-walker gets this for free (it
+;;; hands back the form's own substructure), but eval2's compile-quote used to
+;;; RE-MATERIALIZE quoted data — re-interning every symbol via
+;;; %INTERN-SYMBOL-PKG from (normalize-name (symbol-name s)) + (symbol-package
+;;; s).  In-image that round-trip is LOSSY: symbol-package returns NIL for
+;;; native #x50 syms (stale 1-slot-era code) and package-alias hashes
+;;; (CL-TEST → CL-USER) don't reproduce the original composite intern key, so
+;;; `(eval ''a)` returned a DIFFERENT symbol object than the literal 'a — the
+;;; systemic WS3-flip symbol-identity divergence (macro-function.8-10,
+;;; find-all-symbols, every eql-on-eval-result test).
+;;;
+;;; Fix: under eval2, compile-quote registers the quoted VALUE in a global
+;;; pool (hash idx → value, GC-visible via the special) and emits ONE
+;;; `:li-const dest idx`; the interpreter's op-LI-CONST loads the ORIGINAL
+;;; object back.  Identity is exact (eq), compiles are smaller/faster, and
+;;; shared-structure semantics match the tree-walker precisely.  The pool only
+;;; grows (indices stay valid for cached compiled modules).  Host/native
+;;; builds never see this path — *eval2-runtime-p* is NIL there, and the
+;;; native :li-const string-pool path is untouched.
+;;; (The pool globals *e2-const-pool* / *e2-const-count* live in mvm.lisp —
+;;; loaded before BOTH this file and interp.lisp in host and image orders.)
+(defun %e2-const-register (value)
+  "Register VALUE in the eval2 quote pool; return its index."
+  (unless *e2-const-pool*
+    (setq *e2-const-pool* (make-hash-table))
+    (setq *e2-const-count* 0))
+  (let ((idx *e2-const-count*))
+    (setf (gethash idx *e2-const-pool*) value)
+    (setq *e2-const-count* (+ idx 1))
+    idx))
+
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")
 
@@ -998,12 +1031,39 @@
   (if (and (consp form) (symbolp (car form)))
       (let* ((name (normalize-name (car form)))
              (expander (gethash name *macro-table*)))
-        (if expander
-            (let ((result (funcall expander form)))
-              (if (eq result form)
-                  (cons form nil)
-                  (cons result t)))
-            (cons form nil)))
+        (cond
+          (expander
+           (let ((result (funcall expander form)))
+             (if (eq result form)
+                 (cons form nil)
+                 (cons result t))))
+          ;; eval2 (in-image runtime compile) ONLY: fall back to the RUNTIME
+          ;; macro tables.  A macro defined at runtime — a nested DEFMACRO's
+          ;; compiled set-macro-function registration, (setf (macro-function
+          ;; SYM) ...), or a previously eval'd defmacro — lives in cl-eval's
+          ;; *macro-function-table*, NOT in the compiler's per-call
+          ;; *macro-table*.  Without this fallback eval2 compiled a call to
+          ;; the macro NAME as an undefined function (silent NIL / crash —
+          ;; the whole defmacro / macro-function ANSI cluster under the WS3
+          ;; flip).  Dispatch mirrors cl-eval's runtime MACROEXPAND-1:
+          ;; %interp-closure expanders get (cdr form); compiled expanders and
+          ;; macro-function wrappers try (form) then (form env).  The T
+          ;; marker (a compiler-builtin macro) is NOT expandable here.
+          ;; Guarded by *eval2-runtime-p* so the host/native build path is
+          ;; byte-identical (%raw-macro-expander exists only in the image).
+          (*eval2-runtime-p*
+           (let ((mf (%raw-macro-expander (car form))))
+             (cond
+               ((null mf) (cons form nil))
+               ((eq mf t) (cons form nil))
+               ((%interp-closure-p mf)
+                (let ((result (%call-interp-closure mf (cdr form))))
+                  (if (eq result form) (cons form nil) (cons result t))))
+               (t
+                (let ((result (handler-case (funcall mf form)
+                                (t (c) (funcall mf form nil)))))
+                  (if (eq result form) (cons form nil) (cons result t)))))))
+          (t (cons form nil))))
       (cons form nil)))
 
 (defun macroexpand-mvm (form)
@@ -4752,6 +4812,16 @@
      (compile-character value dest))
     ((keywordp value)
      (compile-keyword value dest))
+    ;; eval2 (in-image runtime compile) ONLY: QUOTE returns ITS OBJECT.
+    ;; Register the original value in the global quote pool and emit one
+    ;; LI-CONST — the interpreter loads the SAME object back, so symbol /
+    ;; list / vector / string identity through (eval '...) matches the
+    ;; tree-walker exactly.  See *e2-const-pool* for the full story (the
+    ;; re-intern round-trip this replaces was lossy in-image).  Immediates
+    ;; above (nil/t/integers/chars/keywords) keep their cheaper paths —
+    ;; they are identity-safe by construction.
+    (*eval2-runtime-p*
+     (emit-ir :li-const dest (%e2-const-register value)))
     ;; Non-keyword symbol: intern at runtime to produce a real symbol
     ;; object — tagged with its home package, the way the SBCL/CCL
     ;; reader does it.  At SBCL build time we know both the symbol

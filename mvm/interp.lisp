@@ -643,6 +643,22 @@
                    (multiple-value-bind (imm npc2) (fetch-u64 bc npc)
                      (reg-set regs vd imm) (setf pc npc2))))))
 
+          ;; LI-CONST: load constant-pool[idx] — the eval2 QUOTE pool.  The
+          ;; compiler (compile-quote under *eval2-runtime-p*) registered the
+          ;; ORIGINAL quoted object in the global *e2-const-pool* and emitted
+          ;; the pool INDEX as the imm64; loading the object back preserves
+          ;; QUOTE identity exactly (CLHS: quote returns its object), matching
+          ;; the tree-walker.  The pool is a global hash (GC root via the
+          ;; special), so the bytecode stays position/GC-independent.
+          (#.+op-li-const+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (idx npc2) (fetch-u64 bc npc)
+               (reg-set regs vd (%val->word
+                                 (if *e2-const-pool*
+                                     (gethash idx *e2-const-pool*)
+                                     nil)))
+               (setf pc npc2))))
+
           ;; PUSH/POP store real VALUES on mvm-stack (not raw words) so the GC
           ;; traces/updates pushed pointers — same GC-safety reason as the regs
           ;; vector.  (A pushed float/cons raw-word integer would be invisible to
@@ -1265,7 +1281,16 @@
                                (mem-write state (+ #x10000098 (* i 8))
                                           (%val->word v) 3)
                                (incf i)))))
-                       (reg-set regs +vreg-vr+ +mvm-nil+))
+                       ;; Unresolved runtime name: signal UNDEFINED-FUNCTION
+                       ;; (CL semantics — `(eval '(no-such-fn))` must signal).
+                       ;; The old silent `(reg-set VR +mvm-nil+)` made every
+                       ;; undefined call quietly evaluate to NIL under eval2,
+                       ;; so error-expecting ANSI tests failed and value tests
+                       ;; got NILs (WS3 flip).  The signal lands in this
+                       ;; DO-instruction's outer handler-case: routed to an
+                       ;; in-module handler frame when one is active, else
+                       ;; re-signalled out of mvm-interpret to the caller.
+                       (error (quote undefined-function) :name name))
                    (setf pc npc))
                  ;; In-module call: push return frame, jump to the bytecode.
                  ;; SAVE VFP (the caller's frame array) in the frame: the

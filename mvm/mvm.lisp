@@ -396,6 +396,20 @@
 
 (defparameter *opcode-table* (make-hash-table :test 'eql))
 
+;; eval2 QUOTE constant pool (in-image runtime compile ONLY).  compile-quote
+;; under *eval2-runtime-p* registers each quoted VALUE here (via
+;; %e2-const-register in compiler.lisp) and emits `:li-const dest idx`; the
+;; interpreter's op-LI-CONST loads the ORIGINAL object back, preserving QUOTE
+;; identity (CLHS: quote returns its object) exactly like the tree-walker.
+;; Defined HERE because mvm.lisp loads before both compiler.lisp and
+;; interp.lisp in the host AND in-image source orders.  Lazy init in
+;; %e2-const-register (defvar init-thunks don't run in-image — CLAUDE.md
+;; limitation 7).
+(defvar *e2-const-pool* nil
+  "In-image eval2 quote pool: hash-table idx -> original quoted value.")
+(defvar *e2-const-count* 0
+  "Next free index in *e2-const-pool*.")
+
 (defmacro defopcode (name code operands description)
   `(setf (gethash ,code *opcode-table*)
          (make-opcode-info :code ,code :name ,name

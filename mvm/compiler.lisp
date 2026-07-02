@@ -1073,8 +1073,22 @@
                  (declare (ignorable ,@(mapcar #'car bindings)))
                  ,db-form))))))
 
+(defvar *bootstrap-macro-template* nil
+  "PERF: persistent name-hash→expander table for the 94 bootstrap macros, built
+   ONCE on the first register-mvm-bootstrap-macros call.  Every eval2-forms call
+   binds a fresh *macro-table* and used to re-CONSTRUCT all 94 macro closures
+   (a chunk of the per-eval compile cost).  Now the first call builds them +
+   snapshots them here; every subsequent call just COPIES this table into
+   *macro-table* (94 cheap hash inserts, no closure construction).  User
+   macrolet/defmacro still add to the per-call copy and are discarded after.")
+
 (defun register-mvm-bootstrap-macros ()
-  "Register standard CL macros needed to compile *runtime-functions*."
+  "Register standard CL macros needed to compile *runtime-functions*.
+   Fast path (template already built): copy it into the current *macro-table*."
+  (when *bootstrap-macro-template*
+    (maphash (lambda (k v) (setf (gethash k *macro-table*) v))
+             *bootstrap-macro-template*)
+    (return-from register-mvm-bootstrap-macros nil))
   ;; COND → nested IF
   (mvm-define-macro "COND"
     (lambda (form)
@@ -3073,6 +3087,12 @@
            (%register-clos-direct-slots ',class-name ',slot-names)
            ,@(nreverse extra-defuns)
            (find-class ',class-name nil)))))
+  ;; PERF: snapshot the just-built 94-macro *macro-table* into the persistent
+  ;; template so every subsequent call takes the fast copy path above instead of
+  ;; re-constructing all these closures.  (First call only.)
+  (let ((tmpl (make-hash-table :test (quote eql))))
+    (maphash (lambda (k v) (setf (gethash k tmpl) v)) *macro-table*)
+    (setq *bootstrap-macro-template* tmpl))
   )
 
 ;;; ============================================================

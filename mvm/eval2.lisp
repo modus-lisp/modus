@@ -11,6 +11,11 @@
 ;; between the functions resolve in-module (bytecode->bytecode) so NO native
 ;; bridge / value marshalling is needed — one representation throughout.  This
 ;; is the 'drop native' model: the interpreter runs everything as bytecode.
+(defvar *eval2-buffer* nil
+  "PERF: persistent 64KB bytecode buffer reused across eval2-forms calls (see
+   the reuse site) instead of (make-array 65536) every call — mvm-buffer-used-
+   bytes copies the bytecode out before the next call, so nothing retains it.")
+
 (defun eval2-forms (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
@@ -104,7 +109,18 @@
           (setq all-ir (cons pend all-ir))))
       (setq all-ir (reverse all-ir)))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
-    (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+    ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
+    ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,
+    ;; so nothing retains the buffer — safe to reset + reuse.
+    (if *eval2-buffer*
+        (progn
+          (setf (mvm-buffer-position *eval2-buffer*) 0)
+          (clrhash (mvm-buffer-labels *eval2-buffer*))
+          (setf (mvm-buffer-fixups *eval2-buffer*) nil)
+          (setq buf *eval2-buffer*))
+        (progn
+          (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+          (setq *eval2-buffer* buf)))
     ;; Pass 1: size each function, assign cumulative bytecode offsets, register
     ;; in *functions* so emit-time CALL resolution finds them.
     (dolist (e all-ir)

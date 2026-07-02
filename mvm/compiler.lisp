@@ -3633,29 +3633,46 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
-       (let ((hash (%global-name-key name)))
-         (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
-         ;; eval2 bridge reads (mvm-nargs) args; a manual :call needs an
-         ;; explicit :set-nargs or the bridge pulls a STALE count and the
-         ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
-         ;; under eval2 (this is what blocked handler-case's *current-condition*
-         ;; type-dispatch, WS3).  Native fixed-arg SYMBOL-VALUE ignores nargs,
-         ;; so this is byte-identical for the ANSI build — gated on
-         ;; *mvm-emit-halves* (T only in build-generic.lisp / eval2; OFF for ANSI).
-         (when *mvm-emit-halves* (emit-ir :set-nargs 1))
-         (emit-ir :call "SYMBOL-VALUE" 1)
-         (unless (= dest +vreg-vr+)
-           (emit-ir :mov dest +vreg-vr+))))
+       (if *eval2-runtime-p*
+           ;; eval2 production-eval semantics (WS3 flip): a global READ of a
+           ;; name with NO binding in the symbol-value alist must signal
+           ;; UNBOUND-VARIABLE carrying the SYMBOL as :name (cell-error-name.1,
+           ;; eval.error.4) — exactly what the tree-walker's %eval-sym-lookup
+           ;; does via its boundp fallback.  The bare SYMBOL-VALUE call
+           ;; returned NIL for absent entries, silently conflating "unbound"
+           ;; with "bound to NIL".  The quoted symbol rides the eval2 const
+           ;; pool, so the condition's :name is EQ to the source symbol.
+           (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
+                                                    (quote ,name))
+                         env dest)
+           (let ((hash (%global-name-key name)))
+             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
+             ;; eval2 bridge reads (mvm-nargs) args; a manual :call needs an
+             ;; explicit :set-nargs or the bridge pulls a STALE count and the
+             ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
+             ;; under eval2 (this is what blocked handler-case's *current-condition*
+             ;; type-dispatch, WS3).  Native fixed-arg SYMBOL-VALUE ignores nargs,
+             ;; so this is byte-identical for the ANSI build — gated on
+             ;; *mvm-emit-halves* (T only in build-generic.lisp / eval2; OFF for ANSI).
+             (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+             (emit-ir :call "SYMBOL-VALUE" 1)
+             (unless (= dest +vreg-vr+)
+               (emit-ir :mov dest +vreg-vr+)))))
       (t
        ;; Implicit global — treat as dynamic variable (auto-register)
        (format t "  WARN: implicit global ~A~%" name)
        (setf (gethash (normalize-name name) *globals*) t)
-       (let ((hash (%global-name-key name)))
-         (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
-         (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge nargs
-         (emit-ir :call "SYMBOL-VALUE" 1)
-         (unless (= dest +vreg-vr+)
-           (emit-ir :mov dest +vreg-vr+)))))))
+       (if *eval2-runtime-p*
+           ;; Same checked read as the registered-global branch above.
+           (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
+                                                    (quote ,name))
+                         env dest)
+           (let ((hash (%global-name-key name)))
+             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
+             (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge nargs
+             (emit-ir :call "SYMBOL-VALUE" 1)
+             (unless (= dest +vreg-vr+)
+               (emit-ir :mov dest +vreg-vr+))))))))
 
 ;;; ------ Compound Form Dispatch ------
 
@@ -3927,6 +3944,24 @@
       ;; constructor / accessors / predicates / setters so subsequent
       ;; calls in the same source resolve them.  Yields NIL into dest.
       ((= op-name 347335033216607151)   ; DEFSTRUCT
+       ;; eval2 production-eval semantics (WS3 flip): Modus represents
+       ;; structs only as the native tagged array — a (:TYPE …) option is
+       ;; unsupported, and the tree-walker's runtime DEFSTRUCT signals
+       ;; "DEFSTRUCT :TYPE option is not supported" (which defstruct.error.3/
+       ;; .4 catch via signals-error).  The build-time handler silently
+       ;; accepts it, so eval2 of such a defstruct returned normally and the
+       ;; error tests failed.  Match the tree-walker: compile a runtime
+       ;; ERROR call instead.  Gated on *eval2-runtime-p* (native build
+       ;; byte-identical).
+       (when (and *eval2-runtime-p*
+                  (consp (cadr form))
+                  (let ((%has-type nil))
+                    (dolist (%opt (cdr (cadr form)) %has-type)
+                      (when (and (consp %opt) (symbolp (car %opt))
+                                 (string-equal (symbol-name (car %opt)) "TYPE"))
+                        (setq %has-type t)))))
+         (compile-form `(error "DEFSTRUCT :TYPE option is not supported") env dest)
+         (return-from compile-compound))
        ;; Queue the returned IR like the nested-DEFUN path above —
        ;; mvm-compile-toplevel returns (:multi-result (info . ir) …) for
        ;; defstruct; dropping it left every nested-defstruct accessor a
@@ -10101,6 +10136,25 @@
     (free-temp-reg)
     (free-temp-reg)))
 
+(defun %compile-arith-arg-step-e2 (arg env dest fast-op generic-name)
+  "eval2 (WS3 flip) pairwise-arith step that does NOT hold a temp register
+   across the recursive operand compile.  The build-time scheme allocates
+   the temp BEFORE compiling ARG, so a right-nested chain
+   (+ g100 (+ g99 (+ … 0))) — the eval'd let.14 / let*.14 shape — holds one
+   temp per nesting level and blows the 12-register budget ('out of
+   temporary registers').  Here the accumulated LHS is pushed, ARG compiles
+   into DEST itself (temp count unchanged during the recursion), and the
+   temp lives only for the straight-line pair emission — the same stack
+   discipline compile-cons has always used for deep nesting.  Gated to
+   *eval2-runtime-p* so build-time native codegen stays byte-identical."
+  (emit-ir :push dest)
+  (compile-form arg env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :mov temp dest)
+    (emit-ir :pop dest)
+    (emit-arith-pair fast-op generic-name dest temp)
+    (free-temp-reg)))
+
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
   (cond
@@ -10110,13 +10164,16 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '+ arg)
-       (let ((temp (alloc-temp-reg))
-             (*arith-push-depth* (1+ *arith-push-depth*)))
-         (emit-ir :push dest)
-         (compile-form arg env temp)
-         (emit-ir :pop dest)
-         (emit-arith-pair :add-checked "GENERIC-ADD" dest temp)
-         (free-temp-reg))))))
+       (if *eval2-runtime-p*
+           (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+             (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
+           (let ((temp (alloc-temp-reg))
+                 (*arith-push-depth* (1+ *arith-push-depth*)))
+             (emit-ir :push dest)
+             (compile-form arg env temp)
+             (emit-ir :pop dest)
+             (emit-arith-pair :add-checked "GENERIC-ADD" dest temp)
+             (free-temp-reg)))))))
 
 (defun compile-sub (args env dest)
   "Compile (- args...).  Unary `(- x)` lowers to `(- 0 x)` so bignum/ratio/
@@ -10139,13 +10196,16 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '- arg)
-       (let ((temp (alloc-temp-reg))
-             (*arith-push-depth* (1+ *arith-push-depth*)))
-         (emit-ir :push dest)
-         (compile-form arg env temp)
-         (emit-ir :pop dest)
-         (emit-arith-pair :sub "GENERIC-SUBTRACT" dest temp)
-         (free-temp-reg))))))
+       (if *eval2-runtime-p*
+           (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+             (%compile-arith-arg-step-e2 arg env dest :sub "GENERIC-SUBTRACT"))
+           (let ((temp (alloc-temp-reg))
+                 (*arith-push-depth* (1+ *arith-push-depth*)))
+             (emit-ir :push dest)
+             (compile-form arg env temp)
+             (emit-ir :pop dest)
+             (emit-arith-pair :sub "GENERIC-SUBTRACT" dest temp)
+             (free-temp-reg)))))))
 
 (defun compile-mul (args env dest)
   "Compile (* args...).  Uses emit-arith-pair so non-fixnum operands
@@ -10167,13 +10227,16 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '* arg)
-       (let ((temp (alloc-temp-reg))
-             (*arith-push-depth* (1+ *arith-push-depth*)))
-         (emit-ir :push dest)
-         (compile-form arg env temp)
-         (emit-ir :pop dest)
-         (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp)
-         (free-temp-reg))))))
+       (if *eval2-runtime-p*
+           (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+             (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
+           (let ((temp (alloc-temp-reg))
+                 (*arith-push-depth* (1+ *arith-push-depth*)))
+             (emit-ir :push dest)
+             (compile-form arg env temp)
+             (emit-ir :pop dest)
+             (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp)
+             (free-temp-reg)))))))
 
 (defun compile-mul26lo (args env dest)
   "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.

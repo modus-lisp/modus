@@ -2350,6 +2350,29 @@
                                     nil)))))))
               nil)))))
 
+(defun %e2-symbol-value-checked (hash sym)
+  "eval2 (WS3 flip) global-variable READ with CL unbound-variable semantics.
+   Emitted by compile-variable-ref under *eval2-runtime-p* instead of a bare
+   SYMBOL-VALUE call (which returns NIL for an ABSENT alist entry, conflating
+   'unbound' with 'bound to NIL').  Mirrors %eval-sym-lookup's tree-walker
+   fallback exactly: present-in-alist → value; absent → signal
+   UNBOUND-VARIABLE with :name SYM (the ORIGINAL symbol, via the eval2 quote
+   pool) so (cell-error-name c) is EQ to the source symbol
+   (cell-error-name.1, eval.error.4)."
+  (if (%boundp-by-hash hash)
+      (symbol-value hash)
+      (let ((c (%make-condition 'unbound-variable (list :name sym))))
+        ;; Publish + run handler-bind stack first, then longjmp to the
+        ;; nearest handler-case — same sequence as %eval-sym-lookup.
+        (setq *current-condition* c)
+        (%associate-active-restart-frames c)
+        (let ((handled (%signal-condition c)))
+          (if handled
+              nil
+              (if (%error-handler-active-p)
+                  (%hc-longjmp)
+                  nil))))))
+
 (defun %runtime-define-condition (form env)
   "Runtime EVAL of (define-condition NAME (PARENT…) (SLOT…) OPTION…).
    Mirrors compiler.lisp's mvm-define-macro \"DEFINE-CONDITION\" expansion,

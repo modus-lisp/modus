@@ -2234,6 +2234,81 @@
         (%gf-set-methods gf (cons new-method (nreverse filtered))))
       new-method)))
 
+(defun %defmethod-full (gf-name qualifier specializers fn params)
+  "Full runtime DEFMETHOD semantics — the eval2 DEFMETHOD expansion's
+   single entry point (compiler.lisp's DEFMETHOD macro under
+   *eval2-runtime-p*).  Mirrors the tree-walker's DEFMETHOD handler
+   (cl-eval.lisp) so eval2 of `(defmethod ...)` behaves identically:
+   1. CLHS 7.6.4 congruence validation against a DECLARED GF lambda-list
+      (shape + &key acceptance) -> PROGRAM-ERROR on mismatch
+      (defmethod.error.1-12).
+   2. Implicit GF creation with a lambda-list DERIVED from the method's
+      params, so %gf-check-arity can reject wrong-arity calls
+      (defmethod.error.13/.14/.15).
+   3. Dispatch-stub installation into the FUNCTION CELL when the name has
+      none — the old eval2 expansion's nested `(defun NAME (&rest a)
+      (%gf-dispatch 'NAME a))` was a COMPILE-TIME-ONLY module registration
+      (never persisted), so a later native `(funcall sym ...)` resolved
+      nothing, %native-sym-resolve returned the SYMBOL itself on miss, and
+      call-indirect jumped into symbol heap data — the defmethod-via-eval
+      UNCATCHABLE SEGV cluster.
+   4. Method registration + key-acceptance meta recording (CLHS 7.6.5).
+   PARAMS is the method's unspecialized lambda-list (markers verbatim)."
+  (let ((gf (%find-gf gf-name)))
+    (when (and gf (%gf-lambda-list gf))
+      (let ((gf-ll (%gf-lambda-list gf)))
+        (let ((gf-shape (%lambda-list-shape gf-ll))
+              (m-shape  (%lambda-list-shape params)))
+          (unless (%method-ll-congruent-p gf-shape (length specializers)
+                                          m-shape)
+            (%signal-program-error)))
+        (unless (%method-accepts-gf-keys-p gf-ll params)
+          (%signal-program-error)))))
+  (when (null (%find-gf gf-name))
+    (%defgeneric gf-name (%derive-gf-ll-from-method params) nil))
+  ;; Install a runtime dispatch stub in the function cell unless the name
+  ;; already has a function (a prior defgeneric/defmethod installed one —
+  ;; don't clobber it).  set-symbol-function handles every name flavor
+  ;; (CL-sym wrapper, native #x50 sym, (setf X) list via the SETF-NAME
+  ;; convention), and fboundp uses the same %sym-name-or-hash keying.
+  (when (and (%sym-name-or-hash gf-name) (not (fboundp gf-name)))
+    (set-symbol-function gf-name (%make-gf-stub gf-name)))
+  (let ((m (%defmethod gf-name qualifier specializers fn)))
+    (%gf-record-method-meta (%find-gf gf-name) m params)
+    m))
+
+(defun %defgeneric-eval2-precheck (gf-name)
+  "CLHS DEFGENERIC error semantics for the eval2 expansion, mirroring the
+   tree-walker's pre-%defgeneric checks (cl-eval.lisp): a name bound to a
+   macro, a special operator, or an ordinary (non-generic) function cannot
+   be made generic -> PROGRAM-ERROR (defgeneric.error.1/2/3).  Only checked
+   when no GF exists yet (redefinition of an existing GF is fine — its
+   dispatch stub IS fbound)."
+  (when (null (%find-gf gf-name))
+    (let ((symish (or (%cl-sym-p gf-name)
+                      (and (symbolp gf-name)
+                           (not (consp gf-name))))))
+      (when symish
+        (when (macro-function gf-name)
+          (%signal-program-error))
+        (when (special-operator-p gf-name)
+          (%signal-program-error))
+        (when (and (fboundp gf-name)
+                   (not (%generic-function-p (fdefinition gf-name))))
+          (%signal-program-error)))))
+  nil)
+
+(defun %gf-install-dispatch-stub (gf-name)
+  "Install a %gf-dispatch stub as GF-NAME's function (eval2 DEFGENERIC
+   expansion).  The old expansion's nested `(defun NAME ...)` registered a
+   module function at COMPILE time only — nothing reached the runtime
+   function tables, so native (funcall sym ...) / (fdefinition sym) after
+   an eval2 defgeneric failed.  Mirrors the tree-walker's unconditional
+   `(set-symbol-function gf-name (%make-gf-stub gf-name))`."
+  (when (%sym-name-or-hash gf-name)
+    (set-symbol-function gf-name (%make-gf-stub gf-name)))
+  nil)
+
 (defun %dg-gf-callable (gf-name)
   "Value of a DEFGENERIC form: the GENERIC-FUNCTION OBJECT (the GF struct)
    for GF-NAME.  CLHS says DEFGENERIC returns the generic-function object;

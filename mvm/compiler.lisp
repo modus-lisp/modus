@@ -2919,12 +2919,29 @@
                                          ',meta-ll)))
                 inline-methods)))
           `(progn
+             ;; eval2 ONLY: CLHS DEFGENERIC error semantics — a name bound to
+             ;; a macro / special operator / ordinary function signals
+             ;; PROGRAM-ERROR (defgeneric.error.1/2/3); mirrors the
+             ;; tree-walker's pre-%defgeneric checks.
+             ,@(when *eval2-runtime-p*
+                 `((%defgeneric-eval2-precheck ',gf-name)))
              (%defgeneric ',gf-name ',lambda-list
                           ',(if combination combination nil))
              ,@(when apo
                  `((%gf-set-arg-precedence ',gf-name ',apo ',lambda-list)))
-             (defun ,gf-name (&rest ,args-var)
-               (%gf-dispatch ',gf-name ,args-var))
+             ;; Dispatch stub: at BUILD time a real defun (embeds NAME as a
+             ;; literal, no capture).  Under eval2 a nested defun is a
+             ;; COMPILE-TIME module registration only — nothing reaches the
+             ;; runtime function tables, so native (funcall sym ...) /
+             ;; (fdefinition sym) after an eval2 defgeneric missed and
+             ;; call-indirect jumped into symbol heap data (same mechanism as
+             ;; the defmethod-via-eval SEGV cluster).  Install the runtime
+             ;; stub into the function cell instead, mirroring the
+             ;; tree-walker's set-symbol-function + %make-gf-stub.
+             ,(if *eval2-runtime-p*
+                  `(%gf-install-dispatch-stub ',gf-name)
+                  `(defun ,gf-name (&rest ,args-var)
+                     (%gf-dispatch ',gf-name ,args-var)))
              ,@method-forms
              ;; CLHS: DEFGENERIC returns the generic-function OBJECT (the GF
              ;; struct), NOT the name symbol.  The tree-walker's DEFGENERIC
@@ -2982,13 +2999,46 @@
              (setq specs (cons ''t specs)))))
         (setq params (nreverse params))
         (setq specs (nreverse specs))
-        `(progn
-           ;; Ensure a dispatch defun exists (implicit GF creation).  Last
-           ;; defun-wins, so a real defgeneric earlier still governs; this
-           ;; only matters when defmethod appears with no defgeneric.
-           (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
-           (%defmethod ',gf-name ',qualifier (list ,@specs)
-                       (lambda ,params ,@body))))))
+        (if *eval2-runtime-p*
+            ;; eval2 (in-image runtime compile) ONLY: route through
+            ;; %defmethod-full (cl-clos.lisp), which carries the tree-walker's
+            ;; full runtime DEFMETHOD semantics — CLHS 7.6.4 congruence
+            ;; validation (defmethod.error.1-12), implicit GF creation with a
+            ;; DERIVED lambda-list (arity checks, defmethod.error.13-15), and
+            ;; the function-cell dispatch-stub install.  The build-time
+            ;; expansion below relied on a nested DEFUN for the dispatch stub,
+            ;; but under eval2 a nested defun is a COMPILE-TIME module
+            ;; registration only — nothing reached the runtime function
+            ;; tables, so a later native `(funcall sym ...)` missed,
+            ;; %native-sym-resolve returned the SYMBOL itself, and
+            ;; call-indirect jumped into symbol heap data: the
+            ;; defmethod-via-eval UNCATCHABLE SEGV cluster (objects/
+            ;; defmethod.lsp 1-11).  Also wraps the body in the CLHS 7.6.5
+            ;; implicit BLOCK named after the GF (or the inner symbol of a
+            ;; (setf X) name) so RETURN-FROM works (defmethod.5/.6).
+            ;; Block-name dispatch mirrors the tree-walker: SYMBOLP first —
+            ;; in-image CL symbols are CONS wrappers (*sym-tag* . array), so a
+            ;; consp-first test would misroute plain symbol names.  symbolp is
+            ;; wrapper-aware; a (setf X) list's car is SETF, not *sym-tag*.
+            (let ((block-name (cond ((symbolp gf-name) gf-name)
+                                    ((and (consp gf-name)
+                                          (consp (cdr gf-name))
+                                          (symbolp (cadr gf-name)))
+                                     (cadr gf-name))
+                                    (t nil))))
+              `(%defmethod-full ',gf-name ',qualifier (list ,@specs)
+                                (lambda ,params
+                                  ,(if block-name
+                                       `(block ,block-name ,@body)
+                                       `(progn ,@body)))
+                                ',params))
+            `(progn
+               ;; Ensure a dispatch defun exists (implicit GF creation).  Last
+               ;; defun-wins, so a real defgeneric earlier still governs; this
+               ;; only matters when defmethod appears with no defgeneric.
+               (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
+               (%defmethod ',gf-name ',qualifier (list ,@specs)
+                           (lambda ,params ,@body)))))))
 
   ;; DEFINE-METHOD-COMBINATION — (define-method-combination name &rest options)
   ;; SHORT form: (define-method-combination name :operator op

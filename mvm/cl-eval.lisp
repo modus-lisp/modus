@@ -4146,6 +4146,12 @@
   ;; CLOS internals so eval'd defgeneric/defmethod forms resolve.
   (puthash "%DEFGENERIC" ht #'%defgeneric)
   (puthash "%DEFMETHOD" ht #'%defmethod)
+  ;; eval2 DEFMETHOD/DEFGENERIC expansion targets (WS3 flip): full runtime
+  ;; defmethod semantics + function-cell stub install.  Without these in the
+  ;; bridge table, eval2's :call to them silently resolved nothing.
+  (puthash "%DEFMETHOD-FULL" ht #'%defmethod-full)
+  (puthash "%GF-INSTALL-DISPATCH-STUB" ht #'%gf-install-dispatch-stub)
+  (puthash "%DEFGENERIC-EVAL2-PRECHECK" ht #'%defgeneric-eval2-precheck)
   (puthash "%DEFCLASS" ht #'%defclass)
   (puthash "%FIND-GF" ht #'%find-gf)
   (puthash "%GF-DISPATCH" ht #'%gf-dispatch)

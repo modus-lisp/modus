@@ -33,16 +33,16 @@
   (dolist (f forms t)
     (when (and (consp f) (symbolp (car f)))
       (let ((n (symbol-name (car f))))
-        (when (or (string-equal n \"DEFUN\") (string-equal n \"DEFMACRO\")
-                  (string-equal n \"DEFPACKAGE\") (string-equal n \"IN-PACKAGE\")
-                  (string-equal n \"DEFVAR\") (string-equal n \"DEFPARAMETER\")
-                  (string-equal n \"DEFCONSTANT\") (string-equal n \"DEFSTRUCT\")
-                  (string-equal n \"DEFCLASS\") (string-equal n \"DEFGENERIC\")
-                  (string-equal n \"DEFMETHOD\") (string-equal n \"DEFTYPE\")
-                  (string-equal n \"DEFINE-CONDITION\") (string-equal n \"DEFSETF\")
-                  (string-equal n \"DEFINE-SYMBOL-MACRO\") (string-equal n \"MACROLET\")
-                  (string-equal n \"DEFINE-METHOD-COMBINATION\")
-                  (string-equal n \"EVAL-WHEN\"))
+        (when (or (string-equal n "DEFUN") (string-equal n "DEFMACRO")
+                  (string-equal n "DEFPACKAGE") (string-equal n "IN-PACKAGE")
+                  (string-equal n "DEFVAR") (string-equal n "DEFPARAMETER")
+                  (string-equal n "DEFCONSTANT") (string-equal n "DEFSTRUCT")
+                  (string-equal n "DEFCLASS") (string-equal n "DEFGENERIC")
+                  (string-equal n "DEFMETHOD") (string-equal n "DEFTYPE")
+                  (string-equal n "DEFINE-CONDITION") (string-equal n "DEFSETF")
+                  (string-equal n "DEFINE-SYMBOL-MACRO") (string-equal n "MACROLET")
+                  (string-equal n "DEFINE-METHOD-COMBINATION")
+                  (string-equal n "EVAL-WHEN"))
           (return-from %eval2-cacheable-p nil))))))
 
 (defun %eval2-run-tuple (tuple)
@@ -54,12 +54,25 @@
    (vector-push*.error, defmethod.error, signals-error helpers) failed under
    the WS3 flip.  Callers that want the capture behaviour (the e2diff gate)
    wrap eval2 in their own handler-case."
-  (%mvm-wrap-escaping-result
-    (mvm-interpret (car tuple) :entry-point (cadr tuple)
-                   :function-table (caddr tuple)
-                   :runtime-table (cadddr tuple) :return-raw nil
-                   :lambda-offsets (car (cddddr tuple)))
-    (car tuple) (caddr tuple) (cadddr tuple) (car (cddddr tuple))))
+  ;; MULTIPLE VALUES propagate (WS3 flip): mvm-interpret stashes the run's
+  ;; simulated MV state in *mvm-last-mv* (read IMMEDIATELY — see interp.lisp);
+  ;; re-emit via values-list so the native caller's multiple-value-list /
+  ;; m-v-bind around (eval …) sees every value, matching the tree-walker.
+  ;; The tail if/values-list shape is values-preserving per
+  ;; tail-form-is-values-p, so this function's epilogue does NOT reset
+  ;; MV-count back to 1.
+  (let* ((%prim (%mvm-wrap-escaping-result
+                  (mvm-interpret (car tuple) :entry-point (cadr tuple)
+                                 :function-table (caddr tuple)
+                                 :runtime-table (cadddr tuple) :return-raw nil
+                                 :lambda-offsets (car (cddddr tuple)))
+                  (car tuple) (caddr tuple) (cadddr tuple) (car (cddddr tuple))))
+         (%mv *mvm-last-mv*))
+    (if %mv
+        (if (eql (car %mv) 0)
+            (values)
+            (values-list (cons %prim (cdr %mv))))
+        %prim)))
 
 (defun eval2-forms (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
@@ -213,7 +226,7 @@
       (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
         (emit-bytecode-for-ir buf ir lp)))
     (dolist (e all-ir)
-      (when (string-equal (string (function-info-name (car e))) \"%EVAL2-THUNK\")
+      (when (string-equal (string (function-info-name (car e))) "%EVAL2-THUNK")
         (setq entry (function-info-bytecode-offset (car e)))))
     (let ((bc (mvm-buffer-used-bytes buf)))
       (if entry
@@ -236,11 +249,11 @@
                 ;; argument (make-list 0 / member 0 / (- 10 j)=0 in nsubstitute's
                 ;; bounds loops) is indistinguishable from a lambda-at-offset-0,
                 ;; and wrapping it into a #x52 trampoline corrupted the callee
-                ;; (make-list \"non-negative fixnum\", remove returned input
+                ;; (make-list "non-negative fixnum", remove returned input
                 ;; unchanged).  %mvm-lambda-offset-p has the matching read-side
                 ;; guard; data-0 priority is correct since the first module
                 ;; function is always a non-lambda (defun / %EVAL2-THUNK).
-                (when (and (or (search \"$$LAMBDA\" nm) (search \"$$CLOSURE\" nm))
+                (when (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                            (not (eql off 0)))
                   (puthash off lam-offsets t))))
             ;; WS3 def persistence: install each top-level user DEFUN as a
@@ -283,11 +296,19 @@
             ;; closure (see %mvm-wrap-escaping-result) so `(eval '#'(lambda
             ;; ...))` hands back a natively-funcallable, per-call-distinct
             ;; function object.
-            (%mvm-wrap-escaping-result
-              (mvm-interpret bc :entry-point entry :function-table fn-table
-                             :runtime-table rt-table :return-raw nil
-                             :lambda-offsets lam-offsets)
-              bc fn-table rt-table lam-offsets))
+            ;; MULTIPLE VALUES propagate — same *mvm-last-mv* + values-list
+            ;; re-emission as %eval2-run-tuple (see the comment there).
+            (let* ((%prim (%mvm-wrap-escaping-result
+                            (mvm-interpret bc :entry-point entry :function-table fn-table
+                                           :runtime-table rt-table :return-raw nil
+                                           :lambda-offsets lam-offsets)
+                            bc fn-table rt-table lam-offsets))
+                   (%mv *mvm-last-mv*))
+              (if %mv
+                  (if (eql (car %mv) 0)
+                      (values)
+                      (values-list (cons %prim (cdr %mv))))
+                  %prim)))
           :no-entry))))
   )
 ;; Single-expression convenience.

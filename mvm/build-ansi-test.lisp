@@ -267,12 +267,27 @@
 ;;; into *sym-name-table* at boot.  symbol-name then consults that
 ;;; table for native syms.
 
-(defun %scan-symbol-names-host (source-str)
+(defun %scan-symbol-names-host (source-str &optional (%pkg nil))
   "Walk SOURCE-STR via SBCL reader, recursively collecting every SYMBOL
    that appears in any form.  Returns a hash-table of upcased name
-   strings → T."
+   strings → T.
+
+   %PKG (optional): bind *package* to it for the read.  The WS3
+   self-host block (*compiler-in-image-source*) must be read under
+   :modus.mvm — interp.lisp contains #.+op-nop+ READ-TIME EVALS whose
+   constants live in :modus.mvm.  Under a :cl-user read, the first #.
+   hit an unbound +OP-NOP+, the read errored, and the
+   `(error () (return))` ABORTED THE WHOLE SCAN — so everything
+   concatenated after interp.lisp (compiler.lisp, eval2.lisp) silently
+   contributed NO names.  Compiler-backquote literals like
+   %SETF-MEM-REF then had no *sym-name-table* entry, in-image
+   SYMBOL-NAME returned \"\" for them, and eval2's compile of any
+   (setf (mem-ref …) …) — i.e. any (values …) form — mis-dispatched
+   into an unresolvable call (the WS3 flip MV-cluster hang).
+   All other sources keep the historical default-package read."
   (let ((names (make-hash-table :test 'equal))
-        (eof (list :eof)))
+        (eof (list :eof))
+        (*package* (if %pkg (or (find-package %pkg) *package*) *package*)))
     (labels ((walk (f)
                (cond
                  ((symbolp f)
@@ -441,12 +456,17 @@
 ;; collision → in-module cross-call resolves to the wrong (last) function →
 ;; infinite self-recursion.  (Reader-interned symbols already work via the
 ;; package-symtab fallback; this closes the build-literal gap.)
-(defun %build-sym-name-auto-source (extra-sources)
+(defun %build-sym-name-auto-source (extra-sources &optional modus-pkg-sources)
   (let ((tbl (make-hash-table :test 'equal)))
     (dolist (src (append (list *prelude-source* *gc-source* *mcgc-pin-source*
                                *rt-source* *bridge-source* *test-source*)
                          extra-sources))
       (let ((found (%scan-symbol-names-host src)))
+        (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
+                 found)))
+    ;; Sources that must be READ under :modus.mvm (see %scan-symbol-names-host).
+    (dolist (src modus-pkg-sources)
+      (let ((found (%scan-symbol-names-host src :modus.mvm)))
         (maphash (lambda (k v) (declare (ignore v)) (setf (gethash k tbl) t))
                  found)))
     ;; Also scan ANSI test files so test-only symbol literals (e.g.
@@ -5354,8 +5374,24 @@
 ;; Now that *driver-source* exists, build the sym-name reverse table INCLUDING
 ;; the driver's quoted symbols (so the in-image eval2 self-check's `(defun sq
 ;; …)` and any other driver literal has a recoverable SYMBOL-NAME).
+;;
+;; ALSO scan *compiler-in-image-source* (mvm.lisp / interp.lisp / compiler.lisp
+;; / eval2.lisp) — the WS3 self-hosted compiler.  Its OWN backquoted expansion
+;; literals (the MEM-REF in compile-values' `(setf (mem-ref …) …)`, %IDIV-TRUNC,
+;; EXACT-DIVIDE, …) are build-literal symbols too; without their names in
+;; *sym-name-table*, in-image SYMBOL-NAME returns "" for them, so NAME-EQ inside
+;; the in-image SETF expander missed the MEM-REF case and fell through to the
+;; generic SET-<accessor> path with an EMPTY accessor name.  Every such name
+;; collided at "" in eval2's *functions* (last-defun-wins), the emitted
+;; in-module CALL resolved to bytecode offset 0 = the module's first function,
+;; and the module recursed on itself forever: eval2 of ANY (values …) /
+;; multiple-value form spun or heap-crashed the fork (multiple-value-prog1.8,
+;; macro-function.8-10, symbol-function.1 under the WS3 flip).  build-generic
+;; has always scanned its compiler/interp sources (its *all-runtime-source*
+;; includes them) — this brings the ANSI build to parity.
 (setq *sym-name-auto-source*
-      (%build-sym-name-auto-source (list *driver-source*)))
+      (%build-sym-name-auto-source (list *driver-source*)
+                                   (list *compiler-in-image-source*)))
 
 (format t "~%Assembling full source...~%")
 

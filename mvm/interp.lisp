@@ -457,6 +457,36 @@
         (reg-set regs +vreg-vr+ +mvm-t+))
       (mvm-jb-pc jb))))
 
+;; WS3 flip MV propagation: secondary values of the LAST completed
+;; mvm-interpret call, as (count . secondaries-list), or NIL when the run
+;; ended with MV-count = 1 (the single-value case).  Production EVAL must
+;; return the evaluated form's MULTIPLE values to its native caller
+;; ((multiple-value-list (eval '(values 1 2 3))) → (1 2 3)) — but the
+;; interpreter models the MV slots in its per-state SIMULATED memory hash,
+;; which is unreachable once mvm-interpret returns.  So the return path
+;; (return-raw NIL only — the eval2 path) stashes the simulated MV state
+;; here; eval2-forms / %eval2-run-tuple read it IMMEDIATELY after their
+;; mvm-interpret call returns and re-emit the values via values-list (a
+;; native fn that writes the REAL MV slots and is exempt from the
+;; set-mv-count=1 epilogue).  Read-right-after-set means nesting is safe:
+;; an inner (eval …) inside an outer interpret overwrites this, but its
+;; reader (the inner eval2 tail) consumed it before the outer interpret
+;; resumed.  Defvar defaults NIL at boot — exactly the wanted initial state.
+(defvar *mvm-last-mv* nil)
+
+(defun %mvm-collect-mv-secs (state mvc)
+  "Read the MVC-1 SECONDARY values (indices 0..MVC-2) from the simulated
+   MV-value slots (#x10000098 + i*8), in order.  Reads back-to-front so
+   each element prepends — no reverse needed.  Same word decoding op-load
+   uses (%word->val of the stored word)."
+  (let ((secs nil)
+        (i (- mvc 2)))
+    (loop
+      (when (< i 0) (return secs))
+      (setq secs (cons (%word->val (mem-read state (+ #x10000098 (* i 8)) 3))
+                       secs))
+      (setq i (- i 1)))))
+
 (defun mvm-interpret (bytecode &key (entry-point 0) function-table runtime-table
                                     (return-raw t) initial-args initial-cenv
                                     lambda-offsets)
@@ -508,6 +538,15 @@
     (when initial-cenv
       (setf (mvm-cenv state) (%val->word initial-cenv)))
 
+    ;; Initialize the SIMULATED MV-count slot to 1 (single value) so the
+    ;; return path below can trust it even for a module that never writes
+    ;; it (a bare literal thunk with a values-preserving tail shape).  In
+    ;; native code the real slot always holds the last callee's count; the
+    ;; fresh per-state memory hash would otherwise read as 0 (= "zero
+    ;; values"), corrupting single-value results.  Word encoding matches
+    ;; op-store / the bridge mirror: the WORD of the fixnum count.
+    (mem-write state #x10000090 (%val->word 1) 3)
+
     (loop
       ;; Re-load regs from the state each iteration: the compiled in-image
       ;; interpreter may cache `regs` in a register, but a GC during
@@ -518,9 +557,20 @@
       ;; this is belt-and-suspenders there.)
       (setf regs (mvm-regs state))
       (when (or (mvm-halted state) (>= pc len))
-        (return (if return-raw
-                    (reg-get regs +vreg-vr+)        ; raw word (caller re-tags)
-                    (svref regs +vreg-vr+))))       ; value directly (boundary-safe)
+        (if return-raw
+            (return (reg-get regs +vreg-vr+))       ; raw word (caller re-tags)
+            ;; Value path (eval2): stash the run's MULTIPLE-VALUE state for
+            ;; the caller (see *mvm-last-mv*).  The simulated MV-count slot
+            ;; is authoritative here: compile-values / the bridge mirror
+            ;; write it, the fn epilogue's op-set-mv-count resets it to 1
+            ;; (matching native, where they are ONE real location), and the
+            ;; entry above initialized it to 1.  Counts outside [0..64] are
+            ;; treated as 1 (defensive: a raw store aliasing the slot).
+            (let ((%mvc (%word->val (mem-read state #x10000090 3))))
+              (if (and (integerp %mvc) (>= %mvc 0) (<= %mvc 64) (not (eql %mvc 1)))
+                  (setq *mvm-last-mv* (cons %mvc (%mvm-collect-mv-secs state %mvc)))
+                  (setq *mvm-last-mv* nil))
+              (return (svref regs +vreg-vr+)))))    ; value directly (boundary-safe)
       (when *mvm-trace*
         (format t "  TRACE pc=~D op=~D flags=~S vr=~S~%"
                 pc (aref bc pc) (mvm-flags state) (reg-get regs +vreg-vr+)))
@@ -628,9 +678,15 @@
                 (setf pc npc))
                (t
                 ;; FRAME-ENTER: allocate a generously-sized frame so all locals
-                ;; that later FRAME-ALLOCs would add still fit.
+                ;; that later FRAME-ALLOCs would add still fit.  The compiler
+                ;; allows up to *let-binding-limit* = 120 binding slots per
+                ;; frame (check-frame-overflow) plus temp spills; the previous
+                ;; +64 over-allocation was BELOW that bound, so an eval'd
+                ;; 100-binding LET (ANSI let.14 / let*.14) stack-stored past
+                ;; the 64-slot array and errored.  +160 covers the compiler's
+                ;; own limit with headroom.
                 (let* ((params (logand code #xFF))
-                       (frame-size (+ params 64)))
+                       (frame-size (+ params 160)))
                   (reg-set regs +vreg-vfp+
                         (%val->word (make-array frame-size :initial-element 0))))
                 (setf pc npc)))))
@@ -1442,7 +1498,17 @@
              (reg-set regs vd (mvm-cenv state)) (setf pc npc)))
           (#.+op-set-mv-count+
            (multiple-value-bind (n npc) (fetch-byte bc pc)
-             (setf (mvm-mv-count state) n) (setf pc npc)))
+             (setf (mvm-mv-count state) n)
+             ;; ALSO write the SIMULATED MV-count slot (#x10000090).  In
+             ;; native code op-set-mv-count and the mem-ref MV-count slot are
+             ;; ONE real memory location; the interp modeled them separately
+             ;; (state field vs memory hash), so a function epilogue's
+             ;; set-mv-count=1 reset never reached the slot that
+             ;; multiple-value-bind / the eval2 MV return path read — a stale
+             ;; count from an inner (values …) leaked past a single-value
+             ;; return.  Word encoding matches op-store / the bridge mirror.
+             (mem-write state #x10000090 (%val->word n) 3)
+             (setf pc npc)))
 
           ;; --- Actor / Concurrency ---
           (#.+op-save-ctx+

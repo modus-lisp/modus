@@ -9702,6 +9702,11 @@
       ;; works, sometimes it isn't and recovery fails.  An explicit
       ;; signal eliminates that fragility.
       (emit-ir :bnnull fn-call-reg good-fn-label)
+      ;; eval2 bridge: manual :call MUST set nargs or the interp's runtime
+      ;; bridge pulls a STALE count and collects garbage args (see the
+      ;; SYMBOL-VALUE sites).  Native fixed-arg fns ignore nargs, so the
+      ;; native build is byte-identical without it.
+      (when *mvm-emit-halves* (emit-ir :set-nargs 0))
       (emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
       ;; If %signal-undefined-function returns (no handler active),
       ;; fall through to the existing dispatch — the original
@@ -9744,6 +9749,12 @@
       (emit-ir :push +vreg-v2+)
       (emit-ir :push +vreg-v3+)
       (emit-ir :mov +vreg-v0+ fn-call-reg)
+      ;; eval2 bridge nargs (see NIL-guard above): with a STALE nargs=0 the
+      ;; bridge called %NATIVE-SYM-RESOLVE with NO args -> (aref NIL 0)
+      ;; hardware fault -> SIGSEGV-handler longjmp to a stale native frame
+      ;; -> every eval2 (funcall 'SYM ...) silently unwound to the next
+      ;; toplevel form (the asdf-gauntlet form-43 detect-os escape).
+      (when *mvm-emit-halves* (emit-ir :set-nargs 1))
       (emit-ir :call "%NATIVE-SYM-RESOLVE" 1)
       (emit-ir :mov fn-call-reg +vreg-vr+)
       (emit-ir :pop +vreg-v3+)
@@ -9993,6 +10004,8 @@
     ;; --- Closure/symbol dispatch (mirrors compile-funcall) ---
     ;; NIL-funcall guard.
     (emit-ir :bnnull fn-reg good-fn-label)
+    ;; eval2 bridge nargs — see compile-funcall's NIL-guard.
+    (when *mvm-emit-halves* (emit-ir :set-nargs 0))
     (emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
     (emit-ir-label good-fn-label)
     ;; Native MVM symbol dispatch (subtag #x50).
@@ -10013,6 +10026,8 @@
     ;; %NATIVE-SYM-RESOLVE clobbers V0.
     (emit-ir :push list-reg)
     (emit-ir :mov +vreg-v0+ fn-reg)
+    ;; eval2 bridge nargs — see compile-funcall's resolver call.
+    (when *mvm-emit-halves* (emit-ir :set-nargs 1))
     (emit-ir :call "%NATIVE-SYM-RESOLVE" 1)
     (emit-ir :mov fn-reg +vreg-vr+)
     (emit-ir :pop list-reg)
@@ -10803,6 +10818,8 @@
     ;; longjmps when a handler-case is active; otherwise it returns
     ;; NIL and we fall through to done with dest = NIL.
     (emit-ir-label error-label)
+    ;; eval2 bridge nargs — see compile-funcall's NIL-guard.
+    (when *mvm-emit-halves* (emit-ir :set-nargs 0))
     (emit-ir :call "%SIGNAL-TYPE-ERROR" 0)
     (emit-ir :mov dest +vreg-vr+)
     (emit-ir-label done-label)
@@ -13063,6 +13080,8 @@
     ;; a defensive branch (the body itself never executes because the
     ;; longjmp unwinds the frame, but the branch keeps the no-handler
     ;; case from running the body on the wrong number of args).
+    ;; eval2 bridge nargs — see compile-funcall's NIL-guard.
+    (when *mvm-emit-halves* (emit-ir :set-nargs 0))
     (emit-ir :call "%SIGNAL-PROGRAM-ERROR" 0)
     (emit-ir :mov +vreg-vr+ +vreg-vn+)
     (emit-ir :br *function-return-label*)

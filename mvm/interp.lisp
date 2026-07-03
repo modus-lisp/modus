@@ -525,8 +525,24 @@
     (when initial-args
       (let ((i 0))
         (dolist (a initial-args)
-          (when (< (+ +vreg-v0+ i) +num-vregs+)
-            (setf (svref regs (+ +vreg-v0+ i)) a))
+          ;; Args 0..3 go in V0..V3 — the MVM calling convention's register
+          ;; window (4 = compiler.lisp's +max-reg-args+, hardcoded here for
+          ;; the same load-order reason as %mvm-collect-call-args).  Args 4+
+          ;; go on the mvm-stack, top = arg4 — exactly where an in-module
+          ;; CALLER's push sequence leaves them, so the callee's frame-enter
+          ;; overflow copy (>4 fixed params) and the &rest prologue's 0x0530
+          ;; trap find them.  Registers V4+ alone were invisible to both: a
+          ;; trampoline-called function with >4 params read 0 for every arg
+          ;; past the register window (the ensure-inherited 8-arg TYPE-ERROR
+          ;; cluster, asdf gauntlet).  NEVER store past the register window:
+          ;; the old `V0+i < +num-vregs+` guard let a 17th+ arg overwrite the
+          ;; SPECIAL registers (VR=16 … VN=19 the canonical NIL … VPC=22), so
+          ;; any trampoline call with >=20 args corrupted NIL and the callee
+          ;; TYPE-ERRORed (ensure-package's 27-arg apply, define-package).
+          (if (< i 4)
+              (setf (svref regs (+ +vreg-v0+ i)) a)
+              (setf (mvm-stack state)
+                    (append (mvm-stack state) (list a))))
           (setf i (+ i 1)))
         (setf (mvm-nargs state) i)))
     ;; The closure-env register is stored as a WORD (op-set-cenv does
@@ -686,9 +702,37 @@
                 ;; the 64-slot array and errored.  +160 covers the compiler's
                 ;; own limit with headroom.
                 (let* ((params (logand code #xFF))
-                       (frame-size (+ params 160)))
-                  (reg-set regs +vreg-vfp+
-                        (%val->word (make-array frame-size :initial-element 0))))
+                       (frame-size (+ params 160))
+                       (frame (make-array frame-size :initial-element 0)))
+                  ;; OVERFLOW-ARG COPY for FIXED-ARITY functions with >4
+                  ;; params: mirror of the native x64 frame-enter trap, which
+                  ;; copies caller-stack args ([RBP+16+k*8]) into frame slots
+                  ;; 4..params-1.  In the interpreter the caller left args 4+
+                  ;; on the mvm-stack (top = arg4 — compile-call pushes
+                  ;; overflow args before the reg-arg push/pop shuffle), and
+                  ;; the fresh frame is all-zero, so WITHOUT this copy every
+                  ;; 5th+ parameter of an eval2 function read as 0 — the asdf
+                  ;; gauntlet's define-package TYPE-ERROR cluster
+                  ;; (ensure-inherited/ensure-symbol take 8 args; check-type
+                  ;; on a zeroed hash-table param signalled).  Non-destructive
+                  ;; walk (the caller's post-call POPs still drain the stack).
+                  ;; Copy params-4 entries UNCONDITIONALLY (bounded only by
+                  ;; stack depth) — exactly the native trap's semantics.  Do
+                  ;; NOT bound by nargs: compile-call PADS under-supplied
+                  ;; direct calls to param-count with NILs (pushing params-4
+                  ;; entries while :set-nargs reports the true pre-pad
+                  ;; count), and the static-rest sentinel path (nargs=255)
+                  ;; also pushes exactly params-4 entries (the packed rest
+                  ;; list included) — an nargs bound would miss both.
+                  (when (> params 4)
+                    (let ((s (mvm-stack state))
+                          (i 4))
+                      (loop
+                        (when (or (>= i params) (null s)) (return))
+                        (%obj-elt-set frame i (car s))
+                        (setq s (cdr s))
+                        (setq i (1+ i)))))
+                  (reg-set regs +vreg-vfp+ (%val->word frame)))
                 (setf pc npc)))))
 
           ;; --- Data Movement ---

@@ -1931,7 +1931,12 @@
 (defun subseq (seq start &rest end-arg)
   "Return a subsequence from START to END (END defaults to length)."
   (let ((end (if end-arg (car end-arg) (length seq))))
-  (if (consp seq)
+  ;; NIL is a (empty) list: (subseq nil 0 0) must return NIL, not #().
+  ;; The consp-only test sent NIL down the array branch, returning an
+  ;; empty VECTOR — which broke the in-image compiler's static-rest
+  ;; pre-pack ((append (subseq args 0 0) ...) → TYPE-ERROR) for any
+  ;; 0-arg call to a req=0 &rest/&key callee in the same eval2 module.
+  (if (or (null seq) (consp seq))
       ;; List: build new list
       (let ((result nil)
             (cur (nthcdr start seq))

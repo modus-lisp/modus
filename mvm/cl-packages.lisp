@@ -754,13 +754,45 @@
                                               (let ((s (%make-cl-symbol name-str)))
                                                 (%cl-sym-set-package s pkg)
                                                 ;; Re-read after alloc — GC may
-                                                ;; have moved the table.  Only
-                                                ;; claim the KEY slot if it is
-                                                ;; free; a colliding-case name
-                                                ;; that already owns it keeps it.
+                                                ;; have moved the table.  Claim
+                                                ;; the KEY slot if it is free —
+                                                ;; OR if the current occupant's
+                                                ;; name is UNRESOLVABLE ("").
+                                                ;; A name-less occupant is an
+                                                ;; early-boot %INTERN-SYMBOL-PKG
+                                                ;; native (a compiled literal
+                                                ;; that ran before
+                                                ;; *sym-name-table* was
+                                                ;; populated, e.g. the '&REST
+                                                ;; in %register-defpackage-
+                                                ;; macro's lambda list).  If we
+                                                ;; DON'T replace it, identity
+                                                ;; splits permanently: EXPORT
+                                                ;; keys the CL seeding entry by
+                                                ;; symbol-name (""), so CL:&REST
+                                                ;; stays stuck :INTERNAL, the
+                                                ;; reader's inherited lookup
+                                                ;; misses, CL-USER mints a
+                                                ;; shadowing internal &REST, and
+                                                ;; the self-hosted compiler's
+                                                ;; (eq p '&rest) never matches a
+                                                ;; read symbol — every eval2
+                                                ;; &rest param compiled as a
+                                                ;; positional (asdf gauntlet
+                                                ;; define-package TYPE-ERROR
+                                                ;; cluster).  Replacing makes
+                                                ;; every later compiled-literal
+                                                ;; lookup converge on this
+                                                ;; properly-named wrapper.  A
+                                                ;; colliding-CASE occupant (|a|
+                                                ;; vs A) has a NON-empty name
+                                                ;; and keeps the slot as before.
                                                 (let ((g (mem-ref #x10000088 :u64)))
-                                                  (when (and g (not (gethash key g)))
-                                                    (puthash key g s)))
+                                                  (when g
+                                                    (let ((old (gethash key g)))
+                                                      (when (or (null old)
+                                                                (= (length (symbol-name old)) 0))
+                                                        (puthash key g s)))))
                                                 s))))
                                 ;; A reused EXISTING symbol may have been
                                 ;; created earlier (by %INTERN-SYMBOL-PKG at

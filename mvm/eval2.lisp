@@ -135,13 +135,32 @@
         ;; tables — so a LATER (eval2 …) call OR the tree-walker can call it.
         ;; Without this every (eval2 '(defun f …)) discarded f (closed-world
         ;; module), so no multi-form program (asdf/load/REPL) could run on eval2.
-        (persist-names (let ((ns nil))
-                         (dolist (f forms)
-                           (when (and (consp f) (symbolp (car f))
-                                      (string-equal (symbol-name (car f)) "DEFUN")
-                                      (symbolp (cadr f)))
-                             (setq ns (cons (string (cadr f)) ns))))
-                         ns)))
+        ;; CLHS 3.2.3.1: forms in a top-level EVAL-WHEN / PROGN / LOCALLY body
+        ;; are THEMSELVES top level, so their DEFUNs must persist too —
+        ;; uiop/asdf wraps nearly every defun in (eval-when (…) …); without
+        ;; this the defun compiles into the module but never reaches the global
+        ;; function tables (gauntlet FAILFORM: PARSE-DEFINE-PACKAGE-FORM,
+        ;; FEATUREP … UNDEFINED-FUNCTION).  The worklist recurses those
+        ;; wrappers; mvm-compile-toplevel's handlers already register nested
+        ;; defuns as module functions (multi-result), so the install loop below
+        ;; finds them in all-ir by name.
+        (persist-names (let ((ns nil) (stack (list forms)))
+                         (loop
+                           (when (null stack) (return ns))
+                           (let ((body (car stack)))
+                             (setq stack (cdr stack))
+                             (dolist (f body)
+                               (when (and (consp f) (symbolp (car f)))
+                                 (let ((hn (symbol-name (car f))))
+                                   (cond
+                                     ((and (string-equal hn "DEFUN")
+                                           (symbolp (cadr f)))
+                                      (setq ns (cons (string (cadr f)) ns)))
+                                     ((string-equal hn "EVAL-WHEN")
+                                      (setq stack (cons (cddr f) stack)))
+                                     ((or (string-equal hn "PROGN")
+                                          (string-equal hn "LOCALLY"))
+                                      (setq stack (cons (cdr f) stack))))))))))))
     (register-mvm-bootstrap-macros)
     ;; Split: last form is the expression; preceding forms are definitions.
     ;; A TRAILING defun is moved into the module definitions (so it gets a real

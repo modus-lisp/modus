@@ -3857,44 +3857,108 @@
 ;;; undefined-function signal (cons-as-fn is invalid).
 
 (defun %funcall-ic-0 (fn)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn nil)
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn nil))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn)))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-1 (fn a)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-2 (fn a b)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a b))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-3 (fn a b c)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a b c))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-4 (fn a b c d)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a b c d))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-5 (fn a b c d e)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a b c d e))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d e)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-6 (fn a b c d e f)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a b c d e f))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d e f)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f))
+    (t (%signal-undefined-function))))
 
 (defun %funcall-ic-7 (fn a b c d e f g)
-  (if (%interp-closure-p fn)
-      (%call-interp-closure fn (list a b c d e f g))
-      (%signal-undefined-function)))
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d e f g)))
+    ;; CL-symbol WRAPPER (cons *sym-tag* [hash pkg name]): funcall of a
+    ;; symbol must call its global function (CLHS funcall accepts function
+    ;; designators).  The wrapper is cons-tagged so it lands in this IC
+    ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
+    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
+    ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f g))
+    (t (%signal-undefined-function))))
 
 ;;; ============================================================
 ;;; %FUNCALL-GF-N — funcall a GF struct (subtag #x32, slot 0 =

@@ -3935,10 +3935,16 @@
 (defvar *use-eval2* nil
   "WS3 flip flag.  When T, production EVAL/LOAD route to eval2 (compile the
    form to MVM bytecode + interpret) instead of the tree-walker %eval-in-env.
-   Default NIL = tree-walker (behaviour-identical to before the flip).  Set to
-   T at boot by the MODUS_USE_EVAL2 build flag (the ~~USE-EVAL2-INIT~~ slot in
-   kernel-main) to test the flip.  Defvar defaults NIL (no boot init-thunk), so
-   OFF is the safe default and LOAD flips automatically because it calls EVAL.")
+   FLIPPED ON BY DEFAULT at boot (the ~~USE-EVAL2-INIT~~ slot in kernel-main
+   emits `(setq *use-eval2* t)`) since the corpus-parity milestone: the full
+   ANSI corpus runs at parity under eval2 (flip residue 387→0, zero regressions
+   vs an apples-to-apples control).  Build with MODUS_NO_EVAL2=1 to opt back
+   out (rollback lever).  The defvar itself defaults NIL (no boot init-thunk
+   runs), so an image whose driver lacks the marker behaves as before.  The
+   diagnostic probe suite (run-all-tests) is temporarily bracketed back onto
+   the tree-walker — its distinct-form evals are ~50x slower under eval2 (no
+   cache hits); making them viable is the Phase-3 tree-walker-deletion
+   prerequisite.  LOAD flips automatically because it calls EVAL.")
 
 (defun eval (form)
   "Evaluate FORM in the null lexical environment.

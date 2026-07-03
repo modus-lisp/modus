@@ -3240,9 +3240,16 @@
 ;; WS3 flip build flag: MODUS_USE_EVAL2 → boot with production EVAL/LOAD routed
 ;; to eval2 (the ~~USE-EVAL2-INIT~~ marker in kernel-main becomes (setq
 ;; *use-eval2* t)).  Off (default) → the marker becomes NIL, byte-identical.
+;; WS3 FLIP (default ON as of the corpus-parity milestone): production EVAL/LOAD
+;; route to eval2 unless MODUS_NO_EVAL2=1 opts back out (rollback lever; also
+;; accepts legacy MODUS_USE_EVAL2=0).  The corpus was proven at parity under the
+;; flip (residue 387→0, zero regressions vs an apples-to-apples control).
 (defvar *use-eval2-build*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_USE_EVAL2") #-sbcl nil))
-    (and v (plusp (length v)) (not (string= v "0")))))
+  (let ((no (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NO_EVAL2") #-sbcl nil))
+              (and v (plusp (length v)) (not (string= v "0")))))
+        (legacy-off (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_USE_EVAL2") #-sbcl nil))
+                      (and v (string= v "0")))))
+    (not (or no legacy-off))))
 ;; WS3 flip gate: MODUS_FLIP_SKIP_PROBES drops the eval-heavy custom probe suite
 ;; (run-all-tests) from the driver so the REAL ANSI corpus can be gated under
 ;; production-eval2 without the diagnostic probes hogging the shard budget.
@@ -5567,12 +5574,26 @@
            ;; WS3 flip: replace ~~USE-EVAL2-INIT~~ with the boot setq when the
            ;; MODUS_USE_EVAL2 build flag is set; else replace with NIL so the
            ;; flag-off driver is byte-identical to before the flip infra.
-           (drv (let ((d (str-sub "~~USE-EVAL2-INIT~~"
-                                  (if *use-eval2-build* "(setq *use-eval2* t)" "nil")
-                                  drv0)))
-                  ;; WS3 flip gate: drop run-all-tests so the corpus gate under
-                  ;; production-eval2 isn't confounded by the eval-heavy probes.
-                  (if *flip-skip-probes* (str-sub "(run-all-tests)" "" d) d)))
+           (drv (let* ((d0 (str-sub "~~USE-EVAL2-INIT~~"
+                                    (if *use-eval2-build* "(setq *use-eval2* t)" "nil")
+                                    drv0))
+                       ;; Flip-gate mode: drop run-all-tests so the corpus gate
+                       ;; isn't confounded by the eval-heavy probes.
+                       (d1 (if *flip-skip-probes*
+                               (str-sub "(run-all-tests)" "" d0)
+                               d0))
+                       ;; FLIP DEFAULT: the diagnostic probe suite stays on the
+                       ;; TREE-WALKER for now — its forms are eval-heavy and
+                       ;; DISTINCT (no cache hits), ~50x slower under eval2.
+                       ;; Probes are diagnostics, not conformance; making them
+                       ;; viable under eval2 (distinct-form compile speed / JIT)
+                       ;; is the Phase-3 (tree-walker deletion) prerequisite.
+                       (d2 (if *use-eval2-build*
+                               (str-sub "(run-all-tests)"
+                                        "(setq *use-eval2* nil) (run-all-tests) (setq *use-eval2* t)"
+                                        d1)
+                               d1)))
+                  d2))
            (tag "~~ANSI-EXP-TOTAL~~")
            (tag-pos (search tag drv))
            (count (- *ansi-test-counter* 10000)))

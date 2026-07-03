@@ -243,6 +243,21 @@
    tree-walker.  At build time it stays NIL, so the host build's DEFPACKAGE
    no-op is byte-identical to before.")
 
+(defvar *e2-persist-defuns* nil
+  "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *eval2-runtime-p*
+   gated).  eval2-forms' pre-scan walks the RAW forms for top-level DEFUNs to
+   persist (install as global trampolines), but it runs BEFORE macroexpansion
+   — a defun hidden behind a user macro (uiop's (with-upgradability ()
+   (defun featurep …)) → eval-when → defun) compiles into the module yet
+   never reaches the global function tables, so the next form's call gets
+   UNDEFINED-FUNCTION (asdf gauntlet FAILFORM 45).  Fix: mvm-compile-toplevel's
+   DEFUN handler — which sees every toplevel-context defun POST-expansion
+   (progn/eval-when/macro wrappers all recurse through mvm-compile-toplevel) —
+   pushes each defun NAME here.  eval2-forms clears it before its compile
+   loop and unions it with the pre-scan names for the trampoline install
+   loop.  The pre-scan is kept as belt-and-braces.  Cleared per eval2-forms
+   call via setq (not let — see *eval2-runtime-p* for why).")
+
 ;;; eval2 QUOTE constant pool (in-image ONLY — *eval2-runtime-p* gated).
 ;;;
 ;;; CLHS: QUOTE returns ITS OBJECT.  The tree-walker gets this for free (it
@@ -14004,6 +14019,15 @@
                             (string= (symbol-name (car raw-name)) "SETF"))
                        (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                        raw-name)))
+         ;; In-image eval2: record this toplevel-context defun NAME for the
+         ;; trampoline-install (persistence) loop.  This handler runs POST-
+         ;; macroexpansion, so macro-hidden defuns (with-upgradability →
+         ;; eval-when → defun) are caught — the raw-forms pre-scan in
+         ;; eval2-forms can't see those.  See *e2-persist-defuns*.
+         (when *eval2-runtime-p*
+           (setq *e2-persist-defuns*
+                 (cons (if (symbolp name) (symbol-name name) (string name))
+                       *e2-persist-defuns*)))
          ;; Detect &rest, &optional, &key before preprocessing strips them
          ;; so we can compute required-count for arity checks.
          (let* ((rest-pos (position '&rest params))

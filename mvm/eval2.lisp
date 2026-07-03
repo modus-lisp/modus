@@ -175,6 +175,11 @@
            (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
            (defs (if last-defun-p forms (reverse (cdr rforms))))
            (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr)))))
+      ;; Compiler-recorded persistence: clear the global BEFORE the compile
+      ;; loop; the toplevel DEFUN handler pushes every toplevel-context defun
+      ;; name (post-macroexpansion) onto it.  setq, not let (compiled let of
+      ;; a special is unreliable in-image — see *mvm-emit-halves*).
+      (setq *e2-persist-defuns* nil)
       (dolist (f toplevel)
         (let ((result (mvm-compile-toplevel f)))
           (cond
@@ -194,7 +199,18 @@
       (dolist (pend *pending-flet-ir*)
         (when (and (consp pend) (car pend) (cdr pend))
           (setq all-ir (cons pend all-ir))))
-      (setq all-ir (reverse all-ir)))
+      (setq all-ir (reverse all-ir))
+      ;; Union the compiler-recorded defun names (macro-hidden defuns the
+      ;; raw-forms pre-scan can't see — with-upgradability → eval-when →
+      ;; defun) into persist-names for the trampoline install loop below.
+      ;; %EVAL2-THUNK excludes itself by name.  NB: a NESTED eval2 during
+      ;; this compile loop (a macroexpander that itself calls EVAL) would
+      ;; clear/consume the global mid-flight; the pre-scan names remain as
+      ;; the safety net in that (rare) case.
+      (dolist (pn *e2-persist-defuns*)
+        (unless (or (string-equal pn "%EVAL2-THUNK")
+                    (member pn persist-names :test (function string=)))
+          (setq persist-names (cons pn persist-names)))))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
     ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,

@@ -1243,13 +1243,30 @@
                (let* ((obj (%word->val (reg-get regs vs)))
                       (raw-st (obj-subtag obj))
                       (st (cond
-                            ;; A native CLOSURE object reads a clean #x52 from
-                            ;; the obj-subtag primop — keep it so funcall takes
-                            ;; the closure (set-cenv) path.  Checked BEFORE the
-                            ;; functionp arm: native functionp is true for a
-                            ;; #x52 closure too, and the old `functionp→#x51`
-                            ;; ordering swallowed every CAPTURING lambda.
-                            ((= raw-st #x52) #x52)
+                            ;; A CLOSURE object reads a clean #x52 from the
+                            ;; obj-subtag primop.  Keep #x52 ONLY for an
+                            ;; IN-MODULE closure — slot 0 is a recorded lambda
+                            ;; bytecode offset — so funcall takes the fast
+                            ;; set-cenv + call-indirect path (the CAPTURING
+                            ;; lambda case; checked BEFORE the functionp arm
+                            ;; because native functionp is true for #x52 too).
+                            ;; A NATIVE #x52 closure (an eval2 TRAMPOLINE from
+                            ;; a persisted defun, or any build-time closure)
+                            ;; carries a NATIVE CODE ADDRESS in slot 0 — the
+                            ;; compiled closure path would obj-ref it and
+                            ;; op-call-ind would jump to it as a bytecode pc
+                            ;; (garbage — the run is silently abandoned).
+                            ;; Report #x51 so the dispatch falls through to
+                            ;; CALL-INDIRECT's functionp bridge with the
+                            ;; closure OBJECT, which native funcall/apply
+                            ;; handle correctly — (funcall #'persisted-defun),
+                            ;; (funcall (symbol-function 'f)), uiop's
+                            ;; (funcall detect) in detect-os.
+                            ((= raw-st #x52)
+                             (if (%mvm-lambda-offset-p
+                                   (%obj-elt-ref obj 0) lambda-offsets)
+                                 #x52
+                                 #x51))
                             ;; A bare native FUNCTION (raw fn-addr from #'NAME /
                             ;; captureless lambda) is NOT a tagged object, so
                             ;; obj-subtag's read above is garbage — report #x51

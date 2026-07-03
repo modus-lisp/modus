@@ -171,7 +171,7 @@ CLOS              ~  defclass, defgeneric, defmethod, standard method combinatio
                      :before/:after/:around, call-next-method, class precedence lists
                      (define-method-combination tests fail)
 File I/O          ✓  Linux syscalls, file streams, open/close, pathnames
-Eval/Compile/Load ✓  Tree-walking interpreter, load from file, macroexpand
+Eval/Compile/Load ✓  eval2 (compile→MVM bytecode→interpret) is production eval/load
 Closures          ✓  Mutable closures via heap-allocated cells
 unwind-protect    ✓  setjmp/longjmp, cleanup on both normal and error paths
 GC                ✓  Cheney semi-space copying collector
@@ -186,32 +186,35 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 ### What's Missing for Quicklisp
 
 ```
-[~] Runtime compile (source → bytecode → interpret): self-hosts now.  The MVM
-    compiler + bytecode interpreter + eval2 are compiled INTO the image (the
-    generic oracle image always; the ANSI image as of efa91ea — WS3 P0).
-    `eval2` = compile a form to MVM bytecode + run it via mvm-interpret, in
-    the image, at runtime.  Still DEAD CODE in the ANSI image (production
-    `eval` routes to the tree-walker); WS3 flips that.  bytecode→native at
-    runtime (the JIT) is WS4.
+[✓] Runtime compile (source → bytecode → interpret): SHIPPED — production
+    `eval`/`load` default to eval2 (compile to MVM bytecode + mvm-interpret)
+    as of d3434e6 (WS3 flip, 2026-07-03).  Post-flip full ANSI: 17321/17318
+    vs tree-walker 17311 (net positive).  MODUS_NO_EVAL2=1 = rollback.
+    Compile-caching (~20x for repeated forms) serves load/asdf patterns.
+    bytecode→native at runtime (the JIT) is WS4.
 [ ] compile-file → FASL
 [ ] Full numeric tower (arbitrary bignums, ratios, full floats, complex)
 [ ] Setf machinery (defsetf, define-setf-expander)
 [✓] Everything else
 ```
 
-### Self-hosting (WS3): retiring the tree-walker
+### Self-hosting (WS3): retiring the tree-walker — THE FLIP IS LANDED
 
-Modus has two evaluators.  The tree-walker (`%eval-in-env`, cl-eval.lisp) is
-what production `eval`/`load` use.  **eval2** (`eval2-forms`, mvm/eval2.lisp)
-compiles a form to MVM bytecode and runs it through `mvm-interpret`
-(interp.lisp).  eval2 reached parity-or-better than the tree-walker on the
-broad + CLOS oracles, and as of efa91ea the compiler+interpreter+eval2 are
-self-hosted in the ANSI image (build-ansi-test.lisp's `*compiler-in-image-source*`,
-mirroring build-generic.lisp's STAGE-1/STAGE-2 blocks).  Plan: prove full-corpus
-parity via an in-image differential gate, flip `eval`/`load` to eval2 behind a
-flag, then delete the tree-walker.  The interpret-vs-JIT back-end choice is made
-after a perf spike (interpretation models memory as a hash-table → slow; the
-gauntlet is time-bounded).  See /home/claude/.claude/plans/hazy-dazzling-deer.md.
+Production `eval`/`load` route to **eval2** (`eval2-forms`, mvm/eval2.lisp:
+compile the form to MVM bytecode via the self-hosted compiler, run it through
+`mvm-interpret`) by default as of **d3434e6** — `*use-eval2*` boots T
+(`MODUS_NO_EVAL2=1` rebuilds with the tree-walker as rollback).  The flip-gate
+drain took production-eval2 corpus regressions 387→60→13→0 (commits 63643dc,
+d40fff5+20fbbfa, 77cea7c+c12345c: quote-identity const pool, condition
+propagation, undefined-fn/unbound-var signals, runtime macros, %defmethod-full,
+MV propagation, in-image compile fidelity incl. the eval2.lisp `\"` extraction
+damage).  Post-flip full ANSI: 17321/17318 vs tree-walker 17311 — net positive.
+The tree-walker (`%eval-in-env`, cl-eval.lisp) still exists: the diagnostic
+probe suite (run-all-tests) is bracketed onto it (distinct-form evals are ~50x
+slower under eval2 — no cache hits).  Phase 3 (DELETE the tree-walker) needs
+distinct-form compile speed or the WS4 JIT first.  Flip gate:
+`MODUS_USE_EVAL2=… MODUS_FLIP_SKIP_PROBES=1` (see build-ansi-test.lisp).
+See /home/claude/.claude/plans/hazy-dazzling-deer.md.
 
 ## Build Commands
 

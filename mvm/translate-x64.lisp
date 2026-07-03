@@ -972,7 +972,15 @@
                 (emit-bytes buf #x48 #x8B #x51 #x10)
                 (emit-bytes buf #x48 #x89 #x14 #x25)
                 (emit-u32 buf #x10000C20)
-                ;; Pop handler stack into [180]/+8/+16 so the outer
+                ;; rdx = [rcx+24] (our saved RBX).  The stub previously did
+                ;; NOT restore RBX — unlike TRAP #x0511 — so a fault-driven
+                ;; longjmp resumed the handler-case with the interrupted
+                ;; callee's RBX (V4) still live: the setjmp-time V4 value the
+                ;; compiler tracks was silently replaced (silent-unwind).
+                (emit-bytes buf #x48 #x8B #x51 #x18)
+                (emit-bytes buf #x48 #x89 #x14 #x25)
+                (emit-u32 buf #x10000C28)
+                ;; Pop handler stack into [180]/+8/+16/+24 so the outer
                 ;; handler-case becomes active when we land in the body.
                 (emit-call buf pop-label)
                 ;; Restore from scratch and jump
@@ -982,6 +990,9 @@
                 ;; mov rbp, [0x10000C18]
                 (emit-bytes buf #x48 #x8B #x2C #x25)
                 (emit-u32 buf #x10000C18)
+                ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
+                (emit-bytes buf #x48 #x8B #x1C #x25)
+                (emit-u32 buf #x10000C28)
                 ;; mov rsp, [0x10000C10]
                 (emit-bytes buf #x48 #x8B #x24 #x25)
                 (emit-u32 buf #x10000C10)
@@ -3838,17 +3849,26 @@
 
 (defun emit-handler-helpers (buf push-label pop-label)
   "Emit two helper functions used by handler-case setjmp/clear traps:
-     __handler_push: push current [#x10000180/+8/+16] state onto a memory
+     __handler_push: push current [#x10000180/+8/+16/+24] state onto a memory
                      stack at #x10000408 (depth at #x10000400, max 64).
-     __handler_pop:  pop top of stack into [#x10000180/+8/+16]; if stack
+     __handler_pop:  pop top of stack into [#x10000180/+8/+16/+24]; if stack
                      empty, write 0 to [#x10000180].
    Both preserve all callee-saved regs. They clobber rax/rcx/rdx/r10/r11
    only — caller-saved per SysV ABI.
 
    Memory map:
-     #x10000180/+8/+16 — current handler state (RSP/RBP/IP, 24 bytes)
+     #x10000180/+8/+16/+24 — current handler state (RSP/RBP/IP/RBX, 32 bytes)
      #x10000400        — handler-stack depth (qword, init 0 by fork)
-     #x10000408+24*N   — handler-stack frame N (24 bytes, max 64 frames)"
+     #x10000408+32*N   — handler-stack frame N (32 bytes, max 64 frames;
+                         region ends at #x10000C08, just below the #x10000C10
+                         longjmp scratch slots)
+
+   The RBX slot [#x10000198] (saved by SETJMP, restored by every longjmp
+   path) MUST be stacked with the rest of the frame: without it, nested
+   handler-cases share ONE RBX slot, so after an inner frame is pushed and
+   popped, an OUTER longjmp restores the INNER (dead) frame's RBX — the
+   caller's V4-cached value is silently replaced and the handler continuation
+   runs on corrupt state (the silent-unwind family)."
   ;; ---- __handler_push ----
   (let ((skip (make-label)))
     (emit-label buf push-label)
@@ -3858,8 +3878,8 @@
     ;; cmp r10, 64 ; jge skip
     (emit-bytes buf #x49 #x83 #xFA #x40)
     (emit-jcc buf :ge skip)
-    ;; r11 = depth*24
-    (emit-bytes buf #x4D #x6B #xDA #x18)            ; imul r11, r10, 24
+    ;; r11 = depth*32
+    (emit-bytes buf #x4D #x6B #xDA #x20)            ; imul r11, r10, 32
     ;; r11 += 0x10000408
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
     (emit-u32 buf #x10000408)
@@ -3875,6 +3895,10 @@
     (emit-bytes buf #x48 #x8B #x04 #x25)
     (emit-u32 buf #x10000190)
     (emit-bytes buf #x49 #x89 #x43 #x10)             ; mov [r11+16], rax
+    ;; rax = [0x10000198]; [r11+24] = rax   (saved RBX — see docstring)
+    (emit-bytes buf #x48 #x8B #x04 #x25)
+    (emit-u32 buf #x10000198)
+    (emit-bytes buf #x49 #x89 #x43 #x18)             ; mov [r11+24], rax
     ;; depth++ ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
     (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
@@ -3900,8 +3924,8 @@
     (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
     (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000400)
-    ;; r11 = depth*24 + 0x10000408
-    (emit-bytes buf #x4D #x6B #xDA #x18)             ; imul r11, r10, 24
+    ;; r11 = depth*32 + 0x10000408
+    (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
     (emit-u32 buf #x10000408)
     ;; Use r10 as memory-scratch (its value is now consumed) so RAX
@@ -3918,6 +3942,10 @@
     (emit-bytes buf #x4D #x8B #x53 #x10)             ; mov r10, [r11+16]
     (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000190)
+    ;; [0x10000198] = [r11+24]   (saved RBX — see push above)
+    (emit-bytes buf #x4D #x8B #x53 #x18)             ; mov r10, [r11+24]
+    (emit-bytes buf #x4C #x89 #x14 #x25)
+    (emit-u32 buf #x10000198)
     (emit-jmp buf done)
     (emit-label buf empty)
     ;; [0x10000180] = 0  (legacy "no handler" sentinel)

@@ -453,6 +453,21 @@
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
   ;; restart-invocation — internal type used by restart-case mechanism
   (%define-condition 'restart-invocation '(condition) nil nil nil)
+  ;; mvm-type-error — raised by the MVM interpreter's opcode guards
+  ;; (op-car/op-cdr/op-setcar/op-setcdr on a non-cons; interp.lisp's
+  ;; host-side define-condition is NOT compiled into the image).  Without
+  ;; this registration the condition type was UNKNOWN to %condition-typep,
+  ;; so it matched NO handler-case clause — not even (t (c)) — and the
+  ;; signal fell through every frame: the whole eval2 toplevel form was
+  ;; silently abandoned (asdf gauntlet form-52 silent stop; any capturing-
+  ;; flet bug surfaced as a vanishing eval instead of a catchable error).
+  ;; Registered as a TYPE-ERROR subtype so both (error (c)) and
+  ;; type-error-expecting handlers match.
+  (%define-condition 'mvm-type-error '(type-error)
+    (list (list 'operation '(:operation) nil)
+          (list 'expected '(:expected) nil)
+          (list 'got '(:got) nil))
+    nil nil)
   ;; %rc-invocation — internal marker for eval2's bytecode restart-case
   ;; (compile-restart-case).  A subtype of ERROR so the MVM interpreter's
   ;; per-opcode (error (c)) longjmp bridge (interp.lisp) catches the

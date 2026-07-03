@@ -2147,8 +2147,10 @@
           accessor
           (let ((acc accessor))
             (lambda (place-args value-form)
+              ;; In-image-safe package (see cell-var-name): hardcoded
+              ;; :modus.mvm interns into NIL under eval2 → NIL setter head.
               (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
-                                    :modus.mvm)))
+                                    (or (find-package "MODUS.MVM") *package*))))
                 `(,setter ,@place-args ,value-form)))))
         `(quote ,accessor))))
 
@@ -6867,9 +6869,16 @@
                                   ((and (consp name) (eq (car name) 'setf))
                                    (format nil "SETF-~A" (symbol-name (cadr name))))
                                   (t (format nil "~A" name))))
+                 ;; In-image-safe package (same fallback as cell-var-name /
+                 ;; %defstruct-intern): under eval2 the package table has no
+                 ;; MODUS.MVM, so the old hardcoded `:modus.mvm` made intern
+                 ;; return NIL — EVERY capture-cell symbol was NIL, the let
+                 ;; bound nothing, and the module's (set-car NIL closure)
+                 ;; signalled MVM-TYPE-ERROR at run time (uiop pathname-equal,
+                 ;; asdf gauntlet form 52; any capturing flet under eval).
                  (cell-sym (intern (format nil "%FLETCELL-~A$$~D"
                                            base-name (make-compiler-label))
-                                   :modus.mvm)))
+                                   (or (find-package "MODUS.MVM") *package*))))
             (push name local-names)
             (push cell-sym cell-names)
             (push (list name (cadr def) (cddr def) cell-sym) defs-data))))
@@ -9222,7 +9231,52 @@
                     ((string= fn-name "EQUAL")  "%EQUAL-FN")
                     (t nil)))
              (resolved-name (or unique-name wrapper-name fn-name)))
-        (emit-ir :li-func dest resolved-name))))
+        ;; eval2 (in-image runtime compile) ONLY: #'NAME of an IN-MODULE
+        ;; function (a defun/flet compiled in THIS eval2 module) must not
+        ;; escape as a bare bytecode-offset fixnum.  op-FN-ADDR stores the
+        ;; raw offset; if the value then crosses the native bridge as a HOF
+        ;; argument (uiop os-macosx-p's `(some #'featurep …)` — asdf gauntlet
+        ;; form 43), %mvm-wrap-escaping's integer branch does NOT wrap it
+        ;; (defun offsets are indistinguishable from data fixnums), so native
+        ;; SOME funcalls a small integer → hardware fault → the run is
+        ;; silently abandoned.  Materialize it as a #x52 closure (env NIL)
+        ;; instead, mirroring the captureless-lambda path above: in-module
+        ;; funcall takes the closure fast path (slot-0 = offset), and the
+        ;; native bridge / eval2 result boundary wrap it into a re-entrant
+        ;; trampoline via the lam-offsets :defun entries recorded by
+        ;; eval2-forms.  GATES: (symbolp name) keeps the internal
+        ;; (function "NAME") string recursion from compile-make-closure on
+        ;; the plain :li-func path (and skips (setf f) names), and
+        ;; %e2-fn-in-module-p limits this to names already compiled into
+        ;; this module (out-of-module #'CAR etc. keep the op-FN-ADDR native
+        ;; object resolution; forward references keep the raw offset —
+        ;; status quo).
+        (if (and *eval2-runtime-p*
+                 (symbolp name)
+                 (%e2-fn-in-module-p resolved-name))
+            (compile-make-closure (list 'function resolved-name) 'nil env dest)
+            (emit-ir :li-func dest resolved-name)))))
+
+(defun %e2-fn-in-module-p (name)
+  "eval2 ONLY (see compile-function-ref): true if NAME (a string) names a
+   function already compiled into the CURRENT eval2 module — i.e. registered
+   in the per-call *function-table* — OR the function whose body is being
+   compiled RIGHT NOW (*current-function-name*): a SELF-reference like
+   uiop featurep's `(some #'featurep (cdr x))` appears before the fn's own
+   registration completes, and missing it leaves the raw-offset escape (the
+   offset is 0 for the first module fn — natively funcalled as garbage:
+   sometimes a silent abandon, sometimes a stale-register wrong value).
+   Compares by STRING so mixed symbol/string function-info names both match.
+   The table is module-local in-image (eval2-forms binds it fresh per call),
+   so the scan is short."
+  (if (and *current-function-name*
+           (string= (string *current-function-name*) name))
+      t
+      (let ((found nil))
+        (dolist (info *function-table* found)
+          (when (and (not found)
+                     (string= (string (function-info-name info)) name))
+            (setq found t))))))
 
 ;;; ============================================================
 ;;; Multiple Values

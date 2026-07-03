@@ -325,6 +325,20 @@
   (and (integerp n) (not (eql n 0)) lam-offsets
        (gethash n lam-offsets)))
 
+(defun %mvm-module-fn-offset-p (n lam-offsets)
+  "True if integer N is the bytecode entry offset of ANY function in the
+   current eval2 module — a $$LAMBDA/$$CLOSURE body (entry T) or an ordinary
+   defun/flet/thunk (entry :DEFUN, recorded since compile-function-ref
+   materializes #'IN-MODULE-FN as a #x52 closure).  Unlike
+   %mvm-lambda-offset-p there is NO 0-exclusion: this predicate is consulted
+   ONLY on the slot-0 of a #x52 closure object (never on a bare integer that
+   could be DATA), and slot-0 of a materialized #'SELF closure is very often
+   0 (the first module function).  A native #x52 closure's slot-0 is a
+   native fn value (not a small integer), so the gethash miss keeps native
+   closures on the native-bridge path."
+  (and (integerp n) lam-offsets
+       (gethash n lam-offsets)))
+
 (defun %mvm-wrap-escaping (v bc ftab rt lam-offsets)
   "If V is an eval2 lambda value about to cross to NATIVE code, wrap it in a
    trampoline so native funcall can invoke it.  Two escaping shapes:
@@ -346,10 +360,14 @@
     ;; such a false #x52 read.
     ((and v (not (consp v)) (not (integerp v))
           (= (obj-subtag v) #x52)
-          (%mvm-lambda-offset-p (%prim-aref v 0) lam-offsets))
+          (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))
-    ;; Bare lambda offset → captureless lambda.
-    ((%mvm-lambda-offset-p v lam-offsets)
+    ;; Bare lambda offset → captureless lambda.  Requires the entry value T
+    ;; (a genuine $$LAMBDA/$$CLOSURE offset): lam-offsets also carries :DEFUN
+    ;; entries for ordinary module functions (so materialized #'IN-MODULE-FN
+    ;; #x52 closures pass the branches above), and a data fixnum that happens
+    ;; to equal a defun offset must NOT be wrapped here.
+    ((eq (%mvm-lambda-offset-p v lam-offsets) t)
      (%mvm-make-trampoline bc ftab rt v nil lam-offsets))
     (t v)))
 
@@ -365,7 +383,7 @@
    #x52-with-recorded-lambda-offset passes through unchanged."
   (if (and v (not (consp v)) (not (integerp v))
            (= (obj-subtag v) #x52)
-           (%mvm-lambda-offset-p (%prim-aref v 0) lam-offsets))
+           (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
       (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
                             lam-offsets)
       v))
@@ -1263,7 +1281,7 @@
                             ;; (funcall (symbol-function 'f)), uiop's
                             ;; (funcall detect) in detect-os.
                             ((= raw-st #x52)
-                             (if (%mvm-lambda-offset-p
+                             (if (%mvm-module-fn-offset-p
                                    (%obj-elt-ref obj 0) lambda-offsets)
                                  #x52
                                  #x51))

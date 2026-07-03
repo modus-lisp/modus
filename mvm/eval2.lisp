@@ -45,6 +45,49 @@
                   (string-equal n "EVAL-WHEN"))
           (return-from %eval2-cacheable-p nil))))))
 
+(defun %e2-scan-persist (f acc depth)
+  "WS3 def persistence pre-scan (see persist-names in eval2-forms): return ACC
+   extended with the names (strings) of every toplevel-context DEFUN in form F.
+   CLHS 3.2.3.1: forms in a top-level EVAL-WHEN / PROGN / LOCALLY body are
+   THEMSELVES top level — recurse those.  A top-level MACRO call's expansion is
+   also processed as top level, so a head that is none of the above is expanded
+   ONE step (macroexpand-1-mvm sees both the compiler *macro-table* and, under
+   *eval2-runtime-p*, the runtime macro tables) and re-inspected — this is what
+   lets the scan see uiop's (with-upgradability () (defun featurep ...)) →
+   eval-when → defun* → progn → defun chain.  The old raw-heads-only scan
+   missed every macro-wrapped defun: single-form (eval FORM) compiles FORM as
+   the %eval2-thunk BODY (compile-form, never mvm-compile-toplevel), so the
+   compiler-recorded *e2-persist-defuns* path never fired either, and the
+   block's own (detect-os) funcall-by-symbol died with CALL-IND non-callable
+   (asdf gauntlet FAILFORM 43/45).  DEPTH guards runaway expansion; expansion
+   errors are treated as no-expansion (the real compile will report them)."
+  (if (or (> depth 40) (not (and (consp f) (symbolp (car f)))))
+      acc
+      (let ((hn (symbol-name (car f))))
+        (cond
+          ((and (string-equal hn "DEFUN") (symbolp (cadr f)))
+           (cons (string (cadr f)) acc))
+          ((string-equal hn "EVAL-WHEN")
+           (dolist (sub (cddr f) acc)
+             (setq acc (%e2-scan-persist sub acc 0))))
+          ((or (string-equal hn "PROGN") (string-equal hn "LOCALLY"))
+           (dolist (sub (cdr f) acc)
+             (setq acc (%e2-scan-persist sub acc 0))))
+          ;; PERF GATE: only a RUNTIME user macro (with-upgradability et al,
+          ;; resolved via macroexpand-1-mvm's *eval2-runtime-p* fallback) can
+          ;; hide a toplevel defun the raw heads miss.  Bootstrap/compile-time
+          ;; macros in *macro-table* (loop, handler-case, dolist, …) never
+          ;; expand to toplevel defuns — skip them so the pre-scan doesn't
+          ;; double-run their expanders on every eval2 call.
+          ((and *macro-table* (gethash (normalize-name (car f)) *macro-table*))
+           acc)
+          (t
+           (let ((ex (handler-case (macroexpand-1-mvm f)
+                       (t (c) (cons f nil)))))
+             (if (cdr ex)
+                 (%e2-scan-persist (car ex) acc (+ depth 1))
+                 acc)))))))
+
 (defun %eval2-run-tuple (tuple)
   "Interpret a cached compiled module tuple (bc entry fn-table rt-table lam-offsets).
    Conditions PROPAGATE to the caller (production EVAL semantics): an error
@@ -135,33 +178,17 @@
         ;; tables — so a LATER (eval2 …) call OR the tree-walker can call it.
         ;; Without this every (eval2 '(defun f …)) discarded f (closed-world
         ;; module), so no multi-form program (asdf/load/REPL) could run on eval2.
-        ;; CLHS 3.2.3.1: forms in a top-level EVAL-WHEN / PROGN / LOCALLY body
-        ;; are THEMSELVES top level, so their DEFUNs must persist too —
-        ;; uiop/asdf wraps nearly every defun in (eval-when (…) …); without
-        ;; this the defun compiles into the module but never reaches the global
-        ;; function tables (gauntlet FAILFORM: PARSE-DEFINE-PACKAGE-FORM,
-        ;; FEATUREP … UNDEFINED-FUNCTION).  The worklist recurses those
-        ;; wrappers; mvm-compile-toplevel's handlers already register nested
-        ;; defuns as module functions (multi-result), so the install loop below
-        ;; finds them in all-ir by name.
-        (persist-names (let ((ns nil) (stack (list forms)))
-                         (loop
-                           (when (null stack) (return ns))
-                           (let ((body (car stack)))
-                             (setq stack (cdr stack))
-                             (dolist (f body)
-                               (when (and (consp f) (symbolp (car f)))
-                                 (let ((hn (symbol-name (car f))))
-                                   (cond
-                                     ((and (string-equal hn "DEFUN")
-                                           (symbolp (cadr f)))
-                                      (setq ns (cons (string (cadr f)) ns)))
-                                     ((string-equal hn "EVAL-WHEN")
-                                      (setq stack (cons (cddr f) stack)))
-                                     ((or (string-equal hn "PROGN")
-                                          (string-equal hn "LOCALLY"))
-                                      (setq stack (cons (cdr f) stack))))))))))))
+        ;; Computed AFTER register-mvm-bootstrap-macros (below) via
+        ;; %e2-scan-persist, which sees through EVAL-WHEN / PROGN / LOCALLY
+        ;; AND macro wrappers (with-upgradability) — see its docstring.
+        (persist-names nil))
     (register-mvm-bootstrap-macros)
+    ;; WS3 def persistence pre-scan.  Runs with *macro-table* freshly populated
+    ;; (bootstrap macros) so %e2-scan-persist's macroexpand-1-mvm sees the same
+    ;; macro environment the compile loop below will; runtime user macros
+    ;; resolve through the *eval2-runtime-p* fallback.
+    (dolist (f forms)
+      (setq persist-names (%e2-scan-persist f persist-names 0)))
     ;; Split: last form is the expression; preceding forms are definitions.
     ;; A TRAILING defun is moved into the module definitions (so it gets a real
     ;; module function + offset to install a trampoline for) and the thunk
@@ -174,7 +201,16 @@
                               (symbolp (cadr last-form))))
            (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
            (defs (if last-defun-p forms (reverse (cdr rforms))))
-           (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr)))))
+           (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr))))
+           ;; REENTRANCY: a NESTED eval2 during this compile loop (the toplevel
+           ;; DEFMACRO handler's expander eval, build-macrolet-expander,
+           ;; DEFCONSTANT value eval) re-enters eval2-forms, which clears and
+           ;; consumes *e2-persist-defuns* — clobbering the outer call's
+           ;; accumulated names.  Save the current value in a LEXICAL here and
+           ;; restore it after the union below, so each nesting level sees only
+           ;; its own recordings.  (Explicit save+setq+restore, NOT a let of
+           ;; the special — compiled let of a special is unreliable in-image.)
+           (%e2pd-saved *e2-persist-defuns*))
       ;; Compiler-recorded persistence: clear the global BEFORE the compile
       ;; loop; the toplevel DEFUN handler pushes every toplevel-context defun
       ;; name (post-macroexpansion) onto it.  setq, not let (compiled let of
@@ -210,7 +246,10 @@
       (dolist (pn *e2-persist-defuns*)
         (unless (or (string-equal pn "%EVAL2-THUNK")
                     (member pn persist-names :test (function string=)))
-          (setq persist-names (cons pn persist-names)))))
+          (setq persist-names (cons pn persist-names))))
+      ;; REENTRANCY: restore the enclosing eval2-forms call's recordings
+      ;; (see %e2pd-saved above).  Outermost call restores NIL — harmless.
+      (setq *e2-persist-defuns* %e2pd-saved))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
     ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,
@@ -288,9 +327,22 @@
                 ;; unchanged).  %mvm-lambda-offset-p has the matching read-side
                 ;; guard; data-0 priority is correct since the first module
                 ;; function is always a non-lambda (defun / %EVAL2-THUNK).
-                (when (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
-                           (not (eql off 0)))
-                  (puthash off lam-offsets t))))
+                (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
+                         (not (eql off 0)))
+                    (puthash off lam-offsets t)
+                    ;; NON-lambda module fns (defuns, flet bodies, the thunk)
+                    ;; record under the distinct :DEFUN marker: the #x52
+                    ;; branches (module-closure vs native-closure
+                    ;; discrimination via %mvm-module-fn-offset-p in
+                    ;; %mvm-wrap-escaping[-result] and op-obj-subtag) accept
+                    ;; any entry INCLUDING offset 0 (the first module fn — a
+                    ;; materialized #'SELF closure's slot-0 is very often 0),
+                    ;; which is safe because slot-0 of a #x52 is never DATA.
+                    ;; The BARE-INTEGER wrap branch keeps the stricter
+                    ;; %mvm-lambda-offset-p (value T + never 0), so a data
+                    ;; fixnum equal to a defun offset still crosses the
+                    ;; bridge unwrapped (make-list-0/member-0 protection).
+                    (puthash off lam-offsets (quote :defun)))))
             ;; WS3 def persistence: install each top-level user DEFUN as a
             ;; re-entrant interp trampoline in BOTH global function tables —
             ;; *symbol-function-table* by NAME (the eval2 native-call bridge's

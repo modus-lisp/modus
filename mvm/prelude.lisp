@@ -1663,7 +1663,16 @@
   (let ((key (if (integerp name-or-hash) name-or-hash
                  (aref name-or-hash 0)))
         (tbl (%globals-table)))
-    (if tbl (gethash key tbl) nil)))
+    ;; GETHASH returns (VALUES value present-p) — TWO values.  Returning it
+    ;; directly in tail position PROPAGATES both, leaving MV-COUNT=2 for the
+    ;; caller.  The old linear-alist SYMBOL-VALUE returned exactly one value,
+    ;; and callers depend on that: e.g. BOOLE reads its BOOLE-* op constants
+    ;; (globals) via SYMBOL-VALUE inside its COND, then returns a bare value —
+    ;; the leaked MV-COUNT=2 survives to `(multiple-value-list (boole …))`,
+    ;; which then reports length 2 (boole.2 collected spuriously) or corrupts
+    ;; the funcall MV path into a wild call (boole.1/.3 → RIP=0xDEAD0004).
+    ;; Truncate to a single value with (VALUES …), which forces MV-COUNT=1.
+    (if tbl (values (gethash key tbl)) nil)))
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash.  O(1) via the globals

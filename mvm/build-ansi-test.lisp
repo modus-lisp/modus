@@ -3230,34 +3230,17 @@
 (defvar *eval2-diff-mode*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_EVAL2_DIFF") #-sbcl nil))
     (and v (plusp (length v)) (not (string= v "0")))))
-;; WS3 flip build flag: MODUS_USE_EVAL2 → boot with production EVAL/LOAD routed
-;; to eval2 (the ~~USE-EVAL2-INIT~~ marker in kernel-main becomes (setq
-;; *use-eval2* t)).  Off (default) → the marker becomes NIL, byte-identical.
-;; WS3 FLIP (default ON as of the corpus-parity milestone): production EVAL/LOAD
-;; route to eval2 unless MODUS_NO_EVAL2=1 opts back out (rollback lever; also
-;; accepts legacy MODUS_USE_EVAL2=0).  The corpus was proven at parity under the
-;; flip (residue 387→0, zero regressions vs an apples-to-apples control).
-(defvar *use-eval2-build*
-  (let ((no (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NO_EVAL2") #-sbcl nil))
-              (and v (plusp (length v)) (not (string= v "0")))))
-        (legacy-off (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_USE_EVAL2") #-sbcl nil))
-                      (and v (string= v "0")))))
-    (not (or no legacy-off))))
-;; WS3 flip gate: MODUS_FLIP_SKIP_PROBES drops the eval-heavy custom probe suite
-;; (run-all-tests) from the driver so the REAL ANSI corpus can be gated under
-;; production-eval2 without the diagnostic probes hogging the shard budget.
-;; Used with MODUS_USE_EVAL2=1 to measure true flip parity on the corpus.
+;; WS3 Phase 3 (tree-walker retired as a production evaluator): production
+;; EVAL/LOAD go straight to eval2 unconditionally (cl-eval.lisp EVAL = (eval2
+;; form)); there is no longer a *use-eval2* flag or a tree-walker rollback path.
+;; The diagnostic probe suite (run-all-tests) runs under eval2 like everything
+;; else — measured to complete in ~1s (the old ~50x-slower premise was closed by
+;; the 194bbfb/8953c39/c4d9403/3281efe perf fixes).
+;; WS3 flip gate (retained for corpus/probe de-confounding): MODUS_FLIP_SKIP_PROBES
+;; drops run-all-tests from the driver so the REAL ANSI corpus can be gated
+;; without the diagnostic probes' P: lines being counted.
 (defvar *flip-skip-probes*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FLIP_SKIP_PROBES") #-sbcl nil))
-    (and v (plusp (length v)) (not (string= v "0")))))
-;; WS3 Phase 3: the diagnostic probe suite (run-all-tests) runs under PRODUCTION
-;; EVAL2 by default — the old walker bracket's perf premise is stale (probes
-;; complete in ~1s under eval2 since the 194bbfb/8953c39/c4d9403 chain; measured
-;; at 70677f9).  MODUS_PROBES_ON_WALKER=1 restores the historical
-;; `(setq *use-eval2* nil) (run-all-tests) (setq *use-eval2* t)` bracket —
-;; the rollback / A-B triage lever for probe-id (<10001) divergences.
-(defvar *probes-on-walker*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_PROBES_ON_WALKER") #-sbcl nil))
     (and v (plusp (length v)) (not (string= v "0")))))
 ;; Accumulated emitted source for the e2diff chunk fns + run-e2diff-FILE fns.
 (defvar *e2diff-sources* "")
@@ -5235,11 +5218,8 @@
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)
-  ;; WS3 flip: production EVAL/LOAD → eval2 when the MODUS_USE_EVAL2 build flag
-  ;; is set (the assembler replaces this marker with `(setq *use-eval2* t)`;
-  ;; flag-off → replaced with `nil`, byte-identical to before).  Placed after
-  ;; all runtime init so eval2's deps (packages/keywords/streams/reader) exist.
-  ~~USE-EVAL2-INIT~~
+  ;; WS3 Phase 3: production EVAL/LOAD route unconditionally to eval2 (see
+  ;; cl-eval.lisp EVAL); no flag/marker needed.
   ;; ansi-aux-macros.lsp's NORMALLY macro: (if *should-always-be-true*
   ;; form (should-never-be-called)). NIL here → every CATCH-TYPE-ERROR /
   ;; NORMALLY-wrapped form expands to a call to an undefined function,
@@ -5573,30 +5553,14 @@
                       (str-sub "(run-real-ansi-tests)" "(run-real-e2diff)"
                                *driver-source*))
                     *driver-source*))
-           ;; WS3 flip: replace ~~USE-EVAL2-INIT~~ with the boot setq when the
-           ;; MODUS_USE_EVAL2 build flag is set; else replace with NIL so the
-           ;; flag-off driver is byte-identical to before the flip infra.
-           (drv (let* ((d0 (str-sub "~~USE-EVAL2-INIT~~"
-                                    (if *use-eval2-build* "(setq *use-eval2* t)" "nil")
-                                    drv0))
-                       ;; Flip-gate mode: drop run-all-tests so the corpus gate
-                       ;; isn't confounded by the eval-heavy probes.
-                       (d1 (if *flip-skip-probes*
-                               (str-sub "(run-all-tests)" "" d0)
-                               d0))
-                       ;; WS3 Phase 3 (unbracketed by default): the probe suite
-                       ;; runs under PRODUCTION EVAL2 — the "~50x slower" walker
-                       ;; bracket premise is stale (probes ~1s under eval2 since
-                       ;; the perf chain; see *probes-on-walker* above).  Probes
-                       ;; now exercise the SAME engine production uses, which is
-                       ;; the point of diagnostics.  MODUS_PROBES_ON_WALKER=1
-                       ;; restores the bracket for A/B triage or rollback.
-                       (d2 (if (and *use-eval2-build* *probes-on-walker*)
-                               (str-sub "(run-all-tests)"
-                                        "(setq *use-eval2* nil) (run-all-tests) (setq *use-eval2* t)"
-                                        d1)
-                               d1)))
-                  d2))
+           ;; WS3 Phase 3: production EVAL routes to eval2 unconditionally, so
+           ;; run-all-tests just runs (under eval2, like everything else) — no
+           ;; ~~USE-EVAL2-INIT~~ marker and no tree-walker bracket.  Flip-gate
+           ;; mode still drops run-all-tests so the corpus gate isn't confounded
+           ;; by the diagnostic probes' P: lines.
+           (drv (if *flip-skip-probes*
+                    (str-sub "(run-all-tests)" "" drv0)
+                    drv0))
            (tag "~~ANSI-EXP-TOTAL~~")
            (tag-pos (search tag drv))
            (count (- *ansi-test-counter* 10000)))

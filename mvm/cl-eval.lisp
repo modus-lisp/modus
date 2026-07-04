@@ -4029,27 +4029,21 @@
       (%gf-dispatch (%gf-name fn) (list a b c d))
       (%signal-undefined-function)))
 
-(defvar *use-eval2* nil
-  "WS3 flip flag.  When T, production EVAL/LOAD route to eval2 (compile the
-   form to MVM bytecode + interpret) instead of the tree-walker %eval-in-env.
-   FLIPPED ON BY DEFAULT at boot (the ~~USE-EVAL2-INIT~~ slot in kernel-main
-   emits `(setq *use-eval2* t)`) since the corpus-parity milestone: the full
-   ANSI corpus runs at parity under eval2 (flip residue 387→0, zero regressions
-   vs an apples-to-apples control).  Build with MODUS_NO_EVAL2=1 to opt back
-   out (rollback lever).  The defvar itself defaults NIL (no boot init-thunk
-   runs), so an image whose driver lacks the marker behaves as before.  The
-   diagnostic probe suite (run-all-tests) is temporarily bracketed back onto
-   the tree-walker — its distinct-form evals are ~50x slower under eval2 (no
-   cache hits); making them viable is the Phase-3 tree-walker-deletion
-   prerequisite.  LOAD flips automatically because it calls EVAL.")
-
 (defun eval (form)
-  "Evaluate FORM in the null lexical environment.
-   Routes to eval2 (MVM compile+interpret) when *use-eval2* (the WS3 flip),
-   else the tree-walker %eval-in-env."
-  (if *use-eval2*
-      (eval2 form)
-      (%eval-in-env form nil)))
+  "Evaluate FORM in the null lexical environment (CLHS).
+
+   WS3 Phase 3 (tree-walker retired as production evaluator): EVAL/LOAD go
+   straight to eval2 — compile FORM to MVM bytecode via the self-hosted
+   compiler + run it through mvm-interpret.  The tree-walker %eval-in-env is
+   NO LONGER a production eval path; it survives only as the runtime
+   evaluation engine for INTERPRETED CLOSURES (%interp-closure — runtime
+   defmacro / define-compiler-macro expanders, (compile nil '(lambda …)),
+   CLOS method bodies produced by eval-defmethod, printer/apply of interp
+   closures) and for DEFTYPE expansion in typep/subtypep (%expand-deftype).
+   Those callers evaluate a lambda body against a runtime env-alist, which
+   eval2 (a top-level-form compiler) does not provide — so %eval-in-env is
+   kept as SHARED infrastructure, not a rollback lever."
+  (eval2 form))
 
 ;;; ============================================================
 ;;; Compile: return proper 3 values

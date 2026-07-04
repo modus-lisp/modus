@@ -453,13 +453,13 @@
 ;;; a captured env compile to flet wrappers + SM entries — see
 ;;; %e2ic-env-pairs / %e2ic-flet-bindings.)
 ;;;
-;;; Gate: active only when (and *use-eval2* (not *e2ic-disable*)) —
-;;; *e2ic-disable* is the rollback lever (and the probe batteries' A-side).
+;;; Gate: active unless *e2ic-disable* — the rollback lever (and the probe
+;;; batteries' A-side).
 
 (defvar *e2ic-disable* nil
   "Rollback lever for the eval2 interp-closure entry: T = every
    %call-interp-closure / %expand-deftype routes to the tree-walker as
-   before.  NIL (boot default) = eval2-first when *use-eval2* is on.")
+   before.  NIL (boot default) = eval2-first.")
 
 (defvar *e2ic-deftype-cache* nil
   "name-string → (entry . trampoline-or-:walker) for %expand-deftype's eval2
@@ -711,7 +711,7 @@
    eval2-first interp-closure call.  Compiles the closure body against its
    captured env ONCE (cached on the closure), applies the trampoline;
    walker fallback for unsupported shapes / compile failure / gate off."
-  (if (or (not *use-eval2*) *e2ic-disable*)
+  (if *e2ic-disable*
       (%call-interp-closure-walker fn args)
       (let ((c (%e2ic-cached fn)))
         (cond
@@ -741,7 +741,7 @@
          (entry (%deftype-lookup head)))
     (cond
       ((null entry) nil)
-      ((or (not *use-eval2*) *e2ic-disable*)
+      (*e2ic-disable*
        (%e2ic-deftype-walker entry args))
       (t
        (let* ((nm (%eval-sym-name head))

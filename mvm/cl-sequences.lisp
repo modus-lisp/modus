@@ -3159,26 +3159,20 @@
     (t (not (zerop (logand n 1))))))
 (defun boundp (sym)
   "Per CLHS, BOUNDP returns T iff SYM has a value cell binding.
-   Modus stores special-var values at fixed slot 0x10000080 (global
-   alist).  Walk the alist looking for SYM.  Keywords are always
-   bound to themselves.  Non-symbol input signals type-error per ANSI
-   — we just return NIL for robustness."
+   Modus stores special-var values in the global hash table at fixed slot
+   0x10000080, keyed by name-hash.  Look SYM up by its hash.  Keywords are
+   always bound to themselves.  Non-symbol input signals type-error per
+   ANSI — we just return NIL for robustness.  (NB cl-packages.lisp defines
+   the authoritative BOUNDP later; this one is kept consistent with the
+   hash-table store so it stays correct under any load order.  The old
+   `(eq (car (car alist)) sym)` walk was ALSO wrong for the hash-keyed
+   store — the keys are name-hashes, not the SYM object.)"
   (cond
     ((null sym) t)
     ((eq sym t) t)
     ((keywordp sym) t)
     ((or (fixnump sym) (consp sym) (characterp sym)) nil)
-    (t
-     ;; Walk the globals alist at 0x10000080.
-     (let ((alist (mem-ref #x10000080 :u64))
-           (found nil))
-       (loop
-         (when (or found (null alist)) (return found))
-         (when (and (consp alist) (consp (car alist))
-                    (eq (car (car alist)) sym))
-           (setq found t))
-         (setq alist (if (consp alist) (cdr alist) nil)))
-       (if found t nil)))))
+    (t (%boundp-by-hash (aref sym 0)))))
 ;; Old definition was a process-of-elimination heuristic (the same
 ;; fragility class as the old functionp — see commit 7203e19).  It
 ;; returned T for closures, bignums, ratios, packages, and anything

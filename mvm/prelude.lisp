@@ -1633,64 +1633,47 @@
 ;;; mem-ref :u64 returns raw bits, which for tagged Lisp values is
 ;;; the value itself (cons pointers, fixnums, etc.).
 
+;; The global special-variable store at #x10000080 is a HASH TABLE keyed by
+;; name-hash (a 60-bit FIXNUM per compute-name-hash — so %ht-hash buckets it
+;; O(1)).  It was a hand-rolled LINEAR ALIST until this commit: every global
+;; read/write walked the whole chain (symbol-value/set-symbol-value/boundp),
+;; and each non-matching node paid an EQL→%IEEE-FLOAT-P comparator call.  UIOP
+;; defines hundreds of specials, so the walk cost grew with the corpus and the
+;; asdf-gauntlet's big WITH-UPGRADABILITY blocks (which read/write many globals)
+;; hit an O(#globals × #accesses) quadratic — minutes/form at forms ~99–109.
+;; This is the SAME family as 194bbfb (unindexed alist) but a DIFFERENT site.
+;; A 0-arg make-hash-table graduates to the O(1) 256-bucket index past its
+;; threshold; the head slot is forwarded by GC exactly like the keyword table
+;; (#x10000148) and pkg-by-hash table (#x10000170), which are already
+;; hash-table objects at BSS slots — so NO GC change is needed.  (The store
+;; head is a hash-table = a cons whose car is the alist and whose cdr carries
+;; the %HT-TAG metadata; a value of raw 0 means "not yet created".)
+(defun %globals-table ()
+  "The globals hash-table object at #x10000080, or NIL if not yet created."
+  (let ((head (mem-ref #x10000080 :u64)))
+    (if (or (eql head 0) (not (consp head))) nil head)))
+
 (defun symbol-value (name-or-hash)
   "Look up a global variable by name hash or symbol object.
-   Uses explicit consp checks so a corrupted alist entry doesn't trip
-   the compile-cxr-guard %SIGNAL-TYPE-ERROR path — if it did, the
-   subsequent (setq *current-condition* c) inside %signal-type-error
-   would re-enter set-symbol-value on the same corrupted alist and
-   recurse to stack-overflow.  See reference_aarch64_te_recursion_fix.md."
+   O(1) via the globals hash table at #x10000080."
   ;; CLHS: (symbol-value nil) ≡ nil, (symbol-value 't) ≡ t — constants
-  ;; with no alist entry needed.  Without this, (aref nil 0) would fault.
+  ;; with no table entry needed.  Without this, (aref nil 0) would fault.
   (when (null name-or-hash) (return-from symbol-value nil))
   (when (eq name-or-hash t) (return-from symbol-value t))
   (let ((key (if (integerp name-or-hash) name-or-hash
                  (aref name-or-hash 0)))
-        (head (mem-ref #x10000080 :u64)))
-    (if (zerop head)
-        nil
-        (let ((cur head)
-              (result nil)
-              (found nil))
-          (loop
-            (when found (return result))
-            (when (not (consp cur)) (return nil))
-            (let ((pair (car cur)))
-              (when (consp pair)
-                (when (eql (car pair) key)
-                  (setq result (cdr pair))
-                  (setq found t))))
-            (setq cur (cdr cur)))))))
+        (tbl (%globals-table)))
+    (if tbl (gethash key tbl) nil)))
 
 (defun set-symbol-value (name-hash value)
-  "Set a global variable by its tagged name hash.
-   Uses explicit consp checks (see symbol-value docstring) so a
-   corrupted alist entry can't recursively invoke %signal-type-error
-   via the compile-cxr guard."
-  (let ((head (mem-ref #x10000080 :u64)))
-    (if (zerop head)
-        (progn
-          (setf (mem-ref #x10000080 :u64)
-                (cons (cons name-hash value) nil))
-          value)
-        (let ((cur head)
-              (done nil)
-              (result value))
-          (loop
-            (when done (return result))
-            (when (not (consp cur))
-              ;; Hit a corrupted tail — prepend a new entry as if alist
-              ;; ended here.  Better than recursing into %signal-type-error.
-              (setf (mem-ref #x10000080 :u64)
-                    (cons (cons name-hash value) head))
-              (setq done t)
-              (return result))
-            (let ((pair (car cur)))
-              (when (and (consp pair) (eql (car pair) name-hash))
-                (set-cdr pair value)
-                (setq done t)
-                (return result)))
-            (setq cur (cdr cur)))))))
+  "Set a global variable by its tagged name hash.  O(1) via the globals
+   hash table at #x10000080, created lazily on first use."
+  (let ((tbl (%globals-table)))
+    (unless tbl
+      (setq tbl (make-hash-table))
+      (setf (mem-ref #x10000080 :u64) tbl))
+    (puthash name-hash tbl value)
+    value))
 
 ;;; ============================================================
 ;;; Interned Symbols

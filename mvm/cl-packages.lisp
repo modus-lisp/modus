@@ -1316,18 +1316,17 @@
     (t nil)))
 
 (defun %boundp-by-hash (key)
-  "Walk the global symbol-value alist looking for KEY.  Returns T if
-   any pair with (eql (car pair) KEY); NIL otherwise — distinguishes
-   'present, bound to NIL' from 'absent'."
-  (let ((cur (mem-ref #x10000080 :u64))
-        (found nil))
-    (loop
-      (when found (return t))
-      (when (not (consp cur)) (return nil))
-      (let ((pair (car cur)))
-        (when (and (consp pair) (eql (car pair) key))
-          (setq found t)))
-      (setq cur (cdr cur)))))
+  "Look KEY up in the global symbol-value HASH TABLE (#x10000080).  Returns
+   T if KEY is present, NIL otherwise — distinguishes 'present, bound to
+   NIL' from 'absent'.  A fresh-cons sentinel (never EQ to any stored value)
+   is used as the gethash default so a global bound to NIL still reads as
+   bound.  (The store is a hash table since the O(n²) globals-alist fix;
+   see symbol-value in prelude.lisp.)"
+  (let ((tbl (%globals-table)))
+    (if (null tbl)
+        nil
+        (let ((miss (cons nil nil)))
+          (not (eq (gethash key tbl miss) miss))))))
 
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS. Numbers, characters, strings,

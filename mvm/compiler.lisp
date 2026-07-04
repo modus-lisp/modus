@@ -4005,9 +4005,19 @@
            (= op-name 131999690084823585))  ; DEFPARAMETER
        (let* ((var-name (cadr form))
               (value-form (caddr form))
+              ;; An initform is PRESENT iff the form has a 3rd element —
+              ;; `(defvar *x* nil)` supplies the initform NIL and MUST bind
+              ;; *x* to NIL (CLHS defvar), whereas `(defvar *x*)` supplies
+              ;; none and leaves *x* unbound.  The old `(when value-form …)`
+              ;; treated a NIL initform as "no value" and SKIPPED the
+              ;; set-symbol-value — so `(defvar *x* nil)` left *x* UNBOUND,
+              ;; and any later read signalled UNBOUND-VARIABLE (asdf form 87:
+              ;; `(defvar *image-dumped-p* nil)` then `(eq *image-dumped-p*
+              ;; …)`).  Test initform PRESENCE via (cddr form), not its value.
+              (has-initform (consp (cddr form)))
               (name-hash (normalize-name var-name)))
          (setf (gethash name-hash *globals*) t)
-         (when value-form
+         (when has-initform
            (compile-form `(set-symbol-value ,name-hash ,value-form) env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
@@ -14172,6 +14182,20 @@
     ((and (consp form) (name-eq (car form) "DEFVAR"))
      (let* ((name (cadr form))
             (value (caddr form))
+            ;; An initform is PRESENT iff the form has a 3rd element.
+            ;; `(defvar *x* nil)` supplies the initform NIL and MUST bind
+            ;; *x* to NIL (CLHS); `(defvar *x*)` supplies none.  The old
+            ;; `(when value …)` skipped a NIL initform → the var stayed
+            ;; UNBOUND (asdf form 87 *image-dumped-p*; any `(defvar *x* nil)`
+            ;; then a read of *x* under eval2 signalled UNBOUND-VARIABLE).
+            ;; ONLY emit the extra NIL-init thunk under eval2 (in-image
+            ;; runtime compile): at BUILD time init-thunks are not run
+            ;; (CLAUDE.md limitation #7), and generating one per every
+            ;; `(defvar *x* nil)` across the whole codebase perturbs the
+            ;; build layout — so keep the historical build-time behaviour
+            ;; (skip NIL) and only fix the runtime path that actually reads
+            ;; the value back.
+            (has-initform (if *eval2-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
@@ -14181,7 +14205,7 @@
        ;; double-tagging: init stores at hash*4 but reads look up hash*2.
        ;; 2) Wrap value in let to avoid register clobber when value is
        ;; a function call (which would clobber V0 holding the hash).
-       (when value
+       (when has-initform
          (let ((tmp-var (gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)
@@ -14194,10 +14218,13 @@
     ((and (consp form) (name-eq (car form) "DEFPARAMETER"))
      (let* ((name (cadr form))
             (value (caddr form))
+            ;; defparameter always has an initform (CLHS requires it); under
+            ;; eval2 bind even a NIL initform (same rationale as DEFVAR).
+            (has-initform (if *eval2-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
-       (when value
+       (when has-initform
          (let ((tmp-var (gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)

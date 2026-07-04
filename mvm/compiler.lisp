@@ -8786,7 +8786,21 @@
    CLHS: searches lexically for the innermost block named NIL.  Modus
    also recognises a loop's implicit BLOCK NIL via *loop-exit-label*.
    Priority: lexical (BLOCK NIL ...) (via *block-labels*) → loop exit
-   → function return."
+   → CROSS-UNIT (BLOCK NIL ...) (via *nonlocal-blocks*, hash 0) →
+   function return.
+
+   The cross-unit branch is load-bearing: `(return x)` inside an
+   FLET/LABELS-local function (or a lambda) whose enclosing `(block nil
+   ...)` established a runtime catch frame must THROW to that frame — it
+   does NOT return from the local function (whose implicit block is named
+   after the FUNCTION, not NIL, per CLHS 3.1).  Without this, uiop's
+   SPLIT-STRING — `(block () ... (flet ((done () (return ...))) (loop ...
+   (done) ...)))` — routed the flet closure's `(return)` to the local
+   function's *function-return-label* (a no-op that let the block fall
+   through, or a wild function-return unwind that escaped uncatchably and
+   aborted the whole eval2 LOAD at asdf form 109 / compute-user-cache).
+   RETURN-FROM already consulted *nonlocal-blocks*; RETURN (== return-from
+   NIL) did not — this closes that asymmetry."
   (let ((block-entry (and *block-labels*
                           (assoc nil *block-labels*))))
     (cond
@@ -8807,6 +8821,15 @@
          (%emit-uwp-unwind-to *loop-exit-uwp-seq*)
          (emit-ir :pop dest))
        (emit-ir :br *loop-exit-label*))
+      ;; Cross-unit BLOCK NIL: we are inside a lambda/flet/labels function
+      ;; whose enclosing (block nil …) installed a runtime catch frame
+      ;; (registered under name-hash 0).  Mirror the RETURN-FROM dispatch:
+      ;; %nlx-throw to that frame's tag so the value propagates out (running
+      ;; intervening unwind-protect cleanups), instead of returning from the
+      ;; local function.
+      ((assoc 0 *nonlocal-blocks* :test #'=)
+       (let ((tag-val (cadr (assoc 0 *nonlocal-blocks* :test #'=))))
+         (compile-form (list '%nlx-throw tag-val value) env dest)))
       (*function-return-label*
        (compile-form value env +vreg-vr+)
        ;; Function-level early return: unwind ALL u-ps active in this unit
@@ -9092,14 +9115,27 @@
                           (+ 700000000 *nonlocal-block-tag-counter*)))
                ;; Cross-unit entry: survives the lambda boundary because
                ;; *nonlocal-blocks* is NOT reset by
-               ;; mvm-compile-function-internal.
-               (*nonlocal-blocks* (cons (list name-hash tag-val)
-                                        *nonlocal-blocks*)))
-          ;; Compile (catch TAG-VAL body...) into the block's dest.  CATCH
-          ;; expands to a handler-case that, on a matching THROW, returns
-          ;; *catch-value*; on a non-matching throw it re-signals so an
-          ;; outer catch/block handles it.
-          (compile-form (cons 'catch (cons tag-val body)) env dest))
+               ;; mvm-compile-function-internal.  IN-IMAGE (eval2): a
+               ;; compiled/interpreted `let` of a SPECIAL does NOT reliably
+               ;; establish a dynamic binding (the documented eval2 limitation
+               ;; — see *mvm-emit-halves* et al.), so the nested compile of a
+               ;; RETURN-FROM/RETURN inside a lambda/flet body would NOT see
+               ;; this entry and would fall through to the function-return
+               ;; path — the exact silent-abort at asdf form 109 (split-string
+               ;; `(block () … (flet ((done () (return …))) …))`).  Use an
+               ;; explicit SAVE + setq + unwind-protect restore instead, which
+               ;; DOES take effect in-image and still unwinds on a compile-time
+               ;; NLX.  (This must be a real dynamic mutation, not a lexical
+               ;; let, so the deep nested compile-form sees the pushed entry.)
+               (%nlb-saved *nonlocal-blocks*))
+          (setq *nonlocal-blocks* (cons (list name-hash tag-val) %nlb-saved))
+          (unwind-protect
+               ;; Compile (catch TAG-VAL body...) into the block's dest.  CATCH
+               ;; expands to a handler-case that, on a matching THROW, returns
+               ;; *catch-value*; on a non-matching throw it re-signals so an
+               ;; outer catch/block handles it.
+               (compile-form (cons 'catch (cons tag-val body)) env dest)
+            (setq *nonlocal-blocks* %nlb-saved)))
         ;; No cross-unit escape: plain lexical block (fast path).
         ;; Record the current UNWIND-PROTECT depth (%uwp-current-seq) in the
         ;; block entry so a RETURN-FROM that jumps out of an intervening

@@ -580,9 +580,26 @@
   (position 0))
 
 (defun mvm-emit-byte (buf byte)
-  "Emit a single byte to the MVM bytecode buffer"
-  (let ((pos (mvm-buffer-position buf)))
-    (setf (aref (mvm-buffer-bytes buf) pos) (logand byte #xFF))
+  "Emit a single byte to the MVM bytecode buffer, growing it on demand.
+   The bounds check is load-bearing: the in-image eval2 path compiles into
+   a persistent 64K-element buffer (eval2.lisp — the host 128MB default
+   blows the in-image heap), and in-image AREF stores have NO bounds check.
+   Without the grow, a single form whose compiled bytecode exceeds the
+   capacity (asdf's big with-upgradability blocks pass 64KB) silently
+   word-stores PAST the array — clobbering the buffer's own labels
+   hash-table and the mvm-buffer struct allocated right after it.  That
+   was the asdf-gauntlet form-76 'silent exit(0)' / form-104 'SIGSEGV
+   calling a zero-filled object from APPLY' heap corruption (reproduced
+   bit-identically with the GC disabled — never a GC bug)."
+  (let ((pos (mvm-buffer-position buf))
+        (bytes (mvm-buffer-bytes buf)))
+    (when (>= pos (length bytes))
+      (let ((grown (make-array (* 2 (length bytes)) :element-type '(unsigned-byte 8))))
+        (dotimes (i pos)
+          (setf (aref grown i) (aref bytes i)))
+        (setf (mvm-buffer-bytes buf) grown)
+        (setq bytes grown)))
+    (setf (aref bytes pos) (logand byte #xFF))
     (setf (mvm-buffer-position buf) (+ pos 1))))
 
 (defun mvm-buffer-used-bytes (buf)

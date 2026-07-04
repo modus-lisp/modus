@@ -1095,9 +1095,30 @@
    The TEST slot is NIL (not the symbol EQL) — INIT-SYMBOL-TABLE calls this
    at the very first instruction of boot, before the symbol intern table
    exists, so quoting 'EQL here would intern into an uninitialised table
-   and fault.  HASH-TABLE-TEST maps a NIL test slot to EQL."
+   and fault.  HASH-TABLE-TEST maps a NIL test slot to EQL.
+
+   The no-arg path now carries the SAME proper 5-list metadata tail as
+   make-hash-table-args — (test rsize rthresh size bucket-holder) with
+   test = NIL — so legacy tables ALSO graduate to the O(1) 256-bucket
+   index once they cross %HT-BUCKET-THRESHOLD entries.  The holder's
+   STRCMP? is T because the NIL-test comparator is %EQUAL-FN (strings
+   compare by content), exactly like an explicit EQUAL table.  This is
+   what fixes the asdf-gauntlet `wedge': the symbol intern table,
+   *SYM-NAME-TABLE* (7.5k entries), *SYMBOL-FUNCTION-TABLE* (2.7k) and
+   friends are all 0-arg tables, and their O(n) linear gethash walks
+   made eval2 compiles of uiop forms take minutes each (quadratic
+   blowup that presented as a deterministic rc=124 hang).  No symbol is
+   quoted here — conses/fixnums/NIL/T only — so the boot-order
+   constraint above still holds."
   (if (null options)
-      (cons nil (cons (%ht-tag) (cons nil (cons 2 (cons 1 16)))))
+      (cons nil
+            (cons (%ht-tag)
+                  (cons nil                       ; test (NIL → %equal-fn)
+                        (cons 2                   ; rehash-size
+                              (cons 1             ; rehash-threshold
+                                    (cons 16      ; size
+                                          (cons (cons nil (cons 0 t)) ; bucket-holder (vec count . strcmp?)
+                                                nil)))))))
       (make-hash-table-args options)))
 
 (defun %ht-keytest (ht)
@@ -1143,7 +1164,7 @@
           ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL table)
           ;; falls through to the linear path.
           (let ((r (%ht-bucket-find vec key (%ht-h-strcmp holder))))
-            (unless (eq r :nohash)
+            (unless (eq r (%ht-nohash))
               (setq use-linear nil)
               (setq found-pair r))))))
     (when use-linear
@@ -1170,7 +1191,7 @@
          (existing (and vec (%ht-bucket-find vec key strcmp?))))
     (cond
       ;; ---- Bucket path: key IS bucketable and already present → update. ----
-      ((and vec existing (not (eq existing :nohash)))
+      ((and vec existing (not (eq existing (%ht-nohash))))
        (set-cdr existing value)               ; update shared pair in place
        value)
       ;; ---- Bucket path: key IS bucketable and absent → add + index. ----
@@ -1303,6 +1324,16 @@
 ;;; stay on the pure-alist path: the bucket-holder is only present on
 ;;; explicit-:TEST tables, and only activated past the threshold.
 
+(defun %ht-nohash ()
+  "Fixnum sentinel for `key/table is not structurally hashable'.
+   Was the keyword :NOHASH — but a keyword literal compiles to a runtime
+   %INTERN-KEYWORD call per evaluation, which (a) is a gethash on the
+   keyword table on the gethash hot path itself, and (b) faults in
+   builds that never call INIT-KEYWORD-TABLE (build-mvm) once legacy
+   0-arg tables carry a bucket-holder.  A fixnum compares by EQ in one
+   instruction and needs no table."
+  -424242001)
+
 (defun %ht-bucket-threshold () 32)
 
 ;;; Bucket-holder layout: (vec-or-flag count . strcmp?).
@@ -1345,14 +1376,14 @@
              (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
              (setq i (+ i 1)))
            (logand h 255))
-         :nohash))
+         (%ht-nohash)))
     ((fixnump key)  (logand key 255))
     ((characterp key) (logand (char-code key) 255))
     ((null key) 17)
     ((eq key t) 19)
     ((%cl-sym-p key) (logand (%cl-sym-hash key) 255))
     ((%native-mvm-sym-p key) (logand (%native-mvm-sym-hash key) 255))
-    (t :nohash)))
+    (t (%ht-nohash))))
 
 (defun %ht-vec-set (vec i val)
   "Var-index ASET forced to dest=frame-slot (CLAUDE.md var-index ASET bug)."
@@ -1373,8 +1404,8 @@
    table's CAR alist.  Comparison is inlined: STRCMP? strings by content, all
    else by EQL."
   (let ((h (%ht-hash key strcmp?)))
-    (if (eq h :nohash)
-        :nohash
+    (if (eq h (%ht-nohash))
+        (%ht-nohash)
         (let ((cur (aref vec h)))
           (if (and strcmp? (stringp key))
               ;; string-content path
@@ -1395,7 +1426,7 @@
   "Index PAIR (the alist cons) under KEY in VEC.  Caller guarantees KEY isn't
    already present (gethash/puthash check first).  No-op for :NOHASH keys."
   (let ((h (%ht-hash key strcmp?)))
-    (unless (eq h :nohash)
+    (unless (eq h (%ht-nohash))
       (let ((old (aref vec h)))
         (%ht-vec-set vec h (cons (cons key pair) old)))))
   pair)
@@ -1403,7 +1434,7 @@
 (defun %ht-bucket-rem (vec key strcmp?)
   "Remove KEY's entry from VEC's bucket."
   (let ((h (%ht-hash key strcmp?)))
-    (unless (eq h :nohash)
+    (unless (eq h (%ht-nohash))
       (let ((result nil) (cur (aref vec h)))
         (loop
           (when (null cur) (return nil))
@@ -1423,12 +1454,12 @@
     (loop
       (when (null cur) (return nil))
       (let* ((pair (car cur)) (k (car pair)))
-        (when (eq (%ht-hash k strcmp?) :nohash) (setq ok nil) (return nil))
+        (when (eq (%ht-hash k strcmp?) (%ht-nohash)) (setq ok nil) (return nil))
         (%ht-bucket-put vec k pair strcmp?))
       (setq cur (cdr cur)))
     (if ok
         (progn (%ht-h-set-vec holder vec) vec)
-        (progn (%ht-h-set-vec holder :nohash) :nohash))))
+        (progn (%ht-h-set-vec holder (%ht-nohash)) (%ht-nohash)))))
 
 (defun %ht-active-vec-h (ht holder)
   "Return the active bucket vector for HT (HOLDER already fetched), building it
@@ -1436,11 +1467,11 @@
    the alist path (still-small table, or a :NOHASH-disabled table)."
   (let ((v (%ht-h-vec holder)))
     (cond
-      ((eq v :nohash) nil)                 ; permanently disabled
+      ((eq v (%ht-nohash)) nil)                 ; permanently disabled
       (v v)                                ; already built
       ((>= (%ht-h-count holder) (%ht-bucket-threshold))
        (let ((r (%ht-rebuild-index ht holder (%ht-h-strcmp holder))))
-         (if (eq r :nohash) nil r)))
+         (if (eq r (%ht-nohash)) nil r)))
       (t nil))))
 
 (defun hash-table-count (ht)
@@ -1461,7 +1492,7 @@
       ;; lazily — but KEEP a :NOHASH-disabled table disabled (EQUALP tables,
       ;; and any table that earlier saw a non-bucketable key).  STRCMP? in
       ;; (cddr holder) is preserved.
-      (unless (eq (%ht-h-vec holder) :nohash)
+      (unless (eq (%ht-h-vec holder) (%ht-nohash))
         (%ht-h-set-vec holder nil))
       (%ht-h-set-count holder 0)))
   ht)
@@ -1535,7 +1566,7 @@
     ;; EQUALP gets the index pre-disabled (car=:NOHASH): EQUALP string keys are
     ;; case-INSENSITIVE and EQUALP conflates e.g. 1/1.0, but the index is
     ;; EQUAL-grade — so EQUALP tables stay on the correct linear path.
-    (let ((holder (cons (if (eq test 'equalp) :nohash nil)
+    (let ((holder (cons (if (eq test 'equalp) (%ht-nohash) nil)
                         (cons 0 (eq test 'equal)))))
       (cons nil
             (cons (%ht-tag)
@@ -1691,6 +1722,7 @@
    passing *package*.  All `'foo' literals in source compile through
    %INTERN-SYMBOL-PKG instead and arrive package-tagged."
   (%intern-symbol-pkg name-hash 0))
+
 
 (defun %intern-symbol-pkg (name-hash pkg-hash)
   "Intern a symbol identified by (NAME-HASH, PKG-HASH).  Per CLHS

@@ -14465,22 +14465,45 @@
          (let ((slot-kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
                (defaults slot-defaults)
                (internal-ctor-sym (%defstruct-intern internal-ctor-name)))
-           (mvm-define-macro ctor-name
-             (lambda (form)
-               (let ((args (cdr form))
-                     (positional (make-list nslots :initial-element nil)))
-                 (loop for i from 0 for d in defaults
-                       do (setf (nth i positional) d))
-                 (loop while args
-                       do (let ((key (car args))
-                                (val (cadr args)))
-                            (let ((idx (position (normalize-name key)
-                                                 slot-kw-names
-                                                 :test #'=)))
-                              (when idx
-                                (setf (nth idx positional) val)))
-                            (setf args (cddr args))))
-                 `(,internal-ctor-sym ,@positional)))))
+           (let ((%ctor-expander
+                   (lambda (form)
+                     (let ((args (cdr form))
+                           (positional (make-list nslots :initial-element nil)))
+                       (loop for i from 0 for d in defaults
+                             do (setf (nth i positional) d))
+                       (loop while args
+                             do (let ((key (car args))
+                                      (val (cadr args)))
+                                  (let ((idx (position (normalize-name key)
+                                                       slot-kw-names
+                                                       :test #'=)))
+                                    (when idx
+                                      (setf (nth idx positional) val)))
+                                  (setf args (cddr args))))
+                       `(,internal-ctor-sym ,@positional)))))
+             (mvm-define-macro ctor-name %ctor-expander)
+             ;; eval2 (in-image runtime compile) PERSISTENCE: *macro-table* is
+             ;; rebound PER eval2 CALL, so without a runtime registration a
+             ;; LATER (eval '(make-NAME …)) compiled the ctor as an undefined
+             ;; function — `(eval '(defstruct S …))` "worked" but every
+             ;; cross-call use of MAKE-S died (probe 8183: the arg-evaluation
+             ;; error killed run-regression-tests' remaining 141 probes once
+             ;; the probe suite ran under production eval2).  The generated
+             ;; slot-accessor/copier/predicate DEFUNs already persist via the
+             ;; toplevel-DEFUN handler's *e2-persist-defuns* recording; the
+             ;; keyword-ctor MACRO was the only piece left per-call.  Register
+             ;; the same expander in the runtime macro table — macroexpand-1-
+             ;; mvm's *eval2-runtime-p* fallback calls it as (funcall mf form).
+             ;; Build-time (*eval2-runtime-p* NIL) never takes this branch, so
+             ;; host/native builds are unchanged.
+             (when *eval2-runtime-p*
+               (set-macro-function (%defstruct-intern ctor-name)
+                                   %ctor-expander)
+               ;; Also register the struct type so cross-call TYPEP /
+               ;; :include ancestry / #S printing see it — mirrors the
+               ;; walker's runtime-DEFSTRUCT registration (cl-eval.lisp).
+               (%register-struct-type struct-name include-parent
+                                      slot-names conc-name))))
 
          ;; Named constructors from (:CONSTRUCTOR name [arg-spec])
          (dolist (nc named-constructors)

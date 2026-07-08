@@ -438,15 +438,17 @@
 ;;; whenever the shape is outside eval2's lambda support:
 ;;;   - non-simple lambda list (dotted tail, nested destructuring, &whole /
 ;;;     &environment / &body — macro-expander shapes),
-;;;   - captured env present AND the body mentions LAMBDA/FUNCTION (a nested
-;;;     closure over a captured cell would snapshot the value at creation
-;;;     instead of sharing the live cell — walker semantics differ),
 ;;;   - a captured binding whose name is unresolvable or whose value is an
 ;;;     interp-closure (FLET/LABELS locals resolve via the env in the walker;
 ;;;     eval2 would compile the call as a global),
 ;;;   - eval2 COMPILE failure (conditions during the body's execution are NOT
 ;;;     caught — they propagate, matching production eval semantics; only the
 ;;;     side-effect-free compile step may fall back).
+;;; (The nested-lambda-over-captured-cells fallback is GONE: compile-lambda
+;;; now threads symbol-macro bindings into nested compilation units —
+;;; %collect-free-vars compiles SM names via their expansions instead of
+;;; snapshot-capturing them — so an inner lambda over a captured name reads
+;;; and setqs the SAME live env cons the walker and sibling closures share.)
 ;;;
 ;;; Gate: active only when (and *use-eval2* (not *e2ic-disable*)) — the
 ;;; run-all-tests walker bracket (setq *use-eval2* nil) keeps the diagnostic
@@ -568,15 +570,6 @@
              (setq out (cons pair out)))))))
     (if bad (quote :e2ic-bad) (reverse out))))
 
-(defun %e2ic-mentions-lambda-p (x)
-  "Conservative tree scan: T when X mentions LAMBDA or FUNCTION anywhere
-   (even quoted — a false positive only costs a walker fallback)."
-  (cond
-    ((symbolp x) (or (name-eq x "LAMBDA") (name-eq x "FUNCTION")))
-    ((consp x) (or (%e2ic-mentions-lambda-p (car x))
-                   (%e2ic-mentions-lambda-p (cdr x))))
-    (t nil)))
-
 (defun %e2ic-sm-bindings (pairs)
   "symbol-macrolet bindings: NAME → (cdr 'PAIR), PAIR by identity via the
    eval2 quote pool."
@@ -596,7 +589,6 @@
       (let ((pairs (%e2ic-env-pairs env params)))
         (cond
           ((eq pairs (quote :e2ic-bad)) nil)
-          ((and pairs (%e2ic-mentions-lambda-p body)) nil)
           (t
            (let ((form (if pairs
                            (list (quote lambda) params

@@ -6471,7 +6471,20 @@
        ((member form bound) acc)
        ((%special-var-name-p form) acc)   ; dynamic binding, never capture
        ((env-lookup env form)
-        (if (member form acc) acc (cons form acc)))
+        ;; SYMBOL-MACRO bindings are NOT captured by value — the name is
+        ;; compiled via its EXPANSION inside the inner unit (compile-lambda
+        ;; threads the symbol-macro bindings through as the inner unit's
+        ;; parent env), so reads stay live and (setq NAME v) keeps its
+        ;; setf-expansion semantics.  Capturing the NAME (the old behavior)
+        ;; SNAPSHOTTED the expansion's value at closure creation and made
+        ;; setq write a dead local — wrong for plain symbol-macrolet code
+        ;; and the blocker for %e2ic's nested-lambda-over-captured-cells
+        ;; fallback (eval2.lisp).  DO walk the expansion: if it references
+        ;; a real outer local, THAT var still needs capturing.
+        (let ((b (env-lookup env form)))
+          (if (eq (binding-location b) :symbol-macro)
+              (%collect-free-vars (binding-expansion b) bound env acc)
+              (if (member form acc) acc (cons form acc)))))
        (t acc)))
     ((atom form) acc)
     (t
@@ -6565,6 +6578,29 @@
       (setq acc (%collect-free-vars (car bs) bound env acc))
       (setq bs (cdr bs)))))
 
+(defun %env-symbol-macros-only (env)
+  "A single compile-env containing ONLY the :symbol-macro bindings reachable
+   from ENV (innermost-first, so shadowing order is preserved for
+   env-lookup's first-match FIND), or NIL when there are none.  Used as the
+   PARENT env of a closure's inner compilation unit: symbol-macrolet
+   expansions must stay visible inside nested lambdas (their expansions are
+   frame-independent forms), while :stack/:reg bindings must NOT leak across
+   the unit boundary — those belong to the OUTER frame; real free variables
+   are captured into the closure env instead (%collect-free-vars)."
+  (let ((out nil)
+        (e env))
+    (loop
+      (when (null e) (return nil))
+      (dolist (b (compile-env-bindings e))
+        (when (eq (binding-location b) :symbol-macro)
+          (setq out (cons b out))))
+      (setq e (compile-env-parent e)))
+    (if out
+        (make-compile-env :bindings (reverse out)
+                          :stack-depth 0
+                          :parent nil)
+        nil)))
+
 (defun compile-lambda (params body env dest)
   "Compile (lambda (params) body*).
    Creates a named function for the lambda body. Registers it in the
@@ -6645,9 +6681,17 @@
                (all-bindings (cons env-binding var-bindings))
                ;; Wrap body in let* that loads captured values
                (wrapped-body `((let* ,all-bindings ,@actual-body)))
-               ;; Compile the closure function (NO parent-env — captured vars
-               ;; are loaded as locals from the closure env at entry)
-               (result (mvm-compile-function-internal lambda-name actual-params wrapped-body nil rest-slot opt-start opt-count))
+               ;; Compile the closure function.  Parent env: NOT the full
+               ;; outer env (captured vars are loaded as locals from the
+               ;; closure env at entry; outer :stack slots must not leak),
+               ;; but the outer env's SYMBOL-MACRO bindings ARE threaded
+               ;; through — %collect-free-vars no longer captures
+               ;; symbol-macro names (their expansions compile in-place),
+               ;; so the inner unit needs them visible.  A symbol-macro
+               ;; expansion that references a captured var resolves to the
+               ;; wrapped-body's own let*-local (correct: the captured
+               ;; value), because child bindings win over the parent chain.
+               (result (mvm-compile-function-internal lambda-name actual-params wrapped-body (%env-symbol-macros-only env) rest-slot opt-start opt-count))
                (info (car result)))
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)

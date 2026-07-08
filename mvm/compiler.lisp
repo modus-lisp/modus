@@ -14890,6 +14890,19 @@
                              (aset obj ,(+ 2 i) val)
                              val)
                           forms-to-compile)
+                    ;; Real (setf ACC) FUNCTION (CLHS 3.1.2.1.2.3 arg order:
+                    ;; new-value first).  `#'(setf acc)` / `(funcall #'(setf
+                    ;; acc) v x)` compile to a call of "SETF-<ACC>" — before
+                    ;; this only the SET-<ACC> defun + the *macro-table*
+                    ;; alias existed, so the function reference was
+                    ;; UNDEFINED-FUNCTION (same- AND cross-call under eval2;
+                    ;; item-3 probes 311/312).  A defun persists across
+                    ;; eval2 calls via *e2-persist-defuns*, closing the
+                    ;; cross-call side for free.
+                    (push `(defun (setf ,(%defstruct-intern acc-name)) (val obj)
+                             (aset obj ,(+ 2 i) val)
+                             val)
+                          forms-to-compile)
                     (let ((setter-sym (%defstruct-intern setter-name)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
                         (mvm-define-macro setf-key

@@ -3257,6 +3257,15 @@
 (defvar *flip-skip-probes*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_FLIP_SKIP_PROBES") #-sbcl nil))
     (and v (plusp (length v)) (not (string= v "0")))))
+;; WS3 Phase 3: the diagnostic probe suite (run-all-tests) runs under PRODUCTION
+;; EVAL2 by default — the old walker bracket's perf premise is stale (probes
+;; complete in ~1s under eval2 since the 194bbfb/8953c39/c4d9403 chain; measured
+;; at 70677f9).  MODUS_PROBES_ON_WALKER=1 restores the historical
+;; `(setq *use-eval2* nil) (run-all-tests) (setq *use-eval2* t)` bracket —
+;; the rollback / A-B triage lever for probe-id (<10001) divergences.
+(defvar *probes-on-walker*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_PROBES_ON_WALKER") #-sbcl nil))
+    (and v (plusp (length v)) (not (string= v "0")))))
 ;; Accumulated emitted source for the e2diff chunk fns + run-e2diff-FILE fns.
 (defvar *e2diff-sources* "")
 ;; Per-file accumulator of (id . actual-form) captured this file; reset per file.
@@ -5582,13 +5591,14 @@
                        (d1 (if *flip-skip-probes*
                                (str-sub "(run-all-tests)" "" d0)
                                d0))
-                       ;; FLIP DEFAULT: the diagnostic probe suite stays on the
-                       ;; TREE-WALKER for now — its forms are eval-heavy and
-                       ;; DISTINCT (no cache hits), ~50x slower under eval2.
-                       ;; Probes are diagnostics, not conformance; making them
-                       ;; viable under eval2 (distinct-form compile speed / JIT)
-                       ;; is the Phase-3 (tree-walker deletion) prerequisite.
-                       (d2 (if *use-eval2-build*
+                       ;; WS3 Phase 3 (unbracketed by default): the probe suite
+                       ;; runs under PRODUCTION EVAL2 — the "~50x slower" walker
+                       ;; bracket premise is stale (probes ~1s under eval2 since
+                       ;; the perf chain; see *probes-on-walker* above).  Probes
+                       ;; now exercise the SAME engine production uses, which is
+                       ;; the point of diagnostics.  MODUS_PROBES_ON_WALKER=1
+                       ;; restores the bracket for A/B triage or rollback.
+                       (d2 (if (and *use-eval2-build* *probes-on-walker*)
                                (str-sub "(run-all-tests)"
                                         "(setq *use-eval2* nil) (run-all-tests) (setq *use-eval2* t)"
                                         d1)

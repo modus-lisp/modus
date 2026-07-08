@@ -3865,7 +3865,10 @@
              (let ((info (car result)))
                (setf (function-info-required-count info) req-end)
                (when (or rest-pos synth-rest)
-                 (setf (function-info-rest-param-p info) t)))
+                 (setf (function-info-rest-param-p info) t)
+                 ;; &optional count — disables compile-call's static
+                 ;; pre-pack for rest+optional callees (see flet site).
+                 (setf (function-info-optional-count info) (cadddr pp))))
              ;; CRITICAL: queue the IR for emission.  mvm-compile-function
              ;; registers the function-info (so call sites resolve and
              ;; link) but the toplevel driver only emits IR it receives
@@ -6974,7 +6977,16 @@
         ;; only set this for synth-rest, leaving explicit &rest broken.
         (when (or synth-rest rest-pos)
           (setf (function-info-required-count info) req-end)
-          (setf (function-info-rest-param-p info) t))
+          (setf (function-info-rest-param-p info) t)
+          ;; Record the &optional count too: compile-call's static-rest
+          ;; pre-pack MUST be disabled for rest+optional callees (it
+          ;; splits at REQ, swallowing the optionals into the rest list
+          ;; and NIL-initing them via the 255 sentinel).  The toplevel
+          ;; defun path has recorded this since the BOA fix; flet/labels
+          ;; didn't — latent for (flet ((f (a &optional b &rest r))))
+          ;; and load-bearing now that &optional+&key routes through the
+          ;; synthesized-&rest transform.
+          (setf (function-info-optional-count info) (cadddr pp)))
         ;; Register with unique name
         (setf (gethash (function-info-name info) *functions*) info)
         (push info *function-table*)
@@ -12884,14 +12896,23 @@
    while bounding the bloat.
 
    &key handling (real, since 2026-05-22): when a lambda-list has &key
-   params and NO &optional and NO explicit &rest, the keys are turned
-   into a synthesized &rest catch var %KW-REST plus a let* extraction
-   prologue that binds each key var (with default) and supplied-p var
-   from the keyword plist.  This reuses the working &rest calling
-   convention; compile-call already packs trailing args into a list
-   for &rest functions.  The (&optional + &key) and (&rest + &key)
-   combinations still fall back to the old positional behavior — they
-   need slot-range coordination that isn't wired yet.
+   params, the keys are turned into a synthesized &rest catch var
+   %KW-REST plus a let* extraction prologue that binds each key var
+   (with default) and supplied-p var from the keyword plist.  This
+   reuses the working &rest calling convention; compile-call already
+   packs trailing args into a list for &rest functions.  An explicit
+   &rest is OK (it binds to the same catch var).  &OPTIONAL + &KEY is
+   also handled here (since 2026-07-08): optional params keep their
+   positional slots (gensym'd, NIL-padded by emit-optional-prologue,
+   rebound in the let* with nargs-based supplied checks exactly like
+   the fallback &optional path), and the catch var sits AFTER them
+   (rest-slot = required + optcount).  compile-call already disables
+   static pre-pack for rest+optional callees, so the callee's dynamic
+   rest/optional prologues see truthful nargs.  Binding order in the
+   let* follows CLHS 3.4.1: optionals left-to-right, then &rest, then
+   keys, then &aux.  (The old positional fallback for this combo bound
+   each &key VAR to whatever arg landed in its slot — `(f 1 2 :k 3)`
+   bound k to the keyword :K itself.)
 
    &aux is handled by wrapping the body in a let* — init forms execute
    inside the function's implicit block, so a (return-from FOO X) in
@@ -12959,12 +12980,12 @@
       ((and (null optional) (null keys) (null auxes)
             (not has-rest) (not has-key))
        (list params body nil 0 nil))
-      ;; --- Real &key path: keys present, no &optional.  An explicit
-      ;; &rest is OK now — it binds to the SAME synthesized catch var
-      ;; (the full trailing plist), and keys are extracted from it.
-      ;; This is the common (&rest args &key ...) shape used by helper
-      ;; functions like make-pathname-test. ---
-      ((and allow-key-transform has-key (null optional))
+      ;; --- Real &key path: keys present.  An explicit &rest is OK —
+      ;; it binds to the SAME synthesized catch var (the full trailing
+      ;; plist), and keys are extracted from it (the common
+      ;; (&rest args &key ...) shape, e.g. make-pathname-test).
+      ;; &optional is OK too — see the docstring. ---
+      ((and allow-key-transform has-key)
        (let* ((kw-rest (intern (format nil "%KW-REST-~D"
                                         (incf *kw-rest-counter*))
                                ;; (or (find-package "MODUS.MVM") *package*), NOT
@@ -12980,14 +13001,48 @@
                                ;; intern-into-NIL bug already fixed for cell-var-name
                                ;; / defstruct-intern / setf-place setters.
                                (or (find-package "MODUS.MVM") *package*)))
-              (new-params (append required (list kw-rest)))
-              (rest-slot (length required))
-              ;; Build let* bindings: for each key, a found-flag, the
-              ;; value (default-aware), and optionally the supplied-p var.
-              ;; When an explicit &rest var is present, bind it FIRST to
-              ;; the full catch-var plist so key extractions below still
-              ;; reference kw-rest (not the user rest var).
-              (bindings (when rest-var (list (list rest-var kw-rest)))))
+              (req-count (length required))
+              ;; &optional params get GENSYM slot names (same CLHS-scope
+              ;; trick as the fallback path at #142 below): the caller
+              ;; fills the slot / emit-optional-prologue NIL-pads it, and
+              ;; the user name is rebound in the let* so an unsupplied
+              ;; optional evaluates its default with earlier params bound
+              ;; and its OWN name still referring to any outer binding.
+              (opt-gensyms (mapcar (lambda (o)
+                                     (declare (ignore o))
+                                     (gensym "%OPT"))
+                                   optional))
+              (new-params (append required opt-gensyms (list kw-rest)))
+              (rest-slot (+ req-count (length optional)))
+              (nargs-var (when optional (gensym "%NARGS")))
+              ;; Build let* bindings in CLHS 3.4.1 order:
+              ;;   1. nargs snapshot + &optional rebinds (supplied checks
+              ;;      via (> nargs idx); read nargs FIRST, before any
+              ;;      default/extraction call can clobber the nargs slot),
+              ;;   2. the explicit &rest var (bound to the full catch-var
+              ;;      plist so key extractions still reference kw-rest),
+              ;;   3. per key: a found-flag, the value (default-aware),
+              ;;      and optionally the supplied-p var.
+              (bindings nil))
+         (when optional
+           (push (list nargs-var (list '%get-nargs)) bindings)
+           (loop for opt in optional
+                 for g in opt-gensyms
+                 for i from 0
+                 for idx = (+ req-count i)
+                 for var = (car opt)
+                 for default = (cadr opt)
+                 for sup = (caddr opt)
+                 do
+                 (push (list var
+                             (if default
+                                 `(if (> ,nargs-var ,idx) ,g ,default)
+                                 g))
+                       bindings)
+                 (when sup
+                   (push (list sup (list '> nargs-var idx)) bindings))))
+         (when rest-var
+           (push (list rest-var kw-rest) bindings))
          (dolist (k keys)
            ;; (car k) is the key's name spec.  Normally a symbol (FOO →
            ;; keyword :FOO, variable FOO).  CLHS also allows the
@@ -13034,15 +13089,23 @@
                   (unless allow-other-keys
                     (list (list '%validate-kw-list kw-rest
                                 (list 'quote declared-kws)))))
+                ;; Touch nargs-var (when bound) so it isn't dead-stripped
+                ;; when no optional default/supplied-p references it —
+                ;; same guard as the fallback &optional path.
+                (touch (when nargs-var (list nargs-var)))
                 (new-body
                   (if auxes
                       `((let* (,@bindings)
+                          ,@touch
                           ,@validation
                           (let* ,auxes ,@body)))
                       `((let* (,@bindings)
+                          ,@touch
                           ,@validation
                           ,@body)))))
-           (list new-params new-body nil 0 rest-slot))))
+           (list new-params new-body
+                 (when optional req-count) (length optional)
+                 rest-slot))))
       ;; --- Fallback: old positional behavior for other combinations ---
       (t
        (let* ((key-params

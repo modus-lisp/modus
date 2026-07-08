@@ -486,18 +486,16 @@
    only after an &-marker, markers limited to &optional/&rest/&key/&aux/
    &allow-other-keys.  Dotted tails, nested destructuring in the required
    section, and &whole/&environment/&body (macro lambda lists) → NIL.
-   ALSO rejects lambda lists combining &OPTIONAL and &KEY: eval2's &key→&rest
-   transform mishandles that combination TODAY (probe T2D/E: supplied :k binds
-   the keyword itself; via the trampoline initial-args path the default reads
-   0) — a pre-existing compile-lambda gap independent of this entry, so those
-   shapes stay on the walker until it's fixed."
+   &OPTIONAL+&KEY combos are ACCEPTED (since 2026-07-08): preprocess-params'
+   &key→&rest transform now handles the combination (optionals keep gensym'd
+   positional slots, the synthesized catch var sits after them), so the old
+   probe-T2D/E mis-binding (supplied :k bound the keyword itself) is fixed
+   and those closures take the e2 path."
   (let ((ps params)
-        (has-opt nil)
-        (has-key nil)
         (in-required t))
     (loop
       (cond
-        ((null ps) (return (not (and has-opt has-key))))
+        ((null ps) (return t))
         ((not (consp ps)) (return nil))          ; dotted tail
         (t
          (let ((p (car ps)))
@@ -511,10 +509,7 @@
                           (string-equal mk "&KEY")
                           (string-equal mk "&AUX")
                           (string-equal mk "&ALLOW-OTHER-KEYS"))
-                      (progn
-                        (when (string-equal mk "&OPTIONAL") (setq has-opt t))
-                        (when (string-equal mk "&KEY") (setq has-key t))
-                        (setq in-required nil))
+                      (setq in-required nil)
                       (return nil)))))           ; &whole/&environment/&body/…
              ((consp p)
               (if in-required

@@ -6687,6 +6687,140 @@
                           :parent nil)
         nil)))
 
+(defun %mll-name-eq (sym name-string)
+  "NAME-EQ that stays correct IN-IMAGE for native MVM symbols whose
+   SYMBOL-NAME reverse lookup returns \"\" (names like &WHOLE/&ENVIRONMENT
+   appear in scanned sources only inside string literals, so they are not
+   in *sym-name-table*): falls back to comparing the symbol's STORED
+   slot-0 hash — the [[reference_eval2_parity]] fix pattern (key by stored
+   hash, not resolved name).  On the host (and whenever SYMBOL-NAME
+   resolves) this is exactly NAME-EQ; the fallback arm references
+   image-only %NATIVE-SYM-P behind the *eval2-runtime-p* guard (same
+   precedent as %raw-macro-expander above)."
+  (and (symbolp sym)
+       (or (name-eq sym name-string)
+           (and *eval2-runtime-p*
+                (%native-sym-p sym)
+                (eql (aref sym 0) (compute-name-hash name-string))))))
+
+(defun %macro-lambda-list-p (params)
+  "T when PARAMS is a MACRO-style lambda list — a shape ordinary
+   compile-lambda parameter binding cannot handle and
+   %transform-macro-lambda-list must rewrite first:
+     - a dotted tail            (a b . rest)
+     - nested destructuring in the REQUIRED section  ((a b) c)
+     - &WHOLE / &ENVIRONMENT / &BODY markers
+   A cons in an &optional/&key section is a (var init [supplied-p]) or
+   ((:kw var) …) spec — NOT a macro trigger (section-aware, mirroring
+   %bind-params / %e2ic-simple-ll-p).  Plain ordinary lambda lists
+   return NIL so the normal compile path is bit-identical."
+  (let ((ps params)
+        (in-required t)
+        (macro nil))
+    (loop
+      (cond
+        ((null ps) (return macro))
+        ((not (consp ps)) (return t))            ; dotted tail
+        (t
+         (let ((p (car ps)))
+           (cond
+             ((and (symbolp p)
+                   (or (%mll-name-eq p "&WHOLE")
+                       (%mll-name-eq p "&ENVIRONMENT")
+                       (%mll-name-eq p "&BODY")))
+              (return t))
+             ((and (symbolp p)
+                   (or (%mll-name-eq p "&OPTIONAL") (%mll-name-eq p "&REST")
+                       (%mll-name-eq p "&KEY") (%mll-name-eq p "&AUX")
+                       (%mll-name-eq p "&ALLOW-OTHER-KEYS")))
+              (setq in-required nil))
+             ((and in-required (consp p))
+              (return t))                        ; nested destructuring
+             (t nil)))
+         (setq ps (cdr ps)))))))
+
+(defun %transform-macro-lambda-list (params body)
+  "Rewrite (lambda MACRO-LL . BODY) into plain-lambda-list code:
+     (lambda (&rest %MLL-ARGS)
+       [(let ((WHOLE-VAR %MLL-ARGS) (ENV-VAR nil)) …)]
+         (destructuring-bind D-PARAMS %MLL-ARGS
+           [(let* AUX-BINDINGS …)]
+             . BODY))
+   where D-PARAMS = PARAMS minus &WHOLE/&ENVIRONMENT/&AUX.  The compiler's
+   DESTRUCTURING-BIND macro handles nested patterns, dotted tails,
+   &optional defaults/supplied-p, &rest/&body and &key; the trailing &AUX
+   section (which it skips) is split into an inner LET*.  &WHOLE binds the
+   ENTIRE argument list (destructuring-bind semantics — at a function-call
+   boundary there is no operator to include; the tree-walker mis-bound it
+   as a positional var, so this is strictly more CL-correct).
+   &ENVIRONMENT binds NIL (matching build-macrolet-expander and the
+   compile-time DEFMACRO handler).  Returns (NEW-PARAMS . NEW-BODY)."
+  (let ((whole-var nil)
+        (env-var nil)
+        (rest params))
+    ;; Leading &WHOLE VAR.
+    (when (and (consp rest) (symbolp (car rest)) (%mll-name-eq (car rest) "&WHOLE"))
+      (setq whole-var (cadr rest))
+      (setq rest (cddr rest)))
+    ;; Strip &ENVIRONMENT VAR (may appear anywhere in the proper part) and
+    ;; split off a trailing &AUX section; preserve a dotted tail.
+    (let ((acc nil)
+          (aux-specs nil)
+          (cur rest)
+          (tail nil))
+      (loop
+        (cond
+          ((null cur) (return))
+          ((not (consp cur)) (setq tail cur) (return))
+          ((and (symbolp (car cur)) (%mll-name-eq (car cur) "&ENVIRONMENT"))
+           (setq env-var (cadr cur))
+           (setq cur (cddr cur)))
+          ((and (symbolp (car cur)) (%mll-name-eq (car cur) "&AUX"))
+           (setq aux-specs (cdr cur))
+           (return))
+          (t (push (car cur) acc)
+             (setq cur (cdr cur)))))
+      (let ((d-params (nreverse acc)))
+        ;; Rebuild the dotted tail, if any (cons-by-cons; APPEND with an
+        ;; atom tail is not guaranteed in-image).
+        (when tail
+          (if d-params
+              (let ((last d-params))
+                (loop
+                  (if (consp (cdr last))
+                      (setq last (cdr last))
+                      (return)))
+                (rplacd last tail))
+              (setq d-params tail)))
+        (let ((args-var (gensym "MLLARGS"))
+              (inner body))
+          (when aux-specs
+            (setq inner
+                  (list (cons 'let*
+                              (cons (let ((abs nil))
+                                      (dolist (spec aux-specs (nreverse abs))
+                                        (push (if (consp spec)
+                                                  (list (car spec)
+                                                        (if (cdr spec) (cadr spec) nil))
+                                                  (list spec nil))
+                                              abs)))
+                                    inner)))))
+          (setq inner
+                (list (cons 'destructuring-bind
+                            (cons d-params (cons args-var inner)))))
+          (when (or whole-var env-var)
+            (setq inner
+                  (list (cons 'let
+                              (cons (append
+                                     (if whole-var
+                                         (list (list whole-var args-var))
+                                         nil)
+                                     (if env-var
+                                         (list (list env-var nil))
+                                         nil))
+                                    inner)))))
+          (cons (list '&rest args-var) inner))))))
+
 (defun compile-lambda (params body env dest)
   "Compile (lambda (params) body*).
    Creates a named function for the lambda body. Registers it in the
@@ -6694,7 +6828,16 @@
    native address for CALL-IND.
    When the lambda captures variables from the enclosing scope, builds
    a closure object and emits code to load captured values from R13
-   (the closure-env register) into locals at function entry."
+   (the closure-env register) into locals at function entry.
+   MACRO-style lambda lists (dotted tail, nested destructuring, &whole/
+   &environment/&body — the defmacro-expander shapes) are rewritten to a
+   plain (&rest …) + DESTRUCTURING-BIND form first (see
+   %transform-macro-lambda-list).  Gated on *eval2-runtime-p* so the
+   host/native build path is byte-identical."
+  (when (and *eval2-runtime-p* (%macro-lambda-list-p params))
+    (let ((tx (%transform-macro-lambda-list params body)))
+      (return-from compile-lambda
+        (compile-lambda (car tx) (cdr tx) env dest))))
   ;; &key transform is ON for lambdas (T = allow-key-transform).  The
   ;; transform rewrites a (&key ...) lambda into a &rest catch var + a
   ;; let* extraction prologue (see preprocess-params).  This was OFF for

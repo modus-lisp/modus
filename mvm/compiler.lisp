@@ -9971,10 +9971,17 @@
       ;; (intersection :test, sort #'<, …) would SEGV on call-indirect
       ;; to a cons addr.  The check + shift + helper-call only fires
       ;; when fn IS a cons; cold path for normal funcall.  Capped at
-      ;; nargs ≤ 4 — the primary use case (:test/:key/:test-not) is
-      ;; always 1- or 2-arg, and the shift loop's write-target reaches
-      ;; V4 which IS fn-call-reg, so we stash fn in a fresh temp first.
-      (when (<= nargs 4)
+      ;; nargs ≤ 3 here: the helper takes (1+ nargs) params, so at
+      ;; nargs ≤ 3 every helper param fits the V0..V3 register window
+      ;; and the plain register shift is correct.  nargs ≥ 4 takes the
+      ;; stack-aware arm below — the helper's params 4+ are STACK
+      ;; overflow args in the calling convention (native frame-enter
+      ;; copies [RBP+16+k*8]; the interp bridge reads the mvm-stack),
+      ;; so a shift into V4 can NEVER pass them.  The old nargs=4
+      ;; shuffle did exactly that: the user's 4th arg went to V4, which
+      ;; no callee reads — %FUNCALL-IC-4's 5th param arrived as stack
+      ;; garbage (the T2D.2/4 corrupted-arg class).
+      (when (<= nargs 3)
         (let ((check-reg (alloc-temp-reg))
               (cmp-reg   (alloc-temp-reg))
               (fn-save   (alloc-temp-reg))
@@ -9983,10 +9990,8 @@
           (emit-ir :li cmp-reg (ash +tag-cons+ +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-ic-label)
-          ;; cons fn → save fn (the shift below would clobber V4
-          ;; = fn-call-reg when nargs=4), shift V0..V_{nargs-1} →
-          ;; V1..V_{nargs}, put fn → V0, call %FUNCALL-IC-<nargs>
-          ;; with (1+ nargs) args.
+          ;; cons fn → save fn, shift V0..V_{nargs-1} → V1..V_{nargs},
+          ;; put fn → V0, call %FUNCALL-IC-<nargs> with (1+ nargs) args.
           (emit-ir :mov fn-save fn-call-reg)
           (loop for i from nargs downto 1
                 do (emit-ir :mov (+ +vreg-v0+ i) (+ +vreg-v0+ (- i 1))))
@@ -9999,6 +10004,43 @@
           (free-temp-reg)   ; free fn-save
           (free-temp-reg)   ; free cmp-reg
           (free-temp-reg))) ; free check-reg
+      ;; IC slow path, nargs 4..10 (the %FUNCALL-IC ladder's extent):
+      ;; the helper call has (1+ nargs) ≥ 5 args, so helper params 4+
+      ;; must go on the STACK.  Key insight: the user's own overflow
+      ;; args (indices 4..nargs-1, when nargs > 4) are ALREADY stack-
+      ;; resident in exactly the positions of the helper's params
+      ;; 5..nargs — they stay in place untouched.  We only need to:
+      ;;   - push old V3 (user arg 3) so it becomes the helper's first
+      ;;     overflow param (param index 4, at stack top);
+      ;;   - shift V0..V2 → V1..V3 and put fn → V0;
+      ;;   - call, then POP the one extra word this branch pushed (the
+      ;;     shared epilogue only drains the original nargs-4 overflow
+      ;;     words).
+      ;; fn-call-reg (V4+ temp) is never a shift target here, so no
+      ;; fn-save is needed.  Covers walker interp-closures AND CL-symbol
+      ;; function designators (both cons-tagged) at 4..10 args; > 10
+      ;; falls through to call-indirect as before.
+      (when (and (> nargs 3) (<= nargs 10))
+        (let ((check-reg (alloc-temp-reg))
+              (cmp-reg   (alloc-temp-reg))
+              (not-ic-label (make-compiler-label)))
+          (emit-ir :obj-tag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +tag-cons+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-ic-label)
+          (emit-ir :push +vreg-v3+)
+          (emit-ir :mov +vreg-v3+ +vreg-v2+)
+          (emit-ir :mov +vreg-v2+ +vreg-v1+)
+          (emit-ir :mov +vreg-v1+ +vreg-v0+)
+          (emit-ir :mov +vreg-v0+ fn-call-reg)
+          (let ((helper-name (format nil "%FUNCALL-IC-~D" nargs)))
+            (emit-ir :set-nargs (1+ nargs))
+            (emit-ir :call helper-name (1+ nargs)))
+          (emit-ir :pop check-reg)   ; drop the extra pushed word
+          (emit-ir :br after-call-label)
+          (emit-ir-label not-ic-label)
+          (free-temp-reg)   ; free cmp-reg
+          (free-temp-reg))) ; free check-reg
       ;; GF struct dispatch: if fn is object-tag + subtag #x32 (array),
       ;; route to %FUNCALL-GF-N helper which verifies slot 0 is
       ;; '%generic-function and dispatches via %gf-dispatch.  Without
@@ -10006,7 +10048,7 @@
       ;; `(eval '(defgeneric NAME …))` after build-time rewriting) fell
       ;; through to call-indirect and SEGV'd inside the heap.
       ;; DGMC.AND.4+ cluster fix, 2026-06-08.
-      (when (<= nargs 4)
+      (when (<= nargs 3)
         (let ((check-reg (alloc-temp-reg))
               (cmp-reg   (alloc-temp-reg))
               (fn-save   (alloc-temp-reg))
@@ -10029,6 +10071,35 @@
           (emit-ir :br after-call-label)
           (emit-ir-label not-gf-label)
           (free-temp-reg)
+          (free-temp-reg)
+          (free-temp-reg)))
+      ;; GF dispatch at nargs=4: %FUNCALL-GF-4 takes 5 params, so its
+      ;; 5th (the user's 4th arg) must go on the STACK, not V4 — same
+      ;; stack-aware shape as the IC 4..10 arm above (the old ≤4 shuffle
+      ;; put it in V4, which no callee reads: the GF method saw stack
+      ;; garbage for its 4th argument).
+      (when (= nargs 4)
+        (let ((check-reg (alloc-temp-reg))
+              (cmp-reg   (alloc-temp-reg))
+              (not-gf-label (make-compiler-label)))
+          (emit-ir :obj-tag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-gf-label)
+          (emit-ir :obj-subtag check-reg fn-call-reg)
+          (emit-ir :li cmp-reg (ash +subtag-array+ +fixnum-shift+))
+          (emit-ir :cmp check-reg cmp-reg)
+          (emit-ir :bne not-gf-label)
+          (emit-ir :push +vreg-v3+)
+          (emit-ir :mov +vreg-v3+ +vreg-v2+)
+          (emit-ir :mov +vreg-v2+ +vreg-v1+)
+          (emit-ir :mov +vreg-v1+ +vreg-v0+)
+          (emit-ir :mov +vreg-v0+ fn-call-reg)
+          (emit-ir :set-nargs 5)
+          (emit-ir :call "%FUNCALL-GF-4" 5)
+          (emit-ir :pop check-reg)   ; drop the extra pushed word
+          (emit-ir :br after-call-label)
+          (emit-ir-label not-gf-label)
           (free-temp-reg)
           (free-temp-reg)))
       ;; GF struct dispatch at >4 args: the per-arity %FUNCALL-GF-N shuffle

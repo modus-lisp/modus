@@ -3972,6 +3972,27 @@
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f g))
     (t (%signal-undefined-function))))
 
+(defun %funcall-ic-8 (fn a b c d e f g h)
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d e f g h)))
+    ;; CL-symbol wrapper designator — see %funcall-ic-0's comment.
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f g h))
+    (t (%signal-undefined-function))))
+
+(defun %funcall-ic-9 (fn a b c d e f g h i)
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d e f g h i)))
+    ;; CL-symbol wrapper designator — see %funcall-ic-0's comment.
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f g h i))
+    (t (%signal-undefined-function))))
+
+(defun %funcall-ic-10 (fn a b c d e f g h i j)
+  (cond
+    ((%interp-closure-p fn) (%call-interp-closure fn (list a b c d e f g h i j)))
+    ;; CL-symbol wrapper designator — see %funcall-ic-0's comment.
+    ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f g h i j))
+    (t (%signal-undefined-function))))
+
 ;;; ============================================================
 ;;; %FUNCALL-GF-N — funcall a GF struct (subtag #x32, slot 0 =
 ;;; '%generic-function).  compile-funcall routes (funcall gf-struct …)

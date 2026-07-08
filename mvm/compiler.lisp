@@ -9517,6 +9517,17 @@
           ((or (= hash 347164158959663450)   ; LET
                (= hash 115433002357585904))  ; LET*
            (tail-form-is-values-p (cddr form)))
+          ;; block — CL blocks are transparent to multiple values; check the
+          ;; body's last form.  Load-bearing for %e2ic: the tree-walker wraps
+          ;; every FLET/LABELS local's body as ((block NAME . BODY)) (cl-eval
+          ;; flet), so a values-returning local compiled through the eval2
+          ;; interp-closure entry used to hit the set-mv-count-1 epilogue and
+          ;; truncate to its primary value (probe F7).  Same imprecision
+          ;; class as the IF branch handling below: a RETURN-FROM into the
+          ;; block with a non-values result leaves the MV count to the
+          ;; dynamic path, which the heuristic already accepts.
+          ((= hash (compute-name-hash "BLOCK"))
+           (tail-form-is-values-p (cddr form)))
           ;; if — check both branches
           ((= hash 448736678201786992)     ; IF
            (or (and (caddr form) (tail-form-is-values-p (list (caddr form))))

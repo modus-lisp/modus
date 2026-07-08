@@ -438,9 +438,7 @@
 ;;; whenever the shape is outside eval2's lambda support:
 ;;;   - non-simple lambda list (dotted tail, nested destructuring, &whole /
 ;;;     &environment / &body — macro-expander shapes),
-;;;   - a captured binding whose name is unresolvable or whose value is an
-;;;     interp-closure (FLET/LABELS locals resolve via the env in the walker;
-;;;     eval2 would compile the call as a global),
+;;;   - a captured binding whose name is unresolvable,
 ;;;   - eval2 COMPILE failure (conditions during the body's execution are NOT
 ;;;     caught — they propagate, matching production eval semantics; only the
 ;;;     side-effect-free compile step may fall back).
@@ -448,11 +446,13 @@
 ;;; now threads symbol-macro bindings into nested compilation units —
 ;;; %collect-free-vars compiles SM names via their expansions instead of
 ;;; snapshot-capturing them — so an inner lambda over a captured name reads
-;;; and setqs the SAME live env cons the walker and sibling closures share.)
+;;; and setqs the SAME live env cons the walker and sibling closures share.
+;;; The env-held-interp-closure fallback is ALSO gone: FLET/LABELS locals in
+;;; a captured env compile to flet wrappers + SM entries — see
+;;; %e2ic-env-pairs / %e2ic-flet-bindings.)
 ;;;
-;;; Gate: active only when (and *use-eval2* (not *e2ic-disable*)) — the
-;;; run-all-tests walker bracket (setq *use-eval2* nil) keeps the diagnostic
-;;; probes on the pure walker, and *e2ic-disable* is the rollback lever.
+;;; Gate: active only when (and *use-eval2* (not *e2ic-disable*)) —
+;;; *e2ic-disable* is the rollback lever (and the probe batteries' A-side).
 
 (defvar *e2ic-disable* nil
   "Rollback lever for the eval2 interp-closure entry: T = every
@@ -547,28 +547,35 @@
              (when snm (setq out (cons snm out))))))))))
 
 (defun %e2ic-env-pairs (env params)
-  "Captured-env binding conses to expose via symbol-macrolet: dedup by NAME
+  "Captured-env binding conses to expose in the compiled unit: dedup by NAME
    keeping the FIRST (innermost) occurrence, drop names a lambda param
-   shadows.  Returns the marker symbol :E2IC-BAD when any binding is outside
-   the entry's support (unresolvable name, or an %interp-closure value —
-   FLET/LABELS locals the walker resolves via the env)."
+   shadows.  Returns (VALUE-PAIRS . FN-PAIRS): FN-PAIRS are bindings whose
+   value is an %interp-closure (what FLET/LABELS store in the walker's env —
+   it conflates the namespaces, guarding call-position lookups by the
+   interp-closure shape; see cl-eval's %eval-funcall).  FN-PAIRS get BOTH a
+   symbol-macrolet entry (value refs, matching the walker's unguarded
+   variable lookup) AND an flet wrapper (call position + #'NAME).  Returns
+   the marker symbol :E2IC-BAD when a binding's name is unresolvable."
   (let ((pnames (%e2ic-ll-var-names params))
         (seen nil)
-        (out nil)
+        (vout nil)
+        (fout nil)
         (bad nil))
     (dolist (pair env)
       (when (and (not bad) (consp pair))
         (let ((nm (%eval-sym-name (car pair))))
           (cond
             ((null nm) (setq bad t))
-            ((%interp-closure-p (cdr pair)) (setq bad t))
             ((member nm seen :test (function string-equal)) nil)
             ((member nm pnames :test (function string-equal))
              (setq seen (cons nm seen)))
+            ((%interp-closure-p (cdr pair))
+             (setq seen (cons nm seen))
+             (setq fout (cons pair fout)))
             (t
              (setq seen (cons nm seen))
-             (setq out (cons pair out)))))))
-    (if bad (quote :e2ic-bad) (reverse out))))
+             (setq vout (cons pair vout)))))))
+    (if bad (quote :e2ic-bad) (cons (reverse vout) (reverse fout)))))
 
 (defun %e2ic-sm-bindings (pairs)
   "symbol-macrolet bindings: NAME → (cdr 'PAIR), PAIR by identity via the
@@ -579,22 +586,63 @@
                             (list (quote cdr) (list (quote quote) pair)))
                       out)))))
 
+(defun %e2ic-flet-bindings (pairs)
+  "flet bindings exposing captured %interp-closure env bindings as LOCAL
+   FUNCTIONS: (NAME (&rest A) (apply (cdr \'PAIR) A)).  The (cdr \'PAIR)
+   read happens at CALL time, so a setq of the same name (via its
+   symbol-macrolet entry) redirects subsequent local calls too — exactly
+   the walker\'s live-env behavior.  APPLY dispatches interp-closures
+   through %call-interp-closure (cl-printer apply), so the callee gets its
+   own %e2ic compile+cache on first call; recursion (LABELS) terminates
+   because each level is one cached wrapper hop."
+  (let ((out nil))
+    (dolist (pair pairs (reverse out))
+      (let ((av (gensym "%E2ICA")))
+        ;; Tail shape (values-list (multiple-value-list …)): APPLY's
+        ;; interp-closure fast path preserves the callee's multiple values,
+        ;; but a bare (apply …) tail is not values-shaped, so the compiled
+        ;; wrapper's epilogue would set-mv-count 1 and truncate them (probe
+        ;; F7).  VALUES-LIST at the tail makes tail-form-is-values-p skip
+        ;; that epilogue — MV parity with the walker holds through the
+        ;; wrapper.
+        (setq out (cons (list (car pair)
+                              (list (quote &rest) av)
+                              (list (quote values-list)
+                                    (list (quote multiple-value-list)
+                                          (list (quote apply)
+                                                (list (quote cdr)
+                                                      (list (quote quote) pair))
+                                                av))))
+                        out))))))
+
 (defun %e2ic-compile (params body env)
-  "Compile an interp-closure's PARAMS/BODY/ENV to a native re-entrant
+  "Compile an interp-closure\'s PARAMS/BODY/ENV to a native re-entrant
    trampoline via eval2, or NIL when the shape needs the walker.  Only the
    COMPILE step is guarded by handler-case — the body does not run here, so
-   falling back cannot double side effects."
+   falling back cannot double side effects.  Captured env: value bindings
+   become symbol-macrolet entries over the live env conses; interp-closure
+   bindings (flet/labels locals) get BOTH an SM entry and an flet wrapper
+   (see %e2ic-env-pairs / %e2ic-flet-bindings)."
   (if (not (%e2ic-simple-ll-p params))
       nil
       (let ((pairs (%e2ic-env-pairs env params)))
         (cond
           ((eq pairs (quote :e2ic-bad)) nil)
           (t
-           (let ((form (if pairs
-                           (list (quote lambda) params
-                                 (cons (quote symbol-macrolet)
-                                       (cons (%e2ic-sm-bindings pairs) body)))
-                           (cons (quote lambda) (cons params body)))))
+           (let* ((vpairs (car pairs))
+                  (fpairs (cdr pairs))
+                  (inner (if fpairs
+                             (list (cons (quote flet)
+                                         (cons (%e2ic-flet-bindings fpairs)
+                                               body)))
+                             body))
+                  (form (if (or vpairs fpairs)
+                            (list (quote lambda) params
+                                  (cons (quote symbol-macrolet)
+                                        (cons (%e2ic-sm-bindings
+                                                (append vpairs fpairs))
+                                              inner)))
+                            (cons (quote lambda) (cons params body)))))
              (handler-case
                  (let ((tramp (%e2ic-eval2-nocache form)))
                    (if (functionp tramp) tramp nil))

@@ -475,9 +475,20 @@
          (t
           (list 'cons (%rbq first level)
                 (%rbq-list rest level))))))))
+;; COMPILE-TIME closure, NOT (eval '(lambda …)): this install runs at boot in
+;; kernel-main, and under WS3 Phase-3 production EVAL is eval2 — a boot-time
+;; eval2 of the lambda runs before init-all-globals (eval2's state defvars all
+;; NIL) and silently produced a broken expander (callee resolution fell into
+;; the :li-func offset-0 fallback), so every runtime defmacro with a backquote
+;; body \"expanded\" to its raw (BACKQUOTE …) template — uiop define-package
+;; became a silent no-op and the asdf gauntlet died at the first read-time #.
+;; that depended on an earlier defparameter.  The historical eval-based install
+;; only worked because boot-time eval used to be the tree-walker (flag NIL).
+;; Convention: non-interp-closure *macro-function-table* entries are funcalled
+;; with the WHOLE form — (cadr mform) is the template.
 (defun %install-runtime-backquote ()
   (set-macro-function 'backquote
-                      (eval '(lambda (template) (runtime-bq-expand template)))))
+                      (function (lambda (mform) (runtime-bq-expand (cadr mform))))))
 (defun %argv-string-at (addr)
   (let ((len 0))
     (let ((i 0))

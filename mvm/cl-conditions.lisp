@@ -1025,6 +1025,18 @@
 ;;; --- handler-bind macro support ---
 ;;; handler-bind is compiled by the build script into %with-handler-bind calls
 
+(defun %hb-handler-entry (type fn)
+  "Build one handler-bind (TYPE FN) entry.  A NATIVE helper on purpose:
+   under eval2 the handler FN must cross the bytecode→native boundary as
+   a DIRECT call argument so the interpreter's escaping-wrap
+   (%mvm-wrap-escaping) turns an in-module lambda into a natively
+   callable trampoline.  The old expansion consed FN into the entry list
+   IN BYTECODE — the raw in-module #x52 closure (slot-0 = a bytecode
+   offset) leaked into *handler-bind-stack* and %signal-condition's
+   native funcall of it crashed silently (SIGSEGV-recovered), so bound
+   handlers never fired under eval2 (probes 601/602/704/705)."
+  (list type fn))
+
 (defun %with-handler-bind (handlers body-fn)
   "Install handler-bind handlers during body execution.
    HANDLERS is a list of (type fn) pairs.

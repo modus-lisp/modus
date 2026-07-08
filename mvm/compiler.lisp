@@ -4089,6 +4089,15 @@
       ;; HANDLER-CASE — setjmp/longjmp error catching
       ((= op-name 362314411895974678)
        (compile-handler-case (cadr form) (cddr form) env dest))
+      ;; HANDLER-BIND — expand to the runtime %with-handler-bind
+      ;; (cl-conditions.lisp).  Same shape the build-time rewriter
+      ;; (build-ansi-test.lisp) and the tree-walker (cl-eval.lisp) use,
+      ;; so all three engines share one runtime implementation.  Before
+      ;; this case, eval2 compiled HANDLER-BIND as an ORDINARY CALL —
+      ;; the binding list was evaluated as a function call (usually
+      ;; signalling) and the handlers never installed.
+      ((= op-name 220644454587779307)   ; (compute-name-hash "HANDLER-BIND")
+       (compile-handler-bind (cadr form) (cddr form) env dest))
       ;; RESTART-CASE — bytecode setjmp/longjmp (stays in the interpreter;
       ;; does NOT route through the native %with-restarts bridge under eval2)
       ((= op-name 791633373928082865)
@@ -5194,6 +5203,37 @@
 ;;;
 ;;; The `error` function in prelude.lisp checks if a handler is active
 ;;; (saved RSP != 0 at 0x10000140) and calls longjmp if so.
+
+(defun compile-handler-bind (bindings body env dest)
+  "Compile (handler-bind ((TYPE FN-FORM)*) BODY*) by expanding to the
+   runtime %with-handler-bind (cl-conditions.lisp) — the transform the
+   build-time rewriter applies to ANSI test source and the tree-walker
+   applies at eval time.  CLHS 9.2.23 semantics all live in
+   %with-handler-bind: handlers established for BODY only (escape-safe
+   unwind-protect pop), handlers not active while a handler runs
+   (%signal-condition's skip machinery), MV propagation from body.
+   Each FN-FORM is evaluated in the SURROUNDING env (it's an argument
+   of the %hb-handler-entry call), so lambda handlers capture lexicals;
+   BODY runs inside a thunk so the frame brackets it.  Idempotent with
+   the build-time rewrite: rewritten source arrives here already as a
+   %with-handler-bind CALL, never as HANDLER-BIND.
+
+   Entries are built via %hb-handler-entry (a NATIVE 2-arg fn) rather
+   than an in-bytecode (list 'type fn): under eval2 the handler fn must
+   pass as a DIRECT native-call argument so the interpreter's
+   escaping-wrap makes it natively callable — consing a raw in-module
+   closure into the list crashed %signal-condition's funcall silently
+   and handlers never ran."
+  (let ((binding-forms nil))
+    (dolist (b bindings)
+      (when (consp b)
+        (push `(%hb-handler-entry ',(car b) ,(cadr b)) binding-forms)))
+    (setq binding-forms (nreverse binding-forms))
+    (if binding-forms
+        (compile-form
+         `(%with-handler-bind (list ,@binding-forms) (lambda () ,@body))
+         env dest)
+        (compile-form `(progn ,@body) env dest))))
 
 (defun compile-handler-case (body-form clauses env dest)
   "Compile (handler-case body (type (var) handler-forms...))

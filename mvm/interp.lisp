@@ -298,13 +298,27 @@
     ;; silently called garbage — surfaced by the WS3 Phase-3 %e2ic entry
     ;; (closure-returning-closure probe) but latent for persisted defuns too.
     ;; Pass-through for everything else (see %mvm-wrap-escaping-result).
-    (%mvm-wrap-escaping-result
-      (mvm-interpret bc :entry-point offset
-                        :function-table ftab :runtime-table rt
-                        :return-raw nil
-                        :initial-args args :initial-cenv env
-                        :lambda-offsets lam-offsets)
-      bc ftab rt lam-offsets)))
+    ;;
+    ;; MV PROPAGATION: the nested mvm-interpret stashes the callee's
+    ;; secondary values in *mvm-last-mv* (read RIGHT AFTER the call, before
+    ;; anything else can clobber it — the wrap helpers never re-enter the
+    ;; interpreter).  Re-emit them via a TAIL values-list so a native caller
+    ;; of the trampoline (e.g. %with-handler-bind's body-fn funcall) sees the
+    ;; full MV state — before this, a handler-bind body returning (values 1
+    ;; 2 3) under eval2 was truncated to its primary (probe 106).  values-
+    ;; list in tail position is exempt from the set-mv-count=1 epilogue
+    ;; (tail-form-is-values-p descends LET).
+    (let ((r (%mvm-wrap-escaping-result
+               (mvm-interpret bc :entry-point offset
+                                 :function-table ftab :runtime-table rt
+                                 :return-raw nil
+                                 :initial-args args :initial-cenv env
+                                 :lambda-offsets lam-offsets)
+               bc ftab rt lam-offsets))
+          (mv *mvm-last-mv*))
+      (values-list (if (if mv (> (car mv) 1) nil)
+                       (cons r (cdr mv))
+                       (list r))))))
 
 (defun %mvm-lambda-offset-p (n lam-offsets)
   "True if integer N is the bytecode entry offset of an eval2 LAMBDA / CLOSURE

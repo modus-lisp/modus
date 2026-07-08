@@ -436,8 +436,10 @@
 ;;;
 ;;; Fallback to %call-interp-closure-walker (the old engine, still present)
 ;;; whenever the shape is outside eval2's lambda support:
-;;;   - non-simple lambda list (dotted tail, nested destructuring, &whole /
-;;;     &environment / &body — macro-expander shapes),
+;;;   - junk lambda list (NIL / non-symbol atom element, unknown &-marker;
+;;;     MACRO lambda lists — dotted tails, nested destructuring, &whole/
+;;;     &environment/&body — are handled since the WS3 finisher via
+;;;     compile-lambda's %transform-macro-lambda-list),
 ;;;   - a captured binding whose name is unresolvable,
 ;;;   - eval2 COMPILE failure (conditions during the body's execution are NOT
 ;;;     caught — they propagate, matching production eval semantics; only the
@@ -483,22 +485,23 @@
         nil)))
 
 (defun %e2ic-simple-ll-p (params)
-  "T when PARAMS is an ordinary lambda list eval2's compile-lambda handles:
-   a PROPER list of plain symbols and (var …) / ((:kw var) …) specs, specs
-   only after an &-marker, markers limited to &optional/&rest/&key/&aux/
-   &allow-other-keys.  Dotted tails, nested destructuring in the required
-   section, and &whole/&environment/&body (macro lambda lists) → NIL.
-   &OPTIONAL+&KEY combos are ACCEPTED (since 2026-07-08): preprocess-params'
-   &key→&rest transform now handles the combination (optionals keep gensym'd
-   positional slots, the synthesized catch var sits after them), so the old
-   probe-T2D/E mis-binding (supplied :k bound the keyword itself) is fixed
-   and those closures take the e2 path."
-  (let ((ps params)
-        (in-required t))
+  "T when PARAMS is a lambda list the eval2 compile path handles.  Since
+   the WS3 finisher (stage 2), MACRO-style lambda lists are ACCEPTED too —
+   dotted tails, nested destructuring in the required section, and
+   &whole/&environment/&body — because compile-lambda rewrites them to a
+   plain (&rest …) + DESTRUCTURING-BIND form (%transform-macro-lambda-list,
+   stage 1).  This is what lets walker-created macro expanders (runtime
+   DEFMACRO / MACROLET / DEFINE-COMPILER-MACRO closures) and destructuring
+   DEFTYPE lambda lists compile+run via %e2ic instead of the tree-walker.
+   NIL (walker fallback) only for junk: a NIL element, a non-symbol
+   non-cons atom in a binding position, or an unknown &-marker.
+   (&OPTIONAL+&KEY combos accepted since 2026-07-08 — preprocess-params'
+   &key→&rest transform handles the combination.)"
+  (let ((ps params))
     (loop
       (cond
         ((null ps) (return t))
-        ((not (consp ps)) (return nil))          ; dotted tail
+        ((not (consp ps)) (return (symbolp ps))) ; dotted tail var
         (t
          (let ((p (car ps)))
            (cond
@@ -506,45 +509,75 @@
              ((symbolp p)
               (let ((mk (%e2ic-ll-marker p)))
                 (when mk
-                  (if (or (string-equal mk "&OPTIONAL")
-                          (string-equal mk "&REST")
-                          (string-equal mk "&KEY")
-                          (string-equal mk "&AUX")
-                          (string-equal mk "&ALLOW-OTHER-KEYS"))
-                      (setq in-required nil)
-                      (return nil)))))           ; &whole/&environment/&body/…
-             ((consp p)
-              (if in-required
-                  (return nil)                    ; nested destructuring
-                  (let ((v (car p)))
-                    (cond
-                      ((and (consp v) (not (symbolp v)))
-                       ;; ((:kw var) …) — inner var must be a symbol
-                       (unless (symbolp (car (cdr v))) (return nil)))
-                      ((symbolp v) nil)
-                      (t (return nil))))))
+                  (unless (or (string-equal mk "&OPTIONAL")
+                              (string-equal mk "&REST")
+                              (string-equal mk "&KEY")
+                              (string-equal mk "&AUX")
+                              (string-equal mk "&ALLOW-OTHER-KEYS")
+                              (string-equal mk "&WHOLE")
+                              (string-equal mk "&ENVIRONMENT")
+                              (string-equal mk "&BODY"))
+                    (return nil)))))             ; unknown &-marker
+             ((consp p) nil)   ; nested pattern / spec — compile side handles
              (t (return nil)))
            (setq ps (cdr ps))))))))
 
-(defun %e2ic-ll-var-names (params)
-  "NAME strings of every variable a simple lambda list binds (params, spec
-   vars, supplied-p vars) — used to drop captured-env bindings a parameter
-   shadows."
-  (let ((out nil))
-    (dolist (p params (reverse out))
+(defun %e2ic-ll-var-names-1 (params out)
+  "Extend OUT with the NAME string of every variable PARAMS binds — FULL
+   macro-lambda-list grammar: nested required patterns (recursive), dotted
+   tail vars, &whole/&environment vars, spec vars and supplied-p vars.
+   Section-aware: a cons in the REQUIRED section is a sub-pattern to
+   recurse into; the same cons after an &-marker is a (var init
+   [supplied-p]) / ((:kw var) …) spec.  Precision matters both ways: a
+   MISSED name leaves a symbol-macrolet env entry colliding with the
+   real parameter binding; an EXTRA name silently drops a live captured
+   cell (body reads an unbound global instead)."
+  (let ((ps params)
+        (in-required t))
+    (loop
       (cond
-        ((symbolp p)
-         (unless (%e2ic-ll-marker p)
-           (let ((nm (%eval-sym-name p)))
-             (when nm (setq out (cons nm out))))))
-        ((consp p)
-         (let ((v (car p)))
-           (let ((var (if (consp v) (car (cdr v)) v)))
-             (let ((nm (%eval-sym-name var)))
-               (when nm (setq out (cons nm out))))))
-         (when (and (cdr p) (cdr (cdr p)) (symbolp (car (cdr (cdr p)))))
-           (let ((snm (%eval-sym-name (car (cdr (cdr p))))))
-             (when snm (setq out (cons snm out))))))))))
+        ((null ps) (return out))
+        ((not (consp ps))                        ; dotted tail var
+         (let ((nm (%eval-sym-name ps)))
+           (when nm (setq out (cons nm out))))
+         (return out))
+        (t
+         (let ((p (car ps)))
+           (cond
+             ((and (symbolp p) (%e2ic-ll-marker p))
+              (let ((mk (%e2ic-ll-marker p)))
+                (if (or (string-equal mk "&WHOLE")
+                        (string-equal mk "&ENVIRONMENT"))
+                    ;; The NEXT element is the bound var — consume it here.
+                    (progn
+                      (setq ps (cdr ps))
+                      (when (and (consp ps) (symbolp (car ps)))
+                        (let ((nm (%eval-sym-name (car ps))))
+                          (when nm (setq out (cons nm out))))))
+                    (setq in-required nil))))
+             ((symbolp p)
+              (let ((nm (%eval-sym-name p)))
+                (when nm (setq out (cons nm out)))))
+             ((consp p)
+              (if in-required
+                  (setq out (%e2ic-ll-var-names-1 p out))
+                  (progn
+                    (let ((v (car p)))
+                      (let ((var (if (consp v) (car (cdr v)) v)))
+                        (let ((nm (%eval-sym-name var)))
+                          (when nm (setq out (cons nm out))))))
+                    (when (and (cdr p) (cdr (cdr p))
+                               (symbolp (car (cdr (cdr p)))))
+                      (let ((snm (%eval-sym-name (car (cdr (cdr p))))))
+                        (when snm (setq out (cons snm out)))))))))
+           (setq ps (cdr ps))))))))
+
+(defun %e2ic-ll-var-names (params)
+  "NAME strings of every variable a lambda list binds (params, nested
+   pattern vars, dotted tails, &whole/&environment vars, spec vars,
+   supplied-p vars) — used to drop captured-env bindings a parameter
+   shadows."
+  (reverse (%e2ic-ll-var-names-1 params nil)))
 
 (defun %e2ic-env-pairs (env params)
   "Captured-env binding conses to expose in the compiled unit: dedup by NAME

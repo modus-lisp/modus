@@ -2199,20 +2199,13 @@
     ((and (eq (car form) 'report-and-ignore-errors) (cdr form))
      (let ((body (mapcar #'rewrite-reader-forms (cdr form))))
        `(handler-case (progn ,@body) (error () nil))))
-    ;; (handler-bind bindings body...)
-    ;; → (%with-handler-bind (list (list 'type fn)...) (lambda () body...))
-    ((and (eq (car form) 'handler-bind) (cdr form))
-     (let* ((bindings (cadr form))
-            (body (mapcar #'rewrite-reader-forms (cddr form)))
-            (binding-forms
-             (mapcar (lambda (b)
-                       (let ((type-name (first b))
-                             (handler-fn (rewrite-reader-forms (second b))))
-                         `(list ',type-name ,handler-fn)))
-                     bindings)))
-       (if binding-forms
-           `(%with-handler-bind (list ,@binding-forms) (lambda () ,@body))
-           `(progn ,@body))))
+    ;; (handler-bind bindings body...) rewrite RETIRED (cecf4f3): the
+    ;; compiler now has a HANDLER-BIND special form (compile-handler-bind)
+    ;; that produces the same %with-handler-bind expansion, so raw test
+    ;; source compiles through the REAL construct — the strongest possible
+    ;; validation of the compiled path.  Subforms still get rewritten by
+    ;; the elementwise default below.  The tree-walker keeps its own
+    ;; HANDLER-BIND branch for runtime-eval'd forms.
     ;; (restart-case form &rest clauses)
     ;; DIFF MODE (eval2 gate): leave RESTART-CASE RAW (only rewrite subforms)
     ;; so eval2 compiles it via the compile-restart-case SPECIAL FORM, keeping

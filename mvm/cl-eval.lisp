@@ -915,14 +915,26 @@
     (t (or (%body-returns-from-p (car body) block-name)
            (%body-returns-from-p (cdr body) block-name)))))
 
-(defun %call-interp-closure (fn args)
-  "Call an interpreted closure."
+(defun %call-interp-closure-walker (fn args)
+  "Call an interpreted closure on the TREE-WALKER: bind the lambda list to
+   ARGS in the captured env and %eval-progn the body.  This is the walker
+   engine proper; %call-interp-closure (the entry every call site uses) is a
+   thin wrapper here, OVERRIDDEN in eval2.lisp (last-defun-wins, eval2-enabled
+   images only) with an eval2-first dispatcher that compiles the closure body
+   against its captured env and falls back to this function for shapes eval2
+   can't serve (WS3 Phase 3 — retiring the tree-walker)."
   ;; fn = (%interp-closure params body env)
   (let ((params (cadr fn))
         (body (caddr fn))
         (closed-env (cadddr fn)))
     (let ((new-env (%bind-params params args closed-env)))
       (%eval-progn body new-env))))
+
+(defun %call-interp-closure (fn args)
+  "Call an interpreted closure.  Non-eval2 builds: straight to the walker.
+   eval2-enabled images override this defun in eval2.lisp (see
+   %call-interp-closure there)."
+  (%call-interp-closure-walker fn args))
 
 (defun %bind-params (params args env)
   "Bind PARAMS to ARGS in ENV, handling &optional / &rest / &key / &aux.

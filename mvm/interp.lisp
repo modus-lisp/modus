@@ -290,11 +290,21 @@
    LAM-OFFSETS is threaded through so a lambda that itself escapes a lambda to a
    native HOF (nested mapcar) keeps working on the re-entry."
   (lambda (&rest args)
-    (mvm-interpret bc :entry-point offset
-                      :function-table ftab :runtime-table rt
-                      :return-raw nil
-                      :initial-args args :initial-cenv env
-                      :lambda-offsets lam-offsets)))
+    ;; Wrap the RESULT like eval2-forms does (%mvm-wrap-escaping-result):
+    ;; a body that returns an in-module #x52 lambda closure must hand the
+    ;; native caller a re-entrant trampoline, not the raw module closure
+    ;; (whose slot-0 is a bytecode offset native funcall would misread as a
+    ;; fn address).  Before this, `(funcall (funcall tramp-returning-lambda))`
+    ;; silently called garbage — surfaced by the WS3 Phase-3 %e2ic entry
+    ;; (closure-returning-closure probe) but latent for persisted defuns too.
+    ;; Pass-through for everything else (see %mvm-wrap-escaping-result).
+    (%mvm-wrap-escaping-result
+      (mvm-interpret bc :entry-point offset
+                        :function-table ftab :runtime-table rt
+                        :return-raw nil
+                        :initial-args args :initial-cenv env
+                        :lambda-offsets lam-offsets)
+      bc ftab rt lam-offsets)))
 
 (defun %mvm-lambda-offset-p (n lam-offsets)
   "True if integer N is the bytecode entry offset of an eval2 LAMBDA / CLOSURE

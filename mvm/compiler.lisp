@@ -4088,7 +4088,7 @@
        (compile-multiple-value-list (cadr form) env dest))
       ;; HANDLER-CASE — setjmp/longjmp error catching
       ((= op-name 362314411895974678)
-       (compile-handler-case (cadr form) (cddr form) env dest))
+       (compile-handler-case (cadr form) (cddr form) env dest nil))
       ;; HANDLER-BIND — expand to the runtime %with-handler-bind
       ;; (cl-conditions.lisp).  Same shape the build-time rewriter
       ;; (build-ansi-test.lisp) and the tree-walker (cl-eval.lisp) use,
@@ -4098,6 +4098,13 @@
       ;; signalling) and the handlers never installed.
       ((= op-name 220644454587779307)   ; (compute-name-hash "HANDLER-BIND")
        (compile-handler-bind (cadr form) (cddr form) env dest))
+      ;; %HANDLER-CASE-CATCH — internal: the handler-case variant CATCH
+      ;; expands to.  Identical to HANDLER-CASE except it does NOT get the
+      ;; NLX-transparency guard (its T-clause IS the frame that consumes a
+      ;; matching block/catch tag — guarding it would longjmp past the
+      ;; catch that owns the tag and no throw would ever land).
+      ((= op-name 708734760566136331)   ; (compute-name-hash "%HANDLER-CASE-CATCH")
+       (compile-handler-case (cadr form) (cddr form) env dest t))
       ;; RESTART-CASE — bytecode setjmp/longjmp (stays in the interpreter;
       ;; does NOT route through the native %with-restarts bridge under eval2)
       ((= op-name 791633373928082865)
@@ -4838,7 +4845,7 @@
              (body-forms (cddr form)))
          (compile-form
           `(let ((%c-tag ,tag-form))
-             (handler-case (progn ,@body-forms)
+             (%handler-case-catch (progn ,@body-forms)
                (t (%c-cnd)
                  (if (if *catch-active* (eql *catch-tag* %c-tag) nil)
                      (let ((%c-v *catch-value*))
@@ -5235,14 +5242,28 @@
          env dest)
         (compile-form `(progn ,@body) env dest))))
 
-(defun compile-handler-case (body-form clauses env dest)
+(defun compile-handler-case (body-form clauses env dest catch-frame-p)
   "Compile (handler-case body (type (var) handler-forms...))
    Uses setjmp/longjmp: saves state, runs body, catches errors.
    Multi-clause: dispatches on *current-condition* type at runtime.
    CLHS 9.1.5.1.1: a single :no-error clause (if present) captures the
    normal-completion values of body and replaces them with the value of
    the clause body — does NOT run if body signals a condition matched
-   by another clause."
+   by another clause.
+
+   NLX TRANSPARENCY (probe 8502): when CATCH-FRAME-P is NIL (a real
+   user handler-case) AND this is a RUNTIME eval2 compile, the handler
+   dispatch first checks whether a BLOCK/TAGBODY non-local exit is in
+   flight (*catch-active* with an internal block tag in
+   [700000001, 800000000) — see compile-block's
+   *nonlocal-block-tag-counter*) and re-longjmps outward instead of
+   running condition clauses.  Without this, a cross-unit RETURN-FROM
+   routed via %nlx-throw's (error \"throw\") fallback arrives at an
+   intervening handler-case with *current-condition* = the \"throw\"
+   SIMPLE-ERROR, so an (error (c) …) clause SWALLOWED the escape and
+   the block fell through (the 8502 shape).  CATCH-FRAME-P is T only
+   for %HANDLER-CASE-CATCH (the CATCH/BLOCK frame itself, which must
+   see the throw to consume its matching tag)."
   ;; Extract a :no-error clause if present.  Per CLHS the clause shape
   ;; is (:no-error VAR-LIST &body FORMS); var-list may bind multiple
   ;; values via multiple-value-bind.
@@ -5311,10 +5332,35 @@
                                 `(progn ,@hbody))))
                       (push (list type-check handler-expr) result)))
                   (nreverse result)))
+               ;; NLX-transparency guard clause (see docstring): a block
+               ;; NLX in flight is NOT a condition — pass it through.
+               ;; Inline (no runtime helper) so every build that compiles
+               ;; handler-case works without extra runtime source.
+               ;; RUNTIME-COMPILE (eval2) ONLY: build-time first-party
+               ;; handler-cases include CONTROL MACHINERY that must see the
+               ;; "throw" condition — most critically mvm-interpret's
+               ;; per-opcode condition bridge, whose (error (c)) clause
+               ;; converts a bridged native throw into a bytecode LONGJMP.
+               ;; Guarding that frame made the NATIVE %hc-longjmp bypass the
+               ;; interpreter entirely (SEGV on the plain cross-unit
+               ;; return-from probe 401/9520 shape).  User code compiled at
+               ;; runtime has no such machinery, and the guard only fires on
+               ;; the internal block-tag range, so it is safe there.
+               (nlx-guard
+                (if (or catch-frame-p (not *eval2-runtime-p*))
+                    nil
+                    '(((if *catch-active*
+                           (if (fixnump *catch-tag*)
+                               (if (> *catch-tag* 700000000)
+                                   (< *catch-tag* 800000000)
+                                   nil)
+                               nil)
+                           nil)
+                       (%hc-longjmp)))))
                ;; Build the full cond dispatch
                (cond-form
                 (if dispatch-forms
-                    `(cond ,@dispatch-forms (t (%hc-longjmp)))
+                    `(cond ,@nlx-guard ,@dispatch-forms (t (%hc-longjmp)))
                     '(%hc-longjmp))))
           ;; Emit setjmp/handler pattern
           ;; SETJMP (#x0510) pushes outer handler state to the per-fork

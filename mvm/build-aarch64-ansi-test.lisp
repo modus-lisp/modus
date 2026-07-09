@@ -123,7 +123,13 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")))
+    (mvm-text "mvm/ansi-bridge.lisp")
+    (string #\Newline)
+    ;; WS3 STEP 4: the tree-walker was extracted from cl-eval.lisp into its
+    ;; own file, loaded ONLY by these legacy fork builds.  Must come AFTER
+    ;; ansi-bridge.lisp so its %call-interp-closure / %expand-deftype
+    ;; engine-provider overrides win (last-defun-wins).
+    (mvm-text "mvm/tree-walker.lisp")))
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
 ;; SBCL-level stubs for functions called during macro expansion

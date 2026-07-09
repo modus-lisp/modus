@@ -434,16 +434,18 @@
 ;;; (5th slot of the %interp-closure list) so repeated calls pay only the
 ;;; ~0.6M-cycle interpret, not the ~16M-cycle compile.
 ;;;
-;;; Fallback to %call-interp-closure-walker (the old engine, still present)
-;;; whenever the shape is outside eval2's lambda support:
+;;; WS3 STEP 4 (tree-walker DELETED from production images): there is no
+;;; walker fallback any more.  A shape outside eval2's lambda support —
 ;;;   - junk lambda list (NIL / non-symbol atom element, unknown &-marker;
 ;;;     MACRO lambda lists — dotted tails, nested destructuring, &whole/
 ;;;     &environment/&body — are handled since the WS3 finisher via
 ;;;     compile-lambda's %transform-macro-lambda-list),
 ;;;   - a captured binding whose name is unresolvable,
 ;;;   - eval2 COMPILE failure (conditions during the body's execution are NOT
-;;;     caught — they propagate, matching production eval semantics; only the
-;;;     side-effect-free compile step may fall back).
+;;;     caught — they propagate, matching production eval semantics)
+;;; — now signals an honest ERROR instead of silently degrading to a second
+;;; evaluator.  The legacy fork builds get the walker from tree-walker.lisp
+;;; (which overrides %call-interp-closure/%expand-deftype there).
 ;;; (The nested-lambda-over-captured-cells fallback is GONE: compile-lambda
 ;;; now threads symbol-macro bindings into nested compilation units —
 ;;; %collect-free-vars compiles SM names via their expansions instead of
@@ -453,14 +455,6 @@
 ;;; a captured env compile to flet wrappers + SM entries — see
 ;;; %e2ic-env-pairs / %e2ic-flet-bindings.)
 ;;;
-;;; Gate: active unless *e2ic-disable* — the rollback lever (and the probe
-;;; batteries' A-side).
-
-(defvar *e2ic-disable* nil
-  "Rollback lever for the eval2 interp-closure entry: T = every
-   %call-interp-closure / %expand-deftype routes to the tree-walker as
-   before.  NIL (boot default) = eval2-first.")
-
 (defvar *e2ic-deftype-cache* nil
   "name-string → (entry . trampoline-or-:walker) for %expand-deftype's eval2
    route.  The registered (params . body) ENTRY cons is stored alongside so a
@@ -707,50 +701,42 @@
         %r)))
 
 (defun %call-interp-closure (fn args)
-  "OVERRIDE (eval2 images; last-defun-wins) of cl-eval.lisp's wrapper:
+  "OVERRIDE (eval2 images; last-defun-wins) of cl-eval.lisp's engine stub:
    eval2-first interp-closure call.  Compiles the closure body against its
-   captured env ONCE (cached on the closure), applies the trampoline;
-   walker fallback for unsupported shapes / compile failure / gate off."
-  (if *e2ic-disable*
-      (%call-interp-closure-walker fn args)
-      (let ((c (%e2ic-cached fn)))
-        (cond
-          ((eq c (quote :e2ic-walker)) (%call-interp-closure-walker fn args))
-          (c (%e2ic-apply c args))
-          (t
-           (let ((tramp (%e2ic-compile (cadr fn) (caddr fn) (cadddr fn))))
-             (%e2ic-cache-set fn (if tramp tramp (quote :e2ic-walker)))
-             (if tramp
-                 (%e2ic-apply tramp args)
-                 (%call-interp-closure-walker fn args))))))))
-
-(defun %e2ic-deftype-walker (entry args)
-  "The walker deftype expansion — %bind-params the registered lambda list to
-   the UNEVALUATED type args, %eval-progn the body (ansi-bridge's original
-   %expand-deftype tail)."
-  (let ((env (%bind-params (car entry) args nil)))
-    (%eval-progn (cdr entry) env)))
+   captured env ONCE (cached on the closure), applies the trampoline.
+   WS3 STEP 4: no walker fallback — an unsupported shape or compile
+   failure signals (cached as :e2ic-fail so repeat calls fail fast)."
+  (let ((c (%e2ic-cached fn)))
+    (cond
+      ((eq c (quote :e2ic-fail))
+       (error "eval2: interp-closure shape unsupported (cached compile failure)"))
+      (c (%e2ic-apply c args))
+      (t
+       (let ((tramp (%e2ic-compile (cadr fn) (caddr fn) (cadddr fn))))
+         (%e2ic-cache-set fn (if tramp tramp (quote :e2ic-fail)))
+         (if tramp
+             (%e2ic-apply tramp args)
+             (error "eval2: interp-closure compile failed (params=~S)"
+                    (cadr fn))))))))
 
 (defun %expand-deftype (type)
-  "OVERRIDE (eval2 images; last-defun-wins) of ansi-bridge's %expand-deftype:
+  "OVERRIDE (eval2 images; last-defun-wins) of ansi-bridge's engine stub:
    route the deftype body eval through the eval2 lambda-body entry, cached
-   per registration (name → (entry . trampoline)); walker fallback as in
-   %call-interp-closure."
+   per registration (name → (entry . trampoline)).  WS3 STEP 4: no walker
+   fallback — a deftype body eval2 can't compile signals."
   (let* ((head (if (consp type) (car type) type))
          (args (if (consp type) (cdr type) nil))
          (entry (%deftype-lookup head)))
     (cond
       ((null entry) nil)
-      (*e2ic-disable*
-       (%e2ic-deftype-walker entry args))
       (t
        (let* ((nm (%eval-sym-name head))
               (hit (if (and nm *e2ic-deftype-cache*)
                        (gethash nm *e2ic-deftype-cache*)
                        nil)))
          (if (and hit (eq (car hit) entry))
-             (if (eq (cdr hit) (quote :e2ic-walker))
-                 (%e2ic-deftype-walker entry args)
+             (if (eq (cdr hit) (quote :e2ic-fail))
+                 (error "eval2: deftype expander compile failed (type=~S)" type)
                  (%e2ic-apply (cdr hit) args))
              (let ((tramp (%e2ic-compile (car entry) (cdr entry) nil)))
                (unless *e2ic-deftype-cache*
@@ -758,7 +744,8 @@
                        (make-hash-table :test (quote equal))))
                (when nm
                  (puthash nm *e2ic-deftype-cache*
-                          (cons entry (if tramp tramp (quote :e2ic-walker)))))
+                          (cons entry (if tramp tramp (quote :e2ic-fail)))))
                (if tramp
                    (%e2ic-apply tramp args)
-                   (%e2ic-deftype-walker entry args)))))))))
+                   (error "eval2: deftype expander compile failed (type=~S)"
+                          type)))))))))

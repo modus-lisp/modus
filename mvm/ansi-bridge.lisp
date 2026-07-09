@@ -5459,18 +5459,15 @@
 
 (defun %expand-deftype (type)
   "Expand a user-deftype TYPE specifier (symbol or (name arg…)) to its
-   underlying type specifier, or NIL if TYPE is not a user deftype."
-  (let* ((head (if (consp type) (car type) type))
-         (args (if (consp type) (cdr type) nil))
-         (entry (%deftype-lookup head)))
-    (if (null entry)
+   underlying type specifier, or NIL if TYPE is not a user deftype.
+   ENGINE-PROVIDER STUB (WS3 STEP 4): the deftype BODY evaluation needs an
+   evaluator engine, so this defun is overridden (last-defun-wins) by
+   eval2.lisp's eval2 route in the production images or tree-walker.lisp's
+   walker route in the legacy fork builds.  Reached = no engine wired in."
+  (let ((head (if (consp type) (car type) type)))
+    (if (null (%deftype-lookup head))
         nil
-        (let* ((params (car entry))
-               (body   (cdr entry))
-               ;; Bind params to the *unevaluated* type args.  &optional
-               ;; defaults and &key all flow through %bind-params.
-               (env (%bind-params params args nil)))
-          (%eval-progn body env)))))
+        (error "no evaluator engine: %EXPAND-DEFTYPE stub reached (type=~S)" type))))
 
 (defun typep (obj type)
   (when (or (eq type 'values)

@@ -635,10 +635,14 @@
    final image layout and write it as little-endian into raw-bytes."
   (declare (ignore module))
   (let* ((arch (and boot-descriptor (getf boot-descriptor :arch)))
-         (patches (case arch
-                    ((:x86-64 :linux-x64)
+         (aarch64-p (member arch '(:aarch64 :rpi)))
+         (patches (cond
+                    ((member arch '(:x86-64 :linux-x64))
                      (and (boundp 'modus.mvm.x64::*x64-li-const-patches*)
                           (symbol-value 'modus.mvm.x64::*x64-li-const-patches*)))
+                    (aarch64-p
+                     (and (boundp 'modus.mvm::*aarch64-li-const-patches*)
+                          (symbol-value 'modus.mvm::*aarch64-li-const-patches*)))
                     (t nil))))
     (when patches
       (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
@@ -648,8 +652,19 @@
              (pool-offset-in-raw (or (kernel-image-constant-pool-offset image)
                                      (+ native-image-offset native-code-length)))
              (load-addr (or (getf boot-descriptor :load-addr) 0))
+             ;; Bare-metal AArch64/RPi images load at load-addr + 0x80000
+             ;; (image_load_offset) — same adjustment as
+             ;; apply-aarch64-code-bounds-patches.  Linux-AArch64 and all
+             ;; x64 formats load at the declared address.
+             (image-load-offset
+              (if (and aarch64-p
+                       (not (eq (getf boot-descriptor :elf-format)
+                                :linux-aarch64)))
+                  #x80000
+                  0))
              (wrap-header (wrap-header-size-for-boot boot-descriptor))
-             (pool-vaddr (+ load-addr wrap-header pool-offset-in-raw)))
+             (pool-vaddr (+ load-addr image-load-offset wrap-header
+                            pool-offset-in-raw)))
         (dolist (patch patches)
           (let* ((native-pos (car patch))
                  (idx (cdr patch))
@@ -659,10 +674,17 @@
                              (aref pool-addr-table idx)
                              0))
                  (tagged-addr (if (zerop offset) 0 (+ pool-vaddr offset))))
-            ;; Little-endian 8-byte write at raw-bytes[file-pos..file-pos+8].
-            (dotimes (i 8)
-              (setf (aref raw-bytes (+ file-pos i))
-                    (logand (ash tagged-addr (* i -8)) #xFF)))))))))
+            (if aarch64-p
+                ;; AArch64: MOVZ+MOVKx3 quad — patch the four imm16
+                ;; fields with successive 16-bit slices of tagged-addr.
+                (dotimes (i 4)
+                  (patch-aarch64-mov-imm16
+                   raw-bytes (+ file-pos (* i 4))
+                   (logand (ash tagged-addr (* i -16)) #xFFFF)))
+                ;; x64: little-endian 8-byte MOVABS immediate write.
+                (dotimes (i 8)
+                  (setf (aref raw-bytes (+ file-pos i))
+                        (logand (ash tagged-addr (* i -8)) #xFF))))))))))
 
 (defun assemble-kernel-image (module target &key boot-descriptor)
   "Assemble a complete bootable kernel image for TARGET."
@@ -702,6 +724,26 @@
                 (when (string-equal (mvm-function-info-name fi) "%GC-COLLECT")
                   (setf found (mvm-function-info-bytecode-offset fi))))
               found)))
+         ;; GENERIC-ADD / GENERIC-MULTIPLY bytecode offsets for the
+         ;; +op-add-checked+ / +op-mul-checked+ overflow slow paths
+         ;; (same wiring as gc-collect-bc-offset; x64 does the analogous
+         ;; lookup in translate-mvm-module-to-x64 via *x64-genadd-label*).
+         ;; NIL when the image has no generic arith — the checked ops
+         ;; then degrade to plain wrapping add/mul.
+         (genadd-bc-offset
+          (when aarch64-unified-p
+            (let ((found nil))
+              (dolist (fi (mvm-module-function-table module))
+                (when (string-equal (mvm-function-info-name fi) "GENERIC-ADD")
+                  (setf found (mvm-function-info-bytecode-offset fi))))
+              found)))
+         (genmul-bc-offset
+          (when aarch64-unified-p
+            (let ((found nil))
+              (dolist (fi (mvm-module-function-table module))
+                (when (string-equal (mvm-function-info-name fi) "GENERIC-MULTIPLY")
+                  (setf found (mvm-function-info-bytecode-offset fi))))
+              found)))
          (native-code
           (cond
             (aarch64-unified-p
@@ -713,7 +755,11 @@
                    (modus.mvm::*aarch64-handler-pop-label*  aarch64-pop-label)
                    (modus.mvm::*aarch64-gc-trampoline-label* aarch64-gc-label)
                    (modus.mvm::*aarch64-gc-collect-bytecode-offset*
-                    gc-collect-bc-offset))
+                    gc-collect-bc-offset)
+                   (modus.mvm::*aarch64-genadd-bytecode-offset*
+                    genadd-bc-offset)
+                   (modus.mvm::*aarch64-genmul-bytecode-offset*
+                    genmul-bc-offset))
                ;; Phase A: emit boot preamble into the unified buffer first.
                (let ((entry-fn (getf boot-descriptor :entry-fn)))
                  (when entry-fn (funcall entry-fn aarch64-unified-buf)))

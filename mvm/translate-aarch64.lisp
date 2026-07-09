@@ -153,6 +153,28 @@
    fn-addr-patched MOVZ+MOVK+BLR sequence that calls the compiled
    collector at runtime.")
 
+(defvar *aarch64-genadd-bytecode-offset* nil
+  "Bytecode-offset of GENERIC-ADD in the kernel image, computed in
+   cross.lisp by scanning the function table (same wiring as
+   *aarch64-gc-collect-bytecode-offset*).  Used by +op-add-checked+'s
+   overflow slow path to call the Lisp bignum-promotion routine via a
+   fn-addr-patched MOVZ+MOVK+BLR.  NIL when the image has no
+   GENERIC-ADD — +op-add-checked+ then degrades to a plain wrapping
+   ADD (the pre-overflow-promotion behavior).")
+
+(defvar *aarch64-genmul-bytecode-offset* nil
+  "Companion to *aarch64-genadd-bytecode-offset* for GENERIC-MULTIPLY /
+   +op-mul-checked+.")
+
+(defvar *aarch64-li-const-patches* nil
+  "List of (native-byte-offset . pool-index) recorded by +op-li-const+
+   translation.  Each entry says: at NATIVE-BYTE-OFFSET (relative to
+   the start of translated code) there is a MOVZ + MOVK + MOVK + MOVK
+   quad whose imm16 fields must be patched with the 64-bit tagged
+   constant-pool address of pool slot POOL-INDEX.  Applied by
+   cross.lisp's apply-li-const-patches once the image layout is final
+   (mirrors x64's *x64-li-const-patches* MOVABS-immediate scheme).")
+
 (defvar *aarch64-fn-addr-patches* nil
   "List of (native-byte-offset . target-bytecode-offset) recorded by
    +op-fn-addr+ translation.  Each entry says: at NATIVE-BYTE-OFFSET in
@@ -274,19 +296,32 @@
 ;;; Branch fixups are resolved in a second pass.
 
 (defstruct a64-buffer
-  ;; 16M entries × 4 bytes = 64 MB native code.  Bare-metal ANSI-test
-  ;; needs ~30 MB; Linux/AArch64 adds ~50% overhead per :push (2 insns
-  ;; vs 1 for SP alignment) plus larger syscall traps, so we bump from
-  ;; 8M to 16M to keep headroom.
+  ;; 16M entries × 4 bytes = 64 MB native code initial capacity.
+  ;; Bare-metal ANSI-test needs ~30 MB; Linux/AArch64 adds ~50%
+  ;; overhead per :push (2 insns vs 1 for SP alignment) plus larger
+  ;; syscall traps.  The WS3 production-eval2 ANSI image (in-image
+  ;; mvm.lisp ISA + interp + compiler + eval2) blows past 64 MB —
+  ;; a64-emit doubles the array on demand (same fix class as the
+  ;; 96 MB x64 code-buffer overflow found landing WS3 on x64).
   (code (make-array 16777216))
   (labels (make-hash-table :test 'eql))
   (fixups nil)
   (position 0))
 
 (defun a64-emit (buf word)
-  "Emit a single 32-bit instruction word."
-  (let ((pos (a64-buffer-position buf)))
-    (setf (aref (a64-buffer-code buf) pos) (logand word #xFFFFFFFF))
+  "Emit a single 32-bit instruction word, doubling the code array on
+   overflow (the fixed 16M-entry array silently capped the WS3 eval2
+   ANSI image at exactly 2^24 instructions: the tail emits — including
+   the GC trampoline that defines the gc-check BL target label — were
+   lost, and a64-resolve-fixups failed with `undefined label 3`)."
+  (let ((pos (a64-buffer-position buf))
+        (code (a64-buffer-code buf)))
+    (when (>= pos (length code))
+      (let ((new (make-array (* 2 (length code)))))
+        (replace new code)
+        (setf (a64-buffer-code buf) new)
+        (setf code new)))
+    (setf (aref code pos) (logand word #xFFFFFFFF))
     (setf (a64-buffer-position buf) (+ pos 1))))
 
 (defun a64-current-index (buf)
@@ -739,6 +774,19 @@
    Encoding: 1|00|11011|1|10|Rm|0|Ra(=11111)|Rn|Rd"
   (a64-emit buf (logior (ash 1 31)            ; sf=1
                         (ash #b0011011110 21) ; UMULH
+                        (ash rm 16)
+                        (ash 0 15)            ; o0=0
+                        (ash +a64-xzr+ 10)   ; Ra=XZR
+                        (ash rn 5)
+                        rd)))
+
+(defun a64-smulh (buf rd rn rm)
+  "SMULH Xd, Xn, Xm — high 64 bits of signed Xn*Xm.
+   Encoding: 1|00|11011|0|10|Rm|0|Ra(=11111)|Rn|Rd (U=0 vs UMULH's U=1).
+   Used by +op-mul-checked+'s overflow test: a signed 64x64 multiply
+   overflowed iff SMULH(a,b) /= (MUL(a,b) ASR #63)."
+  (a64-emit buf (logior (ash 1 31)            ; sf=1
+                        (ash #b0011011010 21) ; SMULH
                         (ash rm 16)
                         (ash 0 15)            ; o0=0
                         (ash +a64-xzr+ 10)   ; Ra=XZR
@@ -1320,6 +1368,48 @@
 ;;; instructions. The translator does a two-pass approach:
 ;;;   Pass 1: Translate all instructions, emit placeholder branches
 ;;;   Pass 2: Resolve branch fixups (MVM offsets → native offsets)
+
+(defun a64-emit-generic-arith-call (buf va vb bc-offset)
+  "Emit the +op-add-checked+ / +op-mul-checked+ overflow slow path:
+   an inline call GENERIC-ADD/GENERIC-MULTIPLY(va, vb), result left in
+   x16.  Mirrors x64's op-mul-checked slow path (translate-x64.lisp
+   ~line 1260) with the aarch64 twist that x19-x23/x27 (V4-V8, CENV)
+   are callee-saved by the callee's own prologue and spilled vregs
+   (V9+) live in the FP frame — so only the caller-scratch arg regs
+   x0-x3 (V0-V3) need saving here.  x30 (LR) is clobbered by the BLR,
+   which is fine: the enclosing function's prologue saved LR and its
+   epilogue restores from the stack (same as every +op-call+ BL).
+   The call target is materialised via a fn-addr-patched MOVZ+MOVK
+   (+tag-function+ OR'd in by apply-aarch64-fn-addr-patches; SUB-3
+   strips it before BLR — same convention as the GC trampoline)."
+  ;; Save x0-x3 (two STP pairs = 32 bytes, keeps SP 16-aligned).
+  (a64-stp-pre    buf +a64-x0+ +a64-x1+ +a64-sp+ -32)
+  (a64-stp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+  ;; Stage BOTH args before writing x0/x1 — va/vb may themselves live
+  ;; in x0-x3 (their values are still intact; STP doesn't clobber), and
+  ;; e.g. va=V1/vb=V0 would collide if we loaded x0 first.
+  (a64-emit-load-vreg buf +a64-x9+  va)
+  (a64-emit-load-vreg buf +a64-x10+ vb)
+  (a64-mov-reg buf +a64-x0+ +a64-x9+)
+  (a64-mov-reg buf +a64-x1+ +a64-x10+)
+  ;; NARGS = 2 at the fixed convention slot (32-bit store).
+  (a64-load-imm64 buf +a64-x17+ #x10000150)
+  (a64-movz buf +a64-x16+ 2 0)
+  (a64-str-width buf +a64-x16+ +a64-x17+ 0 2)
+  ;; Call via fn-addr-patched MOVZ+MOVK+BLR.
+  (let ((movz-byte-pos
+         (* (- (a64-current-index buf)
+               (or *aarch64-translated-start-idx* 0))
+            4)))
+    (push (cons movz-byte-pos bc-offset) *aarch64-fn-addr-patches*))
+  (a64-movz buf +a64-x16+ 0 0)              ; placeholder low 16
+  (a64-movk buf +a64-x16+ 0 1)              ; placeholder high 16
+  (a64-sub-imm buf +a64-x16+ +a64-x16+ 3)   ; strip +tag-function+
+  (a64-blr buf +a64-x16+)
+  ;; Result -> x16, then restore the arg regs.
+  (a64-mov-reg buf +a64-x16+ +a64-x0+)
+  (a64-ldp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+  (a64-ldp-post   buf +a64-x0+ +a64-x1+ +a64-sp+ 32))
 
 (defun translate-mvm-insn (insn buf mvm-to-native-label)
   "Translate a single decoded MVM instruction, emitting AArch64
@@ -2272,6 +2362,87 @@
              (let ((idx (a64-current-index buf)))
                (a64-bcond buf +cc-vs+ 0)
                (a64-add-fixup buf idx label :bcond))))
+
+          ;; ---- ADD-CHECKED Vd, Va, Vb ----
+          ;; Tagged + with bignum overflow promotion (x64 sibling:
+          ;; translate-x64.lisp +op-add-checked+).  tag(a)+tag(b) =
+          ;; 2(a+b) = tag(a+b) directly; ADDS sets V iff the sum left
+          ;; the 64-bit signed (= tagged fixnum) range.  On overflow,
+          ;; call GENERIC-ADD(va,vb) -> bignum via the inline slow path.
+          ;; Result flows through x16 on both paths so the fast path
+          ;; can't clobber a phys-reg vd before the slow path reads
+          ;; va/vb.
+          ((= op +op-add-checked+)
+           (let* ((vd (vr 0)) (va (vr 1)) (vb (vr 2))
+                  (pa (ensure-src va +a64-x16+))
+                  (pb (ensure-src vb +a64-x17+)))
+             (cond
+               (*aarch64-genadd-bytecode-offset*
+                (let ((done (incf *mvm-label-counter*)))
+                  (a64-adds-reg buf +a64-x16+ pa pb 0 0)
+                  (let ((idx (a64-current-index buf)))
+                    (a64-bcond buf +cc-vc+ 0)
+                    (a64-add-fixup buf idx done :bcond))
+                  (a64-emit-generic-arith-call
+                   buf va vb *aarch64-genadd-bytecode-offset*)
+                  (a64-set-label buf done)
+                  (store-dst +a64-x16+ vd)))
+               (t
+                ;; No GENERIC-ADD in this image: plain wrapping add.
+                (a64-add-reg buf +a64-x16+ pa pb 0 0)
+                (store-dst +a64-x16+ vd)))))
+
+          ;; ---- MUL-CHECKED Vd, Va, Vb ----
+          ;; Tagged * with bignum overflow promotion.  Fast path:
+          ;; untag(va) * tagged(vb) = tag(a*b); a signed 64x64 multiply
+          ;; overflowed iff SMULH(high 64) /= (low 64 ASR #63).  On
+          ;; overflow, call GENERIC-MULTIPLY(va,vb) -> bignum.
+          ((= op +op-mul-checked+)
+           (let* ((vd (vr 0)) (va (vr 1)) (vb (vr 2))
+                  (pa (ensure-src va +a64-x16+))
+                  (pb (ensure-src vb +a64-x17+)))
+             (cond
+               (*aarch64-genmul-bytecode-offset*
+                (let ((done (incf *mvm-label-counter*)))
+                  (a64-asr-imm buf +a64-x9+ pa 1)          ; x9 = untag(va)
+                  (a64-mov-reg buf +a64-x10+ pb)           ; x10 = vb (tagged)
+                  (a64-mul   buf +a64-x16+ +a64-x9+ +a64-x10+) ; low 64
+                  (a64-smulh buf +a64-x11+ +a64-x9+ +a64-x10+) ; high 64
+                  ;; CMP x11, x16 ASR #63 — equal means no overflow.
+                  (a64-subs-reg buf +a64-xzr+ +a64-x11+ +a64-x16+ 2 63)
+                  (let ((idx (a64-current-index buf)))
+                    (a64-bcond buf +cc-eq+ 0)
+                    (a64-add-fixup buf idx done :bcond))
+                  (a64-emit-generic-arith-call
+                   buf va vb *aarch64-genmul-bytecode-offset*)
+                  (a64-set-label buf done)
+                  (store-dst +a64-x16+ vd)))
+               (t
+                ;; No GENERIC-MULTIPLY: plain (possibly wrapping) mul.
+                (a64-asr-imm buf +a64-x9+ pa 1)
+                (a64-mul buf +a64-x16+ +a64-x9+ pb)
+                (store-dst +a64-x16+ vd)))))
+
+          ;; ---- LI-CONST Vd, idx ----
+          ;; Load the tagged address of constant-pool slot IDX.  Emit a
+          ;; MOVZ + 3xMOVK placeholder quad; apply-li-const-patches
+          ;; (cross.lisp) writes the four imm16 fields once the pool
+          ;; vaddr is known.  Mirrors x64's MOVABS-placeholder scheme.
+          ((= op +op-li-const+)
+           (let* ((vd (vr 0))
+                  (idx (vr 1))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (movz-byte-pos
+                   (* (- (a64-current-index buf)
+                         (or *aarch64-translated-start-idx* 0))
+                      4)))
+             (push (cons movz-byte-pos idx) *aarch64-li-const-patches*)
+             (a64-movz buf pd 0 0)   ; bits 0-15
+             (a64-movk buf pd 0 1)   ; bits 16-31
+             (a64-movk buf pd 0 2)   ; bits 32-47
+             (a64-movk buf pd 0 3)   ; bits 48-63
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
 
           ;; ---- MUL Vd, Va, Vb ----
           ;; Tagged fixnum multiply: Vd = (Va >> 1) * Vb
@@ -3977,6 +4148,11 @@
      5. Emit epilogue
      6. Resolve all branch fixups (skipped if appending into a shared
         buffer; caller resolves once after all emit)."
+  ;; Reset the li-const patch list for a fresh module translation
+  ;; (single-function translations — function-table nil — must not
+  ;; drop a pending module's patches).
+  (when function-table
+    (setf *aarch64-li-const-patches* nil))
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're
@@ -4126,10 +4302,11 @@
 
    Also returns as a second value a hash table mapping
    function-index → native-byte-offset."
-  ;; Reset fn-addr patch list at start of each image translation.
-  ;; Patches accumulated here are applied by cross.lisp after image
-  ;; assembly; see *aarch64-fn-addr-patches* docstring.
+  ;; Reset fn-addr + li-const patch lists at start of each image
+  ;; translation.  Patches accumulated here are applied by cross.lisp
+  ;; after image assembly; see *aarch64-fn-addr-patches* docstring.
   (setf *aarch64-fn-addr-patches* nil)
+  (setf *aarch64-li-const-patches* nil)
   (let* ((buf (make-a64-buffer))
          (func-offsets (make-hash-table :test 'eql))
          (mvm-to-native-label (make-hash-table :test 'equal))

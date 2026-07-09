@@ -2157,20 +2157,39 @@
 ;;; COUNT-IF-NOT family) for ~50 ms each via the deadline-IRQ recovery.
 ;;; Pre-caching breaks the cycle: %signal-* reads a pre-interned symbol
 ;;; from a fixed slot instead of interning at runtime.
+;; GC-ROOTED storage for the pre-interned signal symbols.  These USED to
+;; live in raw memory slots 0xCA0/0xCA8/0xCB0 — which are NOT in the GC's
+;; root scan (translate-x64 deliberately skips them).  After the FIRST
+;; collection the symbols moved but the raw slots kept the from-space
+;; addresses; the recycled memory was later reused (observed via gdb HW
+;; watchpoint: a file-stream's bpos cell landed on the old TYPE-ERROR
+;; symbol), so every subsequent %signal-type-error built a condition whose
+;; slot-0 "type symbol" was garbage.  %condition-p then returned NIL, the
+;; interpreter bridge's (error (c)) clause rejected the condition, and the
+;; longjmp fell through EVERY frame silently — the asdf gauntlet's
+;; define-package forms aborted their whole toplevel LOAD form with no
+;; report.  Specials live in the globals alist (0x10000080), which IS a
+;; scanned root, so the pointers stay fresh across collections.  Reading a
+;; special does NOT re-enter %INTERN-SYMBOL (the recursion that motivated
+;; the raw slots — see the %init-signal-symbols history note above).
+(defvar *%sig-type-error-sym* nil)
+(defvar *%sig-program-error-sym* nil)
+(defvar *%sig-undefined-function-sym* nil)
+
 (defun %init-signal-symbols ()
   "Pre-intern the TYPE-ERROR / PROGRAM-ERROR / UNDEFINED-FUNCTION
-   symbols and store them at slots 0xCA0/0xCA8/0xCB0.  Must run after
-   init-symbol-table, before any code can signal these conditions."
-  (setf (mem-ref #x10000CA0 :u64) 'type-error)
-  (setf (mem-ref #x10000CA8 :u64) 'program-error)
-  (setf (mem-ref #x10000CB0 :u64) 'undefined-function))
+   symbols into GC-rooted specials.  Must run after init-symbol-table,
+   before any code can signal these conditions."
+  (setq *%sig-type-error-sym* 'type-error)
+  (setq *%sig-program-error-sym* 'program-error)
+  (setq *%sig-undefined-function-sym* 'undefined-function))
 
 (defun %signal-program-error ()
   "Runtime helper: signal a PROGRAM-ERROR condition for handler-case.
    Used by the compiler for arity errors. Sidesteps make-condition,
    which has a complex slot-collection path that's been flaky."
   (let ((c (make-array 2)))
-    (aset c 0 (mem-ref #x10000CA8 :u64))
+    (aset c 0 *%sig-program-error-sym*)
     (aset c 1 nil)
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))
@@ -2182,7 +2201,7 @@
    See %init-signal-symbols for why we read the symbol from a slot
    instead of `(aset c 0 'type-error)'."
   (let ((c (make-array 2)))
-    (aset c 0 (mem-ref #x10000CA0 :u64))
+    (aset c 0 *%sig-type-error-sym*)
     (aset c 1 nil)
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))
@@ -2193,7 +2212,7 @@
    instead of a faulting indirect-call to NIL (or NIL-3 after
    function-pointer tagging — see TAG-PLAN.md)."
   (let ((c (make-array 2)))
-    (aset c 0 (mem-ref #x10000CB0 :u64))
+    (aset c 0 *%sig-undefined-function-sym*)
     (aset c 1 nil)
     (setq *current-condition* c)
     (if (%error-handler-active-p) (%hc-longjmp) nil)))

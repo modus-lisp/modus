@@ -4209,19 +4209,20 @@
     ;; root slot the GC must forward.
     (emit-mov-reg-imm buf 'rax #x10000170)
     (emit-call buf scan-word-label)
-    ;; NOTE: the pre-interned signal-condition symbols at 0xCA0/0xCA8/0xCB0
-    ;; (%init-signal-symbols: 'TYPE-ERROR / 'PROGRAM-ERROR /
-    ;; 'UNDEFINED-FUNCTION) are deliberately NOT scanned here.  In the
-    ;; native-symbol builds these are NOT heap conses ((consp 'type-error)
-    ;; => NIL) — they are interned NATIVE MVM symbols already kept alive
-    ;; (and forwarded) via the symbol intern table at 0x10000088.  An
-    ;; experiment that added three scan_word calls for these slots
-    ;; regressed the ASDF gauntlet from form 44 to form 36 with byte-size-
-    ;; matched idempotent padding scans reaching form 44 — proving the
-    ;; corruption was the SCAN SEMANTICS, not layout shift.  Forwarding
-    ;; them a second time (they alias entries the symtab scan already
-    ;; relocated, and may be referenced by raw untagged keys in the
-    ;; symbol-function table) breaks those aliases.  Leave them unscanned.
+    ;; NOTE: the pre-interned signal-condition symbols ('TYPE-ERROR /
+    ;; 'PROGRAM-ERROR / 'UNDEFINED-FUNCTION) no longer live in raw slots
+    ;; 0xCA0/0xCA8/0xCB0 — those slots were NOT scanned here, so after the
+    ;; first collection they DANGLED into recycled from-space (gdb HW
+    ;; watchpoint showed a file-stream bpos cell reusing the old TYPE-ERROR
+    ;; symbol's memory; every later %signal-type-error then produced a
+    ;; condition %condition-p rejected, and the longjmp silently fell
+    ;; through every handler frame — the asdf-gauntlet define-package
+    ;; silent aborts).  %init-signal-symbols now stores them in SPECIALS
+    ;; (*%sig-type-error-sym* etc., cl-conditions.lisp), which the globals-
+    ;; alist scan above forwards correctly.  The old rationale for not
+    ;; scanning the raw slots ("already forwarded via the symbol intern
+    ;; table") was wrong precisely because forwarding the TABLE never
+    ;; updates raw slot COPIES of the pointers.
     ;; Multiple-value return buffer: MV-COUNT (tagged fixnum) at 0x10000090,
     ;; the (count-1) "extra" values at 0x10000098, 0x100000A0... .  These
     ;; words can hold heap pointers (a cons/string/symbol returned as a

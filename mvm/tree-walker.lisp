@@ -4,8 +4,8 @@
 ;;;; bytecode via the self-hosted compiler + mvm-interpret); this engine was
 ;;;; extracted VERBATIM from cl-eval.lisp (STEP 4a: QUARANTINE).  Loaded by:
 ;;;;   - the legacy fork builds (build-aarch64-ansi-test,
-;;;;     build-aarch64-linux-ansi-test, build-with-compiler,
-;;;;     build-x64-modus-ansi-test), where it IS the eval engine — each
+;;;;     build-aarch64-linux-ansi-test, build-x64-modus-ansi-test),
+;;;;     where it IS the eval engine — each
 ;;;;     defines the (defun eval2 (form) (%eval-in-env form nil)) bridge in
 ;;;;     its own source list, and the two engine-provider overrides at the
 ;;;;     bottom of this file win last-defun-wins (load AFTER ansi-bridge).

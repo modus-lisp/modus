@@ -201,9 +201,9 @@ Production `eval`/`load` are **eval2 ONLY** (compile the form to MVM bytecode
 via the self-hosted compiler, run it through `mvm-interpret`).  As of STEP 4b
 (13526a6, 2026-07-09) the production images (build-ansi-test, build-generic)
 contain ZERO tree-walker code: the walker (`%eval-in-env` + its ~48-function
-engine) lives in **mvm/tree-walker.lisp**, loaded ONLY by the four legacy fork
+engine) lives in **mvm/tree-walker.lisp**, loaded ONLY by the three legacy fork
 builds (build-aarch64-ansi-test, build-aarch64-linux-ansi-test,
-build-with-compiler, build-x64-modus-ansi-test), each of which also defines
+build-x64-modus-ansi-test — the bare-metal x64 ANSI runner), each of which also defines
 the `(defun eval2 (form) (%eval-in-env form nil))` bridge in its own build
 script.  The deletion gate was MEASURED: an instrumented census (every %e2ic
 fallback site printing its shape) showed ZERO walker hits across the full ANSI

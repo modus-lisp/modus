@@ -1,3 +1,10 @@
+> **RETIRED (2026-07-09):** `build-with-compiler.lisp` was deleted — its
+> purpose (a Modus image with the compiler stack embedded) is fully served
+> by `mvm/build-generic.lisp`, which carries the CANONICAL in-image
+> compiler + interpreter + eval2 (production eval).  Build `/tmp/modus`
+> with `sbcl --script mvm/build-generic.lisp` and LOAD any script.
+> References below are historical.
+
 # Runtime compile — status and roadmap
 
 Modus is self-hosting (`mvm/build-mvm.lisp` produces `/tmp/mvm`, a Modus

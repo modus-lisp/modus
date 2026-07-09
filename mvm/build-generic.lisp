@@ -375,12 +375,15 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")
-    (string #\Newline)
-    ;; WS3 STEP 4a: quarantined tree-walker — %e2ic fallback target (see
-    ;; build-ansi-test.lisp note; *e2ic-fallback-count* gates STEP 4b).
-    ;; Before eval2.lisp (spliced later) so eval2's overrides win.
-    (mvm-text "mvm/tree-walker.lisp")))
+    (mvm-text "mvm/ansi-bridge.lisp")))
+;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
+;; image — production eval is eval2 only.  The full-corpus + gauntlet census
+;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback
+;; inventory" was the :li-func offset-0 phantom, fixed in a07fe7d), and the
+;; walker-free image gates clean (16335-16336 / CHUNK-CRASH=0 / FILE-WEDGE=30,
+;; gauntlet 243/243 x2 at 11 FAILFORMs).  tree-walker.lisp remains the eval
+;; engine of the four legacy fork builds ONLY.  If %e2ic-compile ever fails on
+;; a new shape it signals honestly (UNDEFINED-FUNCTION via the NIL fn sentinel).
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))

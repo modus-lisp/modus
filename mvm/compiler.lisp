@@ -6394,15 +6394,27 @@
                         :stack-depth (+ (compile-env-stack-depth env) n-bindings)
                         :parent (compile-env-parent env)
                         :fn-names (compile-env-fn-names env))))
-      ;; Evaluate each binding value and store it to a stack slot
+      ;; Evaluate each binding value and store it to a stack slot.
+      ;; Under temp pressure compile the init directly into DEST (dead
+      ;; until the body value is written — every construct that needs
+      ;; dest's old value across a recursion pushes it first), keeping
+      ;; the counter flat: the with-open-stream-rewrite shape
+      ;; (let ((%wos-result (progn <whole nested body>))) …) otherwise
+      ;; holds 1 temp per nesting LEVEL (harness-for-describe SKIP).
+      ;; See %temps-must-spill-p.
       (let ((i 0))
         (dolist (binding bindings)
-          (let ((val (if (consp binding) (cadr binding) nil))
-                (temp (alloc-temp-reg)))
-            (compile-form val reserve-env temp)
-            (let ((slot (+ (compile-env-stack-depth env) i)))
-              (emit-ir :stack-store temp slot))
-            (free-temp-reg)
+          (let ((val (if (consp binding) (cadr binding) nil)))
+            (if (and (%temps-must-spill-p) (numberp dest))
+                (progn
+                  (compile-form val reserve-env dest)
+                  (let ((slot (+ (compile-env-stack-depth env) i)))
+                    (emit-ir :stack-store dest slot)))
+                (let ((temp (alloc-temp-reg)))
+                  (compile-form val reserve-env temp)
+                  (let ((slot (+ (compile-env-stack-depth env) i)))
+                    (emit-ir :stack-store temp slot))
+                  (free-temp-reg)))
             (setq i (+ i 1))))))
     ;; Phase 2: Build new environment with stack bindings
     (let ((i 0))
@@ -6472,11 +6484,18 @@
       (dolist (binding bindings)
         (let ((var (if (consp binding) (car binding) binding))
               (val (if (consp binding) (cadr binding) nil))
-              (temp (alloc-temp-reg))
               (slot (+ (compile-env-stack-depth env) i)))
-          (compile-form val new-env temp)
-          (emit-ir :stack-store temp slot)
-          (free-temp-reg)
+          ;; Same spill-on-overflow as compile-let's init loop: under
+          ;; temp pressure compile the init into the dead DEST instead
+          ;; of holding a temp across the recursion.
+          (if (and (%temps-must-spill-p) (numberp dest))
+              (progn
+                (compile-form val new-env dest)
+                (emit-ir :stack-store dest slot))
+              (let ((temp (alloc-temp-reg)))
+                (compile-form val new-env temp)
+                (emit-ir :stack-store temp slot)
+                (free-temp-reg)))
           ;; Extend environment with this new binding
           (setq new-env
                 (make-compile-env
@@ -10119,22 +10138,37 @@
     ;; evaluating overflow args may involve function calls that clobber V0-V3.
     (when (> nargs +max-reg-args+)
       (dolist (arg (reverse (nthcdr +max-reg-args+ call-args)))
-        (let ((temp (alloc-temp-reg)))
-          (compile-form arg env temp)
-          (emit-ir :push temp)
-          (free-temp-reg))))
+        (if (%temps-must-spill-p)
+            ;; SPILL: V0 is dead during arg evaluation (arg registers are
+            ;; only populated by the later pops) — counter stays flat.
+            ;; See %temps-must-spill-p / compile-call.
+            (progn
+              (compile-form arg env +vreg-v0+)
+              (emit-ir :push +vreg-v0+))
+            (let ((temp (alloc-temp-reg)))
+              (compile-form arg env temp)
+              (emit-ir :push temp)
+              (free-temp-reg)))))
     ;; Compile function expression into a temp, push on top of overflow args
-    (let ((fn-reg (alloc-temp-reg)))
-      (compile-form fn-form env fn-reg)
-      (emit-ir :push fn-reg)
-      (free-temp-reg))
+    (if (%temps-must-spill-p)
+        (progn
+          (compile-form fn-form env +vreg-v0+)
+          (emit-ir :push +vreg-v0+))
+        (let ((fn-reg (alloc-temp-reg)))
+          (compile-form fn-form env fn-reg)
+          (emit-ir :push fn-reg)
+          (free-temp-reg)))
     ;; Now compile register args using push/pop pattern (safe from clobbering)
     (let ((reg-count (min nargs +max-reg-args+)))
       (dotimes (i reg-count)
-        (let ((temp (alloc-temp-reg)))
-          (compile-form (nth i call-args) env temp)
-          (emit-ir :push temp)
-          (free-temp-reg)))
+        (if (%temps-must-spill-p)
+            (progn
+              (compile-form (nth i call-args) env +vreg-v0+)
+              (emit-ir :push +vreg-v0+))
+            (let ((temp (alloc-temp-reg)))
+              (compile-form (nth i call-args) env temp)
+              (emit-ir :push temp)
+              (free-temp-reg))))
       (loop for i from (1- reg-count) downto 0
             do (emit-ir :pop (+ +vreg-v0+ i)))
       ;; NIL-fill the UNUSED register-arg slots V[reg-count..3].  A funcall
@@ -10742,24 +10776,27 @@
    based / alloc-after-recursion spill variant instead.
 
    Budget math (alloc-temp-reg fails when the pre-alloc counter > 11):
-   the deepest leaf emitters (emit-arith-pair, compile-compare-2's tag
-   check) need up to 3 concurrent temps, so any recursion entered at
-   counter C > 9 can fail on some operand shape.  The spill variants
-   keep the counter FLAT across the recursion and allocate their own
-   (<= 3) temps only for the straight-line emission afterwards, which
-   works iff C <= 9.  Hence the invariant: at C >= 9 nobody holds a
-   temp across a recursion, so the counter can never enter a leaf
-   emitter above 9 and 'out of temporary registers' is structurally
-   unreachable.  Below the threshold the emitted code is byte-identical
+   the deepest leaf emitter is compile-funcall's dispatch tail —
+   fn-call-reg held for the whole dispatch + a 3-temp check window
+   (check/cmp/fn-save or check/cmp/env) = 4 concurrent temps — so any
+   recursion entered at counter C > 8 can fail on some operand shape.
+   The spill variants keep the counter FLAT across the recursion and
+   allocate their own (<= 3) temps only for the straight-line emission
+   afterwards, which works iff C <= 8.  Hence the invariant: when
+   holding would push the recursion entry past 8, nobody holds — the
+   counter can never enter a leaf emitter above 8 and 'out of
+   temporary registers' is structurally unreachable through the gated
+   constructs.  Below the threshold the emitted code is byte-identical
    to the historical scheme; at or above it the old scheme was a
    build-time SKIP that silently dropped whole ANSI test chunks.
 
    HELD is how many temps the calling construct would hold across the
    recursion in its historical variant (1 for the arith step /
-   compile-call arg loop, 2 for compile-compare-2 /
-   compile-object-subtype-p): the recursion entry counter must stay
-   <= 9, so spill when counter + HELD would exceed it."
-  (> (+ *temp-reg-counter* held) 9))
+   compile-call arg loop / let-init loops, 2 for compile-compare-2 /
+   compile-object-subtype-p, 5 for compile-fixnum-truncate2): the
+   recursion entry counter must stay <= 8, so spill when counter +
+   HELD would exceed it."
+  (> (+ *temp-reg-counter* held) 8))
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
@@ -15381,6 +15418,13 @@
                         (mvm-compile-toplevel form)
                         (error (e)
                           (format t "  SKIP ~A: ~A~%" *current-source-location* e)
+                          ;; Identify WHAT was dropped: form head + name.
+                          ;; A bare "SKIP line N" against a 17M-char
+                          ;; assembled source is undebuggable.
+                          (format t "    SKIP-FORM: ~A~%"
+                                  (let ((s (handler-case (format nil "~S" form)
+                                             (error () "<unprintable>"))))
+                                    (if (> (length s) 160) (subseq s 0 160) s)))
                           ;; Remove any lambda/flet entries that were added to
                           ;; *function-table* during this failed form's compilation.
                           ;; These have no corresponding bytecode (bytecode-length=0)

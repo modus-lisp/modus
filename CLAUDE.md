@@ -195,30 +195,29 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 [✓] Everything else
 ```
 
-### Self-hosting (WS3): the tree-walker is RETIRED from production
+### Self-hosting (WS3): COMPLETE — production images are tree-walker-free
 
-Production `eval`/`load` are **eval2 UNCONDITIONALLY** (`(eval2 form)` —
-compile the form to MVM bytecode via the self-hosted compiler, run it through
-`mvm-interpret`).  The `*use-eval2*` flag, `MODUS_NO_EVAL2` lever, boot
-marker, probes-on-walker bracket, and `*e2ic-disable*` are all DELETED
-(STEP 2 = b1e889a, STEP 4 = 5453732, 2026-07-09).  The tree-walker
-(`%eval-in-env` + its ~48-function engine) lives in **mvm/tree-walker.lisp**,
-loaded ONLY by the four legacy fork builds (build-aarch64-ansi-test,
-build-aarch64-linux-ansi-test, build-with-compiler,
-build-x64-modus-ansi-test), each of which also defines the
-`(defun eval2 (form) (%eval-in-env form nil))` bridge in its own build
-script.  Production images contain ZERO walker code; cl-eval.lisp's
-`%call-interp-closure` and ansi-bridge.lisp's `%expand-deftype` are
-engine-provider stubs overridden last-defun-wins by eval2.lisp (production)
-or tree-walker.lisp (forks) — every build wires exactly one engine.
-Unsupported interp-closure shapes / eval2 compile failures now SIGNAL
-honest errors (no silent second-evaluator degradation).  History: the flip
-landed d3434e6 (drain 387→0); the asdf gauntlet runs 243/243 on
-production-eval2.  Landing STEP 2 exposed two structural rules — no
-`(eval …)` in kernel-main/boot paths (boot-time eval2 runs before
-init-all-globals), and never define a duplicate defun name in shared image
-source (by-name resolution ambiguity).
-See /home/claude/.claude/plans/hazy-dazzling-deer.md.
+Production `eval`/`load` are **eval2 ONLY** (compile the form to MVM bytecode
+via the self-hosted compiler, run it through `mvm-interpret`).  As of STEP 4b
+(13526a6, 2026-07-09) the production images (build-ansi-test, build-generic)
+contain ZERO tree-walker code: the walker (`%eval-in-env` + its ~48-function
+engine) lives in **mvm/tree-walker.lisp**, loaded ONLY by the four legacy fork
+builds (build-aarch64-ansi-test, build-aarch64-linux-ansi-test,
+build-with-compiler, build-x64-modus-ansi-test), each of which also defines
+the `(defun eval2 (form) (%eval-in-env form nil))` bridge in its own build
+script.  The deletion gate was MEASURED: an instrumented census (every %e2ic
+fallback site printing its shape) showed ZERO walker hits across the full ANSI
+corpus and the full asdf gauntlet; the walker-free images gate at
+16335-16336 / CHUNK-CRASH=0 / FILE-WEDGE=30 with the gauntlet at 243/243.
+All flip/rollback levers are deleted.  If %e2ic-compile ever fails on a new
+shape, production signals an honest error (no silent second evaluator).
+Structural rules learned landing this: no `(eval …)` in kernel-main/boot
+paths; never define a duplicate defun name in shared image source; when a
+crash marker flips with unrelated edits, check the build-time SKIP/WARN list
+for garbage-execution paths (the :li-func offset-0 class, fixed a07fe7d)
+before theorizing.  Remaining WS3-adjacent follow-ups live in the task list
+(uncompilable chunk defuns ~200 tests; %hc-longjmp unhandled-condition
+report).  Next workstream: WS4 (runtime JIT — bytecode→native at runtime).
 
 ## Build Commands
 

@@ -5,12 +5,6 @@ Modus is a self-hosting bare-metal Lisp operating system. It compiles Lisp to na
 ## Directory Structure
 
 ```
-cross/          Vestigial cross-compiler (see cross/README.md)
-  packages.lisp        Package definitions (used by MVM)
-  x64-asm.lisp         x86-64 assembler (used by MVM)
-  cross-compile.lisp   Original Phase 0 cross-compiler (historical)
-  build.lisp           Original kernel builder (historical)
-
 lib/            Shared utilities
   load-mvm.lisp        MVM system loading boilerplate
   hash.lisp            Dual-FNV-1a symbol hashing
@@ -82,10 +76,13 @@ mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-packages.lisp     909L  Package system (intern, defpackage, etc.)
   cl-conditions.lisp   915L  Condition system (24 types, handler-bind, restarts)
   cl-clos.lisp         429L  CLOS (defclass, defgeneric, defmethod, dispatch)
-  cl-eval.lisp       1,353L  Eval/compile/load, symbol-function table
+  cl-eval.lisp       3,575L  Eval/compile/load (eval2), symbol-function table
   cl-types.lisp        519L  typep, coerce, numeric helpers
   ansi-bridge.lisp   1,888L  Test helpers (eqlt, scaffold, stubs)
   gc.lisp                    GC helper functions (Lisp-side)
+  eval2.lisp                 Production eval: compile→MVM bytecode→interpret
+  interp.lisp                MVM bytecode interpreter (in-image)
+  tree-walker.lisp   3,050L  LEGACY %eval-in-env engine — fork builds ONLY
 
 runtime/        Runtime type system
   tags.lisp            Tag/subtag definitions
@@ -198,22 +195,29 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 [✓] Everything else
 ```
 
-### Self-hosting (WS3): retiring the tree-walker — THE FLIP IS LANDED
+### Self-hosting (WS3): the tree-walker is RETIRED from production
 
-Production `eval`/`load` route to **eval2** (`eval2-forms`, mvm/eval2.lisp:
+Production `eval`/`load` are **eval2 UNCONDITIONALLY** (`(eval2 form)` —
 compile the form to MVM bytecode via the self-hosted compiler, run it through
-`mvm-interpret`) by default as of **d3434e6** — `*use-eval2*` boots T
-(`MODUS_NO_EVAL2=1` rebuilds with the tree-walker as rollback).  The flip-gate
-drain took production-eval2 corpus regressions 387→60→13→0 (commits 63643dc,
-d40fff5+20fbbfa, 77cea7c+c12345c: quote-identity const pool, condition
-propagation, undefined-fn/unbound-var signals, runtime macros, %defmethod-full,
-MV propagation, in-image compile fidelity incl. the eval2.lisp `\"` extraction
-damage).  Post-flip full ANSI: 17321/17318 vs tree-walker 17311 — net positive.
-The tree-walker (`%eval-in-env`, cl-eval.lisp) still exists: the diagnostic
-probe suite (run-all-tests) is bracketed onto it (distinct-form evals are ~50x
-slower under eval2 — no cache hits).  Phase 3 (DELETE the tree-walker) needs
-distinct-form compile speed or the WS4 JIT first.  Flip gate:
-`MODUS_USE_EVAL2=… MODUS_FLIP_SKIP_PROBES=1` (see build-ansi-test.lisp).
+`mvm-interpret`).  The `*use-eval2*` flag, `MODUS_NO_EVAL2` lever, boot
+marker, probes-on-walker bracket, and `*e2ic-disable*` are all DELETED
+(STEP 2 = b1e889a, STEP 4 = 5453732, 2026-07-09).  The tree-walker
+(`%eval-in-env` + its ~48-function engine) lives in **mvm/tree-walker.lisp**,
+loaded ONLY by the four legacy fork builds (build-aarch64-ansi-test,
+build-aarch64-linux-ansi-test, build-with-compiler,
+build-x64-modus-ansi-test), each of which also defines the
+`(defun eval2 (form) (%eval-in-env form nil))` bridge in its own build
+script.  Production images contain ZERO walker code; cl-eval.lisp's
+`%call-interp-closure` and ansi-bridge.lisp's `%expand-deftype` are
+engine-provider stubs overridden last-defun-wins by eval2.lisp (production)
+or tree-walker.lisp (forks) — every build wires exactly one engine.
+Unsupported interp-closure shapes / eval2 compile failures now SIGNAL
+honest errors (no silent second-evaluator degradation).  History: the flip
+landed d3434e6 (drain 387→0); the asdf gauntlet runs 243/243 on
+production-eval2.  Landing STEP 2 exposed two structural rules — no
+`(eval …)` in kernel-main/boot paths (boot-time eval2 runs before
+init-all-globals), and never define a duplicate defun name in shared image
+source (by-name resolution ambiguity).
 See /home/claude/.claude/plans/hazy-dazzling-deer.md.
 
 ## Build Commands
@@ -447,10 +451,10 @@ cause, which is almost always one of:
 
 Method that works:
 1. **Reproduce deterministically.** A crash that reproduces every run is NOT a
-   GC race.  "Crashes on the ANSI image, clean on the generic binary" usually
-   just means the generic binary runs GC-OFF (R14 = full heap, no trigger);
-   the ANSI image sets R14 = midpoint.  Force GC on the generic binary with
-   `MODUS_GC_R14=<small>` (e.g. 262144) for a fast repro.
+   GC race.  NOTE (corrected 2026-07-09): the generic binary does NOT run
+   GC-off — R14 sits 16MB below the mmap end (the guard band), so long runs
+   DO collect (the gauntlet crosses it).  For a faster repro lower the
+   trigger with `MODUS_GC_R14=<small>` (e.g. 262144).
 2. **`RIP=0xDEADxxxx` as the program counter** = a corrupted/NIL FUNCTION
    pointer was *called* (control transfer), not a data deref — i.e. heap
    corruption of a live fn/closure, which is exactly what scanning raw

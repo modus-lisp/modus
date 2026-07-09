@@ -700,30 +700,50 @@
             (values-list (cons %r (cdr %mv))))
         %r)))
 
+(defvar *e2ic-fallback-count* 0
+  "Number of interp-closure / deftype-expander invocations served by the
+   QUARANTINED tree-walker (tree-walker.lisp) because eval2's %e2ic-compile
+   could not serve the shape.  WS3 STEP 4b — deleting the walker from the
+   production images — is gated on driving this to ZERO across the full
+   ANSI corpus + gauntlet: every hit is an eval2 capability gap (measured
+   2026-07-09: ~142 corpus tests across the macrolet-declare / some /
+   times / format-radix / defmacro-tail families).")
+
 (defun %call-interp-closure (fn args)
   "OVERRIDE (eval2 images; last-defun-wins) of cl-eval.lisp's engine stub:
    eval2-first interp-closure call.  Compiles the closure body against its
    captured env ONCE (cached on the closure), applies the trampoline.
-   WS3 STEP 4: no walker fallback — an unsupported shape or compile
-   failure signals (cached as :e2ic-fail so repeat calls fail fast)."
+   WS3 STEP 4a (walker QUARANTINED, not yet deleted): unsupported shapes /
+   compile failures fall back to the tree-walker and bump
+   *e2ic-fallback-count* — the measurable STEP-4b deletion gate."
   (let ((c (%e2ic-cached fn)))
     (cond
-      ((eq c (quote :e2ic-fail))
-       (error "eval2: interp-closure shape unsupported (cached compile failure)"))
+      ((eq c (quote :e2ic-walker))
+       (setq *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*))
+       (%call-interp-closure-walker fn args))
       (c (%e2ic-apply c args))
       (t
        (let ((tramp (%e2ic-compile (cadr fn) (caddr fn) (cadddr fn))))
-         (%e2ic-cache-set fn (if tramp tramp (quote :e2ic-fail)))
+         (%e2ic-cache-set fn (if tramp tramp (quote :e2ic-walker)))
          (if tramp
              (%e2ic-apply tramp args)
-             (error "eval2: interp-closure compile failed (params=~S)"
-                    (cadr fn))))))))
+             (progn
+               (setq *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*))
+               (%call-interp-closure-walker fn args))))))))
+
+(defun %e2ic-deftype-walker (entry args)
+  "The walker deftype expansion — %bind-params the registered lambda list to
+   the UNEVALUATED type args, %eval-progn the body (tree-walker.lisp)."
+  (setq *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*))
+  (let ((env (%bind-params (car entry) args nil)))
+    (%eval-progn (cdr entry) env)))
 
 (defun %expand-deftype (type)
   "OVERRIDE (eval2 images; last-defun-wins) of ansi-bridge's engine stub:
    route the deftype body eval through the eval2 lambda-body entry, cached
-   per registration (name → (entry . trampoline)).  WS3 STEP 4: no walker
-   fallback — a deftype body eval2 can't compile signals."
+   per registration (name → (entry . trampoline)).  WS3 STEP 4a: a deftype
+   body eval2 can't compile falls back to the quarantined walker and bumps
+   *e2ic-fallback-count*."
   (let* ((head (if (consp type) (car type) type))
          (args (if (consp type) (cdr type) nil))
          (entry (%deftype-lookup head)))
@@ -735,8 +755,8 @@
                        (gethash nm *e2ic-deftype-cache*)
                        nil)))
          (if (and hit (eq (car hit) entry))
-             (if (eq (cdr hit) (quote :e2ic-fail))
-                 (error "eval2: deftype expander compile failed (type=~S)" type)
+             (if (eq (cdr hit) (quote :e2ic-walker))
+                 (%e2ic-deftype-walker entry args)
                  (%e2ic-apply (cdr hit) args))
              (let ((tramp (%e2ic-compile (car entry) (cdr entry) nil)))
                (unless *e2ic-deftype-cache*
@@ -744,8 +764,7 @@
                        (make-hash-table :test (quote equal))))
                (when nm
                  (puthash nm *e2ic-deftype-cache*
-                          (cons entry (if tramp tramp (quote :e2ic-fail)))))
+                          (cons entry (if tramp tramp (quote :e2ic-walker)))))
                (if tramp
                    (%e2ic-apply tramp args)
-                   (error "eval2: deftype expander compile failed (type=~S)"
-                          type)))))))))
+                   (%e2ic-deftype-walker entry args)))))))))

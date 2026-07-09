@@ -2,15 +2,20 @@
 ;;;;
 ;;;; WS3 STEP 4 (2026-07-09): production eval is eval2 (compile to MVM
 ;;;; bytecode via the self-hosted compiler + mvm-interpret); this engine was
-;;;; extracted VERBATIM from cl-eval.lisp and is loaded ONLY by the legacy
-;;;; fork builds that do not embed the self-hosted compiler:
-;;;;   build-aarch64-ansi-test, build-aarch64-linux-ansi-test,
-;;;;   build-with-compiler, build-x64-modus-ansi-test
-;;;; (each also defines the (defun eval2 (form) (%eval-in-env form nil))
-;;;; bridge in its own source list).  Load AFTER ansi-bridge.lisp so the two
-;;;; engine-provider overrides at the bottom win via last-defun-wins.
-;;;; The production images (build-ansi-test, build-generic) do NOT load this
-;;;; file — their engine stubs are overridden by eval2.lisp instead.
+;;;; extracted VERBATIM from cl-eval.lisp (STEP 4a: QUARANTINE).  Loaded by:
+;;;;   - the legacy fork builds (build-aarch64-ansi-test,
+;;;;     build-aarch64-linux-ansi-test, build-with-compiler,
+;;;;     build-x64-modus-ansi-test), where it IS the eval engine — each
+;;;;     defines the (defun eval2 (form) (%eval-in-env form nil)) bridge in
+;;;;     its own source list, and the two engine-provider overrides at the
+;;;;     bottom of this file win last-defun-wins (load AFTER ansi-bridge).
+;;;;   - the PRODUCTION images (build-ansi-test, build-generic), where it is
+;;;;     ONLY the %e2ic fallback for interp-closure shapes eval2's
+;;;;     %e2ic-compile cannot yet serve (loaded BEFORE eval2.lisp so eval2's
+;;;;     overrides win; *e2ic-fallback-count* measures the remaining
+;;;;     inventory).  STEP 4b — dropping this file from the production
+;;;;     builds — is gated on that counter reaching ZERO on the full
+;;;;     corpus + gauntlet.
 
 (defun %eval-global-get (name)
   "Look up global variable by name string. Returns (found-p . value)."

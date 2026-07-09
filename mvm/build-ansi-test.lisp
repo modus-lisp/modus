@@ -73,7 +73,16 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")))
+    (mvm-text "mvm/ansi-bridge.lisp")
+    (string #\Newline)
+    ;; WS3 STEP 4a: the tree-walker is QUARANTINED in its own file.  It is
+    ;; still loaded here because eval2's %e2ic falls back to it for shapes
+    ;; %e2ic-compile cannot serve (*e2ic-fallback-count* measures the
+    ;; remaining inventory, ~142 corpus tests as of 2026-07-09).  STEP 4b
+    ;; (drop this line from the production builds) is gated on that
+    ;; counter reaching zero.  Loads BEFORE eval2.lisp so eval2's
+    ;; %call-interp-closure / %expand-deftype overrides win.
+    (mvm-text "mvm/tree-walker.lisp")))
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
 ;;; --- WS3: self-host the MVM compiler in the image (eval2 foundation) ---

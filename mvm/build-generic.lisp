@@ -375,7 +375,12 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")))
+    (mvm-text "mvm/ansi-bridge.lisp")
+    (string #\Newline)
+    ;; WS3 STEP 4a: quarantined tree-walker — %e2ic fallback target (see
+    ;; build-ansi-test.lisp note; *e2ic-fallback-count* gates STEP 4b).
+    ;; Before eval2.lisp (spliced later) so eval2's overrides win.
+    (mvm-text "mvm/tree-walker.lisp")))
 
 (format t "  prelude: ~D chars~%" (length *prelude-source*))
 (format t "  gc:      ~D chars~%" (length *gc-source*))

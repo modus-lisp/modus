@@ -747,15 +747,15 @@
   "True if X is an interpreted closure (cons with tag %INTERP-CLOSURE)."
   (and (consp x) (eq (car x) '%interp-closure)))
 
-(defun %call-interp-closure (fn args)
-  "Call an interpreted closure — ENGINE-PROVIDER STUB (WS3 STEP 4).
-   Every build must supply a real evaluator engine that overrides this
-   defun (last-defun-wins): eval2.lisp's eval2-first dispatcher in the
-   production images, or tree-walker.lisp's walker dispatcher in the
-   legacy fork builds.  If this stub is ever reached, the build wired in
-   no engine at all."
-  (declare (ignore args))
-  (error "no evaluator engine: %CALL-INTERP-CLOSURE stub reached (fn=~S)" fn))
+;; %CALL-INTERP-CLOSURE has NO definition in this file (WS3 STEP 4): the
+;; evaluator engine provides it — tree-walker.lisp's walker dispatcher in
+;; the legacy fork builds, eval2.lisp's eval2-first dispatcher in the
+;; production images (which load tree-walker.lisp earlier only as the
+;; %e2ic fallback).  Call sites below resolve to the build's engine via
+;; whole-program last-defun-wins.  A STUB DEFUN HERE IS A BUG: a third
+;; same-name defun re-triggers the duplicate-defun by-name ambiguity
+;; (CHUNK-CRASH 0->16 on the macro chunk families — see the 4277187 and
+;; 4a0d6a6 commit messages).
 
 ;;; Block / Return-from / Loop / Return / Tagbody / Go for runtime eval.
 ;;;

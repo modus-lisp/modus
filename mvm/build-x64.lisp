@@ -4591,12 +4591,20 @@
                      ~%;; any UNARMED window — chunk glue, run-init-FILE forms, chunk~
                      ~%;; prologues — hung the whole sequential run forever (Linux~
                      ~%;; covers those windows with alarm(45)).  Instead of disarming,~
-                     ~%;; run-test RE-ARMS the counter to the file-budget value~
-                     ~%;; (120000 ticks = ~~2 min) and fork-file arms it at entry, so~
-                     ~%;; the counter is live across every window where fork-file's or~
-                     ~%;; %try-chunk's handler-case is armed.  If it fires in a truly~
-                     ~%;; unarmed window the ISR expires silently (slot 0x10000180 = 0~
-                     ~%;; check) — no worse than before.~
+                     ~%;; run-test RE-ARMS the counter to the glue/print budget and~
+                     ~%;; fork-file arms it at entry, so the counter is live across~
+                     ~%;; every window where fork-file's or %try-chunk's handler-case~
+                     ~%;; is armed.  If it fires in a truly unarmed window the ISR~
+                     ~%;; expires silently (slot 0x10000180 = 0 check) — no worse~
+                     ~%;; than before.~
+                     ~%;;~
+                     ~%;; TICK BUDGETS: QEMU TCG under host load delivers far fewer~
+                     ~%;; than 1000 ticks/s (measured ~~46/s), so budgets are sized~
+                     ~%;; for both rates: per-test 500 (0.5s at 1000Hz, ~~11s at~
+                     ~%;; 46Hz); glue/FAIL-print/file-init 2000 (2s / ~~43s).  The~
+                     ~%;; first cut used 120000 for the glue budget — a corrupted-~
+                     ~%;; bignum condition-print loop (gcd cluster) then spun ~~43~
+                     ~%;; min before the watchdog fired.~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
@@ -4605,11 +4613,11 @@
                      ~%  (%reset-signal-state)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 500)~
                      ~%      (rt-run-test id (funcall thunk) expected)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 120000))~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 2000))~
                      ~%    (t (c)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 120000)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 2000)~
                      ~%      (%test-crash-fail-c id c))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
@@ -4619,11 +4627,11 @@
                      ~%  (%reset-signal-state)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 50)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 500)~
                      ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 120000))~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 2000))~
                      ~%    (t (c)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 120000)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 2000)~
                      ~%      (%test-crash-fail-c id c))))~
                      ~%;; Kept for kernel-main setq compatibility (unused on bare metal).~
                      ~%(defvar *wstatus-addr* #x100001A0)~
@@ -4660,7 +4668,7 @@
                      ~%  ;; glue between tests (see run-test comment).  This handler-case~
                      ~%  ;; is the longjmp target for any watchdog expiry outside a~
                      ~%  ;; narrower armed frame.~
-                     ~%  (setf (mem-ref #x10000C70 :u64) 120000)~
+                     ~%  (setf (mem-ref #x10000C70 :u64) 2000)~
                      ~%  (handler-case (funcall thunk)~
                      ~%    (t (c)~
                      ~%      (%report-file-wedge file-name first-id last-id \"escape\")~

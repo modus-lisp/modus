@@ -260,13 +260,17 @@
     (mvm-emit-byte buf #x22)
     (mvm-emit-byte buf #xD8)
 
-    ;; Enable PAE (CR4.PAE = bit 5)
+    ;; Enable PAE (CR4.PAE = bit 5) + OSFXSR (bit 9) + OSXMMEXCPT (bit 10).
+    ;; OSFXSR was MISSING until 2026-07-09: without it every SSE instruction
+    ;; (#UD) — and the x64 translator emits SSE (cvtsi2sd etc.) for ALL
+    ;; float opcodes — so every float operation on bare-metal x64 faulted
+    ;; and was "recovered" as an error by the #GP handler.  Linux sets
+    ;; OSFXSR for userland, which is why the same image logic worked there.
     (mvm-emit-byte buf #x0F)          ; mov eax, cr4
     (mvm-emit-byte buf #x20)
     (mvm-emit-byte buf #xE0)
-    (mvm-emit-byte buf #x83)          ; or eax, 0x20
-    (mvm-emit-byte buf #xC8)
-    (mvm-emit-byte buf #x20)
+    (mvm-emit-byte buf #x0D)          ; or eax, imm32
+    (mvm-emit-u32 buf #x620)          ; PAE | OSFXSR | OSXMMEXCPT
     (mvm-emit-byte buf #x0F)          ; mov cr4, eax
     (mvm-emit-byte buf #x22)
     (mvm-emit-byte buf #xE0)
@@ -515,6 +519,18 @@
     ;; Set up timer interrupt for HLT-based io-delay
     (emit-x64-interrupt-setup buf)
 
+    ;; NOP-pad so (boot-preamble + the 5-byte JMP cross.lisp emits before
+    ;; native code) is 16-aligned.  The translator 16-aligns function
+    ;; entries relative to (*x64-native-code-offset* + P); builds that
+    ;; leave the offset at 0 then get fn entry addresses at a residue
+    ;; equal to (boot-len + 5) mod 16.  Aligning here makes raw fn
+    ;; entries end in nibble 0 for EVERY bare-metal x64 build, so
+    ;; mvm-fn-addr's OR-3 yields clean nibble-3 fn tags (functionp's
+    ;; fast path) regardless of whether the build script measures the
+    ;; offset (build-x64.lisp does) or leaves it 0.
+    (loop until (zerop (mod (+ (length (mvm-buffer-used-bytes buf)) 5) 16))
+          do (mvm-emit-byte buf #x90))
+
     ;; Fall through to native code
     ))
 
@@ -675,6 +691,10 @@
     ;; 180 and the next FORMAT-spam test infinitely re-enters the same
     ;; failed handler.  AArch64 entry-5 calls BL pop_helper for the
     ;; same reason (boot-aarch64.lisp lines 375-381).
+    ;; 2026-07-09 32-BYTE-FRAME UPDATE (mirrors the #PF handler fix below):
+    ;; stride 24 -> 32, restore RBX from the target frame ([rcx+24]), copy
+    ;; and zero-fill the 4th (RBX) quad in the inline pop.  See the long
+    ;; comment on sg-bytes.
     (let ((deadline-isr-addr (+ idt-base #x900))
           (deadline-bytes
            #(;; entry + EOI
@@ -687,53 +707,57 @@
              #x48 #xB9 #x70 #x0C #x00 #x10 #x00 #x00 #x00 #x00  ; 7: mov rcx, 0x10000C70
              #x48 #x8B #x01                             ; 17: mov rax, [rcx]
              #x48 #x85 #xC0                             ; 20: test rax, rax
-             ;; jz NEAR pit_normal (target byte 177; delta from PC=29 = 148 = 0x94)
-             #x0F #x84 #x94 #x00 #x00 #x00              ; 23: jz pit_normal
+             ;; jz NEAR pit_normal (target byte 205; delta from PC=29 = 176 = 0xB0)
+             #x0F #x84 #xB0 #x00 #x00 #x00              ; 23: jz pit_normal
              #x48 #xFF #xC8                             ; 29: dec rax
              #x48 #x89 #x01                             ; 32: mov [rcx], rax
-             ;; jnz NEAR pit_normal (delta from PC=41 = 136 = 0x88)
-             #x0F #x85 #x88 #x00 #x00 #x00              ; 35: jnz pit_normal
+             ;; jnz NEAR pit_normal (delta from PC=41 = 164 = 0xA4)
+             #x0F #x85 #xA4 #x00 #x00 #x00              ; 35: jnz pit_normal
              ;; Deadline hit:
              #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00  ; 41: mov rcx, 0x10000180
              #x48 #x8B #x01                             ; 51: mov rax, [rcx]
              #x48 #x85 #xC0                             ; 54: test rax, rax
-             ;; jz SHORT pit_normal (delta from PC=59 to 177 = 118 = 0x76)
-             #x74 #x76                                  ; 57: jz pit_normal
-             #x48 #x8B #x69 #x08                        ; 59: mov rbp, [rcx+8]
-             #x48 #x8B #x51 #x10                        ; 63: mov rdx, [rcx+16]
-             ;; Inline handler-stack pop:
-             #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10    ; 67: mov r10, [0x10000400]
-             #x4D #x85 #xD2                             ; 75: test r10, r10
-             ;; jz SHORT zero_fill (target byte 139; delta from PC=80 = 59 = 0x3B)
-             #x74 #x3B                                  ; 78: jz zero_fill
-             #x49 #xFF #xCA                             ; 80: dec r10
-             #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10    ; 83: mov [0x10000400], r10
-             #x4D #x6B #xDA #x18                        ; 91: imul r11, r10, 24
-             #x49 #x81 #xC3 #x08 #x04 #x00 #x10         ; 95: add r11, 0x10000408
-             #x4D #x8B #x13                             ; 102: mov r10, [r11]
-             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 105: mov [0x10000180], r10
-             #x4D #x8B #x53 #x08                        ; 113: mov r10, [r11+8]
-             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 117: mov [0x10000188], r10
-             #x4D #x8B #x53 #x10                        ; 125: mov r10, [r11+16]
-             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 129: mov [0x10000190], r10
-             ;; jmp SHORT epilogue (target byte 166; delta from PC=139 = 27 = 0x1B)
-             #xEB #x1B                                  ; 137: jmp epilogue
-             ;; zero_fill (byte 139):
-             #x4D #x31 #xD2                             ; 139: xor r10, r10
-             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 142: mov [0x10000180], r10
-             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 150: mov [0x10000188], r10
-             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 158: mov [0x10000190], r10
-             ;; epilogue (byte 166):
-             #x48 #x89 #xC4                             ; 166: mov rsp, rax
-             #xB8 #x09 #x10 #xAD #xDE                   ; 169: mov eax, 0xDEAD1009
-             #xFB                                       ; 174: sti
-             #xFF #xE2                                  ; 175: jmp rdx
-             ;; pit_normal (byte 177):
-             #x5A                                       ; 177: pop rdx
-             #x59                                       ; 178: pop rcx
-             #x58                                       ; 179: pop rax
-             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00  ; 180: or qword [rsp+16], 0x200
-             #x48 #xCF                                  ; 189: iretq
+             ;; jz NEAR pit_normal (target 205; delta from PC=63 = 142 = 0x8E)
+             #x0F #x84 #x8E #x00 #x00 #x00              ; 57: jz pit_normal
+             #x48 #x8B #x69 #x08                        ; 63: mov rbp, [rcx+8]
+             #x48 #x8B #x51 #x10                        ; 67: mov rdx, [rcx+16]
+             #x48 #x8B #x59 #x18                        ; 71: mov rbx, [rcx+24] (saved V4)
+             ;; Inline handler-stack pop (32-byte frames):
+             #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10    ; 75: mov r10, [0x10000400]
+             #x4D #x85 #xD2                             ; 83: test r10, r10
+             ;; jz SHORT zero_fill (target byte 159; delta from PC=88 = 71 = 0x47)
+             #x74 #x47                                  ; 86: jz zero_fill
+             #x49 #xFF #xCA                             ; 88: dec r10
+             #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10    ; 91: mov [0x10000400], r10
+             #x4D #x6B #xDA #x20                        ; 99: imul r11, r10, 32
+             #x49 #x81 #xC3 #x08 #x04 #x00 #x10         ; 103: add r11, 0x10000408
+             #x4D #x8B #x13                             ; 110: mov r10, [r11]
+             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 113: mov [0x10000180], r10
+             #x4D #x8B #x53 #x08                        ; 121: mov r10, [r11+8]
+             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 125: mov [0x10000188], r10
+             #x4D #x8B #x53 #x10                        ; 133: mov r10, [r11+16]
+             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 137: mov [0x10000190], r10
+             #x4D #x8B #x53 #x18                        ; 145: mov r10, [r11+24]
+             #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10    ; 149: mov [0x10000198], r10
+             ;; jmp SHORT epilogue (target byte 194; delta from PC=159 = 35 = 0x23)
+             #xEB #x23                                  ; 157: jmp epilogue
+             ;; zero_fill (byte 159):
+             #x4D #x31 #xD2                             ; 159: xor r10, r10
+             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 162: mov [0x10000180], r10
+             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 170: mov [0x10000188], r10
+             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 178: mov [0x10000190], r10
+             #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10    ; 186: mov [0x10000198], r10
+             ;; epilogue (byte 194):
+             #x48 #x89 #xC4                             ; 194: mov rsp, rax
+             #xB8 #x09 #x10 #xAD #xDE                   ; 197: mov eax, 0xDEAD1009
+             #xFB                                       ; 202: sti
+             #xFF #xE2                                  ; 203: jmp rdx
+             ;; pit_normal (byte 205):
+             #x5A                                       ; 205: pop rdx
+             #x59                                       ; 206: pop rcx
+             #x58                                       ; 207: pop rax
+             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00  ; 208: or qword [rsp+16], 0x200
+             #x48 #xCF                                  ; 217: iretq
              )))
       ;; Write the ISR bytes at +x64-idt-addr+ +0x900.
       (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
@@ -814,19 +838,39 @@
             ;; Layout shifts: halt now at byte 140 (was 147), so the
             ;; "no handler armed" jz at byte 20-21 targets 0x76 (was
             ;; 0x7D).
+            ;; 2026-07-09 32-BYTE-FRAME UPDATE: the handler-stack frames grew
+            ;; from 24 to 32 bytes (RSP/RBP/IP/RBX — see emit-handler-helpers
+            ;; in translate-x64.lisp, commit b45987b) but this hand-coded
+            ;; inline pop still used stride 24 and never touched the RBX
+            ;; slot.  Every recovery then repopulated slot 0x10000180 from
+            ;; MISALIGNED frame offsets — an RBX slot holding NIL landed in
+            ;; the RSP slot, and the NEXT longjmp switched to RSP=0xDEAD0001
+            ;; (the bare-metal ANSI nunion cascade / halt-at-13621 class).
+            ;; Now: restore RBX from the target frame ([rcx+24], mirroring
+            ;; TRAP #x0511), pop with stride 32 incl. the 4th quad, and
+            ;; zero-fill all four slots.  Byte offsets:
+            ;;   0 add rsp,8 | 4 mov rcx,0x10000180 | 14 mov rax,[rcx]
+            ;;   17 test rax,rax | 20 jz(rel32) halt(168) | 26 mov rbp,[rcx+8]
+            ;;   30 mov rdx,[rcx+16] | 34 mov rbx,[rcx+24] | 38 mov r10,[0x400]
+            ;;   46 test | 49 jz zero_fill(122) | 51 dec r10 | 54 mov [0x400],r10
+            ;;   62 imul r11,r10,32 | 66 add r11,0x10000408 | 69.. 4-quad copy
+            ;;   120 jmp epilogue(157) | 122 zero_fill (4 slots)
+            ;;   157 mov rsp,rax | 160 mov eax,T | 165 sti | 166 jmp rdx
+            ;;   168 halt: hlt; jmp halt
             #(#x48 #x83 #xC4 #x08
               #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
               #x48 #x8B #x01
               #x48 #x85 #xC0
-              #x74 #x76
+              #x0F #x84 #x8E #x00 #x00 #x00
               #x48 #x8B #x69 #x08
               #x48 #x8B #x51 #x10
+              #x48 #x8B #x59 #x18
               #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10
               #x4D #x85 #xD2
-              #x74 #x3B
+              #x74 #x47
               #x49 #xFF #xCA
               #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10
-              #x4D #x6B #xDA #x18
+              #x4D #x6B #xDA #x20
               #x49 #x81 #xC3 #x08 #x04 #x00 #x10
               #x4D #x8B #x13
               #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10
@@ -834,11 +878,14 @@
               #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
               #x4D #x8B #x53 #x10
               #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
-              #xEB #x1B
+              #x4D #x8B #x53 #x18
+              #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10
+              #xEB #x23
               #x4D #x31 #xD2
               #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10
               #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
               #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
+              #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10
               #x48 #x89 #xC4
               #xB8 #x09 #x10 #xAD #xDE
               #xFB
@@ -864,14 +911,19 @@
            (mvm-emit-u32  buf i)
            (mvm-emit-byte buf (aref sg-bytes i)))))
 
-      ;; Write IDT entries 13 (#GP) and 14 (#PF) pointing at our handler.
+      ;; Write IDT entries 13 (#GP) and 14 (#PF) pointing at our handler,
+      ;; and entry 6 (#UD) at handler+4 — #UD pushes NO error code, so it
+      ;; skips the leading `add rsp,8`.  Without entry 6, every #UD (e.g.
+      ;; SSE-before-OSFXSR historically, or garbage-byte execution) took a
+      ;; #UD -> #GP(IDT-miss) double-hop through the recovery path.
       ;; Same encoding pattern as vector 0x20 above.
-      (dolist (vec '(13 14))
+      (dolist (vec '(6 13 14))
         (let* ((eoff (* vec 16))
                (eaddr (+ idt-base eoff))
-               (off-lo (logand sigsegv-isr-addr #xFFFF))
-               (off-mid (logand (ash sigsegv-isr-addr -16) #xFFFF))
-               (off-hi (logand (ash sigsegv-isr-addr -32) #xFFFFFFFF)))
+               (target (if (= vec 6) (+ sigsegv-isr-addr 4) sigsegv-isr-addr))
+               (off-lo (logand target #xFFFF))
+               (off-mid (logand (ash target -16) #xFFFF))
+               (off-hi (logand (ash target -32) #xFFFFFFFF)))
           ;; mov rdi, eaddr
           (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
           (mvm-emit-u32 buf eaddr) (mvm-emit-u32 buf 0)

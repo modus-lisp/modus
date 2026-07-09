@@ -26,7 +26,7 @@ for n in $FUZZ_VALUES; do
   rm -f /tmp/modus-ansi-test
   MODUS_FUZZ_FUNCALL_NOPS="$n" \
     sbcl --dynamic-space-size 2048 \
-         --script mvm/build-ansi-test.lisp 2>&1 | tail -2
+         --script mvm/build-x64-linux.lisp 2>&1 | tail -2
   if [ ! -f /tmp/modus-ansi-test ]; then
     echo "  BUILD FAILED for n=$n; aborting"
     exit 1

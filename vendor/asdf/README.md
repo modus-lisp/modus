@@ -140,7 +140,7 @@ is the OTHER half — independent of this ECASE fix and still open.
 
 **Binary-scope caveat (important for anyone adding ANSI probes):** the
 runtime ECASE/CCASE/CTYPECASE live in `mvm/runtime-cl-macros.lisp`, which is
-loaded ONLY by `build-generic.lisp`.  `build-ansi-test.lisp` does NOT load
+loaded ONLY by `build-generic.lisp`.  `build-x64-linux.lisp` does NOT load
 that file, so `*modus-runtime-macros*` is UNBOUND in the ANSI-test binary and
 `%install-runtime-cl-macros-late` (rt.lisp, called before the suite runs) is
 a no-op for these.  The ANSI binary's compiled data-and-control ECASE tests
@@ -474,7 +474,7 @@ unchanged; only the mapping is larger.
 Verified: the README's minimal `fsc` reproducer now prints `car=111 gc=1`; the
 `(a b #.(progn (make-string…)(loop … make-string …) 99) c d)` two-GC `#.`
 read-eval reads cleanly; `dotimes`/`loop`/recursion variants all survive.
-Shared boot file ⇒ build-ansi-test gets the fix too.  ANSI gate: 15,355 →
+Shared boot file ⇒ build-x64-linux gets the fix too.  ANSI gate: 15,355 →
 **15,360 passed**, lost-to-crash flat (~118→119), no FILE-WEDGE/CHUNK-CRASH rise.
 Gauntlet: now cleanly reaches uiop/pathname (form 50) and stops at the
 **form-54 READ-ERROR**, which is a SEPARATE, genuine reader/eval issue (the `#.`
@@ -753,7 +753,7 @@ lambda-list keyword — `&BODY`/`&OPTIONAL`/`&KEY`/`&AUX`/`&WHOLE`/
 The exact demotion site was not pinned down, but the fix is idempotent:
 **`%install-runtime-cl-macros` (mvm/runtime-cl-macros.lisp) now re-runs
 `%export-standard-cl-symbols` at its tail.**  It runs at the end of boot in
-BOTH build-generic and build-ansi-test, so `&REST` is now :external
+BOTH build-generic and build-x64-linux, so `&REST` is now :external
 everywhere (also a latent ANSI-conformance fix — CLHS requires it).
 Verified: `(find-symbol "&REST" 'cl)` => `:external`.
 

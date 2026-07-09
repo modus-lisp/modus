@@ -1733,7 +1733,7 @@
   ;; VARIABLE passed to make-package / find-package, instead of treating
   ;; it as a literal designator.  print-symbols 22207/22212/22213 fail
   ;; NOT because of cl-eval but because the build-time
-  ;; rewrite-package-iteration (build-ansi-test.lisp ~L942) stringifies
+  ;; rewrite-package-iteration (build-x64-linux.lisp ~L942) stringifies
   ;; the bare variable `pkg-name` into the string "PKG-NAME" BEFORE
   ;; compilation — so the generated thunk makes a package literally named
   ;; "PKG-NAME".  These probes route through (eval '...) → cl-eval's
@@ -2230,7 +2230,7 @@
   ;; (make-instance scaffold ...) returned NIL, then check-scaffold-copy
   ;; tried to use NIL as a struct → SIGSEGV → file fork crashed before any
   ;; test ran.  Fix: override make-scaffold-copy / check-scaffold-copy in
-  ;; build-aarch64-linux-ansi-test.lisp's "Aux overrides" section to use
+  ;; build-aarch64-linux.lisp's "Aux overrides" section to use
   ;; the defstruct ctor (make-scaffold) instead.
   (handler-case
       (let* ((x (copy-tree '(a b c d e f)))
@@ -4225,7 +4225,7 @@
   ;; %eval-escape'ing; uiop's merge-pathname-directory-component uses ECASE
   ;; and the asdf gauntlet halted at form 56 until this landed.
   ;;
-  ;; These have NO ANSI-binary probe here on purpose: build-ansi-test.lisp
+  ;; These have NO ANSI-binary probe here on purpose: build-x64-linux.lisp
   ;; does not load runtime-cl-macros.lisp, so `*modus-runtime-macros*` is
   ;; unbound and the runtime ECASE/CCASE/CTYPECASE definitions are simply not
   ;; present in this binary (the compiled ANSI data-and-control tests use
@@ -5922,7 +5922,7 @@
       ;; source's make-array calls into cons-wrapper helper calls
       ;; before these probes reach the compiler.  These probes live in
       ;; ansi-tests.lisp which is NOT in the rewriter pipeline (per
-      ;; build-ansi-test.lisp's pipeline application sites), so they
+      ;; build-x64-linux.lisp's pipeline application sites), so they
       ;; exercise the compile-time path directly.
       ;; ----------------------------------------------------------------
       ;; 56420 — plain integer dim still fast-paths to flat 1-D

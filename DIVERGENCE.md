@@ -82,9 +82,9 @@ in the next pass.
   expands to `(unless typep (error))`; tests want `store-value` restart
   to correct the place.
 - `restart-case` options — `:test` `:report` `:interactive` discarded
-  by the build-script rewriter at `mvm/build-ansi-test.lisp:1769`.
+  by the build-script rewriter at `mvm/build-x64-linux.lisp:1769`.
 - `with-condition-restarts` — prior agent attempt regressed; left as
-  `(progn body)` stub at `mvm/build-ansi-test.lisp:1825`.
+  `(progn body)` stub at `mvm/build-x64-linux.lisp:1825`.
 - `restart-bind` return-from across closure body — needs compiler /
   runtime block-tag setjmp.
 
@@ -99,7 +99,7 @@ in the next pass.
 ### Streams
 
 - `with-output-to-string` with 2nd arg — rewriter ignores target-string
-  arg; needs fill-pointer-aware string sink.  *(build-ansi-test.lisp
+  arg; needs fill-pointer-aware string sink.  *(build-x64-linux.lisp
   ~line 1356)*
 - `read-sequence` / `write-sequence` — partial.
 - Binary streams (`:element-type '(unsigned-byte 8)`) — partial.
@@ -108,7 +108,7 @@ in the next pass.
 ### Build-time test-helpers (rewriter stubs)
 
 - `handle-non-abort-restart` — stub returns `'fail` instead of
-  checking restarts.  *(build-ansi-test.lisp ~line 2389)*
+  checking restarts.  *(build-x64-linux.lisp ~line 2389)*
 - Various `make-int-list` / aux helpers — partial.
 
 ### Eval-time machinery

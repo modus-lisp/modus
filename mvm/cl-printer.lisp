@@ -1462,7 +1462,7 @@
 ;;; The innermost block's state lives at the head of *%pp-ctx*, a
 ;;; stack of state arrays #(stream list count listp).  The
 ;;; pprint-logical-block macro (expanded by the build-side rewriter
-;;; in build-ansi-test.lisp) calls %pprint-lb-begin to push a fresh
+;;; in build-x64-linux.lisp) calls %pprint-lb-begin to push a fresh
 ;;; state, runs the body inside a CATCH '%pp-tag, then calls
 ;;; %pprint-lb-end to pop — so there is no fragile rebinding of
 ;;; multiple non-CLHS specials.  pprint-pop / pprint-exit read the

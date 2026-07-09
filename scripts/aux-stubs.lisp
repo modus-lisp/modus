@@ -95,7 +95,7 @@
 
 ;;; signals-error — ansi-aux.lsp's defmacro at line 262 wraps the body in
 ;;; (not (catch 0 form t)) which does NOT actually catch CL errors — it
-;;; catches THROW to tag 0 only.  The build-ansi-test.lisp rewriter
+;;; catches THROW to tag 0 only.  The build-x64-linux.lisp rewriter
 ;;; converts it at compile time to a real handler-case, but our per-file
 ;;; runner uses the generic /tmp/modus build with no rewrite — runtime
 ;;; EVAL would inherit the broken catch-0 version.  Override here.

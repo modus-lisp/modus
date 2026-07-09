@@ -30,7 +30,7 @@ measured against an up-to-date binary.
 ## First thing to do back at the keyboard
 
 ```sh
-sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp
+sbcl --dynamic-space-size 2048 --script mvm/build-x64-linux.lisp
 /tmp/modus-ansi-test | grep -E '^(P|FAIL ).?91[03][0-3]'
 ```
 
@@ -54,7 +54,7 @@ scripts/fragility-fuzzer.sh    # 9 builds × ~22min ≈ 3-4 hours
 ```
 
 Then diff the per-N pass sets to get the current flippy list, with
-*test names* (look up via `build-ansi-test.lisp`'s ID-to-name dump).
+*test names* (look up via `build-x64-linux.lisp`'s ID-to-name dump).
 Only after that do the "what to fix next" question.
 
 ### 2. The two remaining flippy CLOS tests (27084, 27465)
@@ -106,7 +106,7 @@ into fixed slots:
   - `0x10000C50` — si_addr     (siginfo+16)
   - `0x10000C58` — ucontext ptr itself
 
-`%record-test-fail` (in build-ansi-test.lisp) prints all five
+`%record-test-fail` (in build-x64-linux.lisp) prints all five
 divided by 4 (to keep print-dec on the fast path; raw values lose
 low 2 bits in the sar+and chain).  Multiply by 4 to recover real
 addresses.

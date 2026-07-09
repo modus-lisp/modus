@@ -3627,11 +3627,11 @@
 
    The kind bitmap lives at [+mcgc-cfg-bitmap-addr+] + +mcgc-kindbitmap-delta+
    (#x804000) — a LINUX-x64 layout constant (boot-linux-x64.lisp asserts it).
-   Bare-metal x64 (boot-x64.lisp, e.g. build-x64-modus-ansi-test) lays the
+   Bare-metal x64 (boot-x64.lisp, e.g. build-x64) lays the
    metadata out DIFFERENTLY, so that delta is wrong there.  Until the base is
    made layout-agnostic (a config word filled by each boot, or a lazy compute
    from page_count/freelist_base like emit-mcgc-pincount-init), the feature is
-   gated ON only by the Linux builds (build-generic / build-ansi-test).  When
+   gated ON only by the Linux builds (build-generic / build-x64-linux).  When
    NIL, NO kind-bitmap code is emitted (set / check / clear), so non-Linux
    x64 and GC-less builds are byte-identical to before this change.")
 

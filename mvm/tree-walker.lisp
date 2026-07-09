@@ -3,13 +3,13 @@
 ;;;; WS3 STEP 4 (2026-07-09): production eval is eval2 (compile to MVM
 ;;;; bytecode via the self-hosted compiler + mvm-interpret); this engine was
 ;;;; extracted VERBATIM from cl-eval.lisp (STEP 4a: QUARANTINE).  Loaded by:
-;;;;   - the legacy fork builds (build-aarch64-ansi-test,
-;;;;     build-aarch64-linux-ansi-test, build-x64-modus-ansi-test),
+;;;;   - the legacy fork builds (build-aarch64,
+;;;;     build-aarch64-linux, build-x64),
 ;;;;     where it IS the eval engine — each
 ;;;;     defines the (defun eval2 (form) (%eval-in-env form nil)) bridge in
 ;;;;     its own source list, and the two engine-provider overrides at the
 ;;;;     bottom of this file win last-defun-wins (load AFTER ansi-bridge).
-;;;;   - the PRODUCTION images (build-ansi-test, build-generic), where it is
+;;;;   - the PRODUCTION images (build-x64-linux, build-generic), where it is
 ;;;;     ONLY the %e2ic fallback for interp-closure shapes eval2's
 ;;;;     %e2ic-compile cannot yet serve (loaded BEFORE eval2.lisp so eval2's
 ;;;;     overrides win; *e2ic-fallback-count* measures the remaining
@@ -2656,7 +2656,7 @@
              (%eval-progn (cdr args) env)
              nil)))
       ;; HANDLER-BIND — (handler-bind ((TYPE FN-FORM)*) BODY*)
-      ;; Mirrors build-ansi-test.lisp's compile-time rewrite into a
+      ;; Mirrors build-x64-linux.lisp's compile-time rewrite into a
       ;; %with-handler-bind call.  Each binding's FN-FORM is evaluated
       ;; in the surrounding env to produce the handler closure; the body
       ;; runs inside a thunk so %with-handler-bind can establish the
@@ -2681,7 +2681,7 @@
       ((%eval-sym-eq op "WITH-SIMPLE-RESTART")
        (%eval-progn (cdr args) env))
       ;; RESTART-CASE — (restart-case PROTECTED-FORM (NAME (ARGS) [:report …] BODY)*)
-      ;; Mirrors build-ansi-test.lisp's compile-time rewrite into a
+      ;; Mirrors build-x64-linux.lisp's compile-time rewrite into a
       ;; %with-restarts call.  Compiled %with-restarts handles the
       ;; runtime restart frame + INVOKE-RESTART dispatch directly; we
       ;; just hand it lists of (NAME interp-closure REPORT) and a

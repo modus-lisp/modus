@@ -922,7 +922,7 @@
 ;;;   (random-from-seq +standard-chars+)
 ;;; for the pad character; with +standard-chars+ NIL the pad char is
 ;;; garbage and every padding assertion fails.  defvar init-thunks do not
-;;; run at boot, so these are ALSO setq'd in build-ansi-test's kernel-main.
+;;; run at boot, so these are ALSO setq'd in build-x64-linux's kernel-main.
 (defvar +standard-chars+
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~!@#$%^&*()_+|\\=-`{}[]:\";'<>?,./
  ")
@@ -1333,7 +1333,7 @@
 ;;; ============================================================
 ;;; These are macros in standard CL, but we implement them as
 ;;; functions here as stubs. The real expansion happens at
-;;; SBCL-rewrite level in build-ansi-test.lisp.
+;;; SBCL-rewrite level in build-x64-linux.lisp.
 
 ;;; ============================================================
 ;;; float/number utility stubs
@@ -4629,7 +4629,7 @@
 ;; -------------------------------------------------------------------
 ;; %make-array-fill-init / %make-array-fill-list / %make-array-fill-vec
 ;;
-;; Used by build-ansi-test's rewrite-make-array-initcontents to keep
+;; Used by build-x64-linux's rewrite-make-array-initcontents to keep
 ;; the per-test expansion small.  The previous in-line expansion
 ;;   (let ((tmp (make-array N)))
 ;;     (aset tmp 0 v) (aset tmp 1 v) ... (aset tmp (1- N) v)
@@ -4661,7 +4661,7 @@
 ;; lookup, etc.) aren't yet propagated through aref/aset/length.
 
 ;; make-array-with-checks: real defun is in the aux-overrides section
-;; of build-ansi-test.lisp (loads AFTER array-aux.lsp's complex &key+&aux
+;; of build-x64-linux.lisp (loads AFTER array-aux.lsp's complex &key+&aux
 ;; version which the compiler can't faithfully handle).
 
 

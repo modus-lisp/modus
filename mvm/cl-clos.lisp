@@ -4662,7 +4662,7 @@
     (t (error "ARRAY-RANK: ~S is not an array" a))))
 (defun adjustable-array-p (a)
   "True iff A was created with :adjustable t.  Detected by the outer
-   marker (cons 8765432 ...) the build-ansi-test rewriter emits.
+   marker (cons 8765432 ...) the build-x64-linux rewriter emits.
    Native MDA #x34: per CL we can return T (adjustability is allowed)
    but to match the suite's expectations we only return T for MDAs that
    have a fp or were created with explicit adjustable hint.  Pragmatic:

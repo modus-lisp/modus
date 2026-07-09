@@ -10,7 +10,7 @@
 ;;;;   sbcl --script mvm/build-generic.lisp   # → /tmp/modus
 ;;;;   /tmp/modus path/to/script.lisp         # boot, LOAD it, exit
 ;;;;
-;;;; The build cycle is dramatically shorter than build-ansi-test.lisp
+;;;; The build cycle is dramatically shorter than build-x64-linux.lisp
 ;;;; because we don't read 700+ test .lsp files at SBCL time and emit
 ;;;; rewritten run-test forms for each.  A typical full rebuild is on
 ;;;; the order of ~30s instead of ~4-5 minutes.
@@ -391,7 +391,7 @@
 (format t "  bridge:  ~D chars~%" (length *bridge-source*))
 
 ;;; ============================================================
-;;; 3. Build-time scanners (same as build-ansi-test) so runtime LOAD
+;;; 3. Build-time scanners (same as build-x64-linux) so runtime LOAD
 ;;; can find every defun's source — without these the symbol-function
 ;;; table only knows the ~229 hand-curated entries from
 ;;; cl-eval.lisp's %init-sft-list and runtime-EVAL of any other name
@@ -857,7 +857,7 @@
 
 ;; Enable the GC trampoline: without this, every :alloc-obj advances R12
 ;; unchecked and the heap walks past the mapped region in long-running
-;; sessions.  build-ansi-test / build-x64-modus-ansi-test set this; we
+;; sessions.  build-x64-linux / build-x64 set this; we
 ;; need it too so the generic image survives ANSI sweeps.
 (setf modus.mvm.x64::*x64-gc-enabled* t)
 ;; Linux-x64 layout: enable the CONS-KIND bitmap (GC correctness fix for the

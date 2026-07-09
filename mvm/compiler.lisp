@@ -391,7 +391,7 @@
 
 (defvar *clhs-extra-specials* nil
   "Per-file allowlist of additional special-variable name strings,
-   populated by build-ansi-test.lisp from `(declaim (special X))`
+   populated by build-x64-linux.lisp from `(declaim (special X))`
    forms it sees before stripping them.  ANSI test files use
    declaim to mark their own dynamic vars (most commonly *x*) so
    methods inside `(eval '(defgeneric …))` see the binding from
@@ -983,7 +983,7 @@
    (keyed at #x10000080).  Identical to NORMALIZE-NAME on the host (and for
    the native build, where *mvm-emit-halves* is NIL and this is byte-for-byte
    NORMALIZE-NAME).  The in-image eval2 build OVERRIDES this (see
-   build-ansi-test.lisp's stage-2 block) to read a native symbol's STORED
+   build-x64-linux.lisp's stage-2 block) to read a native symbol's STORED
    hash slot directly: a symbol whose name isn't in the build's reverse
    *sym-name-table* (e.g. *cons-test-4* from the unscanned cons/ test dir)
    has SYMBOL-NAME = \"\", so NORMALIZE-NAME would compute compute-name-hash(\"\")
@@ -2616,7 +2616,7 @@
   ;; (:internal :external :inherited) — passed quoted so the helper sees
   ;; the keyword list, not evaluated forms.
   ;;
-  ;; This mirrors the build-side rewrite (build-ansi-test.lisp ~2938) but
+  ;; This mirrors the build-side rewrite (build-x64-linux.lisp ~2938) but
   ;; lives in *macro-table*, which both the compiler AND runtime EVAL /
   ;; macroexpand consult — so macro-hidden and runtime-constructed WPI
   ;; forms now expand (the rewriter only saw literal source forms).
@@ -2824,7 +2824,7 @@
   ;; ===========================================================
   ;; CORE CLOS for eval2 (the compile-then-interpret path).
   ;;
-  ;; eval2-forms compiles via mvm-compile-toplevel (NOT the build-ansi-test
+  ;; eval2-forms compiles via mvm-compile-toplevel (NOT the build-x64-linux
   ;; SBCL-side rewriter), so DEFCLASS/DEFGENERIC/DEFMETHOD/MAKE-INSTANCE were
   ;; never recognised — they compiled as ordinary calls to UNDEFINED-FUNCTION,
   ;; and the class/slot/accessor symbol args read as "implicit global"
@@ -4123,7 +4123,7 @@
        (compile-handler-case (cadr form) (cddr form) env dest nil))
       ;; HANDLER-BIND — expand to the runtime %with-handler-bind
       ;; (cl-conditions.lisp).  Same shape the build-time rewriter
-      ;; (build-ansi-test.lisp) and the tree-walker (cl-eval.lisp) use,
+      ;; (build-x64-linux.lisp) and the tree-walker (cl-eval.lisp) use,
       ;; so all three engines share one runtime implementation.  Before
       ;; this case, eval2 compiled HANDLER-BIND as an ORDINARY CALL —
       ;; the binding list was evaluated as a function call (usually
@@ -4510,7 +4510,7 @@
       ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
       ;; AArch64 Linux *at fileio helpers — see translate-aarch64.lisp traps
       ;; 0x0506..0x050A and the cl-fileio override block in
-      ;; build-aarch64-linux-ansi-test.lisp.  Not callable on bare-metal
+      ;; build-aarch64-linux.lisp.  Not callable on bare-metal
       ;; or x64 (the trap codes are gated on *aarch64-linux-mode* and
       ;; emit garbage on other targets — the build script doesn't emit
       ;; calls to these unless we're in Linux/AArch64 mode).
@@ -5461,7 +5461,7 @@
 ;;; runs that clause body IN BYTECODE.
 ;;;
 ;;; The NATIVE build + the tree-walker are unaffected: they never reach this
-;;; compiler path — in NON-diff mode build-ansi-test.lisp still rewrites
+;;; compiler path — in NON-diff mode build-x64-linux.lisp still rewrites
 ;;; restart-case to (%with-restarts …) (the native run-ansi-* runners depend
 ;;; on it), and cl-eval.lisp's tree-walker calls %with-restarts directly.
 ;;; Only the in-image compiler (eval2 / self-host) sees restart-case as a form
@@ -5514,7 +5514,7 @@
                (setf remaining (cddr remaining)))
               (t (setf body-forms remaining) (return)))))
         ;; Coerce an option value into a form yielding a function (or a
-        ;; string for :report).  Mirrors build-ansi-test's opt-fn-form.
+        ;; string for :report).  Mirrors build-x64-linux's opt-fn-form.
         (flet ((opt-fn-form (opt allow-string)
                  (cond
                    ((null opt) nil)

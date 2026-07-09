@@ -309,7 +309,7 @@ the parent process at the diag point reports
 `DIAG-CLASS-01-FOUND: N` and `DIAG-MAKE-INSTANCE-NIL: Y` — i.e.
 the parent's `*clos-classes*` does NOT contain `class-01`.  Each
 test file's run-ansi-X holds only the file's *own* %defclass calls
-(see comment at build-ansi-test.lisp:1624).  reinitialize-instance.lsp
+(see comment at build-x64-linux.lisp:1624).  reinitialize-instance.lsp
 itself defines `reinit-class-01` but not `class-01` — yet the tests
 that say `(make-instance 'class-01)` PASS at certain layouts.
 
@@ -365,7 +365,7 @@ diff is what's left to pin the precise mechanism.  The probe code
 
 To probe inside the failing fork, the equivalent diag would need to
 be injected into the rewritten run-ansi-reinitialize-instance body
-(via build-ansi-test.lisp's per-file source emitter).
+(via build-x64-linux.lisp's per-file source emitter).
 
 ## Open questions / deeper fragility
 

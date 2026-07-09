@@ -227,7 +227,7 @@ outer handler-case catches it; the fork dies.
 
 ### The workaround
 
-In `mvm/build-ansi-test.lisp`, replaced the wrapper for id 16510 with
+In `mvm/build-x64-linux.lisp`, replaced the wrapper for id 16510 with
 a bare `(%test-crash-fail 16510)` (no `handler-case`, no `run-test`
 call). The file's fork now records the pre-stamped FAIL for 16510 and
 continues into tests 16511..16622. 113 downstream tests recovered +
@@ -468,7 +468,7 @@ parses first.
 
 ## How the harness works
 
-`mvm/build-ansi-test.lisp` builds `/tmp/modus-ansi-test`. It:
+`mvm/build-x64-linux.lisp` builds `/tmp/modus-ansi-test`. It:
 
 1. Loads all `cl-*.lisp` plus `ansi-bridge.lisp` into a big source
    string (`*bridge-source*`).
@@ -570,7 +570,7 @@ is active; regenerate with the diagnostic below.
 
 ## Diagnostics tried this session
 
-### TRY markers (in `build-ansi-test.lisp`, reverted)
+### TRY markers (in `build-x64-linux.lisp`, reverted)
 
 Add to the codegen loop emit a `(when *try-markers-on* (write-string-serial
 "\nTRY ") (print-dec ID) (write-char-serial 10))` before each per-test
@@ -593,7 +593,7 @@ passes by ~66. Something about the extra code per test (stale spill
 slot? cache effect?) pushes files past their SIGALRM budget. Only turn
 it on for one-shot diagnostic runs.
 
-### rdtsc per-test profiler (in `build-ansi-test.lisp` + `compiler.lisp`, reverted)
+### rdtsc per-test profiler (in `build-x64-linux.lisp` + `compiler.lisp`, reverted)
 
 Same idea — wrap run-test with `(let ((t0 (rdtsc))) body (%record-slow-test
 id (- (rdtsc) t0)))`. `compile-rdtsc` needed a SHL +fixnum-shift+ after
@@ -642,7 +642,7 @@ grep -oE "run-test(-mv)? [0-9]+" /tmp/real-ansi-gen.lisp | awk '{print $NF}' \
 - **defvar doesn't run its init thunk** at runtime. ANY fresh `defvar
   *foo* val` resolves to NIL at runtime. Explicit `(setq *foo* val)`
   in the parent's main entry is required. Session added ~20 such
-  initializers to `build-ansi-test.lisp`. Full list: char-code-limit,
+  initializers to `build-x64-linux.lisp`. Full list: char-code-limit,
   call-arguments-limit, most-*-fixnum, *should-always-be-true*,
   *use-random-byte*, *random-readable*, *hash-table-test-iters*,
   *type-list*, *supertype-table*, *defclass-slot-*, *mapc.6-var*,
@@ -672,7 +672,7 @@ grep -oE "run-test(-mv)? [0-9]+" /tmp/real-ansi-gen.lisp | awk '{print $NF}' \
   failures (cl-symbols has 1002, bit-* each ~27, so none hit it now)
   would have FAILs silently dropped past that point.
 
-- **FORMAT directives with `~` in comments in build-ansi-test.lisp will
+- **FORMAT directives with `~` in comments in build-x64-linux.lisp will
   explode during the format-nil of the per-fork source string.** Don't
   write "~200ms" in source comments; use "200ms" or escape the `~~`.
 

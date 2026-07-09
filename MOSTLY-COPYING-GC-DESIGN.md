@@ -160,7 +160,7 @@ stages 1-2 left it.
 
 ## (obsolete) CONSTRAINT: init in Lisp, never grow the boot preamble
 The linux-x64 boot preamble size is load-bearing: `*x64-native-code-offset*`
-is hardcoded per build script (351 in build-ansi-test) and drives the
+is hardcoded per build script (351 in build-x64-linux) and drives the
 function-entry NOP-alignment (keeps fn starts off nibble 0x1).  Adding bytes to
 boot/boot-linux-x64.lisp WITHOUT bumping that offset mis-aligns functions →
 deterministic NIL-deref crashes (learned the hard way, stage 3a).  Therefore:

@@ -1267,7 +1267,7 @@
             (rfn    (cadr r))
             (report (caddr r))
             ;; 4th / 5th spec elements: :interactive fn and :test fn
-            ;; (build-ansi-test.lisp's restart-case macro now threads
+            ;; (build-x64-linux.lisp's restart-case macro now threads
             ;; these through; older 3-element specs leave them NIL).
             (interactive (cadddr r))
             (test (car (cddddr r))))

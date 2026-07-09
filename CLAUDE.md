@@ -147,7 +147,7 @@ Now the harness:
 - Writes one "+" byte per pass to stdout immediately (no buffering,
   survives any later crash); the summary counts those bytes.
 
-Build: `sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp`
+Build: `sbcl --dynamic-space-size 2048 --script mvm/build-x64-linux.lisp`
 Run with summary: `./scripts/ansi-summary.sh` (runs binary, prints honest pass/fail/lost counts)
 
 ### CL Implementation Status
@@ -199,11 +199,11 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 
 Production `eval`/`load` are **eval2 ONLY** (compile the form to MVM bytecode
 via the self-hosted compiler, run it through `mvm-interpret`).  As of STEP 4b
-(13526a6, 2026-07-09) the production images (build-ansi-test, build-generic)
+(13526a6, 2026-07-09) the production images (build-x64-linux, build-generic)
 contain ZERO tree-walker code: the walker (`%eval-in-env` + its ~48-function
 engine) lives in **mvm/tree-walker.lisp**, loaded ONLY by the three legacy fork
-builds (build-aarch64-ansi-test, build-aarch64-linux-ansi-test,
-build-x64-modus-ansi-test — the bare-metal x64 ANSI runner), each of which also defines
+builds (build-aarch64, build-aarch64-linux,
+build-x64 — the bare-metal x64 ANSI runner), each of which also defines
 the `(defun eval2 (form) (%eval-in-env form nil))` bridge in its own build
 script.  The deletion gate was MEASURED: an instrumented census (every %e2ic
 fallback site printing its shape) showed ZERO walker hits across the full ANSI
@@ -468,7 +468,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## MVM Compiler — Source-Quality Guardrails
 
-- **`check-parses` at build time**: Build scripts (`build-ansi-test.lisp`, `build-fixpoint.lisp`, `build-mvm.lisp`) call `modus.mvm::check-parses` on every first-party source file before reading it. A paren mismatch in `%format-impl` once hid behind the lenient in-build reader for weeks, presenting as a fake "late cond branch miscompilation". `check-parses` fails fast with the specific file and error so this can't recur silently. If you write a new build script, wire it into your `mvm-text` wrapper.
+- **`check-parses` at build time**: Build scripts (`build-x64-linux.lisp`, `build-fixpoint.lisp`, `build-mvm.lisp`) call `modus.mvm::check-parses` on every first-party source file before reading it. A paren mismatch in `%format-impl` once hid behind the lenient in-build reader for weeks, presenting as a fake "late cond branch miscompilation". `check-parses` fails fast with the specific file and error so this can't recur silently. If you write a new build script, wire it into your `mvm-text` wrapper.
 - **`compile-call` warns on list-headed non-lambda fn**: The old fallback silently emitted `CALL-INDIRECT` on whatever the "function expression" evaluated to, which routed every downstream cond clause through T/NIL indirection for the `~( ~)` paren bug. Now any `((test) body)`-shaped fn (other than `(lambda …)` or `(setf NAME)`) prints `;; WARN compile-call: …` to stderr with the source location. The code still emits the indirect call so ANSI tests that deliberately construct bad callables keep compiling.
 
 ## MVM Compiler — Active Limitations

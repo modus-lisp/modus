@@ -1,8 +1,8 @@
-;;;; build-ansi-test.lisp — Build ANSI CL test runner (Linux x86-64)
+;;;; build-x64-linux.lisp — Build ANSI CL test runner (Linux x86-64)
 ;;;;
 ;;;; Produces /tmp/modus-ansi-test — runs ANSI CL conformance tests.
 ;;;;
-;;;; Usage: sbcl --dynamic-space-size 2048 --script mvm/build-ansi-test.lisp
+;;;; Usage: sbcl --dynamic-space-size 2048 --script mvm/build-x64-linux.lisp
 ;;;; Run:   /tmp/modus-ansi-test
 ;;;;
 ;;;; Output: FAIL lines for each failing test, then summary: N/M PASS or FAIL

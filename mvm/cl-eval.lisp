@@ -4029,16 +4029,6 @@
       (%gf-dispatch (%gf-name fn) (list a b c d))
       (%signal-undefined-function)))
 
-;; Walker-bridge DEFAULT for builds that do not embed the self-hosted
-;; compiler (the arch-fork build scripts that load cl-eval.lisp without
-;; eval2.lisp: build-aarch64-ansi-test, build-aarch64-linux-ansi-test,
-;; build-with-compiler, build-x64-modus-ansi-test).  In eval2-enabled
-;; builds eval2.lisp loads AFTER this file and its real (defun eval2 …)
-;; wins (last-defun-wins), so this shim is dead code there.  When
-;; %eval-in-env is deleted (Phase-3 STEP 4) this shim must go with it —
-;; at that point the fork builds must embed eval2 or be retired.
-(defun eval2 (form) (%eval-in-env form nil))
-
 (defun eval (form)
   "Evaluate FORM in the null lexical environment (CLHS).
 

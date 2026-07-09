@@ -88,6 +88,15 @@
     (string #\Newline)
     (mvm-text "mvm/cl-eval.lisp")
     (string #\Newline)
+    ;; Walker-bridge for this non-eval2 fork build: shared cl-eval.lisp's EVAL
+    ;; is (eval2 form) unconditionally (WS3 Phase-3); this build does not embed
+    ;; the self-hosted compiler, so route eval2 to the tree-walker here.  Kept
+    ;; OUT of cl-eval.lisp: a second (defun eval2 ...) in shared source made the
+    ;; eval2-enabled ANSI image's by-name resolution ambiguous and regressed the
+    ;; macro chunk families (CHUNK-CRASH 0->16).  When %eval-in-env is deleted
+    ;; (STEP 4) this build must embed eval2 or be retired.
+    "(defun eval2 (form) (%eval-in-env form nil))"
+    (string #\Newline)
     (mvm-text "mvm/cl-clos.lisp")
     (string #\Newline)
     (mvm-text "mvm/cl-types.lisp")

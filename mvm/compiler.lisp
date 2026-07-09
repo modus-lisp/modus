@@ -14331,12 +14331,30 @@
            ;; Use FN-ADDR opcode so the translator can map bytecode offset
            ;; to native code address. Plain LI would load the bytecode offset
            ;; which is NOT a valid native address for CALL-IND.
+           ;;
+           ;; UNKNOWN name: emit the #xFFFFFFF0 sentinel, NOT offset 0.
+           ;; Offset 0 is the FIRST REAL FUNCTION's bytecode offset, so the
+           ;; old fallback made #'MISSING-FN a live tagged pointer to the
+           ;; image code base; CALL-IND's tag-strip then landed 3 bytes
+           ;; EARLY (the code base is not 4-aligned) inside boot-stub
+           ;; padding, and the resulting garbage execution depended on
+           ;; arbitrary boot immediates — silently returning on one build,
+           ;; SIGILL→stale-condition-longjmp (the format-d/macrolet/times
+           ;; CHUNK-CRASH class) on the next.  The sentinel misses every
+           ;; fn-table (native translate loads NIL → funcall signals
+           ;; UNDEFINED-FUNCTION, CLHS-correct) and sits above
+           ;; +mvm-runtime-call-base+ (in-image interp resolves it to NIL
+           ;; the same way).
            (let* ((fn-name (third insn))
                   (fn-info (gethash fn-name *functions*)))
+             (unless (or fn-info *eval2-runtime-p*)
+               (format *error-output*
+                       ";; WARN li-func: unresolved function ~A — emitting NIL sentinel~%"
+                       fn-name))
              (mvm-fn-addr buf (second insn)
                           (if fn-info
                               (function-info-bytecode-offset fn-info)
-                              0))))
+                              #xFFFFFFF0))))
 
           ;; ---- Branches (1 opcode + 4 off32 = 5 bytes) ----
           (:br

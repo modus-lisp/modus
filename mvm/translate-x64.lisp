@@ -3202,8 +3202,14 @@
                  ;; is 16-byte (or better) aligned by NOP-padding so
                  ;; the low nibble is 0 — OR-3 gives a clean tag value.
                  (emit-or-reg-imm buf d 3))
-               ;; Unknown target — load 0 (untagged; would fault on call)
-               (emit-mov-reg-imm buf d 0))
+               ;; Unknown target (the compiler's #xFFFFFFF0 unresolved-name
+               ;; sentinel) — load NIL so funcall's NIL-guard signals
+               ;; UNDEFINED-FUNCTION.  The old `0' was a live but
+               ;; misaligned code-base pointer: CALL-IND's -3 tag strip
+               ;; landed in boot-stub padding and executed whatever bytes
+               ;; the boot immediates happened to be (the CHUNK-CRASH
+               ;; regression class — see compiler.lisp :li-func).
+               (emit-mov-reg-imm buf d #xDEAD0001))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================

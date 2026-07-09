@@ -707,7 +707,25 @@
    production images — is gated on driving this to ZERO across the full
    ANSI corpus + gauntlet: every hit is an eval2 capability gap (measured
    2026-07-09: ~142 corpus tests across the macrolet-declare / some /
-   times / format-radix / defmacro-tail families).")
+   times / format-radix / defmacro-tail families).
+   BOOTS AS NIL, not 0: defvar init-thunks never run in the ANSI image
+   (CLAUDE.md Active Limitation 7) — increment ONLY via %e2ic-bump-fallback.")
+
+(defun %e2ic-bump-fallback ()
+  "NIL-safe increment of *e2ic-fallback-count*.  The defvar's `0' init-form
+   never runs (init-all-globals is skipped in the ANSI image), so the
+   counter boots as NIL.  A bare (+ 1 NIL) tag-checks into GENERIC-ADD,
+   whose (t (%fixnum-+ a b)) clause silently returns NIL+2 = #xDEAD0003;
+   further bumps walk the garbage to #xDEAD0009 — OBJECT tag 9 — after
+   which the first obj-subtag predicate (bignump etc.) dereferences the
+   unmapped #xDEAD0000 header → SIGSEGV inside the walker-fallback /
+   deftype-expansion path (i.e. mid-macroexpansion or mid-typep during
+   handler-case condition matching), which leaks signal-dispatch state and
+   let conditions escape the per-form handler-case → the CHUNK-CRASH
+   regression on the fallback families (format-b/d/o/x, macrolet, some,
+   notany, times, defmacro, handler-case…)."
+  (setq *e2ic-fallback-count*
+        (if *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*) 1)))
 
 (defun %call-interp-closure (fn args)
   "OVERRIDE (eval2 images; last-defun-wins) of cl-eval.lisp's engine stub:
@@ -719,7 +737,7 @@
   (let ((c (%e2ic-cached fn)))
     (cond
       ((eq c (quote :e2ic-walker))
-       (setq *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*))
+       (%e2ic-bump-fallback)
        (%call-interp-closure-walker fn args))
       (c (%e2ic-apply c args))
       (t
@@ -728,13 +746,13 @@
          (if tramp
              (%e2ic-apply tramp args)
              (progn
-               (setq *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*))
+               (%e2ic-bump-fallback)
                (%call-interp-closure-walker fn args))))))))
 
 (defun %e2ic-deftype-walker (entry args)
   "The walker deftype expansion — %bind-params the registered lambda list to
    the UNEVALUATED type args, %eval-progn the body (tree-walker.lisp)."
-  (setq *e2ic-fallback-count* (+ 1 *e2ic-fallback-count*))
+  (%e2ic-bump-fallback)
   (let ((env (%bind-params (car entry) args nil)))
     (%eval-progn (cdr entry) env)))
 

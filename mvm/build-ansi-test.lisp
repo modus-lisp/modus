@@ -4493,7 +4493,7 @@
                      ~%            (setq hit t)))~
                      ~%        hit)~
                      ~%      nil))~
-                     ~%(defun %record-chunk-crash (file-name file-hash chunk-num)~
+                     ~%(defun %record-chunk-crash (file-name file-hash chunk-num c)~
                      ~%  (when (> *fork-shm-addr* 0)~
                      ~%    (let* ((base *fork-shm-addr*)~
                      ~%           (n    (mem-ref (+ base 4) :u32)))~
@@ -4507,10 +4507,36 @@
                      ~%  (write-string-serial file-name)~
                      ~%  (write-string-serial \" CHUNK=\")~
                      ~%  (print-dec chunk-num)~
+                     ~%  ;; DIAG: the escaped condition + last SIGSEGV slots (same as~
+                     ~%  ;; %record-test-fail) so a chunk-level escape is debuggable.~
+                     ~%  (write-string-serial \" COND:\")~
+                     ~%  (setq *write-object-budget* 80)~
+                     ~%  (handler-case (write-object c) (t (e) nil))~
+                     ~%  (let ((rip  (mem-ref #x10000C30 :u64))~
+                     ~%        (site (mem-ref #x10000C40 :u64))~
+                     ~%        (rax  (mem-ref #x10000C48 :u64))~
+                     ~%        (siad (mem-ref #x10000C50 :u64)))~
+                     ~%    (when (> rip 0)~
+                     ~%      (write-string-serial \" RIP/4=\") (print-dec (ash rip -1))~
+                     ~%      (write-string-serial \" SITE/4=\") (print-dec (ash site -1))~
+                     ~%      (write-string-serial \" RAX/4=\") (print-dec (ash rax -1))~
+                     ~%      (write-string-serial \" SI/4=\") (print-dec (ash siad -1))))~
                      ~%  (write-char-serial 10))~
                      ~%(defun %report-chunk-skip (file-name chunk-num)~
                      ~%  (write-char-serial 10)~
                      ~%  (write-string-serial \"CHUNK-SKIP FILE=\")~
+                     ~%  (write-string-serial file-name)~
+                     ~%  (write-string-serial \" CHUNK=\")~
+                     ~%  (print-dec chunk-num)~
+                     ~%  (write-char-serial 10))~
+                     ~%(defun %report-chunk-missing (file-name chunk-num)~
+                     ~%  ;; The chunk defun failed to COMPILE at build time (see the~
+                     ~%  ;; build's \"SKIP line\" report) so its #'run-ansi-X-chunk-N~
+                     ~%  ;; reference resolved to NIL (compiler.lisp :li-func~
+                     ~%  ;; unresolved-name sentinel).  Report instead of funcalling~
+                     ~%  ;; NIL (which would signal and count as a CHUNK-CRASH).~
+                     ~%  (write-char-serial 10)~
+                     ~%  (write-string-serial \"CHUNK-MISSING FILE=\")~
                      ~%  (write-string-serial file-name)~
                      ~%  (write-string-serial \" CHUNK=\")~
                      ~%  (print-dec chunk-num)~
@@ -4523,10 +4549,12 @@
                      ~%;; threshold breaks other tests in the same defun.)~
                      ~%(defun %try-chunk (file-name file-hash chunk-num thunk)~
                      ~%  (cond~
+                     ~%    ((null thunk)~
+                     ~%     (%report-chunk-missing file-name chunk-num))~
                      ~%    ((%chunk-crashed-p file-hash chunk-num)~
                      ~%     (%report-chunk-skip file-name chunk-num))~
                      ~%    (t (handler-case (funcall thunk)~
-                     ~%         (t (c) (%record-chunk-crash file-name file-hash chunk-num))))))~
+                     ~%         (t (c) (%record-chunk-crash file-name file-hash chunk-num c))))))~
                      ~%(defun %clear-fault-slots ()~
                      ~%  ;; Zero the SIGSEGV-handler diag slots so a FAIL caught~
                      ~%  ;; from a NON-SIGSEGV path (handler-case t-clause) doesn't~

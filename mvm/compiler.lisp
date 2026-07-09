@@ -1048,7 +1048,25 @@
              (expander (gethash name *macro-table*)))
         (cond
           (expander
-           (let ((result (funcall expander form)))
+           (let ((result
+                  (if *eval2-runtime-p*
+                      (funcall expander form)
+                      ;; BUILD-TIME salvage: a user-macro expander that
+                      ;; errors host-side (e.g. defmacro.3's body reads a
+                      ;; RUNTIME lexical var the null-lexenv host EVAL can't
+                      ;; see) used to propagate up to mvm-compile-all and
+                      ;; SKIP the WHOLE chunk defun — silently dropping all
+                      ;; sibling tests.  Expand to a runtime (error …) call
+                      ;; instead: the one form fails HONESTLY at runtime,
+                      ;; the rest of the chunk lives.  Not used under eval2
+                      ;; (runtime expander errors are catchable conditions
+                      ;; and must propagate normally).
+                      (handler-case (funcall expander form)
+                        (error (e)
+                          (format t "  WARN macroexpand ~A failed at build time (emitting runtime error): ~A~%"
+                                  (car form) e)
+                          `(error ,(format nil "compile-time macroexpansion of ~A failed"
+                                           (car form))))))))
              (if (eq result form)
                  (cons form nil)
                  (cons result t))))
@@ -1117,7 +1135,11 @@
   (let ((whole-var nil)
         (env-var nil)
         (rest-params nil))
-    ;; Hoist leading &WHOLE var.
+    ;; Hoist leading &WHOLE var.  CLHS 3.4.4.1.2 also allows &WHOLE to be
+    ;; followed by a DESTRUCTURING PATTERN (a list), which destructures
+    ;; the WHOLE macro form (operator included) — macrolet.36's
+    ;; (&whole (m a b) c d).  A pattern can't be LET-bound like a plain
+    ;; var; it's handled below via a wrapping DESTRUCTURING-BIND.
     (when (and (consp mparams)
                (symbolp (car mparams))
                (string= (symbol-name (car mparams)) "&WHOLE"))
@@ -1139,10 +1161,15 @@
       (setf rest-params (nreverse rest-params)))
     ;; Rebuild the destructuring pattern.
     (let* ((bindings (append
-                      (when whole-var (list (list whole-var 'form)))
+                      (when (and whole-var (symbolp whole-var))
+                        (list (list whole-var 'form)))
                       (when env-var (list (list env-var nil)))))
            (db-form `(destructuring-bind (,@rest-params) (cdr form)
                        ,@mbody)))
+      ;; &WHOLE destructuring pattern: bind the pattern against the whole
+      ;; form around the (cdr form) destructure.
+      (when (consp whole-var)
+        (setf db-form `(destructuring-bind ,whole-var form ,db-form)))
       (eval `(lambda (form)
                (let ,bindings
                  (declare (ignorable ,@(mapcar #'car bindings)))
@@ -2114,9 +2141,14 @@
                           ;; in body resolve to a gensym, so a
                           ;; backquoted body returns a real expansion
                           ;; form rather than a runtime list-builder.
+                          ;; CLHS 5.1.1.2 / DEFSETF: the long-form body is
+                          ;; enclosed in an implicit BLOCK named ACCESSOR —
+                          ;; defsetf.5's (return-from defsetf.5-accessor …)
+                          ;; body errored the host EVAL ('return for unknown
+                          ;; block'), which SKIPped the whole chunk defun.
                           (expansion
                             (apply (eval `(lambda ,(append vars-list store-list)
-                                            ,@body-forms))
+                                            (block ,accessor ,@body-forms)))
                                    (append var-gensyms store-gensyms))))
                      `(let* (,@(mapcar #'list var-gensyms place-args)
                              ,@(mapcar #'list store-gensyms (list value-form)))
@@ -5284,8 +5316,29 @@
     (when no-error-clause
       (let ((var-list (cadr no-error-clause))
             (ne-body (cddr no-error-clause)))
-        (setf body-form
-              `(multiple-value-bind ,var-list ,body-form ,@ne-body))))
+        ;; CLHS: the :no-error clause takes an ORDINARY lambda list.
+        ;; compile-multiple-value-bind only understands plain vars — an
+        ;; &AUX section ((z &aux (y x)) — handler-case.29) reached it as
+        ;; a "variable" and errored the host compile ('(Y X) is not of
+        ;; type SYMBOL'), SKIPping the whole chunk defun.  Split a
+        ;; trailing &AUX section off into a LET* around the clause body.
+        (let ((mvb-vars nil)
+              (aux-bindings nil)
+              (cur var-list))
+          (loop
+            (when (null cur) (return))
+            (if (and (symbolp (car cur))
+                     (string= (symbol-name (car cur)) "&AUX"))
+                (progn (setf aux-bindings (cdr cur))
+                       (return))
+                (progn (push (car cur) mvb-vars)
+                       (setf cur (cdr cur)))))
+          (setf mvb-vars (nreverse mvb-vars))
+          (setf body-form
+                (if aux-bindings
+                    `(multiple-value-bind ,mvb-vars ,body-form
+                       (let* ,aux-bindings ,@ne-body))
+                    `(multiple-value-bind ,var-list ,body-form ,@ne-body))))))
     (setf clauses other-clauses))
   ;; Find the first non-warning handler clause
   ;; Clauses: ((type (var) body...) ...)

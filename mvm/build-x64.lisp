@@ -5569,6 +5569,28 @@
 
 (in-package :modus.mvm)
 
+;; STACK RELOCATION (required for this >100MB image): the default stack top
+;; 0x800000 sits INSIDE the image (loads at 0x100000) — the stack then
+;; silently DESTROYS native code in the band below 0x800000.  Diagnosed
+;; 2026-07-09: STRING-LESSP's code spanned 0x7f8df0..0x801520; deep-stack
+;; tests shredded it and later calls into the band executed garbage (the
+;; nunion TYPE-ERROR cascade -> triple fault at T:11090; the tree-walker
+;; fork's permanent T:10633 wedge was the same class).  Move the stack to
+;; the top of QEMU -m 512 RAM: [heap-end 0x1DFFF000 | mcgc-meta 0x1E000000..
+;; ~0x1E200000 | ... stack grows down ... | 0x20000000).  ~30MB headroom,
+;; nothing above it.  boot-x64.lisp threads this through both mov-esp/rsp
+;; sites AND the GC stack_base slot (0x10000058).  REQUIRES -m 512.
+(setf modus.mvm::*x64-stack-top-override* #x20000000)
+
+;; NX FOR DATA PAGES (required for parity with Linux fault recovery): the
+;; ANSI corpus deliberately funcalls non-functions; the blind jump lands in
+;; the heap.  On Linux that's a SIGSEGV -> recovered; with the bare-metal
+;; RWX identity map it EXECUTED heap garbage and triple-faulted the machine
+;; ((funcall 'progn 1), test 12234, ended every run).  With NX on phys >=
+;; 0x10000000 the jump instruction-fetch #PFs into the IDT-14 recovery
+;; handler instead.  See boot/boot-x64.lisp *x64-nx-data-enable*.
+(setf modus.mvm::*x64-nx-data-enable* t)
+
 ;; Install x64 translator in BARE-METAL mode (no Linux syscalls).
 ;; *x64-linux-mode* nil means TRAP codes emit bare-metal I/O (port out)
 ;; instead of syscalls.
@@ -5582,17 +5604,26 @@
 ;; set by boot-x64.lisp's kernel64 entry: semispaces [0x10001000,
 ;; 0x17000000) / [0x17000000, 0x1DFFF000), R14 = 0x17000000.
 
-;; Set native code offset for funcall alignment:
-;;   multiboot header (32) + boot32 stub + kernel64 entry = 2607 bytes,
-;;   + JMP rel32 (5) = 2612.  (Measured by emitting the three boot-fn
-;;   stages into a buffer — re-measure if boot-x64.lisp changes.)
+;; Set native code offset for funcall alignment: MEASURED at build time by
+;; emitting the three boot stages (multiboot header + boot32 + kernel64
+;; entry) into a scratch buffer, + 5 for the JMP rel32 cross.lisp inserts
+;; before native code.  (2612 with NX off, 2627 with NX on — measuring
+;; keeps it correct across boot-x64.lisp changes.)
 ;; Functions NOP-align so (offset + P) & 0xF == 0: raw fn entry addresses
 ;; get low nibble 0, mvm-fn-addr's OR-3 yields clean nibble-3 fn tags, and
 ;; functionp's fast path ((logand x #x0F) == 3) recognizes them.  The old
 ;; tree-walker fork left this at 0 (fn tags ended in nibble 7 — calls
 ;; round-tripped because 2612 mod 4 == 0, but the nibble-3 fast paths in
 ;; the shared runtime missed).
-(setf modus.mvm.x64::*x64-native-code-offset* 2612)
+(setf modus.mvm.x64::*x64-native-code-offset*
+      (let ((buf (make-mvm-buffer))
+            (desc (x64-boot-descriptor)))
+        (funcall (getf desc :multiboot-header-fn) buf)
+        (funcall (getf desc :boot32-fn) buf)
+        (funcall (getf desc :kernel64-entry-fn) buf)
+        (let ((n (+ 5 (length (mvm-buffer-used-bytes buf)))))
+          (format t "~%Bare-metal boot preamble: ~D bytes (native code offset)~%" n)
+          n)))
 
 ;; Compiler-parameter env-var bridge.
 ;;

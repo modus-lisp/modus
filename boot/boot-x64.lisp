@@ -38,6 +38,35 @@
 (defconstant +x64-page-tables-addr+ #x10000)      ; 64KB - PML4 + PDPT + 4xPD (24KB)
 (defconstant +x64-idt-addr+         #x18000)      ; 96KB - IDT + #PF/#GP/PIT ISRs
 (defconstant +x64-stack-top+        #x800000)     ; 8MB - initial stack top (must stay above page tables, below image growth)
+
+;; Stack-top override for LARGE images.  The default 0x800000 sits INSIDE any
+;; image bigger than 7MB (kernel loads at 0x100000 and the ANSI runner is
+;; >100MB) — the stack then silently DESTROYS the native code mapped in the
+;; band below 0x800000.  Diagnosed 2026-07-09 on the bare-metal x64 ANSI
+;; runner: STRING-LESSP's code spanned 0x7f8df0..0x801520, deep-stack tests
+;; shredded it, and every later call into the clobbered band executed
+;; garbage (the nunion TYPE-ERROR cascade -> triple fault at T:11090; the
+;; old tree-walker fork's permanent T:10633 wedge was the same class).
+;; Big-image builds (build-x64.lisp) set this to an address ABOVE the heap
+;; and MCGC metadata (e.g. #x20000000 = top of QEMU -m 512 RAM).  NIL keeps
+;; the historical layout — all small-image bare-metal x64 builds emit
+;; byte-identical boot code.
+(defvar *x64-stack-top-override* nil)
+(defun x64-effective-stack-top ()
+  (or *x64-stack-top-override* +x64-stack-top+))
+
+;; NX (no-execute) for data pages — gated, default OFF (byte-identical boot
+;; for existing builds).  When enabled, the boot32 PD fill sets bit 63 on
+;; every 2MB identity-map entry with phys >= 0x10000000 (heap, MCGC
+;; metadata, relocated stack) and EFER gets NXE (bit 11).  Purpose: on
+;; Linux, funcalling a non-function jumps into PROT_RW heap and the SIGSEGV
+;; handler recovers; on bare metal the identity map was RWX, so the same
+;; jump EXECUTED heap garbage and triple-faulted (ANSI funcall.error tests:
+;; deterministic run-ender at T:12234, (funcall 'progn 1)).  With NX, the
+;; jump becomes an instruction-fetch #PF -> IDT-14 handler -> handler-case
+;; longjmp — same recoverability as Linux.  Code (image at 0x100000, can
+;; grow to 0x0FE00000) stays executable.
+(defvar *x64-nx-data-enable* nil)
 (defconstant +x64-kernel64-addr+    #x100100)     ; 64-bit entry point
 
 ;; Memory regions
@@ -122,9 +151,9 @@
     (mvm-emit-byte buf #x1D)
     (mvm-emit-u32 buf #x500)
 
-    ;; Set up stack: mov esp, stack-top (above kernel image, below page tables)
+    ;; Set up stack: mov esp, stack-top (see *x64-stack-top-override*)
     (mvm-emit-byte buf #xBC)
-    (mvm-emit-u32 buf +x64-stack-top+)
+    (mvm-emit-u32 buf (x64-effective-stack-top))
 
     ;; Clear page table area (28KB at pml4-addr: PML4+PDPT+4xPD)
     ;; mov edi, pml4-addr
@@ -180,19 +209,49 @@
     ;; mov ecx, 2048
     (mvm-emit-byte buf #xB9)
     (mvm-emit-u32 buf 2048)
-    ;; loop: stosd; add eax,0x200000; mov [edi],0; add edi,4; loop
-    (let ((loop-start (mvm-buffer-position buf)))
-      (mvm-emit-byte buf #xAB)        ; stosd (store eax to [edi], edi+=4)
-      (mvm-emit-byte buf #x05)        ; add eax, 0x200000
-      (mvm-emit-u32 buf #x200000)
-      (mvm-emit-byte buf #xC7)        ; mov dword [edi], 0  (high 32 bits)
-      (mvm-emit-byte buf #x07)
-      (mvm-emit-u32 buf 0)
-      (mvm-emit-byte buf #x83)        ; add edi, 4
-      (mvm-emit-byte buf #xC7)
-      (mvm-emit-byte buf #x04)
-      (mvm-emit-byte buf #xE2)        ; loop
-      (mvm-emit-byte buf (logand #xFF (- loop-start (mvm-buffer-position buf) 1))))
+    (if *x64-nx-data-enable*
+        ;; NX variant: high dword = 0x80000000 (bit 63 = NX) for entries with
+        ;; phys >= 0x10000000, else 0.  eax holds phys|0x83 for the CURRENT
+        ;; entry until the add, so compare before advancing.
+        ;; loop: stosd; cmp eax,0x10000000; jb lo; mov [edi],0x80000000;
+        ;;       jmp next; lo: mov [edi],0; next: add eax,0x200000;
+        ;;       add edi,4; loop
+        (let ((loop-start (mvm-buffer-position buf)))
+          (mvm-emit-byte buf #xAB)        ; stosd (low dword, edi+=4)
+          (mvm-emit-byte buf #x3D)        ; cmp eax, 0x10000000
+          (mvm-emit-u32 buf #x10000000)
+          (mvm-emit-byte buf #x72)        ; jb +8 (to the zero store)
+          (mvm-emit-byte buf #x08)
+          (mvm-emit-byte buf #xC7)        ; mov dword [edi], 0x80000000
+          (mvm-emit-byte buf #x07)
+          (mvm-emit-byte buf #x00) (mvm-emit-byte buf #x00)
+          (mvm-emit-byte buf #x00) (mvm-emit-byte buf #x80)
+          (mvm-emit-byte buf #xEB)        ; jmp +6 (past the zero store)
+          (mvm-emit-byte buf #x06)
+          (mvm-emit-byte buf #xC7)        ; mov dword [edi], 0
+          (mvm-emit-byte buf #x07)
+          (mvm-emit-u32 buf 0)
+          (mvm-emit-byte buf #x05)        ; add eax, 0x200000
+          (mvm-emit-u32 buf #x200000)
+          (mvm-emit-byte buf #x83)        ; add edi, 4
+          (mvm-emit-byte buf #xC7)
+          (mvm-emit-byte buf #x04)
+          (mvm-emit-byte buf #xE2)        ; loop
+          (mvm-emit-byte buf (logand #xFF (- loop-start (mvm-buffer-position buf) 1))))
+        ;; Historical variant (byte-identical for existing builds):
+        ;; loop: stosd; add eax,0x200000; mov [edi],0; add edi,4; loop
+        (let ((loop-start (mvm-buffer-position buf)))
+          (mvm-emit-byte buf #xAB)        ; stosd (store eax to [edi], edi+=4)
+          (mvm-emit-byte buf #x05)        ; add eax, 0x200000
+          (mvm-emit-u32 buf #x200000)
+          (mvm-emit-byte buf #xC7)        ; mov dword [edi], 0  (high 32 bits)
+          (mvm-emit-byte buf #x07)
+          (mvm-emit-u32 buf 0)
+          (mvm-emit-byte buf #x83)        ; add edi, 4
+          (mvm-emit-byte buf #xC7)
+          (mvm-emit-byte buf #x04)
+          (mvm-emit-byte buf #xE2)        ; loop
+          (mvm-emit-byte buf (logand #xFF (- loop-start (mvm-buffer-position buf) 1)))))
 
     ;; Load CR3 with PML4
     (mvm-emit-byte buf #xB8)          ; mov eax, pml4
@@ -212,15 +271,16 @@
     (mvm-emit-byte buf #x22)
     (mvm-emit-byte buf #xE0)
 
-    ;; Enable long mode (IA32_EFER.LME = bit 8)
+    ;; Enable long mode (IA32_EFER.LME = bit 8; + NXE bit 11 when the
+    ;; NX-for-data gate is on)
     (mvm-emit-byte buf #xB9)          ; mov ecx, 0xC0000080 (IA32_EFER)
     ;; Emit as bytes (0xC0000080 overflows i386 30-bit fixnum)
     (mvm-emit-byte buf #x80) (mvm-emit-byte buf #x00)
     (mvm-emit-byte buf #x00) (mvm-emit-byte buf #xC0)
     (mvm-emit-byte buf #x0F)          ; rdmsr
     (mvm-emit-byte buf #x32)
-    (mvm-emit-byte buf #x0D)          ; or eax, 0x100
-    (mvm-emit-u32 buf #x100)
+    (mvm-emit-byte buf #x0D)          ; or eax, 0x100 (| 0x800 NXE if gated)
+    (mvm-emit-u32 buf (if *x64-nx-data-enable* #x900 #x100))
     (mvm-emit-byte buf #x0F)          ; wrmsr
     (mvm-emit-byte buf #x30)
 
@@ -316,10 +376,10 @@
     ;; mov ss, ax
     (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xD0)
 
-    ;; Set up 64-bit stack: mov rsp, stack-top (below page tables)
+    ;; Set up 64-bit stack: mov rsp, stack-top (see *x64-stack-top-override*)
     (mvm-emit-byte buf #x48)          ; REX.W
     (mvm-emit-byte buf #xBC)          ; mov rsp, imm64
-    (mvm-emit-u32 buf +x64-stack-top+)
+    (mvm-emit-u32 buf (x64-effective-stack-top))
     (mvm-emit-u32 buf 0)              ; high 32 bits
 
     ;; Initialize serial console (COM1 = 0x3F8)
@@ -418,11 +478,12 @@
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x06FFF000) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
-    ;; Slot 0x10000058 = stack_base = 0x00800000 (top of stack)
+    ;; Slot 0x10000058 = stack_base = top of stack (GC conservative-root
+    ;; scan upper bound; must match the effective stack top).
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf #x10000058) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB8)
-    (mvm-emit-u32 buf #x00800000) (mvm-emit-u32 buf 0)
+    (mvm-emit-u32 buf (x64-effective-stack-top)) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
 
     ;; ---- MCGC config words (bare-metal: physical addresses) ----
@@ -988,6 +1049,6 @@
         :smp-sequence-fn #'x64-init-smp-sequence
         :percpu-layout-fn #'x64-percpu-layout
         :load-addr +x64-kernel-load-addr+
-        :stack-top +x64-stack-top+
+        :stack-top (x64-effective-stack-top)
         :cons-base +x64-cons-base+
         :general-base +x64-general-base+))

@@ -6124,11 +6124,29 @@
                  (new-body (mapcar (lambda (f) (cell-rewrite-form f inner-boxed lambda-params))
                                    body)))
             `(,op ,new-bindings ,@new-body)))
-         ;; General case: rewrite all subforms
+         ;; General case: rewrite all subforms.  IMPROPER-LIST SAFE: loop
+         ;; destructuring patterns (`:for (o . a) :in …`), macro lambda
+         ;; lists, etc. appear as DOTTED subforms of not-yet-expanded macro
+         ;; forms.  The old `(mapcar … (cdr form))` signalled TYPE-ERROR
+         ;; ("A is not of type LIST") on them — uiop's PACKAGE-DEPENDENCIES
+         ;; defun (closure cell + LOOP destructuring) crashed the eval2
+         ;; in-image compile, and the resulting mid-compile condition
+         ;; silently aborted the whole toplevel LOAD form (the asdf
+         ;; gauntlet's premature stop).  Walk conses manually, rewriting
+         ;; each car; a non-NIL atomic tail (always a BINDER in a pattern,
+         ;; never an evaluated read) is preserved unrewritten.
          (t
-          `(,(cell-rewrite-form op boxed-vars lambda-params)
-            ,@(mapcar (lambda (f) (cell-rewrite-form f boxed-vars lambda-params))
-                      (cdr form)))))))))
+          (let ((head (cell-rewrite-form op boxed-vars lambda-params))
+                (acc nil)
+                (cur (cdr form)))
+            (loop while (consp cur) do
+              (push (cell-rewrite-form (car cur) boxed-vars lambda-params) acc)
+              (setq cur (cdr cur)))
+            ;; CUR is NIL (proper list) or the dotted tail atom; use it as
+            ;; the seed and cons the rewritten elements back on in order.
+            (let ((res cur))
+              (dolist (x acc) (setq res (cons x res)))
+              (cons head res)))))))))
 
 ;;; ============================================================
 ;;; Let / Let*
@@ -7066,7 +7084,12 @@
                       ,@(mapcar (lambda (f)
                                   (%flet-rewrite-calls f local-names cell-names))
                                 (cdr form)))))
-         ;; General case: walk operator (compound) and arguments
+         ;; General case: walk operator (compound) and arguments.
+         ;; IMPROPER-LIST SAFE: preserve a dotted tail (a LOOP destructuring
+         ;; binder like `(o . a)` inside a not-yet-expanded LOOP form) —
+         ;; the old (nreverse out) silently DROPPED it, so the pattern
+         ;; `(option . arguments)` became `(option)` and the loop bound
+         ;; ARGUMENTS to nothing (uiop PACKAGE-DEPENDENCIES under eval2).
          (t
           (cons (if (consp op)
                     (%flet-rewrite-calls op local-names cell-names)
@@ -7077,7 +7100,11 @@
                     (push (%flet-rewrite-calls (car rest) local-names cell-names)
                           out)
                     (setf rest (cdr rest)))
-                  (nreverse out)))))))))
+                  ;; REST is NIL (proper list) or the dotted tail; use it as
+                  ;; the seed and cons the rewritten elements back in order.
+                  (let ((res rest))
+                    (dolist (x out) (setq res (cons x res)))
+                    res)))))))))
 
 (defun %cell-name-p (sym)
   "T if SYM is a cell-rewrite-emitted heap-cell name (%CELL-…), i.e. a

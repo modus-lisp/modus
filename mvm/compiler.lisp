@@ -10669,8 +10669,10 @@
    temporary registers').  Here the accumulated LHS is pushed, ARG compiles
    into DEST itself (temp count unchanged during the recursion), and the
    temp lives only for the straight-line pair emission — the same stack
-   discipline compile-cons has always used for deep nesting.  Gated to
-   *eval2-runtime-p* so build-time native codegen stays byte-identical."
+   discipline compile-cons has always used for deep nesting.  Used
+   unconditionally under eval2 (*eval2-runtime-p*), and at build time
+   as the overflow fallback when the temp budget is nearly exhausted
+   (see %arith-step-must-spill-p)."
   (emit-ir :push dest)
   (compile-form arg env dest)
   (let ((temp (alloc-temp-reg)))
@@ -10678,6 +10680,23 @@
     (emit-ir :pop dest)
     (emit-arith-pair fast-op generic-name dest temp)
     (free-temp-reg)))
+
+(defun %arith-step-must-spill-p ()
+  "Build-time overflow gate for the pairwise-arith step: T when the
+   temp-holding scheme could blow the V15 temp budget, so the caller
+   must use the push-based %compile-arith-arg-step-e2 instead.
+
+   Budget math (alloc-temp-reg fails when the pre-alloc counter > 11):
+   the temp-holding step at entry counter C allocates 1 held temp, then
+   emit-arith-pair allocates 2 more at counter C+1 — guaranteed failure
+   at C >= 10, and at C = 9 any operand needing its own temps fails
+   too.  The push-based step keeps the counter flat across the operand
+   recursion and peaks at C+3 allocations, so it works for all operand
+   shapes iff C <= 9.  Hence the switch point is C >= 9: below it the
+   emitted code is byte-identical to the historical scheme; at or above
+   it the old scheme was a build-time 'out of temporary registers' SKIP
+   that silently dropped whole ANSI test chunks."
+  (>= *temp-reg-counter* 9))
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
@@ -10688,7 +10707,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '+ arg)
-       (if *eval2-runtime-p*
+       (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
            (let ((temp (alloc-temp-reg))
@@ -10720,7 +10739,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '- arg)
-       (if *eval2-runtime-p*
+       (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :sub "GENERIC-SUBTRACT"))
            (let ((temp (alloc-temp-reg))
@@ -10751,7 +10770,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '* arg)
-       (if *eval2-runtime-p*
+       (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
            (let ((temp (alloc-temp-reg))
@@ -11481,16 +11500,19 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logand arg)
-         (let ((temp (alloc-temp-reg))
-               (*arith-push-depth* (1+ *arith-push-depth*)))
-           (emit-ir :push dest)
-           (compile-form arg env temp)
-           (emit-ir :pop dest)
-           ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
-           ;; (the now-fast two's-complement engine).  Raw :and on a bignum
-           ;; pointer returned garbage.
-           (emit-arith-pair :and "GENERIC-LOGAND" dest temp)
-           (free-temp-reg)))))))
+         (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+               (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND"))
+             (let ((temp (alloc-temp-reg))
+                   (*arith-push-depth* (1+ *arith-push-depth*)))
+               (emit-ir :push dest)
+               (compile-form arg env temp)
+               (emit-ir :pop dest)
+               ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
+               ;; (the now-fast two's-complement engine).  Raw :and on a bignum
+               ;; pointer returned garbage.
+               (emit-arith-pair :and "GENERIC-LOGAND" dest temp)
+               (free-temp-reg))))))))
 
 (defun compile-logior (args env dest)
   "Compile (logior args...).
@@ -11506,13 +11528,16 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logior arg)
-         (let ((temp (alloc-temp-reg))
-               (*arith-push-depth* (1+ *arith-push-depth*)))
-           (emit-ir :push dest)
-           (compile-form arg env temp)
-           (emit-ir :pop dest)
-           (emit-arith-pair :or "GENERIC-LOGIOR" dest temp)
-           (free-temp-reg)))))))
+         (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+               (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR"))
+             (let ((temp (alloc-temp-reg))
+                   (*arith-push-depth* (1+ *arith-push-depth*)))
+               (emit-ir :push dest)
+               (compile-form arg env temp)
+               (emit-ir :pop dest)
+               (emit-arith-pair :or "GENERIC-LOGIOR" dest temp)
+               (free-temp-reg))))))))
 
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
@@ -11527,13 +11552,16 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logxor arg)
-         (let ((temp (alloc-temp-reg))
-               (*arith-push-depth* (1+ *arith-push-depth*)))
-           (emit-ir :push dest)
-           (compile-form arg env temp)
-           (emit-ir :pop dest)
-           (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
-           (free-temp-reg)))))))
+         (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+               (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR"))
+             (let ((temp (alloc-temp-reg))
+                   (*arith-push-depth* (1+ *arith-push-depth*)))
+               (emit-ir :push dest)
+               (compile-form arg env temp)
+               (emit-ir :pop dest)
+               (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
+               (free-temp-reg))))))))
 
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.

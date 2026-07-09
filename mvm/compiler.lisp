@@ -10725,7 +10725,7 @@
    discipline compile-cons has always used for deep nesting.  Used
    unconditionally under eval2 (*eval2-runtime-p*), and at build time
    as the overflow fallback when the temp budget is nearly exhausted
-   (see %arith-step-must-spill-p)."
+   (see %temps-must-spill-p)."
   (emit-ir :push dest)
   (compile-form arg env dest)
   (let ((temp (alloc-temp-reg)))
@@ -10734,22 +10734,32 @@
     (emit-arith-pair fast-op generic-name dest temp)
     (free-temp-reg)))
 
-(defun %arith-step-must-spill-p ()
-  "Build-time overflow gate for the pairwise-arith step: T when the
-   temp-holding scheme could blow the V15 temp budget, so the caller
-   must use the push-based %compile-arith-arg-step-e2 instead.
+(defun %temps-must-spill-p (&optional (held 1))
+  "Overflow gate for every construct that HOLDS temp registers across a
+   recursive operand compile (pairwise arith, compile-call arg loop,
+   compile-compare-2, compile-object-subtype-p): T when holding could
+   blow the V15 temp budget, so the caller must switch to its push-
+   based / alloc-after-recursion spill variant instead.
 
    Budget math (alloc-temp-reg fails when the pre-alloc counter > 11):
-   the temp-holding step at entry counter C allocates 1 held temp, then
-   emit-arith-pair allocates 2 more at counter C+1 — guaranteed failure
-   at C >= 10, and at C = 9 any operand needing its own temps fails
-   too.  The push-based step keeps the counter flat across the operand
-   recursion and peaks at C+3 allocations, so it works for all operand
-   shapes iff C <= 9.  Hence the switch point is C >= 9: below it the
-   emitted code is byte-identical to the historical scheme; at or above
-   it the old scheme was a build-time 'out of temporary registers' SKIP
-   that silently dropped whole ANSI test chunks."
-  (>= *temp-reg-counter* 9))
+   the deepest leaf emitters (emit-arith-pair, compile-compare-2's tag
+   check) need up to 3 concurrent temps, so any recursion entered at
+   counter C > 9 can fail on some operand shape.  The spill variants
+   keep the counter FLAT across the recursion and allocate their own
+   (<= 3) temps only for the straight-line emission afterwards, which
+   works iff C <= 9.  Hence the invariant: at C >= 9 nobody holds a
+   temp across a recursion, so the counter can never enter a leaf
+   emitter above 9 and 'out of temporary registers' is structurally
+   unreachable.  Below the threshold the emitted code is byte-identical
+   to the historical scheme; at or above it the old scheme was a
+   build-time SKIP that silently dropped whole ANSI test chunks.
+
+   HELD is how many temps the calling construct would hold across the
+   recursion in its historical variant (1 for the arith step /
+   compile-call arg loop, 2 for compile-compare-2 /
+   compile-object-subtype-p): the recursion entry counter must stay
+   <= 9, so spill when counter + HELD would exceed it."
+  (> (+ *temp-reg-counter* held) 9))
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
@@ -10760,7 +10770,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '+ arg)
-       (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+       (if (or *eval2-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
            (let ((temp (alloc-temp-reg))
@@ -10792,7 +10802,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '- arg)
-       (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+       (if (or *eval2-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :sub "GENERIC-SUBTRACT"))
            (let ((temp (alloc-temp-reg))
@@ -10823,7 +10833,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '* arg)
-       (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+       (if (or *eval2-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
            (let ((temp (alloc-temp-reg))
@@ -11091,35 +11101,73 @@
    truncate's 2-arg branch routes here after a runtime fixnump check on
    both operands so the raw IR never sees a boxed-float pointer."
   (destructuring-bind (a b) args
-    (let ((n-temp    (alloc-temp-reg))
-          (d-temp    (alloc-temp-reg))
-          (q-temp    (alloc-temp-reg))
-          (r-temp    (alloc-temp-reg))
-          (addr-temp (alloc-temp-reg)))
-      (compile-form a env n-temp)
-      (compile-form b env d-temp)
-      ;; quotient: :div clobbers RAX/RDX/RCX, so save operands around it
-      (emit-ir :push n-temp)
-      (emit-ir :push d-temp)
-      (emit-ir :div q-temp n-temp d-temp)
-      (emit-ir :pop d-temp)
-      (emit-ir :pop n-temp)
-      ;; remainder: :mod also clobbers RAX/RDX/RCX; save q across it.
-      (emit-ir :push q-temp)
-      (emit-ir :mod r-temp n-temp d-temp)
-      (emit-ir :pop q-temp)
-      ;; MV[0] = remainder, MV-COUNT = 2
-      (emit-ir :li addr-temp +mv-values-addr+)
-      (emit-ir :store addr-temp r-temp +width-u64+)
-      (emit-ir :li addr-temp +mv-count-addr+)
-      (emit-ir :li r-temp (ash 2 +fixnum-shift+))
-      (emit-ir :store addr-temp r-temp +width-u64+)
-      (emit-ir :mov dest q-temp)
-      (free-temp-reg)
-      (free-temp-reg)
-      (free-temp-reg)
-      (free-temp-reg)
-      (free-temp-reg))))
+    (if (%temps-must-spill-p 5)
+        ;; SPILL variant (see %temps-must-spill-p): the historical code
+        ;; below holds 5 temps across BOTH operand recursions — entered
+        ;; at counter >= 8 the allocs alone blow V15 (the format-b/d/o/x
+        ;; chunk SKIPs: (mod (- len i) ci+1) at the bottom of a deep
+        ;; loop/unless/and nest).  Compile the operands with the counter
+        ;; flat (a via the hardware stack, b into dest), then run the
+        ;; div/mod emission with only 3 temps, reusing n-temp as the
+        ;; MV-store address temp (a is dead by then) and dest as the
+        ;; divisor register.
+        (progn
+          (compile-form a env dest)
+          (emit-ir :push dest)
+          (compile-form b env dest)
+          (let ((n-temp (alloc-temp-reg))   ; numerator a, later addr temp
+                (q-temp (alloc-temp-reg))   ; quotient
+                (r-temp (alloc-temp-reg)))  ; remainder
+            (emit-ir :pop n-temp)
+            ;; quotient: :div clobbers RAX/RDX/RCX, save operands around it
+            (emit-ir :push n-temp)
+            (emit-ir :push dest)
+            (emit-ir :div q-temp n-temp dest)
+            (emit-ir :pop dest)
+            (emit-ir :pop n-temp)
+            ;; remainder: :mod also clobbers RAX/RDX/RCX; save q across it.
+            (emit-ir :push q-temp)
+            (emit-ir :mod r-temp n-temp dest)
+            (emit-ir :pop q-temp)
+            ;; MV[0] = remainder, MV-COUNT = 2 (n-temp reused as addr)
+            (emit-ir :li n-temp +mv-values-addr+)
+            (emit-ir :store n-temp r-temp +width-u64+)
+            (emit-ir :li n-temp +mv-count-addr+)
+            (emit-ir :li r-temp (ash 2 +fixnum-shift+))
+            (emit-ir :store n-temp r-temp +width-u64+)
+            (emit-ir :mov dest q-temp)
+            (free-temp-reg)
+            (free-temp-reg)
+            (free-temp-reg)))
+        (let ((n-temp    (alloc-temp-reg))
+              (d-temp    (alloc-temp-reg))
+              (q-temp    (alloc-temp-reg))
+              (r-temp    (alloc-temp-reg))
+              (addr-temp (alloc-temp-reg)))
+          (compile-form a env n-temp)
+          (compile-form b env d-temp)
+          ;; quotient: :div clobbers RAX/RDX/RCX, so save operands around it
+          (emit-ir :push n-temp)
+          (emit-ir :push d-temp)
+          (emit-ir :div q-temp n-temp d-temp)
+          (emit-ir :pop d-temp)
+          (emit-ir :pop n-temp)
+          ;; remainder: :mod also clobbers RAX/RDX/RCX; save q across it.
+          (emit-ir :push q-temp)
+          (emit-ir :mod r-temp n-temp d-temp)
+          (emit-ir :pop q-temp)
+          ;; MV[0] = remainder, MV-COUNT = 2
+          (emit-ir :li addr-temp +mv-values-addr+)
+          (emit-ir :store addr-temp r-temp +width-u64+)
+          (emit-ir :li addr-temp +mv-count-addr+)
+          (emit-ir :li r-temp (ash 2 +fixnum-shift+))
+          (emit-ir :store addr-temp r-temp +width-u64+)
+          (emit-ir :mov dest q-temp)
+          (free-temp-reg)
+          (free-temp-reg)
+          (free-temp-reg)
+          (free-temp-reg)
+          (free-temp-reg)))))
 
 (defun compile-mod (args env dest)
   "Compile (mod a b) — CL floor-style modulus.
@@ -11166,15 +11214,32 @@
      :bge -> NUMERIC->=
 
    Returns T or NIL in DEST in both paths."
-  (let ((a-temp     (alloc-temp-reg))
-        (tag-temp   (alloc-temp-reg))
+  (let ((a-temp     nil)
+        (tag-temp   nil)
         (true-label (make-compiler-label))
         (slow-label (make-compiler-label))
         (end-label  (make-compiler-label)))
-    (compile-form a env dest)
-    (emit-ir :push dest)
-    (compile-form b env a-temp)
-    (emit-ir :pop dest)
+    (if (%temps-must-spill-p 2)
+        ;; SPILL variant: hold NO temps across the operand recursions —
+        ;; a lives on the hardware stack while b compiles into dest, and
+        ;; the two check temps are allocated only for the straight-line
+        ;; emission below.  See %temps-must-spill-p.
+        (progn
+          (compile-form a env dest)
+          (emit-ir :push dest)
+          (compile-form b env dest)
+          (setf a-temp (alloc-temp-reg))
+          (setf tag-temp (alloc-temp-reg))
+          (emit-ir :mov a-temp dest)
+          (emit-ir :pop dest))
+        ;; Historical variant (byte-identical below the threshold).
+        (progn
+          (setf a-temp (alloc-temp-reg))
+          (setf tag-temp (alloc-temp-reg))
+          (compile-form a env dest)
+          (emit-ir :push dest)
+          (compile-form b env a-temp)
+          (emit-ir :pop dest)))
     ;; Tag check: (dest | a-temp) & 1 == 0  ⇒ both fixnums (low bit 0).
     ;; :bnnull tests against NIL (≠NIL→branch), so we use :cmp + :bne.
     (emit-ir :or  tag-temp dest a-temp)
@@ -11553,7 +11618,7 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logand arg)
-         (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+         (if (or *eval2-runtime-p* (%temps-must-spill-p))
              (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND"))
              (let ((temp (alloc-temp-reg))
@@ -11581,7 +11646,7 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logior arg)
-         (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+         (if (or *eval2-runtime-p* (%temps-must-spill-p))
              (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR"))
              (let ((temp (alloc-temp-reg))
@@ -11605,7 +11670,7 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logxor arg)
-         (if (or *eval2-runtime-p* (%arith-step-must-spill-p))
+         (if (or *eval2-runtime-p* (%temps-must-spill-p))
              (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR"))
              (let ((temp (alloc-temp-reg))
@@ -11765,9 +11830,22 @@
   (let ((true-label (make-compiler-label))
         (end-label (make-compiler-label))
         (false-label (make-compiler-label))
-        (temp (alloc-temp-reg))
-        (temp2 (alloc-temp-reg)))
-    (compile-form arg env dest)
+        (temp nil)
+        (temp2 nil))
+    ;; The two check temps are only needed for the straight-line emission
+    ;; AFTER the operand compiles; under temp pressure allocate them after
+    ;; the recursion so nothing is held across it (see %temps-must-spill-p).
+    ;; Below the threshold keep the historical alloc-first order so the
+    ;; emitted register numbering is byte-identical.
+    (if (%temps-must-spill-p 2)
+        (progn
+          (compile-form arg env dest)
+          (setf temp (alloc-temp-reg))
+          (setf temp2 (alloc-temp-reg)))
+        (progn
+          (setf temp (alloc-temp-reg))
+          (setf temp2 (alloc-temp-reg))
+          (compile-form arg env dest)))
     ;; Check object tag
     ;; OBJ-TAG/OBJ-SUBTAG return tagged fixnums (value << fixnum-shift),
     ;; so comparison values must also be tagged.
@@ -13240,20 +13318,35 @@
     ;; they'll be at [RBP+16+k*8] where the callee expects them.
     (when (> nargs +max-reg-args+)
       (dolist (arg (reverse (nthcdr +max-reg-args+ args)))
-        (let ((temp (alloc-temp-reg)))
-          (compile-form arg env temp)
-          (emit-ir :push temp)
-          (free-temp-reg))))
+        (if (%temps-must-spill-p)
+            ;; SPILL: V0 is dead during arg evaluation (arg registers are
+            ;; only populated by the pops below), so compile the arg
+            ;; directly into it — the counter stays flat across the
+            ;; recursion.  See %temps-must-spill-p.
+            (progn
+              (compile-form arg env +vreg-v0+)
+              (emit-ir :push +vreg-v0+))
+            (let ((temp (alloc-temp-reg)))
+              (compile-form arg env temp)
+              (emit-ir :push temp)
+              (free-temp-reg)))))
 
     (let ((reg-count (min nargs +max-reg-args+)))
       ;; Evaluate each register arg into a temp, push to stack, free temp.
       ;; This uses only 1 temp at a time, preventing temp exhaustion when
       ;; args are themselves function calls (which allocate their own temps).
+      ;; Under temp pressure even that 1 held temp is too many (deeply
+      ;; nested arg trees stack one per call level): compile into the
+      ;; dead V0 instead, keeping the counter flat (see %temps-must-spill-p).
       (dotimes (i reg-count)
-        (let ((temp (alloc-temp-reg)))
-          (compile-form (nth i args) env temp)
-          (emit-ir :push temp)
-          (free-temp-reg)))
+        (if (%temps-must-spill-p)
+            (progn
+              (compile-form (nth i args) env +vreg-v0+)
+              (emit-ir :push +vreg-v0+))
+            (let ((temp (alloc-temp-reg)))
+              (compile-form (nth i args) env temp)
+              (emit-ir :push temp)
+              (free-temp-reg))))
       ;; Pop into arg registers (LIFO: last pushed = highest reg, pop first)
       (loop for i from (1- reg-count) downto 0
             do (emit-ir :pop (+ +vreg-v0+ i))))

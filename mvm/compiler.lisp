@@ -5473,11 +5473,24 @@
                                nil)
                            nil)
                        (%hc-longjmp)))))
-               ;; Build the full cond dispatch
+               ;; Build the full cond dispatch.
+               ;; The T tail calls %MAYBE-REPORT-UNHANDLED-HC before the
+               ;; re-longjmp: if NO outer frame is armed the longjmp is a
+               ;; doomed silent escape (the historic diagnostic hole that
+               ;; masked the GC signal-symbol / define-package / find-system
+               ;; bugs) — the helper prints one loud line and returns; the
+               ;; %hc-longjmp still runs unconditionally, so control flow,
+               ;; longjmp targets and frames are all UNCHANGED.  When an
+               ;; outer frame IS armed (normal outward propagation) the
+               ;; helper is silent.  Defined in mvm/cl-conditions.lisp —
+               ;; the same runtime dependency class as the TYPEP calls this
+               ;; dispatch already emits.
                (cond-form
                 (if dispatch-forms
-                    `(cond ,@nlx-guard ,@dispatch-forms (t (%hc-longjmp)))
-                    '(%hc-longjmp))))
+                    `(cond ,@nlx-guard ,@dispatch-forms
+                           (t (progn (%maybe-report-unhandled-hc) (%hc-longjmp))))
+                    '(progn (%maybe-report-unhandled-hc) (%hc-longjmp)))))
+
           ;; Emit setjmp/handler pattern
           ;; SETJMP (#x0510) pushes outer handler state to the per-fork
           ;; handler stack at 0x10000400 before saving its own state at
@@ -5636,10 +5649,16 @@
                       (%rc-clear-invoke)
                       (cond ,@dispatch-clauses (t nil)))
                     ;; A real condition escaped the body — re-signal it so it
-                    ;; propagates to the enclosing handler (or aborts if none).
-                    (if (%error-handler-active-p)
-                        (error ,cnd-var)
-                        (halt))))))
+                    ;; propagates to the enclosing handler.  Re-signal
+                    ;; UNCONDITIONALLY: this expansion runs as EVAL2 BYTECODE,
+                    ;; where the old (%error-handler-active-p) guard read the
+                    ;; interpreter's SIMULATED [#x10000180] (per-state memory
+                    ;; hash, always 0) — it answered NIL even with real
+                    ;; handlers armed, so every condition escaping a
+                    ;; restart-case body silently (halt)ed the image (exit 1,
+                    ;; zero output — the find-system death shape).  `error`
+                    ;; itself handles the truly-unarmed case (report + halt).
+                    (error ,cnd-var)))))
          env dest)))))
 
 ;;; ============================================================

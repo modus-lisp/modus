@@ -657,7 +657,7 @@
     (mvm-emit-byte buf #xCF)
 
     ;; ============================================================
-    ;; Deadline-aware PIT ISR at +x64-idt-addr+ +0x900.  Mirrors AArch64 entry-5:
+    ;; Deadline-aware PIT ISR at +x64-idt-addr+ +0xA00.  Mirrors AArch64 entry-5:
     ;; on every IRQ tick, decrement the counter at 0x10000C70.  When
     ;; the counter is 0, do nothing (no deadline armed).  When it
     ;; transitions 1→0, check slot 0x10000180 (handler-case armed by
@@ -672,7 +672,7 @@
     ;; IRETQ but in 64-bit kernel mode CS/SS values are not used for
     ;; addressing anyway (only descriptor-cache flags matter).
     ;;
-    ;; Deadline-aware PIT ISR at +x64-idt-addr+ +0x900.  Decrements counter at
+    ;; Deadline-aware PIT ISR at +x64-idt-addr+ +0xA00.  Decrements counter at
     ;; 0x10000C70; on 1→0 transition, longjmp via slot 0x10000180.
     ;;
     ;; CRITICAL fix #1: pit_normal IRETQ path injects IF=1 into the
@@ -695,7 +695,49 @@
     ;; stride 24 -> 32, restore RBX from the target frame ([rcx+24]), copy
     ;; and zero-fill the 4th (RBX) quad in the inline pop.  See the long
     ;; comment on sg-bytes.
-    (let ((deadline-isr-addr (+ idt-base #x900))
+    ;; 2026-07-09 HANDLER-STACK HARDENING (mirrors emit-handler-helpers'
+    ;; bare-metal balanced-cap + in-transition flag, translate-x64.lisp):
+    ;;   (a) DEFER-ON-TRANSITION: if the in-transition flag [0x10000D28]
+    ;;       is set (SETJMP arm / CLEAR-HANDLER pop / LONGJMP restore is
+    ;;       mid-flight), do NOT longjmp through half-written state —
+    ;;       re-arm the counter to 1 (retry next tick) and IRETQ.  The
+    ;;       check sits right after the 1->0 decrement, while RAX (=0)
+    ;;       and RCX (=0x10000C70) are still scratch: probing the flag
+    ;;       later would clobber the saved-RSP already loaded into RAX.
+    ;;   (b) ZERO LIVE-OVERFLOW [0x10000D20] before the inline pop: this
+    ;;       longjmp unwinds past ALL capped (strictly inner) setjmp
+    ;;       frames, whose CLEAR-HANDLER absorbs must be discarded.
+    ;;   (c) SELF-RE-ARM: on a deadline hit the ISR re-arms the counter
+    ;;       to 2000 BEFORE acting.  The old one-shot design left
+    ;;       C70=0 whenever the recovery landed anywhere that didn't
+    ;;       re-arm (e.g. an inner handler-case's clause, or a recovery
+    ;;       cascade) — a subsequent spin then had NO watchdog and the
+    ;;       run wedged forever (observed at ceiling/divide, T:13333/
+    ;;       13444, C70=0 depth=0).  Explicit disarms (C70=0 at
+    ;;       fork-file exit) still win.
+    ;;   (d) DEADLINE RESCUE: when the deadline hits with NO armed
+    ;;       handler ([0x10000180]==0 — the drained-stack state) but the
+    ;;       per-file rescue frame [0x10000D68] is armed with budget
+    ;;       [0x10000D90] > 0, jump into the #PF handler's rescue block
+    ;;       (+0x820+192) to wedge the file and continue, instead of
+    ;;       expiring silently (which left post-drain SPINS unrecoverable
+    ;;       — only post-drain FAULTS reached the rescue).  Outside
+    ;;       fork-file (D68=0) the expiry stays silent as designed.
+    ;;   (f) SAFEPOINT LONGJMP (2026-07-10): when a handler IS armed, the
+    ;;       ISR no longer longjmps ITSELF — it sets the deadline-pending
+    ;;       flag [0x10000D30] and IRETQs.  The YIELD safepoint at every
+    ;;       compiled loop back-edge (translate-x64.lisp, op-yield)
+    ;;       consumes the flag and longjmps at a consistent instruction
+    ;;       boundary.  The ISR-side longjmp interrupted slow tests
+    ;;       mid-intern/mid-alloc, abandoning half-written global tables
+    ;;       — observed as 0xCC.. garbage in the intern table with every
+    ;;       symbol lookup #PF-ing (CR2=0x76CCCCCCCC) and the run wedging
+    ;;       in the acosh/asin/gcd band.  Linux never had this class: its
+    ;;       harness kills hung forks (alarm), never async-longjmps.
+    ;; NOTE: moved +0x900 → +0xA00 (2026-07-09): the #PF/#GP recovery
+    ;; handler at +0x820 grew to 349 bytes (no-handler rescue block) and
+    ;; would have overlapped +0x900.  Region +0xA00..+0x2000 is free.
+    (let ((deadline-isr-addr (+ idt-base #xA00))
           (deadline-bytes
            #(;; entry + EOI
              #x50                                       ; 0: push rax
@@ -707,59 +749,70 @@
              #x48 #xB9 #x70 #x0C #x00 #x10 #x00 #x00 #x00 #x00  ; 7: mov rcx, 0x10000C70
              #x48 #x8B #x01                             ; 17: mov rax, [rcx]
              #x48 #x85 #xC0                             ; 20: test rax, rax
-             ;; jz NEAR pit_normal (target byte 205; delta from PC=29 = 176 = 0xB0)
-             #x0F #x84 #xB0 #x00 #x00 #x00              ; 23: jz pit_normal
-             #x48 #xFF #xC8                             ; 29: dec rax
-             #x48 #x89 #x01                             ; 32: mov [rcx], rax
-             ;; jnz NEAR pit_normal (delta from PC=41 = 164 = 0xA4)
-             #x0F #x85 #xA4 #x00 #x00 #x00              ; 35: jnz pit_normal
-             ;; Deadline hit:
-             #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00  ; 41: mov rcx, 0x10000180
-             #x48 #x8B #x01                             ; 51: mov rax, [rcx]
-             #x48 #x85 #xC0                             ; 54: test rax, rax
-             ;; jz NEAR pit_normal (target 205; delta from PC=63 = 142 = 0x8E)
-             #x0F #x84 #x8E #x00 #x00 #x00              ; 57: jz pit_normal
-             #x48 #x8B #x69 #x08                        ; 63: mov rbp, [rcx+8]
-             #x48 #x8B #x51 #x10                        ; 67: mov rdx, [rcx+16]
-             #x48 #x8B #x59 #x18                        ; 71: mov rbx, [rcx+24] (saved V4)
-             ;; Inline handler-stack pop (32-byte frames):
-             #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10    ; 75: mov r10, [0x10000400]
-             #x4D #x85 #xD2                             ; 83: test r10, r10
-             ;; jz SHORT zero_fill (target byte 159; delta from PC=88 = 71 = 0x47)
-             #x74 #x47                                  ; 86: jz zero_fill
-             #x49 #xFF #xCA                             ; 88: dec r10
-             #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10    ; 91: mov [0x10000400], r10
-             #x4D #x6B #xDA #x20                        ; 99: imul r11, r10, 32
-             #x49 #x81 #xC3 #x08 #x04 #x00 #x10         ; 103: add r11, 0x10000408
-             #x4D #x8B #x13                             ; 110: mov r10, [r11]
-             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 113: mov [0x10000180], r10
-             #x4D #x8B #x53 #x08                        ; 121: mov r10, [r11+8]
-             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 125: mov [0x10000188], r10
-             #x4D #x8B #x53 #x10                        ; 133: mov r10, [r11+16]
-             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 137: mov [0x10000190], r10
-             #x4D #x8B #x53 #x18                        ; 145: mov r10, [r11+24]
-             #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10    ; 149: mov [0x10000198], r10
-             ;; jmp SHORT epilogue (target byte 194; delta from PC=159 = 35 = 0x23)
-             #xEB #x23                                  ; 157: jmp epilogue
-             ;; zero_fill (byte 159):
-             #x4D #x31 #xD2                             ; 159: xor r10, r10
-             #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10    ; 162: mov [0x10000180], r10
-             #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10    ; 170: mov [0x10000188], r10
-             #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10    ; 178: mov [0x10000190], r10
-             #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10    ; 186: mov [0x10000198], r10
-             ;; epilogue (byte 194):
-             #x48 #x89 #xC4                             ; 194: mov rsp, rax
-             #xB8 #x09 #x10 #xAD #xDE                   ; 197: mov eax, 0xDEAD1009
-             #xFB                                       ; 202: sti
-             #xFF #xE2                                  ; 203: jmp rdx
-             ;; pit_normal (byte 205):
-             #x5A                                       ; 205: pop rdx
-             #x59                                       ; 206: pop rcx
-             #x58                                       ; 207: pop rax
-             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00  ; 208: or qword [rsp+16], 0x200
-             #x48 #xCF                                  ; 217: iretq
+             ;; jz NEAR pit_normal (target byte 158; delta from PC=29 = 129 = 0x81)
+             #x0F #x84 #x81 #x00 #x00 #x00              ; 23: jz pit_normal
+             ;; COUNTER CLAMP (header point (e)): a recovery cascade can
+             ;; wild-write the counter (observed 0x171CD29D — a heap
+             ;; pointer — at the T:13245 wedge), leaving the watchdog
+             ;; armed-but-never-expiring.  Legitimate arms are <= ~4000
+             ;; raw; anything above 65536 is garbage — reset to 2001 so
+             ;; the deadline fires shortly and recovery proceeds.
+             #x48 #x3D #x00 #x00 #x01 #x00              ; 29: cmp rax, 0x10000
+             #x72 #x0C                                  ; 35: jb no_clamp(49) rel8=12
+             #x48 #xC7 #x01 #xD1 #x07 #x00 #x00         ; 37: mov qword [rcx], 2001
+             ;; jmp NEAR pit_normal (delta from PC=49 = 109 = 0x6D)
+             #xE9 #x6D #x00 #x00 #x00                   ; 44: jmp pit_normal
+             ;; no_clamp (byte 49):
+             #x48 #xFF #xC8                             ; 49: dec rax
+             #x48 #x89 #x01                             ; 52: mov [rcx], rax
+             ;; jnz NEAR pit_normal (delta from PC=61 = 97 = 0x61)
+             #x0F #x85 #x61 #x00 #x00 #x00              ; 55: jnz pit_normal
+             ;; Deadline hit — defer if handler machinery is mid-transition:
+             #x48 #x8B #x04 #x25 #x28 #x0D #x00 #x10    ; 61: mov rax, [0x10000D28]
+             #x48 #x85 #xC0                             ; 69: test rax, rax
+             ;; jz SHORT no_defer (target 94; delta from PC=74 = 20 = 0x14)
+             #x74 #x14                                  ; 72: jz no_defer
+             #x48 #xC7 #x01 #x01 #x00 #x00 #x00         ; 74: mov qword [rcx], 1 (re-arm, retry next tick)
+             #x48 #xFF #x04 #x25 #x18 #x0D #x00 #x10    ; 81: inc qword [0x10000D18] (defer diag count)
+             ;; jmp NEAR pit_normal (delta from PC=94 = 64 = 0x40)
+             #xE9 #x40 #x00 #x00 #x00                   ; 89: jmp pit_normal
+             ;; no_defer (byte 94): SELF-RE-ARM (header point (c)) — rcx
+             ;; still = 0x10000C70 here.
+             #x48 #xC7 #x01 #xD0 #x07 #x00 #x00         ; 94: mov qword [rcx], 2000
+             ;; Armed handler?
+             #x48 #x8B #x04 #x25 #x80 #x01 #x00 #x10    ; 101: mov rax, [0x10000180]
+             #x48 #x85 #xC0                             ; 109: test rax, rax
+             ;; jz SHORT deadline_rescue (target 127; delta from PC=114 = 13 = 0x0D)
+             #x74 #x0D                                  ; 112: jz deadline_rescue
+             ;; SAFEPOINT REQUEST (header point (f)): INCREMENT the pending
+             ;; count; the YIELD check at every loop back-edge consumes it
+             ;; and longjmps at a consistent point (two-tier: corpus-region
+             ;; yields consume immediately, runtime-region yields only at
+             ;; count>=3 — see emit-yield-longjmp-stub).  NO ISR-side
+             ;; longjmp when a handler is armed.
+             #x48 #xFF #x04 #x25 #x30 #x0D #x00 #x10    ; 114: inc qword [0x10000D30]
+             ;; jmp NEAR pit_normal (delta from PC=127 = 31 = 0x1F)
+             #xE9 #x1F #x00 #x00 #x00                   ; 122: jmp pit_normal
+             ;; deadline_rescue (byte 127) — header point (d): drained
+             ;; stack at deadline expiry.  If the per-file rescue frame is
+             ;; armed with budget, jump into the #PF handler's rescue
+             ;; block at +0x820+192 (rel32 = 0x8E0 - (0xA00+158) = -446);
+             ;; else fall to pit_normal (silent expiry as designed).
+             #x48 #x8B #x04 #x25 #x68 #x0D #x00 #x10    ; 127: mov rax, [0x10000D68]
+             #x48 #x85 #xC0                             ; 135: test rax, rax
+             #x74 #x12                                  ; 138: jz pit_normal(158) rel8=18
+             #x48 #x8B #x0C #x25 #x90 #x0D #x00 #x10    ; 140: mov rcx, [0x10000D90]
+             #x48 #x85 #xC9                             ; 148: test rcx, rcx
+             #x74 #x05                                  ; 151: jz pit_normal(158) rel8=5
+             #xE9 #x42 #xFE #xFF #xFF                   ; 153: jmp pf_rescue (rel32 -446)
+             ;; pit_normal (byte 158):
+             #x5A                                       ; 158: pop rdx
+             #x59                                       ; 159: pop rcx
+             #x58                                       ; 160: pop rax
+             #x48 #x81 #x4C #x24 #x10 #x00 #x02 #x00 #x00  ; 161: or qword [rsp+16], 0x200
+             #x48 #xCF                                  ; 170: iretq
              )))
-      ;; Write the ISR bytes at +x64-idt-addr+ +0x900.
+      ;; Write the ISR bytes at +x64-idt-addr+ +0xA00.
       (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
       (mvm-emit-u32 buf deadline-isr-addr) (mvm-emit-u32 buf 0)
       (dotimes (i (length deadline-bytes))
@@ -774,7 +827,7 @@
            (mvm-emit-byte buf #x87)
            (mvm-emit-u32  buf i)
            (mvm-emit-byte buf (aref deadline-bytes i)))))
-      ;; Repatch IDT entry 0x20 (PIT timer) to point at +x64-idt-addr+ +0x900.
+      ;; Repatch IDT entry 0x20 (PIT timer) to point at +x64-idt-addr+ +0xA00.
       (let* ((eaddr (+ idt-base (* #x20 16)))
              (off-lo (logand deadline-isr-addr #xFFFF))
              (off-mid (logand (ash deadline-isr-addr -16) #xFFFF))
@@ -848,48 +901,105 @@
             ;; (the bare-metal ANSI nunion cascade / halt-at-13621 class).
             ;; Now: restore RBX from the target frame ([rcx+24], mirroring
             ;; TRAP #x0511), pop with stride 32 incl. the 4th quad, and
-            ;; zero-fill all four slots.  Byte offsets:
-            ;;   0 add rsp,8 | 4 mov rcx,0x10000180 | 14 mov rax,[rcx]
-            ;;   17 test rax,rax | 20 jz(rel32) halt(168) | 26 mov rbp,[rcx+8]
-            ;;   30 mov rdx,[rcx+16] | 34 mov rbx,[rcx+24] | 38 mov r10,[0x400]
-            ;;   46 test | 49 jz zero_fill(122) | 51 dec r10 | 54 mov [0x400],r10
-            ;;   62 imul r11,r10,32 | 66 add r11,0x10000408 | 69.. 4-quad copy
-            ;;   120 jmp epilogue(157) | 122 zero_fill (4 slots)
-            ;;   157 mov rsp,rax | 160 mov eax,T | 165 sti | 166 jmp rdx
-            ;;   168 halt: hlt; jmp halt
-            #(#x48 #x83 #xC4 #x08
-              #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00
-              #x48 #x8B #x01
-              #x48 #x85 #xC0
-              #x0F #x84 #x8E #x00 #x00 #x00
-              #x48 #x8B #x69 #x08
-              #x48 #x8B #x51 #x10
-              #x48 #x8B #x59 #x18
-              #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10
-              #x4D #x85 #xD2
-              #x74 #x47
-              #x49 #xFF #xCA
-              #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10
-              #x4D #x6B #xDA #x20
-              #x49 #x81 #xC3 #x08 #x04 #x00 #x10
-              #x4D #x8B #x13
-              #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10
-              #x4D #x8B #x53 #x08
-              #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
-              #x4D #x8B #x53 #x10
-              #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
-              #x4D #x8B #x53 #x18
-              #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10
-              #xEB #x23
-              #x4D #x31 #xD2
-              #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10
-              #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10
-              #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10
-              #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10
-              #x48 #x89 #xC4
-              #xB8 #x09 #x10 #xAD #xDE
-              #xFB
-              #xFF #xE2
+            ;; zero-fill all four slots.
+            ;; 2026-07-09 HANDLER-STACK HARDENING: this is a longjmp path,
+            ;; so it zeroes the live-overflow word [0x10000D20] (12 bytes
+            ;; inserted at old offset 38) before the inline pop — the
+            ;; longjmp unwinds past ALL capped (strictly inner) setjmp
+            ;; frames whose CLEAR-HANDLER absorbs must be discarded (see
+            ;; emit-handler-helpers, translate-x64.lisp).  Byte offsets:
+            ;; 2026-07-09 NO-HANDLER RESCUE: when NO handler-case is armed
+            ;; ([0x10000180]==0 — the drained-stack end state), the old code
+            ;; HALTED the machine, killing the whole sequential ANSI run.
+            ;; Now it first checks the per-file rescue frame the runner's
+            ;; fork-file arms at #x10000D68..D80 (a copy of fork-file's own
+            ;; handler-case setjmp frame): if armed AND the rescue budget
+            ;; [0x10000D90] is non-zero, reset the handler-stack state
+            ;; (depth/overflow/flag/[188..198]) and longjmp there — the
+            ;; file is recorded as a FILE-WEDGE and the run continues,
+            ;; which is exactly Linux's dead-fork + parent-continues
+            ;; behavior.  The rescue is MULTI-SHOT with a per-file budget
+            ;; (fork-file arms ~50): the corrupted-condition class (e.g.
+            ;; the gcd/dpb band's test 13621) faults AGAIN in the landing
+            ;; dispatch/clause, so a one-shot died before printing the
+            ;; wedge; the budget lets it bounce until the clause completes
+            ;; while still guaranteeing termination (budget=0 → halt).
+            ;; Also captures the faulting RIP: [0x10000C30] = every fault
+            ;; (read from the interrupt frame — works for #UD entry at +4
+            ;; too since #UD pushes no error code), [0x10000C60] = the RIP
+            ;; of the most recent rescue-path fault.
+            ;;   0 add rsp,8 | 4 mov rax,[rsp] | 8 mov [C30],rax
+            ;;   16 mov rcx,0x10000180 | 26 mov rax,[rcx] | 29 test
+            ;;   32 jz(rel32) rescue(192) | 38 mov rbp,[rcx+8]
+            ;;   42 mov rdx,[rcx+16] | 46 mov rbx,[rcx+24]
+            ;;   50 mov qword [0x10000D20],0 | 62 mov r10,[0x400]
+            ;;   70 test | 73 jz zero_fill(146) | 75 dec r10 | 78 mov [0x400],r10
+            ;;   86 imul r11,r10,32 | 90 add r11,0x10000408 | 97.. 4-quad copy
+            ;;   144 jmp epilogue(181) | 146 zero_fill (4 slots)
+            ;;   181 mov rsp,rax | 184 mov eax,T | 189 sti | 190 jmp rdx
+            ;;   192 rescue: [C60]=[C30]; rax=[D68]; jz halt; rcx=[D90];
+            ;;     jz halt; dec rcx; [D90]=rcx; rbp=[D70]; rdx=[D78];
+            ;;     rbx=[D80]; [400]=0; [D20]=0; [D28]=0;
+            ;;     [188]=[190]=[198]=0; jmp epilogue
+            ;;   346 halt: hlt; jmp halt
+            #(#x48 #x83 #xC4 #x08                       ; 0: add rsp, 8
+              #x48 #x8B #x04 #x24                       ; 4: mov rax, [rsp] (faulting RIP)
+              #x48 #x89 #x04 #x25 #x30 #x0C #x00 #x10   ; 8: mov [0x10000C30], rax
+              #x48 #xB9 #x80 #x01 #x00 #x10 #x00 #x00 #x00 #x00 ; 16: mov rcx, 0x10000180
+              #x48 #x8B #x01                            ; 26: mov rax, [rcx]
+              #x48 #x85 #xC0                            ; 29: test rax, rax
+              #x0F #x84 #x9A #x00 #x00 #x00             ; 32: jz rescue(192) rel=154
+              #x48 #x8B #x69 #x08                       ; 38: mov rbp, [rcx+8]
+              #x48 #x8B #x51 #x10                       ; 42: mov rdx, [rcx+16]
+              #x48 #x8B #x59 #x18                       ; 46: mov rbx, [rcx+24]
+              #x48 #xC7 #x04 #x25 #x20 #x0D #x00 #x10 #x00 #x00 #x00 #x00 ; 50: [0x10000D20]=0
+              #x4C #x8B #x14 #x25 #x00 #x04 #x00 #x10   ; 62: mov r10, [0x10000400]
+              #x4D #x85 #xD2                            ; 70: test r10, r10
+              #x74 #x47                                 ; 73: jz zero_fill(146) rel8=71
+              #x49 #xFF #xCA                            ; 75: dec r10
+              #x4C #x89 #x14 #x25 #x00 #x04 #x00 #x10   ; 78: mov [0x10000400], r10
+              #x4D #x6B #xDA #x20                       ; 86: imul r11, r10, 32
+              #x49 #x81 #xC3 #x08 #x04 #x00 #x10        ; 90: add r11, 0x10000408
+              #x4D #x8B #x13                            ; 97: mov r10, [r11]
+              #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10   ; 100: mov [0x10000180], r10
+              #x4D #x8B #x53 #x08                       ; 108: mov r10, [r11+8]
+              #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10   ; 112: mov [0x10000188], r10
+              #x4D #x8B #x53 #x10                       ; 120: mov r10, [r11+16]
+              #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10   ; 124: mov [0x10000190], r10
+              #x4D #x8B #x53 #x18                       ; 132: mov r10, [r11+24]
+              #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10   ; 136: mov [0x10000198], r10
+              #xEB #x23                                 ; 144: jmp epilogue(181) rel8=35
+              #x4D #x31 #xD2                            ; 146: zero_fill: xor r10, r10
+              #x4C #x89 #x14 #x25 #x80 #x01 #x00 #x10   ; 149: mov [0x10000180], r10
+              #x4C #x89 #x14 #x25 #x88 #x01 #x00 #x10   ; 157: mov [0x10000188], r10
+              #x4C #x89 #x14 #x25 #x90 #x01 #x00 #x10   ; 165: mov [0x10000190], r10
+              #x4C #x89 #x14 #x25 #x98 #x01 #x00 #x10   ; 173: mov [0x10000198], r10
+              #x48 #x89 #xC4                            ; 181: epilogue: mov rsp, rax
+              #xB8 #x09 #x10 #xAD #xDE                  ; 184: mov eax, 0xDEAD1009
+              #xFB                                      ; 189: sti
+              #xFF #xE2                                 ; 190: jmp rdx
+              ;; rescue (byte 192):
+              #x48 #x8B #x04 #x25 #x30 #x0C #x00 #x10   ; 192: mov rax, [0x10000C30]
+              #x48 #x89 #x04 #x25 #x60 #x0C #x00 #x10   ; 200: mov [0x10000C60], rax
+              #x48 #x8B #x04 #x25 #x68 #x0D #x00 #x10   ; 208: mov rax, [0x10000D68]
+              #x48 #x85 #xC0                            ; 216: test rax, rax
+              #x74 #x7D                                 ; 219: jz halt(346) rel8=125
+              #x48 #x8B #x0C #x25 #x90 #x0D #x00 #x10   ; 221: mov rcx, [0x10000D90] (budget)
+              #x48 #x85 #xC9                            ; 229: test rcx, rcx
+              #x74 #x70                                 ; 232: jz halt(346) rel8=112
+              #x48 #xFF #xC9                            ; 234: dec rcx
+              #x48 #x89 #x0C #x25 #x90 #x0D #x00 #x10   ; 237: mov [0x10000D90], rcx
+              #x48 #x8B #x2C #x25 #x70 #x0D #x00 #x10   ; 245: mov rbp, [0x10000D70]
+              #x48 #x8B #x14 #x25 #x78 #x0D #x00 #x10   ; 253: mov rdx, [0x10000D78]
+              #x48 #x8B #x1C #x25 #x80 #x0D #x00 #x10   ; 261: mov rbx, [0x10000D80]
+              #x48 #xC7 #x04 #x25 #x00 #x04 #x00 #x10 #x00 #x00 #x00 #x00 ; 269: depth=0
+              #x48 #xC7 #x04 #x25 #x20 #x0D #x00 #x10 #x00 #x00 #x00 #x00 ; 281: overflow=0
+              #x48 #xC7 #x04 #x25 #x28 #x0D #x00 #x10 #x00 #x00 #x00 #x00 ; 293: in-transition=0
+              #x48 #xC7 #x04 #x25 #x88 #x01 #x00 #x10 #x00 #x00 #x00 #x00 ; 305: [188]=0
+              #x48 #xC7 #x04 #x25 #x90 #x01 #x00 #x10 #x00 #x00 #x00 #x00 ; 317: [190]=0
+              #x48 #xC7 #x04 #x25 #x98 #x01 #x00 #x10 #x00 #x00 #x00 #x00 ; 329: [198]=0
+              #xE9 #x5B #xFF #xFF #xFF                  ; 341: jmp epilogue(181) rel=-165
+              ;; halt (byte 346):
               #xF4
               #xEB #xFD)))
       ;; mov rdi, sigsegv-isr-addr
@@ -989,12 +1099,27 @@
     (mvm-emit-u32 buf #x10000400) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
     (mvm-emit-u32 buf 0)
+    ;; Zero the handler-stack hardening/diag slots at 0x10000D00..0x10000D78:
+    ;;   D00 capped-push count (diag) | D08 max-depth watermark (diag)
+    ;;   D10 pop-at-empty count (diag) | D18 deferred-deadline count (diag)
+    ;;   D20 live-overflow (balanced cap) | D28 in-transition flag
+    ;;   D40..D60 fork-file entry snapshot | D68..D80 no-handler rescue frame
+    ;; D68 = 0 is CRITICAL: it's the rescue-armed flag — firmware garbage
+    ;; there would send a pre-fork-file no-handler fault to a garbage
+    ;; address.  (D80 is only read when D68 is armed, so it can stay.)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf #x10000D00) (mvm-emit-u32 buf 0)
+    (dolist (off '(#x00 #x08 #x10 #x18 #x20 #x28 #x30 #x40 #x48 #x50 #x58 #x60 #x68 #x70 #x78))
+      ;; mov qword [rdi+off], 0
+      (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47)
+      (mvm-emit-byte buf off)
+      (mvm-emit-u32 buf 0))
     ;; Zero qword [0x10000C70] (deadline counter)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf #x10000C70) (mvm-emit-u32 buf 0)
     (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x07)
     (mvm-emit-u32 buf 0)
-    ;; STI — enable interrupts so the deadline-aware PIT ISR (+x64-idt-addr+ +0x900)
+    ;; STI — enable interrupts so the deadline-aware PIT ISR (+x64-idt-addr+ +0xA00)
     ;; can fire and longjmp out of infinite-loop tests.  In the original
     ;; boot, IRQs stayed disabled and Lisp used (sti-hlt) at idle points
     ;; only.  For ANSI testing the timer must fire throughout each test.

@@ -316,7 +316,13 @@
   ;; wrappers would reset [180]=0 on completion, killing signal recovery
   ;; for subsequent tests in the same fork.
   (handler-push-label nil)
-  (handler-pop-label nil))
+  (handler-pop-label nil)
+  ;; BARE-METAL safepoint-deadline stub (nil on Linux): YIELD sites call it
+  ;; when the PIT ISR has set the deadline-pending flag [0x10000D30].  The
+  ;; stub clears the flag and performs the standard longjmp through the
+  ;; innermost armed handler-case — at a SAFE POINT (loop back-edge), never
+  ;; mid-intern/mid-alloc/mid-GC the way the old ISR-side longjmp did.
+  (yield-longjmp-label nil))
 
 (defun ensure-label-at (state mvm-pos)
   "Ensure a label exists for MVM bytecode position MVM-POS.
@@ -670,6 +676,7 @@
               ;; or rax, rcx
               (emit-bytes buf #x48 #x09 #xC8))
              ((= code #x0510)
+              (let ((skiparm-label (make-label)))
               ;; SETJMP: Save RSP, RBP, and return address to fixed memory.
               ;; On first call, returns NIL (#xDEAD0001) in RAX.
               ;; On longjmp, execution resumes here with RAX = T (#xDEAD1009).
@@ -700,7 +707,24 @@
               ;; First, save the OUTER handler state to the per-fork stack.
               ;; CLEAR-HANDLER (and longjmp/sigsegv) pop it back, so nested
               ;; handler-cases don't tear down the parent's setjmp frame.
+              ;;
+              ;; BARE-METAL: bracket the whole transition (push + arm) with
+              ;; the in-transition flag at [0x10000D28].  The PIT deadline
+              ;; ISR DEFERS its longjmp while the flag is set — otherwise a
+              ;; deadline expiring mid-arm longjmps through a HALF-WRITTEN
+              ;; [0x10000180] frame (new RSP, stale IP).
+              (unless *x64-linux-mode*
+                (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 1
+                (emit-u32 buf #x10000D28)
+                (emit-u32 buf 1))
               (emit-call buf (translate-state-handler-push-label state))
+              ;; BARE-METAL BALANCED-CAP: r11=1 from __handler_push means the
+              ;; push was CAPPED (frame dropped, overflow counted) — skip
+              ;; arming [0x10000180] so this handler-case is a transparent
+              ;; no-op instead of a stack corrupter.  See emit-handler-helpers.
+              (unless *x64-linux-mode*
+                (emit-bytes buf #x4D #x85 #xDB)      ; test r11, r11
+                (emit-jcc buf :ne skiparm-label))
               ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
               ;; mov rcx, 0x10000180
@@ -726,67 +750,34 @@
               ;;   movabs rax, NIL       (10 bytes)
               ;; plus the new mov [rcx+24], rbx (4 bytes; emitted ABOVE so
               ;; not in the post-lea distance).
-              ;; = 14 bytes between end-of-LEA and end-of-trap-block.
-              ;; lea rax, [rip+14] lands rax at the byte AFTER the trap.
-              (emit-bytes buf #x48 #x8D #x05 #x0E #x00 #x00 #x00)  ; lea rax, [rip+14]
+              ;; = 14 bytes between end-of-LEA and end-of-trap-block (Linux).
+              ;; BARE-METAL adds the 12-byte in-transition flag clear between
+              ;; mov [rcx+16],rax and the movabs: distance = 4+12+10 = 26.
+              ;; lea rax, [rip+N] lands rax at the byte AFTER the trap.
+              (emit-bytes buf #x48 #x8D #x05
+                          (if *x64-linux-mode* #x0E #x1A)
+                          #x00 #x00 #x00)            ; lea rax, [rip+14/26]
               ;; mov [rcx+16], rax  — save return IP
               (emit-bytes buf #x48 #x89 #x41 #x10)
+              (unless *x64-linux-mode*
+                ;; capped setjmp lands here (arm skipped); both paths clear
+                ;; the in-transition flag.
+                (emit-label buf skiparm-label)
+                (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+                (emit-u32 buf #x10000D28)
+                (emit-u32 buf 0))
               ;; mov rax, NIL (#xDEAD0001) — first-time return.
               ;; On longjmp, execution jumps just past this and RAX holds T
               ;; (set by LONGJMP trap), so the value going into VR is T.
               (emit-bytes buf #x48 #xB8)
-              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0))
+              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0)))
              ((= code #x0511)
               ;; LONGJMP: Restore RSP/RBP/IP from [#x10000180], then pop
               ;; the per-fork handler stack so the OUTER handler frame
               ;; becomes active. Sets RAX = T (#xDEAD1009) so setjmp
-              ;; "returns" non-nil.
-              ;;
-              ;; Order matters: we must read OUR state BEFORE the pop
-              ;; helper overwrites [180]. We stash it in scratch memory
-              ;; at #x10000C10..#x10000C28 (24 bytes).
-              ;; mov rcx, 0x10000180
-              (emit-bytes buf #x48 #xB9)
-              (emit-u32 buf #x10000180) (emit-u32 buf 0)
-              ;; rdx = [rcx]      ; our RSP
-              (emit-bytes buf #x48 #x8B #x11)
-              ;; mov [0x10000C10], rdx
-              (emit-bytes buf #x48 #x89 #x14 #x25)
-              (emit-u32 buf #x10000C10)
-              ;; rdx = [rcx+8]    ; our RBP
-              (emit-bytes buf #x48 #x8B #x51 #x08)
-              ;; mov [0x10000C18], rdx
-              (emit-bytes buf #x48 #x89 #x14 #x25)
-              (emit-u32 buf #x10000C18)
-              ;; rdx = [rcx+16]   ; our IP
-              (emit-bytes buf #x48 #x8B #x51 #x10)
-              ;; mov [0x10000C20], rdx
-              (emit-bytes buf #x48 #x89 #x14 #x25)
-              (emit-u32 buf #x10000C20)
-              ;; rdx = [rcx+24]   ; our saved RBX
-              (emit-bytes buf #x48 #x8B #x51 #x18)
-              ;; mov [0x10000C28], rdx
-              (emit-bytes buf #x48 #x89 #x14 #x25)
-              (emit-u32 buf #x10000C28)
-              ;; Pop the handler stack back into [180]/+8/+16
-              (emit-call buf (translate-state-handler-pop-label state))
-              ;; Restore from scratch and jump
-              ;; mov rdx, [0x10000C20]   ; IP
-              (emit-bytes buf #x48 #x8B #x14 #x25)
-              (emit-u32 buf #x10000C20)
-              ;; mov rbp, [0x10000C18]   ; RBP
-              (emit-bytes buf #x48 #x8B #x2C #x25)
-              (emit-u32 buf #x10000C18)
-              ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
-              (emit-bytes buf #x48 #x8B #x1C #x25)
-              (emit-u32 buf #x10000C28)
-              ;; mov rsp, [0x10000C10]   ; RSP
-              (emit-bytes buf #x48 #x8B #x24 #x25)
-              (emit-u32 buf #x10000C10)
-              ;; mov eax, 0xDEAD1009  (T sentinel; 32-bit zero-extends)
-              (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
-              ;; jmp rdx
-              (emit-bytes buf #xFF #xE2))
+              ;; "returns" non-nil.  Body shared with the bare-metal
+              ;; safepoint-deadline stub — see emit-longjmp-body.
+              (emit-longjmp-body buf (translate-state-handler-pop-label state)))
              ((= code #x0512)
               ;; CLEAR-HANDLER: Pop outer handler state back into
               ;; [#x10000180/+8/+16]. If the per-fork handler stack is
@@ -795,7 +786,19 @@
               ;; __handler_pop preserves RAX (see emit-handler-helpers)
               ;; so (handler-case body) bodies that return in RAX aren't
               ;; clobbered by the pop.
-              (emit-call buf (translate-state-handler-pop-label state)))
+              ;; BARE-METAL: bracket with the in-transition flag so the PIT
+              ;; deadline ISR can't longjmp between the pop's depth--
+              ;; and its [0x10000180] frame copy (a double-consume that
+              ;; skips/leaks one frame).
+              (unless *x64-linux-mode*
+                (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 1
+                (emit-u32 buf #x10000D28)
+                (emit-u32 buf 1))
+              (emit-call buf (translate-state-handler-pop-label state))
+              (unless *x64-linux-mode*
+                (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+                (emit-u32 buf #x10000D28)
+                (emit-u32 buf 0)))
              ((= code #x0530)
               ;; COPY-OVERFLOW-ARGS: at runtime, read nargs from the
               ;; nargs slot and copy any args beyond V0..V3 from the
@@ -3029,9 +3032,26 @@
          (emit-pop buf 'rbx))
 
         ((op= +op-yield+)
-         ;; Preemption check: decrement a yield counter and call the
-         ;; scheduler if it reaches zero.  Stub: emit NOP for now.
-         (emit-nop buf))
+         ;; Preemption check.  LINUX: NOP (no scheduler, no deadline).
+         ;; BARE-METAL: safepoint for the PIT deadline — when the ISR has
+         ;; set the pending flag [0x10000D30], call the shared stub that
+         ;; consumes it and longjmps through the innermost armed
+         ;; handler-case.  YIELD sits at every compiled loop back-edge
+         ;; (compiler.lisp emits it per iteration), so hung tests are
+         ;; recovered at an instruction boundary where no intern/alloc/GC
+         ;; critical section is mid-flight — the ISR-side longjmp used to
+         ;; abandon half-written global state (see emit-yield-longjmp-stub).
+         (if (or *x64-linux-mode*
+                 (null (translate-state-yield-longjmp-label state)))
+             (emit-nop buf)
+             (let ((skip (make-label)))
+               ;; cmp qword [0x10000D30], 0
+               (emit-bytes buf #x48 #x83 #x3C #x25)
+               (emit-u32 buf #x10000D30)
+               (emit-bytes buf #x00)
+               (emit-jcc buf :e skip)
+               (emit-call buf (translate-state-yield-longjmp-label state))
+               (emit-label buf skip))))
 
         ((op= +op-set-mv-count+)
          ;; Store tagged fixnum count to MV-COUNT address.
@@ -3853,6 +3873,134 @@
     (mvm-emit-u32  buf +code-end-slot+)
     (- (mvm-buffer-position buf) start-pos)))
 
+(defun emit-longjmp-body (buf pop-label)
+  "Emit the LONGJMP sequence (TRAP #x0511 body): restore RSP/RBP/IP/RBX
+   from [#x10000180..198], pop the per-fork handler stack so the OUTER
+   frame becomes active, set RAX = T (#xDEAD1009), and jump.  Used by the
+   TRAP #x0511 emission and by the bare-metal safepoint-deadline stub.
+
+   Order matters: we must read OUR state BEFORE the pop helper overwrites
+   [180].  We stash it in scratch memory at #x10000C10..#x10000C28.
+
+   BARE-METAL: (a) sets the in-transition flag [0x10000D28] so the PIT
+   deadline ISR defers while the scratch/pop/restore sequence is
+   mid-flight; (b) zeroes the live-overflow word [0x10000D20] — this
+   longjmp unwinds past ALL capped (strictly inner) frames, whose
+   CLEAR-HANDLERs will never textually run, so their pending absorbs
+   must be discarded or they would wrongly swallow OUTER pops later."
+  (unless *x64-linux-mode*
+    (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 1
+    (emit-u32 buf #x10000D28)
+    (emit-u32 buf 1)
+    (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+    (emit-u32 buf #x10000D20)
+    (emit-u32 buf 0))
+  ;; mov rcx, 0x10000180
+  (emit-bytes buf #x48 #xB9)
+  (emit-u32 buf #x10000180) (emit-u32 buf 0)
+  ;; rdx = [rcx]      ; our RSP
+  (emit-bytes buf #x48 #x8B #x11)
+  ;; mov [0x10000C10], rdx
+  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-u32 buf #x10000C10)
+  ;; rdx = [rcx+8]    ; our RBP
+  (emit-bytes buf #x48 #x8B #x51 #x08)
+  ;; mov [0x10000C18], rdx
+  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-u32 buf #x10000C18)
+  ;; rdx = [rcx+16]   ; our IP
+  (emit-bytes buf #x48 #x8B #x51 #x10)
+  ;; mov [0x10000C20], rdx
+  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-u32 buf #x10000C20)
+  ;; rdx = [rcx+24]   ; our saved RBX
+  (emit-bytes buf #x48 #x8B #x51 #x18)
+  ;; mov [0x10000C28], rdx
+  (emit-bytes buf #x48 #x89 #x14 #x25)
+  (emit-u32 buf #x10000C28)
+  ;; Pop the handler stack back into [180]/+8/+16/+24
+  (emit-call buf pop-label)
+  ;; Restore from scratch and jump
+  ;; mov rdx, [0x10000C20]   ; IP
+  (emit-bytes buf #x48 #x8B #x14 #x25)
+  (emit-u32 buf #x10000C20)
+  ;; mov rbp, [0x10000C18]   ; RBP
+  (emit-bytes buf #x48 #x8B #x2C #x25)
+  (emit-u32 buf #x10000C18)
+  ;; mov rbx, [0x10000C28]   ; restore caller's V4=RBX
+  (emit-bytes buf #x48 #x8B #x1C #x25)
+  (emit-u32 buf #x10000C28)
+  ;; mov rsp, [0x10000C10]   ; RSP
+  (emit-bytes buf #x48 #x8B #x24 #x25)
+  (emit-u32 buf #x10000C10)
+  (unless *x64-linux-mode*
+    ;; clear the in-transition flag — state is now consistent
+    ;; ([180] = parent frame, target regs restored).
+    (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+    (emit-u32 buf #x10000D28)
+    (emit-u32 buf 0))
+  ;; mov eax, 0xDEAD1009  (T sentinel; 32-bit zero-extends)
+  (emit-bytes buf #xB8 #x09 #x10 #xAD #xDE)
+  ;; jmp rdx
+  (emit-bytes buf #xFF #xE2))
+
+(defun emit-yield-longjmp-stub (buf stub-label pop-label)
+  "BARE-METAL safepoint-deadline stub.  YIELD sites (every compiled loop
+   back-edge) call here when the PIT deadline ISR has set the pending
+   flag [0x10000D30].  The stub consumes the flag and longjmps through
+   the innermost armed handler-case — identical to TRAP #x0511, but at a
+   SAFE POINT.  The old design longjmped directly from the ISR at an
+   arbitrary instruction boundary; when a slow (timing-out) test was
+   mid-intern / mid-alloc / mid-GC, the abandoned half-written global
+   state poisoned the whole image (observed: intern-table entries of
+   0xCC.. garbage — every subsequent symbol lookup #PF'd at the same
+   RIP, CR2=0x76CCCCCCCC, and the run wedged in the acosh/asin/gcd
+   band).  Linux never had this class because its harness recovers hung
+   forks by KILLING them (alarm), never by async longjmp.
+
+   The CALL that reaches this stub pushes a return address; the longjmp
+   switches RSP, so it is simply abandoned.  If NO handler is armed
+   ([0x10000180]=0) the longjmp body reads a zero frame — but that state
+   is unreachable here in practice: the flag is only consumed by running
+   compiled code, which implies the runner's handler-cases are armed."
+  (emit-label buf stub-label)
+  ;; TWO-TIER CONSUMPTION: a longjmp from a loop INSIDE the runtime's own
+  ;; machinery (intern bucket walks, global-alist updates, printer loops)
+  ;; abandons a mutating critical section mid-flight — the observed
+  ;; "zombie tail" (every chunk crashing after the first runtime-region
+  ;; consumption at cos.1).  The runner writes the RUNTIME/CORPUS code
+  ;; boundary address into [0x10000DA0] (the tagged fn pointer of a
+  ;; marker defun that is the first function of the generated runner
+  ;; text).  Yields whose CALLER (return address at [rsp]) lies ABOVE
+  ;; the boundary are corpus/runner code — always safe to consume.
+  ;; Yields BELOW it are runtime internals: only consume when the
+  ;; pending count has reached 3 (three deadline periods stuck inside
+  ;; the runtime = a genuine runtime hang; the corrupting longjmp is
+  ;; then the last resort it always used to be).  [0x10000DA0]=0 (marker
+  ;; not wired, e.g. non-ANSI builds) degrades to always-consume.
+  (let ((consume (make-label))
+        (no-consume (make-label)))
+    (emit-bytes buf #x50)                  ; push rax
+    (emit-bytes buf #x48 #x8B #x44 #x24 #x08) ; mov rax, [rsp+8] (caller)
+    (emit-bytes buf #x48 #x3B #x04 #x25)   ; cmp rax, [imm32]
+    (emit-u32 buf #x10000DA0)
+    (emit-jcc buf :ae consume)
+    ;; runtime region: pending >= 3 ?
+    (emit-bytes buf #x48 #x8B #x04 #x25)   ; mov rax, [imm32]
+    (emit-u32 buf #x10000D30)
+    (emit-bytes buf #x48 #x83 #xF8 #x03)   ; cmp rax, 3
+    (emit-jcc buf :ae consume)
+    (emit-label buf no-consume)
+    (emit-bytes buf #x58)                  ; pop rax
+    (emit-bytes buf #xC3)                  ; ret (leave pending for a later yield)
+    (emit-label buf consume)
+    (emit-bytes buf #x58)                  ; pop rax
+    ;; consume the pending flag
+    (emit-bytes buf #x48 #xC7 #x04 #x25)   ; mov qword [imm32], 0
+    (emit-u32 buf #x10000D30)
+    (emit-u32 buf 0)
+    (emit-longjmp-body buf pop-label)))
+
 (defun emit-handler-helpers (buf push-label pop-label)
   "Emit two helper functions used by handler-case setjmp/clear traps:
      __handler_push: push current [#x10000180/+8/+16/+24] state onto a memory
@@ -3876,14 +4024,23 @@
    caller's V4-cached value is silently replaced and the handler continuation
    runs on corrupt state (the silent-unwind family)."
   ;; ---- __handler_push ----
-  (let ((skip (make-label)))
+  (let ((skip (make-label))
+        (capped (make-label))
+        (nomax (make-label)))
     (emit-label buf push-label)
     ;; r10 = depth = [0x10000400]
     (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
-    ;; cmp r10, 64 ; jge skip
+    ;; cmp r10, 64 ; jge skip/capped
+    ;; BARE-METAL (non-Linux): route the capped case through a diagnostic
+    ;; counter at [0x10000D00].  A capped push is a STRUCTURAL IMBALANCE:
+    ;; the frame is silently dropped but the matching CLEAR-HANDLER /
+    ;; longjmp still pops, so every capped setjmp+clear pair drains one
+    ;; REAL frame from the stack (the bare-metal ANSI drain-to-depth-0
+    ;; halt class).  The counter makes cap events observable from the
+    ;; runner (mem-ref #x10000D00).
     (emit-bytes buf #x49 #x83 #xFA #x40)
-    (emit-jcc buf :ge skip)
+    (emit-jcc buf :ge (if *x64-linux-mode* skip capped))
     ;; r11 = depth*32
     (emit-bytes buf #x4D #x6B #xDA #x20)            ; imul r11, r10, 32
     ;; r11 += 0x10000408
@@ -3909,17 +4066,64 @@
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
     (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
     (emit-u32 buf #x10000400)
+    (unless *x64-linux-mode*
+      ;; DIAG: max-depth watermark at [0x10000D08]
+      (emit-bytes buf #x4C #x8B #x1C #x25)           ; mov r11, [imm32]
+      (emit-u32 buf #x10000D08)
+      (emit-bytes buf #x4D #x39 #xD3)                ; cmp r11, r10
+      (emit-jcc buf :ge nomax)
+      (emit-bytes buf #x4C #x89 #x14 #x25)           ; mov [imm32], r10
+      (emit-u32 buf #x10000D08)
+      (emit-label buf nomax)
+      ;; r11 = 0: frame stored — SETJMP arms [0x10000180]
+      (emit-bytes buf #x4D #x31 #xDB))               ; xor r11, r11
     (emit-label buf skip)
-    (emit-bytes buf #xC3))                           ; ret
+    (emit-bytes buf #xC3)                            ; ret
+    (unless *x64-linux-mode*
+      ;; capped-push path (BARE-METAL BALANCED-CAP): the frame is NOT
+      ;; stored, but the event is COUNTED in the live-overflow word at
+      ;; [0x10000D20] so the matching CLEAR-HANDLER pop absorbs it
+      ;; instead of draining a real stored frame (the drain-to-depth-0
+      ;; halt class).  r11=1 tells the SETJMP trap to skip arming
+      ;; [0x10000180] entirely: the capped handler-case degrades to a
+      ;; transparent no-op (its body's errors go to the enclosing
+      ;; handler) rather than corrupting the stack.  [0x10000D00] is
+      ;; the cumulative diagnostic count.
+      (emit-label buf capped)
+      (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
+      (emit-u32 buf #x10000D00)
+      (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
+      (emit-u32 buf #x10000D20)
+      (emit-bytes buf #x49 #xC7 #xC3 #x01 #x00 #x00 #x00) ; mov r11, 1
+      (emit-bytes buf #xC3)))                        ; ret
   ;; ---- __handler_pop ----
   ;; Preserves RAX across the call. CLEAR-HANDLER is emitted after a
   ;; handler-case body succeeds; if dest == VR == RAX, the body's result
   ;; lives in RAX, and clobbering it would hand back a popped RSP
   ;; (masquerading as an unknown-subtag object like #<?184>).
   (let ((empty (make-label))
-        (done (make-label)))
+        (done (make-label))
+        (no-ovf (make-label)))
     (emit-label buf pop-label)
     (emit-bytes buf #x50)                            ; push rax
+    (unless *x64-linux-mode*
+      ;; BARE-METAL BALANCED-CAP: if the live-overflow word [0x10000D20]
+      ;; is non-zero, this pop textually matches a CAPPED push (whose
+      ;; frame was never stored) — absorb it: decrement overflow, leave
+      ;; [0x10000180..198] and the stored stack untouched.  Longjmp-side
+      ;; callers (TRAP #x0511, the #PF/#GP recovery ISR, the PIT deadline
+      ;; ISR) zero [0x10000D20] BEFORE popping — a longjmp unwinds past
+      ;; ALL capped (strictly inner) frames, so their absorbs must not
+      ;; fire against outer pops.
+      (emit-bytes buf #x4C #x8B #x14 #x25)           ; mov r10, [imm32]
+      (emit-u32 buf #x10000D20)
+      (emit-bytes buf #x4D #x85 #xD2)                ; test r10, r10
+      (emit-jcc buf :e no-ovf)
+      (emit-bytes buf #x49 #xFF #xCA)                ; dec r10
+      (emit-bytes buf #x4C #x89 #x14 #x25)           ; mov [imm32], r10
+      (emit-u32 buf #x10000D20)
+      (emit-jmp buf done)
+      (emit-label buf no-ovf))
     ;; r10 = depth = [0x10000400]
     (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
@@ -3954,6 +4158,11 @@
     (emit-u32 buf #x10000198)
     (emit-jmp buf done)
     (emit-label buf empty)
+    (unless *x64-linux-mode*
+      ;; DIAG: pop-at-empty counter at [0x10000D10] — each hit means the
+      ;; stack drained below the structural base (imbalance evidence).
+      (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
+      (emit-u32 buf #x10000D10))
     ;; [0x10000180] = 0  (legacy "no handler" sentinel)
     (emit-bytes buf #x48 #xC7 #x04 #x25)             ; mov qword [imm32], 0
     (emit-u32 buf #x10000180)
@@ -4141,6 +4350,20 @@
         (restore-label (make-label)))
 
     (emit-label buf gc-trampoline-label)
+    (unless *x64-linux-mode*
+      ;; BARE-METAL: set the in-transition flag [0x10000D28] for the WHOLE
+      ;; collection.  The PIT deadline ISR longjmps through the innermost
+      ;; handler-case on expiry; a longjmp OUT OF MID-GC abandons a
+      ;; half-copied heap (semispaces mid-flip, forwarding pointers
+      ;; stamped, R12/R14 not yet swapped) — every subsequent alloc/deref
+      ;; runs on corrupted state.  Observed as the fast-regime asin/gcd
+      ;; band wedges: silent handler-stack drain + wild writes (deadline
+      ;; counter = heap pointer) + global-alist walk spins.  The ISR
+      ;; DEFERS (counter=1, retry next tick) while this flag is set, so
+      ;; the deadline lands only at a consistent point after the GC.
+      (emit-bytes buf #x48 #xC7 #x04 #x25)         ; mov qword [imm32], 1
+      (emit-u32 buf #x10000D28)
+      (emit-u32 buf 1))
     (emit-gc-dbg-char buf #x5B)          ; '[' — trampoline entry
 
     ;; ---- Save all caller registers ----
@@ -4645,6 +4868,11 @@
     (emit-pop buf 'rdi)
     (emit-pop buf 'rsi)
     (emit-pop buf 'rax)
+    (unless *x64-linux-mode*
+      ;; BARE-METAL: clear the in-transition flag — heap consistent again.
+      (emit-bytes buf #x48 #xC7 #x04 #x25)         ; mov qword [imm32], 0
+      (emit-u32 buf #x10000D28)
+      (emit-u32 buf 0))
     (emit-gc-dbg-char buf #x5D)          ; ']' — trampoline exit (after restore)
     (emit-ret buf)))
 
@@ -5760,6 +5988,10 @@
          ;; Handler-stack helpers (push/pop the per-fork stack at #x10000400)
          (handler-push-lbl (make-label))
          (handler-pop-lbl  (make-label))
+         ;; BARE-METAL safepoint-deadline stub (YIELD sites call it; the
+         ;; PIT ISR only sets the pending flag).  NIL on Linux → YIELD
+         ;; stays a NOP and the Linux image is byte-identical.
+         (yield-longjmp-lbl (unless *x64-linux-mode* (make-label)))
          ;; Find %GC-COLLECT function in the table (if present)
          (gc-collect-entry (when *x64-gc-enabled*
                              (find "%GC-COLLECT" function-table
@@ -5805,7 +6037,8 @@
                               :function-table fn-offset-to-label
                               :gc-label gc-trampoline-label
                               :handler-push-label handler-push-lbl
-                              :handler-pop-label handler-pop-lbl)))
+                              :handler-pop-label handler-pop-lbl
+                              :yield-longjmp-label yield-longjmp-lbl)))
                  ;; Emit function label
                  (emit-label buf fn-label)
                  ;; Emit prologue
@@ -5867,7 +6100,10 @@
       ;; Emit handler-stack helpers (push/pop) used by SETJMP/CLEAR-HANDLER
       ;; traps to support nested handler-cases without clobbering the
       ;; parent's setjmp frame.
-      (emit-handler-helpers buf handler-push-lbl handler-pop-lbl))
+      (emit-handler-helpers buf handler-push-lbl handler-pop-lbl)
+      ;; BARE-METAL: safepoint-deadline stub (see emit-yield-longjmp-stub).
+      (when yield-longjmp-lbl
+        (emit-yield-longjmp-stub buf yield-longjmp-lbl handler-pop-lbl)))
 
     ;; Resolve all label fixups
     (fixup-labels buf)

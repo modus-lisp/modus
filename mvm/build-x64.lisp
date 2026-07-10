@@ -10,7 +10,7 @@
 ;;;;     wait4/alarm/mmap); the chunk-crash bitmap degrades to no-ops via
 ;;;;     *fork-shm-addr* = 0
 ;;;;   - per-test wall-clock timeout via the deadline-aware PIT ISR
-;;;;     (boot-x64.lisp, +x64-idt-addr+ + 0x900): run-test arms a tick
+;;;;     (boot-x64.lisp, +x64-idt-addr+ + 0xA00): run-test arms a tick
 ;;;;     counter at #x10000C70; the ISR longjmps through the innermost
 ;;;;     handler-case on expiry.  #PF/#GP recovery via IDT entries 13/14.
 ;;;;   - no argv / no env vars at runtime: all config baked at build time
@@ -4405,6 +4405,15 @@
 (setf *real-ansi-sources*
       (concatenate 'string *real-ansi-sources*
                    (format nil "~%(defvar *skip-below* 0)~
+                     ~%;; SAFEPOINT BOUNDARY marker: the FIRST defun of the generated~
+                     ~%;; runner text.  Native code is laid out in source order, so~
+                     ~%;; every function at an address >= this one is runner/corpus~
+                     ~%;; code where the two-tier deadline safepoint may consume the~
+                     ~%;; pending flag immediately; everything below is the shared~
+                     ~%;; runtime, where a longjmp may abandon a mutating critical~
+                     ~%;; section (intern / global-alist) and is taken only as a~
+                     ~%;; last resort (see emit-yield-longjmp-stub, translate-x64).~
+                     ~%(defun %hs-safepoint-boundary () nil)~
                      ~%(defvar *run-only-below* 0)~
                      ~%;; Bound on FAIL lines per fork-child to prevent any pathological~
                      ~%;; cascade (e.g. nested SIGSEGV in handler) from inflating output.~
@@ -4581,7 +4590,7 @@
                      ~%  (setf (mem-ref #x10000C58 :u64) 0))~
                      ~%;; BARE-METAL per-test deadline: arm the PIT tick counter at~
                      ~%;; #x10000C70 before each test; the deadline-aware PIT ISR~
-                     ~%;; (boot-x64.lisp, +x64-idt-addr+ + 0x900) decrements it every~
+                     ~%;; (boot-x64.lisp, +x64-idt-addr+ + 0xA00) decrements it every~
                      ~%;; ~~1ms tick and longjmps through the innermost armed~
                      ~%;; handler-case on the 1->0 transition — recovering hung tests~
                      ~%;; as clean FAILs.~
@@ -4605,19 +4614,34 @@
                      ~%;; first cut used 120000 for the glue budget — a corrupted-~
                      ~%;; bignum condition-print loop (gcd cluster) then spun ~~43~
                      ~%;; min before the watchdog fired.~
+                     ~%;; HANDLER-STACK DIAG: periodic serial dump of the per-run handler~
+                     ~%;; stack state.  d = live depth (0x10000400), mx = max-depth~
+                     ~%;; watermark (0x10000D08), cp = capped-push count (0x10000D00),~
+                     ~%;; pz = pop-at-empty count (0x10000D10).  All are raw asm-side~
+                     ~%;; counters; :u32 loads tag them into fixnums.~
+                     ~%(defun %hsd-dump (id)~
+                     ~%  (write-string-serial \"HSD id=\") (print-dec id)~
+                     ~%  (write-string-serial \" d=\") (print-dec (mem-ref #x10000400 :u32))~
+                     ~%  (write-string-serial \" mx=\") (print-dec (mem-ref #x10000D08 :u32))~
+                     ~%  (write-string-serial \" cp=\") (print-dec (mem-ref #x10000D00 :u32))~
+                     ~%  (write-string-serial \" pz=\") (print-dec (mem-ref #x10000D10 :u32))~
+                     ~%  (write-string-serial \" ov=\") (print-dec (mem-ref #x10000D20 :u32))~
+                     ~%  (write-string-serial \" df=\") (print-dec (mem-ref #x10000D18 :u32))~
+                     ~%  (write-char-serial 10))~
                      ~%(defun run-test (id thunk expected)~
                      ~%  (when (< id *skip-below*) (return-from run-test nil))~
                      ~%  (when (and (> *run-only-below* 0) (>= id *run-only-below*)) (return-from run-test nil))~
                      ~%  (%fork-set-last-id id)~
+                     ~%  (when (eql 0 (mod id 100)) (%hsd-dump id))~
                      ~%  (%clear-fault-slots)~
                      ~%  (%reset-signal-state)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 500)~
+                     ~%      (progn (setf (mem-ref #x10000C70 :u64) 500) (setf (mem-ref #x10000D30 :u64) 0))~
                      ~%      (rt-run-test id (funcall thunk) expected)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 2000))~
+                     ~%      (progn (setf (mem-ref #x10000C70 :u64) 2000) (setf (mem-ref #x10000D30 :u64) 0)))~
                      ~%    (t (c)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 2000)~
+                     ~%      (progn (setf (mem-ref #x10000C70 :u64) 2000) (setf (mem-ref #x10000D30 :u64) 0))~
                      ~%      (%test-crash-fail-c id c))))~
                      ~%(defun run-test-mv (id thunk expecteds)~
                      ~%  (when (< id *skip-below*) (return-from run-test-mv nil))~
@@ -4627,11 +4651,11 @@
                      ~%  (%reset-signal-state)~
                      ~%  (handler-case~
                      ~%    (progn~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 500)~
+                     ~%      (progn (setf (mem-ref #x10000C70 :u64) 500) (setf (mem-ref #x10000D30 :u64) 0))~
                      ~%      (rt-run-test-mv id (funcall thunk) expecteds)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 2000))~
+                     ~%      (progn (setf (mem-ref #x10000C70 :u64) 2000) (setf (mem-ref #x10000D30 :u64) 0)))~
                      ~%    (t (c)~
-                     ~%      (setf (mem-ref #x10000C70 :u64) 2000)~
+                     ~%      (progn (setf (mem-ref #x10000C70 :u64) 2000) (setf (mem-ref #x10000D30 :u64) 0))~
                      ~%      (%test-crash-fail-c id c))))~
                      ~%;; Kept for kernel-main setq compatibility (unused on bare metal).~
                      ~%(defvar *wstatus-addr* #x100001A0)~
@@ -4652,6 +4676,11 @@
                      ~%  (write-string-serial \" FIRST=\") (print-dec first-id)~
                      ~%  (write-string-serial \" LAST=\")  (print-dec last-id)~
                      ~%  (write-string-serial \" REASON=\") (write-string-serial reason)~
+                     ~%  ;; Fault diag: last faulting RIP + last rescue-path RIP (low 32~
+                     ~%  ;; bits, decimal), captured by the #PF recovery (boot-x64.lisp).~
+                     ~%  (write-string-serial \" FRIP=\") (print-dec (mem-ref #x10000C30 :u32))~
+                     ~%  (write-string-serial \" RRIP=\") (print-dec (mem-ref #x10000C60 :u32))~
+                     ~%  (write-string-serial \" RB=\") (print-dec (mem-ref #x10000D90 :u32))~
                      ~%  (write-char-serial 10))~
                      ~%;; BARE-METAL fork-file: sequential pass-through — no fork/wait4/~
                      ~%;; alarm.  Per-test isolation comes from run-test's handler-case +~
@@ -4664,16 +4693,87 @@
                      ~%  ;; terminal skip value can't silently suppress this file's tests.~
                      ~%  (when (and (> first-id 0) (> *skip-below* first-id))~
                      ~%    (setq *skip-below* first-id))~
+                     ~%  ;; LINUX-FORK PARITY: snapshot the handler-stack depth + the~
+                     ~%  ;; current armed frame at entry; restore at exit and clear the~
+                     ~%  ;; live-overflow word.  On Linux each file runs in a fork whose~
+                     ~%  ;; handler-stack state dies with the child (the child even zeroes~
+                     ~%  ;; 0x10000180/0x10000400 at entry) — sequential bare metal must~
+                     ~%  ;; re-base the same way or any intra-file push/pop imbalance~
+                     ~%  ;; accumulates across all 17K tests (the drain-to-depth-0 halt).~
+                     ~%  ;; Publish the safepoint boundary (tagged fn pointer's raw bits —~
+                     ~%  ;; the low OR-3 tag is irrelevant for the >= compare).~
+                     ~%  (setf (mem-ref #x10000DA0 :u64) (function %hs-safepoint-boundary))~
+                     ~%  (setf (mem-ref #x10000D40 :u64) (mem-ref #x10000400 :u64))~
+                     ~%  (setf (mem-ref #x10000D48 :u64) (mem-ref #x10000180 :u64))~
+                     ~%  (setf (mem-ref #x10000D50 :u64) (mem-ref #x10000188 :u64))~
+                     ~%  (setf (mem-ref #x10000D58 :u64) (mem-ref #x10000190 :u64))~
+                     ~%  (setf (mem-ref #x10000D60 :u64) (mem-ref #x10000198 :u64))~
                      ~%  ;; File-budget watchdog: covers init forms / chunk prologues /~
                      ~%  ;; glue between tests (see run-test comment).  This handler-case~
                      ~%  ;; is the longjmp target for any watchdog expiry outside a~
                      ~%  ;; narrower armed frame.~
-                     ~%  (setf (mem-ref #x10000C70 :u64) 2000)~
-                     ~%  (handler-case (funcall thunk)~
-                     ~%    (t (c)~
-                     ~%      (%report-file-wedge file-name first-id last-id \"escape\")~
-                     ~%      (%stamp-remaining-fails first-id last-id)))~
-                     ~%  (setf (mem-ref #x10000C70 :u64) 0))~%")
+                     ~%  (progn (setf (mem-ref #x10000C70 :u64) 2000) (setf (mem-ref #x10000D30 :u64) 0))~
+                     ~%  (handler-case~
+                     ~%    (progn~
+                     ~%      ;; NO-HANDLER RESCUE arming: [180..198] now holds THIS~
+                     ~%      ;; handler-case's setjmp frame.  Copy it to the rescue slots~
+                     ~%      ;; #x10000D68..D80: if a fault ever finds NO armed handler~
+                     ~%      ;; (drained stack), the #PF recovery longjmps HERE instead of~
+                     ~%      ;; halting the machine — the file is recorded as a wedge and~
+                     ~%      ;; the run continues (= Linux's dead-fork + parent-continues).~
+                     ~%      ;; [0x10000D90] is the rescue BUDGET (multi-shot): the~
+                     ~%      ;; corrupted-condition class (gcd.5 bignum-SAR poison) can~
+                     ~%      ;; fault again while the wedge is being reported; each rescue~
+                     ~%      ;; decrements the budget, 0 halts (guaranteed termination).~
+                     ~%      (setf (mem-ref #x10000D70 :u64) (mem-ref #x10000188 :u64))~
+                     ~%      (setf (mem-ref #x10000D78 :u64) (mem-ref #x10000190 :u64))~
+                     ~%      (setf (mem-ref #x10000D80 :u64) (mem-ref #x10000198 :u64))~
+                     ~%      (setf (mem-ref #x10000D90 :u32) 50)~
+                     ~%      (setf (mem-ref #x10000D68 :u64) (mem-ref #x10000180 :u64))~
+                     ~%      (funcall thunk))~
+                     ~%    ;; NOTE: (t () ...) — NO condition variable, deliberately.~
+                     ~%    ;; Binding one compiles to (let ((c *current-condition*)) ...)~
+                     ~%    ;; whose SPECIAL LOOKUP interns/walks heap tables — after a~
+                     ~%    ;; rescue landing those may be the very thing the poison test~
+                     ~%    ;; corrupted (observed: intern bucket walk #PF at~
+                     ~%    ;; CR2=0x76CCCCCCCC on EVERY landing, 50 rescue bounces, halt).~
+                     ~%    ;; The var-less clause compiles to a bare PROGN: serial +~
+                     ~%    ;; fixed-memory-only reporting that avoids the corrupted heap.~
+                     ~%    (t ()~
+                     ~%      ;; Clear any stale deadline-pending FIRST: pending >= 3 accrued~
+                     ~%      ;; during the drain cascade would otherwise be consumed by the~
+                     ~%      ;; first runtime-region yield INSIDE the wedge report, aborting~
+                     ~%      ;; it mid-line (observed: \"FILE-WEDGE FILE=acosh FIRST=\" cut).~
+                     ~%      (setf (mem-ref #x10000D30 :u64) 0)~
+                     ~%      (setf (mem-ref #x10000C70 :u64) 2000)~
+                     ~%      ;; Wedge reporting under its OWN handler-case: after a rescue~
+                     ~%      ;; landing, heap/condition state may be poisoned enough that~
+                     ~%      ;; even reporting faults — absorb it here (fresh setjmp frame)~
+                     ~%      ;; instead of re-draining to the halt path.~
+                     ~%      (handler-case~
+                     ~%        (progn~
+                     ~%          (%report-file-wedge file-name first-id last-id \"escape\")~
+                     ~%          (%stamp-remaining-fails first-id last-id))~
+                     ~%        (t () nil))))~
+                     ~%  ;; Do NOT disarm the rescue frame at exit: a no-handler fault in~
+                     ~%  ;; the INTER-FILE GAP with D68=0 was a hard halt (observed:~
+                     ~%  ;; CR2=0xDEAD0001 gap fault, RIP=halt).  The just-returned~
+                     ~%  ;; fork-file frame remains a viable landing — its stack slots~
+                     ~%  ;; are intact until the next call reuses them, and its clause +~
+                     ~%  ;; return path lead back INTO the live dispatcher, which then~
+                     ~%  ;; proceeds to the next file.  The next fork-file entry re-arms~
+                     ~%  ;; D68..D90 with fresh values.~
+                     ~%  ;; Keep the watchdog RUNNING across the inter-file gap (do NOT~
+                     ~%  ;; disarm): a post-wedge hang in the glue between files was~
+                     ~%  ;; unrecoverable with C70=0.  The per-file handler-case in~
+                     ~%  ;; run-real-ansi-tests is the gap's longjmp target.~
+                     ~%  (progn (setf (mem-ref #x10000C70 :u64) 2000) (setf (mem-ref #x10000D30 :u64) 0))~
+                     ~%  (setf (mem-ref #x10000400 :u64) (mem-ref #x10000D40 :u64))~
+                     ~%  (setf (mem-ref #x10000180 :u64) (mem-ref #x10000D48 :u64))~
+                     ~%  (setf (mem-ref #x10000188 :u64) (mem-ref #x10000D50 :u64))~
+                     ~%  (setf (mem-ref #x10000190 :u64) (mem-ref #x10000D58 :u64))~
+                     ~%  (setf (mem-ref #x10000198 :u64) (mem-ref #x10000D60 :u64))~
+                     ~%  (setf (mem-ref #x10000D20 :u64) 0))~%")
                    ;; WS3 P1 differential-gate runtime helpers — only under the
                    ;; flag, so flag-off *real-ansi-sources* (and thus the binary)
                    ;; is byte-identical to baseline.  These call eval (tree-walker)
@@ -4804,13 +4904,19 @@
                          (let* ((entry (find name by-name :test #'string= :key #'car))
                                 (first-id (if entry (second entry) nil))
                                 (last-id  (if entry (third  entry) nil)))
+                           ;; Each per-file call sits in its OWN handler-case:
+                           ;; it is the longjmp target for a deadline expiring
+                           ;; in the INTER-FILE GAP (fork-file no longer
+                           ;; disarms the watchdog at exit) and a last-ditch
+                           ;; escape absorber — Linux-parity, where a dead
+                           ;; fork can never take the dispatcher with it.
                            (cond
                              ((and first-id last-id)
                               (format s "  (when (%ansi-file-in-range ~D ~D)~%" first-id last-id)
-                              (format s "    (fork-file ~S ~D ~D (lambda () (run-ansi-~A))))~%"
+                              (format s "    (handler-case (fork-file ~S ~D ~D (lambda () (run-ansi-~A))) (t () nil)))~%"
                                       name first-id last-id name))
                              (t
-                              (format s "  (fork-file ~S 0 0 (lambda () (run-ansi-~A)))~%"
+                              (format s "  (handler-case (fork-file ~S 0 0 (lambda () (run-ansi-~A))) (t () nil))~%"
                                       name name))))))))  ; close format+cond+let*+dolist+let by-name + progn + if diff-mode
                      (format s ")~%")
                      ;; WS3 P1: parallel differential dispatcher.  Same per-file
@@ -5052,6 +5158,10 @@
   (setf (mem-ref #x10000C48 :u64) 0)
   (setf (mem-ref #x10000C50 :u64) 0)
   (setf (mem-ref #x10000C58 :u64) 0)
+  ;; Safepoint boundary (fork-file publishes the real value; 0 =
+  ;; always-consume until then).  0xA0 offset exceeds the boot zero
+  ;; block's disp8 loop, so it is zeroed here instead.
+  (setf (mem-ref #x10000DA0 :u64) 0)
 
   ;; Initialize runtime
   (init-symbol-table)

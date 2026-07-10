@@ -1690,6 +1690,20 @@
           (error (c)
             (if (mvm-handlers state)
                 (setf %lj c)
+                (error c)))
+          ;; NON-ERROR conditions arrive here too: CLHS `error` accepts ANY
+          ;; condition designator, and asdf's report-invalid-form does
+          ;; `(apply 'error 'invalid-source-registry …)` — a WARNING
+          ;; subtype.  In-image, such a condition longjmps natively but
+          ;; matched NO clause here, so it fell PAST every bytecode
+          ;; handler-case frame (the interpreted program's own T-clauses
+          ;; never saw it) straight into the toplevel load swallow —
+          ;; the uncatchable find-system silent death.  Bridge it exactly
+          ;; like the error clause.  (In-image, `warn`/`signal` never
+          ;; longjmp, so only error-of-a-non-error-condition lands here.)
+          (condition (c)
+            (if (mvm-handlers state)
+                (setf %lj c)
                 (error c))))
         (when %lj
           (let ((rpc (%mvm-longjmp-restore state)))

@@ -195,6 +195,24 @@
       (error "fmakunbound: not a function name"))
     (let ((name (car nh))
           (hash (cdr nh)))
+      ;; eval2 installs a module's top-level DEFUNs at BUILD time, before
+      ;; the module's code executes — so a runtime fmakunbound that
+      ;; textually PRECEDES the defun in the same module (uiop defun*:
+      ;; (progn (fmakunbound 'f) (defun f …))) would run AFTER the install
+      ;; and undo it, leaving F undefined (asdf's resolve-location class).
+      ;; Honor source order: skip removal when the RUNNING module is
+      ;; (re)defining this very name (*e2-active-defun-names*, eval2.lisp).
+      ;; The pathological inverse (defun f … then fmakunbound 'f in ONE
+      ;; toplevel form) is thereby left defined — accepted trade-off.
+      (when (and (> (length name) 0)
+                 (boundp '*e2-active-defun-names*)
+                 *e2-active-defun-names*
+                 (let ((cur *e2-active-defun-names*) (hit nil))
+                   (loop
+                     (when (null cur) (return hit))
+                     (when (string-equal name (car cur)) (setq hit t) (setq cur nil))
+                     (when cur (setq cur (cdr cur))))))
+        (return-from fmakunbound sym))
       (when (and (> (length name) 0) *symbol-function-table*)
         (remhash name *symbol-function-table*))
       (when *native-sym-function-table*

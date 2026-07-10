@@ -25,6 +25,21 @@
    is correct: the RESULT depends on live runtime state, not the cache.  bc is a
    COPY (mvm-buffer-used-bytes) so it's safe despite *eval2-buffer* reuse.")
 
+(defvar *e2-active-defun-names* nil
+  "Names (strings) of the top-level DEFUNs of the eval2 module CURRENTLY
+   being interpreted.  Def persistence installs those defuns' trampolines
+   at module-BUILD time — BEFORE the module's code runs — so a runtime
+   (fmakunbound 'f) executing before the (defun f …) in the same module
+   (uiop's defun* expands `(defun* (f) …)` to exactly
+   `(progn (fmakunbound 'f) (defun f …))`) would UNDO the installation
+   and leave F undefined (the asdf resolve-location /
+   process-source-registry-directive silent-death class).  fmakunbound
+   consults this list and SKIPS removal for names the running module is
+   (re)defining, honoring source order.  Set (lexical-save + setq-restore)
+   around the module run in eval2-forms; a condition escaping the run can
+   leave it stale, which self-heals at the next eval2-forms call and at
+   worst makes an unrelated fmakunbound of one of these names a no-op.")
+
 (defvar *eval2-no-cache* nil
   "When T, eval2-forms bypasses *eval2-cache* entirely (neither hit nor
    store) for the current call.  Set (setq + unwind-protect restore) by
@@ -407,12 +422,20 @@
             ;; function object.
             ;; MULTIPLE VALUES propagate — same *mvm-last-mv* + values-list
             ;; re-emission as %eval2-run-tuple (see the comment there).
-            (let* ((%prim (%mvm-wrap-escaping-result
-                            (mvm-interpret bc :entry-point entry :function-table fn-table
-                                           :runtime-table rt-table :return-raw nil
-                                           :lambda-offsets lam-offsets)
-                            bc fn-table rt-table lam-offsets))
+            ;; *e2-active-defun-names* = persist-names for the duration of the
+            ;; run so fmakunbound honors source order vs the pre-run defun
+            ;; installation (see the defvar).  Lexical-save + setq-restore
+            ;; (nested eval2 during the run saves/restores its own).
+            (let* ((%adn-saved *e2-active-defun-names*)
+                   (%prim (progn
+                            (setq *e2-active-defun-names* persist-names)
+                            (%mvm-wrap-escaping-result
+                              (mvm-interpret bc :entry-point entry :function-table fn-table
+                                             :runtime-table rt-table :return-raw nil
+                                             :lambda-offsets lam-offsets)
+                              bc fn-table rt-table lam-offsets)))
                    (%mv *mvm-last-mv*))
+              (setq *e2-active-defun-names* %adn-saved)
               (if %mv
                   (if (eql (car %mv) 0)
                       (values)

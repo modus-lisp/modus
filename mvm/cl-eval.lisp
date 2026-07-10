@@ -49,12 +49,28 @@
    its function value.  On miss, returns SYM itself so the caller's
    downstream dispatch falls through to direct-call (= same path that
    ran before this branch handled CL syms — preserves crash-or-recovery
-   behavior for unbound symbols)."
+   behavior for unbound symbols).
+
+   Tries the hash-keyed *native-sym-function-table* first, then falls
+   back to the NAME-keyed *symbol-function-table* via %sym-name-or-hash
+   — the same tier order symbol-function uses.  Opcode-backed functions
+   like < / > / = are registered by NAME only, so without the fallback
+   (funcall '< 1 2) fell through to CALL-INDIRECT on the symbol itself:
+   \"MVM: CALL-IND with non-callable target\" — uiop's lexicographic<
+   (funcall element< …) with element< = '< , i.e. version<= /
+   version-deprecation, asdf gauntlet forms 112/233/236."
   (let ((h (aref sym 0)))
     (let ((fn (if *native-sym-function-table*
                   (gethash h *native-sym-function-table*)
                   nil)))
-      (if fn fn sym))))
+      (if fn
+          fn
+          (let ((nh (%sym-name-or-hash sym)))
+            (let ((nfn (and nh
+                            (> (length (car nh)) 0)
+                            *symbol-function-table*
+                            (gethash (car nh) *symbol-function-table*))))
+              (if nfn nfn sym)))))))
 
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:

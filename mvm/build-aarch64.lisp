@@ -5613,6 +5613,43 @@
                        1 0))
                (t (c) -1)))
   (write-char-serial 10)
+  ;; p8: GC-pressure interplay — fill most of the 56MB from-space with
+  ;; garbage so the ensuing bignum loop crosses MULTIPLE GC cycles
+  ;; (the real 13196 runs after ~3200 tests of heap state; the fresh-
+  ;; heap probes above never trigger a collection).  gcpress prints the
+  ;; GC count delta; p8 = the 13196 shape at repeat 10000 under that
+  ;; pressure; c9/c10 canaries detect post-loop poison.
+  (write-string-serial \"gc-before=\")
+  (print-dec (handler-case (mem-ref #x10000060 :u64) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"gcpress=\")
+  (print-dec (handler-case
+                 (let ((i 0))
+                   (loop (when (> i 2500000) (return 1))
+                     (cons i i)
+                     (setq i (+ i 1))))
+               (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p8-gcloop=\")
+  (print-dec (handler-case
+                 (let ((bound (ash 1 300)))
+                   (if (null (loop for x = (random-from-interval bound)
+                                   for a = (abs x)
+                                   repeat 10000
+                                   unless (if (plusp x) (eql x a) (eql (- x) a))
+                                   collect (list x a)))
+                       1 0))
+               (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"gc-after=\")
+  (print-dec (handler-case (mem-ref #x10000060 :u64) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c9-intern=\")
+  (print-dec (handler-case (if (eq (read-from-string \":ZAP9\") :zap9) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c10-funcall=\")
+  (print-dec (handler-case (if (funcall (quote evenp) 4) 1 0) (t (c) -1)))
+  (write-char-serial 10)
   (write-string-serial \"c7-intern=\")
   (print-dec (handler-case (if (eq (read-from-string \":ZAP7\") :zap7) 1 0) (t (c) -1)))
   (write-char-serial 10)

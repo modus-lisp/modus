@@ -5490,7 +5490,6 @@
                     `(cond ,@nlx-guard ,@dispatch-forms
                            (t (progn (%maybe-report-unhandled-hc) (%hc-longjmp))))
                     '(progn (%maybe-report-unhandled-hc) (%hc-longjmp)))))
-
           ;; Emit setjmp/handler pattern
           ;; SETJMP (#x0510) pushes outer handler state to the per-fork
           ;; handler stack at 0x10000400 before saving its own state at
@@ -14164,7 +14163,40 @@
    holds &optional params; the prologue NIL-inits any slot in that
    range that the caller didn't supply (so default-init thunks see
    NIL instead of the stale outgoing-arg register from the caller)."
-  (let* ((*ir-buffer* nil)
+  (let* (;; CROSS-UNIT escape pre-analysis — MUST be the FIRST binding:
+         ;; the two walker CALLS below would clobber a live caller-save
+         ;; temp holding an earlier lexical (return-label) in the
+         ;; MVM-compiled in-image compiler (the documented caller-save
+         ;; hazard) — computed first, nothing live can be clobbered.
+         ;;
+         ;; When a RETURN-FROM <fname> sits inside a nested LAMBDA/FLET/
+         ;; LABELS body, the defun's lexical *block-labels* entry is
+         ;; unreachable there (reset at the unit boundary) and the old
+         ;; fallback silently returned from the LOCAL function instead —
+         ;; asdf's search-for-system-definition `(flet ((try (f) …
+         ;; (return-from search-for-system-definition x))) (map () #'try
+         ;; …))` always returned NIL, killing find-system.  Mirror
+         ;; compile-block: when the body analysis finds such an escape
+         ;; (and a runtime catch can nest safely), compile the body as an
+         ;; explicit (BLOCK <name> …) — which installs the runtime CATCH
+         ;; frame + *nonlocal-blocks* entry — and suppress the lexical
+         ;; entry (compile-block's rule: with a catch frame, ALL
+         ;; return-from route through the THROW).
+         ;; Both walkers are wrapped in HANDLER-CASE: in-image they can
+         ;; signal on exotic boot-time body shapes (observed at boot in
+         ;; the generic image; unhandled, the escape corrupted the whole
+         ;; in-image compile — "Undefined branch target").  On a walker
+         ;; signal we conservatively fall back to the classic lexical-
+         ;; entry behavior for that defun.
+         (fn-blk-catch-p (and (symbolp name)
+                              (eq t (handler-case
+                                        (%return-from-escapes-block-p
+                                          body (normalize-name name) nil nil)
+                                      (t (c) :walker-signaled)))
+                              (eq nil (handler-case
+                                          (%block-runtime-catch-unsafe-p body)
+                                        (t (c) :walker-signaled)))))
+         (*ir-buffer* nil)
          (*current-function-name* (if (symbolp name) (symbol-name name)
                                       (string name)))
          (*temp-reg-counter* 0)
@@ -14202,7 +14234,8 @@
          ;; never types, so RETURN-FROM <that-gensym> can't appear
          ;; in source.  Block's dest is VR so RETURN-FROM <fname>
          ;; lands in the function-return register.
-         (*block-labels* (if (symbolp name)
+         ;;
+         (*block-labels* (if (and (symbolp name) (not fn-blk-catch-p))
                              (list (list name return-label +vreg-vr+ 0))
                              nil))
          (*tagbody-tags* nil)
@@ -14296,8 +14329,14 @@
       ;; invariant to preserve.
       (emit-optional-prologue opt-start opt-count)
 
-      ;; Compile body (strip any declarations), result goes to VR
-      (compile-progn (strip-declares body) env +vreg-vr+))
+      ;; Compile body (strip any declarations), result goes to VR.
+      ;; Cross-unit RETURN-FROM <fname> present: route through an explicit
+      ;; BLOCK so compile-block installs the runtime catch frame (see
+      ;; fn-blk-catch-p above).
+      (if fn-blk-catch-p
+          (compile-form (cons 'block (cons name (strip-declares body)))
+                        env +vreg-vr+)
+          (compile-progn (strip-declares body) env +vreg-vr+)))
 
     ;; Set MV count=1 for non-values functions (Genera-style).
     ;; Skip for functions that manually manage the MV buffer (e.g., VALUES, VALUES-LIST).

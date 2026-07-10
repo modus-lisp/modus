@@ -1679,6 +1679,14 @@
     ((null t1) (cons t t))
     ((eq t1 'nil) (cons t t))
     ((eq t2 't) (cons t t))
+    ;; CLOS class OBJECTS are type specifiers (CLHS 4.2.3): unwrap to the
+    ;; registered NAME symbol (slot 1) and recurse.  uiop's coerce-class
+    ;; calls (subtypep (find-class 'load-op) (find-class 'operation)) —
+    ;; the class arrays fell through every clause here to (nil . nil), so
+    ;; make-operation errored "Can't coerce LOAD-OP" (asdf gauntlet 241).
+    ((or (%clos-class-p t1) (%clos-class-p t2))
+     (%subtypep-result (if (%clos-class-p t1) (aref t1 1) t1)
+                       (if (%clos-class-p t2) (aref t2 1) t2)))
     ;; Same name as itself
     ((and (symbolp t1) (symbolp t2) (eq t1 t2)) (cons t t))
     ;; User DEFTYPE on either side — expand to the underlying type
@@ -1723,7 +1731,14 @@
     ((and (symbolp t1) (symbolp t2) (%find-clos-class t1) (%find-clos-class t2))
      (let* ((c1 (%find-clos-class t1))
             (cpl (aref c1 4)))  ; slot 4 = computed CPL
-       (cons (if (member t2 cpl :test #'eq) t nil) t)))
+       ;; eq first (native path, byte-identical); %clos-sym-name-eq second
+       ;; for the eval2 symbol-flavor / cross-package boundary (same
+       ;; slot-0 hash, different object) — mirrors %find-clos-class's
+       ;; two-pass order.
+       (cons (if (or (member t2 cpl :test #'eq)
+                     (member t2 cpl :test #'%clos-sym-name-eq))
+                 t nil)
+             t)))
     ;; t1 is a user CLOS class, t2 is built-in symbol — fall through to
     ;; the static hierarchy after asking %subtype-of-p; CLOS classes
     ;; that ultimately inherit from STANDARD-OBJECT pick up that lattice.

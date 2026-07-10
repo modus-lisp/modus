@@ -797,7 +797,16 @@
     ((eq n 'hash-table) '(atom))
     ((eq n 'restart) '(t))
     ((eq n 'atom) '(t))
-    (t nil)))
+    ;; User CLOS classes: consult the runtime class registry.  A defclass'd
+    ;; name's direct supers are stored in the class array (slot 3); a class
+    ;; with no explicit supers is under STANDARD-OBJECT.  This makes
+    ;; (subtypep 'load-op 'operation) walk the real CPL edges instead of
+    ;; returning unknown (asdf make-operation, gauntlet form 241).
+    (t (let ((cls (%find-clos-class n)))
+         (if cls
+             (let ((supers (aref cls 3)))
+               (if supers supers (list 'standard-object)))
+             nil)))))
 
 (defun %type-known-p (n)
   "Is N a recognized type name we know about?"
@@ -1163,6 +1172,14 @@
   (cond
     ;; Trivial cases
     ((eql t1 t2) (values t t))
+    ;; CLOS class OBJECTS are type specifiers (CLHS 4.2.3): compare by
+    ;; their registered NAMES.  uiop's coerce-class does
+    ;; (subtypep (find-class 'load-op) (find-class 'operation)) — without
+    ;; this the class array fell through every clause to (NIL NIL) and
+    ;; make-operation errored "Can't coerce LOAD-OP" (asdf gauntlet 241).
+    ((or (%clos-class-p t1) (%clos-class-p t2))
+     (%subtypep-impl (if (%clos-class-p t1) (aref t1 1) t1)
+                     (if (%clos-class-p t2) (aref t2 1) t2)))
     ((null t1) (values t t))
     ((eq t1 'nil) (values t t))
     ((eq t2 't) (values t t))

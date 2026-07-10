@@ -514,6 +514,16 @@
 (defun %argv1 () (%argv-string-at #x10000208))
 (defun %argv2 () (%argv-string-at #x10000248))
 (defun %argc  () (mem-ref #x10000200 :u32))
+;; Native diagnostic probes for the handler-frame chain (real RAM — an
+;; interpreted mem-ref only sees the interp's per-state simulated memory
+;; hash, so scripts must call these NATIVE fns to observe [#x10000400]
+;; (handler-stack depth) and [#x10000180] (current armed frame RSP)).
+(defun %hc-depth () (mem-ref #x10000400 :u32))
+(defun %hc-armed-p () (if (eql (mem-ref #x10000180 :u32) 0) nil t))
+;; Saved resume-IP (low 32 bits) of stacked frame N / the current frame —
+;; code addrs are < 4GB so :u32 (tagged load) is exact.
+(defun %hc-frame-ip (n) (mem-ref (+ #x10000408 (* 32 n) 16) :u32))
+(defun %hc-cur-ip () (mem-ref #x10000190 :u32))
 (defun kernel-main ()
   (init-symbol-table)
   (init-keyword-table)

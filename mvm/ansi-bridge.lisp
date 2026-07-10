@@ -5295,10 +5295,22 @@
   (let ((eof-marker (cons 'eof nil))
         (result t))
     (loop
+      ;; These T-clauses are the PRACTICAL BOTTOM of the handler-case
+      ;; ladder for anything loaded at toplevel: a condition matching no
+      ;; user clause used to be swallowed here with ZERO output (the
+      ;; caller just saw the form "return" — masked the GC signal-symbol,
+      ;; define-package and asdf find-system bugs).  Report loudly before
+      ;; the unchanged fallback (read error -> fake EOF stops the load;
+      ;; eval error -> NIL and continue).  Control flow is unchanged.
       (let ((form (handler-case (read stream nil eof-marker)
-                    (t (c) eof-marker))))
+                    (t (c)
+                       (%report-escaping-condition "load-read-error-stops-load")
+                       eof-marker))))
         (when (eq form eof-marker) (return t))
-        (let ((val (handler-case (eval form) (t (c) nil))))
+        (let ((val (handler-case (eval form)
+                     (t (c)
+                        (%report-escaping-condition "load-toplevel-form-swallowed")
+                        nil))))
           (when print
             (handler-case
                 (progn (write val :stream *standard-output*)

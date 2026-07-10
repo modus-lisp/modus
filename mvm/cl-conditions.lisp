@@ -512,6 +512,80 @@
 (defvar *catch-tag* nil)
 (defvar *catch-value* nil)
 
+;;; ============================================================
+;;; Unhandled-condition escape report (diagnostic, purely additive)
+;;; ============================================================
+;;;
+;;; A condition that matched NO armed handler-case clause used to leave the
+;;; current toplevel form via %hc-longjmp with ZERO output — the caller just
+;;; saw the form "return".  That silence has masked real bugs (GC-destroyed
+;;; signal-symbol table, define-package no-op cascade, asdf find-system
+;;; death).  compile-handler-case's dispatch tail now calls
+;;; %MAYBE-REPORT-UNHANDLED-HC just before its (t (%hc-longjmp)) re-longjmp:
+;;; if NO outer frame is armed, that longjmp is doomed (it would restore a
+;;; zero/stale frame), so we print one loud diagnostic line first.  Control
+;;; flow is UNCHANGED — same longjmp targets, same frames, just a print at
+;;; the no-match point.
+;;;
+;;; *%escape-trace* (boots NIL; setq-able at runtime from a probe script)
+;;; additionally reports EVERY %hc-longjmp initiation in `error` — the
+;;; scalpel for "what escaped and from where" investigations.
+
+(defvar *%escape-report-busy*)   ; recursion guard — boots NIL (defvars don't init)
+(defvar *%escape-trace*)         ; dev knob: report every error-signal longjmp
+
+(defun %report-escaping-condition (where)
+  "Print one loud diagnostic line describing *CURRENT-CONDITION*.
+   WHERE is a short static string naming the report site.  Defensive:
+   guarded against recursive signals and printer failures; never alters
+   the caller's control flow.  Text deliberately contains no '+' (the
+   ANSI harness counts pass-bytes on stdout)."
+  (if *%escape-report-busy*
+      nil
+      (progn
+        (setq *%escape-report-busy* t)
+        (write-string-serial "!! UNHANDLED-ESCAPE ")
+        (write-string-serial where)
+        (write-string-serial ": ")
+        (let ((c *current-condition*))
+          (handler-case
+              (if (%condition-p c)
+                  (progn
+                    (write-object (%condition-type-name c))
+                    (let ((fc (handler-case (simple-condition-format-control c)
+                                (t (c2) nil))))
+                      (when fc
+                        (write-string-serial " | ")
+                        (if (stringp fc)
+                            (write-string-serial fc)
+                            (write-object fc))))
+                    (let ((fa (handler-case (simple-condition-format-arguments c)
+                                (t (c2) nil))))
+                      (when fa
+                        (write-string-serial " ARGS=")
+                        (write-object fa)))
+                    (handler-case
+                        (let ((nm (cell-error-name c)))
+                          (when nm
+                            (write-string-serial " NAME=")
+                            (write-object nm)))
+                      (t (c2) nil)))
+                  (write-object c))
+            (t (c2) (write-string-serial "<report-print-error>"))))
+        (write-char-serial 10)
+        (setq *%escape-report-busy* nil))))
+
+(defun %maybe-report-unhandled-hc ()
+  "Called by compiled handler-case dispatch tails just before the
+   (t (%hc-longjmp)) that propagates an unmatched condition outward.
+   [#x10000180] already holds the NEXT OUTER frame (this frame was popped
+   when the longjmp landed here); if it is the no-handler sentinel the
+   re-longjmp is doomed — report loudly.  Otherwise stay silent (normal
+   outward propagation to an armed outer frame)."
+  (if (%error-handler-active-p)
+      nil
+      (%report-escaping-condition "hc-tail-no-outer-frame")))
+
 (defun error (msg &rest args)
   "Signal an error with a condition object."
   (%heal-handler-bind-skip)
@@ -539,8 +613,12 @@
           nil
           ;; Fall back to setjmp/longjmp
           (if (%error-handler-active-p)
-              (%hc-longjmp)
               (progn
+                (when *%escape-trace*
+                  (%report-escaping-condition "error-signal-trace"))
+                (%hc-longjmp))
+              (progn
+                (%report-escaping-condition "error-no-armed-handler")
                 (write-string-serial "ERR:")
                 (write-char-serial 10)
                 (halt)))))))
@@ -677,6 +755,7 @@
           (if (%error-handler-active-p)
               (%hc-longjmp)
               (progn
+                (%report-escaping-condition "cerror-no-armed-handler")
                 (write-string-serial "ERR:")
                 (write-char-serial 10)
                 (halt))))))
@@ -1310,7 +1389,13 @@
                 (values-list r))
               (if (%error-handler-active-p)
                   (%hc-longjmp)
-                  (halt))))))))
+                  ;; This (halt) was SILENT — exit(1) with zero output when a
+                  ;; condition escapes a %with-restarts frame (warn/cerror/
+                  ;; restart-case all route here) and no outer frame is armed.
+                  ;; Report before dying so the escape is diagnosable.
+                  (progn
+                    (%report-escaping-condition "with-restarts-no-armed-handler")
+                    (halt)))))))))
 
 ;;; Override invoke-restart: dispatches on the restart cell's 5th
 ;;; element.  If :case (set by %with-restarts), the cell came from a
@@ -1832,7 +1917,8 @@
   "Stub — just signal the error."
   (if (%error-handler-active-p)
       (%hc-longjmp)
-      (progn (write-string-serial "DEBUG:") (write-char-serial 10) (halt))))
+      (progn (%report-escaping-condition "invoke-debugger-no-armed-handler")
+             (write-string-serial "DEBUG:") (write-char-serial 10) (halt))))
 
 ;;; --- Override typep for package type ---
 

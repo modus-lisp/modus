@@ -5950,6 +5950,86 @@
                 (setf rest (cdr rest))))
             result)))))))
 
+(defun vars-read-in-lambdas (body-forms let-vars)
+  "Which LET-VARS are REFERENCED inside a lambda / flet / labels function
+   body in BODY-FORMS.  Complements vars-mutated-in-lambdas: a var a
+   closure CAPTURES (reads) while code OUTSIDE the closure mutates it
+   must be cell-boxed too, or the closure keeps a stale snapshot from
+   creation time.  uiop's split-string is the canonical shape: the flet
+   DONE reads END/LIST while the enclosing LOOP setf's them — unboxed,
+   DONE returned the whole string unsplit, and parse-version signalled
+   PARSE-ERROR on the un-split segment (asdf gauntlet forms 112/233/236/
+   241).  Callers intersect this with mutated-anywhere before boxing."
+  (let ((result nil))
+    (labels ((note (vs)
+               (dolist (v vs)
+                 (setq result (adjoin v result :test #'name-equal))))
+             (scan (form)
+               (unless (consp form) (return-from scan))
+               (let ((op (car form)))
+                 (cond
+                   ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+                        (and (integerp op) (= op 518921307293258709)))
+                    nil)
+                   ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+                        (and (integerp op) (= op 527981956251550024)))
+                    (let ((params (if (consp (cadr form))
+                                      (remove-if-not #'symbolp (cadr form))
+                                      nil)))
+                      (dolist (f (cddr form))
+                        (note (collect-var-refs f let-vars params)))))
+                   ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+                        (and (integerp op) (= op 113179339635393781)))
+                    (scan (cadr form)))
+                   ((or (and (symbolp op)
+                             (or (string= (symbol-name op) "FLET")
+                                 (string= (symbol-name op) "LABELS")))
+                        (and (integerp op) (= op 230909053785822708))
+                        (and (integerp op) (= op 176230696681611090)))
+                    (let ((defs (cadr form))
+                          (rest-body (cddr form)))
+                      (when (consp defs)
+                        (dolist (def defs)
+                          (when (and (consp def) (consp (cdr def)))
+                            (let ((fparams (if (consp (cadr def))
+                                               (remove-if-not #'symbolp (cadr def))
+                                               nil)))
+                              (dolist (f (cddr def))
+                                (note (collect-var-refs f let-vars fparams)))))))
+                      (dolist (f rest-body)
+                        (scan f))))
+                   (t
+                    (when (consp op) (scan op))
+                    (let ((rest (cdr form)))
+                      (loop while (consp rest) do
+                        (scan (car rest))
+                        (setf rest (cdr rest)))))))))
+      (dolist (f body-forms)
+        (scan f)))
+    result))
+
+(defun %boxed-vars-for-let (scan-forms let-vars)
+  "The cell-boxing set for a LET/LET* over LET-VARS with SCAN-FORMS (body,
+   plus init forms for LET*): vars mutated INSIDE a closure (the classic
+   case), UNION vars READ inside a closure and mutated ANYWHERE (the
+   capture-then-outer-mutation case — see vars-read-in-lambdas).
+   The union half is GATED to in-image runtime compiles (*eval2-runtime-p*):
+   applying it at build time boxed vars inside the in-image compiler's OWN
+   source (compile-flet's LOCAL-NAMES/CELL-NAMES, %loop-parse-cond-clauses,
+   %gf-dispatch-*), and the cell-rewrite of those shapes miscompiled —
+   every runtime flet lost its cross-unit RETURN value (probe R1:
+   (block nil (flet ((d () (return 42))) (d) 99)) → NIL).  Build-time
+   output stays byte-identical with the gate; the runtime-eval side (the
+   asdf gauntlet's split-string PARSE-ERROR cluster) gets the fix."
+  (let ((base (vars-mutated-in-lambdas scan-forms let-vars)))
+    (when *eval2-runtime-p*
+      (let ((mut (collect-setq-vars-in-body (cons 'progn scan-forms) let-vars)))
+        (dolist (v (vars-read-in-lambdas scan-forms let-vars))
+          (when (and (member v mut :test #'name-equal)
+                     (not (member v base :test #'name-equal)))
+            (setq base (cons v base))))))
+    base))
+
 (defun cell-var-name (var)
   "Generate the cell variable name for a boxed variable."
   (let ((base (cond ((symbolp var) (symbol-name var))
@@ -6343,7 +6423,7 @@
   ;; both inits and body.)
   (let* ((body-stripped (strip-declares body))
          (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
-         (boxed-vars (vars-mutated-in-lambdas body-stripped let-vars)))
+         (boxed-vars (%boxed-vars-for-let body-stripped let-vars)))
     (when boxed-vars
       (let* ((non-boxed-bindings
                (remove-if (lambda (b)
@@ -6451,7 +6531,7 @@
          (let-vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
          (init-forms (loop for b in bindings
                            when (consp b) collect (cadr b)))
-         (boxed-vars (vars-mutated-in-lambdas
+         (boxed-vars (%boxed-vars-for-let
                       (append init-forms body-stripped) let-vars)))
     (when boxed-vars
       ;; Walk the bindings in order, replacing each boxed V's slot with
@@ -6739,11 +6819,26 @@
               (when (null pairs) (return acc))
               (setq acc (%collect-free-vars (cadr pairs) bound env acc))
               (setq pairs (cddr pairs)))))
-         ;; Default: walk car AND cdr through the spine. This is the
-         ;; shape that does NOT trigger the dolist regression.
+         ;; Default: walk every ELEMENT as a form — spine-safe.  The old
+         ;; code recursed on (cdr form), a list TAIL, sending it back
+         ;; through the HEAD dispatch above; a tail whose first element
+         ;; was the bare SYMBOL quote/function/let/let*/lambda/setq was
+         ;; misparsed as that special form and skipped.  Concretely,
+         ;; (list 'quote function) — the expansion of `',function` — or
+         ;; (list function o) never collected FUNCTION, so a closure/flet
+         ;; body referencing a variable named FUNCTION (uiop's
+         ;; define-convenience-action-methods) compiled it as an unbound
+         ;; global.  Iterate elements; a dotted tail is a potential var ref.
          (t
-          (setq acc (%collect-free-vars (car form) bound env acc))
-          (%collect-free-vars (cdr form) bound env acc)))))))
+          (let ((cur form))
+            (loop
+              (cond
+                ((null cur) (return acc))
+                ((atom cur)
+                 (return (%collect-free-vars cur bound env acc)))
+                (t
+                 (setq acc (%collect-free-vars (car cur) bound env acc))
+                 (setq cur (cdr cur))))))))))))
 
 (defun %collect-free-vars-list (forms bound env acc)
   "Walk a list of forms (e.g. a lambda body). Iterates via plain LOOP

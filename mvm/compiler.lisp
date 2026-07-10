@@ -2755,7 +2755,18 @@
                  (dolist (p parsed-slots (nreverse acc))
                    (let ((sname (first p)) (readers (fourth p)))
                      (dolist (r readers)
-                       (push `(defun ,r (c) (%condition-slot c (quote ,sname)))
+                       ;; CLHS 9.1.1/7.6.2: a condition :reader defines a
+                       ;; METHOD on the generic named R.  If a GF of that
+                       ;; name already exists (defgeneric or a DEFCLASS
+                       ;; :accessor — asdf's component-name idiom), register
+                       ;; the reader as a method specialized on NAME so the
+                       ;; bare defun below doesn't CLOBBER the generic's
+                       ;; existing methods (which broke register-system's
+                       ;; (component-name system) with a TYPE-ERROR).  Only
+                       ;; when no GF exists do we install the plain defun.
+                       (push `(unless (%cond-install-reader
+                                       (quote ,r) (quote ,name) (quote ,sname))
+                                (defun ,r (c) (%condition-slot c (quote ,sname))))
                              acc)))))))
         `(progn ,def-call ,@reader-defuns))))
 
@@ -5460,18 +5471,24 @@
                ;; Guarding that frame made the NATIVE %hc-longjmp bypass the
                ;; interpreter entirely (SEGV on the plain cross-unit
                ;; return-from probe 401/9520 shape).  User code compiled at
-               ;; runtime has no such machinery, and the guard only fires on
-               ;; the internal block-tag range, so it is safe there.
+               ;; runtime has no such machinery, so it is safe there.
+               ;;
+               ;; The guard fires whenever *CATCH-ACTIVE* is set — i.e. a
+               ;; user CATCH/THROW or a cross-unit RETURN-FROM/BLOCK NLX is
+               ;; in flight.  A THROW is NOT a condition: only its matching
+               ;; %HANDLER-CASE-CATCH frame (catch-frame-p=T, no guard) may
+               ;; observe it.  Any intervening plain HANDLER-CASE/HANDLER-BIND
+               ;; on ERROR must be TRANSPARENT to it, or asdf's internal
+               ;; `(handler-bind ((error ...)) ...)` regions swallow the
+               ;; library's own THROW-based control flow (load-asd /
+               ;; with-asdf-cache) and re-signal it as a spurious
+               ;; LOAD-SYSTEM-DEFINITION-ERROR.  Previously the guard only
+               ;; passed the internal block-tag fixnum range (700M..800M),
+               ;; so user/asdf symbol-tag throws were caught as errors.
                (nlx-guard
                 (if (or catch-frame-p (not *eval2-runtime-p*))
                     nil
-                    '(((if *catch-active*
-                           (if (fixnump *catch-tag*)
-                               (if (> *catch-tag* 700000000)
-                                   (< *catch-tag* 800000000)
-                                   nil)
-                               nil)
-                           nil)
+                    '(((if *catch-active* t nil)
                        (%hc-longjmp)))))
                ;; Build the full cond dispatch.
                ;; The T tail calls %MAYBE-REPORT-UNHANDLED-HC before the

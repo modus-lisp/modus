@@ -333,6 +333,29 @@
           (if (null val2) nil val2))
         val)))
 
+;;; DEFINE-CONDITION :reader / :accessor support when the name is GENERIC.
+;;; Mirrors cl-clos.lisp's %clos-maybe-accessor-method (DEFCLASS case):
+;;; CLHS 7.6.2/9.1.1 — a condition slot :reader defines a METHOD on the
+;;; generic function of that name.  Modus's DEFINE-CONDITION expansion
+;;; emits a plain (defun READER (c) (%condition-slot c 'SLOT)); when a
+;;; DEFGENERIC / DEFCLASS-accessor of the SAME name already exists (asdf's
+;;; idiom: (defgeneric component-name (component)) + a component :accessor
+;;; component-name AND a `bad-system-name` condition :reader component-name),
+;;; that bare defun CLOBBERS the generic — every later dispatch on an
+;;; unrelated instance (register-system → (component-name system)) then ran
+;;; the condition's slot reader and TYPE-ERROR'd.  Fix: if a GF exists,
+;;; register the condition reader as a METHOD specialized on the condition
+;;; CLASS-NAME instead of shadowing the GF; return T so the expansion
+;;; suppresses the plain defun.  If no GF exists, return NIL → the plain
+;;; defun is installed (the common, byte-stable case).
+(defun %cond-install-reader (reader-name class-name slot-name)
+  (if (%find-gf reader-name)
+      (progn
+        (%defmethod reader-name nil (list class-name)
+                    (lambda (c) (%condition-slot c slot-name)))
+        t)
+      nil))
+
 (defun type-error-datum (c) (%condition-slot c 'datum))
 (defun type-error-expected-type (c) (%condition-slot c 'expected-type))
 (defun cell-error-name (c)
@@ -1027,6 +1050,15 @@
    Per CLHS, handlers that were considered before this handler are
    inhibited during its body; we implement this by skipping the first
    *handler-bind-effective-skip* frames of *handler-bind-stack*."
+  ;; NLX-transparency: a THROW / cross-unit RETURN-FROM in flight sets
+  ;; *CATCH-ACTIVE* and routes through (error "throw").  That "throw" is a
+  ;; control transfer, NOT a real condition — no handler-bind handler on
+  ;; ERROR/CONDITION may observe it (else asdf's internal
+  ;; `(handler-bind ((error ...)) ...)` regions run their handler on the
+  ;; library's own THROW and re-signal it as a spurious error).  Skip the
+  ;; whole walk; `error` then %hc-longjmps to the matching CATCH frame.
+  (when *catch-active*
+    (return-from %signal-condition nil))
   (let ((type-name (%condition-type-name cond-obj))
         (cur *handler-bind-stack*)
         (frame-idx 0)

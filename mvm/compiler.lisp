@@ -8099,6 +8099,19 @@
                                   (let ((g (gensym "BY")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf by-form g rest (cddr rest)))))))
+                    ;; Bare DOWNFROM with no end clause: iteration DIRECTION is
+                    ;; carried downstream ONLY by end-test (down-p / the
+                    ;; step-stmts push key off :downto/:above), so `for i
+                    ;; downfrom n' with no TO/DOWNTO/ABOVE stepped +1 — it
+                    ;; counted UP.  Record the direction as :downto with NO
+                    ;; end-form: the end check is gated on end-form, so this
+                    ;; yields "step -1, no end test" — exactly CLHS downfrom.
+                    ;; (uiop's length=n-p `loop :for i :downfrom n' returned
+                    ;; NIL for every proper list, making asdf reject every
+                    ;; source-registry directive as INVALID-SOURCE-REGISTRY —
+                    ;; the find-system silent-death bug.)
+                    (when (and downward (null end-form) (eq end-test :to))
+                      (setf end-test :downto))
                     ;; clause-binds is reverse-source-order (push reverses).
                     ;; Reverse so first-clause comes first; push to with-bindings
                     ;; in source order.  with-bindings is reversed before

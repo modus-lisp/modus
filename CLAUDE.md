@@ -82,7 +82,6 @@ mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   gc.lisp                    GC helper functions (Lisp-side)
   eval2.lisp                 Production eval: compile→MVM bytecode→interpret
   interp.lisp                MVM bytecode interpreter (in-image)
-  tree-walker.lisp   3,050L  LEGACY %eval-in-env engine — fork builds ONLY
 
 runtime/        Runtime type system
   tags.lisp            Tag/subtag definitions
@@ -195,29 +194,30 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 [✓] Everything else
 ```
 
-### Self-hosting (WS3): COMPLETE — production images are tree-walker-free
+### Self-hosting (WS3): FINISHED — the tree-walker is DELETED
 
-Production `eval`/`load` are **eval2 ONLY** (compile the form to MVM bytecode
-via the self-hosted compiler, run it through `mvm-interpret`).  As of STEP 4b
-(13526a6, 2026-07-09) the production images (build-x64-linux, build-generic)
-contain ZERO tree-walker code: the walker (`%eval-in-env` + its ~48-function
-engine) lives in **mvm/tree-walker.lisp**, loaded ONLY by the three legacy fork
-builds (build-aarch64, build-aarch64-linux,
-build-x64 — the bare-metal x64 ANSI runner), each of which also defines
-the `(defun eval2 (form) (%eval-in-env form nil))` bridge in its own build
-script.  The deletion gate was MEASURED: an instrumented census (every %e2ic
-fallback site printing its shape) showed ZERO walker hits across the full ANSI
-corpus and the full asdf gauntlet; the walker-free images gate at
-16335-16336 / CHUNK-CRASH=0 / FILE-WEDGE=30 with the gauntlet at 243/243.
-All flip/rollback levers are deleted.  If %e2ic-compile ever fails on a new
-shape, production signals an honest error (no silent second evaluator).
-Structural rules learned landing this: no `(eval …)` in kernel-main/boot
-paths; never define a duplicate defun name in shared image source; when a
-crash marker flips with unrelated edits, check the build-time SKIP/WARN list
-for garbage-execution paths (the :li-func offset-0 class, fixed a07fe7d)
-before theorizing.  Remaining WS3-adjacent follow-ups live in the task list
-(uncompilable chunk defuns ~200 tests; %hc-longjmp unhandled-condition
-report).  Next workstream: WS4 (runtime JIT — bytecode→native at runtime).
+There is ONE evaluator.  Production `eval`/`load` compile the form to MVM
+bytecode via the self-hosted compiler and run it through `mvm-interpret`
+(eval2).  The tree-walker (`%eval-in-env`) is GONE from the repository —
+deleted after every consumer was ported: the x64-Linux gate image, the
+generic/gauntlet image, the bare-metal x64 runner (build-x64.lisp), the
+Linux/AArch64 runner (build-aarch64-linux.lisp, verified natively on a
+Pi 5), and the bare-metal AArch64 runner (build-aarch64.lisp).  The
+deletion was census-gated: an instrumented build measured ZERO walker
+fallback invocations across the full ANSI corpus and the asdf gauntlet.
+An interp-closure shape eval2 cannot compile now SIGNALS an honest error
+(*e2ic-fallback-count* is the diagnostic; nonzero = new capability gap).
+E2SMOKE (the in-image compile→interpret self-test) passes at boot on
+x64-Linux, bare x64, aarch64-Linux (native Pi 5), and bare aarch64.
+Structural rules learned during the retirement: no `(eval …)` in
+kernel-main/boot init paths; never define a duplicate defun name in
+shared image source; when a crash marker flips with unrelated edits,
+check the build-time SKIP/WARN list for garbage-execution paths (the
+:li-func offset-0 class) before theorizing.  Follow-ups live in the task
+list (aa64 bignum×GC poison band; aa64 safepoint-deadline port; the
+compile-ash root fix = the bare-metal full-sweep blocker; GO-out-of-
+unwind-protect-cleanup NLX).  Next workstream: WS4 — the runtime JIT
+(bytecode→native at runtime), targeting the single evaluator.
 
 ## Build Commands
 

@@ -584,6 +584,13 @@
 ;; memory at PA 0x40090110 = VA 0x00090110, written when SP grew
 ;; past ~1.4 MB.  See task #47 audit for the original investigation.
 (defconstant +tdk-stack-va+      #x08000000)  ; Stack top (outside image)
+
+;; NIL register (x26) init value for the fixpoint entry.  Legacy fixpoint
+;; builds use 0; the bare-metal AArch64 ANSI runner (build-aarch64.lisp)
+;; sets #xDEAD0001 to match the modern compiler's +nil-value+ (compiled
+;; literals and interp.lisp's truthiness both key on that exact bit
+;; pattern).  Default 0 keeps existing fixpoint builds byte-identical.
+(defvar *aarch64-fixpoint-nil-value* 0)
 ;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
 ;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
 ;; boot loader sets x24=base and x25=mid-point (end of the initial
@@ -896,7 +903,10 @@
     ;; check explicitly CBZ's on it to catch `(funcall NIL)`.
     (emit-aarch64-load-imm64 buf x24 +tdk-cons-base-va+)   ; cons alloc
     (emit-aarch64-load-imm64 buf x25 +tdk-cons-limit-va+)  ; cons limit
-    (emit-aarch64-movz buf x26 0 0)                         ; NIL = 0
+    ;; NIL: 0 for legacy fixpoint builds, #xDEAD0001 for the ANSI runner
+    ;; (see *aarch64-fixpoint-nil-value* defvar above).  With value 0 this
+    ;; emits the single MOVZ the legacy sequence used (byte-identical).
+    (emit-aarch64-load-imm64 buf x26 *aarch64-fixpoint-nil-value*)
 
     ;; 18. Set TPIDR_EL1 = per-CPU data VA
     (emit-aarch64-load-imm64 buf x16 +tdk-percpu-va+)

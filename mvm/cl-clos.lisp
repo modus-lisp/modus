@@ -561,6 +561,45 @@
       (setq i (+ i 1)))
     new))
 
+(defun %clos-maybe-accessor-method (fn-name class-name slot-name kind)
+  "DEFCLASS reader/writer/accessor support for names that are GENERIC
+   (CLHS 7.6.2: defclass :reader/:accessor/:writer define METHODS on the
+   generic function of that name).  Modus's DEFCLASS macro emits plain
+   accessor DEFUNs; when a DEFGENERIC of the same name exists (uiop's
+   idiom: (defgeneric component-name (component)) then (defclass component
+   … :accessor component-name) in the same with-upgradability block), the
+   defgeneric's dispatch-stub registration runs AFTER the module's
+   trampoline install and shadows the defun — every call then dispatched
+   an EMPTY GF (asdf register-system → component-name, gauntlet form 241).
+   Called from the DEFCLASS expansion at execution time: if a GF exists,
+   register the accessor as a method specialized on CLASS-NAME; else no-op
+   (the plain defun serves).  KIND :writer gets (new-value obj) params."
+  (let ((gf (%find-gf fn-name)))
+    (when gf
+      (if (eq kind ':writer)
+          (%defmethod fn-name nil (list 't class-name)
+                      (lambda (nv obj) (set-slot-value obj slot-name nv)))
+          (%defmethod fn-name nil (list class-name)
+                      (lambda (obj) (slot-value obj slot-name))))))
+  nil)
+
+(defun %clos-make-initform-thunk (f)
+  "Identity pass-through for a defclass :initform thunk lambda.  The point
+   is the CALL BOUNDARY: under eval2, a captureless (lambda () initform)
+   materializes as an in-module #x52 closure whose slot-0 is a BYTECODE
+   OFFSET valid only while ITS OWN module is interpreted.  The DEFCLASS
+   expansion used to embed that closure inside the (list (cons 'slot
+   thunk) ...) argument to %register-clos-slot-info — nested in data, so
+   the native-bridge arg wrapper (%mvm-wrap-escaping, TOP-LEVEL args
+   only) never saw it.  A later MAKE-INSTANCE from a DIFFERENT module
+   funcalled the stale offset → garbage execution (asdf gauntlet form
+   241: make-instance 'component died with an uncaught \"throw\").
+   Passing the lambda as the SOLE argument of this native fn makes the
+   bridge wrap it into a re-entrant native trampoline bound to its
+   defining module; the returned value is what gets registered.  On the
+   native build path this is a plain identity call."
+  f)
+
 (defun %register-clos-slot-info (class-name initarg-map initform-map)
   "Register per-slot initarg→slot mapping and initform thunks for CLASS-NAME.
    Called from rewriter-emitted code right after %defclass."

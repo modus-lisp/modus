@@ -373,6 +373,35 @@
 (defvar *globals* (make-hash-table :test 'eql)
   "Set of known global variable names (hash -> t)")
 
+(defvar *runtime-special-names* nil
+  "In-image (eval2) registry of variable names PROCLAIMED special at
+   RUNTIME — a hash of name-hash → T populated by the DEFVAR /
+   DEFPARAMETER handlers (both mvm-compile-toplevel's and compile-form's
+   expression-context one) when *eval2-runtime-p*.  The let/let* implicit-
+   special detection consults it so `(let ((*user-var* v)) (callee))`
+   establishes a DYNAMIC binding visible to other compilation units, as
+   CLHS requires for a defvar'd name.  Without it only CLHS-standard
+   earmuffs rebound dynamically: uiop's make-operation bound
+   *in-make-operation* LEXICALLY, the initialize-instance :before guard
+   in another module read the unbound global, and every make-operation
+   errored (asdf gauntlet form 241).  Persistent across eval2 calls
+   (deliberately NOT reset per eval2-forms).  Host builds never populate
+   it (*eval2-runtime-p* stays NIL) — byte-identical.")
+
+(defun %note-runtime-special (name-hash)
+  "Record NAME-HASH as runtime-proclaimed-special (see *runtime-special-names*)."
+  (when *eval2-runtime-p*
+    (unless *runtime-special-names*
+      (setq *runtime-special-names* (make-hash-table :test 'eql)))
+    (setf (gethash name-hash *runtime-special-names*) t)))
+
+(defun %runtime-special-p (var)
+  "T when VAR was defvar'd/defparameter'd at runtime under eval2."
+  (and *eval2-runtime-p*
+       *runtime-special-names*
+       (symbolp var)
+       (gethash (normalize-name var) *runtime-special-names*)))
+
 (defvar *let-skip-implicit-specials* nil
   "When T, compile-form's let/let* dispatch skips the implicit-special
    detection for CLHS-standard earmuffs.  compile-let-with-specials
@@ -3247,16 +3276,33 @@
                     ((and (symbolp key) (string= (symbol-name key) "READER"))
                      (setq extra-defuns
                            (cons `(defun ,val (obj) (slot-value obj ',sname))
+                                 extra-defuns))
+                     ;; CLHS 7.6.2: when NAME is already GENERIC, the reader
+                     ;; must be a METHOD on that GF — the defgeneric's stub
+                     ;; registration otherwise shadows the plain defun (uiop
+                     ;; defgeneric-then-defclass idiom; asdf component-name,
+                     ;; gauntlet form 241).  No-op when no GF exists.
+                     (setq extra-defuns
+                           (cons `(%clos-maybe-accessor-method
+                                   ',val ',class-name ',sname ':reader)
                                  extra-defuns)))
                     ((and (symbolp key) (string= (symbol-name key) "WRITER"))
                      (setq extra-defuns
                            (cons `(defun ,val (nv obj) (set-slot-value obj ',sname nv))
+                                 extra-defuns))
+                     (setq extra-defuns
+                           (cons `(%clos-maybe-accessor-method
+                                   ',val ',class-name ',sname ':writer)
                                  extra-defuns)))
                     ((and (symbolp key) (string= (symbol-name key) "ACCESSOR"))
                      ;; reader NAME + setter SET-NAME (what compiler.lisp's
                      ;; SETF fallback emits for (setf (NAME obj) v)).
                      (setq extra-defuns
                            (cons `(defun ,val (obj) (slot-value obj ',sname))
+                                 extra-defuns))
+                     (setq extra-defuns
+                           (cons `(%clos-maybe-accessor-method
+                                   ',val ',class-name ',sname ':reader)
                                  extra-defuns))
                      (let ((set-name (intern (concatenate 'string "SET-"
                                                           (symbol-name val))
@@ -3269,8 +3315,18 @@
                      (setq initarg-pairs
                            (cons `(cons ',val ',sname) initarg-pairs)))
                     ((and (symbolp key) (string= (symbol-name key) "INITFORM"))
+                     ;; %clos-make-initform-thunk is a native identity fn:
+                     ;; passing the lambda as a TOP-LEVEL bridge argument
+                     ;; lets %mvm-wrap-escaping trampoline-wrap it under
+                     ;; eval2 (an in-module #x52 closure nested in the
+                     ;; %register-clos-slot-info list argument would escape
+                     ;; UNWRAPPED and execute garbage when a later
+                     ;; make-instance funcalls it from another module —
+                     ;; asdf make-instance 'component, gauntlet form 241).
                      (setq initform-pairs
-                           (cons `(cons ',sname (lambda () ,val))
+                           (cons `(cons ',sname
+                                        (%clos-make-initform-thunk
+                                         (lambda () ,val)))
                                  initform-pairs)))))
                 (setq cur (cddr cur))))))
         (setq slot-names (nreverse slot-names))
@@ -3759,7 +3815,10 @@
                                                   (%ensure-clhs-specials-table))
                                          (member (symbol-name var)
                                                  *clhs-extra-specials*
-                                                 :test #'string=))
+                                                 :test #'string=)
+                                         ;; runtime defvar'd names (eval2) —
+                                         ;; see *runtime-special-names*
+                                         (%runtime-special-p var))
                                      (not (member (symbol-name var) declared
                                                   :key #'symbol-name
                                                   :test #'string=)))
@@ -3783,7 +3842,10 @@
                                                   (%ensure-clhs-specials-table))
                                          (member (symbol-name var)
                                                  *clhs-extra-specials*
-                                                 :test #'string=))
+                                                 :test #'string=)
+                                         ;; runtime defvar'd names (eval2) —
+                                         ;; see *runtime-special-names*
+                                         (%runtime-special-p var))
                                      (not (member (symbol-name var) declared
                                                   :key #'symbol-name
                                                   :test #'string=)))
@@ -4052,6 +4114,7 @@
               (has-initform (consp (cddr form)))
               (name-hash (normalize-name var-name)))
          (setf (gethash name-hash *globals*) t)
+         (%note-runtime-special name-hash)
          (when has-initform
            (compile-form `(set-symbol-value ,name-hash ,value-form) env dest))
          (compile-quote var-name dest)))
@@ -14968,6 +15031,7 @@
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
+       (%note-runtime-special name-hash)
        ;; Compile as a thunk that initializes the variable
        ;; IMPORTANT: 1) Use raw name-hash (NOT pre-shifted), because
        ;; compile-integer will apply fixnum-shift. Pre-shifting causes
@@ -14993,6 +15057,7 @@
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
+       (%note-runtime-special name-hash)
        (when has-initform
          (let ((tmp-var (gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))

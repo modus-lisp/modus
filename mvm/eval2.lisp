@@ -88,7 +88,20 @@
           ;; macros in *macro-table* (loop, handler-case, dolist, …) never
           ;; expand to toplevel defuns — skip them so the pre-scan doesn't
           ;; double-run their expanders on every eval2 call.
-          ((and *macro-table* (gethash (normalize-name (car f)) *macro-table*))
+          ;; EXCEPTIONS: DEFCLASS / DEFINE-CONDITION / DEFSTRUCT are bootstrap
+          ;; macros whose expansions DO contain toplevel defuns (slot
+          ;; accessor/reader/writer fns, struct constructors/accessors).
+          ;; Gated out, a single-form (eval '(defclass X … :accessor A-X))
+          ;; compiled A-X only in-module (the form is the %eval2-thunk BODY,
+          ;; so the compiler-recorded path never fires either) and every
+          ;; LATER eval got UNDEFINED-FUNCTION A-X — asdf's COMPONENT-CHILDREN
+          ;; / COMPONENT-OPERATION-TIMES (mark-component-preloaded, gauntlet
+          ;; form 241).  Let those three fall through to the expansion branch.
+          ((and *macro-table*
+                (not (string-equal hn "DEFCLASS"))
+                (not (string-equal hn "DEFINE-CONDITION"))
+                (not (string-equal hn "DEFSTRUCT"))
+                (gethash (normalize-name (car f)) *macro-table*))
            acc)
           (t
            (let ((ex (handler-case (macroexpand-1-mvm f)

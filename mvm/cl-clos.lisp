@@ -1062,6 +1062,61 @@
 ;;; the common (make-instance 'class :k v ...) shape inline; this defun
 ;;; handles the rest — class-object args, missing/extra args, runtime
 ;;; (eval `(make-instance ...)) callers).
+(defun %clos-cpl-name-member-p (class-name cpl-names)
+  "True if CLASS-NAME (a specializer symbol) is EQ to some entry in
+   CPL-NAMES, or name-matches one (eval2 class-name boundary)."
+  (let ((cur cpl-names))
+    (loop
+      (when (null cur) (return nil))
+      (when (or (eq (car cur) class-name)
+                (%clos-sym-name-eq (car cur) class-name))
+        (return t))
+      (setq cur (cdr cur)))))
+
+(defun %clos-init-gf-allows-other-keys-p (gf-name cpl-names)
+  "Scan the methods of GF-NAME (initialize-instance / shared-initialize)
+   for one specialized on a class in CPL-NAMES whose stored method
+   lambda-list contains &ALLOW-OTHER-KEYS.  CLHS 7.1.2: such a method
+   makes EVERY keyword argument a valid initarg for MAKE-INSTANCE."
+  (let ((gf (%find-gf gf-name)))
+    (when gf
+      (let ((methods (%gf-methods gf)))
+        (let ((cur methods))
+          (loop
+            (when (null cur) (return nil))
+            (let* ((m (car cur))
+                   (specs (%method-specializers m))
+                   ;; the class specializer is the LAST required arg for
+                   ;; shared-initialize (obj slot-names) → index 0; for
+                   ;; initialize-instance (obj) → index 0.  We only need
+                   ;; the object specializer, always position 0.
+                   (obj-spec (car specs)))
+              (when (and obj-spec
+                         (%clos-cpl-name-member-p obj-spec cpl-names))
+                ;; %gf-record-method-meta stores
+                ;;   (has-key has-rest aok key-name-strings)
+                ;; so &ALLOW-OTHER-KEYS is at index 2.
+                (let ((meta (%gf-method-meta-for gf m)))
+                  (when (and meta (nth 2 meta))
+                    (return t)))))
+            (setq cur (cdr cur))))))))
+
+(defun %clos-class-cpl-names (class-name)
+  "CLASS-NAME consed onto its CPL (the class itself + ancestors)."
+  (let ((cls (%find-clos-class class-name)))
+    (if cls (aref cls 4) (list class-name))))
+
+(defun %clos-methods-accept-other-initargs-p (class-name)
+  "CLHS 7.1.2: MAKE-INSTANCE accepts ANY keyword when an applicable
+   INITIALIZE-INSTANCE or SHARED-INITIALIZE method (specialized on a class
+   in CLASS-NAME's CPL) declares &ALLOW-OTHER-KEYS.  asdf's
+   `initialize-instance :after ((plan plan-traversal) &key ... &allow-other-keys)`
+   is exactly this shape — without honoring it, (make-instance 'sequential-plan
+   :system s :verbose t) wrongly rejected :verbose and every asdf OPERATE died."
+  (let ((cpl-names (%clos-class-cpl-names class-name)))
+    (or (%clos-init-gf-allows-other-keys-p 'initialize-instance cpl-names)
+        (%clos-init-gf-allows-other-keys-p 'shared-initialize cpl-names))))
+
 (defun %clos-initarg-key-valid-p (class-name key)
   "True if KEY is a declared :initarg for some slot of CLASS-NAME (walking
    the CPL), or one of the always-accepted standard initargs.  Used to
@@ -1130,6 +1185,10 @@
                   (when v (setq aok t)))
                 (return nil)))
             (setq dc (cdr dc))))))
+    ;; CLHS 7.1.2: an applicable INITIALIZE-INSTANCE / SHARED-INITIALIZE
+    ;; method declaring &ALLOW-OTHER-KEYS makes all keywords valid initargs.
+    (when (and (not aok) (%clos-methods-accept-other-initargs-p class-name))
+      (setq aok t))
     ;; 3. Unless :allow-other-keys, every supplied initarg must be valid.
     (unless aok
       (let ((c2 initargs))
@@ -2273,6 +2332,62 @@
         (%gf-set-methods gf (cons new-method (nreverse filtered))))
       new-method)))
 
+(defun %setf-gf-alias-name (gf-name)
+  "If GF-NAME is a (SETF INNER) function-name list, return the string
+   \"SET-<INNER>\" — the symbol the compiler's SETF-place expansion
+   (compiler.lisp: (setf (INNER args) v) -> (SET-INNER args v)) calls.
+   The (setf INNER) GF itself installs under \"SETF-INNER\" (the SETF-NAME
+   convention in %sym-name-or-hash), so without this alias the two never
+   connect and (setf (plan-action-status ...) ...) hit UNDEFINED-FUNCTION
+   SET-PLAN-ACTION-STATUS.  Returns NIL for a plain symbol name."
+  (when (and (consp gf-name) (consp (cdr gf-name)) (null (cddr gf-name)))
+    (let ((head (car gf-name))
+          (inner (cadr gf-name)))
+      (let ((hn (cond ((stringp head) head)
+                      ((%cl-sym-p head) (%cl-sym-name head))
+                      ((symbolp head) (symbol-name head))
+                      (t nil))))
+        (when (and hn (string= hn "SETF")
+                   (or (symbolp inner) (stringp inner) (%cl-sym-p inner)))
+          (let ((in (cond ((stringp inner) inner)
+                          ((%cl-sym-p inner) (%cl-sym-name inner))
+                          (t (symbol-name inner)))))
+            (concatenate 'string "SET-" in)))))))
+
+(defun %setf-alias-reorder-call (gf-name args)
+  "The compiler's SETF-place expansion calls (SET-INNER place-args... VALUE)
+   — VALUE LAST.  A (SETF INNER) generic function follows the CL convention
+   VALUE FIRST: (setf INNER) is called (new-value place-args...).  Rotate
+   the trailing VALUE to the front, then dispatch the (SETF INNER) GF."
+  (when (null args) (return-from %setf-alias-reorder-call nil))
+  ;; Split ARGS into (place-args... . value): value is the last element.
+  (let ((place nil) (cur args))
+    (loop
+      (when (null (cdr cur)) (return nil))
+      (setq place (cons (car cur) place))
+      (setq cur (cdr cur)))
+    (let ((value (car cur)))
+      (%gf-dispatch gf-name (cons value (nreverse place))))))
+
+(defun %install-setf-gf-alias (gf-name stub)
+  "Install a reordering wrapper in the function tables under the
+   SET-<INNER> symbol name so the compiler's SETF-place call
+   (SET-INNER place... VALUE) resolves to the (SETF INNER) GF with the
+   CL value-first convention.  No-op unless GF-NAME is a (SETF INNER) list.
+   STUB is accepted for signature symmetry but not used directly (we need
+   the arg rotation)."
+  (declare (ignore stub))
+  (let ((alias (%setf-gf-alias-name gf-name)))
+    (when alias
+      (let ((hash (compute-name-hash alias))
+            (wrapper (lambda (&rest args)
+                       (%setf-alias-reorder-call gf-name args))))
+        (unless *symbol-function-table* (%sft-init))
+        (puthash alias *symbol-function-table* wrapper)
+        (when *native-sym-function-table*
+          (puthash hash *native-sym-function-table* wrapper)))))
+  nil)
+
 (defun %defmethod-full (gf-name qualifier specializers fn params)
   "Full runtime DEFMETHOD semantics — the eval2 DEFMETHOD expansion's
    single entry point (compiler.lisp's DEFMETHOD macro under
@@ -2312,6 +2427,10 @@
   ;; convention), and fboundp uses the same %sym-name-or-hash keying.
   (when (and (%sym-name-or-hash gf-name) (not (fboundp gf-name)))
     (set-symbol-function gf-name (%make-gf-stub gf-name)))
+  ;; For a (SETF INNER) GF, also alias the dispatch stub under the
+  ;; SET-INNER symbol the compiler's SETF-place expansion calls.
+  (when (fboundp gf-name)
+    (%install-setf-gf-alias gf-name (fdefinition gf-name)))
   (let ((m (%defmethod gf-name qualifier specializers fn)))
     (%gf-record-method-meta (%find-gf gf-name) m params)
     m))
@@ -2345,7 +2464,10 @@
    an eval2 defgeneric failed.  Mirrors the tree-walker's unconditional
    `(set-symbol-function gf-name (%make-gf-stub gf-name))`."
   (when (%sym-name-or-hash gf-name)
-    (set-symbol-function gf-name (%make-gf-stub gf-name)))
+    (set-symbol-function gf-name (%make-gf-stub gf-name))
+    ;; (SETF INNER) GF: alias the stub under SET-INNER for the compiler's
+    ;; SETF-place call convention (see %install-setf-gf-alias).
+    (%install-setf-gf-alias gf-name (fdefinition gf-name)))
   nil)
 
 (defun %dg-gf-callable (gf-name)

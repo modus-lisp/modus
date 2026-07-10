@@ -83,6 +83,18 @@
   (nargs    0)
   (cenv     nil)
   (mv-count 1)
+  ;; Simulated MV slots (#x10000090 count + #x10000098.. extras) in VALUE
+  ;; domain.  Slot 0 = the count word's value; slots 1..20 = the extra
+  ;; values.  These USED to live as raw byte-split words in the MEMORY hash
+  ;; — a heap pointer stored there was invisible to the moving GC, so any
+  ;; collection between a callee's op-values write and the caller's read
+  ;; (e.g. the cons-per-element loop in %mvm-collect-mv-secs) stranded the
+  ;; not-yet-read extras at their old from-space addresses.  Same class as
+  ;; the op-set-cenv raw-word bug (and the native trampoline's MV-area
+  ;; root-scan fix).  Probe: 700K interpreted 3-valued heap-value returns
+  ;; under ~2.5KB/iter alloc pressure = bad=58 (hash words) vs bad=0
+  ;; (value vector).
+  (mv-vals (make-array 21 :initial-element 0) :type simple-vector)
   ;; handler-case / catch / throw setjmp-longjmp stack.  Each entry is a
   ;; "jmp-buf": the bytecode resume-PC for the matching SETJMP (TRAP #x0510)
   ;; plus the snapshot of dynamic interp state to restore on LONGJMP (TRAP
@@ -120,14 +132,35 @@
 (defun mem-write-byte (state addr byte)
   (setf (gethash addr (mvm-memory state)) (logand byte #xFF)))
 
+;; The simulated MV region: count slot #x10000090, extra-value slots
+;; #x10000098 + i*8 (i = 0..19; the native reserved region ends at
+;; +closure-env-addr+ #x10000140).  u64 accesses to this range are routed
+;; to the VALUE-domain mv-vals vector so the moving GC traces the stored
+;; values (see the mv-vals field comment).  Sub-word accesses (never
+;; emitted for MV slots) and all other addresses keep the byte-hash path.
+(declaim (inline %mv-slot-index))
+(defun %mv-slot-index (addr width)
+  "Vector index into mvm-mv-vals for a u64 access to the MV region, else NIL."
+  (and (= width 3)
+       (>= addr #x10000090)
+       (< addr #x10000138)
+       (= 0 (logand addr 7))
+       (ash (- addr #x10000090) -3)))
+
 (defun mem-read (state addr width)
-  (let ((val 0))
-    (dotimes (i (ash 1 width) val)
-      (setf val (logior val (ash (mem-read-byte state (+ addr i)) (* i 8)))))))
+  (let ((mv (%mv-slot-index addr width)))
+    (if mv
+        (%val->word (svref (mvm-mv-vals state) mv))
+        (let ((val 0))
+          (dotimes (i (ash 1 width) val)
+            (setf val (logior val (ash (mem-read-byte state (+ addr i)) (* i 8)))))))))
 
 (defun mem-write (state addr val width)
-  (dotimes (i (ash 1 width))
-    (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))
+  (let ((mv (%mv-slot-index addr width)))
+    (if mv
+        (setf (svref (mvm-mv-vals state) mv) (%word->val val))
+        (dotimes (i (ash 1 width))
+          (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))))
 
 ;;; Object representation — REAL native CL objects (no simulation).  The
 ;;; interpreter is itself native code, so it allocates native objects and
@@ -587,14 +620,13 @@
                     (append (mvm-stack state) (list a))))
           (setf i (+ i 1)))
         (setf (mvm-nargs state) i)))
-    ;; The closure-env register is stored as a WORD (op-set-cenv does
-    ;; `reg-get` = %val->word) and read back as a VALUE (op-get-cenv does
-    ;; `reg-set` = %word->val).  INITIAL-CENV is a VALUE (slot 1 of the #x52
-    ;; closure), so encode it to a word here to match the round-trip op-get-cenv
-    ;; will perform — otherwise the captured-var extraction reads a corrupted
-    ;; env (a TYPE-ERROR / wrong value).
+    ;; The closure-env register is stored as a VALUE (op-set-cenv stores
+    ;; `svref regs vs` directly; op-get-cenv stores it back into the dest
+    ;; slot).  Storing the raw WORD here (the old `%val->word` round-trip)
+    ;; hid the env pointer from the moving GC — see the op-set-cenv comment.
+    ;; INITIAL-CENV is already a VALUE (slot 1 of the #x52 closure).
     (when initial-cenv
-      (setf (mvm-cenv state) (%val->word initial-cenv)))
+      (setf (mvm-cenv state) initial-cenv))
 
     ;; Initialize the SIMULATED MV-count slot to 1 (single value) so the
     ;; return path below can trust it even for a module that never writes
@@ -1593,12 +1625,25 @@
           (#.+op-get-nargs+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (reg-set regs vd (tag-fixnum (mvm-nargs state))) (setf pc npc)))
+          ;; CENV is stored as a VALUE (svref, not reg-get/reg-set): the raw
+          ;; WORD of a heap env (a fixnum-looking integer) is INVISIBLE to the
+          ;; moving GC, and the set-cenv -> callee-get-cenv window ALLOCATES
+          ;; (FRAME-ENTER's make-array).  A collection in that window moved the
+          ;; env cons and left (mvm-cenv state) pointing at from-space — the
+          ;; captured-var extraction then read the forwarding stamp / recycled
+          ;; memory.  This was THE asdf-gauntlet heap-layout-dice class
+          ;; (define-package TYPE-ERROR DATUM=NIL at forms 16/124/134/241,
+          ;; "MVM: unknown opcode", reader desync): every eval2 closure call
+          ;; that took a GC between caller set-cenv and callee get-cenv
+          ;; resurrected a stale env.  Probe: 700K interpreted capturing-
+          ;; closure calls under ~2.5KB/iter alloc pressure = bad=3 (word
+          ;; domain) vs bad=0 (value domain); non-capturing control clean.
           (#.+op-set-cenv+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
-             (setf (mvm-cenv state) (reg-get regs vs)) (setf pc npc)))
+             (setf (mvm-cenv state) (svref regs vs)) (setf pc npc)))
           (#.+op-get-cenv+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
-             (reg-set regs vd (mvm-cenv state)) (setf pc npc)))
+             (setf (svref regs vd) (mvm-cenv state)) (setf pc npc)))
           (#.+op-set-mv-count+
            (multiple-value-bind (n npc) (fetch-byte bc pc)
              (setf (mvm-mv-count state) n)

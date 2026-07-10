@@ -5779,6 +5779,15 @@
 ;; build-fixpoint byte-identical.
 (setf modus.mvm::*aarch64-fixpoint-nil-value* #xDEAD0001)
 
+;; BOOT RE-ENTRY GUARD (boot-aarch64.lisp Phase 0): a wild indirect jump
+;; to the image base re-runs the boot preamble, which rebuilds the page
+;; tables under the live MMU and kills the machine in a recursive fetch
+;; abort (observed: test 12996's GO-from-unwind-protect-cleanup NLX ended
+;; every run).  With the guard, boot re-entry longjmps to the armed
+;; handler-case instead — the test FAILs and the run continues
+;; (Linux-parity: a wild jump there is a recovered SIGSEGV).
+(setf modus.mvm::*aarch64-fixpoint-reentry-guard* t)
+
 ;; Install the AArch64 translator in BARE-METAL mode (no Linux syscalls,
 ;; default *aarch64-linux-mode* nil).  QEMU virt GICv2 init must be ON so
 ;; SETUP-IRQ (trap #x0320) enables the distributor/CPU interface + vtimer

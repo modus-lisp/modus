@@ -591,6 +591,13 @@
 ;; literals and interp.lisp's truthiness both key on that exact bit
 ;; pattern).  Default 0 keeps existing fixpoint builds byte-identical.
 (defvar *aarch64-fixpoint-nil-value* 0)
+
+;; Boot re-entry guard (see Phase 0 in emit-aarch64-fixpoint-entry).
+;; Default NIL emits nothing — legacy fixpoint builds byte-identical.
+;; The bare-metal ANSI runner sets T: a wild jump to the image base then
+;; longjmps to the armed handler-case instead of re-running boot (which
+;; would rebuild the page tables under the live MMU and kill the machine).
+(defvar *aarch64-fixpoint-reentry-guard* nil)
 ;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
 ;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
 ;; boot loader sets x24=base and x25=mid-point (end of the initial
@@ -646,6 +653,78 @@
         (x0 0) (x1 1) (x2 2) (x3 3) (x4 4)
         (x16 16) (x17 17)
         (x24 24) (x25 25) (x26 26))
+
+    ;; ================================================================
+    ;; Phase 0 (OPTIONAL, gated on *aarch64-fixpoint-reentry-guard*):
+    ;; BOOT RE-ENTRY GUARD.  A wild indirect jump in the running kernel
+    ;; (e.g. a corrupted longjmp/NLX target of exactly the image base)
+    ;; RE-EXECUTES this boot preamble — which then rebuilds the page
+    ;; tables under the live MMU, unmapping the code AND the exception
+    ;; vectors mid-flight: the machine dies in a recursive fetch abort
+    ;; at vector entry 4 (observed: bare-AArch64 ANSI runner, test
+    ;; 12996's GO-from-unwind-protect-cleanup NLX).  Guard: the cold
+    ;; boot stores a 64-bit magic at PA 0x50000FF0 just before entering
+    ;; native code; if the entry ever runs with the magic present, this
+    ;; is a RE-entry — treat it exactly like a sync exception: longjmp
+    ;; to the armed handler-case frame (slot 0x10000180, fallback
+    ;; 0x100001C0) with X0 = T, mirroring vector entry 4 (minus ERET —
+    ;; we are not in an exception).  PA 0x50000FF0 == VA 0x50000FF0
+    ;; under the identity L1[1] block, so the same address works both
+    ;; pre-MMU (cold, garbage-RAM false positive ~2^-64) and post-MMU
+    ;; (re-entry).  Default NIL emits NOTHING (legacy byte-identical).
+    (when *aarch64-fixpoint-reentry-guard*
+      ;; x16 = 0x50000FF0; x17 = [x16]
+      (emit-aarch64-movz buf x16 #x0FF0 0)
+      (emit-aarch64-movk buf x16 #x5000 16)
+      (emit-aarch64-u32 buf #xF9400211)          ; LDR x17,[x16]
+      ;; x18 = magic 0x1DEADEADB007CAFE
+      (emit-aarch64-movz buf 18 #xCAFE 0)
+      (emit-aarch64-movk buf 18 #xB007 16)
+      (emit-aarch64-movk buf 18 #xDEAD 32)
+      (emit-aarch64-movk buf 18 #x1DEA 48)
+      ;; CMP x17,x18 ; B.NE cold  (patched below)
+      (emit-aarch64-u32 buf #xEB12023F)          ; CMP x17,x18 (SUBS XZR,x17,x18)
+      (let ((bne-idx (a64-buffer-position buf)))
+        (emit-aarch64-u32 buf 0)                 ; B.NE placeholder
+        ;; ---- RE-ENTRY RECOVERY (mirrors vector entry 4) ----
+        ;; Diag: record the jumper's LR at 0x10000C30 (FELR field).
+        (emit-aarch64-u32 buf #xD2818611)        ; MOVZ x17,#0x0C30
+        (emit-aarch64-u32 buf #xF2A20011)        ; MOVK x17,#0x1000,lsl #16
+        (emit-aarch64-u32 buf #xF900023E)        ; STR x30,[x17]
+        (emit-aarch64-u32 buf #xD2803010)        ; MOVZ x16,#0x0180
+        (emit-aarch64-u32 buf #xF2A20010)        ; MOVK x16,#0x1000,lsl #16
+        (emit-aarch64-u32 buf #xF9400211)        ; LDR x17,[x16]   (slot 180 SP)
+        (emit-aarch64-u32 buf #xB5000091)        ; CBNZ x17,+4 → DO_LJ
+        (emit-aarch64-u32 buf #x91010210)        ; ADD x16,x16,#0x40 (→ 0x1C0)
+        (emit-aarch64-u32 buf #xF9400211)        ; LDR x17,[x16]   (slot 1C0 SP)
+        (emit-aarch64-u32 buf #xB4000171)        ; CBZ x17,+11 → WFI_HALT
+        ;; DO_LJ:
+        (emit-aarch64-u32 buf #x9100023F)        ; ADD sp,x17,#0
+        (emit-aarch64-u32 buf #xF940061D)        ; LDR x29,[x16,#8]
+        (emit-aarch64-u32 buf #xF9400A11)        ; LDR x17,[x16,#16]
+        (emit-aarch64-u32 buf #x37300070)        ; TBNZ x16,#6,+3 → slot_1C0
+        (cond
+          (modus.mvm::*aarch64-handler-pop-label*
+           (let ((idx (modus.mvm::a64-current-index buf)))
+             (modus.mvm::a64-bl buf 0)           ; BL pop_helper (slot 180 path)
+             (modus.mvm::a64-add-fixup buf idx
+                                       modus.mvm::*aarch64-handler-pop-label*
+                                       :bl)))
+          (t
+           (emit-aarch64-u32 buf #xD503201F)))   ; NOP if no pop helper
+        (emit-aarch64-u32 buf #x14000002)        ; B +2 → do_br
+        (emit-aarch64-u32 buf #xF900021F)        ; slot_1C0: STR XZR,[x16]
+        ;; do_br:
+        (emit-aarch64-u32 buf #xD2820120)        ; MOVZ x0,#0x1009
+        (emit-aarch64-u32 buf #xF2BBD5A0)        ; MOVK x0,#0xDEAD,lsl #16 (X0=T)
+        (emit-aarch64-u32 buf #xD61F0220)        ; BR x17 (longjmp)
+        ;; WFI_HALT (no handler armed at all):
+        (emit-aarch64-u32 buf #xD503207F)        ; WFI
+        (emit-aarch64-u32 buf #x17FFFFFF)        ; B -1 (back to WFI)
+        ;; Patch the B.NE to land here (cold boot continues).
+        (let ((off (- (a64-buffer-position buf) bne-idx)))
+          (setf (aref (a64-buffer-code buf) bne-idx)
+                (logior #x54000000 (ash (logand off #x7FFFF) 5) 1)))))
 
     ;; ================================================================
     ;; Phase A: Pre-MMU setup (running at PA 0x40000000+)
@@ -932,6 +1011,17 @@
     ;; low byte happens to be 0x05 get misclassified as characters by
     ;; functionp's fallback path.
     (emit-aarch64-code-bounds-init buf)
+
+    ;; 19d. Boot-completed magic for the re-entry guard (Phase 0).  MMU
+    ;; is on; VA 0x50000FF0 → PA 0x50000FF0 via the identity L1[1] block.
+    (when *aarch64-fixpoint-reentry-guard*
+      (emit-aarch64-movz buf x16 #x0FF0 0)
+      (emit-aarch64-movk buf x16 #x5000 16)
+      (emit-aarch64-movz buf x17 #xCAFE 0)
+      (emit-aarch64-movk buf x17 #xB007 16)
+      (emit-aarch64-movk buf x17 #xDEAD 32)
+      (emit-aarch64-movk buf x17 #x1DEA 48)
+      (emit-aarch64-u32 buf #xF9000211))         ; STR x17,[x16]
 
     ;; 20. Branch to native code via offset-mapped VA
     ;; Native code starts at offset 0x1000 in the image = VA 0x1000

@@ -4650,6 +4650,9 @@
                      ~%  (when (eql 0 (mod id 100)) (%hsd-dump id))~
                      ~%  (%clear-fault-slots)~
                      ~%  (%reset-signal-state)~
+                     ~%  ;; Per-test fault-storm budget reset (0x10000CD0) — see~
+                     ~%  ;; *aarch64-ansi-deadline-hardening*.~
+                     ~%  (setf (mem-ref #x10000CD0 :u64) 0)~
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (setf (mem-ref #x10000C70 :u64) 500)~
@@ -4664,6 +4667,9 @@
                      ~%  (%fork-set-last-id id)~
                      ~%  (%clear-fault-slots)~
                      ~%  (%reset-signal-state)~
+                     ~%  ;; Per-test fault-storm budget reset (0x10000CD0) — see~
+                     ~%  ;; *aarch64-ansi-deadline-hardening*.~
+                     ~%  (setf (mem-ref #x10000CD0 :u64) 0)~
                      ~%  (handler-case~
                      ~%    (progn~
                      ~%      (setf (mem-ref #x10000C70 :u64) 500)~
@@ -4712,6 +4718,9 @@
                      ~%  ;; 0x10000C80): a longjmp-aborted intern leaks +1 per abort in a~
                      ~%  ;; sequential run (Linux forks reset it by dying with the child).~
                      ~%  (setf (mem-ref #x10000C80 :u64) 0)~
+                     ~%  ;; Reset the entry-4 fault-storm budget counter (0x10000CD0,~
+                     ~%  ;; see *aarch64-ansi-deadline-hardening*) — per-file budget.~
+                     ~%  (setf (mem-ref #x10000CD0 :u64) 0)~
                      ~%  ;; LINUX-FORK PARITY: snapshot the handler-stack depth + the~
                      ~%  ;; current armed frame at entry; restore at exit.  On Linux each~
                      ~%  ;; file runs in a fork whose handler-stack state dies with the~
@@ -4746,6 +4755,13 @@
                      ~%      ;; wedge report below re-arms its own handler-case so a fault~
                      ~%      ;; DURING reporting is still absorbed.~
                      ~%      (%save-outer-handler)~
+                     ~%      ;; Rescue BUDGET (0x10000CD8, x64-D90 parity): the 1C0~
+                     ~%      ;; fallback is MULTI-SHOT — the shared consume (vector~
+                     ~%      ;; entry-9 slot) decrements this and only clears 1C0 at 0,~
+                     ~%      ;; so a poisoned wedge-report path gets bounded retries~
+                     ~%      ;; instead of one shot; exhaustion halts (guaranteed~
+                     ~%      ;; termination).  Each landing prints '!' to serial.~
+                     ~%      (setf (mem-ref #x10000CD8 :u64) 50)~
                      ~%      (funcall thunk))~
                      ~%    ;; NOTE: (t () ...) — NO condition variable, deliberately.~
                      ~%    ;; Binding one compiles to (let ((c *current-condition*)) ...)~
@@ -5202,6 +5218,8 @@
   (setf (mem-ref #x10000C58 :u64) 0)
   (setf (mem-ref #x10000C70 :u64) 0)
   (setf (mem-ref #x10000C80 :u64) 0)
+  (setf (mem-ref #x10000CD0 :u64) 0)
+  (setf (mem-ref #x10000CD8 :u64) 0)
   (setf (mem-ref #x10000D40 :u64) 0)
   (setf (mem-ref #x10000D48 :u64) 0)
   (setf (mem-ref #x10000D50 :u64) 0)
@@ -5537,6 +5555,76 @@
 
 ")
 
+;; BIGNUM-POISON PROBE (MODUS_BNPROBE=1 — diagnostic builds ONLY, never
+;; the committed runner's default): the full run's frontier is test 13196
+;; (numbers/abs bignum-random band): after it, EVERY subsequent file
+;; faults instantly — persistent heap poison from a bignum op (the
+;; documented compile-ash bignum-SAR class or an aa64-translator arith
+;; defect; x64 bare crosses this band cleanly).  This probe runs the
+;; op sequence at boot with a canary between each step, prints
+;; pN=/cN= markers, then EXITS (corpus skipped) — one build isolates
+;; the poisoning op.  DO NOT default-enable: a "recovered" probe still
+;; poisons the heap for the corpus that would follow.
+(when (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_BNPROBE")))
+        (and v (string= v "1")))
+  (format t "~%;; BNPROBE ENABLED (diagnostic build — corpus SKIPPED)~%")
+  (setq *driver-source*
+        (let* ((marker "  ;; Initialize FRAGILITY DIAG eq-collision budget at slot 0x10000C60")
+               (pos (search marker *driver-source*))
+               (probe "
+  ;; ===== BNPROBE (see build-time comment) =====
+  (setf (mem-ref #x10000C70 :u64) 2000)
+  (write-string-serial \"BNPROBE-START\") (write-char-serial 10)
+  (write-string-serial \"p1-ash=\")
+  (print-dec (handler-case (if (> (ash 1 300) 0) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c1=\")
+  (print-dec (handler-case (if (eq 'zork1 'zork1) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p2-sub=\")
+  (print-dec (handler-case (if (> (- (ash 1 300) 0) 0) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p3-trunc=\")
+  (print-dec (handler-case (truncate 12345 (ash 1 300)) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p4-mul0=\")
+  (print-dec (handler-case (* 0 (ash 1 300)) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c4=\")
+  (print-dec (handler-case (let ((h (make-hash-table))) (puthash 7 h 9) (gethash 7 h)) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p5-random=\")
+  (print-dec (handler-case (if (>= (random (ash 1 300)) 0) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c5=\")
+  (print-dec (handler-case (if (eq 'zork5 'zork5) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p6-rfi=\")
+  (print-dec (handler-case (if (>= (random-from-interval (ash 1 300)) 0) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"p7-loop=\")
+  (print-dec (handler-case
+                 (let ((bound (ash 1 300)))
+                   (if (null (loop for x = (random-from-interval bound)
+                                   for a = (abs x)
+                                   repeat 100
+                                   unless (if (plusp x) (eql x a) (eql (- x) a))
+                                   collect (list x a)))
+                       1 0))
+               (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c7-intern=\")
+  (print-dec (handler-case (if (eq (read-from-string \":ZAP7\") :zap7) 1 0) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"c8-hash=\")
+  (print-dec (handler-case (let ((h (make-hash-table))) (puthash 1 h 2) (gethash 1 h)) (t (c) -1)))
+  (write-char-serial 10)
+  (write-string-serial \"BNPROBE-END\") (write-char-serial 10)
+  (sys-exit 0)
+"))
+          (concatenate 'string (subseq *driver-source* 0 pos)
+                       probe (subseq *driver-source* pos)))))
+
 ;;; ============================================================
 ;;; 5. Assemble full source
 ;;; ============================================================
@@ -5787,6 +5875,18 @@
 ;; handler-case instead — the test FAILs and the run continues
 ;; (Linux-parity: a wild jump there is a recovered SIGSEGV).
 (setf modus.mvm::*aarch64-fixpoint-reentry-guard* t)
+
+;; DEADLINE/FAULT HARDENING (boot-aarch64.lisp exception vectors, gated):
+;; entry-5 vtimer ISR gets the x64 a41a760 lessons — C70 counter CLAMP
+;; (wild-written values > 65536 reset to 2001) and SELF-RE-ARM to 2000 on
+;; every expiry (one-shot consumption left C70=0, so the NEXT hang ran
+;; with no watchdog — observed freeze at the 13196 bignum band).
+;; entry-4 sync recovery gets a FAULT-STORM BUDGET (0x10000CD0, reset per
+;; fork-file): a fault→longjmp→refault cycle that re-arms its own frame
+;; each pass (observed: PC alternating entry-4 ↔ poisoned print code,
+;; stable frame, machine frozen with no output) is forced onto the 1C0
+;; fork-file fallback after 2048 recoveries — FILE-WEDGE + continue.
+(setf modus.mvm::*aarch64-ansi-deadline-hardening* t)
 
 ;; Install the AArch64 translator in BARE-METAL mode (no Linux syscalls,
 ;; default *aarch64-linux-mode* nil).  QEMU virt GICv2 init must be ON so

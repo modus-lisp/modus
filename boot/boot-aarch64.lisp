@@ -201,6 +201,26 @@
     ;; Native code follows immediately (kernel-main at offset 0x1000)
     ))
 
+;; ANSI-runner deadline/fault hardening for the exception vectors.
+;; Default NIL keeps the legacy entry-4/5/7/8 encodings byte-identical
+;; (all other bare-metal aa64 builds unaffected).  The ANSI runner sets
+;; T, which ports two x64 a41a760 ISR lessons + one aa64-specific one:
+;;   - entry 5 (vtimer deadline): counter CLAMP (a wild-written C70 >
+;;     65536 resets to 2001 — heap pointers scribbled into the slot
+;;     effectively disarmed the watchdog) and SELF-RE-ARM to 2000 on
+;;     every expiry (one-shot consumption left C70=0, so any later hang
+;;     ran without a watchdog — observed at the 13196 bignum band).
+;;     The expiry longjmp continuation lives in the unused entry-7 slot.
+;;   - entry 4 (sync recovery): FAULT-STORM BUDGET at 0x10000CD0 — a
+;;     fault→longjmp→refault cycle that re-arms its own handler-case
+;;     frame each pass spins forever (observed: PC alternating between
+;;     entry-4 and the poisoned print path, stable frame, C70=0).  Each
+;;     recovery increments the counter; past 2048 the recovery is
+;;     FORCED onto the 0x100001C0 fallback (fork-file's frame) — the
+;;     file wedges and the run continues.  fork-file resets the counter
+;;     per file.  Continuation lives in the unused entry-8 slot.
+(defvar *aarch64-ansi-deadline-hardening* nil)
+
 (defun emit-aarch64-exception-vectors (buf)
   "Emit AArch64 exception vector table.
    Must be aligned to 2KB (0x800).
@@ -218,6 +238,182 @@
   ;;   Entry 7-15: Lower EL vectors               → B .
   (dotimes (entry 16)
     (cond
+      ;; ================= ANSI-hardened variants (gated) =================
+      ;; See *aarch64-ansi-deadline-hardening*.  Each variant emits
+      ;; EXACTLY 32 words.  Entry-5's expiry longjmp continuation lives
+      ;; in the (otherwise B-to-self) entry-7 slot; entry-4's storm-
+      ;; budget recovery lives in the entry-8 slot.  Cross-entry branch
+      ;; offsets are computed from the block-start position (every
+      ;; entry is exactly 32 instructions).
+      ((and (= entry 4) *aarch64-ansi-deadline-hardening*)
+       ;; Hardened entry 4: capture diag (ELR/FAR/X0 → 0x10000C30/40/48)
+       ;; then branch to the storm-budget recovery in the entry-8 slot.
+       (let ((base (a64-buffer-position buf)))
+         (emit-aarch64-u32 buf #xD5384030)      ; MRS x16, ELR_EL1
+         (emit-aarch64-u32 buf #xD2818611)      ; MOVZ x17,#0x0c30
+         (emit-aarch64-u32 buf #xF2A20011)      ; MOVK x17,#0x1000,lsl 16
+         (emit-aarch64-u32 buf #xF9000230)      ; STR x16,[x17]
+         (emit-aarch64-u32 buf #xD5386010)      ; MRS x16, FAR_EL1
+         (emit-aarch64-u32 buf #xF9000A30)      ; STR x16,[x17,#0x10]
+         (emit-aarch64-u32 buf #xF9000E20)      ; STR x0,[x17,#0x18]
+         ;; B → entry-8 slot start (= base + 4*32 instructions)
+         (let ((off (- (+ base 128) (a64-buffer-position buf))))
+           (emit-aarch64-u32 buf (logior #x14000000 (logand off #x3FFFFFF))))
+         (dotimes (i (- 32 (- (a64-buffer-position buf) base)))
+           (emit-aarch64-u32 buf #xD503201F))))
+      ((and (= entry 5) *aarch64-ansi-deadline-hardening*)
+       ;; Hardened entry 5 (vtimer deadline IRQ): ack + re-arm timer,
+       ;; C70 clamp (>65536 → 2001), decrement; on expiry branch to the
+       ;; longjmp continuation in the entry-7 slot (which SELF-RE-ARMS
+       ;; C70 = 2000 before longjmping).
+       (let ((base (a64-buffer-position buf)))
+         (emit-aarch64-u32 buf #xA9BF07E0)      ; STP x0,x1,[SP,#-16]!
+         (emit-aarch64-u32 buf #xD2A10020)      ; MOVZ x0,#0x0801,LSL 16 (GICC)
+         (emit-aarch64-u32 buf #xB9400C01)      ; LDR w1,[x0,#0x0C] (IAR)
+         (emit-aarch64-u32 buf #xB9001001)      ; STR w1,[x0,#0x10] (EOIR)
+         (emit-aarch64-u32 buf #xD29E8480)      ; MOVZ x0,#0xF424 (62500)
+         (emit-aarch64-u32 buf #xD51BE300)      ; MSR CNTV_TVAL_EL0,x0
+         (emit-aarch64-u32 buf #xD2803000)      ; MOVZ x0,#0x0180
+         (emit-aarch64-u32 buf #xF2A20000)      ; MOVK x0,#0x1000,LSL 16
+         (emit-aarch64-u32 buf #xF9457801)      ; LDR x1,[x0,#2800] (C70)
+         (emit-aarch64-u32 buf #xB4000101)      ; CBZ x1,+8 → NORMAL
+         (emit-aarch64-u32 buf #xF140403F)      ; CMP x1,#16,LSL#12 (65536)
+         (emit-aarch64-u32 buf #x54000049)      ; B.LS +2 (skip clamp)
+         (emit-aarch64-u32 buf #xD280FA21)      ; MOVZ x1,#2001 (clamp)
+         (emit-aarch64-u32 buf #xF1000421)      ; SUBS x1,x1,#1
+         (emit-aarch64-u32 buf #xF9057801)      ; STR x1,[x0,#2800]
+         (emit-aarch64-u32 buf #x54000041)      ; B.NE +2 → NORMAL
+         ;; B → EXPIRE continuation at entry-7 slot (= base + 64)
+         (let ((off (- (+ base 64) (a64-buffer-position buf))))
+           (emit-aarch64-u32 buf (logior #x14000000 (logand off #x3FFFFFF))))
+         ;; NORMAL:
+         (emit-aarch64-u32 buf #xA8C107E0)      ; LDP x0,x1,[SP],#16
+         (emit-aarch64-u32 buf #xD69F03E0)      ; ERET
+         (dotimes (i (- 32 (- (a64-buffer-position buf) base)))
+           (emit-aarch64-u32 buf #xD503201F))))
+      ((and (= entry 7) *aarch64-ansi-deadline-hardening*)
+       ;; EXPIRE continuation for hardened entry 5.  On entry: x0 =
+       ;; 0x10000180, x0/x1 saved on the interrupted stack (leaked on
+       ;; the longjmp path — SP is replaced from the frame).  The
+       ;; slot-1C0 (rescue) path routes through the shared budgeted
+       ;; consume in the entry-9 slot (multi-shot, serial '!' diag).
+       (let ((base (a64-buffer-position buf)))
+         (emit-aarch64-u32 buf #xD280FA01)      ; e0  MOVZ x1,#2000 (SELF-RE-ARM)
+         (emit-aarch64-u32 buf #xF9057801)      ; e1  STR x1,[x0,#2800]
+         (emit-aarch64-u32 buf #xF9400001)      ; e2  LDR x1,[x0] (slot 180 SP)
+         (emit-aarch64-u32 buf #xB5000081)      ; e3  CBNZ x1,+4 → DO_LJ (e7)
+         (emit-aarch64-u32 buf #x91010000)      ; e4  ADD x0,x0,#0x40 (→1C0)
+         (emit-aarch64-u32 buf #xF9400001)      ; e5  LDR x1,[x0]
+         (emit-aarch64-u32 buf #xB4000181)      ; e6  CBZ x1,+12 → NORMAL2 (e18)
+         ;; DO_LJ:
+         (emit-aarch64-u32 buf #x9100003F)      ; e7  ADD SP,x1,#0
+         (emit-aarch64-u32 buf #xF940041D)      ; e8  LDR x29,[x0,#8]
+         (emit-aarch64-u32 buf #xF9400801)      ; e9  LDR x1,[x0,#16]
+         (emit-aarch64-u32 buf #x37300140)      ; e10 TBNZ x0,#6,+10 → slot_1C0 (e20)
+         (cond
+           (modus.mvm::*aarch64-handler-pop-label*
+            (let ((idx (modus.mvm::a64-current-index buf)))
+              (modus.mvm::a64-bl buf 0)          ; e11 BL pop_helper
+              (modus.mvm::a64-add-fixup buf idx
+                                        modus.mvm::*aarch64-handler-pop-label*
+                                        :bl)))
+           (t (emit-aarch64-u32 buf #xD503201F)))
+         (emit-aarch64-u32 buf #xD5184021)      ; e12 MSR ELR_EL1,x1
+         (emit-aarch64-u32 buf #xD2820120)      ; e13 MOVZ x0,#0x1009
+         (emit-aarch64-u32 buf #xF2BBD5A0)      ; e14 MOVK x0,#0xDEAD,LSL 16
+         (emit-aarch64-u32 buf #xD69F03E0)      ; e15 ERET (longjmp)
+         (emit-aarch64-u32 buf #xD503201F)      ; e16 NOP
+         (emit-aarch64-u32 buf #xD503201F)      ; e17 NOP
+         ;; NORMAL2 (no handler armed — spurious expiry):
+         (emit-aarch64-u32 buf #xA8C107E0)      ; e18 LDP x0,x1,[SP],#16
+         (emit-aarch64-u32 buf #xD69F03E0)      ; e19 ERET
+         (emit-aarch64-u32 buf #xAA0103F1)      ; e20 MOV x17,x1 (IP for shared consume)
+         ;; e21: B → entry-9 slot (= base + 64)
+         (let ((off (- (+ base 64) (a64-buffer-position buf))))
+           (emit-aarch64-u32 buf (logior #x14000000 (logand off #x3FFFFFF))))
+         (dotimes (i (- 32 (- (a64-buffer-position buf) base)))
+           (emit-aarch64-u32 buf #xD503201F))))
+      ((and (= entry 9) *aarch64-ansi-deadline-hardening*)
+       ;; Shared 1C0-rescue consume (from hardened entries 7 and 8):
+       ;; x17 = frame IP (SP/FP already restored by the caller path).
+       ;; Emits one '!' to the UART per rescue landing (visible storm
+       ;; diagnostic), decrements the rescue BUDGET at 0x10000CD8
+       ;; (multi-shot, x64-D90 parity — armed to 50 by fork-file), and
+       ;; only CLEARS 1C0 when the budget is exhausted (guaranteeing
+       ;; termination via entry-8's HALT), then longjmps with X0 = T.
+       (let ((base (a64-buffer-position buf)))
+         (emit-aarch64-u32 buf #xD2800432)      ; c0  MOVZ x18,#0x21 ('!')
+         (emit-aarch64-u32 buf #xD2A40010)      ; c1  MOVZ x16,#0x2000,LSL 16 (UART VA)
+         (emit-aarch64-u32 buf #xB9000212)      ; c2  STR w18,[x16]
+         (emit-aarch64-u32 buf #xD2819B12)      ; c3  MOVZ x18,#0x0CD8
+         (emit-aarch64-u32 buf #xF2A20012)      ; c4  MOVK x18,#0x1000,LSL 16
+         (emit-aarch64-u32 buf #xF9400250)      ; c5  LDR x16,[x18]
+         (emit-aarch64-u32 buf #xF1000610)      ; c6  SUBS x16,x16,#1
+         (emit-aarch64-u32 buf #xF9000250)      ; c7  STR x16,[x18]
+         (emit-aarch64-u32 buf #x5400008C)      ; c8  B.GT +4 → skip (c12)
+         (emit-aarch64-u32 buf #xD2803810)      ; c9  MOVZ x16,#0x01C0 (exhausted:
+         (emit-aarch64-u32 buf #xF2A20010)      ; c10 MOVK x16,#0x1000,LSL 16
+         (emit-aarch64-u32 buf #xF900021F)      ; c11 STR XZR,[x16]  clear 1C0)
+         (emit-aarch64-u32 buf #xD5184031)      ; c12 MSR ELR_EL1,x17
+         (emit-aarch64-u32 buf #xD2820120)      ; c13 MOVZ x0,#0x1009
+         (emit-aarch64-u32 buf #xF2BBD5A0)      ; c14 MOVK x0,#0xDEAD,LSL 16
+         (emit-aarch64-u32 buf #xD69F03E0)      ; c15 ERET (longjmp)
+         (dotimes (i (- 32 (- (a64-buffer-position buf) base)))
+           (emit-aarch64-u32 buf #xD503201F))))
+      ((and (= entry 8) *aarch64-ansi-deadline-hardening*)
+       ;; Storm-budget recovery for hardened entry 4.  Counter at
+       ;; 0x10000CD0; past 256 recoveries the longjmp is FORCED onto
+       ;; the 0x100001C0 fallback (fork-file frame) and the counter is
+       ;; reset — a self-sustaining fault→longjmp cycle becomes a
+       ;; FILE-WEDGE instead of a permanently frozen machine.  run-test
+       ;; and fork-file both reset the counter (per-test/per-file), so
+       ;; a legit fault-heavy file cannot false-trip the budget; the
+       ;; poison cycles this targets never reach run-test.
+       (let ((base (a64-buffer-position buf)))
+         (emit-aarch64-u32 buf #xD2819A10)      ; i0  MOVZ x16,#0x0CD0
+         (emit-aarch64-u32 buf #xF2A20010)      ; i1  MOVK x16,#0x1000,LSL 16
+         (emit-aarch64-u32 buf #xF9400211)      ; i2  LDR x17,[x16]
+         (emit-aarch64-u32 buf #x91000631)      ; i3  ADD x17,x17,#1
+         (emit-aarch64-u32 buf #xF9000211)      ; i4  STR x17,[x16]
+         (emit-aarch64-u32 buf #xF104023F)      ; i5  CMP x17,#256
+         (emit-aarch64-u32 buf #x540002A8)      ; i6  B.HI +21 → FORCE (i27)
+         (emit-aarch64-u32 buf #xD2803010)      ; i7  MOVZ x16,#0x0180
+         (emit-aarch64-u32 buf #xF2A20010)      ; i8  MOVK x16,#0x1000,LSL 16
+         (emit-aarch64-u32 buf #xF9400211)      ; i9  LDR x17,[x16]
+         (emit-aarch64-u32 buf #xB5000091)      ; i10 CBNZ x17,+4 → DO_LJ (i14)
+         (emit-aarch64-u32 buf #x91010210)      ; i11 ADD x16,x16,#0x40 (→1C0)
+         (emit-aarch64-u32 buf #xF9400211)      ; i12 LDR x17,[x16]
+         (emit-aarch64-u32 buf #xB4000171)      ; i13 CBZ x17,+11 → HALT (i24)
+         (emit-aarch64-u32 buf #x9100023F)      ; i14 ADD sp,x17,#0 (DO_LJ)
+         (emit-aarch64-u32 buf #xF940061D)      ; i15 LDR x29,[x16,#8]
+         (emit-aarch64-u32 buf #xF9400A11)      ; i16 LDR x17,[x16,#16]
+         (emit-aarch64-u32 buf #x37300130)      ; i17 TBNZ x16,#6,+9 → slot_1C0 (i26)
+         (cond
+           (modus.mvm::*aarch64-handler-pop-label*
+            (let ((idx (modus.mvm::a64-current-index buf)))
+              (modus.mvm::a64-bl buf 0)          ; i18 BL pop_helper
+              (modus.mvm::a64-add-fixup buf idx
+                                        modus.mvm::*aarch64-handler-pop-label*
+                                        :bl)))
+           (t (emit-aarch64-u32 buf #xD503201F)))
+         (emit-aarch64-u32 buf #xD5184031)      ; i19 MSR ELR_EL1,x17
+         (emit-aarch64-u32 buf #xD2820120)      ; i20 MOVZ x0,#0x1009
+         (emit-aarch64-u32 buf #xF2BBD5A0)      ; i21 MOVK x0,#0xDEAD,LSL 16
+         (emit-aarch64-u32 buf #xD69F03E0)      ; i22 ERET (longjmp)
+         (emit-aarch64-u32 buf #xD503201F)      ; i23 NOP
+         (emit-aarch64-u32 buf #x14000000)      ; i24 HALT: B .
+         (emit-aarch64-u32 buf #xD503201F)      ; i25 NOP
+         ;; i26: slot_1C0 → shared budgeted consume (entry-9 slot;
+         ;; x17 = IP already loaded).  offset = base+32 - 26 = +6.
+         (emit-aarch64-u32 buf #x14000006)      ; i26 B → entry-9
+         (emit-aarch64-u32 buf #xF900021F)      ; i27 FORCE: STR XZR,[x16] (reset ctr)
+         (emit-aarch64-u32 buf #xD2803810)      ; i28 MOVZ x16,#0x01C0
+         (emit-aarch64-u32 buf #xF2A20010)      ; i29 MOVK x16,#0x1000,LSL 16
+         (emit-aarch64-u32 buf #x17FFFFEE)      ; i30 B -18 → i12 (LDR x17,[x16])
+         (emit-aarch64-u32 buf #xD503201F)      ; i31 NOP
+         (dotimes (i (- 32 (- (a64-buffer-position buf) base)))
+           (emit-aarch64-u32 buf #xD503201F))))
+      ;; ================= legacy entries =================
       ((= entry 4)
        ;; Entry 4: Sync exception, Current EL with SP_ELx.
        ;; This is the SIGSEGV-equivalent path on bare-metal AArch64.
@@ -598,6 +794,8 @@
 ;; longjmps to the armed handler-case instead of re-running boot (which
 ;; would rebuild the page tables under the live MMU and kill the machine).
 (defvar *aarch64-fixpoint-reentry-guard* nil)
+
+
 ;; Heap layout for Cheney semispace GC.  Total heap = 112 MB
 ;; (0x09000000-0x10000000); split into two 56-MB semispaces.  The
 ;; boot loader sets x24=base and x25=mid-point (end of the initial

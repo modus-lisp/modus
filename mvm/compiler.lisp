@@ -10391,7 +10391,11 @@
   (let ((fn-form (car args))
         (call-args (cdr args))
         (nargs (length (cdr args)))
-        (save-count (min *temp-reg-counter* 5)))
+        ;; cap 12 (V5..V15): match compile-call.  Under eval2's flat regfile
+        ;; V9-V15 are shared across in-module CALLs, so high-pressure temps
+        ;; must be saved here too; on native x64 V9-V15 are per-frame spills
+        ;; (redundant push/pop, harmless).
+        (save-count (min *temp-reg-counter* 12)))
     ;; Save caller-saved temp registers (V5 through V(4+save-count-1))
     ;; Skip dest register — it will be overwritten with the CALL result.
     (when (> save-count 1)
@@ -10818,7 +10822,8 @@
          (rest-forms (cdr args)) ; arg1 … argN spread
          (leading (butlast rest-forms))
          (spread-form (car (last rest-forms)))
-         (save-count (min *temp-reg-counter* 5))
+         ;; cap 12 (V5..V15): match compile-call for eval2 flat-regfile safety.
+         (save-count (min *temp-reg-counter* 12))
          (fn-reg (alloc-temp-reg))
          (list-reg (alloc-temp-reg))
          (direct-call-label (make-compiler-label))
@@ -10959,7 +10964,8 @@
          ;; subtract them when computing the live range — the caller's
          ;; live count is (counter - 2).
          (caller-live (max 0 (- *temp-reg-counter* 2)))
-         (save-count  (min caller-live 5)))
+         ;; cap 12 (V5..V15): match compile-call for eval2 flat-regfile safety.
+         (save-count  (min caller-live 12)))
     (emit-ir :or   tag-temp dest temp)
     (emit-ir :li   one-temp 1)
     (emit-ir :test tag-temp one-temp)

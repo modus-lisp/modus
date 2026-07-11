@@ -3097,6 +3097,7 @@
              (body (cdr rest2))
              (specs nil)
              (params nil)
+             (lambda-params nil)
              (in-tail nil)
              (args-var (gensym "M-ARGS")))
         (dolist (p sll)
@@ -3124,6 +3125,32 @@
              (setq specs (cons ''t specs)))))
         (setq params (nreverse params))
         (setq specs (nreverse specs))
+        ;; CLHS 7.6.5: a method invoked as part of a GF call must tolerate
+        ;; every keyword the GF-as-a-whole accepts — the UNION of all
+        ;; applicable methods' &key names (plus GF keys).  The GF's own
+        ;; %gf-check-keys already validated the call per 7.6.5; the
+        ;; INDIVIDUAL method body must then IGNORE keys it doesn't name,
+        ;; i.e. bind &key as if &allow-other-keys.  Without this, asdf's
+        ;; primary `(defmethod perform ((o ...) (c ...)))`-style methods
+        ;; with a plain &key errored "unknown keyword argument :VERBOSE"
+        ;; when OPERATE threaded :verbose (accepted by an :around method's
+        ;; &allow-other-keys) through the whole GF call.  We add aok to the
+        ;; LAMBDA binding list only; the metadata `params` (congruence /
+        ;; key-acceptance recording) is left verbatim so defmethod.error
+        ;; arity/key semantics are unchanged.
+        (let ((has-key nil) (has-aok nil))
+          (dolist (p params)
+            (when (and (symbolp p) (string= (symbol-name p) "&KEY"))
+              (setq has-key t))
+            (when (and (symbolp p)
+                       (string= (symbol-name p) "&ALLOW-OTHER-KEYS"))
+              (setq has-aok t)))
+          (setq lambda-params params)
+          (when (and has-key (not has-aok))
+            (setq lambda-params
+                  (append params (list (intern "&ALLOW-OTHER-KEYS"
+                                               (or (find-package "MODUS.MVM")
+                                                   *package*)))))))
         (if *eval2-runtime-p*
             ;; eval2 (in-image runtime compile) ONLY: route through
             ;; %defmethod-full (cl-clos.lisp), which carries the tree-walker's
@@ -3152,7 +3179,7 @@
                                      (cadr gf-name))
                                     (t nil))))
               `(%defmethod-full ',gf-name ',qualifier (list ,@specs)
-                                (lambda ,params
+                                (lambda ,lambda-params
                                   ,(if block-name
                                        `(block ,block-name ,@body)
                                        `(progn ,@body)))
@@ -3163,7 +3190,7 @@
                ;; only matters when defmethod appears with no defgeneric.
                (defun ,gf-name (&rest ,args-var) (%gf-dispatch ',gf-name ,args-var))
                (%defmethod ',gf-name ',qualifier (list ,@specs)
-                           (lambda ,params ,@body)))))))
+                           (lambda ,lambda-params ,@body)))))))
 
   ;; DEFINE-METHOD-COMBINATION — (define-method-combination name &rest options)
   ;; SHORT form: (define-method-combination name :operator op

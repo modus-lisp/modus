@@ -222,21 +222,40 @@
         ;; puts them at 0x41000000-0x4111xxxx, but the fixpoint kernel image
         ;; loads at PA 0x40200000 and this merged image is ~23 MB, ending near
         ;; PA 0x4186C270 — the default net regions land INSIDE the image (the
-        ;; NIC would DMA over kernel code).  Shift every region up by
-        ;; +0x08000000 into free DRAM (0x49000000-0x4911xxxx), well above the
-        ;; image and mapped normal-cacheable by the fixpoint boot's L1[1]
-        ;; 1 GB identity block (VA/PA 0x40000000-0x7FFFFFFF).  These are the
-        ;; ONLY addresses the E1000 driver, IP stack, and HTTP client read;
+        ;; NIC would DMA over kernel code).
+        ;;
+        ;; ROOT-CAUSE FIX (2026-07-11): the earlier relocation to 0x49000000
+        ;; was CATASTROPHICALLY WRONG.  The Cheney GC heap is at VA
+        ;; 0x09000000-0x10000000, which the fixpoint MMU maps to PA
+        ;; 0x49000000-0x50000000 (VA 0x00000000-0x1FFFFFFF -> PA +0x40000000).
+        ;; The E1000 regions at VA 0x49000000 are identity-mapped (L1[1]) to
+        ;; PA 0x49000000 — the SAME physical DRAM as the heap's low ~1.1 MB.
+        ;; So both the CPU's descriptor-ring writes AND the NIC's DMA (the
+        ;; device treats the stored buf-addr as a PA = 0x49xxx000 = heap PA)
+        ;; silently overwrote the first heap objects — including the globals
+        ;; hash-table (symbol-value's store) whose bucket/alist spine went
+        ;; circular, wedging the reader (`read` -> `*readtable*` -> gethash
+        ;; loop) the moment e1000-init ran the RX-descriptor loop.  The tar
+        ;; string was a red herring; the fetch-install path was fine.
+        ;;
+        ;; The heap PA ends at 0x50000000; the runtime metadata (VA
+        ;; 0x10000000-0x10200000, L2[128] override) backs PA 0x50000000-
+        ;; 0x50200000.  Free identity-mapped DRAM (L1[1] normal-cacheable,
+        ;; within QEMU virt -m 512's 0x40000000-0x60000000 DRAM) begins at
+        ;; PA 0x50200000.  Put every E1000/IPC region there: VA==PA (identity),
+        ;; above BOTH the heap and the metadata, so neither CPU writes nor NIC
+        ;; DMA can alias any GC object.  The block spans ~1.2 MB
+        ;; (0x50200000-0x50313000), well inside 0x50200000-0x60000000.
         ;; last-defun-wins makes these overrides authoritative.
         "
-(defun e1000-state-base () #x49060000)
-(defun fe-scratch-base () #x49060900)
-(defun e1000-rx-desc-base () #x49000000)
-(defun e1000-rx-buf-base () #x49001000)
-(defun e1000-tx-desc-base () #x49041000)
-(defun e1000-tx-buf-base () #x49041400)
-(defun ssh-conn-base () #x49080000)
-(defun ssh-ipc-base () #x49100000)
+(defun e1000-state-base () #x50260000)
+(defun fe-scratch-base () #x50260900)
+(defun e1000-rx-desc-base () #x50200000)
+(defun e1000-rx-buf-base () #x50201000)
+(defun e1000-tx-desc-base () #x50241000)
+(defun e1000-tx-buf-base () #x50241400)
+(defun ssh-conn-base () #x50280000)
+(defun ssh-ipc-base () #x50300000)
 ;; arch-aarch64's write-byte / print-dec route through a serial-suppress flag
 ;; at the HARDCODED old ipc-base 0x41100014 (now inside the kernel image, so
 ;; the garbage there could suppress all NIC/IP diagnostic output).  Override

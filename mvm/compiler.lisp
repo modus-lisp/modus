@@ -13598,12 +13598,30 @@
                  (setf true-nargs nargs)
                  (setf args (append args (make-list (- param-count nargs)))))))))))
   (let ((nargs (length args))
-        ;; Save the current temp count BEFORE arg evaluation.
-        ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).
-        ;; We need to save V5..V(4+save-count-1) where save-count is the
-        ;; number of temps currently in use, but only those in V5-V8 range
-        ;; (the caller-saved physical registers).
-        (save-count (min *temp-reg-counter* 5)))  ; at most V4..V8 = 5 regs
+        ;; Save the current temp count BEFORE arg evaluation.  We save the
+        ;; live temps V5..V(4+save-count-1) around the CALL.
+        ;;
+        ;; V5..V8 are the shared physical caller-saved registers (RCX/RDX/
+        ;; R10/R11) — always required.  V9..V15 are SPILL slots.  On native
+        ;; x64 the spills map to per-frame [RBP-40..] locations, so a callee's
+        ;; spills land in its OWN frame and pushing them here is redundant-but-
+        ;; correct.  In the MVM INTERPRETER, however, there is one flat register
+        ;; file shared across in-module calls — a callee's V9..V15 temps clobber
+        ;; a live caller value held there.  So the save range MUST extend
+        ;; through V15, not stop at V8, or high-register-pressure functions
+        ;; (e.g. chipz's copy-match, which holds a live index/value in a spill
+        ;; reg across the inner aref/aset helper calls) mis-execute under eval2
+        ;; — the "big gunzip mis-decode" that vanished when an extra FORMAT
+        ;; shifted allocation off the spill range.  Cap at 12 = V4..V15.
+        ;; (V4 = RBX is callee-saved — skipped below — via the native
+        ;; prologue's RBX push/pop; the interpreter treats V4 as the first
+        ;; temp and low-pressure code consumes it before any call.)
+        ;;
+        ;; NOTE the save range is proportional to LIVE temps: save-count is
+        ;; the current *temp-reg-counter*, so low-pressure call sites (counter
+        ;; <5) still save only V5..V8 (or fewer) — the V9..V15 pushes only
+        ;; appear where the function actually holds that many live temps.
+        (save-count (min *temp-reg-counter* 12)))
     ;; Save caller-saved temp registers (V5 through V(4+save-count-1))
     ;; V4 (RBX) is callee-saved, so skip it — start from V5.
     ;; Skip dest register: it will be overwritten with the CALL result,

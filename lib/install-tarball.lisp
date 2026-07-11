@@ -210,14 +210,29 @@
 
 ;;; --- driver -----------------------------------------------------------------
 
+(defun install-tarball-from-bytes (gz &optional sysname)
+  "Install a Common Lisp system from an in-memory .tar.gz byte vector GZ
+   (an (unsigned-byte 8) vector — e.g. the body returned by HTTP-FETCH).
+   Same pipeline as INSTALL-TARBALL but with no file read, so it works on
+   bare metal where the fetched archive lives only in RAM.  If SYSNAME is
+   given, install that system; otherwise install the first defsystem found.
+   Returns the installed system name (string)."
+  (write-string-serial "install-tarball-from-bytes: ") (print-dec (length gz))
+  (write-string-serial " bytes") (terpri)
+  (%it-install-from-gz-bytes gz sysname))
+
 (defun install-tarball (path &optional sysname)
   "Install a Common Lisp system from the .tar.gz at PATH.  If SYSNAME is given,
    install that system; otherwise install the first defsystem found in the
    first .asd.  Returns the installed system name (string)."
   (write-string-serial "install-tarball: ") (write-string-serial path) (terpri)
-  ;; 1. read + gunzip
-  (let* ((gz (%it-slurp-bytes path))
-         (tarbytes (if (and (>= (length gz) 2)
+  (%it-install-from-gz-bytes (%it-slurp-bytes path) sysname))
+
+(defun %it-install-from-gz-bytes (gz sysname)
+  "Core installer: GZ is a .tar.gz (or plain .tar) byte vector already in
+   memory.  gunzip -> untar -> parse .asd -> load files in order."
+  ;; 1. gunzip
+  (let* ((tarbytes (if (and (>= (length gz) 2)
                             (= (aref gz 0) 31) (= (aref gz 1) 139))
                        (chipz:decompress nil 'chipz:gzip gz)
                        gz)))              ; allow a plain .tar too

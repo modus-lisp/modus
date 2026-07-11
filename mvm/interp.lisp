@@ -1287,9 +1287,17 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (let ((obj (%word->val (reg-get regs vs))))
                  (reg-set regs vd
+                       ;; A BIGNUM is `integerp' = T but is a tag-9 OBJECT, not a
+                       ;; fixnum — reporting +tag-fixnum+ for it made (bignump
+                       ;; <bignum>) = NIL under eval2, so %integer-truncate's
+                       ;; (not (bignump a)) treated a ~2^62 bignum as a fixnum and
+                       ;; ran inline :div on its heap POINTER → garbage varying
+                       ;; per run (gcd.4 / test 13621 0xDEAD0004 wild call).
+                       ;; Exclude bignums so they route to +tag-object+.
                        (tag-fixnum (cond ((consp obj) +tag-cons+)
-                                         ((integerp obj) +tag-fixnum+)
-                                         (t +tag-object+)))))  ; native object
+                                         ((and (integerp obj) (not (bignump obj)))
+                                          +tag-fixnum+)
+                                         (t +tag-object+)))))  ; native object / bignum
                (setf pc npc2))))
 
           (#.+op-obj-subtag+

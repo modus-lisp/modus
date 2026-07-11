@@ -3250,6 +3250,14 @@
     ((symbolp x) nil)
     ((%generic-function-p x) t)
     ((arrayp x) nil)
+    ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
+    ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →
+    ;; (functionp <bignum>) = T.  Under eval2 that made op-obj-subtag report
+    ;; #x51 (native-fn) for a bignum instead of #x30, so (bignump <bignum>) =
+    ;; NIL → %integer-truncate ran inline :div on the bignum's heap pointer →
+    ;; garbage / gcd.4 (test 13621) 0xDEAD0004 wild call.  A bignum is NOT a
+    ;; function (CLHS).
+    ((bignump x) nil)
     ((and (integerp x) (< x #x100000)) nil)
     (t t)))
 (defun keywordp (x)

@@ -188,6 +188,254 @@
     *opcode-table-init-source* (string #\Newline)
     *eval2-source*    (string #\Newline)))
 
+;;; --- NET BUILD (MODUS_NET_BUILD=1) : Quicklisp-over-HTTP image ---------------
+;;; When enabled, append the E1000 net stack + tar/install + chipz source to
+;;; *full-source* so a single fixpoint-boot AArch64 image has BOTH the
+;;; compiler/eval2 stack AND outbound HTTP, and drive a fetch->gunzip->untar->
+;;; load->call-a-function pipeline from kernel-main (see *net-driver-source*).
+;;; Memory map: the fixpoint boot maps VA 0x40000000-0x7FFFFFFF (L1[1], normal
+;;; DRAM identity) and the PCI ECAM at 0x4010000000 (L1[256], device) — exactly
+;;; the regions the net stack uses (E1000 DMA/state 0x41xxxxxx, PCI config
+;;; 0x4010000000).  The compiler heap (0x09000000-0x10000000) and net regions
+;;; are fully disjoint.  No actors: the fetch + load runs synchronously in
+;;; kernel-main, so there is no yield/context-switch to corrupt cons cells
+;;; (MVM Active Limitation 5).
+(defvar *net-build-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD")))
+    (and v (string= v "1"))))
+
+(defvar *net-dir* (merge-pathnames "net/" *modus-base*))
+(defun net-text (rel) (read-file-text (merge-pathnames rel *net-dir*)))
+
+;; Net stack for outbound HTTP over E1000 on QEMU virt.  We do NOT need SSH,
+;; crypto, or the actor system for a plain-HTTP fetch — only the NIC driver,
+;; IP/TCP/ARP/DHCP, and the HTTP client.  arch-aarch64 supplies the E1000 DMA
+;; addresses + PCI config accessors + io primitives.
+(defvar *net-source*
+  (if *net-build-p*
+      (concatenate 'string
+        (net-text "arch-aarch64.lisp")  (string #\Newline)
+        (net-text "e1000.lisp")         (string #\Newline)
+        (net-text "ip.lisp")            (string #\Newline)
+        (net-text "http-client.lisp")   (string #\Newline)
+        ;; RELOCATE the E1000 DMA / state / IPC regions.  arch-aarch64.lisp
+        ;; puts them at 0x41000000-0x4111xxxx, but the fixpoint kernel image
+        ;; loads at PA 0x40200000 and this merged image is ~23 MB, ending near
+        ;; PA 0x4186C270 — the default net regions land INSIDE the image (the
+        ;; NIC would DMA over kernel code).  Shift every region up by
+        ;; +0x08000000 into free DRAM (0x49000000-0x4911xxxx), well above the
+        ;; image and mapped normal-cacheable by the fixpoint boot's L1[1]
+        ;; 1 GB identity block (VA/PA 0x40000000-0x7FFFFFFF).  These are the
+        ;; ONLY addresses the E1000 driver, IP stack, and HTTP client read;
+        ;; last-defun-wins makes these overrides authoritative.
+        "
+(defun e1000-state-base () #x49060000)
+(defun fe-scratch-base () #x49060900)
+(defun e1000-rx-desc-base () #x49000000)
+(defun e1000-rx-buf-base () #x49001000)
+(defun e1000-tx-desc-base () #x49041000)
+(defun e1000-tx-buf-base () #x49041400)
+(defun ssh-conn-base () #x49080000)
+(defun ssh-ipc-base () #x49100000)
+;; arch-aarch64's write-byte / print-dec route through a serial-suppress flag
+;; at the HARDCODED old ipc-base 0x41100014 (now inside the kernel image, so
+;; the garbage there could suppress all NIC/IP diagnostic output).  Override
+;; both to write straight to the UART — this build has no capture buffer.
+(defun write-byte (b) (write-char-serial b))
+(defun print-dec (n)
+  (if (< n 10)
+      (write-char-serial (+ 48 n))
+      (let ((q (truncate n 10)))
+        (print-dec q)
+        (write-char-serial (+ 48 (- n (* q 10)))))))
+;; Assign the E1000 MMIO BAR at VA 0x11000000 instead of 0x10000000.  Under
+;; the fixpoint MMU, VA 0x10000000-0x101FFFFF is remapped to DRAM (PA
+;; 0x50000000) for the runtime's BSS-equivalent metadata, so a BAR there
+;; would route register accesses into DRAM and the NIC would never respond.
+;; VA 0x10200000-0x3FFFFFFF stays device-identity (PA == VA, QEMU virt's
+;; 32-bit PCI MMIO window), so 0x11000000 lands on the real E1000 registers.
+(defun pci-assign-bars ()
+  (let ((next-addr #x11000000))
+    (dotimes (dev 32)
+      (let ((id (pci-config-read 0 dev 0 0)))
+        (when (not (eq id #xFFFFFFFF))
+          (pci-config-write 0 dev 0 #x10 #xFFFFFFFF)
+          (let ((bar-size-mask (pci-config-read 0 dev 0 #x10)))
+            (when (not (zerop bar-size-mask))
+              (let ((size (logand (+ (logxor (logand bar-size-mask #xFFFFFFF0) #xFFFFFFFF) 1) #xFFFFFFFF)))
+                (let ((aligned (logand (+ next-addr (- size 1)) (logxor (- size 1) #xFFFFFFFF))))
+                  (pci-config-write 0 dev 0 #x10 aligned)
+                  (let ((cmd (pci-config-read 0 dev 0 4)))
+                    (pci-config-write 0 dev 0 4 (logior cmd 7)))
+                  (setq next-addr (+ aligned size)))))))))))
+;; Larger HTTP response buffer.  The stock http-fetch-impl caps the response
+;; at 4096 bytes (and tcp-rx-copy bounds its copy at 4096) — too small for a
+;; tar archive (demo.tar is 10240 bytes, sha1.tar is 20480).  Override both
+;; with a 128 KB buffer / bound so a small library tarball fits in RAM.
+(defun tcp-rx-copy (dest dest-off)
+  (let ((buf (e1000-rx-buf)))
+    (let ((ip-total (buf-read-u16-mem buf 16))
+          (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
+      (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
+        (let ((data-base (+ (+ buf 34) tcp-hdr-len)))
+          (let ((i 0))
+            (loop
+              (when (>= i data-len) (return data-len))
+              (let ((dst-idx (+ dest-off i)))
+                (when (< dst-idx 32768)
+                  (aset dest dst-idx (mem-ref (+ data-base i) :u8))))
+              (setq i (+ i 1))))
+          data-len)))))
+(defun http-fetch-impl (url url-len)
+  (let ((scheme-end (url-skip-http url url-len)))
+    (let ((host-end (url-host-end url scheme-end url-len)))
+      (let ((port (url-parse-port url host-end url-len))
+            (path-start (url-path-off url scheme-end url-len)))
+        (let ((host-len (- host-end scheme-end))
+              (path-len (- url-len path-start)))
+          (let ((ip (resolve-host url scheme-end host-end)))
+            (when (zerop ip)
+              (write-byte 68) (write-byte 78) (write-byte 83)
+              (write-byte 58) (write-byte 48) (write-byte 10)
+              (return 0))
+            (when (zerop (tcp-connect ip port))
+              (write-byte 84) (write-byte 67) (write-byte 80)
+              (write-byte 58) (write-byte 70) (write-byte 10)
+              (return 0))
+            (let ((req-buf (make-array 512)))
+              (let ((req-len (http-build-get url scheme-end host-len
+                                              path-start path-len req-buf)))
+                (tcp-send req-buf req-len)))
+            (let ((resp (make-array 32768))
+                  (resp-len 0)
+                  (done 0)
+                  (idle 0))
+              (loop
+                (when (not (zerop done)) (return 0))
+                (let ((n (tcp-receive 300)))
+                  (if (> n 0)
+                      (progn
+                        (let ((copied (tcp-rx-copy resp resp-len)))
+                          (setq resp-len (+ resp-len copied)))
+                        (setq idle 0))
+                      (setq idle (+ idle 1))))
+                (when (zerop (tcp-state)) (setq done 1))
+                (when (> idle 20) (setq done 1)))
+              (tcp-close)
+              (cons resp resp-len))))))))
+"
+        (string #\Newline))
+      ""))
+
+;; chipz (gunzip) + lib/tar.lisp (ustar reader) + lib/install-tarball.lisp.
+;; chipz reads #.array-dimension-limit at READ time, so the constant must be
+;; bound before this source is eval'd — kernel-main sets it early.  We
+;; concatenate chipz in dependency order (package, then leaf modules).
+;; NOTE ON CHIPZ (gunzip): chipz relies on read-time evaluation of its own
+;; constants (#.+max-code-length+ etc.) and #N= reader labels in its inflate
+;; tables.  The MVM build reads *full-source* as text in a single pass without
+;; a host chipz load, so those `#.`/`#N=` forms fail ('variable +MAX-CODE-
+;; LENGTH+ is unbound' / 'Reference to undefined label #1#') and the reader
+;; desyncs, dropping every later form (install-tarball + the net driver).
+;; Compiling chipz into the image therefore needs a build-time pass that
+;; resolves its read-time constants first (host-load chipz, then re-emit the
+;; expanded forms) — a real follow-up.  For now we install PLAIN .tar archives
+;; (install-tarball-from-bytes handles a non-gzip tar directly: it only calls
+;; DECOMPRESS when the gzip magic 1f 8b is present).  DECOMPRESS is left as an
+;; unresolved li-func NIL sentinel — never called on a plain tar.
+(defvar *install-source*
+  (if *net-build-p*
+      (concatenate 'string
+        (read-file-text (merge-pathnames "lib/tar.lisp" *modus-base*))            (string #\Newline)
+        (read-file-text (merge-pathnames "lib/install-tarball.lisp" *modus-base*)) (string #\Newline))
+      ""))
+
+;; Net fetch->install->run driver.  http-fetch-impl returns (resp . resp-len)
+;; where RESP is the raw HTTP response bytes; http-find-body locates the body
+;; start.  We slice the .tar.gz body out into a fresh (unsigned-byte 8) vector
+;; and hand it to install-tarball-from-bytes, then call a function from the
+;; installed system to PROVE it loaded and runs.  This runs synchronously in
+;; kernel-main (no actors / no yield), so cons cells are safe.
+(defvar *net-driver-source*
+  (if *net-build-p* "
+;; Build a URL byte-array from a Lisp string literal (chars are already fixnum
+;; codes in the reader's string).  Returns (values arr len).
+(defun %net-url (s)
+  (let* ((n (length s)) (arr (make-array n)))
+    (dotimes (i n) (aset arr i (char-code (char s i))))
+    (cons arr n)))
+
+;; Fetch URL-STRING and return its HTTP body as a fresh byte vector, or NIL.
+(defun net-fetch-bytes (url-string)
+  (let* ((u (%net-url url-string))
+         (result (http-fetch-impl (car u) (cdr u))))
+    (if (or (null result) (eq result 0))
+        nil
+        (let* ((resp (car result))
+               (resp-len (cdr result))
+               (body-off (http-find-body resp resp-len)))
+          (let* ((blen (- resp-len body-off))
+                 (out (make-array blen)))
+            (let ((i 0))
+              (loop
+                (when (>= i blen) (return nil))
+                (aset out i (aref resp (+ body-off i)))
+                (setq i (+ i 1))))
+            (cons out blen))))))
+
+;; The end-to-end pipeline: bring up the NIC, DHCP for an IP, then fetch +
+;; install + run each demo.
+(defun run-net-pipeline ()
+  (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
+  ;; defvar init-thunks don't run at boot (MVM Active Limitation 7), so
+  ;; *tar-block-size* (a defvar 512 in lib/tar.lisp) is NIL at runtime —
+  ;; (+ off *tar-block-size*) then wedges tar-do-entries.  Set it explicitly.
+  (setq *tar-block-size* 512)
+  ;; NIC + IP bring-up (no actors).
+  (pci-assign-bars)
+  (e1000-probe)
+  (dhcp-client)
+  (write-string-serial \"NET-IP-READY\") (write-char-serial 10)
+  ;; --- demo.tar (plain tar, no gunzip needed) : (demo:sq 7) => 49 ---
+  (handler-case
+      (let ((tb (net-fetch-bytes \"http://10.0.2.2:8080/demo.tar\")))
+        (if (null tb)
+            (progn (write-string-serial \"FETCH-FAIL demo\") (write-char-serial 10))
+            (progn
+              (write-string-serial \"FETCHED demo bytes=\")
+              (print-dec (cdr tb)) (write-char-serial 10)
+              (write-string-serial \"HEAD8=\")
+              (let ((k 0))
+                (loop (when (>= k 8) (return nil))
+                      (print-dec (aref (car tb) k)) (write-char-serial 32)
+                      (setq k (+ k 1))))
+              (write-char-serial 10)
+              (install-tarball-from-bytes (car tb))
+              (write-string-serial \"DEMO-SQ-7=\")
+              (print-dec (handler-case (eval2 (quote (sq 7))) (t (c) -1)))
+              (write-char-serial 10))))
+    (t (c) (write-string-serial \"DEMO-ERR\") (write-char-serial 10)))
+  ;; --- sha1.tar (plain tar) : (sha1:sha1-hex \"abc\") => A9993E36... ---
+  (handler-case
+      (let ((tb (net-fetch-bytes \"http://10.0.2.2:8080/sha1.tar\")))
+        (if (null tb)
+            (progn (write-string-serial \"FETCH-FAIL sha1\") (write-char-serial 10))
+            (progn
+              (write-string-serial \"FETCHED sha1 bytes=\")
+              (print-dec (cdr tb)) (write-char-serial 10)
+              (install-tarball-from-bytes (car tb))
+              (write-string-serial \"SHA1-ABC=\")
+              (handler-case
+                  (let ((h (eval2 (quote (sha1-hex \"abc\")))))
+                    (if (stringp h) (write-string-serial h)
+                        (write-string-serial \"<not-string>\")))
+                (t (c) (write-string-serial \"<err>\")))
+              (write-char-serial 10))))
+    (t (c) (write-string-serial \"SHA1-ERR\") (write-char-serial 10)))
+  (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
+"
+      ""))
+
 ;;; --- Gap A: symbol-function table auto-registration ---
 ;;;
 ;;; cl-eval.lisp's %init-sft-list is a hand-curated allowlist (~229
@@ -5026,12 +5274,50 @@
                                       (subseq result 0 pos)
                                       (subseq result (1+ end))))))))))
 
+(defun strip-package-prefixes (text prefixes)
+  "Remove each package qualifier in PREFIXES (e.g. \"chipz::\" \"chipz:\")
+   from TEXT.  The image compiles all source into one flat namespace
+   (in-package stripped), so a qualified reference like chipz:decompress
+   must become the bare symbol decompress — otherwise the build-time MVM
+   reader errors 'Package CHIPZ does not exist' and SILENTLY SKIPS the
+   whole form (dropping install-tarball + the net driver).  Longer
+   prefixes first so \"chipz::\" is handled before \"chipz:\"."
+  (let ((result text))
+    (dolist (pfx prefixes result)
+      (loop
+        (let ((pos (search pfx result)))
+          (unless pos (return))
+          (setf result (concatenate 'string
+                                    (subseq result 0 pos)
+                                    (subseq result (+ pos (length pfx))))))))))
+
 (setf *prelude-source* (strip-in-package *prelude-source*))
 (setf *rt-source*      (strip-in-package *rt-source*))
 (setf *bridge-source*  (strip-in-package *bridge-source*))
 (setf *test-source*    (strip-in-package *test-source*))
 (setf *ansi-aux-sources*  (strip-in-package *ansi-aux-sources*))
 (setf *real-ansi-sources* (strip-in-package *real-ansi-sources*))
+
+;; NET BUILD: the net stack + chipz + install-tarball are compiled INTO the
+;; image but must have their (in-package ...) forms removed — the MVM image
+;; has no package-scoped compilation; every defun lands in the single flat
+;; namespace (last-defun-wins).  chipz's internal symbols (CHIPZ::foo) and
+;; the CHIPZ: exported names all collapse to bare names, which is fine because
+;; install-tarball calls (chipz:decompress …) and the reader interns it to the
+;; same flat name.  Also drop the ANSI corpus (huge, irrelevant here) so the
+;; net image builds fast and small.
+(when *net-build-p*
+  (setf *net-source*     (strip-in-package *net-source*))
+  (setf *install-source* (strip-in-package *install-source*))
+  ;; chipz's internal + exported symbols collapse to the flat namespace;
+  ;; drop every CHIPZ:/CHIPZ:: qualifier so build-time reads succeed.  Also
+  ;; the SB-EXT / SB-KERNEL qualifiers chipz sometimes emits under #+sbcl are
+  ;; not present in-image — but those live behind reader conditionals the MVM
+  ;; reader skips, so only the CHIPZ package needs flattening here.
+  (setf *install-source*
+        (strip-package-prefixes *install-source* '("chipz::" "chipz:" "CHIPZ::" "CHIPZ:")))
+  (setf *ansi-aux-sources* "")
+  (setf *real-ansi-sources* ""))
 
 ;;; ============================================================
 ;;; 3b. Test-source defun/defmacro registration
@@ -5711,6 +5997,13 @@
     ;; (DEAD CODE until eval routing flips — gate must stay unchanged).
     *compiler-in-image-source*
     (string #\Newline)
+    ;; 3c. NET BUILD: E1000 net stack (arch-aarch64 + e1000 + ip + http-client)
+    ;; then chipz + tar + install-tarball.  "" (zero bytes) unless
+    ;; MODUS_NET_BUILD=1, so the ANSI gate image is byte-identical.
+    *net-source*
+    (string #\Newline)
+    *install-source*
+    (string #\Newline)
     ;; 4. ANSI auxiliary files (scaffold, helpers used by test files)
     ;;    Loaded BEFORE test-source so that test-source can override
     ;;    any aux definitions with simpler MVM-compatible versions.
@@ -5836,6 +6129,9 @@
     ;;     name-hashes in *%extra-macro-names* (macro-function).
     *test-defs-auto-source*
     (string #\Newline)
+    ;; 6c. NET BUILD: run-net-pipeline (fetch->install->run).  "" otherwise.
+    *net-driver-source*
+    (string #\Newline)
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count
     ;; so kernel-main can print EXP:N before running tests.
@@ -5864,9 +6160,15 @@
            ;; ~~USE-EVAL2-INIT~~ marker and no tree-walker bracket.  Flip-gate
            ;; mode still drops run-all-tests so the corpus gate isn't confounded
            ;; by the diagnostic probes' P: lines.
-           (drv (if *flip-skip-probes*
+           (drv1 (if *flip-skip-probes*
                     (str-sub "(run-all-tests)" "" drv0)
                     drv0))
+           ;; NET BUILD: drop the diagnostic probe suite and redirect the
+           ;; corpus driver to the net fetch->install->run pipeline.
+           (drv (if *net-build-p*
+                    (str-sub "(run-all-tests)" ""
+                      (str-sub "(run-real-ansi-tests)" "(run-net-pipeline)" drv1))
+                    drv1))
            (tag "~~ANSI-EXP-TOTAL~~")
            (tag-pos (search tag drv))
            (count (- *ansi-test-counter* 10000)))

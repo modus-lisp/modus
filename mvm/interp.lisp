@@ -1580,7 +1580,29 @@
                          (args (%mvm-collect-call-args state regs nargs
                                                        bc ftab runtime-table
                                                        lambda-offsets)))
-                    (setf (svref regs +vreg-vr+) (apply target args))
+                    ;; PROPAGATE SECONDARY VALUES across the funcall/apply
+                    ;; bridge — identical to op-CALL's runtime-native branch.
+                    ;; A native (or cross-module registered) multi-valued fn
+                    ;; reached via (funcall #'FN …) / (apply #'FN …) writes its
+                    ;; secondaries only into its OWN return list; eval2's
+                    ;; multiple-value-bind/-list read the SIMULATED MV slots
+                    ;; (mem #x10000090 count + #x10000098+ extras via op-load).
+                    ;; Without mirroring here, (funcall #'FN …) truncated to the
+                    ;; primary value — the chipz %inflate `(values consumed
+                    ;; produced)` returned through %decompress/null-vector's
+                    ;; `(funcall fun …)` lost `produced` (garbage 2nd value).
+                    ;; Capture ALL values, put primary in VR, mirror the count
+                    ;; and secondaries into the simulated slots (same WORD
+                    ;; encoding op-store uses for :u64).
+                    (let* ((vals (multiple-value-list (apply target args)))
+                           (nvals (length vals)))
+                      (setf (svref regs +vreg-vr+) (car vals))
+                      (mem-write state #x10000090 (%val->word nvals) 3)
+                      (let ((i 0))
+                        (dolist (v (cdr vals))
+                          (mem-write state (+ #x10000098 (* i 8))
+                                     (%val->word v) 3)
+                          (incf i))))
                     (setf pc npc)))
                  (t
                   (error "MVM: CALL-IND with non-callable target ~S" target))))))

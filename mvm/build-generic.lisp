@@ -555,6 +555,19 @@
   ;; bound symbol can't kill the chain — see CLAUDE.md known limitation
   ;; #7 history.  Most thunks succeed and we get init values for free.
   (init-all-globals)
+  ;; ANSI numeric/array constants whose DEFCONSTANT init thunks don't run
+  ;; at boot (limitation #7).  The x64-linux gate image sets these in its
+  ;; own kernel-main; build-generic relied only on init-all-globals, so
+  ;; array-dimension-limit et al. were UNBOUND — third-party code that
+  ;; reads them at read-time (chipz types-and-tables.lisp:
+  ;; (deftype index () '(mod #.array-dimension-limit))) got UNBOUND-VARIABLE
+  ;; during READ, silently dropping the whole file.
+  (setq array-total-size-limit  (ash 1 24))
+  (setq array-dimension-limit   (ash 1 24))
+  (setq array-rank-limit        256)
+  (setq call-arguments-limit    256)
+  (setq lambda-parameters-limit 256)
+  (setq pi 3.141592653589793d0)
   ;; AFTER init-all-globals — overrides defvar's init.  *write-object-
   ;; budget* defvars to 0 which immediately exhausts; we want a huge
   ;; budget so test names print fully.

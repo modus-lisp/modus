@@ -504,6 +504,37 @@
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
 
+;; Compile-time struct-slot table for DEFSTRUCT :INCLUDE support.  Maps a
+;; struct-name STRING -> the struct's EFFECTIVE (name . default) slot list
+;; (parent slots first, then own — CLHS 3.4.6).  Populated as each
+;; DEFSTRUCT is compiled (parent before child, guaranteed by source order);
+;; a child with (:include PARENT) reads PARENT's entry to prepend the
+;; inherited slots so their accessors/setters/layout are generated with the
+;; child's conc-name at the right offsets.  Runs in both the build-time host
+;; compile and in-image eval2 compile (this defvar lives in the image too);
+;; lazy-init'd because defvar thunks don't auto-run in-image.
+(defvar *defstruct-eff-slots* nil)
+
+(defun %defstruct-eff-slots-get (name-str)
+  "Effective (name . default) slot list registered for struct NAME-STR, or NIL."
+  (let ((cur *defstruct-eff-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (when (string= (car (car cur)) name-str) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %defstruct-eff-slots-put (name-str slots)
+  "Register SLOTS (list of (name . default)) as struct NAME-STR's effective
+   slots, replacing any prior entry."
+  (let ((new nil) (cur *defstruct-eff-slots*))
+    (loop
+      (when (null cur) (return nil))
+      (unless (string= (car (car cur)) name-str)
+        (setq new (cons (car cur) new)))
+      (setq cur (cdr cur)))
+    (setq *defstruct-eff-slots* (cons (cons name-str slots) new)))
+  slots)
+
 (defvar *arith-push-depth* 0
   "Depth of arithmetic PUSH/POP nesting. When > 0, we are inside an
    arithmetic operation that has pushed an intermediate result.
@@ -15300,18 +15331,45 @@
        (unless conc-name-specified
          (setf conc-name (format nil "~A-" struct-str)))
       (let* ((raw-slots (cddr form))
-            ;; Parse slot specs: plain symbol or (symbol default)
-            (slot-names (mapcar (lambda (s)
-                                  (if (consp s) (car s) s))
-                                raw-slots))
-            (slot-defaults (mapcar (lambda (s)
-                                     (if (consp s) (cadr s) nil))
-                                   raw-slots))
+            ;; Parse OWN slot specs: plain symbol or (symbol default)
+            (own-slot-names (mapcar (lambda (s)
+                                      (if (consp s) (car s) s))
+                                    raw-slots))
+            (own-slot-defaults (mapcar (lambda (s)
+                                         (if (consp s) (cadr s) nil))
+                                       raw-slots))
+            ;; DEFSTRUCT :INCLUDE (CLHS 3.4.6): the parent's effective slots
+            ;; come FIRST in the layout; the child generates accessors with
+            ;; its OWN conc-name for the inherited slots too.  Look the parent
+            ;; up in the compile-time table (populated when its own DEFSTRUCT
+            ;; was compiled — source order guarantees parent-before-child).
+            (parent-slots (when include-parent
+                            (%defstruct-eff-slots-get (symbol-name include-parent))))
+            (parent-slot-names (mapcar #'car parent-slots))
+            (parent-slot-defaults (mapcar #'cdr parent-slots))
+            ;; Effective (inherited then own) slot lists used everywhere.
+            (slot-names (append parent-slot-names own-slot-names))
+            (slot-defaults (append parent-slot-defaults own-slot-defaults))
             (nslots (length slot-names))
             (forms-to-compile nil))
+       ;; Register THIS struct's effective slots so its own children inherit.
+       (%defstruct-eff-slots-put
+        struct-str
+        (let ((r nil) (ns slot-names) (ds slot-defaults))
+          (loop
+            (when (null ns) (return (nreverse r)))
+            (setq r (cons (cons (car ns) (car ds)) r))
+            (setq ns (cdr ns)) (setq ds (cdr ds)))))
        ;; Constructor
+       ;; NOTE: the internal all-slots ctor is named %%STRUCT-CTOR-<name>,
+       ;; NOT %MAKE-<name>: a user (:constructor %MAKE-<name> (boa...)) — as
+       ;; chipz's (:constructor %make-inflate-state (data-format)) — would
+       ;; otherwise COLLIDE with the auto internal ctor (last-defun-wins),
+       ;; so the BOA's positional args landed at the wrong slots (value in
+       ;; slot 0 instead of the named slot).  The %% prefix is not a legal
+       ;; user constructor name shape here, so no collision.
        (let ((ctor-name (format nil "MAKE-~A" struct-str))
-             (internal-ctor-name (format nil "%MAKE-~A" struct-str))
+             (internal-ctor-name (format nil "%%STRUCT-CTOR-~A" struct-str))
              (ctor-params nil)
              (ctor-body nil))
          (setf ctor-params (loop for s in slot-names

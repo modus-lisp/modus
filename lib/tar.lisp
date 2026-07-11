@@ -28,16 +28,21 @@
 
 (defun %tar-field-string (bytes off len)
   "Extract a NUL-terminated (or LEN-bounded) ASCII field into a fresh string.
-   Stops at the first NUL byte."
-  (let ((out (make-string 0))
-        (i 0))
+   Stops at the first NUL byte.  Two passes (count then fill) so we never
+   grow a string with CONCATENATE in a loop (that pattern wedged on the
+   bare-metal image; a preallocated string with char stores is robust)."
+  (let ((slen 0) (i 0))
     (loop
       (when (>= i len) (return))
-      (let ((b (%tar-byte bytes (+ off i))))
-        (when (= b 0) (return))
-        (setq out (concatenate 'string out (string (code-char b)))))
+      (when (= (%tar-byte bytes (+ off i)) 0) (return))
+      (setq slen (+ slen 1))
       (setq i (+ i 1)))
-    out))
+    (let ((out (make-string slen)) (j 0))
+      (loop
+        (when (>= j slen) (return))
+        (setf (char out j) (code-char (%tar-byte bytes (+ off j))))
+        (setq j (+ j 1)))
+      out)))
 
 (defun %tar-parse-octal (bytes off len)
   "Parse an octal ASCII field (LEN bytes at OFF) into an integer.
@@ -63,7 +68,7 @@
   "True if the 512-byte block at OFF is entirely zero (or runs past end)."
   (let ((i 0) (allzero t) (n (length bytes)))
     (loop
-      (when (>= i *tar-block-size*) (return))
+      (when (>= i 512) (return))
       (let ((k (+ off i)))
         (when (< k n)
           (when (/= (%tar-byte bytes k) 0)
@@ -73,8 +78,10 @@
     allzero))
 
 (defun %tar-slice (bytes off len)
-  "Return a fresh (unsigned-byte 8) vector = BYTES[OFF .. OFF+LEN)."
-  (let ((out (make-array len :element-type '(unsigned-byte 8)))
+  "Return a fresh vector = BYTES[OFF .. OFF+LEN).  Plain (make-array len) — the
+   bare-metal image's make-array wedges on the :element-type '(unsigned-byte 8)
+   keyword; a generic array holds byte fixnums fine for the tar/string readers."
+  (let ((out (make-array len))
         (i 0))
     (loop
       (when (>= i len) (return))
@@ -84,8 +91,8 @@
 
 (defun %tar-round-up-block (n)
   "Round N up to the next multiple of *tar-block-size*."
-  (let ((r (mod n *tar-block-size*)))
-    (if (= r 0) n (+ n (- *tar-block-size* r)))))
+  (let ((r (mod n 512)))
+    (if (= r 0) n (+ n (- 512 r)))))
 
 (defun tar-do-entries (bytes fn)
   "Walk the ustar archive in BYTES.  For each entry call
@@ -96,11 +103,11 @@
         (zero-run 0))
     (loop
       ;; Need a full header block, else stop.
-      (when (> (+ off *tar-block-size*) n) (return))
+      (when (> (+ off 512) n) (return))
       (if (%tar-zero-block-p bytes off)
           (progn
             (setq zero-run (+ zero-run 1))
-            (setq off (+ off *tar-block-size*))
+            (setq off (+ off 512))
             ;; Two consecutive zero blocks = end of archive.
             (when (>= zero-run 2) (return)))
           (progn
@@ -112,12 +119,13 @@
                    (full   (if (> (length prefix) 0)
                                (concatenate 'string prefix "/" name)
                                name))
-                   (data-off (+ off *tar-block-size*)))
+                   (data-off (+ off 512)))
               (cond
                 ;; Regular file: typeflag #\0 (48) or NUL (0).
                 ((or (= tflag 48) (= tflag 0))
                  (let ((content (%tar-slice bytes data-off size)))
-                   (funcall fn full 48 content)))
+                   (funcall fn full 48 content)
+                   ))
                 ;; Directory: typeflag #\5 (53).
                 ((= tflag 53)
                  (funcall fn full 53 nil))
@@ -153,12 +161,21 @@
 ;;; --- Byte-content -> string helper (ASCII/Latin-1) --------------------------
 
 (defun tar-bytes-to-string (bytes)
-  "Coerce a byte vector to a string, one char per byte (Latin-1)."
-  (let ((n (length bytes))
-        (out (make-string 0))
-        (i 0))
+  "Coerce a byte vector to a string, one char per byte (Latin-1).  Preallocate
+   + char-store (no loop-growing CONCATENATE — see %tar-field-string), then
+   SUBSEQ to normalize into a fresh simple string (make-string output fed
+   straight to make-string-input-stream wedged the bare-metal reader; the
+   subseq copy reads cleanly)."
+  (let* ((n (length bytes))
+         (out (make-string n))
+         (i 0))
     (loop
       (when (>= i n) (return))
-      (setq out (concatenate 'string out (string (code-char (%tar-byte bytes i)))))
+      ;; Store the raw char CODE directly with %prim-aset — the string-input
+      ;; reader's fast path uses %prim-aref (raw code), and a public
+      ;; (setf (char ...)) round-trip on a byte value read via generic AREF
+      ;; produced a string the reader wedged on.  %prim-aset is the internal
+      ;; code-store per CLAUDE.md's string-element contract.
+      (%prim-aset out i (%tar-byte bytes i))
       (setq i (+ i 1)))
     out))

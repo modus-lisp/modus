@@ -37,9 +37,18 @@
     (and (>= ls lf)
          (string= (subseq str (- ls lf) ls) suffix))))
 
+(defun %it-last-slash (path)
+  "Index of the last #\/ in PATH, or NIL.  Manual scan — the compiled
+   POSITION with :from-end t wedged on the bare-metal image."
+  (let ((i 0) (n (length path)) (last nil))
+    (loop
+      (when (>= i n) (return last))
+      (when (char= (char path i) #\/) (setq last i))
+      (setq i (+ i 1)))))
+
 (defun %it-basename (path)
   "Last /-separated component of PATH."
-  (let ((slash (position #\/ path :from-end t)))
+  (let ((slash (%it-last-slash path)))
     (if slash (subseq path (+ slash 1) (length path)) path)))
 
 (defun %it-string-designator (x)
@@ -51,7 +60,10 @@
 ;;; --- reading forms from an in-memory source string --------------------------
 
 (defun %it-read-forms (source-string)
-  "Read every top-level form from SOURCE-STRING; return them in a list."
+  "Read every top-level form from SOURCE-STRING; return them in a list.
+   Persistent string-input stream + READ (the standard loader path).  The
+   :start keyword variant of READ-FROM-STRING wedged the bare-metal image;
+   a single stream read repeatedly reads cleanly."
   (let ((s (make-string-input-stream source-string))
         (eof (list 'eof))
         (acc nil))
@@ -74,7 +86,7 @@
           (write-string-serial "  !! form eval error in ")
           (write-string-serial tag) (write-string-serial ": ")
           (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
-          (terpri))))
+          (write-char-serial 10))))
     count))
 
 ;;; --- .asd parsing -----------------------------------------------------------
@@ -154,7 +166,7 @@
 (defun %it-module-prefix (path)
   "The module-directory prefix of PATH (everything up to and incl. the last
    \"/\"), or \"\" for a top-level file."
-  (let ((slash (position #\/ path :from-end t)))
+  (let ((slash (%it-last-slash path)))
     (if slash (subseq path 0 (+ slash 1)) "")))
 
 (defun %it-file-by-dep (files prefix name)
@@ -218,30 +230,30 @@
    given, install that system; otherwise install the first defsystem found.
    Returns the installed system name (string)."
   (write-string-serial "install-tarball-from-bytes: ") (print-dec (length gz))
-  (write-string-serial " bytes") (terpri)
+  (write-string-serial " bytes") (write-char-serial 10)
   (%it-install-from-gz-bytes gz sysname))
 
 (defun install-tarball (path &optional sysname)
   "Install a Common Lisp system from the .tar.gz at PATH.  If SYSNAME is given,
    install that system; otherwise install the first defsystem found in the
    first .asd.  Returns the installed system name (string)."
-  (write-string-serial "install-tarball: ") (write-string-serial path) (terpri)
+  (write-string-serial "install-tarball: ") (write-string-serial path) (write-char-serial 10)
   (%it-install-from-gz-bytes (%it-slurp-bytes path) sysname))
 
 (defun %it-install-from-gz-bytes (gz sysname)
   "Core installer: GZ is a .tar.gz (or plain .tar) byte vector already in
    memory.  gunzip -> untar -> parse .asd -> load files in order."
   ;; 1. gunzip
-  (let* ((tarbytes (if (and (>= (length gz) 2)
-                            (= (aref gz 0) 31) (= (aref gz 1) 139))
+  (let* ((gzp (and (>= (length gz) 2) (= (aref gz 0) 31) (= (aref gz 1) 139)))
+         (tarbytes (if gzp
                        (chipz:decompress nil 'chipz:gzip gz)
                        gz)))              ; allow a plain .tar too
     (write-string-serial "  gunzipped to ") (print-dec (length tarbytes))
-    (write-string-serial " bytes") (terpri)
+    (write-string-serial " bytes") (write-char-serial 10)
     ;; 2. untar
     (let ((entries (tar-extract tarbytes)))
       (write-string-serial "  extracted ") (print-dec (length entries))
-      (write-string-serial " files") (terpri)
+      (write-string-serial " files") (write-char-serial 10)
       ;; 3. locate the .asd (prefer one matching SYSNAME)
       (let ((asd-entry nil))
         (dolist (e entries)
@@ -253,10 +265,10 @@
                 (setq asd-entry e)))))
         (when (null asd-entry)
           (error "install-tarball: no .asd file found in archive"))
-        (write-string-serial "  using asd: ") (write-string-serial (car asd-entry)) (terpri)
+        (write-string-serial "  using asd: ") (write-string-serial (car asd-entry)) (write-char-serial 10)
         ;; The .asd lives in a directory; source files are relative to that dir.
         (let* ((asd-path (car asd-entry))
-               (asd-dir (let ((slash (position #\/ asd-path :from-end t)))
+               (asd-dir (let ((slash (%it-last-slash asd-path)))
                           (if slash (subseq asd-path 0 (+ slash 1)) "")))
                (asd-src (tar-bytes-to-string (cdr asd-entry)))
                (asd-forms (%it-read-forms asd-src))
@@ -267,8 +279,8 @@
                  (comps (%it-plist-get (cddr ds) :components))
                  (files (nreverse (%it-collect-components comps "" nil)))
                  (ordered (%it-toposort files)))
-            (write-string-serial "  system: ") (write-string-serial this-sysname) (terpri)
-            (write-string-serial "  load order:") (terpri)
+            (write-string-serial "  system: ") (write-string-serial this-sysname) (write-char-serial 10)
+            (write-string-serial "  load order:") (write-char-serial 10)
             ;; 4. load each file's source, in order
             (dolist (f ordered)
               (let* ((rel (concatenate 'string asd-dir (it-file-path f) ".lisp"))
@@ -276,11 +288,11 @@
                 (cond
                   ((null ent)
                    (write-string-serial "    (missing: ")
-                   (write-string-serial rel) (write-string-serial ")") (terpri))
+                   (write-string-serial rel) (write-string-serial ")") (write-char-serial 10))
                   (t
-                   (write-string-serial "    ") (write-string-serial rel) (terpri)
+                   (write-string-serial "    ") (write-string-serial rel) (write-char-serial 10)
                    (%it-eval-source (tar-bytes-to-string (cdr ent))
                                     (it-file-path f))))))
             (write-string-serial "install-tarball: done, system=")
-            (write-string-serial this-sysname) (terpri)
+            (write-string-serial this-sysname) (write-char-serial 10)
             this-sysname))))))

@@ -375,7 +375,13 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")))
+    (mvm-text "mvm/ansi-bridge.lisp")
+    (string #\Newline)
+    ;; POSIX ustar tar reader (pure CL, no FFI) — Quicklisp-client tar support.
+    ;; install-tarball.lisp (the gunzip+untar+load driver) references the CHIPZ
+    ;; package, so it is loaded at RUNTIME (load "lib/install-tarball.lisp")
+    ;; after chipz, NOT compiled into the image here.
+    (mvm-text "lib/tar.lisp")))
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
 ;; image — production eval is eval2 only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback

@@ -5310,6 +5310,44 @@
                                     (subseq result 0 pos)
                                     (subseq result (+ pos (length pfx))))))))))
 
+(defun strip-named-defuns (text names)
+  "Remove every top-level (defun NAME ...) form whose NAME is in NAMES from
+   TEXT (a source string).  Balanced-paren scan from the `(defun NAME ' head
+   to its matching close paren; the removed form is replaced by a comment so
+   line structure downstream is preserved.  Used by the MERGED net build to
+   drop arch-aarch64.lisp's LEGACY runtime primitives (make-array/aref/aset/
+   array-length/numberp) — they are the SSH kernel's minimal stand-ins and,
+   under last-defun-wins, they OVERRIDE the full CL runtime + the eval2
+   compiler's array layout (count<<15 + byte-packed data vs the primops'
+   count<<8 + 8-byte slots), corrupting eval2 (E2SMOKE add=-1).  The net
+   stack's own array use is via compile-time %prim-aref/%prim-aset primops
+   and (make-array n), all of which the FULL CL versions serve correctly."
+  (let ((result text))
+    (dolist (name names result)
+      (let ((needle (concatenate 'string "(defun " name " ")))
+        (loop
+          (let ((pos (search needle result)))
+            (unless pos (return))
+            ;; Balanced-paren scan from pos to the matching close.
+            (let ((depth 0) (i pos) (n (length result)) (end nil) (in-str nil))
+              (loop
+                (when (>= i n) (return))
+                (let ((ch (char result i)))
+                  (cond
+                    (in-str (when (char= ch #\") (setq in-str nil)))
+                    ((char= ch #\") (setq in-str t))
+                    ((char= ch #\() (setq depth (+ depth 1)))
+                    ((char= ch #\))
+                     (setq depth (- depth 1))
+                     (when (= depth 0) (setq end i) (return)))))
+                (setq i (+ i 1)))
+              (unless end (return))
+              (setf result
+                    (concatenate 'string
+                                 (subseq result 0 pos)
+                                 ";; [net-build: legacy " name " stripped]"
+                                 (subseq result (+ end 1)))))))))))
+
 (setf *prelude-source* (strip-in-package *prelude-source*))
 (setf *rt-source*      (strip-in-package *rt-source*))
 (setf *bridge-source*  (strip-in-package *bridge-source*))
@@ -5327,6 +5365,23 @@
 ;; net image builds fast and small.
 (when *net-build-p*
   (setf *net-source*     (strip-in-package *net-source*))
+  ;; Drop arch-aarch64.lisp's LEGACY make-array / numberp.  In the standalone
+  ;; SSH build these ARE the runtime; in this merged image they load AFTER the
+  ;; full CL runtime + the self-hosted eval2 compiler and, via last-defun-wins,
+  ;; override them.  The legacy make-array builds an object with an INCOMPATIBLE
+  ;; layout (header element-count << 15 + byte-packed, len+1-byte payload) — but
+  ;; the compiler/eval2 and the %prim-aref/%prim-aset primops read count<<8 and
+  ;; access 8-byte slots at raw+16+idx*8.  So every array eval2 allocated had a
+  ;; bogus length and a too-small payload, corrupting the compiler's constant/
+  ;; bytecode buffers: eval2 threw even on (+ 1 2) (E2SMOKE add=-1), so
+  ;; (demo:sq 7) could never run.  Stripping these lets ansi-bridge's full
+  ;; (make-array dim &rest kwargs) and cl-eval's full numberp win.  The legacy
+  ;; aref/aset/array-length are NOT stripped — they have no full-CL defun
+  ;; counterpart (those are compile-time primops), so they collide with nothing;
+  ;; the net stack accesses arrays through the primops, not these funcall stubs.
+  ;; print-dec is DELIBERATELY re-overridden below (straight-to-UART), so keep it.
+  (setf *net-source*
+        (strip-named-defuns *net-source* '("make-array" "numberp")))
   (setf *install-source* (strip-in-package *install-source*))
   ;; chipz's internal + exported symbols collapse to the flat namespace;
   ;; drop every CHIPZ:/CHIPZ:: qualifier so build-time reads succeed.  Also

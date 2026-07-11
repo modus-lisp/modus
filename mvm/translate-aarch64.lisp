@@ -3303,7 +3303,15 @@
            (a64-cmp-reg buf +a64-x24+ +a64-x25+)
            (let ((cc (if *aarch64-linux-mode* +cc-cc+ +cc-lt+)))
              (cond
-               (*aarch64-gc-trampoline-label*
+               ;; Only emit the BL-to-trampoline when BOTH the label is
+               ;; bound AND %GC-COLLECT's bytecode offset was found (i.e.
+               ;; emit-aarch64-handler-helpers will actually emit the
+               ;; trampoline and set its label).  Guarding on the label
+               ;; alone produced `undefined label 3` for a module that has
+               ;; :gc-check opcodes but no %GC-COLLECT in its function
+               ;; table (e.g. the net/actors image, which omits gc.lisp).
+               ((and *aarch64-gc-trampoline-label*
+                     *aarch64-gc-collect-bytecode-offset*)
                 (let ((skip-label (incf *mvm-label-counter*)))
                   (let ((idx (a64-current-index buf)))
                     (a64-bcond buf cc 0)

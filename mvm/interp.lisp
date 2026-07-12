@@ -970,20 +970,41 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((b (untag-fixnum (reg-get regs vb))))
-                   (when (zerop b) (error "MVM: division by zero at PC ~D" (1- pc)))
-                   (reg-set regs vd
-                         (tag-fixnum (truncate (untag-fixnum (reg-get regs va)) b))))
+                 ;; Operate on the register VALUES directly.  The old
+                 ;; `(untag-fixnum (reg-get regs vX))` round-trip is
+                 ;; `%val->word` (SHL 1) then `untag-fixnum` (SAR 1) —
+                 ;; an identity ONLY while `%val->word`'s intermediate
+                 ;; fits a fixnum.  For a fixnum VALUE V near 2^62 the
+                 ;; native :shl produces V<<2 which overflows the 64-bit
+                 ;; register (V<<1 already sets the top word bit), so the
+                 ;; SAR reads garbage — `(truncate/mod BIG BIG)` returned
+                 ;; a tiny wrong value under eval2 (native was correct).
+                 ;; The slot already holds the fixnum VALUE, so use it
+                 ;; directly and store the VALUE directly (no re-tag,
+                 ;; which would re-overflow the quotient/remainder word).
+                 (let ((a (svref regs va)) (b (svref regs vb)))
+                   (when (and (integerp b) (zerop b))
+                     (error "MVM: division by zero at PC ~D" (1- pc)))
+                   (setf (svref regs vd) (truncate a b)))
                  (setf pc npc3)))))
 
           (#.+op-mod+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (let ((b (untag-fixnum (reg-get regs vb))))
-                   (when (zerop b) (error "MVM: modulus by zero at PC ~D" (1- pc)))
-                   (reg-set regs vd
-                         (tag-fixnum (mod (untag-fixnum (reg-get regs va)) b))))
+                 ;; See op-div: use the register VALUES directly (the
+                 ;; untag∘reg-get round-trip overflowed for ~2^62 fixnums).
+                 ;; The native :mod translator is IDIV → RDX, i.e. the
+                 ;; TRUNCATE remainder (`rem`, sign follows the dividend),
+                 ;; NOT CL floor-`mod`.  %fixnum-truncate2 emits :mod to
+                 ;; read that truncate remainder; compile-mod does the
+                 ;; floor-mod sign adjustment in Lisp on top.  Match native
+                 ;; with `rem` (the old host `mod` here silently disagreed
+                 ;; for operands of opposite sign).
+                 (let ((a (svref regs va)) (b (svref regs vb)))
+                   (when (and (integerp b) (zerop b))
+                     (error "MVM: modulus by zero at PC ~D" (1- pc)))
+                   (setf (svref regs vd) (rem a b)))
                  (setf pc npc3)))))
 
           (#.+op-neg+ ; -(a<<1) = (-a)<<1
@@ -1079,7 +1100,18 @@
           (#.+op-cmp+
            (multiple-value-bind (va npc) (fetch-reg bc pc)
              (multiple-value-bind (vb npc2) (fetch-reg bc npc)
-               (let ((a (reg-get regs va)) (b (reg-get regs vb)))
+               ;; Compare the register VALUES directly.  The old
+               ;; `(reg-get regs vX)` = `%val->word` (SHL 1) OVERFLOWS the
+               ;; 64-bit register for a fixnum VALUE near 2^62 (V<<1 sets
+               ;; the top word bit → the SHL's V<<2 wraps negative), so
+               ;; `(< BIG-POSITIVE 0)` wrongly returned :lt.  Two big
+               ;; fixnums compared to EACH OTHER happened to survive
+               ;; (both wrap the same way, order preserved), but a big
+               ;; fixnum vs a small constant did not — breaking the
+               ;; sign test in compile-mod's floor adjustment (the eval2
+               ;; mod bug).  The slots hold real VALUES; comparing them
+               ;; directly is exact for fixnums, bignums, and floats.
+               (let ((a (svref regs va)) (b (svref regs vb)))
                  (setf (mvm-flags state)
                        (cond ((and (integerp a) (integerp b))
                               (cond ((= a b) :eq) ((< a b) :lt) (t :gt)))
@@ -1198,13 +1230,15 @@
           (#.+op-consp+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (reg-set regs vd (mvm-boolean (consp (%word->val (reg-get regs vs)))))
+               ;; VALUE directly: the (%word->val (reg-get ...)) round-trip
+               ;; overflows for a fixnum near 2^62 → mis-typed as a cons.
+               (reg-set regs vd (mvm-boolean (consp (svref regs vs))))
                (setf pc npc2))))
 
           (#.+op-atom+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (reg-set regs vd (mvm-boolean (atom (%word->val (reg-get regs vs)))))
+               (reg-set regs vd (mvm-boolean (atom (svref regs vs))))
                (setf pc npc2))))
 
           ;; --- Object Operations ---
@@ -1285,7 +1319,17 @@
           (#.+op-obj-tag+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (let ((obj (%word->val (reg-get regs vs))))
+               ;; Read the register VALUE directly.  The old
+               ;; `(%word->val (reg-get regs vs))` is `%val->word` (SHL 1)
+               ;; then `%word->val` (SAR 1) — a round-trip that OVERFLOWS
+               ;; the 64-bit register for a fixnum VALUE near 2^62 (V<<1
+               ;; already sets the top word bit, so the SHL's V<<2 wraps),
+               ;; yielding a garbage `obj`.  That mis-classified a ~2^62
+               ;; fixnum as an OBJECT → (bignump BIG-FIXNUM) spuriously T
+               ;; → (truncate/mod BIG BIG) routed to the slow bignum path
+               ;; and returned garbage (the eval2 gcd/mod bug).  The slot
+               ;; already holds the VALUE, so use it directly.
+               (let ((obj (svref regs vs)))
                  (reg-set regs vd
                        ;; A BIGNUM is `integerp' = T but is a tag-9 OBJECT, not a
                        ;; fixnum — reporting +tag-fixnum+ for it made (bignump
@@ -1322,7 +1366,12 @@
                ;; funcall returned NIL (WS4 oracle).  Fix: prefer the real
                ;; obj-subtag for genuine OBJECTS (tag = object); only the
                ;; non-object callable (raw fn-addr) gets the #x51 fallback.
-               (let* ((obj (%word->val (reg-get regs vs)))
+               ;; Read the VALUE directly (see op-obj-tag): the
+               ;; `(%word->val (reg-get regs vs))` round-trip overflows for
+               ;; a fixnum VALUE near 2^62.  A non-object value falls
+               ;; through obj-subtag's non-tag-9 bail below, so passing the
+               ;; VALUE straight through is correct for objects AND fixnums.
+               (let* ((obj (svref regs vs))
                       (raw-st (obj-subtag obj))
                       (st (cond
                             ;; A CLOSURE object reads a clean #x52 from the

@@ -47,6 +47,33 @@
 (defun reg-get (regs v) (%val->word (svref regs v)))
 (defun reg-set (regs v w) (setf (svref regs v) (%word->val w)))
 
+;; Raw-wrapping fixnum add/sub for op-add / op-sub.  Native :add/:sub run
+;; hardware ADD/SUB on the 64-bit register words (each = value<<1) and let the
+;; result WRAP at int64 — that wrap is LOAD-BEARING: bignum-add/sub limb
+;; carry/borrow detection relies on two ~2^62 limbs summing to a "negative"
+;; wrapped fixnum value to signal the carry (see %add-limbs-mag in cl-eval).
+;; So op-add/op-sub must reproduce native's int64 wrap, NOT return a host-exact
+;; promoted sum (that would give the true value / promote to a bignum and break
+;; the carry contract).
+;;
+;; The FIX must not re-hit the bug it repairs, and must not depend on the
+;; boundary correctness of the in-image bignum tower.  Both are solved by using
+;; `%fixnum-+` / `%fixnum--` on the register VALUES directly.  interp.lisp is
+;; compiled to NATIVE code and runs natively (only eval2'd code runs through
+;; mvm-interpret), so these primops emit the very same native :add / :sub
+;; hardware instructions — with the identical int64 wrap — that the eval2
+;; opcode is modelling.  There is NO promotion, NO bignum intermediate, and NO
+;; recursion back into this handler.  The old `(+ (reg-get va) (reg-get vb))`
+;; instead round-tripped each operand through %val->word (SHL 1): for a fixnum
+;; VALUE near 2^62, value<<1 already sets bit 63, so the compiled :shl's
+;; value<<2 intermediate overflowed the register and the following :sar read
+;; garbage — collapsing `(+ -3 4611686018427387900)` to -7 under eval2 while
+;; native was correct.  Taking the slot VALUE straight into %fixnum-+ avoids
+;; the extra shift entirely, so the wrap happens exactly once, in hardware.
+(declaim (inline %mvm-wrap-tagword-add %mvm-wrap-tagword-sub))
+(defun %mvm-wrap-tagword-add (a b) (%fixnum-+ a b))
+(defun %mvm-wrap-tagword-sub (a b) (%fixnum-- a b))
+
 ;;; Interpreter state
 
 (defparameter *mvm-trace* nil)  ; when non-nil, mvm-interpret prints each opcode
@@ -813,7 +840,18 @@
           (#.+op-mov+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (reg-set regs vd (reg-get regs vs)) (setf pc npc2))))
+               ;; Plain register-to-register copy: move the slot VALUE directly.
+               ;; The old `(reg-set vd (reg-get vs))` round-tripped through
+               ;; %val->word (SHL 1) then %word->val (SAR 1) — an identity ONLY
+               ;; while %val->word's value<<1 fits int64.  For a fixnum VALUE
+               ;; near 2^62 the compiled :shl's value<<2 overflows the register
+               ;; and the :sar reads garbage, CORRUPTING the moved operand.  The
+               ;; eval2 pairwise-arith step (%compile-arith-arg-step-e2) emits
+               ;; `:mov temp dest` on a freshly compiled ~2^62 literal, so
+               ;; `(+ -3 4611686018427387900)` fed generic-add a garbage second
+               ;; operand and returned -7 (native was correct).  A move needs no
+               ;; reinterpretation — the slots already hold real VALUES.
+               (setf (svref regs vd) (svref regs vs)) (setf pc npc2))))
 
           (#.+op-li+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
@@ -872,7 +910,14 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd (+ (reg-get regs va) (reg-get regs vb)))
+                 ;; RAW WRAPPING add (see %mvm-wrap-tagword-add): reproduce
+                 ;; native :add's int64 wrap of the tagged words WITHOUT the
+                 ;; reg-get/%val->word round-trip, which overflowed for a
+                 ;; fixnum VALUE near 2^62 and collapsed the sum by 2^62
+                 ;; (the eval2 `(+ -3 4611686018427387900)` -> -7 bug).  The
+                 ;; wrap is load-bearing for bignum-add limb carry detection.
+                 (setf (svref regs vd)
+                       (%mvm-wrap-tagword-add (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-add-checked+
@@ -888,7 +933,11 @@
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
                (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
-                 (reg-set regs vd (- (reg-get regs va) (reg-get regs vb)))
+                 ;; RAW WRAPPING sub — mirror of op-add (see
+                 ;; %mvm-wrap-tagword-sub); reproduces native :sub's int64 wrap
+                 ;; of the tagged difference without the overflowing round-trip.
+                 (setf (svref regs vd)
+                       (%mvm-wrap-tagword-sub (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
           (#.+op-mul+

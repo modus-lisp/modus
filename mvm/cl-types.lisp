@@ -2540,7 +2540,17 @@
   (cond
     ;; Bignum-aware: bignum-sub handles fixnum/bignum mix.
     ((or (bignump a) (bignump b)) (bignum-sub a b))
-    ((and (integerp a) (integerp b)) (%fixnum-- a b))
+    ;; Fixnum - fixnum: mirror generic-add's magnitude guard.  Each operand
+    ;; in [-2^61, 2^61-1] guarantees the difference fits the 62-bit fixnum
+    ;; range, so %fixnum-- (raw) is exact.  Larger operands can overflow
+    ;; (e.g. (- 0 most-negative-fixnum) = 2^62), so route through bignum-sub
+    ;; which PROMOTES.  This is the promotion decision for the compiled
+    ;; :sub-checked slow path (native SUB+JO calls here only on overflow).
+    ((and (integerp a) (integerp b))
+     (if (and (<= a 2305843009213693951) (>= a -2305843009213693952)
+              (<= b 2305843009213693951) (>= b -2305843009213693952))
+         (%fixnum-- a b)
+         (bignum-sub a b)))
     ((and (integerp a) (ratiop b))
      (%make-rat (%fixnum-- (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))

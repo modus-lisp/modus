@@ -940,6 +940,22 @@
                        (%mvm-wrap-tagword-sub (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
+          (#.+op-sub-checked+
+           ;; High-level `-`: promote on overflow via GENERIC-SUBTRACT.
+           ;; Mirror of op-add-checked.  Unlike raw op-sub (which reproduces
+           ;; native :sub's LOAD-BEARING int64 wrap for bignum limb borrow
+           ;; detection), this promoting variant returns the TRUE difference,
+           ;; overflowing a fixnum into a bignum — so `(- 0 mnf)` = 2^62 does
+           ;; not wrap back to mnf.  generic-subtract dispatches fixnum /
+           ;; bignum / ratio / float and never re-enters this handler because
+           ;; its bignum-core limb subtracters use raw %fixnum-- (not `-`).
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (generic-subtract (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+
           (#.+op-mul+
            ;; RAW tagged multiply (wraps) — building block for %fixnum-*.
            (multiple-value-bind (vd npc) (fetch-reg bc pc)

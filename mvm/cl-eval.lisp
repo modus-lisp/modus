@@ -2285,18 +2285,21 @@
       ;; 1 limb: fits in 62-bit fixnum or sign-applied form.
       ((null (cdr trimmed))
        (let ((v (car trimmed)))
-         (if (= sign -1) (- 0 v) v)))
+         ;; %fixnum-- (raw): v is a magnitude limb in [0,2^62-1]; its negation
+         ;; stays in fixnum range.  Plain `-` now promotes on overflow and
+         ;; would re-enter generic-subtract on limb values.
+         (if (= sign -1) (%fixnum-- 0 v) v)))
       ;; 2 limbs: small-bignum representation, hi gets sign.
       ((null (cddr trimmed))
        (let* ((lo (car trimmed)) (hi-mag (cadr trimmed))
-              (hi (if (= sign -1) (- 0 hi-mag) hi-mag)))
+              (hi (if (= sign -1) (%fixnum-- 0 hi-mag) hi-mag)))
          (if (= sign -1)
              ;; Negative two's complement: lo' = 2^62 - lo when lo > 0;
              ;; carry into hi.  Same logic as %bignum-negate-parts.
              (if (= lo 0)
                  (make-bignum 0 hi)
                  (make-bignum (%fixnum-+ 1 (logxor lo 4611686018427387903))
-                              (- hi 1)))
+                              (%fixnum-- hi 1)))
              (bignum-to-fixnum-if-possible (make-bignum lo hi)))))
       ;; 3+ limbs: allocate a big-bignum.
       (t
@@ -2333,15 +2336,16 @@
               (cons 1 (list lo))
               (cons 1 (list lo hi))))
          (t
-          ;; Negative — two's complement to sign-magnitude.
+          ;; Negative — two's complement to sign-magnitude.  All limb-value
+          ;; subtractions use raw %fixnum-- (plain `-` now promotes/recurses).
           (if (= lo 0)
-              (cons -1 (list 0 (- 0 hi)))
+              (cons -1 (list 0 (%fixnum-- 0 hi)))
               (let* ((m-lo (%fixnum-+ 1 (logxor lo 4611686018427387903)))
-                     (m-hi (- (logxor hi -1) 0))   ; ~hi
+                     (m-hi (%fixnum-- (logxor hi -1) 0))   ; ~hi
                      (m-hi+1 (%fixnum-+ m-hi (if (= m-lo 4611686018427387904) 1 0)))
                      (m-lo-clamped (logand m-lo 4611686018427387903)))
                 (cons -1 (list m-lo-clamped m-hi+1))))))))
-    ((< n 0) (cons -1 (list (- 0 n))))
+    ((< n 0) (cons -1 (list (%fixnum-- 0 n))))
     ((= n 0) (cons 1 '(0)))
     (t (cons 1 (list n)))))
 
@@ -2367,7 +2371,14 @@
      (let ((hi (bignum-hi b)) (lo (bignum-lo b)))
        (if (= hi 0) lo
            (if (and (= hi -1) (>= lo 2305843009213693952))
-               (- lo 4611686018427387904)
+               ;; lo - 2^62 for lo in [2^61, 2^62-1] = a negative fixnum in
+               ;; [-2^61, -1].  Compute via raw (logior lo -2^62) — NOT
+               ;; (- lo 4611686018427387904): 2^62 is a BIGNUM literal, so `-`
+               ;; (now :sub-checked) would route back through generic-subtract
+               ;; -> bignum-sub -> bignum-add -> here again = infinite
+               ;; recursion / stack-overflow SIGSEGV.  logior mnf sign-extends
+               ;; bit 62+ and is a raw :or on the tagged fixnum words.
+               (logior lo -4611686018427387904)
                b))))))
 
 ;;; --- Magnitude arithmetic on LSB-first limb lists ---
@@ -2429,7 +2440,12 @@
         (return (nreverse result)))
       (let* ((a (car xs))
              (b (if ys (car ys) 0))
-             (diff (- a b borrow))
+             ;; %fixnum-- (raw wrapping :sub), NOT - — plain - now promotes on
+             ;; fixnum overflow to a bignum (via :sub-checked -> generic-
+             ;; subtract -> bignum-sub -> %sub-limbs-mag), which would recurse
+             ;; forever.  The borrow contract relies on the raw signed diff:
+             ;; (< diff 0) signals the borrow.  Mirrors %add-limbs-mag's carry.
+             (diff (%fixnum-- (%fixnum-- a b) borrow))
              (limb (if (< diff 0)
                        ;; diff + 2^62, fixnum-safe: 4611686018427387904 (2^62)
                        ;; is a BIGNUM literal (one past fixnum max), so the raw
@@ -2729,9 +2745,22 @@
 (defun bignum-negate (n)
   "Negate N (fixnum or bignum)."
   (cond
-    ((not (bignump n)) (- 0 n))
+    ;; Fixnum.  `-` now promotes on overflow through :sub-checked ->
+    ;; generic-subtract -> bignum-sub -> bignum-negate, so a plain (- 0 n)
+    ;; would recurse forever on the ONE fixnum that overflows under
+    ;; negation: most-negative-fixnum (-2^62), whose true negation 2^62 is
+    ;; a bignum.  Special-case mnf (build 2^62 = lo0/hi1 directly), and use
+    ;; raw %fixnum-- for every other fixnum — in-range, exact, and it never
+    ;; re-enters checked `-` (nor the small-bignum collapse path, which a
+    ;; parts-based negate would trip on for tiny values).
+    ((not (bignump n))
+     (if (= n -4611686018427387904)
+         (make-bignum 0 1)
+         (%fixnum-- 0 n)))
     ((big-bignum-p n)
-     (%make-bb (- 0 (%bb-sign n)) (%bb-limbs-list n)))
+     ;; sign is -1/0/1 — cannot overflow; raw %fixnum-- keeps us out of
+     ;; the checked-subtract path for defensiveness.
+     (%make-bb (%fixnum-- 0 (%bb-sign n)) (%bb-limbs-list n)))
     (t
      (bignum-to-fixnum-if-possible
        (%bignum-negate-parts (bignum-lo n) (bignum-hi n))))))
@@ -2890,18 +2919,26 @@
   (%generic-bitwise a b 2))
 
 (defun bignum-sub (a b)
-  "Subtract B from A."
-  (if (and (not (bignump a)) (not (bignump b)))
-      (- a b)
-      (bignum-add a (bignum-negate b))))
+  "Subtract B from A.  Always routes through the promoting add/negate path.
+   The old `(- a b)` fixnum/fixnum shortcut is GONE: `-` now compiles to
+   :sub-checked which, on overflow, calls generic-subtract -> bignum-sub, so
+   the shortcut would infinitely recurse on exactly the overflowing pairs
+   (e.g. (- 0 most-negative-fixnum) = 2^62).  bignum-add + bignum-negate use
+   raw %fixnum-+/-- and the mask-based parts helpers, so they promote the
+   overflow to a bignum without re-entering checked `-`."
+  (bignum-add a (bignum-negate b)))
 
 (defun bignum-1- (n)
+  ;; Limb decrements use raw %fixnum-- (they stay in-range by construction:
+  ;; lo>0 so (lo-1)>=0; the hi-1 borrow path is a limb value).  The fixnum
+  ;; tail routes through generic-subtract so mnf promotes: (1- mnf) =
+  ;; -(2^62+1), a bignum — a plain %fixnum-- would wrap it.
   (if (bignump n)
       (let ((lo (bignum-lo n)) (hi (bignum-hi n)))
         (if (> lo 0)
-            (bignum-to-fixnum-if-possible (make-bignum (- lo 1) hi))
-            (bignum-to-fixnum-if-possible (make-bignum 4611686018427387903 (- hi 1)))))
-      (- n 1)))
+            (bignum-to-fixnum-if-possible (make-bignum (%fixnum-- lo 1) hi))
+            (bignum-to-fixnum-if-possible (make-bignum 4611686018427387903 (%fixnum-- hi 1)))))
+      (generic-subtract n 1)))
 (defun %fixnum-integer-length (n)
   (let ((x (if (< n 0) (logxor n -1) n)) (len 0))
     (loop (when (zerop x) (return len))
@@ -2969,7 +3006,8 @@
          ((and (= a-sign -1) (= b-sign 1)) -1)
          (t
           (let ((mag (%cmp-limbs-mag (cdr ap) (cdr bp))))
-            (if (= a-sign -1) (- 0 mag) mag))))))
+            ;; mag is -1/0/1; raw %fixnum-- keeps sign-flip out of checked `-`.
+            (if (= a-sign -1) (%fixnum-- 0 mag) mag))))))
     (t
      (let ((ah (if (bignump a) (bignum-hi a) (if (< a 0) -1 0)))
            (al (if (bignump a) (bignum-lo a)
@@ -3006,7 +3044,8 @@
                     (list 1 0 (%fixnum-+ neg-hi 1)))
                    (t (list -1 neg-lo neg-hi))))
            (list 1 lo hi))))
-    ((< n 0) (list -1 (- 0 n) 0))
+    ;; Raw %fixnum-- (magnitude of a fixnum): plain `-` now promotes/recurses.
+    ((< n 0) (list -1 (%fixnum-- 0 n) 0))
     (t       (list 1  n        0))))
 
 (defun bignum-mul (a b)

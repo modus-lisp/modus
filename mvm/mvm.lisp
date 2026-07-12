@@ -31,7 +31,7 @@
    ;; Opcodes
    #:+op-nop+ #:+op-break+
    #:+op-mov+ #:+op-li+ #:+op-li-const+ #:+op-push+ #:+op-pop+
-   #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-mul-checked+ #:+op-add-checked+ #:+op-div+ #:+op-mod+
+   #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-mul-checked+ #:+op-add-checked+ #:+op-sub-checked+ #:+op-div+ #:+op-mod+
    #:+op-neg+ #:+op-inc+ #:+op-dec+
    #:+op-and+ #:+op-or+ #:+op-xor+
    #:+op-shl+ #:+op-shr+ #:+op-sar+ #:+op-shlv+ #:+op-sarv+ #:+op-ldb+
@@ -76,7 +76,7 @@
    ;; Instruction constructors
    #:mvm-nop #:mvm-break
    #:mvm-mov #:mvm-li #:mvm-li-halves #:mvm-li-const #:mvm-push #:mvm-pop
-   #:mvm-add #:mvm-sub #:mvm-mul #:mvm-mul-checked #:mvm-add-checked #:mvm-div #:mvm-mod
+   #:mvm-add #:mvm-sub #:mvm-mul #:mvm-mul-checked #:mvm-add-checked #:mvm-sub-checked #:mvm-div #:mvm-mod
    #:mvm-neg #:mvm-inc #:mvm-dec
    #:mvm-fadd #:mvm-fsub #:mvm-fmul #:mvm-fdiv
    #:mvm-itof #:mvm-ftoi #:mvm-fcmp
@@ -345,6 +345,7 @@
 (defconstant +op-acc128+   #xAC)  ; (acc128 Vaddr Vlo Vhi) - mem128[Vaddr] += Vhi:Vlo
 (defconstant +op-mul-checked+ #xAD)  ; tagged * with bignum overflow promotion
 (defconstant +op-add-checked+ #xAE)  ; tagged + with bignum overflow promotion
+(defconstant +op-sub-checked+ #xAF)  ; tagged - with bignum overflow promotion
 
 ;; SAP (System Area Pointer) — raw address wrapper for FFI
 (defconstant +op-sap-new+    #xB0)  ; (sap-new Vd Vaddr) - alloc SAP, store raw addr
@@ -525,6 +526,7 @@
 (defopcode :acc128   #xAC (:reg :reg :reg)        "128-bit accumulate: mem[Va] += Vc:Vb")
 (defopcode :mul-checked #xAD (:reg :reg :reg)     "Multiply, promote to bignum on overflow")
 (defopcode :add-checked #xAE (:reg :reg :reg)     "Add, promote to bignum on overflow")
+(defopcode :sub-checked #xAF (:reg :reg :reg)     "Subtract, promote to bignum on overflow")
 
 ;; SAP (System Area Pointer) operations
 (defopcode :sap-new    #xB0 (:reg :reg)              "Allocate SAP with raw address")
@@ -818,6 +820,9 @@
 
 (defun mvm-add-checked (buf vd va vb)
   (encode-instruction buf +op-add-checked+ vd va vb))
+
+(defun mvm-sub-checked (buf vd va vb)
+  (encode-instruction buf +op-sub-checked+ vd va vb))
 
 (defun mvm-div (buf vd va vb)
   (encode-instruction buf +op-div+ vd va vb))

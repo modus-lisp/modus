@@ -744,6 +744,13 @@
                 (when (string-equal (mvm-function-info-name fi) "GENERIC-MULTIPLY")
                   (setf found (mvm-function-info-bytecode-offset fi))))
               found)))
+         (gensub-bc-offset
+          (when aarch64-unified-p
+            (let ((found nil))
+              (dolist (fi (mvm-module-function-table module))
+                (when (string-equal (mvm-function-info-name fi) "GENERIC-SUBTRACT")
+                  (setf found (mvm-function-info-bytecode-offset fi))))
+              found)))
          (native-code
           (cond
             (aarch64-unified-p
@@ -759,7 +766,9 @@
                    (modus.mvm::*aarch64-genadd-bytecode-offset*
                     genadd-bc-offset)
                    (modus.mvm::*aarch64-genmul-bytecode-offset*
-                    genmul-bc-offset))
+                    genmul-bc-offset)
+                   (modus.mvm::*aarch64-gensub-bytecode-offset*
+                    gensub-bc-offset))
                ;; Phase A: emit boot preamble into the unified buffer first.
                (let ((entry-fn (getf boot-descriptor :entry-fn)))
                  (when entry-fn (funcall entry-fn aarch64-unified-buf)))

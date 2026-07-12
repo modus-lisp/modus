@@ -11121,13 +11121,13 @@
        (check-arith-nesting '- arg)
        (if (or *eval2-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-             (%compile-arith-arg-step-e2 arg env dest :sub "GENERIC-SUBTRACT"))
+             (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT"))
            (let ((temp (alloc-temp-reg))
                  (*arith-push-depth* (1+ *arith-push-depth*)))
              (emit-ir :push dest)
              (compile-form arg env temp)
              (emit-ir :pop dest)
-             (emit-arith-pair :sub "GENERIC-SUBTRACT" dest temp)
+             (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp)
              (free-temp-reg)))))))
 
 (defun compile-mul (args env dest)
@@ -14554,6 +14554,7 @@
       (:mul   4)
       (:mul-checked 4)
       (:add-checked 4)
+      (:sub-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
       (:mul64lo 4)
@@ -14812,6 +14813,8 @@
            (mvm-mul-checked buf (second insn) (third insn) (fourth insn)))
           (:add-checked
            (mvm-add-checked buf (second insn) (third insn) (fourth insn)))
+          (:sub-checked
+           (mvm-sub-checked buf (second insn) (third insn) (fourth insn)))
           (:mul26lo
            (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
           (:mul26hi

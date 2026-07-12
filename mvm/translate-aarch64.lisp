@@ -166,6 +166,10 @@
   "Companion to *aarch64-genadd-bytecode-offset* for GENERIC-MULTIPLY /
    +op-mul-checked+.")
 
+(defvar *aarch64-gensub-bytecode-offset* nil
+  "Companion to *aarch64-genadd-bytecode-offset* for GENERIC-SUBTRACT /
+   +op-sub-checked+.")
+
 (defvar *aarch64-li-const-patches* nil
   "List of (native-byte-offset . pool-index) recorded by +op-li-const+
    translation.  Each entry says: at NATIVE-BYTE-OFFSET (relative to
@@ -2390,6 +2394,34 @@
                (t
                 ;; No GENERIC-ADD in this image: plain wrapping add.
                 (a64-add-reg buf +a64-x16+ pa pb 0 0)
+                (store-dst +a64-x16+ vd)))))
+
+          ;; ---- SUB-CHECKED Vd, Va, Vb ----
+          ;; Tagged - with bignum overflow promotion (x64 sibling:
+          ;; translate-x64.lisp +op-sub-checked+; add-checked mirror above).
+          ;; tag(a)-tag(b) = 2(a-b) = tag(a-b) directly; SUBS sets V iff the
+          ;; difference left the 64-bit signed (= tagged fixnum) range (e.g.
+          ;; (- 0 most-negative-fixnum) = 2^62).  On overflow, call
+          ;; GENERIC-SUBTRACT(va,vb) -> bignum via the inline slow path.
+          ;; Result flows through x16 on both paths.
+          ((= op +op-sub-checked+)
+           (let* ((vd (vr 0)) (va (vr 1)) (vb (vr 2))
+                  (pa (ensure-src va +a64-x16+))
+                  (pb (ensure-src vb +a64-x17+)))
+             (cond
+               (*aarch64-gensub-bytecode-offset*
+                (let ((done (incf *mvm-label-counter*)))
+                  (a64-subs-reg buf +a64-x16+ pa pb 0 0)
+                  (let ((idx (a64-current-index buf)))
+                    (a64-bcond buf +cc-vc+ 0)
+                    (a64-add-fixup buf idx done :bcond))
+                  (a64-emit-generic-arith-call
+                   buf va vb *aarch64-gensub-bytecode-offset*)
+                  (a64-set-label buf done)
+                  (store-dst +a64-x16+ vd)))
+               (t
+                ;; No GENERIC-SUBTRACT in this image: plain wrapping sub.
+                (a64-sub-reg buf +a64-x16+ pa pb 0 0)
                 (store-dst +a64-x16+ vd)))))
 
           ;; ---- MUL-CHECKED Vd, Va, Vb ----

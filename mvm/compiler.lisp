@@ -1659,10 +1659,20 @@
             ;; Complex argument: magnitude = sqrt(realpart^2 + imagpart^2),
             ;; routed through the %complex-abs helper.  Fixnum/real fast path
             ;; otherwise: sign-flip when negative.
+            ;; NOTE: the negative branch MUST use GENERIC-NEGATE-INT, not the
+            ;; raw inline `(- 0 ,tmp)`.  `(- 0 n)` is compiled to :sub which
+            ;; does NOT overflow-promote, so negating MOST-NEGATIVE-FIXNUM
+            ;; (-2^62) silently WRAPS back to itself (still negative).  Every
+            ;; direct `(abs …)` — e.g. GCD/LCM's `(abs (car args))` — expands
+            ;; through this macro, so `(gcd -4611686018427387904 36)` fed a
+            ;; still-negative "magnitude" into the Euclid loop and returned -4
+            ;; instead of 4.  GENERIC-NEGATE-INT routes MNF to
+            ;; %SAFE-FIXNUM-NEGATE → (make-bignum 0 1) = +2^62, and negates
+            ;; bignum operands correctly too.
             `(let ((,tmp ,(cadr form)))
                (if (%complex-p ,tmp)
                    (%complex-abs ,tmp)
-                   (if (< ,tmp 0) (- 0 ,tmp) ,tmp))))
+                   (if (< ,tmp 0) (generic-negate-int ,tmp) ,tmp))))
           '(%signal-program-error))))
 
   ;; PROG1 → LET + body + return first value

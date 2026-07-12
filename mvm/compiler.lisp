@@ -11271,7 +11271,8 @@
       ;; (/ x) — recip; integer → ratio, float → 1.0/x, ratio → swap,
       ;; else %idiv-trunc.
       (compile-form `(let ((%dv ,(car args)))
-                       (cond ((integerp %dv) (exact-divide 1 %dv))
+                       (cond ((%complex-p %dv) (complex-div 1 %dv))
+                             ((integerp %dv) (exact-divide 1 %dv))
                              ((%ieee-float-p %dv)
                               (%float-div (%float-from-int 1) %dv))
                              ((ratiop %dv) (%rational-divide 1 %dv))
@@ -11283,7 +11284,9 @@
           (let ((a-sym (gensym "DA"))
                 (b-sym (gensym "DB")))
             (setq acc `(let ((,a-sym ,acc) (,b-sym ,arg))
-                         (cond ((and (integerp ,a-sym) (integerp ,b-sym))
+                         (cond ((or (%complex-p ,a-sym) (%complex-p ,b-sym))
+                                (complex-div ,a-sym ,b-sym))
+                               ((and (integerp ,a-sym) (integerp ,b-sym))
                                 (exact-divide ,a-sym ,b-sym))
                                ((or (%ieee-float-p ,a-sym)
                                     (%ieee-float-p ,b-sym))

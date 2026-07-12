@@ -2222,10 +2222,16 @@
    When either operand is a ratio, route through %rational-divide so
    (exact-divide 1 1/2) returns 2 instead of garbage from %idiv-trunc
    on the raw ratio pointer.
-   Uses %idiv-trunc directly so a recursive call to / can't reach back here."
+   Exact-integer case uses %rat-exact-div, which routes BIGNUM operands
+   through the bignum-safe %integer-truncate (long division) and keeps the
+   raw %idiv-trunc :div fast path only for fixnum/fixnum.  The bare
+   %idiv-trunc treats a bignum pointer as a fixnum → garbage / SIGSEGV; that
+   fired in complex division (/.9, /.11) whenever an exactly-divisible pair
+   of big-bignum products (ac+bd)/(c²+d²) reached this branch.  Neither
+   %rat-exact-div nor %rational-divide recurses back into `/`."
   (cond
     ((or (ratiop a) (ratiop b)) (%rational-divide a b))
-    ((= (mod a b) 0) (%idiv-trunc a b))
+    ((= (mod a b) 0) (%rat-exact-div a b))
     (t (%make-rat a b))))
 
 (defun %rational-divide (a b)
@@ -2500,14 +2506,18 @@
               (<= b 2305843009213693951) (>= b -2305843009213693952))
          (%fixnum-+ a b)
          (bignum-add a b)))
+    ;; Ratio branches: numerator/denominator may be bignums and the
+    ;; cross-products can overflow 62 bits — use the bignum-safe
+    ;; bignum-add / bignum-mul (neither recurses into generic-add) instead
+    ;; of raw %fixnum-+ / %fixnum-* which wrap / mishandle bignum pointers.
     ((and (integerp a) (ratiop b))
-     (%make-rat (%fixnum-+ (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
+     (%make-rat (bignum-add (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     (%make-rat (%fixnum-+ (aref a 0) (%fixnum-* b (aref a 1))) (aref a 1)))
+     (%make-rat (bignum-add (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     (%make-rat (%fixnum-+ (%fixnum-* (aref a 0) (aref b 1))
-                           (%fixnum-* (aref b 0) (aref a 1)))
-                (%fixnum-* (aref a 1) (aref b 1))))
+     (%make-rat (bignum-add (bignum-mul (aref a 0) (aref b 1))
+                            (bignum-mul (aref b 0) (aref a 1)))
+                (bignum-mul (aref a 1) (aref b 1))))
     ((or (%complex-p a) (%complex-p b)) (complex-add a b))
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-add (%any-to-float a) (%any-to-float b))
@@ -2522,13 +2532,18 @@
     ;; that exceed 63 bits.
     ((and (or (bignump a) (integerp a)) (or (bignump b) (integerp b)))
      (bignum-mul a b))
+    ;; Ratio branches: a ratio's numerator/denominator may itself be a
+    ;; BIGNUM (e.g. c=a/m in /.11, where m=a^2+b^2), and even a fixnum×fixnum
+    ;; limb product can exceed 62 bits.  Use bignum-mul (31-bit fast path +
+    ;; overflow promotion; never recurses into generic-multiply) instead of
+    ;; the raw %fixnum-* which wraps / mishandles a bignum pointer.
     ((and (integerp a) (ratiop b))
-     (%make-rat (%fixnum-* a (aref b 0)) (aref b 1)))
+     (%make-rat (bignum-mul a (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     (%make-rat (%fixnum-* (aref a 0) b) (aref a 1)))
+     (%make-rat (bignum-mul (aref a 0) b) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     (%make-rat (%fixnum-* (aref a 0) (aref b 0))
-                (%fixnum-* (aref a 1) (aref b 1))))
+     (%make-rat (bignum-mul (aref a 0) (aref b 0))
+                (bignum-mul (aref a 1) (aref b 1))))
     ((or (%complex-p a) (%complex-p b)) (complex-mul a b))
     ;; IEEE float fast path — SSE2 MULSD via %float-mul primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
@@ -2551,14 +2566,18 @@
               (<= b 2305843009213693951) (>= b -2305843009213693952))
          (%fixnum-- a b)
          (bignum-sub a b)))
+    ;; Ratio branches: numerator/denominator may be bignums and the
+    ;; cross-products can overflow 62 bits — use the bignum-safe
+    ;; bignum-sub / bignum-mul (neither recurses into generic-subtract)
+    ;; instead of raw %fixnum-- / %fixnum-* which wrap / mishandle pointers.
     ((and (integerp a) (ratiop b))
-     (%make-rat (%fixnum-- (%fixnum-* a (aref b 1)) (aref b 0)) (aref b 1)))
+     (%make-rat (bignum-sub (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     (%make-rat (%fixnum-- (aref a 0) (%fixnum-* b (aref a 1))) (aref a 1)))
+     (%make-rat (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     (%make-rat (%fixnum-- (%fixnum-* (aref a 0) (aref b 1))
-                           (%fixnum-* (aref b 0) (aref a 1)))
-                (%fixnum-* (aref a 1) (aref b 1))))
+     (%make-rat (bignum-sub (bignum-mul (aref a 0) (aref b 1))
+                            (bignum-mul (aref b 0) (aref a 1)))
+                (bignum-mul (aref a 1) (aref b 1))))
     ((or (%complex-p a) (%complex-p b)) (complex-sub a b))
     ;; IEEE float fast path — SSE2 SUBSD via %float-sub primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))

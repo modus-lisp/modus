@@ -2705,23 +2705,7 @@
     ;; Big-bignum on either side → general path.
     ((or (and (bignump a) (big-bignum-p a))
          (and (bignump b) (big-bignum-p b)))
-     (let* ((ap (%any-to-limbs a))
-            (bp (%any-to-limbs b))
-            (a-sign (car ap)) (a-limbs (cdr ap))
-            (b-sign (car bp)) (b-limbs (cdr bp)))
-       (cond
-         ((= a-sign b-sign)
-          ;; Same sign: add magnitudes, keep sign.
-          (%make-bb a-sign (%add-limbs-mag a-limbs b-limbs)))
-         (t
-          ;; Opposite signs: subtract smaller magnitude from larger.
-          (let ((cmp (%cmp-limbs-mag a-limbs b-limbs)))
-            (cond
-              ((= cmp 0) 0)
-              ((> cmp 0)
-               (%make-bb a-sign (%sub-limbs-mag a-limbs b-limbs)))
-              (t
-               (%make-bb b-sign (%sub-limbs-mag b-limbs a-limbs)))))))))
+     (%bignum-add-general a b))
     ;; Original 2-slot fast path.
     (t
      (let ((ap (if (bignump a) (cons (bignum-lo a) (bignum-hi a))
@@ -2730,9 +2714,49 @@
                    (%fixnum-to-bignum-parts b))))
        (let ((sum-lo (%fixnum-+ (car ap) (car bp))))
          (let ((carry (if (< sum-lo 0) 1 0))
-               (lo (logand sum-lo 4611686018427387903)))
-           (let ((sum-hi (%fixnum-+ (%fixnum-+ (cdr ap) (cdr bp)) carry)))
-             (bignum-to-fixnum-if-possible (make-bignum lo sum-hi)))))))))
+               (lo (logand sum-lo 4611686018427387903))
+               (ha (cdr ap)) (hb (cdr bp)))
+           (let ((sum-hi (%fixnum-+ (%fixnum-+ ha hb) carry)))
+             ;; The 2-slot small-bignum representation holds at most 124 bits.
+             ;; When both high words share a sign but SUM-HI comes back with the
+             ;; OPPOSITE sign, the tagged :add wrapped past the 62-bit fixnum
+             ;; range — the true sum needs a THIRD limb (e.g. (+ (* a a) (* b b))
+             ;; for a,b near ±2^62 in /.11, where each square is a small bignum
+             ;; with hi ≈ 2^62 and their high words sum out of range).  Route
+             ;; those through the general sign-magnitude path, which allocates
+             ;; the extra limb instead of silently wrapping to a negative value.
+             (if (and (%same-sign-p ha hb) (not (%same-sign-p ha sum-hi)))
+                 (%bignum-add-general a b)
+                 (bignum-to-fixnum-if-possible (make-bignum lo sum-hi))))))))))
+
+(defun %same-sign-p (x y)
+  "True if fixnums X and Y have the same sign (both >= 0 or both < 0).
+   Used by bignum-add's fast path to detect signed high-limb overflow."
+  (if (< x 0) (< y 0) (>= y 0)))
+
+(defun %bignum-add-general (a b)
+  "Sign-magnitude addition of A and B (fixnum / small bignum / big bignum).
+   Correct for any magnitude — allocates as many limbs as the result needs,
+   so it never wraps the way the 2-slot fast path can.  bignum-add's fast
+   path falls back here when its high limb overflows 62 bits (the true sum
+   exceeds 124 bits)."
+  (let* ((ap (%any-to-limbs a))
+         (bp (%any-to-limbs b))
+         (a-sign (car ap)) (a-limbs (cdr ap))
+         (b-sign (car bp)) (b-limbs (cdr bp)))
+    (cond
+      ((= a-sign b-sign)
+       ;; Same sign: add magnitudes, keep sign.
+       (%make-bb a-sign (%add-limbs-mag a-limbs b-limbs)))
+      (t
+       ;; Opposite signs: subtract smaller magnitude from larger.
+       (let ((cmp (%cmp-limbs-mag a-limbs b-limbs)))
+         (cond
+           ((= cmp 0) 0)
+           ((> cmp 0)
+            (%make-bb a-sign (%sub-limbs-mag a-limbs b-limbs)))
+           (t
+            (%make-bb b-sign (%sub-limbs-mag b-limbs a-limbs)))))))))
 
 (defun %bignum-negate-parts (lo hi)
   "Negate bignum with parts lo,hi. Two's complement: invert + add 1."

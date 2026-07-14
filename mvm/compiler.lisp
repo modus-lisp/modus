@@ -3721,6 +3721,7 @@
      ;; primop garbles bignum-pointer operands).
      (let* ((lo (%lit-bn-lo value))
             (hi (%lit-bn-hi value)))
+       (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
        (emit-ir :alloc-obj dest 2 +subtag-bignum+)
        (let ((temp (alloc-temp-reg)))
          (emit-li-tagged temp lo)        ; lo ∈ [0, 2^62-1] — overflows in-image
@@ -3738,6 +3739,7 @@
             (limbs-arr (alloc-temp-reg))
             (temp (alloc-temp-reg)))
        ;; Allocate limbs-array with (2 + nlimbs) slots, subtag #x32.
+       (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
        (emit-ir :alloc-obj limbs-arr (+ 2 nlimbs) +subtag-array+)
        ;; Slot 0 = sign.
        (emit-li-tagged temp sign)
@@ -3752,6 +3754,7 @@
            (emit-ir :obj-set limbs-arr (+ 2 i) temp)
            (incf i)))
        ;; Allocate the 2-slot bignum wrapper.
+       (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
        (emit-ir :alloc-obj dest 2 +subtag-bignum+)
        (emit-li-tagged temp -1)
        (emit-ir :obj-set dest 0 temp)
@@ -5234,6 +5237,7 @@
     ;; from exact-divide.  See compile-make-ratio + cl-types.lisp's
     ;; %make-rat for the runtime shape.
     ((typep value 'ratio)
+     (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
      (emit-ir :alloc-obj dest 2 +subtag-ratio+)
      (let ((temp (alloc-temp-reg)))
        (compile-integer (numerator value) temp)
@@ -5256,6 +5260,7 @@
             (subtag (if (typep value 'single-float)
                         +subtag-single-float+      ; #x64
                         +subtag-float+)))          ; #x60 double
+       (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
        (emit-ir :alloc-obj dest 2 subtag)
        (let ((temp (alloc-temp-reg)))
          ;; Slot 0 = high 32 bits (tagged fixnum, always fits)
@@ -5317,6 +5322,7 @@
        ;; bug.  Push/pop arr-slot around each element so the pointer
        ;; survives — mirrors the cons-iterative path at line ~2606.
        (let ((arr-slot (alloc-temp-reg)))
+         (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
          (emit-ir :alloc-obj arr-slot n +subtag-array+)
          (when (> n 0)
            (let ((elem-slot (alloc-temp-reg)))
@@ -13136,7 +13142,9 @@
 ;;; ============================================================
 
 (defun compile-make-float (dest)
-  "Compile (%make-float) — allocate a 1-slot object with float subtag."
+  "Compile (%make-float) — allocate a 1-slot object with float subtag.
+   GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 1 +subtag-float+))
 
 (defun compile-make-float2 (dest)
@@ -13165,13 +13173,17 @@
 
 (defun compile-make-symbol (dest)
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.
-   Returns an uninitialized symbol object; caller stores name-hash in slot 0."
+   Returns an uninitialized symbol object; caller stores name-hash in slot 0.
+   GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 1 +subtag-symbol+))
 
 (defun compile-make-keyword-obj (dest)
   "Compile (%make-keyword-obj) — allocate a 1-slot object with keyword subtag
    (#x53).  Returns an uninitialized keyword object; caller stores name-hash
-   in slot 0.  Used by %INTERN-KEYWORD."
+   in slot 0.  Used by %INTERN-KEYWORD.
+   GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 1 +subtag-keyword+))
 
 (defun compile-alloc-sym3 (dest)
@@ -13179,7 +13191,9 @@
    (#x50). Slots are uninitialized; the caller fills them. Used by the
    CL symbol allocator to build a full package-aware symbol with slots
    [hash, package, name] without going through make-array (which would
-   give subtag #x32 and require a header rewrite)."
+   give subtag #x32 and require a header rewrite).
+   GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 3 +subtag-symbol+))
 
 (defun compile-alloc-mda-raw (dest)
@@ -13188,7 +13202,9 @@
    via aset / obj-set in the order
        [0:rank 1:dims 2:fp 3:displaced-to 4:disp-offset 5:etype 6:data].
    Phase 1 of native multi-dim array support; see
-   project_multidim_arrays.md."
+   project_multidim_arrays.md.
+   GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 7 +subtag-mda+))
 
 (defun compile-make-closure (fn-form env-form env dest)
@@ -13232,13 +13248,32 @@
     (free-temp-reg)))
 
 (defun compile-make-bignum (dest)
-  "Compile (%make-bignum) — allocate a 2-slot object with bignum subtag."
+  "Compile (%make-bignum) — allocate a 2-slot object with bignum subtag.
+
+   GC-check before the alloc (mirrors compile-make-closure / compile-make-
+   float2).  %make-bb allocates the limbs array FIRST (which can bump R12 up
+   to R14), then calls %make-bignum for the wrapper.  Without a gc-check here
+   that second alloc overshoots R14 by one object, writing the bignum header
+   and slots into the adjacent to-space; the next collection copies survivors
+   over that region and the live big-bignum's header/slot1 (limbs pointer) are
+   clobbered.  Confirmed via gdb on the /.9 & /.11 divide repro: a big-bignum
+   `b` allocated at R12 == R14+16 (past the limit) was overwritten by
+   copy_object during the following GC → %bb-limb SIGSEGV on a garbage limbs
+   pointer.  The object-start bit was correctly SET; the defect was the
+   overshoot, not the bitmap."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 2 +subtag-bignum+))
 
 (defun compile-make-ratio (dest)
   "Compile (%make-ratio) — allocate a 2-slot object with ratio subtag.
    Slot 0 = numerator, slot 1 = denominator (both tagged fixnums).
-   Used by the runtime / and rational-arithmetic helpers."
+   Used by the runtime / and rational-arithmetic helpers.
+
+   GC-check before the alloc: same overshoot-past-R14 hazard as
+   compile-make-bignum — the rational-arithmetic helpers allocate bignum
+   operands immediately before wrapping them in a ratio, so R12 can already
+   sit at R14 when %make-ratio runs."
+  (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 2 +subtag-ratio+))
 
 (defun compile-ratiop (arg env dest)
@@ -13260,13 +13295,23 @@
    We canNOT route the variable path to MAKE-ARRAY-WITH-CHECKS:
    its body calls (make-array X) which would recurse through this
    function indefinitely at runtime."
+  ;; GC-check immediately before every array allocation (overshoot-past-R14
+  ;; hazard; see compile-make-bignum).  The bignum/ratio arithmetic helpers
+  ;; allocate a limbs array (%make-bb, %mul-limbs-mag) immediately before other
+  ;; objects, so R12 can already sit at R14 when this array alloc runs —
+  ;; writing the array header/payload into the adjacent to-space, later
+  ;; clobbered by the next collection.  Placed right before each alloc opcode
+  ;; (after the size is computed, since the gc-trampoline preserves all regs).
   (cond
     ((and (integerp size-form) (<= size-form 65535))
+     (emit-ir :gc-check)
      (emit-ir :alloc-obj dest size-form +subtag-array+))
     ((integerp size-form)
      (emit-ir :li dest size-form)
+     (emit-ir :gc-check)
      (emit-ir :alloc-array dest dest))
-    ;; Quoted 1-element fixnum list: 1-D dims '(N) → size N.
+    ;; Quoted 1-element fixnum list: 1-D dims '(N) → size N.  (Recurses; the
+    ;; inner call emits its own gc-check.)
     ((and (consp size-form) (name-eq (car size-form) "QUOTE")
           (consp (cadr size-form))
           (integerp (car (cadr size-form)))
@@ -13275,6 +13320,7 @@
     (t
      (compile-form size-form env dest)
      (emit-ir :sar dest dest +fixnum-shift+)
+     (emit-ir :gc-check)
      (emit-ir :alloc-array dest dest))))
 
 (defun %quoted-multidim-list-p (form)
@@ -13327,9 +13373,13 @@
       (t (compile-make-array-1d dim-form env dest)))))
 
 (defun compile-make-string-array (size-form env dest)
-  "Like compile-make-array but with string subtag #x31."
+  "Like compile-make-array but with string subtag #x31.
+   GC-check before each alloc (overshoot-past-R14 hazard; see
+   compile-make-bignum)."
   (if (and (integerp size-form) (<= size-form 65535))
-      (emit-ir :alloc-obj dest size-form +subtag-string+)
+      (progn
+        (emit-ir :gc-check)
+        (emit-ir :alloc-obj dest size-form +subtag-string+))
       (progn
         (if (integerp size-form)
             (emit-ir :li dest size-form)
@@ -13337,6 +13387,7 @@
               (compile-form size-form env dest)
               (emit-ir :sar dest dest +fixnum-shift+)))
         ;; ALLOC-ARRAY uses subtag #x32. Use ALLOC-STRING for #x31.
+        (emit-ir :gc-check)
         (emit-ir :alloc-string dest dest))))
 
 ;;; %PRIM-AREF / %PRIM-ASET / %PRIM-ARRAY-LENGTH — primitive (non-peeling)

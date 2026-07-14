@@ -1,27 +1,28 @@
-;;;; build-x64-ql.lisp — Modus x64-linux REPL image with `ql:quickload'.
+;;;; build-generic-cli.lisp — the canonical HOSTED Modus image (`./modus').
 ;;;;
-;;;; A native ELF you run as an ordinary Linux process; it drops into
-;;;; Modus's own self-hosted CL REPL on stdin (eval = eval2 = compile ->
-;;;; MVM bytecode -> interpret).  Baked in on top of the generic runtime:
-;;;;   - lib/tar.lisp             (ustar reader)
-;;;;   - lib/install-tarball.lisp (untar -> parse .asd -> topo-sort -> eval)
-;;;;   - lib/ql-shim.lisp         (the QL package + ql:quickload + the REPL)
+;;;; A native ELF you run as an ordinary Linux process; it drops into Modus's
+;;;; own self-hosted CL REPL on stdin (eval = eval2 = compile -> MVM bytecode ->
+;;;; interpret) and parses SBCL-style toplevel flags.  It is `build-generic'
+;;;; (full CL runtime, no baked ANSI tests) plus ONE baked file — the shared,
+;;;; SBCL-faithful CLI toplevel:
+;;;;   - lib/cli-toplevel.lisp    (argv + SBCL flags + ~/.modusrc + %cli-repl)
 ;;;;
-;;;; "Do something":
-;;;;   sbcl --dynamic-space-size 4096 --script mvm/build-x64-ql.lisp   # → ./modus-ql
-;;;;   ./modus-ql                                                      # → REPL on stdin
-;;;; then, typed / piped into the REPL:
-;;;;   (ql:quickload :sha1)          ; loads systems/sha1.tar (offline bundle)
-;;;;   (sha1:sha1-hex "abc")         ; => "A9993E364706816ABA3E25717850C26C9CD0D89D"
+;;;; NO quicklisp is baked in.  Exactly like stock SBCL — which has no `ql'
+;;;; until you install Quicklisp and its ~/.sbclrc loads quicklisp/setup.lisp —
+;;;; `ql:quickload' is a LOADABLE setup you pull in at runtime:
 ;;;;
-;;;; System location for v1 is OFFLINE: quickload maps  name -> systems/<name>.tar
-;;;; under *ql-systems-dir* (default "systems/", relative to the process cwd; set
-;;;; MODUS_QL_OUT for the binary path).  A bundled systems/sha1.tar ships in the
-;;;; repo.  Network fetch (net/http-client) is a documented follow-up.
+;;;;   sbcl --dynamic-space-size 4096 --script mvm/build-generic-cli.lisp # → ./modus
+;;;;   ./modus
+;;;;   > (load "modus-quicklisp/setup.lisp")   ; the "install quicklisp" step
+;;;;   > (ql:quickload :sha1)                  ; loads systems/sha1.tar (offline)
+;;;;   > (sha1:sha1-hex "abc")                 ; => "A9993E36...9CD0D89D"
 ;;;;
-;;;; This derives from build-generic.lisp (full CL runtime, no baked tests); the
-;;;; only differences are the three baked lib/ files above and a driver that
-;;;; enters %ql-repl when no argv script is given (argv1 still = load-and-exit).
+;;;; setup.lisp itself (load)s lib/tar.lisp + lib/install-tarball.lisp and
+;;;; defines the QL package over them — the Quicklisp-client-loads-its-own-
+;;;; source model.  See modus-quicklisp/setup.lisp and QUICKLOAD.md.
+;;;;
+;;;; Output binary name is `modus' (override with MODUS_CLI_OUT).  This image is
+;;;; a clean CLI with NO `ql' symbol present until setup is loaded.
 
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
@@ -50,8 +51,9 @@
 ;; Strip `chipz::' / `chipz:' package qualifiers from a source string so the
 ;; flat-namespace image reader doesn't error `Package CHIPZ does not exist'
 ;; (which would silently drop the whole enclosing form).  Longer prefix first.
-;; Mirrors build-aarch64.lisp's strip-package-prefixes.
-(defun %ql-strip-one-prefix (text pfx)
+;; Mirrors build-aarch64.lisp's strip-package-prefixes.  Used ONLY for baking
+;; lib/install-tarball.lisp — see the *bridge-source* note.
+(defun %cli-strip-one-prefix (text pfx)
   (let ((result text))
     (loop
       (let ((pos (search pfx result)))
@@ -60,8 +62,8 @@
                                   (subseq result 0 pos)
                                   (subseq result (+ pos (length pfx)))))))))
 
-(defun %ql-strip-chipz (text)
-  (%ql-strip-one-prefix (%ql-strip-one-prefix text "chipz::") "chipz:"))
+(defun %cli-strip-chipz (text)
+  (%cli-strip-one-prefix (%cli-strip-one-prefix text "chipz::") "chipz:"))
 
 (format t "Reading source files...~%")
 
@@ -401,35 +403,37 @@
     (string #\Newline)
     (mvm-text "mvm/ansi-bridge.lisp")
     (string #\Newline)
-    ;; POSIX ustar tar reader (pure CL, no FFI) — Quicklisp-client tar support.
+    ;; tar + install-tarball are baked as GENERAL library primitives (NOT ql).
+    ;; They are the untar->parse-.asd->topo-sort->eval pipeline; nothing about
+    ;; them is quicklisp-specific.  They are baked (not runtime-(load)ed by
+    ;; setup) because a key line — %tar-slice's `(make-array LEN)` with a
+    ;; VARIABLE size — hits a pre-existing eval2 bug: `(make-array n)` for a
+    ;; variable n returns an array of length n/2, so a >512-byte tar entry gets
+    ;; truncated in half and its source fails to READ.  make-array with a
+    ;; variable arg compiles correctly through the build's native compiler, so
+    ;; baking sidesteps the interpreter gap.  (A runtime-(load) of these files
+    ;; was verified to truncate sha1.lisp 7311->3655 bytes; baking loads it
+    ;; whole.)  The QL package + ql:quickload still come ONLY from a runtime
+    ;; (load) of modus-quicklisp/setup.lisp — never baked here.
+    ;;
+    ;; install-tarball.lisp names `chipz:decompress'/`chipz:gzip' on the
+    ;; never-taken .tar.gz path; the flat image has no CHIPZ package so the
+    ;; build reader would error `Package CHIPZ does not exist' and SILENTLY DROP
+    ;; the form.  Strip the `chipz:' prefixes so it collapses to a bare
+    ;; `decompress'/`gzip'; v1 ships PLAIN .tar so decompress is never called
+    ;; (install-tarball only calls it on the gzip magic 1f 8b).  Read via
+    ;; read-file-text (NOT mvm-text) — mvm-text's host check-parses errors on
+    ;; `chipz:' before we strip it.
     (mvm-text "lib/tar.lisp")
     (string #\Newline)
-    ;; install-tarball.lisp (untar -> parse .asd -> topo-sort -> eval each form)
-    ;; + the ql:quickload client shim, both BAKED IN (mirrors the aarch64 net
-    ;; build's proven recipe).  install-tarball references `chipz:decompress'
-    ;; for the .tar.gz path; the flat image has no CHIPZ package, so the
-    ;; build-time reader would error `Package CHIPZ does not exist' and SILENTLY
-    ;; DROP the whole form.  We strip the `chipz:'/`chipz::' prefixes so the
-    ;; reference collapses to a bare `decompress' symbol.  v1 ships PLAIN .tar
-    ;; archives, so decompress is never actually called (install-tarball only
-    ;; calls it when the gzip magic 1f 8b is present); it resolves to the
-    ;; unresolved-fn sentinel and stays dormant.  Network gzip fetch is a
-    ;; documented follow-up.
-    ;; NB: read via read-file-text (NOT mvm-text) — mvm-text's check-parses
-    ;; uses the host SBCL reader, which errors on the `chipz:' qualifier before
-    ;; we get to strip it.  The stripped text is well-formed and the in-build
-    ;; MVM reader parses it fine.
-    (%ql-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
-                                                      *modus-base*)))
-    (string #\Newline)
-    (mvm-text "lib/ql-shim.lisp")
+    (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
+                                                       *modus-base*)))
     (string #\Newline)
     ;; The SHARED SBCL-faithful CLI toplevel: full argv (via the initial-stack
-    ;; walk), SBCL-style flag parsing, ~/.modusrc, and the REPL.  Loaded AFTER
-    ;; ql-shim so cli-toplevel's %cli-repl supersedes %ql-repl for the driver,
-    ;; and it can reference %gc-read64/%gc-stack-base (from gc.lisp, already in
-    ;; *all-runtime-source*).  Other hosted builds adopt it by baking this file
-    ;; and calling (cli-toplevel) from kernel-main.
+    ;; walk), SBCL-style flag parsing, ~/.modusrc, and the REPL.  It references
+    ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).
+    ;; Other hosted builds adopt this toplevel by baking this file and calling
+    ;; (cli-toplevel) from kernel-main.
     (mvm-text "lib/cli-toplevel.lisp")))
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
 ;; image — production eval is eval2 only.  The full-corpus + gauntlet census
@@ -633,14 +637,11 @@
   ;; macro source string fails to parse (the install fn itself doesn't
   ;; wrap — see %install-runtime-cl-macros docstring).
   (handler-case (%install-runtime-cl-macros) (t (c) nil))
-  ;; --- ql:quickload wiring -------------------------------------------------
-  ;; defvar init-thunks don't run at boot (MVM Active Limitation 7), so set the
-  ;; globals these paths depend on explicitly.
+  ;; tar.lisp's *tar-block-size* defvar init-thunk doesn't run at boot (MVM
+  ;; Active Limitation 7); set it so the baked tar reader works.  This is a
+  ;; general library primitive, NOT ql wiring — the QL package + ql:quickload
+  ;; come only from a runtime (load) of modus-quicklisp/setup.lisp.
   (setq *tar-block-size* 512)
-  (setq *ql-systems-dir* \"systems/\")
-  ;; Create the QL package + bind QL:QUICKLOAD before the reader ever sees a
-  ;; `ql:...' token (the REPL, or a script).
-  (%ql-init)
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   ;; cli-toplevel reads the FULL argv off the initial stack, parses SBCL-style
   ;; flags left-to-right (--eval/--load/--script/--quit/--version/--help/rc/
@@ -999,7 +1000,7 @@
 
 (let ((image (build-image :target :linux-x64
                           :source-text cl-user::*full-source*)))
-  (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_QL_OUT") "modus-ql")))
+  (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CLI_OUT") "modus")))
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)

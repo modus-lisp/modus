@@ -24,6 +24,11 @@
 
 (in-package :modus.mvm.x64)
 
+;;; The generic-arith out-of-line label specials are defvar'd further down
+;;; (near the code that sets them), but TRANSLATE-INSTRUCTION references them
+;;; earlier.  Declare them special up front to avoid forward-reference warnings.
+(declaim (special *x64-genadd-label* *x64-genmul-label* *x64-gensub-label*))
+
 (defvar *x64-linux-mode* nil
   "When non-nil, TRAP codes emit Linux syscalls instead of bare-metal I/O.
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of

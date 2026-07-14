@@ -7038,6 +7038,19 @@
                           :parent nil)
         nil)))
 
+;; %NATIVE-SYM-P is image-only (defined in cl-eval.lisp, part of the bridge
+;; source, not host-loaded); forward-declare its ftype so the guarded call in
+;; %MLL-NAME-EQ doesn't warn undefined during the host build.
+(declaim (ftype (function (t) t) %native-sym-p))
+
+(defun %native-sym-slot0-hash (sym)
+  "IN-IMAGE ONLY: a native MVM symbol stores its name hash in array slot 0.
+   Extracted so the AREF sees an unrestricted (T) argument — inside
+   %MLL-NAME-EQ, SBCL narrows SYM to SYMBOL via the surrounding SYMBOLP guard
+   and would flag AREF-of-symbol; host-side this path is dead (*eval2-runtime-p*
+   is NIL there)."
+  (aref sym 0))
+
 (defun %mll-name-eq (sym name-string)
   "NAME-EQ that stays correct IN-IMAGE for native MVM symbols whose
    SYMBOL-NAME reverse lookup returns \"\" (names like &WHOLE/&ENVIRONMENT
@@ -7052,7 +7065,8 @@
        (or (name-eq sym name-string)
            (and *eval2-runtime-p*
                 (%native-sym-p sym)
-                (eql (aref sym 0) (compute-name-hash name-string))))))
+                (eql (%native-sym-slot0-hash sym)
+                     (compute-name-hash name-string))))))
 
 (defun %macro-lambda-list-p (params)
   "T when PARAMS is a MACRO-style lambda list — a shape ordinary

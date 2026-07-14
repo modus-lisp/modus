@@ -13,6 +13,12 @@
 
 (in-package :modus.mvm)
 
+;;; Forward references to specials defined later: *MVM-LAST-MV* at the bottom
+;;; of this file; *SYMBOL-FUNCTION-TABLE* in the image bridge source
+;;; (cl-eval.lisp), which is not host-loaded here.  Declaring them special up
+;;; front keeps SBCL from warning on the guarded uses above their definition.
+(declaim (special *symbol-function-table* *mvm-last-mv*))
+
 ;;; Tag constants and helpers
 
 (defconstant +tag-fixnum+ 0)

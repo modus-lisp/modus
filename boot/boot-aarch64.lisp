@@ -16,6 +16,11 @@
 
 (in-package :modus.mvm)
 
+;;; *AARCH64-HANDLER-POP-LABEL* is defined in translate-aarch64.lisp, which is
+;;; loaded after this file.  Declare it special up front so SBCL doesn't warn
+;;; on the forward references in the emit-* routines below.
+(declaim (special *aarch64-handler-pop-label*))
+
 ;;; ============================================================
 ;;; AArch64 Boot Constants
 ;;; ============================================================

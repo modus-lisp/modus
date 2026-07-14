@@ -19,6 +19,17 @@
 
 (format t "Loading MVM system...~%")
 
+;; Load the whole system inside one compilation unit so SBCL DEFERS
+;; forward-reference warnings (undefined-function / undefined-variable) to
+;; the end of the load and suppresses those that resolve by then.  The MVM
+;; sources reference each other freely across load order (e.g. compiler.lisp
+;; uses helpers defined later, boot-aarch64.lisp uses A64-* from
+;; translate-aarch64.lisp) — all resolve by the final form, so a single unit
+;; makes those refs silent while STILL reporting anything genuinely never
+;; defined (this improves the signal-to-noise of the build log; it changes
+;; only warning reporting, never codegen).
+(with-compilation-unit ()
+
 ;; Packages and x86-64 assembler
 (mvm-load "mvm/packages.lisp")
 (mvm-load "mvm/x64-asm.lisp")
@@ -52,3 +63,5 @@
 
 ;; Cross-compilation pipeline
 (mvm-load "mvm/cross.lisp")
+
+)  ; end with-compilation-unit

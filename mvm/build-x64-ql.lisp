@@ -422,7 +422,15 @@
     (%ql-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
                                                       *modus-base*)))
     (string #\Newline)
-    (mvm-text "lib/ql-shim.lisp")))
+    (mvm-text "lib/ql-shim.lisp")
+    (string #\Newline)
+    ;; The SHARED SBCL-faithful CLI toplevel: full argv (via the initial-stack
+    ;; walk), SBCL-style flag parsing, ~/.modusrc, and the REPL.  Loaded AFTER
+    ;; ql-shim so cli-toplevel's %cli-repl supersedes %ql-repl for the driver,
+    ;; and it can reference %gc-read64/%gc-stack-base (from gc.lisp, already in
+    ;; *all-runtime-source*).  Other hosted builds adopt it by baking this file
+    ;; and calling (cli-toplevel) from kernel-main.
+    (mvm-text "lib/cli-toplevel.lisp")))
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
 ;; image — production eval is eval2 only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback
@@ -633,21 +641,13 @@
   ;; Create the QL package + bind QL:QUICKLOAD before the reader ever sees a
   ;; `ql:...' token (the REPL, or a script).
   (%ql-init)
-  ;; --- entry: script mode (argv1) or interactive REPL ----------------------
-  (let ((path (%argv1)))
-    (cond
-      ((null path)
-       ;; No script argument: drop into the interactive stdin REPL.
-       (handler-case (%ql-repl) (t (c) nil))
-       (sys-exit 0))
-      (t
-       (handler-case
-           (progn (load path) (sys-exit 0))
-         (t (c)
-            (write-string-serial \"unhandled condition while loading: \")
-            (handler-case (write-string-serial path) (t (c) nil))
-            (write-char-serial 10)
-            (sys-exit 1)))))))
+  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
+  ;; cli-toplevel reads the FULL argv off the initial stack, parses SBCL-style
+  ;; flags left-to-right (--eval/--load/--script/--quit/--version/--help/rc/
+  ;; --end-toplevel-options), loads ~/.modusrc before an interactive REPL, and
+  ;; either runs the REPL or exits.  It never returns (exits via sys-exit); the
+  ;; outer handler-case is belt-and-suspenders in case of a parse-path crash.
+  (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
 ")
 
 (defvar *all-runtime-source*

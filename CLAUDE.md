@@ -223,6 +223,25 @@ unwind-protect-cleanup NLX).  Next workstream: WS4 — the runtime JIT
 
 All builds: `sbcl --script <build-script>`
 
+### Build taxonomy — clean images vs ANSI gate runners
+
+Two kinds of build:
+
+- **Clean images (what ships)** — a plain Modus kernel/REPL/SSH/CLI, no test
+  corpus baked in.  These are the shipping artifacts: `build-generic-cli`
+  (the `modus` CLI, SBCL-faithful flags + `--load`/`--eval`), `build-x64-repl`,
+  `build-x64-ssh`, `build-uefi-repl`, the `build-aarch64-*`/`build-rpi-*`/
+  `build-pizero2w-*`/`build-i386-*` images, etc.  (25 of the 29 build scripts.)
+- **ANSI gate runners (NOT for shipping)** — bake the transformed ANSI test
+  corpus into the kernel image and run it natively, for the conformance gate:
+  `build-x64-linux` (the 64-shard Linux gate), `build-x64` (bare-metal QEMU),
+  and the `build-aarch64`/`build-aarch64-linux` counterparts.  Only these 4
+  compile the `.lsp` corpus in; their host-build logs are noisy with
+  test-corpus warnings by design.  These 4 share a large (~4300-line)
+  harness prefix; deduplicating it into a shared module and, later, turning
+  the suite into a `--load`-able script run on a clean image (gated on the
+  WS4 JIT, so nothing is baked) are tracked follow-ups.
+
 ### QEMU AArch64 (virt machine, E1000)
 ```bash
 # SSH server (single-threaded)

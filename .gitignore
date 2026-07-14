@@ -3,6 +3,8 @@
 *.o
 *.fasl
 *.core
+/modus-ql
+/modus
 
 # IDE and editor files
 .vscode/

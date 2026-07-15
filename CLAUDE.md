@@ -237,13 +237,13 @@ Two kinds of build:
   `build-x64-linux` (the 64-shard Linux gate), `build-x64` (bare-metal QEMU),
   and the `build-aarch64`/`build-aarch64-linux` counterparts.  Only these 4
   compile the `.lsp` corpus in; their host-build logs are noisy with
-  test-corpus warnings by design.  The x64 pair shares its ~4300-line harness
-  via `mvm/build-ansi-common-x64.lisp` (each build is a thin wrapper that sets
-  `*ansi-target-bare-metal*`, loads the common file, then appends its own
-  runner-source + build-image tail).  The aarch64 pair still carries its own
-  copy — same extraction is a pending follow-up.  Later end-state (gated on the
-  WS4 JIT): the suite becomes a `--load`-able script run on a clean image, so
-  nothing is baked.
+  test-corpus warnings by design.  Each pair shares its ~4300-line harness via a
+  common module — `mvm/build-ansi-common-x64.lisp` (x64) /
+  `mvm/build-ansi-common-aarch64.lisp` (aarch64); each of the 4 builds is a thin
+  wrapper that sets `*ansi-target-bare-metal*`, loads its common file, then
+  appends its own runner-source + build-image tail.  (Both extractions verified
+  byte-identical to pre-split.)  Later end-state (gated on the WS4 JIT): the
+  suite becomes a `--load`-able script run on a clean image, so nothing is baked.
 
 ### QEMU AArch64 (virt machine, E1000)
 ```bash

@@ -2228,8 +2228,18 @@
    %idiv-trunc treats a bignum pointer as a fixnum → garbage / SIGSEGV; that
    fired in complex division (/.9, /.11) whenever an exactly-divisible pair
    of big-bignum products (ac+bd)/(c²+d²) reached this branch.  Neither
-   %rat-exact-div nor %rational-divide recurses back into `/`."
+   %rat-exact-div nor %rational-divide recurses back into `/`.
+
+   IEEE-float operand: route to SSE2 float division with CLHS float
+   contagion (widest format wins).  complex-div feeds this the scalar
+   real/imag parts of complex operands, so a FLOAT complex (e.g. /.8's
+   (/ #C(i 0.0) #C(i 0.0))) must divide as floats — the integer/ratio
+   path below runs %idiv-trunc / (mod a b) on the raw float bit-slots
+   and returns garbage integers (the #C(1 1) reciprocal bug)."
   (cond
+    ((or (%ieee-float-p a) (%ieee-float-p b))
+     (%as-result-float (%float-div (%any-to-float a) (%any-to-float b))
+                       (%float-result-type a b)))
     ((or (ratiop a) (ratiop b)) (%rational-divide a b))
     ((= (mod a b) 0) (%rat-exact-div a b))
     (t (%make-rat a b))))

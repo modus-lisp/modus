@@ -777,6 +777,166 @@
       (write-string-serial \"WS4-S3 \") (write-string-serial label)
       (write-string-serial \" ERR\") (write-char-serial 10))))
 
+;; WS4 STAGE 4: CONST-POOL literal patching + GC durability.
+;;
+;; A quoted list/string/symbol/bignum cannot be immediate-encoded; the eval2
+;; compiler (compile-quote under *eval2-runtime-p*) registers it in the global
+;; quote pool *e2-const-pool* and emits ONE op-li-const carrying the pool INDEX.
+;; translate-x64 turns each li-const into a 10-byte `movabs reg, 0` placeholder
+;; and records (imm64-native-off . pool-idx) on *x64-li-const-patches*.
+;; mvm-interpret loads the LIVE object back via (%val->word (gethash idx pool)),
+;; preserving QUOTE identity.  A JIT can't gethash at exec time — the native
+;; `movabs` needs the object's TAGGED WORD baked into its imm64.  So for each
+;; li-const patch we resolve idx -> the live pool object -> its tagged native
+;; word ((ash (%val->word obj) -1) — %val->word does SHL 1, so SAR 1 recovers
+;; the actual tagged pointer a native register would hold) -> write that as the
+;; 8-byte imm64.  Then %jit-call; oracle == mvm-interpret.
+;;
+;; DURABILITY: the pool is a GC ROOT (a global special), so a collection MOVES
+;; the pool object and UPDATES the hash-table value — but the baked movabs imm
+;; (a raw byte in the exec page, NOT a GC root) is NOT updated and goes STALE.
+;; This build runs the validation Cheney collector, which has no pin-count array
+;; (MCGC %pin-object is only compiled into MODUS_MCGC_PINNING=1 builds, a
+;; DIFFERENT collector), so we pin durability the collector-compatible way: keep
+;; a (imm-off . idx) reloc list and RE-PATCH the exec page after GC by re-reading
+;; the (updated) pool address.  The GC already fixed the root; we mirror that
+;; fix into the code.  Re-exec then MATCHes.  This is exactly a production JIT's
+;; code-patch-list the runtime maintains across GC.
+(defun %ws4-s4-patch-consts (base patches)
+  ;; Write each live pool object's tagged word into its movabs imm64 slot.
+  ;; PATCHES = list of (imm64-native-off . pool-idx).
+  (dolist (p patches)
+    (let* ((imm-off (car p))
+           (idx (cdr p))
+           (obj (if *e2-const-pool* (gethash idx *e2-const-pool*) nil))
+           ;; obj's actual tagged native word.  Empirically (see DIAG probe): a
+           ;; heap object/cons value's native tagged word == (%val->word obj)
+           ;; directly — %val->word (SHL 1) maps the runtime value cell to the
+           ;; native word a register holds (raw_addr|tag, e.g. cons tag 0x1).
+           ;; (Contrast the S3 FN path, which additionally SAR-1's then -3's,
+           ;; because a resolved fn OBJECT boxes raw_code|3 one level deeper.)
+           (word (%val->word obj))
+           (a (+ base imm-off))
+           (v word)
+           (j 0))
+      (loop while (< j 8)
+            do (progn
+                 (setf (mem-ref (+ a j) :u8) (logand v 255))
+                 (setq v (ash v -8))
+                 (setq j (+ j 1)))))))
+
+(defun %ws4-s4-force-gc ()
+  ;; Force at least one Cheney collection by churning cons allocation until the
+  ;; GC count advances.  Returns the number of collections observed.
+  (let ((before (%gc-count))
+        (junk nil)
+        (acc 0)
+        (i 0))
+    ;; The from/to boundary sits ~469MB above the heap base, so a collection
+    ;; only fires after ~29M cons allocations.  Cap generously (80M) and drop the
+    ;; live chain often so we CHURN (net allocation) rather than retain.  ACC
+    ;; consumes the cons's CAR so the allocation cannot be dead-code eliminated.
+    (loop while (and (< i 80000000) (eql (%gc-count) before))
+          do (progn
+               (setq junk (cons i junk))
+               (setq acc (logxor acc (car junk)))
+               (when (eql (logand i 4095) 4095)
+                 (setq junk nil))
+               (setq i (+ i 1))))
+    ;; ACC keeps the churn observable (defeats dead-code elim of the conses).
+    (when (< acc 0) (write-char-serial 32))
+    (- (%gc-count) before)))
+
+(defun %ws4-s4-probe (form label)
+  (handler-case
+      (progn
+        ;; Ensure the compiler routes QUOTE through the const pool.
+        (setq *eval2-runtime-p* t)
+        (let* ((tuple (%eval2-compile-tuple (list form)))
+               (bc (car tuple))
+               (entry (cadr tuple))
+               (ft-list (caddr tuple))
+               (fn-table (cadddr tuple))
+               (rt-table (car (cddddr tuple)))
+               (lam-offsets (cadr (cddddr tuple))))
+          (setq *x64-jit-mode* t)
+          (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+            (let* ((nlen (code-buffer-position nbuf))
+                   (nbytes (code-buffer-bytes nbuf))
+                   ;; Snapshot BOTH reloc lists (fresh per translate).
+                   (relocs *x64-call-relocs*)
+                   (cpatches *x64-li-const-patches*)
+                   (consts-n (length cpatches))
+                   (elabel (gethash \"%EVAL2-THUNK\" fn-map))
+                   (eoff (if elabel (label-position elabel) 0))
+                   (page (%mmap-exec-page 4096))
+                   (base (sap-address (make-sap page))))
+              ;; Copy native bytes into the exec page.
+              (let ((k 0))
+                (loop while (< k nlen)
+                      do (progn
+                           (setf (mem-ref (+ base k) :u8) (aref nbytes k))
+                           (setq k (+ k 1)))))
+              ;; Relocate out-of-module CALLs (Stage-3 mechanism).
+              (dolist (r relocs)
+                (let* ((imm-off (car r))
+                       (synth (cdr r))
+                       (name (gethash synth rt-table))
+                       (fn (and name (%mvm-resolve-runtime-fn name)))
+                       (raw (if fn (- (ash (%val->word fn) -1) 3) 0)))
+                  (when (> raw 0)
+                    (let ((a (+ base imm-off)) (v raw) (j 0))
+                      (loop while (< j 8)
+                            do (progn
+                                 (setf (mem-ref (+ a j) :u8) (logand v 255))
+                                 (setq v (ash v -8))
+                                 (setq j (+ j 1))))))))
+              ;; Patch CONST-POOL movabs immediates with live pool addresses.
+              (%ws4-s4-patch-consts base cpatches)
+              ;; Oracle: interpret the same bc.
+              (let ((interp (mvm-interpret bc :entry-point entry
+                                          :function-table fn-table
+                                          :runtime-table rt-table
+                                          :return-raw nil
+                                          :lambda-offsets lam-offsets)))
+                ;; First JIT call (no GC in between → holds even without pinning).
+                (let ((jit (%jit-call (+ base eoff))))
+                  (write-string-serial \"WS4-S4 \") (write-string-serial label)
+                  (write-string-serial \" consts=\") (print-dec consts-n)
+                  (write-string-serial \" jit=\") (print-dec jit)
+                  (write-string-serial \" interp=\") (print-dec interp)
+                  (write-char-serial 32)
+                  (if (eql jit interp)
+                      (write-string-serial \"MATCH\")
+                      (write-string-serial \"MISMATCH\"))
+                  (write-char-serial 10))
+                ;; DURABILITY: capture the pool object's pre-GC tagged word, force
+                ;; a real collection (which MOVES the object — the pool is a GC
+                ;; root, so the hash-table value is updated to the new address),
+                ;; capture the post-GC word, re-patch the exec page from the
+                ;; UPDATED pool address, re-exec, re-compare.  If pre != post the
+                ;; object relocated and our re-patch is what keeps the JIT valid.
+                (when (> consts-n 0)
+                  (let* ((p0 (car cpatches))
+                         (idx0 (cdr p0))
+                         (pre (%val->word (gethash idx0 *e2-const-pool*)))
+                         (ngc (%ws4-s4-force-gc))
+                         (post (%val->word (gethash idx0 *e2-const-pool*))))
+                    (%ws4-s4-patch-consts base cpatches)
+                    (let ((jit2 (%jit-call (+ base eoff))))
+                      (write-string-serial \"WS4-S4 \") (write-string-serial label)
+                      (write-string-serial \" post-gc gcs=\") (print-dec ngc)
+                      (write-string-serial \" moved=\") (print-dec (if (eql pre post) 0 1))
+                      (write-string-serial \" jit=\") (print-dec jit2)
+                      (write-char-serial 32)
+                      (if (eql jit2 interp)
+                          (write-string-serial \"MATCH\")
+                          (write-string-serial \"MISMATCH\"))
+                      (write-char-serial 10)))))))))
+    (t (c)
+      (write-string-serial \"WS4-S4 \") (write-string-serial label)
+      (write-string-serial \" ERR\") (write-char-serial 10))))
+
 (defun kernel-main ()
   ;; Banner: ANSI-TEST
   (write-char-serial 65)   ; A
@@ -1210,6 +1370,17 @@
     (%ws4-s3-probe (quote (if (< 3 5) 111 222)) \"lt\")
     (%ws4-s3-probe (quote (* 6 7)) \"mul\")
     (write-string-serial \"WS4-S3-END\") (write-char-serial 10)
+    ;; WS4 STAGE 4: const-pool literal patching + GC durability.  Each of these
+    ;; forms QUOTEs a non-immediate (list / string) → >=1 op-li-const → pool
+    ;; entry.  We bake the live pool object's tagged word into the movabs imm,
+    ;; JIT-call, oracle-match, then force a GC and re-exec (re-patched) to prove
+    ;; the address held / was re-established across a collection.
+    (write-string-serial \"WS4-S4-START\") (write-char-serial 10)
+    (%ws4-s4-probe (quote (car (quote (7 8 9)))) \"car-list\")
+    (%ws4-s4-probe (quote (car (quote (42)))) \"car42\")
+    (%ws4-s4-probe (quote (cadr (quote (10 20 30)))) \"cadr\")
+    (%ws4-s4-probe (quote (car (cdr (cdr (quote (100 200 300)))))) \"caddr\")
+    (write-string-serial \"WS4-S4-END\") (write-char-serial 10)
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 

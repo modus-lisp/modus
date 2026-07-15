@@ -793,6 +793,14 @@
   ;; (compute-applicable-methods #'initialize-instance ...) get NIL.
   (%init-clos-protocol)
 
+  ;; WS4 STAGE 1: initialize the baked-in x64 native translator's lookup
+  ;; tables (*registers* / *condition-codes* / *vreg-to-x64* /
+  ;; *x64-native-code-offset*), which are defparameter/defvar init-thunks
+  ;; that don't run at boot.  translate-mvm-to-x64 is DEAD CODE (nothing
+  ;; routes to it); this just makes it callable if invoked (WS4-S1 probe /
+  ;; future JIT).  See build-ansi-common-x64.lisp *x64-translator-coinit-source*.
+  (%init-x64-translator)
+
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
@@ -987,6 +995,44 @@
                        1 0)
                  (t (c) -1)))
     (write-char-serial 10)
+    ;; ---- WS4 STAGE 1: run the baked-in x64 translator at RUNTIME ----
+    ;; Compile a trivial body to MVM bytecode via the in-image compiler
+    ;; front-half (mvm-compile-all — *opcode-table* is already populated by
+    ;; the eval2 calls above), then feed the bytecode + function-table to
+    ;; translate-mvm-to-x64 (mvm/translate-x64.lisp, baked at WS4-S1) and
+    ;; confirm it emits a non-empty native byte buffer IN-IMAGE.  We do NOT
+    ;; execute the bytes here (that is WS4 Stage 2) — this proves only that
+    ;; the real x64 translator RUNS in a booted eval2 image and produces
+    ;; native code.  translate-mvm-to-x64 returns (values code-buffer fn-map);
+    ;; the byte count is (code-buffer-position code-buffer).
+    (let ((module (handler-case (mvm-compile-all (list (quote (defun jitfn () 42))))
+                    (t (c) nil))))
+      (write-string-serial \"WS4-S1 compile bc-len=\")
+      (print-dec (handler-case (length (compiled-module-bytecode module)) (t (c) -1)))
+      (write-char-serial 10)
+      (let ((ft nil))
+        (handler-case
+            (dolist (fi (compiled-module-function-table module))
+              (setq ft (cons (list (function-info-name fi)
+                                   (function-info-bytecode-offset fi)
+                                   (function-info-bytecode-length fi))
+                             ft)))
+          (t (c) nil))
+        (setq ft (nreverse ft))
+        (write-string-serial \"WS4-S1 fn-table-len=\")
+        (print-dec (length ft)) (write-char-serial 10)
+        (write-string-serial \"WS4-S1 translate-mvm-to-x64 -> \")
+        (print-dec
+         (handler-case
+             (let ((buf (translate-mvm-to-x64 (compiled-module-bytecode module) ft)))
+               (code-buffer-position buf))
+           (t (c)
+             (write-string-serial \"ERR:\")
+             (setq *write-object-budget* 120)
+             (handler-case (write-object c) (t (e) nil))
+             (write-char-serial 32)
+             -1)))
+        (write-string-serial \" bytes OK\") (write-char-serial 10)))
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 

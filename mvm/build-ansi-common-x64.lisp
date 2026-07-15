@@ -104,6 +104,119 @@
 (defvar *interp-source*   (mvm-text "mvm/interp.lisp"))   ; mvm-interpret (bytecode executor)
 (defvar *compiler-image-source* (mvm-text "mvm/compiler.lisp")) ; the 3-phase MVM compiler
 (defvar *eval2-source*    (mvm-text "mvm/eval2.lisp"))    ; eval2-forms / eval2
+;;; --- WS4 STAGE 1: bake the x64 native translator into the image ---
+;;; Adds mvm/x64-asm.lisp (instruction encoder, package modus.asm) and
+;;; mvm/translate-x64.lisp (MVM-bytecode→x86-64 translator, package
+;;; modus.mvm.x64) to the baked source so TRANSLATE-MVM-TO-X64 compiles
+;;; in-image and is runtime-callable — the foundation for the WS4 JIT.
+;;; At this stage the translator is DEAD CODE (nothing routes to it); the
+;;; 32-shard gate must stay unchanged.  Proven recipe: mvm/build-mvm.lisp
+;;; already bakes these two files and calls translate-mvm-to-x64 at runtime.
+;;;
+;;; Package handling: source is read by cross.lisp's READ-ALL-FORMS in
+;;; :MODUS.MVM, and the MVM compiler hashes every symbol by SYMBOL-NAME
+;;; (package-independent), so modus.mvm.x64::translate-mvm-to-x64 /
+;;; modus.asm::code-buffer-position / etc. all resolve by name in the flat
+;;; image namespace.  The (in-package …) / (defpackage …) forms are compiled
+;;; as build-time no-ops (see compile-toplevel), so they cost nothing.
+(defvar *x64-asm-source* (mvm-text "mvm/x64-asm.lisp"))
+;; Shrink the code-buffer's default byte array from 96MB to 64KB.  The
+;; defstruct slot default (make-array 100663296 …) is inlined into the
+;; runtime constructor; a 96MB (≈768MB tagged) alloc per make-code-buffer
+;; would exhaust the ANSI image's ~448MB semispace.  x64-asm's emit-byte
+;; grows the array on demand (%code-buffer-ensure doubles + REPLACEs), so a
+;; small initial array is correct for any translation size — the WS4-S1
+;; probe only needs a few hundred bytes.
+(let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
+      (repl   "(bytes (make-array 65536 :element-type '(unsigned-byte 8)))"))
+  (let ((p (search needle *x64-asm-source*)))
+    (unless p
+      (error "WS4-S1: could not find code-buffer 96MB default to shrink"))
+    (setf *x64-asm-source*
+          (concatenate 'string
+                       (subseq *x64-asm-source* 0 p) repl
+                       (subseq *x64-asm-source* (+ p (length needle)))))))
+(defvar *translate-x64-source* (mvm-text "mvm/translate-x64.lisp"))
+;; Strip install-x64-translator and everything after it — the host-only ELF/
+;; target-descriptor tail (install-x64-translator references *target-x86-64*;
+;; disassemble-native uses &key; translate-single-instruction wants the target
+;; struct).  Same marker build-mvm.lisp uses.
+(let ((marker "(defun install-x64-translator"))
+  (let ((pos (search marker *translate-x64-source*)))
+    (unless pos
+      (error "WS4-S1: could not find install-x64-translator strip marker"))
+    (setf *translate-x64-source*
+          (subseq *translate-x64-source* 0 pos))))
+;; Co-init source (appended AFTER the translator so it wins last-defun).
+;; defparameter/defvar init-thunks are NOT run at boot (CLAUDE.md item 7),
+;; so the translator's three lookup tables (*registers*, *condition-codes*,
+;; *vreg-to-x64*) and *x64-native-code-offset* must be populated explicitly.
+;; %init-x64-translator is called from kernel-main.  The symbols used as
+;; alist/vector keys (rax, rsi, :e, …) are quoted here EXACTLY as the
+;; translator quotes them, so per-package interning makes them EQ to the keys
+;; the translator's reg-info / vreg-phys / emit-jcc compare against.
+(defvar *x64-translator-coinit-source* "
+(defun %init-x64-translator ()
+  ;; *registers* — (name code size needs-rex-low-byte); 64-bit GPRs only
+  ;; (the translator emits only 64-bit ops for the trivial-form path).
+  (setq *registers*
+        (list (list (quote rax)  0 64 nil) (list (quote rcx)  1 64 nil)
+              (list (quote rdx)  2 64 nil) (list (quote rbx)  3 64 nil)
+              (list (quote rsp)  4 64 nil) (list (quote rbp)  5 64 nil)
+              (list (quote rsi)  6 64 nil) (list (quote rdi)  7 64 nil)
+              (list (quote r8)   8 64 t)   (list (quote r9)   9 64 t)
+              (list (quote r10) 10 64 t)   (list (quote r11) 11 64 t)
+              (list (quote r12) 12 64 t)   (list (quote r13) 13 64 t)
+              (list (quote r14) 14 64 t)   (list (quote r15) 15 64 t)
+              ;; 32-bit
+              (list (quote eax)  0 32 nil) (list (quote ecx)  1 32 nil)
+              (list (quote edx)  2 32 nil) (list (quote ebx)  3 32 nil)
+              (list (quote esp)  4 32 nil) (list (quote ebp)  5 32 nil)
+              (list (quote esi)  6 32 nil) (list (quote edi)  7 32 nil)
+              (list (quote r8d)  8 32 t)   (list (quote r9d)  9 32 t)
+              (list (quote r10d) 10 32 t)  (list (quote r11d) 11 32 t)
+              (list (quote r12d) 12 32 t)  (list (quote r13d) 13 32 t)
+              (list (quote r14d) 14 32 t)  (list (quote r15d) 15 32 t)
+              ;; 8-bit
+              (list (quote al)   0 8 nil)  (list (quote cl)   1 8 nil)
+              (list (quote dl)   2 8 nil)  (list (quote bl)   3 8 nil)
+              (list (quote spl)  4 8 t)    (list (quote bpl)  5 8 t)
+              (list (quote sil)  6 8 t)    (list (quote dil)  7 8 t)
+              (list (quote r8b)  8 8 t)    (list (quote r9b)  9 8 t)
+              (list (quote r10b) 10 8 t)   (list (quote r11b) 11 8 t)
+              (list (quote r12b) 12 8 t)   (list (quote r13b) 13 8 t)
+              (list (quote r14b) 14 8 t)   (list (quote r15b) 15 8 t)))
+  ;; *condition-codes* — keyword → 4-bit tttn (emit-jcc's (assoc cc …)).
+  (setq *condition-codes*
+        (list (cons :o 0)  (cons :no 1)  (cons :b 2)   (cons :ae 3)
+              (cons :e 4)   (cons :ne 5)  (cons :be 6)  (cons :a 7)
+              (cons :s 8)   (cons :ns 9)  (cons :p 10)  (cons :np 11)
+              (cons :l 12)  (cons :ge 13) (cons :le 14) (cons :g 15)
+              (cons :z 4)   (cons :nz 5)  (cons :c 2)   (cons :nc 3)
+              (cons :nae 2) (cons :nb 3)  (cons :nbe 7) (cons :na 6)
+              (cons :nge 12)(cons :nl 13) (cons :ng 14) (cons :nle 15)))
+  ;; *vreg-to-x64* — MVM virtual-register → physical register symbol.
+  (let ((v (make-array 23)))
+    (aset v 0 (quote rsi))  (aset v 1 (quote rdi))
+    (aset v 2 (quote r8))   (aset v 3 (quote r9))
+    (aset v 4 (quote rbx))  (aset v 5 (quote rcx))
+    (aset v 6 (quote rdx))  (aset v 7 (quote r10))
+    (aset v 8 (quote r11))
+    ;; V9..V15 spill (nil)
+    (aset v 16 (quote rax)) (aset v 17 (quote r12))
+    (aset v 18 (quote r14)) (aset v 19 (quote r15))
+    (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
+    ;; V22 (VPC) not mapped (nil)
+    (setq *vreg-to-x64* v))
+  ;; Function-entry alignment offset: the ANSI image's native code offset.
+  ;; The translator only uses this to NOP-align emitted fn entries in the
+  ;; JIT buffer relative to where they will run; for the dead-code probe the
+  ;; buffer is standalone, so 0 gives a clean 16-byte-relative alignment.
+  (setq *x64-native-code-offset* 0)
+  ;; Linux syscalls for any TRAP (not exercised by the trivial-form probe).
+  (setq *x64-linux-mode* t)
+  t)
+")
 ;; In-image override of the host-only ieee-float-* / bignum-literal helpers
 ;; (compiler.lisp uses sb-kernel:double-float-*).  Appended AFTER the compiler
 ;; source so it wins (last-defun).  Verbatim from build-generic.lisp.
@@ -170,7 +283,14 @@
     *compiler-image-source* (string #\Newline)
     *stage2-float-override* (string #\Newline)
     *opcode-table-init-source* (string #\Newline)
-    *eval2-source*    (string #\Newline)))
+    *eval2-source*    (string #\Newline)
+    ;; WS4 STAGE 1: x64 instruction encoder + MVM→x64 translator + co-init.
+    ;; Loaded AFTER the compiler (translate-x64 uses modus.mvm compiler
+    ;; symbols like decode-instruction and the opcode constants) and the
+    ;; float override.  DEAD CODE — nothing calls translate-mvm-to-x64 yet.
+    *x64-asm-source* (string #\Newline)
+    *translate-x64-source* (string #\Newline)
+    *x64-translator-coinit-source* (string #\Newline)))
 
 ;;; --- Gap A: symbol-function table auto-registration ---
 ;;;

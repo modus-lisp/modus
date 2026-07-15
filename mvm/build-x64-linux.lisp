@@ -996,35 +996,34 @@
                  (t (c) -1)))
     (write-char-serial 10)
     ;; ---- WS4 STAGE 1: run the baked-in x64 translator at RUNTIME ----
-    ;; Compile a trivial body to MVM bytecode via the in-image compiler
-    ;; front-half (mvm-compile-all — *opcode-table* is already populated by
-    ;; the eval2 calls above), then feed the bytecode + function-table to
-    ;; translate-mvm-to-x64 (mvm/translate-x64.lisp, baked at WS4-S1) and
-    ;; confirm it emits a non-empty native byte buffer IN-IMAGE.  We do NOT
-    ;; execute the bytes here (that is WS4 Stage 2) — this proves only that
-    ;; the real x64 translator RUNS in a booted eval2 image and produces
-    ;; native code.  translate-mvm-to-x64 returns (values code-buffer fn-map);
-    ;; the byte count is (code-buffer-position code-buffer).
-    (let ((module (handler-case (mvm-compile-all (list (quote (defun jitfn () 42))))
-                    (t (c) nil))))
-      (write-string-serial \"WS4-S1 compile bc-len=\")
-      (print-dec (handler-case (length (compiled-module-bytecode module)) (t (c) -1)))
-      (write-char-serial 10)
-      (let ((ft nil))
-        (handler-case
-            (dolist (fi (compiled-module-function-table module))
-              (setq ft (cons (list (function-info-name fi)
-                                   (function-info-bytecode-offset fi)
-                                   (function-info-bytecode-length fi))
-                             ft)))
-          (t (c) nil))
-        (setq ft (nreverse ft))
-        (write-string-serial \"WS4-S1 fn-table-len=\")
-        (print-dec (length ft)) (write-char-serial 10)
+    ;; Hand-assemble a trivial MVM function's bytecode directly at the byte
+    ;; level, then feed it to translate-mvm-to-x64 (mvm/translate-x64.lisp,
+    ;; baked at WS4-S1) and confirm it emits a non-empty native byte buffer
+    ;; IN-IMAGE.  We hand-assemble rather than use the compiler front-half
+    ;; (mvm-compile-all / make-mvm-buffer) because those alloc 128MB+ default
+    ;; buffers / bind many specials — neither reliable for a dead-code probe,
+    ;; and orthogonal to what Stage 1 proves.  We do NOT execute the bytes
+    ;; here (that is WS4 Stage 2) — this proves only that the REAL x64
+    ;; translator RUNS in a booted eval2 image and produces native code.
+    ;; Bytecode (11 bytes):
+    ;;   LI  VR, 84     ; opcode 0x11, reg 16 (VR), imm64 = 42<<1 (tagged 42)
+    ;;   RET            ; opcode 0x82, no operands
+    ;; Function-table entry the translator wants: (NAME OFFSET LENGTH), NAME a
+    ;; string.  translate-mvm-to-x64 returns (values code-buffer fn-map); the
+    ;; byte count is (code-buffer-position code-buffer) — prologue + LI + RET +
+    ;; epilogue + the shared handler-stack helpers.
+    (let ((bc (make-array 11)))
+      (aset bc 0 17)   ; 0x11  op-li
+      (aset bc 1 16)   ; VR    (return-value register)
+      (aset bc 2 84)   ; imm64 byte 0  (42 << 1 = 84)
+      (aset bc 3 0) (aset bc 4 0) (aset bc 5 0) (aset bc 6 0)
+      (aset bc 7 0) (aset bc 8 0) (aset bc 9 0)   ; imm64 bytes 1..7
+      (aset bc 10 130) ; 0x82  op-ret
+      (let ((ft (list (list \"JITFN\" 0 11))))
         (write-string-serial \"WS4-S1 translate-mvm-to-x64 -> \")
         (print-dec
          (handler-case
-             (let ((buf (translate-mvm-to-x64 (compiled-module-bytecode module) ft)))
+             (let ((buf (translate-mvm-to-x64 bc ft)))
                (code-buffer-position buf))
            (t (c)
              (write-string-serial \"ERR:\")

@@ -698,6 +698,85 @@
         (setq n (+ (* n 10) (- b 48)))
         (setq i (+ i 1))))))
 
+;; WS4 STAGE 3 probe body — factored OUT of kernel-main so kernel-main's
+;; compiled body stays small (a ~90-line inline block bloated kernel-main
+;; past a branch-displacement/size boundary and crashed boot; the mechanism
+;; itself is fine — see WS4-S2 which JITs hazard-free forms in-image).
+;; JITs an OUT-OF-MODULE-call FORM, relocates its synthetic CALLs to real
+;; native callee addresses, executes, and asserts == mvm-interpret.
+(defun %ws4-s3-probe (form label)
+  (handler-case
+      (let* ((tuple (%eval2-compile-tuple (list form)))
+             (bc (car tuple))
+             (entry (cadr tuple))
+             (ft-list (caddr tuple))
+             (fn-table (cadddr tuple))
+             (rt-table (car (cddddr tuple)))
+             (lam-offsets (cadr (cddddr tuple)))
+             (rt-n (hash-table-count rt-table)))
+        ;; *x64-jit-mode* enables the synthetic-offset indirect-call path;
+        ;; translate populates *x64-call-relocs* (fresh per call).
+        (setq *x64-jit-mode* t)
+        (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+          (let* ((nlen (code-buffer-position nbuf))
+                 (nbytes (code-buffer-bytes nbuf))
+                 (relocs *x64-call-relocs*)
+                 (reloc-n (length relocs))
+                 (elabel (gethash \"%EVAL2-THUNK\" fn-map))
+                 (eoff (if elabel (label-position elabel) 0))
+                 (page (%mmap-exec-page 4096))
+                 (base (sap-address (make-sap page))))
+            (write-string-serial \"WS4-S3 \") (write-string-serial label)
+            (write-string-serial \" rt=\") (print-dec rt-n)
+            (write-string-serial \" reloc=\") (print-dec reloc-n)
+            (write-char-serial 10)
+            ;; Copy native bytes into the exec page.
+            (let ((k 0))
+              (loop while (< k nlen)
+                    do (progn
+                         (setf (mem-ref (+ base k) :u8) (aref nbytes k))
+                         (setq k (+ k 1)))))
+            ;; RELOCATE each out-of-module call site: reloc = (imm64-off .
+            ;; synth-off) -> name -> raw callee addr -> patch the movabs imm64.
+            (dolist (r relocs)
+              (let* ((imm-off (car r))
+                     (synth (cdr r))
+                     (name (gethash synth rt-table))
+                     (fn (and name (%mvm-resolve-runtime-fn name)))
+                     ;; fn native word = raw|3 (OR-3); %val->word = (raw|3)<<1;
+                     ;; (ash ..-1)=raw|3; raw is 16-aligned so SUB 3 untags.
+                     (raw (if fn (- (ash (%val->word fn) -1) 3) 0)))
+                (if (> raw 0)
+                    (let ((a (+ base imm-off)) (v raw) (j 0))
+                      (loop while (< j 8)
+                            do (progn
+                                 (setf (mem-ref (+ a j) :u8) (logand v 255))
+                                 (setq v (ash v -8))
+                                 (setq j (+ j 1)))))
+                    (progn
+                      (write-string-serial \"WS4-S3 \")
+                      (write-string-serial label)
+                      (write-string-serial \" UNRESOLVED\")
+                      (write-char-serial 10)))))
+            ;; JIT-call the relocated entry; oracle-interpret the same bc.
+            (let ((jit (%jit-call (+ base eoff)))
+                  (interp (mvm-interpret bc :entry-point entry
+                                         :function-table fn-table
+                                         :runtime-table rt-table
+                                         :return-raw nil
+                                         :lambda-offsets lam-offsets)))
+              (write-string-serial \"WS4-S3 \") (write-string-serial label)
+              (write-string-serial \" jit=\") (print-dec jit)
+              (write-string-serial \" interp=\") (print-dec interp)
+              (write-char-serial 32)
+              (if (eql jit interp)
+                  (write-string-serial \"MATCH\")
+                  (write-string-serial \"MISMATCH\"))
+              (write-char-serial 10)))))
+    (t (c)
+      (write-string-serial \"WS4-S3 \") (write-string-serial label)
+      (write-string-serial \" ERR\") (write-char-serial 10))))
+
 (defun kernel-main ()
   ;; Banner: ANSI-TEST
   (write-char-serial 65)   ; A
@@ -1112,6 +1191,25 @@
             (handler-case (write-object c) (t (e) nil))
             (write-char-serial 10)))))
     (write-string-serial \"WS4-S2-END\") (write-char-serial 10)
+    ;; ---- WS4 STAGE 3: JIT forms with OUT-OF-MODULE calls + relocate ----
+    ;; These forms compile to bytecode that CALLs functions NOT in their own
+    ;; module (GENERIC-ADD, NUMERIC-VALUE-LESS-P, GENERIC-MULTIPLY, a user
+    ;; defun).  The compiler emits each such CALL to a SYNTHETIC rt-table
+    ;; offset (>= #x40000000) and records synth-offset->name in the RT-TABLE.
+    ;; mvm-interpret intercepts those (resolve name -> native fn -> apply).
+    ;; A JIT can't apply — the native `call` needs a REAL code address.  So:
+    ;;   translate bc -> native (op-call for a synthetic offset now emits
+    ;;   `movabs rax,0 ; call rax` and pushes (imm64-off . synth-off) onto
+    ;;   *x64-call-relocs*) -> for each reloc, resolve synth-off -> name (via
+    ;;   the module rt-table) -> raw native code addr (%mvm-resolve-runtime-fn
+    ;;   gives the fn OBJECT; its native word is raw|3, so
+    ;;   raw = (ash (%val->word fn) -1) & ~7) -> patch the imm64 in the exec
+    ;;   page -> %jit-call.  Oracle: mvm-interpret the same bc.  Assert MATCH.
+    (write-string-serial \"WS4-S3-START\") (write-char-serial 10)
+    (%ws4-s3-probe (quote (+ 1 2)) \"add\")
+    (%ws4-s3-probe (quote (if (< 3 5) 111 222)) \"lt\")
+    (%ws4-s3-probe (quote (* 6 7)) \"mul\")
+    (write-string-serial \"WS4-S3-END\") (write-char-serial 10)
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 

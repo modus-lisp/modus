@@ -121,6 +121,14 @@
                                                 (and (consp entry)
                                                      (string= (first entry) bad-name)))
                                               table))))))))
+        ;; WS4-S3 DIAG: how many out-of-module (synthetic) CALL relocs did the
+        ;; image-build translation produce?  Should be 0 for a self-contained
+        ;; image module — a nonzero count means unpatched `movabs rax,0;call rax`
+        ;; sites are baked into the image and would crash at boot.
+        (when (and (boundp 'modus.mvm.x64::*x64-call-relocs*)
+                   (symbol-value 'modus.mvm.x64::*x64-call-relocs*))
+          (format t "  WS4-S3 DIAG: image-build produced ~D out-of-module call relocs~%"
+                  (length (symbol-value 'modus.mvm.x64::*x64-call-relocs*))))
         (let ((native-bytes
                ;; When appending into a shared a64-buffer, fixups aren't
                ;; resolved yet — extracting bytes now would yield placeholder

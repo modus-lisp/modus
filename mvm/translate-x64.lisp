@@ -42,6 +42,30 @@
    Bound freshly to nil at the start of TRANSLATE-MVM-TO-X64; read
    by ASSEMBLE-KERNEL-IMAGE after translation completes.")
 
+(defvar *x64-jit-mode* nil
+  "WS4 STAGE 3.  When non-nil (set ONLY by the in-image runtime JIT driver
+   around a translate-mvm-to-x64 call), op-call emits an absolute indirect
+   `movabs rax,imm64; call rax` for synthetic out-of-module targets and
+   records the site in *x64-call-relocs* for JIT-time patching.  Nil at
+   image-build time, so the image codegen is byte-identical to pre-Stage-3.")
+
+(defvar *x64-call-relocs* nil
+  "WS4 STAGE 3 (runtime JIT out-of-module call relocation).  List of
+   (native-imm64-byte-offset . synthetic-mvm-offset) pairs collected
+   during translation.  When op-call's target is a SYNTHETIC runtime
+   offset (>= #x40000000 — a call to a function NOT compiled in this
+   module, resolved by NAME via the rt-table), the translator can NOT
+   emit a rel32 direct CALL (the callee's real native address is only
+   known at JIT time, and on Linux the mmap'd exec page is > 2GB from
+   the image code, so rel32 is out of range anyway).  Instead it emits
+   `movabs rax, 0 ; call rax` and records (imm64-offset . synth-offset)
+   here.  At JIT time the driver resolves synth-offset -> name (via the
+   module's rt-table) -> raw native code address (via %mvm-resolve-
+   runtime-fn + untag) and patches the 8-byte imm64 in place.
+   Bound freshly to nil at the start of TRANSLATE-MVM-TO-X64.  Empty for
+   any module with an empty rt-table (Stage-2 hazard-free forms), so
+   flag-off / hazard-free translation is byte-identical.")
+
 ;;; ============================================================
 ;;; Physical Register Mapping
 ;;; ============================================================
@@ -2822,8 +2846,24 @@
                 (label (when fn-table (gethash target-offset fn-table))))
            (if label
                (emit-call buf label)
-               ;; Unknown target — emit CALL rel32 with placeholder
-               (emit-call buf (make-label)))))
+               ;; WS4 STAGE 3: when the runtime JIT is active (*x64-jit-mode*),
+               ;; a target that is a SYNTHETIC out-of-module offset (>= #x40000000
+               ;; = the interp's +mvm-runtime-call-base+, resolved by NAME) gets
+               ;; an ABSOLUTE indirect call patched at JIT time:
+               ;;   movabs rax, 0   (48 B8 <imm64>)  ; imm64 @ pos+2
+               ;;   call   rax       (FF D0)
+               ;; RAX = scratch/VR, dead across a call, not an arg reg (V0..V3 =
+               ;; RSI/RDI/R8/R9) → safe to clobber.  *x64-jit-mode* is nil at
+               ;; image-build time (defvar default) and the IMAGE compiler's call
+               ;; targets are always small offsets, so this whole branch is
+               ;; unreachable during the image build → codegen byte-identical.
+               (if (and *x64-jit-mode* target-offset (>= target-offset #x40000000))
+                   (let ((imm-off (+ (code-buffer-position buf) 2)))  ; skip 48 B8
+                     (push (cons imm-off target-offset) *x64-call-relocs*)
+                     (emit-mov-reg-imm buf 'rax 0)   ; movabs rax, 0 (patched)
+                     (emit-call-reg buf 'rax))        ; call rax
+                   ;; Unknown target — emit CALL rel32 placeholder (unchanged).
+                   (emit-call buf (make-label))))))
 
         ((op= +op-call-ind+)
          ;; (call-ind Vs) — indirect call through register.
@@ -6063,6 +6103,8 @@
    tagged constant-pool addresses."
   ;; Reset the patch list for this translation.
   (setf *x64-li-const-patches* nil)
+  ;; WS4 STAGE 3: reset the out-of-module CALL relocation list.
+  (setf *x64-call-relocs* nil)
   (let* ((buf (make-code-buffer))
          (n-functions (length function-table))
          ;; Create native labels for each function

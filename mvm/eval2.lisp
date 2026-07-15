@@ -154,6 +154,123 @@
             (values-list (cons %prim (cdr %mv))))
         %prim)))
 
+(defun %eval2-compile-tuple (forms)
+  "WS4 STAGE 2 seam tap.  Compile FORMS to an MVM bytecode module via the
+   SAME self-hosted compiler pipeline eval2-forms uses (mvm-compile-toplevel
+   + Pass1/1.5/2), but STOP before interpreting.  Returns a 6-tuple:
+
+     (bc entry ft-list fn-table rt-table lam-offsets)
+
+   where BC is the module bytecode, ENTRY the %EVAL2-THUNK native entry
+   OFFSET into BC, FN-TABLE the offset-array eval2-forms hands mvm-interpret
+   (:function-table), RT-TABLE the runtime-call table (out-of-module CALLs;
+   EMPTY = hazard-free = JIT-executable without Stage-3 relocation),
+   LAM-OFFSETS the lambda-body offset set, and FT-LIST the
+   (name offset length) function-table list translate-mvm-to-x64 wants
+   (the ADAPTER — built from the SAME function-info structs the compiler
+   produced, so it is consistent with FN-TABLE / ENTRY).
+
+   This does NOT install trampolines, does NOT cache, and does NOT interpret
+   — it is a pure compile.  eval2-forms is UNCHANGED (behavior-identical);
+   this is a parallel, dead-code path reachable only from the WS4-S2 probe.
+   It intentionally omits the persist/reentrancy bookkeeping because a JIT
+   probe form is a single self-contained expression (no cross-call defuns)."
+  (unless (and *opcode-table* (> (hash-table-count *opcode-table*) 0))
+    (setq *opcode-table* (make-hash-table :test (quote eql)))
+    (%populate-opcode-table))
+  (let ((*functions* (make-hash-table :test (quote equal)))
+        (*function-table* nil)
+        (*constant-table* nil)
+        (*label-counter* 0)
+        (*unresolved-calls* (make-hash-table :test (quote equal)))
+        (*macro-table* (make-hash-table :test (quote eql)))
+        (*globals* (make-hash-table :test (quote eql)))
+        (*constants* (make-hash-table :test (quote eql)))
+        (*loop-exit-label* nil)
+        (*block-labels* nil)
+        (*tagbody-tags* nil)
+        (*pending-flet-ir* nil)
+        (*init-thunk-names* nil)
+        (all-ir nil)
+        (buf nil)
+        (global-offset 0)
+        (entry nil)
+        (rt-table (make-hash-table))
+        (rt-next #x40000000))
+    (register-mvm-bootstrap-macros)
+    (let* ((rforms (reverse forms))
+           (last-form (car rforms))
+           (last-defun-p (and (consp last-form) (symbolp (car last-form))
+                              (string-equal (symbol-name (car last-form)) "DEFUN")
+                              (symbolp (cadr last-form))))
+           (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
+           (defs (if last-defun-p forms (reverse (cdr rforms))))
+           (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr)))))
+      (dolist (f toplevel)
+        (let ((result (mvm-compile-toplevel f)))
+          (cond
+            ((null result) nil)
+            ((and (consp result) (eq (car result) :multi-result))
+             (dolist (sub (cdr result))
+               (when (and (car sub) (cdr sub))
+                 (setq all-ir (cons (cons (car sub) (cdr sub)) all-ir)))))
+            (t (when (and (car result) (cdr result))
+                 (setq all-ir (cons (cons (car result) (cdr result)) all-ir)))))))
+      (dolist (pend *pending-flet-ir*)
+        (when (and (consp pend) (car pend) (cdr pend))
+          (setq all-ir (cons pend all-ir))))
+      (setq all-ir (reverse all-ir))
+      ;; Fresh buffer (do NOT touch *eval2-buffer* — keep eval2-forms's reuse
+      ;; buffer pristine for the oracle interpret path that runs after us).
+      (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+      ;; Pass 1: assign cumulative bytecode offsets + register in *functions*.
+      (dolist (e all-ir)
+        (let* ((info (car e)) (ir (cdr e))
+               (fn-size (let ((s 0)) (dolist (insn ir) (setq s (+ s (ir-instruction-size insn)))) s)))
+          (setf (function-info-bytecode-offset info) global-offset)
+          (setf (function-info-bytecode-length info) fn-size)
+          (setf (gethash (function-info-name info) *functions*) info)
+          (setq global-offset (+ global-offset fn-size))))
+      ;; Pass 1.5: out-of-module CALL / LI-FUNC names → synthetic runtime stubs.
+      (dolist (e all-ir)
+        (dolist (insn (cdr e))
+          (let ((name (cond ((eq (car insn) :call) (cadr insn))
+                            ((eq (car insn) :li-func) (caddr insn))
+                            (t nil))))
+            (when (and name (stringp name) (not (gethash name *functions*)))
+              (let ((info (make-function-info :name name :bytecode-offset rt-next
+                                              :bytecode-length 0)))
+                (setf (gethash name *functions*) info)
+                (setf (gethash rt-next rt-table) name)
+                (setq rt-next (+ rt-next 1)))))))
+      ;; Pass 2: emit bytecode.
+      (dolist (e all-ir)
+        (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
+          (emit-bytecode-for-ir buf ir lp)))
+      (dolist (e all-ir)
+        (when (string-equal (string (function-info-name (car e))) "%EVAL2-THUNK")
+          (setq entry (function-info-bytecode-offset (car e)))))
+      (let ((bc (mvm-buffer-used-bytes buf))
+            (fn-table (make-array (length all-ir)))
+            (lam-offsets (make-hash-table))
+            (ft-list nil)
+            (i 0))
+        (dolist (e all-ir)
+          (aset fn-table i (function-info-bytecode-offset (car e)))
+          (setq i (+ i 1))
+          (let ((nm (string (function-info-name (car e))))
+                (off (function-info-bytecode-offset (car e)))
+                (len (function-info-bytecode-length (car e))))
+            ;; ADAPTER: (name offset length) for translate-mvm-to-x64 — same
+            ;; structs, string name.  Reverse-consed then reversed to preserve
+            ;; the all-ir order (which is what fn-table indices track too).
+            (setq ft-list (cons (list nm off len) ft-list))
+            (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
+                     (not (eql off 0)))
+                (puthash off lam-offsets t)
+                (puthash off lam-offsets (quote :defun)))))
+        (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))))
+
 (defun eval2-forms (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic

@@ -4672,6 +4672,12 @@
       ;; uncatchable per-test crash.
       ((= op-name (compute-name-hash "%MMAP-SHARED-PAGE"))
        (compile-mmap-shared (cdr form) env dest))
+      ;; (%mmap-exec-page size) — PROT_RWX page for the WS4 runtime JIT.
+      ((= op-name (compute-name-hash "%MMAP-EXEC-PAGE"))
+       (compile-mmap-exec (cdr form) env dest))
+      ;; (%jit-call entry-addr) — call JIT'd native code at ENTRY-ADDR.
+      ((= op-name (compute-name-hash "%JIT-CALL"))
+       (compile-jit-call (cdr form) env dest))
       ;; (%get-cenv) — read the closure-env register (R13 on x64) into
       ;; DEST. Used only by the closure body prologue to snapshot the
       ;; env-list set by the caller's compile-funcall closure path.
@@ -12955,6 +12961,25 @@
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :trap #x0504)
   (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-mmap-exec (args env dest)
+  "Compile (%mmap-exec-page size) — allocate a PROT_RWX anonymous PRIVATE
+   mmap region of SIZE bytes (page-multiple).  Result is the tagged mmap
+   address.  Uses TRAP #x0505 (WS4 JIT exec-memory primitive).  You can
+   write native bytes into it via (setf (mem-ref addr :u8) ...) and then
+   execute them via (%jit-call addr)."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0505)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-jit-call (args env dest)
+  "Compile (%jit-call entry-addr) — call a JIT'd native function whose
+   entry byte-address is ENTRY-ADDR (a tagged fixnum).  Uses TRAP #x0506,
+   which untags (SAR 1) and `call rsi`.  The callee returns its value in
+   VR(RAX)."
+  (compile-form (car args) env +vreg-v0+)
+  (emit-ir :trap #x0506)
+  (emit-ir :mov dest +vreg-vr+))
 
 (defun compile-read-char-serial (dest)
   "Compile (read-char-serial) — read a character from the serial port.

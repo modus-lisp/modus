@@ -1032,6 +1032,86 @@
              (write-char-serial 32)
              -1)))
         (write-string-serial \" bytes OK\") (write-char-serial 10)))
+    ;; ---- WS4 STAGE 2: JIT a REAL compiled form + assert == interpreter ----
+    ;; For each hazard-free form: obtain (bc entry ft-list fn-table rt-table
+    ;; lam-offsets) from the eval2 COMPILE seam (%eval2-compile-tuple — the
+    ;; same mvm-compile-toplevel + emit pipeline eval2-forms uses, stopping
+    ;; before interpret).  If rt-table is EMPTY (no out-of-module CALLs):
+    ;;   translate bc → native → mmap PROT_RWX page → copy bytes → %jit-call
+    ;; and separately mvm-interpret the SAME bc (the oracle).  Assert MATCH.
+    ;; Forms are chosen so their compiled bytecode has an EMPTY rt-table:
+    ;; const, in-module branch, in-module let, in-module fixnum loop-sum via
+    ;; %fixnum-+/%fixnum-<.  Plain +/< would emit out-of-module GENERIC-ADD /
+    ;; NUMERIC-VALUE-LESS-P CALLs (Stage-3 relocation) — deliberately avoided.
+    (write-string-serial \"WS4-S2-START\") (write-char-serial 10)
+    (dolist (probe (list
+                    (cons \"const\"  (quote (progn 42)))
+                    (cons \"if\"     (quote (if 1 7 8)))
+                    (cons \"let\"    (quote (let ((a 5) (b 9)) b)))))
+      (let ((label (car probe)) (form (cdr probe)))
+        (handler-case
+            (let* ((tuple (%eval2-compile-tuple (list form)))
+                   (bc (car tuple))
+                   (entry (cadr tuple))
+                   (ft-list (caddr tuple))
+                   (fn-table (cadddr tuple))
+                   (rt-table (car (cddddr tuple)))
+                   (lam-offsets (cadr (cddddr tuple)))
+                   (rt-n (hash-table-count rt-table)))
+              (write-string-serial \"WS4-S2 \") (write-string-serial label)
+              (write-string-serial \" rt=\") (print-dec rt-n) (write-char-serial 10)
+              ;; Always confirm the translator produces bytes for this form.
+              (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+                (let ((nlen (code-buffer-position nbuf)))
+                  (write-string-serial \"WS4-S2 \") (write-string-serial label)
+                  (write-string-serial \" native=\") (print-dec nlen)
+                  (write-string-serial \" bytes\") (write-char-serial 10)
+                  (if (> rt-n 0)
+                      (progn
+                        (write-string-serial \"WS4-S2 \") (write-string-serial label)
+                        (write-string-serial \" SKIP-EXEC (rt non-empty; Stage-3)\")
+                        (write-char-serial 10))
+                      ;; rt EMPTY → hazard-free → JIT it.
+                      (let* ((nbytes (code-buffer-bytes nbuf))
+                             ;; Native entry OFFSET for %EVAL2-THUNK in this buffer.
+                             (elabel (gethash \"%EVAL2-THUNK\" fn-map))
+                             (eoff (if elabel (label-position elabel) 0))
+                             ;; %mmap-exec-page returns a TAGGED fixnum (value =
+                             ;; raw<<1).  Route it through make-sap/sap-address
+                             ;; to get BASE, a Lisp integer whose VALUE = the raw
+                             ;; byte address — the shape mem-ref's untag (SHR 1)
+                             ;; address operand and %jit-call's `sar rsi,1` both
+                             ;; want.  (Matches the proven f3db331 spike.)
+                             (page (%mmap-exec-page 4096))
+                             (base (sap-address (make-sap page))))
+                        ;; Copy native bytes into the exec page.
+                        (let ((k 0))
+                          (loop while (< k nlen)
+                                do (progn
+                                     (setf (mem-ref (+ base k) :u8) (aref nbytes k))
+                                     (setq k (+ k 1)))))
+                        ;; JIT-call the native entry; oracle-interpret the same bc.
+                        (let ((jit (%jit-call (+ base eoff)))
+                              (interp (mvm-interpret bc :entry-point entry
+                                                     :function-table fn-table
+                                                     :runtime-table rt-table
+                                                     :return-raw nil
+                                                     :lambda-offsets lam-offsets)))
+                          (write-string-serial \"WS4-S2 \") (write-string-serial label)
+                          (write-string-serial \" jit=\") (print-dec jit)
+                          (write-string-serial \" interp=\") (print-dec interp)
+                          (write-char-serial 32)
+                          (if (eql jit interp)
+                              (write-string-serial \"MATCH\")
+                              (write-string-serial \"MISMATCH\"))
+                          (write-char-serial 10)))))))
+          (t (c)
+            (write-string-serial \"WS4-S2 \") (write-string-serial label)
+            (write-string-serial \" ERR:\")
+            (setq *write-object-budget* 120)
+            (handler-case (write-object c) (t (e) nil))
+            (write-char-serial 10)))))
+    (write-string-serial \"WS4-S2-END\") (write-char-serial 10)
     (write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
     (sys-exit 0))
 

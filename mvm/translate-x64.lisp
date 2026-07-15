@@ -589,6 +589,46 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
+             ((= code #x0505)
+              ;; %MMAP-EXEC-PAGE: anonymous PRIVATE mmap with PROT_RWX (=7).
+              ;; V0(RSI) = size (tagged fixnum, page multiple).
+              ;; Result = mmap address, stored in V0(RSI) tagged.
+              ;; The ONE new primitive for the WS4 JIT: a page you can WRITE
+              ;; native bytes into AND then EXECUTE.  Identical shape to
+              ;; %MMAP-SHARED-PAGE (#x0504) except rdx=7 (RWX) and
+              ;; r10=0x22 (MAP_PRIVATE|MAP_ANONYMOUS).
+              (emit-bytes buf #x57)              ; push rdi
+              (emit-bytes buf #x52)              ; push rdx
+              (emit-bytes buf #x41 #x50)         ; push r8
+              (emit-bytes buf #x41 #x51)         ; push r9
+              (emit-bytes buf #x41 #x52)         ; push r10
+              (emit-bytes buf #x41 #x53)         ; push r11
+              (emit-bytes buf #xB8 #x09 #x00 #x00 #x00) ; mov eax, 9 (SYS_mmap)
+              (emit-bytes buf #x48 #x31 #xFF)    ; xor rdi, rdi (addr = NULL)
+              (emit-bytes buf #x48 #xD1 #xFE)    ; sar rsi, 1 (untag size)
+              (emit-bytes buf #xBA #x07 #x00 #x00 #x00) ; mov edx, 7 (PROT_RWX)
+              (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00) ; mov r10d, 0x22 (PRIV|ANON)
+              (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1 (fd)
+              (emit-bytes buf #x4D #x31 #xC9)    ; xor r9, r9 (offset)
+              (emit-bytes buf #x0F #x05)         ; syscall
+              (emit-bytes buf #x48 #x01 #xC0)    ; add rax, rax (tag result)
+              (emit-bytes buf #x48 #x89 #xC6)    ; mov rsi, rax → V0
+              (emit-bytes buf #x41 #x5B)         ; pop r11
+              (emit-bytes buf #x41 #x5A)         ; pop r10
+              (emit-bytes buf #x41 #x59)         ; pop r9
+              (emit-bytes buf #x41 #x58)         ; pop r8
+              (emit-bytes buf #x5A)              ; pop rdx
+              (emit-bytes buf #x5F))             ; pop rdi
+             ((= code #x0506)
+              ;; %JIT-CALL: call a JIT'd native function whose entry address is
+              ;; in V0(RSI) as a TAGGED fixnum (the Lisp integer of the byte
+              ;; address, so its native word = addr<<1).  Untag (SAR 1) to get
+              ;; the raw address, then indirect-CALL it.  The callee sets up its
+              ;; own rbp frame, saves/restores rbx via [rbp-8], and returns its
+              ;; value in RAX (see +op-ret+).  RAX already IS the VR the caller
+              ;; reads next.
+              (emit-bytes buf #x48 #xD1 #xFE)    ; sar rsi, 1 (untag address)
+              (emit-bytes buf #xFF #xD6))        ; call rsi
              ((= code #x0320)
               ;; SETUP-IRQ: PIC remap + PIT timer + IDT + ISR for HLT-based io-delay
               (if *x64-linux-mode*

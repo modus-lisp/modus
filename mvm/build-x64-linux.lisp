@@ -1068,6 +1068,12 @@
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
 
+  ;; WS4-S5b: *use-jit* default baked from MODUS_USE_JIT at BUILD time.  The
+  ;; boot stub copies no envp, so there is no runtime getenv; the token
+  ;; @@USE-JIT@@ below is string-substituted (SBCL, build time) to T or NIL
+  ;; before the driver source is compiled into the image.
+  (setq *use-jit* @@USE-JIT@@)
+
   ;; Float constants from ansi-bridge — defvars don't run their init
   ;; thunks (per CLAUDE.md), so without these explicit setqs every
   ;; *-float-epsilon resolves to NIL at runtime, and the first ANSI
@@ -1182,6 +1188,31 @@
     (setq *skip-below* (%parse-decimal-at-fixed-208)))
   (when (> (mem-ref #x10000200 :u32) 2)
     (setq *run-only-below* (%parse-decimal-at-fixed-248)))
+
+  ;; WS4-S5b BENCHMARK sentinel (argv1 = 777777): eval2 a cacheable compute
+  ;; form REPEATEDLY (argv2 = iteration count, default 200000).  Production
+  ;; eval2 honors the build-time-baked *use-jit*, so the SAME sentinel run on
+  ;; the JIT-on vs JIT-off binaries — wrapped in external shell `time` — gives
+  ;; the wall-clock speedup.  The form is cacheable (no DEF*) so the FIRST eval
+  ;; compiles + (JIT-on) translates a page; every later eval hits *eval2-cache*
+  ;; and (JIT-on) reuses the cached exec page — the translate cost amortizes,
+  ;; which is where the JIT wins.  Uses only in-image printing; no rdtsc.
+  (when (eql *skip-below* 777777)
+    (write-string-serial \"BENCH-START jit=\")
+    (write-string-serial (if *use-jit* \"1\" \"0\")) (write-char-serial 10)
+    (let ((n (if (> (mem-ref #x10000200 :u32) 2) *run-only-below* 200000))
+          (i 0)
+          (acc 0))
+      (write-string-serial \"BENCH-ITERS=\") (print-dec n) (write-char-serial 10)
+      (loop while (< i n)
+            do (progn
+                 ;; A compute form with in-module let + arithmetic + branch.
+                 ;; Cacheable → cache/JIT-page reuse after the first iteration.
+                 (setq acc (eval2 (quote (let ((a 6) (b 7))
+                                           (if (< a b) (* a b) (+ a b))))))
+                 (setq i (+ i 1))))
+      (write-string-serial \"BENCH-DONE acc=\") (print-dec acc) (write-char-serial 10))
+    (sys-exit 0))
 
   ;; WS3 in-image eval2 self-check (sentinel: argv1 = 888888).  Compiles a form
   ;; to MVM bytecode and interprets it INSIDE this image — proves the
@@ -1425,6 +1456,21 @@
 ;;; ============================================================
 ;;; 5. Assemble full source
 ;;; ============================================================
+
+;; WS4-S5b: substitute the @@USE-JIT@@ token in kernel-main with the build-time
+;; MODUS_USE_JIT value (T to run eval2 as native JIT'd code; NIL = interpret,
+;; the default).  Done BEFORE the sym-name scan so no @@…@@ token leaks into it.
+(let* ((v (sb-ext:posix-getenv "MODUS_USE_JIT"))
+       (on (and v (or (string= v "1") (string-equal v "t") (string-equal v "yes"))))
+       (pos (search "@@USE-JIT@@" *driver-source*)))
+  (when pos
+    (setf *driver-source*
+          (concatenate 'string
+                       (subseq *driver-source* 0 pos)
+                       (if on "t" "nil")
+                       (subseq *driver-source* (+ pos (length "@@USE-JIT@@"))))))
+  (format t "~%WS4-S5b: *use-jit* baked = ~A (MODUS_USE_JIT=~A)~%"
+          (if on "T" "NIL") (or v "<unset>")))
 
 ;; Now that *driver-source* exists, build the sym-name reverse table INCLUDING
 ;; the driver's quoted symbols (so the in-image eval2 self-check's `(defun sq

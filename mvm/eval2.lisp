@@ -40,6 +40,32 @@
    leave it stale, which self-heals at the next eval2-forms call and at
    worst makes an unrelated fmakunbound of one of these names a no-op.")
 
+;;; ============================================================
+;;; WS4 STAGE 5b — runtime JIT seam (bytecode → native → execute)
+;;; ============================================================
+;;;
+;;; *use-jit* (default NIL): when T, eval2-forms / %eval2-run-tuple execute a
+;;; compiled module by TRANSLATING its bytecode to native x64, mmap'ing an
+;;; exec page, relocating out-of-module CALLs + patching const-pool immediates
+;;; (the Stage 1-4 mechanism), and %jit-call'ing the entry — instead of
+;;; mvm-interpret.  Set at boot (build-time default baked from MODUS_USE_JIT).
+;;; ANY failure in the JIT path falls back to mvm-interpret, so correctness is
+;;; never worse than JIT-off (unsupported forms — strings/length/MV — just take
+;;; the interpret path).  When *use-jit* is NIL the seam is inert: eval2 is
+;;; byte-for-byte behavior-identical to before.
+(defvar *use-jit* nil
+  "WS4-S5b: T = execute compiled eval2 modules as native JIT'd code (with
+   interpret fallback on any error); NIL = pure mvm-interpret (unchanged).")
+
+(defvar *jit-page-cache* nil
+  "WS4-S5b per-module JIT cache.  EQ hash keyed by the compiled BC byte-array
+   identity → a jit-entry list (base eoff cpatches gc-stamp).  A repeated eval2
+   of the SAME cached module reuses the already-translated exec page instead of
+   re-translating (that's the speedup: translate cost amortizes over re-evals).
+   After a GC the const-pool objects MOVE (the pool is a GC root the collector
+   updates); each cached page's baked const immediates go stale, so we compare
+   gc-stamp to (%gc-count) and RE-PATCH from the updated pool before re-exec.")
+
 (defvar *eval2-no-cache* nil
   "When T, eval2-forms bypasses *eval2-cache* entirely (neither hit nor
    store) for the current call.  Set (setq + unwind-protect restore) by
@@ -125,8 +151,124 @@
                  (%e2-scan-persist (car ex) acc (+ depth 1))
                  acc)))))))
 
+;;; --- WS4-S5b JIT machinery (small factored helpers) ---
+;;;
+;;; Kept deliberately SMALL / non-inlined into kernel-main or eval2-forms
+;;; (the boot-crash/layout class — a big body baked past a branch-displacement
+;;; boundary SIGSEGVs at boot).  Each does one step; the seam calls %eval2-jit-run.
+
+(defun %jit-write-imm64 (base off word)
+  "Write the 64-bit WORD little-endian into the exec page at BASE+OFF (the
+   10-byte movabs's imm64 slot)."
+  (let ((a (+ base off)) (v word) (j 0))
+    (loop while (< j 8)
+          do (progn
+               (setf (mem-ref (+ a j) :u8) (logand v 255))
+               (setq v (ash v -8))
+               (setq j (+ j 1))))))
+
+(defun %jit-patch-consts (base cpatches)
+  "Bake each live const-pool object's tagged native word into its movabs imm64.
+   CPATCHES = list of (imm64-native-off . pool-idx).  Re-runnable after GC."
+  (dolist (p cpatches)
+    (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (%jit-write-imm64 base (car p) (%val->word obj)))))
+
+(defun %jit-reloc-calls (base relocs rt-table)
+  "Patch each out-of-module CALL movabs with the resolved native callee address.
+   Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
+  (let ((ok t))
+    (dolist (r relocs)
+      (let* ((name (gethash (cdr r) rt-table))
+             (fn (and name (%mvm-resolve-runtime-fn name)))
+             (raw (if fn (- (ash (%val->word fn) -1) 3) 0)))
+        (if (> raw 0)
+            (%jit-write-imm64 base (car r) raw)
+            (setq ok nil))))
+    ok))
+
+(defun %jit-translate-page (bc ft-list rt-table)
+  "Translate BC → native x64, mmap an exec page, copy bytes, relocate calls +
+   patch consts.  Returns a jit-entry list (base eoff cpatches gc-stamp) or NIL
+   if translation/relocation failed (caller falls back to interpret)."
+  (setq *x64-jit-mode* t)
+  (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
+    (let* ((nlen (code-buffer-position nbuf))
+           (nbytes (code-buffer-bytes nbuf))
+           (relocs *x64-call-relocs*)
+           (cpatches *x64-li-const-patches*)
+           (elabel (gethash "%EVAL2-THUNK" fn-map))
+           (eoff (if elabel (label-position elabel) 0))
+           (page (%mmap-exec-page 4096))
+           (base (sap-address (make-sap page))))
+      ;; Copy native bytes into the exec page.
+      (let ((k 0))
+        (loop while (< k nlen)
+              do (progn
+                   (setf (mem-ref (+ base k) :u8) (aref nbytes k))
+                   (setq k (+ k 1)))))
+      (if (%jit-reloc-calls base relocs rt-table)
+          (progn
+            (%jit-patch-consts base cpatches)
+            (list base eoff cpatches (%gc-count)))
+          nil))))
+
+(defun %jit-entry-for (bc ft-list rt-table)
+  "Return a ready-to-call jit-entry (base eoff cpatches gc-stamp) for BC, using
+   *jit-page-cache* (keyed by BC identity) if present — RE-PATCHING const
+   immediates when a GC has fired since the page was built (the pool moved).
+   Builds + caches a fresh page on a miss.  NIL if the page can't be built."
+  (unless *jit-page-cache*
+    (setq *jit-page-cache* (make-hash-table :test (quote eq))))
+  (let ((hit (gethash bc *jit-page-cache*)))
+    (if hit
+        (let ((now (%gc-count)))
+          (if (eql now (cadddr hit))
+              hit
+              ;; A GC moved the const-pool objects; re-bake immediates, then
+              ;; re-store a fresh entry with the new stamp (avoid mutating a
+              ;; nested list place — build + puthash is compiler-safe).
+              (let ((fresh (list (car hit) (cadr hit) (caddr hit) now)))
+                (%jit-patch-consts (car fresh) (caddr fresh))
+                (setf (gethash bc *jit-page-cache*) fresh)
+                fresh)))
+        (let ((entry (%jit-translate-page bc ft-list rt-table)))
+          (when entry (setf (gethash bc *jit-page-cache*) entry))
+          entry))))
+
+(defun %eval2-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p)
+  "WS4-S5b: run compiled module BC as NATIVE JIT'd code, wrapping the result
+   like the interpret path (%mvm-wrap-escaping-result).  If the JIT can't build
+   a page, OR the form produced MULTIPLE VALUES (native writes real BSS MV-count
+   at #x10000090 — a different mechanism from the interpreter's simulated
+   *mvm-last-mv*, so we do NOT try to reproduce it), we throw to the caller's
+   handler-case which falls back to mvm-interpret.  Single-value forms — the
+   bulk of runtime evals — take the fast native path.
+   CACHE-P: T = reuse/store an exec page in *jit-page-cache* (cached modules,
+   where the SAME bc re-evals — the speedup source); NIL = translate once, no
+   cache (the fresh-bc DEF* path, whose page would never be re-hit)."
+  (let ((je (if cache-p
+                (%jit-entry-for bc ft-list rt-table)
+                (%jit-translate-page bc ft-list rt-table))))
+    (if je
+        (progn
+          ;; Native code stamps MV-count into real BSS; seed it to 1 so a
+          ;; single-value form reads back 1 (the thunk epilogue sets it, but
+          ;; be defensive).  A form that sets it >1 falls back for correct MV.
+          (setf (mem-ref #x10000090 :u64) 1)
+          (let ((raw (%jit-call (+ (car je) (cadr je)))))
+            (let ((mvc (mem-ref #x10000090 :u64)))
+              (unless (eql mvc 1)
+                (error "jit-mv-fallback")))
+            ;; SINGLE value: clear the interpreter's simulated MV state so a
+            ;; STALE *mvm-last-mv* from a prior interpret run doesn't leak into
+            ;; this form's return (the seam reads *mvm-last-mv* after us).
+            (setq *mvm-last-mv* nil)
+            (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
+        (error "jit-page-unavailable"))))
+
 (defun %eval2-run-tuple (tuple)
-  "Interpret a cached compiled module tuple (bc entry fn-table rt-table lam-offsets).
+  "Interpret a cached compiled module tuple (bc entry ft-list fn-table rt-table lam-offsets).
    Conditions PROPAGATE to the caller (production EVAL semantics): an error
    signalled inside the evaluated form must reach the caller's handler-case.
    The old `(handler-case ... (error (e) (list :interp-err e)))` swallowed the
@@ -141,12 +283,31 @@
   ;; The tail if/values-list shape is values-preserving per
   ;; tail-form-is-values-p, so this function's epilogue does NOT reset
   ;; MV-count back to 1.
-  (let* ((%prim (%mvm-wrap-escaping-result
-                  (mvm-interpret (car tuple) :entry-point (cadr tuple)
-                                 :function-table (caddr tuple)
-                                 :runtime-table (cadddr tuple) :return-raw nil
-                                 :lambda-offsets (car (cddddr tuple)))
-                  (car tuple) (caddr tuple) (cadddr tuple) (car (cddddr tuple))))
+  ;;
+  ;; TUPLE layout (WS4-S5b): (bc entry ft-list fn-table rt-table lam-offsets)
+  ;;   car=bc caddr=ft-list cadddr=fn-table (car(cddddr))=rt-table
+  ;;   (cadr(cddddr))=lam-offsets.  ft-list was inserted at index 2 for the JIT.
+  (let* ((%bc (car tuple))
+         (%entry (cadr tuple))
+         (%ftl (caddr tuple))
+         (%fnt (cadddr tuple))
+         (%rt (car (cddddr tuple)))
+         (%lam (cadr (cddddr tuple)))
+         ;; WS4-S5b: when *use-jit*, run native; fall back to interpret on ANY
+         ;; error (unsupported form / MV form / page-build failure).
+         (%prim (if *use-jit*
+                    (handler-case (%eval2-jit-run %bc %entry %ftl %fnt %rt %lam t)
+                      (t (c)
+                         (%mvm-wrap-escaping-result
+                           (mvm-interpret %bc :entry-point %entry
+                                          :function-table %fnt :runtime-table %rt
+                                          :return-raw nil :lambda-offsets %lam)
+                           %bc %fnt %rt %lam)))
+                    (%mvm-wrap-escaping-result
+                      (mvm-interpret %bc :entry-point %entry
+                                     :function-table %fnt :runtime-table %rt
+                                     :return-raw nil :lambda-offsets %lam)
+                      %bc %fnt %rt %lam)))
          (%mv *mvm-last-mv*))
     (if %mv
         (if (eql (car %mv) 0)
@@ -467,10 +628,18 @@
                 ;; lambda bodies are recorded (never the %eval2-thunk / helper defuns
                 ;; / the fn at offset 0), so an ordinary fixnum DATA argument — a loop
                 ;; counter 0/1/2, an index — is never mistaken for a callable.
-                (lam-offsets (make-hash-table)))
+                (lam-offsets (make-hash-table))
+                ;; WS4-S5b: (name offset length) list for translate-mvm-to-x64
+                ;; (the JIT adapter — same function-info structs as fn-table).
+                (ft-list nil))
             (dolist (e all-ir)
               (aset fn-table i (function-info-bytecode-offset (car e)))
               (setq i (+ i 1))
+              (setq ft-list
+                    (cons (list (string (function-info-name (car e)))
+                                (function-info-bytecode-offset (car e))
+                                (function-info-bytecode-length (car e)))
+                          ft-list))
               (let ((nm (string (function-info-name (car e))))
                     (off (function-info-bytecode-offset (car e))))
                 ;; NEVER record offset 0: at the native bridge a DATA fixnum 0
@@ -529,7 +698,9 @@
             ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
             (when %cacheable
               (setf (gethash forms *eval2-cache*)
-                    (list bc entry fn-table rt-table lam-offsets)))
+                    ;; WS4-S5b: ft-list inserted at index 2 (see %eval2-run-tuple
+                    ;; layout comment).  reverse → source order (fn-table order).
+                    (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))
             ;; Conditions PROPAGATE (see %eval2-run-tuple): production EVAL
             ;; must let an error signalled by the form reach the caller's
             ;; handler-case instead of returning (:interp-err e) as a value.
@@ -546,11 +717,25 @@
             (let* ((%adn-saved *e2-active-defun-names*)
                    (%prim (progn
                             (setq *e2-active-defun-names* persist-names)
-                            (%mvm-wrap-escaping-result
-                              (mvm-interpret bc :entry-point entry :function-table fn-table
-                                             :runtime-table rt-table :return-raw nil
-                                             :lambda-offsets lam-offsets)
-                              bc fn-table rt-table lam-offsets)))
+                            ;; WS4-S5b: JIT when enabled, interpret-fallback on
+                            ;; any error (page-build fail / MV form / unsupported).
+                            (if *use-jit*
+                                (handler-case
+                                    (%eval2-jit-run bc entry (reverse ft-list)
+                                                    fn-table rt-table lam-offsets nil)
+                                  (t (c)
+                                     (%mvm-wrap-escaping-result
+                                       (mvm-interpret bc :entry-point entry
+                                                      :function-table fn-table
+                                                      :runtime-table rt-table
+                                                      :return-raw nil
+                                                      :lambda-offsets lam-offsets)
+                                       bc fn-table rt-table lam-offsets)))
+                                (%mvm-wrap-escaping-result
+                                  (mvm-interpret bc :entry-point entry :function-table fn-table
+                                                 :runtime-table rt-table :return-raw nil
+                                                 :lambda-offsets lam-offsets)
+                                  bc fn-table rt-table lam-offsets))))
                    (%mv *mvm-last-mv*))
               (setq *e2-active-defun-names* %adn-saved)
               (if %mv

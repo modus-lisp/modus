@@ -1861,6 +1861,8 @@
   (cond
     ((%mda-p a) (upgraded-array-element-type (%mda-etype a)))
     ((stringp a) 'character)
+    ;; Byte-packed (unsigned-byte 8) vector (subtag #x11).
+    ((eql (obj-subtag a) #x11) '(unsigned-byte 8))
     (t t)))
 (defun check-type-error (fn args) nil)
 (defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))

@@ -2656,6 +2656,9 @@
          (eq type 'standard-char)
          (eq type 'extended-char))
      'character)
+    ;; (UNSIGNED-BYTE 8) and near-equivalents upgrade to (UNSIGNED-BYTE 8)
+    ;; — Modus stores these in a byte-packed vector (subtag #x11).
+    ((%u8-element-type-p type) '(unsigned-byte 8))
     ;; Everything else is stored as a general (T) element.
     (t t)))
 
@@ -2701,6 +2704,9 @@
     ;; Strings (incl. MAKE-ARRAY :element-type character/base-char, whose
     ;; data is a subtag-#x31 string) are not simple-vectors.
     ((stringp x) nil)
+    ;; Byte-packed (unsigned-byte 8) vector (subtag #x11): element-type
+    ;; (unsigned-byte 8), NOT T → not a simple-vector.
+    ((eql (obj-subtag x) #x11) nil)
     ;; Native multi-dim header: only rank-1, T-element, plain vectors qualify.
     ((%mda-p x)
      (and (eql (%mda-rank x) 1)
@@ -4665,6 +4671,43 @@
 ;; version which the compiler can't faithfully handle).
 
 
+(defun %u8-element-type-p (etype)
+  "True if ETYPE upgrades to (UNSIGNED-BYTE 8) for Modus's byte-packed
+   u8 vector representation (subtag #x11).  Conservative: recognises the
+   common CL spellings that SBCL upgrades to (unsigned-byte 8) — the
+   exact list form, and (mod 256) / (integer 0 255) — plus the symbol
+   forms.  Anything else keeps the general tagged-word representation."
+  (cond
+    ;; (unsigned-byte 8)
+    ((and (consp etype)
+          (eq (car etype) 'unsigned-byte)
+          (consp (cdr etype))
+          (eql (cadr etype) 8)
+          (null (cddr etype)))
+     t)
+    ;; (mod 256)
+    ((and (consp etype)
+          (eq (car etype) 'mod)
+          (consp (cdr etype))
+          (eql (cadr etype) 256)
+          (null (cddr etype)))
+     t)
+    ;; (integer 0 255)
+    ((and (consp etype)
+          (eq (car etype) 'integer)
+          (consp (cdr etype))
+          (eql (cadr etype) 0)
+          (consp (cddr etype))
+          (eql (caddr etype) 255)
+          (null (cdddr etype)))
+     t)
+    (t nil)))
+
+(defun %make-u8-vector (n)
+  "Allocate a byte-packed (unsigned-byte 8) vector of N bytes (subtag
+   #x11), payload zero-initialised by the alloc-u8 opcode."
+  (%alloc-u8 n))
+
 (defun make-array (dim &rest kwargs)
   "ANSI make-array — see file-level comment above for current scope."
   (let* ((dim-list (cond ((null dim) nil)
@@ -4742,12 +4785,16 @@
       ;; (subtag #x31) so STRINGP / string ops work on the result.
       (let* ((char-elt (or (eq etype 'character) (eq etype 'base-char)
                            (eq etype 'standard-char)))
+             ;; Byte-packed (unsigned-byte 8) storage (subtag #x11): 8x
+             ;; smaller than the general tagged-word array.  Only for real
+             ;; u8 element types; everything else is unchanged.
+             (u8-elt (and etype-set (%u8-element-type-p etype)))
              (data (cond
                      ;; :initial-element — fill every slot.
                      (ie-p
-                      (let* ((a (if char-elt
-                                    (%make-string-array total)
-                                    (make-array total)))
+                      (let* ((a (cond (char-elt (%make-string-array total))
+                                      (u8-elt (%make-u8-vector total))
+                                      (t (make-array total))))
                              (store (if (and char-elt (characterp ie))
                                         (char-code ie) ie))
                              (i 0))
@@ -4757,11 +4804,12 @@
                      ;; :initial-contents — flatten in row-major order
                      ;; for multi-dim; copy verbatim for 1-D / flat lists.
                      (ic-p
-                      (let ((a (if char-elt
-                                   (%make-string-array total)
-                                   (make-array total))))
+                      (let ((a (cond (char-elt (%make-string-array total))
+                                     (u8-elt (%make-u8-vector total))
+                                     (t (make-array total)))))
                         (%mda-fill-contents-flat a ic dim-list)))
                      (char-elt (%make-string-array total))
+                     (u8-elt (%make-u8-vector total))
                      (t (make-array total)))))
         ;; Decide return shape.  Phase 2a: wrap in MDA whenever rank ≠ 1,
         ;; or any non-trivial kwarg appeared, or the dim was passed as
@@ -4775,6 +4823,12 @@
            data)
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) char-elt)
+           data)
+          ;; Plain 1-D (unsigned-byte 8) vector with no other wrapping —
+          ;; return the byte-packed #x11 vector directly so ARRAYP / TYPEP /
+          ;; ARRAY-ELEMENT-TYPE / OBJ-SUBTAG see the real specialized object.
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) u8-elt)
            data)
           ;; Displaced MDA: set DATA slot to the displaced target so that
           ;; type predicates (stringp / typep) and length helpers see
@@ -5545,7 +5599,11 @@
          ((eq tn 'array)         (or (arrayp obj) (stringp obj)))
          ((eq tn 'simple-array)  (or (arrayp obj) (stringp obj)))
          ((eq tn 'vector)        (or (arrayp obj) (stringp obj)))
-         ((eq tn 'simple-vector) (or (arrayp obj) (stringp obj)))
+         ;; SIMPLE-VECTOR = (simple-array t (*)) — element-type T only.
+         ;; A byte-packed u8 vector (subtag #x11) has element-type
+         ;; (unsigned-byte 8), so it is NOT a simple-vector.
+         ((eq tn 'simple-vector) (and (or (arrayp obj) (stringp obj))
+                                      (not (eql (obj-subtag obj) #x11))))
          ((eq tn 'bit-vector)    (arrayp obj))
          ((eq tn 'simple-bit-vector) (arrayp obj))
          ((eq tn 'sequence)      (or (null obj) (consp obj)
@@ -5756,17 +5814,43 @@
                        ((and (consp obj) (eql (car obj) 8765432)) (cdr obj))
                        (t obj))))
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
-               (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32))
+               (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
+                   (= (obj-subtag obj) #x11))
                (let* ((et (and (cdr type) (cadr type)))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
                       (is-string  (= (obj-subtag obj) #x31))
                       (is-array   (= (obj-subtag obj) #x32))
+                      ;; Byte-packed (unsigned-byte 8) vector (subtag #x11):
+                      ;; element type is exactly (UNSIGNED-BYTE 8), NOT T.
+                      (is-u8      (= (obj-subtag obj) #x11))
                       (is-bitvec  (and is-array
                                        (> (array-length obj) 0)
                                        (bit-vector-p obj)))
                       (et-ok
                        (cond
+                         ;; u8 vector: matches (unsigned-byte 8) and integer
+                         ;; supertypes; NOT T / character / bit.
+                         (is-u8
+                          (cond
+                            ((or (null et) (eq et '*)) t)
+                            ((%u8-element-type-p et) t)
+                            ((or (eq et 'unsigned-byte) (eq et 'signed-byte)
+                                 (eq et 'integer) (eq et 'fixnum)
+                                 (eq et 'rational) (eq et 'real)
+                                 (eq et 'number) (eq et 'atom))
+                             t)
+                            ((and (consp et)
+                                  (eq (car et) 'unsigned-byte)
+                                  (consp (cdr et)) (integerp (cadr et))
+                                  (>= (cadr et) 8))
+                             t)
+                            ((and (consp et)
+                                  (or (eq (car et) 'signed-byte)
+                                      (eq (car et) 'integer)
+                                      (eq (car et) 'mod)))
+                             t)
+                            (t nil)))
                          ((or (null et) (eq et '*) (eq et t))
                           (if (or (null et) (eq et '*))
                               t

@@ -48,6 +48,7 @@
 (defconstant +subtag-bignum+ #x30)
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
+(defconstant +subtag-u8-vector+ #x11)   ; byte-packed (unsigned-byte 8) vector
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
                                      ; [rank dims fp displaced-to disp-offset
@@ -4823,6 +4824,16 @@
        (compile-prim-array-length (cadr form) env dest))
       ((= op-name (compute-name-hash "%PRIM-STRINGP"))
        (compile-prim-stringp (cadr form) env dest))
+      ((= op-name (compute-name-hash "%ALLOC-U8"))
+       (compile-alloc-u8 (cadr form) env dest))
+      ((= op-name (compute-name-hash "%U8-REF"))
+       (compile-u8-ref (cadr form) (caddr form) env dest))
+      ((= op-name (compute-name-hash "%U8-SET"))
+       (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name (compute-name-hash "%WORD-AREF"))
+       (compile-word-aref (cadr form) (caddr form) env dest))
+      ((= op-name (compute-name-hash "%WORD-ASET"))
+       (compile-word-aset (cadr form) (caddr form) (cadddr form) env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -12379,6 +12390,10 @@
     (emit-ir :li temp2 (ash +subtag-mda+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; Byte-packed (unsigned-byte 8) vector (subtag #x11).
+    (emit-ir :li temp2 (ash +subtag-u8-vector+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
     (emit-ir-label false-label)
     (compile-nil dest)
     (emit-ir :br end-label)
@@ -13420,7 +13435,13 @@
 ;;; they emit the raw opcode and assume the array argument is a real array.
 ;;; compile-aref/compile-aset/compile-array-length wrap these in a runtime
 ;;; consp check so wrapper inputs route to the helper trampolines.
-(defun compile-prim-aref (arr-form idx-form env dest)
+;;; %WORD-AREF / %WORD-ASET — leaf tagged-WORD element access (the
+;;; original %prim-aref/%prim-aset behaviour).  These ALWAYS emit the
+;;; word-slot opcode (obj-ref/aref, obj-set/aset); they perform NO subtag
+;;; dispatch, so u8 code must not reach them.  compile-prim-aref/aset wrap
+;;; these with a runtime #x11 subtag check that routes byte-packed u8
+;;; vectors to %u8-ref/%u8-set instead.
+(defun compile-word-aref (arr-form idx-form env dest)
   (if (integerp idx-form)
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
@@ -13434,7 +13455,7 @@
         (free-temp-reg)
         (free-temp-reg))))
 
-(defun compile-prim-aset (arr-form idx-form val-form env dest)
+(defun compile-word-aset (arr-form idx-form val-form env dest)
   (if (integerp idx-form)
       (let ((arr-reg (alloc-temp-reg))
             (val-reg (alloc-temp-reg)))
@@ -13456,9 +13477,75 @@
         (free-temp-reg)
         (free-temp-reg))))
 
+;;; %PRIM-AREF / %PRIM-ASET — subtag-dispatching primitive element access.
+;;; A byte-packed u8 vector (subtag #x11) reads/writes a single byte via
+;;; %u8-ref/%u8-set; every other object (general array #x32, string #x31,
+;;; etc.) uses the tagged-word path (%word-aref/%word-aset).  The dispatch
+;;; is a single runtime (obj-subtag arr)==#x11 test — purely additive: for
+;;; all pre-existing (non-#x11) objects the word path is taken unchanged.
+(defun compile-prim-aref (arr-form idx-form env dest)
+  (let ((g-arr (gensym "PAREFA"))
+        (g-idx (gensym "PAREFI")))
+    (compile-form
+     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
+        (if (eql (obj-subtag ,g-arr) #x11)
+            (%u8-ref ,g-arr ,g-idx)
+            (%word-aref ,g-arr ,g-idx)))
+     env dest)))
+
+(defun compile-prim-aset (arr-form idx-form val-form env dest)
+  (let ((g-arr (gensym "PASETA"))
+        (g-idx (gensym "PASETI"))
+        (g-val (gensym "PASETV")))
+    (compile-form
+     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
+        (if (eql (obj-subtag ,g-arr) #x11)
+            (%u8-set ,g-arr ,g-idx ,g-val)
+            (%word-aset ,g-arr ,g-idx ,g-val)))
+     env dest)))
+
 (defun compile-prim-array-length (arr-form env dest)
   (compile-form arr-form env dest)
   (emit-ir :array-len dest dest))
+
+;;; ------------------------------------------------------------------
+;;; Byte-packed (unsigned-byte 8) vector primitives (subtag #x11).
+;;; %ALLOC-U8 / %U8-REF / %U8-SET emit the raw alloc-u8 / u8-ref / u8-set
+;;; opcodes.  These are the low-level building blocks; %make-u8-vector
+;;; (cl-sequences.lisp) and the compile-aref/compile-aset u8 branch call
+;;; them.  Purely additive — only reached for genuine u8 vectors.
+(defun compile-alloc-u8 (count-form env dest)
+  "Compile (%alloc-u8 N) — allocate a byte-packed u8 vector of N bytes."
+  (let ((cnt-reg (alloc-temp-reg)))
+    (compile-form count-form env cnt-reg)
+    (emit-ir :gc-check)
+    (emit-ir :alloc-u8 dest cnt-reg)
+    (free-temp-reg)))
+
+(defun compile-u8-ref (arr-form idx-form env dest)
+  "Compile (%u8-ref arr idx) — load a byte (tagged fixnum) from a u8 vector."
+  (let ((arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg)))
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (emit-ir :u8-ref dest arr-reg idx-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
+
+(defun compile-u8-set (arr-form idx-form val-form env dest)
+  "Compile (%u8-set arr idx val) — store VAL's low byte into a u8 vector.
+   Returns VAL (like aset)."
+  (let ((arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg))
+        (val-reg (alloc-temp-reg)))
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (compile-form val-form env val-reg)
+    (emit-ir :u8-set arr-reg idx-reg val-reg)
+    (emit-ir :mov dest val-reg)
+    (free-temp-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
 
 ;;; AREF / ASET / ARRAY-LENGTH — wrapper-aware front-ends.
 ;;;
@@ -14623,6 +14710,7 @@
       (:array-len 3)
       (:alloc-array 3)  ;; 2-reg: 1 opcode + 2 regs = 3 bytes
       (:alloc-string 3)
+      (:alloc-u8 3)     ;; 2-reg: 1 opcode + 2 regs = 3 bytes
       (:sap-new  3)    ;; 2-reg
       (:sap-addr 3)    ;; 2-reg
       ;; IEEE float conversion (2-reg) / compare (2-reg)
@@ -14640,6 +14728,8 @@
       ;; 3-reg instructions: 1 opcode + 3 regs = 4 bytes
       (:aref  4)
       (:aset  4)
+      (:u8-ref 4)
+      (:u8-set 4)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -14853,6 +14943,8 @@
            (mvm-alloc-array buf (second insn) (third insn)))
           (:alloc-string
            (encode-instruction buf +op-alloc-string+ (second insn) (third insn)))
+          (:alloc-u8
+           (mvm-alloc-u8 buf (second insn) (third insn)))
 
           ;; ---- SAP operations ----
           (:sap-new
@@ -14890,6 +14982,12 @@
           (:aset
            ;; (aset obj idx src)
            (mvm-aset buf (second insn) (third insn) (fourth insn)))
+          (:u8-ref
+           ;; (u8-ref dest arr idx)
+           (mvm-u8-ref buf (second insn) (third insn) (fourth insn)))
+          (:u8-set
+           ;; (u8-set arr idx src)
+           (mvm-u8-set buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

@@ -3059,6 +3059,32 @@
                  (%typename-eq (car elt) 'bit)))
         nil)
        (t t)))
+    ;; Byte-packed (unsigned-byte 8) vector (subtag #x11): element type is
+    ;; exactly (UNSIGNED-BYTE 8), NOT T.  Matches integer-family element
+    ;; specs that are supertypes of (unsigned-byte 8); rejects T /
+    ;; character / bit.
+    ((eql (obj-subtag arr) #x11)
+     (cond
+       ;; (unsigned-byte 8) — exact.
+       ((%u8-element-type-p elt) t)
+       ;; Wider integer supertypes: (unsigned-byte n>=8), unsigned-byte,
+       ;; signed-byte, integer, fixnum, number all contain u8 elements.
+       ((or (%typename-eq elt 'unsigned-byte) (%typename-eq elt 'signed-byte)
+            (%typename-eq elt 'integer) (%typename-eq elt 'fixnum)
+            (%typename-eq elt 'rational) (%typename-eq elt 'real)
+            (%typename-eq elt 'number) (%typename-eq elt 'atom))
+        t)
+       ((and (consp elt)
+             (%typename-eq (car elt) 'unsigned-byte)
+             (consp (cdr elt)) (integerp (cadr elt)) (>= (cadr elt) 8))
+        t)
+       ((and (consp elt)
+             (or (%typename-eq (car elt) 'signed-byte)
+                 (%typename-eq (car elt) 'integer)
+                 (%typename-eq (car elt) 'mod)))
+        t)
+       ;; NOT element-type T, character, or bit.
+       (t nil)))
     (t
      ;; Non-string array.  ELT = T or T-equivalent matches.  CHARACTER
      ;; on a non-string array doesn't (since the elt is T, not character).
@@ -3182,13 +3208,15 @@
           (and (arrayp obj) (= (array-rank obj) 1)))
          ((%typename-eq tn 'simple-vector)
           ;; CL: simple-vector = simple 1-D array of T.  In Modus the
-          ;; element type isn't tracked at the object level, so we
-          ;; can't strictly distinguish (vector T) from (vector bit) /
-          ;; (vector character) for arrays of 0/1 etc.  Reject strings
-          ;; (#x31, definitely char-element-typed) and adjustable
+          ;; element type isn't tracked at the object level for the
+          ;; general case, so we can't strictly distinguish (vector T)
+          ;; from (vector bit) / (vector character) for arrays of 0/1 etc.
+          ;; Reject strings (#x31, char-element-typed), byte-packed u8
+          ;; vectors (#x11, element-type (unsigned-byte 8)) and adjustable
           ;; wrappers but otherwise accept any 1-D arrayp.
           (and (arrayp obj) (= (array-rank obj) 1)
                (not (stringp obj))
+               (not (eql (obj-subtag obj) #x11))
                (not (and (consp obj) (eql (car obj) 8765432)))))
          ((%typename-eq tn 'sequence)
           (or (null obj) (consp obj) (arrayp obj)))

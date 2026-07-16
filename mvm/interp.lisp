@@ -1342,6 +1342,38 @@
                  (reg-set regs vd (%val->word obj)))
                (setf pc npc2))))
 
+          ;; Byte-packed (unsigned-byte 8) vector.  In the in-image
+          ;; interpreter these are ordinary native u8 arrays; the packed
+          ;; heap representation (subtag #x11) only matters in native code.
+          ;; u8-ref/u8-set are plain element access via %obj-elt-ref/set.
+          (#.+op-alloc-u8+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vcount npc2) (fetch-reg bc npc)
+               (let ((obj (make-array (%word->val (reg-get regs vcount))
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+                 (push obj (mvm-heap state))
+                 (reg-set regs vd (%val->word obj)))
+               (setf pc npc2))))
+
+          (#.+op-u8-ref+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vidx npc3) (fetch-reg bc npc2)
+                 (let ((obj (svref regs vobj))
+                       (idx (svref regs vidx)))
+                   (setf (svref regs vd) (%obj-elt-ref obj idx)))
+                 (setf pc npc3)))))
+
+          (#.+op-u8-set+
+           (multiple-value-bind (vobj npc) (fetch-reg bc pc)
+             (multiple-value-bind (vidx npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
+                 (let ((obj (svref regs vobj))
+                       (idx (svref regs vidx)))
+                   (%obj-elt-set obj idx (svref regs vs)))
+                 (setf pc npc3)))))
+
           (#.+op-aref+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vobj npc2) (fetch-reg bc npc)
@@ -1445,6 +1477,20 @@
                (let* ((obj (svref regs vs))
                       (raw-st (obj-subtag obj))
                       (st (cond
+                            ;; Genuine non-callable heap object: a clean
+                            ;; low-subtag (< #x50) is a real vector/array/
+                            ;; struct/hash/bignum/ratio/float/etc. — return it
+                            ;; directly, BEFORE the functionp fallback below.
+                            ;; Without this a u8 vector (subtag #x11) whose heap
+                            ;; address happens to satisfy functionp's legacy
+                            ;; code-range check would be reported as #x51
+                            ;; (native-fn) → arrayp/vectorp/typep all break.
+                            ;; Callable subtags (#x50 symbol / #x51 fn / #x52
+                            ;; closure / #x53 keyword) still fall through to the
+                            ;; dispatch-aware arms.  raw-st = 0 means obj-subtag
+                            ;; bailed (non-object) → fall through to functionp.
+                            ((and (> raw-st 0) (< raw-st #x50))
+                             raw-st)
                             ;; A CLOSURE object reads a clean #x52 from the
                             ;; obj-subtag primop.  Keep #x52 ONLY for an
                             ;; IN-MODULE closure — slot 0 is a recorded lambda

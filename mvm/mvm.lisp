@@ -57,6 +57,7 @@
    #:+op-sap-set8+ #:+op-sap-set32+ #:+op-sap-set64+ #:+op-sap-addr+
    #:+op-set-mv-count+
    #:+op-alloc-string+
+   #:+op-alloc-u8+ #:+op-u8-ref+ #:+op-u8-set+
    #:+op-set-cenv+ #:+op-get-cenv+
    #:+op-set-nargs+ #:+op-get-nargs+
    #:+op-trap+
@@ -92,6 +93,7 @@
    #:mvm-obj-tag #:mvm-obj-subtag
    #:mvm-aref #:mvm-aset #:mvm-array-len
    #:+op-alloc-array+ #:mvm-alloc-array
+   #:mvm-alloc-u8 #:mvm-u8-ref #:mvm-u8-set
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-write-barrier #:mvm-mcgc-collect
@@ -382,6 +384,13 @@
 (defconstant +op-subs+   #xC6)  ; (subs  Vd Va Vb) - Vd = Va-Vb, sets V on signed overflow
 (defconstant +op-bvs+    #xC7)  ; (bvs   off32)    - branch if V set (last :adds/:subs overflowed)
 
+;; Byte-packed (unsigned-byte 8) vector (subtag #x11).  Payload is N raw
+;; bytes at raw+16; object size = align16(16 + N).  See runtime/tags.lisp
+;; +subtag-u8-vector+.
+(defconstant +op-alloc-u8+ #xC8) ; (alloc-u8 Vd Vs) - allocate u8 vector, N bytes = Vs (tagged fixnum)
+(defconstant +op-u8-ref+   #xC9) ; (u8-ref Vd Varr Vidx) - load byte at raw+16+idx → tagged fixnum
+(defconstant +op-u8-set+   #xCA) ; (u8-set Varr Vidx Vval) - store low byte of Vval (tagged) at raw+16+idx
+
 ;;; ============================================================
 ;;; Opcode Metadata Table
 ;;; ============================================================
@@ -555,6 +564,11 @@
 (defopcode :adds  #xC5 (:reg :reg :reg) "Add tagged fixnums, set V on signed overflow")
 (defopcode :subs  #xC6 (:reg :reg :reg) "Sub tagged fixnums, set V on signed overflow")
 (defopcode :bvs   #xC7 (:off32)         "Branch if last :adds/:subs overflowed")
+
+;; Byte-packed (unsigned-byte 8) vector (subtag #x11).
+(defopcode :alloc-u8 #xC8 (:reg :reg)      "Allocate u8 vector (subtag #x11), N bytes in reg")
+(defopcode :u8-ref   #xC9 (:reg :reg :reg) "Load byte from u8 vector → tagged fixnum")
+(defopcode :u8-set   #xCA (:reg :reg :reg) "Store byte into u8 vector (value tagged fixnum)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -965,6 +979,15 @@
 
 (defun mvm-alloc-array (buf vd vcount)
   (encode-instruction buf +op-alloc-array+ vd vcount))
+
+(defun mvm-alloc-u8 (buf vd vs)
+  (encode-instruction buf +op-alloc-u8+ vd vs))
+
+(defun mvm-u8-ref (buf vd varr vidx)
+  (encode-instruction buf +op-u8-ref+ vd varr vidx))
+
+(defun mvm-u8-set (buf varr vidx vval)
+  (encode-instruction buf +op-u8-set+ varr vidx vval))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

@@ -2244,6 +2244,125 @@
            (emit-lea buf d +scratch-reg+ #x09)
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-alloc-u8+)
+         ;; (alloc-u8 Vd Vcount) — byte-packed (unsigned-byte 8) vector.
+         ;; Vcount is a TAGGED fixnum (the element/byte count N).  Object
+         ;; layout: header at [R12] = (N << 8) | #x11, then 8-byte padding,
+         ;; then N packed bytes starting at +16.  Total size = align16(16+N).
+         ;; Modeled on +op-alloc-array+ (same push-R12 / push-count ordering
+         ;; to avoid the d==RAX clobber) but the SIZE is bytes not words and
+         ;; the header COUNT is the byte count itself.
+         (let* ((vd (first operands))
+                (vcount (second operands))
+                (d (dest-phys-or-scratch vd))
+                (pc (vreg-phys vcount)))
+           ;; Save R12-old (u8-vector base) for the final LEA.
+           (emit-push buf 'r12)
+           ;; Load TAGGED count into scratch, untag → N.
+           (if pc
+               (emit-mov-reg-reg buf +scratch-reg+ pc)
+               (emit-load-vreg buf vcount +scratch-reg+))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)   ; untag: scratch = N
+           ;; Save N on stack (clobbered by header build).
+           (emit-push buf +scratch-reg+)
+           ;; Build header: (N << 8) | #x11.
+           (emit-shl-reg-imm buf +scratch-reg+ 8)
+           (emit-or-reg-imm buf +scratch-reg+ #x11)  ; u8-vector subtag
+           (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; MCGC object-start bit (R12 still = base).
+           (emit-mcgc-set-start-bit buf 'r12)
+           ;; Restore N, compute allocation size = align16(16 + N).
+           (emit-pop buf +scratch-reg+)              ; scratch = N
+           (emit-add-reg-imm buf +scratch-reg+ 16)   ; header+pad = 16
+           (emit-add-reg-imm buf +scratch-reg+ 15)   ; round up
+           (emit-and-reg-imm buf +scratch-reg+ -16)  ; align to 16
+           (emit-add-reg-reg buf 'r12 +scratch-reg+) ; advance alloc ptr
+           ;; Recover R12-old (base).
+           (emit-pop buf +scratch-reg+)
+           ;; ---- Zero-initialise the payload (CRITICAL for GC correctness) ----
+           ;; Same rationale as +op-alloc-array+: the caller writes bytes
+           ;; AFTER this returns; any intervening alloc can trigger the flat
+           ;; Cheney scan, which would read still-uninitialised payload as
+           ;; roots.  Zero every 8-byte word from base+8 up to the new R12
+           ;; (the whole object is 16-aligned so this covers pad + all N
+           ;; payload bytes + any tail).  RAX=base; R12=new top.
+           (emit-push buf 'rcx)
+           (emit-push buf 'rdx)
+           (emit-lea buf 'rcx +scratch-reg+ 8)        ; rcx = base + 8
+           (emit-bytes buf #x48 #x31 #xD2)            ; xor rdx, rdx
+           (emit-zero-word-range buf 'rcx 'r12 'rdx)
+           (emit-pop buf 'rdx)
+           (emit-pop buf 'rcx)
+           ;; Result = base | object-tag.
+           (emit-lea buf d +scratch-reg+ #x09)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-u8-ref+)
+         ;; (u8-ref Vd Varr Vidx) — load one byte from a u8 vector.
+         ;; Byte address = (Varr - 9) + 16 + real_idx.
+         ;; Vidx is a TAGGED fixnum (real_idx*2), so real_idx = Vidx >> 1.
+         ;; Result is a TAGGED fixnum (byte << 1), matching mem-ref :u8.
+         (let* ((vd (first operands))
+                (varr (second operands))
+                (vidx (third operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; scratch = real_idx = Vidx >> 1
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           ;; scratch += Varr; effective byte addr = scratch + 7 (= -9+16).
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           ;; movzx eax, byte [scratch + 7]; tag (add rax,rax); mov d, rax
+           (emit-bytes buf #x0F #xB6 #x40 #x07)   ; movzx eax, byte [scratch+7]
+           (emit-bytes buf #x48 #x01 #xC0)        ; add rax, rax (tag as fixnum)
+           (emit-mov-reg-reg buf d 'rax)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-u8-set+)
+         ;; (u8-set Varr Vidx Vval) — store the low byte of Vval into a u8
+         ;; vector.  Byte address = (Varr - 9) + 16 + real_idx = Varr + idx + 7.
+         ;; Vidx and Vval are TAGGED fixnums; untag both (SAR 1) before use.
+         ;; +scratch-reg+ IS RAX, so we build the ADDRESS in RAX and hold the
+         ;; VALUE in RDX (as +op-sap-set8+ does), then `mov [rax+7], dl`.
+         (let* ((varr (first operands))
+                (vidx (second operands))
+                (vval (third operands)))
+           ;; RAX (scratch) = real_idx = Vidx >> 1
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-sar-reg-imm buf +scratch-reg+ 1)
+           ;; RAX += Varr (effective addr = RAX + 7)
+           (let ((pobj (vreg-phys varr)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf varr 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           ;; RDX = untagged value.  Load into RDX first, untag.
+           (let ((pv (vreg-phys vval)))
+             (if pv
+                 (emit-mov-reg-reg buf 'rdx pv)
+                 (progn
+                   ;; emit-load-vreg targets RDX directly (a spill load reads
+                   ;; from [rbp+slot], does not touch RAX-address).
+                   (emit-load-vreg buf vval 'rdx))))
+           (emit-sar-reg-imm buf 'rdx 1)          ; untag value
+           ;; mov [rax+7], dl   →  88 50 07
+           (emit-bytes buf #x88 #x50 #x07)))
+
         ((op= +op-set-cenv+)
          ;; Set R13 (closure-env reg) from Vs.  R13 is reserved for
          ;; passing the closure env-list across funcall — caller writes
@@ -4906,11 +5025,32 @@
       ;; Element count = header >> 8
       (emit-mov-reg-reg buf 'r8 'rax)            ; r8 = header
       (emit-shr-reg-imm buf 'r8 8)               ; r8 = element count
-      ;; Total size = (count + 2) * 8, aligned to 16
-      (emit-add-reg-imm buf 'r8 2)               ; count + 2
-      (emit-shl-reg-imm buf 'r8 3)               ; * 8
-      (emit-add-reg-imm buf 'r8 15)              ; + 15
-      (emit-and-reg-imm buf 'r8 -16)             ; & ~15 (align to 16)
+      ;; ---- Byte-packed (unsigned-byte 8) vector special-case (subtag #x11)
+      ;; For a u8 vector the element count is a BYTE count and the object
+      ;; size is align16(16 + N), NOT the word formula align16((N+2)*8).
+      ;; RAX still holds the full header; R9 is a free scratch (not in the
+      ;; copy_object register contract — rax/rdx/rsi/rcx/r8/r13/rdi).  Test
+      ;; the low subtag byte; if #x11, compute the byte size and skip the
+      ;; word-size path.  All other subtags fall through unchanged (purely
+      ;; additive).
+      (let ((u8-size (make-label))
+            (size-done (make-label)))
+        (emit-mov-reg-reg buf 'r9 'rax)          ; r9 = header
+        (emit-and-reg-imm buf 'r9 #xFF)          ; r9 = subtag byte
+        (emit-cmp-reg-imm buf 'r9 #x11)          ; u8-vector?
+        (emit-jcc buf :e u8-size)
+        ;; ---- General (word) object: size = (count + 2) * 8, align 16 ----
+        (emit-add-reg-imm buf 'r8 2)             ; count + 2
+        (emit-shl-reg-imm buf 'r8 3)             ; * 8
+        (emit-add-reg-imm buf 'r8 15)            ; + 15
+        (emit-and-reg-imm buf 'r8 -16)           ; & ~15 (align to 16)
+        (emit-jmp buf size-done)
+        ;; ---- u8 vector: size = align16(16 + N) ----
+        (emit-label buf u8-size)
+        (emit-add-reg-imm buf 'r8 16)            ; 16 (header + padding) + N
+        (emit-add-reg-imm buf 'r8 15)            ; + 15
+        (emit-and-reg-imm buf 'r8 -16)           ; & ~15 (align to 16)
+        (emit-label buf size-done))
       ;; ---- Conservative-scan sanity guard (CRITICAL) ----
       ;; The stack-root scan is conservative: it treats ANY stack word with
       ;; low nibble 1/9 that lands in [from_start, from_end) as a heap
@@ -5869,11 +6009,26 @@
       (emit-cmp-reg-imm buf 'r8 #x0F)
       (emit-jcc buf :e copy-fwd)
       (emit-mov-reg-reg buf 'r8 'rax)
-      (emit-shr-reg-imm buf 'r8 8)
-      (emit-add-reg-imm buf 'r8 2)
-      (emit-shl-reg-imm buf 'r8 3)
-      (emit-add-reg-imm buf 'r8 15)
-      (emit-and-reg-imm buf 'r8 -16)
+      (emit-shr-reg-imm buf 'r8 8)               ; r8 = element count
+      ;; Byte-packed u8 vector (subtag #x11): size = align16(16 + N).  RAX
+      ;; still holds the header; R9 is free in this (pinning) copy variant
+      ;; too.  Purely additive — non-#x11 objects use the word formula.
+      (let ((u8-size (make-label))
+            (size-done (make-label)))
+        (emit-mov-reg-reg buf 'r9 'rax)
+        (emit-and-reg-imm buf 'r9 #xFF)
+        (emit-cmp-reg-imm buf 'r9 #x11)
+        (emit-jcc buf :e u8-size)
+        (emit-add-reg-imm buf 'r8 2)
+        (emit-shl-reg-imm buf 'r8 3)
+        (emit-add-reg-imm buf 'r8 15)
+        (emit-and-reg-imm buf 'r8 -16)
+        (emit-jmp buf size-done)
+        (emit-label buf u8-size)
+        (emit-add-reg-imm buf 'r8 16)
+        (emit-add-reg-imm buf 'r8 15)
+        (emit-and-reg-imm buf 'r8 -16)
+        (emit-label buf size-done))
       ;; sanity: SOURCE raw + size <= data_end else bogus (corrupt source guard)
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-add-reg-reg buf 'rax 'r8)

@@ -429,7 +429,7 @@
   (format t "~%Reference translation (SBCL side)...~%")
   (let ((fn-table-for-translator
          (mapcar (lambda (fi)
-                   (list (mvm-function-info-name-hash fi)
+                   (list (string (mvm-function-info-name fi))
                          (mvm-function-info-bytecode-offset fi)
                          (mvm-function-info-bytecode-length fi)))
                  fn-table)))
@@ -490,24 +490,30 @@
                                  (* (logxor hash (aref a64-bytes i)) 16777619))))
             (format t "  SBCL-side AArch64 FNV-1a: ~D~%" hash))))))
 
-  ;; i386 reference translation (SBCL side)
+  ;; i386 reference translation (SBCL side) — diagnostic FNV census only.
+  ;; Guarded: the i386 translator uses a fixed-size buffer that the (growing)
+  ;; fixpoint source can overflow.  Not needed for the x64/aarch64 Gen0 image.
   (format t "~%i386 reference translation (SBCL side)...~%")
-  (let ((i386-fn-table-for-translator
-         (mapcar (lambda (fi)
-                   (list (mvm-function-info-name-hash fi)
-                         (mvm-function-info-bytecode-offset fi)
-                         (mvm-function-info-bytecode-length fi)))
-                 fn-table)))
-    (multiple-value-bind (i386-buf i386-fn-map)
-        (modus.mvm.i386::translate-mvm-to-i386 bytecode i386-fn-table-for-translator)
-      (let* ((i386-size (modus.mvm.i386::i386-buffer-position i386-buf))
-             (i386-bytes (modus.mvm.i386::i386-buffer-bytes i386-buf)))
-        (format t "  SBCL-side i386 native: ~D bytes~%" i386-size)
-        (let ((hash 2166136261))
-          (dotimes (i i386-size)
-            (setf hash (logand #xFFFFFFFF
-                               (* (logxor hash (aref i386-bytes i)) 16777619))))
-          (format t "  SBCL-side i386 FNV-1a: ~D~%" hash)))))
+  (handler-case
+      (let ((i386-fn-table-for-translator
+             (mapcar (lambda (fi)
+                       (list (string (mvm-function-info-name fi))
+                             (mvm-function-info-bytecode-offset fi)
+                             (mvm-function-info-bytecode-length fi)))
+                     fn-table)))
+        (multiple-value-bind (i386-buf i386-fn-map)
+            (modus.mvm.i386::translate-mvm-to-i386 bytecode i386-fn-table-for-translator)
+          (declare (ignore i386-fn-map))
+          (let* ((i386-size (modus.mvm.i386::i386-buffer-position i386-buf))
+                 (i386-bytes (modus.mvm.i386::i386-buffer-bytes i386-buf)))
+            (format t "  SBCL-side i386 native: ~D bytes~%" i386-size)
+            (let ((hash 2166136261))
+              (dotimes (i i386-size)
+                (setf hash (logand #xFFFFFFFF
+                                   (* (logxor hash (aref i386-bytes i)) 16777619))))
+              (format t "  SBCL-side i386 FNV-1a: ~D~%" hash)))))
+    (error (e)
+      (format t "  (i386 reference translation SKIPPED: ~A)~%" e)))
 
   ;; Phase 2: Assemble fixpoint image for Gen0 architecture
   (format t "~%Phase 2: Assembling fixpoint kernel image (~A)...~%"

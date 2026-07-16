@@ -1245,6 +1245,78 @@
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
+;;; ============================================================
+;;; 5a. WS5 STAGE 3: strip HOST-ONLY package qualifiers from the self-source
+;;; so Modus's own reader (which has no SB-KERNEL / SB-IMPL / SB-INT / SB-EXT
+;;; packages) can READ it.  These qualifiers name SBCL internals used only by
+;;; BUILD-TIME-ONLY, in-image-DEAD compiler helpers (ieee-float-* overridden by
+;;; *stage2-float-override*; the SBCL backquote expander replaced in-image by
+;;; runtime-bq-expand).  In-image the flat reader would error `Package SB-KERNEL
+;;; does not exist` and SKIP the enclosing defun (+ cascade).  HOST-SAFE: the
+;;; SBCL host build only COMPILES these dead defuns (a call to a name-hashed
+;;; symbol it never runs) — byte-neutral for the shipped image.  Longer prefixes
+;;; first so `::' variants win over `:'.
+(let ((n-before (length *full-source*)))
+  (dolist (pfx '("sb-kernel::" "sb-impl::" "sb-int::" "sb-ext::" "sb-sys::"
+                 "sb-kernel:"  "sb-impl:"  "sb-int:"  "sb-ext:"  "sb-sys:"
+                 "SB-KERNEL::" "SB-IMPL::" "SB-INT::" "SB-EXT::" "SB-SYS::"
+                 "SB-KERNEL:"  "SB-IMPL:"  "SB-INT:"  "SB-EXT:"  "SB-SYS:"))
+    (setf *full-source* (%cli-strip-one-prefix *full-source* pfx)))
+  (format t "WS5-S3: stripped host-only SB-* package qualifiers (~D chars removed)~%"
+          (- n-before (length *full-source*))))
+
+;;; ============================================================
+;;; 5b. WS5 STAGE 3: pre-expand `#.<SYMBOL>` read-time-eval sites so the
+;;; SELF-SOURCE is cleanly re-readable BY MODUS ITSELF.  The only real `#.`
+;;; read-eval forms are the ~95 `#.+op-NAME+` case keys in mvm/interp.lisp's
+;;; mvm-interpret dispatch — ISA opcode DEFCONSTANTs.  In-image `defconstant`
+;;; only folds its value into the compiler's *constants* table and emits NO
+;;; runtime binding (CLAUDE.md limitation #7), so the in-image reader's
+;;; `(eval '+op-nop+)` is UNBOUND and SKIPs the whole mvm-interpret form (+
+;;; cascade READER-ERRORs).  Fix: textually replace each `#.<sym>` bound in
+;;; :MODUS.MVM with its host-evaluated literal — EXACTLY what the host reader
+;;; already produced, so byte-identical for the baked image build.  `#.(<list>)`
+;;; forms and unbound-symbol `#.` sites (none today) are left verbatim.
+(defun %selfhost-expand-read-eval-consts (text)
+  (let ((out (make-string-output-stream))
+        (pos 0)
+        (len (length text))
+        (n-expanded 0))
+    (loop
+      (let ((p (search "#." text :start2 pos)))
+        (unless p
+          (write-string (subseq text pos) out)
+          (return))
+        (write-string (subseq text pos p) out)
+        (let ((tstart (+ p 2)))
+          (if (or (>= tstart len)
+                  (let ((c (char text tstart)))
+                    (or (char= c #\() (char= c #\)) (char= c #\Space)
+                        (char= c #\Newline) (char= c #\Tab) (char= c #\")
+                        (char= c #\;))))
+              (progn (write-string "#." out) (setf pos tstart))
+              (let ((tend tstart))
+                (loop while (and (< tend len)
+                                 (let ((c (char text tend)))
+                                   (not (or (char= c #\() (char= c #\)) (char= c #\Space)
+                                            (char= c #\Newline) (char= c #\Tab)
+                                            (char= c #\") (char= c #\;)))))
+                      do (incf tend))
+                (let* ((tok (subseq text tstart tend))
+                       (sym (find-symbol (string-upcase tok) :modus.mvm)))
+                  (if (and sym (boundp sym))
+                      (progn (prin1 (symbol-value sym) out) (incf n-expanded))
+                      (progn (write-string "#." out) (write-string tok out)))
+                  (setf pos tend)))))))
+    (values (get-output-stream-string out) n-expanded)))
+
+(multiple-value-bind (expanded n)
+    (%selfhost-expand-read-eval-consts *full-source*)
+  (setf *full-source* expanded)
+  (format t "WS5-S3: pre-expanded ~D `#.<const>` read-eval site(s); ~
+            full source now ~D chars~%"
+          n (length *full-source*)))
+
 ;; WS5 STAGE 3: dump the exact baked self-source to a file (for `modus --compile
 ;; <self-source> modus2`) and exit before the slow image build.  Env-guarded so
 ;; normal builds are unaffected.

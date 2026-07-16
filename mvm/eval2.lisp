@@ -55,7 +55,20 @@
 ;;; byte-for-byte behavior-identical to before.
 (defvar *use-jit* nil
   "WS4-S5b: T = execute compiled eval2 modules as native JIT'd code (with
-   interpret fallback on any error); NIL = pure mvm-interpret (unchanged).")
+   interpret fallback on any error); NIL = pure mvm-interpret (unchanged).
+   NB: the seam gates on the FUNCTION %jit-enabled-p (below), not on this
+   special directly — a global-variable setq in kernel-main did NOT reliably
+   propagate to eval2's compiled read in the ANSI image (the value stayed NIL),
+   whereas a defun resolves through the proven SFT (name-hash) path.  This
+   special is kept for documentation / an alternate runtime override; the
+   default %jit-enabled-p returns its value if bound, else NIL.")
+
+(defun %jit-enabled-p ()
+  "WS4-S5b JIT gate.  The build OVERRIDES this defun (build-x64-linux.lisp,
+   baked from MODUS_USE_JIT) to return T or NIL — last-defun-wins.  This base
+   version honors *use-jit* if it is set (an alternate override point), else
+   NIL (safe default: pure interpret)."
+  (and (boundp (quote *use-jit*)) *use-jit*))
 
 (defvar *jit-page-cache* nil
   "WS4-S5b per-module JIT cache.  EQ hash keyed by the compiled BC byte-array
@@ -295,7 +308,7 @@
          (%lam (cadr (cddddr tuple)))
          ;; WS4-S5b: when *use-jit*, run native; fall back to interpret on ANY
          ;; error (unsupported form / MV form / page-build failure).
-         (%prim (if *use-jit*
+         (%prim (if (%jit-enabled-p)
                     (handler-case (%eval2-jit-run %bc %entry %ftl %fnt %rt %lam t)
                       (t (c)
                          (%mvm-wrap-escaping-result
@@ -719,7 +732,7 @@
                             (setq *e2-active-defun-names* persist-names)
                             ;; WS4-S5b: JIT when enabled, interpret-fallback on
                             ;; any error (page-build fail / MV form / unsupported).
-                            (if *use-jit*
+                            (if (%jit-enabled-p)
                                 (handler-case
                                     (%eval2-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil)

@@ -418,6 +418,33 @@
        (%call-interp-closure (car (%get-cenv)) (cdr form)))
       (t (%signal-program-error)))))
 
+(defun %compiler-macro-shim (&rest args)
+  "Wrapper MACRO-FUNCTION returns for macros the Modus compiler
+   implements directly (compiler-macro markers / build-time test-source
+   defmacros: LOOP, WHEN, COND, PUSH, DEFMACRO, …).  These have NO
+   runtime macro expander — the compiler expands them at compile time.
+
+   CLHS §macro-function requires the result to be a FUNCTION, never the
+   boolean T; returning bare T made `(funcall (macro-function 'defmacro)
+   …)` and MACROEXPAND of such a form (MACROEXPAND funcalls
+   MACRO-FUNCTION's result — cl-eval.lisp:588) transfer control to the T
+   bit-pattern (0xDEAD1009, tag 9) → funcall-of-T SIGSEGV, previously
+   MASKED by the boot SIGSEGV handler's fault-and-recover (which made
+   the surrounding SIGNALS-ERROR see a spurious error → false pass, and
+   polluted the shared crash-record page → mis-stamped neighbor tests).
+
+   Since no runtime expander exists, invoking this expander signals
+   PROGRAM-ERROR.  This makes MACROEXPAND of a compiler-implemented
+   macro Modus can't expand at runtime raise honestly instead of
+   crashing or looping (the returned closure is truthful about
+   macro-ness, so MACROEXPAND's `(if mf …)` still enters the funcall),
+   and covers the CLHS §3.1.2.1.2.2 wrong-arity cases (0/1/3+ args) too.
+   The ANSI loop.4.7/4.8 and loop.5.error.3/4 tests — `(signals-error
+   (macroexpand '(loop <malformed>)) program-error)` — now pass because
+   this genuinely signals, not because of a recovered SIGSEGV."
+  (declare (ignore args))
+  (%signal-program-error))
+
 (defun %raw-macro-expander (sym)
   "Internal-only: return the raw expander stored for SYM, or NIL.
    Bypasses the user-facing closure wrapping that macro-function
@@ -481,7 +508,11 @@
              (t nil))))
       (cond
         ((null raw) nil)
-        ((eq raw t) t)                                     ; compiler-macro marker
+        ;; Compiler-macro marker: no runtime expander exists.  Return a
+        ;; real closure (NOT bare T — that funcall-of-T SIGSEGVs) that is
+        ;; truthful about macro-ness and arity-checks per CLHS.
+        ((eq raw t)
+         (%make-closure #'%compiler-macro-shim (cons nil nil)))
         ;; Runtime-defmacro expanders are %interp-closures.  Wrap via
         ;; %interp-macro-shim so user-facing funcall sees a real closure
         ;; object (subtag #x52) instead of the bare %interp-closure

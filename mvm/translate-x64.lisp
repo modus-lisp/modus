@@ -2331,8 +2331,16 @@
          ;; (u8-set Varr Vidx Vval) — store the low byte of Vval into a u8
          ;; vector.  Byte address = (Varr - 9) + 16 + real_idx = Varr + idx + 7.
          ;; Vidx and Vval are TAGGED fixnums; untag both (SAR 1) before use.
-         ;; +scratch-reg+ IS RAX, so we build the ADDRESS in RAX and hold the
-         ;; VALUE in RDX (as +op-sap-set8+ does), then `mov [rax+7], dl`.
+         ;;
+         ;; CLOBBER CONTRACT: this op must clobber ONLY +scratch-reg+ (RAX) —
+         ;; the same convention as +op-aset+ — so the register allocator can
+         ;; keep a live value in any V-phys-reg (RDX included) across it.  The
+         ;; original template held the value in RDX, which corrupted a live
+         ;; caller value when a u8-set (e.g. a byte-packed STRING literal built
+         ;; at a call site) executed while RDX held an argument.  We instead
+         ;; build the ADDRESS in RAX and hold the VALUE in R13, push/pop-saved
+         ;; exactly like +op-aset+ uses R13 for spilled operands.  R13b store:
+         ;; `mov [rax+7], r13b` = 44 88 68 07.
          (let* ((varr (first operands))
                 (vidx (second operands))
                 (vval (third operands)))
@@ -2351,17 +2359,16 @@
                    (emit-load-vreg buf varr 'r13)
                    (emit-add-reg-reg buf +scratch-reg+ 'r13)
                    (emit-pop buf 'r13))))
-           ;; RDX = untagged value.  Load into RDX first, untag.
+           ;; R13 = untagged value (R13 saved/restored so no V-reg is clobbered).
+           (emit-push buf 'r13)
            (let ((pv (vreg-phys vval)))
              (if pv
-                 (emit-mov-reg-reg buf 'rdx pv)
-                 (progn
-                   ;; emit-load-vreg targets RDX directly (a spill load reads
-                   ;; from [rbp+slot], does not touch RAX-address).
-                   (emit-load-vreg buf vval 'rdx))))
-           (emit-sar-reg-imm buf 'rdx 1)          ; untag value
-           ;; mov [rax+7], dl   →  88 50 07
-           (emit-bytes buf #x88 #x50 #x07)))
+                 (emit-mov-reg-reg buf 'r13 pv)
+                 (emit-load-vreg buf vval 'r13)))
+           (emit-sar-reg-imm buf 'r13 1)          ; untag value
+           ;; mov [rax+7], r13b  →  44 88 68 07
+           (emit-bytes buf #x44 #x88 #x68 #x07)
+           (emit-pop buf 'r13)))
 
         ((op= +op-set-cenv+)
          ;; Set R13 (closure-env reg) from Vs.  R13 is reserved for

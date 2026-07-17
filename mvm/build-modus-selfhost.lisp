@@ -889,6 +889,14 @@
   (%init-packages)
   (%init-streams)
   (%init-reader)
+  ;; WS5 self-host: READ our own source, which carries host-only package
+  ;; qualifiers (modus.asm:… / modus.mvm.x64::…) for packages that don't exist
+  ;; in the collapsed single-package image.  Lenient mode interns the bare name
+  ;; in *PACKAGE* instead of a reader-error, so those ~44 cross.lisp /
+  ;; boot-linux-x64 forms READ (were being SKIPped → calls resolved to
+  ;; %unresolved-fn → NIL → TYPE-ERROR NIL during build-image).  ANSI-gate
+  ;; images never set this (defvar default NIL), so they stay byte-identical.
+  (setq *reader-missing-package-lenient* t)
   (%init-condition-types)
   (%init-method-combinations)
   (%init-symbol-function-table)

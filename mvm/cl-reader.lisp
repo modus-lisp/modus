@@ -12,6 +12,17 @@
 (defvar *read-base* nil)
 (defvar *read-suppress* nil)
 (defvar *read-eval* nil)
+;; WS5 self-host: when non-nil, a package-qualified token `PKG:NAME` /
+;; `PKG::NAME` whose PKG does NOT exist interns NAME in *PACKAGE* instead of
+;; signalling a reader-error.  This lets the single-package self-host image
+;; READ its own source, which carries host-only package qualifiers
+;; (modus.asm:make-code-buffer, modus.mvm.x64::*x64-call-relocs*, etc.) that
+;; resolve to those packages only under SBCL — in the collapsed single-package
+;; Modus image the qualifier is redundant (last-defun-wins already unifies the
+;; names).  DEFAULT NIL: the ANSI gate keeps strict CLHS behaviour (unknown
+;; package → reader-error), so gate builds are byte-identical.  The selfhost
+;; kernel-main sets it T.
+(defvar *reader-missing-package-lenient* nil)
 (defvar *read-default-float-format* nil)
 ;; CLHS 2.2 step 9 / 23.1: a single whitespace char that *terminates* a
 ;; token is DISCARDED by `read`/`read-from-string` but PRESERVED (unread)
@@ -1108,9 +1119,15 @@
                  ;; must NOT signal.  ASDF/uiop rely on this constantly:
                  ;; #+clisp (system::setf-function …) must skip cleanly
                  ;; on non-clisp.  Result is discarded, NIL suffices.
-                 (if *read-suppress*
-                     nil
-                     (%reader-error "package not found"))
+                 (cond
+                   (*read-suppress* nil)
+                   ;; WS5 self-host lenient mode: unknown package → intern the
+                   ;; bare NAME in *PACKAGE* (the qualifier is redundant in the
+                   ;; collapsed single-package image).  Default-off, so the
+                   ;; ANSI gate still signals per CLHS.
+                   (*reader-missing-package-lenient*
+                    (intern sym-name *package*))
+                   (t (%reader-error "package not found")))
                  ;; Both pkg::sym and pkg:sym intern directly.  The
                  ;; single-colon branch MUST NOT call (find-symbol name
                  ;; pkg): cl-reader compiles before cl-packages, so that

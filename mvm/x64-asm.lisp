@@ -33,16 +33,30 @@
    copies the existing bytes when the current array is too small."
   (let* ((bytes (code-buffer-bytes buf))
          (cap (length bytes)))
+    (when (null bytes)
+      (format t "  DBG-CBE: code-buffer-bytes is NIL on entry, pos=~D~%" pos))
     (when (>= pos cap)
       (let ((new-cap cap))
         (loop while (>= pos new-cap) do (setf new-cap (* new-cap 2)))
+        (format t "  DBG-CBE: GROW cap ~D -> ~D (pos=~D)~%" cap new-cap pos)
         (let ((new-bytes (make-array new-cap :element-type '(unsigned-byte 8))))
+          (when (null new-bytes)
+            (format t "  DBG-CBE: !!! make-array returned NIL for new-cap=~D (pos=~D old-cap=~D)~%"
+                    new-cap pos cap))
+          (when (and new-bytes (/= (length new-bytes) new-cap))
+            (format t "  DBG-CBE: !!! make-array length ~D != requested ~D~%"
+                    (length new-bytes) new-cap))
           (replace new-bytes bytes :end1 cap)
-          (setf (code-buffer-bytes buf) new-bytes))))))
+          (setf (code-buffer-bytes buf) new-bytes)
+          (format t "  DBG-CBE: GROW done, new bytes len=~D~%"
+                  (length (code-buffer-bytes buf))))))))
 
 (defun emit-byte (buf byte)
   (let ((pos (code-buffer-position buf)))
     (%code-buffer-ensure buf pos)
+    (when (null (code-buffer-bytes buf))
+      (format t "  DBG-EMIT: code-buffer-bytes NIL at pos=~D~%" pos)
+      (error "emit-byte: code-buffer-bytes is NIL at pos ~D" pos))
     (setf (aref (code-buffer-bytes buf) pos) (ldb (byte 8 0) byte))
     (setf (code-buffer-position buf) (+ pos 1))))
 
@@ -72,6 +86,11 @@
   ;; this assert should never fire under normal builds; if it does,
   ;; the diagnostic beats a triple-fault every time.
   (unless (<= -2147483648 value 2147483647)
+    (format t "  DBG-S32: overflow value=~A minusp=~A fixnump=~A pos=~D val-minus-2G=~A~%"
+            value (minusp value)
+            (typep value 'fixnum)
+            (code-buffer-position buf)
+            (ignore-errors (- value 2147483647)))
     (error "emit-s32: value ~D (#x~X) out of range for signed 32-bit ~
             (rel32 branch would silently truncate); buf position ~D"
            value value (code-buffer-position buf)))
@@ -443,12 +462,19 @@
 ;;; Jumps and Calls
 
 (defun emit-jmp (buf target)
-  "JMP rel32 to label or offset"
+  "JMP rel32 to label or offset.
+   FIX: dispatch on INTEGERP, not (label-p) — the translator ALWAYS passes a
+   label struct (ensure-label-at), never a raw integer offset, so a label-p
+   false-negative at scale must NOT fall to the raw-s32 path (which would
+   subtract the struct pointer → garbage rel32 → emit-s32 range abort)."
   (emit-byte buf #xE9)
-  (if (label-p target)
-      (emit-label-ref-rel32 buf target)
-      ;; For a raw offset, compute relative from end of instruction
-      (emit-s32 buf (- target (+ (code-buffer-position buf) 4)))))
+  (if (integerp target)
+      (emit-s32 buf (- target (+ (code-buffer-position buf) 4)))
+      (progn
+        (unless (label-p target)
+          (format t "  DBG-JMP-FIX: label-p FALSE-NEGATIVE routed to label path pos=~D~%"
+                  (code-buffer-position buf)))
+        (emit-label-ref-rel32 buf target))))
 
 (defun emit-jmp-reg (buf reg)
   "JMP reg (indirect)"
@@ -458,13 +484,15 @@
   (emit-byte buf (modrm #b11 4 (reg-code reg))))
 
 (defun emit-call (buf target)
-  "CALL rel32 to label or offset"
+  "CALL rel32 to label or offset.  Dispatch on INTEGERP (see emit-jmp)."
   (emit-byte buf #xE8)
-  (if (label-p target)
-      (emit-label-ref-rel32 buf target)
-      ;; For a raw offset, compute relative from end of instruction
-      ;; rel32 = target - (current_pos + 4)  (we already emitted E8)
-      (emit-s32 buf (- target (+ (code-buffer-position buf) 4)))))
+  (if (integerp target)
+      (emit-s32 buf (- target (+ (code-buffer-position buf) 4)))
+      (progn
+        (unless (label-p target)
+          (format t "  DBG-CALL-FIX: label-p FALSE-NEGATIVE routed to label path pos=~D~%"
+                  (code-buffer-position buf)))
+        (emit-label-ref-rel32 buf target))))
 
 (defun emit-call-reg (buf reg)
   "CALL reg (indirect)"
@@ -491,9 +519,13 @@
     (unless code
       (error "Unknown condition code: ~A" cc))
     (emit-bytes buf #x0F (+ #x80 code))
-    (if (label-p target)
-        (emit-label-ref-rel32 buf target)
-        (emit-s32 buf (- target 6)))))
+    (if (integerp target)
+        (emit-s32 buf (- target 6))
+        (progn
+          (unless (label-p target)
+            (format t "  DBG-JCC-FIX: label-p FALSE-NEGATIVE routed to label path pos=~D~%"
+                    (code-buffer-position buf)))
+          (emit-label-ref-rel32 buf target)))))
 
 ;;; LEA
 

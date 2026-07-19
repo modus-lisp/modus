@@ -234,6 +234,25 @@
    emits the exact same :li IR as before — native translators see no new opcode
    and output is byte-identical.")
 
+(defvar *static-build-p* nil
+  "WS5: when true, the in-image compiler is doing a STATIC BUILD (`modus
+   --compile` producing a fresh standalone image), NOT runtime eval.  It runs
+   with *eval2-runtime-p* T (so the compiler's own in-image operation branches
+   work), but OUTPUT CODEGEN must be static like the ANSI gate image: bake
+   string/quote constants into the OUTPUT module's constant pool (NOT the
+   runtime *e2-const-pool*, which is empty in the child → garbage) and emit
+   plain SYMBOL-VALUE global reads (NOT %e2-symbol-value-checked).  So the two
+   OUTPUT-codegen sites (compile-quote's :li-const path, compile-variable-ref's
+   checked read) test (and *eval2-runtime-p* (not *static-build-p*)).")
+
+(defvar *ws5-str-bake-min* 0
+  "WS5 GC-corruption threshold PROBE.  In a static build, a quoted STRING whose
+   length is >= this value is BAKED into the serialized constant pool (adds pool
+   DATA to the compile's working set); a shorter string goes to the runtime pool
+   (%e2-const-register — minimal, garbage in child).  0 = bake all (max size).
+   Sweeping this walks the compile size monotonically to bracket the exact size
+   at which the large-working-set GC collection starts corrupting the tail.")
+
 (defvar *eval2-runtime-p* nil
   "When true, mvm-compile-toplevel is running INSIDE the image on behalf of
    eval2 (runtime EVAL), not host-side at build time.  Bound to T (via setq,
@@ -3821,7 +3840,7 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
-       (if *eval2-runtime-p*
+       (if (and *eval2-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; eval2 production-eval semantics (WS3 flip): a global READ of a
            ;; name with NO binding in the symbol-value alist must signal
            ;; UNBOUND-VARIABLE carrying the SYMBOL as :name (cell-error-name.1,
@@ -3850,7 +3869,7 @@
        ;; Implicit global — treat as dynamic variable (auto-register)
        (format t "  WARN: implicit global ~A~%" name)
        (setf (gethash (normalize-name name) *globals*) t)
-       (if *eval2-runtime-p*
+       (if (and *eval2-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
            (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
                                                     (quote ,name))
@@ -5181,7 +5200,9 @@
     ;; re-intern round-trip this replaces was lossy in-image).  Immediates
     ;; above (nil/t/integers/chars/keywords) keep their cheaper paths —
     ;; they are identity-safe by construction.
-    (*eval2-runtime-p*
+    ;; WS5: static build (--compile) falls through to the STATIC constant
+    ;; paths below (bake into the output module) — see *static-build-p*.
+    ((and *eval2-runtime-p* (not *static-build-p*))
      (emit-ir :li-const dest (%e2-const-register value)))
     ;; Non-keyword symbol: intern at runtime to produce a real symbol
     ;; object — tagged with its home package, the way the SBCL/CCL
@@ -5306,6 +5327,28 @@
      ;; For long strings, route through the constant table — same
      ;; path that handles arbitrary literal objects.
      (cond
+       ;; WS5 path-1: in a STATIC self-compile (--compile), route EVERY string
+       ;; through the SERIALIZED constant table (one :li-const), NOT the
+       ;; char-by-char alloc-obj path.  The char-by-char path emits ~3
+       ;; instructions per character, bloating the translator's code buffer so
+       ;; the self-compile crosses the collection-free heap budget → a deep GC
+       ;; fires → corrupts the tail functions' label position slots (kernel-main
+       ;; boot entry → SIGILL; see the GC-scale corruption notes).  :li-const is
+       ;; ONE instruction + compact data in the constant pool → keeps the code
+       ;; buffer small (like the runtime-pool build that boots) AND the string
+       ;; is baked/correct (modus2-host proves :li-const strings work in a
+       ;; static image).  Non-static builds keep char-by-char (the pool routing
+       ;; had CLOS regressions under eval2-runtime; see reference_constant_pool).
+       (*static-build-p*
+        ;; WS5 threshold probe: bake strings >= *ws5-str-bake-min* into the
+        ;; serialized pool (correct, adds working-set DATA); route shorter ones
+        ;; to the runtime pool (minimal code, no data, garbage in child).  L=0
+        ;; bakes all (= p1, 22.4MB); raising L shrinks the compile toward lb.
+        (if (>= (length value) *ws5-str-bake-min*)
+            (let ((idx (length *constant-table*)))
+              (push value *constant-table*)
+              (emit-ir :li-const dest idx))
+            (emit-ir :li-const dest (%e2-const-register value))))
        ((>= (length value) 256)
         (let ((idx (length *constant-table*)))
           (push value *constant-table*)
@@ -15952,8 +15995,17 @@
         (*uwp-cleanups* nil)
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
-        (*init-thunk-names* nil)
         (all-ir nil))
+    ;; NOTE: *init-thunk-names* is intentionally NOT let-bound here.  It is
+    ;; PUSH-mutated from the defvar/defparameter handler in mvm-compile-toplevel
+    ;; (a DIFFERENT function called during phase 1) and read back below to
+    ;; generate init-all-globals.  In-image, a WRITE (setq/push) to a caller's
+    ;; let-bound special from a callee does NOT propagate to the caller's
+    ;; binding (unlike in-place hash mutation — why *globals* etc. are fine as
+    ;; let bindings), so the let-bound version came out EMPTY in-image and
+    ;; init-all-globals was never generated → funcall-of-0 at modus2 boot.
+    ;; Using the plain global (reset per compile) makes push+read share one cell.
+    (setq *init-thunk-names* nil)
 
     ;; Register standard macros (cond, and, or) for this compilation
     (register-mvm-bootstrap-macros)
@@ -16028,20 +16080,28 @@
     ;; with INIT- — that incorrectly included user-defined defuns
     ;; like INIT-SYMBOL-TABLE, which then got re-called at the wrong
     ;; time during init-all-globals and broke boot.
-    (when *init-thunk-names*
-      (let ((init-calls nil))
-        (dolist (thunk-name (nreverse *init-thunk-names*))
-          (format t "  init thunk: ~A~%" thunk-name)
-          (push `(handler-case (,(intern thunk-name :modus.mvm))
-                   (t (c) nil))
-                init-calls))
-        (let* ((result (mvm-compile-toplevel
-                         `(defun init-all-globals ()
-                            ,@(nreverse init-calls))))
-               (info (car result))
-               (ir (cdr result)))
-          (when (and info ir)
-            (setf all-ir (nconc all-ir (list (cons info ir))))))))
+    ;; ALWAYS generate init-all-globals (even with an EMPTY body) — never gate
+    ;; on *init-thunk-names* being non-nil.  Boot calls (init-all-globals)
+    ;; unconditionally; if the fn is absent, #'init-all-globals resolves to a
+    ;; NULL (addr-0) fn pointer → funcall-of-0 SIGSEGV before first output.
+    ;; This bit the IN-IMAGE self-compile: *init-thunk-names* comes out EMPTY
+    ;; there (the special's let*-bound push->read chain in
+    ;; compile-source-to-module behaves differently in-image than host), so the
+    ;; old `when` skipped the defun and modus2 crashed at boot.  An empty
+    ;; init-all-globals is a safe no-op.  (DIAG count exposes the empty case.)
+    (let ((init-calls nil))
+      (format t "  init-all-globals: ~D init thunks~%" (length *init-thunk-names*))
+      (dolist (thunk-name (nreverse *init-thunk-names*))
+        (push `(handler-case (,(intern thunk-name :modus.mvm))
+                 (t (c) nil))
+              init-calls))
+      (let* ((result (mvm-compile-toplevel
+                       `(defun init-all-globals ()
+                          ,@(nreverse init-calls))))
+             (info (car result))
+             (ir (cdr result)))
+        (when (and info ir)
+          (setf all-ir (nconc all-ir (list (cons info ir)))))))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))

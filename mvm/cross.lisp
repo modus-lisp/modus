@@ -100,7 +100,7 @@
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
           (let ((table fn-table)
-                (max-retries 10))
+                (max-retries 1))
             (loop for attempt from 1
                   do (handler-case (return (funcall translator bytecode table))
                        (error (e)
@@ -160,6 +160,13 @@
                         ;; Fallback for functions not in fn-map
                         (let ((total-bc (max 1 (length bytecode)))
                               (total-native (length native-bytes)))
+                          ;; WS5 DIAG: a fn missing from fn-map gets a PROPORTIONAL
+                          ;; offset that can land in the constant-data region → boot
+                          ;; entry / by-name calls jump into data → SIGILL.  Log every
+                          ;; miss so the in-image self-compile's mislocated tail
+                          ;; (KERNEL-MAIN etc.) is named.
+                          (format t "  WS5-FNMAP-MISS ~A bc-off=~D~%"
+                                  name (mvm-function-info-bytecode-offset fn-info))
                           (setf (mvm-function-info-native-offset fn-info)
                                 (truncate (* (mvm-function-info-bytecode-offset fn-info)
                                              total-native) total-bc)))))
@@ -1139,8 +1146,14 @@
           ;; Serial base priority: explicit setf > boot descriptor > QEMU virt default
           (let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base #x09000000)))
             ;; Assemble image
-            (assemble-kernel-image module target-desc
-                                   :boot-descriptor boot-desc)))))))
+            (let ((%img (assemble-kernel-image module target-desc
+                                               :boot-descriptor boot-desc)))
+              ;; DIAG: stash the module's function-table in metadata so callers
+              ;; (the --compile driver) can enumerate compiled fns in-image.
+              (setf (kernel-image-metadata %img)
+                    (list* :fn-table (mvm-module-function-table module)
+                           (kernel-image-metadata %img)))
+              %img)))))))
 
 (defun get-boot-descriptor (target-name)
   "Get the boot descriptor for the given target architecture.

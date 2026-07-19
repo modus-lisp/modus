@@ -270,7 +270,7 @@
 (defconstant +mcgc-cfg-page-base-addr+ #x10000E00)
 (defconstant +mcgc-cfg-bitmap-addr+    #x10000E18)
 
-(defconstant +mcgc-kindbitmap-delta+   #x804000
+(defconstant +mcgc-kindbitmap-delta+   #xFE4000
   "Byte offset from the object-start bitmap base to the CONS-KIND bitmap
    base.  Both bitmaps are +mcgc-bitmap-size+ bytes (1 bit / 16-byte
    granule); the kind bitmap lives in the metadata region just past the
@@ -6343,15 +6343,18 @@
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl)))
                  ;; Emit function label
-                 (emit-label buf fn-label)
+                 (handler-case (emit-label buf fn-label)
+                   (error (c) (error "SETUP-emit-label fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
                  ;; Emit prologue
-                 (emit-function-prologue buf)
+                 (handler-case (emit-function-prologue buf)
+                   (error (c) (error "SETUP-prologue fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
                  ;; If length=0 (orphaned stub with no bytecode), emit an immediate
                  ;; epilogue+ret so we don't fall through into the next function.
                  (when (zerop length)
                    (emit-function-epilogue buf))
                  ;; Pre-scan branch targets
-                 (scan-branch-targets state)
+                 (handler-case (scan-branch-targets state)
+                   (error (c) (error "SETUP-scan fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
                  ;; Translate instructions
                  (let ((pos offset)
                        (limit (+ offset length)))

@@ -86,17 +86,16 @@
 ;; read-time eval, resolved by the readers binding *package* to :modus.mvm
 ;; (cross.lisp check-parses / read-all-forms-with-locations).
 (defvar *isa-source*      (mvm-text "mvm/mvm.lisp"))
-;; WS5: shrink the mvm-buffer :bytes default from 128MB to 64KB.  The default
-;; is inlined into make-mvm-buffer's constructor; a bare (make-mvm-buffer) —
-;; which mvm-compile-all's Phase-3 uses — would allocate a 128MB (unsigned-byte
-;; 8) array, blowing the ~448MB semispace and producing an uncatchable OOM
-;; escape.  Production eval2 dodges this by always passing :bytes explicitly;
-;; the self-host build calls mvm-compile-all, so it hits the default.
-;; mvm-emit-byte grows the array on demand (doubles + copies), so a small
-;; initial size is correct for any program.  Mirrors the WS4 x64-asm code-
-;; buffer shrink.  Build-local: other builds never call bare make-mvm-buffer.
+;; WS5 CODE-BUFFER GC-CORRUPTION FIX (2026-07-19): keep the mvm-buffer at a
+;; size that NEVER GROWS during the self-compile.  Like the x64-asm code
+;; buffer, the 64KB shrink forced doubling grows, and each grow's stale
+;; local-across-make-array/GC-move corrupts the bytecode → wrong native code
+;; for functions compiled after the grow → hang (init-keyword-table deadloop).
+;; The old "128MB blows the 448MB semispace" reasoning is STALE (pre-u8-packing
+;; #183; post-#183 a 128MB u8 array is 128MB, and the semispace is now 896MB).
+;; Keep the original 128MB single up-front alloc → ZERO grows → no corruption.
 (let ((needle "(bytes (make-array 134217728 :element-type '(unsigned-byte 8)))")
-      (repl   "(bytes (make-array 65536 :element-type '(unsigned-byte 8)))"))
+      (repl   "(bytes (make-array 33554432 :element-type '(unsigned-byte 8)))"))
   (let ((p (search needle *isa-source*)))
     (unless p (error "WS5: could not find mvm-buffer 128MB default to shrink"))
     (setf *isa-source*
@@ -169,12 +168,20 @@
 
 ;;; --- x64 instruction encoder (modus.asm) ---
 (defvar *x64-asm-source* (mvm-text "mvm/x64-asm.lisp"))
-;; Shrink the code-buffer's default byte array from 96MB to 64KB — a 96MB
-;; (~768MB tagged) alloc per make-code-buffer would exhaust the ~448MB
-;; semispace.  x64-asm's emit-byte grows on demand, so a small initial
-;; array is correct for any translation size.  (WS4-S1 recipe.)
+;; WS5 CODE-BUFFER GC-CORRUPTION FIX (2026-07-19): size the in-image code
+;; buffer big enough to NEVER GROW.  The old 64KB shrink forced ~16
+;; doubling grows (64KB→16MB), and each grow's `(let ((bytes …))
+;; (make-array new-cap) (replace new-bytes bytes))` can trigger a GC that
+;; MOVES the old buffer while a stale local/struct-slot reference is held →
+;; the copy/emission truncates → all native code after the collection point
+;; is lost (self-compile: code truncated at ~9.5MB, kernel-main zero'd →
+;; SIGILL/hang).  The original "96MB = 768MB tagged, exhausts the 448MB
+;; semispace" reasoning is STALE: post-u8-packing (#183) a 96MB u8 array is
+;; 96MB, and the semispace is now 896MB.  The self-compile's native code is
+;; ~15MB; a 32MB single up-front allocation covers it with NO grow → NO
+;; grow-triggered GC on the buffer → no truncation.
 (let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
-      (repl   "(bytes (make-array 65536 :element-type '(unsigned-byte 8)))"))
+      (repl   "(bytes (make-array 33554432 :element-type '(unsigned-byte 8)))"))
   (let ((p (search needle *x64-asm-source*)))
     (unless p
       (error "WS5-S1: could not find code-buffer 96MB default to shrink"))
@@ -870,7 +877,55 @@
     (if (null src)
         (progn (write-string-serial \"modus --compile: cannot read \")
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+       (progn
+        ;; WS5 SYNTHESIS (minimal change from the clean-booting modus2-lb):
+        ;; leave *eval2-runtime-p* / *mvm-emit-halves* at their eval2-leaked
+        ;; T values (that gives the CHECKED + lazy-bind-nil global read, which
+        ;; boots cleanly and DOESN'T crash on argv — the plain static
+        ;; SYMBOL-VALUE read returned garbage for globals unbound at early boot
+        ;; → wild funcall).  Add ONLY *static-build-p* so compile-quote bakes
+        ;; string/list/symbol literals into the child's OWN code (via the static
+        ;; alloc-obj paths) instead of the runtime *e2-const-pool* (which is
+        ;; EMPTY in the child → garbage strings → flag string= never matched).
+        ;; Net: static strings (work) + checked reads (no crash).
+        ;; C=nil (mvm-emit-halves): the eval2-leaked T makes quoted-symbol
+        ;; literals emit :li-halves + :set-nargs (interpret-path shapes) which
+        ;; the NATIVE translator mis-handles → broken symbol interning → the
+        ;; reader crashes even on bare stdin.  Force nil so symbols emit the
+        ;; plain native raw-:li path (proven OK: modus2-sb & modus2-host).
+        ;; WS5: force the EXACT config modus2-host uses (SBCL build-image with
+        ;; eval2 unused): eval2-runtime-p=nil → compile-quote STATIC + compile-
+        ;; variable-ref plain SYMBOL-VALUE + mvm-emit-halves nil native emit.
+        ;; modus2-host (this config, SBCL-compiled) RUNS; modus2-sb (SAME config,
+        ;; in-image-compiled) crashes on argv → the bug is an IN-IMAGE COMPILER
+        ;; divergence (a mislinked fn), NOT the static/checked read choice.  This
+        ;; build + the FNMAP dump localizes that mislinked fn.
+        ;; WS5: reproduce modus2-sb EXACTLY (eval2-runtime-p leaked T + static
+        ;; strings + static reads + halves nil) but WITH the FNMAP dump, so the
+        ;; identical-across-inputs early wild-jump crash (0x1816bad, RBP=0) can
+        ;; be mapped to a function name in sb's OWN layout.
+        (setq *static-build-p* t)
+        (setq *mvm-emit-halves* nil)
+        ;; WS5 DECISIVE: force eval2-runtime-p NIL for the OUTPUT codegen — the
+        ;; EXACT config modus2-hoststatic uses (which BOOTS + --version works
+        ;; under SBCL).  With path-1 strings (no char-by-char GC-corruption bloat)
+        ;; this is the first clean test of eval2-runtime-p=NIL in-image.  If the
+        ;; resulting modus2 boots+evals → the p1 hang was the eval2-runtime-p T
+        ;; codegen LEAK, not GC corruption.  (Compiler-operation branches that
+        ;; needed T were char-by-char/GC artifacts now removed by path-1.)
+        (setq *eval2-runtime-p* nil)
         (let ((image (build-image :target :linux-x64 :source-text src)))
+          ;; WS5 diag: dump the child's fn map (name → vaddr) so a crash RIP
+          ;; can be resolved.  vaddr = 0x400000 + native-image-offset + off.
+          (let ((fns (getf (kernel-image-metadata image) :fn-table))
+                (nio (or (kernel-image-native-image-offset image) 0)))
+            (when fns
+              (dolist (fi fns)
+                (write-string-serial \"FNMAP \")
+                (print-dec (+ nio (or (mvm-function-info-native-offset fi) 0)))
+                (write-char-serial 32)
+                (write-string-serial (string (mvm-function-info-name fi)))
+                (write-char-serial 10))))
           (let ((bytes (kernel-image-image-bytes image))
                 (fd (%selfhost-open-exec out)))
             (if (< fd 0)
@@ -882,7 +937,7 @@
                   (write-string-serial \"modus: wrote \")
                   (print-dec (length bytes))
                   (write-string-serial \" bytes to \")
-                  (write-string-serial out) (write-char-serial 10))))))))
+                  (write-string-serial out) (write-char-serial 10)))))))))
 (defun kernel-main ()
   (init-symbol-table)
   (init-keyword-table)
@@ -1373,6 +1428,34 @@
 ;; allocation walked all the way to the end — too late for a Cheney
 ;; copy that needs the other half free.
 (setf modus.mvm::*linux-x64-r14-offset* modus.mvm::+linux-x64-gc-midpoint+)
+;; WS5 GC-BISECT knobs (default OFF → normal build unchanged).  Each "=0"
+;; disables one GC mechanism so a parallel sweep can isolate which one
+;; corrupts the tail-function labels at self-compile scale.
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_GC")))
+  (when (and v (string= v "0"))
+    (setf modus.mvm.x64::*x64-gc-enabled* nil)
+    (format t "~&;; WS5-BISECT: *x64-gc-enabled* = NIL (GC fully off)~%")))
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_BITMAP")))
+  (when (and v (string= v "0"))
+    (setf modus.mvm.x64::*mcgc-bitmap-enabled* nil)
+    (format t "~&;; WS5-BISECT: *mcgc-bitmap-enabled* = NIL (no object-start gate)~%")))
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_COLLECTOR")))
+  (when (and v (string= v "0"))
+    (setf modus.mvm.x64::*mcgc-collector-enabled* nil)
+    (format t "~&;; WS5-BISECT: *mcgc-collector-enabled* = NIL~%")))
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_KINDBM")))
+  (when (and v (string= v "0"))
+    (setf modus.mvm.x64::*mcgc-kind-bitmap-enabled* nil)
+    (format t "~&;; WS5-BISECT: *mcgc-kind-bitmap-enabled* = NIL~%")))
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_KINDCHECK")))
+  (when (and v (string= v "0"))
+    (setf modus.mvm.x64::*mcgc-kind-check-enabled* nil)
+    (format t "~&;; WS5-BISECT: *mcgc-kind-check-enabled* = NIL~%")))
+;; WS5 string-bake threshold probe (sweep to bracket the GC-corruption size).
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_STRMIN")))
+  (when (and v (> (length v) 0))
+    (setf modus.mvm::*ws5-str-bake-min* (parse-integer v))
+    (format t "~&;; WS5-PROBE: *ws5-str-bake-min* = ~D~%" modus.mvm::*ws5-str-bake-min*)))
 ;; MCGC page-pinning test knob (stage 4).  OFF by default.  MODUS_MCGC_PINNING=1
 ;; enables the page-pool allocator + page collector for a pinning test build.
 #+sbcl
@@ -1425,6 +1508,22 @@
 #+sbcl
 (let ((cf (sb-ext:posix-getenv "MODUS_COMPILE_FILE")))
   (when (and cf (> (length cf) 0))
+    ;; WS5 DEFINITIVE TEST: MODUS_WS5_STATIC=1 makes this HOST (SBCL) build use
+    ;; the SAME static-build codegen as the in-image `--compile` (all strings →
+    ;; constant-table, static reads), but under SBCL's GC (NO Modus-GC → NO
+    ;; corruption possible).  If the result HANGS/crashes → the bug is in the
+    ;; static codegen path (build-constant-pool short strings etc.), NOT GC.
+    ;; If it WORKS → the in-image failure is GC corruption.
+    (when (let ((v (sb-ext:posix-getenv "MODUS_WS5_STATIC")))
+            (and v (string= v "1")))
+      ;; ONLY *static-build-p* — this alone triggers the string→constant-table
+      ;; path (all strings, since *ws5-str-bake-min*=0).  Do NOT force
+      ;; *eval2-runtime-p* T (its in-image-runtime branches break the SBCL host
+      ;; build).  Leaving it NIL keeps symbols/lists/reads on the normal host
+      ;; static paths — so this isolates EXACTLY the short-string constant-table
+      ;; change under SBCL's GC.
+      (setf modus.mvm::*static-build-p* t)
+      (format t "~&;; WS5-STATIC-TEST: host build, strings→constant-table only~%"))
     (let* ((colon (position #\: cf))
            (inp (subseq cf 0 colon))
            (outp (subseq cf (1+ colon)))

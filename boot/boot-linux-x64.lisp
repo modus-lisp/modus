@@ -24,8 +24,8 @@
 ;; heap_end+0 on the overshoot of the second collection.  16 MB of guard past the
 ;; second from_end is far more than any plausible inter-check overshoot.
 (defconstant +linux-x64-gc-guard+ #x1000000)    ; 16MB guard past the 2nd semispace
-(defconstant +linux-x64-gc-midpoint+ #x1C000000)  ; Midpoint offset from heap base (from/to boundary)
-(defconstant +linux-x64-heap-data-size+ (+ #x38000000 +linux-x64-gc-guard+))  ; 896MB + 16MB guard
+(defconstant +linux-x64-gc-midpoint+ #x38000000)  ; 896MB semispace (2x orig): self-compile ~580MB total alloc fits WITHOUT a collection (avoids the large-working-set-collection corruption). Total mmap 2x896MB+guard ~1.8GB < 2GB imm32 cap.
+(defconstant +linux-x64-heap-data-size+ (+ #x70000000 +linux-x64-gc-guard+))  ; 1792MB + 16MB guard
 (defconstant +linux-x64-heap-alloc-start+ #x200)  ; Offset from heap base to first allocatable byte
 
 ;;; ------------------------------------------------------------
@@ -50,7 +50,7 @@
 ;; Object-start bitmap: 1 bit / 16-byte granule = data_size/16/8 bytes.
 (defconstant +mcgc-bitmap-size+ (truncate +linux-x64-heap-data-size+ (* 16 8)))
 (defconstant +mcgc-freelist-size+ (* +mcgc-page-count+ 4))  ; u32 per page index
-(defconstant +mcgc-meta-size+ #x1800000)        ; 24 MiB metadata region (ample;
+(defconstant +mcgc-meta-size+ #x4000000)        ; 64 MiB metadata region (enlarged for 2x heap: 2x~14.5MB bitmaps + descriptor + freelist ~32MB; was 24 MiB;
                                                 ; holds descriptor + object-start
                                                 ; bitmap + freelist + cons-kind bitmap)
 ;; Offsets (from mmap base) of the metadata arrays, each 64-byte aligned.

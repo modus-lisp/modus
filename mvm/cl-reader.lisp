@@ -205,8 +205,24 @@
 (defvar *standard-readtable* nil)
 (defvar *readtable* nil)
 
+;;; Reader "no value" sentinel — returned by read paths that consume input but
+;;; produce no object (comment skip, suppressed #+/#-, etc.) and checked with
+;;; (eq x *rdr-no-value*).  MUST be a fresh, NON-source-representable object: the
+;;; old `*rdr-no-value*` KEYWORD collided with itself under self-hosting — when
+;;; the in-image reader read the literal keyword `*rdr-no-value*` in the reader's
+;;; OWN source (e.g. `(eq obj *rdr-no-value*)`), it returned the canonical
+;;; keyword == the sentinel, so the value was DROPPED, turning `(eq obj X)` into
+;;; the 1-arg `(eq obj)` → compile-eq baked `(error "wrong number of arguments")`
+;;; into modus2's reader → modus2 couldn't read source or --eval.  A fresh cons
+;;; can never be produced by READ, so no literal can ever alias it.
+(defvar *rdr-no-value* nil)
+
 (defun %init-reader-vars ()
   "Initialize reader/print variables."
+  ;; Fresh unique sentinel object (see *rdr-no-value* defvar).  A cons is never
+  ;; EQ to anything READ can construct, so the self-referential keyword collision
+  ;; is structurally impossible.
+  (setq *rdr-no-value* (cons '%rdr-no-value% nil))
   (setq *read-base* 10)
   (setq *read-suppress* nil)
   (setq *read-eval* t)
@@ -269,7 +285,7 @@
 (defun %rmf-semicolon (stream char)
   (declare (ignore char))
   (%skip-line-comment stream)
-  :%rdr-no-value%)
+  *rdr-no-value*)
 (defun %rmf-sharpsign (stream char)
   (declare (ignore char))
   (%read-sharpsign stream *readtable*))
@@ -486,7 +502,7 @@
 
    No-value protocol (2026-06-10): reader macros that produce nothing —
    #+/#- with a failed feature test, #| |# block comments — return the
-   :%rdr-no-value% sentinel instead of recursively reading the next
+   *rdr-no-value* sentinel instead of recursively reading the next
    form.  The old recursion broke whenever the suppressed form was the
    LAST element of a list: the recursive read hit the closing paren and
    signaled (uiop is full of trailing #+clisp/#+clozure elements).
@@ -502,7 +518,7 @@
              (result (if macro-fn
                          (%read-macro-dispatch-simple macro-fn ch stream *readtable*)
                          (%read-as-token ch stream *readtable*))))
-        (if (eq result :%rdr-no-value%)
+        (if (eq result *rdr-no-value*)
             (let ((next (%read-skip-whitespace stream)))
               (cond
                 ((null next)
@@ -511,7 +527,7 @@
                              eof-value)))
                 ((eql next #\))
                  (unread-char next stream)
-                 (return :%rdr-no-value%))
+                 (return *rdr-no-value*))
                 (t (unread-char next stream))))
             (return result))))))
 
@@ -541,7 +557,7 @@
     ;; dispatcher (the literal `;' is consumed earlier in skip-whitespace).
     ;; Skip to end of line and yield the no-value sentinel so the
     ;; %read-internal loop reads the next form, matching `;'-comment semantics.
-    ((eq fn :semicolon) (%skip-line-comment stream) :%rdr-no-value%)
+    ((eq fn :semicolon) (%skip-line-comment stream) *rdr-no-value*)
     ((eq fn :dispatch) (%read-user-dispatch ch stream rt))
     ((or (functionp fn) (%cl-sym-p fn))
      (let ((result (funcall fn stream ch)))
@@ -1208,18 +1224,18 @@
                (unread-char ch stream)
                (let ((obj (%read-internal stream t nil t)))
                  (when (and (not *read-suppress*)
-                            (not (eq obj :%rdr-no-value%)))
+                            (not (eq obj *rdr-no-value*)))
                    (let ((new-cons (list obj)))
                      (if tail (progn (set-cdr tail new-cons) (setq tail new-cons))
                          (progn (setq result new-cons) (setq tail new-cons))))))))))
         ;; Not close paren and not dot — unread and read an object.
-        ;; :%rdr-no-value% elements (trailing #+failed-form / #|comment|#
+        ;; *rdr-no-value* elements (trailing #+failed-form / #|comment|#
         ;; before the close paren) are dropped — see %read-internal.
         (when (not (eql ch #\.))
           (unread-char ch stream)
           (let ((obj (%read-internal stream t nil t)))
             (when (and (not *read-suppress*)
-                       (not (eq obj :%rdr-no-value%)))
+                       (not (eq obj *rdr-no-value*)))
               (let ((new-cons (list obj)))
                 (if tail (progn (set-cdr tail new-cons) (setq tail new-cons))
                     (progn (setq result new-cons) (setq tail new-cons)))))))))))
@@ -1515,7 +1531,7 @@
         ;; comment before the close paren.
         ((= code 124) ; |
          (%skip-block-comment stream)
-         :%rdr-no-value%)
+         *rdr-no-value*)
         ;; #+ — feature read
         ((= code 43)  ; +
          (%read-feature stream t))
@@ -1677,11 +1693,11 @@
                             (aset v i last-elt))
                         (setq i (+ i 1)))
                       (return v)))))))
-        ;; Read element — drop :%rdr-no-value% (trailing #+failed /
+        ;; Read element — drop *rdr-no-value* (trailing #+failed /
         ;; #|comment|# before the close paren; see %read-internal).
         (unread-char ch stream)
         (let ((obj (%read-internal stream t nil t)))
-          (unless (eq obj :%rdr-no-value%)
+          (unless (eq obj *rdr-no-value*)
             (setq elements (cons obj elements))))))))
 
 (defun %read-character (stream)
@@ -1788,7 +1804,7 @@
        ;; the last element before a close paren.
        (let ((*read-suppress* t))
          (%read-internal stream t nil t))
-       :%rdr-no-value%))))
+       *rdr-no-value*))))
 
 (defun %feature-name-eq (a b)
   "Compare two feature designators.  CLHS says #+ matches with EQ on
@@ -2021,11 +2037,11 @@
             (unless (%whitespace-char-p ch) (return nil)))
           (when (eql ch char)
             (return (nreverse result)))
-          ;; Read an object — drop :%rdr-no-value% sentinel elements
+          ;; Read an object — drop *rdr-no-value* sentinel elements
           ;; (trailing suppressed forms; see %read-internal).
           (unread-char ch s)
           (let ((obj (%read-internal s t nil t)))
-            (unless (eq obj :%rdr-no-value%)
+            (unless (eq obj *rdr-no-value*)
               (setq result (cons obj result)))))))))
 
 (defun read-from-string (str &rest args)

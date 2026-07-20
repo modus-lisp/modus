@@ -1993,11 +1993,23 @@
     ;; sees the eval2 shape: the form compiles NESTED inside %eval2-thunk.
     (mvm-define-macro "DEFCONSTANT"
       (lambda (form)
-        (list 'progn
-              (list '%eval-set-global
-                    (list 'quote (cadr form))
-                    (caddr form))
-              (list 'quote (cadr form)))))
+        ;; WS5 STATIC SELF-HOST: during the static --compile (*static-build-p*
+        ;; T) DECLINE to expand — return FORM unchanged so mvm-compile-toplevel's
+        ;; DEFCONSTANT handler processes it: fold the value into *constants* (so
+        ;; refs like `(ash 255 +fixnum-shift+)` compile to a literal, not a
+        ;; SYMBOL-VALUE read of an unbound global) AND register a boot init-thunk.
+        ;; Without this the macro shadowed the toplevel handler → +fixnum-shift+
+        ;; etc. were unbound in the product's own eval2 → bignum-ash(255,garbage)
+        ;; SIGSEGV compiling the first &rest lambda.  Gated on *static-build-p*
+        ;; (NIL in every ANSI-gate build AND in the product's runtime REPL) so
+        ;; those paths keep the runtime %eval-set-global expansion byte-for-byte.
+        (if *static-build-p*
+            form
+            (list 'progn
+                  (list '%eval-set-global
+                        (list 'quote (cadr form))
+                        (caddr form))
+                  (list 'quote (cadr form))))))
     ;; DEFINE-COMPILER-MACRO (RUNTIME / eval2 only): register the expander in
     ;; the SAME *compiler-macro-function-table* the tree-walker's handler
     ;; uses, so COMPILER-MACRO-FUNCTION / (documentation x 'compiler-macro)
@@ -15538,7 +15550,29 @@
            (when (and (symbolp name)
                       (not (constantp name)))
              (proclaim `(special ,name))
-             (set name value)))))
+             (set name value))
+           ;; WS5 SELF-HOST FIX: constant-folding via *constants* only happens
+           ;; at THIS (build) time.  In a STATIC self-host build the produced
+           ;; binary's runtime *constants* table is empty, so any form the
+           ;; product compiles via eval2 that references a compiler defconstant
+           ;; (+max-reg-args+, +vreg-v0+, …) resolves it as a VARIABLE reference
+           ;; → symbol-value → UNBOUND → garbage (the infinite :stack-store loop
+           ;; at mvm-compile-function-internal `loop … below +max-reg-args+`).
+           ;; So under *static-build-p* register a boot init-thunk (run by
+           ;; init-all-globals) binding the symbol-value to the QUOTED
+           ;; already-evaluated value — generalizing the proven
+           ;; `(setq +max-reg-args+ 4)` band-aid to ALL defconstants.  Guarded on
+           ;; *static-build-p* (NIL in every normal host / ANSI-gate build) so
+           ;; those stay byte-identical.
+           (when *static-build-p*
+             (let ((tmp-var (gensym "INIT-TMP"))
+                   (thunk-name (format nil "INIT-~A" (symbol-name name)))
+                   (name-hash (normalize-name name)))
+               (push thunk-name *init-thunk-names*)
+               (mvm-compile-function
+                thunk-name nil
+                (list `(let ((,tmp-var ',value))
+                         (set-symbol-value ,name-hash ,tmp-var)))))))))
      nil)
 
     ;; (defmacro name (params) body...)

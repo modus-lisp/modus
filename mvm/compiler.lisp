@@ -3744,15 +3744,25 @@
     ;; byte-identical.
     (*static-build-p*
      (cond
-       ((zerop value) (emit-ir :li dest 0))
-       ((> value 0)
+       ;; SMALL (|value| < 2^61): value<<1 can't overflow a fixnum, so form the
+       ;; tagged word at compile time and emit a SINGLE :li — byte-for-byte the
+       ;; same codegen as the non-static path.  This keeps the vast majority of
+       ;; integer literals (all small ones, incl. every literal in MVM-INTERPRET
+       ;; and the runtime lambdas) UNCHANGED; only genuinely large literals take
+       ;; the multi-instruction safe path below.  (An over-broad rewrite of ALL
+       ;; literals to :li+:shl perturbed the interpreter enough to fault.)
+       ((and (< value 2305843009213693952)        ; 2^61
+             (> value -2305843009213693952))
+        (let ((tagged (ash value +fixnum-shift+)))
+          (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))
+       ((> value 0)                               ; large positive
         (emit-ir :li dest value)
         (emit-ir :shl dest dest +fixnum-shift+))
-       ((< value -4611686018427387903)          ; most-negative-fixnum
+       ((< value -4611686018427387903)            ; most-negative-fixnum
         (emit-ir :li dest 1)
         (emit-ir :shl dest dest 63))
-       (t                                         ; other negatives
-        (emit-ir :li dest (- value))              ; positive magnitude
+       (t                                          ; large negative
+        (emit-ir :li dest (- value))               ; positive magnitude
         (emit-ir :shl dest dest +fixnum-shift+)
         (emit-ir :neg dest dest))))
     (*mvm-emit-halves*

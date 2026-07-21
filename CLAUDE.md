@@ -504,6 +504,32 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 7. **defvar init-thunks not run**: `(defvar *foo* 42)` declares `*foo*` but does NOT set it to 42 at boot — `init-all-globals` is skipped. Defvars default to NIL. Initialize required values explicitly via setq in an init function (e.g. `*pkg-tag*`, `*sym-tag*` set in `%init-packages`). Predicates that compare against an uninitialized tag with `(eql (car x) *tag*)` will return T for *any* cons-with-NIL-car — see `%pkg-p` history.
 8. **`compile-ash` inlines `:shl`/`:sar` for small constant counts (≤30) WITHOUT a fixnum tag check — corrupts a BIGNUM value.** `(ash bignum-val small-const-count)` shifts the raw tagged word, which is right for a fixnum (low bit 0) but mangles a bignum pointer (tag 0x9): `(ash (ash 1 200) -1)` :sar's the heap address to garbage, `(ash 2^200 -200)` returns a bogus fixnum. Variable-count and large-constant-count ash already route to runtime `bignum-ash` (correct). The bignum-ash runtime fix (9463e26) makes `(ash 1 N)` produce a CORRECT big bignum, which then SURFACES this latent compiler bug in any code that shifts those bignums by a small constant — `%print-integer-in-base`-adjacent format-runtime paths (format-d/o/x/b chunk-crashes), `gcd.5`/`logcount.7-8` (`(ash 1 200/300)` bounds → big-bignum operands → `(ash x -1)`). **FIX IS A COMPILER CHANGE but every attempt so far BROKE the harness's SIGSEGV-handler longjmp recovery** (a previously-recoverable pre-existing crash in nunion/modules went fatal; the 4x code-size blowup of the source-expansion `(if (fixnump g) (%ash-fixnum-raw g k) (bignum-ash g k))` is the suspected trigger — possibly fn-table/branch-displacement). The individual ash results were CORRECT (probes 9920-9925 passed); only harness recovery regressed. A recovery-safe fix is the open follow-up. Workaround for now: route through `bignum-ash` explicitly when a value may be a bignum.
 
+   **Related open bignum bugs surfaced by the WS5 self-host (2026-07); ALL THREE
+   still need a root fix — they were WORKED AROUND, not fixed. See
+   [[reference_bignum_bug_cluster]] for repro cases.**
+   - **8a. `compile-ash` LEFT-shift overflow (the twin of #8).** `(ash <fixnum>
+     small-const)` inlines a raw `:shl` with NO overflow promotion, so
+     `(ash 4611686018427387903 1)` → **−2** (wraps) instead of the bignum
+     9223372036854775806. Broke compile-integer's own 2^62-1 boundary constant in
+     the self-compiled product. WS5 workaround: `emit-li-tagged` emits `:li value;
+     :shl` (untagged fixnum + runtime raw shift) for the tagged word — but any
+     USER `(ash big-fixnum small-const)` still silently wraps.
+   - **8b. `bignum-ash` with a VARIABLE count corrupts the count.** A runtime
+     `bignum-ash(n, count)` on the left-shift limb path passed a CLOBBERED count
+     to `%shl-limbs-mag` (gdb: count became a stack address) → SIGSEGV / runaway
+     bignum. Smells like the MVM caller-save hazard [[reference_mvm_caller_save_bug]]
+     on `count` across `%any-to-limbs`. WS5 workaround: `emit-rest-prologue` uses
+     literal shift counts `(ash X 1)` so it inlines `:shl` instead of calling
+     `bignum-ash`. Any code calling `bignum-ash` with a runtime count is exposed.
+   - **8c. `:mul-checked` / `:add-checked` overflow promotion fails for NEGATIVE
+     operands.** `(* -4611686018427387904 2)` and
+     `(+ -4611686018427387904 -4611686018427387904)` both return small positive
+     GARBAGE instead of −2^63 (positive overflow promotes fine). A real arithmetic
+     correctness bug. CAVEAT: observed only via the self-host binary's eval2 so
+     far — confirm it reproduces in the ANSI / build-generic path before treating
+     it as definitively core (this session mis-attributed several bugs; verify
+     first).
+
 ## Known Bugs
 
 ### Mutable Closures — Global Cell Limitation (RESOLVED)

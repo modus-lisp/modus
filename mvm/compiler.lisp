@@ -3717,12 +3717,51 @@
      hi32 = (value >> 31) masked to 32 bits   (arithmetic, sign-extends)
    Both stay <= #xFFFFFFFF and the intermediate (ash value -31) is in
    [-2^31, 2^31-1] — all safely in fixnum range."
-  (if *mvm-emit-halves*
-      (emit-ir :li-halves dest
-               (* (logand value #x7FFFFFFF) 2)
-               (logand (ash value -31) #xFFFFFFFF))
-      (let ((tagged (ash value +fixnum-shift+)))
-        (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged)))))
+  (cond
+    ;; WS5 STATIC SELF-HOST: this MUST be checked BEFORE *mvm-emit-halves*.  The
+    ;; self-source contains eval2-forms, whose `(setq *mvm-emit-halves* t)` runs
+    ;; at the product's compile-time and stays T for the rest of the --compile,
+    ;; so a *mvm-emit-halves*-first cond routed compile-integer's boundary through
+    ;; the :li-halves branch — whose `(ash value -31)` is broken for large
+    ;; NEGATIVE values (heap-address garbage that varied per build).  *static-
+    ;; build-p* is set for the whole --compile and never unset, so it is the
+    ;; reliable discriminator.
+    ;;
+    ;; The native path's compile-TIME `(ash value +fixnum-shift+)` OVERFLOWS for
+    ;; |value| >= 2^61 (raw :shl, no promotion), and every compile-time fixup for
+    ;; a large NEGATIVE value is ALSO broken (negative :sar / lognot / negation of
+    ;; a large-magnitude fixnum all mangle it).  So NEVER form the tagged word (or
+    ;; touch a large negative) at compile time:
+    ;;  - POSITIVE value: :li the untagged fixnum + :shl left (raw shift = tagged).
+    ;;  - NEGATIVE value: :li the POSITIVE MAGNITUDE (mvm-emit-u64 handles positives
+    ;;    correctly) + :shl + :neg — negate IN-REGISTER, so no large negative is
+    ;;    ever a :li operand or a compile-time arithmetic input.
+    ;;  - most-negative-fixnum (−2^62): magnitude 2^62 overflows fixnum → a bignum
+    ;;    :li operand.  Emit its tagged word (−2^63 = 1<<63) as :li 1 + :shl 63.
+    ;;    (compile-integer no longer classifies −2^62 as fixnum, so this is
+    ;;    defensive only.)
+    ;; Gated on *static-build-p* (NIL in the ANSI-gate build) so that build is
+    ;; byte-identical.
+    (*static-build-p*
+     (cond
+       ((zerop value) (emit-ir :li dest 0))
+       ((> value 0)
+        (emit-ir :li dest value)
+        (emit-ir :shl dest dest +fixnum-shift+))
+       ((< value -4611686018427387903)          ; most-negative-fixnum
+        (emit-ir :li dest 1)
+        (emit-ir :shl dest dest 63))
+       (t                                         ; other negatives
+        (emit-ir :li dest (- value))              ; positive magnitude
+        (emit-ir :shl dest dest +fixnum-shift+)
+        (emit-ir :neg dest dest))))
+    (*mvm-emit-halves*
+     (emit-ir :li-halves dest
+              (* (logand value #x7FFFFFFF) 2)
+              (logand (ash value -31) #xFFFFFFFF)))
+    (t
+     (let ((tagged (ash value +fixnum-shift+)))
+       (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))))
 
 (defun compile-integer (value dest)
   "Load an integer literal into DEST.
@@ -3740,7 +3779,18 @@
    bits — the test's actual-vs-expected comparison then failed even
    when the runtime arithmetic was correct."
   (cond
-    ((and (>= value -4611686018427387904) (<= value 4611686018427387903))
+    ;; WS5: LOW bound is -(2^62-1), NOT most-negative-fixnum -(2^62).  In the
+    ;; self-host compiler the literal -4611686018427387904 (-2^62) is a BIGNUM
+    ;; (the reader parses 2^62 — one past most-positive-fixnum — then negates),
+    ;; so routing it through the fixnum/emit-li-tagged path emitted its heap
+    ;; POINTER as the boundary constant (address garbage, varied per build) →
+    ;; the product compared every fixnum against garbage and couldn't compile any
+    ;; integer literal.  -(2^62-1) is a genuine FIXNUM and emits cleanly.  The
+    ;; only value reclassified is -2^62 itself, which now takes the bignum path —
+    ;; a still-numerically-correct small bignum; CL code cannot observe the
+    ;; representation difference (EQL/arithmetic identical).  Shared file: gate
+    ;; before landing on main.
+    ((and (>= value -4611686018427387903) (<= value 4611686018427387903))
      ;; Fixnum range.  emit-li-tagged keeps the host path as `(:li (ash value 1))`
      ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the
      ;; top/bottom bit of the fixnum range — e.g. most-positive/negative-fixnum).
@@ -14394,7 +14444,12 @@
    register-saved slots) — beyond that the static-pack path in
    compile-call still applies because it writes the sentinel."
   (let ((skip-label   (make-compiler-label))
-        (sentinel-tag (ash 255 +fixnum-shift+))
+        ;; WS5: use literal shift-count 1 (== +fixnum-shift+) so this compiles
+        ;; to an inline :shl instead of a runtime bignum-ash call.  This runs on
+        ;; the BOOT-critical &rest-lambda eval path; in the SELF-COMPILED product
+        ;; the bignum-ash call hit a caller-save slot-clobber (count marshalled
+        ;; from the wrong let*-slot → %shl-limbs-mag SIGSEGV).  Value-identical.
+        (sentinel-tag (ash 255 1))
         (req          rest-slot))
     (let ((nargs-reg (alloc-temp-reg))
           (cmp-reg   (alloc-temp-reg))
@@ -14409,7 +14464,7 @@
       ;; nargs == req: rest list is nil.  Write nil to slot[req].
       (let ((case-req-label (make-compiler-label))
             (built-label    (make-compiler-label)))
-        (emit-ir :li cmp-reg (ash req +fixnum-shift+))
+        (emit-ir :li cmp-reg (ash req 1))   ; +fixnum-shift+ == 1; inline :shl (see above)
         (emit-ir :cmp nargs-reg cmp-reg)
         (emit-ir :bne case-req-label)
         ;; nargs == req — empty rest list.  NIL lives in +vreg-vn+
@@ -14441,7 +14496,7 @@
           (setf cases (reverse cases))
           (dolist (k cases)
             (let ((next-label (make-compiler-label)))
-              (emit-ir :li cmp-reg (ash (+ req k) +fixnum-shift+))
+              (emit-ir :li cmp-reg (ash (+ req k) 1))   ; +fixnum-shift+ == 1; inline :shl
               (emit-ir :cmp nargs-reg cmp-reg)
               (emit-ir :bne next-label)
               ;; Build (cons slot[req] (cons slot[req+1] … nil)) for k rest args.
@@ -14470,7 +14525,7 @@
           (cmp-reg       (alloc-temp-reg))
           (skip-all      (make-compiler-label))
           (after-sentinel (make-compiler-label))
-          (sentinel-tag  (ash 255 +fixnum-shift+)))
+          (sentinel-tag  (ash 255 1)))   ; +fixnum-shift+ == 1; inline :shl (avoid bignum-ash clobber)
       (emit-ir :get-nargs nargs-reg)
       (emit-ir :li cmp-reg sentinel-tag)
       (emit-ir :cmp nargs-reg cmp-reg)
@@ -14484,7 +14539,7 @@
             below (min (+ opt-start opt-count) +max-reg-args+)
             do
             (let ((skip-slot (make-compiler-label)))
-              (emit-ir :li cmp-reg (ash (+ i 1) +fixnum-shift+))
+              (emit-ir :li cmp-reg (ash (+ i 1) 1))   ; +fixnum-shift+ == 1; inline :shl
               (emit-ir :cmp nargs-reg cmp-reg)
               (emit-ir :bge skip-slot)
               (emit-ir :stack-store +vreg-vn+ i)

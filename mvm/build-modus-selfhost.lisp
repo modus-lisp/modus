@@ -971,6 +971,13 @@
   (setq *rt-pass-count* 0)
   (setq *rt-fail-count* 0)
   (setq *rt-registered-tests* nil)
+  ;; WS5: gensym/gentemp counters (defvar inits don't run at boot — limitation
+  ;; #7; every other build image sets these in its own kernel-main).  Without
+  ;; this *gensym-counter* is NIL, so (gensym) yields #:GNIL every time and
+  ;; `(format nil \"G~D\" NIL)` collides — breaking emit-handler-helpers during
+  ;; the self-compiled product's translate-x64 (--compile threw a NIL condition).
+  (setq *gensym-counter* 0)
+  (setq *gentemp-counter* 0)
   (%install-deftest-macro)
   ;; Run all built-in defvar init thunks.  Each is wrapped in
   ;; handler-case at compile time so a thunk that references a not-yet-

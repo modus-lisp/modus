@@ -3744,17 +3744,24 @@
     ;; byte-identical.
     (*static-build-p*
      (cond
-       ;; SMALL (|value| < 2^61): value<<1 can't overflow a fixnum, so form the
-       ;; tagged word at compile time and emit a SINGLE :li — byte-for-byte the
-       ;; same codegen as the non-static path.  This keeps the vast majority of
-       ;; integer literals (all small ones, incl. every literal in MVM-INTERPRET
-       ;; and the runtime lambdas) UNCHANGED; only genuinely large literals take
-       ;; the multi-instruction safe path below.  (An over-broad rewrite of ALL
-       ;; literals to :li+:shl perturbed the interpreter enough to fault.)
-       ((and (< value 2305843009213693952)        ; 2^61
-             (> value -2305843009213693952))
-        (let ((tagged (ash value +fixnum-shift+)))
-          (if (zerop tagged) (emit-ir :li dest 0) (emit-ir :li dest tagged))))
+       ;; SMALL POSITIVE (value < 2^61): value<<1 can't overflow a fixnum, so form
+       ;; the tagged word at compile time and emit a SINGLE :li — byte-for-byte the
+       ;; non-static codegen.  Keeps the vast majority of integer literals (every
+       ;; positive literal in MVM-INTERPRET / the runtime lambdas) UNCHANGED; an
+       ;; over-broad rewrite of ALL literals to :li+:shl perturbed the interpreter
+       ;; enough to fault, so only NON-positive / large values take a wider path.
+       ((zerop value) (emit-ir :li dest 0))
+       ((and (> value 0) (< value 2305843009213693952))    ; small positive: 1 :li
+        (emit-ir :li dest (ash value +fixnum-shift+)))
+       ;; SMALL NEGATIVE: emitting `(:li (ash value 1))` puts a NEGATIVE value in
+       ;; the :li operand, and mvm-emit-u64's native high-32 `(ash val -32)` is
+       ;; broken for negatives (limitation #8) — this is what mangled emit-s32's
+       ;; -2147483648 boundary → the translator dropped whole functions.  Emit the
+       ;; POSITIVE magnitude's tagged word (mvm-emit-u64 handles positives) then
+       ;; :neg in-register, so no negative is ever a :li operand.
+       ((and (< value 0) (> value -2305843009213693952))   ; small negative: :li+:neg
+        (emit-ir :li dest (ash (- value) +fixnum-shift+))
+        (emit-ir :neg dest dest))
        ((> value 0)                               ; large positive
         (emit-ir :li dest value)
         (emit-ir :shl dest dest +fixnum-shift+))

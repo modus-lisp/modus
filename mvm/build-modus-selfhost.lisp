@@ -1025,7 +1025,8 @@
              (string= (car (cdr av)) \"--compile\"))
         (handler-case
             (progn (%selfhost-compile-file (nth 2 av) (nth 3 av)) (sys-exit 0))
-          (t (c) (progn (write-string-serial \"modus --compile: error\")
+          (t (c) (progn (write-string-serial \"modus --compile: error: \")
+                        (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
                         (write-char-serial 10) (sys-exit 1))))
         (handler-case (cli-toplevel) (t (c) (sys-exit 1))))))
 ")

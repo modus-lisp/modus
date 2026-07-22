@@ -95,7 +95,7 @@
 ;; #183; post-#183 a 128MB u8 array is 128MB, and the semispace is now 896MB).
 ;; Keep the original 128MB single up-front alloc → ZERO grows → no corruption.
 (let ((needle "(bytes (make-array 134217728 :element-type '(unsigned-byte 8)))")
-      (repl   "(bytes (make-array 33554432 :element-type '(unsigned-byte 8)))"))
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
   (let ((p (search needle *isa-source*)))
     (unless p (error "WS5: could not find mvm-buffer 128MB default to shrink"))
     (setf *isa-source*
@@ -181,7 +181,7 @@
 ;; ~15MB; a 32MB single up-front allocation covers it with NO grow → NO
 ;; grow-triggered GC on the buffer → no truncation.
 (let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
-      (repl   "(bytes (make-array 33554432 :element-type '(unsigned-byte 8)))"))
+      (repl   "(bytes (make-array 1048576 :element-type '(unsigned-byte 8)))"))
   (let ((p (search needle *x64-asm-source*)))
     (unless p
       (error "WS5-S1: could not find code-buffer 96MB default to shrink"))
@@ -269,6 +269,20 @@
   ;; nibble 0xd → OR-3 closure-ptr tags broke → local capturing-closure call
   ;; jumped mid-instruction → SEGV (the modus3 blocker).  397 → entries nibble 0.
   (setq *x64-linux-mode* t)
+  ;; WS5 modus3 BUG#2 FIX (same limitation-#7 persistence class as the offset):
+  ;; the host-side (setf *x64-gc-enabled* t / *linux-x64-r14-offset* midpoint /
+  ;; *mcgc-kind-bitmap-enabled* t) at this file's tail run HOST-side only, so the
+  ;; in-image --compile emitted modus2 with GC DISABLED (no gc-checks) and R14 at
+  ;; the full heap END.  Result: modus2's own --compile of self-clean5 never
+  ;; collects, accumulates all garbage IR, and R12 walks off the mmap end at
+  ;; ~form 2402 → SIGSEGV (crash site varies: string-upcase / %fmt-integer —
+  ;; whichever alloc crosses the line).  NOT a GC bug — GC was never emitted.
+  ;; install-x64-translator is the authoritative in-image setter, so set them
+  ;; here: R14 = midpoint (#x38000000) so gc-checks fire at half-heap and Cheney
+  ;; copies the live IR into to-space, reclaiming the garbage.
+  (setq *x64-gc-enabled* t)
+  (setq *mcgc-kind-bitmap-enabled* t)
+  (setq *linux-x64-r14-offset* #x38000000)
   t)
 ")
 
@@ -984,6 +998,17 @@
   ;; the self-compiled product's translate-x64 (--compile threw a NIL condition).
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
+  ;; WS5 modus3 BUG#2: same defvar-init-at-boot gap (limitation #7) for two
+  ;; compiler counters that are NOT let-bound in mvm-compile-all and were never
+  ;; setq'd here, so they boot NIL.  *kw-rest-counter* is `incf`'d in
+  ;; preprocess-params when compiling the FIRST &key defun (self-source ~form
+  ;; 1750): (incf NIL) yields a tag-9 garbage value, which flows into
+  ;; (format nil \"%KWF-~A-~D\" name <garbage>) → %FMT-INTEGER dereferences the
+  ;; garbage as an object header → SIGSEGV (surfaced as modus3 `error: NIL`).
+  ;; *nonlocal-block-tag-counter* has the identical latent gap (incf'd when a
+  ;; nonlocal block/return-from compiles).  Init both to 0.
+  (setq *kw-rest-counter* 0)
+  (setq *nonlocal-block-tag-counter* 0)
   ;; WS5 modus3 FIX: *x64-native-code-offset* is a defvar; its build-time
   ;; (setf … 397) at the tail of this file runs HOST-side and does NOT persist
   ;; into the image (limitation #7 — defvar init-thunks don't run at boot).  So

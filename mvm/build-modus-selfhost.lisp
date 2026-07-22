@@ -261,7 +261,13 @@
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
     (setq *vreg-to-x64* v))
-  (setq *x64-native-code-offset* 0)
+  (setq *x64-native-code-offset* 397)  ; WS5 modus3 FIX: linux-x64 boot preamble
+  ;; is 397 bytes; install-x64-translator runs IN-IMAGE and is the authoritative
+  ;; runtime setter (the host-only (setf … 397) at file tail doesn't persist —
+  ;; limitation #7).  With 0 here, in-image --compile aligned fn file-offsets to
+  ;; ≡0 mod 16, and the 397-byte preamble (≡13) shifted every RUNTIME entry to
+  ;; nibble 0xd → OR-3 closure-ptr tags broke → local capturing-closure call
+  ;; jumped mid-instruction → SEGV (the modus3 blocker).  397 → entries nibble 0.
   (setq *x64-linux-mode* t)
   t)
 ")
@@ -978,6 +984,22 @@
   ;; the self-compiled product's translate-x64 (--compile threw a NIL condition).
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
+  ;; WS5 modus3 FIX: *x64-native-code-offset* is a defvar; its build-time
+  ;; (setf … 397) at the tail of this file runs HOST-side and does NOT persist
+  ;; into the image (limitation #7 — defvar init-thunks don't run at boot).  So
+  ;; the in-image --compile defaulted it to 0, which padded fn file-offsets to
+  ;; ≡0 mod 16; the real 397-byte linux-x64 boot preamble (≡13 mod 16) then
+  ;; shifted every RUNTIME fn entry to nibble 0xd instead of 0.  The OR-3
+  ;; closure-pointer tag convention (compile-lambda :li-func + `or $3`,
+  ;; CALL-IND `sub $3`) needs entries ending in 0 (→ tag 0x3); at nibble d a
+  ;; LOCAL call of a capturing flet/labels/lambda jumps MID-INSTRUCTION onto
+  ;; the `89 e5` byte (= `mov %esp,%ebp`, 32-bit) → RBP high-half zeroed → SEGV.
+  ;; This is the modus3 self-reproduction blocker (the compiler's own
+  ;; vars-mutated-in-lambdas uses a recursive capturing `labels scan`).  Set 397
+  ;; so in-image --compile aligns entries to nibble 0, matching the seed's own
+  ;; build.  Proof: nm seed = all fns nibble 0; nm modus2-v2 = all nibble d.
+  ;; See reference_modus3_optional_lambda_miscompile.
+  (setq *x64-native-code-offset* 397)
   (%install-deftest-macro)
   ;; Run all built-in defvar init thunks.  Each is wrapped in
   ;; handler-case at compile time so a thunk that references a not-yet-

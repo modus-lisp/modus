@@ -6342,6 +6342,21 @@
                               :handler-push-label handler-push-lbl
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl)))
+                 ;; Align THIS function's entry.  The tail alignment below only
+                 ;; aligns SUBSEQUENT functions; without a head alignment the
+                 ;; FIRST emitted function starts at whatever code-position the
+                 ;; buffer holds (code-pos 0) → runtime low-nibble != 0 → the
+                 ;; OR-3 closure-pointer tag breaks for any closure that happens
+                 ;; to be emitted first (the modus3 self-reproduction blocker: a
+                 ;; nested lambda/labels closure lands first and its local
+                 ;; funcall jumps mid-instruction → SEGV).  Idempotent: emits 0
+                 ;; NOPs when the position is already aligned, so it is
+                 ;; byte-neutral for every function the tail alignment already
+                 ;; positioned — including the entire host/ANSI build.
+                 (loop
+                   (let* ((p (code-buffer-position buf))
+                          (n (logand (+ *x64-native-code-offset* p) #xF)))
+                     (if (zerop n) (return) (emit-nop buf))))
                  ;; Emit function label
                  (handler-case (emit-label buf fn-label)
                    (error (c) (error "SETUP-emit-label fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))

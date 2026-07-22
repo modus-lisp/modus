@@ -66,14 +66,24 @@
    Delegates to the MVM compiler (compiler.lisp) for the actual
    compilation, then converts the result to an mvm-module for
    the image building pipeline."
-  ;; Read source forms with line numbers
+  ;; Read source forms with line numbers.  Phase markers (gated on
+  ;; *static-build-p*, i.e. the self-host --compile) name the phase a fatal
+  ;; came from — read vs compile vs module-conversion — so a bare
+  ;; `#(TYPE-ERROR NIL)` is no longer phase-anonymous.
+  (when *static-build-p* (format t "  PHASE read~%"))
   (let* ((forms-and-lines (read-all-forms-with-locations source-text))
          (forms (car forms-and-lines))
          (source-lines (cdr forms-and-lines))
          ;; Compile all forms through the MVM compiler
-         (compiled-mod (mvm-compile-all forms :source-lines source-lines))
+         (compiled-mod (progn
+                         (when *static-build-p*
+                           (format t "  PHASE compile (~D forms)~%" (length forms)))
+                         (mvm-compile-all forms :source-lines source-lines)))
          ;; Convert to mvm-module for the image pipeline
-         (module (compiled-module-to-mvm-module compiled-mod source-text)))
+         (module (progn
+                   (when *static-build-p* (format t "  PHASE module-convert~%"))
+                   (compiled-module-to-mvm-module compiled-mod source-text))))
+    (when *static-build-p* (format t "  PHASE module-done~%"))
     (setf (mvm-module-name module) name)
     module))
 

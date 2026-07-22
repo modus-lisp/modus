@@ -16119,59 +16119,76 @@
     ;; Phase 1 & 2: Compile all forms to IR
     (let ((form-index 0))
     (dolist (form forms)
-      (setf *pending-flet-ir* nil)
-      (setf *current-source-location*
-            (if (and source-lines (< form-index (length source-lines)))
-                (format nil "line ~D" (aref source-lines form-index))
-                (format nil "form#~D" form-index)))
-      (when *compile-trace*
-        (format t ";; compile ~A: ~A~%"
-                *current-source-location*
-                (let ((s (format nil "~S" form)))
-                  (if (> (length s) 70) (subseq s 0 70) s))))
-      (incf form-index)
-      ;; Snapshot *function-table* before compiling this form, so we can
-      ;; remove any orphaned lambda entries on error.
-      (let* ((fn-table-before *function-table*)
-             (result (handler-case
-                        (mvm-compile-toplevel form)
-                        (error (e)
-                          (format t "  SKIP ~A: ~A~%" *current-source-location* e)
-                          ;; Identify WHAT was dropped: form head + name.
-                          ;; A bare "SKIP line N" against a 17M-char
-                          ;; assembled source is undebuggable.
-                          (format t "    SKIP-FORM: ~A~%"
-                                  (let ((s (handler-case (format nil "~S" form)
-                                             (error () "<unprintable>"))))
-                                    (if (> (length s) 160) (subseq s 0 160) s)))
-                          ;; Remove any lambda/flet entries that were added to
-                          ;; *function-table* during this failed form's compilation.
-                          ;; These have no corresponding bytecode (bytecode-length=0)
-                          ;; and would become prologue-only stubs that fall through.
-                          (setf *function-table* fn-table-before)
-                          (setf *pending-flet-ir* nil)
-                          nil))))
-        (cond
-          ((null result) nil)
-          ;; Multi-result from defstruct: collect all sub-results
-          ((and (consp result) (eq (car result) :multi-result))
-           (dolist (sub-result (cdr result))
-             (let ((info (car sub-result))
-                   (ir (cdr sub-result)))
+      ;; BULLETPROOF per-form envelope: NOTHING in a single form's processing
+      ;; — not the source-location setup, not the SKIP recovery path, not the
+      ;; post-result IR collection — may abort the whole-module compile.  The
+      ;; self-host --compile once died with a SECOND, uncaught TYPE-ERROR
+      ;; raised INSIDE the SKIP recovery (the old `(format nil "~S" form)`
+      ;; ~S-printed a GC-corrupted form), which escaped as a fatal
+      ;; `#(TYPE-ERROR NIL)`.  Wrap the entire body so a bad form drops
+      ;; cleanly and compilation continues.
+      (handler-case
+       (progn
+        (setf *pending-flet-ir* nil)
+        (setf *current-source-location*
+              (if (and source-lines (< form-index (length source-lines)))
+                  (format nil "line ~D" (aref source-lines form-index))
+                  (format nil "form#~D" form-index)))
+        (when *compile-trace*
+          (format t ";; compile ~A: ~A~%"
+                  *current-source-location*
+                  (let ((s (format nil "~S" form)))
+                    (if (> (length s) 70) (subseq s 0 70) s))))
+        ;; WS5 self-host heartbeat: localize a non-deterministic corruption to
+        ;; a form-index WINDOW (the source-line vector can itself be corrupted,
+        ;; so the monotonic index is the trustworthy coordinate).  Gated on
+        ;; *static-build-p* so the ANSI host build (compiler runs host-side,
+        ;; flag nil) is byte-neutral.
+        (when (and *static-build-p* (zerop (mod form-index 250)))
+          (format t "  CC-HB form#~D ~A~%" form-index *current-source-location*))
+        (incf form-index)
+        ;; Snapshot *function-table* before compiling this form, so we can
+        ;; remove any orphaned lambda entries on error.
+        (let* ((fn-table-before *function-table*)
+               (result (handler-case
+                          (mvm-compile-toplevel form)
+                          (error (e)
+                            ;; SKIP by monotonic form-index (safe) + the
+                            ;; source-location.  Do NOT ~S-print the form here
+                            ;; — a corrupted form's printer is the exact thing
+                            ;; that used to fault the recovery path.
+                            (format t "  SKIP form#~D ~A: ~A~%"
+                                    (1- form-index) *current-source-location* e)
+                            (setf *function-table* fn-table-before)
+                            (setf *pending-flet-ir* nil)
+                            nil))))
+          (cond
+            ((null result) nil)
+            ;; Multi-result from defstruct: collect all sub-results
+            ((and (consp result) (eq (car result) :multi-result))
+             (dolist (sub-result (cdr result))
+               (let ((info (car sub-result))
+                     (ir (cdr sub-result)))
+                 (when (and info ir)
+                   (push (cons info ir) all-ir)))))
+            ;; Single result
+            (t
+             (let ((info (car result))
+                   (ir (cdr result)))
                (when (and info ir)
-                 (push (cons info ir) all-ir)))))
-          ;; Single result
-          (t
-           (let ((info (car result))
-                 (ir (cdr result)))
-             (when (and info ir)
-               (push (cons info ir) all-ir))))))
-      ;; Drain any flet/labels IR collected during this form's compilation
-      (dolist (flet-result *pending-flet-ir*)
-        (let ((info (car flet-result))
-              (ir (cdr flet-result)))
-          (when (and info ir)
-            (push (cons info ir) all-ir))))))
+                 (push (cons info ir) all-ir))))))
+        ;; Drain any flet/labels IR collected during this form's compilation
+        (dolist (flet-result *pending-flet-ir*)
+          (let ((info (car flet-result))
+                (ir (cdr flet-result)))
+            (when (and info ir)
+              (push (cons info ir) all-ir)))))
+       (error (e2)
+         ;; Hard failure OUTSIDE the inner recovery (source-location setup,
+         ;; recovery path, or post-result collection).  Report the form-index
+         ;; and continue — never let one form kill the module.
+         (format t "  SKIP-HARD form#~D: ~A~%" form-index e2)
+         (setf *pending-flet-ir* nil)))))
 
     ;; Reverse to get compilation order
     (setf all-ir (nreverse all-ir))

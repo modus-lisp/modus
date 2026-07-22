@@ -16,13 +16,21 @@
 ;;; ============================================================
 
 (defstruct code-buffer
-  ;; Initial 96MB; grows on demand (see %code-buffer-ensure).  A fixed
-  ;; size used to overflow once the emitted image got large (e.g. the
-  ;; ANSI corpus plus the self-hosted MVM compiler): emit-byte's aset
-  ;; would index past the array and raise INVALID-ARRAY-INDEX-ERROR,
-  ;; which the translator's retry loop then masked into a truncated
-  ;; image + a bogus li-const patch offset.  The real ceiling is the
-  ;; rel32 branch range asserted in emit-s32, not this buffer.
+  ;; Default 96MB here; grows on demand by doubling (see %code-buffer-ensure).
+  ;; This large default is pure waste for the ~dozen call sites that only need
+  ;; a small buffer (boot stubs, scratch/test buffers): each make-code-buffer
+  ;; allocates a fresh array of this size.  Grow-on-demand now handles overflow
+  ;; correctly, so the big default is unnecessary.  Two lower-friction fixes are
+  ;; applied instead of shrinking THIS default (which the ANSI/host builds and
+  ;; the build-modus-selfhost WS5-S1 transform both key off by exact text):
+  ;;   (1) the self-host build's WS5-S1 transform rewrites this to 1MB (was
+  ;;       32MB) — the alloc-heavy path, since the self-compile has no host GC;
+  ;;   (2) the one genuinely-large buffer — the main module output in
+  ;;       translate-mvm-to-x64 — is pre-sized to ~6x the bytecode there, so it
+  ;;       never grow-copies and large images (ANSI gate, self-compile) stay
+  ;;       alloc-neutral regardless of this default.
+  ;; NOTE: this exact `(make-array 100663296 ...)` text is matched by the
+  ;; WS5-S1 string transform in build-modus-selfhost.lisp — keep it verbatim.
   (bytes (make-array 100663296 :element-type '(unsigned-byte 8)))
   (labels (make-hash-table :test 'eq))      ; label -> position
   (fixups nil)                              ; list of (position label offset-size)
@@ -33,23 +41,12 @@
    copies the existing bytes when the current array is too small."
   (let* ((bytes (code-buffer-bytes buf))
          (cap (length bytes)))
-    (when (null bytes)
-      (format t "  DBG-CBE: code-buffer-bytes is NIL on entry, pos=~D~%" pos))
     (when (>= pos cap)
       (let ((new-cap cap))
         (loop while (>= pos new-cap) do (setf new-cap (* new-cap 2)))
-        (format t "  DBG-CBE: GROW cap ~D -> ~D (pos=~D)~%" cap new-cap pos)
         (let ((new-bytes (make-array new-cap :element-type '(unsigned-byte 8))))
-          (when (null new-bytes)
-            (format t "  DBG-CBE: !!! make-array returned NIL for new-cap=~D (pos=~D old-cap=~D)~%"
-                    new-cap pos cap))
-          (when (and new-bytes (/= (length new-bytes) new-cap))
-            (format t "  DBG-CBE: !!! make-array length ~D != requested ~D~%"
-                    (length new-bytes) new-cap))
           (replace new-bytes bytes :end1 cap)
-          (setf (code-buffer-bytes buf) new-bytes)
-          (format t "  DBG-CBE: GROW done, new bytes len=~D~%"
-                  (length (code-buffer-bytes buf))))))))
+          (setf (code-buffer-bytes buf) new-bytes))))))
 
 (defun emit-byte (buf byte)
   (let ((pos (code-buffer-position buf)))

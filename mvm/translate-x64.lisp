@@ -6267,7 +6267,16 @@
   (setf *x64-li-const-patches* nil)
   ;; WS4 STAGE 3: reset the out-of-module CALL relocation list.
   (setf *x64-call-relocs* nil)
-  (let* ((buf (make-code-buffer))
+  (let* ((buf (let ((b (make-code-buffer))
+                    ;; Pre-size to ~6x the bytecode (native is a few x the
+                    ;; bytecode) so the main output buffer never grow-copies —
+                    ;; keeps large images (ANSI gate, self-compile) alloc-neutral
+                    ;; despite the small 1MB code-buffer default.
+                    (est (* 6 (length bytecode))))
+                (when (> est (length (code-buffer-bytes b)))
+                  (setf (code-buffer-bytes b)
+                        (make-array est :element-type '(unsigned-byte 8))))
+                b))
          (n-functions (length function-table))
          ;; Create native labels for each function
          (fn-labels (make-array n-functions))

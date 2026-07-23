@@ -106,8 +106,17 @@
   (position nil))
 
 (defun emit-label (buf label)
-  (setf (label-position label) (code-buffer-position buf))
-  (setf (gethash label (code-buffer-labels buf)) (label-position label)))
+  ;; The label's byte position lives in the STRUCT slot; fixup-labels reads it
+  ;; from there.  The code-buffer-labels hash table is write-only across the
+  ;; whole tree (no gethash reader anywhere), and it is keyed by the LABEL
+  ;; STRUCT — which %ht-hash cannot bucket (returns :NOHASH for non-immediate
+  ;; objects), so every insert degraded to a linear alist scan.  As labels
+  ;; accumulate with module size that made the self-compile O(n^2) — it was THE
+  ;; dominant cost of `modus --compile` (30/30 profiler samples in
+  ;; PUTHASH<-EMIT-LABEL, zero in GC).  Dropping the dead write is
+  ;; behavior-neutral and collapses the quadratic.  (fixpoint-common's
+  ;; emit-label override already omitted it.)
+  (setf (label-position label) (code-buffer-position buf)))
 
 (defun emit-label-ref-rel32 (buf label)
   "Emit a 32-bit relative reference to label (filled in later)"

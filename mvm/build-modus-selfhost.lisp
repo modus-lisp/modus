@@ -980,6 +980,13 @@
   (%init-sym-name-auto)
   (setq *macro-table* (make-hash-table))
   (%init-runtime-macros)
+  ;; Limitation #7: (defvar *setf-expanders* (make-hash-table)) init doesn't run
+  ;; at boot, so the self-compiled compiler's *setf-expanders* is NIL.  Reads
+  ;; (mvm-find-setf-expander) tolerate a NIL table (gethash->NIL), but the FIRST
+  ;; in-image (defsetf ...) WRITES it via (setf (gethash h *setf-expanders*) ..)
+  ;; -> PUTHASH derefs NIL -> SIGSEGV (the modus2 self-compile blocker at the
+  ;; first defsetf, `(defsetf vref vset)`).  Init it here like *macro-table*.
+  (setq *setf-expanders* (make-hash-table :test 'eql))
   (setq *cstr-scratch* #x0FE00000)  ; moved below heap base
   (setq *io-buf-addr*  #x0FF00000)  ; moved out of heap semispace 0; see memory note
   (%init-signal-handling)

@@ -67,7 +67,7 @@
    #:*opcode-table* #:opcode-info #:make-opcode-info
    #:opcode-info-code #:opcode-info-name #:opcode-info-operands #:opcode-info-description
    ;; Encoding/decoding
-   #:encode-instruction #:decode-instruction
+   #:encode-instruction #:decode-instruction #:decode-instruction-mv
    #:make-mvm-buffer #:mvm-buffer-bytes #:mvm-buffer-used-bytes #:mvm-buffer-position #:mvm-buffer-labels
    #:mvm-emit-byte #:mvm-emit-u16 #:mvm-emit-u32 #:mvm-emit-u64
    #:mvm-emit-s16 #:mvm-emit-s32
@@ -732,11 +732,15 @@
   (logior (decode-u32 bytes pos)
           (ash (decode-u32 bytes (+ pos 4)) 32)))
 
-(defun decode-instruction (bytes pos)
-  "Decode an MVM instruction starting at POS in BYTES.
-   Returns (VALUES opcode operands new-pos) where operands is a list."
+(defun decode-instruction-mv (bytes pos)
+  "Decode an MVM instruction at POS in BYTES.
+   Returns (VALUES opcode operands new-pos) where operands is a list — with NO
+   wrapper cons.  The x64 hot path (the main translate loop AND scan-branch-
+   targets, which BOTH decode every instruction) calls this directly to avoid
+   allocating the two wrapper conses per instruction — ~2 conses x 2 decodes per
+   instruction, a meaningful chunk of self-compile GC pressure."
   (when (>= pos (length bytes))
-    (return-from decode-instruction (cons 0 (cons nil (1+ pos)))))  ; NOP, advance past OOB
+    (return-from decode-instruction-mv (values 0 nil (1+ pos))))  ; NOP, advance past OOB
   (let* ((opcode (aref bytes pos))
          (info (gethash opcode *opcode-table*))
          (spec (if info (opcode-info-operands info) nil))
@@ -765,7 +769,15 @@
         (:width
          (push (aref bytes cur) operands)
          (incf cur 1))))
-    (cons opcode (cons (nreverse operands) cur))))
+    (values opcode (nreverse operands) cur)))
+
+(defun decode-instruction (bytes pos)
+  "Decode an MVM instruction at POS in BYTES.
+   Returns a (opcode operands . new-pos) cons (operands is a list).  This cons
+   shape is what the non-x64 translators and the fixpoint decoders consume; the
+   x64 hot path uses decode-instruction-mv to skip the wrapper cons."
+  (multiple-value-bind (opcode operands new-pos) (decode-instruction-mv bytes pos)
+    (cons opcode (cons operands new-pos))))
 
 ;;; ============================================================
 ;;; Convenience Instruction Constructors

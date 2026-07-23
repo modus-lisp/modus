@@ -3813,10 +3813,8 @@
                    (when label
                      (emit-label buf label)))
                  ;; Decode and translate
-                 (let* ((decoded (decode-instruction bytecode pos))
-                        (opcode (car decoded))
-                        (operands (cadr decoded))
-                        (new-pos (cddr decoded)))
+                 (multiple-value-bind (opcode operands new-pos)
+                     (decode-instruction-mv bytecode pos)
                    (translate-instruction state opcode operands new-pos)
                    (setf pos new-pos)))))
     ;; Resolve label fixups
@@ -3833,10 +3831,8 @@
          (pos offset)
          (limit (+ offset length)))
     (loop while (< pos limit)
-          do (let* ((decoded (decode-instruction bytes pos))
-                    (opcode (car decoded))
-                    (operands (cadr decoded))
-                    (new-pos (cddr decoded)))
+          do (multiple-value-bind (opcode operands new-pos)
+                 (decode-instruction-mv bytes pos)
                ;; Check if this is a branch instruction
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
@@ -6390,10 +6386,8 @@
                                 (when label
                                   (emit-label buf label)))
                               ;; Decode and translate
-                              (let* ((decoded (decode-instruction bytecode pos))
-                                     (opcode (car decoded))
-                                     (operands (cadr decoded))
-                                     (new-pos (cddr decoded)))
+                              (multiple-value-bind (opcode operands new-pos)
+                                  (decode-instruction-mv bytecode pos)
                                 (handler-case
                                     (translate-instruction state opcode operands new-pos)
                                   (error (c)

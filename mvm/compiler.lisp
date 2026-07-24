@@ -12181,7 +12181,16 @@
          (progn
            (emit-ir :sar dest dest (- count-form))
            (let ((temp (alloc-temp-reg)))
-             (emit-ir :li temp -2)
+             ;; Mask off the low tag bit.  The mask is -2 (0xFFFF...FFFE),
+             ;; but a NEGATIVE :li operand is materialised via emit-u64,
+             ;; whose in-image high-32 extraction ((ldb (byte 32 32) neg))
+             ;; is non-deterministic (limitation #8) — it bakes garbage
+             ;; high bits that vary run-to-run, wrecking reproducible
+             ;; self-compiles.  Emit the POSITIVE magnitude and negate
+             ;; in-register (a clean NEG r64) so no negative ever reaches
+             ;; a :li operand — same pattern emit-li-tagged uses.
+             (emit-ir :li temp 2)
+             (emit-ir :neg temp temp)
              (emit-ir :and dest dest temp)
              (free-temp-reg)))))
     ;; Large constant or variable count — call bignum-ash so we

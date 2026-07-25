@@ -7068,6 +7068,31 @@
 ;;; acc (rec f bound env acc))) does. We don't fully understand the
 ;;; SBCL-side interaction; the dolist-recursive shape is just avoided.
 
+(defun %collect-bq-free-vars (template bound env acc)
+  "Free-var collection inside an IN-IMAGE (BACKQUOTE ...) template: only
+   (COMMA e) / (COMMA-AT e) / (COMMA-DOT e) payloads are expression
+   positions; everything else is inert template data that must NOT go
+   through %collect-free-vars' special-form dispatch (a template SETQ/LET
+   head would skip its name/binding slots — see the backquote case in
+   %collect-free-vars).  Nested backquotes are walked the same way
+   (over-collection is harmless; under-collection was the modus3 bug)."
+  (cond
+    ((atom template) acc)
+    ((and (symbolp (car template))
+          (or (eq (car template) 'comma)
+              (eq (car template) 'comma-at)
+              (eq (car template) 'comma-dot)))
+     (%collect-free-vars (cadr template) bound env acc))
+    (t
+     (let ((cur template))
+       (loop
+         (cond
+           ((null cur) (return acc))
+           ((atom cur) (return acc))
+           (t
+            (setq acc (%collect-bq-free-vars (car cur) bound env acc))
+            (setq cur (cdr cur)))))))))
+
 (defun %collect-free-vars (form bound env acc)
   "Walk FORM; collect symbol references that are not in BOUND and ARE
    present in ENV. The result is the list of outer-scope variables the
@@ -7114,6 +7139,20 @@
          ;; via expand-backquote and collect from THAT.
          ((eq head 'sb-int:quasiquote)
           (%collect-free-vars (expand-backquote (cadr form)) bound env acc))
+         ;; IN-IMAGE reader backquote: `(setq ,v t) reads as
+         ;; (BACKQUOTE (SETQ (COMMA V) T)).  The default element walk would
+         ;; dispatch the TEMPLATE through the special-form cases below —
+         ;; and the SETQ case walks only VALUE positions, skipping the name
+         ;; slot where a (COMMA V) can sit.  So V was never collected, never
+         ;; captured, and the closure read an unwritten frame slot (raw 0):
+         ;; generate-loop-code's %nat-var emitted (SETQ 0 T) in gen2 — THE
+         ;; modus3 fixpoint blocker (gen3 translate emitted empty bodies
+         ;; because instruction-size, compiled by that gen2, was garbage).
+         ;; Host builds never hit this (SBCL reads backquote as
+         ;; sb-int:quasiquote, handled above).  Walk ONLY the comma payloads;
+         ;; the rest of the template is inert data.
+         ((eq head 'backquote)
+          (%collect-bq-free-vars (cadr form) bound env acc))
          ;; LET: bindings see OUTER scope; body sees inner.
          ((eq head 'let)
           (let ((bindings (cadr form))

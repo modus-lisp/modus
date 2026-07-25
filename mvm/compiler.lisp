@@ -263,6 +263,46 @@
    tree-walker.  At build time it stays NIL, so the host build's DEFPACKAGE
    no-op is byte-identical to before.")
 
+(defun %eval-expander-runtime (lambda-form)
+  "Evaluate LAMBDA-FORM (a `(lambda …)` macro-expander) into a CALLABLE, in
+   RUNTIME-eval codegen mode.  Host-side (SBCL build) this is a transparent
+   wrapper: host EVAL ignores the flags and returns a host closure.
+
+   IN-IMAGE it is load-bearing: a static build (`modus --compile`) drives the
+   compiler with *static-build-p* T / *eval2-runtime-p* NIL / *mvm-emit-halves*
+   NIL (%selfhost-compile-file).  A DEFMACRO form in the SOURCE BEING COMPILED
+   must still build its expander via the image's own EVAL (eval2) — but under
+   those static flags the lambda's function VALUE materializes as an unlinked
+   :li-func offset (raw 0).  mvm-define-macro then registers 0 and the first
+   USE of the macro funcalls 0 → `sub rcx,3; call rcx` → SIGSEGV → the
+   'cond-type=NULL cond=NIL' abort at the defmacro's line.  This killed the
+   modus2→modus3 self-compile at the self-source's FIRST defmacro (defopcode)
+   and silently broke all 4 self-source defmacros (defopcode /
+   define-registers / define-alu-reg-reg / define-alu-reg-imm) in gen1,
+   cascading assembler damage into gen2.  Minimal repro: 2-form file
+   `(defmacro m (x) …)` + a use — see task #187.
+
+   Additionally, eval2 LEAKS *eval2-runtime-p*/*mvm-emit-halves* (bare setq,
+   no restore), so a nested EVAL mid-static-compile would poison the OUTER
+   compile's codegen mode for every remaining form.  This wrapper contains
+   both problems: set runtime-eval flags for the nested EVAL, restore the
+   exact outer mode after (lexical save + setq restore + unwind-protect —
+   NOT a special LET rebind, which is unreliable in-image; see
+   *eval2-runtime-p*'s docstring)."
+  (let ((saved-static *static-build-p*)
+        (saved-e2rt   *eval2-runtime-p*)
+        (saved-halves *mvm-emit-halves*))
+    (unwind-protect
+        (progn
+          (setq *static-build-p* nil)
+          (setq *eval2-runtime-p* t)
+          (setq *mvm-emit-halves* t)
+          (eval lambda-form))
+      (setq *static-build-p* saved-static)
+      (setq *eval2-runtime-p* saved-e2rt)
+      (setq *mvm-emit-halves* saved-halves))))
+
+
 (defvar *e2-persist-defuns* nil
   "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *eval2-runtime-p*
    gated).  eval2-forms' pre-scan walks the RAW forms for top-level DEFUNs to
@@ -1250,10 +1290,11 @@
       ;; form around the (cdr form) destructure.
       (when (consp whole-var)
         (setf db-form `(destructuring-bind ,whole-var form ,db-form)))
-      (eval `(lambda (form)
-               (let ,bindings
-                 (declare (ignorable ,@(mapcar #'car bindings)))
-                 ,db-form))))))
+      (%eval-expander-runtime
+       `(lambda (form)
+          (let ,bindings
+            (declare (ignorable ,@(mapcar #'car bindings)))
+            ,db-form))))))
 
 (defvar *bootstrap-macro-template* nil
   "PERF: persistent name-hash→expander table for the 94 bootstrap macros, built
@@ -2249,8 +2290,9 @@
                           ;; body errored the host EVAL ('return for unknown
                           ;; block'), which SKIPped the whole chunk defun.
                           (expansion
-                            (apply (eval `(lambda ,(append vars-list store-list)
-                                            (block ,accessor ,@body-forms)))
+                            (apply (%eval-expander-runtime
+                                    `(lambda ,(append vars-list store-list)
+                                       (block ,accessor ,@body-forms)))
                                    (append var-gensyms store-gensyms))))
                      `(let* (,@(mapcar #'list var-gensyms place-args)
                              ,@(mapcar #'list store-gensyms (list value-form)))
@@ -4195,13 +4237,14 @@
            ;; (1) Compile-time registration so OTHER forms in this same
            ;; compilation unit that USE the macro can expand against it.
            (let ((expander
-                  (eval `(lambda (form)
-                           (let* (,@(when whole-var `((,whole-var form)))
-                                  ,@(when env-var `((,env-var nil))))
-                             (declare (ignorable ,@(when whole-var (list whole-var))
-                                                 ,@(when env-var (list env-var))))
-                             (destructuring-bind (,@d-params) (cdr form)
-                               ,@body))))))
+                  (%eval-expander-runtime
+                   `(lambda (form)
+                      (let* (,@(when whole-var `((,whole-var form)))
+                             ,@(when env-var `((,env-var nil))))
+                        (declare (ignorable ,@(when whole-var (list whole-var))
+                                            ,@(when env-var (list env-var))))
+                        (destructuring-bind (,@d-params) (cdr form)
+                          ,@body))))))
              (mvm-define-macro (normalize-name name) expander))
          ;; (2) RUNTIME registration + return-the-name.  An ANSI deftest
          ;; like defmacro.1 does `(eq (defmacro NAME (..) ..) 'NAME)` and
@@ -15663,9 +15706,10 @@
            (body (cdddr form)))
        ;; Register macro expander
        ;; The expander is a host-side function (runs at compile time)
-       (let ((expander (eval `(lambda (form)
-                                 (destructuring-bind (,@params) (cdr form)
-                                   ,@body)))))
+       (let ((expander (%eval-expander-runtime
+                        `(lambda (form)
+                           (destructuring-bind (,@params) (cdr form)
+                             ,@body)))))
          (mvm-define-macro (normalize-name name) expander))
        nil))
 

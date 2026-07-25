@@ -3873,9 +3873,19 @@
    byte-identical.  T / NIL force on / off.")
 
 (defun mcgc-bitmap-on-p ()
-  (if (eq *mcgc-bitmap-enabled* :follow-gc)
-      *x64-gc-enabled*
-      *mcgc-bitmap-enabled*))
+  ;; Bitmap follows GC by default.  In a SELF-COMPILED image the defvar
+  ;; :follow-gc init doesn't run (limitation #7) so *mcgc-bitmap-enabled* is
+  ;; NIL, and its install-string setq does NOT reliably persist into the
+  ;; self-compiled image's runtime — but *x64-gc-enabled* DOES (proven: modus3
+  ;; inherits gc-checks but historically 0 object-start BTS -> unhardened
+  ;; collector -> corrupted hash-table bucket -> boot gethash hang).  So treat
+  ;; the uninitialized-default NIL as "follow gc" too, guaranteeing modus2
+  ;; emits the object-start bitmap into modus3.  Host builds keep the value
+  ;; :follow-gc (defvar init runs under SBCL), so their path is byte-identical
+  ;; and the ANSI gate is unaffected.  Explicit non-NIL still forces on.
+  (cond ((eq *mcgc-bitmap-enabled* :follow-gc) *x64-gc-enabled*)
+        ((null *mcgc-bitmap-enabled*)          *x64-gc-enabled*)
+        (t                                     *mcgc-bitmap-enabled*)))
 
 (defvar *mcgc-collector-enabled* :follow-gc
   "Controls the MCGC stage-3 collector enhancements to the x64 GC
@@ -3893,9 +3903,14 @@
    writes of stage 2 and the config words of stage 1).  T / NIL force.")
 
 (defun mcgc-collector-on-p ()
-  (if (eq *mcgc-collector-enabled* :follow-gc)
-      *x64-gc-enabled*
-      *mcgc-collector-enabled*))
+  ;; Same self-compiled-image persistence caveat as mcgc-bitmap-on-p: the
+  ;; :follow-gc default doesn't survive into modus2's runtime, but
+  ;; *x64-gc-enabled* does.  Treat uninitialized NIL as "follow gc" so modus3's
+  ;; emitted collector gets the scan_word conservative-root validation (the
+  ;; other half of the hardening).  Host path (value :follow-gc) is unchanged.
+  (cond ((eq *mcgc-collector-enabled* :follow-gc) *x64-gc-enabled*)
+        ((null *mcgc-collector-enabled*)          *x64-gc-enabled*)
+        (t                                        *mcgc-collector-enabled*)))
 
 (defvar *mcgc-kind-bitmap-enabled* nil
   "MASTER gate for the CONS-KIND bitmap feature (the fix for the symbol-
@@ -3915,7 +3930,15 @@
   "Kind-bitmap SET + CLEAR side: requires the object-start bitmap AND the
    master flag.  When this is on, cons alloc/copy sites mark cons starts and
    point-(c) clears the kind bits with the reclaimed range."
-  (and (mcgc-bitmap-on-p) *mcgc-kind-bitmap-enabled*))
+  ;; Self-compiled-image persistence: *mcgc-kind-bitmap-enabled* (defvar default
+  ;; NIL; explicitly set T by build-x64-linux:1744 for the ANSI gate AND by the
+  ;; self-host coinit) reads NIL in modus2's gen2 emission (the setq doesn't
+  ;; reach it).  Route the NIL case through *x64-gc-enabled* (which DOES persist,
+  ;; same as mcgc-bitmap-on-p).  Host/gate set the flag T explicitly, so they
+  ;; never hit the NIL branch -> byte-neutral there.
+  (and (mcgc-bitmap-on-p)
+       (cond ((null *mcgc-kind-bitmap-enabled*) *x64-gc-enabled*)
+             (t                                 *mcgc-kind-bitmap-enabled*))))
 
 (defvar *mcgc-kind-check-enabled* t
   "Sub-gate for the scan_word CONS-KIND cross-check (the two
@@ -3925,8 +3948,27 @@
    the SET side + clear but skips ONLY the reject — an A/B proving the CHECK
    (not incidental layout shift) restores correctness.")
 
+(defvar *ws5-force-no-kindcheck* nil
+  "WS5 A/B: when T, mcgc-kind-check-on-p returns NIL everywhere (reject off,
+   SET side kept).  Set by MODUS_WS5_NOKCHECK=1 at host build time.")
+
 (defun mcgc-kind-check-on-p ()
-  (and (mcgc-kind-bitmap-on-p) *mcgc-kind-check-enabled*))
+  ;; Same self-compiled-image caveat: *mcgc-kind-check-enabled* has a TRUTHY
+  ;; defvar default (t) which doesn't run in-image (limitation #7), so it reads
+  ;; NIL in modus2's gen2 emission.  When the flag is NIL, follow the kind-bitmap
+  ;; decision (they belong together).  Normal host/gate runs keep the flag T
+  ;; (defvar init runs under SBCL) -> t-branch -> byte-neutral.  CAVEAT: this
+  ;; makes the MODUS_MCGC_KINDCHECK=0 debug A/B knob (build-x64-linux:1811, which
+  ;; sets the flag NIL to disable ONLY the reject) no longer able to turn the
+  ;; check off — acceptable for a dev A/B; flag at gate/commit time.
+  ;; WS5-DBG: *ws5-force-no-kindcheck* (set by MODUS_WS5_NOKCHECK=1 at host
+  ;; build time) forces kind-check OFF unconditionally — the decisive A/B for
+  ;; "is the cons-kind-check reject the self-compile corruption source".  SET
+  ;; side kept; only the scan_word reject is suppressed.
+  (and (mcgc-kind-bitmap-on-p)
+       (not *ws5-force-no-kindcheck*)
+       (cond ((null *mcgc-kind-check-enabled*) (mcgc-kind-bitmap-on-p))
+             (t                                *mcgc-kind-check-enabled*))))
 
 (defvar *mcgc-pinning-enabled* nil
   "MCGC stage 3-4: the page-pinning mostly-copying collector (FFI/IO +

@@ -282,9 +282,29 @@
   ;; copies the live IR into to-space, reclaiming the garbage.
   (setq *x64-gc-enabled* t)
   (setq *mcgc-kind-bitmap-enabled* t)
+  ;; WS5 A/B: persist the kind-check-reject override into the in-image runtime
+  ;; (limitation #7 — the host-side defvar/setf does NOT reach modus2's runtime,
+  ;; so set it here where install-x64-translator authoritatively runs in-image).
+  (setq *ws5-force-no-kindcheck* WS5_NOKCHECK_VALUE)
   (setq *linux-x64-r14-offset* #x38000000)
   t)
 ")
+
+;; WS5 A/B substitution: bake t/nil into the coinit source for the kind-check
+;; override.  MODUS_WS5_NOKCHECK=1 -> the in-image translator co-init sets
+;; *ws5-force-no-kindcheck* T (kind-check reject OFF in the emitted collector).
+#+sbcl
+(let ((val (let ((v (sb-ext:posix-getenv "MODUS_WS5_NOKCHECK")))
+             (if (and v (string= v "1")) "t" "nil")))
+      (needle "WS5_NOKCHECK_VALUE"))
+  (let ((pos (search needle *x64-translator-coinit-source*)))
+    (when pos
+      (setf *x64-translator-coinit-source*
+            (concatenate 'string
+                         (subseq *x64-translator-coinit-source* 0 pos)
+                         val
+                         (subseq *x64-translator-coinit-source* (+ pos (length needle)))))
+      (format t "~&;; WS5-NOKCHECK coinit substitution: *ws5-force-no-kindcheck* = ~A~%" val))))
 
 ;;; --- target descriptors (target.lisp, modus.mvm) ---
 (defvar *target-source* (mvm-text "mvm/target.lisp"))
@@ -1016,6 +1036,15 @@
   ;; nonlocal block/return-from compiles).  Init both to 0.
   (setq *kw-rest-counter* 0)
   (setq *nonlocal-block-tag-counter* 0)
+  ;; WS5 modus3 BUG#3 (2026-07-25): same limitation-#7 gap for the string-bake
+  ;; threshold.  *ws5-str-bake-min* (defvar 0) is UNBOUND in the self-compiled
+  ;; gen2, so compile-quote's `(>= (length s) *ws5-str-bake-min*)` bake test
+  ;; errors for EVERY string literal during gen2's compile of gen3 → all of
+  ;; gen3's strings fall to the runtime *e2-const-pool* path (empty in the
+  ;; child → garbage) → gen3's CLI string= never matches (--compile echoed,
+  ;; rc=1), REPL prints mangled, image 4.6MB smaller (missing const pools).
+  ;; Init to 0 = bake ALL strings, matching the host/gen1 default.
+  (setq *ws5-str-bake-min* 0)
   ;; WS5 modus3 FIX: *x64-native-code-offset* is a defvar; its build-time
   ;; (setf … 397) at the tail of this file runs HOST-side and does NOT persist
   ;; into the image (limitation #7 — defvar init-thunks don't run at boot).  So
@@ -1519,6 +1548,13 @@
   (when (and v (string= v "0"))
     (setf modus.mvm.x64::*mcgc-kind-check-enabled* nil)
     (format t "~&;; WS5-BISECT: *mcgc-kind-check-enabled* = NIL~%")))
+;; WS5 A/B: force the cons-kind CHECK reject OFF unconditionally (the WIP's
+;; mcgc-kind-check-on-p routes a NIL flag back through the bitmap decision, so
+;; MODUS_WS5_KINDCHECK=0 alone no longer disables it — this hard override does).
+#+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_NOKCHECK")))
+  (when (and v (string= v "1"))
+    (setf modus.mvm.x64::*ws5-force-no-kindcheck* t)
+    (format t "~&;; WS5-BISECT: *ws5-force-no-kindcheck* = T (reject OFF)~%")))
 ;; WS5 string-bake threshold probe (sweep to bracket the GC-corruption size).
 #+sbcl (let ((v (sb-ext:posix-getenv "MODUS_WS5_STRMIN")))
   (when (and v (> (length v) 0))

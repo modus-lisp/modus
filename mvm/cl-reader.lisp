@@ -913,10 +913,19 @@
         (setq i (+ i 1))))
     ;; Convert num/den → IEEE via SSE2 (a #x60 double payload).
     (let* ((signed-mant (* sign mantissa))
+           ;; %float-from-int is raw SSE2 cvtsi2sd on a FIXNUM; the decimal
+           ;; exponent loops above push mantissa/divisor into BIGNUM range for
+           ;; large |exponent| literals (1.79d308, 5.9e-8, denormals), and
+           ;; cvtsi2sd of a bignum converts its tagged heap POINTER — the
+           ;; parsed value became a function of the allocation address:
+           ;; wrong AND different on every parse (broke bit-reproducible
+           ;; self-compiles; the 3-float-thunk md5 variance in task #187/#191).
+           ;; %bignum-to-float (cl-types) folds limbs MSB-first in float
+           ;; domain — deterministic, fixnum-transparent, bignum-correct.
            (raw (if (= divisor 1)
-                    (%float-from-int signed-mant)
-                    (%float-div (%float-from-int signed-mant)
-                                (%float-from-int divisor))))
+                    (%bignum-to-float signed-mant)
+                    (%float-div (%bignum-to-float signed-mant)
+                                (%bignum-to-float divisor))))
            (type (if type-arg (car type-arg) 'single-float)))
       ;; Single (the CLHS default) rounds to 24-bit + retags #x61; double
       ;; keeps the full #x60 payload.

@@ -638,6 +638,14 @@
   (setq array-rank-limit        256)
   (setq call-arguments-limit    256)
   (setq lambda-parameters-limit 256)
+  ;; lambda-list-keywords: a standard CL constant.  alexandria's macros.lisp
+  ;; reads `#.(set-difference lambda-list-keywords '(...))' at READ time — if
+  ;; unbound the whole form is silently dropped, cascading to undefined
+  ;; parse-ordinary-lambda-list and downstream defuns.  (Same read-time class
+  ;; as array-dimension-limit above; the aarch64 builds already set this.)
+  (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
+                                   &optional &rest &whole))
+  (setq multiple-values-limit   16)
   (setq pi 3.141592653589793d0)
   ;; AFTER init-all-globals — overrides defvar's init.  *write-object-
   ;; budget* defvars to 0 which immediately exhausts; we want a huge

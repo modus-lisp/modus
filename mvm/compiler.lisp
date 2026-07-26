@@ -1790,6 +1790,21 @@
             (val-form (caddr form)))
         `(nth ,n (multiple-value-list ,val-form)))))
 
+  ;; MULTIPLE-VALUE-CALL → (apply FN (append (multiple-value-list f1) ...))
+  ;; Modus had no compile handler for this standard special operator, so
+  ;; `(multiple-value-call fn a b)` fell through to a call of an undefined
+  ;; function MULTIPLE-VALUE-CALL (surfaced by alexandria's CURRY).  Each
+  ;; argument form must be evaluated in a multiple-values context and ALL its
+  ;; values spliced in order — exactly what the standard compiler-macro does.
+  ;; multiple-value-list/apply/append are all already supported.  Zero value
+  ;; forms → (apply fn nil) = (funcall fn).
+  (mvm-define-macro "MULTIPLE-VALUE-CALL"
+    (lambda (form)
+      (let ((fn (cadr form))
+            (val-forms (cddr form)))
+        `(apply ,fn (append ,@(mapcar (lambda (f) `(multiple-value-list ,f))
+                                      val-forms))))))
+
   ;; TYPECASE → COND + TYPEP
   (mvm-define-macro "TYPECASE"
     (lambda (form)

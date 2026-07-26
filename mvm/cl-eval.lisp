@@ -232,37 +232,43 @@
 (defun fdefinition (sym)
   "Return the function definition of SYM.
    For generic functions, returns the GF object."
-  ;; CLHS: fdefinition is defined for macros (returns the macro's expander
-  ;; function) and for special operators its consequences are merely
-  ;; undefined — it must NOT signal undefined-function the way it would for
-  ;; a never-fbound symbol.  symbol-function below errors for cond/setq/etc.
-  ;; (they live in no function table), so intercept macros & special
-  ;; operators first.  (fdefinition.2 (fdefinition 'cond), fdefinition.3
-  ;; (fdefinition 'setq).)
+  ;; PRECEDENCE (CLHS-faithful): generic function, then ORDINARY FUNCTION,
+  ;; then macro, then special operator.  A real function binding MUST win
+  ;; over an inlining macro: 1+/1-/… are funcallable functions that ALSO
+  ;; carry a compile-time macro for inlining, and the old macro-first order
+  ;; made (fdefinition '1+) return the macro EXPANDER — so (funcall
+  ;; (fdefinition '1+) n), alexandria COMPOSE (ensure-function → fdefinition
+  ;; on a symbol), and (mapcar #'sym …) all PROGRAM-ERROR'd (an expander
+  ;; wants (form env), not a value).  Macros/special ops still resolve last
+  ;; so (fdefinition 'cond)/(fdefinition 'setq) keep working (they have no
+  ;; ordinary-function binding).
+  ;; GF registry first (CL-symbol generic functions).
+  (when (%cl-sym-p sym)
+    (let ((gf (%find-gf sym)))
+      (when gf (return-from fdefinition gf))))
+  ;; Ordinary-function binding next.  Probe the function tables DIRECTLY —
+  ;; not fboundp, which is also true for macros/special ops and so can't
+  ;; gate this.  (Same lookup symbol-function uses, via %sym-name-or-hash.)
+  (let ((nh (%sym-name-or-hash sym)))
+    (when nh
+      (let* ((name (car nh))
+             (hash (cdr nh))
+             (fn (or (and (> (length name) 0)
+                          *symbol-function-table*
+                          (gethash name *symbol-function-table*))
+                     (and *native-sym-function-table*
+                          (gethash hash *native-sym-function-table*)))))
+        (when fn (return-from fdefinition fn)))))
+  ;; Macros (COND/SETQ/DEFUN: an expander but no ordinary function).
   (let ((mf (macro-function sym)))
     (when mf (return-from fdefinition mf)))
+  ;; Special operators — CLHS leaves consequences undefined; return the sym.
   (when (and (or (%cl-sym-p sym) (%native-sym-p sym))
              (special-operator-p sym))
     (return-from fdefinition sym))
-  (let ((name (cond
-                ((%cl-sym-p sym) (%cl-sym-name sym))
-                ((stringp sym) sym)
-                ((and (consp sym) (eq (car sym) 'setf))
-                 ;; (setf foo) — look up as regular name for now
-                 nil)
-                (t nil))))
-    (when (null name)
-      (return-from fdefinition (symbol-function sym)))
-    ;; Check GF registry first
-    (let ((gf-sym (cond
-                    ((%cl-sym-p sym) sym)
-                    ((stringp sym) nil)
-                    (t nil))))
-      (when gf-sym
-        (let ((gf (%find-gf gf-sym)))
-          (when gf (return-from fdefinition gf)))))
-    ;; Fall back to symbol-function
-    (symbol-function sym)))
+  ;; Nothing found — symbol-function signals undefined-function (this is
+  ;; also the (setf foo) path, resolved there by its mangled name).
+  (symbol-function sym))
 
 (defun set-fdefinition (sym fn)
   "Set the function definition of SYM."

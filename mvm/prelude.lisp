@@ -1954,7 +1954,11 @@
 
 (defun subseq (seq start &rest end-arg)
   "Return a subsequence from START to END (END defaults to length)."
-  (let ((end (if end-arg (car end-arg) (length seq))))
+  ;; An EXPLICIT nil end (CL: (subseq s start nil)) means \"to the end\" —
+  ;; same as omitting it.  Guarding on end-arg alone left end=NIL, which the
+  ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates
+  ;; it via its (null cur) terminator).  Treat present-but-nil like absent.
+  (let ((end (if (and end-arg (car end-arg)) (car end-arg) (length seq))))
   ;; NIL is a (empty) list: (subseq nil 0 0) must return NIL, not #().
   ;; The consp-only test sent NIL down the array branch, returning an
   ;; empty VECTOR — which broke the in-image compiler's static-rest

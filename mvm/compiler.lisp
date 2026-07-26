@@ -4185,6 +4185,20 @@
                              (string= (symbol-name (car raw-name)) "SETF"))
                         (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                         raw-name)))
+         ;; In-image eval2: a DEFUN is ALWAYS a global definition (CLHS) even
+         ;; when it reaches compile-form nested — inside %eval2-thunk (a bare
+         ;; top-level expression), a top-level MACROLET/LET body, a deftest
+         ;; thunk, etc.  It compiles into the module (via *pending-flet-ir*
+         ;; below, which gives it an offset) but WITHOUT this it was never
+         ;; recorded for the trampoline-install loop, so a LATER (eval2 …) form
+         ;; got UNDEFINED-FUNCTION.  This is the alexandria lists.lisp case:
+         ;; LASTCAR / PROPER-LIST-LENGTH are defined by a top-level `macrolet`
+         ;; `def` (wrapped into %eval2-thunk → nested here), then called from a
+         ;; later top-level form.  Mirror the toplevel DEFUN handler's record.
+         (when *eval2-runtime-p*
+           (setq *e2-persist-defuns*
+                 (cons (if (symbolp name) (symbol-name name) (string name))
+                       *e2-persist-defuns*)))
          (let* ((rest-pos (position '&rest params))
                 (opt-pos  (position '&optional params))
                 (key-pos  (position '&key params))

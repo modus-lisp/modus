@@ -433,6 +433,10 @@
     ;; DNS-over-UDP/TCP resolver.  The gateway to networked ql:quickload.
     (mvm-text "net/hosted-sockets.lisp")
     (string #\Newline)
+    ;; Hosted block storage + durability: raw-fd positioned block I/O + fsync/
+    ;; ftruncate.  The persistence layer for pagetree/cabinet/cl-consensus.
+    (mvm-text "net/hosted-storage.lisp")
+    (string #\Newline)
     ;; The SHARED SBCL-faithful CLI toplevel: full argv (via the initial-stack
     ;; walk), SBCL-style flag parsing, ~/.modusrc, and the REPL.  It references
     ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).

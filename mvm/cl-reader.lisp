@@ -975,6 +975,19 @@
     ;; Parse the float: integer-part.fraction-part[exponent]
     (let ((sign 1) (cur codes) (int-part 0) (frac-part 0) (frac-div 1)
           (exp-sign 1) (exp-part 0) (in-frac nil) (in-exp nil) (got-digit nil)
+          ;; Significant-digit cap (17): decimal digits beyond a double's
+          ;; precision cannot affect the value, and UNCAPPED accumulation
+          ;; pushed mantissa AND frac-div into bignum range together for
+          ;; long literals ("1.0<1000 zeros>1", ANSI syntax-tokens
+          ;; 25765/25766) — %bignum-to-float then gave inf/inf = NaN.
+          ;; (The pre-2ee5273 cvtsi2sd-of-pointer bug ACCIDENTALLY passed
+          ;; those tests: two consecutively-allocated bignums' pointers
+          ;; divide to ~1.0.)  Excess INT digits count into int-extra
+          ;; (added to the decimal exponent); excess FRAC digits drop.
+          ;; Leading fractional zeros are scale, not significance — they
+          ;; keep growing frac-div (deterministic inf -> underflow 0.0 is
+          ;; correct for sub-denormal magnitudes).
+          (sig-digits 0) (int-extra 0)
           (marker :default))   ; exponent-marker class (numeric tower N1)
       ;; Sign
       (when (and cur (= (car cur) 45)) (setq sign -1) (setq cur (cdr cur)))
@@ -987,10 +1000,25 @@
              (let ((d (- code 48)))
                (setq got-digit t)
                (cond
-                 (in-exp (setq exp-part (+ (* exp-part 10) d)))
-                 (in-frac (setq frac-part (+ (* frac-part 10) d))
-                          (setq frac-div (* frac-div 10)))
-                 (t (setq int-part (+ (* int-part 10) d))))))
+                 ;; Clamp the exponent digits: the value saturates to
+                 ;; inf/0 long before 9999, and an unclamped exp-part
+                 ;; drives the 10^n scaling loops into huge bignums.
+                 (in-exp (when (< exp-part 9999)
+                           (setq exp-part (+ (* exp-part 10) d))))
+                 (in-frac
+                  (cond ((< sig-digits 17)
+                         (setq frac-part (+ (* frac-part 10) d))
+                         (setq frac-div (* frac-div 10))
+                         (when (or (> int-part 0) (> frac-part 0))
+                           (setq sig-digits (+ sig-digits 1))))
+                        (t nil)))   ; beyond double precision: drop
+                 (t
+                  (cond ((< sig-digits 17)
+                         (setq int-part (+ (* int-part 10) d))
+                         (when (> int-part 0)
+                           (setq sig-digits (+ sig-digits 1))))
+                        ;; extra integer digits are pure scale
+                        (t (setq int-extra (+ int-extra 1))))))))
             ((= code 46)
              (if in-frac (return-from %try-parse-float nil)
                  (setq in-frac t)))
@@ -1014,8 +1042,11 @@
       ;; Build a boxed float.  Use the rename'd builder — `%make-float'
       ;; is the compiler primop that allocates an uninitialized 1-slot
       ;; float, NOT a defun call.
-      (%build-float-from-parts sign int-part frac-part frac-div exp-sign exp-part
-                               (%resolve-float-type marker)))))
+      ;; Fold capped-integer-digit scale into the decimal exponent.
+      (let ((eff-exp (+ (* exp-sign exp-part) int-extra)))
+        (%build-float-from-parts sign int-part frac-part frac-div
+                                 (if (< eff-exp 0) -1 1) (abs eff-exp)
+                                 (%resolve-float-type marker))))))
 
 (defun %tag-as-float (arr)
   "Tag an array as a float object (subtag #x60 = 96).

@@ -14735,13 +14735,22 @@
       (emit-ir :li cmp-reg sentinel-tag)
       (emit-ir :cmp nargs-reg cmp-reg)
       (emit-ir :bne after-sentinel)
+      ;; NIL-init ALL unsupplied optional slots, NOT just the register-resident
+      ;; ones (i < +max-reg-args+).  Slot i is the local frame slot RBP-96-i*8
+      ;; for every i (uniform), and the frame-enter prologue copies caller-stack
+      ;; overflow args (i>=4) into those slots INCLUDING the slots of optionals
+      ;; the caller never supplied — so a stack-resident optional (>=5 required
+      ;; params) read stale caller-stack garbage.  Capping at +max-reg-args+
+      ;; left `(defun f (a b c d e &optional g) …)` binding g to 0, which broke
+      ;; alexandria switch/eswitch/cswitch (generate-switch-body's 6th param
+      ;; DEFAULT read 0 → spurious "Multiple default clauses").
       (loop for i from opt-start
-            below (min (+ opt-start opt-count) +max-reg-args+)
+            below (+ opt-start opt-count)
             do (emit-ir :stack-store +vreg-vn+ i))
       (emit-ir :br skip-all)
       (emit-ir-label after-sentinel)
       (loop for i from opt-start
-            below (min (+ opt-start opt-count) +max-reg-args+)
+            below (+ opt-start opt-count)
             do
             (let ((skip-slot (make-compiler-label)))
               (emit-ir :li cmp-reg (ash (+ i 1) 1))   ; +fixnum-shift+ == 1; inline :shl

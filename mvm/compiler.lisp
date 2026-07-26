@@ -16043,15 +16043,34 @@
                 (push `(defun ,(%defstruct-intern ctor-fn-name) ()
                          (,internal-ctor-sym ,@slot-defaults))
                       forms-to-compile))
-               ;; (:CONSTRUCTOR foo) — positional in struct slot order
+               ;; (:CONSTRUCTOR foo) with NO arglist = a KEYWORD constructor
+               ;; (CLHS 3.4.6), identical to the default MAKE-<name> but named
+               ;; foo — NOT positional.  (The old code emitted a positional
+               ;; defun, so `(foo :slot v)` bound SLOT-0 to the keyword :SLOT
+               ;; and shifted every value — alexandria/bt/chipz `(:constructor
+               ;; %make-x)` keyword ctors all mis-filled their slots.)  Register
+               ;; the same keyword→positional expander MAKE-<name> uses.
                ((eq arg-spec :default)
-                (let ((params (loop for s in slot-names
-                                    collect (%defstruct-intern
-                                             (format nil "P-~A"
-                                                     (symbol-name s))))))
-                  (push `(defun ,(%defstruct-intern ctor-fn-name) ,params
-                           (,internal-ctor-sym ,@params))
-                        forms-to-compile)))
+                (let* ((kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
+                       (ds slot-defaults)
+                       (n nslots)
+                       (ics internal-ctor-sym)
+                       (expander
+                         (lambda (form)
+                           (let ((cargs (cdr form))
+                                 (positional (make-list n :initial-element nil)))
+                             (loop for i from 0 for d in ds
+                                   do (setf (nth i positional) d))
+                             (loop while cargs
+                                   do (let ((idx (position (normalize-name (car cargs))
+                                                           kw-names :test #'=)))
+                                        (when idx
+                                          (setf (nth idx positional) (cadr cargs))))
+                                      (setf cargs (cddr cargs)))
+                             `(,ics ,@positional)))))
+                  (mvm-define-macro ctor-fn-name expander)
+                  (when *eval2-runtime-p*
+                    (set-macro-function (%defstruct-intern ctor-fn-name) expander))))
                ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — BOA lambda-list.
                ;; The lambda-list variables ARE slot names (CLHS 3.4.6).  We
                ;; emit a defun whose parameter list IS the BOA arg-spec

@@ -74,20 +74,32 @@
     (nreverse acc)))
 
 (defun %it-eval-source (source-string tag)
-  "Read+eval every top-level form in SOURCE-STRING (a .lisp file's text).
-   Each form is eval'd; an error in one form is reported but does not abort
-   the whole file (mirrors the proven form-by-form load path)."
-  (let ((forms (%it-read-forms source-string))
+  "Read+eval every top-level form in SOURCE-STRING (a .lisp file's text),
+   INTERLEAVING read and eval one form at a time from a single stream — this
+   is essential: a leading `(in-package :foo)` must take effect (it side-
+   effects *package* at eval time) BEFORE the file's remaining forms are READ,
+   or those symbols intern in the wrong package.  Reading the whole file up
+   front (the old path) left symbols split across packages across files.  An
+   error in one form is reported but does not abort the whole file."
+  (let ((s (make-string-input-stream source-string))
+        (eof (list 'eof))
         (count 0))
-    (dolist (form forms)
-      (handler-case
-          (progn (eval form) (setq count (+ count 1)))
-        (t (c)
-          (write-string-serial "  !! form eval error in ")
-          (write-string-serial tag) (write-string-serial ": ")
-          (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
-          (write-char-serial 10))))
-    count))
+    (loop
+      (let ((form (handler-case (read s nil eof)
+                    (t (c)
+                      (write-string-serial "  !! read error in ")
+                      (write-string-serial tag) (write-string-serial ": ")
+                      (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
+                      (write-char-serial 10)
+                      eof))))     ; a read error ends the file
+        (when (eq form eof) (return count))
+        (handler-case
+            (progn (eval form) (setq count (+ count 1)))
+          (t (c)
+            (write-string-serial "  !! form eval error in ")
+            (write-string-serial tag) (write-string-serial ": ")
+            (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
+            (write-char-serial 10)))))))
 
 ;;; --- .asd parsing -----------------------------------------------------------
 ;;;

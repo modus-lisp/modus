@@ -2013,6 +2013,18 @@
         (list '%defpackage-impl
               (list 'quote (cadr form))
               (list 'quote (cddr form)))))
+    ;; IN-PACKAGE (RUNTIME / eval2 only): per CLHS 11.1.2.1.2 the argument is
+    ;; a package designator that is NOT evaluated.  As a plain function
+    ;; `(in-package #:natrium)` evaluated #:natrium as a variable →
+    ;; UNBOUND-VARIABLE (self-evaluating keyword/string designators worked by
+    ;; accident; symbol designators did not — the natrium/asdf load blocker).
+    ;; Expand to the worker with the designator QUOTED; %in-package-1 →
+    ;; find-package coerces string/symbol/uninterned-symbol/package uniformly.
+    ;; load's read/eval loop still switches the reader *package* between forms
+    ;; because the eval side-effects *package* before the next READ.
+    (mvm-define-macro "IN-PACKAGE"
+      (lambda (form)
+        (list '%in-package-1 (list 'quote (cadr form)))))
     ;; DEFTYPE (RUNTIME / eval2 only — same rationale as DEFPACKAGE above):
     ;; register the expander in the SAME *%runtime-deftype-table* the
     ;; tree-walker's DEFTYPE handler uses, so typep/subtypep's

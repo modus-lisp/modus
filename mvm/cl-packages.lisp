@@ -1192,12 +1192,22 @@
 
 ;;; --- in-package ---
 
-(defun in-package (name)
-  "Set *package* to the package named NAME."
+(defun %in-package-1 (name)
+  "Worker for IN-PACKAGE: resolve the package designator NAME (string,
+   symbol — interned or uninterned — or package object) and make it the
+   current *package*.  This is what the IN-PACKAGE macro expands to, so
+   the designator arrives QUOTED (unevaluated) per CLHS 11.1.2.1.2."
   (let ((pkg (find-package name)))
     (when pkg
       (setq *package* pkg))
     pkg))
+
+(defun in-package (name)
+  "Set *package* to the package named NAME.  Retained as a function for
+   programmatic callers that pass an already-evaluated designator; the
+   IN-PACKAGE macro (compiler.lisp) routes source `(in-package foo)` to
+   %in-package-1 so FOO is not evaluated as a variable."
+  (%in-package-1 name))
 
 ;;; --- Iteration: do-symbols, do-external-symbols, do-all-symbols ---
 

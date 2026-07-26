@@ -78,6 +78,55 @@
             (setq i (+ i 1)))))))
 
 ;;; ============================================================
+;;; Server sockets — bind / listen / accept (TCP)
+;;; ============================================================
+;;; For the modus-lisp relays/servers (glass VNC, skep Nostr relay,
+;;; cl-frpc, cl-rustdesk).  bind(49)/listen(50)/accept(43) are all <= 3
+;;; args, so they ride syscall3 too.  (SO_REUSEADDR needs setsockopt =
+;;; 5 args -> a syscall6 trap; deferred with sendto/recvfrom for UDP
+;;; multi-peer.  Without it a just-closed listen port sits in TIME_WAIT
+;;; for ~60s before it can rebind.)
+
+;;; Open a TCP socket, bind to 0.0.0.0:PORT, and listen with BACKLOG.
+;;; Returns the listening fd, or -1 on any failure.
+(defun socket-listen (port backlog)
+  (let ((fd (%sock-open 1)))                 ; SOCK_STREAM
+    (if (< fd 0)
+        -1
+        (progn
+          (%sock-build-addr 0 port)          ; INADDR_ANY : PORT
+          (if (< (syscall3 49 fd (%sock-addr-buf) 16) 0)   ; bind
+              (progn (socket-close fd) -1)
+              (if (< (syscall3 50 fd backlog 0) 0)         ; listen
+                  (progn (socket-close fd) -1)
+                  fd))))))
+
+;;; Accept one connection on listening LFD.  Peer address is discarded
+;;; (accept(fd, NULL, NULL)).  Returns the connected client fd, or -1.
+;;; Blocks until a client connects.
+(defun socket-accept (lfd)
+  (let ((c (syscall3 43 lfd 0 0)))
+    (if (< c 0) -1 c)))
+
+;;; Self-test / minimal server: listen on PORT, accept ONE connection,
+;;; read up to MAX bytes, echo them straight back, close both fds.
+;;; Returns the number of bytes echoed, or -1 on a setup error.  Proves
+;;; bind+listen+accept+recv+send against an external client.
+(defun socket-echo-once (port max)
+  (let ((lfd (socket-listen port 4)))
+    (if (< lfd 0)
+        -1
+        (let ((cfd (socket-accept lfd)))
+          (if (< cfd 0)
+              (progn (socket-close lfd) -1)
+              (let ((buf (make-array max)))
+                (let ((n (socket-recv cfd buf max)))
+                  (when (> n 0) (socket-send cfd buf n))
+                  (socket-close cfd)
+                  (socket-close lfd)
+                  n)))))))
+
+;;; ============================================================
 ;;; DNS over UDP (or TCP) — the first real use of the socket layer
 ;;; ============================================================
 

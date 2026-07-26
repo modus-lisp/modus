@@ -507,6 +507,14 @@
   (syscall3 60 1 0 0))
 (defun %rbq-sym-name-eq (sym name)
   (and (symbolp sym) (string= (symbol-name sym) name)))
+;; UNQUOTE*-equivalent: a nested splice `,,@x / `,,.x evaluates X in the OUTER
+;; pass and must present X's value to the INNER (pass-2) backquote as spliceable
+;; template elements.  Wrap each element in a fresh COMMA marker so pass-2 re-
+;; processes it (a template element re-expands; a plain datum self-quotes).  This
+;; is what makes alexandria once-only's ``(,,g ,,(cdr n)) inside `(let (,,@...))
+;; collapse correctly instead of leaving a raw (BACKQUOTE ...) as a LET binding.
+(defun %rbq-splice-commas (lst)
+  (mapcar (lambda (%sc-e) (list 'comma %sc-e)) lst))
 ;; Level-tracking backquote expander.  LEVEL counts open backquotes
 ;; whose commas are still pending; the entry from the macro is LEVEL 1.
 ;; A COMMA at LEVEL 1 unquotes (its expr stays live); a COMMA at deeper
@@ -551,6 +559,23 @@
           (list 'append2 (cadr first) (%rbq-list rest level)))
          ((and (consp first) (%rbq-sym-name-eq (car first) \"COMMA-DOT\") (= level 1))
           (list 'append2 (cadr first) (%rbq-list rest level)))
+         ;; nested splice `,,@E / `,,.E (outer COMMA + inner COMMA-AT/DOT) at
+         ;; level 2: outer comma is active THIS pass, so evaluate E now, then
+         ;; hand each element to pass-2 wrapped in a COMMA marker (%rbq-splice-
+         ;; commas) so pass-2 re-processes it.  Splicing raw would leave un-
+         ;; expanded (BACKQUOTE ...) elements (once-only's LET-binding bug).
+         ((and (consp first) (= level 2)
+               (%rbq-sym-name-eq (car first) \"COMMA\")
+               (consp (cadr first))
+               (%rbq-sym-name-eq (car (cadr first)) \"COMMA-AT\"))
+          (list 'append2 (list '%rbq-splice-commas (cadr (cadr first)))
+                (%rbq-list rest level)))
+         ((and (consp first) (= level 2)
+               (%rbq-sym-name-eq (car first) \"COMMA\")
+               (consp (cadr first))
+               (%rbq-sym-name-eq (car (cadr first)) \"COMMA-DOT\"))
+          (list 'append2 (list '%rbq-splice-commas (cadr (cadr first)))
+                (%rbq-list rest level)))
          (t
           (list 'cons (%rbq first level)
                 (%rbq-list rest level))))))))

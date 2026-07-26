@@ -5008,6 +5008,8 @@
        (compile-prim-array-length (cadr form) env dest))
       ((= op-name (compute-name-hash "%PRIM-STRINGP"))
        (compile-prim-stringp (cadr form) env dest))
+      ((= op-name (compute-name-hash "%MAKE-ARRAY-RAW"))
+       (compile-make-array-raw (cadr form) env dest))
       ((= op-name (compute-name-hash "%ALLOC-U8"))
        (compile-alloc-u8 (cadr form) env dest))
       ((= op-name (compute-name-hash "%U8-REF"))
@@ -13638,10 +13640,35 @@
           (null (cdr (cadr size-form))))
      (compile-make-array-1d (car (cadr size-form)) env dest))
     (t
-     (compile-form size-form env dest)
-     (emit-ir :sar dest dest +fixnum-shift+)
-     (emit-ir :gc-check)
-     (emit-ir :alloc-array dest dest))))
+     ;; Variable / expression dim.  The runtime VALUE may be a CONS — a
+     ;; multi-dimensional dimensions list, e.g. `(make-array dims)` with
+     ;; dims bound to '(4 3 2 1), or `(make-array (list 2 2))`.  The old
+     ;; SAR-then-alloc-array path assumed a fixnum: it SHR'd the cons
+     ;; POINTER into a garbage element count and ALLOC-ARRAY advanced R12
+     ;; by ~gigabytes → SIGSEGV (alexandria row-major-index.* / any rank>1
+     ;; make-array).  Guard at RUNTIME: a cons routes to the MAKE-ARRAY
+     ;; defun (multi-dim: product of dims + rank); an integer stays on the
+     ;; fast inline path via %MAKE-ARRAY-RAW.  NB the fast path MUST be
+     ;; kept: the runtime MAKE-ARRAY defun itself allocates its flat data
+     ;; vector with `(make-array total)` (integer) — routing that to the
+     ;; defun would recurse forever.  %MAKE-ARRAY-RAW is the un-guarded raw
+     ;; 1-D alloc (no re-entry), and CONSP has excluded the cons case.
+     (compile-form
+      `(let ((%mar-sz ,size-form))
+         (if (consp %mar-sz)
+             (funcall (function make-array) %mar-sz)
+             (%make-array-raw %mar-sz)))
+      env dest))))
+
+(defun compile-make-array-raw (size-form env dest)
+  "Raw 1-D array allocation from an INTEGER size value (already known
+   non-cons by the caller's CONSP guard).  This is the old fast path
+   split out so the guarded variable path can reach it WITHOUT re-entering
+   compile-make-array (which would loop through the CONSP guard forever)."
+  (compile-form size-form env dest)
+  (emit-ir :sar dest dest +fixnum-shift+)
+  (emit-ir :gc-check)
+  (emit-ir :alloc-array dest dest))
 
 (defun %quoted-multidim-list-p (form)
   "If FORM is `'(M N …)` with all-integer dims and length ≥ 2 (or 0 —

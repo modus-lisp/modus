@@ -2362,20 +2362,21 @@
   ;; expands to (setf place (fn place args...)).
   ;; Tests using this require runtime macro definition; we register an MVM
   ;; macro at compile time so subsequent (name place args...) forms expand.
+  ;; DEFINE-MODIFY-MACRO — expand to a real DEFMACRO so the modify-macro
+  ;; PERSISTS across eval2 forms.  The previous impl side-effected
+  ;; mvm-define-macro into the per-call *macro-table* (which eval2-forms rebinds
+  ;; fresh every call) and returned (quote name), so `(define-modify-macro
+  ;; appendf …)` then a use of APPENDF in a LATER top-level form got
+  ;; UNDEFINED-FUNCTION (alexandria appendf/nconcf/unionf/nunionf).  A DEFMACRO
+  ;; form routes through the DEFMACRO handler's persistence path (like any
+  ;; plain top-level defmacro).  The generic `(place &rest args)` expansion is
+  ;; correct for every define-modify-macro use — FN can be a symbol or a lambda.
   (mvm-define-macro "DEFINE-MODIFY-MACRO"
     (lambda (form)
-      (let* ((name (cadr form))
-             (ll (caddr form))
-             (fn (cadddr form)))
-        (mvm-define-macro
-          (symbol-name name)
-          (let ((fn-name fn) (lambda-list ll))
-            (lambda (mform)
-              (let ((place (cadr mform))
-                    (args (cddr mform)))
-                (declare (ignore lambda-list))
-                `(setf ,place (,fn-name ,place ,@args))))))
-        `(quote ,name))))
+      (let ((name (cadr form))
+            (fn (cadddr form)))
+        `(defmacro ,name (%dmm-place &rest %dmm-args)
+           (list 'setf %dmm-place (list* ',fn %dmm-place %dmm-args))))))
 
   ;; GET-SETF-EXPANSION — stub returning a generic 5-value tuple.
   ;; Used by tests that introspect setf machinery; the structure is correct

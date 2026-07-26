@@ -10443,10 +10443,17 @@
           ((or (= hash (compute-name-hash "LOOP"))
                (= hash (compute-name-hash "BLOCK")))
            (loop-body-has-mv-return-p (cdr form)))
-          ;; multiple-value-bind / multiple-value-call — tail is the body's tail
-          ((or (= hash (compute-name-hash "MULTIPLE-VALUE-BIND"))
-               (= hash (compute-name-hash "MULTIPLE-VALUE-CALL")))
+          ;; multiple-value-bind — MV result comes from the body's tail form.
+          ((= hash (compute-name-hash "MULTIPLE-VALUE-BIND"))
            (tail-form-is-values-p (cdddr form)))
+          ;; multiple-value-call — like APPLY/FUNCALL, its result is whatever
+          ;; the CALLED function returned, INCLUDING multiple values.  Always
+          ;; MV-producing.  (The old code checked (cdddr form) — the arg forms
+          ;; AFTER the first value-form — which is nil for a single-value-form
+          ;; mvc like `(multiple-value-call f (apply g args))`, so the lambda
+          ;; epilogue clamped MV-count=1 and dropped a callee's extra values —
+          ;; alexandria multiple-value-compose + ensure-gethash.)
+          ((= hash (compute-name-hash "MULTIPLE-VALUE-CALL")) t)
           ;; multiple-value-prog1 — MV propagation comes from FIRST (the
           ;; saved-values form), NOT the cleanup body.  Without this
           ;; (defun … (multiple-value-prog1 (funcall body-fn) cleanup))

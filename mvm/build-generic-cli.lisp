@@ -437,6 +437,10 @@
     ;; ftruncate.  The persistence layer for pagetree/cabinet/cl-consensus.
     (mvm-text "net/hosted-storage.lisp")
     (string #\Newline)
+    ;; Hosted HTTP/1.0 client on the socket layer: URL -> DNS -> TCP -> GET.
+    ;; The gateway to networked ql:quickload (fetch dist + tarballs).
+    (mvm-text "net/hosted-http.lisp")
+    (string #\Newline)
     ;; The SHARED SBCL-faithful CLI toplevel: full argv (via the initial-stack
     ;; walk), SBCL-style flag parsing, ~/.modusrc, and the REPL.  It references
     ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).

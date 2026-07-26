@@ -2077,6 +2077,9 @@
                   (list '%eval-set-global
                         (list 'quote (cadr form))
                         (caddr form))
+                  ;; Mark NAME a constant variable so (constantp 'name) is T
+                  ;; (CLHS) — alexandria define-constant.1/.2 check this.
+                  (list '%mark-constant-var (list 'quote (cadr form)))
                   (list 'quote (cadr form))))))
     ;; DEFINE-COMPILER-MACRO (RUNTIME / eval2 only): register the expander in
     ;; the SAME *compiler-macro-function-table* the tree-walker's handler

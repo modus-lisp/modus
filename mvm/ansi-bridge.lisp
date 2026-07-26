@@ -3701,9 +3701,12 @@
     ((symbolp form)
      (if (%cl-sym-p form)
          (or (keywordp form)
-             (%cl-constant-variable-name-p (symbol-name form)))
+             (%cl-constant-variable-name-p (symbol-name form))
+             ;; symbols named by a runtime DEFCONSTANT (define-constant.1/.2)
+             (%constant-var-p form))
          ;; Native MVM symbol: match by name too.
-         (%cl-constant-variable-name-p (symbol-name form))))
+         (or (%cl-constant-variable-name-p (symbol-name form))
+             (%constant-var-p form))))
     ((and (consp form) (eq (car form) 'quote)) t)
     (t nil)))
 

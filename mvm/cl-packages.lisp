@@ -1338,9 +1338,32 @@
         (let ((miss (cons nil nil)))
           (not (eq (gethash key tbl miss) miss))))))
 
+;; Runtime registry of symbols named by DEFCONSTANT.  CLHS: (constantp 'name)
+;; is true when NAME names a constant variable.  Populated by the eval2
+;; DEFCONSTANT handler (compiler.lisp) via %mark-constant-var; keyed the same
+;; name-or-hash way symbol-function uses so all symbol flavors resolve.  Lazy-
+;; init (defvars don't run their initform at boot — see limitation #7).
+;; NOTE: only RUNTIME defconstants register here; boot/build-time constants
+;; (pi, most-positive-fixnum, …) are a separate, pre-existing constantp gap.
+(defvar *constant-var-names* nil)
+(defun %constant-var-key (sym)
+  (let ((nh (%sym-name-or-hash sym)))
+    (and nh (if (> (length (car nh)) 0) (car nh) (cdr nh)))))
+(defun %mark-constant-var (sym)
+  (unless *constant-var-names*
+    (setq *constant-var-names* (make-hash-table :test 'equal)))
+  (let ((k (%constant-var-key sym)))
+    (when k (puthash k *constant-var-names* t)))
+  sym)
+(defun %constant-var-p (sym)
+  (and *constant-var-names*
+       (let ((k (%constant-var-key sym)))
+         (and k (gethash k *constant-var-names*)))))
+
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS. Numbers, characters, strings,
-   bit-vectors, T, NIL, keywords, and (quote ...) forms are constants."
+   bit-vectors, T, NIL, keywords, (quote ...) forms, and symbols naming a
+   constant variable (DEFCONSTANT) are constants."
   (declare (ignore env))
   (cond
     ((null form) t)              ; NIL
@@ -1348,8 +1371,9 @@
     ((numberp form) t)
     ((characterp form) t)
     ((stringp form) t)
-    ((%cl-sym-p form) (keywordp form))
-    ((keywordp form) t)          ; native keyword (subtag #x53)
+    ((keywordp form) t)          ; keyword (cl-sym or native #x53)
+    ((%cl-sym-p form) (%constant-var-p form))
+    ((%native-sym-p form) (%constant-var-p form))
     ((and (consp form) (eq (car form) 'quote)) t)
     (t nil)))
 

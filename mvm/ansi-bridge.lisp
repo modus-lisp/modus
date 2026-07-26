@@ -615,10 +615,14 @@
         (t (setq cur (cddr cur)))))))
 
 (defun endp (x)
-  ;; ANSI: type-error if x is not a list (cons or nil).
+  ;; CLHS: ENDP signals a TYPE-ERROR (not a plain error) when its argument is
+  ;; not a list.  A bare (error "…") produced a SIMPLE-ERROR that escaped
+  ;; callers' (handler-case … (type-error () …)) — e.g. alexandria proper-list-
+  ;; length on a dotted list ((endp <improper-tail>)) reported the wrong
+  ;; condition class (proper-list-length.2).
   (cond ((null x) t)
         ((consp x) nil)
-        (t (error "endp: argument is not a list"))))
+        (t (%signal-type-error))))
 
 ;; NOTE: tree-equal lives in cl-sequences.lisp with full &key support
 ;; (:test / :test-not / :allow-other-keys, leftmost-wins, program-error on

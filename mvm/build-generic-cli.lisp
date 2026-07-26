@@ -429,6 +429,10 @@
     (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
                                                        *modus-base*)))
     (string #\Newline)
+    ;; Hosted TCP+UDP sockets (Linux syscalls): connected-socket primitives +
+    ;; DNS-over-UDP/TCP resolver.  The gateway to networked ql:quickload.
+    (mvm-text "net/hosted-sockets.lisp")
+    (string #\Newline)
     ;; The SHARED SBCL-faithful CLI toplevel: full argv (via the initial-stack
     ;; walk), SBCL-style flag parsing, ~/.modusrc, and the REPL.  It references
     ;; %gc-read64/%gc-stack-base (from gc.lisp, already in *all-runtime-source*).

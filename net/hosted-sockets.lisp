@@ -87,19 +87,68 @@
 ;;; multi-peer.  Without it a just-closed listen port sits in TIME_WAIT
 ;;; for ~60s before it can rebind.)
 
-;;; Open a TCP socket, bind to 0.0.0.0:PORT, and listen with BACKLOG.
-;;; Returns the listening fd, or -1 on any failure.
+;;; setsockopt(fd, SOL_SOCKET=1, SO_REUSEADDR=2, &1, 4) via syscall6 (5 args,
+;;; a6 ignored).  Lets a just-closed listen port rebind without the ~60s
+;;; TIME_WAIT wait.  Returns the syscall result (0 = ok).
+(defun %sock-set-reuseaddr (fd)
+  (let ((opt (+ (%sock-addr-buf) 16)))       ; 4 bytes above the sockaddr scratch
+    (setf (mem-ref opt :u32) 1)
+    (syscall6 54 fd 1 2 opt 4 0)))
+
+;;; Open a TCP socket, set SO_REUSEADDR, bind to 0.0.0.0:PORT, and listen with
+;;; BACKLOG.  Returns the listening fd, or -1 on any failure.
 (defun socket-listen (port backlog)
   (let ((fd (%sock-open 1)))                 ; SOCK_STREAM
     (if (< fd 0)
         -1
         (progn
+          (%sock-set-reuseaddr fd)           ; rebind without TIME_WAIT
           (%sock-build-addr 0 port)          ; INADDR_ANY : PORT
           (if (< (syscall3 49 fd (%sock-addr-buf) 16) 0)   ; bind
               (progn (socket-close fd) -1)
               (if (< (syscall3 50 fd backlog 0) 0)         ; listen
                   (progn (socket-close fd) -1)
                   fd))))))
+
+;;; ---- unconnected UDP (sendto/recvfrom, 6-arg) — for multi-peer datagrams
+;;; (webrtc STUN/ICE) where a single connected socket won't do ----
+
+;;; sendto LEN bytes of ARR to IP:PORT on unconnected UDP FD.  Returns bytes
+;;; sent, or negative.  sendto(fd, buf, len, 0, dest_addr, 16).
+(defun udp-sendto (fd arr len ip port)
+  (let ((io (%sock-io-buf)) (i 0))
+    (loop
+      (when (>= i len) (return nil))
+      (setf (mem-ref (+ io i) :u8) (aref arr i))
+      (setq i (+ i 1))))
+  (%sock-build-addr ip port)
+  (syscall6 44 fd (%sock-io-buf) len 0 (%sock-addr-buf) 16))
+
+;;; recvfrom up to MAX bytes into ARR on unconnected UDP FD (peer addr
+;;; discarded).  Returns byte count, or negative.  recvfrom(fd,buf,max,0,0,0).
+(defun udp-recvfrom (fd arr max)
+  (let ((n (syscall6 45 fd (%sock-io-buf) max 0 0 0)))
+    (if (< n 1)
+        n
+        (let ((io (%sock-io-buf)) (i 0))
+          (loop
+            (when (>= i n) (return n))
+            (aset arr i (mem-ref (+ io i) :u8))
+            (setq i (+ i 1)))))))
+
+;;; syscall6 self-proof: resolve NAME via an UNCONNECTED UDP socket using
+;;; sendto+recvfrom (vs dns-lookup's connected send/recv).  Returns host-order
+;;; IP int, or 0.  Exercises the 6-arg trap end-to-end against a live resolver.
+(defun dns-lookup-unconnected (name nlen resip)
+  (let ((fd (%sock-open 2)))                 ; UDP, NOT connected
+    (if (< fd 0)
+        0
+        (let ((qbuf (make-array 300)) (rbuf (make-array 600)))
+          (let ((qlen (%dns-build-query name nlen qbuf nil)))
+            (udp-sendto fd qbuf qlen resip 53)
+            (let ((n (udp-recvfrom fd rbuf 600)))
+              (socket-close fd)
+              (if (< n 12) 0 (%dns-parse-a rbuf n 0))))))))
 
 ;;; Accept one connection on listening LFD.  Peer address is discarded
 ;;; (accept(fd, NULL, NULL)).  Returns the connected client fd, or -1.

@@ -4794,6 +4794,7 @@
       ;; --- Linux Syscalls ---
       ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
       ((= op-name 385320872711688559) (compile-syscall3 (cdr form) env dest))
+      ((= op-name 439365366662434738) (compile-syscall6 (cdr form) env dest))
       ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
       ;; AArch64 Linux *at fileio helpers — see translate-aarch64.lisp traps
       ;; 0x0506..0x050A and the cl-fileio override block in
@@ -13134,6 +13135,30 @@
   (emit-ir :pop +vreg-v1+)
   (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0503)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-syscall6 (args env dest)
+  "Compile (syscall6 num a1 a2 a3 a4 a5 a6) — 6-arg Linux syscall.
+   All args tagged fixnums, untagged before syscall; result tagged in V0.
+   Stack-spills each value (same rationale as compile-syscall3) into V0..V6;
+   the 0x0507 trap marshals them into the x86-64 syscall ABI registers
+   (rdi rsi rdx r10 r8 r9) + rax.  Enables sendto/recvfrom (UDP multi-peer)
+   and setsockopt (5 args, a6 ignored)."
+  (compile-form (nth 0 args) env dest) (emit-ir :push dest)   ; num
+  (compile-form (nth 1 args) env dest) (emit-ir :push dest)   ; a1
+  (compile-form (nth 2 args) env dest) (emit-ir :push dest)   ; a2
+  (compile-form (nth 3 args) env dest) (emit-ir :push dest)   ; a3
+  (compile-form (nth 4 args) env dest) (emit-ir :push dest)   ; a4
+  (compile-form (nth 5 args) env dest) (emit-ir :push dest)   ; a5
+  (compile-form (nth 6 args) env dest)                        ; a6 in dest
+  (emit-ir :mov +vreg-v6+ dest)
+  (emit-ir :pop +vreg-v5+)
+  (emit-ir :pop +vreg-v4+)
+  (emit-ir :pop +vreg-v3+)
+  (emit-ir :pop +vreg-v2+)
+  (emit-ir :pop +vreg-v1+)
+  (emit-ir :pop +vreg-v0+)
+  (emit-ir :trap #x0507)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-aarch64-fileio-trap (trap-code args env dest)

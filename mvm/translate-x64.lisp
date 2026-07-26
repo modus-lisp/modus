@@ -570,6 +570,44 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
+             ((= code #x0507)
+              ;; Generic 6-arg Linux syscall (compile-syscall6).  Sources are
+              ;; V0..V6 = num,a1,a2,a3,a4,a5,a6 (physical rsi,rdi,r8,r9,rbx,
+              ;; rcx,rdx), all tagged fixnums.  Marshal into the x86-64 syscall
+              ;; ABI (rax=num, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5, r9=a6),
+              ;; untag each, syscall, tag result into V0(RSI).  Bytes were
+              ;; assembler-verified (gas .intel_syntax).  The a3<->a6 register
+              ;; overlap (both need a swap between rdx and r9) is the XCHG.
+              ;; Save/restore the V-reg carriers this clobbers (rsi,rdi,r8,r9,
+              ;; rdx,r10); rcx(V5)/r11(V8) are caller-save temps (syscall3
+              ;; already assumes so), rbx(V4) is only read.
+              (emit-bytes buf #x56)                 ; push rsi
+              (emit-bytes buf #x57)                 ; push rdi
+              (emit-bytes buf #x41 #x50)            ; push r8
+              (emit-bytes buf #x41 #x51)            ; push r9
+              (emit-bytes buf #x52)                 ; push rdx
+              (emit-bytes buf #x41 #x52)            ; push r10
+              (emit-bytes buf #x48 #x89 #xF0)       ; mov rax, rsi   (num)
+              (emit-bytes buf #x4C #x89 #xC6)       ; mov rsi, r8    (a2)
+              (emit-bytes buf #x49 #x89 #xDA)       ; mov r10, rbx   (a4)
+              (emit-bytes buf #x49 #x89 #xC8)       ; mov r8, rcx    (a5)
+              (emit-bytes buf #x4C #x87 #xCA)       ; xchg r9, rdx   (rdx=a3, r9=a6)
+              (emit-bytes buf #x48 #xD1 #xF8)       ; sar rax, 1
+              (emit-bytes buf #x48 #xD1 #xFF)       ; sar rdi, 1
+              (emit-bytes buf #x48 #xD1 #xFE)       ; sar rsi, 1
+              (emit-bytes buf #x48 #xD1 #xFA)       ; sar rdx, 1
+              (emit-bytes buf #x49 #xD1 #xFA)       ; sar r10, 1
+              (emit-bytes buf #x49 #xD1 #xF8)       ; sar r8, 1
+              (emit-bytes buf #x49 #xD1 #xF9)       ; sar r9, 1
+              (emit-bytes buf #x0F #x05)            ; syscall
+              (emit-bytes buf #x48 #x01 #xC0)       ; add rax, rax   (tag result)
+              (emit-bytes buf #x48 #x89 #xC6)       ; mov rsi, rax   (result → V0)
+              (emit-bytes buf #x41 #x5A)            ; pop r10
+              (emit-bytes buf #x5A)                 ; pop rdx
+              (emit-bytes buf #x41 #x59)            ; pop r9
+              (emit-bytes buf #x41 #x58)            ; pop r8
+              (emit-bytes buf #x5F)                 ; pop rdi
+              (emit-bytes buf #x48 #x83 #xC4 #x08)) ; add rsp, 8 (discard saved rsi; result kept)
              ((= code #x0504)
               ;; %MMAP-SHARED-PAGE: shared-memory anonymous mmap.
               ;; V0(RSI) = size (tagged fixnum, expected page-multiple).

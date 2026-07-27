@@ -376,8 +376,62 @@
             (when found (return pkg)))))
       (setq cur (cdr cur)))))
 
+(defvar *runtime-born-pkgs* nil
+  "Hash-table (pkg-name-hash -> t) of packages created at RUNTIME (via
+   eval2 make-package / %defpackage-impl, i.e. while *eval2-runtime-p*).
+   Function-table keys fold in the package hash ONLY for these packages
+   (see the %cl-sym-p branch of %sym-name-or-hash in cl-eval.lisp, which
+   keys by the package-qualified name for runtime-born packages).
+   Build-baked packages
+   (COMMON-LISP, COMMON-LISP-USER, the ANSI test packages) mix native and
+   wrapper symbol flavors — the native #x50 flavor carries no package, so
+   it cannot fold — and MUST stay on the bare name-hash key or a
+   define-via-native / call-via-wrapper pair would key to two cells and
+   miss.  A runtime-loaded LIBRARY (trivial-garbage, alexandria, ...) only
+   ever sees wrapper-flavor symbols, so folding its package hash is
+   consistent and gives its symbols DISTINCT function cells.  Without this
+   a library that shadows a CL name (e.g. TRIVIAL-GARBAGE:MAKE-HASH-TABLE)
+   clobbers CL:MAKE-HASH-TABLE's function cell -> #'cl:make-hash-table now
+   resolves to the shadow -> make-weak-hash-table -> #'cl:make-hash-table
+   -> the shadow -> ... infinite recursion -> stack-overflow SIGSEGV at
+   load time.  Defvar-init doesn't run at boot (limitation #7) so this is
+   NIL until the first runtime package is created; the table is built
+   lazily by %mark-runtime-born-pkg.")
+
+(defun %fn-key-system-pkg-name-p (name-string)
+  "T if NAME-STRING is a system / build-baked package whose symbols must
+   keep the BARE function-table key (native #x50 boot syms live here and
+   carry no package to fold).  Guards against a runtime DEFPACKAGE with
+   (:use #:cl) accidentally marking COMMON-LISP itself as runtime-born."
+  (or (string= name-string "COMMON-LISP")
+      (string= name-string "COMMON-LISP-USER")
+      (string= name-string "KEYWORD")
+      (string= name-string "CL")
+      (string= name-string "CL-USER")))
+
+(defun %mark-runtime-born-pkg (name-string)
+  "Record NAME-STRING as a runtime-born package when compiling under
+   *eval2-runtime-p* (runtime eval2 load), so its symbols get
+   package-folded function-table keys.  A no-op at image-build time
+   (*eval2-runtime-p* is NIL there) — that is what keeps the ANSI gate
+   byte-identical — and a no-op for system packages."
+  (when (and *eval2-runtime-p*
+             (not (%fn-key-system-pkg-name-p name-string)))
+    (unless *runtime-born-pkgs*
+      (setq *runtime-born-pkgs* (make-hash-table)))
+    (puthash (compute-name-hash name-string) *runtime-born-pkgs* t)))
+
+(defun %runtime-born-pkg-p (name-string)
+  "T if package NAME-STRING was born at runtime (fold its symbols' fn
+   keys), NIL for system / build-baked packages (bare keys)."
+  (and *runtime-born-pkgs*
+       (not (%fn-key-system-pkg-name-p name-string))
+       (gethash (compute-name-hash name-string) *runtime-born-pkgs*)
+       t))
+
 (defun %make-package-object (name-string)
   "Allocate and initialize an empty package object."
+  (%mark-runtime-born-pkg name-string)
   (let ((data (make-array 7)))
     (aset data 0 name-string) ; name
     (aset data 1 nil)         ; nicknames

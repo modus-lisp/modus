@@ -1108,6 +1108,27 @@
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
 
+(defun %rt-fn-name (fn)
+  "Function-resolution KEY string for name-symbol FN.  Package-qualified
+   (PKG::NAME) iff runtime eval2 AND FN's home package is runtime-born;
+   else bare symbol-name.  Bare at build time (*eval2-runtime-p* NIL) ->
+   host build + ANSI gate byte-identical.
+
+   This is the compiler-layer counterpart to the %cl-sym-p branch of
+   %sym-name-or-hash (cl-eval.lisp): both key the runtime function tables
+   by the SAME package-qualified string for runtime-born-library symbols,
+   so a library that shadows a CL name (trivial-garbage MAKE-HASH-TABLE)
+   gets a DISTINCT function cell instead of clobbering CL:MAKE-HASH-TABLE
+   globally.  Uses the qualified STRING hashed by compute-name-hash — NOT
+   a multiply-based composite (%fixnum-* promotes to a BIGNUM in-image and
+   (logand <bignum> mask) is lossy, collapsing back to the bare key)."
+  (if (and *eval2-runtime-p* (%cl-sym-p fn))
+      (let ((pkg (%cl-sym-package fn)))
+        (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
+            (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn))
+            (symbol-name fn)))
+      (symbol-name fn)))
+
 (defun %global-name-key (sym)
   "Name-hash KEY used for the runtime SYMBOL-VALUE / SET-SYMBOL-VALUE alist
    (keyed at #x10000080).  Identical to NORMALIZE-NAME on the host (and for
@@ -4232,7 +4253,7 @@
          ;; later top-level form.  Mirror the toplevel DEFUN handler's record.
          (when *eval2-runtime-p*
            (setq *e2-persist-defuns*
-                 (cons (if (symbolp name) (symbol-name name) (string name))
+                 (cons (if (symbolp name) (%rt-fn-name name) (string name))
                        *e2-persist-defuns*)))
          (let* ((rest-pos (position '&rest params))
                 (opt-pos  (position '&optional params))
@@ -7839,7 +7860,7 @@
       (dolist (def defs)
         (when (and (consp def) (consp (cdr def)))
           (let* ((name (car def))
-                 (base-name (cond ((symbolp name) (symbol-name name))
+                 (base-name (cond ((symbolp name) (%rt-fn-name name))
                                   ((and (consp name) (eq (car name) 'setf))
                                    (format nil "SETF-~A" (symbol-name (cadr name))))
                                   (t (format nil "~A" name))))
@@ -7900,7 +7921,7 @@
             (params (cadr def))
             (fbody (cddr def)))
         ;; Generate unique global name
-        (let* ((base-name (cond ((symbolp name) (symbol-name name))
+        (let* ((base-name (cond ((symbolp name) (%rt-fn-name name))
                                 ((and (consp name) (eq (car name) 'setf))
                                  (format nil "SETF-~A" (symbol-name (cadr name))))
                                 (t (format nil "~A" name))))
@@ -10236,7 +10257,7 @@
       (compile-lambda (cadr name) (cddr name) env dest)
       ;; #'name or #'(setf name) → load function address
       (let* ((fn-name (cond
-                        ((symbolp name) (symbol-name name))
+                        ((symbolp name) (%rt-fn-name name))
                         ((and (consp name) (eq (car name) 'setf))
                          (format nil "SETF-~A" (symbol-name (cadr name))))
                         ((stringp name) name)
@@ -11129,7 +11150,7 @@
              (symbolp (cadr fn-form))
              (boundp '*functions*)
              *functions*)
-    (let* ((fn-name (symbol-name (cadr fn-form)))
+    (let* ((fn-name (%rt-fn-name (cadr fn-form)))
            (info (gethash fn-name *functions*)))
       (and info
            (function-info-rest-param-p info)
@@ -14081,7 +14102,7 @@
   (let ((static-rest-pack nil)
         (true-nargs nil))
     (when (and (symbolp fn) (boundp '*functions*) *functions*)
-      (let* ((fn-name (symbol-name fn))
+      (let* ((fn-name (%rt-fn-name fn))
              ;; Check for flet/labels name mapping
              (resolved-fn-name (or (env-lookup-fn env fn-name) fn-name))
              (fn-info (gethash resolved-fn-name *functions*)))
@@ -14240,7 +14261,7 @@
     (cond
       ;; Direct call to named function
       ((symbolp fn)
-       (let* ((fn-name (symbol-name fn))
+       (let* ((fn-name (%rt-fn-name fn))
               ;; Check env for flet/labels name mapping (unique name)
               (unique-name (env-lookup-fn env fn-name))
               (resolved-name (or unique-name fn-name)))
@@ -15016,7 +15037,7 @@
     (let ((ir (get-ir-instructions)))
       ;; Store the IR on the function-info for later bytecode emission
       (let ((info (make-function-info
-                    :name (if (symbolp name) (symbol-name name) (string name))
+                    :name (if (symbolp name) (%rt-fn-name name) (string name))
                     :param-count (length params)
                     :bytecode-offset 0
                     :bytecode-length 0
@@ -15721,7 +15742,7 @@
          ;; eval2-forms can't see those.  See *e2-persist-defuns*.
          (when *eval2-runtime-p*
            (setq *e2-persist-defuns*
-                 (cons (if (symbolp name) (symbol-name name) (string name))
+                 (cons (if (symbolp name) (%rt-fn-name name) (string name))
                        *e2-persist-defuns*)))
          ;; Detect &rest, &optional, &key before preprocessing strips them
          ;; so we can compute required-count for arity checks.

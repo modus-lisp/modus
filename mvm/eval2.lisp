@@ -129,7 +129,13 @@
       (let ((hn (symbol-name (car f))))
         (cond
           ((and (string-equal hn "DEFUN") (symbolp (cadr f)))
-           (cons (string (cadr f)) acc))
+           ;; Key the persist name by the SAME string the compiler uses for
+           ;; function-info-name (%rt-fn-name): package-qualified PKG::NAME
+           ;; for a runtime-born library's symbols, bare otherwise.  If this
+           ;; stayed bare while the compiler qualified, the install loop's
+           ;; (member pn persist-names) below would miss and the trampoline
+           ;; would only get installed via the compiler-recorded path.
+           (cons (%rt-fn-name (cadr f)) acc))
           ((string-equal hn "EVAL-WHEN")
            (dolist (sub (cddr f) acc)
              (setq acc (%e2-scan-persist sub acc 0))))

@@ -107,7 +107,23 @@
        (cons full (compute-name-hash full))))
     ((%cl-sym-p sym)
      (let ((nm (%cl-sym-name sym)))
-       (when nm (cons nm (compute-name-hash nm)))))
+       (when nm
+         (let ((pkg (%cl-sym-package sym)))
+           (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
+               ;; Runtime-born library package: key by the PACKAGE-QUALIFIED
+               ;; name, hashed with compute-name-hash (fixnum-safe, no
+               ;; multiply/bignum — %fixnum-* promotes to a BIGNUM when
+               ;; runtime-compiled and (logand <bignum> mask) is lossy
+               ;; in-image).  This gives a shadow like
+               ;; TRIVIAL-GARBAGE::MAKE-HASH-TABLE a DISTINCT function cell,
+               ;; so it no longer clobbers CL:MAKE-HASH-TABLE.
+               (let ((qn (concatenate 'string (%pkg-name pkg) "::" nm)))
+                 (cons qn (compute-name-hash qn)))
+               ;; Bare key (system / build-baked package) — byte-identical
+               ;; to the historical behavior; keeps CL functions reachable
+               ;; through both native #x50 syms (boot) and COMMON-LISP
+               ;; wrappers (user code).
+               (cons nm (compute-name-hash nm)))))))
     ((stringp sym)
      (cons sym (compute-name-hash sym)))
     ((and (not (consp sym)) (not (fixnump sym)) (not (characterp sym))

@@ -205,7 +205,18 @@
     (dolist (r relocs)
       (let* ((name (gethash (cdr r) rt-table))
              (fn (and name (%mvm-resolve-runtime-fn name)))
-             (raw (if fn (- (ash (%val->word fn) -1) 3) 0)))
+             ;; %val->word FN = the callee's tagged native word (entry|3; the
+             ;; LEA+OR-3 tag from mvm-fn-addr — entry is 16-aligned so low nibble
+             ;; is 3).  The JIT's `movabs rax, imm64; call rax` calls the imm
+             ;; DIRECTLY (verified: no runtime shift of the imm), so imm must be
+             ;; the UNTAGGED entry = word - 3.  The old `(- (ash word -1) 3)`
+             ;; HALVED the entry (it assumed %val->word left-shifts the native
+             ;; word; it does NOT — the VALUE it returns already IS the native
+             ;; word).  A halved entry is either below the load base (unmapped)
+             ;; or lands mid-instruction — and for EVAL it landed on an INT3
+             ;; (0xCC) byte, so `(eval …)` SIGTRAP'd whenever its (mapped) halved
+             ;; target got called.
+             (raw (if fn (- (%val->word fn) 3) 0)))
         (if (> raw 0)
             (%jit-write-imm64 base (car r) raw)
             (setq ok nil))))

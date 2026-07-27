@@ -553,6 +553,16 @@
 (defvar *constants* (make-hash-table :test 'eql)
   "Map from constant name (hash) to compile-time value")
 
+;; Global symbol-macros (CLHS DEFINE-SYMBOL-MACRO).  Name-hash -> expansion
+;; form.  compile-variable-ref expands a bare reference to a registered name;
+;; compile-setq/compile-setf route to the expansion.  Complements the LOCAL
+;; symbol-macrolet (compile-env :symbol-macro bindings).  Lazy-init (NIL until
+;; first DEFINE-SYMBOL-MACRO): defvar initforms don't run in-image (limitation
+;; #7), so the DEFINE-SYMBOL-MACRO expander + every reader guard the NIL case.
+;; Needed by global-vars' define-global-var (bt2/bordeaux-threads).
+(defvar *global-symbol-macros* nil
+  "Map from global symbol-macro name (hash) to its expansion form.")
+
 (defvar *init-thunk-names* nil
   "Names of auto-generated INIT-* thunks emitted by the DEFVAR /
    DEFPARAMETER handlers in mvm-compile-toplevel.  init-all-globals
@@ -1804,6 +1814,21 @@
             (val-forms (cddr form)))
         `(apply ,fn (append ,@(mapcar (lambda (f) `(multiple-value-list ,f))
                                       val-forms))))))
+
+  ;; DEFINE-SYMBOL-MACRO — register a GLOBAL symbol-macro (CLHS).  The expander
+  ;; SIDE-EFFECTS *global-symbol-macros* at macroexpand time (works both host-
+  ;; build and in-image eval2 — the expander lambda runs in whichever compiler
+  ;; is expanding) and returns the name.  compile-variable-ref / compile-setq
+  ;; then expand references / route assignments.  Needed by global-vars'
+  ;; define-global-var (bordeaux-threads' internal globals).
+  (mvm-define-macro "DEFINE-SYMBOL-MACRO"
+    (lambda (form)
+      (let ((name (cadr form))
+            (expansion (caddr form)))
+        (unless *global-symbol-macros*
+          (setq *global-symbol-macros* (make-hash-table :test 'eql)))
+        (setf (gethash (normalize-name name) *global-symbol-macros*) expansion)
+        (list 'quote name))))
 
   ;; TYPECASE → COND + TYPEP
   (mvm-define-macro "TYPECASE"
@@ -3979,6 +4004,12 @@
          (:symbol-macro
           ;; Compile the expansion form in place of the symbol reference.
           (compile-form (binding-expansion binding) env dest))))
+      ;; Global symbol-macro (DEFINE-SYMBOL-MACRO): expand the reference.
+      ;; Checked after the lexical env (a local symbol-macrolet/let shadows it)
+      ;; and before constants/globals.
+      ((and *global-symbol-macros*
+            (nth-value 1 (gethash (normalize-name name) *global-symbol-macros*)))
+       (compile-form (gethash (normalize-name name) *global-symbol-macros*) env dest))
       ;; Compile-time constant: fold to literal
       ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
          (unless (eq const-val :not-found)
@@ -7010,6 +7041,14 @@
     (when (and sm-binding (eq (binding-location sm-binding) :symbol-macro))
       (return-from compile-setq
         (compile-form `(setf ,(binding-expansion sm-binding) ,val) env dest))))
+  ;; Global symbol-macro (DEFINE-SYMBOL-MACRO): (setq name v) = (setf expansion v)
+  ;; per CLHS 5.1.2.4 — only when NAME isn't lexically bound (checked above).
+  (when (and *global-symbol-macros*
+             (not (env-lookup env var))
+             (nth-value 1 (gethash (normalize-name var) *global-symbol-macros*)))
+    (return-from compile-setq
+      (compile-form `(setf ,(gethash (normalize-name var) *global-symbol-macros*) ,val)
+                    env dest)))
   (compile-form val env dest)
   (let ((binding (env-lookup env var)))
     (cond

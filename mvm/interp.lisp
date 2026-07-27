@@ -1855,14 +1855,46 @@
              (setf pc npc)))
 
           ;; --- Actor / Concurrency ---
+          ;; setjmp/longjmp emulation.  The operand register holds the
+          ;; UNTAGGED save-area address; the native x64/aarch64 translators
+          ;; do a real register+stack save keyed by that address.  In the
+          ;; interpreter there is no real stack, so we emulate: key a saved
+          ;; (resume-pc . register-file) snapshot by the address value in
+          ;; mvm-memory, return tagged 0 into the operand reg on the initial
+          ;; save, and tagged 1 (=2 raw) when resumed via restore-ctx.
           (#.+op-save-ctx+
-           (push (copy-seq regs) (mvm-stack state)))
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (let ((addr (reg-get regs vd)))
+               ;; Snapshot: (resume-pc result-reg . register-file).  npc is
+               ;; the continuation (the instruction right after save-ctx that
+               ;; restore-ctx resumes into); vd is the register that must
+               ;; hold the save-context RESULT at that continuation, so we
+               ;; record it and, on resume, land tagged-1 into THAT register
+               ;; of the restored file (restore-ctx's own operand register is
+               ;; a different vreg and must not be used for this).
+               (setf (gethash addr (mvm-memory state))
+                     (list* npc vd (copy-seq regs)))
+               ;; Initial-save result = tagged fixnum 0.
+               (reg-set regs vd (tag-fixnum 0))
+               (setf pc npc))))
 
           (#.+op-restore-ctx+
-           (let ((saved (pop (mvm-stack state))))
-             (when (and saved (typep saved 'simple-vector))
-               (replace regs saved)
-               (setf pc (reg-get regs +vreg-vpc+)))))
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (let* ((addr (reg-get regs vd))
+                    (saved (gethash addr (mvm-memory state))))
+               (if (and (consp saved) (typep (cddr saved) 'simple-vector))
+                   (let ((resume-pc (car saved))
+                         (result-reg (cadr saved))
+                         (saved-regs (cddr saved)))
+                     ;; Restore the saved register file, land the resume
+                     ;; result (tagged fixnum 1) in save-context's result
+                     ;; register, and jump to the save point.
+                     (replace regs saved-regs)
+                     (reg-set regs result-reg (tag-fixnum 1))
+                     (setf pc resume-pc))
+                   ;; No saved context (e.g. a hand-initialised area for a
+                   ;; fresh stack) — fall through as a no-op.
+                   (setf pc npc)))))
 
           (#.+op-yield+ nil) ; preemption: no-op
 

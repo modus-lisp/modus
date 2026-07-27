@@ -3313,21 +3313,57 @@
         ;; Actor / Concurrency
         ;; ============================================
         ((op= +op-save-ctx+)
-         ;; Save all callee-saved registers to the stack
-         ;; Used when suspending an actor
-         (emit-push buf 'rbx)
-         (emit-push buf 'r12)
-         (emit-push buf 'r13)
-         (emit-push buf 'r14)
-         (emit-push buf 'r15))
+         ;; (save-ctx Vd) — Vd holds the UNTAGGED save-area address on entry
+         ;; and receives the result on exit: 0 on the initial save, tagged
+         ;; fixnum 1 (=2 raw) when later resumed via restore-ctx.
+         ;;
+         ;; Real setjmp-style save.  Save-area layout (offsets from Rpa):
+         ;;   [+0x00]=RSP  [+0x18]=RBX  [+0x28]=continuation RIP  [+0x38]=RBP
+         ;; HOSTED: R12 (alloc ptr), R14 (heap limit), R15 (nil) are GLOBAL
+         ;; state shared by all fibers — NOT saved (rolling R12 back would
+         ;; corrupt the allocator).  Only RSP/RBX/RBP + the continuation move.
+         ;; Scratch: r11 (Rpa) and rax (both caller-saved, not in the saved set).
+         (let ((vd (first operands))
+               (cont-label (make-label))
+               (done-label (make-label)))
+           ;; Load the untagged save-area address into r11 (Rpa).
+           (emit-load-vreg buf vd 'r11)
+           ;; Save stack pointer, callee-saved RBX, frame pointer RBP.
+           (emit-mov-mem-reg buf 'r11 'rsp #x00)
+           (emit-mov-mem-reg buf 'r11 'rbx #x18)
+           (emit-mov-mem-reg buf 'r11 'rbp #x38)
+           ;; LEA rax, [rip + cont-label]; store as the continuation RIP.
+           (emit-lea-label buf 'rax cont-label)
+           (emit-mov-mem-reg buf 'r11 'rax #x28)
+           ;; Initial-save result = 0.
+           (emit-mov-reg-imm buf 'rax 0)
+           (emit-jmp buf done-label)
+           ;; restore-ctx jumps here (on the resumed stack).  Result = 2
+           ;; (tagged fixnum 1).
+           (emit-label buf cont-label)
+           (emit-mov-reg-imm buf 'rax 2)
+           (emit-label buf done-label)
+           ;; Store the result (rax) into Vd.
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax)
+               (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
 
         ((op= +op-restore-ctx+)
-         ;; Restore callee-saved registers
-         (emit-pop buf 'r15)
-         (emit-pop buf 'r14)
-         (emit-pop buf 'r13)
-         (emit-pop buf 'r12)
-         (emit-pop buf 'rbx))
+         ;; (restore-ctx Vd) — Vd holds the UNTAGGED save-area address.
+         ;; longjmp: reload RBX/RBP/continuation, switch RSP (point of no
+         ;; return), then jump to the saved continuation.  Never returns.
+         ;; Scratch: rax (continuation) and r11 (base) — caller-saved, not
+         ;; in the restored set.
+         (let ((vd (first operands)))
+           ;; Move the address into r11 first (Vd's phys reg may be one of
+           ;; the registers we are about to overwrite).
+           (emit-load-vreg buf vd 'r11)
+           (emit-mov-reg-mem buf 'rax 'r11 #x28)   ; rax = continuation RIP
+           (emit-mov-reg-mem buf 'rbx 'r11 #x18)   ; restore RBX
+           (emit-mov-reg-mem buf 'rbp 'r11 #x38)   ; restore RBP
+           (emit-mov-reg-mem buf 'rsp 'r11 #x00)   ; switch stack (no return)
+           (emit-jmp-reg buf 'rax)))               ; jump to continuation
 
         ((op= +op-yield+)
          ;; Preemption check.  LINUX: NOP (no scheduler, no deadline).

@@ -1227,6 +1227,25 @@
   ;; no normal test id is 888888, so normal runs are unaffected (eval2 dead code).
   (when (eql *skip-below* 888888)
     (write-string-serial \"E2SMOKE-START\") (write-char-serial 10)
+    ;; ---- WS5 JIT BATTERY: run the task battery through the REAL eval2 seam ----
+    ;; Each form is eval2'd with JIT enabled (native path).  We print the result;
+    ;; a wrong value or a crash (masked as fallback) shows here.  The oracle is
+    ;; the KNOWN expected value in the label.
+    (write-string-serial \"BATTERY-START\") (write-char-serial 10)
+    (dolist (pr (list
+                  (cons \"the-add-42\"   (quote (the fixnum (+ 40 2))))
+                  (cons \"mul-42\"       (quote (* 6 7)))
+                  (cons \"letsq-25\"     (quote (let ((x 5)) (* x x))))
+                  (cons \"list123\"      (quote (car (list 1 2 3))))
+                  (cons \"dotimes-4950\" (quote (let ((s 0)) (dotimes (i 100 s) (setq s (+ s i))))))))
+      (let ((label (car pr)) (form (cdr pr)))
+        (write-string-serial \"BAT \") (write-string-serial label)
+        (write-string-serial \" = \")
+        (print-dec (handler-case (eval2 form) (t (c) -99999)))
+        (write-char-serial 10)))
+    (write-string-serial \"BAT-NATIVE=\") (print-dec *jit-native-count*) (write-char-serial 10)
+    (write-string-serial \"BAT-FALLBACK=\") (print-dec *jit-fallback-count*) (write-char-serial 10)
+    (write-string-serial \"BATTERY-END\") (write-char-serial 10)
     (write-string-serial \"add=\")
     (print-dec (eval2 (quote (+ 1 2)))) (write-char-serial 10)
     (write-string-serial \"sqr=\")

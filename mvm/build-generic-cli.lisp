@@ -126,6 +126,127 @@
 ;; eval2.lisp's `\"` extraction damage until the flip wave-3 fidelity fix
 ;; (77cea7c) repaired it; the file is now clean, directly mvm-text-readable.
 (defvar *eval2-canonical-source* (mvm-text "mvm/eval2.lisp"))
+
+;;; ============================================================
+;;; WS5 rung 2: OPTIONAL runtime JIT (MODUS_USE_JIT=1)
+;;; ============================================================
+;;; The default CLI image is pure interpret (eval2 = compile→MVM→mvm-interpret).
+;;; With MODUS_USE_JIT=1 we ALSO bake the x64 native translator into the image so
+;;; eval2's JIT seam (%jit-translate-page / %jit-call in eval2.lisp) can execute
+;;; forms as NATIVE code.  This mirrors what the ANSI gate (build-x64-linux.lisp)
+;;; does via build-ansi-common-x64.lisp: bake x64-asm.lisp + translate-x64.lisp +
+;;; a %init-x64-translator co-init, run %init-x64-translator at boot, and bake
+;;; %jit-enabled-p to return T.  When JIT is OFF none of this source is added, so
+;;; the default image stays byte-identical to before.
+(defvar *jit-on*
+  (let ((v (sb-ext:posix-getenv "MODUS_USE_JIT")))
+    (and v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))))
+
+(defvar *x64-asm-source* (when *jit-on* (mvm-text "mvm/x64-asm.lisp")))
+;; Shrink the code-buffer default from 96MB to 64KB (grows on demand) so a JIT
+;; page translation doesn't try to alloc ~768MB tagged per make-code-buffer.
+(when *jit-on*
+  (let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
+        (repl   "(bytes (make-array 65536 :element-type '(unsigned-byte 8)))"))
+    (let ((p (search needle *x64-asm-source*)))
+      (unless p (error "WS5-JIT: could not find code-buffer 96MB default to shrink"))
+      (setf *x64-asm-source*
+            (concatenate 'string
+                         (subseq *x64-asm-source* 0 p) repl
+                         (subseq *x64-asm-source* (+ p (length needle))))))))
+;; translate-x64.lisp minus the host-only install-x64-translator tail (it refs
+;; *target-x86-64* / disassemble-native &key — not compilable in-image).
+(defvar *translate-x64-source*
+  (when *jit-on*
+    (let ((src (mvm-text "mvm/translate-x64.lisp"))
+          (marker "(defun install-x64-translator"))
+      (let ((pos (search marker src)))
+        (unless pos (error "WS5-JIT: could not find install-x64-translator strip marker"))
+        (subseq src 0 pos)))))
+;; Co-init that populates the translator's defvar lookup tables at boot AND sets
+;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
+;; installs (build-ansi-common-x64.lisp *x64-translator-coinit-source*), plus a
+;; RUNTIME (setq *x64-gc-enabled* …) mirroring the value the host baked into the
+;; image's fixed code — limitation #7 means the file-tail (setf …) does NOT reach
+;; the image runtime, so %jit-translate-page would otherwise read the defvar
+;; default (NIL) and emit gc-checks/trampoline inconsistently with the baked code.
+(defvar *jit-coinit-source*
+  (when *jit-on* "
+(defun %init-x64-translator ()
+  (setq *registers*
+        (list (list (quote rax)  0 64 nil) (list (quote rcx)  1 64 nil)
+              (list (quote rdx)  2 64 nil) (list (quote rbx)  3 64 nil)
+              (list (quote rsp)  4 64 nil) (list (quote rbp)  5 64 nil)
+              (list (quote rsi)  6 64 nil) (list (quote rdi)  7 64 nil)
+              (list (quote r8)   8 64 t)   (list (quote r9)   9 64 t)
+              (list (quote r10) 10 64 t)   (list (quote r11) 11 64 t)
+              (list (quote r12) 12 64 t)   (list (quote r13) 13 64 t)
+              (list (quote r14) 14 64 t)   (list (quote r15) 15 64 t)
+              (list (quote eax)  0 32 nil) (list (quote ecx)  1 32 nil)
+              (list (quote edx)  2 32 nil) (list (quote ebx)  3 32 nil)
+              (list (quote esp)  4 32 nil) (list (quote ebp)  5 32 nil)
+              (list (quote esi)  6 32 nil) (list (quote edi)  7 32 nil)
+              (list (quote r8d)  8 32 t)   (list (quote r9d)  9 32 t)
+              (list (quote r10d) 10 32 t)  (list (quote r11d) 11 32 t)
+              (list (quote r12d) 12 32 t)  (list (quote r13d) 13 32 t)
+              (list (quote r14d) 14 32 t)  (list (quote r15d) 15 32 t)
+              (list (quote al)   0 8 nil)  (list (quote cl)   1 8 nil)
+              (list (quote dl)   2 8 nil)  (list (quote bl)   3 8 nil)
+              (list (quote spl)  4 8 t)    (list (quote bpl)  5 8 t)
+              (list (quote sil)  6 8 t)    (list (quote dil)  7 8 t)
+              (list (quote r8b)  8 8 t)    (list (quote r9b)  9 8 t)
+              (list (quote r10b) 10 8 t)   (list (quote r11b) 11 8 t)
+              (list (quote r12b) 12 8 t)   (list (quote r13b) 13 8 t)
+              (list (quote r14b) 14 8 t)   (list (quote r15b) 15 8 t)))
+  (setq *condition-codes*
+        (list (cons :o 0)  (cons :no 1)  (cons :b 2)   (cons :ae 3)
+              (cons :e 4)   (cons :ne 5)  (cons :be 6)  (cons :a 7)
+              (cons :s 8)   (cons :ns 9)  (cons :p 10)  (cons :np 11)
+              (cons :l 12)  (cons :ge 13) (cons :le 14) (cons :g 15)
+              (cons :z 4)   (cons :nz 5)  (cons :c 2)   (cons :nc 3)
+              (cons :nae 2) (cons :nb 3)  (cons :nbe 7) (cons :na 6)
+              (cons :nge 12)(cons :nl 13) (cons :ng 14) (cons :nle 15)))
+  (let ((v (make-array 23)))
+    (aset v 0 (quote rsi))  (aset v 1 (quote rdi))
+    (aset v 2 (quote r8))   (aset v 3 (quote r9))
+    (aset v 4 (quote rbx))  (aset v 5 (quote rcx))
+    (aset v 6 (quote rdx))  (aset v 7 (quote r10))
+    (aset v 8 (quote r11))
+    (aset v 16 (quote rax)) (aset v 17 (quote r12))
+    (aset v 18 (quote r14)) (aset v 19 (quote r15))
+    (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
+    (setq *vreg-to-x64* v))
+  ;; Fn-entry alignment offset.  The JIT page is a STANDALONE mmap (not the ELF
+  ;; image), so the translator only uses this to NOP-align emitted fn entries
+  ;; RELATIVE to the buffer base — 0 gives clean 16-byte-relative alignment.
+  ;; This matches the ANSI gate's co-init (build-ansi-common-x64.lisp), whose
+  ;; JIT battery runs native with offset 0.
+  (setq *x64-native-code-offset* 0)
+  (setq *x64-linux-mode* t)
+  ;; RUNTIME JIT globals (limitation #7: file-tail host setf doesn't reach here).
+  ;; Match the values the host baked into the image's fixed code so the JIT emits
+  ;; consistent gc-check/trampoline code.
+  (setq *x64-gc-enabled* t)
+  (setq *linux-x64-r14-offset* #x38000000)
+  t)
+"))
+
+;; Baked boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins over
+;; eval2.lisp's base version (last-defun).  When JIT is OFF both defuns are
+;; no-ops (%jit-boot-init returns nil, %jit-enabled-p returns nil) so the seam
+;; stays inert — and the whole string is "" only when JIT is off would change
+;; layout, so we ALWAYS bake these two tiny defuns (JIT-off variant is inert
+;; and keeps *use-jit* nil = interpret).
+(defvar *jit-boot-source*
+  (if *jit-on*
+      "
+(defun %jit-boot-init () (%init-x64-translator) (setq *use-jit* t) t)
+(defun %jit-enabled-p () (and (boundp (quote *use-jit*)) *use-jit*))
+"
+      "
+(defun %jit-boot-init () nil)
+"))
+
 (defvar *stage2-test-source* "
 ;; Multiply overflow promotion regression probes (compiled native mul-checked).
 (defun %nat-mul-20 () (* 10000000000 10000000000))    ; bignum 10^20
@@ -687,6 +808,11 @@
   ;; general library primitive, NOT ql wiring — the QL package + ql:quickload
   ;; come only from a runtime (load) of modus-quicklisp/setup.lisp.
   (setq *tar-block-size* 512)
+  ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).
+  ;; %jit-boot-init is baked to a no-op when JIT is off, or to the translator
+  ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
+  ;; crash can never take down a normal boot.
+  (handler-case (%jit-boot-init) (t (c) nil))
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   ;; cli-toplevel reads the FULL argv off the initial stack, parses SBCL-style
   ;; flags left-to-right (--eval/--load/--script/--quit/--version/--help/rc/
@@ -713,6 +839,15 @@
                        *stage2-float-override* (string #\Newline)
                        *opcode-table-init-source* (string #\Newline)
                        *eval2-canonical-source* (string #\Newline)
+                       ;; WS5 rung 2: register the JIT translator's defuns +
+                       ;; quoted symbols in the SFT / sym-name tables so
+                       ;; %init-x64-translator / translate-mvm-to-x64 are
+                       ;; runtime-reachable and their quoted reg symbols
+                       ;; (rax, :e, …) have recoverable names.  "" when JIT off.
+                       (or *x64-asm-source* "") (string #\Newline)
+                       (or *translate-x64-source* "") (string #\Newline)
+                       (or *jit-coinit-source* "") (string #\Newline)
+                       *jit-boot-source* (string #\Newline)
                        *stage2-test-source* (string #\Newline)
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
@@ -943,6 +1078,14 @@
     (string #\Newline)
     *eval2-canonical-source*
     (string #\Newline)
+    ;; WS5 rung 2: OPTIONAL native JIT translator (only under MODUS_USE_JIT=1;
+    ;; each var is "" when JIT is off → the default image is byte-identical).
+    (or *x64-asm-source* "")
+    (string #\Newline)
+    (or *translate-x64-source* "")
+    (string #\Newline)
+    (or *jit-coinit-source* "")
+    (string #\Newline)
     *stage2-test-source*
     (string #\Newline)
     ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
@@ -956,7 +1099,10 @@
     (string #\Newline)
     *runtime-macros-source*
     (string #\Newline)
-    *driver-source*))
+    *driver-source*
+    (string #\Newline)
+    ;; WS5 rung 2: baked JIT boot hook + gate (LAST so %jit-enabled-p wins).
+    *jit-boot-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 

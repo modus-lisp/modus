@@ -70,6 +70,11 @@
    NIL (safe default: pure interpret)."
   (and (boundp (quote *use-jit*)) *use-jit*))
 
+(defvar *jit-native-count* 0
+  "WS5 diag: number of eval2 forms that completed via the NATIVE JIT path.")
+(defvar *jit-fallback-count* 0
+  "WS5 diag: number of eval2 forms that FELL BACK to mvm-interpret.")
+
 (defvar *jit-page-cache* nil
   "WS4-S5b per-module JIT cache.  EQ hash keyed by the compiled BC byte-array
    identity → a jit-entry list (base eoff cpatches gc-stamp).  A repeated eval2
@@ -283,6 +288,8 @@
             ;; STALE *mvm-last-mv* from a prior interpret run doesn't leak into
             ;; this form's return (the seam reads *mvm-last-mv* after us).
             (setq *mvm-last-mv* nil)
+            (setq *jit-native-count*
+                  (if *jit-native-count* (+ 1 *jit-native-count*) 1))
             (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
         (error "jit-page-unavailable"))))
 
@@ -317,6 +324,8 @@
          (%prim (if (%jit-enabled-p)
                     (handler-case (%eval2-jit-run %bc %entry %ftl %fnt %rt %lam t)
                       (t (c)
+                         (setq *jit-fallback-count*
+                               (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
                          (%mvm-wrap-escaping-result
                            (mvm-interpret %bc :entry-point %entry
                                           :function-table %fnt :runtime-table %rt
@@ -743,6 +752,8 @@
                                     (%eval2-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil)
                                   (t (c)
+                                     (setq *jit-fallback-count*
+                                           (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
                                      (%mvm-wrap-escaping-result
                                        (mvm-interpret bc :entry-point entry
                                                       :function-table fn-table

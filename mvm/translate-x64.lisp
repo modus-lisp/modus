@@ -6526,7 +6526,23 @@
                          (emit-nop buf))))))
 
       ;; Emit GC trampoline (after all functions, before fixup)
-      (when (and gc-trampoline-label gc-collect-label)
+      ;; WS5 JIT FIX: a runtime-JIT'd single-form module has NO %GC-COLLECT
+      ;; function in its function-table, so gc-collect-label is NIL and the
+      ;; trampoline was SKIPPED — yet every allocating form still emits a
+      ;; `call gc-trampoline-label` in its gc-check (op-gc-check uses
+      ;; state's :gc-label = gc-trampoline-label whenever *x64-gc-enabled*).
+      ;; Those calls then had an UNRESOLVED target (label-position NIL), which
+      ;; fixup-labels SILENTLY SKIPS, leaving a placeholder rel32 — so any
+      ;; JIT'd alloc form whose gc-check fires (R12>=R14) CALLs into garbage
+      ;; → SIGSEGV (masked by the eval2 seam's handler-case as a fallback,
+      ;; hence native%≈0 under heap pressure).  emit-gc-trampoline is fully
+      ;; self-contained (it IGNORES gc-collect-label — see its lambda list;
+      ;; it reads the global Cheney metadata at fixed heap-base offsets), so
+      ;; in JIT mode we emit it whenever gc-trampoline-label exists, even with
+      ;; no gc-collect-label.  Gated on *x64-jit-mode* so the ANSI/generic/
+      ;; bare-metal image builds (jit-mode NIL) stay byte-identical.
+      (when (or (and gc-trampoline-label gc-collect-label)
+                (and *x64-jit-mode* gc-trampoline-label))
         (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
         (format t "  GC trampoline emitted, %GC-COLLECT wired~%"))
       ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).

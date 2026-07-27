@@ -4,6 +4,35 @@ A bare-metal Lisp operating system. Boots directly on hardware (or QEMU) into an
 
 A self-hosting system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection.
 
+## Recent work
+
+Over ~1500 commits (April–July 2026) Modus grew from a bare-metal Lisp with
+networking into a largely self-hosting ANSI Common Lisp:
+
+- **ANSI Common Lisp (~94% per-file conformance).** Full condition system
+  (handler-case/bind, restarts, `signal`/`warn`/`cerror`), CLOS with standard
+  method combination and `call-next-method`, the reader and printer with
+  `format` (50+ directives), pathnames and file I/O, a numeric tower (bignums,
+  ratios, single/double floats, complex), and ~400 standard functions.
+- **One evaluator (WS3).** Production `eval` and `load` compile each form to MVM
+  bytecode and run it — the self-hosted MVM compiler runs *inside* the image,
+  and the original tree-walking interpreter has been deleted. The vendored ASDF
+  driver evaluates end-to-end on this path.
+- **Runtime JIT (WS4).** MVM bytecode is translated to native code at runtime
+  (executable memory + call relocation) behind the same evaluator seam.
+- **Full self-reproduction (WS5).** A Modus binary compiles its own source to a
+  native ELF and reproduces itself (modus → modus2 → modus3) with SBCL out of
+  the loop.
+- **GC hardening.** Conservative-root validation via an object-start bitmap, a
+  heap guard band, zero-initialized allocation, and optional Bartlett
+  page-pinning — closing a class of heap-corruption crashes.
+- **SBCL drop-in compatibility (in progress).** Unmodified pure-Common-Lisp
+  libraries load and run from source — e.g. natrium (SHA-256 FIPS-exact) and
+  alexandria — with the `bordeaux-threads` dependency tree loading unmodified.
+- **New platforms and features.** Bare-metal ThinkPad T420 (E1000 SSH, EHCI USB,
+  VGA + PS/2 console), UEFI x86-64, ARM32, byte-packed `(unsigned-byte 8)`
+  arrays, and a hosted `modus` CLI with SBCL-faithful flags.
+
 ## Feature matrix
 
 ### Platforms

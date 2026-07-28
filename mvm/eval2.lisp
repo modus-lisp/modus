@@ -222,10 +222,11 @@
             (setq ok nil))))
     ok))
 
-(defun %jit-translate-page (bc ft-list rt-table)
-  "Translate BC → native x64, mmap an exec page, copy bytes, relocate calls +
-   patch consts.  Returns a jit-entry list (base eoff cpatches gc-stamp) or NIL
-   if translation/relocation failed (caller falls back to interpret)."
+(defun %jit-translate-page-1 (bc ft-list rt-table)
+  "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
+   calls + patch consts.  Returns a jit-entry list (base eoff cpatches
+   gc-stamp) or NIL if RELOCATION failed.  MAY signal (translator gap) — the
+   guard wrapper %jit-translate-page turns any signal into NIL."
   (setq *x64-jit-mode* t)
   (multiple-value-bind (nbuf fn-map) (translate-mvm-to-x64 bc ft-list)
     (let* ((nlen (code-buffer-position nbuf))
@@ -234,7 +235,17 @@
            (cpatches *x64-li-const-patches*)
            (elabel (gethash "%EVAL2-THUNK" fn-map))
            (eoff (if elabel (label-position elabel) 0))
-           (page (%mmap-exec-page 4096))
+           ;; JIT-FIX (Fix 2): the exec page must be big enough for the ACTUAL
+           ;; native code length.  A fixed 4096-byte page overran on every
+           ;; flet/labels/CLOS-dispatch module (their native code is 1k-15k+
+           ;; bytes) — the copy loop below wrote past the mapped region → a
+           ;; SIGSEGV the eval2 seam caught as a (nil-condition) fallback, so
+           ;; those whole shape classes ran interpret-only (native%≈0).  Round
+           ;; nlen UP to a 4096-byte multiple (+1 page of slack for the copy's
+           ;; tail / alignment) so the full native module fits.
+           (npages (+ 1 (ash nlen -12)))
+           (psize (ash npages 12))
+           (page (%mmap-exec-page psize))
            (base (sap-address (make-sap page))))
       ;; Copy native bytes into the exec page.
       (let ((k 0))
@@ -247,6 +258,36 @@
             (%jit-patch-consts base cpatches)
             (list base eoff cpatches (%gc-count)))
           nil))))
+
+(defvar *jit-translate-err-count* 0
+  "DIAGNOSTIC: count of translate-time errors caught by %jit-translate-page's
+   guard (distinct from MV/reloc/page-unavailable fallbacks).")
+(defvar *jit-last-translate-err* nil
+  "DIAGNOSTIC: the last condition caught by %jit-translate-page's guard.")
+
+(defun %jit-translate-page (bc ft-list rt-table)
+  "FLIP-SAFETY GUARD (Fix 1): translate + build a JIT exec page for BC, but
+   turn ANY error signalled while translating/relocating (e.g. a translator
+   gap such as `Unknown register: 0` in a flet/labels/CLOS-dispatch shape)
+   into a clean NIL return, so the caller falls back to mvm-interpret and the
+   program's RESULT is never changed.  Every path from a top-level/load eval
+   to translate-mvm-to-x64 runs through this function (both %eval2-jit-run
+   call shapes call %jit-entry-for or %jit-translate-page), so a translator
+   gap can NEVER escape as an uncaught error nor produce a wrong value — it
+   only costs one interpret fallback.  NB: the outer seam handler-case in
+   %eval2-run-tuple / eval2-forms is kept as belt-and-suspenders; this inner
+   guard exists because a translate error must degrade to NIL (interpret)
+   even in any context whose outer catch might not see it."
+  (handler-case
+      (%jit-translate-page-1 bc ft-list rt-table)
+    (t (c)
+       (setq *jit-translate-err-count*
+             (if (boundp (quote *jit-translate-err-count*))
+                 (+ 1 *jit-translate-err-count*) 1))
+       (setq *jit-last-translate-err* c)
+       (setq *jit-fallback-count*
+             (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
+       nil)))
 
 (defun %jit-entry-for (bc ft-list rt-table)
   "Return a ready-to-call jit-entry (base eoff cpatches gc-stamp) for BC, using

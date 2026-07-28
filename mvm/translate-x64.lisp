@@ -49,6 +49,12 @@
    records the site in *x64-call-relocs* for JIT-time patching.  Nil at
    image-build time, so the image codegen is byte-identical to pre-Stage-3.")
 
+(defvar *jit-xlate-err-info* nil
+  "DIAGNOSTIC: on a translate-time error, the translate loop stashes
+   (:fn I :name NAME :mvm-pos POS :opcode OP :operands OPS) here before
+   re-signaling, so the eval2 seam can report exactly which instruction
+   shape hit a translator gap.")
+
 (defvar *x64-call-relocs* nil
   "WS4 STAGE 3 (runtime JIT out-of-module call relocation).  List of
    (native-imm64-byte-offset . synthetic-mvm-offset) pairs collected
@@ -6490,7 +6496,11 @@
                    (emit-function-epilogue buf))
                  ;; Pre-scan branch targets
                  (handler-case (scan-branch-targets state)
-                   (error (c) (error "SETUP-scan fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
+                   (error (c)
+                     (setq *jit-xlate-err-info*
+                           (list :phase :scan-branch :fn i :name name
+                                 :pos (code-buffer-position buf)))
+                     (error "SETUP-scan fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
                  ;; Translate instructions
                  (let ((pos offset)
                        (limit (+ offset length)))
@@ -6507,6 +6517,9 @@
                                 (handler-case
                                     (translate-instruction state opcode operands new-pos)
                                   (error (c)
+                                    (setq *jit-xlate-err-info*
+                                          (list :name name :mvm-pos pos
+                                                :opcode opcode :operands operands))
                                     (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
                                            c i name pos opcode operands)))
                                 (setf pos new-pos)))))

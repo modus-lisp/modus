@@ -228,6 +228,7 @@
   ;; consistent gc-check/trampoline code.
   (setq *x64-gc-enabled* t)
   (setq *linux-x64-r14-offset* #x38000000)
+  (setq *jit-xlate-err-info* nil)
   t)
 "))
 

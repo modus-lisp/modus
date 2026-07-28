@@ -29,6 +29,24 @@
 ;;; earlier.  Declare them special up front to avoid forward-reference warnings.
 (declaim (special *x64-genadd-label* *x64-genmul-label* *x64-gensub-label*))
 
+(defun %x64-jit-genarith-entry (name)
+  "JIT-mode fallback target for a checked-arith overflow slow path.  Resolve a
+   main-image runtime helper (GENERIC-ADD / GENERIC-SUBTRACT / GENERIC-MULTIPLY)
+   to its UNTAGGED native entry, or NIL if unavailable.
+
+   A single-form runtime-JIT module does NOT contain these helpers, so their
+   in-module label (*x64-genadd-label* etc.) is nil and the overflow slow path
+   was skipped — the fast add/imul then silently WRAPPED at int64 instead of
+   promoting to a bignum, e.g. (+ most-positive-fixnum 1) => -2^62 under the JIT
+   (the interpreter, which has the helper, was correct).  The helper lives at a
+   FIXED main-image code address (never GC-moved), so baking it as an absolute
+   `movabs rax, entry ; call rax` target in the exec page is safe — no
+   relocation needed.  Only reached under *x64-jit-mode*; the whole-image build
+   finds the in-module label and never calls this."
+  (let ((fn (ignore-errors (%mvm-resolve-runtime-fn name))))
+    (and fn (let ((w (%val->word fn)))
+              (and (integerp w) (> w 3) (- w 3))))))
+
 (defvar *x64-linux-mode* nil
   "When non-nil, TRAP codes emit Linux syscalls instead of bare-metal I/O.
    Set by Linux x64 builds to use SYS_write/SYS_read/SYS_exit instead of
@@ -1396,9 +1414,11 @@
          ;; by switching that site to %fixnum-* (raw wrapping :mul).
          (let* ((vd (first operands)) (va (second operands)) (vb (third operands))
                 (d (dest-phys-or-scratch vd))
-                (gm-label *x64-genmul-label*))
+                (gm-label *x64-genmul-label*)
+                (gm-entry (when (and (not gm-label) *x64-jit-mode*)
+                            (%x64-jit-genarith-entry "GENERIC-MULTIPLY"))))
            (cond
-             (gm-label
+             ((or gm-label gm-entry)
               (let ((done (make-label)))
                 (emit-push buf 'r13)
                 (emit-load-vreg buf va 'r13)
@@ -1419,7 +1439,10 @@
                 (emit-load-vreg buf va 'rsi)           ; arg0 = va (still intact)
                 (emit-load-vreg buf vb 'rdi)           ; arg1 = vb
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
-                (emit-call buf gm-label)
+                (if gm-label
+                    (emit-call buf gm-label)
+                    (progn (emit-mov-reg-imm buf 'rax gm-entry) ; movabs rax, GENERIC-MULTIPLY
+                           (emit-call-reg buf 'rax)))
                 (emit-mov-reg-reg buf 'r13 'rax)       ; result -> r13
                 (emit-pop buf 'rbx)
                 (emit-pop buf 'r11) (emit-pop buf 'r10)
@@ -1447,9 +1470,11 @@
          ;; Lisp call that clobbers all caller-saved regs and may GC).
          (let* ((vd (first operands)) (va (second operands)) (vb (third operands))
                 (d (dest-phys-or-scratch vd))
-                (ga-label *x64-genadd-label*))
+                (ga-label *x64-genadd-label*)
+                (ga-entry (when (and (not ga-label) *x64-jit-mode*)
+                            (%x64-jit-genarith-entry "GENERIC-ADD"))))
            (cond
-             (ga-label
+             ((or ga-label ga-entry)
               (let ((done (make-label)))
                 (emit-push buf 'r13)
                 (emit-load-vreg buf va 'r13)
@@ -1467,7 +1492,10 @@
                 (emit-load-vreg buf va 'rsi)
                 (emit-load-vreg buf vb 'rdi)
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
-                (emit-call buf ga-label)
+                (if ga-label
+                    (emit-call buf ga-label)
+                    (progn (emit-mov-reg-imm buf 'rax ga-entry) ; movabs rax, GENERIC-ADD
+                           (emit-call-reg buf 'rax)))
                 (emit-mov-reg-reg buf 'r13 'rax)
                 (emit-pop buf 'rbx)
                 (emit-pop buf 'r11) (emit-pop buf 'r10)
@@ -1496,9 +1524,11 @@
          ;; full Lisp call that clobbers all caller-saved regs and may GC).
          (let* ((vd (first operands)) (va (second operands)) (vb (third operands))
                 (d (dest-phys-or-scratch vd))
-                (gs-label *x64-gensub-label*))
+                (gs-label *x64-gensub-label*)
+                (gs-entry (when (and (not gs-label) *x64-jit-mode*)
+                            (%x64-jit-genarith-entry "GENERIC-SUBTRACT"))))
            (cond
-             (gs-label
+             ((or gs-label gs-entry)
               (let ((done (make-label)))
                 (emit-push buf 'r13)
                 (emit-load-vreg buf va 'r13)
@@ -1516,7 +1546,10 @@
                 (emit-load-vreg buf va 'rsi)
                 (emit-load-vreg buf vb 'rdi)
                 (emit-bytes buf #xC7 #x04 #x25 #x50 #x01 #x00 #x10 #x02 #x00 #x00 #x00) ; [nargs]=2
-                (emit-call buf gs-label)
+                (if gs-label
+                    (emit-call buf gs-label)
+                    (progn (emit-mov-reg-imm buf 'rax gs-entry) ; movabs rax, GENERIC-SUBTRACT
+                           (emit-call-reg buf 'rax)))
                 (emit-mov-reg-reg buf 'r13 'rax)
                 (emit-pop buf 'rbx)
                 (emit-pop buf 'r11) (emit-pop buf 'r10)

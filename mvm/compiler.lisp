@@ -3887,7 +3887,18 @@
     ;; baked choice, gate on (%jit-active-p): the native-backed image takes the
     ;; split, the interpret-only image (and any JIT-inhibited, always-
     ;; interpreted compile) takes the interpret-correct tagged :li.
-    ((or *static-build-p* (and *eval2-runtime-p* (%jit-active-p)))
+    ;; NOTE (#197): the runtime-JIT `(and *eval2-runtime-p* (%jit-active-p))`
+    ;; term was REMOVED.  It made a JIT-on image compile boundary fixnum literals
+    ;; with this positive-magnitude split — which the INTERPRET fallback (hit on
+    ;; any translate error / MV form) cannot execute, so a JIT→interpret fallback
+    ;; of a form containing a near-2^62 literal returned garbage (the last F198/
+    ;; F210 mod-by-≥2^61 divergence).  Now runtime eval2 (BOTH backends) falls
+    ;; through to the *mvm-emit-halves* :li-halves path (a single tagged :li whose
+    ;; interpret side is the overflow-safe fetch-li-value), and the JIT's
+    ;; emit-u64 is bignum-safe (x64-asm.lisp) so it materialises the boundary
+    ;; tagged word correctly — one codegen, correct on both backends.  Only the
+    ;; WS5 static self-compile (*static-build-p*) still uses the split.
+    (*static-build-p*
      (cond
        ;; SMALL POSITIVE (value < 2^61): value<<1 can't overflow a fixnum, so form
        ;; the tagged word at compile time and emit a SINGLE :li — byte-for-byte the

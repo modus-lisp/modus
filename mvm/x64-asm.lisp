@@ -72,8 +72,20 @@
   (emit-byte buf (ldb (byte 8 24) value)))
 
 (defun emit-u64 (buf value)
-  (emit-u32 buf (ldb (byte 32 0) value))
-  (emit-u32 buf (ldb (byte 32 32) value)))
+  ;; Bignum-safe 64-bit emit.  In-image, `(ldb (byte 32 32) V)` / `(ash V -32)`
+  ;; / `(floor V 2^32)` are all BROKEN for a bignum-range V (compile-ash inlines
+  ;; :sar on the bignum POINTER — limitation #8), so a boundary fixnum's TAGGED
+  ;; word (a small bignum > most-positive-fixnum, or a negative word decoded by
+  ;; decode-u64 as an unsigned bignum ≥ 2^63) emitted garbage high bytes → the
+  ;; JIT loaded a wrong immediate for any near-2^62 literal.  Extract the two
+  ;; 32-bit halves without a bignum shift-down: `logand` for the low half, and
+  ;; `(floor V 2^31)` then a fixnum `>>1` for the high half — floor-by-2^31 is
+  ;; exact where floor-by-2^32 / ash-down are not, and its result (< 2^33) is a
+  ;; fixnum so the final `(ash … -1)` is a normal fixnum shift.  Byte-identical
+  ;; to the old `ldb` form for every value the host/fixnum path handles, so the
+  ;; image build stays byte-for-byte the same.
+  (emit-u32 buf (logand value #xFFFFFFFF))
+  (emit-u32 buf (logand (ash (floor value 2147483648) -1) #xFFFFFFFF)))
 
 (defun emit-s32 (buf value)
   ;; Assert the value fits in signed 32-bit range before truncating.

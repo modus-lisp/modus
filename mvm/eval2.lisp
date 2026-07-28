@@ -70,6 +70,26 @@
    NIL (safe default: pure interpret)."
   (and (boundp (quote *use-jit*)) *use-jit*))
 
+(defvar *jit-inhibit* nil
+  "CLASS-3 dynamic JIT inhibit.  When non-nil, %jit-active-p forces the eval2
+   seam onto the INTERPRET path regardless of %jit-enabled-p.  Needed because
+   the ANSI gate BAKES %jit-enabled-p to a CONSTANT (build-x64-linux.lisp,
+   MODUS_USE_JIT) that ignores *use-jit* — so a plain `(setq *use-jit* nil)`
+   around the interp-closure trampoline compile (see %e2ic-eval2-nocache) does
+   NOT disable the JIT there in the gate image, and the native<->interp
+   nested-call boundary fault (define-compiler-macro.1/.2/.7) resurfaces.
+   %e2ic-eval2-nocache sets THIS flag (lexical save + setq-restore) so the
+   inhibit works uniformly in BOTH the CLI (%jit-enabled-p reads *use-jit*)
+   and the gate (baked constant).  BOOTS AS NIL (defvar init-thunks are
+   skipped in the ANSI image); a bare NIL read is exactly the wanted default
+   (JIT not inhibited).")
+
+(defun %jit-active-p ()
+  "The eval2 seam gate: JIT is live only when the build enabled it AND it is
+   not dynamically inhibited (see *jit-inhibit*)."
+  (and (%jit-enabled-p)
+       (not (and (boundp (quote *jit-inhibit*)) *jit-inhibit*))))
+
 (defvar *jit-native-count* 0
   "WS5 diag: number of eval2 forms that completed via the NATIVE JIT path.")
 (defvar *jit-fallback-count* 0
@@ -222,6 +242,25 @@
             (setq ok nil))))
     ok))
 
+(defun %jit-reloc-fn-addrs (base relocs rt-table)
+  "Class 2: patch each out-of-module FN-ADDR movabs with the resolved fn's
+   TAGGED native word — the SAME object %mvm-resolve-runtime-fn / symbol-function
+   returns.  Unlike a CALL target (which is patched UNTAGGED = word-3 because the
+   `call rax` jumps to it directly), a FN-ADDR is a VALUE load: the callable
+   object flows into eq / eql / funcall, so the imm must be the full tagged word
+   (entry|3).  This makes `(eq #'eq (symbol-function 'eq))` T and
+   `%ht-canonicalize-test`'s `(eql v (function %eq-fn))` succeed under JIT.
+   Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
+  (let ((ok t))
+    (dolist (r relocs)
+      (let* ((name (gethash (cdr r) rt-table))
+             (fn (and name (%mvm-resolve-runtime-fn name)))
+             (word (if fn (%val->word fn) 0)))
+        (if (> word 0)
+            (%jit-write-imm64 base (car r) word)
+            (setq ok nil))))
+    ok))
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -232,6 +271,7 @@
     (let* ((nlen (code-buffer-position nbuf))
            (nbytes (code-buffer-bytes nbuf))
            (relocs *x64-call-relocs*)
+           (fa-relocs *x64-fn-addr-relocs*)
            (cpatches *x64-li-const-patches*)
            (elabel (gethash "%EVAL2-THUNK" fn-map))
            (eoff (if elabel (label-position elabel) 0))
@@ -253,7 +293,8 @@
               do (progn
                    (setf (mem-ref (+ base k) :u8) (aref nbytes k))
                    (setq k (+ k 1)))))
-      (if (%jit-reloc-calls base relocs rt-table)
+      (if (and (%jit-reloc-calls base relocs rt-table)
+               (%jit-reloc-fn-addrs base fa-relocs rt-table))
           (progn
             (%jit-patch-consts base cpatches)
             (list base eoff cpatches (%gc-count)))
@@ -373,7 +414,9 @@
          (%lam (cadr (cddddr tuple)))
          ;; WS4-S5b: when *use-jit*, run native; fall back to interpret on ANY
          ;; error (unsupported form / MV form / page-build failure).
-         (%prim (if (%jit-enabled-p)
+         ;; %jit-active-p (not %jit-enabled-p) so *jit-inhibit* (Class 3) works
+         ;; even in the gate image whose %jit-enabled-p is a baked constant.
+         (%prim (if (%jit-active-p)
                     (handler-case (%eval2-jit-run %bc %entry %ftl %fnt %rt %lam t)
                       (t (c)
                          (setq *jit-fallback-count*
@@ -799,7 +842,8 @@
                             (setq *e2-active-defun-names* persist-names)
                             ;; WS4-S5b: JIT when enabled, interpret-fallback on
                             ;; any error (page-build fail / MV form / unsupported).
-                            (if (%jit-enabled-p)
+                            ;; %jit-active-p honors *jit-inhibit* (Class 3).
+                            (if (%jit-active-p)
                                 (handler-case
                                     (%eval2-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil)
@@ -884,12 +928,38 @@
   "eval2 FORM with *eval2-cache* bypassed (see *eval2-no-cache*): the form
    embeds captured env conses via the quote pool, so EQUAL-keyed caching
    would alias two different closures' cells.  setq + unwind-protect (not a
-   let of the special — compiled let of a special is unreliable in-image)."
-  (let ((%saved *eval2-no-cache*))
+   let of the special — compiled let of a special is unreliable in-image).
+
+   CLASS-3 (JIT interp-closure nested-call boundary): compile+build this
+   interp-closure trampoline with the JIT DISABLED.  An %interp-closure's
+   trampoline is ALWAYS run via mvm-interpret (%mvm-make-trampoline re-enters
+   the interpreter; *jit-native-count* does not move for its body), so
+   JIT-translating its %eval2-thunk is pure overhead — AND it triggers a
+   native<->interp boundary fault: when this thunk is built under the JIT and
+   the resulting interp-closure body makes a REAL out-of-module call whose
+   callee is itself an interp trampoline (a user DEFUN persisted via
+   %mvm-make-trampoline), invoking that inner trampoline from the outer
+   interp bridge — while a JIT-native frame is on the stack — jumps to a
+   corrupted native target (RIP=RAX=an unaligned exec-page address) and the
+   boot SIGSEGV handler longjmps out.  `(gcd a b)` in an interp-closure works
+   (gcd's symbol-function is a native builtin, not a trampoline); `(g x)` for
+   a user defun faults (g's symbol-function is a trampoline).  Forcing the
+   interp-closure module through the interpret path removes the extra native
+   frame, so the nested interp->interp bridge call runs correctly — matching
+   the JIT-off baseline exactly.  The inhibit is done via *jit-inhibit* (NOT
+   `(setq *use-jit* nil)`): the ANSI gate BAKES %jit-enabled-p to a constant
+   that ignores *use-jit*, so *jit-inhibit* + the %jit-active-p seam gate is
+   the only inhibit that works in BOTH the CLI and the gate image.  Lexically
+   saved + setq-restored (do NOT dynamically rebind the special: compiled let
+   of a special is unreliable in-image — see *eval2-no-cache* above)."
+  (let ((%saved *eval2-no-cache*)
+        (%savedinh (if (boundp (quote *jit-inhibit*)) *jit-inhibit* nil)))
     (setq *eval2-no-cache* t)
+    (setq *jit-inhibit* t)
     (unwind-protect
         (eval2 form)
-      (setq *eval2-no-cache* %saved))))
+      (setq *eval2-no-cache* %saved)
+      (setq *jit-inhibit* %savedinh))))
 
 (defun %e2ic-ll-marker (x)
   "If X is a lambda-list &-marker symbol, return its NAME string; else NIL."

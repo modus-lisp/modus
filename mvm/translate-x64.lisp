@@ -72,6 +72,22 @@
    any module with an empty rt-table (Stage-2 hazard-free forms), so
    flag-off / hazard-free translation is byte-identical.")
 
+(defvar *x64-fn-addr-relocs* nil
+  "WS4 (Class 2 — fn-object identity).  Like *x64-call-relocs*, but for
+   op-FN-ADDR (`#'NAME`) of an OUT-OF-MODULE function (synthetic runtime
+   offset >= #x40000000).  The interpreter resolves such a target via the
+   rt-table to the SAME fn OBJECT `symbol-function`/%mvm-resolve-runtime-fn
+   returns and stores that object's tagged word; the JIT must do likewise so
+   `(eq #'eq (symbol-function 'eq))` and `%ht-canonicalize-test`'s
+   `(eql v (function %eq-fn))` identity checks hold.  Without this the
+   translator found no local label for the synthetic offset and emitted the
+   #xDEAD0001 NIL sentinel — so `#'eq` under JIT was NIL, never eq to the
+   canonical object.  Each entry is (native-imm64-byte-offset . synth-offset);
+   at JIT time the driver resolves synth-offset -> name -> fn and writes the
+   fn's TAGGED word (NOT untagged like a call target — a value load, not a
+   call site).  Bound freshly to nil in TRANSLATE-MVM-TO-X64; empty for any
+   hazard-free module, so flag-off translation is byte-identical.")
+
 ;;; ============================================================
 ;;; Physical Register Mapping
 ;;; ============================================================
@@ -432,6 +448,24 @@
               ;; Prologue is emitted at function boundaries.
               ;; If > 4 params, copy overflow args from caller's stack
               ;; to local frame slots so stack-load can find them.
+              ;;
+              ;; JIT FLIP-SAFETY (Class 1): the NATIVE frame reserves a FIXED
+              ;; 128 slots (+frame-total-size+ 1120 = 88 overhead + 128*8),
+              ;; whereas the interpreter's frame is sized (params+160) per call.
+              ;; A function with a large param count (or params + deep locals)
+              ;; overruns the fixed native frame: params/locals past slot ~128
+              ;; alias caller-stack / red-zone data, so the JIT returns a WRONG
+              ;; value (flet.20/labels.20: a 130+-param sum reads adjacent stack
+              ;; → e.g. 258 instead of 130).  The compiler's own
+              ;; *let-binding-limit* (120) already caps let-depth, but PARAMS
+              ;; bypass that check.  Under the runtime JIT (*x64-jit-mode*),
+              ;; SIGNAL when the param count leaves no safe body-slot headroom
+              ;; so %jit-translate-page falls back to the (correctly-sized)
+              ;; interpreter — matching the interpret baseline exactly, with no
+              ;; wrong value and no overrun.  Image-build codegen (*x64-jit-mode*
+              ;; nil) is unaffected → shipped image stays byte-identical.
+              (when (and *x64-jit-mode* (>= code 120))
+                (error "jit-frame-param-overflow"))
               (when (> code 4)
                 (loop for i from 4 below code
                       for src-offset = (+ 16 (* (- i 4) 8))  ; [RBP + 16 + k*8]
@@ -3555,13 +3589,24 @@
                 (fn-table (translate-state-function-table state))
                 (label (when fn-table (gethash target-offset fn-table)))
                 (d (dest-phys-or-scratch vd)))
-           (if label
-               (progn
-                 (emit-lea-label buf d label)
-                 ;; OR with 3 to tag (cf. TAG-PLAN.md).  Function code
-                 ;; is 16-byte (or better) aligned by NOP-padding so
-                 ;; the low nibble is 0 — OR-3 gives a clean tag value.
-                 (emit-or-reg-imm buf d 3))
+           (cond
+             (label
+              (emit-lea-label buf d label)
+              ;; OR with 3 to tag (cf. TAG-PLAN.md).  Function code
+              ;; is 16-byte (or better) aligned by NOP-padding so
+              ;; the low nibble is 0 — OR-3 gives a clean tag value.
+              (emit-or-reg-imm buf d 3))
+             ;; JIT (Class 2): #'NAME of an OUT-OF-MODULE function — the
+             ;; synthetic runtime offset (>= #x40000000, resolved by NAME via
+             ;; the rt-table) has no local native label.  Materialize the SAME
+             ;; fn OBJECT the interpreter/symbol-function returns via a JIT-time
+             ;; relocation: `movabs d, 0` (imm64 patched to the fn's TAGGED
+             ;; word) so identity (eq / eql) holds against the canonical object.
+             ((and *x64-jit-mode* target-offset (>= target-offset #x40000000))
+              (let ((imm-off (+ (code-buffer-position buf) 2)))  ; skip REX+B8
+                (push (cons imm-off target-offset) *x64-fn-addr-relocs*)
+                (emit-mov-reg-imm buf d 0)))  ; movabs d, 0 (patched at JIT time)
+             (t
                ;; Unknown target (the compiler's #xFFFFFFF0 unresolved-name
                ;; sentinel) — load NIL so funcall's NIL-guard signals
                ;; UNDEFINED-FUNCTION.  The old `0' was a live but
@@ -3569,7 +3614,7 @@
                ;; landed in boot-stub padding and executed whatever bytes
                ;; the boot immediates happened to be (the CHUNK-CRASH
                ;; regression class — see compiler.lisp :li-func).
-               (emit-mov-reg-imm buf d #xDEAD0001))
+               (emit-mov-reg-imm buf d #xDEAD0001)))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================
@@ -6385,6 +6430,8 @@
   (setf *x64-li-const-patches* nil)
   ;; WS4 STAGE 3: reset the out-of-module CALL relocation list.
   (setf *x64-call-relocs* nil)
+  ;; WS4 (Class 2): reset the out-of-module FN-ADDR relocation list.
+  (setf *x64-fn-addr-relocs* nil)
   (let* ((buf (let ((b (make-code-buffer))
                     ;; Pre-size to ~6x the bytecode (native is a few x the
                     ;; bytecode) so the main output buffer never grow-copies —

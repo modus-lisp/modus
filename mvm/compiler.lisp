@@ -3859,9 +3859,17 @@
     ;;    :li operand.  Emit its tagged word (−2^63 = 1<<63) as :li 1 + :shl 63.
     ;;    (compile-integer no longer classifies −2^62 as fixnum, so this is
     ;;    defensive only.)
-    ;; Gated on *static-build-p* (NIL in the ANSI-gate build) so that build is
-    ;; byte-identical.
-    (*static-build-p*
+    ;; Gated on *static-build-p* OR *eval2-runtime-p* (both NIL in the image
+    ;; build, so that build stays byte-identical).  *eval2-runtime-p* was ADDED
+    ;; here for the runtime JIT: at JIT runtime the `t` branch below emitted
+    ;; `:li dest (ash value 1)` with a NEGATIVE operand for a negative fixnum
+    ;; literal, and translate-x64's JIT-mode :li mangles negative immediates
+    ;; (limitation #8) → every negative literal loaded as address-like garbage
+    ;; ((abs -5) → junk).  Routing runtime compilation through this negative-safe
+    ;; positive-magnitude+:neg block fixes native negative literals; the
+    ;; interpreter handles the same IR identically (same value), so it is
+    ;; result-neutral for the interpret path.
+    ((or *static-build-p* *eval2-runtime-p*)
      (cond
        ;; SMALL POSITIVE (value < 2^61): value<<1 can't overflow a fixnum, so form
        ;; the tagged word at compile time and emit a SINGLE :li — byte-for-byte the

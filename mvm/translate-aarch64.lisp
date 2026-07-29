@@ -3239,6 +3239,61 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ---- ALLOC-U8 Vd, Vcount ----  (byte-packed (unsigned-byte 8) vector)
+          ;; Feature #183, ported from translate-x64.lisp +op-alloc-u8+.  Vcount
+          ;; is a TAGGED fixnum (element/byte count N).  Object: header at [x24]
+          ;; = (N << 8) | #x11 (u8-vector subtag), then 8-byte pad, then N packed
+          ;; bytes at +16.  Total size = align16(16 + N).  (No MCGC start-bit /
+          ;; zero-init — matches the aarch64 :alloc-array convention above.)
+          ((= op +op-alloc-u8+)
+           (let* ((vd (vr 0))
+                  (pcount (ensure-src (vr 1) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pcount 1)              ; x9 = N (untagged)
+             (a64-lsl-imm buf +a64-x16+ +a64-x9+ 8)           ; x16 = N << 8
+             (a64-movz buf +a64-x10+ #x11 0)                  ; x10 = 0x11 subtag
+             (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x10+)  ; x16 = header
+             (a64-stur buf +a64-x16+ +a64-x24+ 0)             ; [x24] = header
+             (a64-add-imm buf pd +a64-x24+ 9)                 ; result = base | tag9
+             ;; size = align16(16 + N) = ((N + 31) >> 4) << 4
+             (a64-add-imm buf +a64-x17+ +a64-x9+ 31)
+             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 4)
+             (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)
+             (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0) ; bump alloc ptr
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
+          ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
+          ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum
+          ;; (byte << 1), matching mem-ref :u8 and translate-x64 +op-u8-ref+.
+          ((= op +op-u8-ref+)
+           (let* ((vd (vr 0))
+                  (parr (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pidx 1)                ; x9 = real_idx
+             (a64-add-reg buf +a64-x9+ +a64-x9+ parr 0 0)     ; x9 = Varr + real_idx
+             ;; LDRB Wpd, [x9, #7]  = 0x39401C00 | (x9<<5) | pd
+             (a64-emit buf (logior #x39401C00 (ash +a64-x9+ 5) pd))
+             (a64-lsl-imm buf pd pd 1)                        ; tag: byte << 1
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- U8-SET Varr, Vidx, Vval ----  (store low byte of Vval)
+          ;; Byte address = Varr + 7 + real_idx.  Vidx and Vval are TAGGED
+          ;; fixnums; untag both (>>1).  Clobbers only scratch (x10/x11) — no
+          ;; V-phys-reg is touched, matching translate-x64 +op-u8-set+.
+          ((= op +op-u8-set+)
+           (let* ((parr (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+))
+                  (pval (ensure-src (vr 2) +a64-x9+)))
+             (a64-asr-imm buf +a64-x10+ pidx 1)               ; x10 = real_idx
+             (a64-add-reg buf +a64-x10+ +a64-x10+ parr 0 0)   ; x10 = Varr + real_idx
+             (a64-asr-imm buf +a64-x11+ pval 1)               ; x11 = untagged value
+             ;; STRB W11, [x10, #7]  = 0x39001C00 | (x10<<5) | 11
+             (a64-emit buf (logior #x39001C00 (ash +a64-x10+ 5) +a64-x11+))))
+
           ;; ---- LOAD Vd, Vaddr, width ----
           ((= op +op-load+)
            (let* ((vd (vr 0))

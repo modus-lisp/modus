@@ -20,6 +20,21 @@
 (defvar *linux-aarch64-r25-offset* +linux-aarch64-heap-size+
   "Offset from heap base for x25 (VL = alloc limit).  Midpoint with GC.")
 
+(defvar *linux-aarch64-gc-midpoint* +linux-aarch64-gc-midpoint+
+  "WS4-AA64 #160: build-overridable semispace boundary.  to_start = heap+this,
+   space_size = this - alloc_start.  Default = the 448MB constant; a GC-on repro
+   build may shrink it (with a matching *linux-aarch64-r25-offset*) so collections
+   fire on a modest allocation.")
+
+(defvar *linux-aarch64-gc-metadata-shl* nil
+  "WS4-AA64 #160: when non-nil, the entry stub stores the Cheney GC metadata
+   (from_start/to_start/space_size/stack_base) SHL-1, matching gc.lisp's
+   (mem-ref :u64) convention (memory holds value<<1; %gc-collect reads back the
+   raw address).  The historical raw store was a LATENT bug — harmless while GC
+   was disabled (metadata never read), but it would HALVE every address the
+   moment a collection fired.  Default nil keeps the GC-off images (the ANSI
+   gate) byte-identical; GC-on builds set it t.")
+
 ;; Shared ELF strtab sanitizer.  Same fn lives in boot-linux-x64.lisp;
 ;; we provide it here too so this file can be loaded without x64 boot.
 (unless (fboundp '%sanitize-symbol-name)
@@ -275,26 +290,35 @@
   (emit-aarch64-u32 buf #x8B100339)   ; ADD x25, x25, x16
 
   ;; GC metadata at absolute slots 0x10000040..0x10000060.
-  (emit-aarch64-load-imm64 buf 17 #x10000040)
-  ;; from_start = mmap+alloc_start
-  (emit-aarch64-u32 buf #xAA1603EA)   ; MOV x10, x22
-  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-heap-alloc-start+)
-  (emit-aarch64-u32 buf #x8B10014A)   ; ADD x10, x10, x16
-  (emit-aarch64-u32 buf #xF900022A)   ; STR x10, [x17, #0]
-  ;; to_start   = mmap+midpoint
-  (emit-aarch64-u32 buf #xAA1603EA)
-  (emit-aarch64-load-imm64 buf 16 +linux-aarch64-gc-midpoint+)
-  (emit-aarch64-u32 buf #x8B10014A)
-  (emit-aarch64-u32 buf #xF900062A)   ; STR x10, [x17, #8]
-  ;; space_size = midpoint - alloc_start
-  (emit-aarch64-load-imm64 buf 10 (- +linux-aarch64-gc-midpoint+
-                                     +linux-aarch64-heap-alloc-start+))
-  (emit-aarch64-u32 buf #xF9000A2A)   ; STR x10, [x17, #16]
-  ;; stack_base = current SP
-  (emit-aarch64-u32 buf #x910003EA)   ; ADD x10, SP, #0
-  (emit-aarch64-u32 buf #xF9000E2A)   ; STR x10, [x17, #24]
-  ;; gc_count = 0
-  (emit-aarch64-u32 buf #xF900123F)   ; STR XZR, [x17, #32]
+  ;; When *linux-aarch64-gc-metadata-shl*, double x10 (ADD x10,x10,x10 =
+  ;; 0x8B0A014A) before each STR so memory holds value<<1 — the convention
+  ;; gc.lisp's (mem-ref :u64) reads back (see the defvar docstring).
+  (flet ((maybe-shl () (when *linux-aarch64-gc-metadata-shl*
+                         (emit-aarch64-u32 buf #x8B0A014A))))  ; ADD x10,x10,x10
+    (emit-aarch64-load-imm64 buf 17 #x10000040)
+    ;; from_start = mmap+alloc_start
+    (emit-aarch64-u32 buf #xAA1603EA)   ; MOV x10, x22
+    (emit-aarch64-load-imm64 buf 16 +linux-aarch64-heap-alloc-start+)
+    (emit-aarch64-u32 buf #x8B10014A)   ; ADD x10, x10, x16
+    (maybe-shl)
+    (emit-aarch64-u32 buf #xF900022A)   ; STR x10, [x17, #0]
+    ;; to_start   = mmap+midpoint
+    (emit-aarch64-u32 buf #xAA1603EA)
+    (emit-aarch64-load-imm64 buf 16 *linux-aarch64-gc-midpoint*)
+    (emit-aarch64-u32 buf #x8B10014A)
+    (maybe-shl)
+    (emit-aarch64-u32 buf #xF900062A)   ; STR x10, [x17, #8]
+    ;; space_size = midpoint - alloc_start
+    (emit-aarch64-load-imm64 buf 10 (- *linux-aarch64-gc-midpoint*
+                                       +linux-aarch64-heap-alloc-start+))
+    (maybe-shl)
+    (emit-aarch64-u32 buf #xF9000A2A)   ; STR x10, [x17, #16]
+    ;; stack_base = current SP
+    (emit-aarch64-u32 buf #x910003EA)   ; ADD x10, SP, #0
+    (maybe-shl)
+    (emit-aarch64-u32 buf #xF9000E2A)   ; STR x10, [x17, #24]
+    ;; gc_count = 0
+    (emit-aarch64-u32 buf #xF900123F))  ; STR XZR, [x17, #32]
 
   ;; x26 = NIL = #xDEAD0001 (matches x64's +nil-value+).  The original
   ;; aa64 boot used NIL=0; that lined up with an early `cset`-based

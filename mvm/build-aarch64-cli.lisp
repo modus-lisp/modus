@@ -398,6 +398,60 @@
   (write-string-serial \"aa64s5-fallback-total=\") (print-dec *jit-fallback-count*)
   (write-char-serial 10)
 
+  ;; (P) WS4-AA64 #160 GC-POISON REPRO (argv1 = 44444): with GC ON but NOT yet
+  ;;     hardened, fill from-space with garbage to force collections, then run a
+  ;;     bignum random/abs loop.  Surviving bignums' raw limb words are scanned
+  ;;     by %gc-scan-copied as candidate pointers; a limb that looks like a
+  ;;     from-space cons/object pointer gets %gc-copy-object'd → a forwarding
+  ;;     pointer stamped over mid-object data → heap poison.  Canaries before/
+  ;;     after detect it; a crash (SIGSEGV) or c-after != 1 = poison confirmed.
+  (when (eql (%parse-decimal-at-fixed-208) 44444)
+    (write-string-serial \"GCPOISON-START\") (write-char-serial 10)
+    (write-string-serial \"c-before=\")
+    (print-dec (handler-case (if (eq (quote zorka) (quote zorka)) 1 0) (t (c) -1)))
+    (write-char-serial 10)
+    (write-string-serial \"gc-before=\") (print-dec (mem-ref #x10000060 :u64))
+    (write-char-serial 10)
+    ;; Build a LIVE list of ~20000 random bignums (each = abs of a 300-bit
+    ;; random, all non-negative), held in `keep`.  Then allocate garbage conses
+    ;; to drive the alloc pointer past the semispace many times → many GCs while
+    ;; `keep` (and every bignum in it) is LIVE and gets COPIED each cycle.  Each
+    ;; copy runs %gc-scan-copied over the bignums' raw limb words; a limb that
+    ;; looks like a from-space cons/object pointer is %gc-copy-object'd → a
+    ;; forwarding pointer stamped over live data = poison.  Detect it 3 ways:
+    ;;   crash (SIGSEGV) / bn-ok != 20000 (a kept bignum went negative or its
+    ;;   abs changed) / c-after != 1.
+    (write-string-serial \"poison-test=\")
+    (print-dec (handler-case
+       (let ((keep nil) (i 0) (bound (ash 1 300))
+             (gmax (let ((a (%parse-decimal-at-fixed-248)))
+                     (if (> a 0) (* a 1000000) 70000000))))
+         ;; phase 1: build live bignum list
+         (loop (when (>= i 8000) (return nil))
+           (setq keep (cons (abs (random-from-interval bound)) keep))
+           (setq i (+ i 1)))
+         ;; phase 2: allocate garbage (argv2 millions, default 70M) while `keep`
+         ;; stays LIVE on the stack (a real root across every collection).
+         (setq i 0)
+         (loop (when (>= i gmax) (return nil))
+           (cons i i)
+           (setq i (+ i 1)))
+         ;; phase 3: integrity check — every kept bignum must still be >= 0 and
+         ;; equal to its own abs (poison would corrupt a limb → sign/value flip).
+         (let ((bad 0))
+           (loop for b in keep
+                 do (unless (and (>= b 0) (eql b (abs b))) (setq bad (+ bad 1))))
+           bad))                     ; 0 = clean, >0 = corrupted bignums
+     (t (c) -3)))
+    (write-char-serial 10)
+    (write-string-serial \"gc-after=\") (print-dec (mem-ref #x10000060 :u64))
+    (write-char-serial 10)
+    (write-string-serial \"c-after=\")
+    (print-dec (handler-case (if (eq (quote zorkz) (quote zorkz)) 1 0) (t (c) -1)))
+    (write-char-serial 10)
+    (write-string-serial \"GCPOISON-END\") (write-char-serial 10)
+    (sys-exit 0))
+
   ;; (6) GC-OFF EXHAUSTION STRESS (diagnostic for the FLIP decision): JIT many
   ;;     DISTINCT forms in a NON-forked loop (like run-all-tests / a long-lived
   ;;     REPL).  GC is OFF on aarch64-linux, so each ~1.5-1.7MB translation
@@ -469,7 +523,22 @@
 (setf *aarch64-stack-align-16* t)
 (setf *aarch64-linux-mode* t)
 (setf *aarch64-fn-align-offset* 120)
-(setf *linux-aarch64-r25-offset* +linux-aarch64-heap-size+)
+;; WS4-AA64 #160: ENABLE GC on this Linux CLI image.  Three knobs:
+;;   (a) *linux-aarch64-gc-metadata-shl* t — store GC metadata <<1 (the latent
+;;       raw-store bug that would halve every address once a collection fires).
+;;   (b) *linux-aarch64-gc-midpoint* — semispace boundary.  Shrunk to 128MB
+;;       (MODUS_GC_MIDPOINT hex override) so collections fire on a modest
+;;       allocation (the 448MB default needs ~448MB/GC — too coarse to repro).
+;;   (c) *linux-aarch64-r25-offset* = midpoint — x25 (alloc limit) = from-space
+;;       end, so the gc-check trampoline fires instead of running off-space.
+;; Trampoline + gc-check are already emitted (cross.lisp binds the labels for
+;; :arch :aarch64); the boot publishes from/to/space_size/stack_base metadata.
+(setf *linux-aarch64-gc-metadata-shl* t)
+(setf *linux-aarch64-gc-midpoint*
+      (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
+        (if (and v (> (length v) 0)) (parse-integer v :radix 16) #x08000000)))
+(setf *linux-aarch64-r25-offset* *linux-aarch64-gc-midpoint*)
+(format t "~%  AArch64 GC: ON  midpoint=#x~X  metadata-shl=t~%" *linux-aarch64-gc-midpoint*)
 (setf *aarch64-handler-pop-label* nil)
 (setf *aarch64-handler-push-label* nil)
 (setf *aarch64-gc-trampoline-label* nil)

@@ -216,8 +216,25 @@ check the build-time SKIP/WARN list for garbage-execution paths (the
 :li-func offset-0 class) before theorizing.  Follow-ups live in the task
 list (aa64 bignum×GC poison band; aa64 safepoint-deadline port; the
 compile-ash root fix = the bare-metal full-sweep blocker; GO-out-of-
-unwind-protect-cleanup NLX).  Next workstream: WS4 — the runtime JIT
-(bytecode→native at runtime), targeting the single evaluator.
+unwind-protect-cleanup NLX).
+
+## WS4 — the runtime JIT (bytecode→native at runtime): LANDED + FLIPPED ON
+
+The self-hosted MVM compiler now JITs eval2 forms to native x86-64 at runtime
+(translate-mvm-to-x64 → mmap exec page → call-relocation → %jit-call), and it is
+the **DEFAULT** for the shipping `build-generic-cli` image (`*jit-on*` defaults
+T; rollback = `MODUS_NO_JIT=1`).  Flip-clean, validated two ways: the full
+64-shard ANSI gate is **reg=0 / gain=+2 / CHUNK-CRASH=0** JIT-on vs JIT-off
+(17478 vs 17476), and a JIT-vs-interpret differential harness (422 boundary
+forms, `/home/claude/jitdiff`) shows **zero JIT wrong-values**.  Correctness is
+preserved by construction: any form the translator can't handle falls back to
+mvm-interpret via the `%jit-translate-page` guard, and both backends share the
+interp-safe boundary-literal codegen (post #197) so fallbacks are correct too.
+Key fixes en route: call-relocation untag (5b866fa), out-of-module GC-trampoline
++ genarith slow-path (a3ea500/88e7519), bignum-safe `emit-u64` (88e7519 — the
+`(ldb (byte 32 32) bignum)` high-word extract was broken by limitation #8; now
+`(logand …)` + `(ash (floor V 2^31) -1)`).  Next: port the JIT to aarch64; then
+back to Quicklisp.
 
 ## Build Commands
 

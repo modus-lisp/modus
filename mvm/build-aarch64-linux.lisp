@@ -1001,6 +1001,27 @@
   ;; no normal test id is 888888, so normal runs are unaffected (mvm-eval dead code).
   (when (eql *skip-below* 888888)
     (write-string-serial \"E2SMOKE-START\") (write-char-serial 10)
+    ;; WS4 aarch64 JIT PRIMITIVE probe (runs FIRST, before the mvm-eval self-
+    ;; checks which have a separate qemu-user path issue): mmap a PROT_RWX page,
+    ;; write a tiny native thunk (movz x0,#84 ; ret — 84 = tagged fixnum 42),
+    ;; flush the I-cache, then %jit-call it.  Exercises trap #x0531 (mmap-exec),
+    ;; #x0533 (icache-flush) and #x0532 (jit-call) end-to-end.  Expect jitprim=42.
+    (write-string-serial \"jitprim=\")
+    (print-dec
+     (handler-case
+         (let ((base (%mmap-exec-page 4096)))
+           (setf (mem-ref (+ base 0) :u8) #x80)
+           (setf (mem-ref (+ base 1) :u8) #x0A)
+           (setf (mem-ref (+ base 2) :u8) #x80)
+           (setf (mem-ref (+ base 3) :u8) #xD2)
+           (setf (mem-ref (+ base 4) :u8) #xC0)
+           (setf (mem-ref (+ base 5) :u8) #x03)
+           (setf (mem-ref (+ base 6) :u8) #x5F)
+           (setf (mem-ref (+ base 7) :u8) #xD6)
+           (%jit-icache-flush base 8)
+           (%jit-call base))
+       (t (c) -1)))
+    (write-char-serial 10)
     (write-string-serial \"add=\")
     (print-dec (mvm-eval (quote (+ 1 2)))) (write-char-serial 10)
     (write-string-serial \"sqr=\")

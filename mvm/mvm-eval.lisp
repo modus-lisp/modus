@@ -63,6 +63,16 @@
    special is kept for documentation / an alternate runtime override; the
    default %jit-enabled-p returns its value if bound, else NIL.")
 
+(defvar *jit-target-arch* :x64
+  "WS4-S5 (aarch64): which native back-end the runtime-JIT seam drives.
+   :x64 (default) → %jit-translate-page-1 (translate-mvm-to-x64, contiguous
+   imm64 relocation).  :aarch64 → %jit-translate-page-1-aarch64
+   (translate-mvm-to-aarch64, MOVZ/MOVK-quad relocation).  Set by the aarch64
+   image's boot init; the x64 image leaves it :x64 so the x64 JIT path is
+   behavior-identical to pre-Stage-5 (the aarch64 branch is dead code there —
+   its translate-mvm-to-aarch64 / a64-* references resolve to unused sentinels,
+   symmetric to the x64 image's existing dead translate-mvm-to-x64 ref).")
+
 (defun %jit-enabled-p ()
   "WS4-S5b JIT gate.  The build OVERRIDES this defun (build-x64-linux.lisp,
    baked from MODUS_USE_JIT) to return T or NIL — last-defun-wins.  This base
@@ -211,6 +221,28 @@
                (setq v (ash v -8))
                (setq j (+ j 1))))))
 
+(defun %jit-write-movz-quad (base off word)
+  "WS4-S5 (aarch64): patch a MOVZ/MOVK quad (4 consecutive 32-bit words) at
+   BASE+OFF with the 4 imm16 halves of WORD.  Register-agnostic: reads each
+   placeholder word (imm=0) and ORs in (half << 5), preserving the placeholder's
+   Rd + move-wide opcode base — so a li-const/fn-addr site targeting ANY Xd (not
+   just x16) patches correctly.  The aarch64 analogue of %jit-write-imm64."
+  (let ((k 0))
+    (loop
+      (when (>= k 4) (return nil))
+      (let* ((wo (+ off (* k 4)))
+             (w (logior (mem-ref (+ base wo) :u8)
+                        (ash (mem-ref (+ base (+ wo 1)) :u8) 8)
+                        (ash (mem-ref (+ base (+ wo 2)) :u8) 16)
+                        (ash (mem-ref (+ base (+ wo 3)) :u8) 24)))
+             (imm (logand (ash word (- (* k 16))) #xFFFF))
+             (nw (logior w (ash imm 5))))
+        (setf (mem-ref (+ base wo) :u8) (logand nw 255))
+        (setf (mem-ref (+ base (+ wo 1)) :u8) (logand (ash nw -8) 255))
+        (setf (mem-ref (+ base (+ wo 2)) :u8) (logand (ash nw -16) 255))
+        (setf (mem-ref (+ base (+ wo 3)) :u8) (logand (ash nw -24) 255)))
+      (setq k (+ k 1)))))
+
 (defun %jit-patch-consts (base cpatches)
   "Bake each live const-pool object's tagged native word into its movabs imm64.
    CPATCHES = list of (imm64-native-off . pool-idx).  Re-runnable after GC."
@@ -300,13 +332,68 @@
             (list base eoff cpatches (%gc-count)))
           nil))))
 
+(defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
+  "WS4-S5 (aarch64) sibling of %jit-translate-page-1.  translate-mvm-to-aarch64
+   wants an eql-keyed func-idx→MVM-offset HASH (not x64's (name offset length)
+   list), so build it from FT-LIST.  Translate BC under *aarch64-jit-mode*, mmap
+   an exec page, copy the native words, relocate out-of-module CALLs (untagged
+   callee addr = word-3) + #'NAME fn-addrs (tagged word) + patch li-const quads
+   (pool object tagged word), flush the I-cache, and return a jit-entry
+   (base eoff nil gc-stamp).  cpatches is NIL: GC is off on aarch64-linux so the
+   const-pool never moves and %jit-entry-for's post-GC re-bake never fires.
+   Returns NIL if any reloc failed to resolve (→ interpret fallback).  MAY signal
+   a translator gap — the %jit-translate-page guard turns it into NIL."
+  (setq *aarch64-jit-mode* t)
+  (let ((ftbl (make-hash-table :test (quote eql))))
+    (let ((i 0)) (dolist (e ft-list) (setf (gethash i ftbl) (cadr e)) (setq i (+ i 1))))
+    (multiple-value-bind (nbuf fn-map) (translate-mvm-to-aarch64 bc ftbl)
+      (let* ((nwords (a64-buffer-position nbuf))
+             (code (a64-buffer-code nbuf))
+             (nlen (* nwords 4))
+             (crel *aarch64-call-relocs*)
+             (frel *aarch64-fn-addr-relocs*)
+             (cpat *aarch64-li-const-patches*)
+             (eoff (gethash mvm-entry fn-map))
+             (npages (+ 1 (ash nlen -12)))
+             (psize (ash npages 12))
+             (base (%mmap-exec-page psize))
+             (k 0) (ok t))
+        (loop
+          (when (>= k nwords) (return nil))
+          (let ((w (aref code k)) (o (* k 4)))
+            (setf (mem-ref (+ base o) :u8) (logand w 255))
+            (setf (mem-ref (+ base (+ o 1)) :u8) (logand (ash w -8) 255))
+            (setf (mem-ref (+ base (+ o 2)) :u8) (logand (ash w -16) 255))
+            (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
+          (setq k (+ k 1)))
+        ;; Out-of-module CALL relocations (untagged callee addr = word-3).
+        (dolist (r crel)
+          (let* ((name (gethash (cdr r) rt-table))
+                 (fn (and name (%mvm-resolve-runtime-fn name)))
+                 (addr (if fn (- (%val->word fn) 3) 0)))
+            (if (> addr 0) (%jit-write-movz-quad base (car r) addr) (setq ok nil))))
+        ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
+        (dolist (r frel)
+          (let* ((name (gethash (cdr r) rt-table))
+                 (fn (and name (%mvm-resolve-runtime-fn name)))
+                 (word (if fn (%val->word fn) 0)))
+            (if (> word 0) (%jit-write-movz-quad base (car r) word) (setq ok nil))))
+        ;; Quoted-literal / string li-const patches (pool object tagged word).
+        (dolist (p cpat)
+          (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+            (%jit-write-movz-quad base (car p) (%val->word obj))))
+        (%jit-icache-flush base nlen)
+        (if (and ok eoff)
+            (list base eoff nil (%gc-count))
+            nil)))))
+
 (defvar *jit-translate-err-count* 0
   "DIAGNOSTIC: count of translate-time errors caught by %jit-translate-page's
    guard (distinct from MV/reloc/page-unavailable fallbacks).")
 (defvar *jit-last-translate-err* nil
   "DIAGNOSTIC: the last condition caught by %jit-translate-page's guard.")
 
-(defun %jit-translate-page (bc ft-list rt-table)
+(defun %jit-translate-page (bc mvm-entry ft-list rt-table)
   "FLIP-SAFETY GUARD (Fix 1): translate + build a JIT exec page for BC, but
    turn ANY error signalled while translating/relocating (e.g. a translator
    gap such as `Unknown register: 0` in a flet/labels/CLOS-dispatch shape)
@@ -320,7 +407,9 @@
    guard exists because a translate error must degrade to NIL (interpret)
    even in any context whose outer catch might not see it."
   (handler-case
-      (%jit-translate-page-1 bc ft-list rt-table)
+      (if (eq *jit-target-arch* :aarch64)
+          (%jit-translate-page-1-aarch64 bc mvm-entry ft-list rt-table)
+          (%jit-translate-page-1 bc ft-list rt-table))
     (t (c)
        (setq *jit-translate-err-count*
              (if (boundp (quote *jit-translate-err-count*))
@@ -330,7 +419,7 @@
              (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
        nil)))
 
-(defun %jit-entry-for (bc ft-list rt-table)
+(defun %jit-entry-for (bc mvm-entry ft-list rt-table)
   "Return a ready-to-call jit-entry (base eoff cpatches gc-stamp) for BC, using
    *jit-page-cache* (keyed by BC identity) if present — RE-PATCHING const
    immediates when a GC has fired since the page was built (the pool moved).
@@ -349,9 +438,9 @@
                 (%jit-patch-consts (car fresh) (caddr fresh))
                 (setf (gethash bc *jit-page-cache*) fresh)
                 fresh)))
-        (let ((entry (%jit-translate-page bc ft-list rt-table)))
-          (when entry (setf (gethash bc *jit-page-cache*) entry))
-          entry))))
+        (let ((je (%jit-translate-page bc mvm-entry ft-list rt-table)))
+          (when je (setf (gethash bc *jit-page-cache*) je))
+          je))))
 
 (defun %mvm-eval-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p)
   "WS4-S5b: run compiled module BC as NATIVE JIT'd code, wrapping the result
@@ -365,8 +454,8 @@
    where the SAME bc re-evals — the speedup source); NIL = translate once, no
    cache (the fresh-bc DEF* path, whose page would never be re-hit)."
   (let ((je (if cache-p
-                (%jit-entry-for bc ft-list rt-table)
-                (%jit-translate-page bc ft-list rt-table))))
+                (%jit-entry-for bc entry ft-list rt-table)
+                (%jit-translate-page bc entry ft-list rt-table))))
     (if je
         (progn
           ;; Native code stamps MV-count into real BSS; seed it to 1 so a

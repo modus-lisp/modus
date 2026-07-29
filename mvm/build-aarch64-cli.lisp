@@ -135,6 +135,33 @@
 (defun %jit-pv (x)
   (if (integerp x) (print-dec x) (write-string-serial \"NI\")))
 
+;; WS4 aarch64 Stage 5: runtime-controllable JIT gate for the in-image
+;; differential.  Overrides mvm-eval.lisp's base %jit-enabled-p (last-defun-wins)
+;; so we can flip the SEAM on/off per form via *cli-jit-on* and confirm the
+;; native path (translate-mvm-to-aarch64 → exec page → %jit-call) agrees with
+;; pure interpret AND actually ran native (*jit-native-count* advanced).
+(defvar *cli-jit-on* nil)
+(defun %jit-enabled-p () *cli-jit-on*)
+
+;; Stage-5 probe: eval FORM through the REAL mvm-eval seam twice — interpret
+;; (jit off) then JIT (jit on) — compare, and report whether the JIT run took
+;; the NATIVE path (native-count advanced) vs fell back to interpret.
+(defun %s5-probe (label form)
+  (setq *cli-jit-on* nil)
+  (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
+        (nc0 *jit-native-count*))
+    (setq *cli-jit-on* t)
+    (let ((jv (handler-case (mvm-eval form) (t (c) (quote JERR)))))
+      (setq *cli-jit-on* nil)
+      (let ((native (> *jit-native-count* nc0)))
+        (write-string-serial label)
+        (if (eql iv jv)
+            (progn (write-string-serial \"MATCH v=\") (%jit-pv iv)
+                   (write-string-serial (if native \" NATIVE\" \" fellback\")))
+            (progn (write-string-serial \"MISMATCH i=\") (%jit-pv iv)
+                   (write-string-serial \" j=\") (%jit-pv jv)))
+        (write-char-serial 10)))))
+
 (defun %jit-diff-probe (label form)
   (write-string-serial label)
   (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
@@ -328,6 +355,26 @@
   (%jit-diff-probe \"aa64s4-const=\" (quote (car (quote (42 7)))))
   (%jit-diff-probe \"aa64s4-str=\"   (quote (length \"hello\")))
   (%jit-diff-probe \"aa64s4-fn=\"    (quote (let ((f (function length))) (funcall f (quote (9 8 7))))))
+
+  ;; (5) WS4 aarch64 STAGE 5: drive the GENERICIZED mvm-eval SEAM.  With
+  ;;     *jit-target-arch* = :aarch64 and the JIT gate on, production mvm-eval
+  ;;     routes through %jit-translate-page → %jit-translate-page-1-aarch64
+  ;;     (translate → exec page → MOVZ-quad relocation → %jit-call).  Each probe
+  ;;     compares the seam's JIT result to pure interpret AND reports whether the
+  ;;     native path actually ran (NATIVE) or cleanly fell back (fellback).
+  (setq *jit-target-arch* :aarch64)
+  (setq *jit-native-count* 0)
+  (setq *jit-fallback-count* 0)
+  (setq *jit-page-cache* nil)
+  (%s5-probe \"aa64s5-add=\"  (quote (+ 1 2)))
+  (%s5-probe \"aa64s5-sqr=\"  (quote (let ((x 5)) (* x x))))
+  (%s5-probe \"aa64s5-len=\"  (quote (length (list 1 2 3))))
+  (%s5-probe \"aa64s5-const=\" (quote (car (quote (42 7)))))
+  (%s5-probe \"aa64s5-str=\"  (quote (length \"hello\")))
+  (write-string-serial \"aa64s5-native-total=\") (print-dec *jit-native-count*)
+  (write-char-serial 10)
+  (write-string-serial \"aa64s5-fallback-total=\") (print-dec *jit-fallback-count*)
+  (write-char-serial 10)
 
   (write-string-serial \"CLI-DONE\") (write-char-serial 10)
   (sys-exit 0))

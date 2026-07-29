@@ -201,6 +201,19 @@
     (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
     (aset map 20 31) (aset map 21 29) (aset map 22 nil)
     (setq *a64-vreg-to-phys* map))
+  ;; *mvm-label-counter* is a (defvar … 0) whose init-thunk does NOT run at boot
+  ;; (CLAUDE.md item 7) → nil at runtime; translate-aarch64's (incf …) would
+  ;; crash.  The compiler doesn't use it, so no earlier path initialised it.
+  (when (null *mvm-label-counter*) (setq *mvm-label-counter* 0))
+  ;; CRITICAL for the JIT: *aarch64-stack-align-16* gates :push/:pop codegen.
+  ;; nil (its runtime default) emits the bare-metal `str [sp,#-8]!` / `ldr
+  ;; [sp],#8` which MISALIGNS SP to 8-mod-16 → Linux EL0 SP-alignment fault
+  ;; (SIGBUS) on the next SP access.  The normal build sets it t host-side
+  ;; (build-aarch64-linux.lisp:1445) but that doesn't reach runtime (item 7),
+  ;; so set it here for JIT-translated code.  *aarch64-linux-mode* likewise so
+  ;; any TRAP codegen emits Linux syscalls.
+  (setq *aarch64-stack-align-16* t)
+  (setq *aarch64-linux-mode* t)
   t)
 ")
 ;; The assembled self-host block, spliced into *full-source* after the bridge.

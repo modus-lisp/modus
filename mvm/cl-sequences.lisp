@@ -1897,7 +1897,7 @@
     (setq type (class-name type)))
   ;; SIZE must be a non-negative integer (CLHS: make-sequence size = "a
   ;; non-negative integer").  Validate before any length comparison or
-  ;; element-filling loop.  This also guards the eval2 / compiled-call path:
+  ;; element-filling loop.  This also guards the mvm-eval / compiled-call path:
   ;; when make-sequence is called with the SIZE argument missing (e.g. the
   ;; arity-error test (make-sequence 'list)), the compiled-call convention
   ;; leaves a garbage value in the SIZE slot; without this check the

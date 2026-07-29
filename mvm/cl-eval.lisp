@@ -211,13 +211,13 @@
       (error "fmakunbound: not a function name"))
     (let ((name (car nh))
           (hash (cdr nh)))
-      ;; eval2 installs a module's top-level DEFUNs at BUILD time, before
+      ;; mvm-eval installs a module's top-level DEFUNs at BUILD time, before
       ;; the module's code executes — so a runtime fmakunbound that
       ;; textually PRECEDES the defun in the same module (uiop defun*:
       ;; (progn (fmakunbound 'f) (defun f …))) would run AFTER the install
       ;; and undo it, leaving F undefined (asdf's resolve-location class).
       ;; Honor source order: skip removal when the RUNNING module is
-      ;; (re)defining this very name (*e2-active-defun-names*, eval2.lisp).
+      ;; (re)defining this very name (*e2-active-defun-names*, mvm-eval.lisp).
       ;; The pathological inverse (defun f … then fmakunbound 'f in ONE
       ;; toplevel form) is thereby left defined — accepted trade-off.
       (when (and (> (length name) 0)
@@ -665,7 +665,7 @@
     (t nil)))
 
 (defun %runtime-register-deftype (tname params body)
-  "eval2 DEFTYPE expansion target (compiler.lisp, *eval2-runtime-p* gated).
+  "mvm-eval DEFTYPE expansion target (compiler.lisp, *mvm-eval-runtime-p* gated).
    Registers the expander in *%runtime-deftype-table* — the SAME registry
    the tree-walker's DEFTYPE handler (below, in %eval-in-env) writes and
    ansi-bridge.lisp's %deftype-lookup / %expand-deftype (typep/subtypep)
@@ -679,8 +679,8 @@
   tname)
 
 (defun %runtime-register-compiler-macro (mname params body)
-  "eval2 DEFINE-COMPILER-MACRO expansion target (compiler.lisp,
-   *eval2-runtime-p* gated).  Registers an %interp-closure expander in
+  "mvm-eval DEFINE-COMPILER-MACRO expansion target (compiler.lisp,
+   *mvm-eval-runtime-p* gated).  Registers an %interp-closure expander in
    *compiler-macro-function-table* — the SAME registry the tree-walker's
    DEFINE-COMPILER-MACRO handler writes and COMPILER-MACRO-FUNCTION
    consults.  Returns MNAME per CLHS."
@@ -836,7 +836,7 @@
 
 ;; %CALL-INTERP-CLOSURE has NO definition in this file (WS3 STEP 4): the
 ;; evaluator engine provides it — tree-walker.lisp's walker dispatcher in
-;; the legacy fork builds, eval2.lisp's eval2-first dispatcher in the
+;; the legacy fork builds, mvm-eval.lisp's mvm-eval-first dispatcher in the
 ;; production images (which load tree-walker.lisp earlier only as the
 ;; %e2ic fallback).  Call sites below resolve to the build's engine via
 ;; whole-program last-defun-wins.  A STUB DEFUN HERE IS A BUG: a third
@@ -928,12 +928,12 @@
 (defvar *%eval-throw-value* nil)
 
 (defun %e2-symbol-value-checked (hash sym)
-  "eval2 (WS3 flip) global-variable READ with CL unbound-variable semantics.
-   Emitted by compile-variable-ref under *eval2-runtime-p* instead of a bare
+  "mvm-eval (WS3 flip) global-variable READ with CL unbound-variable semantics.
+   Emitted by compile-variable-ref under *mvm-eval-runtime-p* instead of a bare
    SYMBOL-VALUE call (which returns NIL for an ABSENT alist entry, conflating
    'unbound' with 'bound to NIL').  Mirrors %eval-sym-lookup's tree-walker
    fallback exactly: present-in-alist → value; absent → signal
-   UNBOUND-VARIABLE with :name SYM (the ORIGINAL symbol, via the eval2 quote
+   UNBOUND-VARIABLE with :name SYM (the ORIGINAL symbol, via the mvm-eval quote
    pool) so (cell-error-name c) is EQ to the source symbol
    (cell-error-name.1, eval.error.4)."
   (if (%boundp-by-hash hash)
@@ -971,7 +971,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn)))
@@ -984,7 +984,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a))
@@ -997,7 +997,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b))
@@ -1010,7 +1010,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b c))
@@ -1023,7 +1023,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d))
@@ -1036,7 +1036,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e))
@@ -1049,7 +1049,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f))
@@ -1062,7 +1062,7 @@
     ;; symbol must call its global function (CLHS funcall accepts function
     ;; designators).  The wrapper is cons-tagged so it lands in this IC
     ;; slow path; resolve via symbol-function (name-keyed + hash-keyed
-    ;; tables — covers native fns AND eval2 trampolines) and call it.
+    ;; tables — covers native fns AND mvm-eval trampolines) and call it.
     ;; Without this, (funcall 'os-unix-p) from a READ symbol signalled
     ;; UNDEFINED-FUNCTION (uiop detect-os, asdf gauntlet).
     ((%cl-sym-p fn) (funcall (symbol-function fn) a b c d e f g))
@@ -1129,7 +1129,7 @@
   "Evaluate FORM in the null lexical environment (CLHS).
 
    WS3 Phase 3 (tree-walker retired as production evaluator): EVAL/LOAD go
-   straight to eval2 — compile FORM to MVM bytecode via the self-hosted
+   straight to mvm-eval — compile FORM to MVM bytecode via the self-hosted
    compiler + run it through mvm-interpret.  The tree-walker %eval-in-env is
    NO LONGER a production eval path; it survives only as the runtime
    evaluation engine for INTERPRETED CLOSURES (%interp-closure — runtime
@@ -1137,9 +1137,9 @@
    CLOS method bodies produced by eval-defmethod, printer/apply of interp
    closures) and for DEFTYPE expansion in typep/subtypep (%expand-deftype).
    Those callers evaluate a lambda body against a runtime env-alist, which
-   eval2 (a top-level-form compiler) does not provide — so %eval-in-env is
+   mvm-eval (a top-level-form compiler) does not provide — so %eval-in-env is
    kept as SHARED infrastructure, not a rollback lever."
-  (eval2 form))
+  (mvm-eval form))
 
 ;;; ============================================================
 ;;; Compile: return proper 3 values
@@ -1390,12 +1390,12 @@
   ;; CLOS internals so eval'd defgeneric/defmethod forms resolve.
   (puthash "%DEFGENERIC" ht #'%defgeneric)
   (puthash "%DEFMETHOD" ht #'%defmethod)
-  ;; eval2 DEFMETHOD/DEFGENERIC expansion targets (WS3 flip): full runtime
+  ;; mvm-eval DEFMETHOD/DEFGENERIC expansion targets (WS3 flip): full runtime
   ;; defmethod semantics + function-cell stub install.  Without these in the
-  ;; bridge table, eval2's :call to them silently resolved nothing.
+  ;; bridge table, mvm-eval's :call to them silently resolved nothing.
   (puthash "%DEFMETHOD-FULL" ht #'%defmethod-full)
   (puthash "%GF-INSTALL-DISPATCH-STUB" ht #'%gf-install-dispatch-stub)
-  (puthash "%DEFGENERIC-EVAL2-PRECHECK" ht #'%defgeneric-eval2-precheck)
+  (puthash "%DEFGENERIC-MVM-EVAL-PRECHECK" ht #'%defgeneric-mvm-eval-precheck)
   (puthash "%DEFCLASS" ht #'%defclass)
   (puthash "%FIND-GF" ht #'%find-gf)
   (puthash "%GF-DISPATCH" ht #'%gf-dispatch)
@@ -3368,7 +3368,7 @@
     ((arrayp x) nil)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →
-    ;; (functionp <bignum>) = T.  Under eval2 that made op-obj-subtag report
+    ;; (functionp <bignum>) = T.  Under mvm-eval that made op-obj-subtag report
     ;; #x51 (native-fn) for a bignum instead of #x30, so (bignump <bignum>) =
     ;; NIL → %integer-truncate ran inline :div on the bignum's heap pointer →
     ;; garbage / gcd.4 (test 13621) 0xDEAD0004 wild call.  A bignum is NOT a
@@ -3524,7 +3524,7 @@
               ;; IS the expansion (CLHS: body runs at macroexpansion time).
               ;; ENGINE-AGNOSTIC (WS3 STEP 4): build a plain lambda over
               ;; (vars… store-vars…) and apply it to the gensym symbols via
-              ;; production EVAL — no walker env-alist needed; eval2's
+              ;; production EVAL — no walker env-alist needed; mvm-eval's
               ;; compile-cache hits on repeated expansions of the same
               ;; descriptor (the lambda form is identical across calls).
               (expander-fn (eval (cons 'lambda

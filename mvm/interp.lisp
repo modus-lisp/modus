@@ -65,15 +65,15 @@
 ;; The FIX must not re-hit the bug it repairs, and must not depend on the
 ;; boundary correctness of the in-image bignum tower.  Both are solved by using
 ;; `%fixnum-+` / `%fixnum--` on the register VALUES directly.  interp.lisp is
-;; compiled to NATIVE code and runs natively (only eval2'd code runs through
+;; compiled to NATIVE code and runs natively (only mvm-eval'd code runs through
 ;; mvm-interpret), so these primops emit the very same native :add / :sub
-;; hardware instructions — with the identical int64 wrap — that the eval2
+;; hardware instructions — with the identical int64 wrap — that the mvm-eval
 ;; opcode is modelling.  There is NO promotion, NO bignum intermediate, and NO
 ;; recursion back into this handler.  The old `(+ (reg-get va) (reg-get vb))`
 ;; instead round-tripped each operand through %val->word (SHL 1): for a fixnum
 ;; VALUE near 2^62, value<<1 already sets bit 63, so the compiled :shl's
 ;; value<<2 intermediate overflowed the register and the following :sar read
-;; garbage — collapsing `(+ -3 4611686018427387900)` to -7 under eval2 while
+;; garbage — collapsing `(+ -3 4611686018427387900)` to -7 under mvm-eval while
 ;; native was correct.  Taking the slot VALUE straight into %fixnum-+ avoids
 ;; the extra shift entirely, so the wrap happens exactly once, in hardware.
 (declaim (inline %mvm-wrap-tagword-add %mvm-wrap-tagword-sub))
@@ -88,7 +88,7 @@
 ;; base are not in-module bytecode offsets but indices into the interpreter's
 ;; RUNTIME-TABLE (synthetic-offset -> native function name).  op-call funcalls the
 ;; real native function with %word->val'd args — the no-marshalling path proven in
-;; WS1.0.  Base is far above any real eval2 module size and fits in a u32.
+;; WS1.0.  Base is far above any real mvm-eval module size and fits in a u32.
 (defconstant +mvm-runtime-call-base+ #x40000000)
 
 (defun %mvm-resolve-runtime-fn (name)
@@ -324,8 +324,8 @@
 ;;; Native-HOF re-entrancy trampoline
 ;;; ============================================================
 ;;;
-;;; The hard eval2 gap: a NATIVE higher-order function (mapcar/reduce/…) that
-;;; funcalls an eval2 lambda VALUE.  funcall/apply/mapcar of #'NAME already
+;;; The hard mvm-eval gap: a NATIVE higher-order function (mapcar/reduce/…) that
+;;; funcalls an mvm-eval lambda VALUE.  funcall/apply/mapcar of #'NAME already
 ;;; work (the value is a real native fn the bridge funcalls), and an IN-module
 ;;; (funcall (lambda …) x) works (op-call-ind jumps within the same interpret
 ;;; loop).  But when an in-module bytecode lambda ESCAPES to native code — its
@@ -334,7 +334,7 @@
 ;;; #x52 closure whose slot-0 is such an offset.  Native funcall can't run
 ;;; bytecode → the call fails.
 ;;;
-;;; Fix: when an eval2 lambda value crosses to native code (only at the op-CALL /
+;;; Fix: when an mvm-eval lambda value crosses to native code (only at the op-CALL /
 ;;; op-CALL-IND runtime bridges), wrap it in a TRAMPOLINE — a real native Modus
 ;;; closure that, when funcalled with args, RE-ENTERS mvm-interpret on the SAME
 ;;; bytecode at the lambda's offset (with the args marshalled into a fresh
@@ -356,7 +356,7 @@
    LAM-OFFSETS is threaded through so a lambda that itself escapes a lambda to a
    native HOF (nested mapcar) keeps working on the re-entry."
   (lambda (&rest args)
-    ;; Wrap the RESULT like eval2-forms does (%mvm-wrap-escaping-result):
+    ;; Wrap the RESULT like mvm-eval-forms does (%mvm-wrap-escaping-result):
     ;; a body that returns an in-module #x52 lambda closure must hand the
     ;; native caller a re-entrant trampoline, not the raw module closure
     ;; (whose slot-0 is a bytecode offset native funcall would misread as a
@@ -371,7 +371,7 @@
     ;; interpreter).  Re-emit them via a TAIL values-list so a native caller
     ;; of the trampoline (e.g. %with-handler-bind's body-fn funcall) sees the
     ;; full MV state — before this, a handler-bind body returning (values 1
-    ;; 2 3) under eval2 was truncated to its primary (probe 106).  values-
+    ;; 2 3) under mvm-eval was truncated to its primary (probe 106).  values-
     ;; list in tail position is exempt from the set-mv-count=1 epilogue
     ;; (tail-form-is-values-p descends LET).
     (let ((r (%mvm-wrap-escaping-result
@@ -387,10 +387,10 @@
                        (list r))))))
 
 (defun %mvm-lambda-offset-p (n lam-offsets)
-  "True if integer N is the bytecode entry offset of an eval2 LAMBDA / CLOSURE
+  "True if integer N is the bytecode entry offset of an mvm-eval LAMBDA / CLOSURE
    function (as recorded in the LAM-OFFSETS hash, keyed by offset).  Built in
-   eval2-forms from the functions whose names carry the `$$LAMBDA` / `$$CLOSURE`
-   marker — i.e. ONLY genuine lambda bodies, never the %eval2-thunk, helper
+   mvm-eval-forms from the functions whose names carry the `$$LAMBDA` / `$$CLOSURE`
+   marker — i.e. ONLY genuine lambda bodies, never the %mvm-eval-thunk, helper
    defuns, or the function at offset 0.  This is what makes a BARE in-module
    offset (a captureless lambda's fn-addr value) safely distinguishable from an
    ordinary fixnum DATA argument at the native bridge: a data integer like 0 / 1
@@ -408,16 +408,16 @@
    `(eql <trampoline> elt)` never matched (so remove returned its input
    UNCHANGED), identity → returned the trampoline.  A data fixnum 0 is far more
    common than a lambda body legitimately at module offset 0, and excluding it is
-   safe: eval2-forms reserves offset 0 for the first named defun / the
-   %EVAL2-THUNK, ordered BEFORE the drained $$LAMBDA / $$CLOSURE bodies (which
-   therefore always get offsets > 0).  eval2-forms also no longer records 0 in
+   safe: mvm-eval-forms reserves offset 0 for the first named defun / the
+   %MVM-EVAL-THUNK, ordered BEFORE the drained $$LAMBDA / $$CLOSURE bodies (which
+   therefore always get offsets > 0).  mvm-eval-forms also no longer records 0 in
    lam-offsets; this guard is the matching defense at the read side."
   (and (integerp n) (not (eql n 0)) lam-offsets
        (gethash n lam-offsets)))
 
 (defun %mvm-module-fn-offset-p (n lam-offsets)
   "True if integer N is the bytecode entry offset of ANY function in the
-   current eval2 module — a $$LAMBDA/$$CLOSURE body (entry T) or an ordinary
+   current mvm-eval module — a $$LAMBDA/$$CLOSURE body (entry T) or an ordinary
    defun/flet/thunk (entry :DEFUN, recorded since compile-function-ref
    materializes #'IN-MODULE-FN as a #x52 closure).  Unlike
    %mvm-lambda-offset-p there is NO 0-exclusion: this predicate is consulted
@@ -430,7 +430,7 @@
        (gethash n lam-offsets)))
 
 (defun %mvm-wrap-escaping (v bc ftab rt lam-offsets)
-  "If V is an eval2 lambda value about to cross to NATIVE code, wrap it in a
+  "If V is an mvm-eval lambda value about to cross to NATIVE code, wrap it in a
    trampoline so native funcall can invoke it.  Two escaping shapes:
      - a #x52 CLOSURE object whose slot-0 is a LAMBDA bytecode offset: wrap
        (slot0 offset, slot1 env).  This is the CAPTURING escaped lambda —
@@ -462,12 +462,12 @@
     (t v)))
 
 (defun %mvm-wrap-escaping-result (v bc ftab rt lam-offsets)
-  "Wrap an eval2 RESULT value (the thunk's return) that is an in-module
+  "Wrap an mvm-eval RESULT value (the thunk's return) that is an in-module
    #x52 lambda closure in a re-entrant trampoline, so the value production
    EVAL hands back is natively funcallable and IDENTITY-DISTINCT per call.
    Unlike the bridge-arg wrapper (%mvm-wrap-escaping), a BARE integer is
    NEVER wrapped here: eval results are ordinary data far more often than
-   captureless-lambda offsets, and under *eval2-runtime-p* compile-lambda
+   captureless-lambda offsets, and under *mvm-eval-runtime-p* compile-lambda
    materializes captureless lambdas as #x52 closures, so the raw-offset
    shape doesn't escape as a result value.  Everything except a
    #x52-with-recorded-lambda-offset passes through unchanged."
@@ -486,22 +486,22 @@
   "True if NAME is a STORAGE-SINK native bridge fn — one that merely STORES its
    lambda argument (into a global cell / the symbol-function table) rather than
    CALLING it.  Such an argument must NOT be trampoline-wrapped: the wrap turns
-   an in-module eval2 lambda (offset / #x52 closure) into a NATIVE trampoline
-   closure, whose slot-0 is a native fn-addr — NOT a bytecode offset.  eval2's
+   an in-module mvm-eval lambda (offset / #x52 closure) into a NATIVE trampoline
+   closure, whose slot-0 is a native fn-addr — NOT a bytecode offset.  mvm-eval's
    own funcall CLOSURE path call-indirects slot-0 as a bytecode offset, so a
-   stored-then-eval2-funcalled trampoline jumps to a bogus PC and returns stale
+   stored-then-mvm-eval-funcalled trampoline jumps to a bogus PC and returns stale
    VR (= the fn itself: `(eq (funcall stored) stored)` was T).  Storing the RAW
-   eval2 representation instead lets a later eval2 funcall dispatch it via the
+   mvm-eval representation instead lets a later mvm-eval funcall dispatch it via the
    normal in-module offset/closure path (the same path a direct funcall uses).
    Comparison is by NAME string (case-insensitive) since NAME is the runtime-
-   table key the eval2 compiler emitted for the CALL."
+   table key the mvm-eval compiler emitted for the CALL."
   (and (stringp name)
        (or (string-equal name "SET-SYMBOL-VALUE")
            (string-equal name "SET-SYMBOL-FUNCTION"))))
 
 (defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets &optional no-wrap)
   "Collect the NARGS arguments for a native bridge call, in order
-   (arg0 arg1 … arg{nargs-1}), wrapping any escaping eval2 lambda value
+   (arg0 arg1 … arg{nargs-1}), wrapping any escaping mvm-eval lambda value
    (unless NO-WRAP — set for storage-sink fns, see %mvm-store-fn-name-p).
 
    The MVM calling convention places the FIRST 4 args (compiler.lisp's
@@ -511,7 +511,7 @@
    onto the mvm-stack (top of stack = arg4, next below = arg5, …) just
    before the :call / :call-indirect.  The original bridge read EVERY arg
    from regs[0..nargs-1], so for nargs>4 it read STALE register slots for
-   args 4+ — every native fn bridge-called from eval2 with >=5 args got
+   args 4+ — every native fn bridge-called from mvm-eval with >=5 args got
    garbage for its 5th+ argument (the assoc/member/adjoin/remove/… clusters:
    the keyword validators saw garbage where :allow-other-keys / :test / :key
    should be → spurious PROGRAM-ERROR returned as a value).  Read the
@@ -572,13 +572,13 @@
 ;; ((multiple-value-list (eval '(values 1 2 3))) → (1 2 3)) — but the
 ;; interpreter models the MV slots in its per-state SIMULATED memory hash,
 ;; which is unreachable once mvm-interpret returns.  So the return path
-;; (return-raw NIL only — the eval2 path) stashes the simulated MV state
-;; here; eval2-forms / %eval2-run-tuple read it IMMEDIATELY after their
+;; (return-raw NIL only — the mvm-eval path) stashes the simulated MV state
+;; here; mvm-eval-forms / %mvm-eval-run-tuple read it IMMEDIATELY after their
 ;; mvm-interpret call returns and re-emit the values via values-list (a
 ;; native fn that writes the REAL MV slots and is exempt from the
 ;; set-mv-count=1 epilogue).  Read-right-after-set means nesting is safe:
 ;; an inner (eval …) inside an outer interpret overwrites this, but its
-;; reader (the inner eval2 tail) consumed it before the outer interpret
+;; reader (the inner mvm-eval tail) consumed it before the outer interpret
 ;; resumed.  Defvar defaults NIL at boot — exactly the wanted initial state.
 (defvar *mvm-last-mv* nil)
 
@@ -608,8 +608,8 @@
    CALLs to functions outside the bytecode module to a direct native funcall.
 
    INITIAL-ARGS / INITIAL-CENV (re-entrancy support, the native-HOF-over-an-
-   eval2-lambda path): when a native higher-order function (mapcar/reduce/…)
-   funcalls an eval2 lambda VALUE that escaped to native code, the escaping
+   mvm-eval-lambda path): when a native higher-order function (mapcar/reduce/…)
+   funcalls an mvm-eval lambda VALUE that escaped to native code, the escaping
    value is a trampoline closure (see %mvm-make-trampoline) that RE-ENTERS this
    interpreter at the lambda's bytecode offset.  INITIAL-ARGS is the list of
    call arguments — they are loaded into V0..Vn (the normal arg registers) and
@@ -682,7 +682,7 @@
       (when (or (mvm-halted state) (>= pc len))
         (if return-raw
             (return (reg-get regs +vreg-vr+))       ; raw word (caller re-tags)
-            ;; Value path (eval2): stash the run's MULTIPLE-VALUE state for
+            ;; Value path (mvm-eval): stash the run's MULTIPLE-VALUE state for
             ;; the caller (see *mvm-last-mv*).  The simulated MV-count slot
             ;; is authoritative here: compile-values / the bridge mirror
             ;; write it, the fn epilogue's op-set-mv-count resets it to 1
@@ -752,7 +752,7 @@
                ;; non-NIL marker so the BNNULL there takes the HANDLER path
                ;; (mirroring the native "setjmp returned non-zero").  With no
                ;; handler active this is an unbalanced longjmp — signal so the
-               ;; outer eval2-forms handler reports it (matches native: a longjmp
+               ;; outer mvm-eval-forms handler reports it (matches native: a longjmp
                ;; with a zeroed jmp-buf slot is undefined / a crash).
                ((= code #x0511)
                 (let ((rpc (%mvm-longjmp-restore state)))
@@ -777,7 +777,7 @@
                ;; VFP simple-vector.  Without this, a &rest/&key lambda CALLED
                ;; WITH >4 ARGS built its rest list from un-spilled (zero/stale)
                ;; frame slots 4+, so the 5th+ keyword/value was lost — the WS3
-               ;; eval2 lambda &key cluster (lambda.33/35/36/44-49: any >4-arg
+               ;; mvm-eval lambda &key cluster (lambda.33/35/36/44-49: any >4-arg
                ;; &key call returned NIL / spurious "unknown keyword" for the
                ;; args past the register window).  The copy is non-destructive
                ;; (the caller's post-call POP cleanup still drains the stack).
@@ -818,7 +818,7 @@
                   ;; on the mvm-stack (top = arg4 — compile-call pushes
                   ;; overflow args before the reg-arg push/pop shuffle), and
                   ;; the fresh frame is all-zero, so WITHOUT this copy every
-                  ;; 5th+ parameter of an eval2 function read as 0 — the asdf
+                  ;; 5th+ parameter of an mvm-eval function read as 0 — the asdf
                   ;; gauntlet's define-package TYPE-ERROR cluster
                   ;; (ensure-inherited/ensure-symbol take 8 args; check-type
                   ;; on a zeroed hash-table param signalled).  Non-destructive
@@ -852,7 +852,7 @@
                ;; while %val->word's value<<1 fits int64.  For a fixnum VALUE
                ;; near 2^62 the compiled :shl's value<<2 overflows the register
                ;; and the :sar reads garbage, CORRUPTING the moved operand.  The
-               ;; eval2 pairwise-arith step (%compile-arith-arg-step-e2) emits
+               ;; mvm-eval pairwise-arith step (%compile-arith-arg-step-e2) emits
                ;; `:mov temp dest` on a freshly compiled ~2^62 literal, so
                ;; `(+ -3 4611686018427387900)` fed generic-add a garbage second
                ;; operand and returned -7 (native was correct).  A move needs no
@@ -878,8 +878,8 @@
                    (multiple-value-bind (imm npc2) (fetch-u64 bc npc)
                      (reg-set regs vd imm) (setf pc npc2))))))
 
-          ;; LI-CONST: load constant-pool[idx] — the eval2 QUOTE pool.  The
-          ;; compiler (compile-quote under *eval2-runtime-p*) registered the
+          ;; LI-CONST: load constant-pool[idx] — the mvm-eval QUOTE pool.  The
+          ;; compiler (compile-quote under *mvm-eval-runtime-p*) registered the
           ;; ORIGINAL quoted object in the global *e2-const-pool* and emitted
           ;; the pool INDEX as the imm64; loading the object back preserves
           ;; QUOTE identity exactly (CLHS: quote returns its object), matching
@@ -920,7 +920,7 @@
                  ;; native :add's int64 wrap of the tagged words WITHOUT the
                  ;; reg-get/%val->word round-trip, which overflowed for a
                  ;; fixnum VALUE near 2^62 and collapsed the sum by 2^62
-                 ;; (the eval2 `(+ -3 4611686018427387900)` -> -7 bug).  The
+                 ;; (the mvm-eval `(+ -3 4611686018427387900)` -> -7 bug).  The
                  ;; wrap is load-bearing for bignum-add limb carry detection.
                  (setf (svref regs vd)
                        (%mvm-wrap-tagword-add (svref regs va) (svref regs vb)))
@@ -1049,7 +1049,7 @@
                  ;; native :shl produces V<<2 which overflows the 64-bit
                  ;; register (V<<1 already sets the top word bit), so the
                  ;; SAR reads garbage — `(truncate/mod BIG BIG)` returned
-                 ;; a tiny wrong value under eval2 (native was correct).
+                 ;; a tiny wrong value under mvm-eval (native was correct).
                  ;; The slot already holds the fixnum VALUE, so use it
                  ;; directly and store the VALUE directly (no re-tag,
                  ;; which would re-overflow the quotient/remainder word).
@@ -1179,7 +1179,7 @@
                ;; fixnums compared to EACH OTHER happened to survive
                ;; (both wrap the same way, order preserved), but a big
                ;; fixnum vs a small constant did not — breaking the
-               ;; sign test in compile-mod's floor adjustment (the eval2
+               ;; sign test in compile-mod's floor adjustment (the mvm-eval
                ;; mod bug).  The slots hold real VALUES; comparing them
                ;; directly is exact for fixnums, bignums, and floats.
                (let ((a (svref regs va)) (b (svref regs vb)))
@@ -1430,13 +1430,13 @@
                ;; yielding a garbage `obj`.  That mis-classified a ~2^62
                ;; fixnum as an OBJECT → (bignump BIG-FIXNUM) spuriously T
                ;; → (truncate/mod BIG BIG) routed to the slow bignum path
-               ;; and returned garbage (the eval2 gcd/mod bug).  The slot
+               ;; and returned garbage (the mvm-eval gcd/mod bug).  The slot
                ;; already holds the VALUE, so use it directly.
                (let ((obj (svref regs vs)))
                  (reg-set regs vd
                        ;; A BIGNUM is `integerp' = T but is a tag-9 OBJECT, not a
                        ;; fixnum — reporting +tag-fixnum+ for it made (bignump
-                       ;; <bignum>) = NIL under eval2, so %integer-truncate's
+                       ;; <bignum>) = NIL under mvm-eval, so %integer-truncate's
                        ;; (not (bignump a)) treated a ~2^62 bignum as a fixnum and
                        ;; ran inline :div on its heap POINTER → garbage varying
                        ;; per run (gcd.4 / test 13621 0xDEAD0004 wild call).
@@ -1498,7 +1498,7 @@
                             ;; set-cenv + call-indirect path (the CAPTURING
                             ;; lambda case; checked BEFORE the functionp arm
                             ;; because native functionp is true for #x52 too).
-                            ;; A NATIVE #x52 closure (an eval2 TRAMPOLINE from
+                            ;; A NATIVE #x52 closure (an mvm-eval TRAMPOLINE from
                             ;; a persisted defun, or any build-time closure)
                             ;; carries a NATIVE CODE ADDRESS in slot 0 — the
                             ;; compiled closure path would obj-ref it and
@@ -1570,7 +1570,7 @@
           ;; the native %float-* primops (SSE2 in this compiled interp); store
           ;; the result float the same way op-alloc-obj does.  Without these,
           ;; (/ 1.0 4.0) — which compiles to %float-div (the FDIV opcode), not a
-          ;; GENERIC-DIV bridge call like + / * — errored in eval2 (WS4 oracle).
+          ;; GENERIC-DIV bridge call like + / * — errored in mvm-eval (WS4 oracle).
           (#.+op-fadd+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (va npc2) (fetch-reg bc npc)
@@ -1625,7 +1625,7 @@
                               ;; a boundary-fixnum arg/result).  %mvm-collect-call-
                               ;; args reads args 0..3 from V0..V3 and args 4+ from
                               ;; the mvm-stack (overflow), wrapping any escaping
-                              ;; eval2 lambda value (a #x52 closure-over-offset or
+                              ;; mvm-eval lambda value (a #x52 closure-over-offset or
                               ;; a bare in-module offset) in a re-entrant
                               ;; trampoline so a NATIVE higher-order callee
                               ;; (mapcar/reduce/…) can funcall it.  Pre-fix this
@@ -1638,7 +1638,7 @@
                          ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
                          ;; multi-valued fns (floor/truncate/round/rem returning a
                          ;; quotient AND remainder) write their secondaries to the
-                         ;; REAL MV slots, which eval2 never reads — eval2 reads the
+                         ;; REAL MV slots, which mvm-eval never reads — mvm-eval reads the
                          ;; SIMULATED MV slots (the mvm-memory hash, where compile-
                          ;; values / multiple-value-bind store via op-store and read
                          ;; via op-load).  So capture ALL return values here and
@@ -1666,7 +1666,7 @@
                        ;; Unresolved runtime name: signal UNDEFINED-FUNCTION
                        ;; (CL semantics — `(eval '(no-such-fn))` must signal).
                        ;; The old silent `(reg-set VR +mvm-nil+)` made every
-                       ;; undefined call quietly evaluate to NIL under eval2,
+                       ;; undefined call quietly evaluate to NIL under mvm-eval,
                        ;; so error-expecting ANSI tests failed and value tests
                        ;; got NILs (WS3 flip).  The signal lands in this
                        ;; DO-instruction's outer handler-case: routed to an
@@ -1695,7 +1695,7 @@
            ;;     OBJECT and store it directly in the slot (the alloc-obj store
            ;;     convention: reg-set∘%val->word = identity), so CALL-INDIRECT's
            ;;     functionp branch bridge-calls it.  This is the higher-order
-           ;;     eval2 path (funcall/apply/mapcar #'NAME).
+           ;;     mvm-eval path (funcall/apply/mapcar #'NAME).
            ;;   - an in-module bytecode OFFSET: a captureless lambda or a defun
            ;;     compiled in THIS thunk.  Store the offset as a plain fixnum
            ;;     value so CALL-INDIRECT's integer branch jumps to the bytecode.
@@ -1736,7 +1736,7 @@
                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+))
                         (mvm-call-stack state))
                   (setf pc target))
-                 ;; Higher-order eval2 bridge: a resolved native function object
+                 ;; Higher-order mvm-eval bridge: a resolved native function object
                  ;; (#'+ , #'1+ , #'< , a %*-FN wrapper, etc.).  funcall/apply/
                  ;; mapcar all route through here.  Pull nargs args (V0..) from
                  ;; the register file exactly as op-CALL's runtime bridge does and
@@ -1746,7 +1746,7 @@
                   (let* ((nargs (mvm-nargs state))
                          ;; Read args 0..3 from V0..V3 and args 4+ from the
                          ;; mvm-stack overflow (see op-CALL's bridge + %mvm-
-                         ;; collect-call-args).  Wraps any escaping eval2 lambda
+                         ;; collect-call-args).  Wraps any escaping mvm-eval lambda
                          ;; arg in a trampoline so a native HOF reached via
                          ;; funcall/apply (e.g. (apply #'mapcar (list lambda
                          ;; list))) can funcall it.  Pre-fix this read
@@ -1758,7 +1758,7 @@
                     ;; bridge — identical to op-CALL's runtime-native branch.
                     ;; A native (or cross-module registered) multi-valued fn
                     ;; reached via (funcall #'FN …) / (apply #'FN …) writes its
-                    ;; secondaries only into its OWN return list; eval2's
+                    ;; secondaries only into its OWN return list; mvm-eval's
                     ;; multiple-value-bind/-list read the SIMULATED MV slots
                     ;; (mem #x10000090 count + #x10000098+ extras via op-load).
                     ;; Without mirroring here, (funcall #'FN …) truncated to the
@@ -1829,7 +1829,7 @@
           ;; captured-var extraction then read the forwarding stamp / recycled
           ;; memory.  This was THE asdf-gauntlet heap-layout-dice class
           ;; (define-package TYPE-ERROR DATUM=NIL at forms 16/124/134/241,
-          ;; "MVM: unknown opcode", reader desync): every eval2 closure call
+          ;; "MVM: unknown opcode", reader desync): every mvm-eval closure call
           ;; that took a GC between caller set-cenv and callee get-cenv
           ;; resurrected a stale env.  Probe: 700K interpreted capturing-
           ;; closure calls under ~2.5KB/iter alloc pressure = bad=3 (word
@@ -1848,7 +1848,7 @@
              ;; ONE real memory location; the interp modeled them separately
              ;; (state field vs memory hash), so a function epilogue's
              ;; set-mv-count=1 reset never reached the slot that
-             ;; multiple-value-bind / the eval2 MV return path read — a stale
+             ;; multiple-value-bind / the mvm-eval MV return path read — a stale
              ;; count from an inner (values …) leaked past a single-value
              ;; return.  Word encoding matches op-store / the bridge mirror.
              (mem-write state #x10000090 (%val->word n) 3)
@@ -1958,7 +1958,7 @@
           ;; / `%signal-condition` fn) signals a real host CL condition here.
           ;; If a handler-case frame is active, capture the condition and
           ;; convert it to a LONGJMP (done below, after the unwind); otherwise
-          ;; re-signal so eval2-forms' outer handler reports :interp-err (an
+          ;; re-signal so mvm-eval-forms' outer handler reports :interp-err (an
           ;; uncaught error / unmatched throw, matching native semantics).
           (error (c)
             (if (mvm-handlers state)

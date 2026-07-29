@@ -378,7 +378,7 @@
 
 (defvar *runtime-born-pkgs* nil
   "Hash-table (pkg-name-hash -> t) of packages created at RUNTIME (via
-   eval2 make-package / %defpackage-impl, i.e. while *eval2-runtime-p*).
+   mvm-eval make-package / %defpackage-impl, i.e. while *mvm-eval-runtime-p*).
    Function-table keys fold in the package hash ONLY for these packages
    (see the %cl-sym-p branch of %sym-name-or-hash in cl-eval.lisp, which
    keys by the package-qualified name for runtime-born packages).
@@ -411,11 +411,11 @@
 
 (defun %mark-runtime-born-pkg (name-string)
   "Record NAME-STRING as a runtime-born package when compiling under
-   *eval2-runtime-p* (runtime eval2 load), so its symbols get
+   *mvm-eval-runtime-p* (runtime mvm-eval load), so its symbols get
    package-folded function-table keys.  A no-op at image-build time
-   (*eval2-runtime-p* is NIL there) — that is what keeps the ANSI gate
+   (*mvm-eval-runtime-p* is NIL there) — that is what keeps the ANSI gate
    byte-identical — and a no-op for system packages."
-  (when (and *eval2-runtime-p*
+  (when (and *mvm-eval-runtime-p*
              (not (%fn-key-system-pkg-name-p name-string)))
     (unless *runtime-born-pkgs*
       (setq *runtime-born-pkgs* (make-hash-table)))
@@ -830,7 +830,7 @@
                                                 ;; shadowing internal &REST, and
                                                 ;; the self-hosted compiler's
                                                 ;; (eq p '&rest) never matches a
-                                                ;; read symbol — every eval2
+                                                ;; read symbol — every mvm-eval
                                                 ;; &rest param compiled as a
                                                 ;; positional (asdf gauntlet
                                                 ;; define-package TYPE-ERROR
@@ -1393,7 +1393,7 @@
           (not (eq (gethash key tbl miss) miss))))))
 
 ;; Runtime registry of symbols named by DEFCONSTANT.  CLHS: (constantp 'name)
-;; is true when NAME names a constant variable.  Populated by the eval2
+;; is true when NAME names a constant variable.  Populated by the mvm-eval
 ;; DEFCONSTANT handler (compiler.lisp) via %mark-constant-var; keyed the same
 ;; name-or-hash way symbol-function uses so all symbol flavors resolve.  Lazy-
 ;; init (defvars don't run their initform at boot — see limitation #7).

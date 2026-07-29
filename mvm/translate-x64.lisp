@@ -70,7 +70,7 @@
 (defvar *jit-xlate-err-info* nil
   "DIAGNOSTIC: on a translate-time error, the translate loop stashes
    (:fn I :name NAME :mvm-pos POS :opcode OP :operands OPS) here before
-   re-signaling, so the eval2 seam can report exactly which instruction
+   re-signaling, so the mvm-eval seam can report exactly which instruction
    shape hit a translator gap.")
 
 (defvar *x64-call-relocs* nil
@@ -6627,7 +6627,7 @@
       ;; Those calls then had an UNRESOLVED target (label-position NIL), which
       ;; fixup-labels SILENTLY SKIPS, leaving a placeholder rel32 — so any
       ;; JIT'd alloc form whose gc-check fires (R12>=R14) CALLs into garbage
-      ;; → SIGSEGV (masked by the eval2 seam's handler-case as a fallback,
+      ;; → SIGSEGV (masked by the mvm-eval seam's handler-case as a fallback,
       ;; hence native%≈0 under heap pressure).  emit-gc-trampoline is fully
       ;; self-contained (it IGNORES gc-collect-label — see its lambda list;
       ;; it reads the global Cheney metadata at fixed heap-base offsets), so

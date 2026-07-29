@@ -1,7 +1,7 @@
 ;;;; build-generic-cli.lisp — the canonical HOSTED Modus image (`./modus').
 ;;;;
 ;;;; A native ELF you run as an ordinary Linux process; it drops into Modus's
-;;;; own self-hosted CL REPL on stdin (eval = eval2 = compile -> MVM bytecode ->
+;;;; own self-hosted CL REPL on stdin (eval = mvm-eval = compile -> MVM bytecode ->
 ;;;; interpret) and parses SBCL-style toplevel flags.  It is `build-generic'
 ;;;; (full CL runtime, no baked ANSI tests) plus ONE baked file — the shared,
 ;;;; SBCL-faithful CLI toplevel:
@@ -133,15 +133,15 @@
 (defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
 (defun %lit-bb-limb (value k) (%bb-limb value k))
 ")
-;; STAGE 2 probe: eval2 = compile form to MVM bytecode + interpret it.
+;; STAGE 2 probe: mvm-eval = compile form to MVM bytecode + interpret it.
 ;; Closed-world (calls only resolve within the compiled module) — fine for
 ;; pure-arithmetic forms whose ops inline to MVM opcodes.
-;; UNIFIED (post-flip): eval2-forms/eval2 now come from the CANONICAL
-;; mvm/eval2.lisp — the same source the ANSI image compiles — instead of the
+;; UNIFIED (post-flip): mvm-eval-forms/mvm-eval now come from the CANONICAL
+;; mvm/mvm-eval.lisp — the same source the ANSI image compiles — instead of the
 ;; stale inline copy this string used to carry.  Unification was blocked by
-;; eval2.lisp's `\"` extraction damage until the flip wave-3 fidelity fix
+;; mvm-eval.lisp's `\"` extraction damage until the flip wave-3 fidelity fix
 ;; (77cea7c) repaired it; the file is now clean, directly mvm-text-readable.
-(defvar *eval2-canonical-source* (mvm-text "mvm/eval2.lisp"))
+(defvar *mvm-eval-canonical-source* (mvm-text "mvm/mvm-eval.lisp"))
 
 ;;; ============================================================
 ;;; WS5 STAGE 1: bake the x64 build TOOLING into the image as DEAD CODE.
@@ -375,7 +375,7 @@
                             "(defun emit-bytes " "(defun %linux-boot-emit-bytes ")
                   "(emit-bytes " "(%linux-boot-emit-bytes ")))
 
-;; The whole self-host tooling block, spliced into *full-source* after eval2.
+;; The whole self-host tooling block, spliced into *full-source* after mvm-eval.
 ;; Order (from the task): x64-asm → translate-x64 → translator-coinit → target
 ;; → cross → boot-desc.  The target/translator target-slot coinit
 ;; (%init-selfhost-targets) is a generated defun appended last.
@@ -430,7 +430,7 @@
 (defun %nat-mul-small () (* 12345 678))               ; fixnum 8369910
 ;; Runtime EVAL of a defun-with-param then call it; guards the intern
 ;; composite-key %fixnum-* fix.  Expect 6.
-(defun %s2-defun-add () (eval2-forms (list (list (quote defun) (quote g) (list (quote y)) (list (quote +) (quote y) 1)) (list (quote g) 5))))
+(defun %s2-defun-add () (mvm-eval-forms (list (list (quote defun) (quote g) (list (quote y)) (list (quote +) (quote y) 1)) (list (quote g) 5))))
 ;; Direct emit+fetch round-trip probe for a u64 immediate (isolates the
 ;; bytecode encoder/decoder from compile-integer).
 (defun %ws1-u64rt (imm)
@@ -442,7 +442,7 @@
             (quote =>) (fetch-u64 bc 0)))))
 (defun %ws1-rt-neg10 () (%ws1-u64rt -10))
 (defun %ws1-rt-pos10 () (%ws1-u64rt 10))
-(defun %ws1-ev (v) (eval2-forms (list v)))
+(defun %ws1-ev (v) (mvm-eval-forms (list v)))
 (defun %ws1-halves-of (v)
   (list (quote v=) v
         (quote lo) (* (logand v 2147483647) 2)
@@ -450,29 +450,29 @@
 (defun %ws1-v2w (v) (%val->word v))
 (defun %ws1-w2v (w) (%word->val w))
 (defun %ws1-roundtrip (v) (%word->val (%val->word v)))
-(defun %s2-if-false () (eval2 (list (quote if) (list (quote >) 1 2) 100 200)))
-(defun %s2-eq-false () (eval2 (list (quote if) (list (quote =) 1 2) 100 200)))
-(defun %s2-nested () (eval2 (list (quote +) (list (quote *) 2 3) (list (quote -) 10 4))))
-(defun %s2-add () (eval2 (list (quote +) 1 2)))
-(defun %s2-mul () (eval2 (list (quote *) 3 4)))
-(defun %s2-sub () (eval2 (list (quote -) 10 3)))
-(defun %s2-if  () (eval2 (list (quote if) (list (quote <) 1 2) 100 200)))
-;; STAGE 3 (drop-native model): eval2 calling other BYTECODE functions.
+(defun %s2-if-false () (mvm-eval (list (quote if) (list (quote >) 1 2) 100 200)))
+(defun %s2-eq-false () (mvm-eval (list (quote if) (list (quote =) 1 2) 100 200)))
+(defun %s2-nested () (mvm-eval (list (quote +) (list (quote *) 2 3) (list (quote -) 10 4))))
+(defun %s2-add () (mvm-eval (list (quote +) 1 2)))
+(defun %s2-mul () (mvm-eval (list (quote *) 3 4)))
+(defun %s2-sub () (mvm-eval (list (quote -) 10 3)))
+(defun %s2-if  () (mvm-eval (list (quote if) (list (quote <) 1 2) 100 200)))
+;; STAGE 3 (drop-native model): mvm-eval calling other BYTECODE functions.
 ;; A helper defun + an expression that calls it — bytecode->bytecode CALL,
 ;; no marshalling, one value representation.
 (defun %s2-call-helper ()
   ;; (defun sq (x) (* x x)) (sq 7) -> 49
-  (eval2-forms (list (list (quote defun) (quote sq) (list (quote x))
+  (mvm-eval-forms (list (list (quote defun) (quote sq) (list (quote x))
                            (list (quote *) (quote x) (quote x)))
                      (list (quote sq) 7))))
 (defun %s2-call-two ()
   ;; (defun add3 (a b c) (+ a (+ b c))) (add3 10 20 30) -> 60
-  (eval2-forms (list (list (quote defun) (quote add3) (list (quote a) (quote b) (quote c))
+  (mvm-eval-forms (list (list (quote defun) (quote add3) (list (quote a) (quote b) (quote c))
                            (list (quote +) (quote a) (list (quote +) (quote b) (quote c))))
                      (list (quote add3) 10 20 30))))
 (defun %s2-recursion ()
   ;; (defun fact (n) (if (< n 2) 1 (* n (fact (- n 1))))) (fact 5) -> 120
-  (eval2-forms (list (list (quote defun) (quote fact) (list (quote n))
+  (mvm-eval-forms (list (list (quote defun) (quote fact) (list (quote n))
                            (list (quote if) (list (quote <) (quote n) 2)
                                  1
                                  (list (quote *) (quote n)
@@ -497,103 +497,103 @@
     (rplaca c2 99)
     (car c)))                                        ; want 99
 ;; A real NATIVE runtime function (compiled into the image, in the sft), NOT in
-;; any eval2 module — the target for the WS1 runtime-call bridge.
+;; any mvm-eval module — the target for the WS1 runtime-call bridge.
 (defun %rt-double (x) (* x 2))
 (defun %rt-add3 (a b c) (+ a (+ b c)))
 (defun %rt-carplus (c) (+ (car c) (cdr c)))   ; takes a CONS arg
 (defun %rt-mkpair (a b) (cons a b))           ; returns a CONS
-;; WS1 milestone: eval2 calling a real native runtime function (no marshalling).
+;; WS1 milestone: mvm-eval calling a real native runtime function (no marshalling).
 (defun %ws1-call-native ()
-  (eval2-forms (list (list (quote %rt-double) 21))))      ; want 42
+  (mvm-eval-forms (list (list (quote %rt-double) 21))))      ; want 42
 (defun %ws1-call-native3 ()
-  (eval2-forms (list (list (quote %rt-add3) 10 20 30))))  ; want 60
+  (mvm-eval-forms (list (list (quote %rt-add3) 10 20 30))))  ; want 60
 (defun %ws1-call-native-nested ()
   ;; native call whose arg is itself a native call -> proves value flow across
   ;; the bridge composes.
-  (eval2-forms (list (list (quote %rt-double)
+  (mvm-eval-forms (list (list (quote %rt-double)
                            (list (quote %rt-double) 5)))))  ; want 20
 ;; WS1 structure: aligned op-cons/op-car on the real heap.
 (defun %ws1-cons-car ()
   ;; pure in-interpreter: op-cons then op-car (no native call) -> 11
-  (eval2-forms (list (list (quote car) (list (quote cons) 11 22)))))
+  (mvm-eval-forms (list (list (quote car) (list (quote cons) 11 22)))))
 (defun %ws1-cons-arg ()
-  ;; eval2 builds a CONS and passes it to a NATIVE fn that cars/cdrs it ->
+  ;; mvm-eval builds a CONS and passes it to a NATIVE fn that cars/cdrs it ->
   ;; proves the interpreter's cons is a real native cons (no marshalling) -> 30
-  (eval2-forms (list (list (quote %rt-carplus) (list (quote cons) 10 20)))))
+  (mvm-eval-forms (list (list (quote %rt-carplus) (list (quote cons) 10 20)))))
 (defun %ws1-cons-return ()
-  ;; native fn RETURNS a cons; eval2 should hand back a real (7 . 8)
-  (eval2-forms (list (list (quote %rt-mkpair) 7 8))))
+  ;; native fn RETURNS a cons; mvm-eval should hand back a real (7 . 8)
+  (mvm-eval-forms (list (list (quote %rt-mkpair) 7 8))))
 ;; Frontier batch: map what the aligned model handles vs what needs work.
 ;; Returns a list of results; labels/expected printed from the test script
 ;; (no string literals here — they would terminate the source-string).
 (defun %ws1-try (form)
-  (handler-case (eval2-forms (list form))
+  (handler-case (mvm-eval-forms (list form))
     (error (e) (list :err e))))
 ;; WS1 strings/vectors (interpreter-internal, make-mvm-object basis).
 (defun %ws1-vec-const ()  ; constant index -> obj-ref
-  (eval2-forms (list (list (quote aref) (vector 10 20 30) 1))))         ; 20
+  (mvm-eval-forms (list (list (quote aref) (vector 10 20 30) 1))))         ; 20
 (defun %ws1-vec-var ()    ; variable index -> aref opcode
-  (eval2-forms (list (list (quote let) (list (list (quote i) 2))
+  (mvm-eval-forms (list (list (quote let) (list (list (quote i) 2))
                            (list (quote aref) (vector 10 20 30) (quote i)))))) ; 30
 (defun %ws1-str-aref ()   ; string elt via obj-ref + code-char wrap
-  (eval2-forms (list (list (quote aref) \"abc\" 1))))                   ; #\b
+  (mvm-eval-forms (list (list (quote aref) \"abc\" 1))))                   ; #\b
 (defun %ws1-vec-fn-var () ; variable index via function param (isolate let vs aref)
-  (eval2-forms (list (list (quote defun) (quote g) (list (quote n))
+  (mvm-eval-forms (list (list (quote defun) (quote g) (list (quote n))
                            (list (quote aref) (vector 10 20 30) (quote n)))
                      (list (quote g) 2))))                              ; 30
 (defun %ws1-aref-raw ()   ; direct aref-opcode test: build vec, var idx from arith
-  (eval2-forms (list (list (quote aref) (vector 10 20 30) (list (quote + ) 1 1))))) ; 30
+  (mvm-eval-forms (list (list (quote aref) (vector 10 20 30) (list (quote + ) 1 1))))) ; 30
 ;; WS1 #2: native strings cross the bridge to NATIVE string functions.
-(defun %ws1-str-length () (eval2-forms (list (list (quote length) \"hello\"))))  ; 5
-(defun %ws1-str-char ()   (eval2-forms (list (list (quote char) \"hello\" 1))))   ; #\e
-(defun %ws1-str-upcase () (eval2-forms (list (list (quote string-upcase) \"abc\")))) ; -> ABC
+(defun %ws1-str-length () (mvm-eval-forms (list (list (quote length) \"hello\"))))  ; 5
+(defun %ws1-str-char ()   (mvm-eval-forms (list (list (quote char) \"hello\" 1))))   ; #\e
+(defun %ws1-str-upcase () (mvm-eval-forms (list (list (quote string-upcase) \"abc\")))) ; -> ABC
 ;; NATIVE objects cross the bridge: vector length + FLOAT arithmetic.
-(defun %ws1-vec-len ()   (eval2-forms (list (list (quote length) (vector 10 20 30))))) ; 3
-(defun %ws1-float-add () (eval2-forms (list (list (quote +) 1.5 2.5))))   ; 4.0
-(defun %ws1-float-mul () (eval2-forms (list (list (quote *) 2.0 3.0))))   ; 6.0
-(defun %ws1-float-lit () (eval2-forms (list 1.5)))                        ; 1.5 (literal round-trip)
-(defun %ws1-float-1arg () (eval2-forms (list (list (quote %rt-double) 1.5))))      ; 3.0 (1 float arg via bridge)
-(defun %ws1-float-3arg () (eval2-forms (list (list (quote %rt-add3) 1.0 2.0 3.0)))) ; 6.0 (3 float args)
-(defun %ws1-float-2lit () (eval2-forms (list (list (quote list) 1.5 2.5))))         ; (1.5 2.5) build 2 floats
-(defun %ws1-2cons () (eval2-forms (list (list (quote cons) 1.0 2.0))))              ; (1.0 . 2.0) 2 floats via cons
-(defun %ws1-2cons-fix () (eval2-forms (list (list (quote cons) 100 200))))          ; (100 . 200) 2 fixnums via cons (control)
+(defun %ws1-vec-len ()   (mvm-eval-forms (list (list (quote length) (vector 10 20 30))))) ; 3
+(defun %ws1-float-add () (mvm-eval-forms (list (list (quote +) 1.5 2.5))))   ; 4.0
+(defun %ws1-float-mul () (mvm-eval-forms (list (list (quote *) 2.0 3.0))))   ; 6.0
+(defun %ws1-float-lit () (mvm-eval-forms (list 1.5)))                        ; 1.5 (literal round-trip)
+(defun %ws1-float-1arg () (mvm-eval-forms (list (list (quote %rt-double) 1.5))))      ; 3.0 (1 float arg via bridge)
+(defun %ws1-float-3arg () (mvm-eval-forms (list (list (quote %rt-add3) 1.0 2.0 3.0)))) ; 6.0 (3 float args)
+(defun %ws1-float-2lit () (mvm-eval-forms (list (list (quote list) 1.5 2.5))))         ; (1.5 2.5) build 2 floats
+(defun %ws1-2cons () (mvm-eval-forms (list (list (quote cons) 1.0 2.0))))              ; (1.0 . 2.0) 2 floats via cons
+(defun %ws1-2cons-fix () (mvm-eval-forms (list (list (quote cons) 100 200))))          ; (100 . 200) 2 fixnums via cons (control)
 ;; Isolate build-vs-print: these don't PRINT the floats.
-(defun %ws1-consp2f () (eval2-forms (list (list (quote consp) (list (quote cons) 1.0 2.0))))) ; T if build ok
-(defun %ws1-floatp1 () (eval2-forms (list (list (quote floatp) (list (quote car) (list (quote cons) 1.0 2.0)))))) ; T
-(defun %ws1-floatp2 () (eval2-forms (list (list (quote floatp) (list (quote cdr) (list (quote cons) 1.0 2.0)))))) ; T if 2nd float valid
-(defun %ws1-eqfloat () (eval2-forms (list (list (quote eql) (list (quote car) (list (quote cons) 5.0 6.0)) 5.0)))) ; T if 1st = 5.0
-(defun %ws1-eql-same () (eval2-forms (list (list (quote eql) 5.0 5.0))))   ; T? (eql semantics on 2 float literals)
-(defun %ws1-car-gt () (eval2-forms (list (list (quote >) (list (quote car) (list (quote cons) 9.0 2.5)) 1.0)))) ; T (car 9.0 > 1.0)
-(defun %ws1-cdr-gt () (eval2-forms (list (list (quote >) (list (quote cdr) (list (quote cons) 9.0 2.5)) 1.0)))) ; T (cdr 2.5 > 1.0); NIL if cdr=0.0
-(defun %ws1-gt-ff () (eval2-forms (list (list (quote >) 9.0 1))))   ; T : ONE float (9.0) vs fixnum 1
-(defun %ws1-lt-ff () (eval2-forms (list (list (quote <) 1 9.0))))   ; T : fixnum 1 vs ONE float
-(defun %ws1-fp9 () (eval2-forms (list (list (quote floatp) 9.0))))  ; T : single float valid
-(defun %ws1-int9 () (eval2-forms (list (list (quote truncate) 9.0)))) ; 9 : single-float value check via truncate
-(defun %ws1-lit9 () (eval2-forms (list 9.0)))    ; 9.0 ? (hi bit31 set -> suspect 0.0)
-(defun %ws1-lit2 () (eval2-forms (list 2.0)))    ; 2.0 ? (hi=0x40000000, hi<<1 bit31 set)
-(defun %ws1-lit05 () (eval2-forms (list 0.5)))   ; 0.5 (hi<<1 bit31 NOT set -> expect ok)
-(defun %ws1-lit-neg () (eval2-forms (list -1.5))) ; -1.5
-(defun %ws1-2to31 () (eval2-forms (list 2147483648)))   ; 2^31 = 0x80000000 (bit31 set) -> round-trip?
-(defun %ws1-2to31m () (eval2-forms (list 2147483647)))  ; 2^31-1 (bit31 NOT set) control
-(defun %ws1-bigfix () (eval2-forms (list 2151677952)))  ; 0x80440000 (the 9.0 hi<<1)
-(defun %ws1-hival () (eval2-forms (list 1075843072)))   ; 0x40220000 = 9.0 hi VALUE; LI imm = 0x80440000 (bit31)
-(defun %ws1-hi2 () (eval2-forms (list 1073741824)))     ; 0x40000000 = 2.0 hi VALUE; LI imm = 0x80000000 (bit31)
+(defun %ws1-consp2f () (mvm-eval-forms (list (list (quote consp) (list (quote cons) 1.0 2.0))))) ; T if build ok
+(defun %ws1-floatp1 () (mvm-eval-forms (list (list (quote floatp) (list (quote car) (list (quote cons) 1.0 2.0)))))) ; T
+(defun %ws1-floatp2 () (mvm-eval-forms (list (list (quote floatp) (list (quote cdr) (list (quote cons) 1.0 2.0)))))) ; T if 2nd float valid
+(defun %ws1-eqfloat () (mvm-eval-forms (list (list (quote eql) (list (quote car) (list (quote cons) 5.0 6.0)) 5.0)))) ; T if 1st = 5.0
+(defun %ws1-eql-same () (mvm-eval-forms (list (list (quote eql) 5.0 5.0))))   ; T? (eql semantics on 2 float literals)
+(defun %ws1-car-gt () (mvm-eval-forms (list (list (quote >) (list (quote car) (list (quote cons) 9.0 2.5)) 1.0)))) ; T (car 9.0 > 1.0)
+(defun %ws1-cdr-gt () (mvm-eval-forms (list (list (quote >) (list (quote cdr) (list (quote cons) 9.0 2.5)) 1.0)))) ; T (cdr 2.5 > 1.0); NIL if cdr=0.0
+(defun %ws1-gt-ff () (mvm-eval-forms (list (list (quote >) 9.0 1))))   ; T : ONE float (9.0) vs fixnum 1
+(defun %ws1-lt-ff () (mvm-eval-forms (list (list (quote <) 1 9.0))))   ; T : fixnum 1 vs ONE float
+(defun %ws1-fp9 () (mvm-eval-forms (list (list (quote floatp) 9.0))))  ; T : single float valid
+(defun %ws1-int9 () (mvm-eval-forms (list (list (quote truncate) 9.0)))) ; 9 : single-float value check via truncate
+(defun %ws1-lit9 () (mvm-eval-forms (list 9.0)))    ; 9.0 ? (hi bit31 set -> suspect 0.0)
+(defun %ws1-lit2 () (mvm-eval-forms (list 2.0)))    ; 2.0 ? (hi=0x40000000, hi<<1 bit31 set)
+(defun %ws1-lit05 () (mvm-eval-forms (list 0.5)))   ; 0.5 (hi<<1 bit31 NOT set -> expect ok)
+(defun %ws1-lit-neg () (mvm-eval-forms (list -1.5))) ; -1.5
+(defun %ws1-2to31 () (mvm-eval-forms (list 2147483648)))   ; 2^31 = 0x80000000 (bit31 set) -> round-trip?
+(defun %ws1-2to31m () (mvm-eval-forms (list 2147483647)))  ; 2^31-1 (bit31 NOT set) control
+(defun %ws1-bigfix () (mvm-eval-forms (list 2151677952)))  ; 0x80440000 (the 9.0 hi<<1)
+(defun %ws1-hival () (mvm-eval-forms (list 1075843072)))   ; 0x40220000 = 9.0 hi VALUE; LI imm = 0x80440000 (bit31)
+(defun %ws1-hi2 () (mvm-eval-forms (list 1073741824)))     ; 0x40000000 = 2.0 hi VALUE; LI imm = 0x80000000 (bit31)
 ;; Ratios (subtag #x33) and bignums (subtag #x30): same native-alloc + obj-set
 ;; path as floats — validate they round-trip and arithmetic builds them.
-(defun %ws1-rat-lit () (eval2-forms (list 1/2)))                         ; 1/2 literal round-trip
-(defun %ws1-rat-lit2 () (eval2-forms (list 3/4)))                        ; 3/4 literal
-(defun %ws1-rat-div () (eval2-forms (list (list (quote /) 4 3))))        ; 4/3 via division
-(defun %ws1-rat-num () (eval2-forms (list (list (quote numerator) 3/4)))) ; 3
-(defun %ws1-rat-den () (eval2-forms (list (list (quote denominator) 3/4)))) ; 4
-(defun %ws1-big-lit () (eval2-forms (list 4611686018427387904)))        ; 2^62 bignum literal
-(defun %ws1-big-mul () (eval2-forms (list (list (quote *) 1000000000000 1000000000000)))) ; 10^24 bignum
-(defun %ws1-big-add () (eval2-forms (list (list (quote +) 4611686018427387904 1)))) ; 2^62+1
-(defun %ws1-big130 () (eval2-forms (list 1361129467683753853853498429727072845824))) ; 2^130 big-bignum literal
-(defun %ws1-big-neg () (eval2-forms (list -4611686018427387904)))                     ; -2^62 negative small bignum
-(defun %ws1-big-neg130 () (eval2-forms (list -1361129467683753853853498429727072845824))) ; -2^130 negative big-bignum
-(defun %ws1-neg5 () (eval2-forms (list -5)))                      ; negative FIXNUM literal round-trip
-(defun %ws1-neg-sub () (eval2-forms (list (list (quote -) 3 8)))) ; -5 via subtraction
-(defun %ws1-neg-big () (eval2-forms (list -1000000)))             ; -10^6 negative fixnum
+(defun %ws1-rat-lit () (mvm-eval-forms (list 1/2)))                         ; 1/2 literal round-trip
+(defun %ws1-rat-lit2 () (mvm-eval-forms (list 3/4)))                        ; 3/4 literal
+(defun %ws1-rat-div () (mvm-eval-forms (list (list (quote /) 4 3))))        ; 4/3 via division
+(defun %ws1-rat-num () (mvm-eval-forms (list (list (quote numerator) 3/4)))) ; 3
+(defun %ws1-rat-den () (mvm-eval-forms (list (list (quote denominator) 3/4)))) ; 4
+(defun %ws1-big-lit () (mvm-eval-forms (list 4611686018427387904)))        ; 2^62 bignum literal
+(defun %ws1-big-mul () (mvm-eval-forms (list (list (quote *) 1000000000000 1000000000000)))) ; 10^24 bignum
+(defun %ws1-big-add () (mvm-eval-forms (list (list (quote +) 4611686018427387904 1)))) ; 2^62+1
+(defun %ws1-big130 () (mvm-eval-forms (list 1361129467683753853853498429727072845824))) ; 2^130 big-bignum literal
+(defun %ws1-big-neg () (mvm-eval-forms (list -4611686018427387904)))                     ; -2^62 negative small bignum
+(defun %ws1-big-neg130 () (mvm-eval-forms (list -1361129467683753853853498429727072845824))) ; -2^130 negative big-bignum
+(defun %ws1-neg5 () (mvm-eval-forms (list -5)))                      ; negative FIXNUM literal round-trip
+(defun %ws1-neg-sub () (mvm-eval-forms (list (list (quote -) 3 8)))) ; -5 via subtraction
+(defun %ws1-neg-big () (mvm-eval-forms (list -1000000)))             ; -10^6 negative fixnum
 ;; GC-stress: build an N-element list via interpreter recursion (op-cons each
 ;; step), holding the growing list `a` in a register across every allocation.
 ;; With early GC forced (MODUS_GC_R14 small), collections fire MID-eval; if the
@@ -601,7 +601,7 @@
 ;; held list survives and length is exact.  A stale-pointer bug would corrupt or
 ;; crash.
 (defun %ws1-gc-stress (n)
-  (eval2-forms (list (list (quote defun) (quote bld) (list (quote k) (quote a))
+  (mvm-eval-forms (list (list (quote defun) (quote bld) (list (quote k) (quote a))
                            (list (quote if) (list (quote =) (quote k) 0)
                                  (quote a)
                                  (list (quote bld) (list (quote -) (quote k) 1)
@@ -705,7 +705,7 @@
     ;; They are the untar->parse-.asd->topo-sort->eval pipeline; nothing about
     ;; them is quicklisp-specific.  They are baked (not runtime-(load)ed by
     ;; setup) because a key line — %tar-slice's `(make-array LEN)` with a
-    ;; VARIABLE size — hits a pre-existing eval2 bug: `(make-array n)` for a
+    ;; VARIABLE size — hits a pre-existing mvm-eval bug: `(make-array n)` for a
     ;; variable n returns an array of length n/2, so a >512-byte tar entry gets
     ;; truncated in half and its source fails to READ.  make-array with a
     ;; variable arg compiles correctly through the build's native compiler, so
@@ -734,7 +734,7 @@
     ;; (cli-toplevel) from kernel-main.
     (mvm-text "lib/cli-toplevel.lisp")))
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
-;; image — production eval is eval2 only.  The full-corpus + gauntlet census
+;; image — production eval is mvm-eval only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback
 ;; inventory" was the :li-func offset-0 phantom, fixed in a07fe7d), and the
 ;; walker-free image gates clean (16335-16336 / CHUNK-CRASH=0 / FILE-WEDGE=30,
@@ -841,8 +841,8 @@
           (list 'cons (%rbq first level)
                 (%rbq-list rest level))))))))
 ;; COMPILE-TIME closure, NOT (eval '(lambda …)): this install runs at boot in
-;; kernel-main, and under WS3 Phase-3 production EVAL is eval2 — a boot-time
-;; eval2 of the lambda runs before init-all-globals (eval2's state defvars all
+;; kernel-main, and under WS3 Phase-3 production EVAL is mvm-eval — a boot-time
+;; mvm-eval of the lambda runs before init-all-globals (mvm-eval's state defvars all
 ;; NIL) and silently produced a broken expander (callee resolution fell into
 ;; the :li-func offset-0 fallback), so every runtime defmacro with a backquote
 ;; body \"expanded\" to its raw (BACKQUOTE …) template — uiop define-package
@@ -919,7 +919,7 @@
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
        (progn
         ;; WS5 SYNTHESIS (minimal change from the clean-booting modus2-lb):
-        ;; leave *eval2-runtime-p* / *mvm-emit-halves* at their eval2-leaked
+        ;; leave *mvm-eval-runtime-p* / *mvm-emit-halves* at their mvm-eval-leaked
         ;; T values (that gives the CHECKED + lazy-bind-nil global read, which
         ;; boots cleanly and DOESN'T crash on argv — the plain static
         ;; SYMBOL-VALUE read returned garbage for globals unbound at early boot
@@ -928,32 +928,32 @@
         ;; alloc-obj paths) instead of the runtime *e2-const-pool* (which is
         ;; EMPTY in the child → garbage strings → flag string= never matched).
         ;; Net: static strings (work) + checked reads (no crash).
-        ;; C=nil (mvm-emit-halves): the eval2-leaked T makes quoted-symbol
+        ;; C=nil (mvm-emit-halves): the mvm-eval-leaked T makes quoted-symbol
         ;; literals emit :li-halves + :set-nargs (interpret-path shapes) which
         ;; the NATIVE translator mis-handles → broken symbol interning → the
         ;; reader crashes even on bare stdin.  Force nil so symbols emit the
         ;; plain native raw-:li path (proven OK: modus2-sb & modus2-host).
         ;; WS5: force the EXACT config modus2-host uses (SBCL build-image with
-        ;; eval2 unused): eval2-runtime-p=nil → compile-quote STATIC + compile-
+        ;; mvm-eval unused): mvm-eval-runtime-p=nil → compile-quote STATIC + compile-
         ;; variable-ref plain SYMBOL-VALUE + mvm-emit-halves nil native emit.
         ;; modus2-host (this config, SBCL-compiled) RUNS; modus2-sb (SAME config,
         ;; in-image-compiled) crashes on argv → the bug is an IN-IMAGE COMPILER
         ;; divergence (a mislinked fn), NOT the static/checked read choice.  This
         ;; build + the FNMAP dump localizes that mislinked fn.
-        ;; WS5: reproduce modus2-sb EXACTLY (eval2-runtime-p leaked T + static
+        ;; WS5: reproduce modus2-sb EXACTLY (mvm-eval-runtime-p leaked T + static
         ;; strings + static reads + halves nil) but WITH the FNMAP dump, so the
         ;; identical-across-inputs early wild-jump crash (0x1816bad, RBP=0) can
         ;; be mapped to a function name in sb's OWN layout.
         (setq *static-build-p* t)
         (setq *mvm-emit-halves* nil)
-        ;; WS5 DECISIVE: force eval2-runtime-p NIL for the OUTPUT codegen — the
+        ;; WS5 DECISIVE: force mvm-eval-runtime-p NIL for the OUTPUT codegen — the
         ;; EXACT config modus2-hoststatic uses (which BOOTS + --version works
         ;; under SBCL).  With path-1 strings (no char-by-char GC-corruption bloat)
-        ;; this is the first clean test of eval2-runtime-p=NIL in-image.  If the
-        ;; resulting modus2 boots+evals → the p1 hang was the eval2-runtime-p T
+        ;; this is the first clean test of mvm-eval-runtime-p=NIL in-image.  If the
+        ;; resulting modus2 boots+evals → the p1 hang was the mvm-eval-runtime-p T
         ;; codegen LEAK, not GC corruption.  (Compiler-operation branches that
         ;; needed T were char-by-char/GC artifacts now removed by path-1.)
-        (setq *eval2-runtime-p* nil)
+        (setq *mvm-eval-runtime-p* nil)
         (let ((image (build-image :target :linux-x64 :source-text src)))
           ;; WS5 diag: dump the child's fn map (name → vaddr) so a crash RIP
           ;; can be resolved.  vaddr = 0x400000 + native-image-offset + off.
@@ -1143,7 +1143,7 @@
                        *compiler-source* (string #\Newline)
                        *stage2-float-override* (string #\Newline)
                        *opcode-table-init-source* (string #\Newline)
-                       *eval2-canonical-source* (string #\Newline)
+                       *mvm-eval-canonical-source* (string #\Newline)
                        ;; WS5 STAGE 1: bake the x64 build tooling as DEAD CODE
                        ;; (translator + target + cross pipeline + linux-x64
                        ;; boot descriptor) so the sft-auto scanner registers
@@ -1370,18 +1370,18 @@
     (string #\Newline)
     *stage1-test-source*
     (string #\Newline)
-    ;; STAGE 2: the MVM compiler + in-image float-bits override + eval2 probe.
+    ;; STAGE 2: the MVM compiler + in-image float-bits override + mvm-eval probe.
     *compiler-source*
     (string #\Newline)
     *stage2-float-override*
     (string #\Newline)
     *opcode-table-init-source*
     (string #\Newline)
-    *eval2-canonical-source*
+    *mvm-eval-canonical-source*
     (string #\Newline)
     ;; WS5 STAGE 1: x64 build tooling baked as DEAD CODE (translator +
     ;; target descriptors + cross-compilation pipeline + linux-x64 boot
-    ;; descriptor/ELF wrapper).  Loaded AFTER the compiler + eval2 (the
+    ;; descriptor/ELF wrapper).  Loaded AFTER the compiler + mvm-eval (the
     ;; translator uses modus.mvm compiler symbols) and BEFORE the sft-auto
     ;; block so scan-defuns registers build-image / assemble-kernel-image /
     ;; wrap-in-elf64-le / etc.  Nothing routes to build-image — the CLI REPL
@@ -1622,7 +1622,7 @@
             (and v (string= v "1")))
       ;; ONLY *static-build-p* — this alone triggers the string→constant-table
       ;; path (all strings, since *ws5-str-bake-min*=0).  Do NOT force
-      ;; *eval2-runtime-p* T (its in-image-runtime branches break the SBCL host
+      ;; *mvm-eval-runtime-p* T (its in-image-runtime branches break the SBCL host
       ;; build).  Leaving it NIL keeps symbols/lists/reads on the normal host
       ;; static paths — so this isolates EXACTLY the short-string constant-table
       ;; change under SBCL's GC.

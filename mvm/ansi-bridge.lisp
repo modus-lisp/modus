@@ -2894,12 +2894,12 @@
 (defun %slot-name-member (nm slot-names)
   "Name-robust membership of slot-name NM in the list SLOT-NAMES.  Uses
    %clos-sym-name-eq (slot-0 hash) rather than EQL: SLOT-NAMES arriving
-   from an eval2-evaluated test body (e.g. (shared-initialize obj '(a c)))
-   are interned by eval2's in-image %INTERN-SYMBOL into objects that are
+   from an mvm-eval-evaluated test body (e.g. (shared-initialize obj '(a c)))
+   are interned by mvm-eval's in-image %INTERN-SYMBOL into objects that are
    NOT eql to the class's natively-registered slot-name symbols, so the
    old plain (member nm slot-names) silently missed every slot under
-   eval2 — shared-initialize then applied no initforms (slots stayed
-   -999, the shared-initialize eval2 divergence cluster)."
+   mvm-eval — shared-initialize then applied no initforms (slots stayed
+   -999, the shared-initialize mvm-eval divergence cluster)."
   (let ((cur slot-names))
     (loop
       (when (null cur) (return nil))
@@ -5532,7 +5532,7 @@
 
 ;; %EXPAND-DEFTYPE has NO definition in this file (WS3 STEP 4): the
 ;; evaluator engine provides it — tree-walker.lisp in the fork builds,
-;; eval2.lisp in the production images.  Consumers here (typep/subtypep)
+;; mvm-eval.lisp in the production images.  Consumers here (typep/subtypep)
 ;; resolve to the build's engine via whole-program last-defun-wins.  Do
 ;; NOT add a stub defun: a third same-name copy re-triggers the
 ;; duplicate-defun by-name ambiguity (CHUNK-CRASH regression class).

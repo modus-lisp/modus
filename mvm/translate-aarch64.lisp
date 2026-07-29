@@ -303,8 +303,8 @@
   ;; 16M entries × 4 bytes = 64 MB native code initial capacity.
   ;; Bare-metal ANSI-test needs ~30 MB; Linux/AArch64 adds ~50%
   ;; overhead per :push (2 insns vs 1 for SP alignment) plus larger
-  ;; syscall traps.  The WS3 production-eval2 ANSI image (in-image
-  ;; mvm.lisp ISA + interp + compiler + eval2) blows past 64 MB —
+  ;; syscall traps.  The WS3 production-mvm-eval ANSI image (in-image
+  ;; mvm.lisp ISA + interp + compiler + mvm-eval) blows past 64 MB —
   ;; a64-emit doubles the array on demand (same fix class as the
   ;; 96 MB x64 code-buffer overflow found landing WS3 on x64).
   (code (make-array 16777216))
@@ -314,7 +314,7 @@
 
 (defun a64-emit (buf word)
   "Emit a single 32-bit instruction word, doubling the code array on
-   overflow (the fixed 16M-entry array silently capped the WS3 eval2
+   overflow (the fixed 16M-entry array silently capped the WS3 mvm-eval
    ANSI image at exactly 2^24 instructions: the tail emits — including
    the GC trampoline that defines the gc-check BL target label — were
    lost, and a64-resolve-fixups failed with `undefined label 3`)."

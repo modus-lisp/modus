@@ -228,7 +228,7 @@
 (defvar *mvm-emit-halves* nil
   "When true, integer/bignum literals emit their tagged-word LI immediate as
    two 32-bit halves (:li-halves) instead of `(:li (ash value 1))`.  Bound to T
-   only by the in-image eval2 path: there `(ash value 1)` overflows the 62-bit
+   only by the in-image mvm-eval path: there `(ash value 1)` overflows the 62-bit
    fixnum range for |value| >= 2^61 and triggers lossy in-image bignum-word
    arithmetic.  On the host (native builds) it stays NIL, so compile-integer
    emits the exact same :li IR as before — native translators see no new opcode
@@ -237,13 +237,13 @@
 (defvar *static-build-p* nil
   "WS5: when true, the in-image compiler is doing a STATIC BUILD (`modus
    --compile` producing a fresh standalone image), NOT runtime eval.  It runs
-   with *eval2-runtime-p* T (so the compiler's own in-image operation branches
+   with *mvm-eval-runtime-p* T (so the compiler's own in-image operation branches
    work), but OUTPUT CODEGEN must be static like the ANSI gate image: bake
    string/quote constants into the OUTPUT module's constant pool (NOT the
    runtime *e2-const-pool*, which is empty in the child → garbage) and emit
    plain SYMBOL-VALUE global reads (NOT %e2-symbol-value-checked).  So the two
    OUTPUT-codegen sites (compile-quote's :li-const path, compile-variable-ref's
-   checked read) test (and *eval2-runtime-p* (not *static-build-p*)).")
+   checked read) test (and *mvm-eval-runtime-p* (not *static-build-p*)).")
 
 (defvar *ws5-str-bake-min* 0
   "WS5 GC-corruption threshold PROBE.  In a static build, a quoted STRING whose
@@ -253,13 +253,13 @@
    Sweeping this walks the compile size monotonically to bracket the exact size
    at which the large-working-set GC collection starts corrupting the tail.")
 
-(defvar *eval2-runtime-p* nil
+(defvar *mvm-eval-runtime-p* nil
   "When true, mvm-compile-toplevel is running INSIDE the image on behalf of
-   eval2 (runtime EVAL), not host-side at build time.  Bound to T (via setq,
+   mvm-eval (runtime EVAL), not host-side at build time.  Bound to T (via setq,
    not let — see *mvm-emit-halves* for why compiled let of a special is
-   unreliable in-image) only by eval2-forms.  Used to route DEFPACKAGE (and
+   unreliable in-image) only by mvm-eval-forms.  Used to route DEFPACKAGE (and
    other package side-effecting forms) to their runtime impl (%defpackage-impl)
-   so eval2 of `(defpackage …)` creates a reader-visible package, matching the
+   so mvm-eval of `(defpackage …)` creates a reader-visible package, matching the
    tree-walker.  At build time it stays NIL, so the host build's DEFPACKAGE
    no-op is byte-identical to before.")
 
@@ -269,9 +269,9 @@
    wrapper: host EVAL ignores the flags and returns a host closure.
 
    IN-IMAGE it is load-bearing: a static build (`modus --compile`) drives the
-   compiler with *static-build-p* T / *eval2-runtime-p* NIL / *mvm-emit-halves*
+   compiler with *static-build-p* T / *mvm-eval-runtime-p* NIL / *mvm-emit-halves*
    NIL (%selfhost-compile-file).  A DEFMACRO form in the SOURCE BEING COMPILED
-   must still build its expander via the image's own EVAL (eval2) — but under
+   must still build its expander via the image's own EVAL (mvm-eval) — but under
    those static flags the lambda's function VALUE materializes as an unlinked
    :li-func offset (raw 0).  mvm-define-macro then registers 0 and the first
    USE of the macro funcalls 0 → `sub rcx,3; call rcx` → SIGSEGV → the
@@ -282,30 +282,30 @@
    cascading assembler damage into gen2.  Minimal repro: 2-form file
    `(defmacro m (x) …)` + a use — see task #187.
 
-   Additionally, eval2 LEAKS *eval2-runtime-p*/*mvm-emit-halves* (bare setq,
+   Additionally, mvm-eval LEAKS *mvm-eval-runtime-p*/*mvm-emit-halves* (bare setq,
    no restore), so a nested EVAL mid-static-compile would poison the OUTER
    compile's codegen mode for every remaining form.  This wrapper contains
    both problems: set runtime-eval flags for the nested EVAL, restore the
    exact outer mode after (lexical save + setq restore + unwind-protect —
    NOT a special LET rebind, which is unreliable in-image; see
-   *eval2-runtime-p*'s docstring)."
+   *mvm-eval-runtime-p*'s docstring)."
   (let ((saved-static *static-build-p*)
-        (saved-e2rt   *eval2-runtime-p*)
+        (saved-e2rt   *mvm-eval-runtime-p*)
         (saved-halves *mvm-emit-halves*))
     (unwind-protect
         (progn
           (setq *static-build-p* nil)
-          (setq *eval2-runtime-p* t)
+          (setq *mvm-eval-runtime-p* t)
           (setq *mvm-emit-halves* t)
           (eval lambda-form))
       (setq *static-build-p* saved-static)
-      (setq *eval2-runtime-p* saved-e2rt)
+      (setq *mvm-eval-runtime-p* saved-e2rt)
       (setq *mvm-emit-halves* saved-halves))))
 
 
 (defvar *e2-persist-defuns* nil
-  "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *eval2-runtime-p*
-   gated).  eval2-forms' pre-scan walks the RAW forms for top-level DEFUNs to
+  "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *mvm-eval-runtime-p*
+   gated).  mvm-eval-forms' pre-scan walks the RAW forms for top-level DEFUNs to
    persist (install as global trampolines), but it runs BEFORE macroexpansion
    — a defun hidden behind a user macro (uiop's (with-upgradability ()
    (defun featurep …)) → eval-when → defun) compiles into the module yet
@@ -313,15 +313,15 @@
    UNDEFINED-FUNCTION (asdf gauntlet FAILFORM 45).  Fix: mvm-compile-toplevel's
    DEFUN handler — which sees every toplevel-context defun POST-expansion
    (progn/eval-when/macro wrappers all recurse through mvm-compile-toplevel) —
-   pushes each defun NAME here.  eval2-forms clears it before its compile
+   pushes each defun NAME here.  mvm-eval-forms clears it before its compile
    loop and unions it with the pre-scan names for the trampoline install
-   loop.  The pre-scan is kept as belt-and-braces.  Cleared per eval2-forms
-   call via setq (not let — see *eval2-runtime-p* for why).")
+   loop.  The pre-scan is kept as belt-and-braces.  Cleared per mvm-eval-forms
+   call via setq (not let — see *mvm-eval-runtime-p* for why).")
 
-;;; eval2 QUOTE constant pool (in-image ONLY — *eval2-runtime-p* gated).
+;;; mvm-eval QUOTE constant pool (in-image ONLY — *mvm-eval-runtime-p* gated).
 ;;;
 ;;; CLHS: QUOTE returns ITS OBJECT.  The tree-walker gets this for free (it
-;;; hands back the form's own substructure), but eval2's compile-quote used to
+;;; hands back the form's own substructure), but mvm-eval's compile-quote used to
 ;;; RE-MATERIALIZE quoted data — re-interning every symbol via
 ;;; %INTERN-SYMBOL-PKG from (normalize-name (symbol-name s)) + (symbol-package
 ;;; s).  In-image that round-trip is LOSSY: symbol-package returns NIL for
@@ -331,18 +331,18 @@
 ;;; systemic WS3-flip symbol-identity divergence (macro-function.8-10,
 ;;; find-all-symbols, every eql-on-eval-result test).
 ;;;
-;;; Fix: under eval2, compile-quote registers the quoted VALUE in a global
+;;; Fix: under mvm-eval, compile-quote registers the quoted VALUE in a global
 ;;; pool (hash idx → value, GC-visible via the special) and emits ONE
 ;;; `:li-const dest idx`; the interpreter's op-LI-CONST loads the ORIGINAL
 ;;; object back.  Identity is exact (eq), compiles are smaller/faster, and
 ;;; shared-structure semantics match the tree-walker precisely.  The pool only
 ;;; grows (indices stay valid for cached compiled modules).  Host/native
-;;; builds never see this path — *eval2-runtime-p* is NIL there, and the
+;;; builds never see this path — *mvm-eval-runtime-p* is NIL there, and the
 ;;; native :li-const string-pool path is untouched.
 ;;; (The pool globals *e2-const-pool* / *e2-const-count* live in mvm.lisp —
 ;;; loaded before BOTH this file and interp.lisp in host and image orders.)
 (defun %e2-const-register (value)
-  "Register VALUE in the eval2 quote pool; return its index."
+  "Register VALUE in the mvm-eval quote pool; return its index."
   (unless *e2-const-pool*
     (setq *e2-const-pool* (make-hash-table))
     (setq *e2-const-count* 0))
@@ -434,30 +434,30 @@
   "Set of known global variable names (hash -> t)")
 
 (defvar *runtime-special-names* nil
-  "In-image (eval2) registry of variable names PROCLAIMED special at
+  "In-image (mvm-eval) registry of variable names PROCLAIMED special at
    RUNTIME — a hash of name-hash → T populated by the DEFVAR /
    DEFPARAMETER handlers (both mvm-compile-toplevel's and compile-form's
-   expression-context one) when *eval2-runtime-p*.  The let/let* implicit-
+   expression-context one) when *mvm-eval-runtime-p*.  The let/let* implicit-
    special detection consults it so `(let ((*user-var* v)) (callee))`
    establishes a DYNAMIC binding visible to other compilation units, as
    CLHS requires for a defvar'd name.  Without it only CLHS-standard
    earmuffs rebound dynamically: uiop's make-operation bound
    *in-make-operation* LEXICALLY, the initialize-instance :before guard
    in another module read the unbound global, and every make-operation
-   errored (asdf gauntlet form 241).  Persistent across eval2 calls
-   (deliberately NOT reset per eval2-forms).  Host builds never populate
-   it (*eval2-runtime-p* stays NIL) — byte-identical.")
+   errored (asdf gauntlet form 241).  Persistent across mvm-eval calls
+   (deliberately NOT reset per mvm-eval-forms).  Host builds never populate
+   it (*mvm-eval-runtime-p* stays NIL) — byte-identical.")
 
 (defun %note-runtime-special (name-hash)
   "Record NAME-HASH as runtime-proclaimed-special (see *runtime-special-names*)."
-  (when *eval2-runtime-p*
+  (when *mvm-eval-runtime-p*
     (unless *runtime-special-names*
       (setq *runtime-special-names* (make-hash-table :test 'eql)))
     (setf (gethash name-hash *runtime-special-names*) t)))
 
 (defun %runtime-special-p (var)
-  "T when VAR was defvar'd/defparameter'd at runtime under eval2."
-  (and *eval2-runtime-p*
+  "T when VAR was defvar'd/defparameter'd at runtime under mvm-eval."
+  (and *mvm-eval-runtime-p*
        *runtime-special-names*
        (symbolp var)
        (gethash (normalize-name var) *runtime-special-names*)))
@@ -539,7 +539,7 @@
                         ;; isolated the GLOBAL emit-ir target, and the
                         ;; inner get-ir-instructions' (setf *ir-buffer* nil)
                         ;; WIPED the enclosing thunk's IR (frame-enter +
-                        ;; everything emitted before the lambda) — eval2 of
+                        ;; everything emitted before the lambda) — mvm-eval of
                         ;; a capturing closure then ran a frame-less thunk
                         ;; that STACK-LOADed a 0 VFP → SIGSEGV (WS4 oracle).
                         "*IR-BUFFER*" "*TEMP-REG-COUNTER*"
@@ -581,7 +581,7 @@
 ;; a child with (:include PARENT) reads PARENT's entry to prepend the
 ;; inherited slots so their accessors/setters/layout are generated with the
 ;; child's conc-name at the right offsets.  Runs in both the build-time host
-;; compile and in-image eval2 compile (this defvar lives in the image too);
+;; compile and in-image mvm-eval compile (this defvar lives in the image too);
 ;; lazy-init'd because defvar thunks don't auto-run in-image.
 (defvar *defstruct-eff-slots* nil)
 
@@ -1110,8 +1110,8 @@
 
 (defun %rt-fn-name (fn)
   "Function-resolution KEY string for name-symbol FN.  Package-qualified
-   (PKG::NAME) iff runtime eval2 AND FN's home package is runtime-born;
-   else bare symbol-name.  Bare at build time (*eval2-runtime-p* NIL) ->
+   (PKG::NAME) iff runtime mvm-eval AND FN's home package is runtime-born;
+   else bare symbol-name.  Bare at build time (*mvm-eval-runtime-p* NIL) ->
    host build + ANSI gate byte-identical.
 
    This is the compiler-layer counterpart to the %cl-sym-p branch of
@@ -1122,7 +1122,7 @@
    globally.  Uses the qualified STRING hashed by compute-name-hash — NOT
    a multiply-based composite (%fixnum-* promotes to a BIGNUM in-image and
    (logand <bignum> mask) is lossy, collapsing back to the bare key)."
-  (if (and *eval2-runtime-p* (%cl-sym-p fn))
+  (if (and *mvm-eval-runtime-p* (%cl-sym-p fn))
       (let ((pkg (%cl-sym-package fn)))
         (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
             (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn))
@@ -1133,13 +1133,13 @@
   "Name-hash KEY used for the runtime SYMBOL-VALUE / SET-SYMBOL-VALUE alist
    (keyed at #x10000080).  Identical to NORMALIZE-NAME on the host (and for
    the native build, where *mvm-emit-halves* is NIL and this is byte-for-byte
-   NORMALIZE-NAME).  The in-image eval2 build OVERRIDES this (see
+   NORMALIZE-NAME).  The in-image mvm-eval build OVERRIDES this (see
    build-x64-linux.lisp's stage-2 block) to read a native symbol's STORED
    hash slot directly: a symbol whose name isn't in the build's reverse
    *sym-name-table* (e.g. *cons-test-4* from the unscanned cons/ test dir)
    has SYMBOL-NAME = \"\", so NORMALIZE-NAME would compute compute-name-hash(\"\")
    — a constant WRONG key that misses the store (keyed by the symbol's real
-   reader/setq-assigned hash).  That made eval2's global READ return NIL where
+   reader/setq-assigned hash).  That made mvm-eval's global READ return NIL where
    the tree-walker (which keys symbol-value by the stored hash) returned the
    value — the WS3 cxr/global cluster (cons.38-53).  Scoped to the GLOBAL
    variable read/write key only (NOT compile-quote symbol interning) so it
@@ -1200,7 +1200,7 @@
         (cond
           (expander
            (let ((result
-                  (if *eval2-runtime-p*
+                  (if *mvm-eval-runtime-p*
                       (funcall expander form)
                       ;; BUILD-TIME salvage: a user-macro expander that
                       ;; errors host-side (e.g. defmacro.3's body reads a
@@ -1209,7 +1209,7 @@
                       ;; SKIP the WHOLE chunk defun — silently dropping all
                       ;; sibling tests.  Expand to a runtime (error …) call
                       ;; instead: the one form fails HONESTLY at runtime,
-                      ;; the rest of the chunk lives.  Not used under eval2
+                      ;; the rest of the chunk lives.  Not used under mvm-eval
                       ;; (runtime expander errors are catchable conditions
                       ;; and must propagate normally).
                       (handler-case (funcall expander form)
@@ -1221,21 +1221,21 @@
              (if (eq result form)
                  (cons form nil)
                  (cons result t))))
-          ;; eval2 (in-image runtime compile) ONLY: fall back to the RUNTIME
+          ;; mvm-eval (in-image runtime compile) ONLY: fall back to the RUNTIME
           ;; macro tables.  A macro defined at runtime — a nested DEFMACRO's
           ;; compiled set-macro-function registration, (setf (macro-function
           ;; SYM) ...), or a previously eval'd defmacro — lives in cl-eval's
           ;; *macro-function-table*, NOT in the compiler's per-call
-          ;; *macro-table*.  Without this fallback eval2 compiled a call to
+          ;; *macro-table*.  Without this fallback mvm-eval compiled a call to
           ;; the macro NAME as an undefined function (silent NIL / crash —
           ;; the whole defmacro / macro-function ANSI cluster under the WS3
           ;; flip).  Dispatch mirrors cl-eval's runtime MACROEXPAND-1:
           ;; %interp-closure expanders get (cdr form); compiled expanders and
           ;; macro-function wrappers try (form) then (form env).  The T
           ;; marker (a compiler-builtin macro) is NOT expandable here.
-          ;; Guarded by *eval2-runtime-p* so the host/native build path is
+          ;; Guarded by *mvm-eval-runtime-p* so the host/native build path is
           ;; byte-identical (%raw-macro-expander exists only in the image).
-          (*eval2-runtime-p*
+          (*mvm-eval-runtime-p*
            (let ((mf (%raw-macro-expander (car form))))
              (cond
                ((null mf) (cons form nil))
@@ -1329,7 +1329,7 @@
 
 (defvar *bootstrap-macro-template* nil
   "PERF: persistent name-hash→expander table for the 94 bootstrap macros, built
-   ONCE on the first register-mvm-bootstrap-macros call.  Every eval2-forms call
+   ONCE on the first register-mvm-bootstrap-macros call.  Every mvm-eval-forms call
    binds a fresh *macro-table* and used to re-CONSTRUCT all 94 macro closures
    (a chunk of the per-eval compile cost).  Now the first call builds them +
    snapshots them here; every subsequent call just COPIES this table into
@@ -1838,7 +1838,7 @@
 
   ;; DEFINE-SYMBOL-MACRO — register a GLOBAL symbol-macro (CLHS).  The expander
   ;; SIDE-EFFECTS *global-symbol-macros* at macroexpand time (works both host-
-  ;; build and in-image eval2 — the expander lambda runs in whichever compiler
+  ;; build and in-image mvm-eval — the expander lambda runs in whichever compiler
   ;; is expanding) and returns the name.  compile-variable-ref / compile-setq
   ;; then expand references / route assignments.  Needed by global-vars'
   ;; define-global-var (bordeaux-threads' internal globals).
@@ -2058,23 +2058,23 @@
             (body (cddr form)))
         `(if ,test nil (progn ,@body)))))
 
-  ;; DEFPACKAGE → %defpackage-impl (RUNTIME / eval2 only).
+  ;; DEFPACKAGE → %defpackage-impl (RUNTIME / mvm-eval only).
   ;; At BUILD time the package system is SBCL-side, so we must NOT register
   ;; this (the host build's DEFPACKAGE stays a no-op → byte-identical image).
-  ;; Under eval2 (*eval2-runtime-p* set by eval2-forms before this runs), the
-  ;; form is wrapped in %eval2-thunk and compiled as a NESTED expression, so a
+  ;; Under mvm-eval (*mvm-eval-runtime-p* set by mvm-eval-forms before this runs), the
+  ;; form is wrapped in %mvm-eval-thunk and compiled as a NESTED expression, so a
   ;; toplevel-only clause never sees it — a macro is the only path that fires
   ;; in both the toplevel and nested compile-form positions.  Expands to the
   ;; same %defpackage-impl call the tree-walker's runtime DEFPACKAGE macro
-  ;; emits (cl-packages.lisp:%register-defpackage-macro), so eval2 of
+  ;; emits (cl-packages.lisp:%register-defpackage-macro), so mvm-eval of
   ;; `(defpackage …)` creates a reader-visible package in *all-packages*.
-  (when *eval2-runtime-p*
+  (when *mvm-eval-runtime-p*
     (mvm-define-macro "DEFPACKAGE"
       (lambda (form)
         (list '%defpackage-impl
               (list 'quote (cadr form))
               (list 'quote (cddr form)))))
-    ;; IN-PACKAGE (RUNTIME / eval2 only): per CLHS 11.1.2.1.2 the argument is
+    ;; IN-PACKAGE (RUNTIME / mvm-eval only): per CLHS 11.1.2.1.2 the argument is
     ;; a package designator that is NOT evaluated.  As a plain function
     ;; `(in-package #:natrium)` evaluated #:natrium as a variable →
     ;; UNBOUND-VARIABLE (self-evaluating keyword/string designators worked by
@@ -2086,13 +2086,13 @@
     (mvm-define-macro "IN-PACKAGE"
       (lambda (form)
         (list '%in-package-1 (list 'quote (cadr form)))))
-    ;; DEFTYPE (RUNTIME / eval2 only — same rationale as DEFPACKAGE above):
+    ;; DEFTYPE (RUNTIME / mvm-eval only — same rationale as DEFPACKAGE above):
     ;; register the expander in the SAME *%runtime-deftype-table* the
     ;; tree-walker's DEFTYPE handler uses, so typep/subtypep's
     ;; %deftype-lookup / %expand-deftype (ansi-bridge.lisp) see it.  Without
-    ;; this, eval2 compiled (deftype ...) as an undefined-function call —
+    ;; this, mvm-eval compiled (deftype ...) as an undefined-function call —
     ;; the deftype.7/.8/.16-.18 + documentation.symbol.type.3 flip residue.
-    ;; Returns the NAME (identity-preserved via the eval2 quote pool, so
+    ;; Returns the NAME (identity-preserved via the mvm-eval quote pool, so
     ;; (eq (eval `(deftype ,sym ...)) sym) holds).
     (mvm-define-macro "DEFTYPE"
       (lambda (form)
@@ -2100,11 +2100,11 @@
               (list 'quote (cadr form))
               (list 'quote (caddr form))
               (list 'quote (cdddr form)))))
-    ;; DEFCONSTANT (RUNTIME / eval2 only): mirror the tree-walker's handler —
+    ;; DEFCONSTANT (RUNTIME / mvm-eval only): mirror the tree-walker's handler —
     ;; evaluate the value and set the global via %eval-set-global (both the
     ;; eval-only alist AND compiled code's hash-keyed store), return the name.
     ;; The build-time toplevel DEFCONSTANT clause (mvm-compile-toplevel) never
-    ;; sees the eval2 shape: the form compiles NESTED inside %eval2-thunk.
+    ;; sees the mvm-eval shape: the form compiles NESTED inside %mvm-eval-thunk.
     (mvm-define-macro "DEFCONSTANT"
       (lambda (form)
         ;; WS5 STATIC SELF-HOST: during the static --compile (*static-build-p*
@@ -2113,7 +2113,7 @@
         ;; refs like `(ash 255 +fixnum-shift+)` compile to a literal, not a
         ;; SYMBOL-VALUE read of an unbound global) AND register a boot init-thunk.
         ;; Without this the macro shadowed the toplevel handler → +fixnum-shift+
-        ;; etc. were unbound in the product's own eval2 → bignum-ash(255,garbage)
+        ;; etc. were unbound in the product's own mvm-eval → bignum-ash(255,garbage)
         ;; SIGSEGV compiling the first &rest lambda.  Gated on *static-build-p*
         ;; (NIL in every ANSI-gate build AND in the product's runtime REPL) so
         ;; those paths keep the runtime %eval-set-global expansion byte-for-byte.
@@ -2127,7 +2127,7 @@
                   ;; (CLHS) — alexandria define-constant.1/.2 check this.
                   (list '%mark-constant-var (list 'quote (cadr form)))
                   (list 'quote (cadr form))))))
-    ;; DEFINE-COMPILER-MACRO (RUNTIME / eval2 only): register the expander in
+    ;; DEFINE-COMPILER-MACRO (RUNTIME / mvm-eval only): register the expander in
     ;; the SAME *compiler-macro-function-table* the tree-walker's handler
     ;; uses, so COMPILER-MACRO-FUNCTION / (documentation x 'compiler-macro)
     ;; resolve it.  Returns the NAME per CLHS.
@@ -2297,7 +2297,7 @@
                 ((consp place)
                  ;; Intern the SET-<accessor> symbol into MODUS.MVM when that
                  ;; package resolves (build-time SBCL), else *package* (which IS
-                 ;; MODUS.MVM during a normal compile).  In-image eval2 has NO
+                 ;; MODUS.MVM during a normal compile).  In-image mvm-eval has NO
                  ;; MODUS.MVM package, so the old hardcoded `(intern … :modus.mvm)`
                  ;; returned NIL → the expansion became `(NIL place-args value)`,
                  ;; a call to NIL: every defstruct/CLOS (setf (NAME-slot s) v)
@@ -2400,7 +2400,7 @@
           (let ((acc accessor))
             (lambda (place-args value-form)
               ;; In-image-safe package (see cell-var-name): hardcoded
-              ;; :modus.mvm interns into NIL under eval2 → NIL setter head.
+              ;; :modus.mvm interns into NIL under mvm-eval → NIL setter head.
               (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
                                     (or (find-package "MODUS.MVM") *package*))))
                 `(,setter ,@place-args ,value-form)))))
@@ -2412,8 +2412,8 @@
   ;; Tests using this require runtime macro definition; we register an MVM
   ;; macro at compile time so subsequent (name place args...) forms expand.
   ;; DEFINE-MODIFY-MACRO — expand to a real DEFMACRO so the modify-macro
-  ;; PERSISTS across eval2 forms.  The previous impl side-effected
-  ;; mvm-define-macro into the per-call *macro-table* (which eval2-forms rebinds
+  ;; PERSISTS across mvm-eval forms.  The previous impl side-effected
+  ;; mvm-define-macro into the per-call *macro-table* (which mvm-eval-forms rebinds
   ;; fresh every call) and returned (quote name), so `(define-modify-macro
   ;; appendf …)` then a use of APPENDF in a LATER top-level form got
   ;; UNDEFINED-FUNCTION (alexandria appendf/nconcf/unionf/nunionf).  A DEFMACRO
@@ -3054,9 +3054,9 @@
             `(%maphash-impl ,fn-form ,ht-form))))))))
 
   ;; ===========================================================
-  ;; CORE CLOS for eval2 (the compile-then-interpret path).
+  ;; CORE CLOS for mvm-eval (the compile-then-interpret path).
   ;;
-  ;; eval2-forms compiles via mvm-compile-toplevel (NOT the build-x64-linux
+  ;; mvm-eval-forms compiles via mvm-compile-toplevel (NOT the build-x64-linux
   ;; SBCL-side rewriter), so DEFCLASS/DEFGENERIC/DEFMETHOD/MAKE-INSTANCE were
   ;; never recognised — they compiled as ordinary calls to UNDEFINED-FUNCTION,
   ;; and the class/slot/accessor symbol args read as "implicit global"
@@ -3064,7 +3064,7 @@
   ;; back-end calls (%defclass / %register-clos-* / %make-instance /
   ;; %shared-init-default-spread / %defgeneric / %defmethod / %gf-dispatch)
   ;; that the tree-walker's CLOS handlers (cl-eval.lisp) and the build-ansi
-  ;; rewriter both target — so eval2 shares one CLOS registry and dispatch.
+  ;; rewriter both target — so mvm-eval shares one CLOS registry and dispatch.
   ;;
   ;; SCOPE: CORE single-dispatch — :initarg/:initform/:accessor/:reader/
   ;; :writer slot options, make-instance, slot-value, subclass typep, and
@@ -3082,11 +3082,11 @@
   ;; WHY initforms run in bytecode and not via %shared-init-default-spread's
   ;; T slot-names path: that native helper's step-2 does
   ;; `(aset instance idx (funcall thunk))` with the destination computed
-  ;; before the value.  For an eval2 class the thunk is a re-entrant interp
+  ;; before the value.  For an mvm-eval class the thunk is a re-entrant interp
   ;; trampoline, so (funcall thunk) recurses into mvm-interpret (may GC) —
   ;; the native aset then wrote to a stale instance pointer → SIGSEGV.
-  ;; Funcalling each thunk at the TOP eval2 level (like a working
-  ;; mapcar-over-an-eval2-lambda) and applying via set-slot-value avoids the
+  ;; Funcalling each thunk at the TOP mvm-eval level (like a working
+  ;; mapcar-over-an-mvm-eval-lambda) and applying via set-slot-value avoids the
   ;; deep-native re-entrancy.  CLHS: initforms apply only to slots not set by
   ;; an initarg, so the %slot-boundp guard skips initarg-supplied slots.
   (mvm-define-macro "MAKE-INSTANCE"
@@ -3136,7 +3136,7 @@
   ;; %gf-dispatch (mirrors the build-time expansion, which embeds NAME as a
   ;; literal so there's no capture).  Handles inline (:method ...) options,
   ;; (:method-combination NAME [opt]) and (:argument-precedence-order ...) so
-  ;; eval2 reaches the same runtime CLOS registry the tree-walker does.
+  ;; mvm-eval reaches the same runtime CLOS registry the tree-walker does.
   ;; (%defgeneric / %defmethod / %gf-dispatch / method combinations are all
   ;; defined in the image, so this expands to ordinary calls.)
   (mvm-define-macro "DEFGENERIC"
@@ -3149,7 +3149,7 @@
              (inline-methods nil)
              (args-var (gensym "GF-ARGS")))
         ;; Scan options for :method-combination / :argument-precedence-order /
-        ;; (:method ...) — documentation and others are ignored (eval2 has no
+        ;; (:method ...) — documentation and others are ignored (mvm-eval has no
         ;; runtime option validator; the tree-walker remains the reference for
         ;; option-error tests).
         (dolist (opt options)
@@ -3236,33 +3236,33 @@
                                          ',meta-ll)))
                 inline-methods)))
           `(progn
-             ;; eval2 ONLY: CLHS DEFGENERIC error semantics — a name bound to
+             ;; mvm-eval ONLY: CLHS DEFGENERIC error semantics — a name bound to
              ;; a macro / special operator / ordinary function signals
              ;; PROGRAM-ERROR (defgeneric.error.1/2/3); mirrors the
              ;; tree-walker's pre-%defgeneric checks.
-             ,@(when *eval2-runtime-p*
-                 `((%defgeneric-eval2-precheck ',gf-name)))
+             ,@(when *mvm-eval-runtime-p*
+                 `((%defgeneric-mvm-eval-precheck ',gf-name)))
              (%defgeneric ',gf-name ',lambda-list
                           ',(if combination combination nil))
              ,@(when apo
                  `((%gf-set-arg-precedence ',gf-name ',apo ',lambda-list)))
              ;; Dispatch stub: at BUILD time a real defun (embeds NAME as a
-             ;; literal, no capture).  Under eval2 a nested defun is a
+             ;; literal, no capture).  Under mvm-eval a nested defun is a
              ;; COMPILE-TIME module registration only — nothing reaches the
              ;; runtime function tables, so native (funcall sym ...) /
-             ;; (fdefinition sym) after an eval2 defgeneric missed and
+             ;; (fdefinition sym) after an mvm-eval defgeneric missed and
              ;; call-indirect jumped into symbol heap data (same mechanism as
              ;; the defmethod-via-eval SEGV cluster).  Install the runtime
              ;; stub into the function cell instead, mirroring the
              ;; tree-walker's set-symbol-function + %make-gf-stub.
-             ,(if *eval2-runtime-p*
+             ,(if *mvm-eval-runtime-p*
                   `(%gf-install-dispatch-stub ',gf-name)
                   `(defun ,gf-name (&rest ,args-var)
                      (%gf-dispatch ',gf-name ,args-var)))
              ,@method-forms
              ;; CLHS: DEFGENERIC returns the generic-function OBJECT (the GF
              ;; struct), NOT the name symbol.  The tree-walker's DEFGENERIC
-             ;; handler (cl-eval.lisp) returns (%dg-gf-callable gf-name); eval2
+             ;; handler (cl-eval.lisp) returns (%dg-gf-callable gf-name); mvm-eval
              ;; must match so `(funcall (defgeneric g …) …)` — the GF struct in
              ;; a variable — dispatches via compile-funcall's #x32 struct path.
              ;; Returning ',gf-name (the symbol) here diverged: funcalling the
@@ -3343,15 +3343,15 @@
                   (append params (list (intern "&ALLOW-OTHER-KEYS"
                                                (or (find-package "MODUS.MVM")
                                                    *package*)))))))
-        (if *eval2-runtime-p*
-            ;; eval2 (in-image runtime compile) ONLY: route through
+        (if *mvm-eval-runtime-p*
+            ;; mvm-eval (in-image runtime compile) ONLY: route through
             ;; %defmethod-full (cl-clos.lisp), which carries the tree-walker's
             ;; full runtime DEFMETHOD semantics — CLHS 7.6.4 congruence
             ;; validation (defmethod.error.1-12), implicit GF creation with a
             ;; DERIVED lambda-list (arity checks, defmethod.error.13-15), and
             ;; the function-cell dispatch-stub install.  The build-time
             ;; expansion below relied on a nested DEFUN for the dispatch stub,
-            ;; but under eval2 a nested defun is a COMPILE-TIME module
+            ;; but under mvm-eval a nested defun is a COMPILE-TIME module
             ;; registration only — nothing reached the runtime function
             ;; tables, so a later native `(funcall sym ...)` missed,
             ;; %native-sym-resolve returned the SYMBOL itself, and
@@ -3395,7 +3395,7 @@
   ;;   — first arg after NAME is the combination lambda-list (a list or NIL).
   ;; Registers via %define-method-combination / %define-method-combination-long
   ;; (both in the image); %gf-dispatch consults the registry.  Mirrors the
-  ;; SBCL-side rewriter so eval2 reaches the same runtime registry.
+  ;; SBCL-side rewriter so mvm-eval reaches the same runtime registry.
   (mvm-define-macro "DEFINE-METHOD-COMBINATION"
     (lambda (form)
       (let* ((mc-name (cadr form))
@@ -3548,7 +3548,7 @@
                      ;; %clos-make-initform-thunk is a native identity fn:
                      ;; passing the lambda as a TOP-LEVEL bridge argument
                      ;; lets %mvm-wrap-escaping trampoline-wrap it under
-                     ;; eval2 (an in-module #x52 closure nested in the
+                     ;; mvm-eval (an in-module #x52 closure nested in the
                      ;; %register-clos-slot-info list argument would escape
                      ;; UNWRAPPED and execute garbage when a later
                      ;; make-instance funcalls it from another module —
@@ -3828,7 +3828,7 @@
    Native/host path (*mvm-emit-halves* NIL): exactly `(:li dest (ash value 1))`
    as before — byte-identical, no new opcode for the translators.
 
-   In-image eval2 path (*mvm-emit-halves* T): emit :li-halves with the two
+   In-image mvm-eval path (*mvm-emit-halves* T): emit :li-halves with the two
    32-bit halves of the tagged word computed by FIXNUM-SAFE ops, so we never
    form (value<<1) as a single in-image integer (it overflows the 62-bit fixnum
    range for |value| >= 2^61, where bignum-word ASH/LOGAND are lossy).
@@ -3838,7 +3838,7 @@
    [-2^31, 2^31-1] — all safely in fixnum range."
   (cond
     ;; WS5 STATIC SELF-HOST: this MUST be checked BEFORE *mvm-emit-halves*.  The
-    ;; self-source contains eval2-forms, whose `(setq *mvm-emit-halves* t)` runs
+    ;; self-source contains mvm-eval-forms, whose `(setq *mvm-emit-halves* t)` runs
     ;; at the product's compile-time and stays T for the rest of the --compile,
     ;; so a *mvm-emit-halves*-first cond routed compile-integer's boundary through
     ;; the :li-halves branch — whose `(ash value -31)` is broken for large
@@ -3859,7 +3859,7 @@
     ;;    :li operand.  Emit its tagged word (−2^63 = 1<<63) as :li 1 + :shl 63.
     ;;    (compile-integer no longer classifies −2^62 as fixnum, so this is
     ;;    defensive only.)
-    ;; Gated on *static-build-p* OR (runtime eval2 AND the JIT is the active
+    ;; Gated on *static-build-p* OR (runtime mvm-eval AND the JIT is the active
     ;; backend).  Both terms are NIL in the image build, so that build stays
     ;; byte-identical.
     ;;
@@ -3887,12 +3887,12 @@
     ;; baked choice, gate on (%jit-active-p): the native-backed image takes the
     ;; split, the interpret-only image (and any JIT-inhibited, always-
     ;; interpreted compile) takes the interpret-correct tagged :li.
-    ;; NOTE (#197): the runtime-JIT `(and *eval2-runtime-p* (%jit-active-p))`
+    ;; NOTE (#197): the runtime-JIT `(and *mvm-eval-runtime-p* (%jit-active-p))`
     ;; term was REMOVED.  It made a JIT-on image compile boundary fixnum literals
     ;; with this positive-magnitude split — which the INTERPRET fallback (hit on
     ;; any translate error / MV form) cannot execute, so a JIT→interpret fallback
     ;; of a form containing a near-2^62 literal returned garbage (the last F198/
-    ;; F210 mod-by-≥2^61 divergence).  Now runtime eval2 (BOTH backends) falls
+    ;; F210 mod-by-≥2^61 divergence).  Now runtime mvm-eval (BOTH backends) falls
     ;; through to the *mvm-emit-halves* :li-halves path (a single tagged :li whose
     ;; interpret side is the overflow-safe fetch-li-value), and the JIT's
     ;; emit-u64 is bignum-safe (x64-asm.lisp) so it materialises the boundary
@@ -4036,10 +4036,10 @@
    Now we route through %INTERN-KEYWORD just like compile-quote routes
    non-keyword symbols through %INTERN-SYMBOL.  Same eq guarantee
    (interned per name-hash) but real symbol-typed objects."
-  ;; emit-li-tagged: byte-identical native, :li-halves in eval2 (see the symbol
+  ;; emit-li-tagged: byte-identical native, :li-halves in mvm-eval (see the symbol
   ;; case in compile-quote — raw :li corrupts a ~60-bit name-hash in-image).
   (emit-li-tagged +vreg-v0+ (normalize-name kw))
-  (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge needs nargs (see compile-quote symbol case)
+  (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge needs nargs (see compile-quote symbol case)
   (emit-ir :call "%INTERN-KEYWORD" 1)
   (unless (= dest +vreg-vr+)
     (emit-ir :mov dest +vreg-vr+)))
@@ -4081,27 +4081,27 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
-       (if (and *eval2-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
-           ;; eval2 production-eval semantics (WS3 flip): a global READ of a
+       (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
+           ;; mvm-eval production-eval semantics (WS3 flip): a global READ of a
            ;; name with NO binding in the symbol-value alist must signal
            ;; UNBOUND-VARIABLE carrying the SYMBOL as :name (cell-error-name.1,
            ;; eval.error.4) — exactly what the tree-walker's %eval-sym-lookup
            ;; does via its boundp fallback.  The bare SYMBOL-VALUE call
            ;; returned NIL for absent entries, silently conflating "unbound"
-           ;; with "bound to NIL".  The quoted symbol rides the eval2 const
+           ;; with "bound to NIL".  The quoted symbol rides the mvm-eval const
            ;; pool, so the condition's :name is EQ to the source symbol.
            (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
                                                     (quote ,name))
                          env dest)
            (let ((hash (%global-name-key name)))
-             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
-             ;; eval2 bridge reads (mvm-nargs) args; a manual :call needs an
+             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
+             ;; mvm-eval bridge reads (mvm-nargs) args; a manual :call needs an
              ;; explicit :set-nargs or the bridge pulls a STALE count and the
              ;; native SYMBOL-VALUE gets the wrong arg → a bare global read = NIL
-             ;; under eval2 (this is what blocked handler-case's *current-condition*
+             ;; under mvm-eval (this is what blocked handler-case's *current-condition*
              ;; type-dispatch, WS3).  Native fixed-arg SYMBOL-VALUE ignores nargs,
              ;; so this is byte-identical for the ANSI build — gated on
-             ;; *mvm-emit-halves* (T only in build-generic.lisp / eval2; OFF for ANSI).
+             ;; *mvm-emit-halves* (T only in build-generic.lisp / mvm-eval; OFF for ANSI).
              (when *mvm-emit-halves* (emit-ir :set-nargs 1))
              (emit-ir :call "SYMBOL-VALUE" 1)
              (unless (= dest +vreg-vr+)
@@ -4110,14 +4110,14 @@
        ;; Implicit global — treat as dynamic variable (auto-register)
        (format t "  WARN: implicit global ~A~%" name)
        (setf (gethash (normalize-name name) *globals*) t)
-       (if (and *eval2-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
+       (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
            (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
                                                     (quote ,name))
                          env dest)
            (let ((hash (%global-name-key name)))
-             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
-             (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; eval2 bridge nargs
+             (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
+             (when *mvm-emit-halves* (emit-ir :set-nargs 1))  ; mvm-eval bridge nargs
              (emit-ir :call "SYMBOL-VALUE" 1)
              (unless (= dest +vreg-vr+)
                (emit-ir :mov dest +vreg-vr+))))))))
@@ -4159,7 +4159,7 @@
                                          (member (symbol-name var)
                                                  *clhs-extra-specials*
                                                  :test #'string=)
-                                         ;; runtime defvar'd names (eval2) —
+                                         ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
                                          (%runtime-special-p var))
                                      (not (member (symbol-name var) declared
@@ -4186,7 +4186,7 @@
                                          (member (symbol-name var)
                                                  *clhs-extra-specials*
                                                  :test #'string=)
-                                         ;; runtime defvar'd names (eval2) —
+                                         ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
                                          (%runtime-special-p var))
                                      (not (member (symbol-name var) declared
@@ -4278,17 +4278,17 @@
                              (string= (symbol-name (car raw-name)) "SETF"))
                         (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                         raw-name)))
-         ;; In-image eval2: a DEFUN is ALWAYS a global definition (CLHS) even
-         ;; when it reaches compile-form nested — inside %eval2-thunk (a bare
+         ;; In-image mvm-eval: a DEFUN is ALWAYS a global definition (CLHS) even
+         ;; when it reaches compile-form nested — inside %mvm-eval-thunk (a bare
          ;; top-level expression), a top-level MACROLET/LET body, a deftest
          ;; thunk, etc.  It compiles into the module (via *pending-flet-ir*
          ;; below, which gives it an offset) but WITHOUT this it was never
-         ;; recorded for the trampoline-install loop, so a LATER (eval2 …) form
+         ;; recorded for the trampoline-install loop, so a LATER (mvm-eval …) form
          ;; got UNDEFINED-FUNCTION.  This is the alexandria lists.lisp case:
          ;; LASTCAR / PROPER-LIST-LENGTH are defined by a top-level `macrolet`
-         ;; `def` (wrapped into %eval2-thunk → nested here), then called from a
+         ;; `def` (wrapped into %mvm-eval-thunk → nested here), then called from a
          ;; later top-level form.  Mirror the toplevel DEFUN handler's record.
-         (when *eval2-runtime-p*
+         (when *mvm-eval-runtime-p*
            (setq *e2-persist-defuns*
                  (cons (if (symbolp name) (%rt-fn-name name) (string name))
                        *e2-persist-defuns*)))
@@ -4416,16 +4416,16 @@
       ;; constructor / accessors / predicates / setters so subsequent
       ;; calls in the same source resolve them.  Yields NIL into dest.
       ((= op-name 347335033216607151)   ; DEFSTRUCT
-       ;; eval2 production-eval semantics (WS3 flip): Modus represents
+       ;; mvm-eval production-eval semantics (WS3 flip): Modus represents
        ;; structs only as the native tagged array — a (:TYPE …) option is
        ;; unsupported, and the tree-walker's runtime DEFSTRUCT signals
        ;; "DEFSTRUCT :TYPE option is not supported" (which defstruct.error.3/
        ;; .4 catch via signals-error).  The build-time handler silently
-       ;; accepts it, so eval2 of such a defstruct returned normally and the
+       ;; accepts it, so mvm-eval of such a defstruct returned normally and the
        ;; error tests failed.  Match the tree-walker: compile a runtime
-       ;; ERROR call instead.  Gated on *eval2-runtime-p* (native build
+       ;; ERROR call instead.  Gated on *mvm-eval-runtime-p* (native build
        ;; byte-identical).
-       (when (and *eval2-runtime-p*
+       (when (and *mvm-eval-runtime-p*
                   (consp (cadr form))
                   (let ((%has-type nil))
                     (dolist (%opt (cdr (cadr form)) %has-type)
@@ -4546,7 +4546,7 @@
       ;; (cl-conditions.lisp).  Same shape the build-time rewriter
       ;; (build-x64-linux.lisp) and the tree-walker (cl-eval.lisp) use,
       ;; so all three engines share one runtime implementation.  Before
-      ;; this case, eval2 compiled HANDLER-BIND as an ORDINARY CALL —
+      ;; this case, mvm-eval compiled HANDLER-BIND as an ORDINARY CALL —
       ;; the binding list was evaluated as a function call (usually
       ;; signalling) and the handlers never installed.
       ((= op-name 220644454587779307)   ; (compute-name-hash "HANDLER-BIND")
@@ -4559,7 +4559,7 @@
       ((= op-name 708734760566136331)   ; (compute-name-hash "%HANDLER-CASE-CATCH")
        (compile-handler-case (cadr form) (cddr form) env dest t))
       ;; RESTART-CASE — bytecode setjmp/longjmp (stays in the interpreter;
-      ;; does NOT route through the native %with-restarts bridge under eval2)
+      ;; does NOT route through the native %with-restarts bridge under mvm-eval)
       ((= op-name 791633373928082865)
        (compile-restart-case (cadr form) (cddr form) env dest))
       ;; IGNORE-ERRORS — compile body only
@@ -5084,7 +5084,7 @@
       ;; word W; the integer of magnitude W has native representation W<<1, so
       ;; %val->word = SHL 1 and %word->val = SHR 1.  Runtime is tag-driven, so
       ;; the shifted bits carry their own tag (fixnum/cons/object) — this is a
-      ;; pure reinterpret, no type guard.  (eval2 already does %word->val for
+      ;; pure reinterpret, no type guard.  (mvm-eval already does %word->val for
       ;; fixnums as (ash r -1); these generalize it to pointers.)
       ((= op-name (compute-name-hash "%VAL->WORD"))
        (compile-val-to-word (cdr form) env dest))
@@ -5451,7 +5451,7 @@
      (compile-character value dest))
     ((keywordp value)
      (compile-keyword value dest))
-    ;; eval2 (in-image runtime compile) ONLY: QUOTE returns ITS OBJECT.
+    ;; mvm-eval (in-image runtime compile) ONLY: QUOTE returns ITS OBJECT.
     ;; Register the original value in the global quote pool and emit one
     ;; LI-CONST — the interpreter loads the SAME object back, so symbol /
     ;; list / vector / string identity through (eval '...) matches the
@@ -5461,7 +5461,7 @@
     ;; they are identity-safe by construction.
     ;; WS5: static build (--compile) falls through to the STATIC constant
     ;; paths below (bake into the output module) — see *static-build-p*.
-    ((and *eval2-runtime-p* (not *static-build-p*))
+    ((and *mvm-eval-runtime-p* (not *static-build-p*))
      (emit-ir :li-const dest (%e2-const-register value)))
     ;; Non-keyword symbol: intern at runtime to produce a real symbol
     ;; object — tagged with its home package, the way the SBCL/CCL
@@ -5486,18 +5486,18 @@
             ;; runtime treats 0 as "leave slot 1 NIL".
             (pkg-hash (if pkg-name (compute-name-hash pkg-name) 0)))
        ;; emit-li-tagged (NOT raw :li): byte-identical in the native/host path
-       ;; (*mvm-emit-halves* NIL), but in the in-image eval2 path it emits
+       ;; (*mvm-emit-halves* NIL), but in the in-image mvm-eval path it emits
        ;; :li-halves so we never form (name-hash<<1) as one in-image integer.
        ;; A ~60-bit FNV name-hash<<1 routed through the raw :li -> mvm-emit-u64
-       ;; split (logand/ash of the formed word) corrupted the hash, so eval2's
+       ;; split (logand/ash of the formed word) corrupted the hash, so mvm-eval's
        ;; quoted symbols interned a junk #:|| (empty name, not eq) — WS4 oracle.
        (emit-li-tagged +vreg-v0+ (normalize-name value))
        (emit-li-tagged +vreg-v1+ pkg-hash)
-       ;; eval2 ONLY: the interp's runtime-call bridge pulls (mvm-nargs) args
+       ;; mvm-eval ONLY: the interp's runtime-call bridge pulls (mvm-nargs) args
        ;; from the register file, so this MANUAL call needs nargs set (the
        ;; normal compile-call path emits :set-nargs; native fixed-arg fns just
        ;; read V0/V1 and ignore nargs, so the native path is byte-identical
-       ;; without it).  Without this, eval2's quoted symbols interned with stale
+       ;; without it).  Without this, mvm-eval's quoted symbols interned with stale
        ;; nargs -> wrong args -> empty #:|| symbol (WS4 oracle).
        (when *mvm-emit-halves* (emit-ir :set-nargs 2))
        (emit-ir :call "%INTERN-SYMBOL-PKG" 2)
@@ -5597,7 +5597,7 @@
        ;; buffer small (like the runtime-pool build that boots) AND the string
        ;; is baked/correct (modus2-host proves :li-const strings work in a
        ;; static image).  Non-static builds keep char-by-char (the pool routing
-       ;; had CLOS regressions under eval2-runtime; see reference_constant_pool).
+       ;; had CLOS regressions under mvm-eval-runtime; see reference_constant_pool).
        (*static-build-p*
         ;; WS5 threshold probe: bake strings >= *ws5-str-bake-min* into the
         ;; serialized pool (correct, adds working-set DATA); route shorter ones
@@ -5725,7 +5725,7 @@
    %with-handler-bind CALL, never as HANDLER-BIND.
 
    Entries are built via %hb-handler-entry (a NATIVE 2-arg fn) rather
-   than an in-bytecode (list 'type fn): under eval2 the handler fn must
+   than an in-bytecode (list 'type fn): under mvm-eval the handler fn must
    pass as a DIRECT native-call argument so the interpreter's
    escaping-wrap makes it natively callable — consing a raw in-module
    closure into the list crashed %signal-condition's funcall silently
@@ -5751,7 +5751,7 @@
    by another clause.
 
    NLX TRANSPARENCY (probe 8502): when CATCH-FRAME-P is NIL (a real
-   user handler-case) AND this is a RUNTIME eval2 compile, the handler
+   user handler-case) AND this is a RUNTIME mvm-eval compile, the handler
    dispatch first checks whether a BLOCK/TAGBODY non-local exit is in
    flight (*catch-active* with an internal block tag in
    [700000001, 800000000) — see compile-block's
@@ -5856,7 +5856,7 @@
                ;; NLX in flight is NOT a condition — pass it through.
                ;; Inline (no runtime helper) so every build that compiles
                ;; handler-case works without extra runtime source.
-               ;; RUNTIME-COMPILE (eval2) ONLY: build-time first-party
+               ;; RUNTIME-COMPILE (mvm-eval) ONLY: build-time first-party
                ;; handler-cases include CONTROL MACHINERY that must see the
                ;; "throw" condition — most critically mvm-interpret's
                ;; per-opcode condition bridge, whose (error (c)) clause
@@ -5879,7 +5879,7 @@
                ;; passed the internal block-tag fixnum range (700M..800M),
                ;; so user/asdf symbol-tag throws were caught as errors.
                (nlx-guard
-                (if (or catch-frame-p (not *eval2-runtime-p*))
+                (if (or catch-frame-p (not *mvm-eval-runtime-p*))
                     nil
                     '(((if *catch-active* t nil)
                        (%hc-longjmp)))))
@@ -5927,10 +5927,10 @@
 ;;; body-fn); RETURNING from that native bridge back into the bytecode
 ;;; interpreter corrupts mvm-interpret's callee-saved loop state (the
 ;;; nested native handler-case's setjmp/RBX save-restore perturbs the
-;;; cached state/pc), so under eval2 a restart-case returns garbage even
+;;; cached state/pc), so under mvm-eval a restart-case returns garbage even
 ;;; on a plain NORMAL exit — independent of any longjmp.
 ;;;
-;;; To make eval2 correct we compile restart-case as a SPECIAL FORM whose
+;;; To make mvm-eval correct we compile restart-case as a SPECIAL FORM whose
 ;;; expansion establishes the restart frame via native %rc-* helpers and wraps
 ;;; the protected body in the compiler's own HANDLER-CASE special form for the
 ;;; catch.  handler-case compiles to an IN-BYTECODE setjmp (TRAP #x0510) — the
@@ -5949,7 +5949,7 @@
 ;;; compiler path — in NON-diff mode build-x64-linux.lisp still rewrites
 ;;; restart-case to (%with-restarts …) (the native run-ansi-* runners depend
 ;;; on it), and cl-eval.lisp's tree-walker calls %with-restarts directly.
-;;; Only the in-image compiler (eval2 / self-host) sees restart-case as a form
+;;; Only the in-image compiler (mvm-eval / self-host) sees restart-case as a form
 ;;; to compile, and this special form intercepts it before it can fall through
 ;;; to a bogus function call.
 (defun compile-restart-case (protected-form clauses env dest)
@@ -6059,7 +6059,7 @@
                       (cond ,@dispatch-clauses (t nil)))
                     ;; A real condition escaped the body — re-signal it so it
                     ;; propagates to the enclosing handler.  Re-signal
-                    ;; UNCONDITIONALLY: this expansion runs as EVAL2 BYTECODE,
+                    ;; UNCONDITIONALLY: this expansion runs as MVM-EVAL BYTECODE,
                     ;; where the old (%error-handler-active-p) guard read the
                     ;; interpreter's SIMULATED [#x10000180] (per-state memory
                     ;; hash, always 0) — it answered NIL even with real
@@ -6160,7 +6160,7 @@
     ;; `(setf a x b y)` boxed only `a`, leaving `b` captured BY VALUE in any
     ;; enclosing closure.  An unboxed captured var is copied by value into each
     ;; closure's env-list, so `b`'s mutation became invisible to sibling
-    ;; closures / initform thunks (the shared-initialize eval2 divergence;
+    ;; closures / initform thunks (the shared-initialize mvm-eval divergence;
     ;; the tree-walker uses real shared frames so it didn't manifest there).
     ;; Scan ALL places, and recurse into ALL value forms (and into non-symbol
     ;; places, which may contain nested mutating subforms).
@@ -6504,7 +6504,7 @@
    plus init forms for LET*): vars mutated INSIDE a closure (the classic
    case), UNION vars READ inside a closure and mutated ANYWHERE (the
    capture-then-outer-mutation case — see vars-read-in-lambdas).
-   The union half is GATED to in-image runtime compiles (*eval2-runtime-p*):
+   The union half is GATED to in-image runtime compiles (*mvm-eval-runtime-p*):
    applying it at build time boxed vars inside the in-image compiler's OWN
    source (compile-flet's LOCAL-NAMES/CELL-NAMES, %loop-parse-cond-clauses,
    %gf-dispatch-*), and the cell-rewrite of those shapes miscompiled —
@@ -6513,7 +6513,7 @@
    output stays byte-identical with the gate; the runtime-eval side (the
    asdf gauntlet's split-string PARSE-ERROR cluster) gets the fix."
   (let ((base (vars-mutated-in-lambdas scan-forms let-vars)))
-    (when *eval2-runtime-p*
+    (when *mvm-eval-runtime-p*
       (let ((mut (collect-setq-vars-in-body (cons 'progn scan-forms) let-vars)))
         (dolist (v (vars-read-in-lambdas scan-forms let-vars))
           (when (and (member v mut :test #'name-equal)
@@ -6528,7 +6528,7 @@
                     (t (format nil "~A" var)))))
     ;; Intern into MODUS.MVM when that package is resolvable (build-time
     ;; SBCL host), else fall back to *package* — which IS MODUS.MVM during
-    ;; a normal compile.  CRITICAL for self-hosted / in-image eval (eval2):
+    ;; a normal compile.  CRITICAL for self-hosted / in-image eval (mvm-eval):
     ;; there `(find-package "MODUS.MVM")` returns NIL (the package table
     ;; isn't populated in-image), so the old `(intern name :modus.mvm)`
     ;; returned NIL — the cell-rewrite then produced `(car NIL)` / `(set-car
@@ -6542,7 +6542,7 @@
 (defun %defstruct-intern (name)
   "Intern NAME for a DEFSTRUCT-generated symbol (constructor / accessor /
    setter / predicate names AND the synthetic P-<slot> constructor params).
-   Build-time SBCL resolves MODUS.MVM; in-image eval2 does NOT (the package
+   Build-time SBCL resolves MODUS.MVM; in-image mvm-eval does NOT (the package
    table isn't populated — `(find-package \"MODUS.MVM\")` is NIL), so the old
    hardcoded `(intern name :modus.mvm)` interned into NIL → returned NIL.  A
    NIL parameter symbol made the constructor a `(defun … (NIL NIL …))` whose
@@ -6753,7 +6753,7 @@
          ;; lists, etc. appear as DOTTED subforms of not-yet-expanded macro
          ;; forms.  The old `(mapcar … (cdr form))` signalled TYPE-ERROR
          ;; ("A is not of type LIST") on them — uiop's PACKAGE-DEPENDENCIES
-         ;; defun (closure cell + LOOP destructuring) crashed the eval2
+         ;; defun (closure cell + LOOP destructuring) crashed the mvm-eval
          ;; in-image compile, and the resulting mid-compile condition
          ;; silently aborted the whole toplevel LOAD form (the asdf
          ;; gauntlet's premature stop).  Walk conses manually, rewriting
@@ -7134,7 +7134,7 @@
    was compiled into DEST by compile-setq before the dispatch.  Moves it to V1
    and the name-hash to V0, then bridges SET-SYMBOL-VALUE.
 
-   Uses :mov (not :push/:pop) to stage V1: under eval2 the manual :push dest /
+   Uses :mov (not :push/:pop) to stage V1: under mvm-eval the manual :push dest /
    :li V0 / :pop V1 sequence wrote the value to V1 correctly but the global
    write still no-op'd — the runtime-bridge CALL needs V0/V1 set by plain :mov
    (the same shape compile-call's arg setup leaves them in) for SET-SYMBOL-VALUE
@@ -7146,8 +7146,8 @@
     ;; hash we load next).  If dest IS V1 the :mov is a self-move (harmless).
     (unless (= dest +vreg-v1+)
       (emit-ir :mov +vreg-v1+ dest))
-    (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (eval2 :li-halves)
-    (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; eval2 bridge nargs
+    (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
+    (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
     (emit-ir :call "SET-SYMBOL-VALUE" 2)
     (unless (= dest +vreg-vr+)
       (emit-ir :mov dest +vreg-vr+))))
@@ -7259,7 +7259,7 @@
         ;; SNAPSHOTTED the expansion's value at closure creation and made
         ;; setq write a dead local — wrong for plain symbol-macrolet code
         ;; and the blocker for %e2ic's nested-lambda-over-captured-cells
-        ;; fallback (eval2.lisp).  DO walk the expansion: if it references
+        ;; fallback (mvm-eval.lisp).  DO walk the expansion: if it references
         ;; a real outer local, THAT var still needs capturing.
         (let ((b (env-lookup env form)))
           (if (eq (binding-location b) :symbol-macro)
@@ -7419,7 +7419,7 @@
   "IN-IMAGE ONLY: a native MVM symbol stores its name hash in array slot 0.
    Extracted so the AREF sees an unrestricted (T) argument — inside
    %MLL-NAME-EQ, SBCL narrows SYM to SYMBOL via the surrounding SYMBOLP guard
-   and would flag AREF-of-symbol; host-side this path is dead (*eval2-runtime-p*
+   and would flag AREF-of-symbol; host-side this path is dead (*mvm-eval-runtime-p*
    is NIL there)."
   (aref sym 0))
 
@@ -7431,11 +7431,11 @@
    slot-0 hash — the [[reference_eval2_parity]] fix pattern (key by stored
    hash, not resolved name).  On the host (and whenever SYMBOL-NAME
    resolves) this is exactly NAME-EQ; the fallback arm references
-   image-only %NATIVE-SYM-P behind the *eval2-runtime-p* guard (same
+   image-only %NATIVE-SYM-P behind the *mvm-eval-runtime-p* guard (same
    precedent as %raw-macro-expander above)."
   (and (symbolp sym)
        (or (name-eq sym name-string)
-           (and *eval2-runtime-p*
+           (and *mvm-eval-runtime-p*
                 (%native-sym-p sym)
                 (eql (%native-sym-slot0-hash sym)
                      (compute-name-hash name-string))))))
@@ -7569,9 +7569,9 @@
    MACRO-style lambda lists (dotted tail, nested destructuring, &whole/
    &environment/&body — the defmacro-expander shapes) are rewritten to a
    plain (&rest …) + DESTRUCTURING-BIND form first (see
-   %transform-macro-lambda-list).  Gated on *eval2-runtime-p* so the
+   %transform-macro-lambda-list).  Gated on *mvm-eval-runtime-p* so the
    host/native build path is byte-identical."
-  (when (and *eval2-runtime-p* (%macro-lambda-list-p params))
+  (when (and *mvm-eval-runtime-p* (%macro-lambda-list-p params))
     (let ((tx (%transform-macro-lambda-list params body)))
       (return-from compile-lambda
         (compile-lambda (car tx) (cdr tx) env dest))))
@@ -7610,8 +7610,8 @@
           (setf (gethash (function-info-name info) *functions*) info)
           (push info *function-table*)
           (push result *pending-flet-ir*)
-          (if *eval2-runtime-p*
-              ;; eval2 (in-image runtime compile) ONLY: materialize even a
+          (if *mvm-eval-runtime-p*
+              ;; mvm-eval (in-image runtime compile) ONLY: materialize even a
               ;; CAPTURELESS lambda as a #x52 closure (env = NIL) instead of
               ;; the bare :li-func bytecode-offset fixnum.  A bare offset
               ;; VALUE is indistinguishable from ordinary integer DATA, so
@@ -7619,12 +7619,12 @@
               ;; same module shape were EQUAL — colliding in EQUAL-keyed
               ;; registries (documentation.function.t.5 returned an EARLIER
               ;; test's doc string), and (b) the value couldn't be safely
-              ;; wrapped at the eval2 return boundary (a data fixnum result
+              ;; wrapped at the mvm-eval return boundary (a data fixnum result
               ;; aliasing a lambda offset would wrap).  As a #x52 object the
               ;; value is unambiguous: compile-funcall's closure dispatch
               ;; handles it in-module, %mvm-wrap-escaping's #x52 branch wraps
               ;; it at the native bridge, and %mvm-wrap-escaping-result wraps
-              ;; it when returned from eval2.  Native builds keep the bare
+              ;; it when returned from mvm-eval.  Native builds keep the bare
               ;; fn-addr (byte-identical).
               (compile-make-closure (list 'function lambda-name) 'nil env dest)
               (emit-ir :li-func dest lambda-name)))
@@ -7808,7 +7808,7 @@
          ;; binder like `(o . a)` inside a not-yet-expanded LOOP form) —
          ;; the old (nreverse out) silently DROPPED it, so the pattern
          ;; `(option . arguments)` became `(option)` and the loop bound
-         ;; ARGUMENTS to nothing (uiop PACKAGE-DEPENDENCIES under eval2).
+         ;; ARGUMENTS to nothing (uiop PACKAGE-DEPENDENCIES under mvm-eval).
          (t
           (cons (if (consp op)
                     (%flet-rewrite-calls op local-names cell-names)
@@ -7902,7 +7902,7 @@
                                    (format nil "SETF-~A" (symbol-name (cadr name))))
                                   (t (format nil "~A" name))))
                  ;; In-image-safe package (same fallback as cell-var-name /
-                 ;; %defstruct-intern): under eval2 the package table has no
+                 ;; %defstruct-intern): under mvm-eval the package table has no
                  ;; MODUS.MVM, so the old hardcoded `:modus.mvm` made intern
                  ;; return NIL — EVERY capture-cell symbol was NIL, the let
                  ;; bound nothing, and the module's (set-car NIL closure)
@@ -9852,7 +9852,7 @@
    (done) ...)))` — routed the flet closure's `(return)` to the local
    function's *function-return-label* (a no-op that let the block fall
    through, or a wild function-return unwind that escaped uncatchably and
-   aborted the whole eval2 LOAD at asdf form 109 / compute-user-cache).
+   aborted the whole mvm-eval LOAD at asdf form 109 / compute-user-cache).
    RETURN-FROM already consulted *nonlocal-blocks*; RETURN (== return-from
    NIL) did not — this closes that asymmetry."
   (let ((block-entry (and *block-labels*
@@ -10169,9 +10169,9 @@
                           (+ 700000000 *nonlocal-block-tag-counter*)))
                ;; Cross-unit entry: survives the lambda boundary because
                ;; *nonlocal-blocks* is NOT reset by
-               ;; mvm-compile-function-internal.  IN-IMAGE (eval2): a
+               ;; mvm-compile-function-internal.  IN-IMAGE (mvm-eval): a
                ;; compiled/interpreted `let` of a SPECIAL does NOT reliably
-               ;; establish a dynamic binding (the documented eval2 limitation
+               ;; establish a dynamic binding (the documented mvm-eval limitation
                ;; — see *mvm-emit-halves* et al.), so the nested compile of a
                ;; RETURN-FROM/RETURN inside a lambda/flet body would NOT see
                ;; this entry and would fall through to the function-return
@@ -10321,8 +10321,8 @@
                     ((string= fn-name "EQUAL")  "%EQUAL-FN")
                     (t nil)))
              (resolved-name (or unique-name wrapper-name fn-name)))
-        ;; eval2 (in-image runtime compile) ONLY: #'NAME of an IN-MODULE
-        ;; function (a defun/flet compiled in THIS eval2 module) must not
+        ;; mvm-eval (in-image runtime compile) ONLY: #'NAME of an IN-MODULE
+        ;; function (a defun/flet compiled in THIS mvm-eval module) must not
         ;; escape as a bare bytecode-offset fixnum.  op-FN-ADDR stores the
         ;; raw offset; if the value then crosses the native bridge as a HOF
         ;; argument (uiop os-macosx-p's `(some #'featurep …)` — asdf gauntlet
@@ -10332,24 +10332,24 @@
         ;; silently abandoned.  Materialize it as a #x52 closure (env NIL)
         ;; instead, mirroring the captureless-lambda path above: in-module
         ;; funcall takes the closure fast path (slot-0 = offset), and the
-        ;; native bridge / eval2 result boundary wrap it into a re-entrant
+        ;; native bridge / mvm-eval result boundary wrap it into a re-entrant
         ;; trampoline via the lam-offsets :defun entries recorded by
-        ;; eval2-forms.  GATES: (symbolp name) keeps the internal
+        ;; mvm-eval-forms.  GATES: (symbolp name) keeps the internal
         ;; (function "NAME") string recursion from compile-make-closure on
         ;; the plain :li-func path (and skips (setf f) names), and
         ;; %e2-fn-in-module-p limits this to names already compiled into
         ;; this module (out-of-module #'CAR etc. keep the op-FN-ADDR native
         ;; object resolution; forward references keep the raw offset —
         ;; status quo).
-        (if (and *eval2-runtime-p*
+        (if (and *mvm-eval-runtime-p*
                  (symbolp name)
                  (%e2-fn-in-module-p resolved-name))
             (compile-make-closure (list 'function resolved-name) 'nil env dest)
             (emit-ir :li-func dest resolved-name)))))
 
 (defun %e2-fn-in-module-p (name)
-  "eval2 ONLY (see compile-function-ref): true if NAME (a string) names a
-   function already compiled into the CURRENT eval2 module — i.e. registered
+  "mvm-eval ONLY (see compile-function-ref): true if NAME (a string) names a
+   function already compiled into the CURRENT mvm-eval module — i.e. registered
    in the per-call *function-table* — OR the function whose body is being
    compiled RIGHT NOW (*current-function-name*): a SELF-reference like
    uiop featurep's `(some #'featurep (cdr x))` appears before the fn's own
@@ -10357,7 +10357,7 @@
    offset is 0 for the first module fn — natively funcalled as garbage:
    sometimes a silent abandon, sometimes a stale-register wrong value).
    Compares by STRING so mixed symbol/string function-info names both match.
-   The table is module-local in-image (eval2-forms binds it fresh per call),
+   The table is module-local in-image (mvm-eval-forms binds it fresh per call),
    so the scan is short."
   (if (and *current-function-name*
            (string= (string *current-function-name*) name))
@@ -10508,7 +10508,7 @@
           ;; block — CL blocks are transparent to multiple values; check the
           ;; body's last form.  Load-bearing for %e2ic: the tree-walker wraps
           ;; every FLET/LABELS local's body as ((block NAME . BODY)) (cl-eval
-          ;; flet), so a values-returning local compiled through the eval2
+          ;; flet), so a values-returning local compiled through the mvm-eval
           ;; interp-closure entry used to hit the set-mv-count-1 epilogue and
           ;; truncate to its primary value (probe F7).  Same imprecision
           ;; class as the IF branch handling below: a RETURN-FROM into the
@@ -10630,15 +10630,15 @@
    count/slots INLINE (a count-driven loop), instead of calling the %mv-to-list
    helper.
 
-   Why inline rather than (%mv-to-list ...): eval2 (compile->MVM-bytecode->
+   Why inline rather than (%mv-to-list ...): mvm-eval (compile->MVM-bytecode->
    interpret) resolves %mv-to-list as a RUNTIME-BRIDGE native call (target
    >= +mvm-runtime-call-base+), so the interp's op-CALL bridge runs the REAL
-   native %mv-to-list, which reads REAL memory at the MV slots — but eval2's
+   native %mv-to-list, which reads REAL memory at the MV slots — but mvm-eval's
    own (values ...) writes the interp's SIMULATED memory (op-store/op-load ->
    mvm-memory hash).  The bridged helper therefore never saw the count/values
-   eval2 wrote and returned only the primary; multiple-value-list / nth-value /
+   mvm-eval wrote and returned only the primary; multiple-value-list / nth-value /
    mod all collapsed to the single value.  Inlining the SAME loop %mv-to-list
-   uses keeps the slot reads in bytecode, so they hit eval2's simulated memory
+   uses keeps the slot reads in bytecode, so they hit mvm-eval's simulated memory
    (consistent with how compile-values writes and compile-multiple-value-bind
    reads).  Native compilation is unaffected: the inlined reads compile to the
    identical real-memory mem-refs %mv-to-list did.  The expansion is one loop
@@ -10794,7 +10794,7 @@
   (let ((fn-form (car args))
         (call-args (cdr args))
         (nargs (length (cdr args)))
-        ;; cap 12 (V5..V15): match compile-call.  Under eval2's flat regfile
+        ;; cap 12 (V5..V15): match compile-call.  Under mvm-eval's flat regfile
         ;; V9-V15 are shared across in-module CALLs, so high-pressure temps
         ;; must be saved here too; on native x64 V9-V15 are per-frame spills
         ;; (redundant push/pop, harmless).
@@ -10846,7 +10846,7 @@
       ;; with fewer args than the callee's required-param count would
       ;; otherwise leave the missing positional params reading STALE caller
       ;; register values (garbage).  When that garbage is a heap pointer the
-      ;; callee dereferences it and faults/escapes — the WS3 eval2 E2-UNSUP
+      ;; callee dereferences it and faults/escapes — the WS3 mvm-eval E2-UNSUP
       ;; cluster: `(funcall MAPC #'APPEND)` (1 arg, MAPC needs `fn list`) read
       ;; a stale V1 for `list`, sometimes NIL (returns cleanly), sometimes a
       ;; bad pointer (uncatchable escape).  Clearing V[reg-count..3] to NIL
@@ -10883,7 +10883,7 @@
       ;; works, sometimes it isn't and recovery fails.  An explicit
       ;; signal eliminates that fragility.
       (emit-ir :bnnull fn-call-reg good-fn-label)
-      ;; eval2 bridge: manual :call MUST set nargs or the interp's runtime
+      ;; mvm-eval bridge: manual :call MUST set nargs or the interp's runtime
       ;; bridge pulls a STALE count and collects garbage args (see the
       ;; SYMBOL-VALUE sites).  Native fixed-arg fns ignore nargs, so the
       ;; native build is byte-identical without it.
@@ -10930,10 +10930,10 @@
       (emit-ir :push +vreg-v2+)
       (emit-ir :push +vreg-v3+)
       (emit-ir :mov +vreg-v0+ fn-call-reg)
-      ;; eval2 bridge nargs (see NIL-guard above): with a STALE nargs=0 the
+      ;; mvm-eval bridge nargs (see NIL-guard above): with a STALE nargs=0 the
       ;; bridge called %NATIVE-SYM-RESOLVE with NO args -> (aref NIL 0)
       ;; hardware fault -> SIGSEGV-handler longjmp to a stale native frame
-      ;; -> every eval2 (funcall 'SYM ...) silently unwound to the next
+      ;; -> every mvm-eval (funcall 'SYM ...) silently unwound to the next
       ;; toplevel form (the asdf-gauntlet form-43 detect-os escape).
       (when *mvm-emit-halves* (emit-ir :set-nargs 1))
       (emit-ir :call "%NATIVE-SYM-RESOLVE" 1)
@@ -11225,7 +11225,7 @@
          (rest-forms (cdr args)) ; arg1 … argN spread
          (leading (butlast rest-forms))
          (spread-form (car (last rest-forms)))
-         ;; cap 12 (V5..V15): match compile-call for eval2 flat-regfile safety.
+         ;; cap 12 (V5..V15): match compile-call for mvm-eval flat-regfile safety.
          (save-count (min *temp-reg-counter* 12))
          (fn-reg (alloc-temp-reg))
          (list-reg (alloc-temp-reg))
@@ -11257,7 +11257,7 @@
     ;; --- Closure/symbol dispatch (mirrors compile-funcall) ---
     ;; NIL-funcall guard.
     (emit-ir :bnnull fn-reg good-fn-label)
-    ;; eval2 bridge nargs — see compile-funcall's NIL-guard.
+    ;; mvm-eval bridge nargs — see compile-funcall's NIL-guard.
     (when *mvm-emit-halves* (emit-ir :set-nargs 0))
     (emit-ir :call "%SIGNAL-UNDEFINED-FUNCTION" 0)
     (emit-ir-label good-fn-label)
@@ -11279,7 +11279,7 @@
     ;; %NATIVE-SYM-RESOLVE clobbers V0.
     (emit-ir :push list-reg)
     (emit-ir :mov +vreg-v0+ fn-reg)
-    ;; eval2 bridge nargs — see compile-funcall's resolver call.
+    ;; mvm-eval bridge nargs — see compile-funcall's resolver call.
     (when *mvm-emit-halves* (emit-ir :set-nargs 1))
     (emit-ir :call "%NATIVE-SYM-RESOLVE" 1)
     (emit-ir :mov fn-reg +vreg-vr+)
@@ -11367,7 +11367,7 @@
          ;; subtract them when computing the live range — the caller's
          ;; live count is (counter - 2).
          (caller-live (max 0 (- *temp-reg-counter* 2)))
-         ;; cap 12 (V5..V15): match compile-call for eval2 flat-regfile safety.
+         ;; cap 12 (V5..V15): match compile-call for mvm-eval flat-regfile safety.
          (save-count  (min caller-live 12)))
     (emit-ir :or   tag-temp dest temp)
     (emit-ir :li   one-temp 1)
@@ -11421,7 +11421,7 @@
     (free-temp-reg)))
 
 (defun %compile-arith-arg-step-e2 (arg env dest fast-op generic-name)
-  "eval2 (WS3 flip) pairwise-arith step that does NOT hold a temp register
+  "mvm-eval (WS3 flip) pairwise-arith step that does NOT hold a temp register
    across the recursive operand compile.  The build-time scheme allocates
    the temp BEFORE compiling ARG, so a right-nested chain
    (+ g100 (+ g99 (+ … 0))) — the eval'd let.14 / let*.14 shape — holds one
@@ -11430,7 +11430,7 @@
    into DEST itself (temp count unchanged during the recursion), and the
    temp lives only for the straight-line pair emission — the same stack
    discipline compile-cons has always used for deep nesting.  Used
-   unconditionally under eval2 (*eval2-runtime-p*), and at build time
+   unconditionally under mvm-eval (*mvm-eval-runtime-p*), and at build time
    as the overflow fallback when the temp budget is nearly exhausted
    (see %temps-must-spill-p)."
   (emit-ir :push dest)
@@ -11480,7 +11480,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '+ arg)
-       (if (or *eval2-runtime-p* (%temps-must-spill-p))
+       (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
            (let ((temp (alloc-temp-reg))
@@ -11512,7 +11512,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '- arg)
-       (if (or *eval2-runtime-p* (%temps-must-spill-p))
+       (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT"))
            (let ((temp (alloc-temp-reg))
@@ -11543,7 +11543,7 @@
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
        (check-arith-nesting '* arg)
-       (if (or *eval2-runtime-p* (%temps-must-spill-p))
+       (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
            (let ((*arith-push-depth* (1+ *arith-push-depth*)))
              (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
            (let ((temp (alloc-temp-reg))
@@ -12162,7 +12162,7 @@
     ;; longjmps when a handler-case is active; otherwise it returns
     ;; NIL and we fall through to done with dest = NIL.
     (emit-ir-label error-label)
-    ;; eval2 bridge nargs — see compile-funcall's NIL-guard.
+    ;; mvm-eval bridge nargs — see compile-funcall's NIL-guard.
     (when *mvm-emit-halves* (emit-ir :set-nargs 0))
     (emit-ir :call "%SIGNAL-TYPE-ERROR" 0)
     (emit-ir :mov dest +vreg-vr+)
@@ -12331,7 +12331,7 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logand arg)
-         (if (or *eval2-runtime-p* (%temps-must-spill-p))
+         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
              (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND"))
              (let ((temp (alloc-temp-reg))
@@ -12359,7 +12359,7 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logior arg)
-         (if (or *eval2-runtime-p* (%temps-must-spill-p))
+         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
              (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR"))
              (let ((temp (alloc-temp-reg))
@@ -12383,7 +12383,7 @@
        (compile-form (car flat-args) env dest)
        (dolist (arg (cdr flat-args))
          (check-arith-nesting 'logxor arg)
-         (if (or *eval2-runtime-p* (%temps-must-spill-p))
+         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
              (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR"))
              (let ((temp (alloc-temp-reg))
@@ -14220,7 +14220,7 @@
         ;; a live caller value held there.  So the save range MUST extend
         ;; through V15, not stop at V8, or high-register-pressure functions
         ;; (e.g. chipz's copy-match, which holds a live index/value in a spill
-        ;; reg across the inner aref/aset helper calls) mis-execute under eval2
+        ;; reg across the inner aref/aset helper calls) mis-execute under mvm-eval
         ;; — the "big gunzip mis-decode" that vanished when an extra FORMAT
         ;; shifted allocation off the spill range.  Cap at 12 = V4..V15.
         ;; (V4 = RBX is callee-saved — skipped below — via the native
@@ -14474,7 +14474,7 @@
        (let* ((kw-rest (intern (format nil "%KW-REST-~D"
                                         (incf *kw-rest-counter*))
                                ;; (or (find-package "MODUS.MVM") *package*), NOT
-                               ;; the hardcoded :modus.mvm keyword: in eval2
+                               ;; the hardcoded :modus.mvm keyword: in mvm-eval
                                ;; (in-image self-host) the package table has no
                                ;; MODUS.MVM, so `(intern name :modus.mvm)`
                                ;; interned into a NIL package and returned NIL.
@@ -14728,7 +14728,7 @@
     ;; a defensive branch (the body itself never executes because the
     ;; longjmp unwinds the frame, but the branch keeps the no-handler
     ;; case from running the body on the wrong number of args).
-    ;; eval2 bridge nargs — see compile-funcall's NIL-guard.
+    ;; mvm-eval bridge nargs — see compile-funcall's NIL-guard.
     (when *mvm-emit-halves* (emit-ir :set-nargs 0))
     (emit-ir :call "%SIGNAL-PROGRAM-ERROR" 0)
     (emit-ir :mov +vreg-vr+ +vreg-vn+)
@@ -15518,7 +15518,7 @@
            ;; the same way).
            (let* ((fn-name (third insn))
                   (fn-info (gethash fn-name *functions*)))
-             (unless (or fn-info *eval2-runtime-p*)
+             (unless (or fn-info *mvm-eval-runtime-p*)
                (format *error-output*
                        ";; WARN li-func: unresolved function ~A — emitting NIL sentinel~%"
                        fn-name))
@@ -15772,12 +15772,12 @@
                             (string= (symbol-name (car raw-name)) "SETF"))
                        (format nil "SETF-~A" (symbol-name (cadr raw-name)))
                        raw-name)))
-         ;; In-image eval2: record this toplevel-context defun NAME for the
+         ;; In-image mvm-eval: record this toplevel-context defun NAME for the
          ;; trampoline-install (persistence) loop.  This handler runs POST-
          ;; macroexpansion, so macro-hidden defuns (with-upgradability →
          ;; eval-when → defun) are caught — the raw-forms pre-scan in
-         ;; eval2-forms can't see those.  See *e2-persist-defuns*.
-         (when *eval2-runtime-p*
+         ;; mvm-eval-forms can't see those.  See *e2-persist-defuns*.
+         (when *mvm-eval-runtime-p*
            (setq *e2-persist-defuns*
                  (cons (if (symbolp name) (%rt-fn-name name) (string name))
                        *e2-persist-defuns*)))
@@ -15821,15 +15821,15 @@
             ;; *x* to NIL (CLHS); `(defvar *x*)` supplies none.  The old
             ;; `(when value …)` skipped a NIL initform → the var stayed
             ;; UNBOUND (asdf form 87 *image-dumped-p*; any `(defvar *x* nil)`
-            ;; then a read of *x* under eval2 signalled UNBOUND-VARIABLE).
-            ;; ONLY emit the extra NIL-init thunk under eval2 (in-image
+            ;; then a read of *x* under mvm-eval signalled UNBOUND-VARIABLE).
+            ;; ONLY emit the extra NIL-init thunk under mvm-eval (in-image
             ;; runtime compile): at BUILD time init-thunks are not run
             ;; (CLAUDE.md limitation #7), and generating one per every
             ;; `(defvar *x* nil)` across the whole codebase perturbs the
             ;; build layout — so keep the historical build-time behaviour
             ;; (skip NIL) and only fix the runtime path that actually reads
             ;; the value back.
-            (has-initform (if *eval2-runtime-p* (consp (cddr form)) value))
+            (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
@@ -15854,8 +15854,8 @@
      (let* ((name (cadr form))
             (value (caddr form))
             ;; defparameter always has an initform (CLHS requires it); under
-            ;; eval2 bind even a NIL initform (same rationale as DEFVAR).
-            (has-initform (if *eval2-runtime-p* (consp (cddr form)) value))
+            ;; mvm-eval bind even a NIL initform (same rationale as DEFVAR).
+            (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
@@ -15870,8 +15870,8 @@
                      (set-symbol-value ,name-hash ,tmp-var))))))))
 
     ;; (defpackage ...) — at BUILD time the package system is SBCL-side only,
-    ;; so skip (byte-identical host build).  Under eval2 a runtime DEFPACKAGE
-    ;; macro (register-mvm-bootstrap-macros, gated on *eval2-runtime-p*)
+    ;; so skip (byte-identical host build).  Under mvm-eval a runtime DEFPACKAGE
+    ;; macro (register-mvm-bootstrap-macros, gated on *mvm-eval-runtime-p*)
     ;; expands this to %defpackage-impl before it ever reaches this clause, so
     ;; this remains a pure build-time no-op.
     ((and (consp form) (name-eq (car form) "DEFPACKAGE"))
@@ -15927,7 +15927,7 @@
            ;; WS5 SELF-HOST FIX: constant-folding via *constants* only happens
            ;; at THIS (build) time.  In a STATIC self-host build the produced
            ;; binary's runtime *constants* table is empty, so any form the
-           ;; product compiles via eval2 that references a compiler defconstant
+           ;; product compiles via mvm-eval that references a compiler defconstant
            ;; (+max-reg-args+, +vreg-v0+, …) resolves it as a VARIABLE reference
            ;; → symbol-value → UNBOUND → garbage (the infinite :stack-store loop
            ;; at mvm-compile-function-internal `loop … below +max-reg-args+`).
@@ -16105,21 +16105,21 @@
                                   (setf args (cddr args))))
                        `(,internal-ctor-sym ,@positional)))))
              (mvm-define-macro ctor-name %ctor-expander)
-             ;; eval2 (in-image runtime compile) PERSISTENCE: *macro-table* is
-             ;; rebound PER eval2 CALL, so without a runtime registration a
+             ;; mvm-eval (in-image runtime compile) PERSISTENCE: *macro-table* is
+             ;; rebound PER mvm-eval CALL, so without a runtime registration a
              ;; LATER (eval '(make-NAME …)) compiled the ctor as an undefined
              ;; function — `(eval '(defstruct S …))` "worked" but every
              ;; cross-call use of MAKE-S died (probe 8183: the arg-evaluation
              ;; error killed run-regression-tests' remaining 141 probes once
-             ;; the probe suite ran under production eval2).  The generated
+             ;; the probe suite ran under production mvm-eval).  The generated
              ;; slot-accessor/copier/predicate DEFUNs already persist via the
              ;; toplevel-DEFUN handler's *e2-persist-defuns* recording; the
              ;; keyword-ctor MACRO was the only piece left per-call.  Register
              ;; the same expander in the runtime macro table — macroexpand-1-
-             ;; mvm's *eval2-runtime-p* fallback calls it as (funcall mf form).
-             ;; Build-time (*eval2-runtime-p* NIL) never takes this branch, so
+             ;; mvm's *mvm-eval-runtime-p* fallback calls it as (funcall mf form).
+             ;; Build-time (*mvm-eval-runtime-p* NIL) never takes this branch, so
              ;; host/native builds are unchanged.
-             (when *eval2-runtime-p*
+             (when *mvm-eval-runtime-p*
                (set-macro-function (%defstruct-intern ctor-name)
                                    %ctor-expander)
                ;; Also register the struct type so cross-call TYPEP /
@@ -16166,7 +16166,7 @@
                                       (setf cargs (cddr cargs)))
                              `(,ics ,@positional)))))
                   (mvm-define-macro ctor-fn-name expander)
-                  (when *eval2-runtime-p*
+                  (when *mvm-eval-runtime-p*
                     (set-macro-function (%defstruct-intern ctor-fn-name) expander))))
                ;; (:CONSTRUCTOR foo (slot1 slot2 ...)) — BOA lambda-list.
                ;; The lambda-list variables ARE slot names (CLHS 3.4.6).  We
@@ -16325,9 +16325,9 @@
                     ;; acc) v x)` compile to a call of "SETF-<ACC>" — before
                     ;; this only the SET-<ACC> defun + the *macro-table*
                     ;; alias existed, so the function reference was
-                    ;; UNDEFINED-FUNCTION (same- AND cross-call under eval2;
+                    ;; UNDEFINED-FUNCTION (same- AND cross-call under mvm-eval;
                     ;; item-3 probes 311/312).  A defun persists across
-                    ;; eval2 calls via *e2-persist-defuns*, closing the
+                    ;; mvm-eval calls via *e2-persist-defuns*, closing the
                     ;; cross-call side for free.
                     (push `(defun (setf ,(%defstruct-intern acc-name)) (val obj)
                              (aset obj ,(+ 2 i) val)
@@ -16359,12 +16359,12 @@
        ;; The direct-type check is INLINED in bytecode (an object array whose
        ;; slot-0 is the '%struct-instance marker and slot-1 is EQ to NAME)
        ;; rather than delegating to the native %struct-instance-named-p.  Under
-       ;; eval2 the predicate body runs as bytecode while the native helper is
+       ;; mvm-eval the predicate body runs as bytecode while the native helper is
        ;; reached through the runtime bridge — across that boundary the helper's
        ;; own `'%struct-instance` marker / NAME literals are NOT eq to the ones
-       ;; the eval2 constructor stored (they were interned in different
+       ;; the mvm-eval constructor stored (they were interned in different
        ;; contexts), so the native helper returned NIL for a perfectly valid
-       ;; eval2 struct.  Inlining keeps the whole comparison in one bytecode
+       ;; mvm-eval struct.  Inlining keeps the whole comparison in one bytecode
        ;; module where symbol identity holds (probe: `(eq (aref s 1) 'NAME)` is
        ;; T).  The AOT/native image runs the SAME inlined bytecode, so the
        ;; comparison is symbol-eq there too — no behavior change.  The native

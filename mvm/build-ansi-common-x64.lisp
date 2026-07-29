@@ -6,7 +6,7 @@
 ;;;;   build-x64.lisp        (t)   — bare-metal multiboot kernel (QEMU)
 ;;;;
 ;;;; This file holds everything the two share: load the MVM system, read the
-;;;; first-party + eval2 sources, all the build-time transforms (chunking,
+;;;; first-party + mvm-eval sources, all the build-time transforms (chunking,
 ;;;; SFT / runtime-macro / sym-name auto-generation), and load the ANSI test
 ;;;; corpus into *real-ansi-sources* / *ansi-file-names*.  Each wrapper then
 ;;;; appends its OWN target-specific runner-source assembly (bare-metal PIT
@@ -84,7 +84,7 @@
     (string #\Newline)
     (mvm-text "mvm/ansi-bridge.lisp")))
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
-;; image — production eval is eval2 only.  The full-corpus + gauntlet census
+;; image — production eval is mvm-eval only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback
 ;; inventory" was the :li-func offset-0 phantom, fixed in a07fe7d), and the
 ;; walker-free image gates clean (16335-16336 / CHUNK-CRASH=0 / FILE-WEDGE=30,
@@ -93,17 +93,17 @@
 ;; a new shape it signals honestly (UNDEFINED-FUNCTION via the NIL fn sentinel).
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
-;;; --- WS3: self-host the MVM compiler in the image (eval2 foundation) ---
+;;; --- WS3: self-host the MVM compiler in the image (mvm-eval foundation) ---
 ;;; Replicates build-generic.lisp's STAGE-1 (ISA + bytecode interpreter) and
-;;; STAGE-2 (compiler + in-image float-bit override + opcode table + eval2)
+;;; STAGE-2 (compiler + in-image float-bit override + opcode table + mvm-eval)
 ;;; source blocks so the ANSI image can compile-and-interpret a form at
-;;; runtime.  At this stage eval2 is DEAD CODE (nothing routes to it); the
+;;; runtime.  At this stage mvm-eval is DEAD CODE (nothing routes to it); the
 ;;; 32-shard gate must stay unchanged.  Order matters: loaded AFTER
 ;;; *bridge-source* (needs %prim-aref, the CL runtime) — see *full-source*.
 (defvar *isa-source*      (mvm-text "mvm/mvm.lisp"))      ; opcode/vreg constants + structs
 (defvar *interp-source*   (mvm-text "mvm/interp.lisp"))   ; mvm-interpret (bytecode executor)
 (defvar *compiler-image-source* (mvm-text "mvm/compiler.lisp")) ; the 3-phase MVM compiler
-(defvar *eval2-source*    (mvm-text "mvm/eval2.lisp"))    ; eval2-forms / eval2
+(defvar *mvm-eval-source*    (mvm-text "mvm/mvm-eval.lisp"))    ; mvm-eval-forms / mvm-eval
 ;;; --- WS4 STAGE 1: bake the x64 native translator into the image ---
 ;;; Adds mvm/x64-asm.lisp (instruction encoder, package modus.asm) and
 ;;; mvm/translate-x64.lisp (MVM-bytecode→x86-64 translator, package
@@ -233,13 +233,13 @@
 (defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
 (defun %lit-bb-limb (value k) (%bb-limb value k))
 ;; In-image override of %GLOBAL-NAME-KEY (the SYMBOL-VALUE / SET-SYMBOL-VALUE
-;; alist key the eval2 compiler emits for a GLOBAL variable read/write).  The
+;; alist key the mvm-eval compiler emits for a GLOBAL variable read/write).  The
 ;; host/native version is NORMALIZE-NAME = compute-name-hash(symbol-name sym).
 ;; In the image, symbol-name reverse-resolves a native #x50/#x53 sym via the
 ;; build-generated *sym-name-table*, which only covers SCANNED sources.  A
 ;; symbol from an UNSCANNED ANSI test dir (e.g. *cons-test-4* from cons/cxr.lsp)
 ;; has no reverse entry, so symbol-name returns \"\" and compute-name-hash(\"\")
-;; is a CONSTANT wrong key — eval2's global read then missed the store (keyed
+;; is a CONSTANT wrong key — mvm-eval's global read then missed the store (keyed
 ;; by the symbol's REAL reader/setq-assigned hash) and returned NIL, so the cxr
 ;; tests cons.38-53 signalled inside CAAAAR..CDDDDR (E2-UNSUP) where the tree-
 ;; walker (which keys symbol-value by the symbol's stored hash slot) returned
@@ -283,7 +283,7 @@
     *compiler-image-source* (string #\Newline)
     *stage2-float-override* (string #\Newline)
     *opcode-table-init-source* (string #\Newline)
-    *eval2-source*    (string #\Newline)
+    *mvm-eval-source*    (string #\Newline)
     ;; WS4 STAGE 1: x64 instruction encoder + MVM→x64 translator + co-init.
     ;; Loaded AFTER the compiler (translate-x64 uses modus.mvm compiler
     ;; symbols like decode-instruction and the opcode constants) and the
@@ -415,10 +415,10 @@
    constants live in :modus.mvm.  Under a :cl-user read, the first #.
    hit an unbound +OP-NOP+, the read errored, and the
    `(error () (return))` ABORTED THE WHOLE SCAN — so everything
-   concatenated after interp.lisp (compiler.lisp, eval2.lisp) silently
+   concatenated after interp.lisp (compiler.lisp, mvm-eval.lisp) silently
    contributed NO names.  Compiler-backquote literals like
    %SETF-MEM-REF then had no *sym-name-table* entry, in-image
-   SYMBOL-NAME returned \"\" for them, and eval2's compile of any
+   SYMBOL-NAME returned \"\" for them, and mvm-eval's compile of any
    (setf (mem-ref …) …) — i.e. any (values …) form — mis-dispatched
    into an unresolvable call (the WS3 flip MV-cluster hang).
    All other sources keep the historical default-package read."
@@ -586,9 +586,9 @@
 ;; Builds the %init-sym-name-auto source from EXTRA-SOURCES (a list of source
 ;; strings to scan in addition to the always-scanned first-party + ANSI-test
 ;; symbols).  Factored into a function so it can be called AFTER *driver-source*
-;; is defined — the driver carries quoted symbol literals (e.g. the eval2
+;; is defined — the driver carries quoted symbol literals (e.g. the mvm-eval
 ;; self-check's `(defun sq …)`) whose names SYMBOL-NAME must be able to recover;
-;; without scanning the driver those symbols reverse-map to "" and eval2's
+;; without scanning the driver those symbols reverse-map to "" and mvm-eval's
 ;; defun-registration keys every such function under the empty string → name
 ;; collision → in-module cross-call resolves to the wrong (last) function →
 ;; infinite self-recursion.  (Reader-interned symbols already work via the
@@ -1771,10 +1771,10 @@
                  (declare (ignorable ,@(mapcar #'car bindings)))
                  ,db-form))))))
 
-;; Forward declaration: *eval2-diff-mode* is defined (from MODUS_EVAL2_DIFF)
+;; Forward declaration: *mvm-eval-diff-mode* is defined (from MODUS_MVM_EVAL_DIFF)
 ;; further down, but rewrite-reader-forms references it to gate the RESTART-CASE
 ;; rewrite (raw special form in diff mode; %with-restarts otherwise).
-(defvar *eval2-diff-mode*)
+(defvar *mvm-eval-diff-mode*)
 
 (defun rewrite-reader-forms (form)
   "Walk form tree, rewriting reader-related forms for MVM."
@@ -2344,8 +2344,8 @@
     ;; the elementwise default below.  The tree-walker keeps its own
     ;; HANDLER-BIND branch for runtime-eval'd forms.
     ;; (restart-case form &rest clauses)
-    ;; DIFF MODE (eval2 gate): leave RESTART-CASE RAW (only rewrite subforms)
-    ;; so eval2 compiles it via the compile-restart-case SPECIAL FORM, keeping
+    ;; DIFF MODE (mvm-eval gate): leave RESTART-CASE RAW (only rewrite subforms)
+    ;; so mvm-eval compiles it via the compile-restart-case SPECIAL FORM, keeping
     ;; it IN BYTECODE instead of routing through the native %with-restarts
     ;; bridge (which corrupts mvm-interpret's loop state on return).  The
     ;; tree-walker (cl-eval.lisp) handles raw restart-case too, so the diff
@@ -2354,7 +2354,7 @@
     ;; (%with-restarts …) — the native run-ansi-* runners rely on it and the
     ;; existing restart-case tests pass through it; not touching that path
     ;; keeps the native ANSI gate byte-for-byte unchanged.
-    ((and (eq (car form) 'restart-case) (cdr form) *eval2-diff-mode*)
+    ((and (eq (car form) 'restart-case) (cdr form) *mvm-eval-diff-mode*)
      (let* ((protected-form (rewrite-reader-forms (cadr form)))
             (clauses (cddr form))
             (new-clauses
@@ -3358,19 +3358,19 @@
 ;; so init-forms in unrelated files don't run (many crash the parent).
 (defvar *ansi-file-ranges* nil)
 
-;;; --- WS3 Phase 1: differential gate (eval vs eval2) ---
-;; MODUS_EVAL2_DIFF=1 → ALSO emit, per test, an (id . actual-form) capture into
-;; a separate *e2diff-sources* block and run the tree-walker-vs-eval2 differential
+;;; --- WS3 Phase 1: differential gate (eval vs mvm-eval) ---
+;; MODUS_MVM_EVAL_DIFF=1 → ALSO emit, per test, an (id . actual-form) capture into
+;; a separate *e2diff-sources* block and run the tree-walker-vs-mvm-eval differential
 ;; gate (run-real-e2diff) INSTEAD of the normal run-real-ansi-tests.  When the
 ;; flag is unset the whole block below is dead/empty and the produced binary is
 ;; byte-identical to a normal build (verified flag-off).
-(defvar *eval2-diff-mode*
-  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_EVAL2_DIFF") #-sbcl nil))
+(defvar *mvm-eval-diff-mode*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_MVM_EVAL_DIFF") #-sbcl nil))
     (and v (plusp (length v)) (not (string= v "0")))))
 ;; WS3 Phase 3 (tree-walker retired as a production evaluator): production
-;; EVAL/LOAD go straight to eval2 unconditionally (cl-eval.lisp EVAL = (eval2
-;; form)); there is no longer a *use-eval2* flag or a tree-walker rollback path.
-;; The diagnostic probe suite (run-all-tests) runs under eval2 like everything
+;; EVAL/LOAD go straight to mvm-eval unconditionally (cl-eval.lisp EVAL = (mvm-eval
+;; form)); there is no longer a *use-mvm-eval* flag or a tree-walker rollback path.
+;; The diagnostic probe suite (run-all-tests) runs under mvm-eval like everything
 ;; else — measured to complete in ~1s (the old ~50x-slower premise was closed by
 ;; the 194bbfb/8953c39/c4d9403/3281efe perf fixes).
 ;; WS3 flip gate (retained for corpus/probe de-confounding): MODUS_FLIP_SKIP_PROBES
@@ -3736,7 +3736,7 @@
                        ;; Same unreadable-object filters as test-str — a form
                        ;; that prints #<FUNCTION ...> can't round-trip through
                        ;; the in-image reader so it's not capturable.
-                       (when *eval2-diff-mode*
+                       (when *mvm-eval-diff-mode*
                          (let ((e2form-str
                                 (handler-case
                                   (let ((cooked
@@ -3991,7 +3991,7 @@
                 ;; and overflowing the fixed 128MB MVM bytecode buffer.  (The
                 ;; companion run-real-ansi-tests dispatcher is likewise skipped
                 ;; below; the driver calls run-real-e2diff instead.)
-                (unless *eval2-diff-mode*
+                (unless *mvm-eval-diff-mode*
                 (let ((chunk-size 8)
                       (forms (nreverse test-forms))
                       (chunk-num 0)
@@ -4055,8 +4055,8 @@
                 ;; (%e2diff ID '(actual)) for every captured test.  Chunked +
                 ;; %try-chunk-wrapped like the normal run (huge files blow MVM
                 ;; codegen otherwise / a chunk-prologue crash mustn't lose the
-                ;; whole file).  Only emitted under MODUS_EVAL2_DIFF.
-                (when *eval2-diff-mode*
+                ;; whole file).  Only emitted under MODUS_MVM_EVAL_DIFF.
+                (when *mvm-eval-diff-mode*
                   (let ((e2out (make-string-output-stream))
                         (e2forms (nreverse *e2diff-forms*))  ; (id . form-str)
                         (e2chunk-size 8)

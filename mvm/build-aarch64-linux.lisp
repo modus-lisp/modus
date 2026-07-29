@@ -1,8 +1,8 @@
 ;;;; build-aarch64-linux.lisp — Build ANSI CL test runner (Linux AArch64)
 ;;;;
 ;;;; Re-fork of build-x64-linux.lisp (2026-07-09) carrying the WS3
-;;;; production-eval2 stack (in-image mvm.lisp ISA + interp.lisp +
-;;;; compiler.lisp + eval2.lisp; tree-walker dropped).  The AArch64-Linux
+;;;; production-mvm-eval stack (in-image mvm.lisp ISA + interp.lisp +
+;;;; compiler.lisp + mvm-eval.lisp; tree-walker dropped).  The AArch64-Linux
 ;;;; delta vs the x64 sibling (see the original fork commit a3142d9):
 ;;;;   - boot/boot-linux-aarch64.lisp descriptor + install-aarch64-translator
 ;;;;     (:target :linux-aarch64), *aarch64-stack-align-16*,
@@ -366,14 +366,14 @@
                    ;; WS3 P1 differential-gate runtime helpers — only under the
                    ;; flag, so flag-off *real-ansi-sources* (and thus the binary)
                    ;; is byte-identical to baseline.  These call eval (tree-walker)
-                   ;; and eval2 (interpreter) and emit the inventory markers.
-                   (if *eval2-diff-mode*
+                   ;; and mvm-eval (interpreter) and emit the inventory markers.
+                   (if *mvm-eval-diff-mode*
                        (format nil "~
-                     ~%;; ===== WS3 Phase 1: differential gate (eval vs eval2) =====~
+                     ~%;; ===== WS3 Phase 1: differential gate (eval vs mvm-eval) =====~
                      ~%(defvar *e2-tw-threw* (list :tw-threw))~
                      ~%(defvar *e2-e2-threw* (list :e2-threw))~
                      ~%;; Structural compare TOLERANT of cross-evaluator symbol~
-                     ~%;; identity: eval and eval2 re-intern result symbols in~
+                     ~%;; identity: eval and mvm-eval re-intern result symbols in~
                      ~%;; different table slots, so a raw EQL on `(A . B)` reports~
                      ~%;; a FALSE divergence even when both trees are identical.~
                      ~%;; So: symbols compared by SYMBOL-NAME, numbers by EQL,~
@@ -394,7 +394,7 @@
                      ~%    ;; SAME cross-evaluator symbol-name tolerance the cons case uses.~
                      ~%    ;; rt-equal compares vector elements with EQL, which is a FALSE~
                      ~%    ;; divergence for symbol elements (eval re-interns result symbols~
-                     ~%    ;; in a different table slot than eval2) — e.g. nsubstitute-vector~
+                     ~%    ;; in a different table slot than mvm-eval) — e.g. nsubstitute-vector~
                      ~%    ;; returning #(B B B C): identical PRINT, eql-distinct symbols.~
                      ~%    ((and (vectorp a) (vectorp b)~
                      ~%          (not (stringp a)) (not (stringp b)))~
@@ -410,8 +410,8 @@
                      ~%  (setq *write-object-budget* 60)~
                      ~%  (handler-case (write-object v) (t (c) (write-string-serial \"?\"))))~
                      ~%;; Run FORM through BOTH evaluators; classify; one line out.~
-                     ~%;; E2-UNSUP=eval2 signalled.  TW-THREW (tree-walker errored)~
-                     ~%;; is SKIPPED (not an eval2 gap).  E2-DIVERGE=both returned~
+                     ~%;; E2-UNSUP=mvm-eval signalled.  TW-THREW (tree-walker errored)~
+                     ~%;; is SKIPPED (not an mvm-eval gap).  E2-DIVERGE=both returned~
                      ~%;; but values differ.  P-DIFF=agree (for the agree count).~
                      ~%(defun %e2diff (id form)~
                      ~%  (when (< id *skip-below*) (return-from %e2diff nil))~
@@ -421,7 +421,7 @@
                      ~%  (%clear-fault-slots)~
                      ~%  (%reset-signal-state)~
                      ~%  (let ((tw (handler-case (eval form) (t (c) *e2-tw-threw*)))~
-                     ~%        (e2 (handler-case (eval2 form) (t (c) *e2-e2-threw*))))~
+                     ~%        (e2 (handler-case (mvm-eval form) (t (c) *e2-e2-threw*))))~
                      ~%    (cond~
                      ~%      ((eq e2 *e2-e2-threw*)~
                      ~%       (cond~
@@ -458,7 +458,7 @@
                      ;; undefined fns.  Emit a NO-OP body — the driver calls
                      ;; run-real-e2diff instead.  The normal-mode body (Phase 1
                      ;; + Phase 2) is generated only when NOT in diff mode.
-                     (if *eval2-diff-mode*
+                     (if *mvm-eval-diff-mode*
                          (format s "  nil~%")
                        (progn
                      ;; Phase 1 (PARENT): run init-forms for the defclass-*
@@ -507,7 +507,7 @@
                      ;; run-e2diff-FILE (which itself runs the file's init forms
                      ;; then the %e2diff chunks).  Only emitted under the flag —
                      ;; the run-e2diff-* fns don't exist otherwise.
-                     (when *eval2-diff-mode*
+                     (when *mvm-eval-diff-mode*
                        (format s "~%(defun run-real-e2diff ()~%")
                        ;; Same conservative parent-side init (defclass-* +
                        ;; dgmc-aux) as run-real-ansi-tests so cross-file class
@@ -948,7 +948,7 @@
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387904)
-  ;; WS3 Phase 3: production EVAL/LOAD route unconditionally to eval2 (see
+  ;; WS3 Phase 3: production EVAL/LOAD route unconditionally to mvm-eval (see
   ;; cl-eval.lisp EVAL); no flag/marker needed.
   ;; ansi-aux-macros.lsp's NORMALLY macro: (if *should-always-be-true*
   ;; form (should-never-be-called)). NIL here → every CATCH-TYPE-ERROR /
@@ -994,46 +994,46 @@
   (when (> (mem-ref #x10000200 :u32) 2)
     (setq *run-only-below* (%parse-decimal-at-fixed-248)))
 
-  ;; WS3 in-image eval2 self-check (sentinel: argv1 = 888888).  Compiles a form
+  ;; WS3 in-image mvm-eval self-check (sentinel: argv1 = 888888).  Compiles a form
   ;; to MVM bytecode and interprets it INSIDE this image — proves the
-  ;; self-hosted compiler+interpreter work end-to-end (eval2-forms lazily inits
+  ;; self-hosted compiler+interpreter work end-to-end (mvm-eval-forms lazily inits
   ;; *opcode-table* on first use).  Reachable only via `binary 888888 999999`;
-  ;; no normal test id is 888888, so normal runs are unaffected (eval2 dead code).
+  ;; no normal test id is 888888, so normal runs are unaffected (mvm-eval dead code).
   (when (eql *skip-below* 888888)
     (write-string-serial \"E2SMOKE-START\") (write-char-serial 10)
     (write-string-serial \"add=\")
-    (print-dec (eval2 (quote (+ 1 2)))) (write-char-serial 10)
+    (print-dec (mvm-eval (quote (+ 1 2)))) (write-char-serial 10)
     (write-string-serial \"sqr=\")
-    (print-dec (eval2 (quote (let ((x 5)) (* x x))))) (write-char-serial 10)
+    (print-dec (mvm-eval (quote (let ((x 5)) (* x x))))) (write-char-serial 10)
     ;; Multi-form defun + cross-form call: SQ is defined, then called.  The
     ;; in-module CALL (sq 7) resolves bytecode->bytecode via *functions* keyed by
     ;; SQ's SYMBOL-NAME; this exercises the full self-hosted defun-registration +
     ;; cross-call path.  (SQ's name is recoverable because the driver source is
     ;; now scanned into *sym-name-table* — see %build-sym-name-auto-source.)
     (write-string-serial \"defcall=\")
-    (print-dec (eval2-forms (list (quote (defun sq (x) (* x x))) (quote (sq 7)))))
+    (print-dec (mvm-eval-forms (list (quote (defun sq (x) (* x x))) (quote (sq 7)))))
     (write-char-serial 10)
-    ;; WS3 PERSISTENCE probe: define PF in one eval2 call, then call it from a
-    ;; SEPARATE eval2 call and via the tree-walker.  Both must resolve PF (=36/45)
+    ;; WS3 PERSISTENCE probe: define PF in one mvm-eval call, then call it from a
+    ;; SEPARATE mvm-eval call and via the tree-walker.  Both must resolve PF (=36/45)
     ;; — proving top-level defun persistence (the asdf-gauntlet / flip keystone).
-    (eval2 (quote (defun pf (x) (* x 9))))
+    (mvm-eval (quote (defun pf (x) (* x 9))))
     (write-string-serial \"persist-call=\")
-    (print-dec (handler-case (eval2 (quote (pf 4))) (t (c) -1))) (write-char-serial 10)
+    (print-dec (handler-case (mvm-eval (quote (pf 4))) (t (c) -1))) (write-char-serial 10)
     (write-string-serial \"persist-tw=\")
     (print-dec (handler-case (funcall (quote pf) 5) (t (c) -1))) (write-char-serial 10)
-    ;; Multi-call persistence: a 3rd, separate eval2 call must still resolve PF.
+    ;; Multi-call persistence: a 3rd, separate mvm-eval call must still resolve PF.
     (write-string-serial \"persist-call3=\")
-    (print-dec (handler-case (eval2 (quote (pf 7))) (t (c) -1))) (write-char-serial 10)
+    (print-dec (handler-case (mvm-eval (quote (pf 7))) (t (c) -1))) (write-char-serial 10)
     ;; Forward ref: a SECOND persisted defun (PG) whose body CALLS PF.
-    (eval2 (quote (defun pg (y) (+ (pf y) 1))))
+    (mvm-eval (quote (defun pg (y) (+ (pf y) 1))))
     (write-string-serial \"persist-fwd=\")
-    (print-dec (handler-case (eval2 (quote (pg 2))) (t (c) -1))) (write-char-serial 10)
-    ;; WS3 DEFPACKAGE probe (asdf-gauntlet form-11 blocker): eval2 of a
+    (print-dec (handler-case (mvm-eval (quote (pg 2))) (t (c) -1))) (write-char-serial 10)
+    ;; WS3 DEFPACKAGE probe (asdf-gauntlet form-11 blocker): mvm-eval of a
     ;; (defpackage …) form must create a READER-VISIBLE package, so a later
     ;; (find-package …) — the tree-walker / reader path — resolves it.  Before
-    ;; the *eval2-runtime-p* DEFPACKAGE routing, eval2 skipped defpackage to a
+    ;; the *mvm-eval-runtime-p* DEFPACKAGE routing, mvm-eval skipped defpackage to a
     ;; no-op and dpkg-find was 0 (NIL).  Expect 1.
-    (eval2 (quote (defpackage e2pkg (:use) (:export \"ZAP\"))))
+    (mvm-eval (quote (defpackage e2pkg (:use) (:export \"ZAP\"))))
     (write-string-serial \"dpkg-find=\")
     (print-dec (handler-case (if (find-package \"E2PKG\") 1 0) (t (c) -1)))
     (write-char-serial 10)
@@ -1091,19 +1091,19 @@
 ;;; ============================================================
 
 ;; Now that *driver-source* exists, build the sym-name reverse table INCLUDING
-;; the driver's quoted symbols (so the in-image eval2 self-check's `(defun sq
+;; the driver's quoted symbols (so the in-image mvm-eval self-check's `(defun sq
 ;; …)` and any other driver literal has a recoverable SYMBOL-NAME).
 ;;
 ;; ALSO scan *compiler-in-image-source* (mvm.lisp / interp.lisp / compiler.lisp
-;; / eval2.lisp) — the WS3 self-hosted compiler.  Its OWN backquoted expansion
+;; / mvm-eval.lisp) — the WS3 self-hosted compiler.  Its OWN backquoted expansion
 ;; literals (the MEM-REF in compile-values' `(setf (mem-ref …) …)`, %IDIV-TRUNC,
 ;; EXACT-DIVIDE, …) are build-literal symbols too; without their names in
 ;; *sym-name-table*, in-image SYMBOL-NAME returns "" for them, so NAME-EQ inside
 ;; the in-image SETF expander missed the MEM-REF case and fell through to the
 ;; generic SET-<accessor> path with an EMPTY accessor name.  Every such name
-;; collided at "" in eval2's *functions* (last-defun-wins), the emitted
+;; collided at "" in mvm-eval's *functions* (last-defun-wins), the emitted
 ;; in-module CALL resolved to bytecode offset 0 = the module's first function,
-;; and the module recursed on itself forever: eval2 of ANY (values …) /
+;; and the module recursed on itself forever: mvm-eval of ANY (values …) /
 ;; multiple-value form spun or heap-crashed the fork (multiple-value-prog1.8,
 ;; macro-function.8-10, symbol-function.1 under the WS3 flip).  build-generic
 ;; has always scanned its compiler/interp sources (its *all-runtime-source*
@@ -1131,7 +1131,7 @@
     ;; 3. ANSI bridge (helpers, stubs, missing functions)
     *bridge-source*
     (string #\Newline)
-    ;; 3b. WS3: MVM compiler + interpreter + eval2 self-hosted in the image
+    ;; 3b. WS3: MVM compiler + interpreter + mvm-eval self-hosted in the image
     ;; (DEAD CODE until eval routing flips — gate must stay unchanged).
     *compiler-in-image-source*
     (string #\Newline)
@@ -1305,7 +1305,7 @@
     *real-ansi-sources*
     (string #\Newline)
     ;; 6a2. WS3 P1 differential per-file runners (run-e2diff-FILE + chunks).
-    ;;      "" unless MODUS_EVAL2_DIFF — flag-off adds ZERO bytes (the source
+    ;;      "" unless MODUS_MVM_EVAL_DIFF — flag-off adds ZERO bytes (the source
     ;;      already begins with its own newline per file, so no separator is
     ;;      needed here).  Calls into %e2diff / %try-chunk / run-init-FILE (all
     ;;      in *real-ansi-sources*); MVM resolves calls by name so definition
@@ -1319,7 +1319,7 @@
     ;; 7. Driver (sys-exit, kernel-main).
     ;; Substitute the placeholder for the build-time ANSI test count
     ;; so kernel-main can print EXP:N before running tests.
-    ;; WS3 P1: under MODUS_EVAL2_DIFF, redirect the production test driver call
+    ;; WS3 P1: under MODUS_MVM_EVAL_DIFF, redirect the production test driver call
     ;; (run-real-ansi-tests) to the differential gate (run-real-e2diff) — same
     ;; per-file fork + range-gating, but emits E2-DIVERGE/E2-UNSUP/P-DIFF.  A
     ;; plain string swap so the flag-off driver is byte-identical.
@@ -1330,7 +1330,7 @@
                                 (subseq str 0 p) replacement
                                 (subseq str (+ p (length needle))))
                    str))))
-    (let* ((drv0 (if *eval2-diff-mode*
+    (let* ((drv0 (if *mvm-eval-diff-mode*
                     ;; Redirect the production driver to the differential gate:
                     ;; swap run-real-ansi-tests→run-real-e2diff AND skip the slow
                     ;; eval-heavy custom probe suite (run-all-tests) which would
@@ -1339,9 +1339,9 @@
                       (str-sub "(run-real-ansi-tests)" "(run-real-e2diff)"
                                *driver-source*))
                     *driver-source*))
-           ;; WS3 Phase 3: production EVAL routes to eval2 unconditionally, so
-           ;; run-all-tests just runs (under eval2, like everything else) — no
-           ;; ~~USE-EVAL2-INIT~~ marker and no tree-walker bracket.  Flip-gate
+           ;; WS3 Phase 3: production EVAL routes to mvm-eval unconditionally, so
+           ;; run-all-tests just runs (under mvm-eval, like everything else) — no
+           ;; ~~USE-MVM-EVAL-INIT~~ marker and no tree-walker bracket.  Flip-gate
            ;; mode still drops run-all-tests so the corpus gate isn't confounded
            ;; by the diagnostic probes' P: lines.
            (drv (if *flip-skip-probes*

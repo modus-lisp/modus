@@ -1106,7 +1106,7 @@
    what fixes the asdf-gauntlet `wedge': the symbol intern table,
    *SYM-NAME-TABLE* (7.5k entries), *SYMBOL-FUNCTION-TABLE* (2.7k) and
    friends are all 0-arg tables, and their O(n) linear gethash walks
-   made eval2 compiles of uiop forms take minutes each (quadratic
+   made mvm-eval compiles of uiop forms take minutes each (quadratic
    blowup that presented as a deterministic rc=124 hang).  No symbol is
    quoted here — conses/fixnums/NIL/T only — so the boot-order
    constraint above still holds."
@@ -1963,7 +1963,7 @@
   ;; The consp-only test sent NIL down the array branch, returning an
   ;; empty VECTOR — which broke the in-image compiler's static-rest
   ;; pre-pack ((append (subseq args 0 0) ...) → TYPE-ERROR) for any
-  ;; 0-arg call to a req=0 &rest/&key callee in the same eval2 module.
+  ;; 0-arg call to a req=0 &rest/&key callee in the same mvm-eval module.
   (if (or (null seq) (consp seq))
       ;; List: build new list
       (let ((result nil)

@@ -481,7 +481,7 @@
   ;; host-side define-condition is NOT compiled into the image).  Without
   ;; this registration the condition type was UNKNOWN to %condition-typep,
   ;; so it matched NO handler-case clause — not even (t (c)) — and the
-  ;; signal fell through every frame: the whole eval2 toplevel form was
+  ;; signal fell through every frame: the whole mvm-eval toplevel form was
   ;; silently abandoned (asdf gauntlet form-52 silent stop; any capturing-
   ;; flet bug surfaced as a vanishing eval instead of a catchable error).
   ;; Registered as a TYPE-ERROR subtype so both (error (c)) and
@@ -491,7 +491,7 @@
           (list 'expected '(:expected) nil)
           (list 'got '(:got) nil))
     nil nil)
-  ;; %rc-invocation — internal marker for eval2's bytecode restart-case
+  ;; %rc-invocation — internal marker for mvm-eval's bytecode restart-case
   ;; (compile-restart-case).  A subtype of ERROR so the MVM interpreter's
   ;; per-opcode (error (c)) longjmp bridge (interp.lisp) catches the
   ;; invoke-restart %hc-longjmp and redirects it into the bytecode
@@ -1138,14 +1138,14 @@
 
 (defun %hb-handler-entry (type fn)
   "Build one handler-bind (TYPE FN) entry.  A NATIVE helper on purpose:
-   under eval2 the handler FN must cross the bytecode→native boundary as
+   under mvm-eval the handler FN must cross the bytecode→native boundary as
    a DIRECT call argument so the interpreter's escaping-wrap
    (%mvm-wrap-escaping) turns an in-module lambda into a natively
    callable trampoline.  The old expansion consed FN into the entry list
    IN BYTECODE — the raw in-module #x52 closure (slot-0 = a bytecode
    offset) leaked into *handler-bind-stack* and %signal-condition's
    native funcall of it crashed silently (SIGSEGV-recovered), so bound
-   handlers never fired under eval2 (probes 601/602/704/705)."
+   handlers never fired under mvm-eval (probes 601/602/704/705)."
   (list type fn))
 
 (defun %with-handler-bind (handlers body-fn)
@@ -1266,13 +1266,13 @@
 (defvar *restart-case-result* nil)
 (defvar *restart-invoking-p* nil)
 
-;;; --- restart-case bytecode helpers (WS3 / eval2) -------------------
+;;; --- restart-case bytecode helpers (WS3 / mvm-eval) -------------------
 ;;; compile-restart-case (mvm/compiler.lisp) keeps restart-case IN BYTECODE
 ;;; (a compiler special form using handler-case's setjmp) instead of routing
 ;;; through the native %with-restarts bridge — which corrupts mvm-interpret's
 ;;; loop state on return.  But the restart REGISTRY (*restart-stack*) and the
 ;;; invoke handshake state (*restart-invoking-p* / *restart-case-result*) are
-;;; special globals whose bytecode SYMBOL-VALUE key (eval2's stored-hash) can
+;;; special globals whose bytecode SYMBOL-VALUE key (mvm-eval's stored-hash) can
 ;;; differ from the key NATIVE invoke-restart uses.  So the bytecode side must
 ;;; NOT touch those specials directly; it calls these NATIVE helpers, which
 ;;; read/write the specials in native code — the same code invoke-restart runs
@@ -1457,7 +1457,7 @@
               ;; (NAME FN REPORT …) prefix.  %with-restarts now appends an
               ;; INTERACTIVE + TEST slot before the marker, so its index is
               ;; no longer fixed at 4 — detect by membership.  :BC-CASE marks
-              ;; a restart-case cell built by the eval2 compiler special form
+              ;; a restart-case cell built by the mvm-eval compiler special form
               ;; (compile-restart-case): its clause BODY runs in BYTECODE after
               ;; the longjmp, so invoke-restart must NOT try to call rfn (which
               ;; would be a bytecode lambda native code can't invoke) — it just
@@ -1473,7 +1473,7 @@
           (setq *restarts-being-invoked* (cons r *restarts-being-invoked*))
           (cond
             ((eq style :bc-case)
-             ;; eval2 restart-case: stash the invoke ARGS + invoked cell; the
+             ;; mvm-eval restart-case: stash the invoke ARGS + invoked cell; the
              ;; bytecode restart-case handler runs the matching clause body.
              ;; *current-condition* is a %RC-INVOCATION (an ERROR subtype) so
              ;; the interpreter's per-opcode (error (c)) longjmp bridge catches
@@ -1849,7 +1849,7 @@
      (let* ((c1 (%find-clos-class t1))
             (cpl (aref c1 4)))  ; slot 4 = computed CPL
        ;; eq first (native path, byte-identical); %clos-sym-name-eq second
-       ;; for the eval2 symbol-flavor / cross-package boundary (same
+       ;; for the mvm-eval symbol-flavor / cross-package boundary (same
        ;; slot-0 hash, different object) — mirrors %find-clos-class's
        ;; two-pass order.
        (cons (if (or (member t2 cpl :test #'eq)

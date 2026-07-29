@@ -339,10 +339,10 @@
    change, and no risk of a fuzzy match returning a stale different-flavor
    duplicate ahead of the real entry (which corrupted user-class SUBTYPEP
    when the lookup was fuzzy-first).  Pass 2 (NAME-HASH) runs ONLY when eq
-   found nothing — that is exactly the eval2 boundary, where %defclass
-   stored a native-MVM-sym and eval2's in-image %INTERN-SYMBOL produced a
+   found nothing — that is exactly the mvm-eval boundary, where %defclass
+   stored a native-MVM-sym and mvm-eval's in-image %INTERN-SYMBOL produced a
    non-eq CL-sym-wrapper for the same source literal (FIND-CLASS otherwise
-   errored 'class not found' under eval2).  Mirrors the hash robustness of
+   errored 'class not found' under mvm-eval).  Mirrors the hash robustness of
    %find-struct-type / the condition registry, but kept strictly secondary."
   (let ((cur *clos-classes*))
     (loop
@@ -585,7 +585,7 @@
 
 (defun %clos-make-initform-thunk (f)
   "Identity pass-through for a defclass :initform thunk lambda.  The point
-   is the CALL BOUNDARY: under eval2, a captureless (lambda () initform)
+   is the CALL BOUNDARY: under mvm-eval, a captureless (lambda () initform)
    materializes as an in-module #x52 closure whose slot-0 is a BYTECODE
    OFFSET valid only while ITS OWN module is interpreted.  The DEFCLASS
    expansion used to embed that closure inside the (list (cons 'slot
@@ -647,7 +647,7 @@
 (defun %class-slots-for (class-name)
   "Return list of class-allocated slot names for CLASS-NAME (no CPL walk).
    TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
-   byte-identical), name-hash fallback for the eval2 class-name boundary."
+   byte-identical), name-hash fallback for the mvm-eval class-name boundary."
   (let ((cur *clos-class-slots*))
     (loop
       (when (null cur) (return nil))
@@ -686,7 +686,7 @@
 (defun %direct-slots-for (class-name)
   "Return list of direct-slot-names for CLASS-NAME (any allocation).
    TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
-   byte-identical), name-hash fallback for the eval2 class-name boundary."
+   byte-identical), name-hash fallback for the mvm-eval class-name boundary."
   (let ((cur *clos-direct-slots*))
     (loop
       (when (null cur) (return nil))
@@ -789,13 +789,13 @@
    to the one %register-clos-slot-info stored, so this is byte-identical to
    the old single-pass body — no behavior change for that path.  Pass 2
    (slot-0 name-hash via %clos-sym-name-eq) runs ONLY when eq found nothing
-   — that is exactly the eval2 boundary, where %defclass/%register stored a
-   native-MVM-sym class name while eval2's in-image %INTERN-SYMBOL handed us
+   — that is exactly the mvm-eval boundary, where %defclass/%register stored a
+   native-MVM-sym class name while mvm-eval's in-image %INTERN-SYMBOL handed us
    a non-eq CL-sym-wrapper for the same literal.  Without pass 2 the initarg
-   /initform maps were invisible under eval2, so MAKE-INSTANCE rejected every
+   /initform maps were invisible under mvm-eval, so MAKE-INSTANCE rejected every
    (valid) initarg as 'invalid initarg' and SHARED-INITIALIZE ran no
    initforms — every slot stayed -999 (make-instance / make-load-form-saving-
-   slots / shared-initialize eval2 divergences)."
+   slots / shared-initialize mvm-eval divergences)."
   (let ((cur *clos-slot-info*))
     (loop
       (when (null cur) (return nil))
@@ -924,9 +924,9 @@
 (defun %clos-initform-alist (class-name)
   "Return a list of (slot-name . thunk) for every slot of CLASS-NAME (and
    its supers via the CPL) that has an initform.  Most-specific entry wins
-   per slot (direct class shadows ancestor).  Used by the eval2 MAKE-INSTANCE
+   per slot (direct class shadows ancestor).  Used by the mvm-eval MAKE-INSTANCE
    expansion to apply initforms IN BYTECODE — funcalling each thunk at the
-   top eval2 level rather than from deep inside native %shared-init-apply-
+   top mvm-eval level rather than from deep inside native %shared-init-apply-
    initargs, which SIGSEGV'd when the thunk is a re-entrant interp trampoline
    (the aset-destination/value GC-eval-order hazard on the native side)."
   (let* ((cname (if (%clos-class-p class-name) (aref class-name 1) class-name))
@@ -972,7 +972,7 @@
   "Return the directly-declared default-initarg thunks for CLASS-NAME
    (no CPL walk).  Returns nil if none registered.
    TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
-   byte-identical), name-hash fallback for the eval2 class-name boundary."
+   byte-identical), name-hash fallback for the mvm-eval class-name boundary."
   (let ((cur *clos-default-initargs*))
     (loop
       (when (null cur) (return nil))
@@ -1064,7 +1064,7 @@
 ;;; (eval `(make-instance ...)) callers).
 (defun %clos-cpl-name-member-p (class-name cpl-names)
   "True if CLASS-NAME (a specializer symbol) is EQ to some entry in
-   CPL-NAMES, or name-matches one (eval2 class-name boundary)."
+   CPL-NAMES, or name-matches one (mvm-eval class-name boundary)."
   (let ((cur cpl-names))
     (loop
       (when (null cur) (return nil))
@@ -1457,19 +1457,19 @@
    Both flavors of class-name symbol are subtag-#x50 objects whose slot 0
    is the SAME compute-name-hash of the name (%native-mvm-sym-hash and
    %cl-sym-hash are both (aref s 0)).  Comparing that stored slot-0 hash is
-   a single flavor-independent identity key that closes the eval2 boundary:
+   a single flavor-independent identity key that closes the mvm-eval boundary:
    %defclass / DEFCLASS-macro stored the class name as a native-MVM-sym,
-   while eval2's in-image %INTERN-SYMBOL produces a CL-sym-wrapper for the
+   while mvm-eval's in-image %INTERN-SYMBOL produces a CL-sym-wrapper for the
    SAME source literal `'cls-name`.  They are not eq, but share slot 0, so
    the MIXED case now matches — FIND-CLASS used to error 'class not found'
    for every shared-initialize / slot-exists-p / make-instance test under
-   eval2.
+   mvm-eval.
 
    This deliberately does NOT canonicalise via the resolved NAME (the old
    string-equal / %sym-name-or-hash path).  A compile-time-literal CL-sym
    interned with only a hash lazy-reverse-looks-up the build-time
    *SYM-NAME-TABLE* and returns \"\" when the hash isn't there — exactly the
-   runtime-loaded tac-3 / eval2 classes.  (string-equal \"\" \"\") and
+   runtime-loaded tac-3 / mvm-eval classes.  (string-equal \"\" \"\") and
    (compute-name-hash \"\") then collapse EVERY such symbol into one
    equivalence class, making %find-clos-class return a wrong/oversized class
    so user-class SUBTYPEP regressed (tac-3.3/.4/.5/.6/.13/.14/.15 went
@@ -1481,7 +1481,7 @@
     ;; CL-sym-wrapper (>=3 slots).  In BOTH layouts slot 0 is the same
     ;; compute-name-hash of the symbol name (see %native-mvm-sym-hash /
     ;; %cl-sym-hash, both = (aref s 0)), so the stored slot-0 hash is a
-    ;; flavor-independent identity key.  This is what closes the eval2
+    ;; flavor-independent identity key.  This is what closes the mvm-eval
     ;; boundary: a class stored as a native-MVM-sym vs the in-image
     ;; %INTERN-SYMBOL CL-sym-wrapper for the same literal share slot 0.
     ;;
@@ -1489,7 +1489,7 @@
     ;; string-equal / %sym-name-or-hash path): for compile-time-literal
     ;; CL-syms interned with only a hash, %cl-sym-name lazy-reverse-looks-
     ;; up the build-time *SYM-NAME-TABLE* and returns "" when the hash
-    ;; isn't there (exactly the eval2 / runtime-loaded tac-3 classes).
+    ;; isn't there (exactly the mvm-eval / runtime-loaded tac-3 classes).
     ;; string-equal "" "" — and compute-name-hash "" — then collapse EVERY
     ;; such symbol into one equivalence class, so %find-clos-class returns
     ;; a wrong/oversized class and user-class SUBTYPEP regresses
@@ -2199,7 +2199,7 @@
    identical, no behavior change.  Pass 2 (NAME-HASH via %clos-sym-name-eq
    on the symbol's stored slot-0 hash, NOT symbol-name which returns \"\" for
    runtime-interned syms) runs ONLY when eq found nothing — exactly the
-   eval2 boundary, where %defgeneric stored a native-MVM-sym and eval2's
+   mvm-eval boundary, where %defgeneric stored a native-MVM-sym and mvm-eval's
    in-image %INTERN-SYMBOL produced a non-eq CL-sym-wrapper for the same
    source literal.  Kept strictly secondary and gated on plain-symbol NAME
    (never a setf-list) so it can't fuzzy-collapse distinct (setf X) names.
@@ -2389,10 +2389,10 @@
   nil)
 
 (defun %defmethod-full (gf-name qualifier specializers fn params)
-  "Full runtime DEFMETHOD semantics — the eval2 DEFMETHOD expansion's
+  "Full runtime DEFMETHOD semantics — the mvm-eval DEFMETHOD expansion's
    single entry point (compiler.lisp's DEFMETHOD macro under
-   *eval2-runtime-p*).  Mirrors the tree-walker's DEFMETHOD handler
-   (cl-eval.lisp) so eval2 of `(defmethod ...)` behaves identically:
+   *mvm-eval-runtime-p*).  Mirrors the tree-walker's DEFMETHOD handler
+   (cl-eval.lisp) so mvm-eval of `(defmethod ...)` behaves identically:
    1. CLHS 7.6.4 congruence validation against a DECLARED GF lambda-list
       (shape + &key acceptance) -> PROGRAM-ERROR on mismatch
       (defmethod.error.1-12).
@@ -2400,7 +2400,7 @@
       params, so %gf-check-arity can reject wrong-arity calls
       (defmethod.error.13/.14/.15).
    3. Dispatch-stub installation into the FUNCTION CELL when the name has
-      none — the old eval2 expansion's nested `(defun NAME (&rest a)
+      none — the old mvm-eval expansion's nested `(defun NAME (&rest a)
       (%gf-dispatch 'NAME a))` was a COMPILE-TIME-ONLY module registration
       (never persisted), so a later native `(funcall sym ...)` resolved
       nothing, %native-sym-resolve returned the SYMBOL itself on miss, and
@@ -2435,8 +2435,8 @@
     (%gf-record-method-meta (%find-gf gf-name) m params)
     m))
 
-(defun %defgeneric-eval2-precheck (gf-name)
-  "CLHS DEFGENERIC error semantics for the eval2 expansion, mirroring the
+(defun %defgeneric-mvm-eval-precheck (gf-name)
+  "CLHS DEFGENERIC error semantics for the mvm-eval expansion, mirroring the
    tree-walker's pre-%defgeneric checks (cl-eval.lisp): a name bound to a
    macro, a special operator, or an ordinary (non-generic) function cannot
    be made generic -> PROGRAM-ERROR (defgeneric.error.1/2/3).  Only checked
@@ -2457,11 +2457,11 @@
   nil)
 
 (defun %gf-install-dispatch-stub (gf-name)
-  "Install a %gf-dispatch stub as GF-NAME's function (eval2 DEFGENERIC
+  "Install a %gf-dispatch stub as GF-NAME's function (mvm-eval DEFGENERIC
    expansion).  The old expansion's nested `(defun NAME ...)` registered a
    module function at COMPILE time only — nothing reached the runtime
    function tables, so native (funcall sym ...) / (fdefinition sym) after
-   an eval2 defgeneric failed.  Mirrors the tree-walker's unconditional
+   an mvm-eval defgeneric failed.  Mirrors the tree-walker's unconditional
    `(set-symbol-function gf-name (%make-gf-stub gf-name))`."
   (when (%sym-name-or-hash gf-name)
     (set-symbol-function gf-name (%make-gf-stub gf-name))
@@ -2474,11 +2474,11 @@
   "Value of a DEFGENERIC form: the GENERIC-FUNCTION OBJECT (the GF struct)
    for GF-NAME.  CLHS says DEFGENERIC returns the generic-function object;
    the native dispatch-fn stub (formerly returned from *gf-fn-to-name*) was
-   an implementation detail that eval2's interpreter cannot funcall — it
+   an implementation detail that mvm-eval's interpreter cannot funcall — it
    misses %find-gf and errors 'undefined generic function'.  The GF struct
    is %generic-function-p / functionp and funcalls via the %FUNCALL-GF-N ->
    %gf-dispatch path (with trap-#x0530 handling the >4-arg overflow), so
-   returning it is BOTH more ANSI-conformant and eval2-safe.  This also
+   returning it is BOTH more ANSI-conformant and mvm-eval-safe.  This also
    gives ENSURE-GENERIC-FUNCTION eql-identity: DEFGENERIC and a later
    ENSURE-GENERIC-FUNCTION of the same name return the SAME struct."
   (%find-gf gf-name))

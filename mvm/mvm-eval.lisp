@@ -1,4 +1,4 @@
-;;;; eval2.lisp — in-image runtime evaluator: compile a list of top-level
+;;;; mvm-eval.lisp — in-image runtime evaluator: compile a list of top-level
 ;;;; forms to ONE MVM bytecode module and execute the trailing expression via
 ;;;; mvm-interpret.  Extracted verbatim from build-generic.lisp's
 ;;;; *stage2-test-source* so the same source feeds BOTH the generic oracle
@@ -6,27 +6,27 @@
 ;;;; tree-walker).  Depends on mvm.lisp (ISA), interp.lisp (mvm-interpret),
 ;;;; and compiler.lisp (mvm-compile-toplevel / emit pipeline) being loaded
 ;;;; earlier in the image source.
-;; eval2-forms: compile a LIST of top-level forms (helper defuns followed by a
+;; mvm-eval-forms: compile a LIST of top-level forms (helper defuns followed by a
 ;; trailing expression) into ONE bytecode module and run the expression.  CALLs
 ;; between the functions resolve in-module (bytecode->bytecode) so NO native
 ;; bridge / value marshalling is needed — one representation throughout.  This
 ;; is the 'drop native' model: the interpreter runs everything as bytecode.
-(defvar *eval2-buffer* nil
-  "PERF: persistent 64KB bytecode buffer reused across eval2-forms calls (see
+(defvar *mvm-eval-buffer* nil
+  "PERF: persistent 64KB bytecode buffer reused across mvm-eval-forms calls (see
    the reuse site) instead of (make-array 65536) every call — mvm-buffer-used-
    bytes copies the bytecode out before the next call, so nothing retains it.")
 
-(defvar *eval2-cache* nil
+(defvar *mvm-eval-cache* nil
   "PERF Round 2 (compile-caching): EQUAL hash, FORMS → (bc entry fn-table
-   rt-table lam-offsets) — the compiled MVM module for those forms.  eval2 of a
+   rt-table lam-offsets) — the compiled MVM module for those forms.  mvm-eval of a
    tiny form is ~26x compile-bound; the harness/asdf re-eval the same forms
    constantly, so caching the compiled bytecode skips the whole ~15M-cycle
    compile and pays only ~0.6M interpret.  Re-interpreting the cached bytecode
    is correct: the RESULT depends on live runtime state, not the cache.  bc is a
-   COPY (mvm-buffer-used-bytes) so it's safe despite *eval2-buffer* reuse.")
+   COPY (mvm-buffer-used-bytes) so it's safe despite *mvm-eval-buffer* reuse.")
 
 (defvar *e2-active-defun-names* nil
-  "Names (strings) of the top-level DEFUNs of the eval2 module CURRENTLY
+  "Names (strings) of the top-level DEFUNs of the mvm-eval module CURRENTLY
    being interpreted.  Def persistence installs those defuns' trampolines
    at module-BUILD time — BEFORE the module's code runs — so a runtime
    (fmakunbound 'f) executing before the (defun f …) in the same module
@@ -36,29 +36,29 @@
    process-source-registry-directive silent-death class).  fmakunbound
    consults this list and SKIPS removal for names the running module is
    (re)defining, honoring source order.  Set (lexical-save + setq-restore)
-   around the module run in eval2-forms; a condition escaping the run can
-   leave it stale, which self-heals at the next eval2-forms call and at
+   around the module run in mvm-eval-forms; a condition escaping the run can
+   leave it stale, which self-heals at the next mvm-eval-forms call and at
    worst makes an unrelated fmakunbound of one of these names a no-op.")
 
 ;;; ============================================================
 ;;; WS4 STAGE 5b — runtime JIT seam (bytecode → native → execute)
 ;;; ============================================================
 ;;;
-;;; *use-jit* (default NIL): when T, eval2-forms / %eval2-run-tuple execute a
+;;; *use-jit* (default NIL): when T, mvm-eval-forms / %mvm-eval-run-tuple execute a
 ;;; compiled module by TRANSLATING its bytecode to native x64, mmap'ing an
 ;;; exec page, relocating out-of-module CALLs + patching const-pool immediates
 ;;; (the Stage 1-4 mechanism), and %jit-call'ing the entry — instead of
 ;;; mvm-interpret.  Set at boot (build-time default baked from MODUS_USE_JIT).
 ;;; ANY failure in the JIT path falls back to mvm-interpret, so correctness is
 ;;; never worse than JIT-off (unsupported forms — strings/length/MV — just take
-;;; the interpret path).  When *use-jit* is NIL the seam is inert: eval2 is
+;;; the interpret path).  When *use-jit* is NIL the seam is inert: mvm-eval is
 ;;; byte-for-byte behavior-identical to before.
 (defvar *use-jit* nil
-  "WS4-S5b: T = execute compiled eval2 modules as native JIT'd code (with
+  "WS4-S5b: T = execute compiled mvm-eval modules as native JIT'd code (with
    interpret fallback on any error); NIL = pure mvm-interpret (unchanged).
    NB: the seam gates on the FUNCTION %jit-enabled-p (below), not on this
    special directly — a global-variable setq in kernel-main did NOT reliably
-   propagate to eval2's compiled read in the ANSI image (the value stayed NIL),
+   propagate to mvm-eval's compiled read in the ANSI image (the value stayed NIL),
    whereas a defun resolves through the proven SFT (name-hash) path.  This
    special is kept for documentation / an alternate runtime override; the
    default %jit-enabled-p returns its value if bound, else NIL.")
@@ -71,49 +71,49 @@
   (and (boundp (quote *use-jit*)) *use-jit*))
 
 (defvar *jit-inhibit* nil
-  "CLASS-3 dynamic JIT inhibit.  When non-nil, %jit-active-p forces the eval2
+  "CLASS-3 dynamic JIT inhibit.  When non-nil, %jit-active-p forces the mvm-eval
    seam onto the INTERPRET path regardless of %jit-enabled-p.  Needed because
    the ANSI gate BAKES %jit-enabled-p to a CONSTANT (build-x64-linux.lisp,
    MODUS_USE_JIT) that ignores *use-jit* — so a plain `(setq *use-jit* nil)`
-   around the interp-closure trampoline compile (see %e2ic-eval2-nocache) does
+   around the interp-closure trampoline compile (see %e2ic-mvm-eval-nocache) does
    NOT disable the JIT there in the gate image, and the native<->interp
    nested-call boundary fault (define-compiler-macro.1/.2/.7) resurfaces.
-   %e2ic-eval2-nocache sets THIS flag (lexical save + setq-restore) so the
+   %e2ic-mvm-eval-nocache sets THIS flag (lexical save + setq-restore) so the
    inhibit works uniformly in BOTH the CLI (%jit-enabled-p reads *use-jit*)
    and the gate (baked constant).  BOOTS AS NIL (defvar init-thunks are
    skipped in the ANSI image); a bare NIL read is exactly the wanted default
    (JIT not inhibited).")
 
 (defun %jit-active-p ()
-  "The eval2 seam gate: JIT is live only when the build enabled it AND it is
+  "The mvm-eval seam gate: JIT is live only when the build enabled it AND it is
    not dynamically inhibited (see *jit-inhibit*)."
   (and (%jit-enabled-p)
        (not (and (boundp (quote *jit-inhibit*)) *jit-inhibit*))))
 
 (defvar *jit-native-count* 0
-  "WS5 diag: number of eval2 forms that completed via the NATIVE JIT path.")
+  "WS5 diag: number of mvm-eval forms that completed via the NATIVE JIT path.")
 (defvar *jit-fallback-count* 0
-  "WS5 diag: number of eval2 forms that FELL BACK to mvm-interpret.")
+  "WS5 diag: number of mvm-eval forms that FELL BACK to mvm-interpret.")
 
 (defvar *jit-page-cache* nil
   "WS4-S5b per-module JIT cache.  EQ hash keyed by the compiled BC byte-array
-   identity → a jit-entry list (base eoff cpatches gc-stamp).  A repeated eval2
+   identity → a jit-entry list (base eoff cpatches gc-stamp).  A repeated mvm-eval
    of the SAME cached module reuses the already-translated exec page instead of
    re-translating (that's the speedup: translate cost amortizes over re-evals).
    After a GC the const-pool objects MOVE (the pool is a GC root the collector
    updates); each cached page's baked const immediates go stale, so we compare
    gc-stamp to (%gc-count) and RE-PATCH from the updated pool before re-exec.")
 
-(defvar *eval2-no-cache* nil
-  "When T, eval2-forms bypasses *eval2-cache* entirely (neither hit nor
+(defvar *mvm-eval-no-cache* nil
+  "When T, mvm-eval-forms bypasses *mvm-eval-cache* entirely (neither hit nor
    store) for the current call.  Set (setq + unwind-protect restore) by
-   %e2ic-eval2-nocache: the interp-closure entry compiles forms that embed
+   %e2ic-mvm-eval-nocache: the interp-closure entry compiles forms that embed
    CAPTURED ENV CONSES via the quote pool — two DIFFERENT closures can have
    EQUAL forms (same params/body, structurally-equal but non-eq env pairs),
    and an EQUAL-keyed cache hit would hand closure B a module whose const
    pool holds closure A's cells (shared state, the two-counters bug).")
 
-(defun %eval2-cacheable-p (forms)
+(defun %mvm-eval-cacheable-p (forms)
   "T unless any top-level form is a DEF* / IN-PACKAGE / EVAL-WHEN whose FIRST
    compile has side effects (macro/trampoline/package registration) that a
    cache HIT would skip.  Those always take the full (uncached) compile path;
@@ -131,20 +131,20 @@
                   (string-equal n "DEFINE-SYMBOL-MACRO") (string-equal n "MACROLET")
                   (string-equal n "DEFINE-METHOD-COMBINATION")
                   (string-equal n "EVAL-WHEN"))
-          (return-from %eval2-cacheable-p nil))))))
+          (return-from %mvm-eval-cacheable-p nil))))))
 
 (defun %e2-scan-persist (f acc depth)
-  "WS3 def persistence pre-scan (see persist-names in eval2-forms): return ACC
+  "WS3 def persistence pre-scan (see persist-names in mvm-eval-forms): return ACC
    extended with the names (strings) of every toplevel-context DEFUN in form F.
    CLHS 3.2.3.1: forms in a top-level EVAL-WHEN / PROGN / LOCALLY body are
    THEMSELVES top level — recurse those.  A top-level MACRO call's expansion is
    also processed as top level, so a head that is none of the above is expanded
    ONE step (macroexpand-1-mvm sees both the compiler *macro-table* and, under
-   *eval2-runtime-p*, the runtime macro tables) and re-inspected — this is what
+   *mvm-eval-runtime-p*, the runtime macro tables) and re-inspected — this is what
    lets the scan see uiop's (with-upgradability () (defun featurep ...)) →
    eval-when → defun* → progn → defun chain.  The old raw-heads-only scan
    missed every macro-wrapped defun: single-form (eval FORM) compiles FORM as
-   the %eval2-thunk BODY (compile-form, never mvm-compile-toplevel), so the
+   the %mvm-eval-thunk BODY (compile-form, never mvm-compile-toplevel), so the
    compiler-recorded *e2-persist-defuns* path never fired either, and the
    block's own (detect-os) funcall-by-symbol died with CALL-IND non-callable
    (asdf gauntlet FAILFORM 43/45).  DEPTH guards runaway expansion; expansion
@@ -168,16 +168,16 @@
            (dolist (sub (cdr f) acc)
              (setq acc (%e2-scan-persist sub acc 0))))
           ;; PERF GATE: only a RUNTIME user macro (with-upgradability et al,
-          ;; resolved via macroexpand-1-mvm's *eval2-runtime-p* fallback) can
+          ;; resolved via macroexpand-1-mvm's *mvm-eval-runtime-p* fallback) can
           ;; hide a toplevel defun the raw heads miss.  Bootstrap/compile-time
           ;; macros in *macro-table* (loop, handler-case, dolist, …) never
           ;; expand to toplevel defuns — skip them so the pre-scan doesn't
-          ;; double-run their expanders on every eval2 call.
+          ;; double-run their expanders on every mvm-eval call.
           ;; EXCEPTIONS: DEFCLASS / DEFINE-CONDITION / DEFSTRUCT are bootstrap
           ;; macros whose expansions DO contain toplevel defuns (slot
           ;; accessor/reader/writer fns, struct constructors/accessors).
           ;; Gated out, a single-form (eval '(defclass X … :accessor A-X))
-          ;; compiled A-X only in-module (the form is the %eval2-thunk BODY,
+          ;; compiled A-X only in-module (the form is the %mvm-eval-thunk BODY,
           ;; so the compiler-recorded path never fires either) and every
           ;; LATER eval got UNDEFINED-FUNCTION A-X — asdf's COMPONENT-CHILDREN
           ;; / COMPONENT-OPERATION-TIMES (mark-component-preloaded, gauntlet
@@ -197,9 +197,9 @@
 
 ;;; --- WS4-S5b JIT machinery (small factored helpers) ---
 ;;;
-;;; Kept deliberately SMALL / non-inlined into kernel-main or eval2-forms
+;;; Kept deliberately SMALL / non-inlined into kernel-main or mvm-eval-forms
 ;;; (the boot-crash/layout class — a big body baked past a branch-displacement
-;;; boundary SIGSEGVs at boot).  Each does one step; the seam calls %eval2-jit-run.
+;;; boundary SIGSEGVs at boot).  Each does one step; the seam calls %mvm-eval-jit-run.
 
 (defun %jit-write-imm64 (base off word)
   "Write the 64-bit WORD little-endian into the exec page at BASE+OFF (the
@@ -273,13 +273,13 @@
            (relocs *x64-call-relocs*)
            (fa-relocs *x64-fn-addr-relocs*)
            (cpatches *x64-li-const-patches*)
-           (elabel (gethash "%EVAL2-THUNK" fn-map))
+           (elabel (gethash "%MVM-EVAL-THUNK" fn-map))
            (eoff (if elabel (label-position elabel) 0))
            ;; JIT-FIX (Fix 2): the exec page must be big enough for the ACTUAL
            ;; native code length.  A fixed 4096-byte page overran on every
            ;; flet/labels/CLOS-dispatch module (their native code is 1k-15k+
            ;; bytes) — the copy loop below wrote past the mapped region → a
-           ;; SIGSEGV the eval2 seam caught as a (nil-condition) fallback, so
+           ;; SIGSEGV the mvm-eval seam caught as a (nil-condition) fallback, so
            ;; those whole shape classes ran interpret-only (native%≈0).  Round
            ;; nlen UP to a 4096-byte multiple (+1 page of slack for the copy's
            ;; tail / alignment) so the full native module fits.
@@ -312,11 +312,11 @@
    gap such as `Unknown register: 0` in a flet/labels/CLOS-dispatch shape)
    into a clean NIL return, so the caller falls back to mvm-interpret and the
    program's RESULT is never changed.  Every path from a top-level/load eval
-   to translate-mvm-to-x64 runs through this function (both %eval2-jit-run
+   to translate-mvm-to-x64 runs through this function (both %mvm-eval-jit-run
    call shapes call %jit-entry-for or %jit-translate-page), so a translator
    gap can NEVER escape as an uncaught error nor produce a wrong value — it
    only costs one interpret fallback.  NB: the outer seam handler-case in
-   %eval2-run-tuple / eval2-forms is kept as belt-and-suspenders; this inner
+   %mvm-eval-run-tuple / mvm-eval-forms is kept as belt-and-suspenders; this inner
    guard exists because a translate error must degrade to NIL (interpret)
    even in any context whose outer catch might not see it."
   (handler-case
@@ -353,7 +353,7 @@
           (when entry (setf (gethash bc *jit-page-cache*) entry))
           entry))))
 
-(defun %eval2-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p)
+(defun %mvm-eval-jit-run (bc entry ft-list fn-table rt-table lam-offsets cache-p)
   "WS4-S5b: run compiled module BC as NATIVE JIT'd code, wrapping the result
    like the interpret path (%mvm-wrap-escaping-result).  If the JIT can't build
    a page, OR the form produced MULTIPLE VALUES (native writes real BSS MV-count
@@ -386,7 +386,7 @@
             (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
         (error "jit-page-unavailable"))))
 
-(defun %eval2-run-tuple (tuple)
+(defun %mvm-eval-run-tuple (tuple)
   "Interpret a cached compiled module tuple (bc entry ft-list fn-table rt-table lam-offsets).
    Conditions PROPAGATE to the caller (production EVAL semantics): an error
    signalled inside the evaluated form must reach the caller's handler-case.
@@ -394,7 +394,7 @@
    signal into a return VALUE, so every `(eval ...) must signal` ANSI test
    (vector-push*.error, defmethod.error, signals-error helpers) failed under
    the WS3 flip.  Callers that want the capture behaviour (the e2diff gate)
-   wrap eval2 in their own handler-case."
+   wrap mvm-eval in their own handler-case."
   ;; MULTIPLE VALUES propagate (WS3 flip): mvm-interpret stashes the run's
   ;; simulated MV state in *mvm-last-mv* (read IMMEDIATELY — see interp.lisp);
   ;; re-emit via values-list so the native caller's multiple-value-list /
@@ -417,7 +417,7 @@
          ;; %jit-active-p (not %jit-enabled-p) so *jit-inhibit* (Class 3) works
          ;; even in the gate image whose %jit-enabled-p is a baked constant.
          (%prim (if (%jit-active-p)
-                    (handler-case (%eval2-jit-run %bc %entry %ftl %fnt %rt %lam t)
+                    (handler-case (%mvm-eval-jit-run %bc %entry %ftl %fnt %rt %lam t)
                       (t (c)
                          (setq *jit-fallback-count*
                                (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
@@ -438,15 +438,15 @@
             (values-list (cons %prim (cdr %mv))))
         %prim)))
 
-(defun %eval2-compile-tuple (forms)
+(defun %mvm-eval-compile-tuple (forms)
   "WS4 STAGE 2 seam tap.  Compile FORMS to an MVM bytecode module via the
-   SAME self-hosted compiler pipeline eval2-forms uses (mvm-compile-toplevel
+   SAME self-hosted compiler pipeline mvm-eval-forms uses (mvm-compile-toplevel
    + Pass1/1.5/2), but STOP before interpreting.  Returns a 6-tuple:
 
      (bc entry ft-list fn-table rt-table lam-offsets)
 
-   where BC is the module bytecode, ENTRY the %EVAL2-THUNK native entry
-   OFFSET into BC, FN-TABLE the offset-array eval2-forms hands mvm-interpret
+   where BC is the module bytecode, ENTRY the %MVM-EVAL-THUNK native entry
+   OFFSET into BC, FN-TABLE the offset-array mvm-eval-forms hands mvm-interpret
    (:function-table), RT-TABLE the runtime-call table (out-of-module CALLs;
    EMPTY = hazard-free = JIT-executable without Stage-3 relocation),
    LAM-OFFSETS the lambda-body offset set, and FT-LIST the
@@ -455,7 +455,7 @@
    produced, so it is consistent with FN-TABLE / ENTRY).
 
    This does NOT install trampolines, does NOT cache, and does NOT interpret
-   — it is a pure compile.  eval2-forms is UNCHANGED (behavior-identical);
+   — it is a pure compile.  mvm-eval-forms is UNCHANGED (behavior-identical);
    this is a parallel, dead-code path reachable only from the WS4-S2 probe.
    It intentionally omits the persist/reentrancy bookkeeping because a JIT
    probe form is a single self-contained expression (no cross-call defuns)."
@@ -489,7 +489,7 @@
                               (symbolp (cadr last-form))))
            (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
            (defs (if last-defun-p forms (reverse (cdr rforms))))
-           (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr)))))
+           (toplevel (append defs (list (list (quote defun) (quote %mvm-eval-thunk) nil expr)))))
       (dolist (f toplevel)
         (let ((result (mvm-compile-toplevel f)))
           (cond
@@ -504,7 +504,7 @@
         (when (and (consp pend) (car pend) (cdr pend))
           (setq all-ir (cons pend all-ir))))
       (setq all-ir (reverse all-ir))
-      ;; Fresh buffer (do NOT touch *eval2-buffer* — keep eval2-forms's reuse
+      ;; Fresh buffer (do NOT touch *mvm-eval-buffer* — keep mvm-eval-forms's reuse
       ;; buffer pristine for the oracle interpret path that runs after us).
       (setq buf (make-mvm-buffer :bytes (make-array 65536)))
       ;; Pass 1: assign cumulative bytecode offsets + register in *functions*.
@@ -532,7 +532,7 @@
         (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
           (emit-bytecode-for-ir buf ir lp)))
       (dolist (e all-ir)
-        (when (string-equal (string (function-info-name (car e))) "%EVAL2-THUNK")
+        (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
           (setq entry (function-info-bytecode-offset (car e)))))
       (let ((bc (mvm-buffer-used-bytes buf))
             (fn-table (make-array (length all-ir)))
@@ -555,28 +555,28 @@
                 (puthash off lam-offsets (quote :defun)))))
         (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))))
 
-(defun eval2-forms (forms)
+(defun mvm-eval-forms (forms)
   ;; In-image: emit integer literals as fixnum-safe :li-halves (set the GLOBAL,
   ;; not a let-binding — compiled LET of a special may not establish a dynamic
   ;; binding the compiler's compile-integer reads).  Native builds never call
-  ;; eval2-forms, so the global stays NIL there.
+  ;; mvm-eval-forms, so the global stays NIL there.
   (setq *mvm-emit-halves* t)
   ;; Mark in-image runtime compilation so mvm-compile-toplevel routes package
   ;; side-effecting forms (DEFPACKAGE) to their runtime impl instead of the
   ;; build-time no-op.  setq (not let): compiled let of a special is unreliable
   ;; in-image (same reason as *mvm-emit-halves* above).  Native builds never
-  ;; call eval2-forms, so the global stays NIL at build time.
-  (setq *eval2-runtime-p* t)
+  ;; call mvm-eval-forms, so the global stays NIL at build time.
+  (setq *mvm-eval-runtime-p* t)
   ;; LAZY opcode-table init.  encode-instruction (mvm.lisp) reads *opcode-table*
   ;; for each instruction's operand spec during Pass-2 emit; with a NIL table
   ;; (the ANSI image skips init-all-globals, so the defparameter init thunk
   ;; never ran) every operand is silently DROPPED → corrupt bytecode → garbage
-  ;; result.  Create + populate here, on first eval2 use, NOT at boot: a
+  ;; result.  Create + populate here, on first mvm-eval use, NOT at boot: a
   ;; permanent populated *opcode-table* GC root shifts GC timing enough to
   ;; surface a latent crash elsewhere (GET-INTERNAL-RUN-TIME.2 / 0xDEAD0004),
-  ;; and eval2 is dead code until the WS3 flip, so lazy keeps the normal image's
+  ;; and mvm-eval is dead code until the WS3 flip, so lazy keeps the normal image's
   ;; live set identical to baseline.  Skips when already populated (the generic
-  ;; image, or a 2nd eval2 call).  NB %populate-opcode-table's `setf gethash`
+  ;; image, or a 2nd mvm-eval call).  NB %populate-opcode-table's `setf gethash`
   ;; no-ops on a NIL table, so the table MUST be created first.
   (unless (and *opcode-table* (> (hash-table-count *opcode-table*) 0))
     (setq *opcode-table* (make-hash-table :test (quote eql)))
@@ -585,12 +585,12 @@
   ;; effecting DEF*) and already compiled, re-interpret the cached module and
   ;; skip the whole compile pipeline.  Checked BEFORE the big let so a hit pays
   ;; none of the setup/hash-alloc cost either.
-  (let ((%cacheable (and (not *eval2-no-cache*) (%eval2-cacheable-p forms))))
+  (let ((%cacheable (and (not *mvm-eval-no-cache*) (%mvm-eval-cacheable-p forms))))
     (when %cacheable
-      (unless *eval2-cache*
-        (setq *eval2-cache* (make-hash-table :test (quote equal))))
-      (let ((%hit (gethash forms *eval2-cache*)))
-        (when %hit (return-from eval2-forms (%eval2-run-tuple %hit)))))
+      (unless *mvm-eval-cache*
+        (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
+      (let ((%hit (gethash forms *mvm-eval-cache*)))
+        (when %hit (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)
@@ -613,9 +613,9 @@
         ;; WS3 def persistence: names of top-level user DEFUNs in FORMS.  Each is
         ;; compiled as a real module function and, after the module builds,
         ;; installed as a re-entrant interp trampoline in the global function
-        ;; tables — so a LATER (eval2 …) call OR the tree-walker can call it.
-        ;; Without this every (eval2 '(defun f …)) discarded f (closed-world
-        ;; module), so no multi-form program (asdf/load/REPL) could run on eval2.
+        ;; tables — so a LATER (mvm-eval …) call OR the tree-walker can call it.
+        ;; Without this every (mvm-eval '(defun f …)) discarded f (closed-world
+        ;; module), so no multi-form program (asdf/load/REPL) could run on mvm-eval.
         ;; Computed AFTER register-mvm-bootstrap-macros (below) via
         ;; %e2-scan-persist, which sees through EVAL-WHEN / PROGN / LOCALLY
         ;; AND macro wrappers (with-upgradability) — see its docstring.
@@ -624,7 +624,7 @@
     ;; WS3 def persistence pre-scan.  Runs with *macro-table* freshly populated
     ;; (bootstrap macros) so %e2-scan-persist's macroexpand-1-mvm sees the same
     ;; macro environment the compile loop below will; runtime user macros
-    ;; resolve through the *eval2-runtime-p* fallback.
+    ;; resolve through the *mvm-eval-runtime-p* fallback.
     (dolist (f forms)
       (setq persist-names (%e2-scan-persist f persist-names 0)))
     ;; Split: last form is the expression; preceding forms are definitions.
@@ -639,10 +639,10 @@
                               (symbolp (cadr last-form))))
            (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
            (defs (if last-defun-p forms (reverse (cdr rforms))))
-           (toplevel (append defs (list (list (quote defun) (quote %eval2-thunk) nil expr))))
-           ;; REENTRANCY: a NESTED eval2 during this compile loop (the toplevel
+           (toplevel (append defs (list (list (quote defun) (quote %mvm-eval-thunk) nil expr))))
+           ;; REENTRANCY: a NESTED mvm-eval during this compile loop (the toplevel
            ;; DEFMACRO handler's expander eval, build-macrolet-expander,
-           ;; DEFCONSTANT value eval) re-enters eval2-forms, which clears and
+           ;; DEFCONSTANT value eval) re-enters mvm-eval-forms, which clears and
            ;; consumes *e2-persist-defuns* — clobbering the outer call's
            ;; accumulated names.  Save the current value in a LEXICAL here and
            ;; restore it after the union below, so each nesting level sees only
@@ -677,30 +677,30 @@
       ;; Union the compiler-recorded defun names (macro-hidden defuns the
       ;; raw-forms pre-scan can't see — with-upgradability → eval-when →
       ;; defun) into persist-names for the trampoline install loop below.
-      ;; %EVAL2-THUNK excludes itself by name.  NB: a NESTED eval2 during
+      ;; %MVM-EVAL-THUNK excludes itself by name.  NB: a NESTED mvm-eval during
       ;; this compile loop (a macroexpander that itself calls EVAL) would
       ;; clear/consume the global mid-flight; the pre-scan names remain as
       ;; the safety net in that (rare) case.
       (dolist (pn *e2-persist-defuns*)
-        (unless (or (string-equal pn "%EVAL2-THUNK")
+        (unless (or (string-equal pn "%MVM-EVAL-THUNK")
                     (member pn persist-names :test (function string=)))
           (setq persist-names (cons pn persist-names))))
-      ;; REENTRANCY: restore the enclosing eval2-forms call's recordings
+      ;; REENTRANCY: restore the enclosing mvm-eval-forms call's recordings
       ;; (see %e2pd-saved above).  Outermost call restores NIL — harmless.
       (setq *e2-persist-defuns* %e2pd-saved))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
     ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,
     ;; so nothing retains the buffer — safe to reset + reuse.
-    (if *eval2-buffer*
+    (if *mvm-eval-buffer*
         (progn
-          (setf (mvm-buffer-position *eval2-buffer*) 0)
-          (clrhash (mvm-buffer-labels *eval2-buffer*))
-          (setf (mvm-buffer-fixups *eval2-buffer*) nil)
-          (setq buf *eval2-buffer*))
+          (setf (mvm-buffer-position *mvm-eval-buffer*) 0)
+          (clrhash (mvm-buffer-labels *mvm-eval-buffer*))
+          (setf (mvm-buffer-fixups *mvm-eval-buffer*) nil)
+          (setq buf *mvm-eval-buffer*))
         (progn
           (setq buf (make-mvm-buffer :bytes (make-array 65536)))
-          (setq *eval2-buffer* buf)))
+          (setq *mvm-eval-buffer* buf)))
     ;; Pass 1: size each function, assign cumulative bytecode offsets, register
     ;; in *functions* so emit-time CALL resolution finds them.
     (dolist (e all-ir)
@@ -719,7 +719,7 @@
     ;; so registering the name at a runtime stub offset lets the interp's
     ;; op-FN-ADDR map that offset back to the name and load the REAL native
     ;; function OBJECT.  The subsequent CALL-INDIRECT then bridge-calls it —
-    ;; this is the higher-order eval2 path (funcall/apply/mapcar #'NAME).
+    ;; this is the higher-order mvm-eval path (funcall/apply/mapcar #'NAME).
     (dolist (e all-ir)
       (dolist (insn (cdr e))
         ;; The fn NAME is operand 1 for :call ((:call name nargs)) but operand 2
@@ -738,17 +738,17 @@
       (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
         (emit-bytecode-for-ir buf ir lp)))
     (dolist (e all-ir)
-      (when (string-equal (string (function-info-name (car e))) "%EVAL2-THUNK")
+      (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
         (setq entry (function-info-bytecode-offset (car e)))))
     (let ((bc (mvm-buffer-used-bytes buf)))
       (if entry
           (let ((fn-table (make-array (length all-ir))) (i 0)
                 ;; LAMBDA-OFFSETS: the bytecode entry offsets of in-module LAMBDA /
                 ;; CLOSURE bodies (named *$$LAMBDA* / *$$CLOSURE* by compile-lambda).
-                ;; The interp's native-bridge uses this to recognise an eval2 lambda
+                ;; The interp's native-bridge uses this to recognise an mvm-eval lambda
                 ;; VALUE escaping to a native higher-order fn (mapcar/reduce/…) and
                 ;; wrap it in a re-entrant trampoline.  Keyed by offset; ONLY genuine
-                ;; lambda bodies are recorded (never the %eval2-thunk / helper defuns
+                ;; lambda bodies are recorded (never the %mvm-eval-thunk / helper defuns
                 ;; / the fn at offset 0), so an ordinary fixnum DATA argument — a loop
                 ;; counter 0/1/2, an index — is never mistaken for a callable.
                 (lam-offsets (make-hash-table))
@@ -772,7 +772,7 @@
                 ;; (make-list "non-negative fixnum", remove returned input
                 ;; unchanged).  %mvm-lambda-offset-p has the matching read-side
                 ;; guard; data-0 priority is correct since the first module
-                ;; function is always a non-lambda (defun / %EVAL2-THUNK).
+                ;; function is always a non-lambda (defun / %MVM-EVAL-THUNK).
                 (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                          (not (eql off 0)))
                     (puthash off lam-offsets t)
@@ -791,12 +791,12 @@
                     (puthash off lam-offsets (quote :defun)))))
             ;; WS3 def persistence: install each top-level user DEFUN as a
             ;; re-entrant interp trampoline in BOTH global function tables —
-            ;; *symbol-function-table* by NAME (the eval2 native-call bridge's
+            ;; *symbol-function-table* by NAME (the mvm-eval native-call bridge's
             ;; %mvm-resolve-runtime-fn key) and *native-sym-function-table* by
             ;; HASH (symbol-function / funcall key).  The trampoline closes over
             ;; BC so the module bytecode stays GC-alive; fn-table + lam-offsets
             ;; are fully built by now; env = NIL (a top-level defun captures
-            ;; nothing).  A later (eval2 …) call OR the tree-walker now resolves f.
+            ;; nothing).  A later (mvm-eval …) call OR the tree-walker now resolves f.
             (when persist-names
               (dolist (e all-ir)
                 (let ((pn (string (function-info-name (car e)))))
@@ -817,14 +817,14 @@
                         (puthash (compute-name-hash pn)
                                  *native-sym-function-table* tramp)))))))
             ;; PERF Round 2: cache the compiled module for these forms so a
-            ;; later eval2 of the same forms skips the whole compile.  bc is a
+            ;; later mvm-eval of the same forms skips the whole compile.  bc is a
             ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
             (when %cacheable
-              (setf (gethash forms *eval2-cache*)
-                    ;; WS4-S5b: ft-list inserted at index 2 (see %eval2-run-tuple
+              (setf (gethash forms *mvm-eval-cache*)
+                    ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
                     ;; layout comment).  reverse → source order (fn-table order).
                     (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))
-            ;; Conditions PROPAGATE (see %eval2-run-tuple): production EVAL
+            ;; Conditions PROPAGATE (see %mvm-eval-run-tuple): production EVAL
             ;; must let an error signalled by the form reach the caller's
             ;; handler-case instead of returning (:interp-err e) as a value.
             ;; The RESULT is wrapped when it is an in-module #x52 lambda
@@ -832,11 +832,11 @@
             ;; ...))` hands back a natively-funcallable, per-call-distinct
             ;; function object.
             ;; MULTIPLE VALUES propagate — same *mvm-last-mv* + values-list
-            ;; re-emission as %eval2-run-tuple (see the comment there).
+            ;; re-emission as %mvm-eval-run-tuple (see the comment there).
             ;; *e2-active-defun-names* = persist-names for the duration of the
             ;; run so fmakunbound honors source order vs the pre-run defun
             ;; installation (see the defvar).  Lexical-save + setq-restore
-            ;; (nested eval2 during the run saves/restores its own).
+            ;; (nested mvm-eval during the run saves/restores its own).
             (let* ((%adn-saved *e2-active-defun-names*)
                    (%prim (progn
                             (setq *e2-active-defun-names* persist-names)
@@ -845,7 +845,7 @@
                             ;; %jit-active-p honors *jit-inhibit* (Class 3).
                             (if (%jit-active-p)
                                 (handler-case
-                                    (%eval2-jit-run bc entry (reverse ft-list)
+                                    (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil)
                                   (t (c)
                                      (setq *jit-fallback-count*
@@ -872,40 +872,40 @@
           :no-entry))))
   )
 ;; Single-expression convenience.
-(defun eval2 (form) (eval2-forms (list form)))
+(defun mvm-eval (form) (mvm-eval-forms (list form)))
 
 ;;; ============================================================
-;;; WS3 Phase 3 — eval2 lambda-body-against-env entry (%e2ic)
+;;; WS3 Phase 3 — mvm-eval lambda-body-against-env entry (%e2ic)
 ;;; ============================================================
 ;;;
 ;;; The tree-walker (%eval-in-env) could not be deleted because it was the
 ;;; only engine that could evaluate a LAMBDA BODY AGAINST A CAPTURED ENV —
 ;;; the %interp-closure call path (compile nil '(lambda …), coerce 'function,
 ;;; runtime define-compiler-macro expanders, walker-created closures) and
-;;; DEFTYPE expansion (%expand-deftype).  This block gives eval2 that entry:
+;;; DEFTYPE expansion (%expand-deftype).  This block gives mvm-eval that entry:
 ;;;
 ;;;   %e2ic-compile PARAMS BODY ENV → native trampoline (or NIL = fallback)
 ;;;
-;;; Design: compile `(lambda PARAMS (symbol-macrolet SM . BODY))` via eval2,
+;;; Design: compile `(lambda PARAMS (symbol-macrolet SM . BODY))` via mvm-eval,
 ;;; where SM maps each captured env binding NAME to `(cdr 'PAIR)` — PAIR
 ;;; being the walker's OWN alist binding cons, passed by identity through
-;;; the eval2 quote pool (*e2-const-pool*).  Reads see the live cell value;
+;;; the mvm-eval quote pool (*e2-const-pool*).  Reads see the live cell value;
 ;;; `(setq NAME v)` expands (compile-setq symbol-macro path) to
 ;;; `(set-cdr 'PAIR v)` — mutating the SAME cons the walker and any sibling
 ;;; closures share, so mutation semantics match the walker exactly.
-;;; eval2 returns the lambda as a re-entrant native trampoline
+;;; mvm-eval returns the lambda as a re-entrant native trampoline
 ;;; (%mvm-wrap-escaping-result → %mvm-make-trampoline), cached per closure
 ;;; (5th slot of the %interp-closure list) so repeated calls pay only the
 ;;; ~0.6M-cycle interpret, not the ~16M-cycle compile.
 ;;;
 ;;; WS3 STEP 4 (tree-walker DELETED from production images): there is no
-;;; walker fallback any more.  A shape outside eval2's lambda support —
+;;; walker fallback any more.  A shape outside mvm-eval's lambda support —
 ;;;   - junk lambda list (NIL / non-symbol atom element, unknown &-marker;
 ;;;     MACRO lambda lists — dotted tails, nested destructuring, &whole/
 ;;;     &environment/&body — are handled since the WS3 finisher via
 ;;;     compile-lambda's %transform-macro-lambda-list),
 ;;;   - a captured binding whose name is unresolvable,
-;;;   - eval2 COMPILE failure (conditions during the body's execution are NOT
+;;;   - mvm-eval COMPILE failure (conditions during the body's execution are NOT
 ;;;     caught — they propagate, matching production eval semantics)
 ;;; — now signals an honest ERROR instead of silently degrading to a second
 ;;; evaluator.  The legacy fork builds get the walker from tree-walker.lisp
@@ -920,12 +920,12 @@
 ;;; %e2ic-env-pairs / %e2ic-flet-bindings.)
 ;;;
 (defvar *e2ic-deftype-cache* nil
-  "name-string → (entry . trampoline-or-:walker) for %expand-deftype's eval2
+  "name-string → (entry . trampoline-or-:walker) for %expand-deftype's mvm-eval
    route.  The registered (params . body) ENTRY cons is stored alongside so a
    re-registered deftype (entry no longer eq) recompiles.")
 
-(defun %e2ic-eval2-nocache (form)
-  "eval2 FORM with *eval2-cache* bypassed (see *eval2-no-cache*): the form
+(defun %e2ic-mvm-eval-nocache (form)
+  "mvm-eval FORM with *mvm-eval-cache* bypassed (see *mvm-eval-no-cache*): the form
    embeds captured env conses via the quote pool, so EQUAL-keyed caching
    would alias two different closures' cells.  setq + unwind-protect (not a
    let of the special — compiled let of a special is unreliable in-image).
@@ -934,7 +934,7 @@
    interp-closure trampoline with the JIT DISABLED.  An %interp-closure's
    trampoline is ALWAYS run via mvm-interpret (%mvm-make-trampoline re-enters
    the interpreter; *jit-native-count* does not move for its body), so
-   JIT-translating its %eval2-thunk is pure overhead — AND it triggers a
+   JIT-translating its %mvm-eval-thunk is pure overhead — AND it triggers a
    native<->interp boundary fault: when this thunk is built under the JIT and
    the resulting interp-closure body makes a REAL out-of-module call whose
    callee is itself an interp trampoline (a user DEFUN persisted via
@@ -951,14 +951,14 @@
    that ignores *use-jit*, so *jit-inhibit* + the %jit-active-p seam gate is
    the only inhibit that works in BOTH the CLI and the gate image.  Lexically
    saved + setq-restored (do NOT dynamically rebind the special: compiled let
-   of a special is unreliable in-image — see *eval2-no-cache* above)."
-  (let ((%saved *eval2-no-cache*)
+   of a special is unreliable in-image — see *mvm-eval-no-cache* above)."
+  (let ((%saved *mvm-eval-no-cache*)
         (%savedinh (if (boundp (quote *jit-inhibit*)) *jit-inhibit* nil)))
-    (setq *eval2-no-cache* t)
+    (setq *mvm-eval-no-cache* t)
     (setq *jit-inhibit* t)
     (unwind-protect
-        (eval2 form)
-      (setq *eval2-no-cache* %saved)
+        (mvm-eval form)
+      (setq *mvm-eval-no-cache* %saved)
       (setq *jit-inhibit* %savedinh))))
 
 (defun %e2ic-ll-marker (x)
@@ -969,7 +969,7 @@
         nil)))
 
 (defun %e2ic-simple-ll-p (params)
-  "T when PARAMS is a lambda list the eval2 compile path handles.  Since
+  "T when PARAMS is a lambda list the mvm-eval compile path handles.  Since
    the WS3 finisher (stage 2), MACRO-style lambda lists are ACCEPTED too —
    dotted tails, nested destructuring in the required section, and
    &whole/&environment/&body — because compile-lambda rewrites them to a
@@ -1096,7 +1096,7 @@
 
 (defun %e2ic-sm-bindings (pairs)
   "symbol-macrolet bindings: NAME → (cdr 'PAIR), PAIR by identity via the
-   eval2 quote pool."
+   mvm-eval quote pool."
   (let ((out nil))
     (dolist (pair pairs (reverse out))
       (setq out (cons (list (car pair)
@@ -1134,7 +1134,7 @@
 
 (defun %e2ic-compile (params body env)
   "Compile an interp-closure\'s PARAMS/BODY/ENV to a native re-entrant
-   trampoline via eval2, or NIL when the shape needs the walker.  Only the
+   trampoline via mvm-eval, or NIL when the shape needs the walker.  Only the
    COMPILE step is guarded by handler-case — the body does not run here, so
    falling back cannot double side effects.  Captured env: value bindings
    become symbol-macrolet entries over the live env conses; interp-closure
@@ -1161,7 +1161,7 @@
                                               inner)))
                             (cons (quote lambda) (cons params body)))))
              (handler-case
-                 (let ((tramp (%e2ic-eval2-nocache form)))
+                 (let ((tramp (%e2ic-mvm-eval-nocache form)))
                    (if (functionp tramp) tramp nil))
                (t (c) nil))))))))
 
@@ -1180,8 +1180,8 @@
 
 (defun %e2ic-apply (tramp args)
   "Apply the compiled trampoline and re-emit the interpret run's multiple
-   values (same *mvm-last-mv* protocol as %eval2-run-tuple) so MV parity
-   with production eval2 holds through the closure boundary."
+   values (same *mvm-last-mv* protocol as %mvm-eval-run-tuple) so MV parity
+   with production mvm-eval holds through the closure boundary."
   (let* ((%r (apply tramp args))
          (%mv *mvm-last-mv*))
     (if %mv
@@ -1195,7 +1195,7 @@
    could NOT serve.  Historical: counted tree-walker fallbacks until the
    walker was DELETED (the deletion census measured ZERO hits across the
    full ANSI corpus + gauntlet); now counts SIGNALED unsupported-shape
-   errors — any nonzero value marks a fresh eval2 capability gap.
+   errors — any nonzero value marks a fresh mvm-eval capability gap.
    BOOTS AS NIL, not 0: defvar init-thunks never run in the ANSI image
    (CLAUDE.md Active Limitation 7) — increment ONLY via %e2ic-bump-fallback.")
 
@@ -1225,7 +1225,7 @@
     (cond
       ((eq c (quote :e2ic-fail))
        (%e2ic-bump-fallback)
-       (error "eval2: interp-closure shape unsupported (cached compile failure)"))
+       (error "mvm-eval: interp-closure shape unsupported (cached compile failure)"))
       (c (%e2ic-apply c args))
       (t
        (let ((tramp (%e2ic-compile (cadr fn) (caddr fn) (cadddr fn))))
@@ -1234,13 +1234,13 @@
              (%e2ic-apply tramp args)
              (progn
                (%e2ic-bump-fallback)
-               (error "eval2: interp-closure compile failed (params=~S)"
+               (error "mvm-eval: interp-closure compile failed (params=~S)"
                       (cadr fn)))))))))
 
 (defun %expand-deftype (type)
-  "OVERRIDE (eval2 images; last-defun-wins) of ansi-bridge's engine stub:
-   route the deftype body eval through the eval2 lambda-body entry, cached
-   per registration (name → (entry . trampoline)).  A deftype body eval2
+  "OVERRIDE (mvm-eval images; last-defun-wins) of ansi-bridge's engine stub:
+   route the deftype body eval through the mvm-eval lambda-body entry, cached
+   per registration (name → (entry . trampoline)).  A deftype body mvm-eval
    can't compile SIGNALS (the tree-walker is deleted)."
   (let* ((head (if (consp type) (car type) type))
          (args (if (consp type) (cdr type) nil))
@@ -1255,7 +1255,7 @@
          (if (and hit (eq (car hit) entry))
              (if (eq (cdr hit) (quote :e2ic-fail))
                  (progn (%e2ic-bump-fallback)
-                        (error "eval2: deftype expander compile failed (type=~S)"
+                        (error "mvm-eval: deftype expander compile failed (type=~S)"
                                type))
                  (%e2ic-apply (cdr hit) args))
              (let ((tramp (%e2ic-compile (car entry) (cdr entry) nil)))
@@ -1268,5 +1268,5 @@
                (if tramp
                    (%e2ic-apply tramp args)
                    (progn (%e2ic-bump-fallback)
-                          (error "eval2: deftype expander compile failed (type=~S)"
+                          (error "mvm-eval: deftype expander compile failed (type=~S)"
                                  type))))))))))

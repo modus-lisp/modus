@@ -155,7 +155,7 @@
         (eval form)))))
 
 (defun %cli-load-file (path)
-  "Load PATH (a Lisp source file) via the runtime LOAD (eval2)."
+  "Load PATH (a Lisp source file) via the runtime LOAD (mvm-eval)."
   (load path))
 
 ;;; ===========================================================================
@@ -163,7 +163,7 @@
 ;;; ===========================================================================
 
 (defun %cli-print-version ()
-  (%cli-line "Modus 0.1 (hosted CLI; self-hosted MVM, eval2)"))
+  (%cli-line "Modus 0.1 (hosted CLI; self-hosted MVM, mvm-eval)"))
 
 (defun %cli-print-help ()
   (%cli-line "Usage: modus [options] [--end-toplevel-options args...]")

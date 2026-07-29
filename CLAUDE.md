@@ -76,11 +76,11 @@ mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-packages.lisp     909L  Package system (intern, defpackage, etc.)
   cl-conditions.lisp   915L  Condition system (24 types, handler-bind, restarts)
   cl-clos.lisp         429L  CLOS (defclass, defgeneric, defmethod, dispatch)
-  cl-eval.lisp       3,575L  Eval/compile/load (eval2), symbol-function table
+  cl-eval.lisp       3,575L  Eval/compile/load (mvm-eval), symbol-function table
   cl-types.lisp        519L  typep, coerce, numeric helpers
   ansi-bridge.lisp   1,888L  Test helpers (eqlt, scaffold, stubs)
   gc.lisp                    GC helper functions (Lisp-side)
-  eval2.lisp                 Production eval: compile→MVM bytecode→interpret
+  mvm-eval.lisp                 Production eval: compile→MVM bytecode→interpret
   interp.lisp                MVM bytecode interpreter (in-image)
 
 runtime/        Runtime type system
@@ -167,7 +167,7 @@ CLOS              ~  defclass, defgeneric, defmethod, standard method combinatio
                      :before/:after/:around, call-next-method, class precedence lists
                      (define-method-combination tests fail)
 File I/O          ✓  Linux syscalls, file streams, open/close, pathnames
-Eval/Compile/Load ✓  eval2 (compile→MVM bytecode→interpret) is production eval/load
+Eval/Compile/Load ✓  mvm-eval (compile→MVM bytecode→interpret) is production eval/load
 Closures          ✓  Mutable closures via heap-allocated cells
 unwind-protect    ✓  setjmp/longjmp, cleanup on both normal and error paths
 GC                ✓  Cheney semi-space copying collector
@@ -183,9 +183,9 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 
 ```
 [✓] Runtime compile (source → bytecode → interpret): SHIPPED — production
-    `eval`/`load` default to eval2 (compile to MVM bytecode + mvm-interpret)
+    `eval`/`load` default to mvm-eval (compile to MVM bytecode + mvm-interpret)
     as of d3434e6 (WS3 flip, 2026-07-03).  Post-flip full ANSI: 17321/17318
-    vs tree-walker 17311 (net positive).  MODUS_NO_EVAL2=1 = rollback.
+    vs tree-walker 17311 (net positive).  MODUS_NO_MVM_EVAL=1 = rollback.
     Compile-caching (~20x for repeated forms) serves load/asdf patterns.
     bytecode→native at runtime (the JIT) is WS4.
 [ ] compile-file → FASL
@@ -198,14 +198,14 @@ Setf              ~  defsetf (short + CLHS-correct long form), define-setf-expan
 
 There is ONE evaluator.  Production `eval`/`load` compile the form to MVM
 bytecode via the self-hosted compiler and run it through `mvm-interpret`
-(eval2).  The tree-walker (`%eval-in-env`) is GONE from the repository —
+(mvm-eval).  The tree-walker (`%eval-in-env`) is GONE from the repository —
 deleted after every consumer was ported: the x64-Linux gate image, the
 generic/gauntlet image, the bare-metal x64 runner (build-x64.lisp), the
 Linux/AArch64 runner (build-aarch64-linux.lisp, verified natively on a
 Pi 5), and the bare-metal AArch64 runner (build-aarch64.lisp).  The
 deletion was census-gated: an instrumented build measured ZERO walker
 fallback invocations across the full ANSI corpus and the asdf gauntlet.
-An interp-closure shape eval2 cannot compile now SIGNALS an honest error
+An interp-closure shape mvm-eval cannot compile now SIGNALS an honest error
 (*e2ic-fallback-count* is the diagnostic; nonzero = new capability gap).
 E2SMOKE (the in-image compile→interpret self-test) passes at boot on
 x64-Linux, bare x64, aarch64-Linux (native Pi 5), and bare aarch64.
@@ -220,7 +220,7 @@ unwind-protect-cleanup NLX).
 
 ## WS4 — the runtime JIT (bytecode→native at runtime): LANDED + FLIPPED ON
 
-The self-hosted MVM compiler now JITs eval2 forms to native x86-64 at runtime
+The self-hosted MVM compiler now JITs mvm-eval forms to native x86-64 at runtime
 (translate-mvm-to-x64 → mmap exec page → call-relocation → %jit-call), and it is
 the **DEFAULT** for the shipping `build-generic-cli` image (`*jit-on*` defaults
 T; rollback = `MODUS_NO_JIT=1`).  Flip-clean, validated two ways: the full
@@ -542,7 +542,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
      operands.** `(* -4611686018427387904 2)` and
      `(+ -4611686018427387904 -4611686018427387904)` both return small positive
      GARBAGE instead of −2^63 (positive overflow promotes fine). A real arithmetic
-     correctness bug. CAVEAT: observed only via the self-host binary's eval2 so
+     correctness bug. CAVEAT: observed only via the self-host binary's mvm-eval so
      far — confirm it reproduces in the ANSI / build-generic path before treating
      it as definitively core (this session mis-attributed several bugs; verify
      first).
@@ -627,7 +627,7 @@ SIGSEGV handler + NIL=#xDEAD0001 fixes closed that class, and a fuzz sweep
 produced **zero diff** vs baseline.  When a change appears to break something
 unrelated, the cause is a real semantic regression — bisect to it.  Almost
 always one of: an auto-extracted runtime macro now shadowing a validating
-runtime function (the eval2-CLOS make-instance case), a missing rewrite, a
+runtime function (the mvm-eval-CLOS make-instance case), a missing rewrite, a
 name collision (last-defun-wins), a subtag collision, or a missing gc-check.
 
 If you still suspect layout, the fuzz knob settles it in one build: set

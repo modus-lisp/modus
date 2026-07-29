@@ -406,8 +406,8 @@
 
 (defparameter *opcode-table* (make-hash-table :test 'eql))
 
-;; eval2 QUOTE constant pool (in-image runtime compile ONLY).  compile-quote
-;; under *eval2-runtime-p* registers each quoted VALUE here (via
+;; mvm-eval QUOTE constant pool (in-image runtime compile ONLY).  compile-quote
+;; under *mvm-eval-runtime-p* registers each quoted VALUE here (via
 ;; %e2-const-register in compiler.lisp) and emits `:li-const dest idx`; the
 ;; interpreter's op-LI-CONST loads the ORIGINAL object back, preserving QUOTE
 ;; identity (CLHS: quote returns its object) exactly like the tree-walker.
@@ -416,7 +416,7 @@
 ;; %e2-const-register (defvar init-thunks don't run in-image — CLAUDE.md
 ;; limitation 7).
 (defvar *e2-const-pool* nil
-  "In-image eval2 quote pool: hash-table idx -> original quoted value.")
+  "In-image mvm-eval quote pool: hash-table idx -> original quoted value.")
 (defvar *e2-const-count* 0
   "Next free index in *e2-const-pool*.")
 
@@ -597,8 +597,8 @@
 
 (defun mvm-emit-byte (buf byte)
   "Emit a single byte to the MVM bytecode buffer, growing it on demand.
-   The bounds check is load-bearing: the in-image eval2 path compiles into
-   a persistent 64K-element buffer (eval2.lisp — the host 128MB default
+   The bounds check is load-bearing: the in-image mvm-eval path compiles into
+   a persistent 64K-element buffer (mvm-eval.lisp — the host 128MB default
    blows the in-image heap), and in-image AREF stores have NO bounds check.
    Without the grow, a single form whose compiled bytecode exceeds the
    capacity (asdf's big with-upgradability blocks pass 64KB) silently

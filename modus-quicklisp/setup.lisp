@@ -15,7 +15,7 @@
 ;;;;
 ;;;;   (load "/abs/path/to/modus/modus-quicklisp/setup.lisp")
 ;;;;
-;;;; What it does, at RUNTIME, using ONLY the base CL runtime + eval2 that
+;;;; What it does, at RUNTIME, using ONLY the base CL runtime + mvm-eval that
 ;;;; build-generic-cli ships:
 ;;;;
 ;;;;   1. Defines the QL package + ql:quickload over install-tarball.
@@ -25,7 +25,7 @@
 ;;;; lib/install-tarball.lisp) is baked into build-generic-cli as a GENERAL
 ;;;; library primitive (install-tarball / tar-extract / ...), NOT as ql.  It is
 ;;;; baked rather than runtime-(load)ed because %tar-slice's `(make-array LEN)`
-;;;; with a variable size hits a pre-existing eval2 bug (a variable-size
+;;;; with a variable size hits a pre-existing mvm-eval bug (a variable-size
 ;;;; make-array returns a half-length array under the interpreter, truncating
 ;;;; any >512-byte tar entry so its source won't READ); the native build
 ;;;; compiles it correctly.  See mvm/build-generic-cli.lisp's *bridge-source*

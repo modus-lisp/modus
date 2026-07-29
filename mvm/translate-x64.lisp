@@ -709,8 +709,10 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
-             ((= code #x0505)
-              ;; %MMAP-EXEC-PAGE: anonymous PRIVATE mmap with PROT_RWX (=7).
+             ((= code #x0531)
+              ;; %MMAP-EXEC-PAGE (arch-neutral JIT trap; was #x0505 which
+              ;; collides with the AArch64 fileio/alarm block).
+              ;; anonymous PRIVATE mmap with PROT_RWX (=7).
               ;; V0(RSI) = size (tagged fixnum, page multiple).
               ;; Result = mmap address, stored in V0(RSI) tagged.
               ;; The ONE new primitive for the WS4 JIT: a page you can WRITE
@@ -739,8 +741,14 @@
               (emit-bytes buf #x41 #x58)         ; pop r8
               (emit-bytes buf #x5A)              ; pop rdx
               (emit-bytes buf #x5F))             ; pop rdi
-             ((= code #x0506)
-              ;; %JIT-CALL: call a JIT'd native function whose entry address is
+             ((= code #x0533)
+              ;; %JIT-ICACHE-FLUSH: no-op on x86-64 (coherent I-cache — writes
+              ;; to an exec page are visible to fetch without maintenance).
+              ;; AArch64 does the DC CVAU / IC IVAU loop here instead.
+              (emit-bytes buf #x90))            ; nop
+             ((= code #x0532)
+              ;; %JIT-CALL (arch-neutral; was #x0506).
+              ;; call a JIT'd native function whose entry address is
               ;; in V0(RSI) as a TAGGED fixnum (the Lisp integer of the byte
               ;; address, so its native word = addr<<1).  Untag (SAR 1) to get
               ;; the raw address, then indirect-CALL it.  The callee sets up its

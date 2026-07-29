@@ -1798,6 +1798,66 @@
                 (a64-movz buf +a64-x8+ 38 0)            ; renameat
                 (a64-svc buf 0)
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((and *aarch64-linux-mode* (= code #x0531))
+                ;; %MMAP-EXEC-PAGE (WS4 JIT exec-memory primitive; arch-neutral
+                ;; trap — x64 uses the same #x0531).  mmap(NULL, size,
+                ;; PROT_RWX=7, MAP_PRIVATE|MAP_ANON=0x22, -1, 0).
+                ;; V0(x0)=size(tagged); result = address (tagged).  mmap = 222.
+                ;; Same shape as #x0504 (mmap-shared) but PROT_RWX + PRIVATE.
+                (a64-asr-imm buf +a64-x1+ +a64-x0+ 1)   ; x1 = size
+                (a64-movz buf +a64-x0+ 0 0)             ; x0 = NULL
+                (a64-movz buf +a64-x2+ 7 0)             ; x2 = PROT_READ|WRITE|EXEC
+                (a64-movz buf +a64-x3+ #x22 0)          ; x3 = MAP_PRIVATE|MAP_ANON
+                (a64-emit buf (logior #x92800000 (ash 0 5) +a64-x4+)) ; x4 = -1 (fd)
+                (a64-movz buf +a64-x5+ 0 0)             ; x5 = offset
+                (a64-movz buf +a64-x8+ 222 0)
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))  ; tag result
+               ((= code #x0532)
+                ;; %JIT-CALL (arch-neutral trap; x64 uses the same #x0532).
+                ;; V0(x0) = entry byte-address as a TAGGED fixnum (word =
+                ;; addr<<1).  Untag (ASR 1), then BLR it.  BLR clobbers x30
+                ;; (our own return address), so save/restore the caller's LR
+                ;; across the call via a pre/post-indexed stack slot.  The
+                ;; JIT'd thunk sets up its own AAPCS frame and returns its
+                ;; value in x0 — which IS VR on AArch64 (vreg-vr → x0), so no
+                ;; extra move is needed.
+                (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)     ; x0 = raw entry addr
+                (a64-str-pre buf +a64-x30+ +a64-sp+ -16)  ; STR x30,[sp,#-16]!
+                (a64-blr buf +a64-x0+)                     ; call (result → x0)
+                (a64-ldr-post buf +a64-x30+ +a64-sp+ 16)) ; LDR x30,[sp],#16
+               ((= code #x0533)
+                ;; %JIT-ICACHE-FLUSH base len (arch-neutral trap; NO-OP on x64).
+                ;; After writing native bytes into a %mmap-exec-page region,
+                ;; make them fetchable: clean the D-cache to PoU then invalidate
+                ;; the I-cache over [base, base+len).  x86-64 needs none of this
+                ;; (coherent I-fetch); AArch64 does, or the core executes stale
+                ;; I-cache — a SILENT failure (works under qemu-user, crashes on
+                ;; real Cortex-A hardware).  Stride 16 = the ARMv8 minimum cache
+                ;; line; a stride no larger than the true line size is always
+                ;; safe (redundant maintenance is harmless), so this is correct
+                ;; on any implementation without reading CTR_EL0.
+                ;; V0(x0)=base(tagged, page-aligned), V1(x1)=len(tagged).
+                (a64-asr-imm buf +a64-x9+ +a64-x0+ 1)     ; x9  = base (raw)
+                (a64-asr-imm buf +a64-x10+ +a64-x1+ 1)    ; x10 = len
+                (a64-add-reg buf +a64-x10+ +a64-x9+ +a64-x10+ 0 0) ; x10 = end
+                ;; D-cache clean to PoU
+                (a64-mov-reg buf +a64-x14+ +a64-x9+)      ; cursor = base
+                (let ((d-top (a64-current-index buf)))
+                  (a64-emit buf (logior #xD50B7B20 +a64-x14+)) ; DC CVAU, x14
+                  (a64-add-imm buf +a64-x14+ +a64-x14+ 16)
+                  (a64-cmp-reg buf +a64-x14+ +a64-x10+)
+                  (a64-bcond buf +cc-cc+ (- d-top (a64-current-index buf)))) ; B.LO
+                (a64-dsb buf #xB)                          ; DSB ISH
+                ;; I-cache invalidate to PoU
+                (a64-mov-reg buf +a64-x14+ +a64-x9+)      ; cursor = base
+                (let ((i-top (a64-current-index buf)))
+                  (a64-emit buf (logior #xD50B7520 +a64-x14+)) ; IC IVAU, x14
+                  (a64-add-imm buf +a64-x14+ +a64-x14+ 16)
+                  (a64-cmp-reg buf +a64-x14+ +a64-x10+)
+                  (a64-bcond buf +cc-cc+ (- i-top (a64-current-index buf)))) ; B.LO
+                (a64-dsb buf #xB)                          ; DSB ISH
+                (a64-isb buf))                             ; ISB
                ((= code #x0510)
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:

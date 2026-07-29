@@ -4955,6 +4955,11 @@
       ;; (%jit-call entry-addr) — call JIT'd native code at ENTRY-ADDR.
       ((= op-name (compute-name-hash "%JIT-CALL"))
        (compile-jit-call (cdr form) env dest))
+      ;; (%jit-icache-flush base len) — make freshly-written JIT bytes in
+      ;; [base,base+len) executable.  AArch64 needs D-cache clean + I-cache
+      ;; invalidate; x64 is a no-op.
+      ((= op-name (compute-name-hash "%JIT-ICACHE-FLUSH"))
+       (compile-jit-icache-flush (cdr form) env dest))
       ;; (%get-cenv) — read the closure-env register (R13 on x64) into
       ;; DEST. Used only by the closure body prologue to snapshot the
       ;; env-list set by the caller's compile-funcall closure path.
@@ -13369,21 +13374,38 @@
 (defun compile-mmap-exec (args env dest)
   "Compile (%mmap-exec-page size) — allocate a PROT_RWX anonymous PRIVATE
    mmap region of SIZE bytes (page-multiple).  Result is the tagged mmap
-   address.  Uses TRAP #x0505 (WS4 JIT exec-memory primitive).  You can
-   write native bytes into it via (setf (mem-ref addr :u8) ...) and then
-   execute them via (%jit-call addr)."
+   address.  Uses TRAP #x0531 (WS4 JIT exec-memory primitive — arch-neutral:
+   #x0505 collides with the AArch64 fileio/alarm trap block, so the JIT
+   primitives live at #x0531..#x0533 which are free on every translator).
+   You can write native bytes into it via (setf (mem-ref addr :u8) ...),
+   flush with (%jit-icache-flush addr len), then execute via (%jit-call addr)."
   (compile-form (car args) env +vreg-v0+)
-  (emit-ir :trap #x0505)
+  (emit-ir :trap #x0531)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-jit-call (args env dest)
   "Compile (%jit-call entry-addr) — call a JIT'd native function whose
-   entry byte-address is ENTRY-ADDR (a tagged fixnum).  Uses TRAP #x0506,
-   which untags (SAR 1) and `call rsi`.  The callee returns its value in
-   VR(RAX)."
+   entry byte-address is ENTRY-ADDR (a tagged fixnum).  Uses TRAP #x0532,
+   which untags (>>1) and indirect-calls it (x64 `call rsi`; AArch64
+   `blr x0` with LR saved).  The callee returns its value in VR."
   (compile-form (car args) env +vreg-v0+)
-  (emit-ir :trap #x0506)
+  (emit-ir :trap #x0532)
   (emit-ir :mov dest +vreg-vr+))
+
+(defun compile-jit-icache-flush (args env dest)
+  "Compile (%jit-icache-flush base len) — after writing native bytes into a
+   %mmap-exec-page region [base, base+len), make them executable.  On AArch64
+   this cleans the D-cache to PoU and invalidates the I-cache over the range
+   (self-modifying-code coherency, which x86-64 handles in hardware).  Uses
+   TRAP #x0533 — a NO-OP on x64, the DC CVAU / IC IVAU loop on AArch64.
+   V0 = base, V1 = len."
+  (compile-form (car args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadr args) env dest)
+  (emit-ir :mov +vreg-v1+ dest)
+  (emit-ir :pop +vreg-v0+)
+  (emit-ir :trap #x0533)
+  (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-read-char-serial (dest)
   "Compile (read-char-serial) — read a character from the serial port.

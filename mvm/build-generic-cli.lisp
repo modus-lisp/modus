@@ -138,9 +138,19 @@
 ;;; a %init-x64-translator co-init, run %init-x64-translator at boot, and bake
 ;;; %jit-enabled-p to return T.  When JIT is OFF none of this source is added, so
 ;;; the default image stays byte-identical to before.
+;; FLIP (2026-07, WS4 #197): the runtime JIT is now the DEFAULT for the shipping
+;; CLI.  It is flip-clean — the full ANSI gate (64-shard NET) is reg=0 / gain=+2 /
+;; CHUNK-CRASH=0 JIT-on vs JIT-off, and the JIT-vs-interpret differential harness
+;; (422 boundary forms) shows zero JIT wrong-values.  Any form the translator
+;; can't handle falls back cleanly to mvm-interpret (the %jit-translate-page
+;; guard), so correctness is preserved by construction.  Rollback: MODUS_NO_JIT=1
+;; (or an explicit MODUS_USE_JIT=0) rebuilds the pure-interpret image.
 (defvar *jit-on*
-  (let ((v (sb-ext:posix-getenv "MODUS_USE_JIT")))
-    (and v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))))
+  (let ((no (sb-ext:posix-getenv "MODUS_NO_JIT"))
+        (v  (sb-ext:posix-getenv "MODUS_USE_JIT")))
+    (cond ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
+          (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
+          (t t))))                                    ; DEFAULT: JIT ON
 
 (defvar *x64-asm-source* (when *jit-on* (mvm-text "mvm/x64-asm.lisp")))
 ;; Shrink the code-buffer default from 96MB to 64KB (grows on demand) so a JIT

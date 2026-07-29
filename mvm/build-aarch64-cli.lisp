@@ -63,6 +63,88 @@
         (setq n (+ (* n 10) (- b 48)))
         (setq i (+ i 1))))))
 
+;; WS4 aarch64 Stage 4 helper: patch a MOVZ/MOVK quad (4 consecutive words) at
+;; BASE+OFF with the 4 imm16 halves of VAL.  Reads each placeholder word and ORs
+;; in (half << 5) — register-agnostic (li-const / fn-addr sites may target any
+;; Xd, not just x16), because a64-movz/a64-movk emit the correct rd+opcode base
+;; with imm=0 and the imm16 field (bits 5-20) is zero in the placeholder.
+(defun %jit-patch-quad (base off val)
+  (let ((k 0))
+    (loop
+      (when (>= k 4) (return nil))
+      (let* ((wo (+ off (* k 4)))
+             (w (logior (mem-ref (+ base wo) :u8)
+                        (ash (mem-ref (+ base (+ wo 1)) :u8) 8)
+                        (ash (mem-ref (+ base (+ wo 2)) :u8) 16)
+                        (ash (mem-ref (+ base (+ wo 3)) :u8) 24)))
+             (imm (logand (ash val (- (* k 16))) #xFFFF))
+             (nw (logior w (ash imm 5))))
+        (setf (mem-ref (+ base wo) :u8) (logand nw 255))
+        (setf (mem-ref (+ base (+ wo 1)) :u8) (logand (ash nw -8) 255))
+        (setf (mem-ref (+ base (+ wo 2)) :u8) (logand (ash nw -16) 255))
+        (setf (mem-ref (+ base (+ wo 3)) :u8) (logand (ash nw -24) 255)))
+      (setq k (+ k 1)))))
+
+;; WS4 aarch64 Stage 3/4: JIT-compile FORM, copy to an exec page, patch ALL
+;; three reloc classes (out-of-module CALL = untagged word-3; out-of-module
+;; #'NAME fn-addr = tagged word; quoted-literal li-const = pool obj tagged word),
+;; icache-flush, %jit-call.  Returns (interp-result . jit-result) for a
+;; differential compare (NORELOC in cdr if a reloc failed to resolve).
+(defun %jit-run-form (form)
+  (let* ((tuple (%mvm-eval-compile-tuple (list form)))
+         (bc (car tuple)) (entry (cadr tuple)) (ft-list (caddr tuple))
+         (rt-table (car (cddddr tuple)))
+         (ftbl (make-hash-table :test (quote eql))))
+    (let ((i 0)) (dolist (e ft-list) (setf (gethash i ftbl) (cadr e)) (setq i (+ i 1))))
+    (multiple-value-bind (nbuf fn-map) (translate-mvm-to-aarch64 bc ftbl)
+      (let ((nwords (a64-buffer-position nbuf)) (code (a64-buffer-code nbuf))
+            (eoff (gethash entry fn-map))
+            (crel *aarch64-call-relocs*)
+            (frel *aarch64-fn-addr-relocs*)
+            (cpat *aarch64-li-const-patches*)
+            (base (%mmap-exec-page 16384)) (k 0) (ok t))
+        (loop
+          (when (>= k nwords) (return nil))
+          (let ((w (aref code k)) (o (* k 4)))
+            (setf (mem-ref (+ base o) :u8) (logand w 255))
+            (setf (mem-ref (+ base (+ o 1)) :u8) (logand (ash w -8) 255))
+            (setf (mem-ref (+ base (+ o 2)) :u8) (logand (ash w -16) 255))
+            (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
+          (setq k (+ k 1)))
+        ;; Out-of-module CALL relocations (untagged callee addr = word-3).
+        (dolist (r crel)
+          (let* ((name (gethash (cdr r) rt-table))
+                 (fn (and name (%mvm-resolve-runtime-fn name)))
+                 (addr (if fn (- (%val->word fn) 3) 0)))
+            (if (> addr 0) (%jit-patch-quad base (car r) addr) (setq ok nil))))
+        ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
+        (dolist (r frel)
+          (let* ((name (gethash (cdr r) rt-table))
+                 (fn (and name (%mvm-resolve-runtime-fn name)))
+                 (word (if fn (%val->word fn) 0)))
+            (if (> word 0) (%jit-patch-quad base (car r) word) (setq ok nil))))
+        ;; Quoted-literal / string li-const patches (pool object tagged word).
+        (dolist (p cpat)
+          (let* ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+            (%jit-patch-quad base (car p) (%val->word obj))))
+        (%jit-icache-flush base (* nwords 4))
+        (if (and ok eoff)
+            (%jit-call (+ base eoff))
+            (quote NORELOC))))))
+
+(defun %jit-pv (x)
+  (if (integerp x) (print-dec x) (write-string-serial \"NI\")))
+
+(defun %jit-diff-probe (label form)
+  (write-string-serial label)
+  (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
+        (jv (handler-case (%jit-run-form form) (t (c) (quote JERR)))))
+    (if (eql iv jv)
+        (progn (write-string-serial \"MATCH v=\") (%jit-pv iv))
+        (progn (write-string-serial \"MISMATCH i=\") (%jit-pv iv)
+               (write-string-serial \" j=\") (%jit-pv jv))))
+  (write-char-serial 10))
+
 (defun kernel-main ()
   ;; Banner: CLI-BOOT
   (write-string-serial \"CLI-BOOT\") (write-char-serial 10)
@@ -236,6 +318,16 @@
                   (write-string-serial \"NORELOC\"))))))
     (t (c) (write-string-serial \"ERR\")))
   (write-char-serial 10)
+
+  ;; (4) WS4 aarch64 STAGE 4: const-pool + fn-addr relocation, via %jit-run-form
+  ;;     (patches call + fn-addr + li-const quads).  Each probe compares the JIT
+  ;;     result to mvm-interpret.
+  ;;       const: (car '(42 7))                     — quoted-list li-const → 42
+  ;;       str:   (length \"hello\")                   — string li-const + CALL → 5
+  ;;       fn:    (funcall #'car '(9 8)) via a var   — out-of-module fn-addr → 9
+  (%jit-diff-probe \"aa64s4-const=\" (quote (car (quote (42 7)))))
+  (%jit-diff-probe \"aa64s4-str=\"   (quote (length \"hello\")))
+  (%jit-diff-probe \"aa64s4-fn=\"    (quote (let ((f (function length))) (funcall f (quote (9 8 7))))))
 
   (write-string-serial \"CLI-DONE\") (write-char-serial 10)
   (sys-exit 0))

@@ -211,6 +211,16 @@
    offset.  Bound freshly to nil per JIT translation; empty for any hazard-free
    (rt-empty) module, so flag-off / hazard-free translation is byte-identical.")
 
+(defvar *aarch64-fn-addr-relocs* nil
+  "WS4 aarch64 Stage 4.  List of (movz-quad-native-byte-offset . synthetic-mvm-
+   offset) for OUT-OF-MODULE #'NAME value-loads (op-fn-addr to a synthetic
+   runtime offset) collected during a JIT translation.  Under *aarch64-jit-mode*
+   op-fn-addr to a synthetic offset emits a full MOVZ/MOVK quad placeholder
+   (instead of the sentinel-0 the whole-image path uses) and records the site
+   here; the JIT driver patches it with the fn's TAGGED native word
+   (%val->word fn — a value load keeps the +tag-function+ tag, NOT word-3).
+   Nil at image build → whole-image codegen unchanged.")
+
 (defvar *aarch64-code-base-patch-offset* nil
   "Byte offset of the MOVZ that loads code_base in the boot stub's
    emit-aarch64-code-bounds-init block.  Patched at link time by
@@ -3769,6 +3779,22 @@
                 (a64-movz buf pd 0 0)
                 ;; MOVK Xd, #0, lsl 16 (placeholder for high 16 bits)
                 (a64-movk buf pd 0 1))
+               ;; WS4 aarch64 Stage 4: a JIT out-of-module #'NAME value-load
+               ;; (synthetic runtime offset).  Emit a FULL MOVZ/MOVK quad so the
+               ;; complete 64-bit TAGGED fn word fits, and record the site in
+               ;; *aarch64-fn-addr-relocs*; the JIT driver resolves it (rt-table
+               ;; → %mvm-resolve-runtime-fn → %val->word fn, tagged) and patches
+               ;; the 4 imm16 fields.  Without this the whole-image (t) branch
+               ;; below would load 0 (a NIL sentinel) for an out-of-module #'fn.
+               ((and *aarch64-jit-mode* (>= target-offset #x40000000))
+                (let ((movz-byte-off (* (- (a64-current-index buf)
+                                           (or *aarch64-translated-start-idx* 0))
+                                        4)))
+                  (push (cons movz-byte-off target-offset) *aarch64-fn-addr-relocs*))
+                (a64-movz buf pd 0 0)   ; placeholder addr[15:0]  LSL 0
+                (a64-movk buf pd 0 1)   ; placeholder addr[31:16] LSL 16
+                (a64-movk buf pd 0 2)   ; placeholder addr[47:32] LSL 32
+                (a64-movk buf pd 0 3))  ; placeholder addr[63:48] LSL 48
                (t
                 ;; Unknown target: load 0 (NIL/sentinel)
                 (a64-movz buf pd 0 0)
@@ -4343,9 +4369,11 @@
   ;; drop a pending module's patches).
   (when function-table
     (setf *aarch64-li-const-patches* nil))
-  ;; WS4 aarch64 Stage 3: fresh JIT call-reloc list per module (only populated
-  ;; under *aarch64-jit-mode*; nil otherwise so image-build codegen is unchanged).
+  ;; WS4 aarch64 Stage 3/4: fresh JIT call-reloc + fn-addr-reloc lists per module
+  ;; (only populated under *aarch64-jit-mode*; nil otherwise so image-build
+  ;; codegen is unchanged).
   (setf *aarch64-call-relocs* nil)
+  (setf *aarch64-fn-addr-relocs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're

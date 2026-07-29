@@ -851,6 +851,13 @@
   ;; (compute-applicable-methods #'initialize-instance ...) get NIL.
   (%init-clos-protocol)
 
+  ;; WS4-AA64 FLIP: initialize the aarch64 runtime JIT when built JIT-on
+  ;; (MODUS_USE_JIT / default).  Runs the translator co-init + selects the
+  ;; aarch64 back-end so production mvm-eval JITs native via the Stage-5 seam.
+  ;; Inert no-op when JIT-off.  Wrapped so a JIT-init fault can never take down
+  ;; a normal boot (belt-and-suspenders; the seam already guards translate).
+  (handler-case (%aa64-jit-boot-init) (t (c) nil))
+
   ;; Set default pathname defaults to the ANSI test sandbox directory
   (setq *default-pathname-defaults* \"/home/claude/modus/tmp/ansi-test/sandbox/\")
 
@@ -1376,7 +1383,12 @@
                        (subseq drv 0 tag-pos)
                        (princ-to-string count)
                        (subseq drv (+ tag-pos (length tag))))
-          drv)))))
+          drv)))
+    ;; 8. WS4-AA64 FLIP: %jit-enabled-p override (→ t when JIT-on) + the
+    ;; %aa64-jit-boot-init the driver calls.  Baked LAST so its %jit-enabled-p
+    ;; wins over mvm-eval.lisp's base (last-defun).  Inert no-op when JIT-off.
+    (string #\Newline)
+    *aarch64-jit-flip-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 (format t "  ANSI tests: ~D~%" (- *ansi-test-counter* 10000))

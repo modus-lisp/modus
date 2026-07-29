@@ -229,6 +229,46 @@
     *translate-aarch64-source* (string #\Newline)
     *aarch64-translator-coinit-source* (string #\Newline)))
 
+;;; ============================================================
+;;; WS4-AA64 FLIP knob: default runtime-JIT on/off for the aarch64 image
+;;; ============================================================
+;;; Mirrors build-generic-cli.lisp's *jit-on* logic: MODUS_NO_JIT → off,
+;;; MODUS_USE_JIT → explicit, else *aarch64-jit-default*.  When ON, the wrapper
+;;; bakes *aarch64-jit-flip-source* (LAST, so its %jit-enabled-p wins over
+;;; mvm-eval.lisp's base) and kernel-main calls (%aa64-jit-boot-init), so
+;;; production mvm-eval JITs native via the Stage-5 seam.  When OFF the boot
+;;; init is an inert no-op and %jit-enabled-p stays the base (interpret) version
+;;; — byte-neutral vs pre-flip.  x64 is untouched (this is aarch64-only source).
+(defvar *aarch64-jit-default* nil
+  "Default runtime-JIT state when neither MODUS_NO_JIT nor MODUS_USE_JIT is set.
+   nil = interpret (current behavior); the knob exposes the JIT via
+   MODUS_USE_JIT=1 for validation.  The FLIP commit sets this t once the JIT-on
+   gate is proven to survive the corpus + be pass-neutral on real hardware.")
+(defvar *aarch64-jit-on*
+  (let ((no (sb-ext:posix-getenv "MODUS_NO_JIT"))
+        (v  (sb-ext:posix-getenv "MODUS_USE_JIT")))
+    (cond ((and no (> (length no) 0)) nil)
+          ((and v (> (length v) 0))
+           (or (string= v "1") (string-equal v "t") (string-equal v "yes")))
+          (t *aarch64-jit-default*))))
+(format t "~%  AArch64 runtime JIT: ~A~%" (if *aarch64-jit-on* "ON" "OFF (interpret)"))
+;; Baked LAST in *full-source* (after driver) so %jit-enabled-p wins (last-defun).
+;; %aa64-jit-boot-init runs the translator co-init (vreg map, stack-align-16,
+;; linux-mode, label counter) and selects the aarch64 JIT back-end; the Stage-5
+;; seam sets *aarch64-jit-mode* per translation itself.
+(defvar *aarch64-jit-flip-source*
+  (if *aarch64-jit-on*
+      "
+(defun %jit-enabled-p () t)
+(defun %aa64-jit-boot-init ()
+  (%init-aarch64-translator)
+  (setq *jit-target-arch* :aarch64)
+  t)
+"
+      "
+(defun %aa64-jit-boot-init () nil)
+"))
+
 ;;; --- Gap A: symbol-function table auto-registration ---
 ;;;
 ;;; cl-eval.lisp's %init-sft-list is a hand-curated allowlist (~229

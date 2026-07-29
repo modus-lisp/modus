@@ -42,6 +42,16 @@
 (setf *rt-source*      (cli-strip-in-package *rt-source*))
 (setf *bridge-source*  (cli-strip-in-package *bridge-source*))
 
+;; WS4-AA64 FLIP: honor the same MODUS_USE_JIT / MODUS_NO_JIT knob the gate uses
+;; (*aarch64-jit-on*, computed in build-ansi-common-aarch64.lisp) as the CLI's
+;; DEFAULT runtime-JIT state.  Baked as %cli-jit-default; kernel-main seeds
+;; *cli-jit-on* from it.  The Stage 3/4/5 probes still force their own on/off
+;; around each form so the differential stays rigorous regardless of the default.
+(defvar *cli-jit-default-source*
+  (format nil "(defun %~A-jit-default () ~A)~%" "cli"
+          (if *aarch64-jit-on* "t" "nil")))
+(format t "  CLI default runtime JIT: ~A~%" (if *aarch64-jit-on* "ON" "OFF"))
+
 ;;; ============================================================
 ;;; Driver (sys-exit + kernel-main JIT self-test)
 ;;; ============================================================
@@ -164,12 +174,17 @@
 
 (defun %jit-diff-probe (label form)
   (write-string-serial label)
-  (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
-        (jv (handler-case (%jit-run-form form) (t (c) (quote JERR)))))
-    (if (eql iv jv)
-        (progn (write-string-serial \"MATCH v=\") (%jit-pv iv))
-        (progn (write-string-serial \"MISMATCH i=\") (%jit-pv iv)
-               (write-string-serial \" j=\") (%jit-pv jv))))
+  ;; Force the interpret baseline (independent of the built-in default) so this
+  ;; probe always compares manual-JIT vs pure interpret.
+  (let ((save *cli-jit-on*))
+    (setq *cli-jit-on* nil)
+    (let ((iv (handler-case (mvm-eval form) (t (c) (quote IERR))))
+          (jv (handler-case (%jit-run-form form) (t (c) (quote JERR)))))
+      (setq *cli-jit-on* save)
+      (if (eql iv jv)
+          (progn (write-string-serial \"MATCH v=\") (%jit-pv iv))
+          (progn (write-string-serial \"MISMATCH i=\") (%jit-pv iv)
+                 (write-string-serial \" j=\") (%jit-pv jv)))))
   (write-char-serial 10))
 
 (defun kernel-main ()
@@ -247,6 +262,13 @@
   ;; Stage-3 relocation additionally needs *aarch64-jit-mode* t.
   (%init-aarch64-translator)
   (setq *aarch64-jit-mode* t)
+  ;; Select the aarch64 JIT back-end and seed the CLI's default JIT gate from
+  ;; the build-time MODUS_USE_JIT/MODUS_NO_JIT knob (%cli-jit-default).  Probes
+  ;; below still force their own on/off around each form.
+  (setq *jit-target-arch* :aarch64)
+  (setq *cli-jit-on* (%cli-jit-default))
+  (write-string-serial \"cli-jit-default=\") (print-dec (if *cli-jit-on* 1 0))
+  (write-char-serial 10)
 
   ;; --- JIT SELF-TEST -------------------------------------------------------
   ;; (1) Primitive probe: mmap PROT_RWX, write `movz x0,#84 ; ret` (84 = tagged
@@ -376,6 +398,26 @@
   (write-string-serial \"aa64s5-fallback-total=\") (print-dec *jit-fallback-count*)
   (write-char-serial 10)
 
+  ;; (6) GC-OFF EXHAUSTION STRESS (diagnostic for the FLIP decision): JIT many
+  ;;     DISTINCT forms in a NON-forked loop (like run-all-tests / a long-lived
+  ;;     REPL).  GC is OFF on aarch64-linux, so each ~1.5-1.7MB translation
+  ;;     accumulates.  Heartbeat every 50 forms; the last one printed before the
+  ;;     process dies marks where the 896MB heap exhausts.  Runs only when argv1
+  ;;     = 55555 (so the normal CLI run isn't destroyed by it).
+  (when (eql (%parse-decimal-at-fixed-208) 55555)
+    (setq *cli-jit-on* t)
+    (let ((i 0))
+      (loop
+        (when (>= i 4000) (return nil))
+        (when (eql (mod i 50) 0)
+          (write-string-serial \"stress i=\") (print-dec i) (write-char-serial 10))
+        ;; Distinct form each iteration (varying literal) → distinct bytecode →
+        ;; distinct exec page → fresh ~1.7MB translation (no page-cache hit).
+        (mvm-eval (list (quote +) i 1))
+        (setq i (+ i 1))))
+    (setq *cli-jit-on* nil)
+    (write-string-serial \"stress-SURVIVED-4000\") (write-char-serial 10))
+
   (write-string-serial \"CLI-DONE\") (write-char-serial 10)
   (sys-exit 0))
 ")
@@ -409,7 +451,8 @@
     *sft-auto-source*          (string #\Newline)
     *sym-name-auto-source*     (string #\Newline)
     *runtime-macros-auto-source* (string #\Newline)
-    *driver-source*))
+    *driver-source*            (string #\Newline)
+    *cli-jit-default-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 

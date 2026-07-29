@@ -68,14 +68,28 @@
   (= (logand val 15) 9))
 
 (defun %gc-is-forward (val)
-  "Check if VAL is a forwarding pointer (low 4 bits = 1111)."
-  (= (logand val 15) 15))
+  "Check if VAL is a forwarding pointer (low 4 bits = 1111).
+   #160/linux: guard on FIXNUMP first.  %gc-read64 returns the raw 64-bit word
+   as a Lisp integer; a word >= most-positive-fixnum (2^62) — common on Linux
+   where the stack/heap hold high-bit machine words — is a BIGNUM, and
+   (logand bignum 15) routes through GENERIC-LOGAND (%BB-LIMBS-LIST) which
+   ALLOCATES → re-trips the gc-check → recursive %gc-collect.  A forwarding
+   pointer is always a to-space address (~2^47, fixnum), so a non-fixnum word is
+   never a forwarding pointer — skip it allocation-free."
+  (if (fixnump val) (= (logand val 15) 15) nil))
 
 (defun %gc-is-pointer (val)
-  "Check if VAL is a heap pointer (cons or object)."
-  (let ((tag (logand val 15)))
-    (if (= tag 1) t
-        (if (= tag 9) t nil))))
+  "Check if VAL is a heap pointer (cons or object).
+   #160/linux: guard on FIXNUMP first (see %gc-is-forward).  A genuine cons/
+   object pointer into the heap (address ~2^47) is fixnum-range; a raw word that
+   promoted to a BIGNUM (>= 2^62) is never such a pointer, and running
+   (logand bignum 15) here would ALLOCATE (GENERIC-LOGAND) during collection —
+   the recursive-GC bug.  Skip non-fixnum words allocation-free."
+  (if (fixnump val)
+      (let ((tag (logand val 15)))
+        (if (= tag 1) t
+            (if (= tag 9) t nil)))
+      nil))
 
 (defun %gc-is-immediate (val)
   "Check if VAL is an immediate (fixnum or immediate constant)."

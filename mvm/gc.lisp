@@ -116,6 +116,82 @@
         (if (>= raw-addr (+ space-start space-size)) nil t))))
 
 ;;; ============================================================
+;;; WS4-AA64 #160: Object-start bitmap (conservative-root validation)
+;;; ============================================================
+;;; 1 bit / 16-byte granule.  page_base (fixed heap base) at 0x10000E00,
+;;; bitmap_base at 0x10000E18 — both stored value<<1 by %gc-bitmap-init so
+;;; (mem-ref :u64) reads back the raw address.  The bit records that a granule
+;;; is a REAL object start; %gc-forward-slot / %gc-scan-copied gate
+;;; %gc-copy-object on it, so a false conservative root (a bignum limb / scratch
+;;; word that merely looks like a from-space cons/object pointer, but lands
+;;; mid-object) is NOT copied — killing the forward-pointer-stamp corruption
+;;; class.  Native alloc sites (translate-aarch64 emit-aarch64-gc-mark-start)
+;;; set the bit for mutator allocations; %gc-copy-object sets it for GC
+;;; survivors (so the post-swap from-space has valid bits); %gc-collect clears
+;;; the reclaimed from-space range after each swap.  When bitmap_base = 0
+;;; (uninitialised: bare-metal, x64-dead path) EVERY predicate degrades to the
+;;; pre-bitmap behaviour, so this whole mechanism is inert unless
+;;; %gc-bitmap-init has run.
+
+(defun %gc-bitmap-page-base () (mem-ref #x10000E00 :u64))
+(defun %gc-bitmap-base ()      (mem-ref #x10000E18 :u64))
+
+(defun %gc-bitmap-init ()
+  "Reserve the object-start bitmap.  page_base = the fixed heap base (from_start
+   BEFORE any collection = the lowest object address); bitmap = an 8 MB
+   zero-filled PROT_RW mmap (covers a 1 GB heap span at 1 bit / 16 bytes).  MUST
+   run in kernel-main BEFORE any instrumented allocation (else a native
+   alloc-site bit-set would write through a garbage bitmap_base).  Non-allocating
+   (mmap result + config addresses are fixnums)."
+  (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
+  (setf (mem-ref #x10000E18 :u64) (%mmap-exec-page #x800000)))
+
+(defun %gc-mark-start (raw-addr)
+  "Set the object-start bit for the object whose raw byte address is RAW-ADDR."
+  (let ((bmp (%gc-bitmap-base)))
+    (if (= bmp 0)
+        nil
+        (let* ((gran (ash (- raw-addr (%gc-bitmap-page-base)) -4))
+               (byte-addr (+ bmp (ash gran -3)))
+               (bit (logand gran 7)))
+          (setf (mem-ref byte-addr :u8)
+                (logior (mem-ref byte-addr :u8) (ash 1 bit)))))))
+
+(defun %gc-is-start (raw-addr)
+  "T if RAW-ADDR is a recorded object start.  When the bitmap is off
+   (bitmap_base = 0) returns T unconditionally — the pre-#160 behaviour."
+  (let ((bmp (%gc-bitmap-base)))
+    (if (= bmp 0)
+        t
+        (let* ((gran (ash (- raw-addr (%gc-bitmap-page-base)) -4))
+               (byte-addr (+ bmp (ash gran -3)))
+               (bit (logand gran 7)))
+          (if (= (logand (mem-ref byte-addr :u8) (ash 1 bit)) 0) nil t)))))
+
+(defun %gc-clear-bitmap-range (range-start size)
+  "Zero the bitmap bits for [RANGE-START, RANGE-START+SIZE) — the reclaimed
+   from-space after a swap — so stale start-bits can't falsely accept garbage
+   next cycle.  Clears u64-at-a-time over the interior then a byte tail; stays
+   WITHIN the exact byte range (the per-semispace bitmap boundary at size/128 is
+   not 8-aligned, so over-clearing would erase the sibling's live bits)."
+  (let ((bmp (%gc-bitmap-base)))
+    (if (= bmp 0)
+        nil
+        (let* ((base (+ bmp (ash (- range-start (%gc-bitmap-page-base)) -7)))
+               (nbytes (ash size -7))
+               (nq (ash nbytes -3))
+               (i 0))
+          (loop
+            (when (>= i nq) (return nil))
+            (setf (mem-ref (+ base (* i 8)) :u64) 0)
+            (setq i (+ i 1)))
+          (let ((j (* nq 8)))
+            (loop
+              (when (>= j nbytes) (return nil))
+              (setf (mem-ref (+ base j) :u8) 0)
+              (setq j (+ j 1))))))))
+
+;;; ============================================================
 ;;; Object Copying
 ;;; ============================================================
 
@@ -150,6 +226,9 @@
                  (let ((new-ptr (logior free-ptr 1)))
                    ;; Leave forwarding pointer in from-space
                    (%gc-write64 raw-addr (logior free-ptr 15))
+                   ;; #160: record the survivor's start bit in to-space (valid
+                   ;; from-space bits for the NEXT cycle after the swap).
+                   (%gc-mark-start free-ptr)
                    ;; Return results
                    (%gc-write64 #x10000100 new-ptr)
                    (%gc-write64 #x10000108 (+ free-ptr 16))))))))
@@ -179,6 +258,8 @@
                    (let ((new-ptr (logior free-ptr 9)))
                      ;; Leave forwarding pointer in old location
                      (%gc-write64 raw-addr (logior free-ptr 15))
+                     ;; #160: record the survivor's start bit in to-space.
+                     (%gc-mark-start free-ptr)
                      ;; Return results
                      (%gc-write64 #x10000100 new-ptr)
                      (%gc-write64 #x10000108 (+ free-ptr total-bytes)))))))))
@@ -198,12 +279,17 @@
   (let ((val (%gc-read64 raw-slot-addr)))
     (if (%gc-is-pointer val)
         (if (%gc-in-space val from-start from-size)
-            (progn
-              (%gc-copy-object val from-start from-size free-ptr)
-              ;; Update the slot with the new pointer
-              (%gc-write64 raw-slot-addr (%gc-read64 #x10000100))
-              ;; Return new free pointer
-              (%gc-read64 #x10000108))
+            ;; #160: only copy a candidate that is a RECORDED object start.
+            ;; A false root (looks like a from-space pointer but lands
+            ;; mid-object) is left untouched — no forward-pointer stamp.
+            (if (%gc-is-start (logand val (lognot 15)))
+                (progn
+                  (%gc-copy-object val from-start from-size free-ptr)
+                  ;; Update the slot with the new pointer
+                  (%gc-write64 raw-slot-addr (%gc-read64 #x10000100))
+                  ;; Return new free pointer
+                  (%gc-read64 #x10000108))
+                free-ptr)
             free-ptr)
         free-ptr)))
 
@@ -289,10 +375,15 @@
       (let ((val (%gc-read64 scan)))
         (if (%gc-is-pointer val)
             (if (%gc-in-space val from-start from-size)
-                (progn
-                  (%gc-copy-object val from-start from-size fp)
-                  (%gc-write64 scan (%gc-read64 #x10000100))
-                  (setq fp (%gc-read64 #x10000108)))
+                ;; #160: object-start gate (same as %gc-forward-slot) — a
+                ;; copied object's raw data word that looks like a from-space
+                ;; pointer but isn't an object start is skipped.
+                (if (%gc-is-start (logand val (lognot 15)))
+                    (progn
+                      (%gc-copy-object val from-start from-size fp)
+                      (%gc-write64 scan (%gc-read64 #x10000100))
+                      (setq fp (%gc-read64 #x10000108)))
+                    nil)
                 nil)
             ;; Not a pointer — check if it looks like an object header
             ;; (it has a valid subtag and count). Actually, we don't need
@@ -349,6 +440,10 @@
       ;; Step 4: Swap semispaces
       (%gc-set-from-start to-start)
       (%gc-set-to-start from-start)
+      ;; #160: clear the reclaimed (old from-space) bitmap range so stale
+      ;; start-bits can't falsely accept garbage on the next cycle.  Survivors'
+      ;; bits were set in to-space by %gc-copy-object (now the new from-space).
+      (%gc-clear-bitmap-range from-start space-size)
       ;; Step 5: Update alloc pointer and limit
       (%gc-set-r12 free-ptr)
       (%gc-set-r14 (+ to-start space-size))

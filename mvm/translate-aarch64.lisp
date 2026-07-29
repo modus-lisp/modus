@@ -221,6 +221,52 @@
    (%val->word fn — a value load keeps the +tag-function+ tag, NOT word-3).
    Nil at image build → whole-image codegen unchanged.")
 
+(defvar *aarch64-gc-bitmap-enabled* nil
+  "WS4-AA64 #160: when non-nil, every heap ALLOCATION opcode emits an inline
+   object-start-bit SET for the object it creates (raw base in x24, pre-bump).
+   The bit records that this 16-byte granule is a REAL object start; gc.lisp's
+   %gc-forward-slot / %gc-scan-copied then REFUSE to %gc-copy-object any
+   conservative root whose tag-stripped address is not a recorded start — so a
+   false root (a bignum limb / scratch word that merely looks like a from-space
+   cons/object pointer) can no longer stamp a forwarding pointer over
+   mid-object data.  This is the aarch64 port of the x64 MCGC scan_word
+   validation (ace1544/810a975), adapted to the Lisp-side collector.  Default
+   nil = no SET emitted = byte-identical to pre-#160 (bare-metal, gate, x64).")
+
+(defun emit-aarch64-gc-mark-start (buf)
+  "WS4-AA64 #160: set the object-start bit for the object whose raw base is in
+   x24 (the alloc pointer, BEFORE the opcode bumps it).  1 bit / 16-byte
+   granule; page_base at config 0x10000E00, bitmap_base at 0x10000E18 — both
+   stored value<<1 by %gc-bitmap-init, so LDR then ASR #1 recovers the raw
+   address.  Scratch x9..x13 (dead across MVM opcodes; the alloc opcodes use
+   x16/x17 + phys vregs, never x9..x13).  Guarded: bitmap_base == 0 (pre-init /
+   disabled) skips the write.  Encodings for AND/LSLV/LDRB/STRB are
+   assembler-verified (no a64-* helper exists for them).  Emitted only under
+   *aarch64-gc-bitmap-enabled*."
+  (when *aarch64-gc-bitmap-enabled*
+    (a64-load-imm64 buf +a64-x10+ #x10000E18)
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x10+ 0)
+    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)          ; x11 = bitmap_base
+    (a64-cmp-imm buf +a64-x11+ 0)
+    (let ((skip (incf *mvm-label-counter*)))
+      (let ((idx (a64-current-index buf)))
+        (a64-bcond buf +cc-eq+ 0)                     ; bitmap_base==0 → skip
+        (a64-add-fixup buf idx skip :bcond))
+      (a64-load-imm64 buf +a64-x10+ #x10000E00)
+      (a64-ldr-unsigned buf +a64-x9+ +a64-x10+ 0)
+      (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)           ; x9 = page_base
+      (a64-sub-reg buf +a64-x9+ +a64-x24+ +a64-x9+ 0 0) ; x9 = addr - page_base
+      (a64-lsr-imm buf +a64-x10+ +a64-x9+ 7)          ; x10 = byte offset (gran>>3)
+      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x10+ 0 0) ; x11 = byte address
+      (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4)           ; x9 = granule
+      (a64-emit buf #x92400929)                       ; AND x9, x9, #7  (bit index)
+      (a64-movz buf +a64-x12+ 1 0)                    ; x12 = 1
+      (a64-emit buf #x9AC9218C)                       ; LSLV x12, x12, x9  (1<<bit)
+      (a64-emit buf #x3940016D)                       ; LDRB w13, [x11]
+      (a64-orr-reg buf +a64-x13+ +a64-x13+ +a64-x12+) ; w13 |= mask
+      (a64-emit buf #x3900016D)                       ; STRB w13, [x11]
+      (a64-set-label buf skip))))
+
 (defvar *aarch64-code-base-patch-offset* nil
   "Byte offset of the MOVZ that loads code_base in the boot stub's
    emit-aarch64-code-bounds-init block.  Patched at link time by
@@ -2973,6 +3019,7 @@
                   (pa (ensure-src (vr 1) +a64-x16+))
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new cons base
              (a64-stp-offset buf pa pb +a64-x24+ 0)
              (a64-add-imm buf pd +a64-x24+ 1)
              (a64-add-imm buf +a64-x24+ +a64-x24+ 16)
@@ -3072,6 +3119,7 @@
                   (total-size (logand (+ (* (+ count 2) 8) 15) (lognot 15)))
                   (header-imm (logior (ash count 8) subtag))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new object base
              ;; Header value fits in MOVZ (if subtag-only) or MOVZ+MOVK
              ;; for larger counts — a64-load-imm64 picks the right form.
              (a64-load-imm64 buf +a64-x16+ header-imm)
@@ -3250,6 +3298,7 @@
            (let* ((vd (vr 0))
                   (pcount (ensure-src (vr 1) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new array base
              ;; Build header: x16 = (count << 8) | #x32 via LSL + ORR-reg
              ;; (MOVK at shift=0 would clobber bits 0-15 and corrupt the
              ;;  low byte of count for count>=256, so use a separate temp).
@@ -3276,6 +3325,7 @@
            (let* ((vd (vr 0))
                   (pcount (ensure-src (vr 1) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new u8-vector base
              (a64-asr-imm buf +a64-x9+ pcount 1)              ; x9 = N (untagged)
              (a64-lsl-imm buf +a64-x16+ +a64-x9+ 8)           ; x16 = N << 8
              (a64-movz buf +a64-x10+ #x11 0)                  ; x10 = 0x11 subtag
@@ -3473,6 +3523,7 @@
           ((= op +op-alloc-cons+)
            (let* ((vd (vr 0))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new cons base
              (a64-mov-reg buf pd +a64-x24+)
              (a64-add-imm buf +a64-x24+ +a64-x24+ 16)
              (unless (a64-phys-reg vd)
@@ -3837,6 +3888,7 @@
            (let* ((vd (vr 0))
                   (pcount (ensure-src (vr 1) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new string base
              (a64-lsl-imm buf +a64-x16+ pcount 8)
              (a64-movz buf +a64-x9+ #x31 0)
              (a64-orr-reg buf +a64-x16+ +a64-x16+ +a64-x9+)

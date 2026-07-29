@@ -212,6 +212,14 @@
   (setf (mem-ref #x100001C0 :u64) 0)
   (setf (mem-ref #x100001C8 :u64) 0)
   (setf (mem-ref #x10000400 :u64) 0)
+  ;; WS4-AA64 #160: object-start bitmap config words (page_base / bitmap_base).
+  ;; Zero them, then reserve the bitmap BEFORE any allocation (init-symbol-table
+  ;; below is the first allocator) so every mutator alloc records its start bit.
+  ;; %gc-bitmap-init is non-allocating; the boot already published from_start at
+  ;; 0x10000040 (which it reads as page_base).
+  (setf (mem-ref #x10000E00 :u64) 0)
+  (setf (mem-ref #x10000E18 :u64) 0)
+  (%gc-bitmap-init)
 
   ;; Runtime init (mirrors the ANSI gate kernel-main prefix, trimmed).
   (init-symbol-table)
@@ -538,7 +546,11 @@
       (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
         (if (and v (> (length v) 0)) (parse-integer v :radix 16) #x08000000)))
 (setf *linux-aarch64-r25-offset* *linux-aarch64-gc-midpoint*)
-(format t "~%  AArch64 GC: ON  midpoint=#x~X  metadata-shl=t~%" *linux-aarch64-gc-midpoint*)
+;; WS4-AA64 #160 Stage B: emit the object-start-bit SET at every alloc site so
+;; gc.lisp's %gc-forward-slot / %gc-scan-copied can reject false roots.
+(setf *aarch64-gc-bitmap-enabled* t)
+(format t "~%  AArch64 GC: ON  midpoint=#x~X  metadata-shl=t  bitmap=t~%"
+        *linux-aarch64-gc-midpoint*)
 (setf *aarch64-handler-pop-label* nil)
 (setf *aarch64-handler-push-label* nil)
 (setf *aarch64-gc-trampoline-label* nil)

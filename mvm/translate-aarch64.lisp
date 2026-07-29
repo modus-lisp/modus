@@ -194,6 +194,23 @@
    become layout-shift-stable, eliminating the ADR-truncation class
    of fragility bugs on AArch64 ANSI builds.")
 
+(defvar *aarch64-jit-mode* nil
+  "WS4 aarch64 Stage 3.  Non-nil only inside the runtime-JIT driver around a
+   translate-mvm-to-aarch64 call.  Under it, op-call to a SYNTHETIC runtime
+   offset (>= #x40000000 — a function NOT in this module, resolved by NAME via
+   the rt-table) emits a RELOCATABLE absolute call (a MOVZ/MOVK quad → x16;
+   BLR x16) and records the patch site in *aarch64-call-relocs*, instead of the
+   SVC #x0511 undefined-call trap.  Nil at image-build time → whole-image
+   codegen unchanged (byte-identical to pre-Stage-3).")
+
+(defvar *aarch64-call-relocs* nil
+  "WS4 aarch64 Stage 3.  List of (movz-quad-native-byte-offset . synthetic-mvm-
+   offset) collected during a JIT translation.  At JIT time the driver resolves
+   synthetic-offset → name (rt-table) → raw native address (%mvm-resolve-
+   runtime-fn, untagged), then rewrites the 4 MOVZ/MOVK imm16 fields at that
+   offset.  Bound freshly to nil per JIT translation; empty for any hazard-free
+   (rt-empty) module, so flag-off / hazard-free translation is byte-identical.")
+
 (defvar *aarch64-code-base-patch-offset* nil
   "Byte offset of the MOVZ that loads code_base in the boot stub's
    emit-aarch64-code-bounds-init block.  Patched at link time by
@@ -3340,6 +3357,24 @@
                 (let ((idx (a64-current-index buf)))
                   (a64-bl buf 0)  ; placeholder
                   (a64-add-fixup buf idx label :bl)))
+               ;; WS4 aarch64 Stage 3: a JIT out-of-module call (synthetic
+               ;; runtime offset).  Emit a RELOCATABLE absolute call — a
+               ;; MOVZ/MOVK quad loads the callee's real native address into
+               ;; x16, then BLR x16.  The 4 imm16 fields are patched at JIT
+               ;; time (rt-table → %mvm-resolve-runtime-fn → address).  BLR
+               ;; clobbers x30, restored by the enclosing fn's epilogue (same
+               ;; as the BL label path).  Args/nargs are already staged by the
+               ;; compiler's preceding IR, exactly as for the label path.
+               ((and *aarch64-jit-mode* (>= target-offset #x40000000))
+                (let ((movz-byte-off (* (- (a64-current-index buf)
+                                           (or *aarch64-translated-start-idx* 0))
+                                        4)))
+                  (push (cons movz-byte-off target-offset) *aarch64-call-relocs*))
+                (a64-movz buf +a64-x16+ 0 0)   ; placeholder addr[15:0]  LSL 0
+                (a64-movk buf +a64-x16+ 0 1)   ; placeholder addr[31:16] LSL 16
+                (a64-movk buf +a64-x16+ 0 2)   ; placeholder addr[47:32] LSL 32
+                (a64-movk buf +a64-x16+ 0 3)   ; placeholder addr[63:48] LSL 48
+                (a64-blr buf +a64-x16+))
                (t
                 (format t "~&  AARCH64 CALL: NO LABEL for target-offset=~D — emitting SVC #x0511 trap~%"
                         target-offset)
@@ -4308,6 +4343,9 @@
   ;; drop a pending module's patches).
   (when function-table
     (setf *aarch64-li-const-patches* nil))
+  ;; WS4 aarch64 Stage 3: fresh JIT call-reloc list per module (only populated
+  ;; under *aarch64-jit-mode*; nil otherwise so image-build codegen is unchanged).
+  (setf *aarch64-call-relocs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're

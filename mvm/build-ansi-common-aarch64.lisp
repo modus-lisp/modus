@@ -162,6 +162,47 @@
              modus.mvm::*opcode-table*)
     (format s "  t)~%")
     (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%")))
+;;; WS4-AA64 STAGE 1: bake the AArch64 MVM→native translator into the image so
+;;; TRANSLATE-MVM-TO-AARCH64 compiles in-image and is runtime-callable — the
+;;; foundation for the AArch64 runtime JIT (mirrors build-ansi-common-x64's
+;;; Stage-1 baking of x64-asm + translate-x64).  DEAD CODE at this stage:
+;;; nothing routes to it, so the gate must stay unchanged.
+(defvar *translate-aarch64-source* (mvm-text "mvm/translate-aarch64.lisp"))
+;; Shrink the a64-buffer code array default (16M general slots ≈ 128MB tagged)
+;; to 64K — a64-emit grows it on demand (%code-buffer doubling); a 128MB alloc
+;; per make-a64-buffer would exhaust the ANSI image semispace.
+(let ((needle "(code (make-array 16777216))")
+      (repl   "(code (make-array 65536))"))
+  (let ((p (search needle *translate-aarch64-source*)))
+    (unless p (error "WS4-AA64-S1: could not find a64-buffer 16M code default to shrink"))
+    (setf *translate-aarch64-source*
+          (concatenate 'string (subseq *translate-aarch64-source* 0 p) repl
+                       (subseq *translate-aarch64-source* (+ p (length needle)))))))
+;; Strip install-aarch64-translator and the host-only ELF/target-descriptor/
+;; disassemble tail after it (refs *target-aarch64*, &key disassemble — not
+;; compilable in-image).  Same idea as translate-x64's install-x64-translator.
+(let ((marker "(defun install-aarch64-translator"))
+  (let ((pos (search marker *translate-aarch64-source*)))
+    (unless pos (error "WS4-AA64-S1: could not find install-aarch64-translator strip marker"))
+    (setf *translate-aarch64-source* (subseq *translate-aarch64-source* 0 pos))))
+;; Co-init: *a64-vreg-to-phys* is a defparameter init-thunk (NOT run at boot —
+;; CLAUDE.md item 7), so populate it explicitly from %init-aarch64-translator.
+;; Values are the vreg-index → aarch64-phys-reg map from translate-aarch64.lisp
+;; (V0-V3→x0-x3, V4-V8→x19-x23, VR→x0, VA→x24, VL→x25, VN→x26, VSP→sp, VFP→x29;
+;; V9-V15 + V22 spill = nil).  Raw numbers (defconstants don't fold in-image);
+;; spill slots set to nil explicitly (aarch64 alloc-array does NOT zero-init).
+(defvar *aarch64-translator-coinit-source* "
+(defun %init-aarch64-translator ()
+  (let ((map (make-array 23)))
+    (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
+    (aset map 4 19) (aset map 5 20) (aset map 6 21) (aset map 7 22) (aset map 8 23)
+    (aset map 9 nil) (aset map 10 nil) (aset map 11 nil) (aset map 12 nil)
+    (aset map 13 nil) (aset map 14 nil) (aset map 15 nil)
+    (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
+    (aset map 20 31) (aset map 21 29) (aset map 22 nil)
+    (setq *a64-vreg-to-phys* map))
+  t)
+")
 ;; The assembled self-host block, spliced into *full-source* after the bridge.
 (defvar *compiler-in-image-source*
   (concatenate 'string
@@ -170,7 +211,10 @@
     *compiler-image-source* (string #\Newline)
     *stage2-float-override* (string #\Newline)
     *opcode-table-init-source* (string #\Newline)
-    *mvm-eval-source*    (string #\Newline)))
+    *mvm-eval-source*    (string #\Newline)
+    ;; WS4-AA64 STAGE 1: translator + co-init (DEAD CODE — nothing calls it yet).
+    *translate-aarch64-source* (string #\Newline)
+    *aarch64-translator-coinit-source* (string #\Newline)))
 
 ;;; --- Gap A: symbol-function table auto-registration ---
 ;;;

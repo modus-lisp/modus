@@ -3567,8 +3567,11 @@
                ;; alone produced `undefined label 3` for a module that has
                ;; :gc-check opcodes but no %GC-COLLECT in its function
                ;; table (e.g. the net/actors image, which omits gc.lisp).
+               ;; #160 Stage 1: the NATIVE collector needs no %GC-COLLECT
+               ;; bytecode offset, so accept it on the label alone.
                ((and *aarch64-gc-trampoline-label*
-                     *aarch64-gc-collect-bytecode-offset*)
+                     (or *aarch64-gc-native-mcgc*
+                         *aarch64-gc-collect-bytecode-offset*))
                 (let ((skip-label (incf *mvm-label-counter*)))
                   (let ((idx (a64-current-index buf)))
                     (a64-bcond buf cc 0)
@@ -4173,6 +4176,296 @@
   (a64-load-imm64 buf +a64-x17+ #x10000168)
   (a64-str-unsigned buf +a64-x16+ +a64-x17+ 0))
 
+;;; ============================================================
+;;; WS4-AA64 #160 STAGE 1: NATIVE Cheney GC trampoline
+;;; ============================================================
+;;; Mirrors x64 emit-gc-trampoline (translate-x64.lisp).  ZERO Lisp allocation
+;;; during collection → structurally cannot re-enter the gc-check nor route
+;;; through the bignum engine (the Lisp-collector failure classes).  Consumes
+;;; the SAME bitmaps Stage-B/a6d12ae built: object-start @0x10000E18 (validated
+;;; in scan_word, set on survivors in copy_object).  cons-kind kind-check +
+;;; leaf-subtag type-aware skip are STAGE 2.
+(defconstant +a64-x28+ 28)   ; free scratch (unused by Modus codegen); GC obj-bitmap base
+
+(defvar *aarch64-gc-native-mcgc* nil
+  "WS4-AA64 #160 Stage 1.  When non-nil, emit-aarch64-handler-helpers emits the
+   NATIVE Cheney GC trampoline (below) at *aarch64-gc-trampoline-label* instead
+   of the Lisp-%gc-collect-calling one.  Default nil → the Lisp path is emitted
+   (byte-identical to pre-Stage-1 for gate/bare-metal).")
+
+(defun a64-ldrb (buf wt xn)
+  "LDRB Wt, [Xn, #0]  (assembler-verified 0x39400000|Xn<<5|Wt)."
+  (a64-emit buf (logior #x39400000 (ash xn 5) wt)))
+(defun a64-strb (buf wt xn)
+  "STRB Wt, [Xn, #0]  (0x39000000|Xn<<5|Wt)."
+  (a64-emit buf (logior #x39000000 (ash xn 5) wt)))
+(defun a64-lslv (buf rd rn rm)
+  "LSLV Xd, Xn, Xm  (0x9AC02000|Xm<<16|Xn<<5|Xd)."
+  (a64-emit buf (logior #x9AC02000 (ash rm 16) (ash rn 5) rd)))
+
+(defun emit-aarch64-native-gc-trampoline (buf)
+  "Native Cheney copying collector.  Layout: label → B main → [scan_word] →
+   [copy_object] → main.  GC registers (all mutator regs saved in a 240B frame):
+     x19=from_start x20=from_end x21=free_ptr x22=to_start x23=stack_base
+     x25=space_size x26=loop_var x27=page_base x28=obj_bitmap_base ; x9..x17=scratch
+   All GC metadata (0x40..0x58) + bitmap config (0xE00/0xE18) are stored value<<1,
+   so LOAD+ASR#1 recovers raw and STORE writes <<1.  x24/x25 (mutator VA/VL) are
+   set to the new alloc-ptr / limit at exit; all other regs restored."
+  (a64-set-label buf *aarch64-gc-trampoline-label*)
+  (let ((scan-word (incf *mvm-label-counter*))
+        (copy-obj  (incf *mvm-label-counter*))
+        (main      (incf *mvm-label-counter*)))
+    ;; entry: jump over the subroutines to main
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i main :b))
+
+    ;; ============ SUBROUTINE scan_word (x9 = ADDRESS of word) ============
+    (a64-set-label buf scan-word)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)       ; x10 = value
+    (a64-lsr-imm buf +a64-x12+ +a64-x10+ 4)
+    (a64-lsl-imm buf +a64-x12+ +a64-x12+ 4)            ; x12 = raw = val & ~15
+    (a64-sub-reg buf +a64-x11+ +a64-x10+ +a64-x12+ 0 0) ; x11 = tag = val - raw
+    (let ((maybe (incf *mvm-label-counter*))
+          (sret  (incf *mvm-label-counter*)))
+      (a64-cmp-imm buf +a64-x11+ 1)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i maybe :bcond))
+      (a64-cmp-imm buf +a64-x11+ 9)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i maybe :bcond))
+      (a64-ret buf)                                    ; not a pointer
+      (a64-set-label buf maybe)
+      ;; in from-space?  from_start(x19) <= raw(x12) < from_end(x20)
+      (a64-cmp-reg buf +a64-x12+ +a64-x19+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i sret :bcond)) ; raw<from_start
+      (a64-cmp-reg buf +a64-x12+ +a64-x20+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sret :bcond)) ; raw>=from_end
+      ;; object-start bitmap validate: gran=(raw-page)>>4 ; byte=objbmp+gran>>3 ; bit=gran&7
+      (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
+      (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7)
+      (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)  ; byte addr
+      (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)              ; granule
+      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+) ; bit idx
+      (a64-ldrb buf +a64-x15+ +a64-x14+)
+      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)    ; mask=1<<bit
+      (a64-ands-reg buf +a64-xzr+ +a64-x15+ +a64-x16+)     ; TST byte & mask
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond)) ; bit clear → skip
+      ;; copy + update the word (save x9 word-addr + x30 across the nested BL)
+      (a64-stp-pre buf +a64-x9+ +a64-x30+ +a64-sp+ -16)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i copy-obj :bl)) ; x10 tagged → x10 new
+      (a64-ldp-post buf +a64-x9+ +a64-x30+ +a64-sp+ 16)
+      (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)         ; [word] = new ptr
+      (a64-set-label buf sret)
+      (a64-ret buf))
+
+    ;; ============ SUBROUTINE copy_object (x10 = tagged; → x10 = new; advances x21) ============
+    (a64-set-label buf copy-obj)
+    (a64-lsr-imm buf +a64-x11+ +a64-x10+ 4)
+    (a64-lsl-imm buf +a64-x11+ +a64-x11+ 4)              ; x11 = raw src
+    (a64-sub-reg buf +a64-x12+ +a64-x10+ +a64-x11+ 0 0)  ; x12 = tag (1 or 9)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 0)         ; x13 = first word (car/header)
+    (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4)
+    (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4)
+    (a64-sub-reg buf +a64-x14+ +a64-x13+ +a64-x14+ 0 0)  ; x14 = first-word tag
+    (let ((co-fwd  (incf *mvm-label-counter*))
+          (co-cons (incf *mvm-label-counter*))
+          (co-done (incf *mvm-label-counter*))
+          (oloop   (incf *mvm-label-counter*))
+          (odone   (incf *mvm-label-counter*)))
+      (a64-cmp-imm buf +a64-x14+ 15)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
+      (a64-cmp-imm buf +a64-x12+ 1)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-cons :bcond))
+      ;; ---- object: size = align16((count+2)*8) ----
+      (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; x12 = dest_start
+      (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)            ; count
+      (a64-add-imm buf +a64-x15+ +a64-x15+ 2)
+      (a64-lsl-imm buf +a64-x15+ +a64-x15+ 3)            ; (count+2)*8
+      (a64-add-imm buf +a64-x15+ +a64-x15+ 15)
+      (a64-lsr-imm buf +a64-x15+ +a64-x15+ 4)
+      (a64-lsl-imm buf +a64-x15+ +a64-x15+ 4)            ; size aligned16
+      (a64-add-reg buf +a64-x9+ +a64-x11+ +a64-x15+ 0 0) ; x9 = src end
+      (a64-mov-reg buf +a64-x16+ +a64-x11+)              ; x16 = src ptr
+      (a64-set-label buf oloop)
+      (a64-cmp-reg buf +a64-x16+ +a64-x9+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i odone :bcond))
+      (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)
+      (a64-str-unsigned buf +a64-x17+ +a64-x21+ 0)
+      (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
+      (a64-add-imm buf +a64-x21+ +a64-x21+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i oloop :b))
+      (a64-set-label buf odone)
+      (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd ptr
+      (a64-add-imm buf +a64-x10+ +a64-x12+ 9)            ; new tagged = dest|9
+      ;; set object-start bit for dest_start (x12), scratch x13..x17
+      (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
+      (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
+      (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
+      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-ldrb buf +a64-x15+ +a64-x14+)
+      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
+      ;; ---- cons: 16 bytes ----
+      (a64-set-label buf co-cons)
+      (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; dest_start
+      (a64-str-unsigned buf +a64-x13+ +a64-x21+ 0)       ; car (x13 = first word)
+      (a64-ldr-unsigned buf +a64-x14+ +a64-x11+ 1)       ; cdr = [src+8]
+      (a64-str-unsigned buf +a64-x14+ +a64-x21+ 1)       ; [dest+8] = cdr
+      (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd
+      (a64-add-imm buf +a64-x10+ +a64-x12+ 1)            ; new tagged = dest|1
+      (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
+      (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
+      (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
+      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-ldrb buf +a64-x15+ +a64-x14+)
+      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
+      (a64-add-imm buf +a64-x21+ +a64-x21+ 16)           ; advance free_ptr
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
+      ;; ---- already forwarded: x13 = new|15 ----
+      (a64-set-label buf co-fwd)
+      (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4) (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4) ; new addr
+      (a64-add-reg buf +a64-x10+ +a64-x14+ +a64-x12+ 0 0) ; new | orig tag
+      (a64-set-label buf co-done)
+      (a64-ret buf))
+
+    ;; ============ MAIN BODY ============
+    (a64-set-label buf main)
+    ;; save mutator regs (same 240B frame as the Lisp trampoline)
+    (a64-stp-pre    buf +a64-x0+  +a64-x1+  +a64-sp+ -240)
+    (a64-stp-offset buf +a64-x2+  +a64-x3+  +a64-sp+ 16)
+    (a64-stp-offset buf +a64-x4+  +a64-x5+  +a64-sp+ 32)
+    (a64-stp-offset buf +a64-x6+  +a64-x7+  +a64-sp+ 48)
+    (a64-stp-offset buf +a64-x8+  +a64-x9+  +a64-sp+ 64)
+    (a64-stp-offset buf +a64-x10+ +a64-x11+ +a64-sp+ 80)
+    (a64-stp-offset buf +a64-x12+ +a64-x13+ +a64-sp+ 96)
+    (a64-stp-offset buf +a64-x14+ +a64-x15+ +a64-sp+ 112)
+    (a64-stp-offset buf +a64-x16+ +a64-x17+ +a64-sp+ 128)
+    (a64-str-unsigned buf +a64-x18+ +a64-sp+ 144)
+    (a64-str-unsigned buf +a64-x19+ +a64-sp+ 152)
+    (a64-str-unsigned buf +a64-x20+ +a64-sp+ 160)
+    (a64-str-unsigned buf +a64-x21+ +a64-sp+ 168)
+    (a64-str-unsigned buf +a64-x22+ +a64-sp+ 176)
+    (a64-str-unsigned buf +a64-x23+ +a64-sp+ 184)
+    (a64-str-unsigned buf +a64-x26+ +a64-sp+ 192)
+    (a64-str-unsigned buf +a64-x27+ +a64-sp+ 200)
+    (a64-str-unsigned buf +a64-x29+ +a64-sp+ 208)
+    (a64-str-unsigned buf +a64-x30+ +a64-sp+ 216)
+    ;; load GC metadata (all stored <<1 → ASR #1 to raw)
+    (flet ((load-asr (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
+                     (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1)))
+      (load-asr +a64-x19+ #x10000040)                   ; from_start
+      (load-asr +a64-x22+ #x10000048)                   ; to_start
+      (a64-mov-reg buf +a64-x21+ +a64-x22+)             ; free_ptr = to_start
+      (load-asr +a64-x25+ #x10000050)                   ; space_size
+      (a64-add-reg buf +a64-x20+ +a64-x19+ +a64-x25+ 0 0) ; from_end = from_start+space_size
+      (load-asr +a64-x23+ #x10000058)                   ; stack_base
+      (load-asr +a64-x27+ #x10000E00)                   ; page_base
+      (load-asr +a64-x28+ #x10000E18))                  ; obj-bitmap base
+    ;; ---- scan stack: x26 from SP to stack_base ----
+    (a64-add-imm buf +a64-x26+ +a64-sp+ 0)              ; x26 = SP (scan start)
+    (let ((sloop (incf *mvm-label-counter*))
+          (sdone (incf *mvm-label-counter*)))
+      (a64-set-label buf sloop)
+      (a64-cmp-reg buf +a64-x26+ +a64-x23+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone :bcond))
+      (a64-mov-reg buf +a64-x9+ +a64-x26+)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x26+ +a64-x26+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
+      (a64-set-label buf sdone))
+    ;; ---- fixed global roots ----
+    (flet ((scan-fixed (addr) (a64-load-imm64 buf +a64-x9+ addr)
+                       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))))
+      (scan-fixed #x10000080)      ; globals hash-table
+      (scan-fixed #x10000088)      ; symbol intern table
+      (scan-fixed #x10000148)      ; keyword intern table
+      (scan-fixed #x10000170))     ; package-by-hash table
+    ;; ---- MV region: count-1 extras from 0x98 (only when 2<=count<=16) ----
+    ;; count = [0x90]>>1; extras = count-1.  Guards (both SIGNED, mirroring x64's
+    ;; JLE — a b.eq-only guard let a zeroed/garbage count run extras=-1 as a
+    ;; runaway scan): skip if extras<=0 (count 0/1) OR count>16 (garbage —
+    ;; multiple-values-limit is 16), so a stale/uninit MV-count can't drive a
+    ;; wild scan off into unmapped memory.
+    (a64-load-imm64 buf +a64-x16+ #x10000090)
+    (a64-ldr-unsigned buf +a64-x26+ +a64-x16+ 0)        ; tagged count
+    (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)             ; raw count
+    (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)             ; extras = count-1
+    (let ((mvloop (incf *mvm-label-counter*))
+          (mvdone (incf *mvm-label-counter*)))
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i mvdone :bcond)) ; extras<=0
+      (a64-cmp-imm buf +a64-x26+ 16)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i mvdone :bcond)) ; extras>16 garbage
+      (a64-load-imm64 buf +a64-x9+ #x10000098)
+      (a64-set-label buf mvloop)
+      (a64-cmp-imm buf +a64-x26+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i mvdone :bcond))
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 8)
+      (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i mvloop :b))
+      (a64-set-label buf mvdone))
+    ;; ---- Cheney scan: x26 from to_start to free_ptr ----
+    (a64-mov-reg buf +a64-x26+ +a64-x22+)               ; scan = to_start
+    (let ((cloop (incf *mvm-label-counter*))
+          (cdone (incf *mvm-label-counter*)))
+      (a64-set-label buf cloop)
+      (a64-cmp-reg buf +a64-x26+ +a64-x21+)             ; scan >= free_ptr?
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
+      (a64-mov-reg buf +a64-x9+ +a64-x26+)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x26+ +a64-x26+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
+      (a64-set-label buf cdone))
+    ;; ---- clear reclaimed (old from_start = x19) object-start bitmap range ----
+    ;; dest = obj_bitmap(x28) + (x19-page_base)>>7 ; count = space_size(x25)>>7 bytes (u64 loop; power-of-2 semispace → 8-aligned)
+    (a64-sub-reg buf +a64-x9+ +a64-x19+ +a64-x27+ 0 0)
+    (a64-lsr-imm buf +a64-x9+ +a64-x9+ 7)
+    (a64-add-reg buf +a64-x9+ +a64-x28+ +a64-x9+ 0 0)   ; x9 = dest
+    (a64-lsr-imm buf +a64-x10+ +a64-x25+ 7)             ; x10 = byte count
+    (a64-add-reg buf +a64-x10+ +a64-x9+ +a64-x10+ 0 0)  ; x10 = dest end
+    (let ((zloop (incf *mvm-label-counter*))
+          (zdone (incf *mvm-label-counter*)))
+      (a64-set-label buf zloop)
+      (a64-cmp-reg buf +a64-x9+ +a64-x10+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i zdone :bcond))
+      (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)       ; store 8 zero bytes
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zloop :b))
+      (a64-set-label buf zdone))
+    ;; ---- swap metadata (store <<1) ----
+    (a64-lsl-imm buf +a64-x9+ +a64-x22+ 1)              ; new from_start = to_start
+    (a64-load-imm64 buf +a64-x16+ #x10000040) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-lsl-imm buf +a64-x9+ +a64-x19+ 1)              ; new to_start = old from_start
+    (a64-load-imm64 buf +a64-x16+ #x10000048) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    ;; x24 = free_ptr ; x25 = new from_start(to_start x22) + space_size(x25)
+    (a64-mov-reg buf +a64-x24+ +a64-x21+)
+    (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
+    ;; gc_count += 1 (stored <<1 → += 2)
+    (a64-load-imm64 buf +a64-x16+ #x10000060)
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0) (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
+    (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
+    ;; ---- restore mutator regs + RET ----
+    (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
+    (a64-ldr-unsigned buf +a64-x29+ +a64-sp+ 208)
+    (a64-ldr-unsigned buf +a64-x27+ +a64-sp+ 200)
+    (a64-ldr-unsigned buf +a64-x26+ +a64-sp+ 192)
+    (a64-ldr-unsigned buf +a64-x23+ +a64-sp+ 184)
+    (a64-ldr-unsigned buf +a64-x22+ +a64-sp+ 176)
+    (a64-ldr-unsigned buf +a64-x21+ +a64-sp+ 168)
+    (a64-ldr-unsigned buf +a64-x20+ +a64-sp+ 160)
+    (a64-ldr-unsigned buf +a64-x19+ +a64-sp+ 152)
+    (a64-ldr-unsigned buf +a64-x18+ +a64-sp+ 144)
+    (a64-ldp-offset buf +a64-x16+ +a64-x17+ +a64-sp+ 128)
+    (a64-ldp-offset buf +a64-x14+ +a64-x15+ +a64-sp+ 112)
+    (a64-ldp-offset buf +a64-x12+ +a64-x13+ +a64-sp+ 96)
+    (a64-ldp-offset buf +a64-x10+ +a64-x11+ +a64-sp+ 80)
+    (a64-ldp-offset buf +a64-x8+  +a64-x9+  +a64-sp+ 64)
+    (a64-ldp-offset buf +a64-x6+  +a64-x7+  +a64-sp+ 48)
+    (a64-ldp-offset buf +a64-x4+  +a64-x5+  +a64-sp+ 32)
+    (a64-ldp-offset buf +a64-x2+  +a64-x3+  +a64-sp+ 16)
+    (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 240)
+    (a64-ret buf)))
+
 (defun emit-aarch64-handler-helpers (buf)
   "If *aarch64-handler-push-label* / *aarch64-handler-pop-label* are
    bound (non-nil), emit the push and pop helpers into BUF and set
@@ -4270,7 +4563,13 @@
   ;;   [sp+192..199] x26  [sp+200..207] x27
   ;;   [sp+208..215] x29 (FP) [sp+216..223] x30 (LR)
   ;;   [sp+224..239] padding (2 slots)
-  (when (and *aarch64-gc-trampoline-label*
+  ;; WS4-AA64 #160 Stage 1: when *aarch64-gc-native-mcgc*, emit the NATIVE
+  ;; Cheney collector at the trampoline label (no Lisp %gc-collect needed);
+  ;; otherwise the Lisp-%gc-collect-calling trampoline below (unchanged).
+  (when (and *aarch64-gc-native-mcgc* *aarch64-gc-trampoline-label*)
+    (emit-aarch64-native-gc-trampoline buf))
+  (when (and (not *aarch64-gc-native-mcgc*)
+             *aarch64-gc-trampoline-label*
              *aarch64-gc-collect-bytecode-offset*)
     (a64-set-label buf *aarch64-gc-trampoline-label*)
     ;; Save x0..x17 as nine STP pairs (also allocates 240-byte frame

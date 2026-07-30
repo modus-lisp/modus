@@ -422,26 +422,26 @@
   ;;     the collector is correct for a pure pointer/cons workload.
   (when (eql (%parse-decimal-at-fixed-208) 33333)
     (write-string-serial \"GCLIST-START\") (write-char-serial 10)
-    (write-string-serial \"len/bad=\")
-    (print-dec (handler-case
-       (let ((live nil) (i 0)
-             (gmax (let ((a (%parse-decimal-at-fixed-248)))
-                     (if (> a 0) (* a 1000000) 20000000))))
-         (loop (when (>= i 100000) (return nil)) (setq live (cons i live)) (setq i (+ i 1)))
-         (setq i 0)
-         (loop (when (>= i gmax) (return nil)) (cons i i) (setq i (+ i 1)))
-         (let ((n 0) (bad 0) (p live) (expect 99999))
-           (loop (when (null p) (return nil))
-             (unless (eql (car p) expect) (setq bad (+ bad 1)))
-             (setq expect (- expect 1)) (setq n (+ n 1)) (setq p (cdr p)))
-           ;; encode: n*10 + (bad>0 ? 1 : 0) ... simpler: return bad (0=clean) but
-           ;; also want n; print n first then bad below.
-           (setf (mem-ref #x10000C88 :u64) n)
-           bad))
-     (t (c) -1)))
-    (write-char-serial 10)
-    (write-string-serial \"n=\") (print-dec (mem-ref #x10000C88 :u64)) (write-char-serial 10)
-    (write-string-serial \"gc=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
+    (let ((live nil) (i 0)
+          (gmax (let ((a (%parse-decimal-at-fixed-248)))
+                  (if (> a 0) (* a 1000000) 20000000))))
+      ;; phase 1: build a 100000-cons chain, car = descending i (head car=99999)
+      (loop (when (>= i 100000) (return nil)) (setq live (cons i live)) (setq i (+ i 1)))
+      (write-string-serial \"built gc=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
+      (write-string-serial \"head0=\") (print-dec (if (consp live) (car live) -7)) (write-char-serial 10)
+      ;; phase 2: dead garbage to force collections
+      (setq i 0)
+      (loop (when (>= i gmax) (return nil)) (cons i i) (setq i (+ i 1)))
+      (write-string-serial \"gc-after=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
+      ;; phase 3: walk with a consp guard (no deref of a non-cons), count length
+      (let ((n 0) (p live))
+        (loop
+          (when (null p) (return nil))
+          (when (not (consp p)) (return nil))   ; corrupted link → stop
+          (setq n (+ n 1)) (setq p (cdr p)))
+        (write-string-serial \"walked=\") (print-dec n) (write-char-serial 10)
+        (write-string-serial \"headcar=\") (print-dec (if (consp live) (car live) -7))
+        (write-char-serial 10)))
     (write-string-serial \"GCLIST-END\") (write-char-serial 10)
     (sys-exit 0))
 
@@ -581,7 +581,10 @@
 ;; WS4-AA64 #160 Stage B: emit the object-start-bit SET at every alloc site so
 ;; gc.lisp's %gc-forward-slot / %gc-scan-copied can reject false roots.
 (setf *aarch64-gc-bitmap-enabled* t)
-(format t "~%  AArch64 GC: ON  midpoint=#x~X  metadata-shl=t  bitmap=t~%"
+;; WS4-AA64 #160 Stage 1: use the NATIVE Cheney collector (not the Lisp
+;; %gc-collect path).  Allocation-free → can't re-enter; object-start-validated.
+(setf *aarch64-gc-native-mcgc* t)
+(format t "~%  AArch64 GC: ON (NATIVE MCGC)  midpoint=#x~X  metadata-shl=t  bitmap=t~%"
         *linux-aarch64-gc-midpoint*)
 (setf *aarch64-handler-pop-label* nil)
 (setf *aarch64-handler-push-label* nil)

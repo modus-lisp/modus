@@ -1943,6 +1943,15 @@
                   (a64-bcond buf +cc-cc+ (- i-top (a64-current-index buf)))) ; B.LO
                 (a64-dsb buf #xB)                          ; DSB ISH
                 (a64-isb buf))                             ; ISB
+               ((= code #x0534)
+                ;; %JIT-FREE-PAGE base len — munmap(addr, len).  aarch64=215.
+                ;; Reclaims a transient JIT exec page (x64 = no-op); reclaim is
+                ;; runtime-gated to *jit-reclaim-on* (currently off; flip round).
+                (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)     ; x0 = addr
+                (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)     ; x1 = len
+                (a64-movz buf +a64-x8+ 215 0)             ; munmap
+                (a64-svc buf 0)
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))    ; tag result
                ((= code #x0510)
                 ;; SETJMP: Save SP, FP (X29), return-IP to 0x10000180/188/190.
                 ;; First call: return NIL (=X26=0) in X0.  On longjmp:
@@ -4246,7 +4255,36 @@
       (a64-ldrb buf +a64-x15+ +a64-x14+)
       (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)    ; mask=1<<bit
       (a64-ands-reg buf +a64-xzr+ +a64-x15+ +a64-x16+)     ; TST byte & mask
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond)) ; bit clear → skip
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond)) ; obj-start bit clear → skip
+      ;; ---- CONS-KIND cross-check (x64-parity: emit-mcgc-cons-kind-or-jump) ----
+      ;; A tag-9 (object) candidate whose target is a CONS (cons-kind bit SET), or a
+      ;; tag-1 (cons) candidate whose target is NOT a cons (cons-kind CLEAR), is a
+      ;; conservative FALSE POSITIVE (raw/unboxed data in a pointer-bearing object —
+      ;; e.g. a stored hash in a hash-table backing array — that merely aliases a
+      ;; live object start).  REJECT it (don't copy).  Without this, a tag-9 value
+      ;; aliasing a cons is copied via copy_object's OBJECT path → the cons's CAR is
+      ;; read as a header → astronomical count → the copy loop runs off the mapped
+      ;; heap → SIGSEGV (WS4-AA64 #160 root cause).  conskind base @0x10000E40 (<<1);
+      ;; scratch x13..x17; preserves x9(word-addr)/x10(value)/x11(tag)/x12(raw).
+      (a64-load-imm64 buf +a64-x14+ #x10000E40) (a64-ldr-unsigned buf +a64-x14+ +a64-x14+ 0) (a64-asr-imm buf +a64-x14+ +a64-x14+ 1)
+      (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)          ; raw - page_base
+      (a64-lsr-imm buf +a64-x15+ +a64-x13+ 7) (a64-add-reg buf +a64-x15+ +a64-x14+ +a64-x15+ 0 0) ; x15 = conskind byte addr
+      (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)                      ; granule
+      (a64-movz buf +a64-x16+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x16+)  ; x13 = bit idx
+      (a64-ldrb buf +a64-x16+ +a64-x15+)                           ; x16 = conskind byte
+      (a64-movz buf +a64-x17+ 1 0) (a64-lslv buf +a64-x17+ +a64-x17+ +a64-x13+)     ; x17 = mask = 1<<bit
+      (let ((ck-tag1 (incf *mvm-label-counter*)) (ck-done (incf *mvm-label-counter*)))
+        (a64-cmp-imm buf +a64-x11+ 1)                              ; tag == 1 (cons)?
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i ck-tag1 :bcond))
+        ;; tag == 9 (object): REJECT if cons-kind bit SET (a tag-9 value → a cons)
+        (a64-ands-reg buf +a64-xzr+ +a64-x16+ +a64-x17+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i sret :bcond))
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i ck-done :b))
+        (a64-set-label buf ck-tag1)
+        ;; tag == 1 (cons): REJECT if cons-kind bit CLEAR (a tag-1 value → a non-cons)
+        (a64-ands-reg buf +a64-xzr+ +a64-x16+ +a64-x17+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond))
+        (a64-set-label buf ck-done))
       ;; copy + update the word (save x9 word-addr + x30 across the nested BL)
       (a64-stp-pre buf +a64-x9+ +a64-x30+ +a64-sp+ -16)
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i copy-obj :bl)) ; x10 tagged → x10 new
@@ -4273,11 +4311,19 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
       (a64-cmp-imm buf +a64-x12+ 1)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-cons :bcond))
-      ;; ---- object: size = align16((count+2)*8) ----
+      ;; ---- object: size = align16((count+2)*8), EXCEPT u8-vector (#x11) whose
+      ;;      header count is in BYTES → size = align16(16 + count). ----
       (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; x12 = dest_start
-      (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)            ; count
-      (a64-add-imm buf +a64-x15+ +a64-x15+ 2)
-      (a64-lsl-imm buf +a64-x15+ +a64-x15+ 3)            ; (count+2)*8
+      (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)            ; x15 = count
+      (a64-lsl-imm buf +a64-x9+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 56) ; x9 = subtag
+      (a64-cmp-imm buf +a64-x9+ #x11)
+      (let ((u8sz (incf *mvm-label-counter*)) (hadsz (incf *mvm-label-counter*)))
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+        (a64-lsl-imm buf +a64-x15+ +a64-x15+ 3) (a64-add-imm buf +a64-x15+ +a64-x15+ 16) ; (count+2)*8 = count*8+16
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i hadsz :b))
+        (a64-set-label buf u8sz)
+        (a64-add-imm buf +a64-x15+ +a64-x15+ 16)         ; u8: 16 + count(bytes)
+        (a64-set-label buf hadsz))
       (a64-add-imm buf +a64-x15+ +a64-x15+ 15)
       (a64-lsr-imm buf +a64-x15+ +a64-x15+ 4)
       (a64-lsl-imm buf +a64-x15+ +a64-x15+ 4)            ; size aligned16
@@ -4313,6 +4359,18 @@
       (a64-add-imm buf +a64-x10+ +a64-x12+ 1)            ; new tagged = dest|1
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
+      (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
+      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-ldrb buf +a64-x15+ +a64-x14+)
+      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
+      ;; ALSO set the CONS-KIND bit for dest (x12) so the type-aware to-space
+      ;; scan classifies this copy as a cons.  conskind base @0x10000E40 (<<1).
+      ;; NB: x10 holds the RETURN value (dest|1) — must NOT clobber it; use x9
+      ;; for the base and x13..x17 for the bit math.
+      (a64-load-imm64 buf +a64-x9+ #x10000E40) (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0) (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
+      (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
+      (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x9+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
       (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
@@ -4404,16 +4462,77 @@
       (a64-sub-imm buf +a64-x26+ +a64-x26+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i mvloop :b))
       (a64-set-label buf mvdone))
-    ;; ---- Cheney scan: x26 from to_start to free_ptr ----
-    (a64-mov-reg buf +a64-x26+ +a64-x22+)               ; scan = to_start
+    ;; ---- Cheney scan: OBJECT-BY-OBJECT, TYPE-AWARE ----
+    ;; #160 PIECE 1: walk to-space object-by-object (cursor x26; next-obj x24;
+    ;; slot cursor x18 — all preserved across scan_word/copy_object).  The
+    ;; cons-kind bitmap (@0x10000E40) says whether the granule at the cursor is a
+    ;; cons (scan car+cdr) or a headered object (read subtag).  LEAF subtags
+    ;; (string #x10/#x31, u8 #x11, u64 #x14, sap #x16, bignum #x30, floats
+    ;; #x60/#x64/#x65/#x66) carry RAW payload → copy but DO NOT scan their slots
+    ;; as pointers (so a leaf data word aliasing a from-space start is never
+    ;; rewritten — the residual gap the word-by-word scan had).  #x61 = mvm-module
+    ;; is NOT a leaf (pointer slots) so it is scanned.  Object size mirrors
+    ;; copy_object: u8 = align16(16+count[bytes]); else align16((count+2)*8).
+    (a64-mov-reg buf +a64-x26+ +a64-x22+)               ; walk cursor = to_start
     (let ((cloop (incf *mvm-label-counter*))
-          (cdone (incf *mvm-label-counter*)))
+          (cdone (incf *mvm-label-counter*))
+          (is-cons (incf *mvm-label-counter*))
+          (leafskip (incf *mvm-label-counter*))
+          (u8sz2 (incf *mvm-label-counter*))
+          (haveslots (incf *mvm-label-counter*))
+          (sloop (incf *mvm-label-counter*))
+          (sdone2 (incf *mvm-label-counter*)))
       (a64-set-label buf cloop)
-      (a64-cmp-reg buf +a64-x26+ +a64-x21+)             ; scan >= free_ptr?
+      (a64-cmp-reg buf +a64-x26+ +a64-x21+)             ; cursor >= free_ptr → done
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
+      ;; cons-kind check for cursor: conskind base @0x10000E40 (<<1)
+      (a64-load-imm64 buf +a64-x9+ #x10000E40) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+      (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)  ; cursor - page_base
+      (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x12+ 0 0) ; byte addr
+      (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)              ; granule
+      (a64-movz buf +a64-x13+ 7 0) (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x13+) ; bit idx
+      (a64-ldrb buf +a64-x14+ +a64-x12+)
+      (a64-movz buf +a64-x15+ 1 0) (a64-lslv buf +a64-x15+ +a64-x15+ +a64-x11+)  ; mask
+      (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)     ; TST
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond)) ; set → cons
+      ;; headered object
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x26+ 0)         ; x13 = header
+      (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56) ; x14 = subtag
+      (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)              ; x15 = count
+      (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)              ; x16 = count*8
+      (a64-add-imm buf +a64-x18+ +a64-x26+ 16)             ; x18 = slot cursor (obj+16)
+      (a64-cmp-imm buf +a64-x14+ #x11)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
+      (a64-add-imm buf +a64-x9+ +a64-x16+ 16)              ; general: count*8+16
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i haveslots :b))
+      (a64-set-label buf u8sz2)
+      (a64-add-imm buf +a64-x9+ +a64-x15+ 16)              ; u8: 16+count(bytes)
+      (a64-set-label buf haveslots)
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4) ; align16
+      (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)   ; x24 = next object pos (preserved)
+      (a64-add-reg buf +a64-x26+ +a64-x18+ +a64-x16+ 0 0)  ; x26 = slot_end = obj+16+count*8
+      (dolist (st (list #x10 #x11 #x14 #x16 #x30 #x31 #x60 #x64 #x65 #x66))
+        (a64-cmp-imm buf +a64-x14+ st)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
+      ;; pointer-bearing: scan slots [x18 .. slot_end=x26)
+      (a64-set-label buf sloop)
+      (a64-cmp-reg buf +a64-x18+ +a64-x26+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone2 :bcond))
+      (a64-mov-reg buf +a64-x9+ +a64-x18+)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x18+ +a64-x18+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
+      (a64-set-label buf sdone2)
+      (a64-set-label buf leafskip)
+      (a64-mov-reg buf +a64-x26+ +a64-x24+)                ; advance to next object
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
+      ;; cons: scan car @cursor, cdr @cursor+8
+      (a64-set-label buf is-cons)
       (a64-mov-reg buf +a64-x9+ +a64-x26+)
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-      (a64-add-imm buf +a64-x26+ +a64-x26+ 8)
+      (a64-add-imm buf +a64-x9+ +a64-x26+ 8)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
       (a64-set-label buf cdone))
     ;; ---- clear reclaimed (old from_start = x19) object-start bitmap range ----
@@ -4447,6 +4566,32 @@
       (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte :b))
       (a64-set-label buf zdone))
+    ;; ---- ALSO byte-exact clear the reclaimed CONS-KIND bitmap range ----
+    ;; (else stale cons-kind bits in the reclaimed semispace would misclassify a
+    ;; future object-start as a cons in the type-aware walk.)  Same range/method.
+    (a64-load-imm64 buf +a64-x12+ #x10000E40) (a64-ldr-unsigned buf +a64-x12+ +a64-x12+ 0) (a64-asr-imm buf +a64-x12+ +a64-x12+ 1) ; x12 = conskind base
+    (a64-sub-reg buf +a64-x9+ +a64-x19+ +a64-x27+ 0 0)
+    (a64-lsr-imm buf +a64-x9+ +a64-x9+ 7)
+    (a64-add-reg buf +a64-x9+ +a64-x12+ +a64-x9+ 0 0)   ; x9 = dest (conskind)
+    (a64-lsr-imm buf +a64-x10+ +a64-x25+ 7)             ; x10 = byte count
+    (a64-add-reg buf +a64-x10+ +a64-x9+ +a64-x10+ 0 0)  ; x10 = dest end (exclusive)
+    (a64-sub-imm buf +a64-x11+ +a64-x10+ 7)             ; x11 = end-7
+    (let ((zloop2 (incf *mvm-label-counter*))
+          (zbyte2 (incf *mvm-label-counter*))
+          (zdone2b (incf *mvm-label-counter*)))
+      (a64-set-label buf zloop2)
+      (a64-cmp-reg buf +a64-x9+ +a64-x11+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i zbyte2 :bcond))
+      (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 8)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zloop2 :b))
+      (a64-set-label buf zbyte2)
+      (a64-cmp-reg buf +a64-x9+ +a64-x10+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i zdone2b :bcond))
+      (a64-strb buf +a64-xzr+ +a64-x9+)
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte2 :b))
+      (a64-set-label buf zdone2b))
     ;; ---- swap metadata (store <<1) ----
     (a64-lsl-imm buf +a64-x9+ +a64-x22+ 1)              ; new from_start = to_start
     (a64-load-imm64 buf +a64-x16+ #x10000040) (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)

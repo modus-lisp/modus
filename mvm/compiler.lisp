@@ -4960,6 +4960,10 @@
       ;; invalidate; x64 is a no-op.
       ((= op-name (compute-name-hash "%JIT-ICACHE-FLUSH"))
        (compile-jit-icache-flush (cdr form) env dest))
+      ;; (%jit-free-page base len) — munmap a transient JIT exec page (WS4
+      ;; #160 Piece 2 reclamation).  aarch64 munmap; x64 no-op.
+      ((= op-name (compute-name-hash "%JIT-FREE-PAGE"))
+       (compile-jit-free-page (cdr form) env dest))
       ;; (%get-cenv) — read the closure-env register (R13 on x64) into
       ;; DEST. Used only by the closure body prologue to snapshot the
       ;; env-list set by the caller's compile-funcall closure path.
@@ -13405,6 +13409,23 @@
   (emit-ir :mov +vreg-v1+ dest)
   (emit-ir :pop +vreg-v0+)
   (emit-ir :trap #x0533)
+  (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-jit-free-page (args env dest)
+  "Compile (%jit-free-page base len) — munmap [base, base+len), reclaiming a
+   %mmap-exec-page region whose JIT'd code is no longer referenced (the WS4
+   transient-form path: a top-level form with EMPTY lam-offsets, whose page
+   holds only straight-line code nothing keeps after the native call returns).
+   TRAP #x0534: aarch64 munmap(V0=base, V1=len) syscall 215; x86-64 a NO-OP
+   (the aarch64 runtime JIT is the only caller — reclaim is runtime-gated to
+   *jit-target-arch* :aarch64, so x64 emits the call but never executes it).
+   V0 = base, V1 = len."
+  (compile-form (car args) env dest)
+  (emit-ir :push dest)
+  (compile-form (cadr args) env dest)
+  (emit-ir :mov +vreg-v1+ dest)
+  (emit-ir :pop +vreg-v0+)
+  (emit-ir :trap #x0534)
   (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-read-char-serial (dest)

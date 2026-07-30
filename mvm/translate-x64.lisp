@@ -746,6 +746,12 @@
               ;; to an exec page are visible to fetch without maintenance).
               ;; AArch64 does the DC CVAU / IC IVAU loop here instead.
               (emit-bytes buf #x90))            ; nop
+             ((= code #x0534)
+              ;; %JIT-FREE-PAGE: NO-OP on x86-64.  The transient-page reclaim is
+              ;; runtime-gated to *jit-target-arch* :aarch64, so this trap is
+              ;; emitted (mvm-eval is shared) but NEVER executed on x64 — keeping
+              ;; x64 byte-identical / differential=2.  aarch64 munmaps the page.
+              (emit-bytes buf #x90))            ; nop
              ((= code #x0532)
               ;; %JIT-CALL (arch-neutral; was #x0506).
               ;; call a JIT'd native function whose entry address is

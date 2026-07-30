@@ -358,6 +358,11 @@
              (psize (ash npages 12))
              (base (%mmap-exec-page psize))
              (k 0) (ok t))
+        ;; SAFE-FLIP GUARD: MAP_FAILED (mmap returns -errno = a NEGATIVE/tiny Lisp
+        ;; integer, vs a huge-positive address) → DON'T write/call a bad page;
+        ;; return NIL so the seam falls back to mvm-interpret for this form.
+        (when (< base 4096)
+          (return-from %jit-translate-page-1-aarch64 nil))
         (loop
           (when (>= k nwords) (return nil))
           (let ((w (aref code k)) (o (* k 4)))
@@ -384,7 +389,10 @@
             (%jit-write-movz-quad base (car p) (%val->word obj))))
         (%jit-icache-flush base nlen)
         (if (and ok eoff)
-            (list base eoff nil (%gc-count))
+            ;; 5th element = PSIZE, so a transient form's page can be munmap'd
+            ;; (%jit-free-page base psize) after its native call — see
+            ;; %mvm-eval-jit-run's reclamation.
+            (list base eoff nil (%gc-count) psize)
             nil)))))
 
 (defvar *jit-translate-err-count* 0
@@ -452,10 +460,42 @@
    bulk of runtime evals — take the fast native path.
    CACHE-P: T = reuse/store an exec page in *jit-page-cache* (cached modules,
    where the SAME bc re-evals — the speedup source); NIL = translate once, no
-   cache (the fresh-bc DEF* path, whose page would never be re-hit)."
-  (let ((je (if cache-p
-                (%jit-entry-for bc entry ft-list rt-table)
-                (%jit-translate-page bc entry ft-list rt-table))))
+   cache (the fresh-bc DEF* path, whose page would never be re-hit).
+
+   WS4 #160 Piece 2 — CONSERVATIVE-CORRECT transient reclamation (aarch64):
+   a TRANSIENT form has EMPTY lam-offsets, meaning NO lambda/closure body was
+   compiled INTO its exec page — the page holds only the top-level thunk's
+   straight-line code, which nothing references once the native call returns.
+   Such a page is translated WITHOUT caching and munmap'd immediately after the
+   call (bounding a long run of distinct transient forms — e.g. a REPL/stress
+   evaluating thousands of `(+ i 1)` — to O(1) live RWX pages).  CODE-BEARING
+   forms (non-empty lam-offsets: a lambda body IS in the page, so an escaping
+   closure may reference it) keep the cache/retain path and are NEVER freed —
+   so there is NO use-after-free by construction.  As extra insurance a page is
+   also retained if the form's RESULT is itself a function.  Reclaim is gated to
+   *jit-target-arch* :aarch64; on x64 TRANSIENT is always NIL so behaviour and
+   emitted-runtime are unchanged (the %jit-free-page trap is a no-op there)."
+  ;; #160 Piece 2 (round 2): lam-offsets is NOT a usable transient signal on
+  ;; aarch64 — it is ALWAYS non-nil (measured length 7 for every top-level form,
+  ;; including `(+ i 1)`), so the earlier `(null lam-offsets)` never fired and
+  ;; nothing was reclaimed (still exhausting ~2350).  Use the RESULT TYPE
+  ;; instead: on aarch64 translate the run-tuple page WITHOUT caching (top-level
+  ;; forms rarely re-eval the SAME bc, so the cache mostly just accumulates —
+  ;; the exhaustion source) and, after the native call, FREE the page UNLESS the
+  ;; result is a FUNCTION (an escaping closure whose code lives IN this page).
+  ;; A `defun`/`setf-fn` form returns a symbol/non-function, and its installed
+  ;; body is a SEPARATE module (its own page, built on first call) — so freeing
+  ;; the top-level installer page is safe (validated by the defun/closure
+  ;; retention probes).  x64 is untouched (aa64 is nil → original cache path).
+  ;; STEP-A: reclamation is gated behind *jit-reclaim-on* (default NIL = the
+  ;; CACHED baseline — %jit-entry-for, no free).  With it NIL, aa64 behaves
+  ;; exactly like x64's cache path, so STEP A measures the true baseline; the
+  ;; MAP_FAILED guard in %jit-translate-page-1-aarch64 still applies to both.
+  (let* ((aa64 (and (eq *jit-target-arch* :aarch64)
+                    (boundp (quote *jit-reclaim-on*)) *jit-reclaim-on*))
+         (je (if (and cache-p (not aa64))
+                 (%jit-entry-for bc entry ft-list rt-table)
+                 (%jit-translate-page bc entry ft-list rt-table))))
     (if je
         (progn
           ;; Native code stamps MV-count into real BSS; seed it to 1 so a
@@ -465,6 +505,8 @@
           (let ((raw (%jit-call (+ (car je) (cadr je)))))
             (let ((mvc (mem-ref #x10000090 :u64)))
               (unless (eql mvc 1)
+                ;; MV form → fall back to interpret; DON'T free (result unknown —
+                ;; could be a function; leak the rare MV-form page conservatively).
                 (error "jit-mv-fallback")))
             ;; SINGLE value: clear the interpreter's simulated MV state so a
             ;; STALE *mvm-last-mv* from a prior interpret run doesn't leak into
@@ -472,7 +514,12 @@
             (setq *mvm-last-mv* nil)
             (setq *jit-native-count*
                   (if *jit-native-count* (+ 1 *jit-native-count*) 1))
-            (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
+            (let ((result (%mvm-wrap-escaping-result raw bc fn-table rt-table lam-offsets)))
+              ;; Reclaim the (uncached) aarch64 page unless the RESULT is a
+              ;; function/closure whose code is in it.  car(cddddr je) = PSIZE.
+              (when (and aa64 (car (cddddr je)) (not (functionp result)))
+                (%jit-free-page (car je) (car (cddddr je))))
+              result)))
         (error "jit-page-unavailable"))))
 
 (defun %mvm-eval-run-tuple (tuple)

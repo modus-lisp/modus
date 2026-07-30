@@ -499,7 +499,7 @@
     (let ((i 0))
       (loop
         (when (>= i 4000) (return nil))
-        (when (eql (mod i 50) 0)
+        (when (eql (mod i 100) 0)
           (write-string-serial \"stress i=\") (print-dec i) (write-char-serial 10))
         ;; Distinct form each iteration (varying literal) → distinct bytecode →
         ;; distinct exec page → fresh ~1.7MB translation (no page-cache hit).
@@ -507,6 +507,52 @@
         (setq i (+ i 1))))
     (setq *cli-jit-on* nil)
     (write-string-serial \"stress-SURVIVED-4000\") (write-char-serial 10))
+
+  ;; (8) WS4 #160 Piece 2 DEFUN-RETENTION regression net (argv1 = 56667):
+  ;;     define a fn via JIT (returns a SYMBOL → non-function result → its
+  ;;     installer page IS reclaimed).  Drive many transient forms (freeing
+  ;;     pages), then call the fn 100x.  If the fn's BODY had lived in the freed
+  ;;     installer page, this would UAF-crash; defun-bad must be 0 (body is a
+  ;;     SEPARATE module, built on first call).
+  (when (eql (%parse-decimal-at-fixed-208) 56667)
+    (setq *cli-jit-on* t)
+    (write-string-serial \"DEFUNPROBE-START\") (write-char-serial 10)
+    (mvm-eval (list (quote defun) (quote probefoo) (quote (x)) (list (quote +) (quote x) 100)))
+    (let ((i 0)) (loop (when (>= i 3000) (return nil)) (mvm-eval (list (quote +) i 1)) (setq i (+ i 1))))
+    (let ((bad 0) (j 0))
+      (loop (when (>= j 100) (return nil))
+        (unless (eql (mvm-eval (list (quote probefoo) j)) (+ j 100)) (setq bad (+ bad 1)))
+        (setq j (+ j 1)))
+      (write-string-serial \"defun-bad=\") (print-dec bad) (write-char-serial 10)
+      )
+    (write-string-serial \"DEFUNPROBE-END\") (write-char-serial 10)
+    (sys-exit 0))
+
+  ;; (7) WS4 #160 Piece 2 CLOSURE-RETENTION regression net (argv1 = 56666):
+  ;;     JIT N escaping closures (each (lambda () K) — NON-empty lam-offsets +
+  ;;     function result → CODE-BEARING → page retained forever, never freed).
+  ;;     Keep them live, then drive many TRANSIENT (+ i 1) forms through
+  ;;     reclamation (which munmaps their pages).  Finally funcall every closure;
+  ;;     the sum must equal 0+1+..+(N-1) = 19900 for N=200.  A crash or wrong sum
+  ;;     = a use-after-free (the transient/code-bearing classifier has a hole).
+  ;;     Must PASS by construction (code-bearing pages are never reclaimed).
+  (when (eql (%parse-decimal-at-fixed-208) 56666)
+    (setq *cli-jit-on* t)
+    (write-string-serial \"CLOSPROBE-START\") (write-char-serial 10)
+    (let ((fns nil) (i 0) (n 200))
+      (loop (when (>= i n) (return nil))
+        (setq fns (cons (mvm-eval (list (quote lambda) (quote ()) i)) fns))
+        (setq i (+ i 1)))
+      (setq i 0)
+      (loop (when (>= i 6000) (return nil)) (mvm-eval (list (quote +) i 1)) (setq i (+ i 1)))
+      (let ((sum 0) (p fns))
+        (loop (when (null p) (return nil))
+          (setq sum (+ sum (funcall (car p))))
+          (setq p (cdr p)))
+        (write-string-serial \"clos-sum=\") (print-dec sum) (write-char-serial 10)
+        (write-string-serial \"clos-expected=\") (print-dec (* (/ n 2) (- n 1))) (write-char-serial 10)))
+    (write-string-serial \"CLOSPROBE-END\") (write-char-serial 10)
+    (sys-exit 0))
 
   (write-string-serial \"CLI-DONE\") (write-char-serial 10)
   (sys-exit 0))

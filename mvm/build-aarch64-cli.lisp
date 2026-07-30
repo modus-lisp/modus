@@ -528,6 +528,31 @@
     (write-string-serial \"DEFUNPROBE-END\") (write-char-serial 10)
     (sys-exit 0))
 
+  ;; (9) FLIP-READINESS odd-form battery (argv1 = 56668): JIT-on must NEVER
+  ;;     SIGSEGV on any valid form — it either goes native or degrades to
+  ;;     interpret via %jit-translate-page's handler-case guard.  Each form
+  ;;     below is odd-but-valid; all must return the correct value.  A crash =
+  ;;     a translator HARDWARE-FAULT the Lisp-error guard can't catch.
+  (when (eql (%parse-decimal-at-fixed-208) 56668)
+    (setq *cli-jit-on* t)
+    (write-string-serial \"BATTERY-START\") (write-char-serial 10)
+    ;; b1: captureless constant lambda → funcall → 5
+    (write-string-serial \"b1=\") (print-dec (funcall (mvm-eval (list (quote lambda) (quote ()) 5)))) (write-char-serial 10)
+    ;; b2: empty progn → NIL (print 1 if null, 0 otherwise)
+    (write-string-serial \"b2null=\") (print-dec (if (null (mvm-eval (list (quote progn)))) 1 0)) (write-char-serial 10)
+    ;; b3: immediate literal
+    (write-string-serial \"b3=\") (print-dec (mvm-eval (list (quote +) 7 0))) (write-char-serial 10)
+    ;; b4: nested lambda → funcall funcall → 1
+    (write-string-serial \"b4=\") (print-dec (funcall (funcall (mvm-eval (list (quote lambda) (quote ()) (list (quote lambda) (quote ()) 1)))))) (write-char-serial 10)
+    ;; b5: identity lambda → funcall 42 → 42
+    (write-string-serial \"b5=\") (print-dec (funcall (mvm-eval (list (quote lambda) (quote (x)) (quote x))) 42)) (write-char-serial 10)
+    ;; b6: quoted-literal + arithmetic → (+ (car '(10 20)) 5) → 15
+    (write-string-serial \"b6=\") (print-dec (mvm-eval (list (quote +) (list (quote car) (list (quote quote) (list 10 20))) 5))) (write-char-serial 10)
+    ;; b7: a form that may be a translator GAP (flet) → must fall back, not crash
+    (write-string-serial \"b7=\") (print-dec (mvm-eval (list (quote flet) (list (list (quote g) (quote (y)) (list (quote * ) (quote y) 3))) (list (quote g) 4)))) (write-char-serial 10)
+    (write-string-serial \"BATTERY-END\") (write-char-serial 10)
+    (sys-exit 0))
+
   ;; (7) WS4 #160 Piece 2 CLOSURE-RETENTION regression net (argv1 = 56666):
   ;;     JIT N escaping closures (each (lambda () K) — NON-empty lam-offsets +
   ;;     function result → CODE-BEARING → page retained forever, never freed).

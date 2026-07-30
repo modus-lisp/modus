@@ -233,39 +233,51 @@
    validation (ace1544/810a975), adapted to the Lisp-side collector.  Default
    nil = no SET emitted = byte-identical to pre-#160 (bare-metal, gate, x64).")
 
+(defun emit-aarch64-gc-set-bit (buf cfg-bitmap-addr)
+  "WS4-AA64 #160: set the bit for the object whose raw base is in x24 (the alloc
+   pointer, BEFORE the opcode bumps it) in the bitmap whose base pointer lives at
+   config CFG-BITMAP-ADDR (0x10000E18 = object-start, 0x10000E40 = cons-kind).
+   1 bit / 16-byte granule; page_base at config 0x10000E00 — both bases stored
+   value<<1 by %gc-bitmap-init, so LDR then ASR #1 recovers the raw address.
+   Scratch x9..x13 (dead across MVM opcodes; alloc opcodes use x16/x17 + phys
+   vregs, never x9..x13).  Guarded: base == 0 (pre-init / disabled) skips the
+   write.  AND/LSLV/LDRB/STRB encodings assembler-verified."
+  (a64-load-imm64 buf +a64-x10+ cfg-bitmap-addr)
+  (a64-ldr-unsigned buf +a64-x11+ +a64-x10+ 0)
+  (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)            ; x11 = bitmap_base
+  (a64-cmp-imm buf +a64-x11+ 0)
+  (let ((skip (incf *mvm-label-counter*)))
+    (let ((idx (a64-current-index buf)))
+      (a64-bcond buf +cc-eq+ 0)                       ; base==0 → skip
+      (a64-add-fixup buf idx skip :bcond))
+    (a64-load-imm64 buf +a64-x10+ #x10000E00)
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x10+ 0)
+    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)             ; x9 = page_base
+    (a64-sub-reg buf +a64-x9+ +a64-x24+ +a64-x9+ 0 0) ; x9 = addr - page_base
+    (a64-lsr-imm buf +a64-x10+ +a64-x9+ 7)            ; x10 = byte offset (gran>>3)
+    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x10+ 0 0) ; x11 = byte address
+    (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4)             ; x9 = granule
+    (a64-emit buf #x92400929)                         ; AND x9, x9, #7  (bit index)
+    (a64-movz buf +a64-x12+ 1 0)                      ; x12 = 1
+    (a64-emit buf #x9AC9218C)                         ; LSLV x12, x12, x9  (1<<bit)
+    (a64-emit buf #x3940016D)                         ; LDRB w13, [x11]
+    (a64-orr-reg buf +a64-x13+ +a64-x13+ +a64-x12+)   ; w13 |= mask
+    (a64-emit buf #x3900016D)                         ; STRB w13, [x11]
+    (a64-set-label buf skip)))
+
 (defun emit-aarch64-gc-mark-start (buf)
-  "WS4-AA64 #160: set the object-start bit for the object whose raw base is in
-   x24 (the alloc pointer, BEFORE the opcode bumps it).  1 bit / 16-byte
-   granule; page_base at config 0x10000E00, bitmap_base at 0x10000E18 — both
-   stored value<<1 by %gc-bitmap-init, so LDR then ASR #1 recovers the raw
-   address.  Scratch x9..x13 (dead across MVM opcodes; the alloc opcodes use
-   x16/x17 + phys vregs, never x9..x13).  Guarded: bitmap_base == 0 (pre-init /
-   disabled) skips the write.  Encodings for AND/LSLV/LDRB/STRB are
-   assembler-verified (no a64-* helper exists for them).  Emitted only under
-   *aarch64-gc-bitmap-enabled*."
+  "Set the OBJECT-START bit (bitmap base @0x10000E18) for the object at x24.
+   Emitted at every alloc site under *aarch64-gc-bitmap-enabled*."
   (when *aarch64-gc-bitmap-enabled*
-    (a64-load-imm64 buf +a64-x10+ #x10000E18)
-    (a64-ldr-unsigned buf +a64-x11+ +a64-x10+ 0)
-    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)          ; x11 = bitmap_base
-    (a64-cmp-imm buf +a64-x11+ 0)
-    (let ((skip (incf *mvm-label-counter*)))
-      (let ((idx (a64-current-index buf)))
-        (a64-bcond buf +cc-eq+ 0)                     ; bitmap_base==0 → skip
-        (a64-add-fixup buf idx skip :bcond))
-      (a64-load-imm64 buf +a64-x10+ #x10000E00)
-      (a64-ldr-unsigned buf +a64-x9+ +a64-x10+ 0)
-      (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)           ; x9 = page_base
-      (a64-sub-reg buf +a64-x9+ +a64-x24+ +a64-x9+ 0 0) ; x9 = addr - page_base
-      (a64-lsr-imm buf +a64-x10+ +a64-x9+ 7)          ; x10 = byte offset (gran>>3)
-      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x10+ 0 0) ; x11 = byte address
-      (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4)           ; x9 = granule
-      (a64-emit buf #x92400929)                       ; AND x9, x9, #7  (bit index)
-      (a64-movz buf +a64-x12+ 1 0)                    ; x12 = 1
-      (a64-emit buf #x9AC9218C)                       ; LSLV x12, x12, x9  (1<<bit)
-      (a64-emit buf #x3940016D)                       ; LDRB w13, [x11]
-      (a64-orr-reg buf +a64-x13+ +a64-x13+ +a64-x12+) ; w13 |= mask
-      (a64-emit buf #x3900016D)                       ; STRB w13, [x11]
-      (a64-set-label buf skip))))
+    (emit-aarch64-gc-set-bit buf #x10000E18)))
+
+(defun emit-aarch64-gc-mark-cons (buf)
+  "WS4-AA64 #160 bug#4: ALSO set the CONS-KIND bit (bitmap base @0x10000E40) for
+   the 16-byte cons at x24, so %gc-scan-copied classifies it as a cons (scan
+   car+cdr) rather than reading car as an object header.  Emitted only at the
+   CONS alloc site, after emit-aarch64-gc-mark-start."
+  (when *aarch64-gc-bitmap-enabled*
+    (emit-aarch64-gc-set-bit buf #x10000E40)))
 
 (defvar *aarch64-code-base-patch-offset* nil
   "Byte offset of the MOVZ that loads code_base in the boot stub's
@@ -3020,6 +3032,7 @@
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new cons base
+             (emit-aarch64-gc-mark-cons buf)    ; #160 bug#4: mark it CONS-KIND
              (a64-stp-offset buf pa pb +a64-x24+ 0)
              (a64-add-imm buf pd +a64-x24+ 1)
              (a64-add-imm buf +a64-x24+ +a64-x24+ 16)
@@ -3524,6 +3537,7 @@
            (let* ((vd (vr 0))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (emit-aarch64-gc-mark-start buf)   ; #160: x24 = new cons base
+             (emit-aarch64-gc-mark-cons buf)    ; #160 bug#4: mark it CONS-KIND
              (a64-mov-reg buf pd +a64-x24+)
              (a64-add-imm buf +a64-x24+ +a64-x24+ 16)
              (unless (a64-phys-reg vd)

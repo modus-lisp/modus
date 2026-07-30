@@ -219,6 +219,7 @@
   ;; 0x10000040 (which it reads as page_base).
   (setf (mem-ref #x10000E00 :u64) 0)
   (setf (mem-ref #x10000E18 :u64) 0)
+  (setf (mem-ref #x10000E40 :u64) 0)   ; #160 bug#4: cons-kind bitmap base
   (%gc-bitmap-init)
 
   ;; Runtime init (mirrors the ANSI gate kernel-main prefix, trimmed).

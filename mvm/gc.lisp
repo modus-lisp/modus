@@ -149,16 +149,25 @@
 
 (defun %gc-bitmap-page-base () (mem-ref #x10000E00 :u64))
 (defun %gc-bitmap-base ()      (mem-ref #x10000E18 :u64))
+;; #160 bug#4: the CONS-KIND bitmap (a second object-start-sized bitmap, 1 bit /
+;; 16-byte granule) records which starts are 16-byte CONS cells (car/cdr, no
+;; header) vs headered OBJECTS.  %gc-scan-copied uses it to walk to-space
+;; object-by-object and scan each object's slots by TYPE — instead of the old
+;; conservative every-word scan that forwarded false-positive data words
+;; (bignum limbs, float IEEE bits) and corrupted runtime structures.  Base at
+;; config 0x10000E40 (past the x64 MCGC config block, which ends at 0x10000E38).
+(defun %gc-cons-bitmap-base () (mem-ref #x10000E40 :u64))
 
 (defun %gc-bitmap-init ()
-  "Reserve the object-start bitmap.  page_base = the fixed heap base (from_start
-   BEFORE any collection = the lowest object address); bitmap = an 8 MB
-   zero-filled PROT_RW mmap (covers a 1 GB heap span at 1 bit / 16 bytes).  MUST
-   run in kernel-main BEFORE any instrumented allocation (else a native
-   alloc-site bit-set would write through a garbage bitmap_base).  Non-allocating
+  "Reserve the object-start AND cons-kind bitmaps.  page_base = the fixed heap
+   base (from_start BEFORE any collection = the lowest object address); each
+   bitmap = an 8 MB zero-filled PROT_RW mmap (covers a 1 GB heap span at 1 bit /
+   16 bytes).  MUST run in kernel-main BEFORE any instrumented allocation (else a
+   native alloc-site bit-set would write through a garbage base).  Non-allocating
    (mmap result + config addresses are fixnums)."
   (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
-  (setf (mem-ref #x10000E18 :u64) (%mmap-exec-page #x800000)))
+  (setf (mem-ref #x10000E18 :u64) (%mmap-exec-page #x800000))
+  (setf (mem-ref #x10000E40 :u64) (%mmap-exec-page #x800000)))
 
 (defun %gc-mark-start (raw-addr)
   "Set the object-start bit for the object whose raw byte address is RAW-ADDR."
@@ -182,27 +191,76 @@
                (bit (logand gran 7)))
           (if (= (logand (mem-ref byte-addr :u8) (ash 1 bit)) 0) nil t)))))
 
-(defun %gc-clear-bitmap-range (range-start size)
-  "Zero the bitmap bits for [RANGE-START, RANGE-START+SIZE) — the reclaimed
-   from-space after a swap — so stale start-bits can't falsely accept garbage
-   next cycle.  Clears u64-at-a-time over the interior then a byte tail; stays
-   WITHIN the exact byte range (the per-semispace bitmap boundary at size/128 is
-   not 8-aligned, so over-clearing would erase the sibling's live bits)."
-  (let ((bmp (%gc-bitmap-base)))
+(defun %gc-mark-cons (raw-addr)
+  "Set the CONS-KIND bit for the 16-byte cons whose raw byte address is RAW-ADDR
+   (in addition to its object-start bit).  Only conses set this bit; headered
+   objects leave it clear, so %gc-scan-copied classifies cons vs object."
+  (let ((bmp (%gc-cons-bitmap-base)))
     (if (= bmp 0)
         nil
-        (let* ((base (+ bmp (ash (- range-start (%gc-bitmap-page-base)) -7)))
+        (let* ((gran (ash (- raw-addr (%gc-bitmap-page-base)) -4))
+               (byte-addr (+ bmp (ash gran -3)))
+               (bit (logand gran 7)))
+          (setf (mem-ref byte-addr :u8)
+                (logior (mem-ref byte-addr :u8) (ash 1 bit)))))))
+
+(defun %gc-is-cons-granule (raw-addr)
+  "T if RAW-ADDR is a recorded CONS start (cons-kind bit set)."
+  (let ((bmp (%gc-cons-bitmap-base)))
+    (if (= bmp 0)
+        nil
+        (let* ((gran (ash (- raw-addr (%gc-bitmap-page-base)) -4))
+               (byte-addr (+ bmp (ash gran -3)))
+               (bit (logand gran 7)))
+          (if (= (logand (mem-ref byte-addr :u8) (ash 1 bit)) 0) nil t)))))
+
+(defun %gc-leaf-subtag-p (subtag)
+  "T if an object of SUBTAG has a RAW-DATA payload (no Lisp pointers) — the
+   to-space scan must NOT forward its slots.  Enumerated leaves: string #x10,
+   u8-vector #x11, u64-vector #x14, sap #x16, bignum #x30, and every float
+   flavor (#x60 double / #x64 single / #x65 short / #x66 long; #x60 also =
+   mvm-bytecode, likewise raw).  Everything else (simple-vector/array/ratio/
+   struct/hash/symbol/function/closure/module/…) is pointer-bearing — scan it.
+   See compiler.lisp's float-subtag note: floats live at #x60/#x64..#x66 and
+   #x61..#x63 are NON-float pointer-bearing objects, so they are NOT leaves."
+  (if (= subtag #x10) t
+   (if (= subtag #x11) t
+    (if (= subtag #x14) t
+     (if (= subtag #x16) t
+      (if (= subtag #x30) t
+       (if (= subtag #x60) t
+        (if (= subtag #x64) t
+         (if (= subtag #x65) t
+          (if (= subtag #x66) t
+           nil))))))))))
+
+(defun %gc-clear-bitmap-range (range-start size)
+  "Zero the object-start AND cons-kind bitmap bits for [RANGE-START,
+   RANGE-START+SIZE) — the reclaimed from-space after a swap — so stale bits
+   can't falsely accept/classify garbage next cycle.  Clears u64-at-a-time over
+   the interior then a byte tail; stays WITHIN the exact byte range (the
+   per-semispace bitmap boundary at size/128 is not 8-aligned, so over-clearing
+   would erase the sibling's live bits)."
+  (let ((bmp (%gc-bitmap-base))
+        (cbmp (%gc-cons-bitmap-base)))
+    (if (= bmp 0)
+        nil
+        (let* ((off (ash (- range-start (%gc-bitmap-page-base)) -7))
+               (base (+ bmp off))
+               (cbase (+ cbmp off))
                (nbytes (ash size -7))
                (nq (ash nbytes -3))
                (i 0))
           (loop
             (when (>= i nq) (return nil))
             (setf (mem-ref (+ base (* i 8)) :u64) 0)
+            (setf (mem-ref (+ cbase (* i 8)) :u64) 0)
             (setq i (+ i 1)))
           (let ((j (* nq 8)))
             (loop
               (when (>= j nbytes) (return nil))
               (setf (mem-ref (+ base j) :u8) 0)
+              (setf (mem-ref (+ cbase j) :u8) 0)
               (setq j (+ j 1))))))))
 
 ;;; ============================================================
@@ -243,6 +301,10 @@
                    ;; #160: record the survivor's start bit in to-space (valid
                    ;; from-space bits for the NEXT cycle after the swap).
                    (%gc-mark-start free-ptr)
+                   ;; #160 bug#4: it's a CONS — record the cons-kind bit too so
+                   ;; the to-space object-by-object scan classifies it (16 bytes,
+                   ;; scan car+cdr) rather than reading car as an object header.
+                   (%gc-mark-cons free-ptr)
                    ;; Return results
                    (%gc-write64 #x10000100 new-ptr)
                    (%gc-write64 #x10000108 (+ free-ptr 16))))))))
@@ -362,50 +424,67 @@
 ;;; ============================================================
 
 (defun %gc-scan-copied (scan-start free-ptr from-start from-size)
-  "Cheney scan loop: scan all objects that have been copied to to-space.
-   For each pointer field in each object, if it points into from-space,
-   copy the referenced object and update the pointer.
-   SCAN-START: start of to-space data (raw byte address).
-   FREE-PTR: current end of copied data (raw byte address).
-   Returns the final free pointer."
+  "Cheney scan loop, TYPE-AWARE (#160 bug#4).  Walk to-space OBJECT-BY-OBJECT
+   from SCAN-START to the (growing) free pointer.  At each object start use the
+   CONS-KIND bitmap to classify:
+     - CONS (cons-kind bit set): a 16-byte car/cdr pair — forward BOTH words,
+       advance 16.
+     - OBJECT (tag 9, header at start): read header → count + subtag.  If the
+       subtag is a LEAF (%gc-leaf-subtag-p: string/u8/u64/sap/bignum/float),
+       DO NOT scan its raw-data payload; else forward each of its COUNT slots
+       (which start at start+16 after the header+padding words).  Advance by the
+       object's aligned size = align16((count+2)*8).
+   This replaces the old conservative every-word scan, which forwarded
+   false-positive DATA words (bignum limbs, float IEEE bits) that happened to
+   look like from-space pointers at a real object start — corrupting runtime
+   structures (the GETHASH/SYMBOL-VALUE type-error recursion).  If the bitmaps
+   are off (bitmap_base=0), fall back to the old word-by-word conservative scan
+   (bare-metal / uninstrumented builds keep working).
+   SCAN-START / FREE-PTR: raw byte addresses.  Returns the final free pointer."
   (let ((scan scan-start)
         (fp free-ptr))
-    (loop
-      (when (>= scan fp) (return fp))
-      ;; Look at the word at scan position.
-      ;; We need to figure out what kind of object this is.
-      ;; In to-space, objects are laid out contiguously:
-      ;; - cons cells: 16 bytes (car, cdr)
-      ;; - objects: header + padding + slots
-      ;;
-      ;; The trick: we don't know a priori whether we're at a cons or object.
-      ;; But we DO know because we track what was copied. The copy function
-      ;; copies cons cells as 16-byte chunks and objects as header+slots.
-      ;;
-      ;; Simpler approach: just treat every 8-byte word as a potential
-      ;; pointer and forward it. This is conservative for the scan but
-      ;; correct because we only forward values that are actually pointers
-      ;; into from-space.
-      (let ((val (%gc-read64 scan)))
-        (if (%gc-is-pointer val)
-            (if (%gc-in-space val from-start from-size)
-                ;; #160: object-start gate (same as %gc-forward-slot) — a
-                ;; copied object's raw data word that looks like a from-space
-                ;; pointer but isn't an object start is skipped.
-                (if (%gc-is-start (logand val (lognot 15)))
-                    (progn
-                      (%gc-copy-object val from-start from-size fp)
-                      (%gc-write64 scan (%gc-read64 #x10000100))
-                      (setq fp (%gc-read64 #x10000108)))
-                    nil)
-                nil)
-            ;; Not a pointer — check if it looks like an object header
-            ;; (it has a valid subtag and count). Actually, we don't need
-            ;; to distinguish — just scan word by word. Object headers
-            ;; are not pointers (low bit patterns don't match cons/object
-            ;; tags in practice), so they'll be skipped.
-            nil))
-      (setq scan (+ scan 8)))))
+    (if (= (%gc-bitmap-base) 0)
+        ;; -- Legacy conservative word-by-word scan (bitmaps disabled) --
+        (progn
+          (loop
+            (when (>= scan fp) (return nil))
+            (let ((val (%gc-read64 scan)))
+              (when (%gc-is-pointer val)
+                (when (%gc-in-space val from-start from-size)
+                  (%gc-copy-object val from-start from-size fp)
+                  (%gc-write64 scan (%gc-read64 #x10000100))
+                  (setq fp (%gc-read64 #x10000108)))))
+            (setq scan (+ scan 8)))
+          fp)
+        ;; -- Type-aware object-by-object walk (bitmaps on) --
+        (progn
+          (loop
+            (when (>= scan fp) (return nil))
+            (if (%gc-is-cons-granule scan)
+                ;; CONS: forward car (scan) and cdr (scan+8); 16 bytes.
+                (progn
+                  (setq fp (%gc-forward-slot scan from-start from-size fp))
+                  (setq fp (%gc-forward-slot (+ scan 8) from-start from-size fp))
+                  (setq scan (+ scan 16)))
+                ;; OBJECT: header at scan.
+                (let* ((header (%gc-read64 scan))
+                       (count (ash header -8))
+                       (subtag (logand header #xFF))
+                       (total-bytes (logand (+ (* (+ count 2) 8) 15)
+                                            (lognot 15))))
+                  ;; Pointer-bearing objects: forward each of the COUNT slots
+                  ;; (slot i at scan + 16 + i*8 — header word + padding word
+                  ;; precede slot0).  Leaf objects: skip the raw payload.
+                  (unless (%gc-leaf-subtag-p subtag)
+                    (let ((i 0))
+                      (loop
+                        (when (>= i count) (return nil))
+                        (setq fp (%gc-forward-slot (+ scan (+ 16 (* i 8)))
+                                                   from-start from-size fp))
+                        (setq i (+ i 1)))))
+                  ;; Guard against a zero/garbage size stalling the walk.
+                  (setq scan (+ scan (if (< total-bytes 16) 16 total-bytes))))))
+          fp))))
 
 ;;; ============================================================
 ;;; Main Collector Entry Point

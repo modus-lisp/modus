@@ -413,6 +413,37 @@
   ;;     from-space cons/object pointer gets %gc-copy-object'd → a forwarding
   ;;     pointer stamped over mid-object data → heap poison.  Canaries before/
   ;;     after detect it; a crash (SIGSEGV) or c-after != 1 = poison confirmed.
+  ;; (C) GC-CORRECTNESS, POINTER-ONLY (argv1=33333, argv2=garbage-millions):
+  ;;     build a LIVE chain of 100000 conses (car = descending i), hold it,
+  ;;     allocate dead cons garbage to force collections, then verify the chain
+  ;;     survived intact (length 100000, cars 99999..0).  NO bignums/floats, so
+  ;;     NO leaf-object data words are conservatively scanned — isolates whether
+  ;;     the collector is correct for a pure pointer/cons workload.
+  (when (eql (%parse-decimal-at-fixed-208) 33333)
+    (write-string-serial \"GCLIST-START\") (write-char-serial 10)
+    (write-string-serial \"len/bad=\")
+    (print-dec (handler-case
+       (let ((live nil) (i 0)
+             (gmax (let ((a (%parse-decimal-at-fixed-248)))
+                     (if (> a 0) (* a 1000000) 20000000))))
+         (loop (when (>= i 100000) (return nil)) (setq live (cons i live)) (setq i (+ i 1)))
+         (setq i 0)
+         (loop (when (>= i gmax) (return nil)) (cons i i) (setq i (+ i 1)))
+         (let ((n 0) (bad 0) (p live) (expect 99999))
+           (loop (when (null p) (return nil))
+             (unless (eql (car p) expect) (setq bad (+ bad 1)))
+             (setq expect (- expect 1)) (setq n (+ n 1)) (setq p (cdr p)))
+           ;; encode: n*10 + (bad>0 ? 1 : 0) ... simpler: return bad (0=clean) but
+           ;; also want n; print n first then bad below.
+           (setf (mem-ref #x10000C88 :u64) n)
+           bad))
+     (t (c) -1)))
+    (write-char-serial 10)
+    (write-string-serial \"n=\") (print-dec (mem-ref #x10000C88 :u64)) (write-char-serial 10)
+    (write-string-serial \"gc=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
+    (write-string-serial \"GCLIST-END\") (write-char-serial 10)
+    (sys-exit 0))
+
   (when (eql (%parse-decimal-at-fixed-208) 44444)
     (write-string-serial \"GCPOISON-START\") (write-char-serial 10)
     (write-string-serial \"c-before=\")

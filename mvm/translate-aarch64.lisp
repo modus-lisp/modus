@@ -4307,8 +4307,8 @@
       (a64-set-label buf co-cons)
       (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; dest_start
       (a64-str-unsigned buf +a64-x13+ +a64-x21+ 0)       ; car (x13 = first word)
-      (a64-ldr-unsigned buf +a64-x14+ +a64-x11+ 1)       ; cdr = [src+8]
-      (a64-str-unsigned buf +a64-x14+ +a64-x21+ 1)       ; [dest+8] = cdr
+      (a64-ldr-unsigned buf +a64-x14+ +a64-x11+ 8)       ; cdr = [src+8] (imm=BYTE offset, scaled /8)
+      (a64-str-unsigned buf +a64-x14+ +a64-x21+ 8)       ; [dest+8] = cdr
       (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd
       (a64-add-imm buf +a64-x10+ +a64-x12+ 1)            ; new tagged = dest|1
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
@@ -4417,20 +4417,35 @@
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
       (a64-set-label buf cdone))
     ;; ---- clear reclaimed (old from_start = x19) object-start bitmap range ----
-    ;; dest = obj_bitmap(x28) + (x19-page_base)>>7 ; count = space_size(x25)>>7 bytes (u64 loop; power-of-2 semispace → 8-aligned)
+    ;; dest = obj_bitmap(x28) + (x19-page_base)>>7 ; count = space_size(x25)>>7 bytes.
+    ;; #160 FIX: the per-semispace byte count is NOT 8-aligned — space_size =
+    ;; midpoint-alloc_start is NOT a power of 2 — so a pure u64 store loop
+    ;; overshoots up to 7 bytes into the NEXT semispace's bitmap, clearing that
+    ;; semispace's objects' object-start bits.  The next GC then REJECTS those
+    ;; (now-live) objects as non-starts → root/chain references silently break
+    ;; (the walked=1 bug).  Clear BYTE-EXACT: u64 only while a full 8 bytes fit
+    ;; (x9 < end-7), then STRB the 0-7 byte tail.  (Mirrors x64's REP STOSB.)
     (a64-sub-reg buf +a64-x9+ +a64-x19+ +a64-x27+ 0 0)
     (a64-lsr-imm buf +a64-x9+ +a64-x9+ 7)
     (a64-add-reg buf +a64-x9+ +a64-x28+ +a64-x9+ 0 0)   ; x9 = dest
     (a64-lsr-imm buf +a64-x10+ +a64-x25+ 7)             ; x10 = byte count
-    (a64-add-reg buf +a64-x10+ +a64-x9+ +a64-x10+ 0 0)  ; x10 = dest end
+    (a64-add-reg buf +a64-x10+ +a64-x9+ +a64-x10+ 0 0)  ; x10 = dest end (exclusive)
+    (a64-sub-imm buf +a64-x11+ +a64-x10+ 7)             ; x11 = end-7 (last safe u64 start+1)
     (let ((zloop (incf *mvm-label-counter*))
+          (zbyte (incf *mvm-label-counter*))
           (zdone (incf *mvm-label-counter*)))
       (a64-set-label buf zloop)
-      (a64-cmp-reg buf +a64-x9+ +a64-x10+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i zdone :bcond))
-      (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)       ; store 8 zero bytes
+      (a64-cmp-reg buf +a64-x9+ +a64-x11+)              ; x9 >= end-7 → done with u64
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i zbyte :bcond))
+      (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)       ; store 8 zero bytes (fits)
       (a64-add-imm buf +a64-x9+ +a64-x9+ 8)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zloop :b))
+      (a64-set-label buf zbyte)
+      (a64-cmp-reg buf +a64-x9+ +a64-x10+)              ; byte tail: while x9 < end
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i zdone :bcond))
+      (a64-strb buf +a64-xzr+ +a64-x9+)                 ; store 1 zero byte
+      (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte :b))
       (a64-set-label buf zdone))
     ;; ---- swap metadata (store <<1) ----
     (a64-lsl-imm buf +a64-x9+ +a64-x22+ 1)              ; new from_start = to_start

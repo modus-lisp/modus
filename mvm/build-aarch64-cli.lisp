@@ -279,6 +279,30 @@
   (write-string-serial \"cli-jit-default=\") (print-dec (if *cli-jit-on* 1 0))
   (write-char-serial 10)
 
+  ;; ISOLATED pure-cons GC milestone (argv 33333) — runs BEFORE any JIT/mvm-eval
+  ;; probe so its collection count is UNAMBIGUOUS (Stage-1 native-GC milestone).
+  (when (eql (%parse-decimal-at-fixed-208) 33333)
+    (write-string-serial \"GCLIST-START\") (write-char-serial 10)
+    (let ((live nil) (i 0)
+          (gmax (let ((a (%parse-decimal-at-fixed-248)))
+                  (if (> a 0) (* a 1000000) 20000000))))
+      (loop (when (>= i 100000) (return nil)) (setq live (cons i live)) (setq i (+ i 1)))
+      (write-string-serial \"built gc=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
+      (write-string-serial \"head0=\") (print-dec (if (consp live) (car live) -7)) (write-char-serial 10)
+      (setq i 0)
+      (loop (when (>= i gmax) (return nil)) (cons i i) (setq i (+ i 1)))
+      (write-string-serial \"gc-after=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
+      (let ((n 0) (p live))
+        (loop
+          (when (null p) (return nil))
+          (when (not (consp p)) (return nil))
+          (setq n (+ n 1)) (setq p (cdr p)))
+        (write-string-serial \"walked=\") (print-dec n) (write-char-serial 10)
+        (write-string-serial \"headcar=\") (print-dec (if (consp live) (car live) -7))
+        (write-char-serial 10)))
+    (write-string-serial \"GCLIST-END\") (write-char-serial 10)
+    (sys-exit 0))
+
   ;; --- JIT SELF-TEST -------------------------------------------------------
   ;; (1) Primitive probe: mmap PROT_RWX, write `movz x0,#84 ; ret` (84 = tagged
   ;;     fixnum 42), icache-flush, %jit-call.  Exercises traps #x0531/#x0533/
@@ -414,36 +438,8 @@
   ;;     from-space cons/object pointer gets %gc-copy-object'd → a forwarding
   ;;     pointer stamped over mid-object data → heap poison.  Canaries before/
   ;;     after detect it; a crash (SIGSEGV) or c-after != 1 = poison confirmed.
-  ;; (C) GC-CORRECTNESS, POINTER-ONLY (argv1=33333, argv2=garbage-millions):
-  ;;     build a LIVE chain of 100000 conses (car = descending i), hold it,
-  ;;     allocate dead cons garbage to force collections, then verify the chain
-  ;;     survived intact (length 100000, cars 99999..0).  NO bignums/floats, so
-  ;;     NO leaf-object data words are conservatively scanned — isolates whether
-  ;;     the collector is correct for a pure pointer/cons workload.
-  (when (eql (%parse-decimal-at-fixed-208) 33333)
-    (write-string-serial \"GCLIST-START\") (write-char-serial 10)
-    (let ((live nil) (i 0)
-          (gmax (let ((a (%parse-decimal-at-fixed-248)))
-                  (if (> a 0) (* a 1000000) 20000000))))
-      ;; phase 1: build a 100000-cons chain, car = descending i (head car=99999)
-      (loop (when (>= i 100000) (return nil)) (setq live (cons i live)) (setq i (+ i 1)))
-      (write-string-serial \"built gc=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
-      (write-string-serial \"head0=\") (print-dec (if (consp live) (car live) -7)) (write-char-serial 10)
-      ;; phase 2: dead garbage to force collections
-      (setq i 0)
-      (loop (when (>= i gmax) (return nil)) (cons i i) (setq i (+ i 1)))
-      (write-string-serial \"gc-after=\") (print-dec (mem-ref #x10000060 :u64)) (write-char-serial 10)
-      ;; phase 3: walk with a consp guard (no deref of a non-cons), count length
-      (let ((n 0) (p live))
-        (loop
-          (when (null p) (return nil))
-          (when (not (consp p)) (return nil))   ; corrupted link → stop
-          (setq n (+ n 1)) (setq p (cdr p)))
-        (write-string-serial \"walked=\") (print-dec n) (write-char-serial 10)
-        (write-string-serial \"headcar=\") (print-dec (if (consp live) (car live) -7))
-        (write-char-serial 10)))
-    (write-string-serial \"GCLIST-END\") (write-char-serial 10)
-    (sys-exit 0))
+  ;; (pure-cons GC test moved ABOVE the JIT self-test — see the 33333 probe near
+  ;; %init-aarch64-translator — so its collection count is isolated.)
 
   (when (eql (%parse-decimal-at-fixed-208) 44444)
     (write-string-serial \"GCPOISON-START\") (write-char-serial 10)

@@ -547,6 +547,9 @@
 (defparameter +neg-limb-bits-1+  -61)
 (defparameter +fixnum-read-guard+ 230584300921369395)
 (defparameter +small-bignum-bits+ 124)
+(defparameter +half-limb-bits+     31)
+(defparameter +neg-half-limb-bits+ -31)
+(defparameter +half-limb-mask+     2147483647)
 
 (defun set-target-fixnum-bits (bits)
   "Set the target fixnum width and recompute every derived constant.
@@ -568,7 +571,20 @@
         ;; reader's safe-accumulate bound for small radices
         +fixnum-read-guard+    (floor (ash 1 (- bits 1)) 10)
         ;; 2-slot bignum capacity: lo + hi*2^bits
-        +small-bignum-bits+    (* 2 bits))
+        +small-bignum-bits+    (* 2 bits)
+        ;; HALF-LIMB width.  The bignum multiply splits every limb into two
+        ;; halves so that half x half still fits a fixnum; the half is
+        ;; therefore bits/2 wide, and its mask 2^(bits/2)-1 is also the
+        ;; largest operand bignum-mul's native fast path may accept (the
+        ;; square of anything bigger is not a fixnum).  62 bits -> 31 and
+        ;; 2147483647, exactly the literals these were hardcoded to; 30 bits
+        ;; -> 15 and 32767.  Hardcoding them was silently wrong on any tower
+        ;; narrower than 62: two 31-bit halves have a 62-bit product, which on
+        ;; a 30-bit tower is a BIGNUM, so the schoolbook loop recursed back
+        ;; into the multiply it was implementing.
+        +half-limb-bits+       (floor bits 2)
+        +neg-half-limb-bits+   (- (floor bits 2))
+        +half-limb-mask+       (- (ash 1 (floor bits 2)) 1))
   bits)
 
 (defun set-target-fixnum-bits-for (target)
@@ -595,8 +611,12 @@
      (defconstant +limb-bits+ ~D)~%(defconstant +limb-bits-1+ ~D)~%~
      (defconstant +limb-split-bits+ ~D)~%(defconstant +neg-limb-bits+ ~D)~%~
      (defconstant +neg-limb-bits-1+ ~D)~%(defconstant +fixnum-read-guard+ ~D)~%~
-     (defconstant +small-bignum-bits+ ~D)~%"
+     (defconstant +small-bignum-bits+ ~D)~%~
+     (defconstant +half-limb-bits+ ~D)~%~
+     (defconstant +neg-half-limb-bits+ ~D)~%~
+     (defconstant +half-limb-mask+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+ +limb-bits+ +limb-bits-1+
     +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
-    +small-bignum-bits+))
+    +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
+    +half-limb-mask+))

@@ -2521,8 +2521,8 @@
   (let ((result nil) (cur lst))
     (loop (when (null cur) (return (nreverse result)))
       (let ((v (car cur)))
-        (setq result (cons (logand v 2147483647) result))   ; lo
-        (setq result (cons (ash v -31) result))             ; hi
+        (setq result (cons (logand v +half-limb-mask+) result))   ; lo
+        (setq result (cons (ash v +neg-half-limb-bits+) result))  ; hi
         (setq cur (cdr cur))))))
 
 (defun %halves-to-limbs (lst)
@@ -2532,7 +2532,7 @@
     (loop (when (null cur) (return (nreverse result)))
       (let* ((lo (car cur))
              (hi (if (cdr cur) (cadr cur) 0))
-             (limb (%fixnum-+ lo (ash hi 31))))
+             (limb (%fixnum-+ lo (ash hi +half-limb-bits+))))
         (setq result (cons limb result))
         (setq cur (if (cdr cur) (cddr cur) nil))))))
 
@@ -2562,8 +2562,8 @@
                     (loop (when (= carry 0) (return nil))
                       (let* ((cur (aref out pos))
                              (sum (%fixnum-+ cur carry))
-                             (lo (logand sum 2147483647))
-                             (newcarry (ash sum -31)))
+                             (lo (logand sum +half-limb-mask+))
+                             (newcarry (ash sum +neg-half-limb-bits+)))
                         (aset out pos lo)
                         (setq carry newcarry)
                         (setq pos (+ pos 1)))))
@@ -2573,8 +2573,8 @@
                    (pos (+ i j))
                    (cur (aref out pos))
                    (sum (%fixnum-+ (%fixnum-+ cur prod) carry))
-                   (lo (logand sum 2147483647))
-                   (newcarry (ash sum -31)))
+                   (lo (logand sum +half-limb-mask+))
+                   (newcarry (ash sum +neg-half-limb-bits+)))
               (aset out pos lo)
               (setq carry newcarry))
             (setq j (+ j 1))))
@@ -3135,11 +3135,20 @@
    Fast path uses %fixnum-* directly (not *) so we don't recurse —
    compile-mul routes every * through generic-multiply which calls
    bignum-mul on integers."
-  ;; Fast path: both fixnum and 31-bit-safe.
+  ;; Fast path: both fixnum and small enough that the PRODUCT is still a
+  ;; fixnum.  The bound is +mul-fast-max+ = 2^(fixnum-bits/2)-1, which follows
+  ;; the target width: 2147483647 on a 62-bit tower (exactly the literal that
+  ;; used to be hardcoded here) and 32767 on a 30-bit one.  Hardcoding 2^31-1
+  ;; was silently WRONG on any tower narrower than 62 bits — two 31-bit
+  ;; operands have a 62-bit product, which is not a 30-bit fixnum, so
+  ;; (* 17034 65536) took this path and %fixnum-* WRAPPED instead of promoting.
+  ;; The compiled :mul-checked slow path calls generic-multiply -> here
+  ;; precisely in order to promote, so the wrap silently defeated the
+  ;; overflow detection that had already worked correctly.
   (when (and (not (bignump a)) (not (bignump b)))
     (let* ((aa (if (< a 0) (- 0 a) a))
            (bb (if (< b 0) (- 0 b) b))
-           (max 2147483647))   ; 2^31 - 1
+           (max +half-limb-mask+))
       (when (and (<= aa max) (<= bb max))
         (return-from bignum-mul (%fixnum-* a b)))))
   ;; General path: convert both to sign+limbs, multiply magnitudes,

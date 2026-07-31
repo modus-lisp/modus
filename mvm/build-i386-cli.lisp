@@ -976,6 +976,36 @@
         (format out "  (%init-sym-name-auto-~D)~%" c))
       (format out ")~%"))))
 
+;;; ============================================================
+;;; The build-time / runtime hash-agreement probe
+;;; ============================================================
+;;; THE invariant behind the name-hash: the SAME name hashed by the BUILD and
+;;; by the IMAGE must be the SAME NUMBER.  Build-time hashes are baked in as
+;;; literals (which :li truncates to the target word); runtime hashes are
+;;; recomputed with target arithmetic (where anything wider than a fixnum
+;;; becomes a bignum).  Nothing checked that they agreed, and on i386 they do
+;;; NOT — COMPUTE-NAME-HASH is 60 bits wide and an i386 fixnum holds 30.
+;;;
+;;; This bakes the build's own answer in so the image can compare it against
+;;; its own.  It is the check that would have caught the whole class, and it
+;;; stays RED (as an %xgap, so probe 7 is still a usable gate) until the hash
+;;; width is derived from the target.  Promote both to %chk when it is.
+;;;
+;;; The width is set here because BUILD-IMAGE only calls
+;;; SET-TARGET-FIXNUM-BITS-FOR later; it sets the same value again, so this is
+;;; idempotent, not a second source of truth.
+(modus.mvm::set-target-fixnum-bits 30)
+
+(defvar *hash-probe-source*
+  (if (>= *i386-layer* 5)
+      (format nil "(defun %build-hash-abc () ~D)~%(defun %build-hash-quote () ~D)~%"
+              (modus.mvm::compute-name-hash "ABC")
+              (modus.mvm::compute-name-hash "QUOTE"))
+      ""))
+(format t "  build-time hash of ABC: ~D (fits a target fixnum: ~A)~%"
+        (modus.mvm::compute-name-hash "ABC")
+        (if (<= (modus.mvm::compute-name-hash "ABC") modus.mvm::+fixnum-max+) "YES" "NO"))
+
 (defvar *sym-name-auto-source*
   (if (>= *i386-layer* 5)
       (emit-sym-name-auto (scan-symbol-names *scanned-source*) 200)
@@ -1083,6 +1113,12 @@
   ;; They are different numbers, so no hash-keyed table can match them.
   (%tag2 49 51) (%xgap (if (eql (%prim-aref (quote abc) 0)
                                 (normalize-name (quote abc))) 1 0) 1)
+  ;; t14-t15 BUILD-TIME vs RUNTIME.  %build-hash-abc returns the hash the
+  ;; BUILD computed, baked in as a literal and therefore subject to the same
+  ;; :li truncation every other baked hash gets.  normalize-name recomputes it
+  ;; in-image with target arithmetic.  These two agreeing is the invariant.
+  (%tag2 49 52) (%xgap (if (eql (%build-hash-abc) (normalize-name (quote abc))) 1 0) 1)
+  (%tag2 49 53) (%xgap (if (eql (%build-hash-quote) (normalize-name (quote quote))) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
   (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
   (putnl)
@@ -1127,6 +1163,7 @@
     *mvm-eval-source* (string #\Newline)
     *sft-auto-source* (string #\Newline)
     *sym-name-auto-source* (string #\Newline)
+    *hash-probe-source* (string #\Newline)
     *l5-init-source* (string #\Newline)
     *bridge-source* (string #\Newline)
     *crypto-source* (string #\Newline)

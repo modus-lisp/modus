@@ -63,6 +63,76 @@
             "OFF (MODUS_NO_JIT)" "ON (flipped #199)"))
 
 ;;; ============================================================
+;;; Linux/AArch64 file-I/O syscall overrides
+;;; ============================================================
+;;;
+;;; WS5 #203: cl-fileio.lisp hardcodes x86-64 syscall numbers (open=2, stat=4,
+;;; unlink=87, mkdir=83, rename=82).  The AArch64 generic ABI DROPPED all of
+;;; them in favour of the `*at' variants with a dirfd argument, so on aarch64
+;;; every one of those calls hits a bogus/unimplemented number: %sys-stat-exists
+;;; returned NIL for a file that exists and LOAD failed with FILE-ERROR for any
+;;; path.  That made --load / --script / ~/.modusrc dead on this image.
+;;;
+;;; The ANSI gate wrapper (mvm/build-aarch64-linux.lisp, section "4c") already
+;;; carries exactly these overrides — but they live in the WRAPPER, not in the
+;;; shared build-ansi-common-aarch64.lisp, so this corpus-free CLI never got
+;;; them.  Copied verbatim rather than hoisted into the common file so the gate
+;;; image is untouched (hoisting would double-define them there).  Keep the two
+;;; copies in sync; the source of truth is build-aarch64-linux.lisp section 4c.
+;;;
+;;; Baked AFTER *bridge-source* so last-defun-wins picks the aarch64 forms.
+(defvar *aarch64-fileio-override-source* "
+(defun %sys-open-rdonly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 0 0))
+(defun %sys-open-wronly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 577 420))
+(defun %sys-open-append (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 1089 420))
+(defun %sys-open-rdwr (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 66 420))
+(defun %sys-open-create-excl (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-openat *cstr-scratch* 193 420))
+(defun %sys-unlink (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-unlinkat *cstr-scratch* 0 0))
+(defun %sys-rename (old-str new-str)
+  (%string-to-cstr old-str *cstr-scratch*)
+  (let ((new-addr (+ *cstr-scratch* 2048)))
+    (%string-to-cstr new-str new-addr)
+    (%aarch64-renameat *cstr-scratch* new-addr 0)))
+(defun %sys-mkdir (path-str mode)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (%aarch64-mkdirat *cstr-scratch* mode 0))
+(defun %sys-stat-size (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
+      (if (< ret 0)
+          -1
+          ;; struct stat on AArch64 differs from x86-64 layout —
+          ;; st_size is at offset 48 in both, so the same load works.
+          (mem-ref (+ buf-addr 48) :u32)))))
+(defun %sys-stat-exists (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
+      (if (< ret 0) nil t))))
+(defun %sys-stat-mtime (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (%aarch64-newfstatat path-addr buf-addr 0)))
+      (if (< ret 0)
+          0
+          (mem-ref (+ buf-addr 88) :u32)))))
+
+")
+
+;;; ============================================================
 ;;; The SHARED SBCL-faithful CLI toplevel (lib/cli-toplevel.lisp)
 ;;; ============================================================
 ;;;
@@ -131,9 +201,22 @@
 (defun halt ()
   (syscall3 93 1 0 0))
 
+;; WS5 #203 exit-code bisect: probes 11111/11112/11113 measured
+;;   inline (syscall3 93 3 0 0)            -> rc 3   (trap untag OK)
+;;   inline (let ((c 3)) (syscall3 93 c 0 0)) -> rc 3   (variable operand OK)
+;;   (sys-exit 3) through the wrapper below   -> rc 6   (2n — still tagged)
+;; so the loss is specific to routing a DEFUN PARAMETER into the trap.  MEASURED
+;; follow-up: dropping the pointless `(let ((c code)) ...)` rebind (done below)
+;; does NOT fix it — 11113 still exits 6.  So the defect is in how aarch64
+;; codegen lands a parameter in compile-syscall3's push/pop operand shuffle, not
+;; in the rebind; parameters work everywhere else in the image, and x64 compiles
+;; the identical source correctly (`modus --eval (sys-exit 7)` exits 7 there).
+;; NOT fixed here: the fix belongs in the shared compiler/translate-aarch64 and
+;; needs its own ANSI-gated session.  Probes 11111-11113 stay as the reproducer.
+;; CONSEQUENCE: every nonzero exit this image produces is DOUBLED (sys-exit 1 →
+;; rc 2).  Exit 0 is unaffected, so success paths are correct.
 (defun sys-exit (code)
-  (let ((c code))
-    (syscall3 93 c 0 0)))
+  (syscall3 93 code 0 0))
 
 ;; WS5 #203: TRUE when argv[1] parses as a nonzero decimal, i.e. this run
 ;; selects one of the baked regression probes rather than the hosted CLI.
@@ -714,6 +797,23 @@
     (write-string-serial \"ARGVPROBE-END\") (write-char-serial 10)
     (sys-exit 0))
 
+  ;; (11) EXIT-CODE bisect (argv1 = 11111/11112/11113).  The SBCL differential
+  ;;      found `modus --eval (sys-exit 7)` exiting 14 on aarch64 while x64
+  ;;      exits 7 — exactly 2n, i.e. the value reaching the SVC is still tagged.
+  ;;      compile-syscall3 (arch-neutral) passes all four operands TAGGED and
+  ;;      trap #x0502 untags them, so one of the three shapes below must break.
+  ;;      Each variant exits with 3; the observed rc identifies the culprit:
+  ;;        11111 inline literal        rc 3 = trap OK
+  ;;        11112 inline let-variable   rc 3 = variable operand OK
+  ;;        11113 through the sys-exit wrapper (a defun parameter)
+  ;;      Run all three and compare; do NOT reason about it from the source.
+  (when (eql (%parse-decimal-at-fixed-208) 11111)
+    (syscall3 93 3 0 0))
+  (when (eql (%parse-decimal-at-fixed-208) 11112)
+    (let ((c 3)) (syscall3 93 c 0 0)))
+  (when (eql (%parse-decimal-at-fixed-208) 11113)
+    (sys-exit 3))
+
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   ;; Anything that is NOT a numeric probe selector (i.e. argv[1] does not start
   ;; with a digit — every SBCL-style flag starts with '-', and no argument at
@@ -772,6 +872,7 @@
     ;; write-object) and BEFORE the driver only in the sense that the driver's
     ;; kernel-main calls (cli-toplevel) — MVM resolves calls by name across the
     ;; whole unit, so a forward reference to sys-exit is fine.
+    *aarch64-fileio-override-source* (string #\Newline)
     *cli-toplevel-source*      (string #\Newline)
     *cli-aarch64-arm-source*   (string #\Newline)
     *driver-source*            (string #\Newline)

@@ -542,7 +542,8 @@
     ("ATOMIC-XCHG" . "XCHG is issued against EAX here")
     ("CALL-IND"    . "EAX is caller-saved; VR cannot be live across a call")
     ("TAILCALL"    . "EAX is caller-saved; VR cannot be live across a call")
-    ("CALL"        . "EAX is caller-saved; VR cannot be live across a call"))
+    ("CALL"        . "EAX is caller-saved; VR cannot be live across a call")
+    ("TRAP"        . "syscall ABI/IN/OUT force EAX, so the :trap arm brackets the whole dispatch with push/pop EAX; no trap returns a value in EAX"))
   "Opcodes permitted to write EAX with a non-VR destination, each with the
    reason it is legitimate.  The justification lives NEXT TO the exemption on
    purpose: an allowlist without reasons becomes a place to hide bugs.")
@@ -1132,6 +1133,16 @@
 
         ((op= +op-trap+)
          (let ((code (first operands)))
+           ;; VR-PRESERVING: several trap arms MUST use EAX — the i386 syscall
+           ;; ABI puts the call number and the result there, and IN/OUT use
+           ;; AL/AX/EAX — so EAX cannot simply be avoided the way it was for
+           ;; the ALU/object/memory opcodes.  Instead the whole dispatch is
+           ;; bracketed with push/pop, which satisfies the invariant in
+           ;; substance: no trap returns a value in EAX (they all deliver into
+           ;; V0/ESI), so restoring it afterwards is always correct.  For the
+           ;; non-returning arms (SYS_exit, the unimplemented-trap reporter)
+           ;; the unbalanced push is harmless — the process is leaving.
+           (i386-emit-push-reg buf +i386-eax+)
            (cond
              ((< code #x0100)
               ;; Frame-enter: code = nparams.
@@ -1636,7 +1647,8 @@
                                (setf *i386-unimpl-ops* (make-hash-table :test 'eql)))))
                   (incf (gethash (+ #x10000 code) tbl 0))))
               (unless (member code *i386-safe-nop-traps*)
-                (i386-emit-unimpl-trap buf code))))))
+                (i386-emit-unimpl-trap buf code))))
+           (i386-emit-pop-reg buf +i386-eax+)))
 
         ;; ============================================
         ;; Data Movement
@@ -1801,9 +1813,9 @@
          ;; NEG preserves the fixnum tag: -(n<<1) = (-n)<<1
          (let ((vd (first operands))
                (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-neg-reg buf +i386-eax+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-neg-reg buf +scratch0+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-inc+)
          ;; (inc Vd) -- add tagged fixnum 1 (raw value 2)
@@ -2030,37 +2042,37 @@
          ;; Cons tag = 0x01, so untag: ptr - 1, car at [ptr-1+0] = [ptr-1]
          ;; With type check: verify low 4 bits == 0x01
          (let ((vd (first operands)) (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           ;; Type check
-           (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
-           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
+           (i386-load-vreg buf +scratch0+ vs)
+           ;; Type check — VR-PRESERVING: value in ECX, tag scratch in EDX
+           (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+           (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+           (i386-emit-cmp-reg-imm buf +scratch1+ +tag-cons+)
            (let ((ok-label (i386-make-label)))
              (i386-emit-jcc buf :e ok-label)
              (i386-emit-int3 buf)   ; trap on non-cons
              (i386-emit-label buf ok-label))
            ;; Strip tag, load car (word 0)
-           (i386-emit-sub-reg-imm buf +i386-eax+ +tag-cons+)
-           (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ 0)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-emit-sub-reg-imm buf +scratch0+ +tag-cons+)
+           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-cdr+)
          ;; (cdr Vd Vs) -- load cdr from cons cell
          ;; cdr at [ptr - tag + 4] = [ptr - 1 + 4] = [ptr + 3]
          (let ((vd (first operands)) (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           ;; Type check
-           (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
-           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
+           (i386-load-vreg buf +scratch0+ vs)
+           ;; Type check — VR-PRESERVING: value in ECX, tag scratch in EDX
+           (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+           (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+           (i386-emit-cmp-reg-imm buf +scratch1+ +tag-cons+)
            (let ((ok-label (i386-make-label)))
              (i386-emit-jcc buf :e ok-label)
              (i386-emit-int3 buf)
              (i386-emit-label buf ok-label))
            ;; Strip tag, load cdr (word 1 = offset 4 on 32-bit)
-           (i386-emit-sub-reg-imm buf +i386-eax+ +tag-cons+)
-           (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ 4)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-emit-sub-reg-imm buf +scratch0+ +tag-cons+)
+           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 4)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-cons+)
          ;; (cons Vd Va Vb) -- allocate cons cell via bump allocator
@@ -2071,22 +2083,21 @@
          ;; clobbers VR, so if vb-arg=VR we'd get car's value for cdr.
          (let ((vd (first operands)) (va-arg (second operands)) (vb-arg (third operands)))
            ;; Load cdr value first (before EAX is touched)
-           (i386-load-vreg buf +scratch0+ vb-arg)
-           ;; Load alloc pointer into EDX
-           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
-           ;; Store car
-           (i386-load-vreg buf +i386-eax+ va-arg)
-           (i386-emit-mov-mem-reg buf +i386-edx+ 0 +i386-eax+)
-           ;; Store cdr (already in scratch0)
-           (i386-emit-mov-mem-reg buf +i386-edx+ 4 +scratch0+)
-           ;; Tag pointer as cons
-           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
-           (i386-emit-or-reg-imm buf +i386-eax+ +tag-cons+)
-           ;; Bump alloc by 16 (cons = 8 bytes but need 16-byte alignment for tag)
-           (i386-emit-add-reg-imm buf +i386-edx+ 16)
-           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
-           ;; Store result
-           (i386-store-vreg buf vd +i386-eax+)))
+           ;; VR-PRESERVING: car, cdr and the alloc pointer are three live
+           ;; values but only ECX/EDX are available, so cdr goes via one
+           ;; stack slot rather than through EAX (which is VR).
+           (i386-load-vreg buf +scratch0+ vb-arg)          ; cdr
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*); EDX = base
+           (i386-load-vreg buf +scratch0+ va-arg)          ; car
+           (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
+           (i386-emit-pop-reg buf +scratch0+)              ; cdr back
+           (i386-emit-mov-mem-reg buf +scratch1+ 4 +scratch0+)
+           (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+           (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
+           (i386-emit-add-reg-imm buf +scratch1+ 16)
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-setcar+)
          ;; (setcar Vd Vs) -- [Vd - tag] = Vs
@@ -2094,36 +2105,34 @@
          ;; so if vs=VR we'd get the cons pointer instead of the value.
          (let ((vd-reg (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-load-vreg buf +i386-eax+ vd-reg)
-           (i386-emit-sub-reg-imm buf +i386-eax+ +tag-cons+)
-           (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+)))
+           (i386-load-vreg buf +scratch1+ vd-reg)
+           (i386-emit-sub-reg-imm buf +scratch1+ +tag-cons+)
+           (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)))
 
         ((op= +op-setcdr+)
          ;; (setcdr Vd Vs) -- [Vd - tag + 4] = Vs
          ;; IMPORTANT: Load value FIRST — same VR clobber issue as setcar.
          (let ((vd-reg (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-load-vreg buf +i386-eax+ vd-reg)
-           (i386-emit-sub-reg-imm buf +i386-eax+ +tag-cons+)
-           (i386-emit-mov-mem-reg buf +i386-eax+ 4 +scratch0+)))
+           (i386-load-vreg buf +scratch1+ vd-reg)
+           (i386-emit-sub-reg-imm buf +scratch1+ +tag-cons+)
+           (i386-emit-mov-mem-reg buf +scratch1+ 4 +scratch0+)))
 
         ((op= +op-consp+)
          ;; (consp Vd Vs) -- test low 4 bits for cons tag
          (let ((vd (first operands)) (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-and-reg-imm buf +i386-eax+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +i386-eax+ +tag-cons+)
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
+           (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
            (let ((true-label (i386-make-label))
                  (done-label (i386-make-label)))
              (i386-emit-jcc buf :e true-label)
-             ;; False: load NIL
-             (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
+             (i386-emit-mov-reg-abs buf +scratch0+ *vn-addr*)
              (i386-emit-jmp-rel32 buf done-label)
-             ;; True: load T
              (i386-emit-label buf true-label)
-             (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
+             (i386-emit-mov-reg-imm buf +scratch0+ +i386-mvm-t+)
              (i386-emit-label buf done-label))
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-atom+)
          ;; (atom Vd Vs) -- opposite of consp
@@ -2151,18 +2160,17 @@
          ;; Header word at [VA]: (count << 8) | subtag  (matches x64 format)
          ;; Result = VA | object_tag, advance VA by aligned size
          (let ((vd (first operands)) (count (second operands)) (subtag (third operands)))
-           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
-           ;; Write header: (count << 8) | subtag
-           (i386-emit-mov-mem-imm buf +i386-edx+ 0
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)
+           (i386-emit-mov-mem-imm buf +scratch1+ 0
                                   (logior (ash count 8) subtag))
-           ;; Tag pointer
-           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
-           (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
-           ;; Bump alloc: header (4) + count*4, aligned to 16
+           ;; VR-PRESERVING: bump in ECX, then tag the BASE in EDX in place,
+           ;; so no third register (EAX = VR) is needed.
+           (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (let ((total (logand (+ (* (1+ count) 4) 15) (lognot 15))))
-             (i386-emit-add-reg-imm buf +i386-edx+ total))
-           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
-           (i386-store-vreg buf vd +i386-eax+)))
+             (i386-emit-add-reg-imm buf +scratch0+ total))
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
 
         ((op= +op-alloc-array+)
          ;; (alloc-array Vd Vcount) — dynamic array allocation
@@ -2172,32 +2180,23 @@
          ;; Result = VA | 0x09 (object tag)
          (let ((vd (first operands)) (vcount (second operands)))
            ;; Load count into ECX
-           (i386-load-vreg buf +i386-ecx+ vcount)
-           ;; Save count on stack
-           (i386-emit-push-reg buf +i386-ecx+)
-           ;; Build header: (count << 8) | array-subtag
-           (i386-emit-shl-reg-imm buf +i386-ecx+ 8)
-           (i386-emit-or-reg-imm buf +i386-ecx+ #x32)
-           ;; Load VA (alloc pointer) into EDX
-           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
-           ;; Write header at [EDX]
-           (i386-emit-mov-mem-reg buf +i386-edx+ 0 +i386-ecx+)
-           ;; Result = EDX | object_tag -> EAX
-           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
-           (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
-           ;; Restore count into ECX
-           (i386-emit-pop-reg buf +i386-ecx+)
-           ;; Compute alloc size: (count + 1) * 4, aligned to 16
-           ;; ECX = count; add 1 for header, mul by 4, align
-           (i386-emit-add-reg-imm buf +i386-ecx+ 1)
-           (i386-emit-shl-reg-imm buf +i386-ecx+ 2)  ; * 4
-           (i386-emit-add-reg-imm buf +i386-ecx+ 15)  ; for alignment
-           (i386-emit-and-reg-imm buf +i386-ecx+ -16)  ; align to 16
-           ;; Advance alloc pointer: EDX += ECX
-           (i386-emit-add-reg-reg buf +i386-edx+ +i386-ecx+)
-           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
-           ;; Store result
-           (i386-store-vreg buf vd +i386-eax+)))
+           ;; VR-PRESERVING: keep the BASE in EDX throughout and tag it in
+           ;; place at the end, so no third register (EAX = VR) is needed.
+           (i386-load-vreg buf +scratch0+ vcount)
+           (i386-emit-push-reg buf +scratch0+)              ; save count
+           (i386-emit-shl-reg-imm buf +scratch0+ 8)
+           (i386-emit-or-reg-imm buf +scratch0+ #x32)
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*) ; EDX = base
+           (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
+           (i386-emit-pop-reg buf +scratch0+)               ; count
+           (i386-emit-add-reg-imm buf +scratch0+ 1)
+           (i386-emit-shl-reg-imm buf +scratch0+ 2)
+           (i386-emit-add-reg-imm buf +scratch0+ 15)
+           (i386-emit-and-reg-imm buf +scratch0+ -16)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
 
         ((op= +op-obj-ref+)
          ;; (obj-ref Vd Vobj idx:imm8) -- load object slot
@@ -2401,14 +2400,11 @@
         ((op= +op-alloc-cons+)
          ;; (alloc-cons Vd) -- bump-allocate cons cell, tag as cons
          (let ((vd (first operands)))
-           (i386-emit-mov-reg-abs buf +i386-eax+ *va-addr*)
-           ;; Tag as cons
-           (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)
+           (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
-           ;; Bump alloc by 16 (16-byte alignment for 4-bit tag)
-           (i386-emit-add-reg-imm buf +i386-eax+ 16)
-           (i386-emit-mov-abs-reg buf *va-addr* +i386-eax+)
-           ;; Store tagged result
+           (i386-emit-add-reg-imm buf +scratch1+ 16)
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch1+)
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-gc-check+)
@@ -2430,8 +2426,8 @@
         ((op= +op-write-barrier+)
          ;; (write-barrier Vobj) -- mark card table dirty (stub)
          (let ((vobj (first operands)))
-           (i386-load-vreg buf +i386-eax+ vobj)
-           (i386-emit-shr-reg-imm buf +i386-eax+ 12)
+           (i386-load-vreg buf +scratch0+ vobj)
+           (i386-emit-shr-reg-imm buf +scratch0+ 12)
            ;; Card table write would go here; NOP for now
            (i386-emit-nop buf)))
 
@@ -2598,7 +2594,9 @@
                 (fn-table (i386-translate-state-function-table state))
                 (label (when fn-table (gethash target-offset fn-table)))
                 (pd (i386-vreg-phys vd))
-                (dst (or pd +i386-eax+)))
+                ;; VR-PRESERVING: a spilled destination stages through ECX,
+                ;; never EAX (which is VR).
+                (dst (or pd +scratch0+)))
            (cond
              (label
               (i386-emit-byte buf #xE8)          ; call rel32
@@ -2665,18 +2663,18 @@
            (i386-emit-push-reg buf +scratch0+)
            (i386-emit-shl-reg-imm buf +scratch0+ 8)
            (i386-emit-or-reg-imm buf +scratch0+ #x31)       ; STRING subtag
-           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
-           (i386-emit-mov-mem-reg buf +i386-edx+ 0 +scratch0+)
-           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
-           (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)  ; EDX = base
+           (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
            (i386-emit-pop-reg buf +scratch0+)               ; count
            (i386-emit-add-reg-imm buf +scratch0+ 1)         ; + header word
            (i386-emit-shl-reg-imm buf +scratch0+ 2)         ; * 4
            (i386-emit-add-reg-imm buf +scratch0+ 15)
            (i386-emit-and-reg-imm buf +scratch0+ -16)
-           (i386-emit-add-reg-reg buf +i386-edx+ +scratch0+)
-           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           ;; VR-PRESERVING: tag the base in EDX in place (never EAX).
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
 
         ;; ---- ALLOC-U8 Vd, Vcount ----  byte-packed (unsigned-byte 8) vector
         ;; Feature #183.  Vcount is a TAGGED fixnum (byte count N).  Object:
@@ -2691,17 +2689,17 @@
            (i386-emit-push-reg buf +scratch0+)
            (i386-emit-shl-reg-imm buf +scratch0+ 8)
            (i386-emit-or-reg-imm buf +scratch0+ #x11)       ; u8-vector subtag
-           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
-           (i386-emit-mov-mem-reg buf +i386-edx+ 0 +scratch0+)
-           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
-           (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)  ; EDX = base
+           (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
            (i386-emit-pop-reg buf +scratch0+)               ; N
            (i386-emit-add-reg-imm buf +scratch0+ 4)         ; header bytes
            (i386-emit-add-reg-imm buf +scratch0+ 15)
            (i386-emit-and-reg-imm buf +scratch0+ -16)
-           (i386-emit-add-reg-reg buf +i386-edx+ +scratch0+)
-           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           ;; VR-PRESERVING: tag the base in EDX in place (never EAX).
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
 
         ;; ---- U8-REF Vd, Varr, Vidx ----
         ;; Byte address = (Varr - 9) + 4 + real_idx = Varr + real_idx - 5.
@@ -2711,13 +2709,13 @@
          (let ((vd (first operands))
                (varr (second operands))
                (vidx (third operands)))
-           (i386-load-vreg buf +scratch0+ vidx)             ; load idx BEFORE
-           (i386-load-vreg buf +i386-eax+ varr)             ; EAX clobbers VR
+           (i386-load-vreg buf +scratch0+ vidx)
+           (i386-load-vreg buf +scratch1+ varr)
            (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; real_idx
-           (i386-emit-add-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-emit-movzx-byte buf +i386-eax+ +i386-eax+ -5)
-           (i386-emit-shl-reg-imm buf +i386-eax+ 1)         ; tag as fixnum
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+           (i386-emit-movzx-byte buf +scratch0+ +scratch0+ -5)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)         ; tag as fixnum
+           (i386-store-vreg buf vd +scratch0+)))
 
         ;; ---- U8-SET Varr, Vidx, Vval ----
         ;; Byte address = Varr + real_idx - 5.  Vidx and Vval are TAGGED.
@@ -2729,13 +2727,17 @@
          (let ((varr (first operands))
                (vidx (second operands))
                (vval (third operands)))
-           (i386-load-vreg buf +scratch0+ vval)             ; ECX = value
-           (i386-load-vreg buf +scratch1+ vidx)             ; EDX = idx
-           (i386-load-vreg buf +i386-eax+ varr)             ; EAX = arr (clobbers VR)
+           ;; VR-PRESERVING: value via one stack slot; stored from DL (EDX is
+           ;; low-byte addressable, unlike ESI/EDI in 32-bit mode).
+           (i386-load-vreg buf +scratch0+ vval)
            (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; untag value
-           (i386-emit-sar-reg-imm buf +scratch1+ 1)         ; untag idx
-           (i386-emit-add-reg-reg buf +i386-eax+ +scratch1+)
-           (i386-emit-mov-mem8-reg buf +i386-eax+ -5 +scratch0+)))
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-load-vreg buf +scratch0+ vidx)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; real_idx
+           (i386-load-vreg buf +scratch1+ varr)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = addr+5
+           (i386-emit-pop-reg buf +scratch1+)               ; EDX = value
+           (i386-emit-mov-mem8-reg buf +scratch0+ -5 +scratch1+)))
 
         ;; ---- ADDS / SUBS / BVS ----  (explicit overflow-flag arithmetic)
         ;; Same code as :add/:sub — the i386 MOV that stores the result does

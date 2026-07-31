@@ -151,15 +151,47 @@
   (write-char-serial 103) (write-char-serial 61)  ; g=
   (%pdec (funcall (function sq) 9)) (putnl))
 
+;; ---- 30-bit-fixnum / bignum-promotion battery ----------------------
+;; SHA-256 is u32 arithmetic.  A u32 does not fit an i386 fixnum (~30 bits),
+;; so every one of these is a value that MUST transparently promote.  Each
+;; probe prints a small expected number so %pdec (built only from +,-,<,>)
+;; can report it.
+(defun probe-bignum ()
+  (write-char-serial 107) (write-char-serial 49) (write-char-serial 61) ; k1=
+  (%pdec (logand #x428a2f98 255)) (putnl)          ; expect 152
+  (write-char-serial 107) (write-char-serial 50) (write-char-serial 61) ; k2=
+  (%pdec (ash #x428a2f98 -24)) (putnl)             ; expect 66
+  (write-char-serial 107) (write-char-serial 51) (write-char-serial 61) ; k3=
+  (%pdec (logand (+ #x40000000 1) 255)) (putnl)    ; expect 1
+  (write-char-serial 107) (write-char-serial 52) (write-char-serial 61) ; k4=
+  (%pdec (logand #xFFFFFFFF 255)) (putnl)          ; expect 255
+  (write-char-serial 107) (write-char-serial 53) (write-char-serial 61) ; k5=
+  (%pdec (logand (logxor #xFFFFFFFF #x428a2f98) 255)) (putnl)  ; expect 103
+  (write-char-serial 107) (write-char-serial 54) (write-char-serial 61) ; k6=
+  (%pdec (logand (ash 1 29) 255)) (putnl))         ; expect 0
+
+(defun probe-memu32 ()
+  ;; mem-ref :u32 must survive a u32 that cannot be a fixnum.  Uses the
+  ;; scratch BSS above the i386 global slot block.
+  (setf (mem-ref #x10000b00 :u32) #x428a2f98)
+  (write-char-serial 109) (write-char-serial 61)   ; m=
+  (%pdec (logand (mem-ref #x10000b00 :u32) 255)) (putnl)   ; expect 152
+  (write-char-serial 110) (write-char-serial 61)   ; n=
+  (%pdec (ash (mem-ref #x10000b00 :u32) -24)) (putnl))     ; expect 66
+
 (defun probe-fixnum-width ()
   ;; How wide IS a fixnum here?  Count doublings until the value stops
   ;; growing monotonically (wrap) — on a 32-bit word with a 1-bit tag this
   ;; should report 30.
   (write-char-serial 119) (write-char-serial 61)  ; w=
+  ;; Double until the value stops growing OR we pass 40 doublings.  The
+  ;; bound keeps this probe from running into the (currently broken) bignum
+  ;; path, so it reports the fixnum width rather than SIGSEGVing.
   (let ((n 1) (k 0))
     (loop
+      (when (> k 40) (return nil))
       (let ((n2 (+ n n)))
-        (when (<= n2 n) (return nil))
+        (when (< n2 n) (return nil))
         (setq n n2)
         (setq k (+ k 1))))
     (%pdec k))
@@ -188,6 +220,8 @@
       ((eql which 4) (probe-funcall))
       ((eql which 5) (probe-fixnum-width))
       ((eql which 6) (probe-argv))
+      ((eql which 7) (probe-bignum))
+      ((eql which 8) (probe-memu32))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

@@ -345,54 +345,54 @@
    if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
    ops from the rest of i386 codegen when triaging a miscompile.")
 
-(defparameter *i386-gc-bitmap-enabled* nil
+(defparameter *i386-gc-bitmap-enabled* t
   "Emit the object-start / cons-kind bit-set at every allocation site.
-   Must be ON whenever *i386-gc-enabled* is: the collector without the bitmap
-   is the unhardened collector that corrupts.")
+   Must be ON whenever the collector is: without the bitmaps scan_word has no
+   conservative-root validation and copy_object stamps forwarding pointers over
+   mid-object data.  Like *i386-gc-enabled*, it takes effect only in
+   *i386-linux-mode* — the bitmaps are mmap'd by boot/boot-linux-i386.lisp, and
+   with a null base the bit-set would write through a garbage pointer.")
 
-(defparameter *i386-gc-enabled* nil
-  "Whether :gc-check may CALL the collector.
+(defparameter *i386-gc-enabled* t
+  "Whether :gc-check calls the collector.  DEFAULT T since the native i386
+   Cheney collector landed (i386-emit-gc-trampoline).
 
-   DEFAULT NIL, deliberately.  The wiring works — %GC-COLLECT is reached,
-   cycles complete, and 64 KiB of SHA-256 no longer exhausts the arena — but
-   the collector is UNHARDENED on i386: gc.lisp's %gc-is-start returns T
-   unconditionally while bitmap_base is 0, so %gc-forward-slot performs NO
-   conservative-root validation and copy_object stamps forwarding pointers
-   over mid-object data.  Measured: 64 KiB produced a corrupted hash array.
+   MILESTONE THAT FLIPPED IT ON: SHA-256 over 64 KiB completes with digest
+   7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2 —
+   byte-equal to Python hashlib, generated not transcribed — across 8
+   collections, rc=0.  A 1000-cons chain survives 6 forced collections with
+   every element intact, and 4 KiB of SHA-256 is exact under a collection
+   every 1 MB (roughly 120 cycles), which on a 30-bit tower means constant
+   bignum allocation across every one of them.
 
-   Enabled, that trades an honest crash at the arena edge for a WRONG ANSWER.
-   That is the same crash-to-silent-corruption trade rejected for the 2 GB
-   arena bump, and it is not made acceptable by the corruption currently
-   being loud — `1S23451S2345` is luck, not a property.  So the collector
-   stays off until the object-start bitmap lands.
-
-   TO ENABLE: (1) run %gc-bitmap-init at boot so bitmap_base is non-zero —
-   gc.lisp's validation is ALREADY WRITTEN and merely inert; (2) emit an
-   inline start-bit set at the six i386 alloc opcodes (cons, alloc-cons,
-   alloc-obj, alloc-array, alloc-string, alloc-u8), which x86 BTS does in one
-   instruction given a granule index; (3) byte-exact clear the reclaimed
-   from-space bitmap range after each swap — point (c) of
-   reference_mcgc_validation_collector, whose omission let the bitmap
-   saturate and silently decay the check to a no-op on aarch64.
-   i386's advantage: the whole arena is under 2^30, so granule arithmetic
-   stays in fixnums and cannot trip the re-entrancy trap.")
+   OFF is still a supported configuration (MODUS_I386_GC=0 in
+   build-i386-cli.lisp): with no collector every allocation is permanent and
+   the arena is the lifetime budget, so bulk work dies honestly at the edge.")
 
 (defvar *i386-gc-collect-label* nil
-  "Label :gc-check CALLs.  This is the GC TRAMPOLINE (below), not %GC-COLLECT
-   itself.  NIL (no collector in the module) makes :gc-check fall back to its
-   historical `int $0x31`.")
-(defvar *i386-gc-collect-fn-label* nil
-  "Label of the Lisp-side %GC-COLLECT, resolved by name in
-   TRANSLATE-MVM-TO-I386 exactly as the generic-arith entries are.  The
-   trampoline CALLs this; :gc-check must never call it directly (see
-   I386-EMIT-GC-TRAMPOLINE for why).")
+  "Label of the native collector, which :gc-check CALLs.  NIL when the
+   collector is disabled, and :gc-check then falls back to its historical
+   `int $0x31`.")
 
-;;; Cheney GC metadata slots that the trampoline and gc.lisp SHARE.  gc.lisp
-;;; hardcodes the same addresses (see its header comment); they are named here
-;;; so the two halves of the protocol are greppable together.
-(defconstant +i386-gc-saved-sp+  #x10000068)
-(defconstant +i386-gc-saved-va+  #x10000070)
-(defconstant +i386-gc-saved-vl+  #x10000078)
+;;; Cheney GC metadata, at the same fixed addresses x64 and aarch64 use.
+;;; Values are RAW byte addresses, exactly as on x64 — the native collector
+;;; holds them in registers, so the address<<1 convention gc.lisp needed (it
+;;; reads them with (mem-ref :u64), which is raw, so memory had to hold the
+;;; TAGGED form) is gone.  boot/boot-linux-i386.lisp stores them raw to match.
+;;; The saved-sp/va/vl slots at 0x68/0x70/0x78 are no longer used at all: the
+;;; collector keeps ESP in a register and writes VA/VL itself.
+(defparameter *i386-gc-stress-limit* nil
+  "When set, the collector installs VL = new_from_start + this instead of
+   + space_size, so collections keep recurring at that interval.  Corruption in
+   a copying collector shows up at the SECOND collection (the first leaves the
+   old semispace intact), so being able to force dozens of cycles out of a
+   small workload is what makes the survival tests cheap.  NIL = normal.")
+
+(defconstant +i386-gc-from-start+ #x10000040)
+(defconstant +i386-gc-to-start+   #x10000048)
+(defconstant +i386-gc-space-size+ #x10000050)
+(defconstant +i386-gc-stack-base+ #x10000058)
+(defconstant +i386-gc-count+      #x10000060)
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)
@@ -630,7 +630,7 @@
    VR-PRESERVING by construction (see the register invariant): computes in the
    ECX/EDX scratch pair, saved around the sequence so the caller's operands
    survive, and never touches EAX.  The build-time checker enforces this."
-  (when *i386-gc-bitmap-enabled*
+  (when (and *i386-gc-bitmap-enabled* *i386-linux-mode*)
     (i386-emit-push-reg buf +scratch0+)
     (i386-emit-push-reg buf +scratch1+)
     ;; ECX = granule index = (base - page_base) >> 4
@@ -1133,70 +1133,388 @@
 ;;; Prologue / Epilogue
 ;;; ============================================================
 
+;;; ============================================================
+;;; Native i386 Cheney collector (the third arch arm)
+;;; ============================================================
+;;; The collector is arch-specific by nature — registers, word size, object
+;;; layout — exactly as translate-*.lisp is N native back ends for one IR.
+;;; x64 (emit-gc-trampoline) and aarch64 (emit-aarch64-native-gc-trampoline)
+;;; each grew one; this is i386's, mirroring x64's structure (the most mature
+;;; arm): scan_word / copy_object / flat Cheney to-space scan / semispace swap,
+;;; with the object-start and cons-kind bitmaps as the conservative-root gate.
+;;;
+;;; WHY NATIVE AND NOT mvm/gc.lisp.  gc.lisp is a Lisp-side collector that has
+;;; never actually run: %gc-read64 is (mem-ref a :u64), and :u64 is RAW
+;;; (needs-tag NIL), so a loaded machine word is reinterpreted as a TAGGED Lisp
+;;; value — i.e. as word/2.  A real cons/object pointer has low nibble 1 or 9
+;;; and is therefore an ODD word, so FIXNUMP is false for it and the
+;;; (if (fixnump val) ...) guard in %gc-is-pointer / %gc-is-forward returns NIL
+;;; for exactly the words a collector exists to forward.  Measured with planted
+;;; words: 0x20000001 and 0x20000009 both report is-pointer NIL.  Native code
+;;; has no such problem: a machine word in a register is just a machine word.
+;;;
+;;; i386 SHAPES (all read off this file's own alloc opcodes, not assumed):
+;;;   cons          16 bytes allocated, car at +0, cdr at +4
+;;;   object        4-byte header at +0, slot i at +4+i*4,
+;;;                 size = align16((count+1)*4)
+;;;   u8 vector     subtag #x11, N packed bytes at +4, size = align16(4+N)
+;;;   EVERY alloc site aligns to 16, so the 16-byte granule of the start/cons
+;;;   bitmaps distinguishes every object — two objects can never share one.
+;;;
+;;; REGISTER CONTRACT inside the collector (PUSHAD has saved every mutator
+;;; register, so all eight are free):
+;;;   EBX = from_start        EDI = from_end        ESI = free pointer
+;;;   EBP = loop cursor       EAX/ECX/EDX = temps
+;;;   scan_word and copy_object PRESERVE EBX/EDI/EBP and advance only ESI.
+;;; VA/VL are memory slots on i386, so unlike x64 there is no register pair to
+;;; restore — the collector writes them directly.
+
+(defun i386-emit-gcnative-markbit (buf addr-reg cons-p)
+  "Set the object-start bit (and, when CONS-P, the cons-kind bit) for the raw
+   to-space address in ADDR-REG.  Survivors must be marked at their NEW
+   location: after the swap this region becomes from-space, and the next
+   collection's scan_word validates roots against exactly these bits.
+   Preserves every register (ECX/EDX are saved) and reads ADDR-REG only."
+  (i386-emit-push-reg buf +scratch0+)
+  (i386-emit-push-reg buf +scratch1+)
+  (i386-emit-mov-reg-reg buf +scratch0+ addr-reg)
+  (i386-emit-byte buf #x2B)                                ; SUB ECX, [page_base]
+  (i386-emit-byte buf (i386-modrm #b00 +scratch0+ 5))
+  (i386-emit-u32 buf *gc-page-base-addr*)
+  (i386-emit-shr-reg-imm buf +scratch0+ 4)                 ; 16-byte granule
+  (i386-emit-mov-reg-abs buf +scratch1+ *gc-startbmp-addr*)
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf #xAB)      ; BTS [EDX], ECX
+  (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+))
+  (when cons-p
+    (i386-emit-mov-reg-abs buf +scratch1+ *gc-consbmp-addr*)
+    (i386-emit-byte buf #x0F) (i386-emit-byte buf #xAB)
+    (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+)))
+  (i386-emit-pop-reg buf +scratch1+)
+  (i386-emit-pop-reg buf +scratch0+))
+
+(defun i386-emit-gcnative-bittest (buf addr-reg bitmap-addr)
+  "BT the bit for raw address ADDR-REG in the bitmap whose base word lives at
+   BITMAP-ADDR, leaving the answer in CF.  Preserves every register: the POPs
+   that follow BT do not touch flags, so CF survives to the caller's Jcc."
+  (i386-emit-push-reg buf +i386-eax+)
+  (i386-emit-push-reg buf +scratch1+)
+  (i386-emit-mov-reg-reg buf +i386-eax+ addr-reg)
+  (i386-emit-byte buf #x2B)                                ; SUB EAX, [page_base]
+  (i386-emit-byte buf (i386-modrm #b00 +i386-eax+ 5))
+  (i386-emit-u32 buf *gc-page-base-addr*)
+  (i386-emit-shr-reg-imm buf +i386-eax+ 4)
+  (i386-emit-mov-reg-abs buf +scratch1+ bitmap-addr)
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf #xA3)      ; BT [EDX], EAX
+  (i386-emit-byte buf (i386-modrm #b00 +i386-eax+ +scratch1+))
+  (i386-emit-pop-reg buf +scratch1+)
+  (i386-emit-pop-reg buf +i386-eax+))
+
+(defun i386-emit-gcnative-copy (buf copy-label)
+  "copy_object.  In: EAX = tagged from-space pointer.  Out: EAX = tagged
+   to-space pointer, ESI advanced, forwarding pointer left behind.
+   Preserves EBX/EDI/EBP; clobbers EAX/ECX/EDX."
+  (let ((c-cons (i386-make-label)) (c-fwd (i386-make-label))
+        (c-u8 (i386-make-label))   (c-align (i386-make-label))
+        (c-bogus (i386-make-label))
+        (c-loop (i386-make-label)) (c-done (i386-make-label)))
+    (i386-emit-label buf copy-label)
+    (i386-emit-push-reg buf +i386-eax+)          ; [ESP] = original tagged ptr
+    (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch0+ -16)   ; ECX = raw address
+    (i386-emit-and-reg-imm buf +i386-eax+ 15)
+    (i386-emit-cmp-reg-imm buf +i386-eax+ +tag-cons+)
+    (i386-emit-jcc buf :e c-cons)
+
+    ;; ---- object ----
+    (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)   ; EAX = header
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ 15)
+    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
+    (i386-emit-jcc buf :e c-fwd)
+    ;; size -> EDX.  u8 vectors count BYTES, everything else counts WORDS.
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ 255)
+    (i386-emit-cmp-reg-imm buf +scratch1+ #x11)
+    (i386-emit-jcc buf :e c-u8)
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-shr-reg-imm buf +scratch1+ 8)     ; element count
+    (i386-emit-add-reg-imm buf +scratch1+ 1)     ; + header word
+    (i386-emit-shl-reg-imm buf +scratch1+ 2)     ; * 4
+    (i386-emit-jmp-rel32 buf c-align)
+    (i386-emit-label buf c-u8)
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-shr-reg-imm buf +scratch1+ 8)     ; byte count N
+    (i386-emit-add-reg-imm buf +scratch1+ 4)     ; + header
+    (i386-emit-label buf c-align)
+    (i386-emit-add-reg-imm buf +scratch1+ 15)
+    (i386-emit-and-reg-imm buf +scratch1+ -16)
+    ;; ---- conservative-scan sanity guard (x64's, ported) ----
+    ;; A false root that survives the bitmap gates would otherwise have its
+    ;; first word read as a header, yielding an absurd size that runs the copy
+    ;; loop off to-space.  A real object lies ENTIRELY inside from-space.
+    (i386-emit-cmp-reg-imm buf +scratch1+ 16)
+    (i386-emit-jcc buf :b c-bogus)
+    (i386-emit-mov-reg-reg buf +i386-eax+ +scratch0+)
+    (i386-emit-add-reg-reg buf +i386-eax+ +scratch1+)
+    (i386-emit-cmp-reg-reg buf +i386-eax+ +i386-edi+)
+    (i386-emit-jcc buf :a c-bogus)
+    ;; ---- copy EDX bytes from ECX to ESI ----
+    (i386-emit-push-reg buf +i386-esi+)          ; destination start
+    (i386-emit-push-reg buf +scratch1+)          ; size
+    (i386-emit-label buf c-loop)
+    (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+    (i386-emit-jcc buf :e c-done)
+    (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)
+    (i386-emit-mov-mem-reg buf +i386-esi+ 0 +i386-eax+)
+    (i386-emit-add-reg-imm buf +scratch0+ 4)
+    (i386-emit-add-reg-imm buf +i386-esi+ 4)
+    (i386-emit-sub-reg-imm buf +scratch1+ 4)
+    (i386-emit-jmp-rel32 buf c-loop)
+    (i386-emit-label buf c-done)
+    (i386-emit-pop-reg buf +scratch1+)           ; size
+    (i386-emit-pop-reg buf +i386-eax+)           ; destination start
+    (i386-emit-sub-reg-reg buf +scratch0+ +scratch1+)  ; ECX = original raw
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-or-reg-imm buf +scratch1+ 15)
+    (i386-emit-mov-mem-reg buf +scratch0+ 0 +scratch1+) ; forwarding pointer
+    (i386-emit-gcnative-markbit buf +i386-eax+ nil)
+    (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
+    (i386-emit-add-reg-imm buf +i386-esp+ 4)     ; drop saved tagged ptr
+    (i386-emit-ret buf)
+
+    ;; ---- bogus size: hand the pointer back untouched ----
+    (i386-emit-label buf c-bogus)
+    (i386-emit-pop-reg buf +i386-eax+)
+    (i386-emit-ret buf)
+
+    ;; ---- cons ----
+    (i386-emit-label buf c-cons)
+    (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 0)   ; car word
+    (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+    (i386-emit-and-reg-imm buf +scratch1+ 15)
+    (i386-emit-cmp-reg-imm buf +scratch1+ 15)
+    (i386-emit-jcc buf :e c-fwd)
+    (i386-emit-mov-mem-reg buf +i386-esi+ 0 +i386-eax+)   ; car
+    (i386-emit-mov-reg-mem buf +i386-eax+ +scratch0+ 4)
+    (i386-emit-mov-mem-reg buf +i386-esi+ 4 +i386-eax+)   ; cdr at +4, not +8
+    (i386-emit-mov-reg-reg buf +i386-eax+ +i386-esi+)
+    (i386-emit-or-reg-imm buf +i386-eax+ 15)
+    (i386-emit-mov-mem-reg buf +scratch0+ 0 +i386-eax+)   ; forwarding pointer
+    (i386-emit-gcnative-markbit buf +i386-esi+ t)
+    (i386-emit-mov-reg-reg buf +i386-eax+ +i386-esi+)
+    (i386-emit-add-reg-imm buf +i386-esi+ 16)
+    (i386-emit-or-reg-imm buf +i386-eax+ +tag-cons+)
+    (i386-emit-add-reg-imm buf +i386-esp+ 4)
+    (i386-emit-ret buf)
+
+    ;; ---- already forwarded: EAX = forwarding word ----
+    (i386-emit-label buf c-fwd)
+    (i386-emit-and-reg-imm buf +i386-eax+ -16)
+    (i386-emit-pop-reg buf +scratch1+)           ; original tagged ptr
+    (i386-emit-and-reg-imm buf +scratch1+ 15)    ; its tag
+    (i386-emit-or-reg-reg buf +i386-eax+ +scratch1+)
+    (i386-emit-ret buf)))
+
+(defun i386-emit-gcnative-scan-word (buf scan-label copy-label)
+  "scan_word.  In: EAX = ADDRESS of the word to examine.  If it holds a
+   from-space cons/object pointer that the bitmaps confirm, copy the target and
+   write the new pointer back.  Preserves EBX/EDI/EBP/ESI-as-free-ptr
+   semantics; clobbers EAX/ECX/EDX."
+  (let ((w-cons (i386-make-label)) (w-obj (i386-make-label))
+        (w-copy (i386-make-label)) (w-done (i386-make-label)))
+    (i386-emit-label buf scan-label)
+    (i386-emit-push-reg buf +i386-eax+)                   ; address of the word
+    (i386-emit-mov-reg-mem buf +scratch1+ +i386-eax+ 0)   ; EDX = the value
+    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+    (i386-emit-and-reg-imm buf +scratch0+ 15)
+    (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
+    (i386-emit-jcc buf :e w-cons)
+    (i386-emit-cmp-reg-imm buf +scratch0+ +tag-object+)
+    (i386-emit-jcc buf :e w-obj)
+    (i386-emit-jmp-rel32 buf w-done)
+
+    ;; ---- cons-tagged candidate ----
+    (i386-emit-label buf w-cons)
+    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+    (i386-emit-and-reg-imm buf +scratch0+ -16)            ; ECX = raw target
+    (i386-emit-cmp-reg-reg buf +scratch0+ +i386-ebx+)
+    (i386-emit-jcc buf :b w-done)
+    (i386-emit-cmp-reg-reg buf +scratch0+ +i386-edi+)
+    (i386-emit-jcc buf :ae w-done)
+    ;; object-start bit must be SET (conservative-root validation)
+    (i386-emit-gcnative-bittest buf +scratch0+ *gc-startbmp-addr*)
+    (i386-emit-jcc buf :ae w-done)                        ; JNC
+    ;; ...and the start must really BE a cons.  aarch64 #160 (77c29e9): a
+    ;; scratch word holding object_base|1 passes the start gate and would then
+    ;; be copied as a 16-byte cons, truncating the object and stranding its
+    ;; real obj-tagged reference.
+    (i386-emit-gcnative-bittest buf +scratch0+ *gc-consbmp-addr*)
+    (i386-emit-jcc buf :ae w-done)                        ; JNC
+    (i386-emit-jmp-rel32 buf w-copy)
+
+    ;; ---- object-tagged candidate ----
+    (i386-emit-label buf w-obj)
+    (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+    (i386-emit-and-reg-imm buf +scratch0+ -16)
+    (i386-emit-cmp-reg-reg buf +scratch0+ +i386-ebx+)
+    (i386-emit-jcc buf :b w-done)
+    (i386-emit-cmp-reg-reg buf +scratch0+ +i386-edi+)
+    (i386-emit-jcc buf :ae w-done)
+    (i386-emit-gcnative-bittest buf +scratch0+ *gc-startbmp-addr*)
+    (i386-emit-jcc buf :ae w-done)                        ; JNC
+    ;; ...and the start must NOT be a cons — the mirror-image cross-check:
+    ;; cons_base|9 would otherwise be copied as a variable-size object, reading
+    ;; a cons's car as a header.
+    (i386-emit-gcnative-bittest buf +scratch0+ *gc-consbmp-addr*)
+    (i386-emit-jcc buf :b w-done)                         ; JC
+
+    (i386-emit-label buf w-copy)
+    (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)     ; tagged pointer
+    (i386-emit-call-rel32 buf copy-label)
+    (i386-emit-pop-reg buf +scratch1+)                    ; address of the word
+    (i386-emit-mov-mem-reg buf +scratch1+ 0 +i386-eax+)
+    (i386-emit-ret buf)
+
+    (i386-emit-label buf w-done)
+    (i386-emit-pop-reg buf +i386-eax+)
+    (i386-emit-ret buf)))
+
 (defun i386-emit-gc-trampoline (buf tramp-label collect-label)
-  "The GC TRAMPOLINE — the half of the collector protocol i386 was missing.
+  "A complete Cheney copying collector in native i386, called by :gc-check.
 
-   MEASURED FAILURE IT FIXES (WS5, 2026-07-31).  :gc-check used to emit a bare
-   `call %GC-COLLECT`.  A bare call implements NEITHER side of the protocol
-   that mvm/gc.lisp documents and that the x64 / aarch64 trampolines provide:
+   WHAT THIS REPLACED, and why a bare `call %GC-COLLECT` could never work
+   (WS5, 2026-07-31 — every claim below measured, none inferred):
+     (1) %GC-COLLECT read the mutator stack pointer from 0x10000068, which
+         nothing wrote.  It read 0, %gc-collect's own sanity check fired and
+         set saved-rsp = stack_base, making the scan range EMPTY.  Measured:
+         'S' on 12970 of 12970 collections, stack-word counter 0.
+     (2) %GC-COLLECT published the post-collection alloc pointer and limit at
+         0x10000070/78 and nothing read them back into VA/VL, so VA stayed at
+         or above VL and the next allocation collected again.  Measured: a
+         16 KiB SHA-256 needing at most two collections performed 12970.
+     (3) Even with both fixed, gc.lisp cannot see a heap pointer at all — see
+         the file-header note above.  That is why this arm is native.
 
-     (1) %GC-COLLECT reads the mutator's stack pointer from 0x10000068.
-         Nothing wrote it, so it read 0 (demand-zeroed BSS); %gc-collect's own
-         sanity check then fired ('S' on stdout) and set saved-rsp = stack_base,
-         which makes the scan range [stack_base, stack_base) — EMPTY.  Every
-         root reachable only from the stack — i.e. essentially every live local
-         — was invisible to the collector.  Measured: 12970 of 12970 collections
-         printed 'S', and the instrumented stack-word counter stayed at 0.
+   PUSHAD comes FIRST and the stack scan then starts at ESP, i.e. AT the
+   register-save frame rather than past it: those saved registers are roots,
+   and skipping them hands a stale pre-GC pointer back at POPAD (the aarch64
+   fc25505 bug).  Nothing is written to 0x10000068/70/78 any more — the
+   collector holds ESP in a register and writes VA/VL itself."
+  (declare (ignore collect-label))
+  (let ((scan-label (i386-make-label))
+        (copy-label (i386-make-label))
+        (body-label (i386-make-label)))
+    (i386-emit-label buf tramp-label)
+    (i386-emit-byte buf #x60)                             ; PUSHAD
+    ;; --- metadata: EBX = from_start, ESI = free ptr (to_start), EDI = from_end
+    (i386-emit-mov-reg-abs buf +i386-ebx+ +i386-gc-from-start+)
+    (i386-emit-mov-reg-abs buf +i386-esi+ +i386-gc-to-start+)
+    (i386-emit-mov-reg-reg buf +i386-edi+ +i386-ebx+)
+    (i386-emit-byte buf #x03)                             ; ADD EDI, [space_size]
+    (i386-emit-byte buf (i386-modrm #b00 +i386-edi+ 5))
+    (i386-emit-u32 buf +i386-gc-space-size+)
 
-     (2) %GC-COLLECT publishes the post-collection alloc pointer and limit by
-         writing 0x10000070 / 0x10000078 (%gc-set-r12 / %gc-set-r14).  On x64
-         and aarch64 the trampoline pops them back into R12/R14.  On i386 VA/VL
-         are memory slots and NOTHING read those words back, so VA stayed at or
-         above VL after a collection — and the very next allocation's :gc-check
-         collected again.  Measured: a 16 KiB SHA-256 (which needs at most two
-         collections) performed 12970 and was still going when killed.
+    ;; --- stack roots: [ESP, stack_base) ---
+    (let ((sl (i386-make-label)) (sd (i386-make-label)))
+      (i386-emit-mov-reg-reg buf +i386-ebp+ +i386-esp+)
+      (i386-emit-label buf sl)
+      (i386-emit-cmp-reg-abs buf +i386-ebp+ +i386-gc-stack-base+)
+      (i386-emit-jcc buf :ae sd)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)            ; 4-byte words
+      (i386-emit-jmp-rel32 buf sl)
+      (i386-emit-label buf sd))
 
-     (3) A bare call also clobbers the caller's live registers.  EAX *is* VR on
-         i386 and :gc-check's own comment notes it may hold a live value.
+    ;; --- fixed global roots (same set the x64 trampoline scans) ---
+    (dolist (a (list #x10000080     ; global special-variable alist
+                     #x10000088     ; symbol intern table
+                     #x10000148     ; keyword intern table
+                     #x10000170))   ; package-by-hash table
+      (i386-emit-mov-reg-imm buf +i386-eax+ a)
+      (i386-emit-call-rel32 buf scan-label))
 
-   The fix is the standard shape (mirrors emit-aarch64-native-gc-trampoline):
-   PUSHAD first so every mutator register becomes a scannable stack word, THEN
-   record ESP — pointing AT the register-save frame, never past it.  Recording
-   the pointer above the save area is the aarch64 fc25505 bug: the saved
-   registers are roots, and skipping them hands a stale pre-GC pointer back at
-   restore time.
+    ;; --- the i386 GLOBAL SLOT BLOCK, scanned in full ---
+    ;; x64 and aarch64 keep the closure-env register, nargs and MV-count in
+    ;; PHYSICAL registers, which PUSHAD-equivalents already spill onto the
+    ;; scanned stack.  i386 has no spare register, so they live in memory —
+    ;; and CENV (globals+0x10) is a live HEAP POINTER that no root set covered.
+    ;; That is the 2dd9e6f/c0dc6b8 invisible-root class, and it bites the
+    ;; moment a collector actually forwards anything.  Scanning the whole block
+    ;; rather than CENV alone keeps any slot added later covered by
+    ;; construction; the non-pointer slots (VA/VL/page_base/bitmap bases are
+    ;; 16-aligned, nargs/MV-count are small integers) fail the tag or range
+    ;; test harmlessly.
+    (let ((gl (i386-make-label)) (gd (i386-make-label)))
+      (i386-emit-mov-reg-imm buf +i386-ebp+ *i386-globals-base*)
+      (i386-emit-label buf gl)
+      (i386-emit-cmp-reg-imm buf +i386-ebp+ (+ *i386-globals-base* #x24))
+      (i386-emit-jcc buf :ae gd)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf gl)
+      (i386-emit-label buf gd))
 
-   Metadata is stored SHIFTED LEFT ONE.  gc.lisp reads these slots with
-   (mem-ref addr :u64), and :u64 is RAW (memory-width-code -> needs-tag NIL),
-   so the raw word IS the tagged Lisp value and memory must hold address<<1 for
-   the Lisp value to be the address.  Same convention as boot-linux-i386's
-   metadata init and aarch64's LSL/ASR dance."
-  (i386-emit-label buf tramp-label)
-  ;; --- save every mutator register; ESP then points at the frame ---
-  (i386-emit-byte buf #x60)                                  ; PUSHAD
-  (i386-emit-mov-reg-reg buf +scratch0+ +i386-esp+)
-  (i386-emit-add-reg-reg buf +scratch0+ +scratch0+)          ; ESP << 1
-  (i386-emit-mov-abs-reg buf +i386-gc-saved-sp+ +scratch0+)
-  ;; --- publish VA / VL for the collector ---
-  (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
-  (i386-emit-add-reg-reg buf +scratch0+ +scratch0+)
-  (i386-emit-mov-abs-reg buf +i386-gc-saved-va+ +scratch0+)
-  (i386-emit-mov-reg-abs buf +scratch0+ *vl-addr*)
-  (i386-emit-add-reg-reg buf +scratch0+ +scratch0+)
-  (i386-emit-mov-abs-reg buf +i386-gc-saved-vl+ +scratch0+)
-  ;; --- nargs = 0 for the call (parity with the standard call sequence) ---
-  (i386-emit-mov-reg-imm buf +scratch0+ 0)
-  (i386-emit-mov-abs-reg buf *nargs-addr* +scratch0+)
-  (i386-emit-call-rel32 buf collect-label)
-  ;; --- install the collector's new alloc pointer and limit ---
-  (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-saved-va+)
-  (i386-emit-shr-reg-imm buf +scratch0+ 1)
-  (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
-  (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-saved-vl+)
-  (i386-emit-shr-reg-imm buf +scratch0+ 1)
-  (i386-emit-mov-abs-reg buf *vl-addr* +scratch0+)
-  (i386-emit-byte buf #x61)                                  ; POPAD
-  (i386-emit-ret buf))
+    ;; --- Cheney scan of to-space: [to_start, free_ptr), free_ptr growing ---
+    (let ((cl (i386-make-label)) (cd (i386-make-label)))
+      (i386-emit-mov-reg-abs buf +i386-ebp+ +i386-gc-to-start+)
+      (i386-emit-label buf cl)
+      (i386-emit-cmp-reg-reg buf +i386-ebp+ +i386-esi+)
+      (i386-emit-jcc buf :ae cd)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf cl)
+      (i386-emit-label buf cd))
+
+    ;; --- swap semispaces ---
+    (i386-emit-mov-reg-abs buf +i386-eax+ +i386-gc-to-start+)
+    (i386-emit-mov-abs-reg buf +i386-gc-from-start+ +i386-eax+)
+    (i386-emit-mov-abs-reg buf +i386-gc-to-start+ +i386-ebx+)
+    ;; --- install VA = free pointer, VL = new from_start + space_size ---
+    (i386-emit-mov-abs-reg buf *va-addr* +i386-esi+)
+    (if *i386-gc-stress-limit*
+        (i386-emit-add-reg-imm buf +i386-eax+ *i386-gc-stress-limit*)
+        (progn
+          (i386-emit-byte buf #x03)                       ; ADD EAX, [space_size]
+          (i386-emit-byte buf (i386-modrm #b00 +i386-eax+ 5))
+          (i386-emit-u32 buf +i386-gc-space-size+)))
+    (i386-emit-mov-abs-reg buf *vl-addr* +i386-eax+)
+
+    ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---
+    ;; EBX is the semispace this collection just evacuated; its bits are stale.
+    ;; Without this the bitmaps saturate monotonically and the conservative-root
+    ;; gate decays to a no-op over many collections — the exact decay class that
+    ;; cost x64 and aarch64 a round each.  REP STOSB, not STOSD: the two
+    ;; semispaces' bitmap sub-ranges meet at space_size/128, which is not
+    ;; 8-aligned, so a wider clear would erase the sibling's live bits.
+    (dolist (bmp (list *gc-startbmp-addr* *gc-consbmp-addr*))
+      (i386-emit-byte buf #xFC)                           ; CLD
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebx+)
+      (i386-emit-byte buf #x2B)                           ; SUB EAX, [page_base]
+      (i386-emit-byte buf (i386-modrm #b00 +i386-eax+ 5))
+      (i386-emit-u32 buf *gc-page-base-addr*)
+      (i386-emit-shr-reg-imm buf +i386-eax+ 7)            ; 1 bit / 16 bytes
+      (i386-emit-mov-reg-abs buf +i386-edi+ bmp)
+      (i386-emit-add-reg-reg buf +i386-edi+ +i386-eax+)
+      (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-space-size+)
+      (i386-emit-shr-reg-imm buf +scratch0+ 7)
+      (i386-emit-byte buf #x31) (i386-emit-byte buf #xC0) ; XOR EAX, EAX
+      (i386-emit-byte buf #xF3) (i386-emit-byte buf #xAA)); REP STOSB
+
+    ;; --- gc_count++ ---
+    (i386-emit-byte buf #xFF)                             ; INC dword [abs32]
+    (i386-emit-byte buf (i386-modrm #b00 0 5))
+    (i386-emit-u32 buf +i386-gc-count+)
+
+    (i386-emit-byte buf #x61)                             ; POPAD
+    (i386-emit-ret buf)
+
+    ;; --- subroutines, jumped over by the body above ---
+    (i386-emit-label buf body-label)
+    (i386-emit-gcnative-scan-word buf scan-label copy-label)
+    (i386-emit-gcnative-copy buf copy-label)))
 
 (defun i386-emit-prologue (buf)
   "Emit i386 function prologue.
@@ -3121,23 +3439,23 @@
           (loop for entry in function-table
                 when (string-equal (first entry) "GENERIC-MULTIPLY")
                   return (gethash (second entry) fn-offset-to-label)))
-    ;; WS5: resolve the COLLECTOR the same way, so :gc-check can CALL it
-    ;; instead of emitting `int $0x31` (an invalid interrupt on hosted Linux —
-    ;; i386 previously had no collector at all and simply ran off the arena).
-    ;; This is the Lisp-side %GC-COLLECT from mvm/gc.lisp, not a native
-    ;; trampoline: i386 needs to stop exhausting the arena, not to be fast.
-    ;; :gc-check calls the TRAMPOLINE, which brackets %GC-COLLECT with the
-    ;; register save + metadata publish/reload the protocol requires — a bare
-    ;; call implements neither half.  See I386-EMIT-GC-TRAMPOLINE.
-    (setf *i386-gc-collect-fn-label*
-          (loop for entry in function-table
-                when (string-equal (first entry) "%GC-COLLECT")
-                  return (gethash (second entry) fn-offset-to-label)))
-    ;; Only mint the trampoline label when the collector is actually enabled —
-    ;; a GC-off i386 image then emits byte-identical code to before the
-    ;; trampoline existed (verified against a pre-change build).
+    ;; WS5: the label :gc-check CALLs is the NATIVE collector, emitted after
+    ;; the last function (see I386-EMIT-GC-TRAMPOLINE).  It needs nothing from
+    ;; the module — no %GC-COLLECT bytecode offset, no Lisp-side entry — so
+    ;; gate on the enable flag alone.  With the collector off, no label is
+    ;; minted, :gc-check keeps its historical `int $0x31`, and the image is
+    ;; byte-identical to one built before this collector existed.
+    ;; *i386-linux-mode* is part of the gate on purpose: the collector depends
+    ;; on boot-side initialisation — GC metadata at 0x10000040.., the two
+    ;; mmap'd bitmaps, and a stack base below 2^30 — that ONLY
+    ;; boot/boot-linux-i386.lisp performs.  A bare-metal i386 image has none of
+    ;; it (its global slot block is at #x600 and those words are zero), so
+    ;; enabling the collector there would call it with a null bitmap base and a
+    ;; garbage from-space.  Bare-metal i386 therefore keeps `int $0x31` and is
+    ;; byte-identical to a pre-collector build; wiring it up is a separate job
+    ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
-          (and *i386-gc-enabled* *i386-gc-collect-fn-label* (i386-make-label)))
+          (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -3184,13 +3502,16 @@
                               (i386-translate-insn state opcode operands new-pos)
                               (setf pos new-pos)))))))
     ;; The GC trampoline, emitted once after the last function.
-    (when (and *i386-gc-collect-label* *i386-gc-collect-fn-label*)
+    (when *i386-gc-collect-label*
       (when *i386-fn-align*
         (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
                                 *i386-fn-align*))
               do (i386-emit-nop buf)))
-      (i386-emit-gc-trampoline buf *i386-gc-collect-label*
-                               *i386-gc-collect-fn-label*))
+      ;; The checker polices OPCODE codegen (EAX doubles as VR there).  Inside
+      ;; the collector every mutator register is already saved by PUSHAD, so
+      ;; EAX is an ordinary temp; silence the checker for this block.
+      (let ((*i386-check-eax-invariant* nil))
+        (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
     ;; Resolve all label fixups
     (i386-fixup-labels buf)
     ;; Resolve fn-map: replace label IDs with actual native byte positions

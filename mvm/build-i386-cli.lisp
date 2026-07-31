@@ -895,6 +895,11 @@
 
 (setf modus.mvm.i386::*i386-linux-mode* t)
 (modus.mvm.i386::i386-set-globals-base +linux-i386-globals+)
+(let ((v (sb-ext:posix-getenv "MODUS_I386_GCSTRESS")))
+  (when (and v (plusp (length v)))
+    (setf modus.mvm.i386::*i386-gc-stress-limit* (parse-integer v))
+    (format t "~&  GC stress limit: ~D bytes between collections~%"
+            modus.mvm.i386::*i386-gc-stress-limit*)))
 (let ((v (sb-ext:posix-getenv "MODUS_I386_VL")))
   (when (and v (plusp (length v)))
     (setf modus.mvm::*linux-i386-vl-offset* (parse-integer v))
@@ -905,47 +910,39 @@
 (setf modus.mvm.i386::*i386-checked-arith-slowpath*
       (let ((v (sb-ext:posix-getenv "MODUS_I386_NO_CHECKED")))
         (not (and v (plusp (length v))))))
-;; WS5: enable the collector AND its object-start bitmap together (the bitmap
-;; is not optional -- %gc-is-start degrades to T when bitmap_base = 0).
-;; MODUS_I386_GC=1 turns both on; MODUS_I386_BMP=1 turns on the bitmap alone;
-;; MODUS_I386_VL=<bytes> lowers the first GC trigger so a collection can be
-;; provoked in seconds instead of gigabytes; MODUS_I386_GCDIAG=1 adds the
-;; counting/dumping collector overrides.
+;; WS5: the NATIVE i386 Cheney collector is ON by default (the third arch
+;; arm, alongside x64's emit-gc-trampoline and aarch64's native MCGC).
+;; MILESTONE: SHA-256 over 64 KiB completes with the digest Python hashlib
+;; produces, across 8 collections, rc=0; a 1000-cons chain survives 6 forced
+;; collections intact; 4 KiB of SHA-256 is exact under a collection every 1 MB.
 ;;
-;; STILL GATED OFF, and now for a MEASURED reason rather than a mystery.
-;; Two of the three defects behind the 64 KiB corruption are fixed (the GC
-;; trampoline, see I386-EMIT-GC-TRAMPOLINE); the third is not, and it is in
-;; SHARED code:
-;;
-;;   mvm/gc.lisp CANNOT SEE A HEAP POINTER.  %gc-read64 is (mem-ref a :u64),
-;;   and :u64 is RAW (memory-width-code -> needs-tag NIL), so the machine word
-;;   lands in a vreg UNTAGGED and every later Lisp operation reinterprets it as
-;;   a tagged value -- i.e. as the integer word/2.  A real cons/object pointer
-;;   has low nibble 1 or 9, hence an ODD word, hence FIXNUMP is false, hence
-;;   the (if (fixnump val) ...) guard in %gc-is-pointer / %gc-is-forward
-;;   returns NIL for exactly the words the collector exists to forward.
-;;   MEASURED with planted words (probe 46): 0x20000001 -> is-pointer 0,
-;;   0x20000009 -> is-pointer 0.  The same halving wrecks header decoding
-;;   (probe 43: a header with true count 5 / subtag 0x32 decodes as count 2 /
-;;   subtag 0x99), and %gc-scan-stack's +8 step scans every OTHER word of a
-;;   4-byte-word stack.
-;;
-;;   CONSEQUENCE, which is the answer to what a collection corrupts: it copies
-;;   NOTHING.  A collection is a free-the-world -- it swaps semispaces and
-;;   hands the mutator a fresh empty space while every live object stays in the
-;;   old one.  The FIRST collection survives by luck (the old space is not
-;;   reused yet); the SECOND swaps back and the mutator allocates on top of
-;;   still-live data.  That is why the damage reaches live locals.
-;;
-;; Fixing it means giving gc.lisp exact machine-word access (byte/halfword
-;; loads and stores, width- and endian-neutral) or writing a native i386
-;; Cheney trampoline as x64 and aarch64 both ended up doing.  Until then the
-;; standing rule applies: an honest crash at the arena edge is recoverable, a
-;; wrong digest is not.
-(flet ((envp (n) (let ((v (sb-ext:posix-getenv n)))
-                   (and v (plusp (length v)) (not (string= v "0"))))))
-  (let* ((gcon (envp "MODUS_I386_GC"))
-         (bmpon (or gcon (envp "MODUS_I386_BMP"))))
+;; Knobs, all off/normal by default:
+;;   MODUS_I386_GC=0        build WITHOUT the collector (every allocation
+;;                          permanent; the arena is the lifetime budget and
+;;                          bulk work dies honestly at its edge)
+;;   MODUS_I386_BMP=0       drop the object-start / cons-kind bit-set.  Only
+;;                          meaningful with the collector off: without the
+;;                          bitmaps scan_word has no conservative-root
+;;                          validation and copy_object stamps forwarding
+;;                          pointers over mid-object data.
+;;   MODUS_I386_VL=<bytes>  first GC trigger, so a collection can be provoked
+;;                          in seconds instead of gigabytes
+;;   MODUS_I386_GCSTRESS=<bytes>
+;;                          keep collecting at that interval forever.  A
+;;                          copying collector's corruption appears at the
+;;                          SECOND collection (the first leaves the old
+;;                          semispace intact), so forcing dozens of cycles out
+;;                          of a small workload is what makes survival tests
+;;                          cheap.
+;;   MODUS_I386_GCDIAG=1    counting/dumping overrides (they patch mvm/gc.lisp,
+;;                          which the native collector no longer uses, so they
+;;                          are inert now and kept only for the record)
+(flet ((envp (n dflt) (let ((v (sb-ext:posix-getenv n)))
+                        (if (and v (plusp (length v)))
+                            (not (string= v "0"))
+                            dflt))))
+  (let* ((gcon (envp "MODUS_I386_GC" t))
+         (bmpon (envp "MODUS_I386_BMP" t)))
     (setf modus.mvm.i386::*i386-gc-bitmap-enabled* bmpon)
     (setf modus.mvm.i386::*i386-gc-enabled* gcon)
     (format t "~&  GC: collector=~A bitmap=~A~%" gcon bmpon)))

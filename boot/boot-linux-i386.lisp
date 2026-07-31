@@ -327,29 +327,26 @@
   ;; nargs / cenv / mv-count slots are already zero (demand-zeroed BSS).
 
   ;; --- Cheney GC metadata at the shared fixed addresses ---
-  ;; --- Cheney GC metadata, stored SHIFTED LEFT ONE -----------------------
-  ;; gc.lisp reads these with (mem-ref addr :u64), and :u64 is RAW
-  ;; (memory-width-code -> needs-tag NIL), so the raw word IS the tagged Lisp
-  ;; value.  Memory must therefore hold address<<1 for the Lisp value to be
-  ;; the address.  Storing raw was the latent bug documented on aarch64
-  ;; (reference_aa64_gc_poison_root_cause): harmless while nothing collects,
-  ;; and it HALVES every address the moment something does.
-  ;; [0x10000040] from_start = (heap + alloc_start) << 1
+  ;; --- Cheney GC metadata, stored RAW ------------------------------------
+  ;; RAW byte addresses, matching x64 and aarch64.  The consumer is the NATIVE
+  ;; collector (i386-emit-gc-trampoline in translate-i386.lisp), which holds
+  ;; these in registers.  They used to be stored address<<1 for mvm/gc.lisp,
+  ;; whose (mem-ref :u64) is RAW and therefore reinterprets any loaded word as
+  ;; a TAGGED Lisp value — the same halving that makes gc.lisp unable to
+  ;; recognise a heap pointer at all.  Native code has no such convention.
+  ;; [0x10000040] from_start = heap + alloc_start
   (i386l-bytes buf #x89 #xC1)
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-heap-alloc-start+)
-  (i386l-bytes buf #x01 #xC9)                         ; add ecx, ecx  (<<1)
   (i386l-mov-abs-reg buf #x10000040 1)
-  ;; [0x10000048] to_start = (heap + midpoint) << 1
+  ;; [0x10000048] to_start = heap + midpoint
   (i386l-bytes buf #x89 #xC1)
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-gc-midpoint+)
-  (i386l-bytes buf #x01 #xC9)
   (i386l-mov-abs-reg buf #x10000048 1)
-  ;; [0x10000050] space_size << 1
+  ;; [0x10000050] space_size
   (i386l-mov-abs-imm buf #x10000050
-                     (ash (- +linux-i386-gc-midpoint+ +linux-i386-heap-alloc-start+) 1))
-  ;; [0x10000058] stack_base = our RELOCATED stack top, << 1
+                     (- +linux-i386-gc-midpoint+ +linux-i386-heap-alloc-start+))
+  ;; [0x10000058] stack_base = our RELOCATED stack top
   (i386l-mov-reg-imm buf 1 (- (+ +linux-i386-stack-addr+ +linux-i386-stack-size+) 16))
-  (i386l-bytes buf #x01 #xC9)
   (i386l-mov-abs-reg buf #x10000058 1)
   ;; [0x10000060] gc_count = 0
   (i386l-mov-abs-imm buf #x10000060 0)
@@ -367,8 +364,7 @@
   (i386l-bytes buf #x89 #xC1)                         ; mov ecx, eax
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-heap-alloc-start+)
   (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x18) 1)   ; raw page_base
-  (i386l-bytes buf #x01 #xC9)                         ; <<1
-  (i386l-mov-abs-reg buf #x10000E00 1)                ; gc.lisp page_base
+  (i386l-mov-abs-reg buf #x10000E00 1)                ; raw copy, diagnostics only
 
   ;; object-start bitmap
   (i386l-mov-reg-imm buf 3 0)                         ; addr = NULL (any)
@@ -380,8 +376,7 @@
   (i386l-mov-reg-imm buf 0 192) (i386l-bytes buf #xCD #x80)
   (i386l-bytes buf #x5D)
   (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x1C) 0)   ; raw, for codegen
-  (i386l-bytes buf #x01 #xC0)                         ; add eax, eax  (<<1)
-  (i386l-mov-abs-reg buf #x10000E18 0)                ; gc.lisp bitmap_base
+  (i386l-mov-abs-reg buf #x10000E18 0)                ; raw copy, diagnostics only
 
   ;; cons-kind bitmap
   (i386l-mov-reg-imm buf 3 0)
@@ -393,8 +388,7 @@
   (i386l-mov-reg-imm buf 0 192) (i386l-bytes buf #xCD #x80)
   (i386l-bytes buf #x5D)
   (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x20) 0)   ; raw, for codegen
-  (i386l-bytes buf #x01 #xC0)                         ; <<1
-  (i386l-mov-abs-reg buf #x10000E40 0)                ; gc.lisp cons bitmap
+  (i386l-mov-abs-reg buf #x10000E40 0)                ; raw copy, diagnostics only
 
   ;; --- frame pointer ---
   (i386l-bytes buf #x89 #xE5)                         ; mov ebp, esp

@@ -170,6 +170,24 @@
   (write-char-serial 107) (write-char-serial 54) (write-char-serial 61) ; k6=
   (%pdec (logand (ash 1 29) 255)) (putnl))         ; expect 0
 
+(defun probe-memu32-split ()
+  ;; RE-MEASURE FROM SCRATCH.  probe 8s earlier attribution -- that the
+  ;; :shl 1 tagging overflows -- was made on a substrate that still had 15
+  ;; VR-clobbering opcodes, so it
+  ;; is not trusted.  Split the two directions apart:
+  ;;   s* = value that FITS a 30-bit fixnum -> isolates the LOAD path
+  ;;   b* = value that does NOT fit (a bignum literal now) -> adds the STORE path
+  (setf (mem-ref #x10000b00 :u32) 4660)          ; #x1234, a fixnum
+  (write-char-serial 115) (write-char-serial 49) (write-char-serial 61) ; s1=
+  (%pdec (logand (mem-ref #x10000b00 :u32) 255)) (putnl)   ; expect 52
+  (write-char-serial 115) (write-char-serial 50) (write-char-serial 61) ; s2=
+  (%pdec (ash (mem-ref #x10000b00 :u32) -8)) (putnl)       ; expect 18
+  (setf (mem-ref #x10000b00 :u32) 1116352408)    ; #x428a2f98, a BIGNUM here
+  (write-char-serial 98) (write-char-serial 49) (write-char-serial 61)  ; b1=
+  (%pdec (logand (mem-ref #x10000b00 :u32) 255)) (putnl)   ; expect 152
+  (write-char-serial 98) (write-char-serial 50) (write-char-serial 61)  ; b2=
+  (%pdec (ash (mem-ref #x10000b00 :u32) -24)) (putnl))     ; expect 66
+
 (defun probe-memu32 ()
   ;; mem-ref :u32 must survive a u32 that cannot be a fixnum.  Uses the
   ;; scratch BSS above the i386 global slot block.
@@ -222,6 +240,7 @@
       ((eql which 6) (probe-argv))
       ((eql which 7) (probe-bignum))
       ((eql which 8) (probe-memu32))
+      ((eql which 9) (probe-memu32-split))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

@@ -2108,6 +2108,62 @@
               ;; 0F 09 = WBINVD instruction
               (i386-emit-byte buf #x0F)
               (i386-emit-byte buf #x09))
+             ;; ---- #x0510 / #x0511 / #x0512 — setjmp / longjmp / clear-handler
+             ;; NOT YET IMPLEMENTED.  They fall through to the unimplemented
+             ;; reporter below, which NAMES them at runtime rather than
+             ;; silently no-opping.  This is the single highest-priority gap on
+             ;; i386: it gates (1) i386's own bootstrap, because
+             ;; init-all-globals wraps every init thunk in handler-case, (2)
+             ;; --load and therefore cli-toplevel, and (3) ASDF/alexandria,
+             ;; which lean on handler-case and unwind-protect throughout.
+             ;;
+             ;; THE DESIGN, derived for i386 rather than transliterated — and
+             ;; the first point is a trap that transliteration would walk into:
+             ;;
+             ;; RESULT REGISTER.  compiler.lisp emits
+             ;;     (emit-ir :trap #x0510) (emit-ir :mov dest +vreg-vr+)
+             ;; so setjmp MUST deliver its result in VR — and on i386 VR *is*
+             ;; EAX.  But this whole :trap dispatch is bracketed with
+             ;; push eax / pop eax, on the stated assumption that "no trap
+             ;; returns a value in EAX (they all deliver into V0/ESI)".  Trap
+             ;; #x0510 is the first that breaks it, so the bracket must be made
+             ;; conditional: 0x0510 (and the point longjmp resumes at) writes
+             ;; EAX and must NOT have it restored by the trailing pop.  On x64
+             ;; the question does not arise, because RAX is not VR there.  The
+             ;; EAX/VR checker will police whatever is written here; if it
+             ;; fires, fix the sequence rather than allowlisting it.
+             ;;
+             ;; JMP_BUF.  x64 saves RSP/RBP/IP/RBX at 0x10000180.  i386 needs
+             ;; SIX words, because ESI/EDI/EBX are V0/V1/V4 — live vregs, not
+             ;; merely callee-saved — so a longjmp that does not restore them
+             ;; resumes into garbage:
+             ;;   0x10000180 ESP   +4 EBP   +8 IP   +12 EBX   +16 ESI   +20 EDI
+             ;; That range is free here: gc.lisp's stale comment claims
+             ;; 0x180/0x188 for copy results but its code uses 0x100/0x108, and
+             ;; i386 no longer runs gc.lisp at all.  It ends at 0x198, clear of
+             ;; argc at 0x200.
+             ;;
+             ;; NESTING.  Mirror x64's per-fork handler stack at 0x10000400:
+             ;; #x0510 pushes the current jmp_buf before overwriting it, #x0512
+             ;; pops it back.  Without that, a nested handler-case tears down
+             ;; its parent's frame.  Sequential handler-cases (what
+             ;; init-all-globals does, one per thunk) would work without it,
+             ;; which is exactly why a single-level version would look correct
+             ;; and then fail later.
+             ;;
+             ;; STACK RELOCATION.  The saved ESP is on the RELOCATED stack
+             ;; (MAP_FIXED at 0x18000000), not the kernel's, so it is below the
+             ;; 2^30 fixnum ceiling and consistent with %gc-stack-base — but a
+             ;; longjmp must leave the collector's idea of the stack correct,
+             ;; since the native collector scans [ESP, stack_base).  Unwinding
+             ;; to a SHALLOWER ESP is safe (the scan range only shrinks); the
+             ;; hazard is any path that leaves a stale saved ESP behind.
+             ;;
+             ;; GC ROOTS.  The jmp_buf as specified holds ESP/EBP/IP and three
+             ;; VREGS.  Those vreg words CAN be heap pointers, so the jmp_buf —
+             ;; and every live entry of the handler stack — must be scanned by
+             ;; the collector, exactly as CENV at globals+0x10 had to be.  The
+             ;; root set is in i386-emit-gc-trampoline.
              ((= code #x0530)
               ;; COPY-OVERFLOW-ARGS — the &rest prologue's runtime argument
               ;; copy, mirroring translate-x64.lisp's #x0530 arm.

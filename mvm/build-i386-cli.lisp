@@ -15,7 +15,8 @@
 ;;;;   1  prelude only                       (cons/arith/string primitives)
 ;;;;   2  + gc + rt                          (runtime support)
 ;;;;   3  + the CL bridge (cl-*.lisp)        (packages/streams/reader/printer)
-;;;;   4  + MVM ISA + interp + compiler + mvm-eval   (runtime compile)
+;;;;   4  + the unforked net/crypto.lisp   (SHA-256 / ChaCha20)
+;;;   5  + MVM ISA + interp + compiler + mvm-eval   (so EVAL evaluates)
 ;;;; Default is 1 while the port is being brought up.
 ;;;;
 ;;;; The build ALWAYS prints the translator's unimplemented-opcode report
@@ -109,6 +110,76 @@
                     (logior hml b3)))))))))))
 ")
 
+
+;;; ============================================================
+;;; Layer 5: the MVM compiler + interpreter (so EVAL actually evaluates)
+;;; ============================================================
+;;; Layers 1-4 give the CL bridge, which DEFINES eval/load/read — but Modus's
+;;; EVAL is mvm-eval: compile the form to MVM bytecode with the self-hosted
+;;; compiler, then run mvm-interpret.  Without these four files EVAL is
+;;; compiled in with an unresolved callee, so lib/cli-toplevel.lisp's
+;;; --eval/--load/REPL cannot work at all.  Verified by symmap before this
+;;; existed: EVAL/LOAD/READ present, MVM-EVAL/COMPILE-SOURCE-TO-MODULE/
+;;; MVM-INTERPRET absent.
+;;;
+;;; Order and contents mirror build-generic-cli.lisp, which bakes them
+;;; directly (build-aarch64-cli gets them via the aarch64 common file).  NO JIT
+;;; sources: mvm-eval's JIT seam falls back to mvm-interpret when the
+;;; translator is absent, which is exactly what a pure-interpret image wants.
+(defvar *isa-source*      (if (>= *i386-layer* 5) (mvm-text "mvm/mvm.lisp") ""))
+(defvar *interp-source*   (if (>= *i386-layer* 5) (mvm-text "mvm/interp.lisp") ""))
+(defvar *compiler-source* (if (>= *i386-layer* 5) (mvm-text "mvm/compiler.lisp") ""))
+(defvar *mvm-eval-source* (if (>= *i386-layer* 5) (mvm-text "mvm/mvm-eval.lisp") ""))
+
+;;; In-image override of ieee-float-bits: the build-time version uses
+;;; sb-kernel:double-float-* (host-only).  Appended AFTER the compiler source
+;;; so it wins (last-defun-wins).  Only matters for compiling FLOAT literals.
+(defvar *stage2-float-override* "
+(defun ieee-float-bits (f)
+  (logior (ash (logand (%prim-aref f 0) 4294967295) 32)
+          (logand (%prim-aref f 1) 4294967295)))
+;; Read hi/lo 32-bit halves directly from the boxed float's slots.  NEVER
+;; combine into a 64-bit integer: for floats >= 2.0 the hi half >= #x40000000,
+;; so (ash hi 32) >= 2^62 and Modus's bignum-range ASH is lossy, corrupting
+;; the literal's bits at compile time (2.0/9.0/-1.5 all read back as garbage).
+;; These two stay <= #xFFFFFFFF, safely in fixnum range.
+(defun ieee-float-hi32 (f) (logand (%prim-aref f 0) 4294967295))
+(defun ieee-float-lo32 (f) (logand (%prim-aref f 1) 4294967295))
+;; Bignum-literal decomposition: read the already-built bignum object's slots
+;; directly.  The host recompute path uses (logand value mask62), but the
+;; compiled `logand` primop is a raw machine AND of tagged words — for a bignum
+;; operand (a heap pointer) that yields garbage (e.g. (logand 2^62 (1- 2^62))
+;; returned 66281634333124 instead of 0).  These read the decomposed limbs the
+;; host already stored.
+(defun %lit-bignum-big-p (value) (big-bignum-p value))
+(defun %lit-bn-lo (value) (bignum-lo value))
+(defun %lit-bn-hi (value) (bignum-hi value))
+(defun %lit-bb-sign (value) (%bb-sign value))
+(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
+(defun %lit-bb-limb (value k) (%bb-limb value k))
+")
+(defvar *float-override-source*
+  (if (>= *i386-layer* 5) *stage2-float-override* ""))
+
+;;; The opcode table, materialised as code.  *opcode-table* is a host hash
+;;; table built by the ISA definition at load time; the image needs the same
+;;; contents, so emit a populate function and a defparameter whose init thunk
+;;; runs it at boot.
+(defvar *opcode-table-init-source*
+  (if (>= *i386-layer* 5)
+      (with-output-to-string (s)
+        (format s "(defun %populate-opcode-table ()~%")
+        (maphash (lambda (code info)
+                   (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                           code code
+                           (modus.mvm::opcode-info-name info)
+                           (modus.mvm::opcode-info-operands info)
+                           (modus.mvm::opcode-info-description info)))
+                 modus.mvm::*opcode-table*)
+        (format s "  t)~%")
+        (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%"))
+      ""))
+
 (defvar *crypto-source*
   (if (>= *i386-layer* 4)
       (concatenate 'string *crypto-glue-source* (string #\Newline)
@@ -138,6 +209,8 @@
 ;;; quote — one terminates the string early and SBCL reports the nonsense
 ;;; `defvar ... got 27 args`, which sends you hunting in the wrong file.
 ;;; The generator asserts on it.
+
+
 
 
 
@@ -604,6 +677,7 @@
       ((eql which 2) (probe-bulk))
       ((eql which 3) (probe-chain))
       ((eql which 4) (probe-argv))
+      ((eql which 5) (probe-eval))
       (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
 
@@ -614,11 +688,72 @@
 ;;; Assemble
 ;;; ============================================================
 
+
+;;; ============================================================
+;;; Layer-5 boot init + the EVAL probe
+;;; ============================================================
+;;; Baking the compiler in makes MVM-EVAL RESOLVE; it does not by itself make
+;;; EVAL work.  mvm-eval needs the runtime tables the CL bridge builds at boot
+;;; (symbols, packages, streams, reader, conditions, the symbol-function
+;;; table).  i386's kernel-main never ran any of them — layers 1-4 only ever
+;;; used compiled primitives and crypto, which need none.  This is the first
+;;; half of the reachability work; the build-GENERATED half (%init-sft-auto,
+;;; %init-sym-name-auto, init-all-globals, %install-runtime-cl-macros,
+;;; %install-runtime-backquote) does not exist for i386 yet.
+;;; Below layer 5 both definitions are stubs, so layer 4 is untouched.
+(defvar *l5-init-source*
+  (if (>= *i386-layer* 5)
+      "
+(defun %l5-boot ()
+  (init-symbol-table)
+  (init-keyword-table)
+  (%init-packages)
+  (%init-streams)
+  (%init-reader)
+  (%init-condition-types)
+  (%init-method-combinations)
+  (%init-symbol-function-table)
+  (%init-signal-handling)
+  (%init-signal-symbols)
+  0)
+
+;; Does EVAL actually evaluate?  Each step is separate so a failure localises:
+;; a bare constant needs only the interpreter, arithmetic needs the compiler's
+;; opcode emission, and the multiply exercises the promotion path through the
+;; whole compile-to-bytecode-and-interpret round trip.
+(defun probe-eval ()
+  (%l5-boot)
+  (write-char-serial 101) (write-char-serial 49) (write-char-serial 61)
+  (%pdec (eval 42)) (putnl)
+  (write-char-serial 101) (write-char-serial 50) (write-char-serial 61)
+  (%pdec (eval (list (quote +) 1 2))) (putnl)
+  (write-char-serial 101) (write-char-serial 51) (write-char-serial 61)
+  (%pdec (eval (list (quote *) 6 7))) (putnl)
+  (write-char-serial 101) (write-char-serial 52) (write-char-serial 61)
+  (%pdec (ash (eval (list (quote *) 17034 65536)) -24)) (putnl)
+  0)
+"
+      "
+(defun %l5-boot () 0)
+(defun probe-eval () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
+"))
+
 (defvar *full-source*
   (concatenate 'string
     *prelude-source* (string #\Newline)
     *gc-source* (string #\Newline)
     *rt-source* (string #\Newline)
+    ;; Layer 5, in build-generic-cli's order: ISA + interpreter first (so the
+    ;; compiler's emitted opcodes have their definitions), then the compiler,
+    ;; then the in-image float override, the materialised opcode table, and
+    ;; mvm-eval last since it ties compile and interpret together.
+    *isa-source* (string #\Newline)
+    *interp-source* (string #\Newline)
+    *compiler-source* (string #\Newline)
+    *float-override-source* (string #\Newline)
+    *opcode-table-init-source* (string #\Newline)
+    *mvm-eval-source* (string #\Newline)
+    *l5-init-source* (string #\Newline)
     *bridge-source* (string #\Newline)
     *crypto-source* (string #\Newline)
     *driver-source*))

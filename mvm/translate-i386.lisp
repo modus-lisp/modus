@@ -2609,21 +2609,29 @@
 
         ((op= +op-atom+)
          ;; (atom Vd Vs) -- opposite of consp
+         ;; VR-PRESERVING: computes in ECX, exactly like :consp above.  This
+         ;; used to compute in EAX, which IS VR on i386, so whenever the
+         ;; destination vreg was not VR it destroyed a live value.  Caught by
+         ;; the mechanized invariant checker the moment layer 5 baked
+         ;; compiler.lisp in — the first source to use ATOM with a non-VR
+         ;; destination (5 sites).  Nothing before it had, which is exactly how
+         ;; this class hides: the function size is unchanged and the wrong
+         ;; value surfaces far from the opcode that produced it.
          (let ((vd (first operands)) (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-and-reg-imm buf +i386-eax+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +i386-eax+ +tag-cons+)
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
+           (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
            (let ((true-label (i386-make-label))
                  (done-label (i386-make-label)))
              (i386-emit-jcc buf :ne true-label)
              ;; Is cons -> return NIL
-             (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
+             (i386-emit-mov-reg-abs buf +scratch0+ *vn-addr*)
              (i386-emit-jmp-rel32 buf done-label)
              ;; Not cons -> return T
              (i386-emit-label buf true-label)
-             (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
+             (i386-emit-mov-reg-imm buf +scratch0+ +i386-mvm-t+)
              (i386-emit-label buf done-label))
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-store-vreg buf vd +scratch0+)))
 
         ;; ============================================
         ;; Object Operations (32-bit, 4-byte slots)

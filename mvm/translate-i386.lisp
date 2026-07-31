@@ -339,6 +339,33 @@
    if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
    ops from the rest of i386 codegen when triaging a miscompile.")
 
+(defparameter *i386-gc-enabled* nil
+  "Whether :gc-check may CALL the collector.
+
+   DEFAULT NIL, deliberately.  The wiring works — %GC-COLLECT is reached,
+   cycles complete, and 64 KiB of SHA-256 no longer exhausts the arena — but
+   the collector is UNHARDENED on i386: gc.lisp's %gc-is-start returns T
+   unconditionally while bitmap_base is 0, so %gc-forward-slot performs NO
+   conservative-root validation and copy_object stamps forwarding pointers
+   over mid-object data.  Measured: 64 KiB produced a corrupted hash array.
+
+   Enabled, that trades an honest crash at the arena edge for a WRONG ANSWER.
+   That is the same crash-to-silent-corruption trade rejected for the 2 GB
+   arena bump, and it is not made acceptable by the corruption currently
+   being loud — `1S23451S2345` is luck, not a property.  So the collector
+   stays off until the object-start bitmap lands.
+
+   TO ENABLE: (1) run %gc-bitmap-init at boot so bitmap_base is non-zero —
+   gc.lisp's validation is ALREADY WRITTEN and merely inert; (2) emit an
+   inline start-bit set at the six i386 alloc opcodes (cons, alloc-cons,
+   alloc-obj, alloc-array, alloc-string, alloc-u8), which x86 BTS does in one
+   instruction given a granule index; (3) byte-exact clear the reclaimed
+   from-space bitmap range after each swap — point (c) of
+   reference_mcgc_validation_collector, whose omission let the bitmap
+   saturate and silently decay the check to a no-op on aarch64.
+   i386's advantage: the whole arena is under 2^30, so granule arithmetic
+   stays in fixnums and cannot trip the re-entrancy trap.")
+
 (defvar *i386-gc-collect-label* nil
   "Label of %GC-COLLECT, resolved by name in TRANSLATE-MVM-TO-I386 exactly as
    the generic-arith entries are.  NIL (no collector in the module) makes
@@ -2421,7 +2448,8 @@
          (let ((ok-label (i386-make-label)))
            (i386-emit-jcc buf :b ok-label)   ; unsigned below -> room left
            ;; GC needed
-           (let ((gc-lbl (i386-translate-state-gc-label state)))
+           (let ((gc-lbl (and *i386-gc-enabled*
+                              (i386-translate-state-gc-label state))))
              (if gc-lbl
                  (i386-emit-call-rel32 buf gc-lbl)
                  (i386-emit-int buf #x31)))  ; trap to GC handler

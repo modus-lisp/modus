@@ -5348,6 +5348,34 @@
   "True if X is a stream object."
   (and x (streamp x)))
 
+;;; WS5 #203 gap 3 — make a failing LOAD *reportable* to its caller.
+;;;
+;;; %load-from-stream reports an escaping toplevel condition and then CONTINUES
+;;; with the next form (see the ladder note below).  That is load-bearing for
+;;; the ANSI harness — a corpus file whose Nth form dies must still run forms
+;;; N+1.. — but it is wrong for a hosted CLI: SBCL's `--script' ABORTS at the
+;;; first error and exits 1, whereas Modus ran on to the end and exited 0, so
+;;; `--script' could not fail and every gap this session had to be read out of
+;;; the swallow's diagnostic line.
+;;;
+;;; Rather than change the swallow (which would rewrite harness behaviour),
+;;; record the failure and let the CALLER decide:
+;;;   *LOAD-ERROR-CONDITION*  — set to the escaping condition; callers clear it
+;;;                             before (load ...) and test it after.
+;;;   *LOAD-ABORT-ON-ERROR*   — when true, stop the form loop at the first
+;;;                             failure instead of continuing.
+;;; Both default FALSE for everyone who does not opt in — and note these are
+;;; defvars, which do NOT run their init-thunks at boot (MVM limitation 7), so
+;;; "unset" reads as NIL and the harness path is bit-for-bit what it was.
+;;; lib/cli-toplevel.lisp opts in; nothing else does.
+(defvar *load-error-condition* nil
+  "The condition that escaped a toplevel form during the last LOAD, or NIL.
+   Set by %load-from-stream; cleared by the caller before it loads.")
+(defvar *load-abort-on-error* nil
+  "When true, %load-from-stream stops at the first toplevel form that
+   signals, instead of reporting and continuing.  The hosted CLI sets it so
+   --load/--script abort like SBCL's; the ANSI harness leaves it NIL.")
+
 (defun %load-from-stream (stream verbose print)
   "Read+eval all forms from STREAM.  Returns T."
   (when verbose
@@ -5366,12 +5394,21 @@
       (let ((form (handler-case (read stream nil eof-marker)
                     (t (c)
                        (%report-escaping-condition "load-read-error-stops-load")
+                       ;; Record it too: a read error already stops the load,
+                       ;; but the caller still needs to know the load FAILED
+                       ;; (SBCL exits 1 on a malformed --script).
+                       (setq *load-error-condition* c)
                        eof-marker))))
         (when (eq form eof-marker) (return t))
         (let ((val (handler-case (eval form)
                      (t (c)
                         (%report-escaping-condition "load-toplevel-form-swallowed")
+                        (setq *load-error-condition* c)
                         nil))))
+          ;; Opt-in abort (hosted CLI).  Unset/NIL for the ANSI harness, whose
+          ;; per-file runners depend on continuing past a failed form.
+          (when (and *load-abort-on-error* *load-error-condition*)
+            (return nil))
           (when print
             (handler-case
                 (progn (write val :stream *standard-output*)

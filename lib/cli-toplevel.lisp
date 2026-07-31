@@ -155,8 +155,23 @@
         (eval form)))))
 
 (defun %cli-load-file (path)
-  "Load PATH (a Lisp source file) via the runtime LOAD (mvm-eval)."
-  (load path))
+  "Load PATH (a Lisp source file) via the runtime LOAD (mvm-eval).
+
+   WS5 #203 gap 3: Modus's LOAD reports an escaping toplevel condition and then
+   CONTINUES to the next form — right for the ANSI harness, wrong here.  SBCL
+   aborts the load at the first error and exits nonzero; before this, a broken
+   file loaded 'successfully' and `--script' always exited 0, so a failing load
+   was indistinguishable from a working one except by reading the diagnostic
+   line.  Opt into the abort (see *LOAD-ABORT-ON-ERROR* in mvm/ansi-bridge.lisp)
+   and re-signal, so the caller's handler-case does the SBCL thing: report and
+   exit 1 non-interactively.  The specific condition has already been printed
+   loudly by %report-escaping-condition at the point it escaped."
+  (setq *load-abort-on-error* t)
+  (setq *load-error-condition* nil)
+  (load path)
+  (when *load-error-condition*
+    (setq *load-error-condition* nil)
+    (error "load aborted: unhandled error in a toplevel form")))
 
 ;;; ===========================================================================
 ;;; version / help banners
@@ -228,14 +243,20 @@
   (handler-case
       (progn
         (if (or (null path) (string= path "-"))
-            ;; stdin: read+eval every form from fd 0 until EOF.
+            ;; stdin: read+eval every form from fd 0 until EOF.  Errors
+            ;; propagate to the handler-case below (this loop has no swallow),
+            ;; which is already SBCL's --script behaviour: abort, exit 1.
             (let ((in (%make-file-stream-full 0 0))
                   (eof (list 'eof)))
               (loop
                 (let ((form (read in nil eof)))
                   (when (eq form eof) (return nil))
                   (eval form))))
-            (load path))
+            ;; File: %cli-load-file turns LOAD's report-and-continue into an
+            ;; abort + re-signal (WS5 #203 gap 3), so a script whose Nth form
+            ;; dies stops there and exits nonzero instead of running on to the
+            ;; end and exiting 0.
+            (%cli-load-file path))
         (sys-exit 0))
     (t (c)
       (%cli-msg "Modus: unhandled error in --script")

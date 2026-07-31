@@ -74,9 +74,29 @@
 ;; fast it is; correctness comes first (see feedback_correctness_over_regression).
 ;;
 ;; The JIT itself is NOT disabled or deleted — only its default.  Re-enable per
-;; build with MODUS_USE_JIT=1, or per run with (setq *cli-jit-on* t).  NOTE that
-;; MODUS_NO_JIT / MODUS_USE_JIT are BUILD-time knobs baked into %cli-jit-default;
-;; there is no runtime env override, so the runtime escape hatch is the setq.
+;; build with MODUS_USE_JIT=1.  NOTE that MODUS_NO_JIT / MODUS_USE_JIT are
+;; BUILD-time knobs baked into %cli-jit-default; there is no runtime env
+;; override.
+;;
+;; THE RUNTIME KNOB WORKS IN BOTH DIRECTIONS — but it prints a scary warning.
+;; `--eval '(setq *cli-jit-on* t)'` emits
+;;   WARN: implicit global setq *CLI-JIT-ON*
+;; which reads like the assignment was lost to a fresh implicit global.  It is
+;; NOT: measured on this image, `--eval` reads back `before=NIL` / `after=T`,
+;; and — the behavioural proof, since a value readback alone could be a second
+;; cell — the JIT's own double-execution signature APPEARS after the setq (the
+;; two-form file `(defun g1 …)` + `(princ "A=") (princ (g1 41))` goes from
+;; "A=42" to "A=A=42").  So the compiled image's *cli-jit-on* and the name
+;; SETQ'd from --eval are the SAME cell; the WARN only records that the form
+;; being compiled at runtime had no defvar in scope.  Symmetrically,
+;; `(setq *cli-jit-on* nil)` disables it on a JIT-on build ("A=A=42" -> "A=42").
+;;
+;; What genuinely does NOT work is READING an internal that no baked defvar
+;; exports to the runtime namespace: `--eval '(princ *jit-native-count*)'`
+;; signals UNBOUND-VARIABLE even while the JIT is running and counting.  So use
+;; a BEHAVIOURAL probe (the doubling above), not a counter readback, to confirm
+;; which mode you are in.  For a durable JIT-on image, rebuild with
+;; MODUS_USE_JIT=1.
 ;; Re-flip the default only after the re-execution cluster above is fixed AND a
 ;; probe covers define-in-one-form / use-in-a-later-form with side effects.
 (defvar *cli-jit-default-source*

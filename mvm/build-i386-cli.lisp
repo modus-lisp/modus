@@ -140,6 +140,9 @@
 ;;; The generator asserts on it.
 
 
+
+
+
 (defun sys-exit (code)
   (let ((c code))
     (syscall3 1 c 0 0)))
@@ -550,12 +553,52 @@
   0)
 
 
+;; probe-argv: the ARCH-SPECIFIC half of lib/cli-toplevel.lisp, proven on i386
+;; without needing the rest of it.  cli-toplevel walks the LIVE initial process
+;; stack for the full argv/envp; only three of its functions are arch-specific,
+;; and all three differ for exactly two reasons: pointers are 4 bytes, not 8,
+;; and i386 RELOCATES its stack at boot (the kernel's sits near 0x40800000,
+;; above the 2^30 fixnum ceiling), so %gc-stack-base is NOT the initial SP.
+;; The boot stub therefore saves the initial ESP to 0x10000290, and these are
+;; the i386 forms of %cli-argv-base / %cli-collect-argv / %cli-getenv.
+;;
+;; mem-ref :u64 is RAW, so a loaded pointer reads back as raw/2 — double it to
+;; get the real byte address.  Same convention cli-toplevel documents.
+(defun %i386-argv-base ()
+  (+ (* 2 (mem-ref 268436112 :u64)) 4))
+
+(defun %i386-argv-ptr (i)
+  (* 2 (mem-ref (+ (%i386-argv-base) (* 4 i)) :u64)))
+
+(defun %pcstr (addr)
+  (let ((i 0))
+    (loop
+      (let ((b (mem-ref (+ addr i) :u8)))
+        (when (eql b 0) (return nil))
+        (write-char-serial b)
+        (setq i (+ i 1))))))
+
+(defun probe-argv ()
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 99) (write-char-serial 61) (%pdec (mem-ref 268435968 :u32)) (putnl)
+  (let ((argc (mem-ref 268435968 :u32)) (i 0))
+    (loop
+      (when (>= i argc) (return nil))
+      (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 118) (write-char-serial 91) (%pdec i) (write-char-serial 61)
+      (%pcstr (%i386-argv-ptr i)) (putnl)
+      (setq i (+ i 1)))
+    ;; envp follows argv's NULL terminator; print the first entry as proof the
+    ;; environment vector is reachable too (cli-toplevel needs HOME for ~/.modusrc)
+    (let ((envp (+ (%i386-argv-base) (* 4 (+ argc 1)))))
+      (write-char-serial 101) (write-char-serial 110) (write-char-serial 118) (write-char-serial 112) (write-char-serial 91) (write-char-serial 48) (write-char-serial 93) (write-char-serial 61) (%pcstr (* 2 (mem-ref envp :u64))) (putnl)))
+  0)
+
 (defun kernel-main ()
   (let ((which (%argv1)))
     (cond
       ((eql which 1) (probe-gcmeta))
       ((eql which 2) (probe-bulk))
       ((eql which 3) (probe-chain))
+      ((eql which 4) (probe-argv))
       (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
 

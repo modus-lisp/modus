@@ -17,6 +17,7 @@
 #   ./scripts/run-i386.sh gc             dump heap / collector state
 #   ./scripts/run-i386.sh bulk 64        SHA-256 over 64 KiB; prints digest + collections
 #   ./scripts/run-i386.sh chain 10       cons-chain survival over 1000 conses
+#   ./scripts/run-i386.sh argv A B       echo argc/argv/envp off the initial stack
 #   ./scripts/run-i386.sh probe N [ARG]  run probe N directly
 #   ./scripts/run-i386.sh exec ARGS...   run the image with arbitrary arguments
 #
@@ -59,6 +60,7 @@ case "$cmd" in
   gc)    run_image 1 ;;
   bulk)  run_image 2 "${1:?usage: $0 bulk <KiB>}" ;;
   chain) run_image 3 "${1:?usage: $0 chain <hundreds-of-conses>}" ;;
+  argv)  run_image 4 "$@" ;;
   probe) run_image "${1:?usage: $0 probe <n> [arg]}" "${2:-}" ;;
   exec)  run_image "$@" ;;
   help|-h|--help)

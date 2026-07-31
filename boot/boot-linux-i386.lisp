@@ -271,6 +271,18 @@
 
   (i386l-bytes buf #x83 #xC4 #x08)              ; add esp, 8  (drop saved argv ptrs)
 
+  ;; [0x10000290] = the INITIAL process ESP, saved RAW, before the relocation
+  ;; below replaces it.  lib/cli-toplevel.lisp walks the live initial stack to
+  ;; read the FULL argv and envp (not just the argv[1]/argv[2] copies above),
+  ;; and derives its base from the initial stack pointer.  On x64 and aarch64
+  ;; that pointer IS %gc-stack-base, because those ports keep the kernel's
+  ;; stack.  i386 relocates (the kernel's stack sits near 0x40800000, above the
+  ;; 2^30 fixnum ceiling), so stack_base is our NEW stack and would point at a
+  ;; page that never held argv.  Hence a slot of its own.  The pages of the
+  ;; original stack stay mapped for the life of the process, so walking them
+  ;; later is safe.
+  (i386l-mov-abs-reg buf #x10000290 4)          ; mov [0x10000290], esp
+
   ;; --- Relocate the stack below 2^30 -------------------------------------
   ;; Must come AFTER the argv staging above, which reads the kernel-supplied
   ;; stack and copies argv[1]/argv[2] into fixed BSS.  Nothing else depends on

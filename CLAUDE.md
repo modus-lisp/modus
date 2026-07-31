@@ -302,6 +302,7 @@ compiled to native i386. Everything goes through one script:
 ./scripts/run-i386.sh gc             # heap / collector state
 ./scripts/run-i386.sh bulk 64        # SHA-256 over 64 KiB: digest + collections
 ./scripts/run-i386.sh chain 10       # cons-chain survival across collections
+./scripts/run-i386.sh argv A B       # argc/argv/envp off the initial stack
 ./scripts/run-i386.sh exec ARGS...   # arbitrary invocation
 ```
 
@@ -328,6 +329,23 @@ i386 has a **native Cheney collector** (`i386-emit-gc-trampoline` in
 `translate-i386.lisp`), the third arch arm after x64 and aarch64, on by default.
 It is gated on `*i386-linux-mode*`: bare-metal i386 has no GC metadata or
 bitmaps and keeps `int $0x31`.
+
+**Hosted toplevel (`lib/cli-toplevel.lisp`) is NOT yet wired on i386**, and the
+blocker is a prerequisite rather than wiring. Its `--eval`/`--load`/REPL all go
+through `eval` → `mvm-eval` → the self-hosted compiler + `mvm-interpret`; the
+i386 image contains `EVAL`/`LOAD`/`READ` but **not** `MVM-EVAL`,
+`COMPILE-SOURCE-TO-MODULE` or `MVM-INTERPRET` (verified in the symmap), because
+layer 4 stops at crypto. Wiring the toplevel therefore needs a layer 5 that
+compiles `mvm.lisp` + `interp.lisp` + `compiler.lisp` + `mvm-eval.lisp` into
+the 32-bit image — the self-host-on-32-bit workstream.
+
+The *arch-specific* half is already done and proven: only three functions in
+cli-toplevel are arch-dependent (`%cli-argv-base`, `%cli-collect-argv`,
+`%cli-getenv`), all for two reasons — pointers are 4 bytes not 8, and i386
+relocates its stack at boot so `%gc-stack-base` is not the initial SP. The boot
+stub now saves the initial ESP at `0x10000290`, and `run-i386.sh argv` walks the
+live initial stack to print the full argv (including `argv[0]`, which the
+argv[1]/argv[2] BSS copies never had) plus envp.
 
 ### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
 

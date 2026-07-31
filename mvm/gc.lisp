@@ -105,9 +105,33 @@
 ;;; mem-ref does SHR 1 internally to get the real address.
 
 (defun %gc-read64 (raw-addr)
-  "Read a 64-bit word from byte address RAW-ADDR.
-   RAW-ADDR is a Lisp integer representing the byte address.
-   mem-ref handles the fixnum tagging internally."
+  "Read one machine word from byte address RAW-ADDR.
+
+   *** MEASURED DEFECT (WS5/i386, 2026-07-31) — READ THIS BEFORE TRUSTING ANY
+   *** VALUE THIS FUNCTION RETURNS.
+   :u64 is RAW: memory-width-code returns needs-tag NIL for it, so the loaded
+   machine word is placed in the vreg UNTAGGED and every subsequent Lisp
+   operation reinterprets it as a TAGGED value.  The integer this function
+   yields is therefore word/2, not word.  Two consequences, both measured on
+   i386 (the first target to actually run this Lisp-side collector; x64 and
+   aarch64 use native trampolines instead):
+
+     - A cons/object pointer word has low nibble 1 or 9 and is therefore ODD,
+       so FIXNUMP is false for it.  %gc-is-pointer and %gc-is-forward both
+       guard on (fixnump val) and so return NIL for every real heap pointer:
+       nothing is ever forwarded.  Planted-word probe: 0x20000001 and
+       0x20000009 both report is-pointer = NIL.  Meanwhile an ordinary FIXNUM
+       whose value is 1 or 9 mod 16 IS accepted as a pointer — the only
+       candidates that get through are non-pointers.
+     - Header decoding is off by the same factor: for a header with true
+       count 5 and subtag #x32, (ash header -8) yields 2 and
+       (logand header #xFF) yields #x99.  ((ash header -7) happens to give the
+       true count, which is the tell.)
+
+   Nothing here is i386-specific; i386 merely exercised it.  A correct fix
+   gives this layer exact machine-word access (byte/halfword loads, composed
+   width- and endian-neutrally) or replaces the Lisp collector with a native
+   trampoline.  See mvm/build-i386-cli.lisp's collector-flag comment."
   (mem-ref raw-addr :u64))
 
 (defun %gc-write64 (raw-addr val)
@@ -372,7 +396,15 @@
 (defun %gc-scan-stack (rsp-val stack-base from-start from-size free-ptr)
   "Scan the stack for root pointers. The stack grows downward,
    so RSP is the lowest address and STACK-BASE is the highest.
-   Each 8-byte word on the stack is checked as a potential tagged value."
+   Each 8-byte word on the stack is checked as a potential tagged value.
+
+   WIDTH BUG (measured, WS5/i386): the +8 step is the 64-bit word size baked
+   in.  On a 32-bit target the stack is 4-byte-word granular, so this examines
+   only every OTHER word and half the roots are never even looked at.  The
+   same 64-bit shape is baked into %gc-copy-object (cdr at +8, size
+   (count+2)*8) and %gc-scan-copied (slots at +16+i*8); on i386 the cdr is at
+   +4, the size is align16((count+1)*4) and slot i is at +4+i*4.  Both need to
+   come from the target word size, not from a literal."
   (let ((addr rsp-val)
         (fp free-ptr))
     (loop

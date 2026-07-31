@@ -378,9 +378,21 @@
    stays in fixnums and cannot trip the re-entrancy trap.")
 
 (defvar *i386-gc-collect-label* nil
-  "Label of %GC-COLLECT, resolved by name in TRANSLATE-MVM-TO-I386 exactly as
-   the generic-arith entries are.  NIL (no collector in the module) makes
-   :gc-check fall back to its historical `int $0x31`.")
+  "Label :gc-check CALLs.  This is the GC TRAMPOLINE (below), not %GC-COLLECT
+   itself.  NIL (no collector in the module) makes :gc-check fall back to its
+   historical `int $0x31`.")
+(defvar *i386-gc-collect-fn-label* nil
+  "Label of the Lisp-side %GC-COLLECT, resolved by name in
+   TRANSLATE-MVM-TO-I386 exactly as the generic-arith entries are.  The
+   trampoline CALLs this; :gc-check must never call it directly (see
+   I386-EMIT-GC-TRAMPOLINE for why).")
+
+;;; Cheney GC metadata slots that the trampoline and gc.lisp SHARE.  gc.lisp
+;;; hardcodes the same addresses (see its header comment); they are named here
+;;; so the two halves of the protocol are greppable together.
+(defconstant +i386-gc-saved-sp+  #x10000068)
+(defconstant +i386-gc-saved-va+  #x10000070)
+(defconstant +i386-gc-saved-vl+  #x10000078)
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)
@@ -1120,6 +1132,71 @@
 ;;; ============================================================
 ;;; Prologue / Epilogue
 ;;; ============================================================
+
+(defun i386-emit-gc-trampoline (buf tramp-label collect-label)
+  "The GC TRAMPOLINE — the half of the collector protocol i386 was missing.
+
+   MEASURED FAILURE IT FIXES (WS5, 2026-07-31).  :gc-check used to emit a bare
+   `call %GC-COLLECT`.  A bare call implements NEITHER side of the protocol
+   that mvm/gc.lisp documents and that the x64 / aarch64 trampolines provide:
+
+     (1) %GC-COLLECT reads the mutator's stack pointer from 0x10000068.
+         Nothing wrote it, so it read 0 (demand-zeroed BSS); %gc-collect's own
+         sanity check then fired ('S' on stdout) and set saved-rsp = stack_base,
+         which makes the scan range [stack_base, stack_base) — EMPTY.  Every
+         root reachable only from the stack — i.e. essentially every live local
+         — was invisible to the collector.  Measured: 12970 of 12970 collections
+         printed 'S', and the instrumented stack-word counter stayed at 0.
+
+     (2) %GC-COLLECT publishes the post-collection alloc pointer and limit by
+         writing 0x10000070 / 0x10000078 (%gc-set-r12 / %gc-set-r14).  On x64
+         and aarch64 the trampoline pops them back into R12/R14.  On i386 VA/VL
+         are memory slots and NOTHING read those words back, so VA stayed at or
+         above VL after a collection — and the very next allocation's :gc-check
+         collected again.  Measured: a 16 KiB SHA-256 (which needs at most two
+         collections) performed 12970 and was still going when killed.
+
+     (3) A bare call also clobbers the caller's live registers.  EAX *is* VR on
+         i386 and :gc-check's own comment notes it may hold a live value.
+
+   The fix is the standard shape (mirrors emit-aarch64-native-gc-trampoline):
+   PUSHAD first so every mutator register becomes a scannable stack word, THEN
+   record ESP — pointing AT the register-save frame, never past it.  Recording
+   the pointer above the save area is the aarch64 fc25505 bug: the saved
+   registers are roots, and skipping them hands a stale pre-GC pointer back at
+   restore time.
+
+   Metadata is stored SHIFTED LEFT ONE.  gc.lisp reads these slots with
+   (mem-ref addr :u64), and :u64 is RAW (memory-width-code -> needs-tag NIL),
+   so the raw word IS the tagged Lisp value and memory must hold address<<1 for
+   the Lisp value to be the address.  Same convention as boot-linux-i386's
+   metadata init and aarch64's LSL/ASR dance."
+  (i386-emit-label buf tramp-label)
+  ;; --- save every mutator register; ESP then points at the frame ---
+  (i386-emit-byte buf #x60)                                  ; PUSHAD
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-esp+)
+  (i386-emit-add-reg-reg buf +scratch0+ +scratch0+)          ; ESP << 1
+  (i386-emit-mov-abs-reg buf +i386-gc-saved-sp+ +scratch0+)
+  ;; --- publish VA / VL for the collector ---
+  (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
+  (i386-emit-add-reg-reg buf +scratch0+ +scratch0+)
+  (i386-emit-mov-abs-reg buf +i386-gc-saved-va+ +scratch0+)
+  (i386-emit-mov-reg-abs buf +scratch0+ *vl-addr*)
+  (i386-emit-add-reg-reg buf +scratch0+ +scratch0+)
+  (i386-emit-mov-abs-reg buf +i386-gc-saved-vl+ +scratch0+)
+  ;; --- nargs = 0 for the call (parity with the standard call sequence) ---
+  (i386-emit-mov-reg-imm buf +scratch0+ 0)
+  (i386-emit-mov-abs-reg buf *nargs-addr* +scratch0+)
+  (i386-emit-call-rel32 buf collect-label)
+  ;; --- install the collector's new alloc pointer and limit ---
+  (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-saved-va+)
+  (i386-emit-shr-reg-imm buf +scratch0+ 1)
+  (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+  (i386-emit-mov-reg-abs buf +scratch0+ +i386-gc-saved-vl+)
+  (i386-emit-shr-reg-imm buf +scratch0+ 1)
+  (i386-emit-mov-abs-reg buf *vl-addr* +scratch0+)
+  (i386-emit-byte buf #x61)                                  ; POPAD
+  (i386-emit-ret buf))
 
 (defun i386-emit-prologue (buf)
   "Emit i386 function prologue.
@@ -3049,10 +3126,18 @@
     ;; i386 previously had no collector at all and simply ran off the arena).
     ;; This is the Lisp-side %GC-COLLECT from mvm/gc.lisp, not a native
     ;; trampoline: i386 needs to stop exhausting the arena, not to be fast.
-    (setf *i386-gc-collect-label*
+    ;; :gc-check calls the TRAMPOLINE, which brackets %GC-COLLECT with the
+    ;; register save + metadata publish/reload the protocol requires — a bare
+    ;; call implements neither half.  See I386-EMIT-GC-TRAMPOLINE.
+    (setf *i386-gc-collect-fn-label*
           (loop for entry in function-table
                 when (string-equal (first entry) "%GC-COLLECT")
                   return (gethash (second entry) fn-offset-to-label)))
+    ;; Only mint the trampoline label when the collector is actually enabled —
+    ;; a GC-off i386 image then emits byte-identical code to before the
+    ;; trampoline existed (verified against a pre-change build).
+    (setf *i386-gc-collect-label*
+          (and *i386-gc-enabled* *i386-gc-collect-fn-label* (i386-make-label)))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -3098,6 +3183,14 @@
                                    (new-pos (cddr decoded)))
                               (i386-translate-insn state opcode operands new-pos)
                               (setf pos new-pos)))))))
+    ;; The GC trampoline, emitted once after the last function.
+    (when (and *i386-gc-collect-label* *i386-gc-collect-fn-label*)
+      (when *i386-fn-align*
+        (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
+                                *i386-fn-align*))
+              do (i386-emit-nop buf)))
+      (i386-emit-gc-trampoline buf *i386-gc-collect-label*
+                               *i386-gc-collect-fn-label*))
     ;; Resolve all label fixups
     (i386-fixup-labels buf)
     ;; Resolve fn-map: replace label IDs with actual native byte positions

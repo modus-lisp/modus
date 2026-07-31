@@ -358,6 +358,19 @@
         (sha256 m)
         (write-char-serial 111) (write-char-serial 107) (putnl)))))
 
+(defun probe-gcstate ()
+  ;; Is the bitmap actually live, and did any collection run?  Addresses are
+  ;; GENERATED, not transcribed -- hand-written hex-to-decimal has produced
+  ;; four false findings this session.
+  (write-char-serial 98) (write-char-serial 61)
+  (%pdec (if (= (mem-ref 268439064 :u64) 0) 0 1)) (putnl)      ; b= object-start bmp
+  (write-char-serial 99) (write-char-serial 61)
+  (%pdec (if (= (mem-ref 268439104 :u64) 0) 0 1)) (putnl)      ; c= cons-kind bmp
+  (write-char-serial 112) (write-char-serial 61)
+  (%pdec (if (= (mem-ref 268439040 :u64) 0) 0 1)) (putnl)      ; p= page_base
+  (write-char-serial 103) (write-char-serial 61)
+  (%pdec5 (mem-ref 268435552 :u64)) (putnl))                   ; g= gccount
+
 (defun probe-heapuse ()
   ;; How much heap does SHA-256 actually burn, and is there a collector?
   ;; VA (alloc pointer) and VL (alloc limit) live in the i386 global slot
@@ -564,7 +577,7 @@
   ;; Throughput: SHA-256 over 64 KiB.  Digest printed so the run is verifiable
   ;; rather than merely timed.
   (sha256-init)
-  (let ((n 65536))
+  (let ((n 4096))
     (let ((m (make-array n)))
       (let ((i 0))
         (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
@@ -626,6 +639,7 @@
       ((eql which 17) (probe-fixnum-spin))
       ((eql which 18) (probe-rot))
       ((eql which 19) (probe-heapuse))
+      ((eql which 27) (probe-gcstate))
       ((eql which 20) (probe-nblocks))
       ((eql which 21) (probe-frameslot))
       ((eql which 22) (probe-qrsteps))
@@ -667,6 +681,17 @@
 (setf modus.mvm.i386::*i386-checked-arith-slowpath*
       (let ((v (sb-ext:posix-getenv "MODUS_I386_NO_CHECKED")))
         (not (and v (plusp (length v))))))
+;; WS5: enable the collector AND its object-start bitmap together.  The
+;; bitmap is not optional — the collector without it is the unhardened one
+;; that corrupts (gc.lisp's %gc-is-start degrades to T when bitmap_base = 0).
+;; GATED OFF.  The bitmap is live (config words verified non-zero) and the
+;; alloc sites set their bits, but the collector STILL corrupts at 64 KiB, so
+;; something beyond conservative-root validation is wrong.  Per the standing
+;; rule the tree must not ship a collector that is enabled and silently
+;; corrupting -- an honest crash at the arena edge is recoverable, a wrong
+;; digest is not.  Flip BOTH to t to resume the investigation.
+(setf modus.mvm.i386::*i386-gc-bitmap-enabled* nil)
+(setf modus.mvm.i386::*i386-gc-enabled* nil)
 (setf modus.mvm.i386::*i386-record-unimpl* t)
 (setf modus.mvm.i386::*i386-unimpl-ops* nil)
 

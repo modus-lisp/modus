@@ -171,6 +171,9 @@
 (defparameter *nargs-addr*   #x60C)  ; nargs convention slot (raw, untagged)
 (defparameter *cenv-addr*    #x610)  ; closure-env "register" (x64: R13)
 (defparameter *mvcount-addr* #x614)  ; multiple-values count (tagged)
+(defparameter *gc-page-base-addr* #x618)  ; raw from_start, for the bit-set
+(defparameter *gc-startbmp-addr*  #x61C)  ; raw object-start bitmap base
+(defparameter *gc-consbmp-addr*   #x620)  ; raw cons-kind bitmap base
 
 (defun i386-set-globals-base (base)
   "Relocate the i386 absolute-address global slot block to BASE.
@@ -182,7 +185,10 @@
         *vn-addr*      (+ base #x08)
         *nargs-addr*   (+ base #x0C)
         *cenv-addr*    (+ base #x10)
-        *mvcount-addr* (+ base #x14))
+        *mvcount-addr*     (+ base #x14)
+        *gc-page-base-addr* (+ base #x18)
+        *gc-startbmp-addr*  (+ base #x1C)
+        *gc-consbmp-addr*   (+ base #x20))
   base)
 
 (defconstant +spill-base+   -28)   ; First general spill slot
@@ -338,6 +344,11 @@
   "When NIL, :add/:sub/:mul-checked degrade to plain WRAPPING arithmetic even
    if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
    ops from the rest of i386 codegen when triaging a miscompile.")
+
+(defparameter *i386-gc-bitmap-enabled* nil
+  "Emit the object-start / cons-kind bit-set at every allocation site.
+   Must be ON whenever *i386-gc-enabled* is: the collector without the bitmap
+   is the unhardened collector that corrupts.")
 
 (defparameter *i386-gc-enabled* nil
   "Whether :gc-check may CALL the collector.
@@ -591,6 +602,41 @@
   "When true, a violation ERRORs instead of being recorded.")
 (defvar *i386-cur-opname* nil "Opcode being translated, or NIL outside translation.")
 (defvar *i386-cur-dest-is-vr* nil "Does the current opcode's destination vreg = VR?")
+
+(defun i386-emit-gc-mark-start (buf base-reg &optional cons-p)
+  "Set BASE-REG's object-start bit (and, when CONS-P, its cons-kind bit).
+
+   This is what makes gc.lisp's conservative-root validation actually work on
+   i386: %gc-is-start returns T unconditionally while bitmap_base is 0, so
+   without these bits every false root is copied and copy_object stamps
+   forwarding pointers over mid-object data.
+
+   x86 BTS with a REGISTER bit offset does the whole bit-string address
+   calculation in one instruction, so the sequence is just: granule index =
+   (base - page_base) >> 4, then BTS [bitmap], index.
+
+   VR-PRESERVING by construction (see the register invariant): computes in the
+   ECX/EDX scratch pair, saved around the sequence so the caller's operands
+   survive, and never touches EAX.  The build-time checker enforces this."
+  (when *i386-gc-bitmap-enabled*
+    (i386-emit-push-reg buf +scratch0+)
+    (i386-emit-push-reg buf +scratch1+)
+    ;; ECX = granule index = (base - page_base) >> 4
+    (i386-emit-mov-reg-reg buf +scratch0+ base-reg)
+    (i386-emit-byte buf #x2B)                                  ; SUB r32, r/m32
+    (i386-emit-byte buf (i386-modrm #b00 +scratch0+ 5))
+    (i386-emit-u32 buf *gc-page-base-addr*)
+    (i386-emit-shr-reg-imm buf +scratch0+ 4)
+    ;; EDX = bitmap base ; BTS [EDX], ECX
+    (i386-emit-mov-reg-abs buf +scratch1+ *gc-startbmp-addr*)
+    (i386-emit-byte buf #x0F) (i386-emit-byte buf #xAB)        ; BTS r/m32, r32
+    (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+))
+    (when cons-p
+      (i386-emit-mov-reg-abs buf +scratch1+ *gc-consbmp-addr*)
+      (i386-emit-byte buf #x0F) (i386-emit-byte buf #xAB)
+      (i386-emit-byte buf (i386-modrm #b00 +scratch0+ +scratch1+)))
+    (i386-emit-pop-reg buf +scratch1+)
+    (i386-emit-pop-reg buf +scratch0+)))
 
 (defun i386-check-eax-write (reg)
   "Signal if REG is EAX and the current opcode may not write it."
@@ -2124,6 +2170,7 @@
            (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)
            (i386-emit-pop-reg buf +scratch0+)              ; cdr back
            (i386-emit-mov-mem-reg buf +scratch1+ 4 +scratch0+)
+           (i386-emit-gc-mark-start buf +scratch1+ t)   ; object-start + cons-kind
            (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
            (i386-emit-add-reg-imm buf +scratch1+ 16)
@@ -2200,6 +2247,7 @@
            (let ((total (logand (+ (* (1+ count) 4) 15) (lognot 15))))
              (i386-emit-add-reg-imm buf +scratch0+ total))
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
@@ -2226,6 +2274,7 @@
            (i386-emit-and-reg-imm buf +scratch0+ -16)
            (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
@@ -2432,6 +2481,7 @@
          ;; (alloc-cons Vd) -- bump-allocate cons cell, tag as cons
          (let ((vd (first operands)))
            (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)
+           (i386-emit-gc-mark-start buf +scratch1+ t)   ; object-start + cons-kind
            (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
            (i386-emit-add-reg-imm buf +scratch1+ 16)
@@ -2705,6 +2755,7 @@
            (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
            ;; VR-PRESERVING: tag the base in EDX in place (never EAX).
+           (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 
@@ -2730,6 +2781,7 @@
            (i386-emit-add-reg-reg buf +scratch0+ +scratch1+); ECX = new VA
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
            ;; VR-PRESERVING: tag the base in EDX in place (never EAX).
+           (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
            (i386-store-vreg buf vd +scratch1+)))
 

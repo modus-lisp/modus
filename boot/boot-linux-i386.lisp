@@ -66,6 +66,12 @@
    targets — we relocate the stack somewhere that satisfies it.  This is
    i386-local by construction: x64 and aarch64 are untouched.")
 (defconstant +linux-i386-stack-size+ #x800000)   ; 8 MB
+(defconstant +linux-i386-bitmap-size+ #x800000
+  "8 MB per bitmap = 1 bit / 16-byte granule over a 1 GB span; the arena is
+   512 MB so 4 MB is used.  TWO bitmaps: object-start (conservative-root
+   validation) and cons-kind (so %gc-scan-copied walks to-space by TYPE rather
+   than forwarding every word — the latter mis-forwards bignum limbs, and
+   SHA-256 on a 30-bit tower allocates almost nothing but bignums).")
 (defconstant +linux-i386-heap-alloc-start+ #x200
   "Offset from heap base to the first allocatable byte.  The low 512 bytes
    mirror argc/argv the way the 64-bit ports do.")
@@ -347,6 +353,48 @@
   (i386l-mov-abs-reg buf #x10000058 1)
   ;; [0x10000060] gc_count = 0
   (i386l-mov-abs-imm buf #x10000060 0)
+
+  ;; --- Object-start + cons-kind bitmaps ---------------------------------
+  ;; gc.lisp's %gc-bitmap-init cannot be used on i386: it allocates via
+  ;; %mmap-exec-page (trap #x0531), which is unimplemented here and would hit
+  ;; the loud-trap reporter.  So the boot stub reserves them directly.
+  ;; page_base = from_start (the lowest object address, before any collection).
+  ;; Each config word at 0x10000E.. is stored <<1 because gc.lisp reads them
+  ;; with (mem-ref :u64), which is RAW; the RAW copies in the i386 global slot
+  ;; block are what the TRANSLATOR's inline bit-set uses.
+  ;; EAX still holds the heap base here; the two mmaps below clobber it, so
+  ;; every EAX-dependent store above must already have happened.
+  (i386l-bytes buf #x89 #xC1)                         ; mov ecx, eax
+  (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-heap-alloc-start+)
+  (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x18) 1)   ; raw page_base
+  (i386l-bytes buf #x01 #xC9)                         ; <<1
+  (i386l-mov-abs-reg buf #x10000E00 1)                ; gc.lisp page_base
+
+  ;; object-start bitmap
+  (i386l-mov-reg-imm buf 3 0)                         ; addr = NULL (any)
+  (i386l-mov-reg-imm buf 1 +linux-i386-bitmap-size+)
+  (i386l-mov-reg-imm buf 2 3)                         ; PROT_READ|WRITE
+  (i386l-mov-reg-imm buf 6 #x22)                      ; PRIVATE|ANON
+  (i386l-mov-reg-imm buf 7 #xFFFFFFFF)
+  (i386l-bytes buf #x55) (i386l-bytes buf #x31 #xED)
+  (i386l-mov-reg-imm buf 0 192) (i386l-bytes buf #xCD #x80)
+  (i386l-bytes buf #x5D)
+  (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x1C) 0)   ; raw, for codegen
+  (i386l-bytes buf #x01 #xC0)                         ; add eax, eax  (<<1)
+  (i386l-mov-abs-reg buf #x10000E18 0)                ; gc.lisp bitmap_base
+
+  ;; cons-kind bitmap
+  (i386l-mov-reg-imm buf 3 0)
+  (i386l-mov-reg-imm buf 1 +linux-i386-bitmap-size+)
+  (i386l-mov-reg-imm buf 2 3)
+  (i386l-mov-reg-imm buf 6 #x22)
+  (i386l-mov-reg-imm buf 7 #xFFFFFFFF)
+  (i386l-bytes buf #x55) (i386l-bytes buf #x31 #xED)
+  (i386l-mov-reg-imm buf 0 192) (i386l-bytes buf #xCD #x80)
+  (i386l-bytes buf #x5D)
+  (i386l-mov-abs-reg buf (+ +linux-i386-globals+ #x20) 0)   ; raw, for codegen
+  (i386l-bytes buf #x01 #xC0)                         ; <<1
+  (i386l-mov-abs-reg buf #x10000E40 0)                ; gc.lisp cons bitmap
 
   ;; --- frame pointer ---
   (i386l-bytes buf #x89 #xE5)                         ; mov ebp, esp

@@ -768,6 +768,16 @@
   (setf (mem-ref #x100001C0 :u64) 0)
   (setf (mem-ref #x100001C8 :u64) 0)
   (setf (mem-ref #x10000400 :u64) 0)
+  ;; WS4-AA64 #160: object-start + cons-kind bitmap config words.  Zero them,
+  ;; then reserve the bitmaps BEFORE any allocation (init-symbol-table below is
+  ;; the first allocator) so every mutator alloc records its start/kind bits.
+  ;; %gc-bitmap-init is non-allocating; the boot already published from_start at
+  ;; 0x10000040 (read as page_base).  GC-on gate only (native MCGC enabled at
+  ;; the tail); with GC off these slots are harmlessly zeroed and unused.
+  (setf (mem-ref #x10000E00 :u64) 0)
+  (setf (mem-ref #x10000E18 :u64) 0)
+  (setf (mem-ref #x10000E40 :u64) 0)   ; #160 bug#4: cons-kind bitmap base
+  (%gc-bitmap-init)
 
   ;; Initialize runtime
   (init-symbol-table)
@@ -1415,12 +1425,32 @@
 ;; measures absolute buffer position including the boot preamble).
 (setf *aarch64-fn-align-offset* 120)
 
-;; GC stays OFF on Linux/AArch64 for now — x25 (VL, the alloc limit) is
-;; set to the full heap end so the GC trampoline never fires.  896 MB
-;; heap; per-file forks keep each file's allocations transient.  (The
-;; x64 sibling runs the validation Cheney collector; porting that to
-;; the aarch64 translator is a separate workstream.)
-(setf *linux-aarch64-r25-offset* +linux-aarch64-heap-size+)
+;; WS4-AA64 #160: GC ON — NATIVE Cheney MCGC (the same collector the CLI ships).
+;; Five knobs, identical to build-aarch64-cli.lisp:
+;;   (a) *linux-aarch64-gc-metadata-shl* t — store GC metadata <<1.
+;;   (b) *linux-aarch64-gc-midpoint*      — semispace boundary (128MB default,
+;;       MODUS_GC_MIDPOINT hex override) so collections fire on heavy files.
+;;   (c) *linux-aarch64-r25-offset* = midpoint — x25 (alloc limit) = from-space
+;;       end, so the gc-check trampoline fires instead of running off-space.
+;;   (d) *aarch64-gc-bitmap-enabled* t — object-start + cons-kind bit at each
+;;       alloc so scan_word rejects false roots / mis-typed cons candidates.
+;;   (e) *aarch64-gc-native-mcgc* t — native alloc-free trampoline + the
+;;       reserved-x28 long-range gc-check (BL's +/-128MB reach can't hit a tail
+;;       trampoline across the ~200MB baked corpus; boot loads x28 = tramp VA).
+(setf *linux-aarch64-gc-metadata-shl* t)
+(setf *linux-aarch64-gc-midpoint*
+      (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_GC_MIDPOINT")))
+        (if (and v (> (length v) 0)) (parse-integer v :radix 16) #x08000000)))
+(setf *linux-aarch64-r25-offset* *linux-aarch64-gc-midpoint*)
+(setf *aarch64-gc-bitmap-enabled* t)
+(setf *aarch64-gc-native-mcgc* t)
+;; LONG-RANGE: the GC-on corpus (~200MB) exceeds BL's +/-128MB reach, so
+;; in-module calls emit an absolute MOVZ/MOVK x16,VA; BLR x16 (unlimited reach)
+;; instead of `BL label`.  Gate-only; OFF everywhere else → CLI/bare-metal/x64
+;; byte-identical.  Removes the branch horizon with no veneer islands / fixpoint.
+(setf *aarch64-force-absolute-inmodule-calls* t)
+(format t "~%  AArch64 GATE GC: ON (NATIVE MCGC)  midpoint=#x~X  metadata-shl=t  bitmap=t  abs-calls=t~%"
+        *linux-aarch64-gc-midpoint*)
 
 ;; Bare-metal handler-stack helpers are AArch64-specific and only fire
 ;; in the unified-buffer fork-file flow.  Linux/AArch64 inherits the

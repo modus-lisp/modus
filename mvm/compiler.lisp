@@ -1131,12 +1131,12 @@
   (logand value +fixnum-max+))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
-  (ash value -62))   ; PHASE-3 TODO: +neg-limb-bits+
+  (ash value +neg-limb-bits+))
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
-          (setf mag (ash mag -62)) (incf n))))   ; PHASE-3 TODO: count -> +neg-limb-bits+
+          (setf mag (ash mag +neg-limb-bits+)) (incf n))))
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
@@ -1149,6 +1149,34 @@
     ((symbolp sym) (compute-name-hash (symbol-name sym)))
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
+
+(defun %const-int-value (form)
+  "Resolve FORM to an INTEGER when it is a literal integer, or a reference to
+   a DEFCONSTANT whose value is an integer.  Otherwise NIL.
+
+   Why this exists: constant folding happens in COMPILE-VARIABLE-REF, which
+   runs long AFTER a special-form compiler has already chosen its code path.
+   So a site that dispatches on `(integerp arg-form)` sees a SYMBOL for
+   `+some-constant+` and takes its slow/general branch even though the value
+   was perfectly well known at compile time.  COMPILE-ASH is the case that
+   matters: `(ash x +limb-bits+)` missed the inline :shl/:sar path entirely
+   and emitted a runtime BIGNUM-ASH call instead.
+
+   Latent for as long as defconstants have existed (the ~dozen
+   `(ash X +fixnum-shift+)` sites in baked compiler.lisp have always paid
+   for it); it became load-bearing once the numeric tower's shift counts
+   became width constants, since those MUST be named to vary with the target.
+
+   NB integers are returned unchanged rather than looked up: a raw integer in
+   a form is already a literal, and NORMALIZE-NAME maps integers to
+   themselves (they double as name hashes elsewhere), so looking them up
+   could otherwise alias a literal onto a constant's hash."
+  (cond
+    ((integerp form) form)
+    ((or (symbolp form) (stringp form))
+     (let ((v (gethash (normalize-name form) *constants* :not-found)))
+       (if (and (not (eq v :not-found)) (integerp v)) v nil)))
+    (t nil)))
 
 (defun %rt-fn-name (fn)
   "Function-resolution KEY string for name-symbol FN.  Package-qualified
@@ -12457,14 +12485,17 @@
    to 65536 — format-d/b/o/x tests doing `(ash 1 (+ 2 (random 80)))'
    built broken universe values that cascaded into wrong test
    outcomes.  See feedback_correctness_over_regression."
+  ;; Resolve a NAMED constant to its value first: constant folding happens in
+  ;; compile-variable-ref, far too late for this dispatch.  See %const-int-value.
+  (let ((count (%const-int-value count-form)))
   (cond
     ;; Small constant shift (≤ 30 bits left, any right) — inline.
-    ((and (integerp count-form) (<= count-form 30))
+    ((and count (<= count 30))
      (compile-form value-form env dest)
-     (if (>= count-form 0)
-         (emit-ir :shl dest dest count-form)
+     (if (>= count 0)
+         (emit-ir :shl dest dest count)
          (progn
-           (emit-ir :sar dest dest (- count-form))
+           (emit-ir :sar dest dest (- count))
            (let ((temp (alloc-temp-reg)))
              ;; Mask off the low tag bit.  The mask is -2 (0xFFFF...FFFE),
              ;; but a NEGATIVE :li operand is materialised via emit-u64,
@@ -12482,7 +12513,9 @@
     ;; promote to bignum on overflow.  Slower (a real call) but
     ;; correct for arbitrary shift sizes.
     (t
-     (compile-call 'bignum-ash (list value-form count-form) env dest))))
+     ;; Pass the ORIGINAL count-form so the runtime call still gets the
+     ;; constant folded normally by compile-variable-ref.
+     (compile-call 'bignum-ash (list value-form count-form) env dest)))))
 
 (defun compile-ldb (bytespec value-form env dest)
   "Compile (ldb (byte size pos) value) - extract bit field.

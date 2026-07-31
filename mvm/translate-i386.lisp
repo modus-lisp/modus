@@ -521,6 +521,74 @@
        (i386-emit-s32 buf offset)))))
 
 ;;; ============================================================
+;;; Mechanized enforcement of the i386 register invariant
+;;; ============================================================
+;;;
+;;; The invariant (stated in full at I386-LOAD-VREG) is: an opcode must not
+;;; write EAX unless its destination vreg IS VR.  Documenting it is not
+;;; enough — it has been violated twice, and both times the symptom appeared
+;;; far from the cause with no size change to give it away.  So the emit
+;;; helpers CHECK it at build time.  Every one of the opcodes that has never
+;;; been hand-audited either passes silently (mechanically proven to respect
+;;; the invariant) or fails the build naming itself.  Zero runtime cost.
+
+(defparameter *i386-eax-allowlist*
+  '(("DIV"         . "IDIV requires the dividend in EDX:EAX")
+    ("MOD"         . "IDIV requires the dividend in EDX:EAX")
+    ("MUL26LO"     . "MUL requires one operand in EAX")
+    ("MUL26HI"     . "MUL requires one operand in EAX")
+    ("IO-READ"     . "IN uses AL/AX/EAX by ISA")
+    ("IO-WRITE"    . "OUT uses AL/AX/EAX by ISA")
+    ("ATOMIC-XCHG" . "XCHG is issued against EAX here")
+    ("CALL-IND"    . "EAX is caller-saved; VR cannot be live across a call")
+    ("TAILCALL"    . "EAX is caller-saved; VR cannot be live across a call")
+    ("CALL"        . "EAX is caller-saved; VR cannot be live across a call"))
+  "Opcodes permitted to write EAX with a non-VR destination, each with the
+   reason it is legitimate.  The justification lives NEXT TO the exemption on
+   purpose: an allowlist without reasons becomes a place to hide bugs.")
+
+(defvar *i386-check-eax-invariant* t)
+(defvar *i386-eax-violations* nil
+  "Hash of opcode-name -> violation count, filled by I386-CHECK-EAX-WRITE.
+   COLLECTING rather than erroring is deliberate: cross.lisp wraps the
+   translator in a handler-case, so an ERROR would surface as one masked
+   \"WARN: translator error\" and hide every violation after the first —
+   the same masking pattern this workstream keeps having to undo.  One build
+   now reports the complete list.")
+(defvar *i386-eax-invariant-fatal* nil
+  "When true, a violation ERRORs instead of being recorded.")
+(defvar *i386-cur-opname* nil "Opcode being translated, or NIL outside translation.")
+(defvar *i386-cur-dest-is-vr* nil "Does the current opcode's destination vreg = VR?")
+
+(defun i386-check-eax-write (reg)
+  "Signal if REG is EAX and the current opcode may not write it."
+  (when (and *i386-check-eax-invariant*
+             (eql reg +i386-eax+)
+             *i386-cur-opname*
+             (not *i386-cur-dest-is-vr*)
+             (not (assoc *i386-cur-opname* *i386-eax-allowlist* :test #'string=)))
+    (let ((tbl (or *i386-eax-violations*
+                   (setf *i386-eax-violations* (make-hash-table :test 'equal)))))
+      (incf (gethash *i386-cur-opname* tbl 0)))
+    (when *i386-eax-invariant-fatal*
+      (error "i386 REGISTER INVARIANT VIOLATED in opcode ~A:~%~
+            it writes EAX, but EAX *is* VR and this opcode's destination vreg~%~
+            is not VR — so it destroys a live VR.  Compute in the ECX/EDX~%~
+            scratch pair (+scratch0+/+scratch1+) and let I386-STORE-VREG~%~
+            write EAX only when vd really is VR.  If EAX is genuinely~%~
+            required (hardware operand, or after a CALL), add ~A to~%~
+            *i386-eax-allowlist* WITH ITS REASON."
+             *i386-cur-opname* *i386-cur-opname*)))
+  reg)
+
+(defun i386-eax-invariant-report ()
+  "Alist of (opcode-name . violation-count), worst first."
+  (let ((acc nil))
+    (when *i386-eax-violations*
+      (maphash (lambda (k v) (push (cons k v) acc)) *i386-eax-violations*))
+    (sort acc #'> :key #'cdr)))
+
+;;; ============================================================
 ;;; i386 Instruction Emitters
 ;;; ============================================================
 
@@ -528,16 +596,19 @@
 
 (defun i386-emit-mov-reg-reg (buf dst src)
   "MOV dst, src (register-to-register, 32-bit)"
+  (i386-check-eax-write dst)
   (i386-emit-byte buf #x89)   ; MOV r/m32, r32
   (i386-emit-byte buf (i386-modrm #b11 src dst)))
 
 (defun i386-emit-mov-reg-imm (buf reg imm)
   "MOV reg, imm32"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf (+ #xB8 reg))
   (i386-emit-u32 buf (logand imm #xFFFFFFFF)))
 
 (defun i386-emit-mov-reg-mem (buf reg base offset)
   "MOV reg, [base + offset]"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #x8B)
   (i386-emit-modrm-mem buf reg base offset))
 
@@ -556,6 +627,7 @@
 
 (defun i386-emit-mov-reg-abs (buf reg addr)
   "MOV reg, [addr] (absolute 32-bit address, no base register)"
+  (i386-check-eax-write reg)
   ;; Encoding: 8B /r mod=00 r/m=5 disp32
   (i386-emit-byte buf #x8B)
   (i386-emit-byte buf (i386-modrm #b00 reg 5))
@@ -593,12 +665,14 @@
 
 (defun i386-emit-movzx-byte (buf reg base offset)
   "MOVZX reg, BYTE [base+offset]"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #x0F)
   (i386-emit-byte buf #xB6)
   (i386-emit-modrm-mem buf reg base offset))
 
 (defun i386-emit-movzx-word (buf reg base offset)
   "MOVZX reg, WORD [base+offset]"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #x0F)
   (i386-emit-byte buf #xB7)
   (i386-emit-modrm-mem buf reg base offset))
@@ -622,6 +696,7 @@
 
 (defun i386-emit-pop-reg (buf reg)
   "POP reg (32-bit)"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf (+ #x58 reg)))
 
 (defun i386-emit-push-imm32 (buf imm)
@@ -643,11 +718,13 @@
     `(progn
        (defun ,(intern (format nil "I386-EMIT-~A-REG-REG" name) pkg) (buf dst src)
          ,(format nil "~A dst, src (register-register)" name)
+         (i386-check-eax-write dst)
          (i386-emit-byte buf ,opcode-rr)
          (i386-emit-byte buf (i386-modrm #b11 src dst)))
 
        (defun ,(intern (format nil "I386-EMIT-~A-REG-IMM" name) pkg) (buf reg imm)
          ,(format nil "~A reg, imm" name)
+         (i386-check-eax-write reg)
          (cond
            ;; Sign-extended 8-bit immediate (most common)
            ((<= -128 imm 127)
@@ -706,6 +783,7 @@
 
 (defun i386-emit-shl-reg-imm (buf reg count)
   "SHL reg, imm8"
+  (i386-check-eax-write reg)
   (if (= count 1)
       (progn (i386-emit-byte buf #xD1)
              (i386-emit-byte buf (i386-modrm #b11 4 reg)))
@@ -715,6 +793,7 @@
 
 (defun i386-emit-shr-reg-imm (buf reg count)
   "SHR reg, imm8 (logical shift right)"
+  (i386-check-eax-write reg)
   (if (= count 1)
       (progn (i386-emit-byte buf #xD1)
              (i386-emit-byte buf (i386-modrm #b11 5 reg)))
@@ -724,6 +803,7 @@
 
 (defun i386-emit-sar-reg-imm (buf reg count)
   "SAR reg, imm8 (arithmetic shift right)"
+  (i386-check-eax-write reg)
   (if (= count 1)
       (progn (i386-emit-byte buf #xD1)
              (i386-emit-byte buf (i386-modrm #b11 7 reg)))
@@ -733,11 +813,13 @@
 
 (defun i386-emit-shl-reg-cl (buf reg)
   "SHL reg, CL — shift left by count in CL"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #xD3)
   (i386-emit-byte buf (i386-modrm #b11 4 reg)))
 
 (defun i386-emit-sar-reg-cl (buf reg)
   "SAR reg, CL — arithmetic shift right by count in CL"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #xD3)
   (i386-emit-byte buf (i386-modrm #b11 7 reg)))
 
@@ -745,6 +827,7 @@
 
 (defun i386-emit-imul-reg-reg (buf dst src)
   "IMUL dst, src (two-operand signed multiply)"
+  (i386-check-eax-write dst)
   (i386-emit-byte buf #x0F)
   (i386-emit-byte buf #xAF)
   (i386-emit-byte buf (i386-modrm #b11 dst src)))
@@ -767,11 +850,13 @@
 
 (defun i386-emit-neg-reg (buf reg)
   "NEG reg (two's complement negate)"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #xF7)
   (i386-emit-byte buf (i386-modrm #b11 3 reg)))
 
 (defun i386-emit-not-reg (buf reg)
   "NOT reg (bitwise complement)"
+  (i386-check-eax-write reg)
   (i386-emit-byte buf #xF7)
   (i386-emit-byte buf (i386-modrm #b11 2 reg)))
 
@@ -779,6 +864,7 @@
 
 (defun i386-emit-lea (buf dst base offset)
   "LEA dst, [base + offset]"
+  (i386-check-eax-write dst)
   (i386-emit-byte buf #x8D)
   (i386-emit-modrm-mem buf dst base offset))
 
@@ -1022,7 +1108,17 @@
    OPCODE: numeric MVM opcode.
    OPERANDS: list of decoded operands.
    MVM-NEXT-POS: bytecode position after this instruction."
-  (let ((buf (i386-translate-state-buf state)))
+  (let* ((buf (i386-translate-state-buf state))
+         ;; Bind the invariant-checker's context for this opcode.  The
+         ;; destination is operand 0 when the opcode's first operand type is
+         ;; :reg; ops with no register destination get NIL, so ANY EAX write
+         ;; from them is a violation.  See i386-check-eax-write.
+         (%oi (gethash opcode *opcode-table*))
+         (%tys (and %oi (opcode-info-operands %oi)))
+         (*i386-cur-opname* (and %oi (string (opcode-info-name %oi))))
+         (*i386-cur-dest-is-vr*
+           (and %tys (eq (first %tys) :reg) operands
+                (eql (first operands) +vreg-vr+))))
     (macrolet ((op= (sym) `(= opcode ,sym)))
       (cond
         ;; ============================================

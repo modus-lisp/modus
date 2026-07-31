@@ -268,6 +268,13 @@
   (format t "  boot code:   ~D bytes~%" (length (kernel-image-boot-code image)))
   (format t "  native code: ~D bytes~%" (length (kernel-image-native-code image)))
   ;; ---- Unimplemented-opcode report (the whole point of layering) ----
+  ;; Mechanized i386 register-invariant audit (see i386-check-eax-write).
+  (let ((viol (modus.mvm.i386::i386-eax-invariant-report)))
+    (if (null viol)
+        (format t "~%  EAX/VR INVARIANT: clean (no opcode writes EAX with a non-VR dest).~%")
+        (progn
+          (format t "~%  *** EAX/VR INVARIANT VIOLATIONS (~D opcodes) ***~%" (length viol))
+          (dolist (e viol) (format t "    ~A  x~D~%" (car e) (cdr e))))))
   (let ((report (modus.mvm.i386::i386-unimplemented-report)))
     (if (null report)
         (format t "~%  TRANSLATOR: no unimplemented opcodes.~%")

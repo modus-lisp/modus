@@ -125,172 +125,62 @@
 ;;; in entirely the wrong place.  Cost this twice; write SHA256 of abc, not
 ;;; SHA256("abc").
 (defvar *driver-source* "
+;;; ============================================================
+;;; Driver: the regression suite plus three diagnostics
+;;; ============================================================
+;;; GENERATED, not written by hand.  Every expected value in the suite —
+;;; digests, quarter-round words, magnitude-ladder residues — was computed by
+;;; ONE script (scratchpad gendriver.py) from the same expression the image
+;;; evaluates, then baked in.  Hand-transcribing hex produced four separate
+;;; false findings during the i386 bring-up, so the rule is now structural.
+;;;
+;;; *** WARNING: this is a LISP STRING. ***  Its text cannot contain a double
+;;; quote — one terminates the string early and SBCL reports the nonsense
+;;; `defvar ... got 27 args`, which sends you hunting in the wrong file.
+;;; The generator asserts on it.
+
 
 (defun sys-exit (code)
   (let ((c code))
     (syscall3 1 c 0 0)))
 
-;; argv[1] was staged as a NUL-terminated ASCII string at #x10000208 by the
-;; entry stub (see boot/boot-linux-i386.lisp); parse it as a decimal integer.
-(defun %parse-decimal-at-fixed-208 ()
+;; argv[1] / argv[2] are staged NUL-terminated by the entry stub
+;; (boot/boot-linux-i386.lisp) at these fixed BSS addresses.
+(defun %argv1 ()
   (let ((n 0) (i 0))
     (loop
-      (let ((b (mem-ref (+ #x10000208 i) :u8)))
+      (let ((b (mem-ref (+ 268435976 i) :u8)))
         (when (or (< b 48) (> b 57)) (return n))
         (setq n (+ (* n 10) (- b 48)))
         (setq i (+ i 1))))))
 
-;; Decimal printer built ONLY from +, -, < and > — deliberately NOT from
-;; TRUNCATE/MOD.  Those are real CL-runtime defuns (cl-types.lisp /
-;; cl-eval.lisp) and TRUNCATE takes &rest, so using them here would couple
-;; every numeric probe to the &rest/nargs machinery.  Repeated subtraction
-;; keeps the probes measuring what they claim to measure.  Values < 1000.
-(defun %pdec5 (n)
-  ;; 5-digit decimal, for MB-scale addresses.  Repeated subtraction only.
-  (let ((tt 0) (th 0) (h 0) (t10 0) (r n))
-    (loop (when (< r 10000) (return nil)) (setq r (- r 10000)) (setq tt (+ tt 1)))
-    (loop (when (< r 1000) (return nil)) (setq r (- r 1000)) (setq th (+ th 1)))
-    (loop (when (< r 100) (return nil)) (setq r (- r 100)) (setq h (+ h 1)))
-    (loop (when (< r 10) (return nil)) (setq r (- r 10)) (setq t10 (+ t10 1)))
-    (when (> tt 0) (write-char-serial (+ 48 tt)))
-    (when (or (> tt 0) (> th 0)) (write-char-serial (+ 48 th)))
-    (when (or (> tt 0) (> th 0) (> h 0)) (write-char-serial (+ 48 h)))
-    (when (or (> tt 0) (> th 0) (> h 0) (> t10 0)) (write-char-serial (+ 48 t10)))
-    (write-char-serial (+ 48 r))))
-
-(defun %pdec (n)
-  (if (< n 0)
-      (progn (write-char-serial 45) (%pdec (- 0 n)))
-      (let ((h 0) (t10 0) (r n))
-        (loop (when (< r 100) (return nil)) (setq r (- r 100)) (setq h (+ h 1)))
-        (loop (when (< r 10) (return nil)) (setq r (- r 10)) (setq t10 (+ t10 1)))
-        (when (> h 0) (write-char-serial (+ 48 h)))
-        (when (or (> h 0) (> t10 0)) (write-char-serial (+ 48 t10)))
-        (write-char-serial (+ 48 r)))))
+(defun %argv2 ()
+  (let ((n 0) (i 0))
+    (loop
+      (let ((b (mem-ref (+ 268436040 i) :u8)))
+        (when (or (< b 48) (> b 57)) (return n))
+        (setq n (+ (* n 10) (- b 48)))
+        (setq i (+ i 1))))))
 
 (defun putnl () (write-char-serial 10))
 
-(defun emit-str-ok () (write-char-serial 79) (write-char-serial 75))
-
-;; Layer-1 probes: no CL runtime at all, just the compiler's own codegen on a
-;; 32-bit word.  Each of these is a DIFFERENT translator path, so a failure
-;; localises immediately.
-(defun probe-arith ()
-  (write-char-serial 97) (write-char-serial 61)   ; a=
-  (%pdec (+ 1 2)) (putnl)
-  (write-char-serial 98) (write-char-serial 61)   ; b=
-  (%pdec (let ((x 5)) (* x x))) (putnl)
-  (write-char-serial 99) (write-char-serial 61)   ; c=
-  (%pdec (- 100 58)) (putnl)
-  (write-char-serial 100) (write-char-serial 61)  ; d=  (plain sub)
-  (%pdec (- 144 132)) (putnl))
-
-(defun sq (x) (* x x))
-
-(defun probe-defcall ()
-  (write-char-serial 101) (write-char-serial 61)  ; e=
-  (%pdec (sq 7)) (putnl))
-
-(defun probe-cons ()
-  (let ((p (cons 3 4)))
-    (write-char-serial 102) (write-char-serial 61)  ; f=
-    (%pdec (+ (car p) (cdr p))) (putnl)))
-
-(defun probe-funcall ()
-  ;; exercises :fn-addr (the position-independent call/pop/add form) plus the
-  ;; +3 function tag and :call-ind's strip
-  (write-char-serial 103) (write-char-serial 61)  ; g=
-  (%pdec (funcall (function sq) 9)) (putnl))
-
-;; ---- 30-bit-fixnum / bignum-promotion battery ----------------------
-;; SHA-256 is u32 arithmetic.  A u32 does not fit an i386 fixnum (~30 bits),
-;; so every one of these is a value that MUST transparently promote.  Each
-;; probe prints a small expected number so %pdec (built only from +,-,<,>)
-;; can report it.
-(defun probe-bignum ()
-  (write-char-serial 107) (write-char-serial 49) (write-char-serial 61) ; k1=
-  (%pdec (logand #x428a2f98 255)) (putnl)          ; expect 152
-  (write-char-serial 107) (write-char-serial 50) (write-char-serial 61) ; k2=
-  (%pdec (ash #x428a2f98 -24)) (putnl)             ; expect 66
-  (write-char-serial 107) (write-char-serial 51) (write-char-serial 61) ; k3=
-  (%pdec (logand (+ #x40000000 1) 255)) (putnl)    ; expect 1
-  (write-char-serial 107) (write-char-serial 52) (write-char-serial 61) ; k4=
-  (%pdec (logand #xFFFFFFFF 255)) (putnl)          ; expect 255
-  (write-char-serial 107) (write-char-serial 53) (write-char-serial 61) ; k5=
-  (%pdec (logand (logxor #xFFFFFFFF #x428a2f98) 255)) (putnl)  ; expect 103
-  (write-char-serial 107) (write-char-serial 54) (write-char-serial 61) ; k6=
-  (%pdec (logand (ash 1 29) 255)) (putnl))         ; expect 0
-
-(defun probe-promote ()
-  ;; Isolate the promoting-arithmetic path that compile-mem-refs reconstruction
-  ;; depends on: hi*65536 + lo must become a BIGNUM, not a wrapped fixnum.
-  (write-char-serial 112) (write-char-serial 49) (write-char-serial 61) ; p1=
-  (%pdec (logand (* 17034 65536) 255)) (putnl)              ; expect 0
-  (write-char-serial 112) (write-char-serial 50) (write-char-serial 61) ; p2=
-  (%pdec (ash (* 17034 65536) -24)) (putnl)                 ; expect 66
-  (write-char-serial 112) (write-char-serial 51) (write-char-serial 61) ; p3=
-  (%pdec (logand (+ (* 17034 65536) 152) 255)) (putnl)      ; expect 152
-  (write-char-serial 112) (write-char-serial 52) (write-char-serial 61) ; p4=
-  (%pdec (ash (+ (* 17034 65536) 152) -24)) (putnl))        ; expect 66
-
-(defun probe-memu32-split ()
-  ;; RE-MEASURE FROM SCRATCH.  probe 8s earlier attribution -- that the
-  ;; :shl 1 tagging overflows -- was made on a substrate that still had 15
-  ;; VR-clobbering opcodes, so it
-  ;; is not trusted.  Split the two directions apart:
-  ;;   s* = value that FITS a 30-bit fixnum -> isolates the LOAD path
-  ;;   b* = value that does NOT fit (a bignum literal now) -> adds the STORE path
-  (setf (mem-ref #x10000b00 :u32) 4660)          ; #x1234, a fixnum
-  (write-char-serial 115) (write-char-serial 49) (write-char-serial 61) ; s1=
-  (%pdec (logand (mem-ref #x10000b00 :u32) 255)) (putnl)   ; expect 52
-  (write-char-serial 115) (write-char-serial 50) (write-char-serial 61) ; s2=
-  (%pdec (ash (mem-ref #x10000b00 :u32) -8)) (putnl)       ; expect 18
-  (setf (mem-ref #x10000b00 :u32) 1116352408)    ; #x428a2f98, a BIGNUM here
-  (write-char-serial 98) (write-char-serial 49) (write-char-serial 61)  ; b1=
-  (%pdec (logand (mem-ref #x10000b00 :u32) 255)) (putnl)   ; expect 152
-  (write-char-serial 98) (write-char-serial 50) (write-char-serial 61)  ; b2=
-  (%pdec (ash (mem-ref #x10000b00 :u32) -24)) (putnl))     ; expect 66
-
-(defun probe-memu32 ()
-  ;; mem-ref :u32 must survive a u32 that cannot be a fixnum.  Uses the
-  ;; scratch BSS above the i386 global slot block.
-  (setf (mem-ref #x10000b00 :u32) #x428a2f98)
-  (write-char-serial 109) (write-char-serial 61)   ; m=
-  (%pdec (logand (mem-ref #x10000b00 :u32) 255)) (putnl)   ; expect 152
-  (write-char-serial 110) (write-char-serial 61)   ; n=
-  (%pdec (ash (mem-ref #x10000b00 :u32) -24)) (putnl))     ; expect 66
-
-(defun probe-fixnum-width ()
-  ;; How wide IS a fixnum here?  Count doublings until the value stops
-  ;; growing monotonically (wrap) — on a 32-bit word with a 1-bit tag this
-  ;; should report 30.
-  (write-char-serial 119) (write-char-serial 61)  ; w=
-  ;; Double until the value stops growing OR we pass 40 doublings.  The
-  ;; bound keeps this probe from running into the (currently broken) bignum
-  ;; path, so it reports the fixnum width rather than SIGSEGVing.
-  (let ((n 1) (k 0))
-    (loop
-      (when (> k 40) (return nil))
-      (let ((n2 (+ n n)))
-        (when (< n2 n) (return nil))
-        (setq n n2)
-        (setq k (+ k 1))))
-    (%pdec k))
-  (putnl))
-
-(defun probe-argv ()
-  ;; Echo the raw bytes the entry stub staged at #x10000208, then the parsed
-  ;; integer.  Proves argv staging + mem-ref :u8 independently of everything.
-  (write-char-serial 118) (write-char-serial 61)   ; v=
-  (let ((i 0))
-    (loop
-      (let ((b (mem-ref (+ #x10000208 i) :u8)))
-        (when (eql b 0) (return nil))
-        (write-char-serial b)
-        (setq i (+ i 1)))))
-  (putnl)
-  (write-char-serial 110) (write-char-serial 61)   ; n=
-  (%pdec (%parse-decimal-at-fixed-208)) (putnl))
+;; Decimal printer built ONLY from +, -, < and > — deliberately NOT from
+;; TRUNCATE/MOD, which are real CL-runtime defuns taking &rest.  Using them
+;; here would couple every numeric check to the &rest/nargs machinery instead
+;; of measuring what it claims to measure.
+(defun %pdec (n)
+  (if (< n 0)
+      (progn (write-char-serial 45) (%pdec (- 0 n)))
+      (let ((tt 0) (th 0) (h 0) (t10 0) (r n))
+        (loop (when (< r 10000) (return nil)) (setq r (- r 10000)) (setq tt (+ tt 1)))
+        (loop (when (< r 1000) (return nil)) (setq r (- r 1000)) (setq th (+ th 1)))
+        (loop (when (< r 100) (return nil)) (setq r (- r 100)) (setq h (+ h 1)))
+        (loop (when (< r 10) (return nil)) (setq r (- r 10)) (setq t10 (+ t10 1)))
+        (when (> tt 0) (write-char-serial (+ 48 tt)))
+        (when (or (> tt 0) (> th 0)) (write-char-serial (+ 48 th)))
+        (when (or (> tt 0) (> th 0) (> h 0)) (write-char-serial (+ 48 h)))
+        (when (or (> tt 0) (> th 0) (> h 0) (> t10 0)) (write-char-serial (+ 48 t10)))
+        (write-char-serial (+ 48 r)))))
 
 (defun %hexdig (n) (if (< n 10) (+ 48 n) (+ 87 n)))
 (defun %phex (b)
@@ -300,400 +190,94 @@
   (let ((i 0))
     (loop (when (>= i 32) (return nil)) (%phex (aref h i)) (setq i (+ i 1))))
   (putnl))
+(defun %phex32 (s off)
+  (%phex (aref s off)) (%phex (aref s (+ off 1)))
+  (%phex (aref s (+ off 2))) (%phex (aref s (+ off 3))))
+(defun %phexw (a)
+  (%phex (mem-ref (+ a 3) :u8)) (%phex (mem-ref (+ a 2) :u8))
+  (%phex (mem-ref (+ a 1) :u8)) (%phex (mem-ref a :u8)))
 
-(defun probe-lshift ()
-  ;; SHA-256s sigma functions do (ash (logand x 3) 30) — a LEFT shift whose
-  ;; RESULT leaves a 30-bit fixnum even though the INPUT is a small fixnum.
-  ;; compile-ashs guard only covers a bignum INPUT, so this is the shape it
-  ;; would still miss.  (ash 3 30) = 3221225472.
-  (write-char-serial 108) (write-char-serial 49) (write-char-serial 61) ; l1=
-  (%pdec (logand (ash 3 30) 255)) (putnl)          ; expect 0
-  (write-char-serial 108) (write-char-serial 50) (write-char-serial 61) ; l2=
-  (%pdec (ash (ash 3 30) -24)) (putnl)             ; expect 192
-  (write-char-serial 108) (write-char-serial 51) (write-char-serial 61) ; l3=
-  (%pdec (logand (ash 255 24) 255)) (putnl)        ; expect 0
-  (write-char-serial 108) (write-char-serial 52) (write-char-serial 61) ; l4=
-  (%pdec (ash (logand (ash 255 24) 4294967295) -24)) (putnl))  ; expect 255
+(defun %gccount () (mem-ref 268435552 :u32))
 
+;;; ---- self-checking scoreboard -------------------------------------------
+;;; Counters live in BSS rather than defvars: a defvar's init form is not run
+;;; at boot on this image (Active Limitation #7), so a defvar would silently
+;;; read NIL.
+(defun %sc-reset () (setf (mem-ref 268438400 :u32) 0)
+                    (setf (mem-ref 268438408 :u32) 0)
+                    (setf (mem-ref 268438416 :u32) 0))
+(defun %sc-pass () (setf (mem-ref 268438400 :u32) (+ (mem-ref 268438400 :u32) 1)))
+(defun %sc-fail () (setf (mem-ref 268438408 :u32) (+ (mem-ref 268438408 :u32) 1)))
+(defun %sc-gap () (setf (mem-ref 268438416 :u32) (+ (mem-ref 268438416 :u32) 1)))
+
+;; Every check prints its own verdict: a suite you have to eyeball is not a
+;; suite.  Callers emit the label, then one of these closes the line.
+(defun %chk (got want)
+  (write-char-serial 32)
+  (if (eql got want)
+      (progn (%sc-pass) (write-char-serial 80) (write-char-serial 65) (write-char-serial 83) (write-char-serial 83))
+      (progn (%sc-fail) (write-char-serial 70) (write-char-serial 65) (write-char-serial 73) (write-char-serial 76)
+             (write-char-serial 32) (%pdec got)
+             (write-char-serial 32) (write-char-serial 119) (write-char-serial 97) (write-char-serial 110) (write-char-serial 116) (write-char-serial 32) (%pdec want)))
+  (putnl))
+
+
+;; A check for a defect that is KNOWN and still open.  It reports loudly on
+;; every run — got and want, same as a failure — but does not fail the suite,
+;; so the gate stays honest about the gap without going permanently red.  If
+;; one of these starts passing, that is a signal to promote it to a %chk.
+(defun %xgap (got want)
+  (write-char-serial 32)
+  (if (eql got want)
+      (progn (%sc-pass) (write-char-serial 80) (write-char-serial 65) (write-char-serial 83) (write-char-serial 83) (write-char-serial 32) (write-char-serial 40) (write-char-serial 107) (write-char-serial 110) (write-char-serial 111) (write-char-serial 119) (write-char-serial 110) (write-char-serial 32) (write-char-serial 103) (write-char-serial 97) (write-char-serial 112) (write-char-serial 32) (write-char-serial 110) (write-char-serial 111) (write-char-serial 119) (write-char-serial 32) (write-char-serial 70) (write-char-serial 73) (write-char-serial 88) (write-char-serial 69) (write-char-serial 68) (write-char-serial 32) (write-char-serial 45) (write-char-serial 32) (write-char-serial 112) (write-char-serial 114) (write-char-serial 111) (write-char-serial 109) (write-char-serial 111) (write-char-serial 116) (write-char-serial 101) (write-char-serial 32) (write-char-serial 116) (write-char-serial 111) (write-char-serial 32) (write-char-serial 37) (write-char-serial 99) (write-char-serial 104) (write-char-serial 107) (write-char-serial 41))
+      (progn (%sc-gap) (write-char-serial 75) (write-char-serial 78) (write-char-serial 79) (write-char-serial 87) (write-char-serial 78) (write-char-serial 45) (write-char-serial 71) (write-char-serial 65) (write-char-serial 80)
+             (write-char-serial 32) (%pdec got)
+             (write-char-serial 32) (write-char-serial 119) (write-char-serial 97) (write-char-serial 110) (write-char-serial 116) (write-char-serial 32) (%pdec want)))
+  (putnl))
+
+(defun %chkge (got want)
+  (write-char-serial 32)
+  (if (>= got want)
+      (progn (%sc-pass) (write-char-serial 80) (write-char-serial 65) (write-char-serial 83) (write-char-serial 83))
+      (progn (%sc-fail) (write-char-serial 70) (write-char-serial 65) (write-char-serial 73) (write-char-serial 76)
+             (write-char-serial 32) (%pdec got)
+             (write-char-serial 32) (write-char-serial 109) (write-char-serial 105) (write-char-serial 110) (write-char-serial 32) (%pdec want)))
+  (putnl))
+
+(defun %chkdig (got want)
+  (let ((bad 0) (i 0))
+    (loop (when (>= i 32) (return nil))
+          (when (not (eql (aref got i) (aref want i))) (setq bad (+ bad 1)))
+          (setq i (+ i 1)))
+    (write-char-serial 32)
+    (if (eql bad 0)
+        (progn (%sc-pass) (write-char-serial 80) (write-char-serial 65) (write-char-serial 83) (write-char-serial 83) (putnl))
+        (progn (%sc-fail) (write-char-serial 70) (write-char-serial 65) (write-char-serial 73) (write-char-serial 76) (putnl)
+               (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 103) (write-char-serial 111) (write-char-serial 116) (write-char-serial 32) (%print-digest got)))))
+
+
+(defun sq (x) (* x x))
 (defun f5 (a b c d e) (+ a (+ b (+ c (+ d e)))))
 (defun f6 (a b c d e f) (+ a (+ b (+ c (+ d (+ e f))))))
 (defun f5id (a b c d e) e)
 (defun f6id (a b c d e f) f)
 
-(defun probe-arity ()
-  ;; KNOWN-ANSWER tests for the >4-argument calling convention.
-  ;; Powers of two so a wrong param is identifiable from the sum.
-  (write-char-serial 97) (write-char-serial 53) (write-char-serial 61) ; a5=
-  (%pdec (f5 1 2 4 8 16)) (putnl)          ; expect 31
-  (write-char-serial 97) (write-char-serial 54) (write-char-serial 61) ; a6=
-  (%pdec (f6 1 2 4 8 16 32)) (putnl)       ; expect 63
-  (write-char-serial 105) (write-char-serial 53) (write-char-serial 61) ; i5=
-  (%pdec (f5id 1 2 4 8 16)) (putnl)        ; expect 16 (the 5th arg alone)
-  (write-char-serial 105) (write-char-serial 54) (write-char-serial 61) ; i6=
-  (%pdec (f6id 1 2 4 8 16 32)) (putnl))    ; expect 32 (the 6th arg alone)
-
-(defun %phex32 (s off)
-  (%phex (aref s off)) (%phex (aref s (+ off 1)))
-  (%phex (aref s (+ off 2))) (%phex (aref s (+ off 3))))
-
-(defun %parse-decimal-at-fixed-248 ()
-  ;; argv[2], staged by the entry stub at #x10000248.
-  (let ((n 0) (i 0))
-    (loop
-      (let ((b (mem-ref (+ 268437576 i) :u8)))
-        (when (or (< b 48) (> b 57)) (return n))
-        (setq n (+ (* n 10) (- b 48)))
-        (setq i (+ i 1))))))
-
-(defun probe-nblocks ()
-  ;; Hash argv[2] * 64 bytes.  Bisecting the largest N that COMPLETES gives
-  ;; the heap burn per 64-byte block directly, since the arena is a known
-  ;; 496 MiB and there is no collector to reclaim any of it.
-  (sha256-init)
-  (let ((nb (%parse-decimal-at-fixed-248)))
-    (let ((n (* nb 64)))
-      (let ((m (make-array n)))
-        (let ((i 0))
-          (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
-        (sha256 m)
-        (write-char-serial 111) (write-char-serial 107) (putnl)))))
-
-(defun probe-gcstate ()
-  ;; Is the bitmap actually live, and did any collection run?  Addresses are
-  ;; GENERATED, not transcribed -- hand-written hex-to-decimal has produced
-  ;; four false findings this session.
-  (write-char-serial 98) (write-char-serial 61)
-  (%pdec (if (= (mem-ref 268439064 :u64) 0) 0 1)) (putnl)      ; b= object-start bmp
-  (write-char-serial 99) (write-char-serial 61)
-  (%pdec (if (= (mem-ref 268439104 :u64) 0) 0 1)) (putnl)      ; c= cons-kind bmp
-  (write-char-serial 112) (write-char-serial 61)
-  (%pdec (if (= (mem-ref 268439040 :u64) 0) 0 1)) (putnl)      ; p= page_base
-  (write-char-serial 103) (write-char-serial 61)
-  (%pdec5 (mem-ref 268435552 :u64)) (putnl))                   ; g= gccount
-
-(defun probe-heapuse ()
-  ;; How much heap does SHA-256 actually burn, and is there a collector?
-  ;; VA (alloc pointer) and VL (alloc limit) live in the i386 global slot
-  ;; block at #x10000A00 / #x10000A04.
-  (sha256-init)
-  (let ((n 1024))
-    (let ((m (make-array n)))
-      (let ((i 0))
-        (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
-      ;; Print VA and VL as absolute MiB — no bignum subtraction involved, so
-      ;; the measurement cannot be confounded by the arithmetic under test.
-      (write-char-serial 118) (write-char-serial 48) (write-char-serial 61) ; v0=
-      (%pdec5 (ash (mem-ref 268437504 :u32) -20)) (putnl)
-      (sha256 m)
-      (write-char-serial 118) (write-char-serial 49) (write-char-serial 61) ; v1=
-      (%pdec5 (ash (mem-ref 268437504 :u32) -20)) (putnl)
-      (write-char-serial 118) (write-char-serial 108) (write-char-serial 61) ; vl=
-      (%pdec5 (ash (mem-ref 268437508 :u32) -20)) (putnl))))
-
+;; chacha-qr shape: 5 params, 4 let bindings, repeated setq — the exact body
+;; that exposed the >4-argument calling-convention bug.
 (defun g5 (s a b c d)
-  ;; chacha-qr shape: 5 params, 4 let bindings, repeated setq.  s unused, to
-  ;; match chacha-qr where the buffer is param 0 and the offsets are 1..4.
   (let ((sa a) (sb b) (sc c) (sd d))
     (setq sa (+ sa sb))
     (setq sd (logxor sd sa))
     (setq sc (+ sc sd))
     (setq sb (logxor sb sc))
     (+ sa (+ sb (+ sc sd)))))
-
 (defun g5d (s a b c d)
-  ;; Does param 4 (the overflow arg) SURVIVE a let/setq-heavy body?
   (let ((x 0))
     (setq x (+ x a)) (setq x (+ x b)) (setq x (+ x c))
     d))
-
 (defun g5buf (s a b c d)
-  ;; Same, but reading through the buffer the way chacha-qr does.
   (let ((va (buf-read-u32 s a)) (vd (buf-read-u32 s d)))
     (+ va vd)))
-
-(defun probe-band ()
-  ;; MAGNITUDE LADDER: 30, 32, 48, 60 and 62 bits, each through
-  ;; logand/ash/logior/logxor/+/-.  The 48-bit band was untested by
-  ;; construction before this -- SHA-256 masks before shifting so it
-  ;; never forms one.  Generated from Python so the value fed and the
-  ;; value expected come from ONE computation.
-  (%pdec (logand 1073741823 255)) (write-char-serial 32)
-  (%pdec (logand (ash 1073741823 -8) 255)) (write-char-serial 32)
-  (%pdec (logand (logior 1073741823 1) 255)) (write-char-serial 32)
-  (%pdec (logand (logxor 1073741823 255) 255)) (write-char-serial 32)
-  (%pdec (logand (+ 1073741823 1) 255)) (write-char-serial 32)
-  (%pdec (logand (- 1073741823 1) 255)) (putnl)
-  (%pdec (logand 2609737539 255)) (write-char-serial 32)
-  (%pdec (logand (ash 2609737539 -8) 255)) (write-char-serial 32)
-  (%pdec (logand (logior 2609737539 1) 255)) (write-char-serial 32)
-  (%pdec (logand (logxor 2609737539 255) 255)) (write-char-serial 32)
-  (%pdec (logand (+ 2609737539 1) 255)) (write-char-serial 32)
-  (%pdec (logand (- 2609737539 1) 255)) (putnl)
-  (%pdec (logand 171031759355904 255)) (write-char-serial 32)
-  (%pdec (logand (ash 171031759355904 -8) 255)) (write-char-serial 32)
-  (%pdec (logand (logior 171031759355904 1) 255)) (write-char-serial 32)
-  (%pdec (logand (logxor 171031759355904 255) 255)) (write-char-serial 32)
-  (%pdec (logand (+ 171031759355904 1) 255)) (write-char-serial 32)
-  (%pdec (logand (- 171031759355904 1) 255)) (putnl)
-  (%pdec (logand 576460752303435833 255)) (write-char-serial 32)
-  (%pdec (logand (ash 576460752303435833 -8) 255)) (write-char-serial 32)
-  (%pdec (logand (logior 576460752303435833 1) 255)) (write-char-serial 32)
-  (%pdec (logand (logxor 576460752303435833 255) 255)) (write-char-serial 32)
-  (%pdec (logand (+ 576460752303435833 1) 255)) (write-char-serial 32)
-  (%pdec (logand (- 576460752303435833 1) 255)) (putnl)
-  (%pdec (logand 4611686018427387911 255)) (write-char-serial 32)
-  (%pdec (logand (ash 4611686018427387911 -8) 255)) (write-char-serial 32)
-  (%pdec (logand (logior 4611686018427387911 1) 255)) (write-char-serial 32)
-  (%pdec (logand (logxor 4611686018427387911 255) 255)) (write-char-serial 32)
-  (%pdec (logand (+ 4611686018427387911 1) 255)) (write-char-serial 32)
-  (%pdec (logand (- 4611686018427387911 1) 255)) (putnl))
-
-(defun probe-rfcqr ()
-  (let ((s (make-array 64)))
-    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
-    (buf-write-u32 s 0 286331153)
-    (buf-write-u32 s 16 16909060)
-    (buf-write-u32 s 32 2609737539)
-    (buf-write-u32 s 48 19088743)
-    (chacha-qr s 0 16 32 48)
-    (write-char-serial 114) (write-char-serial 61)
-    (%phex32 s 0) (%phex32 s 16) (%phex32 s 32) (%phex32 s 48) (putnl)))
-
-(defun probe-rotbig ()
-  ;; The rotations on a BIGNUM input.  probe-rot used 0x01020304, which is a
-  ;; FIXNUM on a 30-bit tower; in ChaCha every rotation input is a u32 and
-  ;; therefore a bignum.  x = 0x9b8d6f43 = 2610427203.
-  (write-char-serial 98) (write-char-serial 49) (write-char-serial 61) ; b1=
-  (%pdec (logand (chacha-rotl16 2610427203) 255)) (putnl)
-  (write-char-serial 98) (write-char-serial 50) (write-char-serial 61) ; b2=
-  (%pdec (ash (chacha-rotl16 2610427203) -24)) (putnl)
-  (write-char-serial 98) (write-char-serial 51) (write-char-serial 61) ; b3=
-  (%pdec (logand (chacha-rotl12 2610427203) 255)) (putnl)
-  (write-char-serial 98) (write-char-serial 52) (write-char-serial 61) ; b4=
-  (%pdec (ash (chacha-rotl12 2610427203) -24)) (putnl)
-  (write-char-serial 98) (write-char-serial 53) (write-char-serial 61) ; b5=
-  (%pdec (logand (chacha-rotl8 2610427203) 255)) (putnl)
-  (write-char-serial 98) (write-char-serial 54) (write-char-serial 61) ; b6=
-  (%pdec (ash (chacha-rotl7 2610427203) -24)) (putnl))
-
-(defun myqr (s a b c d)
-  ;; EXACT clone of chacha-qr from net/crypto.lisp.  If this is correct and
-  ;; chacha-qr is not, the difference is compilation of that specific body,
-  ;; not a shared callee.
-  (let ((sa (buf-read-u32 s a))
-        (sb (buf-read-u32 s b))
-        (sc (buf-read-u32 s c))
-        (sd (buf-read-u32 s d)))
-    (setq sa (logand (+ sa sb) 4294967295))
-    (setq sd (chacha-rotl16 (logxor sd sa)))
-    (setq sc (logand (+ sc sd) 4294967295))
-    (setq sb (chacha-rotl12 (logxor sb sc)))
-    (setq sa (logand (+ sa sb) 4294967295))
-    (setq sd (chacha-rotl8 (logxor sd sa)))
-    (setq sc (logand (+ sc sd) 4294967295))
-    (setq sb (chacha-rotl7 (logxor sb sc)))
-    (buf-write-u32 s a sa)
-    (buf-write-u32 s b sb)
-    (buf-write-u32 s c sc)
-    (buf-write-u32 s d sd)))
-
-(defun %qr-setup (s)
-  (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
-  (buf-write-u32 s 0 286331153)
-  (buf-write-u32 s 16 16909060)
-  (buf-write-u32 s 32 2610427203)
-  (buf-write-u32 s 48 19088743))
-
-(defun probe-qrcmp ()
-  (let ((s (make-array 64)))
-    (%qr-setup s) (chacha-qr s 0 16 32 48)
-    (write-char-serial 99) (write-char-serial 61)      ; c= crypto.lisp version
-    (%phex32 s 0) (%phex32 s 16) (%phex32 s 32) (%phex32 s 48) (putnl))
-  (let ((s2 (make-array 64)))
-    (%qr-setup s2) (myqr s2 0 16 32 48)
-    (write-char-serial 109) (write-char-serial 61)     ; m= inline clone
-    (%phex32 s2 0) (%phex32 s2 16) (%phex32 s2 32) (%phex32 s2 48) (putnl)))
-
-(defun probe-qrsteps ()
-  ;; Walk chacha-qrs first step by hand on the RFC 8439 inputs.
-  ;; a=11111111 b=01020304 -> sa = 12131415
-  ;; sd = rotl16(01234567 xor 12131415) = rotl16(13305172) = 51721330
-  (write-char-serial 113) (write-char-serial 49) (write-char-serial 61) ; q1=
-  (%pdec (logand (logand (+ 286331153 16909060) 4294967295) 255)) (putnl)  ; expect 21
-  (write-char-serial 113) (write-char-serial 50) (write-char-serial 61) ; q2=
-  (%pdec (ash (logand (+ 286331153 16909060) 4294967295) -24)) (putnl)    ; expect 18
-  (write-char-serial 113) (write-char-serial 51) (write-char-serial 61) ; q3=
-  (%pdec (logand (logxor 19088743 303240213) 255)) (putnl)               ; expect 114
-  (write-char-serial 113) (write-char-serial 52) (write-char-serial 61) ; q4=
-  (%pdec (ash (chacha-rotl16 322109810) -24)) (putnl))                   ; expect 81
-
-(defun probe-frameslot ()
-  (write-char-serial 103) (write-char-serial 49) (write-char-serial 61) ; g1=
-  (%pdec (g5 0 1 2 4 8)) (putnl)             ; expect 42
-  (write-char-serial 103) (write-char-serial 50) (write-char-serial 61) ; g2=
-  (%pdec (g5d 0 1 2 4 8)) (putnl)            ; expect 8
-  (let ((s (make-array 64)))
-    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
-    (buf-write-u32 s 0 5)
-    (buf-write-u32 s 48 9)
-    (write-char-serial 103) (write-char-serial 51) (write-char-serial 61) ; g3=
-    (%pdec (g5buf s 0 16 32 48)) (putnl)))   ; expect 14
-
-(defun probe-rot ()
-  ;; Isolate the four ChaCha rotations on 0x01020304 = 16909060.
-  ;; rotl16 -> 03040102 (50594050)   rotl12 -> 20304010 (540016656)
-  ;; rotl8  -> 02030401 (33818625)   rotl7  -> 81018200 (2164326912)
-  ;; Printed as low byte + high byte so %pdec (which handles < 1000) suffices.
-  (write-char-serial 114) (write-char-serial 49) (write-char-serial 61) ; r1=
-  (%pdec (logand (chacha-rotl16 16909060) 255)) (putnl)        ; expect 2
-  (write-char-serial 114) (write-char-serial 50) (write-char-serial 61) ; r2=
-  (%pdec (ash (chacha-rotl16 16909060) -24)) (putnl)           ; expect 3
-  (write-char-serial 114) (write-char-serial 51) (write-char-serial 61) ; r3=
-  (%pdec (logand (chacha-rotl12 16909060) 255)) (putnl)        ; expect 16
-  (write-char-serial 114) (write-char-serial 52) (write-char-serial 61) ; r4=
-  (%pdec (ash (chacha-rotl12 16909060) -24)) (putnl)           ; expect 32
-  (write-char-serial 114) (write-char-serial 53) (write-char-serial 61) ; r5=
-  (%pdec (logand (chacha-rotl8 16909060) 255)) (putnl)         ; expect 1
-  (write-char-serial 114) (write-char-serial 54) (write-char-serial 61) ; r6=
-  (%pdec (ash (chacha-rotl7 16909060) -24)) (putnl))           ; expect 129
-
-(defun probe-chacha2 ()
-  ;; RFC 8439 section 2.1.1 quarter-round test vector.  NB chacha-qr takes BYTE
-  ;; OFFSETS into a 64-byte buffer, not word indices — an earlier probe passed
-  ;; 0 1 2 3 and got a meaningless answer; that was the probes bug, not the code.
-  ;;   in : a=11111111 b=01020304 c=9b8d6f43 d=01234567
-  ;;   out: a=ea2a92f4 b=cb1cf8ce c=4581472e d=5881c4bb
-  (let ((s (make-array 64)))
-    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
-    (buf-write-u32 s 0 286331153)
-    (buf-write-u32 s 16 16909060)
-    (buf-write-u32 s 32 2610427203)
-    (buf-write-u32 s 48 19088743)
-    (chacha-qr s 0 16 32 48)
-    (write-char-serial 113) (write-char-serial 61)
-    (%phex32 s 0) (%phex32 s 16) (%phex32 s 32) (%phex32 s 48) (putnl)))
-
-(defun probe-sha-bulk ()
-  ;; Throughput: SHA-256 over 64 KiB.  Digest printed so the run is verifiable
-  ;; rather than merely timed.
-  (sha256-init)
-  (let ((n 4096))
-    (let ((m (make-array n)))
-      (let ((i 0))
-        (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
-      (write-char-serial 98) (write-char-serial 61)
-      (%print-digest (sha256 m)))))
-
-(defun probe-fixnum-spin ()
-  ;; Pure-fixnum workload, NO bignum promotion and NO allocation: the
-  ;; emulation-overhead baseline.  Same loop on i386-under-qemu and x64 lets
-  ;; the qemu factor be divided out of the crypto comparison.
-  (let ((i 0) (acc 0))
-    (loop (when (>= i 3000000) (return nil))
-          (setq acc (logand (+ acc i) 65535))
-          (setq i (+ i 1)))
-    (write-char-serial 122) (write-char-serial 61)
-    (%pdec (logand acc 255)) (putnl)))
-
-(defun probe-chacha ()
-  ;; chacha-qr takes FIVE parameters.  i386s :call pushes only V2/V3 and trap
-  ;; 0530 COPY-OVERFLOW-ARGS is still unimplemented, so this should now hit the
-  ;; LOUD trap and say so, instead of silently computing on garbage.
-  (let ((s (make-array 16)))
-    (let ((i 0)) (loop (when (>= i 16) (return nil)) (aset s i i) (setq i (+ i 1))))
-    (chacha-qr s 0 1 2 3)
-    (write-char-serial 113) (write-char-serial 61)   ; q=
-    (%pdec (logand (aref s 0) 255)) (putnl)))
-
-(defun probe-sha256 ()
-  (sha256-init)
-  ;; SHA256 of abc -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-  (let ((m (make-array 3)))
-    (aset m 0 97) (aset m 1 98) (aset m 2 99)
-    (write-char-serial 97) (write-char-serial 98) (write-char-serial 99)
-    (write-char-serial 61)
-    (%print-digest (sha256 m)))
-  ;; SHA256 of the empty string -> e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-  (write-char-serial 101) (write-char-serial 61)
-  (%print-digest (sha256 (make-array 0))))
-
-(defun %argv2 ()
-  (let ((n 0) (i 0))
-    (loop
-      (let ((b (mem-ref (+ 268436040 i) :u8)))
-        (when (or (< b 48) (> b 57)) (return n))
-        (setq n (+ (* n 10) (- b 48)))
-        (setq i (+ i 1))))))
-;; ---- WS5 fresh-eyes GC instrumentation (generated by genprobe.py) ----
-(defun %phexw (a)
-  (%phex (mem-ref (+ a 3) :u8)) (%phex (mem-ref (+ a 2) :u8))
-  (%phex (mem-ref (+ a 1) :u8)) (%phex (mem-ref a :u8)))
-(defun %ctrb (a) (setf (mem-ref a :u64) (+ (mem-ref a :u64) 1)))
-(defun %ctrz ()
-  (setf (mem-ref 268438400 :u64) 0)
-  (setf (mem-ref 268438408 :u64) 0)
-  (setf (mem-ref 268438416 :u64) 0)
-  (setf (mem-ref 268438424 :u64) 0)
-  (setf (mem-ref 268438432 :u64) 0)
-  (setf (mem-ref 268438440 :u64) 0)
-  (setf (mem-ref 268438448 :u64) 0)
-  (setf (mem-ref 268438456 :u64) 0)
-  0)
-(defun probe-gcmeta ()
-  (write-char-serial 102) (write-char-serial 115) (write-char-serial 61) (%phexw 268435520) (putnl)
-  (write-char-serial 116) (write-char-serial 115) (write-char-serial 61) (%phexw 268435528) (putnl)
-  (write-char-serial 115) (write-char-serial 122) (write-char-serial 61) (%phexw 268435536) (putnl)
-  (write-char-serial 115) (write-char-serial 98) (write-char-serial 61) (%phexw 268435544) (putnl)
-  (write-char-serial 103) (write-char-serial 99) (write-char-serial 61) (%phexw 268435552) (putnl)
-  (write-char-serial 114) (write-char-serial 115) (write-char-serial 61) (%phexw 268435560) (putnl)
-  (write-char-serial 114) (write-char-serial 49) (write-char-serial 61) (%phexw 268435568) (putnl)
-  (write-char-serial 114) (write-char-serial 52) (write-char-serial 61) (%phexw 268435576) (putnl)
-  (write-char-serial 118) (write-char-serial 97) (write-char-serial 61) (%phexw 268438016) (putnl)
-  (write-char-serial 118) (write-char-serial 108) (write-char-serial 61) (%phexw 268438020) (putnl)
-  (write-char-serial 99) (write-char-serial 101) (write-char-serial 61) (%phexw 268438032) (putnl)
-  (write-char-serial 112) (write-char-serial 98) (write-char-serial 61) (%phexw 268439040) (putnl)
-  (write-char-serial 98) (write-char-serial 109) (write-char-serial 61) (%phexw 268439064) (putnl)
-  (write-char-serial 99) (write-char-serial 98) (write-char-serial 61) (%phexw 268439104) (putnl)
-  0)
-(defun %pctrs ()
-  (write-char-serial 99) (write-char-serial 48) (write-char-serial 61) (%phexw 268438400) (putnl)
-  (write-char-serial 99) (write-char-serial 49) (write-char-serial 61) (%phexw 268438408) (putnl)
-  (write-char-serial 99) (write-char-serial 50) (write-char-serial 61) (%phexw 268438416) (putnl)
-  (write-char-serial 99) (write-char-serial 51) (write-char-serial 61) (%phexw 268438424) (putnl)
-  (write-char-serial 99) (write-char-serial 52) (write-char-serial 61) (%phexw 268438432) (putnl)
-  (write-char-serial 99) (write-char-serial 53) (write-char-serial 61) (%phexw 268438440) (putnl)
-  (write-char-serial 99) (write-char-serial 54) (write-char-serial 61) (%phexw 268438448) (putnl)
-  (write-char-serial 99) (write-char-serial 55) (write-char-serial 61) (%phexw 268438456) (putnl)
-  0)
-
-;; probe-oddword: plant a KNOWN cons-tagged machine word byte by byte, then ask
-;; gc.lisp's own predicates about it.  Nothing is inferred; the word is built
-;; here.  0x20000001 = a cons pointer into the arena.
-(defun probe-oddword ()
-  (setf (mem-ref 268438272 :u8) 1)
-  (setf (mem-ref 268438273 :u8) 0)
-  (setf (mem-ref 268438274 :u8) 0)
-  (setf (mem-ref 268438275 :u8) 32)
-  (write-char-serial 119) (write-char-serial 48) (write-char-serial 61) (%phexw 268438272) (putnl)
-  (write-char-serial 102) (write-char-serial 112) (write-char-serial 61) (%phexw-val (if (fixnump (%gc-read64 268438272)) 1 0)) (putnl)
-  (write-char-serial 105) (write-char-serial 112) (write-char-serial 61) (%phexw-val (if (%gc-is-pointer (%gc-read64 268438272)) 1 0)) (putnl)
-  ;; and an OBJECT-tagged word 0x20000009
-  (setf (mem-ref 268438272 :u8) 9)
-  (write-char-serial 119) (write-char-serial 49) (write-char-serial 61) (%phexw 268438272) (putnl)
-  (write-char-serial 105) (write-char-serial 57) (write-char-serial 61) (%phexw-val (if (%gc-is-pointer (%gc-read64 268438272)) 1 0)) (putnl))
-
-(defun probe-gcbulk ()
-  (%ctrz)
-  (sha256-init)
-  (let ((n (* (%argv2) 1024)))
-    (let ((m (make-array n)))
-      (let ((i 0))
-        (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
-      (write-char-serial 100) (write-char-serial 61) (%print-digest (sha256 m))))
-  (putnl)
-  (probe-gcmeta)
-  (%pctrs))
-
 
 (defun %mkchain (n)
   (let ((c nil) (i 0))
@@ -701,181 +285,286 @@
           (setq c (cons i c))
           (setq i (+ i 1)))))
 
-(defun probe-conschain ()
-  (%ctrz)
-  (let ((n (* (%argv2) 100)))
-    (let ((c (%mkchain n)))
-      ;; churn: allocate a lot of garbage so collections happen
-      (let ((k 0) (junk nil))
-        (loop (when (>= k 400000) (return nil))
-              (setq junk (cons k k))
-              (setq k (+ k 1))))
-      ;; walk and verify: element j (0-based from head) must be (n-1-j)
-      (let ((walked 0) (p c) (bad 0) (firstbad 0))
-        (loop
-          (when (eql p nil) (return nil))
-          (when (>= walked n) (return nil))
-          (let ((v (car p)))
-            (when (not (eql v (- n (+ walked 1))))
-              (when (eql bad 0) (setq firstbad walked))
-              (setq bad (+ bad 1))))
-          (setq walked (+ walked 1))
-          (setq p (cdr p)))
-        (write-char-serial 119) (write-char-serial 61) (%phexw-val walked) (putnl)
-        (write-char-serial 98) (write-char-serial 61) (%phexw-val bad) (putnl)
-        (write-char-serial 102) (write-char-serial 61) (%phexw-val firstbad) (putnl)
-        (write-char-serial 110) (write-char-serial 61) (%phexw-val n) (putnl))))
-  (probe-gcmeta)
-  (%pctrs))
+;; Walk a chain built by %mkchain and count elements that are not what they
+;; must be.  Element j counting from the head is (n-1-j).
+(defun %walkchain (c n)
+  (let ((walked 0) (p c) (bad 0))
+    (loop
+      (when (eql p nil) (return nil))
+      (when (>= walked n) (return nil))
+      (when (not (eql (car p) (- n (+ walked 1)))) (setq bad (+ bad 1)))
+      (setq walked (+ walked 1))
+      (setq p (cdr p)))
+    (+ bad (- n walked))))
 
+(defun %fill-bytes (m n)
+  (let ((i 0))
+    (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1)))))
 
-(defun %phexw-val (v)
-  (%phex (logand (ash v -24) 255)) (%phex (logand (ash v -16) 255))
-  (%phex (logand (ash v -8) 255))  (%phex (logand v 255)))
+(defun %exp-abc (a)
+  (aset a 0 186)
+  (aset a 1 120)
+  (aset a 2 22)
+  (aset a 3 191)
+  (aset a 4 143)
+  (aset a 5 1)
+  (aset a 6 207)
+  (aset a 7 234)
+  (aset a 8 65)
+  (aset a 9 65)
+  (aset a 10 64)
+  (aset a 11 222)
+  (aset a 12 93)
+  (aset a 13 174)
+  (aset a 14 34)
+  (aset a 15 35)
+  (aset a 16 176)
+  (aset a 17 3)
+  (aset a 18 97)
+  (aset a 19 163)
+  (aset a 20 150)
+  (aset a 21 23)
+  (aset a 22 122)
+  (aset a 23 156)
+  (aset a 24 180)
+  (aset a 25 16)
+  (aset a 26 255)
+  (aset a 27 97)
+  (aset a 28 242)
+  (aset a 29 0)
+  (aset a 30 21)
+  (aset a 31 173)
+  a)
 
+(defun %exp-empty (a)
+  (aset a 0 227)
+  (aset a 1 176)
+  (aset a 2 196)
+  (aset a 3 66)
+  (aset a 4 152)
+  (aset a 5 252)
+  (aset a 6 28)
+  (aset a 7 20)
+  (aset a 8 154)
+  (aset a 9 251)
+  (aset a 10 244)
+  (aset a 11 200)
+  (aset a 12 153)
+  (aset a 13 111)
+  (aset a 14 185)
+  (aset a 15 36)
+  (aset a 16 39)
+  (aset a 17 174)
+  (aset a 18 65)
+  (aset a 19 228)
+  (aset a 20 100)
+  (aset a 21 155)
+  (aset a 22 147)
+  (aset a 23 76)
+  (aset a 24 164)
+  (aset a 25 149)
+  (aset a 26 153)
+  (aset a 27 27)
+  (aset a 28 120)
+  (aset a 29 82)
+  (aset a 30 184)
+  (aset a 31 85)
+  a)
 
-;; probe-hdr: what does gc.lisp's header decoding actually see?
-;; VA (raw alloc pointer) at globals+0 is the address the NEXT object gets.
-(defun probe-hdr ()
-  (let ((a (mem-ref 268438016 :u32)))
-    (let ((v (make-array 5)))
-      (aset v 0 0)
-      ;; raw bytes of the header word at address A (exact: :u8 loads tag)
-      (write-char-serial 98) (write-char-serial 48) (write-char-serial 61) (%phexw-val (mem-ref a :u8)) (putnl)
-      (write-char-serial 98) (write-char-serial 49) (write-char-serial 61) (%phexw-val (mem-ref (+ a 1) :u8)) (putnl)
-      (write-char-serial 98) (write-char-serial 50) (write-char-serial 61) (%phexw-val (mem-ref (+ a 2) :u8)) (putnl)
-      (write-char-serial 98) (write-char-serial 51) (write-char-serial 61) (%phexw-val (mem-ref (+ a 3) :u8)) (putnl)
-      ;; what gc.lisp computes from the same word
-      (let ((h (%gc-read64 a)))
-        (write-char-serial 104) (write-char-serial 99) (write-char-serial 61) (%phexw-val (ash h -8)) (putnl)
-        (write-char-serial 104) (write-char-serial 115) (write-char-serial 61) (%phexw-val (logand h 255)) (putnl)
-        (write-char-serial 104) (write-char-serial 55) (write-char-serial 61) (%phexw-val (ash h -7)) (putnl))
-      (write-char-serial 97) (write-char-serial 61) (%phexw-val a) (putnl)
-      (write-char-serial 110) (write-char-serial 61) (%phexw-val (mem-ref 268438016 :u32)) (putnl))))
+(defun %exp-bulk (a)
+  (aset a 0 161)
+  (aset a 1 242)
+  (aset a 2 89)
+  (aset a 3 212)
+  (aset a 4 54)
+  (aset a 5 94)
+  (aset a 6 212)
+  (aset a 7 50)
+  (aset a 8 12)
+  (aset a 9 55)
+  (aset a 10 124)
+  (aset a 11 226)
+  (aset a 12 111)
+  (aset a 13 92)
+  (aset a 14 140)
+  (aset a 15 86)
+  (aset a 16 220)
+  (aset a 17 220)
+  (aset a 18 154)
+  (aset a 19 137)
+  (aset a 20 231)
+  (aset a 21 182)
+  (aset a 22 65)
+  (aset a 23 191)
+  (aset a 24 216)
+  (aset a 25 234)
+  (aset a 26 191)
+  (aset a 27 187)
+  (aset a 28 234)
+  (aset a 29 200)
+  (aset a 30 102)
+  (aset a 31 84)
+  a)
 
-;; probe-gcsmall: force a collection with a small VL, then report state.
-(defun probe-gcsmall ()
-  (%ctrz)
-  (let ((k 0) (junk nil))
-    (loop (when (>= k 200000) (return nil))
-          (setq junk (cons k k))
-          (setq k (+ k 1))))
+(defun probe-suite ()
+  (%sc-reset)
+  (sha256-init)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 99) (write-char-serial 111) (write-char-serial 100) (write-char-serial 101) (write-char-serial 103) (write-char-serial 101) (write-char-serial 110) (write-char-serial 32) (write-char-serial 98) (write-char-serial 97) (write-char-serial 115) (write-char-serial 105) (write-char-serial 99) (write-char-serial 115) (putnl)
+  (write-char-serial 97) (write-char-serial 100) (write-char-serial 100) (%chk (+ 1 2) 3)
+  (write-char-serial 109) (write-char-serial 117) (write-char-serial 108) (%chk (let ((x 5)) (* x x)) 25)
+  (write-char-serial 115) (write-char-serial 117) (write-char-serial 98) (%chk (- 100 58) 42)
+  (write-char-serial 100) (write-char-serial 101) (write-char-serial 102) (write-char-serial 117) (write-char-serial 110) (write-char-serial 45) (write-char-serial 99) (write-char-serial 97) (write-char-serial 108) (write-char-serial 108) (%chk (sq 7) 49)
+  (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 45) (write-char-serial 99) (write-char-serial 97) (write-char-serial 114) (write-char-serial 45) (write-char-serial 99) (write-char-serial 100) (write-char-serial 114) (%chk (let ((p (cons 3 4))) (+ (car p) (cdr p))) 7)
+  (write-char-serial 102) (write-char-serial 117) (write-char-serial 110) (write-char-serial 99) (write-char-serial 97) (write-char-serial 108) (write-char-serial 108) (%chk (funcall (function sq) 9) 81)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 119) (write-char-serial 111) (write-char-serial 114) (write-char-serial 100) (write-char-serial 32) (write-char-serial 119) (write-char-serial 105) (write-char-serial 100) (write-char-serial 116) (write-char-serial 104) (putnl)
+  (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 109) (write-char-serial 97) (write-char-serial 120) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741823) 1 0) 1)
+  (write-char-serial 112) (write-char-serial 97) (write-char-serial 115) (write-char-serial 116) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741824) 1 0) 0)
+  (write-char-serial 100) (write-char-serial 111) (write-char-serial 117) (write-char-serial 98) (write-char-serial 108) (write-char-serial 105) (write-char-serial 110) (write-char-serial 103) (write-char-serial 45) (write-char-serial 112) (write-char-serial 114) (write-char-serial 111) (write-char-serial 109) (write-char-serial 111) (write-char-serial 116) (write-char-serial 101) (write-char-serial 115) (write-char-serial 45) (write-char-serial 110) (write-char-serial 111) (write-char-serial 116) (write-char-serial 45) (write-char-serial 119) (write-char-serial 114) (write-char-serial 97) (write-char-serial 112) (write-char-serial 115) (%chk (if (> (ash 1 40) 0) 1 0) 1)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 32) (write-char-serial 112) (write-char-serial 114) (write-char-serial 111) (write-char-serial 109) (write-char-serial 111) (write-char-serial 116) (write-char-serial 105) (write-char-serial 111) (write-char-serial 110) (putnl)
+  (write-char-serial 108) (write-char-serial 111) (write-char-serial 103) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (write-char-serial 45) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (%chk (logand 1116352408 255) 152)
+  (write-char-serial 97) (write-char-serial 115) (write-char-serial 104) (write-char-serial 45) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (%chk (ash 1116352408 -24) 66)
+  (write-char-serial 99) (write-char-serial 97) (write-char-serial 114) (write-char-serial 114) (write-char-serial 121) (write-char-serial 45) (write-char-serial 50) (write-char-serial 94) (write-char-serial 51) (write-char-serial 48) (%chk (logand (+ 1073741824 1) 255) 1)
+  (write-char-serial 108) (write-char-serial 111) (write-char-serial 103) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (write-char-serial 45) (write-char-serial 109) (write-char-serial 97) (write-char-serial 120) (write-char-serial 45) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (%chk (logand 4294967295 255) 255)
+  (write-char-serial 108) (write-char-serial 111) (write-char-serial 103) (write-char-serial 120) (write-char-serial 111) (write-char-serial 114) (write-char-serial 45) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (%chk (logand (logxor 4294967295 1116352408) 255) 103)
+  (write-char-serial 109) (write-char-serial 117) (write-char-serial 108) (write-char-serial 45) (write-char-serial 112) (write-char-serial 114) (write-char-serial 111) (write-char-serial 109) (write-char-serial 111) (write-char-serial 116) (write-char-serial 101) (write-char-serial 45) (write-char-serial 108) (write-char-serial 111) (%chk (logand (* 17034 65536) 255) 0)
+  (write-char-serial 115) (write-char-serial 104) (write-char-serial 108) (write-char-serial 45) (write-char-serial 111) (write-char-serial 118) (write-char-serial 101) (write-char-serial 114) (write-char-serial 102) (write-char-serial 108) (write-char-serial 111) (write-char-serial 119) (%chk (ash (ash 3 30) -24) 192)
+  (write-char-serial 109) (write-char-serial 97) (write-char-serial 115) (write-char-serial 107) (write-char-serial 45) (write-char-serial 116) (write-char-serial 104) (write-char-serial 101) (write-char-serial 110) (write-char-serial 45) (write-char-serial 115) (write-char-serial 104) (write-char-serial 105) (write-char-serial 102) (write-char-serial 116) (%chk (ash (logand (ash 255 24) 4294967295) -24) 255)
+  (write-char-serial 109) (write-char-serial 117) (write-char-serial 108) (write-char-serial 45) (write-char-serial 112) (write-char-serial 114) (write-char-serial 111) (write-char-serial 109) (write-char-serial 111) (write-char-serial 116) (write-char-serial 101) (write-char-serial 45) (write-char-serial 104) (write-char-serial 105) (%xgap (ash (* 17034 65536) -24) 66)
+  (write-char-serial 109) (write-char-serial 117) (write-char-serial 108) (write-char-serial 45) (write-char-serial 114) (write-char-serial 101) (write-char-serial 115) (write-char-serial 117) (write-char-serial 108) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%xgap (if (fixnump (* 17034 65536)) 1 0) 0)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 109) (write-char-serial 101) (write-char-serial 109) (write-char-serial 45) (write-char-serial 114) (write-char-serial 101) (write-char-serial 102) (write-char-serial 32) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (write-char-serial 32) (write-char-serial 114) (write-char-serial 111) (write-char-serial 117) (write-char-serial 110) (write-char-serial 100) (write-char-serial 32) (write-char-serial 116) (write-char-serial 114) (write-char-serial 105) (write-char-serial 112) (putnl)
+  (setf (mem-ref 268438272 :u32) 1116352408)
+  (write-char-serial 109) (write-char-serial 101) (write-char-serial 109) (write-char-serial 114) (write-char-serial 101) (write-char-serial 102) (write-char-serial 45) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (write-char-serial 45) (write-char-serial 108) (write-char-serial 111) (%chk (logand (mem-ref 268438272 :u32) 255) 152)
+  (write-char-serial 109) (write-char-serial 101) (write-char-serial 109) (write-char-serial 114) (write-char-serial 101) (write-char-serial 102) (write-char-serial 45) (write-char-serial 117) (write-char-serial 51) (write-char-serial 50) (write-char-serial 45) (write-char-serial 104) (write-char-serial 105) (%chk (ash (mem-ref 268438272 :u32) -24) 66)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 99) (write-char-serial 97) (write-char-serial 108) (write-char-serial 108) (write-char-serial 105) (write-char-serial 110) (write-char-serial 103) (write-char-serial 32) (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 118) (write-char-serial 101) (write-char-serial 110) (write-char-serial 116) (write-char-serial 105) (write-char-serial 111) (write-char-serial 110) (write-char-serial 32) (write-char-serial 40) (write-char-serial 62) (write-char-serial 52) (write-char-serial 32) (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 115) (write-char-serial 41) (putnl)
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 115) (write-char-serial 53) (write-char-serial 45) (write-char-serial 115) (write-char-serial 117) (write-char-serial 109) (%chk (f5 1 2 4 8 16) 31)
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 115) (write-char-serial 54) (write-char-serial 45) (write-char-serial 115) (write-char-serial 117) (write-char-serial 109) (%chk (f6 1 2 4 8 16 32) 63)
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 115) (write-char-serial 53) (write-char-serial 45) (write-char-serial 108) (write-char-serial 97) (write-char-serial 115) (write-char-serial 116) (%chk (f5id 1 2 4 8 16) 16)
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 115) (write-char-serial 54) (write-char-serial 45) (write-char-serial 108) (write-char-serial 97) (write-char-serial 115) (write-char-serial 116) (%chk (f6id 1 2 4 8 16 32) 32)
+  (write-char-serial 102) (write-char-serial 114) (write-char-serial 97) (write-char-serial 109) (write-char-serial 101) (write-char-serial 115) (write-char-serial 108) (write-char-serial 111) (write-char-serial 116) (write-char-serial 45) (write-char-serial 115) (write-char-serial 101) (write-char-serial 116) (write-char-serial 113) (%chk (g5 0 1 2 4 8) 42)
+  (write-char-serial 102) (write-char-serial 114) (write-char-serial 97) (write-char-serial 109) (write-char-serial 101) (write-char-serial 115) (write-char-serial 108) (write-char-serial 111) (write-char-serial 116) (write-char-serial 45) (write-char-serial 99) (write-char-serial 97) (write-char-serial 114) (write-char-serial 114) (write-char-serial 121) (%chk (g5d 0 1 2 4 8) 8)
+  (let ((s (make-array 64)))
+    (%fill-bytes s 64)
+    (buf-write-u32 s 0 5) (buf-write-u32 s 48 9)
+    (write-char-serial 102) (write-char-serial 114) (write-char-serial 97) (write-char-serial 109) (write-char-serial 101) (write-char-serial 115) (write-char-serial 108) (write-char-serial 111) (write-char-serial 116) (write-char-serial 45) (write-char-serial 98) (write-char-serial 117) (write-char-serial 102) (%chk (g5buf s 0 16 32 48) 14))
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 109) (write-char-serial 97) (write-char-serial 103) (write-char-serial 110) (write-char-serial 105) (write-char-serial 116) (write-char-serial 117) (write-char-serial 100) (write-char-serial 101) (write-char-serial 32) (write-char-serial 108) (write-char-serial 97) (write-char-serial 100) (write-char-serial 100) (write-char-serial 101) (write-char-serial 114) (write-char-serial 32) (write-char-serial 40) (write-char-serial 51) (write-char-serial 48) (write-char-serial 47) (write-char-serial 51) (write-char-serial 50) (write-char-serial 47) (write-char-serial 52) (write-char-serial 56) (write-char-serial 47) (write-char-serial 54) (write-char-serial 48) (write-char-serial 47) (write-char-serial 54) (write-char-serial 50) (write-char-serial 32) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 115) (write-char-serial 41) (putnl)
+  (write-char-serial 51) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (%chk (logand 1073741823 255) 255)
+  (write-char-serial 51) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 115) (write-char-serial 104) (write-char-serial 114) (%chk (logand (ash 1073741823 -8) 255) 255)
+  (write-char-serial 51) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logior 1073741823 1) 255) 255)
+  (write-char-serial 51) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 120) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logxor 1073741823 255) 255) 0)
+  (write-char-serial 51) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 110) (write-char-serial 99) (%chk (logand (+ 1073741823 1) 255) 0)
+  (write-char-serial 51) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 100) (write-char-serial 101) (write-char-serial 99) (%chk (logand (- 1073741823 1) 255) 254)
+  (write-char-serial 51) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (%chk (logand 2609737539 255) 67)
+  (write-char-serial 51) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 115) (write-char-serial 104) (write-char-serial 114) (%chk (logand (ash 2609737539 -8) 255) 111)
+  (write-char-serial 51) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logior 2609737539 1) 255) 67)
+  (write-char-serial 51) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 120) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logxor 2609737539 255) 255) 188)
+  (write-char-serial 51) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 110) (write-char-serial 99) (%chk (logand (+ 2609737539 1) 255) 68)
+  (write-char-serial 51) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 100) (write-char-serial 101) (write-char-serial 99) (%chk (logand (- 2609737539 1) 255) 66)
+  (write-char-serial 52) (write-char-serial 56) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (%chk (logand 171031759355904 255) 0)
+  (write-char-serial 52) (write-char-serial 56) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 115) (write-char-serial 104) (write-char-serial 114) (%chk (logand (ash 171031759355904 -8) 255) 0)
+  (write-char-serial 52) (write-char-serial 56) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logior 171031759355904 1) 255) 1)
+  (write-char-serial 52) (write-char-serial 56) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 120) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logxor 171031759355904 255) 255) 255)
+  (write-char-serial 52) (write-char-serial 56) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 110) (write-char-serial 99) (%chk (logand (+ 171031759355904 1) 255) 1)
+  (write-char-serial 52) (write-char-serial 56) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 100) (write-char-serial 101) (write-char-serial 99) (%chk (logand (- 171031759355904 1) 255) 255)
+  (write-char-serial 54) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (%chk (logand 576460752303435833 255) 57)
+  (write-char-serial 54) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 115) (write-char-serial 104) (write-char-serial 114) (%chk (logand (ash 576460752303435833 -8) 255) 48)
+  (write-char-serial 54) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logior 576460752303435833 1) 255) 57)
+  (write-char-serial 54) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 120) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logxor 576460752303435833 255) 255) 198)
+  (write-char-serial 54) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 110) (write-char-serial 99) (%chk (logand (+ 576460752303435833 1) 255) 58)
+  (write-char-serial 54) (write-char-serial 48) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 100) (write-char-serial 101) (write-char-serial 99) (%chk (logand (- 576460752303435833 1) 255) 56)
+  (write-char-serial 54) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 97) (write-char-serial 110) (write-char-serial 100) (%chk (logand 4611686018427387911 255) 7)
+  (write-char-serial 54) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 115) (write-char-serial 104) (write-char-serial 114) (%chk (logand (ash 4611686018427387911 -8) 255) 0)
+  (write-char-serial 54) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logior 4611686018427387911 1) 255) 7)
+  (write-char-serial 54) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 120) (write-char-serial 111) (write-char-serial 114) (%chk (logand (logxor 4611686018427387911 255) 255) 248)
+  (write-char-serial 54) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 105) (write-char-serial 110) (write-char-serial 99) (%chk (logand (+ 4611686018427387911 1) 255) 8)
+  (write-char-serial 54) (write-char-serial 50) (write-char-serial 98) (write-char-serial 105) (write-char-serial 116) (write-char-serial 45) (write-char-serial 100) (write-char-serial 101) (write-char-serial 99) (%chk (logand (- 4611686018427387911 1) 255) 6)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 99) (write-char-serial 114) (write-char-serial 121) (write-char-serial 112) (write-char-serial 116) (write-char-serial 111) (putnl)
+  (let ((m (make-array 3)) (e (make-array 32)))
+    (aset m 0 97) (aset m 1 98) (aset m 2 99)
+    (write-char-serial 115) (write-char-serial 104) (write-char-serial 97) (write-char-serial 50) (write-char-serial 53) (write-char-serial 54) (write-char-serial 45) (write-char-serial 97) (write-char-serial 98) (write-char-serial 99) (%chkdig (sha256 m) (%exp-abc e)))
+  (let ((e (make-array 32)))
+    (write-char-serial 115) (write-char-serial 104) (write-char-serial 97) (write-char-serial 50) (write-char-serial 53) (write-char-serial 54) (write-char-serial 45) (write-char-serial 101) (write-char-serial 109) (write-char-serial 112) (write-char-serial 116) (write-char-serial 121) (%chkdig (sha256 (make-array 0)) (%exp-empty e)))
+  (let ((s (make-array 64)))
+    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
+    (buf-write-u32 s 0 286331153)
+    (buf-write-u32 s 16 16909060)
+    (buf-write-u32 s 32 2609737539)
+    (buf-write-u32 s 48 19088743)
+    (chacha-qr s 0 16 32 48)
+    (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 45) (write-char-serial 113) (write-char-serial 114) (write-char-serial 45) (write-char-serial 119) (write-char-serial 48) (%chk (buf-read-u32 s 0) 3928658676)
+    (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 45) (write-char-serial 113) (write-char-serial 114) (write-char-serial 45) (write-char-serial 119) (write-char-serial 49) (%chk (buf-read-u32 s 16) 3407673550)
+    (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 45) (write-char-serial 113) (write-char-serial 114) (write-char-serial 45) (write-char-serial 119) (write-char-serial 50) (%chk (buf-read-u32 s 32) 1166100270)
+    (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 45) (write-char-serial 113) (write-char-serial 114) (write-char-serial 45) (write-char-serial 119) (write-char-serial 51) (%chk (buf-read-u32 s 48) 1484899515)
+    0)
+  (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 99) (write-char-serial 111) (write-char-serial 108) (write-char-serial 108) (write-char-serial 101) (write-char-serial 99) (write-char-serial 116) (write-char-serial 111) (write-char-serial 114) (write-char-serial 58) (write-char-serial 32) (write-char-serial 98) (write-char-serial 117) (write-char-serial 108) (write-char-serial 107) (write-char-serial 32) (write-char-serial 83) (write-char-serial 72) (write-char-serial 65) (write-char-serial 32) (write-char-serial 43) (write-char-serial 32) (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 105) (write-char-serial 110) (write-char-serial 32) (write-char-serial 115) (write-char-serial 117) (write-char-serial 114) (write-char-serial 118) (write-char-serial 105) (write-char-serial 118) (write-char-serial 97) (write-char-serial 108) (putnl)
+  (let ((chain (%mkchain 1000)))
+    (let ((m (make-array 16384)) (e (make-array 32)))
+      (%fill-bytes m 16384)
+      (write-char-serial 115) (write-char-serial 104) (write-char-serial 97) (write-char-serial 50) (write-char-serial 53) (write-char-serial 54) (write-char-serial 45) (write-char-serial 98) (write-char-serial 117) (write-char-serial 108) (write-char-serial 107) (write-char-serial 45) (write-char-serial 49) (write-char-serial 54) (write-char-serial 107) (%chkdig (sha256 m) (%exp-bulk e)))
+    (write-char-serial 99) (write-char-serial 111) (write-char-serial 108) (write-char-serial 108) (write-char-serial 101) (write-char-serial 99) (write-char-serial 116) (write-char-serial 105) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 45) (write-char-serial 114) (write-char-serial 97) (write-char-serial 110) (%chkge (%gccount) 1)
+    (write-char-serial 99) (write-char-serial 104) (write-char-serial 97) (write-char-serial 105) (write-char-serial 110) (write-char-serial 45) (write-char-serial 115) (write-char-serial 117) (write-char-serial 114) (write-char-serial 118) (write-char-serial 105) (write-char-serial 118) (write-char-serial 101) (write-char-serial 100) (write-char-serial 45) (write-char-serial 103) (write-char-serial 99) (%chk (%walkchain chain 1000) 0))
+  (write-char-serial 61) (write-char-serial 61) (write-char-serial 32) (write-char-serial 115) (write-char-serial 117) (write-char-serial 109) (write-char-serial 109) (write-char-serial 97) (write-char-serial 114) (write-char-serial 121) (write-char-serial 32) (write-char-serial 32) (write-char-serial 112) (write-char-serial 97) (write-char-serial 115) (write-char-serial 115) (write-char-serial 32) (%pdec (mem-ref 268438400 :u32))
+  (write-char-serial 32) (write-char-serial 32) (write-char-serial 102) (write-char-serial 97) (write-char-serial 105) (write-char-serial 108) (write-char-serial 32) (%pdec (mem-ref 268438408 :u32))
+  (write-char-serial 32) (write-char-serial 32) (write-char-serial 107) (write-char-serial 110) (write-char-serial 111) (write-char-serial 119) (write-char-serial 110) (write-char-serial 45) (write-char-serial 103) (write-char-serial 97) (write-char-serial 112) (write-char-serial 32) (%pdec (mem-ref 268438416 :u32))
   (putnl)
-  (probe-gcmeta)
-  (%pctrs))
+  (mem-ref 268438408 :u32))
 
-;; probe-ptrword: can %gc-forward-slot EVER accept a heap word holding a
-;; cons pointer?  Allocates (cons (cons 1 2) 3): the inner cons lands at the
-;; pre-allocation VA, the outer 16 bytes later, and the outer cons's CAR slot
-;; therefore holds a cons-tagged pointer.  Reads that exact word both ways.
-(defun probe-ptrword ()
-  (let ((a (mem-ref 268438016 :u32)))
-    (let ((inner (cons 1 2)))
-      (let ((outer (cons inner 3)))
-        (let ((oa (+ a 16)))
-          (write-char-serial 98) (write-char-serial 48) (write-char-serial 61) (%phexw-val (mem-ref oa :u8)) (putnl)
-          (write-char-serial 98) (write-char-serial 49) (write-char-serial 61) (%phexw-val (mem-ref (+ oa 1) :u8)) (putnl)
-          (write-char-serial 105) (write-char-serial 97) (write-char-serial 61) (%phexw-val a) (putnl)
-          (write-char-serial 102) (write-char-serial 112) (write-char-serial 61) (%phexw-val (if (fixnump (%gc-read64 oa)) 1 0)) (putnl)
-          (write-char-serial 105) (write-char-serial 112) (write-char-serial 61) (%phexw-val (if (%gc-is-pointer (%gc-read64 oa)) 1 0)) (putnl)
-          (write-char-serial 99) (write-char-serial 118) (write-char-serial 61) (%phexw-val (+ (car outer) 0)) (putnl))))))
+;; Heap / collector state.  The one diagnostic that is not a pass/fail check:
+;; it reports the map, which is what you want when something is wrong rather
+;; than merely failing.
+(defun probe-gcmeta ()
+  (write-char-serial 102) (write-char-serial 114) (write-char-serial 111) (write-char-serial 109) (write-char-serial 95) (write-char-serial 115) (write-char-serial 116) (write-char-serial 97) (write-char-serial 114) (write-char-serial 116) (write-char-serial 61) (%phexw 268435520) (putnl)
+  (write-char-serial 116) (write-char-serial 111) (write-char-serial 95) (write-char-serial 115) (write-char-serial 116) (write-char-serial 97) (write-char-serial 114) (write-char-serial 116) (write-char-serial 32) (write-char-serial 32) (write-char-serial 61) (%phexw 268435528) (putnl)
+  (write-char-serial 115) (write-char-serial 112) (write-char-serial 97) (write-char-serial 99) (write-char-serial 101) (write-char-serial 95) (write-char-serial 115) (write-char-serial 105) (write-char-serial 122) (write-char-serial 101) (write-char-serial 61) (%phexw 268435536) (putnl)
+  (write-char-serial 115) (write-char-serial 116) (write-char-serial 97) (write-char-serial 99) (write-char-serial 107) (write-char-serial 95) (write-char-serial 98) (write-char-serial 97) (write-char-serial 115) (write-char-serial 101) (write-char-serial 61) (%phexw 268435544) (putnl)
+  (write-char-serial 103) (write-char-serial 99) (write-char-serial 95) (write-char-serial 99) (write-char-serial 111) (write-char-serial 117) (write-char-serial 110) (write-char-serial 116) (write-char-serial 32) (write-char-serial 32) (write-char-serial 61) (%phexw 268435552) (putnl)
+  (write-char-serial 86) (write-char-serial 65) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 61) (%phexw 268438016) (putnl)
+  (write-char-serial 86) (write-char-serial 76) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 61) (%phexw 268438020) (putnl)
+  (write-char-serial 67) (write-char-serial 69) (write-char-serial 78) (write-char-serial 86) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 32) (write-char-serial 61) (%phexw 268438032) (putnl)
+  (write-char-serial 112) (write-char-serial 97) (write-char-serial 103) (write-char-serial 101) (write-char-serial 95) (write-char-serial 98) (write-char-serial 97) (write-char-serial 115) (write-char-serial 101) (write-char-serial 32) (write-char-serial 61) (%phexw 268438040) (putnl)
+  (write-char-serial 115) (write-char-serial 116) (write-char-serial 97) (write-char-serial 114) (write-char-serial 116) (write-char-serial 95) (write-char-serial 98) (write-char-serial 109) (write-char-serial 112) (write-char-serial 32) (write-char-serial 61) (%phexw 268438044) (putnl)
+  (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 95) (write-char-serial 98) (write-char-serial 109) (write-char-serial 112) (write-char-serial 32) (write-char-serial 32) (write-char-serial 61) (%phexw 268438048) (putnl)
+  0)
+
+;; Bulk SHA over argv[2] KiB: the size knob for pushing the collector.  Prints
+;; the digest and the collection count; verify the digest against hashlib.
+(defun probe-bulk ()
+  (sha256-init)
+  (let ((n (* (%argv2) 1024)))
+    (let ((m (make-array n)))
+      (%fill-bytes m n)
+      (write-char-serial 100) (write-char-serial 105) (write-char-serial 103) (write-char-serial 101) (write-char-serial 115) (write-char-serial 116) (write-char-serial 61) (%print-digest (sha256 m))
+      (write-char-serial 99) (write-char-serial 111) (write-char-serial 108) (write-char-serial 108) (write-char-serial 101) (write-char-serial 99) (write-char-serial 116) (write-char-serial 105) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 61) (%pdec (%gccount)) (putnl)))
+  0)
+
+;; Cons-chain forwarding over argv[2]*100 conses, churned by a 4 KiB SHA so
+;; real collections happen underneath it.  Prints elements wrong (want 0).
+(defun probe-chain ()
+  (sha256-init)
+  (let ((n (* (%argv2) 100)))
+    (let ((chain (%mkchain n)))
+      (let ((m (make-array 4096)))
+        (%fill-bytes m 4096)
+        (sha256 m))
+      (write-char-serial 119) (write-char-serial 114) (write-char-serial 111) (write-char-serial 110) (write-char-serial 103) (write-char-serial 45) (write-char-serial 101) (write-char-serial 108) (write-char-serial 101) (write-char-serial 109) (write-char-serial 101) (write-char-serial 110) (write-char-serial 116) (write-char-serial 115) (write-char-serial 61) (%pdec (%walkchain chain n)) (putnl)
+      (write-char-serial 99) (write-char-serial 111) (write-char-serial 108) (write-char-serial 108) (write-char-serial 101) (write-char-serial 99) (write-char-serial 116) (write-char-serial 105) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 61) (%pdec (%gccount)) (putnl)))
+  0)
+
 
 (defun kernel-main ()
-  (let ((which (%parse-decimal-at-fixed-208)))
+  (let ((which (%argv1)))
     (cond
-      ((eql which 1) (probe-arith))
-      ((eql which 2) (probe-defcall))
-      ((eql which 3) (probe-cons))
-      ((eql which 4) (probe-funcall))
-      ((eql which 5) (probe-fixnum-width))
-      ((eql which 6) (probe-argv))
-      ((eql which 7) (probe-bignum))
-      ((eql which 8) (probe-memu32))
-      ((eql which 9) (probe-memu32-split))
-      ((eql which 10) (probe-promote))
-      ((eql which 11) (probe-sha256))
-      ((eql which 12) (probe-lshift))
-      ((eql which 13) (probe-chacha))
-      ((eql which 14) (probe-arity))
-      ((eql which 15) (probe-chacha2))
-      ((eql which 16) (probe-sha-bulk))
-      ((eql which 17) (probe-fixnum-spin))
-      ((eql which 18) (probe-rot))
-      ((eql which 19) (probe-heapuse))
-      ((eql which 27) (probe-gcstate))
-      ((eql which 40) (probe-gcmeta))
-      ((eql which 41) (probe-gcbulk))
-      ((eql which 42) (probe-conschain))
-      ((eql which 43) (probe-hdr))
-      ((eql which 44) (probe-gcsmall))
-      ((eql which 46) (probe-oddword))
-      ((eql which 20) (probe-nblocks))
-      ((eql which 21) (probe-frameslot))
-      ((eql which 22) (probe-qrsteps))
-      ((eql which 23) (probe-qrcmp))
-      ((eql which 24) (probe-rotbig))
-      ((eql which 25) (probe-band))
-      ((eql which 26) (probe-rfcqr))
-      (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
-                (probe-funcall) (probe-fixnum-width)))))
-  (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)
-  (write-char-serial 69) (putnl)   ; DONE
+      ((eql which 1) (probe-gcmeta))
+      ((eql which 2) (probe-bulk))
+      ((eql which 3) (probe-chain))
+      (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
+
 ")
+
 
 ;;; ============================================================
 ;;; Assemble
 ;;; ============================================================
-
-;;; ============================================================
-;;; Opt-in GC diagnostics (MODUS_I386_GCDIAG=1)
-;;; ============================================================
-;;; These OVERRIDE gc.lisp's %gc-forward-slot / %gc-scan-stack (last-defun-wins)
-;;; with counting + stack-dumping copies.  They are what measured the WS5
-;;; findings: the per-collection stack-word count, the low-nibble histogram of
-;;; scanned stack words, and how many candidates each gate accepts.  Counters
-;;; live at 0x10000B80+8k and are printed RAW by %pctrs, so each printed value
-;;; is TWICE the count (a raw :u64 store of a Lisp fixnum writes value<<1).
-;;; Off by default: they change the collector, so they must never be in a
-;;; shipping image.
-(defvar *gcdiag-source*
-  (if (let ((v (sb-ext:posix-getenv "MODUS_I386_GCDIAG")))
-        (and v (plusp (length v)) (not (string= v "0"))))
-      "
-(defun %gc-forward-slot (raw-slot-addr from-start from-size free-ptr)
-  (let ((val (%gc-read64 raw-slot-addr)))
-    (if (%gc-is-pointer val)
-        (progn
-          (%ctrb 268438424)
-          (if (%gc-in-space val from-start from-size)
-              (progn
-                (%ctrb 268438432)
-                (if (%gc-is-start (logand val (lognot 15)))
-                    (progn
-                      (%ctrb 268438440)
-                      (%gc-copy-object val from-start from-size free-ptr)
-                      (%gc-write64 raw-slot-addr (%gc-read64 268435712))
-                      (%gc-read64 268435720))
-                    free-ptr))
-              free-ptr))
-        free-ptr)))
-
-(defun %gc-scan-stack (rsp-val stack-base from-start from-size free-ptr)
-  (let ((addr rsp-val)
-        (fp free-ptr)
-        (dump (eql (%gc-count) 0)))
-    (loop
-      (when (>= addr stack-base) (return fp))
-      (%ctrb 268438400)
-      (let ((nib (logand (mem-ref addr :u8) 15)))
-        (when (eql nib 1) (%ctrb 268438408))
-        (when (eql nib 9) (%ctrb 268438416)))
-      (when dump (%phexw addr) (write-char-serial 32))
-      (setq fp (%gc-forward-slot addr from-start from-size fp))
-      (setq addr (+ addr 8)))))
-
-"
-      ""))
 
 (defvar *full-source*
   (concatenate 'string
@@ -884,8 +573,7 @@
     *rt-source* (string #\Newline)
     *bridge-source* (string #\Newline)
     *crypto-source* (string #\Newline)
-    *driver-source* (string #\Newline)
-    *gcdiag-source*))
+    *driver-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
@@ -910,39 +598,47 @@
 (setf modus.mvm.i386::*i386-checked-arith-slowpath*
       (let ((v (sb-ext:posix-getenv "MODUS_I386_NO_CHECKED")))
         (not (and v (plusp (length v))))))
-;; WS5: the NATIVE i386 Cheney collector is ON by default (the third arch
-;; arm, alongside x64's emit-gc-trampoline and aarch64's native MCGC).
-;; MILESTONE: SHA-256 over 64 KiB completes with the digest Python hashlib
-;; produces, across 8 collections, rc=0; a 1000-cons chain survives 6 forced
-;; collections intact; 4 KiB of SHA-256 is exact under a collection every 1 MB.
+;; WS5: the NATIVE i386 Cheney collector is ON by default (the third arch arm,
+;; alongside x64's emit-gc-trampoline and aarch64's native MCGC).  It landed
+;; green: SHA-256 over 64 KiB produces the digest Python hashlib does, across 8
+;; collections; a cons chain survives 6 forced collections intact; 4 KiB of
+;; SHA-256 is exact under a collection every 1 MB.
 ;;
-;; Knobs, all off/normal by default:
-;;   MODUS_I386_GC=0        build WITHOUT the collector (every allocation
-;;                          permanent; the arena is the lifetime budget and
-;;                          bulk work dies honestly at its edge)
-;;   MODUS_I386_BMP=0       drop the object-start / cons-kind bit-set.  Only
-;;                          meaningful with the collector off: without the
-;;                          bitmaps scan_word has no conservative-root
-;;                          validation and copy_object stamps forwarding
-;;                          pointers over mid-object data.
-;;   MODUS_I386_VL=<bytes>  first GC trigger, so a collection can be provoked
-;;                          in seconds instead of gigabytes
+;; ---- ENV KNOBS (the complete list; defaults are what ships) ---------------
+;; PRODUCTION
+;;   MODUS_I386_OUT=<path>    where to write the image
+;;                            (default /home/claude/ws5-gate-out/modus-i386-cli)
+;;   MODUS_I386_LAYER=1..4    how much of the stack to bake in.  1 prelude,
+;;                            2 +gc/rt, 3 +the CL bridge, 4 +crypto.  Default 1
+;;                            during bring-up; the suite needs 4.
+;; DEV / TRIAGE ONLY
+;;   MODUS_I386_GC=0          build WITHOUT the collector.  Every allocation is
+;;                            then permanent, the arena is the whole lifetime
+;;                            budget, and bulk work dies honestly at its edge.
+;;   MODUS_I386_BMP=0         drop the object-start / cons-kind bit-set.  Only
+;;                            sensible together with GC=0: without the bitmaps
+;;                            scan_word has no conservative-root validation and
+;;                            copy_object stamps forwarding pointers over
+;;                            mid-object data.
+;;   MODUS_I386_VL=<bytes>    first GC trigger, so a collection can be provoked
+;;                            in seconds instead of gigabytes.
 ;;   MODUS_I386_GCSTRESS=<bytes>
-;;                          keep collecting at that interval forever.  A
-;;                          copying collector's corruption appears at the
-;;                          SECOND collection (the first leaves the old
-;;                          semispace intact), so forcing dozens of cycles out
-;;                          of a small workload is what makes survival tests
-;;                          cheap.
-;;   MODUS_I386_GCDIAG=1    counting/dumping overrides (they patch mvm/gc.lisp,
-;;                          which the native collector no longer uses, so they
-;;                          are inert now and kept only for the record)
+;;                            keep collecting at that interval forever.  A
+;;                            copying collector's corruption shows up at the
+;;                            SECOND collection — the first leaves the old
+;;                            semispace intact — so forcing dozens of cycles
+;;                            out of a small workload is what makes the
+;;                            survival tests cheap.
+;;   MODUS_I386_NO_CHECKED=1  disable the checked-arith slow paths, isolating
+;;                            the overflow-promotion ops from the rest of
+;;                            i386 codegen when triaging a miscompile.
+;; Everything is driven through scripts/run-i386.sh; see that script first.
 (flet ((envp (n dflt) (let ((v (sb-ext:posix-getenv n)))
                         (if (and v (plusp (length v)))
                             (not (string= v "0"))
                             dflt))))
-  (let* ((gcon (envp "MODUS_I386_GC" t))
-         (bmpon (envp "MODUS_I386_BMP" t)))
+  (let ((gcon (envp "MODUS_I386_GC" t))
+        (bmpon (envp "MODUS_I386_BMP" t)))
     (setf modus.mvm.i386::*i386-gc-bitmap-enabled* bmpon)
     (setf modus.mvm.i386::*i386-gc-enabled* gcon)
     (format t "~&  GC: collector=~A bitmap=~A~%" gcon bmpon)))

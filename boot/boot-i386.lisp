@@ -1,4 +1,9 @@
 ;;;; boot-i386.lisp - i386 (32-bit x86) Boot Sequence for Modus
+;;;; LEGACY MINI-LISP PATH.  This image runs mvm/repl-source.lisp — a separate
+;;;; 708-line toy Lisp with its own reader, printer and evaluator, NOT the real
+;;;; Common Lisp stack.  The real CL image on i386 is mvm/build-i386-cli.lisp
+;;;; (prelude + gc + rt + the cl-*.lisp bridge + crypto), driven by
+;;;; scripts/run-i386.sh.  Retiring this second Lisp is its own workstream.
 ;;;;
 ;;;; Boot protocol for i386 (Multiboot1 via QEMU -kernel or GRUB):
 ;;;;   1. Multiboot1 header at 0x100000 (1MB)

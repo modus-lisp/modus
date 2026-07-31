@@ -290,7 +290,51 @@ sbcl --script mvm/build-rpi-repl.lisp     # Serial REPL
 sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
 ```
 
-### QEMU i386 (32-bit x86, Multiboot)
+### Running i386 (hosted Linux/i386 — the REAL CL image)
+
+`mvm/build-i386-cli.lisp` is the real Common Lisp stack on 32 bits: prelude +
+gc + rt + the whole `cl-*.lisp` bridge + the **unforked** `net/crypto.lisp`,
+compiled to native i386. Everything goes through one script:
+
+```bash
+./scripts/run-i386.sh build          # build the image (layer 4)
+./scripts/run-i386.sh test           # regression suite; exit 0 = green
+./scripts/run-i386.sh gc             # heap / collector state
+./scripts/run-i386.sh bulk 64        # SHA-256 over 64 KiB: digest + collections
+./scripts/run-i386.sh chain 10       # cons-chain survival across collections
+./scripts/run-i386.sh exec ARGS...   # arbitrary invocation
+```
+
+**32-bit ELFs need `qemu-i386-static` — binfmt_misc is NOT registered here, so
+running the binary directly does not fail loudly, it silently fails to exec.**
+That cost hours once; the run script wraps it so it cannot happen again.
+
+The suite is self-checking: it prints PASS/FAIL per check and a summary, and
+exits non-zero on any failure. Expected values (digests, RFC 8439 quarter-round
+words, magnitude-ladder residues) are GENERATED from one computation and baked
+in — hand-transcribed hex produced four separate false findings during bring-up.
+Checks marked `KNOWN-GAP` are open defects reported loudly on every run without
+failing the gate (currently: runtime multiply does not promote on overflow —
+`ash` and `+` do).
+
+Build knobs (env; full list at the top of `mvm/build-i386-cli.lisp`):
+`MODUS_I386_OUT`, `MODUS_I386_LAYER` are production; `MODUS_I386_GC=0`,
+`MODUS_I386_BMP=0`, `MODUS_I386_VL=<bytes>`, `MODUS_I386_GCSTRESS=<bytes>`,
+`MODUS_I386_NO_CHECKED=1` are dev/triage only. `GCSTRESS` makes the collector
+recollect at a fixed interval — a copying collector's corruption appears at the
+SECOND collection, so this is what makes survival tests cheap.
+
+i386 has a **native Cheney collector** (`i386-emit-gc-trampoline` in
+`translate-i386.lisp`), the third arch arm after x64 and aarch64, on by default.
+It is gated on `*i386-linux-mode*`: bare-metal i386 has no GC metadata or
+bitmaps and keeps `int $0x31`.
+
+### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
+
+The builds below run `mvm/repl-source.lisp`, a separate 708-line toy Lisp with
+its own reader/printer/evaluator — **not** the CL stack above. Retiring this
+second Lisp is its own workstream.
+
 ```bash
 sbcl --script mvm/build-i386-repl.lisp    # Serial REPL
 sbcl --script mvm/build-i386-ssh.lisp     # SSH (NE2000 ISA NIC)

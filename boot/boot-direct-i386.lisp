@@ -1,4 +1,9 @@
 ;;;; boot-direct-i386.lisp — Direct boot (no GRUB) for i386
+;;;; LEGACY MINI-LISP PATH.  This image runs mvm/repl-source.lisp — a separate
+;;;; 708-line toy Lisp with its own reader, printer and evaluator, NOT the real
+;;;; Common Lisp stack.  The real CL image on i386 is mvm/build-i386-cli.lisp
+;;;; (prelude + gc + rt + the cl-*.lisp bridge + crypto), driven by
+;;;; scripts/run-i386.sh.  Retiring this second Lisp is its own workstream.
 ;;;;
 ;;;; Produces a 512-byte MBR boot sector that:
 ;;;;   1. Sets VGA text mode 3 (80x25) via INT 10h

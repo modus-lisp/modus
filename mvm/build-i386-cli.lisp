@@ -302,6 +302,16 @@
   (write-char-serial 108) (write-char-serial 52) (write-char-serial 61) ; l4=
   (%pdec (ash (logand (ash 255 24) 4294967295) -24)) (putnl))  ; expect 255
 
+(defun probe-chacha ()
+  ;; chacha-qr takes FIVE parameters.  i386s :call pushes only V2/V3 and trap
+  ;; 0530 COPY-OVERFLOW-ARGS is still unimplemented, so this should now hit the
+  ;; LOUD trap and say so, instead of silently computing on garbage.
+  (let ((s (make-array 16)))
+    (let ((i 0)) (loop (when (>= i 16) (return nil)) (aset s i i) (setq i (+ i 1))))
+    (chacha-qr s 0 1 2 3)
+    (write-char-serial 113) (write-char-serial 61)   ; q=
+    (%pdec (logand (aref s 0) 255)) (putnl)))
+
 (defun probe-sha256 ()
   (sha256-init)
   ;; SHA256 of abc -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -329,6 +339,7 @@
       ((eql which 10) (probe-promote))
       ((eql which 11) (probe-sha256))
       ((eql which 12) (probe-lshift))
+      ((eql which 13) (probe-chacha))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

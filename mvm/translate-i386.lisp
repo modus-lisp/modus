@@ -267,6 +267,57 @@
 (defvar *i386-unimpl-ops* nil
   "Hash of opcode -> number of INT3 placeholders emitted for it.")
 
+(defparameter *i386-safe-nop-traps* (list #x0520)
+  "Trap codes that are GENUINELY safe to no-op on i386, with the reason.
+   Everything NOT on this list fails loudly — see I386-EMIT-UNIMPL-TRAP.
+
+   #x0520 INSTALL-SIGNAL-HANDLERS — pure side effect, no result, no control
+     transfer.  Skipping it means a hardware fault is fatal instead of being
+     longjmp-recovered into a handler-case; that DEGRADES diagnostics but
+     cannot manufacture a wrong value.  Safe.
+
+   Deliberately NOT on this list, because each either PRODUCES A VALUE or
+   TRANSFERS CONTROL, so a no-op silently yields garbage that flows onward:
+   #x0510 SETJMP (returns 0/nonzero), #x0511 LONGJMP (must transfer control),
+   #x0512 CLEAR-HANDLER (pops handler state), #x0530 COPY-OVERFLOW-ARGS
+   (materialises arguments 5+ — a no-op hands the callee stack garbage),
+   #x0531 %MMAP-EXEC-PAGE (returns a page address).")
+
+(defun i386-emit-unimpl-trap (buf code)
+  "Emit code that NAMES ITSELF when an unimplemented trap is reached.
+
+   Why this is not a NOP: a silent no-op on a load-bearing trap does not
+   disable a feature, it produces GARBAGE THAT FLOWS ONWARD.  The 243
+   no-op'd COPY-OVERFLOW-ARGS sites are why a missing >4-argument calling
+   convention presented as a baffling SIGSEGV deep inside GENERIC-LOGAND
+   instead of saying what was actually missing.  Same failure-mode family as
+   a handler-case that masks a buffer overflow as \"giving up\", or a boot
+   SIGSEGV handler that turns a real bug into a false pass.
+
+   Hosted Linux: write(2, \"...trap #xNNNN\", n) then _exit(70).  The message
+   is materialised position-independently with the call/pop idiom (i386 has
+   no RIP-relative addressing): `call .do` pushes the address of the bytes
+   that follow it, which ARE the string.
+   Bare metal: INT3, the loudest thing available without a console."
+  (if *i386-linux-mode*
+      (let ((msg (format nil "MODUS i386: unimplemented trap #x~4,'0X~%" code))
+            (do-lbl (i386-make-label))
+            (str-lbl (i386-make-label)))
+        (i386-emit-jmp-rel32 buf str-lbl)
+        (i386-emit-label buf do-lbl)
+        (i386-emit-pop-reg buf +i386-ecx+)                 ; ecx = &msg
+        (i386-emit-mov-reg-imm buf +i386-ebx+ 2)           ; fd = stderr
+        (i386-emit-mov-reg-imm buf +i386-edx+ (length msg)); count
+        (i386-emit-mov-reg-imm buf +i386-eax+ 4)           ; SYS_write
+        (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+        (i386-emit-mov-reg-imm buf +i386-ebx+ 70)          ; distinctive status
+        (i386-emit-mov-reg-imm buf +i386-eax+ 1)           ; SYS_exit
+        (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+        (i386-emit-label buf str-lbl)
+        (i386-emit-call-rel32 buf do-lbl)                  ; pushes &msg
+        (loop for ch across msg do (i386-emit-byte buf (char-code ch))))
+      (i386-emit-int3 buf)))
+
 (defparameter *i386-linux-mode* nil
   "When true, the target is a HOSTED Linux/i386 ELF rather than bare metal:
    the serial-I/O traps become write(2) syscalls and the Linux syscall traps
@@ -1446,16 +1497,17 @@
               (i386-emit-byte buf #x0F)
               (i386-emit-byte buf #x09))
              (t
-              ;; Unknown trap: NOP (avoid crash via INT with no IDT).
-              ;; WS5: record it — an unimplemented trap silently NOP'd is even
-              ;; harder to diagnose than an INT3, because the program keeps
-              ;; running with a missing side effect / garbage result.  Keyed by
-              ;; #x10000 + code so it can't collide with an opcode number.
+              ;; Unimplemented trap.  Recorded at BUILD time (keyed by
+              ;; #x10000 + code so it cannot collide with an opcode number)
+              ;; AND, unless explicitly classified safe, made to NAME ITSELF
+              ;; at RUN time rather than silently no-op.  See
+              ;; *i386-safe-nop-traps* / i386-emit-unimpl-trap.
               (when *i386-record-unimpl*
                 (let ((tbl (or *i386-unimpl-ops*
                                (setf *i386-unimpl-ops* (make-hash-table :test 'eql)))))
                   (incf (gethash (+ #x10000 code) tbl 0))))
-              nil))))
+              (unless (member code *i386-safe-nop-traps*)
+                (i386-emit-unimpl-trap buf code))))))
 
         ;; ============================================
         ;; Data Movement

@@ -520,7 +520,35 @@
               (when (and aa64 (car (cddddr je)) (not (functionp result)))
                 (%jit-free-page (car je) (car (cddddr je))))
               result)))
-        (error "jit-page-unavailable"))))
+        ;; NO PAGE: %jit-translate-page's flip-safety guard returned NIL (a
+        ;; translator gap it converted from a signal, or a page-build failure).
+        ;; Its contract is "a translator gap can NEVER escape as an uncaught
+        ;; error — it only costs one interpret fallback", so DEGRADE HERE, at
+        ;; the single point of detection, rather than signalling and relying on
+        ;; every caller to convert the signal back into an interpret.
+        ;;
+        ;; WS5 #203: `(error "jit-page-unavailable")` broke that contract on the
+        ;; path that matters most for loading a library.  Both existing callers
+        ;; (mvm-eval-forms and the %e2ic seam) do wrap this in a handler-case
+        ;; that interprets — but MACROEXPANSION of a runtime-defined macro runs
+        ;; the expander from inside %mvm-eval-compile-tuple, i.e. while COMPILING
+        ;; a later top-level form, and that path has no such wrapper.  Net
+        ;; effect on aarch64 (JIT on by default since #199): a macro defined by
+        ;; one top-level form and used by ANY later form — the shape of every
+        ;; real library, and nearly all of alexandria — died with
+        ;; "jit-page-unavailable", uncatchable even by a handler-case around the
+        ;; use, because the failure happened before that form ever ran.
+        ;;
+        ;; Interpreting here is exactly what the two callers' handlers already
+        ;; do, so their behaviour is unchanged; they stay as belt-and-suspenders.
+        (progn
+          (setq *jit-fallback-count*
+                (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
+          (%mvm-wrap-escaping-result
+            (mvm-interpret bc :entry-point entry
+                           :function-table fn-table :runtime-table rt-table
+                           :return-raw nil :lambda-offsets lam-offsets)
+            bc fn-table rt-table lam-offsets)))))
 
 (defun %mvm-eval-run-tuple (tuple)
   "Interpret a cached compiled module tuple (bc entry ft-list fn-table rt-table lam-offsets).

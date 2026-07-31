@@ -146,6 +146,31 @@
 ;;; image already bakes (bridge + gc + driver).
 (defvar *cli-toplevel-source* (mvm-text "lib/cli-toplevel.lisp"))
 
+;;; ============================================================
+;;; Runtime (load-time) backquote expander
+;;; ============================================================
+;;;
+;;; WS5 #203 gap 5.  Backquote in a BAKED macro body is expanded at build time
+;;; by compiler.lisp, so this image looked fine — but a macro defined at RUNTIME
+;;; reaches EVAL with the reader's (BACKQUOTE template) marker intact, and with
+;;; no expander installed for BACKQUOTE the COMMA sub-markers survive into the
+;;; expansion.  `(defmacro m (x) `(+ ,x 1))' + `(m 41)' in a --load'ed file
+;;; failed with UNDEFINED-FUNCTION NAME="COMMA".  Since alexandria is
+;;; essentially a macro library (with-gensyms, once-only, if-let, when-let,
+;;; switch/eswitch, define-constant — all runtime defmacro + backquote), this
+;;; blocked `quickload :alexandria' outright.
+;;;
+;;; x64's build-generic-cli already had the expander; it was buried in that
+;;; wrapper's *driver-source* string, so aarch64 never got it.  Now extracted to
+;;; lib/runtime-backquote.lisp and shared by both (same duplication class as the
+;;; file-I/O overrides).  Concatenated right before *driver-source*, and fed to
+;;; BOTH auto-scanners below — the SFT one so runtime EVAL can resolve the
+;;; defuns by name, and (critically) the sym-name one, because %rbq-sym-name-eq
+;;; dispatches on (symbol-name sym) being "COMMA"/"COMMA-AT"/"BACKQUOTE": if
+;;; those names are missing from *SYM-NAME-TABLE* symbol-name returns "" and the
+;;; expander silently degrades to a no-op.
+(defvar *runtime-backquote-source* (mvm-text "lib/runtime-backquote.lisp"))
+
 ;;; ---- the AArch64 ARM of cli-toplevel -------------------------------------
 ;;;
 ;;; cli-toplevel is arch-neutral EXCEPT for %cli-argv-base — the one place it
@@ -187,7 +212,8 @@
                     (%scan-defun-names-host *mcgc-pin-source*)
                     (%scan-defun-names-host *rt-source*)
                     (%scan-defun-names-host *bridge-source*)
-                    (%scan-defun-names-host *cli-toplevel-source*)))
+                    (%scan-defun-names-host *cli-toplevel-source*)
+                    (%scan-defun-names-host *runtime-backquote-source*)))
         (format t "  SFT auto-init (+cli-toplevel): ~D unique names / ~D chunk(s)~%"
                 count chunks)
         src))
@@ -403,6 +429,11 @@
   (%init-signal-handling)
   (%init-signal-symbols)
   (%init-make-load-form)
+  ;; WS5 #203 gap 5: register the load-time BACKQUOTE expander (same call site
+  ;; and ordering x64's build-generic-cli uses).  Without it a macro defined at
+  ;; RUNTIME keeps the reader's COMMA markers in its expansion and the first
+  ;; call dies with UNDEFINED-FUNCTION NAME=\"COMMA\".
+  (%install-runtime-backquote)
   (%init-clos-protocol)
 
   ;; File-I/O scratch buffers + counters (defvar init-thunks don't run at boot).
@@ -844,7 +875,8 @@
 ;;; ============================================================
 
 (setq *sym-name-auto-source*
-      (%build-sym-name-auto-source (list *driver-source* *cli-toplevel-source*)
+      (%build-sym-name-auto-source (list *driver-source* *cli-toplevel-source*
+                                         *runtime-backquote-source*)
                                    (list *compiler-in-image-source*)))
 
 ;;; ============================================================
@@ -872,6 +904,7 @@
     ;; write-object) and BEFORE the driver only in the sense that the driver's
     ;; kernel-main calls (cli-toplevel) — MVM resolves calls by name across the
     ;; whole unit, so a forward reference to sys-exit is fine.
+    *runtime-backquote-source*  (string #\Newline)
     *aarch64-fileio-override-source* (string #\Newline)
     *cli-toplevel-source*      (string #\Newline)
     *cli-aarch64-arm-source*   (string #\Newline)

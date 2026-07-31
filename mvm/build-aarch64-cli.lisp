@@ -42,15 +42,25 @@
 (setf *rt-source*      (cli-strip-in-package *rt-source*))
 (setf *bridge-source*  (cli-strip-in-package *bridge-source*))
 
-;; WS4-AA64 FLIP: honor the same MODUS_USE_JIT / MODUS_NO_JIT knob the gate uses
-;; (*aarch64-jit-on*, computed in build-ansi-common-aarch64.lisp) as the CLI's
-;; DEFAULT runtime-JIT state.  Baked as %cli-jit-default; kernel-main seeds
-;; *cli-jit-on* from it.  The Stage 3/4/5 probes still force their own on/off
-;; around each form so the differential stays rigorous regardless of the default.
+;; WS4-AA64 FLIP (#199, 2026-07-31): the CLI (JIT-capable shipping image)
+;; DEFAULTS the runtime JIT ON.  Justification: on real Cortex-A76 the JIT is a
+;; ~4.6x hot-code speedup (repeated mvm-eval 35168ms interpret -> 7661ms JIT,
+;; BENCH-NATIVE=300005 so the native path amortized via the page cache), it is
+;; correctness-proven (55555 SURVIVED-4000, odd-form battery, full-corpus
+;; answers correct), and it is load-bearing for the cooperative-threading model.
+;; MODUS_NO_JIT=1 reverts to interpret.  This is DECOUPLED from the gate's
+;; *aarch64-jit-default* (which STAYS nil): the ANSI gate is a one-shot test
+;; harness where the JIT amortizes nothing and cripples throughput (it times out
+;; ~587 vs 17189 interpret), so the gate must remain interpret to stay usable.
 (defvar *cli-jit-default-source*
   (format nil "(defun %~A-jit-default () ~A)~%" "cli"
-          (if *aarch64-jit-on* "t" "nil")))
-(format t "  CLI default runtime JIT: ~A~%" (if *aarch64-jit-on* "ON" "OFF"))
+          (if (let ((no #+sbcl (sb-ext:posix-getenv "MODUS_NO_JIT") #-sbcl nil))
+                (and no (> (length no) 0)))
+              "nil" "t")))
+(format t "  CLI default runtime JIT: ~A~%"
+        (if (let ((no #+sbcl (sb-ext:posix-getenv "MODUS_NO_JIT") #-sbcl nil))
+              (and no (> (length no) 0)))
+            "OFF (MODUS_NO_JIT)" "ON (flipped #199)"))
 
 ;;; ============================================================
 ;;; Driver (sys-exit + kernel-main JIT self-test)
@@ -492,6 +502,27 @@
   ;;     DISTINCT forms in a NON-forked loop (like run-all-tests / a long-lived
   ;;     REPL).  GC is OFF on aarch64-linux, so each ~1.5-1.7MB translation
   ;;     accumulates.  Heartbeat every 50 forms; the last one printed before the
+  ;; WS4-AA64 JIT PERF BENCHMARK (argv1 = 777777 JIT-on / 777778 interpret;
+  ;; argv2 = iters, default 300000).  Repeatedly mvm-eval a CACHEABLE compute
+  ;; form (no DEF*): the first eval compiles + (JIT) translates a page, every
+  ;; later eval hits the cache + reuses the exec page so translate cost
+  ;; amortizes — the hot/repeated case where the JIT is supposed to win.
+  ;; External `time` on the two argv modes on the Pi = the real aarch64 speedup.
+  (when (or (eql (%parse-decimal-at-fixed-208) 777777)
+            (eql (%parse-decimal-at-fixed-208) 777778))
+    (setq *cli-jit-on* (eql (%parse-decimal-at-fixed-208) 777777))
+    (write-string-serial \"BENCH-START jit=\") (print-dec (if *cli-jit-on* 1 0)) (write-char-serial 10)
+    (let ((n (let ((a (%parse-decimal-at-fixed-248))) (if (and a (> a 0)) a 300000)))
+          (i 0) (acc 0))
+      (write-string-serial \"BENCH-ITERS=\") (print-dec n) (write-char-serial 10)
+      (loop
+        (when (>= i n) (return nil))
+        (setq acc (mvm-eval (quote (let ((a 6) (b 7)) (if (< a b) (* a b) (+ a b))))))
+        (setq i (+ i 1)))
+      (write-string-serial \"BENCH-DONE acc=\") (print-dec acc) (write-char-serial 10)
+      (write-string-serial \"BENCH-NATIVE=\") (print-dec *jit-native-count*) (write-char-serial 10))
+    (sys-exit 0))
+
   ;;     process dies marks where the 896MB heap exhausts.  Runs only when argv1
   ;;     = 55555 (so the normal CLI run isn't destroyed by it).
   (when (eql (%parse-decimal-at-fixed-208) 55555)

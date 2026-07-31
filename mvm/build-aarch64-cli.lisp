@@ -63,6 +63,66 @@
             "OFF (MODUS_NO_JIT)" "ON (flipped #199)"))
 
 ;;; ============================================================
+;;; The SHARED SBCL-faithful CLI toplevel (lib/cli-toplevel.lisp)
+;;; ============================================================
+;;;
+;;; WS5 #203 (2026-07-31): the aarch64 hosted image adopts the same toplevel
+;;; x64's build-generic-cli uses — full argv off the initial process stack,
+;;; SBCL-style left-to-right flag parsing (--eval/--load/--script/--quit/
+;;; --version/--help/--userinit/--end-toplevel-options), ~/.modusrc before an
+;;; interactive REPL, and %cli-repl on stdin.  It depends on read /
+;;; make-string-input-stream / load / %make-file-stream-full / %sys-stat-exists
+;;; / write-object / mem-ref / %gc-stack-base / sys-exit, all of which this
+;;; image already bakes (bridge + gc + driver).
+(defvar *cli-toplevel-source* (mvm-text "lib/cli-toplevel.lisp"))
+
+;;; ---- the AArch64 ARM of cli-toplevel -------------------------------------
+;;;
+;;; cli-toplevel is arch-neutral EXCEPT for %cli-argv-base — the one place it
+;;; turns %gc-stack-base into the real byte address of argv[0]'s stack slot.
+;;;
+;;;   x64  (boot/boot-linux-x64.lisp)  stores the initial RSP RAW at
+;;;        0x10000058.  A (mem-ref … :u64) LOAD returns the stored word placed
+;;;        in a fixnum whose machine word IS those bits, so its Lisp VALUE is
+;;;        stored>>1 = RSP/2 — hence the shared file's `(* 2 …)`.
+;;;   aa64 (boot/boot-linux-aarch64.lisp) stores stack_base through `maybe-shl`
+;;;        when *linux-aarch64-gc-metadata-shl* is true — which THIS build sets
+;;;        (see the GC knobs at the bottom).  The word in memory is SP<<1, so
+;;;        the very same :u64 read already yields the REAL SP.  Doubling it
+;;;        would land at 2*SP — far outside the mapped stack.
+;;;
+;;; So the aarch64 arm is exactly "don't double".  Nothing else changes: an
+;;; argv[i]/envp[i] POINTER is stored RAW on the stack by the kernel on both
+;;; arches, so it reads back halved on both and the shared file's `(* 2 ptr)`
+;;; is already correct here.  aarch64 also keeps the kernel's stack (no i386-
+;;; style relocation), so no saved-SP slot is needed.
+;;;
+;;; Placed AFTER *cli-toplevel-source* in *full-source*: last-defun-wins means
+;;; every call site resolves to this one.
+(defvar *cli-aarch64-arm-source* "
+(defun %cli-argv-base ()
+  (+ (%gc-stack-base) 8))
+")
+
+;;; The common file's SFT auto-scan only covers prelude/gc/mcgc/rt/bridge, so
+;;; cli-toplevel's defuns would be invisible to runtime EVAL (build-generic-cli
+;;; gets them for free because it bakes the file INTO its *bridge-source*).
+;;; Regenerate with cli-toplevel's names appended so a --load'ed script can
+;;; call e.g. %cli-getenv by name.
+(setq *sft-auto-source*
+      (multiple-value-bind (src count chunks)
+          (%generate-sft-auto-source
+            (append (%scan-defun-names-host *prelude-source*)
+                    (%scan-defun-names-host *gc-source*)
+                    (%scan-defun-names-host *mcgc-pin-source*)
+                    (%scan-defun-names-host *rt-source*)
+                    (%scan-defun-names-host *bridge-source*)
+                    (%scan-defun-names-host *cli-toplevel-source*)))
+        (format t "  SFT auto-init (+cli-toplevel): ~D unique names / ~D chunk(s)~%"
+                count chunks)
+        src))
+
+;;; ============================================================
 ;;; Driver (sys-exit + kernel-main JIT self-test)
 ;;; ============================================================
 
@@ -74,6 +134,13 @@
 (defun sys-exit (code)
   (let ((c code))
     (syscall3 93 c 0 0)))
+
+;; WS5 #203: TRUE when argv[1] parses as a nonzero decimal, i.e. this run
+;; selects one of the baked regression probes rather than the hosted CLI.
+;; Everything the probe vehicle prints (the CLI-BOOT banner, the JIT self-test)
+;; is gated on this so a plain `modus --eval FORM` writes only what FORM writes.
+(defun %cli-probe-mode-p ()
+  (> (%parse-decimal-at-fixed-208) 0))
 
 (defun %parse-decimal-at-fixed-208 ()
   (let ((n 0) (i 0))
@@ -198,8 +265,12 @@
   (write-char-serial 10))
 
 (defun kernel-main ()
-  ;; Banner: CLI-BOOT
-  (write-string-serial \"CLI-BOOT\") (write-char-serial 10)
+  ;; Banner: CLI-BOOT.  Printed ONLY in probe mode (argv[1] parses as a
+  ;; nonzero decimal).  A hosted CLI must not emit anything on a clean
+  ;; `modus --eval ...` run — SBCL doesn't, and the SBCL-differential table
+  ;; compares stdout byte-for-byte.
+  (when (%cli-probe-mode-p)
+    (write-string-serial \"CLI-BOOT\") (write-char-serial 10))
 
   ;; Zero the runtime-metadata BSS slots (Linux/AArch64 kernels don't reliably
   ;; zero a ~900MB BSS tail; garbage here corrupts the global alist / handler
@@ -286,8 +357,9 @@
   ;; below still force their own on/off around each form.
   (setq *jit-target-arch* :aarch64)
   (setq *cli-jit-on* (%cli-jit-default))
-  (write-string-serial \"cli-jit-default=\") (print-dec (if *cli-jit-on* 1 0))
-  (write-char-serial 10)
+  (when (%cli-probe-mode-p)
+    (write-string-serial \"cli-jit-default=\") (print-dec (if *cli-jit-on* 1 0))
+    (write-char-serial 10))
 
   ;; ISOLATED pure-cons GC milestone (argv 33333) — runs BEFORE any JIT/mvm-eval
   ;; probe so its collection count is UNAMBIGUOUS (Stage-1 native-GC milestone).
@@ -314,6 +386,13 @@
     (sys-exit 0))
 
   ;; --- JIT SELF-TEST -------------------------------------------------------
+  ;; WS5 #203: the whole self-test (steps 1-5) is now PROBE-MODE ONLY.  It used
+  ;; to run unconditionally and wrote 16 lines to stdout on every boot — which
+  ;; is fine for a probe vehicle but fatal for a hosted CLI (`modus --eval` must
+  ;; emit exactly what the form prints, like SBCL).  Probe runs are unaffected:
+  ;; every numeric-argv probe still gets the identical self-test prologue,
+  ;; because %cli-probe-mode-p is true for all of them.
+  (when (%cli-probe-mode-p)
   ;; (1) Primitive probe: mmap PROT_RWX, write `movz x0,#84 ; ret` (84 = tagged
   ;;     fixnum 42), icache-flush, %jit-call.  Exercises traps #x0531/#x0533/
   ;;     #x0532 end-to-end.  Expect jitprim=42.
@@ -439,7 +518,8 @@
   (write-string-serial \"aa64s5-native-total=\") (print-dec *jit-native-count*)
   (write-char-serial 10)
   (write-string-serial \"aa64s5-fallback-total=\") (print-dec *jit-fallback-count*)
-  (write-char-serial 10)
+  (write-char-serial 10))
+  ;; --- end PROBE-MODE-ONLY JIT self-test -----------------------------------
 
   ;; (P) WS4-AA64 #160 GC-POISON REPRO (argv1 = 44444): with GC ON but NOT yet
   ;;     hardened, fill from-space with garbage to force collections, then run a
@@ -610,7 +690,50 @@
     (write-string-serial \"CLOSPROBE-END\") (write-char-serial 10)
     (sys-exit 0))
 
-  (write-string-serial \"CLI-DONE\") (write-char-serial 10)
+  ;; (10) ARGV APPARATUS probe (argv1 = 22222): validate the aarch64 arm of
+  ;;      cli-toplevel BEFORE trusting anything built on it.  Prints argc, the
+  ;;      raw %gc-stack-base read, the computed argv base, every argv[i] as
+  ;;      collected by cli-toplevel's OWN %cli-collect-argv, and $HOME via
+  ;;      %cli-getenv.  If %cli-argv-base's arch arm were wrong these would be
+  ;;      garbage/empty rather than the shell's actual argv.
+  (when (eql (%parse-decimal-at-fixed-208) 22222)
+    (write-string-serial \"ARGVPROBE-START\") (write-char-serial 10)
+    (write-string-serial \"argc=\") (print-dec (%cli-argc)) (write-char-serial 10)
+    (write-string-serial \"stack-base=\") (print-dec (%gc-stack-base)) (write-char-serial 10)
+    (write-string-serial \"argv-base=\") (print-dec (%cli-argv-base)) (write-char-serial 10)
+    (let ((av (%cli-collect-argv)) (i 0))
+      (loop
+        (when (null av) (return nil))
+        (write-string-serial \"argv[\") (print-dec i) (write-string-serial \"]=\")
+        (write-string-serial (car av)) (write-char-serial 10)
+        (setq av (cdr av)) (setq i (+ i 1))))
+    (let ((h (%cli-getenv \"HOME\")))
+      (write-string-serial \"HOME=\")
+      (when h (write-string-serial h))
+      (write-char-serial 10))
+    (write-string-serial \"ARGVPROBE-END\") (write-char-serial 10)
+    (sys-exit 0))
+
+  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
+  ;; Anything that is NOT a numeric probe selector (i.e. argv[1] does not start
+  ;; with a digit — every SBCL-style flag starts with '-', and no argument at
+  ;; all leaves the fixed BSS zeroed) falls through to cli-toplevel, which
+  ;; re-reads the FULL argv off the live initial stack and parses it SBCL-style.
+  ;;
+  ;; COLLISION NOTE: %parse-decimal-at-fixed-208 reads argv[1] only, and only
+  ;; as a leading decimal.  So the ONLY shape that collides with SBCL flag
+  ;; parsing is a bare positive-integer first argument (`modus 33333`), which
+  ;; SBCL would treat as the start of the trailing args.  Flags (`--eval`,
+  ;; `-e`, `--script`) all start with '-' and parse as 0; a bare `0` also
+  ;; parses as 0 and reaches the toplevel.  Probe IDs are 5-6 digit constants,
+  ;; so the collision is confined to those exact integers.
+  ;; A probe that runs to completion WITHOUT its own (sys-exit) — 55555 is the
+  ;; one — must still end at CLI-DONE, exactly as before this file grew a
+  ;; toplevel.  Only a NON-probe run reaches cli-toplevel.
+  (if (%cli-probe-mode-p)
+      (progn (write-string-serial \"CLI-DONE\") (write-char-serial 10)
+             (sys-exit 0))
+      (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
   (sys-exit 0))
 ")
 
@@ -621,7 +744,7 @@
 ;;; ============================================================
 
 (setq *sym-name-auto-source*
-      (%build-sym-name-auto-source (list *driver-source*)
+      (%build-sym-name-auto-source (list *driver-source* *cli-toplevel-source*)
                                    (list *compiler-in-image-source*)))
 
 ;;; ============================================================
@@ -643,6 +766,14 @@
     *sft-auto-source*          (string #\Newline)
     *sym-name-auto-source*     (string #\Newline)
     *runtime-macros-auto-source* (string #\Newline)
+    ;; The shared SBCL-faithful toplevel, then the AArch64 arm that overrides
+    ;; its single arch-specific function (%cli-argv-base) by last-defun-wins.
+    ;; Both must come AFTER the bridge (they need read / load / file streams /
+    ;; write-object) and BEFORE the driver only in the sense that the driver's
+    ;; kernel-main calls (cli-toplevel) — MVM resolves calls by name across the
+    ;; whole unit, so a forward reference to sys-exit is fine.
+    *cli-toplevel-source*      (string #\Newline)
+    *cli-aarch64-arm-source*   (string #\Newline)
     *driver-source*            (string #\Newline)
     *cli-jit-default-source*))
 

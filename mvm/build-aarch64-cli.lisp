@@ -42,25 +42,52 @@
 (setf *rt-source*      (cli-strip-in-package *rt-source*))
 (setf *bridge-source*  (cli-strip-in-package *bridge-source*))
 
-;; WS4-AA64 FLIP (#199, 2026-07-31): the CLI (JIT-capable shipping image)
-;; DEFAULTS the runtime JIT ON.  Justification: on real Cortex-A76 the JIT is a
-;; ~4.6x hot-code speedup (repeated mvm-eval 35168ms interpret -> 7661ms JIT,
-;; BENCH-NATIVE=300005 so the native path amortized via the page cache), it is
-;; correctness-proven (55555 SURVIVED-4000, odd-form battery, full-corpus
-;; answers correct), and it is load-bearing for the cooperative-threading model.
-;; MODUS_NO_JIT=1 reverts to interpret.  This is DECOUPLED from the gate's
-;; *aarch64-jit-default* (which STAYS nil): the ANSI gate is a one-shot test
-;; harness where the JIT amortizes nothing and cripples throughput (it times out
-;; ~587 vs 17189 interpret), so the gate must remain interpret to stay usable.
+;; WS4-AA64 #199 FLIP **REVERTED** (WS5 #203, 2026-07-31): the CLI now DEFAULTS
+;; the runtime JIT **OFF**.  Opt in with MODUS_USE_JIT=1.
+;;
+;; #199 flipped it ON for a real ~4.6x Cortex-A76 hot-code speedup (repeated
+;; mvm-eval 35168ms interpret -> 7661ms JIT, BENCH-NATIVE=300005).  That number
+;; still stands and probe 777777 still measures it — it forces *cli-jit-on* on
+;; regardless of this default, so the perf work is unaffected.
+;;
+;; What #199's correctness validation did NOT cover is a top-level form that has
+;; SIDE EFFECTS and a later form that uses what it defined — i.e. every source
+;; file ever written.  The 55555 stress and the odd-form battery both check the
+;; RETURNED VALUE of self-contained forms, so a form that runs TWICE scores as a
+;; pass.  Measured on this image with --load (each row is one 2-form file):
+;;
+;;   (defun g1 (x) (+ x 1)) / (princ "A=") (princ (g1 41))
+;;        JIT ON  -> "A=A=42"   the princ ran TWICE; JIT OFF -> "A=42"
+;;   same, but the call is inside (handler-case ... (t (c) :ERR))
+;;        JIT ON  -> :ERR                            JIT OFF -> 42
+;;   (defparameter *f1* (lambda (x) (+ x 1))) / (princ "C=") (funcall *f1* 41)
+;;        JIT ON  -> "C=" ~hundreds of times (runaway re-execution)
+;;   (defmacro md ...) / (funcall (%raw-macro-expander 'md) '(md 41))
+;;        JIT ON  -> "D=" ~hundreds of times;        JIT OFF -> (+ 41 1)
+;;
+;; So under the JIT a top-level form's side effects are DUPLICATED (the native
+;; run happens, then an error after the native call — e.g. the jit-mv-fallback
+;; path — makes the caller's handler-case re-interpret the WHOLE form), and in
+;; some shapes it re-runs unboundedly.  Duplicated output/IO is silent wrong
+;; behaviour even when the final value looks right.  A default that cannot load
+;; a file which defines something and then uses it is the wrong default however
+;; fast it is; correctness comes first (see feedback_correctness_over_regression).
+;;
+;; The JIT itself is NOT disabled or deleted — only its default.  Re-enable per
+;; build with MODUS_USE_JIT=1, or per run with (setq *cli-jit-on* t).  NOTE that
+;; MODUS_NO_JIT / MODUS_USE_JIT are BUILD-time knobs baked into %cli-jit-default;
+;; there is no runtime env override, so the runtime escape hatch is the setq.
+;; Re-flip the default only after the re-execution cluster above is fixed AND a
+;; probe covers define-in-one-form / use-in-a-later-form with side effects.
 (defvar *cli-jit-default-source*
   (format nil "(defun %~A-jit-default () ~A)~%" "cli"
-          (if (let ((no #+sbcl (sb-ext:posix-getenv "MODUS_NO_JIT") #-sbcl nil))
-                (and no (> (length no) 0)))
-              "nil" "t")))
+          (if (let ((on #+sbcl (sb-ext:posix-getenv "MODUS_USE_JIT") #-sbcl nil))
+                (and on (> (length on) 0) (not (string= on "0"))))
+              "t" "nil")))
 (format t "  CLI default runtime JIT: ~A~%"
-        (if (let ((no #+sbcl (sb-ext:posix-getenv "MODUS_NO_JIT") #-sbcl nil))
-              (and no (> (length no) 0)))
-            "OFF (MODUS_NO_JIT)" "ON (flipped #199)"))
+        (if (let ((on #+sbcl (sb-ext:posix-getenv "MODUS_USE_JIT") #-sbcl nil))
+              (and on (> (length on) 0) (not (string= on "0"))))
+            "ON (MODUS_USE_JIT)" "OFF (#199 flip reverted, WS5 #203)"))
 
 ;;; ============================================================
 ;;; Linux/AArch64 file-I/O syscall overrides
@@ -507,6 +534,14 @@
   ;; every numeric-argv probe still gets the identical self-test prologue,
   ;; because %cli-probe-mode-p is true for all of them.
   (when (%cli-probe-mode-p)
+  ;; WS5 #203: the JIT self-test is ABOUT the JIT, so it forces *cli-jit-on* on
+  ;; rather than inheriting the shipping default — which is now OFF (the #199
+  ;; flip was reverted; see the big note at the top of this file).  This keeps
+  ;; every downstream probe line (aa64s3/s4/s5, and the 44444 GC-poison probe
+  ;; that runs after) byte-identical to the pre-revert binary; the ONLY probe
+  ;; output that changes is the `cli-jit-default=' line, 1 -> 0, which is the
+  ;; honest report of the new default.
+  (setq *cli-jit-on* t)
   ;; (1) Primitive probe: mmap PROT_RWX, write `movz x0,#84 ; ret` (84 = tagged
   ;;     fixnum 42), icache-flush, %jit-call.  Exercises traps #x0531/#x0533/
   ;;     #x0532 end-to-end.  Expect jitprim=42.

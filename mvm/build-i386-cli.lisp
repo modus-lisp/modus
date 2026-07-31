@@ -377,6 +377,107 @@
       (write-char-serial 118) (write-char-serial 108) (write-char-serial 61) ; vl=
       (%pdec5 (ash (mem-ref 268437508 :u32) -20)) (putnl))))
 
+(defun g5 (s a b c d)
+  ;; chacha-qr shape: 5 params, 4 let bindings, repeated setq.  s unused, to
+  ;; match chacha-qr where the buffer is param 0 and the offsets are 1..4.
+  (let ((sa a) (sb b) (sc c) (sd d))
+    (setq sa (+ sa sb))
+    (setq sd (logxor sd sa))
+    (setq sc (+ sc sd))
+    (setq sb (logxor sb sc))
+    (+ sa (+ sb (+ sc sd)))))
+
+(defun g5d (s a b c d)
+  ;; Does param 4 (the overflow arg) SURVIVE a let/setq-heavy body?
+  (let ((x 0))
+    (setq x (+ x a)) (setq x (+ x b)) (setq x (+ x c))
+    d))
+
+(defun g5buf (s a b c d)
+  ;; Same, but reading through the buffer the way chacha-qr does.
+  (let ((va (buf-read-u32 s a)) (vd (buf-read-u32 s d)))
+    (+ va vd)))
+
+(defun probe-rotbig ()
+  ;; The rotations on a BIGNUM input.  probe-rot used 0x01020304, which is a
+  ;; FIXNUM on a 30-bit tower; in ChaCha every rotation input is a u32 and
+  ;; therefore a bignum.  x = 0x9b8d6f43 = 2610427203.
+  (write-char-serial 98) (write-char-serial 49) (write-char-serial 61) ; b1=
+  (%pdec (logand (chacha-rotl16 2610427203) 255)) (putnl)
+  (write-char-serial 98) (write-char-serial 50) (write-char-serial 61) ; b2=
+  (%pdec (ash (chacha-rotl16 2610427203) -24)) (putnl)
+  (write-char-serial 98) (write-char-serial 51) (write-char-serial 61) ; b3=
+  (%pdec (logand (chacha-rotl12 2610427203) 255)) (putnl)
+  (write-char-serial 98) (write-char-serial 52) (write-char-serial 61) ; b4=
+  (%pdec (ash (chacha-rotl12 2610427203) -24)) (putnl)
+  (write-char-serial 98) (write-char-serial 53) (write-char-serial 61) ; b5=
+  (%pdec (logand (chacha-rotl8 2610427203) 255)) (putnl)
+  (write-char-serial 98) (write-char-serial 54) (write-char-serial 61) ; b6=
+  (%pdec (ash (chacha-rotl7 2610427203) -24)) (putnl))
+
+(defun myqr (s a b c d)
+  ;; EXACT clone of chacha-qr from net/crypto.lisp.  If this is correct and
+  ;; chacha-qr is not, the difference is compilation of that specific body,
+  ;; not a shared callee.
+  (let ((sa (buf-read-u32 s a))
+        (sb (buf-read-u32 s b))
+        (sc (buf-read-u32 s c))
+        (sd (buf-read-u32 s d)))
+    (setq sa (logand (+ sa sb) 4294967295))
+    (setq sd (chacha-rotl16 (logxor sd sa)))
+    (setq sc (logand (+ sc sd) 4294967295))
+    (setq sb (chacha-rotl12 (logxor sb sc)))
+    (setq sa (logand (+ sa sb) 4294967295))
+    (setq sd (chacha-rotl8 (logxor sd sa)))
+    (setq sc (logand (+ sc sd) 4294967295))
+    (setq sb (chacha-rotl7 (logxor sb sc)))
+    (buf-write-u32 s a sa)
+    (buf-write-u32 s b sb)
+    (buf-write-u32 s c sc)
+    (buf-write-u32 s d sd)))
+
+(defun %qr-setup (s)
+  (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
+  (buf-write-u32 s 0 286331153)
+  (buf-write-u32 s 16 16909060)
+  (buf-write-u32 s 32 2610427203)
+  (buf-write-u32 s 48 19088743))
+
+(defun probe-qrcmp ()
+  (let ((s (make-array 64)))
+    (%qr-setup s) (chacha-qr s 0 16 32 48)
+    (write-char-serial 99) (write-char-serial 61)      ; c= crypto.lisp version
+    (%phex32 s 0) (%phex32 s 16) (%phex32 s 32) (%phex32 s 48) (putnl))
+  (let ((s2 (make-array 64)))
+    (%qr-setup s2) (myqr s2 0 16 32 48)
+    (write-char-serial 109) (write-char-serial 61)     ; m= inline clone
+    (%phex32 s2 0) (%phex32 s2 16) (%phex32 s2 32) (%phex32 s2 48) (putnl)))
+
+(defun probe-qrsteps ()
+  ;; Walk chacha-qrs first step by hand on the RFC 8439 inputs.
+  ;; a=11111111 b=01020304 -> sa = 12131415
+  ;; sd = rotl16(01234567 xor 12131415) = rotl16(13305172) = 51721330
+  (write-char-serial 113) (write-char-serial 49) (write-char-serial 61) ; q1=
+  (%pdec (logand (logand (+ 286331153 16909060) 4294967295) 255)) (putnl)  ; expect 21
+  (write-char-serial 113) (write-char-serial 50) (write-char-serial 61) ; q2=
+  (%pdec (ash (logand (+ 286331153 16909060) 4294967295) -24)) (putnl)    ; expect 18
+  (write-char-serial 113) (write-char-serial 51) (write-char-serial 61) ; q3=
+  (%pdec (logand (logxor 19088743 303240213) 255)) (putnl)               ; expect 114
+  (write-char-serial 113) (write-char-serial 52) (write-char-serial 61) ; q4=
+  (%pdec (ash (chacha-rotl16 322109810) -24)) (putnl))                   ; expect 81
+
+(defun probe-frameslot ()
+  (write-char-serial 103) (write-char-serial 49) (write-char-serial 61) ; g1=
+  (%pdec (g5 0 1 2 4 8)) (putnl)             ; expect 42
+  (write-char-serial 103) (write-char-serial 50) (write-char-serial 61) ; g2=
+  (%pdec (g5d 0 1 2 4 8)) (putnl)            ; expect 8
+  (let ((s (make-array 64)))
+    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
+    (buf-write-u32 s 0 5)
+    (buf-write-u32 s 48 9)
+    (write-char-serial 103) (write-char-serial 51) (write-char-serial 61) ; g3=
+    (%pdec (g5buf s 0 16 32 48)) (putnl)))   ; expect 14
+
 (defun probe-rot ()
   ;; Isolate the four ChaCha rotations on 0x01020304 = 16909060.
   ;; rotl16 -> 03040102 (50594050)   rotl12 -> 20304010 (540016656)
@@ -478,6 +579,10 @@
       ((eql which 18) (probe-rot))
       ((eql which 19) (probe-heapuse))
       ((eql which 20) (probe-nblocks))
+      ((eql which 21) (probe-frameslot))
+      ((eql which 22) (probe-qrsteps))
+      ((eql which 23) (probe-qrcmp))
+      ((eql which 24) (probe-rotbig))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

@@ -849,6 +849,138 @@
 
 (defvar *sft-auto-source*
   (if (>= *i386-layer* 5) (emit-sft-auto *all-defun-names* 200) ""))
+
+;;; ============================================================
+;;; Layer 5, third half: *sym-name-table*
+;;; ============================================================
+;;; Ported from build-generic-cli.lisp, which is the arm that already had it.
+;;; Native MVM symbols carry only a name HASH; SYMBOL-NAME recovers the string
+;;; by reverse lookup in *sym-name-table*, populated at boot from a build-time
+;;; scan of the image source.  Without it EVERY native symbol's name is "",
+;;; so NAME-EQ (which compares compute-name-hash of the names) matches
+;;; NOTHING — the in-image compiler then fails to recognise even QUOTE, treats
+;;; (quote X) as a function call, compiles X as a variable reference, and
+;;; recurses until the 8 MB stack is gone.  That is exactly what (eval 42) did:
+;;; one `WARN: implicit global #:||` (the empty name) and a SIGSEGV with
+;;; ESP below the stack region.
+
+(defun scan-symbol-names (text)
+  "Return list of distinct symbol-shaped tokens in TEXT."
+  (let ((seen (make-hash-table :test 'equal))
+        (result nil)
+        (pos 0)
+        (len (length text)))
+    (loop
+      (when (>= pos len) (return (nreverse result)))
+      (let ((c (char text pos)))
+        (cond
+          ((or (char= c #\Space) (char= c #\Newline) (char= c #\Tab)
+               (char= c #\Return) (char= c #\Page))
+           (incf pos))
+          ((char= c #\;)
+           ;; comment to end of line
+           (loop while (and (< pos len)
+                            (not (char= (char text pos) #\Newline)))
+                 do (incf pos)))
+          ((char= c #\")
+           ;; string literal — skip to closing quote
+           (incf pos)
+           (loop while (and (< pos len) (not (char= (char text pos) #\")))
+                 do (when (char= (char text pos) #\\) (incf pos))
+                    (incf pos))
+           (incf pos))
+          ;; Sharp dispatch: #\X character literal, #| ... |# block
+          ;; comment, #(...) vector literal, #+/#- feature, etc.  Without
+          ;; this special-case, #\" / #\; / #\( etc. fool the string- and
+          ;; comment-skippers in the branches above and the scanner ends
+          ;; up consuming dozens of legitimate tokens as if they were
+          ;; inside a string.  In particular COMMA-AT on line 992 of
+          ;; cl-reader.lisp was being eaten by the bogus string-skip
+          ;; triggered by #\" on line 957.
+          ((char= c #\#)
+           (incf pos)
+           (when (< pos len)
+             (let ((next (char text pos)))
+               (cond
+                 ;; #\X — skip the backslash + next char (which may be
+                 ;; any single character) + any trailing word (e.g.
+                 ;; #\Newline / #\Space).
+                 ((char= next #\\)
+                  (incf pos)  ; past the backslash
+                  (when (< pos len) (incf pos))  ; the literal char
+                  ;; Multi-char names like Newline / Space / Tab — eat
+                  ;; the rest of the word.
+                  (loop while (and (< pos len)
+                                   (alphanumericp (char text pos)))
+                        do (incf pos)))
+                 ;; #| ... |# block comment
+                 ((char= next #\|)
+                  (incf pos)
+                  (loop while (and (< (1+ pos) len)
+                                   (not (and (char= (char text pos) #\|)
+                                             (char= (char text (1+ pos)) #\#))))
+                        do (incf pos))
+                  (when (< (1+ pos) len) (incf pos) (incf pos))))))
+           ;; Other # forms (#( vector, #+ feature, etc.) just fall
+           ;; through — the next iteration reads them as ordinary
+           ;; tokens.
+           )
+          ((or (char= c #\() (char= c #\)) (char= c #\') (char= c #\`)
+               (char= c #\,))
+           (incf pos))
+          (t
+           ;; symbol token
+           (let ((start pos))
+             (loop while (and (< pos len)
+                              (let ((ch (char text pos)))
+                                (not (or (char= ch #\Space) (char= ch #\Newline)
+                                         (char= ch #\() (char= ch #\))
+                                         (char= ch #\Tab) (char= ch #\")
+                                         (char= ch #\;)))))
+                   do (incf pos))
+             (let ((token (string-upcase (subseq text start pos))))
+               (unless (or (gethash token seen)
+                           (zerop (length token))
+                           (every #'digit-char-p token))
+                 (setf (gethash token seen) t)
+                 (push token result))
+               ;; Also register a keyword token's bare name (without the
+               ;; leading colon).  compile-keyword uses (normalize-name
+               ;; KW) → hash of "FOO" (not ":FOO"); symbol-name at
+               ;; runtime looks up that hash in *sym-name-table*.
+               ;; Without this, keywords interned at build-time print
+               ;; as :|| because the colon-prefixed entry doesn't match.
+               (when (and (> (length token) 1)
+                          (char= (char token 0) #\:))
+                 (let ((bare (subseq token 1)))
+                   (unless (or (gethash bare seen)
+                               (zerop (length bare)))
+                     (setf (gethash bare seen) t)
+                     (push bare result))))))))))))
+
+
+
+(defun emit-sym-name-auto (names chunk-size)
+  (with-output-to-string (out)
+    (let ((n-chunks (ceiling (length names) chunk-size)))
+      (dotimes (c n-chunks)
+        (format out "(defun %init-sym-name-auto-~D ()~%" c)
+        (let ((start (* c chunk-size))
+              (end (min (* (1+ c) chunk-size) (length names))))
+          (loop for i from start below end
+                do (format out "  (puthash (compute-name-hash ~S) *sym-name-table* ~S)~%"
+                          (nth i names) (nth i names))))
+        (format out ")~%"))
+      (format out "(defun %init-sym-name-auto ()~%")
+      (dotimes (c n-chunks)
+        (format out "  (%init-sym-name-auto-~D)~%" c))
+      (format out ")~%"))))
+
+(defvar *sym-name-auto-source*
+  (if (>= *i386-layer* 5)
+      (emit-sym-name-auto (scan-symbol-names *scanned-source*) 200)
+      ""))
+(format t "  sym-name-auto: ~D chars~%" (length *sym-name-auto-source*))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
 
 (defvar *l5-init-source*
@@ -870,6 +1002,8 @@
   ;; The generated table: every compiled defun, by name, so a form compiled
   ;; at runtime can actually CALL them.
   (%init-sft-auto)             (%l5-step 105)  ; i
+  (setq *sym-name-table* (make-hash-table))
+  (%init-sym-name-auto)        (%l5-step 109)  ; m
   ;; Run every defvar/defparameter init thunk.  The compiler EMITS
   ;; init-all-globals from the source it compiled, so it is already in the
   ;; image (verified by symmap); nothing had ever called it, which left every
@@ -897,6 +1031,8 @@
   (%init-method-combinations)
   (%init-symbol-function-table)
   (%init-sft-auto)
+  (setq *sym-name-table* (make-hash-table))
+  (%init-sym-name-auto)
   0)
 
 (defun probe-l5 ()
@@ -922,6 +1058,31 @@
   ;; t6 the populate thunk, which is what SIGSEGVs inside init-all-globals
   (%populate-opcode-table)
   (%tag2 116 54) (%chk (if (gethash 1 *opcode-table*) 1 0) 1)
+  ;; t7-t9 THE (EVAL 42) FRONTIER.  compute-name-hash is 60 bits wide by
+  ;; construction and i386 fixnums hold 30, so the hash is a BIGNUM at
+  ;; RUNTIME.  compile-variable-ref splices it into
+  ;; (%e2-symbol-value-checked <hash> (quote <name>)) as a literal; if
+  ;; compile-form then misclassifies that bignum as a SYMBOL the compiler
+  ;; recurses on it forever — which is what (eval 42) does, printing
+  ;; `WARN: implicit global #:||` (empty name) and running the 8 MB stack out.
+  (%tag2 116 55) (%chk (if (integerp (normalize-name (quote abc))) 1 0) 1)
+  (%tag2 116 56) (%xgap (if (bignump (normalize-name (quote abc))) 1 0) 0)
+  (%tag2 116 57) (%chk (if (symbolp (normalize-name (quote abc))) 1 0) 0)
+  ;; t10-t11 does the *sym-name-table* reverse lookup actually work?  Its keys
+  ;; are name hashes, i.e. BIGNUMS here, so every lookup rides EQL-on-bignums.
+  (%tag2 49 48) (%xgap (length (symbol-name (quote abc))) 3)
+  (%tag2 49 49) (%xgap (if (gethash (normalize-name (quote abc)) *sym-name-table*) 1 0) 1)
+  ;; t12 THE ROOT: two hashes of the SAME name are two distinct bignum
+  ;; OBJECTS, and EQL on bignums is identity here — so every hash-keyed
+  ;; table (sym-name, intern, macro, symbol-function) misses on i386.
+  (%tag2 49 50) (%xgap (if (eql (normalize-name (quote abc))
+                                (normalize-name (quote abc))) 1 0) 1)
+  ;; t13 THE MISMATCH, both halves side by side.  A quoted symbol's STORED
+  ;; hash comes from a BUILD-TIME literal, which :li truncates to 32 bits, so
+  ;; it is a fixnum.  The same name hashed IN-IMAGE is a 60-bit bignum (t8).
+  ;; They are different numbers, so no hash-keyed table can match them.
+  (%tag2 49 51) (%xgap (if (eql (%prim-aref (quote abc) 0)
+                                (normalize-name (quote abc))) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
   (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
   (putnl)
@@ -965,6 +1126,7 @@
     *opcode-table-init-source* (string #\Newline)
     *mvm-eval-source* (string #\Newline)
     *sft-auto-source* (string #\Newline)
+    *sym-name-auto-source* (string #\Newline)
     *l5-init-source* (string #\Newline)
     *bridge-source* (string #\Newline)
     *crypto-source* (string #\Newline)

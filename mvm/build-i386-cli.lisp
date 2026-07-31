@@ -145,6 +145,19 @@
 ;; cl-eval.lisp) and TRUNCATE takes &rest, so using them here would couple
 ;; every numeric probe to the &rest/nargs machinery.  Repeated subtraction
 ;; keeps the probes measuring what they claim to measure.  Values < 1000.
+(defun %pdec5 (n)
+  ;; 5-digit decimal, for MB-scale addresses.  Repeated subtraction only.
+  (let ((tt 0) (th 0) (h 0) (t10 0) (r n))
+    (loop (when (< r 10000) (return nil)) (setq r (- r 10000)) (setq tt (+ tt 1)))
+    (loop (when (< r 1000) (return nil)) (setq r (- r 1000)) (setq th (+ th 1)))
+    (loop (when (< r 100) (return nil)) (setq r (- r 100)) (setq h (+ h 1)))
+    (loop (when (< r 10) (return nil)) (setq r (- r 10)) (setq t10 (+ t10 1)))
+    (when (> tt 0) (write-char-serial (+ 48 tt)))
+    (when (or (> tt 0) (> th 0)) (write-char-serial (+ 48 th)))
+    (when (or (> tt 0) (> th 0) (> h 0)) (write-char-serial (+ 48 h)))
+    (when (or (> tt 0) (> th 0) (> h 0) (> t10 0)) (write-char-serial (+ 48 t10)))
+    (write-char-serial (+ 48 r))))
+
 (defun %pdec (n)
   (if (< n 0)
       (progn (write-char-serial 45) (%pdec (- 0 n)))
@@ -323,6 +336,47 @@
   (%phex (aref s off)) (%phex (aref s (+ off 1)))
   (%phex (aref s (+ off 2))) (%phex (aref s (+ off 3))))
 
+(defun %parse-decimal-at-fixed-248 ()
+  ;; argv[2], staged by the entry stub at #x10000248.
+  (let ((n 0) (i 0))
+    (loop
+      (let ((b (mem-ref (+ 268437576 i) :u8)))
+        (when (or (< b 48) (> b 57)) (return n))
+        (setq n (+ (* n 10) (- b 48)))
+        (setq i (+ i 1))))))
+
+(defun probe-nblocks ()
+  ;; Hash argv[2] * 64 bytes.  Bisecting the largest N that COMPLETES gives
+  ;; the heap burn per 64-byte block directly, since the arena is a known
+  ;; 496 MiB and there is no collector to reclaim any of it.
+  (sha256-init)
+  (let ((nb (%parse-decimal-at-fixed-248)))
+    (let ((n (* nb 64)))
+      (let ((m (make-array n)))
+        (let ((i 0))
+          (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
+        (sha256 m)
+        (write-char-serial 111) (write-char-serial 107) (putnl)))))
+
+(defun probe-heapuse ()
+  ;; How much heap does SHA-256 actually burn, and is there a collector?
+  ;; VA (alloc pointer) and VL (alloc limit) live in the i386 global slot
+  ;; block at #x10000A00 / #x10000A04.
+  (sha256-init)
+  (let ((n 1024))
+    (let ((m (make-array n)))
+      (let ((i 0))
+        (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
+      ;; Print VA and VL as absolute MiB — no bignum subtraction involved, so
+      ;; the measurement cannot be confounded by the arithmetic under test.
+      (write-char-serial 118) (write-char-serial 48) (write-char-serial 61) ; v0=
+      (%pdec5 (ash (mem-ref 268437504 :u32) -20)) (putnl)
+      (sha256 m)
+      (write-char-serial 118) (write-char-serial 49) (write-char-serial 61) ; v1=
+      (%pdec5 (ash (mem-ref 268437504 :u32) -20)) (putnl)
+      (write-char-serial 118) (write-char-serial 108) (write-char-serial 61) ; vl=
+      (%pdec5 (ash (mem-ref 268437508 :u32) -20)) (putnl))))
+
 (defun probe-rot ()
   ;; Isolate the four ChaCha rotations on 0x01020304 = 16909060.
   ;; rotl16 -> 03040102 (50594050)   rotl12 -> 20304010 (540016656)
@@ -422,6 +476,8 @@
       ((eql which 16) (probe-sha-bulk))
       ((eql which 17) (probe-fixnum-spin))
       ((eql which 18) (probe-rot))
+      ((eql which 19) (probe-heapuse))
+      ((eql which 20) (probe-nblocks))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

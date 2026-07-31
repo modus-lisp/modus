@@ -2108,6 +2108,66 @@
               ;; 0F 09 = WBINVD instruction
               (i386-emit-byte buf #x0F)
               (i386-emit-byte buf #x09))
+             ((= code #x0530)
+              ;; COPY-OVERFLOW-ARGS — the &rest prologue's runtime argument
+              ;; copy, mirroring translate-x64.lisp's #x0530 arm.
+              ;;
+              ;; With more than +max-reg-args+ (4) arguments the caller PUSHES
+              ;; args 4.. before :call pushes V2/V3, so in the callee the frame
+              ;; reads:  [ebp+0] saved ebp, [ebp+4] return address, [ebp+8] V2,
+              ;; [ebp+12] V3, [ebp+16] arg4, [ebp+20] arg5, ...
+              ;; Hence  src(i) = ebp + 16 + (i-4)*4, which simplifies EXACTLY
+              ;; to ebp + 4*i.  The destination is the local frame slot the
+              ;; &rest cond-ladder loads from, the same address :obj-set uses
+              ;; for a VFP destination:  dst(i) = ebp + frame-slot-base - 4*i.
+              ;; Copying them there lets the ladder load args 0..3 and 4..N
+              ;; through one addressing form.
+              ;;
+              ;; Cap at 32 total args, as x64 does: the ladder is unrolled per
+              ;; defun, and raising x64's cap to 50 cost +30MB and regressed
+              ;; ANSI via layout shift.  i386's frame has 128 slots, so 32 fits.
+              ;;
+              ;; Registers: the whole :trap dispatch is already bracketed with
+              ;; push/pop EAX, and this arm additionally saves ECX/EDX/ESI, so
+              ;; it clobbers nothing the prologue still needs.
+              (let ((done (i386-make-label))
+                    (nocap (i386-make-label))
+                    (top (i386-make-label)))
+                (i386-emit-push-reg buf +scratch0+)
+                (i386-emit-push-reg buf +scratch1+)
+                (i386-emit-push-reg buf +i386-esi+)
+                ;; ECX = nargs (raw, untagged — the convention slot)
+                (i386-emit-mov-reg-abs buf +scratch0+ *nargs-addr*)
+                (i386-emit-cmp-reg-imm buf +scratch0+ 5)
+                (i386-emit-jcc buf :l done)
+                (i386-emit-cmp-reg-imm buf +scratch0+ 32)
+                (i386-emit-jcc buf :le nocap)
+                (i386-emit-mov-reg-imm buf +scratch0+ 32)
+                (i386-emit-label buf nocap)
+                ;; EDX = i, starting at +max-reg-args+
+                (i386-emit-mov-reg-imm buf +scratch1+ 4)
+                (i386-emit-label buf top)
+                (i386-emit-cmp-reg-reg buf +scratch1+ +scratch0+)
+                (i386-emit-jcc buf :ge done)
+                ;; ESI = [ebp + 4*i]
+                (i386-emit-mov-reg-reg buf +i386-esi+ +scratch1+)
+                (i386-emit-shl-reg-imm buf +i386-esi+ 2)
+                (i386-emit-add-reg-reg buf +i386-esi+ +i386-ebp+)
+                (i386-emit-mov-reg-mem buf +i386-esi+ +i386-esi+ 0)
+                ;; [ebp + frame-slot-base - 4*i] = ESI
+                (i386-emit-push-reg buf +scratch1+)
+                (i386-emit-shl-reg-imm buf +scratch1+ 2)
+                (i386-emit-neg-reg buf +scratch1+)
+                (i386-emit-add-reg-imm buf +scratch1+ +frame-slot-base+)
+                (i386-emit-add-reg-reg buf +scratch1+ +i386-ebp+)
+                (i386-emit-mov-mem-reg buf +scratch1+ 0 +i386-esi+)
+                (i386-emit-pop-reg buf +scratch1+)
+                (i386-emit-add-reg-imm buf +scratch1+ 1)
+                (i386-emit-jmp-rel32 buf top)
+                (i386-emit-label buf done)
+                (i386-emit-pop-reg buf +i386-esi+)
+                (i386-emit-pop-reg buf +scratch1+)
+                (i386-emit-pop-reg buf +scratch0+)))
              (t
               ;; Unimplemented trap.  Recorded at BUILD time (keyed by
               ;; #x10000 + code so it cannot collide with an opcode number)

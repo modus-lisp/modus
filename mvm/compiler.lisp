@@ -1158,6 +1158,35 @@
             (symbol-name fn)))
       (symbol-name fn)))
 
+(defun %init-thunk-store (name name-hash tmp-var)
+  "The STORE half of a generated defvar/defparameter/defconstant init thunk:
+   bind the global NAME (whose key is NAME-HASH) to the value already in
+   TMP-VAR.
+
+   Two forms, because on a 32-BIT target the name hash is not a fixnum.
+   COMPUTE-NAME-HASH is 60 bits wide by construction, and i386's fixnum
+   ceiling is 2^30-1 — so `(set-symbol-value <60-bit literal> v)` sends the
+   hash through COMPILE-INTEGER, which correctly refuses to truncate and
+   materialises a BIGNUM.  Every other global access keys the alist by
+   EMIT-LI-TAGGED's silently truncated 32-bit word instead, so the store
+   lands under a key no read will ever match: on i386 EVERY defvar with an
+   initform read back NIL, and init-all-globals SIGSEGV'd the moment one of
+   those NILs was used as a hash table (%populate-opcode-table → puthash →
+   set-car of NIL).  Measured, not inferred: the thunk for *PROBE-TBL* emits
+   a 2-slot bignum whose slot 0 is 0x257A04C4, which is exactly
+   (ash (compute-name-hash \"*PROBE-TBL*\") 1) truncated to 32 bits.
+
+   The SETQ form has no literal hash at all — %COMPILE-SETQ-GLOBAL uses
+   EMIT-LI-TAGGED, the same path the read uses, so writer and reader agree by
+   construction whatever the word size.
+
+   64-BIT TARGETS ARE UNREACHED, not merely unchanged: a 60-bit hash is
+   always <= +FIXNUM-MAX+ = 2^62-1 there, so the first branch always wins and
+   the emitted IR is bit-identical to before this existed."
+  (if (<= name-hash +fixnum-max+)
+      `(set-symbol-value ,name-hash ,tmp-var)
+      `(setq ,name ,tmp-var)))
+
 (defun %global-name-key (sym)
   "Name-hash KEY used for the runtime SYMBOL-VALUE / SET-SYMBOL-VALUE alist
    (keyed at #x10000080).  Identical to NORMALIZE-NAME on the host (and for
@@ -16043,7 +16072,7 @@
            (mvm-compile-function
             thunk-name nil
             (list `(let ((,tmp-var ,value))
-                     (set-symbol-value ,name-hash ,tmp-var))))))))
+                     ,(%init-thunk-store name name-hash tmp-var))))))))
 
     ;; (defparameter name value) — same as defvar
     ((and (consp form) (name-eq (car form) "DEFPARAMETER"))
@@ -16063,7 +16092,7 @@
            (mvm-compile-function
             thunk-name nil
             (list `(let ((,tmp-var ,value))
-                     (set-symbol-value ,name-hash ,tmp-var))))))))
+                     ,(%init-thunk-store name name-hash tmp-var))))))))
 
     ;; (defpackage ...) — at BUILD time the package system is SBCL-side only,
     ;; so skip (byte-identical host build).  Under mvm-eval a runtime DEFPACKAGE
@@ -16141,7 +16170,7 @@
                (mvm-compile-function
                 thunk-name nil
                 (list `(let ((,tmp-var ',value))
-                         (set-symbol-value ,name-hash ,tmp-var)))))))))
+                         ,(%init-thunk-store name name-hash tmp-var)))))))))
      nil)
 
     ;; (defmacro name (params) body...)

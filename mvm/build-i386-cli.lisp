@@ -743,6 +743,7 @@
       ((eql which 4) (probe-argv))
       ((eql which 5) (probe-eval))
       ((eql which 6) (sys-exit (if (eql (probe-hc) 0) 0 1)))
+      ((eql which 7) (sys-exit (if (eql (probe-l5) 0) 0 1)))
       (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
 
@@ -853,7 +854,40 @@
 (defvar *l5-init-source*
   (if (>= *i386-layer* 5)
       "
+;; One letter per completed step, unbuffered, so a crash names the LAST step
+;; that finished rather than leaving the whole boot as one opaque SIGSEGV.
+(defun %l5-step (c) (write-char-serial c))
+
 (defun %l5-boot ()
+  (init-symbol-table)          (%l5-step 97)   ; a
+  (init-keyword-table)         (%l5-step 98)   ; b
+  (%init-packages)             (%l5-step 99)   ; c
+  (%init-streams)              (%l5-step 100)  ; d
+  (%init-reader)               (%l5-step 101)  ; e
+  (%init-condition-types)      (%l5-step 102)  ; f
+  (%init-method-combinations)  (%l5-step 103)  ; g
+  (%init-symbol-function-table) (%l5-step 104) ; h
+  ;; The generated table: every compiled defun, by name, so a form compiled
+  ;; at runtime can actually CALL them.
+  (%init-sft-auto)             (%l5-step 105)  ; i
+  ;; Run every defvar/defparameter init thunk.  The compiler EMITS
+  ;; init-all-globals from the source it compiled, so it is already in the
+  ;; image (verified by symmap); nothing had ever called it, which left every
+  ;; defparameter the compiler and mvm-eval depend on at NIL — Active
+  ;; Limitation #7, and the reason (eval 42) had nothing to work with.
+  (init-all-globals)           (%l5-step 106)  ; j
+  (%init-signal-handling)      (%l5-step 107)  ; k
+  (%init-signal-symbols)       (%l5-step 108)  ; l
+  (putnl)
+  0)
+
+;; probe-l5: the boot steps BEFORE init-all-globals, then the pieces
+;; init-all-globals depends on, one at a time.  init-all-globals runs 56
+;; generated thunks with no output of its own, so a fault inside one is
+;; otherwise a bare SIGSEGV.
+(defparameter *probe-tbl* (make-hash-table :test (quote eql)))
+
+(defun %l5-pre ()
   (init-symbol-table)
   (init-keyword-table)
   (%init-packages)
@@ -862,18 +896,36 @@
   (%init-condition-types)
   (%init-method-combinations)
   (%init-symbol-function-table)
-  ;; The generated table: every compiled defun, by name, so a form compiled
-  ;; at runtime can actually CALL them.
   (%init-sft-auto)
-  ;; Run every defvar/defparameter init thunk.  The compiler EMITS
-  ;; init-all-globals from the source it compiled, so it is already in the
-  ;; image (verified by symmap); nothing had ever called it, which left every
-  ;; defparameter the compiler and mvm-eval depend on at NIL — Active
-  ;; Limitation #7, and the reason (eval 42) had nothing to work with.
-  (init-all-globals)
-  (%init-signal-handling)
-  (%init-signal-symbols)
   0)
+
+(defun probe-l5 ()
+  (%l5-pre)
+  (%sc-reset)
+  ;; t1 hash-table basics (make-hash-table takes a &key, so this also
+  ;;    exercises the &rest/nargs path init thunks lean on)
+  (%tag2 116 49)
+  (%chk (let ((h (make-hash-table :test (quote eql)))) (puthash 1 h 2) (gethash 1 h)) 2)
+  ;; t2 *opcode-table* is expected NIL before any init thunk has run
+  (%tag2 116 50) (%chk (if *opcode-table* 1 0) 0)
+  ;; t3 plain SETQ of that same global — isolates the global slot machinery
+  ;;    from the generated thunk
+  (setq *opcode-table* 7)
+  (%tag2 116 51) (%chk (if (eql *opcode-table* 7) 1 0) 1)
+  (setq *opcode-table* nil)
+  ;; t4 a generated init thunk for a global defined HERE, in the driver
+  (init-*probe-tbl*)
+  (%tag2 116 52) (%chk (if *probe-tbl* 1 0) 1)
+  ;; t5 the real one, in isolation
+  (init-*opcode-table*)
+  (%tag2 116 53) (%chk (if *opcode-table* 1 0) 1)
+  ;; t6 the populate thunk, which is what SIGSEGVs inside init-all-globals
+  (%populate-opcode-table)
+  (%tag2 116 54) (%chk (if (gethash 1 *opcode-table*) 1 0) 1)
+  (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
+  (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
+  (putnl)
+  (mem-ref 268438408 :u32))
 
 ;; Does EVAL actually evaluate?  Each step is separate so a failure localises:
 ;; a bare constant needs only the interpreter, arithmetic needs the compiler's
@@ -894,6 +946,7 @@
       "
 (defun %l5-boot () 0)
 (defun probe-eval () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
+(defun probe-l5 () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
 "))
 
 (defvar *full-source*

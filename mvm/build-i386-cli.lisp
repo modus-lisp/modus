@@ -302,6 +302,83 @@
   (write-char-serial 108) (write-char-serial 52) (write-char-serial 61) ; l4=
   (%pdec (ash (logand (ash 255 24) 4294967295) -24)) (putnl))  ; expect 255
 
+(defun f5 (a b c d e) (+ a (+ b (+ c (+ d e)))))
+(defun f6 (a b c d e f) (+ a (+ b (+ c (+ d (+ e f))))))
+(defun f5id (a b c d e) e)
+(defun f6id (a b c d e f) f)
+
+(defun probe-arity ()
+  ;; KNOWN-ANSWER tests for the >4-argument calling convention.
+  ;; Powers of two so a wrong param is identifiable from the sum.
+  (write-char-serial 97) (write-char-serial 53) (write-char-serial 61) ; a5=
+  (%pdec (f5 1 2 4 8 16)) (putnl)          ; expect 31
+  (write-char-serial 97) (write-char-serial 54) (write-char-serial 61) ; a6=
+  (%pdec (f6 1 2 4 8 16 32)) (putnl)       ; expect 63
+  (write-char-serial 105) (write-char-serial 53) (write-char-serial 61) ; i5=
+  (%pdec (f5id 1 2 4 8 16)) (putnl)        ; expect 16 (the 5th arg alone)
+  (write-char-serial 105) (write-char-serial 54) (write-char-serial 61) ; i6=
+  (%pdec (f6id 1 2 4 8 16 32)) (putnl))    ; expect 32 (the 6th arg alone)
+
+(defun %phex32 (s off)
+  (%phex (aref s off)) (%phex (aref s (+ off 1)))
+  (%phex (aref s (+ off 2))) (%phex (aref s (+ off 3))))
+
+(defun probe-rot ()
+  ;; Isolate the four ChaCha rotations on 0x01020304 = 16909060.
+  ;; rotl16 -> 03040102 (50594050)   rotl12 -> 20304010 (540016656)
+  ;; rotl8  -> 02030401 (33818625)   rotl7  -> 81018200 (2164326912)
+  ;; Printed as low byte + high byte so %pdec (which handles < 1000) suffices.
+  (write-char-serial 114) (write-char-serial 49) (write-char-serial 61) ; r1=
+  (%pdec (logand (chacha-rotl16 16909060) 255)) (putnl)        ; expect 2
+  (write-char-serial 114) (write-char-serial 50) (write-char-serial 61) ; r2=
+  (%pdec (ash (chacha-rotl16 16909060) -24)) (putnl)           ; expect 3
+  (write-char-serial 114) (write-char-serial 51) (write-char-serial 61) ; r3=
+  (%pdec (logand (chacha-rotl12 16909060) 255)) (putnl)        ; expect 16
+  (write-char-serial 114) (write-char-serial 52) (write-char-serial 61) ; r4=
+  (%pdec (ash (chacha-rotl12 16909060) -24)) (putnl)           ; expect 32
+  (write-char-serial 114) (write-char-serial 53) (write-char-serial 61) ; r5=
+  (%pdec (logand (chacha-rotl8 16909060) 255)) (putnl)         ; expect 1
+  (write-char-serial 114) (write-char-serial 54) (write-char-serial 61) ; r6=
+  (%pdec (ash (chacha-rotl7 16909060) -24)) (putnl))           ; expect 129
+
+(defun probe-chacha2 ()
+  ;; RFC 8439 section 2.1.1 quarter-round test vector.  NB chacha-qr takes BYTE
+  ;; OFFSETS into a 64-byte buffer, not word indices — an earlier probe passed
+  ;; 0 1 2 3 and got a meaningless answer; that was the probes bug, not the code.
+  ;;   in : a=11111111 b=01020304 c=9b8d6f43 d=01234567
+  ;;   out: a=ea2a92f4 b=cb1cf8ce c=4581472e d=5881c4bb
+  (let ((s (make-array 64)))
+    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
+    (buf-write-u32 s 0 286331153)
+    (buf-write-u32 s 16 16909060)
+    (buf-write-u32 s 32 2610427203)
+    (buf-write-u32 s 48 19088743)
+    (chacha-qr s 0 16 32 48)
+    (write-char-serial 113) (write-char-serial 61)
+    (%phex32 s 0) (%phex32 s 16) (%phex32 s 32) (%phex32 s 48) (putnl)))
+
+(defun probe-sha-bulk ()
+  ;; Throughput: SHA-256 over 64 KiB.  Digest printed so the run is verifiable
+  ;; rather than merely timed.
+  (sha256-init)
+  (let ((n 4096))
+    (let ((m (make-array n)))
+      (let ((i 0))
+        (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))
+      (write-char-serial 98) (write-char-serial 61)
+      (%print-digest (sha256 m)))))
+
+(defun probe-fixnum-spin ()
+  ;; Pure-fixnum workload, NO bignum promotion and NO allocation: the
+  ;; emulation-overhead baseline.  Same loop on i386-under-qemu and x64 lets
+  ;; the qemu factor be divided out of the crypto comparison.
+  (let ((i 0) (acc 0))
+    (loop (when (>= i 3000000) (return nil))
+          (setq acc (logand (+ acc i) 65535))
+          (setq i (+ i 1)))
+    (write-char-serial 122) (write-char-serial 61)
+    (%pdec (logand acc 255)) (putnl)))
+
 (defun probe-chacha ()
   ;; chacha-qr takes FIVE parameters.  i386s :call pushes only V2/V3 and trap
   ;; 0530 COPY-OVERFLOW-ARGS is still unimplemented, so this should now hit the
@@ -340,6 +417,11 @@
       ((eql which 11) (probe-sha256))
       ((eql which 12) (probe-lshift))
       ((eql which 13) (probe-chacha))
+      ((eql which 14) (probe-arity))
+      ((eql which 15) (probe-chacha2))
+      ((eql which 16) (probe-sha-bulk))
+      ((eql which 17) (probe-fixnum-spin))
+      ((eql which 18) (probe-rot))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

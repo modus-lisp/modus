@@ -701,6 +701,90 @@
 ;;; %init-sym-name-auto, init-all-globals, %install-runtime-cl-macros,
 ;;; %install-runtime-backquote) does not exist for i386 yet.
 ;;; Below layer 5 both definitions are stubs, so layer 4 is untouched.
+
+;;; ============================================================
+;;; Layer 5, second half: the build-GENERATED bootstrap
+;;; ============================================================
+;;; Baking the compiler in makes MVM-EVAL resolve; it does not make a compiled
+;;; form's CALLS resolve.  mvm-eval compiles a form to bytecode whose calls are
+;;; looked up by name in *symbol-function-table*, and that table is not built
+;;; from the image's function table — it is POPULATED AT BOOT by a generated
+;;; %init-sft-auto that puthashes every defun name to its #'function.  Without
+;;; it, (eval 42) SIGSEGVs: the compiled thunk calls into nothing.
+;;;
+;;; Ported verbatim in shape from build-generic-cli.lisp, which is the arm that
+;;; bakes these directly.  Chunked at 200 entries per function for the same
+;;; reason it is there: one 3000-entry defun exceeds the compiler's function
+;;; size limits.
+(defun scan-defuns (text)
+  "Return list of defun names (strings) found in TEXT."
+  (let ((names nil)
+        (pos 0))
+    (loop
+      (let ((p (search "(defun " text :start2 pos)))
+        (unless p (return (nreverse names)))
+        (let* ((start (+ p 7))
+               (end (or (position-if (lambda (c)
+                                       (or (char= c #\Space)
+                                           (char= c #\Newline)
+                                           (char= c #\()
+                                           (char= c #\)))) text
+                                     :start start)
+                        (length text))))
+          (push (string-upcase (subseq text start end)) names)
+          (setq pos end))))))
+
+;;; Everything that ends up in the image EXCEPT the generated bootstrap itself
+;;; (which is derived FROM this, and whose own defuns — %init-sft-auto-N — do
+;;; not need to be callable by name from runtime eval).
+(defvar *scanned-source*
+  (concatenate 'string
+    *prelude-source* (string #\Newline)
+    *gc-source* (string #\Newline)
+    *rt-source* (string #\Newline)
+    *isa-source* (string #\Newline)
+    *interp-source* (string #\Newline)
+    *compiler-source* (string #\Newline)
+    *float-override-source* (string #\Newline)
+    *opcode-table-init-source* (string #\Newline)
+    *mvm-eval-source* (string #\Newline)
+    *bridge-source* (string #\Newline)
+    *crypto-source* (string #\Newline)
+    *driver-source*))
+
+(defvar *all-defun-names*
+  ;; Filter to names that look like valid CL identifiers.
+  (remove-if-not (lambda (s)
+                   (and (stringp s)
+                        (> (length s) 0)
+                        (every (lambda (c)
+                                 (or (alphanumericp c)
+                                     (find c "+-*/<=>?!@$%^&_:|.~")))
+                               s)))
+                 (scan-defuns *scanned-source*)))
+
+(format t "  defuns found: ~D~%" (length *all-defun-names*))
+
+(defun emit-sft-auto (names chunk-size)
+  (with-output-to-string (out)
+    (let ((n-chunks (ceiling (length names) chunk-size)))
+      (dotimes (c n-chunks)
+        (format out "(defun %init-sft-auto-~D ()~%" c)
+        (let ((start (* c chunk-size))
+              (end (min (* (1+ c) chunk-size) (length names))))
+          (loop for i from start below end
+                do (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
+                          (nth i names) (nth i names))))
+        (format out ")~%"))
+      (format out "(defun %init-sft-auto ()~%")
+      (dotimes (c n-chunks)
+        (format out "  (%init-sft-auto-~D)~%" c))
+      (format out ")~%"))))
+
+(defvar *sft-auto-source*
+  (if (>= *i386-layer* 5) (emit-sft-auto *all-defun-names* 200) ""))
+(format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
+
 (defvar *l5-init-source*
   (if (>= *i386-layer* 5)
       "
@@ -713,6 +797,15 @@
   (%init-condition-types)
   (%init-method-combinations)
   (%init-symbol-function-table)
+  ;; The generated table: every compiled defun, by name, so a form compiled
+  ;; at runtime can actually CALL them.
+  (%init-sft-auto)
+  ;; Run every defvar/defparameter init thunk.  The compiler EMITS
+  ;; init-all-globals from the source it compiled, so it is already in the
+  ;; image (verified by symmap); nothing had ever called it, which left every
+  ;; defparameter the compiler and mvm-eval depend on at NIL — Active
+  ;; Limitation #7, and the reason (eval 42) had nothing to work with.
+  (init-all-globals)
   (%init-signal-handling)
   (%init-signal-symbols)
   0)
@@ -753,6 +846,7 @@
     *float-override-source* (string #\Newline)
     *opcode-table-init-source* (string #\Newline)
     *mvm-eval-source* (string #\Newline)
+    *sft-auto-source* (string #\Newline)
     *l5-init-source* (string #\Newline)
     *bridge-source* (string #\Newline)
     *crypto-source* (string #\Newline)
@@ -791,7 +885,8 @@
 ;; PRODUCTION
 ;;   MODUS_I386_OUT=<path>    where to write the image
 ;;                            (default /home/claude/ws5-gate-out/modus-i386-cli)
-;;   MODUS_I386_LAYER=1..4    how much of the stack to bake in.  1 prelude,
+;;   MODUS_I386_SYMMAP=<path> symbol map location (default: image path + .symmap)
+;;   MODUS_I386_LAYER=1..5    how much of the stack to bake in.  1 prelude,
 ;;                            2 +gc/rt, 3 +the CL bridge, 4 +crypto.  Default 1
 ;;                            during bring-up; the suite needs 4.
 ;; DEV / TRIAGE ONLY
@@ -828,7 +923,18 @@
 (setf modus.mvm.i386::*i386-record-unimpl* t)
 (setf modus.mvm.i386::*i386-unimpl-ops* nil)
 
-(setf *write-symmap-path* "/home/claude/ws5-gate-out/modus-i386-cli.symmap")
+;;; The symmap follows the IMAGE path (or MODUS_I386_SYMMAP if you want it
+;;; somewhere else).  It used to be a fixed absolute path, which meant any
+;;; build — including a verification build in a detached worktree, pointed at
+;;; its own MODUS_I386_OUT — silently overwrote the shared symmap of whatever
+;;; else was there.  A fixed output path is exactly the wrong shape for the
+;;; concurrent / detached-worktree gating this workstream now uses.
+(defvar *i386-image-path*
+  (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_OUT")
+      "/home/claude/ws5-gate-out/modus-i386-cli"))
+(setf *write-symmap-path*
+      (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_SYMMAP")
+          (concatenate 'string *i386-image-path* ".symmap")))
 
 (format t "~%Compiling i386 CL image (~D chars)...~%"
         (length cl-user::*full-source*))
@@ -863,8 +969,7 @@
                           (let ((info (gethash k *opcode-table*)))
                             (if info (opcode-info-name info) "?"))
                           n)))))))
-  (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_OUT")
-                  "/home/claude/ws5-gate-out/modus-i386-cli")))
+  (let ((path *i386-image-path*))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
                               :element-type '(unsigned-byte 8)

@@ -12448,11 +12448,63 @@
   ;; compile-variable-ref, far too late for this dispatch.  See %const-int-value.
   (let ((count (%const-int-value count-form)))
   (cond
-    ;; Small constant shift (≤ 30 bits left, any right) — inline.
+    ;; Small constant shift (≤ 30 bits left, any right) — inline, but GUARDED.
+    ;;
+    ;; ACTIVE LIMITATION #8: the inline :shl/:sar shifts the TAGGED WORD.  That
+    ;; is right for a fixnum (low bit 0) and mangles a BIGNUM, whose tagged
+    ;; word is a heap pointer — `(ash <bignum> -24)` returned -62 instead of 66.
+    ;; It became load-bearing on the 30-bit tower, where an ordinary u32 IS a
+    ;; bignum and SHA-256's byte extraction is exactly this shape.
+    ;;
+    ;; SIZE-CONSCIOUS FORMULATION, chosen deliberately over the historically
+    ;; known-bad one.  The previous attempt expanded
+    ;;     (if (fixnump g) (%ash-fixnum-raw g k) (bignum-ash g k))
+    ;; as SOURCE at every site, which recompiles VALUE-FORM twice and blew code
+    ;; size up ~4x; that broke the ANSI harness's SIGSEGV-longjmp recovery
+    ;; (suspected fn-table / branch-displacement effects) even though the ash
+    ;; RESULTS were correct.  Here the test is emitted at IR level instead:
+    ;; VALUE-FORM is compiled ONCE, and the bignum case is an out-of-line CALL
+    ;; rather than an inlined second copy of the computation.  The fast path is
+    ;; unchanged; the added cost is a test, a branch and a cold call stub.
     ((and count (<= count 30))
      (compile-form value-form env dest)
+     (let ((fix-label (make-compiler-label))
+           (ash-done  (make-compiler-label))
+           (fx (alloc-temp-reg)))
+       ;; fixnum? (tag bit clear)  -> take the inline path
+       (emit-ir :li fx 1)
+       (emit-ir :test dest fx)
+       (emit-ir :beq fix-label)
+       ;; --- cold path: BIGNUM-ASH(value, count) ---
+       (emit-ir :mov +vreg-v0+ dest)
+       (emit-li-tagged +vreg-v1+ count)
+       (emit-ir :set-nargs 2)
+       (emit-ir :call "BIGNUM-ASH" 2)
+       (emit-ir :mov dest +vreg-vr+)
+       (emit-ir :br ash-done)
+       (emit-ir-label fix-label)
      (if (>= count 0)
-         (emit-ir :shl dest dest count)
+         ;; LEFT shift.  The guard above only catches a BIGNUM input; a small
+         ;; FIXNUM input can still produce a result outside the fixnum range —
+         ;; `(ash 3 30)` is 3221225472, which fits 62 bits but not 30.  That is
+         ;; exactly SHA-256's sigma shape, `(ash (logand x 3) 30)`, so it is
+         ;; not a corner.  Verify by shifting back: (x<<n)>>n = x iff nothing
+         ;; was lost; otherwise take the same cold out-of-line BIGNUM-ASH call.
+         (let ((chk (alloc-temp-reg))
+               (ok  (make-compiler-label)))
+           (emit-ir :mov chk dest)
+           (emit-ir :shl dest dest count)
+           (emit-ir :mov fx dest)
+           (emit-ir :sar fx fx count)
+           (emit-ir :cmp fx chk)
+           (emit-ir :beq ok)
+           (emit-ir :mov +vreg-v0+ chk)
+           (emit-li-tagged +vreg-v1+ count)
+           (emit-ir :set-nargs 2)
+           (emit-ir :call "BIGNUM-ASH" 2)
+           (emit-ir :mov dest +vreg-vr+)
+           (emit-ir-label ok)
+           (free-temp-reg))
          (progn
            (emit-ir :sar dest dest (- count))
            (let ((temp (alloc-temp-reg)))
@@ -12467,7 +12519,9 @@
              (emit-ir :li temp 2)
              (emit-ir :neg temp temp)
              (emit-ir :and dest dest temp)
-             (free-temp-reg)))))
+             (free-temp-reg))))
+       (free-temp-reg)
+       (emit-ir-label ash-done)))
     ;; Large constant or variable count — call bignum-ash so we
     ;; promote to bignum on overflow.  Slower (a real call) but
     ;; correct for arbitrary shift sizes.
@@ -12968,6 +13022,30 @@
 (defun compile-mem-ref (addr-form type-form env dest)
   "Compile (mem-ref addr type) - raw memory read.
    Address is a tagged fixnum. Type controls width and tagging."
+  ;; Width that cannot fit the target's fixnum range: read it as two half-width
+  ;; loads and recombine, so an out-of-range value becomes a BIGNUM instead of
+  ;; a wrapped negative.  The :u16 recursion does not promote, so this
+  ;; terminates.
+  ;;
+  ;; BIGNUM-ASH is called explicitly, and the combine is `+` not `*`, on
+  ;; purpose: `(ash hi 16)` would take compile-ash's INLINE path (a fixnum
+  ;; shifted left, which overflows), and a `(* hi 65536)` reconstruction was
+  ;; measured to WRAP rather than promote on the 30-bit tower — runtime
+  ;; MULTIPLY promotion is a separate, still-open gap.  Depending on it here
+  ;; would have made mem-ref inherit a defect it does not need: SHA-256 uses
+  ;; no wide multiply, and neither does this.
+  (let* ((wt0 (memory-width-code type-form))
+         (w0 (car wt0)))
+    (when (and (%mem-width-promotes-p w0 (cdr wt0))
+               (not *target-big-endian-p*))
+      (let ((asym (gensym "MRA")))
+        (return-from compile-mem-ref
+          (compile-form
+            (list 'let (list (list asym addr-form))
+                  (list '+ (list 'bignum-ash
+                                 (list 'mem-ref (list '+ asym 2) :u16) 16)
+                           (list 'mem-ref asym :u16)))
+            env dest)))))
   (compile-form addr-form env dest)
   ;; Untag address: logical shift right by 1
   ;; Must use SHR (not SAR) because on 32-bit targets, addresses >= 0x40000000
@@ -12979,28 +13057,8 @@
          (width (car wt))
          (needs-tag (cdr wt)))
     (emit-ir :load dest dest width)
-    (cond
-      ;; Width that cannot fit the target's fixnum range: PROMOTE.  The raw
-      ;; word is split into two 16-bit halves — each a fixnum at any supported
-      ;; width — and recombined with the CHECKED (promoting) arithmetic, so an
-      ;; out-of-range value becomes a bignum instead of a wrapped negative.
-      ;; Done on the loaded VALUE, not on memory, so it is endianness-neutral.
-      ((%mem-width-promotes-p width needs-tag)
-       (let ((hi (alloc-temp-reg))
-             (m  (alloc-temp-reg)))
-         (emit-ir :mov hi dest)
-         (emit-ir :shr hi hi 16)                 ; hi = raw >> 16  (<= #xFFFF)
-         (emit-ir :shl hi hi +fixnum-shift+)     ; tagged fixnum
-         (emit-ir :li m #xFFFF)
-         (emit-ir :and dest dest m)              ; lo = raw & #xFFFF
-         (emit-ir :shl dest dest +fixnum-shift+) ; tagged fixnum
-         (emit-ir :li m (ash 65536 +fixnum-shift+))
-         (emit-ir :mul-checked hi hi m)          ; hi * 65536, promoting
-         (emit-ir :add-checked dest hi dest)     ; + lo, promoting
-         (free-temp-reg)
-         (free-temp-reg)))
-      (needs-tag
-       (emit-ir :shl dest dest +fixnum-shift+)))))
+    (when needs-tag
+      (emit-ir :shl dest dest +fixnum-shift+))))
 
 (defun compile-setf (place value-form env dest)
   "Compile (setf place value)"

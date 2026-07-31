@@ -82,10 +82,48 @@
                                 (string #\Newline))))
       ""))
 
+;;; Layer 4: the UNFORKED net/crypto.lisp.  NOT crypto-32 / crypto-w32 /
+;;; crypto-fast / crypto-32-fast / crypto-mvm-split — the base 2018-line file,
+;;; verbatim.  The only extra source is ARCH GLUE, which is exactly what
+;;; net/arch-*.lisp supplies for every other target: e1000-state-base (a
+;;; scratch region for the K constants) and buf-read/write-u32, copied
+;;; VERBATIM from net/ip.lisp (the canonical unforked definitions — note the
+;;; forks in 32bit-overrides.lisp / crypto-mvm-split.lisp are NOT used).
+(defvar *crypto-glue-source* "
+(defun e1000-state-base () 268438528)   ; #x10000C00, inside the hosted BSS
+(defun buf-write-u32 (buf off val)
+  (aset buf off (logand (ash val -24) 255))
+  (aset buf (+ off 1) (logand (ash val -16) 255))
+  (aset buf (+ off 2) (logand (ash val -8) 255))
+  (aset buf (+ off 3) (logand val 255)))
+(defun buf-read-u32 (buf off)
+  (let ((b0 (aref buf off)))
+    (let ((b1 (aref buf (+ off 1))))
+      (let ((b2 (aref buf (+ off 2))))
+        (let ((b3 (aref buf (+ off 3))))
+          (let ((hi (ash b0 24)))
+            (let ((mid (ash b1 16)))
+              (let ((lo (ash b2 8)))
+                (let ((hm (logior hi mid)))
+                  (let ((hml (logior hm lo)))
+                    (logior hml b3)))))))))))
+")
+
+(defvar *crypto-source*
+  (if (>= *i386-layer* 4)
+      (concatenate 'string *crypto-glue-source* (string #\Newline)
+                   (mvm-text "net/crypto.lisp") (string #\Newline))
+      ""))
+
 ;;; ============================================================
 ;;; Driver — argv-dispatched probes, mirroring build-aarch64-cli
 ;;; ============================================================
 
+;;; *** WARNING: the driver below is a LISP STRING. ***  Its comments cannot
+;;; contain a double-quote character — one `"` terminates the string early and
+;;; SBCL reports the nonsense `defvar ... got 27 args`, which sends you hunting
+;;; in entirely the wrong place.  Cost this twice; write SHA256 of abc, not
+;;; SHA256("abc").
 (defvar *driver-source* "
 
 (defun sys-exit (code)
@@ -170,6 +208,18 @@
   (write-char-serial 107) (write-char-serial 54) (write-char-serial 61) ; k6=
   (%pdec (logand (ash 1 29) 255)) (putnl))         ; expect 0
 
+(defun probe-promote ()
+  ;; Isolate the promoting-arithmetic path that compile-mem-refs reconstruction
+  ;; depends on: hi*65536 + lo must become a BIGNUM, not a wrapped fixnum.
+  (write-char-serial 112) (write-char-serial 49) (write-char-serial 61) ; p1=
+  (%pdec (logand (* 17034 65536) 255)) (putnl)              ; expect 0
+  (write-char-serial 112) (write-char-serial 50) (write-char-serial 61) ; p2=
+  (%pdec (ash (* 17034 65536) -24)) (putnl)                 ; expect 66
+  (write-char-serial 112) (write-char-serial 51) (write-char-serial 61) ; p3=
+  (%pdec (logand (+ (* 17034 65536) 152) 255)) (putnl)      ; expect 152
+  (write-char-serial 112) (write-char-serial 52) (write-char-serial 61) ; p4=
+  (%pdec (ash (+ (* 17034 65536) 152) -24)) (putnl))        ; expect 66
+
 (defun probe-memu32-split ()
   ;; RE-MEASURE FROM SCRATCH.  probe 8s earlier attribution -- that the
   ;; :shl 1 tagging overflows -- was made on a substrate that still had 15
@@ -229,6 +279,41 @@
   (write-char-serial 110) (write-char-serial 61)   ; n=
   (%pdec (%parse-decimal-at-fixed-208)) (putnl))
 
+(defun %hexdig (n) (if (< n 10) (+ 48 n) (+ 87 n)))
+(defun %phex (b)
+  (write-char-serial (%hexdig (ash b -4)))
+  (write-char-serial (%hexdig (logand b 15))))
+(defun %print-digest (h)
+  (let ((i 0))
+    (loop (when (>= i 32) (return nil)) (%phex (aref h i)) (setq i (+ i 1))))
+  (putnl))
+
+(defun probe-lshift ()
+  ;; SHA-256s sigma functions do (ash (logand x 3) 30) — a LEFT shift whose
+  ;; RESULT leaves a 30-bit fixnum even though the INPUT is a small fixnum.
+  ;; compile-ashs guard only covers a bignum INPUT, so this is the shape it
+  ;; would still miss.  (ash 3 30) = 3221225472.
+  (write-char-serial 108) (write-char-serial 49) (write-char-serial 61) ; l1=
+  (%pdec (logand (ash 3 30) 255)) (putnl)          ; expect 0
+  (write-char-serial 108) (write-char-serial 50) (write-char-serial 61) ; l2=
+  (%pdec (ash (ash 3 30) -24)) (putnl)             ; expect 192
+  (write-char-serial 108) (write-char-serial 51) (write-char-serial 61) ; l3=
+  (%pdec (logand (ash 255 24) 255)) (putnl)        ; expect 0
+  (write-char-serial 108) (write-char-serial 52) (write-char-serial 61) ; l4=
+  (%pdec (ash (logand (ash 255 24) 4294967295) -24)) (putnl))  ; expect 255
+
+(defun probe-sha256 ()
+  (sha256-init)
+  ;; SHA256 of abc -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+  (let ((m (make-array 3)))
+    (aset m 0 97) (aset m 1 98) (aset m 2 99)
+    (write-char-serial 97) (write-char-serial 98) (write-char-serial 99)
+    (write-char-serial 61)
+    (%print-digest (sha256 m)))
+  ;; SHA256 of the empty string -> e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  (write-char-serial 101) (write-char-serial 61)
+  (%print-digest (sha256 (make-array 0))))
+
 (defun kernel-main ()
   (let ((which (%parse-decimal-at-fixed-208)))
     (cond
@@ -241,6 +326,9 @@
       ((eql which 7) (probe-bignum))
       ((eql which 8) (probe-memu32))
       ((eql which 9) (probe-memu32-split))
+      ((eql which 10) (probe-promote))
+      ((eql which 11) (probe-sha256))
+      ((eql which 12) (probe-lshift))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)
@@ -258,6 +346,7 @@
     *gc-source* (string #\Newline)
     *rt-source* (string #\Newline)
     *bridge-source* (string #\Newline)
+    *crypto-source* (string #\Newline)
     *driver-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
@@ -287,6 +376,10 @@
   (format t "  boot code:   ~D bytes~%" (length (kernel-image-boot-code image)))
   (format t "  native code: ~D bytes~%" (length (kernel-image-native-code image)))
   ;; ---- Unimplemented-opcode report (the whole point of layering) ----
+  (format t "~%  checked-arith slow paths: GENADD=~A GENSUB=~A GENMUL=~A  (NIL = degrades to wrapping)~%"
+          (and modus.mvm.i386::*i386-genadd-label* t)
+          (and modus.mvm.i386::*i386-gensub-label* t)
+          (and modus.mvm.i386::*i386-genmul-label* t))
   ;; Mechanized i386 register-invariant audit (see i386-check-eax-write).
   (let ((viol (modus.mvm.i386::i386-eax-invariant-report)))
     (if (null viol)

@@ -668,6 +668,13 @@
                     (aarch64-p
                      (and (boundp 'modus.mvm::*aarch64-li-const-patches*)
                           (symbol-value 'modus.mvm::*aarch64-li-const-patches*)))
+                    ;; WS5: i386 emits a 5-byte `MOV r32, imm32` placeholder;
+                    ;; the immediate is a plain 4-byte LE address.
+                    ((member arch '(:i386 :linux-i386))
+                     (and (find-package :modus.mvm.i386)
+                          (let ((s (find-symbol "*I386-LI-CONST-PATCHES*"
+                                                :modus.mvm.i386)))
+                            (and s (boundp s) (symbol-value s)))))
                     (t nil))))
     (when patches
       (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
@@ -699,17 +706,24 @@
                              (aref pool-addr-table idx)
                              0))
                  (tagged-addr (if (zerop offset) 0 (+ pool-vaddr offset))))
-            (if aarch64-p
-                ;; AArch64: MOVZ+MOVKx3 quad — patch the four imm16
-                ;; fields with successive 16-bit slices of tagged-addr.
-                (dotimes (i 4)
-                  (patch-aarch64-mov-imm16
-                   raw-bytes (+ file-pos (* i 4))
-                   (logand (ash tagged-addr (* i -16)) #xFFFF)))
-                ;; x64: little-endian 8-byte MOVABS immediate write.
-                (dotimes (i 8)
-                  (setf (aref raw-bytes (+ file-pos i))
-                        (logand (ash tagged-addr (* i -8)) #xFF))))))))))
+            (cond
+              (aarch64-p
+               ;; AArch64: MOVZ+MOVKx3 quad — patch the four imm16
+               ;; fields with successive 16-bit slices of tagged-addr.
+               (dotimes (i 4)
+                 (patch-aarch64-mov-imm16
+                  raw-bytes (+ file-pos (* i 4))
+                  (logand (ash tagged-addr (* i -16)) #xFFFF))))
+              ((member arch '(:i386 :linux-i386))
+               ;; i386: little-endian 4-byte MOV r32,imm32 immediate.
+               (dotimes (i 4)
+                 (setf (aref raw-bytes (+ file-pos i))
+                       (logand (ash tagged-addr (* i -8)) #xFF))))
+              (t
+               ;; x64: little-endian 8-byte MOVABS immediate write.
+               (dotimes (i 8)
+                 (setf (aref raw-bytes (+ file-pos i))
+                       (logand (ash tagged-addr (* i -8)) #xFF)))))))))))
 
 (defun assemble-kernel-image (module target &key boot-descriptor)
   "Assemble a complete bootable kernel image for TARGET."

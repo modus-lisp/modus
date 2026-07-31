@@ -148,9 +148,43 @@
 ;;; VA, VL, VN are stored at FIXED memory addresses (not EBP-relative)
 ;;; because each function creates a new frame with a new EBP.
 ;;; Using absolute addresses ensures alloc state is globally accessible.
-(defconstant +va-addr+      #x600)  ; Alloc pointer (absolute address)
-(defconstant +vl-addr+      #x604)  ; Alloc limit (absolute address)
-(defconstant +vn-addr+      #x608)  ; NIL constant (absolute address)
+;;;
+;;; RELOCATABLE (WS5 i386-CL): these were `defconstant`s pinned at #x600.
+;;; That works for bare-metal (low RAM is ours) but a HOSTED Linux/i386 ELF
+;;; cannot map anything below mmap_min_addr (65536 by default), so the whole
+;;; slot block has to move.  They are therefore `defparameter`s derived from
+;;; *i386-globals-base*; call I386-SET-GLOBALS-BASE to relocate the block.
+;;; Defaults are unchanged (#x600/#x604/#x608) so every existing bare-metal
+;;; i386 build emits byte-identical code.
+(defparameter *i386-globals-base* #x600
+  "Base of the i386 absolute-address global slot block.")
+(defparameter *va-addr*      #x600)  ; Alloc pointer (absolute address)
+(defparameter *vl-addr*      #x604)  ; Alloc limit (absolute address)
+(defparameter *vn-addr*      #x608)  ; NIL constant (absolute address)
+;;; --- WS5 additions: slots that x64/aarch64 keep in spare PHYSICAL registers.
+;;; i386 has no spare register (EAX=VR, ECX/EDX=scratch, EBX=V4, ESI=V0,
+;;; EDI=V1, ESP/EBP), so the closure-env "register" and the nargs/MV-count
+;;; convention slots all live in this block instead.  Single-threaded
+;;; cooperative execution makes a global slot exactly as correct as x64's R13:
+;;; the caller writes it immediately before the (indirect) call and the callee
+;;; reads it as its first prologue action.
+(defparameter *nargs-addr*   #x60C)  ; nargs convention slot (raw, untagged)
+(defparameter *cenv-addr*    #x610)  ; closure-env "register" (x64: R13)
+(defparameter *mvcount-addr* #x614)  ; multiple-values count (tagged)
+
+(defun i386-set-globals-base (base)
+  "Relocate the i386 absolute-address global slot block to BASE.
+   Bare metal keeps the #x600 default; a hosted Linux ELF must pass an
+   address inside a mapped LOAD segment (see boot/boot-linux-i386.lisp)."
+  (setf *i386-globals-base* base
+        *va-addr*      (+ base #x00)
+        *vl-addr*      (+ base #x04)
+        *vn-addr*      (+ base #x08)
+        *nargs-addr*   (+ base #x0C)
+        *cenv-addr*    (+ base #x10)
+        *mvcount-addr* (+ base #x14))
+  base)
+
 (defconstant +spill-base+   -28)   ; First general spill slot
 
 (defun i386-spill-offset (vreg)
@@ -192,6 +226,52 @@
 (defun i386-vreg-spills-p (vreg)
   "Does VREG spill to the stack on i386?"
   (null (i386-vreg-phys vreg)))
+
+;;; ============================================================
+;;; WS5 i386-CL translator knobs
+;;; ============================================================
+
+(defvar *i386-li-const-patches* nil
+  "List of (native-byte-offset . pool-index) recorded by +op-li-const+.
+   The offset points at the 4-byte immediate field of a `MOV r32, imm32`
+   placeholder; cross.lisp's APPLY-LI-CONST-PATCHES writes the tagged
+   constant-pool address there once the final image layout is known.
+   Counterpart of *x64-li-const-patches* / *aarch64-li-const-patches*.")
+
+(defparameter *i386-fn-tag-3* nil
+  "When true, :fn-addr tags function addresses with the +3 function tag
+   (TAG-PLAN.md; tags cons=1, fn=3, char=5, obj=9 are disjoint) and
+   :call-ind strips it before the indirect call — the x64/aarch64 contract
+   the shared CL runtime's funcall dispatch and FUNCTIONP assume.
+
+   Default NIL keeps the LEGACY bare-metal i386 builds (mvm/repl-source.lisp
+   and friends) byte-identical: they never reached a working :fn-addr (it was
+   an unimplemented opcode that emitted INT3), so nothing there depends on
+   either convention.  The CL/mvm-eval i386 build sets this to T.
+
+   NB: with tagging on, function entry points MUST be 16-byte aligned in the
+   FINAL virtual address so OR-3 yields a clean tag — see
+   *i386-fn-align* / *i386-native-code-offset*.")
+
+(defparameter *i386-fn-align* nil
+  "When non-nil, an integer alignment (16) applied to every function entry
+   point.  Padding is computed against (+ *i386-native-code-offset* pos) so
+   the alignment holds at the RUNTIME virtual address, not merely at the
+   buffer offset.  Required whenever *i386-fn-tag-3* is on.")
+
+(defparameter *i386-native-code-offset* 0
+  "Virtual-address offset of native-code byte 0 within the final image.
+   Only used to make *i386-fn-align* padding correct; mirrors
+   *x64-native-code-offset*.")
+
+;;; GENERIC-ADD / -SUBTRACT / -MULTIPLY entry labels, resolved by name in
+;;; TRANSLATE-MVM-TO-I386.  NIL (e.g. an image that does not define them, or
+;;; single-instruction translation) makes the :add/:sub/:mul-checked opcodes
+;;; degrade to plain wrapping arithmetic, exactly like translate-x64's
+;;; fallback branch.
+(defvar *i386-genadd-label* nil)
+(defvar *i386-gensub-label* nil)
+(defvar *i386-genmul-label* nil)
 
 ;;; ============================================================
 ;;; i386 Code Buffer
@@ -248,6 +328,18 @@
         (i386-buffer-fixups buf))
   (i386-emit-u32 buf 0))
 
+(defun i386-emit-fixup-diff32 (buf label-id anchor)
+  "Emit a 32-bit placeholder holding (LABEL - ANCHOR), a purely
+   BUFFER-RELATIVE difference.  Used by :fn-addr to materialise a function
+   address position-independently (i386 has no RIP-relative LEA): the code
+   does `call .next / pop d / add d, (fn - .next)`, and ANCHOR is the buffer
+   position of `.next`.  Because the value is a difference between two
+   positions in the same buffer it needs no knowledge of the final load
+   address, unlike the x64 MOVABS form."
+  (push (list (i386-buffer-position buf) label-id :diff32 anchor)
+        (i386-buffer-fixups buf))
+  (i386-emit-u32 buf 0))
+
 (defun i386-fixup-labels (buf)
   "Resolve all branch label references.  Asserts rel32 fits in signed
    32-bit before encoding; out-of-range silently truncates and becomes
@@ -256,11 +348,22 @@
    but the assert costs nothing.)"
   (let ((bytes (i386-buffer-bytes buf)))
     (dolist (fixup (i386-buffer-fixups buf))
-      (destructuring-bind (pos label-id fixup-type) fixup
+      (destructuring-bind (pos label-id fixup-type &optional anchor) fixup
         (let ((target (gethash label-id (i386-buffer-labels buf))))
           (unless target
             (error "i386: undefined label ~A" label-id))
           (ecase fixup-type
+            (:diff32
+             ;; Buffer-relative difference (label - anchor); see
+             ;; i386-emit-fixup-diff32.
+             (let* ((rel (- target anchor)))
+               (unless (<= -2147483648 rel 2147483647)
+                 (error "i386 diff32 ~D out of range at pos ~D" rel pos))
+               (let ((urel (if (minusp rel) (logand rel #xFFFFFFFF) rel)))
+                 (setf (aref bytes (+ pos 0)) (logand urel #xFF)
+                       (aref bytes (+ pos 1)) (logand (ash urel -8) #xFF)
+                       (aref bytes (+ pos 2)) (logand (ash urel -16) #xFF)
+                       (aref bytes (+ pos 3)) (logand (ash urel -24) #xFF)))))
             (:rel32
              ;; rel32 is relative to end of the 4-byte displacement field
              (let* ((rel (- target (+ pos 4))))
@@ -625,7 +728,8 @@
   '((:e  . #x4)  (:ne . #x5)
     (:l  . #xC)  (:ge . #xD)  (:le . #xE)  (:g  . #xF)
     (:b  . #x2)  (:ae . #x3)  (:be . #x6)  (:a  . #x7)
-    (:z  . #x4)  (:nz . #x5)  (:s  . #x8)  (:ns . #x9))
+    (:z  . #x4)  (:nz . #x5)  (:s  . #x8)  (:ns . #x9)
+    (:o  . #x0)  (:no . #x1))
   "Condition code keyword -> numeric encoding for Jcc.")
 
 (defun i386-emit-jcc (buf cc &optional label-id)
@@ -693,9 +797,9 @@
 (defun i386-vreg-abs-addr (vreg)
   "Return absolute memory address for VA/VL/VN, or nil for other vregs."
   (cond
-    ((= vreg +vreg-va+) +va-addr+)
-    ((= vreg +vreg-vl+) +vl-addr+)
-    ((= vreg +vreg-vn+) +vn-addr+)
+    ((= vreg +vreg-va+) *va-addr*)
+    ((= vreg +vreg-vl+) *vl-addr*)
+    ((= vreg +vreg-vn+) *vn-addr*)
     (t nil)))
 
 (defun i386-load-vreg (buf scratch vreg)
@@ -1576,7 +1680,7 @@
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
            (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-cmp-reg-abs buf +i386-eax+ +vn-addr+)
+           (i386-emit-cmp-reg-abs buf +i386-eax+ *vn-addr*)
            (i386-emit-jcc buf :e label)))
 
         ((op= +op-bnnull+)
@@ -1586,7 +1690,7 @@
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
            (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-cmp-reg-abs buf +i386-eax+ +vn-addr+)
+           (i386-emit-cmp-reg-abs buf +i386-eax+ *vn-addr*)
            (i386-emit-jcc buf :ne label)))
 
         ;; ============================================
@@ -1640,7 +1744,7 @@
            ;; Load cdr value first (before EAX is touched)
            (i386-load-vreg buf +scratch0+ vb-arg)
            ;; Load alloc pointer into EDX
-           (i386-emit-mov-reg-abs buf +i386-edx+ +va-addr+)
+           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
            ;; Store car
            (i386-load-vreg buf +i386-eax+ va-arg)
            (i386-emit-mov-mem-reg buf +i386-edx+ 0 +i386-eax+)
@@ -1651,7 +1755,7 @@
            (i386-emit-or-reg-imm buf +i386-eax+ +tag-cons+)
            ;; Bump alloc by 16 (cons = 8 bytes but need 16-byte alignment for tag)
            (i386-emit-add-reg-imm buf +i386-edx+ 16)
-           (i386-emit-mov-abs-reg buf +va-addr+ +i386-edx+)
+           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
            ;; Store result
            (i386-store-vreg buf vd +i386-eax+)))
 
@@ -1684,7 +1788,7 @@
                  (done-label (i386-make-label)))
              (i386-emit-jcc buf :e true-label)
              ;; False: load NIL
-             (i386-emit-mov-reg-abs buf +i386-eax+ +vn-addr+)
+             (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
              (i386-emit-jmp-rel32 buf done-label)
              ;; True: load T
              (i386-emit-label buf true-label)
@@ -1702,7 +1806,7 @@
                  (done-label (i386-make-label)))
              (i386-emit-jcc buf :ne true-label)
              ;; Is cons -> return NIL
-             (i386-emit-mov-reg-abs buf +i386-eax+ +vn-addr+)
+             (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
              (i386-emit-jmp-rel32 buf done-label)
              ;; Not cons -> return T
              (i386-emit-label buf true-label)
@@ -1718,7 +1822,7 @@
          ;; Header word at [VA]: (count << 8) | subtag  (matches x64 format)
          ;; Result = VA | object_tag, advance VA by aligned size
          (let ((vd (first operands)) (count (second operands)) (subtag (third operands)))
-           (i386-emit-mov-reg-abs buf +i386-edx+ +va-addr+)
+           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
            ;; Write header: (count << 8) | subtag
            (i386-emit-mov-mem-imm buf +i386-edx+ 0
                                   (logior (ash count 8) subtag))
@@ -1728,7 +1832,7 @@
            ;; Bump alloc: header (4) + count*4, aligned to 16
            (let ((total (logand (+ (* (1+ count) 4) 15) (lognot 15))))
              (i386-emit-add-reg-imm buf +i386-edx+ total))
-           (i386-emit-mov-abs-reg buf +va-addr+ +i386-edx+)
+           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
            (i386-store-vreg buf vd +i386-eax+)))
 
         ((op= +op-alloc-array+)
@@ -1746,7 +1850,7 @@
            (i386-emit-shl-reg-imm buf +i386-ecx+ 8)
            (i386-emit-or-reg-imm buf +i386-ecx+ #x32)
            ;; Load VA (alloc pointer) into EDX
-           (i386-emit-mov-reg-abs buf +i386-edx+ +va-addr+)
+           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
            ;; Write header at [EDX]
            (i386-emit-mov-mem-reg buf +i386-edx+ 0 +i386-ecx+)
            ;; Result = EDX | object_tag -> EAX
@@ -1762,7 +1866,7 @@
            (i386-emit-and-reg-imm buf +i386-ecx+ -16)  ; align to 16
            ;; Advance alloc pointer: EDX += ECX
            (i386-emit-add-reg-reg buf +i386-edx+ +i386-ecx+)
-           (i386-emit-mov-abs-reg buf +va-addr+ +i386-edx+)
+           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
            ;; Store result
            (i386-store-vreg buf vd +i386-eax+)))
 
@@ -1924,6 +2028,11 @@
            (i386-emit-push-mem buf +i386-ebp+ -20)  ; V3
            (i386-emit-push-mem buf +i386-ebp+ -16)  ; V2
            (i386-load-vreg buf +i386-eax+ vs)
+           ;; Strip the +3 function tag that :fn-addr applied (TAG-PLAN.md).
+           ;; Gated so the legacy bare-metal i386 images, which never had a
+           ;; working :fn-addr, stay byte-identical.
+           (when *i386-fn-tag-3*
+             (i386-emit-sub-reg-imm buf +i386-eax+ 3))
            (i386-emit-call-reg buf +i386-eax+)
            ;; Clean up pushed V2/V3
            (i386-emit-add-reg-imm buf +i386-esp+ 8)))
@@ -1968,13 +2077,13 @@
         ((op= +op-alloc-cons+)
          ;; (alloc-cons Vd) -- bump-allocate cons cell, tag as cons
          (let ((vd (first operands)))
-           (i386-emit-mov-reg-abs buf +i386-eax+ +va-addr+)
+           (i386-emit-mov-reg-abs buf +i386-eax+ *va-addr*)
            ;; Tag as cons
            (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
            ;; Bump alloc by 16 (16-byte alignment for 4-bit tag)
            (i386-emit-add-reg-imm buf +i386-eax+ 16)
-           (i386-emit-mov-abs-reg buf +va-addr+ +i386-eax+)
+           (i386-emit-mov-abs-reg buf *va-addr* +i386-eax+)
            ;; Store tagged result
            (i386-store-vreg buf vd +scratch0+)))
 
@@ -1983,8 +2092,8 @@
          ;; Both at absolute addresses. If VA >= VL, trigger GC.
          ;; IMPORTANT: Use scratch0 (ECX), NOT EAX! EAX is VR and may hold
          ;; a live value (e.g., the car arg popped before GC-CHECK + CONS).
-         (i386-emit-mov-reg-abs buf +scratch0+ +va-addr+)
-         (i386-emit-cmp-reg-abs buf +scratch0+ +vl-addr+)
+         (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
+         (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
          (let ((ok-label (i386-make-label)))
            (i386-emit-jcc buf :b ok-label)   ; unsigned below -> room left
            ;; GC needed
@@ -2011,15 +2120,15 @@
          (i386-emit-push-reg buf +i386-edi+)     ; V1
          (i386-emit-push-reg buf +i386-ebx+)     ; V4
          ;; Also save VA/VL/VN from absolute addresses
-         (i386-emit-push-abs buf +va-addr+)
-         (i386-emit-push-abs buf +vl-addr+)
-         (i386-emit-push-abs buf +vn-addr+))
+         (i386-emit-push-abs buf *va-addr*)
+         (i386-emit-push-abs buf *vl-addr*)
+         (i386-emit-push-abs buf *vn-addr*))
 
         ((op= +op-restore-ctx+)
          ;; Restore (reverse order of save)
-         (i386-emit-pop-abs buf +vn-addr+)
-         (i386-emit-pop-abs buf +vl-addr+)
-         (i386-emit-pop-abs buf +va-addr+)
+         (i386-emit-pop-abs buf *vn-addr*)
+         (i386-emit-pop-abs buf *vl-addr*)
+         (i386-emit-pop-abs buf *va-addr*)
          (i386-emit-pop-reg buf +i386-ebx+)
          (i386-emit-pop-reg buf +i386-edi+)
          (i386-emit-pop-reg buf +i386-esi+))
@@ -2121,6 +2230,275 @@
            (i386-emit-byte buf (i386-modrm #b00 +i386-eax+ 5))
            (i386-emit-u32 buf offset)))
 
+        ;; ================================================================
+        ;; WS5 (i386 CL / mvm-eval): opcodes that existed on x64 + aarch64
+        ;; but had never been ported here, so they hit the INT3 default.
+        ;; Every one of these is load-bearing for the real CL runtime:
+        ;; without them a Modus CL image on i386 traps as soon as it takes
+        ;; a function address, builds a closure, allocates a string, or
+        ;; compiles a form at runtime.
+        ;; ================================================================
+
+        ;; ---- LI-CONST Vd, idx ----  (constant-pool literal)
+        ((op= +op-li-const+)
+         ;; Emit `MOV r32, imm32` (B8+r id — always 5 bytes) as a
+         ;; placeholder and record the imm field for the image-assembly
+         ;; patch pass.  x64 uses a 10-byte MOVABS; on i386 a plain imm32
+         ;; already covers the whole address space.
+         (let* ((vd (first operands))
+                (idx (second operands))
+                (pd (i386-vreg-phys vd))
+                (dst (or pd +i386-eax+))
+                (start (i386-current-pos buf)))
+           (i386-emit-mov-reg-imm buf dst 0)
+           (let ((emitted (- (i386-current-pos buf) start)))
+             (unless (= emitted 5)
+               (error "i386 li-const: expected 5-byte MOV r32,imm32, got ~D"
+                      emitted)))
+           (push (cons (+ start 1) idx) *i386-li-const-patches*)
+           (unless pd (i386-store-vreg buf vd dst))))
+
+        ;; ---- FN-ADDR Vd, target ----  (tagged native function address)
+        ((op= +op-fn-addr+)
+         ;; i386 has no RIP-relative LEA, so the address is materialised
+         ;; position-independently:
+         ;;     call .next          ; E8 00000000  (pushes &.next)
+         ;;   .next:
+         ;;     pop  dst            ; 58+r
+         ;;     add  dst, (fn-.next); 81 /0 id   <- :diff32 fixup
+         ;;     or   dst, 3         ; function tag (when *i386-fn-tag-3*)
+         ;; The ADD displacement is a buffer-relative difference, so it is
+         ;; resolved entirely inside i386-fixup-labels.
+         (let* ((vd (first operands))
+                (target-offset (second operands))
+                (fn-table (i386-translate-state-function-table state))
+                (label (when fn-table (gethash target-offset fn-table)))
+                (pd (i386-vreg-phys vd))
+                (dst (or pd +i386-eax+)))
+           (cond
+             (label
+              (i386-emit-byte buf #xE8)          ; call rel32
+              (i386-emit-u32 buf 0)              ; rel32 = 0 -> next insn
+              (let ((anchor (i386-current-pos buf)))
+                (i386-emit-pop-reg buf dst)
+                (i386-emit-byte buf #x81)                     ; ADD r/m32, imm32
+                (i386-emit-byte buf (i386-modrm #b11 0 dst))  ; /0, mod=11
+                (i386-emit-fixup-diff32 buf label anchor))
+              (when *i386-fn-tag-3*
+                (i386-emit-or-reg-imm buf dst 3)))
+             (t
+              ;; Unresolved name (the compiler's #xFFFFFFF0 sentinel): load
+              ;; NIL so funcall's NIL guard raises UNDEFINED-FUNCTION rather
+              ;; than calling a wild address.  Same choice as translate-x64.
+              (i386-emit-mov-reg-abs buf dst *vn-addr*)))
+           (unless pd (i386-store-vreg buf vd dst))))
+
+        ;; ---- SET-CENV Vs / GET-CENV Vd ----  (closure environment)
+        ;; x64 keeps this in R13.  i386 has no spare register, so it lives
+        ;; in the global slot block; see *cenv-addr*.
+        ((op= +op-set-cenv+)
+         (let ((vs (first operands)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-mov-abs-reg buf *cenv-addr* +scratch0+)))
+
+        ((op= +op-get-cenv+)
+         (let ((vd (first operands)))
+           (i386-emit-mov-reg-abs buf +scratch0+ *cenv-addr*)
+           (i386-store-vreg buf vd +scratch0+)))
+
+        ;; ---- SET-NARGS imm8 / GET-NARGS Vd ----
+        ;; Raw (untagged) count in the slot; :get-nargs tags it (<<1) so the
+        ;; rest of the IR's tagged world can compare it against :li values.
+        ((op= +op-set-nargs+)
+         (let ((n (logand (first operands) #xFF)))
+           (i386-emit-byte buf #xC7)                       ; MOV r/m32, imm32
+           (i386-emit-byte buf (i386-modrm #b00 0 5))      ; mod=00 rm=101 -> disp32
+           (i386-emit-u32 buf *nargs-addr*)
+           (i386-emit-u32 buf n)))
+
+        ((op= +op-get-nargs+)
+         (let ((vd (first operands)))
+           (i386-emit-mov-reg-abs buf +scratch0+ *nargs-addr*)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)        ; tag as fixnum
+           (i386-store-vreg buf vd +scratch0+)))
+
+        ;; ---- SET-MV-COUNT imm8 ----  (multiple-values count, TAGGED)
+        ((op= +op-set-mv-count+)
+         (let ((tagged (ash (first operands) 1)))
+           (i386-emit-byte buf #xC7)
+           (i386-emit-byte buf (i386-modrm #b00 0 5))
+           (i386-emit-u32 buf *mvcount-addr*)
+           (i386-emit-u32 buf tagged)))
+
+        ;; ---- ALLOC-STRING Vd, Vcount ----
+        ;; Identical to :alloc-array except for the subtag (#x31).  Vcount is
+        ;; UNTAGGED (the compiler already SAR'd it), and — as on every other
+        ;; target — a string stores one char CODE per WORD, so the element
+        ;; count is a word count: size = align16((count+1)*4).
+        ((op= +op-alloc-string+)
+         (let ((vd (first operands)) (vcount (second operands)))
+           (i386-load-vreg buf +scratch0+ vcount)
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-emit-shl-reg-imm buf +scratch0+ 8)
+           (i386-emit-or-reg-imm buf +scratch0+ #x31)       ; STRING subtag
+           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
+           (i386-emit-mov-mem-reg buf +i386-edx+ 0 +scratch0+)
+           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
+           (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
+           (i386-emit-pop-reg buf +scratch0+)               ; count
+           (i386-emit-add-reg-imm buf +scratch0+ 1)         ; + header word
+           (i386-emit-shl-reg-imm buf +scratch0+ 2)         ; * 4
+           (i386-emit-add-reg-imm buf +scratch0+ 15)
+           (i386-emit-and-reg-imm buf +scratch0+ -16)
+           (i386-emit-add-reg-reg buf +i386-edx+ +scratch0+)
+           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ;; ---- ALLOC-U8 Vd, Vcount ----  byte-packed (unsigned-byte 8) vector
+        ;; Feature #183.  Vcount is a TAGGED fixnum (byte count N).  Object:
+        ;; header at [VA] = (N << 8) | #x11, then N packed bytes at +4 (i386
+        ;; objects have a 4-byte header and NO padding word — cf. :obj-ref's
+        ;; (1+idx)*4).  Total size = align16(4 + N).
+        ;; NOTE: the 24-bit i386 count field caps a u8 vector at 16 MB.
+        ((op= +op-alloc-u8+)
+         (let ((vd (first operands)) (vcount (second operands)))
+           (i386-load-vreg buf +scratch0+ vcount)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; untag -> N
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-emit-shl-reg-imm buf +scratch0+ 8)
+           (i386-emit-or-reg-imm buf +scratch0+ #x11)       ; u8-vector subtag
+           (i386-emit-mov-reg-abs buf +i386-edx+ *va-addr*)
+           (i386-emit-mov-mem-reg buf +i386-edx+ 0 +scratch0+)
+           (i386-emit-mov-reg-reg buf +i386-eax+ +i386-edx+)
+           (i386-emit-or-reg-imm buf +i386-eax+ +tag-object+)
+           (i386-emit-pop-reg buf +scratch0+)               ; N
+           (i386-emit-add-reg-imm buf +scratch0+ 4)         ; header bytes
+           (i386-emit-add-reg-imm buf +scratch0+ 15)
+           (i386-emit-and-reg-imm buf +scratch0+ -16)
+           (i386-emit-add-reg-reg buf +i386-edx+ +scratch0+)
+           (i386-emit-mov-abs-reg buf *va-addr* +i386-edx+)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ;; ---- U8-REF Vd, Varr, Vidx ----
+        ;; Byte address = (Varr - 9) + 4 + real_idx = Varr + real_idx - 5.
+        ;; Vidx is TAGGED (real_idx*2); result is TAGGED (byte << 1), matching
+        ;; mem-ref :u8 and the x64/aarch64 ports.
+        ((op= +op-u8-ref+)
+         (let ((vd (first operands))
+               (varr (second operands))
+               (vidx (third operands)))
+           (i386-load-vreg buf +scratch0+ vidx)             ; load idx BEFORE
+           (i386-load-vreg buf +i386-eax+ varr)             ; EAX clobbers VR
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; real_idx
+           (i386-emit-add-reg-reg buf +i386-eax+ +scratch0+)
+           (i386-emit-movzx-byte buf +i386-eax+ +i386-eax+ -5)
+           (i386-emit-shl-reg-imm buf +i386-eax+ 1)         ; tag as fixnum
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ;; ---- U8-SET Varr, Vidx, Vval ----
+        ;; Byte address = Varr + real_idx - 5.  Vidx and Vval are TAGGED.
+        ;; The value MUST end up in one of EAX/ECX/EDX/EBX — in 32-bit mode
+        ;; only those four have an addressable low byte (reg fields 4..7 mean
+        ;; AH/CH/DH/BH, NOT SIL/DIL), so ECX is used and `mov [eax-5], cl`
+        ;; is emitted.  All three operands are loaded before EAX is clobbered.
+        ((op= +op-u8-set+)
+         (let ((varr (first operands))
+               (vidx (second operands))
+               (vval (third operands)))
+           (i386-load-vreg buf +scratch0+ vval)             ; ECX = value
+           (i386-load-vreg buf +scratch1+ vidx)             ; EDX = idx
+           (i386-load-vreg buf +i386-eax+ varr)             ; EAX = arr (clobbers VR)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)         ; untag value
+           (i386-emit-sar-reg-imm buf +scratch1+ 1)         ; untag idx
+           (i386-emit-add-reg-reg buf +i386-eax+ +scratch1+)
+           (i386-emit-mov-mem8-reg buf +i386-eax+ -5 +scratch0+)))
+
+        ;; ---- ADDS / SUBS / BVS ----  (explicit overflow-flag arithmetic)
+        ;; Same code as :add/:sub — the i386 MOV that stores the result does
+        ;; not disturb EFLAGS, so a following :bvs still sees OF.
+        ((op= +op-adds+)
+         (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
+           (i386-load-vreg buf +scratch0+ vb)
+           (i386-load-vreg buf +i386-eax+ va)
+           (i386-emit-add-reg-reg buf +i386-eax+ +scratch0+)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ((op= +op-subs+)
+         (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
+           (i386-load-vreg buf +scratch0+ vb)
+           (i386-load-vreg buf +i386-eax+ va)
+           (i386-emit-sub-reg-reg buf +i386-eax+ +scratch0+)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ((op= +op-bvs+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (i386-ensure-label-at state target-pos)))
+           (i386-emit-jcc buf :o label)))
+
+        ;; ---- ADD-CHECKED / SUB-CHECKED / MUL-CHECKED ----
+        ;; Tagged arithmetic with bignum overflow promotion.  This matters far
+        ;; MORE on i386 than on the 64-bit targets: a fixnum here is ~30 bits,
+        ;; so ordinary program values overflow routinely.
+        ;;
+        ;; The result is computed in EDX — never EAX — so that va/vb stay
+        ;; readable for the slow path even when one of them is VR (EAX).  That
+        ;; is the same reason translate-x64 sums into R13.
+        ;;
+        ;; Slow path calls GENERIC-ADD/-SUBTRACT/-MULTIPLY with the i386 call
+        ;; convention: V0=ESI, V1=EDI, V2/V3 pushed by the caller.  ESI/EDI are
+        ;; saved around the call because they hold live V0/V1; the callee
+        ;; preserves EBX/ESI/EDI itself, and EAX/ECX/EDX are ours to clobber.
+        ((or (op= +op-add-checked+) (op= +op-sub-checked+) (op= +op-mul-checked+))
+         (let* ((vd (first operands)) (va (second operands)) (vb (third operands))
+                (kind (cond ((op= +op-add-checked+) :add)
+                            ((op= +op-sub-checked+) :sub)
+                            (t :mul)))
+                (gen-label (ecase kind
+                             (:add *i386-genadd-label*)
+                             (:sub *i386-gensub-label*)
+                             (:mul *i386-genmul-label*))))
+           ;; ---- fast path (result in EDX) ----
+           (i386-load-vreg buf +scratch0+ vb)               ; ECX = vb
+           (i386-load-vreg buf +scratch1+ va)               ; EDX = va
+           (ecase kind
+             (:add (i386-emit-add-reg-reg buf +scratch1+ +scratch0+))
+             (:sub (i386-emit-sub-reg-reg buf +scratch1+ +scratch0+))
+             ;; (a>>1) * (b<<1) = (a*b)<<1; IMUL sets OF exactly when the
+             ;; tagged product leaves the 32-bit signed range.
+             (:mul (i386-emit-sar-reg-imm buf +scratch1+ 1)
+                   (i386-emit-imul-reg-reg buf +scratch1+ +scratch0+)))
+           (if (null gen-label)
+               ;; No generic-arith entry in this module (or single-instruction
+               ;; translation): degrade to plain wrapping arithmetic, exactly
+               ;; like translate-x64's fallback branch.
+               (i386-store-vreg buf vd +scratch1+)
+               (let ((done (i386-make-label)))
+                 (i386-emit-jcc buf :no done)
+                 ;; ---- overflow slow path ----
+                 ;; va/vb are still intact: the fast path touched only ECX/EDX.
+                 (i386-load-vreg buf +scratch0+ va)         ; ECX = va
+                 (i386-load-vreg buf +scratch1+ vb)         ; EDX = vb
+                 (i386-emit-push-reg buf +i386-esi+)        ; save V0
+                 (i386-emit-push-reg buf +i386-edi+)        ; save V1
+                 (i386-emit-mov-reg-reg buf +i386-esi+ +scratch0+)  ; arg0
+                 (i386-emit-mov-reg-reg buf +i386-edi+ +scratch1+)  ; arg1
+                 ;; nargs = 2 (raw), for a callee with &optional/&rest.
+                 (i386-emit-byte buf #xC7)
+                 (i386-emit-byte buf (i386-modrm #b00 0 5))
+                 (i386-emit-u32 buf *nargs-addr*)
+                 (i386-emit-u32 buf 2)
+                 ;; V2/V3 are the caller's, still in this frame's slots.
+                 (i386-emit-push-mem buf +i386-ebp+ -20)    ; V3
+                 (i386-emit-push-mem buf +i386-ebp+ -16)    ; V2
+                 (i386-emit-call-rel32 buf gen-label)
+                 (i386-emit-add-reg-imm buf +i386-esp+ 8)
+                 (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)  ; result
+                 (i386-emit-pop-reg buf +i386-edi+)
+                 (i386-emit-pop-reg buf +i386-esi+)
+                 (i386-emit-label buf done)
+                 (i386-store-vreg buf vd +scratch1+)))))
+
         ;; ============================================
         ;; Unknown Opcode
         ;; ============================================
@@ -2198,6 +2576,9 @@
    BYTECODE: vector of (unsigned-byte 8) containing MVM instructions.
    FUNCTION-TABLE: list of (name offset length) entries.
    Returns (VALUES i386-buffer function-name-to-label-map)."
+  ;; Reset the per-translation LI-CONST patch list (see
+  ;; *i386-li-const-patches* / cross.lisp's apply-li-const-patches).
+  (setf *i386-li-const-patches* nil)
   (let* ((buf (make-i386-buffer))
          (n-functions (length function-table))
          (fn-labels (make-array n-functions))
@@ -2213,11 +2594,37 @@
                (setf (aref fn-labels i) label)
                (setf (gethash name fn-map) label)
                (setf (gethash offset fn-offset-to-label) label)))
+    ;; Resolve the generic-arithmetic entries used by the overflow slow paths
+    ;; of :add/:sub/:mul-checked (mirrors translate-mvm-to-x64).  Absent from
+    ;; the module ⇒ NIL ⇒ those opcodes degrade to wrapping arithmetic.
+    (setf *i386-genadd-label*
+          (loop for entry in function-table
+                when (string-equal (first entry) "GENERIC-ADD")
+                  return (gethash (second entry) fn-offset-to-label)))
+    (setf *i386-gensub-label*
+          (loop for entry in function-table
+                when (string-equal (first entry) "GENERIC-SUBTRACT")
+                  return (gethash (second entry) fn-offset-to-label)))
+    (setf *i386-genmul-label*
+          (loop for entry in function-table
+                when (string-equal (first entry) "GENERIC-MULTIPLY")
+                  return (gethash (second entry) fn-offset-to-label)))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table
           for fn-offset = (second entry)
           for fn-length = (third entry)
+          do (progn
+               ;; Function-entry alignment.  With *i386-fn-tag-3* on, :fn-addr
+               ;; OR-3s the entry address, so the low nibble must be 0 at the
+               ;; RUNTIME virtual address — hence padding is computed against
+               ;; *i386-native-code-offset* + buffer position, not the buffer
+               ;; position alone.
+               (when *i386-fn-align*
+                 (loop until (zerop (mod (+ *i386-native-code-offset*
+                                            (i386-current-pos buf))
+                                         *i386-fn-align*))
+                       do (i386-emit-nop buf))))
           do (let* ((fn-label (aref fn-labels i))
                     (state (make-i386-translate-state
                             :buf buf

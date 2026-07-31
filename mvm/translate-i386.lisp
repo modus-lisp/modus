@@ -289,6 +289,22 @@
    (materialises arguments 5+ — a no-op hands the callee stack garbage),
    #x0531 %MMAP-EXEC-PAGE (returns a page address).")
 
+(defparameter *i386-eax-live-traps* (list #x0510 #x0511)
+  "Trap codes whose ARM OWNS EAX, so the :trap dispatch must NOT bracket them
+   with push/pop EAX.  On i386 VR is EAX, and these two are the only traps
+   that traffic in VR:
+
+   #x0510 SETJMP     — compiler.lisp emits (:trap #x0510) (:mov dest VR), so
+     the result has to arrive in VR.  A trailing `pop eax` would restore the
+     pre-trap EAX, setjmp would always read as NIL, and handler-case would
+     silently never take its handler path.
+   #x0511 LONGJMP    — hands the T sentinel to the setjmp resume point in EAX
+     and never returns; the bracket's pop is unreachable anyway.
+
+   #x0512 CLEAR-HANDLER is deliberately ABSENT: there EAX holds the
+   handler-case body's result (dest==VR==EAX) and the bracket is exactly what
+   preserves it across the pop helper.")
+
 (defun i386-emit-unimpl-trap (buf code)
   "Emit code that NAMES ITSELF when an unimplemented trap is reached.
 
@@ -305,9 +321,24 @@
    no RIP-relative addressing): `call .do` pushes the address of the bytes
    that follow it, which ARE the string.
    Bare metal: INT3, the loudest thing available without a console."
+  (i386-emit-abort-msg buf
+                       (format nil "MODUS i386: unimplemented trap #x~4,'0X~%" code)
+                       70))
+
+(defun i386-emit-abort-msg (buf msg status)
+  "Emit code that writes MSG to stderr and _exit(STATUS).  Hosted Linux only;
+   bare metal gets INT3 (the loudest thing available without a console).
+
+   The message is materialised position-independently with the call/pop idiom
+   (i386 has no RIP-relative addressing): `call .do` pushes the address of the
+   bytes that follow it, which ARE the string.
+
+   Factored out of I386-EMIT-UNIMPL-TRAP so the handler-case traps can NAME a
+   structurally impossible state (a longjmp with nothing armed) instead of
+   jumping to a null saved IP — the same reasoning that made an unimplemented
+   trap say its own number rather than silently no-op."
   (if *i386-linux-mode*
-      (let ((msg (format nil "MODUS i386: unimplemented trap #x~4,'0X~%" code))
-            (do-lbl (i386-make-label))
+      (let ((do-lbl (i386-make-label))
             (str-lbl (i386-make-label)))
         (i386-emit-jmp-rel32 buf str-lbl)
         (i386-emit-label buf do-lbl)
@@ -316,7 +347,7 @@
         (i386-emit-mov-reg-imm buf +i386-edx+ (length msg)); count
         (i386-emit-mov-reg-imm buf +i386-eax+ 4)           ; SYS_write
         (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
-        (i386-emit-mov-reg-imm buf +i386-ebx+ 70)          ; distinctive status
+        (i386-emit-mov-reg-imm buf +i386-ebx+ status)
         (i386-emit-mov-reg-imm buf +i386-eax+ 1)           ; SYS_exit
         (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
         (i386-emit-label buf str-lbl)
@@ -396,6 +427,60 @@
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)
+
+;;; ============================================================
+;;; handler-case / unwind-protect state (TRAP #x0510/#x0511/#x0512)
+;;; ============================================================
+;;;
+;;; The jmp_buf is SIX words on i386, not x64's four.  ESI/EDI/EBX are V0/V1/V4
+;;; — LIVE VREGS, not merely callee-saved — so a longjmp that fails to restore
+;;; them resumes into garbage.  x64 only has to stack RBX (=V4) because its
+;;; other vregs are either caller-saved or spilled.
+;;;
+;;;   +0  ESP   +4  EBP   +8  IP   +12 EBX(V4)   +16 ESI(V0)   +20 EDI(V1)
+;;;
+;;; The range 0x10000180..0x10000198 is free in the hosted BSS: gc.lisp's
+;;; comment claims 0x180/0x188 for copy results but its code uses 0x100/0x108,
+;;; and i386 does not run gc.lisp's collector at all.  It ends clear of argc
+;;; (0x10000200).
+;;;
+;;; Handler-stack region 0x10000400..0x10000A00 (the boot map already reserves
+;;; it), ending clear of the i386 global slot block at 0x10000A00.  That is
+;;; 0x5F8 bytes = 63 frames of 24, so the depth cap is 63 rather than x64's 64.
+;;;
+;;; Scratch at 0x100003C0..0x100003F8 sits in the unused gap between the
+;;; saved initial ESP (0x10000290) and the handler stack.
+
+(defparameter *i386-jmpbuf-addr* #x10000180
+  "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")
+(defconstant +i386-jmpbuf-words+ 6)
+(defconstant +i386-jmpbuf-size+ 24)
+
+(defparameter *i386-hstack-depth-addr* #x10000400
+  "Handler-stack depth (dword).  Demand-zeroed BSS, so it starts at 0.")
+(defparameter *i386-hstack-base-addr* #x10000408
+  "Handler-stack frame 0.  Frame N is at base + 24*N.")
+(defparameter *i386-hstack-max-depth* 63
+  "Frames that fit below the i386 global slot block at 0x10000A00.")
+
+(defparameter *i386-longjmp-scratch-addr* #x100003C0
+  "Six words.  LONGJMP copies the jmp_buf here BEFORE the pop overwrites it.")
+(defparameter *i386-gcroot-bound-addr* #x100003E8
+  "Scratch used by the GC trampoline's handler-stack root loop: scan_word
+   clobbers EAX/ECX/EDX and every other register is collector state, so the
+   loop bound has to live in memory.")
+(defparameter *i386-hstack-capcount-addr* #x100003F0
+  "Cumulative count of capped pushes (diagnostic only).")
+(defparameter *i386-hstack-overflow-addr* #x100003F8
+  "LIVE capped-push count — the BALANCED-CAP counter.  A capped push stores no
+   frame, so the CLEAR-HANDLER that textually matches it must ABSORB its pop
+   rather than drain a real stored frame (the drain-to-depth-0 class x64 hit on
+   bare metal).  LONGJMP zeroes it: a longjmp unwinds past ALL capped (strictly
+   inner) frames at once, so their pending absorbs must not fire against outer
+   pops later.")
+
+(defvar *i386-handler-push-label* nil)
+(defvar *i386-handler-pop-label* nil)
 
 ;;; ============================================================
 ;;; i386 Code Buffer
@@ -597,7 +682,7 @@
     ("CALL-IND"    . "EAX is caller-saved; VR cannot be live across a call")
     ("TAILCALL"    . "EAX is caller-saved; VR cannot be live across a call")
     ("CALL"        . "EAX is caller-saved; VR cannot be live across a call")
-    ("TRAP"        . "syscall ABI/IN/OUT force EAX, so the :trap arm brackets the whole dispatch with push/pop EAX; no trap returns a value in EAX"))
+    ("TRAP"        . "syscall ABI/IN/OUT force EAX, so the :trap arm brackets the whole dispatch with push/pop EAX.  The handler-case traps #x0510/#x0511 DO deliver in EAX — deliberately, because EAX *is* VR and SETJMP's result goes to VR — and are excluded from the bracket by *i386-eax-live-traps*"))
   "Opcodes permitted to write EAX with a non-VR destination, each with the
    reason it is legitimate.  The justification lives NEXT TO the exemption on
    purpose: an allowlist without reasons becomes a place to hide bugs.")
@@ -921,6 +1006,31 @@
   (i386-emit-byte buf #x0F)
   (i386-emit-byte buf #xAF)
   (i386-emit-byte buf (i386-modrm #b11 dst src)))
+
+(defun i386-emit-imul-reg-reg-imm8 (buf dst src imm)
+  "IMUL dst, src, imm8 (6B /r ib) — three-operand signed multiply by a small
+   constant.  Used for the handler-stack frame index (frame size 24 is not a
+   power of two, so SHL will not do)."
+  (i386-check-eax-write dst)
+  (assert (<= -128 imm 127))
+  (i386-emit-byte buf #x6B)
+  (i386-emit-byte buf (i386-modrm #b11 dst src))
+  (i386-emit-s8 buf imm))
+
+(defun i386-emit-mov-abs-imm (buf addr imm)
+  "MOV dword [addr], imm32 (C7 /0 with mod=00 r/m=101 disp32)"
+  (i386-emit-byte buf #xC7)
+  (i386-emit-byte buf (i386-modrm #b00 0 5))
+  (i386-emit-u32 buf (logand addr #xFFFFFFFF))
+  (i386-emit-u32 buf (logand imm #xFFFFFFFF)))
+
+(defun i386-emit-add-abs-imm8 (buf addr imm)
+  "ADD dword [addr], imm8 sign-extended (83 /0 with mod=00 r/m=101 disp32)"
+  (assert (<= -128 imm 127))
+  (i386-emit-byte buf #x83)
+  (i386-emit-byte buf (i386-modrm #b00 0 5))
+  (i386-emit-u32 buf (logand addr #xFFFFFFFF))
+  (i386-emit-s8 buf imm))
 
 (defun i386-emit-mul-reg (buf reg)
   "MUL reg: unsigned multiply EDX:EAX = EAX * reg"
@@ -1379,6 +1489,89 @@
     (i386-emit-pop-reg buf +i386-eax+)
     (i386-emit-ret buf)))
 
+(defun i386-emit-handler-helpers (buf push-label pop-label)
+  "Emit __handler_push / __handler_pop: the NESTING half of the handler-case
+   traps.  Both preserve EAX (CLEAR-HANDLER is emitted right after a
+   handler-case body whose result is in dest — and dest==VR==EAX on i386, so
+   clobbering EAX there would hand back a popped frame word as the value).
+   Both clobber only ECX/EDX, the declared scratch pair.
+
+   __handler_push: stack the CURRENT jmp_buf, then return EDX = 0 (stored) or
+                   1 (capped).  SETJMP skips arming on 1, which degrades an
+                   over-deep handler-case to a transparent no-op instead of a
+                   stack corrupter.
+   __handler_pop:  restore the top stacked frame into the jmp_buf, or zero the
+                   jmp_buf when the stack is empty.
+
+   Nesting is NOT deferrable.  SEQUENTIAL handler-cases — exactly what
+   init-all-globals does, one per init thunk — work with a single-level
+   implementation, so a version without this passes the early milestones and
+   fails later, which is the worst available failure shape."
+  (let ((jb *i386-jmpbuf-addr*)
+        (hd *i386-hstack-depth-addr*)
+        (hs *i386-hstack-base-addr*)
+        (ovf *i386-hstack-overflow-addr*))
+    ;; ---------------- __handler_push ----------------
+    (let ((capped (i386-make-label)))
+      (i386-emit-label buf push-label)
+      (i386-emit-push-reg buf +i386-eax+)
+      (i386-emit-mov-reg-abs buf +scratch0+ hd)              ; ECX = depth
+      (i386-emit-cmp-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+      (i386-emit-jcc buf :ge capped)
+      ;; EDX = hs + depth*24
+      (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
+      (i386-emit-add-reg-imm buf +scratch1+ hs)
+      (dotimes (i +i386-jmpbuf-words+)
+        (i386-emit-mov-reg-abs buf +i386-eax+ (+ jb (* 4 i)))
+        (i386-emit-mov-mem-reg buf +scratch1+ (* 4 i) +i386-eax+))
+      (i386-emit-add-reg-imm buf +scratch0+ 1)
+      (i386-emit-mov-abs-reg buf hd +scratch0+)
+      (i386-emit-mov-reg-imm buf +scratch1+ 0)               ; EDX = 0: stored
+      (i386-emit-pop-reg buf +i386-eax+)
+      (i386-emit-ret buf)
+      (i386-emit-label buf capped)
+      (i386-emit-add-abs-imm8 buf *i386-hstack-capcount-addr* 1)
+      (i386-emit-add-abs-imm8 buf ovf 1)
+      (i386-emit-mov-reg-imm buf +scratch1+ 1)               ; EDX = 1: capped
+      (i386-emit-pop-reg buf +i386-eax+)
+      (i386-emit-ret buf))
+    ;; ---------------- __handler_pop ----------------
+    (let ((no-ovf (i386-make-label))
+          (empty (i386-make-label))
+          (done (i386-make-label)))
+      (i386-emit-label buf pop-label)
+      (i386-emit-push-reg buf +i386-eax+)
+      ;; A pop that textually matches a CAPPED push absorbs it and touches
+      ;; nothing else.
+      (i386-emit-mov-reg-abs buf +scratch0+ ovf)
+      (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+      (i386-emit-jcc buf :e no-ovf)
+      (i386-emit-add-reg-imm buf +scratch0+ -1)
+      (i386-emit-mov-abs-reg buf ovf +scratch0+)
+      (i386-emit-jmp-rel32 buf done)
+      (i386-emit-label buf no-ovf)
+      (i386-emit-mov-reg-abs buf +scratch0+ hd)
+      (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+      (i386-emit-jcc buf :e empty)
+      (i386-emit-add-reg-imm buf +scratch0+ -1)
+      (i386-emit-mov-abs-reg buf hd +scratch0+)
+      (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
+      (i386-emit-add-reg-imm buf +scratch1+ hs)
+      (dotimes (i +i386-jmpbuf-words+)
+        (i386-emit-mov-reg-mem buf +i386-eax+ +scratch1+ (* 4 i))
+        (i386-emit-mov-abs-reg buf (+ jb (* 4 i)) +i386-eax+))
+      (i386-emit-jmp-rel32 buf done)
+      (i386-emit-label buf empty)
+      ;; Zero the WHOLE jmp_buf, not just word 0.  Word 0 == 0 is the
+      ;; "no handler armed" sentinel LONGJMP checks, but leaving the other
+      ;; five words holding a dead frame's EBX/ESI/EDI leaves the collector
+      ;; scanning stale roots (they are scanned — see i386-emit-gc-trampoline).
+      (dotimes (i +i386-jmpbuf-words+)
+        (i386-emit-mov-abs-imm buf (+ jb (* 4 i)) 0))
+      (i386-emit-label buf done)
+      (i386-emit-pop-reg buf +i386-eax+)
+      (i386-emit-ret buf))))
+
 (defun i386-emit-gc-trampoline (buf tramp-label collect-label)
   "A complete Cheney copying collector in native i386, called by :gc-check.
 
@@ -1455,6 +1648,44 @@
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
       (i386-emit-jmp-rel32 buf gl)
       (i386-emit-label buf gd))
+
+    ;; --- the handler-case jmp_buf and every LIVE handler-stack frame ---
+    ;; Three of the six words in a jmp_buf are VREGS (EBX=V4, ESI=V0, EDI=V1),
+    ;; so they can be heap pointers held across an arbitrary amount of
+    ;; allocation inside a handler-case body.  Missing them is the same
+    ;; invisible-root class as CENV at globals+0x10, which sat unscanned until
+    ;; this session.  ESP/EBP/IP are scanned too rather than skipped — the
+    ;; stack (0x18000000) and the ELF image (0x08048000) are both BELOW the
+    ;; arena (0x30000000), so scan_word's from-space bounds test rejects them,
+    ;; and scanning the block whole keeps any slot added later covered.
+    (let ((jl (i386-make-label)) (jd (i386-make-label)))
+      (i386-emit-mov-reg-imm buf +i386-ebp+ *i386-jmpbuf-addr*)
+      (i386-emit-label buf jl)
+      (i386-emit-cmp-reg-imm buf +i386-ebp+ (+ *i386-jmpbuf-addr*
+                                               +i386-jmpbuf-size+))
+      (i386-emit-jcc buf :ae jd)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf jl)
+      (i386-emit-label buf jd))
+    ;; Live frames only: [hstack_base, hstack_base + 24*depth).  scan_word
+    ;; clobbers EAX/ECX/EDX and EBX/ESI/EDI are collector state, so the bound
+    ;; goes to memory rather than a register.
+    (let ((hl (i386-make-label)) (hd (i386-make-label)))
+      (i386-emit-mov-reg-abs buf +scratch0+ *i386-hstack-depth-addr*)
+      (i386-emit-imul-reg-reg-imm8 buf +scratch0+ +scratch0+ +i386-jmpbuf-size+)
+      (i386-emit-add-reg-imm buf +scratch0+ *i386-hstack-base-addr*)
+      (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch0+)
+      (i386-emit-mov-reg-imm buf +i386-ebp+ *i386-hstack-base-addr*)
+      (i386-emit-label buf hl)
+      (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
+      (i386-emit-jcc buf :ae hd)
+      (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+      (i386-emit-call-rel32 buf scan-label)
+      (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+      (i386-emit-jmp-rel32 buf hl)
+      (i386-emit-label buf hd))
 
     ;; --- Cheney scan of to-space: [to_start, free_ptr), free_ptr growing ---
     (let ((cl (i386-make-label)) (cd (i386-make-label)))
@@ -1609,12 +1840,23 @@
            ;; ABI puts the call number and the result there, and IN/OUT use
            ;; AL/AX/EAX — so EAX cannot simply be avoided the way it was for
            ;; the ALU/object/memory opcodes.  Instead the whole dispatch is
-           ;; bracketed with push/pop, which satisfies the invariant in
-           ;; substance: no trap returns a value in EAX (they all deliver into
-           ;; V0/ESI), so restoring it afterwards is always correct.  For the
+           ;; bracketed with push/pop: for every trap that DELIVERS into
+           ;; V0/ESI, restoring EAX afterwards is always correct.  For the
            ;; non-returning arms (SYS_exit, the unimplemented-trap reporter)
            ;; the unbalanced push is harmless — the process is leaving.
-           (i386-emit-push-reg buf +i386-eax+)
+           ;;
+           ;; THE EXCEPTIONS ARE THE HANDLER-CASE TRAPS.  SETJMP (#x0510) is
+           ;; the first trap whose RESULT is a value in VR — and VR *is* EAX
+           ;; here — and LONGJMP (#x0511) hands the T sentinel to the setjmp
+           ;; resume point in EAX and never returns.  Both must therefore run
+           ;; OUTSIDE the bracket; a trailing `pop eax` would make setjmp
+           ;; always look like NIL and handler-case silently never take its
+           ;; handler path.  CLEAR-HANDLER (#x0512) keeps the bracket — there
+           ;; EAX holds the handler-case BODY's result and must be preserved,
+           ;; which is exactly what the bracket does.
+           (let ((eax-is-result (member code *i386-eax-live-traps*)))
+           (unless eax-is-result
+             (i386-emit-push-reg buf +i386-eax+))
            (cond
              ((< code #x0100)
               ;; Frame-enter: code = nparams.
@@ -2109,61 +2351,117 @@
               (i386-emit-byte buf #x0F)
               (i386-emit-byte buf #x09))
              ;; ---- #x0510 / #x0511 / #x0512 — setjmp / longjmp / clear-handler
-             ;; NOT YET IMPLEMENTED.  They fall through to the unimplemented
-             ;; reporter below, which NAMES them at runtime rather than
-             ;; silently no-opping.  This is the single highest-priority gap on
-             ;; i386: it gates (1) i386's own bootstrap, because
-             ;; init-all-globals wraps every init thunk in handler-case, (2)
-             ;; --load and therefore cli-toplevel, and (3) ASDF/alexandria,
-             ;; which lean on handler-case and unwind-protect throughout.
              ;;
-             ;; THE DESIGN, derived for i386 rather than transliterated — and
-             ;; the first point is a trap that transliteration would walk into:
+             ;; DERIVED for i386, not transliterated from x64.  The three
+             ;; points where the 32-bit form actually differs:
              ;;
-             ;; RESULT REGISTER.  compiler.lisp emits
-             ;;     (emit-ir :trap #x0510) (emit-ir :mov dest +vreg-vr+)
-             ;; so setjmp MUST deliver its result in VR — and on i386 VR *is*
-             ;; EAX.  But this whole :trap dispatch is bracketed with
-             ;; push eax / pop eax, on the stated assumption that "no trap
-             ;; returns a value in EAX (they all deliver into V0/ESI)".  Trap
-             ;; #x0510 is the first that breaks it, so the bracket must be made
-             ;; conditional: 0x0510 (and the point longjmp resumes at) writes
-             ;; EAX and must NOT have it restored by the trailing pop.  On x64
-             ;; the question does not arise, because RAX is not VR there.  The
-             ;; EAX/VR checker will police whatever is written here; if it
-             ;; fires, fix the sequence rather than allowlisting it.
+             ;; (1) RESULT REGISTER.  compiler.lisp emits
+             ;;         (emit-ir :trap #x0510) (emit-ir :mov dest +vreg-vr+)
+             ;;     so SETJMP must deliver its result in VR — and on i386 VR
+             ;;     *is* EAX.  But this :trap dispatch is bracketed with
+             ;;     push/pop EAX, on the assumption that no trap returns a
+             ;;     value there.  #x0510 is the first that does, so the
+             ;;     bracket is made CONDITIONAL (see *i386-eax-live-traps*):
+             ;;     if the trailing pop ran, setjmp would always appear to
+             ;;     return NIL, handler-case would silently never take its
+             ;;     handler path, and the failure would surface far from here.
+             ;;     On x64 the question does not arise — RAX is not VR there.
              ;;
-             ;; JMP_BUF.  x64 saves RSP/RBP/IP/RBX at 0x10000180.  i386 needs
-             ;; SIX words, because ESI/EDI/EBX are V0/V1/V4 — live vregs, not
-             ;; merely callee-saved — so a longjmp that does not restore them
-             ;; resumes into garbage:
-             ;;   0x10000180 ESP   +4 EBP   +8 IP   +12 EBX   +16 ESI   +20 EDI
-             ;; That range is free here: gc.lisp's stale comment claims
-             ;; 0x180/0x188 for copy results but its code uses 0x100/0x108, and
-             ;; i386 no longer runs gc.lisp at all.  It ends at 0x198, clear of
-             ;; argc at 0x200.
+             ;; (2) SIX-WORD JMP_BUF.  ESI/EDI/EBX are V0/V1/V4 — live vregs,
+             ;;     not merely callee-saved — so a longjmp that does not
+             ;;     restore them resumes into garbage.  Layout, free range and
+             ;;     GC-root treatment: see *i386-jmpbuf-addr*.
              ;;
-             ;; NESTING.  Mirror x64's per-fork handler stack at 0x10000400:
-             ;; #x0510 pushes the current jmp_buf before overwriting it, #x0512
-             ;; pops it back.  Without that, a nested handler-case tears down
-             ;; its parent's frame.  Sequential handler-cases (what
-             ;; init-all-globals does, one per thunk) would work without it,
-             ;; which is exactly why a single-level version would look correct
-             ;; and then fail later.
+             ;; (3) NESTING from the start: see i386-emit-handler-helpers.
              ;;
-             ;; STACK RELOCATION.  The saved ESP is on the RELOCATED stack
-             ;; (MAP_FIXED at 0x18000000), not the kernel's, so it is below the
-             ;; 2^30 fixnum ceiling and consistent with %gc-stack-base — but a
-             ;; longjmp must leave the collector's idea of the stack correct,
-             ;; since the native collector scans [ESP, stack_base).  Unwinding
-             ;; to a SHALLOWER ESP is safe (the scan range only shrinks); the
-             ;; hazard is any path that leaves a stale saved ESP behind.
+             ;; STACK RELOCATION is not a hazard: the saved ESP is on the
+             ;; relocated stack (MAP_FIXED 0x18000000) and a longjmp only
+             ;; unwinds to a SHALLOWER ESP, which shrinks the collector's scan
+             ;; range.  The hazard would be a STALE saved ESP, which is why
+             ;; __handler_pop zeroes the whole jmp_buf when the stack empties.
              ;;
-             ;; GC ROOTS.  The jmp_buf as specified holds ESP/EBP/IP and three
-             ;; VREGS.  Those vreg words CAN be heap pointers, so the jmp_buf —
-             ;; and every live entry of the handler stack — must be scanned by
-             ;; the collector, exactly as CENV at globals+0x10 had to be.  The
-             ;; root set is in i386-emit-gc-trampoline.
+             ;; Bare metal keeps the unimplemented-trap reporter: these
+             ;; addresses are in the HOSTED Linux BSS (0x10000180 is past the
+             ;; end of RAM on a `qemu-system-i386 -m 256` board), and the
+             ;; bare-metal i386 images run mvm/repl-source.lisp, which has no
+             ;; handler-case.  Gating on *i386-linux-mode* also keeps those
+             ;; images byte-identical.
+             ((and (= code #x0510) *i386-linux-mode* *i386-handler-push-label*)
+              (let ((skiparm (i386-make-label))
+                    (resume (i386-make-label)))
+                ;; Stack the OUTER frame first; EDX comes back 1 if capped.
+                (i386-emit-call-rel32 buf *i386-handler-push-label*)
+                (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+                (i386-emit-jcc buf :ne skiparm)
+                ;; Arm: ECX = &jmp_buf, then the five register words.
+                (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
+                (i386-emit-mov-mem-reg buf +scratch0+  0 +i386-esp+)
+                (i386-emit-mov-mem-reg buf +scratch0+  4 +i386-ebp+)
+                (i386-emit-mov-mem-reg buf +scratch0+ 12 +i386-ebx+)
+                (i386-emit-mov-mem-reg buf +scratch0+ 16 +i386-esi+)
+                (i386-emit-mov-mem-reg buf +scratch0+ 20 +i386-edi+)
+                ;; Resume IP.  i386 has no RIP-relative LEA, so use the
+                ;; call/pop idiom the rest of this file uses: `call +0` pushes
+                ;; the address of the next instruction, and a buffer-relative
+                ;; diff32 (which needs no knowledge of the load address) turns
+                ;; it into the address of RESUME.  The call/pop pair is stack
+                ;; balanced and happens AFTER [ECX+0]=ESP, so the saved ESP is
+                ;; exactly the ESP that RESUME will run with.
+                (i386-emit-byte buf #xE8) (i386-emit-u32 buf 0) ; call next insn
+                (let ((anchor (i386-current-pos buf)))
+                  (i386-emit-pop-reg buf +scratch1+)
+                  (i386-emit-byte buf #x81)                     ; add edx, imm32
+                  (i386-emit-byte buf (i386-modrm #b11 0 +scratch1+))
+                  (i386-emit-fixup-diff32 buf resume anchor))
+                (i386-emit-mov-mem-reg buf +scratch0+ 8 +scratch1+)
+                (i386-emit-label buf skiparm)
+                ;; First return: NIL.  Read from *vn-addr* rather than baking
+                ;; #xDEAD0001 in — bare-metal i386 uses 0 for NIL, and
+                ;; :bnnull compares against this very slot.
+                (i386-emit-mov-reg-abs buf +i386-eax+ *vn-addr*)
+                ;; LONGJMP lands here with EAX already holding the T sentinel.
+                (i386-emit-label buf resume)))
+             ((and (= code #x0511) *i386-linux-mode* *i386-handler-pop-label*)
+              ;; LONGJMP.  Read OUR frame out to scratch BEFORE the pop
+              ;; overwrites the jmp_buf, then restore and transfer.
+              (let ((armed (i386-make-label))
+                    (ljs *i386-longjmp-scratch-addr*))
+                ;; This longjmp unwinds past every capped (strictly inner)
+                ;; frame at once, so their pending absorbs must be discarded.
+                (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
+                (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
+                (dotimes (i +i386-jmpbuf-words+)
+                  (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
+                  (i386-emit-mov-abs-reg buf (+ ljs (* 4 i)) +scratch1+))
+                ;; Nothing armed (saved ESP == 0) would mean jumping to a null
+                ;; IP on a null stack.  Say so instead.
+                (i386-emit-mov-reg-abs buf +scratch0+ ljs)
+                (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+                (i386-emit-jcc buf :ne armed)
+                (i386-emit-abort-msg
+                 buf "MODUS i386: longjmp with no handler armed
+" 71)
+                (i386-emit-label buf armed)
+                (i386-emit-call-rel32 buf *i386-handler-pop-label*)
+                ;; Restore the live vregs first, then EBP, then the target IP
+                ;; into EDX, then ESP.  Nothing after the ESP load touches
+                ;; memory, so the abandoned frame cannot be read back.
+                (i386-emit-mov-reg-abs buf +i386-ebx+ (+ ljs 12))
+                (i386-emit-mov-reg-abs buf +i386-esi+ (+ ljs 16))
+                (i386-emit-mov-reg-abs buf +i386-edi+ (+ ljs 20))
+                (i386-emit-mov-reg-abs buf +i386-ebp+ (+ ljs 4))
+                (i386-emit-mov-reg-abs buf +scratch1+ (+ ljs 8))
+                (i386-emit-mov-reg-abs buf +i386-esp+ ljs)
+                ;; EAX = T sentinel, so the :bnnull after SETJMP's
+                ;; (:mov dest VR) takes the handler path.
+                (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
+                (i386-emit-jmp-reg buf +scratch1+)))
+             ((and (= code #x0512) *i386-linux-mode* *i386-handler-pop-label*)
+              ;; CLEAR-HANDLER: pop the outer frame back into the jmp_buf.
+              ;; The dispatch's push/pop EAX bracket is what preserves the
+              ;; handler-case body's result across this call (dest==VR==EAX);
+              ;; __handler_pop preserves EAX itself as well.
+              (i386-emit-call-rel32 buf *i386-handler-pop-label*))
              ((= code #x0530)
               ;; COPY-OVERFLOW-ARGS — the &rest prologue's runtime argument
               ;; copy, mirroring translate-x64.lisp's #x0530 arm.
@@ -2236,7 +2534,8 @@
                   (incf (gethash (+ #x10000 code) tbl 0))))
               (unless (member code *i386-safe-nop-traps*)
                 (i386-emit-unimpl-trap buf code))))
-           (i386-emit-pop-reg buf +i386-eax+)))
+           (unless eax-is-result
+             (i386-emit-pop-reg buf +i386-eax+)))))
 
         ;; ============================================
         ;; Data Movement
@@ -3580,6 +3879,15 @@
     ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
           (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
+    ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512).  Hosted
+    ;; Linux only: the jmp_buf and handler stack live in the hosted BSS, which
+    ;; a bare-metal i386 board does not have.  With these NIL the traps fall
+    ;; through to the unimplemented reporter exactly as before, so every
+    ;; bare-metal i386 image stays byte-identical.
+    (setf *i386-handler-push-label*
+          (and *i386-linux-mode* (i386-make-label)))
+    (setf *i386-handler-pop-label*
+          (and *i386-linux-mode* (i386-make-label)))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -3636,6 +3944,17 @@
       ;; EAX is an ordinary temp; silence the checker for this block.
       (let ((*i386-check-eax-invariant* nil))
         (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
+    ;; The handler-case push/pop helpers, likewise emitted once after the last
+    ;; function.  They use EAX as a copy temp but SAVE AND RESTORE it, which
+    ;; the per-opcode checker cannot see; silence it for this block.
+    (when *i386-handler-push-label*
+      (when *i386-fn-align*
+        (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
+                                *i386-fn-align*))
+              do (i386-emit-nop buf)))
+      (let ((*i386-check-eax-invariant* nil))
+        (i386-emit-handler-helpers buf *i386-handler-push-label*
+                                   *i386-handler-pop-label*)))
     ;; Resolve all label fixups
     (i386-fixup-labels buf)
     ;; Resolve fn-map: replace label IDs with actual native byte positions

@@ -670,6 +670,70 @@
       (write-char-serial 101) (write-char-serial 110) (write-char-serial 118) (write-char-serial 112) (write-char-serial 91) (write-char-serial 48) (write-char-serial 93) (write-char-serial 61) (%pcstr (* 2 (mem-ref envp :u64))) (putnl)))
   0)
 
+;;; ---- probe-hc: the handler-case traps, mechanics only ------------------
+;;; TRAP #x0510/#x0511/#x0512 in ISOLATION, with no condition system in the
+;;; picture: a (t (c) ...) clause compiles its type check to the literal T, so
+;;; the whole round trip is setjmp / longjmp / clear-handler and nothing else.
+;;; %HC-LONGJMP is the compiler special form that emits #x0511 directly.
+;;;
+;;; Kept OUT of probe-suite deliberately.  The suite is a fixed 71-check gate
+;;; used to detect regressions across this port; changing its count would make
+;;; every future comparison ambiguous.
+(defun %hc1 () (handler-case 7 (t (c) 9)))
+(defun %hc2 () (handler-case (progn (%hc-longjmp) 7) (t (c) 9)))
+;; Inner frame catches; the outer must NOT be the one that fires.
+(defun %hc3 ()
+  (handler-case (handler-case (progn (%hc-longjmp) 1) (t (c) 2)) (t (c) 3)))
+;; THE NESTING CHECK.  An inner handler-case runs to completion FIRST, so its
+;; CLEAR-HANDLER pops.  If the pop restored the wrong frame — or if there were
+;; no handler stack at all — the outer frame would be gone and this longjmp
+;; would leave the function.  A single-level implementation passes %hc1/%hc2
+;; and fails here.
+(defun %hc4 ()
+  (handler-case (progn (handler-case 1 (t (c) 2)) (%hc-longjmp) 5) (t (c) 3)))
+;; Live vregs across the longjmp: ESI/EDI/EBX are V0/V1/V4, so a four-word
+;; jmp_buf resumes with garbage in them.
+(defun %hc5 (a b)
+  (let ((x (+ a 1)) (y (+ b 2)) (z (+ a b)))
+    (let ((r (handler-case (progn (%hc-longjmp) 0) (t (c) 5))))
+      (+ r (+ x (+ y z))))))
+;; Sequential handler-cases — the init-all-globals shape.
+(defun %hc6 ()
+  (let ((s 0))
+    (setq s (+ s (handler-case (progn (%hc-longjmp) 0) (t (c) 1))))
+    (setq s (+ s (handler-case (progn (%hc-longjmp) 0) (t (c) 10))))
+    (setq s (+ s (handler-case 100 (t (c) 0))))
+    s))
+;; unwind-protect, both paths.  ASDF depends specifically on the second.
+(defun %uwp1 ()
+  (let ((flag 0))
+    (let ((v (unwind-protect 7 (setq flag 1))))
+      (+ v flag))))
+(defun %uwp2 ()
+  (let ((flag 0))
+    (let ((v (handler-case (unwind-protect (progn (%hc-longjmp) 0)
+                             (setq flag 1))
+               (t (c) 20))))
+      (+ v flag))))
+
+(defun %tag2 (a b) (write-char-serial a) (write-char-serial b))
+
+(defun probe-hc ()
+  (%sc-reset)
+  (%tag2 104 49) (%chk (%hc1) 7)
+  (%tag2 104 50) (%chk (%hc2) 9)
+  (%tag2 104 51) (%chk (%hc3) 2)
+  (%tag2 104 52) (%chk (%hc4) 3)
+  (%tag2 104 53) (%chk (%hc5 3 4) 22)
+  (%tag2 104 54) (%chk (%hc6) 111)
+  (%tag2 117 49) (%chk (%uwp1) 8)
+  (%tag2 117 50) (%chk (%uwp2) 21)
+  (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
+  (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
+  (write-char-serial 32) (write-char-serial 67) (write-char-serial 65) (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268436464 :u32))
+  (putnl)
+  (mem-ref 268438408 :u32))
+
 (defun kernel-main ()
   (let ((which (%argv1)))
     (cond
@@ -678,6 +742,7 @@
       ((eql which 3) (probe-chain))
       ((eql which 4) (probe-argv))
       ((eql which 5) (probe-eval))
+      ((eql which 6) (sys-exit (if (eql (probe-hc) 0) 0 1)))
       (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
 

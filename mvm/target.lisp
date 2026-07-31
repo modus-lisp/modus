@@ -523,6 +523,10 @@
 ;;; EVALs the value form, so a host-only helper there would break
 ;;; `modus --compile` (the self-host path).
 
+(defparameter *target-big-endian-p* nil
+  "Endianness of the target being compiled FOR.  Set by BUILD-IMAGE from the
+   target descriptor, alongside the numeric width.")
+
 (defparameter *target-fixnum-bits* 62
   "Magnitude bits in a tagged fixnum on the target being compiled FOR.
    Set by BUILD-IMAGE from the target's word size; 62 for 64-bit, 30 for
@@ -568,7 +572,8 @@
   bits)
 
 (defun set-target-fixnum-bits-for (target)
-  "Derive the fixnum width from TARGET's word size (bytes)."
+  "Derive the numeric width (and endianness) from TARGET."
+  (setf *target-big-endian-p* (eq (target-endianness target) :big))
   (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
 
 (defun width-constants-source ()

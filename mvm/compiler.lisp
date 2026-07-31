@@ -12930,6 +12930,21 @@
 ;;; Memory Operations
 ;;; ============================================================
 
+(defun %mem-width-bits (width-code)
+  "Nominal bit width of an MVM memory width code (0=u8 1=u16 2=u32 3=u64)."
+  (case width-code (0 8) (1 16) (2 32) (t 64)))
+
+(defun %mem-width-promotes-p (width-code needs-tag)
+  "Can a load of this width produce a value OUTSIDE the target's fixnum range?
+
+   ONE RULE, evaluated identically at every width — not a 32-bit special case:
+       (>= width-bits +fixnum-bits+)
+   :u32 is 32 < 62 on a 64-bit target, so nothing changes there and the 64-bit
+   images stay per-function-identical by ARITHMETIC rather than by exemption.
+   The same expression is 32 >= 30 on a 32-bit target, where a u32 genuinely
+   cannot be a fixnum and must promote to a bignum."
+  (and needs-tag (>= (%mem-width-bits width-code) +fixnum-bits+)))
+
 (defun memory-width-code (type-form)
   "Convert a type keyword to an MVM memory width code.
    Returns (cons width-code needs-tag-p)"
@@ -12964,9 +12979,28 @@
          (width (car wt))
          (needs-tag (cdr wt)))
     (emit-ir :load dest dest width)
-    ;; Tag result as fixnum if needed (u8/u16/u32)
-    (when needs-tag
-      (emit-ir :shl dest dest +fixnum-shift+))))
+    (cond
+      ;; Width that cannot fit the target's fixnum range: PROMOTE.  The raw
+      ;; word is split into two 16-bit halves — each a fixnum at any supported
+      ;; width — and recombined with the CHECKED (promoting) arithmetic, so an
+      ;; out-of-range value becomes a bignum instead of a wrapped negative.
+      ;; Done on the loaded VALUE, not on memory, so it is endianness-neutral.
+      ((%mem-width-promotes-p width needs-tag)
+       (let ((hi (alloc-temp-reg))
+             (m  (alloc-temp-reg)))
+         (emit-ir :mov hi dest)
+         (emit-ir :shr hi hi 16)                 ; hi = raw >> 16  (<= #xFFFF)
+         (emit-ir :shl hi hi +fixnum-shift+)     ; tagged fixnum
+         (emit-ir :li m #xFFFF)
+         (emit-ir :and dest dest m)              ; lo = raw & #xFFFF
+         (emit-ir :shl dest dest +fixnum-shift+) ; tagged fixnum
+         (emit-ir :li m (ash 65536 +fixnum-shift+))
+         (emit-ir :mul-checked hi hi m)          ; hi * 65536, promoting
+         (emit-ir :add-checked dest hi dest)     ; + lo, promoting
+         (free-temp-reg)
+         (free-temp-reg)))
+      (needs-tag
+       (emit-ir :shl dest dest +fixnum-shift+)))))
 
 (defun compile-setf (place value-form env dest)
   "Compile (setf place value)"
@@ -12978,6 +13012,33 @@
        (let* ((wt2 (memory-width-code type-form))
               (width (car wt2))
               (needs-untag (cdr wt2)))
+         ;; Width that cannot fit the target's fixnum range: the VALUE may be a
+         ;; bignum, and the plain path below would :sar its heap POINTER and
+         ;; write garbage.  (That store-side half is what made probe 8 read
+         ;; b1=4 — it was corrupt before any load happened.)  Rewrite into two
+         ;; half-width stores, each fixnum-safe at any supported width; the
+         ;; :u16 recursion does not promote, so this terminates.
+         ;;
+         ;; BIGNUM-ASH is called explicitly rather than ASH because compile-ash
+         ;; inlines :sar for small constant counts, which mangles a bignum
+         ;; pointer — Active Limitation #8, fixed separately.
+         ;;
+         ;; LITTLE-ENDIAN: halves are placed lo-at-+0, hi-at-+2.  Promotion can
+         ;; only trigger on a 32-bit target, and the only 32-bit target running
+         ;; this runtime is i386; a big-endian 32-bit target would need the two
+         ;; offsets swapped.  Stated rather than silently assumed.
+         (when (and (%mem-width-promotes-p width needs-untag)
+                    (not *target-big-endian-p*))
+           (let ((asym (gensym "MEMA")) (vsym (gensym "MEMV")))
+             (return-from compile-setf
+               (compile-form
+                 (list 'let (list (list asym addr-form) (list vsym value-form))
+                       (list 'setf (list 'mem-ref asym :u16)
+                             (list 'logand vsym 65535))
+                       (list 'setf (list 'mem-ref (list '+ asym 2) :u16)
+                             (list 'logand (list 'bignum-ash vsym -16) 65535))
+                       vsym)
+                 env dest))))
          (let ((addr-reg (alloc-temp-reg)))
            ;; Compile value first
            (compile-form value-form env dest)

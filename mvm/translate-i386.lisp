@@ -892,9 +892,42 @@
     ((= vreg +vreg-vn+) *vn-addr*)
     (t nil)))
 
+;;; ============================================================
+;;; *** i386 REGISTER INVARIANT — read before adding an opcode ***
+;;; ============================================================
+;;;
+;;;   AN OPCODE MUST NOT WRITE EAX UNLESS ITS DESTINATION VREG *IS* VR.
+;;;   Compute in the ECX/EDX scratch pair (+scratch0+ / +scratch1+) and let
+;;;   I386-STORE-VREG decide; it writes EAX only when vd really is VR.
+;;;
+;;; WHY THIS IS A STATED INVARIANT AND NOT CASE-BY-CASE VIGILANCE: EAX *is*
+;;; VR on i386.  x64 and aarch64 have spare registers so their translators
+;;; cannot express this hazard; i386 structurally can, and it has now bitten
+;;; twice.  Round 1 (Stage C) was the ALU/flag ops: the compiler keeps a live
+;;; operand in VR across the `:or tmp,a,b / :test tmp,1 / :add d,a,b`
+;;; fixnum type-check, so an EAX-clobbering :or made `(+ a b)` compute
+;;; (a|b)+b — observable as a loop counter advancing by 2.  Round 2 (Phase
+;;; 3.2) was the object/memory ops: a clobbered VR reached +op-obj-subtag+ as
+;;; tagged fixnum 9, which tag-stripped to address 9 and SIGSEGV'd deep
+;;; inside GENERIC-LOGAND, nowhere near the actual cause.
+;;;
+;;; Both rounds share the signature that makes them expensive: the function
+;;; SIZE is unchanged, so a size-based diff shows nothing; the wrong value
+;;; surfaces far from the op that produced it.
+;;;
+;;; LEGITIMATE EXCEPTIONS, and the only ones:
+;;;   * hardware-forced operands — :div/:mod (IDIV needs EDX:EAX),
+;;;     :mul26lo/:mul26hi (MUL needs EAX), :io-read/:io-write (IN/OUT use
+;;;     AL/AX/EAX), :atomic-xchg.
+;;;   * anything at or after a CALL — :call/:call-ind/:tailcall.  EAX is
+;;;     caller-saved, so VR cannot be live across a call by ABI anyway.
+;;; If you add an opcode that needs EAX for any OTHER reason, it is a bug.
+
 (defun i386-load-vreg (buf scratch vreg)
   "Load virtual register VREG into physical register SCRATCH.
-   If VREG already lives in SCRATCH, no code is emitted."
+   If VREG already lives in SCRATCH, no code is emitted.
+   NB pass +scratch0+/+scratch1+, not +i386-eax+ — see the register
+   invariant above."
   (let ((phys (i386-vreg-phys vreg))
         (abs (i386-vreg-abs-addr vreg)))
     (cond
@@ -2074,17 +2107,15 @@
          ;; (obj-ref Vd Vobj idx:imm8) -- load object slot
          (let ((vd (first operands)) (vobj (second operands)) (idx (third operands)))
            (if (= vobj +vreg-vfp+)
-               ;; Frame slot access: use safe EBP-relative offset below spill area
                (progn
-                 (i386-emit-mov-reg-mem buf +i386-eax+ +i386-ebp+
+                 (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+
                                         (+ +frame-slot-base+ (* idx -4)))
-                 (i386-store-vreg buf vd +i386-eax+))
-               ;; Normal object slot access
+                 (i386-store-vreg buf vd +scratch0+))
                (progn
-                 (i386-load-vreg buf +i386-eax+ vobj)
-                 (i386-emit-sub-reg-imm buf +i386-eax+ +tag-object+)
-                 (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ (* (1+ idx) 4))
-                 (i386-store-vreg buf vd +i386-eax+)))))
+                 (i386-load-vreg buf +scratch0+ vobj)
+                 (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ (* (1+ idx) 4))
+                 (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-obj-set+)
          ;; (obj-set Vobj idx:imm8 Vs) -- store object slot
@@ -2099,28 +2130,28 @@
                ;; IMPORTANT: Load value FIRST — loading vobj into EAX clobbers VR.
                (progn
                  (i386-load-vreg buf +scratch0+ vs)
-                 (i386-load-vreg buf +i386-eax+ vobj)
-                 (i386-emit-sub-reg-imm buf +i386-eax+ +tag-object+)
-                 (i386-emit-mov-mem-reg buf +i386-eax+ (* (1+ idx) 4) +scratch0+)))))
+                 (i386-load-vreg buf +scratch1+ vobj)
+                 (i386-emit-sub-reg-imm buf +scratch1+ +tag-object+)
+                 (i386-emit-mov-mem-reg buf +scratch1+ (* (1+ idx) 4) +scratch0+)))))
 
         ((op= +op-obj-tag+)
          ;; (obj-tag Vd Vs) -- extract low 4-bit tag as tagged fixnum
          (let ((vd (first operands)) (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-and-reg-imm buf +i386-eax+ +tag-mask+)
-           (i386-emit-shl-reg-imm buf +i386-eax+ 1)  ; tag as fixnum
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)  ; tag as fixnum
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-obj-subtag+)
          ;; (obj-subtag Vd Vs) -- extract subtag from object header
          ;; Header format: (count << 8) | subtag. Subtag is low 8 bits.
          (let ((vd (first operands)) (vs (second operands)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-sub-reg-imm buf +i386-eax+ +tag-object+)
-           (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ 0)  ; load header
-           (i386-emit-and-reg-imm buf +i386-eax+ #xFF)          ; mask to subtag
-           (i386-emit-shl-reg-imm buf +i386-eax+ 1)             ; tag as fixnum
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
+           (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aref+)
          ;; (aref Vd Vobj Vidx) — variable-index array load
@@ -2133,42 +2164,39 @@
            ;; Load Vidx into scratch0, shift left 1 (Vidx*2 = real_idx*4)
            (i386-load-vreg buf +scratch0+ vidx)
            (i386-emit-shl-reg-imm buf +scratch0+ 1)
-           ;; Add Vobj
-           (i386-load-vreg buf +i386-eax+ vobj)
-           (i386-emit-add-reg-reg buf +i386-eax+ +scratch0+)
-           ;; Load from [EAX - 5]
-           (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ -5)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch1+ vobj)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ -5)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aset+)
          ;; (aset Vobj Vidx Vs) — variable-index array store
          ;; Store Vs at [Vobj + Vidx*2 - 5]
          (let ((vobj (first operands)) (vidx (second operands)) (vs (third operands)))
            ;; Load value into scratch0 FIRST (before EAX clobbers VR)
+           ;; Three operands but only two scratch registers now that EAX is
+           ;; off-limits, so the VALUE goes through one stack slot.
            (i386-load-vreg buf +scratch0+ vs)
-           ;; Compute address: Vobj + Vidx*2 - 5
-           (i386-load-vreg buf +i386-eax+ vidx)
-           (i386-emit-shl-reg-imm buf +i386-eax+ 1)
-           ;; Need Vobj in EDX (scratch1), add to EAX
-           (i386-emit-push-reg buf +scratch0+)  ; save value
+           (i386-emit-push-reg buf +scratch0+)          ; save value
+           (i386-load-vreg buf +scratch0+ vidx)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)
            (i386-load-vreg buf +scratch1+ vobj)
-           (i386-emit-add-reg-reg buf +i386-eax+ +scratch1+)
-           (i386-emit-pop-reg buf +scratch0+)   ; restore value
-           ;; Store value at [EAX - 5]
-           (i386-emit-mov-mem-reg buf +i386-eax+ -5 +scratch0+)))
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)  ; ECX = addr+5
+           (i386-emit-pop-reg buf +scratch1+)           ; EDX = value
+           (i386-emit-mov-mem-reg buf +scratch0+ -5 +scratch1+)))
 
         ((op= +op-array-len+)
          ;; (array-len Vd Vobj) — extract element count from header
          ;; Header at [Vobj - 9], count in upper 24 bits (on 32-bit: [31:8])
          ;; Tagged result = count << 1
          (let ((vd (first operands)) (vobj (second operands)))
-           (i386-load-vreg buf +i386-eax+ vobj)
-           (i386-emit-sub-reg-imm buf +i386-eax+ +tag-object+)
-           (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ 0)  ; load header word
-           (i386-emit-shr-reg-imm buf +i386-eax+ 8)             ; count = header >> 8
-           (i386-emit-and-reg-imm buf +i386-eax+ #xFFFFFF)      ; mask to 24 bits
-           (i386-emit-shl-reg-imm buf +i386-eax+ 1)             ; tag as fixnum
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch0+ vobj)
+           (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
+           (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
+           (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+           (i386-store-vreg buf vd +scratch0+)))
 
         ;; ============================================
         ;; Raw Memory Operations
@@ -2176,13 +2204,13 @@
         ((op= +op-load+)
          ;; (load Vd Vaddr width:imm8)
          (let ((vd (first operands)) (vaddr (second operands)) (width (third operands)))
-           (i386-load-vreg buf +i386-eax+ vaddr)
+           (i386-load-vreg buf +scratch0+ vaddr)
            (ecase width
-             (0 (i386-emit-movzx-byte buf +i386-eax+ +i386-eax+ 0))
-             (1 (i386-emit-movzx-word buf +i386-eax+ +i386-eax+ 0))
-             (2 (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ 0))
-             (3 (i386-emit-mov-reg-mem buf +i386-eax+ +i386-eax+ 0)))  ; 64-bit: low 32
-           (i386-store-vreg buf vd +i386-eax+)))
+             (0 (i386-emit-movzx-byte buf +scratch0+ +scratch0+ 0))
+             (1 (i386-emit-movzx-word buf +scratch0+ +scratch0+ 0))
+             (2 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0))
+             (3 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)))  ; 64-bit: low 32
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-store+)
          ;; (store Vaddr Vs width:imm8)
@@ -2190,12 +2218,12 @@
          ;; so if Vs=VR we'd get the address instead of the value.
          (let ((vaddr (first operands)) (vs (second operands)) (width (third operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-load-vreg buf +i386-eax+ vaddr)
+           (i386-load-vreg buf +scratch1+ vaddr)
            (ecase width
-             (0 (i386-emit-mov-mem8-reg buf +i386-eax+ 0 +scratch0+))
-             (1 (i386-emit-mov-mem16-reg buf +i386-eax+ 0 +scratch0+))
-             (2 (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+))
-             (3 (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+)))))
+             (0 (i386-emit-mov-mem8-reg buf +scratch1+ 0 +scratch0+))
+             (1 (i386-emit-mov-mem16-reg buf +scratch1+ 0 +scratch0+))
+             (2 (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+))
+             (3 (i386-emit-mov-mem-reg buf +scratch1+ 0 +scratch0+)))))
 
         ((op= +op-fence+)
          (i386-emit-mfence buf))

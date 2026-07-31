@@ -51,12 +51,26 @@
    cenv/mv-count), inside the demand-zeroed BSS.")
 
 (defconstant +linux-i386-heap-hint+   #x30000000)
-(defconstant +linux-i386-heap-size+   #x80000000)  ; 2 GB — see the ceiling note
+(defconstant +linux-i386-heap-size+   #x20000000)  ; 512 MB = two 256 MB semispaces
+(defconstant +linux-i386-gc-midpoint+ #x10000000
+  "Cheney semispace boundary: from-space is [alloc_start, midpoint),
+   to-space is [midpoint, 2*midpoint).  Sized so that EVERY address in the
+   arena stays below 2^30 and is therefore a FIXNUM on the 30-bit tower —
+   which is what lets gc.lisp hold them as ordinary Lisp integers without
+   promoting to bignums mid-collection (the aarch64 re-entrancy trap).")
+(defconstant +linux-i386-stack-addr+ #x18000000
+  "MAP_FIXED base of our OWN stack.  The kernel-supplied stack sits around
+   0x40800000, which is just above 2^30-1 and therefore NOT a fixnum, so
+   %gc-stack-base could not be represented at all.  Rather than change
+   gc.lisp's metadata convention — shared code, load-bearing on two working
+   targets — we relocate the stack somewhere that satisfies it.  This is
+   i386-local by construction: x64 and aarch64 are untouched.")
+(defconstant +linux-i386-stack-size+ #x800000)   ; 8 MB
 (defconstant +linux-i386-heap-alloc-start+ #x200
   "Offset from heap base to the first allocatable byte.  The low 512 bytes
    mirror argc/argv the way the 64-bit ports do.")
 
-(defparameter *linux-i386-vl-offset* #x5F000000
+(defparameter *linux-i386-vl-offset* #x10000000
   "Offset from heap base for VL (the alloc limit).  With GC OFF this is set
    just short of the mapping end so :gc-check never fires; a GC-on build
    would lower it to the semispace midpoint.
@@ -251,6 +265,25 @@
 
   (i386l-bytes buf #x83 #xC4 #x08)              ; add esp, 8  (drop saved argv ptrs)
 
+  ;; --- Relocate the stack below 2^30 -------------------------------------
+  ;; Must come AFTER the argv staging above, which reads the kernel-supplied
+  ;; stack and copies argv[1]/argv[2] into fixed BSS.  Nothing else depends on
+  ;; the original ESP, and we never return, so switching is safe here.
+  ;; mmap2(0x18000000, 8MB, PROT_READ|WRITE, PRIVATE|ANON|FIXED, -1, 0)
+  (i386l-mov-reg-imm buf 3 +linux-i386-stack-addr+)  ; ebx = addr
+  (i386l-mov-reg-imm buf 1 +linux-i386-stack-size+)  ; ecx = length
+  (i386l-mov-reg-imm buf 2 3)                        ; edx = PROT_READ|WRITE
+  (i386l-mov-reg-imm buf 6 #x32)                     ; esi = PRIVATE|ANON|FIXED
+  (i386l-mov-reg-imm buf 7 #xFFFFFFFF)               ; edi = -1
+  (i386l-bytes buf #x55)                             ; push ebp
+  (i386l-bytes buf #x31 #xED)                        ; xor ebp, ebp (pgoff 0)
+  (i386l-mov-reg-imm buf 0 192)                      ; SYS_mmap2
+  (i386l-bytes buf #xCD #x80)
+  (i386l-bytes buf #x5D)                             ; pop ebp
+  ;; switch to the new stack (top, 16-aligned)
+  (i386l-bytes buf #xBC)                             ; mov esp, imm32
+  (i386l-le32 buf (- (+ +linux-i386-stack-addr+ +linux-i386-stack-size+) 16))
+
   ;; --- mmap2(hint, size, PROT_READ|WRITE, MAP_PRIVATE|MAP_ANON, -1, 0) ---
   ;; i386 has no 6-register syscall convention beyond EBP, and old_mmap(90)
   ;; takes a struct pointer; mmap2(192) is the clean register form.  Its 6th
@@ -288,19 +321,30 @@
   ;; nargs / cenv / mv-count slots are already zero (demand-zeroed BSS).
 
   ;; --- Cheney GC metadata at the shared fixed addresses ---
-  ;; [0x10000040] from_start = heap + alloc_start
+  ;; --- Cheney GC metadata, stored SHIFTED LEFT ONE -----------------------
+  ;; gc.lisp reads these with (mem-ref addr :u64), and :u64 is RAW
+  ;; (memory-width-code -> needs-tag NIL), so the raw word IS the tagged Lisp
+  ;; value.  Memory must therefore hold address<<1 for the Lisp value to be
+  ;; the address.  Storing raw was the latent bug documented on aarch64
+  ;; (reference_aa64_gc_poison_root_cause): harmless while nothing collects,
+  ;; and it HALVES every address the moment something does.
+  ;; [0x10000040] from_start = (heap + alloc_start) << 1
   (i386l-bytes buf #x89 #xC1)
   (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-heap-alloc-start+)
+  (i386l-bytes buf #x01 #xC9)                         ; add ecx, ecx  (<<1)
   (i386l-mov-abs-reg buf #x10000040 1)
-  ;; [0x10000048] to_start = heap + vl-offset
+  ;; [0x10000048] to_start = (heap + midpoint) << 1
   (i386l-bytes buf #x89 #xC1)
-  (i386l-bytes buf #x81 #xC1) (i386l-le32 buf *linux-i386-vl-offset*)
+  (i386l-bytes buf #x81 #xC1) (i386l-le32 buf +linux-i386-gc-midpoint+)
+  (i386l-bytes buf #x01 #xC9)
   (i386l-mov-abs-reg buf #x10000048 1)
-  ;; [0x10000050] space_size
+  ;; [0x10000050] space_size << 1
   (i386l-mov-abs-imm buf #x10000050
-                     (- *linux-i386-vl-offset* +linux-i386-heap-alloc-start+))
-  ;; [0x10000058] stack_base = current ESP (the conservative stack scan's top)
-  (i386l-mov-abs-reg buf #x10000058 4)                ; mov [0x10000058], esp
+                     (ash (- +linux-i386-gc-midpoint+ +linux-i386-heap-alloc-start+) 1))
+  ;; [0x10000058] stack_base = our RELOCATED stack top, << 1
+  (i386l-mov-reg-imm buf 1 (- (+ +linux-i386-stack-addr+ +linux-i386-stack-size+) 16))
+  (i386l-bytes buf #x01 #xC9)
+  (i386l-mov-abs-reg buf #x10000058 1)
   ;; [0x10000060] gc_count = 0
   (i386l-mov-abs-imm buf #x10000060 0)
 

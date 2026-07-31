@@ -339,6 +339,10 @@
    if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
    ops from the rest of i386 codegen when triaging a miscompile.")
 
+(defvar *i386-gc-collect-label* nil
+  "Label of %GC-COLLECT, resolved by name in TRANSLATE-MVM-TO-I386 exactly as
+   the generic-arith entries are.  NIL (no collector in the module) makes
+   :gc-check fall back to its historical `int $0x31`.")
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)
@@ -2960,6 +2964,15 @@
           (loop for entry in function-table
                 when (string-equal (first entry) "GENERIC-MULTIPLY")
                   return (gethash (second entry) fn-offset-to-label)))
+    ;; WS5: resolve the COLLECTOR the same way, so :gc-check can CALL it
+    ;; instead of emitting `int $0x31` (an invalid interrupt on hosted Linux —
+    ;; i386 previously had no collector at all and simply ran off the arena).
+    ;; This is the Lisp-side %GC-COLLECT from mvm/gc.lisp, not a native
+    ;; trampoline: i386 needs to stop exhausting the arena, not to be fast.
+    (setf *i386-gc-collect-label*
+          (loop for entry in function-table
+                when (string-equal (first entry) "%GC-COLLECT")
+                  return (gethash (second entry) fn-offset-to-label)))
     ;; Translate each function
     (loop for i from 0 below n-functions
           for entry in function-table
@@ -2982,6 +2995,7 @@
                             :mvm-bytes bytecode
                             :mvm-length fn-length
                             :mvm-offset fn-offset
+                            :gc-label *i386-gc-collect-label*
                             :function-table fn-offset-to-label)))
                ;; Emit function label
                (i386-emit-label buf fn-label)

@@ -71,7 +71,15 @@
   ;; came from — read vs compile vs module-conversion — so a bare
   ;; `#(TYPE-ERROR NIL)` is no longer phase-anonymous.
   (when *static-build-p* (format t "  PHASE read~%"))
-  (let* ((forms-and-lines (read-all-forms-with-locations source-text))
+  ;; WS5 Phase 2b: prepend the target's numeric-width DEFCONSTANT block.
+  ;; Done HERE, not in each build script, so no script can forget it — 13
+  ;; scripts bake the numeric tower and a missing constant would NOT fail
+  ;; loudly: compile-variable-ref falls through to a global SYMBOL-VALUE read
+  ;; returning NIL, silently miscompiling the tower.  Central + unconditional
+  ;; removes that failure mode by construction.  (Line numbers in read errors
+  ;; shift by the block's line count; it is 15 short lines.)
+  (let* ((source-text (concatenate 'string (width-constants-source) source-text))
+         (forms-and-lines (read-all-forms-with-locations source-text))
          (forms (car forms-and-lines))
          (source-lines (cdr forms-and-lines))
          ;; Compile all forms through the MVM compiler
@@ -1279,6 +1287,11 @@
     (unless target-desc
       (error "Unknown target architecture: ~A~%Known targets: ~{~A~^, ~}"
              target (list-targets)))
+    ;; WS5 Phase 2b: the numeric width follows the TARGET's word size —
+    ;; 62-bit fixnums on a 64-bit target, 30-bit on a 32-bit one.  i386 gets
+    ;; a coherent 30-bit tower automatically from (target-word-size ...) = 4;
+    ;; no per-target special-casing anywhere.
+    (set-target-fixnum-bits-for target-desc)
     ;; Get source
     (let ((src-text (or source-text
                        (when source

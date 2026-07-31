@@ -12,47 +12,6 @@
 ;;;; - Arithmetic, comparisons, logand, logior, logxor, ash
 ;;;; - write-byte, mem-ref
 
-;;; ============================================================
-;;; Target numeric width  (WS5 — width parameterization, Phase 1)
-;;; ============================================================
-;;;
-;;; ONE knob, +FIXNUM-BITS+; everything else derives from it.  Before this
-;;; block the whole numeric tower hardcoded 62-bit magic numbers in ~75
-;;; places with no named constant anywhere — which is exactly why a 32-bit
-;;; target could not have a working bignum path, and therefore why
-;;; crypto-32.lisp / crypto-w32.lisp / 32bit-overrides.lisp had to be
-;;; hand-forked.  Naming the width is what makes those forks deletable
-;;; rather than merge-able.
-;;;
-;;; A tagged fixnum is value<<1 in one machine word, so the magnitude is
-;;; (word_bits - 2) bits: 62 on a 64-bit target, 30 on a 32-bit one.
-;;;
-;;; DESIGN INVARIANT: a bignum LIMB is exactly a non-negative fixnum, so the
-;;; limb mask IS +FIXNUM-MAX+ and the limb width IS +FIXNUM-BITS+.  Keeping
-;;; them the same constant (rather than two that happen to be equal) is what
-;;; stops them drifting apart when the width changes.
-;;;
-;;; PHASE 1 NOTE: these fold to exactly the magic numbers they replaced, so
-;;; the 64-bit images are byte-identical.  The Modus compiler's toplevel
-;;; DEFCONSTANT handler evaluates the value and folds references through
-;;; *constants*, so an in-image reference compiles to the same literal an
-;;; explicit magic number did — the parameterization emits no code at all.
-
-(defconstant +fixnum-bits+ 62)                        ; magnitude bits
-(defconstant +fixnum-max+ 4611686018427387903)        ; 2^62 - 1
-(defconstant +fixnum-min+ -4611686018427387903)       ; -(2^62 - 1)
-(defconstant +fixnum-limit+ 4611686018427387904)      ; 2^62
-(defconstant +fixnum-neg-limit+ -4611686018427387904) ; -2^62
-(defconstant +fixnum-half+ 2305843009213693952)       ; 2^61
-(defconstant +fixnum-neg-half+ -2305843009213693952)  ; -2^61
-(defconstant +fixnum-half-max+ 2305843009213693951)   ; 2^61 - 1
-(defconstant +limb-bits+ 62)                          ; = +fixnum-bits+
-(defconstant +limb-bits-1+ 61)                        ; = +fixnum-bits+ - 1
-(defconstant +limb-split-bits+ 30)                    ; = (floor +fixnum-bits+ 2) - 1
-(defconstant +neg-limb-bits+ -62)                     ; = -+limb-bits+
-(defconstant +neg-limb-bits-1+ -61)                   ; = -(+limb-bits+ - 1)
-(defconstant +fixnum-read-guard+ 230584300921369395) ; +fixnum-half+/20 — the
-  ;; reader's safe-accumulate bound for radix <= 20 (see cl-reader.lisp)
 
 (in-package :modus.mvm)
 

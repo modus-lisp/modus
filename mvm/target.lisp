@@ -494,3 +494,104 @@
 (defun target-big-endian-p (target)
   "Is this a big-endian target?"
   (eq (target-endianness target) :big))
+
+;;; ============================================================
+;;; Target numeric width (WS5 Phase 2b)
+;;; ============================================================
+;;;
+;;; A tagged fixnum is value<<1 in one machine word, so the magnitude is
+;;; (word_bits - 2) bits: 62 on a 64-bit target, 30 on a 32-bit one.  Before
+;;; this, the whole numeric tower hardcoded 62-bit magic numbers, which is why
+;;; a 32-bit target could not have a working bignum path and crypto-32.lisp /
+;;; crypto-w32.lisp / 32bit-overrides.lisp had to be hand-forked.
+;;;
+;;; DESIGN INVARIANT: a bignum LIMB is exactly a non-negative fixnum.  So the
+;;; limb mask IS +fixnum-max+ and the limb width IS +fixnum-bits+ — ONE
+;;; constant, not two that happen to coincide.  A small (2-slot) bignum is
+;;; lo + hi*2^bits, giving 2*bits of capacity by construction: 124 bits at 62,
+;;; 60 bits at 30.  Values past that already route to the LSB-first
+;;; big-bignum limb list, which scales with limb width automatically — so no
+;;; representation change is needed to move the width.
+;;;
+;;; TWO CONSUMERS, deliberately served differently:
+;;;   HOST side  — compile-integer's literal decomposition needs the TARGET's
+;;;                width, which varies per build.  These defparameters.
+;;;   IN-IMAGE   — the bignum core needs a FOLDED literal.  Served by the
+;;;                defconstant block WIDTH-CONSTANTS-SOURCE generates, which
+;;;                compile-source-to-module prepends to every compilation.
+;;; The in-image half must be literals: the in-image DEFCONSTANT handler
+;;; EVALs the value form, so a host-only helper there would break
+;;; `modus --compile` (the self-host path).
+
+(defparameter *target-fixnum-bits* 62
+  "Magnitude bits in a tagged fixnum on the target being compiled FOR.
+   Set by BUILD-IMAGE from the target's word size; 62 for 64-bit, 30 for
+   32-bit.  Everything else derives from this one knob.")
+
+(defparameter +fixnum-bits+      62)
+(defparameter +fixnum-max+       4611686018427387903)
+(defparameter +fixnum-min+       -4611686018427387903)
+(defparameter +fixnum-limit+     4611686018427387904)
+(defparameter +fixnum-neg-limit+ -4611686018427387904)
+(defparameter +fixnum-half+      2305843009213693952)
+(defparameter +fixnum-neg-half+  -2305843009213693952)
+(defparameter +fixnum-half-max+  2305843009213693951)
+(defparameter +limb-bits+        62)
+(defparameter +limb-bits-1+      61)
+(defparameter +limb-split-bits+  30)
+(defparameter +neg-limb-bits+    -62)
+(defparameter +neg-limb-bits-1+  -61)
+(defparameter +fixnum-read-guard+ 230584300921369395)
+(defparameter +small-bignum-bits+ 124)
+
+(defun set-target-fixnum-bits (bits)
+  "Set the target fixnum width and recompute every derived constant.
+   BITS is (word-size * 8) - 2."
+  (setf *target-fixnum-bits*   bits
+        +fixnum-bits+          bits
+        +fixnum-max+           (- (ash 1 bits) 1)
+        +fixnum-min+           (- (- (ash 1 bits) 1))
+        +fixnum-limit+         (ash 1 bits)
+        +fixnum-neg-limit+     (- (ash 1 bits))
+        +fixnum-half+          (ash 1 (- bits 1))
+        +fixnum-neg-half+      (- (ash 1 (- bits 1)))
+        +fixnum-half-max+      (- (ash 1 (- bits 1)) 1)
+        +limb-bits+            bits
+        +limb-bits-1+          (- bits 1)
+        +limb-split-bits+      (- (floor bits 2) 1)
+        +neg-limb-bits+        (- bits)
+        +neg-limb-bits-1+      (- (- bits 1))
+        ;; reader's safe-accumulate bound for small radices
+        +fixnum-read-guard+    (floor (ash 1 (- bits 1)) 10)
+        ;; 2-slot bignum capacity: lo + hi*2^bits
+        +small-bignum-bits+    (* 2 bits))
+  bits)
+
+(defun set-target-fixnum-bits-for (target)
+  "Derive the fixnum width from TARGET's word size (bytes)."
+  (set-target-fixnum-bits (- (* 8 (target-word-size target)) 2)))
+
+(defun width-constants-source ()
+  "The width DEFCONSTANT block, as source text, with the CURRENT target's
+   values baked in as literals.
+
+   compile-source-to-module prepends this to every compilation, so no build
+   script can forget it — there is no path that compiles baked source with a
+   missing or host-inherited width.  That matters: a missing constant would
+   NOT fail loudly, because compile-variable-ref falls through to a global
+   SYMBOL-VALUE read returning NIL, which would silently miscompile the whole
+   numeric tower.  Making the injection unconditional and central removes that
+   failure mode by construction rather than relying on every script."
+  (format nil
+    "(defconstant +fixnum-bits+ ~D)~%(defconstant +fixnum-max+ ~D)~%~
+     (defconstant +fixnum-min+ ~D)~%(defconstant +fixnum-limit+ ~D)~%~
+     (defconstant +fixnum-neg-limit+ ~D)~%(defconstant +fixnum-half+ ~D)~%~
+     (defconstant +fixnum-neg-half+ ~D)~%(defconstant +fixnum-half-max+ ~D)~%~
+     (defconstant +limb-bits+ ~D)~%(defconstant +limb-bits-1+ ~D)~%~
+     (defconstant +limb-split-bits+ ~D)~%(defconstant +neg-limb-bits+ ~D)~%~
+     (defconstant +neg-limb-bits-1+ ~D)~%(defconstant +fixnum-read-guard+ ~D)~%~
+     (defconstant +small-bignum-bits+ ~D)~%"
+    +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
+    +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+ +limb-bits+ +limb-bits-1+
+    +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
+    +small-bignum-bits+))

@@ -1,0 +1,3 @@
+Modus: error during --eval/--load: #(SIMPLE-ERROR ((FORMAT-CONTROL . "wrong number of arguments") (FORMAT-ARGUMENTS)))
+Modus REPL (hosted).  Ctrl-D to exit.
+> 

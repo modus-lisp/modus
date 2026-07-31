@@ -1,0 +1,1 @@
+Modus 0.1 (hosted CLI; self-hosted MVM, eval2)

@@ -786,7 +786,7 @@
                                      ;; inconsistent intern key (must match prelude
                                      ;; %INTERN-SYMBOL-PKG exactly).
                                      (key (logand (%fixnum-+ name-hash
-                                                     (%fixnum-* pkg-hash 2305843009213693951))
+                                                     (%fixnum-* pkg-hash +fixnum-half-max+))
                                                   #x3FFFFFFFFFFFFFFF))
                                      ;; compute-name-hash UPPERCASES before
                                      ;; hashing, so "A" and "a" share KEY.

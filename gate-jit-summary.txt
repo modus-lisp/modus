@@ -1,0 +1,13 @@
+# sharding 17708 tests across 64 shards of ~277 each
+# output dir: /tmp/ansi-shard.PfC0
+# all shards done in 391s
+ANSI sharded summary (deduped)
+  ANSI expected:      17625
+  ANSI passed:        16450
+  ANSI failed:        1124
+  ANSI lost to crash: 51
+  ANSI pass (of run): 93.60%  (16450 / 17574)
+  ANSI pass (overall):93.33%  (16450 / 17625)
+  Custom pass/fail:   937 / 25
+  Extra pass/fail:    108 / 26   (Modus probes + runtime-suite-load tests; NOT in ANSI total)
+  Symbol pass/fail:   1 / 1   (define-condition init-forms)

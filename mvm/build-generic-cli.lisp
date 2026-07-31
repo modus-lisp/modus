@@ -1207,6 +1207,19 @@
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)
       (write-sequence (kernel-image-image-bytes image) out))
+    ;; WS5 GATE AID: also dump the NATIVE CODE section on its own.  The full
+    ;; image embeds a source blob and an auto-generated symbol-name table,
+    ;; both of which track the source TEXT, so a pure refactor that renames a
+    ;; literal to a constant changes the image without changing a single
+    ;; emitted instruction.  Hashing the native code separates "the compiler
+    ;; emitted the same code" from "the file happens to be the same size".
+    (when (sb-ext:posix-getenv "MODUS_DUMP_NATIVE")
+      (with-open-file (o (concatenate 'string path ".native")
+                         :direction :output :element-type '(unsigned-byte 8)
+                         :if-exists :supersede)
+        (write-sequence (kernel-image-native-code image) o))
+      (format t "  native code: ~D bytes -> ~A.native~%"
+              (length (kernel-image-native-code image)) path))
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)

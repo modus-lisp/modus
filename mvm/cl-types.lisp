@@ -2163,7 +2163,7 @@
 ;; SIGSEGV'd (gcd.4/.6/.7, lcm.4/.6/.7).  Special-case the one fixnum whose
 ;; negation escapes the fixnum range; +2^62 = small-bignum (lo=0, hi=1).
 (defun %safe-fixnum-negate (n)
-  (if (= n -4611686018427387904)
+  (if (= n +fixnum-neg-limit+)
       (make-bignum 0 1)
       (- 0 n)))
 
@@ -2512,8 +2512,8 @@
     ;; Larger operands route through bignum-add, which correctly
     ;; promotes a + b that would have wrapped %fixnum-+ to a bignum.
     ((and (integerp a) (integerp b))
-     (if (and (<= a 2305843009213693951) (>= a -2305843009213693952)
-              (<= b 2305843009213693951) (>= b -2305843009213693952))
+     (if (and (<= a +fixnum-half-max+) (>= a +fixnum-neg-half+)
+              (<= b +fixnum-half-max+) (>= b +fixnum-neg-half+))
          (%fixnum-+ a b)
          (bignum-add a b)))
     ;; Ratio branches: numerator/denominator may be bignums and the
@@ -2572,8 +2572,8 @@
     ;; which PROMOTES.  This is the promotion decision for the compiled
     ;; :sub-checked slow path (native SUB+JO calls here only on overflow).
     ((and (integerp a) (integerp b))
-     (if (and (<= a 2305843009213693951) (>= a -2305843009213693952)
-              (<= b 2305843009213693951) (>= b -2305843009213693952))
+     (if (and (<= a +fixnum-half-max+) (>= a +fixnum-neg-half+)
+              (<= b +fixnum-half-max+) (>= b +fixnum-neg-half+))
          (%fixnum-- a b)
          (bignum-sub a b)))
     ;; Ratio branches: numerator/denominator may be bignums and the
@@ -2682,7 +2682,7 @@
         ;; Add 2^k to q.  For k up to ~62, ash 1 k is a fixnum.
         ;; Beyond that we'd need bignum representation, but for our
         ;; ANSI suite the trig case keeps k ≤ 47.  Guard anyway.
-        (setq q (bignum-add q (if (>= k 62) (bignum-mul (ash 1 30) (ash 1 (- k 30))) (ash 1 k))))))))
+        (setq q (bignum-add q (if (>= k +limb-bits+) (bignum-mul (ash 1 +limb-split-bits+) (ash 1 (- k +limb-split-bits+))) (ash 1 k))))))))
 
 (defun %integer-truncate (a b)
   "Bignum-aware integer truncate.  Returns the quotient only;

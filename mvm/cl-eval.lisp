@@ -2351,7 +2351,7 @@
              ;; carry into hi.  Same logic as %bignum-negate-parts.
              (if (= lo 0)
                  (make-bignum 0 hi)
-                 (make-bignum (%fixnum-+ 1 (logxor lo 4611686018427387903))
+                 (make-bignum (%fixnum-+ 1 (logxor lo +fixnum-max+))
                               (%fixnum-- hi 1)))
              (bignum-to-fixnum-if-possible (make-bignum lo hi)))))
       ;; 3+ limbs: allocate a big-bignum.
@@ -2393,10 +2393,10 @@
           ;; subtractions use raw %fixnum-- (plain `-` now promotes/recurses).
           (if (= lo 0)
               (cons -1 (list 0 (%fixnum-- 0 hi)))
-              (let* ((m-lo (%fixnum-+ 1 (logxor lo 4611686018427387903)))
+              (let* ((m-lo (%fixnum-+ 1 (logxor lo +fixnum-max+)))
                      (m-hi (%fixnum-- (logxor hi -1) 0))   ; ~hi
-                     (m-hi+1 (%fixnum-+ m-hi (if (= m-lo 4611686018427387904) 1 0)))
-                     (m-lo-clamped (logand m-lo 4611686018427387903)))
+                     (m-hi+1 (%fixnum-+ m-hi (if (= m-lo +fixnum-limit+) 1 0)))
+                     (m-lo-clamped (logand m-lo +fixnum-max+)))
                 (cons -1 (list m-lo-clamped m-hi+1))))))))
     ((< n 0) (cons -1 (list (%fixnum-- 0 n))))
     ((= n 0) (cons 1 '(0)))
@@ -2423,7 +2423,7 @@
     (t
      (let ((hi (bignum-hi b)) (lo (bignum-lo b)))
        (if (= hi 0) lo
-           (if (and (= hi -1) (>= lo 2305843009213693952))
+           (if (and (= hi -1) (>= lo +fixnum-half+))
                ;; lo - 2^62 for lo in [2^61, 2^62-1] = a negative fixnum in
                ;; [-2^61, -1].  Compute via raw (logior lo -2^62) — NOT
                ;; (- lo 4611686018427387904): 2^62 is a BIGNUM literal, so `-`
@@ -2431,7 +2431,7 @@
                ;; -> bignum-sub -> bignum-add -> here again = infinite
                ;; recursion / stack-overflow SIGSEGV.  logior mnf sign-extends
                ;; bit 62+ and is a raw :or on the tagged fixnum words.
-               (logior lo -4611686018427387904)
+               (logior lo +fixnum-neg-limit+)
                b))))))
 
 ;;; --- Magnitude arithmetic on LSB-first limb lists ---
@@ -2448,7 +2448,7 @@
              (b (if ys (car ys) 0))
              (sum (%fixnum-+ (%fixnum-+ a b) carry))
              ;; Detect carry: tagged add wraps to negative iff sum ≥ 2^62.
-             (limb (logand sum 4611686018427387903))
+             (limb (logand sum +fixnum-max+))
              (next-carry (if (< sum 0) 1 0)))
         (setq result (cons limb result))
         (setq carry next-carry)
@@ -2506,7 +2506,7 @@
                        ;; corrupted every borrowing limb.  (logand diff 2^62-1)
                        ;; equals diff+2^62 for diff in [-(2^62-1),-1] and stays
                        ;; a fixnum — mirrors %add-limbs-mag's mask idiom.
-                       (logand diff 4611686018427387903)
+                       (logand diff +fixnum-max+)
                        diff))
              (next-borrow (if (< diff 0) 1 0)))
         (setq result (cons limb result))
@@ -2586,14 +2586,14 @@
          (setq acc (cons (aref out i) acc))
          (setq i (+ i 1)))))))
 (defun %shl1-fixnum (n)
-  (if (>= n 2305843009213693952)
-      (make-bignum (logand (ash n 1) 4611686018427387903) (ash n -61))
+  (if (>= n +fixnum-half+)
+      (make-bignum (logand (ash n 1) +fixnum-max+) (ash n +neg-limb-bits-1+))
       (ash n 1)))
 (defun %shl1-bignum (lo hi)
-  (make-bignum (logand (ash lo 1) 4611686018427387903)
+  (make-bignum (logand (ash lo 1) +fixnum-max+)
                (%fixnum-+ (ash hi 1) (ash lo -61))))
 (defun %shr1-bignum (lo hi)
-  (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi 61) 4611686018427387903))
+  (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi +limb-bits-1+) +fixnum-max+))
                (ash hi -1)))
 
 ;;; --- Limb-list shift helpers (LSB-first 62-bit limbs) ---
@@ -2620,7 +2620,7 @@
             (return (nreverse acc)))
       (let* ((v (car cur))
              (top (ash v -61))                       ; bit 61 -> carries out
-             (low61 (logand v 2305843009213693951))  ; v & (2^61-1)
+             (low61 (logand v +fixnum-half-max+))  ; v & (2^61-1)
              ;; (low61 << 1) <= 2^62-2 (safe fixnum), OR the incoming carry bit.
              (lo (logior (ash low61 1) carry)))
         (setq acc (cons lo acc))
@@ -2641,15 +2641,15 @@
              (nxt (logand v 1)))           ; this limb's low bit -> next-lower
         (setq acc (cons hi acc))
         ;; 2^61 literal (not `(ash 1 61)` which would re-enter bignum-ash).
-        (setq carry (if (= nxt 1) 2305843009213693952 0))
+        (setq carry (if (= nxt 1) +fixnum-half+ 0))
         (setq rev (cdr rev))))))
 
 (defun %shl-limbs-mag (mag count)
   "Left-shift an LSB-first limb list MAG by COUNT bits (COUNT >= 0).
    Whole-limb part prepends zero limbs; the residual bits are applied one
    at a time (constant-shift, no bignum-ash re-entry)."
-  (let* ((whole (truncate count 62))
-         (bits (- count (* whole 62)))
+  (let* ((whole (truncate count +limb-bits+))
+         (bits (- count (* whole +limb-bits+)))
          ;; Residual sub-limb shift, one bit at a time.
          (shifted (let ((cur mag) (i 0))
                     (loop (when (>= i bits) (return cur))
@@ -2666,8 +2666,8 @@
 (defun %shr-limbs-mag (mag count)
   "Logical right-shift an LSB-first limb list MAG by COUNT bits (>= 0).
    Drops whole low limbs, then applies the residual bits one at a time."
-  (let* ((whole (truncate count 62))
-         (bits (- count (* whole 62)))
+  (let* ((whole (truncate count +limb-bits+))
+         (bits (- count (* whole +limb-bits+)))
          (dropped (let ((cur mag) (i 0))
                     (loop (when (or (>= i whole) (null cur)) (return cur))
                       (setq cur (cdr cur))
@@ -2681,8 +2681,8 @@
   "True if any of the low COUNT bits of the magnitude MAG (LSB-first
    62-bit limbs) is set.  Used for the floor-correction of an arithmetic
    right shift of a negative integer."
-  (let* ((whole (truncate count 62))
-         (bits (- count (* whole 62)))
+  (let* ((whole (truncate count +limb-bits+))
+         (bits (- count (* whole +limb-bits+)))
          (found nil) (cur mag) (i 0))
     ;; Any nonzero limb fully inside the dropped WHOLE limbs.
     (loop (when (or (>= i whole) (null cur) found) (return nil))
@@ -2747,7 +2747,7 @@
       (cons n 0)
       ;; Same 2^62-bignum-literal bug as %sub-limbs-mag: use the fixnum-safe
       ;; mask form (logand n 2^62-1) = n + 2^62 for negative fixnum n.
-      (cons (logand n 4611686018427387903) -1)))
+      (cons (logand n +fixnum-max+) -1)))
 
 (defun bignum-add (a b)
   "Add A and B, where either may be a fixnum, small bignum, or big
@@ -2767,7 +2767,7 @@
                    (%fixnum-to-bignum-parts b))))
        (let ((sum-lo (%fixnum-+ (car ap) (car bp))))
          (let ((carry (if (< sum-lo 0) 1 0))
-               (lo (logand sum-lo 4611686018427387903))
+               (lo (logand sum-lo +fixnum-max+))
                (ha (cdr ap)) (hb (cdr bp)))
            (let ((sum-hi (%fixnum-+ (%fixnum-+ ha hb) carry)))
              ;; The 2-slot small-bignum representation holds at most 124 bits.
@@ -2817,7 +2817,7 @@
       ;; No overflow: ~0 + 1 = 2^62, carry into hi
       (make-bignum 0 (%fixnum-+ (logxor hi -1) 1))
       ;; ~lo + 1 < 2^62 when lo > 0, so no carry
-      (make-bignum (%fixnum-+ 1 (logxor lo 4611686018427387903)) (logxor hi -1))))
+      (make-bignum (%fixnum-+ 1 (logxor lo +fixnum-max+)) (logxor hi -1))))
 
 (defun bignum-negate (n)
   "Negate N (fixnum or bignum)."
@@ -2831,7 +2831,7 @@
     ;; re-enters checked `-` (nor the small-bignum collapse path, which a
     ;; parts-based negate would trip on for tiny values).
     ((not (bignump n))
-     (if (= n -4611686018427387904)
+     (if (= n +fixnum-neg-limit+)
          (make-bignum 0 1)
          (%fixnum-- 0 n)))
     ((big-bignum-p n)
@@ -2901,7 +2901,7 @@
         ;; %add-limbs-mag, then truncated back to WIDTH limbs.
         (let ((inverted (let ((acc nil) (cur padded))
                           (loop (when (null cur) (return (nreverse acc)))
-                            (setq acc (cons (- 4611686018427387903 (car cur)) acc))
+                            (setq acc (cons (- +fixnum-max+ (car cur)) acc))
                             (setq cur (cdr cur))))))
           (%take-limbs (%add-limbs-mag inverted (list 1)) width))
         padded)))
@@ -2916,7 +2916,7 @@
 
 (defun %tc-sign-limb (sm)
   "The infinite sign-extension limb for SM: 0 if non-negative, else mask."
-  (if (= (car sm) -1) 4611686018427387903 0))
+  (if (= (car sm) -1) +fixnum-max+ 0))
 
 (defun %tc-to-integer (tc-limbs neg)
   "Convert a two's-complement limb list TC-LIMBS (LSB-first, 62-bit) back
@@ -2928,7 +2928,7 @@
       ;; (mask - limb) then add 1 with the proven %add-limbs-mag.
       (let ((inverted (let ((acc nil) (cur tc-limbs))
                         (loop (when (null cur) (return (nreverse acc)))
-                          (setq acc (cons (- 4611686018427387903 (car cur)) acc))
+                          (setq acc (cons (- +fixnum-max+ (car cur)) acc))
                           (setq cur (cdr cur))))))
         (%make-bb -1 (%add-limbs-mag inverted (list 1))))
       (%make-bb 1 tc-limbs)))
@@ -2961,7 +2961,7 @@
          (sign-a (%tc-sign-limb sa))
          (sign-b (%tc-sign-limb sb))
          (result-sign-limb (%limb-op op sign-a sign-b))
-         (neg (= result-sign-limb 4611686018427387903))
+         (neg (= result-sign-limb +fixnum-max+))
          (out nil) (xs ta) (ys tb))
     (loop (when (null xs) (return nil))
       (setq out (cons (%limb-op op (car xs) (car ys)) out))
@@ -3014,7 +3014,7 @@
       (let ((lo (bignum-lo n)) (hi (bignum-hi n)))
         (if (> lo 0)
             (bignum-to-fixnum-if-possible (make-bignum (%fixnum-- lo 1) hi))
-            (bignum-to-fixnum-if-possible (make-bignum 4611686018427387903 (%fixnum-- hi 1)))))
+            (bignum-to-fixnum-if-possible (make-bignum +fixnum-max+ (%fixnum-- hi 1)))))
       (generic-subtract n 1)))
 (defun %fixnum-integer-length (n)
   (let ((x (if (< n 0) (logxor n -1) n)) (len 0))
@@ -3029,7 +3029,7 @@
      ;; of the (positive) top limb.
      (let* ((nl (%bb-nlimbs n))
             (top (%bb-limb n (- nl 1))))
-       (+ (* (- nl 1) 62) (%fixnum-integer-length top))))
+       (+ (* (- nl 1) +limb-bits+) (%fixnum-integer-length top))))
     (t
      (let ((hi (bignum-hi n)))
        (if (> hi 0) (+ 62 (%fixnum-integer-length hi))
@@ -3088,10 +3088,10 @@
     (t
      (let ((ah (if (bignump a) (bignum-hi a) (if (< a 0) -1 0)))
            (al (if (bignump a) (bignum-lo a)
-                   (logand a 4611686018427387903)))
+                   (logand a +fixnum-max+)))
            (bh (if (bignump b) (bignum-hi b) (if (< b 0) -1 0)))
            (bl (if (bignump b) (bignum-lo b)
-                   (logand b 4611686018427387903))))
+                   (logand b +fixnum-max+))))
        (cond ((< ah bh) -1)
              ((> ah bh) 1)
              ((< al bl) -1)
@@ -3115,9 +3115,9 @@
      (let ((lo (bignum-lo n)) (hi (bignum-hi n)))
        (if (< hi 0)
            ;; Negative: negate via two's complement.
-           (let ((neg-lo (%fixnum-+ 1 (logxor lo 4611686018427387903)))
+           (let ((neg-lo (%fixnum-+ 1 (logxor lo +fixnum-max+)))
                  (neg-hi (logxor hi -1)))
-             (cond ((>= neg-lo 4611686018427387904)
+             (cond ((>= neg-lo +fixnum-limit+)
                     (list 1 0 (%fixnum-+ neg-hi 1)))
                    (t (list -1 neg-lo neg-hi))))
            (list 1 lo hi))))

@@ -41,6 +41,48 @@
 (defconstant +tag-forward+   #b1111)
 
 (defconstant +fixnum-shift+ 1)
+
+;;; ============================================================
+;;; Target numeric width  (WS5 — width parameterization, Phase 1)
+;;; ============================================================
+;;;
+;;; ONE knob, +FIXNUM-BITS+; everything else derives from it.  Before this
+;;; block the whole numeric tower hardcoded 62-bit magic numbers in ~75
+;;; places with no named constant anywhere — which is exactly why a 32-bit
+;;; target could not have a working bignum path, and therefore why
+;;; crypto-32.lisp / crypto-w32.lisp / 32bit-overrides.lisp had to be
+;;; hand-forked.  Naming the width is what makes those forks deletable
+;;; rather than merge-able.
+;;;
+;;; A tagged fixnum is value<<1 in one machine word, so the magnitude is
+;;; (word_bits - 2) bits: 62 on a 64-bit target, 30 on a 32-bit one.
+;;;
+;;; DESIGN INVARIANT: a bignum LIMB is exactly a non-negative fixnum, so the
+;;; limb mask IS +FIXNUM-MAX+ and the limb width IS +FIXNUM-BITS+.  Keeping
+;;; them the same constant (rather than two that happen to be equal) is what
+;;; stops them drifting apart when the width changes.
+;;;
+;;; PHASE 1 NOTE: these fold to exactly the magic numbers they replaced, so
+;;; the 64-bit images are byte-identical.  The Modus compiler's toplevel
+;;; DEFCONSTANT handler evaluates the value and folds references through
+;;; *constants*, so an in-image reference compiles to the same literal an
+;;; explicit magic number did — the parameterization emits no code at all.
+
+(defconstant +fixnum-bits+ 62)                        ; magnitude bits
+(defconstant +fixnum-max+ 4611686018427387903)        ; 2^62 - 1
+(defconstant +fixnum-min+ -4611686018427387903)       ; -(2^62 - 1)
+(defconstant +fixnum-limit+ 4611686018427387904)      ; 2^62
+(defconstant +fixnum-neg-limit+ -4611686018427387904) ; -2^62
+(defconstant +fixnum-half+ 2305843009213693952)       ; 2^61
+(defconstant +fixnum-neg-half+ -2305843009213693952)  ; -2^61
+(defconstant +fixnum-half-max+ 2305843009213693951)   ; 2^61 - 1
+(defconstant +limb-bits+ 62)                          ; = +fixnum-bits+
+(defconstant +limb-bits-1+ 61)                        ; = +fixnum-bits+ - 1
+(defconstant +limb-split-bits+ 30)                    ; = (floor +fixnum-bits+ 2) - 1
+(defconstant +neg-limb-bits+ -62)                     ; = -+limb-bits+
+(defconstant +neg-limb-bits-1+ -61)                   ; = -(+limb-bits+ - 1)
+(defconstant +fixnum-read-guard+ 230584300921369395) ; +fixnum-half+/20 — the
+  ;; reader's safe-accumulate bound for radix <= 20 (see cl-reader.lisp)
 (defconstant +char-shift+ 8)
 (defconstant +char-tag+ #x05)
 
@@ -1086,18 +1128,18 @@
   (> (integer-length (abs value)) 124))
 (defun %lit-bn-lo (value)
   "Low 62-bit limb (slot 0) of a small bignum VALUE."
-  (logand value 4611686018427387903))
+  (logand value +fixnum-max+))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
-  (ash value -62))
+  (ash value +neg-limb-bits+))
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
-          (setf mag (ash mag -62)) (incf n))))
+          (setf mag (ash mag +neg-limb-bits+)) (incf n))))
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
-  (logand (ash (abs value) (* -62 k)) 4611686018427387903))
+  (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
 
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
@@ -3907,7 +3949,7 @@
        ;; over-broad rewrite of ALL literals to :li+:shl perturbed the interpreter
        ;; enough to fault, so only NON-positive / large values take a wider path.
        ((zerop value) (emit-ir :li dest 0))
-       ((and (> value 0) (< value 2305843009213693952))    ; small positive: 1 :li
+       ((and (> value 0) (< value +fixnum-half+))    ; small positive: 1 :li
         (emit-ir :li dest (ash value +fixnum-shift+)))
        ;; SMALL NEGATIVE: emitting `(:li (ash value 1))` puts a NEGATIVE value in
        ;; the :li operand, and mvm-emit-u64's native high-32 `(ash val -32)` is
@@ -3915,13 +3957,13 @@
        ;; -2147483648 boundary → the translator dropped whole functions.  Emit the
        ;; POSITIVE magnitude's tagged word (mvm-emit-u64 handles positives) then
        ;; :neg in-register, so no negative is ever a :li operand.
-       ((and (< value 0) (> value -2305843009213693952))   ; small negative: :li+:neg
+       ((and (< value 0) (> value +fixnum-neg-half+))   ; small negative: :li+:neg
         (emit-ir :li dest (ash (- value) +fixnum-shift+))
         (emit-ir :neg dest dest))
        ((> value 0)                               ; large positive
         (emit-ir :li dest value)
         (emit-ir :shl dest dest +fixnum-shift+))
-       ((< value -4611686018427387903)            ; most-negative-fixnum
+       ((< value +fixnum-min+)            ; most-negative-fixnum
         (emit-ir :li dest 1)
         (emit-ir :shl dest dest 63))
        (t                                          ; large negative
@@ -3963,7 +4005,7 @@
     ;; a still-numerically-correct small bignum; CL code cannot observe the
     ;; representation difference (EQL/arithmetic identical).  Shared file: gate
     ;; before landing on main.
-    ((and (>= value -4611686018427387903) (<= value 4611686018427387903))
+    ((and (>= value +fixnum-min+) (<= value +fixnum-max+))
      ;; Fixnum range.  emit-li-tagged keeps the host path as `(:li (ash value 1))`
      ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the
      ;; top/bottom bit of the fixnum range — e.g. most-positive/negative-fixnum).

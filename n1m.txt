@@ -1,0 +1,29 @@
+K01:(init-symbol-table)
+K02:(init-keyword-table)
+K03:(%init-packages)
+K04:(%init-streams)
+K05:(%init-reader)
+K06:(init-all-globals)
+K07:(%init-condition-types)
+K08:(%init-method-combinations)
+K09:(%init-symbol-function-table)
+K10:(%init-sft-auto)
+K11:(%init-sym-name-auto)
+K12:(%init-runtime-macros)
+K13:(%init-signal-handling)
+M14:signal-symbols
+M15:make-load-form
+M16:backquote
+E2A-opcodes
+E2B-bootmacros
+E2C-precompile
+E2f
+E2D-compiled
+M17:deftest
+M18:init-all-globals-2
+M19:install-cl-macros
+M20:init-x64-translator
+M21:selfhost-targets
+Modus: error during --eval/--load: #(SIMPLE-ERROR ((FORMAT-CONTROL . "wrong number of arguments") (FORMAT-ARGUMENTS)))
+Modus REPL (hosted).  Ctrl-D to exit.
+> 

@@ -1445,8 +1445,8 @@
   (setq multiple-values-limit   16)
   (setq internal-time-units-per-second 1000000)
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
-  (setq most-positive-fixnum  4611686018427387903)
-  (setq most-negative-fixnum -4611686018427387904)
+  (setq most-positive-fixnum  +fixnum-max+)
+  (setq most-negative-fixnum +fixnum-neg-limit+)
   ;; WS3 Phase 3: production EVAL/LOAD route unconditionally to mvm-eval (see
   ;; cl-eval.lisp EVAL); no flag/marker needed.
   ;; ansi-aux-macros.lsp's NORMALLY macro: (if *should-always-be-true*

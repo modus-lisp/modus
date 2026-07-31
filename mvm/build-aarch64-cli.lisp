@@ -270,8 +270,8 @@
   (setq lambda-list-keywords    (quote (&allow-other-keys &aux &body &environment &key
                                         &optional &rest &whole)))
   (setq multiple-values-limit   16)
-  (setq most-positive-fixnum  4611686018427387903)
-  (setq most-negative-fixnum -4611686018427387904)
+  (setq most-positive-fixnum  +fixnum-max+)
+  (setq most-negative-fixnum +fixnum-neg-limit+)
   (setq pi 3.141592653589793d0)
   (setq *default-pathname-defaults* \"/tmp/\")
 

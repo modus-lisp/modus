@@ -1,0 +1,5 @@
+  init-all-globals: 0 init thunks
+  Handler-stack helpers emitted (push/pop)
+FNMAP 421 KERNEL-MAIN
+FNMAP 549 INIT-ALL-GLOBALS
+modus: wrote 1615 bytes to /home/claude/ws5-hunt/e42-final

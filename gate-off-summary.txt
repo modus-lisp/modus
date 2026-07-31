@@ -1,0 +1,13 @@
+# sharding 17708 tests across 64 shards of ~277 each
+# output dir: /tmp/ansi-shard.VtyU
+# all shards done in 389s
+ANSI sharded summary (deduped)
+  ANSI expected:      17625
+  ANSI passed:        16454
+  ANSI failed:        1120
+  ANSI lost to crash: 51
+  ANSI pass (of run): 93.63%  (16454 / 17574)
+  ANSI pass (overall):93.36%  (16454 / 17625)
+  Custom pass/fail:   937 / 24
+  Extra pass/fail:    108 / 26   (Modus probes + runtime-suite-load tests; NOT in ANSI total)
+  Symbol pass/fail:   1 / 1   (define-condition init-forms)

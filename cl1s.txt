@@ -1,0 +1,9 @@
+  SKIP read at line 1: #(SIMPLE-ERROR ((FORMAT-CONTROL . wrong number of arguments) (FORMAT-ARGUMENTS)))
+  SKIP read at line 4: #(SIMPLE-ERROR ((FORMAT-CONTROL . wrong number of arguments) (FORMAT-ARGUMENTS)))
+  init-all-globals: 0 init thunks
+  DBG-S32: overflow value=1120 minusp=NIL fixnump=T pos=7 val-minus-2G=-2147482527
+  WARN: translator error #1: #(SIMPLE-ERROR ((FORMAT-CONTROL . SETUP-prologue fn ~D '~A' pos ~D: ~A) (FORMAT-ARGUMENTS 0 INIT-ALL-GLOBALS 7 #(SIMPLE-ERROR ((FORMAT-CONTROL . emit-s32: value ~D (#x~X) out of range for signed 32-bit ~
+            (rel32 branch would silently truncate); buf position ~D) (FORMAT-ARGUMENTS 1120 1120 7))))))
+  WARN: giving up on translator, using partial result
+FNMAP 416 INIT-ALL-GLOBALS
+modus: wrote 1195 bytes to /home/claude/ws5-hunt/e42-clean

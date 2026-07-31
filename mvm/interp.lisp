@@ -301,7 +301,7 @@
     ;; exactly most-negative-fixnum territory; use the baked min-fixnum literal
     ;; (compiled correctly at host build time) plus the low half instead.
     (values (if (= hi-signed -2147483648)
-                (+ (ash lo -1) -4611686018427387904)
+                (+ (ash lo -1) +fixnum-neg-limit+)
                 (+ (ash lo -1) (* hi-signed 2147483648)))
             (+ pc 8))))
 

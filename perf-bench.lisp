@@ -1,0 +1,7 @@
+(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(defun sumloop (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s i)))))
+(let ((t0 (rdtsc)))
+  (fib 28)
+  (sumloop 300000)
+  (let ((t1 (rdtsc)))
+    (format t "CYCLES=~A~%" (- t1 t0))))

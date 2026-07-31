@@ -829,7 +829,7 @@
                     ;; literals (e.g. 100000000000000000000) parse to a
                     ;; real bignum instead of silently overflowing :mul.
                     (cond
-                      ((or (bignump n) (>= n 230584300921369395))   ; 2^61 / 20 (safe for base ≤ 20)
+                      ((or (bignump n) (>= n +fixnum-read-guard+))   ; 2^61 / 20 (safe for base ≤ 20)
                        (setq n (bignum-add (bignum-mul n base) digit)))
                       (t
                        (setq n (+ (* n base) digit))))

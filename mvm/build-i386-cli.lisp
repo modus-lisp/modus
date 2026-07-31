@@ -398,6 +398,54 @@
   (let ((va (buf-read-u32 s a)) (vd (buf-read-u32 s d)))
     (+ va vd)))
 
+(defun probe-band ()
+  ;; MAGNITUDE LADDER: 30, 32, 48, 60 and 62 bits, each through
+  ;; logand/ash/logior/logxor/+/-.  The 48-bit band was untested by
+  ;; construction before this -- SHA-256 masks before shifting so it
+  ;; never forms one.  Generated from Python so the value fed and the
+  ;; value expected come from ONE computation.
+  (%pdec (logand 1073741823 255)) (write-char-serial 32)
+  (%pdec (logand (ash 1073741823 -8) 255)) (write-char-serial 32)
+  (%pdec (logand (logior 1073741823 1) 255)) (write-char-serial 32)
+  (%pdec (logand (logxor 1073741823 255) 255)) (write-char-serial 32)
+  (%pdec (logand (+ 1073741823 1) 255)) (write-char-serial 32)
+  (%pdec (logand (- 1073741823 1) 255)) (putnl)
+  (%pdec (logand 2609737539 255)) (write-char-serial 32)
+  (%pdec (logand (ash 2609737539 -8) 255)) (write-char-serial 32)
+  (%pdec (logand (logior 2609737539 1) 255)) (write-char-serial 32)
+  (%pdec (logand (logxor 2609737539 255) 255)) (write-char-serial 32)
+  (%pdec (logand (+ 2609737539 1) 255)) (write-char-serial 32)
+  (%pdec (logand (- 2609737539 1) 255)) (putnl)
+  (%pdec (logand 171031759355904 255)) (write-char-serial 32)
+  (%pdec (logand (ash 171031759355904 -8) 255)) (write-char-serial 32)
+  (%pdec (logand (logior 171031759355904 1) 255)) (write-char-serial 32)
+  (%pdec (logand (logxor 171031759355904 255) 255)) (write-char-serial 32)
+  (%pdec (logand (+ 171031759355904 1) 255)) (write-char-serial 32)
+  (%pdec (logand (- 171031759355904 1) 255)) (putnl)
+  (%pdec (logand 576460752303435833 255)) (write-char-serial 32)
+  (%pdec (logand (ash 576460752303435833 -8) 255)) (write-char-serial 32)
+  (%pdec (logand (logior 576460752303435833 1) 255)) (write-char-serial 32)
+  (%pdec (logand (logxor 576460752303435833 255) 255)) (write-char-serial 32)
+  (%pdec (logand (+ 576460752303435833 1) 255)) (write-char-serial 32)
+  (%pdec (logand (- 576460752303435833 1) 255)) (putnl)
+  (%pdec (logand 4611686018427387911 255)) (write-char-serial 32)
+  (%pdec (logand (ash 4611686018427387911 -8) 255)) (write-char-serial 32)
+  (%pdec (logand (logior 4611686018427387911 1) 255)) (write-char-serial 32)
+  (%pdec (logand (logxor 4611686018427387911 255) 255)) (write-char-serial 32)
+  (%pdec (logand (+ 4611686018427387911 1) 255)) (write-char-serial 32)
+  (%pdec (logand (- 4611686018427387911 1) 255)) (putnl))
+
+(defun probe-rfcqr ()
+  (let ((s (make-array 64)))
+    (let ((i 0)) (loop (when (>= i 64) (return nil)) (aset s i 0) (setq i (+ i 1))))
+    (buf-write-u32 s 0 286331153)
+    (buf-write-u32 s 16 16909060)
+    (buf-write-u32 s 32 2609737539)
+    (buf-write-u32 s 48 19088743)
+    (chacha-qr s 0 16 32 48)
+    (write-char-serial 114) (write-char-serial 61)
+    (%phex32 s 0) (%phex32 s 16) (%phex32 s 32) (%phex32 s 48) (putnl)))
+
 (defun probe-rotbig ()
   ;; The rotations on a BIGNUM input.  probe-rot used 0x01020304, which is a
   ;; FIXNUM on a 30-bit tower; in ChaCha every rotation input is a u32 and
@@ -583,6 +631,8 @@
       ((eql which 22) (probe-qrsteps))
       ((eql which 23) (probe-qrcmp))
       ((eql which 24) (probe-rotbig))
+      ((eql which 25) (probe-band))
+      ((eql which 26) (probe-rfcqr))
       (t (progn (probe-argv) (probe-arith) (probe-defcall) (probe-cons)
                 (probe-funcall) (probe-fixnum-width)))))
   (write-char-serial 68) (write-char-serial 79) (write-char-serial 78)

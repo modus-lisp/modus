@@ -259,6 +259,14 @@
    the alignment holds at the RUNTIME virtual address, not merely at the
    buffer offset.  Required whenever *i386-fn-tag-3* is on.")
 
+(defparameter *i386-record-unimpl* t
+  "Record every MVM opcode that hits the translator's INT3 default, in
+   *i386-unimpl-ops*.  A silent INT3 is the worst failure mode when bringing
+   a target up: the image builds clean and then dies with no explanation.")
+
+(defvar *i386-unimpl-ops* nil
+  "Hash of opcode -> number of INT3 placeholders emitted for it.")
+
 (defparameter *i386-linux-mode* nil
   "When true, the target is a HOSTED Linux/i386 ELF rather than bare metal:
    the serial-I/O traps become write(2) syscalls and the Linux syscall traps
@@ -275,6 +283,11 @@
 ;;; single-instruction translation) makes the :add/:sub/:mul-checked opcodes
 ;;; degrade to plain wrapping arithmetic, exactly like translate-x64's
 ;;; fallback branch.
+(defparameter *i386-checked-arith-slowpath* t
+  "When NIL, :add/:sub/:mul-checked degrade to plain WRAPPING arithmetic even
+   if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
+   ops from the rest of i386 codegen when triaging a miscompile.")
+
 (defvar *i386-genadd-label* nil)
 (defvar *i386-gensub-label* nil)
 (defvar *i386-genmul-label* nil)
@@ -289,9 +302,29 @@
   (fixups nil)     ; list of (byte-position label-id fixup-type)
   (position 0))
 
+(defun i386-grow-buffer (buf need)
+  "Double the code buffer until it can hold NEED bytes.
+   WS5: the buffer used to be a FIXED 1.5 MB simple-vector, which was fine
+   for the 90 KB toy-REPL image but overflows immediately on a real CL image
+   (the prelude + rt + cl-* bridge is ~2 MB of native code).  The failure was
+   also badly disguised: cross.lisp's translate-module-to-native wraps the
+   translator in a handler-case, so the array-index error surfaced only as
+   `WARN: giving up on translator' followed by an image with 0 bytes of
+   native code.  x64's code-buffer already grows on demand; now i386's does."
+  (let* ((old (i386-buffer-bytes buf))
+         (cap (length old)))
+    (when (> need cap)
+      (let ((new-cap cap))
+        (loop while (< new-cap need) do (setf new-cap (* 2 new-cap)))
+        (let ((new (make-array new-cap)))
+          (replace new old)
+          (setf (i386-buffer-bytes buf) new))))))
+
 (defun i386-emit-byte (buf byte)
   "Emit a single byte."
   (let ((pos (i386-buffer-position buf)))
+    (when (>= pos (length (i386-buffer-bytes buf)))
+      (i386-grow-buffer buf (1+ pos)))
     (setf (aref (i386-buffer-bytes buf) pos) (logand byte #xFF))
     (setf (i386-buffer-position buf) (+ pos 1))))
 
@@ -1413,7 +1446,15 @@
               (i386-emit-byte buf #x0F)
               (i386-emit-byte buf #x09))
              (t
-              ;; Unknown trap: NOP (avoid crash via INT with no IDT)
+              ;; Unknown trap: NOP (avoid crash via INT with no IDT).
+              ;; WS5: record it — an unimplemented trap silently NOP'd is even
+              ;; harder to diagnose than an INT3, because the program keeps
+              ;; running with a missing side effect / garbage result.  Keyed by
+              ;; #x10000 + code so it can't collide with an opcode number.
+              (when *i386-record-unimpl*
+                (let ((tbl (or *i386-unimpl-ops*
+                               (setf *i386-unimpl-ops* (make-hash-table :test 'eql)))))
+                  (incf (gethash (+ #x10000 code) tbl 0))))
               nil))))
 
         ;; ============================================
@@ -1467,10 +1508,13 @@
          (let ((vd (first operands))
                (va (second operands))
                (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-add-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           ;; VR-PRESERVING (WS5): compute in the ECX/EDX scratch pair, not
+           ;; EAX — EAX is VR and may hold a live value the compiler reads
+           ;; again after this op (see the :or type-check note above).
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-sub+)
          ;; (sub Vd Va Vb) -- tagged fixnums subtract directly
@@ -1478,10 +1522,13 @@
          (let ((vd (first operands))
                (va (second operands))
                (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-sub-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           ;; VR-PRESERVING (WS5): compute in the ECX/EDX scratch pair, not
+           ;; EAX — EAX is VR and may hold a live value the compiler reads
+           ;; again after this op (see the :or type-check note above).
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-sub-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-mul+)
          ;; (mul Vd Va Vb) -- tagged multiply
@@ -1492,12 +1539,13 @@
          (let ((vd (first operands))
                (va (second operands))
                (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-sar-reg-imm buf +i386-eax+ 1)   ; untag one operand
-           (i386-emit-imul-reg-reg buf +i386-eax+ +scratch0+)
+           ;; VR-PRESERVING (WS5): compute in the ECX/EDX scratch pair.
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)   ; untag one operand
+           (i386-emit-imul-reg-reg buf +scratch0+ +scratch1+)
            ;; Result is already correctly tagged (a * (b<<1) = (a*b)<<1)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-mul26lo+)
          ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
@@ -1602,26 +1650,49 @@
         ;; Bitwise Operations
         ;; ============================================
         ((op= +op-and+)
-         ;; IMPORTANT: Load vb FIRST — loading va into EAX clobbers VR.
+        ;; VR-PRESERVING FORM (WS5).  These used to compute in EAX, which is
+        ;; VR: that destroyed a live VR even when vd was a DIFFERENT vreg.
+        ;; With only 8 registers the compiler routinely keeps an operand in VR
+        ;; across the type-check ALU op that precedes generic arithmetic, so
+        ;; `(+ a b)` open-coded as `:or tmp,a,b / :test tmp,1 / :add d,a,b`
+        ;; read back the OR'd value as `a` and computed (a|b)+b.  Symptom: a
+        ;; loop counter advancing by 2.  Compute in the scratch pair (ECX/EDX)
+        ;; and let i386-store-vreg touch EAX only when vd really is VR.
          (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-and-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-and-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-or+)
+        ;; VR-PRESERVING FORM (WS5).  These used to compute in EAX, which is
+        ;; VR: that destroyed a live VR even when vd was a DIFFERENT vreg.
+        ;; With only 8 registers the compiler routinely keeps an operand in VR
+        ;; across the type-check ALU op that precedes generic arithmetic, so
+        ;; `(+ a b)` open-coded as `:or tmp,a,b / :test tmp,1 / :add d,a,b`
+        ;; read back the OR'd value as `a` and computed (a|b)+b.  Symptom: a
+        ;; loop counter advancing by 2.  Compute in the scratch pair (ECX/EDX)
+        ;; and let i386-store-vreg touch EAX only when vd really is VR.
          (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-or-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-or-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-xor+)
+        ;; VR-PRESERVING FORM (WS5).  These used to compute in EAX, which is
+        ;; VR: that destroyed a live VR even when vd was a DIFFERENT vreg.
+        ;; With only 8 registers the compiler routinely keeps an operand in VR
+        ;; across the type-check ALU op that precedes generic arithmetic, so
+        ;; `(+ a b)` open-coded as `:or tmp,a,b / :test tmp,1 / :add d,a,b`
+        ;; read back the OR'd value as `a` and computed (a|b)+b.  Symptom: a
+        ;; loop counter advancing by 2.  Compute in the scratch pair (ECX/EDX)
+        ;; and let i386-store-vreg touch EAX only when vd really is VR.
          (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-xor-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-xor-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-shl+)
          (let ((vd (first operands)) (vs (second operands)) (amt (third operands)))
@@ -1678,18 +1749,27 @@
         ;; ============================================
         ((op= +op-cmp+)
          ;; (cmp Va Vb) -- sets CPU flags
-         ;; IMPORTANT: Load vb FIRST — loading va into EAX clobbers VR.
+         ;; VR-PRESERVING (WS5): this opcode has NO destination, so it must
+         ;; not touch EAX at all — EAX is VR, and the compiler keeps a live
+         ;; operand there across the type-check `:or / :test` pair that
+         ;; precedes open-coded generic arithmetic.  Clobbering it made
+         ;; `(+ a b)` compute (a|b)+b.  Use the ECX/EDX scratch pair.
          (let ((va (first operands)) (vb (second operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-cmp-reg-reg buf +i386-eax+ +scratch0+)))
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)))
 
         ((op= +op-test+)
          ;; (test Va Vb) -- AND, sets flags, discards result
+         ;; VR-PRESERVING (WS5): this opcode has NO destination, so it must
+         ;; not touch EAX at all — EAX is VR, and the compiler keeps a live
+         ;; operand there across the type-check `:or / :test` pair that
+         ;; precedes open-coded generic arithmetic.  Clobbering it made
+         ;; `(+ a b)` compute (a|b)+b.  Use the ECX/EDX scratch pair.
          (let ((va (first operands)) (vb (second operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-test-reg-reg buf +i386-eax+ +scratch0+)))
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-test-reg-reg buf +scratch0+ +scratch1+)))
 
         ;; ============================================
         ;; Branches
@@ -1745,8 +1825,9 @@
                 (off (second operands))
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-cmp-reg-abs buf +i386-eax+ *vn-addr*)
+           ;; VR-PRESERVING (WS5): no destination — must not clobber EAX/VR.
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
            (i386-emit-jcc buf :e label)))
 
         ((op= +op-bnnull+)
@@ -1755,8 +1836,9 @@
                 (off (second operands))
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-cmp-reg-abs buf +i386-eax+ *vn-addr*)
+           ;; VR-PRESERVING (WS5): no destination — must not clobber EAX/VR.
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
            (i386-emit-jcc buf :ne label)))
 
         ;; ============================================
@@ -2484,17 +2566,23 @@
         ;; not disturb EFLAGS, so a following :bvs still sees OF.
         ((op= +op-adds+)
          (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-add-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           ;; VR-PRESERVING (WS5): compute in the ECX/EDX scratch pair, not
+           ;; EAX — EAX is VR and may hold a live value the compiler reads
+           ;; again after this op (see the :or type-check note above).
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-subs+)
          (let ((vd (first operands)) (va (second operands)) (vb (third operands)))
-           (i386-load-vreg buf +scratch0+ vb)
-           (i386-load-vreg buf +i386-eax+ va)
-           (i386-emit-sub-reg-reg buf +i386-eax+ +scratch0+)
-           (i386-store-vreg buf vd +i386-eax+)))
+           ;; VR-PRESERVING (WS5): compute in the ECX/EDX scratch pair, not
+           ;; EAX — EAX is VR and may hold a live value the compiler reads
+           ;; again after this op (see the :or type-check note above).
+           (i386-load-vreg buf +scratch1+ vb)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-sub-reg-reg buf +scratch0+ +scratch1+)
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-bvs+)
          (let* ((off (first operands))
@@ -2520,10 +2608,11 @@
                 (kind (cond ((op= +op-add-checked+) :add)
                             ((op= +op-sub-checked+) :sub)
                             (t :mul)))
-                (gen-label (ecase kind
-                             (:add *i386-genadd-label*)
-                             (:sub *i386-gensub-label*)
-                             (:mul *i386-genmul-label*))))
+                (gen-label (and *i386-checked-arith-slowpath*
+                                (ecase kind
+                                  (:add *i386-genadd-label*)
+                                  (:sub *i386-gensub-label*)
+                                  (:mul *i386-genmul-label*)))))
            ;; ---- fast path (result in EDX) ----
            (i386-load-vreg buf +scratch0+ vb)               ; ECX = vb
            (i386-load-vreg buf +scratch1+ va)               ; EDX = va
@@ -2569,8 +2658,26 @@
         ;; Unknown Opcode
         ;; ============================================
         (t
-         ;; Emit trap for unrecognised MVM instructions
+         ;; Emit trap for unrecognised MVM instructions.
+         ;; WS5: also RECORD it.  A silent INT3 is the single most expensive
+         ;; failure mode when bringing a new target up — the image builds
+         ;; clean and then dies at an address with no explanation.  The
+         ;; counter table lets a build script print exactly which opcodes are
+         ;; still missing before anything is ever run.
+         (when *i386-record-unimpl*
+           (let ((tbl (or *i386-unimpl-ops*
+                          (setf *i386-unimpl-ops* (make-hash-table :test 'eql)))))
+             (incf (gethash opcode tbl 0))))
          (i386-emit-int3 buf))))))
+
+(defun i386-unimplemented-report ()
+  "Return an alist of (opcode-number . emit-count) for every MVM opcode that
+   fell through to the INT3 default during the last translation, sorted by
+   count.  See *i386-record-unimpl*."
+  (let ((acc nil))
+    (when *i386-unimpl-ops*
+      (maphash (lambda (k v) (push (cons k v) acc)) *i386-unimpl-ops*))
+    (sort acc #'> :key #'cdr)))
 
 ;;; ============================================================
 ;;; Branch Target Scanning (Pass 1)

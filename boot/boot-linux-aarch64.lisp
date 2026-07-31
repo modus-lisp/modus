@@ -336,6 +336,22 @@
   ;; case by case but kept needing fresh patches; this fixes the root.
   (emit-aarch64-load-imm64 buf 26 #xDEAD0001)
 
+  ;; NATIVE MCGC: reserve x28 = the GC trampoline's absolute VA, loaded once
+  ;; at boot, so every gc-check fire site is a single range-unlimited
+  ;; `BLR x28` (BL's +/-128MB imm26 reach can't hit a tail trampoline across
+  ;; the ~200MB ANSI-gate image).  MOVZ x28,#lo16 + MOVK x28,#hi16,LSL#16 —
+  ;; patched post-link by cross.lisp::apply-aarch64-x28-trampoline-patch, which
+  ;; reads *aarch64-x28-load-patch-offset* (the raw-bytes byte position we
+  ;; record here) and writes the trampoline label's VA (< 2^32 for a ~200MB
+  ;; image, so two MOV instructions suffice).  When native MCGC is off x28 is
+  ;; free scratch (the Lisp collector uses BL) and we emit nothing here so the
+  ;; boot stub stays byte-identical.
+  (when modus.mvm::*aarch64-gc-native-mcgc*
+    (setf modus.mvm::*aarch64-x28-load-patch-offset*
+          (* (modus.mvm::a64-buffer-position buf) 4))
+    (modus.mvm::a64-movz buf modus.mvm::+a64-x28+ 0 0)   ; placeholder (lo16)
+    (modus.mvm::a64-movk buf modus.mvm::+a64-x28+ 0 1))  ; placeholder (hi16 lsl 16)
+
   ;; x29 (FP) = SP
   (emit-aarch64-u32 buf #x910003FD))
 

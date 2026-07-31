@@ -221,6 +221,30 @@
    (%val->word fn — a value load keeps the +tag-function+ tag, NOT word-3).
    Nil at image build → whole-image codegen unchanged.")
 
+(defvar *aarch64-force-absolute-inmodule-calls* nil
+  "WS4-AA64 long-range calls: when non-nil, the +op-call+ label case emits an
+   ABSOLUTE call (MOVZ/MOVK x16, target-VA; BLR x16) with a build-time patch
+   instead of a range-limited `BL label`.  Absolute calls have UNLIMITED reach,
+   so a baked image larger than BL's +/-128MB horizon (the ~200MB GC-on ANSI
+   gate) links with no branch-range overflow, no veneer islands, and no
+   offset-shift fixpoint.  ONLY set by the ANSI-gate build (build-aarch64-
+   linux.lisp); OFF everywhere else (CLI, bare-metal, x64) so their in-module
+   calls stay `BL` and their output is byte-identical.  BLR (not BR) preserves
+   the call/return contract: BLR sets x30 exactly as BL did, and the target VA
+   is a raw code address (no +tag-function+ — this is a direct control-transfer,
+   not a functionp-visible value load).  The gate is a test tool, so the ~4-
+   words-per-call size cost is irrelevant.")
+
+(defvar *aarch64-inmodule-call-patches* nil
+  "Companion to *aarch64-force-absolute-inmodule-calls*: list of
+   (movz-abs-word-index . target-label-id) recorded at each absolute in-module
+   call site.  cross.lisp::apply-aarch64-inmodule-call-patches resolves each
+   label to its final word-index, computes the raw target VA (base-va +
+   4*label-word), and writes it into the 4 MOVZ/MOVK imm16 fields at
+   movz-abs-word-index.  The index is an ABSOLUTE unified-buffer word-index
+   (buffer word W → raw byte 4W → VA base+4W), so no translated-start
+   bookkeeping is needed.  Nil between builds and when the flag is off.")
+
 (defvar *aarch64-gc-bitmap-enabled* nil
   "WS4-AA64 #160: when non-nil, every heap ALLOCATION opcode emits an inline
    object-start-bit SET for the object it creates (raw base in x24, pre-bump).
@@ -292,6 +316,18 @@
 
 (defvar *aarch64-code-end-patch-offset* nil
   "Companion to *aarch64-code-base-patch-offset* for code_end.")
+
+(defvar *aarch64-x28-load-patch-offset* nil
+  "Byte offset (in raw-bytes, pre-ELF-wrap) of the MOVZ that loads the
+   native-MCGC trampoline VA into x28 in emit-linux-aarch64-entry.  Only
+   emitted when *aarch64-gc-native-mcgc* is set: the boot stub materialises
+   the trampoline's absolute VA into the reserved call register x28 so each
+   gc-check fire site is a single range-unlimited `BLR x28` (the ~200MB gate
+   image overflows BL's +/-128MB imm26 reach to a tail trampoline).  Patched
+   at link time by cross.lisp::apply-aarch64-x28-trampoline-patch once the
+   trampoline label's word-index is known — MOVZ at offset (lo16), MOVK at
+   offset+4 (hi16 lsl 16), no function tag (BLR takes a raw address).  Nil
+   between builds and when native MCGC is off.")
 
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
@@ -427,6 +463,33 @@
    LABEL-ID is the target, TYPE is :b/:bcond/:bl."
   (push (list index label-id type) (a64-buffer-fixups buf)))
 
+(defun a64-emit-call-label (buf label-id &optional tail)
+  "Emit a control transfer to LABEL-ID.  TAIL nil = CALL (sets x30 for
+   return: BL / BLR); TAIL t = TAIL JUMP (preserves the caller's x30 so the
+   callee returns past us: B / BR).  Default: range-limited `BL`/`B` fixup.
+   Under *aarch64-force-absolute-inmodule-calls* (the gate long-range mode):
+   absolute MOVZ/MOVK x16, target-VA; BLR/BR x16 — UNLIMITED reach, so a
+   >128MB baked image reaches any tail-emitted target (handler-push/pop
+   helpers, generic-arith helpers) and any cross-function callee/tailcall
+   with no branch horizon and no veneer islands.  BLR/BR match BL/B's x30
+   contract; the loaded VA is a raw code address (no +tag-function+ —
+   direct control transfer, not a value load).  x16 is ABI scratch (never a
+   live vreg across a call/tailcall).  Build-time patched via
+   *aarch64-inmodule-call-patches* (movz-abs-word-index . label-id).  Flag
+   OFF (CLI/bare-metal/x64) → plain BL/B → byte-identical."
+  (if *aarch64-force-absolute-inmodule-calls*
+      (progn
+        (push (cons (a64-current-index buf) label-id)
+              *aarch64-inmodule-call-patches*)
+        (a64-movz buf +a64-x16+ 0 0)   ; placeholder VA[15:0]  LSL 0
+        (a64-movk buf +a64-x16+ 0 1)   ; placeholder VA[31:16] LSL 16
+        (a64-movk buf +a64-x16+ 0 2)   ; placeholder VA[47:32] LSL 32
+        (a64-movk buf +a64-x16+ 0 3)   ; placeholder VA[63:48] LSL 48
+        (if tail (a64-br buf +a64-x16+) (a64-blr buf +a64-x16+)))
+      (let ((idx (a64-current-index buf)))
+        (if tail (a64-b buf 0) (a64-bl buf 0))
+        (a64-add-fixup buf idx label-id (if tail :b :bl)))))
+
 (defun %a64-check-branch-range (type offset index)
   "Assert OFFSET (in 32-bit instruction units) fits the encoding range
    for the branch TYPE.  Without this each branch silently truncates
@@ -452,18 +515,81 @@
               index ~D — would silently truncate"
              type offset lo hi index))))
 
-(defun a64-resolve-fixups (buf)
+(defun %a64-branch-in-range-p (type offset)
+  "Non-erroring predicate mirror of %a64-check-branch-range: T iff OFFSET
+   (in 32-bit instruction units) fits TYPE's signed imm range."
+  (ecase type
+    ((:b :bl)      (<= (- (ash 1 25)) offset (1- (ash 1 25))))
+    ((:bcond :cbz) (<= (- (ash 1 18)) offset (1- (ash 1 18))))
+    (:adr          (<= (- (ash 1 18)) offset (1- (ash 1 18))))
+    (:tbz          (<= (- (ash 1 13)) offset (1- (ash 1 13))))))
+
+(defun %a64-emit-veneer (buf target-word base-va)
+  "Append a long-branch VENEER at the current buffer end and return its
+   start word-index.  The veneer is a range-extension island for an
+   out-of-range BL: it materialises the target's ABSOLUTE runtime VA into
+   x16 (IP0 — the ABI intra-procedure scratch, never a live vreg across a
+   call) and BR x16.  BR (not BLR) leaves the caller's BL-set x30 intact so
+   the callee returns to the original caller.  TARGET-WORD is the target's
+   word-index in BUF; BASE-VA is the runtime VA of buffer word 0
+   (declared-load-addr + image-load-offset + wrap-header), so the target VA
+   is BASE-VA + 4*TARGET-WORD.  MOVZ/MOVK give unlimited reach, so the
+   veneer can target anywhere; only the *caller→veneer* hop must fit BL's
+   +/-128MB (verified by the caller's range check after retargeting)."
+  (let ((veneer-idx (a64-buffer-position buf))
+        (target-va (+ base-va (* 4 target-word))))
+    (a64-load-imm64 buf +a64-x16+ target-va)   ; MOVZ/MOVK x16, target-va
+    (a64-br buf +a64-x16+)                       ; BR x16 (preserves x30)
+    veneer-idx))
+
+(defun a64-resolve-fixups (buf &optional veneer-base-va)
   "Resolve all branch fixups by patching instruction words.
    Each branch type's offset is range-checked before encoding so an
    out-of-range branch produces a build-time error instead of a
-   silently-truncated wild jump."
-  (let ((code (a64-buffer-code buf)))
+   silently-truncated wild jump.
+
+   LONG-BRANCH VENEERS (WS4-AA64): when VENEER-BASE-VA is supplied and a
+   :bl call's target is beyond BL's +/-128MB imm26 reach (only possible in
+   the >128MB baked ANSI-gate image), the call is redirected to a veneer
+   appended at the buffer end (MOVZ/MOVK x16,target-VA; BR x16 — see
+   %a64-emit-veneer).  Veneers are created ONLY for out-of-range calls, so
+   any sub-128MB image (CLI ~57MB, bare-metal ~84MB, x64) produces ZERO
+   veneers and is byte-identical to the pre-veneer output.  The scheme is
+   APPEND-ONLY: it never moves existing code, adds no new relative branches
+   (the veneer body is absolute/register), so it converges in a single pass
+   with no offset-shift oscillation — the classic linker range-extension
+   fixpoint collapses to one iteration here.  Distinct targets share one
+   veneer (dedup by target label).  A retargeted call whose veneer is still
+   out of reach (an early-caller→late-target that the end island can't
+   cover) surfaces as a precise range error rather than a silent truncation."
+  (let ((code (a64-buffer-code buf))
+        ;; target-label -> veneer start word-index (append-only dedup cache)
+        (veneer-cache (and veneer-base-va (make-hash-table :test 'eql))))
+    ;; ---- Phase 1: create end-veneers for out-of-range :bl calls ----
+    ;; (Iterating the fixup list; appending veneers grows the buffer but
+    ;;  moves nothing already emitted, so one pass suffices.)
+    (when veneer-cache
+      (dolist (fixup (a64-buffer-fixups buf))
+        (destructuring-bind (index label-id type) fixup
+          (when (eq type :bl)
+            (let ((target (gethash label-id (a64-buffer-labels buf))))
+              (when (and target
+                         (not (%a64-branch-in-range-p :bl (- target index)))
+                         (not (gethash label-id veneer-cache)))
+                (setf (gethash label-id veneer-cache)
+                      (%a64-emit-veneer buf target veneer-base-va))))))))
+    ;; ---- Phase 2: encode every fixup (retargeting via veneer if needed) ----
     (dolist (fixup (a64-buffer-fixups buf))
       (destructuring-bind (index label-id type) fixup
-        (let* ((target (gethash label-id (a64-buffer-labels buf))))
-          (unless target
+        (let* ((raw-target (gethash label-id (a64-buffer-labels buf))))
+          (unless raw-target
             (error "AArch64: undefined label ~D (fixup at index ~D, type ~A)" label-id index type))
-          (let ((offset (- target index)))
+          ;; Redirect an out-of-range :bl to its veneer (if one was made).
+          (let* ((veneer-idx (and veneer-cache (eq type :bl)
+                                  (not (%a64-branch-in-range-p :bl (- raw-target index)))
+                                  (gethash label-id veneer-cache)))
+                 (target (or veneer-idx raw-target))
+                 (offset (- target index)))
             (%a64-check-branch-range type offset index)
             (ecase type
               (:b
@@ -1983,10 +2109,10 @@
                   (a64-movz buf +a64-x16+ #xFFF0 0)
                   (a64-movk buf +a64-x16+ #x1000 1)
                   (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
-                  ;; BL handler_push (fixup resolved at end of unified emit)
-                  (let ((idx (a64-current-index buf)))
-                    (a64-bl buf 0)
-                    (a64-add-fixup buf idx *aarch64-handler-push-label* :bl))
+                  ;; Call handler_push (BL, or absolute under the gate long-range
+                  ;; flag — the helper is tail-emitted, out of BL reach in the
+                  ;; >128MB image).  x16 is dead here (x30 already stored above).
+                  (a64-emit-call-label buf *aarch64-handler-push-label*)
                   ;; restore caller x30
                   (a64-movz buf +a64-x16+ #xFFF0 0)
                   (a64-movk buf +a64-x16+ #x1000 1)
@@ -2050,9 +2176,9 @@
                    ;; with outer (or zeros if depth==0).  No need to
                    ;; preserve x30 here: we BR to scratch-IP at the end
                    ;; rather than returning.
-                   (let ((idx (a64-current-index buf)))
-                     (a64-bl buf 0)
-                     (a64-add-fixup buf idx *aarch64-handler-pop-label* :bl))
+                   ;; Call handler_pop (BL, or absolute under the gate long-range
+                   ;; flag — helper is tail-emitted, out of BL reach at >128MB).
+                   (a64-emit-call-label buf *aarch64-handler-pop-label*)
                    ;; Restore inner SP/FP/IP from scratch.
                    (a64-load-imm64 buf +a64-x17+ #x10000C10)
                    (a64-ldr-unsigned buf +a64-x16+ +a64-x17+ 0)
@@ -2089,9 +2215,9 @@
                    (a64-movz buf +a64-x16+ #xFFF0 0)
                    (a64-movk buf +a64-x16+ #x1000 1)
                    (a64-str-unsigned buf +a64-x30+ +a64-x16+ 0)
-                   (let ((idx (a64-current-index buf)))
-                     (a64-bl buf 0)
-                     (a64-add-fixup buf idx *aarch64-handler-pop-label* :bl))
+                   ;; Call handler_pop (BL, or absolute under the gate long-range
+                   ;; flag — helper is tail-emitted, out of BL reach at >128MB).
+                   (a64-emit-call-label buf *aarch64-handler-pop-label*)
                    (a64-movz buf +a64-x16+ #xFFF0 0)
                    (a64-movk buf +a64-x16+ #x1000 1)
                    (a64-ldr-unsigned buf +a64-x30+ +a64-x16+ 0))
@@ -3435,10 +3561,11 @@
            (let* ((target-offset (vr 0))
                   (label (gethash target-offset mvm-to-native-label)))
              (cond
+               ;; In-module call: `BL label` (or absolute MOVZ/MOVK x16,VA;
+               ;; BLR x16 under the gate long-range flag — unlimited reach for
+               ;; the >128MB image).  See a64-emit-call-label.
                (label
-                (let ((idx (a64-current-index buf)))
-                  (a64-bl buf 0)  ; placeholder
-                  (a64-add-fixup buf idx label :bl)))
+                (a64-emit-call-label buf label))
                ;; WS4 aarch64 Stage 3: a JIT out-of-module call (synthetic
                ;; runtime offset).  Emit a RELOCATABLE absolute call — a
                ;; MOVZ/MOVK quad loads the callee's real native address into
@@ -3536,9 +3663,12 @@
                (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
                (a64-ldp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
                (a64-ldp-post buf +a64-x29+ +a64-x30+ +a64-sp+ 80)
-               (let ((idx (a64-current-index buf)))
-                 (a64-b buf 0)
-                 (a64-add-fixup buf idx label :b)))))
+               ;; TAIL JUMP to the target (B, or absolute BR under the gate
+               ;; long-range flag — a cross-function tailcall can exceed B's
+               ;; +/-128MB reach in the >128MB image; x30 already restored so
+               ;; the callee returns to OUR caller).  x16 is dead after the
+               ;; frame restore; args stay in x0-x3.
+               (a64-emit-call-label buf label t))))
 
           ;; ---- ALLOC-CONS Vd ----
           ;; Bump-allocate 16 bytes, return untagged pointer in Vd
@@ -3585,9 +3715,19 @@
                   (let ((idx (a64-current-index buf)))
                     (a64-bcond buf cc 0)
                     (a64-add-fixup buf idx skip-label :bcond))
-                  (let ((idx (a64-current-index buf)))
-                    (a64-bl buf 0)
-                    (a64-add-fixup buf idx *aarch64-gc-trampoline-label* :bl))
+                  ;; NATIVE MCGC: call via reserved x28 (= trampoline VA, loaded
+                  ;; once at boot) — range-unlimited, so the huge ANSI-gate image
+                  ;; (~200MB) reaches the tail trampoline (a single BL is ±128MB
+                  ;; and overflows there).  ZERO code-size bloat: BLR x28 is one
+                  ;; instruction, same as the BL it replaces, and this is the
+                  ;; COLD path (only when x24>=x25).  The Lisp-collector
+                  ;; (bytecode-offset) path keeps the short-range BL — its x28 is
+                  ;; NOT loaded, so BLR would be wrong, and its image fits ±128MB.
+                  (if *aarch64-gc-native-mcgc*
+                      (a64-blr buf +a64-x28+)
+                      (let ((idx (a64-current-index buf)))
+                        (a64-bl buf 0)
+                        (a64-add-fixup buf idx *aarch64-gc-trampoline-label* :bl)))
                   (a64-set-label buf skip-label)))
                (t
                 (a64-bcond buf cc 2)
@@ -4407,6 +4547,11 @@
     (a64-str-unsigned buf +a64-x27+ +a64-sp+ 200)
     (a64-str-unsigned buf +a64-x29+ +a64-sp+ 208)
     (a64-str-unsigned buf +a64-x30+ +a64-sp+ 216)
+    ;; Preserve the caller's x28 (= trampoline VA, the reserved gc-check call
+    ;; register) in free frame slot 224 — the collector reuses x28 as the
+    ;; object-start bitmap base below, so it MUST be restored before RET or the
+    ;; next gc-check's BLR x28 would jump to the bitmap base.
+    (a64-str-unsigned buf +a64-x28+ +a64-sp+ 224)
     ;; load GC metadata (all stored <<1 → ASR #1 to raw)
     (flet ((load-asr (rd addr) (a64-load-imm64 buf +a64-x16+ addr)
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1)))
@@ -4605,6 +4750,7 @@
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0) (a64-add-imm buf +a64-x9+ +a64-x9+ 2)
     (a64-str-unsigned buf +a64-x9+ +a64-x16+ 0)
     ;; ---- restore mutator regs + RET ----
+    (a64-ldr-unsigned buf +a64-x28+ +a64-sp+ 224)   ; restore trampoline VA into x28
     (a64-ldr-unsigned buf +a64-x30+ +a64-sp+ 216)
     (a64-ldr-unsigned buf +a64-x29+ +a64-sp+ 208)
     (a64-ldr-unsigned buf +a64-x27+ +a64-sp+ 200)
@@ -5053,6 +5199,7 @@
   ;; after image assembly; see *aarch64-fn-addr-patches* docstring.
   (setf *aarch64-fn-addr-patches* nil)
   (setf *aarch64-li-const-patches* nil)
+  (setf *aarch64-inmodule-call-patches* nil)
   (let* ((buf (make-a64-buffer))
          (func-offsets (make-hash-table :test 'eql))
          (mvm-to-native-label (make-hash-table :test 'equal))

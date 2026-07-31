@@ -797,13 +797,21 @@
                ;; Phase A: emit boot preamble into the unified buffer first.
                (let ((entry-fn (getf boot-descriptor :entry-fn)))
                  (when entry-fn (funcall entry-fn aarch64-unified-buf)))
-               ;; Phase B: remember the position before the B placeholder.
-               ;; We emit one instruction-word as a placeholder; assemble's
-               ;; final byte concat skips re-emitting JMP/B for AArch64
-               ;; unified (the B is inside our unified bytes already).
+               ;; Phase B: remember the position before the entry-jump
+               ;; placeholder.  Normally ONE word (a B to kernel-main, patched
+               ;; below).  Under the gate long-range flag the image exceeds B's
+               ;; +/-128MB reach and kernel-main sits ~200MB away, so we instead
+               ;; reserve THREE words (MOVZ/MOVK x16, km-VA; BR x16 — absolute,
+               ;; unlimited reach), patched below.  x16 is dead at the entry.
+               ;; Sub-128MB images keep the 1-word B → byte-identical.
                (setf aarch64-boot-end-instr
                      (modus.mvm::a64-buffer-position aarch64-unified-buf))
-               (modus.mvm::a64-emit aarch64-unified-buf 0)  ; placeholder B
+               (if modus.mvm::*aarch64-force-absolute-inmodule-calls*
+                   (progn
+                     (modus.mvm::a64-movz aarch64-unified-buf modus.mvm::+a64-x16+ 0 0)
+                     (modus.mvm::a64-movk aarch64-unified-buf modus.mvm::+a64-x16+ 0 1)
+                     (modus.mvm::a64-br   aarch64-unified-buf modus.mvm::+a64-x16+))
+                   (modus.mvm::a64-emit aarch64-unified-buf 0))  ; placeholder B
                ;; Phase C: translate into the same buffer.
                (translate-module-to-native module target
                                            :into-buf aarch64-unified-buf)))
@@ -850,23 +858,58 @@
     ;; the explicit JMP emission since our B is already inside boot-code).
     (when aarch64-unified-p
       (let* ((b-instr-idx aarch64-boot-end-instr)
+             ;; Entry-jump placeholder is 3 words (MOVZ/MOVK/BR) under the gate
+             ;; long-range flag, else 1 word (B).
+             (entry-jump-words
+              (if modus.mvm::*aarch64-force-absolute-inmodule-calls* 3 1))
              ;; kernel-image-entry-point is kernel-main's offset in BYTES
              ;; within the translated region (Phase 2a kept it relative).
              (km-byte-offset (or (kernel-image-entry-point image) 0))
-             ;; Translated region starts immediately after B (1 instruction).
-             (km-instr-idx (+ b-instr-idx 1 (/ km-byte-offset 4)))
-             ;; AArch64 B imm26 = target_pc - current_pc, in instruction units.
-             (b-imm26 (- km-instr-idx b-instr-idx))
-             (b-insn (logior #x14000000 (logand b-imm26 #x3FFFFFF))))
-        ;; Patch the placeholder B with the real instruction.
-        (setf (aref (modus.mvm::a64-buffer-code aarch64-unified-buf) b-instr-idx)
-              b-insn)
-        ;; Resolve all fixups across boot + native + helpers.
-        (modus.mvm::a64-resolve-fixups aarch64-unified-buf)
-        ;; Extract bytes and split.  boot-code-bytes includes the patched
-        ;; B at its tail; native-code-bytes starts at the byte right after.
+             ;; Translated region starts immediately after the entry jump.
+             (km-instr-idx (+ b-instr-idx entry-jump-words (/ km-byte-offset 4))))
+        (if modus.mvm::*aarch64-force-absolute-inmodule-calls*
+            ;; ABSOLUTE entry jump: patch MOVZ x16,#lo (b-instr-idx) + MOVK
+            ;; x16,#hi (b-instr-idx+1) with kernel-main's runtime VA (BR x16 at
+            ;; b-instr-idx+2 is fixed).  Unlimited reach — no imm26 horizon.
+            (let* ((declared (or (getf boot-descriptor :load-addr) 0))
+                   (wrap (wrap-header-size-for-boot boot-descriptor))
+                   (km-va (+ declared wrap (* 4 km-instr-idx)))
+                   (code (modus.mvm::a64-buffer-code aarch64-unified-buf)))
+              (setf (aref code b-instr-idx)
+                    (logior (aref code b-instr-idx)
+                            (ash (logand km-va #xFFFF) 5)))
+              (setf (aref code (+ b-instr-idx 1))
+                    (logior (aref code (+ b-instr-idx 1))
+                            (ash (logand (ash km-va -16) #xFFFF) 5))))
+            ;; Short B: imm26 = target_pc - current_pc (instruction units).
+            (let ((b-insn (logior #x14000000
+                                  (logand (- km-instr-idx b-instr-idx) #x3FFFFFF))))
+              (setf (aref (modus.mvm::a64-buffer-code aarch64-unified-buf) b-instr-idx)
+                    b-insn)))
+        ;; Resolve all fixups across boot + native + helpers.  Pass the
+        ;; runtime VA of buffer word 0 so a64-resolve-fixups can build
+        ;; long-branch veneers for any :bl call that exceeds BL's +/-128MB
+        ;; reach (the >128MB baked GC-on gate).  base-va = declared-load-addr
+        ;; + image-load-offset + wrap-header — identical to the fn-addr /
+        ;; code-bounds VA formula; the unified buffer's byte layout IS
+        ;; raw-bytes (boot stub at word 0), so target word W → VA base+4W.
+        ;; Sub-128MB images (CLI/bare-metal) create zero veneers → byte-
+        ;; identical output; passing base-va is harmless there.
+        (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
+               (arch (getf boot-descriptor :arch))
+               (elf-fmt (getf boot-descriptor :elf-format))
+               (image-load-offset
+                (if (and (member arch '(:aarch64 :rpi))
+                         (not (eq elf-fmt :linux-aarch64)))
+                    #x80000 0))
+               (wrap-header (wrap-header-size-for-boot boot-descriptor))
+               (veneer-base-va (+ declared-load-addr image-load-offset wrap-header)))
+          (modus.mvm::a64-resolve-fixups aarch64-unified-buf veneer-base-va))
+        ;; Extract bytes and split.  boot-code includes the entry jump (1 word
+        ;; B, or 3 words MOVZ/MOVK/BR under the long-range flag) at its tail;
+        ;; native-code starts at the byte right after.
         (let* ((all-bytes (modus.mvm::a64-buffer-to-bytes aarch64-unified-buf))
-               (boot-end-bytes (* (+ b-instr-idx 1) 4)))
+               (boot-end-bytes (* (+ b-instr-idx entry-jump-words) 4)))
           (setf (kernel-image-boot-code image)
                 (subseq all-bytes 0 boot-end-bytes))
           (setf native-code (subseq all-bytes boot-end-bytes))
@@ -1014,6 +1057,80 @@
         ;; raw fn-addrs correctly.  See translate-aarch64.lisp's
         ;; emit-aarch64-code-bounds-init.
         (apply-aarch64-code-bounds-patches raw-bytes image boot-descriptor)
+        ;; AArch64 native-MCGC x28-trampoline patch: emit-linux-aarch64-entry
+        ;; left a MOVZ+MOVK placeholder pair loading the GC trampoline's VA into
+        ;; the reserved gc-check call register x28 (so each fire site is a single
+        ;; range-unlimited `BLR x28`).  Now that a64-resolve-fixups has run and
+        ;; the trampoline label's word-index is known, fill it in.  The unified
+        ;; a64-buffer's byte layout IS raw-bytes (boot stub at the front), so the
+        ;; label word-index * 4 is the absolute raw-bytes byte position, and its
+        ;; runtime VA = load-addr + wrap-header + label-word*4 (no function tag —
+        ;; BLR takes a raw address).  See *aarch64-x28-load-patch-offset*.
+        (when (and (boundp '*aarch64-gc-native-mcgc*) *aarch64-gc-native-mcgc*
+                   (boundp '*aarch64-x28-load-patch-offset*)
+                   *aarch64-x28-load-patch-offset*
+                   aarch64-unified-buf aarch64-gc-label boot-descriptor)
+          (let ((label-word (gethash aarch64-gc-label
+                                     (a64-buffer-labels aarch64-unified-buf))))
+            (unless label-word
+              (error "x28-trampoline-patch: GC trampoline label ~A unresolved"
+                     aarch64-gc-label))
+            (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
+                   (arch (getf boot-descriptor :arch))
+                   (elf-fmt (getf boot-descriptor :elf-format))
+                   (image-load-offset
+                    (if (and (member arch '(:aarch64 :rpi))
+                             (not (eq elf-fmt :linux-aarch64)))
+                        #x80000 0))
+                   (wrap-header (wrap-header-size-for-boot boot-descriptor))
+                   (tramp-va (+ declared-load-addr image-load-offset
+                                wrap-header (* label-word 4)))
+                   (off *aarch64-x28-load-patch-offset*))
+              (patch-aarch64-mov-imm16 raw-bytes off
+                                       (logand tramp-va #xFFFF))
+              (patch-aarch64-mov-imm16 raw-bytes (+ off 4)
+                                       (logand (ash tramp-va -16) #xFFFF))
+              ;; Reset for next build.
+              (setf *aarch64-x28-load-patch-offset* nil))))
+        ;; AArch64 absolute in-module call patches (gate long-range): each
+        ;; +op-call+ site that emitted MOVZ/MOVK x16,VA; BLR x16 under
+        ;; *aarch64-force-absolute-inmodule-calls* recorded (movz-abs-word-index
+        ;; . target-label).  Resolve the label to its final word-index and write
+        ;; the raw target VA (base-va + 4*label-word — no function tag; BLR takes
+        ;; a raw code address) into the 4 MOVZ/MOVK imm16 fields.  The unified
+        ;; buffer's byte layout IS raw-bytes, so movz-abs-word-index*4 is the
+        ;; MOVZ's byte position and label-word*4 is the target's image offset.
+        (when (and (boundp '*aarch64-inmodule-call-patches*)
+                   *aarch64-inmodule-call-patches*
+                   aarch64-unified-buf boot-descriptor)
+          (let* ((declared-load-addr (or (getf boot-descriptor :load-addr) 0))
+                 (arch (getf boot-descriptor :arch))
+                 (elf-fmt (getf boot-descriptor :elf-format))
+                 (image-load-offset
+                  (if (and (member arch '(:aarch64 :rpi))
+                           (not (eq elf-fmt :linux-aarch64)))
+                      #x80000 0))
+                 (wrap-header (wrap-header-size-for-boot boot-descriptor))
+                 (base-va (+ declared-load-addr image-load-offset wrap-header))
+                 (labels (a64-buffer-labels aarch64-unified-buf)))
+            (dolist (patch *aarch64-inmodule-call-patches*)
+              (let* ((movz-word (car patch))
+                     (label-id (cdr patch))
+                     (label-word (gethash label-id labels)))
+                (unless label-word
+                  (error "inmodule-call-patch: label ~A unresolved" label-id))
+                (let ((target-va (+ base-va (* 4 label-word)))
+                      (pos (* 4 movz-word)))
+                  (patch-aarch64-mov-imm16 raw-bytes pos
+                                           (logand target-va #xFFFF))
+                  (patch-aarch64-mov-imm16 raw-bytes (+ pos 4)
+                                           (logand (ash target-va -16) #xFFFF))
+                  (patch-aarch64-mov-imm16 raw-bytes (+ pos 8)
+                                           (logand (ash target-va -32) #xFFFF))
+                  (patch-aarch64-mov-imm16 raw-bytes (+ pos 12)
+                                           (logand (ash target-va -48) #xFFFF)))))
+            ;; Reset for next build.
+            (setf *aarch64-inmodule-call-patches* nil)))
         ;; UEFI: patch stub with kernel data offset/size, then wrap in PE32+
         (when (and boot-descriptor (getf boot-descriptor :uefi))
           (patch-uefi-stub raw-bytes

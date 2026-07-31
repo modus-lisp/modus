@@ -503,6 +503,8 @@
     ((eq (getf boot-descriptor :elf-format) :linux-x64) 120)
     ;; Linux AArch64 ELF64: same 64+56 layout as x64.
     ((eq (getf boot-descriptor :elf-format) :linux-aarch64) 120)
+    ;; Linux i386 ELF32: ELF header (52) + 1 program header (32) = 84.
+    ((eq (getf boot-descriptor :elf-format) :linux-i386) 84)
     ;; UEFI PE wrap: complex, no LI-CONST support yet
     ((getf boot-descriptor :uefi) 0)
     ;; Generic ELF32-be / ELF64-be wraps
@@ -1164,6 +1166,11 @@
                                        (or (kernel-image-native-image-offset image) 0)
                                        :native-code-length
                                        (length (kernel-image-native-code image))))
+                    ((eq (getf boot-descriptor :elf-format) :linux-i386)
+                     (wrap-in-elf32-le-i386
+                       raw-bytes
+                       (or (getf boot-descriptor :load-addr) #x08048000)
+                       :bss-end (getf boot-descriptor :bss-end)))
                     ((eq (getf boot-descriptor :elf-format) :linux-aarch64)
                      (wrap-in-elf64-le-aa64 raw-bytes
                                             (or (getf boot-descriptor :load-addr) #x400000)
@@ -1202,11 +1209,13 @@
                         #x400000))
          ;; ehdr+phdr for the ELF wrapper.  For non-ELF targets this is 0;
          ;; the image-byte 0 already lives at the load address.
-         (elf-header (if (and boot-descriptor
-                              (or (eq (getf boot-descriptor :elf-format) :linux-x64)
-                                  (eq (getf boot-descriptor :elf-format) :linux-aarch64)))
-                         120
-                         0))
+         (elf-header (cond
+                       ((null boot-descriptor) 0)
+                       ((member (getf boot-descriptor :elf-format)
+                                '(:linux-x64 :linux-aarch64))
+                        120)
+                       ((eq (getf boot-descriptor :elf-format) :linux-i386) 84)
+                       (t 0)))
          (nio (or (kernel-image-native-image-offset image) 0))
          (ncl (length (kernel-image-native-code image)))
          (sorted (stable-sort (copy-list function-table)
@@ -1242,6 +1251,7 @@
     (:uefi-x64 :x86-64)
     (:linux-x64 :x86-64)
     (:linux-aarch64 :aarch64)
+    (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
     (otherwise target)))
@@ -1316,6 +1326,7 @@
     (:uefi-x64 (uefi-x64-boot-descriptor))
     (:linux-x64 (linux-x64-boot-descriptor))
     (:linux-aarch64 (linux-aarch64-boot-descriptor))
+    (:linux-i386 (linux-i386-boot-descriptor))
     (:x64-console (x64-console-boot-descriptor))
     (:i386-console (i386-console-boot-descriptor))
     (otherwise nil)))

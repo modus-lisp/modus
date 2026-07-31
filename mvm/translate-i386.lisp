@@ -259,6 +259,12 @@
    the alignment holds at the RUNTIME virtual address, not merely at the
    buffer offset.  Required whenever *i386-fn-tag-3* is on.")
 
+(defparameter *i386-linux-mode* nil
+  "When true, the target is a HOSTED Linux/i386 ELF rather than bare metal:
+   the serial-I/O traps become write(2) syscalls and the Linux syscall traps
+   (#x0500 exit, #x0502 syscall3, #x0503 syscall3-raw) are emitted.
+   Counterpart of *x64-linux-mode*.")
+
 (defparameter *i386-native-code-offset* 0
   "Virtual-address offset of native-code byte 0 within the final image.
    Only used to make *i386-fn-align* padding correct; mirrors
@@ -931,6 +937,66 @@
              ((< code #x0300)
               ;; Frame-alloc (#x100+N) and frame-free (#x200+N): NOP
               nil)
+             ((and (= code #x0300) *i386-linux-mode*)
+              ;; HOSTED LINUX: serial write becomes write(1, &byte, 1).
+              ;; V0 (ESI) holds the tagged char code.  i386 syscall ABI:
+              ;; eax=nr, ebx=fd, ecx=buf, edx=len, int 0x80.  EBX carries V4
+              ;; so it must be saved; ECX/EDX are translator scratch.
+              (i386-emit-byte buf #x53)                       ; push ebx
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xF0) ; mov eax, esi
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xF8) ; sar eax, 1
+              (i386-emit-byte buf #x50)                       ; push eax (byte buffer)
+              (i386-emit-byte buf #xBB) (i386-emit-u32 buf 1) ; mov ebx, 1 (stdout)
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xE1) ; mov ecx, esp
+              (i386-emit-byte buf #xBA) (i386-emit-u32 buf 1) ; mov edx, 1
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf 4) ; mov eax, 4 (SYS_write)
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80) ; int 0x80
+              (i386-emit-byte buf #x58)                       ; pop eax (discard buf)
+              (i386-emit-byte buf #x5B))                      ; pop ebx
+
+             ((and (= code #x0500) *i386-linux-mode*)
+              ;; SYS_exit(V0): eax=1, ebx=untagged code, int 0x80.  Does not
+              ;; return, so EBX need not be restored.
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xF3) ; mov ebx, esi
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xFB) ; sar ebx, 1
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf 1)     ; mov eax, 1
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)) ; int 0x80
+
+             ((and (= code #x0502) *i386-linux-mode*)
+              ;; Generic 3-arg Linux syscall (compile-syscall3 emits :trap #x0502).
+              ;;   sources: V0(ESI)=nr, V1(EDI)=a1, V2=[EBP-16], V3=[EBP-20]
+              ;;   i386 ABI: eax=nr, ebx=a1, ecx=a2, edx=a3, int 0x80
+              ;; All four are TAGGED fixnums and are untagged here; the result
+              ;; is re-tagged into V0 (ESI), matching translate-x64's #x0502.
+              ;; EBX holds V4 (callee-saved in this translator's own ABI) so it
+              ;; is stacked around the call.
+              (i386-emit-byte buf #x53)                          ; push ebx
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xF0) ; mov eax, esi
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xF8) ; sar eax, 1
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xFB) ; mov ebx, edi
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xFB) ; sar ebx, 1
+              (i386-emit-mov-reg-mem buf +i386-ecx+ +i386-ebp+ -16) ; V2
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xF9) ; sar ecx, 1
+              (i386-emit-mov-reg-mem buf +i386-edx+ +i386-ebp+ -20) ; V3
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xFA) ; sar edx, 1
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80) ; int 0x80
+              (i386-emit-byte buf #x01) (i386-emit-byte buf #xC0) ; add eax, eax (tag)
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC6) ; mov esi, eax
+              (i386-emit-byte buf #x5B))                          ; pop ebx
+
+             ((and (= code #x0503) *i386-linux-mode*)
+              ;; Raw 3-arg syscall: number is TAGGED, args 1-3 are RAW, and the
+              ;; result is RAW (not re-tagged).  Mirrors translate-x64 #x0503.
+              (i386-emit-byte buf #x53)                          ; push ebx
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xF0) ; mov eax, esi
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xF8) ; sar eax, 1
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xFB) ; mov ebx, edi (raw)
+              (i386-emit-mov-reg-mem buf +i386-ecx+ +i386-ebp+ -16)
+              (i386-emit-mov-reg-mem buf +i386-edx+ +i386-ebp+ -20)
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80) ; int 0x80
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC6) ; mov esi, eax
+              (i386-emit-byte buf #x5B))                          ; pop ebx
+
              ((= code #x0300)
               ;; Serial write: V0 (ESI) contains tagged fixnum char code
               ;; Poll TX ready: wait for LSR bit 5 (THR empty)

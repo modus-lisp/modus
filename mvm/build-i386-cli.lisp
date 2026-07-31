@@ -564,7 +564,7 @@
   ;; Throughput: SHA-256 over 64 KiB.  Digest printed so the run is verifiable
   ;; rather than merely timed.
   (sha256-init)
-  (let ((n 4096))
+  (let ((n 65536))
     (let ((m (make-array n)))
       (let ((i 0))
         (loop (when (>= i n) (return nil)) (aset m i (logand i 255)) (setq i (+ i 1))))

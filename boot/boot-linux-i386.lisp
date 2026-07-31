@@ -51,15 +51,60 @@
    cenv/mv-count), inside the demand-zeroed BSS.")
 
 (defconstant +linux-i386-heap-hint+   #x30000000)
-(defconstant +linux-i386-heap-size+   #x20000000)  ; 512 MB
+(defconstant +linux-i386-heap-size+   #x80000000)  ; 2 GB — see the ceiling note
 (defconstant +linux-i386-heap-alloc-start+ #x200
   "Offset from heap base to the first allocatable byte.  The low 512 bytes
    mirror argc/argv the way the 64-bit ports do.")
 
-(defparameter *linux-i386-vl-offset* #x1F000000
+(defparameter *linux-i386-vl-offset* #x5F000000
   "Offset from heap base for VL (the alloc limit).  With GC OFF this is set
    just short of the mapping end so :gc-check never fires; a GC-on build
-   lowers it to the semispace midpoint.")
+   would lower it to the semispace midpoint.
+
+   HARD CEILING AT 2^31, measured.  The arena top must stay below 2^31:
+   with the top at 0x9EFFD000 a 64 KiB SHA-256 COMPLETED but produced a WRONG
+   digest (heap addresses above 2^31 have the sign bit set and something in
+   the path does signed arithmetic on them); with the top at 0x5EFFD000 the
+   same run SIGSEGVs on arena exhaustion.  So this offset is set to keep the
+   top at 0x7EFFD000, just under 2^31 — the largest arena that is both safe
+   and useful.  Growing past it trades a crash for silent corruption, which
+   is strictly worse.
+
+   CONSEQUENCE: bumping the arena is NOT a general fallback for the missing
+   collector.  64 KiB of SHA-256 needs somewhere between 1 GB and 2 GB of
+   permanent allocation, which is already past what fits below 2^31.  Bulk
+   crypto on i386 genuinely REQUIRES a collector; the arena only buys the
+   small-input cases.
+
+   THE CEILING, stated because i386 HAS NO COLLECTOR (see the note below).
+   Every allocation is permanent, so this offset IS the total lifetime
+   allocation budget of the process — 2032 MiB.  When VA reaches VL the
+   :gc-check calls a collector that does not exist and the process dies on
+   `int $0x31`.  Raised from 496 MiB because SHA-256 over 64 KiB exhausted
+   that; see WS5 notes for the measured input-size ceiling.
+
+   WHY THERE IS NO COLLECTOR, and why wiring the existing Lisp-side
+   %GC-COLLECT is NOT a small job on i386.  gc.lisp reads its metadata with
+   (mem-ref addr :u64), and :u64 is RAW (needs-tag nil), so memory must hold
+   address<<1 for the Lisp value to be the address.  On a 30-bit tower:
+     heap base  0x1FFFD000   fits a fixnum, <<1 fits 32-bit signed   OK
+     VL         0x3EFFD000   fits, <<1 fits                          OK
+     space_size 0x1F000000   fits, <<1 fits                          OK
+     stack base ~0x40800000  1082130432 > 2^30-1                     DOES NOT FIT
+   The stack base cannot be represented at all in the convention gc.lisp
+   uses, and <<1 overflows signed 32-bit on top of that.  Representing it as
+   a promoted bignum instead makes %gc-scan-stack do bignum arithmetic
+   DURING a collection, which allocates, which re-trips gc-check at
+   from-space-full — the documented aarch64 re-entrancy bug
+   (reference_aa64_gc_poison_root_cause), there fixed by keeping the tag
+   checks allocation-free.  Add that i386 has no object-start bitmap, so
+   %gc-forward-slot would have no conservative-root validation either — the
+   poison class that cost aarch64 most of a session.
+
+   ONE PIECE OF GOOD LUCK worth recording: every address INSIDE the arena
+   (0x1FFFD000..0x3EFFD000 at the old size) is below 2^30, so heap pointers
+   themselves are fixnums and the aarch64 re-entrancy trap does not fire for
+   them.  Only the STACK base, which lives above the arena, breaks.")
 
 (defconstant +linux-i386-nil-value+ #xDEAD0001
   "NIL.  Same immediate the 64-bit ports use — low nibble 1 (cons tag), a

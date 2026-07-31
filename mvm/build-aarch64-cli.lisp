@@ -691,6 +691,10 @@
 (format t "~%Compiling AArch64 CLI/JIT host (~D chars)...~%"
         (length cl-user::*full-source*))
 
+(let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
+  (when (and sm (plusp (length sm)))
+    (setf modus.mvm::*write-symmap-path* sm)))
+
 (let ((image (build-image :target :linux-aarch64 :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CLI_OUT")
                   "/home/claude/modus-aa64-cli")))
@@ -698,6 +702,13 @@
                               :element-type '(unsigned-byte 8)
                               :if-exists :supersede)
       (write-sequence (kernel-image-image-bytes image) out))
+    (when (sb-ext:posix-getenv "MODUS_DUMP_NATIVE")
+      (with-open-file (o (concatenate 'string path ".native")
+                         :direction :output :element-type '(unsigned-byte 8)
+                         :if-exists :supersede)
+        (write-sequence (kernel-image-native-code image) o))
+      (format t "  native code: ~D bytes -> ~A.native~%"
+              (length (kernel-image-native-code image)) path))
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)))

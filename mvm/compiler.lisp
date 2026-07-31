@@ -1131,12 +1131,12 @@
   (logand value +fixnum-max+))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
-  (ash value +neg-limb-bits+))
+  (ash value -62))   ; PHASE-3 TODO: +neg-limb-bits+
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
-          (setf mag (ash mag +neg-limb-bits+)) (incf n))))
+          (setf mag (ash mag -62)) (incf n))))   ; PHASE-3 TODO: count -> +neg-limb-bits+
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))

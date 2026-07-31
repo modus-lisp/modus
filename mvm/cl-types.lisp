@@ -2682,7 +2682,8 @@
         ;; Add 2^k to q.  For k up to ~62, ash 1 k is a fixnum.
         ;; Beyond that we'd need bignum representation, but for our
         ;; ANSI suite the trig case keeps k ≤ 47.  Guard anyway.
-        (setq q (bignum-add q (if (>= k +limb-bits+) (bignum-mul (ash 1 +limb-split-bits+) (ash 1 (- k +limb-split-bits+))) (ash 1 k))))))))
+        ;; PHASE-3 TODO: the 30 split wants +limb-split-bits+ (see compile-ash).
+        (setq q (bignum-add q (if (>= k +limb-bits+) (bignum-mul (ash 1 30) (ash 1 (- k 30))) (ash 1 k))))))))
 
 (defun %integer-truncate (a b)
   "Bignum-aware integer truncate.  Returns the quotient only;

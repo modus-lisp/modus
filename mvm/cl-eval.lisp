@@ -2587,13 +2587,17 @@
          (setq i (+ i 1)))))))
 (defun %shl1-fixnum (n)
   (if (>= n +fixnum-half+)
-      (make-bignum (logand (ash n 1) +fixnum-max+) (ash n +neg-limb-bits-1+))
+      ;; PHASE-3 TODO: the -61 shift count wants +neg-limb-bits-1+, but
+      ;; compile-ash tests (integerp count-form) so a NAMED constant misses
+      ;; the inline :sar path.  Literal until compile-ash resolves constants.
+      (make-bignum (logand (ash n 1) +fixnum-max+) (ash n -61))
       (ash n 1)))
 (defun %shl1-bignum (lo hi)
   (make-bignum (logand (ash lo 1) +fixnum-max+)
                (%fixnum-+ (ash hi 1) (ash lo -61))))
 (defun %shr1-bignum (lo hi)
-  (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi +limb-bits-1+) +fixnum-max+))
+  ;; PHASE-3 TODO: the 61 shift count wants +limb-bits-1+ (see compile-ash).
+  (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi 61) +fixnum-max+))
                (ash hi -1)))
 
 ;;; --- Limb-list shift helpers (LSB-first 62-bit limbs) ---

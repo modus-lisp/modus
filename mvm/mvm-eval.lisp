@@ -196,7 +196,7 @@
                 (not (string-equal hn "DEFCLASS"))
                 (not (string-equal hn "DEFINE-CONDITION"))
                 (not (string-equal hn "DEFSTRUCT"))
-                (gethash (normalize-name (car f)) *macro-table*))
+                (%macro-expander (car f) (normalize-name (car f))))
            acc)
           (t
            (let ((ex (handler-case (macroexpand-1-mvm f)

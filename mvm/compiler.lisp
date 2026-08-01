@@ -1256,7 +1256,9 @@
    forever on no-op expanders."
   (if (and (consp form) (symbolp (car form)))
       (let* ((name (normalize-name (car form)))
-             (expander (gethash name *macro-table*)))
+             ;; CONFIRMED lookup — see %MACRO-NAME-CONFIRMED-P.  A hash
+             ;; collision here runs the WRONG expander, silently.
+             (expander (%macro-expander (car form) name)))
         (cond
           (expander
            (let ((result
@@ -1320,13 +1322,57 @@
         (return form))
       (setf form expanded))))
 
+(defvar *macro-name-table* nil
+  "hash -> the NAME STRING that hash was registered under, for every macro
+   defined by MVM-DEFINE-MACRO with a string name.
+
+   *MACRO-TABLE* is keyed BY THE HASH, and that is the whole problem: when the
+   key IS the hash, a colliding name is a colliding KEY, not a colliding
+   bucket, so chaining does not save it — the second registration simply
+   overwrites the first and THE WRONG EXPANDER RUNS.  No error, no warning, a
+   silent miscompile, in exactly the code path a macro-heavy library lives in.
+   One real collision was measured in the ANSI corpus at this hash width;
+   nothing makes macro names luckier.
+
+   Same shape as the COMPILE-COMPOUND dispatch guard and as the pre-existing
+   %FORM-OP-IS: the hash stays the fast lookup, the name is confirmed only
+   once a hash actually hits.")
+
+(defun %macro-name-confirmed-p (op hash)
+  "NIL only when OP's hash hits a macro registered under a DIFFERENT name.
+
+   Cheap by shape: one table lookup, and a string compare only when the hash
+   is a registered macro hash.  Same honest limit as %OP-NAME-CONFIRMED-P —
+   where SYMBOL-NAME cannot recover a name (a symbol never scanned into
+   *SYM-NAME-TABLE* reads as \"\") there is nothing to compare and we trust
+   the hash exactly as before.  Never worse; better wherever a name exists."
+  (let ((registered (and *macro-name-table* (gethash hash *macro-name-table*))))
+    (cond
+      ((null registered) t)             ; registered by hash, or not a macro
+      ((not (symbolp op)) t)            ; caller passed a raw hash
+      (t (let ((n (symbol-name op)))
+           (or (null n) (zerop (length n)) (string-equal n registered)))))))
+
+(defun %macro-expander (op hash)
+  "The expander for OP, or NIL — the confirmed replacement for a bare
+   (gethash hash *macro-table*)."
+  (and (%macro-name-confirmed-p op hash)
+       (gethash hash *macro-table*)))
+
 (defun mvm-define-macro (name expander)
   "Register a macro with NAME (string or hash) and EXPANDER function.
    EXPANDER takes the whole form (including the operator) and returns
-   the expansion."
-  (setf (gethash (if (integerp name) name (compute-name-hash name))
-                 *macro-table*)
-        expander))
+   the expansion.
+
+   A STRING name is also recorded in *MACRO-NAME-TABLE* so a later lookup can
+   confirm it; an integer name registers no string and therefore no
+   confirmation, which is the pre-existing behaviour."
+  (let ((hash (if (integerp name) name (compute-name-hash name))))
+    (unless (integerp name)
+      (unless *macro-name-table*
+        (setq *macro-name-table* (make-hash-table :test 'eql)))
+      (setf (gethash hash *macro-name-table*) (string name)))
+    (setf (gethash hash *macro-table*) expander)))
 
 (defun build-macrolet-expander (mparams mbody)
   "Build a compile-time macro expander for a MACROLET local macro with

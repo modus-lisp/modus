@@ -2591,7 +2591,17 @@
       (ash n 1)))
 (defun %shl1-bignum (lo hi)
   (make-bignum (logand (ash lo 1) +fixnum-max+)
-               (%fixnum-+ (ash hi 1) (ash lo -61))))
+               ;; -61 was hardcoded here: the TOP bit of a limb, correct only
+               ;; on a 62-bit tower.  Every other constant in this engine is
+               ;; already derived from the target width, and +neg-limb-bits-1+
+               ;; IS -61 on the 64-bit targets, so this is byte-identical
+               ;; there — but on a 30-bit tower it must be -29.  It read as
+               ;; harmless because x86-32 masks a shift count to 5 bits and
+               ;; 61 & 31 happens to be exactly 29; the moment the i386
+               ;; translator started saturating out-of-range counts (which it
+               ;; must, so `(ash x -32)' can answer 0), that coincidence went
+               ;; away and took SHA-256/ChaCha20 with it.
+               (%fixnum-+ (ash hi 1) (ash lo +neg-limb-bits-1+))))
 (defun %shr1-bignum (lo hi)
   (make-bignum (%fixnum-+ (ash lo -1) (logand (ash hi +limb-bits-1+) +fixnum-max+))
                (ash hi -1)))
@@ -2619,8 +2629,13 @@
             (when (> carry 0) (setq acc (cons carry acc)))
             (return (nreverse acc)))
       (let* ((v (car cur))
-             (top (ash v -61))                       ; bit 61 -> carries out
-             (low61 (logand v +fixnum-half-max+))  ; v & (2^61-1)
+             ;; Top bit of a limb -> carries out.  Width-derived for the same
+             ;; reason as %shl1-bignum above (-61 on the 64-bit targets, so
+             ;; byte-identical there; -29 on a 30-bit tower).  Note LOW61
+             ;; below was ALREADY width-derived via +fixnum-half-max+, which
+             ;; is what made the hardcoded shift look consistent.
+             (top (ash v +neg-limb-bits-1+))
+             (low61 (logand v +fixnum-half-max+))  ; v & (2^(limb-1) - 1)
              ;; (low61 << 1) <= 2^62-2 (safe fixnum), OR the incoming carry bit.
              (lo (logior (ash low61 1) carry)))
         (setq acc (cons lo acc))

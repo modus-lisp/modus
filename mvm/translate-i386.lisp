@@ -2774,16 +2774,51 @@
            (i386-emit-xor-reg-reg buf +scratch0+ +scratch1+)
            (i386-store-vreg buf vd +scratch0+)))
 
+        ;; ---- Constant-amount shifts, SATURATED at the word width ----------
+        ;;
+        ;; x86 MASKS a shift count to the low 5 bits in 32-bit operand size, so
+        ;; `SAR EAX, 32' assembles to `SAR EAX, 0' — a NO-OP that silently
+        ;; returns the operand unchanged.  The 64-bit ports never see this: a
+        ;; count of 32 is an ordinary in-range 64-bit shift there.
+        ;;
+        ;; The MVM emits such counts.  compile-ash's inline fast path is gated
+        ;; by `(and count (<= count 30))' — bounded ABOVE only — so EVERY right
+        ;; shift, of any magnitude, is inlined as a single :sar.  `(ash 7 -32)'
+        ;; therefore answered 7 on this target.
+        ;;
+        ;; That one wrong answer was the runtime-QUOTE failure.  mvm-emit-u64
+        ;; emits its high word as `(logand (ash val -32) #xFFFFFFFF)'; with the
+        ;; shift a no-op the high word repeated the low word, so every 8-byte
+        ;; immediate read back wrong.  Under mvm-eval the only remaining user
+        ;; of that path is :li-const, whose immediate is the *e2-const-pool*
+        ;; INDEX for a quoted object — so `(eval '(quote X))' missed the pool
+        ;; and returned NIL for every X.  Downstream: every compiled `',name'
+        ;; was NIL, a runtime DEFMACRO's (set-macro-function ',name …)
+        ;; registered nothing (silently — %macro-sym-key just answers NIL), and
+        ;; (setf (symbol-function 'f) …) reported `not a symbol'.
+        ;;
+        ;; Saturating here rather than in compile-ash keeps the fix on the arch
+        ;; whose instruction has the quirk, and leaves x64/aarch64 codegen
+        ;; byte-identical.  A count >= 32 has exactly one right answer per op:
+        ;; 0 for the logical shifts, and the replicated sign bit for SAR, which
+        ;; `SAR reg, 31' produces.  (The variable-count :shlv/:sarv take their
+        ;; count from CL and are masked by the same hardware rule; compile-ash
+        ;; routes every VARIABLE count to runtime BIGNUM-ASH, so they are not
+        ;; reachable with an out-of-range count from that path.)
         ((op= +op-shl+)
          (let ((vd (first operands)) (vs (second operands)) (amt (third operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-shl-reg-imm buf +scratch0+ amt)
+           (if (>= amt 32)
+               (i386-emit-mov-reg-imm buf +scratch0+ 0)
+               (i386-emit-shl-reg-imm buf +scratch0+ amt))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-shr+)
          (let ((vd (first operands)) (vs (second operands)) (amt (third operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-shr-reg-imm buf +scratch0+ amt)
+           (if (>= amt 32)
+               (i386-emit-mov-reg-imm buf +scratch0+ 0)
+               (i386-emit-shr-reg-imm buf +scratch0+ amt))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-sar+)
@@ -2794,7 +2829,7 @@
            (i386-load-vreg buf +scratch0+ vs)
            ;; SAR by amt: always arithmetic shift to preserve sign.
            ;; (SHR for unsigned untagging has its own opcode +op-shr+.)
-           (i386-emit-sar-reg-imm buf +scratch0+ amt)
+           (i386-emit-sar-reg-imm buf +scratch0+ (if (>= amt 32) 31 amt))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-shlv+)

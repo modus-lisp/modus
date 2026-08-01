@@ -641,6 +641,11 @@
   (write-char-serial 105) (write-char-serial 110) (write-char-serial 116) (write-char-serial 101) (write-char-serial 103) (write-char-serial 101) (write-char-serial 114) (write-char-serial 112) (write-char-serial 45) (write-char-serial 122) (write-char-serial 101) (write-char-serial 114) (write-char-serial 111) (%chk (if (integerp 0) 1 0) 1)
   (write-char-serial 97) (write-char-serial 114) (write-char-serial 114) (write-char-serial 97) (write-char-serial 121) (write-char-serial 45) (write-char-serial 108) (write-char-serial 101) (write-char-serial 110) (write-char-serial 103) (write-char-serial 116) (write-char-serial 104) (write-char-serial 45) (write-char-serial 116) (%chk (array-length t) 0)
   (write-char-serial 97) (write-char-serial 114) (write-char-serial 114) (write-char-serial 97) (write-char-serial 121) (write-char-serial 45) (write-char-serial 108) (write-char-serial 101) (write-char-serial 110) (write-char-serial 103) (write-char-serial 116) (write-char-serial 104) (write-char-serial 45) (write-char-serial 114) (write-char-serial 101) (write-char-serial 97) (write-char-serial 108) (%chk (array-length (make-array 5)) 5)
+  (write-char-serial 97) (write-char-serial 115) (write-char-serial 104) (write-char-serial 45) (write-char-serial 110) (write-char-serial 101) (write-char-serial 103) (write-char-serial 51) (write-char-serial 50) (%chk (if (eql (ash 7 -32) 0) 1 0) 1)
+  (write-char-serial 97) (write-char-serial 115) (write-char-serial 104) (write-char-serial 45) (write-char-serial 110) (write-char-serial 101) (write-char-serial 103) (write-char-serial 54) (write-char-serial 52) (%chk (if (eql (ash 7 -64) 0) 1 0) 1)
+  (write-char-serial 97) (write-char-serial 115) (write-char-serial 104) (write-char-serial 45) (write-char-serial 110) (write-char-serial 101) (write-char-serial 103) (write-char-serial 51) (write-char-serial 50) (write-char-serial 45) (write-char-serial 110) (write-char-serial 101) (write-char-serial 103) (%chk (if (eql (ash -7 -32) -1) 1 0) 1)
+  (write-char-serial 97) (write-char-serial 115) (write-char-serial 104) (write-char-serial 45) (write-char-serial 110) (write-char-serial 101) (write-char-serial 103) (write-char-serial 51) (write-char-serial 49) (%chk (if (eql (ash 7 -31) 0) 1 0) 1)
+  (write-char-serial 97) (write-char-serial 115) (write-char-serial 104) (write-char-serial 45) (write-char-serial 110) (write-char-serial 101) (write-char-serial 103) (write-char-serial 50) (%chk (if (eql (ash 7 -2) 1) 1 0) 1)
   (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 119) (write-char-serial 111) (write-char-serial 114) (write-char-serial 100) (write-char-serial 32) (write-char-serial 119) (write-char-serial 105) (write-char-serial 100) (write-char-serial 116) (write-char-serial 104) (putnl)
   (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 109) (write-char-serial 97) (write-char-serial 120) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741823) 1 0) 1)
   (write-char-serial 112) (write-char-serial 97) (write-char-serial 115) (write-char-serial 116) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741824) 1 0) 0)
@@ -1178,14 +1183,24 @@
                      (defun %lt-s-defmacro () ~S)~%~
                      (defun %lt-s-use () ~S)~%~
                      (defun %lt-s-defun () ~S)~%~
-                     (defun %lt-s-call () ~S)~%"
+                     (defun %lt-s-call () ~S)~%~
+                     (defun %lt-s-ltm () ~S)~%~
+                     (defun %lt-s-defmacro-nobq () ~S)~%~
+                     (defun %lt-s-use-nobq () ~S)~%~
+                     (defun %lt-s-plus () ~S)~%~
+                     (defun %lt-s-carlist () ~S)~%"
                 path size
                 (concatenate 'string path ".does-not-exist")
                 "FOO"
                 "(defmacro %ltm (a) `(+ ,a 1))"
                 "(%ltm 41)"
                 "(defun %ltf (a) (* a 6))"
-                "(%ltf 7)"))
+                "(%ltf 7)"
+                "%LTM"
+                "(defmacro %ltn (a) (list (quote +) a 1))"
+                "(%ltn 41)"
+                "(+ 41 1)"
+                "(car (list 1 2))"))
       "(defun %lt-path () nil)
 (defun %lt-size () 0)
 (defun %lt-nopath () nil)
@@ -1194,6 +1209,11 @@
 (defun %lt-s-use () nil)
 (defun %lt-s-defun () nil)
 (defun %lt-s-call () nil)
+(defun %lt-s-ltm () nil)
+(defun %lt-s-defmacro-nobq () nil)
+(defun %lt-s-use-nobq () nil)
+(defun %lt-s-plus () nil)
+(defun %lt-s-carlist () nil)
 "))
 
 (defvar *hash-probe-source*
@@ -1442,6 +1462,26 @@
 ;; separately: what a native quoted symbol looks like, what the READER
 ;; produces, whether the two key helpers accept each, and finally the whole
 ;; read-defmacro-eval-use round trip.
+(defun %lt-dummy-expander (mform) 7)
+
+;; Byte-level helpers for the :li-const wire-format probe.  Each returns a
+;; single small integer so %pdec can never be handed a bignum or NIL (it would
+;; spin forever subtracting).
+(defun %dbg-u64-byte (val i)
+  (let ((b (make-mvm-buffer :bytes (make-array 64))))
+    (mvm-emit-u64 b val)
+    (aref (mvm-buffer-bytes b) i)))
+(defun %dbg-u32-byte (val i)
+  (let ((b (make-mvm-buffer :bytes (make-array 64))))
+    (mvm-emit-u32 b val)
+    (aref (mvm-buffer-bytes b) i)))
+(defun %dbg-u64-fetch-lo (val)
+  (let ((b (make-mvm-buffer :bytes (make-array 64))))
+    (mvm-emit-u64 b val)
+    (let ((bc (mvm-buffer-bytes b)))
+      (logior (aref bc 0) (ash (aref bc 1) 8)
+              (ash (aref bc 2) 16) (ash (aref bc 3) 24)))))
+
 (defun probe-sym ()
   (%l5-boot)
   (%sc-reset)
@@ -1468,6 +1508,87 @@
   (%tag2 114 51) (%chk (progn (eval (read-from-string (%lt-s-defmacro)))
                               (eval (read-from-string (%lt-s-use))))
                        42)
+  ;; Where along the registration chain does a runtime DEFMACRO stop?  Each
+  ;; tier separately, all AFTER the defmacro above has been eval'd.
+  (%tag2 109 49) (%chk (if *macro-function-table* 1 0) 1)
+  (%tag2 109 50) (%chk (if (%macro-sym-key (%lt-s-ltm)) 1 0) 1)
+  (%tag2 109 51) (%chk (if (gethash (%lt-s-ltm) *macro-function-table*) 1 0) 1)
+  (%tag2 109 52) (%chk (if (%raw-macro-expander (read-from-string (%lt-s-ltm))) 1 0) 1)
+  (%tag2 109 53) (%chk (if (macro-function (read-from-string (%lt-s-ltm))) 1 0) 1)
+  ;; set-macro-function in isolation: does the plumbing work at all when the
+  ;; compiled DEFMACRO body is taken out of the picture?
+  (%tag2 109 54) (%chk (progn (set-macro-function (quote %ltz)
+                                                  (function %lt-dummy-expander))
+                              (if (macro-function (quote %ltz)) 1 0))
+                       1)
+  (%tag2 109 55) (%chk (if (%raw-macro-expander (quote %ltz)) 1 0) 1)
+  ;; QUOTE under mvm-eval.  compile-quote's runtime arm registers the ORIGINAL
+  ;; object in *e2-const-pool* and emits :li-const IDX; the interpreter loads
+  ;; it back, which is what makes (eval '(quote X)) return X itself.  If that
+  ;; round trip drops the object, EVERY compiled `',name' is NIL — which is
+  ;; exactly the shape set-macro-function was handed above (obj-subtag 0).
+  ;; Every check yields 0 or 1: %pdec of a NIL got would spin forever, so a
+  ;; probe must never hand it one.
+  (%tag2 113 49) (%chk (if (eval (list (quote quote) (quote foo))) 1 0) 1)
+  (%tag2 113 50) (%chk (if (eql (eval (list (quote quote) (quote foo)))
+                                (quote foo)) 1 0) 1)
+  (%tag2 113 51) (%chk (if (eval (list (quote quote) (list 7 8))) 1 0) 1)
+  (%tag2 113 52) (%chk (if (eql (car (eval (list (quote quote) (list 7 8)))) 7) 1 0) 1)
+  (%tag2 113 53) (%chk (if *e2-const-pool* 1 0) 1)
+  (%tag2 113 54) (%chk (if (gethash 0 *e2-const-pool*) 1 0) 1)
+  ;; The wire format underneath :li-const.  Under mvm-eval every OTHER 64-bit
+  ;; immediate goes out as :li-halves; :li-const is the last user of the raw
+  ;; mvm-emit-u64 / fetch-u64 pair, and that pair is built from #xFFFFFFFF
+  ;; masks — a BIGNUM at this word size, where it is a fixnum on both 64-bit
+  ;; targets.  Round-trip it directly rather than inferring.
+  (%tag2 120 49) (%chk (let ((b (make-mvm-buffer :bytes (make-array 64))))
+                         (mvm-emit-u64 b 7)
+                         (mvm-buffer-position b))
+                       8)
+  (%tag2 120 50) (%chk (%dbg-u64-byte 7 0) 7)
+  (%tag2 120 51) (%chk (%dbg-u64-byte 7 1) 0)
+  (%tag2 120 52) (%chk (%dbg-u64-byte 7 2) 0)
+  (%tag2 120 53) (%chk (%dbg-u64-byte 7 3) 0)
+  (%tag2 120 54) (%chk (%dbg-u64-byte 7 4) 0)
+  (%tag2 120 55) (%chk (%dbg-u32-byte 7 0) 7)
+  (%tag2 120 56) (%chk (%dbg-u32-byte 7 1) 0)
+  (%tag2 120 57) (%chk (%dbg-u32-byte 7 2) 0)
+  (%tag2 122 49) (%chk (%dbg-u64-fetch-lo 7) 7)
+  (%tag2 122 50) (%chk (if (eql (ash 7 -16) 0) 1 0) 1)
+  (%tag2 122 51) (%chk (if (eql (ash 7 -32) 0) 1 0) 1)
+  (%tag2 122 52) (%chk (logand (ash 7 -16) 255) 0)
+  (%tag2 122 53) (%chk (let ((b (make-mvm-buffer :bytes (make-array 64))))
+                         (mvm-li-const b 5 3)
+                         (mvm-buffer-position b))
+                       10)
+  ;; The sub-step underneath, isolated.  #xFFFFFFFF is a BIGNUM at this word
+  ;; size, so `(logand 7 #xFFFFFFFF)' can hand back a bignum whose value is 7;
+  ;; `(ash <bignum> -16)' then shifts the HEAP POINTER (Active Limitation 8)
+  ;; and the byte comes out as (address >> 16) & 255.  y1 says which of the
+  ;; two it is; y2-y4 say whether the corruption is visible downstream.
+  (%tag2 121 49) (%chk (if (fixnump (logand 7 4294967295)) 1 0) 1)
+  (%tag2 121 50) (%chk (if (eql (logand 7 4294967295) 7) 1 0) 1)
+  (%tag2 121 51) (%chk (if (eql (ash (logand 7 4294967295) -16) 0) 1 0) 1)
+  (%tag2 121 52) (%chk (if (eql (logand (ash (logand 7 4294967295) -16) 255) 0) 1 0) 1)
+  ;; r3 is the last red light: a runtime DEFMACRO now REGISTERS (m3-m5) but its
+  ;; call still yields a heap object rather than 42.  Split expansion from
+  ;; evaluation, and backquote from macro dispatch, so the next session starts
+  ;; from a located fault rather than a symptom.
+  (%tag2 110 49) (%chk (if (consp (macroexpand-1 (read-from-string (%lt-s-use)))) 1 0) 1)
+  (%tag2 110 50) (%chk (if (eql (cadr (macroexpand-1 (read-from-string (%lt-s-use)))) 41) 1 0) 1)
+  (%tag2 110 51) (%chk (if (eql (caddr (macroexpand-1 (read-from-string (%lt-s-use)))) 1) 1 0) 1)
+  (%tag2 110 52) (%chk (if (eql (eval (macroexpand-1 (read-from-string (%lt-s-use)))) 42) 1 0) 1)
+  ;; A macro whose body builds the expansion with LIST instead of a backquote:
+  ;; separates the runtime backquote expander from the macro-dispatch path.
+  (%tag2 110 53) (%chk (progn (eval (read-from-string (%lt-s-defmacro-nobq)))
+                              (if (eql (eval (read-from-string (%lt-s-use-nobq))) 42) 1 0))
+                       1)
+  ;; The narrowest form of the same question, with no macro in sight: a
+  ;; TOP-LEVEL expression whose operator is a READER-produced CL symbol naming
+  ;; a compiler builtin.  e2 already proves the identical form works when the
+  ;; operator is a NATIVE symbol built with LIST.
+  (%tag2 112 49) (%chk (if (eql (eval (read-from-string (%lt-s-plus))) 42) 1 0) 1)
+  (%tag2 112 50) (%chk (if (eql (eval (read-from-string (%lt-s-carlist))) 1) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
   (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
   (putnl)

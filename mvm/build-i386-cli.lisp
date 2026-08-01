@@ -161,6 +161,55 @@
 (defvar *runtime-backquote-source*
   (if (>= *i386-layer* 5) (mvm-text "lib/runtime-backquote.lisp") ""))
 
+;;; ============================================================
+;;; The shared SBCL-faithful CLI toplevel, plus its i386 arm
+;;; ============================================================
+;;; lib/cli-toplevel.lisp is arch-neutral EXCEPT for three functions that read
+;;; the process argv/envp.  On the 64-bit ports those walk the LIVE initial
+;;; stack with 8-byte slots and the :u64 "raw>>1" convention.  Neither holds
+;;; here: slots are 4 bytes, and the kernel stack is at 0x40800390 -- above the
+;;; 2^30 ceiling a tagged mem-ref address can express -- so i386 reads the copy
+;;; the boot stub STAGED into the BSS instead (see +linux-i386-argv-ptrs+).
+;;; A staged slot holds a BSS byte address directly and a :u32 load tags its
+;;; result, so the Lisp value IS the pointer: no doubling, nothing unrepresentable.
+;;;
+;;; Concatenated AFTER *cli-toplevel-source* so last-defun-wins takes these.
+(defvar *cli-toplevel-source*
+  (if (>= *i386-layer* 5) (mvm-text "lib/cli-toplevel.lisp") ""))
+
+(defvar *cli-i386-arm-source*
+  (if (>= *i386-layer* 5)
+      "
+(defun %cli-argv-base () 268472320)   ; #x10009000 — the staged pointer array
+
+(defun %cli-collect-argv ()
+  (let ((argc (%cli-argc)) (base (%cli-argv-base)) (acc nil) (i 0))
+    (loop
+      (when (>= i argc) (return (reverse acc)))
+      (let ((ptr (mem-ref (+ base (* 4 i)) :u32)))
+        (when (eql ptr 0) (return (reverse acc)))
+        (setq acc (cons (%cli-cstr-at ptr) acc)))
+      (setq i (+ i 1)))))
+
+(defun %cli-getenv (name)
+  ;; envp begins one slot past argv's NULL terminator, exactly as on the real
+  ;; stack.  NB the equals sign is built with code-char: this source is a LISP
+  ;; STRING and a double quote in it would terminate the string early.
+  (let ((argc (%cli-argc)) (base (%cli-argv-base)) (i 0))
+    (let ((envp (+ base (* 4 (+ argc 1))))
+          (prefix (concatenate (quote string) name (string (code-char 61)))))
+      (let ((plen (length prefix)))
+        (loop
+          (let ((ptr (mem-ref (+ envp (* 4 i)) :u32)))
+            (when (eql ptr 0) (return nil))
+            (let ((entry (%cli-cstr-at ptr)))
+              (when (and entry (>= (length entry) plen)
+                         (string= (subseq entry 0 plen) prefix))
+                (return (subseq entry plen)))))
+          (setq i (+ i 1)))))))
+"
+      ""))
+
 ;;; %init-runtime-macros — mark every compiler macro name as KNOWN in
 ;;; *macro-table*, so macroexpand-1 at runtime answers "yes, that is a macro".
 ;;; Generated exactly the way build-generic-cli.lisp generates it (scan
@@ -357,6 +406,23 @@
 
 ;; argv[1] / argv[2] are staged NUL-terminated by the entry stub
 ;; (boot/boot-linux-i386.lisp) at these fixed BSS addresses.
+;; Is argv[1] a bare decimal number?  That selects a PROBE; anything else is a
+;; real CLI invocation and goes to cli-toplevel.  argc<2 (no args at all) stays
+;; the 90-check regression suite, which every gate in this port depends on.
+(defun %argv1-numeric-p ()
+  ;; Returns 1 or 0 -- NEVER NIL.  It first returned NIL on the non-numeric
+  ;; path while the other path returned 0/1, so the caller's (eql … 0) test was
+  ;; false for BOTH answers and every command line still ran the suite.
+  (let ((b0 (mem-ref 268435976 :u8)))
+    (if (or (< b0 48) (> b0 57))
+        0
+        (let ((i 0) (ok 1))
+          (loop
+            (let ((b (mem-ref (+ 268435976 i) :u8)))
+              (when (eql b 0) (return ok))
+              (when (or (< b 48) (> b 57)) (setq ok 0) (return 0))
+              (setq i (+ i 1))))))))
+
 (defun %argv1 ()
   (let ((n 0) (i 0))
     (loop
@@ -900,6 +966,11 @@
   (mem-ref 268438408 :u32))
 
 (defun kernel-main ()
+  ;; A numeric argv[1] runs that probe; no args runs the suite; anything else
+  ;; is a real command line and goes to the shared SBCL-faithful toplevel.
+  (when (and (>= (mem-ref 268435968 :u32) 2) (eql (%argv1-numeric-p) 0))
+    (handler-case (cli-toplevel) (t (c) (sys-exit 1)))
+    (sys-exit 0))
   (let ((which (%argv1)))
     (cond
       ((eql which 1) (probe-gcmeta))
@@ -992,6 +1063,8 @@
     ;; "COMMA-AT" / "BACKQUOTE", and a missing sym-name entry turns the whole
     ;; expander into a silent no-op rather than an error.
     *runtime-backquote-source* (string #\Newline)
+    *cli-toplevel-source* (string #\Newline)
+    *cli-i386-arm-source* (string #\Newline)
     *driver-source*))
 
 (defvar *all-defun-names*
@@ -1182,14 +1255,36 @@
 ;;; Generated with FORMAT rather than written into *driver-source*: that
 ;;; string cannot contain a double-quote character, so a path literal is
 ;;; impossible there.
+(defvar *i386-fixture-dir*
+  ;; Beside the image, never inside the repo: the fixture is build output.
+  (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_OUT")
+      "/home/claude/ws5-gate-out/modus-i386-cli"))
+
 (defvar *loadtest-source*
   (if (>= *i386-layer* 5)
       (let* ((path (namestring (merge-pathnames "tests/runtime-metric.lisp"
                                                 *modus-base*)))
-             (size (with-open-file (s path :element-type '(unsigned-byte 8))
-                     (file-length s))))
-        (format t "  load target: ~A (~D bytes)~%" path size)
+             ;; The SIZE checks (probe 8 f3/f4, which validate the struct
+             ;; stat64 offsets) use a FIXTURE THIS BUILD WRITES, not the load
+             ;; target.  tests/runtime-metric.lisp is owned and actively edited
+             ;; by another workstream: baking its length made probe 8 report
+             ;; 4601-vs-3171 and look like a syscall regression when nothing in
+             ;; this port had changed.  A probe must not depend on a file its
+             ;; owner can change underneath it.
+             (fixture (namestring (merge-pathnames "i386-fixture.txt"
+                                                   (directory-namestring
+                                                     *i386-fixture-dir*))))
+             (fixture-bytes 2048)
+             (ignore1 (with-open-file (f fixture :direction :output
+                                                 :if-exists :supersede
+                                                 :element-type '(unsigned-byte 8))
+                        (dotimes (i fixture-bytes) (write-byte (mod i 251) f))))
+             (size fixture-bytes))
+        (declare (ignore ignore1))
+        (format t "  load target: ~A~%  size fixture: ~A (~D bytes)~%"
+                path fixture size)
         (format nil "(defun %lt-path () ~S)~%(defun %lt-size () ~D)~%~
+                     (defun %lt-fixture () ~S)~%~
                      (defun %lt-nopath () ~S)~%~
                      (defun %lt-s-foo () ~S)~%~
                      (defun %lt-s-defmacro () ~S)~%~
@@ -1212,6 +1307,7 @@
                      (defun %lt-s-ift () ~S)~%~
                      (defun %lt-s-cil () ~S)~%"
                 path size
+                fixture
                 (concatenate 'string path ".does-not-exist")
                 "FOO"
                 "(defmacro %ltm (a) `(+ ,a 1))"
@@ -1235,6 +1331,7 @@
                 "(funcall (car (list (lambda () 7))))"))
       "(defun %lt-path () nil)
 (defun %lt-size () 0)
+(defun %lt-fixture () nil)
 (defun %lt-nopath () nil)
 (defun %lt-s-foo () nil)
 (defun %lt-s-defmacro () nil)
@@ -1477,8 +1574,8 @@
   (%sc-reset)
   (%tag2 102 49) (%chk (if (%sys-stat-exists (%lt-path)) 1 0) 1)
   (%tag2 102 50) (%chk (if (%sys-stat-exists (%lt-nopath)) 1 0) 0)
-  (%tag2 102 51) (%chk (%sys-stat-size (%lt-path)) (%lt-size))
-  (%tag2 102 52) (%chk (let ((fd (%sys-open-rdonly (%lt-path))))
+  (%tag2 102 51) (%chk (%sys-stat-size (%lt-fixture)) (%lt-size))
+  (%tag2 102 52) (%chk (let ((fd (%sys-open-rdonly (%lt-fixture))))
                          (let ((n (%sys-fstat-size fd)))
                            (%sys-close fd)
                            n))
@@ -1824,6 +1921,8 @@
     *i386-fileio-source* (string #\Newline)
     *crypto-source* (string #\Newline)
     *runtime-backquote-source* (string #\Newline)
+    *cli-toplevel-source* (string #\Newline)
+    *cli-i386-arm-source* (string #\Newline)
     *driver-source* (string #\Newline)
     *dbg-source*))
 

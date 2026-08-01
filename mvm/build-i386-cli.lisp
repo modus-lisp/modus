@@ -1193,7 +1193,10 @@
                      (defun %lt-s-lambda3 () ~S)~%~
                      (defun %lt-s-lambda1 () ~S)~%~
                      (defun %lt-s-list2 () ~S)~%~
-                     (defun %lt-s-list3 () ~S)~%"
+                     (defun %lt-s-list3 () ~S)~%~
+                     (defun %lt-s-hc-plain () ~S)~%~
+                     (defun %lt-s-hc-err () ~S)~%~
+                     (defun %lt-s-hc-native () ~S)~%"
                 path size
                 (concatenate 'string path ".does-not-exist")
                 "FOO"
@@ -1210,7 +1213,10 @@
                 "(lambda (x) (list (quote +) x 1))"
                 "(lambda (x) (list x))"
                 "(list 1 2)"
-                "(list 1 2 3)"))
+                "(list 1 2 3)"
+                "(handler-case 7 (error (c) 9))"
+                "(handler-case (error (quote simple-error)) (error (c) 9))"
+                "(handler-case (progn (rt-inc-probe 41)) (error (c) 9))"))
       "(defun %lt-path () nil)
 (defun %lt-size () 0)
 (defun %lt-nopath () nil)
@@ -1229,6 +1235,9 @@
 (defun %lt-s-lambda1 () nil)
 (defun %lt-s-list2 () nil)
 (defun %lt-s-list3 () nil)
+(defun %lt-s-hc-plain () nil)
+(defun %lt-s-hc-err () nil)
+(defun %lt-s-hc-native () nil)
 "))
 
 (defvar *hash-probe-source*
@@ -1486,6 +1495,9 @@
 ;; NATIVE control for the &rest-arity probes: same body shape as a macro
 ;; expander, but compiled by the BUILD rather than by mvm-eval.
 (defun %lt-native-list3 (x) (list (quote +) x 1))
+;; Stand-in for runtime-metric's rt-inc: a NATIVE fn called from inside an
+;; EVAL'd handler-case body, which is the exact shape that fails.
+(defun rt-inc-probe (x) (+ x 1))
 
 ;; Byte-level helpers for the :li-const wire-format probe.  Each returns a
 ;; single small integer so %pdec can never be handed a bignum or NIL (it would
@@ -1688,6 +1700,15 @@
   (%tag2 104 54) (%chk (length (eval (list (quote list) 1 2))) 2)
   (%tag2 104 55) (%chk (length (eval (read-from-string (%lt-s-list2)))) 2)
   (setq *mvm-eval-no-cache* nil)
+  ;; HANDLER-CASE under mvm-eval -- the last gap.  It works NATIVELY (probe 6
+  ;; is 8/8), so this splits the eval'd path three ways: a body that cannot
+  ;; signal at all (c1 -- if THIS fails, setjmp/clear-handler is broken under
+  ;; eval, nothing to do with signalling), a body that deliberately signals
+  ;; (c2), and a body that merely calls a NATIVE function (c3 -- the
+  ;; runtime-metric shape).
+  (%tag2 99 49) (%chk (if (eql (eval (read-from-string (%lt-s-hc-plain))) 7) 1 0) 1)
+  (%tag2 99 50) (%chk (if (eql (eval (read-from-string (%lt-s-hc-err))) 9) 1 0) 1)
+  (%tag2 99 51) (%chk (if (eql (eval (read-from-string (%lt-s-hc-native))) 42) 1 0) 1)
   (%tag2 112 49) (%chk (if (eql (eval (read-from-string (%lt-s-plus))) 42) 1 0) 1)
   (%tag2 112 50) (%chk (if (eql (eval (read-from-string (%lt-s-carlist))) 1) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))

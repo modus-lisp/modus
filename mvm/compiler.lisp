@@ -1050,8 +1050,8 @@
     (loop for c across name
           do (setq h1 (logand (* (logxor h1 (char-code c)) 16777619) #xFFFFFFFF))
              (setq h2 (logand (* (logxor h2 (char-code c)) 805306457) #xFFFFFFFF)))
-    (let ((combined (logior (ash (logand h1 #x3FFFFFFF) 30)
-                            (logand h2 #x3FFFFFFF))))
+    (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                            (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
 (defun ieee-float-bits (f)
@@ -1408,7 +1408,7 @@
         (if (null clauses) nil
             (let ((clause (car clauses)))
               (if (and (symbolp (car clause))
-                       (= (compute-name-hash (symbol-name (car clause))) 307092296168853251))
+                       (= (compute-name-hash (symbol-name (car clause))) 47238915))  ; T
                   `(progn ,@(cdr clause))
                   ;; Short form (cond (test)) — when clause has no body,
                   ;; ANSI returns the value of TEST if non-NIL.  Bind to
@@ -1516,7 +1516,7 @@
                                (cond
                                  ((or (eq keys t)
                                       (and (symbolp keys)
-                                           (= (compute-name-hash (symbol-name keys)) 351744830753626451)))
+                                           (= (compute-name-hash (symbol-name keys)) 101669203)))  ; OTHERWISE
                                   `(t ,@effective-body))
                                  ((listp keys)
                                   `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
@@ -1922,7 +1922,7 @@
                                (if (or (eq type t)
                                        (and (symbolp type)
                                             (= (compute-name-hash (symbol-name type))
-                                               351744830753626451)))
+                                               101669203)))  ; OTHERWISE
                                    `(t ,@body)
                                    `((typep ,tmp ',type) ,@body))))
                            clauses))))))
@@ -3651,7 +3651,7 @@
   (loop while (and (consp body)
                    (consp (car body))
                    (symbolp (caar body))
-                   (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
+                   (= (compute-name-hash (symbol-name (caar body))) 133791479))  ; DECLARE
         do (setf body (cdr body)))
   ;; Drop a leading string — docstring — when the body has more forms.
   ;; A lone (defun foo (x) "x") still returns the string, so don't
@@ -3662,7 +3662,7 @@
     (loop while (and (consp body)
                      (consp (car body))
                      (symbolp (caar body))
-                     (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
+                     (= (compute-name-hash (symbol-name (caar body))) 133791479))  ; DECLARE
           do (setf body (cdr body))))
   body)
 
@@ -3672,13 +3672,13 @@
     (loop while (and (consp body)
                      (consp (car body))
                      (symbolp (caar body))
-                     (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
+                     (= (compute-name-hash (symbol-name (caar body))) 133791479))  ; DECLARE
           do (let ((decl (car body)))
                ;; (declare (special x y z) ...)
                (dolist (spec (cdr decl))
                  (when (and (consp spec) (symbolp (car spec))
                             (= (compute-name-hash (symbol-name (car spec)))
-                               494057320882034318))  ; SPECIAL
+                               511973006))  ; SPECIAL
                    (dolist (var (cdr spec))
                      (push var specials))))
                (setf body (cdr body))))
@@ -4182,11 +4182,153 @@
 
 ;;; ------ Compound Form Dispatch ------
 
+;;; ============================================================
+;;; Hash-dispatch collision confirmation
+;;; ============================================================
+;;;
+;;; COMPILE-COMPOUND IS NOT A HASH TABLE.  It dispatches every special form
+;;; with a direct `(= op-name <literal>)` integer compare — 200-odd of them —
+;;; so there is no bucket and no chain: THE HASH IS THE IDENTITY.  A hash
+;;; TABLE that collides degrades to comparing keys within a bucket; this
+;;; degrades to silently running one special form's handler for a different
+;;; name.
+;;;
+;;; And the exposure is not bounded by our own corpus.  OP-NAME is the hash of
+;;; whatever symbol heads a compound form, INCLUDING USER CODE, so "no
+;;; collisions among the names we ship" does not establish safety — it cannot
+;;; be measured away for inputs nobody has written yet.  At 29 bits the odds
+;;; are about 274/2^29, roughly 1 in 2 million per distinct user name.  Small,
+;;; and a SILENT MISCOMPILE.
+;;;
+;;; So confirm the NAME once the hash matches.  The integer compare stays the
+;;; fast reject — the common case is a MISS and costs exactly what it did
+;;; before — and the confirmation is one table lookup per compound form, with
+;;; a string compare only when the hash really is one of the dispatch hashes.
+;;;
+;;; This is a CLASS fix, not a width fix: the same misdispatch was possible at
+;;; 60 bits, just rarer.
+;;;
+;;; HONEST LIMIT: a native MVM symbol carries only a hash, and SYMBOL-NAME
+;;; recovers the string by reverse lookup in *SYM-NAME-TABLE*.  Where the name
+;;; is NOT recoverable (empty string — a symbol never scanned into that table)
+;;; there is nothing to compare and we fall back to trusting the hash, exactly
+;;; as before.  So: correct by construction wherever a name is recoverable,
+;;; and never worse than the old behaviour where it is not.  Widening
+;;; *SYM-NAME-TABLE* coverage tightens it further.
+
+(defparameter *hash-dispatch-names*
+  '(
+    "STI" "MUL26HI" "ON" "COMMON-LISP-USER"
+    "BEING" "DO" "MAKE-PACKAGE" "MACROLET"
+    "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
+    "ARRAY-IN-BOUNDS-P" "FUNCALL" "%SETF-MEM-REF" "%IDIV-TRUNC"
+    "IO-IN-BYTE" "XCHG-MEM" "WBINVD" "SWITCH-IDLE-STACK"
+    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "SYSCALL3-RAW" "PROGN"
+    "WHEN" "DECLAIM" "LOGXOR" "RETURN-FROM"
+    "ATOM" "%FLOAT-MUL" "RATIOP" "FUNCTION"
+    "LET*" "UNLESS" "SAP-ADDRESS" "B"
+    "CAR" "DEFPARAMETER" "PAUSE" "NTH-VALUE"
+    "COUNTING" "ETYPECASE" "IO-IN-DWORD" "OF"
+    "LABELS" "MMIO-DO-WRITE32" "CONSP" "SET-ALLOC-PTR"
+    "APPEND" "LISTP" "COLLECT" "SETUP-IRQ"
+    "THEREIS" "HASH-VALUES" "SVREF" "TRUNCATE"
+    "MAXIMIZING" "HANDLER-BIND" "DOWNTO" "FLET"
+    "LOGAND" "LOOP-FINISH" "%WORD-LOGXOR" "WITH-OPEN-FILE"
+    "DEFVAR" "WITH" "IN-PACKAGE" "%ALLOC-MDA-RAW"
+    "VALUES-LIST" "%SAVE-OUTER-HANDLER" "%GET-NARGS" "CLI"
+    ">=" "T" "AND" "REQUIRE"
+    "CHARACTERP" "USING" "SAP-REF-32" "SAP-SET-64"
+    "INITIALLY" "LET" "DEFSTRUCT" "EQUALP"
+    "OTHERWISE" "FROM" "HANDLER-CASE" "%FLOAT-ADD"
+    "MMIO-DO-READ32" "<=" "SYSCALL3" "IO-OUT-DWORD"
+    "PRESENT-SYMBOLS" "SYMBOL" "ASET" "VALUES"
+    "%FLOAT-SUB" "SYSCALL6" "LOGIOR" "UNWIND-PROTECT"
+    "IF" "CDDR" "%FLOAT-FROM-INT" "PROG"
+    "INTEGERP" "WHILE" "DEFMACRO" "CADR"
+    "%FIXNUM--" "SPECIAL" "SYMBOL-MACROLET" "ASH"
+    "LOOP" "CHAR-CODE" "QUOTE" "PROGV"
+    "DECLARE" "LAMBDA" "MFENCE" "FN-ADDR"
+    "NAMED" "LOAD-TIME-VALUE" "STI-HLT" "UNTAG"
+    "MULTIPLE-VALUE-BIND" "SAP-SET-32" "%ALLOC-SYM3" "SETQ"
+    "AREF" "%FLOAT-DIV" "CTYPECASE" "TYPECASE"
+    "SHADOW" "SUM" "RDTSC" "IO-IN-DWORD-RAW"
+    "%FIXNUM-*" "PCI-CONFIG-READ-RAW" "TIMER-REARM" "BL"
+    "IN" "1-" "EXTERNAL-SYMBOLS" "CAAR"
+    "%FIXNUM-+" "READ-CHAR-SERIAL" "GO" "TO"
+    "MAKE-SAP" "SAP-REF-64" "CODE-CHAR" "WRMSR"
+    "ZEROP" "SET-CAR" "%WORD-LOGIOR" "EQ"
+    "MINIMIZE" "COUNT" "MOD" "%NLX-THROW"
+    "CONS" "JUMP-TO-ADDRESS" "UNTIL" "BIT"
+    "REPEAT" "THROW" "SET-CDR" "APPENDING"
+    "EXPORT" "MAKE-ARRAY" "1+" "OBJ-SUBTAG"
+    "WFI" "UPFROM" "LDB" "BELOW"
+    "%HANDLER-CASE-CATCH" "THEN" "-" "ARRAY-LENGTH"
+    "OF-TYPE" "RETURN" "%MAKE-RATIO" "PROG*"
+    "NIC-IRQ-UNMASK" "EQL" "FINALLY" "SAVE-CONTEXT"
+    "ELSE" "GET-ALLOC-PTR" "/" "PROVIDE"
+    "CATCH" "EQUAL" "WITH-INPUT-FROM-STRING" "CDAR"
+    "ADR" "NOT" "RESTART-CASE" "%HC-LONGJMP"
+    "SET-RSP" "INTO" "%MAKE-BIGNUM" "PERCPU-SET"
+    "SAP-REF-8" "UPTO" "SUMMING" "WRITE-CHAR-SERIAL"
+    "HASH-VALUE" "+" "SET-ALLOC-LIMIT" "*"
+    "MAKE-SAP-RAW" "END" "FOR" "NEVER"
+    "EXTERNAL-SYMBOL" "%NAMED-LOOP" "SYS-EXIT" "NCONC"
+    "RESTORE-CONTEXT" "WITH-OUTPUT-TO-STRING" "HASH-KEYS" "DOWNFROM"
+    "MAXIMIZE" "MEM-REF" "%ERROR-HANDLER-ACTIVE-P" "%MCGC-COLLECT"
+    "SAP-SET-8" "HLT" "LOCALLY" "BY"
+    "DOING" "CALL-NATIVE" "IO-OUT-BYTE" "ARRAYP"
+    "CDR" "ABOVE" "%WORD-LOGAND" "APPLY"
+    "DEFUN" "%MAKE-KEYWORD-OBJ" "THE" "IMPORT"
+    "%RESTORE-OUTER-HANDLER" "SYMBOLP" "SETUP-NIC-IDT" "="
+    "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
+    "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
+    "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF"
+    "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
+    "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
+    "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
+    "MINIMIZING" "%CLEAR-OUTER-HANDLER" "PROCLAIM" "SHIFTF"
+    "EACH" "AS" "IGNORE-ERRORS" "HASH-KEY")
+  "Every name COMPILE-COMPOUND dispatches on by bare hash comparison.
+   GENERATED, never hand-typed: the literals in the dispatch were inverted to
+   these names and then re-derived through COMPUTE-NAME-HASH itself, in one
+   run, so the list and the literals come from a single computation.")
+
+(defvar *hash-dispatch-table* nil
+  "hash -> name, built once from *HASH-DISPATCH-NAMES*.")
+
+(defun %hash-dispatch-name (h)
+  "The dispatch name H is the hash of, or NIL if H is not a dispatch hash."
+  (unless *hash-dispatch-table*
+    (let ((tbl (make-hash-table :test 'eql)))
+      (dolist (n *hash-dispatch-names*)
+        (setf (gethash (compute-name-hash n) tbl) n))
+      (setq *hash-dispatch-table* tbl)))
+  (gethash h *hash-dispatch-table*))
+
+(defun %op-name-confirmed-p (op op-name)
+  "NIL only when OP's hash collides with a dispatch name that OP is not."
+  (let ((sf (%hash-dispatch-name op-name)))
+    (cond
+      ((null sf) t)                     ; not a dispatch hash — nothing to confirm
+      ((not (symbolp op)) t)            ; caller passed a raw hash
+      (t (let ((n (symbol-name op)))
+           (or (null n)
+               (zerop (length n))       ; name not recoverable — trust the hash
+               (string-equal n sf)))))))
+
 (defun compile-compound (form env dest)
   "Compile a compound form (operator . args)"
   (let* ((op (car form))
          (op-name (cond ((integerp op) op) ((symbolp op) (normalize-name op)) (t nil))))
     (cond
+      ;; HASH-COLLISION GUARD — first, so it wins over every hash compare
+      ;; below.  Fires only when OP's hash IS one of the dispatch hashes but
+      ;; OP's recovered name is a DIFFERENT name, i.e. a genuine collision;
+      ;; sends it to the ordinary call path where it belongs instead of
+      ;; silently running some special form's handler.  See
+      ;; %OP-NAME-CONFIRMED-P.
+      ((and op-name (symbolp op) (not (%op-name-confirmed-p op op-name)))
+       (compile-call op (cdr form) env dest))
       ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
       ;; through compile-funcall, NOT compile-call: compile-call's
       ;; indirect path emits a bare :call-indirect with no closure
@@ -4199,10 +4341,10 @@
       ((null op-name)
        (compile-funcall form env dest))
       ;; --- Special Forms ---
-      ((= op-name 518921307293258709)    (compile-quote (cadr form) dest))
-      ((= op-name 448736678201786992)       (compile-if (cdr form) env dest))
-      ((= op-name 87505416312042891)    (compile-progn (cdr form) env dest))
-      ((= op-name 347164158959663450)
+      ((= op-name 338547669)    (compile-quote (cadr form) dest))  ; QUOTE
+      ((= op-name 463569520)       (compile-if (cdr form) env dest))  ; IF
+      ((= op-name 28734859)    (compile-progn (cdr form) env dest))  ; PROGN
+      ((= op-name 536263002)  ; LET
        (let* ((bindings (cadr form))
               (body (cddr form))
               (declared (extract-special-vars body))
@@ -4229,7 +4371,7 @@
          (if specials
              (compile-let-with-specials bindings body specials env dest)
              (compile-let bindings body env dest))))
-      ((= op-name 115433002357585904)
+      ((= op-name 431241200)  ; LET*
        (let* ((bindings (cadr form))
               (body (cddr form))
               (declared (extract-special-vars body))
@@ -4256,7 +4398,7 @@
          (if specials
              (compile-let-with-specials bindings body specials env dest t)
              (compile-let* bindings body env dest))))
-      ((= op-name 565254038635891948)
+      ((= op-name 260934892)  ; SETQ
        ;; CLHS 5.1.2.5: (setq var1 val1 var2 val2 ...) — multiple pairs allowed.
        ;; Compile all but the LAST pair with dest=ignored; LAST pair uses dest.
        (let ((pairs (cdr form)))
@@ -4269,10 +4411,10 @@
                 (compile-setq (car cur) (cadr cur) env dest)
                 (setq cur (cddr cur)))
               (compile-setq (car cur) (cadr cur) env dest))))))
-      ((= op-name 527981956251550024)   (compile-lambda (cadr form) (cddr form) env dest))
-      ((= op-name 89559098115627243)     (compile-when (cdr form) env dest))
-      ((= op-name 123360604517422061)   (compile-unless (cdr form) env dest))
-      ((= op-name 502185558679326091)     (compile-loop (cdr form) env dest))
+      ((= op-name 80380232)   (compile-lambda (cadr form) (cddr form) env dest))  ; LAMBDA
+      ((= op-name 226908395)     (compile-when (cdr form) env dest))  ; WHEN
+      ((= op-name 64017389)   (compile-unless (cdr form) env dest))  ; UNLESS
+      ((= op-name 521850251)     (compile-loop (cdr form) env dest))  ; LOOP
       ;; %NAMED-LOOP — expand-cl-loop wraps NAMED LOOPs as
       ;; (%NAMED-LOOP NAME BODY).  Establishes (block NAME …) AND binds
       ;; *suppress-loop-block-nil* = t for the body so the inner simple-
@@ -4280,18 +4422,18 @@
       ;; per CLHS 6.1.2.2, a NAMED LOOP's implicit block IS the named
       ;; block, not nil.  Internal `(return nil)` from test-form exits
       ;; still works via *loop-exit-label* fallback in compile-return.
-      ((= op-name 873406207708231128)
+      ((= op-name 374453720)  ; %NAMED-LOOP
        (let ((nl-name (cadr form))
              (nl-body (cddr form)))
          (let ((*suppress-loop-block-nil* t))
            (compile-block nl-name nl-body env dest))))
-      ((= op-name 732905726022713733)   (compile-return (cadr form) env dest))
-      ((= op-name 1062346144843286510)    (compile-block (cadr form) (cddr form) env dest))
-      ((= op-name 54884900767456285)  (compile-tagbody (cdr form) env dest))
-      ((= op-name 609179962647778703)       (compile-go (cadr form) env dest))
-      ((= op-name 1080561289491153610)  (compile-dotimes (cadr form) (cddr form) env dest))
-      ((= op-name 113179339635393781) (compile-function-ref (cadr form) env dest))
-      ((= op-name 59431251605330656)  (compile-funcall (cdr form) env dest))
+      ((= op-name 232767877)   (compile-return (cadr form) env dest))  ; RETURN
+      ((= op-name 372279278)    (compile-block (cadr form) (cddr form) env dest))  ; BLOCK
+      ((= op-name 495377437)  (compile-tagbody (cdr form) env dest))  ; TAGBODY
+      ((= op-name 502453647)       (compile-go (cadr form) env dest))  ; GO
+      ((= op-name 214205130)  (compile-dotimes (cadr form) (cddr form) env dest))  ; DOTIMES
+      ((= op-name 402801909) (compile-function-ref (cadr form) env dest))  ; FUNCTION
+      ((= op-name 73964256)  (compile-funcall (cdr form) env dest))  ; FUNCALL
       ;; APPLY — intercept (apply #'FNAME list) only when FNAME is a
       ;; literal `#'…` function reference to a known &rest function
       ;; with required-count = 0.  For those we can use the static-
@@ -4311,7 +4453,7 @@
       ;;     into V0..V_{req-1}, which req isn't statically known.
       ;; Everything outside the narrow safe shape falls through to
       ;; the cl-printer apply defun's runtime ladder.
-      ((and (= op-name 973763329607944835)
+      ((and (= op-name 9882243)  ; APPLY
             (= (length (cdr form)) 2)
             (apply-targets-safe-rest-fn-p (cadr form)))
        (compile-apply (cdr form) env dest))
@@ -4326,7 +4468,7 @@
       ;; expansion).  Now we recognise nested DEFUN like the toplevel
       ;; path does and yield NIL into DEST (defun's value isn't used in
       ;; expression contexts).  Probe 9795 captures the original bug.
-      ((= op-name 974270913155467339)   ; DEFUN
+      ((= op-name 238798923)   ; DEFUN
        (let* ((raw-name (cadr form))
               (params   (caddr form))
               (body     (cdddr form))
@@ -4398,7 +4540,7 @@
       ;; table so subsequent compile-form passes in the same source see
       ;; the macro.  Yields NIL into dest (defmacro's value isn't used in
       ;; expression contexts).
-      ((= op-name 486374561508212106)   ; DEFMACRO
+      ((= op-name 320224650)   ; DEFMACRO
        (let ((name (cadr form))
              (params (caddr form))
              (body (cdddr form)))
@@ -4473,7 +4615,7 @@
       ;; which already knows how to process DEFSTRUCT — registers
       ;; constructor / accessors / predicates / setters so subsequent
       ;; calls in the same source resolve them.  Yields NIL into dest.
-      ((= op-name 347335033216607151)   ; DEFSTRUCT
+      ((= op-name 459236271)   ; DEFSTRUCT
        ;; mvm-eval production-eval semantics (WS3 flip): Modus represents
        ;; structs only as the native tagged array — a (:TYPE …) option is
        ;; unsupported, and the tree-walker's runtime DEFSTRUCT signals
@@ -4514,8 +4656,8 @@
       ;; value position, so just compile it).  Return the symbol-name as
       ;; an interned symbol (same as compile-quote would for any quoted
       ;; sym), matching ANSI: defvar/defparameter return the variable name.
-      ((or (= op-name 263277541136800469)   ; DEFVAR
-           (= op-name 131999690084823585))  ; DEFPARAMETER
+      ((or (= op-name 428301013)   ; DEFVAR
+           (= op-name 352645665))  ; DEFPARAMETER
        (let* ((var-name (cadr form))
               (value-form (caddr form))
               ;; An initform is PRESENT iff the form has a 3rd element —
@@ -4535,10 +4677,10 @@
            (compile-form `(set-symbol-value ,name-hash ,value-form) env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
-      ((= op-name 230909053785822708)
+      ((= op-name 445617652)  ; FLET
        (compile-flet (cadr form) (cddr form) env dest nil))
       ;; LABELS — compile local functions, bodies see all local names (recursive)
-      ((= op-name 176230696681611090)
+      ((= op-name 417505106)  ; LABELS
        (compile-flet (cadr form) (cddr form) env dest t))
       ;; RETURN-FROM block-name value — look up name in *block-labels* and
       ;; branch directly to that block's exit.  Compiles the value into the
@@ -4553,7 +4695,7 @@
       ;; to the block's runtime CATCH tag for a proper non-local exit that
       ;; runs intervening unwind-protect cleanups and propagates the value.
       ;; (3) compile-return fallback (BLOCK NIL / loop / function).
-      ((= op-name 102326962717880022)
+      ((= op-name 164933334)  ; RETURN-FROM
        (let* ((bname (cadr form))
               (entry (assoc bname *block-labels*
                             :test (lambda (a b)
@@ -4583,22 +4725,22 @@
                             env dest)))
            (t (compile-return (caddr form) env dest)))))
       ;; VALUES — return multiple values
-      ((= op-name 419785975474686239)
+      ((= op-name 18794783)  ; VALUES
        (compile-values (cdr form) env dest))
       ;; VALUES-LIST — return list elements as multiple values
-      ((= op-name 276551395991592440)
+      ((= op-name 34053624)  ; VALUES-LIST
        (let ((n (length (cdr form))))
          (cond
            ((= n 1) (compile-values-list (cadr form) env dest))
            (t (compile-arity-error env dest)))))
       ;; MULTIPLE-VALUE-BIND — bind variables to multiple return values
-      ((= op-name 544225037749651317)
+      ((= op-name 432654197)  ; MULTIPLE-VALUE-BIND
        (compile-multiple-value-bind (cadr form) (caddr form) (cdddr form) env dest))
       ;; MULTIPLE-VALUE-LIST — collect multiple values into a list
-      ((= op-name 76959345744650934)
+      ((= op-name 169747126)  ; MULTIPLE-VALUE-LIST
        (compile-multiple-value-list (cadr form) env dest))
       ;; HANDLER-CASE — setjmp/longjmp error catching
-      ((= op-name 362314411895974678)
+      ((= op-name 319400726)  ; HANDLER-CASE
        (compile-handler-case (cadr form) (cddr form) env dest nil))
       ;; HANDLER-BIND — expand to the runtime %with-handler-bind
       ;; (cl-conditions.lisp).  Same shape the build-time rewriter
@@ -4607,30 +4749,30 @@
       ;; this case, mvm-eval compiled HANDLER-BIND as an ORDINARY CALL —
       ;; the binding list was evaluated as a function call (usually
       ;; signalling) and the handlers never installed.
-      ((= op-name 220644454587779307)   ; (compute-name-hash "HANDLER-BIND")
+      ((= op-name 49694955)   ; (compute-name-hash "HANDLER-BIND")
        (compile-handler-bind (cadr form) (cddr form) env dest))
       ;; %HANDLER-CASE-CATCH — internal: the handler-case variant CATCH
       ;; expands to.  Identical to HANDLER-CASE except it does NOT get the
       ;; NLX-transparency guard (its T-clause IS the frame that consumes a
       ;; matching block/catch tag — guarding it would longjmp past the
       ;; catch that owns the tag and no throw would ever land).
-      ((= op-name 708734760566136331)   ; (compute-name-hash "%HANDLER-CASE-CATCH")
+      ((= op-name 243424779)   ; (compute-name-hash "%HANDLER-CASE-CATCH")
        (compile-handler-case (cadr form) (cddr form) env dest t))
       ;; RESTART-CASE — bytecode setjmp/longjmp (stays in the interpreter;
       ;; does NOT route through the native %with-restarts bridge under mvm-eval)
-      ((= op-name 791633373928082865)
+      ((= op-name 308006321)  ; RESTART-CASE
        (compile-restart-case (cadr form) (cddr form) env dest))
       ;; IGNORE-ERRORS — compile body only
-      ((= op-name 1140402238842668217)
+      ((= op-name 97207481)  ; IGNORE-ERRORS
        (compile-progn (cdr form) env dest))
       ;; UNWIND-PROTECT — protected form + cleanup, preserving MV state
       ;; (unwind-protect protected cleanup...)
       ;; Evaluates protected, saves MV state, runs cleanup forms,
       ;; restores MV state, returns primary value of protected form.
-      ((= op-name 446290548490879374)
+      ((= op-name 182681998)  ; UNWIND-PROTECT
        (compile-unwind-protect (cadr form) (cddr form) env dest))
       ;; MACROLET — register local macros, compile body, then unregister
-      ((= op-name 36999051998272136)
+      ((= op-name 309402248)  ; MACROLET
        (let ((saved-macros nil)
              (macro-defs (cadr form))
              (body (cddr form)))
@@ -4651,12 +4793,12 @@
                (setf (gethash (car saved) *macro-table*) (cdr saved))
                (remhash (car saved) *macro-table*)))))
       ;; WITH-OPEN-FILE — compile as let binding stream var to a dummy file stream
-      ((= op-name 258734651587197007)
+      ((= op-name 365656143)  ; WITH-OPEN-FILE
        (let ((spec (cadr form))
              (body (cddr form)))
          (compile-form `(let ((,(car spec) (%make-file-stream))) ,@body) env dest)))
       ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
-      ((= op-name 884158782725716889)
+      ((= op-name 163216281)  ; WITH-OUTPUT-TO-STRING
        (let* ((spec (cadr form))
               (var (car spec))
               (body (cddr form))
@@ -4686,7 +4828,7 @@
       ;; CLHS: (with-input-from-string (var string &key index start end) body)
       ;; The :index argument is a place that gets setf'd to the final
       ;; stream position when the body completes normally.
-      ((= op-name 778706583216373557)
+      ((= op-name 92471093)  ; WITH-INPUT-FROM-STRING
        (let* ((spec (cadr form))
               (var (car spec))
               (str-form (cadr spec))
@@ -4742,14 +4884,14 @@
       ;; expansion finds the right defun.  See compile-multiple-value-bind.)
 
       ;; --- Arithmetic ---
-      ((= op-name 829550095445217828)        (compile-add (cdr form) env dest))
-      ((= op-name 721461107543724402)        (compile-sub (cdr form) env dest))
-      ((= op-name 847564926404219517)        (compile-mul (cdr form) env dest))
-      ((= op-name 757490770535469248)        (compile-div (cdr form) env dest))
+      ((= op-name 124424740)        (compile-add (cdr form) env dest))  ; +
+      ((= op-name 84808050)        (compile-sub (cdr form) env dest))  ; -
+      ((= op-name 131027581)        (compile-mul (cdr form) env dest))  ; *
+      ((= op-name 98013376)        (compile-div (cdr form) env dest))  ; /
       ;; %IDIV-TRUNC — raw integer division (truncate toward zero), one
       ;; pair only.  Used by EXACT-DIVIDE / TRUNCATE / generic helpers
       ;; that need plain IDIV without going through the rational-aware /.
-      ((= op-name 61935208432995099)
+      ((= op-name 163466011)  ; %IDIV-TRUNC
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4763,7 +4905,7 @@
       ;; GENERIC-SUBTRACT / GENERIC-MULTIPLY in their fixnum branches so
       ;; that the slow-path runtime helpers can't infinite-recurse back
       ;; through the rational-aware + - * intrinsics.
-      ((= op-name 600786370690744885)
+      ((= op-name 201671221)  ; %FIXNUM-+
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4772,7 +4914,7 @@
            (emit-ir :pop dest)
            (emit-ir :add dest dest temp)
            (free-temp-reg))))
-      ((= op-name 492697382789251459)
+      ((= op-name 162054531)  ; %FIXNUM--
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4781,7 +4923,7 @@
            (emit-ir :pop dest)
            (emit-ir :sub dest dest temp)
            (free-temp-reg))))
-      ((= op-name 582771539731743196)
+      ((= op-name 195068380)  ; %FIXNUM-*
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4790,11 +4932,11 @@
            (emit-ir :pop dest)
            (emit-ir :mul dest dest temp)
            (free-temp-reg))))
-      ((= op-name 701100176259851453)
+      ((= op-name 249914557)  ; 1+
        (when (arity-ok-p form 1 1 env dest) (compile-1+ (cadr form) env dest)))
-      ((= op-name 593011189432099851)
+      ((= op-name 210297867)  ; 1-
        (when (arity-ok-p form 1 1 env dest) (compile-1- (cadr form) env dest)))
-      ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
+      ((= op-name 396221377) (compile-truncate (cdr form) env dest))  ; TRUNCATE
       ((= op-name (compute-name-hash "%FIXNUM-TRUNCATE2"))
        (compile-fixnum-truncate2 (cdr form) env dest))
 
@@ -4802,7 +4944,7 @@
       ;; %FLOAT-ADD / -SUB / -MUL / -DIV: 2-arg, both already IEEE-float
       ;; objects; emit the IR op which the per-arch translator implements
       ;; (SSE2 on x64, FPU on AArch64, soft-float helper on others).
-      ((= op-name 363733912886848150)
+      ((= op-name 504441494)  ; %FLOAT-ADD
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4812,7 +4954,7 @@
            (emit-ir :gc-check)
            (emit-ir :fadd dest dest temp)
            (free-temp-reg))))
-      ((= op-name 423520786981492675)
+      ((= op-name 99178435)  ; %FLOAT-SUB
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4822,7 +4964,7 @@
            (emit-ir :gc-check)
            (emit-ir :fsub dest dest temp)
            (free-temp-reg))))
-      ((= op-name 108770753001553443)
+      ((= op-name 241991203)  ; %FLOAT-MUL
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4832,7 +4974,7 @@
            (emit-ir :gc-check)
            (emit-ir :fmul dest dest temp)
            (free-temp-reg))))
-      ((= op-name 569140195803361476)
+      ((= op-name 503197892)  ; %FLOAT-DIV
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
            (compile-form a env dest)
@@ -4843,22 +4985,22 @@
            (emit-ir :fdiv dest dest temp)
            (free-temp-reg))))
       ;; %FLOAT-FROM-INT — tagged integer → fresh float object.
-      ((= op-name 457736132923706479)
+      ((= op-name 345394287)  ; %FLOAT-FROM-INT
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (cadr form) env dest)
          (emit-ir :gc-check)
          (emit-ir :itof dest dest)))
       ;; %FLOAT-TO-INT — float → tagged integer (truncate toward zero).
-      ((= op-name 1031108042338437058)
+      ((= op-name 458033090)  ; %FLOAT-TO-INT
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (cadr form) env dest)
          (emit-ir :ftoi dest dest)))
-      ((= op-name 1047143422370414916) (compile-mul26lo (cdr form) env dest))
-      ((= op-name 3053449675996246) (compile-mul26hi (cdr form) env dest))
+      ((= op-name 325386564) (compile-mul26lo (cdr form) env dest))  ; MUL26LO
+      ((= op-name 421051478) (compile-mul26hi (cdr form) env dest))  ; MUL26HI
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
       ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
       ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
-      ((= op-name 654425922550660137)      (compile-mod (cdr form) env dest))
+      ((= op-name 485030953)      (compile-mod (cdr form) env dest))  ; MOD
 
       ;; --- Comparisons ---
       ;; Handle 3-arg comparisons: (<= a b c) → (and (<= a b) (<= b c)).
@@ -4872,63 +5014,63 @@
       ;; later operands silently vanish.  Bind each operand to a fresh
       ;; gensym up front so each runs exactly once, in left-to-right
       ;; order, before any pairwise compare runs.
-      ((and (member op-name '(1027713239215462235 1063742901133465257 1009698407182718722 377678312869028470 305990259964713332))
+      ((and (member op-name '(197056347 210261673 190453506 141337206 411375988))  ; < > = <= >=
             (= (length (cdr form)) 3))
        (let ((a (cadr form)) (b (caddr form)) (c (cadddr form))
              (ta (gensym "CMP-A")) (tb (gensym "CMP-B")) (tc (gensym "CMP-C")))
          (compile-form `(let ((,ta ,a) (,tb ,b) (,tc ,c))
                           (and (,(car form) ,ta ,tb) (,(car form) ,tb ,tc)))
                        env dest)))
-      ((= op-name 1027713239215462235)        (compile-compare :blt (cdr form) env dest))
-      ((= op-name 1063742901133465257)        (compile-compare :bgt (cdr form) env dest))
-      ((= op-name 1009698407182718722)        (compile-compare :beq (cdr form) env dest))
-      ((= op-name 377678312869028470)       (compile-compare :ble (cdr form) env dest))
-      ((= op-name 305990259964713332)       (compile-compare :bge (cdr form) env dest))
-      ((= op-name 644866047583222547)       (compile-eq (cdr form) env dest))
+      ((= op-name 197056347)        (compile-compare :blt (cdr form) env dest))  ; <
+      ((= op-name 210261673)        (compile-compare :bgt (cdr form) env dest))  ; >
+      ((= op-name 190453506)        (compile-compare :beq (cdr form) env dest))  ; =
+      ((= op-name 141337206)       (compile-compare :ble (cdr form) env dest))  ; <=
+      ((= op-name 411375988)       (compile-compare :bge (cdr form) env dest))  ; >=
+      ((= op-name 104921875)       (compile-eq (cdr form) env dest))  ; EQ
 
       ;; --- List Operations ---
-      ((= op-name 131620339109781567)      (when (arity-ok-p form 1 1 env dest) (compile-car (cadr form) env dest)))
-      ((= op-name 960859484116883722)      (when (arity-ok-p form 1 1 env dest) (compile-cdr (cadr form) env dest)))
-      ((= op-name 658831809041752574)      (when (arity-ok-p form 2 2 env dest) (compile-cons (cadr form) (caddr form) env dest)))
-      ((= op-name 643626177239181368)      (when (arity-ok-p form 2 2 env dest) (compile-set-car (cadr form) (caddr form) env dest)))
-      ((= op-name 680584020244584045)      (when (arity-ok-p form 2 2 env dest) (compile-set-cdr (cadr form) (caddr form) env dest)))
-      ((= op-name 599790875489715846)      (when (arity-ok-p form 1 1 env dest) (compile-caar (cadr form) env dest)))
-      ((= op-name 492519292879068819)      (when (arity-ok-p form 1 1 env dest) (compile-cadr (cadr form) env dest)))
-      ((= op-name 779194256552149755)      (when (arity-ok-p form 1 1 env dest) (compile-cdar (cadr form) env dest)))
-      ((= op-name 455511896952479694)      (when (arity-ok-p form 1 1 env dest) (compile-cddr (cadr form) env dest)))
+      ((= op-name 469786687)      (when (arity-ok-p form 1 1 env dest) (compile-car (cadr form) env dest)))  ; CAR
+      ((= op-name 144447754)      (when (arity-ok-p form 1 1 env dest) (compile-cdr (cadr form) env dest)))  ; CDR
+      ((= op-name 67772926)      (when (arity-ok-p form 2 2 env dest) (compile-cons (cadr form) (caddr form) env dest)))  ; CONS
+      ((= op-name 513353784)      (when (arity-ok-p form 2 2 env dest) (compile-set-car (cadr form) (caddr form) env dest)))  ; SET-CAR
+      ((= op-name 193943149)      (when (arity-ok-p form 2 2 env dest) (compile-set-cdr (cadr form) (caddr form) env dest)))  ; SET-CDR
+      ((= op-name 44009094)      (when (arity-ok-p form 1 1 env dest) (compile-caar (cadr form) env dest)))  ; CAAR
+      ((= op-name 128966291)      (when (arity-ok-p form 1 1 env dest) (compile-cadr (cadr form) env dest)))  ; CADR
+      ((= op-name 17580795)      (when (arity-ok-p form 1 1 env dest) (compile-cdar (cadr form) env dest)))  ; CDAR
+      ((= op-name 229121998)      (when (arity-ok-p form 1 1 env dest) (compile-cddr (cadr form) env dest)))  ; CDDR
 
       ;; --- Bitwise Operations ---
-      ((= op-name 245376457710419216)   (compile-logand (cdr form) env dest))
-      ((= op-name 444641700551290191)   (compile-logior (cdr form) env dest))
-      ((= op-name 91997575206662710)   (compile-logxor (cdr form) env dest))
+      ((= op-name 9878800)   (compile-logand (cdr form) env dest))  ; LOGAND
+      ((= op-name 256208207)   (compile-logior (cdr form) env dest))  ; LOGIOR
+      ((= op-name 391033398)   (compile-logxor (cdr form) env dest))  ; LOGXOR
       ;; %word-log{and,ior,xor}: raw tagged-word bitwise (no dispatch/error),
       ;; used by generic-log*'s non-integer fallback.
-      ((= op-name 971449395863493638)   (compile-word-logand (cdr form) env dest))
-      ((= op-name 643978041343708313)   (compile-word-logior (cdr form) env dest))
-      ((= op-name 256699368442599680)   (compile-word-logxor (cdr form) env dest))
-      ((= op-name 498596602025227109)      (when (arity-ok-p form 2 2 env dest) (compile-ash (cadr form) (caddr form) env dest)))
-      ((= op-name 707618725562015373)      (when (arity-ok-p form 2 2 env dest) (compile-ldb (cadr form) (caddr form) env dest)))
+      ((= op-name 135535622)   (compile-word-logand (cdr form) env dest))  ; %WORD-LOGAND
+      ((= op-name 513658009)   (compile-word-logior (cdr form) env dest))  ; %WORD-LOGIOR
+      ((= op-name 448207104)   (compile-word-logxor (cdr form) env dest))  ; %WORD-LOGXOR
+      ((= op-name 519566181)      (when (arity-ok-p form 2 2 env dest) (compile-ash (cadr form) (caddr form) env dest)))  ; ASH
+      ((= op-name 393961101)      (when (arity-ok-p form 2 2 env dest) (compile-ldb (cadr form) (caddr form) env dest)))  ; LDB
 
       ;; --- Type Predicates (all 1-arg) ---
-      ((= op-name 1034692707450833644)     (when (arity-ok-p form 1 1 env dest) (compile-null (cadr form) env dest)))
-      ((= op-name 791386596785250882)      (when (arity-ok-p form 1 1 env dest) (compile-null (cadr form) env dest)))
-      ((= op-name 193192138738169214)      (when (arity-ok-p form 1 1 env dest) (compile-consp (cadr form) env dest)))
-      ((= op-name 1084402973118869726)     (when (arity-ok-p form 1 1 env dest) (compile-fixnump (cadr form) env dest)))
-      ((= op-name 105613410085771328)      (when (arity-ok-p form 1 1 env dest) (compile-atom-p (cadr form) env dest)))
-      ((= op-name 197121891723777229)      (when (arity-ok-p form 1 1 env dest) (compile-listp (cadr form) env dest)))
-      ((= op-name 1005235261373835305)     (when (arity-ok-p form 1 1 env dest) (compile-symbolp (cadr form) env dest)))
-      ((= op-name 701502595840197579)      (when (arity-ok-p form 1 1 env dest) (compile-obj-subtag (cadr form) env dest)))
-      ((= op-name 1091515641497713485)     (when (arity-ok-p form 1 1 env dest) (compile-bignump (cadr form) env dest)))
-      ((= op-name 113022884777089022)      (when (arity-ok-p form 1 1 env dest) (compile-ratiop (cadr form) env dest)))
-      ((= op-name 1024588698656382250)     (when (arity-ok-p form 1 1 env dest) (compile-stringp (cadr form) env dest)))
-      ((= op-name 959229030243575902)      (when (arity-ok-p form 1 1 env dest) (compile-arrayp (cadr form) env dest)))
-      ((= op-name 467922512990154729)      (when (arity-ok-p form 1 1 env dest) (compile-integerp (cadr form) env dest)))
-      ((= op-name 641752649465622469)      (when (arity-ok-p form 1 1 env dest) (compile-zerop (cadr form) env dest)))
-      ((= op-name 322465010757792166)      (when (arity-ok-p form 1 1 env dest) (compile-characterp (cadr form) env dest)))
+      ((= op-name 394857196)     (when (arity-ok-p form 1 1 env dest) (compile-null (cadr form) env dest)))  ; NULL
+      ((= op-name 300589634)      (when (arity-ok-p form 1 1 env dest) (compile-null (cadr form) env dest)))  ; NOT
+      ((= op-name 456799614)      (when (arity-ok-p form 1 1 env dest) (compile-consp (cadr form) env dest)))  ; CONSP
+      ((= op-name 314716382)     (when (arity-ok-p form 1 1 env dest) (compile-fixnump (cadr form) env dest)))  ; FIXNUMP
+      ((= op-name 383129664)      (when (arity-ok-p form 1 1 env dest) (compile-atom-p (cadr form) env dest)))  ; ATOM
+      ((= op-name 290510029)      (when (arity-ok-p form 1 1 env dest) (compile-listp (cadr form) env dest)))  ; LISTP
+      ((= op-name 270854185)     (when (arity-ok-p form 1 1 env dest) (compile-symbolp (cadr form) env dest)))  ; SYMBOLP
+      ((= op-name 484754379)      (when (arity-ok-p form 1 1 env dest) (compile-obj-subtag (cadr form) env dest)))  ; OBJ-SUBTAG
+      ((= op-name 397507405)     (when (arity-ok-p form 1 1 env dest) (compile-bignump (cadr form) env dest)))  ; BIGNUMP
+      ((= op-name 162994174)      (when (arity-ok-p form 1 1 env dest) (compile-ratiop (cadr form) env dest)))  ; RATIOP
+      ((= op-name 301866282)     (when (arity-ok-p form 1 1 env dest) (compile-stringp (cadr form) env dest)))  ; STRINGP
+      ((= op-name 498640990)      (when (arity-ok-p form 1 1 env dest) (compile-arrayp (cadr form) env dest)))  ; ARRAYP
+      ((= op-name 84668393)      (when (arity-ok-p form 1 1 env dest) (compile-integerp (cadr form) env dest)))  ; INTEGERP
+      ((= op-name 379744197)      (when (arity-ok-p form 1 1 env dest) (compile-zerop (cadr form) env dest)))  ; ZEROP
+      ((= op-name 3682726)      (when (arity-ok-p form 1 1 env dest) (compile-characterp (cadr form) env dest)))  ; CHARACTERP
 
       ;; --- Character Operations (1-arg) ---
-      ((= op-name 511431138979586071) (when (arity-ok-p form 1 1 env dest) (compile-char-code (cadr form) env dest)))
-      ((= op-name 632535660519644111) (when (arity-ok-p form 1 1 env dest) (compile-code-char (cadr form) env dest)))
+      ((= op-name 401170455) (when (arity-ok-p form 1 1 env dest) (compile-char-code (cadr form) env dest)))  ; CHAR-CODE
+      ((= op-name 399825871) (when (arity-ok-p form 1 1 env dest) (compile-code-char (cadr form) env dest)))  ; CODE-CHAR
 
       ;; --- EQL ---
       ;; Identity is the right answer for fixnums/chars/symbols/nil/t,
@@ -4937,15 +5079,15 @@
       ;; identity check, then on mismatch fall through to the runtime
       ;; eql defun (cl-types.lisp:1144) which does the boxed-numeric
       ;; slot compare.
-      ((= op-name 743927193407775751)      (compile-eql (cdr form) env dest))
-      ;; NOTE: EQUAL (hash 777630921077348411) is NOT inlined as EQ — it's a
+      ((= op-name 366437383)      (compile-eql (cdr form) env dest))  ; EQL
+      ;; NOTE: EQUAL (hash 322164795) is NOT inlined as EQ — it's a
       ;; user-defined function (structural equality), dispatched via compile-call.
 
       ;; --- %GET-NARGS — read the caller-supplied arg count (tagged
       ;; fixnum) from the nargs convention slot.  Must be the first form
       ;; evaluated in a function body (before any nested call overwrites
       ;; the slot).  Used by &optional supplied-p binding. ---
-      ((= op-name 291167260277925928)
+      ((= op-name 253012008)  ; %GET-NARGS
        (let ((d (or dest (alloc-temp-reg))))
          (emit-ir :get-nargs d)
          (unless dest (free-temp-reg))))
@@ -4954,40 +5096,40 @@
       ;; (%mcgc-collect) -> emit :mcgc-collect IR.  translate-x64 turns it into
       ;; an unconditional CALL to the page-GC trampoline when pinning is on,
       ;; else a no-op.  Lets the pin-stress probe force a full collection.
-      ((= op-name 921463927867368627)
+      ((= op-name 311387315)  ; %MCGC-COLLECT
        (emit-ir :mcgc-collect)
        (when dest (emit-ir :li dest +nil-value+)))
 
       ;; --- Memory Operations (2-arg) ---
-      ((= op-name 900047298083458158)  (when (arity-ok-p form 2 2 env dest) (compile-mem-ref (cadr form) (caddr form) env dest)))
-      ((= op-name 61397303667544258)   (when (arity-ok-p form 2 2 env dest) (compile-setf (cadr form) (caddr form) env dest)))
+      ((= op-name 473926766)  (when (arity-ok-p form 2 2 env dest) (compile-mem-ref (cadr form) (caddr form) env dest)))  ; MEM-REF
+      ((= op-name 8753346)   (when (arity-ok-p form 2 2 env dest) (compile-setf (cadr form) (caddr form) env dest)))  ; %SETF-MEM-REF
 
       ;; --- I/O Port Operations ---
-      ((= op-name 951008440734391765)  (compile-io-out-byte (cadr form) (caddr form) env dest))
-      ((= op-name 64505486828081420)   (compile-io-in-byte (cadr form) env dest))
-      ((= op-name 402197317922113957) (compile-io-out-dword (cadr form) (caddr form) env dest))
-      ((= op-name 157364223757942884)  (compile-io-in-dword (cadr form) env dest))
+      ((= op-name 153312725)  (compile-io-out-byte (cadr form) (caddr form) env dest))  ; IO-OUT-BYTE
+      ((= op-name 191238412)   (compile-io-in-byte (cadr form) env dest))  ; IO-IN-BYTE
+      ((= op-name 72632741) (compile-io-out-dword (cadr form) (caddr form) env dest))  ; IO-OUT-DWORD
+      ((= op-name 300777572)  (compile-io-in-dword (cadr form) env dest))  ; IO-IN-DWORD
 
       ;; --- Serial Console ---
-      ((= op-name 821056500804198866) (compile-write-char-serial (cdr form) env dest))
-      ((= op-name 602746553318600181)  (compile-read-char-serial dest))
+      ((= op-name 445227474) (compile-write-char-serial (cdr form) env dest))  ; WRITE-CHAR-SERIAL
+      ((= op-name 46919157)  (compile-read-char-serial dest))  ; READ-CHAR-SERIAL
 
       ;; --- SAP (System Area Pointer) ---
-      ((= op-name 613080895778544554) (compile-make-sap (cdr form) env dest))
-      ((= op-name 848425955895126923) (compile-make-sap-raw (cdr form) env dest))
-      ((= op-name 815904472968259812) (compile-sap-ref (cdr form) env dest :u8))
-      ((= op-name 333410446086126141) (compile-sap-ref (cdr form) env dest :u32))
-      ((= op-name 622121571885883806) (compile-sap-ref (cdr form) env dest :u64))
-      ((= op-name 922421810905006511) (compile-sap-set (cdr form) env :u8))
-      ((= op-name 550869834617056174) (compile-sap-set (cdr form) env :u32))
-      ((= op-name 334162645828734861) (compile-sap-set (cdr form) env :u64))
-      ((= op-name 124167155243180718) (compile-sap-addr (cdr form) env dest))
+      ((= op-name 433298346) (compile-make-sap (cdr form) env dest))  ; MAKE-SAP
+      ((= op-name 384396171) (compile-make-sap-raw (cdr form) env dest))  ; MAKE-SAP-RAW
+      ((= op-name 214673636) (compile-sap-ref (cdr form) env dest :u8))  ; SAP-REF-8
+      ((= op-name 50919997) (compile-sap-ref (cdr form) env dest :u32))  ; SAP-REF-32
+      ((= op-name 407249310) (compile-sap-ref (cdr form) env dest :u64))  ; SAP-REF-64
+      ((= op-name 431997359) (compile-sap-set (cdr form) env :u8))  ; SAP-SET-8
+      ((= op-name 355609518) (compile-sap-set (cdr form) env :u32))  ; SAP-SET-32
+      ((= op-name 254267277) (compile-sap-set (cdr form) env :u64))  ; SAP-SET-64
+      ((= op-name 22979246) (compile-sap-addr (cdr form) env dest))  ; SAP-ADDRESS
 
       ;; --- Linux Syscalls ---
-      ((= op-name 874449673647888811) (compile-sys-exit (cdr form) env dest))
-      ((= op-name 385320872711688559) (compile-syscall3 (cdr form) env dest))
-      ((= op-name 439365366662434738) (compile-syscall6 (cdr form) env dest))
-      ((= op-name 84019503938880062)  (compile-syscall3-raw (cdr form) env dest))
+      ((= op-name 190339499) (compile-sys-exit (cdr form) env dest))  ; SYS-EXIT
+      ((= op-name 256561519) (compile-syscall3 (cdr form) env dest))  ; SYSCALL3
+      ((= op-name 276369330) (compile-syscall6 (cdr form) env dest))  ; SYSCALL6
+      ((= op-name 525009470)  (compile-syscall3-raw (cdr form) env dest))  ; SYSCALL3-RAW
       ;; AArch64 Linux *at fileio helpers — see translate-aarch64.lisp traps
       ;; 0x0506..0x050A and the cl-fileio override block in
       ;; build-aarch64-linux.lisp.  Not callable on bare-metal
@@ -5030,89 +5172,89 @@
 
       ;; --- Error Handler (handler-case support) ---
       ;; (%hc-longjmp) — longjmp to nearest handler-case
-      ((= op-name 792633669140441529) (compile-hc-longjmp dest))
+      ((= op-name 2058681) (compile-hc-longjmp dest))  ; %HC-LONGJMP
       ;; (%error-handler-active-p) — check if a handler-case is active
-      ((= op-name 904577799958313483) (compile-error-handler-active-p dest))
+      ((= op-name 347568651) (compile-error-handler-active-p dest))  ; %ERROR-HANDLER-ACTIVE-P
       ;; (%install-signal-handlers handler-addr) — install SIGSEGV/etc handlers
       ((= op-name (compute-name-hash "%INSTALL-SIGNAL-HANDLERS"))
        (compile-install-signal-handlers (cdr form) env dest))
 
       ;; --- Timestamp Counter ---
-      ((= op-name 580098868411189197) (compile-rdtsc dest))
+      ((= op-name 215533517) (compile-rdtsc dest))  ; RDTSC
 
       ;; --- Wait For Interrupt ---
-      ((= op-name 703562642750212015) (compile-wfi dest))
+      ((= op-name 243189679) (compile-wfi dest))  ; WFI
 
       ;; --- Setup IRQ ---
-      ((= op-name 208317008853653791)  (compile-setup-irq dest))
+      ((= op-name 389503263)  (compile-setup-irq dest))  ; SETUP-IRQ
       ;; --- Timer Rearm ---
-      ((= op-name 590227155880225484) (compile-timer-rearm dest))
+      ((= op-name 142125772) (compile-timer-rearm dest))  ; TIMER-REARM
 
       ;; --- NIC Interrupt Setup ---
-      ((= op-name 1009685354534069733) (compile-setup-nic-idt dest))
-      ((= op-name 739607750214719398)  (compile-nic-irq-unmask dest))
+      ((= op-name 528147941) (compile-setup-nic-idt dest))  ; SETUP-NIC-IDT
+      ((= op-name 492083110)  (compile-nic-irq-unmask dest))  ; NIC-IRQ-UNMASK
 
       ;; --- Outer-handler save/clear/restore (AArch64 fork-file fallback) ---
-      ((= op-name 290749171156322546)  (compile-save-outer-handler dest))
-      ((= op-name 1092167958334654506) (compile-clear-outer-handler dest))
-      ((= op-name 987952812817568243)  (compile-restore-outer-handler dest))
+      ((= op-name 315918578)  (compile-save-outer-handler dest))  ; %SAVE-OUTER-HANDLER
+      ((= op-name 150505514) (compile-clear-outer-handler dest))  ; %CLEAR-OUTER-HANDLER
+      ((= op-name 165237235)  (compile-restore-outer-handler dest))  ; %RESTORE-OUTER-HANDLER
 
       ;; --- MMIO (raw 32-bit address at 0x600140, result at 0x600148) ---
-      ((= op-name 372079205816461105)  (compile-mmio-do-read32 dest))
-      ((= op-name 186965853563265998) (compile-mmio-do-write32 dest))
+      ((= op-name 68216625)  (compile-mmio-do-read32 dest))  ; MMIO-DO-READ32
+      ((= op-name 477373390) (compile-mmio-do-write32 dest))  ; MMIO-DO-WRITE32
       ;; --- Raw I/O port read (port in low 16 of [0x600140], result at 0x600148) ---
-      ((= op-name 581371924726892981) (compile-io-in-dword-raw dest))
+      ((= op-name 313477557) (compile-io-in-dword-raw dest))  ; IO-IN-DWORD-RAW
       ;; --- PCI config read (V0=addr without enable, result at 0x600148) ---
-      ((= op-name 587268234776988492) (compile-pci-config-read-raw (cadr form) env dest))
+      ((= op-name 89721676) (compile-pci-config-read-raw (cadr form) env dest))  ; PCI-CONFIG-READ-RAW
 
       ;; --- Memory Barrier ---
-      ((= op-name 1082210422183761822) (compile-memory-barrier dest))
+      ((= op-name 145037214) (compile-memory-barrier dest))  ; MEMORY-BARRIER
       ;; --- Cache Flush (WBINVD on x86, NOP on others) ---
-      ((= op-name 70198493141306239) (compile-wbinvd dest))
+      ((= op-name 86526847) (compile-wbinvd dest))  ; WBINVD
 
       ;; --- System Registers ---
-      ((= op-name 756709414635220786)   (compile-get-alloc-ptr dest))
-      ((= op-name 1055755022150105225) (compile-get-alloc-limit dest))
-      ((= op-name 193475663400074726)   (compile-set-alloc-ptr (cadr form) env dest))
-      ((= op-name 831645445086829693) (compile-set-alloc-limit (cadr form) env dest))
-      ((= op-name 541448696650310846)           (compile-untag (cadr form) env dest))
+      ((= op-name 523513650)   (compile-get-alloc-ptr dest))  ; GET-ALLOC-PTR
+      ((= op-name 194607241) (compile-get-alloc-limit dest))  ; GET-ALLOC-LIMIT
+      ((= op-name 488062438)   (compile-set-alloc-ptr (cadr form) env dest))  ; SET-ALLOC-PTR
+      ((= op-name 421551229) (compile-set-alloc-limit (cadr form) env dest))  ; SET-ALLOC-LIMIT
+      ((= op-name 481862846)           (compile-untag (cadr form) env dest))  ; UNTAG
 
       ;; --- Actor/Context Primitives ---
-      ((= op-name 746185050329267356)    (compile-save-context (cadr form) env dest))
-      ((= op-name 876713729717888613) (compile-restore-context (cadr form) env dest))
-      ((= op-name 949162595018862897)     (compile-call-native (cdr form) env dest))
+      ((= op-name 458865820)    (compile-save-context (cadr form) env dest))  ; SAVE-CONTEXT
+      ((= op-name 377349733) (compile-restore-context (cadr form) env dest))  ; RESTORE-CONTEXT
+      ((= op-name 442102065)     (compile-call-native (cdr form) env dest))  ; CALL-NATIVE
 
       ;; --- SMP Primitives ---
-      ((= op-name 64976006036515571) (compile-xchg-mem (cadr form) (caddr form) env dest))
-      ((= op-name 133047071382386485)    (compile-pause dest))
-      ((= op-name 532818990203984097)   (compile-mfence dest))
-      ((= op-name 930330168574267847)      (compile-hlt dest))
-      ((= op-name 637964639327971374)    (compile-wrmsr (cdr form) env dest))
-      ((= op-name 2665441512406489)      (compile-sti dest))
-      ((= op-name 295712735144528609)      (compile-cli dest))
-      ((= op-name 535690985964426756)  (compile-sti-hlt dest))
+      ((= op-name 391473907) (compile-xchg-mem (cadr form) (caddr form) env dest))  ; XCHG-MEM
+      ((= op-name 228292405)    (compile-pause dest))  ; PAUSE
+      ((= op-name 336353505)   (compile-mfence dest))  ; MFENCE
+      ((= op-name 308007367)      (compile-hlt dest))  ; HLT
+      ((= op-name 24487982)    (compile-wrmsr (cdr form) env dest))  ; WRMSR
+      ((= op-name 406093273)      (compile-sti dest))  ; STI
+      ((= op-name 355093217)      (compile-cli dest))  ; CLI
+      ((= op-name 136123908)  (compile-sti-hlt dest))  ; STI-HLT
 
       ;; --- Per-CPU Data ---
-      ((= op-name 1049169163874840266)       (compile-percpu-ref (cadr form) env dest))
-      ((= op-name 815670105998589857)       (compile-percpu-set (cadr form) (caddr form) env dest))
-      ((= op-name 76399844366031519) (compile-switch-idle-stack dest))
-      ((= op-name 796316490043394273)          (compile-set-rsp (cadr form) env dest))
-      ((= op-name 1011033367071895394)             (compile-lidt (cadr form) env dest))
+      ((= op-name 97234634)       (compile-percpu-ref (cadr form) env dest))  ; PERCPU-REF
+      ((= op-name 396623777)       (compile-percpu-set (cadr form) (caddr form) env dest))  ; PERCPU-SET
+      ((= op-name 222354079) (compile-switch-idle-stack dest))  ; SWITCH-IDLE-STACK
+      ((= op-name 362858721)          (compile-set-rsp (cadr form) env dest))  ; SET-RSP
+      ((= op-name 159231842)             (compile-lidt (cadr form) env dest))  ; LIDT
 
       ;; --- Jump ---
-      ((= op-name 659104475066268328)  (compile-jump-to-address (cadr form) env dest))
+      ((= op-name 470235816)  (compile-jump-to-address (cadr form) env dest))  ; JUMP-TO-ADDRESS
 
       ;; --- Function Address ---
-      ((= op-name 532864888570260201)          (compile-fn-addr (cadr form) dest))
+      ((= op-name 499837673)          (compile-fn-addr (cadr form) dest))  ; FN-ADDR
 
       ;; --- Symbol allocation ---
-      ((= op-name 45246193365715235)    (compile-make-symbol dest))  ; %make-symbol
-      ((= op-name 977538405397341142)   (compile-make-keyword-obj dest))  ; %make-keyword-obj
-      ((= op-name 559186982902022686)   (compile-alloc-sym3 dest))   ; %alloc-sym3
-      ((= op-name 273316247894500307)   (compile-alloc-mda-raw dest)) ; %alloc-mda-raw
-      ((= op-name 810904247565536455)   (compile-make-bignum dest))  ; %make-bignum
-      ((= op-name 735635543474837196)   (compile-make-ratio dest))   ; %make-ratio
-      ((= op-name 1084136681741725453) (compile-make-float dest))  ; %make-float
+      ((= op-name 522996003)    (compile-make-symbol dest))  ; %make-symbol
+      ((= op-name 167781334)   (compile-make-keyword-obj dest))  ; %make-keyword-obj
+      ((= op-name 26804766)   (compile-alloc-sym3 dest))   ; %alloc-sym3
+      ((= op-name 61727699)   (compile-alloc-mda-raw dest)) ; %alloc-mda-raw
+      ((= op-name 152947911)   (compile-make-bignum dest))  ; %make-bignum
+      ((= op-name 10557132)   (compile-make-ratio dest))   ; %make-ratio
+      ((= op-name 9531149) (compile-make-float dest))  ; %make-float
       ((= op-name (compute-name-hash "%MAKE-FLOAT2")) (compile-make-float2 dest))
       ((= op-name (compute-name-hash "%MAKE-SINGLE2")) (compile-make-single2 dest))
       ((= op-name (compute-name-hash "%MAKE-SHORT2")) (compile-make-short2 dest))
@@ -5122,24 +5264,24 @@
       ;; Replaces (cons #'fn env) for closure object creation. The
       ;; cons form collided with CL symbols (also cons cells) in the
       ;; funcall dispatch; see ansi-notes.md.
-      ((= op-name 82305594443552132)
+      ((= op-name 142644612)  ; %MAKE-CLOSURE
        (when (arity-ok-p form 2 2 env dest)
          (compile-make-closure (cadr form) (caddr form) env dest)))
 
       ;; --- Array Operations ---
-      ((= op-name 686483400154579705)       (compile-make-array form env dest))
+      ((= op-name 17023737)       (compile-make-array form env dest))  ; MAKE-ARRAY
       ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
       ((= op-name (compute-name-hash "%MAKE-STRING-ARRAY"))
        (compile-make-string-array (cadr form) env dest))
-      ((= op-name 568601634040735695)             (compile-aref-form form env dest))
+      ((= op-name 338454479)             (compile-aref-form form env dest))  ; AREF
       ;; SVREF — same machinery as AREF but strict 2-arg arity (CLHS):
       ;; `(svref vec idx)` is illegal with extra args.
-      ((= op-name 216456113736582507)
+      ((= op-name 28329323)  ; SVREF
        (cond
          ((= (length (cdr form)) 2) (compile-aref-form form env dest))
          (t (compile-arity-error env dest))))
-      ((= op-name 416706424900304020)             (compile-aset-form form env dest))
-      ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
+      ((= op-name 273235092)             (compile-aset-form form env dest))  ; ASET
+      ((= op-name 331512983)     (compile-array-length (cadr form) env dest))  ; ARRAY-LENGTH
       ;; %PRIM-AREF / %PRIM-ASET / %PRIM-ARRAY-LENGTH / %PRIM-STRINGP —
       ;; non-wrapper-peeling variants used internally by the wrapper-aware
       ;; trampolines emitted by compile-aref/compile-aset/compile-array-length/
@@ -5183,7 +5325,7 @@
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
       ;; For complex places (aref etc.): fall back to compile-call (runtime %rotatef2)
-      ((= op-name 1044059997085533624)
+      ((= op-name 520684984)  ; ROTATEF
        (let ((places (cdr form)))
          (cond
            ;; No places: no-op
@@ -5214,7 +5356,7 @@
 
       ;; SHIFTF — (shiftf place1 place2 ... new-val) → shift values left, return old first
       ;; (shiftf p1 p2 nv) → (let ((old p1)) (setf p1 p2) (setf p2 nv) old)
-      ((= op-name 1101471631057784809)
+      ((= op-name 379375593)  ; SHIFTF
        (let ((all (cdr form)))
          (when (>= (length all) 2)
            (let* ((places (butlast all))
@@ -5228,25 +5370,25 @@
                               ,(car tmps)) env dest)))))
 
       ;; NTH-VALUE — (nth-value n form) → (nth n (multiple-value-list form))
-      ((= op-name 134258368733485643)
+      ((= op-name 457595467)  ; NTH-VALUE
        (let ((n (cadr form))
              (form-arg (caddr form)))
          (compile-form `(nth ,n (multiple-value-list ,form-arg)) env dest)))
 
       ;; PROG — (prog bindings {tag|form}...) → (let bindings (block nil (tagbody...)))
-      ((= op-name 467831526245976269)
+      ((= op-name 306923725)  ; PROG
        (let ((bindings (cadr form))
              (body (cddr form)))
          (compile-form `(let ,bindings (block nil (tagbody ,@body))) env dest)))
 
       ;; PROG* — (prog* bindings {tag|form}...) → (let* bindings (block nil (tagbody...)))
-      ((= op-name 735983952601536591)
+      ((= op-name 495016015)  ; PROG*
        (let ((bindings (cadr form))
              (body (cddr form)))
          (compile-form `(let* ,bindings (block nil (tagbody ,@body))) env dest)))
 
       ;; LOOP-FINISH — exit the current loop (like (return) from a loop)
-      ((= op-name 246420928440230597)
+      ((= op-name 377971397)  ; LOOP-FINISH
        (if *loop-exit-label*
            (progn
              (compile-nil dest)
@@ -5259,7 +5401,7 @@
            (compile-nil dest)))
 
       ;; BIT — like aref but for bit arrays: (bit array index)
-      ((= op-name 675678019619508760)
+      ((= op-name 496243224)  ; BIT
        (compile-form `(aref ,(cadr form) ,(caddr form)) env dest))
 
       ;; ARRAY-IN-BOUNDS-P — (array-in-bounds-p array index...)
@@ -5268,7 +5410,7 @@
       ;; truncates the user-visible length but the underlying storage
       ;; still backs the full dimension).  Use %array-raw-length to
       ;; bypass fp slicing — array-length itself is fp-aware for MDAs.
-      ((= op-name 57704008642470133)
+      ((= op-name 24994037)  ; ARRAY-IN-BOUNDS-P
        (let ((arr (cadr form))
              (indices (cddr form)))
          (cond
@@ -5286,22 +5428,22 @@
                             env dest)))))
 
       ;; THE — (the type form) → compile form, ignore type declaration
-      ((= op-name 977942333759456998)
+      ((= op-name 425658086)  ; THE
        (compile-form (caddr form) env dest))
 
       ;; DECLARE — skip when found in non-declaration position
-      ((= op-name 524150358979133175)
+      ((= op-name 133791479)  ; DECLARE
        (compile-nil dest))
 
       ;; LOCALLY — (locally decl... body...) → compile body, skip declare forms
-      ((= op-name 931620444762315919)
+      ((= op-name 131849359)  ; LOCALLY
        (let ((body (remove-if (lambda (f)
-                                (and (consp f) (= (normalize-name (car f)) 524150358979133175)))
+                                (and (consp f) (= (normalize-name (car f)) 133791479)))  ; DECLARE
                               (cdr form))))
          (compile-progn body env dest)))
 
       ;; LOAD-TIME-VALUE — (load-time-value form &optional read-only-p) → compile form
-      ((= op-name 535180122462347159)
+      ((= op-name 394026903)  ; LOAD-TIME-VALUE
        (compile-form (cadr form) env dest))
 
       ;; SYMBOL-MACROLET — (symbol-macrolet ((name expansion-form)*) body*)
@@ -5311,7 +5453,7 @@
       ;; expansion instead.  Per ANSI, SETF on a symbol-macrolet name
       ;; is equivalent to SETF on the expansion — handled in compile-setq
       ;; via the same env lookup.
-      ((= op-name 494270185402127659)
+      ((= op-name 1922347)  ; SYMBOL-MACROLET
        (let* ((sm-bindings (cadr form))
               (sm-body (cddr form))
               (new-bindings (compile-env-bindings env)))
@@ -5337,7 +5479,7 @@
       ;; LOAD), or no situations, it evaluates to NIL.  (Top-level
       ;; processing is handled separately in mvm-compile-toplevel, where MVM
       ;; collapses compile/load to a single execute phase.)
-      ((= op-name 1086924202144944840)
+      ((= op-name 130912968)  ; EVAL-WHEN
        (let ((situations (cadr form))
              (run nil))
          (dolist (s situations)
@@ -5358,7 +5500,7 @@
       ;; correct results for tests where the body's writes to those
       ;; vars are clobbered by restore on exit (e.g. PROGV.6A), and
       ;; for any test that doesn't probe boundp of unbound vars.
-      ((= op-name 519861365770534371)
+      ((= op-name 187203043)  ; PROGV
        (let ((vars-form  (cadr form))
              (vals-form  (caddr form))
              (body-forms (cdddr form)))
@@ -5379,7 +5521,7 @@
       ;; catches with the SAME tag (the inner catches the throw); good
       ;; enough for most ANSI tests. The tag is evaluated once and saved
       ;; locally so it isn't re-evaluated by the handler.
-      ((= op-name 773672091476800706)
+      ((= op-name 44774594)  ; CATCH
        (let ((tag-form (cadr form))
              (body-forms (cddr form)))
          (compile-form
@@ -5397,7 +5539,7 @@
 
       ;; THROW — (throw tag value) — set globals, signal error to unwind
       ;; to the nearest CATCH. The (error ...) call longjmps out.
-      ((= op-name 679248612953119241)
+      ((= op-name 218356233)  ; THROW
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
@@ -5423,7 +5565,7 @@
       ;; This is a SEPARATE op from user-visible THROW so that the change
       ;; does NOT alter restart-case / catch internals that rely on the
       ;; full (error "throw") signal path.
-      ((= op-name 655266345339067571)   ; (compute-name-hash "%NLX-THROW")
+      ((= op-name 423943347)   ; (compute-name-hash "%NLX-THROW")
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
          (compile-form
@@ -5439,7 +5581,7 @@
       ;; TYPECASE — (typecase key (type1 form1...) ...) → rewrite as let + cond typep
       ;; Per CLHS, an empty-body clause whose type matches returns NIL
       ;; (not the truth value).  Wrap body with (or body '(nil)).
-      ((= op-name 578189417670937395)
+      ((= op-name 70667059)  ; TYPECASE
        (let ((key-form (cadr form))
              (clauses (cddr form))
              (tmp (gensym "TC")))
@@ -5462,8 +5604,8 @@
       ;; TYPECASE macro, then append a (t (%signal-type-error)) fall-through.
       ;; CTYPECASE is restartable in full CL; we degrade it to the
       ;; ETYPECASE signalling behaviour (CLAUDE.md documented pattern).
-      ((or (= op-name 152261594881962774)    ; ETYPECASE
-           (= op-name 575883593470696800))   ; CTYPECASE
+      ((or (= op-name 287126294)    ; ETYPECASE
+           (= op-name 320052576))   ; CTYPECASE
        (let ((key-form (cadr form))
              (clauses (cddr form))
              (tmp (gensym "ETC")))
@@ -5481,7 +5623,7 @@
       ;; CCASE — like CASE but signals TYPE-ERROR on no-match (restartable
       ;; in full CL; degraded to the ECASE signalling behaviour per the
       ;; CLAUDE.md documented pattern).  T / OTHERWISE are ordinary keys.
-      ((= op-name 53423618847963656)
+      ((= op-name 209697288)  ; CCASE
        (compile-form `(ecase ,(cadr form) ,@(cddr form)) env dest))
 
       ;; --- Function Call (default) ---
@@ -5493,10 +5635,10 @@
       ;; which silently made the whole package system a stub and cost
       ;; ~980 passes on cl-symbols.lsp.  Now they fall through to
       ;; compile-call so the real defuns get invoked.
-      ((member op-name '(757877016639086236   ; PROVIDE
-                          313710498321880194   ; REQUIRE
-                          1094519557412445920  ; PROCLAIM
-                          90289849190648180))  ; DECLAIM
+      ((member op-name '(86089372   ; PROVIDE
+                          101258370   ; REQUIRE
+                          62725856  ; PROCLAIM
+                          102992244))  ; DECLAIM
        (compile-nil dest))
 
       (t (compile-call op (cdr form) env dest)))))
@@ -6238,7 +6380,7 @@
                          (string= (symbol-name op) "SETF")
                          (string= (symbol-name op) "PSETQ")
                          (string= (symbol-name op) "PSETF")))
-                (and (integerp op) (= op 565254038635891948)))))  ; setq hash
+                (and (integerp op) (= op 260934892)))))  ; setq hash
      (let ((args (cdr form))
            (result nil)
            (i 0))
@@ -6287,7 +6429,7 @@
     ;; Skip init of lambda params — they shadow the outer vars
     ((and (consp form)
           (or (and (symbolp (car form)) (string= (symbol-name (car form)) "LAMBDA"))
-              (and (integerp (car form)) (= (car form) 527981956251550024))))  ; lambda hash
+              (and (integerp (car form)) (= (car form) 80380232))))  ; lambda hash
      ;; Collect mutations in lambda body but shadow params from bound-vars
      (let* ((params (if (consp (cadr form)) (cadr form) nil))
             (inner-bound (remove-if (lambda (v)
@@ -6307,8 +6449,8 @@
           (or (and (symbolp (car form))
                    (or (string= (symbol-name (car form)) "FLET")
                        (string= (symbol-name (car form)) "LABELS")))
-              (and (integerp (car form)) (= (car form) 230909053785822708))   ; flet hash
-              (and (integerp (car form)) (= (car form) 176230696681611090)))) ; labels hash
+              (and (integerp (car form)) (= (car form) 445617652))   ; flet hash
+              (and (integerp (car form)) (= (car form) 417505106)))) ; labels hash
      (let ((defs (cadr form))
            (rest-body (cddr form))
            (results nil))
@@ -6352,7 +6494,7 @@
                  (cond
                    ;; lambda — now we're inside a lambda, check for setq of let-vars
                    ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
-                        (and (integerp op) (= op 527981956251550024)))
+                        (and (integerp op) (= op 80380232)))  ; LAMBDA
                     ;; Find vars setq'd in this lambda's body (shadowing its own params)
                     (let* ((params (if (consp (cadr form)) (cadr form) nil))
                            (visible-vars (remove-if
@@ -6367,7 +6509,7 @@
                         (scan f t))))
                    ;; function literal — same as lambda
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
-                        (and (integerp op) (= op 113179339635393781)))
+                        (and (integerp op) (= op 402801909)))  ; FUNCTION
                     (scan (cadr form) in-lambda))
                    ;; FLET / LABELS — each function body is a separate
                    ;; function (compiled by mvm-compile-function-internal)
@@ -6377,8 +6519,8 @@
                    ((or (and (symbolp op)
                              (or (string= (symbol-name op) "FLET")
                                  (string= (symbol-name op) "LABELS")))
-                        (and (integerp op) (= op 230909053785822708))   ; flet hash
-                        (and (integerp op) (= op 176230696681611090)))  ; labels hash
+                        (and (integerp op) (= op 445617652))   ; flet hash
+                        (and (integerp op) (= op 417505106)))  ; labels hash
                     (let ((defs (cadr form))
                           (rest-body (cddr form)))
                       (when (consp defs)
@@ -6405,7 +6547,7 @@
                         (scan f in-lambda))))
                    ;; skip quoted forms
                    ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
-                        (and (integerp op) (= op 518921307293258709)))
+                        (and (integerp op) (= op 338547669)))  ; QUOTE
                     nil)
                    (t
                     ;; A compound `op` shows up when `form` is a binding pair
@@ -6442,10 +6584,10 @@
      (let ((op (car form)))
        (cond
          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
-              (and (integerp op) (= op 518921307293258709)))
+              (and (integerp op) (= op 338547669)))  ; QUOTE
           nil)
          ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
-              (and (integerp op) (= op 527981956251550024)))
+              (and (integerp op) (= op 80380232)))  ; LAMBDA
           (let* ((params (if (consp (cadr form)) (cadr form) nil))
                  (new-locals (append params local-vars))
                  (result nil))
@@ -6454,17 +6596,17 @@
                 (setq result (adjoin v result :test #'name-equal))))
             result))
          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
-              (and (integerp op) (= op 113179339635393781)))
+              (and (integerp op) (= op 402801909)))  ; FUNCTION
           (if (and (consp (cadr form))
                    (let ((inner-op (car (cadr form))))
                      (or (and (symbolp inner-op) (string= (symbol-name inner-op) "LAMBDA"))
-                         (and (integerp inner-op) (= inner-op 527981956251550024)))))
+                         (and (integerp inner-op) (= inner-op 80380232)))))  ; LAMBDA
               (collect-var-refs (cadr form) bound-vars local-vars)
               nil))
          ((or (and (symbolp op) (or (string= (symbol-name op) "LET")
                                     (string= (symbol-name op) "LET*")))
-              (and (integerp op) (or (= op 347164158959663450)
-                                     (= op 115433002357585904))))
+              (and (integerp op) (or (= op 536263002)  ; LET
+                                     (= op 431241200))))  ; LET*
           (let* ((bindings (cadr form))
                  (body (cddr form))
                  (let-names (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
@@ -6480,7 +6622,7 @@
             result))
          ;; setq — value is a reference context but var name is not
          ((or (and (symbolp op) (string= (symbol-name op) "SETQ"))
-              (and (integerp op) (= op 565254038635891948)))
+              (and (integerp op) (= op 260934892)))  ; SETQ
           (let ((var (cadr form))
                 (val (caddr form))
                 (result nil))
@@ -6527,23 +6669,23 @@
                (let ((op (car form)))
                  (cond
                    ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
-                        (and (integerp op) (= op 518921307293258709)))
+                        (and (integerp op) (= op 338547669)))  ; QUOTE
                     nil)
                    ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
-                        (and (integerp op) (= op 527981956251550024)))
+                        (and (integerp op) (= op 80380232)))  ; LAMBDA
                     (let ((params (if (consp (cadr form))
                                       (remove-if-not #'symbolp (cadr form))
                                       nil)))
                       (dolist (f (cddr form))
                         (note (collect-var-refs f let-vars params)))))
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
-                        (and (integerp op) (= op 113179339635393781)))
+                        (and (integerp op) (= op 402801909)))  ; FUNCTION
                     (scan (cadr form)))
                    ((or (and (symbolp op)
                              (or (string= (symbol-name op) "FLET")
                                  (string= (symbol-name op) "LABELS")))
-                        (and (integerp op) (= op 230909053785822708))
-                        (and (integerp op) (= op 176230696681611090)))
+                        (and (integerp op) (= op 445617652))  ; FLET
+                        (and (integerp op) (= op 417505106)))  ; LABELS
                     (let ((defs (cadr form))
                           (rest-body (cddr form)))
                       (when (consp defs)
@@ -6672,7 +6814,7 @@
          ;; by-value capture).  Emitting a PROGN of single-pair forms preserves
          ;; left-to-right SETQ/SETF evaluation order.
          ((or (and (symbolp op) (string= (symbol-name op) "SETQ"))
-              (and (integerp op) (= op 565254038635891948))
+              (and (integerp op) (= op 260934892))  ; SETQ
               (and (symbolp op) (string= (symbol-name op) "SETF")))
           (let* ((setf-p (and (symbolp op) (string= (symbol-name op) "SETF")))
                  (args (cdr form))
@@ -6741,7 +6883,7 @@
                 `(pop ,(cell-rewrite-form var boxed-vars lambda-params)))))
          ;; lambda — shadow boxed-vars with lambda params
          ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
-              (and (integerp op) (= op 527981956251550024)))
+              (and (integerp op) (= op 80380232)))  ; LAMBDA
           (let* ((params (if (consp (cadr form)) (cadr form) (list (cadr form))))
                  ;; Remove params from boxed-vars (they shadow)
                  (inner-boxed (remove-if (lambda (v)
@@ -6761,8 +6903,8 @@
          ((or (and (symbolp op)
                    (or (string= (symbol-name op) "FLET")
                        (string= (symbol-name op) "LABELS")))
-              (and (integerp op) (= op 230909053785822708))   ; flet hash
-              (and (integerp op) (= op 176230696681611090)))  ; labels hash
+              (and (integerp op) (= op 445617652))   ; flet hash
+              (and (integerp op) (= op 417505106)))  ; labels hash
           (let* ((defs (cadr form))
                  (rest-body (cddr form))
                  (new-defs
@@ -6792,13 +6934,13 @@
             `(,op ,new-defs ,@new-rest)))
          ;; quote — don't rewrite inside
          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
-              (and (integerp op) (= op 518921307293258709)))
+              (and (integerp op) (= op 338547669)))  ; QUOTE
           form)
          ;; let/let* — inner bindings may shadow
          ((or (and (symbolp op) (string= (symbol-name op) "LET"))
-              (and (integerp op) (= op 347164158959663450))
+              (and (integerp op) (= op 536263002))  ; LET
               (and (symbolp op) (string= (symbol-name op) "LET*"))
-              (and (integerp op) (= op 115433002357585904)))
+              (and (integerp op) (= op 431241200)))  ; LET*
           (let* ((bindings (cadr form))
                  (body (cddr form))
                  ;; Variables bound by this let shadow outer boxed vars
@@ -7760,11 +7902,11 @@
        (cond
          ;; (quote ...) — leave as-is
          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
-              (and (integerp op) (= op 518921307293258709)))
+              (and (integerp op) (= op 338547669)))  ; QUOTE
           form)
          ;; (function NAME) — if NAME is a local, replace with (car cell)
          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
-              (and (integerp op) (= op 113179339635393781)))
+              (and (integerp op) (= op 402801909)))  ; FUNCTION
           (let ((arg (cadr form)))
             (cond
               ;; (function (lambda ...)) — walk inside the lambda's body,
@@ -7773,7 +7915,7 @@
                     (or (and (symbolp (car arg))
                              (string= (symbol-name (car arg)) "LAMBDA"))
                         (and (integerp (car arg))
-                             (= (car arg) 527981956251550024))))
+                             (= (car arg) 80380232))))  ; LAMBDA
                (let* ((params (cadr arg))
                       (pnames (if (consp params)
                                   (remove-if-not #'symbolp params)
@@ -7799,7 +7941,7 @@
               (t form))))
          ;; (lambda (params...) body...) — walk body with shadow
          ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
-              (and (integerp op) (= op 527981956251550024)))
+              (and (integerp op) (= op 80380232)))  ; LAMBDA
           (let* ((params (cadr form))
                  (pnames (if (consp params) (remove-if-not #'symbolp params) nil))
                  (filtered (loop for n in local-names
@@ -7819,8 +7961,8 @@
          ((or (and (symbolp op)
                    (or (string= (symbol-name op) "FLET")
                        (string= (symbol-name op) "LABELS")))
-              (and (integerp op) (= op 230909053785822708))
-              (and (integerp op) (= op 176230696681611090)))
+              (and (integerp op) (= op 445617652))  ; FLET
+              (and (integerp op) (= op 417505106)))  ; LABELS
           (let* ((defs (cadr form))
                  (rest-body (cddr form))
                  (def-names (when (consp defs)
@@ -8105,24 +8247,24 @@
   (when (not (symbolp sym)) (return-from cl-loop-keyword-p nil))
   (and (symbolp sym)
        (member (normalize-name sym)
-               '(861144843042936108 1113883427174140325 313452561496444628
-                 468563938978316688
-                 666095121438175797 32547421316216284 942546142429891564
-                 204640710178503481 1066799008902276193
-                 579297982844014476 820203232253031873 647934184416839188
-                 146808687552856964 891107942385378521 646649243001235175
-                 676158121401459048 264837417035531413 89559098115627243
-                 123360604517422061 448736678201786992 732905726022713733
-                 744661507158602198 340376721697683628 1091564327776232814
-                 870389735836749037 212607784983936827
-                 195734683635763289 682179722204096129
-                 876035653932002648 1018827631117520136
+               '(111940908 252922277 460426964  ; FOR AS AND
+                 208372112  ; WHILE
+                 301724213 28653020 414780396  ; UNTIL DO DOING
+                 128219961 134997089  ; COLLECT COLLECTING
+                 343019404 310277569 213190164  ; SUM SUMMING COUNT
+                 297337732 435414233 470771431  ; COUNTING MAXIMIZE MINIMIZE
+                 305832296 70927509 226908395  ; REPEAT WITH WHEN
+                 64017389 463569520 232767877  ; UNLESS IF RETURN
+                 296890838 47397036 66659694  ; FINALLY INITIALLY ALWAYS
+                 517623021 363298619  ; NEVER THEREIS
+                 61360217 383248001  ; APPEND APPENDING
+                 231288152 441781512  ; NCONC NCONCING
                  ;; UPTO (TO synonym), MAXIMIZING/MINIMIZING (synonyms)
-                 819586319614622873 220277010584993844 1092018583149917146
+                 23755929 348520500 18723802  ; UPTO MAXIMIZING MINIMIZING
                  ;; NAMED, ELSE, END (for LOOP.13/14 conditional execution)
-                 534228586620302156 755721607140894312 851431579352036592
+                 370258764 483141224 75674864  ; NAMED ELSE END
                  ;; BEING (hash-keys / hash-values / symbols / pkg-* iteration)
-                 31436867775890672))))
+                 262800624))))  ; BEING
 
 
 ;;; (defvar *suppress-loop-block-nil*) — declared near top of file
@@ -8238,7 +8380,7 @@
   "If REST starts with OF-TYPE typespec, return (typespec . new-rest).
    Else NIL."
   (when (and rest (symbolp (car rest))
-             (= (normalize-name (car rest)) 729509721274984859))
+             (= (normalize-name (car rest)) 490334619))  ; OF-TYPE
     (cons (cadr rest) (cddr rest))))
 
 (defun %loop-try-bare-type (rest)
@@ -8260,14 +8402,14 @@
    Type syntax: bare symbol (FIXNUM/T/...) or OF-TYPE type-spec
    (symbol or list)."
   (when (and rest (symbolp (car rest))
-             (= (normalize-name (car rest)) 808667750738154955))   ; INTO
+             (= (normalize-name (car rest)) 386454987))   ; INTO
     (let ((var (cadr rest))
           (after (cddr rest))
           (type-spec nil))
       (cond
         ;; OF-TYPE type-spec — consume both tokens.
         ((and after (symbolp (car after))
-              (= (normalize-name (car after)) 729509721274984859))
+              (= (normalize-name (car after)) 490334619))  ; OF-TYPE
          (setf type-spec (cadr after))
          (setf after (cddr after)))
         ;; Bare type symbol — consume one.
@@ -8300,17 +8442,17 @@
    Recognises COLLECT/COLLECTING, SUM/SUMMING, COUNT/COUNTING,
    APPEND/APPENDING, NCONC/NCONCING, MAXIMIZE/MAXIMIZING,
    MINIMIZE/MINIMIZING, RETURN, DO/DOING, IF, WHEN, UNLESS."
-  (cond ((or (= kw 204640710178503481) (= kw 1066799008902276193)) :collect)
-        ((or (= kw 579297982844014476) (= kw 820203232253031873)) :sum)
-        ((or (= kw 647934184416839188) (= kw 146808687552856964)) :count)
-        ((or (= kw 195734683635763289) (= kw 682179722204096129)) :append)
-        ((or (= kw 876035653932002648) (= kw 1018827631117520136)) :nconc)
-        ((or (= kw 891107942385378521) (= kw 220277010584993844)) :maximize)
-        ((or (= kw 646649243001235175) (= kw 1092018583149917146)) :minimize)
-        ((= kw 732905726022713733) :return)
-        ((or (= kw 32547421316216284) (= kw 942546142429891564)) :do)
-        ((or (= kw 89559098115627243) (= kw 448736678201786992)) :when)
-        ((= kw 123360604517422061) :unless)))
+  (cond ((or (= kw 128219961) (= kw 134997089)) :collect)  ; COLLECT COLLECTING
+        ((or (= kw 343019404) (= kw 310277569)) :sum)  ; SUM SUMMING
+        ((or (= kw 213190164) (= kw 297337732)) :count)  ; COUNT COUNTING
+        ((or (= kw 61360217) (= kw 383248001)) :append)  ; APPEND APPENDING
+        ((or (= kw 231288152) (= kw 441781512)) :nconc)  ; NCONC NCONCING
+        ((or (= kw 435414233) (= kw 348520500)) :maximize)  ; MAXIMIZE MAXIMIZING
+        ((or (= kw 470771431) (= kw 18723802)) :minimize)  ; MINIMIZE MINIMIZING
+        ((= kw 232767877) :return)  ; RETURN
+        ((or (= kw 28653020) (= kw 414780396)) :do)  ; DO DOING
+        ((or (= kw 226908395) (= kw 463569520)) :when)  ; WHEN IF
+        ((= kw 64017389) :unless)))  ; UNLESS
 
 (defun %loop-acc-stmt (kind expr into-var)
   "Build the body statement for a single accumulator clause inside a
@@ -8354,7 +8496,7 @@
       (let ((tok (and (symbolp (car rest)) (normalize-name (car rest)))))
         ;; First clause is required; subsequent clauses must be after AND.
         (unless first
-          (unless (and tok (= tok 313452561496444628))   ; AND
+          (unless (and tok (= tok 460426964))   ; AND
             (return))
           (setf rest (cdr rest)))
         (setf first nil)
@@ -8390,13 +8532,13 @@
                  (setf rest (cdr inner-then))
                  (let ((inner-else-stmts nil))
                    (when (and rest (symbolp (car rest))
-                              (= (normalize-name (car rest)) 755721607140894312))
+                              (= (normalize-name (car rest)) 483141224))  ; ELSE
                      (setf rest (cdr rest))
                      (let ((er (%loop-parse-cond-clauses rest state)))
                        (setf inner-else-stmts (car er))
                        (setf rest (cdr er))))
                    (when (and rest (symbolp (car rest))
-                              (= (normalize-name (car rest)) 851431579352036592))
+                              (= (normalize-name (car rest)) 75674864))  ; END
                      (setf rest (cdr rest)))
                    (let ((eff-cond (if (eq kind :unless)
                                        `(not ,inner-cond)
@@ -8467,7 +8609,7 @@
     ;; NAMED <symbol>: optional, must come first.  Stores the block name so
     ;; expand-cl-loop can wrap the result in (block <name> ...).
     (when (and rest (symbolp (car rest))
-               (= (normalize-name (car rest)) 534228586620302156))   ; NAMED
+               (= (normalize-name (car rest)) 370258764))   ; NAMED
       (setf (loop-state-block-name state) (cadr rest))
       (setf rest (cddr rest)))
     (loop while rest do
@@ -8476,12 +8618,12 @@
           ;; END as a top-level token: defensive no-op (most ENDs are
           ;; consumed inside WHEN/IF/UNLESS, but a stray one shouldn't
           ;; abort parsing).
-          ((= kw 851431579352036592)
+          ((= kw 75674864)  ; END
            (setf rest (cdr rest)))
           ;; FOR var FROM start [TO|BELOW end] [BY step]
           ;; FOR, AS, or AND (loop conjunction — starts another iteration clause)
-          ((or (= kw 861144843042936108) (= kw 1113883427174140325)
-               (= kw 313452561496444628))
+          ((or (= kw 111940908) (= kw 252922277)  ; FOR AS
+               (= kw 460426964))  ; AND
            (let ((var (cadr rest))
                  (destr-pairs nil))      ; list of (component . accessor-on-gensym)
              (setf rest (cddr rest))
@@ -8505,7 +8647,7 @@
                  ;; Skip OF-TYPE type-spec early so destructuring pattern can be
                  ;; followed by `of-type fixnum in ...' or similar.
                  (when (and rest (symbolp (car rest))
-                            (= (normalize-name (car rest)) 729509721274984859))  ; OF-TYPE
+                            (= (normalize-name (car rest)) 490334619))  ; OF-TYPE
                    (setf rest (cddr rest)))
                  (cond
                    ;; Case 1: =-destructuring (legacy NTH-based path).
@@ -8513,7 +8655,7 @@
                    ;; patterns `(A . B)' / `(A B . C)'.  For dotted, the tail
                    ;; symbol gets bound to the NTHCDR of value-form, not NTH.
                    ((and rest (symbolp (car rest))
-                         (= (normalize-name (car rest)) 1009698407182718722))  ; =
+                         (= (normalize-name (car rest)) 190453506))  ; =
                     (let ((value-form (cadr rest))
                           (g (gensym "DSTR")))
                       (setf rest (cddr rest))
@@ -8550,20 +8692,20 @@
                    ;; pushed as general iters AFTER the iter binds.
                    ((and rest (symbolp (car rest))
                          (let ((nk (normalize-name (car rest))))
-                           (or (= nk 592855328021284152)        ; IN
-                               (= nk 16092538585173950)         ; ON
-                               (= nk 1027666347502942664)       ; ACROSS
+                           (or (= nk 516392248)        ; IN
+                               (= nk 202641342)         ; ON
+                               (= nk 18430408)       ; ACROSS
                                ;; BEING — hash-keys / hash-values use
                                ;; this and the iterated var IS commonly
                                ;; destructured (key is a cons, etc.).
-                               (= nk 31436867775890672))))      ; BEING
+                               (= nk 262800624))))      ; BEING
                     (let ((g (gensym "DSTR")))
                       (setf destr-pairs (%loop-destr-pairs components g))
                       (setf var g))))))
              (when (and var (not (consp var)) rest)
              ;; Skip OF-TYPE type-spec — we ignore type declarations.
              (when (and (symbolp (car rest))
-                        (= (normalize-name (car rest)) 729509721274984859))
+                        (= (normalize-name (car rest)) 490334619))  ; OF-TYPE
                (setf rest (cddr rest)))
              ;; Skip BARE type symbol (FIXNUM, T, FLOAT, STRING, ...) —
              ;; CLHS bare-type shorthand for OF-TYPE.  Only when the
@@ -8581,15 +8723,15 @@
                  ;; in any order. Triggered by any of FROM/UPFROM/DOWNFROM/TO/BELOW/
                  ;; DOWNTO/ABOVE/BY. Defaults: start=0, end-test=:to (loop forever
                  ;; without END), by=1.
-                 ((or (= iter-kw 355693237506394641)    ; FROM
-                      (= iter-kw 704601669436668564)    ; UPFROM
-                      (= iter-kw 888358500084682875)    ; DOWNFROM
-                      (= iter-kw 611742951095832940)    ; TO
-                      (= iter-kw 819586319614622873)    ; UPTO (TO synonym)
-                      (= iter-kw 708656842296756988)    ; BELOW
-                      (= iter-kw 962879967384500096)    ; ABOVE
-                      (= iter-kw 223271319558938470)    ; DOWNTO
-                      (= iter-kw 934319717393949980))   ; BY
+                 ((or (= iter-kw 220023313)    ; FROM
+                      (= iter-kw 528235156)    ; UPFROM
+                      (= iter-kw 358174843)    ; DOWNFROM
+                      (= iter-kw 418976108)    ; TO
+                      (= iter-kw 23755929)    ; UPTO (TO synonym)
+                      (= iter-kw 128223996)    ; BELOW
+                      (= iter-kw 372946816)    ; ABOVE
+                      (= iter-kw 404037478)    ; DOWNTO
+                      (= iter-kw 517285148))   ; BY
                   ;; Capture each FROM/TO/BY clause's value into a fresh
                   ;; gensym in SOURCE ORDER, then push them as WITH bindings.
                   ;; ANSI says clauses evaluate left-to-right (CLHS 6.1.2.1.1
@@ -8610,48 +8752,48 @@
                     ;; Loop while next token is one of these clause keywords.
                     (loop while (and rest (symbolp (car rest))
                                     (let ((kw2 (normalize-name (car rest))))
-                                      (or (= kw2 355693237506394641)
-                                          (= kw2 704601669436668564)
-                                          (= kw2 888358500084682875)
-                                          (= kw2 611742951095832940)
-                                          (= kw2 819586319614622873)  ; UPTO
-                                          (= kw2 708656842296756988)
-                                          (= kw2 962879967384500096)
-                                          (= kw2 223271319558938470)
-                                          (= kw2 934319717393949980))))
+                                      (or (= kw2 220023313)  ; FROM
+                                          (= kw2 528235156)  ; UPFROM
+                                          (= kw2 358174843)  ; DOWNFROM
+                                          (= kw2 418976108)  ; TO
+                                          (= kw2 23755929)  ; UPTO
+                                          (= kw2 128223996)  ; BELOW
+                                          (= kw2 372946816)  ; ABOVE
+                                          (= kw2 404037478)  ; DOWNTO
+                                          (= kw2 517285148))))  ; BY
                           do (let ((sub-kw (normalize-name (car rest))))
                                (cond
-                                 ((= sub-kw 355693237506394641)  ; FROM
+                                 ((= sub-kw 220023313)  ; FROM
                                   (let ((g (gensym "FROM")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf start-form g rest (cddr rest))))
-                                 ((= sub-kw 704601669436668564)  ; UPFROM
+                                 ((= sub-kw 528235156)  ; UPFROM
                                   (let ((g (gensym "UPFROM")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf start-form g rest (cddr rest))))
-                                 ((= sub-kw 888358500084682875)  ; DOWNFROM
+                                 ((= sub-kw 358174843)  ; DOWNFROM
                                   (let ((g (gensym "DOWNFROM")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf start-form g downward t rest (cddr rest))))
-                                 ((or (= sub-kw 611742951095832940)  ; TO
-                                      (= sub-kw 819586319614622873)) ; UPTO
+                                 ((or (= sub-kw 418976108)  ; TO
+                                      (= sub-kw 23755929)) ; UPTO
                                   (let ((g (gensym "TO")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test (if downward :downto :to)
                                           end-form g rest (cddr rest))))
-                                 ((= sub-kw 708656842296756988)  ; BELOW
+                                 ((= sub-kw 128223996)  ; BELOW
                                   (let ((g (gensym "BELOW")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test :below end-form g rest (cddr rest))))
-                                 ((= sub-kw 962879967384500096)  ; ABOVE
+                                 ((= sub-kw 372946816)  ; ABOVE
                                   (let ((g (gensym "ABOVE")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test :above end-form g rest (cddr rest))))
-                                 ((= sub-kw 223271319558938470)  ; DOWNTO
+                                 ((= sub-kw 404037478)  ; DOWNTO
                                   (let ((g (gensym "DOWNTO")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf end-test :downto end-form g rest (cddr rest))))
-                                 ((= sub-kw 934319717393949980)  ; BY
+                                 ((= sub-kw 517285148)  ; BY
                                   (let ((g (gensym "BY")))
                                     (push (list g (cadr rest)) clause-binds)
                                     (setf by-form g rest (cddr rest)))))))
@@ -8686,7 +8828,7 @@
                  ;; via with-bindings so a side-effecting BY form (e.g. one
                  ;; that does RETURN-FROM the LOOP's named block) fires before
                  ;; the loop body runs.
-                 ((= iter-kw 592855328021284152)
+                 ((= iter-kw 516392248)  ; IN
                   (setf rest (cdr rest))
                   (let ((list-form (car rest))
                         (tmp (gensym "LI"))
@@ -8694,7 +8836,7 @@
                     (setf rest (cdr rest))
                     (when (and rest (symbolp (car rest))
                                (= (compute-name-hash (symbol-name (car rest)))
-                                  934319717393949980))  ; BY
+                                  517285148))  ; BY
                       (setf rest (cdr rest))
                       (let ((g (gensym "INBY")))
                         (push (list g (car rest)) (loop-state-with-bindings state))
@@ -8707,7 +8849,7 @@
                           (loop-state-iterations state))))
 
                  ;; FOR var ACROSS array
-                 ((= iter-kw 1027666347502942664)
+                 ((= iter-kw 18430408)  ; ACROSS
                   (setf rest (cdr rest))
                   (let ((array-form (car rest))
                         (idx (gensym "LI"))
@@ -8724,7 +8866,7 @@
                  ;; a clause-bind so the BY value-form is captured exactly once
                  ;; in source order, then store the gensym in by-form so the
                  ;; step uses the captured value rather than re-evaluating.
-                 ((= iter-kw 16092538585173950)
+                 ((= iter-kw 202641342)  ; ON
                   (setf rest (cdr rest))
                   (let ((list-form (car rest))
                         (by-fn nil))
@@ -8732,7 +8874,7 @@
                     ;; Check for optional BY
                     (when (and rest (symbolp (car rest))
                                (= (compute-name-hash (symbol-name (car rest)))
-                                  934319717393949980))  ; BY
+                                  517285148))  ; BY
                       (setf rest (cdr rest))
                       (let ((g (gensym "ONBY")))
                         (push (list g (car rest)) (loop-state-with-bindings state))
@@ -8744,13 +8886,13 @@
                           (loop-state-iterations state))))
 
                  ;; FOR var = init [THEN step]
-                 ((= iter-kw 1009698407182718722)
+                 ((= iter-kw 190453506)  ; =
                   (setf rest (cdr rest))
                   (let ((init (car rest))
                         (step nil))
                     (setf rest (cdr rest))
                     (when (and rest (symbolp (car rest))
-                               (= (normalize-name (car rest)) 712293789701165160))
+                               (= (normalize-name (car rest)) 325947496))  ; THEN
                       (setf step (cadr rest) rest (cddr rest)))
                     (push (make-loop-iter :kind :general :var var
                                           :init-form init
@@ -8761,32 +8903,32 @@
                  ;;   kind ∈ {HASH-KEY[S], HASH-VALUE[S],
                  ;;           SYMBOL[S], EXTERNAL-SYMBOL[S], PRESENT-SYMBOL[S]}
                  ;; (USING (HASH-KEY var)/(HASH-VALUE var) binds the other half.)
-                 ((= iter-kw 31436867775890672)   ; BEING
+                 ((= iter-kw 262800624)   ; BEING
                   (setf rest (cdr rest))
                   ;; Optional THE / EACH
                   (when (and rest (symbolp (car rest))
-                             (or (= (normalize-name (car rest)) 977942333759456998)   ; THE
-                                 (= (normalize-name (car rest)) 1109496130581528424)));EACH
+                             (or (= (normalize-name (car rest)) 425658086)   ; THE
+                                 (= (normalize-name (car rest)) 416956264)));EACH
                     (setf rest (cdr rest)))
                   ;; Kind keyword
                   (let ((kind-kw (and rest (symbolp (car rest))
                                       (normalize-name (car rest))))
                         (iter-kind nil))
                     (cond
-                      ((or (= kind-kw 1147972382719290703)   ; HASH-KEY
-                           (= kind-kw 887827087004053180))   ; HASH-KEYS
+                      ((or (= kind-kw 181202255)   ; HASH-KEY
+                           (= kind-kw 302526140))   ; HASH-KEYS
                        (setf iter-kind :hash-keys))
-                      ((or (= kind-kw 828835450700251691)    ; HASH-VALUE
-                           (= kind-kw 213861533733362616))   ; HASH-VALUES
+                      ((or (= kind-kw 494092843)    ; HASH-VALUE
+                           (= kind-kw 166632376))   ; HASH-VALUES
                        (setf iter-kind :hash-values))
-                      ((or (= kind-kw 414411792086412289)    ; SYMBOL
-                           (= kind-kw 1023250092332836994))  ; SYMBOLS
+                      ((or (= kind-kw 156527617)    ; SYMBOL
+                           (= kind-kw 277457026))  ; SYMBOLS
                        (setf iter-kind :pkg-symbols))
-                      ((or (= kind-kw 872512145144985745)    ; EXTERNAL-SYMBOL
-                           (= kind-kw 593846167963712370))   ; EXTERNAL-SYMBOLS
+                      ((or (= kind-kw 153909393)    ; EXTERNAL-SYMBOL
+                           (= kind-kw 66173810))   ; EXTERNAL-SYMBOLS
                        (setf iter-kind :pkg-external))
-                      ((or (= kind-kw 37498298314639895)     ; PRESENT-SYMBOL
-                           (= kind-kw 412098041472307620))   ; PRESENT-SYMBOLS
+                      ((or (= kind-kw 411093527)     ; PRESENT-SYMBOL
+                           (= kind-kw 284955044))   ; PRESENT-SYMBOLS
                        (setf iter-kind :pkg-present))
                       (t
                        (format t "  WARN: unknown BEING kind ~A~%" kind-kw)))
@@ -8796,8 +8938,8 @@
                       ;; expr defaults to *package*.)
                       (let ((src-form nil))
                         (when (and rest (symbolp (car rest))
-                                   (or (= (normalize-name (car rest)) 160211188404669686) ; OF
-                                       (= (normalize-name (car rest)) 592855328021284152)));IN
+                                   (or (= (normalize-name (car rest)) 255462646) ; OF
+                                       (= (normalize-name (car rest)) 516392248)));IN
                           (setf rest (cdr rest))
                           (setf src-form (car rest))
                           (setf rest (cdr rest)))
@@ -8808,7 +8950,7 @@
                         ;; Optional USING (HASH-KEY var) / (HASH-VALUE var)
                         (let ((using-var nil))
                           (when (and rest (symbolp (car rest))
-                                     (= (normalize-name (car rest)) 328151623910292473))
+                                     (= (normalize-name (car rest)) 338295801))  ; USING
                             (setf rest (cdr rest))
                             (let ((u-spec (car rest)))
                               (setf rest (cdr rest))
@@ -8850,7 +8992,7 @@
           ;; Old behavior (push :while iter to iterations → test-forms
           ;; AT START before init-stmts) broke `:FOR x :IN list :WHILE x`
           ;; because x was tested before init-stmt set it from car tmp.
-          ((= kw 468563938978316688)
+          ((= kw 208372112)  ; WHILE
            (let ((test `(if (null ,(cadr rest)) (return nil))))
              (if (or (loop-state-body-forms state)
                      (loop-state-accumulator state))
@@ -8859,7 +9001,7 @@
            (setf rest (cddr rest)))
 
           ;; UNTIL condition — same source-order rule.
-          ((= kw 666095121438175797)
+          ((= kw 301724213)  ; UNTIL
            (let ((test `(if ,(cadr rest) (return nil))))
              (if (or (loop-state-body-forms state)
                      (loop-state-accumulator state))
@@ -8868,7 +9010,7 @@
            (setf rest (cddr rest)))
 
           ;; REPEAT n
-          ((= kw 676158121401459048)
+          ((= kw 305832296)  ; REPEAT
            (let ((n-form (cadr rest))
                  (counter (gensym "RC")))
              (push (make-loop-iter :kind :repeat :var counter
@@ -8884,7 +9026,7 @@
           ;; We collect each AND-group as a single tagged binding entry
           ;; (:and-group (var1 init1) (var2 init2) …); generate-loop-code
           ;; emits LET around the group and LET* across groups.
-          ((= kw 264837417035531413)
+          ((= kw 70927509)  ; WITH
            (setf rest (cdr rest))   ; consume WITH
            (let ((group nil)
                  (and-seen nil))
@@ -8899,22 +9041,22 @@
                    ;; Optional OF-TYPE typespec (full form).
                    (when (and rest (symbolp (car rest))
                               (= (normalize-name (car rest))
-                                 729509721274984859))   ; OF-TYPE
+                                 490334619))   ; OF-TYPE
                      (setf type-spec (cadr rest))
                      (setf rest (cddr rest)))
                    ;; Or bare type symbol shorthand (FIXNUM, FLOAT, T,
                    ;; STRING, …) — only when NOT `=` and not a LOOP kw.
                    (when (and rest (null type-spec) (symbolp (car rest))
                               (not (= (normalize-name (car rest))
-                                      1009698407182718722))  ; =
+                                      190453506))  ; =
                               (not (= (normalize-name (car rest))
-                                      313452561496444628))   ; AND
+                                      460426964))   ; AND
                               (not (cl-loop-keyword-p (car rest))))
                      (setf type-spec (car rest))
                      (setf rest (cdr rest)))
                    ;; Optional `= init`.
                    (when (and rest (symbolp (car rest))
-                              (= (normalize-name (car rest)) 1009698407182718722))
+                              (= (normalize-name (car rest)) 190453506))  ; =
                      (setf rest (cdr rest))
                      (setf init (car rest))
                      (setf init-given t)
@@ -8955,7 +9097,7 @@
                      (t
                       (push (list var init) group)))
                    (unless (and rest (symbolp (car rest))
-                                (= (normalize-name (car rest)) 313452561496444628))
+                                (= (normalize-name (car rest)) 460426964))  ; AND
                      (return-from with-parse))
                    (setf rest (cdr rest))
                    (setf and-seen t))))
@@ -8976,7 +9118,7 @@
                  (t (push (cons :and-group g) (loop-state-with-bindings state)))))))
 
           ;; DO body...
-          ((or (= kw 32547421316216284) (= kw 942546142429891564))
+          ((or (= kw 28653020) (= kw 414780396))  ; DO DOING
            (setf rest (cdr rest))
            ;; Collect body forms until next loop keyword
            (loop while (and rest (not (and (symbolp (car rest))
@@ -8990,7 +9132,7 @@
           ;; A trailing OF-TYPE-style symbol after INTO is silently consumed.
           ;; %try-into reads (and skips) optional INTO var [type] from rest
           ;; and returns the var symbol or NIL.
-          ((or (= kw 204640710178503481) (= kw 1066799008902276193))   ; COLLECT
+          ((or (= kw 128219961) (= kw 134997089))   ; COLLECT
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
@@ -8998,7 +9140,7 @@
                (push (if iv (list :collect expr (car iv)) (list :collect expr))
                      (loop-state-accumulator state)))))
 
-          ((or (= kw 579297982844014476) (= kw 820203232253031873))   ; SUM
+          ((or (= kw 343019404) (= kw 310277569))   ; SUM
            (let ((expr (cadr rest))
                  (type-spec nil))
              (setf rest (cddr rest))
@@ -9026,7 +9168,7 @@
                          (list :sum expr nil type-spec))
                      (loop-state-accumulator state)))))
 
-          ((or (= kw 647934184416839188) (= kw 146808687552856964))   ; COUNT
+          ((or (= kw 213190164) (= kw 297337732))   ; COUNT
            (let ((expr (cadr rest))
                  (type-spec nil))
              (setf rest (cddr rest))
@@ -9051,7 +9193,7 @@
                          (list :count expr nil type-spec))
                      (loop-state-accumulator state)))))
 
-          ((or (= kw 195734683635763289) (= kw 682179722204096129))   ; APPEND
+          ((or (= kw 61360217) (= kw 383248001))   ; APPEND
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
@@ -9059,7 +9201,7 @@
                (push (if iv (list :append expr (car iv)) (list :append expr))
                      (loop-state-accumulator state)))))
 
-          ((or (= kw 876035653932002648) (= kw 1018827631117520136))  ; NCONC
+          ((or (= kw 231288152) (= kw 441781512))  ; NCONC
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
@@ -9067,7 +9209,7 @@
                (push (if iv (list :nconc expr (car iv)) (list :nconc expr))
                      (loop-state-accumulator state)))))
 
-          ((or (= kw 891107942385378521) (= kw 220277010584993844))   ; MAXIMIZE
+          ((or (= kw 435414233) (= kw 348520500))   ; MAXIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
@@ -9075,7 +9217,7 @@
                (push (if iv (list :maximize expr (car iv)) (list :maximize expr))
                      (loop-state-accumulator state)))))
 
-          ((or (= kw 646649243001235175) (= kw 1092018583149917146))  ; MINIMIZE
+          ((or (= kw 470771431) (= kw 18723802))  ; MINIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              (let ((iv (%loop-try-into rest)))
@@ -9088,7 +9230,7 @@
           ;;            | RETURN expr | DO body... | WHEN/IF/UNLESS ...
           ;; Binds IT to the test value so clause bodies (e.g. COLLECT IT)
           ;; can reference the cond result per CLHS 6.1.8.1.
-          ((or (= kw 89559098115627243) (= kw 448736678201786992))
+          ((or (= kw 226908395) (= kw 463569520))  ; WHEN IF
            (let ((cond-form (cadr rest)))
              (setf rest (cddr rest))
              ;; Parse THEN-branch: a chain of AND-separated accumulator clauses.
@@ -9098,14 +9240,14 @@
                ;; Optional ELSE.
                (let ((else-stmts nil))
                  (when (and rest (symbolp (car rest))
-                            (= (normalize-name (car rest)) 755721607140894312))  ; ELSE
+                            (= (normalize-name (car rest)) 483141224))  ; ELSE
                    (setf rest (cdr rest))
                    (let ((else-result (%loop-parse-cond-clauses rest state)))
                      (setf else-stmts (car else-result))
                      (setf rest (cdr else-result))))
                  ;; Optional END.
                  (when (and rest (symbolp (car rest))
-                            (= (normalize-name (car rest)) 851431579352036592))  ; END
+                            (= (normalize-name (car rest)) 75674864))  ; END
                    (setf rest (cdr rest)))
                  ;; Build the conditional body form and push it.  Bind IT
                  ;; for clause bodies that reference it.
@@ -9131,7 +9273,7 @@
                           (loop-state-body-forms state))))))))
 
           ;; FINALLY form...
-          ((= kw 744661507158602198)
+          ((= kw 296890838)  ; FINALLY
            (setf rest (cdr rest))
            (loop while (and rest (not (and (symbolp (car rest))
                                            (cl-loop-keyword-p (car rest)))))
@@ -9139,7 +9281,7 @@
                     (setf rest (cdr rest))))
 
           ;; INITIALLY form... (runs once before the loop body)
-          ((= kw 340376721697683628)
+          ((= kw 47397036)  ; INITIALLY
            (setf rest (cdr rest))
            (loop while (and rest (not (and (symbolp (car rest))
                                            (cl-loop-keyword-p (car rest)))))
@@ -9147,19 +9289,19 @@
                     (setf rest (cdr rest))))
 
           ;; ALWAYS expr
-          ((= kw 1091564327776232814)
+          ((= kw 66659694)  ; ALWAYS
            (let ((expr (cadr rest)))
              (push (list :always expr) (loop-state-accumulator state))
              (setf rest (cddr rest))))
 
           ;; NEVER expr (same as always (not expr))
-          ((= kw 870389735836749037)
+          ((= kw 517623021)  ; NEVER
            (let ((expr (cadr rest)))
              (push (list :always `(not ,expr)) (loop-state-accumulator state))
              (setf rest (cddr rest))))
 
           ;; THEREIS expr
-          ((= kw 212607784983936827)
+          ((= kw 363298619)  ; THEREIS
            (let ((expr (cadr rest)))
              (push (list :thereis expr) (loop-state-accumulator state))
              (setf rest (cddr rest))))
@@ -9167,7 +9309,7 @@
           ;; UNLESS cond <clause> ... — same shape as WHEN with negated cond.
           ;; IT is bound to the test value (per CLHS) so clause bodies can
           ;; reference it.
-          ((= kw 123360604517422061)
+          ((= kw 64017389)  ; UNLESS
            (let ((cond-form (cadr rest)))
              (setf rest (cddr rest))
              (let* ((then-result (%loop-parse-cond-clauses rest state))
@@ -9175,13 +9317,13 @@
                (setf rest (cdr then-result))
                (let ((else-stmts nil))
                  (when (and rest (symbolp (car rest))
-                            (= (normalize-name (car rest)) 755721607140894312))
+                            (= (normalize-name (car rest)) 483141224))  ; ELSE
                    (setf rest (cdr rest))
                    (let ((else-result (%loop-parse-cond-clauses rest state)))
                      (setf else-stmts (car else-result))
                      (setf rest (cdr else-result))))
                  (when (and rest (symbolp (car rest))
-                            (= (normalize-name (car rest)) 851431579352036592))
+                            (= (normalize-name (car rest)) 75674864))  ; END
                    (setf rest (cdr rest)))
                  (cond
                    ((null then-stmts)
@@ -9204,7 +9346,7 @@
                           (loop-state-body-forms state))))))))
 
           ;; RETURN expr
-          ((= kw 732905726022713733)
+          ((= kw 232767877)  ; RETURN
            (push `(return ,(cadr rest)) (loop-state-body-forms state))
            (setf rest (cddr rest)))
 
@@ -10052,10 +10194,10 @@
                (when (and (not found) (consp form))
                  (cond
                    ;; quote — opaque, never a return-from
-                   ((%form-op-is form 518921307293258709 "QUOTE") nil)
+                   ((%form-op-is form 338547669 "QUOTE") nil)
                    ;; an inner BLOCK with the same name shadows ours for
                    ;; its body (RETURN-FROM there targets the inner block).
-                   ((%form-op-is form 1062346144843286510 "BLOCK")
+                   ((%form-op-is form 372279278 "BLOCK")
                     (let ((inner-sh (or sh
                                         (= (normalize-name (cadr form))
                                            block-hash))))
@@ -10064,7 +10206,7 @@
                           (walk (car cur) xl inner-sh)
                           (setq cur (cdr cur))))))
                    ;; lambda — body crosses a compilation-unit boundary
-                   ((%form-op-is form 527981956251550024 "LAMBDA")
+                   ((%form-op-is form 80380232 "LAMBDA")
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do
                         (walk (car cur) t sh)
@@ -10081,8 +10223,8 @@
                    ;; (consulted in compile-block) now gates those out, so
                    ;; the legitimate flet/labels cross-unit wins
                    ;; (FLET.4/4A, LABELS.4/4A/6) land without the breakage.
-                   ((or (%form-op-is form 230909053785822708 "FLET")
-                        (%form-op-is form 176230696681611090 "LABELS"))
+                   ((or (%form-op-is form 445617652 "FLET")
+                        (%form-op-is form 417505106 "LABELS"))
                     (let ((cur (cadr form)))
                       (loop while (consp cur) do
                         ;; each def = (name (args) body...) — body crosses
@@ -10114,16 +10256,16 @@
                         (walk (car cur) xl sh)
                         (setq cur (cdr cur)))))
                    ;; (function (lambda ...)) — recurse with the lambda case
-                   ((%form-op-is form 113179339635393781 "FUNCTION")
+                   ((%form-op-is form 402801909 "FUNCTION")
                     (walk (cadr form) xl sh))
                    ;; RETURN-FROM <name> — check target + lambda boundary
-                   ((%form-op-is form 102326962717880022 "RETURN-FROM")
+                   ((%form-op-is form 164933334 "RETURN-FROM")
                     (when (and xl (not sh)
                                (= (normalize-name (cadr form)) block-hash))
                       (setq found t))
                     (walk (caddr form) xl sh))
                    ;; RETURN (== return-from NIL) — only for the NIL block.
-                   ((%form-op-is form 732905726022713733 "RETURN")
+                   ((%form-op-is form 232767877 "RETURN")
                     (when (and xl (not sh) (= block-hash 0))
                       (setq found t))
                     (walk (cadr form) xl sh))
@@ -10167,17 +10309,17 @@
     (labels ((walk (form in-fn)
                (when (and (not found) (consp form))
                  (cond
-                   ((%form-op-is form 518921307293258709 "QUOTE") nil)
-                   ((%form-op-is form 446290548490879374 "UNWIND-PROTECT")
+                   ((%form-op-is form 338547669 "QUOTE") nil)
+                   ((%form-op-is form 182681998 "UNWIND-PROTECT")
                     (setq found t))
-                   ((and in-fn (%form-op-is form 609179962647778703 "GO"))
+                   ((and in-fn (%form-op-is form 502453647 "GO"))
                     (setq found t))
-                   ((%form-op-is form 527981956251550024 "LAMBDA")
+                   ((%form-op-is form 80380232 "LAMBDA")
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) t)
                             (setq cur (cdr cur)))))
-                   ((or (%form-op-is form 230909053785822708 "FLET")
-                        (%form-op-is form 176230696681611090 "LABELS"))
+                   ((or (%form-op-is form 445617652 "FLET")
+                        (%form-op-is form 417505106 "LABELS"))
                     (let ((cur (cadr form)))
                       (loop while (consp cur) do
                         (let ((bcur (cddr (car cur))))
@@ -10187,7 +10329,7 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
-                   ((%form-op-is form 113179339635393781 "FUNCTION")
+                   ((%form-op-is form 402801909 "FUNCTION")
                     (walk (cadr form) in-fn))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
@@ -10562,15 +10704,15 @@
       (let ((hash (compute-name-hash (symbol-name op))))
         (cond
           ;; Direct values call
-          ((= hash 419785975474686239) t)  ; VALUES
+          ((= hash 18794783) t)  ; VALUES
           ;; VALUES-LIST also returns multiple values
-          ((= hash 276551395991592440) t)  ; VALUES-LIST
+          ((= hash 34053624) t)  ; VALUES-LIST
           ;; progn — check last form
-          ((= hash 87505416312042891)      ; PROGN
+          ((= hash 28734859)      ; PROGN
            (tail-form-is-values-p (cdr form)))
           ;; let/let* — check body (last form after bindings)
-          ((or (= hash 347164158959663450)   ; LET
-               (= hash 115433002357585904))  ; LET*
+          ((or (= hash 536263002)   ; LET
+               (= hash 431241200))  ; LET*
            (tail-form-is-values-p (cddr form)))
           ;; block — CL blocks are transparent to multiple values; check the
           ;; body's last form.  Load-bearing for %e2ic: the tree-walker wraps
@@ -10584,7 +10726,7 @@
           ((= hash (compute-name-hash "BLOCK"))
            (tail-form-is-values-p (cddr form)))
           ;; if — check both branches
-          ((= hash 448736678201786992)     ; IF
+          ((= hash 463569520)     ; IF
            (or (and (caddr form) (tail-form-is-values-p (list (caddr form))))
                (and (cadddr form) (tail-form-is-values-p (list (cadddr form))))))
           ;; cond — check the body of each clause (last expression)
@@ -16108,15 +16250,15 @@
 
     ;; Package operations — no-op (flat namespace via name hashes)
     ((and (consp form) (member (normalize-name (car form))
-                               '(36538461984543970    ; MAKE-PACKAGE
-                                 683735621833107523   ; EXPORT
-                                 979925672549573714   ; IMPORT
-                                 578501138257555745   ; SHADOW
-                                 1078152541798551995  ; USE-PACKAGE
-                                 757877016639086236   ; PROVIDE
-                                 313710498321880194   ; REQUIRE
-                                 1094519557412445920  ; PROCLAIM
-                                 90289849190648180))) ; DECLAIM
+                               '(260674786    ; MAKE-PACKAGE
+                                 502065219   ; EXPORT
+                                 87368786   ; IMPORT
+                                 532181281   ; SHADOW
+                                 503730619  ; USE-PACKAGE
+                                 86089372   ; PROVIDE
+                                 101258370   ; REQUIRE
+                                 62725856  ; PROCLAIM
+                                 102992244))) ; DECLAIM
      nil)
 
     ;; (eval-when (situations...) body...) — compile body as top-level forms

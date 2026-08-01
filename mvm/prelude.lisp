@@ -1519,10 +1519,10 @@
     ((null v) 'eql)
     ((%native-mvm-sym-p v)
      (let ((h (%native-mvm-sym-hash v)))
-       (cond ((eql h 644866047583222547) 'eq)
-             ((eql h 743927193407775751) 'eql)
-             ((eql h 777630921077348411) 'equal)
-             ((eql h 349037300549106995) 'equalp)
+       (cond ((eql h 104921875) 'eq)  ; EQ
+             ((eql h 366437383) 'eql)  ; EQL
+             ((eql h 322164795) 'equal)  ; EQUAL
+             ((eql h 127106355) 'equalp)  ; EQUALP
              (t 'eql))))
     ((symbolp v)
      (let ((n (symbol-name v)))
@@ -1790,7 +1790,7 @@
                        ;; Unresolved known package — default to CL-USER,
                        ;; looked up from the same table by its canonical
                        ;; name hash (self-heals if registration changes).
-                       (setq pkg (gethash 26532410810097741 pkg-tab))))))
+                       (setq pkg (gethash 51798093 pkg-tab))))))  ; COMMON-LISP-USER
                (aset sym 1 pkg))
              (aset sym 2 "")    ; name — SYMBOL-NAME reverse-fills via *SYM-NAME-TABLE*
              ;; Re-read the root — %ALLOC-SYM3 may have triggered GC.
@@ -1896,8 +1896,8 @@
         (setq h1 (logand (* (logxor h1 c) 16777619) #xFFFFFFFF))
         (setq h2 (logand (* (logxor h2 c) 805306457) #xFFFFFFFF)))
       (setq i (+ i 1)))
-    (let ((combined (logior (ash (logand h1 #x3FFFFFFF) 30)
-                            (logand h2 #x3FFFFFFF))))
+    (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                            (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
 (defun name-eq (sym name-string)

@@ -1450,8 +1450,8 @@
     (loop for c across name
           do (setq h1 (logand (* (logxor h1 (char-code c)) 16777619) #xFFFFFFFF))
              (setq h2 (logand (* (logxor h2 (char-code c)) 805306457) #xFFFFFFFF)))
-    (let ((combined (logior (ash (logand h1 #x3FFFFFFF) 30)
-                            (logand h2 #x3FFFFFFF))))
+    (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                            (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
 (defun compiled-module-to-mvm-module (compiled-mod source-text)

@@ -366,11 +366,11 @@
               (let ((offset (- target index)))
                 (let ((masked (logand offset 67108863)))
                   (cond
-                    ((eql type 126943983357610533)
+                    ((eql type 518081061)
                      (a64i-write-bytes-at buf index
                        (logand masked 255) (logand (ash masked -8) 255)
                        (logand (ash masked -16) 255) (logior 20 (logand (ash masked -24) 3))))
-                    ((eql type 592037923804208769)
+                    ((eql type 391831169)
                      (a64i-write-bytes-at buf index
                        (logand masked 255) (logand (ash masked -8) 255)
                        (logand (ash masked -16) 255) (logior 148 (logand (ash masked -24) 3))))
@@ -380,7 +380,7 @@
                          (a64i-write-bytes-at buf index
                            (logand lo24 255) (logand (ash lo24 -8) 255)
                            (logand (ash lo24 -16) 255) #x54))))
-                    ((eql type 782868907041998776)
+                    ((eql type 253724600)
                      (let ((byte-off (* offset 4)))
                        (let ((immlo (logand byte-off 3)))
                          (let ((immhi (logand (ash byte-off -2) 524287)))
@@ -750,7 +750,7 @@
          (when label
            (let ((idx (a64i-current-index buf)))
              (a64i-bl buf 0)
-             (a64i-add-fixup buf idx label 592037923804208769)))))) ; :bl hash
+             (a64i-add-fixup buf idx label 391831169)))))) ; :bl hash
     ;; CALL-IND Vs (#x81 = 129)
     ((= op 129)
      (let ((ps (ensure-src-i386a64 (car operands) 16)))
@@ -770,7 +770,7 @@
            (a64i-ldp-post buf 29 30 31 80)
            (let ((idx (a64i-current-index buf)))
              (a64i-b buf 0)
-             (a64i-add-fixup buf idx label 126943983357610533)))))) ; :b hash
+             (a64i-add-fixup buf idx label 518081061)))))) ; :b hash
     ;; ALLOC-CONS Vd (#x88 = 136)
     ((= op 136)
      (let ((vd (car operands)))
@@ -860,7 +860,7 @@
                (let ((idx (a64i-current-index buf)))
                  ;; ADR pd: byte3=0x10, lo24=pd (placeholder)
                  (a64i-emit buf 16 pd) ; 16=0x10
-                 (a64i-add-fixup buf idx label 782868907041998776)) ; :adr hash
+                 (a64i-add-fixup buf idx label 253724600)) ; :adr hash
                (a64i-movz buf pd 0 0)))
          (a64i-maybe-store pd vd))))
     ;; Unknown opcode: BRK with opcode number
@@ -924,7 +924,7 @@
       (let ((label (a64i-get-or-make-label target-byte mvm-to-native-label)))
         (let ((idx (a64i-current-index buf)))
           (a64i-b buf 0)
-          (a64i-add-fixup buf idx label 126943983357610533)))))) ; :b hash
+          (a64i-add-fixup buf idx label 518081061)))))) ; :b hash
 
 (defun a64i-translate-bcond (buf operands insn-offset insn-size mvm-to-native-label cond-code)
   (let ((mvm-offset (car operands)))

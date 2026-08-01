@@ -395,8 +395,8 @@
           (setq h1 (logand (* (logxor h1 c) 16777619) 4294967295))
           (setq h2 (logand (* (logxor h2 c) 805306457) 4294967295)))
         (setq cur (cdr cur)))
-      (let ((combined (logior (ash (logand h1 1073741823) 30)
-                              (logand h2 1073741823))))
+      (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                              (logand h2 +name-hash-lo-mask+))))
         (if (= combined 0) 1 combined)))))
 
 (defun normalize-name (sym)
@@ -724,12 +724,12 @@
         (mvm-compile-toplevel-by-hash op-hash form)))))
 
 (defun mvm-compile-toplevel-by-hash (op-hash form)
-  (if (= op-hash 974270913155467339)
+  (if (= op-hash 238798923)
       ;; DEFUN
       (mvm-compile-toplevel-defun form)
-    (if (= op-hash 269523121177805831)
+    (if (= op-hash 165266439)
         nil  ;; IN-PACKAGE — skip
-      (if (= op-hash 1027883123116465666)
+      (if (= op-hash 104930818)
           nil  ;; DEFPACKAGE — skip
         nil))))  ;; Unknown — skip for now
 

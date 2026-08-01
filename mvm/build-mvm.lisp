@@ -250,8 +250,8 @@
         (setq h1 (logand (* (logxor h1 c) 16777619) 4294967295))
         (setq h2 (logand (* (logxor h2 c) 805306457) 4294967295)))
       (setq cur (cdr cur)))
-    (let ((combined (logior (ash (logand h1 1073741823) 30)
-                            (logand h2 1073741823))))
+    (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                            (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
 ;;; Override globals functions to use 0x600000 (Linux BSS)
@@ -906,8 +906,8 @@
       (setq h2 (logand (* (logxor h2 c8) 805306457) 4294967295))
       (setq h1 (logand (* (logxor h1 c9) 16777619) 4294967295))
       (setq h2 (logand (* (logxor h2 c9) 805306457) 4294967295))
-      (let ((combined (logior (ash (logand h1 1073741823) 30)
-                              (logand h2 1073741823))))
+      (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
+                              (logand h2 +name-hash-lo-mask+))))
         (if (zerop combined) 1 combined)))))
 
 ")

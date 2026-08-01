@@ -551,6 +551,50 @@
 (defparameter +neg-half-limb-bits+ -31)
 (defparameter +half-limb-mask+     2147483647)
 
+;;; ---- NAME-HASH width (FIXED, not per-target) -------------------------
+;;; The dual-FNV-1a symbol hash is 29 bits WIDE ON EVERY TARGET.  This is the
+;;; one width constant that deliberately does NOT follow +fixnum-bits+.
+;;;
+;;; WHY IT MUST FIT THE NARROWEST TOWER.  The same name is hashed on BOTH
+;;; sides of the build boundary and the two results have to be the same
+;;; number: at BUILD time the hash is baked in as a literal (which :li
+;;; truncates to the target word, 32 bits on i386, and which the function
+;;; table stores with MVM-EMIT-U32 — cross.lisp:332 — so it has only 32 bits
+;;; for it anyway); at RUN time the image recomputes it with target
+;;; arithmetic, where anything wider than a fixnum becomes a BIGNUM.  The
+;;; historical 60-bit hash satisfied neither on a 30-bit tower, so every
+;;; hash-keyed table missed: *sym-name-table* missed, SYMBOL-NAME returned "",
+;;; NAME-EQ (which compares the hashes of two NAMES) matched nothing, the
+;;; in-image compiler stopped recognising even QUOTE, and (eval 42) recursed
+;;; until the stack was gone.  Measured on i386, probe 7 t8/t10/t11/t13.
+;;;
+;;; WHY NOT PARAMETERISE IT PER TARGET.  Because the compiler's special-form
+;;; dispatch compares op-name against ~274 BAKED hash literals; a width that
+;;; varied would need all of them generated per target (or the whole cond
+;;; restructured into a dispatch table).  Fixing the width at the narrowest
+;;; value makes the literals a ONE-TIME regeneration and leaves nothing to
+;;; parameterise — no per-target divergence and no hot-path cost.
+;;;
+;;; WHY 29.  It must fit the narrowest fixnum tower we intend to support as a
+;;; TAGGED word.  The narrowest today is 32-bit/i386, whose fixnums hold 30
+;;; bits; the hash travels as value<<1, so a full 30-bit hash would set bit 31
+;;; and read as negative.  29 keeps the tagged word comfortably positive.
+;;; A 16-BIT TARGET WOULD NEED A DIFFERENT APPROACH ENTIRELY: ~14-bit fixnums
+;;; leave 2^13 hash values, where collisions across ~16k symbols are not
+;;; theoretical but certain, and the whole hash-as-identity scheme would have
+;;; to be replaced rather than narrowed.
+;;;
+;;; COLLISION HEADROOM.  2^29 = 536,870,912 values.  Measured over the real
+;;; corpora rather than estimated — see the commit that introduced this.
+;;;
+;;; The split is 15 high bits of FNV-a and 14 low bits of FNV-b.  These stay
+;;; DEFPARAMETERs, and SET-TARGET-FIXNUM-BITS still assigns them, so the width
+;;; is greppable and documented in one place even though the value is fixed.
+(defparameter +name-hash-bits+     29)
+(defparameter +name-hash-shift+    14)
+(defparameter +name-hash-hi-mask+  32767)
+(defparameter +name-hash-lo-mask+  16383)
+
 (defun set-target-fixnum-bits (bits)
   "Set the target fixnum width and recompute every derived constant.
    BITS is (word-size * 8) - 2."
@@ -584,7 +628,15 @@
         ;; into the multiply it was implementing.
         +half-limb-bits+       (floor bits 2)
         +neg-half-limb-bits+   (- (floor bits 2))
-        +half-limb-mask+       (- (ash 1 (floor bits 2)) 1))
+        +half-limb-mask+       (- (ash 1 (floor bits 2)) 1)
+        ;; NAME-HASH width is FIXED at 29 on every target — see the
+        ;; defparameter block above.  Assigned here (rather than left alone)
+        ;; so this function stays the single place the widths are set, and so
+        ;; a future narrower tower has one obvious thing to revisit.
+        +name-hash-bits+       29
+        +name-hash-shift+      14
+        +name-hash-hi-mask+    32767
+        +name-hash-lo-mask+    16383)
   bits)
 
 (defun set-target-fixnum-bits-for (target)
@@ -614,9 +666,14 @@
      (defconstant +small-bignum-bits+ ~D)~%~
      (defconstant +half-limb-bits+ ~D)~%~
      (defconstant +neg-half-limb-bits+ ~D)~%~
-     (defconstant +half-limb-mask+ ~D)~%"
+     (defconstant +half-limb-mask+ ~D)~%~
+     (defconstant +name-hash-bits+ ~D)~%~
+     (defconstant +name-hash-shift+ ~D)~%~
+     (defconstant +name-hash-hi-mask+ ~D)~%~
+     (defconstant +name-hash-lo-mask+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+ +limb-bits+ +limb-bits-1+
     +limb-split-bits+ +neg-limb-bits+ +neg-limb-bits-1+ +fixnum-read-guard+
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
-    +half-limb-mask+))
+    +half-limb-mask+
+    +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+))

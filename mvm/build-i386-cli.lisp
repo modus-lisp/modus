@@ -988,8 +988,9 @@
 ;;;
 ;;; This bakes the build's own answer in so the image can compare it against
 ;;; its own.  It is the check that would have caught the whole class, and it
-;;; stays RED (as an %xgap, so probe 7 is still a usable gate) until the hash
-;;; width is derived from the target.  Promote both to %chk when it is.
+;;; is now a HARD CHECK (%chk): with the hash fixed at 29 bits on every target
+;;; the build's literal and the image's recomputation are the same number, and
+;;; probe 7 fails the moment they diverge again.
 ;;;
 ;;; The width is set here because BUILD-IMAGE only calls
 ;;; SET-TARGET-FIXNUM-BITS-FOR later; it sets the same value again, so this is
@@ -1006,11 +1007,6 @@
         (modus.mvm::compute-name-hash "ABC")
         (if (<= (modus.mvm::compute-name-hash "ABC") modus.mvm::+fixnum-max+) "YES" "NO"))
 
-(defvar *sym-name-auto-source*
-  (if (>= *i386-layer* 5)
-      (emit-sym-name-auto (scan-symbol-names *scanned-source*) 200)
-      ""))
-(format t "  sym-name-auto: ~D chars~%" (length *sym-name-auto-source*))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
 
 (defvar *l5-init-source*
@@ -1096,29 +1092,29 @@
   ;; recurses on it forever — which is what (eval 42) does, printing
   ;; `WARN: implicit global #:||` (empty name) and running the 8 MB stack out.
   (%tag2 116 55) (%chk (if (integerp (normalize-name (quote abc))) 1 0) 1)
-  (%tag2 116 56) (%xgap (if (bignump (normalize-name (quote abc))) 1 0) 0)
+  (%tag2 116 56) (%chk (if (bignump (normalize-name (quote abc))) 1 0) 0)
   (%tag2 116 57) (%chk (if (symbolp (normalize-name (quote abc))) 1 0) 0)
   ;; t10-t11 does the *sym-name-table* reverse lookup actually work?  Its keys
   ;; are name hashes, i.e. BIGNUMS here, so every lookup rides EQL-on-bignums.
-  (%tag2 49 48) (%xgap (length (symbol-name (quote abc))) 3)
-  (%tag2 49 49) (%xgap (if (gethash (normalize-name (quote abc)) *sym-name-table*) 1 0) 1)
+  (%tag2 49 48) (%chk (length (symbol-name (quote abc))) 3)
+  (%tag2 49 49) (%chk (if (gethash (normalize-name (quote abc)) *sym-name-table*) 1 0) 1)
   ;; t12 THE ROOT: two hashes of the SAME name are two distinct bignum
   ;; OBJECTS, and EQL on bignums is identity here — so every hash-keyed
   ;; table (sym-name, intern, macro, symbol-function) misses on i386.
-  (%tag2 49 50) (%xgap (if (eql (normalize-name (quote abc))
+  (%tag2 49 50) (%chk (if (eql (normalize-name (quote abc))
                                 (normalize-name (quote abc))) 1 0) 1)
   ;; t13 THE MISMATCH, both halves side by side.  A quoted symbol's STORED
   ;; hash comes from a BUILD-TIME literal, which :li truncates to 32 bits, so
   ;; it is a fixnum.  The same name hashed IN-IMAGE is a 60-bit bignum (t8).
   ;; They are different numbers, so no hash-keyed table can match them.
-  (%tag2 49 51) (%xgap (if (eql (%prim-aref (quote abc) 0)
+  (%tag2 49 51) (%chk (if (eql (%prim-aref (quote abc) 0)
                                 (normalize-name (quote abc))) 1 0) 1)
   ;; t14-t15 BUILD-TIME vs RUNTIME.  %build-hash-abc returns the hash the
   ;; BUILD computed, baked in as a literal and therefore subject to the same
   ;; :li truncation every other baked hash gets.  normalize-name recomputes it
   ;; in-image with target arithmetic.  These two agreeing is the invariant.
-  (%tag2 49 52) (%xgap (if (eql (%build-hash-abc) (normalize-name (quote abc))) 1 0) 1)
-  (%tag2 49 53) (%xgap (if (eql (%build-hash-quote) (normalize-name (quote quote))) 1 0) 1)
+  (%tag2 49 52) (%chk (if (eql (%build-hash-abc) (normalize-name (quote abc))) 1 0) 1)
+  (%tag2 49 53) (%chk (if (eql (%build-hash-quote) (normalize-name (quote quote))) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
   (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
   (putnl)
@@ -1145,6 +1141,22 @@
 (defun probe-eval () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
 (defun probe-l5 () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
 "))
+
+(defvar *sym-name-auto-source*
+  (if (>= *i386-layer* 5)
+      ;; Scan the GENERATED layer-5 sources too, not just *scanned-source*.
+      ;; A name that is only ever written in %l5-boot / probe-l5 (or in the
+      ;; baked hash probe) still needs a *sym-name-table* entry, or
+      ;; SYMBOL-NAME returns "" for it and every name-based check silently
+      ;; degrades — which is exactly how t10/t11/t13/t14 read as real gaps
+      ;; when they were measuring an unscanned probe name.
+      (emit-sym-name-auto
+       (scan-symbol-names (concatenate 'string *scanned-source* (string #\Newline)
+                                       *l5-init-source* (string #\Newline)
+                                       *hash-probe-source*))
+       200)
+      ""))
+(format t "  sym-name-auto: ~D chars~%" (length *sym-name-auto-source*))
 
 (defvar *full-source*
   (concatenate 'string

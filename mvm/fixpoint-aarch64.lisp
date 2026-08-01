@@ -18,14 +18,14 @@
               (let ((offset (- target index)))
                 (let ((word (aref code index)))
                   (cond
-                    ;; :b (name-hash 126943983357610533) and :bl (592037923804208769)
+                    ;; :b (name-hash 518081061) and :bl (391831169)
                     ;; Both use imm26 encoding
-                    ((eql type 126943983357610533)
+                    ((eql type 518081061)
                      (setq fix-b (+ fix-b 1))
                      (aset code index
                            (logior (logand word #xFC000000)
                                    (logand offset #x3FFFFFF))))
-                    ((eql type 592037923804208769)
+                    ((eql type 391831169)
                      (setq fix-bl (+ fix-bl 1))
                      (aset code index
                            (logior (logand word #xFC000000)
@@ -53,8 +53,8 @@
                                (write-char-serial 119) ;; w
                                (print-dec new-word) (write-char-serial 10))))
                          (aset code index new-word))))
-                    ;; :adr (name-hash 782868907041998776)
-                    ((eql type 782868907041998776)
+                    ;; :adr (name-hash 253724600)
+                    ((eql type 253724600)
                      (setq fix-adr (+ fix-adr 1))
                      (let ((byte-off (* offset 4)))
                        (let ((immlo (logand byte-off 3)))

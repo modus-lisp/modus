@@ -311,7 +311,31 @@
              ;; or lands mid-instruction — and for EVAL it landed on an INT3
              ;; (0xCC) byte, so `(eval …)` SIGTRAP'd whenever its (mapped) halved
              ;; target got called.
-             (raw (if fn (- (%val->word fn) 3) 0)))
+             ;; WS5 #206: the callee must be NATIVE code.  A function defined at
+             ;; RUNTIME (a defun evaluated by an earlier top-level form) is not
+             ;; — symbol-function holds a HEAP closure object, and the heap is
+             ;; mapped PROT_READ|WRITE with no PROT_EXEC.  Patching its address
+             ;; into `movabs rax, imm64; call rax` jumps into non-executable
+             ;; memory: SEGV_ACCERR, caught by the boot signal handler, surfaced
+             ;; as an escape MID-EXECUTION, and answered by re-running the whole
+             ;; form — which is the observed side-effect doubling (task #203).
+             ;; Same class as the DGMC GF-array bug that SUB-3'd into the heap.
+             ;;
+             ;; The low nibble already separates them and cannot collide (see
+             ;; CLAUDE.md: cons=1, fn=3, char=5, obj=9 are disjoint, and
+             ;; mvm-fn-addr's LEA+OR-3 makes a native fn word ALWAYS end in 3).
+             ;;   (symbol-function 'car) -> 15165315        low nibble 3, in-image
+             ;;   a runtime (defun kk …)  -> 129844928268201 low nibble 9, on-heap
+             ;; So: only patch a tag-3 word.  Anything else fails the reloc,
+             ;; which fails the page build, which makes %mvm-eval-jit-run take
+             ;; its je=NIL branch and interpret the form ONCE — the correct
+             ;; value with no duplicated side effects.  Losing the JIT for forms
+             ;; that call runtime-defined functions is the price until a
+             ;; late-bound bridge exists; a correct interpret beats a wrong
+             ;; native jump.
+             (word (if fn (%val->word fn) 0))
+             (nativep (eql (logand word 15) 3))
+             (raw (if nativep (- word 3) 0)))
         (if (> raw 0)
             (%jit-write-imm64 base (car r) raw)
             (setq ok nil))))

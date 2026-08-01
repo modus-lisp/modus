@@ -495,9 +495,31 @@
    normal in-module offset/closure path (the same path a direct funcall uses).
    Comparison is by NAME string (case-insensitive) since NAME is the runtime-
    table key the mvm-eval compiler emitted for the CALL."
-  (and (stringp name)
-       (or (string-equal name "SET-SYMBOL-VALUE")
-           (string-equal name "SET-SYMBOL-FUNCTION"))))
+  ;; WS5 #203 gap 2 — DISABLED (returns NIL: every storage sink now WRAPS).
+  ;;
+  ;; The no-wrap above was correct against the OLD funcall dispatch, which
+  ;; reported #x52 for any closure object and therefore call-indirected a
+  ;; native trampoline's slot 0 as a bytecode pc.  op-obj-subtag has since
+  ;; grown the arm that fixes exactly that: a #x52 whose slot 0 is NOT a
+  ;; recorded offset of the CURRENT module is reported as #x51 and routed to
+  ;; CALL-INDIRECT's native functionp bridge.  So storing a trampoline is safe
+  ;; now, and the reason for storing raw is gone.
+  ;;
+  ;; Meanwhile storing RAW became actively wrong.  That same dispatch arm
+  ;; infers "slot 0 is not an offset of the current module ⇒ it is a native
+  ;; address" — which is FALSE for the one shape no-wrap creates: an in-module
+  ;; #x52 closure that was stored by one top-level form and funcalled by a
+  ;; LATER one.  Its slot 0 is a bytecode offset of the DEFINING module, the
+  ;; later module's lambda-offsets do not contain it, so it is misrouted to the
+  ;; native bridge and dies with PROGRAM-ERROR.  Measured on aarch64: the
+  ;; stored value reports subtag #x51 with slot0 = 71 (a raw offset), while the
+  ;; same source on x64 — which wraps — reports #x52 with a native slot 0 and
+  ;; works.  This is the #203 blocker: `(defparameter *f* (lambda ...))` in one
+  ;; form and `(funcall *f* ...)` in the next is what every library does.
+  ;;
+  ;; Kept as a function (rather than deleted at the call sites) so the original
+  ;; reasoning above stays with the code and the behaviour is one edit away.
+  (progn name nil))
 
 (defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets &optional no-wrap)
   "Collect the NARGS arguments for a native bridge call, in order

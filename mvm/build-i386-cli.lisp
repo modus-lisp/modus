@@ -1587,6 +1587,30 @@
   ;; TOP-LEVEL expression whose operator is a READER-produced CL symbol naming
   ;; a compiler builtin.  e2 already proves the identical form works when the
   ;; operator is a NATIVE symbol built with LIST.
+  ;; The expansion's OPERATOR, which n1-n3 never looked at.
+  (%tag2 118 49) (%chk (length (macroexpand-1 (read-from-string (%lt-s-use)))) 3)
+  (%tag2 118 50) (%chk (if (symbolp (car (macroexpand-1 (read-from-string (%lt-s-use))))) 1 0) 1)
+  (%tag2 118 51) (%chk (length (symbol-name (car (macroexpand-1 (read-from-string (%lt-s-use)))))) 1)
+  (%tag2 118 52) (%chk (if (eql (normalize-name (car (macroexpand-1 (read-from-string (%lt-s-use)))))
+                                (normalize-name (quote +))) 1 0)
+                       1)
+  ;; And the same for a fresh list built at runtime with the SAME operator
+  ;; object, to separate a wrong operator from a wrong list.  (No double
+  ;; quote may appear anywhere in this source -- it is a LISP STRING; the
+  ;; file says so at the top and it still caught me once.)
+  (%tag2 118 53) (%chk (if (eql (eval (list (car (macroexpand-1 (read-from-string (%lt-s-use))))
+                                            41 1))
+                                42) 1 0)
+                       1)
+  ;; v1 says the expansion is 4 long while v2-v5 say its first three elements
+  ;; are exactly right and eval-able.  So the expander appends ONE extra
+  ;; argument.  v6 asks what it is; v7 asks whether a LIST-built macro body
+  ;; (no backquote at all) gets the same extra element, which separates the
+  ;; backquote expander from the expander CALL convention.
+  (%tag2 118 54) (%chk (if (null (cadddr (macroexpand-1 (read-from-string (%lt-s-use))))) 1 0) 1)
+  (%tag2 118 55) (%chk (progn (eval (read-from-string (%lt-s-defmacro-nobq)))
+                              (length (macroexpand-1 (read-from-string (%lt-s-use-nobq)))))
+                       3)
   (%tag2 112 49) (%chk (if (eql (eval (read-from-string (%lt-s-plus))) 42) 1 0) 1)
   (%tag2 112 50) (%chk (if (eql (eval (read-from-string (%lt-s-carlist))) 1) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))

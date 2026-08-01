@@ -386,14 +386,14 @@
 
 (defun compute-name-hash (name-input)
   (let ((chars (string-upcase (string name-input))))
-    (let ((h1 2166136261)
-          (h2 3735928559)
+    (let ((h1 40389)             ; 16-bit state; see mvm/compiler.lisp
+          (h2 48879)
           (cur chars))
       (loop
         (when (null cur) (return nil))
-        (let ((c (car cur)))
-          (setq h1 (logand (* (logxor h1 c) 16777619) 4294967295))
-          (setq h2 (logand (* (logxor h2 c) 805306457) 4294967295)))
+        (let ((c (logand (car cur) 65535)))
+          (setq h1 (logand (* (logxor h1 c) 403) 65535))
+          (setq h2 (logand (* (logxor h2 c) 89) 65535)))
         (setq cur (cdr cur)))
       (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
                               (logand h2 +name-hash-lo-mask+))))

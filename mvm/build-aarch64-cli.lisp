@@ -1030,5 +1030,7 @@
       (format t "  native code: ~D bytes -> ~A.native~%"
               (length (kernel-image-native-code image)) path))
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    (when (string= path "/home/claude/modus-aa64-cli")
+      (format t "~%NOTE: wrote the SHARED default path.  Set MODUS_CLI_OUT for any~%      gate or comparison build — the default is outside the worktree, so~%      two agents building at once overwrite each other.~%"))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)))

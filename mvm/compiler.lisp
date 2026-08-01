@@ -1046,10 +1046,12 @@
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
   (let ((name (string-upcase (string name-string)))
-        (h1 2166136261) (h2 3735928559))
+        ;; low 16 bits of the FNV-1a-32 offset bases — see the docstring
+        (h1 #x9DC5) (h2 #xBEEF))
     (loop for c across name
-          do (setq h1 (logand (* (logxor h1 (char-code c)) 16777619) #xFFFFFFFF))
-             (setq h2 (logand (* (logxor h2 (char-code c)) 805306457) #xFFFFFFFF)))
+          do (let ((cc (logand (char-code c) #xFFFF)))
+               (setq h1 (logand (* (logxor h1 cc) 403) #xFFFF))
+               (setq h2 (logand (* (logxor h2 cc) 89) #xFFFF))))
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
                             (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))

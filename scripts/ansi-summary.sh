@@ -1,5 +1,11 @@
 #!/bin/bash
-# ansi-summary.sh — run /home/claude/modus/tmp/modus-ansi-test and print a real pass/fail summary.
+# ansi-summary.sh — run the ANSI image and print a real pass/fail summary.
+#
+# Binary: $MODUS_ANSI_OUT, else /home/claude/modus/tmp/modus-ansi-test.
+# USE THE ENV VAR FOR ANY GATE OR COMPARISON RUN.  The default is a SHARED
+# path outside whatever worktree built it, so two agents gating at once
+# silently measure each other's binary — build-x64-linux.lisp honours the same
+# variable, so set it on both the build and the run.
 #
 # The harness emits, for every ANSI test:
 #   "+"                           — one byte per passing test (survives fork crashes)
@@ -22,7 +28,10 @@ TMPDIR="$(cd "$(dirname "$0")/.." && pwd)/tmp"
 mkdir -p "$TMPDIR"
 OUT="$TMPDIR/ansi-summary-raw.log"
 
-/home/claude/modus/tmp/modus-ansi-test > "$OUT" 2>&1
+BIN="${MODUS_ANSI_OUT:-/home/claude/modus/tmp/modus-ansi-test}"
+[ -x "$BIN" ] || { echo "ansi-summary: no image at $BIN (set MODUS_ANSI_OUT)" >&2; exit 2; }
+echo "ansi-summary: running $BIN" >&2
+"$BIN" > "$OUT" 2>&1
 status=$?
 
 awk '

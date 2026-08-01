@@ -1863,6 +1863,8 @@
                               :if-exists :supersede)
       (write-sequence (kernel-image-image-bytes image) out))
     #+sbcl (sb-ext:run-program "/bin/chmod" (list "+x" path) :wait t)
+    (when (string= path "/home/claude/modus/tmp/modus-ansi-test")
+      (format t "~%NOTE: wrote the SHARED default path.  Set MODUS_ANSI_OUT for any~%      gate or comparison build — the default is outside the worktree, so~%      two agents building at once overwrite each other.~%"))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
     ;; Surface the per-defun "NOTE: redefining" stream as a single line

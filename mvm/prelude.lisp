@@ -1883,7 +1883,12 @@
 ;; native MVM symbols back to their name string.
 (defun compute-name-hash (name-string)
   "Dual-FNV-1a hash for a name string. 60-bit collision-resistant."
-  (let ((h1 2166136261) (h2 3735928559)
+  ;; 16-BIT STATE, bit-identical to the 32-bit FNV form — see the note on
+  ;; COMPUTE-NAME-HASH in mvm/compiler.lisp.  This matters most HERE: a 32-bit
+  ;; state is a BIGNUM on i386's 30-bit tower, so the old form allocated
+  ;; through the generic bignum engine once per character of every name
+  ;; hashed at runtime.  The largest intermediate below is 2^25.
+  (let ((h1 40389) (h2 48879)          ; #x9DC5 / #xBEEF
         (len (array-length name-string))
         (i 0))
     (loop
@@ -1893,8 +1898,9 @@
         ;; path in build-time version).
         (when (and (>= c 97) (<= c 122))
           (setq c (- c 32)))
-        (setq h1 (logand (* (logxor h1 c) 16777619) #xFFFFFFFF))
-        (setq h2 (logand (* (logxor h2 c) 805306457) #xFFFFFFFF)))
+        (setq c (logand c 65535))
+        (setq h1 (logand (* (logxor h1 c) 403) 65535))
+        (setq h2 (logand (* (logxor h2 c) 89) 65535)))
       (setq i (+ i 1)))
     (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
                             (logand h2 +name-hash-lo-mask+))))

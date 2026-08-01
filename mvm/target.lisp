@@ -637,6 +637,20 @@
         +name-hash-shift+      14
         +name-hash-hi-mask+    32767
         +name-hash-lo-mask+    16383)
+  ;; COMPUTE-NAME-HASH holds its two FNV streams in 16 BITS, not 32, so that
+  ;; the whole computation stays in fixnums on a 30-bit tower (a 32-bit state
+  ;; is a bignum there, and it was allocating once per character on the
+  ;; compiler's hottest path).  That reduction is bit-identical ONLY because
+  ;; the output takes <= 16 LOW bits from each stream and FNV's low half is a
+  ;; closed system mod 2^16.  Widen the hash past that and the high halves —
+  ;; which are no longer computed — start being read.  Fail loudly here rather
+  ;; than silently returning a different number.
+  (assert (and (<= +name-hash-shift+ 16)
+               (<= (integer-length +name-hash-hi-mask+) 16)
+               (<= (integer-length +name-hash-lo-mask+) 16))
+          () "name-hash width ~D exceeds the 16-bit-state reduction in ~
+              COMPUTE-NAME-HASH; restore 32-bit streams before widening."
+          +name-hash-bits+)
   bits)
 
 (defun set-target-fixnum-bits-for (target)

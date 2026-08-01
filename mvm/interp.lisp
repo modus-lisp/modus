@@ -53,6 +53,24 @@
 (defun reg-get (regs v) (%val->word (svref regs v)))
 (defun reg-set (regs v w) (setf (svref regs v) (%word->val w)))
 
+;; Store the NIL / T IMMEDIATES into a register slot WITHOUT going through
+;; %word->val.
+;;
+;; The regs vector holds VALUES, and the value denoted by word #xDEAD0001 is
+;; exactly NIL (and #xDEAD1009 exactly T), so these are what reg-set already
+;; computes on a 62-bit tower — a semantic no-op there.
+;;
+;; They are NOT a no-op on a 30-bit one.  #xDEAD0001 is 3735879681, far past
+;; that fixnum range, so the constant is a BIGNUM in-image; %word->val is an
+;; unguarded `:sar' by 1 (MVM Active Limitation 8), which shifts the bignum's
+;; HEAP POINTER rather than its value.  VN — the register compile-nil moves
+;; from for every NIL an mvm-eval-compiled form produces — therefore held
+;; garbage: not NIL, not a cons.  `(eval '(cons 2 nil))' built (2 . <garbage>)
+;; and every list built under mvm-eval carried one extra element, which is
+;; what made a runtime DEFMACRO expand to (+ 41 1 NIL).
+(defun reg-set-nil (regs v) (setf (svref regs v) nil))
+(defun reg-set-t   (regs v) (setf (svref regs v) t))
+
 ;; Raw-wrapping fixnum add/sub for op-add / op-sub.  Native :add/:sub run
 ;; hardware ADD/SUB on the 64-bit register words (each = value<<1) and let the
 ;; result WRAP at int64 — that wrap is LOAD-BEARING: bignum-add/sub limb
@@ -584,7 +602,7 @@
       (setf (mvm-mv-count state) (mvm-jb-mv-count jb))
       (let ((regs (mvm-regs state)))
         (setf (svref regs +vreg-vfp+) (mvm-jb-vfp jb))
-        (reg-set regs +vreg-vr+ +mvm-t+))
+        (reg-set-t regs +vreg-vr+))
       (mvm-jb-pc jb))))
 
 ;; WS3 flip MV propagation: secondary values of the LAST completed
@@ -646,7 +664,7 @@
          (ftab (or function-table (vector)))
          (regs (mvm-regs state)))
     (declare (type fixnum pc len) (type simple-vector regs) (ignorable ftab))
-    (reg-set regs +vreg-vn+ +mvm-nil+)  ; VN holds the canonical NIL immediate
+    (reg-set-nil regs +vreg-vn+)  ; VN holds the canonical NIL immediate
     (reg-set regs +vreg-vpc+ pc)
     ;; Re-entry arg marshalling: store each initial arg VALUE into V0..Vn and
     ;; set NARGS, then set the closure env.  Mirrors what a normal CALL caller
@@ -767,7 +785,7 @@
                        :cenv (mvm-cenv state)
                        :mv-count (mvm-mv-count state))
                       (mvm-handlers state))
-                (reg-set regs +vreg-vr+ +mvm-nil+)
+                (reg-set-nil regs +vreg-vr+)
                 (setf pc npc))
                ;; LONGJMP (#x0511): pop the nearest jmp-buf, restore its dynamic
                ;; state, jump pc back to the setjmp's resume-PC, and set VR to a
@@ -1728,7 +1746,7 @@
                           (fn (and name (%mvm-resolve-runtime-fn name))))
                      (if (functionp fn)
                          (reg-set regs vd (%val->word fn))
-                         (reg-set regs vd +mvm-nil+)))
+                         (reg-set-nil regs vd)))
                    (setf (svref regs vd) target))
                (setf pc npc2))))
 

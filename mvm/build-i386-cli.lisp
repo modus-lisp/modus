@@ -1188,7 +1188,12 @@
                      (defun %lt-s-defmacro-nobq () ~S)~%~
                      (defun %lt-s-use-nobq () ~S)~%~
                      (defun %lt-s-plus () ~S)~%~
-                     (defun %lt-s-carlist () ~S)~%"
+                     (defun %lt-s-carlist () ~S)~%~
+                     (defun %lt-s-ltn () ~S)~%~
+                     (defun %lt-s-lambda3 () ~S)~%~
+                     (defun %lt-s-lambda1 () ~S)~%~
+                     (defun %lt-s-list2 () ~S)~%~
+                     (defun %lt-s-list3 () ~S)~%"
                 path size
                 (concatenate 'string path ".does-not-exist")
                 "FOO"
@@ -1200,7 +1205,12 @@
                 "(defmacro %ltn (a) (list (quote +) a 1))"
                 "(%ltn 41)"
                 "(+ 41 1)"
-                "(car (list 1 2))"))
+                "(car (list 1 2))"
+                "%LTN"
+                "(lambda (x) (list (quote +) x 1))"
+                "(lambda (x) (list x))"
+                "(list 1 2)"
+                "(list 1 2 3)"))
       "(defun %lt-path () nil)
 (defun %lt-size () 0)
 (defun %lt-nopath () nil)
@@ -1214,6 +1224,11 @@
 (defun %lt-s-use-nobq () nil)
 (defun %lt-s-plus () nil)
 (defun %lt-s-carlist () nil)
+(defun %lt-s-ltn () nil)
+(defun %lt-s-lambda3 () nil)
+(defun %lt-s-lambda1 () nil)
+(defun %lt-s-list2 () nil)
+(defun %lt-s-list3 () nil)
 "))
 
 (defvar *hash-probe-source*
@@ -1415,11 +1430,16 @@
   ;; symbol-name can recover COMMA / BACKQUOTE from *sym-name-table* — without
   ;; the latter the expander is a SILENT no-op and the COMMA marker survives
   ;; into the expansion.
+  ;; PRINTS 0 OR 1, NEVER THE VALUE.  This check currently FAILS (0), and the
+  ;; failing value is a heap object, not a number -- handing that to %pdec
+  ;; printed a tagged pointer as byte garbage, which reads like display noise
+  ;; rather than the real failure it is.  A probe must never let a red light
+  ;; look like static.
   (write-char-serial 101) (write-char-serial 56) (write-char-serial 61)
   (eval (list (quote defmacro) (quote %e8m) (list (quote a))
               (list (quote backquote)
                     (list (quote +) (list (quote comma) (quote a)) 1))))
-  (%pdec (eval (list (quote %e8m) 41))) (putnl)
+  (%pdec (if (eql (eval (list (quote %e8m) 41)) 42) 1 0)) (putnl)
   0)
 
 ;; probe-fileio: the i386 syscall numbers and the struct stat64 offsets,
@@ -1463,6 +1483,9 @@
 ;; produces, whether the two key helpers accept each, and finally the whole
 ;; read-defmacro-eval-use round trip.
 (defun %lt-dummy-expander (mform) 7)
+;; NATIVE control for the &rest-arity probes: same body shape as a macro
+;; expander, but compiled by the BUILD rather than by mvm-eval.
+(defun %lt-native-list3 (x) (list (quote +) x 1))
 
 ;; Byte-level helpers for the :li-const wire-format probe.  Each returns a
 ;; single small integer so %pdec can never be handed a bignum or NIL (it would
@@ -1611,6 +1634,60 @@
   (%tag2 118 55) (%chk (progn (eval (read-from-string (%lt-s-defmacro-nobq)))
                               (length (macroexpand-1 (read-from-string (%lt-s-use-nobq)))))
                        3)
+  ;; WHERE is the extra NIL introduced?  w1/w2 call the REGISTERED expander
+  ;; directly with exactly one argument, bypassing macroexpand-1 entirely.
+  ;; w3 is the native control (must be 3).  w4 is the decisive one: a lambda
+  ;; compiled at RUNTIME by mvm-eval, funcalled with one argument, whose body
+  ;; is the same (list ...) call and NO macro machinery is involved at all.
+  ;;   w4 = 4  -> every runtime-compiled lambda over-counts its &rest callee
+  ;;   w4 = 3  -> the fault is in the macro dispatch, not the lambda body
+  ;; w5 uses a 1-element list so an off-by-one shows as 2 rather than needing
+  ;; the operator to be right.
+  (%tag2 119 49) (%chk (length (funcall (%raw-macro-expander (read-from-string (%lt-s-ltm)))
+                                        (read-from-string (%lt-s-use))))
+                       3)
+  (%tag2 119 50) (%chk (progn (eval (read-from-string (%lt-s-defmacro-nobq)))
+                              (length (funcall (%raw-macro-expander
+                                                 (read-from-string (%lt-s-ltn)))
+                                               (read-from-string (%lt-s-use-nobq)))))
+                       3)
+  (%tag2 119 51) (%chk (length (%lt-native-list3 41)) 3)
+  (%tag2 119 52) (%chk (length (funcall (eval (read-from-string (%lt-s-lambda3))) 41)) 3)
+  (%tag2 119 53) (%chk (length (funcall (eval (read-from-string (%lt-s-lambda1))) 41)) 1)
+  ;; Is the +1 confined to a runtime-compiled LAMBDA, or does it hit every
+  ;; mvm-eval call into a native &rest function?  u1-u3 are native controls.
+  ;; u4/u5 are the same &rest call made from a TOP-LEVEL eval, with no lambda
+  ;; anywhere.  p2 could not see this: (car (list 1 2 NIL)) is still 1.
+  ;; NOTE the same shape answers correctly on x64, so whatever this is, it is
+  ;; i386-local -- the shared compiler/interp are not at fault.
+  (%tag2 117 49) (%chk (length (list 1 2)) 2)
+  (%tag2 117 50) (%chk (length (funcall (function list) 1 2)) 2)
+  (%tag2 117 51) (%chk (length (apply (function list) (list 1 2))) 2)
+  (%tag2 117 52) (%chk (length (eval (read-from-string (%lt-s-list2)))) 2)
+  (%tag2 117 53) (%chk (length (eval (read-from-string (%lt-s-list3)))) 3)
+  ;; LIST is a BOOTSTRAP MACRO (register-mvm-bootstrap-macros expands
+  ;; (list a b) -> (cons a (cons b nil))), not a call -- which is why d1/d2
+  ;; measured some other bridge call and looked deceptively clean.  So the
+  ;; extra element is introduced either by the READER (g1: does the read form
+  ;; itself carry a trailing NIL?) or by the expansion (g2: same form built
+  ;; natively, so the reader cannot be involved).
+  (%tag2 103 49) (%chk (length (read-from-string (%lt-s-list2))) 3)
+  (%tag2 103 50) (%chk (length (eval (list (quote list) 1 2))) 2)
+  (%tag2 103 51) (%chk (length (eval (list (quote cons) 1 (list (quote cons) 2 nil)))) 2)
+  ;; g3 removes the LIST macro, the reader and &rest from the picture, so the
+  ;; remaining suspects are the innermost (cons X nil) itself and mvm-eval's
+  ;; COMPILE CACHE (keyed by EQUAL on the form list -- a wrong hit returns
+  ;; another form's module).  h1-h4 test the cons; h5-h6 re-run the failing
+  ;; shapes with the cache switched off.
+  (%tag2 104 49) (%chk (length (eval (list (quote cons) 2 nil))) 1)
+  (%tag2 104 50) (%chk (if (null (cdr (eval (list (quote cons) 2 nil)))) 1 0) 1)
+  (%tag2 104 51) (%chk (if (null (eval nil)) 1 0) 1)
+  (%tag2 104 52) (%chk (if (consp (eval nil)) 1 0) 0)
+  (setq *mvm-eval-no-cache* t)
+  (%tag2 104 53) (%chk (length (eval (list (quote cons) 1 (list (quote cons) 2 nil)))) 2)
+  (%tag2 104 54) (%chk (length (eval (list (quote list) 1 2))) 2)
+  (%tag2 104 55) (%chk (length (eval (read-from-string (%lt-s-list2)))) 2)
+  (setq *mvm-eval-no-cache* nil)
   (%tag2 112 49) (%chk (if (eql (eval (read-from-string (%lt-s-plus))) 42) 1 0) 1)
   (%tag2 112 50) (%chk (if (eql (eval (read-from-string (%lt-s-carlist))) 1) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))

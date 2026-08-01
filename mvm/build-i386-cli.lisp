@@ -1241,7 +1241,7 @@
                 "(list 1 2 3)"
                 "(handler-case 7 (error (c) 9))"
                 "(handler-case (error (quote simple-error)) (error (c) 9))"
-                "(handler-case (progn (rt-inc-probe 41)) (error (c) 9))"
+                "(handler-case (%ltf 7) (error (c) 9))"
                 "(if t 1 2)"
                 "(funcall (car (list (lambda () 7))))"))
       "(defun %lt-path () nil)
@@ -1737,6 +1737,10 @@
   ;; runtime-metric shape).
   (%tag2 99 49) (%chk (if (eql (eval (read-from-string (%lt-s-hc-plain))) 7) 1 0) 1)
   (%tag2 99 50) (%chk (if (eql (eval (read-from-string (%lt-s-hc-err))) 9) 1 0) 1)
+  ;; c3 calls %LTF, which r1 above DEFINED BY EVAL -- the runtime-metric shape
+  ;; (a by-name call to an eval-defined fn, from inside an eval'd handler-case).
+  ;; It used to call a driver defun and failed for a reason that had nothing to
+  ;; do with handler-case, i.e. it was a broken probe asserting a phantom gap.
   (%tag2 99 51) (%chk (if (eql (eval (read-from-string (%lt-s-hc-native))) 42) 1 0) 1)
   ;; The T IMMEDIATE through mvm-eval.  op-LI picks its load path from the
   ;; HIGH 32 bits only (>= 2^30), which is a 62-bit-tower test: a word with

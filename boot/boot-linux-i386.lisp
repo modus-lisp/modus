@@ -62,6 +62,26 @@
   "Base of the i386 absolute-address global slot block (VA/VL/VN/nargs/
    cenv/mv-count), inside the demand-zeroed BSS.")
 
+;;; ---- Staged argv/envp (BSS) --------------------------------------------
+;;; The kernel hands us argv/envp on ITS stack, near 0x40800000.  An MVM
+;;; mem-ref carries its address as a TAGGED fixnum (the opcode untags with
+;;; SHR 1), so on a 32-bit word any address at or above 2^30 is
+;;; unrepresentable — measured: esp=0x40800390.  argc survives only because
+;;; the boot stub already copies it down to 0x10000200.
+;;;
+;;; So the stub stages the WHOLE vector into the BSS: the strings into an
+;;; arena, and a pointer array holding their BSS addresses.  The array has
+;;; exactly the shape the kernel stack had — argv[0..n-1], NULL, envp[0..m-1],
+;;; NULL — so lib/cli-toplevel.lisp's walking logic is unchanged; only the
+;;; base address and the slot width differ.  Both regions sit below 2^30, so
+;;; every address in them is an ordinary fixnum.
+(defconstant +linux-i386-argv-ptrs+  #x10009000
+  "Staged pointer array: argv[0..n-1], NULL, envp[0..m-1], NULL. 4-byte slots.")
+(defconstant +linux-i386-argv-ptrs-end+ #x1000A000)
+(defconstant +linux-i386-argv-arena+ #x1000A000
+  "Staged string arena — every argv/envp string, NUL-terminated, packed.")
+(defconstant +linux-i386-argv-arena-end+ #x1001E000)
+
 (defconstant +linux-i386-heap-hint+   #x30000000)
 (defconstant +linux-i386-heap-size+   #x20000000)  ; 512 MB = two 256 MB semispaces
 (defconstant +linux-i386-gc-midpoint+ #x10000000
@@ -164,6 +184,115 @@
 
 ;;; Convenience: MOV r32, imm32 / MOV [abs32], imm32 / MOV [abs32], r32
 (defun i386l-mov-reg-imm (buf reg imm) (i386l-bytes buf (+ #xB8 reg)) (i386l-le32 buf imm))
+
+(defun i386l-le32-list (v)
+  "The 4 little-endian bytes of V, as a LIST (for length-computed blocks)."
+  (let ((n (logand v #xFFFFFFFF)))
+    (list (logand n #xFF) (logand (ash n -8) #xFF)
+          (logand (ash n -16) #xFF) (logand (ash n -24) #xFF))))
+
+(defun i386l-rel8 (d)
+  "One signed displacement byte.  Errors rather than truncating: a silently
+   wrapped jump target is the worst possible boot bug to debug."
+  (assert (<= -128 d 127) (d) "rel8 displacement ~D out of range" d)
+  (list (logand d #xFF)))
+
+(defun emit-i386-stage-argv (buf)
+  "Copy the kernel's argv AND envp — pointers and the strings themselves —
+   down into the BSS, so both are addressable on a 32-bit word.
+
+   Must run while ESP still points at the kernel's stack, i.e. BEFORE the
+   relocation below.  Clobbers EAX/EBX/ECX-free/EDX/ESI/EDI/EBP; nothing
+   after it depends on those.
+
+   Walks slots from &argv[0] until it has seen TWO consecutive NULLs (end of
+   argv, then end of envp), copying each string into the arena and recording
+   its BSS address.  Both regions are bounds-checked; overflowing either stops
+   the walk cleanly rather than scribbling over the heap metadata below.
+
+   EVERY jump displacement here is COMPUTED from the measured length of the
+   emitted blocks, never hand-counted — a wrong displacement in a boot stub
+   presents as an unattributable early crash, and this session already lost a
+   round to hand arithmetic that a script got right."
+  (let* ((pro (append (list #x89 #xE3)                       ; mov ebx, esp
+                      (list #x83 #xC3 #x04)                  ; add ebx, 4  -> &argv[0]
+                      (cons #xBA (i386l-le32-list +linux-i386-argv-ptrs+))   ; mov edx, ptrs
+                      (cons #xBF (i386l-le32-list +linux-i386-argv-arena+))  ; mov edi, arena
+                      (list #x31 #xED)))                     ; xor ebp, ebp (NULL run)
+         ;; --- loop head ---
+         (a1  (append (list #x81 #xFA)
+                      (i386l-le32-list +linux-i386-argv-ptrs-end+)))  ; cmp edx, ptrs-end
+         (sz-a2 6)                                           ; jae DONE (0F 83 rel32)
+         (a3  (list #x8B #x03))                              ; mov eax, [ebx]
+         (a4  (list #x85 #xC0))                              ; test eax, eax
+         (sz-a5 2)                                           ; jnz COPY (rel8)
+         (a6  (list #xC7 #x02 #x00 #x00 #x00 #x00))          ; mov dword [edx], 0
+         (a7  (list #x83 #xC2 #x04))                         ; add edx, 4
+         (a8  (list #x83 #xC3 #x04))                         ; add ebx, 4
+         (a9  (list #x45))                                   ; inc ebp
+         (a10 (list #x83 #xFD #x02))                         ; cmp ebp, 2
+         (sz-a11 2)                                          ; jl LOOP (rel8)
+         (sz-a12 5)                                          ; jmp DONE (rel32)
+         ;; --- copy one string ---
+         (c13 (append (list #x81 #xFF)
+                      (i386l-le32-list +linux-i386-argv-arena-end+)))  ; cmp edi, arena-end
+         (sz-c14 2)                                          ; jae DONE (rel8)
+         ;; NOTE: no `xor ebp,ebp' here.  EBP counts NULL terminators SEEN IN
+         ;; TOTAL, not consecutively.  The stack is argv[..] NULL envp[..] NULL
+         ;; and then the AUXILIARY VECTOR, which is (type,value) pairs, not
+         ;; pointers.  Resetting the count on each non-NULL entry meant envp's
+         ;; own terminator read as the FIRST null again, so the walk ran on
+         ;; into auxv and dereferenced AT_* type codes as char* -- it faulted
+         ;; on esi=3 (AT_PHDR) after staging 33 slots.  Two terminators total
+         ;; is exactly the end of envp.
+         (c15 (list))
+         (c16 (list #x89 #x3A))                              ; mov [edx], edi
+         (c17 (list #x83 #xC2 #x04))                         ; add edx, 4
+         (c18 (list #x89 #xC6))                              ; mov esi, eax
+         (s19 (list #x8A #x06))                              ; mov al, [esi]
+         (s20 (list #x88 #x07))                              ; mov [edi], al
+         (s21 (list #x46))                                   ; inc esi
+         (s22 (list #x47))                                   ; inc edi
+         (s23 (list #x84 #xC0))                              ; test al, al
+         (sz-s24 2)                                          ; jnz STR (rel8)
+         (c25 (list #x83 #xC3 #x04))                         ; add ebx, 4
+         (sz-c26 5)                                          ; jmp LOOP (rel32)
+         ;; --- measured spans ---
+         (str-body (+ (length s19) (length s20) (length s21)
+                      (length s22) (length s23) sz-s24))
+         (null-tail (+ (length a6) (length a7) (length a8)
+                       (length a9) (length a10) sz-a11 sz-a12))
+         (copy-len (+ (length c13) sz-c14 (length c15) (length c16)
+                      (length c17) (length c18) str-body (length c25) sz-c26))
+         (loop-len (+ (length a1) sz-a2 (length a3) (length a4) sz-a5 null-tail))
+         ;; The `jl LOOP' sits BEFORE the trailing `jmp DONE', so its backward
+         ;; span must exclude that jmp.  (Caught by disassembling the emitted
+         ;; stub: the jl landed 5 bytes early, mid-instruction, and the boot
+         ;; SIGSEGV'd before printing anything.  Every other displacement here
+         ;; verified correct against the same disassembly.)
+         (back-to-loop (- loop-len sz-a12)))
+    (flet ((emit (bytes) (dolist (b bytes) (mvm-emit-byte buf b))))
+      (emit pro)
+      (emit a1)
+      ;; jae DONE — past the rest of the loop head and the whole copy block
+      (emit (append (list #x0F #x83)
+                    (i386l-le32-list (+ (length a3) (length a4) sz-a5
+                                        null-tail copy-len))))
+      (emit a3) (emit a4)
+      (emit (append (list #x75) (i386l-rel8 null-tail)))     ; jnz COPY
+      (emit a6) (emit a7) (emit a8) (emit a9) (emit a10)
+      (emit (append (list #x7C) (i386l-rel8 (- back-to-loop))))  ; jl LOOP
+      (emit (append (list #xE9) (i386l-le32-list copy-len))) ; jmp DONE
+      (emit c13)
+      (emit (append (list #x73)                              ; jae DONE
+                    (i386l-rel8 (+ (length c15) (length c16) (length c17)
+                                   (length c18) str-body (length c25) sz-c26))))
+      (emit c16) (emit c17) (emit c18)
+      (emit s19) (emit s20) (emit s21) (emit s22) (emit s23)
+      (emit (append (list #x75) (i386l-rel8 (- str-body))))  ; jnz STR
+      (emit c25)
+      (emit (append (list #xE9)                              ; jmp LOOP
+                    (i386l-le32-list (- (+ loop-len copy-len))))))))
 (defun i386l-mov-abs-imm (buf addr imm)
   (i386l-bytes buf #xC7 #x05) (i386l-le32 buf addr) (i386l-le32 buf imm))
 (defun i386l-mov-abs-reg (buf addr reg)
@@ -282,6 +411,12 @@
   (i386l-bytes buf #xF3 #xA4)                   ; rep movsb                       2
 
   (i386l-bytes buf #x83 #xC4 #x08)              ; add esp, 8  (drop saved argv ptrs)
+
+  ;; --- Stage the FULL argv + envp into the BSS ---------------------------
+  ;; ESP is the initial process stack again here, which is what this needs.
+  ;; The argv[1]/argv[2] copies above stay: probe-argv and the older CLI
+  ;; probes read those two fixed slots directly, and they cost 128 bytes.
+  (emit-i386-stage-argv buf)
 
   ;; [0x10000290] = the INITIAL process ESP, saved RAW, before the relocation
   ;; below replaces it.  lib/cli-toplevel.lisp walks the live initial stack to

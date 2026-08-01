@@ -795,11 +795,13 @@
 ;;
 ;; mem-ref :u64 is RAW, so a loaded pointer reads back as raw/2 — double it to
 ;; get the real byte address.  Same convention cli-toplevel documents.
-(defun %i386-argv-base ()
-  (+ (* 2 (mem-ref 268436112 :u64)) 4))
+(defun %i386-argv-base () 268472320)   ; #x10009000, the staged pointer array
 
+;; A staged slot holds a BSS byte address directly.  A :u32 load tags its
+;; result, so the Lisp value IS the stored word -- no doubling, unlike the
+;; 64-bit :u64 convention, and no address above 2^30 to be unrepresentable.
 (defun %i386-argv-ptr (i)
-  (* 2 (mem-ref (+ (%i386-argv-base) (* 4 i)) :u64)))
+  (mem-ref (+ (%i386-argv-base) (* 4 i)) :u32))
 
 (defun %pcstr (addr)
   (let ((i 0))
@@ -811,39 +813,26 @@
 
 (defun probe-argv ()
   (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 99) (write-char-serial 61) (%pdec (mem-ref 268435968 :u32)) (putnl)
-  ;; The saved initial ESP, printed as raw bytes (%phexw reads byte-wise, so it
-  ;; works even when the VALUE cannot be represented).  This is the measurement
-  ;; behind the blocker below: the kernel-supplied stack sits near 0x40800000.
+  ;; The saved initial ESP, as raw bytes (%phexw reads byte-wise, so it works
+  ;; even when the VALUE is unrepresentable).  Kept as the standing evidence
+  ;; for WHY the boot stub stages: an MVM mem-ref carries its address as a
+  ;; tagged fixnum, so anything at or above 2^30 cannot be addressed at all on
+  ;; a 32-bit word, and the kernel stack lives up at 0x408.....
   (write-char-serial 101) (write-char-serial 115) (write-char-serial 112) (write-char-serial 61)
   (%phexw 268436112) (putnl)
-  ;; HARD LIMIT, not a bug to be worked around here.  An MVM mem-ref carries its
-  ;; ADDRESS as a tagged fixnum (the opcode untags with SHR 1), so on a 32-bit
-  ;; word an address at or above 2^30 has no representation at all -- its tagged
-  ;; form overflows.  ARGC reads fine only because the boot stub copies it into
-  ;; the BSS at 0x10000200; the argv POINTERS and the strings they name are
-  ;; still up on the kernel stack, out of reach.  Dereferencing one is an
-  ;; immediate SIGSEGV, which is what this probe used to do.
-  ;; Wiring lib/cli-toplevel.lisp on i386 therefore needs the BOOT STUB to stage
-  ;; the whole argv/envp vector down into the BSS, extending what it already
-  ;; does for argv[1]/argv[2] -- it is not a matter of an arch arm in Lisp.
-  (when (>= (mem-ref 268436112 :u8) 0)
-    (let ((hi (mem-ref 268436115 :u8)))
-      (when (>= hi 64)
-        (write-char-serial 65) (write-char-serial 66) (write-char-serial 79)
-        (write-char-serial 86) (write-char-serial 69) (write-char-serial 50)
-        (write-char-serial 94) (write-char-serial 51) (write-char-serial 48)
-        (putnl)
-        (return-from probe-argv 0))))
+  ;; Everything below reads the STAGED copy in the BSS instead, which the boot
+  ;; stub filled with the same shape the kernel stack had: argv[0..n-1], NULL,
+  ;; envp[0..m-1], NULL -- 4-byte slots, all addresses below 2^30.
   (let ((argc (mem-ref 268435968 :u32)) (i 0))
     (loop
       (when (>= i argc) (return nil))
-      (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 118) (write-char-serial 91) (%pdec i) (write-char-serial 61)
+      (write-char-serial 97) (write-char-serial 114) (write-char-serial 103) (write-char-serial 118) (write-char-serial 91) (%pdec i) (write-char-serial 93) (write-char-serial 61)
       (%pcstr (%i386-argv-ptr i)) (putnl)
       (setq i (+ i 1)))
     ;; envp follows argv's NULL terminator; print the first entry as proof the
-    ;; environment vector is reachable too (cli-toplevel needs HOME for ~/.modusrc)
-    (let ((envp (+ (%i386-argv-base) (* 4 (+ argc 1)))))
-      (write-char-serial 101) (write-char-serial 110) (write-char-serial 118) (write-char-serial 112) (write-char-serial 91) (write-char-serial 48) (write-char-serial 93) (write-char-serial 61) (%pcstr (* 2 (mem-ref envp :u64))) (putnl)))
+    ;; environment vector staged too (cli-toplevel needs HOME for ~/.modusrc).
+    (write-char-serial 101) (write-char-serial 110) (write-char-serial 118) (write-char-serial 112) (write-char-serial 91) (write-char-serial 48) (write-char-serial 93) (write-char-serial 61)
+    (%pcstr (%i386-argv-ptr (+ argc 1))) (putnl))
   0)
 
 ;;; ---- probe-hc: the handler-case traps, mechanics only ------------------

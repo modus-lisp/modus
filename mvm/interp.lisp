@@ -537,36 +537,74 @@
    normal in-module offset/closure path (the same path a direct funcall uses).
    Comparison is by NAME string (case-insensitive) since NAME is the runtime-
    table key the mvm-eval compiler emitted for the CALL."
-  ;; WS5 #203 gap 2 — DISABLED (returns NIL: every storage sink now WRAPS).
+  ;; WS5 #203 gap 2 — REPURPOSED.  This no longer means "do not wrap"; it means
+  ;; "this sink's argument OUTLIVES the module, so wrap it DEEPLY".
   ;;
-  ;; The no-wrap above was correct against the OLD funcall dispatch, which
-  ;; reported #x52 for any closure object and therefore call-indirected a
-  ;; native trampoline's slot 0 as a bytecode pc.  op-obj-subtag has since
-  ;; grown the arm that fixes exactly that: a #x52 whose slot 0 is NOT a
-  ;; recorded offset of the CURRENT module is reported as #x51 and routed to
-  ;; CALL-INDIRECT's native functionp bridge.  So storing a trampoline is safe
-  ;; now, and the reason for storing raw is gone.
+  ;; The original no-wrap was correct against the OLD funcall dispatch, which
+  ;; reported #x52 for any closure object and so call-indirected a native
+  ;; trampoline's slot 0 as a bytecode pc.  op-obj-subtag has since grown the
+  ;; arm that fixes exactly that (a #x52 whose slot 0 is not a recorded offset
+  ;; of the CURRENT module is reported #x51 and routed to the native bridge),
+  ;; so storing a trampoline became safe — and storing RAW became the defect:
+  ;; the stored offset indexes the DEFINING module's bytecode, which the later
+  ;; module does not have.  That was fixed by wrapping here (9fefc2e).
   ;;
-  ;; Meanwhile storing RAW became actively wrong.  That same dispatch arm
-  ;; infers "slot 0 is not an offset of the current module ⇒ it is a native
-  ;; address" — which is FALSE for the one shape no-wrap creates: an in-module
-  ;; #x52 closure that was stored by one top-level form and funcalled by a
-  ;; LATER one.  Its slot 0 is a bytecode offset of the DEFINING module, the
-  ;; later module's lambda-offsets do not contain it, so it is misrouted to the
-  ;; native bridge and dies with PROGRAM-ERROR.  Measured on aarch64: the
-  ;; stored value reports subtag #x51 with slot0 = 71 (a raw offset), while the
-  ;; same source on x64 — which wraps — reports #x52 with a native slot 0 and
-  ;; works.  This is the #203 blocker: `(defparameter *f* (lambda ...))` in one
-  ;; form and `(funcall *f* ...)` in the next is what every library does.
-  ;;
-  ;; Kept as a function (rather than deleted at the call sites) so the original
-  ;; reasoning above stays with the code and the behaviour is one edit away.
-  (progn name nil))
+  ;; But wrapping only reached the value the sink was HANDED.  For
+  ;; `(defparameter *tbl* (list (lambda () 7)))` that value is the CONS, so the
+  ;; closure INSIDE it stayed raw and `(funcall (car *tbl*))` from a later form
+  ;; still died.  Measured: the bare stored closure has a native slot 0
+  ;; (#<fn>), the one inside the cons still had a raw offset (86).  Confirmed
+  ;; on x64 and i386 too, so this is shared, not an aarch64 nicety — and it is
+  ;; the shape libraries use for handler/hook tables and method lists.
+  (and (stringp name)
+       (or (string-equal name "SET-SYMBOL-VALUE")
+           (string-equal name "SET-SYMBOL-FUNCTION"))))
+
+(defun %mvm-wrap-escaping-deep (v bc ftab rt lam-offsets budget)
+  "%MVM-WRAP-ESCAPING, but reaching THROUGH cons structure.
+
+   Used only at the storage sinks (see %mvm-store-fn-name-p), whose argument
+   escapes into a global and outlives the module that built it.  Every other
+   bridge argument keeps the cheap shallow wrap, so this cannot slow the common
+   call path — which matters, because the ANSI gate is shard-timeout sensitive.
+
+   Rewrites IN PLACE (set-car/set-cdr) rather than rebuilding, so object
+   IDENTITY and any other references to the same structure are preserved.  That
+   is safe precisely because the value being replaced is an in-module closure,
+   which is MEANINGLESS outside its defining module — nothing can be relying on
+   the raw form.
+
+   BUDGET bounds the walk (node count), which also makes a circular structure
+   terminate; the cdr spine is iterated rather than recursed so a long list
+   cannot blow the stack."
+  (if (or (null v) (<= budget 0))
+      v
+      (if (consp v)
+          (let ((node v) (left budget))
+            (loop
+              (when (or (not (consp node)) (<= left 0)) (return nil))
+              (let* ((a (car node))
+                     (wa (if (consp a)
+                             (%mvm-wrap-escaping-deep a bc ftab rt lam-offsets
+                                                      (- left 1))
+                             (%mvm-wrap-escaping a bc ftab rt lam-offsets))))
+                (unless (eq wa a) (set-car node wa)))
+              (setq left (- left 1))
+              (let ((d (cdr node)))
+                (if (consp d)
+                    (setq node d)
+                    (progn
+                      (let ((wd (%mvm-wrap-escaping d bc ftab rt lam-offsets)))
+                        (unless (eq wd d) (set-cdr node wd)))
+                      (return nil)))))
+            v)
+          (%mvm-wrap-escaping v bc ftab rt lam-offsets))))
 
 (defun %mvm-collect-call-args (state regs nargs bc ftab rt lam-offsets &optional no-wrap)
   "Collect the NARGS arguments for a native bridge call, in order
-   (arg0 arg1 … arg{nargs-1}), wrapping any escaping mvm-eval lambda value
-   (unless NO-WRAP — set for storage-sink fns, see %mvm-store-fn-name-p).
+   (arg0 arg1 … arg{nargs-1}), wrapping any escaping mvm-eval lambda value.
+   NO-WRAP is a legacy parameter NAME: it now selects the DEEP wrap for
+   storage-sink fns (see %mvm-store-fn-name-p), not the absence of wrapping.
 
    The MVM calling convention places the FIRST 4 args (compiler.lisp's
    +max-reg-args+ — hardcoded 4 here because that constant is defined in
@@ -596,12 +634,20 @@
         ;; rev = (arg{nargs-1} … arg4); prepend each (wrapped) → args now =
         ;; (arg4 … arg{nargs-1}).
         (dolist (v rev)
-          (push (if no-wrap v (%mvm-wrap-escaping v bc ftab rt lam-offsets)) args))))
+          ;; NO-WRAP is now the STORAGE-SINK flag (see %mvm-store-fn-name-p):
+          ;; the argument outlives this module, so wrap it DEEPLY — reaching
+          ;; through cons structure — instead of shallowly.  Everything else
+          ;; keeps the cheap shallow wrap.
+          (push (if no-wrap
+                    (%mvm-wrap-escaping-deep v bc ftab rt lam-offsets 1000)
+                    (%mvm-wrap-escaping v bc ftab rt lam-offsets))
+                args))))
     ;; Prepend the register args (indices min(nargs,4)-1 … 0) so they lead.
     (let ((i (- (if (> nargs 4) 4 nargs) 1)))
       (loop
         (when (< i 0) (return))
-        (push (if no-wrap (svref regs i)
+        (push (if no-wrap
+                  (%mvm-wrap-escaping-deep (svref regs i) bc ftab rt lam-offsets 1000)
                   (%mvm-wrap-escaping (svref regs i) bc ftab rt lam-offsets))
               args)
         (setq i (- i 1))))

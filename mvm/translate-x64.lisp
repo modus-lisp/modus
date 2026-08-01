@@ -4641,7 +4641,12 @@
     (emit-label buf done)
     (emit-bytes buf #x58)                            ; pop rax
     (emit-bytes buf #xC3))                           ; ret
-  (format t "  Handler-stack helpers emitted (push/pop)~%"))
+  ;; WS5 #203: to *ERROR-OUTPUT*, not stdout.  translate-x64 is baked INTO the
+  ;; hosted x64 image (kernel-main calls %jit-boot-init at every boot), so this
+  ;; build-time chatter was printing on a SHIPPED binary's stdout on every run —
+  ;; the same pollution class as the implicit-global WARN, one layer down.  On
+  ;; the SBCL build host *error-output* is stderr, so build logs keep it.
+  (format *error-output* "~&  Handler-stack helpers emitted (push/pop)~%"))
 
 (defun emit-gc-dbg-char (buf ch)
   "DEBUG (gated by *x64-gc-debug*): write byte CH to fd 1, preserving all
@@ -6651,7 +6656,7 @@
       (when (or (and gc-trampoline-label gc-collect-label)
                 (and *x64-jit-mode* gc-trampoline-label))
         (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
-        (format t "  GC trampoline emitted, %GC-COLLECT wired~%"))
+        (format *error-output* "~&  GC trampoline emitted, %GC-COLLECT wired~%"))
       ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).
       (when cons-bit-label
         (emit-mcgc-cons-bit-subroutine buf cons-bit-label))
@@ -6659,7 +6664,7 @@
       ;; flag-off layout is byte-identical since this is skipped entirely).
       (when page-gc-label
         (emit-page-gc-trampoline buf page-gc-label)
-        (format t "  MCGC page-GC trampoline emitted (pinning build)~%"))
+        (format *error-output* "~&  MCGC page-GC trampoline emitted (pinning build)~%"))
       ;; Emit handler-stack helpers (push/pop) used by SETJMP/CLEAR-HANDLER
       ;; traps to support nested handler-cases without clobbering the
       ;; parent's setjmp frame.

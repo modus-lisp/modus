@@ -70,6 +70,30 @@
 ;; what made a runtime DEFMACRO expand to (+ 41 1 NIL).
 (defun reg-set-nil (regs v) (setf (svref regs v) nil))
 (defun reg-set-t   (regs v) (setf (svref regs v) t))
+(defun reg-set-boolean (regs v b) (if b (reg-set-t regs v) (reg-set-nil regs v)))
+
+;; Is register V NIL?  Tests the slot's VALUE instead of asking
+;; `(mvm-nil-p (reg-get regs v))'.
+;;
+;; That round trip is not equivalent on a 32-bit word.  reg-get is %val->word,
+;; a shift LEFT by one, and NIL's word #xDEAD0001 does not survive it: the top
+;; bit is shifted out and the result read back as a tagged fixnum is the SIGNED
+;; interpretation, -559087615, which no longer `eql's +mvm-nil+ (3735879681).
+;; Computed both ways rather than by hand:
+;;     64-bit  %val->word(NIL) -> 3735879681  = +mvm-nil+   -> NIL is NIL
+;;     32-bit  %val->word(NIL) -> -559087615 /= +mvm-nil+   -> NIL is NOT NIL
+;; So on i386 every BNULL fell through and every BNNULL branched.  What that
+;; broke was HANDLER-CASE under eval: the compiled form is
+;; `trap SETJMP (VR:=NIL) / mov d,VR / BNNULL d,handler', so the handler ran on
+;; the NORMAL path, no clause matched a NIL *current-condition*, and the
+;; dispatch's `(t (%hc-longjmp))' fallback fired TRAP #x0511 on an empty
+;; handler stack -- "MVM LONGJMP with no active handler-case", for a body that
+;; could not signal at all.
+;;
+;; Same family as VN holding garbage (reg-set-nil above) and as CONSP seeing
+;; NIL's low nibble as the cons tag: NIL's bit pattern is a perfectly ordinary
+;; value on a 32-bit word, so it must never be recovered by arithmetic.
+(defun reg-nil-p (regs v) (null (svref regs v)))
 
 ;; Raw-wrapping fixnum add/sub for op-add / op-sub.  Native :add/:sub run
 ;; hardware ADD/SUB on the 64-bit register words (each = value<<1) and let the
@@ -1271,12 +1295,12 @@
           (#.+op-bnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
              (multiple-value-bind (off npc2) (fetch-s32 bc npc)
-               (setf pc (if (mvm-nil-p (reg-get regs vs)) (+ npc2 off) npc2)))))
+               (setf pc (if (reg-nil-p regs vs) (+ npc2 off) npc2)))))
 
           (#.+op-bnnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
              (multiple-value-bind (off npc2) (fetch-s32 bc npc)
-               (setf pc (if (not (mvm-nil-p (reg-get regs vs))) (+ npc2 off) npc2)))))
+               (setf pc (if (not (reg-nil-p regs vs)) (+ npc2 off) npc2)))))
 
           ;; --- List Operations ---
           ;; --- List ops, ALIGNED MODEL (unified representation) ---
@@ -1343,13 +1367,17 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                ;; VALUE directly: the (%word->val (reg-get ...)) round-trip
                ;; overflows for a fixnum near 2^62 → mis-typed as a cons.
-               (reg-set regs vd (mvm-boolean (consp (svref regs vs))))
+               ;; reg-set-boolean, NOT (reg-set … (mvm-boolean …)): mvm-boolean
+               ;; hands back the raw WORD of t/nil, and on a 30-bit tower those
+               ;; words are BIGNUMS, so reg-set's %word->val :sar shifts a heap
+               ;; pointer (Active Limitation 8) and CONSP returned garbage.
+               (reg-set-boolean regs vd (consp (svref regs vs)))
                (setf pc npc2))))
 
           (#.+op-atom+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
-               (reg-set regs vd (mvm-boolean (atom (svref regs vs))))
+               (reg-set-boolean regs vd (atom (svref regs vs)))
                (setf pc npc2))))
 
           ;; --- Object Operations ---

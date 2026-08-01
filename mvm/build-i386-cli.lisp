@@ -74,11 +74,22 @@
 (defvar *bridge-source*
   (if (>= *i386-layer* 3)
       (apply #'concatenate 'string
+             ;; ansi-bridge.lisp is LAST, exactly as build-generic-cli.lisp
+             ;; orders it.  It is not only test scaffolding: it holds the
+             ;; runtime MAKE-ARRAY defun, and compile-make-array routes every
+             ;; kwarg-bearing call — including the
+             ;; `(make-array n :element-type '(unsigned-byte 8))` in
+             ;; mvm-buffer-used-bytes, i.e. every mvm-eval — to
+             ;; `(funcall #'make-array …)`.  Without the file that funcall
+             ;; produced NIL, and the very next `(setf (aref result i) …)`
+             ;; ran OBJ-SUBTAG on NIL: SIGSEGV inside MVM-BUFFER-USED-BYTES,
+             ;; two frames under (eval 42).
              (loop for f in '("mvm/cl-sequences.lisp" "mvm/cl-streams.lisp"
                               "mvm/cl-fileio.lisp"    "mvm/cl-printer.lisp"
                               "mvm/cl-reader.lisp"    "mvm/cl-eval.lisp"
                               "mvm/cl-clos.lisp"      "mvm/cl-types.lisp"
-                              "mvm/cl-packages.lisp"  "mvm/cl-conditions.lisp")
+                              "mvm/cl-packages.lisp"  "mvm/cl-conditions.lisp"
+                              "mvm/ansi-bridge.lisp")
                    append (list (cli-strip-in-package (mvm-text f))
                                 (string #\Newline))))
       ""))
@@ -493,6 +504,12 @@
   (write-char-serial 100) (write-char-serial 101) (write-char-serial 102) (write-char-serial 117) (write-char-serial 110) (write-char-serial 45) (write-char-serial 99) (write-char-serial 97) (write-char-serial 108) (write-char-serial 108) (%chk (sq 7) 49)
   (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 45) (write-char-serial 99) (write-char-serial 97) (write-char-serial 114) (write-char-serial 45) (write-char-serial 99) (write-char-serial 100) (write-char-serial 114) (%chk (let ((p (cons 3 4))) (+ (car p) (cdr p))) 7)
   (write-char-serial 102) (write-char-serial 117) (write-char-serial 110) (write-char-serial 99) (write-char-serial 97) (write-char-serial 108) (write-char-serial 108) (%chk (funcall (function sq) 9) 81)
+  (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 112) (write-char-serial 45) (write-char-serial 110) (write-char-serial 105) (write-char-serial 108) (%chk (if (consp nil) 1 0) 0)
+  (write-char-serial 97) (write-char-serial 116) (write-char-serial 111) (write-char-serial 109) (write-char-serial 45) (write-char-serial 110) (write-char-serial 105) (write-char-serial 108) (%chk (if (atom nil) 1 0) 1)
+  (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 112) (write-char-serial 45) (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (%chk (if (consp (cons 1 2)) 1 0) 1)
+  (write-char-serial 97) (write-char-serial 116) (write-char-serial 111) (write-char-serial 109) (write-char-serial 45) (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (%chk (if (atom (cons 1 2)) 1 0) 0)
+  (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 112) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (consp 7) 1 0) 0)
+  (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 112) (write-char-serial 45) (write-char-serial 108) (write-char-serial 105) (write-char-serial 115) (write-char-serial 116) (write-char-serial 45) (write-char-serial 119) (write-char-serial 97) (write-char-serial 108) (write-char-serial 107) (%chk (let ((n 0) (cur (list 1 2 3))) (loop (when (not (consp cur)) (return n)) (setq n (+ n 1)) (setq cur (cdr cur)))) 3)
   (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 119) (write-char-serial 111) (write-char-serial 114) (write-char-serial 100) (write-char-serial 32) (write-char-serial 119) (write-char-serial 105) (write-char-serial 100) (write-char-serial 116) (write-char-serial 104) (putnl)
   (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 109) (write-char-serial 97) (write-char-serial 120) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741823) 1 0) 1)
   (write-char-serial 112) (write-char-serial 97) (write-char-serial 115) (write-char-serial 116) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741824) 1 0) 0)
@@ -1158,6 +1175,16 @@
       ""))
 (format t "  sym-name-auto: ~D chars~%" (length *sym-name-auto-source*))
 
+;;; MODUS_I386_DBG=<path>: append one extra source file LAST, so a
+;;; last-defun-wins override can instrument an in-image function without
+;;; touching the shared mvm/*.lisp (which x64/aarch64 also compile).  Empty
+;;; by default; nothing in a normal build reads it.
+(defvar *dbg-source*
+  (let ((p (sb-ext:posix-getenv "MODUS_I386_DBG")))
+    (if (and p (plusp (length p)))
+        (progn (format t "  DBG override: ~A~%" p) (read-file-text p))
+        "")))
+
 (defvar *full-source*
   (concatenate 'string
     *prelude-source* (string #\Newline)
@@ -1179,7 +1206,8 @@
     *l5-init-source* (string #\Newline)
     *bridge-source* (string #\Newline)
     *crypto-source* (string #\Newline)
-    *driver-source*))
+    *driver-source* (string #\Newline)
+    *dbg-source*))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 

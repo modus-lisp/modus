@@ -3008,13 +3008,39 @@
 
         ((op= +op-consp+)
          ;; (consp Vd Vs) -- test low 4 bits for cons tag
+         ;;
+         ;; MUST EXCLUDE NIL FIRST.  On hosted Linux/i386 NIL is
+         ;; #xDEAD0001 (+linux-i386-nil-value+), whose low nibble IS
+         ;; +tag-cons+ — so a bare tag test answers T for NIL.  x64 has
+         ;; always compared against R15 before the tag test for exactly
+         ;; this reason; i386 never did.
+         ;;
+         ;; The consequence was not subtle.  `(car NIL)` correctly yields
+         ;; NIL (compile-cxr-guard-and-deref short-circuits on :bnull), so
+         ;; the improper-list-safe idiom used all over the compiler --
+         ;;     (loop while (consp cur) do (walk (car cur) ...)
+         ;;                                (setq cur (cdr cur)))
+         ;; -- never terminated on i386: reaching the list's terminating
+         ;; NIL, consp said T, (car NIL) gave NIL back, and the walk
+         ;; recursed on NIL forever.  That is what blew the 8 MB stack with
+         ;; 26,869 frames of %RETURN-FROM-ESCAPES-BLOCK-P's inner WALK on
+         ;; (eval 42): the walker was not walking 42, it was walking NIL,
+         ;; whose CAR is itself.
+         ;;
+         ;; Bare-metal i386 uses 0 for NIL, whose low nibble is 0 and so
+         ;; was never affected; comparing against *vn-addr* (rather than
+         ;; baking an immediate) is correct on both.
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
            (let ((true-label (i386-make-label))
+                 (false-label (i386-make-label))
                  (done-label (i386-make-label)))
+             (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
+             (i386-emit-jcc buf :e false-label)
+             (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
+             (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
              (i386-emit-jcc buf :e true-label)
+             (i386-emit-label buf false-label)
              (i386-emit-mov-reg-abs buf +scratch0+ *vn-addr*)
              (i386-emit-jmp-rel32 buf done-label)
              (i386-emit-label buf true-label)
@@ -3032,17 +3058,22 @@
          ;; destination (5 sites).  Nothing before it had, which is exactly how
          ;; this class hides: the function size is unchanged and the wrong
          ;; value surfaces far from the opcode that produced it.
+         ;; ...and NIL IS an atom, so it takes the T path here — the mirror
+         ;; of the +op-consp+ NIL exclusion above.  Without it (atom NIL)
+         ;; answered NIL on hosted Linux/i386.
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
            (let ((true-label (i386-make-label))
                  (done-label (i386-make-label)))
+             (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
+             (i386-emit-jcc buf :e true-label)
+             (i386-emit-and-reg-imm buf +scratch0+ +tag-mask+)
+             (i386-emit-cmp-reg-imm buf +scratch0+ +tag-cons+)
              (i386-emit-jcc buf :ne true-label)
              ;; Is cons -> return NIL
              (i386-emit-mov-reg-abs buf +scratch0+ *vn-addr*)
              (i386-emit-jmp-rel32 buf done-label)
-             ;; Not cons -> return T
+             ;; Not cons (or NIL) -> return T
              (i386-emit-label buf true-label)
              (i386-emit-mov-reg-imm buf +scratch0+ +i386-mvm-t+)
              (i386-emit-label buf done-label))

@@ -983,6 +983,7 @@
       ((eql which 8) (sys-exit (if (eql (probe-fileio) 0) 0 1)))
       ((eql which 9) (probe-load))
       ((eql which 10) (sys-exit (if (eql (probe-sym) 0) 0 1)))
+      ((eql which 11) (probe-cli))
       (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
 
@@ -1305,7 +1306,8 @@
                      (defun %lt-s-hc-err () ~S)~%~
                      (defun %lt-s-hc-native () ~S)~%~
                      (defun %lt-s-ift () ~S)~%~
-                     (defun %lt-s-cil () ~S)~%"
+                     (defun %lt-s-cil () ~S)~%~
+                     (defun %lt-s-one () ~S)~%"
                 path size
                 fixture
                 (concatenate 'string path ".does-not-exist")
@@ -1328,7 +1330,8 @@
                 "(handler-case (error (quote simple-error)) (error (c) 9))"
                 "(handler-case (%ltf 7) (error (c) 9))"
                 "(if t 1 2)"
-                "(funcall (car (list (lambda () 7))))"))
+                "(funcall (car (list (lambda () 7))))"
+                "1"))
       "(defun %lt-path () nil)
 (defun %lt-size () 0)
 (defun %lt-fixture () nil)
@@ -1353,6 +1356,7 @@
 (defun %lt-s-hc-native () nil)
 (defun %lt-s-ift () nil)
 (defun %lt-s-cil () nil)
+(defun %lt-s-one () nil)
 "))
 
 (defvar *hash-probe-source*
@@ -1631,6 +1635,108 @@
     (let ((bc (mvm-buffer-bytes b)))
       (logior (aref bc 0) (ash (aref bc 1) 8)
               (ash (aref bc 2) 16) (ash (aref bc 3) 24)))))
+
+;; probe-cli: the CLI ACTION functions called directly, one at a time, with a
+;; letter printed before and after each.  cli-toplevel is another workstream's
+;; file so it cannot be instrumented; this reaches the same functions from
+;; outside.  A missing trailing letter names the step that did not return.
+;; Minimal repro attempts for the cli-toplevel action failure.  Every function
+;; cli-toplevel CALLS works when called from probe-cli, so the difference must
+;; be the calling function's own shape.  rep1 = handler-case around the same
+;; call, inside a let*/cond, one frame.  rep2 = same, plus a SECOND
+;; handler-case in a branch that is never taken, to test whether mere presence
+;; of another frame in the function is what breaks it.
+(defun %cli-rep1 (s)
+  (let* ((all (list 1 2))
+         (args (cdr all))
+         (actions nil)
+         (interactive t))
+    (setq actions (cons (cons (quote :eval) s) actions))
+    (setq interactive nil)
+    (cond
+      (args
+       (handler-case (%cli-run-actions (reverse actions))
+         (t (c) (write-char-serial 102)))
+       1)
+      (t 0))))
+
+(defun %cli-rep2 (s)
+  (let* ((all (list 1 2))
+         (args (cdr all))
+         (actions nil)
+         (interactive t))
+    (setq actions (cons (cons (quote :eval) s) actions))
+    (setq interactive nil)
+    (cond
+      (args
+       (handler-case (%cli-run-actions (reverse actions))
+         (t (c) (write-char-serial 102)))
+       (cond
+         (interactive
+          (handler-case (%cli-eval-string s) (t (c) nil))
+          1)
+         (t 1)))
+      (t 0))))
+
+(defun probe-cli ()
+  (%l5-boot)
+  (write-char-serial 65) (putnl)                          ; A: boot done
+  (handler-case
+      (progn (%cli-eval-string (%lt-s-one))
+             (write-char-serial 66))                      ; B: eval-string ok
+    (t (c) (write-char-serial 98)))                       ; b: eval-string threw
+  (putnl)
+  (handler-case
+      (progn (%cli-eval-string (%lt-s-plus))
+             (write-char-serial 67))                      ; C: eval a real form
+    (t (c) (write-char-serial 99)))
+  (putnl)
+  (handler-case
+      (progn (%cli-load-file (%lt-path))
+             (write-char-serial 68))                      ; D: load-file ok
+    (t (c) (write-char-serial 100)))                      ; d: load-file threw
+  (putnl)
+  (handler-case
+      (progn (%cli-run-actions (list (cons (quote :eval) (%lt-s-one))))
+             (write-char-serial 69))                      ; E: run-actions ok
+    (t (c) (write-char-serial 101)))
+  (putnl)
+  (write-char-serial 90) (putnl)                          ; Z: reached the end
+  ;; What does %cli-collect-argv ACTUALLY return?  `--quit alone exits 0' does
+  ;; NOT prove the parse works: an EMPTY arg list produces the same rc=0 (the
+  ;; loop exits immediately and the REPL reads EOF).  Print the count and every
+  ;; element so the list is data instead of an inference.
+  (write-char-serial 78) (write-char-serial 61)            ; N=
+  (%pdec (length (%cli-collect-argv))) (putnl)
+  (let ((cur (%cli-collect-argv)) (i 0))
+    (loop
+      (when (null cur) (return nil))
+      (write-char-serial 91) (%pdec i) (write-char-serial 93)   ; [i]
+      (write-string-serial (car cur)) (putnl)
+      (setq cur (cdr cur))
+      (setq i (+ i 1))))
+  ;; The one thing the markers above do NOT exercise: cli-toplevel feeds
+  ;; %cli-eval-string a string built at RUNTIME by %cli-cstr-at out of the
+  ;; staged argv bytes, whereas A-E used build-time string LITERALS.  Run
+  ;; `probe 11 <form>' and this evaluates argv[2] through the same path the
+  ;; CLI does.  Also reports the string's length and first char code, so a
+  ;; malformed runtime string shows up as data rather than as an exception.
+  (when (>= (mem-ref 268435968 :u32) 3)
+    (let ((s (%cli-cstr-at (%i386-argv-ptr 2))))
+      (write-char-serial 76) (write-char-serial 61) (%pdec (length s))   ; L=
+      (write-char-serial 32) (write-char-serial 67) (write-char-serial 61)
+      (%pdec (char-code (char s 0))) (putnl)                             ; C=
+      (handler-case (progn (%cli-eval-string s) (write-char-serial 82))  ; R: ok
+        (t (c) (write-char-serial 114)))                                 ; r: threw
+      (putnl)
+      ;; The two shape repros, each guarded so a throw is visible as a letter.
+      (handler-case (progn (%cli-rep1 s) (write-char-serial 83))         ; S: rep1 ok
+        (t (c) (write-char-serial 115)))                                 ; s: rep1 threw
+      (putnl)
+      (handler-case (progn (%cli-rep2 s) (write-char-serial 84))         ; T: rep2 ok
+        (t (c) (write-char-serial 116)))                                 ; t: rep2 threw
+      (putnl)))
+  0)
 
 (defun probe-sym ()
   (%l5-boot)

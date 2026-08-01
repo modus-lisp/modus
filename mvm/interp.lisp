@@ -933,14 +933,43 @@
              ;; right bits.  |word| >= 2^62 means a boundary fixnum literal whose
              ;; word overflows the in-image fixnum range — fetch-li-value returns
              ;; %word->val(word) DIRECTLY (overflow-free), stored as the value.
+             ;; The NIL / T IMMEDIATES are recognised from their WIRE BYTES and
+             ;; stored as VALUES, before either arithmetic path can touch them.
+             ;;
+             ;; mvm-li encodes its operand verbatim, and compile-t emits
+             ;; `(:li dest +t-value+)', so a T literal arrives here as the raw
+             ;; word #xDEAD1009 (and compiler.lisp's %MCGC-COLLECT path emits
+             ;; #xDEAD0001 the same way).  Both have hi = 0, so the split test
+             ;; below — which reads the HIGH word only and is really a "does
+             ;; |word| reach 2^62" question, i.e. a 62-bit-tower test — sends
+             ;; them down the reg-set branch, where %word->val is an unguarded
+             ;; :sar on what is a BIGNUM at this width.  The T literal came back
+             ;; corrupted: still non-NIL, so `(if t …)' and every truthiness
+             ;; test kept working, but `(eq (eval t) t)' was FALSE.  Silent, and
+             ;; it would break any `(eq x t)' in eval'd code.
+             ;;
+             ;; Discriminating on bytes 3,2 = DE,AD costs one aref and one
+             ;; compare on the hot path and short-circuits immediately for
+             ;; ordinary literals; no #xDEADxxxx word is a legitimate fixnum
+             ;; immediate.  A no-op on the 64-bit targets, where reg-set already
+             ;; yields exactly T / NIL for these two words.
              (let* ((hi (logior (aref bc (+ npc 4)) (ash (aref bc (+ npc 5)) 8)
                                 (ash (aref bc (+ npc 6)) 16) (ash (aref bc (+ npc 7)) 24)))
-                    (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi)))
-               (if (or (>= hi-signed #x40000000) (< hi-signed #x-40000000))
-                   (multiple-value-bind (val npc2) (fetch-li-value bc npc)
-                     (setf (svref regs vd) val) (setf pc npc2))
-                   (multiple-value-bind (imm npc2) (fetch-u64 bc npc)
-                     (reg-set regs vd imm) (setf pc npc2))))))
+                    (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi))
+                    (deadp (and (= (aref bc (+ npc 3)) #xDE)
+                                (= (aref bc (+ npc 2)) #xAD)
+                                (= hi-signed 0))))
+               (cond
+                 ((and deadp (= (aref bc (+ npc 1)) #x00) (= (aref bc npc) #x01))
+                  (reg-set-nil regs vd) (setf pc (+ npc 8)))
+                 ((and deadp (= (aref bc (+ npc 1)) #x10) (= (aref bc npc) #x09))
+                  (reg-set-t regs vd) (setf pc (+ npc 8)))
+                 ((or (>= hi-signed #x40000000) (< hi-signed #x-40000000))
+                  (multiple-value-bind (val npc2) (fetch-li-value bc npc)
+                    (setf (svref regs vd) val) (setf pc npc2)))
+                 (t
+                  (multiple-value-bind (imm npc2) (fetch-u64 bc npc)
+                    (reg-set regs vd imm) (setf pc npc2)))))))
 
           ;; LI-CONST: load constant-pool[idx] — the mvm-eval QUOTE pool.  The
           ;; compiler (compile-quote under *mvm-eval-runtime-p*) registered the

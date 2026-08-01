@@ -1219,7 +1219,9 @@
                      (defun %lt-s-list3 () ~S)~%~
                      (defun %lt-s-hc-plain () ~S)~%~
                      (defun %lt-s-hc-err () ~S)~%~
-                     (defun %lt-s-hc-native () ~S)~%"
+                     (defun %lt-s-hc-native () ~S)~%~
+                     (defun %lt-s-ift () ~S)~%~
+                     (defun %lt-s-cil () ~S)~%"
                 path size
                 (concatenate 'string path ".does-not-exist")
                 "FOO"
@@ -1239,7 +1241,9 @@
                 "(list 1 2 3)"
                 "(handler-case 7 (error (c) 9))"
                 "(handler-case (error (quote simple-error)) (error (c) 9))"
-                "(handler-case (progn (rt-inc-probe 41)) (error (c) 9))"))
+                "(handler-case (progn (rt-inc-probe 41)) (error (c) 9))"
+                "(if t 1 2)"
+                "(funcall (car (list (lambda () 7))))"))
       "(defun %lt-path () nil)
 (defun %lt-size () 0)
 (defun %lt-nopath () nil)
@@ -1261,6 +1265,8 @@
 (defun %lt-s-hc-plain () nil)
 (defun %lt-s-hc-err () nil)
 (defun %lt-s-hc-native () nil)
+(defun %lt-s-ift () nil)
+(defun %lt-s-cil () nil)
 "))
 
 (defvar *hash-probe-source*
@@ -1732,6 +1738,18 @@
   (%tag2 99 49) (%chk (if (eql (eval (read-from-string (%lt-s-hc-plain))) 7) 1 0) 1)
   (%tag2 99 50) (%chk (if (eql (eval (read-from-string (%lt-s-hc-err))) 9) 1 0) 1)
   (%tag2 99 51) (%chk (if (eql (eval (read-from-string (%lt-s-hc-native))) 42) 1 0) 1)
+  ;; The T IMMEDIATE through mvm-eval.  op-LI picks its load path from the
+  ;; HIGH 32 bits only (>= 2^30), which is a 62-bit-tower test: a word with
+  ;; hi=0 but lo >= 2^30 -- exactly #xDEAD1009 and #xDEAD0001 -- takes the
+  ;; reg-set branch, where %word->val :sar's what is a BIGNUM at this width.
+  ;; compile-t emits (:li dest +t-value+), so this would corrupt every T
+  ;; literal in an eval'd form.  MEASURE before believing it.
+  (%tag2 107 49) (%chk (if (eval t) 1 0) 1)
+  (%tag2 107 50) (%chk (if (eq (eval t) t) 1 0) 1)
+  (%tag2 107 51) (%chk (if (eql (eval (read-from-string (%lt-s-ift))) 1) 1 0) 1)
+  ;; And the runtime-metric SIGSEGV, isolated: a closure reached through a list
+  ;; and funcalled with ZERO arguments.
+  (%tag2 107 52) (%chk (if (eql (eval (read-from-string (%lt-s-cil))) 7) 1 0) 1)
   (%tag2 112 49) (%chk (if (eql (eval (read-from-string (%lt-s-plus))) 42) 1 0) 1)
   (%tag2 112 50) (%chk (if (eql (eval (read-from-string (%lt-s-carlist))) 1) 1 0) 1)
   (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))

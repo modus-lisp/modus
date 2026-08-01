@@ -63,6 +63,49 @@
    special is kept for documentation / an alternate runtime override; the
    default %jit-enabled-p returns its value if bound, else NIL.")
 
+;;; WS5 #203 — THE RE-EXECUTION GUARD.
+;;;
+;;; The interpret fallback re-runs the WHOLE FORM.  That is only SAFE while no
+;;; user code has run yet; once control has entered JIT'd native code, the
+;;; form's side effects have already happened, and re-running duplicates them.
+;;; The old `(t (c) ...interpret...)` handler could not tell the two apart, so
+;;; an ordinary error signalled by the user's own code replayed every side
+;;; effect that preceded it (measured: pre=2 post=1 for a 3-setq progn).
+;;;
+;;; These two flags let the handler decide.  Both default to NIL, which is also
+;;; what an uninitialised defvar reads as (compiler limitation #7), so no
+;;; explicit init is required — but they MUST be saved/restored around each
+;;; attempt rather than dynamically rebound, because JIT'd native code can call
+;;; back into mvm-eval (a macroexpander running during a later form's compile),
+;;; and because an escaping condition would otherwise leak the set value the
+;;; same way *handler-bind-stack* used to (see 279f2cc).
+(defvar *jit-native-ran* nil
+  "T once control has been transferred INTO JIT'd native code for the current
+   %mvm-eval-jit-run attempt.  While NIL, an escaping condition can only have
+   come from JIT setup (translate / page build / relocation) — no user code has
+   executed, so falling back to mvm-interpret is safe and invisible.  Once T,
+   an escaping condition is the user's own and MUST be re-signalled, never
+   answered by re-running the form.")
+
+(defvar *jit-infra-fallback* nil
+  "T when %mvm-eval-jit-run has DELIBERATELY signalled an internal sentinel
+   asking for the interpret fallback even though native code already ran — at
+   present only the multiple-values case, where the native MV block cannot yet
+   be reproduced into the interpreter's simulated *mvm-last-mv*.  This is the
+   one path that still double-executes side effects; it is narrow (single-value
+   forms, the overwhelming majority, never take it) and is counted separately
+   in *jit-mv-fallback-count* so its true frequency is measurable rather than
+   assumed.  Reproducing the MV block from BSS (tagged count at #x10000090,
+   extras at #x10000098+) would close it — tracked separately.")
+
+(defvar *jit-mv-fallback-count* nil
+  "How many times the MV path forced a re-run (the remaining double-execute).")
+
+(defvar *jit-resignal-count* nil
+  "How many times an escaping USER condition was correctly re-signalled instead
+   of being answered by re-running the form.  Non-zero here is the guard doing
+   exactly its job; before the fix every one of these was a duplicated form.")
+
 (defvar *jit-target-arch* :x64
   "WS4-S5 (aarch64): which native back-end the runtime-JIT seam drives.
    :x64 (default) → %jit-translate-page-1 (translate-mvm-to-x64, contiguous
@@ -502,11 +545,31 @@
           ;; single-value form reads back 1 (the thunk epilogue sets it, but
           ;; be defensive).  A form that sets it >1 falls back for correct MV.
           (setf (mem-ref #x10000090 :u64) 1)
+          ;; WS5 #203 POINT OF NO RETURN.  Everything above this line is JIT
+          ;; setup: if it signals, no user code has run and the interpret
+          ;; fallback is safe.  The instant we branch into the page, the form's
+          ;; side effects begin, so any condition escaping from here on is the
+          ;; user's and re-running the form would duplicate them.  Set the flag
+          ;; BEFORE the call, not after — a condition signalled by the very
+          ;; first instruction of the form must already count as "native ran".
+          (setq *jit-native-ran* t)
           (let ((raw (%jit-call (+ (car je) (cadr je)))))
             (let ((mvc (mem-ref #x10000090 :u64)))
               (unless (eql mvc 1)
                 ;; MV form → fall back to interpret; DON'T free (result unknown —
                 ;; could be a function; leak the rare MV-form page conservatively).
+                ;;
+                ;; WS5 #203: this is the ONE remaining path that re-runs a form
+                ;; whose side effects already happened.  Native stamped a real
+                ;; MV block (tagged count at #x10000090, extras at #x10000098+)
+                ;; which we cannot yet translate into the interpreter's
+                ;; simulated *mvm-last-mv*, so the only way to produce correct
+                ;; VALUES today is to re-interpret.  Flag it so the handler
+                ;; allows the fallback despite *jit-native-ran*, and count it
+                ;; so the cost is measured rather than assumed.
+                (setq *jit-infra-fallback* t)
+                (setq *jit-mv-fallback-count*
+                      (if *jit-mv-fallback-count* (+ 1 *jit-mv-fallback-count*) 1))
                 (error "jit-mv-fallback")))
             ;; SINGLE value: clear the interpreter's simulated MV state so a
             ;; STALE *mvm-last-mv* from a prior interpret run doesn't leak into
@@ -576,26 +639,86 @@
          (%fnt (cadddr tuple))
          (%rt (car (cddddr tuple)))
          (%lam (cadr (cddddr tuple)))
-         ;; WS4-S5b: when *use-jit*, run native; fall back to interpret on ANY
-         ;; error (unsupported form / MV form / page-build failure).
-         ;; %jit-active-p (not %jit-enabled-p) so *jit-inhibit* (Class 3) works
-         ;; even in the gate image whose %jit-enabled-p is a baked constant.
+         ;; WS4-S5b: when *use-jit*, run native; fall back to interpret on a JIT
+         ;; SETUP failure (unsupported form / page-build failure), and on the MV
+         ;; sentinel.  %jit-active-p (not %jit-enabled-p) so *jit-inhibit*
+         ;; (Class 3) works even in the gate image whose %jit-enabled-p is a
+         ;; baked constant.
+         ;;
+         ;; WS5 #203: the handler used to be `(t (c) ...interpret...)` — it
+         ;; answered EVERY condition by re-running the whole form, including a
+         ;; genuine error signalled by the user's own code after that code had
+         ;; already run.  Save the guard flags lexically and clear them before
+         ;; the attempt (setq, not a dynamic rebind — see 279f2cc: a dynamic
+         ;; rebind does not survive the native/interpret longjmp boundary the
+         ;; way a lexical save + explicit restore does), then decide in the
+         ;; handler on the basis of whether native code actually ran.
+         (%jnr-save *jit-native-ran*)
+         (%jif-save *jit-infra-fallback*)
+         (%ignore1 (setq *jit-native-ran* nil))
+         (%ignore2 (setq *jit-infra-fallback* nil))
          (%prim (if (%jit-active-p)
                     (handler-case (%mvm-eval-jit-run %bc %entry %ftl %fnt %rt %lam t)
                       (t (c)
-                         (setq *jit-fallback-count*
-                               (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
-                         (%mvm-wrap-escaping-result
-                           (mvm-interpret %bc :entry-point %entry
-                                          :function-table %fnt :runtime-table %rt
-                                          :return-raw nil :lambda-offsets %lam)
-                           %bc %fnt %rt %lam)))
+                         (let ((%ran *jit-native-ran*)
+                               (%infra *jit-infra-fallback*))
+                           ;; Restore the enclosing attempt's flags before we
+                           ;; either re-signal or recurse into the interpreter;
+                           ;; a nested mvm-eval (a macroexpander invoked from
+                           ;; JIT'd code) must not inherit ours.
+                           (setq *jit-native-ran* %jnr-save)
+                           (setq *jit-infra-fallback* %jif-save)
+                           (if (and %ran (not %infra) (%condition-p c))
+                               ;; USER CONDITION, raised after the form's side
+                               ;; effects began.  Re-running would duplicate
+                               ;; them.  Propagate it, exactly as the non-JIT
+                               ;; path does — production EVAL semantics.
+                               (progn
+                                 (setq *jit-resignal-count*
+                                       (if *jit-resignal-count*
+                                           (+ 1 *jit-resignal-count*) 1))
+                                 (error c))
+                               ;; Fall back.  THREE ways to get here:
+                               ;;  (1) JIT setup failed before any user code ran
+                               ;;      — safe and invisible, the original intent;
+                               ;;  (2) the MV sentinel — known double-execute;
+                               ;;  (3) native ran and escaped with something that
+                               ;;      is NOT a well-formed condition (%condition-p
+                               ;;      false).  (3) is the unresolved-runtime-
+                               ;;      function sentinel: an INFRASTRUCTURE failure
+                               ;;      that happens DURING native execution, which
+                               ;;      is the case the re-flip gate's
+                               ;;      "infrastructure vs user condition" dichotomy
+                               ;;      did not anticipate.  Re-signalling it yields
+                               ;;      a malformed #(NIL NIL) at toplevel, so we
+                               ;;      still fall back (and still double) until the
+                               ;;      JIT can resolve runtime-defined functions.
+                               (progn
+                                 (setq *jit-fallback-count*
+                                       (if *jit-fallback-count*
+                                           (+ 1 *jit-fallback-count*) 1))
+                                 (%mvm-wrap-escaping-result
+                                   (mvm-interpret %bc :entry-point %entry
+                                                  :function-table %fnt :runtime-table %rt
+                                                  :return-raw nil :lambda-offsets %lam)
+                                   %bc %fnt %rt %lam))))))
                     (%mvm-wrap-escaping-result
                       (mvm-interpret %bc :entry-point %entry
                                      :function-table %fnt :runtime-table %rt
                                      :return-raw nil :lambda-offsets %lam)
                       %bc %fnt %rt %lam)))
-         (%mv *mvm-last-mv*))
+         ;; *mvm-last-mv* must be read IMMEDIATELY after the run (see the note
+         ;; at the top of this function and interp.lisp) — nothing may come
+         ;; between %prim and %mv.
+         (%mv *mvm-last-mv*)
+         ;; WS5 #203: restore on the SUCCESS path too, but only AFTER %mv has
+         ;; been latched.  The handler restores before it re-signals or falls
+         ;; back; a run that completes normally would otherwise leave
+         ;; *jit-native-ran* set to T, and the NEXT form's handler would read
+         ;; that stale T and re-signal a setup failure it should have quietly
+         ;; interpreted.
+         (%ignore3 (setq *jit-native-ran* %jnr-save))
+         (%ignore4 (setq *jit-infra-fallback* %jif-save)))
     (if %mv
         (if (eql (car %mv) 0)
             (values)
@@ -1002,16 +1125,43 @@
             ;; installation (see the defvar).  Lexical-save + setq-restore
             ;; (nested mvm-eval during the run saves/restores its own).
             (let* ((%adn-saved *e2-active-defun-names*)
+                   ;; WS5 #203: the re-execution guard, same as in
+                   ;; %mvm-eval-run-tuple.  THIS is the site the doubling was
+                   ;; measured at (a top-level form calling a runtime-defined
+                   ;; function): the old `(t (c) ...interpret...)` answered a
+                   ;; condition raised AFTER the form's side effects had already
+                   ;; run by re-running the whole form.  Lexical-save +
+                   ;; setq-restore, matching %adn-saved directly above.
+                   (%jnr-saved *jit-native-ran*)
+                   (%jif-saved *jit-infra-fallback*)
                    (%prim (progn
                             (setq *e2-active-defun-names* persist-names)
-                            ;; WS4-S5b: JIT when enabled, interpret-fallback on
-                            ;; any error (page-build fail / MV form / unsupported).
+                            (setq *jit-native-ran* nil)
+                            (setq *jit-infra-fallback* nil)
+                            ;; WS4-S5b: JIT when enabled, interpret-fallback on a
+                            ;; SETUP failure (page-build fail / unsupported) or
+                            ;; the MV sentinel — but NOT on a user condition
+                            ;; raised once native code is running.
                             ;; %jit-active-p honors *jit-inhibit* (Class 3).
                             (if (%jit-active-p)
                                 (handler-case
                                     (%mvm-eval-jit-run bc entry (reverse ft-list)
                                                     fn-table rt-table lam-offsets nil)
                                   (t (c)
+                                     (let ((%ran *jit-native-ran*)
+                                           (%infra *jit-infra-fallback*))
+                                       (setq *jit-native-ran* %jnr-saved)
+                                       (setq *jit-infra-fallback* %jif-saved)
+                                       (if (and %ran (not %infra) (%condition-p c))
+                                           ;; User condition, after side effects
+                                           ;; began → propagate, never re-run.
+                                           (progn
+                                             (setq *e2-active-defun-names* %adn-saved)
+                                             (setq *jit-resignal-count*
+                                                   (if *jit-resignal-count*
+                                                       (+ 1 *jit-resignal-count*) 1))
+                                             (error c))
+                                           (progn
                                      (setq *jit-fallback-count*
                                            (if *jit-fallback-count* (+ 1 *jit-fallback-count*) 1))
                                      (%mvm-wrap-escaping-result
@@ -1020,7 +1170,7 @@
                                                       :runtime-table rt-table
                                                       :return-raw nil
                                                       :lambda-offsets lam-offsets)
-                                       bc fn-table rt-table lam-offsets)))
+                                       bc fn-table rt-table lam-offsets))))))
                                 (%mvm-wrap-escaping-result
                                   (mvm-interpret bc :entry-point entry :function-table fn-table
                                                  :runtime-table rt-table :return-raw nil
@@ -1028,6 +1178,12 @@
                                   bc fn-table rt-table lam-offsets))))
                    (%mv *mvm-last-mv*))
               (setq *e2-active-defun-names* %adn-saved)
+              ;; WS5 #203: restore the guard flags on the SUCCESS path too, or a
+              ;; completed native run leaves *jit-native-ran* set and the NEXT
+              ;; form's handler re-signals a setup failure it should have
+              ;; quietly interpreted.  After %mv is latched, as above.
+              (setq *jit-native-ran* %jnr-saved)
+              (setq *jit-infra-fallback* %jif-saved)
               (if %mv
                   (if (eql (car %mv) 0)
                       (values)

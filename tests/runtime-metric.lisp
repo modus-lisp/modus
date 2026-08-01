@@ -54,4 +54,28 @@
 (rt-check "special-mutate"  (progn (rt-bump) (rt-bump) *rt-counter*))
 (rt-check "higher-order"    (funcall (lambda (f) (funcall f 20)) #'rt-double))
 (rt-check "recursion"       (labels ((f (n) (if (< n 2) n (+ (f (- n 1)) (f (- n 2)))))) (f 10)))
+;; --- re-execution check ------------------------------------------------
+;; A form can produce the CORRECT value while executing TWICE, which no
+;; value-only check can see.  x64 does exactly this for a call by name to a
+;; runtime-defined function: the call lands at the module thunk entry instead
+;; of the callee, so the form re-enters FROM THE TOP, and only then resolves
+;; and completes.  The signature is asymmetric — a side effect placed BEFORE
+;; the call runs twice, one placed AFTER it runs once:
+;;     pre=2 post=1        (x64)        pre=1 post=1   (SBCL, aarch64)
+;; Count with real counters, never by eyeballing duplicated output: the
+;; duplicated text is easy to mistake for a printing artifact, and a filter
+;; like `grep -v' can delete it along with the value on the same line.
+(defvar *rt-pre* 0)
+(defvar *rt-post* 0)
+(defun rt-touch (x) (+ x 1))
+(progn (setq *rt-pre* (+ *rt-pre* 1))
+       (rt-touch 1)
+       (setq *rt-post* (+ *rt-post* 1)))
+;; Value is 1/0 rather than a keyword ON PURPOSE: this file is meant to be
+;; DIFFED against SBCL, and princ of a keyword still prints the leading colon
+;; on Modus (:YES vs SBCL's YES), which would make the row diverge textually
+;; forever for a reason that has nothing to do with what it measures.
+(rt-check "form-ran-once" (if (and (= *rt-pre* 1) (= *rt-post* 1))
+                              1
+                              (list 0 *rt-pre* *rt-post*)))
 (princ "RT-OK") (terpri)

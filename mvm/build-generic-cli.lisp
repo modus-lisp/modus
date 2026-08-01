@@ -150,7 +150,34 @@
         (v  (sb-ext:posix-getenv "MODUS_USE_JIT")))
     (cond ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
-          (t t))))                                    ; DEFAULT: JIT ON
+          ;; WS5 #203: DEFAULT is now OFF (was ON).  This is the x64 half of the
+          ;; same revert f9ba3c3 made for aarch64, and it is the SAME DEFECT —
+          ;; the two only looked different because aarch64's default was already
+          ;; off, so the symptom moved to x64 alone and read as a separate
+          ;; "x64 cannot call a runtime-defined function by name" bug.
+          ;;
+          ;; mvm-eval-forms wraps the JIT run in a handler-case that, on ANY
+          ;; escaping condition, re-runs the WHOLE FORM under mvm-interpret.
+          ;; It cannot tell a JIT-infrastructure failure from a genuine
+          ;; condition signalled by the user's code, so a normal error re-
+          ;; executes every side effect that preceded it.  Measured on the
+          ;; x64 CLI, one 3-form file, counters not output:
+          ;;   (progn (setq *pre* (1+ *pre*)) (setq *r* (kk 41))
+          ;;          (setq *post* (1+ *post*)))
+          ;;     JIT on   pre=2 post=1 ret=42      <- pre-call effects doubled
+          ;;     JIT off  pre=1 post=1 ret=42
+          ;; and (setq *use-jit* nil) alone flips it, which is the causal proof.
+          ;; The value is correct either way, so neither the ANSI suite nor any
+          ;; value-only check can see it — tests/runtime-metric.lisp's
+          ;; form-ran-once is what catches it.
+          ;;
+          ;; The JIT is NOT removed; opt in with MODUS_USE_JIT=1.  RE-FLIP GATE
+          ;; (same as aarch64's): the fallback must distinguish an infrastructure
+          ;; failure from a user condition and re-signal the latter instead of
+          ;; re-running the form — and form-ran-once must stay 1 with the JIT ON.
+          ;; Do not re-flip on value-only evidence; that is exactly what let the
+          ;; original flip through.
+          (t nil))))                                  ; DEFAULT: JIT OFF
 
 (defvar *x64-asm-source* (when *jit-on* (mvm-text "mvm/x64-asm.lisp")))
 ;; Shrink the code-buffer default from 96MB to 64KB (grows on demand) so a JIT

@@ -19,6 +19,10 @@
 #   ./scripts/run-i386.sh chain 10       cons-chain survival over 1000 conses
 #   ./scripts/run-i386.sh argv A B       echo argc/argv/envp off the initial stack
 #   ./scripts/run-i386.sh probe N [ARG]  run probe N directly
+#                                        5 = eval, 6 = handler battery,
+#                                        7 = hash agreement, 8 = file I/O,
+#                                        9 = LOAD tests/runtime-metric.lisp,
+#                                        10 = symbol / macro registration
 #   ./scripts/run-i386.sh exec ARGS...   run the image with arbitrary arguments
 #
 # Build knobs (env, all dev-only except OUT/LAYER) are documented at the top of

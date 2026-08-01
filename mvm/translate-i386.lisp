@@ -3169,12 +3169,47 @@
         ((op= +op-obj-subtag+)
          ;; (obj-subtag Vd Vs) -- extract subtag from object header
          ;; Header format: (count << 8) | subtag. Subtag is low 8 bits.
+         ;;
+         ;; TAG-SAFE, exactly as x64's +op-obj-subtag+ has been: only
+         ;; dereference when Vs really is a heap pointer.  Two ways the raw
+         ;; deref crashes:
+         ;;   1. Vs's low nibble is not +tag-object+ (fixnum / cons /
+         ;;      immediate / forward) — [Vs-9] is off by a random offset.
+         ;;   2. Vs IS T (+i386-mvm-t+ = #xDEAD1009).  Its low nibble is 9,
+         ;;      so it LOOKS like a heap pointer, but it is an immediate and
+         ;;      [T-9] = #xDEAD1000 is unmapped.
+         ;; On either, return subtag 0, which falsifies every caller's
+         ;; specific-subtag comparison — the answer they want.
+         ;;
+         ;; The compiler RELIES on this: compile-integerp's docstring says
+         ;; in as many words that it may reach the bignum-subtag check on T
+         ;; "without crashing" because the opcode bails safely.  i386 did
+         ;; not bail, so `(integerp T)` SIGSEGVed — which is where
+         ;; %install-runtime-cl-macros died at boot, via %FORM-OP-IS's
+         ;; `(and (integerp op) …)` while compiling a macro definition.
+         ;;
+         ;; NIL (#xDEAD0001 hosted, 0 bare-metal) has a non-9 nibble either
+         ;; way, so the tag check already covers it; only T needs naming.
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
-           (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
-           (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+           (let ((fail-label (i386-make-label))
+                 (done-label (i386-make-label)))
+             (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+             (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+             (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
+             (i386-emit-jcc buf :ne fail-label)
+             ;; T-immediate check (register compare, not a >2^31 imm32).
+             (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
+             (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+             (i386-emit-jcc buf :e fail-label)
+             (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+             (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
+             (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
+             (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+             (i386-emit-jmp-rel32 buf done-label)
+             (i386-emit-label buf fail-label)
+             (i386-emit-mov-reg-imm buf +scratch0+ 0)
+             (i386-emit-label buf done-label))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aref+)
@@ -3213,13 +3248,32 @@
          ;; (array-len Vd Vobj) — extract element count from header
          ;; Header at [Vobj - 9], count in upper 24 bits (on 32-bit: [31:8])
          ;; Tagged result = count << 1
+         ;; Same tag-safety hazard as +op-obj-subtag+ above, and x64 carries
+         ;; the same mirror guard: predicates that gate on obj-subtag now
+         ;; return 0 for T, but %clos-instance-p / %gf-p go on to ask
+         ;; (>= (array-length x) 1) — which lands here.  On a tag or
+         ;; T-immediate miss return tagged fixnum 0, so `(>= … 1)' answers
+         ;; NIL, i.e. "not an array of N+ slots".
          (let ((vd (first operands)) (vobj (second operands)))
            (i386-load-vreg buf +scratch0+ vobj)
-           (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
-           (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
-           (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
-           (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+           (let ((fail-label (i386-make-label))
+                 (done-label (i386-make-label)))
+             (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+             (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+             (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
+             (i386-emit-jcc buf :ne fail-label)
+             (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
+             (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+             (i386-emit-jcc buf :e fail-label)
+             (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+             (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
+             (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
+             (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
+             (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+             (i386-emit-jmp-rel32 buf done-label)
+             (i386-emit-label buf fail-label)
+             (i386-emit-mov-reg-imm buf +scratch0+ 0)
+             (i386-emit-label buf done-label))
            (i386-store-vreg buf vd +scratch0+)))
 
         ;; ============================================

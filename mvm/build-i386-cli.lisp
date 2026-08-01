@@ -142,6 +142,129 @@
 (defvar *compiler-source* (if (>= *i386-layer* 5) (mvm-text "mvm/compiler.lisp") ""))
 (defvar *mvm-eval-source* (if (>= *i386-layer* 5) (mvm-text "mvm/mvm-eval.lisp") ""))
 
+;;; The runtime CL macros (when/unless/setf/incf/case/dolist/...): source
+;;; strings in *modus-runtime-macros*, installed at boot by
+;;; %install-runtime-cl-macros.  Same file both 64-bit CLIs bake.
+(defvar *rt-macros-source*
+  (if (>= *i386-layer* 5) (mvm-text "mvm/runtime-cl-macros.lisp") ""))
+
+;;; The LOAD-TIME backquote expander (WS5 #203 gap 5).  Without it a macro
+;;; defined at RUNTIME keeps the reader's COMMA markers in its expansion and
+;;; the first call dies with UNDEFINED-FUNCTION NAME="COMMA".
+;;;
+;;; MUST be fed to BOTH auto-scanners below — the SFT one so runtime EVAL can
+;;; resolve its defuns by name, and (critically) the sym-name one, because
+;;; %rbq-sym-name-eq dispatches on (symbol-name sym) being "COMMA" /
+;;; "COMMA-AT" / "BACKQUOTE".  A missing sym-name entry makes symbol-name
+;;; return "" and the expander degrades to a SILENT NO-OP — it does not
+;;; error, so nothing downstream tells you the bootstrap only half happened.
+(defvar *runtime-backquote-source*
+  (if (>= *i386-layer* 5) (mvm-text "lib/runtime-backquote.lisp") ""))
+
+;;; %init-runtime-macros — mark every compiler macro name as KNOWN in
+;;; *macro-table*, so macroexpand-1 at runtime answers "yes, that is a macro".
+;;; Generated exactly the way build-generic-cli.lisp generates it (scan
+;;; compiler.lisp for MVM-DEFINE-MACRO names).
+(defun scan-mvm-define-macro-forms (text)
+  (let ((names nil) (pos 0))
+    (loop
+      (let ((p (search "(mvm-define-macro \"" text :start2 pos)))
+        (unless p (return (nreverse names)))
+        (let* ((start (+ p (length "(mvm-define-macro \"")))
+               (end (position #\" text :start start)))
+          (push (subseq text start end) names)
+          (setq pos (1+ end)))))))
+
+(defvar *macro-names*
+  (if (>= *i386-layer* 5) (scan-mvm-define-macro-forms *compiler-source*) nil))
+
+(defvar *runtime-macros-source*
+  (if (>= *i386-layer* 5)
+      (with-output-to-string (out)
+        (format out "(defun %init-runtime-macros ()~%")
+        (dolist (name *macro-names*)
+          (format out "  (puthash (compute-name-hash ~S) *macro-table* t)~%" name))
+        (format out ")~%"))
+      "(defun %init-runtime-macros () nil)
+"))
+
+;;; ============================================================
+;;; Linux/i386 file-I/O syscall overrides
+;;; ============================================================
+;;; mvm/cl-fileio.lisp hardcodes x86-64 syscall numbers (open=2, close=3,
+;;; read=0, write=1, lseek=8, stat=4, fstat=5, unlink=87, rename=82,
+;;; mkdir=83, getpid=39, getdents64=217).  i386 shares almost none of them.
+;;; Same class build-aarch64-cli.lisp fixed for the *at-only AArch64 ABI
+;;; (be1aef1): without these overrides LOAD, OPEN and every path predicate
+;;; are silently dead on this image.  Concatenated AFTER *bridge-source*, so
+;;; last-defun-wins makes every call site resolve here.
+;;;
+;;; Addresses are passed as TAGGED fixnums and untagged by trap #x0502's SAR,
+;;; so every scratch address must be below 2^30 — see +linux-i386-bss-end+.
+;;;
+;;; Two deliberate departures from a literal transliteration:
+;;;   * EXISTENCE goes through access(2) (33), not stat.  It is the only
+;;;     thing OPEN needs, and it has no struct layout to get wrong.
+;;;   * SIZE/MTIME use stat64 (195) / fstat64 (197), whose struct stat64 is
+;;;     NOT the x86-64 struct stat: st_size sits at 44, not 48, and st_mtime
+;;;     at 72, not 88.  Probe 9 measures both against a file whose size the
+;;;     BUILD computes, so a wrong offset fails loudly instead of returning
+;;;     a plausible number.
+(defvar *i386-fileio-source*
+  (if (>= *i386-layer* 5)
+      "
+(defun %sys-open-rdonly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 0 0))
+(defun %sys-open-wronly (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 577 420))
+(defun %sys-open-append (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 1089 420))
+(defun %sys-open-rdwr (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 66 420))
+(defun %sys-open-create-excl (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 5 *cstr-scratch* 193 420))
+(defun %sys-close (fd) (syscall3 6 fd 0 0))
+(defun %sys-getpid () (syscall3 20 0 0 0))
+(defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
+(defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
+(defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))
+(defun %sys-unlink (path-str)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 10 *cstr-scratch* 0 0))
+(defun %sys-rename (old-str new-str)
+  (%string-to-cstr old-str *cstr-scratch*)
+  (let ((new-addr (+ *cstr-scratch* 2048)))
+    (%string-to-cstr new-str new-addr)
+    (syscall3 38 *cstr-scratch* new-addr 0)))
+(defun %sys-mkdir (path-str mode)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 39 *cstr-scratch* mode 0))
+(defun %sys-stat-exists (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*)))
+    (if (< (syscall3 33 path-addr 0 0) 0) nil t)))
+(defun %sys-stat-size (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (syscall3 195 path-addr buf-addr 0)))
+      (if (< ret 0) -1 (mem-ref (+ buf-addr 44) :u32)))))
+(defun %sys-stat-mtime (path-str)
+  (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+        (buf-addr *io-buf-addr*))
+    (let ((ret (syscall3 195 path-addr buf-addr 0)))
+      (if (< ret 0) 0 (mem-ref (+ buf-addr 72) :u32)))))
+(defun %sys-fstat-size (fd)
+  (let ((buf-addr *io-buf-addr*))
+    (let ((ret (syscall3 197 fd buf-addr 0)))
+      (if (< ret 0) -1 (mem-ref (+ buf-addr 44) :u32)))))
+(defun %sys-getdents64 (fd buf-addr buf-size) (syscall3 220 fd buf-addr buf-size))
+"
+      ""))
+
 ;;; In-image override of ieee-float-bits: the build-time version uses
 ;;; sb-kernel:double-float-* (host-only).  Appended AFTER the compiler source
 ;;; so it wins (last-defun-wins).  Only matters for compiling FLOAT literals.
@@ -510,6 +633,14 @@
   (write-char-serial 97) (write-char-serial 116) (write-char-serial 111) (write-char-serial 109) (write-char-serial 45) (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (%chk (if (atom (cons 1 2)) 1 0) 0)
   (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 112) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (consp 7) 1 0) 0)
   (write-char-serial 99) (write-char-serial 111) (write-char-serial 110) (write-char-serial 115) (write-char-serial 112) (write-char-serial 45) (write-char-serial 108) (write-char-serial 105) (write-char-serial 115) (write-char-serial 116) (write-char-serial 45) (write-char-serial 119) (write-char-serial 97) (write-char-serial 108) (write-char-serial 107) (%chk (let ((n 0) (cur (list 1 2 3))) (loop (when (not (consp cur)) (return n)) (setq n (+ n 1)) (setq cur (cdr cur)))) 3)
+  (write-char-serial 105) (write-char-serial 110) (write-char-serial 116) (write-char-serial 101) (write-char-serial 103) (write-char-serial 101) (write-char-serial 114) (write-char-serial 112) (write-char-serial 45) (write-char-serial 116) (%chk (if (integerp t) 1 0) 0)
+  (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 112) (write-char-serial 45) (write-char-serial 116) (%chk (if (bignump t) 1 0) 0)
+  (write-char-serial 115) (write-char-serial 121) (write-char-serial 109) (write-char-serial 98) (write-char-serial 111) (write-char-serial 108) (write-char-serial 112) (write-char-serial 45) (write-char-serial 116) (%chk (if (symbolp t) 1 0) 1)
+  (write-char-serial 115) (write-char-serial 116) (write-char-serial 114) (write-char-serial 105) (write-char-serial 110) (write-char-serial 103) (write-char-serial 112) (write-char-serial 45) (write-char-serial 116) (%chk (if (stringp t) 1 0) 0)
+  (write-char-serial 105) (write-char-serial 110) (write-char-serial 116) (write-char-serial 101) (write-char-serial 103) (write-char-serial 101) (write-char-serial 114) (write-char-serial 112) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (%chk (if (integerp 5) 1 0) 1)
+  (write-char-serial 105) (write-char-serial 110) (write-char-serial 116) (write-char-serial 101) (write-char-serial 103) (write-char-serial 101) (write-char-serial 114) (write-char-serial 112) (write-char-serial 45) (write-char-serial 122) (write-char-serial 101) (write-char-serial 114) (write-char-serial 111) (%chk (if (integerp 0) 1 0) 1)
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 114) (write-char-serial 97) (write-char-serial 121) (write-char-serial 45) (write-char-serial 108) (write-char-serial 101) (write-char-serial 110) (write-char-serial 103) (write-char-serial 116) (write-char-serial 104) (write-char-serial 45) (write-char-serial 116) (%chk (array-length t) 0)
+  (write-char-serial 97) (write-char-serial 114) (write-char-serial 114) (write-char-serial 97) (write-char-serial 121) (write-char-serial 45) (write-char-serial 108) (write-char-serial 101) (write-char-serial 110) (write-char-serial 103) (write-char-serial 116) (write-char-serial 104) (write-char-serial 45) (write-char-serial 114) (write-char-serial 101) (write-char-serial 97) (write-char-serial 108) (%chk (array-length (make-array 5)) 5)
   (write-char-serial 45) (write-char-serial 45) (write-char-serial 32) (write-char-serial 119) (write-char-serial 111) (write-char-serial 114) (write-char-serial 100) (write-char-serial 32) (write-char-serial 119) (write-char-serial 105) (write-char-serial 100) (write-char-serial 116) (write-char-serial 104) (putnl)
   (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 109) (write-char-serial 97) (write-char-serial 120) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741823) 1 0) 1)
   (write-char-serial 112) (write-char-serial 97) (write-char-serial 115) (write-char-serial 116) (write-char-serial 45) (write-char-serial 102) (write-char-serial 105) (write-char-serial 120) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (write-char-serial 45) (write-char-serial 105) (write-char-serial 115) (write-char-serial 45) (write-char-serial 98) (write-char-serial 105) (write-char-serial 103) (write-char-serial 110) (write-char-serial 117) (write-char-serial 109) (%chk (if (fixnump 1073741824) 1 0) 0)
@@ -761,6 +892,9 @@
       ((eql which 5) (probe-eval))
       ((eql which 6) (sys-exit (if (eql (probe-hc) 0) 0 1)))
       ((eql which 7) (sys-exit (if (eql (probe-l5) 0) 0 1)))
+      ((eql which 8) (sys-exit (if (eql (probe-fileio) 0) 0 1)))
+      ((eql which 9) (probe-load))
+      ((eql which 10) (sys-exit (if (eql (probe-sym) 0) 0 1)))
       (t (sys-exit (if (eql (probe-suite) 0) 0 1)))))
   (sys-exit 0))
 
@@ -825,6 +959,7 @@
     *prelude-source* (string #\Newline)
     *gc-source* (string #\Newline)
     *rt-source* (string #\Newline)
+    *rt-macros-source* (string #\Newline)
     *isa-source* (string #\Newline)
     *interp-source* (string #\Newline)
     *compiler-source* (string #\Newline)
@@ -832,7 +967,14 @@
     *opcode-table-init-source* (string #\Newline)
     *mvm-eval-source* (string #\Newline)
     *bridge-source* (string #\Newline)
+    *i386-fileio-source* (string #\Newline)
     *crypto-source* (string #\Newline)
+    ;; BOTH scanners see the backquote expander: the SFT scan below takes its
+    ;; defun names, and *sym-name-auto-source* scans this same text for symbol
+    ;; names — %rbq-sym-name-eq compares SYMBOL-NAME against "COMMA" /
+    ;; "COMMA-AT" / "BACKQUOTE", and a missing sym-name entry turns the whole
+    ;; expander into a silent no-op rather than an error.
+    *runtime-backquote-source* (string #\Newline)
     *driver-source*))
 
 (defvar *all-defun-names*
@@ -1014,6 +1156,46 @@
 ;;; idempotent, not a second source of truth.
 (modus.mvm::set-target-fixnum-bits 30)
 
+;;; The --load target and its EXPECTED size, both from ONE computation at
+;;; build time.  Hand-transcribing either would repeat the mistake that
+;;; produced four false findings during this bring-up; and a stat64 offset
+;;; that is merely plausible returns a plausible number, so the expected
+;;; value has to come from the same place the file does.
+;;;
+;;; Generated with FORMAT rather than written into *driver-source*: that
+;;; string cannot contain a double-quote character, so a path literal is
+;;; impossible there.
+(defvar *loadtest-source*
+  (if (>= *i386-layer* 5)
+      (let* ((path (namestring (merge-pathnames "tests/runtime-metric.lisp"
+                                                *modus-base*)))
+             (size (with-open-file (s path :element-type '(unsigned-byte 8))
+                     (file-length s))))
+        (format t "  load target: ~A (~D bytes)~%" path size)
+        (format nil "(defun %lt-path () ~S)~%(defun %lt-size () ~D)~%~
+                     (defun %lt-nopath () ~S)~%~
+                     (defun %lt-s-foo () ~S)~%~
+                     (defun %lt-s-defmacro () ~S)~%~
+                     (defun %lt-s-use () ~S)~%~
+                     (defun %lt-s-defun () ~S)~%~
+                     (defun %lt-s-call () ~S)~%"
+                path size
+                (concatenate 'string path ".does-not-exist")
+                "FOO"
+                "(defmacro %ltm (a) `(+ ,a 1))"
+                "(%ltm 41)"
+                "(defun %ltf (a) (* a 6))"
+                "(%ltf 7)"))
+      "(defun %lt-path () nil)
+(defun %lt-size () 0)
+(defun %lt-nopath () nil)
+(defun %lt-s-foo () nil)
+(defun %lt-s-defmacro () nil)
+(defun %lt-s-use () nil)
+(defun %lt-s-defun () nil)
+(defun %lt-s-call () nil)
+"))
+
 (defvar *hash-probe-source*
   (if (>= *i386-layer* 5)
       (format nil "(defun %build-hash-abc () ~D)~%(defun %build-hash-quote () ~D)~%"
@@ -1055,6 +1237,37 @@
   (init-all-globals)           (%l5-step 106)  ; j
   (%init-signal-handling)      (%l5-step 107)  ; k
   (%init-signal-symbols)       (%l5-step 108)  ; l
+  ;; ---- macro / backquote bootstrap ------------------------------------
+  ;; AFTER init-all-globals, deliberately: the *macro-table* defvar init
+  ;; thunk would otherwise replace the table %init-runtime-macros just
+  ;; filled, and %install-runtime-cl-macros needs *modus-runtime-macros*
+  ;; to already hold its defvar value.
+  (setq *macro-table* (make-hash-table))
+  (%init-runtime-macros)       (%l5-step 110)  ; n
+  (init-compiler-macro-set)    (%l5-step 111)  ; o
+  (%init-make-load-form)       (%l5-step 112)  ; p
+  ;; The load-time backquote expander.  A macro defined at RUNTIME keeps
+  ;; the reader's COMMA markers in its expansion without it, and the first
+  ;; call dies with UNDEFINED-FUNCTION NAME=COMMA.
+  (%install-runtime-backquote) (%l5-step 113)  ; q
+  ;; Each entry is EVAL of a READ source string, so this is also the first
+  ;; real exercise of eval+read together.  %install-runtime-cl-macros
+  ;; deliberately carries no internal handler-case (see its docstring), so
+  ;; the resilience wrapper belongs here, exactly as in the 64-bit CLIs.
+  (handler-case (%install-runtime-cl-macros) (t (c) nil))
+                               (%l5-step 114)  ; r
+  ;; defvar init thunks that other targets also set explicitly.
+  (setq *gensym-counter* 0)
+  (setq *gentemp-counter* 0)
+  (setq *write-object-budget* 1000000)
+  ;; File-I/O scratch, inside the demand-zeroed BSS reserved by
+  ;; +linux-i386-bss-end+.  Both are RAW byte addresses below 2^30 so
+  ;; syscall3 can carry them as tagged fixnums.
+  (setq *cstr-scratch* 268451840)   ; #x10004000
+  (setq *io-buf-addr*  268468224)   ; #x10008000
+  (setq *scratch-mmapped* t)        ; the BSS is already mapped; never mmap
+  (setq *filesystem* nil)
+                               (%l5-step 115)  ; s
   (putnl)
   0)
 
@@ -1151,13 +1364,134 @@
   (%pdec (eval (list (quote *) 6 7))) (putnl)
   (write-char-serial 101) (write-char-serial 52) (write-char-serial 61)
   (%pdec (ash (eval (list (quote *) 17034 65536)) -24)) (putnl)
+  ;; e5: a REAL cross-function call through the symbol-function table.  CAR of
+  ;; a freshly consed LIST cannot be constant-folded, so this only answers 1 if
+  ;; the compiled thunk actually resolved and called two native functions by
+  ;; name.
+  (write-char-serial 101) (write-char-serial 53) (write-char-serial 61)
+  (%pdec (eval (list (quote car) (list (quote list) 1 2)))) (putnl)
+  ;; e6: DEFINE in one top-level form, CALL BY NAME from a later one — the
+  ;; shape every library's interior has, and the one a load-time metric cannot
+  ;; see.  Forms are built with LIST rather than written as literals so the
+  ;; build's scan-defuns does not mistake a quoted (defun ...) for a real one.
+  (write-char-serial 101) (write-char-serial 54) (write-char-serial 61)
+  (%pdec (mvm-eval-forms
+           (list (list (quote defun) (quote %e6f) (list (quote x))
+                       (list (quote *) (quote x) 3))
+                 (list (quote %e6f) 14))))
+  (putnl)
+  ;; e7: the same define/call split across TWO SEPARATE eval calls — which is
+  ;; what LOAD does, one top-level form at a time.  e6 only proved a call
+  ;; inside one compilation unit; this proves the definition PERSISTS into the
+  ;; next one.
+  (write-char-serial 101) (write-char-serial 55) (write-char-serial 61)
+  (eval (list (quote defun) (quote %e7f) (list (quote x))
+              (list (quote +) (quote x) 4)))
+  (%pdec (eval (list (quote %e7f) 38))) (putnl)
+  ;; e8: a RUNTIME defmacro whose body is a BACKQUOTE template, again across
+  ;; two evals.  The reader produces exactly this (BACKQUOTE (+ (COMMA a) 1))
+  ;; shape; building it by hand keeps the probe independent of the reader.
+  ;; Answers 42 only if %install-runtime-backquote registered the expander AND
+  ;; symbol-name can recover COMMA / BACKQUOTE from *sym-name-table* — without
+  ;; the latter the expander is a SILENT no-op and the COMMA marker survives
+  ;; into the expansion.
+  (write-char-serial 101) (write-char-serial 56) (write-char-serial 61)
+  (eval (list (quote defmacro) (quote %e8m) (list (quote a))
+              (list (quote backquote)
+                    (list (quote +) (list (quote comma) (quote a)) 1))))
+  (%pdec (eval (list (quote %e8m) 41))) (putnl)
   0)
+
+;; probe-fileio: the i386 syscall numbers and the struct stat64 offsets,
+;; measured rather than assumed.  Every expected value is baked by the build
+;; from the same file the image opens.
+(defun probe-fileio ()
+  (%l5-boot)
+  (%sc-reset)
+  (%tag2 102 49) (%chk (if (%sys-stat-exists (%lt-path)) 1 0) 1)
+  (%tag2 102 50) (%chk (if (%sys-stat-exists (%lt-nopath)) 1 0) 0)
+  (%tag2 102 51) (%chk (%sys-stat-size (%lt-path)) (%lt-size))
+  (%tag2 102 52) (%chk (let ((fd (%sys-open-rdonly (%lt-path))))
+                         (let ((n (%sys-fstat-size fd)))
+                           (%sys-close fd)
+                           n))
+                       (%lt-size))
+  (%tag2 102 53) (%chk (if (> (%sys-stat-mtime (%lt-path)) 1000000000) 1 0) 1)
+  (%tag2 102 54) (%chk (let ((s (open (%lt-path))))
+                         (let ((c (read-char s nil nil)))
+                           (close s)
+                           (if c (char-code c) 0)))
+                       59)
+  (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
+  (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
+  (putnl)
+  (mem-ref 268438408 :u32))
+
+;; probe-load: the real thing — LOAD a file of ordinary CL, form by form.
+;; WATCH THE OUTPUT SHAPE, not just the values: a failed-first-compile retry
+;; re-executes a whole top-level form, which prints `name=name=42' rather
+;; than `name=42'.  A value-only check cannot see that.
+(defun probe-load ()
+  (%l5-boot)
+  (load (%lt-path))
+  0)
+
+;; probe-sym: the symbol / macro-registration battery.  Runtime DEFMACRO is
+;; the one gap LOAD still trips over, and it fails SILENTLY (%macro-sym-key
+;; returning NIL makes set-macro-function a no-op), so each tier is measured
+;; separately: what a native quoted symbol looks like, what the READER
+;; produces, whether the two key helpers accept each, and finally the whole
+;; read-defmacro-eval-use round trip.
+(defun probe-sym ()
+  (%l5-boot)
+  (%sc-reset)
+  (%tag2 115 49) (%chk (obj-subtag (quote foo)) 80)
+  (%tag2 115 50) (%chk (if (symbolp (quote foo)) 1 0) 1)
+  (%tag2 115 51) (%chk (length (symbol-name (quote foo))) 3)
+  (%tag2 115 52) (%chk (if (%sym-name-or-hash (quote foo)) 1 0) 1)
+  (%tag2 115 53) (%chk (if (%macro-sym-key (quote foo)) 1 0) 1)
+  (%tag2 115 54) (%chk (if (%cl-sym-p (read-from-string (%lt-s-foo))) 1 0) 1)
+  (%tag2 115 55) (%chk (if (symbolp (read-from-string (%lt-s-foo))) 1 0) 1)
+  (%tag2 115 56) (%chk (if (%sym-name-or-hash (read-from-string (%lt-s-foo))) 1 0) 1)
+  (%tag2 115 57) (%chk (if (%macro-sym-key (read-from-string (%lt-s-foo))) 1 0) 1)
+  ;; read + eval a DEFUN, then read + eval a call to it — the LOAD shape,
+  ;; through the real reader rather than a hand-built form.
+  (%tag2 114 49) (%chk (progn (eval (read-from-string (%lt-s-defun)))
+                              (eval (read-from-string (%lt-s-call))))
+                       42)
+  ;; the same for a DEFMACRO whose body is a real reader backquote.
+  (%tag2 114 50) (%chk (progn (eval (read-from-string (%lt-s-defmacro)))
+                              (if (macro-function (read-from-string
+                                                    (%lt-s-foo)))
+                                  0 1))
+                       1)
+  (%tag2 114 51) (%chk (progn (eval (read-from-string (%lt-s-defmacro)))
+                              (eval (read-from-string (%lt-s-use))))
+                       42)
+  (write-char-serial 80) (write-char-serial 61) (%pdec (mem-ref 268438400 :u32))
+  (write-char-serial 32) (write-char-serial 70) (write-char-serial 61) (%pdec (mem-ref 268438408 :u32))
+  (putnl)
+  (mem-ref 268438408 :u32))
 "
       "
 (defun %l5-boot () 0)
 (defun probe-eval () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
 (defun probe-l5 () (write-char-serial 110) (write-char-serial 97) (putnl) 0)
 "))
+
+;;; Names the token scanner CANNOT see, fed to it explicitly.
+;;;
+;;; scan-symbol-names deliberately skips string literals, so the reader's
+;;; backquote markers — which appear in lib/runtime-backquote.lisp and
+;;; mvm/cl-reader.lisp only as the STRINGS "COMMA" / "COMMA-AT" /
+;;; "COMMA-DOT" / "BACKQUOTE" — never reach *SYM-NAME-TABLE*.  That is not a
+;;; loud failure: %rbq-sym-name-eq compares (symbol-name sym) against those
+;;; strings, symbol-name returns "" for an unregistered hash, no branch
+;;; matches, and the whole runtime backquote expander degrades to a SILENT
+;;; NO-OP.  Listing them here is scanner input only — this text is never
+;;; compiled into the image.
+(defvar *extra-sym-names*
+  "comma comma-at comma-dot backquote quasiquote")
 
 (defvar *sym-name-auto-source*
   (if (>= *i386-layer* 5)
@@ -1170,7 +1504,9 @@
       (emit-sym-name-auto
        (scan-symbol-names (concatenate 'string *scanned-source* (string #\Newline)
                                        *l5-init-source* (string #\Newline)
-                                       *hash-probe-source*))
+                                       *hash-probe-source* (string #\Newline)
+                                       *loadtest-source* (string #\Newline)
+                                       *extra-sym-names*))
        200)
       ""))
 (format t "  sym-name-auto: ~D chars~%" (length *sym-name-auto-source*))
@@ -1190,6 +1526,7 @@
     *prelude-source* (string #\Newline)
     *gc-source* (string #\Newline)
     *rt-source* (string #\Newline)
+    *rt-macros-source* (string #\Newline)
     ;; Layer 5, in build-generic-cli's order: ISA + interpreter first (so the
     ;; compiler's emitted opcodes have their definitions), then the compiler,
     ;; then the in-image float override, the materialised opcode table, and
@@ -1200,12 +1537,16 @@
     *float-override-source* (string #\Newline)
     *opcode-table-init-source* (string #\Newline)
     *mvm-eval-source* (string #\Newline)
+    *runtime-macros-source* (string #\Newline)
     *sft-auto-source* (string #\Newline)
     *sym-name-auto-source* (string #\Newline)
     *hash-probe-source* (string #\Newline)
+    *loadtest-source* (string #\Newline)
     *l5-init-source* (string #\Newline)
     *bridge-source* (string #\Newline)
+    *i386-fileio-source* (string #\Newline)
     *crypto-source* (string #\Newline)
+    *runtime-backquote-source* (string #\Newline)
     *driver-source* (string #\Newline)
     *dbg-source*))
 

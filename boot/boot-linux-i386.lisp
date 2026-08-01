@@ -45,7 +45,19 @@
 
 (defconstant +linux-i386-load-addr+   #x08048000)
 (defconstant +linux-i386-bss-addr+    #x10000000)
-(defconstant +linux-i386-bss-end+     #x10001000)
+(defconstant +linux-i386-bss-end+     #x10020000
+  "End of the demand-zeroed BSS block.  Was #x10001000 (one page) while the
+   image only needed the fixed metadata slots.  File I/O needs two scratch
+   buffers at fixed RAW addresses — cl-fileio's *cstr-scratch* (C-string
+   staging for path arguments) and *io-buf-addr* (the 4 KB read/write
+   buffer) — and i386 has nowhere else to put them: the ELF ends around
+   0x0A800000, the stack is a MAP_FIXED 8 MB at 0x18000000 and the heap a
+   512 MB arena at 0x30000000, all GC-owned.  Extending p_memsz by 124 KB
+   costs nothing (the pages are demand-zeroed and only two are touched) and,
+   critically, RESERVES the range at exec time, so the later NULL-hinted
+   bitmap mmaps cannot land in it.  Both scratch addresses stay below 2^30,
+   which they must: syscall3 takes TAGGED fixnums and untags with SAR, so an
+   address at or above 2^30 could not be passed at all on this word size.")
 (defconstant +linux-i386-globals+     #x10000A00
   "Base of the i386 absolute-address global slot block (VA/VL/VN/nargs/
    cenv/mv-count), inside the demand-zeroed BSS.")

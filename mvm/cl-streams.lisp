@@ -164,7 +164,19 @@
     (setq *standard-input* serial-in)
     (setq *standard-output* serial-out)
     (setq *terminal-io* (%make-stream 4 (cons serial-in serial-out)))
-    (setq *error-output* serial-out)
+    ;; WS5 #203 gap 1: *ERROR-OUTPUT* is a REAL fd-2 stream, not the stdout
+    ;; stream object.  It used to be `serial-out' itself, so everything CLHS
+    ;; routes to *error-output* — WARN, the compiler's implicit-global
+    ;; diagnostics, a program's own (format *error-output* ...) — landed on fd
+    ;; 1, interleaved into the program's real output.  SBCL sends all of it to
+    ;; fd 2, and the differential table flagged the divergence.
+    ;;
+    ;; A type-9 file stream is the right vehicle: %fs-write-char issues ONE
+    ;; write(2) per char with no buffering, so diagnostics still appear
+    ;; immediately and cannot be lost by an exit that skips a flush.  It reads
+    ;; *io-buf-addr*, which kernel-main sets AFTER this init — harmless, since
+    ;; nothing writes to stderr during stream initialisation itself.
+    (setq *error-output* (%make-file-stream-full 2 1))
     (setq *debug-io* (%make-stream 4 (cons serial-in serial-out)))
     (setq *query-io* (%make-stream 4 (cons serial-in serial-out)))
     (setq *trace-output* serial-out)))

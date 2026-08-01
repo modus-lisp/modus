@@ -4166,7 +4166,15 @@
                (emit-ir :mov dest +vreg-vr+)))))
       (t
        ;; Implicit global — treat as dynamic variable (auto-register)
-       (format t "  WARN: implicit global ~A~%" name)
+       ;; WS5 #203 gap 1: to *ERROR-OUTPUT*, not stdout, and with ~& so it can
+       ;; never splice into the middle of a line.  Both matter for MEASUREMENT,
+       ;; not aesthetics: this warning used to be emitted mid-line on stdout, so
+       ;; a `grep -v WARN:' over a program's output silently deleted the VALUE
+       ;; printed on the same line.  That produced a false "the fix didn't work"
+       ;; twice, on the same fix, for two different readers.  On the SBCL build
+       ;; host *error-output* is stderr; in-image %init-streams now makes it a
+       ;; real fd-2 stream (it used to be the stdout stream object itself).
+       (format *error-output* "~&  WARN: implicit global ~A~%" name)
        (setf (gethash (normalize-name name) *globals*) t)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
@@ -7334,7 +7342,8 @@
        (%compile-setq-global var dest))
       (t
        ;; Implicit global for setq
-       (format t "  WARN: implicit global setq ~A~%" var)
+       ;; See the companion note at the implicit-global read site above.
+       (format *error-output* "~&  WARN: implicit global setq ~A~%" var)
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
 

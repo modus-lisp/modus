@@ -221,6 +221,23 @@
    (%val->word fn — a value load keeps the +tag-function+ tag, NOT word-3).
    Nil at image build → whole-image codegen unchanged.")
 
+(defvar *aarch64-fn-addr-local-relocs* nil
+  "WS5 aarch64 JIT: list of (movz-quad-native-byte-offset . in-module-mvm-offset)
+   for IN-MODULE #'fn / closure fn-addr value-loads collected during a JIT
+   translation.  The whole-image path answers an in-module op-fn-addr by pushing
+   the site onto *aarch64-fn-addr-patches* and emitting a 2-instruction
+   MOVZ/MOVK pair, which `apply-aarch64-fn-addr-patches` fills in AFTER image
+   assembly.  The runtime JIT never runs that patcher — the module's final
+   address isn't known until its exec page is mmap'd — so under
+   *aarch64-jit-mode* those sites used to load a literal 0.  Every closure
+   built by JIT'd code therefore got fn-addr slot 0 = 0, and funcall's
+   call-indirect on it took the bad-callable trap (surfacing as PROGRAM-ERROR
+   with the closure body never entered).  Under *aarch64-jit-mode* an in-module
+   fn-addr now emits a FULL MOVZ/MOVK quad (the exec-page base is a 64-bit
+   runtime address; 32 bits are not enough) and records the site here; the JIT
+   driver patches it with (page-base + fn-native-offset) OR +tag-function+.
+   Nil at image build → whole-image codegen unchanged.")
+
 (defvar *aarch64-force-absolute-inmodule-calls* nil
   "WS4-AA64 long-range calls: when non-nil, the +op-call+ label case emits an
    ABSOLUTE call (MOVZ/MOVK x16, target-VA; BLR x16) with a build-time patch
@@ -3979,6 +3996,23 @@
                   (target-offset (vr 1))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (cond
+               ;; WS5 aarch64 JIT: an IN-MODULE fn-addr under the runtime JIT.
+               ;; MUST come before the whole-image clause below — that clause
+               ;; defers to apply-aarch64-fn-addr-patches, which the JIT never
+               ;; runs, so the site stayed a literal 0 (see
+               ;; *aarch64-fn-addr-local-relocs*).  Emit the full 64-bit quad
+               ;; and let the JIT driver patch (base + native-offset) | 3.
+               ((and *aarch64-jit-mode*
+                     (gethash target-offset mvm-to-native-label))
+                (let ((movz-byte-off (* (- (a64-current-index buf)
+                                           (or *aarch64-translated-start-idx* 0))
+                                        4)))
+                  (push (cons movz-byte-off target-offset)
+                        *aarch64-fn-addr-local-relocs*))
+                (a64-movz buf pd 0 0)   ; placeholder addr[15:0]  LSL 0
+                (a64-movk buf pd 0 1)   ; placeholder addr[31:16] LSL 16
+                (a64-movk buf pd 0 2)   ; placeholder addr[47:32] LSL 32
+                (a64-movk buf pd 0 3))  ; placeholder addr[63:48] LSL 48
                ((gethash target-offset mvm-to-native-label)
                 ;; Record the byte position of the MOVZ so the patcher
                 ;; can find both MOVZ (movz-pos) and MOVK (movz-pos+4).
@@ -5045,6 +5079,7 @@
   ;; codegen is unchanged).
   (setf *aarch64-call-relocs* nil)
   (setf *aarch64-fn-addr-relocs* nil)
+  (setf *aarch64-fn-addr-local-relocs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're

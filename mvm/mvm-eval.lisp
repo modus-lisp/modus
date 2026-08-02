@@ -411,6 +411,18 @@
    Returns NIL if any reloc failed to resolve (→ interpret fallback).  MAY signal
    a translator gap — the %jit-translate-page guard turns it into NIL."
   (setq *aarch64-jit-mode* t)
+  ;; WS5 aarch64 JIT: function entries must be 16-BYTE aligned inside the exec
+  ;; page.  A closure's fn-addr slot is tagged with +tag-function+ (3) and
+  ;; +op-call-ind+ validates `addr & 15 == 3` before SUB-3/BLR, so the raw
+  ;; entry address needs low nibble 0.  The exec page from %mmap-exec-page is
+  ;; page (4096) aligned, so the constraint reduces to native-offset mod 16 = 0
+  ;; — which is what translate-mvm-to-aarch64's fn-entry NOP pad computes when
+  ;; *aarch64-fn-align-offset* is 0.  In-image that global has no value (defvar
+  ;; init-thunks don't run — CLAUDE.md item 7) and the pad loop degenerated to
+  ;; zero padding, so entries landed on arbitrary 4-byte boundaries.  Set it
+  ;; explicitly here (JIT-only; the host image builds set their own value
+  ;; host-side and never call this function).
+  (setq *aarch64-fn-align-offset* 0)
   (let ((ftbl (make-hash-table :test (quote eql))))
     (let ((i 0)) (dolist (e ft-list) (setf (gethash i ftbl) (cadr e)) (setq i (+ i 1))))
     (multiple-value-bind (nbuf fn-map) (translate-mvm-to-aarch64 bc ftbl)
@@ -419,6 +431,7 @@
              (nlen (* nwords 4))
              (crel *aarch64-call-relocs*)
              (frel *aarch64-fn-addr-relocs*)
+             (lrel *aarch64-fn-addr-local-relocs*)
              (cpat *aarch64-li-const-patches*)
              (eoff (gethash mvm-entry fn-map))
              (npages (+ 1 (ash nlen -12)))
@@ -459,6 +472,23 @@
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0)))
             (if (> word 0) (%jit-write-movz-quad base (car r) word) (setq ok nil))))
+        ;; WS5: IN-MODULE fn-addr relocations.  These are the sites that build a
+        ;; CLOSURE (make-closure stores the lambda's fn-addr in slot 0) and any
+        ;; #'LOCAL-FN value-load.  The whole-image path defers them to
+        ;; apply-aarch64-fn-addr-patches, which the JIT never runs, so before
+        ;; this loop every JIT-built closure carried fn-addr 0 and funcall of it
+        ;; took +op-call-ind+'s bad-callable trap → PROGRAM-ERROR with the body
+        ;; never entered.  Patch value = (base + fn-native-offset) | +tag-function+.
+        ;; If the entry is not 16-aligned the tag nibble would not read back as
+        ;; 3 and call-ind would reject it, so fail the reloc instead of shipping
+        ;; a closure that traps — the seam then interprets this form (correct,
+        ;; just not native).
+        (dolist (r lrel)
+          (let* ((noff (gethash (cdr r) fn-map))
+                 (addr (if noff (+ base noff) 0)))
+            (if (and noff (eql (logand addr 15) 0))
+                (%jit-write-movz-quad base (car r) (logior addr 3))
+                (setq ok nil))))
         ;; Quoted-literal / string li-const patches (pool object tagged word).
         (dolist (p cpat)
           (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))

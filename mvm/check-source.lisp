@@ -192,14 +192,21 @@
         (t (some #'has-function-calls-p (cdr form)))))
 
 (defun check-deep-arithmetic (form)
-  "Check for deeply nested arithmetic with function calls — register clobber risk."
+  "Check for deeply nested arithmetic with function calls.
+
+   As of the ANF normalizer in compiler.lisp (ANF-NORMALIZE-ARITH-ARGS) this
+   is no longer a miscompile: whenever an operand would reach the unsafe
+   PUSH/POP nesting that CHECK-ARITH-NESTING guards, the compiler binds it —
+   and every non-constant operand to its left — to LET* temporaries and
+   compiles that instead.  Kept as INFO because the rewrite costs frame slots
+   (see *let-binding-limit*), so hand-hoisting is still cheaper in hot code."
   (when (and (consp form)
              (arithmetic-op-p (car form)))
     (let ((depth (measure-arithmetic-depth form)))
       (when (and (> depth *nesting-depth-limit*)
                  (has-function-calls-p form))
-        (warn-check :warn
-                    (format nil "arithmetic nesting depth ~D with function calls — register clobber risk"
+        (warn-check :info
+                    (format nil "arithmetic nesting depth ~D with function calls — compiler will ANF-hoist into let* temporaries"
                             depth))))))
 
 (defun check-variable-index-aset (form)

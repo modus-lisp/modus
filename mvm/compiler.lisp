@@ -939,6 +939,93 @@
              form-type n-bindings current-depth new-depth *let-binding-limit*
              *current-function-name*))))
 
+;;; ------------------------------------------------------------
+;;; ANF normalization of over-nested arithmetic operands
+;;; ------------------------------------------------------------
+;;;
+;;; CHECK-ARITH-NESTING above describes a real hazard, but the shape it
+;;; rejects is ordinary portable CL — e.g.
+;;;
+;;;   (+ 3 (loop for tk in rle sum (+ (aref v (car tk)) (extra tk))))
+;;;
+;;; whose LOOP...SUM expansion compiles `(+ acc (+ (aref …) (extra …)))'
+;;; while the outer `+' already holds a live PUSH.  Rather than refuse the
+;;; program, apply the remedy the error message itself prescribes: bind the
+;;; offending operands to LET* temporaries first.
+;;;
+;;; Why that is enough.  `*arith-push-depth* + form-arith-call-depth(operand)'
+;;; counts the arithmetic PUSHes that will be live when the deepest call
+;;; inside OPERAND executes, minus one; the guard permits 1 (i.e. two live
+;;; pushes) and rejects 2.  Hoisting an operand out of `(op a1 … an)' moves
+;;; its evaluation from inside this form's PUSH/POP window to before it, so
+;;; every call in the hoisted initform runs with exactly one fewer live push
+;;; — landing back in the already-accepted zone.  The residual
+;;; `(op t1 … tn)' holds only variables, so it can never trip again, and each
+;;; hoisted initform is a strict subform, so the rewrite terminates.
+;;;
+;;; The rewrite fires ONLY where CHECK-ARITH-NESTING would otherwise have
+;;; signalled (i.e. where the build previously SKIPped the whole form), so
+;;; codegen for every program that compiles today is unchanged.
+
+(defun %anf-operand-trips-p (arg)
+  "T when ARG in an arithmetic PUSH position would make CHECK-ARITH-NESTING
+   signal at the current *arith-push-depth*.  Mirrors that test exactly."
+  (and (form-contains-call-p arg)
+       (>= (+ *arith-push-depth* (form-arith-call-depth arg)) 2)))
+
+(defun %anf-order-insensitive-p (form)
+  "T when evaluating FORM can neither cause nor observe a side effect, so a
+   hoist may legally step over it without disturbing left-to-right order."
+  (or (null form)
+      (eq form t)
+      (numberp form)
+      (characterp form)
+      (stringp form)
+      (keywordp form)
+      (and (consp form) (symbolp (car form))
+           (member (car form) '(quote function)))))
+
+(defun anf-normalize-arith-args (op args env)
+  "If compiling (OP . ARGS) at the current *arith-push-depth* would trip
+   CHECK-ARITH-NESTING on one of its PUSHed operands, return an equivalent
+   LET*-normalized form; otherwise return NIL.
+
+   Every operand from the first through the LAST offending one is bound, in
+   source order, to a fresh temporary — LET*, and including the operands to
+   the left of the offender, so left-to-right evaluation order is preserved
+   exactly.  Operands whose evaluation is order-insensitive (constants,
+   quoted data) stay inline, and operands to the right of the last offender
+   stay inline because they already evaluate after every hoisted one.
+
+   Returns NIL if the temporaries would not fit in the frame; the caller then
+   falls back to CHECK-ARITH-NESTING's diagnostic, which is more useful than
+   a frame-overflow error."
+  (let ((last -1)
+        (i 0))
+    (dolist (a (cdr args))
+      (setq i (1+ i))
+      (when (%anf-operand-trips-p a)
+        (setq last i)))
+    (if (< last 0)
+        nil
+        (let ((binds nil)
+              (new nil)
+              (j 0))
+          (dolist (a args)
+            (if (and (<= j last)
+                     (not (%anf-order-insensitive-p a)))
+                (let ((g (gensym "ANF")))
+                  (setq binds (cons (list g a) binds))
+                  (setq new (cons g new)))
+                (setq new (cons a new)))
+            (setq j (1+ j)))
+          (cond
+            ((null binds) nil)
+            ((> (+ (if env (compile-env-stack-depth env) 0) (length binds))
+                *let-binding-limit*)
+             nil)
+            (t (list 'let* (reverse binds) (cons op (reverse new)))))))))
+
 ;;; ============================================================
 ;;; IR Instruction Representation
 ;;; ============================================================
@@ -11739,23 +11826,27 @@
 
 (defun compile-add (args env dest)
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
-  (cond
-    ((null args) (compile-integer 0 dest))
-    ((null (cdr args)) (compile-form (car args) env dest))
-    (t
-     (compile-form (car args) env dest)
-     (dolist (arg (cdr args))
-       (check-arith-nesting '+ arg)
-       (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-           (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-             (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
-           (let ((temp (alloc-temp-reg))
-                 (*arith-push-depth* (1+ *arith-push-depth*)))
-             (emit-ir :push dest)
-             (compile-form arg env temp)
-             (emit-ir :pop dest)
-             (emit-arith-pair :add-checked "GENERIC-ADD" dest temp)
-             (free-temp-reg)))))))
+  (let ((anf (and args (cdr args) (anf-normalize-arith-args '+ args env))))
+    (cond
+      ((null args) (compile-integer 0 dest))
+      ((null (cdr args)) (compile-form (car args) env dest))
+      ;; Over-nested operand: bind it (and everything to its left) to LET*
+      ;; temporaries instead of refusing to compile the program.
+      (anf (compile-form anf env dest))
+      (t
+       (compile-form (car args) env dest)
+       (dolist (arg (cdr args))
+         (check-arith-nesting '+ arg)   ; backstop — ANF above handles the hit
+         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+               (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD"))
+             (let ((temp (alloc-temp-reg))
+                   (*arith-push-depth* (1+ *arith-push-depth*)))
+               (emit-ir :push dest)
+               (compile-form arg env temp)
+               (emit-ir :pop dest)
+               (emit-arith-pair :add-checked "GENERIC-ADD" dest temp)
+               (free-temp-reg))))))))
 
 (defun compile-sub (args env dest)
   "Compile (- args...).  Unary `(- x)` lowers to `(- 0 x)` so bignum/ratio/
@@ -11775,19 +11866,23 @@
      ;; bignum / ratio / IEEE-float arguments correctly.
      (compile-sub (list 0 (car args)) env dest))
     (t
-     (compile-form (car args) env dest)
-     (dolist (arg (cdr args))
-       (check-arith-nesting '- arg)
-       (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-           (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-             (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT"))
-           (let ((temp (alloc-temp-reg))
-                 (*arith-push-depth* (1+ *arith-push-depth*)))
-             (emit-ir :push dest)
-             (compile-form arg env temp)
-             (emit-ir :pop dest)
-             (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp)
-             (free-temp-reg)))))))
+     (let ((anf (anf-normalize-arith-args '- args env)))
+       (if anf
+           (compile-form anf env dest)
+           (progn
+             (compile-form (car args) env dest)
+             (dolist (arg (cdr args))
+               (check-arith-nesting '- arg)   ; backstop — ANF above handles the hit
+               (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                   (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                     (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT"))
+                   (let ((temp (alloc-temp-reg))
+                         (*arith-push-depth* (1+ *arith-push-depth*)))
+                     (emit-ir :push dest)
+                     (compile-form arg env temp)
+                     (emit-ir :pop dest)
+                     (emit-arith-pair :sub-checked "GENERIC-SUBTRACT" dest temp)
+                     (free-temp-reg))))))))))
 
 (defun compile-mul (args env dest)
   "Compile (* args...).  Uses emit-arith-pair so non-fixnum operands
@@ -11806,19 +11901,23 @@
     ((null args) (compile-integer 1 dest))
     ((null (cdr args)) (compile-form (car args) env dest))
     (t
-     (compile-form (car args) env dest)
-     (dolist (arg (cdr args))
-       (check-arith-nesting '* arg)
-       (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-           (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-             (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
-           (let ((temp (alloc-temp-reg))
-                 (*arith-push-depth* (1+ *arith-push-depth*)))
-             (emit-ir :push dest)
-             (compile-form arg env temp)
-             (emit-ir :pop dest)
-             (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp)
-             (free-temp-reg)))))))
+     (let ((anf (anf-normalize-arith-args '* args env)))
+       (if anf
+           (compile-form anf env dest)
+           (progn
+             (compile-form (car args) env dest)
+             (dolist (arg (cdr args))
+               (check-arith-nesting '* arg)   ; backstop — ANF above handles the hit
+               (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                   (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                     (%compile-arith-arg-step-e2 arg env dest :mul-checked "GENERIC-MULTIPLY"))
+                   (let ((temp (alloc-temp-reg))
+                         (*arith-push-depth* (1+ *arith-push-depth*)))
+                     (emit-ir :push dest)
+                     (compile-form arg env temp)
+                     (emit-ir :pop dest)
+                     (emit-arith-pair :mul-checked "GENERIC-MULTIPLY" dest temp)
+                     (free-temp-reg))))))))))
 
 (defun compile-mul26lo (args env dest)
   "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.
@@ -12594,22 +12693,26 @@
       ((null (cdr flat-args))
        (compile-form (car flat-args) env dest))
       (t
-       (compile-form (car flat-args) env dest)
-       (dolist (arg (cdr flat-args))
-         (check-arith-nesting 'logand arg)
-         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-               (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND"))
-             (let ((temp (alloc-temp-reg))
-                   (*arith-push-depth* (1+ *arith-push-depth*)))
-               (emit-ir :push dest)
-               (compile-form arg env temp)
-               (emit-ir :pop dest)
-               ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
-               ;; (the now-fast two's-complement engine).  Raw :and on a bignum
-               ;; pointer returned garbage.
-               (emit-arith-pair :and "GENERIC-LOGAND" dest temp)
-               (free-temp-reg))))))))
+       (let ((anf (anf-normalize-arith-args 'logand flat-args env)))
+         (if anf
+             (compile-form anf env dest)
+             (progn
+               (compile-form (car flat-args) env dest)
+               (dolist (arg (cdr flat-args))
+                 (check-arith-nesting 'logand arg) ; backstop — ANF handles the hit
+                 (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                     (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                       (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND"))
+                     (let ((temp (alloc-temp-reg))
+                           (*arith-push-depth* (1+ *arith-push-depth*)))
+                       (emit-ir :push dest)
+                       (compile-form arg env temp)
+                       (emit-ir :pop dest)
+                       ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
+                       ;; (the now-fast two's-complement engine).  Raw :and on a bignum
+                       ;; pointer returned garbage.
+                       (emit-arith-pair :and "GENERIC-LOGAND" dest temp)
+                       (free-temp-reg)))))))))))
 
 (defun compile-logior (args env dest)
   "Compile (logior args...).
@@ -12622,19 +12725,23 @@
       ((null (cdr flat-args))
        (compile-form (car flat-args) env dest))
       (t
-       (compile-form (car flat-args) env dest)
-       (dolist (arg (cdr flat-args))
-         (check-arith-nesting 'logior arg)
-         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-               (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR"))
-             (let ((temp (alloc-temp-reg))
-                   (*arith-push-depth* (1+ *arith-push-depth*)))
-               (emit-ir :push dest)
-               (compile-form arg env temp)
-               (emit-ir :pop dest)
-               (emit-arith-pair :or "GENERIC-LOGIOR" dest temp)
-               (free-temp-reg))))))))
+       (let ((anf (anf-normalize-arith-args 'logior flat-args env)))
+         (if anf
+             (compile-form anf env dest)
+             (progn
+               (compile-form (car flat-args) env dest)
+               (dolist (arg (cdr flat-args))
+                 (check-arith-nesting 'logior arg) ; backstop — ANF handles the hit
+                 (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                     (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                       (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR"))
+                     (let ((temp (alloc-temp-reg))
+                           (*arith-push-depth* (1+ *arith-push-depth*)))
+                       (emit-ir :push dest)
+                       (compile-form arg env temp)
+                       (emit-ir :pop dest)
+                       (emit-arith-pair :or "GENERIC-LOGIOR" dest temp)
+                       (free-temp-reg)))))))))))
 
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
@@ -12646,19 +12753,23 @@
       ((null (cdr flat-args))
        (compile-form (car flat-args) env dest))
       (t
-       (compile-form (car flat-args) env dest)
-       (dolist (arg (cdr flat-args))
-         (check-arith-nesting 'logxor arg)
-         (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
-             (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-               (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR"))
-             (let ((temp (alloc-temp-reg))
-                   (*arith-push-depth* (1+ *arith-push-depth*)))
-               (emit-ir :push dest)
-               (compile-form arg env temp)
-               (emit-ir :pop dest)
-               (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
-               (free-temp-reg))))))))
+       (let ((anf (anf-normalize-arith-args 'logxor flat-args env)))
+         (if anf
+             (compile-form anf env dest)
+             (progn
+               (compile-form (car flat-args) env dest)
+               (dolist (arg (cdr flat-args))
+                 (check-arith-nesting 'logxor arg) ; backstop — ANF handles the hit
+                 (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
+                     (let ((*arith-push-depth* (1+ *arith-push-depth*)))
+                       (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR"))
+                     (let ((temp (alloc-temp-reg))
+                           (*arith-push-depth* (1+ *arith-push-depth*)))
+                       (emit-ir :push dest)
+                       (compile-form arg env temp)
+                       (emit-ir :pop dest)
+                       (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
+                       (free-temp-reg)))))))))))
 
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.

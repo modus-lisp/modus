@@ -28,10 +28,11 @@
 
 ;;; This build is now a thin wrapper: the shared harness (load MVM, read
 ;;; sources, transforms, load the ANSI corpus) lives in
-;;; build-ansi-common-x64.lisp; only the bare-metal-specific runner-source
+;;; build-ansi-common.lisp; only the bare-metal-specific runner-source
 ;;; assembly + build-image tail below is kept here.
 (defvar *ansi-target-bare-metal* t)
-(load (merge-pathnames "build-ansi-common-x64.lisp"
+(defvar *ansi-target-arch* :x64)
+(load (merge-pathnames "build-ansi-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 ;; Generate run-real-ansi-tests that calls all file-level runners.
 ;;

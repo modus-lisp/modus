@@ -134,7 +134,7 @@
 ;;; With MODUS_USE_JIT=1 we ALSO bake the x64 native translator into the image so
 ;;; mvm-eval's JIT seam (%jit-translate-page / %jit-call in mvm-eval.lisp) can execute
 ;;; forms as NATIVE code.  This mirrors what the ANSI gate (build-x64-linux.lisp)
-;;; does via build-ansi-common-x64.lisp: bake x64-asm.lisp + translate-x64.lisp +
+;;; does via build-ansi-common.lisp: bake x64-asm.lisp + translate-x64.lisp +
 ;;; a %init-x64-translator co-init, run %init-x64-translator at boot, and bake
 ;;; %jit-enabled-p to return T.  When JIT is OFF none of this source is added, so
 ;;; the default image stays byte-identical to before.
@@ -212,7 +212,7 @@
         (subseq src 0 pos)))))
 ;; Co-init that populates the translator's defvar lookup tables at boot AND sets
 ;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
-;; installs (build-ansi-common-x64.lisp *x64-translator-coinit-source*), plus a
+;; installs (build-ansi-common.lisp *x64-translator-coinit-source*), plus a
 ;; RUNTIME (setq *x64-gc-enabled* …) mirroring the value the host baked into the
 ;; image's fixed code — limitation #7 means the file-tail (setf …) does NOT reach
 ;; the image runtime, so %jit-translate-page would otherwise read the defvar
@@ -266,7 +266,7 @@
   ;; Fn-entry alignment offset.  The JIT page is a STANDALONE mmap (not the ELF
   ;; image), so the translator only uses this to NOP-align emitted fn entries
   ;; RELATIVE to the buffer base — 0 gives clean 16-byte-relative alignment.
-  ;; This matches the ANSI gate's co-init (build-ansi-common-x64.lisp), whose
+  ;; This matches the ANSI gate's co-init (build-ansi-common.lisp), whose
   ;; JIT battery runs native with offset 0.
   (setq *x64-native-code-offset* 0)
   (setq *x64-linux-mode* t)

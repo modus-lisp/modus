@@ -255,10 +255,11 @@ Two kinds of build:
   and the `build-aarch64`/`build-aarch64-linux` counterparts.  Only these 4
   compile the `.lsp` corpus in; their host-build logs are noisy with
   test-corpus warnings by design.  Each pair shares its ~4300-line harness via a
-  common module — `mvm/build-ansi-common-x64.lisp` (x64) /
-  `mvm/build-ansi-common-aarch64.lisp` (aarch64); each of the 4 builds is a thin
-  wrapper that sets `*ansi-target-bare-metal*`, loads its common file, then
-  appends its own runner-source + build-image tail.  (Both extractions verified
+  common module — `mvm/build-ansi-common.lisp`, shared by all four; each of the
+  4 builds is a thin wrapper that sets `*ansi-target-bare-metal*` and
+  `*ansi-target-arch*` (`:x64` / `:aarch64`), loads the common file, then
+  appends its own runner-source + build-image tail.  The common file's only
+  arch divergence is the WS4 Stage-1 native-translator block it bakes in.  (Both extractions verified
   byte-identical to pre-split.)  Later end-state (gated on the WS4 JIT): the
   suite becomes a `--load`-able script run on a clean image, so nothing is baked.
 

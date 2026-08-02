@@ -10,10 +10,11 @@
 
 ;;; This build is now a thin wrapper: the shared harness (load MVM, read
 ;;; sources, transforms, load the ANSI corpus) lives in
-;;; build-ansi-common-x64.lisp; only the Linux-specific runner-source
+;;; build-ansi-common.lisp; only the Linux-specific runner-source
 ;;; assembly + build-image tail below is kept here.
 (defvar *ansi-target-bare-metal* nil)
-(load (merge-pathnames "build-ansi-common-x64.lisp"
+(defvar *ansi-target-arch* :x64)
+(load (merge-pathnames "build-ansi-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 ;; Generate run-real-ansi-tests that calls all file-level runners.
 ;;
@@ -1037,7 +1038,7 @@
   ;; *x64-native-code-offset*), which are defparameter/defvar init-thunks
   ;; that don't run at boot.  translate-mvm-to-x64 is DEAD CODE (nothing
   ;; routes to it); this just makes it callable if invoked (WS4-S1 probe /
-  ;; future JIT).  See build-ansi-common-x64.lisp *x64-translator-coinit-source*.
+  ;; future JIT).  See mvm/build-ansi-common.lisp *x64-translator-coinit-source*.
   (%init-x64-translator)
 
   ;; Set default pathname defaults to the ANSI test sandbox directory

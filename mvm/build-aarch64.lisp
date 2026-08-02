@@ -41,11 +41,12 @@
 ;;;; Output (serial): FAIL lines for each failing test, then N/M DONE
 
 
-;;; Thin wrapper: shared harness lives in build-ansi-common-aarch64.lisp;
+;;; Thin wrapper: shared harness lives in build-ansi-common.lisp;
 ;;; only the bare-metal runner-source + build-image tail (and the bare-only
 ;;; MODUS_NET_BUILD net-driver source, below) are kept here.
 (defvar *ansi-target-bare-metal* t)
-(load (merge-pathnames "build-ansi-common-aarch64.lisp"
+(defvar *ansi-target-arch* :aarch64)
+(load (merge-pathnames "build-ansi-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 ;;; --- NET BUILD (MODUS_NET_BUILD=1) : Quicklisp-over-HTTP image ---------------
 ;;; When enabled, append the E1000 net stack + tar/install + chipz source to

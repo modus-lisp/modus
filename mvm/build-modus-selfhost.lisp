@@ -156,7 +156,7 @@
 ;;;
 ;;; At this stage the tooling is DEAD CODE — nothing routes to build-image;
 ;;; the CLI REPL is unchanged.  The proven translator recipe is
-;;; mvm/build-ansi-common-x64.lisp lines 108-219 (WS4 Stage 1); the build
+;;; mvm/build-ansi-common.lisp (the :x64 arch block) (WS4 Stage 1); the build
 ;;; pipeline (target/cross/boot-desc) is new to WS5.
 ;;;
 ;;; Package handling: source is read by cross.lisp's READ-ALL-FORMS in
@@ -207,7 +207,7 @@
 ;; (CLAUDE.md item 7), so the translator's three lookup tables (*registers*,
 ;; *condition-codes*, *vreg-to-x64*) and *x64-native-code-offset* must be
 ;; populated explicitly.  %init-x64-translator is called from kernel-main.
-;; Verbatim from the WS4 recipe (build-ansi-common-x64.lisp:158-219).
+;; Verbatim from the WS4 recipe (build-ansi-common.lisp *x64-translator-coinit-source*).
 (defvar *x64-translator-coinit-source* "
 (defun %init-x64-translator ()
   (setq *registers*

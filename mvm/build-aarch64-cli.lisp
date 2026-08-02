@@ -12,14 +12,16 @@
 ;;;;   sbcl --dynamic-space-size 12288 --script mvm/build-aarch64-cli.lisp
 ;;;;   → /home/claude/modus-aa64-cli   (override with MODUS_CLI_OUT)
 ;;;;
-;;;; We LOAD build-ansi-common-aarch64.lisp to reuse its proven source-var
+;;;; We LOAD build-ansi-common.lisp (with *ansi-target-arch* :aarch64) to reuse
+;;;; its proven source-var
 ;;;; construction (mvm-text reads, the a64-buffer/translate shrink+strip, the
 ;;;; %init-aarch64-translator co-init, the sft/sym-name/runtime-macro scanners)
 ;;;; and its helpers.  The corpus it reads into *real-ansi-sources* is simply
 ;;;; NOT concatenated into our *full-source*, so it is never compiled in.
 
 (defvar *ansi-target-bare-metal* nil)
-(load (merge-pathnames "build-ansi-common-aarch64.lisp"
+(defvar *ansi-target-arch* :aarch64)
+(load (merge-pathnames "build-ansi-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 
 (format t "~%=== Building minimal AArch64 CLI/JIT host (no corpus) ===~%")
@@ -164,7 +166,7 @@
 ;;;
 ;;; The ANSI gate wrapper (mvm/build-aarch64-linux.lisp, section "4c") already
 ;;; carries exactly these overrides — but they live in the WRAPPER, not in the
-;;; shared build-ansi-common-aarch64.lisp, so this corpus-free CLI never got
+;;; shared build-ansi-common.lisp, so this corpus-free CLI never got
 ;;; them.  Copied verbatim rather than hoisted into the common file so the gate
 ;;; image is untouched (hoisting would double-define them there).  Keep the two
 ;;; copies in sync; the source of truth is build-aarch64-linux.lisp section 4c.

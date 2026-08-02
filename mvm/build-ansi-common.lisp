@@ -1,18 +1,35 @@
-;;;; build-ansi-common-x64.lisp — shared ANSI CL test-runner harness (x86-64)
+;;;; build-ansi-common.lisp — shared ANSI CL test-runner harness (x64 + AArch64)
 ;;;;
-;;;; Loaded by the two x86-64 ANSI gate runners AFTER each sets the target
-;;;; flag *ANSI-TARGET-BARE-METAL*:
-;;;;   build-x64-linux.lisp  (nil) — Linux ELF, the 64-shard conformance gate
-;;;;   build-x64.lisp        (t)   — bare-metal multiboot kernel (QEMU)
+;;;; Loaded by all FOUR ANSI gate runners AFTER each sets the target flag
+;;;; *ANSI-TARGET-BARE-METAL* and the arch selector *ANSI-TARGET-ARCH*:
+;;;;   build-x64-linux.lisp      (nil :x64)     — Linux ELF, the 64-shard gate
+;;;;   build-x64.lisp            (t   :x64)     — bare-metal multiboot kernel (QEMU)
+;;;;   build-aarch64-linux.lisp  (nil :aarch64) — Linux AArch64 ELF gate
+;;;;   build-aarch64.lisp        (t   :aarch64) — bare-metal AArch64 (QEMU virt)
 ;;;;
-;;;; This file holds everything the two share: load the MVM system, read the
+;;;; This file holds everything the four share: load the MVM system, read the
 ;;;; first-party + mvm-eval sources, all the build-time transforms (chunking,
 ;;;; SFT / runtime-macro / sym-name auto-generation), and load the ANSI test
 ;;;; corpus into *real-ansi-sources* / *ansi-file-names*.  Each wrapper then
 ;;;; appends its OWN target-specific runner-source assembly (bare-metal PIT
 ;;;; watchdog + IDT recovery vs Linux fork/wait4 per-file isolation) and calls
-;;;; build-image.  The only prefix divergence — *mcgc-pin-source* — is
-;;;; parameterized below on the target flag.  See CLAUDE.md "Build taxonomy".
+;;;; build-image; the bare AArch64 wrapper additionally defines the
+;;;; MODUS_NET_BUILD net-driver source (that feature is bare-metal only).
+;;;;
+;;;; TWO axes of divergence are parameterized here and nowhere else:
+;;;;   *ansi-target-bare-metal* — selects *mcgc-pin-source* (Linux-only GC
+;;;;                              page-pinning support).
+;;;;   *ansi-target-arch*       — selects the WS4 Stage-1 native-translator
+;;;;                              block baked into the image: x64-asm.lisp +
+;;;;                              translate-x64.lisp + %init-x64-translator,
+;;;;                              vs translate-aarch64.lisp +
+;;;;                              %init-aarch64-translator + the AArch64
+;;;;                              runtime-JIT flip knob.
+;;;; Everything else is byte-for-byte common to all four images.
+;;;; See CLAUDE.md "Build taxonomy — clean images vs ANSI gate runners".
+
+(declaim (special *ansi-target-arch*))
+
 
 (declaim (special *ansi-target-bare-metal*))
 
@@ -104,14 +121,73 @@
 (defvar *interp-source*   (mvm-text "mvm/interp.lisp"))   ; mvm-interpret (bytecode executor)
 (defvar *compiler-image-source* (mvm-text "mvm/compiler.lisp")) ; the 3-phase MVM compiler
 (defvar *mvm-eval-source*    (mvm-text "mvm/mvm-eval.lisp"))    ; mvm-eval-forms / mvm-eval
-;;; --- WS4 STAGE 1: bake the x64 native translator into the image ---
-;;; Adds mvm/x64-asm.lisp (instruction encoder, package modus.asm) and
-;;; mvm/translate-x64.lisp (MVM-bytecode→x86-64 translator, package
-;;; modus.mvm.x64) to the baked source so TRANSLATE-MVM-TO-X64 compiles
-;;; in-image and is runtime-callable — the foundation for the WS4 JIT.
-;;; At this stage the translator is DEAD CODE (nothing routes to it); the
-;;; 32-shard gate must stay unchanged.  Proven recipe: mvm/build-mvm.lisp
-;;; already bakes these two files and calls translate-mvm-to-x64 at runtime.
+;; In-image override of the host-only ieee-float-* / bignum-literal helpers
+;; (compiler.lisp uses sb-kernel:double-float-*).  Appended AFTER the compiler
+;; source so it wins (last-defun).  Verbatim from build-generic.lisp.
+(defvar *stage2-float-override* "
+(defun ieee-float-bits (f)
+  (logior (ash (logand (%prim-aref f 0) 4294967295) 32)
+          (logand (%prim-aref f 1) 4294967295)))
+(defun ieee-float-hi32 (f) (logand (%prim-aref f 0) 4294967295))
+(defun ieee-float-lo32 (f) (logand (%prim-aref f 1) 4294967295))
+(defun %lit-bignum-big-p (value) (big-bignum-p value))
+(defun %lit-bn-lo (value) (bignum-lo value))
+(defun %lit-bn-hi (value) (bignum-hi value))
+(defun %lit-bb-sign (value) (%bb-sign value))
+(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
+(defun %lit-bb-limb (value k) (%bb-limb value k))
+;; In-image override of %GLOBAL-NAME-KEY (the SYMBOL-VALUE / SET-SYMBOL-VALUE
+;; alist key the mvm-eval compiler emits for a GLOBAL variable read/write).  The
+;; host/native version is NORMALIZE-NAME = compute-name-hash(symbol-name sym).
+;; In the image, symbol-name reverse-resolves a native #x50/#x53 sym via the
+;; build-generated *sym-name-table*, which only covers SCANNED sources.  A
+;; symbol from an UNSCANNED ANSI test dir (e.g. *cons-test-4* from cons/cxr.lsp)
+;; has no reverse entry, so symbol-name returns \"\" and compute-name-hash(\"\")
+;; is a CONSTANT wrong key — mvm-eval's global read then missed the store (keyed
+;; by the symbol's REAL reader/setq-assigned hash) and returned NIL, so the cxr
+;; tests cons.38-53 signalled inside CAAAAR..CDDDDR (E2-UNSUP) where the tree-
+;; walker (which keys symbol-value by the symbol's stored hash slot) returned
+;; the value.  Read the symbol object's stored hash (slot 0) directly here --
+;; authoritative and always present.  SCOPE: global var read/write key ONLY;
+;; compile-quote symbol interning still uses NORMALIZE-NAME, so quoted-symbol
+;; identity (and the type-name registry it feeds) is untouched.
+(defun %global-name-key (sym)
+  (cond
+    ((integerp sym) sym)
+    ((symbolp sym)
+     (let ((h (cond
+                ((null sym) nil) ((eq sym t) nil)
+                ((fixnump sym) nil) ((characterp sym) nil)
+                ((stringp sym) nil) ((consp sym) nil)
+                (t (let ((st (obj-subtag sym)))
+                     (if (or (= st 80) (= st 83)) (aref sym 0) nil))))))
+       (if h h (normalize-name sym))))
+    ((stringp sym) (compute-name-hash sym))
+    (t 0)))
+")
+;; Generated boot-time populator for *opcode-table* (the host *opcode-table*
+;; is populated when mvm.lisp/compiler.lisp load host-side for macro scanning).
+(defvar *opcode-table-init-source*
+  (with-output-to-string (s)
+    (format s "(defun %~A-opcode-table ()~%" "populate")
+    (maphash (lambda (code info)
+               (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
+                       code code
+                       (modus.mvm::opcode-info-name info)
+                       (modus.mvm::opcode-info-operands info)
+                       (modus.mvm::opcode-info-description info)))
+             modus.mvm::*opcode-table*)
+    (format s "  t)~%")
+    (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%")))
+;;; ============================================================
+;;; WS4 STAGE 1: bake the arch's native MVM→machine-code translator
+;;; ============================================================
+;;; Adds the target architecture's translator to the baked source so
+;;; TRANSLATE-MVM-TO-<ARCH> compiles in-image and is runtime-callable — the
+;;; foundation for the WS4 runtime JIT.  At this stage the translator is DEAD
+;;; CODE (nothing routes to it); the gate must stay unchanged.  Proven recipe:
+;;; mvm/build-mvm.lisp already bakes these files and calls the translator at
+;;; runtime.
 ;;;
 ;;; Package handling: source is read by cross.lisp's READ-ALL-FORMS in
 ;;; :MODUS.MVM, and the MVM compiler hashes every symbol by SYMBOL-NAME
@@ -119,34 +195,69 @@
 ;;; modus.asm::code-buffer-position / etc. all resolve by name in the flat
 ;;; image namespace.  The (in-package …) / (defpackage …) forms are compiled
 ;;; as build-time no-ops (see compile-toplevel), so they cost nothing.
-(defvar *x64-asm-source* (mvm-text "mvm/x64-asm.lisp"))
-;; Shrink the code-buffer's default byte array from 96MB to 64KB.  The
-;; defstruct slot default (make-array 100663296 …) is inlined into the
-;; runtime constructor; a 96MB (≈768MB tagged) alloc per make-code-buffer
-;; would exhaust the ANSI image's ~448MB semispace.  x64-asm's emit-byte
-;; grows the array on demand (%code-buffer-ensure doubles + REPLACEs), so a
-;; small initial array is correct for any translation size — the WS4-S1
-;; probe only needs a few hundred bytes.
-(let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
-      (repl   "(bytes (make-array 65536 :element-type '(unsigned-byte 8)))"))
-  (let ((p (search needle *x64-asm-source*)))
-    (unless p
-      (error "WS4-S1: could not find code-buffer 96MB default to shrink"))
-    (setf *x64-asm-source*
-          (concatenate 'string
-                       (subseq *x64-asm-source* 0 p) repl
-                       (subseq *x64-asm-source* (+ p (length needle)))))))
-(defvar *translate-x64-source* (mvm-text "mvm/translate-x64.lisp"))
-;; Strip install-x64-translator and everything after it — the host-only ELF/
-;; target-descriptor tail (install-x64-translator references *target-x86-64*;
-;; disassemble-native uses &key; translate-single-instruction wants the target
-;; struct).  Same marker build-mvm.lisp uses.
-(let ((marker "(defun install-x64-translator"))
-  (let ((pos (search marker *translate-x64-source*)))
-    (unless pos
-      (error "WS4-S1: could not find install-x64-translator strip marker"))
-    (setf *translate-x64-source*
-          (subseq *translate-x64-source* 0 pos))))
+;;;
+;;; The per-arch translator SOURCE variables are DEFVAR'd nil unconditionally
+;;; (so they are proclaimed special before the guarded reads below compile) and
+;;; only the arch actually being built reads + trims its files.  The co-init
+;;; TEXT below is plain constant source, so it is defined unconditionally; only
+;;; the arch's own block is ever spliced into the image.  *ARCH-TRANSLATOR-BLOCK*
+;;; is the assembled result, spliced into *compiler-in-image-source*.
+(defvar *x64-asm-source* nil)
+(defvar *translate-x64-source* nil)
+(defvar *translate-aarch64-source* nil)
+
+;;; --- x64: instruction encoder + MVM→x64 translator (read + trim) ---
+(when (eq *ansi-target-arch* :x64)
+  (setf *x64-asm-source* (mvm-text "mvm/x64-asm.lisp"))
+  ;; Shrink the code-buffer's default byte array from 96MB to 64KB.  The
+  ;; defstruct slot default (make-array 100663296 …) is inlined into the
+  ;; runtime constructor; a 96MB (≈768MB tagged) alloc per make-code-buffer
+  ;; would exhaust the ANSI image's ~448MB semispace.  x64-asm's emit-byte
+  ;; grows the array on demand (%code-buffer-ensure doubles + REPLACEs), so a
+  ;; small initial array is correct for any translation size — the WS4-S1
+  ;; probe only needs a few hundred bytes.
+  (let ((needle "(bytes (make-array 100663296 :element-type '(unsigned-byte 8)))")
+        (repl   "(bytes (make-array 65536 :element-type '(unsigned-byte 8)))"))
+    (let ((p (search needle *x64-asm-source*)))
+      (unless p
+        (error "WS4-S1: could not find code-buffer 96MB default to shrink"))
+      (setf *x64-asm-source*
+            (concatenate 'string
+                         (subseq *x64-asm-source* 0 p) repl
+                         (subseq *x64-asm-source* (+ p (length needle)))))))
+  (setf *translate-x64-source* (mvm-text "mvm/translate-x64.lisp"))
+  ;; Strip install-x64-translator and everything after it — the host-only ELF/
+  ;; target-descriptor tail (install-x64-translator references *target-x86-64*;
+  ;; disassemble-native uses &key; translate-single-instruction wants the target
+  ;; struct).  Same marker build-mvm.lisp uses.
+  (let ((marker "(defun install-x64-translator"))
+    (let ((pos (search marker *translate-x64-source*)))
+      (unless pos
+        (error "WS4-S1: could not find install-x64-translator strip marker"))
+      (setf *translate-x64-source*
+            (subseq *translate-x64-source* 0 pos)))))
+
+;;; --- AArch64: MVM→aarch64 translator (read + trim) ---
+(when (eq *ansi-target-arch* :aarch64)
+  (setf *translate-aarch64-source* (mvm-text "mvm/translate-aarch64.lisp"))
+  ;; Shrink the a64-buffer code array default (16M general slots ≈ 128MB tagged)
+  ;; to 64K — a64-emit grows it on demand (%code-buffer doubling); a 128MB alloc
+  ;; per make-a64-buffer would exhaust the ANSI image semispace.
+  (let ((needle "(code (make-array 16777216))")
+        (repl   "(code (make-array 65536))"))
+    (let ((p (search needle *translate-aarch64-source*)))
+      (unless p (error "WS4-AA64-S1: could not find a64-buffer 16M code default to shrink"))
+      (setf *translate-aarch64-source*
+            (concatenate 'string (subseq *translate-aarch64-source* 0 p) repl
+                         (subseq *translate-aarch64-source* (+ p (length needle)))))))
+  ;; Strip install-aarch64-translator and the host-only ELF/target-descriptor/
+  ;; disassemble tail after it (refs *target-aarch64*, &key disassemble — not
+  ;; compilable in-image).  Same idea as translate-x64's install-x64-translator.
+  (let ((marker "(defun install-aarch64-translator"))
+    (let ((pos (search marker *translate-aarch64-source*)))
+      (unless pos (error "WS4-AA64-S1: could not find install-aarch64-translator strip marker"))
+      (setf *translate-aarch64-source* (subseq *translate-aarch64-source* 0 pos)))))
+
 ;; Co-init source (appended AFTER the translator so it wins last-defun).
 ;; defparameter/defvar init-thunks are NOT run at boot (CLAUDE.md item 7),
 ;; so the translator's three lookup tables (*registers*, *condition-codes*,
@@ -217,64 +328,106 @@
   (setq *x64-linux-mode* t)
   t)
 ")
-;; In-image override of the host-only ieee-float-* / bignum-literal helpers
-;; (compiler.lisp uses sb-kernel:double-float-*).  Appended AFTER the compiler
-;; source so it wins (last-defun).  Verbatim from build-generic.lisp.
-(defvar *stage2-float-override* "
-(defun ieee-float-bits (f)
-  (logior (ash (logand (%prim-aref f 0) 4294967295) 32)
-          (logand (%prim-aref f 1) 4294967295)))
-(defun ieee-float-hi32 (f) (logand (%prim-aref f 0) 4294967295))
-(defun ieee-float-lo32 (f) (logand (%prim-aref f 1) 4294967295))
-(defun %lit-bignum-big-p (value) (big-bignum-p value))
-(defun %lit-bn-lo (value) (bignum-lo value))
-(defun %lit-bn-hi (value) (bignum-hi value))
-(defun %lit-bb-sign (value) (%bb-sign value))
-(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
-(defun %lit-bb-limb (value k) (%bb-limb value k))
-;; In-image override of %GLOBAL-NAME-KEY (the SYMBOL-VALUE / SET-SYMBOL-VALUE
-;; alist key the mvm-eval compiler emits for a GLOBAL variable read/write).  The
-;; host/native version is NORMALIZE-NAME = compute-name-hash(symbol-name sym).
-;; In the image, symbol-name reverse-resolves a native #x50/#x53 sym via the
-;; build-generated *sym-name-table*, which only covers SCANNED sources.  A
-;; symbol from an UNSCANNED ANSI test dir (e.g. *cons-test-4* from cons/cxr.lsp)
-;; has no reverse entry, so symbol-name returns \"\" and compute-name-hash(\"\")
-;; is a CONSTANT wrong key — mvm-eval's global read then missed the store (keyed
-;; by the symbol's REAL reader/setq-assigned hash) and returned NIL, so the cxr
-;; tests cons.38-53 signalled inside CAAAAR..CDDDDR (E2-UNSUP) where the tree-
-;; walker (which keys symbol-value by the symbol's stored hash slot) returned
-;; the value.  Read the symbol object's stored hash (slot 0) directly here --
-;; authoritative and always present.  SCOPE: global var read/write key ONLY;
-;; compile-quote symbol interning still uses NORMALIZE-NAME, so quoted-symbol
-;; identity (and the type-name registry it feeds) is untouched.
-(defun %global-name-key (sym)
-  (cond
-    ((integerp sym) sym)
-    ((symbolp sym)
-     (let ((h (cond
-                ((null sym) nil) ((eq sym t) nil)
-                ((fixnump sym) nil) ((characterp sym) nil)
-                ((stringp sym) nil) ((consp sym) nil)
-                (t (let ((st (obj-subtag sym)))
-                     (if (or (= st 80) (= st 83)) (aref sym 0) nil))))))
-       (if h h (normalize-name sym))))
-    ((stringp sym) (compute-name-hash sym))
-    (t 0)))
+;; Co-init: *a64-vreg-to-phys* is a defparameter init-thunk (NOT run at boot —
+;; CLAUDE.md item 7), so populate it explicitly from %init-aarch64-translator.
+;; Values are the vreg-index → aarch64-phys-reg map from translate-aarch64.lisp
+;; (V0-V3→x0-x3, V4-V8→x19-x23, VR→x0, VA→x24, VL→x25, VN→x26, VSP→sp, VFP→x29;
+;; V9-V15 + V22 spill = nil).  Raw numbers (defconstants don't fold in-image);
+;; spill slots set to nil explicitly (aarch64 alloc-array does NOT zero-init).
+(defvar *aarch64-translator-coinit-source* "
+(defun %init-aarch64-translator ()
+  (let ((map (make-array 23)))
+    (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
+    (aset map 4 19) (aset map 5 20) (aset map 6 21) (aset map 7 22) (aset map 8 23)
+    (aset map 9 nil) (aset map 10 nil) (aset map 11 nil) (aset map 12 nil)
+    (aset map 13 nil) (aset map 14 nil) (aset map 15 nil)
+    (aset map 16 0) (aset map 17 24) (aset map 18 25) (aset map 19 26)
+    (aset map 20 31) (aset map 21 29) (aset map 22 nil)
+    (setq *a64-vreg-to-phys* map))
+  ;; *mvm-label-counter* is a (defvar … 0) whose init-thunk does NOT run at boot
+  ;; (CLAUDE.md item 7) → nil at runtime; translate-aarch64's (incf …) would
+  ;; crash.  The compiler doesn't use it, so no earlier path initialised it.
+  (when (null *mvm-label-counter*) (setq *mvm-label-counter* 0))
+  ;; CRITICAL for the JIT: *aarch64-stack-align-16* gates :push/:pop codegen.
+  ;; nil (its runtime default) emits the bare-metal `str [sp,#-8]!` / `ldr
+  ;; [sp],#8` which MISALIGNS SP to 8-mod-16 → Linux EL0 SP-alignment fault
+  ;; (SIGBUS) on the next SP access.  The normal build sets it t host-side
+  ;; (build-aarch64-linux.lisp:1445) but that doesn't reach runtime (item 7),
+  ;; so set it here for JIT-translated code.  *aarch64-linux-mode* likewise so
+  ;; any TRAP codegen emits Linux syscalls.
+  (setq *aarch64-stack-align-16* t)
+  (setq *aarch64-linux-mode* t)
+  t)
 ")
-;; Generated boot-time populator for *opcode-table* (the host *opcode-table*
-;; is populated when mvm.lisp/compiler.lisp load host-side for macro scanning).
-(defvar *opcode-table-init-source*
-  (with-output-to-string (s)
-    (format s "(defun %~A-opcode-table ()~%" "populate")
-    (maphash (lambda (code info)
-               (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
-                       code code
-                       (modus.mvm::opcode-info-name info)
-                       (modus.mvm::opcode-info-operands info)
-                       (modus.mvm::opcode-info-description info)))
-             modus.mvm::*opcode-table*)
-    (format s "  t)~%")
-    (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%")))
+
+;;; ============================================================
+;;; WS4-AA64 FLIP knob: default runtime-JIT on/off for the aarch64 image
+;;; ============================================================
+;;; Mirrors build-generic-cli.lisp's *jit-on* logic: MODUS_NO_JIT → off,
+;;; MODUS_USE_JIT → explicit, else *aarch64-jit-default*.  When ON, the wrapper
+;;; bakes *aarch64-jit-flip-source* (LAST, so its %jit-enabled-p wins over
+;;; mvm-eval.lisp's base) and kernel-main calls (%aa64-jit-boot-init), so
+;;; production mvm-eval JITs native via the Stage-5 seam.  When OFF the boot
+;;; init is an inert no-op and %jit-enabled-p stays the base (interpret) version
+;;; — byte-neutral vs pre-flip.  x64 is untouched (this is aarch64-only source).
+(defvar *aarch64-jit-default* nil
+  "Default runtime-JIT state when neither MODUS_NO_JIT nor MODUS_USE_JIT is set.
+   nil = interpret (current behavior); the knob exposes the JIT via
+   MODUS_USE_JIT=1 for validation.  The FLIP commit sets this t once the JIT-on
+   gate is proven to survive the corpus + be pass-neutral on real hardware.")
+(defvar *aarch64-jit-on*
+  (let ((no (sb-ext:posix-getenv "MODUS_NO_JIT"))
+        (v  (sb-ext:posix-getenv "MODUS_USE_JIT")))
+    (cond ((and no (> (length no) 0)) nil)
+          ((and v (> (length v) 0))
+           (or (string= v "1") (string-equal v "t") (string-equal v "yes")))
+          (t *aarch64-jit-default*))))
+(when (eq *ansi-target-arch* :aarch64)
+  (format t "~%  AArch64 runtime JIT: ~A~%" (if *aarch64-jit-on* "ON" "OFF (interpret)")))
+;; Baked LAST in *full-source* (after driver) so %jit-enabled-p wins (last-defun).
+;; %aa64-jit-boot-init runs the translator co-init (vreg map, stack-align-16,
+;; linux-mode, label counter) and selects the aarch64 JIT back-end; the Stage-5
+;; seam sets *aarch64-jit-mode* per translation itself.
+(defvar *aarch64-jit-flip-source*
+  (if *aarch64-jit-on*
+      "
+(defun %jit-enabled-p () t)
+(defun %aa64-jit-boot-init ()
+  (%init-aarch64-translator)
+  (setq *jit-target-arch* :aarch64)
+  t)
+"
+      "
+(defun %aa64-jit-boot-init () nil)
+"))
+
+
+;; The arch's translator source, assembled in image load order.  x64:
+;; instruction encoder + MVM→x64 translator + co-init.  aarch64: MVM→aarch64
+;; translator + co-init.  Spliced AFTER the compiler (the translators use
+;; modus.mvm compiler symbols like decode-instruction and the opcode constants)
+;; and the float override.  DEAD CODE — nothing calls translate-mvm-to-<arch>
+;; yet.
+;;
+;; NB: COND, deliberately, not ECASE/CASE.  SBCL's CASE family expands with a
+;; GENSYM for the key form, which advances the host *GENSYM-COUNTER* by one.
+;; That counter feeds gensym names into the auto-generated sym-name reverse
+;; table further down, so a single extra gensym here renames G322 -> G323 in the
+;; baked source and the built image stops being byte-identical to the one the
+;; pre-merge pair produced.  Keep this form gensym-free.
+(defvar *arch-translator-block*
+  (cond
+    ((eq *ansi-target-arch* :x64)
+     (concatenate 'string
+       *x64-asm-source*               (string #\Newline)
+       *translate-x64-source*         (string #\Newline)
+       *x64-translator-coinit-source* (string #\Newline)))
+    ((eq *ansi-target-arch* :aarch64)
+     (concatenate 'string
+       *translate-aarch64-source*         (string #\Newline)
+       *aarch64-translator-coinit-source* (string #\Newline)))
+    (t (error "build-ansi-common: unknown *ansi-target-arch* ~S (want :x64 or :aarch64)"
+              *ansi-target-arch*))))
 ;; The assembled self-host block, spliced into *full-source* after the bridge.
 (defvar *compiler-in-image-source*
   (concatenate 'string
@@ -284,13 +437,8 @@
     *stage2-float-override* (string #\Newline)
     *opcode-table-init-source* (string #\Newline)
     *mvm-eval-source*    (string #\Newline)
-    ;; WS4 STAGE 1: x64 instruction encoder + MVM→x64 translator + co-init.
-    ;; Loaded AFTER the compiler (translate-x64 uses modus.mvm compiler
-    ;; symbols like decode-instruction and the opcode constants) and the
-    ;; float override.  DEAD CODE — nothing calls translate-mvm-to-x64 yet.
-    *x64-asm-source* (string #\Newline)
-    *translate-x64-source* (string #\Newline)
-    *x64-translator-coinit-source* (string #\Newline)))
+    *arch-translator-block*))
+
 
 ;;; --- Gap A: symbol-function table auto-registration ---
 ;;;
@@ -4507,4 +4655,3 @@
 
 (load-ansi-chapter "/home/claude/modus/tmp/ansi-test/objects/"
   '("add-method.lsp" "allocate-instance.lsp" "call-next-method.lsp" "change-class.lsp" "class-name.lsp" "class-of.lsp" "compute-applicable-methods.lsp" "defclass-01.lsp" "defclass-02.lsp" "defclass-03.lsp" "defclass-errors.lsp" "defclass-forward-reference.lsp" "defclass.lsp" "defgeneric-method-combination-and.lsp" "defgeneric-method-combination-append.lsp" "defgeneric-method-combination-aux.lsp" "defgeneric-method-combination-list.lsp" "defgeneric-method-combination-max.lsp" "defgeneric-method-combination-min.lsp" "defgeneric-method-combination-nconc.lsp" "defgeneric-method-combination-or.lsp" "defgeneric-method-combination-plus.lsp" "defgeneric-method-combination-progn.lsp" "defgeneric.lsp" "define-method-combination-long-form.lsp" "define-method-combination.lsp" "defmethod.lsp" "ensure-generic-function.lsp" "find-class.lsp" "find-method.lsp" "load.lsp" "make-instance.lsp" "make-instances-obsolete.lsp" "make-load-form-saving-slots.lsp" "make-load-form.lsp" "method-qualifiers.lsp" "next-method-p.lsp" "no-applicable-method.lsp" "no-next-method.lsp" "reinitialize-instance.lsp" "remove-method.lsp" "shared-initialize.lsp" "slot-boundp.lsp" "slot-exists-p.lsp" "slot-makunbound.lsp" "slot-missing.lsp" "slot-unbound.lsp" "slot-value.lsp" "unbound-slot.lsp" "update-instance-for-different-class.lsp" "with-accessors.lsp" "with-slots.lsp" ))
-

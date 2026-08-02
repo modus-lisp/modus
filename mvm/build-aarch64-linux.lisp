@@ -28,10 +28,11 @@
 ;;;; Exit code: 0 = all pass, >0 = number of failures
 
 
-;;; Thin wrapper: shared harness lives in build-ansi-common-aarch64.lisp;
+;;; Thin wrapper: shared harness lives in build-ansi-common.lisp;
 ;;; only the Linux-AArch64 runner-source + build-image tail is kept here.
 (defvar *ansi-target-bare-metal* nil)
-(load (merge-pathnames "build-ansi-common-aarch64.lisp"
+(defvar *ansi-target-arch* :aarch64)
+(load (merge-pathnames "build-ansi-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 ;; Generate run-real-ansi-tests that calls all file-level runners.
 ;;

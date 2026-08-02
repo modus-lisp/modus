@@ -50,8 +50,7 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 
 | file | note |
 |---|---|
-| `build-ansi-common-x64` (4510 L) | loaded by `build-x64-linux` + `build-x64` |
-| `build-ansi-common-aarch64` (4487 L) | loaded by the two aarch64 gates |
+| `build-ansi-common` (4646 L) | loaded by all 4 gate wrappers (+ `build-aarch64-cli`); arch chosen by `*ansi-target-arch*` |
 
 These two **fail standalone by design** — they are not entry points. They are
 also ~94% identical (253 diff lines, 7 hunks); merging them is task #208.

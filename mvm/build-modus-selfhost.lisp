@@ -46,7 +46,10 @@
 (defun mvm-text (relative-path)
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (read-file-text path)))
+    ;; #211: wrap each file so its own (in-package …) cannot leak into the
+    ;; next file of the concatenated build blob.  See
+    ;; modus.mvm::*build-package-reset-text*.
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
 ;; Strip `chipz::' / `chipz:' package qualifiers from a source string so the
 ;; flat-namespace image reader doesn't error `Package CHIPZ does not exist'
@@ -201,7 +204,9 @@
     (unless pos
       (error "WS5-S1: could not find install-x64-translator strip marker"))
     (setf *translate-x64-source*
-          (subseq *translate-x64-source* 0 pos))))
+          ;; #211: re-append the package reset the trim just cut off.
+          (concatenate 'string (subseq *translate-x64-source* 0 pos)
+                       modus.mvm::*build-package-reset-text*))))
 
 ;; Translator co-init: defvar/defparameter init-thunks do NOT run at boot
 ;; (CLAUDE.md item 7), so the translator's three lookup tables (*registers*,
@@ -209,6 +214,13 @@
 ;; populated explicitly.  %init-x64-translator is called from kernel-main.
 ;; Verbatim from the WS4 recipe (build-ansi-common.lisp *x64-translator-coinit-source*).
 (defvar *x64-translator-coinit-source* "
+;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
+;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
+;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
+;; x64-asm.lisp's own *REGISTERS* — MODUS.ASM::RBP, not MODUS.MVM::RBP.  Read
+;; in MODUS.MVM this table silently mismatched and the JIT died with
+;; Unknown-register RBP, falling back to interpret for EVERY form.
+(in-package :modus.asm)
 (defun %init-x64-translator ()
   (setq *registers*
         (list (list (quote rax)  0 64 nil) (list (quote rcx)  1 64 nil)
@@ -288,6 +300,7 @@
   (setq *ws5-force-no-kindcheck* WS5_NOKCHECK_VALUE)
   (setq *linux-x64-r14-offset* #x38000000)
   t)
+(in-package :modus.mvm)
 ")
 
 ;; WS5 A/B substitution: bake t/nil into the coinit source for the kind-check

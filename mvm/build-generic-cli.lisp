@@ -46,7 +46,10 @@
 (defun mvm-text (relative-path)
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (read-file-text path)))
+    ;; #211: wrap each file so its own (in-package …) cannot leak into the
+    ;; next file of the concatenated build blob.  See
+    ;; modus.mvm::*build-package-reset-text*.
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
 ;; Strip `chipz::' / `chipz:' package qualifiers from a source string so the
 ;; flat-namespace image reader doesn't error `Package CHIPZ does not exist'
@@ -209,7 +212,11 @@
           (marker "(defun install-x64-translator"))
       (let ((pos (search marker src)))
         (unless pos (error "WS5-JIT: could not find install-x64-translator strip marker"))
-        (subseq src 0 pos)))))
+        ;; #211: the trim drops mvm-text's trailing package reset with the
+        ;; tail, so re-append it — the next chunk concatenated after this one
+        ;; (*jit-coinit-source*) must not read in MODUS.MVM.X64.
+        (concatenate 'string (subseq src 0 pos)
+                     modus.mvm::*build-package-reset-text*)))))
 ;; Co-init that populates the translator's defvar lookup tables at boot AND sets
 ;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
 ;; installs (build-ansi-common.lisp *x64-translator-coinit-source*), plus a
@@ -219,6 +226,13 @@
 ;; default (NIL) and emit gc-checks/trampoline inconsistently with the baked code.
 (defvar *jit-coinit-source*
   (when *jit-on* "
+;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
+;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
+;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
+;; x64-asm.lisp's own *REGISTERS* — MODUS.ASM::RBP, not MODUS.MVM::RBP.  Read
+;; in MODUS.MVM this table silently mismatched and the JIT died with
+;; Unknown-register RBP, falling back to interpret for EVERY form.
+(in-package :modus.asm)
 (defun %init-x64-translator ()
   (setq *registers*
         (list (list (quote rax)  0 64 nil) (list (quote rcx)  1 64 nil)
@@ -277,6 +291,7 @@
   (setq *linux-x64-r14-offset* #x38000000)
   (setq *jit-xlate-err-info* nil)
   t)
+(in-package :modus.mvm)
 "))
 
 ;; Baked boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins over

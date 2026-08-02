@@ -37,7 +37,10 @@
 (defun mvm-text (relative-path)
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (read-file-text path)))
+    ;; #211: wrap each file so its own (in-package …) cannot leak into the
+    ;; next file of the concatenated build blob.  See
+    ;; modus.mvm::*build-package-reset-text*.
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
 (format t "Reading source files...~%")
 

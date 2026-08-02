@@ -1393,7 +1393,33 @@
    Reader errors SKIP to the next line and continue — needed for ANSI
    test fixtures that contain platform-specific reader syntax (`#<`
    etc.) the SBCL reader rejects. First-party sources should be
-   verified via CHECK-PARSES first (see that function's docstring)."
+   verified via CHECK-PARSES first (see that function's docstring).
+
+   PACKAGE TRACKING (#211).  A file's own (in-package …) is honoured, the
+   way a real loader does, so SYMBOL-PACKAGE is authoritative for every
+   symbol and not just for explicitly-qualified ones.  That is the
+   prerequisite for folding the package into the function-table key (and
+   so for letting two build-baked packages define the same name — the
+   ceiling behind #210).
+
+   THE SWITCH IS STICKY, AND THAT IS WHY IT NEEDS ITS PARTNER CHANGE.  This
+   function binds *package* once around the WHOLE source text, and the gate
+   build hands it the entire ~17.7 MB CONCATENATED blob — not one file at a
+   time.  So an (in-package …) inside one file would otherwise change the
+   read package for everything after it (the harness, the driver, the whole
+   ANSI corpus), and nothing would switch back, because corpus files carry
+   no in-package of their own.  Measured cost of that leak: NET −23, with
+   %loop-parse-cond-clauses binding MODUS.MVM::IT while the corpus read
+   MODUS.ASM::IT, so `COLLECT IT` silently became a free variable
+   (env-lookup compares binding names with EQUAL on the SYMBOL).  MVM-TEXT
+   closes it by wrapping every file's text in %BUILD-PACKAGE-RESET-TEXT, so
+   each file both starts and ends in :MODUS.MVM.  Do not land one of these
+   two changes without the other.
+
+   The FIND-PACKAGE guard keeps this lenient: an unknown package name
+   leaves *package* untouched rather than erroring, which matters because
+   this same reader ingests ANSI fixtures whose packages need not exist
+   host-side."
   (let ((forms nil)
         (lines nil)
         (line-count 1)
@@ -1414,9 +1440,50 @@
                           :skip))))
             (when (eq form :eof) (return))
             (unless (eq form :skip)
+              ;; Honour (in-package …) — see this function's docstring for why
+              ;; the FIND-PACKAGE guard and MVM-TEXT's per-file reset are both
+              ;; load-bearing.  Compared by NAME, not by symbol identity: the
+              ;; form was just read in whatever package is current, so
+              ;; (car form) is not EQ to CL:IN-PACKAGE in general.
+              (when (and (consp form)
+                         (symbolp (car form))
+                         (string= (symbol-name (car form)) "IN-PACKAGE")
+                         (cdr form))
+                (let ((pkg (find-package (string (cadr form)))))
+                  (when pkg (setq *package* pkg))))
               (push form forms)
               (push line-count lines))))))
     (cons (nreverse forms) (coerce (nreverse lines) 'vector))))
+
+;;; ------------------------------------------------------------------
+;;; Per-file read-package reset (#211)
+;;; ------------------------------------------------------------------
+
+(defvar *build-package-reset-text* "(in-package :modus.mvm)"
+  "The reset MVM-TEXT wraps around every first-party source file's text.
+
+   READ-ALL-FORMS-WITH-LOCATIONS honours (in-package …), but it is handed
+   the whole CONCATENATED build blob, so a declaration inside one file
+   would leak into every file after it — the corpus files carry no
+   in-package to switch back.  Wrapping each file makes its text hermetic:
+   it begins in :MODUS.MVM whatever the previous file left behind, and it
+   ends in :MODUS.MVM whatever it declared itself.
+
+   The compiler treats IN-PACKAGE as a build-time no-op (compiler.lisp,
+   'package system is SBCL-side only'), so these cost nothing in the
+   compiled output.  The leading copy carries NO trailing newline and the
+   trailing copy NO leading one, so the blob's newline count — and hence
+   every reported source line — is unchanged.
+
+   NOTE for any build script that TRIMS an mvm-text result (the
+   install-x64-translator tail strip, etc.): the trailing reset is cut off
+   with the tail, so re-append this after the SUBSEQ.")
+
+(defun %build-package-scoped-source (text)
+  "Wrap TEXT so it reads hermetically in :MODUS.MVM.  See
+   *BUILD-PACKAGE-RESET-TEXT*.  MVM-TEXT (seven build scripts) is the only
+   caller; keep them identical."
+  (concatenate 'string *build-package-reset-text* text *build-package-reset-text*))
 
 (defun check-parses (path)
   "Verify PATH reads cleanly with SBCL's reader — errors loudly otherwise.

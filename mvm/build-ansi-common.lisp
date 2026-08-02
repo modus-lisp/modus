@@ -58,7 +58,10 @@
    of getting silently skipped later during the concatenated compile."
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (read-file-text path)))
+    ;; #211: wrap each file so its own (in-package …) cannot leak into the
+    ;; next file of the concatenated build blob.  See
+    ;; modus.mvm::*build-package-reset-text*.
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
@@ -235,7 +238,9 @@
       (unless pos
         (error "WS4-S1: could not find install-x64-translator strip marker"))
       (setf *translate-x64-source*
-            (subseq *translate-x64-source* 0 pos)))))
+            ;; #211: re-append the package reset the trim just cut off.
+            (concatenate 'string (subseq *translate-x64-source* 0 pos)
+                         modus.mvm::*build-package-reset-text*)))))
 
 ;;; --- AArch64: MVM→aarch64 translator (read + trim) ---
 (when (eq *ansi-target-arch* :aarch64)
@@ -256,7 +261,10 @@
   (let ((marker "(defun install-aarch64-translator"))
     (let ((pos (search marker *translate-aarch64-source*)))
       (unless pos (error "WS4-AA64-S1: could not find install-aarch64-translator strip marker"))
-      (setf *translate-aarch64-source* (subseq *translate-aarch64-source* 0 pos)))))
+      ;; #211: re-append the package reset the trim just cut off.
+      (setf *translate-aarch64-source*
+            (concatenate 'string (subseq *translate-aarch64-source* 0 pos)
+                         modus.mvm::*build-package-reset-text*)))))
 
 ;; Co-init source (appended AFTER the translator so it wins last-defun).
 ;; defparameter/defvar init-thunks are NOT run at boot (CLAUDE.md item 7),
@@ -267,6 +275,13 @@
 ;; translator quotes them, so per-package interning makes them EQ to the keys
 ;; the translator's reg-info / vreg-phys / emit-jcc compare against.
 (defvar *x64-translator-coinit-source* "
+;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
+;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
+;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
+;; x64-asm.lisp's own *REGISTERS* — MODUS.ASM::RBP, not MODUS.MVM::RBP.  Read
+;; in MODUS.MVM this table silently mismatched and the JIT died with
+;; Unknown-register RBP, falling back to interpret for EVERY form.
+(in-package :modus.asm)
 (defun %init-x64-translator ()
   ;; *registers* — (name code size needs-rex-low-byte); 64-bit GPRs only
   ;; (the translator emits only 64-bit ops for the trivial-form path).
@@ -327,6 +342,7 @@
   ;; Linux syscalls for any TRAP (not exercised by the trivial-form probe).
   (setq *x64-linux-mode* t)
   t)
+(in-package :modus.mvm)
 ")
 ;; Co-init: *a64-vreg-to-phys* is a defparameter init-thunk (NOT run at boot —
 ;; CLAUDE.md item 7), so populate it explicitly from %init-aarch64-translator.

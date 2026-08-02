@@ -37,7 +37,10 @@
    late-cond-branch."
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (read-file-text path)))
+    ;; #211: wrap each file so its own (in-package …) cannot leak into the
+    ;; next file of the concatenated build blob.  See
+    ;; modus.mvm::*build-package-reset-text*.
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
 (format t "Reading source files...~%")
 
@@ -69,7 +72,9 @@
     (format t "  Stripping at position ~A (of ~D)~%" pos (length *translate-x64-source*))
     (when pos
       (setf *translate-x64-source*
-            (subseq *translate-x64-source* 0 pos)))))
+            ;; #211: re-append the package reset the trim just cut off.
+            (concatenate 'string (subseq *translate-x64-source* 0 pos)
+                         modus.mvm::*build-package-reset-text*)))))
 
 ;; Combine x64-asm + translate-x64 (preprocessed)
 (defvar *x64-source-text*
@@ -315,6 +320,13 @@
     (aset s 6 p-gc-label)
     s))
 
+;; #211: read this replica in :MODUS.ASM, the package x64-asm.lisp itself
+;; declares.  The image interns symbols PER PACKAGE (CLHS 11.1.2), so a
+;; register name quoted here must be the SAME symbol reg-info's ASSOC sees in
+;; x64-asm.lisp's own *REGISTERS* — MODUS.ASM::RBP, not MODUS.MVM::RBP.  Read
+;; in MODUS.MVM this table silently mismatched and the JIT died with
+;; Unknown-register RBP, falling back to interpret for EVERY form.
+(in-package :modus.asm)
 ;;; Manual init for *vreg-to-x64* (can't use vector literal on bare metal)
 (defun init-vreg-to-x64-manual ()
   (let ((v (make-array 23)))
@@ -350,6 +362,7 @@
     (setq cc (cons (cons (quote no) 1) cc))
     (setq cc (cons (cons (quote o)  0) cc))
     (setq *condition-codes* cc)))
+(in-package :modus.mvm)
 
 
 ;;; Blob reader: uses addresses in Linux BSS area (not bare-metal 0x390000)

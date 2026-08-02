@@ -97,17 +97,59 @@
 ;; a BEHAVIOURAL probe (the doubling above), not a counter readback, to confirm
 ;; which mode you are in.  For a durable JIT-on image, rebuild with
 ;; MODUS_USE_JIT=1.
-;; Re-flip the default only after the re-execution cluster above is fixed AND a
-;; probe covers define-in-one-form / use-in-a-later-form with side effects.
+;; ---------------------------------------------------------------------------
+;; WS5 #206/#207 (2026-08-02): the default is ON AGAIN.  Both defects above are
+;; FIXED at the root, and the re-flip condition stated in the paragraph above —
+;; "the re-execution cluster is fixed AND a probe covers define-in-one-form /
+;; use-in-a-later-form with side effects" — is satisfied by
+;; tests/runtime-metric.lisp, which is exactly that probe.
+;;
+;; Two independent root causes, both in the JIT's handling of a HEAP CLOSURE:
+;;
+;;  1. #206, the duplication.  A runtime-defined function is a heap closure
+;;     (word nibble 9), not native code (nibble 3), and the call relocation
+;;     patched its heap address in as a native call target.  The heap has no
+;;     PROT_EXEC, so the branch faulted MID-EXECUTION and the fallback re-ran
+;;     the whole form.  Fixed by requiring the FN tag before patching: a
+;;     non-tag-3 callee now fails the reloc, fails the page build, and the form
+;;     is interpreted ONCE.  (aec8341 / 3b9b4a4.)
+;;  2. #207, aarch64-only, why "C=" and "D=" repeated unboundedly above.
+;;     In-module +op-fn-addr+ emitted a MOVZ/MOVK PLACEHOLDER patched by
+;;     apply-aarch64-fn-addr-patches AFTER image assembly — which the runtime
+;;     JIT never runs.  So every JIT-built closure got slot 0 = literal 0 and
+;;     trapped in +op-call-ind+ before its body.  Fixed by emitting a full
+;;     4-instruction quad under *aarch64-jit-mode* and relocating it at
+;;     page-build time.  (21347e4.)  x64 was structurally immune: its
+;;     in-module fn-addr is PC-relative LEA + OR-3, nothing to patch.
+;;
+;; GATE — tests/runtime-metric.lisp with the JIT ON, vs SBCL: EMPTY DIFF, all
+;; 16 checks, form-ran-once=1, on BOTH aarch64 and x64.  ANSI: 64-shard NET
+;; BASE 17476 / NET 17475 with CHUNK-CRASH 0=0 and FILE-WEDGE 30=30; the lone
+;; -1 passes 3/3 on both binaries in isolation (shard-truncation noise).
+;; See GATE-RESULT-206-207.md.
+;;
+;; The behavioural-probe lesson above STILL APPLIES and is why this flip is
+;; trustworthy: it was validated with runtime-metric's form-ran-once, not with
+;; a counter readback (still UNBOUND at runtime) and not with value-only checks
+;; (which scored a twice-run form as a pass, and is what let #199 through).
+;;
+;; Rollback: MODUS_NO_JIT=1 or MODUS_USE_JIT=0 at BUILD time.
+;; ---------------------------------------------------------------------------
+;; One place decides, so the baked default and the banner cannot disagree —
+;; they were two copies of the same env test before.  MODUS_NO_JIT is honoured
+;; here too now, matching build-generic-cli.lisp's knob set exactly.
+(defvar *cli-jit-on-p*
+  (let ((no #+sbcl (sb-ext:posix-getenv "MODUS_NO_JIT")  #-sbcl nil)
+        (on #+sbcl (sb-ext:posix-getenv "MODUS_USE_JIT") #-sbcl nil))
+    (cond ((and no (> (length no) 0)) nil)                    ; explicit rollback
+          ((and on (> (length on) 0)) (not (string= on "0"))) ; explicit
+          (t t))))                                            ; DEFAULT: JIT ON
 (defvar *cli-jit-default-source*
-  (format nil "(defun %~A-jit-default () ~A)~%" "cli"
-          (if (let ((on #+sbcl (sb-ext:posix-getenv "MODUS_USE_JIT") #-sbcl nil))
-                (and on (> (length on) 0) (not (string= on "0"))))
-              "t" "nil")))
+  (format nil "(defun %~A-jit-default () ~A)~%" "cli" (if *cli-jit-on-p* "t" "nil")))
 (format t "  CLI default runtime JIT: ~A~%"
-        (if (let ((on #+sbcl (sb-ext:posix-getenv "MODUS_USE_JIT") #-sbcl nil))
-              (and on (> (length on) 0) (not (string= on "0"))))
-            "ON (MODUS_USE_JIT)" "OFF (#199 flip reverted, WS5 #203)"))
+        (if *cli-jit-on-p*
+            "ON (default since WS5 #206/#207; MODUS_NO_JIT=1 to disable)"
+            "OFF (MODUS_NO_JIT / MODUS_USE_JIT=0)"))
 
 ;;; ============================================================
 ;;; Linux/AArch64 file-I/O syscall overrides

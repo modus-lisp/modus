@@ -439,10 +439,19 @@
             (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
           (setq k (+ k 1)))
         ;; Out-of-module CALL relocations (untagged callee addr = word-3).
+        ;; WS5 #206: the callee must carry the FN tag — see %jit-reloc-calls for
+        ;; the full account.  A RUNTIME-defined function (a defun evaluated by an
+        ;; earlier top-level form) is a HEAP CLOSURE, tag 9, and the heap has no
+        ;; PROT_EXEC; branching to it faults mid-execution and the fallback then
+        ;; re-runs the form, duplicating its side effects.  The tag test is
+        ;; arch-independent (cons=1/fn=3/char=5/obj=9 are disjoint everywhere),
+        ;; so aarch64 needs exactly the same guard as x64 — this is the same
+        ;; defect, not a port of an x64-specific workaround.
         (dolist (r crel)
           (let* ((name (gethash (cdr r) rt-table))
                  (fn (and name (%mvm-resolve-runtime-fn name)))
-                 (addr (if fn (- (%val->word fn) 3) 0)))
+                 (word (if fn (%val->word fn) 0))
+                 (addr (if (eql (logand word 15) 3) (- word 3) 0)))
             (if (> addr 0) (%jit-write-movz-quad base (car r) addr) (setq ok nil))))
         ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
         (dolist (r frel)

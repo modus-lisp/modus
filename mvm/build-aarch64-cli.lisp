@@ -355,10 +355,17 @@
             (setf (mem-ref (+ base (+ o 3)) :u8) (logand (ash w -24) 255)))
           (setq k (+ k 1)))
         ;; Out-of-module CALL relocations (untagged callee addr = word-3).
+        ;; WS5 #206: require the FN tag, matching the production path in
+        ;; mvm-eval.lisp's %jit-translate-page-1-aarch64.  A RUNTIME-defined
+        ;; callee is a heap closure (tag 9) and the heap has no PROT_EXEC.
+        ;; This is a validation probe, so it MUST reject exactly what production
+        ;; rejects — a probe that relocates more permissively than the code it
+        ;; is validating reports success for cases that fault in production.
         (dolist (r crel)
           (let* ((name (gethash (cdr r) rt-table))
                  (fn (and name (%mvm-resolve-runtime-fn name)))
-                 (addr (if fn (- (%val->word fn) 3) 0)))
+                 (word (if fn (%val->word fn) 0))
+                 (addr (if (eql (logand word 15) 3) (- word 3) 0)))
             (if (> addr 0) (%jit-patch-quad base (car r) addr) (setq ok nil))))
         ;; Out-of-module #'NAME fn-addr relocations (full TAGGED fn word).
         (dolist (r frel)

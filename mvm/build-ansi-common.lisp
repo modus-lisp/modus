@@ -409,12 +409,20 @@
 ;; and the float override.  DEAD CODE — nothing calls translate-mvm-to-<arch>
 ;; yet.
 ;;
-;; NB: COND, deliberately, not ECASE/CASE.  SBCL's CASE family expands with a
-;; GENSYM for the key form, which advances the host *GENSYM-COUNTER* by one.
-;; That counter feeds gensym names into the auto-generated sym-name reverse
-;; table further down, so a single extra gensym here renames G322 -> G323 in the
-;; baked source and the built image stops being byte-identical to the one the
-;; pre-merge pair produced.  Keep this form gensym-free.
+;; COND rather than ECASE only because SBCL's CASE family expands with a
+;; gensym, which advances the host *GENSYM-COUNTER* and renames a gensym in the
+;; auto-generated sym-name table — enough to break the byte-identity check used
+;; to prove the #208 merge was a null change.  The `t` clause below keeps
+;; ECASE's error on an unknown arch, so nothing was traded for it.
+;;
+;; DO NOT generalise this into a rule.  It is a MEASUREMENT convenience, not a
+;; correctness property: byte-identity is the cheapest proof that a pure
+;; refactor changed nothing, and it is worth having ONLY while it is free.
+;; Abandon it the moment it would cost a line of clarity — or a gensym where
+;; hygiene actually needs one — and fall back to the ANSI gate.  Layout shift by
+;; itself does not break tests; the MODUS_FUZZ_FUNCALL_NOPS sweep (~50K
+;; perturbation sites, 8000 tests) produced zero diff.  See CLAUDE.md
+;; "Layout shift broke an unrelated test — it almost never did".
 (defvar *arch-translator-block*
   (cond
     ((eq *ansi-target-arch* :x64)

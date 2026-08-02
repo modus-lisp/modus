@@ -31,7 +31,8 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 | script | arch | board | BUILD |
 |---|---|---|---|
 | `build-x64` | x64 | multiboot QEMU — **bare ANSI gate** | OK |
-| `build-x64-repl` / `-ssh` / `-console-repl` | x64 | multiboot QEMU | OK |
+| `build-x64-cl-repl` | x64 | multiboot QEMU — **bare metal running the REAL CL** (#204); boots, evaluates, one known gap (global var READ — see its header) | OK |
+| `build-x64-repl` / `-ssh` / `-console-repl` | x64 | multiboot QEMU (second Lisp) | OK |
 | `build-aarch64` | aarch64 | QEMU virt — **bare ANSI gate** | OK |
 | `build-aarch64-repl` / `-ssh` / `-actors` / `-isolated` | aarch64 | QEMU virt (E1000) | OK |
 | `build-i386-repl` / `-ssh` / `-diag-ssh` | i386 | QEMU + T420 | OK |
@@ -83,6 +84,13 @@ The 12 failures are NOT 12 atrophied scripts. By actual cause:
   enforcing it.
 - **Do**: retire `repl-source.lisp` (#204). Note the whole broken RPi family
   builds `*repl-source*` — the second Lisp and the broken cell overlap heavily.
+  Step 1 has landed: `build-x64-cl-repl` is a bare-metal multiboot image whose
+  REPL is the real CL (reader + `eval` = mvm-eval + printer) over COM1, with
+  `lib/serial-repl.lisp` as the bare-metal counterpart of `lib/cli-toplevel.lisp`.
+  It is the replacement target for `build-x64-repl` and `build-x64-console-repl`.
+  Also worth knowing: `build-generic-cli` and `build-ansi-common-x64` still
+  `(mvm-load "mvm/repl-source.lisp")` but never reference `*repl-source*` — two
+  of the 24 "bakes the second Lisp" scripts are vestigial loads, not bakes.
 - **Don't**: merge the three CLI builds. Measured overlap of non-comment lines
   is `generic∩aa64 64`, `generic∩i386 193`, `aa64∩i386 72`, **all three 35** —
   they are genuinely different bring-ups, and the shared parts were already

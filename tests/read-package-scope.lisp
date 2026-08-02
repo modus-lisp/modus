@@ -135,6 +135,68 @@
        (coerce (subseq wrapped-lines 1 4) 'list)
        (coerce raw-lines 'list)))
 
+;;; ---------------------------------------------------------------
+;;; (E) THE ENABLING PROPERTY — what the switch actually buys.
+;;;
+;;; DEFINE-REGISTERS, the one directly observable win the earlier attempts
+;;; cited, was deleted as vestigial on main (b26e5f4), so there is no longer a
+;;; user-visible behaviour that flips.  What remains is the property #210 needs:
+;;; two build-baked files that declare different packages now produce
+;;; DISTINGUISHABLE (package, name) pairs for the same name.  Before this
+;;; change both read as the single symbol MODUS.MVM::SAME-NAME and the pair was
+;;; indistinguishable — which is exactly why the function table could only ever
+;;; be keyed on the bare name.
+;;; ---------------------------------------------------------------
+(let* ((blob (concatenate 'string
+                          (wrapped "(in-package :modus.asm)
+(defun same-name () 1)
+")
+                          (string #\Newline)
+                          (wrapped "(in-package :modus.mvm.x64)
+(defun same-name () 2)
+")))
+       (defuns (remove-if-not (lambda (f)
+                                (and (consp f) (symbolp (car f))
+                                     (string= (symbol-name (car f)) "DEFUN")))
+                              (forms-of blob)))
+       (a (cadr (first defuns)))
+       (b (cadr (second defuns))))
+  (chk "E: same NAME in both" (list (symbol-name a) (symbol-name b))
+       (list "SAME-NAME" "SAME-NAME"))
+  (chk "E: different PACKAGE" (list (pkg-of a) (pkg-of b))
+       (list "MODUS.ASM" "MODUS.MVM.X64"))
+  (chk "E: therefore not the same symbol — a (package,name) key can tell them
+        apart, which a bare-name key cannot"
+       (eq a b) nil))
+
+;;; ---------------------------------------------------------------
+;;; (F) the same property on a REAL first-party file rather than a fixture.
+;;; mvm/x64-asm.lisp declares :modus.asm; read as the build reads it, its
+;;; unqualified symbols must now land there.
+;;; ---------------------------------------------------------------
+(let* ((path (merge-pathnames "../mvm/x64-asm.lisp" *load-truename*))
+       (text (with-open-file (s path)
+               (let ((buf (make-string (file-length s))))
+                 (subseq buf 0 (read-sequence buf s)))))
+       (forms (forms-of (wrapped text)))
+       (reg-info (find-if (lambda (f)
+                            (and (consp f) (symbolp (car f))
+                                 (string= (symbol-name (car f)) "DEFUN")
+                                 (string= (symbol-name (cadr f)) "REG-INFO")))
+                          forms)))
+  (chk "F: x64-asm.lisp's REG-INFO interns in MODUS.ASM"
+       (pkg-of (cadr reg-info)) "MODUS.ASM")
+  ;; …and the wrap still restores MODUS.MVM afterwards, on a 3000-line real file.
+  (let* ((blob (concatenate 'string (wrapped text) (string #\Newline)
+                            "(defun after-x64-asm () nil)"))
+         (tail (find-if (lambda (f)
+                          (and (consp f) (symbolp (car f))
+                               (string= (symbol-name (car f)) "DEFUN")
+                               (string= (symbol-name (cadr f)) "AFTER-X64-ASM")))
+                        (forms-of blob))))
+    (chk "F: and the next chunk is back in MODUS.MVM"
+         (pkg-of (cadr tail)) "MODUS.MVM")))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

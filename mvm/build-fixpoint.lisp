@@ -89,7 +89,16 @@
     (dolist (file *mvm-source-files*)
       (let ((path (merge-pathnames file *modus-base*)))
         (format t "  ~A~%" file)
-        (write-string (read-file-text path) s)
+        ;; #211: this list is the one place a build concatenates first-party
+        ;; files WITHOUT going through MVM-TEXT, and three of them declare their
+        ;; own package (x64-asm = MODUS.ASM, translate-x64 = MODUS.MVM.X64,
+        ;; translate-i386 = MODUS.MVM.I386).  The reader honours those now, so
+        ;; wrap each one the same way MVM-TEXT does or the declaration leaks
+        ;; into every file after it (translate-arm32, cross, the boot
+        ;; descriptors, and the whole *fixpoint-source* tail).
+        (write-string (modus.mvm::%build-package-scoped-source
+                       (read-file-text path))
+                      s)
         (terpri s)))))
 
 ;;; ============================================================
@@ -210,8 +219,11 @@
 
 (in-package :modus.mvm)
 
-;; Forward x64-asm bindings so defmacro bodies can access them at expansion time
-;; (x64-asm.lisp source is read in modus.mvm package, so *registers* resolves here)
+;; Forward x64-asm bindings so defmacro bodies can access them at expansion time.
+;; #211 note: x64-asm.lisp's source is now read in MODUS.ASM (its own
+;; declaration) rather than MODUS.MVM, so its own references resolve to
+;; MODUS.ASM::*REGISTERS* directly.  This host-side forward is kept for any
+;; build-time expansion that still names the symbol unqualified in MODUS.MVM.
 (defparameter *registers* modus.asm::*registers*)
 
 ;; Install translators

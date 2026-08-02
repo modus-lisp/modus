@@ -3851,7 +3851,21 @@
               ;; handle the unmodified test forms.
               )
             (let ((out (make-string-output-stream)) (test-forms nil) (init-forms nil))
-              (format out "~%;; === ~A ===~%" file)
+              ;; #211: start every corpus FILE's section in :MODUS.MVM.  The
+              ;; build reader honours (in-package …) now, and the corpus DOES
+              ;; contain one — load.lsp is emitted verbatim and carries
+              ;; `(IN-PACKAGE "CL-TEST")` at top level.  Read on one 17.7 MB
+              ;; concatenated blob that switch is STICKY: every file after
+              ;; load.lsp read in CL-TEST, so `COLLECT IT` in defun.lsp bound
+              ;; CL-TEST::IT against the LOOP expander's MODUS.MVM::IT and
+              ;; silently became a free variable (measured: loop14 −16,
+              ;; structures-03 −5, macrolet −2).  Same per-file containment
+              ;; MVM-TEXT applies to first-party sources — see
+              ;; modus.mvm::*build-package-reset-text*.  NOT an allow-list: the
+              ;; declaring file still reads in its own package, it just cannot
+              ;; leak into the next one.
+              (format out "~%;; === ~A ===~%~A~%" file
+                      modus.mvm::*build-package-reset-text*)
 (dolist (form forms)
                 (cond
                   ((and (consp form) (eq (car form) 'deftest))
@@ -4266,6 +4280,9 @@
                     (setf *e2diff-sources*
                           (concatenate 'string *e2diff-sources*
                                        (get-output-stream-string e2out))))))
+              ;; #211: close the section in :MODUS.MVM too, so the harness
+              ;; driver text concatenated after the last file is unaffected.
+              (format out "~%~A~%" modus.mvm::*build-package-reset-text*)
               (setf *real-ansi-sources*
                     (concatenate 'string *real-ansi-sources*
                                  (get-output-stream-string out)))

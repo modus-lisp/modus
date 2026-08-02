@@ -180,12 +180,31 @@
       (r8b  8 8 t)    (r9b  9 8 t)    (r10b 10 8 t)   (r11b 11 8 t)
       (r12b 12 8 t)   (r13b 13 8 t)   (r14b 14 8 t)   (r15b 15 8 t))))
 
-;; Define register symbols
-(defmacro define-registers ()
-  `(progn
-     ,@(mapcar (lambda (r) `(defconstant ,(first r) ',(first r)))
-               *registers*)))
-(define-registers)
+;; NO register-symbol DEFCONSTANTs here, deliberately.  There used to be a
+;; DEFINE-REGISTERS macro expanding to `(defconstant rax 'rax)` … one per row
+;; above — 48 constants named RAX…R15, EAX…R15D and AL BL CL DL SPL BPL SIL DIL.
+;; Nothing ever read them: every register in this encoder, in translate-x64.lisp
+;; and in translate-i386.lisp is written QUOTED ('rax) or lives inside a quoted
+;; list ('(rax rdx r8)), and the in-image translator gets its table from
+;; %init-x64-translator's (quote rax) forms.  They were dead weight.
+;;
+;; Dead weight with teeth, because the image has a FLAT, NAME-HASHED namespace:
+;; the compiler's *constants* table is keyed by (compute-name-hash "DL"), so a
+;; DEFCONSTANT of MODUS.ASM::DL registers the name DL for every unit compiled
+;; after this file, whatever package it was read in — and DL, AL, BL, CL, R8…R15
+;; are ordinary local variable names all over first-party source (cl-printer's
+;; %fmt-integer digit list, cl-eval's bignum compare, cl-reader's dispatch list,
+;; the X25519 field-arithmetic limbs r0…r9 in net/*).  Today x64-asm.lisp is
+;; baked AFTER those files so none of them are exposed, but that is an ordering
+;; accident, not a guarantee.
+;;
+;; The expansion also used to FAIL at build time (the build read this file in
+;; MODUS.MVM, splitting *REGISTERS* from the macro's reference, so the build
+;; printed "WARN macroexpand DEFINE-REGISTERS failed" and emitted a runtime-error
+;; stub).  That failure was load-bearing: it is why the collision never fired.
+;; Deleting the macro removes the hazard instead of relying on the accident.
+;; If a bare register symbol is ever genuinely wanted, quote it — do not
+;; reintroduce image-wide constants for 48 two-letter names.  See task #211.
 
 (defun reg-info (reg)
   (or (assoc reg *registers*)

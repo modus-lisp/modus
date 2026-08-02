@@ -27,28 +27,43 @@
 ;;;; => 3; a DEFUN in one top-level form called from a later one ((f 21) => 42);
 ;;;; a DEFMACRO — plain and backquoted — defined in one form and used in a later
 ;;;; one; multi-line forms; MAPCAR over a LAMBDA; FORMAT to a string stream;
-;;;; error recovery ((car 5) => TYPE-ERROR, REPL continues).
+;;;; error recovery ((car 5) => TYPE-ERROR, REPL continues); reading a
+;;;; GLOBAL/special variable by name (*n* => 41, *print-base* => 10);
+;;;; (defparameter *g* (lambda (a b) (+ a b))) + (funcall *g* 20 22) => 42.
 ;;;;
-;;;; KNOWN GAP — reading a GLOBAL/special variable by name fails:
+;;;; FIXED (task #212) — reading a GLOBAL by name used to fail:
 ;;;;     (defparameter *n* 41)   =>  *N*
 ;;;;     (symbol-value '*n*)     =>  41          ; the binding is really there
 ;;;;     *n*                     =>  PROGRAM-ERROR
-;;;; It is a COMPILE-time failure inside the in-image compiler's
-;;;; COMPILE-VARIABLE-REF, not a runtime one: (if nil *n* 7) fails too, and no
-;;;; handler-case clause can catch it because the form never runs.  It hits
-;;;; built-in globals as well (*print-base*), so it is not about implicit
-;;;; registration.  Every ingredient of that code path works when called
-;;;; directly from this REPL — (symbol-name '*n*) => "*N*", (normalize-name
-;;;; '*n*) => 390483305, (%global-name-key '*n*) => 390483305,
-;;;; (gethash 1 (symbol-value '*constants*) 'dflt) => DFLT,
-;;;; (%e2-symbol-value-checked (compute-name-hash "*N*") '*n*) => 41 — each
-;;;; returning the SAME value the hosted CLI returns.  The hosted image
-;;;; (build-generic-cli, MODUS_NO_JIT=1, same compiler source) compiles the same
-;;;; reference fine, so this is bare-metal-specific.  Note that nothing else
-;;;; exercises it: the bare ANSI gate's E2SMOKE only does arithmetic, LET and
-;;;; DEFUN through mvm-eval, so a global READ through mvm-eval has never run on
-;;;; bare metal before this image.  Next step is to instrument
-;;;; COMPILE-VARIABLE-REF's branches with serial markers.
+;;;; It was a COMPILE-time failure ((if nil *n* 7) failed too, and no
+;;;; handler-case could catch it — HANDLER-CASE's own expansion references
+;;;; *CATCH-ACTIVE* / *CURRENT-CONDITION*, so it failed to compile as well).
+;;;; The cause was NOT in the global-read codegen at all.  The in-image
+;;;; *GLOBALS* registry is empty at the start of every compilation unit, so
+;;;; EVERY free-variable reference — user or built-in — falls to
+;;;; COMPILE-VARIABLE-REF's last `t' arm, whose first act is
+;;;;     (format *error-output* "~&  WARN: implicit global ~A~%" name)
+;;;; and on bare metal *ERROR-OUTPUT* was an UNWRITABLE Linux fd-2 stream (see
+;;;; the comment at the (setq *error-output* …) in KERNEL-MAIN below).  The
+;;;; format signalled before the compiler ever emitted the read.  Ruled out
+;;;; along the way, each verified from this REPL and matching the hosted CLI:
+;;;; (symbol-name '*n*) => "*N*", (normalize-name '*n*) => 390483305,
+;;;; (%global-name-key '*n*) => 390483305, 3-arg GETHASH with a default on
+;;;; *CONSTANTS*, and (%e2-symbol-value-checked (%global-name-key '*n*) '*n*)
+;;;; => 41 — i.e. the whole %e2-symbol-value-checked path the arm emits.
+;;;; Nothing else had ever exercised it: the bare ANSI gate's E2SMOKE only does
+;;;; arithmetic, LET and DEFUN through mvm-eval, so a global READ through
+;;;; mvm-eval had never run on bare metal before this image.
+;;;;
+;;;; REMAINING WART (shared with the hosted CLI, not bare-metal-specific): that
+;;;; "WARN: implicit global" line is emitted for names that ARE bound — the
+;;;; compiler's own *GLOBALS* table is per-compilation-unit and starts empty in
+;;;; the image, so a REPL that evaluates one form at a time re-warns for every
+;;;; global it reads.  Harmless (it is a diagnostic on *error-output*), but on
+;;;; bare metal stderr IS the console, so it interleaves with REPL output.
+;;;; Silencing it correctly means teaching COMPILE-VARIABLE-REF not to call a
+;;;; runtime-bound special an "implicit global", which is a change to the SHARED
+;;;; mvm/compiler.lisp and therefore needs the 64-shard ANSI gate.
 ;;;;
 ;;;; Usage: sbcl --dynamic-space-size 4096 --script mvm/build-x64-cl-repl.lisp
 ;;;; Run:   qemu-system-x86_64 -kernel /tmp/modus-x64-cl-repl.bin -m 512 \
@@ -642,6 +657,31 @@
   (init-keyword-table)
   (%init-packages)
   (%init-streams)
+  ;; BARE METAL HAS NO FILE DESCRIPTORS.  %init-streams (cl-streams.lisp,
+  ;; WS5 #203 gap 1) ends with (setq *error-output* (%make-file-stream-full 2 1))
+  ;; — a type-9 Linux fd-2 stream.  Writing one char to it runs
+  ;;   %fs-write-char -> %sys-write-raw -> (syscall3 1 …) -> :trap #x0502
+  ;; which the x64 translator emits as a literal SYSCALL instruction.  Long mode
+  ;; is entered here with IA32_EFER.LME|NXE but NOT SCE, so that SYSCALL raises
+  ;; #UD, boot-x64.lisp's IDT entry 6 longjmps out, and the write surfaces as
+  ;; #(PROGRAM-ERROR NIL).
+  ;;
+  ;; That made reading ANY global by name fail at COMPILE time (task #212).
+  ;; The in-image *GLOBALS* registry starts empty in every compilation unit, so
+  ;; EVERY free-variable reference — user (*n*) or built-in (*print-base*) —
+  ;; lands in compile-variable-ref's final `t' arm (compiler.lisp ~4302), whose
+  ;; FIRST act is (format *error-output* \"~&  WARN: implicit global ~A~%\" name).
+  ;; The format blew up before the compiler ever emitted the read, so `*n*'
+  ;; failed, `(if nil *n* 7)' failed (the ref is never evaluated), and no
+  ;; handler-case could catch it — HANDLER-CASE's own expansion references
+  ;; *CATCH-ACTIVE* / *CURRENT-CONDITION* and so failed to compile too.
+  ;;
+  ;; There is exactly one console here, so stderr is the serial port.  This is
+  ;; what *error-output* was before WS5 #203 split it onto fd 2 for the hosted
+  ;; differential table.  LATENT ELSEWHERE: build-x64.lisp / build-aarch64.lisp
+  ;; (the bare-metal ANSI gate images) call %init-streams too and have the same
+  ;; unwritable stderr; not touched here to keep the gate images byte-identical.
+  (setq *error-output* *standard-output*)
   (%init-reader)
   (%init-condition-types)
   (%init-method-combinations)

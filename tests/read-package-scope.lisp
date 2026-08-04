@@ -564,6 +564,71 @@
        (list (length syms) (and syms (pkg-of (car syms))))
        (list 1 "CL-TEST")))
 
+;;; ---------------------------------------------------------------
+;;; (K) #214 — THE PPRINT LOGICAL-BLOCK TAG MUST BE PACKAGE-PROOF.
+;;;
+;;; Same ROOT as (J) — an injected symbol crossing a package boundary — but a
+;;; different MECHANISM: a runtime CATCH tag, not a compile-time ENV-LOOKUP.
+;;;
+;;; build-ansi-common.lisp's pprint-logical-block rewriter emits the CATCH
+;;; frame INTO the corpus file's own text, so it is read in the package THAT
+;;; FILE declares; printer/pprint-exit-if-list-exhausted.lsp declares
+;;; (in-package :cl-test).  cl-printer.lisp's %pprint-pop-fn / %pprint-exit-fn
+;;; carry the matching THROWs and are read in MODUS.MVM.  Since #211 made
+;;; symbol identity per-package, CL-TEST::%PP-TAG and MODUS.MVM::%PP-TAG are
+;;; different objects; compile-quote emits both a name hash AND a package hash,
+;;; and CATCH compares tags with EQL — so every pprint-pop / pprint-exit throw
+;;; escaped its own block.  Observed on the gate as
+;;;   FAIL 21688  COND:#(SIMPLE-ERROR ((FORMAT-CONTROL . "throw") …))
+;;; i.e. an uncaught THROW, for pprint-exit-if-list-exhausted.1 and .2.
+;;;
+;;; A KEYWORD tag is package-proof by construction: :%PP-TAG prints and reads
+;;; back to the one interned keyword object from any package.
+;;; ---------------------------------------------------------------
+(defun file-text (rel)
+  (let ((path (merge-pathnames rel *load-truename*)))
+    (with-open-file (s path)
+      (let ((buf (make-string (file-length s))))
+        (subseq buf 0 (read-sequence buf s))))))
+
+;;; K1: the mechanism, on the reader itself.  A plain symbol read in two
+;;; packages yields two objects (so an EQL tag comparison must fail); the
+;;; keyword yields one.
+(let* ((in-ct (let ((*package* (find-package "CL-TEST")))
+                (read-from-string "%pp-tag")))
+       (in-mm (let ((*package* (find-package "MODUS.MVM")))
+                (read-from-string "%pp-tag")))
+       (kw-ct (let ((*package* (find-package "CL-TEST")))
+                (read-from-string ":%pp-tag")))
+       (kw-mm (let ((*package* (find-package "MODUS.MVM")))
+                (read-from-string ":%pp-tag"))))
+  (chk "K1: a plain tag symbol read in two packages is TWO objects"
+       (eq in-ct in-mm) nil)
+  (chk "K1: …which is why an EQL catch-tag comparison could never match"
+       (eql in-ct in-mm) nil)
+  (chk "K1: the KEYWORD tag is ONE object from either package"
+       (eq kw-ct kw-mm) t))
+
+;;; K2: the guard.  Every pp-tag literal on BOTH sides of the boundary must be
+;;; the keyword — the rewriter's CATCH (emitted into corpus text) and
+;;; cl-printer.lisp's THROWs (read in MODUS.MVM).
+(let* ((rewriter (file-text "../mvm/build-ansi-common.lisp"))
+       (printer  (file-text "../mvm/cl-printer.lisp"))
+       (bad nil))
+  (dolist (pair (list (cons "build-ansi-common.lisp" rewriter)
+                      (cons "cl-printer.lisp" printer)))
+    (let ((text (cdr pair)) (start 0))
+      (loop (let ((p (search "'%pp-tag" text :start2 start)))
+              (unless p (return))
+              (pushnew (car pair) bad :test #'string=)
+              (setq start (1+ p))))))
+  (chk "K2: no quoted-symbol '%pp-tag survives on either side of the boundary"
+       (sort bad #'string<) nil)
+  (chk "K2: the rewriter's CATCH uses the keyword tag"
+       (integerp (search "(catch :%pp-tag" rewriter)) t)
+  (chk "K2: cl-printer.lisp's THROWs use the keyword tag"
+       (integerp (search "(throw :%pp-tag nil)" printer)) t))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

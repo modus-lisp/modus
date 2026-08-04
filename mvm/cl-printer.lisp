@@ -1463,10 +1463,21 @@
 ;;; stack of state arrays #(stream list count listp).  The
 ;;; pprint-logical-block macro (expanded by the build-side rewriter
 ;;; in build-x64-linux.lisp) calls %pprint-lb-begin to push a fresh
-;;; state, runs the body inside a CATCH '%pp-tag, then calls
+;;; state, runs the body inside a CATCH :%pp-tag, then calls
 ;;; %pprint-lb-end to pop — so there is no fragile rebinding of
 ;;; multiple non-CLHS specials.  pprint-pop / pprint-exit read the
 ;;; head state via the helpers below.
+;;;
+;;; #214: the tag is a KEYWORD, not a quoted %PP-TAG symbol.  The CATCH is
+;;; emitted by the rewriter INTO a corpus file's own text, so it is read
+;;; in whatever package that file declares — CL-TEST for
+;;; pprint-exit-if-list-exhausted.lsp — while the THROWs below are read
+;;; here, in MODUS.MVM.  Since #211 made symbol identity per-package,
+;;; CL-TEST::%PP-TAG and MODUS.MVM::%PP-TAG are different objects, and
+;;; CATCH compares tags with EQL: every throw escaped its own block as an
+;;; uncaught SIMPLE-ERROR "throw".  A keyword prints as :%PP-TAG and reads
+;;; back to the one interned keyword object from any package, so the tag
+;;; is package-proof by construction.
 ;;;
 ;;;   state slot 0  resolved output stream
 ;;;   state slot 1  remaining list being iterated by pprint-pop
@@ -1565,14 +1576,14 @@
                   ;; *print-length* exhausted: emit "..." and exit.
                   ((and plen (integerp plen) (>= cnt plen))
                    (write-string "..." stream)
-                   (throw '%pp-tag nil))
+                   (throw :%pp-tag nil))
                   ;; Proper end of list: nothing left.
                   ((null lst) nil)
                   ;; Dotted tail: write " . <atom>" and exit.
                   ((not (consp lst))
                    (write-string " . " stream)
                    (%write-obj lst stream nil t)
-                   (throw '%pp-tag nil))
+                   (throw :%pp-tag nil))
                   ;; Normal element.
                   (t
                    (aset st 1 (cdr lst))
@@ -1590,10 +1601,10 @@
             (cnt (aref st 2))
             (plen *print-length*))
         (cond
-          ((null lst) (throw '%pp-tag nil))
+          ((null lst) (throw :%pp-tag nil))
           ((and plen (integerp plen) (>= cnt plen))
            (write-string "..." (aref st 0))
-           (throw '%pp-tag nil))))))
+           (throw :%pp-tag nil))))))
   nil)
 
 (defun pprint (obj &rest stream-arg)

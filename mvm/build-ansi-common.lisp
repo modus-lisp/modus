@@ -2072,7 +2072,7 @@
     ;; bound, (c) suffix is written, (d) when body is empty, the list-arg is
     ;; written.  That's enough to pass PPRINT-LOGICAL-BLOCK.1..N which were
     ;; failing previously because the rewriter dropped everything but body.
-    ;; Real implementation: each logical block establishes a CATCH '%pp-tag
+    ;; Real implementation: each logical block establishes a CATCH :%pp-tag
     ;; frame plus dynamic state (*%pp-list* / *%pp-count* / *%pp-stream* /
     ;; *%pp-listp* / *%pp-level*) that the runtime helpers %pprint-pop-fn and
     ;; %pprint-exit-fn read.  pprint-pop / pprint-exit-if-list-exhausted are
@@ -2100,7 +2100,11 @@
              (svar (gensym "PPS")))
          ;; CLHS: supplying BOTH :prefix and :per-line-prefix is an error.
          ;; %pprint-lb-begin pushes block state on *%pp-ctx*; the body runs
-         ;; inside CATCH '%pp-tag (so pprint-pop / pprint-exit can escape it);
+         ;; inside CATCH :%pp-tag (so pprint-pop / pprint-exit can escape it);
+         ;; #214: a KEYWORD tag, because this CATCH is emitted into the corpus
+         ;; file's own text and read in the package THAT file declares, while
+         ;; cl-printer.lisp's matching THROWs read in MODUS.MVM — see the
+         ;; comment on %pprint-pop-fn.
          ;; %pprint-lb-end writes the suffix and pops — balanced on both
          ;; normal and thrown exit.  *print-level* depth = (length *%pp-ctx*)
          ;; at block entry → "#" when it meets/exceeds *print-level*.
@@ -2125,7 +2129,7 @@
                                         ,svar ,list-arg
                                         ,(if have-prefix prefix nil)
                                         ,(if have-per-line per-line nil))))
-                            (catch '%pp-tag
+                            (catch :%pp-tag
                               ,@(or body `((write ,list-arg :stream ,svar))))
                             (%pprint-lb-end ,svar ,suffix)))
                       nil)

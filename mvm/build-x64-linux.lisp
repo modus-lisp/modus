@@ -541,28 +541,45 @@
 (format t "  dumped: ~Areal-ansi-gen.lisp~%" *build-dump-dir*)
 
 ;;; ============================================================
-;;; 3. Strip in-package forms from source text
+;;; 3. (RETIRED #211) Strip in-package forms from source text
 ;;; ============================================================
-
-(defun strip-in-package (text)
-  "Remove (in-package ...) forms from source text."
-  (let ((result text))
-    (loop
-      (let ((pos (search "(in-package " result)))
-        (unless pos (return result))
-        ;; Find the closing paren
-        (let ((end (position #\) result :start pos)))
-          (when end
-            (setf result (concatenate 'string
-                                      (subseq result 0 pos)
-                                      (subseq result (1+ end))))))))))
-
-(setf *prelude-source* (strip-in-package *prelude-source*))
-(setf *rt-source*      (strip-in-package *rt-source*))
-(setf *bridge-source*  (strip-in-package *bridge-source*))
-(setf *test-source*    (strip-in-package *test-source*))
-(setf *ansi-aux-sources*  (strip-in-package *ansi-aux-sources*))
-(setf *real-ansi-sources* (strip-in-package *real-ansi-sources*))
+;;;
+;;; STRIP-IN-PACKAGE used to erase every (in-package …) from these blobs,
+;;; back when READ-ALL-FORMS-WITH-LOCATIONS ignored the form anyway (the
+;;; image namespace is flat: the MVM compiler hashes symbols by SYMBOL-NAME).
+;;; Now that the reader HONOURS in-package, this erasure is not merely
+;;; obsolete — it was actively defeating the per-file containment, because it
+;;; was CASE-SENSITIVE:
+;;;
+;;;   (search "(in-package " text)
+;;;
+;;; MVM-TEXT's and the corpus emitter's reset is the lowercase literal
+;;; "(in-package :modus.mvm)", so every one of them matched and was deleted.
+;;; The ANSI corpus's own declarations reach the blob through `format ~S`,
+;;; i.e. UPPERCASE — `(IN-PACKAGE "CL-TEST")` — so none of them matched and
+;;; every one survived.  Measured on the 7a66219 build's own real-ansi-gen.lisp
+;;; dump (which is written BEFORE this step):
+;;;
+;;;   1508  (in-package :modus.mvm)     <- the containment, all stripped
+;;;    672  (IN-PACKAGE "CL-TEST")      <- the switches, all kept
+;;;
+;;; Exactly inverted.  The corpus therefore still read one sticky CL-TEST
+;;; blob from the first chapter load.lsp onwards, and LOOP's
+;;; %loop-parse-cond-clauses kept binding MODUS.MVM::IT against a body that
+;;; said CL-TEST::IT — the loop14 / structures-03 / macrolet losses, unchanged
+;;; by 7a66219 because 7a66219's resets never survived to the image.
+;;;
+;;; Deleted rather than case-folded: case-folding would strip the corpus's
+;;; declarations too, which would erase package-awareness in this image and
+;;; put the (package, name) pair back out of reach — the #210 ceiling this
+;;; whole change exists to lift.  Every blob below is already per-file
+;;; contained (MVM-TEXT for first-party sources, the corpus emitter's own
+;;; section wrap for *real-ansi-sources*), and the compiler treats IN-PACKAGE
+;;; as a build-time no-op (compiler.lisp: "package system is SBCL-side only"),
+;;; so leaving the forms in costs nothing in compiled output.
+;;;
+;;; If you add a new source blob here, contain it per file; do not reintroduce
+;;; a text eraser.  tests/read-package-scope.lisp fails if one comes back.
 
 ;;; ============================================================
 ;;; 3b. Test-source defun/defmacro registration

@@ -925,7 +925,16 @@
 ;;; ============================================================
 
 (defun strip-in-package (text)
-  "Remove (in-package ...) forms from source text."
+  "Remove (in-package ...) forms from source text.
+
+   #211 SCOPE: this is now for VENDORED sources only (the net stack, chipz,
+   install-tarball) — text that is spliced in raw, without MVM-TEXT's per-file
+   package containment, and whose qualified names are flattened by
+   STRIP-PACKAGE-PREFIXES anyway.  NEVER apply it to a CONTAINED blob: the
+   search string is lowercase and CASE-SENSITIVE, so it eats the
+   \"(in-package :modus.mvm)\" resets while leaving the ANSI corpus's
+   `format ~S`-emitted UPPERCASE `(IN-PACKAGE \"CL-TEST\")` untouched — i.e. it
+   removes the containment and keeps the leak.  See mvm/build-x64-linux.lisp."
   (let ((result text))
     (loop
       (let ((pos (search "(in-package " result)))
@@ -992,12 +1001,11 @@
                                  ";; [net-build: legacy " name " stripped]"
                                  (subseq result (+ end 1)))))))))))
 
-(setf *prelude-source* (strip-in-package *prelude-source*))
-(setf *rt-source*      (strip-in-package *rt-source*))
-(setf *bridge-source*  (strip-in-package *bridge-source*))
-(setf *test-source*    (strip-in-package *test-source*))
-(setf *ansi-aux-sources*  (strip-in-package *ansi-aux-sources*))
-(setf *real-ansi-sources* (strip-in-package *real-ansi-sources*))
+;; #211: the ANSI blobs are NO LONGER stripped.  The build reader honours
+;; (in-package …) and each of these is already per-file contained (MVM-TEXT /
+;; the corpus emitter's section wrap), so the erasure was obsolete — and, being
+;; case-sensitive, it deleted the lowercase containment resets while keeping
+;; every uppercase corpus declaration.  See mvm/build-x64-linux.lisp.
 
 ;; NET BUILD: the net stack + chipz + install-tarball are compiled INTO the
 ;; image but must have their (in-package ...) forms removed — the MVM image

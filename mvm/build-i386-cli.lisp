@@ -49,28 +49,23 @@
     ;; modus.mvm::*build-package-reset-text*.
     (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
-;;; Strip (in-package ...) forms — the image reader is flat-namespace.
-(defun cli-strip-in-package (text)
-  (let ((result text))
-    (loop
-      (let ((pos (search "(in-package " result)))
-        (unless pos (return result))
-        (let ((end (position #\) result :start pos)))
-          (if end
-              (setf result (concatenate 'string
-                                        (subseq result 0 pos)
-                                        (subseq result (1+ end))))
-              (return result)))))))
+;;; #211: the (in-package …) eraser is RETIRED.  The build reader honours
+;;; (in-package …) and MVM-TEXT contains each file (it both starts and ends in
+;;; :MODUS.MVM), so erasing is obsolete — and the eraser was case-sensitive on
+;;; a lowercase needle, which meant it deleted the containment resets and kept
+;;; any uppercase declaration.  IN-PACKAGE compiles to nothing (compiler.lisp:
+;;; "package system is SBCL-side only"), so leaving the forms in costs nothing.
+;;; See mvm/build-x64-linux.lisp for the measured counts.
 
 (format t "Reading source files...~%")
 
 (defvar *prelude-source*
   (if (>= *i386-layer* 1)
-      (cli-strip-in-package (mvm-text "mvm/prelude.lisp"))
+      (mvm-text "mvm/prelude.lisp")
       ""))
 (defvar *gc-source*      (if (>= *i386-layer* 2) (mvm-text "mvm/gc.lisp") ""))
 (defvar *rt-source*      (if (>= *i386-layer* 2)
-                             (cli-strip-in-package (mvm-text "mvm/rt.lisp")) ""))
+                             (mvm-text "mvm/rt.lisp") ""))
 
 ;; Layer 3: the CL bridge, in the SAME order build-generic-cli.lisp uses.
 ;; (Order matters — later files override earlier defuns, last-defun-wins.)
@@ -93,7 +88,7 @@
                               "mvm/cl-clos.lisp"      "mvm/cl-types.lisp"
                               "mvm/cl-packages.lisp"  "mvm/cl-conditions.lisp"
                               "mvm/ansi-bridge.lisp")
-                   append (list (cli-strip-in-package (mvm-text f))
+                   append (list (mvm-text f)
                                 (string #\Newline))))
       ""))
 

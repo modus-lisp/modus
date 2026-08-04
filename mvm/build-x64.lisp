@@ -627,28 +627,22 @@
 (format t "  dumped: ~Areal-ansi-gen.lisp~%" *build-dump-dir*)
 
 ;;; ============================================================
-;;; 3. Strip in-package forms from source text
+;;; 3. (RETIRED #211) Strip in-package forms from source text
 ;;; ============================================================
-
-(defun strip-in-package (text)
-  "Remove (in-package ...) forms from source text."
-  (let ((result text))
-    (loop
-      (let ((pos (search "(in-package " result)))
-        (unless pos (return result))
-        ;; Find the closing paren
-        (let ((end (position #\) result :start pos)))
-          (when end
-            (setf result (concatenate 'string
-                                      (subseq result 0 pos)
-                                      (subseq result (1+ end))))))))))
-
-(setf *prelude-source* (strip-in-package *prelude-source*))
-(setf *rt-source*      (strip-in-package *rt-source*))
-(setf *bridge-source*  (strip-in-package *bridge-source*))
-(setf *test-source*    (strip-in-package *test-source*))
-(setf *ansi-aux-sources*  (strip-in-package *ansi-aux-sources*))
-(setf *real-ansi-sources* (strip-in-package *real-ansi-sources*))
+;;;
+;;; The erasure is gone.  READ-ALL-FORMS-WITH-LOCATIONS now HONOURS
+;;; (in-package …) and every blob below is per-file contained (MVM-TEXT for
+;;; first-party sources, the corpus emitter's own section wrap for
+;;; *real-ansi-sources*), so stripping is obsolete — and it was worse than
+;;; obsolete: `(search "(in-package " text)` is CASE-SENSITIVE, so it deleted
+;;; the lowercase containment resets ("(in-package :modus.mvm)") while leaving
+;;; every UPPERCASE corpus declaration `(IN-PACKAGE "CL-TEST")` — the corpus
+;;; reaches the blob through `format ~S` — intact.  Exactly inverted: the
+;;; containment vanished and the sticky switch survived.  Full rationale and
+;;; the measured 1508-stripped / 672-kept counts: mvm/build-x64-linux.lisp.
+;;;
+;;; If you add a new source blob here, contain it per file; do not reintroduce
+;;; a text eraser.  tests/read-package-scope.lisp fails if one comes back.
 
 ;;; ============================================================
 ;;; 3b. Test-source defun/defmacro registration

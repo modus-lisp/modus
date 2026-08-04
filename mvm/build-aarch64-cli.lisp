@@ -26,23 +26,13 @@
 
 (format t "~%=== Building minimal AArch64 CLI/JIT host (no corpus) ===~%")
 
-;;; strip (in-package ...) forms from source text (the gate wrapper does this;
-;;; the common file leaves the raw text with in-package forms in it).
-(defun cli-strip-in-package (text)
-  (let ((result text))
-    (loop
-      (let ((pos (search "(in-package " result)))
-        (unless pos (return result))
-        (let ((end (position #\) result :start pos)))
-          (if end
-              (setf result (concatenate 'string
-                                        (subseq result 0 pos)
-                                        (subseq result (1+ end))))
-              (return result)))))))
-
-(setf *prelude-source* (cli-strip-in-package *prelude-source*))
-(setf *rt-source*      (cli-strip-in-package *rt-source*))
-(setf *bridge-source*  (cli-strip-in-package *bridge-source*))
+;;; #211: the (in-package …) eraser is RETIRED.  The build reader honours
+;;; (in-package …) and MVM-TEXT contains each file (it both starts and ends in
+;;; :MODUS.MVM), so erasing is obsolete — and the eraser was case-sensitive on
+;;; a lowercase needle, which meant it deleted the containment resets and kept
+;;; any uppercase declaration.  IN-PACKAGE compiles to nothing (compiler.lisp:
+;;; "package system is SBCL-side only"), so leaving the forms in costs nothing.
+;;; See mvm/build-x64-linux.lisp for the measured counts.
 
 ;; WS4-AA64 #199 FLIP **REVERTED** (WS5 #203, 2026-07-31): the CLI now DEFAULTS
 ;; the runtime JIT **OFF**.  Opt in with MODUS_USE_JIT=1.

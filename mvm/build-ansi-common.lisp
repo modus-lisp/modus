@@ -4255,7 +4255,13 @@
                     ;; Leading newline so this file's block separates from the
                     ;; preceding *real-ansi-sources* content (no separator in
                     ;; *full-source*, keeping flag-off byte-identical).
-                    (format e2out "~%;; === e2diff ~A ===~%" file-name)
+                    ;; #211: same per-file containment as the *real-ansi-sources*
+                    ;; section — the e2diff blob is concatenated straight into
+                    ;; *full-source* too, so a declaration inside one file's
+                    ;; quoted test literals must not set the read package for
+                    ;; the next file (or for the driver that follows).
+                    (format e2out "~%;; === e2diff ~A ===~%~A~%" file-name
+                            modus.mvm::*build-package-reset-text*)
                     (let ((remaining e2forms))
                       (loop while remaining do
                         (incf e2chunk-num)
@@ -4277,6 +4283,8 @@
                       (format e2out "  (%try-chunk ~S ~D ~D #'run-e2diff-~A-chunk-~D)~%"
                               file-name file-hash c file-name c))
                     (format e2out ")~%")
+                    ;; #211: close the e2diff section in :MODUS.MVM too.
+                    (format e2out "~%~A~%" modus.mvm::*build-package-reset-text*)
                     (setf *e2diff-sources*
                           (concatenate 'string *e2diff-sources*
                                        (get-output-stream-string e2out))))))

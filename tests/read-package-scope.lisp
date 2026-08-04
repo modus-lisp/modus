@@ -197,6 +197,135 @@
     (chk "F: and the next chunk is back in MODUS.MVM"
          (pkg-of (cadr tail)) "MODUS.MVM")))
 
+;;; ---------------------------------------------------------------
+;;; (G) THE CORPUS PATH.  The ANSI corpus never goes through MVM-TEXT — the
+;;; harness prints each transformed test file into *real-ansi-sources* itself
+;;; (build-ansi-common.lisp) — so it needs, and now has, its own section wrap.
+;;;
+;;; And the corpus DOES declare packages: 267 of the 845 .lsp files carry an
+;;; (in-package …), 250 of them :cl-test.  They reach the blob through
+;;; `format ~S`, i.e. UPPERCASE — `(IN-PACKAGE "CL-TEST")` — which is exactly
+;;; the shape the retired text eraser could not see (test H).
+;;;
+;;; The discriminator is a file that declares NOTHING following a file that
+;;; declares CL-TEST: iteration/loop14.lsp has no in-package of its own, yet
+;;; its tests were the ones failing.  Its IT must be MODUS.MVM::IT, because
+;;; that is the symbol LOOP's %loop-parse-cond-clauses binds.
+;;; ---------------------------------------------------------------
+;; The harness creates the corpus's packages host-side so SBCL's reader can
+;; resolve qualified symbols in the fixtures (build-ansi-common.lisp does the
+;; same `(defpackage "CL-TEST" (:use "CL"))`).  Without it FIND-PACKAGE fails,
+;; the reader's guard correctly declines to switch, and this test would prove
+;; nothing about the declaring file.
+(eval-when (:load-toplevel :execute)
+  (unless (find-package "CL-TEST") (make-package "CL-TEST" :use '("CL"))))
+
+(defun find-sym-named (name form)
+  "First symbol named NAME anywhere in FORM (the LOOP body's anaphoric IT)."
+  (cond ((and (symbolp form) form (string= (symbol-name form) name)) form)
+        ((consp form) (or (find-sym-named name (car form))
+                          (find-sym-named name (cdr form))))
+        (t nil)))
+
+(defun corpus-section (file body)
+  "A corpus file's emitted section, exactly as build-ansi-common.lisp writes it."
+  (concatenate 'string
+               (format nil "~%;; === ~A ===~%" file)
+               modus.mvm::*build-package-reset-text* (string #\Newline)
+               body (string #\Newline)
+               modus.mvm::*build-package-reset-text* (string #\Newline)))
+
+(let* ((blob (concatenate 'string
+                          ;; a chapter load.lsp, emitted verbatim, uppercase
+                          (corpus-section "load.lsp"
+                                          "(IN-PACKAGE \"CL-TEST\")
+(DEFUN RUN-ANSI-LOAD () (LOOP FOR X IN '(1) WHEN X COLLECT IT))")
+                          ;; loop14.lsp: declares nothing at all
+                          (corpus-section "loop14.lsp"
+                                          "(DEFUN RUN-ANSI-LOOP14 () (LOOP FOR X IN '(1) WHEN X COLLECT IT))")))
+       (defuns (remove-if-not (lambda (f)
+                                (and (consp f) (symbolp (car f))
+                                     (string= (symbol-name (car f)) "DEFUN")))
+                              (forms-of blob)))
+       (it-of (lambda (f) (find-sym-named "IT" f))))
+  (chk "G: two corpus defuns read" (length defuns) 2)
+  (chk "G: the DECLARING corpus file really does read in CL-TEST"
+       (pkg-of (cadr (first defuns))) "CL-TEST")
+  (chk "G: …including its LOOP's IT"
+       (pkg-of (funcall it-of (first defuns))) "CL-TEST")
+  (chk "G: the NEXT corpus file, which declares nothing, is back in MODUS.MVM"
+       (pkg-of (cadr (second defuns))) "MODUS.MVM")
+  (chk "G: …and so is its IT — the loop14 discriminator, on the corpus path"
+       (pkg-of (funcall it-of (second defuns))) "MODUS.MVM"))
+
+;;; ---------------------------------------------------------------
+;;; (H) NO TEXT ERASER MAY BE APPLIED TO A CONTAINED BLOB.
+;;;
+;;; This is the hole that survived the first fix.  The ANSI build scripts ran
+;;; every blob through
+;;;
+;;;   (defun strip-in-package (text) … (search "(in-package " text) …)
+;;;
+;;; after the containment was inserted.  SEARCH on strings is case-sensitive,
+;;; and the needle is lowercase, so it deleted every "(in-package :modus.mvm)"
+;;; reset and left every uppercase `(IN-PACKAGE "CL-TEST")` — removing the
+;;; containment and keeping the leak.  Measured on the 7a66219 build's own
+;;; real-ansi-gen.lisp: 1508 resets stripped, 672 corpus declarations kept.
+;;;
+;;; H1 demonstrates the mechanism on a fixture (so the reason for H2 is
+;;; legible); H2 is the guard that keeps it from coming back.
+;;; ---------------------------------------------------------------
+(defun retired-eraser (text)
+  "The eraser that used to run after containment.  Verbatim, for the record."
+  (let ((result text))
+    (loop
+      (let ((pos (search "(in-package " result)))
+        (unless pos (return result))
+        (let ((end (position #\) result :start pos)))
+          (when end
+            (setf result (concatenate 'string
+                                      (subseq result 0 pos)
+                                      (subseq result (1+ end))))))))))
+
+(let* ((blob (concatenate 'string
+                          (corpus-section "load.lsp" "(IN-PACKAGE \"CL-TEST\")")
+                          (corpus-section "loop14.lsp" "(DEFUN RUN-ANSI-LOOP14 (IT) IT)")))
+       (erased (retired-eraser blob))
+       (defun-form (find-if (lambda (f)
+                              (and (consp f) (symbolp (car f))
+                                   (string= (symbol-name (car f)) "DEFUN")))
+                            (forms-of erased))))
+  (chk "H1: the eraser removes every lowercase containment reset"
+       (search "(in-package :modus.mvm)" erased) nil)
+  (chk "H1: …and keeps every uppercase corpus declaration"
+       (integerp (search "(IN-PACKAGE \"CL-TEST\")" erased)) t)
+  (chk "H1: …so the erased blob LEAKS — this is the whole bug"
+       (pkg-of (cadr defun-form)) "CL-TEST"))
+
+;;; H2: no build script may hand a CONTAINED blob to such an eraser.  Vendored
+;;; raw text (net/chipz/install-tarball, spliced without containment and
+;;; name-flattened anyway) is the one legitimate use, so it is allowed.
+(let* ((build-dir (merge-pathnames "../mvm/" *load-truename*))
+       (contained '("*prelude-source*" "*gc-source*" "*rt-source*"
+                    "*bridge-source*" "*test-source*" "*ansi-aux-sources*"
+                    "*real-ansi-sources*" "*e2diff-sources*"
+                    "*compiler-in-image-source*" "*driver-source*"
+                    "*full-source*" "(mvm-text "))
+       (offenders nil))
+  (dolist (path (directory (merge-pathnames "build-*.lisp" build-dir)))
+    (with-open-file (s path)
+      (loop for line = (read-line s nil nil)
+            while line
+            do (when (search "strip-in-package" line)
+                 (dolist (blob contained)
+                   (when (search blob line)
+                     (push (format nil "~A: ~A"
+                                   (file-namestring path)
+                                   (string-trim " " line))
+                           offenders)))))))
+  (chk "H2: no build script strips in-package from a contained blob"
+       (nreverse offenders) nil))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

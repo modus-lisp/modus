@@ -1558,6 +1558,14 @@
    it once.  Writes the dotted '. tail' or '...' marker and throws to
    %pp-tag when iteration must stop."
   (declare (special *print-length*))
+  ;; CLHS: pprint-pop outside a pprint-logical-block is an error.  This used
+  ;; to return NIL, which the corpus never noticed because the tag mismatch
+  ;; (see the header note) left blocks un-popped: *%pp-ctx* still held a stale
+  ;; exhausted state, so pprint-pop.error.1 got its error from THAT.  With the
+  ;; tag fixed, blocks unwind and the stack is genuinely empty here — so the
+  ;; real requirement has to be met rather than met by accident.
+  (when (null *%pp-ctx*)
+    (error "pprint-pop used outside a pprint-logical-block"))
   (let ((st (car *%pp-ctx*)))
     (if (null st)
         nil
@@ -1595,6 +1603,11 @@
    block's list is exhausted, or *print-length* reached (emitting
    '...').  Returns NIL otherwise."
   (declare (special *print-length*))
+  ;; CLHS: pprint-exit-if-list-exhausted outside a pprint-logical-block is an
+  ;; error — see the note in %pprint-pop-fn for why this was previously
+  ;; satisfied only by leaked block state.
+  (when (null *%pp-ctx*)
+    (error "pprint-exit-if-list-exhausted used outside a pprint-logical-block"))
   (let ((st (car *%pp-ctx*)))
     (when (and st (aref st 3))
       (let ((lst (aref st 1))

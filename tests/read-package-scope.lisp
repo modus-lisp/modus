@@ -456,6 +456,114 @@
   (chk "I3: …and does not delete it afterwards"
        (or (null last-delete) (and create (< last-delete create))) t))
 
+;;; ---------------------------------------------------------------
+;;; (J) #214 — LOOP'S `IT` ANAPHOR IS RECOGNISED BY NAME, NOT BY IDENTITY.
+;;;
+;;; CLHS 6.1.1.5: LOOP keywords are not true keywords.  They are symbols
+;;; recognised BY NAME (compared with STRING=) and are explicitly package-
+;;; independent — IT among them.  So matching IT by symbol identity is wrong
+;;; regardless of packages; matching by name is the conformant reading.
+;;;
+;;; compiler.lisp's %loop-parse-cond-clauses callers injected the binding with
+;;; a backquoted `it`, which interns in MODUS.MVM (the package compiler.lisp
+;;; itself is read in).  ENV-LOOKUP resolves bindings with :TEST #'EQUAL, and
+;;; EQUAL on symbols is EQ, so a file declaring its own package reads
+;;; CL-TEST::IT and never matched the MODUS.MVM::IT binding: the anaphor
+;;; silently became a free variable.  Before #211 the build erased packages so
+;;; both were one symbol and this could not surface; #211 made it live.
+;;;
+;;; The observable defect, on main, is BOTH symbols appearing in one expansion:
+;;;   (LET ((MODUS.MVM::IT X)) (WHEN MODUS.MVM::IT (... CL-TEST::IT ...)))
+;;; J1/J2 assert exactly one, in the package the source was read in.  J3 is the
+;;; converse guard: ordinary variables must STILL be matched by identity.
+;;; ---------------------------------------------------------------
+(defun it-syms (form)
+  "Every DISTINCT symbol named IT anywhere in FORM."
+  (let ((acc nil))
+    (labels ((walk (f)
+               (cond ((and f (symbolp f) (string= (symbol-name f) "IT"))
+                      (pushnew f acc))
+                     ((consp f) (walk (car f)) (walk (cdr f))))))
+      (walk form))
+    acc))
+
+(defun ct (name) (intern name "CL-TEST"))
+
+;;; J1: WHEN … COLLECT IT, written entirely in CL-TEST.
+(let* ((body (list (ct "FOR") (ct "X") (ct "IN") ''(1 2)
+                   (ct "WHEN") (ct "X") (ct "COLLECT") (ct "IT")))
+       (syms (it-syms (modus.mvm::expand-cl-loop body))))
+  (chk "J1: WHEN…COLLECT IT expands to ONE it symbol (not binding+reference)"
+       (length syms) 1)
+  (chk "J1: …and it is the CL-TEST::IT the source actually wrote"
+       (pkg-of (car syms)) "CL-TEST"))
+
+;;; J2: the other three injection sites — WHEN/ELSE, UNLESS, UNLESS/ELSE.
+(dolist (spec (list (list "WHEN…ELSE"
+                          (list (ct "WHEN") (ct "X") (ct "COLLECT") (ct "IT")
+                                (ct "ELSE") (ct "COLLECT") (ct "IT")))
+                    (list "UNLESS"
+                          (list (ct "UNLESS") (ct "X") (ct "COLLECT") (ct "IT")))
+                    (list "UNLESS…ELSE"
+                          (list (ct "UNLESS") (ct "X") (ct "COLLECT") (ct "IT")
+                                (ct "ELSE") (ct "COLLECT") (ct "IT")))))
+  (let* ((body (append (list (ct "FOR") (ct "X") (ct "IN") ''(1 2)) (cadr spec)))
+         (syms (it-syms (modus.mvm::expand-cl-loop body))))
+    (chk (format nil "J2: ~A binds the source's own IT" (car spec))
+         (list (length syms) (and syms (pkg-of (car syms))))
+         (list 1 "CL-TEST"))))
+
+;;; J2b: a file that declares NOTHING still gets MODUS.MVM::IT — the fallback
+;;; path, and the shape loop14.lsp (no in-package of its own) reads as.
+(let* ((body (list 'modus.mvm::for 'modus.mvm::x 'modus.mvm::in ''(1 2)
+                   'modus.mvm::when 'modus.mvm::x
+                   'modus.mvm::collect 'modus.mvm::it))
+       (syms (it-syms (modus.mvm::expand-cl-loop body))))
+  (chk "J2b: an undeclared file's IT stays MODUS.MVM::IT, still single"
+       (list (length syms) (and syms (pkg-of (car syms))))
+       (list 1 "MODUS.MVM")))
+
+;;; J2c: no IT mentioned at all — the binding still matches its own test, and
+;;; nothing from another package leaks in.
+(let* ((body (list (ct "FOR") (ct "X") (ct "IN") ''(1 2)
+                   (ct "WHEN") (ct "X") (ct "COLLECT") (ct "X")))
+       (syms (it-syms (modus.mvm::expand-cl-loop body))))
+  (chk "J2c: clause with no IT reference still expands to one IT binding"
+       (length syms) 1))
+
+;;; J3: THE CONVERSE.  ENV-LOOKUP must NOT have become a name match: a user's
+;;; CL-TEST::X and MODUS.MVM::X are legitimately different variables, which is
+;;; exactly the distinction #211 established.  Only the injected anaphor is
+;;; name-recognised.
+(let* ((empty (modus.mvm::make-empty-env))
+       (env   (car (modus.mvm::env-extend-stack empty (ct "X")))))
+  (chk "J3: same symbol resolves"
+       (not (null (modus.mvm::env-lookup env (ct "X")))) t)
+  (chk "J3: same NAME in another package does NOT resolve (still identity)"
+       (modus.mvm::env-lookup env 'modus.mvm::x) nil)
+  ;; …and the two really are same-named distinct symbols, so the check above
+  ;; is testing what it claims to.
+  (chk "J3: (the two probes are same-named, different symbols)"
+       (list (string= (symbol-name (ct "X")) (symbol-name 'modus.mvm::x))
+             (eq (ct "X") 'modus.mvm::x))
+       (list t nil)))
+
+;;; J4: the same property on the CORPUS path, end to end — the blob a gate
+;;; build actually reads, not a hand-built form list.  Mirrors (G).
+(let* ((blob (corpus-section "loop14ish.lsp"
+                             "(IN-PACKAGE \"CL-TEST\")
+(DEFUN RUN-ANSI-LOOP14ISH () (LOOP FOR X IN '(1) WHEN X COLLECT IT))"))
+       (defun-form (find-if (lambda (f)
+                              (and (consp f) (symbolp (car f))
+                                   (string= (symbol-name (car f)) "DEFUN")))
+                            (forms-of blob)))
+       ;; the LOOP form is the defun body
+       (loop-form (car (cdddr defun-form)))
+       (syms (it-syms (modus.mvm::expand-cl-loop (cdr loop-form)))))
+  (chk "J4: corpus-read LOOP expands to one IT, in the file's own package"
+       (list (length syms) (and syms (pkg-of (car syms))))
+       (list 1 "CL-TEST")))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

@@ -8626,6 +8626,46 @@
     (:count 0)
     (t nil)))
 
+(defun %loop-it-anaphor (form)
+  "The symbol named IT that FORM actually contains, or NIL.
+
+   CLHS 6.1.1.5: LOOP keywords — IT among them — are *not* true keywords.
+   They are recognised BY NAME (compared with STRING=) and are explicitly
+   package-independent, so `COLLECT IT` must bind the anaphor whatever
+   package the source file was read in.
+
+   The WHEN/IF/UNLESS expanders inject the binding with a backquoted `it`,
+   which interns in whatever package compiler.lisp itself was read in
+   (MODUS.MVM).  ENV-LOOKUP resolves bindings with :TEST #'EQUAL, and EQUAL
+   on symbols is EQ, so a corpus/user file declaring its own package reads
+   CL-TEST::IT and never matches the MODUS.MVM::IT binding — the anaphor
+   silently degrades to a free variable.  (Before #211 the build erased
+   packages so both were one symbol and this could not surface.)
+
+   Fixing it here rather than in ENV-LOOKUP is deliberate: ordinary
+   bindings MUST keep matching by identity, because CL-TEST::X and
+   MODUS.MVM::X are legitimately different variables — the distinction
+   #211 just established.  Only the injected anaphor is name-recognised,
+   so only the anaphor is resolved by name.
+
+   Comparison goes through %MLL-NAME-EQ (the established idiom in this
+   file, see the &KEY/&AUX parsing above) so it stays correct IN-IMAGE for
+   native MVM symbols whose SYMBOL-NAME reverse lookup returns \"\"."
+  (cond ((and form (symbolp form) (%mll-name-eq form "IT")) form)
+        ((consp form) (or (%loop-it-anaphor (car form))
+                          (%loop-it-anaphor (cdr form))))
+        (t nil)))
+
+(defun %loop-it-var (then-stmts else-stmts)
+  "The symbol to bind as LOOP's IT anaphor for one WHEN/IF/UNLESS clause:
+   the IT the user's own clause bodies reference, so the injected LET
+   binding is EQ to every reference to it.  Falls back to this file's own
+   IT when the bodies mention none (nothing then references it, and the
+   generated test still matches its own binding)."
+  (or (%loop-it-anaphor then-stmts)
+      (%loop-it-anaphor else-stmts)
+      'it))
+
 (defun %loop-parse-cond-clauses (rest state)
   "Parse a sequence of conditional accumulator/action clauses inside a
    WHEN/IF/UNLESS branch.  Stops at AND/ELSE/END or any non-clause
@@ -9394,27 +9434,29 @@
                             (= (normalize-name (car rest)) 75674864))  ; END
                    (setf rest (cdr rest)))
                  ;; Build the conditional body form and push it.  Bind IT
-                 ;; for clause bodies that reference it.
-                 (cond
-                   ((null then-stmts)
-                    ;; Defensive: WHEN/IF with no recognised clause.  Treat
-                    ;; the next single token as a body form (legacy fallback).
-                    (when rest
-                      (push `(when ,cond-form ,(car rest)) (loop-state-body-forms state))
-                      (setf rest (cdr rest))))
-                   (else-stmts
-                    (push `(let ((it ,cond-form))
-                             (if it
-                                 ,(if (= (length then-stmts) 1) (car then-stmts)
-                                      (cons 'progn then-stmts))
-                                 ,(if (= (length else-stmts) 1) (car else-stmts)
-                                      (cons 'progn else-stmts))))
-                          (loop-state-body-forms state)))
-                   (t
-                    (push `(let ((it ,cond-form))
-                             (when it
-                               ,@then-stmts))
-                          (loop-state-body-forms state))))))))
+                 ;; for clause bodies that reference it — the IT they
+                 ;; actually wrote (see %LOOP-IT-VAR), not this file's.
+                 (let ((itv (%loop-it-var then-stmts else-stmts)))
+                   (cond
+                     ((null then-stmts)
+                      ;; Defensive: WHEN/IF with no recognised clause.  Treat
+                      ;; the next single token as a body form (legacy fallback).
+                      (when rest
+                        (push `(when ,cond-form ,(car rest)) (loop-state-body-forms state))
+                        (setf rest (cdr rest))))
+                     (else-stmts
+                      (push `(let ((,itv ,cond-form))
+                               (if ,itv
+                                   ,(if (= (length then-stmts) 1) (car then-stmts)
+                                        (cons 'progn then-stmts))
+                                   ,(if (= (length else-stmts) 1) (car else-stmts)
+                                        (cons 'progn else-stmts))))
+                            (loop-state-body-forms state)))
+                     (t
+                      (push `(let ((,itv ,cond-form))
+                               (when ,itv
+                                 ,@then-stmts))
+                            (loop-state-body-forms state)))))))))
 
           ;; FINALLY form...
           ((= kw 296890838)  ; FINALLY
@@ -9469,25 +9511,26 @@
                  (when (and rest (symbolp (car rest))
                             (= (normalize-name (car rest)) 75674864))  ; END
                    (setf rest (cdr rest)))
-                 (cond
-                   ((null then-stmts)
-                    (when rest
-                      (push `(unless ,cond-form ,(car rest)) (loop-state-body-forms state))
-                      (setf rest (cdr rest))))
-                   (else-stmts
-                    ;; UNLESS cond X else Y == IF cond Y X
-                    (push `(let ((it ,cond-form))
-                             (if it
-                                 ,(if (= (length else-stmts) 1) (car else-stmts)
-                                      (cons 'progn else-stmts))
-                                 ,(if (= (length then-stmts) 1) (car then-stmts)
-                                      (cons 'progn then-stmts))))
-                          (loop-state-body-forms state)))
-                   (t
-                    (push `(let ((it ,cond-form))
-                             (unless it
-                               ,@then-stmts))
-                          (loop-state-body-forms state))))))))
+                 (let ((itv (%loop-it-var then-stmts else-stmts)))
+                   (cond
+                     ((null then-stmts)
+                      (when rest
+                        (push `(unless ,cond-form ,(car rest)) (loop-state-body-forms state))
+                        (setf rest (cdr rest))))
+                     (else-stmts
+                      ;; UNLESS cond X else Y == IF cond Y X
+                      (push `(let ((,itv ,cond-form))
+                               (if ,itv
+                                   ,(if (= (length else-stmts) 1) (car else-stmts)
+                                        (cons 'progn else-stmts))
+                                   ,(if (= (length then-stmts) 1) (car then-stmts)
+                                        (cons 'progn then-stmts))))
+                            (loop-state-body-forms state)))
+                     (t
+                      (push `(let ((,itv ,cond-form))
+                               (unless ,itv
+                                 ,@then-stmts))
+                            (loop-state-body-forms state)))))))))
 
           ;; RETURN expr
           ((= kw 232767877)  ; RETURN

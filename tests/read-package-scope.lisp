@@ -351,6 +351,111 @@
   (chk "H3: every build script's MVM-TEXT applies the per-file package scope"
        (sort unscoped #'string<) nil))
 
+;;; ---------------------------------------------------------------
+;;; (I) #213 — A STAND-IN MUST READ IN THE PACKAGE OF THE THING IT REPLACES.
+;;;
+;;; mvm/ansi-bridge.lisp carries a hand-written scaffold (SBT-01..SBT-16)
+;;; standing in for structures-03.lsp's `defstruct*` forms, which are commented
+;;; out in the corpus.  Several of its constructors supply SYMBOL slot defaults:
+;;;
+;;;   (defun sbt-02-con-2 (a b) (vector 'sbt-02 a b 'z))
+;;;   (defun sbt-06-con (&optional (a 'p) (b 'q) (c 'r)) (vector 'sbt-06 c b a))
+;;;
+;;; structures-03.lsp declares `(in-package :cl-test)`, so the values it compares
+;;; those against are CL-TEST::Z / CL-TEST::P.  ansi-bridge.lisp declares no
+;;; package, so before #213 the scaffold produced MODUS.MVM::Z — correctly NOT
+;;; EQL, and (once #211 made per-file package identity real) correctly failing:
+;;; gate IDs 15733/15734/15743/15744/15745, i.e. structures-03 02/2, 02/3 and
+;;; 06/1-3.  The discriminator that identifies the mechanism: 02/1 (expects
+;;; 1 2 3) and 06/4 (supplies all three values itself) contain no
+;;; scaffold-supplied symbol and passed throughout.
+;;;
+;;; I2 is the property the fix installs; I1 records the guard-driven fallback
+;;; that keeps the clean images (which bake ansi-bridge.lisp but have no
+;;; CL-TEST and no structures-03) byte-identical; I3 guards the precondition.
+;;; ---------------------------------------------------------------
+(defun ansi-bridge-text ()
+  (let ((path (merge-pathnames "../mvm/ansi-bridge.lisp" *load-truename*)))
+    (with-open-file (s path)
+      (let ((buf (make-string (file-length s))))
+        (subseq buf 0 (read-sequence buf s))))))
+
+(defun bridge-defun (forms name)
+  (find-if (lambda (f)
+             (and (consp f) (symbolp (car f))
+                  (string= (symbol-name (car f)) "DEFUN")
+                  (symbolp (cadr f))
+                  (string= (symbol-name (cadr f)) name)))
+           forms))
+
+;;; I1: with CL-TEST absent, READ-ALL-FORMS-WITH-LOCATIONS' FIND-PACKAGE guard
+;;; declines to switch and the block reads in MODUS.MVM, exactly as before #213.
+;;; This is what the five clean-image builds that bake ansi-bridge.lisp see.
+(let ((existing (find-package "CL-TEST")))
+  (when existing (delete-package existing)))
+(let* ((forms (forms-of (wrapped (ansi-bridge-text))))
+       (con2 (bridge-defun forms "SBT-02-CON-2")))
+  (chk "I1: CL-TEST absent -> the guard declines, scaffold reads in MODUS.MVM"
+       (pkg-of (find-sym-named "Z" con2)) "MODUS.MVM"))
+
+;;; I2: with CL-TEST present — the state every ANSI gate build is in by the time
+;;; build-image reads the blob (build-ansi-common.lisp creates it at the
+;;; `(defpackage "CL-TEST" (:use "CL"))` line, the wrappers' build-image call is
+;;; the LAST form in the script) — the scaffold's symbol defaults must land in
+;;; CL-TEST, and the switch must not leak into the rest of the file.
+(make-package "CL-TEST" :use '("CL"))
+(let* ((forms (forms-of (wrapped (ansi-bridge-text))))
+       (con2 (bridge-defun forms "SBT-02-CON-2"))
+       (con6 (bridge-defun forms "SBT-06-CON"))
+       (con3 (bridge-defun forms "SBT-02-CON-3"))
+       ;; The first defun AFTER the scaffold block, and one further out.
+       ;; Probed via a LAMBDA-LIST variable / a non-CL name: a defun named
+       ;; REVERSE reads as COMMON-LISP:REVERSE in both MODUS.MVM and CL-TEST
+       ;; (both :use "CL"), so the NAME of an inherited symbol discriminates
+       ;; nothing — only home-package-less symbols do.
+       (after-adjacent (bridge-defun forms "REVERSE"))
+       (after (bridge-defun forms "%CHECK-KW-ALLOWED"))
+       ;; …and one from before it.
+       (before (bridge-defun forms "EXPAND-IN-CURRENT-ENV")))
+  (chk "I2: sbt-02-con-2's 'Z default interns in CL-TEST"
+       (pkg-of (find-sym-named "Z" con2)) "CL-TEST")
+  (chk "I2: sbt-02-con-3's 'X and 'Y defaults too"
+       (list (pkg-of (find-sym-named "X" con3))
+             (pkg-of (find-sym-named "Y" con3)))
+       (list "CL-TEST" "CL-TEST"))
+  (chk "I2: sbt-06-con's 'P 'Q 'R lambda-list defaults too"
+       (list (pkg-of (find-sym-named "P" con6))
+             (pkg-of (find-sym-named "Q" con6))
+             (pkg-of (find-sym-named "R" con6)))
+       (list "CL-TEST" "CL-TEST" "CL-TEST"))
+  (chk "I2: the scaffold's own names are in CL-TEST"
+       (pkg-of (cadr con2)) "CL-TEST")
+  (chk "I2: code BEFORE the block is untouched (MODUS.MVM)"
+       (pkg-of (cadr before)) "MODUS.MVM")
+  (chk "I2: the very next defun after the block is back in MODUS.MVM"
+       (pkg-of (car (caddr after-adjacent))) "MODUS.MVM")
+  (chk "I2: code AFTER the block is back in MODUS.MVM — the switch is SCOPED"
+       (pkg-of (cadr after)) "MODUS.MVM"))
+
+;;; I3: the precondition.  The scaffold only lands in CL-TEST because the ANSI
+;;; harness has created that package host-side by the time build-image reads the
+;;; concatenated blob; the reader's guard silently declines otherwise, which
+;;; would make the fix a no-op that still looks landed.  Guard the ordering:
+;;; build-ansi-common.lisp must create CL-TEST, and must not delete it after.
+(let* ((path (merge-pathnames "../mvm/build-ansi-common.lisp" *load-truename*))
+       (text (with-open-file (s path)
+               (let ((buf (make-string (file-length s))))
+                 (subseq buf 0 (read-sequence buf s)))))
+       (create (search "(defpackage \"CL-TEST\"" text))
+       (last-delete (let ((p nil) (start 0))
+                      (loop (let ((hit (search "(delete-package \"CL-TEST\")"
+                                               text :start2 start)))
+                              (if hit (progn (setq p hit) (setq start (1+ hit)))
+                                  (return p)))))))
+  (chk "I3: build-ansi-common.lisp creates CL-TEST host-side" (integerp create) t)
+  (chk "I3: …and does not delete it afterwards"
+       (or (null last-delete) (and create (< last-delete create))) t))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

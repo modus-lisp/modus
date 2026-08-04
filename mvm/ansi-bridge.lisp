@@ -373,6 +373,36 @@
 ;;; as a vector #(<tag-sym> slot-0 slot-1 …) and accessors index
 ;;; via aref — `(setf (aref …) …)` already works in Modus so setf
 ;;; on accessors comes for free.  ~25 lines per struct.
+;;;
+;;; #213 — THIS BLOCK READS IN CL-TEST, and must.  structures-03.lsp
+;;; declares `(in-package :cl-test)` itself, so the values it compares
+;;; against are CL-TEST::X/Y/Z/P/Q/R.  The rest of ansi-bridge.lisp has no
+;;; package declaration, so it reads in MODUS.MVM (mvm-text's per-file
+;;; reset, #211) — and a stand-in that produced MODUS.MVM::Z for a slot
+;;; default was handing back a symbol that is correctly NOT EQL to the
+;;; CL-TEST::Z the test expects.  Since #211 made per-file package
+;;; identity real that stopped being invisible: structures-03 tests
+;;; 02/2, 02/3 and 06/1-3 (every test whose EXPECTATION contains a
+;;; scaffold-supplied symbol) failed, while 02/1 and 06/4 — which supply
+;;; all their own values — kept passing.  A stand-in belongs in the
+;;; package of the thing it stands in for.
+;;;
+;;; Scoped, not file-wide: the switch back to :modus.mvm at the end of the
+;;; block is load-bearing (mvm-text's trailing reset would catch it at the
+;;; end of the file, but everything after this block would read in CL-TEST
+;;; until then).
+;;;
+;;; Requires CL-TEST to exist HOST-SIDE at the moment the concatenated
+;;; build blob is read, because read-all-forms-with-locations' FIND-PACKAGE
+;;; guard (cross.lisp) declines to switch to a package that does not exist.
+;;; In the four ANSI gate builds it does: build-ansi-common.lisp creates it
+;;; long before build-image reads the blob.  In the clean images that also
+;;; bake ansi-bridge.lisp (build-generic-cli / build-generic / build-i386-cli
+;;; / build-x64-cl-repl / build-modus-selfhost) CL-TEST does not exist, the
+;;; guard declines, this block reads in MODUS.MVM exactly as before, and
+;;; those images are unchanged — which is right: there is no structures-03
+;;; in them for the stand-in to stand in for.
+(in-package :cl-test)
 
 ;; SBT-01: (:constructor sbt-01-con (b a c)) — slots a b c.
 (defun sbt-01-con (b a c) (vector 'sbt-01 a b c))
@@ -495,6 +525,11 @@
 (defun sbt-16-a (s) (aref s 1))
 (defun sbt-16-b (s) (aref s 2))
 (defun sbt-16-c (s) (aref s 3))
+
+;;; End of the CL-TEST-scoped structures-03 stand-in.  Everything below is
+;;; ordinary harness code and must read in MODUS.MVM again — see the #213
+;;; note at the head of the block.
+(in-package :modus.mvm)
 
 ;; Sequence-aware REVERSE / NREVERSE — the prelude versions only handle
 ;; lists.  CLHS reverse/nreverse take any sequence (list, vector, string).

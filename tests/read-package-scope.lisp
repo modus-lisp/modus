@@ -326,6 +326,31 @@
   (chk "H2: no build script strips in-package from a contained blob"
        (nreverse offenders) nil))
 
+;;; H3: EVERY build script's MVM-TEXT must scope the file it reads.  H2 catches
+;;; an eraser that removes containment; this catches containment that was never
+;;; applied.  mvm/build-x64-cl-repl.lisp landed on main with an eighth,
+;;; unwrapped copy of MVM-TEXT while this change was being gated — and it bakes
+;;; x64-asm.lisp (:modus.asm), translate-x64.lisp (:modus.mvm.x64), mvm.lisp,
+;;; compiler.lisp, interp.lisp, prelude.lisp and gc.lisp, so every one of those
+;;; declarations was leaking into the rest of its blob.  A copy of MVM-TEXT is
+;;; easy to add and easy to forget; this makes forgetting fail loudly.
+(let* ((build-dir (merge-pathnames "../mvm/" *load-truename*))
+       (unscoped nil))
+  (dolist (path (directory (merge-pathnames "build-*.lisp" build-dir)))
+    (let ((text (with-open-file (s path)
+                  (let ((buf (make-string (file-length s))))
+                    (subseq buf 0 (read-sequence buf s))))))
+      (let ((p (search "(defun mvm-text " text)))
+        (when p
+          ;; the body up to the next top-level form
+          (let* ((end (or (search (format nil "~%(") text :start2 (1+ p))
+                          (length text)))
+                 (body (subseq text p end)))
+            (unless (search "%build-package-scoped-source" body)
+              (push (file-namestring path) unscoped)))))))
+  (chk "H3: every build script's MVM-TEXT applies the per-file package scope"
+       (sort unscoped #'string<) nil))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

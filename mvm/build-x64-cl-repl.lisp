@@ -91,7 +91,15 @@
 (defun mvm-text (relative-path)
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (read-file-text path)))
+    ;; #211: wrap each file so its own (in-package …) cannot leak into the
+    ;; next file of the concatenated build blob.  This build bakes
+    ;; x64-asm.lisp (:modus.asm), translate-x64.lisp (:modus.mvm.x64),
+    ;; mvm.lisp, compiler.lisp, interp.lisp, prelude.lisp and gc.lisp — the
+    ;; build reader HONOURS in-package, and it is handed one concatenated
+    ;; blob, so without this each declaration would set the read package for
+    ;; every file after it.  See modus.mvm::*build-package-reset-text*; keep
+    ;; every mvm-text copy identical.
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))
 
 (format t "Reading source files...~%")
 
@@ -185,7 +193,11 @@
           (marker "(defun install-x64-translator"))
       (let ((pos (search marker src)))
         (unless pos (error "WS5-JIT: could not find install-x64-translator strip marker"))
-        (subseq src 0 pos)))))
+        ;; #211: the trim cuts off mvm-text's trailing reset — re-append it, or
+        ;; translate-x64.lisp's (in-package :modus.mvm.x64) leaks into whatever
+        ;; is concatenated next.
+        (concatenate 'string (subseq src 0 pos)
+                     modus.mvm::*build-package-reset-text*)))))
 ;; Co-init that populates the translator's defvar lookup tables at boot AND sets
 ;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
 ;; installs (build-ansi-common-x64.lisp *x64-translator-coinit-source*), plus a

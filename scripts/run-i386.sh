@@ -30,7 +30,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${MODUS_I386_OUT:-/home/claude/ws5-gate-out/modus-i386-cli}"
+IMAGE="${MODUS_I386_OUT:-/tmp/modus-i386-cli}"
 QEMU="${QEMU_I386:-qemu-i386-static}"
 
 die() { echo "run-i386: $*" >&2; exit 1; }

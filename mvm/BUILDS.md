@@ -64,7 +64,7 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 |---|---|---|---|
 | `build-generic-cli` | x64 | **the canonical `./modus` CLI** — SBCL-faithful flags, net stack, JIT on | OK |
 | `build-aarch64-cli` | aarch64 | the aarch64 CLI / JIT host | OK |
-| `build-i386-cli` | i386 | the 32-bit CLI (WS5 #200) | env |
+| `build-i386-cli` | i386 | the 32-bit CLI (WS5 #200) | **OK** (layer 5) |
 | `build-x64-linux` | x64 | **ANSI gate runner** (the 64-shard conformance number) | OK |
 | `build-aarch64-linux` | aarch64 | ANSI gate runner | OK |
 | `build-generic` | x64 | minimal image that LOADs argv[1] | OK |
@@ -116,9 +116,30 @@ The 12 failures are NOT 12 atrophied scripts. By actual cause:
 
 1. **2 × expected** — `build-ansi-common-{x64,aarch64}` are libraries, not
    entry points. Not a defect.
-2. **1 × environment** — `build-i386-cli` wants
-   `/home/claude/ws5-gate-out/modus-i386-cli.symmap`, a path from another
-   worktree. The build is fine; the default output path is not.
+2. **1 × environment — FIXED.** `build-i386-cli` wrote to
+   `/home/claude/ws5-gate-out/…`, a path from a worktree that no longer
+   exists (3 sites: image, symmap, and a build-time fixture).  Defaults now
+   point at `/tmp/modus-i386-cli`; `MODUS_I386_OUT` still overrides.
+
+   The bigger trap was underneath: `*i386-layer*` **defaults to 1**, and
+   layer 1 bakes `prelude.lisp` ONLY — no gc/rt (≥2), no CL bridge (≥3), no
+   compiler/mvm-eval (≥5).  So the default `build-i386-cli` produced a
+   bring-up rung, not the i386 CLI, and reported *2500 unresolved calls with
+   no `%UNRESOLVED-FN` stub at all* — correctly, since `cl-sequences.lisp`
+   (where the stub lives) simply is not in a layer-1 image.  At **layer 5**
+   the image builds clean (41.8 MB), unresolved falls to **55 → the real
+   stub**, the EAX/VR invariant is clean, and it RUNS under
+   `qemu-i386-static` (probe 5 evaluates: `e1=42 e2=3 e3=42 e4=66 e5=1`).
+
+   `mvm/build.lisp` now sets `MODUS_I386_LAYER=5` for the
+   `i386/hosted/-/cli` cell, so the matrix key means the CLI rather than
+   rung 1 of its ladder.
+
+   **Remaining real i386 gap: floating point.**  13 distinct translator
+   gaps, and 157 of the ~165 sites are float ops —
+   `FDIV ×57, FMUL ×31, FADD ×24, FSUB ×22, ITOF ×17, FTOI ×6` — plus 8
+   traps and `SAP-NEW`/`SAP-ADDR`.  That is #201 (width-neutral numeric
+   tower), not a build defect.
 3. **1 × REAL bit-rot** — `build-fixpoint`:
    `Fixpoint content (15399263 bytes) exceeds metadata offset 0x400000`.
    The image has outgrown the fixpoint layout. Genuinely stale.

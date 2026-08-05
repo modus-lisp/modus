@@ -7,7 +7,7 @@
 ;;;; aarch64.  This is the vehicle for getting it onto a 32-bit word.
 ;;;;
 ;;;;   sbcl --dynamic-space-size 8192 --script mvm/build-i386-cli.lisp
-;;;;   qemu-i386-static /home/claude/ws5-gate-out/modus-i386-cli <probe>
+;;;;   qemu-i386-static /tmp/modus-i386-cli <probe>
 ;;;;
 ;;;; MODUS_I386_LAYER selects how much of the stack is baked in.  Bringing a
 ;;;; new word size up one layer at a time is the whole point: each layer is a
@@ -1257,7 +1257,7 @@
 (defvar *i386-fixture-dir*
   ;; Beside the image, never inside the repo: the fixture is build output.
   (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_OUT")
-      "/home/claude/ws5-gate-out/modus-i386-cli"))
+      "/tmp/modus-i386-cli"))
 
 (defvar *loadtest-source*
   (if (>= *i386-layer* 5)
@@ -2062,7 +2062,7 @@
 ;; ---- ENV KNOBS (the complete list; defaults are what ships) ---------------
 ;; PRODUCTION
 ;;   MODUS_I386_OUT=<path>    where to write the image
-;;                            (default /home/claude/ws5-gate-out/modus-i386-cli)
+;;                            (default /tmp/modus-i386-cli)
 ;;   MODUS_I386_SYMMAP=<path> symbol map location (default: image path + .symmap)
 ;;   MODUS_I386_LAYER=1..5    how much of the stack to bake in.  1 prelude,
 ;;                            2 +gc/rt, 3 +the CL bridge, 4 +crypto.  Default 1
@@ -2109,7 +2109,7 @@
 ;;; concurrent / detached-worktree gating this workstream now uses.
 (defvar *i386-image-path*
   (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_OUT")
-      "/home/claude/ws5-gate-out/modus-i386-cli"))
+      "/tmp/modus-i386-cli"))
 (setf *write-symmap-path*
       (or #+sbcl (sb-ext:posix-getenv "MODUS_I386_SYMMAP")
           (concatenate 'string *i386-image-path* ".symmap")))

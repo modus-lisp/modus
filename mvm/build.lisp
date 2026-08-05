@@ -161,13 +161,36 @@
       ;; accept a legacy script name too, so muscle memory keeps working
       (find key *matrix* :key #'row-legacy :test #'string-equal)))
 
-(defun run-legacy (script)
+;;; Per-cell environment.  A legacy script may need env vars to build the
+;;; REAL image rather than a bring-up rung — see the i386 entry, where the
+;;; script's own default is MODUS_I386_LAYER=1 (prelude only, no CL bridge
+;;; at all).  Putting the layer here means the matrix cell means what it
+;;; says: "i386/hosted/-/cli" builds the i386 CLI, not rung 1 of its
+;;; bring-up ladder.
+(defparameter *cell-env*
+  '(("i386/hosted/-/cli"
+     ("MODUS_I386_LAYER"  . "5")
+     ("MODUS_I386_OUT"    . "/tmp/modus-i386-cli")
+     ("MODUS_I386_SYMMAP" . "/tmp/modus-i386-cli.symmap"))))
+
+(defun apply-cell-env (key)
+  (let ((entry (assoc key *cell-env* :test #'string-equal)))
+    (when entry
+      (require :sb-posix)
+      (dolist (kv (cdr entry))
+        ;; Do NOT clobber an explicit override from the caller.
+        (unless (sb-ext:posix-getenv (car kv))
+          (funcall (intern "SETENV" :sb-posix) (car kv) (cdr kv) 1)
+          (format t "~&build.lisp: ~A=~A~%" (car kv) (cdr kv)))))))
+
+(defun run-legacy (script &optional key)
   "Delegate to a build-*.lisp, unchanged."
   (let ((path (merge-pathnames (concatenate 'string script ".lisp")
                                (directory-namestring (truename *load-truename*)))))
     (unless (probe-file path)
       (format *error-output* "build.lisp: no such build script: ~A~%" path)
       (sb-ext:exit :code 2))
+    (when key (apply-cell-env key))
     (format t "~&build.lisp: delegating to ~A (cell not yet migrated)~%" script)
     (load path)))
 
@@ -211,4 +234,4 @@
           (print-matrix)
           (sb-ext:exit :code 2))
          ((eq (row-status row) :native) (build-cell row))
-         (t (run-legacy (row-legacy row))))))))
+         (t (run-legacy (row-legacy row) (row-key row))))))))

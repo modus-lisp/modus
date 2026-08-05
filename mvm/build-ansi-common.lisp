@@ -127,18 +127,16 @@
 ;; In-image override of the host-only ieee-float-* / bignum-literal helpers
 ;; (compiler.lisp uses sb-kernel:double-float-*).  Appended AFTER the compiler
 ;; source so it wins (last-defun).  Verbatim from build-generic.lisp.
-(defvar *stage2-float-override* "
-(defun ieee-float-bits (f)
-  (logior (ash (logand (%prim-aref f 0) 4294967295) 32)
-          (logand (%prim-aref f 1) 4294967295)))
-(defun ieee-float-hi32 (f) (logand (%prim-aref f 0) 4294967295))
-(defun ieee-float-lo32 (f) (logand (%prim-aref f 1) 4294967295))
-(defun %lit-bignum-big-p (value) (big-bignum-p value))
-(defun %lit-bn-lo (value) (bignum-lo value))
-(defun %lit-bn-hi (value) (bignum-hi value))
-(defun %lit-bb-sign (value) (%bb-sign value))
-(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
-(defun %lit-bb-limb (value k) (%bb-limb value k))
+(defvar *stage2-float-override*
+  ;; #201: the float/bignum literal accessors are ONE definition, in
+  ;; mvm/float-slot-overrides.lisp (they encode the float object's SLOT LAYOUT;
+  ;; six duplicated copies made a layout change silent-corruption-prone).  The
+  ;; %GLOBAL-NAME-KEY override below is ANSI-image-specific and stays here.
+  (concatenate 'string
+   (let ((p (merge-pathnames "mvm/float-slot-overrides.lisp" *modus-base*)))
+     (modus.mvm::check-parses p)
+     (concatenate 'string (string #\Newline) (read-file-text p)))
+   "
 ;; In-image override of %GLOBAL-NAME-KEY (the SYMBOL-VALUE / SET-SYMBOL-VALUE
 ;; alist key the mvm-eval compiler emits for a GLOBAL variable read/write).  The
 ;; host/native version is NORMALIZE-NAME = compute-name-hash(symbol-name sym).
@@ -167,7 +165,7 @@
        (if h h (normalize-name sym))))
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
-")
+"))
 ;; Generated boot-time populator for *opcode-table* (the host *opcode-table*
 ;; is populated when mvm.lisp/compiler.lisp load host-side for macro scanning).
 (defvar *opcode-table-init-source*

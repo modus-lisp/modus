@@ -27,8 +27,8 @@
    treat -0.0 - 0.0 = -0.0 as a strict negative → numeric-equal-p 0.0 -0.0
    returned NIL → subtypep-float signed-zero range subset checks failed.
    Mask off the sign bit before comparing the hi slot."
-  (and (= (logand (aref x 0) #x7FFFFFFF) 0)
-       (= (logand (aref x 1) #xFFFFFFFF) 0)))
+  (and (= (logand (%float-hi32 x) #x7FFFFFFF) 0)
+       (= (%float-lo32 x) 0)))
 
 ;;; ============================================================
 ;;; Transcendental functions — rational approximations via Taylor
@@ -1625,8 +1625,8 @@
   (cond
     ((eq a b) t)
     ((and (%ieee-float-p a) (%ieee-float-p b))
-     (and (= (aref a 0) (aref b 0))
-          (= (aref a 1) (aref b 1))))
+     (and (= (%float-hi32 a) (%float-hi32 b))
+          (= (%float-lo32 a) (%float-lo32 b))))
     ((and (ratiop a) (ratiop b))
      (and (= (aref a 0) (aref b 0))
           (= (aref a 1) (aref b 1))))
@@ -2295,7 +2295,7 @@
        (not (characterp x))
        (let ((st (obj-subtag x)))
          (or (= st #x60) (and (>= st #x64) (<= st #x66))))
-       (= (array-length x) 2)))
+       (= (array-length x) 4)))
 
 (defun %float-declared-type (x)
   "The declared CL float type of IEEE float X, from its subtag."
@@ -2318,10 +2318,10 @@
    HI/LO (the same hi32/lo32 fixnum representation existing floats use).
    Dispatches to the per-subtag alloc primops (compiler.lisp)."
   (cond
-    ((eq type 'single-float) (let ((o (%make-single2))) (aset o 0 hi) (aset o 1 lo) o))
-    ((eq type 'short-float)  (let ((o (%make-short2)))  (aset o 0 hi) (aset o 1 lo) o))
-    ((eq type 'long-float)   (let ((o (%make-long2)))   (aset o 0 hi) (aset o 1 lo) o))
-    (t                       (let ((o (%make-float2)))  (aset o 0 hi) (aset o 1 lo) o))))
+    ((eq type 'single-float) (let ((o (%make-single2))) (%float-set-bits o hi lo)))
+    ((eq type 'short-float)  (let ((o (%make-short2)))  (%float-set-bits o hi lo)))
+    ((eq type 'long-float)   (let ((o (%make-long2)))   (%float-set-bits o hi lo)))
+    (t                       (let ((o (%make-float2)))  (%float-set-bits o hi lo)))))
 
 (defun %round-to-single (f)
   "Round the IEEE-double payload of float F to single-float (24-bit)
@@ -2331,13 +2331,13 @@
    printer path expects).  Zero / subnormal / inf / nan pass through
    retagged (not rounded).  HI stored sign-extended to match the SSE2
    float-store convention (translate-x64.lisp)."
-  (let* ((hi   (logand (aref f 0) 4294967295))
-         (lo   (logand (aref f 1) 4294967295))
+  (let* ((hi   (%float-hi32 f))
+         (lo   (%float-lo32 f))
          (sign (logand (ash hi -31) 1))
          (exp  (logand (ash hi -20) 2047))
          (mant (logior (ash (logand hi 1048575) 32) lo)))   ; 52-bit fraction
     (if (or (= exp 0) (= exp 2047))
-        (%make-typed-float (aref f 0) (aref f 1) 'single-float)
+        (%make-typed-float hi lo 'single-float)
         (let* ((keep (ash mant -29))                 ; top 23 fraction bits
                (rem  (logand mant 536870911))        ; low 29 bits (2^29-1)
                (half 268435456)                      ; 2^28
@@ -2364,12 +2364,12 @@
    (float i 0.0s0) yields a real short-float (#x65), not a single (#x64)."
   (cond
     ((or (eq type 'double-float) (eq type 'long-float))
-     (%make-typed-float (aref f 0) (aref f 1) type))
+     (%make-typed-float (%float-hi32 f) (%float-lo32 f) type))
     (t                                   ; single / short: round to 24-bit
      (let ((s (%round-to-single f)))     ; #x64, 24-bit-rounded payload
        (if (eq type 'single-float)
            s
-           (%make-typed-float (aref s 0) (aref s 1) type))))))   ; retag short
+           (%make-typed-float (%float-hi32 s) (%float-lo32 s) type))))))   ; retag short
 
 (defun %float-result-type (a b)
   "CL float contagion (CLHS 12.1.4.4): the result float format is the
@@ -2395,9 +2395,8 @@
    Layout: sign|11-bit exponent|52-bit mantissa.  Value = (-1)^sign *
    (1 + mantissa/2^52) * 2^(exponent - 1023) for normal floats; subnormal
    has implicit-1 bit cleared and exponent = -1022."
-  (let* ((hi (aref x 0))                              ; tagged fixnum, may be negative if sign bit set
-         (lo (aref x 1))                              ; lo 32 bits (unsigned in 0..2^32-1)
-         (hi-u32 (logand hi 4294967295))              ; mask to unsigned 32-bit
+  (let* ((hi-u32 (%float-hi32 x))                     ; high 32 IEEE bits, unsigned
+         (lo (%float-lo32 x))                         ; low 32 IEEE bits, unsigned
          (sign-bit (logand (ash hi-u32 -31) 1))
          (exponent (logand (ash hi-u32 -20) 2047))   ; 11 bits
          (mantissa-hi (logand hi-u32 1048575))        ; low 20 bits of hi
@@ -2660,7 +2659,7 @@
    stored SIGNED (negative fixnum) by the arithmetic path or UNSIGNED
    (0..2^32-1) by the reader's single-float literal path, so test bit 31
    directly after masking to 32 bits rather than relying on fixnum sign."
-  (= (logand (ash (logand (aref x 0) 4294967295) -31) 1) 1))
+  (= (logand (ash (%float-hi32 x) -31) 1) 1))
 
 (defun %bignum-trunc-doubling (na nb)
   "Return ⌊na/nb⌋ where NA, NB are non-negative integers (fixnum or
@@ -2754,12 +2753,12 @@
   "Extract absolute integer part of boxed float X (truncate toward zero).
    For the REAL tests, only used with positive floats (0.0001) and
    negative floats (-0.0001) which both have integer part 0."
-  (if (< (aref x 0) 0)
+  (if (>= (%float-hi32 x) 2147483648)
       ;; Negative float: for small values like -0.0001, integer part is 0
       0
       ;; Positive float: extract from hi32/lo32
-      (let ((raw-hi (ash (aref x 0) -1))
-            (raw-lo (ash (aref x 1) -1)))
+      (let ((raw-hi (ash (%float-hi32 x) -1))
+            (raw-lo (ash (%float-lo32 x) -1)))
         (let ((exp-biased (logand (ash raw-hi -20) 2047)))
           (let ((exponent (- exp-biased 1023)))
             (if (< exponent 0)
@@ -2781,12 +2780,11 @@
    Used to short-circuit range comparisons against integers without
    coercing through %ieee-float-to-rat (whose denominators of the form
    ash 1 66 overflow modus's 63-bit fixnums)."
-  (let* ((hi (aref x 0))
-         (hi-u32 (logand hi 4294967295))
+  (let* ((hi-u32 (%float-hi32 x))
          (sign-bit (logand (ash hi-u32 -31) 1))
          (exponent (logand (ash hi-u32 -20) 2047)))
     (cond
-      ((and (= exponent 0) (= (aref x 1) 0)
+      ((and (= exponent 0) (= (%float-lo32 x) 0)
             (= (logand hi-u32 1048575) 0)) 0)    ; ±zero
       ((and (= sign-bit 1) (< exponent 1023)) -1) ; -1 < x < 0
       ((= sign-bit 1) -2)                         ; x <= -1

@@ -45,9 +45,9 @@
         (= (obj-subtag x) 96)))))
 
 (defun rt-float-equal (a b)
-  "Compare two boxed floats by their hi32/lo32 slots."
-  (if (= (aref a 0) (aref b 0))
-      (= (aref a 1) (aref b 1))
+  "Compare two boxed floats by their IEEE bits (four 16-bit chunk slots)."
+  (if (= (%float-hi32 a) (%float-hi32 b))
+      (= (%float-lo32 a) (%float-lo32 b))
       nil))
 
 (defun %rt-unadj (x)

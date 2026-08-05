@@ -2106,8 +2106,7 @@
   "True iff F is an IEEE float whose exponent is all-ones (±inf or NaN).
    Used by expt to detect IEEE-double overflow without trapping MXCSR."
   (and (%ieee-float-p f)
-       (let* ((hi (aref f 0))
-              (hi-u32 (logand hi 4294967295))
+       (let* ((hi-u32 (%float-hi32 f))
               (exp-biased (logand (ash hi-u32 -20) 2047)))
          (= exp-biased 2047))))
 
@@ -2116,10 +2115,8 @@
    Used by expt's underflow detection — if both operands were non-zero
    but the product is zero, MULSD denormalized to zero (underflow)."
   (and (%ieee-float-p f)
-       (let* ((hi (aref f 0))
-              (lo (aref f 1))
-              (hi-u32 (logand hi 4294967295))
-              (lo-u32 (logand lo 4294967295))
+       (let* ((hi-u32 (%float-hi32 f))
+              (lo-u32 (%float-lo32 f))
               ;; Mask off the sign bit (bit 31 of hi).
               (hi-nosign (logand hi-u32 2147483647)))
          (and (= hi-nosign 0) (= lo-u32 0)))))

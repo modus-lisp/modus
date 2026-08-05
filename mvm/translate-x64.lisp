@@ -437,6 +437,85 @@
     (maybe-store-scratch buf vd)))
 
 ;;; ============================================================
+;;; Boxed IEEE float payload (#201 width-neutral layout)
+;;; ============================================================
+;;;
+;;; A float object is subtag #x60 (or #x64..#x66) with FOUR slots, each holding
+;;; one 16-bit chunk of the IEEE-754 double stored TAGGED (chunk << 1):
+;;;
+;;;   slot 0 = bits 63..48   slot 1 = bits 47..32
+;;;   slot 2 = bits 31..16   slot 3 = bits 15..0
+;;;
+;;; Every chunk is 0..65535, so the stored machine word is 0..131070: always
+;;; positive, always low-bit-0 — the conservative collector reads the slot as a
+;;; fixnum and never follows the float's raw bit pattern as a pointer — and it
+;;; fits a 32-BIT word, which `hi32 << 1' did not.  That is the whole point:
+;;; one layout for x64, aarch64 and i386.  See docs/i386-float-blocker.md.
+;;;
+;;; Layout in memory (raw base R, tagged pointer P = R + 9):
+;;;   [R+0] header = #x460 = (count 4) << 8 | #x60
+;;;   [R+8] padding      [R+16..R+40] slots 0..3
+;;; Object size = align16((4 + 2) * 8) = 48, which is what the GC's
+;;; copy_object computes from the header — allocator and collector agree.
+;;; From the TAGGED pointer, slot i is at offset i*8 + 7.
+
+(defun emit-float-load-bits (buf ptr acc tmp)
+  "Reassemble the four tagged 16-bit chunks of the float object whose TAGGED
+   pointer is in PTR into the 64-bit IEEE bit pattern in ACC.  TMP is clobbered.
+   Each `shl 48 / shr N' pair both masks the chunk to 16 bits and positions it,
+   so a slot carrying junk in its upper bits cannot corrupt a neighbour."
+  ;; slot 0 -> bits 63..48
+  (emit-mov-reg-mem buf acc ptr 7)
+  (emit-sar-reg-imm buf acc 1)
+  (emit-shl-reg-imm buf acc 48)
+  ;; slot 1 -> bits 47..32
+  (emit-mov-reg-mem buf tmp ptr 15)
+  (emit-sar-reg-imm buf tmp 1)
+  (emit-shl-reg-imm buf tmp 48)
+  (emit-shr-reg-imm buf tmp 16)
+  (emit-or-reg-reg buf acc tmp)
+  ;; slot 2 -> bits 31..16
+  (emit-mov-reg-mem buf tmp ptr 23)
+  (emit-sar-reg-imm buf tmp 1)
+  (emit-shl-reg-imm buf tmp 48)
+  (emit-shr-reg-imm buf tmp 32)
+  (emit-or-reg-reg buf acc tmp)
+  ;; slot 3 -> bits 15..0
+  (emit-mov-reg-mem buf tmp ptr 31)
+  (emit-sar-reg-imm buf tmp 1)
+  (emit-shl-reg-imm buf tmp 48)
+  (emit-shr-reg-imm buf tmp 48)
+  (emit-or-reg-reg buf acc tmp))
+
+(defun emit-float-store-bits (buf base src tmp)
+  "Split the 64-bit IEEE bit pattern in SRC into four tagged 16-bit chunks and
+   store them into slots 0..3 of the object whose RAW base is BASE (offsets
+   16/24/32/40).  TMP is clobbered; SRC is preserved."
+  ;; slot 0 = bits 63..48  (SHR is logical, so no mask needed)
+  (emit-mov-reg-reg buf tmp src)
+  (emit-shr-reg-imm buf tmp 48)
+  (emit-shl-reg-imm buf tmp 1)
+  (emit-mov-mem-reg buf base tmp 16)
+  ;; slot 1 = bits 47..32
+  (emit-mov-reg-reg buf tmp src)
+  (emit-shl-reg-imm buf tmp 16)
+  (emit-shr-reg-imm buf tmp 48)
+  (emit-shl-reg-imm buf tmp 1)
+  (emit-mov-mem-reg buf base tmp 24)
+  ;; slot 2 = bits 31..16
+  (emit-mov-reg-reg buf tmp src)
+  (emit-shl-reg-imm buf tmp 32)
+  (emit-shr-reg-imm buf tmp 48)
+  (emit-shl-reg-imm buf tmp 1)
+  (emit-mov-mem-reg buf base tmp 32)
+  ;; slot 3 = bits 15..0
+  (emit-mov-reg-reg buf tmp src)
+  (emit-shl-reg-imm buf tmp 48)
+  (emit-shr-reg-imm buf tmp 48)
+  (emit-shl-reg-imm buf tmp 1)
+  (emit-mov-mem-reg buf base tmp 40))
+
+;;; ============================================================
 ;;; Instruction Translation
 ;;; ============================================================
 
@@ -2547,20 +2626,27 @@
         ;; ================================================================
         ;; IEEE 64-bit float arithmetic — SSE2 lowering.
         ;;
-        ;; Float OBJECTS in modus are subtag #x60, 2 slots:
-        ;;   slot 0 = hi32 tagged fixnum (sign-extended into bits 32..63)
-        ;;   slot 1 = lo32 tagged fixnum (positive when masked to low 32)
-        ;; Stored value = tag-shift left by 1.
+        ;; Float OBJECTS in modus are subtag #x60, FOUR slots (#201), each
+        ;; holding one 16-bit chunk of the IEEE double, stored TAGGED (<< 1):
+        ;;   slot 0 = bits 63..48   slot 1 = bits 47..32
+        ;;   slot 2 = bits 31..16   slot 3 = bits 15..0
+        ;; Every chunk is 0..65535, so the stored word is 0..131070: positive,
+        ;; low-bit-0 (the conservative GC reads it as a fixnum, never as a
+        ;; pointer) and it FITS A 32-BIT MACHINE WORD.  The old 2 x 32-bit
+        ;; layout stored hi32 << 1, which overflows a 32-bit slot and loses the
+        ;; double's sign bit — that is why i386 had no floats.  See
+        ;; docs/i386-float-blocker.md; compiler.lisp +float-slots+ and
+        ;; mvm/float-slot-overrides.lisp must agree with this.
         ;;
         ;; Per-op pattern:
         ;;   1. Stack-save both operand pointers (avoids vreg/scratch aliasing).
-        ;;   2. Pop each, load slot 0 + slot 1, untag (sar 1), combine into a
-        ;;      single u64 of IEEE bits, MOVQ into XMM.
+        ;;   2. Pop each, EMIT-FLOAT-LOAD-BITS to reassemble the four chunks
+        ;;      into a single u64 of IEEE bits, MOVQ into XMM.
         ;;   3. ADDSD / SUBSD / MULSD / DIVSD xmm0, xmm1.
-        ;;   4. Allocate a fresh 2-slot float object via the R12 bump
-        ;;      (header at [R12], padding at [R12+8], slots at [R12+16/24]).
-        ;;   5. MOVQ rcx, xmm0; split into hi32/lo32; tag-shift left by 1;
-        ;;      store back to slots; LEA dest, [R12+9]; ADD R12, 32.
+        ;;   4. Allocate a fresh 4-slot float object via the R12 bump
+        ;;      (header at [R12], padding at [R12+8], slots at [R12+16..40]).
+        ;;   5. MOVQ rcx, xmm0; EMIT-FLOAT-STORE-BITS splits into four tagged
+        ;;      chunks; LEA dest, [R12+9]; ADD R12, 48.
         ;;
         ;; XMM0/XMM1 are caller-saved on System V; modus's allocator doesn't
         ;; otherwise use XMM regs so we can clobber freely.
@@ -2581,58 +2667,34 @@
 
            ;; Pop Vb pointer → load its IEEE bits into xmm1.
            (emit-pop buf 'rax)
-           (emit-mov-reg-mem buf 'rcx 'rax 7)    ; slot 0 (hi32 tagged)
-           (emit-sar-reg-imm buf 'rcx 1)         ; untag
-           (emit-shl-reg-imm buf 'rcx 32)        ; into upper half
-           (emit-mov-reg-mem buf 'rdx 'rax 15)   ; slot 1 (lo32 tagged)
-           (emit-sar-reg-imm buf 'rdx 1)         ; untag (sign-ext)
-           (emit-shl-reg-imm buf 'rdx 32)        ; mask off sign
-           (emit-shr-reg-imm buf 'rdx 32)        ; via shl/shr 32
-           (emit-or-reg-reg buf 'rcx 'rdx)       ; combine
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC9)  ; MOVQ xmm1, rcx
 
            ;; Pop Va pointer → load its IEEE bits into xmm0.
            (emit-pop buf 'rax)
-           (emit-mov-reg-mem buf 'rcx 'rax 7)
-           (emit-sar-reg-imm buf 'rcx 1)
-           (emit-shl-reg-imm buf 'rcx 32)
-           (emit-mov-reg-mem buf 'rdx 'rax 15)
-           (emit-sar-reg-imm buf 'rdx 1)
-           (emit-shl-reg-imm buf 'rdx 32)
-           (emit-shr-reg-imm buf 'rdx 32)
-           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; MOVQ xmm0, rcx
 
            ;; Float op: ADDSD/SUBSD/MULSD/DIVSD xmm0, xmm1
            ;;   F2 0F <op> C1  (ModR/M: 11 000 001 — xmm0 dest, xmm1 src)
            (emit-bytes buf #xF2 #x0F sse-opcode #xC1)
 
-           ;; Allocate fresh 2-slot float object at R12.
-           (emit-mov-reg-imm buf 'rcx #x260)            ; (count=2)<<8 | subtag #x60
+           ;; Allocate fresh 4-slot float object at R12.
+           (emit-mov-reg-imm buf 'rcx #x460)            ; (count=4)<<8 | subtag #x60
            (emit-mov-mem-reg buf 'r12 'rcx 0)           ; header at [R12]
 
            ;; Extract result bits: MOVQ rcx, xmm0
            (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)
 
-           ;; Slot 0 = (hi32 sign-extended) << 1
-           (emit-mov-reg-reg buf 'rdx 'rcx)
-           (emit-sar-reg-imm buf 'rdx 32)
-           (emit-shl-reg-imm buf 'rdx 1)
-           (emit-mov-mem-reg buf 'r12 'rdx 16)
-
-           ;; Slot 1 = (lo32 zero-extended) << 1
-           (emit-mov-reg-reg buf 'rdx 'rcx)
-           (emit-shl-reg-imm buf 'rdx 32)
-           (emit-shr-reg-imm buf 'rdx 32)
-           (emit-shl-reg-imm buf 'rdx 1)
-           (emit-mov-mem-reg buf 'r12 'rdx 24)
+           ;; Four tagged 16-bit chunks into slots 0..3.
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
 
            ;; MCGC object-start bit (R12 still = float base).
            (emit-mcgc-set-start-bit buf 'r12)
-           ;; Result tagged pointer = R12 + 9; advance R12 by 32 bytes.
+           ;; Result tagged pointer = R12 + 9; advance R12 by 48 bytes.
            (let ((d (dest-phys-or-scratch vd)))
              (emit-lea buf d 'r12 9)
-             (emit-add-reg-imm buf 'r12 32)
+             (emit-add-reg-imm buf 'r12 48)
              (maybe-store-scratch buf vd))))
 
         ((op= +op-itof+)
@@ -2645,23 +2707,15 @@
            ;; CVTSI2SD xmm0, rax: F2 REX.W 0F 2A C0
            (emit-bytes buf #xF2 #x48 #x0F #x2A #xC0)
            ;; Allocate + store-back (same tail as fadd)
-           (emit-mov-reg-imm buf 'rcx #x260)
+           (emit-mov-reg-imm buf 'rcx #x460)
            (emit-mov-mem-reg buf 'r12 'rcx 0)
            (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)   ; MOVQ rcx, xmm0
-           (emit-mov-reg-reg buf 'rdx 'rcx)
-           (emit-sar-reg-imm buf 'rdx 32)
-           (emit-shl-reg-imm buf 'rdx 1)
-           (emit-mov-mem-reg buf 'r12 'rdx 16)
-           (emit-mov-reg-reg buf 'rdx 'rcx)
-           (emit-shl-reg-imm buf 'rdx 32)
-           (emit-shr-reg-imm buf 'rdx 32)
-           (emit-shl-reg-imm buf 'rdx 1)
-           (emit-mov-mem-reg buf 'r12 'rdx 24)
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
            ;; MCGC object-start bit (R12 still = float base).
            (emit-mcgc-set-start-bit buf 'r12)
            (let ((d (dest-phys-or-scratch vd)))
              (emit-lea buf d 'r12 9)
-             (emit-add-reg-imm buf 'r12 32)
+             (emit-add-reg-imm buf 'r12 48)
              (maybe-store-scratch buf vd))))
 
         ((op= +op-ftoi+)
@@ -2670,14 +2724,7 @@
                 (vs (second operands)))
            ;; Load Vs float bits → xmm0
            (emit-load-vreg buf vs 'rax)
-           (emit-mov-reg-mem buf 'rcx 'rax 7)
-           (emit-sar-reg-imm buf 'rcx 1)
-           (emit-shl-reg-imm buf 'rcx 32)
-           (emit-mov-reg-mem buf 'rdx 'rax 15)
-           (emit-sar-reg-imm buf 'rdx 1)
-           (emit-shl-reg-imm buf 'rdx 32)
-           (emit-shr-reg-imm buf 'rdx 32)
-           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)   ; MOVQ xmm0, rcx
            ;; CVTTSD2SI rax, xmm0: F2 REX.W 0F 2C C0
            (emit-bytes buf #xF2 #x48 #x0F #x2C #xC0)
@@ -2698,25 +2745,11 @@
            (emit-push buf 'rax)
            ;; Vb → xmm1
            (emit-pop buf 'rax)
-           (emit-mov-reg-mem buf 'rcx 'rax 7)
-           (emit-sar-reg-imm buf 'rcx 1)
-           (emit-shl-reg-imm buf 'rcx 32)
-           (emit-mov-reg-mem buf 'rdx 'rax 15)
-           (emit-sar-reg-imm buf 'rdx 1)
-           (emit-shl-reg-imm buf 'rdx 32)
-           (emit-shr-reg-imm buf 'rdx 32)
-           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC9)   ; MOVQ xmm1, rcx
            ;; Va → xmm0
            (emit-pop buf 'rax)
-           (emit-mov-reg-mem buf 'rcx 'rax 7)
-           (emit-sar-reg-imm buf 'rcx 1)
-           (emit-shl-reg-imm buf 'rcx 32)
-           (emit-mov-reg-mem buf 'rdx 'rax 15)
-           (emit-sar-reg-imm buf 'rdx 1)
-           (emit-shl-reg-imm buf 'rdx 32)
-           (emit-shr-reg-imm buf 'rdx 32)
-           (emit-or-reg-reg buf 'rcx 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)   ; MOVQ xmm0, rcx
            ;; UCOMISD xmm0, xmm1: 66 0F 2E C1
            (emit-bytes buf #x66 #x0F #x2E #xC1)))

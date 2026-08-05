@@ -886,9 +886,8 @@
    (sign mant exp) where value = sign * mant * 2^exp, mant is a non-
    negative integer.  Returns (list sign mant exp) — :infinity for inf,
    :nan for NaN, :zero for ±0.0."
-  (let* ((hi (aref f 0))
-         (lo (aref f 1))
-         (hi-u32 (logand hi 4294967295))
+  (let* ((hi-u32 (%float-hi32 f))
+         (lo (%float-lo32 f))
          (sign-bit (logand (ash hi-u32 -31) 1))
          (exp-biased (logand (ash hi-u32 -20) 2047))
          (mant-hi (logand hi-u32 1048575))

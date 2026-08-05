@@ -869,6 +869,47 @@
                 (setq i (- i 1))))))))
 
 ;;; ============================================================
+;;; Boxed IEEE float slot accessors (#201)
+;;; ============================================================
+;;;
+;;; A boxed float (subtag #x60 double, #x64/#x65/#x66 single/short/long) has
+;;; FOUR slots, each holding one 16-bit chunk of the IEEE-754 double:
+;;;
+;;;   slot 0 = bits 63..48    slot 1 = bits 47..32
+;;;   slot 2 = bits 31..16    slot 3 = bits 15..0
+;;;
+;;; Each chunk is 0..65535, so the stored MACHINE WORD (chunk << 1, the fixnum
+;;; tag) is 0..131070 — always positive, always low-bit-0, so the conservative
+;;; collector reads the slot as a fixnum and never follows the float's raw bit
+;;; pattern as a pointer.  Unlike the old 2 x 32-bit layout, chunk << 1 fits a
+;;; 32-bit machine word, so the layout is width-neutral (x64 / aarch64 / i386).
+;;; See docs/i386-float-blocker.md and mvm/float-slot-overrides.lisp.
+;;;
+;;; EVERY reader of a float's IEEE bits goes through these three functions.
+;;; AREF on a float slot yields the chunk, NOT a 32-bit half — do not open-code
+;;; (aref f 0) as "hi32" anywhere.
+
+(defun %float-hi32 (f)
+  "High 32 IEEE bits of boxed float F, UNSIGNED (0..2^32-1)."
+  (logior (ash (%prim-aref f 0) 16) (%prim-aref f 1)))
+
+(defun %float-lo32 (f)
+  "Low 32 IEEE bits of boxed float F, UNSIGNED (0..2^32-1)."
+  (logior (ash (%prim-aref f 2) 16) (%prim-aref f 3)))
+
+(defun %float-set-bits (f hi lo)
+  "Store the 32-bit halves HI/LO into boxed float F as four 16-bit chunks.
+   HI/LO may be signed (the arithmetic path stores hi32 sign-extended) or
+   unsigned; both are masked to 32 bits first.  Returns F."
+  (let ((h (logand hi 4294967295))
+        (l (logand lo 4294967295)))
+    (%prim-aset f 0 (ash h -16))
+    (%prim-aset f 1 (logand h 65535))
+    (%prim-aset f 2 (ash l -16))
+    (%prim-aset f 3 (logand l 65535))
+    f))
+
+;;; ============================================================
 ;;; Object Printer
 ;;; ============================================================
 

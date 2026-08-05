@@ -63,8 +63,14 @@ if ! tail -1 "$OUT" 2>/dev/null | grep -q '^> $'; then
     exit 1
 fi
 
-# Send expression
-printf '%s\n' "$EXPR" >&3
+# Send expression.
+# CR, not LF: the bare-metal serial line editor terminates a line on CR
+# (0x0D) and ignores LF.  Sending "\n" made this helper silently produce
+# NOTHING and exit 0 — the expression echoed at the prompt and was never
+# evaluated, so the extraction below found no result line.  Verified on both
+# x64 and aarch64: with "\r" a bare symbol evaluates and prints, with "\n" it
+# does not.
+printf '%s\r' "$EXPR" >&3
 sleep 1
 
 # Close FIFO and let QEMU process

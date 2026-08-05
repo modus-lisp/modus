@@ -3,6 +3,31 @@
 36 scripts, 30,387 lines. They are essentially **arch × (hosted | bare) × board**,
 plus a payload axis (repl / ssh / actors / CLI / ANSI-gate / self-host).
 
+## Running them — one entry point
+
+```bash
+./scripts/run.sh list           # the run matrix
+./scripts/run.sh x64-repl       # interactive
+./scripts/run.sh aarch64-ssh    # boot, wait for sshd, smoke test
+```
+
+`scripts/run.sh` replaces ~14 near-identical `run-<arch>-<payload>.sh`
+launchers.  They were copy-paste siblings that had **drifted**, and the drift
+was the real cost: `run-aarch64-ssh` rebuilt the kernel on *every* invocation
+while `run-x64-ssh` checked staleness; x64/i386 wrapped QEMU in `no-thp-exec`
+to dodge THP-compaction hangs while aarch64/arm32 did not.  Every QEMU flag
+in `run.sh`'s table is transcribed verbatim from the script it replaces.
+
+**BUILD status is not RUN status.**  Every row below was *built*; that says
+nothing about whether the image evaluates.  Two verified examples:
+- `scripts/run-repl-eval.sh` sent `\n`; the bare-metal serial line editor
+  terminates on `\r`.  It therefore produced NO output and exited 0 — a
+  silent pass.  Fixed.
+- With `\r`, `build-x64-repl` and `build-aarch64-repl` both evaluate a bare
+  symbol (`x` → `nil`) but a call (`(+ 1 2)`) echoes and never returns, on
+  **both** arches.  That is legacy `repl-source.lisp` rot and is exactly the
+  argument for #204 (retire the second Lisp; put every image on CL/mvm).
+
 Every row below was **built from a clean worktree on 2026-08-02** (all 36,
 concurrently). `BUILD` is that result — not a guess from file dates.
 
@@ -53,8 +78,10 @@ concurrently). `BUILD` is that result — not a guess from file dates.
 |---|---|
 | `build-ansi-common` (4646 L) | loaded by all 4 gate wrappers (+ `build-aarch64-cli`); arch chosen by `*ansi-target-arch*` |
 
-These two **fail standalone by design** — they are not entry points. They are
-also ~94% identical (253 diff lines, 7 hunks); merging them is task #208.
+This **fails standalone by design** — it is not an entry point. It is the
+result of #208 (LANDED): the two ~94%-identical `build-ansi-common-{x64,
+aarch64}` files were merged into one, so a shared-harness fix no longer has
+to be applied twice with nothing enforcing it.
 
 ---
 
@@ -79,9 +106,10 @@ The 12 failures are NOT 12 atrophied scripts. By actual cause:
 
 ## What to actually consolidate
 
-- **Do**: merge the two `build-ansi-common-*` (#208) — ~4,250 duplicated lines,
-  and a shared-harness fix currently has to be applied twice with nothing
+- **DONE (#208)**: merged the two `build-ansi-common-*` — ~4,250 duplicated lines,
+  and a shared-harness fix had to be applied twice with nothing
   enforcing it.
+- **DONE**: `scripts/run.sh` — one entry point for ~14 drifted QEMU launchers.
 - **Do**: retire `repl-source.lisp` (#204). Note the whole broken RPi family
   builds `*repl-source*` — the second Lisp and the broken cell overlap heavily.
   Step 1 has landed: `build-x64-cl-repl` is a bare-metal multiboot image whose

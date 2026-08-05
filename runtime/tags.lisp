@@ -67,6 +67,18 @@
 ;;; A single-float parked there was scanned as an mvm-module, its raw IEEE
 ;;; bit-slots were followed as pointers, and the resulting corrupted funcall
 ;;; crashed with RIP=0xDEAD1004.  See CLAUDE.md.
+;;; LAYOUT (#201): every float object — #x60 and #x64..#x66 alike — has FOUR
+;;; slots, each holding one 16-bit chunk of the IEEE-754 double, stored TAGGED
+;;; (chunk << 1):
+;;;   slot 0 = bits 63..48   slot 1 = bits 47..32
+;;;   slot 2 = bits 31..16   slot 3 = bits 15..0
+;;; Each chunk is 0..65535, so the stored word is 0..131070: positive,
+;;; low-bit-0 (the conservative collector reads it as a fixnum and never
+;;; follows the float's bit pattern as a pointer) and — unlike the previous
+;;; 2 x 32-bit layout, where hi32 << 1 overflowed a 32-bit word and lost the
+;;; SIGN BIT — it fits a 32-bit machine word.  That is what makes the layout
+;;; width-neutral across x64 / aarch64 / i386.  See docs/i386-float-blocker.md.
+(defconstant +float-slots+ 4)             ; see compiler.lisp (authoritative)
 (defconstant +subtag-float+ #x60)         ; double-float (the default float)
 (defconstant +subtag-mvm-module+ #x61)    ; DO NOT hold numeric payloads here
 (defconstant +subtag-single-float+ #x64)

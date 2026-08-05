@@ -69,8 +69,23 @@
 ;; compile-time and reader-parsed keyword references.
 (defconstant +subtag-keyword+ #x53)
 (defconstant +subtag-float+  #x60)
+;; #201 — WIDTH-NEUTRAL FLOAT LAYOUT.  A boxed float has FOUR slots, each
+;; holding one 16-bit chunk of the IEEE-754 double, stored TAGGED (chunk << 1):
+;;   slot 0 = bits 63..48   slot 1 = bits 47..32
+;;   slot 2 = bits 31..16   slot 3 = bits 15..0
+;; Every chunk is 0..65535, so the stored MACHINE WORD is 0..131070: always
+;; positive, always low-bit-0 (the conservative collector reads it as a fixnum
+;; and never follows the float's bit pattern as a pointer — the documented
+;; RIP=0xDEAD1004 corruption class), and it fits a 32-BIT machine word.  The
+;; previous 2 x 32-bit layout stored hi32 << 1, which overflows a 32-bit slot
+;; and loses bit 31 — the double's SIGN BIT — which is why i386 had no float
+;; support.  One layout now serves x64, aarch64 and i386.
+;; Object size = align16((4 + 2) * 8) = 48 bytes on a 64-bit word.
+;; See docs/i386-float-blocker.md; the translators (translate-x64.lisp,
+;; translate-aarch64.lisp) and mvm/float-slot-overrides.lisp must agree.
+(defconstant +float-slots+ 4)
 ;; Float type-identity subtags (numeric tower N1, approach B+): all four
-;; share the 2-slot 64-bit IEEE payload (so :fadd/:fcmp/Dragon4 are
+;; share the 4-slot 64-bit IEEE payload (so :fadd/:fcmp/Dragon4 are
 ;; unchanged — they read bits, never the subtag).  The subtag carries
 ;; only the DECLARED CL float type so typep/type-of/contagion can
 ;; distinguish them.  #x60 stays double-float (preserves the boot image
@@ -6069,14 +6084,21 @@
                         +subtag-single-float+      ; #x64
                         +subtag-float+)))          ; #x60 double
        (emit-ir :gc-check)   ; overshoot-past-R14 hazard; see compile-make-bignum
-       (emit-ir :alloc-obj dest 2 subtag)
+       (emit-ir :alloc-obj dest +float-slots+ subtag)
        (let ((temp (alloc-temp-reg)))
-         ;; Slot 0 = high 32 bits (tagged fixnum, always fits)
-         (emit-ir :li temp (ash hi +fixnum-shift+))
+         ;; FOUR 16-bit chunks, each stored TAGGED (chunk << 1).  Every chunk is
+         ;; 0..65535, so the stored word is 0..131070 — positive, low-bit-0 (GC
+         ;; reads it as a fixnum, never as a pointer) and it fits a 32-bit
+         ;; machine word, which the old 2 x 32-bit layout did not.  See #201 /
+         ;; docs/i386-float-blocker.md.
+         (emit-ir :li temp (ash (ash hi -16) +fixnum-shift+))          ; 63..48
          (emit-ir :obj-set dest 0 temp)
-         ;; Slot 1 = low 32 bits (tagged fixnum, always fits)
-         (emit-ir :li temp (ash lo +fixnum-shift+))
+         (emit-ir :li temp (ash (logand hi 65535) +fixnum-shift+))     ; 47..32
          (emit-ir :obj-set dest 1 temp)
+         (emit-ir :li temp (ash (ash lo -16) +fixnum-shift+))          ; 31..16
+         (emit-ir :obj-set dest 2 temp)
+         (emit-ir :li temp (ash (logand lo 65535) +fixnum-shift+))     ; 15..0
+         (emit-ir :obj-set dest 3 temp)
          (free-temp-reg))))
     ;; String: allocate array with string subtag, fill with char codes.
     ;; Pool routing (push to *constant-table* + emit :li-const) was wired
@@ -14325,34 +14347,42 @@
 ;;; ============================================================
 
 (defun compile-make-float (dest)
-  "Compile (%make-float) — allocate a 1-slot object with float subtag.
+  "Compile (%make-float) — allocate a float-subtag object.  DEAD: the reader's
+   only caller was renamed to %build-float-from-parts precisely because this
+   primop shortcut produced an uninitialised float (cl-reader.lisp ~line 858).
+   Kept for the op-name dispatch table; sized like every other float so that if
+   anything does reach it the object is at least well-formed (%ieee-float-p
+   requires +float-slots+ slots).
    GC-check first (overshoot-past-R14 hazard; see compile-make-bignum)."
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 1 +subtag-float+))
+  (emit-ir :alloc-obj dest +float-slots+ +subtag-float+))
 
 (defun compile-make-float2 (dest)
-  "Compile (%make-float2) — allocate a 2-slot boxed float (hi/lo IEEE words).
-   Matches the float-literal shape; used by the self-hosted interpreter to build
-   a real native float instead of a simulated object."
+  "Compile (%make-float2) — allocate a boxed double-float (#x60).  The payload
+   is +float-slots+ 16-bit chunks of the IEEE double; the caller stores them
+   (%float-set-bits).  Matches the float-literal shape; used by the self-hosted
+   interpreter to build a real native float instead of a simulated object.
+   The name still ends in `2' for source compatibility — it is the arity of the
+   hi/lo halves the CALLER thinks in, not the slot count."
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-float+))
+  (emit-ir :alloc-obj dest +float-slots+ +subtag-float+))
 
 (defun compile-make-single2 (dest)
-  "Compile (%make-single2) — allocate a 2-slot boxed float tagged
-   single-float (#x61).  Same 64-bit IEEE payload as %make-float2; caller
-   stores hi/lo.  See numeric tower N1 (approach B+)."
+  "Compile (%make-single2) — boxed float tagged single-float (#x64).  Same
+   64-bit IEEE payload as %make-float2; caller stores the chunks.  See numeric
+   tower N1 (approach B+)."
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-single-float+))
+  (emit-ir :alloc-obj dest +float-slots+ +subtag-single-float+))
 
 (defun compile-make-short2 (dest)
-  "Compile (%make-short2) — 2-slot boxed float tagged short-float (#x62)."
+  "Compile (%make-short2) — boxed float tagged short-float (#x65)."
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-short-float+))
+  (emit-ir :alloc-obj dest +float-slots+ +subtag-short-float+))
 
 (defun compile-make-long2 (dest)
-  "Compile (%make-long2) — 2-slot boxed float tagged long-float (#x63)."
+  "Compile (%make-long2) — boxed float tagged long-float (#x66)."
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-long-float+))
+  (emit-ir :alloc-obj dest +float-slots+ +subtag-long-float+))
 
 (defun compile-make-symbol (dest)
   "Compile (%make-symbol) — allocate a 1-slot object with symbol subtag.

@@ -366,8 +366,11 @@
 (defconstant +op-get-nargs+  #xBD)  ; (get-nargs Vd) - read nargs reg into Vd (callee entry)
 
 ;; IEEE 64-bit float arithmetic.  Operands are tagged float OBJECTS
-;; (subtag #x60, two slots: hi32 + lo32 as tagged fixnums).  Result is
-;; a freshly-allocated float object via the bump allocator (R12 on x64).
+;; (subtag #x60, FOUR slots: the IEEE double split into 16-bit chunks
+;; 63..48 / 47..32 / 31..16 / 15..0, each stored as a tagged fixnum, so every
+;; slot word is positive, low-bit-0 and fits a 32-bit machine word — see #201
+;; and docs/i386-float-blocker.md).  Result is a freshly-allocated float
+;; object via the bump allocator (R12 on x64).
 ;; Per-arch translators choose lowering: x64 uses SSE2 (movq/addsd/...);
 ;; other archs may emit a call to a software-float runtime helper or
 ;; emit-an-error if no float support is wired up.

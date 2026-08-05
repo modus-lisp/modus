@@ -96,30 +96,16 @@
 ;; sb-kernel:double-float-* (host-only).  In-image a float is a 2-slot boxed
 ;; object (hi32/lo32); read them directly.  Appended AFTER the compiler source
 ;; so it wins (last-defun).  Only matters for compiling FLOAT literals.
-(defvar *stage2-float-override* "
-(defun ieee-float-bits (f)
-  (logior (ash (logand (%prim-aref f 0) 4294967295) 32)
-          (logand (%prim-aref f 1) 4294967295)))
-;; Read hi/lo 32-bit halves directly from the boxed float's slots.  NEVER
-;; combine into a 64-bit integer: for floats >= 2.0 the hi half >= #x40000000,
-;; so (ash hi 32) >= 2^62 and Modus's bignum-range ASH is lossy, corrupting
-;; the literal's bits at compile time (2.0/9.0/-1.5 all read back as garbage).
-;; These two stay <= #xFFFFFFFF, safely in fixnum range.
-(defun ieee-float-hi32 (f) (logand (%prim-aref f 0) 4294967295))
-(defun ieee-float-lo32 (f) (logand (%prim-aref f 1) 4294967295))
-;; Bignum-literal decomposition: read the already-built bignum object's slots
-;; directly.  The host recompute path uses (logand value mask62), but the
-;; compiled `logand` primop is a raw machine AND of tagged words — for a bignum
-;; operand (a heap pointer) that yields garbage (e.g. (logand 2^62 (1- 2^62))
-;; returned 66281634333124 instead of 0).  These read the decomposed limbs the
-;; host already stored.
-(defun %lit-bignum-big-p (value) (big-bignum-p value))
-(defun %lit-bn-lo (value) (bignum-lo value))
-(defun %lit-bn-hi (value) (bignum-hi value))
-(defun %lit-bb-sign (value) (%bb-sign value))
-(defun %lit-bb-nlimbs (value) (%bb-nlimbs value))
-(defun %lit-bb-limb (value k) (%bb-limb value k))
-")
+(defvar *stage2-float-override*
+  ;; #201: ONE definition, in mvm/float-slot-overrides.lisp.  These accessors
+  ;; encode the float object's SLOT LAYOUT; they used to be duplicated verbatim
+  ;; in six build scripts, where a layout change that missed one copy would be
+  ;; silent numeric corruption rather than a build error.  Read as raw text (no
+  ;; MVM-TEXT package wrapper) so the blob is byte-identical to the old inline
+  ;; string.
+  (let ((p (merge-pathnames "mvm/float-slot-overrides.lisp" *modus-base*)))
+    (modus.mvm::check-parses p)
+    (concatenate 'string (string #\Newline) (read-file-text p))))
 ;; STAGE 2 probe: mvm-eval = compile form to MVM bytecode + interpret it.
 ;; Closed-world (calls only resolve within the compiled module) — fine for
 ;; pure-arithmetic forms whose ops inline to MVM opcodes.

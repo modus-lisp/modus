@@ -875,10 +875,16 @@
 ;;; --- IEEE float (FP) instructions ---
 ;;; Double-precision (FP64).  D0-D31 are FP regs; same number space as
 ;;; X regs for register fields.  The float "object" layout matches x64
-;;; (mvm/translate-x64.lisp +op-fadd+): a 2-slot heap object with subtag
-;;; #x60, tagged pointer = raw+9; slot 0 = hi32 sign-extended<<1, slot 1
-;;; = lo32 zero-extended<<1.  Splitting into two tagged fixnums avoids
-;;; the low-bit collision with fixnum tag.
+;;; (mvm/translate-x64.lisp +op-fadd+): a FOUR-slot heap object with subtag
+;;; #x60, tagged pointer = raw+9; slot i holds one 16-bit chunk of the IEEE
+;;; double, stored TAGGED (chunk << 1):
+;;;   slot 0 = bits 63..48   slot 1 = bits 47..32
+;;;   slot 2 = bits 31..16   slot 3 = bits 15..0
+;;; Every chunk is 0..65535, so the stored word is 0..131070 — positive,
+;;; low-bit-0 (no collision with the fixnum tag, so the conservative collector
+;;; reads it as a fixnum and never follows the float's bit pattern as a
+;;; pointer) — and it fits a 32-bit machine word, which hi32<<1 did not.  One
+;;; layout for x64 / aarch64 / i386; see #201, docs/i386-float-blocker.md.
 
 (defun a64-fadd-d (buf dd dn dm)
   "FADD Dd, Dn, Dm  (FP64 add)"
@@ -915,6 +921,61 @@
 (defun a64-fmov-x-d (buf xd dn)
   "FMOV Xd, Dn  (move raw FP reg bits → int64, no conversion)"
   (a64-emit buf (logior #x9E660000 (ash dn 5) xd)))
+
+;;; --- Boxed float payload: four tagged 16-bit chunks (#201) ---
+
+(defun a64-float-load-bits (buf ps acc tmp)
+  "Reassemble the four tagged 16-bit chunks of the float object whose TAGGED
+   pointer is in PS into the 64-bit IEEE bit pattern in ACC.  TMP is clobbered.
+   Slot i sits at tagged-pointer offset i*8+7.  Each LSL 48 / LSR n pair both
+   masks the chunk to 16 bits and positions it, so junk in a slot's upper bits
+   cannot corrupt a neighbouring chunk."
+  ;; slot 0 -> bits 63..48
+  (a64-ldur buf acc ps 7)
+  (a64-lsr-imm buf acc acc 1)
+  (a64-lsl-imm buf acc acc 48)
+  ;; slot 1 -> bits 47..32
+  (a64-ldur buf tmp ps 15)
+  (a64-lsr-imm buf tmp tmp 1)
+  (a64-lsl-imm buf tmp tmp 48)
+  (a64-lsr-imm buf tmp tmp 16)
+  (a64-orr-reg buf acc acc tmp)
+  ;; slot 2 -> bits 31..16
+  (a64-ldur buf tmp ps 23)
+  (a64-lsr-imm buf tmp tmp 1)
+  (a64-lsl-imm buf tmp tmp 48)
+  (a64-lsr-imm buf tmp tmp 32)
+  (a64-orr-reg buf acc acc tmp)
+  ;; slot 3 -> bits 15..0
+  (a64-ldur buf tmp ps 31)
+  (a64-lsr-imm buf tmp tmp 1)
+  (a64-lsl-imm buf tmp tmp 48)
+  (a64-lsr-imm buf tmp tmp 48)
+  (a64-orr-reg buf acc acc tmp))
+
+(defun a64-float-store-bits (buf base src tmp)
+  "Split the 64-bit IEEE bit pattern in SRC into four tagged 16-bit chunks and
+   STUR them into slots 0..3 of the object whose RAW base is BASE (offsets
+   16/24/32/40).  TMP is clobbered; SRC is preserved."
+  ;; slot 0 = bits 63..48  (LSR is logical, so already masked)
+  (a64-lsr-imm buf tmp src 48)
+  (a64-lsl-imm buf tmp tmp 1)
+  (a64-stur buf tmp base 16)
+  ;; slot 1 = bits 47..32
+  (a64-lsl-imm buf tmp src 16)
+  (a64-lsr-imm buf tmp tmp 48)
+  (a64-lsl-imm buf tmp tmp 1)
+  (a64-stur buf tmp base 24)
+  ;; slot 2 = bits 31..16
+  (a64-lsl-imm buf tmp src 32)
+  (a64-lsr-imm buf tmp tmp 48)
+  (a64-lsl-imm buf tmp tmp 1)
+  (a64-stur buf tmp base 32)
+  ;; slot 3 = bits 15..0
+  (a64-lsl-imm buf tmp src 48)
+  (a64-lsr-imm buf tmp tmp 48)
+  (a64-lsl-imm buf tmp tmp 1)
+  (a64-stur buf tmp base 40))
 
 ;;; --- Shift (register) ---
 ;;; Variable shifts: LSLV/LSRV/ASRV encoded as data-processing (2 source)
@@ -4138,33 +4199,24 @@
           ;; ============================================================
           ;; IEEE float opcodes (FP64).  Mirror translate-x64.lisp.
           ;;
-          ;; Float object layout:
+          ;; Float object layout (#201, width-neutral — see
+          ;; docs/i386-float-blocker.md):
           ;;   tagged ptr = raw + 9 (obj tag)
-          ;;   [raw + 0]  header = #x260 (count=2 | subtag #x60)
+          ;;   [raw + 0]  header = #x460 (count=4 | subtag #x60)
           ;;   [raw + 8]  unused (alignment padding)
-          ;;   [raw + 16] slot 0: hi32 sign-extended<<1 (tagged fixnum)
-          ;;   [raw + 24] slot 1: lo32 zero-extended<<1 (tagged fixnum)
-          ;; OBJ-REF idx*8+7 from tagged pointer reaches slot 0 at +7,
-          ;; slot 1 at +15.
+          ;;   [raw + 16] slot 0: IEEE bits 63..48, tagged (chunk<<1)
+          ;;   [raw + 24] slot 1: IEEE bits 47..32, tagged
+          ;;   [raw + 32] slot 2: IEEE bits 31..16, tagged
+          ;;   [raw + 40] slot 3: IEEE bits 15..0,  tagged
+          ;; OBJ-REF idx*8+7 from the tagged pointer reaches slot i at
+          ;; +7/+15/+23/+31.  Object size = align16((4+2)*8) = 48, which is
+          ;; exactly what the collector derives from the header count.
           ;;
           ;; Used scratch: x9..x11 (volatile), D0/D1 (FP scratch).
           ;; ============================================================
 
-          ;; Helper: load float object bits (Vs is tagged ptr) into D-reg.
-          ;; Generated inline for each opcode below.  Sequence:
-          ;;   LDUR x9,  [ps, #7]    ; tagged hi32<<1
-          ;;   LSR  x9,  x9, #1      ; untag (logical for hi32 sign bit handling — see split)
-          ;;   LSL  x9,  x9, #32     ; into upper half
-          ;;   LDUR x10, [ps, #15]   ; tagged lo32<<1
-          ;;   LSR  x10, x10, #1     ; untag
-          ;;   AND  x10, x10, #0xFFFFFFFF
-          ;;   ORR  x9,  x9, x10     ; combine into 64-bit float bit pattern
-          ;;   FMOV Dx,  x9          ; bits → FP reg
-          ;;
-          ;; NOTE on sign-extension: slot 0 was stored as (hi32 << 1)
-          ;; where hi32 was the upper 32 bits of the float's bit pattern.
-          ;; x64 uses SAR (arithmetic) then shifts to discard.  AArch64
-          ;; uses LSR (logical) since we'll mask anyway.  Both work.
+          ;; A64-FLOAT-LOAD-BITS / A64-FLOAT-STORE-BITS (defined with the FP
+          ;; instruction emitters above) do the chunk reassembly and split.
 
           ;; ---- FADD / FSUB / FMUL / FDIV Vd, Va, Vb ----
           ((or (= op +op-fadd+) (= op +op-fsub+)
@@ -4174,25 +4226,10 @@
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              ;; Load Va float bits → D0
-             (a64-ldur buf +a64-x9+  pa 7)
-             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
-             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
-             (a64-ldur buf +a64-x10+ pa 15)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
-             ;; AND x10, x10, #0xFFFFFFFF  via LSL 32 / LSR 32
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-float-load-bits buf pa +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf 0 +a64-x9+)             ; D0 ← Va bits
              ;; Load Vb float bits → D1
-             (a64-ldur buf +a64-x9+  pb 7)
-             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
-             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
-             (a64-ldur buf +a64-x10+ pb 15)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-float-load-bits buf pb +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf 1 +a64-x9+)             ; D1 ← Vb bits
              ;; Perform op: Dout ← D0 op D1
              (cond ((= op +op-fadd+) (a64-fadd-d buf 0 0 1))
@@ -4201,22 +4238,15 @@
                    (t                (a64-fdiv-d buf 0 0 1)))
              ;; D0 bits → x9
              (a64-fmov-x-d buf +a64-x9+ 0)
-             ;; Allocate fresh 2-slot float at x24 (alloc ptr).
-             ;; Header = (2<<8)|#x60 = #x260.
-             (a64-movz buf +a64-x10+ #x260 0)
+             ;; Allocate fresh 4-slot float at x24 (alloc ptr).
+             ;; Header = (4<<8)|#x60 = #x460.
+             (a64-movz buf +a64-x10+ #x460 0)
              (a64-stur buf +a64-x10+ +a64-x24+ 0)
-             ;; Slot 0 = (hi32 sign-ext) << 1.  hi32 = x9 >>> 32 (arith).
-             (a64-asr-imm buf +a64-x10+ +a64-x9+ 32)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-stur buf +a64-x10+ +a64-x24+ 16)
-             ;; Slot 1 = (lo32 zero-ext) << 1.
-             (a64-lsl-imm buf +a64-x10+ +a64-x9+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-stur buf +a64-x10+ +a64-x24+ 24)
-             ;; Tagged result = x24 + 9; advance x24 by 32.
+             ;; Four tagged 16-bit chunks into slots 0..3.
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             ;; Tagged result = x24 + 9; advance x24 by 48.
              (a64-add-imm buf pd +a64-x24+ 9)
-             (a64-add-imm buf +a64-x24+ +a64-x24+ 32)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -4232,18 +4262,12 @@
              (a64-scvtf-d-x buf 0 +a64-x9+)
              ;; D0 bits → x9
              (a64-fmov-x-d buf +a64-x9+ 0)
-             ;; Allocate 2-slot float (same tail as fadd)
-             (a64-movz buf +a64-x10+ #x260 0)
+             ;; Allocate 4-slot float (same tail as fadd)
+             (a64-movz buf +a64-x10+ #x460 0)
              (a64-stur buf +a64-x10+ +a64-x24+ 0)
-             (a64-asr-imm buf +a64-x10+ +a64-x9+ 32)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-stur buf +a64-x10+ +a64-x24+ 16)
-             (a64-lsl-imm buf +a64-x10+ +a64-x9+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-stur buf +a64-x10+ +a64-x24+ 24)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
              (a64-add-imm buf pd +a64-x24+ 9)
-             (a64-add-imm buf +a64-x24+ +a64-x24+ 32)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -4254,14 +4278,7 @@
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              ;; Reassemble float bits → D0
-             (a64-ldur buf +a64-x9+  ps 7)
-             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
-             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
-             (a64-ldur buf +a64-x10+ ps 15)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf 0 +a64-x9+)
              ;; FCVTZS x9, D0
              (a64-fcvtzs-x-d buf +a64-x9+ 0)
@@ -4276,24 +4293,10 @@
            (let* ((pa (ensure-src (vr 0) +a64-x16+))
                   (pb (ensure-src (vr 1) +a64-x17+)))
              ;; Reassemble Va float bits → D0
-             (a64-ldur buf +a64-x9+  pa 7)
-             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
-             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
-             (a64-ldur buf +a64-x10+ pa 15)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-float-load-bits buf pa +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf 0 +a64-x9+)
              ;; Reassemble Vb float bits → D1
-             (a64-ldur buf +a64-x9+  pb 7)
-             (a64-lsr-imm buf +a64-x9+ +a64-x9+ 1)
-             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 32)
-             (a64-ldur buf +a64-x10+ pb 15)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 1)
-             (a64-lsl-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-lsr-imm buf +a64-x10+ +a64-x10+ 32)
-             (a64-orr-reg buf +a64-x9+ +a64-x9+ +a64-x10+)
+             (a64-float-load-bits buf pb +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf 1 +a64-x9+)
              (a64-fcmp-d buf 0 1)))
 

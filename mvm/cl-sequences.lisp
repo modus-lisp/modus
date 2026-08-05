@@ -820,9 +820,9 @@
           (or (= st 96) (and (>= st 100) (<= st 102))))))))  ; #x60 + #x64..#x66 (skip #x61-63: mvm-module etc.)
 
 (defun float-equal (a b)
-  "Compare two boxed floats by hi32/lo32 slots."
-  (if (= (aref a 0) (aref b 0))
-      (= (aref a 1) (aref b 1))
+  "Compare two boxed floats by their IEEE bits (four 16-bit chunk slots)."
+  (if (= (%float-hi32 a) (%float-hi32 b))
+      (= (%float-lo32 a) (%float-lo32 b))
       nil))
 
 

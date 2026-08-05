@@ -1436,9 +1436,8 @@
    non-floats) falls back to a coarse mantissa*2^exp split."
   (cond
     ((%ieee-float-p float)
-     (let* ((hi (aref float 0))
-            (lo (aref float 1))
-            (hi-u32 (logand hi 4294967295))
+     (let* ((hi-u32 (%float-hi32 float))
+            (lo (%float-lo32 float))
             (sign-bit (logand (ash hi-u32 -31) 1))
             (exponent (logand (ash hi-u32 -20) 2047))
             (mantissa-hi (logand hi-u32 1048575))

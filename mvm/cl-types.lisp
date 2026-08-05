@@ -2439,10 +2439,25 @@
    %float-from-int primop is cvtsi2sd on a 62-bit fixnum; handed a bignum
    it converts the heap POINTER bits → garbage (e.g. ~6.5e13 for a 1e20
    bignum, which broke (float (rational x) x) round-trip — rational.3).
-   For a bignum, fold the sign-magnitude limbs (LSB-first, each <2^62)
-   MSB-first as floats: acc = acc*2^62 + limb.  Bit-exact whenever the
-   magnitude has ≤53 significant bits (every value the ANSI round-trip
-   tests feed in came FROM a double); correctly-rounded-per-step otherwise."
+   For a bignum, fold the sign-magnitude limbs (LSB-first, each
+   <2^+limb-bits+) MSB-first as floats: acc = acc*2^+limb-bits+ + limb.
+   Bit-exact whenever the magnitude has ≤53 significant bits (every value the
+   ANSI round-trip tests feed in came FROM a double); correctly-rounded-per-
+   step otherwise.
+
+   WIDTH-PARAMETERISED (was hardcoded to the 62-bit tower).  The radix must be
+   2^+limb-bits+, and the only way to name it is as the square of
+   2^+half-limb-bits+, because 2^+limb-bits+ is itself a BIGNUM literal and
+   %float-from-int is cvtsi2sd on a FIXNUM.  On the 62-bit tower
+   +half-limb-bits+ is 31, so `(ash 1 +half-limb-bits+)' IS 2147483648 and
+   `base' IS 2^62 — identical to the old hardcoded constants, hence no change
+   on x64/aarch64.  On the 30-bit i386 tower it is 15 / 2^30, which is the
+   correct radix there; the old literal 2147483648 was a BIGNUM on i386, so
+   %float-from-int converted its heap POINTER and every large float literal
+   came out wrong AND different on every parse (the exact failure the
+   docstring above describes, reintroduced one level up).  Same class as the
+   +half-limb-mask+ hardcoding fixed in target.lisp: 'silently wrong on any
+   tower narrower than 62'."
   (if (not (bignump n))
       (%float-from-int n)
       (let* ((sm   (%any-to-limbs n))           ; (sign . limbs LSB-first)
@@ -2452,8 +2467,8 @@
                        (setq acc (cons (car cur) acc))
                        (setq cur (cdr cur)))))   ; MSB-first
              (acc  (%float-from-int 0))
-             (b31  (%float-from-int 2147483648)) ; 2^31 (2^62 is a bignum literal)
-             (base (%float-mul b31 b31))         ; 2^62 as a double
+             (bhl  (%float-from-int (ash 1 +half-limb-bits+))) ; 2^(limb-bits/2)
+             (base (%float-mul bhl bhl))         ; 2^+limb-bits+ as a double
              (cur  rev))
         (loop
           (when (null cur) (return nil))

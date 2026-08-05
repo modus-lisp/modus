@@ -629,6 +629,196 @@
   (chk "K2: cl-printer.lisp's THROWs use the keyword tag"
        (integerp (search "(throw :%pp-tag nil)" printer)) t))
 
+
+;;; ---------------------------------------------------------------
+;;; (F) #211 part 2 — the (package, name) function-table key
+;;; ---------------------------------------------------------------
+;;; The point of the whole exercise: two BUILD-BAKED files declaring different
+;;; packages must each be able to define a function with the SAME NAME, and
+;;; each file's calls must reach its OWN definition.  Before the fold the
+;;; compile-time *FUNCTIONS* table was keyed on a bare name string, so the
+;;; second defun silently won for BOTH files (last-defun-wins) — the ceiling
+;;; behind #210's multi-translator bake.  Measured in the shipping ./modus
+;;; blob, exactly two names already collide this way: REX-PREFIX and MODRM,
+;;; defined by both mvm/x64-asm.lisp (MODUS.ASM) and mvm/translate-x64.lisp
+;;; (MODUS.MVM.X64).  They happen to be semantically identical, so the
+;;; collision was survivable by luck; F1/F2 below fail on any build that
+;;; still relies on that luck.
+;;;
+;;; This drives the REAL compiler over a REAL two-file blob (built exactly the
+;;; way MVM-TEXT builds one) rather than reasoning about the key scheme.
+
+(defun fk-compile-blob (blob)
+  "Compile BLOB's forms the way MVM-COMPILE-ALL does, but WITHOUT let-binding
+   *FUNCTIONS* away, so the test can inspect the resulting table.  Returns a
+   list of (function-info . ir) pairs."
+  (let ((modus.mvm::*functions* (make-hash-table :test 'equal))
+        (modus.mvm::*function-table* nil)
+        (modus.mvm::*constant-table* nil)
+        (modus.mvm::*label-counter* 0)
+        (modus.mvm::*unresolved-calls* (make-hash-table :test 'equal))
+        (modus.mvm::*macro-table* (make-hash-table :test 'eql))
+        (modus.mvm::*globals* (make-hash-table :test 'eql))
+        (modus.mvm::*constants* (make-hash-table :test 'eql))
+        (modus.mvm::*block-labels* nil)
+        (modus.mvm::*tagbody-tags* nil)
+        (modus.mvm::*pending-flet-ir* nil)
+        (results nil))
+    (modus.mvm::register-mvm-bootstrap-macros)
+    (dolist (form (forms-of blob))
+      (let ((r (modus.mvm::mvm-compile-toplevel form)))
+        (cond ((and (consp r) (eq (car r) :multi-result))
+               (dolist (x (cdr r)) (push x results)))
+              ((and (consp r) (car r) (cdr r)) (push r results)))))
+    (list (nreverse results) modus.mvm::*functions*)))
+
+(defun fk-ir-call-targets (pairs fn-name)
+  "Every :CALL operand in the IR of the function whose (bare) name is FN-NAME."
+  (let ((hit (find-if (lambda (p)
+                        (string= (string (modus.mvm::function-info-name (car p)))
+                                 fn-name))
+                      pairs))
+        (targets nil))
+    (when hit
+      (dolist (insn (cdr hit))
+        (when (and (consp insn) (eq (car insn) :call))
+          (push (second insn) targets))))
+    (nreverse targets)))
+
+;;; Two files, two packages, ONE function name — plus, in file B's package
+;;; only, a call to a helper that lives in MODUS.MVM and is NOT defined in B
+;;; (the cross-package case that must keep resolving).
+(let* ((file-a (wrapped "(in-package :modus.asm)
+(defun fk-shared () 1)
+(defun fk-call-a () (fk-shared))
+"))
+       (file-mvm (wrapped "(defun fk-only-in-mvm () 7)
+"))
+       (file-b (wrapped "(in-package :modus.mvm.x64)
+(defun fk-shared () 2)
+(defun fk-call-b () (fk-shared))
+(defun fk-cross-b () (fk-only-in-mvm))
+"))
+       (blob (concatenate 'string file-a (string #\Newline)
+                          file-mvm (string #\Newline) file-b))
+       (compiled (fk-compile-blob blob))
+       (pairs (first compiled))
+       (fns (second compiled))
+       (a-info (gethash "MODUS.ASM::FK-SHARED" fns))
+       (b-info (gethash "MODUS.MVM.X64::FK-SHARED" fns))
+       (mvm-info (gethash "MODUS.MVM::FK-ONLY-IN-MVM" fns)))
+
+  ;; F1: each package's definition has its own entry.
+  (chk "F1: MODUS.ASM::FK-SHARED is registered"      (not (null a-info)) t)
+  (chk "F1: MODUS.MVM.X64::FK-SHARED is registered"  (not (null b-info)) t)
+  (chk "F1: they are TWO DISTINCT function-infos"
+       (and a-info b-info (not (eq a-info b-info))) t)
+
+  ;; F2: and each file's call site targets its OWN definition.
+  (chk "F2: file A's call targets MODUS.ASM::FK-SHARED"
+       (fk-ir-call-targets pairs "FK-CALL-A") (list "MODUS.ASM::FK-SHARED"))
+  (chk "F2: file B's call targets MODUS.MVM.X64::FK-SHARED"
+       (fk-ir-call-targets pairs "FK-CALL-B") (list "MODUS.MVM.X64::FK-SHARED"))
+  ;; %FN-INFO-FOR-KEY reads the *FUNCTIONS* special, so restore the table the
+  ;; blob produced around the resolution assertions (FK-COMPILE-BLOB let-binds
+  ;; it, exactly as MVM-COMPILE-ALL does).
+  (let ((modus.mvm::*functions* fns))
+    (chk "F2: the two call sites do NOT resolve to the same entry"
+         (let ((ta (car (fk-ir-call-targets pairs "FK-CALL-A")))
+               (tb (car (fk-ir-call-targets pairs "FK-CALL-B"))))
+           (and ta tb
+                (not (eq (modus.mvm::%fn-info-for-key ta)
+                         (modus.mvm::%fn-info-for-key tb)))))
+         t)
+    (chk "F2: …and each lands on the entry from its own file"
+         (list (eq (modus.mvm::%fn-info-for-key
+                     (car (fk-ir-call-targets pairs "FK-CALL-A"))) a-info)
+               (eq (modus.mvm::%fn-info-for-key
+                     (car (fk-ir-call-targets pairs "FK-CALL-B"))) b-info))
+         (list t t)))
+
+  ;; F3: the CROSS-package call still resolves.  MODUS.MVM.X64 does not define
+  ;; FK-ONLY-IN-MVM, so its qualified key misses and the lookup falls back to
+  ;; the bare key — which is exactly how this call resolved before the fold.
+  ;; This fallback is what makes the change a strict superset: nothing that
+  ;; resolved before stops resolving.
+  (chk "F3: the cross-package call is emitted under B's package key"
+       (fk-ir-call-targets pairs "FK-CROSS-B")
+       (list "MODUS.MVM.X64::FK-ONLY-IN-MVM"))
+  (let ((modus.mvm::*functions* fns))
+    (chk "F3: …and still resolves, via the bare-key fallback, to MODUS.MVM's defn"
+         (eq (modus.mvm::%fn-info-for-key "MODUS.MVM.X64::FK-ONLY-IN-MVM")
+             mvm-info)
+         t))
+
+  ;; F4: the bare key is still populated (last-defun-wins, unchanged), so the
+  ;; generated (puthash "NAME" *symbol-function-table* #'NAME) seeding source
+  ;; — which is read in MODUS.MVM whatever package the defun was in — keeps
+  ;; finding every function.
+  (chk "F4: the bare FK-SHARED key still exists (last-defun-wins preserved)"
+       (eq (gethash "FK-SHARED" fns) b-info) t))
+
+;;; F5: a COMMON-LISP symbol must NOT fold — every build script seeds the
+;;; runtime tables with bare-name (puthash "CAR" … #'CAR) forms, and
+;;; SYMBOL-FUNCTION looks CL functions up by bare name.  The exception set is
+;;; exactly the ANSI-mandated one (a clean SBCL image has 36 packages, 33 of
+;;; them SB-*, and precisely COMMON-LISP / COMMON-LISP-USER / KEYWORD besides).
+;;;
+;;; NOTE this is asserted BOTH on the key function directly and on real
+;;; emitted IR: an empty result from the IR probe alone would not be evidence.
+(let ((cl-sym    (let ((*package* (find-package "MODUS.MVM")))
+                   (read-from-string "list-length")))
+      (user-sym  (let ((*package* (find-package "COMMON-LISP-USER")))
+                   (read-from-string "fk-user-fn")))
+      (kw-sym    (read-from-string ":fk-kw"))
+      (asm-sym   (let ((*package* (find-package "MODUS.ASM")))
+                   (read-from-string "fk-asm-fn")))
+      (gsym      (gensym "FK-")))
+  (chk "F5: a COMMON-LISP symbol keeps the bare key"
+       (modus.mvm::%fn-key-qualify cl-sym "LIST-LENGTH") "LIST-LENGTH")
+  (chk "F5: a COMMON-LISP-USER symbol keeps the bare key"
+       (modus.mvm::%fn-key-qualify user-sym "FK-USER-FN") "FK-USER-FN")
+  (chk "F5: a KEYWORD keeps the bare key"
+       (modus.mvm::%fn-key-qualify kw-sym "FK-KW") "FK-KW")
+  (chk "F5: an UNINTERNED symbol keeps the bare key (CLHS: no home package)"
+       (modus.mvm::%fn-key-qualify gsym "FK-G") "FK-G")
+  (chk "F5: an implementation package DOES fold"
+       (modus.mvm::%fn-key-qualify asm-sym "FK-ASM-FN") "MODUS.ASM::FK-ASM-FN")
+  (chk "F5: an already-qualified key is not qualified twice"
+       (modus.mvm::%fn-key-qualify asm-sym "TG::FK-ASM-FN") "TG::FK-ASM-FN"))
+
+;;; F5b: and on real IR — a body full of CL calls must emit NO COMMON-LISP::
+;;; key.  The probe is proved non-vacuous first: it must find some call.
+(let* ((blob (wrapped "(defun fk-cl-caller (x)
+  (list-length (append (reverse x) (nreverse (copy-list x)))))
+"))
+       (pairs (first (fk-compile-blob blob)))
+       (targets (fk-ir-call-targets pairs "FK-CL-CALLER")))
+  (chk "F5b: the probe is non-vacuous (the body really emits :CALLs)"
+       (and (> (length targets) 0) t) t)
+  (chk "F5b: no CL call is package-qualified"
+       (remove-if-not (lambda (tg) (search "COMMON-LISP::" tg)) targets) nil))
+
+;;; F6: the compiler-side ANSI exception list and its RUNTIME twin in
+;;; cl-packages.lisp must not drift apart.  They are deliberately separate
+;;; defuns (compiler.lisp is loaded host-side where cl-packages.lisp never is,
+;;; and not every image bakes both), so nothing but this guard keeps them
+;;; in step.
+(let* ((compiler-src (file-text "../mvm/compiler.lisp"))
+       (packages-src (file-text "../mvm/cl-packages.lisp"))
+       (names '("COMMON-LISP" "COMMON-LISP-USER" "KEYWORD" "CL" "CL-USER"))
+       (body-of (lambda (text fn)
+                  (let* ((start (search (concatenate 'string "(defun " fn " ") text))
+                         (chunk (and start (subseq text start (min (length text)
+                                                                   (+ start 2000))))))
+                    (remove-if-not
+                      (lambda (n) (search (concatenate 'string "\"" n "\"") chunk))
+                      names)))))
+  (chk "F6: compiler-side %fn-key-ansi-pkg-p lists exactly the ANSI packages"
+       (funcall body-of compiler-src "%fn-key-ansi-pkg-p") names)
+  (chk "F6: runtime-side %fn-key-system-pkg-name-p lists the same set"
+       (funcall body-of packages-src "%fn-key-system-pkg-name-p") names))
+
 (format t "~%#211 read-package scope: ~:[~D FAILURE(S)~;ALL PASS~]~%"
         (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))

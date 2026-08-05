@@ -739,7 +739,11 @@
   source-location ; string describing where defined (e.g. "form#123")
   rest-param-p    ; T if function has &rest parameter
   required-count  ; number of required params (before &rest)
-  optional-count) ; number of &optional params (between required and &rest)
+  optional-count  ; number of &optional params (between required and &rest)
+  qualified-name) ; #211: "PKG::NAME" when the defun's name symbol has a
+                  ; foldable home package, else NIL.  NAME stays BARE — the
+                  ; emitted native FN table and its by-name probes read that.
+                  ; See %FN-KEY-PKG-OF / %FN-REGISTER-INFO.
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -1246,6 +1250,161 @@
             (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn))
             (symbol-name fn)))
       (symbol-name fn)))
+
+;;; ------------------------------------------------------------------
+;;; #211 part 2 — fold (package, name) into the *FUNCTIONS* key
+;;; ------------------------------------------------------------------
+;;;
+;;; BEFORE: the compile-time function table was keyed on a BARE name string,
+;;; so two build-baked packages could never define the same function name —
+;;; the second silently won for BOTH (last-defun-wins).  Measured in the
+;;; shipping ./modus blob: 2972 toplevel defuns across COMMON-LISP (643),
+;;; MODUS.MVM (2092), MODUS.ASM (42) and MODUS.MVM.X64 (71), with exactly
+;;; two names colliding across packages — REX-PREFIX and MODRM, defined
+;;; both by mvm/x64-asm.lisp (MODUS.ASM) and mvm/translate-x64.lisp
+;;; (MODUS.MVM.X64).  Those two happen to be semantically identical, so the
+;;; collision was survivable by luck; that luck is the ceiling behind #210's
+;;; multi-translator bake.
+;;;
+;;; AFTER: a defun registers under BOTH its bare name (unchanged, still
+;;; last-defun-wins) AND its package-qualified key PKG::NAME, and a call
+;;; site emits the qualified key of the package it was READ in.  Resolution
+;;; (%FN-INFO-FOR-KEY) tries qualified first and falls back to bare.  That
+;;; fallback is what makes this a strict SUPERSET of the old behaviour:
+;;;   - a call inside package P to a name P defines  -> P's definition (new,
+;;;     and the point of the exercise);
+;;;   - a call that crosses into a package which does NOT define the name
+;;;     (translate-x64.lisp calling an unexported MODUS.MVM helper; the
+;;;     generated (puthash "NAME" *symbol-function-table* #'NAME) seeding
+;;;     source, which is read in MODUS.MVM whatever package the defun was
+;;;     in) -> the bare key, i.e. exactly what resolved before.
+;;; Nothing that resolved before stops resolving.
+;;;
+;;; SCOPE.  This keys the compile-time *FUNCTIONS* table (and therefore the
+;;; :CALL / :LI-FUNC / :FN-ADDR IR operands) only.  FUNCTION-INFO-NAME stays
+;;; BARE, so the emitted native FN table (cross.lisp's name-hash column) and
+;;; its by-name probes ("KERNEL-MAIN", "%GC-COLLECT", "GENERIC-ADD" …) are
+;;; untouched, as are the runtime *SYMBOL-FUNCTION-TABLE* keys.  The runtime
+;;; side already folds, for runtime-born packages only, via %RT-FN-NAME and
+;;; %SYM-NAME-OR-HASH (b21126d) — that stays as it is.
+
+(defun %fn-key-ansi-pkg-p (pkg-name)
+  "T for the ANSI-mandated package names whose functions keep the BARE
+   function-table key.  Measured against a clean SBCL image (--no-userinit
+   --no-sysinit): 36 packages, 33 of them SB-*, and exactly three that are
+   not — COMMON-LISP, COMMON-LISP-USER, KEYWORD.  So this exception set is
+   precisely the standard-mandated one, plus the two CLHS nicknames; it is
+   not an arbitrary allowlist.  MODUS.MVM is Modus's analogue of the SB-*
+   family: ordinary implementation code, and it folds.
+
+   MUST STAY IN STEP with cl-packages.lisp's %FN-KEY-SYSTEM-PKG-NAME-P,
+   which is the RUNTIME twin of this predicate (it gates the runtime-born
+   package fold).  Deliberately a separate defun rather than a shared one:
+   compiler.lisp is loaded HOST-side into SBCL where cl-packages.lisp never
+   is, and not every image that bakes cl-packages.lisp also bakes
+   compiler.lisp — a shared definition would be an unresolved call in one
+   direction or the other.  tests/read-package-scope.lisp guards the pair."
+  (or (string= pkg-name "COMMON-LISP")
+      (string= pkg-name "COMMON-LISP-USER")
+      (string= pkg-name "KEYWORD")
+      (string= pkg-name "CL")
+      (string= pkg-name "CL-USER")))
+
+(defun %fn-key-pkg-of (fn)
+  "Home-package NAME of function-name symbol FN when that package should be
+   FOLDED into the function-table key; NIL when it should not be.
+
+   NIL for a non-symbol, for NIL/T, for an UNINTERNED symbol (CLHS: no home
+   package — and a gensym must not be keyed by name anyway), and for the
+   ANSI-mandated packages COMMON-LISP / COMMON-LISP-USER / KEYWORD (plus the
+   CL / CL-USER nicknames) — see %FN-KEY-ANSI-PKG-P.
+
+   WHY THOSE THREE ARE EXEMPT, and it is NOT the reason previously recorded.
+   The old justification — \"the native #x50 symbol flavor carries no
+   package, so it cannot fold\" — is STALE.  Measured in a built image: every
+   #x50 symbol is the 3-slot [hash, package, name] flavor, whether it came
+   from a compile-time literal, the reader, or MAKE-SYMBOL; %CL-SYM-P is T
+   and %NATIVE-MVM-SYM-P is NIL for all of them; the sole 1-slot allocator
+   %MAKE-SYMBOL has no call sites anywhere in the tree, and the only live
+   1-slot flavor is the #x53 KEYWORD.  Interned symbols carry a real package
+   ('FOO -> COMMON-LISP-USER, 'CAR -> COMMON-LISP); uninterned ones carry
+   NIL, correctly.  The real reason for the exemption is the BUILD/RUNTIME
+   key contract: every build script seeds the runtime tables with generated
+   (puthash \"NAME\" *symbol-function-table* #'NAME) forms keyed on the BARE
+   name, and SYMBOL-FUNCTION / FBOUNDP look CL functions up by bare name.
+   Folding COMMON-LISP would key CL:CAR as COMMON-LISP::CAR on one side of
+   that contract and CAR on the other.
+
+   Host-side and in-image are the SAME two calls: SYMBOL-PACKAGE then
+   PACKAGE-NAME.  Both are total on symbols in both worlds."
+  (and fn
+       (not (eq fn t))
+       (symbolp fn)
+       (let ((p (symbol-package fn)))
+         (and p
+              (let ((pn (package-name p)))
+                (and pn
+                     (> (length pn) 0)
+                     (not (%fn-key-ansi-pkg-p pn))
+                     pn))))))
+
+(defun %fn-key-unqualify (key)
+  "The BARE name inside a package-qualified *FUNCTIONS* KEY, or NIL when KEY
+   carries no \"::\" qualifier.  Splits at the FIRST \"::\", which is the
+   correct split: a package name cannot contain \"::\", but a symbol NAME can
+   — |A::B| is a legal symbol name — so splitting at the last one would
+   return \"B\" for \"MODUS.MVM::A::B\" and the bare-key fallback would then
+   land on the wrong entry.
+
+   (Do NOT write a literal defun form in this docstring: the build scripts'
+   source-text scanners look for that token to build the runtime symbol-
+   function seeding table, and a defun inside a STRING is picked up as a real
+   name — an earlier draft of this comment produced a spurious
+   \"WARN li-func: unresolved function A::B\" in every build log.)"
+  (let ((n (length key))
+        (pos nil)
+        (i 0))
+    (loop
+      (when (or pos (> (+ i 2) n)) (return))
+      (when (and (char= (char key i) #\:) (char= (char key (+ i 1)) #\:))
+        (setq pos i))
+      (setq i (+ i 1)))
+    (and pos (subseq key (+ pos 2)))))
+
+(defun %fn-key-qualify (fn bare)
+  "The package-folded *FUNCTIONS* key for name-symbol FN whose SYMBOL-NAME is
+   BARE.  Returns BARE unchanged when FN's home package is not foldable, and
+   — importantly — when BARE is ALREADY qualified: under runtime mvm-eval,
+   %RT-FN-NAME hands back a PKG::NAME string for a runtime-born library
+   package (b21126d), and qualifying that a second time would produce
+   PKG::PKG::NAME and miss its own registration."
+  (if (%fn-key-unqualify bare)
+      bare
+      (let ((pn (%fn-key-pkg-of fn)))
+        (if pn (concatenate 'string pn "::" bare) bare))))
+
+(defun %fn-info-for-key (key)
+  "*FUNCTIONS* entry for KEY, falling back to KEY's bare name when the
+   package-qualified key has no entry.  The fallback is what keeps the fold
+   a strict superset of the historical bare-key behaviour — see the block
+   comment above."
+  (let ((hit (and *functions* (gethash key *functions*))))
+    (if hit
+        hit
+        (let ((b (%fn-key-unqualify key)))
+          (and b *functions* (gethash b *functions*))))))
+
+(defun %fn-register-info (info)
+  "Register INFO in *FUNCTIONS* under its BARE name (unchanged: last-defun-
+   wins) and, when it carries a QUALIFIED-NAME, ALSO under that key.  The
+   qualified entry is what lets two baked packages define the same name and
+   each resolve to its own.  Both registrations happen in definition order at
+   every site, so within one package last-defun-wins is preserved exactly."
+  (setf (gethash (function-info-name info) *functions*) info)
+  (let ((q (function-info-qualified-name info)))
+    (when q
+      (setf (gethash q *functions*) info)))
+  info)
 
 (defun %init-thunk-store (name name-hash tmp-var)
   "The STORE half of a generated defvar/defparameter/defconstant init thunk:
@@ -7960,7 +8119,7 @@
                                      (make-compiler-label)))
                (result (mvm-compile-function-internal lambda-name actual-params actual-body env rest-slot opt-start opt-count))
                (info (car result)))
-          (setf (gethash (function-info-name info) *functions*) info)
+          (%fn-register-info info)
           (push info *function-table*)
           (push result *pending-flet-ir*)
           (if *mvm-eval-runtime-p*
@@ -8012,7 +8171,7 @@
                ;; value), because child bindings win over the parent chain.
                (result (mvm-compile-function-internal lambda-name actual-params wrapped-body (%env-symbol-macros-only env) rest-slot opt-start opt-count))
                (info (car result)))
-          (setf (gethash (function-info-name info) *functions*) info)
+          (%fn-register-info info)
           (push info *function-table*)
           (push result *pending-flet-ir*)
           ;; Build closure object at definition site as a 2-slot
@@ -8360,7 +8519,7 @@
           ;; synthesized-&rest transform.
           (setf (function-info-optional-count info) (cadddr pp)))
         ;; Register with unique name
-        (setf (gethash (function-info-name info) *functions*) info)
+        (%fn-register-info info)
         (push info *function-table*)
         (push result *pending-flet-ir*)))
     ;; Compile outer body with the flet env (has name mappings)
@@ -10716,7 +10875,13 @@
                     ((string= fn-name "EQ")     "%EQ-FN")
                     ((string= fn-name "EQUAL")  "%EQUAL-FN")
                     (t nil)))
-             (resolved-name (or unique-name wrapper-name fn-name)))
+             ;; #211: package-qualified key when neither a flet/labels
+             ;; binding nor a primitive wrapper claimed the name.  Phase 3
+             ;; falls back to the bare key on a miss.
+             (resolved-name (or unique-name wrapper-name
+                                (if (symbolp name)
+                                    (%fn-key-qualify name fn-name)
+                                    fn-name))))
         ;; mvm-eval (in-image runtime compile) ONLY: #'NAME of an IN-MODULE
         ;; function (a defun/flet compiled in THIS mvm-eval module) must not
         ;; escape as a bare bytecode-offset fixnum.  op-FN-ADDR stores the
@@ -10755,14 +10920,22 @@
    Compares by STRING so mixed symbol/string function-info names both match.
    The table is module-local in-image (mvm-eval-forms binds it fresh per call),
    so the scan is short."
-  (if (and *current-function-name*
-           (string= (string *current-function-name*) name))
-      t
-      (let ((found nil))
-        (dolist (info *function-table* found)
-          (when (and (not found)
-                     (string= (string (function-info-name info)) name))
-            (setq found t))))))
+  ;; #211: NAME may now arrive package-qualified (compile-function-ref emits
+  ;; the folded key), while *CURRENT-FUNCTION-NAME* and FUNCTION-INFO-NAME are
+  ;; both BARE.  Compare against the qualified key AND its bare form so the
+  ;; self-reference and in-module cases keep matching — missing them would
+  ;; reinstate the raw-offset escape this predicate exists to prevent.
+  (let ((bare (or (%fn-key-unqualify name) name)))
+    (if (and *current-function-name*
+             (or (string= (string *current-function-name*) name)
+                 (string= (string *current-function-name*) bare)))
+        t
+        (let ((found nil))
+          (dolist (info *function-table* found)
+            (when (and (not found)
+                       (let ((n (string (function-info-name info))))
+                         (or (string= n name) (string= n bare))))
+              (setq found t)))))))
 
 ;;; ============================================================
 ;;; Multiple Values
@@ -11584,7 +11757,8 @@
              (boundp '*functions*)
              *functions*)
     (let* ((fn-name (%rt-fn-name (cadr fn-form)))
-           (info (gethash fn-name *functions*)))
+           (info (%fn-info-for-key
+                   (%fn-key-qualify (cadr fn-form) fn-name))))
       (and info
            (function-info-rest-param-p info)
            (let ((req (function-info-required-count info)))
@@ -12602,7 +12776,9 @@
     (dolist (entry (reverse *arity-audit-log*))
       (destructuring-bind (caller callee nargs req param-count has-rest src) entry
         (declare (ignore req param-count has-rest))
-        (let ((final (gethash callee *functions*)))
+        ;; #211: CALLEE is whatever key compile-call resolved to, which may
+        ;; be package-qualified — go through the same fallback lookup.
+        (let ((final (%fn-info-for-key callee)))
           (when final
             (let ((f-req   (function-info-required-count final))
                   (f-pc    (function-info-param-count final))
@@ -14718,9 +14894,13 @@
         (true-nargs nil))
     (when (and (symbolp fn) (boundp '*functions*) *functions*)
       (let* ((fn-name (%rt-fn-name fn))
-             ;; Check for flet/labels name mapping
-             (resolved-fn-name (or (env-lookup-fn env fn-name) fn-name))
-             (fn-info (gethash resolved-fn-name *functions*)))
+             ;; Check for flet/labels name mapping.  A flet/labels binding
+             ;; SHADOWS the global, so it is consulted BEFORE the #211
+             ;; package-qualified key (env-lookup-fn is keyed on the bare
+             ;; name at both bind and lookup — see compile-flet's base-name).
+             (resolved-fn-name (or (env-lookup-fn env fn-name)
+                                   (%fn-key-qualify fn fn-name)))
+             (fn-info (%fn-info-for-key resolved-fn-name)))
         (when fn-info
           (let ((req (function-info-required-count fn-info))
                 (param-count (function-info-param-count fn-info))
@@ -14879,7 +15059,11 @@
        (let* ((fn-name (%rt-fn-name fn))
               ;; Check env for flet/labels name mapping (unique name)
               (unique-name (env-lookup-fn env fn-name))
-              (resolved-name (or unique-name fn-name)))
+              ;; #211: otherwise emit the key of the package this call was
+              ;; READ in.  Phase 3 (%fn-info-for-key) falls back to the bare
+              ;; key when that package defines no such name, so a call that
+              ;; crosses packages resolves exactly as it did before.
+              (resolved-name (or unique-name (%fn-key-qualify fn fn-name))))
          (emit-ir :call resolved-name nargs)))
       ;; (setf name) function — emit as SETF-NAME call
       ((and (consp fn) (eq (car fn) 'setf) (symbolp (cadr fn)))
@@ -15651,8 +15835,18 @@
     ;; Build function-info
     (let ((ir (get-ir-instructions)))
       ;; Store the IR on the function-info for later bytecode emission
-      (let ((info (make-function-info
-                    :name (if (symbolp name) (%rt-fn-name name) (string name))
+      (let* ((bare-name (if (symbolp name) (%rt-fn-name name) (string name)))
+             (info (make-function-info
+                    :name bare-name
+                    ;; #211: the package-folded alias key, or NIL when the
+                    ;; name symbol has no foldable home package (a string
+                    ;; name from flet/labels/lambda/toplevel-thunk, an
+                    ;; uninterned symbol, or a COMMON-LISP / -USER / KEYWORD
+                    ;; symbol).  NIL keeps the site byte-identical.
+                    :qualified-name
+                      (and (symbolp name)
+                           (let ((q (%fn-key-qualify name bare-name)))
+                             (if (equal q bare-name) nil q)))
                     :param-count (length params)
                     :bytecode-offset 0
                     :bytecode-length 0
@@ -16095,7 +16289,7 @@
            ;; +mvm-runtime-call-base+ (in-image interp resolves it to NIL
            ;; the same way).
            (let* ((fn-name (third insn))
-                  (fn-info (gethash fn-name *functions*)))
+                  (fn-info (%fn-info-for-key fn-name)))
              (unless (or fn-info *mvm-eval-runtime-p*)
                (format *error-output*
                        ";; WARN li-func: unresolved function ~A — emitting NIL sentinel~%"
@@ -16185,7 +16379,7 @@
           ;; ---- Call ----
           (:call
            (let* ((fn-name (second insn))
-                  (fn-info (gethash fn-name *functions*))
+                  (fn-info (%fn-info-for-key fn-name))
                   (target (if fn-info
                               (function-info-bytecode-offset fn-info)
                               ;; Unresolved: target the %UNRESOLVED-FN stub
@@ -16209,7 +16403,7 @@
           (:fn-addr
            (let* ((dest-reg (second insn))
                   (fn-name (third insn))
-                  (fn-info (gethash fn-name *functions*))
+                  (fn-info (%fn-info-for-key fn-name))
                   (target (if fn-info
                               (function-info-bytecode-offset fn-info)
                               0)))
@@ -16300,7 +16494,13 @@
       ;; Record source location
       (setf (function-info-source-location info) *current-source-location*)
       ;; Warn on redefinition with source locations + log for end-of-build summary.
-      (let ((existing (gethash (function-info-name info) *functions*)))
+      ;; #211: report on the key this defun will actually be resolved BY — its
+      ;; package-qualified one when it has one.  Two packages defining the same
+      ;; name are no longer redefining each other, and saying so would be a
+      ;; false report; a genuine same-package redefinition still lands here.
+      (let ((existing (gethash (or (function-info-qualified-name info)
+                                   (function-info-name info))
+                               *functions*)))
         (when existing
           (let ((old-loc (or (function-info-source-location existing) "?"))
                 (new-loc (or *current-source-location* "?")))
@@ -16309,7 +16509,7 @@
             (push (list (function-info-name info) old-loc new-loc)
                   *redefinition-log*))))
       ;; Register in function table
-      (setf (gethash (function-info-name info) *functions*) info)
+      (%fn-register-info info)
       (push info *function-table*)
       ;; Return the info and IR for later bytecode emission
       (cons info ir))))
@@ -17141,7 +17341,7 @@
             (setf (function-info-bytecode-offset info) global-offset)
             (setf (function-info-bytecode-length info) fn-size)
             ;; Update function in hash table so calls can resolve
-            (setf (gethash (function-info-name info) *functions*) info)
+            (%fn-register-info info)
             (incf global-offset fn-size))))
 
       ;; Debug: show bytecode offsets for key functions
@@ -17175,8 +17375,13 @@
               (let ((fn-size (function-info-bytecode-length (car entry))))
                 (dotimes (i fn-size)
                   (mvm-nop buf)))
-              ;; Remove from function table so calls resolve to %unresolved-fn
+              ;; Remove from function table so calls resolve to %unresolved-fn.
+              ;; #211: BOTH keys — leaving the package-qualified alias behind
+              ;; would let an in-package call still resolve to this entry,
+              ;; whose bytecode has just been replaced by NOP padding.
               (remhash (function-info-name (car entry)) *functions*)
+              (let ((q (function-info-qualified-name (car entry))))
+                (when q (remhash q *functions*)))
               (setf *function-table*
                     (remove (car entry) *function-table*))))))
 

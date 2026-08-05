@@ -3,6 +3,31 @@
 36 scripts, 30,387 lines. They are essentially **arch × (hosted | bare) × board**,
 plus a payload axis (repl / ssh / actors / CLI / ANSI-gate / self-host).
 
+## Building them — one entry point
+
+```bash
+sbcl --script mvm/build.lisp --list             # the build matrix
+sbcl --script mvm/build.lisp x64/bare/qemu/repl
+sbcl --script mvm/build.lisp build-x64-repl     # legacy name still resolves
+```
+
+`mvm/build.lisp` is the single build entry point.  The matrix is
+**arch × mode × board × payload** — `x64|aarch64|i386` × `hosted|bare` ×
+`qemu|rpi|t420`.  Every cell is reachable today: a cell is either `native`
+(built from the table, no legacy script) or `legacy` (delegates to its
+`build-*.lisp`, unchanged).  Cells migrate one at a time, each gated on
+producing a **byte-identical** image.
+
+Migrated so far (both verified byte-identical to the script they replace):
+
+| cell | md5 legacy == native |
+|---|---|
+| `x64/bare/qemu/repl` | `269b461a764016eea6533c46798ad3e4` |
+| `aarch64/bare/qemu/repl` | `fd0d40b12e984e064f3713ce03ed21e8` |
+
+`aarch64/bare/rpi/repl` is also native and reproduces the known RPi
+`A64-BUFFER` build failure *identically* — the migration does not mask it.
+
 ## Running them — one entry point
 
 ```bash

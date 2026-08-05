@@ -1142,6 +1142,145 @@
   (i386-emit-modrm-mem buf 0 +i386-esp+ 0)
   (i386-emit-s8 buf 0))
 
+;;; ============================================================
+;;; --- SSE2 double-precision + the boxed-float payload (#200/#201) ---
+;;; ============================================================
+;;;
+;;; A float object is subtag #x60 (#x64..#x66 for single/short/long) with FOUR
+;;; slots, each holding one 16-bit chunk of the IEEE-754 double stored TAGGED
+;;; (chunk << 1):
+;;;
+;;;   slot 0 = bits 63..48   slot 1 = bits 47..32
+;;;   slot 2 = bits 31..16   slot 3 = bits 15..0
+;;;
+;;; Every chunk is 0..65535, so the stored machine word is 0..131070: always
+;;; positive, always low-bit-0 (the conservative collector reads the slot as a
+;;; fixnum and never follows the float's raw bit pattern as a pointer) and it
+;;; FITS A 32-BIT WORD.  The old 2 x 32-bit layout stored hi32 << 1, which
+;;; overflows a 32-bit slot and loses the double's SIGN BIT — that, and only
+;;; that, is why i386 had no floats.  See docs/i386-float-blocker.md;
+;;; compiler.lisp's +float-slots+ / +subtag-float+ and
+;;; mvm/float-slot-overrides.lisp must agree with this.
+;;;
+;;; i386 object shape (unlike x64 there is NO padding word): raw base R,
+;;; tagged pointer P = R | 9, header at [R+0], slot i at [R + (i+1)*4].
+;;; Size = align16((4+1)*4) = 32, which is exactly what the i386 collector's
+;;; copy_object derives from the header count — allocator and collector agree.
+;;;
+;;; WHY THE STACK AND NOT REGISTER PAIRS.  x64 reassembles the four chunks
+;;; into ONE 64-bit GPR and MOVQs it into an XMM.  i386 has no 64-bit GPR, and
+;;; it has exactly TWO free registers (ECX/EDX — EAX *is* VR, ESI/EDI/EBX are
+;;; V0/V1/V4, EBP is VFP), which is not enough to hold a pointer plus a
+;;; 2-register 64-bit accumulator.  So the double is assembled directly in
+;;; memory, 16 bits at a time, with `MOV WORD [ESP+k], dx`: the little-endian
+;;; stack image of a double puts bits 15..0 at [ESP+0] and bits 63..48 at
+;;; [ESP+6], so each chunk goes straight to its own halfword and there is no
+;;; accumulator at all.  Peak live registers: one pointer + one chunk = 2.
+;;; MOVSD then loads/stores the whole double from [ESP] in one instruction.
+;;;
+;;; SSE2 REQUIREMENT.  ADDSD/MOVSD/CVTSI2SD are SSE2 (Pentium 4+).  On hosted
+;;; Linux (the only i386 target that reaches float code today — this is
+;;; build-i386-cli) the kernel has already set CR4.OSFXSR/OSXMMEXCPT, so they
+;;; just work.  A bare-metal i386 kernel would have to enable those CR4 bits
+;;; before executing any of this; it currently never does, and it also never
+;;; emits a float opcode, so nothing regresses.  Chose SSE2 over the x87 FPU
+;;; deliberately: x87 computes in 80-bit extended precision and storing back
+;;; to a double DOUBLE-ROUNDS, which can differ from x64 in the last bit.
+;;; SSE2 is bit-exact against x64, and bit-exactness is the requirement.
+
+(defconstant +i386-xmm0+ 0)
+(defconstant +i386-xmm1+ 1)
+
+(defconstant +i386-float-header+ #x460
+  "Header word for a 4-slot double-float object: (count 4) << 8 | subtag #x60.
+   Mirrors compiler.lisp's +float-slots+ / +subtag-float+ and translate-x64's
+   literal; keep the three in step.")
+
+(defconstant +i386-float-size+ 32
+  "align16((+float-slots+ + 1) * 4) — the i386 object has a 4-byte header and
+   NO padding word, so 5 words = 20 bytes rounds up to 32.")
+
+(defun i386-emit-movsd-xmm-esp (buf xmm)
+  "MOVSD xmm, [ESP] — F2 0F 10 /r with mod=00 r/m=100 (SIB) and SIB base=ESP."
+  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x10)
+  (i386-emit-byte buf (i386-modrm #b00 xmm 4))
+  (i386-emit-byte buf (i386-sib 0 4 +i386-esp+)))
+
+(defun i386-emit-movsd-esp-xmm (buf xmm)
+  "MOVSD [ESP], xmm — F2 0F 11 /r, same addressing form."
+  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x11)
+  (i386-emit-byte buf (i386-modrm #b00 xmm 4))
+  (i386-emit-byte buf (i386-sib 0 4 +i386-esp+)))
+
+(defun i386-emit-sse-arith (buf sse-op xmm-dst xmm-src)
+  "F2 0F <sse-op> /r — ADDSD(#x58) / SUBSD(#x5C) / MULSD(#x59) / DIVSD(#x5E)
+   xmm-dst, xmm-src, register form."
+  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf sse-op)
+  (i386-emit-byte buf (i386-modrm #b11 xmm-dst xmm-src)))
+
+(defun i386-emit-ucomisd (buf xmm-dst xmm-src)
+  "UCOMISD xmm-dst, xmm-src — 66 0F 2E /r.  Sets ZF/PF/CF like x64's, so the
+   following :beq/:blt/:bgt read the same flags on both arches."
+  (i386-emit-byte buf #x66) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x2E)
+  (i386-emit-byte buf (i386-modrm #b11 xmm-dst xmm-src)))
+
+(defun i386-emit-cvtsi2sd (buf xmm gpr)
+  "CVTSI2SD xmm, r32 — F2 0F 2A /r.  The source is a SIGNED 32-bit integer,
+   which is exactly what an untagged i386 fixnum is (31 significant bits)."
+  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x2A)
+  (i386-emit-byte buf (i386-modrm #b11 xmm gpr)))
+
+(defun i386-emit-cvttsd2si (buf gpr xmm)
+  "CVTTSD2SI r32, xmm — F2 0F 2C /r, truncating toward zero."
+  (i386-check-eax-write gpr)
+  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x2C)
+  (i386-emit-byte buf (i386-modrm #b11 gpr xmm)))
+
+(defun i386-emit-float-bits-to-stack (buf ptr-reg tmp-reg)
+  "PTR-REG holds the TAGGED pointer to a float object.  Push 8 bytes and fill
+   them with the object's IEEE double, little-endian, so [ESP] is a valid
+   `double' for MOVSD.  Clobbers PTR-REG (untagged in place) and TMP-REG;
+   leaves ESP 8 lower — the caller must release it.
+
+   Slot i carries bits 63-16i .. 48-16i, i.e. halfword (3-i) of the
+   little-endian image, hence the (6 - 2i) displacement.  Storing only DX
+   masks the chunk to 16 bits for free, so junk above bit 15 of a slot cannot
+   corrupt a neighbour (the same guarantee x64 gets from its shl48/shr pair)."
+  (i386-emit-sub-reg-imm buf ptr-reg +tag-object+)      ; tagged -> raw base
+  (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+  (dotimes (i 4)
+    (i386-emit-mov-reg-mem buf tmp-reg ptr-reg (* (1+ i) 4))
+    (i386-emit-shr-reg-imm buf tmp-reg 1)               ; untag the chunk
+    (i386-emit-mov-mem16-reg buf +i386-esp+ (- 6 (* 2 i)) tmp-reg)))
+
+(defun i386-emit-float-bits-from-stack (buf base-reg tmp-reg)
+  "The inverse: an 8-byte little-endian double sits at [ESP]; BASE-REG holds
+   the RAW base of a freshly allocated 4-slot float object.  Split the double
+   into four tagged 16-bit chunks and write slots 0..3.  Clobbers TMP-REG;
+   BASE-REG and ESP are preserved.  MOVZX zero-extends, so `shl 1' can never
+   produce a negative (pointer-looking) slot word."
+  (dotimes (i 4)
+    (i386-emit-movzx-word buf tmp-reg +i386-esp+ (- 6 (* 2 i)))
+    (i386-emit-shl-reg-imm buf tmp-reg 1)               ; tag the chunk
+    (i386-emit-mov-mem-reg buf base-reg (* (1+ i) 4) tmp-reg)))
+
+(defun i386-emit-float-alloc (buf base-reg bump-reg)
+  "Allocate a 4-slot double-float object at VA.  Leaves the RAW base in
+   BASE-REG (still untagged — the caller stores the payload through it, then
+   tags it), bumps VA by +i386-float-size+ using BUMP-REG, and sets the MCGC
+   object-start bit.  Mirrors +op-alloc-obj+'s VR-preserving shape: the base
+   stays in EDX and is tagged in place at the very end, so no third register
+   (EAX = VR) is ever needed.
+
+   The preceding :gc-check is emitted by compiler.lisp, not here — see the
+   x64 note; 32 bytes is far inside the collector's overshoot guard."
+  (i386-emit-mov-reg-abs buf base-reg *va-addr*)
+  (i386-emit-mov-mem-imm buf base-reg 0 +i386-float-header+)
+  (i386-emit-mov-reg-reg buf bump-reg base-reg)
+  (i386-emit-add-reg-imm buf bump-reg +i386-float-size+)
+  (i386-emit-mov-abs-reg buf *va-addr* bump-reg)
+  (i386-emit-gc-mark-start buf base-reg))               ; object-start only
+
 ;;; --- I/O Port Instructions ---
 
 (defun i386-emit-in-al-dx (buf)      (i386-emit-byte buf #xEC))
@@ -3853,6 +3992,105 @@
                  (i386-emit-pop-reg buf +i386-esi+)
                  (i386-emit-label buf done)
                  (i386-store-vreg buf vd +scratch1+)))))
+
+        ;; ================================================================
+        ;; IEEE 64-bit float arithmetic — SSE2 lowering (#200/#201).
+        ;;
+        ;; Layout, register-pressure argument and the SSE2-vs-x87 decision are
+        ;; all documented at I386-EMIT-FLOAT-BITS-TO-STACK above; read that
+        ;; before changing anything here.
+        ;;
+        ;; Per-op shape (compare translate-x64's, which is the same modulo the
+        ;; stack detour that replaces its MOVQ through a 64-bit GPR):
+        ;;   1. Load an operand pointer into ECX, expand its four chunks into
+        ;;      an 8-byte little-endian double at [ESP], MOVSD it into an XMM,
+        ;;      release the 8 bytes.  Done for Vb then Va, so only ONE operand
+        ;;      pointer is ever live — no push/pop pairing needed.
+        ;;   2. ADDSD / SUBSD / MULSD / DIVSD xmm0, xmm1.
+        ;;   3. Allocate a fresh 4-slot float, MOVSD the result back out to
+        ;;      [ESP], split it into four tagged 16-bit chunks, tag the base.
+        ;;
+        ;; XMM0/XMM1 are caller-saved and modus uses no XMM register for
+        ;; anything else, so they can be clobbered freely.  ESP is restored
+        ;; before every vreg access; spilled vregs are addressed off EBP
+        ;; anyway, so the temporary ESP dips cannot disturb them.
+        ;; ================================================================
+        ((or (op= +op-fadd+) (op= +op-fsub+) (op= +op-fmul+) (op= +op-fdiv+))
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (sse-op (cond ((op= +op-fadd+) #x58)     ; ADDSD
+                              ((op= +op-fsub+) #x5C)     ; SUBSD
+                              ((op= +op-fmul+) #x59)     ; MULSD
+                              (t               #x5E))))  ; DIVSD
+           ;; Vb -> xmm1
+           (i386-load-vreg buf +scratch0+ vb)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm1+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           ;; Va -> xmm0
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           ;; xmm0 = xmm0 <op> xmm1
+           (i386-emit-sse-arith buf sse-op +i386-xmm0+ +i386-xmm1+)
+           ;; Allocate, write the payload back, tag.
+           (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+           (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
+        ((op= +op-itof+)
+         ;; (itof Vd Vs) — tagged integer -> freshly allocated float object.
+         (let ((vd (first operands)) (vs (second operands)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)      ; untag (signed)
+           (i386-emit-cvtsi2sd buf +i386-xmm0+ +scratch0+)
+           (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+           (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
+        ((op= +op-ftoi+)
+         ;; (ftoi Vd Vs) — float -> tagged integer, truncating toward zero.
+         ;; Allocates nothing, so compiler.lisp correctly emits no :gc-check.
+         ;;
+         ;; KNOWN GAP, shared with x64 and inherited deliberately rather than
+         ;; papered over: CVTTSD2SI returns the integer-indefinite value when
+         ;; the double is out of range, and the following `shl 1' turns that
+         ;; into 0 — a silent wrong answer instead of a bignum or an error.
+         ;; i386 hits it earlier than x64 (fixnums are 31-bit here, 63-bit
+         ;; there), so |x| >= 2^30 truncates wrong on i386 while x64 still
+         ;; answers correctly.  Fixing it is one change in both translators.
+         (let ((vd (first operands)) (vs (second operands)))
+           (i386-load-vreg buf +scratch0+ vs)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-cvttsd2si buf +scratch0+ +i386-xmm0+)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)      ; tag as fixnum
+           (i386-store-vreg buf vd +scratch0+)))
+
+        ((op= +op-fcmp+)
+         ;; (fcmp Va Vb) — UCOMISD, leaving x86 flags for the following
+         ;; :beq/:blt/:bgt.  Identical flag semantics to x64's arm.
+         (let ((va (first operands)) (vb (second operands)))
+           (i386-load-vreg buf +scratch0+ vb)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm1+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-load-vreg buf +scratch0+ va)
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-ucomisd buf +i386-xmm0+ +i386-xmm1+)))
 
         ;; ============================================
         ;; Unknown Opcode

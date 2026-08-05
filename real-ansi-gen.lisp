@@ -1,5 +1,6 @@
 
 ;; === acons.lsp ===
+(in-package :modus.mvm)
 (defun run-init-acons ()
   nil
 )
@@ -57,11 +58,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10014 c)))
 )
 (defun run-ansi-acons ()
-  (%try-chunk "acons" 15828927 1 #'run-ansi-acons-chunk-1)
-  (%try-chunk "acons" 15828927 2 #'run-ansi-acons-chunk-2)
+  (%try-chunk "acons" 3164095 1 #'run-ansi-acons-chunk-1)
+  (%try-chunk "acons" 3164095 2 #'run-ansi-acons-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === adjoin.lsp ===
+(in-package :modus.mvm)
 (defun run-init-adjoin ()
   nil
 )
@@ -242,14 +246,17 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10054 c)))
 )
 (defun run-ansi-adjoin ()
-  (%try-chunk "adjoin" 3050528 1 #'run-ansi-adjoin-chunk-1)
-  (%try-chunk "adjoin" 3050528 2 #'run-ansi-adjoin-chunk-2)
-  (%try-chunk "adjoin" 3050528 3 #'run-ansi-adjoin-chunk-3)
-  (%try-chunk "adjoin" 3050528 4 #'run-ansi-adjoin-chunk-4)
-  (%try-chunk "adjoin" 3050528 5 #'run-ansi-adjoin-chunk-5)
+  (%try-chunk "adjoin" 2231328 1 #'run-ansi-adjoin-chunk-1)
+  (%try-chunk "adjoin" 2231328 2 #'run-ansi-adjoin-chunk-2)
+  (%try-chunk "adjoin" 2231328 3 #'run-ansi-adjoin-chunk-3)
+  (%try-chunk "adjoin" 2231328 4 #'run-ansi-adjoin-chunk-4)
+  (%try-chunk "adjoin" 2231328 5 #'run-ansi-adjoin-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === append.lsp ===
+(in-package :modus.mvm)
 (defun run-init-append ()
   nil
 )
@@ -312,11 +319,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10068 c)))
 )
 (defun run-ansi-append ()
-  (%try-chunk "append" 5589081 1 #'run-ansi-append-chunk-1)
-  (%try-chunk "append" 5589081 2 #'run-ansi-append-chunk-2)
+  (%try-chunk "append" 11028569 1 #'run-ansi-append-chunk-1)
+  (%try-chunk "append" 11028569 2 #'run-ansi-append-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === assoc-if-not.lsp ===
+(in-package :modus.mvm)
 (defun run-init-assoc-if-not ()
   nil
 )
@@ -481,13 +491,16 @@
   (handler-case (run-test 10096 (lambda () (SIGNALS-TYPE-ERROR X 'Y (ASSOC-IF-NOT #'IDENTITY X))) 'T) (t (c) (%test-crash-fail-c 10096 c)))
 )
 (defun run-ansi-assoc-if-not ()
-  (%try-chunk "assoc-if-not" 9363696 1 #'run-ansi-assoc-if-not-chunk-1)
-  (%try-chunk "assoc-if-not" 9363696 2 #'run-ansi-assoc-if-not-chunk-2)
-  (%try-chunk "assoc-if-not" 9363696 3 #'run-ansi-assoc-if-not-chunk-3)
-  (%try-chunk "assoc-if-not" 9363696 4 #'run-ansi-assoc-if-not-chunk-4)
+  (%try-chunk "assoc-if-not" 8790256 1 #'run-ansi-assoc-if-not-chunk-1)
+  (%try-chunk "assoc-if-not" 8790256 2 #'run-ansi-assoc-if-not-chunk-2)
+  (%try-chunk "assoc-if-not" 8790256 3 #'run-ansi-assoc-if-not-chunk-3)
+  (%try-chunk "assoc-if-not" 8790256 4 #'run-ansi-assoc-if-not-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === assoc-if.lsp ===
+(in-package :modus.mvm)
 (defun run-init-assoc-if ()
   nil
 )
@@ -633,13 +646,16 @@
   (handler-case (run-test 10124 (lambda () (SIGNALS-TYPE-ERROR X 'Y (ASSOC-IF #'NULL X))) 'T) (t (c) (%test-crash-fail-c 10124 c)))
 )
 (defun run-ansi-assoc-if ()
-  (%try-chunk "assoc-if" 8875704 1 #'run-ansi-assoc-if-chunk-1)
-  (%try-chunk "assoc-if" 8875704 2 #'run-ansi-assoc-if-chunk-2)
-  (%try-chunk "assoc-if" 8875704 3 #'run-ansi-assoc-if-chunk-3)
-  (%try-chunk "assoc-if" 8875704 4 #'run-ansi-assoc-if-chunk-4)
+  (%try-chunk "assoc-if" 1584824 1 #'run-ansi-assoc-if-chunk-1)
+  (%try-chunk "assoc-if" 1584824 2 #'run-ansi-assoc-if-chunk-2)
+  (%try-chunk "assoc-if" 1584824 3 #'run-ansi-assoc-if-chunk-3)
+  (%try-chunk "assoc-if" 1584824 4 #'run-ansi-assoc-if-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === assoc.lsp ===
+(in-package :modus.mvm)
 (defun run-init-assoc ()
   nil
 )
@@ -853,16 +869,19 @@
   (handler-case (run-test 10176 (lambda () (SIGNALS-TYPE-ERROR X 'Y (ASSOC 'X X))) 'T) (t (c) (%test-crash-fail-c 10176 c)))
 )
 (defun run-ansi-assoc ()
-  (%try-chunk "assoc" 11340626 1 #'run-ansi-assoc-chunk-1)
-  (%try-chunk "assoc" 11340626 2 #'run-ansi-assoc-chunk-2)
-  (%try-chunk "assoc" 11340626 3 #'run-ansi-assoc-chunk-3)
-  (%try-chunk "assoc" 11340626 4 #'run-ansi-assoc-chunk-4)
-  (%try-chunk "assoc" 11340626 5 #'run-ansi-assoc-chunk-5)
-  (%try-chunk "assoc" 11340626 6 #'run-ansi-assoc-chunk-6)
-  (%try-chunk "assoc" 11340626 7 #'run-ansi-assoc-chunk-7)
+  (%try-chunk "assoc" 4262738 1 #'run-ansi-assoc-chunk-1)
+  (%try-chunk "assoc" 4262738 2 #'run-ansi-assoc-chunk-2)
+  (%try-chunk "assoc" 4262738 3 #'run-ansi-assoc-chunk-3)
+  (%try-chunk "assoc" 4262738 4 #'run-ansi-assoc-chunk-4)
+  (%try-chunk "assoc" 4262738 5 #'run-ansi-assoc-chunk-5)
+  (%try-chunk "assoc" 4262738 6 #'run-ansi-assoc-chunk-6)
+  (%try-chunk "assoc" 4262738 7 #'run-ansi-assoc-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === atom.lsp ===
+(in-package :modus.mvm)
 (defun run-init-atom ()
   nil
 )
@@ -884,10 +903,13 @@
   (handler-case (run-test 10181 (lambda () (HANDLER-CASE (PROGN (ATOM 'A 'B) NIL) (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10181 c)))
 )
 (defun run-ansi-atom ()
-  (%try-chunk "atom" 11409472 1 #'run-ansi-atom-chunk-1)
+  (%try-chunk "atom" 14030912 1 #'run-ansi-atom-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === butlast.lsp ===
+(in-package :modus.mvm)
 (defun run-init-butlast ()
   nil
 )
@@ -956,11 +978,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10197 c)))
 )
 (defun run-ansi-butlast ()
-  (%try-chunk "butlast" 7478982 1 #'run-ansi-butlast-chunk-1)
-  (%try-chunk "butlast" 7478982 2 #'run-ansi-butlast-chunk-2)
+  (%try-chunk "butlast" 6758086 1 #'run-ansi-butlast-chunk-1)
+  (%try-chunk "butlast" 6758086 2 #'run-ansi-butlast-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === cons-test-01.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *CONS-FNS*
   (LIST 'CONS 'CONSP 'ATOM 'RPLACA 'RPLACD 'CAR 'CDR 'CAAR 'CADR 'CDAR 'CDDR
         'CAAAR 'CAADR 'CADAR 'CADDR 'CDAAR 'CDADR 'CDDAR 'CDDDR 'CAAAAR 'CAAADR
@@ -1052,11 +1077,14 @@
                        'NINTERSECTION 'ADJOIN 'SET-DIFFERENCE 'NSET-DIFFERENCE
                        'SET-EXCLUSIVE-OR 'NSET-EXCLUSIVE-OR 'SUBSETP 'UNION
                        'NUNION)) (t (c) nil))
-  (%try-chunk "cons-test-01" 5176145 1 #'run-ansi-cons-test-01-chunk-1)
-  (%try-chunk "cons-test-01" 5176145 2 #'run-ansi-cons-test-01-chunk-2)
+  (%try-chunk "cons-test-01" 1407825 1 #'run-ansi-cons-test-01-chunk-1)
+  (%try-chunk "cons-test-01" 1407825 2 #'run-ansi-cons-test-01-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === cons-test-03.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cons-test-03 ()
   nil
 )
@@ -1070,10 +1098,13 @@
   (handler-case (run-test 10215 (lambda () (NOTNOT-MV (TYPEP '(A B C D E F G H) 'LIST))) 'T) (t (c) (%test-crash-fail-c 10215 c)))
 )
 (defun run-ansi-cons-test-03 ()
-  (%try-chunk "cons-test-03" 5176323 1 #'run-ansi-cons-test-03-chunk-1)
+  (%try-chunk "cons-test-03" 4979715 1 #'run-ansi-cons-test-03-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === cons-test-05.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *CONS-ACCESSORS*
   '(FIRST SECOND THIRD FOURTH FIFTH SIXTH SEVENTH EIGHTH NINTH TENTH CAR CDR
           CAAR CADR CDAR CDDR CAAAR CAADR CADAR CADDR CDAAR CDADR CDDAR CDDDR
@@ -1171,10 +1202,13 @@
                                CAAADR CAADAR CAADDR CADAAR CADADR CADDAR CADDDR
                                CDAAAR CDAADR CDADAR CDADDR CDDAAR CDDADR CDDDAR
                                CDDDDR)) (t (c) nil))
-  (%try-chunk "cons-test-05" 5176501 1 #'run-ansi-cons-test-05-chunk-1)
+  (%try-chunk "cons-test-05" 8551605 1 #'run-ansi-cons-test-05-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === cons.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cons ()
   nil
 )
@@ -1195,10 +1229,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10226 c)))
 )
 (defun run-ansi-cons ()
-  (%try-chunk "cons" 11100670 1 #'run-ansi-cons-chunk-1)
+  (%try-chunk "cons" 664062 1 #'run-ansi-cons-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === consp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-consp ()
   nil
 )
@@ -1223,11 +1260,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10236 c)))
 )
 (defun run-ansi-consp ()
-  (%try-chunk "consp" 14873982 1 #'run-ansi-consp-chunk-1)
-  (%try-chunk "consp" 14873982 2 #'run-ansi-consp-chunk-2)
+  (%try-chunk "consp" 3814782 1 #'run-ansi-consp-chunk-1)
+  (%try-chunk "consp" 3814782 2 #'run-ansi-consp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-alist.lsp ===
+(in-package :modus.mvm)
 (defun run-init-copy-alist ()
   nil
 )
@@ -1257,10 +1297,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10240 c)))
 )
 (defun run-ansi-copy-alist ()
-  (%try-chunk "copy-alist" 4407828 1 #'run-ansi-copy-alist-chunk-1)
+  (%try-chunk "copy-alist" 6455828 1 #'run-ansi-copy-alist-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-list.lsp ===
+(in-package :modus.mvm)
 (defun run-init-copy-list ()
   nil
 )
@@ -1280,10 +1323,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10246 c)))
 )
 (defun run-ansi-copy-list ()
-  (%try-chunk "copy-list" 13957 1 #'run-ansi-copy-list-chunk-1)
+  (%try-chunk "copy-list" 4519557 1 #'run-ansi-copy-list-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-tree.lsp ===
+(in-package :modus.mvm)
 (defun run-init-copy-tree ()
   nil
 )
@@ -1314,10 +1360,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10251 c)))
 )
 (defun run-ansi-copy-tree ()
-  (%try-chunk "copy-tree" 12251809 1 #'run-ansi-copy-tree-chunk-1)
+  (%try-chunk "copy-tree" 16380577 1 #'run-ansi-copy-tree-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === cxr.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *CONS-TEST-4*
   (CONS
    (CONS (CONS (CONS 'A 'B) (CONS 'C 'D)) (CONS (CONS 'E 'F) (CONS 'G 'H)))
@@ -1607,26 +1656,29 @@
                            (CONS (CONS 'E 'F) (CONS 'G 'H)))
                      (CONS (CONS (CONS 'I 'J) (CONS 'K 'L))
                            (CONS (CONS 'M 'N) (CONS 'O 'P))))) (t (c) nil))
-  (%try-chunk "cxr" 14385462 1 #'run-ansi-cxr-chunk-1)
-  (%try-chunk "cxr" 14385462 2 #'run-ansi-cxr-chunk-2)
-  (%try-chunk "cxr" 14385462 3 #'run-ansi-cxr-chunk-3)
-  (%try-chunk "cxr" 14385462 4 #'run-ansi-cxr-chunk-4)
-  (%try-chunk "cxr" 14385462 5 #'run-ansi-cxr-chunk-5)
-  (%try-chunk "cxr" 14385462 6 #'run-ansi-cxr-chunk-6)
-  (%try-chunk "cxr" 14385462 7 #'run-ansi-cxr-chunk-7)
-  (%try-chunk "cxr" 14385462 8 #'run-ansi-cxr-chunk-8)
-  (%try-chunk "cxr" 14385462 9 #'run-ansi-cxr-chunk-9)
-  (%try-chunk "cxr" 14385462 10 #'run-ansi-cxr-chunk-10)
-  (%try-chunk "cxr" 14385462 11 #'run-ansi-cxr-chunk-11)
-  (%try-chunk "cxr" 14385462 12 #'run-ansi-cxr-chunk-12)
-  (%try-chunk "cxr" 14385462 13 #'run-ansi-cxr-chunk-13)
-  (%try-chunk "cxr" 14385462 14 #'run-ansi-cxr-chunk-14)
-  (%try-chunk "cxr" 14385462 15 #'run-ansi-cxr-chunk-15)
-  (%try-chunk "cxr" 14385462 16 #'run-ansi-cxr-chunk-16)
-  (%try-chunk "cxr" 14385462 17 #'run-ansi-cxr-chunk-17)
+  (%try-chunk "cxr" 13173046 1 #'run-ansi-cxr-chunk-1)
+  (%try-chunk "cxr" 13173046 2 #'run-ansi-cxr-chunk-2)
+  (%try-chunk "cxr" 13173046 3 #'run-ansi-cxr-chunk-3)
+  (%try-chunk "cxr" 13173046 4 #'run-ansi-cxr-chunk-4)
+  (%try-chunk "cxr" 13173046 5 #'run-ansi-cxr-chunk-5)
+  (%try-chunk "cxr" 13173046 6 #'run-ansi-cxr-chunk-6)
+  (%try-chunk "cxr" 13173046 7 #'run-ansi-cxr-chunk-7)
+  (%try-chunk "cxr" 13173046 8 #'run-ansi-cxr-chunk-8)
+  (%try-chunk "cxr" 13173046 9 #'run-ansi-cxr-chunk-9)
+  (%try-chunk "cxr" 13173046 10 #'run-ansi-cxr-chunk-10)
+  (%try-chunk "cxr" 13173046 11 #'run-ansi-cxr-chunk-11)
+  (%try-chunk "cxr" 13173046 12 #'run-ansi-cxr-chunk-12)
+  (%try-chunk "cxr" 13173046 13 #'run-ansi-cxr-chunk-13)
+  (%try-chunk "cxr" 13173046 14 #'run-ansi-cxr-chunk-14)
+  (%try-chunk "cxr" 13173046 15 #'run-ansi-cxr-chunk-15)
+  (%try-chunk "cxr" 13173046 16 #'run-ansi-cxr-chunk-16)
+  (%try-chunk "cxr" 13173046 17 #'run-ansi-cxr-chunk-17)
 )
 
+(in-package :modus.mvm)
+
 ;; === endp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-endp ()
   nil
 )
@@ -1649,10 +1701,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10395 c)))
 )
 (defun run-ansi-endp ()
-  (%try-chunk "endp" 11537312 1 #'run-ansi-endp-chunk-1)
+  (%try-chunk "endp" 15436704 1 #'run-ansi-endp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === get-properties.lsp ===
+(in-package :modus.mvm)
 (defun run-init-get-properties ()
   nil
 )
@@ -1758,11 +1813,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10410 c)))
 )
 (defun run-ansi-get-properties ()
-  (%try-chunk "get-properties" 9073205 1 #'run-ansi-get-properties-chunk-1)
-  (%try-chunk "get-properties" 9073205 2 #'run-ansi-get-properties-chunk-2)
+  (%try-chunk "get-properties" 9368117 1 #'run-ansi-get-properties-chunk-1)
+  (%try-chunk "get-properties" 9368117 2 #'run-ansi-get-properties-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === getf.lsp ===
+(in-package :modus.mvm)
 (defun run-init-getf ()
   nil
 )
@@ -1948,12 +2006,15 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10432 c)))
 )
 (defun run-ansi-getf ()
-  (%try-chunk "getf" 5026743 1 #'run-ansi-getf-chunk-1)
-  (%try-chunk "getf" 5026743 2 #'run-ansi-getf-chunk-2)
-  (%try-chunk "getf" 5026743 3 #'run-ansi-getf-chunk-3)
+  (%try-chunk "getf" 13169591 1 #'run-ansi-getf-chunk-1)
+  (%try-chunk "getf" 13169591 2 #'run-ansi-getf-chunk-2)
+  (%try-chunk "getf" 13169591 3 #'run-ansi-getf-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === intersection.lsp ===
+(in-package :modus.mvm)
 (defun run-init-intersection ()
   nil
 )
@@ -2259,16 +2320,19 @@
   (handler-case (run-test 10481 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 10481 c)))
 )
 (defun run-ansi-intersection ()
-  (%try-chunk "intersection" 567666 1 #'run-ansi-intersection-chunk-1)
-  (%try-chunk "intersection" 567666 2 #'run-ansi-intersection-chunk-2)
-  (%try-chunk "intersection" 567666 3 #'run-ansi-intersection-chunk-3)
-  (%try-chunk "intersection" 567666 4 #'run-ansi-intersection-chunk-4)
-  (%try-chunk "intersection" 567666 5 #'run-ansi-intersection-chunk-5)
-  (%try-chunk "intersection" 567666 6 #'run-ansi-intersection-chunk-6)
-  (%try-chunk "intersection" 567666 7 #'run-ansi-intersection-chunk-7)
+  (%try-chunk "intersection" 15870322 1 #'run-ansi-intersection-chunk-1)
+  (%try-chunk "intersection" 15870322 2 #'run-ansi-intersection-chunk-2)
+  (%try-chunk "intersection" 15870322 3 #'run-ansi-intersection-chunk-3)
+  (%try-chunk "intersection" 15870322 4 #'run-ansi-intersection-chunk-4)
+  (%try-chunk "intersection" 15870322 5 #'run-ansi-intersection-chunk-5)
+  (%try-chunk "intersection" 15870322 6 #'run-ansi-intersection-chunk-6)
+  (%try-chunk "intersection" 15870322 7 #'run-ansi-intersection-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === last.lsp ===
+(in-package :modus.mvm)
 (defun run-init-last ()
   nil
 )
@@ -2330,12 +2394,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10505 c)))
 )
 (defun run-ansi-last ()
-  (%try-chunk "last" 10971821 1 #'run-ansi-last-chunk-1)
-  (%try-chunk "last" 10971821 2 #'run-ansi-last-chunk-2)
-  (%try-chunk "last" 10971821 3 #'run-ansi-last-chunk-3)
+  (%try-chunk "last" 4614829 1 #'run-ansi-last-chunk-1)
+  (%try-chunk "last" 4614829 2 #'run-ansi-last-chunk-2)
+  (%try-chunk "last" 4614829 3 #'run-ansi-last-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === ldiff.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ldiff ()
   nil
 )
@@ -2425,12 +2492,15 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10522 c)))
 )
 (defun run-ansi-ldiff ()
-  (%try-chunk "ldiff" 4649918 1 #'run-ansi-ldiff-chunk-1)
-  (%try-chunk "ldiff" 4649918 2 #'run-ansi-ldiff-chunk-2)
-  (%try-chunk "ldiff" 4649918 3 #'run-ansi-ldiff-chunk-3)
+  (%try-chunk "ldiff" 3027902 1 #'run-ansi-ldiff-chunk-1)
+  (%try-chunk "ldiff" 3027902 2 #'run-ansi-ldiff-chunk-2)
+  (%try-chunk "ldiff" 3027902 3 #'run-ansi-ldiff-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === list-length.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP LIST-LENGTH-CIRCULAR-LIST "infinite-list")
 (defun run-init-list-length ()
   nil
@@ -2473,11 +2543,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10533 c)))
 )
 (defun run-ansi-list-length ()
-  (%try-chunk "list-length" 71396 1 #'run-ansi-list-length-chunk-1)
-  (%try-chunk "list-length" 71396 2 #'run-ansi-list-length-chunk-2)
+  (%try-chunk "list-length" 14816996 1 #'run-ansi-list-length-chunk-1)
+  (%try-chunk "list-length" 14816996 2 #'run-ansi-list-length-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === list.lsp ===
+(in-package :modus.mvm)
 (defun run-init-list ()
   nil
 )
@@ -2530,11 +2603,14 @@
                                                                              . 16)) (t (c) (%test-crash-fail-c 10544 c)))
 )
 (defun run-ansi-list ()
-  (%try-chunk "list" 6343109 1 #'run-ansi-list-chunk-1)
-  (%try-chunk "list" 6343109 2 #'run-ansi-list-chunk-2)
+  (%try-chunk "list" 15747525 1 #'run-ansi-list-chunk-1)
+  (%try-chunk "list" 15747525 2 #'run-ansi-list-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === listp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-listp ()
   nil
 )
@@ -2557,11 +2633,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10553 c)))
 )
 (defun run-ansi-listp ()
-  (%try-chunk "listp" 10884301 1 #'run-ansi-listp-chunk-1)
-  (%try-chunk "listp" 10884301 2 #'run-ansi-listp-chunk-2)
+  (%try-chunk "listp" 5297357 1 #'run-ansi-listp-chunk-1)
+  (%try-chunk "listp" 5297357 2 #'run-ansi-listp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;cons-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -2645,7 +2724,10 @@
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-list.lsp ===
+(in-package :modus.mvm)
 (defun run-init-make-list ()
   nil
 )
@@ -2723,12 +2805,15 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10572 c)))
 )
 (defun run-ansi-make-list ()
-  (%try-chunk "make-list" 630618 1 #'run-ansi-make-list-chunk-1)
-  (%try-chunk "make-list" 630618 2 #'run-ansi-make-list-chunk-2)
-  (%try-chunk "make-list" 630618 3 #'run-ansi-make-list-chunk-3)
+  (%try-chunk "make-list" 6070106 1 #'run-ansi-make-list-chunk-1)
+  (%try-chunk "make-list" 6070106 2 #'run-ansi-make-list-chunk-2)
+  (%try-chunk "make-list" 6070106 3 #'run-ansi-make-list-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === mapc.lsp ===
+(in-package :modus.mvm)
 (defun run-init-mapc ()
   nil
 )
@@ -2802,11 +2887,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10587 c)))
 )
 (defun run-ansi-mapc ()
-  (%try-chunk "mapc" 11418192 1 #'run-ansi-mapc-chunk-1)
-  (%try-chunk "mapc" 11418192 2 #'run-ansi-mapc-chunk-2)
+  (%try-chunk "mapc" 8763984 1 #'run-ansi-mapc-chunk-1)
+  (%try-chunk "mapc" 8763984 2 #'run-ansi-mapc-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === mapcan.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *MAPCAN.6-VAR* NIL)
 (DEFUN MAPCAN.6-FUN (X) (PUSH X *MAPCAN.6-VAR*) (COPY-LIST *MAPCAN.6-VAR*))
 (defun run-init-mapcan ()
@@ -2922,12 +3010,15 @@
 )
 (defun run-ansi-mapcan ()
   (handler-case (setq *MAPCAN.6-VAR* NIL) (t (c) nil))
-  (%try-chunk "mapcan" 13799695 1 #'run-ansi-mapcan-chunk-1)
-  (%try-chunk "mapcan" 13799695 2 #'run-ansi-mapcan-chunk-2)
-  (%try-chunk "mapcan" 13799695 3 #'run-ansi-mapcan-chunk-3)
+  (%try-chunk "mapcan" 1593615 1 #'run-ansi-mapcan-chunk-1)
+  (%try-chunk "mapcan" 1593615 2 #'run-ansi-mapcan-chunk-2)
+  (%try-chunk "mapcan" 1593615 3 #'run-ansi-mapcan-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === mapcar.lsp ===
+(in-package :modus.mvm)
 (defun run-init-mapcar ()
   nil
 )
@@ -3029,11 +3120,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10621 c)))
 )
 (defun run-ansi-mapcar ()
-  (%try-chunk "mapcar" 13801475 1 #'run-ansi-mapcar-chunk-1)
-  (%try-chunk "mapcar" 13801475 2 #'run-ansi-mapcar-chunk-2)
+  (%try-chunk "mapcar" 3758083 1 #'run-ansi-mapcar-chunk-1)
+  (%try-chunk "mapcar" 3758083 2 #'run-ansi-mapcar-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === mapcon.lsp ===
+(in-package :modus.mvm)
 (defun run-init-mapcon ()
   nil
 )
@@ -3108,11 +3202,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10634 c)))
 )
 (defun run-ansi-mapcon ()
-  (%try-chunk "mapcon" 13910945 1 #'run-ansi-mapcon-chunk-1)
-  (%try-chunk "mapcon" 13910945 2 #'run-ansi-mapcon-chunk-2)
+  (%try-chunk "mapcon" 15975329 1 #'run-ansi-mapcon-chunk-1)
+  (%try-chunk "mapcon" 15975329 2 #'run-ansi-mapcon-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === mapl.lsp ===
+(in-package :modus.mvm)
 (defun run-init-mapl ()
   nil
 )
@@ -3235,11 +3332,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10648 c)))
 )
 (defun run-ansi-mapl ()
-  (%try-chunk "mapl" 11419527 1 #'run-ansi-mapl-chunk-1)
-  (%try-chunk "mapl" 11419527 2 #'run-ansi-mapl-chunk-2)
+  (%try-chunk "mapl" 14286727 1 #'run-ansi-mapl-chunk-1)
+  (%try-chunk "mapl" 14286727 2 #'run-ansi-mapl-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === maplist.lsp ===
+(in-package :modus.mvm)
 (defun run-init-maplist ()
   nil
 )
@@ -3399,12 +3499,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10667 c)))
 )
 (defun run-ansi-maplist ()
-  (%try-chunk "maplist" 16515817 1 #'run-ansi-maplist-chunk-1)
-  (%try-chunk "maplist" 16515817 2 #'run-ansi-maplist-chunk-2)
-  (%try-chunk "maplist" 16515817 3 #'run-ansi-maplist-chunk-3)
+  (%try-chunk "maplist" 1000169 1 #'run-ansi-maplist-chunk-1)
+  (%try-chunk "maplist" 1000169 2 #'run-ansi-maplist-chunk-2)
+  (%try-chunk "maplist" 1000169 3 #'run-ansi-maplist-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === member-if-not.lsp ===
+(in-package :modus.mvm)
 (defun run-init-member-if-not ()
   nil
 )
@@ -3527,12 +3630,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10690 c)))
 )
 (defun run-ansi-member-if-not ()
-  (%try-chunk "member-if-not" 7497277 1 #'run-ansi-member-if-not-chunk-1)
-  (%try-chunk "member-if-not" 7497277 2 #'run-ansi-member-if-not-chunk-2)
-  (%try-chunk "member-if-not" 7497277 3 #'run-ansi-member-if-not-chunk-3)
+  (%try-chunk "member-if-not" 7104061 1 #'run-ansi-member-if-not-chunk-1)
+  (%try-chunk "member-if-not" 7104061 2 #'run-ansi-member-if-not-chunk-2)
+  (%try-chunk "member-if-not" 7104061 3 #'run-ansi-member-if-not-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === member-if.lsp ===
+(in-package :modus.mvm)
 (defun run-init-member-if ()
   nil
 )
@@ -3652,12 +3758,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10714 c)))
 )
 (defun run-ansi-member-if ()
-  (%try-chunk "member-if" 3876421 1 #'run-ansi-member-if-chunk-1)
-  (%try-chunk "member-if" 3876421 2 #'run-ansi-member-if-chunk-2)
-  (%try-chunk "member-if" 3876421 3 #'run-ansi-member-if-chunk-3)
+  (%try-chunk "member-if" 3368517 1 #'run-ansi-member-if-chunk-1)
+  (%try-chunk "member-if" 3368517 2 #'run-ansi-member-if-chunk-2)
+  (%try-chunk "member-if" 3368517 3 #'run-ansi-member-if-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === member.lsp ===
+(in-package :modus.mvm)
 (defun run-init-member ()
   nil
 )
@@ -3885,16 +3994,19 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10764 c)))
 )
 (defun run-ansi-member ()
-  (%try-chunk "member" 7153655 1 #'run-ansi-member-chunk-1)
-  (%try-chunk "member" 7153655 2 #'run-ansi-member-chunk-2)
-  (%try-chunk "member" 7153655 3 #'run-ansi-member-chunk-3)
-  (%try-chunk "member" 7153655 4 #'run-ansi-member-chunk-4)
-  (%try-chunk "member" 7153655 5 #'run-ansi-member-chunk-5)
-  (%try-chunk "member" 7153655 6 #'run-ansi-member-chunk-6)
-  (%try-chunk "member" 7153655 7 #'run-ansi-member-chunk-7)
+  (%try-chunk "member" 7399415 1 #'run-ansi-member-chunk-1)
+  (%try-chunk "member" 7399415 2 #'run-ansi-member-chunk-2)
+  (%try-chunk "member" 7399415 3 #'run-ansi-member-chunk-3)
+  (%try-chunk "member" 7399415 4 #'run-ansi-member-chunk-4)
+  (%try-chunk "member" 7399415 5 #'run-ansi-member-chunk-5)
+  (%try-chunk "member" 7399415 6 #'run-ansi-member-chunk-6)
+  (%try-chunk "member" 7399415 7 #'run-ansi-member-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === nbutlast.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP NBUTLAST.2 "segmentation fault")
 (DEFSKIP NBUTLAST.3 "segmentation fault")
 (defun run-init-nbutlast ()
@@ -3966,12 +4078,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10783 c)))
 )
 (defun run-ansi-nbutlast ()
-  (%try-chunk "nbutlast" 6578624 1 #'run-ansi-nbutlast-chunk-1)
-  (%try-chunk "nbutlast" 6578624 2 #'run-ansi-nbutlast-chunk-2)
-  (%try-chunk "nbutlast" 6578624 3 #'run-ansi-nbutlast-chunk-3)
+  (%try-chunk "nbutlast" 14950848 1 #'run-ansi-nbutlast-chunk-1)
+  (%try-chunk "nbutlast" 14950848 2 #'run-ansi-nbutlast-chunk-2)
+  (%try-chunk "nbutlast" 14950848 3 #'run-ansi-nbutlast-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nconc.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP NCONC.5 "infinite loop")
 (defun run-init-nconc ()
   nil
@@ -4019,10 +4134,13 @@
                                                       I)))) '((A . 1) 1)) (t (c) (%test-crash-fail-c 10790 c)))
 )
 (defun run-ansi-nconc ()
-  (%try-chunk "nconc" 3255640 1 #'run-ansi-nconc-chunk-1)
+  (%try-chunk "nconc" 13184344 1 #'run-ansi-nconc-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === nintersection.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nintersection ()
   nil
 )
@@ -4331,15 +4449,18 @@
   (handler-case (run-test 10838 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 10838 c)))
 )
 (defun run-ansi-nintersection ()
-  (%try-chunk "nintersection" 11308260 1 #'run-ansi-nintersection-chunk-1)
-  (%try-chunk "nintersection" 11308260 2 #'run-ansi-nintersection-chunk-2)
-  (%try-chunk "nintersection" 11308260 3 #'run-ansi-nintersection-chunk-3)
-  (%try-chunk "nintersection" 11308260 4 #'run-ansi-nintersection-chunk-4)
-  (%try-chunk "nintersection" 11308260 5 #'run-ansi-nintersection-chunk-5)
-  (%try-chunk "nintersection" 11308260 6 #'run-ansi-nintersection-chunk-6)
+  (%try-chunk "nintersection" 6491364 1 #'run-ansi-nintersection-chunk-1)
+  (%try-chunk "nintersection" 6491364 2 #'run-ansi-nintersection-chunk-2)
+  (%try-chunk "nintersection" 6491364 3 #'run-ansi-nintersection-chunk-3)
+  (%try-chunk "nintersection" 6491364 4 #'run-ansi-nintersection-chunk-4)
+  (%try-chunk "nintersection" 6491364 5 #'run-ansi-nintersection-chunk-5)
+  (%try-chunk "nintersection" 6491364 6 #'run-ansi-nintersection-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === nreconc.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nreconc ()
   nil
 )
@@ -4370,10 +4491,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10845 c)))
 )
 (defun run-ansi-nreconc ()
-  (%try-chunk "nreconc" 15514743 1 #'run-ansi-nreconc-chunk-1)
+  (%try-chunk "nreconc" 2522231 1 #'run-ansi-nreconc-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === nset-difference.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nset-difference ()
   nil
 )
@@ -4671,15 +4795,18 @@
   (handler-case (run-test 10890 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 10890 c)))
 )
 (defun run-ansi-nset-difference ()
-  (%try-chunk "nset-difference" 13467601 1 #'run-ansi-nset-difference-chunk-1)
-  (%try-chunk "nset-difference" 13467601 2 #'run-ansi-nset-difference-chunk-2)
-  (%try-chunk "nset-difference" 13467601 3 #'run-ansi-nset-difference-chunk-3)
-  (%try-chunk "nset-difference" 13467601 4 #'run-ansi-nset-difference-chunk-4)
-  (%try-chunk "nset-difference" 13467601 5 #'run-ansi-nset-difference-chunk-5)
-  (%try-chunk "nset-difference" 13467601 6 #'run-ansi-nset-difference-chunk-6)
+  (%try-chunk "nset-difference" 12550097 1 #'run-ansi-nset-difference-chunk-1)
+  (%try-chunk "nset-difference" 12550097 2 #'run-ansi-nset-difference-chunk-2)
+  (%try-chunk "nset-difference" 12550097 3 #'run-ansi-nset-difference-chunk-3)
+  (%try-chunk "nset-difference" 12550097 4 #'run-ansi-nset-difference-chunk-4)
+  (%try-chunk "nset-difference" 12550097 5 #'run-ansi-nset-difference-chunk-5)
+  (%try-chunk "nset-difference" 12550097 6 #'run-ansi-nset-difference-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === nset-exclusive-or.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nset-exclusive-or ()
   nil
 )
@@ -5012,16 +5139,19 @@
   (handler-case (run-test 10941 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 10941 c)))
 )
 (defun run-ansi-nset-exclusive-or ()
-  (%try-chunk "nset-exclusive-or" 541000 1 #'run-ansi-nset-exclusive-or-chunk-1)
-  (%try-chunk "nset-exclusive-or" 541000 2 #'run-ansi-nset-exclusive-or-chunk-2)
-  (%try-chunk "nset-exclusive-or" 541000 3 #'run-ansi-nset-exclusive-or-chunk-3)
-  (%try-chunk "nset-exclusive-or" 541000 4 #'run-ansi-nset-exclusive-or-chunk-4)
-  (%try-chunk "nset-exclusive-or" 541000 5 #'run-ansi-nset-exclusive-or-chunk-5)
-  (%try-chunk "nset-exclusive-or" 541000 6 #'run-ansi-nset-exclusive-or-chunk-6)
-  (%try-chunk "nset-exclusive-or" 541000 7 #'run-ansi-nset-exclusive-or-chunk-7)
+  (%try-chunk "nset-exclusive-or" 12321096 1 #'run-ansi-nset-exclusive-or-chunk-1)
+  (%try-chunk "nset-exclusive-or" 12321096 2 #'run-ansi-nset-exclusive-or-chunk-2)
+  (%try-chunk "nset-exclusive-or" 12321096 3 #'run-ansi-nset-exclusive-or-chunk-3)
+  (%try-chunk "nset-exclusive-or" 12321096 4 #'run-ansi-nset-exclusive-or-chunk-4)
+  (%try-chunk "nset-exclusive-or" 12321096 5 #'run-ansi-nset-exclusive-or-chunk-5)
+  (%try-chunk "nset-exclusive-or" 12321096 6 #'run-ansi-nset-exclusive-or-chunk-6)
+  (%try-chunk "nset-exclusive-or" 12321096 7 #'run-ansi-nset-exclusive-or-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsublis.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nsublis ()
   nil
 )
@@ -5186,13 +5316,16 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10968 c)))
 )
 (defun run-ansi-nsublis ()
-  (%try-chunk "nsublis" 9932523 1 #'run-ansi-nsublis-chunk-1)
-  (%try-chunk "nsublis" 9932523 2 #'run-ansi-nsublis-chunk-2)
-  (%try-chunk "nsublis" 9932523 3 #'run-ansi-nsublis-chunk-3)
-  (%try-chunk "nsublis" 9932523 4 #'run-ansi-nsublis-chunk-4)
+  (%try-chunk "nsublis" 5164779 1 #'run-ansi-nsublis-chunk-1)
+  (%try-chunk "nsublis" 5164779 2 #'run-ansi-nsublis-chunk-2)
+  (%try-chunk "nsublis" 5164779 3 #'run-ansi-nsublis-chunk-3)
+  (%try-chunk "nsublis" 5164779 4 #'run-ansi-nsublis-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsubst-if-not.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nsubst-if-not ()
   nil
 )
@@ -5302,12 +5435,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 10989 c)))
 )
 (defun run-ansi-nsubst-if-not ()
-  (%try-chunk "nsubst-if-not" 4446072 1 #'run-ansi-nsubst-if-not-chunk-1)
-  (%try-chunk "nsubst-if-not" 4446072 2 #'run-ansi-nsubst-if-not-chunk-2)
-  (%try-chunk "nsubst-if-not" 4446072 3 #'run-ansi-nsubst-if-not-chunk-3)
+  (%try-chunk "nsubst-if-not" 16160632 1 #'run-ansi-nsubst-if-not-chunk-1)
+  (%try-chunk "nsubst-if-not" 16160632 2 #'run-ansi-nsubst-if-not-chunk-2)
+  (%try-chunk "nsubst-if-not" 16160632 3 #'run-ansi-nsubst-if-not-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsubst-if.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nsubst-if ()
   nil
 )
@@ -5418,12 +5554,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11011 c)))
 )
 (defun run-ansi-nsubst-if ()
-  (%try-chunk "nsubst-if" 15563472 1 #'run-ansi-nsubst-if-chunk-1)
-  (%try-chunk "nsubst-if" 15563472 2 #'run-ansi-nsubst-if-chunk-2)
-  (%try-chunk "nsubst-if" 15563472 3 #'run-ansi-nsubst-if-chunk-3)
+  (%try-chunk "nsubst-if" 5159632 1 #'run-ansi-nsubst-if-chunk-1)
+  (%try-chunk "nsubst-if" 5159632 2 #'run-ansi-nsubst-if-chunk-2)
+  (%try-chunk "nsubst-if" 5159632 3 #'run-ansi-nsubst-if-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsubst.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *NSUBST-TREE-1* '(10 (30 20 10) (20 10) (10 20 30 40)))
 (defun run-init-nsubst ()
   (handler-case (setq *NSUBST-TREE-1* '(10 (30 20 10) (20 10) (10 20 30 40))) (t (c) nil))
@@ -5622,13 +5761,16 @@
 )
 (defun run-ansi-nsubst ()
   (handler-case (setq *NSUBST-TREE-1* '(10 (30 20 10) (20 10) (10 20 30 40))) (t (c) nil))
-  (%try-chunk "nsubst" 7140810 1 #'run-ansi-nsubst-chunk-1)
-  (%try-chunk "nsubst" 7140810 2 #'run-ansi-nsubst-chunk-2)
-  (%try-chunk "nsubst" 7140810 3 #'run-ansi-nsubst-chunk-3)
-  (%try-chunk "nsubst" 7140810 4 #'run-ansi-nsubst-chunk-4)
+  (%try-chunk "nsubst" 7189962 1 #'run-ansi-nsubst-chunk-1)
+  (%try-chunk "nsubst" 7189962 2 #'run-ansi-nsubst-chunk-2)
+  (%try-chunk "nsubst" 7189962 3 #'run-ansi-nsubst-chunk-3)
+  (%try-chunk "nsubst" 7189962 4 #'run-ansi-nsubst-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === nth.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nth ()
   nil
 )
@@ -5672,10 +5814,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11048 c)))
 )
 (defun run-ansi-nth ()
-  (%try-chunk "nth" 6485733 1 #'run-ansi-nth-chunk-1)
+  (%try-chunk "nth" 882405 1 #'run-ansi-nth-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === nthcdr.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nthcdr ()
   nil
 )
@@ -5713,11 +5858,14 @@
                                                       I X Y)))) '((B C D) 2 1 2)) (t (c) (%test-crash-fail-c 11061 c)))
 )
 (defun run-ansi-nthcdr ()
-  (%try-chunk "nthcdr" 2763248 1 #'run-ansi-nthcdr-chunk-1)
-  (%try-chunk "nthcdr" 2763248 2 #'run-ansi-nthcdr-chunk-2)
+  (%try-chunk "nthcdr" 12069360 1 #'run-ansi-nthcdr-chunk-1)
+  (%try-chunk "nthcdr" 12069360 2 #'run-ansi-nthcdr-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === nunion.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nunion ()
   nil
 )
@@ -6035,17 +6183,20 @@
   (handler-case (run-test 11118 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11118 c)))
 )
 (defun run-ansi-nunion ()
-  (%try-chunk "nunion" 16586130 1 #'run-ansi-nunion-chunk-1)
-  (%try-chunk "nunion" 16586130 2 #'run-ansi-nunion-chunk-2)
-  (%try-chunk "nunion" 16586130 3 #'run-ansi-nunion-chunk-3)
-  (%try-chunk "nunion" 16586130 4 #'run-ansi-nunion-chunk-4)
-  (%try-chunk "nunion" 16586130 5 #'run-ansi-nunion-chunk-5)
-  (%try-chunk "nunion" 16586130 6 #'run-ansi-nunion-chunk-6)
-  (%try-chunk "nunion" 16586130 7 #'run-ansi-nunion-chunk-7)
-  (%try-chunk "nunion" 16586130 8 #'run-ansi-nunion-chunk-8)
+  (%try-chunk "nunion" 13243794 1 #'run-ansi-nunion-chunk-1)
+  (%try-chunk "nunion" 13243794 2 #'run-ansi-nunion-chunk-2)
+  (%try-chunk "nunion" 13243794 3 #'run-ansi-nunion-chunk-3)
+  (%try-chunk "nunion" 13243794 4 #'run-ansi-nunion-chunk-4)
+  (%try-chunk "nunion" 13243794 5 #'run-ansi-nunion-chunk-5)
+  (%try-chunk "nunion" 13243794 6 #'run-ansi-nunion-chunk-6)
+  (%try-chunk "nunion" 13243794 7 #'run-ansi-nunion-chunk-7)
+  (%try-chunk "nunion" 13243794 8 #'run-ansi-nunion-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === pairlis.lsp ===
+(in-package :modus.mvm)
 (DEFUN MY-PAIRLIS (X Y &OPTIONAL ALIST)
   (IF (NULL X)
       ALIST
@@ -6103,11 +6254,14 @@
   (handler-case (run-test 11130 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11130 c)))
 )
 (defun run-ansi-pairlis ()
-  (%try-chunk "pairlis" 15213995 1 #'run-ansi-pairlis-chunk-1)
-  (%try-chunk "pairlis" 15213995 2 #'run-ansi-pairlis-chunk-2)
+  (%try-chunk "pairlis" 1500587 1 #'run-ansi-pairlis-chunk-1)
+  (%try-chunk "pairlis" 1500587 2 #'run-ansi-pairlis-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pop.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pop ()
   nil
 )
@@ -6140,10 +6294,13 @@
                              (AND (EQT (CDR X) Y) (POP X)))) 'C) (t (c) (%test-crash-fail-c 11135 c)))
 )
 (defun run-ansi-pop ()
-  (%try-chunk "pop" 10949880 1 #'run-ansi-pop-chunk-1)
+  (%try-chunk "pop" 791800 1 #'run-ansi-pop-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === push.lsp ===
+(in-package :modus.mvm)
 (defun run-init-push ()
   nil
 )
@@ -6206,10 +6363,13 @@
                                                       X)))) '((Z D E) (Z D E))) (t (c) (%test-crash-fail-c 11143 c)))
 )
 (defun run-ansi-push ()
-  (%try-chunk "push" 8507545 1 #'run-ansi-push-chunk-1)
+  (%try-chunk "push" 13062297 1 #'run-ansi-push-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === pushnew.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pushnew ()
   nil
 )
@@ -6478,13 +6638,16 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11173 c)))
 )
 (defun run-ansi-pushnew ()
-  (%try-chunk "pushnew" 13377973 1 #'run-ansi-pushnew-chunk-1)
-  (%try-chunk "pushnew" 13377973 2 #'run-ansi-pushnew-chunk-2)
-  (%try-chunk "pushnew" 13377973 3 #'run-ansi-pushnew-chunk-3)
-  (%try-chunk "pushnew" 13377973 4 #'run-ansi-pushnew-chunk-4)
+  (%try-chunk "pushnew" 680373 1 #'run-ansi-pushnew-chunk-1)
+  (%try-chunk "pushnew" 680373 2 #'run-ansi-pushnew-chunk-2)
+  (%try-chunk "pushnew" 680373 3 #'run-ansi-pushnew-chunk-3)
+  (%try-chunk "pushnew" 680373 4 #'run-ansi-pushnew-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === rassoc-if-not.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rassoc-if-not ()
   nil
 )
@@ -6611,13 +6774,16 @@
   (handler-case (run-test 11198 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11198 c)))
 )
 (defun run-ansi-rassoc-if-not ()
-  (%try-chunk "rassoc-if-not" 6748186 1 #'run-ansi-rassoc-if-not-chunk-1)
-  (%try-chunk "rassoc-if-not" 6748186 2 #'run-ansi-rassoc-if-not-chunk-2)
-  (%try-chunk "rassoc-if-not" 6748186 3 #'run-ansi-rassoc-if-not-chunk-3)
-  (%try-chunk "rassoc-if-not" 6748186 4 #'run-ansi-rassoc-if-not-chunk-4)
+  (%try-chunk "rassoc-if-not" 669722 1 #'run-ansi-rassoc-if-not-chunk-1)
+  (%try-chunk "rassoc-if-not" 669722 2 #'run-ansi-rassoc-if-not-chunk-2)
+  (%try-chunk "rassoc-if-not" 669722 3 #'run-ansi-rassoc-if-not-chunk-3)
+  (%try-chunk "rassoc-if-not" 669722 4 #'run-ansi-rassoc-if-not-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === rassoc-if.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rassoc-if ()
   nil
 )
@@ -6731,12 +6897,15 @@
   (handler-case (run-test 11222 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11222 c)))
 )
 (defun run-ansi-rassoc-if ()
-  (%try-chunk "rassoc-if" 6788210 1 #'run-ansi-rassoc-if-chunk-1)
-  (%try-chunk "rassoc-if" 6788210 2 #'run-ansi-rassoc-if-chunk-2)
-  (%try-chunk "rassoc-if" 6788210 3 #'run-ansi-rassoc-if-chunk-3)
+  (%try-chunk "rassoc-if" 7607410 1 #'run-ansi-rassoc-if-chunk-1)
+  (%try-chunk "rassoc-if" 7607410 2 #'run-ansi-rassoc-if-chunk-2)
+  (%try-chunk "rassoc-if" 7607410 3 #'run-ansi-rassoc-if-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === rassoc.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rassoc ()
   nil
 )
@@ -6983,15 +7152,18 @@
   (handler-case (run-test 11270 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11270 c)))
 )
 (defun run-ansi-rassoc ()
-  (%try-chunk "rassoc" 9837336 1 #'run-ansi-rassoc-chunk-1)
-  (%try-chunk "rassoc" 9837336 2 #'run-ansi-rassoc-chunk-2)
-  (%try-chunk "rassoc" 9837336 3 #'run-ansi-rassoc-chunk-3)
-  (%try-chunk "rassoc" 9837336 4 #'run-ansi-rassoc-chunk-4)
-  (%try-chunk "rassoc" 9837336 5 #'run-ansi-rassoc-chunk-5)
-  (%try-chunk "rassoc" 9837336 6 #'run-ansi-rassoc-chunk-6)
+  (%try-chunk "rassoc" 1383192 1 #'run-ansi-rassoc-chunk-1)
+  (%try-chunk "rassoc" 1383192 2 #'run-ansi-rassoc-chunk-2)
+  (%try-chunk "rassoc" 1383192 3 #'run-ansi-rassoc-chunk-3)
+  (%try-chunk "rassoc" 1383192 4 #'run-ansi-rassoc-chunk-4)
+  (%try-chunk "rassoc" 1383192 5 #'run-ansi-rassoc-chunk-5)
+  (%try-chunk "rassoc" 1383192 6 #'run-ansi-rassoc-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === remf.lsp ===
+(in-package :modus.mvm)
 (defun run-init-remf ()
   nil
 )
@@ -7096,11 +7268,14 @@
                                                        X))))) '(NIL (E F))) (t (c) (%test-crash-fail-c 11280 c)))
 )
 (defun run-ansi-remf ()
-  (%try-chunk "remf" 12295931 1 #'run-ansi-remf-chunk-1)
-  (%try-chunk "remf" 12295931 2 #'run-ansi-remf-chunk-2)
+  (%try-chunk "remf" 11329275 1 #'run-ansi-remf-chunk-1)
+  (%try-chunk "remf" 11329275 2 #'run-ansi-remf-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === rest.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rest ()
   nil
 )
@@ -7116,10 +7291,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11284 c)))
 )
 (defun run-ansi-rest ()
-  (%try-chunk "rest" 12091943 1 #'run-ansi-rest-chunk-1)
+  (%try-chunk "rest" 10863143 1 #'run-ansi-rest-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === revappend.lsp ===
+(in-package :modus.mvm)
 (defun run-init-revappend ()
   nil
 )
@@ -7160,11 +7338,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11293 c)))
 )
 (defun run-ansi-revappend ()
-  (%try-chunk "revappend" 15011152 1 #'run-ansi-revappend-chunk-1)
-  (%try-chunk "revappend" 15011152 2 #'run-ansi-revappend-chunk-2)
+  (%try-chunk "revappend" 6131024 1 #'run-ansi-revappend-chunk-1)
+  (%try-chunk "revappend" 6131024 2 #'run-ansi-revappend-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === rplaca.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rplaca ()
   nil
 )
@@ -7199,10 +7380,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11300 c)))
 )
 (defun run-ansi-rplaca ()
-  (%try-chunk "rplaca" 5528354 1 #'run-ansi-rplaca-chunk-1)
+  (%try-chunk "rplaca" 6298402 1 #'run-ansi-rplaca-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === rplacd.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rplacd ()
   nil
 )
@@ -7237,10 +7421,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11307 c)))
 )
 (defun run-ansi-rplacd ()
-  (%try-chunk "rplacd" 5528799 1 #'run-ansi-rplacd-chunk-1)
+  (%try-chunk "rplacd" 5758175 1 #'run-ansi-rplacd-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === set-difference.lsp ===
+(in-package :modus.mvm)
 (defun run-init-set-difference ()
   nil
 )
@@ -7536,15 +7723,18 @@
   (handler-case (run-test 11352 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11352 c)))
 )
 (defun run-ansi-set-difference ()
-  (%try-chunk "set-difference" 6510983 1 #'run-ansi-set-difference-chunk-1)
-  (%try-chunk "set-difference" 6510983 2 #'run-ansi-set-difference-chunk-2)
-  (%try-chunk "set-difference" 6510983 3 #'run-ansi-set-difference-chunk-3)
-  (%try-chunk "set-difference" 6510983 4 #'run-ansi-set-difference-chunk-4)
-  (%try-chunk "set-difference" 6510983 5 #'run-ansi-set-difference-chunk-5)
-  (%try-chunk "set-difference" 6510983 6 #'run-ansi-set-difference-chunk-6)
+  (%try-chunk "set-difference" 13654407 1 #'run-ansi-set-difference-chunk-1)
+  (%try-chunk "set-difference" 13654407 2 #'run-ansi-set-difference-chunk-2)
+  (%try-chunk "set-difference" 13654407 3 #'run-ansi-set-difference-chunk-3)
+  (%try-chunk "set-difference" 13654407 4 #'run-ansi-set-difference-chunk-4)
+  (%try-chunk "set-difference" 13654407 5 #'run-ansi-set-difference-chunk-5)
+  (%try-chunk "set-difference" 13654407 6 #'run-ansi-set-difference-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === set-exclusive-or.lsp ===
+(in-package :modus.mvm)
 (defun run-init-set-exclusive-or ()
   nil
 )
@@ -7872,16 +8062,19 @@
   (handler-case (run-test 11403 (lambda () (RANDOM-SET-EXCLUSIVE-OR-TEST 10 100)) 'NIL) (t (c) (%test-crash-fail-c 11403 c)))
 )
 (defun run-ansi-set-exclusive-or ()
-  (%try-chunk "set-exclusive-or" 7499390 1 #'run-ansi-set-exclusive-or-chunk-1)
-  (%try-chunk "set-exclusive-or" 7499390 2 #'run-ansi-set-exclusive-or-chunk-2)
-  (%try-chunk "set-exclusive-or" 7499390 3 #'run-ansi-set-exclusive-or-chunk-3)
-  (%try-chunk "set-exclusive-or" 7499390 4 #'run-ansi-set-exclusive-or-chunk-4)
-  (%try-chunk "set-exclusive-or" 7499390 5 #'run-ansi-set-exclusive-or-chunk-5)
-  (%try-chunk "set-exclusive-or" 7499390 6 #'run-ansi-set-exclusive-or-chunk-6)
-  (%try-chunk "set-exclusive-or" 7499390 7 #'run-ansi-set-exclusive-or-chunk-7)
+  (%try-chunk "set-exclusive-or" 1388158 1 #'run-ansi-set-exclusive-or-chunk-1)
+  (%try-chunk "set-exclusive-or" 1388158 2 #'run-ansi-set-exclusive-or-chunk-2)
+  (%try-chunk "set-exclusive-or" 1388158 3 #'run-ansi-set-exclusive-or-chunk-3)
+  (%try-chunk "set-exclusive-or" 1388158 4 #'run-ansi-set-exclusive-or-chunk-4)
+  (%try-chunk "set-exclusive-or" 1388158 5 #'run-ansi-set-exclusive-or-chunk-5)
+  (%try-chunk "set-exclusive-or" 1388158 6 #'run-ansi-set-exclusive-or-chunk-6)
+  (%try-chunk "set-exclusive-or" 1388158 7 #'run-ansi-set-exclusive-or-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === sublis.lsp ===
+(in-package :modus.mvm)
 (defun run-init-sublis ()
   nil
 )
@@ -8051,13 +8244,16 @@
                                                                      (B A))) (t (c) (%test-crash-fail-c 11430 c)))
 )
 (defun run-ansi-sublis ()
-  (%try-chunk "sublis" 4717373 1 #'run-ansi-sublis-chunk-1)
-  (%try-chunk "sublis" 4717373 2 #'run-ansi-sublis-chunk-2)
-  (%try-chunk "sublis" 4717373 3 #'run-ansi-sublis-chunk-3)
-  (%try-chunk "sublis" 4717373 4 #'run-ansi-sublis-chunk-4)
+  (%try-chunk "sublis" 2095933 1 #'run-ansi-sublis-chunk-1)
+  (%try-chunk "sublis" 2095933 2 #'run-ansi-sublis-chunk-2)
+  (%try-chunk "sublis" 2095933 3 #'run-ansi-sublis-chunk-3)
+  (%try-chunk "sublis" 2095933 4 #'run-ansi-sublis-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === subsetp.lsp ===
+(in-package :modus.mvm)
 (DEFVAR CONS-TEST-24-VAR '(78 "z" (8 9)))
 (defun run-init-subsetp ()
   (handler-case (setq CONS-TEST-24-VAR '(78 "z" (8 9))) (t (c) nil))
@@ -8275,14 +8471,17 @@
 )
 (defun run-ansi-subsetp ()
   (handler-case (setq CONS-TEST-24-VAR '(78 "z" (8 9))) (t (c) nil))
-  (%try-chunk "subsetp" 14583297 1 #'run-ansi-subsetp-chunk-1)
-  (%try-chunk "subsetp" 14583297 2 #'run-ansi-subsetp-chunk-2)
-  (%try-chunk "subsetp" 14583297 3 #'run-ansi-subsetp-chunk-3)
-  (%try-chunk "subsetp" 14583297 4 #'run-ansi-subsetp-chunk-4)
-  (%try-chunk "subsetp" 14583297 5 #'run-ansi-subsetp-chunk-5)
+  (%try-chunk "subsetp" 15091201 1 #'run-ansi-subsetp-chunk-1)
+  (%try-chunk "subsetp" 15091201 2 #'run-ansi-subsetp-chunk-2)
+  (%try-chunk "subsetp" 15091201 3 #'run-ansi-subsetp-chunk-3)
+  (%try-chunk "subsetp" 15091201 4 #'run-ansi-subsetp-chunk-4)
+  (%try-chunk "subsetp" 15091201 5 #'run-ansi-subsetp-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === subst-if-not.lsp ===
+(in-package :modus.mvm)
 (defun run-init-subst-if-not ()
   nil
 )
@@ -8390,12 +8589,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11490 c)))
 )
 (defun run-ansi-subst-if-not ()
-  (%try-chunk "subst-if-not" 4537422 1 #'run-ansi-subst-if-not-chunk-1)
-  (%try-chunk "subst-if-not" 4537422 2 #'run-ansi-subst-if-not-chunk-2)
-  (%try-chunk "subst-if-not" 4537422 3 #'run-ansi-subst-if-not-chunk-3)
+  (%try-chunk "subst-if-not" 2079822 1 #'run-ansi-subst-if-not-chunk-1)
+  (%try-chunk "subst-if-not" 2079822 2 #'run-ansi-subst-if-not-chunk-2)
+  (%try-chunk "subst-if-not" 2079822 3 #'run-ansi-subst-if-not-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === subst-if.lsp ===
+(in-package :modus.mvm)
 (defun run-init-subst-if ()
   nil
 )
@@ -8502,12 +8704,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11511 c)))
 )
 (defun run-ansi-subst-if ()
-  (%try-chunk "subst-if" 13804742 1 #'run-ansi-subst-if-chunk-1)
-  (%try-chunk "subst-if" 13804742 2 #'run-ansi-subst-if-chunk-2)
-  (%try-chunk "subst-if" 13804742 3 #'run-ansi-subst-if-chunk-3)
+  (%try-chunk "subst-if" 3122374 1 #'run-ansi-subst-if-chunk-1)
+  (%try-chunk "subst-if" 3122374 2 #'run-ansi-subst-if-chunk-2)
+  (%try-chunk "subst-if" 3122374 3 #'run-ansi-subst-if-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === subst.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *SUBST-TREE-1* '(10 (30 20 10) (20 10) (10 20 30 40)))
 (defun run-init-subst ()
   (handler-case (setq *SUBST-TREE-1* '(10 (30 20 10) (20 10) (10 20 30 40))) (t (c) nil))
@@ -8699,13 +8904,16 @@
 )
 (defun run-ansi-subst ()
   (handler-case (setq *SUBST-TREE-1* '(10 (30 20 10) (20 10) (10 20 30 40))) (t (c) nil))
-  (%try-chunk "subst" 3569228 1 #'run-ansi-subst-chunk-1)
-  (%try-chunk "subst" 3569228 2 #'run-ansi-subst-chunk-2)
-  (%try-chunk "subst" 3569228 3 #'run-ansi-subst-chunk-3)
-  (%try-chunk "subst" 3569228 4 #'run-ansi-subst-chunk-4)
+  (%try-chunk "subst" 15513164 1 #'run-ansi-subst-chunk-1)
+  (%try-chunk "subst" 15513164 2 #'run-ansi-subst-chunk-2)
+  (%try-chunk "subst" 15513164 3 #'run-ansi-subst-chunk-3)
+  (%try-chunk "subst" 15513164 4 #'run-ansi-subst-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === tailp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-tailp ()
   nil
 )
@@ -8745,11 +8953,14 @@
                                                       I X Y)))) '(T 2 1 2)) (t (c) (%test-crash-fail-c 11550 c)))
 )
 (defun run-ansi-tailp ()
-  (%try-chunk "tailp" 5920399 1 #'run-ansi-tailp-chunk-1)
-  (%try-chunk "tailp" 5920399 2 #'run-ansi-tailp-chunk-2)
+  (%try-chunk "tailp" 13784719 1 #'run-ansi-tailp-chunk-1)
+  (%try-chunk "tailp" 13784719 2 #'run-ansi-tailp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === tree-equal.lsp ===
+(in-package :modus.mvm)
 (defun run-init-tree-equal ()
   nil
 )
@@ -8827,13 +9038,16 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11577 c)))
 )
 (defun run-ansi-tree-equal ()
-  (%try-chunk "tree-equal" 9481360 1 #'run-ansi-tree-equal-chunk-1)
-  (%try-chunk "tree-equal" 9481360 2 #'run-ansi-tree-equal-chunk-2)
-  (%try-chunk "tree-equal" 9481360 3 #'run-ansi-tree-equal-chunk-3)
-  (%try-chunk "tree-equal" 9481360 4 #'run-ansi-tree-equal-chunk-4)
+  (%try-chunk "tree-equal" 7875728 1 #'run-ansi-tree-equal-chunk-1)
+  (%try-chunk "tree-equal" 7875728 2 #'run-ansi-tree-equal-chunk-2)
+  (%try-chunk "tree-equal" 7875728 3 #'run-ansi-tree-equal-chunk-3)
+  (%try-chunk "tree-equal" 7875728 4 #'run-ansi-tree-equal-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === union.lsp ===
+(in-package :modus.mvm)
 (defun run-init-union ()
   nil
 )
@@ -9161,17 +9375,20 @@
   (handler-case (run-test 11634 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 11634 c)))
 )
 (defun run-ansi-union ()
-  (%try-chunk "union" 13686612 1 #'run-ansi-union-chunk-1)
-  (%try-chunk "union" 13686612 2 #'run-ansi-union-chunk-2)
-  (%try-chunk "union" 13686612 3 #'run-ansi-union-chunk-3)
-  (%try-chunk "union" 13686612 4 #'run-ansi-union-chunk-4)
-  (%try-chunk "union" 13686612 5 #'run-ansi-union-chunk-5)
-  (%try-chunk "union" 13686612 6 #'run-ansi-union-chunk-6)
-  (%try-chunk "union" 13686612 7 #'run-ansi-union-chunk-7)
-  (%try-chunk "union" 13686612 8 #'run-ansi-union-chunk-8)
+  (%try-chunk "union" 15013716 1 #'run-ansi-union-chunk-1)
+  (%try-chunk "union" 15013716 2 #'run-ansi-union-chunk-2)
+  (%try-chunk "union" 15013716 3 #'run-ansi-union-chunk-3)
+  (%try-chunk "union" 15013716 4 #'run-ansi-union-chunk-4)
+  (%try-chunk "union" 15013716 5 #'run-ansi-union-chunk-5)
+  (%try-chunk "union" 15013716 6 #'run-ansi-union-chunk-6)
+  (%try-chunk "union" 15013716 7 #'run-ansi-union-chunk-7)
+  (%try-chunk "union" 15013716 8 #'run-ansi-union-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === and.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP AND.1)
 (defun run-init-and ()
   nil
@@ -9218,11 +9435,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11648 c)))
 )
 (defun run-ansi-and ()
-  (%try-chunk "and" 15634132 1 #'run-ansi-and-chunk-1)
-  (%try-chunk "and" 15634132 2 #'run-ansi-and-chunk-2)
+  (%try-chunk "and" 7442132 1 #'run-ansi-and-chunk-1)
+  (%try-chunk "and" 7442132 2 #'run-ansi-and-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === apply.lsp ===
+(in-package :modus.mvm)
 (defun run-init-apply ()
   nil
 )
@@ -9271,11 +9491,14 @@
                                                                     3)) (t (c) (%test-crash-fail-c 11661 c)))
 )
 (defun run-ansi-apply ()
-  (%try-chunk "apply" 9783939 1 #'run-ansi-apply-chunk-1)
-  (%try-chunk "apply" 9783939 2 #'run-ansi-apply-chunk-2)
+  (%try-chunk "apply" 9882243 1 #'run-ansi-apply-chunk-1)
+  (%try-chunk "apply" 9882243 2 #'run-ansi-apply-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === block.lsp ===
+(in-package :modus.mvm)
 (defun run-init-block ()
   nil
 )
@@ -9321,11 +9544,14 @@
                              (BLOCK FOO :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 11673 c)))
 )
 (defun run-ansi-block ()
-  (%try-chunk "block" 14927854 1 #'run-ansi-block-chunk-1)
-  (%try-chunk "block" 14927854 2 #'run-ansi-block-chunk-2)
+  (%try-chunk "block" 3180526 1 #'run-ansi-block-chunk-1)
+  (%try-chunk "block" 3180526 2 #'run-ansi-block-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === call-arguments-limit.lsp ===
+(in-package :modus.mvm)
 (defun run-init-call-arguments-limit ()
   nil
 )
@@ -9339,10 +9565,13 @@
   (handler-case (run-test 11678 (lambda () (< CALL-ARGUMENTS-LIMIT LAMBDA-PARAMETERS-LIMIT)) 'NIL) (t (c) (%test-crash-fail-c 11678 c)))
 )
 (defun run-ansi-call-arguments-limit ()
-  (%try-chunk "call-arguments-limit" 11654344 1 #'run-ansi-call-arguments-limit-chunk-1)
+  (%try-chunk "call-arguments-limit" 12752072 1 #'run-ansi-call-arguments-limit-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === case.lsp ===
+(in-package :modus.mvm)
 (defun run-init-case ()
   nil
 )
@@ -9472,14 +9701,17 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11718 c)))
 )
 (defun run-ansi-case ()
-  (%try-chunk "case" 1556395 1 #'run-ansi-case-chunk-1)
-  (%try-chunk "case" 1556395 2 #'run-ansi-case-chunk-2)
-  (%try-chunk "case" 1556395 3 #'run-ansi-case-chunk-3)
-  (%try-chunk "case" 1556395 4 #'run-ansi-case-chunk-4)
-  (%try-chunk "case" 1556395 5 #'run-ansi-case-chunk-5)
+  (%try-chunk "case" 7110571 1 #'run-ansi-case-chunk-1)
+  (%try-chunk "case" 7110571 2 #'run-ansi-case-chunk-2)
+  (%try-chunk "case" 7110571 3 #'run-ansi-case-chunk-3)
+  (%try-chunk "case" 7110571 4 #'run-ansi-case-chunk-4)
+  (%try-chunk "case" 7110571 5 #'run-ansi-case-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === catch.lsp ===
+(in-package :modus.mvm)
 (DEFUN CATCH.11-FN (X) (THROW 'FOO X))
 (defun run-init-catch ()
   nil
@@ -9532,11 +9764,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11734 c)))
 )
 (defun run-ansi-catch ()
-  (%try-chunk "catch" 1815746 1 #'run-ansi-catch-chunk-1)
-  (%try-chunk "catch" 1815746 2 #'run-ansi-catch-chunk-2)
+  (%try-chunk "catch" 11220162 1 #'run-ansi-catch-chunk-1)
+  (%try-chunk "catch" 11220162 2 #'run-ansi-catch-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ccase.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ccase ()
   nil
 )
@@ -9654,14 +9889,17 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11767 c)))
 )
 (defun run-ansi-ccase ()
-  (%try-chunk "ccase" 817672 1 #'run-ansi-ccase-chunk-1)
-  (%try-chunk "ccase" 817672 2 #'run-ansi-ccase-chunk-2)
-  (%try-chunk "ccase" 817672 3 #'run-ansi-ccase-chunk-3)
-  (%try-chunk "ccase" 817672 4 #'run-ansi-ccase-chunk-4)
-  (%try-chunk "ccase" 817672 5 #'run-ansi-ccase-chunk-5)
+  (%try-chunk "ccase" 8370696 1 #'run-ansi-ccase-chunk-1)
+  (%try-chunk "ccase" 8370696 2 #'run-ansi-ccase-chunk-2)
+  (%try-chunk "ccase" 8370696 3 #'run-ansi-ccase-chunk-3)
+  (%try-chunk "ccase" 8370696 4 #'run-ansi-ccase-chunk-4)
+  (%try-chunk "ccase" 8370696 5 #'run-ansi-ccase-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === compiled-function-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-compiled-function-p ()
   nil
 )
@@ -9686,10 +9924,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11773 c)))
 )
 (defun run-ansi-compiled-function-p ()
-  (%try-chunk "compiled-function-p" 6467984 1 #'run-ansi-compiled-function-p-chunk-1)
+  (%try-chunk "compiled-function-p" 6304144 1 #'run-ansi-compiled-function-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === complement.lsp ===
+(in-package :modus.mvm)
 (defun run-init-complement ()
   nil
 )
@@ -9924,12 +10165,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11791 c)))
 )
 (defun run-ansi-complement ()
-  (%try-chunk "complement" 6018589 1 #'run-ansi-complement-chunk-1)
-  (%try-chunk "complement" 6018589 2 #'run-ansi-complement-chunk-2)
-  (%try-chunk "complement" 6018589 3 #'run-ansi-complement-chunk-3)
+  (%try-chunk "complement" 15160861 1 #'run-ansi-complement-chunk-1)
+  (%try-chunk "complement" 15160861 2 #'run-ansi-complement-chunk-2)
+  (%try-chunk "complement" 15160861 3 #'run-ansi-complement-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === cond.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cond ()
   nil
 )
@@ -9994,12 +10238,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11811 c)))
 )
 (defun run-ansi-cond ()
-  (%try-chunk "cond" 11101649 1 #'run-ansi-cond-chunk-1)
-  (%try-chunk "cond" 11101649 2 #'run-ansi-cond-chunk-2)
-  (%try-chunk "cond" 11101649 3 #'run-ansi-cond-chunk-3)
+  (%try-chunk "cond" 8349137 1 #'run-ansi-cond-chunk-1)
+  (%try-chunk "cond" 8349137 2 #'run-ansi-cond-chunk-2)
+  (%try-chunk "cond" 8349137 3 #'run-ansi-cond-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === constantly.lsp ===
+(in-package :modus.mvm)
 (defun run-init-constantly ()
   nil
 )
@@ -10030,10 +10277,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11816 c)))
 )
 (defun run-ansi-constantly ()
-  (%try-chunk "constantly" 6172164 1 #'run-ansi-constantly-chunk-1)
+  (%try-chunk "constantly" 16100868 1 #'run-ansi-constantly-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === ctypecase.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP CTYPECASE.13)
 (defun run-init-ctypecase ()
   nil
@@ -10125,11 +10375,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11832 c)))
 )
 (defun run-ansi-ctypecase ()
-  (%try-chunk "ctypecase" 13360480 1 #'run-ansi-ctypecase-chunk-1)
-  (%try-chunk "ctypecase" 13360480 2 #'run-ansi-ctypecase-chunk-2)
+  (%try-chunk "ctypecase" 1285472 1 #'run-ansi-ctypecase-chunk-1)
+  (%try-chunk "ctypecase" 1285472 2 #'run-ansi-ctypecase-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === data-and-control-flow.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *DCF-FNS*
   '(APPLY FBOUNDP FMAKUNBOUND FUNCALL FUNCTION-LAMBDA-EXPRESSION FUNCTIONP
           COMPILED-FUNCTION-P NOT EQ EQL EQUAL EQUALP IDENTITY COMPLEMENT
@@ -10231,10 +10484,13 @@
                       PSETF
                       SHIFTF
                       ROTATEF)) (t (c) nil))
-  (%try-chunk "data-and-control-flow" 5069316 1 #'run-ansi-data-and-control-flow-chunk-1)
+  (%try-chunk "data-and-control-flow" 13703684 1 #'run-ansi-data-and-control-flow-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === defconstant.lsp ===
+(in-package :modus.mvm)
 (DEFCONSTANT TEST-CONSTANT-1 17)
 (DEFCONSTANT TEST-CONSTANT-2 'A "This is the documentation.")
 (defun run-init-defconstant ()
@@ -10264,10 +10520,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11842 c)))
 )
 (defun run-ansi-defconstant ()
-  (%try-chunk "defconstant" 1772534 1 #'run-ansi-defconstant-chunk-1)
+  (%try-chunk "defconstant" 15338486 1 #'run-ansi-defconstant-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-modify-macro.lsp ===
+(in-package :modus.mvm)
 (defun run-init-define-modify-macro ()
   nil
 )
@@ -10401,10 +10660,13 @@
                                                         DOC)))))) '(T T T)) (t (c) (%test-crash-fail-c 11848 c)))
 )
 (defun run-ansi-define-modify-macro ()
-  (%try-chunk "define-modify-macro" 2056760 1 #'run-ansi-define-modify-macro-chunk-1)
+  (%try-chunk "define-modify-macro" 8626744 1 #'run-ansi-define-modify-macro-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-setf-expander.lsp ===
+(in-package :modus.mvm)
 (DEFUN MY-CAR (X) (CAR X))
 (DEFUN MY-ASSOC (KEY ALIST)
   (LOOP FOR PAIR IN ALIST
@@ -10517,10 +10779,13 @@
                                                                   "D-S-EX.7")) (t (c) (%test-crash-fail-c 11855 c)))
 )
 (defun run-ansi-define-setf-expander ()
-  (%try-chunk "define-setf-expander" 11264975 1 #'run-ansi-define-setf-expander-chunk-1)
+  (%try-chunk "define-setf-expander" 9659343 1 #'run-ansi-define-setf-expander-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === defparameter.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *DEFPARAMETER-TEST-VAR-1* 100)
 (defun run-init-defparameter ()
   (handler-case (setq *DEFPARAMETER-TEST-VAR-1* 100) (t (c) nil))
@@ -10595,10 +10860,13 @@
 )
 (defun run-ansi-defparameter ()
   (handler-case (setq *DEFPARAMETER-TEST-VAR-1* 100) (t (c) nil))
-  (%try-chunk "defparameter" 16232993 1 #'run-ansi-defparameter-chunk-1)
+  (%try-chunk "defparameter" 324129 1 #'run-ansi-defparameter-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === defsetf.lsp ===
+(in-package :modus.mvm)
 (DEFUN DEFSETF.1-ACCESSOR (X) (CADR X))
 (DEFUN DEFSETF.1-ACCESSOR-SETTOR (X VAL) (SETF (CADR X) VAL))
 (DEFUN DEFSETF.2-ACCESSOR (X) (CADR X))
@@ -10730,11 +10998,14 @@
                           (DECLARE)
                           "Doc string for defsetf.4-accessor setf"
                           `(SETF (ELT ,SEQ ,N) ,VAL)))) (t (c) nil))
-  (%try-chunk "defsetf" 12786572 1 #'run-ansi-defsetf-chunk-1)
-  (%try-chunk "defsetf" 12786572 2 #'run-ansi-defsetf-chunk-2)
+  (%try-chunk "defsetf" 11115404 1 #'run-ansi-defsetf-chunk-1)
+  (%try-chunk "defsetf" 11115404 2 #'run-ansi-defsetf-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defun.lsp ===
+(in-package :modus.mvm)
 (DEFUN DEFUN-TEST-FUN-1 () (RETURN-FROM DEFUN-TEST-FUN-1 'GOOD))
 (DEFUN DEFUN-TEST-FUN-2 () (RETURN-FROM DEFUN-TEST-FUN-2 (VALUES)))
 (DEFUN DEFUN-TEST-FUN-3 ()
@@ -10857,11 +11128,14 @@
                                    COLLECT IT))) 'NIL) (t (c) (%test-crash-fail-c 11887 c)))
 )
 (defun run-ansi-defun ()
-  (%try-chunk "defun" 10520651 1 #'run-ansi-defun-chunk-1)
-  (%try-chunk "defun" 10520651 2 #'run-ansi-defun-chunk-2)
+  (%try-chunk "defun" 3917899 1 #'run-ansi-defun-chunk-1)
+  (%try-chunk "defun" 3917899 2 #'run-ansi-defun-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defvar.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *DEFVAR-TEST-VAR-1* 100)
 (defun run-init-defvar ()
   (handler-case (setq *DEFVAR-TEST-VAR-1* 100) (t (c) nil))
@@ -10933,10 +11207,13 @@
 )
 (defun run-ansi-defvar ()
   (handler-case (setq *DEFVAR-TEST-VAR-1* 100) (t (c) nil))
-  (%try-chunk "defvar" 13376213 1 #'run-ansi-defvar-chunk-1)
+  (%try-chunk "defvar" 8870613 1 #'run-ansi-defvar-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === destructuring-bind.lsp ===
+(in-package :modus.mvm)
 (defun run-init-destructuring-bind ()
   nil
 )
@@ -11159,14 +11436,17 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11933 c)))
 )
 (defun run-ansi-destructuring-bind ()
-  (%try-chunk "destructuring-bind" 1872466 1 #'run-ansi-destructuring-bind-chunk-1)
-  (%try-chunk "destructuring-bind" 1872466 2 #'run-ansi-destructuring-bind-chunk-2)
-  (%try-chunk "destructuring-bind" 1872466 3 #'run-ansi-destructuring-bind-chunk-3)
-  (%try-chunk "destructuring-bind" 1872466 4 #'run-ansi-destructuring-bind-chunk-4)
-  (%try-chunk "destructuring-bind" 1872466 5 #'run-ansi-destructuring-bind-chunk-5)
+  (%try-chunk "destructuring-bind" 2036306 1 #'run-ansi-destructuring-bind-chunk-1)
+  (%try-chunk "destructuring-bind" 2036306 2 #'run-ansi-destructuring-bind-chunk-2)
+  (%try-chunk "destructuring-bind" 2036306 3 #'run-ansi-destructuring-bind-chunk-3)
+  (%try-chunk "destructuring-bind" 2036306 4 #'run-ansi-destructuring-bind-chunk-4)
+  (%try-chunk "destructuring-bind" 2036306 5 #'run-ansi-destructuring-bind-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === ecase.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ecase ()
   nil
 )
@@ -11262,14 +11542,17 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11967 c)))
 )
 (defun run-ansi-ecase ()
-  (%try-chunk "ecase" 11929086 1 #'run-ansi-ecase-chunk-1)
-  (%try-chunk "ecase" 11929086 2 #'run-ansi-ecase-chunk-2)
-  (%try-chunk "ecase" 11929086 3 #'run-ansi-ecase-chunk-3)
-  (%try-chunk "ecase" 11929086 4 #'run-ansi-ecase-chunk-4)
-  (%try-chunk "ecase" 11929086 5 #'run-ansi-ecase-chunk-5)
+  (%try-chunk "ecase" 5965310 1 #'run-ansi-ecase-chunk-1)
+  (%try-chunk "ecase" 5965310 2 #'run-ansi-ecase-chunk-2)
+  (%try-chunk "ecase" 5965310 3 #'run-ansi-ecase-chunk-3)
+  (%try-chunk "ecase" 5965310 4 #'run-ansi-ecase-chunk-4)
+  (%try-chunk "ecase" 5965310 5 #'run-ansi-ecase-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === eql.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP EQL.8 "complex number")
 (DEFSKIP EQL.11 "complex number")
 (defun run-init-eql ()
@@ -11305,11 +11588,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 11982 c)))
 )
 (defun run-ansi-eql ()
-  (%try-chunk "eql" 13820935 1 #'run-ansi-eql-chunk-1)
-  (%try-chunk "eql" 13820935 2 #'run-ansi-eql-chunk-2)
+  (%try-chunk "eql" 14115847 1 #'run-ansi-eql-chunk-1)
+  (%try-chunk "eql" 14115847 2 #'run-ansi-eql-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === equal.lsp ===
+(in-package :modus.mvm)
 (defun run-init-equal ()
   nil
 )
@@ -11394,12 +11680,15 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12005 c)))
 )
 (defun run-ansi-equal ()
-  (%try-chunk "equal" 2938939 1 #'run-ansi-equal-chunk-1)
-  (%try-chunk "equal" 2938939 2 #'run-ansi-equal-chunk-2)
-  (%try-chunk "equal" 2938939 3 #'run-ansi-equal-chunk-3)
+  (%try-chunk "equal" 3397691 1 #'run-ansi-equal-chunk-1)
+  (%try-chunk "equal" 3397691 2 #'run-ansi-equal-chunk-2)
+  (%try-chunk "equal" 3397691 3 #'run-ansi-equal-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === equalp.lsp ===
+(in-package :modus.mvm)
 (DEFSTRUCT EQUALP-STRUCT-16 A B C)
 (DEFSTRUCT EQUALP-STRUCT-16-ALT A B C)
 (defun run-init-equalp ()
@@ -11680,14 +11969,17 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12045 c)))
 )
 (defun run-ansi-equalp ()
-  (%try-chunk "equalp" 9911603 1 #'run-ansi-equalp-chunk-1)
-  (%try-chunk "equalp" 9911603 2 #'run-ansi-equalp-chunk-2)
-  (%try-chunk "equalp" 9911603 3 #'run-ansi-equalp-chunk-3)
-  (%try-chunk "equalp" 9911603 4 #'run-ansi-equalp-chunk-4)
-  (%try-chunk "equalp" 9911603 5 #'run-ansi-equalp-chunk-5)
+  (%try-chunk "equalp" 9665843 1 #'run-ansi-equalp-chunk-1)
+  (%try-chunk "equalp" 9665843 2 #'run-ansi-equalp-chunk-2)
+  (%try-chunk "equalp" 9665843 3 #'run-ansi-equalp-chunk-3)
+  (%try-chunk "equalp" 9665843 4 #'run-ansi-equalp-chunk-4)
+  (%try-chunk "equalp" 9665843 5 #'run-ansi-equalp-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === etypecase.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ETYPECASE.12)
 (defun run-init-etypecase ()
   nil
@@ -11808,12 +12100,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12064 c)))
 )
 (defun run-ansi-etypecase ()
-  (%try-chunk "etypecase" 14660374 1 #'run-ansi-etypecase-chunk-1)
-  (%try-chunk "etypecase" 14660374 2 #'run-ansi-etypecase-chunk-2)
-  (%try-chunk "etypecase" 14660374 3 #'run-ansi-etypecase-chunk-3)
+  (%try-chunk "etypecase" 1913622 1 #'run-ansi-etypecase-chunk-1)
+  (%try-chunk "etypecase" 1913622 2 #'run-ansi-etypecase-chunk-2)
+  (%try-chunk "etypecase" 1913622 3 #'run-ansi-etypecase-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === every.lsp ===
+(in-package :modus.mvm)
 (defun run-init-every ()
   nil
 )
@@ -12155,15 +12450,18 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12108 c)))
 )
 (defun run-ansi-every ()
-  (%try-chunk "every" 16194162 1 #'run-ansi-every-chunk-1)
-  (%try-chunk "every" 16194162 2 #'run-ansi-every-chunk-2)
-  (%try-chunk "every" 16194162 3 #'run-ansi-every-chunk-3)
-  (%try-chunk "every" 16194162 4 #'run-ansi-every-chunk-4)
-  (%try-chunk "every" 16194162 5 #'run-ansi-every-chunk-5)
-  (%try-chunk "every" 16194162 6 #'run-ansi-every-chunk-6)
+  (%try-chunk "every" 6888050 1 #'run-ansi-every-chunk-1)
+  (%try-chunk "every" 6888050 2 #'run-ansi-every-chunk-2)
+  (%try-chunk "every" 6888050 3 #'run-ansi-every-chunk-3)
+  (%try-chunk "every" 6888050 4 #'run-ansi-every-chunk-4)
+  (%try-chunk "every" 6888050 5 #'run-ansi-every-chunk-5)
+  (%try-chunk "every" 6888050 6 #'run-ansi-every-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === fboundp.lsp ===
+(in-package :modus.mvm)
 (DEFUN FBOUNDP-5-FN (X) X)
 (DEFSKIP FBOUNDP.6)
 (defun run-init-fboundp ()
@@ -12216,12 +12514,15 @@
                                         (ERROR (C) (LIST (LIST X C)))))) 'NIL) (t (c) (%test-crash-fail-c 12126 c)))
 )
 (defun run-ansi-fboundp ()
-  (%try-chunk "fboundp" 14428331 1 #'run-ansi-fboundp-chunk-1)
-  (%try-chunk "fboundp" 14428331 2 #'run-ansi-fboundp-chunk-2)
-  (%try-chunk "fboundp" 14428331 3 #'run-ansi-fboundp-chunk-3)
+  (%try-chunk "fboundp" 2451627 1 #'run-ansi-fboundp-chunk-1)
+  (%try-chunk "fboundp" 2451627 2 #'run-ansi-fboundp-chunk-2)
+  (%try-chunk "fboundp" 2451627 3 #'run-ansi-fboundp-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === fdefinition.lsp ===
+(in-package :modus.mvm)
 (defun run-init-fdefinition ()
   nil
 )
@@ -12295,11 +12596,14 @@
                              I)) '1) (t (c) (%test-crash-fail-c 12139 c)))
 )
 (defun run-ansi-fdefinition ()
-  (%try-chunk "fdefinition" 4502868 1 #'run-ansi-fdefinition-chunk-1)
-  (%try-chunk "fdefinition" 4502868 2 #'run-ansi-fdefinition-chunk-2)
+  (%try-chunk "fdefinition" 6763860 1 #'run-ansi-fdefinition-chunk-1)
+  (%try-chunk "fdefinition" 6763860 2 #'run-ansi-fdefinition-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === flet.lsp ===
+(in-package :modus.mvm)
 (DEFUN FLET.72 () :BAD)
 (DEFMACRO FLET.73 () :BAD)
 (defun run-init-flet ()
@@ -13180,18 +13484,21 @@
                                                                :GOOD)) (t (c) (%test-crash-fail-c 12210 c)))
 )
 (defun run-ansi-flet ()
-  (%try-chunk "flet" 5461492 1 #'run-ansi-flet-chunk-1)
-  (%try-chunk "flet" 5461492 2 #'run-ansi-flet-chunk-2)
-  (%try-chunk "flet" 5461492 3 #'run-ansi-flet-chunk-3)
-  (%try-chunk "flet" 5461492 4 #'run-ansi-flet-chunk-4)
-  (%try-chunk "flet" 5461492 5 #'run-ansi-flet-chunk-5)
-  (%try-chunk "flet" 5461492 6 #'run-ansi-flet-chunk-6)
-  (%try-chunk "flet" 5461492 7 #'run-ansi-flet-chunk-7)
-  (%try-chunk "flet" 5461492 8 #'run-ansi-flet-chunk-8)
-  (%try-chunk "flet" 5461492 9 #'run-ansi-flet-chunk-9)
+  (%try-chunk "flet" 9410036 1 #'run-ansi-flet-chunk-1)
+  (%try-chunk "flet" 9410036 2 #'run-ansi-flet-chunk-2)
+  (%try-chunk "flet" 9410036 3 #'run-ansi-flet-chunk-3)
+  (%try-chunk "flet" 9410036 4 #'run-ansi-flet-chunk-4)
+  (%try-chunk "flet" 9410036 5 #'run-ansi-flet-chunk-5)
+  (%try-chunk "flet" 9410036 6 #'run-ansi-flet-chunk-6)
+  (%try-chunk "flet" 9410036 7 #'run-ansi-flet-chunk-7)
+  (%try-chunk "flet" 9410036 8 #'run-ansi-flet-chunk-8)
+  (%try-chunk "flet" 9410036 9 #'run-ansi-flet-chunk-9)
 )
 
+(in-package :modus.mvm)
+
 ;; === fmakunbound.lsp ===
+(in-package :modus.mvm)
 (defun run-init-fmakunbound ()
   nil
 )
@@ -13272,11 +13579,14 @@
                                         (ERROR (C) (LIST (LIST X C)))))) 'NIL) (t (c) (%test-crash-fail-c 12221 c)))
 )
 (defun run-ansi-fmakunbound ()
-  (%try-chunk "fmakunbound" 10962087 1 #'run-ansi-fmakunbound-chunk-1)
-  (%try-chunk "fmakunbound" 10962087 2 #'run-ansi-fmakunbound-chunk-2)
+  (%try-chunk "fmakunbound" 4539559 1 #'run-ansi-fmakunbound-chunk-1)
+  (%try-chunk "fmakunbound" 4539559 2 #'run-ansi-fmakunbound-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === funcall.lsp ===
+(in-package :modus.mvm)
 (DEFUN XCONS (X Y) (CONS X Y))
 (defun run-init-funcall ()
   nil
@@ -13352,12 +13662,15 @@
   (handler-case (run-test 12239 (lambda () (SIGNALS-TYPE-ERROR X 'A (FUNCALL #'CAR X))) 'T) (t (c) (%test-crash-fail-c 12239 c)))
 )
 (defun run-ansi-funcall ()
-  (%try-chunk "funcall" 8264416 1 #'run-ansi-funcall-chunk-1)
-  (%try-chunk "funcall" 8264416 2 #'run-ansi-funcall-chunk-2)
-  (%try-chunk "funcall" 8264416 3 #'run-ansi-funcall-chunk-3)
+  (%try-chunk "funcall" 6855392 1 #'run-ansi-funcall-chunk-1)
+  (%try-chunk "funcall" 6855392 2 #'run-ansi-funcall-chunk-2)
+  (%try-chunk "funcall" 6855392 3 #'run-ansi-funcall-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === function-lambda-expression.lsp ===
+(in-package :modus.mvm)
 (defun run-init-function-lambda-expression ()
   nil
 )
@@ -13394,10 +13707,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12245 c)))
 )
 (defun run-ansi-function-lambda-expression ()
-  (%try-chunk "function-lambda-expression" 320736 1 #'run-ansi-function-lambda-expression-chunk-1)
+  (%try-chunk "function-lambda-expression" 9250016 1 #'run-ansi-function-lambda-expression-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === function.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP FUNCTION.7)
 (defun run-init-function ()
   nil
@@ -13620,12 +13936,15 @@
                                                                          C D))) (t (c) (%test-crash-fail-c 12268 c)))
 )
 (defun run-ansi-function ()
-  (%try-chunk "function" 14779637 1 #'run-ansi-function-chunk-1)
-  (%try-chunk "function" 14779637 2 #'run-ansi-function-chunk-2)
-  (%try-chunk "function" 14779637 3 #'run-ansi-function-chunk-3)
+  (%try-chunk "function" 148725 1 #'run-ansi-function-chunk-1)
+  (%try-chunk "function" 148725 2 #'run-ansi-function-chunk-2)
+  (%try-chunk "function" 148725 3 #'run-ansi-function-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === functionp.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP FUNCITONP.7)
 (defun run-init-functionp ()
   nil
@@ -13674,11 +13993,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12282 c)))
 )
 (defun run-ansi-functionp ()
-  (%try-chunk "functionp" 6757725 1 #'run-ansi-functionp-chunk-1)
-  (%try-chunk "functionp" 6757725 2 #'run-ansi-functionp-chunk-2)
+  (%try-chunk "functionp" 449885 1 #'run-ansi-functionp-chunk-1)
+  (%try-chunk "functionp" 449885 2 #'run-ansi-functionp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === get-setf-expansion.lsp ===
+(in-package :modus.mvm)
 (defun run-init-get-setf-expansion ()
   nil
 )
@@ -13734,10 +14056,13 @@
                              (LENGTH VALS))) '5) (t (c) (%test-crash-fail-c 12287 c)))
 )
 (defun run-ansi-get-setf-expansion ()
-  (%try-chunk "get-setf-expansion" 14100220 1 #'run-ansi-get-setf-expansion-chunk-1)
+  (%try-chunk "get-setf-expansion" 9971452 1 #'run-ansi-get-setf-expansion-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === identity.lsp ===
+(in-package :modus.mvm)
 (defun run-init-identity ()
   nil
 )
@@ -13757,10 +14082,13 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12293 c)))
 )
 (defun run-ansi-identity ()
-  (%try-chunk "identity" 8684409 1 #'run-ansi-identity-chunk-1)
+  (%try-chunk "identity" 10929017 1 #'run-ansi-identity-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === if.lsp ===
+(in-package :modus.mvm)
 (defun run-init-if ()
   nil
 )
@@ -13835,11 +14163,14 @@
                                                       I)))) '(T 1)) (t (c) (%test-crash-fail-c 12307 c)))
 )
 (defun run-ansi-if ()
-  (%try-chunk "if" 15204976 1 #'run-ansi-if-chunk-1)
-  (%try-chunk "if" 15204976 2 #'run-ansi-if-chunk-2)
+  (%try-chunk "if" 10584688 1 #'run-ansi-if-chunk-1)
+  (%try-chunk "if" 10584688 2 #'run-ansi-if-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === labels.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP LABELS.40)
 (DEFUN LABELS.50 () :BAD)
 (DEFMACRO LABELS.51 () :BAD)
@@ -14190,16 +14521,19 @@
                                                                :GOOD)) (t (c) (%test-crash-fail-c 12362 c)))
 )
 (defun run-ansi-labels ()
-  (%try-chunk "labels" 3809106 1 #'run-ansi-labels-chunk-1)
-  (%try-chunk "labels" 3809106 2 #'run-ansi-labels-chunk-2)
-  (%try-chunk "labels" 3809106 3 #'run-ansi-labels-chunk-3)
-  (%try-chunk "labels" 3809106 4 #'run-ansi-labels-chunk-4)
-  (%try-chunk "labels" 3809106 5 #'run-ansi-labels-chunk-5)
-  (%try-chunk "labels" 3809106 6 #'run-ansi-labels-chunk-6)
-  (%try-chunk "labels" 3809106 7 #'run-ansi-labels-chunk-7)
+  (%try-chunk "labels" 14851922 1 #'run-ansi-labels-chunk-1)
+  (%try-chunk "labels" 14851922 2 #'run-ansi-labels-chunk-2)
+  (%try-chunk "labels" 14851922 3 #'run-ansi-labels-chunk-3)
+  (%try-chunk "labels" 14851922 4 #'run-ansi-labels-chunk-4)
+  (%try-chunk "labels" 14851922 5 #'run-ansi-labels-chunk-5)
+  (%try-chunk "labels" 14851922 6 #'run-ansi-labels-chunk-6)
+  (%try-chunk "labels" 14851922 7 #'run-ansi-labels-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === lambda-list-keywords.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lambda-list-keywords ()
   nil
 )
@@ -14215,10 +14549,13 @@
                             LAMBDA-LIST-KEYWORDS)) 'NIL) (t (c) (%test-crash-fail-c 12366 c)))
 )
 (defun run-ansi-lambda-list-keywords ()
-  (%try-chunk "lambda-list-keywords" 5621080 1 #'run-ansi-lambda-list-keywords-chunk-1)
+  (%try-chunk "lambda-list-keywords" 16319832 1 #'run-ansi-lambda-list-keywords-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === lambda-parameters-limit.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lambda-parameters-limit ()
   nil
 )
@@ -14227,10 +14564,13 @@
   (handler-case (run-test 12368 (lambda () (< LAMBDA-PARAMETERS-LIMIT 50)) 'NIL) (t (c) (%test-crash-fail-c 12368 c)))
 )
 (defun run-ansi-lambda-parameters-limit ()
-  (%try-chunk "lambda-parameters-limit" 6459455 1 #'run-ansi-lambda-parameters-limit-chunk-1)
+  (%try-chunk "lambda-parameters-limit" 9949247 1 #'run-ansi-lambda-parameters-limit-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === let.lsp ===
+(in-package :modus.mvm)
 (defun run-init-let ()
   nil
 )
@@ -14341,12 +14681,15 @@
                                (+ X X X)))) '3) (t (c) (%test-crash-fail-c 12386 c)))
 )
 (defun run-ansi-let ()
-  (%try-chunk "let" 9025882 1 #'run-ansi-let-chunk-1)
-  (%try-chunk "let" 9025882 2 #'run-ansi-let-chunk-2)
-  (%try-chunk "let" 9025882 3 #'run-ansi-let-chunk-3)
+  (%try-chunk "let" 16169306 1 #'run-ansi-let-chunk-1)
+  (%try-chunk "let" 16169306 2 #'run-ansi-let-chunk-2)
+  (%try-chunk "let" 16169306 3 #'run-ansi-let-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === letstar.lsp ===
+(in-package :modus.mvm)
 (defun run-init-letstar ()
   nil
 )
@@ -14477,12 +14820,15 @@
                                (+ X Y)))) '3) (t (c) (%test-crash-fail-c 12409 c)))
 )
 (defun run-ansi-letstar ()
-  (%try-chunk "letstar" 3227310 1 #'run-ansi-letstar-chunk-1)
-  (%try-chunk "letstar" 3227310 2 #'run-ansi-letstar-chunk-2)
-  (%try-chunk "letstar" 3227310 3 #'run-ansi-letstar-chunk-3)
+  (%try-chunk "letstar" 11058862 1 #'run-ansi-letstar-chunk-1)
+  (%try-chunk "letstar" 11058862 2 #'run-ansi-letstar-chunk-2)
+  (%try-chunk "letstar" 11058862 3 #'run-ansi-letstar-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;cons-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;random-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;types-aux.lsp")
@@ -14572,7 +14918,10 @@
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === macrolet.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO MACROLET.50 () :BAD)
 (DEFUN MACROLET.51 () :BAD)
 (defun run-init-macrolet ()
@@ -15072,16 +15421,19 @@
                                                                :GOOD)) (t (c) (%test-crash-fail-c 12462 c)))
 )
 (defun run-ansi-macrolet ()
-  (%try-chunk "macrolet" 6429320 1 #'run-ansi-macrolet-chunk-1)
-  (%try-chunk "macrolet" 6429320 2 #'run-ansi-macrolet-chunk-2)
-  (%try-chunk "macrolet" 6429320 3 #'run-ansi-macrolet-chunk-3)
-  (%try-chunk "macrolet" 6429320 4 #'run-ansi-macrolet-chunk-4)
-  (%try-chunk "macrolet" 6429320 5 #'run-ansi-macrolet-chunk-5)
-  (%try-chunk "macrolet" 6429320 6 #'run-ansi-macrolet-chunk-6)
-  (%try-chunk "macrolet" 6429320 7 #'run-ansi-macrolet-chunk-7)
+  (%try-chunk "macrolet" 7412360 1 #'run-ansi-macrolet-chunk-1)
+  (%try-chunk "macrolet" 7412360 2 #'run-ansi-macrolet-chunk-2)
+  (%try-chunk "macrolet" 7412360 3 #'run-ansi-macrolet-chunk-3)
+  (%try-chunk "macrolet" 7412360 4 #'run-ansi-macrolet-chunk-4)
+  (%try-chunk "macrolet" 7412360 5 #'run-ansi-macrolet-chunk-5)
+  (%try-chunk "macrolet" 7412360 6 #'run-ansi-macrolet-chunk-6)
+  (%try-chunk "macrolet" 7412360 7 #'run-ansi-macrolet-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === multiple-value-bind.lsp ===
+(in-package :modus.mvm)
 (defun run-init-multiple-value-bind ()
   nil
 )
@@ -15174,12 +15526,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12479 c)))
 )
 (defun run-ansi-multiple-value-bind ()
-  (%try-chunk "multiple-value-bind" 15796085 1 #'run-ansi-multiple-value-bind-chunk-1)
-  (%try-chunk "multiple-value-bind" 15796085 2 #'run-ansi-multiple-value-bind-chunk-2)
-  (%try-chunk "multiple-value-bind" 15796085 3 #'run-ansi-multiple-value-bind-chunk-3)
+  (%try-chunk "multiple-value-bind" 13223797 1 #'run-ansi-multiple-value-bind-chunk-1)
+  (%try-chunk "multiple-value-bind" 13223797 2 #'run-ansi-multiple-value-bind-chunk-2)
+  (%try-chunk "multiple-value-bind" 13223797 3 #'run-ansi-multiple-value-bind-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === multiple-value-call.lsp ===
+(in-package :modus.mvm)
 (defun run-init-multiple-value-call ()
   nil
 )
@@ -15201,10 +15556,13 @@
                                                                                   2)) (t (c) (%test-crash-fail-c 12484 c)))
 )
 (defun run-ansi-multiple-value-call ()
-  (%try-chunk "multiple-value-call" 9439798 1 #'run-ansi-multiple-value-call-chunk-1)
+  (%try-chunk "multiple-value-call" 14944822 1 #'run-ansi-multiple-value-call-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === multiple-value-list.lsp ===
+(in-package :modus.mvm)
 (defun run-init-multiple-value-list ()
   nil
 )
@@ -15257,11 +15615,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12497 c)))
 )
 (defun run-ansi-multiple-value-list ()
-  (%try-chunk "multiple-value-list" 4301494 1 #'run-ansi-multiple-value-list-chunk-1)
-  (%try-chunk "multiple-value-list" 4301494 2 #'run-ansi-multiple-value-list-chunk-2)
+  (%try-chunk "multiple-value-list" 1974966 1 #'run-ansi-multiple-value-list-chunk-1)
+  (%try-chunk "multiple-value-list" 1974966 2 #'run-ansi-multiple-value-list-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === multiple-value-prog1.lsp ===
+(in-package :modus.mvm)
 (defun run-init-multiple-value-prog1 ()
   nil
 )
@@ -15337,11 +15698,14 @@
                              (MULTIPLE-VALUE-PROG1 :GOOD :FOO))) ':GOOD) (t (c) (%test-crash-fail-c 12509 c)))
 )
 (defun run-ansi-multiple-value-prog1 ()
-  (%try-chunk "multiple-value-prog1" 2704359 1 #'run-ansi-multiple-value-prog1-chunk-1)
-  (%try-chunk "multiple-value-prog1" 2704359 2 #'run-ansi-multiple-value-prog1-chunk-2)
+  (%try-chunk "multiple-value-prog1" 14140391 1 #'run-ansi-multiple-value-prog1-chunk-1)
+  (%try-chunk "multiple-value-prog1" 14140391 2 #'run-ansi-multiple-value-prog1-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === multiple-value-setq.lsp ===
+(in-package :modus.mvm)
 (defun run-init-multiple-value-setq ()
   nil
 )
@@ -15484,12 +15848,15 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12529 c)))
 )
 (defun run-ansi-multiple-value-setq ()
-  (%try-chunk "multiple-value-setq" 8503135 1 #'run-ansi-multiple-value-setq-chunk-1)
-  (%try-chunk "multiple-value-setq" 8503135 2 #'run-ansi-multiple-value-setq-chunk-2)
-  (%try-chunk "multiple-value-setq" 8503135 3 #'run-ansi-multiple-value-setq-chunk-3)
+  (%try-chunk "multiple-value-setq" 7405407 1 #'run-ansi-multiple-value-setq-chunk-1)
+  (%try-chunk "multiple-value-setq" 7405407 2 #'run-ansi-multiple-value-setq-chunk-2)
+  (%try-chunk "multiple-value-setq" 7405407 3 #'run-ansi-multiple-value-setq-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nil.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nil ()
   nil
 )
@@ -15506,10 +15873,13 @@
   (handler-case (run-test 12537 (lambda () (EQT NIL 'NIL)) 'T) (t (c) (%test-crash-fail-c 12537 c)))
 )
 (defun run-ansi-nil ()
-  (%try-chunk "nil" 6509852 1 #'run-ansi-nil-chunk-1)
+  (%try-chunk "nil" 1250588 1 #'run-ansi-nil-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === not-and-null.lsp ===
+(in-package :modus.mvm)
 (defun run-init-not-and-null ()
   nil
 )
@@ -15538,11 +15908,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12549 c)))
 )
 (defun run-ansi-not-and-null ()
-  (%try-chunk "not-and-null" 4609530 1 #'run-ansi-not-and-null-chunk-1)
-  (%try-chunk "not-and-null" 4609530 2 #'run-ansi-not-and-null-chunk-2)
+  (%try-chunk "not-and-null" 7869946 1 #'run-ansi-not-and-null-chunk-1)
+  (%try-chunk "not-and-null" 7869946 2 #'run-ansi-not-and-null-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === notany.lsp ===
+(in-package :modus.mvm)
 (defun run-init-notany ()
   nil
 )
@@ -15882,15 +16255,18 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12591 c)))
 )
 (defun run-ansi-notany ()
-  (%try-chunk "notany" 16096004 1 #'run-ansi-notany-chunk-1)
-  (%try-chunk "notany" 16096004 2 #'run-ansi-notany-chunk-2)
-  (%try-chunk "notany" 16096004 3 #'run-ansi-notany-chunk-3)
-  (%try-chunk "notany" 16096004 4 #'run-ansi-notany-chunk-4)
-  (%try-chunk "notany" 16096004 5 #'run-ansi-notany-chunk-5)
-  (%try-chunk "notany" 16096004 6 #'run-ansi-notany-chunk-6)
+  (%try-chunk "notany" 8854276 1 #'run-ansi-notany-chunk-1)
+  (%try-chunk "notany" 8854276 2 #'run-ansi-notany-chunk-2)
+  (%try-chunk "notany" 8854276 3 #'run-ansi-notany-chunk-3)
+  (%try-chunk "notany" 8854276 4 #'run-ansi-notany-chunk-4)
+  (%try-chunk "notany" 8854276 5 #'run-ansi-notany-chunk-5)
+  (%try-chunk "notany" 8854276 6 #'run-ansi-notany-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === notevery.lsp ===
+(in-package :modus.mvm)
 (defun run-init-notevery ()
   nil
 )
@@ -16224,15 +16600,18 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12633 c)))
 )
 (defun run-ansi-notevery ()
-  (%try-chunk "notevery" 241047 1 #'run-ansi-notevery-chunk-1)
-  (%try-chunk "notevery" 241047 2 #'run-ansi-notevery-chunk-2)
-  (%try-chunk "notevery" 241047 3 #'run-ansi-notevery-chunk-3)
-  (%try-chunk "notevery" 241047 4 #'run-ansi-notevery-chunk-4)
-  (%try-chunk "notevery" 241047 5 #'run-ansi-notevery-chunk-5)
-  (%try-chunk "notevery" 241047 6 #'run-ansi-notevery-chunk-6)
+  (%try-chunk "notevery" 13266327 1 #'run-ansi-notevery-chunk-1)
+  (%try-chunk "notevery" 13266327 2 #'run-ansi-notevery-chunk-2)
+  (%try-chunk "notevery" 13266327 3 #'run-ansi-notevery-chunk-3)
+  (%try-chunk "notevery" 13266327 4 #'run-ansi-notevery-chunk-4)
+  (%try-chunk "notevery" 13266327 5 #'run-ansi-notevery-chunk-5)
+  (%try-chunk "notevery" 13266327 6 #'run-ansi-notevery-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === nth-value.lsp ===
+(in-package :modus.mvm)
 (defun run-init-nth-value ()
   nil
 )
@@ -16287,11 +16666,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12644 c)))
 )
 (defun run-ansi-nth-value ()
-  (%try-chunk "nth-value" 8100427 1 #'run-ansi-nth-value-chunk-1)
-  (%try-chunk "nth-value" 8100427 2 #'run-ansi-nth-value-chunk-2)
+  (%try-chunk "nth-value" 4610635 1 #'run-ansi-nth-value-chunk-1)
+  (%try-chunk "nth-value" 4610635 2 #'run-ansi-nth-value-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === or.lsp ===
+(in-package :modus.mvm)
 (defun run-init-or ()
   nil
 )
@@ -16335,11 +16717,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12658 c)))
 )
 (defun run-ansi-or ()
-  (%try-chunk "or" 15159586 1 #'run-ansi-or-chunk-1)
-  (%try-chunk "or" 15159586 2 #'run-ansi-or-chunk-2)
+  (%try-chunk "or" 8458530 1 #'run-ansi-or-chunk-1)
+  (%try-chunk "or" 8458530 2 #'run-ansi-or-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === places.lsp ===
+(in-package :modus.mvm)
 (DEFUN ACCESSOR-5-1-2-6-UPDATE-FN (X Y) (SETF (CAR X) Y) Y)
 (DEFSETF ACCESSOR-5-1-2-6 ACCESSOR-5-1-2-6-UPDATE-FN)
 (DEFMACRO ACCESSOR-5-1-2-7 (X) `(CAR ,X))
@@ -16591,14 +16976,17 @@
                                                                                      T)) (t (c) (%test-crash-fail-c 12698 c)))
 )
 (defun run-ansi-places ()
-  (%try-chunk "places" 14313527 1 #'run-ansi-places-chunk-1)
-  (%try-chunk "places" 14313527 2 #'run-ansi-places-chunk-2)
-  (%try-chunk "places" 14313527 3 #'run-ansi-places-chunk-3)
-  (%try-chunk "places" 14313527 4 #'run-ansi-places-chunk-4)
-  (%try-chunk "places" 14313527 5 #'run-ansi-places-chunk-5)
+  (%try-chunk "places" 6776887 1 #'run-ansi-places-chunk-1)
+  (%try-chunk "places" 6776887 2 #'run-ansi-places-chunk-2)
+  (%try-chunk "places" 6776887 3 #'run-ansi-places-chunk-3)
+  (%try-chunk "places" 6776887 4 #'run-ansi-places-chunk-4)
+  (%try-chunk "places" 6776887 5 #'run-ansi-places-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === prog.lsp ===
+(in-package :modus.mvm)
 (defun run-init-prog ()
   nil
 )
@@ -16723,12 +17111,15 @@
                              (PROG* ((X :GOOD)) (RETURN X)))) ':GOOD) (t (c) (%test-crash-fail-c 12722 c)))
 )
 (defun run-ansi-prog ()
-  (%try-chunk "prog" 10406093 1 #'run-ansi-prog-chunk-1)
-  (%try-chunk "prog" 10406093 2 #'run-ansi-prog-chunk-2)
-  (%try-chunk "prog" 10406093 3 #'run-ansi-prog-chunk-3)
+  (%try-chunk "prog" 4933837 1 #'run-ansi-prog-chunk-1)
+  (%try-chunk "prog" 4933837 2 #'run-ansi-prog-chunk-2)
+  (%try-chunk "prog" 4933837 3 #'run-ansi-prog-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === prog1.lsp ===
+(in-package :modus.mvm)
 (defun run-init-prog1 ()
   nil
 )
@@ -16750,10 +17141,13 @@
                              (PROG1 'GOOD))) 'GOOD) (t (c) (%test-crash-fail-c 12729 c)))
 )
 (defun run-ansi-prog1 ()
-  (%try-chunk "prog1" 3399580 1 #'run-ansi-prog1-chunk-1)
+  (%try-chunk "prog1" 12918684 1 #'run-ansi-prog1-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === prog2.lsp ===
+(in-package :modus.mvm)
 (defun run-init-prog2 ()
   nil
 )
@@ -16784,10 +17178,13 @@
                              (PROG2 'BAD1 'GOOD 'BAD2))) 'GOOD) (t (c) (%test-crash-fail-c 12737 c)))
 )
 (defun run-ansi-prog2 ()
-  (%try-chunk "prog2" 3399847 1 #'run-ansi-prog2-chunk-1)
+  (%try-chunk "prog2" 15949991 1 #'run-ansi-prog2-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === progn.lsp ===
+(in-package :modus.mvm)
 (defun run-init-progn ()
   nil
 )
@@ -16827,11 +17224,14 @@
                              (PROGN :BAD :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 12747 c)))
 )
 (defun run-ansi-progn ()
-  (%try-chunk "progn" 3388811 1 #'run-ansi-progn-chunk-1)
-  (%try-chunk "progn" 3388811 2 #'run-ansi-progn-chunk-2)
+  (%try-chunk "progn" 11957643 1 #'run-ansi-progn-chunk-1)
+  (%try-chunk "progn" 11957643 2 #'run-ansi-progn-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === progv.lsp ===
+(in-package :modus.mvm)
 (defun run-init-progv ()
   nil
 )
@@ -16931,12 +17331,15 @@
                              (PROGV NIL NIL :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 12765 c)))
 )
 (defun run-ansi-progv ()
-  (%try-chunk "progv" 3390947 1 #'run-ansi-progv-chunk-1)
-  (%try-chunk "progv" 3390947 2 #'run-ansi-progv-chunk-2)
-  (%try-chunk "progv" 3390947 3 #'run-ansi-progv-chunk-3)
+  (%try-chunk "progv" 2653667 1 #'run-ansi-progv-chunk-1)
+  (%try-chunk "progv" 2653667 2 #'run-ansi-progv-chunk-2)
+  (%try-chunk "progv" 2653667 3 #'run-ansi-progv-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === psetf.lsp ===
+(in-package :modus.mvm)
 (defun run-init-psetf ()
   nil
 )
@@ -17462,15 +17865,18 @@
                                                                              3)) (t (c) (%test-crash-fail-c 12811 c)))
 )
 (defun run-ansi-psetf ()
-  (%try-chunk "psetf" 4117179 1 #'run-ansi-psetf-chunk-1)
-  (%try-chunk "psetf" 4117179 2 #'run-ansi-psetf-chunk-2)
-  (%try-chunk "psetf" 4117179 3 #'run-ansi-psetf-chunk-3)
-  (%try-chunk "psetf" 4117179 4 #'run-ansi-psetf-chunk-4)
-  (%try-chunk "psetf" 4117179 5 #'run-ansi-psetf-chunk-5)
-  (%try-chunk "psetf" 4117179 6 #'run-ansi-psetf-chunk-6)
+  (%try-chunk "psetf" 10638011 1 #'run-ansi-psetf-chunk-1)
+  (%try-chunk "psetf" 10638011 2 #'run-ansi-psetf-chunk-2)
+  (%try-chunk "psetf" 10638011 3 #'run-ansi-psetf-chunk-3)
+  (%try-chunk "psetf" 10638011 4 #'run-ansi-psetf-chunk-4)
+  (%try-chunk "psetf" 10638011 5 #'run-ansi-psetf-chunk-5)
+  (%try-chunk "psetf" 10638011 6 #'run-ansi-psetf-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === psetq.lsp ===
+(in-package :modus.mvm)
 (defun run-init-psetq ()
   nil
 )
@@ -17597,11 +18003,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12824 c)))
 )
 (defun run-ansi-psetq ()
-  (%try-chunk "psetq" 4115844 1 #'run-ansi-psetq-chunk-1)
-  (%try-chunk "psetq" 4115844 2 #'run-ansi-psetq-chunk-2)
+  (%try-chunk "psetq" 12258692 1 #'run-ansi-psetq-chunk-1)
+  (%try-chunk "psetq" 12258692 2 #'run-ansi-psetq-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === return-from.lsp ===
+(in-package :modus.mvm)
 (defun run-init-return-from ()
   nil
 )
@@ -17613,10 +18022,13 @@
                              (BLOCK FOO (RETURN-FROM FOO :GOOD)))) ':GOOD) (t (c) (%test-crash-fail-c 12827 c)))
 )
 (defun run-ansi-return-from ()
-  (%try-chunk "return-from" 12480214 1 #'run-ansi-return-from-chunk-1)
+  (%try-chunk "return-from" 13938390 1 #'run-ansi-return-from-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === return.lsp ===
+(in-package :modus.mvm)
 (defun run-init-return ()
   nil
 )
@@ -17642,10 +18054,13 @@
                              (BLOCK NIL (RETURN :GOOD) :BAD))) ':GOOD) (t (c) (%test-crash-fail-c 12833 c)))
 )
 (defun run-ansi-return ()
-  (%try-chunk "return" 7274885 1 #'run-ansi-return-chunk-1)
+  (%try-chunk "return" 14664069 1 #'run-ansi-return-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === rotatef.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rotatef ()
   nil
 )
@@ -18085,14 +18500,17 @@
                                                        (VALUES X Y))))) '(2 1)) (t (c) (%test-crash-fail-c 12870 c)))
 )
 (defun run-ansi-rotatef ()
-  (%try-chunk "rotatef" 8029624 1 #'run-ansi-rotatef-chunk-1)
-  (%try-chunk "rotatef" 8029624 2 #'run-ansi-rotatef-chunk-2)
-  (%try-chunk "rotatef" 8029624 3 #'run-ansi-rotatef-chunk-3)
-  (%try-chunk "rotatef" 8029624 4 #'run-ansi-rotatef-chunk-4)
-  (%try-chunk "rotatef" 8029624 5 #'run-ansi-rotatef-chunk-5)
+  (%try-chunk "rotatef" 591288 1 #'run-ansi-rotatef-chunk-1)
+  (%try-chunk "rotatef" 591288 2 #'run-ansi-rotatef-chunk-2)
+  (%try-chunk "rotatef" 591288 3 #'run-ansi-rotatef-chunk-3)
+  (%try-chunk "rotatef" 591288 4 #'run-ansi-rotatef-chunk-4)
+  (%try-chunk "rotatef" 591288 5 #'run-ansi-rotatef-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === shiftf.lsp ===
+(in-package :modus.mvm)
 (defun run-init-shiftf ()
   nil
 )
@@ -18180,11 +18598,14 @@
                                                       X Y)))) '((A) 3 1)) (t (c) (%test-crash-fail-c 12879 c)))
 )
 (defun run-ansi-shiftf ()
-  (%try-chunk "shiftf" 6197225 1 #'run-ansi-shiftf-chunk-1)
-  (%try-chunk "shiftf" 6197225 2 #'run-ansi-shiftf-chunk-2)
+  (%try-chunk "shiftf" 10276841 1 #'run-ansi-shiftf-chunk-1)
+  (%try-chunk "shiftf" 10276841 2 #'run-ansi-shiftf-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === some.lsp ===
+(in-package :modus.mvm)
 (defun run-init-some ()
   nil
 )
@@ -18533,15 +18954,18 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12923 c)))
 )
 (defun run-ansi-some ()
-  (%try-chunk "some" 8352555 1 #'run-ansi-some-chunk-1)
-  (%try-chunk "some" 8352555 2 #'run-ansi-some-chunk-2)
-  (%try-chunk "some" 8352555 3 #'run-ansi-some-chunk-3)
-  (%try-chunk "some" 8352555 4 #'run-ansi-some-chunk-4)
-  (%try-chunk "some" 8352555 5 #'run-ansi-some-chunk-5)
-  (%try-chunk "some" 8352555 6 #'run-ansi-some-chunk-6)
+  (%try-chunk "some" 6058795 1 #'run-ansi-some-chunk-1)
+  (%try-chunk "some" 6058795 2 #'run-ansi-some-chunk-2)
+  (%try-chunk "some" 6058795 3 #'run-ansi-some-chunk-3)
+  (%try-chunk "some" 6058795 4 #'run-ansi-some-chunk-4)
+  (%try-chunk "some" 6058795 5 #'run-ansi-some-chunk-5)
+  (%try-chunk "some" 6058795 6 #'run-ansi-some-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === t.lsp ===
+(in-package :modus.mvm)
 (defun run-init-t ()
   nil
 )
@@ -18552,10 +18976,13 @@
   (handler-case (run-test 12927 (lambda () (SYMBOL-VALUE T)) 'T) (t (c) (%test-crash-fail-c 12927 c)))
 )
 (defun run-ansi-t ()
-  (%try-chunk "t" 6770435 1 #'run-ansi-t-chunk-1)
+  (%try-chunk "t" 13684483 1 #'run-ansi-t-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === tagbody.lsp ===
+(in-package :modus.mvm)
 (defun run-init-tagbody ()
   nil
 )
@@ -18676,12 +19103,15 @@
                              (TAGBODY :FOO))) 'NIL) (t (c) (%test-crash-fail-c 12945 c)))
 )
 (defun run-ansi-tagbody ()
-  (%try-chunk "tagbody" 13032477 1 #'run-ansi-tagbody-chunk-1)
-  (%try-chunk "tagbody" 13032477 2 #'run-ansi-tagbody-chunk-2)
-  (%try-chunk "tagbody" 13032477 3 #'run-ansi-tagbody-chunk-3)
+  (%try-chunk "tagbody" 8838173 1 #'run-ansi-tagbody-chunk-1)
+  (%try-chunk "tagbody" 8838173 2 #'run-ansi-tagbody-chunk-2)
+  (%try-chunk "tagbody" 8838173 3 #'run-ansi-tagbody-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === typecase.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP TYPECASE.15)
 (defun run-init-typecase ()
   nil
@@ -18801,13 +19231,16 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12970 c)))
 )
 (defun run-ansi-typecase ()
-  (%try-chunk "typecase" 2788147 1 #'run-ansi-typecase-chunk-1)
-  (%try-chunk "typecase" 2788147 2 #'run-ansi-typecase-chunk-2)
-  (%try-chunk "typecase" 2788147 3 #'run-ansi-typecase-chunk-3)
-  (%try-chunk "typecase" 2788147 4 #'run-ansi-typecase-chunk-4)
+  (%try-chunk "typecase" 3558195 1 #'run-ansi-typecase-chunk-1)
+  (%try-chunk "typecase" 3558195 2 #'run-ansi-typecase-chunk-2)
+  (%try-chunk "typecase" 3558195 3 #'run-ansi-typecase-chunk-3)
+  (%try-chunk "typecase" 3558195 4 #'run-ansi-typecase-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === unless.lsp ===
+(in-package :modus.mvm)
 (defun run-init-unless ()
   nil
 )
@@ -18862,11 +19295,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 12986 c)))
 )
 (defun run-ansi-unless ()
-  (%try-chunk "unless" 9032685 1 #'run-ansi-unless-chunk-1)
-  (%try-chunk "unless" 9032685 2 #'run-ansi-unless-chunk-2)
+  (%try-chunk "unless" 13685741 1 #'run-ansi-unless-chunk-1)
+  (%try-chunk "unless" 13685741 2 #'run-ansi-unless-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === unwind-protect.lsp ===
+(in-package :modus.mvm)
 (defun run-init-unwind-protect ()
   nil
 )
@@ -18953,11 +19389,14 @@
                              (UNWIND-PROTECT :GOOD :BAD))) ':GOOD) (t (c) (%test-crash-fail-c 12999 c)))
 )
 (defun run-ansi-unwind-protect ()
-  (%try-chunk "unwind-protect" 6930830 1 #'run-ansi-unwind-protect-chunk-1)
-  (%try-chunk "unwind-protect" 6930830 2 #'run-ansi-unwind-protect-chunk-2)
+  (%try-chunk "unwind-protect" 14909838 1 #'run-ansi-unwind-protect-chunk-1)
+  (%try-chunk "unwind-protect" 14909838 2 #'run-ansi-unwind-protect-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === values-list.lsp ===
+(in-package :modus.mvm)
 (defun run-init-values-list ()
   nil
 )
@@ -18995,11 +19434,14 @@
                              (EQUALT X (MULTIPLE-VALUE-LIST (VALUES-LIST X))))) 'T) (t (c) (%test-crash-fail-c 13008 c)))
 )
 (defun run-ansi-values-list ()
-  (%try-chunk "values-list" 3644920 1 #'run-ansi-values-list-chunk-1)
-  (%try-chunk "values-list" 3644920 2 #'run-ansi-values-list-chunk-2)
+  (%try-chunk "values-list" 499192 1 #'run-ansi-values-list-chunk-1)
+  (%try-chunk "values-list" 499192 2 #'run-ansi-values-list-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === values.lsp ===
+(in-package :modus.mvm)
 (defun run-init-values ()
   nil
 )
@@ -19090,11 +19532,14 @@
   (handler-case (run-test 13023 (lambda () ((LAMBDA (A) (LCM (VALUES A (SETQ A 1)))) 10)) '10) (t (c) (%test-crash-fail-c 13023 c)))
 )
 (defun run-ansi-values ()
-  (%try-chunk "values" 14420255 1 #'run-ansi-values-chunk-1)
-  (%try-chunk "values" 14420255 2 #'run-ansi-values-chunk-2)
+  (%try-chunk "values" 2017567 1 #'run-ansi-values-chunk-1)
+  (%try-chunk "values" 2017567 2 #'run-ansi-values-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === when.lsp ===
+(in-package :modus.mvm)
 (defun run-init-when ()
   nil
 )
@@ -19146,11 +19591,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13037 c)))
 )
 (defun run-ansi-when ()
-  (%try-chunk "when" 9836779 1 #'run-ansi-when-chunk-1)
-  (%try-chunk "when" 9836779 2 #'run-ansi-when-chunk-2)
+  (%try-chunk "when" 8804587 1 #'run-ansi-when-chunk-1)
+  (%try-chunk "when" 8804587 2 #'run-ansi-when-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === clrhash.lsp ===
+(in-package :modus.mvm)
 (defun run-init-clrhash ()
   nil
 )
@@ -19230,10 +19678,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13044 c)))
 )
 (defun run-ansi-clrhash ()
-  (%try-chunk "clrhash" 1318424 1 #'run-ansi-clrhash-chunk-1)
+  (%try-chunk "clrhash" 2235928 1 #'run-ansi-clrhash-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === gethash.lsp ===
+(in-package :modus.mvm)
 (defun run-init-gethash ()
   nil
 )
@@ -19424,11 +19875,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13060 c)))
 )
 (defun run-ansi-gethash ()
-  (%try-chunk "gethash" 12340067 1 #'run-ansi-gethash-chunk-1)
-  (%try-chunk "gethash" 12340067 2 #'run-ansi-gethash-chunk-2)
+  (%try-chunk "gethash" 10603363 1 #'run-ansi-gethash-chunk-1)
+  (%try-chunk "gethash" 10603363 2 #'run-ansi-gethash-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table-count.lsp ===
+(in-package :modus.mvm)
 (defun run-init-hash-table-count ()
   nil
 )
@@ -19467,11 +19921,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13073 c)))
 )
 (defun run-ansi-hash-table-count ()
-  (%try-chunk "hash-table-count" 8030192 1 #'run-ansi-hash-table-count-chunk-1)
-  (%try-chunk "hash-table-count" 8030192 2 #'run-ansi-hash-table-count-chunk-2)
+  (%try-chunk "hash-table-count" 10586096 1 #'run-ansi-hash-table-count-chunk-1)
+  (%try-chunk "hash-table-count" 10586096 2 #'run-ansi-hash-table-count-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table-p.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP HASH-TABLE-P.1)
 (defun run-init-hash-table-p ()
   nil
@@ -19494,10 +19951,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13079 c)))
 )
 (defun run-ansi-hash-table-p ()
-  (%try-chunk "hash-table-p" 12125123 1 #'run-ansi-hash-table-p-chunk-1)
+  (%try-chunk "hash-table-p" 1524675 1 #'run-ansi-hash-table-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table-rehash-size.lsp ===
+(in-package :modus.mvm)
 (defun run-init-hash-table-rehash-size ()
   nil
 )
@@ -19527,10 +19987,13 @@
   (handler-case (run-test 13085 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13085 c)))
 )
 (defun run-ansi-hash-table-rehash-size ()
-  (%try-chunk "hash-table-rehash-size" 7393806 1 #'run-ansi-hash-table-rehash-size-chunk-1)
+  (%try-chunk "hash-table-rehash-size" 2298382 1 #'run-ansi-hash-table-rehash-size-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table-rehash-threshold.lsp ===
+(in-package :modus.mvm)
 (defun run-init-hash-table-rehash-threshold ()
   nil
 )
@@ -19563,10 +20026,13 @@
   (handler-case (run-test 13091 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13091 c)))
 )
 (defun run-ansi-hash-table-rehash-threshold ()
-  (%try-chunk "hash-table-rehash-threshold" 13617700 1 #'run-ansi-hash-table-rehash-threshold-chunk-1)
+  (%try-chunk "hash-table-rehash-threshold" 8522276 1 #'run-ansi-hash-table-rehash-threshold-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table-size.lsp ===
+(in-package :modus.mvm)
 (defun run-init-hash-table-size ()
   nil
 )
@@ -19579,10 +20045,13 @@
   (handler-case (run-test 13094 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13094 c)))
 )
 (defun run-ansi-hash-table-size ()
-  (%try-chunk "hash-table-size" 14586030 1 #'run-ansi-hash-table-size-chunk-1)
+  (%try-chunk "hash-table-size" 1937582 1 #'run-ansi-hash-table-size-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table-test.lsp ===
+(in-package :modus.mvm)
 (defun run-init-hash-table-test ()
   nil
 )
@@ -19617,10 +20086,13 @@
   (handler-case (run-test 13101 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13101 c)))
 )
 (defun run-ansi-hash-table-test ()
-  (%try-chunk "hash-table-test" 3005509 1 #'run-ansi-hash-table-test-chunk-1)
+  (%try-chunk "hash-table-test" 11721797 1 #'run-ansi-hash-table-test-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === hash-table.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP HASH-TABLE.2)
 (DEFSKIP HASH-TABLE.3)
 (defun run-init-hash-table ()
@@ -19633,10 +20105,13 @@
                             (TYPEP (MAKE-HASH-TABLE) (FIND-CLASS 'HASH-TABLE)))) 'T) (t (c) (%test-crash-fail-c 13104 c)))
 )
 (defun run-ansi-hash-table ()
-  (%try-chunk "hash-table" 2718990 1 #'run-ansi-hash-table-chunk-1)
+  (%try-chunk "hash-table" 12205326 1 #'run-ansi-hash-table-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;hash-table-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -19663,7 +20138,10 @@
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-hash-table.lsp ===
+(in-package :modus.mvm)
 (defun run-init-make-hash-table ()
   nil
 )
@@ -20009,13 +20487,16 @@
                                                                                   0)) (t (c) (%test-crash-fail-c 13133 c)))
 )
 (defun run-ansi-make-hash-table ()
-  (%try-chunk "make-hash-table" 15638049 1 #'run-ansi-make-hash-table-chunk-1)
-  (%try-chunk "make-hash-table" 15638049 2 #'run-ansi-make-hash-table-chunk-2)
-  (%try-chunk "make-hash-table" 15638049 3 #'run-ansi-make-hash-table-chunk-3)
-  (%try-chunk "make-hash-table" 15638049 4 #'run-ansi-make-hash-table-chunk-4)
+  (%try-chunk "make-hash-table" 13098529 1 #'run-ansi-make-hash-table-chunk-1)
+  (%try-chunk "make-hash-table" 13098529 2 #'run-ansi-make-hash-table-chunk-2)
+  (%try-chunk "make-hash-table" 13098529 3 #'run-ansi-make-hash-table-chunk-3)
+  (%try-chunk "make-hash-table" 13098529 4 #'run-ansi-make-hash-table-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === maphash.lsp ===
+(in-package :modus.mvm)
 (defun run-init-maphash ()
   nil
 )
@@ -20225,11 +20706,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13145 c)))
 )
 (defun run-ansi-maphash ()
-  (%try-chunk "maphash" 11574953 1 #'run-ansi-maphash-chunk-1)
-  (%try-chunk "maphash" 11574953 2 #'run-ansi-maphash-chunk-2)
+  (%try-chunk "maphash" 6774441 1 #'run-ansi-maphash-chunk-1)
+  (%try-chunk "maphash" 6774441 2 #'run-ansi-maphash-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === remhash.lsp ===
+(in-package :modus.mvm)
 (defun run-init-remhash ()
   nil
 )
@@ -20334,11 +20818,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13155 c)))
 )
 (defun run-ansi-remhash ()
-  (%try-chunk "remhash" 11127887 1 #'run-ansi-remhash-chunk-1)
-  (%try-chunk "remhash" 11127887 2 #'run-ansi-remhash-chunk-2)
+  (%try-chunk "remhash" 8768591 1 #'run-ansi-remhash-chunk-1)
+  (%try-chunk "remhash" 8768591 2 #'run-ansi-remhash-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === sxhash.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP SXHASH.15 "segmentation fault")
 (DEFSKIP SXHASH.16 "infinite loop")
 (defun run-init-sxhash ()
@@ -20552,12 +21039,15 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13177 c)))
 )
 (defun run-ansi-sxhash ()
-  (%try-chunk "sxhash" 1297662 1 #'run-ansi-sxhash-chunk-1)
-  (%try-chunk "sxhash" 1297662 2 #'run-ansi-sxhash-chunk-2)
-  (%try-chunk "sxhash" 1297662 3 #'run-ansi-sxhash-chunk-3)
+  (%try-chunk "sxhash" 4492542 1 #'run-ansi-sxhash-chunk-1)
+  (%try-chunk "sxhash" 4492542 2 #'run-ansi-sxhash-chunk-2)
+  (%try-chunk "sxhash" 4492542 3 #'run-ansi-sxhash-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-hash-table-iterator.lsp ===
+(in-package :modus.mvm)
 (defun run-init-with-hash-table-iterator ()
   nil
 )
@@ -20920,11 +21410,14 @@
                                      (DECLARE (SPECIAL X)))))))) ':GOOD) (t (c) (%test-crash-fail-c 13190 c)))
 )
 (defun run-ansi-with-hash-table-iterator ()
-  (%try-chunk "with-hash-table-iterator" 11873078 1 #'run-ansi-with-hash-table-iterator-chunk-1)
-  (%try-chunk "with-hash-table-iterator" 11873078 2 #'run-ansi-with-hash-table-iterator-chunk-2)
+  (%try-chunk "with-hash-table-iterator" 12364598 1 #'run-ansi-with-hash-table-iterator-chunk-1)
+  (%try-chunk "with-hash-table-iterator" 12364598 2 #'run-ansi-with-hash-table-iterator-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === abs.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ABS.14 "complex number")
 (DEFSKIP ABS.15 "complex number")
 (DEFSKIP ABS.16 "complex number")
@@ -21023,11 +21516,14 @@
                              (ABS -4))) '4) (t (c) (%test-crash-fail-c 13203 c)))
 )
 (defun run-ansi-abs ()
-  (%try-chunk "abs" 15716279 1 #'run-ansi-abs-chunk-1)
-  (%try-chunk "abs" 15716279 2 #'run-ansi-abs-chunk-2)
+  (%try-chunk "abs" 2543543 1 #'run-ansi-abs-chunk-1)
+  (%try-chunk "abs" 2543543 2 #'run-ansi-abs-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === acos.lsp ===
+(in-package :modus.mvm)
 (defun run-init-acos ()
   nil
 )
@@ -21111,11 +21607,14 @@
   (handler-case (run-test 13215 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13215 c)))
 )
 (defun run-ansi-acos ()
-  (%try-chunk "acos" 8096977 1 #'run-ansi-acos-chunk-1)
-  (%try-chunk "acos" 8096977 2 #'run-ansi-acos-chunk-2)
+  (%try-chunk "acos" 10996945 1 #'run-ansi-acos-chunk-1)
+  (%try-chunk "acos" 10996945 2 #'run-ansi-acos-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === acosh.lsp ===
+(in-package :modus.mvm)
 (defun run-init-acosh ()
   nil
 )
@@ -21189,11 +21688,14 @@
   (handler-case (run-test 13225 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13225 c)))
 )
 (defun run-ansi-acosh ()
-  (%try-chunk "acosh" 15982897 1 #'run-ansi-acosh-chunk-1)
-  (%try-chunk "acosh" 15982897 2 #'run-ansi-acosh-chunk-2)
+  (%try-chunk "acosh" 1925425 1 #'run-ansi-acosh-chunk-1)
+  (%try-chunk "acosh" 1925425 2 #'run-ansi-acosh-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === arithmetic-error.lsp ===
+(in-package :modus.mvm)
 (defun run-init-arithmetic-error ()
   nil
 )
@@ -21286,10 +21788,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13232 c)))
 )
 (defun run-ansi-arithmetic-error ()
-  (%try-chunk "arithmetic-error" 5812498 1 #'run-ansi-arithmetic-error-chunk-1)
+  (%try-chunk "arithmetic-error" 12366098 1 #'run-ansi-arithmetic-error-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === ash.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ash ()
   nil
 )
@@ -21338,11 +21843,14 @@
                                                       I X Y)))) '(4 2 1 2)) (t (c) (%test-crash-fail-c 13244 c)))
 )
 (defun run-ansi-ash ()
-  (%try-chunk "ash" 15610725 1 #'run-ansi-ash-chunk-1)
-  (%try-chunk "ash" 15610725 2 #'run-ansi-ash-chunk-2)
+  (%try-chunk "ash" 16249701 1 #'run-ansi-ash-chunk-1)
+  (%try-chunk "ash" 16249701 2 #'run-ansi-ash-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === asin.lsp ===
+(in-package :modus.mvm)
 (defun run-init-asin ()
   nil
 )
@@ -21426,11 +21934,14 @@
   (handler-case (run-test 13256 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13256 c)))
 )
 (defun run-ansi-asin ()
-  (%try-chunk "asin" 13619698 1 #'run-ansi-asin-chunk-1)
-  (%try-chunk "asin" 13619698 2 #'run-ansi-asin-chunk-2)
+  (%try-chunk "asin" 4821490 1 #'run-ansi-asin-chunk-1)
+  (%try-chunk "asin" 4821490 2 #'run-ansi-asin-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === asinh.lsp ===
+(in-package :modus.mvm)
 (defun run-init-asinh ()
   nil
 )
@@ -21502,11 +22013,14 @@
   (handler-case (run-test 13266 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13266 c)))
 )
 (defun run-ansi-asinh ()
-  (%try-chunk "asinh" 4188586 1 #'run-ansi-asinh-chunk-1)
-  (%try-chunk "asinh" 4188586 2 #'run-ansi-asinh-chunk-2)
+  (%try-chunk "asinh" 698794 1 #'run-ansi-asinh-chunk-1)
+  (%try-chunk "asinh" 698794 2 #'run-ansi-asinh-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === atan.lsp ===
+(in-package :modus.mvm)
 (defun run-init-atan ()
   nil
 )
@@ -21776,12 +22290,15 @@
   (handler-case (run-test 13287 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13287 c)))
 )
 (defun run-ansi-atan ()
-  (%try-chunk "atan" 11459045 1 #'run-ansi-atan-chunk-1)
-  (%try-chunk "atan" 11459045 2 #'run-ansi-atan-chunk-2)
-  (%try-chunk "atan" 11459045 3 #'run-ansi-atan-chunk-3)
+  (%try-chunk "atan" 8378853 1 #'run-ansi-atan-chunk-1)
+  (%try-chunk "atan" 8378853 2 #'run-ansi-atan-chunk-2)
+  (%try-chunk "atan" 8378853 3 #'run-ansi-atan-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === atanh.lsp ===
+(in-package :modus.mvm)
 (defun run-init-atanh ()
   nil
 )
@@ -21886,11 +22403,14 @@
   (handler-case (run-test 13299 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13299 c)))
 )
 (defun run-ansi-atanh ()
-  (%try-chunk "atanh" 13217061 1 #'run-ansi-atanh-chunk-1)
-  (%try-chunk "atanh" 13217061 2 #'run-ansi-atanh-chunk-2)
+  (%try-chunk "atanh" 12938533 1 #'run-ansi-atanh-chunk-1)
+  (%try-chunk "atanh" 12938533 2 #'run-ansi-atanh-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === boole.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *BOOLE-VAL-NAMES*
   '(BOOLE-1 BOOLE-2 BOOLE-AND BOOLE-ANDC1 BOOLE-ANDC2 BOOLE-C1 BOOLE-C2
     BOOLE-CLR BOOLE-EQV BOOLE-IOR BOOLE-NAND BOOLE-NOR BOOLE-ORC1 BOOLE-ORC2
@@ -22043,11 +22563,14 @@
                         #'(LAMBDA (X Y) (DECLARE (IGNORE X)) (LOGNOT Y))
                         (CONSTANTLY 0) #'LOGEQV #'LOGIOR #'LOGNAND #'LOGNOR
                         #'LOGORC1 #'LOGORC2 (CONSTANTLY -1) #'LOGXOR)) (t (c) nil))
-  (%try-chunk "boole" 7197500 1 #'run-ansi-boole-chunk-1)
-  (%try-chunk "boole" 7197500 2 #'run-ansi-boole-chunk-2)
+  (%try-chunk "boole" 3806012 1 #'run-ansi-boole-chunk-1)
+  (%try-chunk "boole" 3806012 2 #'run-ansi-boole-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === byte.lsp ===
+(in-package :modus.mvm)
 (defun run-init-byte ()
   nil
 )
@@ -22097,11 +22620,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13328 c)))
 )
 (defun run-ansi-byte ()
-  (%try-chunk "byte" 1990853 1 #'run-ansi-byte-chunk-1)
-  (%try-chunk "byte" 1990853 2 #'run-ansi-byte-chunk-2)
+  (%try-chunk "byte" 15196357 1 #'run-ansi-byte-chunk-1)
+  (%try-chunk "byte" 15196357 2 #'run-ansi-byte-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ceiling.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ceiling ()
   nil
 )
@@ -22216,12 +22742,15 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 13349 c)))
 )
 (defun run-ansi-ceiling ()
-  (%try-chunk "ceiling" 9423540 1 #'run-ansi-ceiling-chunk-1)
-  (%try-chunk "ceiling" 9423540 2 #'run-ansi-ceiling-chunk-2)
-  (%try-chunk "ceiling" 9423540 3 #'run-ansi-ceiling-chunk-3)
+  (%try-chunk "ceiling" 16255668 1 #'run-ansi-ceiling-chunk-1)
+  (%try-chunk "ceiling" 16255668 2 #'run-ansi-ceiling-chunk-2)
+  (%try-chunk "ceiling" 16255668 3 #'run-ansi-ceiling-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === cis.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP CIS.1 "complex number")
 (defun run-init-cis ()
   nil
@@ -22252,10 +22781,13 @@
                                  COLLECT (LIST X C (COS X) (SIN X)))) 'NIL) (t (c) (%test-crash-fail-c 13354 c)))
 )
 (defun run-ansi-cis ()
-  (%try-chunk "cis" 14277950 1 #'run-ansi-cis-chunk-1)
+  (%try-chunk "cis" 7183678 1 #'run-ansi-cis-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === complex.lsp ===
+(in-package :modus.mvm)
 (defun run-init-complex ()
   nil
 )
@@ -22297,10 +22829,13 @@
                                  COLLECT C)) 'NIL) (t (c) (%test-crash-fail-c 13361 c)))
 )
 (defun run-ansi-complex ()
-  (%try-chunk "complex" 12023575 1 #'run-ansi-complex-chunk-1)
+  (%try-chunk "complex" 2488087 1 #'run-ansi-complex-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === complexp.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP COMPLEXP.ERROR.3 "complex number")
 (defun run-init-complexp ()
   nil
@@ -22312,10 +22847,13 @@
   (handler-case (run-test 13364 (lambda () (CHECK-TYPE-PREDICATE #'COMPLEXP 'COMPLEX)) 'NIL) (t (c) (%test-crash-fail-c 13364 c)))
 )
 (defun run-ansi-complexp ()
-  (%try-chunk "complexp" 13137839 1 #'run-ansi-complexp-chunk-1)
+  (%try-chunk "complexp" 5339055 1 #'run-ansi-complexp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === conjugate.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP CONJUGATE.3 "complex number")
 (DEFSKIP CONJUGATE.4 "complex number")
 (DEFSKIP CONJUGATE.5 "complex number")
@@ -22344,10 +22882,13 @@
                                                   (IMAGPART XC))))) 'T) (t (c) (%test-crash-fail-c 13368 c)))
 )
 (defun run-ansi-conjugate ()
-  (%try-chunk "conjugate" 14172989 1 #'run-ansi-conjugate-chunk-1)
+  (%try-chunk "conjugate" 1786685 1 #'run-ansi-conjugate-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === cos.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cos ()
   nil
 )
@@ -22438,13 +22979,16 @@
   (handler-case (run-test 13395 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13395 c)))
 )
 (defun run-ansi-cos ()
-  (%try-chunk "cos" 14264600 1 #'run-ansi-cos-chunk-1)
-  (%try-chunk "cos" 14264600 2 #'run-ansi-cos-chunk-2)
-  (%try-chunk "cos" 14264600 3 #'run-ansi-cos-chunk-3)
-  (%try-chunk "cos" 14264600 4 #'run-ansi-cos-chunk-4)
+  (%try-chunk "cos" 7285016 1 #'run-ansi-cos-chunk-1)
+  (%try-chunk "cos" 7285016 2 #'run-ansi-cos-chunk-2)
+  (%try-chunk "cos" 7285016 3 #'run-ansi-cos-chunk-3)
+  (%try-chunk "cos" 7285016 4 #'run-ansi-cos-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === cosh.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cosh ()
   nil
 )
@@ -22515,11 +23059,14 @@
   (handler-case (run-test 13404 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 13404 c)))
 )
 (defun run-ansi-cosh ()
-  (%try-chunk "cosh" 11263184 1 #'run-ansi-cosh-chunk-1)
-  (%try-chunk "cosh" 11263184 2 #'run-ansi-cosh-chunk-2)
+  (%try-chunk "cosh" 13049040 1 #'run-ansi-cosh-chunk-1)
+  (%try-chunk "cosh" 13049040 2 #'run-ansi-cosh-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === decf.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP DECF.18 "complex number")
 (DEFSKIP DECF.19 "complex number")
 (DEFSKIP DECF.20 "complex number")
@@ -22658,12 +23205,15 @@
                                                                                     0)) (t (c) (%test-crash-fail-c 13426 c)))
 )
 (defun run-ansi-decf ()
-  (%try-chunk "decf" 6187971 1 #'run-ansi-decf-chunk-1)
-  (%try-chunk "decf" 6187971 2 #'run-ansi-decf-chunk-2)
-  (%try-chunk "decf" 6187971 3 #'run-ansi-decf-chunk-3)
+  (%try-chunk "decf" 12315587 1 #'run-ansi-decf-chunk-1)
+  (%try-chunk "decf" 12315587 2 #'run-ansi-decf-chunk-2)
+  (%try-chunk "decf" 12315587 3 #'run-ansi-decf-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === deposit-field.lsp ===
+(in-package :modus.mvm)
 (defun run-init-deposit-field ()
   nil
 )
@@ -22746,11 +23296,14 @@
                                  ALWAYS (EQL (DEPOSIT-FIELD -1 (BYTE 0 0) I) I))) 'T) (t (c) (%test-crash-fail-c 13435 c)))
 )
 (defun run-ansi-deposit-field ()
-  (%try-chunk "deposit-field" 10760120 1 #'run-ansi-deposit-field-chunk-1)
-  (%try-chunk "deposit-field" 10760120 2 #'run-ansi-deposit-field-chunk-2)
+  (%try-chunk "deposit-field" 10039224 1 #'run-ansi-deposit-field-chunk-1)
+  (%try-chunk "deposit-field" 10039224 2 #'run-ansi-deposit-field-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === divide.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP /.ERROR.1)
 (DEFSKIP /.ERROR.2)
 (DEFSKIP /.ERROR.3)
@@ -22866,11 +23419,14 @@
                                                                            5/7)) (t (c) (%test-crash-fail-c 13450 c)))
 )
 (defun run-ansi-divide ()
-  (%try-chunk "divide" 7019268 1 #'run-ansi-divide-chunk-1)
-  (%try-chunk "divide" 7019268 2 #'run-ansi-divide-chunk-2)
+  (%try-chunk "divide" 8133380 1 #'run-ansi-divide-chunk-1)
+  (%try-chunk "divide" 8133380 2 #'run-ansi-divide-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === dpb.lsp ===
+(in-package :modus.mvm)
 (defun run-init-dpb ()
   nil
 )
@@ -22944,11 +23500,14 @@
                                  ALWAYS (EQL (DPB -1 (BYTE 0 0) I) I))) 'T) (t (c) (%test-crash-fail-c 13459 c)))
 )
 (defun run-ansi-dpb ()
-  (%try-chunk "dpb" 13502849 1 #'run-ansi-dpb-chunk-1)
-  (%try-chunk "dpb" 13502849 2 #'run-ansi-dpb-chunk-2)
+  (%try-chunk "dpb" 7883137 1 #'run-ansi-dpb-chunk-1)
+  (%try-chunk "dpb" 7883137 2 #'run-ansi-dpb-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === epsilons.lsp ===
+(in-package :modus.mvm)
 (defun run-init-epsilons ()
   nil
 )
@@ -23052,11 +23611,14 @@
                                    (LIST EPS LONG-FLOAT-NEGATIVE-EPSILON))))) ':GOOD) (t (c) (%test-crash-fail-c 13472 c)))
 )
 (defun run-ansi-epsilons ()
-  (%try-chunk "epsilons" 9790646 1 #'run-ansi-epsilons-chunk-1)
-  (%try-chunk "epsilons" 9790646 2 #'run-ansi-epsilons-chunk-2)
+  (%try-chunk "epsilons" 3843254 1 #'run-ansi-epsilons-chunk-1)
+  (%try-chunk "epsilons" 3843254 2 #'run-ansi-epsilons-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === evenp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-evenp ()
   nil
 )
@@ -23102,11 +23664,14 @@
   (handler-case (run-test 13482 (lambda () (EVENP 100000000000000000000000000000001)) 'NIL) (t (c) (%test-crash-fail-c 13482 c)))
 )
 (defun run-ansi-evenp ()
-  (%try-chunk "evenp" 16163279 1 #'run-ansi-evenp-chunk-1)
-  (%try-chunk "evenp" 16163279 2 #'run-ansi-evenp-chunk-2)
+  (%try-chunk "evenp" 7135695 1 #'run-ansi-evenp-chunk-1)
+  (%try-chunk "evenp" 7135695 2 #'run-ansi-evenp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === exp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-exp ()
   nil
 )
@@ -23165,11 +23730,14 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13496 c)))
 )
 (defun run-ansi-exp ()
-  (%try-chunk "exp" 13735762 1 #'run-ansi-exp-chunk-1)
-  (%try-chunk "exp" 13735762 2 #'run-ansi-exp-chunk-2)
+  (%try-chunk "exp" 10622802 1 #'run-ansi-exp-chunk-1)
+  (%try-chunk "exp" 10622802 2 #'run-ansi-exp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === expt.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP EXPT.8 "complex number")
 (DEFSKIP EXPT.9 "complex number")
 (DEFSKIP EXPT.10 "complex number")
@@ -23278,13 +23846,16 @@
   (handler-case (run-test 13527 (lambda () (<= (REALPART (EXPT -8 1/3)) 0.0)) 'NIL) (t (c) (%test-crash-fail-c 13527 c)))
 )
 (defun run-ansi-expt ()
-  (%try-chunk "expt" 14516502 1 #'run-ansi-expt-chunk-1)
-  (%try-chunk "expt" 14516502 2 #'run-ansi-expt-chunk-2)
-  (%try-chunk "expt" 14516502 3 #'run-ansi-expt-chunk-3)
-  (%try-chunk "expt" 14516502 4 #'run-ansi-expt-chunk-4)
+  (%try-chunk "expt" 1376534 1 #'run-ansi-expt-chunk-1)
+  (%try-chunk "expt" 1376534 2 #'run-ansi-expt-chunk-2)
+  (%try-chunk "expt" 1376534 3 #'run-ansi-expt-chunk-3)
+  (%try-chunk "expt" 1376534 4 #'run-ansi-expt-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === fceiling.lsp ===
+(in-package :modus.mvm)
 (defun run-init-fceiling ()
   nil
 )
@@ -23409,11 +23980,14 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 13540 c)))
 )
 (defun run-ansi-fceiling ()
-  (%try-chunk "fceiling" 15703994 1 #'run-ansi-fceiling-chunk-1)
-  (%try-chunk "fceiling" 15703994 2 #'run-ansi-fceiling-chunk-2)
+  (%try-chunk "fceiling" 10690490 1 #'run-ansi-fceiling-chunk-1)
+  (%try-chunk "fceiling" 10690490 2 #'run-ansi-fceiling-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ffloor.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ffloor ()
   nil
 )
@@ -23529,11 +24103,14 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 13553 c)))
 )
 (defun run-ansi-ffloor ()
-  (%try-chunk "ffloor" 14484697 1 #'run-ansi-ffloor-chunk-1)
-  (%try-chunk "ffloor" 14484697 2 #'run-ansi-ffloor-chunk-2)
+  (%try-chunk "ffloor" 3294425 1 #'run-ansi-ffloor-chunk-1)
+  (%try-chunk "ffloor" 3294425 2 #'run-ansi-ffloor-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === float.lsp ===
+(in-package :modus.mvm)
 (defun run-init-float ()
   nil
 )
@@ -23597,11 +24174,14 @@
                                  COLLECT X)) 'NIL) (t (c) (%test-crash-fail-c 13566 c)))
 )
 (defun run-ansi-float ()
-  (%try-chunk "float" 7442687 1 #'run-ansi-float-chunk-1)
-  (%try-chunk "float" 7442687 2 #'run-ansi-float-chunk-2)
+  (%try-chunk "float" 15290623 1 #'run-ansi-float-chunk-1)
+  (%try-chunk "float" 15290623 2 #'run-ansi-float-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === floatp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-floatp ()
   nil
 )
@@ -23614,10 +24194,13 @@
   (handler-case (run-test 13571 (lambda () (CHECK-TYPE-PREDICATE #'FLOATP 'FLOAT)) 'NIL) (t (c) (%test-crash-fail-c 13571 c)))
 )
 (defun run-ansi-floatp ()
-  (%try-chunk "floatp" 8080599 1 #'run-ansi-floatp-chunk-1)
+  (%try-chunk "floatp" 11259095 1 #'run-ansi-floatp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === floor.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP FLOOR.10 "no such function rationalp")
 (DEFSKIP FLOOR.11 "no such function rationalp")
 (defun run-init-floor ()
@@ -23706,12 +24289,15 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 13590 c)))
 )
 (defun run-ansi-floor ()
-  (%try-chunk "floor" 7406375 1 #'run-ansi-floor-chunk-1)
-  (%try-chunk "floor" 7406375 2 #'run-ansi-floor-chunk-2)
-  (%try-chunk "floor" 7406375 3 #'run-ansi-floor-chunk-3)
+  (%try-chunk "floor" 9388839 1 #'run-ansi-floor-chunk-1)
+  (%try-chunk "floor" 9388839 2 #'run-ansi-floor-chunk-2)
+  (%try-chunk "floor" 9388839 3 #'run-ansi-floor-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === fround.lsp ===
+(in-package :modus.mvm)
 (defun run-init-fround ()
   nil
 )
@@ -23821,11 +24407,14 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 13603 c)))
 )
 (defun run-ansi-fround ()
-  (%try-chunk "fround" 13923299 1 #'run-ansi-fround-chunk-1)
-  (%try-chunk "fround" 13923299 2 #'run-ansi-fround-chunk-2)
+  (%try-chunk "fround" 11924451 1 #'run-ansi-fround-chunk-1)
+  (%try-chunk "fround" 11924451 2 #'run-ansi-fround-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ftruncate.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ftruncate ()
   nil
 )
@@ -23950,11 +24539,14 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 13616 c)))
 )
 (defun run-ansi-ftruncate ()
-  (%try-chunk "ftruncate" 5909135 1 #'run-ansi-ftruncate-chunk-1)
-  (%try-chunk "ftruncate" 5909135 2 #'run-ansi-ftruncate-chunk-2)
+  (%try-chunk "ftruncate" 11856527 1 #'run-ansi-ftruncate-chunk-1)
+  (%try-chunk "ftruncate" 11856527 2 #'run-ansi-ftruncate-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === gcd.lsp ===
+(in-package :modus.mvm)
 (defun run-init-gcd ()
   nil
 )
@@ -24034,11 +24626,14 @@
                                                       I)))) '(0 1)) (t (c) (%test-crash-fail-c 13628 c)))
 )
 (defun run-ansi-gcd ()
-  (%try-chunk "gcd" 11527583 1 #'run-ansi-gcd-chunk-1)
-  (%try-chunk "gcd" 11527583 2 #'run-ansi-gcd-chunk-2)
+  (%try-chunk "gcd" 16278943 1 #'run-ansi-gcd-chunk-1)
+  (%try-chunk "gcd" 16278943 2 #'run-ansi-gcd-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === imagpart.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP IMAGPART.ERROR.2)
 (defun run-init-imagpart ()
   nil
@@ -24067,10 +24662,13 @@
                                  COLLECT (LIST X IP (* 0 X)))) 'NIL) (t (c) (%test-crash-fail-c 13634 c)))
 )
 (defun run-ansi-imagpart ()
-  (%try-chunk "imagpart" 13215922 1 #'run-ansi-imagpart-chunk-1)
+  (%try-chunk "imagpart" 15575218 1 #'run-ansi-imagpart-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === incf.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP INCF.18 "complex number")
 (DEFSKIP INCF.19 "complex number")
 (DEFSKIP INCF.20 "complex number")
@@ -24209,12 +24807,15 @@
                                                                                     2)) (t (c) (%test-crash-fail-c 13656 c)))
 )
 (defun run-ansi-incf ()
-  (%try-chunk "incf" 1146173 1 #'run-ansi-incf-chunk-1)
-  (%try-chunk "incf" 1146173 2 #'run-ansi-incf-chunk-2)
-  (%try-chunk "incf" 1146173 3 #'run-ansi-incf-chunk-3)
+  (%try-chunk "incf" 3996989 1 #'run-ansi-incf-chunk-1)
+  (%try-chunk "incf" 3996989 2 #'run-ansi-incf-chunk-2)
+  (%try-chunk "incf" 3996989 3 #'run-ansi-incf-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === integer-length.lsp ===
+(in-package :modus.mvm)
 (defun run-init-integer-length ()
   nil
 )
@@ -24256,10 +24857,13 @@
                                              (BIGNUM-EQL (1+ LEN) LEN2)))) 'T) (t (c) (%test-crash-fail-c 13664 c)))
 )
 (defun run-ansi-integer-length ()
-  (%try-chunk "integer-length" 16633216 1 #'run-ansi-integer-length-chunk-1)
+  (%try-chunk "integer-length" 16321920 1 #'run-ansi-integer-length-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === integerp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-integerp ()
   nil
 )
@@ -24276,10 +24880,13 @@
   (handler-case (run-test 13669 (lambda () (CHECK-TYPE-PREDICATE #'INTEGERP 'INTEGER)) 'NIL) (t (c) (%test-crash-fail-c 13669 c)))
 )
 (defun run-ansi-integerp ()
-  (%try-chunk "integerp" 3125225 1 #'run-ansi-integerp-chunk-1)
+  (%try-chunk "integerp" 782313 1 #'run-ansi-integerp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === isqrt.lsp ===
+(in-package :modus.mvm)
 (defun run-init-isqrt ()
   nil
 )
@@ -24319,10 +24926,13 @@
                                  COLLECT (LIST I S))) 'NIL) (t (c) (%test-crash-fail-c 13677 c)))
 )
 (defun run-ansi-isqrt ()
-  (%try-chunk "isqrt" 3237194 1 #'run-ansi-isqrt-chunk-1)
+  (%try-chunk "isqrt" 1746250 1 #'run-ansi-isqrt-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === lcm.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lcm ()
   nil
 )
@@ -24406,11 +25016,14 @@
                                                       I)))) '(0 1)) (t (c) (%test-crash-fail-c 13693 c)))
 )
 (defun run-ansi-lcm ()
-  (%try-chunk "lcm" 8979869 1 #'run-ansi-lcm-chunk-1)
-  (%try-chunk "lcm" 8979869 2 #'run-ansi-lcm-chunk-2)
+  (%try-chunk "lcm" 4965789 1 #'run-ansi-lcm-chunk-1)
+  (%try-chunk "lcm" 4965789 2 #'run-ansi-lcm-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ldb.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ldb ()
   nil
 )
@@ -24524,11 +25137,14 @@
                                                                             6)) (t (c) (%test-crash-fail-c 13703 c)))
 )
 (defun run-ansi-ldb ()
-  (%try-chunk "ldb" 9035405 1 #'run-ansi-ldb-chunk-1)
-  (%try-chunk "ldb" 9035405 2 #'run-ansi-ldb-chunk-2)
+  (%try-chunk "ldb" 8085133 1 #'run-ansi-ldb-chunk-1)
+  (%try-chunk "ldb" 8085133 2 #'run-ansi-ldb-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;numbers-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;random-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;floor-aux.lsp")
@@ -24642,7 +25258,10 @@
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === log.lsp ===
+(in-package :modus.mvm)
 (defun run-init-log ()
   nil
 )
@@ -24761,11 +25380,14 @@
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 13713 c)))
 )
 (defun run-ansi-log ()
-  (%try-chunk "log" 8936971 1 #'run-ansi-log-chunk-1)
-  (%try-chunk "log" 8936971 2 #'run-ansi-log-chunk-2)
+  (%try-chunk "log" 5004811 1 #'run-ansi-log-chunk-1)
+  (%try-chunk "log" 5004811 2 #'run-ansi-log-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logand.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logand ()
   nil
 )
@@ -24848,11 +25470,14 @@
                                                       I A B C)))) '(16 3 1 2 3)) (t (c) (%test-crash-fail-c 13727 c)))
 )
 (defun run-ansi-logand ()
-  (%try-chunk "logand" 1228048 1 #'run-ansi-logand-chunk-1)
-  (%try-chunk "logand" 1228048 2 #'run-ansi-logand-chunk-2)
+  (%try-chunk "logand" 9878800 1 #'run-ansi-logand-chunk-1)
+  (%try-chunk "logand" 9878800 2 #'run-ansi-logand-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logandc1.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logandc1 ()
   nil
 )
@@ -24909,11 +25534,14 @@
                                                       I A B)))) '(-1 2 1 2)) (t (c) (%test-crash-fail-c 13739 c)))
 )
 (defun run-ansi-logandc1 ()
-  (%try-chunk "logandc1" 13892186 1 #'run-ansi-logandc1-chunk-1)
-  (%try-chunk "logandc1" 13892186 2 #'run-ansi-logandc1-chunk-2)
+  (%try-chunk "logandc1" 7846490 1 #'run-ansi-logandc1-chunk-1)
+  (%try-chunk "logandc1" 7846490 2 #'run-ansi-logandc1-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logandc2.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logandc2 ()
   nil
 )
@@ -24970,11 +25598,14 @@
                                                       I A B)))) '(-1 2 1 2)) (t (c) (%test-crash-fail-c 13751 c)))
 )
 (defun run-ansi-logandc2 ()
-  (%try-chunk "logandc2" 13892097 1 #'run-ansi-logandc2-chunk-1)
-  (%try-chunk "logandc2" 13892097 2 #'run-ansi-logandc2-chunk-2)
+  (%try-chunk "logandc2" 1243649 1 #'run-ansi-logandc2-chunk-1)
+  (%try-chunk "logandc2" 1243649 2 #'run-ansi-logandc2-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logbitp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logbitp ()
   nil
 )
@@ -25026,11 +25657,14 @@
                                                       I A B)))) '(NIL 2 1 2)) (t (c) (%test-crash-fail-c 13765 c)))
 )
 (defun run-ansi-logbitp ()
-  (%try-chunk "logbitp" 15997228 1 #'run-ansi-logbitp-chunk-1)
-  (%try-chunk "logbitp" 15997228 2 #'run-ansi-logbitp-chunk-2)
+  (%try-chunk "logbitp" 11606316 1 #'run-ansi-logbitp-chunk-1)
+  (%try-chunk "logbitp" 11606316 2 #'run-ansi-logbitp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logcount.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logcount ()
   nil
 )
@@ -25067,11 +25701,14 @@
                                  COLLECT Y)) 'NIL) (t (c) (%test-crash-fail-c 13776 c)))
 )
 (defun run-ansi-logcount ()
-  (%try-chunk "logcount" 13410768 1 #'run-ansi-logcount-chunk-1)
-  (%try-chunk "logcount" 13410768 2 #'run-ansi-logcount-chunk-2)
+  (%try-chunk "logcount" 11149776 1 #'run-ansi-logcount-chunk-1)
+  (%try-chunk "logcount" 11149776 2 #'run-ansi-logcount-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logeqv.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logeqv ()
   nil
 )
@@ -25148,11 +25785,14 @@
                                                       I A B C)))) '(56 3 1 2 3)) (t (c) (%test-crash-fail-c 13788 c)))
 )
 (defun run-ansi-logeqv ()
-  (%try-chunk "logeqv" 3975033 1 #'run-ansi-logeqv-chunk-1)
-  (%try-chunk "logeqv" 3975033 2 #'run-ansi-logeqv-chunk-2)
+  (%try-chunk "logeqv" 5039993 1 #'run-ansi-logeqv-chunk-1)
+  (%try-chunk "logeqv" 5039993 2 #'run-ansi-logeqv-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logior.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logior ()
   nil
 )
@@ -25223,11 +25863,14 @@
                                                       I A B C)))) '(55 3 1 2 3)) (t (c) (%test-crash-fail-c 13800 c)))
 )
 (defun run-ansi-logior ()
-  (%try-chunk "logior" 11496783 1 #'run-ansi-logior-chunk-1)
-  (%try-chunk "logior" 11496783 2 #'run-ansi-logior-chunk-2)
+  (%try-chunk "logior" 4549967 1 #'run-ansi-logior-chunk-1)
+  (%try-chunk "logior" 4549967 2 #'run-ansi-logior-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === lognand.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lognand ()
   nil
 )
@@ -25283,11 +25926,14 @@
                                                       I A B)))) '(3 2 1 2)) (t (c) (%test-crash-fail-c 13812 c)))
 )
 (defun run-ansi-lognand ()
-  (%try-chunk "lognand" 10810902 1 #'run-ansi-lognand-chunk-1)
-  (%try-chunk "lognand" 10810902 2 #'run-ansi-lognand-chunk-2)
+  (%try-chunk "lognand" 12826134 1 #'run-ansi-lognand-chunk-1)
+  (%try-chunk "lognand" 12826134 2 #'run-ansi-lognand-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === lognor.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lognor ()
   nil
 )
@@ -25343,11 +25989,14 @@
                                                       I A B)))) '(0 2 1 2)) (t (c) (%test-crash-fail-c 13824 c)))
 )
 (defun run-ansi-lognor ()
-  (%try-chunk "lognor" 13428528 1 #'run-ansi-lognor-chunk-1)
-  (%try-chunk "lognor" 13428528 2 #'run-ansi-lognor-chunk-2)
+  (%try-chunk "lognor" 13575984 1 #'run-ansi-lognor-chunk-1)
+  (%try-chunk "lognor" 13575984 2 #'run-ansi-lognor-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === lognot.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lognot ()
   nil
 )
@@ -25374,10 +26023,13 @@
                                  COLLECT (LIST X Z))) 'NIL) (t (c) (%test-crash-fail-c 13831 c)))
 )
 (defun run-ansi-lognot ()
-  (%try-chunk "lognot" 13429062 1 #'run-ansi-lognot-chunk-1)
+  (%try-chunk "lognot" 371014 1 #'run-ansi-lognot-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === logorc1.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logorc1 ()
   nil
 )
@@ -25436,11 +26088,14 @@
                                                       I A B)))) '(19 2 1 2)) (t (c) (%test-crash-fail-c 13844 c)))
 )
 (defun run-ansi-logorc1 ()
-  (%try-chunk "logorc1" 2453612 1 #'run-ansi-logorc1-chunk-1)
-  (%try-chunk "logorc1" 2453612 2 #'run-ansi-logorc1-chunk-2)
+  (%try-chunk "logorc1" 3420268 1 #'run-ansi-logorc1-chunk-1)
+  (%try-chunk "logorc1" 3420268 2 #'run-ansi-logorc1-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logorc2.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logorc2 ()
   nil
 )
@@ -25499,11 +26154,14 @@
                                                       I A B)))) '(27 2 1 2)) (t (c) (%test-crash-fail-c 13857 c)))
 )
 (defun run-ansi-logorc2 ()
-  (%try-chunk "logorc2" 2453879 1 #'run-ansi-logorc2-chunk-1)
-  (%try-chunk "logorc2" 2453879 2 #'run-ansi-logorc2-chunk-2)
+  (%try-chunk "logorc2" 6451575 1 #'run-ansi-logorc2-chunk-1)
+  (%try-chunk "logorc2" 6451575 2 #'run-ansi-logorc2-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === logtest.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logtest ()
   nil
 )
@@ -25527,10 +26185,13 @@
   (handler-case (run-test 13865 (lambda () (NOTNOT-MV (LOGTEST 8 (LOGIOR 8 4)))) 'T) (t (c) (%test-crash-fail-c 13865 c)))
 )
 (defun run-ansi-logtest ()
-  (%try-chunk "logtest" 1415205 1 #'run-ansi-logtest-chunk-1)
+  (%try-chunk "logtest" 4347941 1 #'run-ansi-logtest-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === logxor.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logxor ()
   nil
 )
@@ -25610,11 +26271,14 @@
                                                       I A B C)))) '(56 3 1 2 3)) (t (c) (%test-crash-fail-c 13877 c)))
 )
 (defun run-ansi-logxor ()
-  (%try-chunk "logxor" 6550070 1 #'run-ansi-logxor-chunk-1)
-  (%try-chunk "logxor" 6550070 2 #'run-ansi-logxor-chunk-2)
+  (%try-chunk "logxor" 5157430 1 #'run-ansi-logxor-chunk-1)
+  (%try-chunk "logxor" 5157430 2 #'run-ansi-logxor-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-random-state.lsp ===
+(in-package :modus.mvm)
 (defun run-init-make-random-state ()
   nil
 )
@@ -25654,10 +26318,13 @@
                                   (FLOATP (RANDOM 1.0 RS2)) T))) 'T) (t (c) (%test-crash-fail-c 13885 c)))
 )
 (defun run-ansi-make-random-state ()
-  (%try-chunk "make-random-state" 7367849 1 #'run-ansi-make-random-state-chunk-1)
+  (%try-chunk "make-random-state" 15625385 1 #'run-ansi-make-random-state-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === mask-field.lsp ===
+(in-package :modus.mvm)
 (defun run-init-mask-field ()
   nil
 )
@@ -25773,11 +26440,14 @@
                                                                             6)) (t (c) (%test-crash-fail-c 13895 c)))
 )
 (defun run-ansi-mask-field ()
-  (%try-chunk "mask-field" 2142108 1 #'run-ansi-mask-field-chunk-1)
-  (%try-chunk "mask-field" 2142108 2 #'run-ansi-mask-field-chunk-2)
+  (%try-chunk "mask-field" 12857244 1 #'run-ansi-mask-field-chunk-1)
+  (%try-chunk "mask-field" 12857244 2 #'run-ansi-mask-field-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === max.lsp ===
+(in-package :modus.mvm)
 (defun run-init-max ()
   nil
 )
@@ -25937,14 +26607,17 @@
                                                                           4 5 6)) (t (c) (%test-crash-fail-c 13934 c)))
 )
 (defun run-ansi-max ()
-  (%try-chunk "max" 7290827 1 #'run-ansi-max-chunk-1)
-  (%try-chunk "max" 7290827 2 #'run-ansi-max-chunk-2)
-  (%try-chunk "max" 7290827 3 #'run-ansi-max-chunk-3)
-  (%try-chunk "max" 7290827 4 #'run-ansi-max-chunk-4)
-  (%try-chunk "max" 7290827 5 #'run-ansi-max-chunk-5)
+  (%try-chunk "max" 10387403 1 #'run-ansi-max-chunk-1)
+  (%try-chunk "max" 10387403 2 #'run-ansi-max-chunk-2)
+  (%try-chunk "max" 10387403 3 #'run-ansi-max-chunk-3)
+  (%try-chunk "max" 10387403 4 #'run-ansi-max-chunk-4)
+  (%try-chunk "max" 10387403 5 #'run-ansi-max-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === min.lsp ===
+(in-package :modus.mvm)
 (defun run-init-min ()
   nil
 )
@@ -26104,14 +26777,17 @@
                                                                           4 5 6)) (t (c) (%test-crash-fail-c 13973 c)))
 )
 (defun run-ansi-min ()
-  (%try-chunk "min" 7345829 1 #'run-ansi-min-chunk-1)
-  (%try-chunk "min" 7345829 2 #'run-ansi-min-chunk-2)
-  (%try-chunk "min" 7345829 3 #'run-ansi-min-chunk-3)
-  (%try-chunk "min" 7345829 4 #'run-ansi-min-chunk-4)
-  (%try-chunk "min" 7345829 5 #'run-ansi-min-chunk-5)
+  (%try-chunk "min" 3004069 1 #'run-ansi-min-chunk-1)
+  (%try-chunk "min" 3004069 2 #'run-ansi-min-chunk-2)
+  (%try-chunk "min" 3004069 3 #'run-ansi-min-chunk-3)
+  (%try-chunk "min" 3004069 4 #'run-ansi-min-chunk-4)
+  (%try-chunk "min" 3004069 5 #'run-ansi-min-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === minus.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP MINUS.9)
 (DEFSKIP SUBTRACT.6)
 (defun run-init-minus ()
@@ -26278,11 +26954,14 @@
                                  COLLECT (LIST I CI J CJ (- CI CJ)))) 'NIL) (t (c) (%test-crash-fail-c 13987 c)))
 )
 (defun run-ansi-minus ()
-  (%try-chunk "minus" 3513643 1 #'run-ansi-minus-chunk-1)
-  (%try-chunk "minus" 3513643 2 #'run-ansi-minus-chunk-2)
+  (%try-chunk "minus" 14933291 1 #'run-ansi-minus-chunk-1)
+  (%try-chunk "minus" 14933291 2 #'run-ansi-minus-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === minusp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-minusp ()
   nil
 )
@@ -26318,11 +26997,14 @@
                                             MOST-NEGATIVE-LONG-FLOAT))) 'NIL) (t (c) (%test-crash-fail-c 13997 c)))
 )
 (defun run-ansi-minusp ()
-  (%try-chunk "minusp" 10731459 1 #'run-ansi-minusp-chunk-1)
-  (%try-chunk "minusp" 10731459 2 #'run-ansi-minusp-chunk-2)
+  (%try-chunk "minusp" 229315 1 #'run-ansi-minusp-chunk-1)
+  (%try-chunk "minusp" 229315 2 #'run-ansi-minusp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === number-comparison.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP =.10 "complex number")
 (DEFSKIP =.11 "complex number")
 (DEFSKIP =.13 "complex number")
@@ -27610,26 +28292,29 @@
                                                                                   T)) (t (c) (%test-crash-fail-c 14126 c)))
 )
 (defun run-ansi-number-comparison ()
-  (%try-chunk "number-comparison" 16375224 1 #'run-ansi-number-comparison-chunk-1)
-  (%try-chunk "number-comparison" 16375224 2 #'run-ansi-number-comparison-chunk-2)
-  (%try-chunk "number-comparison" 16375224 3 #'run-ansi-number-comparison-chunk-3)
-  (%try-chunk "number-comparison" 16375224 4 #'run-ansi-number-comparison-chunk-4)
-  (%try-chunk "number-comparison" 16375224 5 #'run-ansi-number-comparison-chunk-5)
-  (%try-chunk "number-comparison" 16375224 6 #'run-ansi-number-comparison-chunk-6)
-  (%try-chunk "number-comparison" 16375224 7 #'run-ansi-number-comparison-chunk-7)
-  (%try-chunk "number-comparison" 16375224 8 #'run-ansi-number-comparison-chunk-8)
-  (%try-chunk "number-comparison" 16375224 9 #'run-ansi-number-comparison-chunk-9)
-  (%try-chunk "number-comparison" 16375224 10 #'run-ansi-number-comparison-chunk-10)
-  (%try-chunk "number-comparison" 16375224 11 #'run-ansi-number-comparison-chunk-11)
-  (%try-chunk "number-comparison" 16375224 12 #'run-ansi-number-comparison-chunk-12)
-  (%try-chunk "number-comparison" 16375224 13 #'run-ansi-number-comparison-chunk-13)
-  (%try-chunk "number-comparison" 16375224 14 #'run-ansi-number-comparison-chunk-14)
-  (%try-chunk "number-comparison" 16375224 15 #'run-ansi-number-comparison-chunk-15)
-  (%try-chunk "number-comparison" 16375224 16 #'run-ansi-number-comparison-chunk-16)
-  (%try-chunk "number-comparison" 16375224 17 #'run-ansi-number-comparison-chunk-17)
+  (%try-chunk "number-comparison" 12426680 1 #'run-ansi-number-comparison-chunk-1)
+  (%try-chunk "number-comparison" 12426680 2 #'run-ansi-number-comparison-chunk-2)
+  (%try-chunk "number-comparison" 12426680 3 #'run-ansi-number-comparison-chunk-3)
+  (%try-chunk "number-comparison" 12426680 4 #'run-ansi-number-comparison-chunk-4)
+  (%try-chunk "number-comparison" 12426680 5 #'run-ansi-number-comparison-chunk-5)
+  (%try-chunk "number-comparison" 12426680 6 #'run-ansi-number-comparison-chunk-6)
+  (%try-chunk "number-comparison" 12426680 7 #'run-ansi-number-comparison-chunk-7)
+  (%try-chunk "number-comparison" 12426680 8 #'run-ansi-number-comparison-chunk-8)
+  (%try-chunk "number-comparison" 12426680 9 #'run-ansi-number-comparison-chunk-9)
+  (%try-chunk "number-comparison" 12426680 10 #'run-ansi-number-comparison-chunk-10)
+  (%try-chunk "number-comparison" 12426680 11 #'run-ansi-number-comparison-chunk-11)
+  (%try-chunk "number-comparison" 12426680 12 #'run-ansi-number-comparison-chunk-12)
+  (%try-chunk "number-comparison" 12426680 13 #'run-ansi-number-comparison-chunk-13)
+  (%try-chunk "number-comparison" 12426680 14 #'run-ansi-number-comparison-chunk-14)
+  (%try-chunk "number-comparison" 12426680 15 #'run-ansi-number-comparison-chunk-15)
+  (%try-chunk "number-comparison" 12426680 16 #'run-ansi-number-comparison-chunk-16)
+  (%try-chunk "number-comparison" 12426680 17 #'run-ansi-number-comparison-chunk-17)
 )
 
+(in-package :modus.mvm)
+
 ;; === numberp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-numberp ()
   nil
 )
@@ -27642,10 +28327,13 @@
   (handler-case (run-test 14130 (lambda () (CHECK-TYPE-PREDICATE #'NUMBERP 'NUMBER)) 'NIL) (t (c) (%test-crash-fail-c 14130 c)))
 )
 (defun run-ansi-numberp ()
-  (%try-chunk "numberp" 518132 1 #'run-ansi-numberp-chunk-1)
+  (%try-chunk "numberp" 11806708 1 #'run-ansi-numberp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === numerator-denominator.lsp ===
+(in-package :modus.mvm)
 (defun run-init-numerator-denominator ()
   nil
 )
@@ -27721,11 +28409,14 @@
                                  COLLECT (LIST R N D))) 'NIL) (t (c) (%test-crash-fail-c 14139 c)))
 )
 (defun run-ansi-numerator-denominator ()
-  (%try-chunk "numerator-denominator" 5478273 1 #'run-ansi-numerator-denominator-chunk-1)
-  (%try-chunk "numerator-denominator" 5478273 2 #'run-ansi-numerator-denominator-chunk-2)
+  (%try-chunk "numerator-denominator" 14964609 1 #'run-ansi-numerator-denominator-chunk-1)
+  (%try-chunk "numerator-denominator" 14964609 2 #'run-ansi-numerator-denominator-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === oddp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-oddp ()
   nil
 )
@@ -27768,11 +28459,14 @@
   (handler-case (run-test 14149 (lambda () (ODDP 100000000000000000000000000000000)) 'NIL) (t (c) (%test-crash-fail-c 14149 c)))
 )
 (defun run-ansi-oddp ()
-  (%try-chunk "oddp" 10921936 1 #'run-ansi-oddp-chunk-1)
-  (%try-chunk "oddp" 10921936 2 #'run-ansi-oddp-chunk-2)
+  (%try-chunk "oddp" 1746896 1 #'run-ansi-oddp-chunk-1)
+  (%try-chunk "oddp" 1746896 2 #'run-ansi-oddp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === oneminus.lsp ===
+(in-package :modus.mvm)
 (defun run-init-oneminus ()
   nil
 )
@@ -27899,12 +28593,15 @@
                              (1- 2))) '1) (t (c) (%test-crash-fail-c 14167 c)))
 )
 (defun run-ansi-oneminus ()
-  (%try-chunk "oneminus" 8469207 1 #'run-ansi-oneminus-chunk-1)
-  (%try-chunk "oneminus" 8469207 2 #'run-ansi-oneminus-chunk-2)
-  (%try-chunk "oneminus" 8469207 3 #'run-ansi-oneminus-chunk-3)
+  (%try-chunk "oneminus" 11631319 1 #'run-ansi-oneminus-chunk-1)
+  (%try-chunk "oneminus" 11631319 2 #'run-ansi-oneminus-chunk-2)
+  (%try-chunk "oneminus" 11631319 3 #'run-ansi-oneminus-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === oneplus.lsp ===
+(in-package :modus.mvm)
 (defun run-init-oneplus ()
   nil
 )
@@ -28031,12 +28728,15 @@
                              (1+ 1))) '2) (t (c) (%test-crash-fail-c 14185 c)))
 )
 (defun run-ansi-oneplus ()
-  (%try-chunk "oneplus" 1808929 1 #'run-ansi-oneplus-chunk-1)
-  (%try-chunk "oneplus" 1808929 2 #'run-ansi-oneplus-chunk-2)
-  (%try-chunk "oneplus" 1808929 3 #'run-ansi-oneplus-chunk-3)
+  (%try-chunk "oneplus" 10279457 1 #'run-ansi-oneplus-chunk-1)
+  (%try-chunk "oneplus" 10279457 2 #'run-ansi-oneplus-chunk-2)
+  (%try-chunk "oneplus" 10279457 3 #'run-ansi-oneplus-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === parse-integer.lsp ===
+(in-package :modus.mvm)
 (defun run-init-parse-integer ()
   nil
 )
@@ -28411,16 +29111,19 @@
                                                                         4 5)) (t (c) (%test-crash-fail-c 14241 c)))
 )
 (defun run-ansi-parse-integer ()
-  (%try-chunk "parse-integer" 6797505 1 #'run-ansi-parse-integer-chunk-1)
-  (%try-chunk "parse-integer" 6797505 2 #'run-ansi-parse-integer-chunk-2)
-  (%try-chunk "parse-integer" 6797505 3 #'run-ansi-parse-integer-chunk-3)
-  (%try-chunk "parse-integer" 6797505 4 #'run-ansi-parse-integer-chunk-4)
-  (%try-chunk "parse-integer" 6797505 5 #'run-ansi-parse-integer-chunk-5)
-  (%try-chunk "parse-integer" 6797505 6 #'run-ansi-parse-integer-chunk-6)
-  (%try-chunk "parse-integer" 6797505 7 #'run-ansi-parse-integer-chunk-7)
+  (%try-chunk "parse-integer" 14219457 1 #'run-ansi-parse-integer-chunk-1)
+  (%try-chunk "parse-integer" 14219457 2 #'run-ansi-parse-integer-chunk-2)
+  (%try-chunk "parse-integer" 14219457 3 #'run-ansi-parse-integer-chunk-3)
+  (%try-chunk "parse-integer" 14219457 4 #'run-ansi-parse-integer-chunk-4)
+  (%try-chunk "parse-integer" 14219457 5 #'run-ansi-parse-integer-chunk-5)
+  (%try-chunk "parse-integer" 14219457 6 #'run-ansi-parse-integer-chunk-6)
+  (%try-chunk "parse-integer" 14219457 7 #'run-ansi-parse-integer-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === phase.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP PHASE.10 "complex number")
 (DEFSKIP PHASE.11 "complex number")
 (DEFSKIP PHASE.12 "complex number")
@@ -28453,11 +29156,14 @@
   (handler-case (run-test 14253 (lambda () (EQLT (PHASE -1/2) (COERCE PI 'SINGLE-FLOAT))) 'T) (t (c) (%test-crash-fail-c 14253 c)))
 )
 (defun run-ansi-phase ()
-  (%try-chunk "phase" 4204584 1 #'run-ansi-phase-chunk-1)
-  (%try-chunk "phase" 4204584 2 #'run-ansi-phase-chunk-2)
+  (%try-chunk "phase" 403496 1 #'run-ansi-phase-chunk-1)
+  (%try-chunk "phase" 403496 2 #'run-ansi-phase-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === plus.lsp ===
+(in-package :modus.mvm)
 (defun run-init-plus ()
   nil
 )
@@ -28867,14 +29573,17 @@
                                  COLLECT (LIST X EPS EPS2))) 'NIL) (t (c) (%test-crash-fail-c 14287 c)))
 )
 (defun run-ansi-plus ()
-  (%try-chunk "plus" 3350173 1 #'run-ansi-plus-chunk-1)
-  (%try-chunk "plus" 3350173 2 #'run-ansi-plus-chunk-2)
-  (%try-chunk "plus" 3350173 3 #'run-ansi-plus-chunk-3)
-  (%try-chunk "plus" 3350173 4 #'run-ansi-plus-chunk-4)
-  (%try-chunk "plus" 3350173 5 #'run-ansi-plus-chunk-5)
+  (%try-chunk "plus" 2973341 1 #'run-ansi-plus-chunk-1)
+  (%try-chunk "plus" 2973341 2 #'run-ansi-plus-chunk-2)
+  (%try-chunk "plus" 2973341 3 #'run-ansi-plus-chunk-3)
+  (%try-chunk "plus" 2973341 4 #'run-ansi-plus-chunk-4)
+  (%try-chunk "plus" 2973341 5 #'run-ansi-plus-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === plusp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-plusp ()
   nil
 )
@@ -28911,11 +29620,14 @@
                                             MOST-POSITIVE-LONG-FLOAT))) 'NIL) (t (c) (%test-crash-fail-c 14298 c)))
 )
 (defun run-ansi-plusp ()
-  (%try-chunk "plusp" 12956997 1 #'run-ansi-plusp-chunk-1)
-  (%try-chunk "plusp" 12956997 2 #'run-ansi-plusp-chunk-2)
+  (%try-chunk "plusp" 2094405 1 #'run-ansi-plusp-chunk-1)
+  (%try-chunk "plusp" 2094405 2 #'run-ansi-plusp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === random-state-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-random-state-p ()
   nil
 )
@@ -28929,10 +29641,13 @@
   (handler-case (run-test 14303 (lambda () (NOTNOT-MV (RANDOM-STATE-P (MAKE-RANDOM-STATE)))) 'T) (t (c) (%test-crash-fail-c 14303 c)))
 )
 (defun run-ansi-random-state-p ()
-  (%try-chunk "random-state-p" 1559547 1 #'run-ansi-random-state-p-chunk-1)
+  (%try-chunk "random-state-p" 9882619 1 #'run-ansi-random-state-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === random.lsp ===
+(in-package :modus.mvm)
 (defun run-init-random ()
   nil
 )
@@ -29009,11 +29724,14 @@
                                                                                   T)) (t (c) (%test-crash-fail-c 14314 c)))
 )
 (defun run-ansi-random ()
-  (%try-chunk "random" 11744836 1 #'run-ansi-random-chunk-1)
-  (%try-chunk "random" 11744836 2 #'run-ansi-random-chunk-2)
+  (%try-chunk "random" 14202436 1 #'run-ansi-random-chunk-1)
+  (%try-chunk "random" 14202436 2 #'run-ansi-random-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === rational.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP RATIONAL.1 "no such function integer-decode-float")
 (defun run-init-rational ()
   nil
@@ -29045,10 +29763,13 @@
                                              COLLECT (LIST X R X2)))) 'NIL) (t (c) (%test-crash-fail-c 14320 c)))
 )
 (defun run-ansi-rational ()
-  (%try-chunk "rational" 14180669 1 #'run-ansi-rational-chunk-1)
+  (%try-chunk "rational" 7659837 1 #'run-ansi-rational-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === rationalize.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP RATIONALIZE.1 "no such function integer-decode-float")
 (defun run-init-rationalize ()
   nil
@@ -29081,10 +29802,13 @@
                                              COLLECT (LIST X R X2)))) 'NIL) (t (c) (%test-crash-fail-c 14326 c)))
 )
 (defun run-ansi-rationalize ()
-  (%try-chunk "rationalize" 14445283 1 #'run-ansi-rationalize-chunk-1)
+  (%try-chunk "rationalize" 3599075 1 #'run-ansi-rationalize-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === rationalp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rationalp ()
   nil
 )
@@ -29107,10 +29831,13 @@
   (handler-case (run-test 14332 (lambda () (CHECK-TYPE-PREDICATE #'RATIONALP 'RATIONAL)) 'NIL) (t (c) (%test-crash-fail-c 14332 c)))
 )
 (defun run-ansi-rationalp ()
-  (%try-chunk "rationalp" 3792613 1 #'run-ansi-rationalp-chunk-1)
+  (%try-chunk "rationalp" 5136101 1 #'run-ansi-rationalp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === real.lsp ===
+(in-package :modus.mvm)
 (defun run-init-real ()
   nil
 )
@@ -29170,10 +29897,13 @@
                                  COLLECT (LIST I TP))) 'NIL) (t (c) (%test-crash-fail-c 14336 c)))
 )
 (defun run-ansi-real ()
-  (%try-chunk "real" 12200701 1 #'run-ansi-real-chunk-1)
+  (%try-chunk "real" 2583293 1 #'run-ansi-real-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === realp.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP REALP.3 "complex number")
 (defun run-init-realp ()
   nil
@@ -29191,10 +29921,13 @@
   (handler-case (run-test 14344 (lambda () (CHECK-TYPE-PREDICATE #'REALP 'REAL)) 'NIL) (t (c) (%test-crash-fail-c 14344 c)))
 )
 (defun run-ansi-realp ()
-  (%try-chunk "realp" 12113445 1 #'run-ansi-realp-chunk-1)
+  (%try-chunk "realp" 11392549 1 #'run-ansi-realp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === realpart.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP REALPART.ERROR.2 "complex number")
 (defun run-init-realpart ()
   nil
@@ -29225,10 +29958,13 @@
                                  COLLECT (LIST C RP IP C2))) 'NIL) (t (c) (%test-crash-fail-c 14350 c)))
 )
 (defun run-ansi-realpart ()
-  (%try-chunk "realpart" 10765218 1 #'run-ansi-realpart-chunk-1)
+  (%try-chunk "realpart" 5964706 1 #'run-ansi-realpart-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === round.lsp ===
+(in-package :modus.mvm)
 (defun run-init-round ()
   nil
 )
@@ -29332,12 +30068,15 @@
   (handler-case (run-test-mv 14373 (lambda () (multiple-value-list (ROUND 3/2))) '(2 -1/2)) (t (c) (%test-crash-fail-c 14373 c)))
 )
 (defun run-ansi-round ()
-  (%try-chunk "round" 15136445 1 #'run-ansi-round-chunk-1)
-  (%try-chunk "round" 15136445 2 #'run-ansi-round-chunk-2)
-  (%try-chunk "round" 15136445 3 #'run-ansi-round-chunk-3)
+  (%try-chunk "round" 8844989 1 #'run-ansi-round-chunk-1)
+  (%try-chunk "round" 8844989 2 #'run-ansi-round-chunk-2)
+  (%try-chunk "round" 8844989 3 #'run-ansi-round-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === signum.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP SIGNUM.8 "complex number")
 (DEFSKIP SIGNUM.9 "complex number")
 (defun run-init-signum ()
@@ -29406,11 +30145,14 @@
                                                       I)))) '(1 1)) (t (c) (%test-crash-fail-c 14385 c)))
 )
 (defun run-ansi-signum ()
-  (%try-chunk "signum" 14088884 1 #'run-ansi-signum-chunk-1)
-  (%try-chunk "signum" 14088884 2 #'run-ansi-signum-chunk-2)
+  (%try-chunk "signum" 1751732 1 #'run-ansi-signum-chunk-1)
+  (%try-chunk "signum" 1751732 2 #'run-ansi-signum-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === sin.lsp ===
+(in-package :modus.mvm)
 (defun run-init-sin ()
   nil
 )
@@ -29501,13 +30243,16 @@
   (handler-case (run-test 14412 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 14412 c)))
 )
 (defun run-ansi-sin ()
-  (%try-chunk "sin" 8769291 1 #'run-ansi-sin-chunk-1)
-  (%try-chunk "sin" 8769291 2 #'run-ansi-sin-chunk-2)
-  (%try-chunk "sin" 8769291 3 #'run-ansi-sin-chunk-3)
-  (%try-chunk "sin" 8769291 4 #'run-ansi-sin-chunk-4)
+  (%try-chunk "sin" 9129739 1 #'run-ansi-sin-chunk-1)
+  (%try-chunk "sin" 9129739 2 #'run-ansi-sin-chunk-2)
+  (%try-chunk "sin" 9129739 3 #'run-ansi-sin-chunk-3)
+  (%try-chunk "sin" 9129739 4 #'run-ansi-sin-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === sinh.lsp ===
+(in-package :modus.mvm)
 (defun run-init-sinh ()
   nil
 )
@@ -29576,11 +30321,14 @@
   (handler-case (run-test 14421 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 14421 c)))
 )
 (defun run-ansi-sinh ()
-  (%try-chunk "sinh" 8719947 1 #'run-ansi-sinh-chunk-1)
-  (%try-chunk "sinh" 8719947 2 #'run-ansi-sinh-chunk-2)
+  (%try-chunk "sinh" 4181579 1 #'run-ansi-sinh-chunk-1)
+  (%try-chunk "sinh" 4181579 2 #'run-ansi-sinh-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === sqrt.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP SQRT.6)
 (DEFSKIP SQRT.7 "complex number")
 (DEFSKIP SQRT.9 "no such function rational")
@@ -29703,12 +30451,15 @@
                                  COLLECT (LIST X S))) 'NIL) (t (c) (%test-crash-fail-c 14440 c)))
 )
 (defun run-ansi-sqrt ()
-  (%try-chunk "sqrt" 4314803 1 #'run-ansi-sqrt-chunk-1)
-  (%try-chunk "sqrt" 4314803 2 #'run-ansi-sqrt-chunk-2)
-  (%try-chunk "sqrt" 4314803 3 #'run-ansi-sqrt-chunk-3)
+  (%try-chunk "sqrt" 251571 1 #'run-ansi-sqrt-chunk-1)
+  (%try-chunk "sqrt" 251571 2 #'run-ansi-sqrt-chunk-2)
+  (%try-chunk "sqrt" 251571 3 #'run-ansi-sqrt-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === tan.lsp ===
+(in-package :modus.mvm)
 (defun run-init-tan ()
   nil
 )
@@ -29791,13 +30542,16 @@
   (handler-case (run-test 14467 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 14467 c)))
 )
 (defun run-ansi-tan ()
-  (%try-chunk "tan" 9127516 1 #'run-ansi-tan-chunk-1)
-  (%try-chunk "tan" 9127516 2 #'run-ansi-tan-chunk-2)
-  (%try-chunk "tan" 9127516 3 #'run-ansi-tan-chunk-3)
-  (%try-chunk "tan" 9127516 4 #'run-ansi-tan-chunk-4)
+  (%try-chunk "tan" 15599196 1 #'run-ansi-tan-chunk-1)
+  (%try-chunk "tan" 15599196 2 #'run-ansi-tan-chunk-2)
+  (%try-chunk "tan" 15599196 3 #'run-ansi-tan-chunk-3)
+  (%try-chunk "tan" 15599196 4 #'run-ansi-tan-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === tanh.lsp ===
+(in-package :modus.mvm)
 (defun run-init-tanh ()
   nil
 )
@@ -29866,11 +30620,14 @@
   (handler-case (run-test 14476 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 14476 c)))
 )
 (defun run-ansi-tanh ()
-  (%try-chunk "tanh" 7036148 1 #'run-ansi-tanh-chunk-1)
-  (%try-chunk "tanh" 7036148 2 #'run-ansi-tanh-chunk-2)
+  (%try-chunk "tanh" 11803892 1 #'run-ansi-tanh-chunk-1)
+  (%try-chunk "tanh" 11803892 2 #'run-ansi-tanh-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === times.lsp ===
+(in-package :modus.mvm)
 (defun run-init-times ()
   nil
 )
@@ -30245,13 +31002,16 @@
                                                       I X Y Z)))) '(30 3 1 2 3)) (t (c) (%test-crash-fail-c 14506 c)))
 )
 (defun run-ansi-times ()
-  (%try-chunk "times" 1297777 1 #'run-ansi-times-chunk-1)
-  (%try-chunk "times" 1297777 2 #'run-ansi-times-chunk-2)
-  (%try-chunk "times" 1297777 3 #'run-ansi-times-chunk-3)
-  (%try-chunk "times" 1297777 4 #'run-ansi-times-chunk-4)
+  (%try-chunk "times" 1396081 1 #'run-ansi-times-chunk-1)
+  (%try-chunk "times" 1396081 2 #'run-ansi-times-chunk-2)
+  (%try-chunk "times" 1396081 3 #'run-ansi-times-chunk-3)
+  (%try-chunk "times" 1396081 4 #'run-ansi-times-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === truncate.lsp ===
+(in-package :modus.mvm)
 (defun run-init-truncate ()
   nil
 )
@@ -30362,12 +31122,15 @@
                                    COLLECT (LIST I X Q R)))) 'NIL) (t (c) (%test-crash-fail-c 14527 c)))
 )
 (defun run-ansi-truncate ()
-  (%try-chunk "truncate" 2988993 1 #'run-ansi-truncate-chunk-1)
-  (%try-chunk "truncate" 2988993 2 #'run-ansi-truncate-chunk-2)
-  (%try-chunk "truncate" 2988993 3 #'run-ansi-truncate-chunk-3)
+  (%try-chunk "truncate" 10345409 1 #'run-ansi-truncate-chunk-1)
+  (%try-chunk "truncate" 10345409 2 #'run-ansi-truncate-chunk-2)
+  (%try-chunk "truncate" 10345409 3 #'run-ansi-truncate-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === upgraded-complex-part-type.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-UCPT-TEST (NAME TYPES)
   `(DEFTEST ,NAME
     (LOOP FOR TYPE IN (REMOVE-DUPLICATES ,TYPES)
@@ -30453,10 +31216,13 @@
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 14532 c)))
 )
 (defun run-ansi-upgraded-complex-part-type ()
-  (%try-chunk "upgraded-complex-part-type" 7915633 1 #'run-ansi-upgraded-complex-part-type-chunk-1)
+  (%try-chunk "upgraded-complex-part-type" 12535921 1 #'run-ansi-upgraded-complex-part-type-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === zerop.lsp ===
+(in-package :modus.mvm)
 (defun run-init-zerop ()
   nil
 )
@@ -30508,11 +31274,14 @@
   (handler-case (run-test 14547 (lambda () (NOTEVERY #'ZEROP (LIST -0.0 -0.0 -0.0d0 -0.0d0))) 'NIL) (t (c) (%test-crash-fail-c 14547 c)))
 )
 (defun run-ansi-zerop ()
-  (%try-chunk "zerop" 1077189 1 #'run-ansi-zerop-chunk-1)
-  (%try-chunk "zerop" 1077189 2 #'run-ansi-zerop-chunk-2)
+  (%try-chunk "zerop" 10645445 1 #'run-ansi-zerop-chunk-1)
+  (%try-chunk "zerop" 10645445 2 #'run-ansi-zerop-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === boundp.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-boundp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -30547,11 +31316,14 @@
 )
 (defun run-ansi-boundp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "boundp" 12937045 1 #'run-ansi-boundp-chunk-1)
-  (%try-chunk "boundp" 12937045 2 #'run-ansi-boundp-chunk-2)
+  (%try-chunk "boundp" 5269333 1 #'run-ansi-boundp-chunk-1)
+  (%try-chunk "boundp" 5269333 2 #'run-ansi-boundp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === cl-symbols.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-cl-symbols ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -31942,135 +32714,138 @@
 )
 (defun run-ansi-cl-symbols ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "cl-symbols" 4927112 1 #'run-ansi-cl-symbols-chunk-1)
-  (%try-chunk "cl-symbols" 4927112 2 #'run-ansi-cl-symbols-chunk-2)
-  (%try-chunk "cl-symbols" 4927112 3 #'run-ansi-cl-symbols-chunk-3)
-  (%try-chunk "cl-symbols" 4927112 4 #'run-ansi-cl-symbols-chunk-4)
-  (%try-chunk "cl-symbols" 4927112 5 #'run-ansi-cl-symbols-chunk-5)
-  (%try-chunk "cl-symbols" 4927112 6 #'run-ansi-cl-symbols-chunk-6)
-  (%try-chunk "cl-symbols" 4927112 7 #'run-ansi-cl-symbols-chunk-7)
-  (%try-chunk "cl-symbols" 4927112 8 #'run-ansi-cl-symbols-chunk-8)
-  (%try-chunk "cl-symbols" 4927112 9 #'run-ansi-cl-symbols-chunk-9)
-  (%try-chunk "cl-symbols" 4927112 10 #'run-ansi-cl-symbols-chunk-10)
-  (%try-chunk "cl-symbols" 4927112 11 #'run-ansi-cl-symbols-chunk-11)
-  (%try-chunk "cl-symbols" 4927112 12 #'run-ansi-cl-symbols-chunk-12)
-  (%try-chunk "cl-symbols" 4927112 13 #'run-ansi-cl-symbols-chunk-13)
-  (%try-chunk "cl-symbols" 4927112 14 #'run-ansi-cl-symbols-chunk-14)
-  (%try-chunk "cl-symbols" 4927112 15 #'run-ansi-cl-symbols-chunk-15)
-  (%try-chunk "cl-symbols" 4927112 16 #'run-ansi-cl-symbols-chunk-16)
-  (%try-chunk "cl-symbols" 4927112 17 #'run-ansi-cl-symbols-chunk-17)
-  (%try-chunk "cl-symbols" 4927112 18 #'run-ansi-cl-symbols-chunk-18)
-  (%try-chunk "cl-symbols" 4927112 19 #'run-ansi-cl-symbols-chunk-19)
-  (%try-chunk "cl-symbols" 4927112 20 #'run-ansi-cl-symbols-chunk-20)
-  (%try-chunk "cl-symbols" 4927112 21 #'run-ansi-cl-symbols-chunk-21)
-  (%try-chunk "cl-symbols" 4927112 22 #'run-ansi-cl-symbols-chunk-22)
-  (%try-chunk "cl-symbols" 4927112 23 #'run-ansi-cl-symbols-chunk-23)
-  (%try-chunk "cl-symbols" 4927112 24 #'run-ansi-cl-symbols-chunk-24)
-  (%try-chunk "cl-symbols" 4927112 25 #'run-ansi-cl-symbols-chunk-25)
-  (%try-chunk "cl-symbols" 4927112 26 #'run-ansi-cl-symbols-chunk-26)
-  (%try-chunk "cl-symbols" 4927112 27 #'run-ansi-cl-symbols-chunk-27)
-  (%try-chunk "cl-symbols" 4927112 28 #'run-ansi-cl-symbols-chunk-28)
-  (%try-chunk "cl-symbols" 4927112 29 #'run-ansi-cl-symbols-chunk-29)
-  (%try-chunk "cl-symbols" 4927112 30 #'run-ansi-cl-symbols-chunk-30)
-  (%try-chunk "cl-symbols" 4927112 31 #'run-ansi-cl-symbols-chunk-31)
-  (%try-chunk "cl-symbols" 4927112 32 #'run-ansi-cl-symbols-chunk-32)
-  (%try-chunk "cl-symbols" 4927112 33 #'run-ansi-cl-symbols-chunk-33)
-  (%try-chunk "cl-symbols" 4927112 34 #'run-ansi-cl-symbols-chunk-34)
-  (%try-chunk "cl-symbols" 4927112 35 #'run-ansi-cl-symbols-chunk-35)
-  (%try-chunk "cl-symbols" 4927112 36 #'run-ansi-cl-symbols-chunk-36)
-  (%try-chunk "cl-symbols" 4927112 37 #'run-ansi-cl-symbols-chunk-37)
-  (%try-chunk "cl-symbols" 4927112 38 #'run-ansi-cl-symbols-chunk-38)
-  (%try-chunk "cl-symbols" 4927112 39 #'run-ansi-cl-symbols-chunk-39)
-  (%try-chunk "cl-symbols" 4927112 40 #'run-ansi-cl-symbols-chunk-40)
-  (%try-chunk "cl-symbols" 4927112 41 #'run-ansi-cl-symbols-chunk-41)
-  (%try-chunk "cl-symbols" 4927112 42 #'run-ansi-cl-symbols-chunk-42)
-  (%try-chunk "cl-symbols" 4927112 43 #'run-ansi-cl-symbols-chunk-43)
-  (%try-chunk "cl-symbols" 4927112 44 #'run-ansi-cl-symbols-chunk-44)
-  (%try-chunk "cl-symbols" 4927112 45 #'run-ansi-cl-symbols-chunk-45)
-  (%try-chunk "cl-symbols" 4927112 46 #'run-ansi-cl-symbols-chunk-46)
-  (%try-chunk "cl-symbols" 4927112 47 #'run-ansi-cl-symbols-chunk-47)
-  (%try-chunk "cl-symbols" 4927112 48 #'run-ansi-cl-symbols-chunk-48)
-  (%try-chunk "cl-symbols" 4927112 49 #'run-ansi-cl-symbols-chunk-49)
-  (%try-chunk "cl-symbols" 4927112 50 #'run-ansi-cl-symbols-chunk-50)
-  (%try-chunk "cl-symbols" 4927112 51 #'run-ansi-cl-symbols-chunk-51)
-  (%try-chunk "cl-symbols" 4927112 52 #'run-ansi-cl-symbols-chunk-52)
-  (%try-chunk "cl-symbols" 4927112 53 #'run-ansi-cl-symbols-chunk-53)
-  (%try-chunk "cl-symbols" 4927112 54 #'run-ansi-cl-symbols-chunk-54)
-  (%try-chunk "cl-symbols" 4927112 55 #'run-ansi-cl-symbols-chunk-55)
-  (%try-chunk "cl-symbols" 4927112 56 #'run-ansi-cl-symbols-chunk-56)
-  (%try-chunk "cl-symbols" 4927112 57 #'run-ansi-cl-symbols-chunk-57)
-  (%try-chunk "cl-symbols" 4927112 58 #'run-ansi-cl-symbols-chunk-58)
-  (%try-chunk "cl-symbols" 4927112 59 #'run-ansi-cl-symbols-chunk-59)
-  (%try-chunk "cl-symbols" 4927112 60 #'run-ansi-cl-symbols-chunk-60)
-  (%try-chunk "cl-symbols" 4927112 61 #'run-ansi-cl-symbols-chunk-61)
-  (%try-chunk "cl-symbols" 4927112 62 #'run-ansi-cl-symbols-chunk-62)
-  (%try-chunk "cl-symbols" 4927112 63 #'run-ansi-cl-symbols-chunk-63)
-  (%try-chunk "cl-symbols" 4927112 64 #'run-ansi-cl-symbols-chunk-64)
-  (%try-chunk "cl-symbols" 4927112 65 #'run-ansi-cl-symbols-chunk-65)
-  (%try-chunk "cl-symbols" 4927112 66 #'run-ansi-cl-symbols-chunk-66)
-  (%try-chunk "cl-symbols" 4927112 67 #'run-ansi-cl-symbols-chunk-67)
-  (%try-chunk "cl-symbols" 4927112 68 #'run-ansi-cl-symbols-chunk-68)
-  (%try-chunk "cl-symbols" 4927112 69 #'run-ansi-cl-symbols-chunk-69)
-  (%try-chunk "cl-symbols" 4927112 70 #'run-ansi-cl-symbols-chunk-70)
-  (%try-chunk "cl-symbols" 4927112 71 #'run-ansi-cl-symbols-chunk-71)
-  (%try-chunk "cl-symbols" 4927112 72 #'run-ansi-cl-symbols-chunk-72)
-  (%try-chunk "cl-symbols" 4927112 73 #'run-ansi-cl-symbols-chunk-73)
-  (%try-chunk "cl-symbols" 4927112 74 #'run-ansi-cl-symbols-chunk-74)
-  (%try-chunk "cl-symbols" 4927112 75 #'run-ansi-cl-symbols-chunk-75)
-  (%try-chunk "cl-symbols" 4927112 76 #'run-ansi-cl-symbols-chunk-76)
-  (%try-chunk "cl-symbols" 4927112 77 #'run-ansi-cl-symbols-chunk-77)
-  (%try-chunk "cl-symbols" 4927112 78 #'run-ansi-cl-symbols-chunk-78)
-  (%try-chunk "cl-symbols" 4927112 79 #'run-ansi-cl-symbols-chunk-79)
-  (%try-chunk "cl-symbols" 4927112 80 #'run-ansi-cl-symbols-chunk-80)
-  (%try-chunk "cl-symbols" 4927112 81 #'run-ansi-cl-symbols-chunk-81)
-  (%try-chunk "cl-symbols" 4927112 82 #'run-ansi-cl-symbols-chunk-82)
-  (%try-chunk "cl-symbols" 4927112 83 #'run-ansi-cl-symbols-chunk-83)
-  (%try-chunk "cl-symbols" 4927112 84 #'run-ansi-cl-symbols-chunk-84)
-  (%try-chunk "cl-symbols" 4927112 85 #'run-ansi-cl-symbols-chunk-85)
-  (%try-chunk "cl-symbols" 4927112 86 #'run-ansi-cl-symbols-chunk-86)
-  (%try-chunk "cl-symbols" 4927112 87 #'run-ansi-cl-symbols-chunk-87)
-  (%try-chunk "cl-symbols" 4927112 88 #'run-ansi-cl-symbols-chunk-88)
-  (%try-chunk "cl-symbols" 4927112 89 #'run-ansi-cl-symbols-chunk-89)
-  (%try-chunk "cl-symbols" 4927112 90 #'run-ansi-cl-symbols-chunk-90)
-  (%try-chunk "cl-symbols" 4927112 91 #'run-ansi-cl-symbols-chunk-91)
-  (%try-chunk "cl-symbols" 4927112 92 #'run-ansi-cl-symbols-chunk-92)
-  (%try-chunk "cl-symbols" 4927112 93 #'run-ansi-cl-symbols-chunk-93)
-  (%try-chunk "cl-symbols" 4927112 94 #'run-ansi-cl-symbols-chunk-94)
-  (%try-chunk "cl-symbols" 4927112 95 #'run-ansi-cl-symbols-chunk-95)
-  (%try-chunk "cl-symbols" 4927112 96 #'run-ansi-cl-symbols-chunk-96)
-  (%try-chunk "cl-symbols" 4927112 97 #'run-ansi-cl-symbols-chunk-97)
-  (%try-chunk "cl-symbols" 4927112 98 #'run-ansi-cl-symbols-chunk-98)
-  (%try-chunk "cl-symbols" 4927112 99 #'run-ansi-cl-symbols-chunk-99)
-  (%try-chunk "cl-symbols" 4927112 100 #'run-ansi-cl-symbols-chunk-100)
-  (%try-chunk "cl-symbols" 4927112 101 #'run-ansi-cl-symbols-chunk-101)
-  (%try-chunk "cl-symbols" 4927112 102 #'run-ansi-cl-symbols-chunk-102)
-  (%try-chunk "cl-symbols" 4927112 103 #'run-ansi-cl-symbols-chunk-103)
-  (%try-chunk "cl-symbols" 4927112 104 #'run-ansi-cl-symbols-chunk-104)
-  (%try-chunk "cl-symbols" 4927112 105 #'run-ansi-cl-symbols-chunk-105)
-  (%try-chunk "cl-symbols" 4927112 106 #'run-ansi-cl-symbols-chunk-106)
-  (%try-chunk "cl-symbols" 4927112 107 #'run-ansi-cl-symbols-chunk-107)
-  (%try-chunk "cl-symbols" 4927112 108 #'run-ansi-cl-symbols-chunk-108)
-  (%try-chunk "cl-symbols" 4927112 109 #'run-ansi-cl-symbols-chunk-109)
-  (%try-chunk "cl-symbols" 4927112 110 #'run-ansi-cl-symbols-chunk-110)
-  (%try-chunk "cl-symbols" 4927112 111 #'run-ansi-cl-symbols-chunk-111)
-  (%try-chunk "cl-symbols" 4927112 112 #'run-ansi-cl-symbols-chunk-112)
-  (%try-chunk "cl-symbols" 4927112 113 #'run-ansi-cl-symbols-chunk-113)
-  (%try-chunk "cl-symbols" 4927112 114 #'run-ansi-cl-symbols-chunk-114)
-  (%try-chunk "cl-symbols" 4927112 115 #'run-ansi-cl-symbols-chunk-115)
-  (%try-chunk "cl-symbols" 4927112 116 #'run-ansi-cl-symbols-chunk-116)
-  (%try-chunk "cl-symbols" 4927112 117 #'run-ansi-cl-symbols-chunk-117)
-  (%try-chunk "cl-symbols" 4927112 118 #'run-ansi-cl-symbols-chunk-118)
-  (%try-chunk "cl-symbols" 4927112 119 #'run-ansi-cl-symbols-chunk-119)
-  (%try-chunk "cl-symbols" 4927112 120 #'run-ansi-cl-symbols-chunk-120)
-  (%try-chunk "cl-symbols" 4927112 121 #'run-ansi-cl-symbols-chunk-121)
-  (%try-chunk "cl-symbols" 4927112 122 #'run-ansi-cl-symbols-chunk-122)
-  (%try-chunk "cl-symbols" 4927112 123 #'run-ansi-cl-symbols-chunk-123)
-  (%try-chunk "cl-symbols" 4927112 124 #'run-ansi-cl-symbols-chunk-124)
-  (%try-chunk "cl-symbols" 4927112 125 #'run-ansi-cl-symbols-chunk-125)
-  (%try-chunk "cl-symbols" 4927112 126 #'run-ansi-cl-symbols-chunk-126)
+  (%try-chunk "cl-symbols" 6139528 1 #'run-ansi-cl-symbols-chunk-1)
+  (%try-chunk "cl-symbols" 6139528 2 #'run-ansi-cl-symbols-chunk-2)
+  (%try-chunk "cl-symbols" 6139528 3 #'run-ansi-cl-symbols-chunk-3)
+  (%try-chunk "cl-symbols" 6139528 4 #'run-ansi-cl-symbols-chunk-4)
+  (%try-chunk "cl-symbols" 6139528 5 #'run-ansi-cl-symbols-chunk-5)
+  (%try-chunk "cl-symbols" 6139528 6 #'run-ansi-cl-symbols-chunk-6)
+  (%try-chunk "cl-symbols" 6139528 7 #'run-ansi-cl-symbols-chunk-7)
+  (%try-chunk "cl-symbols" 6139528 8 #'run-ansi-cl-symbols-chunk-8)
+  (%try-chunk "cl-symbols" 6139528 9 #'run-ansi-cl-symbols-chunk-9)
+  (%try-chunk "cl-symbols" 6139528 10 #'run-ansi-cl-symbols-chunk-10)
+  (%try-chunk "cl-symbols" 6139528 11 #'run-ansi-cl-symbols-chunk-11)
+  (%try-chunk "cl-symbols" 6139528 12 #'run-ansi-cl-symbols-chunk-12)
+  (%try-chunk "cl-symbols" 6139528 13 #'run-ansi-cl-symbols-chunk-13)
+  (%try-chunk "cl-symbols" 6139528 14 #'run-ansi-cl-symbols-chunk-14)
+  (%try-chunk "cl-symbols" 6139528 15 #'run-ansi-cl-symbols-chunk-15)
+  (%try-chunk "cl-symbols" 6139528 16 #'run-ansi-cl-symbols-chunk-16)
+  (%try-chunk "cl-symbols" 6139528 17 #'run-ansi-cl-symbols-chunk-17)
+  (%try-chunk "cl-symbols" 6139528 18 #'run-ansi-cl-symbols-chunk-18)
+  (%try-chunk "cl-symbols" 6139528 19 #'run-ansi-cl-symbols-chunk-19)
+  (%try-chunk "cl-symbols" 6139528 20 #'run-ansi-cl-symbols-chunk-20)
+  (%try-chunk "cl-symbols" 6139528 21 #'run-ansi-cl-symbols-chunk-21)
+  (%try-chunk "cl-symbols" 6139528 22 #'run-ansi-cl-symbols-chunk-22)
+  (%try-chunk "cl-symbols" 6139528 23 #'run-ansi-cl-symbols-chunk-23)
+  (%try-chunk "cl-symbols" 6139528 24 #'run-ansi-cl-symbols-chunk-24)
+  (%try-chunk "cl-symbols" 6139528 25 #'run-ansi-cl-symbols-chunk-25)
+  (%try-chunk "cl-symbols" 6139528 26 #'run-ansi-cl-symbols-chunk-26)
+  (%try-chunk "cl-symbols" 6139528 27 #'run-ansi-cl-symbols-chunk-27)
+  (%try-chunk "cl-symbols" 6139528 28 #'run-ansi-cl-symbols-chunk-28)
+  (%try-chunk "cl-symbols" 6139528 29 #'run-ansi-cl-symbols-chunk-29)
+  (%try-chunk "cl-symbols" 6139528 30 #'run-ansi-cl-symbols-chunk-30)
+  (%try-chunk "cl-symbols" 6139528 31 #'run-ansi-cl-symbols-chunk-31)
+  (%try-chunk "cl-symbols" 6139528 32 #'run-ansi-cl-symbols-chunk-32)
+  (%try-chunk "cl-symbols" 6139528 33 #'run-ansi-cl-symbols-chunk-33)
+  (%try-chunk "cl-symbols" 6139528 34 #'run-ansi-cl-symbols-chunk-34)
+  (%try-chunk "cl-symbols" 6139528 35 #'run-ansi-cl-symbols-chunk-35)
+  (%try-chunk "cl-symbols" 6139528 36 #'run-ansi-cl-symbols-chunk-36)
+  (%try-chunk "cl-symbols" 6139528 37 #'run-ansi-cl-symbols-chunk-37)
+  (%try-chunk "cl-symbols" 6139528 38 #'run-ansi-cl-symbols-chunk-38)
+  (%try-chunk "cl-symbols" 6139528 39 #'run-ansi-cl-symbols-chunk-39)
+  (%try-chunk "cl-symbols" 6139528 40 #'run-ansi-cl-symbols-chunk-40)
+  (%try-chunk "cl-symbols" 6139528 41 #'run-ansi-cl-symbols-chunk-41)
+  (%try-chunk "cl-symbols" 6139528 42 #'run-ansi-cl-symbols-chunk-42)
+  (%try-chunk "cl-symbols" 6139528 43 #'run-ansi-cl-symbols-chunk-43)
+  (%try-chunk "cl-symbols" 6139528 44 #'run-ansi-cl-symbols-chunk-44)
+  (%try-chunk "cl-symbols" 6139528 45 #'run-ansi-cl-symbols-chunk-45)
+  (%try-chunk "cl-symbols" 6139528 46 #'run-ansi-cl-symbols-chunk-46)
+  (%try-chunk "cl-symbols" 6139528 47 #'run-ansi-cl-symbols-chunk-47)
+  (%try-chunk "cl-symbols" 6139528 48 #'run-ansi-cl-symbols-chunk-48)
+  (%try-chunk "cl-symbols" 6139528 49 #'run-ansi-cl-symbols-chunk-49)
+  (%try-chunk "cl-symbols" 6139528 50 #'run-ansi-cl-symbols-chunk-50)
+  (%try-chunk "cl-symbols" 6139528 51 #'run-ansi-cl-symbols-chunk-51)
+  (%try-chunk "cl-symbols" 6139528 52 #'run-ansi-cl-symbols-chunk-52)
+  (%try-chunk "cl-symbols" 6139528 53 #'run-ansi-cl-symbols-chunk-53)
+  (%try-chunk "cl-symbols" 6139528 54 #'run-ansi-cl-symbols-chunk-54)
+  (%try-chunk "cl-symbols" 6139528 55 #'run-ansi-cl-symbols-chunk-55)
+  (%try-chunk "cl-symbols" 6139528 56 #'run-ansi-cl-symbols-chunk-56)
+  (%try-chunk "cl-symbols" 6139528 57 #'run-ansi-cl-symbols-chunk-57)
+  (%try-chunk "cl-symbols" 6139528 58 #'run-ansi-cl-symbols-chunk-58)
+  (%try-chunk "cl-symbols" 6139528 59 #'run-ansi-cl-symbols-chunk-59)
+  (%try-chunk "cl-symbols" 6139528 60 #'run-ansi-cl-symbols-chunk-60)
+  (%try-chunk "cl-symbols" 6139528 61 #'run-ansi-cl-symbols-chunk-61)
+  (%try-chunk "cl-symbols" 6139528 62 #'run-ansi-cl-symbols-chunk-62)
+  (%try-chunk "cl-symbols" 6139528 63 #'run-ansi-cl-symbols-chunk-63)
+  (%try-chunk "cl-symbols" 6139528 64 #'run-ansi-cl-symbols-chunk-64)
+  (%try-chunk "cl-symbols" 6139528 65 #'run-ansi-cl-symbols-chunk-65)
+  (%try-chunk "cl-symbols" 6139528 66 #'run-ansi-cl-symbols-chunk-66)
+  (%try-chunk "cl-symbols" 6139528 67 #'run-ansi-cl-symbols-chunk-67)
+  (%try-chunk "cl-symbols" 6139528 68 #'run-ansi-cl-symbols-chunk-68)
+  (%try-chunk "cl-symbols" 6139528 69 #'run-ansi-cl-symbols-chunk-69)
+  (%try-chunk "cl-symbols" 6139528 70 #'run-ansi-cl-symbols-chunk-70)
+  (%try-chunk "cl-symbols" 6139528 71 #'run-ansi-cl-symbols-chunk-71)
+  (%try-chunk "cl-symbols" 6139528 72 #'run-ansi-cl-symbols-chunk-72)
+  (%try-chunk "cl-symbols" 6139528 73 #'run-ansi-cl-symbols-chunk-73)
+  (%try-chunk "cl-symbols" 6139528 74 #'run-ansi-cl-symbols-chunk-74)
+  (%try-chunk "cl-symbols" 6139528 75 #'run-ansi-cl-symbols-chunk-75)
+  (%try-chunk "cl-symbols" 6139528 76 #'run-ansi-cl-symbols-chunk-76)
+  (%try-chunk "cl-symbols" 6139528 77 #'run-ansi-cl-symbols-chunk-77)
+  (%try-chunk "cl-symbols" 6139528 78 #'run-ansi-cl-symbols-chunk-78)
+  (%try-chunk "cl-symbols" 6139528 79 #'run-ansi-cl-symbols-chunk-79)
+  (%try-chunk "cl-symbols" 6139528 80 #'run-ansi-cl-symbols-chunk-80)
+  (%try-chunk "cl-symbols" 6139528 81 #'run-ansi-cl-symbols-chunk-81)
+  (%try-chunk "cl-symbols" 6139528 82 #'run-ansi-cl-symbols-chunk-82)
+  (%try-chunk "cl-symbols" 6139528 83 #'run-ansi-cl-symbols-chunk-83)
+  (%try-chunk "cl-symbols" 6139528 84 #'run-ansi-cl-symbols-chunk-84)
+  (%try-chunk "cl-symbols" 6139528 85 #'run-ansi-cl-symbols-chunk-85)
+  (%try-chunk "cl-symbols" 6139528 86 #'run-ansi-cl-symbols-chunk-86)
+  (%try-chunk "cl-symbols" 6139528 87 #'run-ansi-cl-symbols-chunk-87)
+  (%try-chunk "cl-symbols" 6139528 88 #'run-ansi-cl-symbols-chunk-88)
+  (%try-chunk "cl-symbols" 6139528 89 #'run-ansi-cl-symbols-chunk-89)
+  (%try-chunk "cl-symbols" 6139528 90 #'run-ansi-cl-symbols-chunk-90)
+  (%try-chunk "cl-symbols" 6139528 91 #'run-ansi-cl-symbols-chunk-91)
+  (%try-chunk "cl-symbols" 6139528 92 #'run-ansi-cl-symbols-chunk-92)
+  (%try-chunk "cl-symbols" 6139528 93 #'run-ansi-cl-symbols-chunk-93)
+  (%try-chunk "cl-symbols" 6139528 94 #'run-ansi-cl-symbols-chunk-94)
+  (%try-chunk "cl-symbols" 6139528 95 #'run-ansi-cl-symbols-chunk-95)
+  (%try-chunk "cl-symbols" 6139528 96 #'run-ansi-cl-symbols-chunk-96)
+  (%try-chunk "cl-symbols" 6139528 97 #'run-ansi-cl-symbols-chunk-97)
+  (%try-chunk "cl-symbols" 6139528 98 #'run-ansi-cl-symbols-chunk-98)
+  (%try-chunk "cl-symbols" 6139528 99 #'run-ansi-cl-symbols-chunk-99)
+  (%try-chunk "cl-symbols" 6139528 100 #'run-ansi-cl-symbols-chunk-100)
+  (%try-chunk "cl-symbols" 6139528 101 #'run-ansi-cl-symbols-chunk-101)
+  (%try-chunk "cl-symbols" 6139528 102 #'run-ansi-cl-symbols-chunk-102)
+  (%try-chunk "cl-symbols" 6139528 103 #'run-ansi-cl-symbols-chunk-103)
+  (%try-chunk "cl-symbols" 6139528 104 #'run-ansi-cl-symbols-chunk-104)
+  (%try-chunk "cl-symbols" 6139528 105 #'run-ansi-cl-symbols-chunk-105)
+  (%try-chunk "cl-symbols" 6139528 106 #'run-ansi-cl-symbols-chunk-106)
+  (%try-chunk "cl-symbols" 6139528 107 #'run-ansi-cl-symbols-chunk-107)
+  (%try-chunk "cl-symbols" 6139528 108 #'run-ansi-cl-symbols-chunk-108)
+  (%try-chunk "cl-symbols" 6139528 109 #'run-ansi-cl-symbols-chunk-109)
+  (%try-chunk "cl-symbols" 6139528 110 #'run-ansi-cl-symbols-chunk-110)
+  (%try-chunk "cl-symbols" 6139528 111 #'run-ansi-cl-symbols-chunk-111)
+  (%try-chunk "cl-symbols" 6139528 112 #'run-ansi-cl-symbols-chunk-112)
+  (%try-chunk "cl-symbols" 6139528 113 #'run-ansi-cl-symbols-chunk-113)
+  (%try-chunk "cl-symbols" 6139528 114 #'run-ansi-cl-symbols-chunk-114)
+  (%try-chunk "cl-symbols" 6139528 115 #'run-ansi-cl-symbols-chunk-115)
+  (%try-chunk "cl-symbols" 6139528 116 #'run-ansi-cl-symbols-chunk-116)
+  (%try-chunk "cl-symbols" 6139528 117 #'run-ansi-cl-symbols-chunk-117)
+  (%try-chunk "cl-symbols" 6139528 118 #'run-ansi-cl-symbols-chunk-118)
+  (%try-chunk "cl-symbols" 6139528 119 #'run-ansi-cl-symbols-chunk-119)
+  (%try-chunk "cl-symbols" 6139528 120 #'run-ansi-cl-symbols-chunk-120)
+  (%try-chunk "cl-symbols" 6139528 121 #'run-ansi-cl-symbols-chunk-121)
+  (%try-chunk "cl-symbols" 6139528 122 #'run-ansi-cl-symbols-chunk-122)
+  (%try-chunk "cl-symbols" 6139528 123 #'run-ansi-cl-symbols-chunk-123)
+  (%try-chunk "cl-symbols" 6139528 124 #'run-ansi-cl-symbols-chunk-124)
+  (%try-chunk "cl-symbols" 6139528 125 #'run-ansi-cl-symbols-chunk-125)
+  (%try-chunk "cl-symbols" 6139528 126 #'run-ansi-cl-symbols-chunk-126)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-symbol.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-copy-symbol ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32153,10 +32928,13 @@
 )
 (defun run-ansi-copy-symbol ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "copy-symbol" 11295425 1 #'run-ansi-copy-symbol-chunk-1)
+  (%try-chunk "copy-symbol" 10410689 1 #'run-ansi-copy-symbol-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === gensym.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-gensym ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32211,12 +32989,15 @@
 )
 (defun run-ansi-gensym ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "gensym" 2332348 1 #'run-ansi-gensym-chunk-1)
-  (%try-chunk "gensym" 2332348 2 #'run-ansi-gensym-chunk-2)
-  (%try-chunk "gensym" 2332348 3 #'run-ansi-gensym-chunk-3)
+  (%try-chunk "gensym" 5576380 1 #'run-ansi-gensym-chunk-1)
+  (%try-chunk "gensym" 5576380 2 #'run-ansi-gensym-chunk-2)
+  (%try-chunk "gensym" 5576380 3 #'run-ansi-gensym-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === gentemp.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-gentemp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32458,11 +33239,14 @@
 )
 (defun run-ansi-gentemp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "gentemp" 4761975 1 #'run-ansi-gentemp-chunk-1)
-  (%try-chunk "gentemp" 4761975 2 #'run-ansi-gentemp-chunk-2)
+  (%try-chunk "gentemp" 3008887 1 #'run-ansi-gentemp-chunk-1)
+  (%try-chunk "gentemp" 3008887 2 #'run-ansi-gentemp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === get.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP GET.4 "segmentation fault")
 (defun run-init-get ()
@@ -32579,11 +33363,14 @@
 )
 (defun run-ansi-get ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "get" 11555529 1 #'run-ansi-get-chunk-1)
-  (%try-chunk "get" 11555529 2 #'run-ansi-get-chunk-2)
+  (%try-chunk "get" 10343113 1 #'run-ansi-get-chunk-1)
+  (%try-chunk "get" 10343113 2 #'run-ansi-get-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === keywordp.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-keywordp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32619,11 +33406,14 @@
 )
 (defun run-ansi-keywordp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "keywordp" 13829574 1 #'run-ansi-keywordp-chunk-1)
-  (%try-chunk "keywordp" 13829574 2 #'run-ansi-keywordp-chunk-2)
+  (%try-chunk "keywordp" 9897414 1 #'run-ansi-keywordp-chunk-1)
+  (%try-chunk "keywordp" 9897414 2 #'run-ansi-keywordp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;cl-symbols-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -32651,7 +33441,10 @@
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-symbol.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-symbol ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32801,12 +33594,15 @@
 )
 (defun run-ansi-make-symbol ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-symbol" 14523646 1 #'run-ansi-make-symbol-chunk-1)
-  (%try-chunk "make-symbol" 14523646 2 #'run-ansi-make-symbol-chunk-2)
-  (%try-chunk "make-symbol" 14523646 3 #'run-ansi-make-symbol-chunk-3)
+  (%try-chunk "make-symbol" 5741822 1 #'run-ansi-make-symbol-chunk-1)
+  (%try-chunk "make-symbol" 5741822 2 #'run-ansi-make-symbol-chunk-2)
+  (%try-chunk "make-symbol" 5741822 3 #'run-ansi-make-symbol-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === makunbound.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-makunbound ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32873,10 +33669,13 @@
 )
 (defun run-ansi-makunbound ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "makunbound" 15854041 1 #'run-ansi-makunbound-chunk-1)
+  (%try-chunk "makunbound" 1993177 1 #'run-ansi-makunbound-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === remprop.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-remprop ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -32994,10 +33793,13 @@
 )
 (defun run-ansi-remprop ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "remprop" 11533800 1 #'run-ansi-remprop-chunk-1)
+  (%try-chunk "remprop" 10141160 1 #'run-ansi-remprop-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === set.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-set ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -33064,10 +33866,13 @@
 )
 (defun run-ansi-set ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "set" 8812189 1 #'run-ansi-set-chunk-1)
+  (%try-chunk "set" 12121757 1 #'run-ansi-set-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === special-operator-p.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFPARAMETER +SPECIAL-OPERATORS+
   '(BLOCK LET*
@@ -33175,10 +33980,13 @@
                              PROGV
                              LET
                              QUOTE)) (t (c) nil))
-  (%try-chunk "special-operator-p" 2424470 1 #'run-ansi-special-operator-p-chunk-1)
+  (%try-chunk "special-operator-p" 6995606 1 #'run-ansi-special-operator-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === symbol-function.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-symbol-function ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -33214,10 +34022,13 @@
 )
 (defun run-ansi-symbol-function ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "symbol-function" 11832262 1 #'run-ansi-symbol-function-chunk-1)
+  (%try-chunk "symbol-function" 10423238 1 #'run-ansi-symbol-function-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === symbol-name.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-symbol-name ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -33234,10 +34045,13 @@
 )
 (defun run-ansi-symbol-name ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "symbol-name" 9010827 1 #'run-ansi-symbol-name-chunk-1)
+  (%try-chunk "symbol-name" 4980363 1 #'run-ansi-symbol-name-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === symbolp.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-symbolp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -33253,10 +34067,13 @@
 )
 (defun run-ansi-symbolp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "symbolp" 14837801 1 #'run-ansi-symbolp-chunk-1)
+  (%try-chunk "symbolp" 2418729 1 #'run-ansi-symbolp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -33273,7 +34090,10 @@
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === structure-00.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN MAKE-STRUCT-P-FN (STRUCTURE-NAME)
   (ASSERT (TYPEP STRUCTURE-NAME '(OR STRING SYMBOL CHARACTER)))
@@ -33359,7 +34179,10 @@ do the defstruct."
   (handler-case (setq *DEFSTRUCT-WITH-TESTS-NAMES* NIL) (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === structures-01.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT S-1 FOO BAR)
 (defun run-init-structures-01 ()
@@ -33400,11 +34223,14 @@ do the defstruct."
 )
 (defun run-ansi-structures-01 ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "structures-01" 2082589 1 #'run-ansi-structures-01-chunk-1)
-  (%try-chunk "structures-01" 2082589 2 #'run-ansi-structures-01-chunk-2)
+  (%try-chunk "structures-01" 11159325 1 #'run-ansi-structures-01-chunk-1)
+  (%try-chunk "structures-01" 11159325 2 #'run-ansi-structures-01-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === structures-02.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFVAR *S-2-F6-COUNTER* 0)
 (DEFSTRUCT S-2
@@ -33512,11 +34338,14 @@ do the defstruct."
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
   (handler-case (setq *S-2-F6-COUNTER* 0) (t (c) nil))
   (handler-case (setq *ST-60* 100) (t (c) nil))
-  (%try-chunk "structures-02" 2082678 1 #'run-ansi-structures-02-chunk-1)
-  (%try-chunk "structures-02" 2082678 2 #'run-ansi-structures-02-chunk-2)
+  (%try-chunk "structures-02" 8128374 1 #'run-ansi-structures-02-chunk-1)
+  (%try-chunk "structures-02" 8128374 2 #'run-ansi-structures-02-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === structures-03.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN SBT-SLOTS (SNAME S &REST SLOTS)
   (LOOP FOR SLOTNAME IN SLOTS
@@ -33779,17 +34608,20 @@ do the defstruct."
 )
 (defun run-ansi-structures-03 ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "structures-03" 2082767 1 #'run-ansi-structures-03-chunk-1)
-  (%try-chunk "structures-03" 2082767 2 #'run-ansi-structures-03-chunk-2)
-  (%try-chunk "structures-03" 2082767 3 #'run-ansi-structures-03-chunk-3)
-  (%try-chunk "structures-03" 2082767 4 #'run-ansi-structures-03-chunk-4)
-  (%try-chunk "structures-03" 2082767 5 #'run-ansi-structures-03-chunk-5)
-  (%try-chunk "structures-03" 2082767 6 #'run-ansi-structures-03-chunk-6)
-  (%try-chunk "structures-03" 2082767 7 #'run-ansi-structures-03-chunk-7)
-  (%try-chunk "structures-03" 2082767 8 #'run-ansi-structures-03-chunk-8)
+  (%try-chunk "structures-03" 14731215 1 #'run-ansi-structures-03-chunk-1)
+  (%try-chunk "structures-03" 14731215 2 #'run-ansi-structures-03-chunk-2)
+  (%try-chunk "structures-03" 14731215 3 #'run-ansi-structures-03-chunk-3)
+  (%try-chunk "structures-03" 14731215 4 #'run-ansi-structures-03-chunk-4)
+  (%try-chunk "structures-03" 14731215 5 #'run-ansi-structures-03-chunk-5)
+  (%try-chunk "structures-03" 14731215 6 #'run-ansi-structures-03-chunk-6)
+  (%try-chunk "structures-03" 14731215 7 #'run-ansi-structures-03-chunk-7)
+  (%try-chunk "structures-03" 14731215 8 #'run-ansi-structures-03-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === structures-04.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT STRUCT-INCLUDE-01A A (B 0))
 (DEFSKIP STRUCT-INCLUDE.1)
@@ -33875,10 +34707,13 @@ do the defstruct."
 )
 (defun run-ansi-structures-04 ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "structures-04" 2082144 1 #'run-ansi-structures-04-chunk-1)
+  (%try-chunk "structures-04" 14189920 1 #'run-ansi-structures-04-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === base-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-base-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -33899,10 +34734,13 @@ do the defstruct."
 )
 (defun run-ansi-base-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "base-string" 12169450 1 #'run-ansi-base-string-chunk-1)
+  (%try-chunk "base-string" 11448554 1 #'run-ansi-base-string-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === char-schar.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-char-schar ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -34098,13 +34936,16 @@ do the defstruct."
 )
 (defun run-ansi-char-schar ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "char-schar" 11709897 1 #'run-ansi-char-schar-chunk-1)
-  (%try-chunk "char-schar" 11709897 2 #'run-ansi-char-schar-chunk-2)
-  (%try-chunk "char-schar" 11709897 3 #'run-ansi-char-schar-chunk-3)
-  (%try-chunk "char-schar" 11709897 4 #'run-ansi-char-schar-chunk-4)
+  (%try-chunk "char-schar" 11562441 1 #'run-ansi-char-schar-chunk-1)
+  (%try-chunk "char-schar" 11562441 2 #'run-ansi-char-schar-chunk-2)
+  (%try-chunk "char-schar" 11562441 3 #'run-ansi-char-schar-chunk-3)
+  (%try-chunk "char-schar" 11562441 4 #'run-ansi-char-schar-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;string-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -34135,7 +34976,10 @@ do the defstruct."
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -34259,13 +35103,16 @@ do the defstruct."
 )
 (defun run-ansi-make-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-string" 3293445 1 #'run-ansi-make-string-chunk-1)
-  (%try-chunk "make-string" 3293445 2 #'run-ansi-make-string-chunk-2)
-  (%try-chunk "make-string" 3293445 3 #'run-ansi-make-string-chunk-3)
-  (%try-chunk "make-string" 3293445 4 #'run-ansi-make-string-chunk-4)
+  (%try-chunk "make-string" 1949957 1 #'run-ansi-make-string-chunk-1)
+  (%try-chunk "make-string" 1949957 2 #'run-ansi-make-string-chunk-2)
+  (%try-chunk "make-string" 1949957 3 #'run-ansi-make-string-chunk-3)
+  (%try-chunk "make-string" 1949957 4 #'run-ansi-make-string-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === nstring-capitalize.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-nstring-capitalize ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -34500,12 +35347,15 @@ do the defstruct."
 )
 (defun run-ansi-nstring-capitalize ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nstring-capitalize" 13022213 1 #'run-ansi-nstring-capitalize-chunk-1)
-  (%try-chunk "nstring-capitalize" 13022213 2 #'run-ansi-nstring-capitalize-chunk-2)
-  (%try-chunk "nstring-capitalize" 13022213 3 #'run-ansi-nstring-capitalize-chunk-3)
+  (%try-chunk "nstring-capitalize" 8025093 1 #'run-ansi-nstring-capitalize-chunk-1)
+  (%try-chunk "nstring-capitalize" 8025093 2 #'run-ansi-nstring-capitalize-chunk-2)
+  (%try-chunk "nstring-capitalize" 8025093 3 #'run-ansi-nstring-capitalize-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nstring-downcase.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP NSTRING-DOWNCASE.9 "loop: number expected at :end")
 (defun run-init-nstring-downcase ()
@@ -34740,12 +35590,15 @@ do the defstruct."
 )
 (defun run-ansi-nstring-downcase ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nstring-downcase" 13737303 1 #'run-ansi-nstring-downcase-chunk-1)
-  (%try-chunk "nstring-downcase" 13737303 2 #'run-ansi-nstring-downcase-chunk-2)
-  (%try-chunk "nstring-downcase" 13737303 3 #'run-ansi-nstring-downcase-chunk-3)
+  (%try-chunk "nstring-downcase" 7658839 1 #'run-ansi-nstring-downcase-chunk-1)
+  (%try-chunk "nstring-downcase" 7658839 2 #'run-ansi-nstring-downcase-chunk-2)
+  (%try-chunk "nstring-downcase" 7658839 3 #'run-ansi-nstring-downcase-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nstring-upcase.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP NSTRING-UPCASE.9 "loop: number expected at :end")
 (defun run-init-nstring-upcase ()
@@ -34969,12 +35822,15 @@ do the defstruct."
 )
 (defun run-ansi-nstring-upcase ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nstring-upcase" 4960424 1 #'run-ansi-nstring-upcase-chunk-1)
-  (%try-chunk "nstring-upcase" 4960424 2 #'run-ansi-nstring-upcase-chunk-2)
-  (%try-chunk "nstring-upcase" 4960424 3 #'run-ansi-nstring-upcase-chunk-3)
+  (%try-chunk "nstring-upcase" 1224872 1 #'run-ansi-nstring-upcase-chunk-1)
+  (%try-chunk "nstring-upcase" 1224872 2 #'run-ansi-nstring-upcase-chunk-2)
+  (%try-chunk "nstring-upcase" 1224872 3 #'run-ansi-nstring-upcase-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-base-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-simple-base-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -35017,11 +35873,14 @@ do the defstruct."
 )
 (defun run-ansi-simple-base-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "simple-base-string" 7066929 1 #'run-ansi-simple-base-string-chunk-1)
-  (%try-chunk "simple-base-string" 7066929 2 #'run-ansi-simple-base-string-chunk-2)
+  (%try-chunk "simple-base-string" 15127857 1 #'run-ansi-simple-base-string-chunk-1)
+  (%try-chunk "simple-base-string" 15127857 2 #'run-ansi-simple-base-string-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-string-p.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-simple-string-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -35060,11 +35919,14 @@ do the defstruct."
 )
 (defun run-ansi-simple-string-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "simple-string-p" 4132868 1 #'run-ansi-simple-string-p-chunk-1)
-  (%try-chunk "simple-string-p" 4132868 2 #'run-ansi-simple-string-p-chunk-2)
+  (%try-chunk "simple-string-p" 13799428 1 #'run-ansi-simple-string-p-chunk-1)
+  (%try-chunk "simple-string-p" 13799428 2 #'run-ansi-simple-string-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-simple-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -35114,12 +35976,15 @@ do the defstruct."
 )
 (defun run-ansi-simple-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "simple-string" 10146105 1 #'run-ansi-simple-string-chunk-1)
-  (%try-chunk "simple-string" 10146105 2 #'run-ansi-simple-string-chunk-2)
-  (%try-chunk "simple-string" 10146105 3 #'run-ansi-simple-string-chunk-3)
+  (%try-chunk "simple-string" 10604857 1 #'run-ansi-simple-string-chunk-1)
+  (%try-chunk "simple-string" 10604857 2 #'run-ansi-simple-string-chunk-2)
+  (%try-chunk "simple-string" 10604857 3 #'run-ansi-simple-string-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-capitalize.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string-capitalize ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -35343,12 +36208,15 @@ do the defstruct."
 )
 (defun run-ansi-string-capitalize ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-capitalize" 10592355 1 #'run-ansi-string-capitalize-chunk-1)
-  (%try-chunk "string-capitalize" 10592355 2 #'run-ansi-string-capitalize-chunk-2)
-  (%try-chunk "string-capitalize" 10592355 3 #'run-ansi-string-capitalize-chunk-3)
+  (%try-chunk "string-capitalize" 3104867 1 #'run-ansi-string-capitalize-chunk-1)
+  (%try-chunk "string-capitalize" 3104867 2 #'run-ansi-string-capitalize-chunk-2)
+  (%try-chunk "string-capitalize" 3104867 3 #'run-ansi-string-capitalize-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-comparisons.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string-comparisons ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -36838,27 +37706,30 @@ do the defstruct."
 )
 (defun run-ansi-string-comparisons ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-comparisons" 9619517 1 #'run-ansi-string-comparisons-chunk-1)
-  (%try-chunk "string-comparisons" 9619517 2 #'run-ansi-string-comparisons-chunk-2)
-  (%try-chunk "string-comparisons" 9619517 3 #'run-ansi-string-comparisons-chunk-3)
-  (%try-chunk "string-comparisons" 9619517 4 #'run-ansi-string-comparisons-chunk-4)
-  (%try-chunk "string-comparisons" 9619517 5 #'run-ansi-string-comparisons-chunk-5)
-  (%try-chunk "string-comparisons" 9619517 6 #'run-ansi-string-comparisons-chunk-6)
-  (%try-chunk "string-comparisons" 9619517 7 #'run-ansi-string-comparisons-chunk-7)
-  (%try-chunk "string-comparisons" 9619517 8 #'run-ansi-string-comparisons-chunk-8)
-  (%try-chunk "string-comparisons" 9619517 9 #'run-ansi-string-comparisons-chunk-9)
-  (%try-chunk "string-comparisons" 9619517 10 #'run-ansi-string-comparisons-chunk-10)
-  (%try-chunk "string-comparisons" 9619517 11 #'run-ansi-string-comparisons-chunk-11)
-  (%try-chunk "string-comparisons" 9619517 12 #'run-ansi-string-comparisons-chunk-12)
-  (%try-chunk "string-comparisons" 9619517 13 #'run-ansi-string-comparisons-chunk-13)
-  (%try-chunk "string-comparisons" 9619517 14 #'run-ansi-string-comparisons-chunk-14)
-  (%try-chunk "string-comparisons" 9619517 15 #'run-ansi-string-comparisons-chunk-15)
-  (%try-chunk "string-comparisons" 9619517 16 #'run-ansi-string-comparisons-chunk-16)
-  (%try-chunk "string-comparisons" 9619517 17 #'run-ansi-string-comparisons-chunk-17)
-  (%try-chunk "string-comparisons" 9619517 18 #'run-ansi-string-comparisons-chunk-18)
+  (%try-chunk "string-comparisons" 6670397 1 #'run-ansi-string-comparisons-chunk-1)
+  (%try-chunk "string-comparisons" 6670397 2 #'run-ansi-string-comparisons-chunk-2)
+  (%try-chunk "string-comparisons" 6670397 3 #'run-ansi-string-comparisons-chunk-3)
+  (%try-chunk "string-comparisons" 6670397 4 #'run-ansi-string-comparisons-chunk-4)
+  (%try-chunk "string-comparisons" 6670397 5 #'run-ansi-string-comparisons-chunk-5)
+  (%try-chunk "string-comparisons" 6670397 6 #'run-ansi-string-comparisons-chunk-6)
+  (%try-chunk "string-comparisons" 6670397 7 #'run-ansi-string-comparisons-chunk-7)
+  (%try-chunk "string-comparisons" 6670397 8 #'run-ansi-string-comparisons-chunk-8)
+  (%try-chunk "string-comparisons" 6670397 9 #'run-ansi-string-comparisons-chunk-9)
+  (%try-chunk "string-comparisons" 6670397 10 #'run-ansi-string-comparisons-chunk-10)
+  (%try-chunk "string-comparisons" 6670397 11 #'run-ansi-string-comparisons-chunk-11)
+  (%try-chunk "string-comparisons" 6670397 12 #'run-ansi-string-comparisons-chunk-12)
+  (%try-chunk "string-comparisons" 6670397 13 #'run-ansi-string-comparisons-chunk-13)
+  (%try-chunk "string-comparisons" 6670397 14 #'run-ansi-string-comparisons-chunk-14)
+  (%try-chunk "string-comparisons" 6670397 15 #'run-ansi-string-comparisons-chunk-15)
+  (%try-chunk "string-comparisons" 6670397 16 #'run-ansi-string-comparisons-chunk-16)
+  (%try-chunk "string-comparisons" 6670397 17 #'run-ansi-string-comparisons-chunk-17)
+  (%try-chunk "string-comparisons" 6670397 18 #'run-ansi-string-comparisons-chunk-18)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-downcase.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string-downcase ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -37072,12 +37943,15 @@ do the defstruct."
 )
 (defun run-ansi-string-downcase ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-downcase" 5667345 1 #'run-ansi-string-downcase-chunk-1)
-  (%try-chunk "string-downcase" 5667345 2 #'run-ansi-string-downcase-chunk-2)
-  (%try-chunk "string-downcase" 5667345 3 #'run-ansi-string-downcase-chunk-3)
+  (%try-chunk "string-downcase" 2488849 1 #'run-ansi-string-downcase-chunk-1)
+  (%try-chunk "string-downcase" 2488849 2 #'run-ansi-string-downcase-chunk-2)
+  (%try-chunk "string-downcase" 2488849 3 #'run-ansi-string-downcase-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-left-trim.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP STRING-LEFT-TRIM.16 "string expected")
 (DEFSKIP STRING-LEFT-TRIM.17 "string expected")
@@ -37366,13 +38240,16 @@ do the defstruct."
 )
 (defun run-ansi-string-left-trim ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-left-trim" 14553971 1 #'run-ansi-string-left-trim-chunk-1)
-  (%try-chunk "string-left-trim" 14553971 2 #'run-ansi-string-left-trim-chunk-2)
-  (%try-chunk "string-left-trim" 14553971 3 #'run-ansi-string-left-trim-chunk-3)
-  (%try-chunk "string-left-trim" 14553971 4 #'run-ansi-string-left-trim-chunk-4)
+  (%try-chunk "string-left-trim" 9786227 1 #'run-ansi-string-left-trim-chunk-1)
+  (%try-chunk "string-left-trim" 9786227 2 #'run-ansi-string-left-trim-chunk-2)
+  (%try-chunk "string-left-trim" 9786227 3 #'run-ansi-string-left-trim-chunk-3)
+  (%try-chunk "string-left-trim" 9786227 4 #'run-ansi-string-left-trim-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-right-trim.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string-right-trim ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -37665,13 +38542,16 @@ do the defstruct."
 )
 (defun run-ansi-string-right-trim ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-right-trim" 4095592 1 #'run-ansi-string-right-trim-chunk-1)
-  (%try-chunk "string-right-trim" 4095592 2 #'run-ansi-string-right-trim-chunk-2)
-  (%try-chunk "string-right-trim" 4095592 3 #'run-ansi-string-right-trim-chunk-3)
-  (%try-chunk "string-right-trim" 4095592 4 #'run-ansi-string-right-trim-chunk-4)
+  (%try-chunk "string-right-trim" 3718760 1 #'run-ansi-string-right-trim-chunk-1)
+  (%try-chunk "string-right-trim" 3718760 2 #'run-ansi-string-right-trim-chunk-2)
+  (%try-chunk "string-right-trim" 3718760 3 #'run-ansi-string-right-trim-chunk-3)
+  (%try-chunk "string-right-trim" 3718760 4 #'run-ansi-string-right-trim-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-trim.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string-trim ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -37961,13 +38841,16 @@ do the defstruct."
 )
 (defun run-ansi-string-trim ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-trim" 11499109 1 #'run-ansi-string-trim-chunk-1)
-  (%try-chunk "string-trim" 11499109 2 #'run-ansi-string-trim-chunk-2)
-  (%try-chunk "string-trim" 11499109 3 #'run-ansi-string-trim-chunk-3)
-  (%try-chunk "string-trim" 11499109 4 #'run-ansi-string-trim-chunk-4)
+  (%try-chunk "string-trim" 4585061 1 #'run-ansi-string-trim-chunk-1)
+  (%try-chunk "string-trim" 4585061 2 #'run-ansi-string-trim-chunk-2)
+  (%try-chunk "string-trim" 4585061 3 #'run-ansi-string-trim-chunk-3)
+  (%try-chunk "string-trim" 4585061 4 #'run-ansi-string-trim-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === string-upcase.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string-upcase ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -38175,12 +39058,15 @@ do the defstruct."
 )
 (defun run-ansi-string-upcase ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string-upcase" 5507374 1 #'run-ansi-string-upcase-chunk-1)
-  (%try-chunk "string-upcase" 5507374 2 #'run-ansi-string-upcase-chunk-2)
-  (%try-chunk "string-upcase" 5507374 3 #'run-ansi-string-upcase-chunk-3)
+  (%try-chunk "string-upcase" 15305006 1 #'run-ansi-string-upcase-chunk-1)
+  (%try-chunk "string-upcase" 15305006 2 #'run-ansi-string-upcase-chunk-2)
+  (%try-chunk "string-upcase" 15305006 3 #'run-ansi-string-upcase-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -38274,13 +39160,16 @@ do the defstruct."
 )
 (defun run-ansi-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "string" 13250922 1 #'run-ansi-string-chunk-1)
-  (%try-chunk "string" 13250922 2 #'run-ansi-string-chunk-2)
-  (%try-chunk "string" 13250922 3 #'run-ansi-string-chunk-3)
-  (%try-chunk "string" 13250922 4 #'run-ansi-string-chunk-4)
+  (%try-chunk "string" 14561642 1 #'run-ansi-string-chunk-1)
+  (%try-chunk "string" 14561642 2 #'run-ansi-string-chunk-2)
+  (%try-chunk "string" 14561642 3 #'run-ansi-string-chunk-3)
+  (%try-chunk "string" 14561642 4 #'run-ansi-string-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === stringp.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-stringp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -38350,12 +39239,15 @@ do the defstruct."
 )
 (defun run-ansi-stringp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "stringp" 4922666 1 #'run-ansi-stringp-chunk-1)
-  (%try-chunk "stringp" 4922666 2 #'run-ansi-stringp-chunk-2)
-  (%try-chunk "stringp" 4922666 3 #'run-ansi-stringp-chunk-3)
+  (%try-chunk "stringp" 16653610 1 #'run-ansi-stringp-chunk-1)
+  (%try-chunk "stringp" 16653610 2 #'run-ansi-stringp-chunk-2)
+  (%try-chunk "stringp" 16653610 3 #'run-ansi-stringp-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === char-compare.lsp ===
+(in-package :modus.mvm)
 (defun run-init-char-compare ()
   nil
 )
@@ -39037,25 +39929,28 @@ do the defstruct."
                                                       I A B C)))) '(NIL 3 1 2 3)) (t (c) (%test-crash-fail-c 16423 c)))
 )
 (defun run-ansi-char-compare ()
-  (%try-chunk "char-compare" 2909293 1 #'run-ansi-char-compare-chunk-1)
-  (%try-chunk "char-compare" 2909293 2 #'run-ansi-char-compare-chunk-2)
-  (%try-chunk "char-compare" 2909293 3 #'run-ansi-char-compare-chunk-3)
-  (%try-chunk "char-compare" 2909293 4 #'run-ansi-char-compare-chunk-4)
-  (%try-chunk "char-compare" 2909293 5 #'run-ansi-char-compare-chunk-5)
-  (%try-chunk "char-compare" 2909293 6 #'run-ansi-char-compare-chunk-6)
-  (%try-chunk "char-compare" 2909293 7 #'run-ansi-char-compare-chunk-7)
-  (%try-chunk "char-compare" 2909293 8 #'run-ansi-char-compare-chunk-8)
-  (%try-chunk "char-compare" 2909293 9 #'run-ansi-char-compare-chunk-9)
-  (%try-chunk "char-compare" 2909293 10 #'run-ansi-char-compare-chunk-10)
-  (%try-chunk "char-compare" 2909293 11 #'run-ansi-char-compare-chunk-11)
-  (%try-chunk "char-compare" 2909293 12 #'run-ansi-char-compare-chunk-12)
-  (%try-chunk "char-compare" 2909293 13 #'run-ansi-char-compare-chunk-13)
-  (%try-chunk "char-compare" 2909293 14 #'run-ansi-char-compare-chunk-14)
-  (%try-chunk "char-compare" 2909293 15 #'run-ansi-char-compare-chunk-15)
-  (%try-chunk "char-compare" 2909293 16 #'run-ansi-char-compare-chunk-16)
+  (%try-chunk "char-compare" 3662957 1 #'run-ansi-char-compare-chunk-1)
+  (%try-chunk "char-compare" 3662957 2 #'run-ansi-char-compare-chunk-2)
+  (%try-chunk "char-compare" 3662957 3 #'run-ansi-char-compare-chunk-3)
+  (%try-chunk "char-compare" 3662957 4 #'run-ansi-char-compare-chunk-4)
+  (%try-chunk "char-compare" 3662957 5 #'run-ansi-char-compare-chunk-5)
+  (%try-chunk "char-compare" 3662957 6 #'run-ansi-char-compare-chunk-6)
+  (%try-chunk "char-compare" 3662957 7 #'run-ansi-char-compare-chunk-7)
+  (%try-chunk "char-compare" 3662957 8 #'run-ansi-char-compare-chunk-8)
+  (%try-chunk "char-compare" 3662957 9 #'run-ansi-char-compare-chunk-9)
+  (%try-chunk "char-compare" 3662957 10 #'run-ansi-char-compare-chunk-10)
+  (%try-chunk "char-compare" 3662957 11 #'run-ansi-char-compare-chunk-11)
+  (%try-chunk "char-compare" 3662957 12 #'run-ansi-char-compare-chunk-12)
+  (%try-chunk "char-compare" 3662957 13 #'run-ansi-char-compare-chunk-13)
+  (%try-chunk "char-compare" 3662957 14 #'run-ansi-char-compare-chunk-14)
+  (%try-chunk "char-compare" 3662957 15 #'run-ansi-char-compare-chunk-15)
+  (%try-chunk "char-compare" 3662957 16 #'run-ansi-char-compare-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === character.lsp ===
+(in-package :modus.mvm)
 (defun run-init-character ()
   nil
 )
@@ -39393,25 +40288,28 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 16547 c)))
 )
 (defun run-ansi-character ()
-  (%try-chunk "character" 7862854 1 #'run-ansi-character-chunk-1)
-  (%try-chunk "character" 7862854 2 #'run-ansi-character-chunk-2)
-  (%try-chunk "character" 7862854 3 #'run-ansi-character-chunk-3)
-  (%try-chunk "character" 7862854 4 #'run-ansi-character-chunk-4)
-  (%try-chunk "character" 7862854 5 #'run-ansi-character-chunk-5)
-  (%try-chunk "character" 7862854 6 #'run-ansi-character-chunk-6)
-  (%try-chunk "character" 7862854 7 #'run-ansi-character-chunk-7)
-  (%try-chunk "character" 7862854 8 #'run-ansi-character-chunk-8)
-  (%try-chunk "character" 7862854 9 #'run-ansi-character-chunk-9)
-  (%try-chunk "character" 7862854 10 #'run-ansi-character-chunk-10)
-  (%try-chunk "character" 7862854 11 #'run-ansi-character-chunk-11)
-  (%try-chunk "character" 7862854 12 #'run-ansi-character-chunk-12)
-  (%try-chunk "character" 7862854 13 #'run-ansi-character-chunk-13)
-  (%try-chunk "character" 7862854 14 #'run-ansi-character-chunk-14)
-  (%try-chunk "character" 7862854 15 #'run-ansi-character-chunk-15)
-  (%try-chunk "character" 7862854 16 #'run-ansi-character-chunk-16)
+  (%try-chunk "character" 16529990 1 #'run-ansi-character-chunk-1)
+  (%try-chunk "character" 16529990 2 #'run-ansi-character-chunk-2)
+  (%try-chunk "character" 16529990 3 #'run-ansi-character-chunk-3)
+  (%try-chunk "character" 16529990 4 #'run-ansi-character-chunk-4)
+  (%try-chunk "character" 16529990 5 #'run-ansi-character-chunk-5)
+  (%try-chunk "character" 16529990 6 #'run-ansi-character-chunk-6)
+  (%try-chunk "character" 16529990 7 #'run-ansi-character-chunk-7)
+  (%try-chunk "character" 16529990 8 #'run-ansi-character-chunk-8)
+  (%try-chunk "character" 16529990 9 #'run-ansi-character-chunk-9)
+  (%try-chunk "character" 16529990 10 #'run-ansi-character-chunk-10)
+  (%try-chunk "character" 16529990 11 #'run-ansi-character-chunk-11)
+  (%try-chunk "character" 16529990 12 #'run-ansi-character-chunk-12)
+  (%try-chunk "character" 16529990 13 #'run-ansi-character-chunk-13)
+  (%try-chunk "character" 16529990 14 #'run-ansi-character-chunk-14)
+  (%try-chunk "character" 16529990 15 #'run-ansi-character-chunk-15)
+  (%try-chunk "character" 16529990 16 #'run-ansi-character-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;char-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -39427,7 +40325,10 @@ do the defstruct."
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === name-char.lsp ===
+(in-package :modus.mvm)
 (defun run-init-name-char ()
   nil
 )
@@ -39532,11 +40433,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 16556 c)))
 )
 (defun run-ansi-name-char ()
-  (%try-chunk "name-char" 618533 1 #'run-ansi-name-char-chunk-1)
-  (%try-chunk "name-char" 618533 2 #'run-ansi-name-char-chunk-2)
+  (%try-chunk "name-char" 14839845 1 #'run-ansi-name-char-chunk-1)
+  (%try-chunk "name-char" 14839845 2 #'run-ansi-name-char-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === concatenate.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-concatenate ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -39906,16 +40810,19 @@ do the defstruct."
 )
 (defun run-ansi-concatenate ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "concatenate" 9359760 1 #'run-ansi-concatenate-chunk-1)
-  (%try-chunk "concatenate" 9359760 2 #'run-ansi-concatenate-chunk-2)
-  (%try-chunk "concatenate" 9359760 3 #'run-ansi-concatenate-chunk-3)
-  (%try-chunk "concatenate" 9359760 4 #'run-ansi-concatenate-chunk-4)
-  (%try-chunk "concatenate" 9359760 5 #'run-ansi-concatenate-chunk-5)
-  (%try-chunk "concatenate" 9359760 6 #'run-ansi-concatenate-chunk-6)
-  (%try-chunk "concatenate" 9359760 7 #'run-ansi-concatenate-chunk-7)
+  (%try-chunk "concatenate" 3772816 1 #'run-ansi-concatenate-chunk-1)
+  (%try-chunk "concatenate" 3772816 2 #'run-ansi-concatenate-chunk-2)
+  (%try-chunk "concatenate" 3772816 3 #'run-ansi-concatenate-chunk-3)
+  (%try-chunk "concatenate" 3772816 4 #'run-ansi-concatenate-chunk-4)
+  (%try-chunk "concatenate" 3772816 5 #'run-ansi-concatenate-chunk-5)
+  (%try-chunk "concatenate" 3772816 6 #'run-ansi-concatenate-chunk-6)
+  (%try-chunk "concatenate" 3772816 7 #'run-ansi-concatenate-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-seq.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-copy-seq ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -40098,13 +41005,16 @@ do the defstruct."
 )
 (defun run-ansi-copy-seq ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "copy-seq" 2662688 1 #'run-ansi-copy-seq-chunk-1)
-  (%try-chunk "copy-seq" 2662688 2 #'run-ansi-copy-seq-chunk-2)
-  (%try-chunk "copy-seq" 2662688 3 #'run-ansi-copy-seq-chunk-3)
-  (%try-chunk "copy-seq" 2662688 4 #'run-ansi-copy-seq-chunk-4)
+  (%try-chunk "copy-seq" 13934880 1 #'run-ansi-copy-seq-chunk-1)
+  (%try-chunk "copy-seq" 13934880 2 #'run-ansi-copy-seq-chunk-2)
+  (%try-chunk "copy-seq" 13934880 3 #'run-ansi-copy-seq-chunk-3)
+  (%try-chunk "copy-seq" 13934880 4 #'run-ansi-copy-seq-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === count-if-not.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 `(DEFTEST COUNT-IF-NOT.SPECIAL-VECTOR.1
   (LET ((V #(1 0 1 1 1 0 1 1 1 0 1)))
@@ -40602,22 +41512,25 @@ do the defstruct."
 )
 (defun run-ansi-count-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "count-if-not" 9031814 1 #'run-ansi-count-if-not-chunk-1)
-  (%try-chunk "count-if-not" 9031814 2 #'run-ansi-count-if-not-chunk-2)
-  (%try-chunk "count-if-not" 9031814 3 #'run-ansi-count-if-not-chunk-3)
-  (%try-chunk "count-if-not" 9031814 4 #'run-ansi-count-if-not-chunk-4)
-  (%try-chunk "count-if-not" 9031814 5 #'run-ansi-count-if-not-chunk-5)
-  (%try-chunk "count-if-not" 9031814 6 #'run-ansi-count-if-not-chunk-6)
-  (%try-chunk "count-if-not" 9031814 7 #'run-ansi-count-if-not-chunk-7)
-  (%try-chunk "count-if-not" 9031814 8 #'run-ansi-count-if-not-chunk-8)
-  (%try-chunk "count-if-not" 9031814 9 #'run-ansi-count-if-not-chunk-9)
-  (%try-chunk "count-if-not" 9031814 10 #'run-ansi-count-if-not-chunk-10)
-  (%try-chunk "count-if-not" 9031814 11 #'run-ansi-count-if-not-chunk-11)
-  (%try-chunk "count-if-not" 9031814 12 #'run-ansi-count-if-not-chunk-12)
-  (%try-chunk "count-if-not" 9031814 13 #'run-ansi-count-if-not-chunk-13)
+  (%try-chunk "count-if-not" 15339654 1 #'run-ansi-count-if-not-chunk-1)
+  (%try-chunk "count-if-not" 15339654 2 #'run-ansi-count-if-not-chunk-2)
+  (%try-chunk "count-if-not" 15339654 3 #'run-ansi-count-if-not-chunk-3)
+  (%try-chunk "count-if-not" 15339654 4 #'run-ansi-count-if-not-chunk-4)
+  (%try-chunk "count-if-not" 15339654 5 #'run-ansi-count-if-not-chunk-5)
+  (%try-chunk "count-if-not" 15339654 6 #'run-ansi-count-if-not-chunk-6)
+  (%try-chunk "count-if-not" 15339654 7 #'run-ansi-count-if-not-chunk-7)
+  (%try-chunk "count-if-not" 15339654 8 #'run-ansi-count-if-not-chunk-8)
+  (%try-chunk "count-if-not" 15339654 9 #'run-ansi-count-if-not-chunk-9)
+  (%try-chunk "count-if-not" 15339654 10 #'run-ansi-count-if-not-chunk-10)
+  (%try-chunk "count-if-not" 15339654 11 #'run-ansi-count-if-not-chunk-11)
+  (%try-chunk "count-if-not" 15339654 12 #'run-ansi-count-if-not-chunk-12)
+  (%try-chunk "count-if-not" 15339654 13 #'run-ansi-count-if-not-chunk-13)
 )
 
+(in-package :modus.mvm)
+
 ;; === count-if.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-count-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -41077,22 +41990,25 @@ do the defstruct."
 )
 (defun run-ansi-count-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "count-if" 287726 1 #'run-ansi-count-if-chunk-1)
-  (%try-chunk "count-if" 287726 2 #'run-ansi-count-if-chunk-2)
-  (%try-chunk "count-if" 287726 3 #'run-ansi-count-if-chunk-3)
-  (%try-chunk "count-if" 287726 4 #'run-ansi-count-if-chunk-4)
-  (%try-chunk "count-if" 287726 5 #'run-ansi-count-if-chunk-5)
-  (%try-chunk "count-if" 287726 6 #'run-ansi-count-if-chunk-6)
-  (%try-chunk "count-if" 287726 7 #'run-ansi-count-if-chunk-7)
-  (%try-chunk "count-if" 287726 8 #'run-ansi-count-if-chunk-8)
-  (%try-chunk "count-if" 287726 9 #'run-ansi-count-if-chunk-9)
-  (%try-chunk "count-if" 287726 10 #'run-ansi-count-if-chunk-10)
-  (%try-chunk "count-if" 287726 11 #'run-ansi-count-if-chunk-11)
-  (%try-chunk "count-if" 287726 12 #'run-ansi-count-if-chunk-12)
-  (%try-chunk "count-if" 287726 13 #'run-ansi-count-if-chunk-13)
+  (%try-chunk "count-if" 5514222 1 #'run-ansi-count-if-chunk-1)
+  (%try-chunk "count-if" 5514222 2 #'run-ansi-count-if-chunk-2)
+  (%try-chunk "count-if" 5514222 3 #'run-ansi-count-if-chunk-3)
+  (%try-chunk "count-if" 5514222 4 #'run-ansi-count-if-chunk-4)
+  (%try-chunk "count-if" 5514222 5 #'run-ansi-count-if-chunk-5)
+  (%try-chunk "count-if" 5514222 6 #'run-ansi-count-if-chunk-6)
+  (%try-chunk "count-if" 5514222 7 #'run-ansi-count-if-chunk-7)
+  (%try-chunk "count-if" 5514222 8 #'run-ansi-count-if-chunk-8)
+  (%try-chunk "count-if" 5514222 9 #'run-ansi-count-if-chunk-9)
+  (%try-chunk "count-if" 5514222 10 #'run-ansi-count-if-chunk-10)
+  (%try-chunk "count-if" 5514222 11 #'run-ansi-count-if-chunk-11)
+  (%try-chunk "count-if" 5514222 12 #'run-ansi-count-if-chunk-12)
+  (%try-chunk "count-if" 5514222 13 #'run-ansi-count-if-chunk-13)
 )
 
+(in-package :modus.mvm)
+
 ;; === count.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-count ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -41552,25 +42468,28 @@ do the defstruct."
 )
 (defun run-ansi-count ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "count" 16746004 1 #'run-ansi-count-chunk-1)
-  (%try-chunk "count" 16746004 2 #'run-ansi-count-chunk-2)
-  (%try-chunk "count" 16746004 3 #'run-ansi-count-chunk-3)
-  (%try-chunk "count" 16746004 4 #'run-ansi-count-chunk-4)
-  (%try-chunk "count" 16746004 5 #'run-ansi-count-chunk-5)
-  (%try-chunk "count" 16746004 6 #'run-ansi-count-chunk-6)
-  (%try-chunk "count" 16746004 7 #'run-ansi-count-chunk-7)
-  (%try-chunk "count" 16746004 8 #'run-ansi-count-chunk-8)
-  (%try-chunk "count" 16746004 9 #'run-ansi-count-chunk-9)
-  (%try-chunk "count" 16746004 10 #'run-ansi-count-chunk-10)
-  (%try-chunk "count" 16746004 11 #'run-ansi-count-chunk-11)
-  (%try-chunk "count" 16746004 12 #'run-ansi-count-chunk-12)
-  (%try-chunk "count" 16746004 13 #'run-ansi-count-chunk-13)
-  (%try-chunk "count" 16746004 14 #'run-ansi-count-chunk-14)
-  (%try-chunk "count" 16746004 15 #'run-ansi-count-chunk-15)
-  (%try-chunk "count" 16746004 16 #'run-ansi-count-chunk-16)
+  (%try-chunk "count" 11863572 1 #'run-ansi-count-chunk-1)
+  (%try-chunk "count" 11863572 2 #'run-ansi-count-chunk-2)
+  (%try-chunk "count" 11863572 3 #'run-ansi-count-chunk-3)
+  (%try-chunk "count" 11863572 4 #'run-ansi-count-chunk-4)
+  (%try-chunk "count" 11863572 5 #'run-ansi-count-chunk-5)
+  (%try-chunk "count" 11863572 6 #'run-ansi-count-chunk-6)
+  (%try-chunk "count" 11863572 7 #'run-ansi-count-chunk-7)
+  (%try-chunk "count" 11863572 8 #'run-ansi-count-chunk-8)
+  (%try-chunk "count" 11863572 9 #'run-ansi-count-chunk-9)
+  (%try-chunk "count" 11863572 10 #'run-ansi-count-chunk-10)
+  (%try-chunk "count" 11863572 11 #'run-ansi-count-chunk-11)
+  (%try-chunk "count" 11863572 12 #'run-ansi-count-chunk-12)
+  (%try-chunk "count" 11863572 13 #'run-ansi-count-chunk-13)
+  (%try-chunk "count" 11863572 14 #'run-ansi-count-chunk-14)
+  (%try-chunk "count" 11863572 15 #'run-ansi-count-chunk-15)
+  (%try-chunk "count" 11863572 16 #'run-ansi-count-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === elt.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-elt ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -42034,7 +42953,10 @@ do the defstruct."
   (%try-chunk "elt" 13896674 9 #'run-ansi-elt-chunk-9)
 )
 
+(in-package :modus.mvm)
+
 ;; === fill-strings.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-fill-strings ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -42057,10 +42979,13 @@ do the defstruct."
 )
 (defun run-ansi-fill-strings ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "fill-strings" 11478835 1 #'run-ansi-fill-strings-chunk-1)
+  (%try-chunk "fill-strings" 11462451 1 #'run-ansi-fill-strings-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === fill.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP ARRAY-UNSIGNED-BYTE8-FILL-7)
 (defun run-init-fill ()
@@ -42810,19 +43735,22 @@ do the defstruct."
 )
 (defun run-ansi-fill ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "fill" 929256 1 #'run-ansi-fill-chunk-1)
-  (%try-chunk "fill" 929256 2 #'run-ansi-fill-chunk-2)
-  (%try-chunk "fill" 929256 3 #'run-ansi-fill-chunk-3)
-  (%try-chunk "fill" 929256 4 #'run-ansi-fill-chunk-4)
-  (%try-chunk "fill" 929256 5 #'run-ansi-fill-chunk-5)
-  (%try-chunk "fill" 929256 6 #'run-ansi-fill-chunk-6)
-  (%try-chunk "fill" 929256 7 #'run-ansi-fill-chunk-7)
-  (%try-chunk "fill" 929256 8 #'run-ansi-fill-chunk-8)
-  (%try-chunk "fill" 929256 9 #'run-ansi-fill-chunk-9)
-  (%try-chunk "fill" 929256 10 #'run-ansi-fill-chunk-10)
+  (%try-chunk "fill" 6434280 1 #'run-ansi-fill-chunk-1)
+  (%try-chunk "fill" 6434280 2 #'run-ansi-fill-chunk-2)
+  (%try-chunk "fill" 6434280 3 #'run-ansi-fill-chunk-3)
+  (%try-chunk "fill" 6434280 4 #'run-ansi-fill-chunk-4)
+  (%try-chunk "fill" 6434280 5 #'run-ansi-fill-chunk-5)
+  (%try-chunk "fill" 6434280 6 #'run-ansi-fill-chunk-6)
+  (%try-chunk "fill" 6434280 7 #'run-ansi-fill-chunk-7)
+  (%try-chunk "fill" 6434280 8 #'run-ansi-fill-chunk-8)
+  (%try-chunk "fill" 6434280 9 #'run-ansi-fill-chunk-9)
+  (%try-chunk "fill" 6434280 10 #'run-ansi-fill-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-if-not.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-find-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -43902,20 +44830,23 @@ do the defstruct."
 )
 (defun run-ansi-find-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "find-if-not" 8957440 1 #'run-ansi-find-if-not-chunk-1)
-  (%try-chunk "find-if-not" 8957440 2 #'run-ansi-find-if-not-chunk-2)
-  (%try-chunk "find-if-not" 8957440 3 #'run-ansi-find-if-not-chunk-3)
-  (%try-chunk "find-if-not" 8957440 4 #'run-ansi-find-if-not-chunk-4)
-  (%try-chunk "find-if-not" 8957440 5 #'run-ansi-find-if-not-chunk-5)
-  (%try-chunk "find-if-not" 8957440 6 #'run-ansi-find-if-not-chunk-6)
-  (%try-chunk "find-if-not" 8957440 7 #'run-ansi-find-if-not-chunk-7)
-  (%try-chunk "find-if-not" 8957440 8 #'run-ansi-find-if-not-chunk-8)
-  (%try-chunk "find-if-not" 8957440 9 #'run-ansi-find-if-not-chunk-9)
-  (%try-chunk "find-if-not" 8957440 10 #'run-ansi-find-if-not-chunk-10)
-  (%try-chunk "find-if-not" 8957440 11 #'run-ansi-find-if-not-chunk-11)
+  (%try-chunk "find-if-not" 11644416 1 #'run-ansi-find-if-not-chunk-1)
+  (%try-chunk "find-if-not" 11644416 2 #'run-ansi-find-if-not-chunk-2)
+  (%try-chunk "find-if-not" 11644416 3 #'run-ansi-find-if-not-chunk-3)
+  (%try-chunk "find-if-not" 11644416 4 #'run-ansi-find-if-not-chunk-4)
+  (%try-chunk "find-if-not" 11644416 5 #'run-ansi-find-if-not-chunk-5)
+  (%try-chunk "find-if-not" 11644416 6 #'run-ansi-find-if-not-chunk-6)
+  (%try-chunk "find-if-not" 11644416 7 #'run-ansi-find-if-not-chunk-7)
+  (%try-chunk "find-if-not" 11644416 8 #'run-ansi-find-if-not-chunk-8)
+  (%try-chunk "find-if-not" 11644416 9 #'run-ansi-find-if-not-chunk-9)
+  (%try-chunk "find-if-not" 11644416 10 #'run-ansi-find-if-not-chunk-10)
+  (%try-chunk "find-if-not" 11644416 11 #'run-ansi-find-if-not-chunk-11)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-if.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-find-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -44910,21 +45841,24 @@ do the defstruct."
 )
 (defun run-ansi-find-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "find-if" 1800552 1 #'run-ansi-find-if-chunk-1)
-  (%try-chunk "find-if" 1800552 2 #'run-ansi-find-if-chunk-2)
-  (%try-chunk "find-if" 1800552 3 #'run-ansi-find-if-chunk-3)
-  (%try-chunk "find-if" 1800552 4 #'run-ansi-find-if-chunk-4)
-  (%try-chunk "find-if" 1800552 5 #'run-ansi-find-if-chunk-5)
-  (%try-chunk "find-if" 1800552 6 #'run-ansi-find-if-chunk-6)
-  (%try-chunk "find-if" 1800552 7 #'run-ansi-find-if-chunk-7)
-  (%try-chunk "find-if" 1800552 8 #'run-ansi-find-if-chunk-8)
-  (%try-chunk "find-if" 1800552 9 #'run-ansi-find-if-chunk-9)
-  (%try-chunk "find-if" 1800552 10 #'run-ansi-find-if-chunk-10)
-  (%try-chunk "find-if" 1800552 11 #'run-ansi-find-if-chunk-11)
-  (%try-chunk "find-if" 1800552 12 #'run-ansi-find-if-chunk-12)
+  (%try-chunk "find-if" 8763752 1 #'run-ansi-find-if-chunk-1)
+  (%try-chunk "find-if" 8763752 2 #'run-ansi-find-if-chunk-2)
+  (%try-chunk "find-if" 8763752 3 #'run-ansi-find-if-chunk-3)
+  (%try-chunk "find-if" 8763752 4 #'run-ansi-find-if-chunk-4)
+  (%try-chunk "find-if" 8763752 5 #'run-ansi-find-if-chunk-5)
+  (%try-chunk "find-if" 8763752 6 #'run-ansi-find-if-chunk-6)
+  (%try-chunk "find-if" 8763752 7 #'run-ansi-find-if-chunk-7)
+  (%try-chunk "find-if" 8763752 8 #'run-ansi-find-if-chunk-8)
+  (%try-chunk "find-if" 8763752 9 #'run-ansi-find-if-chunk-9)
+  (%try-chunk "find-if" 8763752 10 #'run-ansi-find-if-chunk-10)
+  (%try-chunk "find-if" 8763752 11 #'run-ansi-find-if-chunk-11)
+  (%try-chunk "find-if" 8763752 12 #'run-ansi-find-if-chunk-12)
 )
 
+(in-package :modus.mvm)
+
 ;; === find.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP FIND-VECTOR.34)
 (defun run-init-find ()
@@ -45711,31 +46645,34 @@ do the defstruct."
 )
 (defun run-ansi-find ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "find" 955778 1 #'run-ansi-find-chunk-1)
-  (%try-chunk "find" 955778 2 #'run-ansi-find-chunk-2)
-  (%try-chunk "find" 955778 3 #'run-ansi-find-chunk-3)
-  (%try-chunk "find" 955778 4 #'run-ansi-find-chunk-4)
-  (%try-chunk "find" 955778 5 #'run-ansi-find-chunk-5)
-  (%try-chunk "find" 955778 6 #'run-ansi-find-chunk-6)
-  (%try-chunk "find" 955778 7 #'run-ansi-find-chunk-7)
-  (%try-chunk "find" 955778 8 #'run-ansi-find-chunk-8)
-  (%try-chunk "find" 955778 9 #'run-ansi-find-chunk-9)
-  (%try-chunk "find" 955778 10 #'run-ansi-find-chunk-10)
-  (%try-chunk "find" 955778 11 #'run-ansi-find-chunk-11)
-  (%try-chunk "find" 955778 12 #'run-ansi-find-chunk-12)
-  (%try-chunk "find" 955778 13 #'run-ansi-find-chunk-13)
-  (%try-chunk "find" 955778 14 #'run-ansi-find-chunk-14)
-  (%try-chunk "find" 955778 15 #'run-ansi-find-chunk-15)
-  (%try-chunk "find" 955778 16 #'run-ansi-find-chunk-16)
-  (%try-chunk "find" 955778 17 #'run-ansi-find-chunk-17)
-  (%try-chunk "find" 955778 18 #'run-ansi-find-chunk-18)
-  (%try-chunk "find" 955778 19 #'run-ansi-find-chunk-19)
-  (%try-chunk "find" 955778 20 #'run-ansi-find-chunk-20)
-  (%try-chunk "find" 955778 21 #'run-ansi-find-chunk-21)
-  (%try-chunk "find" 955778 22 #'run-ansi-find-chunk-22)
+  (%try-chunk "find" 9868674 1 #'run-ansi-find-chunk-1)
+  (%try-chunk "find" 9868674 2 #'run-ansi-find-chunk-2)
+  (%try-chunk "find" 9868674 3 #'run-ansi-find-chunk-3)
+  (%try-chunk "find" 9868674 4 #'run-ansi-find-chunk-4)
+  (%try-chunk "find" 9868674 5 #'run-ansi-find-chunk-5)
+  (%try-chunk "find" 9868674 6 #'run-ansi-find-chunk-6)
+  (%try-chunk "find" 9868674 7 #'run-ansi-find-chunk-7)
+  (%try-chunk "find" 9868674 8 #'run-ansi-find-chunk-8)
+  (%try-chunk "find" 9868674 9 #'run-ansi-find-chunk-9)
+  (%try-chunk "find" 9868674 10 #'run-ansi-find-chunk-10)
+  (%try-chunk "find" 9868674 11 #'run-ansi-find-chunk-11)
+  (%try-chunk "find" 9868674 12 #'run-ansi-find-chunk-12)
+  (%try-chunk "find" 9868674 13 #'run-ansi-find-chunk-13)
+  (%try-chunk "find" 9868674 14 #'run-ansi-find-chunk-14)
+  (%try-chunk "find" 9868674 15 #'run-ansi-find-chunk-15)
+  (%try-chunk "find" 9868674 16 #'run-ansi-find-chunk-16)
+  (%try-chunk "find" 9868674 17 #'run-ansi-find-chunk-17)
+  (%try-chunk "find" 9868674 18 #'run-ansi-find-chunk-18)
+  (%try-chunk "find" 9868674 19 #'run-ansi-find-chunk-19)
+  (%try-chunk "find" 9868674 20 #'run-ansi-find-chunk-20)
+  (%try-chunk "find" 9868674 21 #'run-ansi-find-chunk-21)
+  (%try-chunk "find" 9868674 22 #'run-ansi-find-chunk-22)
 )
 
+(in-package :modus.mvm)
+
 ;; === length.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN LENGTH.LIST-4-BODY ()
   (LET ((X NIL))
@@ -45868,14 +46805,17 @@ do the defstruct."
 )
 (defun run-ansi-length ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "length" 7593891 1 #'run-ansi-length-chunk-1)
-  (%try-chunk "length" 7593891 2 #'run-ansi-length-chunk-2)
-  (%try-chunk "length" 7593891 3 #'run-ansi-length-chunk-3)
-  (%try-chunk "length" 7593891 4 #'run-ansi-length-chunk-4)
-  (%try-chunk "length" 7593891 5 #'run-ansi-length-chunk-5)
+  (%try-chunk "length" 4546467 1 #'run-ansi-length-chunk-1)
+  (%try-chunk "length" 4546467 2 #'run-ansi-length-chunk-2)
+  (%try-chunk "length" 4546467 3 #'run-ansi-length-chunk-3)
+  (%try-chunk "length" 4546467 4 #'run-ansi-length-chunk-4)
+  (%try-chunk "length" 4546467 5 #'run-ansi-length-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;search-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;subseq-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;remove-aux.lsp")
@@ -45929,7 +46869,10 @@ do the defstruct."
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-sequence.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-sequence ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -46333,20 +47276,23 @@ do the defstruct."
 )
 (defun run-ansi-make-sequence ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-sequence" 16206103 1 #'run-ansi-make-sequence-chunk-1)
-  (%try-chunk "make-sequence" 16206103 2 #'run-ansi-make-sequence-chunk-2)
-  (%try-chunk "make-sequence" 16206103 3 #'run-ansi-make-sequence-chunk-3)
-  (%try-chunk "make-sequence" 16206103 4 #'run-ansi-make-sequence-chunk-4)
-  (%try-chunk "make-sequence" 16206103 5 #'run-ansi-make-sequence-chunk-5)
-  (%try-chunk "make-sequence" 16206103 6 #'run-ansi-make-sequence-chunk-6)
-  (%try-chunk "make-sequence" 16206103 7 #'run-ansi-make-sequence-chunk-7)
-  (%try-chunk "make-sequence" 16206103 8 #'run-ansi-make-sequence-chunk-8)
-  (%try-chunk "make-sequence" 16206103 9 #'run-ansi-make-sequence-chunk-9)
-  (%try-chunk "make-sequence" 16206103 10 #'run-ansi-make-sequence-chunk-10)
-  (%try-chunk "make-sequence" 16206103 11 #'run-ansi-make-sequence-chunk-11)
+  (%try-chunk "make-sequence" 6932759 1 #'run-ansi-make-sequence-chunk-1)
+  (%try-chunk "make-sequence" 6932759 2 #'run-ansi-make-sequence-chunk-2)
+  (%try-chunk "make-sequence" 6932759 3 #'run-ansi-make-sequence-chunk-3)
+  (%try-chunk "make-sequence" 6932759 4 #'run-ansi-make-sequence-chunk-4)
+  (%try-chunk "make-sequence" 6932759 5 #'run-ansi-make-sequence-chunk-5)
+  (%try-chunk "make-sequence" 6932759 6 #'run-ansi-make-sequence-chunk-6)
+  (%try-chunk "make-sequence" 6932759 7 #'run-ansi-make-sequence-chunk-7)
+  (%try-chunk "make-sequence" 6932759 8 #'run-ansi-make-sequence-chunk-8)
+  (%try-chunk "make-sequence" 6932759 9 #'run-ansi-make-sequence-chunk-9)
+  (%try-chunk "make-sequence" 6932759 10 #'run-ansi-make-sequence-chunk-10)
+  (%try-chunk "make-sequence" 6932759 11 #'run-ansi-make-sequence-chunk-11)
 )
 
+(in-package :modus.mvm)
+
 ;; === map-into.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-map-into ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -46884,17 +47830,20 @@ do the defstruct."
 )
 (defun run-ansi-map-into ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "map-into" 14225946 1 #'run-ansi-map-into-chunk-1)
-  (%try-chunk "map-into" 14225946 2 #'run-ansi-map-into-chunk-2)
-  (%try-chunk "map-into" 14225946 3 #'run-ansi-map-into-chunk-3)
-  (%try-chunk "map-into" 14225946 4 #'run-ansi-map-into-chunk-4)
-  (%try-chunk "map-into" 14225946 5 #'run-ansi-map-into-chunk-5)
-  (%try-chunk "map-into" 14225946 6 #'run-ansi-map-into-chunk-6)
-  (%try-chunk "map-into" 14225946 7 #'run-ansi-map-into-chunk-7)
-  (%try-chunk "map-into" 14225946 8 #'run-ansi-map-into-chunk-8)
+  (%try-chunk "map-into" 3248666 1 #'run-ansi-map-into-chunk-1)
+  (%try-chunk "map-into" 3248666 2 #'run-ansi-map-into-chunk-2)
+  (%try-chunk "map-into" 3248666 3 #'run-ansi-map-into-chunk-3)
+  (%try-chunk "map-into" 3248666 4 #'run-ansi-map-into-chunk-4)
+  (%try-chunk "map-into" 3248666 5 #'run-ansi-map-into-chunk-5)
+  (%try-chunk "map-into" 3248666 6 #'run-ansi-map-into-chunk-6)
+  (%try-chunk "map-into" 3248666 7 #'run-ansi-map-into-chunk-7)
+  (%try-chunk "map-into" 3248666 8 #'run-ansi-map-into-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === map.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-map ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -47219,19 +48168,22 @@ do the defstruct."
 )
 (defun run-ansi-map ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "map" 7291539 1 #'run-ansi-map-chunk-1)
-  (%try-chunk "map" 7291539 2 #'run-ansi-map-chunk-2)
-  (%try-chunk "map" 7291539 3 #'run-ansi-map-chunk-3)
-  (%try-chunk "map" 7291539 4 #'run-ansi-map-chunk-4)
-  (%try-chunk "map" 7291539 5 #'run-ansi-map-chunk-5)
-  (%try-chunk "map" 7291539 6 #'run-ansi-map-chunk-6)
-  (%try-chunk "map" 7291539 7 #'run-ansi-map-chunk-7)
-  (%try-chunk "map" 7291539 8 #'run-ansi-map-chunk-8)
-  (%try-chunk "map" 7291539 9 #'run-ansi-map-chunk-9)
-  (%try-chunk "map" 7291539 10 #'run-ansi-map-chunk-10)
+  (%try-chunk "map" 12862099 1 #'run-ansi-map-chunk-1)
+  (%try-chunk "map" 12862099 2 #'run-ansi-map-chunk-2)
+  (%try-chunk "map" 12862099 3 #'run-ansi-map-chunk-3)
+  (%try-chunk "map" 12862099 4 #'run-ansi-map-chunk-4)
+  (%try-chunk "map" 12862099 5 #'run-ansi-map-chunk-5)
+  (%try-chunk "map" 12862099 6 #'run-ansi-map-chunk-6)
+  (%try-chunk "map" 12862099 7 #'run-ansi-map-chunk-7)
+  (%try-chunk "map" 12862099 8 #'run-ansi-map-chunk-8)
+  (%try-chunk "map" 12862099 9 #'run-ansi-map-chunk-9)
+  (%try-chunk "map" 12862099 10 #'run-ansi-map-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === merge.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-merge ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -47685,25 +48637,28 @@ do the defstruct."
 )
 (defun run-ansi-merge ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "merge" 1143103 1 #'run-ansi-merge-chunk-1)
-  (%try-chunk "merge" 1143103 2 #'run-ansi-merge-chunk-2)
-  (%try-chunk "merge" 1143103 3 #'run-ansi-merge-chunk-3)
-  (%try-chunk "merge" 1143103 4 #'run-ansi-merge-chunk-4)
-  (%try-chunk "merge" 1143103 5 #'run-ansi-merge-chunk-5)
-  (%try-chunk "merge" 1143103 6 #'run-ansi-merge-chunk-6)
-  (%try-chunk "merge" 1143103 7 #'run-ansi-merge-chunk-7)
-  (%try-chunk "merge" 1143103 8 #'run-ansi-merge-chunk-8)
-  (%try-chunk "merge" 1143103 9 #'run-ansi-merge-chunk-9)
-  (%try-chunk "merge" 1143103 10 #'run-ansi-merge-chunk-10)
-  (%try-chunk "merge" 1143103 11 #'run-ansi-merge-chunk-11)
-  (%try-chunk "merge" 1143103 12 #'run-ansi-merge-chunk-12)
-  (%try-chunk "merge" 1143103 13 #'run-ansi-merge-chunk-13)
-  (%try-chunk "merge" 1143103 14 #'run-ansi-merge-chunk-14)
-  (%try-chunk "merge" 1143103 15 #'run-ansi-merge-chunk-15)
-  (%try-chunk "merge" 1143103 16 #'run-ansi-merge-chunk-16)
+  (%try-chunk "merge" 6418751 1 #'run-ansi-merge-chunk-1)
+  (%try-chunk "merge" 6418751 2 #'run-ansi-merge-chunk-2)
+  (%try-chunk "merge" 6418751 3 #'run-ansi-merge-chunk-3)
+  (%try-chunk "merge" 6418751 4 #'run-ansi-merge-chunk-4)
+  (%try-chunk "merge" 6418751 5 #'run-ansi-merge-chunk-5)
+  (%try-chunk "merge" 6418751 6 #'run-ansi-merge-chunk-6)
+  (%try-chunk "merge" 6418751 7 #'run-ansi-merge-chunk-7)
+  (%try-chunk "merge" 6418751 8 #'run-ansi-merge-chunk-8)
+  (%try-chunk "merge" 6418751 9 #'run-ansi-merge-chunk-9)
+  (%try-chunk "merge" 6418751 10 #'run-ansi-merge-chunk-10)
+  (%try-chunk "merge" 6418751 11 #'run-ansi-merge-chunk-11)
+  (%try-chunk "merge" 6418751 12 #'run-ansi-merge-chunk-12)
+  (%try-chunk "merge" 6418751 13 #'run-ansi-merge-chunk-13)
+  (%try-chunk "merge" 6418751 14 #'run-ansi-merge-chunk-14)
+  (%try-chunk "merge" 6418751 15 #'run-ansi-merge-chunk-15)
+  (%try-chunk "merge" 6418751 16 #'run-ansi-merge-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === mismatch.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-mismatch ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -48212,28 +49167,31 @@ do the defstruct."
 )
 (defun run-ansi-mismatch ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "mismatch" 13651659 1 #'run-ansi-mismatch-chunk-1)
-  (%try-chunk "mismatch" 13651659 2 #'run-ansi-mismatch-chunk-2)
-  (%try-chunk "mismatch" 13651659 3 #'run-ansi-mismatch-chunk-3)
-  (%try-chunk "mismatch" 13651659 4 #'run-ansi-mismatch-chunk-4)
-  (%try-chunk "mismatch" 13651659 5 #'run-ansi-mismatch-chunk-5)
-  (%try-chunk "mismatch" 13651659 6 #'run-ansi-mismatch-chunk-6)
-  (%try-chunk "mismatch" 13651659 7 #'run-ansi-mismatch-chunk-7)
-  (%try-chunk "mismatch" 13651659 8 #'run-ansi-mismatch-chunk-8)
-  (%try-chunk "mismatch" 13651659 9 #'run-ansi-mismatch-chunk-9)
-  (%try-chunk "mismatch" 13651659 10 #'run-ansi-mismatch-chunk-10)
-  (%try-chunk "mismatch" 13651659 11 #'run-ansi-mismatch-chunk-11)
-  (%try-chunk "mismatch" 13651659 12 #'run-ansi-mismatch-chunk-12)
-  (%try-chunk "mismatch" 13651659 13 #'run-ansi-mismatch-chunk-13)
-  (%try-chunk "mismatch" 13651659 14 #'run-ansi-mismatch-chunk-14)
-  (%try-chunk "mismatch" 13651659 15 #'run-ansi-mismatch-chunk-15)
-  (%try-chunk "mismatch" 13651659 16 #'run-ansi-mismatch-chunk-16)
-  (%try-chunk "mismatch" 13651659 17 #'run-ansi-mismatch-chunk-17)
-  (%try-chunk "mismatch" 13651659 18 #'run-ansi-mismatch-chunk-18)
-  (%try-chunk "mismatch" 13651659 19 #'run-ansi-mismatch-chunk-19)
+  (%try-chunk "mismatch" 8670923 1 #'run-ansi-mismatch-chunk-1)
+  (%try-chunk "mismatch" 8670923 2 #'run-ansi-mismatch-chunk-2)
+  (%try-chunk "mismatch" 8670923 3 #'run-ansi-mismatch-chunk-3)
+  (%try-chunk "mismatch" 8670923 4 #'run-ansi-mismatch-chunk-4)
+  (%try-chunk "mismatch" 8670923 5 #'run-ansi-mismatch-chunk-5)
+  (%try-chunk "mismatch" 8670923 6 #'run-ansi-mismatch-chunk-6)
+  (%try-chunk "mismatch" 8670923 7 #'run-ansi-mismatch-chunk-7)
+  (%try-chunk "mismatch" 8670923 8 #'run-ansi-mismatch-chunk-8)
+  (%try-chunk "mismatch" 8670923 9 #'run-ansi-mismatch-chunk-9)
+  (%try-chunk "mismatch" 8670923 10 #'run-ansi-mismatch-chunk-10)
+  (%try-chunk "mismatch" 8670923 11 #'run-ansi-mismatch-chunk-11)
+  (%try-chunk "mismatch" 8670923 12 #'run-ansi-mismatch-chunk-12)
+  (%try-chunk "mismatch" 8670923 13 #'run-ansi-mismatch-chunk-13)
+  (%try-chunk "mismatch" 8670923 14 #'run-ansi-mismatch-chunk-14)
+  (%try-chunk "mismatch" 8670923 15 #'run-ansi-mismatch-chunk-15)
+  (%try-chunk "mismatch" 8670923 16 #'run-ansi-mismatch-chunk-16)
+  (%try-chunk "mismatch" 8670923 17 #'run-ansi-mismatch-chunk-17)
+  (%try-chunk "mismatch" 8670923 18 #'run-ansi-mismatch-chunk-18)
+  (%try-chunk "mismatch" 8670923 19 #'run-ansi-mismatch-chunk-19)
 )
 
+(in-package :modus.mvm)
+
 ;; === nreverse.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-nreverse ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -48383,12 +49341,15 @@ do the defstruct."
 )
 (defun run-ansi-nreverse ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nreverse" 11313865 1 #'run-ansi-nreverse-chunk-1)
-  (%try-chunk "nreverse" 11313865 2 #'run-ansi-nreverse-chunk-2)
-  (%try-chunk "nreverse" 11313865 3 #'run-ansi-nreverse-chunk-3)
+  (%try-chunk "nreverse" 14574281 1 #'run-ansi-nreverse-chunk-1)
+  (%try-chunk "nreverse" 14574281 2 #'run-ansi-nreverse-chunk-2)
+  (%try-chunk "nreverse" 14574281 3 #'run-ansi-nreverse-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsubstitute-if-not.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-nsubstitute-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -49559,25 +50520,28 @@ do the defstruct."
 )
 (defun run-ansi-nsubstitute-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nsubstitute-if-not" 11070977 1 #'run-ansi-nsubstitute-if-not-chunk-1)
-  (%try-chunk "nsubstitute-if-not" 11070977 2 #'run-ansi-nsubstitute-if-not-chunk-2)
-  (%try-chunk "nsubstitute-if-not" 11070977 3 #'run-ansi-nsubstitute-if-not-chunk-3)
-  (%try-chunk "nsubstitute-if-not" 11070977 4 #'run-ansi-nsubstitute-if-not-chunk-4)
-  (%try-chunk "nsubstitute-if-not" 11070977 5 #'run-ansi-nsubstitute-if-not-chunk-5)
-  (%try-chunk "nsubstitute-if-not" 11070977 6 #'run-ansi-nsubstitute-if-not-chunk-6)
-  (%try-chunk "nsubstitute-if-not" 11070977 7 #'run-ansi-nsubstitute-if-not-chunk-7)
-  (%try-chunk "nsubstitute-if-not" 11070977 8 #'run-ansi-nsubstitute-if-not-chunk-8)
-  (%try-chunk "nsubstitute-if-not" 11070977 9 #'run-ansi-nsubstitute-if-not-chunk-9)
-  (%try-chunk "nsubstitute-if-not" 11070977 10 #'run-ansi-nsubstitute-if-not-chunk-10)
-  (%try-chunk "nsubstitute-if-not" 11070977 11 #'run-ansi-nsubstitute-if-not-chunk-11)
-  (%try-chunk "nsubstitute-if-not" 11070977 12 #'run-ansi-nsubstitute-if-not-chunk-12)
-  (%try-chunk "nsubstitute-if-not" 11070977 13 #'run-ansi-nsubstitute-if-not-chunk-13)
-  (%try-chunk "nsubstitute-if-not" 11070977 14 #'run-ansi-nsubstitute-if-not-chunk-14)
-  (%try-chunk "nsubstitute-if-not" 11070977 15 #'run-ansi-nsubstitute-if-not-chunk-15)
-  (%try-chunk "nsubstitute-if-not" 11070977 16 #'run-ansi-nsubstitute-if-not-chunk-16)
+  (%try-chunk "nsubstitute-if-not" 9629185 1 #'run-ansi-nsubstitute-if-not-chunk-1)
+  (%try-chunk "nsubstitute-if-not" 9629185 2 #'run-ansi-nsubstitute-if-not-chunk-2)
+  (%try-chunk "nsubstitute-if-not" 9629185 3 #'run-ansi-nsubstitute-if-not-chunk-3)
+  (%try-chunk "nsubstitute-if-not" 9629185 4 #'run-ansi-nsubstitute-if-not-chunk-4)
+  (%try-chunk "nsubstitute-if-not" 9629185 5 #'run-ansi-nsubstitute-if-not-chunk-5)
+  (%try-chunk "nsubstitute-if-not" 9629185 6 #'run-ansi-nsubstitute-if-not-chunk-6)
+  (%try-chunk "nsubstitute-if-not" 9629185 7 #'run-ansi-nsubstitute-if-not-chunk-7)
+  (%try-chunk "nsubstitute-if-not" 9629185 8 #'run-ansi-nsubstitute-if-not-chunk-8)
+  (%try-chunk "nsubstitute-if-not" 9629185 9 #'run-ansi-nsubstitute-if-not-chunk-9)
+  (%try-chunk "nsubstitute-if-not" 9629185 10 #'run-ansi-nsubstitute-if-not-chunk-10)
+  (%try-chunk "nsubstitute-if-not" 9629185 11 #'run-ansi-nsubstitute-if-not-chunk-11)
+  (%try-chunk "nsubstitute-if-not" 9629185 12 #'run-ansi-nsubstitute-if-not-chunk-12)
+  (%try-chunk "nsubstitute-if-not" 9629185 13 #'run-ansi-nsubstitute-if-not-chunk-13)
+  (%try-chunk "nsubstitute-if-not" 9629185 14 #'run-ansi-nsubstitute-if-not-chunk-14)
+  (%try-chunk "nsubstitute-if-not" 9629185 15 #'run-ansi-nsubstitute-if-not-chunk-15)
+  (%try-chunk "nsubstitute-if-not" 9629185 16 #'run-ansi-nsubstitute-if-not-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsubstitute-if.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-nsubstitute-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -50750,25 +51714,28 @@ do the defstruct."
 )
 (defun run-ansi-nsubstitute-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nsubstitute-if" 4608793 1 #'run-ansi-nsubstitute-if-chunk-1)
-  (%try-chunk "nsubstitute-if" 4608793 2 #'run-ansi-nsubstitute-if-chunk-2)
-  (%try-chunk "nsubstitute-if" 4608793 3 #'run-ansi-nsubstitute-if-chunk-3)
-  (%try-chunk "nsubstitute-if" 4608793 4 #'run-ansi-nsubstitute-if-chunk-4)
-  (%try-chunk "nsubstitute-if" 4608793 5 #'run-ansi-nsubstitute-if-chunk-5)
-  (%try-chunk "nsubstitute-if" 4608793 6 #'run-ansi-nsubstitute-if-chunk-6)
-  (%try-chunk "nsubstitute-if" 4608793 7 #'run-ansi-nsubstitute-if-chunk-7)
-  (%try-chunk "nsubstitute-if" 4608793 8 #'run-ansi-nsubstitute-if-chunk-8)
-  (%try-chunk "nsubstitute-if" 4608793 9 #'run-ansi-nsubstitute-if-chunk-9)
-  (%try-chunk "nsubstitute-if" 4608793 10 #'run-ansi-nsubstitute-if-chunk-10)
-  (%try-chunk "nsubstitute-if" 4608793 11 #'run-ansi-nsubstitute-if-chunk-11)
-  (%try-chunk "nsubstitute-if" 4608793 12 #'run-ansi-nsubstitute-if-chunk-12)
-  (%try-chunk "nsubstitute-if" 4608793 13 #'run-ansi-nsubstitute-if-chunk-13)
-  (%try-chunk "nsubstitute-if" 4608793 14 #'run-ansi-nsubstitute-if-chunk-14)
-  (%try-chunk "nsubstitute-if" 4608793 15 #'run-ansi-nsubstitute-if-chunk-15)
-  (%try-chunk "nsubstitute-if" 4608793 16 #'run-ansi-nsubstitute-if-chunk-16)
+  (%try-chunk "nsubstitute-if" 10343193 1 #'run-ansi-nsubstitute-if-chunk-1)
+  (%try-chunk "nsubstitute-if" 10343193 2 #'run-ansi-nsubstitute-if-chunk-2)
+  (%try-chunk "nsubstitute-if" 10343193 3 #'run-ansi-nsubstitute-if-chunk-3)
+  (%try-chunk "nsubstitute-if" 10343193 4 #'run-ansi-nsubstitute-if-chunk-4)
+  (%try-chunk "nsubstitute-if" 10343193 5 #'run-ansi-nsubstitute-if-chunk-5)
+  (%try-chunk "nsubstitute-if" 10343193 6 #'run-ansi-nsubstitute-if-chunk-6)
+  (%try-chunk "nsubstitute-if" 10343193 7 #'run-ansi-nsubstitute-if-chunk-7)
+  (%try-chunk "nsubstitute-if" 10343193 8 #'run-ansi-nsubstitute-if-chunk-8)
+  (%try-chunk "nsubstitute-if" 10343193 9 #'run-ansi-nsubstitute-if-chunk-9)
+  (%try-chunk "nsubstitute-if" 10343193 10 #'run-ansi-nsubstitute-if-chunk-10)
+  (%try-chunk "nsubstitute-if" 10343193 11 #'run-ansi-nsubstitute-if-chunk-11)
+  (%try-chunk "nsubstitute-if" 10343193 12 #'run-ansi-nsubstitute-if-chunk-12)
+  (%try-chunk "nsubstitute-if" 10343193 13 #'run-ansi-nsubstitute-if-chunk-13)
+  (%try-chunk "nsubstitute-if" 10343193 14 #'run-ansi-nsubstitute-if-chunk-14)
+  (%try-chunk "nsubstitute-if" 10343193 15 #'run-ansi-nsubstitute-if-chunk-15)
+  (%try-chunk "nsubstitute-if" 10343193 16 #'run-ansi-nsubstitute-if-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === nsubstitute.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-nsubstitute ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -52093,28 +53060,31 @@ do the defstruct."
 )
 (defun run-ansi-nsubstitute ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "nsubstitute" 4363691 1 #'run-ansi-nsubstitute-chunk-1)
-  (%try-chunk "nsubstitute" 4363691 2 #'run-ansi-nsubstitute-chunk-2)
-  (%try-chunk "nsubstitute" 4363691 3 #'run-ansi-nsubstitute-chunk-3)
-  (%try-chunk "nsubstitute" 4363691 4 #'run-ansi-nsubstitute-chunk-4)
-  (%try-chunk "nsubstitute" 4363691 5 #'run-ansi-nsubstitute-chunk-5)
-  (%try-chunk "nsubstitute" 4363691 6 #'run-ansi-nsubstitute-chunk-6)
-  (%try-chunk "nsubstitute" 4363691 7 #'run-ansi-nsubstitute-chunk-7)
-  (%try-chunk "nsubstitute" 4363691 8 #'run-ansi-nsubstitute-chunk-8)
-  (%try-chunk "nsubstitute" 4363691 9 #'run-ansi-nsubstitute-chunk-9)
-  (%try-chunk "nsubstitute" 4363691 10 #'run-ansi-nsubstitute-chunk-10)
-  (%try-chunk "nsubstitute" 4363691 11 #'run-ansi-nsubstitute-chunk-11)
-  (%try-chunk "nsubstitute" 4363691 12 #'run-ansi-nsubstitute-chunk-12)
-  (%try-chunk "nsubstitute" 4363691 13 #'run-ansi-nsubstitute-chunk-13)
-  (%try-chunk "nsubstitute" 4363691 14 #'run-ansi-nsubstitute-chunk-14)
-  (%try-chunk "nsubstitute" 4363691 15 #'run-ansi-nsubstitute-chunk-15)
-  (%try-chunk "nsubstitute" 4363691 16 #'run-ansi-nsubstitute-chunk-16)
-  (%try-chunk "nsubstitute" 4363691 17 #'run-ansi-nsubstitute-chunk-17)
-  (%try-chunk "nsubstitute" 4363691 18 #'run-ansi-nsubstitute-chunk-18)
-  (%try-chunk "nsubstitute" 4363691 19 #'run-ansi-nsubstitute-chunk-19)
+  (%try-chunk "nsubstitute" 1267115 1 #'run-ansi-nsubstitute-chunk-1)
+  (%try-chunk "nsubstitute" 1267115 2 #'run-ansi-nsubstitute-chunk-2)
+  (%try-chunk "nsubstitute" 1267115 3 #'run-ansi-nsubstitute-chunk-3)
+  (%try-chunk "nsubstitute" 1267115 4 #'run-ansi-nsubstitute-chunk-4)
+  (%try-chunk "nsubstitute" 1267115 5 #'run-ansi-nsubstitute-chunk-5)
+  (%try-chunk "nsubstitute" 1267115 6 #'run-ansi-nsubstitute-chunk-6)
+  (%try-chunk "nsubstitute" 1267115 7 #'run-ansi-nsubstitute-chunk-7)
+  (%try-chunk "nsubstitute" 1267115 8 #'run-ansi-nsubstitute-chunk-8)
+  (%try-chunk "nsubstitute" 1267115 9 #'run-ansi-nsubstitute-chunk-9)
+  (%try-chunk "nsubstitute" 1267115 10 #'run-ansi-nsubstitute-chunk-10)
+  (%try-chunk "nsubstitute" 1267115 11 #'run-ansi-nsubstitute-chunk-11)
+  (%try-chunk "nsubstitute" 1267115 12 #'run-ansi-nsubstitute-chunk-12)
+  (%try-chunk "nsubstitute" 1267115 13 #'run-ansi-nsubstitute-chunk-13)
+  (%try-chunk "nsubstitute" 1267115 14 #'run-ansi-nsubstitute-chunk-14)
+  (%try-chunk "nsubstitute" 1267115 15 #'run-ansi-nsubstitute-chunk-15)
+  (%try-chunk "nsubstitute" 1267115 16 #'run-ansi-nsubstitute-chunk-16)
+  (%try-chunk "nsubstitute" 1267115 17 #'run-ansi-nsubstitute-chunk-17)
+  (%try-chunk "nsubstitute" 1267115 18 #'run-ansi-nsubstitute-chunk-18)
+  (%try-chunk "nsubstitute" 1267115 19 #'run-ansi-nsubstitute-chunk-19)
 )
 
+(in-package :modus.mvm)
+
 ;; === position-if-not.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-position-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -53205,19 +54175,22 @@ do the defstruct."
 )
 (defun run-ansi-position-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "position-if-not" 13376572 1 #'run-ansi-position-if-not-chunk-1)
-  (%try-chunk "position-if-not" 13376572 2 #'run-ansi-position-if-not-chunk-2)
-  (%try-chunk "position-if-not" 13376572 3 #'run-ansi-position-if-not-chunk-3)
-  (%try-chunk "position-if-not" 13376572 4 #'run-ansi-position-if-not-chunk-4)
-  (%try-chunk "position-if-not" 13376572 5 #'run-ansi-position-if-not-chunk-5)
-  (%try-chunk "position-if-not" 13376572 6 #'run-ansi-position-if-not-chunk-6)
-  (%try-chunk "position-if-not" 13376572 7 #'run-ansi-position-if-not-chunk-7)
-  (%try-chunk "position-if-not" 13376572 8 #'run-ansi-position-if-not-chunk-8)
-  (%try-chunk "position-if-not" 13376572 9 #'run-ansi-position-if-not-chunk-9)
-  (%try-chunk "position-if-not" 13376572 10 #'run-ansi-position-if-not-chunk-10)
+  (%try-chunk "position-if-not" 1940540 1 #'run-ansi-position-if-not-chunk-1)
+  (%try-chunk "position-if-not" 1940540 2 #'run-ansi-position-if-not-chunk-2)
+  (%try-chunk "position-if-not" 1940540 3 #'run-ansi-position-if-not-chunk-3)
+  (%try-chunk "position-if-not" 1940540 4 #'run-ansi-position-if-not-chunk-4)
+  (%try-chunk "position-if-not" 1940540 5 #'run-ansi-position-if-not-chunk-5)
+  (%try-chunk "position-if-not" 1940540 6 #'run-ansi-position-if-not-chunk-6)
+  (%try-chunk "position-if-not" 1940540 7 #'run-ansi-position-if-not-chunk-7)
+  (%try-chunk "position-if-not" 1940540 8 #'run-ansi-position-if-not-chunk-8)
+  (%try-chunk "position-if-not" 1940540 9 #'run-ansi-position-if-not-chunk-9)
+  (%try-chunk "position-if-not" 1940540 10 #'run-ansi-position-if-not-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === position-if.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-position-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -54289,19 +55262,22 @@ do the defstruct."
 )
 (defun run-ansi-position-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "position-if" 8241684 1 #'run-ansi-position-if-chunk-1)
-  (%try-chunk "position-if" 8241684 2 #'run-ansi-position-if-chunk-2)
-  (%try-chunk "position-if" 8241684 3 #'run-ansi-position-if-chunk-3)
-  (%try-chunk "position-if" 8241684 4 #'run-ansi-position-if-chunk-4)
-  (%try-chunk "position-if" 8241684 5 #'run-ansi-position-if-chunk-5)
-  (%try-chunk "position-if" 8241684 6 #'run-ansi-position-if-chunk-6)
-  (%try-chunk "position-if" 8241684 7 #'run-ansi-position-if-chunk-7)
-  (%try-chunk "position-if" 8241684 8 #'run-ansi-position-if-chunk-8)
-  (%try-chunk "position-if" 8241684 9 #'run-ansi-position-if-chunk-9)
-  (%try-chunk "position-if" 8241684 10 #'run-ansi-position-if-chunk-10)
+  (%try-chunk "position-if" 2720276 1 #'run-ansi-position-if-chunk-1)
+  (%try-chunk "position-if" 2720276 2 #'run-ansi-position-if-chunk-2)
+  (%try-chunk "position-if" 2720276 3 #'run-ansi-position-if-chunk-3)
+  (%try-chunk "position-if" 2720276 4 #'run-ansi-position-if-chunk-4)
+  (%try-chunk "position-if" 2720276 5 #'run-ansi-position-if-chunk-5)
+  (%try-chunk "position-if" 2720276 6 #'run-ansi-position-if-chunk-6)
+  (%try-chunk "position-if" 2720276 7 #'run-ansi-position-if-chunk-7)
+  (%try-chunk "position-if" 2720276 8 #'run-ansi-position-if-chunk-8)
+  (%try-chunk "position-if" 2720276 9 #'run-ansi-position-if-chunk-9)
+  (%try-chunk "position-if" 2720276 10 #'run-ansi-position-if-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === position.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-position ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -54987,29 +55963,32 @@ do the defstruct."
 )
 (defun run-ansi-position ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "position" 9029806 1 #'run-ansi-position-chunk-1)
-  (%try-chunk "position" 9029806 2 #'run-ansi-position-chunk-2)
-  (%try-chunk "position" 9029806 3 #'run-ansi-position-chunk-3)
-  (%try-chunk "position" 9029806 4 #'run-ansi-position-chunk-4)
-  (%try-chunk "position" 9029806 5 #'run-ansi-position-chunk-5)
-  (%try-chunk "position" 9029806 6 #'run-ansi-position-chunk-6)
-  (%try-chunk "position" 9029806 7 #'run-ansi-position-chunk-7)
-  (%try-chunk "position" 9029806 8 #'run-ansi-position-chunk-8)
-  (%try-chunk "position" 9029806 9 #'run-ansi-position-chunk-9)
-  (%try-chunk "position" 9029806 10 #'run-ansi-position-chunk-10)
-  (%try-chunk "position" 9029806 11 #'run-ansi-position-chunk-11)
-  (%try-chunk "position" 9029806 12 #'run-ansi-position-chunk-12)
-  (%try-chunk "position" 9029806 13 #'run-ansi-position-chunk-13)
-  (%try-chunk "position" 9029806 14 #'run-ansi-position-chunk-14)
-  (%try-chunk "position" 9029806 15 #'run-ansi-position-chunk-15)
-  (%try-chunk "position" 9029806 16 #'run-ansi-position-chunk-16)
-  (%try-chunk "position" 9029806 17 #'run-ansi-position-chunk-17)
-  (%try-chunk "position" 9029806 18 #'run-ansi-position-chunk-18)
-  (%try-chunk "position" 9029806 19 #'run-ansi-position-chunk-19)
-  (%try-chunk "position" 9029806 20 #'run-ansi-position-chunk-20)
+  (%try-chunk "position" 2263214 1 #'run-ansi-position-chunk-1)
+  (%try-chunk "position" 2263214 2 #'run-ansi-position-chunk-2)
+  (%try-chunk "position" 2263214 3 #'run-ansi-position-chunk-3)
+  (%try-chunk "position" 2263214 4 #'run-ansi-position-chunk-4)
+  (%try-chunk "position" 2263214 5 #'run-ansi-position-chunk-5)
+  (%try-chunk "position" 2263214 6 #'run-ansi-position-chunk-6)
+  (%try-chunk "position" 2263214 7 #'run-ansi-position-chunk-7)
+  (%try-chunk "position" 2263214 8 #'run-ansi-position-chunk-8)
+  (%try-chunk "position" 2263214 9 #'run-ansi-position-chunk-9)
+  (%try-chunk "position" 2263214 10 #'run-ansi-position-chunk-10)
+  (%try-chunk "position" 2263214 11 #'run-ansi-position-chunk-11)
+  (%try-chunk "position" 2263214 12 #'run-ansi-position-chunk-12)
+  (%try-chunk "position" 2263214 13 #'run-ansi-position-chunk-13)
+  (%try-chunk "position" 2263214 14 #'run-ansi-position-chunk-14)
+  (%try-chunk "position" 2263214 15 #'run-ansi-position-chunk-15)
+  (%try-chunk "position" 2263214 16 #'run-ansi-position-chunk-16)
+  (%try-chunk "position" 2263214 17 #'run-ansi-position-chunk-17)
+  (%try-chunk "position" 2263214 18 #'run-ansi-position-chunk-18)
+  (%try-chunk "position" 2263214 19 #'run-ansi-position-chunk-19)
+  (%try-chunk "position" 2263214 20 #'run-ansi-position-chunk-20)
 )
 
+(in-package :modus.mvm)
+
 ;; === reduce.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-reduce ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -55493,22 +56472,25 @@ do the defstruct."
 )
 (defun run-ansi-reduce ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "reduce" 15378103 1 #'run-ansi-reduce-chunk-1)
-  (%try-chunk "reduce" 15378103 2 #'run-ansi-reduce-chunk-2)
-  (%try-chunk "reduce" 15378103 3 #'run-ansi-reduce-chunk-3)
-  (%try-chunk "reduce" 15378103 4 #'run-ansi-reduce-chunk-4)
-  (%try-chunk "reduce" 15378103 5 #'run-ansi-reduce-chunk-5)
-  (%try-chunk "reduce" 15378103 6 #'run-ansi-reduce-chunk-6)
-  (%try-chunk "reduce" 15378103 7 #'run-ansi-reduce-chunk-7)
-  (%try-chunk "reduce" 15378103 8 #'run-ansi-reduce-chunk-8)
-  (%try-chunk "reduce" 15378103 9 #'run-ansi-reduce-chunk-9)
-  (%try-chunk "reduce" 15378103 10 #'run-ansi-reduce-chunk-10)
-  (%try-chunk "reduce" 15378103 11 #'run-ansi-reduce-chunk-11)
-  (%try-chunk "reduce" 15378103 12 #'run-ansi-reduce-chunk-12)
-  (%try-chunk "reduce" 15378103 13 #'run-ansi-reduce-chunk-13)
+  (%try-chunk "reduce" 15328951 1 #'run-ansi-reduce-chunk-1)
+  (%try-chunk "reduce" 15328951 2 #'run-ansi-reduce-chunk-2)
+  (%try-chunk "reduce" 15328951 3 #'run-ansi-reduce-chunk-3)
+  (%try-chunk "reduce" 15328951 4 #'run-ansi-reduce-chunk-4)
+  (%try-chunk "reduce" 15328951 5 #'run-ansi-reduce-chunk-5)
+  (%try-chunk "reduce" 15328951 6 #'run-ansi-reduce-chunk-6)
+  (%try-chunk "reduce" 15328951 7 #'run-ansi-reduce-chunk-7)
+  (%try-chunk "reduce" 15328951 8 #'run-ansi-reduce-chunk-8)
+  (%try-chunk "reduce" 15328951 9 #'run-ansi-reduce-chunk-9)
+  (%try-chunk "reduce" 15328951 10 #'run-ansi-reduce-chunk-10)
+  (%try-chunk "reduce" 15328951 11 #'run-ansi-reduce-chunk-11)
+  (%try-chunk "reduce" 15328951 12 #'run-ansi-reduce-chunk-12)
+  (%try-chunk "reduce" 15328951 13 #'run-ansi-reduce-chunk-13)
 )
 
+(in-package :modus.mvm)
+
 ;; === remove-duplicates.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP REMOVE-DUPLICATES.FOLD.3)
 (defun run-init-remove-duplicates ()
@@ -56068,17 +57050,20 @@ do the defstruct."
 )
 (defun run-ansi-remove-duplicates ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "remove-duplicates" 5049984 1 #'run-ansi-remove-duplicates-chunk-1)
-  (%try-chunk "remove-duplicates" 5049984 2 #'run-ansi-remove-duplicates-chunk-2)
-  (%try-chunk "remove-duplicates" 5049984 3 #'run-ansi-remove-duplicates-chunk-3)
-  (%try-chunk "remove-duplicates" 5049984 4 #'run-ansi-remove-duplicates-chunk-4)
-  (%try-chunk "remove-duplicates" 5049984 5 #'run-ansi-remove-duplicates-chunk-5)
-  (%try-chunk "remove-duplicates" 5049984 6 #'run-ansi-remove-duplicates-chunk-6)
-  (%try-chunk "remove-duplicates" 5049984 7 #'run-ansi-remove-duplicates-chunk-7)
-  (%try-chunk "remove-duplicates" 5049984 8 #'run-ansi-remove-duplicates-chunk-8)
+  (%try-chunk "remove-duplicates" 5344896 1 #'run-ansi-remove-duplicates-chunk-1)
+  (%try-chunk "remove-duplicates" 5344896 2 #'run-ansi-remove-duplicates-chunk-2)
+  (%try-chunk "remove-duplicates" 5344896 3 #'run-ansi-remove-duplicates-chunk-3)
+  (%try-chunk "remove-duplicates" 5344896 4 #'run-ansi-remove-duplicates-chunk-4)
+  (%try-chunk "remove-duplicates" 5344896 5 #'run-ansi-remove-duplicates-chunk-5)
+  (%try-chunk "remove-duplicates" 5344896 6 #'run-ansi-remove-duplicates-chunk-6)
+  (%try-chunk "remove-duplicates" 5344896 7 #'run-ansi-remove-duplicates-chunk-7)
+  (%try-chunk "remove-duplicates" 5344896 8 #'run-ansi-remove-duplicates-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === remove.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-remove ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -57740,25 +58725,28 @@ do the defstruct."
 )
 (defun run-ansi-remove ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "remove" 8895025 1 #'run-ansi-remove-chunk-1)
-  (%try-chunk "remove" 8895025 2 #'run-ansi-remove-chunk-2)
-  (%try-chunk "remove" 8895025 3 #'run-ansi-remove-chunk-3)
-  (%try-chunk "remove" 8895025 4 #'run-ansi-remove-chunk-4)
-  (%try-chunk "remove" 8895025 5 #'run-ansi-remove-chunk-5)
-  (%try-chunk "remove" 8895025 6 #'run-ansi-remove-chunk-6)
-  (%try-chunk "remove" 8895025 7 #'run-ansi-remove-chunk-7)
-  (%try-chunk "remove" 8895025 8 #'run-ansi-remove-chunk-8)
-  (%try-chunk "remove" 8895025 9 #'run-ansi-remove-chunk-9)
-  (%try-chunk "remove" 8895025 10 #'run-ansi-remove-chunk-10)
-  (%try-chunk "remove" 8895025 11 #'run-ansi-remove-chunk-11)
-  (%try-chunk "remove" 8895025 12 #'run-ansi-remove-chunk-12)
-  (%try-chunk "remove" 8895025 13 #'run-ansi-remove-chunk-13)
-  (%try-chunk "remove" 8895025 14 #'run-ansi-remove-chunk-14)
-  (%try-chunk "remove" 8895025 15 #'run-ansi-remove-chunk-15)
-  (%try-chunk "remove" 8895025 16 #'run-ansi-remove-chunk-16)
+  (%try-chunk "remove" 13597233 1 #'run-ansi-remove-chunk-1)
+  (%try-chunk "remove" 13597233 2 #'run-ansi-remove-chunk-2)
+  (%try-chunk "remove" 13597233 3 #'run-ansi-remove-chunk-3)
+  (%try-chunk "remove" 13597233 4 #'run-ansi-remove-chunk-4)
+  (%try-chunk "remove" 13597233 5 #'run-ansi-remove-chunk-5)
+  (%try-chunk "remove" 13597233 6 #'run-ansi-remove-chunk-6)
+  (%try-chunk "remove" 13597233 7 #'run-ansi-remove-chunk-7)
+  (%try-chunk "remove" 13597233 8 #'run-ansi-remove-chunk-8)
+  (%try-chunk "remove" 13597233 9 #'run-ansi-remove-chunk-9)
+  (%try-chunk "remove" 13597233 10 #'run-ansi-remove-chunk-10)
+  (%try-chunk "remove" 13597233 11 #'run-ansi-remove-chunk-11)
+  (%try-chunk "remove" 13597233 12 #'run-ansi-remove-chunk-12)
+  (%try-chunk "remove" 13597233 13 #'run-ansi-remove-chunk-13)
+  (%try-chunk "remove" 13597233 14 #'run-ansi-remove-chunk-14)
+  (%try-chunk "remove" 13597233 15 #'run-ansi-remove-chunk-15)
+  (%try-chunk "remove" 13597233 16 #'run-ansi-remove-chunk-16)
 )
 
+(in-package :modus.mvm)
+
 ;; === replace.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-replace ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -58814,22 +59802,25 @@ do the defstruct."
 )
 (defun run-ansi-replace ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "replace" 13260763 1 #'run-ansi-replace-chunk-1)
-  (%try-chunk "replace" 13260763 2 #'run-ansi-replace-chunk-2)
-  (%try-chunk "replace" 13260763 3 #'run-ansi-replace-chunk-3)
-  (%try-chunk "replace" 13260763 4 #'run-ansi-replace-chunk-4)
-  (%try-chunk "replace" 13260763 5 #'run-ansi-replace-chunk-5)
-  (%try-chunk "replace" 13260763 6 #'run-ansi-replace-chunk-6)
-  (%try-chunk "replace" 13260763 7 #'run-ansi-replace-chunk-7)
-  (%try-chunk "replace" 13260763 8 #'run-ansi-replace-chunk-8)
-  (%try-chunk "replace" 13260763 9 #'run-ansi-replace-chunk-9)
-  (%try-chunk "replace" 13260763 10 #'run-ansi-replace-chunk-10)
-  (%try-chunk "replace" 13260763 11 #'run-ansi-replace-chunk-11)
-  (%try-chunk "replace" 13260763 12 #'run-ansi-replace-chunk-12)
-  (%try-chunk "replace" 13260763 13 #'run-ansi-replace-chunk-13)
+  (%try-chunk "replace" 2676699 1 #'run-ansi-replace-chunk-1)
+  (%try-chunk "replace" 2676699 2 #'run-ansi-replace-chunk-2)
+  (%try-chunk "replace" 2676699 3 #'run-ansi-replace-chunk-3)
+  (%try-chunk "replace" 2676699 4 #'run-ansi-replace-chunk-4)
+  (%try-chunk "replace" 2676699 5 #'run-ansi-replace-chunk-5)
+  (%try-chunk "replace" 2676699 6 #'run-ansi-replace-chunk-6)
+  (%try-chunk "replace" 2676699 7 #'run-ansi-replace-chunk-7)
+  (%try-chunk "replace" 2676699 8 #'run-ansi-replace-chunk-8)
+  (%try-chunk "replace" 2676699 9 #'run-ansi-replace-chunk-9)
+  (%try-chunk "replace" 2676699 10 #'run-ansi-replace-chunk-10)
+  (%try-chunk "replace" 2676699 11 #'run-ansi-replace-chunk-11)
+  (%try-chunk "replace" 2676699 12 #'run-ansi-replace-chunk-12)
+  (%try-chunk "replace" 2676699 13 #'run-ansi-replace-chunk-13)
 )
 
+(in-package :modus.mvm)
+
 ;; === reverse.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-reverse ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -58988,12 +59979,15 @@ do the defstruct."
 )
 (defun run-ansi-reverse ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "reverse" 9056495 1 #'run-ansi-reverse-chunk-1)
-  (%try-chunk "reverse" 9056495 2 #'run-ansi-reverse-chunk-2)
-  (%try-chunk "reverse" 9056495 3 #'run-ansi-reverse-chunk-3)
+  (%try-chunk "reverse" 9007343 1 #'run-ansi-reverse-chunk-1)
+  (%try-chunk "reverse" 9007343 2 #'run-ansi-reverse-chunk-2)
+  (%try-chunk "reverse" 9007343 3 #'run-ansi-reverse-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === search-bitvector.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-search-bitvector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -59199,12 +60193,15 @@ do the defstruct."
 )
 (defun run-ansi-search-bitvector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "search-bitvector" 15778170 1 #'run-ansi-search-bitvector-chunk-1)
-  (%try-chunk "search-bitvector" 15778170 2 #'run-ansi-search-bitvector-chunk-2)
-  (%try-chunk "search-bitvector" 15778170 3 #'run-ansi-search-bitvector-chunk-3)
+  (%try-chunk "search-bitvector" 590202 1 #'run-ansi-search-bitvector-chunk-1)
+  (%try-chunk "search-bitvector" 590202 2 #'run-ansi-search-bitvector-chunk-2)
+  (%try-chunk "search-bitvector" 590202 3 #'run-ansi-search-bitvector-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === search-list.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-search-list ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -59501,14 +60498,17 @@ do the defstruct."
 )
 (defun run-ansi-search-list ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "search-list" 4787502 1 #'run-ansi-search-list-chunk-1)
-  (%try-chunk "search-list" 4787502 2 #'run-ansi-search-list-chunk-2)
-  (%try-chunk "search-list" 4787502 3 #'run-ansi-search-list-chunk-3)
-  (%try-chunk "search-list" 4787502 4 #'run-ansi-search-list-chunk-4)
-  (%try-chunk "search-list" 4787502 5 #'run-ansi-search-list-chunk-5)
+  (%try-chunk "search-list" 7146798 1 #'run-ansi-search-list-chunk-1)
+  (%try-chunk "search-list" 7146798 2 #'run-ansi-search-list-chunk-2)
+  (%try-chunk "search-list" 7146798 3 #'run-ansi-search-list-chunk-3)
+  (%try-chunk "search-list" 7146798 4 #'run-ansi-search-list-chunk-4)
+  (%try-chunk "search-list" 7146798 5 #'run-ansi-search-list-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === search-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-search-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -59698,12 +60698,15 @@ do the defstruct."
 )
 (defun run-ansi-search-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "search-string" 952241 1 #'run-ansi-search-string-chunk-1)
-  (%try-chunk "search-string" 952241 2 #'run-ansi-search-string-chunk-2)
-  (%try-chunk "search-string" 952241 3 #'run-ansi-search-string-chunk-3)
+  (%try-chunk "search-string" 14895025 1 #'run-ansi-search-string-chunk-1)
+  (%try-chunk "search-string" 14895025 2 #'run-ansi-search-string-chunk-2)
+  (%try-chunk "search-string" 14895025 3 #'run-ansi-search-string-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === search-vector.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP SEARCH-VECTOR.10 "unbound variable *pattern-sublists*")
 (defun run-init-search-vector ()
@@ -59897,12 +60900,15 @@ do the defstruct."
 )
 (defun run-ansi-search-vector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "search-vector" 15661813 1 #'run-ansi-search-vector-chunk-1)
-  (%try-chunk "search-vector" 15661813 2 #'run-ansi-search-vector-chunk-2)
-  (%try-chunk "search-vector" 15661813 3 #'run-ansi-search-vector-chunk-3)
+  (%try-chunk "search-vector" 3078901 1 #'run-ansi-search-vector-chunk-1)
+  (%try-chunk "search-vector" 3078901 2 #'run-ansi-search-vector-chunk-2)
+  (%try-chunk "search-vector" 3078901 3 #'run-ansi-search-vector-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === sort.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP SORT-BIT-VECTOR.3)
 (DEFSKIP SORT-STRING.4)
@@ -60115,13 +61121,16 @@ do the defstruct."
 )
 (defun run-ansi-sort ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "sort" 8251629 1 #'run-ansi-sort-chunk-1)
-  (%try-chunk "sort" 8251629 2 #'run-ansi-sort-chunk-2)
-  (%try-chunk "sort" 8251629 3 #'run-ansi-sort-chunk-3)
-  (%try-chunk "sort" 8251629 4 #'run-ansi-sort-chunk-4)
+  (%try-chunk "sort" 289005 1 #'run-ansi-sort-chunk-1)
+  (%try-chunk "sort" 289005 2 #'run-ansi-sort-chunk-2)
+  (%try-chunk "sort" 289005 3 #'run-ansi-sort-chunk-3)
+  (%try-chunk "sort" 289005 4 #'run-ansi-sort-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === stable-sort.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-stable-sort ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -60355,14 +61364,17 @@ do the defstruct."
 )
 (defun run-ansi-stable-sort ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "stable-sort" 14335069 1 #'run-ansi-stable-sort-chunk-1)
-  (%try-chunk "stable-sort" 14335069 2 #'run-ansi-stable-sort-chunk-2)
-  (%try-chunk "stable-sort" 14335069 3 #'run-ansi-stable-sort-chunk-3)
-  (%try-chunk "stable-sort" 14335069 4 #'run-ansi-stable-sort-chunk-4)
-  (%try-chunk "stable-sort" 14335069 5 #'run-ansi-stable-sort-chunk-5)
+  (%try-chunk "stable-sort" 228445 1 #'run-ansi-stable-sort-chunk-1)
+  (%try-chunk "stable-sort" 228445 2 #'run-ansi-stable-sort-chunk-2)
+  (%try-chunk "stable-sort" 228445 3 #'run-ansi-stable-sort-chunk-3)
+  (%try-chunk "stable-sort" 228445 4 #'run-ansi-stable-sort-chunk-4)
+  (%try-chunk "stable-sort" 228445 5 #'run-ansi-stable-sort-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === subseq.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subseq ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -60611,14 +61623,17 @@ do the defstruct."
 )
 (defun run-ansi-subseq ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subseq" 15810244 1 #'run-ansi-subseq-chunk-1)
-  (%try-chunk "subseq" 15810244 2 #'run-ansi-subseq-chunk-2)
-  (%try-chunk "subseq" 15810244 3 #'run-ansi-subseq-chunk-3)
-  (%try-chunk "subseq" 15810244 4 #'run-ansi-subseq-chunk-4)
-  (%try-chunk "subseq" 15810244 5 #'run-ansi-subseq-chunk-5)
+  (%try-chunk "subseq" 11222724 1 #'run-ansi-subseq-chunk-1)
+  (%try-chunk "subseq" 11222724 2 #'run-ansi-subseq-chunk-2)
+  (%try-chunk "subseq" 11222724 3 #'run-ansi-subseq-chunk-3)
+  (%try-chunk "subseq" 11222724 4 #'run-ansi-subseq-chunk-4)
+  (%try-chunk "subseq" 11222724 5 #'run-ansi-subseq-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === substitute-if-not.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-substitute-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -62138,24 +63153,27 @@ do the defstruct."
 )
 (defun run-ansi-substitute-if-not ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "substitute-if-not" 15517351 1 #'run-ansi-substitute-if-not-chunk-1)
-  (%try-chunk "substitute-if-not" 15517351 2 #'run-ansi-substitute-if-not-chunk-2)
-  (%try-chunk "substitute-if-not" 15517351 3 #'run-ansi-substitute-if-not-chunk-3)
-  (%try-chunk "substitute-if-not" 15517351 4 #'run-ansi-substitute-if-not-chunk-4)
-  (%try-chunk "substitute-if-not" 15517351 5 #'run-ansi-substitute-if-not-chunk-5)
-  (%try-chunk "substitute-if-not" 15517351 6 #'run-ansi-substitute-if-not-chunk-6)
-  (%try-chunk "substitute-if-not" 15517351 7 #'run-ansi-substitute-if-not-chunk-7)
-  (%try-chunk "substitute-if-not" 15517351 8 #'run-ansi-substitute-if-not-chunk-8)
-  (%try-chunk "substitute-if-not" 15517351 9 #'run-ansi-substitute-if-not-chunk-9)
-  (%try-chunk "substitute-if-not" 15517351 10 #'run-ansi-substitute-if-not-chunk-10)
-  (%try-chunk "substitute-if-not" 15517351 11 #'run-ansi-substitute-if-not-chunk-11)
-  (%try-chunk "substitute-if-not" 15517351 12 #'run-ansi-substitute-if-not-chunk-12)
-  (%try-chunk "substitute-if-not" 15517351 13 #'run-ansi-substitute-if-not-chunk-13)
-  (%try-chunk "substitute-if-not" 15517351 14 #'run-ansi-substitute-if-not-chunk-14)
-  (%try-chunk "substitute-if-not" 15517351 15 #'run-ansi-substitute-if-not-chunk-15)
+  (%try-chunk "substitute-if-not" 11650727 1 #'run-ansi-substitute-if-not-chunk-1)
+  (%try-chunk "substitute-if-not" 11650727 2 #'run-ansi-substitute-if-not-chunk-2)
+  (%try-chunk "substitute-if-not" 11650727 3 #'run-ansi-substitute-if-not-chunk-3)
+  (%try-chunk "substitute-if-not" 11650727 4 #'run-ansi-substitute-if-not-chunk-4)
+  (%try-chunk "substitute-if-not" 11650727 5 #'run-ansi-substitute-if-not-chunk-5)
+  (%try-chunk "substitute-if-not" 11650727 6 #'run-ansi-substitute-if-not-chunk-6)
+  (%try-chunk "substitute-if-not" 11650727 7 #'run-ansi-substitute-if-not-chunk-7)
+  (%try-chunk "substitute-if-not" 11650727 8 #'run-ansi-substitute-if-not-chunk-8)
+  (%try-chunk "substitute-if-not" 11650727 9 #'run-ansi-substitute-if-not-chunk-9)
+  (%try-chunk "substitute-if-not" 11650727 10 #'run-ansi-substitute-if-not-chunk-10)
+  (%try-chunk "substitute-if-not" 11650727 11 #'run-ansi-substitute-if-not-chunk-11)
+  (%try-chunk "substitute-if-not" 11650727 12 #'run-ansi-substitute-if-not-chunk-12)
+  (%try-chunk "substitute-if-not" 11650727 13 #'run-ansi-substitute-if-not-chunk-13)
+  (%try-chunk "substitute-if-not" 11650727 14 #'run-ansi-substitute-if-not-chunk-14)
+  (%try-chunk "substitute-if-not" 11650727 15 #'run-ansi-substitute-if-not-chunk-15)
 )
 
+(in-package :modus.mvm)
+
 ;; === substitute-if.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-substitute-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -63602,24 +64620,27 @@ do the defstruct."
 )
 (defun run-ansi-substitute-if ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "substitute-if" 3642495 1 #'run-ansi-substitute-if-chunk-1)
-  (%try-chunk "substitute-if" 3642495 2 #'run-ansi-substitute-if-chunk-2)
-  (%try-chunk "substitute-if" 3642495 3 #'run-ansi-substitute-if-chunk-3)
-  (%try-chunk "substitute-if" 3642495 4 #'run-ansi-substitute-if-chunk-4)
-  (%try-chunk "substitute-if" 3642495 5 #'run-ansi-substitute-if-chunk-5)
-  (%try-chunk "substitute-if" 3642495 6 #'run-ansi-substitute-if-chunk-6)
-  (%try-chunk "substitute-if" 3642495 7 #'run-ansi-substitute-if-chunk-7)
-  (%try-chunk "substitute-if" 3642495 8 #'run-ansi-substitute-if-chunk-8)
-  (%try-chunk "substitute-if" 3642495 9 #'run-ansi-substitute-if-chunk-9)
-  (%try-chunk "substitute-if" 3642495 10 #'run-ansi-substitute-if-chunk-10)
-  (%try-chunk "substitute-if" 3642495 11 #'run-ansi-substitute-if-chunk-11)
-  (%try-chunk "substitute-if" 3642495 12 #'run-ansi-substitute-if-chunk-12)
-  (%try-chunk "substitute-if" 3642495 13 #'run-ansi-substitute-if-chunk-13)
-  (%try-chunk "substitute-if" 3642495 14 #'run-ansi-substitute-if-chunk-14)
-  (%try-chunk "substitute-if" 3642495 15 #'run-ansi-substitute-if-chunk-15)
+  (%try-chunk "substitute-if" 13423743 1 #'run-ansi-substitute-if-chunk-1)
+  (%try-chunk "substitute-if" 13423743 2 #'run-ansi-substitute-if-chunk-2)
+  (%try-chunk "substitute-if" 13423743 3 #'run-ansi-substitute-if-chunk-3)
+  (%try-chunk "substitute-if" 13423743 4 #'run-ansi-substitute-if-chunk-4)
+  (%try-chunk "substitute-if" 13423743 5 #'run-ansi-substitute-if-chunk-5)
+  (%try-chunk "substitute-if" 13423743 6 #'run-ansi-substitute-if-chunk-6)
+  (%try-chunk "substitute-if" 13423743 7 #'run-ansi-substitute-if-chunk-7)
+  (%try-chunk "substitute-if" 13423743 8 #'run-ansi-substitute-if-chunk-8)
+  (%try-chunk "substitute-if" 13423743 9 #'run-ansi-substitute-if-chunk-9)
+  (%try-chunk "substitute-if" 13423743 10 #'run-ansi-substitute-if-chunk-10)
+  (%try-chunk "substitute-if" 13423743 11 #'run-ansi-substitute-if-chunk-11)
+  (%try-chunk "substitute-if" 13423743 12 #'run-ansi-substitute-if-chunk-12)
+  (%try-chunk "substitute-if" 13423743 13 #'run-ansi-substitute-if-chunk-13)
+  (%try-chunk "substitute-if" 13423743 14 #'run-ansi-substitute-if-chunk-14)
+  (%try-chunk "substitute-if" 13423743 15 #'run-ansi-substitute-if-chunk-15)
 )
 
+(in-package :modus.mvm)
+
 ;; === substitute.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP SUBSTITUTE.TEST-AND-TEST-NOT.1)
 (DEFSKIP SUBSTITUTE.TEST-AND-TEST-NOT.2)
@@ -65152,28 +66173,31 @@ do the defstruct."
 )
 (defun run-ansi-substitute ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "substitute" 8688349 1 #'run-ansi-substitute-chunk-1)
-  (%try-chunk "substitute" 8688349 2 #'run-ansi-substitute-chunk-2)
-  (%try-chunk "substitute" 8688349 3 #'run-ansi-substitute-chunk-3)
-  (%try-chunk "substitute" 8688349 4 #'run-ansi-substitute-chunk-4)
-  (%try-chunk "substitute" 8688349 5 #'run-ansi-substitute-chunk-5)
-  (%try-chunk "substitute" 8688349 6 #'run-ansi-substitute-chunk-6)
-  (%try-chunk "substitute" 8688349 7 #'run-ansi-substitute-chunk-7)
-  (%try-chunk "substitute" 8688349 8 #'run-ansi-substitute-chunk-8)
-  (%try-chunk "substitute" 8688349 9 #'run-ansi-substitute-chunk-9)
-  (%try-chunk "substitute" 8688349 10 #'run-ansi-substitute-chunk-10)
-  (%try-chunk "substitute" 8688349 11 #'run-ansi-substitute-chunk-11)
-  (%try-chunk "substitute" 8688349 12 #'run-ansi-substitute-chunk-12)
-  (%try-chunk "substitute" 8688349 13 #'run-ansi-substitute-chunk-13)
-  (%try-chunk "substitute" 8688349 14 #'run-ansi-substitute-chunk-14)
-  (%try-chunk "substitute" 8688349 15 #'run-ansi-substitute-chunk-15)
-  (%try-chunk "substitute" 8688349 16 #'run-ansi-substitute-chunk-16)
-  (%try-chunk "substitute" 8688349 17 #'run-ansi-substitute-chunk-17)
-  (%try-chunk "substitute" 8688349 18 #'run-ansi-substitute-chunk-18)
-  (%try-chunk "substitute" 8688349 19 #'run-ansi-substitute-chunk-19)
+  (%try-chunk "substitute" 3953373 1 #'run-ansi-substitute-chunk-1)
+  (%try-chunk "substitute" 3953373 2 #'run-ansi-substitute-chunk-2)
+  (%try-chunk "substitute" 3953373 3 #'run-ansi-substitute-chunk-3)
+  (%try-chunk "substitute" 3953373 4 #'run-ansi-substitute-chunk-4)
+  (%try-chunk "substitute" 3953373 5 #'run-ansi-substitute-chunk-5)
+  (%try-chunk "substitute" 3953373 6 #'run-ansi-substitute-chunk-6)
+  (%try-chunk "substitute" 3953373 7 #'run-ansi-substitute-chunk-7)
+  (%try-chunk "substitute" 3953373 8 #'run-ansi-substitute-chunk-8)
+  (%try-chunk "substitute" 3953373 9 #'run-ansi-substitute-chunk-9)
+  (%try-chunk "substitute" 3953373 10 #'run-ansi-substitute-chunk-10)
+  (%try-chunk "substitute" 3953373 11 #'run-ansi-substitute-chunk-11)
+  (%try-chunk "substitute" 3953373 12 #'run-ansi-substitute-chunk-12)
+  (%try-chunk "substitute" 3953373 13 #'run-ansi-substitute-chunk-13)
+  (%try-chunk "substitute" 3953373 14 #'run-ansi-substitute-chunk-14)
+  (%try-chunk "substitute" 3953373 15 #'run-ansi-substitute-chunk-15)
+  (%try-chunk "substitute" 3953373 16 #'run-ansi-substitute-chunk-16)
+  (%try-chunk "substitute" 3953373 17 #'run-ansi-substitute-chunk-17)
+  (%try-chunk "substitute" 3953373 18 #'run-ansi-substitute-chunk-18)
+  (%try-chunk "substitute" 3953373 19 #'run-ansi-substitute-chunk-19)
 )
 
+(in-package :modus.mvm)
+
 ;; === adjust-array.lsp ===
+(in-package :modus.mvm)
 (DEFUN LISTIFY-FORM (FORM)
   (COND ((INTEGERP FORM) `'(,FORM)) ((NULL FORM) NIL)
         ((AND (CONSP FORM) (EQ (CAR FORM) 'QUOTE) (CONSP (CADR FORM))) FORM)
@@ -66084,15 +67108,18 @@ do the defstruct."
                              A2)) '#(C D E Y)) (t (c) (%test-crash-fail-c 19756 c)))
 )
 (defun run-ansi-adjust-array ()
-  (%try-chunk "adjust-array" 5247038 1 #'run-ansi-adjust-array-chunk-1)
-  (%try-chunk "adjust-array" 5247038 2 #'run-ansi-adjust-array-chunk-2)
-  (%try-chunk "adjust-array" 5247038 3 #'run-ansi-adjust-array-chunk-3)
-  (%try-chunk "adjust-array" 5247038 4 #'run-ansi-adjust-array-chunk-4)
-  (%try-chunk "adjust-array" 5247038 5 #'run-ansi-adjust-array-chunk-5)
-  (%try-chunk "adjust-array" 5247038 6 #'run-ansi-adjust-array-chunk-6)
+  (%try-chunk "adjust-array" 6590526 1 #'run-ansi-adjust-array-chunk-1)
+  (%try-chunk "adjust-array" 6590526 2 #'run-ansi-adjust-array-chunk-2)
+  (%try-chunk "adjust-array" 6590526 3 #'run-ansi-adjust-array-chunk-3)
+  (%try-chunk "adjust-array" 6590526 4 #'run-ansi-adjust-array-chunk-4)
+  (%try-chunk "adjust-array" 6590526 5 #'run-ansi-adjust-array-chunk-5)
+  (%try-chunk "adjust-array" 6590526 6 #'run-ansi-adjust-array-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === adjustable-array-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-adjustable-array-p ()
   nil
 )
@@ -66147,11 +67174,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 19769 c)))
 )
 (defun run-ansi-adjustable-array-p ()
-  (%try-chunk "adjustable-array-p" 468897 1 #'run-ansi-adjustable-array-p-chunk-1)
-  (%try-chunk "adjustable-array-p" 468897 2 #'run-ansi-adjustable-array-p-chunk-2)
+  (%try-chunk "adjustable-array-p" 190369 1 #'run-ansi-adjustable-array-p-chunk-1)
+  (%try-chunk "adjustable-array-p" 190369 2 #'run-ansi-adjustable-array-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === aref.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP AREF.1 "zero-length array")
 (DEFSKIP SETF-AREF.2 "zero-length array")
 (defun run-init-aref ()
@@ -66340,12 +67370,15 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 19788 c)))
 )
 (defun run-ansi-aref ()
-  (%try-chunk "aref" 11823055 1 #'run-ansi-aref-chunk-1)
-  (%try-chunk "aref" 11823055 2 #'run-ansi-aref-chunk-2)
-  (%try-chunk "aref" 11823055 3 #'run-ansi-aref-chunk-3)
+  (%try-chunk "aref" 2910159 1 #'run-ansi-aref-chunk-1)
+  (%try-chunk "aref" 2910159 2 #'run-ansi-aref-chunk-2)
+  (%try-chunk "aref" 2910159 3 #'run-ansi-aref-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-as-class.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-as-class ()
   nil
 )
@@ -66389,11 +67422,14 @@ do the defstruct."
   (handler-case (run-test 19803 (lambda () (TYPEP (1+ MOST-POSITIVE-FIXNUM) (FIND-CLASS 'ARRAY))) 'NIL) (t (c) (%test-crash-fail-c 19803 c)))
 )
 (defun run-ansi-array-as-class ()
-  (%try-chunk "array-as-class" 16168746 1 #'run-ansi-array-as-class-chunk-1)
-  (%try-chunk "array-as-class" 16168746 2 #'run-ansi-array-as-class-chunk-2)
+  (%try-chunk "array-as-class" 79658 1 #'run-ansi-array-as-class-chunk-1)
+  (%try-chunk "array-as-class" 79658 2 #'run-ansi-array-as-class-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-dimension.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-dimension ()
   nil
 )
@@ -66475,11 +67511,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 19815 c)))
 )
 (defun run-ansi-array-dimension ()
-  (%try-chunk "array-dimension" 12283411 1 #'run-ansi-array-dimension-chunk-1)
-  (%try-chunk "array-dimension" 12283411 2 #'run-ansi-array-dimension-chunk-2)
+  (%try-chunk "array-dimension" 15592979 1 #'run-ansi-array-dimension-chunk-1)
+  (%try-chunk "array-dimension" 15592979 2 #'run-ansi-array-dimension-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-dimensions.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ARRAY-DIMENSIONS.1 "zero-length array")
 (defun run-init-array-dimensions ()
   nil
@@ -66542,11 +67581,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 19827 c)))
 )
 (defun run-ansi-array-dimensions ()
-  (%try-chunk "array-dimensions" 2708544 1 #'run-ansi-array-dimensions-chunk-1)
-  (%try-chunk "array-dimensions" 2708544 2 #'run-ansi-array-dimensions-chunk-2)
+  (%try-chunk "array-dimensions" 16454720 1 #'run-ansi-array-dimensions-chunk-1)
+  (%try-chunk "array-dimensions" 16454720 2 #'run-ansi-array-dimensions-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-displacement.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-displacement ()
   nil
 )
@@ -66751,11 +67793,14 @@ do the defstruct."
   (handler-case (run-test 19841 (lambda () (SIGNALS-TYPE-ERROR X NIL (ARRAY-DISPLACEMENT X))) 'T) (t (c) (%test-crash-fail-c 19841 c)))
 )
 (defun run-ansi-array-displacement ()
-  (%try-chunk "array-displacement" 14712908 1 #'run-ansi-array-displacement-chunk-1)
-  (%try-chunk "array-displacement" 14712908 2 #'run-ansi-array-displacement-chunk-2)
+  (%try-chunk "array-displacement" 5144652 1 #'run-ansi-array-displacement-chunk-1)
+  (%try-chunk "array-displacement" 5144652 2 #'run-ansi-array-displacement-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-element-type.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-element-type ()
   nil
 )
@@ -66775,10 +67820,13 @@ do the defstruct."
   (handler-case (run-test 19847 (lambda () (SIGNALS-TYPE-ERROR X NIL (ARRAY-ELEMENT-TYPE X))) 'T) (t (c) (%test-crash-fail-c 19847 c)))
 )
 (defun run-ansi-array-element-type ()
-  (%try-chunk "array-element-type" 987584 1 #'run-ansi-array-element-type-chunk-1)
+  (%try-chunk "array-element-type" 430528 1 #'run-ansi-array-element-type-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-has-fill-pointer-p.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ARRAY-HAS-FILL-POINTER-P.1 "zero-length array")
 (defun run-init-array-has-fill-pointer-p ()
   nil
@@ -66828,11 +67876,14 @@ do the defstruct."
                             (ARRAY-HAS-FILL-POINTER-P X))) 'T) (t (c) (%test-crash-fail-c 19856 c)))
 )
 (defun run-ansi-array-has-fill-pointer-p ()
-  (%try-chunk "array-has-fill-pointer-p" 5562696 1 #'run-ansi-array-has-fill-pointer-p-chunk-1)
-  (%try-chunk "array-has-fill-pointer-p" 5562696 2 #'run-ansi-array-has-fill-pointer-p-chunk-2)
+  (%try-chunk "array-has-fill-pointer-p" 11379016 1 #'run-ansi-array-has-fill-pointer-p-chunk-1)
+  (%try-chunk "array-has-fill-pointer-p" 11379016 2 #'run-ansi-array-has-fill-pointer-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-in-bounds-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-in-bounds-p ()
   nil
 )
@@ -67093,13 +68144,16 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 19883 c)))
 )
 (defun run-ansi-array-in-bounds-p ()
-  (%try-chunk "array-in-bounds-p" 4202741 1 #'run-ansi-array-in-bounds-p-chunk-1)
-  (%try-chunk "array-in-bounds-p" 4202741 2 #'run-ansi-array-in-bounds-p-chunk-2)
-  (%try-chunk "array-in-bounds-p" 4202741 3 #'run-ansi-array-in-bounds-p-chunk-3)
-  (%try-chunk "array-in-bounds-p" 4202741 4 #'run-ansi-array-in-bounds-p-chunk-4)
+  (%try-chunk "array-in-bounds-p" 8216821 1 #'run-ansi-array-in-bounds-p-chunk-1)
+  (%try-chunk "array-in-bounds-p" 8216821 2 #'run-ansi-array-in-bounds-p-chunk-2)
+  (%try-chunk "array-in-bounds-p" 8216821 3 #'run-ansi-array-in-bounds-p-chunk-3)
+  (%try-chunk "array-in-bounds-p" 8216821 4 #'run-ansi-array-in-bounds-p-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-misc.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-misc ()
   nil
 )
@@ -67112,10 +68166,13 @@ do the defstruct."
   (handler-case (run-test 19889 (lambda () (AND (TYPEP ARRAY-RANK-LIMIT 'FIXNUM) T)) 'T) (t (c) (%test-crash-fail-c 19889 c)))
 )
 (defun run-ansi-array-misc ()
-  (%try-chunk "array-misc" 3975023 1 #'run-ansi-array-misc-chunk-1)
+  (%try-chunk "array-misc" 2844527 1 #'run-ansi-array-misc-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-rank.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-rank ()
   nil
 )
@@ -67150,11 +68207,14 @@ do the defstruct."
   (handler-case (run-test 19898 (lambda () (SIGNALS-TYPE-ERROR X NIL (LOCALLY (ARRAY-RANK X) T))) 'T) (t (c) (%test-crash-fail-c 19898 c)))
 )
 (defun run-ansi-array-rank ()
-  (%try-chunk "array-rank" 3631501 1 #'run-ansi-array-rank-chunk-1)
-  (%try-chunk "array-rank" 3631501 2 #'run-ansi-array-rank-chunk-2)
+  (%try-chunk "array-rank" 15657357 1 #'run-ansi-array-rank-chunk-1)
+  (%try-chunk "array-rank" 15657357 2 #'run-ansi-array-rank-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-row-major-index.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-row-major-index ()
   nil
 )
@@ -67198,10 +68258,13 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 19905 c)))
 )
 (defun run-ansi-array-row-major-index ()
-  (%try-chunk "array-row-major-index" 4727636 1 #'run-ansi-array-row-major-index-chunk-1)
+  (%try-chunk "array-row-major-index" 5481300 1 #'run-ansi-array-row-major-index-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-t.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ARRAY-T.2.2 "zero-length array")
 (DEFSKIP ARRAY-T.3.2 "zero-length array")
 (DEFSKIP ARRAY-T.4.2 "zero-length array")
@@ -67407,17 +68470,20 @@ do the defstruct."
                             '(ARRAY T (2 3)))) 'NIL) (t (c) (%test-crash-fail-c 19962 c)))
 )
 (defun run-ansi-array-t ()
-  (%try-chunk "array-t" 1778519 1 #'run-ansi-array-t-chunk-1)
-  (%try-chunk "array-t" 1778519 2 #'run-ansi-array-t-chunk-2)
-  (%try-chunk "array-t" 1778519 3 #'run-ansi-array-t-chunk-3)
-  (%try-chunk "array-t" 1778519 4 #'run-ansi-array-t-chunk-4)
-  (%try-chunk "array-t" 1778519 5 #'run-ansi-array-t-chunk-5)
-  (%try-chunk "array-t" 1778519 6 #'run-ansi-array-t-chunk-6)
-  (%try-chunk "array-t" 1778519 7 #'run-ansi-array-t-chunk-7)
-  (%try-chunk "array-t" 1778519 8 #'run-ansi-array-t-chunk-8)
+  (%try-chunk "array-t" 16769879 1 #'run-ansi-array-t-chunk-1)
+  (%try-chunk "array-t" 16769879 2 #'run-ansi-array-t-chunk-2)
+  (%try-chunk "array-t" 16769879 3 #'run-ansi-array-t-chunk-3)
+  (%try-chunk "array-t" 16769879 4 #'run-ansi-array-t-chunk-4)
+  (%try-chunk "array-t" 16769879 5 #'run-ansi-array-t-chunk-5)
+  (%try-chunk "array-t" 16769879 6 #'run-ansi-array-t-chunk-6)
+  (%try-chunk "array-t" 16769879 7 #'run-ansi-array-t-chunk-7)
+  (%try-chunk "array-t" 16769879 8 #'run-ansi-array-t-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === array-total-size.lsp ===
+(in-package :modus.mvm)
 (defun run-init-array-total-size ()
   nil
 )
@@ -67470,11 +68536,14 @@ do the defstruct."
                             (LOCALLY (ARRAY-TOTAL-SIZE X) T))) 'T) (t (c) (%test-crash-fail-c 19974 c)))
 )
 (defun run-ansi-array-total-size ()
-  (%try-chunk "array-total-size" 12577081 1 #'run-ansi-array-total-size-chunk-1)
-  (%try-chunk "array-total-size" 12577081 2 #'run-ansi-array-total-size-chunk-2)
+  (%try-chunk "array-total-size" 5728569 1 #'run-ansi-array-total-size-chunk-1)
+  (%try-chunk "array-total-size" 5728569 2 #'run-ansi-array-total-size-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === array.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ARRAY.1.2 "zero-length array")
 (DEFSKIP ARRAY.1.3 "segmentation fault")
 (defun run-init-array ()
@@ -67697,19 +68766,22 @@ do the defstruct."
                             '(ARRAY * (2 3)))) 'NIL) (t (c) (%test-crash-fail-c 20048 c)))
 )
 (defun run-ansi-array ()
-  (%try-chunk "array" 9031646 1 #'run-ansi-array-chunk-1)
-  (%try-chunk "array" 9031646 2 #'run-ansi-array-chunk-2)
-  (%try-chunk "array" 9031646 3 #'run-ansi-array-chunk-3)
-  (%try-chunk "array" 9031646 4 #'run-ansi-array-chunk-4)
-  (%try-chunk "array" 9031646 5 #'run-ansi-array-chunk-5)
-  (%try-chunk "array" 9031646 6 #'run-ansi-array-chunk-6)
-  (%try-chunk "array" 9031646 7 #'run-ansi-array-chunk-7)
-  (%try-chunk "array" 9031646 8 #'run-ansi-array-chunk-8)
-  (%try-chunk "array" 9031646 9 #'run-ansi-array-chunk-9)
-  (%try-chunk "array" 9031646 10 #'run-ansi-array-chunk-10)
+  (%try-chunk "array" 10588126 1 #'run-ansi-array-chunk-1)
+  (%try-chunk "array" 10588126 2 #'run-ansi-array-chunk-2)
+  (%try-chunk "array" 10588126 3 #'run-ansi-array-chunk-3)
+  (%try-chunk "array" 10588126 4 #'run-ansi-array-chunk-4)
+  (%try-chunk "array" 10588126 5 #'run-ansi-array-chunk-5)
+  (%try-chunk "array" 10588126 6 #'run-ansi-array-chunk-6)
+  (%try-chunk "array" 10588126 7 #'run-ansi-array-chunk-7)
+  (%try-chunk "array" 10588126 8 #'run-ansi-array-chunk-8)
+  (%try-chunk "array" 10588126 9 #'run-ansi-array-chunk-9)
+  (%try-chunk "array" 10588126 10 #'run-ansi-array-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === arrayp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-arrayp ()
   nil
 )
@@ -67752,11 +68824,14 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20058 c)))
 )
 (defun run-ansi-arrayp ()
-  (%try-chunk "arrayp" 15280222 1 #'run-ansi-arrayp-chunk-1)
-  (%try-chunk "arrayp" 15280222 2 #'run-ansi-arrayp-chunk-2)
+  (%try-chunk "arrayp" 12101726 1 #'run-ansi-arrayp-chunk-1)
+  (%try-chunk "arrayp" 12101726 2 #'run-ansi-arrayp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-and.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-AND.1 "zero-length array")
 (DEFSKIP BIT-AND.2 "zero-length array")
 (DEFSKIP BIT-AND.3 "zero-length array")
@@ -68147,12 +69222,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20078 c)))
 )
 (defun run-ansi-bit-and ()
-  (%try-chunk "bit-and" 10102918 1 #'run-ansi-bit-and-chunk-1)
-  (%try-chunk "bit-and" 10102918 2 #'run-ansi-bit-and-chunk-2)
-  (%try-chunk "bit-and" 10102918 3 #'run-ansi-bit-and-chunk-3)
+  (%try-chunk "bit-and" 8661126 1 #'run-ansi-bit-and-chunk-1)
+  (%try-chunk "bit-and" 8661126 2 #'run-ansi-bit-and-chunk-2)
+  (%try-chunk "bit-and" 8661126 3 #'run-ansi-bit-and-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-andc1.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-ANDC1.1 "zero-length array")
 (DEFSKIP BIT-ANDC1.2 "zero-length array")
 (DEFSKIP BIT-ANDC1.3 "zero-length array")
@@ -68547,12 +69625,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20098 c)))
 )
 (defun run-ansi-bit-andc1 ()
-  (%try-chunk "bit-andc1" 15165036 1 #'run-ansi-bit-andc1-chunk-1)
-  (%try-chunk "bit-andc1" 15165036 2 #'run-ansi-bit-andc1-chunk-2)
-  (%try-chunk "bit-andc1" 15165036 3 #'run-ansi-bit-andc1-chunk-3)
+  (%try-chunk "bit-andc1" 13772396 1 #'run-ansi-bit-andc1-chunk-1)
+  (%try-chunk "bit-andc1" 13772396 2 #'run-ansi-bit-andc1-chunk-2)
+  (%try-chunk "bit-andc1" 13772396 3 #'run-ansi-bit-andc1-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-andc2.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-ANDC2.1 "zero-length array")
 (DEFSKIP BIT-ANDC2.2 "zero-length array")
 (DEFSKIP BIT-ANDC2.3 "zero-length array")
@@ -68947,12 +70028,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20118 c)))
 )
 (defun run-ansi-bit-andc2 ()
-  (%try-chunk "bit-andc2" 15165303 1 #'run-ansi-bit-andc2-chunk-1)
-  (%try-chunk "bit-andc2" 15165303 2 #'run-ansi-bit-andc2-chunk-2)
-  (%try-chunk "bit-andc2" 15165303 3 #'run-ansi-bit-andc2-chunk-3)
+  (%try-chunk "bit-andc2" 26487 1 #'run-ansi-bit-andc2-chunk-1)
+  (%try-chunk "bit-andc2" 26487 2 #'run-ansi-bit-andc2-chunk-2)
+  (%try-chunk "bit-andc2" 26487 3 #'run-ansi-bit-andc2-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-eqv.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-EQV.1 "zero-length array")
 (DEFSKIP BIT-EQV.2 "zero-length array")
 (DEFSKIP BIT-EQV.3 "zero-length array")
@@ -69343,12 +70427,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20138 c)))
 )
 (defun run-ansi-bit-eqv ()
-  (%try-chunk "bit-eqv" 7484271 1 #'run-ansi-bit-eqv-chunk-1)
-  (%try-chunk "bit-eqv" 7484271 2 #'run-ansi-bit-eqv-chunk-2)
-  (%try-chunk "bit-eqv" 7484271 3 #'run-ansi-bit-eqv-chunk-3)
+  (%try-chunk "bit-eqv" 947055 1 #'run-ansi-bit-eqv-chunk-1)
+  (%try-chunk "bit-eqv" 947055 2 #'run-ansi-bit-eqv-chunk-2)
+  (%try-chunk "bit-eqv" 947055 3 #'run-ansi-bit-eqv-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-ior.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-IOR.1 "zero-length array")
 (DEFSKIP BIT-IOR.2 "zero-length array")
 (DEFSKIP BIT-IOR.3 "zero-length array")
@@ -69739,12 +70826,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20158 c)))
 )
 (defun run-ansi-bit-ior ()
-  (%try-chunk "bit-ior" 5609753 1 #'run-ansi-bit-ior-chunk-1)
-  (%try-chunk "bit-ior" 5609753 2 #'run-ansi-bit-ior-chunk-2)
-  (%try-chunk "bit-ior" 5609753 3 #'run-ansi-bit-ior-chunk-3)
+  (%try-chunk "bit-ior" 907545 1 #'run-ansi-bit-ior-chunk-1)
+  (%try-chunk "bit-ior" 907545 2 #'run-ansi-bit-ior-chunk-2)
+  (%try-chunk "bit-ior" 907545 3 #'run-ansi-bit-ior-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-nand.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-NAND.1 "zero-length array")
 (DEFSKIP BIT-NAND.2 "zero-length array")
 (DEFSKIP BIT-NAND.3 "zero-length array")
@@ -70137,12 +71227,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20178 c)))
 )
 (defun run-ansi-bit-nand ()
-  (%try-chunk "bit-nand" 10530736 1 #'run-ansi-bit-nand-chunk-1)
-  (%try-chunk "bit-nand" 10530736 2 #'run-ansi-bit-nand-chunk-2)
-  (%try-chunk "bit-nand" 10530736 3 #'run-ansi-bit-nand-chunk-3)
+  (%try-chunk "bit-nand" 2568112 1 #'run-ansi-bit-nand-chunk-1)
+  (%try-chunk "bit-nand" 2568112 2 #'run-ansi-bit-nand-chunk-2)
+  (%try-chunk "bit-nand" 2568112 3 #'run-ansi-bit-nand-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-nor.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-NOR.1 "zero-length array")
 (DEFSKIP BIT-NOR.2 "zero-length array")
 (DEFSKIP BIT-NOR.3 "zero-length array")
@@ -70533,12 +71626,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20198 c)))
 )
 (defun run-ansi-bit-nor ()
-  (%try-chunk "bit-nor" 4785702 1 #'run-ansi-bit-nor-chunk-1)
-  (%try-chunk "bit-nor" 4785702 2 #'run-ansi-bit-nor-chunk-2)
-  (%try-chunk "bit-nor" 4785702 3 #'run-ansi-bit-nor-chunk-3)
+  (%try-chunk "bit-nor" 8816166 1 #'run-ansi-bit-nor-chunk-1)
+  (%try-chunk "bit-nor" 8816166 2 #'run-ansi-bit-nor-chunk-2)
+  (%try-chunk "bit-nor" 8816166 3 #'run-ansi-bit-nor-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-not.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-NOT.1 "zero-length array")
 (DEFSKIP BIT-NOT.2 "zero-length array")
 (DEFSKIP BIT-NOT.3 "zero-length array")
@@ -70721,11 +71817,14 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20212 c)))
 )
 (defun run-ansi-bit-not ()
-  (%try-chunk "bit-not" 4785168 1 #'run-ansi-bit-not-chunk-1)
-  (%try-chunk "bit-not" 4785168 2 #'run-ansi-bit-not-chunk-2)
+  (%try-chunk "bit-not" 2753552 1 #'run-ansi-bit-not-chunk-1)
+  (%try-chunk "bit-not" 2753552 2 #'run-ansi-bit-not-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-orc1.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-ORC1.1 "zero-length array")
 (DEFSKIP BIT-ORC1.2 "zero-length array")
 (DEFSKIP BIT-ORC1.3 "zero-length array")
@@ -71133,12 +72232,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20233 c)))
 )
 (defun run-ansi-bit-orc1 ()
-  (%try-chunk "bit-orc1" 14435562 1 #'run-ansi-bit-orc1-chunk-1)
-  (%try-chunk "bit-orc1" 14435562 2 #'run-ansi-bit-orc1-chunk-2)
-  (%try-chunk "bit-orc1" 14435562 3 #'run-ansi-bit-orc1-chunk-3)
+  (%try-chunk "bit-orc1" 4228330 1 #'run-ansi-bit-orc1-chunk-1)
+  (%try-chunk "bit-orc1" 4228330 2 #'run-ansi-bit-orc1-chunk-2)
+  (%try-chunk "bit-orc1" 4228330 3 #'run-ansi-bit-orc1-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-orc2.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-ORC2.1 "zero-length array")
 (DEFSKIP BIT-ORC2.2 "zero-length array")
 (DEFSKIP BIT-ORC2.3 "zero-length array")
@@ -71546,12 +72648,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20254 c)))
 )
 (defun run-ansi-bit-orc2 ()
-  (%try-chunk "bit-orc2" 14435473 1 #'run-ansi-bit-orc2-chunk-1)
-  (%try-chunk "bit-orc2" 14435473 2 #'run-ansi-bit-orc2-chunk-2)
-  (%try-chunk "bit-orc2" 14435473 3 #'run-ansi-bit-orc2-chunk-3)
+  (%try-chunk "bit-orc2" 14402705 1 #'run-ansi-bit-orc2-chunk-1)
+  (%try-chunk "bit-orc2" 14402705 2 #'run-ansi-bit-orc2-chunk-2)
+  (%try-chunk "bit-orc2" 14402705 3 #'run-ansi-bit-orc2-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-vector-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-bit-vector-p ()
   nil
 )
@@ -71599,11 +72704,14 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20270 c)))
 )
 (defun run-ansi-bit-vector-p ()
-  (%try-chunk "bit-vector-p" 4149841 1 #'run-ansi-bit-vector-p-chunk-1)
-  (%try-chunk "bit-vector-p" 4149841 2 #'run-ansi-bit-vector-p-chunk-2)
+  (%try-chunk "bit-vector-p" 10768977 1 #'run-ansi-bit-vector-p-chunk-1)
+  (%try-chunk "bit-vector-p" 10768977 2 #'run-ansi-bit-vector-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-vector.lsp ===
+(in-package :modus.mvm)
 (defun run-init-bit-vector ()
   nil
 )
@@ -71649,13 +72757,16 @@ do the defstruct."
                             (FIND-CLASS 'BIT-VECTOR))) 'NIL) (t (c) (%test-crash-fail-c 20297 c)))
 )
 (defun run-ansi-bit-vector ()
-  (%try-chunk "bit-vector" 828732 1 #'run-ansi-bit-vector-chunk-1)
-  (%try-chunk "bit-vector" 828732 2 #'run-ansi-bit-vector-chunk-2)
-  (%try-chunk "bit-vector" 828732 3 #'run-ansi-bit-vector-chunk-3)
-  (%try-chunk "bit-vector" 828732 4 #'run-ansi-bit-vector-chunk-4)
+  (%try-chunk "bit-vector" 4007228 1 #'run-ansi-bit-vector-chunk-1)
+  (%try-chunk "bit-vector" 4007228 2 #'run-ansi-bit-vector-chunk-2)
+  (%try-chunk "bit-vector" 4007228 3 #'run-ansi-bit-vector-chunk-3)
+  (%try-chunk "bit-vector" 4007228 4 #'run-ansi-bit-vector-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit-xor.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP BIT-XOR.1 "zero-length array")
 (DEFSKIP BIT-XOR.2 "zero-length array")
 (DEFSKIP BIT-XOR.3 "zero-length array")
@@ -72046,12 +73157,15 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20317 c)))
 )
 (defun run-ansi-bit-xor ()
-  (%try-chunk "bit-xor" 16426368 1 #'run-ansi-bit-xor-chunk-1)
-  (%try-chunk "bit-xor" 16426368 2 #'run-ansi-bit-xor-chunk-2)
-  (%try-chunk "bit-xor" 16426368 3 #'run-ansi-bit-xor-chunk-3)
+  (%try-chunk "bit-xor" 15148416 1 #'run-ansi-bit-xor-chunk-1)
+  (%try-chunk "bit-xor" 15148416 2 #'run-ansi-bit-xor-chunk-2)
+  (%try-chunk "bit-xor" 15148416 3 #'run-ansi-bit-xor-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === bit.lsp ===
+(in-package :modus.mvm)
 (defun run-init-bit ()
   nil
 )
@@ -72304,11 +73418,14 @@ do the defstruct."
   (handler-case (run-test 20328 (lambda () (HANDLER-CASE (PROGN (BIT) NIL) (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20328 c)))
 )
 (defun run-ansi-bit ()
-  (%try-chunk "bit" 16110104 1 #'run-ansi-bit-chunk-1)
-  (%try-chunk "bit" 16110104 2 #'run-ansi-bit-chunk-2)
+  (%try-chunk "bit" 9703960 1 #'run-ansi-bit-chunk-1)
+  (%try-chunk "bit" 9703960 2 #'run-ansi-bit-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === fill-pointer.lsp ===
+(in-package :modus.mvm)
 (defun run-init-fill-pointer ()
   nil
 )
@@ -72429,11 +73546,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20340 c)))
 )
 (defun run-ansi-fill-pointer ()
-  (%try-chunk "fill-pointer" 5540310 1 #'run-ansi-fill-pointer-chunk-1)
-  (%try-chunk "fill-pointer" 5540310 2 #'run-ansi-fill-pointer-chunk-2)
+  (%try-chunk "fill-pointer" 5966294 1 #'run-ansi-fill-pointer-chunk-1)
+  (%try-chunk "fill-pointer" 5966294 2 #'run-ansi-fill-pointer-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;array-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;bit-aux.lsp")
 (IN-PACKAGE "CL-TEST")
@@ -72494,7 +73614,10 @@ do the defstruct."
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-array.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP MAKE-ARRAY.10 "zero-length array")
 (DEFSKIP MAKE-ARRAY.11 "zero-length array")
 (DEFSKIP MAKE-ARRAY.12 "zero-length array")
@@ -73837,24 +74960,27 @@ do the defstruct."
                                                                       4 1 2 3 4)) (t (c) (%test-crash-fail-c 20453 c)))
 )
 (defun run-ansi-make-array ()
-  (%try-chunk "make-array" 6980345 1 #'run-ansi-make-array-chunk-1)
-  (%try-chunk "make-array" 6980345 2 #'run-ansi-make-array-chunk-2)
-  (%try-chunk "make-array" 6980345 3 #'run-ansi-make-array-chunk-3)
-  (%try-chunk "make-array" 6980345 4 #'run-ansi-make-array-chunk-4)
-  (%try-chunk "make-array" 6980345 5 #'run-ansi-make-array-chunk-5)
-  (%try-chunk "make-array" 6980345 6 #'run-ansi-make-array-chunk-6)
-  (%try-chunk "make-array" 6980345 7 #'run-ansi-make-array-chunk-7)
-  (%try-chunk "make-array" 6980345 8 #'run-ansi-make-array-chunk-8)
-  (%try-chunk "make-array" 6980345 9 #'run-ansi-make-array-chunk-9)
-  (%try-chunk "make-array" 6980345 10 #'run-ansi-make-array-chunk-10)
-  (%try-chunk "make-array" 6980345 11 #'run-ansi-make-array-chunk-11)
-  (%try-chunk "make-array" 6980345 12 #'run-ansi-make-array-chunk-12)
-  (%try-chunk "make-array" 6980345 13 #'run-ansi-make-array-chunk-13)
-  (%try-chunk "make-array" 6980345 14 #'run-ansi-make-array-chunk-14)
-  (%try-chunk "make-array" 6980345 15 #'run-ansi-make-array-chunk-15)
+  (%try-chunk "make-array" 246521 1 #'run-ansi-make-array-chunk-1)
+  (%try-chunk "make-array" 246521 2 #'run-ansi-make-array-chunk-2)
+  (%try-chunk "make-array" 246521 3 #'run-ansi-make-array-chunk-3)
+  (%try-chunk "make-array" 246521 4 #'run-ansi-make-array-chunk-4)
+  (%try-chunk "make-array" 246521 5 #'run-ansi-make-array-chunk-5)
+  (%try-chunk "make-array" 246521 6 #'run-ansi-make-array-chunk-6)
+  (%try-chunk "make-array" 246521 7 #'run-ansi-make-array-chunk-7)
+  (%try-chunk "make-array" 246521 8 #'run-ansi-make-array-chunk-8)
+  (%try-chunk "make-array" 246521 9 #'run-ansi-make-array-chunk-9)
+  (%try-chunk "make-array" 246521 10 #'run-ansi-make-array-chunk-10)
+  (%try-chunk "make-array" 246521 11 #'run-ansi-make-array-chunk-11)
+  (%try-chunk "make-array" 246521 12 #'run-ansi-make-array-chunk-12)
+  (%try-chunk "make-array" 246521 13 #'run-ansi-make-array-chunk-13)
+  (%try-chunk "make-array" 246521 14 #'run-ansi-make-array-chunk-14)
+  (%try-chunk "make-array" 246521 15 #'run-ansi-make-array-chunk-15)
 )
 
+(in-package :modus.mvm)
+
 ;; === row-major-aref.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP ROW-MAJOR-AREF.3 "zero-length array")
 (DEFSKIP ROW-MAJOR-AREF.6 "zero-length array")
 (defun run-init-row-major-aref ()
@@ -74007,11 +75133,14 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20464 c)))
 )
 (defun run-ansi-row-major-aref ()
-  (%try-chunk "row-major-aref" 12253078 1 #'run-ansi-row-major-aref-chunk-1)
-  (%try-chunk "row-major-aref" 12253078 2 #'run-ansi-row-major-aref-chunk-2)
+  (%try-chunk "row-major-aref" 9353110 1 #'run-ansi-row-major-aref-chunk-1)
+  (%try-chunk "row-major-aref" 9353110 2 #'run-ansi-row-major-aref-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === sbit.lsp ===
+(in-package :modus.mvm)
 (defun run-init-sbit ()
   nil
 )
@@ -74115,11 +75244,14 @@ do the defstruct."
   (handler-case (run-test 20473 (lambda () (HANDLER-CASE (PROGN (SBIT) NIL) (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20473 c)))
 )
 (defun run-ansi-sbit ()
-  (%try-chunk "sbit" 15090211 1 #'run-ansi-sbit-chunk-1)
-  (%try-chunk "sbit" 15090211 2 #'run-ansi-sbit-chunk-2)
+  (%try-chunk "sbit" 15942179 1 #'run-ansi-sbit-chunk-1)
+  (%try-chunk "sbit" 15942179 2 #'run-ansi-sbit-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-array-t.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP SIMPLE-ARRAY-T.2.2 "zero-length array")
 (DEFSKIP SIMPLE-ARRAY-T.3.2 "zero-length array")
 (DEFSKIP SIMPLE-ARRAY-T.4.2 "zero-length array")
@@ -74325,17 +75457,20 @@ do the defstruct."
                             '(SIMPLE-ARRAY T (2 3)))) 'NIL) (t (c) (%test-crash-fail-c 20530 c)))
 )
 (defun run-ansi-simple-array-t ()
-  (%try-chunk "simple-array-t" 7999132 1 #'run-ansi-simple-array-t-chunk-1)
-  (%try-chunk "simple-array-t" 7999132 2 #'run-ansi-simple-array-t-chunk-2)
-  (%try-chunk "simple-array-t" 7999132 3 #'run-ansi-simple-array-t-chunk-3)
-  (%try-chunk "simple-array-t" 7999132 4 #'run-ansi-simple-array-t-chunk-4)
-  (%try-chunk "simple-array-t" 7999132 5 #'run-ansi-simple-array-t-chunk-5)
-  (%try-chunk "simple-array-t" 7999132 6 #'run-ansi-simple-array-t-chunk-6)
-  (%try-chunk "simple-array-t" 7999132 7 #'run-ansi-simple-array-t-chunk-7)
-  (%try-chunk "simple-array-t" 7999132 8 #'run-ansi-simple-array-t-chunk-8)
+  (%try-chunk "simple-array-t" 5869212 1 #'run-ansi-simple-array-t-chunk-1)
+  (%try-chunk "simple-array-t" 5869212 2 #'run-ansi-simple-array-t-chunk-2)
+  (%try-chunk "simple-array-t" 5869212 3 #'run-ansi-simple-array-t-chunk-3)
+  (%try-chunk "simple-array-t" 5869212 4 #'run-ansi-simple-array-t-chunk-4)
+  (%try-chunk "simple-array-t" 5869212 5 #'run-ansi-simple-array-t-chunk-5)
+  (%try-chunk "simple-array-t" 5869212 6 #'run-ansi-simple-array-t-chunk-6)
+  (%try-chunk "simple-array-t" 5869212 7 #'run-ansi-simple-array-t-chunk-7)
+  (%try-chunk "simple-array-t" 5869212 8 #'run-ansi-simple-array-t-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-array.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP SIMPLE-ARRAY.1.2 "zero-length array")
 (DEFSKIP SIMPLE-ARRAY.2.2 "zero-length array")
 (DEFSKIP SIMPLE-ARRAY.3.2 "zero-length array")
@@ -74561,18 +75696,21 @@ do the defstruct."
                             '(SIMPLE-ARRAY * (2 3)))) 'NIL) (t (c) (%test-crash-fail-c 20599 c)))
 )
 (defun run-ansi-simple-array ()
-  (%try-chunk "simple-array" 8017861 1 #'run-ansi-simple-array-chunk-1)
-  (%try-chunk "simple-array" 8017861 2 #'run-ansi-simple-array-chunk-2)
-  (%try-chunk "simple-array" 8017861 3 #'run-ansi-simple-array-chunk-3)
-  (%try-chunk "simple-array" 8017861 4 #'run-ansi-simple-array-chunk-4)
-  (%try-chunk "simple-array" 8017861 5 #'run-ansi-simple-array-chunk-5)
-  (%try-chunk "simple-array" 8017861 6 #'run-ansi-simple-array-chunk-6)
-  (%try-chunk "simple-array" 8017861 7 #'run-ansi-simple-array-chunk-7)
-  (%try-chunk "simple-array" 8017861 8 #'run-ansi-simple-array-chunk-8)
-  (%try-chunk "simple-array" 8017861 9 #'run-ansi-simple-array-chunk-9)
+  (%try-chunk "simple-array" 12572613 1 #'run-ansi-simple-array-chunk-1)
+  (%try-chunk "simple-array" 12572613 2 #'run-ansi-simple-array-chunk-2)
+  (%try-chunk "simple-array" 12572613 3 #'run-ansi-simple-array-chunk-3)
+  (%try-chunk "simple-array" 12572613 4 #'run-ansi-simple-array-chunk-4)
+  (%try-chunk "simple-array" 12572613 5 #'run-ansi-simple-array-chunk-5)
+  (%try-chunk "simple-array" 12572613 6 #'run-ansi-simple-array-chunk-6)
+  (%try-chunk "simple-array" 12572613 7 #'run-ansi-simple-array-chunk-7)
+  (%try-chunk "simple-array" 12572613 8 #'run-ansi-simple-array-chunk-8)
+  (%try-chunk "simple-array" 12572613 9 #'run-ansi-simple-array-chunk-9)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-bit-vector-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-simple-bit-vector-p ()
   nil
 )
@@ -74600,11 +75738,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20612 c)))
 )
 (defun run-ansi-simple-bit-vector-p ()
-  (%try-chunk "simple-bit-vector-p" 7631154 1 #'run-ansi-simple-bit-vector-p-chunk-1)
-  (%try-chunk "simple-bit-vector-p" 7631154 2 #'run-ansi-simple-bit-vector-p-chunk-2)
+  (%try-chunk "simple-bit-vector-p" 3387698 1 #'run-ansi-simple-bit-vector-p-chunk-1)
+  (%try-chunk "simple-bit-vector-p" 3387698 2 #'run-ansi-simple-bit-vector-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-bit-vector.lsp ===
+(in-package :modus.mvm)
 (defun run-init-simple-bit-vector ()
   nil
 )
@@ -74632,11 +75773,14 @@ do the defstruct."
   (handler-case (run-test 20628 (lambda () (NOTNOT-MV (TYPEP #*01101 '(SIMPLE-BIT-VECTOR 5)))) 'T) (t (c) (%test-crash-fail-c 20628 c)))
 )
 (defun run-ansi-simple-bit-vector ()
-  (%try-chunk "simple-bit-vector" 6914319 1 #'run-ansi-simple-bit-vector-chunk-1)
-  (%try-chunk "simple-bit-vector" 6914319 2 #'run-ansi-simple-bit-vector-chunk-2)
+  (%try-chunk "simple-bit-vector" 6340879 1 #'run-ansi-simple-bit-vector-chunk-1)
+  (%try-chunk "simple-bit-vector" 6340879 2 #'run-ansi-simple-bit-vector-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === simple-vector-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-simple-vector-p ()
   nil
 )
@@ -74663,11 +75807,14 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20639 c)))
 )
 (defun run-ansi-simple-vector-p ()
-  (%try-chunk "simple-vector-p" 5849392 1 #'run-ansi-simple-vector-p-chunk-1)
-  (%try-chunk "simple-vector-p" 5849392 2 #'run-ansi-simple-vector-p-chunk-2)
+  (%try-chunk "simple-vector-p" 8388912 1 #'run-ansi-simple-vector-p-chunk-1)
+  (%try-chunk "simple-vector-p" 8388912 2 #'run-ansi-simple-vector-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === svref.lsp ===
+(in-package :modus.mvm)
 (defun run-init-svref ()
   nil
 )
@@ -74731,10 +75878,13 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20647 c)))
 )
 (defun run-ansi-svref ()
-  (%try-chunk "svref" 12256619 1 #'run-ansi-svref-chunk-1)
+  (%try-chunk "svref" 11552107 1 #'run-ansi-svref-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === upgraded-array-element-type.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *UPGRADED-ARRAY-TYPES-TO-CHECK*
   `(BOOLEAN BASE-CHAR CHARACTER T
     ,@(LOOP FOR I FROM 0 TO 32
@@ -74863,11 +76013,14 @@ do the defstruct."
                                         FLOAT SHORT-FLOAT SINGLE-FLOAT
                                         DOUBLE-FLOAT COMPLEX RATIONAL FIXNUM
                                         FUNCTION SEQUENCE LIST CONS ATOM SYMBOL)) (t (c) nil))
-  (%try-chunk "upgraded-array-element-type" 2021033 1 #'run-ansi-upgraded-array-element-type-chunk-1)
-  (%try-chunk "upgraded-array-element-type" 2021033 2 #'run-ansi-upgraded-array-element-type-chunk-2)
+  (%try-chunk "upgraded-array-element-type" 10147497 1 #'run-ansi-upgraded-array-element-type-chunk-1)
+  (%try-chunk "upgraded-array-element-type" 10147497 2 #'run-ansi-upgraded-array-element-type-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === vector-pop.lsp ===
+(in-package :modus.mvm)
 (defun run-init-vector-pop ()
   nil
 )
@@ -74913,10 +76066,13 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20663 c)))
 )
 (defun run-ansi-vector-pop ()
-  (%try-chunk "vector-pop" 11078540 1 #'run-ansi-vector-pop-chunk-1)
+  (%try-chunk "vector-pop" 2231180 1 #'run-ansi-vector-pop-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === vector-push-extend.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP VECTOR-PUSH-EXTEND.28)
 (DEFUN VECTOR-PUSH-EXTEND-ERROR-TEST (SEQ VAL)
   (DECLARE (OPTIMIZE (SAFETY 3)))
@@ -75770,15 +76926,18 @@ do the defstruct."
                             (ERROR NIL T))) 'T) (t (c) (%test-crash-fail-c 20709 c)))
 )
 (defun run-ansi-vector-push-extend ()
-  (%try-chunk "vector-push-extend" 9650510 1 #'run-ansi-vector-push-extend-chunk-1)
-  (%try-chunk "vector-push-extend" 9650510 2 #'run-ansi-vector-push-extend-chunk-2)
-  (%try-chunk "vector-push-extend" 9650510 3 #'run-ansi-vector-push-extend-chunk-3)
-  (%try-chunk "vector-push-extend" 9650510 4 #'run-ansi-vector-push-extend-chunk-4)
-  (%try-chunk "vector-push-extend" 9650510 5 #'run-ansi-vector-push-extend-chunk-5)
-  (%try-chunk "vector-push-extend" 9650510 6 #'run-ansi-vector-push-extend-chunk-6)
+  (%try-chunk "vector-push-extend" 15335758 1 #'run-ansi-vector-push-extend-chunk-1)
+  (%try-chunk "vector-push-extend" 15335758 2 #'run-ansi-vector-push-extend-chunk-2)
+  (%try-chunk "vector-push-extend" 15335758 3 #'run-ansi-vector-push-extend-chunk-3)
+  (%try-chunk "vector-push-extend" 15335758 4 #'run-ansi-vector-push-extend-chunk-4)
+  (%try-chunk "vector-push-extend" 15335758 5 #'run-ansi-vector-push-extend-chunk-5)
+  (%try-chunk "vector-push-extend" 15335758 6 #'run-ansi-vector-push-extend-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === vector-push.lsp ===
+(in-package :modus.mvm)
 (DEFUN VECTOR-PUSH-ERROR-TEST (SEQ VAL)
   (DECLARE (OPTIMIZE (SAFETY 3)))
   (HANDLER-CASE
@@ -76183,14 +77342,17 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20745 c)))
 )
 (defun run-ansi-vector-push ()
-  (%try-chunk "vector-push" 14165101 1 #'run-ansi-vector-push-chunk-1)
-  (%try-chunk "vector-push" 14165101 2 #'run-ansi-vector-push-chunk-2)
-  (%try-chunk "vector-push" 14165101 3 #'run-ansi-vector-push-chunk-3)
-  (%try-chunk "vector-push" 14165101 4 #'run-ansi-vector-push-chunk-4)
-  (%try-chunk "vector-push" 14165101 5 #'run-ansi-vector-push-chunk-5)
+  (%try-chunk "vector-push" 5858413 1 #'run-ansi-vector-push-chunk-1)
+  (%try-chunk "vector-push" 5858413 2 #'run-ansi-vector-push-chunk-2)
+  (%try-chunk "vector-push" 5858413 3 #'run-ansi-vector-push-chunk-3)
+  (%try-chunk "vector-push" 5858413 4 #'run-ansi-vector-push-chunk-4)
+  (%try-chunk "vector-push" 5858413 5 #'run-ansi-vector-push-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === vector.lsp ===
+(in-package :modus.mvm)
 (defun run-init-vector ()
   nil
 )
@@ -76354,19 +77516,22 @@ do the defstruct."
                                                                     1 2 3)) (t (c) (%test-crash-fail-c 20818 c)))
 )
 (defun run-ansi-vector ()
-  (%try-chunk "vector" 4357374 1 #'run-ansi-vector-chunk-1)
-  (%try-chunk "vector" 4357374 2 #'run-ansi-vector-chunk-2)
-  (%try-chunk "vector" 4357374 3 #'run-ansi-vector-chunk-3)
-  (%try-chunk "vector" 4357374 4 #'run-ansi-vector-chunk-4)
-  (%try-chunk "vector" 4357374 5 #'run-ansi-vector-chunk-5)
-  (%try-chunk "vector" 4357374 6 #'run-ansi-vector-chunk-6)
-  (%try-chunk "vector" 4357374 7 #'run-ansi-vector-chunk-7)
-  (%try-chunk "vector" 4357374 8 #'run-ansi-vector-chunk-8)
-  (%try-chunk "vector" 4357374 9 #'run-ansi-vector-chunk-9)
-  (%try-chunk "vector" 4357374 10 #'run-ansi-vector-chunk-10)
+  (%try-chunk "vector" 15777022 1 #'run-ansi-vector-chunk-1)
+  (%try-chunk "vector" 15777022 2 #'run-ansi-vector-chunk-2)
+  (%try-chunk "vector" 15777022 3 #'run-ansi-vector-chunk-3)
+  (%try-chunk "vector" 15777022 4 #'run-ansi-vector-chunk-4)
+  (%try-chunk "vector" 15777022 5 #'run-ansi-vector-chunk-5)
+  (%try-chunk "vector" 15777022 6 #'run-ansi-vector-chunk-6)
+  (%try-chunk "vector" 15777022 7 #'run-ansi-vector-chunk-7)
+  (%try-chunk "vector" 15777022 8 #'run-ansi-vector-chunk-8)
+  (%try-chunk "vector" 15777022 9 #'run-ansi-vector-chunk-9)
+  (%try-chunk "vector" 15777022 10 #'run-ansi-vector-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === vectorp.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP VECTORP.7 "zero-length array")
 (defun run-init-vectorp ()
   nil
@@ -76400,11 +77565,14 @@ do the defstruct."
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 20834 c)))
 )
 (defun run-ansi-vectorp ()
-  (%try-chunk "vectorp" 1923198 1 #'run-ansi-vectorp-chunk-1)
-  (%try-chunk "vectorp" 1923198 2 #'run-ansi-vectorp-chunk-2)
+  (%try-chunk "vectorp" 11901054 1 #'run-ansi-vectorp-chunk-1)
+  (%try-chunk "vectorp" 11901054 2 #'run-ansi-vectorp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === do.lsp ===
+(in-package :modus.mvm)
 (defun run-init-do ()
   nil
 )
@@ -76529,12 +77697,15 @@ do the defstruct."
                                  (PUSH X RESULT))))) '(10 8 6 4 2 0)) (t (c) (%test-crash-fail-c 20857 c)))
 )
 (defun run-ansi-do ()
-  (%try-chunk "do" 15234524 1 #'run-ansi-do-chunk-1)
-  (%try-chunk "do" 15234524 2 #'run-ansi-do-chunk-2)
-  (%try-chunk "do" 15234524 3 #'run-ansi-do-chunk-3)
+  (%try-chunk "do" 11875804 1 #'run-ansi-do-chunk-1)
+  (%try-chunk "do" 11875804 2 #'run-ansi-do-chunk-2)
+  (%try-chunk "do" 11875804 3 #'run-ansi-do-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === dolist.lsp ===
+(in-package :modus.mvm)
 (defun run-init-dolist ()
   nil
 )
@@ -76622,12 +77793,15 @@ do the defstruct."
                                                                                  A)) (t (c) (%test-crash-fail-c 20876 c)))
 )
 (defun run-ansi-dolist ()
-  (%try-chunk "dolist" 13750038 1 #'run-ansi-dolist-chunk-1)
-  (%try-chunk "dolist" 13750038 2 #'run-ansi-dolist-chunk-2)
-  (%try-chunk "dolist" 13750038 3 #'run-ansi-dolist-chunk-3)
+  (%try-chunk "dolist" 6229782 1 #'run-ansi-dolist-chunk-1)
+  (%try-chunk "dolist" 6229782 2 #'run-ansi-dolist-chunk-2)
+  (%try-chunk "dolist" 6229782 3 #'run-ansi-dolist-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === dostar.lsp ===
+(in-package :modus.mvm)
 (defun run-init-dostar ()
   nil
 )
@@ -76752,12 +77926,15 @@ do the defstruct."
                                  (INCF RESULT X))))) '55) (t (c) (%test-crash-fail-c 20899 c)))
 )
 (defun run-ansi-dostar ()
-  (%try-chunk "dostar" 14571528 1 #'run-ansi-dostar-chunk-1)
-  (%try-chunk "dostar" 14571528 2 #'run-ansi-dostar-chunk-2)
-  (%try-chunk "dostar" 14571528 3 #'run-ansi-dostar-chunk-3)
+  (%try-chunk "dostar" 14096392 1 #'run-ansi-dostar-chunk-1)
+  (%try-chunk "dostar" 14096392 2 #'run-ansi-dostar-chunk-2)
+  (%try-chunk "dostar" 14096392 3 #'run-ansi-dostar-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === dotimes.lsp ===
+(in-package :modus.mvm)
 (defun run-init-dotimes ()
   nil
 )
@@ -76891,13 +78068,16 @@ do the defstruct."
                                                                            1 0)) (t (c) (%test-crash-fail-c 20929 c)))
 )
 (defun run-ansi-dotimes ()
-  (%try-chunk "dotimes" 2654922 1 #'run-ansi-dotimes-chunk-1)
-  (%try-chunk "dotimes" 2654922 2 #'run-ansi-dotimes-chunk-2)
-  (%try-chunk "dotimes" 2654922 3 #'run-ansi-dotimes-chunk-3)
-  (%try-chunk "dotimes" 2654922 4 #'run-ansi-dotimes-chunk-4)
+  (%try-chunk "dotimes" 12878538 1 #'run-ansi-dotimes-chunk-1)
+  (%try-chunk "dotimes" 12878538 2 #'run-ansi-dotimes-chunk-2)
+  (%try-chunk "dotimes" 12878538 3 #'run-ansi-dotimes-chunk-3)
+  (%try-chunk "dotimes" 12878538 4 #'run-ansi-dotimes-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -76931,7 +78111,10 @@ do the defstruct."
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === loop.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop ()
   nil
 )
@@ -76964,10 +78147,13 @@ do the defstruct."
                                      (PUSH 'A X))))) '(A A A A)) (t (c) (%test-crash-fail-c 20936 c)))
 )
 (defun run-ansi-loop ()
-  (%try-chunk "loop" 6917515 1 #'run-ansi-loop-chunk-1)
+  (%try-chunk "loop" 1756555 1 #'run-ansi-loop-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop1.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP LOOP.1.44 "complex number")
 (DEFSKIP LOOP.1.45 "complex number")
 (DEFSKIP LOOP.1.46 "complex number")
@@ -77214,17 +78400,20 @@ do the defstruct."
                                    COLLECT I))) '(1 2 3 4)) (t (c) (%test-crash-fail-c 20996 c)))
 )
 (defun run-ansi-loop1 ()
-  (%try-chunk "loop1" 11683242 1 #'run-ansi-loop1-chunk-1)
-  (%try-chunk "loop1" 11683242 2 #'run-ansi-loop1-chunk-2)
-  (%try-chunk "loop1" 11683242 3 #'run-ansi-loop1-chunk-3)
-  (%try-chunk "loop1" 11683242 4 #'run-ansi-loop1-chunk-4)
-  (%try-chunk "loop1" 11683242 5 #'run-ansi-loop1-chunk-5)
-  (%try-chunk "loop1" 11683242 6 #'run-ansi-loop1-chunk-6)
-  (%try-chunk "loop1" 11683242 7 #'run-ansi-loop1-chunk-7)
-  (%try-chunk "loop1" 11683242 8 #'run-ansi-loop1-chunk-8)
+  (%try-chunk "loop1" 7046570 1 #'run-ansi-loop1-chunk-1)
+  (%try-chunk "loop1" 7046570 2 #'run-ansi-loop1-chunk-2)
+  (%try-chunk "loop1" 7046570 3 #'run-ansi-loop1-chunk-3)
+  (%try-chunk "loop1" 7046570 4 #'run-ansi-loop1-chunk-4)
+  (%try-chunk "loop1" 7046570 5 #'run-ansi-loop1-chunk-5)
+  (%try-chunk "loop1" 7046570 6 #'run-ansi-loop1-chunk-6)
+  (%try-chunk "loop1" 7046570 7 #'run-ansi-loop1-chunk-7)
+  (%try-chunk "loop1" 7046570 8 #'run-ansi-loop1-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop10.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP LOOP.10.73 "complex number")
 (DEFSKIP LOOP.10.87 "complex number")
 (defun run-init-loop10 ()
@@ -77641,22 +78830,25 @@ do the defstruct."
                                    SUMMING 2))) '12) (t (c) (%test-crash-fail-c 21095 c)))
 )
 (defun run-ansi-loop10 ()
-  (%try-chunk "loop10" 16396938 1 #'run-ansi-loop10-chunk-1)
-  (%try-chunk "loop10" 16396938 2 #'run-ansi-loop10-chunk-2)
-  (%try-chunk "loop10" 16396938 3 #'run-ansi-loop10-chunk-3)
-  (%try-chunk "loop10" 16396938 4 #'run-ansi-loop10-chunk-4)
-  (%try-chunk "loop10" 16396938 5 #'run-ansi-loop10-chunk-5)
-  (%try-chunk "loop10" 16396938 6 #'run-ansi-loop10-chunk-6)
-  (%try-chunk "loop10" 16396938 7 #'run-ansi-loop10-chunk-7)
-  (%try-chunk "loop10" 16396938 8 #'run-ansi-loop10-chunk-8)
-  (%try-chunk "loop10" 16396938 9 #'run-ansi-loop10-chunk-9)
-  (%try-chunk "loop10" 16396938 10 #'run-ansi-loop10-chunk-10)
-  (%try-chunk "loop10" 16396938 11 #'run-ansi-loop10-chunk-11)
-  (%try-chunk "loop10" 16396938 12 #'run-ansi-loop10-chunk-12)
-  (%try-chunk "loop10" 16396938 13 #'run-ansi-loop10-chunk-13)
+  (%try-chunk "loop10" 15643274 1 #'run-ansi-loop10-chunk-1)
+  (%try-chunk "loop10" 15643274 2 #'run-ansi-loop10-chunk-2)
+  (%try-chunk "loop10" 15643274 3 #'run-ansi-loop10-chunk-3)
+  (%try-chunk "loop10" 15643274 4 #'run-ansi-loop10-chunk-4)
+  (%try-chunk "loop10" 15643274 5 #'run-ansi-loop10-chunk-5)
+  (%try-chunk "loop10" 15643274 6 #'run-ansi-loop10-chunk-6)
+  (%try-chunk "loop10" 15643274 7 #'run-ansi-loop10-chunk-7)
+  (%try-chunk "loop10" 15643274 8 #'run-ansi-loop10-chunk-8)
+  (%try-chunk "loop10" 15643274 9 #'run-ansi-loop10-chunk-9)
+  (%try-chunk "loop10" 15643274 10 #'run-ansi-loop10-chunk-10)
+  (%try-chunk "loop10" 15643274 11 #'run-ansi-loop10-chunk-11)
+  (%try-chunk "loop10" 15643274 12 #'run-ansi-loop10-chunk-12)
+  (%try-chunk "loop10" 15643274 13 #'run-ansi-loop10-chunk-13)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop11.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop11 ()
   nil
 )
@@ -77794,13 +78986,16 @@ do the defstruct."
                                    COLLECT 'X))) '(X X X X X)) (t (c) (%test-crash-fail-c 21127 c)))
 )
 (defun run-ansi-loop11 ()
-  (%try-chunk "loop11" 16397027 1 #'run-ansi-loop11-chunk-1)
-  (%try-chunk "loop11" 16397027 2 #'run-ansi-loop11-chunk-2)
-  (%try-chunk "loop11" 16397027 3 #'run-ansi-loop11-chunk-3)
-  (%try-chunk "loop11" 16397027 4 #'run-ansi-loop11-chunk-4)
+  (%try-chunk "loop11" 5468899 1 #'run-ansi-loop11-chunk-1)
+  (%try-chunk "loop11" 5468899 2 #'run-ansi-loop11-chunk-2)
+  (%try-chunk "loop11" 5468899 3 #'run-ansi-loop11-chunk-3)
+  (%try-chunk "loop11" 5468899 4 #'run-ansi-loop11-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop12.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop12 ()
   nil
 )
@@ -77968,15 +79163,18 @@ do the defstruct."
                                    THEREIS (AND (>= I 2) (+ I 1))))) '3) (t (c) (%test-crash-fail-c 21170 c)))
 )
 (defun run-ansi-loop12 ()
-  (%try-chunk "loop12" 16396760 1 #'run-ansi-loop12-chunk-1)
-  (%try-chunk "loop12" 16396760 2 #'run-ansi-loop12-chunk-2)
-  (%try-chunk "loop12" 16396760 3 #'run-ansi-loop12-chunk-3)
-  (%try-chunk "loop12" 16396760 4 #'run-ansi-loop12-chunk-4)
-  (%try-chunk "loop12" 16396760 5 #'run-ansi-loop12-chunk-5)
-  (%try-chunk "loop12" 16396760 6 #'run-ansi-loop12-chunk-6)
+  (%try-chunk "loop12" 2437592 1 #'run-ansi-loop12-chunk-1)
+  (%try-chunk "loop12" 2437592 2 #'run-ansi-loop12-chunk-2)
+  (%try-chunk "loop12" 2437592 3 #'run-ansi-loop12-chunk-3)
+  (%try-chunk "loop12" 2437592 4 #'run-ansi-loop12-chunk-4)
+  (%try-chunk "loop12" 2437592 5 #'run-ansi-loop12-chunk-5)
+  (%try-chunk "loop12" 2437592 6 #'run-ansi-loop12-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop13.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop13 ()
   nil
 )
@@ -78310,20 +79508,23 @@ do the defstruct."
                              (LOOP RETURN 'A))) 'A) (t (c) (%test-crash-fail-c 21256 c)))
 )
 (defun run-ansi-loop13 ()
-  (%try-chunk "loop13" 16396849 1 #'run-ansi-loop13-chunk-1)
-  (%try-chunk "loop13" 16396849 2 #'run-ansi-loop13-chunk-2)
-  (%try-chunk "loop13" 16396849 3 #'run-ansi-loop13-chunk-3)
-  (%try-chunk "loop13" 16396849 4 #'run-ansi-loop13-chunk-4)
-  (%try-chunk "loop13" 16396849 5 #'run-ansi-loop13-chunk-5)
-  (%try-chunk "loop13" 16396849 6 #'run-ansi-loop13-chunk-6)
-  (%try-chunk "loop13" 16396849 7 #'run-ansi-loop13-chunk-7)
-  (%try-chunk "loop13" 16396849 8 #'run-ansi-loop13-chunk-8)
-  (%try-chunk "loop13" 16396849 9 #'run-ansi-loop13-chunk-9)
-  (%try-chunk "loop13" 16396849 10 #'run-ansi-loop13-chunk-10)
-  (%try-chunk "loop13" 16396849 11 #'run-ansi-loop13-chunk-11)
+  (%try-chunk "loop13" 9040433 1 #'run-ansi-loop13-chunk-1)
+  (%try-chunk "loop13" 9040433 2 #'run-ansi-loop13-chunk-2)
+  (%try-chunk "loop13" 9040433 3 #'run-ansi-loop13-chunk-3)
+  (%try-chunk "loop13" 9040433 4 #'run-ansi-loop13-chunk-4)
+  (%try-chunk "loop13" 9040433 5 #'run-ansi-loop13-chunk-5)
+  (%try-chunk "loop13" 9040433 6 #'run-ansi-loop13-chunk-6)
+  (%try-chunk "loop13" 9040433 7 #'run-ansi-loop13-chunk-7)
+  (%try-chunk "loop13" 9040433 8 #'run-ansi-loop13-chunk-8)
+  (%try-chunk "loop13" 9040433 9 #'run-ansi-loop13-chunk-9)
+  (%try-chunk "loop13" 9040433 10 #'run-ansi-loop13-chunk-10)
+  (%try-chunk "loop13" 9040433 11 #'run-ansi-loop13-chunk-11)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop14.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop14 ()
   nil
 )
@@ -78776,16 +79977,19 @@ do the defstruct."
                                    END))) '(2 4 6 8 10)) (t (c) (%test-crash-fail-c 21305 c)))
 )
 (defun run-ansi-loop14 ()
-  (%try-chunk "loop14" 16397294 1 #'run-ansi-loop14-chunk-1)
-  (%try-chunk "loop14" 16397294 2 #'run-ansi-loop14-chunk-2)
-  (%try-chunk "loop14" 16397294 3 #'run-ansi-loop14-chunk-3)
-  (%try-chunk "loop14" 16397294 4 #'run-ansi-loop14-chunk-4)
-  (%try-chunk "loop14" 16397294 5 #'run-ansi-loop14-chunk-5)
-  (%try-chunk "loop14" 16397294 6 #'run-ansi-loop14-chunk-6)
-  (%try-chunk "loop14" 16397294 7 #'run-ansi-loop14-chunk-7)
+  (%try-chunk "loop14" 6009838 1 #'run-ansi-loop14-chunk-1)
+  (%try-chunk "loop14" 6009838 2 #'run-ansi-loop14-chunk-2)
+  (%try-chunk "loop14" 6009838 3 #'run-ansi-loop14-chunk-3)
+  (%try-chunk "loop14" 6009838 4 #'run-ansi-loop14-chunk-4)
+  (%try-chunk "loop14" 6009838 5 #'run-ansi-loop14-chunk-5)
+  (%try-chunk "loop14" 6009838 6 #'run-ansi-loop14-chunk-6)
+  (%try-chunk "loop14" 6009838 7 #'run-ansi-loop14-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop15.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop15 ()
   nil
 )
@@ -78960,15 +80164,18 @@ do the defstruct."
                                      :COUNT T)))) '0) (t (c) (%test-crash-fail-c 21351 c)))
 )
 (defun run-ansi-loop15 ()
-  (%try-chunk "loop15" 16397383 1 #'run-ansi-loop15-chunk-1)
-  (%try-chunk "loop15" 16397383 2 #'run-ansi-loop15-chunk-2)
-  (%try-chunk "loop15" 16397383 3 #'run-ansi-loop15-chunk-3)
-  (%try-chunk "loop15" 16397383 4 #'run-ansi-loop15-chunk-4)
-  (%try-chunk "loop15" 16397383 5 #'run-ansi-loop15-chunk-5)
-  (%try-chunk "loop15" 16397383 6 #'run-ansi-loop15-chunk-6)
+  (%try-chunk "loop15" 12612679 1 #'run-ansi-loop15-chunk-1)
+  (%try-chunk "loop15" 12612679 2 #'run-ansi-loop15-chunk-2)
+  (%try-chunk "loop15" 12612679 3 #'run-ansi-loop15-chunk-3)
+  (%try-chunk "loop15" 12612679 4 #'run-ansi-loop15-chunk-4)
+  (%try-chunk "loop15" 12612679 5 #'run-ansi-loop15-chunk-5)
+  (%try-chunk "loop15" 12612679 6 #'run-ansi-loop15-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop16.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop16 ()
   nil
 )
@@ -79144,15 +80351,18 @@ do the defstruct."
                                      #:COUNT T)))) '0) (t (c) (%test-crash-fail-c 21397 c)))
 )
 (defun run-ansi-loop16 ()
-  (%try-chunk "loop16" 16397116 1 #'run-ansi-loop16-chunk-1)
-  (%try-chunk "loop16" 16397116 2 #'run-ansi-loop16-chunk-2)
-  (%try-chunk "loop16" 16397116 3 #'run-ansi-loop16-chunk-3)
-  (%try-chunk "loop16" 16397116 4 #'run-ansi-loop16-chunk-4)
-  (%try-chunk "loop16" 16397116 5 #'run-ansi-loop16-chunk-5)
-  (%try-chunk "loop16" 16397116 6 #'run-ansi-loop16-chunk-6)
+  (%try-chunk "loop16" 9581372 1 #'run-ansi-loop16-chunk-1)
+  (%try-chunk "loop16" 9581372 2 #'run-ansi-loop16-chunk-2)
+  (%try-chunk "loop16" 9581372 3 #'run-ansi-loop16-chunk-3)
+  (%try-chunk "loop16" 9581372 4 #'run-ansi-loop16-chunk-4)
+  (%try-chunk "loop16" 9581372 5 #'run-ansi-loop16-chunk-5)
+  (%try-chunk "loop16" 9581372 6 #'run-ansi-loop16-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop17.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop17 ()
   nil
 )
@@ -79231,12 +80441,15 @@ do the defstruct."
                                    FINALLY (RETURN X)))) '1) (t (c) (%test-crash-fail-c 21414 c)))
 )
 (defun run-ansi-loop17 ()
-  (%try-chunk "loop17" 16397205 1 #'run-ansi-loop17-chunk-1)
-  (%try-chunk "loop17" 16397205 2 #'run-ansi-loop17-chunk-2)
-  (%try-chunk "loop17" 16397205 3 #'run-ansi-loop17-chunk-3)
+  (%try-chunk "loop17" 16184213 1 #'run-ansi-loop17-chunk-1)
+  (%try-chunk "loop17" 16184213 2 #'run-ansi-loop17-chunk-2)
+  (%try-chunk "loop17" 16184213 3 #'run-ansi-loop17-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop2.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop2 ()
   nil
 )
@@ -79358,13 +80571,16 @@ do the defstruct."
                                    SUM X))) '6) (t (c) (%test-crash-fail-c 21440 c)))
 )
 (defun run-ansi-loop2 ()
-  (%try-chunk "loop2" 11683153 1 #'run-ansi-loop2-chunk-1)
-  (%try-chunk "loop2" 11683153 2 #'run-ansi-loop2-chunk-2)
-  (%try-chunk "loop2" 11683153 3 #'run-ansi-loop2-chunk-3)
-  (%try-chunk "loop2" 11683153 4 #'run-ansi-loop2-chunk-4)
+  (%try-chunk "loop2" 443729 1 #'run-ansi-loop2-chunk-1)
+  (%try-chunk "loop2" 443729 2 #'run-ansi-loop2-chunk-2)
+  (%try-chunk "loop2" 443729 3 #'run-ansi-loop2-chunk-3)
+  (%try-chunk "loop2" 443729 4 #'run-ansi-loop2-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop3.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop3 ()
   nil
 )
@@ -79495,13 +80711,16 @@ do the defstruct."
                                    SUM (CAR X)))) '6) (t (c) (%test-crash-fail-c 21467 c)))
 )
 (defun run-ansi-loop3 ()
-  (%try-chunk "loop3" 11683064 1 #'run-ansi-loop3-chunk-1)
-  (%try-chunk "loop3" 11683064 2 #'run-ansi-loop3-chunk-2)
-  (%try-chunk "loop3" 11683064 3 #'run-ansi-loop3-chunk-3)
-  (%try-chunk "loop3" 11683064 4 #'run-ansi-loop3-chunk-4)
+  (%try-chunk "loop3" 10618104 1 #'run-ansi-loop3-chunk-1)
+  (%try-chunk "loop3" 10618104 2 #'run-ansi-loop3-chunk-2)
+  (%try-chunk "loop3" 10618104 3 #'run-ansi-loop3-chunk-3)
+  (%try-chunk "loop3" 10618104 4 #'run-ansi-loop3-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop4.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop4 ()
   nil
 )
@@ -79574,11 +80793,14 @@ do the defstruct."
                                    COLLECT X))) '(1 2 3 4 5)) (t (c) (%test-crash-fail-c 21480 c)))
 )
 (defun run-ansi-loop4 ()
-  (%try-chunk "loop4" 11683687 1 #'run-ansi-loop4-chunk-1)
-  (%try-chunk "loop4" 11683687 2 #'run-ansi-loop4-chunk-2)
+  (%try-chunk "loop4" 6506343 1 #'run-ansi-loop4-chunk-1)
+  (%try-chunk "loop4" 6506343 2 #'run-ansi-loop4-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop5.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop5 ()
   nil
 )
@@ -79785,14 +81007,17 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 21516 c)))
 )
 (defun run-ansi-loop5 ()
-  (%try-chunk "loop5" 11683598 1 #'run-ansi-loop5-chunk-1)
-  (%try-chunk "loop5" 11683598 2 #'run-ansi-loop5-chunk-2)
-  (%try-chunk "loop5" 11683598 3 #'run-ansi-loop5-chunk-3)
-  (%try-chunk "loop5" 11683598 4 #'run-ansi-loop5-chunk-4)
-  (%try-chunk "loop5" 11683598 5 #'run-ansi-loop5-chunk-5)
+  (%try-chunk "loop5" 16680718 1 #'run-ansi-loop5-chunk-1)
+  (%try-chunk "loop5" 16680718 2 #'run-ansi-loop5-chunk-2)
+  (%try-chunk "loop5" 16680718 3 #'run-ansi-loop5-chunk-3)
+  (%try-chunk "loop5" 16680718 4 #'run-ansi-loop5-chunk-4)
+  (%try-chunk "loop5" 16680718 5 #'run-ansi-loop5-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop6.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *LOOP.6.ALIST* '((A . 1) (B . 2) (C . 3)))
 (DEFPARAMETER *LOOP.6.ALIST.2* '(("a" . 1) ("b" . 2) ("c" . 3)))
 (DEFPARAMETER *LOOP.6.ALIST.3*
@@ -80093,15 +81318,18 @@ do the defstruct."
                         (LOOP FOR (VAL . KEY) IN *LOOP.6.ALIST.8*
                               DO (SETF (GETHASH KEY TABLE) VAL))
                         TABLE)) (t (c) nil))
-  (%try-chunk "loop6" 11683509 1 #'run-ansi-loop6-chunk-1)
-  (%try-chunk "loop6" 11683509 2 #'run-ansi-loop6-chunk-2)
-  (%try-chunk "loop6" 11683509 3 #'run-ansi-loop6-chunk-3)
-  (%try-chunk "loop6" 11683509 4 #'run-ansi-loop6-chunk-4)
-  (%try-chunk "loop6" 11683509 5 #'run-ansi-loop6-chunk-5)
-  (%try-chunk "loop6" 11683509 6 #'run-ansi-loop6-chunk-6)
+  (%try-chunk "loop6" 10077877 1 #'run-ansi-loop6-chunk-1)
+  (%try-chunk "loop6" 10077877 2 #'run-ansi-loop6-chunk-2)
+  (%try-chunk "loop6" 10077877 3 #'run-ansi-loop6-chunk-3)
+  (%try-chunk "loop6" 10077877 4 #'run-ansi-loop6-chunk-4)
+  (%try-chunk "loop6" 10077877 5 #'run-ansi-loop6-chunk-5)
+  (%try-chunk "loop6" 10077877 6 #'run-ansi-loop6-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop7.lsp ===
+(in-package :modus.mvm)
 (MAKE-PACKAGE "LOOP.CL-TEST.1" :USE NIL)
 (IN-PACKAGE "LOOP.CL-TEST.1")
 (INTERN "FOO")
@@ -80330,14 +81558,17 @@ do the defstruct."
   (handler-case (INTERN "Y") (t (c) nil))
   (handler-case (INTERN "Z") (t (c) nil))
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "loop7" 11683420 1 #'run-ansi-loop7-chunk-1)
-  (%try-chunk "loop7" 11683420 2 #'run-ansi-loop7-chunk-2)
-  (%try-chunk "loop7" 11683420 3 #'run-ansi-loop7-chunk-3)
-  (%try-chunk "loop7" 11683420 4 #'run-ansi-loop7-chunk-4)
-  (%try-chunk "loop7" 11683420 5 #'run-ansi-loop7-chunk-5)
+  (%try-chunk "loop7" 3475036 1 #'run-ansi-loop7-chunk-1)
+  (%try-chunk "loop7" 3475036 2 #'run-ansi-loop7-chunk-2)
+  (%try-chunk "loop7" 3475036 3 #'run-ansi-loop7-chunk-3)
+  (%try-chunk "loop7" 3475036 4 #'run-ansi-loop7-chunk-4)
+  (%try-chunk "loop7" 3475036 5 #'run-ansi-loop7-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop8.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop8 ()
   nil
 )
@@ -80410,13 +81641,16 @@ do the defstruct."
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 21624 c)))
 )
 (defun run-ansi-loop8 ()
-  (%try-chunk "loop8" 11682619 1 #'run-ansi-loop8-chunk-1)
-  (%try-chunk "loop8" 11682619 2 #'run-ansi-loop8-chunk-2)
-  (%try-chunk "loop8" 11682619 3 #'run-ansi-loop8-chunk-3)
-  (%try-chunk "loop8" 11682619 4 #'run-ansi-loop8-chunk-4)
+  (%try-chunk "loop8" 11158331 1 #'run-ansi-loop8-chunk-1)
+  (%try-chunk "loop8" 11158331 2 #'run-ansi-loop8-chunk-2)
+  (%try-chunk "loop8" 11158331 3 #'run-ansi-loop8-chunk-3)
+  (%try-chunk "loop8" 11158331 4 #'run-ansi-loop8-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === loop9.lsp ===
+(in-package :modus.mvm)
 (defun run-init-loop9 ()
   nil
 )
@@ -80624,14 +81858,17 @@ do the defstruct."
                                    NCONC (COPY-SEQ X)))) '(A B C D E F G I)) (t (c) (%test-crash-fail-c 21662 c)))
 )
 (defun run-ansi-loop9 ()
-  (%try-chunk "loop9" 11682530 1 #'run-ansi-loop9-chunk-1)
-  (%try-chunk "loop9" 11682530 2 #'run-ansi-loop9-chunk-2)
-  (%try-chunk "loop9" 11682530 3 #'run-ansi-loop9-chunk-3)
-  (%try-chunk "loop9" 11682530 4 #'run-ansi-loop9-chunk-4)
-  (%try-chunk "loop9" 11682530 5 #'run-ansi-loop9-chunk-5)
+  (%try-chunk "loop9" 4555490 1 #'run-ansi-loop9-chunk-1)
+  (%try-chunk "loop9" 4555490 2 #'run-ansi-loop9-chunk-2)
+  (%try-chunk "loop9" 4555490 3 #'run-ansi-loop9-chunk-3)
+  (%try-chunk "loop9" 4555490 4 #'run-ansi-loop9-chunk-4)
+  (%try-chunk "loop9" 4555490 5 #'run-ansi-loop9-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-pprint-dispatch.lsp ===
+(in-package :modus.mvm)
 (defun run-init-copy-pprint-dispatch ()
   nil
 )
@@ -80827,11 +82064,14 @@ do the defstruct."
   (handler-case (run-test 21672 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 21672 c)))
 )
 (defun run-ansi-copy-pprint-dispatch ()
-  (%try-chunk "copy-pprint-dispatch" 16310779 1 #'run-ansi-copy-pprint-dispatch-chunk-1)
-  (%try-chunk "copy-pprint-dispatch" 16310779 2 #'run-ansi-copy-pprint-dispatch-chunk-2)
+  (%try-chunk "copy-pprint-dispatch" 156155 1 #'run-ansi-copy-pprint-dispatch-chunk-1)
+  (%try-chunk "copy-pprint-dispatch" 156155 2 #'run-ansi-copy-pprint-dispatch-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-dispatch.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN PPRINT-DISPATCH-TEST-FN.1 (STREAM OBJ)
   (DECLARE (IGNORE OBJ))
@@ -81407,11 +82647,14 @@ do the defstruct."
 )
 (defun run-ansi-pprint-dispatch ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-dispatch" 6562107 1 #'run-ansi-pprint-dispatch-chunk-1)
-  (%try-chunk "pprint-dispatch" 6562107 2 #'run-ansi-pprint-dispatch-chunk-2)
+  (%try-chunk "pprint-dispatch" 7725371 1 #'run-ansi-pprint-dispatch-chunk-1)
+  (%try-chunk "pprint-dispatch" 7725371 2 #'run-ansi-pprint-dispatch-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-exit-if-list-exhausted.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-pprint-exit-if-list-exhausted ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -81436,7 +82679,7 @@ do the defstruct."
                                         (LET ((#:PPS205
                                                (%PPRINT-LB-BEGIN #:PPS205
                                                 '(1 2) NIL NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (ASSERT
                                              (EQUAL
                                               (MULTIPLE-VALUE-LIST
@@ -81474,7 +82717,7 @@ do the defstruct."
                                         (LET ((#:PPS206
                                                (%PPRINT-LB-BEGIN #:PPS206
                                                 '(1 2) NIL NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (ASSERT
                                              (EQUAL
                                               (MULTIPLE-VALUE-LIST
@@ -81512,7 +82755,7 @@ do the defstruct."
                                         (LET ((#:PPS207
                                                (%PPRINT-LB-BEGIN #:PPS207
                                                 '(1 . 2) NIL NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (ASSERT
                                              (EQUAL
                                               (MULTIPLE-VALUE-LIST
@@ -81549,7 +82792,7 @@ do the defstruct."
                                         (LET ((#:PPS208
                                                (%PPRINT-LB-BEGIN #:PPS208
                                                 '(1 . 2) "[" NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (ASSERT
                                              (EQUAL
                                               (MULTIPLE-VALUE-LIST
@@ -81588,7 +82831,7 @@ do the defstruct."
                                         (LET ((#:PPS209
                                                (%PPRINT-LB-BEGIN #:PPS209 NIL
                                                 NIL NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (%PPRINT-POP-FN)
                                             (ASSERT NIL))
                                           (%PPRINT-LB-END #:PPS209 NIL)))
@@ -81615,7 +82858,7 @@ do the defstruct."
                                         (LET ((#:PPS210
                                                (%PPRINT-LB-BEGIN #:PPS210 1 NIL
                                                 NIL)))
-                                          (CATCH '%PP-TAG (%PPRINT-POP-FN))
+                                          (CATCH :%PP-TAG (%PPRINT-POP-FN))
                                           (%PPRINT-LB-END #:PPS210 NIL)))
                                     NIL)
                                   (GET-OUTPUT-STREAM-STRING OS)))))) '"1") (t (c) (%test-crash-fail-c 21693 c)))
@@ -81640,7 +82883,7 @@ do the defstruct."
                                         (LET ((#:PPS211
                                                (%PPRINT-LB-BEGIN #:PPS211 '(1)
                                                 NIL NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (ASSERT
                                              (EQUAL '(1)
                                                     (MULTIPLE-VALUE-LIST
@@ -81669,7 +82912,7 @@ do the defstruct."
                                         (LET ((#:PPS212
                                                (%PPRINT-LB-BEGIN #:PPS212
                                                 '(1 2 3) "{" NIL)))
-                                          (CATCH '%PP-TAG
+                                          (CATCH :%PP-TAG
                                             (%PPRINT-POP-FN)
                                             (ASSERT NIL))
                                           (%PPRINT-LB-END #:PPS212 "}")))
@@ -81729,7 +82972,7 @@ do the defstruct."
                                                                                  "{"
                                                                                  NIL)))
                                                                            (CATCH
-                                                                               '%PP-TAG
+                                                                               :%PP-TAG
                                                                              (%PPRINT-EXIT-FN)
                                                                              (WRITE
                                                                               (%PPRINT-POP-FN)
@@ -81811,7 +83054,7 @@ do the defstruct."
                                                                                  "{"
                                                                                  NIL)))
                                                                            (CATCH
-                                                                               '%PP-TAG
+                                                                               :%PP-TAG
                                                                              (%PPRINT-EXIT-FN)
                                                                              (WRITE
                                                                               (%PPRINT-POP-FN)
@@ -81899,7 +83142,7 @@ do the defstruct."
                                                                                    "<"
                                                                                    NIL)))
                                                                              (CATCH
-                                                                                 '%PP-TAG
+                                                                                 :%PP-TAG
                                                                                (%PPRINT-EXIT-FN)
                                                                                (WRITE
                                                                                 (%PPRINT-POP-FN)
@@ -81990,7 +83233,7 @@ do the defstruct."
                                                                                    "[["
                                                                                    NIL)))
                                                                              (CATCH
-                                                                                 '%PP-TAG
+                                                                                 :%PP-TAG
                                                                                (%PPRINT-EXIT-FN)
                                                                                (WRITE
                                                                                 (%PPRINT-POP-FN)
@@ -82068,7 +83311,7 @@ do the defstruct."
                                                                                  "{"
                                                                                  NIL)))
                                                                            (CATCH
-                                                                               '%PP-TAG
+                                                                               :%PP-TAG
                                                                              (LET ((VALS
                                                                                     (MULTIPLE-VALUE-LIST
                                                                                      (%PPRINT-POP-FN))))
@@ -82160,12 +83403,15 @@ do the defstruct."
 )
 (defun run-ansi-pprint-exit-if-list-exhausted ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-exit-if-list-exhausted" 15027404 1 #'run-ansi-pprint-exit-if-list-exhausted-chunk-1)
-  (%try-chunk "pprint-exit-if-list-exhausted" 15027404 2 #'run-ansi-pprint-exit-if-list-exhausted-chunk-2)
-  (%try-chunk "pprint-exit-if-list-exhausted" 15027404 3 #'run-ansi-pprint-exit-if-list-exhausted-chunk-3)
+  (%try-chunk "pprint-exit-if-list-exhausted" 4066508 1 #'run-ansi-pprint-exit-if-list-exhausted-chunk-1)
+  (%try-chunk "pprint-exit-if-list-exhausted" 4066508 2 #'run-ansi-pprint-exit-if-list-exhausted-chunk-2)
+  (%try-chunk "pprint-exit-if-list-exhausted" 4066508 3 #'run-ansi-pprint-exit-if-list-exhausted-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-fill.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-PPRINT-FILL-TEST
           (NAME ARGS EXPECTED-VALUE &KEY (MARGIN 100) (CIRCLE NIL) (LEN NIL))
@@ -82561,11 +83807,14 @@ do the defstruct."
 )
 (defun run-ansi-pprint-fill ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-fill" 2876020 1 #'run-ansi-pprint-fill-chunk-1)
-  (%try-chunk "pprint-fill" 2876020 2 #'run-ansi-pprint-fill-chunk-2)
+  (%try-chunk "pprint-fill" 1516148 1 #'run-ansi-pprint-fill-chunk-1)
+  (%try-chunk "pprint-fill" 1516148 2 #'run-ansi-pprint-fill-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-indent.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-pprint-indent ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -83167,13 +84416,16 @@ M") (t (c) (%test-crash-fail-c 21734 c)))
 )
 (defun run-ansi-pprint-indent ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-indent" 7439239 1 #'run-ansi-pprint-indent-chunk-1)
-  (%try-chunk "pprint-indent" 7439239 2 #'run-ansi-pprint-indent-chunk-2)
-  (%try-chunk "pprint-indent" 7439239 3 #'run-ansi-pprint-indent-chunk-3)
-  (%try-chunk "pprint-indent" 7439239 4 #'run-ansi-pprint-indent-chunk-4)
+  (%try-chunk "pprint-indent" 10208135 1 #'run-ansi-pprint-indent-chunk-1)
+  (%try-chunk "pprint-indent" 10208135 2 #'run-ansi-pprint-indent-chunk-2)
+  (%try-chunk "pprint-indent" 10208135 3 #'run-ansi-pprint-indent-chunk-3)
+  (%try-chunk "pprint-indent" 10208135 4 #'run-ansi-pprint-indent-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-linear.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-PPRINT-LINEAR-TEST
           (NAME ARGS EXPECTED-VALUE &KEY (MARGIN 100) (CIRCLE NIL))
@@ -83514,11 +84766,14 @@ M") (t (c) (%test-crash-fail-c 21734 c)))
 )
 (defun run-ansi-pprint-linear ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-linear" 9534302 1 #'run-ansi-pprint-linear-chunk-1)
-  (%try-chunk "pprint-linear" 9534302 2 #'run-ansi-pprint-linear-chunk-2)
+  (%try-chunk "pprint-linear" 9780062 1 #'run-ansi-pprint-linear-chunk-1)
+  (%try-chunk "pprint-linear" 9780062 2 #'run-ansi-pprint-linear-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-logical-block.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-pprint-logical-block ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -84049,13 +85304,16 @@ abcd3") (t (c) (%test-crash-fail-c 21765 c)))
 )
 (defun run-ansi-pprint-logical-block ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-logical-block" 6514716 1 #'run-ansi-pprint-logical-block-chunk-1)
-  (%try-chunk "pprint-logical-block" 6514716 2 #'run-ansi-pprint-logical-block-chunk-2)
-  (%try-chunk "pprint-logical-block" 6514716 3 #'run-ansi-pprint-logical-block-chunk-3)
-  (%try-chunk "pprint-logical-block" 6514716 4 #'run-ansi-pprint-logical-block-chunk-4)
+  (%try-chunk "pprint-logical-block" 5253148 1 #'run-ansi-pprint-logical-block-chunk-1)
+  (%try-chunk "pprint-logical-block" 5253148 2 #'run-ansi-pprint-logical-block-chunk-2)
+  (%try-chunk "pprint-logical-block" 5253148 3 #'run-ansi-pprint-logical-block-chunk-3)
+  (%try-chunk "pprint-logical-block" 5253148 4 #'run-ansi-pprint-logical-block-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-newline.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-PPRINT-NEWLINE-TEST (NAME FORM EXPECTED-VALUE &REST KEY-ARGS)
   `(DEF-PPRINT-TEST ,NAME
@@ -84924,11 +86182,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-pprint-newline ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-newline" 10577889 1 #'run-ansi-pprint-newline-chunk-1)
-  (%try-chunk "pprint-newline" 10577889 2 #'run-ansi-pprint-newline-chunk-2)
+  (%try-chunk "pprint-newline" 4188129 1 #'run-ansi-pprint-newline-chunk-1)
+  (%try-chunk "pprint-newline" 4188129 2 #'run-ansi-pprint-newline-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-tab.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEF-PPRINT-TEST PPRINT-TAB.NON-PRETTY.5
                  (LET ((*STANDARD-OUTPUT* (MAKE-STRING-OUTPUT-STREAM)))
@@ -85470,11 +86731,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-pprint-tab ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-tab" 16683372 1 #'run-ansi-pprint-tab-chunk-1)
-  (%try-chunk "pprint-tab" 16683372 2 #'run-ansi-pprint-tab-chunk-2)
+  (%try-chunk "pprint-tab" 11932012 1 #'run-ansi-pprint-tab-chunk-1)
+  (%try-chunk "pprint-tab" 11932012 2 #'run-ansi-pprint-tab-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint-tabular.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-PPRINT-TABULAR-TEST
           (NAME ARGS EXPECTED-VALUE &KEY (MARGIN 100) (CIRCLE NIL) (PRE NIL))
@@ -85775,11 +87039,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-pprint-tabular ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint-tabular" 16638710 1 #'run-ansi-pprint-tabular-chunk-1)
-  (%try-chunk "pprint-tabular" 16638710 2 #'run-ansi-pprint-tabular-chunk-2)
+  (%try-chunk "pprint-tabular" 15573750 1 #'run-ansi-pprint-tabular-chunk-1)
+  (%try-chunk "pprint-tabular" 15573750 2 #'run-ansi-pprint-tabular-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pprint.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-pprint ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -85825,10 +87092,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-pprint ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "pprint" 6455254 1 #'run-ansi-pprint-chunk-1)
+  (%try-chunk "pprint" 11386838 1 #'run-ansi-pprint-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === prin1-to-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-prin1-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -85844,10 +87114,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-prin1-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "prin1-to-string" 2620565 1 #'run-ansi-prin1-to-string-chunk-1)
+  (%try-chunk "prin1-to-string" 1113237 1 #'run-ansi-prin1-to-string-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === prin1.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-prin1 ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -85891,10 +87164,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-prin1 ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "prin1" 5838803 1 #'run-ansi-prin1-chunk-1)
+  (%try-chunk "prin1" 11130835 1 #'run-ansi-prin1-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === princ-to-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-princ-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -85910,10 +87186,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-princ-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "princ-to-string" 7761687 1 #'run-ansi-princ-to-string-chunk-1)
+  (%try-chunk "princ-to-string" 5205783 1 #'run-ansi-princ-to-string-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === princ.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-princ ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -85957,10 +87236,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-princ ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "princ" 5848593 1 #'run-ansi-princ-chunk-1)
+  (%try-chunk "princ" 15695377 1 #'run-ansi-princ-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-array.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-array ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -86552,16 +87834,19 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-array ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-array" 5596746 1 #'run-ansi-print-array-chunk-1)
-  (%try-chunk "print-array" 5596746 2 #'run-ansi-print-array-chunk-2)
-  (%try-chunk "print-array" 5596746 3 #'run-ansi-print-array-chunk-3)
-  (%try-chunk "print-array" 5596746 4 #'run-ansi-print-array-chunk-4)
-  (%try-chunk "print-array" 5596746 5 #'run-ansi-print-array-chunk-5)
-  (%try-chunk "print-array" 5596746 6 #'run-ansi-print-array-chunk-6)
-  (%try-chunk "print-array" 5596746 7 #'run-ansi-print-array-chunk-7)
+  (%try-chunk "print-array" 3089994 1 #'run-ansi-print-array-chunk-1)
+  (%try-chunk "print-array" 3089994 2 #'run-ansi-print-array-chunk-2)
+  (%try-chunk "print-array" 3089994 3 #'run-ansi-print-array-chunk-3)
+  (%try-chunk "print-array" 3089994 4 #'run-ansi-print-array-chunk-4)
+  (%try-chunk "print-array" 3089994 5 #'run-ansi-print-array-chunk-5)
+  (%try-chunk "print-array" 3089994 6 #'run-ansi-print-array-chunk-6)
+  (%try-chunk "print-array" 3089994 7 #'run-ansi-print-array-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-bit-vector.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-bit-vector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -86623,10 +87908,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-bit-vector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-bit-vector" 13331304 1 #'run-ansi-print-bit-vector-chunk-1)
+  (%try-chunk "print-bit-vector" 11316072 1 #'run-ansi-print-bit-vector-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-characters.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-characters ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -86768,11 +88056,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-characters ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-characters" 6765433 1 #'run-ansi-print-characters-chunk-1)
-  (%try-chunk "print-characters" 6765433 2 #'run-ansi-print-characters-chunk-2)
+  (%try-chunk "print-characters" 1833849 1 #'run-ansi-print-characters-chunk-1)
+  (%try-chunk "print-characters" 1833849 2 #'run-ansi-print-characters-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-complex.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-complex ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -86819,10 +88110,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-complex ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-complex" 16673251 1 #'run-ansi-print-complex-chunk-1)
+  (%try-chunk "print-complex" 12937699 1 #'run-ansi-print-complex-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-cons.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-cons ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -87319,12 +88613,15 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-cons ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-cons" 10676490 1 #'run-ansi-print-cons-chunk-1)
-  (%try-chunk "print-cons" 10676490 2 #'run-ansi-print-cons-chunk-2)
-  (%try-chunk "print-cons" 10676490 3 #'run-ansi-print-cons-chunk-3)
+  (%try-chunk "print-cons" 12757258 1 #'run-ansi-print-cons-chunk-1)
+  (%try-chunk "print-cons" 12757258 2 #'run-ansi-print-cons-chunk-2)
+  (%try-chunk "print-cons" 12757258 3 #'run-ansi-print-cons-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-floats.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFPARAMETER *POSSIBLE-SHORT-FLOAT-EXPONENT-MARKERS*
   (LOOP FOR TYPE IN '(SHORT-FLOAT SINGLE-FLOAT DOUBLE-FLOAT LONG-FLOAT)
@@ -88041,12 +89338,15 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                                    NCONC (LIST C
                                                                (CHAR-DOWNCASE
                                                                 C)))) (t (c) nil))
-  (%try-chunk "print-floats" 2487032 1 #'run-ansi-print-floats-chunk-1)
-  (%try-chunk "print-floats" 2487032 2 #'run-ansi-print-floats-chunk-2)
-  (%try-chunk "print-floats" 2487032 3 #'run-ansi-print-floats-chunk-3)
+  (%try-chunk "print-floats" 6959864 1 #'run-ansi-print-floats-chunk-1)
+  (%try-chunk "print-floats" 6959864 2 #'run-ansi-print-floats-chunk-2)
+  (%try-chunk "print-floats" 6959864 3 #'run-ansi-print-floats-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-integers.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-integers ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -95484,34 +96784,37 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-integers ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-integers" 11586646 1 #'run-ansi-print-integers-chunk-1)
-  (%try-chunk "print-integers" 11586646 2 #'run-ansi-print-integers-chunk-2)
-  (%try-chunk "print-integers" 11586646 3 #'run-ansi-print-integers-chunk-3)
-  (%try-chunk "print-integers" 11586646 4 #'run-ansi-print-integers-chunk-4)
-  (%try-chunk "print-integers" 11586646 5 #'run-ansi-print-integers-chunk-5)
-  (%try-chunk "print-integers" 11586646 6 #'run-ansi-print-integers-chunk-6)
-  (%try-chunk "print-integers" 11586646 7 #'run-ansi-print-integers-chunk-7)
-  (%try-chunk "print-integers" 11586646 8 #'run-ansi-print-integers-chunk-8)
-  (%try-chunk "print-integers" 11586646 9 #'run-ansi-print-integers-chunk-9)
-  (%try-chunk "print-integers" 11586646 10 #'run-ansi-print-integers-chunk-10)
-  (%try-chunk "print-integers" 11586646 11 #'run-ansi-print-integers-chunk-11)
-  (%try-chunk "print-integers" 11586646 12 #'run-ansi-print-integers-chunk-12)
-  (%try-chunk "print-integers" 11586646 13 #'run-ansi-print-integers-chunk-13)
-  (%try-chunk "print-integers" 11586646 14 #'run-ansi-print-integers-chunk-14)
-  (%try-chunk "print-integers" 11586646 15 #'run-ansi-print-integers-chunk-15)
-  (%try-chunk "print-integers" 11586646 16 #'run-ansi-print-integers-chunk-16)
-  (%try-chunk "print-integers" 11586646 17 #'run-ansi-print-integers-chunk-17)
-  (%try-chunk "print-integers" 11586646 18 #'run-ansi-print-integers-chunk-18)
-  (%try-chunk "print-integers" 11586646 19 #'run-ansi-print-integers-chunk-19)
-  (%try-chunk "print-integers" 11586646 20 #'run-ansi-print-integers-chunk-20)
-  (%try-chunk "print-integers" 11586646 21 #'run-ansi-print-integers-chunk-21)
-  (%try-chunk "print-integers" 11586646 22 #'run-ansi-print-integers-chunk-22)
-  (%try-chunk "print-integers" 11586646 23 #'run-ansi-print-integers-chunk-23)
-  (%try-chunk "print-integers" 11586646 24 #'run-ansi-print-integers-chunk-24)
-  (%try-chunk "print-integers" 11586646 25 #'run-ansi-print-integers-chunk-25)
+  (%try-chunk "print-integers" 3476566 1 #'run-ansi-print-integers-chunk-1)
+  (%try-chunk "print-integers" 3476566 2 #'run-ansi-print-integers-chunk-2)
+  (%try-chunk "print-integers" 3476566 3 #'run-ansi-print-integers-chunk-3)
+  (%try-chunk "print-integers" 3476566 4 #'run-ansi-print-integers-chunk-4)
+  (%try-chunk "print-integers" 3476566 5 #'run-ansi-print-integers-chunk-5)
+  (%try-chunk "print-integers" 3476566 6 #'run-ansi-print-integers-chunk-6)
+  (%try-chunk "print-integers" 3476566 7 #'run-ansi-print-integers-chunk-7)
+  (%try-chunk "print-integers" 3476566 8 #'run-ansi-print-integers-chunk-8)
+  (%try-chunk "print-integers" 3476566 9 #'run-ansi-print-integers-chunk-9)
+  (%try-chunk "print-integers" 3476566 10 #'run-ansi-print-integers-chunk-10)
+  (%try-chunk "print-integers" 3476566 11 #'run-ansi-print-integers-chunk-11)
+  (%try-chunk "print-integers" 3476566 12 #'run-ansi-print-integers-chunk-12)
+  (%try-chunk "print-integers" 3476566 13 #'run-ansi-print-integers-chunk-13)
+  (%try-chunk "print-integers" 3476566 14 #'run-ansi-print-integers-chunk-14)
+  (%try-chunk "print-integers" 3476566 15 #'run-ansi-print-integers-chunk-15)
+  (%try-chunk "print-integers" 3476566 16 #'run-ansi-print-integers-chunk-16)
+  (%try-chunk "print-integers" 3476566 17 #'run-ansi-print-integers-chunk-17)
+  (%try-chunk "print-integers" 3476566 18 #'run-ansi-print-integers-chunk-18)
+  (%try-chunk "print-integers" 3476566 19 #'run-ansi-print-integers-chunk-19)
+  (%try-chunk "print-integers" 3476566 20 #'run-ansi-print-integers-chunk-20)
+  (%try-chunk "print-integers" 3476566 21 #'run-ansi-print-integers-chunk-21)
+  (%try-chunk "print-integers" 3476566 22 #'run-ansi-print-integers-chunk-22)
+  (%try-chunk "print-integers" 3476566 23 #'run-ansi-print-integers-chunk-23)
+  (%try-chunk "print-integers" 3476566 24 #'run-ansi-print-integers-chunk-24)
+  (%try-chunk "print-integers" 3476566 25 #'run-ansi-print-integers-chunk-25)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-length.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT PRINT-LENGTH-STRUCT FOO)
 (defun run-init-print-length ()
@@ -95940,11 +97243,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-length ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-length" 12932023 1 #'run-ansi-print-length-chunk-1)
-  (%try-chunk "print-length" 12932023 2 #'run-ansi-print-length-chunk-2)
+  (%try-chunk "print-length" 15455159 1 #'run-ansi-print-length-chunk-1)
+  (%try-chunk "print-length" 15455159 2 #'run-ansi-print-length-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-level.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT PRINT-LEVEL-STRUCT)
 (DEFSTRUCT PRINT-LEVEL-STRUCT2 A B C)
@@ -96035,10 +97341,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-level ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-level" 13406453 1 #'run-ansi-print-level-chunk-1)
+  (%try-chunk "print-level" 12570869 1 #'run-ansi-print-level-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-lines.lsp ===
+(in-package :modus.mvm)
 (defun run-init-print-lines ()
   nil
 )
@@ -96046,10 +97355,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
   (handler-case (run-test 22162 (lambda () *PRINT-LINES*) 'NIL) (t (c) (%test-crash-fail-c 22162 c)))
 )
 (defun run-ansi-print-lines ()
-  (%try-chunk "print-lines" 10232486 1 #'run-ansi-print-lines-chunk-1)
+  (%try-chunk "print-lines" 696998 1 #'run-ansi-print-lines-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-pathname.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-pathname ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -96095,10 +97407,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-pathname ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-pathname" 15187961 1 #'run-ansi-print-pathname-chunk-1)
+  (%try-chunk "print-pathname" 6225913 1 #'run-ansi-print-pathname-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-random-state.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-random-state ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -96126,10 +97441,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-random-state ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-random-state" 15344866 1 #'run-ansi-print-random-state-chunk-1)
+  (%try-chunk "print-random-state" 664802 1 #'run-ansi-print-random-state-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-ratios.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-ratios ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -96145,10 +97463,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-ratios ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-ratios" 10548785 1 #'run-ansi-print-ratios-chunk-1)
+  (%try-chunk "print-ratios" 1766961 1 #'run-ansi-print-ratios-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-strings.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-strings ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -96285,11 +97606,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-strings ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-strings" 9515877 1 #'run-ansi-print-strings-chunk-1)
-  (%try-chunk "print-strings" 9515877 2 #'run-ansi-print-strings-chunk-2)
+  (%try-chunk "print-strings" 3601253 1 #'run-ansi-print-strings-chunk-1)
+  (%try-chunk "print-strings" 3601253 2 #'run-ansi-print-strings-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-structure.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT PRINT-STRUCT-1 FOO BAR)
 (defun run-init-print-structure ()
@@ -96343,10 +97667,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-structure ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-structure" 8110166 1 #'run-ansi-print-structure-chunk-1)
+  (%try-chunk "print-structure" 8192086 1 #'run-ansi-print-structure-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-symbols.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN PRINC.SYMBOL.FN (SYM CASE *PRINT-CASE* EXPECTED)
   (%SET-READTABLE-CASE *READTABLE* CASE)
@@ -97407,13 +98734,16 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-symbols ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-symbols" 1193206 1 #'run-ansi-print-symbols-chunk-1)
-  (%try-chunk "print-symbols" 1193206 2 #'run-ansi-print-symbols-chunk-2)
-  (%try-chunk "print-symbols" 1193206 3 #'run-ansi-print-symbols-chunk-3)
-  (%try-chunk "print-symbols" 1193206 4 #'run-ansi-print-symbols-chunk-4)
+  (%try-chunk "print-symbols" 14890230 1 #'run-ansi-print-symbols-chunk-1)
+  (%try-chunk "print-symbols" 14890230 2 #'run-ansi-print-symbols-chunk-2)
+  (%try-chunk "print-symbols" 14890230 3 #'run-ansi-print-symbols-chunk-3)
+  (%try-chunk "print-symbols" 14890230 4 #'run-ansi-print-symbols-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-unreadable-object.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-unreadable-object ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -97631,10 +98961,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-unreadable-object ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-unreadable-object" 6740592 1 #'run-ansi-print-unreadable-object-chunk-1)
+  (%try-chunk "print-unreadable-object" 10885744 1 #'run-ansi-print-unreadable-object-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === print-vector.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print-vector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -98080,14 +99413,17 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print-vector ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print-vector" 11458570 1 #'run-ansi-print-vector-chunk-1)
-  (%try-chunk "print-vector" 11458570 2 #'run-ansi-print-vector-chunk-2)
-  (%try-chunk "print-vector" 11458570 3 #'run-ansi-print-vector-chunk-3)
-  (%try-chunk "print-vector" 11458570 4 #'run-ansi-print-vector-chunk-4)
-  (%try-chunk "print-vector" 11458570 5 #'run-ansi-print-vector-chunk-5)
+  (%try-chunk "print-vector" 16193546 1 #'run-ansi-print-vector-chunk-1)
+  (%try-chunk "print-vector" 16193546 2 #'run-ansi-print-vector-chunk-2)
+  (%try-chunk "print-vector" 16193546 3 #'run-ansi-print-vector-chunk-3)
+  (%try-chunk "print-vector" 16193546 4 #'run-ansi-print-vector-chunk-4)
+  (%try-chunk "print-vector" 16193546 5 #'run-ansi-print-vector-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === print.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-print ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -98133,10 +99469,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-print ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "print" 5847614 1 #'run-ansi-print-chunk-1)
+  (%try-chunk "print" 8010302 1 #'run-ansi-print-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === printer-control-vars.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-printer-control-vars ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -98158,11 +99497,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-printer-control-vars ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "printer-control-vars" 12785824 1 #'run-ansi-printer-control-vars-chunk-1)
-  (%try-chunk "printer-control-vars" 12785824 2 #'run-ansi-printer-control-vars-chunk-2)
+  (%try-chunk "printer-control-vars" 9246880 1 #'run-ansi-printer-control-vars-chunk-1)
+  (%try-chunk "printer-control-vars" 9246880 2 #'run-ansi-printer-control-vars-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === write-to-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-write-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -98189,10 +99531,13 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-write-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "write-to-string" 7015492 1 #'run-ansi-write-to-string-chunk-1)
+  (%try-chunk "write-to-string" 15010884 1 #'run-ansi-write-to-string-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === write.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-write ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -98279,11 +99624,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
 )
 (defun run-ansi-write ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "write" 2996514 1 #'run-ansi-write-chunk-1)
-  (%try-chunk "write" 2996514 2 #'run-ansi-write-chunk-2)
+  (%try-chunk "write" 2046242 1 #'run-ansi-write-chunk-1)
+  (%try-chunk "write" 2046242 2 #'run-ansi-write-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-a.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-a ()
   nil
 )
@@ -99470,23 +100818,26 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"xyz") (t (c) (%test-crash-fail-c 22400 c)))
 )
 (defun run-ansi-format-a ()
-  (%try-chunk "format-a" 6236152 1 #'run-ansi-format-a-chunk-1)
-  (%try-chunk "format-a" 6236152 2 #'run-ansi-format-a-chunk-2)
-  (%try-chunk "format-a" 6236152 3 #'run-ansi-format-a-chunk-3)
-  (%try-chunk "format-a" 6236152 4 #'run-ansi-format-a-chunk-4)
-  (%try-chunk "format-a" 6236152 5 #'run-ansi-format-a-chunk-5)
-  (%try-chunk "format-a" 6236152 6 #'run-ansi-format-a-chunk-6)
-  (%try-chunk "format-a" 6236152 7 #'run-ansi-format-a-chunk-7)
-  (%try-chunk "format-a" 6236152 8 #'run-ansi-format-a-chunk-8)
-  (%try-chunk "format-a" 6236152 9 #'run-ansi-format-a-chunk-9)
-  (%try-chunk "format-a" 6236152 10 #'run-ansi-format-a-chunk-10)
-  (%try-chunk "format-a" 6236152 11 #'run-ansi-format-a-chunk-11)
-  (%try-chunk "format-a" 6236152 12 #'run-ansi-format-a-chunk-12)
-  (%try-chunk "format-a" 6236152 13 #'run-ansi-format-a-chunk-13)
-  (%try-chunk "format-a" 6236152 14 #'run-ansi-format-a-chunk-14)
+  (%try-chunk "format-a" 9512952 1 #'run-ansi-format-a-chunk-1)
+  (%try-chunk "format-a" 9512952 2 #'run-ansi-format-a-chunk-2)
+  (%try-chunk "format-a" 9512952 3 #'run-ansi-format-a-chunk-3)
+  (%try-chunk "format-a" 9512952 4 #'run-ansi-format-a-chunk-4)
+  (%try-chunk "format-a" 9512952 5 #'run-ansi-format-a-chunk-5)
+  (%try-chunk "format-a" 9512952 6 #'run-ansi-format-a-chunk-6)
+  (%try-chunk "format-a" 9512952 7 #'run-ansi-format-a-chunk-7)
+  (%try-chunk "format-a" 9512952 8 #'run-ansi-format-a-chunk-8)
+  (%try-chunk "format-a" 9512952 9 #'run-ansi-format-a-chunk-9)
+  (%try-chunk "format-a" 9512952 10 #'run-ansi-format-a-chunk-10)
+  (%try-chunk "format-a" 9512952 11 #'run-ansi-format-a-chunk-11)
+  (%try-chunk "format-a" 9512952 12 #'run-ansi-format-a-chunk-12)
+  (%try-chunk "format-a" 9512952 13 #'run-ansi-format-a-chunk-13)
+  (%try-chunk "format-a" 9512952 14 #'run-ansi-format-a-chunk-14)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-ampersand.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP FORMAT.&.3)
 (DEFSKIP FORMAT.&.4)
 (DEFSKIP FORMAT.&.8)
@@ -99672,12 +101023,15 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"X") (t (c) (%test-crash-fail-c 22418 c)))
 )
 (defun run-ansi-format-ampersand ()
-  (%try-chunk "format-ampersand" 11944466 1 #'run-ansi-format-ampersand-chunk-1)
-  (%try-chunk "format-ampersand" 11944466 2 #'run-ansi-format-ampersand-chunk-2)
-  (%try-chunk "format-ampersand" 11944466 3 #'run-ansi-format-ampersand-chunk-3)
+  (%try-chunk "format-ampersand" 7799314 1 #'run-ansi-format-ampersand-chunk-1)
+  (%try-chunk "format-ampersand" 7799314 2 #'run-ansi-format-ampersand-chunk-2)
+  (%try-chunk "format-ampersand" 7799314 3 #'run-ansi-format-ampersand-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-b.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-b ()
   nil
 )
@@ -100575,15 +101929,18 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                                  COMMAINT FMT X S1 S2)))) 'NIL) (t (c) (%test-crash-fail-c 22461 c)))
 )
 (defun run-ansi-format-b ()
-  (%try-chunk "format-b" 6236419 1 #'run-ansi-format-b-chunk-1)
-  (%try-chunk "format-b" 6236419 2 #'run-ansi-format-b-chunk-2)
-  (%try-chunk "format-b" 6236419 3 #'run-ansi-format-b-chunk-3)
-  (%try-chunk "format-b" 6236419 4 #'run-ansi-format-b-chunk-4)
-  (%try-chunk "format-b" 6236419 5 #'run-ansi-format-b-chunk-5)
-  (%try-chunk "format-b" 6236419 6 #'run-ansi-format-b-chunk-6)
+  (%try-chunk "format-b" 12544259 1 #'run-ansi-format-b-chunk-1)
+  (%try-chunk "format-b" 12544259 2 #'run-ansi-format-b-chunk-2)
+  (%try-chunk "format-b" 12544259 3 #'run-ansi-format-b-chunk-3)
+  (%try-chunk "format-b" 12544259 4 #'run-ansi-format-b-chunk-4)
+  (%try-chunk "format-b" 12544259 5 #'run-ansi-format-b-chunk-5)
+  (%try-chunk "format-b" 12544259 6 #'run-ansi-format-b-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-brace.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-brace ()
   nil
 )
@@ -102046,28 +103403,31 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 22613 c)))
 )
 (defun run-ansi-format-brace ()
-  (%try-chunk "format-brace" 4845318 1 #'run-ansi-format-brace-chunk-1)
-  (%try-chunk "format-brace" 4845318 2 #'run-ansi-format-brace-chunk-2)
-  (%try-chunk "format-brace" 4845318 3 #'run-ansi-format-brace-chunk-3)
-  (%try-chunk "format-brace" 4845318 4 #'run-ansi-format-brace-chunk-4)
-  (%try-chunk "format-brace" 4845318 5 #'run-ansi-format-brace-chunk-5)
-  (%try-chunk "format-brace" 4845318 6 #'run-ansi-format-brace-chunk-6)
-  (%try-chunk "format-brace" 4845318 7 #'run-ansi-format-brace-chunk-7)
-  (%try-chunk "format-brace" 4845318 8 #'run-ansi-format-brace-chunk-8)
-  (%try-chunk "format-brace" 4845318 9 #'run-ansi-format-brace-chunk-9)
-  (%try-chunk "format-brace" 4845318 10 #'run-ansi-format-brace-chunk-10)
-  (%try-chunk "format-brace" 4845318 11 #'run-ansi-format-brace-chunk-11)
-  (%try-chunk "format-brace" 4845318 12 #'run-ansi-format-brace-chunk-12)
-  (%try-chunk "format-brace" 4845318 13 #'run-ansi-format-brace-chunk-13)
-  (%try-chunk "format-brace" 4845318 14 #'run-ansi-format-brace-chunk-14)
-  (%try-chunk "format-brace" 4845318 15 #'run-ansi-format-brace-chunk-15)
-  (%try-chunk "format-brace" 4845318 16 #'run-ansi-format-brace-chunk-16)
-  (%try-chunk "format-brace" 4845318 17 #'run-ansi-format-brace-chunk-17)
-  (%try-chunk "format-brace" 4845318 18 #'run-ansi-format-brace-chunk-18)
-  (%try-chunk "format-brace" 4845318 19 #'run-ansi-format-brace-chunk-19)
+  (%try-chunk "format-brace" 10235654 1 #'run-ansi-format-brace-chunk-1)
+  (%try-chunk "format-brace" 10235654 2 #'run-ansi-format-brace-chunk-2)
+  (%try-chunk "format-brace" 10235654 3 #'run-ansi-format-brace-chunk-3)
+  (%try-chunk "format-brace" 10235654 4 #'run-ansi-format-brace-chunk-4)
+  (%try-chunk "format-brace" 10235654 5 #'run-ansi-format-brace-chunk-5)
+  (%try-chunk "format-brace" 10235654 6 #'run-ansi-format-brace-chunk-6)
+  (%try-chunk "format-brace" 10235654 7 #'run-ansi-format-brace-chunk-7)
+  (%try-chunk "format-brace" 10235654 8 #'run-ansi-format-brace-chunk-8)
+  (%try-chunk "format-brace" 10235654 9 #'run-ansi-format-brace-chunk-9)
+  (%try-chunk "format-brace" 10235654 10 #'run-ansi-format-brace-chunk-10)
+  (%try-chunk "format-brace" 10235654 11 #'run-ansi-format-brace-chunk-11)
+  (%try-chunk "format-brace" 10235654 12 #'run-ansi-format-brace-chunk-12)
+  (%try-chunk "format-brace" 10235654 13 #'run-ansi-format-brace-chunk-13)
+  (%try-chunk "format-brace" 10235654 14 #'run-ansi-format-brace-chunk-14)
+  (%try-chunk "format-brace" 10235654 15 #'run-ansi-format-brace-chunk-15)
+  (%try-chunk "format-brace" 10235654 16 #'run-ansi-format-brace-chunk-16)
+  (%try-chunk "format-brace" 10235654 17 #'run-ansi-format-brace-chunk-17)
+  (%try-chunk "format-brace" 10235654 18 #'run-ansi-format-brace-chunk-18)
+  (%try-chunk "format-brace" 10235654 19 #'run-ansi-format-brace-chunk-19)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-c.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-c ()
   nil
 )
@@ -102197,11 +103557,14 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                  DO (LOOP-FINISH))) 'NIL) (t (c) (%test-crash-fail-c 22625 c)))
 )
 (defun run-ansi-format-c ()
-  (%try-chunk "format-c" 6236330 1 #'run-ansi-format-c-chunk-1)
-  (%try-chunk "format-c" 6236330 2 #'run-ansi-format-c-chunk-2)
+  (%try-chunk "format-c" 5941418 1 #'run-ansi-format-c-chunk-1)
+  (%try-chunk "format-c" 5941418 2 #'run-ansi-format-c-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-circumflex.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-circumflex ()
   nil
 )
@@ -107362,68 +108725,71 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"XA YB ") (t (c) (%test-crash-fail-c 23095 c)))
 )
 (defun run-ansi-format-circumflex ()
-  (%try-chunk "format-circumflex" 15897237 1 #'run-ansi-format-circumflex-chunk-1)
-  (%try-chunk "format-circumflex" 15897237 2 #'run-ansi-format-circumflex-chunk-2)
-  (%try-chunk "format-circumflex" 15897237 3 #'run-ansi-format-circumflex-chunk-3)
-  (%try-chunk "format-circumflex" 15897237 4 #'run-ansi-format-circumflex-chunk-4)
-  (%try-chunk "format-circumflex" 15897237 5 #'run-ansi-format-circumflex-chunk-5)
-  (%try-chunk "format-circumflex" 15897237 6 #'run-ansi-format-circumflex-chunk-6)
-  (%try-chunk "format-circumflex" 15897237 7 #'run-ansi-format-circumflex-chunk-7)
-  (%try-chunk "format-circumflex" 15897237 8 #'run-ansi-format-circumflex-chunk-8)
-  (%try-chunk "format-circumflex" 15897237 9 #'run-ansi-format-circumflex-chunk-9)
-  (%try-chunk "format-circumflex" 15897237 10 #'run-ansi-format-circumflex-chunk-10)
-  (%try-chunk "format-circumflex" 15897237 11 #'run-ansi-format-circumflex-chunk-11)
-  (%try-chunk "format-circumflex" 15897237 12 #'run-ansi-format-circumflex-chunk-12)
-  (%try-chunk "format-circumflex" 15897237 13 #'run-ansi-format-circumflex-chunk-13)
-  (%try-chunk "format-circumflex" 15897237 14 #'run-ansi-format-circumflex-chunk-14)
-  (%try-chunk "format-circumflex" 15897237 15 #'run-ansi-format-circumflex-chunk-15)
-  (%try-chunk "format-circumflex" 15897237 16 #'run-ansi-format-circumflex-chunk-16)
-  (%try-chunk "format-circumflex" 15897237 17 #'run-ansi-format-circumflex-chunk-17)
-  (%try-chunk "format-circumflex" 15897237 18 #'run-ansi-format-circumflex-chunk-18)
-  (%try-chunk "format-circumflex" 15897237 19 #'run-ansi-format-circumflex-chunk-19)
-  (%try-chunk "format-circumflex" 15897237 20 #'run-ansi-format-circumflex-chunk-20)
-  (%try-chunk "format-circumflex" 15897237 21 #'run-ansi-format-circumflex-chunk-21)
-  (%try-chunk "format-circumflex" 15897237 22 #'run-ansi-format-circumflex-chunk-22)
-  (%try-chunk "format-circumflex" 15897237 23 #'run-ansi-format-circumflex-chunk-23)
-  (%try-chunk "format-circumflex" 15897237 24 #'run-ansi-format-circumflex-chunk-24)
-  (%try-chunk "format-circumflex" 15897237 25 #'run-ansi-format-circumflex-chunk-25)
-  (%try-chunk "format-circumflex" 15897237 26 #'run-ansi-format-circumflex-chunk-26)
-  (%try-chunk "format-circumflex" 15897237 27 #'run-ansi-format-circumflex-chunk-27)
-  (%try-chunk "format-circumflex" 15897237 28 #'run-ansi-format-circumflex-chunk-28)
-  (%try-chunk "format-circumflex" 15897237 29 #'run-ansi-format-circumflex-chunk-29)
-  (%try-chunk "format-circumflex" 15897237 30 #'run-ansi-format-circumflex-chunk-30)
-  (%try-chunk "format-circumflex" 15897237 31 #'run-ansi-format-circumflex-chunk-31)
-  (%try-chunk "format-circumflex" 15897237 32 #'run-ansi-format-circumflex-chunk-32)
-  (%try-chunk "format-circumflex" 15897237 33 #'run-ansi-format-circumflex-chunk-33)
-  (%try-chunk "format-circumflex" 15897237 34 #'run-ansi-format-circumflex-chunk-34)
-  (%try-chunk "format-circumflex" 15897237 35 #'run-ansi-format-circumflex-chunk-35)
-  (%try-chunk "format-circumflex" 15897237 36 #'run-ansi-format-circumflex-chunk-36)
-  (%try-chunk "format-circumflex" 15897237 37 #'run-ansi-format-circumflex-chunk-37)
-  (%try-chunk "format-circumflex" 15897237 38 #'run-ansi-format-circumflex-chunk-38)
-  (%try-chunk "format-circumflex" 15897237 39 #'run-ansi-format-circumflex-chunk-39)
-  (%try-chunk "format-circumflex" 15897237 40 #'run-ansi-format-circumflex-chunk-40)
-  (%try-chunk "format-circumflex" 15897237 41 #'run-ansi-format-circumflex-chunk-41)
-  (%try-chunk "format-circumflex" 15897237 42 #'run-ansi-format-circumflex-chunk-42)
-  (%try-chunk "format-circumflex" 15897237 43 #'run-ansi-format-circumflex-chunk-43)
-  (%try-chunk "format-circumflex" 15897237 44 #'run-ansi-format-circumflex-chunk-44)
-  (%try-chunk "format-circumflex" 15897237 45 #'run-ansi-format-circumflex-chunk-45)
-  (%try-chunk "format-circumflex" 15897237 46 #'run-ansi-format-circumflex-chunk-46)
-  (%try-chunk "format-circumflex" 15897237 47 #'run-ansi-format-circumflex-chunk-47)
-  (%try-chunk "format-circumflex" 15897237 48 #'run-ansi-format-circumflex-chunk-48)
-  (%try-chunk "format-circumflex" 15897237 49 #'run-ansi-format-circumflex-chunk-49)
-  (%try-chunk "format-circumflex" 15897237 50 #'run-ansi-format-circumflex-chunk-50)
-  (%try-chunk "format-circumflex" 15897237 51 #'run-ansi-format-circumflex-chunk-51)
-  (%try-chunk "format-circumflex" 15897237 52 #'run-ansi-format-circumflex-chunk-52)
-  (%try-chunk "format-circumflex" 15897237 53 #'run-ansi-format-circumflex-chunk-53)
-  (%try-chunk "format-circumflex" 15897237 54 #'run-ansi-format-circumflex-chunk-54)
-  (%try-chunk "format-circumflex" 15897237 55 #'run-ansi-format-circumflex-chunk-55)
-  (%try-chunk "format-circumflex" 15897237 56 #'run-ansi-format-circumflex-chunk-56)
-  (%try-chunk "format-circumflex" 15897237 57 #'run-ansi-format-circumflex-chunk-57)
-  (%try-chunk "format-circumflex" 15897237 58 #'run-ansi-format-circumflex-chunk-58)
-  (%try-chunk "format-circumflex" 15897237 59 #'run-ansi-format-circumflex-chunk-59)
+  (%try-chunk "format-circumflex" 14471829 1 #'run-ansi-format-circumflex-chunk-1)
+  (%try-chunk "format-circumflex" 14471829 2 #'run-ansi-format-circumflex-chunk-2)
+  (%try-chunk "format-circumflex" 14471829 3 #'run-ansi-format-circumflex-chunk-3)
+  (%try-chunk "format-circumflex" 14471829 4 #'run-ansi-format-circumflex-chunk-4)
+  (%try-chunk "format-circumflex" 14471829 5 #'run-ansi-format-circumflex-chunk-5)
+  (%try-chunk "format-circumflex" 14471829 6 #'run-ansi-format-circumflex-chunk-6)
+  (%try-chunk "format-circumflex" 14471829 7 #'run-ansi-format-circumflex-chunk-7)
+  (%try-chunk "format-circumflex" 14471829 8 #'run-ansi-format-circumflex-chunk-8)
+  (%try-chunk "format-circumflex" 14471829 9 #'run-ansi-format-circumflex-chunk-9)
+  (%try-chunk "format-circumflex" 14471829 10 #'run-ansi-format-circumflex-chunk-10)
+  (%try-chunk "format-circumflex" 14471829 11 #'run-ansi-format-circumflex-chunk-11)
+  (%try-chunk "format-circumflex" 14471829 12 #'run-ansi-format-circumflex-chunk-12)
+  (%try-chunk "format-circumflex" 14471829 13 #'run-ansi-format-circumflex-chunk-13)
+  (%try-chunk "format-circumflex" 14471829 14 #'run-ansi-format-circumflex-chunk-14)
+  (%try-chunk "format-circumflex" 14471829 15 #'run-ansi-format-circumflex-chunk-15)
+  (%try-chunk "format-circumflex" 14471829 16 #'run-ansi-format-circumflex-chunk-16)
+  (%try-chunk "format-circumflex" 14471829 17 #'run-ansi-format-circumflex-chunk-17)
+  (%try-chunk "format-circumflex" 14471829 18 #'run-ansi-format-circumflex-chunk-18)
+  (%try-chunk "format-circumflex" 14471829 19 #'run-ansi-format-circumflex-chunk-19)
+  (%try-chunk "format-circumflex" 14471829 20 #'run-ansi-format-circumflex-chunk-20)
+  (%try-chunk "format-circumflex" 14471829 21 #'run-ansi-format-circumflex-chunk-21)
+  (%try-chunk "format-circumflex" 14471829 22 #'run-ansi-format-circumflex-chunk-22)
+  (%try-chunk "format-circumflex" 14471829 23 #'run-ansi-format-circumflex-chunk-23)
+  (%try-chunk "format-circumflex" 14471829 24 #'run-ansi-format-circumflex-chunk-24)
+  (%try-chunk "format-circumflex" 14471829 25 #'run-ansi-format-circumflex-chunk-25)
+  (%try-chunk "format-circumflex" 14471829 26 #'run-ansi-format-circumflex-chunk-26)
+  (%try-chunk "format-circumflex" 14471829 27 #'run-ansi-format-circumflex-chunk-27)
+  (%try-chunk "format-circumflex" 14471829 28 #'run-ansi-format-circumflex-chunk-28)
+  (%try-chunk "format-circumflex" 14471829 29 #'run-ansi-format-circumflex-chunk-29)
+  (%try-chunk "format-circumflex" 14471829 30 #'run-ansi-format-circumflex-chunk-30)
+  (%try-chunk "format-circumflex" 14471829 31 #'run-ansi-format-circumflex-chunk-31)
+  (%try-chunk "format-circumflex" 14471829 32 #'run-ansi-format-circumflex-chunk-32)
+  (%try-chunk "format-circumflex" 14471829 33 #'run-ansi-format-circumflex-chunk-33)
+  (%try-chunk "format-circumflex" 14471829 34 #'run-ansi-format-circumflex-chunk-34)
+  (%try-chunk "format-circumflex" 14471829 35 #'run-ansi-format-circumflex-chunk-35)
+  (%try-chunk "format-circumflex" 14471829 36 #'run-ansi-format-circumflex-chunk-36)
+  (%try-chunk "format-circumflex" 14471829 37 #'run-ansi-format-circumflex-chunk-37)
+  (%try-chunk "format-circumflex" 14471829 38 #'run-ansi-format-circumflex-chunk-38)
+  (%try-chunk "format-circumflex" 14471829 39 #'run-ansi-format-circumflex-chunk-39)
+  (%try-chunk "format-circumflex" 14471829 40 #'run-ansi-format-circumflex-chunk-40)
+  (%try-chunk "format-circumflex" 14471829 41 #'run-ansi-format-circumflex-chunk-41)
+  (%try-chunk "format-circumflex" 14471829 42 #'run-ansi-format-circumflex-chunk-42)
+  (%try-chunk "format-circumflex" 14471829 43 #'run-ansi-format-circumflex-chunk-43)
+  (%try-chunk "format-circumflex" 14471829 44 #'run-ansi-format-circumflex-chunk-44)
+  (%try-chunk "format-circumflex" 14471829 45 #'run-ansi-format-circumflex-chunk-45)
+  (%try-chunk "format-circumflex" 14471829 46 #'run-ansi-format-circumflex-chunk-46)
+  (%try-chunk "format-circumflex" 14471829 47 #'run-ansi-format-circumflex-chunk-47)
+  (%try-chunk "format-circumflex" 14471829 48 #'run-ansi-format-circumflex-chunk-48)
+  (%try-chunk "format-circumflex" 14471829 49 #'run-ansi-format-circumflex-chunk-49)
+  (%try-chunk "format-circumflex" 14471829 50 #'run-ansi-format-circumflex-chunk-50)
+  (%try-chunk "format-circumflex" 14471829 51 #'run-ansi-format-circumflex-chunk-51)
+  (%try-chunk "format-circumflex" 14471829 52 #'run-ansi-format-circumflex-chunk-52)
+  (%try-chunk "format-circumflex" 14471829 53 #'run-ansi-format-circumflex-chunk-53)
+  (%try-chunk "format-circumflex" 14471829 54 #'run-ansi-format-circumflex-chunk-54)
+  (%try-chunk "format-circumflex" 14471829 55 #'run-ansi-format-circumflex-chunk-55)
+  (%try-chunk "format-circumflex" 14471829 56 #'run-ansi-format-circumflex-chunk-56)
+  (%try-chunk "format-circumflex" 14471829 57 #'run-ansi-format-circumflex-chunk-57)
+  (%try-chunk "format-circumflex" 14471829 58 #'run-ansi-format-circumflex-chunk-58)
+  (%try-chunk "format-circumflex" 14471829 59 #'run-ansi-format-circumflex-chunk-59)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-conditional.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-conditional ()
   nil
 )
@@ -107956,17 +109322,20 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"Y2") (t (c) (%test-crash-fail-c 23153 c)))
 )
 (defun run-ansi-format-conditional ()
-  (%try-chunk "format-conditional" 5380999 1 #'run-ansi-format-conditional-chunk-1)
-  (%try-chunk "format-conditional" 5380999 2 #'run-ansi-format-conditional-chunk-2)
-  (%try-chunk "format-conditional" 5380999 3 #'run-ansi-format-conditional-chunk-3)
-  (%try-chunk "format-conditional" 5380999 4 #'run-ansi-format-conditional-chunk-4)
-  (%try-chunk "format-conditional" 5380999 5 #'run-ansi-format-conditional-chunk-5)
-  (%try-chunk "format-conditional" 5380999 6 #'run-ansi-format-conditional-chunk-6)
-  (%try-chunk "format-conditional" 5380999 7 #'run-ansi-format-conditional-chunk-7)
-  (%try-chunk "format-conditional" 5380999 8 #'run-ansi-format-conditional-chunk-8)
+  (%try-chunk "format-conditional" 2022279 1 #'run-ansi-format-conditional-chunk-1)
+  (%try-chunk "format-conditional" 2022279 2 #'run-ansi-format-conditional-chunk-2)
+  (%try-chunk "format-conditional" 2022279 3 #'run-ansi-format-conditional-chunk-3)
+  (%try-chunk "format-conditional" 2022279 4 #'run-ansi-format-conditional-chunk-4)
+  (%try-chunk "format-conditional" 2022279 5 #'run-ansi-format-conditional-chunk-5)
+  (%try-chunk "format-conditional" 2022279 6 #'run-ansi-format-conditional-chunk-6)
+  (%try-chunk "format-conditional" 2022279 7 #'run-ansi-format-conditional-chunk-7)
+  (%try-chunk "format-conditional" 2022279 8 #'run-ansi-format-conditional-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-d.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-d ()
   nil
 )
@@ -108888,15 +110257,18 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                                  COMMAINT FMT X S1 S2 S3)))) 'NIL) (t (c) (%test-crash-fail-c 23199 c)))
 )
 (defun run-ansi-format-d ()
-  (%try-chunk "format-d" 6236597 1 #'run-ansi-format-d-chunk-1)
-  (%try-chunk "format-d" 6236597 2 #'run-ansi-format-d-chunk-2)
-  (%try-chunk "format-d" 6236597 3 #'run-ansi-format-d-chunk-3)
-  (%try-chunk "format-d" 6236597 4 #'run-ansi-format-d-chunk-4)
-  (%try-chunk "format-d" 6236597 5 #'run-ansi-format-d-chunk-5)
-  (%try-chunk "format-d" 6236597 6 #'run-ansi-format-d-chunk-6)
+  (%try-chunk "format-d" 6482357 1 #'run-ansi-format-d-chunk-1)
+  (%try-chunk "format-d" 6482357 2 #'run-ansi-format-d-chunk-2)
+  (%try-chunk "format-d" 6482357 3 #'run-ansi-format-d-chunk-3)
+  (%try-chunk "format-d" 6482357 4 #'run-ansi-format-d-chunk-4)
+  (%try-chunk "format-d" 6482357 5 #'run-ansi-format-d-chunk-5)
+  (%try-chunk "format-d" 6482357 6 #'run-ansi-format-d-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-f.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP FORMAT.F.42)
 (defun run-init-format-f ()
   nil
@@ -109572,16 +110944,19 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"10.0") (t (c) (%test-crash-fail-c 23254 c)))
 )
 (defun run-ansi-format-f ()
-  (%try-chunk "format-f" 6236775 1 #'run-ansi-format-f-chunk-1)
-  (%try-chunk "format-f" 6236775 2 #'run-ansi-format-f-chunk-2)
-  (%try-chunk "format-f" 6236775 3 #'run-ansi-format-f-chunk-3)
-  (%try-chunk "format-f" 6236775 4 #'run-ansi-format-f-chunk-4)
-  (%try-chunk "format-f" 6236775 5 #'run-ansi-format-f-chunk-5)
-  (%try-chunk "format-f" 6236775 6 #'run-ansi-format-f-chunk-6)
-  (%try-chunk "format-f" 6236775 7 #'run-ansi-format-f-chunk-7)
+  (%try-chunk "format-f" 2910823 1 #'run-ansi-format-f-chunk-1)
+  (%try-chunk "format-f" 2910823 2 #'run-ansi-format-f-chunk-2)
+  (%try-chunk "format-f" 2910823 3 #'run-ansi-format-f-chunk-3)
+  (%try-chunk "format-f" 2910823 4 #'run-ansi-format-f-chunk-4)
+  (%try-chunk "format-f" 2910823 5 #'run-ansi-format-f-chunk-5)
+  (%try-chunk "format-f" 2910823 6 #'run-ansi-format-f-chunk-6)
+  (%try-chunk "format-f" 2910823 7 #'run-ansi-format-f-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-goto.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-goto ()
   nil
 )
@@ -110271,18 +111646,21 @@ A A A ") (t (c) (%test-crash-fail-c 21781 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"01229") (t (c) (%test-crash-fail-c 23320 c)))
 )
 (defun run-ansi-format-goto ()
-  (%try-chunk "format-goto" 2318970 1 #'run-ansi-format-goto-chunk-1)
-  (%try-chunk "format-goto" 2318970 2 #'run-ansi-format-goto-chunk-2)
-  (%try-chunk "format-goto" 2318970 3 #'run-ansi-format-goto-chunk-3)
-  (%try-chunk "format-goto" 2318970 4 #'run-ansi-format-goto-chunk-4)
-  (%try-chunk "format-goto" 2318970 5 #'run-ansi-format-goto-chunk-5)
-  (%try-chunk "format-goto" 2318970 6 #'run-ansi-format-goto-chunk-6)
-  (%try-chunk "format-goto" 2318970 7 #'run-ansi-format-goto-chunk-7)
-  (%try-chunk "format-goto" 2318970 8 #'run-ansi-format-goto-chunk-8)
-  (%try-chunk "format-goto" 2318970 9 #'run-ansi-format-goto-chunk-9)
+  (%try-chunk "format-goto" 5481082 1 #'run-ansi-format-goto-chunk-1)
+  (%try-chunk "format-goto" 5481082 2 #'run-ansi-format-goto-chunk-2)
+  (%try-chunk "format-goto" 5481082 3 #'run-ansi-format-goto-chunk-3)
+  (%try-chunk "format-goto" 5481082 4 #'run-ansi-format-goto-chunk-4)
+  (%try-chunk "format-goto" 5481082 5 #'run-ansi-format-goto-chunk-5)
+  (%try-chunk "format-goto" 5481082 6 #'run-ansi-format-goto-chunk-6)
+  (%try-chunk "format-goto" 5481082 7 #'run-ansi-format-goto-chunk-7)
+  (%try-chunk "format-goto" 5481082 8 #'run-ansi-format-goto-chunk-8)
+  (%try-chunk "format-goto" 5481082 9 #'run-ansi-format-goto-chunk-9)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-justify.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-justify ()
   nil
 )
@@ -111068,15 +112446,18 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                                                                  T)) (t (c) (%test-crash-fail-c 23362 c)))
 )
 (defun run-ansi-format-justify ()
-  (%try-chunk "format-justify" 413175 1 #'run-ansi-format-justify-chunk-1)
-  (%try-chunk "format-justify" 413175 2 #'run-ansi-format-justify-chunk-2)
-  (%try-chunk "format-justify" 413175 3 #'run-ansi-format-justify-chunk-3)
-  (%try-chunk "format-justify" 413175 4 #'run-ansi-format-justify-chunk-4)
-  (%try-chunk "format-justify" 413175 5 #'run-ansi-format-justify-chunk-5)
-  (%try-chunk "format-justify" 413175 6 #'run-ansi-format-justify-chunk-6)
+  (%try-chunk "format-justify" 2477559 1 #'run-ansi-format-justify-chunk-1)
+  (%try-chunk "format-justify" 2477559 2 #'run-ansi-format-justify-chunk-2)
+  (%try-chunk "format-justify" 2477559 3 #'run-ansi-format-justify-chunk-3)
+  (%try-chunk "format-justify" 2477559 4 #'run-ansi-format-justify-chunk-4)
+  (%try-chunk "format-justify" 2477559 5 #'run-ansi-format-justify-chunk-5)
+  (%try-chunk "format-justify" 2477559 6 #'run-ansi-format-justify-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-logical-block.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-logical-block ()
   nil
 )
@@ -111983,17 +113364,20 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                 (FORMAT NIL "~<~<~A~^xxx~:>yyy~:>" '((1))))))) '"1yyy") (t (c) (%test-crash-fail-c 23425 c)))
 )
 (defun run-ansi-format-logical-block ()
-  (%try-chunk "format-logical-block" 7021158 1 #'run-ansi-format-logical-block-chunk-1)
-  (%try-chunk "format-logical-block" 7021158 2 #'run-ansi-format-logical-block-chunk-2)
-  (%try-chunk "format-logical-block" 7021158 3 #'run-ansi-format-logical-block-chunk-3)
-  (%try-chunk "format-logical-block" 7021158 4 #'run-ansi-format-logical-block-chunk-4)
-  (%try-chunk "format-logical-block" 7021158 5 #'run-ansi-format-logical-block-chunk-5)
-  (%try-chunk "format-logical-block" 7021158 6 #'run-ansi-format-logical-block-chunk-6)
-  (%try-chunk "format-logical-block" 7021158 7 #'run-ansi-format-logical-block-chunk-7)
-  (%try-chunk "format-logical-block" 7021158 8 #'run-ansi-format-logical-block-chunk-8)
+  (%try-chunk "format-logical-block" 13836902 1 #'run-ansi-format-logical-block-chunk-1)
+  (%try-chunk "format-logical-block" 13836902 2 #'run-ansi-format-logical-block-chunk-2)
+  (%try-chunk "format-logical-block" 13836902 3 #'run-ansi-format-logical-block-chunk-3)
+  (%try-chunk "format-logical-block" 13836902 4 #'run-ansi-format-logical-block-chunk-4)
+  (%try-chunk "format-logical-block" 13836902 5 #'run-ansi-format-logical-block-chunk-5)
+  (%try-chunk "format-logical-block" 13836902 6 #'run-ansi-format-logical-block-chunk-6)
+  (%try-chunk "format-logical-block" 13836902 7 #'run-ansi-format-logical-block-chunk-7)
+  (%try-chunk "format-logical-block" 13836902 8 #'run-ansi-format-logical-block-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-newline.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP FORMAT.NEWLINE.3)
 (defun run-init-format-newline ()
   nil
@@ -112051,10 +113435,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"A X") (t (c) (%test-crash-fail-c 23429 c)))
 )
 (defun run-ansi-format-newline ()
-  (%try-chunk "format-newline" 5780875 1 #'run-ansi-format-newline-chunk-1)
+  (%try-chunk "format-newline" 11597195 1 #'run-ansi-format-newline-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-o.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-o ()
   nil
 )
@@ -112949,15 +114336,18 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                                  COMMAINT FMT X S1 S2 S3)))) 'NIL) (t (c) (%test-crash-fail-c 23472 c)))
 )
 (defun run-ansi-format-o ()
-  (%try-chunk "format-o" 6235974 1 #'run-ansi-format-o-chunk-1)
-  (%try-chunk "format-o" 6235974 2 #'run-ansi-format-o-chunk-2)
-  (%try-chunk "format-o" 6235974 3 #'run-ansi-format-o-chunk-3)
-  (%try-chunk "format-o" 6235974 4 #'run-ansi-format-o-chunk-4)
-  (%try-chunk "format-o" 6235974 5 #'run-ansi-format-o-chunk-5)
-  (%try-chunk "format-o" 6235974 6 #'run-ansi-format-o-chunk-6)
+  (%try-chunk "format-o" 10594118 1 #'run-ansi-format-o-chunk-1)
+  (%try-chunk "format-o" 10594118 2 #'run-ansi-format-o-chunk-2)
+  (%try-chunk "format-o" 10594118 3 #'run-ansi-format-o-chunk-3)
+  (%try-chunk "format-o" 10594118 4 #'run-ansi-format-o-chunk-4)
+  (%try-chunk "format-o" 10594118 5 #'run-ansi-format-o-chunk-5)
+  (%try-chunk "format-o" 10594118 6 #'run-ansi-format-o-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-p ()
   nil
 )
@@ -113298,14 +114688,17 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                    COLLECT (LIST X S)))) 'NIL) (t (c) (%test-crash-fail-c 23508 c)))
 )
 (defun run-ansi-format-p ()
-  (%try-chunk "format-p" 6234817 1 #'run-ansi-format-p-chunk-1)
-  (%try-chunk "format-p" 6234817 2 #'run-ansi-format-p-chunk-2)
-  (%try-chunk "format-p" 6234817 3 #'run-ansi-format-p-chunk-3)
-  (%try-chunk "format-p" 6234817 4 #'run-ansi-format-p-chunk-4)
-  (%try-chunk "format-p" 6234817 5 #'run-ansi-format-p-chunk-5)
+  (%try-chunk "format-p" 4317889 1 #'run-ansi-format-p-chunk-1)
+  (%try-chunk "format-p" 4317889 2 #'run-ansi-format-p-chunk-2)
+  (%try-chunk "format-p" 4317889 3 #'run-ansi-format-p-chunk-3)
+  (%try-chunk "format-p" 4317889 4 #'run-ansi-format-p-chunk-4)
+  (%try-chunk "format-p" 4317889 5 #'run-ansi-format-p-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-page.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-page ()
   nil
 )
@@ -113397,10 +114790,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"") (t (c) (%test-crash-fail-c 23516 c)))
 )
 (defun run-ansi-format-page ()
-  (%try-chunk "format-page" 12402650 1 #'run-ansi-format-page-chunk-1)
+  (%try-chunk "format-page" 16236506 1 #'run-ansi-format-page-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-paren.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-paren ()
   nil
 )
@@ -113951,16 +115347,19 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"ABC DEF GHI") (t (c) (%test-crash-fail-c 23566 c)))
 )
 (defun run-ansi-format-paren ()
-  (%try-chunk "format-paren" 4377913 1 #'run-ansi-format-paren-chunk-1)
-  (%try-chunk "format-paren" 4377913 2 #'run-ansi-format-paren-chunk-2)
-  (%try-chunk "format-paren" 4377913 3 #'run-ansi-format-paren-chunk-3)
-  (%try-chunk "format-paren" 4377913 4 #'run-ansi-format-paren-chunk-4)
-  (%try-chunk "format-paren" 4377913 5 #'run-ansi-format-paren-chunk-5)
-  (%try-chunk "format-paren" 4377913 6 #'run-ansi-format-paren-chunk-6)
-  (%try-chunk "format-paren" 4377913 7 #'run-ansi-format-paren-chunk-7)
+  (%try-chunk "format-paren" 11062585 1 #'run-ansi-format-paren-chunk-1)
+  (%try-chunk "format-paren" 11062585 2 #'run-ansi-format-paren-chunk-2)
+  (%try-chunk "format-paren" 11062585 3 #'run-ansi-format-paren-chunk-3)
+  (%try-chunk "format-paren" 11062585 4 #'run-ansi-format-paren-chunk-4)
+  (%try-chunk "format-paren" 11062585 5 #'run-ansi-format-paren-chunk-5)
+  (%try-chunk "format-paren" 11062585 6 #'run-ansi-format-paren-chunk-6)
+  (%try-chunk "format-paren" 11062585 7 #'run-ansi-format-paren-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-percent.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-percent ()
   nil
 )
@@ -114080,11 +115479,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                    COLLECT I))) 'NIL) (t (c) (%test-crash-fail-c 23577 c)))
 )
 (defun run-ansi-format-percent ()
-  (%try-chunk "format-percent" 13451906 1 #'run-ansi-format-percent-chunk-1)
-  (%try-chunk "format-percent" 13451906 2 #'run-ansi-format-percent-chunk-2)
+  (%try-chunk "format-percent" 4227714 1 #'run-ansi-format-percent-chunk-1)
+  (%try-chunk "format-percent" 4227714 2 #'run-ansi-format-percent-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-question.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-question ()
   nil
 )
@@ -114292,12 +115694,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"16") (t (c) (%test-crash-fail-c 23597 c)))
 )
 (defun run-ansi-format-question ()
-  (%try-chunk "format-question" 2922735 1 #'run-ansi-format-question-chunk-1)
-  (%try-chunk "format-question" 2922735 2 #'run-ansi-format-question-chunk-2)
-  (%try-chunk "format-question" 2922735 3 #'run-ansi-format-question-chunk-3)
+  (%try-chunk "format-question" 8345839 1 #'run-ansi-format-question-chunk-1)
+  (%try-chunk "format-question" 8345839 2 #'run-ansi-format-question-chunk-2)
+  (%try-chunk "format-question" 8345839 3 #'run-ansi-format-question-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-r.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "roman-numerals.lsp")
 (DEFPARAMETER *ENGLISH-NUMBER-NAMES*
   '("zero" "one" "two" "three" "four" "five" "six" "seven" "eight" "nine" "ten"
@@ -115313,19 +116718,22 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                 "ninety-fourth" "ninety-fifth" "ninety-sixth"
                                 "ninety-seventh" "ninety-eighth" "ninety-ninth"
                                 "one hundredth")) (t (c) nil))
-  (%try-chunk "format-r" 6234995 1 #'run-ansi-format-r-chunk-1)
-  (%try-chunk "format-r" 6234995 2 #'run-ansi-format-r-chunk-2)
-  (%try-chunk "format-r" 6234995 3 #'run-ansi-format-r-chunk-3)
-  (%try-chunk "format-r" 6234995 4 #'run-ansi-format-r-chunk-4)
-  (%try-chunk "format-r" 6234995 5 #'run-ansi-format-r-chunk-5)
-  (%try-chunk "format-r" 6234995 6 #'run-ansi-format-r-chunk-6)
-  (%try-chunk "format-r" 6234995 7 #'run-ansi-format-r-chunk-7)
-  (%try-chunk "format-r" 6234995 8 #'run-ansi-format-r-chunk-8)
-  (%try-chunk "format-r" 6234995 9 #'run-ansi-format-r-chunk-9)
-  (%try-chunk "format-r" 6234995 10 #'run-ansi-format-r-chunk-10)
+  (%try-chunk "format-r" 746355 1 #'run-ansi-format-r-chunk-1)
+  (%try-chunk "format-r" 746355 2 #'run-ansi-format-r-chunk-2)
+  (%try-chunk "format-r" 746355 3 #'run-ansi-format-r-chunk-3)
+  (%try-chunk "format-r" 746355 4 #'run-ansi-format-r-chunk-4)
+  (%try-chunk "format-r" 746355 5 #'run-ansi-format-r-chunk-5)
+  (%try-chunk "format-r" 746355 6 #'run-ansi-format-r-chunk-6)
+  (%try-chunk "format-r" 746355 7 #'run-ansi-format-r-chunk-7)
+  (%try-chunk "format-r" 746355 8 #'run-ansi-format-r-chunk-8)
+  (%try-chunk "format-r" 746355 9 #'run-ansi-format-r-chunk-9)
+  (%try-chunk "format-r" 746355 10 #'run-ansi-format-r-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-s.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-s ()
   nil
 )
@@ -116333,20 +117741,23 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                     (GET-OUTPUT-STREAM-STRING STREAM))))))) '"   789") (t (c) (%test-crash-fail-c 23760 c)))
 )
 (defun run-ansi-format-s ()
-  (%try-chunk "format-s" 6234906 1 #'run-ansi-format-s-chunk-1)
-  (%try-chunk "format-s" 6234906 2 #'run-ansi-format-s-chunk-2)
-  (%try-chunk "format-s" 6234906 3 #'run-ansi-format-s-chunk-3)
-  (%try-chunk "format-s" 6234906 4 #'run-ansi-format-s-chunk-4)
-  (%try-chunk "format-s" 6234906 5 #'run-ansi-format-s-chunk-5)
-  (%try-chunk "format-s" 6234906 6 #'run-ansi-format-s-chunk-6)
-  (%try-chunk "format-s" 6234906 7 #'run-ansi-format-s-chunk-7)
-  (%try-chunk "format-s" 6234906 8 #'run-ansi-format-s-chunk-8)
-  (%try-chunk "format-s" 6234906 9 #'run-ansi-format-s-chunk-9)
-  (%try-chunk "format-s" 6234906 10 #'run-ansi-format-s-chunk-10)
-  (%try-chunk "format-s" 6234906 11 #'run-ansi-format-s-chunk-11)
+  (%try-chunk "format-s" 10920730 1 #'run-ansi-format-s-chunk-1)
+  (%try-chunk "format-s" 10920730 2 #'run-ansi-format-s-chunk-2)
+  (%try-chunk "format-s" 10920730 3 #'run-ansi-format-s-chunk-3)
+  (%try-chunk "format-s" 10920730 4 #'run-ansi-format-s-chunk-4)
+  (%try-chunk "format-s" 10920730 5 #'run-ansi-format-s-chunk-5)
+  (%try-chunk "format-s" 10920730 6 #'run-ansi-format-s-chunk-6)
+  (%try-chunk "format-s" 10920730 7 #'run-ansi-format-s-chunk-7)
+  (%try-chunk "format-s" 10920730 8 #'run-ansi-format-s-chunk-8)
+  (%try-chunk "format-s" 10920730 9 #'run-ansi-format-s-chunk-9)
+  (%try-chunk "format-s" 10920730 10 #'run-ansi-format-s-chunk-10)
+  (%try-chunk "format-s" 10920730 11 #'run-ansi-format-s-chunk-11)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-t.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-t ()
   nil
 )
@@ -117287,15 +118698,18 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                   (GET-OUTPUT-STREAM-STRING S)))))) '"XXYY") (t (c) (%test-crash-fail-c 23802 c)))
 )
 (defun run-ansi-format-t ()
-  (%try-chunk "format-t" 6235173 1 #'run-ansi-format-t-chunk-1)
-  (%try-chunk "format-t" 6235173 2 #'run-ansi-format-t-chunk-2)
-  (%try-chunk "format-t" 6235173 3 #'run-ansi-format-t-chunk-3)
-  (%try-chunk "format-t" 6235173 4 #'run-ansi-format-t-chunk-4)
-  (%try-chunk "format-t" 6235173 5 #'run-ansi-format-t-chunk-5)
-  (%try-chunk "format-t" 6235173 6 #'run-ansi-format-t-chunk-6)
+  (%try-chunk "format-t" 11461669 1 #'run-ansi-format-t-chunk-1)
+  (%try-chunk "format-t" 11461669 2 #'run-ansi-format-t-chunk-2)
+  (%try-chunk "format-t" 11461669 3 #'run-ansi-format-t-chunk-3)
+  (%try-chunk "format-t" 11461669 4 #'run-ansi-format-t-chunk-4)
+  (%try-chunk "format-t" 11461669 5 #'run-ansi-format-t-chunk-5)
+  (%try-chunk "format-t" 11461669 6 #'run-ansi-format-t-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-tilde.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-tilde ()
   nil
 )
@@ -117390,11 +118804,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                    COLLECT (LIST I S S2)))) 'NIL) (t (c) (%test-crash-fail-c 23812 c)))
 )
 (defun run-ansi-format-tilde ()
-  (%try-chunk "format-tilde" 14856185 1 #'run-ansi-format-tilde-chunk-1)
-  (%try-chunk "format-tilde" 14856185 2 #'run-ansi-format-tilde-chunk-2)
+  (%try-chunk "format-tilde" 11038713 1 #'run-ansi-format-tilde-chunk-1)
+  (%try-chunk "format-tilde" 11038713 2 #'run-ansi-format-tilde-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === format-x.lsp ===
+(in-package :modus.mvm)
 (defun run-init-format-x ()
   nil
 )
@@ -118306,15 +119723,18 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                                  COMMAINT FMT X S1 S2 S3)))) 'NIL) (t (c) (%test-crash-fail-c 23855 c)))
 )
 (defun run-ansi-format-x ()
-  (%try-chunk "format-x" 6234105 1 #'run-ansi-format-x-chunk-1)
-  (%try-chunk "format-x" 6234105 2 #'run-ansi-format-x-chunk-2)
-  (%try-chunk "format-x" 6234105 3 #'run-ansi-format-x-chunk-3)
-  (%try-chunk "format-x" 6234105 4 #'run-ansi-format-x-chunk-4)
-  (%try-chunk "format-x" 6234105 5 #'run-ansi-format-x-chunk-5)
-  (%try-chunk "format-x" 6234105 6 #'run-ansi-format-x-chunk-6)
+  (%try-chunk "format-x" 1826809 1 #'run-ansi-format-x-chunk-1)
+  (%try-chunk "format-x" 1826809 2 #'run-ansi-format-x-chunk-2)
+  (%try-chunk "format-x" 1826809 3 #'run-ansi-format-x-chunk-3)
+  (%try-chunk "format-x" 1826809 4 #'run-ansi-format-x-chunk-4)
+  (%try-chunk "format-x" 1826809 5 #'run-ansi-format-x-chunk-5)
+  (%try-chunk "format-x" 1826809 6 #'run-ansi-format-x-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === formatter-c.lsp ===
+(in-package :modus.mvm)
 (defun run-init-formatter-c ()
   nil
 )
@@ -118485,10 +119905,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                    COLLECT (LIST C S1 S2 N)))) 'NIL) (t (c) (%test-crash-fail-c 23863 c)))
 )
 (defun run-ansi-formatter-c ()
-  (%try-chunk "formatter-c" 5546377 1 #'run-ansi-formatter-c-chunk-1)
+  (%try-chunk "formatter-c" 15229321 1 #'run-ansi-formatter-c-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === broadcast-stream-streams.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-broadcast-stream-streams ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118510,10 +119933,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-broadcast-stream-streams ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "broadcast-stream-streams" 10227355 1 #'run-ansi-broadcast-stream-streams-chunk-1)
+  (%try-chunk "broadcast-stream-streams" 6344347 1 #'run-ansi-broadcast-stream-streams-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === clear-input.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-clear-input ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118547,11 +119973,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-clear-input ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "clear-input" 8290573 1 #'run-ansi-clear-input-chunk-1)
-  (%try-chunk "clear-input" 8290573 2 #'run-ansi-clear-input-chunk-2)
+  (%try-chunk "clear-input" 10010893 1 #'run-ansi-clear-input-chunk-1)
+  (%try-chunk "clear-input" 10010893 2 #'run-ansi-clear-input-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === clear-output.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-clear-output ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118588,11 +120017,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-clear-output ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "clear-output" 8701868 1 #'run-ansi-clear-output-chunk-1)
-  (%try-chunk "clear-output" 8701868 2 #'run-ansi-clear-output-chunk-2)
+  (%try-chunk "clear-output" 1247148 1 #'run-ansi-clear-output-chunk-1)
+  (%try-chunk "clear-output" 1247148 2 #'run-ansi-clear-output-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === concatenated-stream-streams.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-concatenated-stream-streams ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118643,10 +120075,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-concatenated-stream-streams ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "concatenated-stream-streams" 10398967 1 #'run-ansi-concatenated-stream-streams-chunk-1)
+  (%try-chunk "concatenated-stream-streams" 13200631 1 #'run-ansi-concatenated-stream-streams-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === echo-stream-input-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-echo-stream-input-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118672,10 +120107,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-echo-stream-input-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "echo-stream-input-stream" 15854493 1 #'run-ansi-echo-stream-input-stream-chunk-1)
+  (%try-chunk "echo-stream-input-stream" 6056861 1 #'run-ansi-echo-stream-input-stream-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === echo-stream-output-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-echo-stream-output-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118702,10 +120140,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-echo-stream-output-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "echo-stream-output-stream" 12198476 1 #'run-ansi-echo-stream-output-stream-chunk-1)
+  (%try-chunk "echo-stream-output-stream" 10920524 1 #'run-ansi-echo-stream-output-stream-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-length.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-file-length ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -118919,12 +120360,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-file-length ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "file-length" 3556984 1 #'run-ansi-file-length-chunk-1)
-  (%try-chunk "file-length" 3556984 2 #'run-ansi-file-length-chunk-2)
-  (%try-chunk "file-length" 3556984 3 #'run-ansi-file-length-chunk-3)
+  (%try-chunk "file-length" 4425336 1 #'run-ansi-file-length-chunk-1)
+  (%try-chunk "file-length" 4425336 2 #'run-ansi-file-length-chunk-2)
+  (%try-chunk "file-length" 4425336 3 #'run-ansi-file-length-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-position.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-file-position ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119146,11 +120590,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-file-position ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "file-position" 6601685 1 #'run-ansi-file-position-chunk-1)
-  (%try-chunk "file-position" 6601685 2 #'run-ansi-file-position-chunk-2)
+  (%try-chunk "file-position" 13466581 1 #'run-ansi-file-position-chunk-1)
+  (%try-chunk "file-position" 13466581 2 #'run-ansi-file-position-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-string-length.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-file-string-length ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119247,10 +120694,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-file-string-length ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "file-string-length" 5026384 1 #'run-ansi-file-string-length-chunk-1)
+  (%try-chunk "file-string-length" 10728016 1 #'run-ansi-file-string-length-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === finish-output.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-finish-output ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119286,11 +120736,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-finish-output ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "finish-output" 2244702 1 #'run-ansi-finish-output-chunk-1)
-  (%try-chunk "finish-output" 2244702 2 #'run-ansi-finish-output-chunk-2)
+  (%try-chunk "finish-output" 3604574 1 #'run-ansi-finish-output-chunk-1)
+  (%try-chunk "finish-output" 3604574 2 #'run-ansi-finish-output-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === force-output.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-force-output ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119326,11 +120779,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-force-output ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "force-output" 12929264 1 #'run-ansi-force-output-chunk-1)
-  (%try-chunk "force-output" 12929264 2 #'run-ansi-force-output-chunk-2)
+  (%try-chunk "force-output" 7178480 1 #'run-ansi-force-output-chunk-1)
+  (%try-chunk "force-output" 7178480 2 #'run-ansi-force-output-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === fresh-line.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP FRESH-LINE.1)
 (DEFSKIP FRESH-LINE.2)
@@ -119387,10 +120843,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-fresh-line ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "fresh-line" 8939414 1 #'run-ansi-fresh-line-chunk-1)
+  (%try-chunk "fresh-line" 6498198 1 #'run-ansi-fresh-line-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === get-output-stream-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-get-output-stream-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119419,10 +120878,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-get-output-stream-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "get-output-stream-string" 12088466 1 #'run-ansi-get-output-stream-string-chunk-1)
+  (%try-chunk "get-output-stream-string" 12661906 1 #'run-ansi-get-output-stream-string-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === input-stream-p.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-input-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119454,10 +120916,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-input-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "input-stream-p" 10959461 1 #'run-ansi-input-stream-p-chunk-1)
+  (%try-chunk "input-stream-p" 9960037 1 #'run-ansi-input-stream-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === interactive-stream-p.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-interactive-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119480,10 +120945,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-interactive-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "interactive-stream-p" 12621379 1 #'run-ansi-interactive-stream-p-chunk-1)
+  (%try-chunk "interactive-stream-p" 8115779 1 #'run-ansi-interactive-stream-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === listen.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-listen ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119551,11 +121019,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-listen ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "listen" 12242078 1 #'run-ansi-listen-chunk-1)
-  (%try-chunk "listen" 12242078 2 #'run-ansi-listen-chunk-2)
+  (%try-chunk "listen" 2722974 1 #'run-ansi-listen-chunk-1)
+  (%try-chunk "listen" 2722974 2 #'run-ansi-listen-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -119614,7 +121085,10 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-broadcast-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-broadcast-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -119697,11 +121171,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-broadcast-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-broadcast-stream" 11737918 1 #'run-ansi-make-broadcast-stream-chunk-1)
-  (%try-chunk "make-broadcast-stream" 11737918 2 #'run-ansi-make-broadcast-stream-chunk-2)
+  (%try-chunk "make-broadcast-stream" 7936830 1 #'run-ansi-make-broadcast-stream-chunk-1)
+  (%try-chunk "make-broadcast-stream" 7936830 2 #'run-ansi-make-broadcast-stream-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-concatenated-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-concatenated-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -120198,14 +121675,17 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-concatenated-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-concatenated-stream" 8809818 1 #'run-ansi-make-concatenated-stream-chunk-1)
-  (%try-chunk "make-concatenated-stream" 8809818 2 #'run-ansi-make-concatenated-stream-chunk-2)
-  (%try-chunk "make-concatenated-stream" 8809818 3 #'run-ansi-make-concatenated-stream-chunk-3)
-  (%try-chunk "make-concatenated-stream" 8809818 4 #'run-ansi-make-concatenated-stream-chunk-4)
-  (%try-chunk "make-concatenated-stream" 8809818 5 #'run-ansi-make-concatenated-stream-chunk-5)
+  (%try-chunk "make-concatenated-stream" 8596826 1 #'run-ansi-make-concatenated-stream-chunk-1)
+  (%try-chunk "make-concatenated-stream" 8596826 2 #'run-ansi-make-concatenated-stream-chunk-2)
+  (%try-chunk "make-concatenated-stream" 8596826 3 #'run-ansi-make-concatenated-stream-chunk-3)
+  (%try-chunk "make-concatenated-stream" 8596826 4 #'run-ansi-make-concatenated-stream-chunk-4)
+  (%try-chunk "make-concatenated-stream" 8596826 5 #'run-ansi-make-concatenated-stream-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-echo-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP MAKE-ECHO-STREAM.15)
 (DEFSKIP MAKE-ECHO-STREAM.16)
@@ -120716,12 +122196,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-echo-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-echo-stream" 5099552 1 #'run-ansi-make-echo-stream-chunk-1)
-  (%try-chunk "make-echo-stream" 5099552 2 #'run-ansi-make-echo-stream-chunk-2)
-  (%try-chunk "make-echo-stream" 5099552 3 #'run-ansi-make-echo-stream-chunk-3)
+  (%try-chunk "make-echo-stream" 16224288 1 #'run-ansi-make-echo-stream-chunk-1)
+  (%try-chunk "make-echo-stream" 16224288 2 #'run-ansi-make-echo-stream-chunk-2)
+  (%try-chunk "make-echo-stream" 16224288 3 #'run-ansi-make-echo-stream-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-string-input-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-string-input-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -120845,11 +122328,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-string-input-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-string-input-stream" 13441119 1 #'run-ansi-make-string-input-stream-chunk-1)
-  (%try-chunk "make-string-input-stream" 13441119 2 #'run-ansi-make-string-input-stream-chunk-2)
+  (%try-chunk "make-string-input-stream" 12539999 1 #'run-ansi-make-string-input-stream-chunk-1)
+  (%try-chunk "make-string-input-stream" 12539999 2 #'run-ansi-make-string-input-stream-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-string-output-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-string-output-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -121035,11 +122521,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-string-output-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-string-output-stream" 4611454 1 #'run-ansi-make-string-output-stream-chunk-1)
-  (%try-chunk "make-string-output-stream" 4611454 2 #'run-ansi-make-string-output-stream-chunk-2)
+  (%try-chunk "make-string-output-stream" 12557694 1 #'run-ansi-make-string-output-stream-chunk-1)
+  (%try-chunk "make-string-output-stream" 12557694 2 #'run-ansi-make-string-output-stream-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-synonym-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-make-synonym-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -121112,10 +122601,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-synonym-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-synonym-stream" 1030144 1 #'run-ansi-make-synonym-stream-chunk-1)
+  (%try-chunk "make-synonym-stream" 833536 1 #'run-ansi-make-synonym-stream-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-two-way-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP MAKE-TWO-WAY-STREAM.3)
 (DEFSKIP MAKE-TWO-WAY-STREAM.6)
@@ -121545,12 +123037,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-make-two-way-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "make-two-way-stream" 4834799 1 #'run-ansi-make-two-way-stream-chunk-1)
-  (%try-chunk "make-two-way-stream" 4834799 2 #'run-ansi-make-two-way-stream-chunk-2)
-  (%try-chunk "make-two-way-stream" 4834799 3 #'run-ansi-make-two-way-stream-chunk-3)
+  (%try-chunk "make-two-way-stream" 6768111 1 #'run-ansi-make-two-way-stream-chunk-1)
+  (%try-chunk "make-two-way-stream" 6768111 2 #'run-ansi-make-two-way-stream-chunk-2)
+  (%try-chunk "make-two-way-stream" 6768111 3 #'run-ansi-make-two-way-stream-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === open-stream-p.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-open-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -121598,10 +123093,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-open-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "open-stream-p" 11251783 1 #'run-ansi-open-stream-p-chunk-1)
+  (%try-chunk "open-stream-p" 9203783 1 #'run-ansi-open-stream-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === open.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN GENERATOR-FOR-ELEMENT-TYPE (TYPE)
   (ETYPECASE TYPE
@@ -123055,13 +124553,16 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-open ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "open" 2661931 1 #'run-ansi-open-chunk-1)
-  (%try-chunk "open" 2661931 2 #'run-ansi-open-chunk-2)
-  (%try-chunk "open" 2661931 3 #'run-ansi-open-chunk-3)
-  (%try-chunk "open" 2661931 4 #'run-ansi-open-chunk-4)
+  (%try-chunk "open" 6446635 1 #'run-ansi-open-chunk-1)
+  (%try-chunk "open" 6446635 2 #'run-ansi-open-chunk-2)
+  (%try-chunk "open" 6446635 3 #'run-ansi-open-chunk-3)
+  (%try-chunk "open" 6446635 4 #'run-ansi-open-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === output-stream-p.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-output-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -123093,10 +124594,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-output-stream-p ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "output-stream-p" 14488332 1 #'run-ansi-output-stream-p-chunk-1)
+  (%try-chunk "output-stream-p" 12292876 1 #'run-ansi-output-stream-p-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === peek-char.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP PEEK-CHAR.4 "no such function name-char")
 (DEFSKIP PEEK-CHAR.5 "no such function name-char")
@@ -123329,12 +124833,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-peek-char ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "peek-char" 11203113 1 #'run-ansi-peek-char-chunk-1)
-  (%try-chunk "peek-char" 11203113 2 #'run-ansi-peek-char-chunk-2)
-  (%try-chunk "peek-char" 11203113 3 #'run-ansi-peek-char-chunk-3)
+  (%try-chunk "peek-char" 8155689 1 #'run-ansi-peek-char-chunk-1)
+  (%try-chunk "peek-char" 8155689 2 #'run-ansi-peek-char-chunk-2)
+  (%try-chunk "peek-char" 8155689 3 #'run-ansi-peek-char-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-byte.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-read-byte ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -123534,11 +125041,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-read-byte ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-byte" 14774002 1 #'run-ansi-read-byte-chunk-1)
-  (%try-chunk "read-byte" 14774002 2 #'run-ansi-read-byte-chunk-2)
+  (%try-chunk "read-byte" 11579122 1 #'run-ansi-read-byte-chunk-1)
+  (%try-chunk "read-byte" 11579122 2 #'run-ansi-read-byte-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-char-no-hang.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP READ-CHAR-NO-HANG.3)
 (defun run-init-read-char-no-hang ()
@@ -123641,11 +125151,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-read-char-no-hang ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-char-no-hang" 15844441 1 #'run-ansi-read-char-no-hang-chunk-1)
-  (%try-chunk "read-char-no-hang" 15844441 2 #'run-ansi-read-char-no-hang-chunk-2)
+  (%try-chunk "read-char-no-hang" 8045657 1 #'run-ansi-read-char-no-hang-chunk-1)
+  (%try-chunk "read-char-no-hang" 8045657 2 #'run-ansi-read-char-no-hang-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-char.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP READ-CHAR.3)
 (defun run-init-read-char ()
@@ -123737,11 +125250,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-read-char ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-char" 3875552 1 #'run-ansi-read-char-chunk-1)
-  (%try-chunk "read-char" 3875552 2 #'run-ansi-read-char-chunk-2)
+  (%try-chunk "read-char" 7414496 1 #'run-ansi-read-char-chunk-1)
+  (%try-chunk "read-char" 7414496 2 #'run-ansi-read-char-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-line.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-read-line ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -123869,11 +125385,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-read-line ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-line" 13090918 1 #'run-ansi-read-line-chunk-1)
-  (%try-chunk "read-line" 13090918 2 #'run-ansi-read-line-chunk-2)
+  (%try-chunk "read-line" 2654310 1 #'run-ansi-read-line-chunk-1)
+  (%try-chunk "read-line" 2654310 2 #'run-ansi-read-line-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-sequence.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-READ-SEQUENCE-TEST (NAME INIT ARGS INPUT &REST EXPECTED)
   `(DEFTEST ,NAME
@@ -124087,11 +125606,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-read-sequence ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-sequence" 11441231 1 #'run-ansi-read-sequence-chunk-1)
-  (%try-chunk "read-sequence" 11441231 2 #'run-ansi-read-sequence-chunk-2)
+  (%try-chunk "read-sequence" 11097167 1 #'run-ansi-read-sequence-chunk-1)
+  (%try-chunk "read-sequence" 11097167 2 #'run-ansi-read-sequence-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === stream-element-type.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-stream-element-type ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124185,11 +125707,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-stream-element-type ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "stream-element-type" 15854853 1 #'run-ansi-stream-element-type-chunk-1)
-  (%try-chunk "stream-element-type" 15854853 2 #'run-ansi-stream-element-type-chunk-2)
+  (%try-chunk "stream-element-type" 13364485 1 #'run-ansi-stream-element-type-chunk-1)
+  (%try-chunk "stream-element-type" 13364485 2 #'run-ansi-stream-element-type-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === stream-error-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-stream-error-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124212,10 +125737,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-stream-error-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "stream-error-stream" 8633575 1 #'run-ansi-stream-error-stream-chunk-1)
+  (%try-chunk "stream-error-stream" 7634151 1 #'run-ansi-stream-error-stream-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === stream-external-format.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-stream-external-format ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124241,10 +125769,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-stream-external-format ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "stream-external-format" 15600213 1 #'run-ansi-stream-external-format-chunk-1)
+  (%try-chunk "stream-external-format" 12929621 1 #'run-ansi-stream-external-format-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === streamp.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-streamp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124276,10 +125807,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-streamp ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "streamp" 5426315 1 #'run-ansi-streamp-chunk-1)
+  (%try-chunk "streamp" 15453323 1 #'run-ansi-streamp-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === synonym-stream-symbol.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-synonym-stream-symbol ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124298,10 +125832,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-synonym-stream-symbol ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "synonym-stream-symbol" 13254476 1 #'run-ansi-synonym-stream-symbol-chunk-1)
+  (%try-chunk "synonym-stream-symbol" 11222860 1 #'run-ansi-synonym-stream-symbol-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === terpri.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP TERPRI.1)
 (DEFSKIP TERPRI.2)
@@ -124334,10 +125871,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-terpri ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "terpri" 10538183 1 #'run-ansi-terpri-chunk-1)
+  (%try-chunk "terpri" 16731335 1 #'run-ansi-terpri-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === two-way-stream-input-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-two-way-stream-input-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124364,10 +125904,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-two-way-stream-input-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "two-way-stream-input-stream" 16308930 1 #'run-ansi-two-way-stream-input-stream-chunk-1)
+  (%try-chunk "two-way-stream-input-stream" 6462146 1 #'run-ansi-two-way-stream-input-stream-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === two-way-stream-output-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-two-way-stream-output-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124394,10 +125937,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-two-way-stream-output-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "two-way-stream-output-stream" 7436971 1 #'run-ansi-two-way-stream-output-stream-chunk-1)
+  (%try-chunk "two-way-stream-output-stream" 14482091 1 #'run-ansi-two-way-stream-output-stream-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === unread-char.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-unread-char ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124499,10 +126045,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-unread-char ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "unread-char" 68947 1 #'run-ansi-unread-char-chunk-1)
+  (%try-chunk "unread-char" 6376787 1 #'run-ansi-unread-char-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-input-from-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-with-input-from-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124758,13 +126307,16 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-with-input-from-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "with-input-from-string" 14597941 1 #'run-ansi-with-input-from-string-chunk-1)
-  (%try-chunk "with-input-from-string" 14597941 2 #'run-ansi-with-input-from-string-chunk-2)
-  (%try-chunk "with-input-from-string" 14597941 3 #'run-ansi-with-input-from-string-chunk-3)
-  (%try-chunk "with-input-from-string" 14597941 4 #'run-ansi-with-input-from-string-chunk-4)
+  (%try-chunk "with-input-from-string" 8585013 1 #'run-ansi-with-input-from-string-chunk-1)
+  (%try-chunk "with-input-from-string" 8585013 2 #'run-ansi-with-input-from-string-chunk-2)
+  (%try-chunk "with-input-from-string" 8585013 3 #'run-ansi-with-input-from-string-chunk-3)
+  (%try-chunk "with-input-from-string" 8585013 4 #'run-ansi-with-input-from-string-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-open-file.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-with-open-file ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -124900,11 +126452,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-with-open-file ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "with-open-file" 15759439 1 #'run-ansi-with-open-file-chunk-1)
-  (%try-chunk "with-open-file" 15759439 2 #'run-ansi-with-open-file-chunk-2)
+  (%try-chunk "with-open-file" 13334607 1 #'run-ansi-with-open-file-chunk-1)
+  (%try-chunk "with-open-file" 13334607 2 #'run-ansi-with-open-file-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-open-stream.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-with-open-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -125022,11 +126577,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-with-open-stream ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "with-open-stream" 15341317 1 #'run-ansi-with-open-stream-chunk-1)
-  (%try-chunk "with-open-stream" 15341317 2 #'run-ansi-with-open-stream-chunk-2)
+  (%try-chunk "with-open-stream" 1496837 1 #'run-ansi-with-open-stream-chunk-1)
+  (%try-chunk "with-open-stream" 1496837 2 #'run-ansi-with-open-stream-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-output-to-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP WITH-OUTPUT-TO-STRING.14)
 (defun run-init-with-output-to-string ()
@@ -125136,11 +126694,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-with-output-to-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "with-output-to-string" 6847385 1 #'run-ansi-with-output-to-string-chunk-1)
-  (%try-chunk "with-output-to-string" 6847385 2 #'run-ansi-with-output-to-string-chunk-2)
+  (%try-chunk "with-output-to-string" 12221337 1 #'run-ansi-with-output-to-string-chunk-1)
+  (%try-chunk "with-output-to-string" 12221337 2 #'run-ansi-with-output-to-string-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === write-char.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP WRITE-CHAR.1)
 (defun run-init-write-char ()
@@ -125171,10 +126732,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-write-char ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "write-char" 10547215 1 #'run-ansi-write-char-chunk-1)
+  (%try-chunk "write-char" 1765391 1 #'run-ansi-write-char-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === write-line.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP WRITE-LINE.3)
 (DEFSKIP WRITE-LINE.4)
@@ -125246,10 +126810,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-write-line ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "write-line" 11773353 1 #'run-ansi-write-line-chunk-1)
+  (%try-chunk "write-line" 12740009 1 #'run-ansi-write-line-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === write-sequence.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-WRITE-SEQUENCE-TEST (NAME INPUT ARGS &REST EXPECTED)
   `(DEFTEST ,NAME
@@ -125454,11 +127021,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-write-sequence ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "write-sequence" 12024672 1 #'run-ansi-write-sequence-chunk-1)
-  (%try-chunk "write-sequence" 12024672 2 #'run-ansi-write-sequence-chunk-2)
+  (%try-chunk "write-sequence" 2407264 1 #'run-ansi-write-sequence-chunk-1)
+  (%try-chunk "write-sequence" 2407264 2 #'run-ansi-write-sequence-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === write-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-write-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -125662,12 +127232,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
 )
 (defun run-ansi-write-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "write-string" 9988146 1 #'run-ansi-write-string-chunk-1)
-  (%try-chunk "write-string" 9988146 2 #'run-ansi-write-string-chunk-2)
-  (%try-chunk "write-string" 9988146 3 #'run-ansi-write-string-chunk-3)
+  (%try-chunk "write-string" 2205746 1 #'run-ansi-write-string-chunk-1)
+  (%try-chunk "write-string" 2205746 2 #'run-ansi-write-string-chunk-2)
+  (%try-chunk "write-string" 2205746 3 #'run-ansi-write-string-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === defpackage.lsp ===
+(in-package :modus.mvm)
 (defun run-init-defpackage ()
   nil
 )
@@ -126358,13 +127931,16 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                                                       SUCCESS)) (t (c) (%test-crash-fail-c 24400 c)))
 )
 (defun run-ansi-defpackage ()
-  (%try-chunk "defpackage" 16375298 1 #'run-ansi-defpackage-chunk-1)
-  (%try-chunk "defpackage" 16375298 2 #'run-ansi-defpackage-chunk-2)
-  (%try-chunk "defpackage" 16375298 3 #'run-ansi-defpackage-chunk-3)
-  (%try-chunk "defpackage" 16375298 4 #'run-ansi-defpackage-chunk-4)
+  (%try-chunk "defpackage" 4267522 1 #'run-ansi-defpackage-chunk-1)
+  (%try-chunk "defpackage" 4267522 2 #'run-ansi-defpackage-chunk-2)
+  (%try-chunk "defpackage" 4267522 3 #'run-ansi-defpackage-chunk-3)
+  (%try-chunk "defpackage" 4267522 4 #'run-ansi-defpackage-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === delete-package.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-DELETE-PACKAGE-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -126519,10 +128095,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                              (ERROR (C) T)))) 'T) (t (c) (%test-crash-fail-c 24408 c)))
 )
 (defun run-ansi-delete-package ()
-  (%try-chunk "delete-package" 7566577 1 #'run-ansi-delete-package-chunk-1)
+  (%try-chunk "delete-package" 5174513 1 #'run-ansi-delete-package-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === do-all-symbols.lsp ===
+(in-package :modus.mvm)
 (defun run-init-do-all-symbols ()
   nil
 )
@@ -126689,11 +128268,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                              (DO-ALL-SYMBOLS (S :GOOD)))) ':GOOD) (t (c) (%test-crash-fail-c 24421 c)))
 )
 (defun run-ansi-do-all-symbols ()
-  (%try-chunk "do-all-symbols" 11933536 1 #'run-ansi-do-all-symbols-chunk-1)
-  (%try-chunk "do-all-symbols" 11933536 2 #'run-ansi-do-all-symbols-chunk-2)
+  (%try-chunk "do-all-symbols" 12228448 1 #'run-ansi-do-all-symbols-chunk-1)
+  (%try-chunk "do-all-symbols" 12228448 2 #'run-ansi-do-all-symbols-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === do-external-symbols.lsp ===
+(in-package :modus.mvm)
 (DEFUN COLLECT-EXTERNAL-SYMBOLS (PKG)
   (REMOVE-DUPLICATES
    (SORT-SYMBOLS
@@ -126787,11 +128369,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                              (DO-EXTERNAL-SYMBOLS (S "CL-TEST" :GOOD)))) ':GOOD) (t (c) (%test-crash-fail-c 24433 c)))
 )
 (defun run-ansi-do-external-symbols ()
-  (%try-chunk "do-external-symbols" 1741556 1 #'run-ansi-do-external-symbols-chunk-1)
-  (%try-chunk "do-external-symbols" 1741556 2 #'run-ansi-do-external-symbols-chunk-2)
+  (%try-chunk "do-external-symbols" 2822900 1 #'run-ansi-do-external-symbols-chunk-1)
+  (%try-chunk "do-external-symbols" 2822900 2 #'run-ansi-do-external-symbols-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === do-symbols.lsp ===
+(in-package :modus.mvm)
 (DEFUN COLLECT-SYMBOLS (PKG)
   (REMOVE-DUPLICATES
    (SORT-SYMBOLS
@@ -126910,11 +128495,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                              (DO-SYMBOLS (S "CL-TEST" :GOOD)))) ':GOOD) (t (c) (%test-crash-fail-c 24445 c)))
 )
 (defun run-ansi-do-symbols ()
-  (%try-chunk "do-symbols" 2141428 1 #'run-ansi-do-symbols-chunk-1)
-  (%try-chunk "do-symbols" 2141428 2 #'run-ansi-do-symbols-chunk-2)
+  (%try-chunk "do-symbols" 3812596 1 #'run-ansi-do-symbols-chunk-1)
+  (%try-chunk "do-symbols" 3812596 2 #'run-ansi-do-symbols-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === export.lsp ===
+(in-package :modus.mvm)
 (defun run-init-export ()
   nil
 )
@@ -127010,10 +128598,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24452 c)))
 )
 (defun run-ansi-export ()
-  (%try-chunk "export" 10790979 1 #'run-ansi-export-chunk-1)
+  (%try-chunk "export" 15525955 1 #'run-ansi-export-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-all-symbols.lsp ===
+(in-package :modus.mvm)
 (defun run-init-find-all-symbols ()
   nil
 )
@@ -127221,11 +128812,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24463 c)))
 )
 (defun run-ansi-find-all-symbols ()
-  (%try-chunk "find-all-symbols" 5482510 1 #'run-ansi-find-all-symbols-chunk-1)
-  (%try-chunk "find-all-symbols" 5482510 2 #'run-ansi-find-all-symbols-chunk-2)
+  (%try-chunk "find-all-symbols" 14297102 1 #'run-ansi-find-all-symbols-chunk-1)
+  (%try-chunk "find-all-symbols" 14297102 2 #'run-ansi-find-all-symbols-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-package.lsp ===
+(in-package :modus.mvm)
 (defun run-init-find-package ()
   nil
 )
@@ -127359,12 +128953,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24482 c)))
 )
 (defun run-ansi-find-package ()
-  (%try-chunk "find-package" 1188205 1 #'run-ansi-find-package-chunk-1)
-  (%try-chunk "find-package" 1188205 2 #'run-ansi-find-package-chunk-2)
-  (%try-chunk "find-package" 1188205 3 #'run-ansi-find-package-chunk-3)
+  (%try-chunk "find-package" 14344557 1 #'run-ansi-find-package-chunk-1)
+  (%try-chunk "find-package" 14344557 2 #'run-ansi-find-package-chunk-2)
+  (%try-chunk "find-package" 14344557 3 #'run-ansi-find-package-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-symbol.lsp ===
+(in-package :modus.mvm)
 (defun run-init-find-symbol ()
   nil
 )
@@ -127558,13 +129155,16 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24508 c)))
 )
 (defun run-ansi-find-symbol ()
-  (%try-chunk "find-symbol" 8318313 1 #'run-ansi-find-symbol-chunk-1)
-  (%try-chunk "find-symbol" 8318313 2 #'run-ansi-find-symbol-chunk-2)
-  (%try-chunk "find-symbol" 8318313 3 #'run-ansi-find-symbol-chunk-3)
-  (%try-chunk "find-symbol" 8318313 4 #'run-ansi-find-symbol-chunk-4)
+  (%try-chunk "find-symbol" 12086633 1 #'run-ansi-find-symbol-chunk-1)
+  (%try-chunk "find-symbol" 12086633 2 #'run-ansi-find-symbol-chunk-2)
+  (%try-chunk "find-symbol" 12086633 3 #'run-ansi-find-symbol-chunk-3)
+  (%try-chunk "find-symbol" 12086633 4 #'run-ansi-find-symbol-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === import.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *IMPORT-PACKAGE-TEST-NAME*
   (LOOP FOR I FROM 1
         FOR NAME = (FORMAT NIL "ITP-~A" I)
@@ -128033,12 +129633,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
   (handler-case (setq *IMPORT-PACKAGE-TEST-NAME* (LOOP FOR I FROM 1
                                        FOR NAME = (FORMAT NIL "ITP-~A" I)
                                        UNLESS (FIND-PACKAGE NAME) RETURN NAME)) (t (c) nil))
-  (%try-chunk "import" 10118226 1 #'run-ansi-import-chunk-1)
-  (%try-chunk "import" 10118226 2 #'run-ansi-import-chunk-2)
-  (%try-chunk "import" 10118226 3 #'run-ansi-import-chunk-3)
+  (%try-chunk "import" 3482706 1 #'run-ansi-import-chunk-1)
+  (%try-chunk "import" 3482706 2 #'run-ansi-import-chunk-2)
+  (%try-chunk "import" 3482706 3 #'run-ansi-import-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === in-package.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-IN-PACKAGE-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -128120,10 +129723,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                            (ERROR (C) C)))) 'PACKAGE-ERROR) (t (c) (%test-crash-fail-c 24530 c)))
 )
 (defun run-ansi-in-package ()
-  (%try-chunk "in-package" 9356295 1 #'run-ansi-in-package-chunk-1)
+  (%try-chunk "in-package" 14271495 1 #'run-ansi-in-package-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === intern.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-INTERN-TEST
           (TEST-NAME &KEY (SYMBOL-NAME "FOO") (PACKAGE-NAME "TEMP1"))
   `(DEFTEST ,TEST-NAME
@@ -128309,10 +129915,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24536 c)))
 )
 (defun run-ansi-intern ()
-  (%try-chunk "intern" 3218861 1 #'run-ansi-intern-chunk-1)
+  (%try-chunk "intern" 10575277 1 #'run-ansi-intern-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === keyword.lsp ===
+(in-package :modus.mvm)
 (defun run-init-keyword ()
   nil
 )
@@ -128331,10 +129940,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                (RETURN (LIST S (EVAL S))))))) 'T) (t (c) (%test-crash-fail-c 24539 c)))
 )
 (defun run-ansi-keyword ()
-  (%try-chunk "keyword" 6564710 1 #'run-ansi-keyword-chunk-1)
+  (%try-chunk "keyword" 7940966 1 #'run-ansi-keyword-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === list-all-packages.lsp ===
+(in-package :modus.mvm)
 (defun run-init-list-all-packages ()
   nil
 )
@@ -128361,10 +129973,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24544 c)))
 )
 (defun run-ansi-list-all-packages ()
-  (%try-chunk "list-all-packages" 9796613 1 #'run-ansi-list-all-packages-chunk-1)
+  (%try-chunk "list-all-packages" 5766149 1 #'run-ansi-list-all-packages-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;packages00-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;package-aux.lsp")
 (IN-PACKAGE "CL-TEST")
@@ -128405,7 +130020,10 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-package.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-MAKE-PACKAGE-TEST1 (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -129034,13 +130652,16 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                              (ERROR (C) T)))) 'T) (t (c) (%test-crash-fail-c 24574 c)))
 )
 (defun run-ansi-make-package ()
-  (%try-chunk "make-package" 3822818 1 #'run-ansi-make-package-chunk-1)
-  (%try-chunk "make-package" 3822818 2 #'run-ansi-make-package-chunk-2)
-  (%try-chunk "make-package" 3822818 3 #'run-ansi-make-package-chunk-3)
-  (%try-chunk "make-package" 3822818 4 #'run-ansi-make-package-chunk-4)
+  (%try-chunk "make-package" 9016546 1 #'run-ansi-make-package-chunk-1)
+  (%try-chunk "make-package" 9016546 2 #'run-ansi-make-package-chunk-2)
+  (%try-chunk "make-package" 9016546 3 #'run-ansi-make-package-chunk-3)
+  (%try-chunk "make-package" 9016546 4 #'run-ansi-make-package-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-error-package.lsp ===
+(in-package :modus.mvm)
 (defun run-init-package-error-package ()
   nil
 )
@@ -129076,10 +130697,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24580 c)))
 )
 (defun run-ansi-package-error-package ()
-  (%try-chunk "package-error-package" 16637735 1 #'run-ansi-package-error-package-chunk-1)
+  (%try-chunk "package-error-package" 14835495 1 #'run-ansi-package-error-package-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-error.lsp ===
+(in-package :modus.mvm)
 (defun run-init-package-error ()
   nil
 )
@@ -129102,10 +130726,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                              'PACKAGE-ERROR))) 'NIL) (t (c) (%test-crash-fail-c 24584 c)))
 )
 (defun run-ansi-package-error ()
-  (%try-chunk "package-error" 15746968 1 #'run-ansi-package-error-chunk-1)
+  (%try-chunk "package-error" 12126104 1 #'run-ansi-package-error-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-name.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-PACKAGE-NAME-TEST (TEST-NAME NAME-FORM EXPECTED-NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM) (EXPECTED-NAME ,EXPECTED-NAME-FORM))
@@ -129211,12 +130838,15 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
   (handler-case (run-test 24603 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 24603 c)))
 )
 (defun run-ansi-package-name ()
-  (%try-chunk "package-name" 12968255 1 #'run-ansi-package-name-chunk-1)
-  (%try-chunk "package-name" 12968255 2 #'run-ansi-package-name-chunk-2)
-  (%try-chunk "package-name" 12968255 3 #'run-ansi-package-name-chunk-3)
+  (%try-chunk "package-name" 10641727 1 #'run-ansi-package-name-chunk-1)
+  (%try-chunk "package-name" 10641727 2 #'run-ansi-package-name-chunk-2)
+  (%try-chunk "package-name" 10641727 3 #'run-ansi-package-name-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-nicknames.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-PACKAGE-NICKNAMES-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -129303,11 +130933,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
   (handler-case (run-test 24619 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 24619 c)))
 )
 (defun run-ansi-package-nicknames ()
-  (%try-chunk "package-nicknames" 7716603 1 #'run-ansi-package-nicknames-chunk-1)
-  (%try-chunk "package-nicknames" 7716603 2 #'run-ansi-package-nicknames-chunk-2)
+  (%try-chunk "package-nicknames" 2096891 1 #'run-ansi-package-nicknames-chunk-1)
+  (%try-chunk "package-nicknames" 2096891 2 #'run-ansi-package-nicknames-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-shadowing-symbols.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-PACKAGE-SHADOWING-SYMBOLS-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -129364,10 +130997,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24621 c)))
 )
 (defun run-ansi-package-shadowing-symbols ()
-  (%try-chunk "package-shadowing-symbols" 1210958 1 #'run-ansi-package-shadowing-symbols-chunk-1)
+  (%try-chunk "package-shadowing-symbols" 16300622 1 #'run-ansi-package-shadowing-symbols-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-use-list.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-PACKAGE-USE-LIST-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -129417,10 +131053,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24623 c)))
 )
 (defun run-ansi-package-use-list ()
-  (%try-chunk "package-use-list" 16226956 1 #'run-ansi-package-use-list-chunk-1)
+  (%try-chunk "package-use-list" 268940 1 #'run-ansi-package-use-list-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === package-used-by-list.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-PACKAGE-USED-BY-LIST-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -129476,10 +131115,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24625 c)))
 )
 (defun run-ansi-package-used-by-list ()
-  (%try-chunk "package-used-by-list" 12649694 1 #'run-ansi-package-used-by-list-chunk-1)
+  (%try-chunk "package-used-by-list" 2458846 1 #'run-ansi-package-used-by-list-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === packagep.lsp ===
+(in-package :modus.mvm)
 (defun run-init-packagep ()
   nil
 )
@@ -129491,10 +131133,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24629 c)))
 )
 (defun run-ansi-packagep ()
-  (%try-chunk "packagep" 5109693 1 #'run-ansi-packagep-chunk-1)
+  (%try-chunk "packagep" 8681405 1 #'run-ansi-packagep-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === rename-package.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rename-package ()
   nil
 )
@@ -129753,11 +131398,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24641 c)))
 )
 (defun run-ansi-rename-package ()
-  (%try-chunk "rename-package" 14678440 1 #'run-ansi-rename-package-chunk-1)
-  (%try-chunk "rename-package" 14678440 2 #'run-ansi-rename-package-chunk-2)
+  (%try-chunk "rename-package" 5552552 1 #'run-ansi-rename-package-chunk-1)
+  (%try-chunk "rename-package" 5552552 2 #'run-ansi-rename-package-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === shadow.lsp ===
+(in-package :modus.mvm)
 (defun run-init-shadow ()
   nil
 )
@@ -130214,11 +131862,14 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24653 c)))
 )
 (defun run-ansi-shadow ()
-  (%try-chunk "shadow" 12577 1 #'run-ansi-shadow-chunk-1)
-  (%try-chunk "shadow" 12577 2 #'run-ansi-shadow-chunk-2)
+  (%try-chunk "shadow" 12087585 1 #'run-ansi-shadow-chunk-1)
+  (%try-chunk "shadow" 12087585 2 #'run-ansi-shadow-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === shadowing-import.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-SHADOWING-IMPORT-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME1 ,NAME-FORM))
@@ -130344,10 +131995,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24659 c)))
 )
 (defun run-ansi-shadowing-import ()
-  (%try-chunk "shadowing-import" 766153 1 #'run-ansi-shadowing-import-chunk-1)
+  (%try-chunk "shadowing-import" 454857 1 #'run-ansi-shadowing-import-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === unexport.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-UNEXPORT-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -130625,10 +132279,13 @@ X CCC") (t (c) (%test-crash-fail-c 23353 c)))
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24667 c)))
 )
 (defun run-ansi-unexport ()
-  (%try-chunk "unexport" 13649432 1 #'run-ansi-unexport-chunk-1)
+  (%try-chunk "unexport" 8783384 1 #'run-ansi-unexport-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === unintern.lsp ===
+(in-package :modus.mvm)
 NIL
 (DEFMACRO DEF-UNINTERN-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
@@ -131005,11 +132662,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24678 c)))
 )
 (defun run-ansi-unintern ()
-  (%try-chunk "unintern" 7196950 1 #'run-ansi-unintern-chunk-1)
-  (%try-chunk "unintern" 7196950 2 #'run-ansi-unintern-chunk-2)
+  (%try-chunk "unintern" 12751126 1 #'run-ansi-unintern-chunk-1)
+  (%try-chunk "unintern" 12751126 2 #'run-ansi-unintern-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === unuse-package.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-UNUSE-PACKAGE-TEST (TEST-NAME &KEY (USER "H") (USED "G"))
   `(DEFTEST ,TEST-NAME
     (LET ((USER-NAME ,USER) (USED-NAME ,USED))
@@ -131281,11 +132941,14 @@ NIL
                              (ERROR (C) T)))) 'T) (t (c) (%test-crash-fail-c 24689 c)))
 )
 (defun run-ansi-unuse-package ()
-  (%try-chunk "unuse-package" 3302824 1 #'run-ansi-unuse-package-chunk-1)
-  (%try-chunk "unuse-package" 3302824 2 #'run-ansi-unuse-package-chunk-2)
+  (%try-chunk "unuse-package" 16262568 1 #'run-ansi-unuse-package-chunk-1)
+  (%try-chunk "unuse-package" 16262568 2 #'run-ansi-unuse-package-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === use-package.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-USE-PACKAGE-TEST (TEST-NAME &KEY (USER "H") (USED "G"))
   `(DEFTEST ,TEST-NAME
     (LET ((USER-NAME ,USER) (USED-NAME ,USED))
@@ -131585,11 +133248,14 @@ NIL
                              (ERROR (C) T)))) 'T) (t (c) (%test-crash-fail-c 24698 c)))
 )
 (defun run-ansi-use-package ()
-  (%try-chunk "use-package" 9851323 1 #'run-ansi-use-package-chunk-1)
-  (%try-chunk "use-package" 9851323 2 #'run-ansi-use-package-chunk-2)
+  (%try-chunk "use-package" 414139 1 #'run-ansi-use-package-chunk-1)
+  (%try-chunk "use-package" 414139 2 #'run-ansi-use-package-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-package-iterator.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-WITH-PACKAGE-ITERATOR-TEST (TEST-NAME NAME-FORM)
   `(DEFTEST ,TEST-NAME
     (LET ((NAME ,NAME-FORM))
@@ -131794,11 +133460,14 @@ NIL
                                      (DECLARE (SPECIAL X)))))))) ':GOOD) (t (c) (%test-crash-fail-c 24713 c)))
 )
 (defun run-ansi-with-package-iterator ()
-  (%try-chunk "with-package-iterator" 8026829 1 #'run-ansi-with-package-iterator-chunk-1)
-  (%try-chunk "with-package-iterator" 8026829 2 #'run-ansi-with-package-iterator-chunk-2)
+  (%try-chunk "with-package-iterator" 9992909 1 #'run-ansi-with-package-iterator-chunk-1)
+  (%try-chunk "with-package-iterator" 9992909 2 #'run-ansi-with-package-iterator-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === compile.lsp ===
+(in-package :modus.mvm)
 (defun run-init-compile ()
   nil
 )
@@ -131880,18 +133549,24 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24724 c)))
 )
 (defun run-ansi-compile ()
-  (%try-chunk "compile" 16555366 1 #'run-ansi-compile-chunk-1)
-  (%try-chunk "compile" 16555366 2 #'run-ansi-compile-chunk-2)
+  (%try-chunk "compile" 3120486 1 #'run-ansi-compile-chunk-1)
+  (%try-chunk "compile" 3120486 2 #'run-ansi-compile-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === compiler-macros.lsp ===
+(in-package :modus.mvm)
 (defun run-init-compiler-macros ()
   nil
 )
 (defun run-ansi-compiler-macros ()
 )
 
+(in-package :modus.mvm)
+
 ;; === constantp.lsp ===
+(in-package :modus.mvm)
 (DEFCONSTANT CONSTANTP-TEST-SYMBOL 1)
 (DEFMACRO MACRO-FOR-CONSTANTP.11 (X) X)
 (defun run-init-constantp ()
@@ -131934,11 +133609,14 @@ NIL
                                                       I X Y)))) '(T 2 1 2)) (t (c) (%test-crash-fail-c 24739 c)))
 )
 (defun run-ansi-constantp ()
-  (%try-chunk "constantp" 7800049 1 #'run-ansi-constantp-chunk-1)
-  (%try-chunk "constantp" 7800049 2 #'run-ansi-constantp-chunk-2)
+  (%try-chunk "constantp" 7062769 1 #'run-ansi-constantp-chunk-1)
+  (%try-chunk "constantp" 7062769 2 #'run-ansi-constantp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === declaim.lsp ===
+(in-package :modus.mvm)
 (defun run-init-declaim ()
   nil
 )
@@ -131973,11 +133651,14 @@ NIL
                                    (%F)))))) ':GOOD) (t (c) (%test-crash-fail-c 24750 c)))
 )
 (defun run-ansi-declaim ()
-  (%try-chunk "declaim" 13961588 1 #'run-ansi-declaim-chunk-1)
-  (%try-chunk "declaim" 13961588 2 #'run-ansi-declaim-chunk-2)
+  (%try-chunk "declaim" 2328948 1 #'run-ansi-declaim-chunk-1)
+  (%try-chunk "declaim" 2328948 2 #'run-ansi-declaim-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === declaration.lsp ===
+(in-package :modus.mvm)
 (defun run-init-declaration ()
   nil
 )
@@ -132141,11 +133822,14 @@ NIL
                                                                                 T)) (t (c) (%test-crash-fail-c 24761 c)))
 )
 (defun run-ansi-declaration ()
-  (%try-chunk "declaration" 15765319 1 #'run-ansi-declaration-chunk-1)
-  (%try-chunk "declaration" 15765319 2 #'run-ansi-declaration-chunk-2)
+  (%try-chunk "declaration" 16043847 1 #'run-ansi-declaration-chunk-1)
+  (%try-chunk "declaration" 16043847 2 #'run-ansi-declaration-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-compiler-macro.lsp ===
+(in-package :modus.mvm)
 (defun run-init-define-compiler-macro ()
   nil
 )
@@ -132439,11 +134123,14 @@ NIL
                                                         *X*))))) '((7 23) :GOOD)) (t (c) (%test-crash-fail-c 24772 c)))
 )
 (defun run-ansi-define-compiler-macro ()
-  (%try-chunk "define-compiler-macro" 11385787 1 #'run-ansi-define-compiler-macro-chunk-1)
-  (%try-chunk "define-compiler-macro" 11385787 2 #'run-ansi-define-compiler-macro-chunk-2)
+  (%try-chunk "define-compiler-macro" 1211323 1 #'run-ansi-define-compiler-macro-chunk-1)
+  (%try-chunk "define-compiler-macro" 1211323 2 #'run-ansi-define-compiler-macro-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-symbol-macro.lsp ===
+(in-package :modus.mvm)
 (defun run-init-define-symbol-macro ()
   nil
 )
@@ -132470,10 +134157,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24775 c)))
 )
 (defun run-ansi-define-symbol-macro ()
-  (%try-chunk "define-symbol-macro" 14534606 1 #'run-ansi-define-symbol-macro-chunk-1)
+  (%try-chunk "define-symbol-macro" 7473102 1 #'run-ansi-define-symbol-macro-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === defmacro.lsp ===
+(in-package :modus.mvm)
 (defun run-init-defmacro ()
   nil
 )
@@ -132806,12 +134496,15 @@ NIL
                                                        (NIL NIL NIL))) (t (c) (%test-crash-fail-c 24800 c)))
 )
 (defun run-ansi-defmacro ()
-  (%try-chunk "defmacro" 8109450 1 #'run-ansi-defmacro-chunk-1)
-  (%try-chunk "defmacro" 8109450 2 #'run-ansi-defmacro-chunk-2)
-  (%try-chunk "defmacro" 8109450 3 #'run-ansi-defmacro-chunk-3)
+  (%try-chunk "defmacro" 1457546 1 #'run-ansi-defmacro-chunk-1)
+  (%try-chunk "defmacro" 1457546 2 #'run-ansi-defmacro-chunk-2)
+  (%try-chunk "defmacro" 1457546 3 #'run-ansi-defmacro-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === dynamic-extent.lsp ===
+(in-package :modus.mvm)
 (defun run-init-dynamic-extent ()
   nil
 )
@@ -132926,11 +134619,14 @@ NIL
                              :GOOD)) ':GOOD) (t (c) (%test-crash-fail-c 24816 c)))
 )
 (defun run-ansi-dynamic-extent ()
-  (%try-chunk "dynamic-extent" 15437897 1 #'run-ansi-dynamic-extent-chunk-1)
-  (%try-chunk "dynamic-extent" 15437897 2 #'run-ansi-dynamic-extent-chunk-2)
+  (%try-chunk "dynamic-extent" 13717577 1 #'run-ansi-dynamic-extent-chunk-1)
+  (%try-chunk "dynamic-extent" 13717577 2 #'run-ansi-dynamic-extent-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === eval-and-compile.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *EVAL-AND-COMPILE-FNS*
   '(COMPILE EVAL MACROEXPAND MACROEXPAND-1 PROCLAIM SPECIAL-OPERATOR-P
             CONSTANTP))
@@ -132956,10 +134652,13 @@ NIL
                                    DEFMACRO
                                    DEFINE-SYMBOL-MACRO
                                    DECLAIM)) (t (c) nil))
-  (%try-chunk "eval-and-compile" 963443 1 #'run-ansi-eval-and-compile-chunk-1)
+  (%try-chunk "eval-and-compile" 16118643 1 #'run-ansi-eval-and-compile-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === eval-when.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *EVAL-WHEN.1-COLLECTOR*)
 (defun run-init-eval-when ()
   nil
@@ -133111,12 +134810,15 @@ NIL
                              (EVAL-WHEN (:EXECUTE) :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 24836 c)))
 )
 (defun run-ansi-eval-when ()
-  (%try-chunk "eval-when" 10474184 1 #'run-ansi-eval-when-chunk-1)
-  (%try-chunk "eval-when" 10474184 2 #'run-ansi-eval-when-chunk-2)
-  (%try-chunk "eval-when" 10474184 3 #'run-ansi-eval-when-chunk-3)
+  (%try-chunk "eval-when" 13472456 1 #'run-ansi-eval-when-chunk-1)
+  (%try-chunk "eval-when" 13472456 2 #'run-ansi-eval-when-chunk-2)
+  (%try-chunk "eval-when" 13472456 3 #'run-ansi-eval-when-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === eval.lsp ===
+(in-package :modus.mvm)
 (defun run-init-eval ()
   nil
 )
@@ -133150,11 +134852,14 @@ NIL
                                              (ERROR (C) T))))) 'T) (t (c) (%test-crash-fail-c 24847 c)))
 )
 (defun run-ansi-eval ()
-  (%try-chunk "eval" 4936449 1 #'run-ansi-eval-chunk-1)
-  (%try-chunk "eval" 4936449 2 #'run-ansi-eval-chunk-2)
+  (%try-chunk "eval" 13882113 1 #'run-ansi-eval-chunk-1)
+  (%try-chunk "eval" 13882113 2 #'run-ansi-eval-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ignorable.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ignorable ()
   nil
 )
@@ -133199,10 +134904,13 @@ NIL
                                                                         (C . B))) (t (c) (%test-crash-fail-c 24855 c)))
 )
 (defun run-ansi-ignorable ()
-  (%try-chunk "ignorable" 12614080 1 #'run-ansi-ignorable-chunk-1)
+  (%try-chunk "ignorable" 735680 1 #'run-ansi-ignorable-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === ignore.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ignore ()
   nil
 )
@@ -133229,10 +134937,13 @@ NIL
                              :GOOD)) ':GOOD) (t (c) (%test-crash-fail-c 24861 c)))
 )
 (defun run-ansi-ignore ()
-  (%try-chunk "ignore" 3866319 1 #'run-ansi-ignore-chunk-1)
+  (%try-chunk "ignore" 65231 1 #'run-ansi-ignore-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === lambda.lsp ===
+(in-package :modus.mvm)
 (defun run-init-lambda ()
   nil
 )
@@ -133474,18 +135185,21 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24930 c)))
 )
 (defun run-ansi-lambda ()
-  (%try-chunk "lambda" 3178824 1 #'run-ansi-lambda-chunk-1)
-  (%try-chunk "lambda" 3178824 2 #'run-ansi-lambda-chunk-2)
-  (%try-chunk "lambda" 3178824 3 #'run-ansi-lambda-chunk-3)
-  (%try-chunk "lambda" 3178824 4 #'run-ansi-lambda-chunk-4)
-  (%try-chunk "lambda" 3178824 5 #'run-ansi-lambda-chunk-5)
-  (%try-chunk "lambda" 3178824 6 #'run-ansi-lambda-chunk-6)
-  (%try-chunk "lambda" 3178824 7 #'run-ansi-lambda-chunk-7)
-  (%try-chunk "lambda" 3178824 8 #'run-ansi-lambda-chunk-8)
-  (%try-chunk "lambda" 3178824 9 #'run-ansi-lambda-chunk-9)
+  (%try-chunk "lambda" 13271368 1 #'run-ansi-lambda-chunk-1)
+  (%try-chunk "lambda" 13271368 2 #'run-ansi-lambda-chunk-2)
+  (%try-chunk "lambda" 13271368 3 #'run-ansi-lambda-chunk-3)
+  (%try-chunk "lambda" 13271368 4 #'run-ansi-lambda-chunk-4)
+  (%try-chunk "lambda" 13271368 5 #'run-ansi-lambda-chunk-5)
+  (%try-chunk "lambda" 13271368 6 #'run-ansi-lambda-chunk-6)
+  (%try-chunk "lambda" 13271368 7 #'run-ansi-lambda-chunk-7)
+  (%try-chunk "lambda" 13271368 8 #'run-ansi-lambda-chunk-8)
+  (%try-chunk "lambda" 13271368 9 #'run-ansi-lambda-chunk-9)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -133522,7 +135236,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === locally.lsp ===
+(in-package :modus.mvm)
 (defun run-init-locally ()
   nil
 )
@@ -133550,10 +135267,13 @@ NIL
                              (LOCALLY :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 24938 c)))
 )
 (defun run-ansi-locally ()
-  (%try-chunk "locally" 9215119 1 #'run-ansi-locally-chunk-1)
+  (%try-chunk "locally" 14408847 1 #'run-ansi-locally-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === macro-function.lsp ===
+(in-package :modus.mvm)
 (defun run-init-macro-function ()
   nil
 )
@@ -133664,11 +135384,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24955 c)))
 )
 (defun run-ansi-macro-function ()
-  (%try-chunk "macro-function" 14874458 1 #'run-ansi-macro-function-chunk-1)
-  (%try-chunk "macro-function" 14874458 2 #'run-ansi-macro-function-chunk-2)
+  (%try-chunk "macro-function" 8107866 1 #'run-ansi-macro-function-chunk-1)
+  (%try-chunk "macro-function" 8107866 2 #'run-ansi-macro-function-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === macroexpand-1.lsp ===
+(in-package :modus.mvm)
 (defun run-init-macroexpand-1 ()
   nil
 )
@@ -133720,10 +135443,13 @@ NIL
                                                       I A B)))) '(T 2 1 2)) (t (c) (%test-crash-fail-c 24963 c)))
 )
 (defun run-ansi-macroexpand-1 ()
-  (%try-chunk "macroexpand-1" 7229783 1 #'run-ansi-macroexpand-1-chunk-1)
+  (%try-chunk "macroexpand-1" 11686231 1 #'run-ansi-macroexpand-1-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === macroexpand.lsp ===
+(in-package :modus.mvm)
 (defun run-init-macroexpand ()
   nil
 )
@@ -133775,10 +135501,13 @@ NIL
                                                       I A B)))) '(T 2 1 2)) (t (c) (%test-crash-fail-c 24971 c)))
 )
 (defun run-ansi-macroexpand ()
-  (%try-chunk "macroexpand" 5160547 1 #'run-ansi-macroexpand-chunk-1)
+  (%try-chunk "macroexpand" 15138403 1 #'run-ansi-macroexpand-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === optimize.lsp ===
+(in-package :modus.mvm)
 (defun run-init-optimize ()
   nil
 )
@@ -133812,10 +135541,13 @@ NIL
                                              COLLECT (LIST D N VAL)))) 'NIL) (t (c) (%test-crash-fail-c 24979 c)))
 )
 (defun run-ansi-optimize ()
-  (%try-chunk "optimize" 9457054 1 #'run-ansi-optimize-chunk-1)
+  (%try-chunk "optimize" 10718622 1 #'run-ansi-optimize-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === proclaim.lsp ===
+(in-package :modus.mvm)
 (defun run-init-proclaim ()
   nil
 )
@@ -133867,11 +135599,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 24993 c)))
 )
 (defun run-ansi-proclaim ()
-  (%try-chunk "proclaim" 4808416 1 #'run-ansi-proclaim-chunk-1)
-  (%try-chunk "proclaim" 4808416 2 #'run-ansi-proclaim-chunk-2)
+  (%try-chunk "proclaim" 12394208 1 #'run-ansi-proclaim-chunk-1)
+  (%try-chunk "proclaim" 12394208 2 #'run-ansi-proclaim-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === special.lsp ===
+(in-package :modus.mvm)
 (defun run-init-special ()
   nil
 )
@@ -133904,10 +135639,13 @@ NIL
                                (%F)))) 'A) (t (c) (%test-crash-fail-c 24996 c)))
 )
 (defun run-ansi-special ()
-  (%try-chunk "special" 14341774 1 #'run-ansi-special-chunk-1)
+  (%try-chunk "special" 8656526 1 #'run-ansi-special-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === symbol-macrolet.lsp ===
+(in-package :modus.mvm)
 (DEFCONSTANT CONSTANT-FOR-SYMBOL-MACROLET.ERROR.2 NIL)
 (defun run-init-symbol-macrolet ()
   nil
@@ -133979,11 +135717,14 @@ NIL
                                :GOOD))) ':GOOD) (t (c) (%test-crash-fail-c 25008 c)))
 )
 (defun run-ansi-symbol-macrolet ()
-  (%try-chunk "symbol-macrolet" 16110891 1 #'run-ansi-symbol-macrolet-chunk-1)
-  (%try-chunk "symbol-macrolet" 16110891 2 #'run-ansi-symbol-macrolet-chunk-2)
+  (%try-chunk "symbol-macrolet" 1922347 1 #'run-ansi-symbol-macrolet-chunk-1)
+  (%try-chunk "symbol-macrolet" 1922347 2 #'run-ansi-symbol-macrolet-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === the.lsp ===
+(in-package :modus.mvm)
 (defun run-init-the ()
   nil
 )
@@ -134107,13 +135848,16 @@ NIL
                                                                              2)) (t (c) (%test-crash-fail-c 25033 c)))
 )
 (defun run-ansi-the ()
-  (%try-chunk "the" 9209574 1 #'run-ansi-the-chunk-1)
-  (%try-chunk "the" 9209574 2 #'run-ansi-the-chunk-2)
-  (%try-chunk "the" 9209574 3 #'run-ansi-the-chunk-3)
-  (%try-chunk "the" 9209574 4 #'run-ansi-the-chunk-4)
+  (%try-chunk "the" 6227686 1 #'run-ansi-the-chunk-1)
+  (%try-chunk "the" 6227686 2 #'run-ansi-the-chunk-2)
+  (%try-chunk "the" 6227686 3 #'run-ansi-the-chunk-3)
+  (%try-chunk "the" 6227686 4 #'run-ansi-the-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === type.lsp ===
+(in-package :modus.mvm)
 (defun run-init-type ()
   nil
 )
@@ -134163,10 +135907,13 @@ NIL
                                                        (VALUES X Y))))) '(1 3)) (t (c) (%test-crash-fail-c 25039 c)))
 )
 (defun run-ansi-type ()
-  (%try-chunk "type" 7238263 1 #'run-ansi-type-chunk-1)
+  (%try-chunk "type" 14905975 1 #'run-ansi-type-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === class-precedence-lists.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-CPL-TEST (OBJFORM EXPECTED-CPL &OPTIONAL NAME)
   (LET* ((ORDERED
@@ -134362,7 +136109,10 @@ NIL
   (handler-case (setq *CPL-OUTPUT-STREAM* (MAKE-STRING-OUTPUT-STREAM)) (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === coerce.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-coerce ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -134479,13 +136229,16 @@ NIL
 )
 (defun run-ansi-coerce ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "coerce" 13795778 1 #'run-ansi-coerce-chunk-1)
-  (%try-chunk "coerce" 13795778 2 #'run-ansi-coerce-chunk-2)
-  (%try-chunk "coerce" 13795778 3 #'run-ansi-coerce-chunk-3)
-  (%try-chunk "coerce" 13795778 4 #'run-ansi-coerce-chunk-4)
+  (%try-chunk "coerce" 10879426 1 #'run-ansi-coerce-chunk-1)
+  (%try-chunk "coerce" 10879426 2 #'run-ansi-coerce-chunk-2)
+  (%try-chunk "coerce" 10879426 3 #'run-ansi-coerce-chunk-3)
+  (%try-chunk "coerce" 10879426 4 #'run-ansi-coerce-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === deftype.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-deftype ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -134911,12 +136664,15 @@ NIL
 )
 (defun run-ansi-deftype ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "deftype" 7739880 1 #'run-ansi-deftype-chunk-1)
-  (%try-chunk "deftype" 7739880 2 #'run-ansi-deftype-chunk-2)
-  (%try-chunk "deftype" 7739880 3 #'run-ansi-deftype-chunk-3)
+  (%try-chunk "deftype" 2693608 1 #'run-ansi-deftype-chunk-1)
+  (%try-chunk "deftype" 2693608 2 #'run-ansi-deftype-chunk-2)
+  (%try-chunk "deftype" 2693608 3 #'run-ansi-deftype-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;types-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -134948,7 +136704,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === standard-generic-function.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (UNLESS (TYPEP #'CONS 'GENERIC-FUNCTION)
   (DEFTEST STANDARD-GENERIC-FUNCTION.1
@@ -134996,7 +136755,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-array.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-array ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -135270,16 +137032,19 @@ NIL
 )
 (defun run-ansi-subtypep-array ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-array" 10671007 1 #'run-ansi-subtypep-array-chunk-1)
-  (%try-chunk "subtypep-array" 10671007 2 #'run-ansi-subtypep-array-chunk-2)
-  (%try-chunk "subtypep-array" 10671007 3 #'run-ansi-subtypep-array-chunk-3)
-  (%try-chunk "subtypep-array" 10671007 4 #'run-ansi-subtypep-array-chunk-4)
-  (%try-chunk "subtypep-array" 10671007 5 #'run-ansi-subtypep-array-chunk-5)
-  (%try-chunk "subtypep-array" 10671007 6 #'run-ansi-subtypep-array-chunk-6)
-  (%try-chunk "subtypep-array" 10671007 7 #'run-ansi-subtypep-array-chunk-7)
+  (%try-chunk "subtypep-array" 15061919 1 #'run-ansi-subtypep-array-chunk-1)
+  (%try-chunk "subtypep-array" 15061919 2 #'run-ansi-subtypep-array-chunk-2)
+  (%try-chunk "subtypep-array" 15061919 3 #'run-ansi-subtypep-array-chunk-3)
+  (%try-chunk "subtypep-array" 15061919 4 #'run-ansi-subtypep-array-chunk-4)
+  (%try-chunk "subtypep-array" 15061919 5 #'run-ansi-subtypep-array-chunk-5)
+  (%try-chunk "subtypep-array" 15061919 6 #'run-ansi-subtypep-array-chunk-6)
+  (%try-chunk "subtypep-array" 15061919 7 #'run-ansi-subtypep-array-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-complex.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN CHECK-NOT-COMPLEX-TYPE (TYPE)
   (LET ((RESULT1 (MULTIPLE-VALUE-LIST (SUBTYPEP* TYPE 'COMPLEX)))
@@ -135380,10 +137145,13 @@ NIL
 )
 (defun run-ansi-subtypep-complex ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-complex" 1017606 1 #'run-ansi-subtypep-complex-chunk-1)
+  (%try-chunk "subtypep-complex" 6784774 1 #'run-ansi-subtypep-complex-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-cons.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFVAR *CONS-TYPES*
   '(CONS (CONS) (CONS *) (CONS * *) (CONS T) (CONS T T) (CONS T *) (CONS * T)))
@@ -135687,15 +137455,18 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
   (handler-case (setq *CONS-TYPES* '(CONS (CONS) (CONS *) (CONS * *) (CONS T) (CONS T T)
                           (CONS T *) (CONS * T))) (t (c) nil))
-  (%try-chunk "subtypep-cons" 13923447 1 #'run-ansi-subtypep-cons-chunk-1)
-  (%try-chunk "subtypep-cons" 13923447 2 #'run-ansi-subtypep-cons-chunk-2)
-  (%try-chunk "subtypep-cons" 13923447 3 #'run-ansi-subtypep-cons-chunk-3)
-  (%try-chunk "subtypep-cons" 13923447 4 #'run-ansi-subtypep-cons-chunk-4)
-  (%try-chunk "subtypep-cons" 13923447 5 #'run-ansi-subtypep-cons-chunk-5)
-  (%try-chunk "subtypep-cons" 13923447 6 #'run-ansi-subtypep-cons-chunk-6)
+  (%try-chunk "subtypep-cons" 13431927 1 #'run-ansi-subtypep-cons-chunk-1)
+  (%try-chunk "subtypep-cons" 13431927 2 #'run-ansi-subtypep-cons-chunk-2)
+  (%try-chunk "subtypep-cons" 13431927 3 #'run-ansi-subtypep-cons-chunk-3)
+  (%try-chunk "subtypep-cons" 13431927 4 #'run-ansi-subtypep-cons-chunk-4)
+  (%try-chunk "subtypep-cons" 13431927 5 #'run-ansi-subtypep-cons-chunk-5)
+  (%try-chunk "subtypep-cons" 13431927 6 #'run-ansi-subtypep-cons-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-eql.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-eql ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -135724,10 +137495,13 @@ NIL
 )
 (defun run-ansi-subtypep-eql ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-eql" 15546246 1 #'run-ansi-subtypep-eql-chunk-1)
+  (%try-chunk "subtypep-eql" 7419782 1 #'run-ansi-subtypep-eql-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-float.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (UNLESS (EQL 0.0 -0.0)
   (DEFTEST SUBTYPEP.SHORT-FLOAT.ZERO.2A
@@ -136103,18 +137877,21 @@ NIL
 )
 (defun run-ansi-subtypep-float ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-float" 3515534 1 #'run-ansi-subtypep-float-chunk-1)
-  (%try-chunk "subtypep-float" 3515534 2 #'run-ansi-subtypep-float-chunk-2)
-  (%try-chunk "subtypep-float" 3515534 3 #'run-ansi-subtypep-float-chunk-3)
-  (%try-chunk "subtypep-float" 3515534 4 #'run-ansi-subtypep-float-chunk-4)
-  (%try-chunk "subtypep-float" 3515534 5 #'run-ansi-subtypep-float-chunk-5)
-  (%try-chunk "subtypep-float" 3515534 6 #'run-ansi-subtypep-float-chunk-6)
-  (%try-chunk "subtypep-float" 3515534 7 #'run-ansi-subtypep-float-chunk-7)
-  (%try-chunk "subtypep-float" 3515534 8 #'run-ansi-subtypep-float-chunk-8)
-  (%try-chunk "subtypep-float" 3515534 9 #'run-ansi-subtypep-float-chunk-9)
+  (%try-chunk "subtypep-float" 2172046 1 #'run-ansi-subtypep-float-chunk-1)
+  (%try-chunk "subtypep-float" 2172046 2 #'run-ansi-subtypep-float-chunk-2)
+  (%try-chunk "subtypep-float" 2172046 3 #'run-ansi-subtypep-float-chunk-3)
+  (%try-chunk "subtypep-float" 2172046 4 #'run-ansi-subtypep-float-chunk-4)
+  (%try-chunk "subtypep-float" 2172046 5 #'run-ansi-subtypep-float-chunk-5)
+  (%try-chunk "subtypep-float" 2172046 6 #'run-ansi-subtypep-float-chunk-6)
+  (%try-chunk "subtypep-float" 2172046 7 #'run-ansi-subtypep-float-chunk-7)
+  (%try-chunk "subtypep-float" 2172046 8 #'run-ansi-subtypep-float-chunk-8)
+  (%try-chunk "subtypep-float" 2172046 9 #'run-ansi-subtypep-float-chunk-9)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-function.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-function ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -136128,10 +137905,13 @@ NIL
 )
 (defun run-ansi-subtypep-function ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-function" 15620044 1 #'run-ansi-subtypep-function-chunk-1)
+  (%try-chunk "subtypep-function" 13670348 1 #'run-ansi-subtypep-function-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-integer.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-integer ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -136478,19 +138258,22 @@ NIL
 )
 (defun run-ansi-subtypep-integer ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-integer" 11870032 1 #'run-ansi-subtypep-integer-chunk-1)
-  (%try-chunk "subtypep-integer" 11870032 2 #'run-ansi-subtypep-integer-chunk-2)
-  (%try-chunk "subtypep-integer" 11870032 3 #'run-ansi-subtypep-integer-chunk-3)
-  (%try-chunk "subtypep-integer" 11870032 4 #'run-ansi-subtypep-integer-chunk-4)
-  (%try-chunk "subtypep-integer" 11870032 5 #'run-ansi-subtypep-integer-chunk-5)
-  (%try-chunk "subtypep-integer" 11870032 6 #'run-ansi-subtypep-integer-chunk-6)
-  (%try-chunk "subtypep-integer" 11870032 7 #'run-ansi-subtypep-integer-chunk-7)
-  (%try-chunk "subtypep-integer" 11870032 8 #'run-ansi-subtypep-integer-chunk-8)
-  (%try-chunk "subtypep-integer" 11870032 9 #'run-ansi-subtypep-integer-chunk-9)
-  (%try-chunk "subtypep-integer" 11870032 10 #'run-ansi-subtypep-integer-chunk-10)
+  (%try-chunk "subtypep-integer" 4857680 1 #'run-ansi-subtypep-integer-chunk-1)
+  (%try-chunk "subtypep-integer" 4857680 2 #'run-ansi-subtypep-integer-chunk-2)
+  (%try-chunk "subtypep-integer" 4857680 3 #'run-ansi-subtypep-integer-chunk-3)
+  (%try-chunk "subtypep-integer" 4857680 4 #'run-ansi-subtypep-integer-chunk-4)
+  (%try-chunk "subtypep-integer" 4857680 5 #'run-ansi-subtypep-integer-chunk-5)
+  (%try-chunk "subtypep-integer" 4857680 6 #'run-ansi-subtypep-integer-chunk-6)
+  (%try-chunk "subtypep-integer" 4857680 7 #'run-ansi-subtypep-integer-chunk-7)
+  (%try-chunk "subtypep-integer" 4857680 8 #'run-ansi-subtypep-integer-chunk-8)
+  (%try-chunk "subtypep-integer" 4857680 9 #'run-ansi-subtypep-integer-chunk-9)
+  (%try-chunk "subtypep-integer" 4857680 10 #'run-ansi-subtypep-integer-chunk-10)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-member.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-member ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -136614,15 +138397,18 @@ NIL
 )
 (defun run-ansi-subtypep-member ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-member" 1230526 1 #'run-ansi-subtypep-member-chunk-1)
-  (%try-chunk "subtypep-member" 1230526 2 #'run-ansi-subtypep-member-chunk-2)
-  (%try-chunk "subtypep-member" 1230526 3 #'run-ansi-subtypep-member-chunk-3)
-  (%try-chunk "subtypep-member" 1230526 4 #'run-ansi-subtypep-member-chunk-4)
-  (%try-chunk "subtypep-member" 1230526 5 #'run-ansi-subtypep-member-chunk-5)
-  (%try-chunk "subtypep-member" 1230526 6 #'run-ansi-subtypep-member-chunk-6)
+  (%try-chunk "subtypep-member" 14550718 1 #'run-ansi-subtypep-member-chunk-1)
+  (%try-chunk "subtypep-member" 14550718 2 #'run-ansi-subtypep-member-chunk-2)
+  (%try-chunk "subtypep-member" 14550718 3 #'run-ansi-subtypep-member-chunk-3)
+  (%try-chunk "subtypep-member" 14550718 4 #'run-ansi-subtypep-member-chunk-4)
+  (%try-chunk "subtypep-member" 14550718 5 #'run-ansi-subtypep-member-chunk-5)
+  (%try-chunk "subtypep-member" 14550718 6 #'run-ansi-subtypep-member-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-rational.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-rational ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -136782,12 +138568,15 @@ NIL
 )
 (defun run-ansi-subtypep-rational ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-rational" 10549620 1 #'run-ansi-subtypep-rational-chunk-1)
-  (%try-chunk "subtypep-rational" 10549620 2 #'run-ansi-subtypep-rational-chunk-2)
-  (%try-chunk "subtypep-rational" 10549620 3 #'run-ansi-subtypep-rational-chunk-3)
+  (%try-chunk "subtypep-rational" 1653108 1 #'run-ansi-subtypep-rational-chunk-1)
+  (%try-chunk "subtypep-rational" 1653108 2 #'run-ansi-subtypep-rational-chunk-2)
+  (%try-chunk "subtypep-rational" 1653108 3 #'run-ansi-subtypep-rational-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep-real.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep-real ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -136918,13 +138707,16 @@ NIL
 )
 (defun run-ansi-subtypep-real ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep-real" 8798100 1 #'run-ansi-subtypep-real-chunk-1)
-  (%try-chunk "subtypep-real" 8798100 2 #'run-ansi-subtypep-real-chunk-2)
-  (%try-chunk "subtypep-real" 8798100 3 #'run-ansi-subtypep-real-chunk-3)
-  (%try-chunk "subtypep-real" 8798100 4 #'run-ansi-subtypep-real-chunk-4)
+  (%try-chunk "subtypep-real" 12566420 1 #'run-ansi-subtypep-real-chunk-1)
+  (%try-chunk "subtypep-real" 12566420 2 #'run-ansi-subtypep-real-chunk-2)
+  (%try-chunk "subtypep-real" 12566420 3 #'run-ansi-subtypep-real-chunk-3)
+  (%try-chunk "subtypep-real" 12566420 4 #'run-ansi-subtypep-real-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === subtypep.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-subtypep ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -137043,13 +138835,16 @@ NIL
 )
 (defun run-ansi-subtypep ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "subtypep" 789227 1 #'run-ansi-subtypep-chunk-1)
-  (%try-chunk "subtypep" 789227 2 #'run-ansi-subtypep-chunk-2)
-  (%try-chunk "subtypep" 789227 3 #'run-ansi-subtypep-chunk-3)
-  (%try-chunk "subtypep" 789227 4 #'run-ansi-subtypep-chunk-4)
+  (%try-chunk "subtypep" 10341099 1 #'run-ansi-subtypep-chunk-1)
+  (%try-chunk "subtypep" 10341099 2 #'run-ansi-subtypep-chunk-2)
+  (%try-chunk "subtypep" 10341099 3 #'run-ansi-subtypep-chunk-3)
+  (%try-chunk "subtypep" 10341099 4 #'run-ansi-subtypep-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === type-of.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT TYPE-OF.EXAMPLE-STRUCT A B C)
 (defun run-init-type-of ()
@@ -137203,11 +138998,14 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'TYPE-OF.EXAMPLE-CLASS 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'TYPE-OF.EXAMPLE-CLASS (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'TYPE-OF.EXAMPLE-CLASS NIL) (t (c) nil))
-  (%try-chunk "type-of" 6906179 1 #'run-ansi-type-of-chunk-1)
-  (%try-chunk "type-of" 6906179 2 #'run-ansi-type-of-chunk-2)
+  (%try-chunk "type-of" 7889219 1 #'run-ansi-type-of-chunk-1)
+  (%try-chunk "type-of" 7889219 2 #'run-ansi-type-of-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === typep.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN TYPEP.19-FN (REPS &OPTIONAL (PROB 0.5))
   (LET* ((VEC "abcdefghijklmnopqrstuvwxyz"))
@@ -137324,13 +139122,16 @@ NIL
 (defun run-ansi-typep ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
   (handler-case (COMPILE 'TYPEP.19-FN) (t (c) nil))
-  (%try-chunk "typep" 6664079 1 #'run-ansi-typep-chunk-1)
-  (%try-chunk "typep" 6664079 2 #'run-ansi-typep-chunk-2)
-  (%try-chunk "typep" 6664079 3 #'run-ansi-typep-chunk-3)
-  (%try-chunk "typep" 6664079 4 #'run-ansi-typep-chunk-4)
+  (%try-chunk "typep" 3796879 1 #'run-ansi-typep-chunk-1)
+  (%try-chunk "typep" 3796879 2 #'run-ansi-typep-chunk-2)
+  (%try-chunk "typep" 3796879 3 #'run-ansi-typep-chunk-3)
+  (%try-chunk "typep" 3796879 4 #'run-ansi-typep-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === types-and-class-2.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSTRUCT TAC-2-STRUCT A B C)
 (DEFSTRUCT (TAC-2A-STRUCT (:INCLUDE TAC-2-STRUCT)) D E)
@@ -137551,14 +139352,17 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'TAC-3-ABC 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'TAC-3-ABC (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'TAC-3-ABC NIL) (t (c) nil))
-  (%try-chunk "types-and-class-2" 10226734 1 #'run-ansi-types-and-class-2-chunk-1)
-  (%try-chunk "types-and-class-2" 10226734 2 #'run-ansi-types-and-class-2-chunk-2)
-  (%try-chunk "types-and-class-2" 10226734 3 #'run-ansi-types-and-class-2-chunk-3)
-  (%try-chunk "types-and-class-2" 10226734 4 #'run-ansi-types-and-class-2-chunk-4)
-  (%try-chunk "types-and-class-2" 10226734 5 #'run-ansi-types-and-class-2-chunk-5)
+  (%try-chunk "types-and-class-2" 10488878 1 #'run-ansi-types-and-class-2-chunk-1)
+  (%try-chunk "types-and-class-2" 10488878 2 #'run-ansi-types-and-class-2-chunk-2)
+  (%try-chunk "types-and-class-2" 10488878 3 #'run-ansi-types-and-class-2-chunk-3)
+  (%try-chunk "types-and-class-2" 10488878 4 #'run-ansi-types-and-class-2-chunk-4)
+  (%try-chunk "types-and-class-2" 10488878 5 #'run-ansi-types-and-class-2-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === types-and-class.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFPARAMETER *TYPE-AND-CLASS-FNS*
   '(COERCE SUBTYPEP TYPE-OF TYPEP TYPE-ERROR-DATUM TYPE-ERROR-EXPECTED-TYPE))
@@ -137715,13 +139519,16 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
   (handler-case (setq *TYPE-AND-CLASS-FNS* '(COERCE SUBTYPEP TYPE-OF TYPEP TYPE-ERROR-DATUM
                                     TYPE-ERROR-EXPECTED-TYPE)) (t (c) nil))
-  (%try-chunk "types-and-class" 1833441 1 #'run-ansi-types-and-class-chunk-1)
-  (%try-chunk "types-and-class" 1833441 2 #'run-ansi-types-and-class-chunk-2)
-  (%try-chunk "types-and-class" 1833441 3 #'run-ansi-types-and-class-chunk-3)
-  (%try-chunk "types-and-class" 1833441 4 #'run-ansi-types-and-class-chunk-4)
+  (%try-chunk "types-and-class" 3865057 1 #'run-ansi-types-and-class-chunk-1)
+  (%try-chunk "types-and-class" 3865057 2 #'run-ansi-types-and-class-chunk-2)
+  (%try-chunk "types-and-class" 3865057 3 #'run-ansi-types-and-class-chunk-3)
+  (%try-chunk "types-and-class" 3865057 4 #'run-ansi-types-and-class-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === copy-readtable.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-copy-readtable ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -137755,10 +139562,13 @@ NIL
 )
 (defun run-ansi-copy-readtable ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "copy-readtable" 11930091 1 #'run-ansi-copy-readtable-chunk-1)
+  (%try-chunk "copy-readtable" 15485419 1 #'run-ansi-copy-readtable-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === dispatch-macro-characters.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-dispatch-macro-characters ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -137879,10 +139689,13 @@ NIL
 )
 (defun run-ansi-dispatch-macro-characters ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "dispatch-macro-characters" 16012871 1 #'run-ansi-dispatch-macro-characters-chunk-1)
+  (%try-chunk "dispatch-macro-characters" 1791559 1 #'run-ansi-dispatch-macro-characters-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === get-macro-character.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-get-macro-character ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -138147,11 +139960,14 @@ NIL
 )
 (defun run-ansi-get-macro-character ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "get-macro-character" 1077698 1 #'run-ansi-get-macro-character-chunk-1)
-  (%try-chunk "get-macro-character" 1077698 2 #'run-ansi-get-macro-character-chunk-2)
+  (%try-chunk "get-macro-character" 5386690 1 #'run-ansi-get-macro-character-chunk-1)
+  (%try-chunk "get-macro-character" 5386690 2 #'run-ansi-get-macro-character-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;reader-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -138178,7 +139994,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === read-delimited-list.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-read-delimited-list ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -138237,10 +140056,13 @@ NIL
 )
 (defun run-ansi-read-delimited-list ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-delimited-list" 4281938 1 #'run-ansi-read-delimited-list-chunk-1)
+  (%try-chunk "read-delimited-list" 10524242 1 #'run-ansi-read-delimited-list-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-from-string.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-read-from-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -138469,13 +140291,16 @@ NIL
 )
 (defun run-ansi-read-from-string ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-from-string" 16198246 1 #'run-ansi-read-from-string-chunk-1)
-  (%try-chunk "read-from-string" 16198246 2 #'run-ansi-read-from-string-chunk-2)
-  (%try-chunk "read-from-string" 16198246 3 #'run-ansi-read-from-string-chunk-3)
-  (%try-chunk "read-from-string" 16198246 4 #'run-ansi-read-from-string-chunk-4)
+  (%try-chunk "read-from-string" 7514726 1 #'run-ansi-read-from-string-chunk-1)
+  (%try-chunk "read-from-string" 7514726 2 #'run-ansi-read-from-string-chunk-2)
+  (%try-chunk "read-from-string" 7514726 3 #'run-ansi-read-from-string-chunk-3)
+  (%try-chunk "read-from-string" 7514726 4 #'run-ansi-read-from-string-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-preserving-whitespace.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-read-preserving-whitespace ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -138601,13 +140426,16 @@ NIL
 )
 (defun run-ansi-read-preserving-whitespace ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-preserving-whitespace" 3305491 1 #'run-ansi-read-preserving-whitespace-chunk-1)
-  (%try-chunk "read-preserving-whitespace" 3305491 2 #'run-ansi-read-preserving-whitespace-chunk-2)
-  (%try-chunk "read-preserving-whitespace" 3305491 3 #'run-ansi-read-preserving-whitespace-chunk-3)
-  (%try-chunk "read-preserving-whitespace" 3305491 4 #'run-ansi-read-preserving-whitespace-chunk-4)
+  (%try-chunk "read-preserving-whitespace" 14348307 1 #'run-ansi-read-preserving-whitespace-chunk-1)
+  (%try-chunk "read-preserving-whitespace" 14348307 2 #'run-ansi-read-preserving-whitespace-chunk-2)
+  (%try-chunk "read-preserving-whitespace" 14348307 3 #'run-ansi-read-preserving-whitespace-chunk-3)
+  (%try-chunk "read-preserving-whitespace" 14348307 4 #'run-ansi-read-preserving-whitespace-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === read-suppress.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-READ-SUPPRESS-TEST (NAME STRING)
   `(DEFTEST ,NAME
@@ -138830,10 +140658,13 @@ NIL
 )
 (defun run-ansi-read-suppress ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read-suppress" 16055761 1 #'run-ansi-read-suppress-chunk-1)
+  (%try-chunk "read-suppress" 5438929 1 #'run-ansi-read-suppress-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === read.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-read ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -138936,13 +140767,16 @@ NIL
 )
 (defun run-ansi-read ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "read" 12201413 1 #'run-ansi-read-chunk-1)
-  (%try-chunk "read" 12201413 2 #'run-ansi-read-chunk-2)
-  (%try-chunk "read" 12201413 3 #'run-ansi-read-chunk-3)
-  (%try-chunk "read" 12201413 4 #'run-ansi-read-chunk-4)
+  (%try-chunk "read" 93637 1 #'run-ansi-read-chunk-1)
+  (%try-chunk "read" 93637 2 #'run-ansi-read-chunk-2)
+  (%try-chunk "read" 93637 3 #'run-ansi-read-chunk-3)
+  (%try-chunk "read" 93637 4 #'run-ansi-read-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === reader-test.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN READ-SYMBOL.9-BODY (NATOMS MAXLEN &OPTIONAL (CHARS +STANDARD-CHARS+))
   (LOOP REPEAT NATOMS
@@ -139355,13 +141189,16 @@ NIL
 )
 (defun run-ansi-reader-test ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "reader-test" 8086121 1 #'run-ansi-reader-test-chunk-1)
-  (%try-chunk "reader-test" 8086121 2 #'run-ansi-reader-test-chunk-2)
-  (%try-chunk "reader-test" 8086121 3 #'run-ansi-reader-test-chunk-3)
-  (%try-chunk "reader-test" 8086121 4 #'run-ansi-reader-test-chunk-4)
+  (%try-chunk "reader-test" 15098473 1 #'run-ansi-reader-test-chunk-1)
+  (%try-chunk "reader-test" 15098473 2 #'run-ansi-reader-test-chunk-2)
+  (%try-chunk "reader-test" 15098473 3 #'run-ansi-reader-test-chunk-3)
+  (%try-chunk "reader-test" 15098473 4 #'run-ansi-reader-test-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === readtable-case.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFSKIP READTABLE-CASE.CASE-UPCASE)
 (DEFSKIP READTABLE-CASE.CASE-DOWNCASE)
@@ -139430,11 +141267,14 @@ NIL
 )
 (defun run-ansi-readtable-case ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "readtable-case" 14707538 1 #'run-ansi-readtable-case-chunk-1)
-  (%try-chunk "readtable-case" 14707538 2 #'run-ansi-readtable-case-chunk-2)
+  (%try-chunk "readtable-case" 6204242 1 #'run-ansi-readtable-case-chunk-1)
+  (%try-chunk "readtable-case" 6204242 2 #'run-ansi-readtable-case-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === readtablep.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-readtablep ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -139487,10 +141327,13 @@ NIL
 )
 (defun run-ansi-readtablep ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "readtablep" 1358659 1 #'run-ansi-readtablep-chunk-1)
+  (%try-chunk "readtablep" 16743235 1 #'run-ansi-readtablep-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === set-macro-character.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN SET-MACRO-CHARACTER.3-TEST-FN (STREAM CHAR)
   (DECLARE (IGNORE STREAM))
@@ -139641,10 +141484,13 @@ NIL
 )
 (defun run-ansi-set-macro-character ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "set-macro-character" 146070 1 #'run-ansi-set-macro-character-chunk-1)
+  (%try-chunk "set-macro-character" 4536982 1 #'run-ansi-set-macro-character-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === set-syntax-from-char.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFMACRO DEF-SET-SYNTAX-FROM-CHAR-TEST (NAME FORM &BODY EXPECTED-VALUES)
   `(DEFTEST ,NAME
@@ -140366,11 +142212,14 @@ NIL
 )
 (defun run-ansi-set-syntax-from-char ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "set-syntax-from-char" 1468927 1 #'run-ansi-set-syntax-from-char-chunk-1)
-  (%try-chunk "set-syntax-from-char" 1468927 2 #'run-ansi-set-syntax-from-char-chunk-2)
+  (%try-chunk "set-syntax-from-char" 14281215 1 #'run-ansi-set-syntax-from-char-chunk-1)
+  (%try-chunk "set-syntax-from-char" 14281215 2 #'run-ansi-set-syntax-from-char-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === syntax-tokens.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-syntax-tokens ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -140574,12 +142423,15 @@ NIL
 )
 (defun run-ansi-syntax-tokens ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "syntax-tokens" 7357611 1 #'run-ansi-syntax-tokens-chunk-1)
-  (%try-chunk "syntax-tokens" 7357611 2 #'run-ansi-syntax-tokens-chunk-2)
-  (%try-chunk "syntax-tokens" 7357611 3 #'run-ansi-syntax-tokens-chunk-3)
+  (%try-chunk "syntax-tokens" 11715755 1 #'run-ansi-syntax-tokens-chunk-1)
+  (%try-chunk "syntax-tokens" 11715755 2 #'run-ansi-syntax-tokens-chunk-2)
+  (%try-chunk "syntax-tokens" 11715755 3 #'run-ansi-syntax-tokens-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === syntax.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEF-SYNTAX-VECTOR-TEST SYNTAX.SHARP-LEFT-PAREN.1
     "#()")
@@ -142645,28 +144497,31 @@ NIL
 )
 (defun run-ansi-syntax ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "syntax" 11223886 1 #'run-ansi-syntax-chunk-1)
-  (%try-chunk "syntax" 11223886 2 #'run-ansi-syntax-chunk-2)
-  (%try-chunk "syntax" 11223886 3 #'run-ansi-syntax-chunk-3)
-  (%try-chunk "syntax" 11223886 4 #'run-ansi-syntax-chunk-4)
-  (%try-chunk "syntax" 11223886 5 #'run-ansi-syntax-chunk-5)
-  (%try-chunk "syntax" 11223886 6 #'run-ansi-syntax-chunk-6)
-  (%try-chunk "syntax" 11223886 7 #'run-ansi-syntax-chunk-7)
-  (%try-chunk "syntax" 11223886 8 #'run-ansi-syntax-chunk-8)
-  (%try-chunk "syntax" 11223886 9 #'run-ansi-syntax-chunk-9)
-  (%try-chunk "syntax" 11223886 10 #'run-ansi-syntax-chunk-10)
-  (%try-chunk "syntax" 11223886 11 #'run-ansi-syntax-chunk-11)
-  (%try-chunk "syntax" 11223886 12 #'run-ansi-syntax-chunk-12)
-  (%try-chunk "syntax" 11223886 13 #'run-ansi-syntax-chunk-13)
-  (%try-chunk "syntax" 11223886 14 #'run-ansi-syntax-chunk-14)
-  (%try-chunk "syntax" 11223886 15 #'run-ansi-syntax-chunk-15)
-  (%try-chunk "syntax" 11223886 16 #'run-ansi-syntax-chunk-16)
-  (%try-chunk "syntax" 11223886 17 #'run-ansi-syntax-chunk-17)
-  (%try-chunk "syntax" 11223886 18 #'run-ansi-syntax-chunk-18)
-  (%try-chunk "syntax" 11223886 19 #'run-ansi-syntax-chunk-19)
+  (%try-chunk "syntax" 8684366 1 #'run-ansi-syntax-chunk-1)
+  (%try-chunk "syntax" 8684366 2 #'run-ansi-syntax-chunk-2)
+  (%try-chunk "syntax" 8684366 3 #'run-ansi-syntax-chunk-3)
+  (%try-chunk "syntax" 8684366 4 #'run-ansi-syntax-chunk-4)
+  (%try-chunk "syntax" 8684366 5 #'run-ansi-syntax-chunk-5)
+  (%try-chunk "syntax" 8684366 6 #'run-ansi-syntax-chunk-6)
+  (%try-chunk "syntax" 8684366 7 #'run-ansi-syntax-chunk-7)
+  (%try-chunk "syntax" 8684366 8 #'run-ansi-syntax-chunk-8)
+  (%try-chunk "syntax" 8684366 9 #'run-ansi-syntax-chunk-9)
+  (%try-chunk "syntax" 8684366 10 #'run-ansi-syntax-chunk-10)
+  (%try-chunk "syntax" 8684366 11 #'run-ansi-syntax-chunk-11)
+  (%try-chunk "syntax" 8684366 12 #'run-ansi-syntax-chunk-12)
+  (%try-chunk "syntax" 8684366 13 #'run-ansi-syntax-chunk-13)
+  (%try-chunk "syntax" 8684366 14 #'run-ansi-syntax-chunk-14)
+  (%try-chunk "syntax" 8684366 15 #'run-ansi-syntax-chunk-15)
+  (%try-chunk "syntax" 8684366 16 #'run-ansi-syntax-chunk-16)
+  (%try-chunk "syntax" 8684366 17 #'run-ansi-syntax-chunk-17)
+  (%try-chunk "syntax" 8684366 18 #'run-ansi-syntax-chunk-18)
+  (%try-chunk "syntax" 8684366 19 #'run-ansi-syntax-chunk-19)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-standard-io-syntax.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-with-standard-io-syntax ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -142779,12 +144634,15 @@ NIL
 )
 (defun run-ansi-with-standard-io-syntax ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "with-standard-io-syntax" 2664892 1 #'run-ansi-with-standard-io-syntax-chunk-1)
-  (%try-chunk "with-standard-io-syntax" 2664892 2 #'run-ansi-with-standard-io-syntax-chunk-2)
-  (%try-chunk "with-standard-io-syntax" 2664892 3 #'run-ansi-with-standard-io-syntax-chunk-3)
+  (%try-chunk "with-standard-io-syntax" 9775548 1 #'run-ansi-with-standard-io-syntax-chunk-1)
+  (%try-chunk "with-standard-io-syntax" 9775548 2 #'run-ansi-with-standard-io-syntax-chunk-2)
+  (%try-chunk "with-standard-io-syntax" 9775548 3 #'run-ansi-with-standard-io-syntax-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === apropos-list.lsp ===
+(in-package :modus.mvm)
 (DEFSKIP APROPOS-LIST.3)
 (DEFSKIP APROPOS-LIST.4)
 (DEFSKIP APROPOS-LIST.5)
@@ -142858,10 +144716,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 25957 c)))
 )
 (defun run-ansi-apropos-list ()
-  (%try-chunk "apropos-list" 7220528 1 #'run-ansi-apropos-list-chunk-1)
+  (%try-chunk "apropos-list" 9612592 1 #'run-ansi-apropos-list-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === apropos.lsp ===
+(in-package :modus.mvm)
 (defun run-init-apropos ()
   nil
 )
@@ -143004,11 +144865,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 25969 c)))
 )
 (defun run-ansi-apropos ()
-  (%try-chunk "apropos" 14395271 1 #'run-ansi-apropos-chunk-1)
-  (%try-chunk "apropos" 14395271 2 #'run-ansi-apropos-chunk-2)
+  (%try-chunk "apropos" 1697671 1 #'run-ansi-apropos-chunk-1)
+  (%try-chunk "apropos" 1697671 2 #'run-ansi-apropos-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === decode-universal-time.lsp ===
+(in-package :modus.mvm)
 (defun run-init-decode-universal-time ()
   nil
 )
@@ -143213,11 +145077,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 25983 c)))
 )
 (defun run-ansi-decode-universal-time ()
-  (%try-chunk "decode-universal-time" 8152051 1 #'run-ansi-decode-universal-time-chunk-1)
-  (%try-chunk "decode-universal-time" 8152051 2 #'run-ansi-decode-universal-time-chunk-2)
+  (%try-chunk "decode-universal-time" 15262707 1 #'run-ansi-decode-universal-time-chunk-1)
+  (%try-chunk "decode-universal-time" 15262707 2 #'run-ansi-decode-universal-time-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === describe.lsp ===
+(in-package :modus.mvm)
 (DEFUN HARNESS-FOR-DESCRIBE (FN)
   (LET (S1 S2)
     (LET ((*STANDARD-OUTPUT* (MAKE-STRING-OUTPUT-STREAM)))
@@ -143304,10 +145171,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 25989 c)))
 )
 (defun run-ansi-describe ()
-  (%try-chunk "describe" 1635826 1 #'run-ansi-describe-chunk-1)
+  (%try-chunk "describe" 14300658 1 #'run-ansi-describe-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === disassemble.lsp ===
+(in-package :modus.mvm)
 (DEFUN DISASSEMBLE-IT (FN)
   (LET (VAL)
     (VALUES
@@ -143457,11 +145327,14 @@ NIL
   (handler-case (run-test 26003 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26003 c)))
 )
 (defun run-ansi-disassemble ()
-  (%try-chunk "disassemble" 7707035 1 #'run-ansi-disassemble-chunk-1)
-  (%try-chunk "disassemble" 7707035 2 #'run-ansi-disassemble-chunk-2)
+  (%try-chunk "disassemble" 13359515 1 #'run-ansi-disassemble-chunk-1)
+  (%try-chunk "disassemble" 13359515 2 #'run-ansi-disassemble-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === documentation.lsp ===
+(in-package :modus.mvm)
 (defun run-init-documentation ()
   nil
 )
@@ -144322,17 +146195,20 @@ NIL
                                                                                   "FOO28")) (t (c) (%test-crash-fail-c 26061 c)))
 )
 (defun run-ansi-documentation ()
-  (%try-chunk "documentation" 7598917 1 #'run-ansi-documentation-chunk-1)
-  (%try-chunk "documentation" 7598917 2 #'run-ansi-documentation-chunk-2)
-  (%try-chunk "documentation" 7598917 3 #'run-ansi-documentation-chunk-3)
-  (%try-chunk "documentation" 7598917 4 #'run-ansi-documentation-chunk-4)
-  (%try-chunk "documentation" 7598917 5 #'run-ansi-documentation-chunk-5)
-  (%try-chunk "documentation" 7598917 6 #'run-ansi-documentation-chunk-6)
-  (%try-chunk "documentation" 7598917 7 #'run-ansi-documentation-chunk-7)
-  (%try-chunk "documentation" 7598917 8 #'run-ansi-documentation-chunk-8)
+  (%try-chunk "documentation" 16282437 1 #'run-ansi-documentation-chunk-1)
+  (%try-chunk "documentation" 16282437 2 #'run-ansi-documentation-chunk-2)
+  (%try-chunk "documentation" 16282437 3 #'run-ansi-documentation-chunk-3)
+  (%try-chunk "documentation" 16282437 4 #'run-ansi-documentation-chunk-4)
+  (%try-chunk "documentation" 16282437 5 #'run-ansi-documentation-chunk-5)
+  (%try-chunk "documentation" 16282437 6 #'run-ansi-documentation-chunk-6)
+  (%try-chunk "documentation" 16282437 7 #'run-ansi-documentation-chunk-7)
+  (%try-chunk "documentation" 16282437 8 #'run-ansi-documentation-chunk-8)
 )
 
+(in-package :modus.mvm)
+
 ;; === dribble.lsp ===
+(in-package :modus.mvm)
 (defun run-init-dribble ()
   nil
 )
@@ -144342,10 +146218,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26062 c)))
 )
 (defun run-ansi-dribble ()
-  (%try-chunk "dribble" 9853729 1 #'run-ansi-dribble-chunk-1)
+  (%try-chunk "dribble" 10705697 1 #'run-ansi-dribble-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === ed.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ed ()
   nil
 )
@@ -144354,10 +146233,13 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26063 c)))
 )
 (defun run-ansi-ed ()
-  (%try-chunk "ed" 15237550 1 #'run-ansi-ed-chunk-1)
+  (%try-chunk "ed" 2294190 1 #'run-ansi-ed-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === encode-universal-time.lsp ===
+(in-package :modus.mvm)
 (defun run-init-encode-universal-time ()
   nil
 )
@@ -144453,10 +146335,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26067 c)))
 )
 (defun run-ansi-encode-universal-time ()
-  (%try-chunk "encode-universal-time" 470417 1 #'run-ansi-encode-universal-time-chunk-1)
+  (%try-chunk "encode-universal-time" 13561233 1 #'run-ansi-encode-universal-time-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === environment-functions.lsp ===
+(in-package :modus.mvm)
 (DEFMACRO DEF-ENV-TESTS (FN-NAME)
   (FLET ((%NAME (SUFFIX)
            (INTERN (CONCATENATE 'STRING (SYMBOL-NAME FN-NAME) SUFFIX)
@@ -144483,7 +146368,10 @@ NIL
 (defun run-ansi-environment-functions ()
 )
 
+(in-package :modus.mvm)
+
 ;; === get-internal-time.lsp ===
+(in-package :modus.mvm)
 (defun run-init-get-internal-time ()
   nil
 )
@@ -144536,11 +146424,14 @@ NIL
                             (TYPEP INTERNAL-TIME-UNITS-PER-SECOND '(INTEGER 1)))) 'T) (t (c) (%test-crash-fail-c 26077 c)))
 )
 (defun run-ansi-get-internal-time ()
-  (%try-chunk "get-internal-time" 12060435 1 #'run-ansi-get-internal-time-chunk-1)
-  (%try-chunk "get-internal-time" 12060435 2 #'run-ansi-get-internal-time-chunk-2)
+  (%try-chunk "get-internal-time" 6997779 1 #'run-ansi-get-internal-time-chunk-1)
+  (%try-chunk "get-internal-time" 6997779 2 #'run-ansi-get-internal-time-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === get-universal-time.lsp ===
+(in-package :modus.mvm)
 (defun run-init-get-universal-time ()
   nil
 )
@@ -144595,10 +146486,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26084 c)))
 )
 (defun run-ansi-get-universal-time ()
-  (%try-chunk "get-universal-time" 15906705 1 #'run-ansi-get-universal-time-chunk-1)
+  (%try-chunk "get-universal-time" 9107345 1 #'run-ansi-get-universal-time-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === inspect.lsp ===
+(in-package :modus.mvm)
 (defun run-init-inspect ()
   nil
 )
@@ -144608,10 +146502,13 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26086 c)))
 )
 (defun run-ansi-inspect ()
-  (%try-chunk "inspect" 15686201 1 #'run-ansi-inspect-chunk-1)
+  (%try-chunk "inspect" 8247865 1 #'run-ansi-inspect-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -144638,7 +146535,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === room.lsp ===
+(in-package :modus.mvm)
 (defun run-init-room ()
   nil
 )
@@ -144686,10 +146586,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26091 c)))
 )
 (defun run-ansi-room ()
-  (%try-chunk "room" 2413456 1 #'run-ansi-room-chunk-1)
+  (%try-chunk "room" 11441040 1 #'run-ansi-room-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === sleep.lsp ===
+(in-package :modus.mvm)
 (defun run-init-sleep ()
   nil
 )
@@ -144715,11 +146618,14 @@ NIL
   (handler-case (run-test 26107 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26107 c)))
 )
 (defun run-ansi-sleep ()
-  (%try-chunk "sleep" 9557400 1 #'run-ansi-sleep-chunk-1)
-  (%try-chunk "sleep" 9557400 2 #'run-ansi-sleep-chunk-2)
+  (%try-chunk "sleep" 9049496 1 #'run-ansi-sleep-chunk-1)
+  (%try-chunk "sleep" 9049496 2 #'run-ansi-sleep-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === time.lsp ===
+(in-package :modus.mvm)
 (defun run-init-time ()
   nil
 )
@@ -144798,10 +146704,13 @@ NIL
                              (= (LENGTH S) 0))) 'NIL) (t (c) (%test-crash-fail-c 26115 c)))
 )
 (defun run-ansi-time ()
-  (%try-chunk "time" 13587082 1 #'run-ansi-time-chunk-1)
+  (%try-chunk "time" 13177482 1 #'run-ansi-time-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === trace.lsp ===
+(in-package :modus.mvm)
 (DEFUN FUNCTION-TO-TRACE (X) (CAR X))
 (DEFUN ANOTHER-FUNCTION-TO-TRACE (X) (CDR X))
 (DEFUN (SETF FUNCTION-TO-TRACE) (VAL ARG) (SETF (CAR ARG) VAL))
@@ -145024,11 +146933,14 @@ NIL
                               (PROG1 (TRACE) (UNTRACE))))) '(GENERIC-FUNCTION-TO-TRACE2)) (t (c) (%test-crash-fail-c 26130 c)))
 )
 (defun run-ansi-trace ()
-  (%try-chunk "trace" 6771974 1 #'run-ansi-trace-chunk-1)
-  (%try-chunk "trace" 6771974 2 #'run-ansi-trace-chunk-2)
+  (%try-chunk "trace" 1283334 1 #'run-ansi-trace-chunk-1)
+  (%try-chunk "trace" 1283334 2 #'run-ansi-trace-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === user-homedir-pathname.lsp ===
+(in-package :modus.mvm)
 (defun run-init-user-homedir-pathname ()
   nil
 )
@@ -145056,10 +146968,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26137 c)))
 )
 (defun run-ansi-user-homedir-pathname ()
-  (%try-chunk "user-homedir-pathname" 14693452 1 #'run-ansi-user-homedir-pathname-chunk-1)
+  (%try-chunk "user-homedir-pathname" 7156812 1 #'run-ansi-user-homedir-pathname-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === abort.lsp ===
+(in-package :modus.mvm)
 (defun run-init-abort ()
   nil
 )
@@ -145092,10 +147007,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26142 c)))
 )
 (defun run-ansi-abort ()
-  (%try-chunk "abort" 4883565 1 #'run-ansi-abort-chunk-1)
+  (%try-chunk "abort" 16139373 1 #'run-ansi-abort-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === assert.lsp ===
+(in-package :modus.mvm)
 (defun run-init-assert ()
   nil
 )
@@ -145159,11 +147077,14 @@ NIL
                              (ASSERT T NIL "Foo!"))) 'NIL) (t (c) (%test-crash-fail-c 26154 c)))
 )
 (defun run-ansi-assert ()
-  (%try-chunk "assert" 15337757 1 #'run-ansi-assert-chunk-1)
-  (%try-chunk "assert" 15337757 2 #'run-ansi-assert-chunk-2)
+  (%try-chunk "assert" 16697629 1 #'run-ansi-assert-chunk-1)
+  (%try-chunk "assert" 16697629 2 #'run-ansi-assert-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === cell-error-name.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cell-error-name ()
   nil
 )
@@ -145198,10 +147119,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26162 c)))
 )
 (defun run-ansi-cell-error-name ()
-  (%try-chunk "cell-error-name" 15030686 1 #'run-ansi-cell-error-name-chunk-1)
+  (%try-chunk "cell-error-name" 7641502 1 #'run-ansi-cell-error-name-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === cerror.lsp ===
+(in-package :modus.mvm)
 (defun run-init-cerror ()
   nil
 )
@@ -145251,11 +147175,14 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26172 c)))
 )
 (defun run-ansi-cerror ()
-  (%try-chunk "cerror" 9389740 1 #'run-ansi-cerror-chunk-1)
-  (%try-chunk "cerror" 9389740 2 #'run-ansi-cerror-chunk-2)
+  (%try-chunk "cerror" 9766572 1 #'run-ansi-cerror-chunk-1)
+  (%try-chunk "cerror" 9766572 2 #'run-ansi-cerror-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === check-type.lsp ===
+(in-package :modus.mvm)
 (defun run-init-check-type ()
   nil
 )
@@ -145383,11 +147310,14 @@ NIL
                                  (ERROR "Foo!"))))) 'NIL) (t (c) (%test-crash-fail-c 26181 c)))
 )
 (defun run-ansi-check-type ()
-  (%try-chunk "check-type" 13881596 1 #'run-ansi-check-type-chunk-1)
-  (%try-chunk "check-type" 13881596 2 #'run-ansi-check-type-chunk-2)
+  (%try-chunk "check-type" 5214460 1 #'run-ansi-check-type-chunk-1)
+  (%try-chunk "check-type" 5214460 2 #'run-ansi-check-type-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === compute-restarts.lsp ===
+(in-package :modus.mvm)
 (defun run-init-compute-restarts ()
   nil
 )
@@ -145505,11 +147435,14 @@ NIL
                                                                                   NIL)) (t (c) (%test-crash-fail-c 26190 c)))
 )
 (defun run-ansi-compute-restarts ()
-  (%try-chunk "compute-restarts" 1443491 1 #'run-ansi-compute-restarts-chunk-1)
-  (%try-chunk "compute-restarts" 1443491 2 #'run-ansi-compute-restarts-chunk-2)
+  (%try-chunk "compute-restarts" 8865443 1 #'run-ansi-compute-restarts-chunk-1)
+  (%try-chunk "compute-restarts" 8865443 2 #'run-ansi-compute-restarts-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === condition.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *ALLOWED-CONDITION-INCLUSIONS*
   '((ARITHMETIC-ERROR ERROR SERIOUS-CONDITION CONDITION)
     (CELL-ERROR ERROR SERIOUS-CONDITION CONDITION) (CONDITION)
@@ -145677,10 +147610,13 @@ NIL
                                        (UNDEFINED-FUNCTION CELL-ERROR ERROR
                                         SERIOUS-CONDITION CONDITION)
                                        (WARNING CONDITION))) (t (c) nil))
-  (%try-chunk "condition" 6601580 1 #'run-ansi-condition-chunk-1)
+  (%try-chunk "condition" 1555308 1 #'run-ansi-condition-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === continue.lsp ===
+(in-package :modus.mvm)
 (defun run-init-continue ()
   nil
 )
@@ -145712,10 +147648,13 @@ NIL
                              (PROGN (CONTINUE C2)))) 'NIL) (t (c) (%test-crash-fail-c 26198 c)))
 )
 (defun run-ansi-continue ()
-  (%try-chunk "continue" 4701278 1 #'run-ansi-continue-chunk-1)
+  (%try-chunk "continue" 4275294 1 #'run-ansi-continue-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-condition.lsp ===
+(in-package :modus.mvm)
 (DEFUN CONDITION-4/SLOT-1 (C) (%CONDITION-SLOT C 'SLOT1))
 (DEFUN CONDITION-4/SLOT-2 (C) (%CONDITION-SLOT C 'SLOT2))
 (DEFUN CONDITION-5/SLOT-1 (C) (%CONDITION-SLOT C 'SLOT1))
@@ -148458,16 +150397,19 @@ NIL
  (LET ((C (MAKE-CONDITION 'CONDITION-30)))
    (HANDLER-CASE (SIGNAL C) (ERROR NIL NIL) (CONDITION-30 (C2) (EQT C C2))))
  T) (t (c) nil))
-  (%try-chunk "define-condition" 1768180 1 #'run-ansi-define-condition-chunk-1)
-  (%try-chunk "define-condition" 1768180 2 #'run-ansi-define-condition-chunk-2)
-  (%try-chunk "define-condition" 1768180 3 #'run-ansi-define-condition-chunk-3)
-  (%try-chunk "define-condition" 1768180 4 #'run-ansi-define-condition-chunk-4)
-  (%try-chunk "define-condition" 1768180 5 #'run-ansi-define-condition-chunk-5)
-  (%try-chunk "define-condition" 1768180 6 #'run-ansi-define-condition-chunk-6)
-  (%try-chunk "define-condition" 1768180 7 #'run-ansi-define-condition-chunk-7)
+  (%try-chunk "define-condition" 6666996 1 #'run-ansi-define-condition-chunk-1)
+  (%try-chunk "define-condition" 6666996 2 #'run-ansi-define-condition-chunk-2)
+  (%try-chunk "define-condition" 6666996 3 #'run-ansi-define-condition-chunk-3)
+  (%try-chunk "define-condition" 6666996 4 #'run-ansi-define-condition-chunk-4)
+  (%try-chunk "define-condition" 6666996 5 #'run-ansi-define-condition-chunk-5)
+  (%try-chunk "define-condition" 6666996 6 #'run-ansi-define-condition-chunk-6)
+  (%try-chunk "define-condition" 6666996 7 #'run-ansi-define-condition-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === error.lsp ===
+(in-package :modus.mvm)
 (defun run-init-error ()
   nil
 )
@@ -148534,11 +150476,14 @@ NIL
                                             (FROB-SIMPLE-ERROR C FMT))))) 'T) (t (c) (%test-crash-fail-c 26266 c)))
 )
 (defun run-ansi-error ()
-  (%try-chunk "error" 4302103 1 #'run-ansi-error-chunk-1)
-  (%try-chunk "error" 4302103 2 #'run-ansi-error-chunk-2)
+  (%try-chunk "error" 5006615 1 #'run-ansi-error-chunk-1)
+  (%try-chunk "error" 5006615 2 #'run-ansi-error-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === handler-bind.lsp ===
+(in-package :modus.mvm)
 (DEFUN HANDLER-BIND.7-HANDLER-FN (C) (DECLARE (IGNORE C)) (THROW 'FOO 'GOOD))
 (defun run-init-handler-bind ()
   nil
@@ -148636,11 +150581,14 @@ NIL
                                (ERROR "an error")))) 'GOOD) (t (c) (%test-crash-fail-c 26282 c)))
 )
 (defun run-ansi-handler-bind ()
-  (%try-chunk "handler-bind" 6113515 1 #'run-ansi-handler-bind-chunk-1)
-  (%try-chunk "handler-bind" 6113515 2 #'run-ansi-handler-bind-chunk-2)
+  (%try-chunk "handler-bind" 16140523 1 #'run-ansi-handler-bind-chunk-1)
+  (%try-chunk "handler-bind" 16140523 2 #'run-ansi-handler-bind-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === handler-case.lsp ===
+(in-package :modus.mvm)
 (defun run-init-handler-case ()
   nil
 )
@@ -148778,13 +150726,16 @@ NIL
                                               Y))))) ':GOOD) (t (c) (%test-crash-fail-c 26310 c)))
 )
 (defun run-ansi-handler-case ()
-  (%try-chunk "handler-case" 1075990 1 #'run-ansi-handler-case-chunk-1)
-  (%try-chunk "handler-case" 1075990 2 #'run-ansi-handler-case-chunk-2)
-  (%try-chunk "handler-case" 1075990 3 #'run-ansi-handler-case-chunk-3)
-  (%try-chunk "handler-case" 1075990 4 #'run-ansi-handler-case-chunk-4)
+  (%try-chunk "handler-case" 633622 1 #'run-ansi-handler-case-chunk-1)
+  (%try-chunk "handler-case" 633622 2 #'run-ansi-handler-case-chunk-2)
+  (%try-chunk "handler-case" 633622 3 #'run-ansi-handler-case-chunk-3)
+  (%try-chunk "handler-case" 633622 4 #'run-ansi-handler-case-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === ignore-errors.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ignore-errors ()
   nil
 )
@@ -148817,10 +150768,13 @@ NIL
                             (SIMPLE-CONDITION NIL 'GOOD))) 'GOOD) (t (c) (%test-crash-fail-c 26316 c)))
 )
 (defun run-ansi-ignore-errors ()
-  (%try-chunk "ignore-errors" 4654265 1 #'run-ansi-ignore-errors-chunk-1)
+  (%try-chunk "ignore-errors" 13321401 1 #'run-ansi-ignore-errors-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === invoke-debugger.lsp ===
+(in-package :modus.mvm)
 (defun run-init-invoke-debugger ()
   nil
 )
@@ -148887,10 +150841,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26322 c)))
 )
 (defun run-ansi-invoke-debugger ()
-  (%try-chunk "invoke-debugger" 5319931 1 #'run-ansi-invoke-debugger-chunk-1)
+  (%try-chunk "invoke-debugger" 10874107 1 #'run-ansi-invoke-debugger-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;types-aux.lsp")
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;define-condition-aux.lsp")
 (IN-PACKAGE "CL-TEST")
@@ -148923,7 +150880,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-condition.lsp ===
+(in-package :modus.mvm)
 (defun run-init-make-condition ()
   nil
 )
@@ -148959,10 +150919,13 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26327 c)))
 )
 (defun run-ansi-make-condition ()
-  (%try-chunk "make-condition" 690987 1 #'run-ansi-make-condition-chunk-1)
+  (%try-chunk "make-condition" 5294891 1 #'run-ansi-make-condition-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === muffle-warning.lsp ===
+(in-package :modus.mvm)
 (defun run-init-muffle-warning ()
   nil
 )
@@ -149004,10 +150967,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26332 c)))
 )
 (defun run-ansi-muffle-warning ()
-  (%try-chunk "muffle-warning" 6100881 1 #'run-ansi-muffle-warning-chunk-1)
+  (%try-chunk "muffle-warning" 6510481 1 #'run-ansi-muffle-warning-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === restart-bind.lsp ===
+(in-package :modus.mvm)
 (defun run-init-restart-bind ()
   nil
 )
@@ -149209,13 +151175,16 @@ NIL
                                                       I)))) '((C B A) 1)) (t (c) (%test-crash-fail-c 26358 c)))
 )
 (defun run-ansi-restart-bind ()
-  (%try-chunk "restart-bind" 339276 1 #'run-ansi-restart-bind-chunk-1)
-  (%try-chunk "restart-bind" 339276 2 #'run-ansi-restart-bind-chunk-2)
-  (%try-chunk "restart-bind" 339276 3 #'run-ansi-restart-bind-chunk-3)
-  (%try-chunk "restart-bind" 339276 4 #'run-ansi-restart-bind-chunk-4)
+  (%try-chunk "restart-bind" 10956108 1 #'run-ansi-restart-bind-chunk-1)
+  (%try-chunk "restart-bind" 10956108 2 #'run-ansi-restart-bind-chunk-2)
+  (%try-chunk "restart-bind" 10956108 3 #'run-ansi-restart-bind-chunk-3)
+  (%try-chunk "restart-bind" 10956108 4 #'run-ansi-restart-bind-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === restart-case.lsp ===
+(in-package :modus.mvm)
 (defun run-init-restart-case ()
   nil
 )
@@ -149556,14 +151525,17 @@ NIL
                                (LAMBDA () (SIGNAL 'X :Y 1)))))) 'NIL) (t (c) (%test-crash-fail-c 26395 c)))
 )
 (defun run-ansi-restart-case ()
-  (%try-chunk "restart-case" 5492145 1 #'run-ansi-restart-case-chunk-1)
-  (%try-chunk "restart-case" 5492145 2 #'run-ansi-restart-case-chunk-2)
-  (%try-chunk "restart-case" 5492145 3 #'run-ansi-restart-case-chunk-3)
-  (%try-chunk "restart-case" 5492145 4 #'run-ansi-restart-case-chunk-4)
-  (%try-chunk "restart-case" 5492145 5 #'run-ansi-restart-case-chunk-5)
+  (%try-chunk "restart-case" 6016433 1 #'run-ansi-restart-case-chunk-1)
+  (%try-chunk "restart-case" 6016433 2 #'run-ansi-restart-case-chunk-2)
+  (%try-chunk "restart-case" 6016433 3 #'run-ansi-restart-case-chunk-3)
+  (%try-chunk "restart-case" 6016433 4 #'run-ansi-restart-case-chunk-4)
+  (%try-chunk "restart-case" 6016433 5 #'run-ansi-restart-case-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === store-value.lsp ===
+(in-package :modus.mvm)
 (defun run-init-store-value ()
   nil
 )
@@ -149605,10 +151577,13 @@ NIL
                              (PROGN (STORE-VALUE 21 C2)))) 'NIL) (t (c) (%test-crash-fail-c 26400 c)))
 )
 (defun run-ansi-store-value ()
-  (%try-chunk "store-value" 3095918 1 #'run-ansi-store-value-chunk-1)
+  (%try-chunk "store-value" 2211182 1 #'run-ansi-store-value-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === use-value.lsp ===
+(in-package :modus.mvm)
 (defun run-init-use-value ()
   nil
 )
@@ -149649,10 +151624,13 @@ NIL
                              (PROGN (USE-VALUE 21 C2)))) 'NIL) (t (c) (%test-crash-fail-c 26405 c)))
 )
 (defun run-ansi-use-value ()
-  (%try-chunk "use-value" 16354218 1 #'run-ansi-use-value-chunk-1)
+  (%try-chunk "use-value" 7211946 1 #'run-ansi-use-value-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === warn.lsp ===
+(in-package :modus.mvm)
 (defun run-init-warn ()
   nil
 )
@@ -149880,12 +151858,15 @@ NIL
                                                         WARNED))))) '((NIL) T)) (t (c) (%test-crash-fail-c 26424 c)))
 )
 (defun run-ansi-warn ()
-  (%try-chunk "warn" 15017469 1 #'run-ansi-warn-chunk-1)
-  (%try-chunk "warn" 15017469 2 #'run-ansi-warn-chunk-2)
-  (%try-chunk "warn" 15017469 3 #'run-ansi-warn-chunk-3)
+  (%try-chunk "warn" 16541181 1 #'run-ansi-warn-chunk-1)
+  (%try-chunk "warn" 16541181 2 #'run-ansi-warn-chunk-2)
+  (%try-chunk "warn" 16541181 3 #'run-ansi-warn-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-condition-restarts.lsp ===
+(in-package :modus.mvm)
 (defun run-init-with-condition-restarts ()
   nil
 )
@@ -149942,10 +151923,13 @@ NIL
                                  (INVOKE-RESTART (FIND-RESTART 'FOO C2))))))) 'GOOD) (t (c) (%test-crash-fail-c 26432 c)))
 )
 (defun run-ansi-with-condition-restarts ()
-  (%try-chunk "with-condition-restarts" 8256922 1 #'run-ansi-with-condition-restarts-chunk-1)
+  (%try-chunk "with-condition-restarts" 9387418 1 #'run-ansi-with-condition-restarts-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-simple-restart.lsp ===
+(in-package :modus.mvm)
 (defun run-init-with-simple-restart ()
   nil
 )
@@ -149976,10 +151960,13 @@ NIL
                                                                                 T)) (t (c) (%test-crash-fail-c 26440 c)))
 )
 (defun run-ansi-with-simple-restart ()
-  (%try-chunk "with-simple-restart" 12023516 1 #'run-ansi-with-simple-restart-chunk-1)
+  (%try-chunk "with-simple-restart" 14169820 1 #'run-ansi-with-simple-restart-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === directory-namestring.lsp ===
+(in-package :modus.mvm)
 (defun run-init-directory-namestring ()
   nil
 )
@@ -150019,10 +152006,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26445 c)))
 )
 (defun run-ansi-directory-namestring ()
-  (%try-chunk "directory-namestring" 3233889 1 #'run-ansi-directory-namestring-chunk-1)
+  (%try-chunk "directory-namestring" 5199969 1 #'run-ansi-directory-namestring-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === enough-namestring.lsp ===
+(in-package :modus.mvm)
 (defun run-init-enough-namestring ()
   nil
 )
@@ -150099,11 +152089,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26454 c)))
 )
 (defun run-ansi-enough-namestring ()
-  (%try-chunk "enough-namestring" 4032262 1 #'run-ansi-enough-namestring-chunk-1)
-  (%try-chunk "enough-namestring" 4032262 2 #'run-ansi-enough-namestring-chunk-2)
+  (%try-chunk "enough-namestring" 10258182 1 #'run-ansi-enough-namestring-chunk-1)
+  (%try-chunk "enough-namestring" 10258182 2 #'run-ansi-enough-namestring-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-namestring.lsp ===
+(in-package :modus.mvm)
 (defun run-init-file-namestring ()
   nil
 )
@@ -150141,10 +152134,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26459 c)))
 )
 (defun run-ansi-file-namestring ()
-  (%try-chunk "file-namestring" 11307606 1 #'run-ansi-file-namestring-chunk-1)
+  (%try-chunk "file-namestring" 6490710 1 #'run-ansi-file-namestring-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === host-namestring.lsp ===
+(in-package :modus.mvm)
 (defun run-init-host-namestring ()
   nil
 )
@@ -150181,10 +152177,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26464 c)))
 )
 (defun run-ansi-host-namestring ()
-  (%try-chunk "host-namestring" 14392872 1 #'run-ansi-host-namestring-chunk-1)
+  (%try-chunk "host-namestring" 8265256 1 #'run-ansi-host-namestring-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load-logical-pathname-translations.lsp ===
+(in-package :modus.mvm)
 (defun run-init-load-logical-pathname-translations ()
   nil
 )
@@ -150207,10 +152206,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26468 c)))
 )
 (defun run-ansi-load-logical-pathname-translations ()
-  (%try-chunk "load-logical-pathname-translations" 16254445 1 #'run-ansi-load-logical-pathname-translations-chunk-1)
+  (%try-chunk "load-logical-pathname-translations" 4736493 1 #'run-ansi-load-logical-pathname-translations-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;pathnames-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -150246,14 +152248,20 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === logical-pathname-translations.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logical-pathname-translations ()
   nil
 )
 (defun run-ansi-logical-pathname-translations ()
 )
 
+(in-package :modus.mvm)
+
 ;; === logical-pathname.lsp ===
+(in-package :modus.mvm)
 (defun run-init-logical-pathname ()
   nil
 )
@@ -150382,11 +152390,14 @@ NIL
                             (TYPE-ERROR NIL T))) 'T) (t (c) (%test-crash-fail-c 26481 c)))
 )
 (defun run-ansi-logical-pathname ()
-  (%try-chunk "logical-pathname" 7999667 1 #'run-ansi-logical-pathname-chunk-1)
-  (%try-chunk "logical-pathname" 7999667 2 #'run-ansi-logical-pathname-chunk-2)
+  (%try-chunk "logical-pathname" 8507571 1 #'run-ansi-logical-pathname-chunk-1)
+  (%try-chunk "logical-pathname" 8507571 2 #'run-ansi-logical-pathname-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-pathname.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *NULL-PATHNAME* (MAKE-PATHNAME))
 (DEFUN MAKE-PATHNAME-TEST
        (
@@ -150518,12 +152529,15 @@ NIL
 )
 (defun run-ansi-make-pathname ()
   (handler-case (setq *NULL-PATHNAME* (MAKE-PATHNAME)) (t (c) nil))
-  (%try-chunk "make-pathname" 12432690 1 #'run-ansi-make-pathname-chunk-1)
-  (%try-chunk "make-pathname" 12432690 2 #'run-ansi-make-pathname-chunk-2)
-  (%try-chunk "make-pathname" 12432690 3 #'run-ansi-make-pathname-chunk-3)
+  (%try-chunk "make-pathname" 12825906 1 #'run-ansi-make-pathname-chunk-1)
+  (%try-chunk "make-pathname" 12825906 2 #'run-ansi-make-pathname-chunk-2)
+  (%try-chunk "make-pathname" 12825906 3 #'run-ansi-make-pathname-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === merge-pathnames.lsp ===
+(in-package :modus.mvm)
 (defun run-init-merge-pathnames ()
   nil
 )
@@ -150770,10 +152784,13 @@ NIL
                                                                           T)) (t (c) (%test-crash-fail-c 26510 c)))
 )
 (defun run-ansi-merge-pathnames ()
-  (%try-chunk "merge-pathnames" 15593419 1 #'run-ansi-merge-pathnames-chunk-1)
+  (%try-chunk "merge-pathnames" 8908747 1 #'run-ansi-merge-pathnames-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === namestring.lsp ===
+(in-package :modus.mvm)
 (defun run-init-namestring ()
   nil
 )
@@ -150797,10 +152814,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26514 c)))
 )
 (defun run-ansi-namestring ()
-  (%try-chunk "namestring" 1366061 1 #'run-ansi-namestring-chunk-1)
+  (%try-chunk "namestring" 9295917 1 #'run-ansi-namestring-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === parse-namestring.lsp ===
+(in-package :modus.mvm)
 (defun run-init-parse-namestring ()
   nil
 )
@@ -150901,10 +152921,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26521 c)))
 )
 (defun run-ansi-parse-namestring ()
-  (%try-chunk "parse-namestring" 13773485 1 #'run-ansi-parse-namestring-chunk-1)
+  (%try-chunk "parse-namestring" 15755949 1 #'run-ansi-parse-namestring-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-device.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-device ()
   nil
 )
@@ -150965,11 +152988,14 @@ NIL
   (handler-case (run-test 26531 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26531 c)))
 )
 (defun run-ansi-pathname-device ()
-  (%try-chunk "pathname-device" 13936448 1 #'run-ansi-pathname-device-chunk-1)
-  (%try-chunk "pathname-device" 13936448 2 #'run-ansi-pathname-device-chunk-2)
+  (%try-chunk "pathname-device" 3188544 1 #'run-ansi-pathname-device-chunk-1)
+  (%try-chunk "pathname-device" 3188544 2 #'run-ansi-pathname-device-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-directory.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-directory ()
   nil
 )
@@ -151059,11 +153085,14 @@ NIL
   (handler-case (run-test 26541 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26541 c)))
 )
 (defun run-ansi-pathname-directory ()
-  (%try-chunk "pathname-directory" 14893777 1 #'run-ansi-pathname-directory-chunk-1)
-  (%try-chunk "pathname-directory" 14893777 2 #'run-ansi-pathname-directory-chunk-2)
+  (%try-chunk "pathname-directory" 14336721 1 #'run-ansi-pathname-directory-chunk-1)
+  (%try-chunk "pathname-directory" 14336721 2 #'run-ansi-pathname-directory-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-host.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-host ()
   nil
 )
@@ -151128,11 +153157,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26552 c)))
 )
 (defun run-ansi-pathname-host ()
-  (%try-chunk "pathname-host" 16427688 1 #'run-ansi-pathname-host-chunk-1)
-  (%try-chunk "pathname-host" 16427688 2 #'run-ansi-pathname-host-chunk-2)
+  (%try-chunk "pathname-host" 5679784 1 #'run-ansi-pathname-host-chunk-1)
+  (%try-chunk "pathname-host" 5679784 2 #'run-ansi-pathname-host-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-match-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-match-p ()
   nil
 )
@@ -151188,11 +153220,14 @@ NIL
   (handler-case (run-test 26567 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26567 c)))
 )
 (defun run-ansi-pathname-match-p ()
-  (%try-chunk "pathname-match-p" 9458918 1 #'run-ansi-pathname-match-p-chunk-1)
-  (%try-chunk "pathname-match-p" 9458918 2 #'run-ansi-pathname-match-p-chunk-2)
+  (%try-chunk "pathname-match-p" 15275238 1 #'run-ansi-pathname-match-p-chunk-1)
+  (%try-chunk "pathname-match-p" 15275238 2 #'run-ansi-pathname-match-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-name.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-name ()
   nil
 )
@@ -151250,11 +153285,14 @@ NIL
   (handler-case (run-test 26577 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26577 c)))
 )
 (defun run-ansi-pathname-name ()
-  (%try-chunk "pathname-name" 9340615 1 #'run-ansi-pathname-name-chunk-1)
-  (%try-chunk "pathname-name" 9340615 2 #'run-ansi-pathname-name-chunk-2)
+  (%try-chunk "pathname-name" 181959 1 #'run-ansi-pathname-name-chunk-1)
+  (%try-chunk "pathname-name" 181959 2 #'run-ansi-pathname-name-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-type.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-type ()
   nil
 )
@@ -151312,11 +153350,14 @@ NIL
   (handler-case (run-test 26587 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26587 c)))
 )
 (defun run-ansi-pathname-type ()
-  (%try-chunk "pathname-type" 4819080 1 #'run-ansi-pathname-type-chunk-1)
-  (%try-chunk "pathname-type" 4819080 2 #'run-ansi-pathname-type-chunk-2)
+  (%try-chunk "pathname-type" 14682248 1 #'run-ansi-pathname-type-chunk-1)
+  (%try-chunk "pathname-type" 14682248 2 #'run-ansi-pathname-type-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname-version.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname-version ()
   nil
 )
@@ -151342,10 +153383,13 @@ NIL
   (handler-case (run-test 26593 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26593 c)))
 )
 (defun run-ansi-pathname-version ()
-  (%try-chunk "pathname-version" 15859698 1 #'run-ansi-pathname-version-chunk-1)
+  (%try-chunk "pathname-version" 2965490 1 #'run-ansi-pathname-version-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathname.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathname ()
   nil
 )
@@ -151410,11 +153454,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26606 c)))
 )
 (defun run-ansi-pathname ()
-  (%try-chunk "pathname" 1364621 1 #'run-ansi-pathname-chunk-1)
-  (%try-chunk "pathname" 1364621 2 #'run-ansi-pathname-chunk-2)
+  (%try-chunk "pathname" 6640269 1 #'run-ansi-pathname-chunk-1)
+  (%try-chunk "pathname" 6640269 2 #'run-ansi-pathname-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathnamep.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathnamep ()
   nil
 )
@@ -151437,10 +153484,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26612 c)))
 )
 (defun run-ansi-pathnamep ()
-  (%try-chunk "pathnamep" 4017877 1 #'run-ansi-pathnamep-chunk-1)
+  (%try-chunk "pathnamep" 4706005 1 #'run-ansi-pathnamep-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === pathnames.lsp ===
+(in-package :modus.mvm)
 (defun run-init-pathnames ()
   nil
 )
@@ -151458,10 +153508,13 @@ NIL
                                                (LIST (LIST P1 S P2)))))))) 'NIL) (t (c) (%test-crash-fail-c 26613 c)))
 )
 (defun run-ansi-pathnames ()
-  (%try-chunk "pathnames" 4017966 1 #'run-ansi-pathnames-chunk-1)
+  (%try-chunk "pathnames" 11308846 1 #'run-ansi-pathnames-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === translate-logical-pathname.lsp ===
+(in-package :modus.mvm)
 (defun run-init-translate-logical-pathname ()
   nil
 )
@@ -151502,10 +153555,13 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26618 c)))
 )
 (defun run-ansi-translate-logical-pathname ()
-  (%try-chunk "translate-logical-pathname" 5752304 1 #'run-ansi-translate-logical-pathname-chunk-1)
+  (%try-chunk "translate-logical-pathname" 13141488 1 #'run-ansi-translate-logical-pathname-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === wild-pathname-p.lsp ===
+(in-package :modus.mvm)
 (defun run-init-wild-pathname-p ()
   nil
 )
@@ -151650,14 +153706,17 @@ NIL
   (handler-case (run-test 26654 (lambda () NIL) 'NIL) (t (c) (%test-crash-fail-c 26654 c)))
 )
 (defun run-ansi-wild-pathname-p ()
-  (%try-chunk "wild-pathname-p" 8552435 1 #'run-ansi-wild-pathname-p-chunk-1)
-  (%try-chunk "wild-pathname-p" 8552435 2 #'run-ansi-wild-pathname-p-chunk-2)
-  (%try-chunk "wild-pathname-p" 8552435 3 #'run-ansi-wild-pathname-p-chunk-3)
-  (%try-chunk "wild-pathname-p" 8552435 4 #'run-ansi-wild-pathname-p-chunk-4)
-  (%try-chunk "wild-pathname-p" 8552435 5 #'run-ansi-wild-pathname-p-chunk-5)
+  (%try-chunk "wild-pathname-p" 4882419 1 #'run-ansi-wild-pathname-p-chunk-1)
+  (%try-chunk "wild-pathname-p" 4882419 2 #'run-ansi-wild-pathname-p-chunk-2)
+  (%try-chunk "wild-pathname-p" 4882419 3 #'run-ansi-wild-pathname-p-chunk-3)
+  (%try-chunk "wild-pathname-p" 4882419 4 #'run-ansi-wild-pathname-p-chunk-4)
+  (%try-chunk "wild-pathname-p" 4882419 5 #'run-ansi-wild-pathname-p-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === compile-file.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (DEFUN COMPILE-FILE-TEST
        (FILE FUNNAME
@@ -151930,13 +153989,16 @@ NIL
 )
 (defun run-ansi-compile-file ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "compile-file" 10895845 1 #'run-ansi-compile-file-chunk-1)
-  (%try-chunk "compile-file" 10895845 2 #'run-ansi-compile-file-chunk-2)
-  (%try-chunk "compile-file" 10895845 3 #'run-ansi-compile-file-chunk-3)
-  (%try-chunk "compile-file" 10895845 4 #'run-ansi-compile-file-chunk-4)
+  (%try-chunk "compile-file" 770533 1 #'run-ansi-compile-file-chunk-1)
+  (%try-chunk "compile-file" 770533 2 #'run-ansi-compile-file-chunk-2)
+  (%try-chunk "compile-file" 770533 3 #'run-ansi-compile-file-chunk-3)
+  (%try-chunk "compile-file" 770533 4 #'run-ansi-compile-file-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === features.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-features ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -151958,10 +154020,13 @@ NIL
 )
 (defun run-ansi-features ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "features" 10669640 1 #'run-ansi-features-chunk-1)
+  (%try-chunk "features" 11701832 1 #'run-ansi-features-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === load-file.lsp ===
+(in-package :modus.mvm)
 (DEFUN LOAD-FILE-TEST
        (FILE FUNNAME
         &REST ARGS
@@ -152216,13 +154281,16 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26708 c)))
 )
 (defun run-ansi-load-file ()
-  (%try-chunk "load-file" 97690 1 #'run-ansi-load-file-chunk-1)
-  (%try-chunk "load-file" 97690 2 #'run-ansi-load-file-chunk-2)
-  (%try-chunk "load-file" 97690 3 #'run-ansi-load-file-chunk-3)
-  (%try-chunk "load-file" 97690 4 #'run-ansi-load-file-chunk-4)
+  (%try-chunk "load-file" 8306074 1 #'run-ansi-load-file-chunk-1)
+  (%try-chunk "load-file" 8306074 2 #'run-ansi-load-file-chunk-2)
+  (%try-chunk "load-file" 8306074 3 #'run-ansi-load-file-chunk-3)
+  (%try-chunk "load-file" 8306074 4 #'run-ansi-load-file-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -152239,7 +154307,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === modules.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-modules ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -152316,11 +154387,14 @@ NIL
 )
 (defun run-ansi-modules ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "modules" 4660206 1 #'run-ansi-modules-chunk-1)
-  (%try-chunk "modules" 4660206 2 #'run-ansi-modules-chunk-2)
+  (%try-chunk "modules" 170990 1 #'run-ansi-modules-chunk-1)
+  (%try-chunk "modules" 170990 2 #'run-ansi-modules-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-compilation-unit.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (defun run-init-with-compilation-unit ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
@@ -152352,10 +154426,13 @@ NIL
 )
 (defun run-ansi-with-compilation-unit ()
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
-  (%try-chunk "with-compilation-unit" 1668546 1 #'run-ansi-with-compilation-unit-chunk-1)
+  (%try-chunk "with-compilation-unit" 3290562 1 #'run-ansi-with-compilation-unit-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === delete-file.lsp ===
+(in-package :modus.mvm)
 (defun run-init-delete-file ()
   nil
 )
@@ -152497,10 +154574,13 @@ NIL
                                                                             NIL)) (t (c) (%test-crash-fail-c 26735 c)))
 )
 (defun run-ansi-delete-file ()
-  (%try-chunk "delete-file" 8992701 1 #'run-ansi-delete-file-chunk-1)
+  (%try-chunk "delete-file" 16316349 1 #'run-ansi-delete-file-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === directory.lsp ===
+(in-package :modus.mvm)
 (defun run-init-directory ()
   nil
 )
@@ -152551,11 +154631,14 @@ NIL
   (handler-case (run-test 26745 (lambda () (HANDLER-CASE (PROGN (DIRECTORY) NIL) (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26745 c)))
 )
 (defun run-ansi-directory ()
-  (%try-chunk "directory" 16381942 1 #'run-ansi-directory-chunk-1)
-  (%try-chunk "directory" 16381942 2 #'run-ansi-directory-chunk-2)
+  (%try-chunk "directory" 15349750 1 #'run-ansi-directory-chunk-1)
+  (%try-chunk "directory" 15349750 2 #'run-ansi-directory-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === ensure-directories-exist.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ensure-directories-exist ()
   nil
 )
@@ -152855,11 +154938,14 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26756 c)))
 )
 (defun run-ansi-ensure-directories-exist ()
-  (%try-chunk "ensure-directories-exist" 6284649 1 #'run-ansi-ensure-directories-exist-chunk-1)
-  (%try-chunk "ensure-directories-exist" 6284649 2 #'run-ansi-ensure-directories-exist-chunk-2)
+  (%try-chunk "ensure-directories-exist" 3269993 1 #'run-ansi-ensure-directories-exist-chunk-1)
+  (%try-chunk "ensure-directories-exist" 3269993 2 #'run-ansi-ensure-directories-exist-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-author.lsp ===
+(in-package :modus.mvm)
 (defun run-init-file-author ()
   nil
 )
@@ -152945,11 +155031,14 @@ NIL
                                                                                  T)) (t (c) (%test-crash-fail-c 26767 c)))
 )
 (defun run-ansi-file-author ()
-  (%try-chunk "file-author" 630201 1 #'run-ansi-file-author-chunk-1)
-  (%try-chunk "file-author" 630201 2 #'run-ansi-file-author-chunk-2)
+  (%try-chunk "file-author" 1007033 1 #'run-ansi-file-author-chunk-1)
+  (%try-chunk "file-author" 1007033 2 #'run-ansi-file-author-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-error.lsp ===
+(in-package :modus.mvm)
 (defun run-init-file-error ()
   nil
 )
@@ -153096,11 +155185,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26776 c)))
 )
 (defun run-ansi-file-error ()
-  (%try-chunk "file-error" 14893668 1 #'run-ansi-file-error-chunk-1)
-  (%try-chunk "file-error" 14893668 2 #'run-ansi-file-error-chunk-2)
+  (%try-chunk "file-error" 12255844 1 #'run-ansi-file-error-chunk-1)
+  (%try-chunk "file-error" 12255844 2 #'run-ansi-file-error-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === file-write-date.lsp ===
+(in-package :modus.mvm)
 (defun run-init-file-write-date ()
   nil
 )
@@ -153173,11 +155265,14 @@ NIL
                                                                                  T)) (t (c) (%test-crash-fail-c 26786 c)))
 )
 (defun run-ansi-file-write-date ()
-  (%try-chunk "file-write-date" 1504040 1 #'run-ansi-file-write-date-chunk-1)
-  (%try-chunk "file-write-date" 1504040 2 #'run-ansi-file-write-date-chunk-2)
+  (%try-chunk "file-write-date" 1520424 1 #'run-ansi-file-write-date-chunk-1)
+  (%try-chunk "file-write-date" 1520424 2 #'run-ansi-file-write-date-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
        (MAKE-PATHNAME :DIRECTORY (PATHNAME-DIRECTORY *LOAD-PATHNAME*))))
@@ -153198,7 +155293,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === probe-file.lsp ===
+(in-package :modus.mvm)
 (defun run-init-probe-file ()
   nil
 )
@@ -153249,11 +155347,14 @@ NIL
                                                                                  T)) (t (c) (%test-crash-fail-c 26795 c)))
 )
 (defun run-ansi-probe-file ()
-  (%try-chunk "probe-file" 6981958 1 #'run-ansi-probe-file-chunk-1)
-  (%try-chunk "probe-file" 6981958 2 #'run-ansi-probe-file-chunk-2)
+  (%try-chunk "probe-file" 9472326 1 #'run-ansi-probe-file-chunk-1)
+  (%try-chunk "probe-file" 9472326 2 #'run-ansi-probe-file-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === rename-file.lsp ===
+(in-package :modus.mvm)
 (defun run-init-rename-file ()
   nil
 )
@@ -153684,10 +155785,13 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26803 c)))
 )
 (defun run-ansi-rename-file ()
-  (%try-chunk "rename-file" 5689708 1 #'run-ansi-rename-file-chunk-1)
+  (%try-chunk "rename-file" 4657516 1 #'run-ansi-rename-file-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === truename.lsp ===
+(in-package :modus.mvm)
 (defun run-init-truename ()
   nil
 )
@@ -153865,11 +155969,14 @@ NIL
                                                                                  T)) (t (c) (%test-crash-fail-c 26815 c)))
 )
 (defun run-ansi-truename ()
-  (%try-chunk "truename" 1166230 1 #'run-ansi-truename-chunk-1)
-  (%try-chunk "truename" 1166230 2 #'run-ansi-truename-chunk-2)
+  (%try-chunk "truename" 101270 1 #'run-ansi-truename-chunk-1)
+  (%try-chunk "truename" 101270 2 #'run-ansi-truename-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === add-method.lsp ===
+(in-package :modus.mvm)
 (DEFUN ADD-METHOD-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'ADD-METHOD-GF-01 %GF-ARGS))
 (DEFUN ADD-METHOD-GF-02 (&REST %GF-ARGS)
@@ -154330,11 +156437,14 @@ NIL
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'ADD-METHOD-GF-02 'ADD-METHOD-GF-02)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'ADD-METHOD-GF-02) (t (c) nil))
-  (%try-chunk "add-method" 8312060 1 #'run-ansi-add-method-chunk-1)
-  (%try-chunk "add-method" 8312060 2 #'run-ansi-add-method-chunk-2)
+  (%try-chunk "add-method" 7771388 1 #'run-ansi-add-method-chunk-1)
+  (%try-chunk "add-method" 7771388 2 #'run-ansi-add-method-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === allocate-instance.lsp ===
+(in-package :modus.mvm)
 (DEFSTRUCT ALLOCATE-INSTANCE-STRUCT-01
   A
   (B 0 :TYPE INTEGER)
@@ -154527,10 +156637,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'ALLOCATE-INSTANCE-CLASS-02 '(B)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'ALLOCATE-INSTANCE-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'ALLOCATE-INSTANCE-CLASS-02 NIL) (t (c) nil))
-  (%try-chunk "allocate-instance" 16552174 1 #'run-ansi-allocate-instance-chunk-1)
+  (%try-chunk "allocate-instance" 4624622 1 #'run-ansi-allocate-instance-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === call-next-method.lsp ===
+(in-package :modus.mvm)
 (DEFUN CNM-GF-01 (&REST %GF-ARGS) (%GF-DISPATCH 'CNM-GF-01 %GF-ARGS))
 (DEFUN CNM-GF-02 (&REST %GF-ARGS) (%GF-DISPATCH 'CNM-GF-02 %GF-ARGS))
 (DEFUN CNM-GF-03 (&REST %GF-ARGS) (%GF-DISPATCH 'CNM-GF-03 %GF-ARGS))
@@ -155068,11 +157181,14 @@ NIL
  (LAMBDA (X) (DECLARE (OPTIMIZE (SAFETY 3))) (CALL-NEXT-METHOD :BAD)) '(X)) (t (c) nil))
   (handler-case (%DEFGENERIC-METHOD 'CNM-ORDER-ERROR-GF-02 'NIL (LIST 'T) (LAMBDA (X) X) '(X)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'CNM-ORDER-ERROR-GF-02) (t (c) nil))
-  (%try-chunk "call-next-method" 15946413 1 #'run-ansi-call-next-method-chunk-1)
-  (%try-chunk "call-next-method" 15946413 2 #'run-ansi-call-next-method-chunk-2)
+  (%try-chunk "call-next-method" 14832301 1 #'run-ansi-call-next-method-chunk-1)
+  (%try-chunk "call-next-method" 14832301 2 #'run-ansi-call-next-method-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === change-class.lsp ===
+(in-package :modus.mvm)
 (defun run-init-change-class ()
   (handler-case (%DEFCLASS 'CHANGE-CLASS-CLASS-01A '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CHANGE-CLASS-CLASS-01A
@@ -156781,14 +158897,17 @@ NIL
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE OBJ 'A 'Z)
    OBJ)) (t (c) nil))
-  (%try-chunk "change-class" 14390634 1 #'run-ansi-change-class-chunk-1)
-  (%try-chunk "change-class" 14390634 2 #'run-ansi-change-class-chunk-2)
-  (%try-chunk "change-class" 14390634 3 #'run-ansi-change-class-chunk-3)
-  (%try-chunk "change-class" 14390634 4 #'run-ansi-change-class-chunk-4)
-  (%try-chunk "change-class" 14390634 5 #'run-ansi-change-class-chunk-5)
+  (%try-chunk "change-class" 12719466 1 #'run-ansi-change-class-chunk-1)
+  (%try-chunk "change-class" 12719466 2 #'run-ansi-change-class-chunk-2)
+  (%try-chunk "change-class" 12719466 3 #'run-ansi-change-class-chunk-3)
+  (%try-chunk "change-class" 12719466 4 #'run-ansi-change-class-chunk-4)
+  (%try-chunk "change-class" 12719466 5 #'run-ansi-change-class-chunk-5)
 )
 
+(in-package :modus.mvm)
+
 ;; === class-name.lsp ===
+(in-package :modus.mvm)
 (defun run-init-class-name ()
   (handler-case (%DEFCLASS 'CLASS-NAME-CLASS-01 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'CLASS-NAME-CLASS-01 (LIST) (LIST)) (t (c) nil))
@@ -156856,10 +158975,13 @@ NIL
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CLASS-NAME-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CLASS-NAME-CLASS-01 NIL) (t (c) nil))
   (handler-case (%DEFMETHOD 'CLASS-NAME 'NIL (LIST 'CLASS-NAME-CLASS-01) (LAMBDA (X) 'SILLY)) (t (c) nil))
-  (%try-chunk "class-name" 14593163 1 #'run-ansi-class-name-chunk-1)
+  (%try-chunk "class-name" 12938379 1 #'run-ansi-class-name-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === class-of.lsp ===
+(in-package :modus.mvm)
 (defun run-init-class-of ()
   nil
 )
@@ -156869,10 +158991,13 @@ NIL
                                          (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 26893 c)))
 )
 (defun run-ansi-class-of ()
-  (%try-chunk "class-of" 10890437 1 #'run-ansi-class-of-chunk-1)
+  (%try-chunk "class-of" 7466181 1 #'run-ansi-class-of-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === compute-applicable-methods.lsp ===
+(in-package :modus.mvm)
 (DEFUN CAM-GF-01 (&REST %GF-ARGS) (%GF-DISPATCH 'CAM-GF-01 %GF-ARGS))
 (DEFPARAMETER *CAM-GF-01-METHOD1*
   (%DEFMETHOD 'CAM-GF-01 'NIL (LIST 'INTEGER 'INTEGER) (LAMBDA (X Y) 1)))
@@ -157041,11 +159166,14 @@ NIL
   (handler-case (setq *CAM-GF-04-METHOD4* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'NUMBER)
                            (LAMBDA (X) 8))) (t (c) nil))
   (handler-case (setq *CAM-GF-04-METHOD5* (%DEFMETHOD 'CAM-GF-04 '+ (LIST 'T) (LAMBDA (X) 16))) (t (c) nil))
-  (%try-chunk "compute-applicable-methods" 12691027 1 #'run-ansi-compute-applicable-methods-chunk-1)
-  (%try-chunk "compute-applicable-methods" 12691027 2 #'run-ansi-compute-applicable-methods-chunk-2)
+  (%try-chunk "compute-applicable-methods" 9299539 1 #'run-ansi-compute-applicable-methods-chunk-1)
+  (%try-chunk "compute-applicable-methods" 9299539 2 #'run-ansi-compute-applicable-methods-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defclass-01.lsp ===
+(in-package :modus.mvm)
 (DEFUN S1-R (OBJ) (SLOT-VALUE OBJ 'S1))
 (DEFUN S2-W (NV OBJ) (SET-SLOT-VALUE OBJ 'S2 NV))
 (DEFUN S3-A (OBJ) (SLOT-VALUE OBJ 'S3))
@@ -159496,21 +161624,24 @@ NIL
      (%REGISTER-CLOS-DEFAULT-INITARGS 'CLASS-28
       (LIST (CONS ':S2 (LAMBDA () (INCF Y)))))
      (FIND-CLASS 'CLASS-28 NIL)))) (t (c) nil))
-  (%try-chunk "defclass-01" 2305130 1 #'run-ansi-defclass-01-chunk-1)
-  (%try-chunk "defclass-01" 2305130 2 #'run-ansi-defclass-01-chunk-2)
-  (%try-chunk "defclass-01" 2305130 3 #'run-ansi-defclass-01-chunk-3)
-  (%try-chunk "defclass-01" 2305130 4 #'run-ansi-defclass-01-chunk-4)
-  (%try-chunk "defclass-01" 2305130 5 #'run-ansi-defclass-01-chunk-5)
-  (%try-chunk "defclass-01" 2305130 6 #'run-ansi-defclass-01-chunk-6)
-  (%try-chunk "defclass-01" 2305130 7 #'run-ansi-defclass-01-chunk-7)
-  (%try-chunk "defclass-01" 2305130 8 #'run-ansi-defclass-01-chunk-8)
-  (%try-chunk "defclass-01" 2305130 9 #'run-ansi-defclass-01-chunk-9)
-  (%try-chunk "defclass-01" 2305130 10 #'run-ansi-defclass-01-chunk-10)
-  (%try-chunk "defclass-01" 2305130 11 #'run-ansi-defclass-01-chunk-11)
-  (%try-chunk "defclass-01" 2305130 12 #'run-ansi-defclass-01-chunk-12)
+  (%try-chunk "defclass-01" 8924266 1 #'run-ansi-defclass-01-chunk-1)
+  (%try-chunk "defclass-01" 8924266 2 #'run-ansi-defclass-01-chunk-2)
+  (%try-chunk "defclass-01" 8924266 3 #'run-ansi-defclass-01-chunk-3)
+  (%try-chunk "defclass-01" 8924266 4 #'run-ansi-defclass-01-chunk-4)
+  (%try-chunk "defclass-01" 8924266 5 #'run-ansi-defclass-01-chunk-5)
+  (%try-chunk "defclass-01" 8924266 6 #'run-ansi-defclass-01-chunk-6)
+  (%try-chunk "defclass-01" 8924266 7 #'run-ansi-defclass-01-chunk-7)
+  (%try-chunk "defclass-01" 8924266 8 #'run-ansi-defclass-01-chunk-8)
+  (%try-chunk "defclass-01" 8924266 9 #'run-ansi-defclass-01-chunk-9)
+  (%try-chunk "defclass-01" 8924266 10 #'run-ansi-defclass-01-chunk-10)
+  (%try-chunk "defclass-01" 8924266 11 #'run-ansi-defclass-01-chunk-11)
+  (%try-chunk "defclass-01" 8924266 12 #'run-ansi-defclass-01-chunk-12)
 )
 
+(in-package :modus.mvm)
+
 ;; === defclass-02.lsp ===
+(in-package :modus.mvm)
 (DEFUN CLASS-0201-C (OBJ) (SLOT-VALUE OBJ 'C))
 (DEFUN S1-R (OBJ) (SLOT-VALUE OBJ 'S1))
 (DEFUN S1-W (NV OBJ) (SET-SLOT-VALUE OBJ 'S1 NV))
@@ -161630,15 +163761,18 @@ NIL
   (handler-case (%REGISTER-GF-FN #'SET-S-ACC) (t (c) nil))
   (handler-case (%REGISTER-GF-FN #'SETF-S-ACC) (t (c) nil))
   (handler-case (FIND-CLASS 'CLASS-0223B NIL) (t (c) nil))
-  (%try-chunk "defclass-02" 2305041 1 #'run-ansi-defclass-02-chunk-1)
-  (%try-chunk "defclass-02" 2305041 2 #'run-ansi-defclass-02-chunk-2)
-  (%try-chunk "defclass-02" 2305041 3 #'run-ansi-defclass-02-chunk-3)
-  (%try-chunk "defclass-02" 2305041 4 #'run-ansi-defclass-02-chunk-4)
-  (%try-chunk "defclass-02" 2305041 5 #'run-ansi-defclass-02-chunk-5)
-  (%try-chunk "defclass-02" 2305041 6 #'run-ansi-defclass-02-chunk-6)
+  (%try-chunk "defclass-02" 11955217 1 #'run-ansi-defclass-02-chunk-1)
+  (%try-chunk "defclass-02" 11955217 2 #'run-ansi-defclass-02-chunk-2)
+  (%try-chunk "defclass-02" 11955217 3 #'run-ansi-defclass-02-chunk-3)
+  (%try-chunk "defclass-02" 11955217 4 #'run-ansi-defclass-02-chunk-4)
+  (%try-chunk "defclass-02" 11955217 5 #'run-ansi-defclass-02-chunk-5)
+  (%try-chunk "defclass-02" 11955217 6 #'run-ansi-defclass-02-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === defclass-03.lsp ===
+(in-package :modus.mvm)
 (DEFUN A-SLOT (OBJ) (SLOT-VALUE OBJ 'A))
 (defun run-init-defclass-03 ()
   (handler-case (%DEFCLASS 'CLASS-0301A '(A B) 'NIL) (t (c) nil))
@@ -162490,11 +164624,14 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'CLASS-0306H 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'CLASS-0306H (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'CLASS-0306H NIL) (t (c) nil))
-  (%try-chunk "defclass-03" 2304952 1 #'run-ansi-defclass-03-chunk-1)
-  (%try-chunk "defclass-03" 2304952 2 #'run-ansi-defclass-03-chunk-2)
+  (%try-chunk "defclass-03" 5352376 1 #'run-ansi-defclass-03-chunk-1)
+  (%try-chunk "defclass-03" 5352376 2 #'run-ansi-defclass-03-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defclass-errors.lsp ===
+(in-package :modus.mvm)
 (defun run-init-defclass-errors ()
   nil
 )
@@ -162701,12 +164838,15 @@ NIL
                                  COLLECT (LIST CL NAME))) 'NIL) (t (c) (%test-crash-fail-c 27075 c)))
 )
 (defun run-ansi-defclass-errors ()
-  (%try-chunk "defclass-errors" 7159384 1 #'run-ansi-defclass-errors-chunk-1)
-  (%try-chunk "defclass-errors" 7159384 2 #'run-ansi-defclass-errors-chunk-2)
-  (%try-chunk "defclass-errors" 7159384 3 #'run-ansi-defclass-errors-chunk-3)
+  (%try-chunk "defclass-errors" 14958168 1 #'run-ansi-defclass-errors-chunk-1)
+  (%try-chunk "defclass-errors" 14958168 2 #'run-ansi-defclass-errors-chunk-2)
+  (%try-chunk "defclass-errors" 14958168 3 #'run-ansi-defclass-errors-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === defclass-forward-reference.lsp ===
+(in-package :modus.mvm)
 (defun run-init-defclass-forward-reference ()
   nil
 )
@@ -163079,10 +165219,13 @@ NIL
                                 (ERROR NIL :GOOD))))) ':GOOD) (t (c) (%test-crash-fail-c 27079 c)))
 )
 (defun run-ansi-defclass-forward-reference ()
-  (%try-chunk "defclass-forward-reference" 3061558 1 #'run-ansi-defclass-forward-reference-chunk-1)
+  (%try-chunk "defclass-forward-reference" 13711158 1 #'run-ansi-defclass-forward-reference-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === defclass.lsp ===
+(in-package :modus.mvm)
 (DEFCLASS-WITH-TESTS DEFCLASS-1 NIL NIL)
 (DEFCLASS-WITH-TESTS DEFCLASS-2 NIL (SLOT1 SLOT2 SLOT3))
 (DEFCLASS-WITH-TESTS DEFCLASS-3 (DEFCLASS-1) NIL)
@@ -163094,7 +165237,10 @@ NIL
 (defun run-ansi-defclass ()
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-and.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.AND.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.AND.1 %GF-ARGS))
@@ -163915,11 +166061,14 @@ NIL
                              (HANDLER-CASE (FUNCALL FN 'X) (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27091 c)))
 )
 (defun run-ansi-defgeneric-method-combination-and ()
-  (%try-chunk "defgeneric-method-combination-and" 16453273 1 #'run-ansi-defgeneric-method-combination-and-chunk-1)
-  (%try-chunk "defgeneric-method-combination-and" 16453273 2 #'run-ansi-defgeneric-method-combination-and-chunk-2)
+  (%try-chunk "defgeneric-method-combination-and" 10342041 1 #'run-ansi-defgeneric-method-combination-and-chunk-1)
+  (%try-chunk "defgeneric-method-combination-and" 10342041 2 #'run-ansi-defgeneric-method-combination-and-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-append.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.APPEND.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.APPEND.1 %GF-ARGS))
@@ -164968,11 +167117,14 @@ NIL
                                                                                  :CAUGHT)) (t (c) (%test-crash-fail-c 27104 c)))
 )
 (defun run-ansi-defgeneric-method-combination-append ()
-  (%try-chunk "defgeneric-method-combination-append" 420428 1 #'run-ansi-defgeneric-method-combination-append-chunk-1)
-  (%try-chunk "defgeneric-method-combination-append" 420428 2 #'run-ansi-defgeneric-method-combination-append-chunk-2)
+  (%try-chunk "defgeneric-method-combination-append" 11709004 1 #'run-ansi-defgeneric-method-combination-append-chunk-1)
+  (%try-chunk "defgeneric-method-combination-append" 11709004 2 #'run-ansi-defgeneric-method-combination-append-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-aux.lsp ===
+(in-package :modus.mvm)
 (defun run-init-defgeneric-method-combination-aux ()
   (handler-case (%DEFCLASS 'DGMC-CLASS-01 'NIL 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'DGMC-CLASS-01 (LIST) (LIST)) (t (c) nil))
@@ -165062,7 +167214,10 @@ NIL
   (handler-case (FIND-CLASS 'DGMC-CLASS-07 NIL) (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-list.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.LIST.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.LIST.1 %GF-ARGS))
@@ -165959,11 +168114,14 @@ NIL
                                            (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27116 c)))
 )
 (defun run-ansi-defgeneric-method-combination-list ()
-  (%try-chunk "defgeneric-method-combination-list" 14298448 1 #'run-ansi-defgeneric-method-combination-list-chunk-1)
-  (%try-chunk "defgeneric-method-combination-list" 14298448 2 #'run-ansi-defgeneric-method-combination-list-chunk-2)
+  (%try-chunk "defgeneric-method-combination-list" 16690512 1 #'run-ansi-defgeneric-method-combination-list-chunk-1)
+  (%try-chunk "defgeneric-method-combination-list" 16690512 2 #'run-ansi-defgeneric-method-combination-list-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-max.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.MAX.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.MAX.1 %GF-ARGS))
@@ -166793,11 +168951,14 @@ NIL
                              (HANDLER-CASE (FUNCALL FN 'A) (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27128 c)))
 )
 (defun run-ansi-defgeneric-method-combination-max ()
-  (%try-chunk "defgeneric-method-combination-max" 13535942 1 #'run-ansi-defgeneric-method-combination-max-chunk-1)
-  (%try-chunk "defgeneric-method-combination-max" 13535942 2 #'run-ansi-defgeneric-method-combination-max-chunk-2)
+  (%try-chunk "defgeneric-method-combination-max" 3934918 1 #'run-ansi-defgeneric-method-combination-max-chunk-1)
+  (%try-chunk "defgeneric-method-combination-max" 3934918 2 #'run-ansi-defgeneric-method-combination-max-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-min.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.MIN.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.MIN.1 %GF-ARGS))
@@ -167627,11 +169788,14 @@ NIL
                              (HANDLER-CASE (FUNCALL FN 'A) (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27140 c)))
 )
 (defun run-ansi-defgeneric-method-combination-min ()
-  (%try-chunk "defgeneric-method-combination-min" 13483432 1 #'run-ansi-defgeneric-method-combination-min-chunk-1)
-  (%try-chunk "defgeneric-method-combination-min" 13483432 2 #'run-ansi-defgeneric-method-combination-min-chunk-2)
+  (%try-chunk "defgeneric-method-combination-min" 6733224 1 #'run-ansi-defgeneric-method-combination-min-chunk-1)
+  (%try-chunk "defgeneric-method-combination-min" 6733224 2 #'run-ansi-defgeneric-method-combination-min-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-nconc.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.NCONC.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.NCONC.1 %GF-ARGS))
@@ -168580,11 +170744,14 @@ NIL
                                            (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27152 c)))
 )
 (defun run-ansi-defgeneric-method-combination-nconc ()
-  (%try-chunk "defgeneric-method-combination-nconc" 3755269 1 #'run-ansi-defgeneric-method-combination-nconc-chunk-1)
-  (%try-chunk "defgeneric-method-combination-nconc" 3755269 2 #'run-ansi-defgeneric-method-combination-nconc-chunk-2)
+  (%try-chunk "defgeneric-method-combination-nconc" 2182405 1 #'run-ansi-defgeneric-method-combination-nconc-chunk-1)
+  (%try-chunk "defgeneric-method-combination-nconc" 2182405 2 #'run-ansi-defgeneric-method-combination-nconc-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-or.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.OR.1 (&REST %GF-ARGS) (%GF-DISPATCH 'DG-MC.FUN.OR.1 %GF-ARGS))
 (DEFUN DG-MC.FUN.OR.2 (&REST %GF-ARGS) (%GF-DISPATCH 'DG-MC.FUN.OR.2 %GF-ARGS))
@@ -169400,11 +171567,14 @@ NIL
                              (HANDLER-CASE (FUNCALL FN 'A) (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27164 c)))
 )
 (defun run-ansi-defgeneric-method-combination-or ()
-  (%try-chunk "defgeneric-method-combination-or" 3354023 1 #'run-ansi-defgeneric-method-combination-or-chunk-1)
-  (%try-chunk "defgeneric-method-combination-or" 3354023 2 #'run-ansi-defgeneric-method-combination-or-chunk-2)
+  (%try-chunk "defgeneric-method-combination-or" 16575911 1 #'run-ansi-defgeneric-method-combination-or-chunk-1)
+  (%try-chunk "defgeneric-method-combination-or" 16575911 2 #'run-ansi-defgeneric-method-combination-or-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-plus.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.PLUS.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.PLUS.1 %GF-ARGS))
@@ -170225,11 +172395,14 @@ NIL
                              (HANDLER-CASE (FUNCALL FN 'A) (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27176 c)))
 )
 (defun run-ansi-defgeneric-method-combination-plus ()
-  (%try-chunk "defgeneric-method-combination-plus" 2104936 1 #'run-ansi-defgeneric-method-combination-plus-chunk-1)
-  (%try-chunk "defgeneric-method-combination-plus" 2104936 2 #'run-ansi-defgeneric-method-combination-plus-chunk-2)
+  (%try-chunk "defgeneric-method-combination-plus" 11312744 1 #'run-ansi-defgeneric-method-combination-plus-chunk-1)
+  (%try-chunk "defgeneric-method-combination-plus" 11312744 2 #'run-ansi-defgeneric-method-combination-plus-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric-method-combination-progn.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "defgeneric-method-combination-aux.lsp")
 (DEFUN DG-MC.FUN.PROGN.1 (&REST %GF-ARGS)
   (%GF-DISPATCH 'DG-MC.FUN.PROGN.1 %GF-ARGS))
@@ -171479,11 +173652,14 @@ NIL
                              (HANDLER-CASE (FUNCALL FN 'B) (ERROR NIL :ERROR)))) ':ERROR) (t (c) (%test-crash-fail-c 27192 c)))
 )
 (defun run-ansi-defgeneric-method-combination-progn ()
-  (%try-chunk "defgeneric-method-combination-progn" 14237878 1 #'run-ansi-defgeneric-method-combination-progn-chunk-1)
-  (%try-chunk "defgeneric-method-combination-progn" 14237878 2 #'run-ansi-defgeneric-method-combination-progn-chunk-2)
+  (%try-chunk "defgeneric-method-combination-progn" 9044150 1 #'run-ansi-defgeneric-method-combination-progn-chunk-1)
+  (%try-chunk "defgeneric-method-combination-progn" 9044150 2 #'run-ansi-defgeneric-method-combination-progn-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defgeneric.lsp ===
+(in-package :modus.mvm)
 (DEFUN DEFGENERIC-TESTFN-01 (X) X)
 (DEFMACRO DEFGENERIC-TESTMACRO-02 (X) X)
 (DEFUN DEFGENERIC-ERROR-FN.4 (&REST %GF-ARGS)
@@ -174340,16 +176516,19 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'DEFGENERIC.29.CLASS.3 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'DEFGENERIC.29.CLASS.3 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'DEFGENERIC.29.CLASS.3 NIL) (t (c) nil))
-  (%try-chunk "defgeneric" 10396849 1 #'run-ansi-defgeneric-chunk-1)
-  (%try-chunk "defgeneric" 10396849 2 #'run-ansi-defgeneric-chunk-2)
-  (%try-chunk "defgeneric" 10396849 3 #'run-ansi-defgeneric-chunk-3)
-  (%try-chunk "defgeneric" 10396849 4 #'run-ansi-defgeneric-chunk-4)
-  (%try-chunk "defgeneric" 10396849 5 #'run-ansi-defgeneric-chunk-5)
-  (%try-chunk "defgeneric" 10396849 6 #'run-ansi-defgeneric-chunk-6)
-  (%try-chunk "defgeneric" 10396849 7 #'run-ansi-defgeneric-chunk-7)
+  (%try-chunk "defgeneric" 1598641 1 #'run-ansi-defgeneric-chunk-1)
+  (%try-chunk "defgeneric" 1598641 2 #'run-ansi-defgeneric-chunk-2)
+  (%try-chunk "defgeneric" 1598641 3 #'run-ansi-defgeneric-chunk-3)
+  (%try-chunk "defgeneric" 1598641 4 #'run-ansi-defgeneric-chunk-4)
+  (%try-chunk "defgeneric" 1598641 5 #'run-ansi-defgeneric-chunk-5)
+  (%try-chunk "defgeneric" 1598641 6 #'run-ansi-defgeneric-chunk-6)
+  (%try-chunk "defgeneric" 1598641 7 #'run-ansi-defgeneric-chunk-7)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-method-combination-long-form.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *DMC-LONG-01*
   (%DEFINE-METHOD-COMBINATION-LONG 'MC-LONG-01
    #'(LAMBDA (%DMC-APPLICABLE %DMC-CARGS)
@@ -175279,13 +177458,16 @@ NIL
   (handler-case (%DEFGENERIC 'DMC-LONG-GF-10 '(X Y) '(MC-LONG-10 1 2 3 4)) (t (c) nil))
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'DMC-LONG-GF-10 'DMC-LONG-GF-10) (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'DMC-LONG-GF-10) (t (c) nil))
-  (%try-chunk "define-method-combination-long-form" 2482312 1 #'run-ansi-define-method-combination-long-form-chunk-1)
-  (%try-chunk "define-method-combination-long-form" 2482312 2 #'run-ansi-define-method-combination-long-form-chunk-2)
-  (%try-chunk "define-method-combination-long-form" 2482312 3 #'run-ansi-define-method-combination-long-form-chunk-3)
-  (%try-chunk "define-method-combination-long-form" 2482312 4 #'run-ansi-define-method-combination-long-form-chunk-4)
+  (%try-chunk "define-method-combination-long-form" 8396936 1 #'run-ansi-define-method-combination-long-form-chunk-1)
+  (%try-chunk "define-method-combination-long-form" 8396936 2 #'run-ansi-define-method-combination-long-form-chunk-2)
+  (%try-chunk "define-method-combination-long-form" 8396936 3 #'run-ansi-define-method-combination-long-form-chunk-3)
+  (%try-chunk "define-method-combination-long-form" 8396936 4 #'run-ansi-define-method-combination-long-form-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === define-method-combination.lsp ===
+(in-package :modus.mvm)
 (DEFVAR *DMC-TIMES* (%DEFINE-METHOD-COMBINATION 'TIMES '* NIL))
 (DEFUN DMC-GF-01 (&REST %GF-ARGS) (%GF-DISPATCH 'DMC-GF-01 %GF-ARGS))
 (DEFUN DMC-GF-02 (&REST %GF-ARGS) (%GF-DISPATCH 'DMC-GF-02 %GF-ARGS))
@@ -175591,11 +177773,14 @@ NIL
   (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'REAL) (LAMBDA (X) 5)) (t (c) nil))
   (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'NUMBER) (LAMBDA (X) 7)) (t (c) nil))
   (handler-case (%DEFMETHOD 'DMC-GF-07 'TIMES (LIST 'COMPLEX) (LAMBDA (X) 11)) (t (c) nil))
-  (%try-chunk "define-method-combination" 13110796 1 #'run-ansi-define-method-combination-chunk-1)
-  (%try-chunk "define-method-combination" 13110796 2 #'run-ansi-define-method-combination-chunk-2)
+  (%try-chunk "define-method-combination" 16354828 1 #'run-ansi-define-method-combination-chunk-1)
+  (%try-chunk "define-method-combination" 16354828 2 #'run-ansi-define-method-combination-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === defmethod.lsp ===
+(in-package :modus.mvm)
 (defun run-init-defmethod ()
   nil
 )
@@ -176056,13 +178241,16 @@ NIL
                                                                                T)) (t (c) (%test-crash-fail-c 27314 c)))
 )
 (defun run-ansi-defmethod ()
-  (%try-chunk "defmethod" 12376391 1 #'run-ansi-defmethod-chunk-1)
-  (%try-chunk "defmethod" 12376391 2 #'run-ansi-defmethod-chunk-2)
-  (%try-chunk "defmethod" 12376391 3 #'run-ansi-defmethod-chunk-3)
-  (%try-chunk "defmethod" 12376391 4 #'run-ansi-defmethod-chunk-4)
+  (%try-chunk "defmethod" 12671303 1 #'run-ansi-defmethod-chunk-1)
+  (%try-chunk "defmethod" 12671303 2 #'run-ansi-defmethod-chunk-2)
+  (%try-chunk "defmethod" 12671303 3 #'run-ansi-defmethod-chunk-3)
+  (%try-chunk "defmethod" 12671303 4 #'run-ansi-defmethod-chunk-4)
 )
 
+(in-package :modus.mvm)
+
 ;; === ensure-generic-function.lsp ===
+(in-package :modus.mvm)
 (defun run-init-ensure-generic-function ()
   nil
 )
@@ -176406,11 +178594,14 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27330 c)))
 )
 (defun run-ansi-ensure-generic-function ()
-  (%try-chunk "ensure-generic-function" 1232990 1 #'run-ansi-ensure-generic-function-chunk-1)
-  (%try-chunk "ensure-generic-function" 1232990 2 #'run-ansi-ensure-generic-function-chunk-2)
+  (%try-chunk "ensure-generic-function" 16158814 1 #'run-ansi-ensure-generic-function-chunk-1)
+  (%try-chunk "ensure-generic-function" 16158814 2 #'run-ansi-ensure-generic-function-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-class.lsp ===
+(in-package :modus.mvm)
 (DEFUN FIND-CLASS-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'FIND-CLASS-GF-01 %GF-ARGS))
 (DEFUN FIND-CLASS-GF-02 (&REST %GF-ARGS)
@@ -177009,12 +179200,15 @@ NIL
                             (ERROR (C) T))) 'T) (t (c) (%test-crash-fail-c 27355 c)))
 )
 (defun run-ansi-find-class ()
-  (%try-chunk "find-class" 8677561 1 #'run-ansi-find-class-chunk-1)
-  (%try-chunk "find-class" 8677561 2 #'run-ansi-find-class-chunk-2)
-  (%try-chunk "find-class" 8677561 3 #'run-ansi-find-class-chunk-3)
+  (%try-chunk "find-class" 11790521 1 #'run-ansi-find-class-chunk-1)
+  (%try-chunk "find-class" 11790521 2 #'run-ansi-find-class-chunk-2)
+  (%try-chunk "find-class" 11790521 3 #'run-ansi-find-class-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === find-method.lsp ===
+(in-package :modus.mvm)
 (DEFUN FIND-METHOD-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'FIND-METHOD-GF-01 %GF-ARGS))
 (DEFPARAMETER *FIND-METHOD-GF-01-METHOD1*
@@ -177166,12 +179360,15 @@ NIL
                                    (LIST
                                     (LIST 'EQL *FIND-METHOD-02-METHOD2-VALUE*))
                                    (LAMBDA (X) 'B))) (t (c) nil))
-  (%try-chunk "find-method" 5102144 1 #'run-ansi-find-method-chunk-1)
-  (%try-chunk "find-method" 5102144 2 #'run-ansi-find-method-chunk-2)
-  (%try-chunk "find-method" 5102144 3 #'run-ansi-find-method-chunk-3)
+  (%try-chunk "find-method" 15211072 1 #'run-ansi-find-method-chunk-1)
+  (%try-chunk "find-method" 15211072 2 #'run-ansi-find-method-chunk-2)
+  (%try-chunk "find-method" 15211072 3 #'run-ansi-find-method-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === load.lsp ===
+(in-package :modus.mvm)
 (COMPILE-AND-LOAD "ANSI-TESTS:AUX;defclass-aux.lsp")
 (IN-PACKAGE "CL-TEST")
 (LET ((*DEFAULT-PATHNAME-DEFAULTS*
@@ -177234,7 +179431,10 @@ NIL
   (handler-case (IN-PACKAGE "CL-TEST") (t (c) nil))
 )
 
+(in-package :modus.mvm)
+
 ;; === make-instance.lsp ===
+(in-package :modus.mvm)
 (%DEFMETHOD 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
  (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS))
 (defun run-init-make-instance ()
@@ -177510,11 +179710,14 @@ NIL
   (handler-case (FIND-CLASS 'MAKE-INSTANCE-CLASS-01 NIL) (t (c) nil))
   (handler-case (%DEFMETHOD 'MAKE-INSTANCE 'NIL (LIST 'MAKE-INSTANCE-CLASS-01)
  (LAMBDA (X &REST INITARGS &KEY &ALLOW-OTHER-KEYS) INITARGS)) (t (c) nil))
-  (%try-chunk "make-instance" 2906881 1 #'run-ansi-make-instance-chunk-1)
-  (%try-chunk "make-instance" 2906881 2 #'run-ansi-make-instance-chunk-2)
+  (%try-chunk "make-instance" 12606209 1 #'run-ansi-make-instance-chunk-1)
+  (%try-chunk "make-instance" 12606209 2 #'run-ansi-make-instance-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-instances-obsolete.lsp ===
+(in-package :modus.mvm)
 (defun run-init-make-instances-obsolete ()
   (handler-case (%DEFCLASS 'MAKE-INSTANCES-OBSOLETE-CLASS-01 '(A B C D) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'MAKE-INSTANCES-OBSOLETE-CLASS-01
@@ -177645,10 +179848,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'MAKE-INSTANCES-OBSOLETE-CLASS-01 '(B)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MAKE-INSTANCES-OBSOLETE-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MAKE-INSTANCES-OBSOLETE-CLASS-01 NIL) (t (c) nil))
-  (%try-chunk "make-instances-obsolete" 14764518 1 #'run-ansi-make-instances-obsolete-chunk-1)
+  (%try-chunk "make-instances-obsolete" 13928934 1 #'run-ansi-make-instances-obsolete-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-load-form-saving-slots.lsp ===
+(in-package :modus.mvm)
 (DEFSTRUCT MLFSS-01 A B C)
 (%DEFPACKAGE-IMPL "CL-TEST-MLFSS-PACKAGE" '((:USE) (:EXPORT #:A)))
 (DEFSTRUCT MLFSS-03 CL-TEST-MLFSS-PACKAGE:A)
@@ -178161,11 +180367,14 @@ NIL
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'MLFSS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'MLFSS-02 NIL) (t (c) nil))
   (handler-case (%DEFPACKAGE-IMPL "CL-TEST-MLFSS-PACKAGE" '((:USE) (:EXPORT #:A))) (t (c) nil))
-  (%try-chunk "make-load-form-saving-slots" 16184734 1 #'run-ansi-make-load-form-saving-slots-chunk-1)
-  (%try-chunk "make-load-form-saving-slots" 16184734 2 #'run-ansi-make-load-form-saving-slots-chunk-2)
+  (%try-chunk "make-load-form-saving-slots" 14431646 1 #'run-ansi-make-load-form-saving-slots-chunk-1)
+  (%try-chunk "make-load-form-saving-slots" 14431646 2 #'run-ansi-make-load-form-saving-slots-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === make-load-form.lsp ===
+(in-package :modus.mvm)
 (DEFSTRUCT MAKE-LOAD-FORM-STRUCT-02 A B C)
 (DEFINE-CONDITION MAKE-LOAD-FORM-CONDITION-03
     NIL
@@ -178474,11 +180683,14 @@ NIL
                 COLLECT `(SETF (SLOT-VALUE ,NEWOBJ ',SLOT-NAME)
                                  ',(SLOT-VALUE OBJ SLOT-NAME)))
         ,NEWOBJ)))) (t (c) nil))
-  (%try-chunk "make-load-form" 2635581 1 #'run-ansi-make-load-form-chunk-1)
-  (%try-chunk "make-load-form" 2635581 2 #'run-ansi-make-load-form-chunk-2)
+  (%try-chunk "make-load-form" 9369405 1 #'run-ansi-make-load-form-chunk-1)
+  (%try-chunk "make-load-form" 9369405 2 #'run-ansi-make-load-form-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === method-qualifiers.lsp ===
+(in-package :modus.mvm)
 (DEFUN MQ-GENERIC-FUNCTION (&REST %GF-ARGS)
   (%GF-DISPATCH 'MQ-GENERIC-FUNCTION %GF-ARGS))
 (DEFPARAMETER *MQ-METHOD-1*
@@ -178568,10 +180780,13 @@ NIL
   (handler-case (FIND-CLASS 'MQ-CLASS-03 NIL) (t (c) nil))
   (handler-case (setq *MQ-METHOD-4* (%DEFMETHOD 'MQ-GENERIC-FUNCTION ':AROUND
                      (LIST 'MQ-CLASS-03) (LAMBDA (X) 'FOO))) (t (c) nil))
-  (%try-chunk "method-qualifiers" 5789150 1 #'run-ansi-method-qualifiers-chunk-1)
+  (%try-chunk "method-qualifiers" 9606622 1 #'run-ansi-method-qualifiers-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === next-method-p.lsp ===
+(in-package :modus.mvm)
 (DEFUN NMP-GF-01 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-01 %GF-ARGS))
 (DEFUN NMP-GF-02 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-02 %GF-ARGS))
 (DEFUN NMP-GF-03 (&REST %GF-ARGS) (%GF-DISPATCH 'NMP-GF-03 %GF-ARGS))
@@ -178697,11 +180912,14 @@ NIL
   (handler-case (%DEFMETHOD 'NMP-GF-05 ':AROUND (LIST 'NUMBER)
  (LAMBDA (X) (NOTNOT-MV (NEXT-METHOD-P)))) (t (c) nil))
   (handler-case (%DEFMETHOD 'NMP-GF-05 'NIL (LIST 'INTEGER) (LAMBDA (X) 'FOO)) (t (c) nil))
-  (%try-chunk "next-method-p" 844495 1 #'run-ansi-next-method-p-chunk-1)
-  (%try-chunk "next-method-p" 844495 2 #'run-ansi-next-method-p-chunk-2)
+  (%try-chunk "next-method-p" 8970959 1 #'run-ansi-next-method-p-chunk-1)
+  (%try-chunk "next-method-p" 8970959 2 #'run-ansi-next-method-p-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === no-applicable-method.lsp ===
+(in-package :modus.mvm)
 (DEFUN NO-APP-METH-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'NO-APP-METH-GF-01 %GF-ARGS))
 (defun run-init-no-applicable-method ()
@@ -178721,10 +180939,13 @@ NIL
   (handler-case (HANDLER-CASE (%REGISTER-GF-FN #'NO-APP-METH-GF-01 'NO-APP-METH-GF-01)
               (T (C) NIL)) (t (c) nil))
   (handler-case (%DG-GF-CALLABLE 'NO-APP-METH-GF-01) (t (c) nil))
-  (%try-chunk "no-applicable-method" 13343884 1 #'run-ansi-no-applicable-method-chunk-1)
+  (%try-chunk "no-applicable-method" 13606028 1 #'run-ansi-no-applicable-method-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === no-next-method.lsp ===
+(in-package :modus.mvm)
 (DEFUN NO-NEXT-METH-GF-01 (&REST %GF-ARGS)
   (%GF-DISPATCH 'NO-NEXT-METH-GF-01 %GF-ARGS))
 (%DEFMETHOD 'NO-NEXT-METH-GF-01 'NIL (LIST 'INTEGER)
@@ -178758,10 +180979,13 @@ NIL
  (LAMBDA (X) (CALL-NEXT-METHOD))) (t (c) nil))
   (handler-case (%DEFMETHOD 'NO-NEXT-METH-GF-01 ':AROUND (LIST 'CHARACTER)
  (LAMBDA (X) (CALL-NEXT-METHOD))) (t (c) nil))
-  (%try-chunk "no-next-method" 1915246 1 #'run-ansi-no-next-method-chunk-1)
+  (%try-chunk "no-next-method" 11647342 1 #'run-ansi-no-next-method-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === reinitialize-instance.lsp ===
+(in-package :modus.mvm)
 (%DEFMETHOD 'REINITIALIZE-INSTANCE ':AFTER (LIST 'REINIT-CLASS-01)
  (LAMBDA (INSTANCE &REST INITARGS &KEY (X NIL X-P))
    (DECLARE (IGNORE INITARGS))
@@ -179126,11 +181350,14 @@ NIL
    (DECLARE (IGNORE INITARGS))
    (WHEN X-P (SET-SLOT-VALUE INSTANCE 'A X))
    INSTANCE)) (t (c) nil))
-  (%try-chunk "reinitialize-instance" 12961188 1 #'run-ansi-reinitialize-instance-chunk-1)
-  (%try-chunk "reinitialize-instance" 12961188 2 #'run-ansi-reinitialize-instance-chunk-2)
+  (%try-chunk "reinitialize-instance" 3638692 1 #'run-ansi-reinitialize-instance-chunk-1)
+  (%try-chunk "reinitialize-instance" 3638692 2 #'run-ansi-reinitialize-instance-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === remove-method.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *REMOVE-METH-GF-01*
   (PROGN
    (%VALIDATE-DEFGENERIC-OPTIONS 'REMOVE-METH-GF-01 '(X) 'NIL)
@@ -179679,11 +181906,14 @@ NIL
   (handler-case (setq *REMOVE-METH-GF-03-METHOD-T* (%DEFMETHOD 'REMOVE-METH-GF-03 'NIL
                                     (LIST 'T)
                                     (LAMBDA (X) (LIST *RMGF-03-VAR* X)))) (t (c) nil))
-  (%try-chunk "remove-method" 10950699 1 #'run-ansi-remove-method-chunk-1)
-  (%try-chunk "remove-method" 10950699 2 #'run-ansi-remove-method-chunk-2)
+  (%try-chunk "remove-method" 11819051 1 #'run-ansi-remove-method-chunk-1)
+  (%try-chunk "remove-method" 11819051 2 #'run-ansi-remove-method-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === shared-initialize.lsp ===
+(in-package :modus.mvm)
 (DEFSTRUCT SHARED-INIT-CLASS-03 A B C)
 (%DEFMETHOD 'SHARED-INITIALIZE 'NIL (LIST 'SHARED-INIT-CLASS-03 'T)
  (LAMBDA
@@ -180979,15 +183209,18 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SHARED-INIT-CLASS-09 '(A)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SHARED-INIT-CLASS-09 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SHARED-INIT-CLASS-09 NIL) (t (c) nil))
-  (%try-chunk "shared-initialize" 5563411 1 #'run-ansi-shared-initialize-chunk-1)
-  (%try-chunk "shared-initialize" 5563411 2 #'run-ansi-shared-initialize-chunk-2)
-  (%try-chunk "shared-initialize" 5563411 3 #'run-ansi-shared-initialize-chunk-3)
-  (%try-chunk "shared-initialize" 5563411 4 #'run-ansi-shared-initialize-chunk-4)
-  (%try-chunk "shared-initialize" 5563411 5 #'run-ansi-shared-initialize-chunk-5)
-  (%try-chunk "shared-initialize" 5563411 6 #'run-ansi-shared-initialize-chunk-6)
+  (%try-chunk "shared-initialize" 13919251 1 #'run-ansi-shared-initialize-chunk-1)
+  (%try-chunk "shared-initialize" 13919251 2 #'run-ansi-shared-initialize-chunk-2)
+  (%try-chunk "shared-initialize" 13919251 3 #'run-ansi-shared-initialize-chunk-3)
+  (%try-chunk "shared-initialize" 13919251 4 #'run-ansi-shared-initialize-chunk-4)
+  (%try-chunk "shared-initialize" 13919251 5 #'run-ansi-shared-initialize-chunk-5)
+  (%try-chunk "shared-initialize" 13919251 6 #'run-ansi-shared-initialize-chunk-6)
 )
 
+(in-package :modus.mvm)
+
 ;; === slot-boundp.lsp ===
+(in-package :modus.mvm)
 (defun run-init-slot-boundp ()
   (handler-case (%DEFCLASS 'SLOT-BOUNDP-CLASS-01 '(A B C) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SLOT-BOUNDP-CLASS-01 (LIST (CONS ':B 'B))
@@ -181152,11 +183385,14 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SLOT-BOUNDP-CLASS-01 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SLOT-BOUNDP-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SLOT-BOUNDP-CLASS-01 NIL) (t (c) nil))
-  (%try-chunk "slot-boundp" 6034988 1 #'run-ansi-slot-boundp-chunk-1)
-  (%try-chunk "slot-boundp" 6034988 2 #'run-ansi-slot-boundp-chunk-2)
+  (%try-chunk "slot-boundp" 5969452 1 #'run-ansi-slot-boundp-chunk-1)
+  (%try-chunk "slot-boundp" 5969452 2 #'run-ansi-slot-boundp-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === slot-exists-p.lsp ===
+(in-package :modus.mvm)
 (DEFSTRUCT SLOT-EXISTS-P-STRUCT-01 A B C)
 (DEFSTRUCT (SLOT-EXISTS-P-STRUCT-02 (:INCLUDE SLOT-EXISTS-P-STRUCT-01)) D E)
 (DEFINE-CONDITION SLOT-EXISTS-P-CONDITION-01
@@ -181399,12 +183635,15 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SLOT-EXISTS-P-CLASS-03C 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SLOT-EXISTS-P-CLASS-03C (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SLOT-EXISTS-P-CLASS-03C NIL) (t (c) nil))
-  (%try-chunk "slot-exists-p" 5425083 1 #'run-ansi-slot-exists-p-chunk-1)
-  (%try-chunk "slot-exists-p" 5425083 2 #'run-ansi-slot-exists-p-chunk-2)
-  (%try-chunk "slot-exists-p" 5425083 3 #'run-ansi-slot-exists-p-chunk-3)
+  (%try-chunk "slot-exists-p" 2639803 1 #'run-ansi-slot-exists-p-chunk-1)
+  (%try-chunk "slot-exists-p" 2639803 2 #'run-ansi-slot-exists-p-chunk-2)
+  (%try-chunk "slot-exists-p" 2639803 3 #'run-ansi-slot-exists-p-chunk-3)
 )
 
+(in-package :modus.mvm)
+
 ;; === slot-makunbound.lsp ===
+(in-package :modus.mvm)
 (defun run-init-slot-makunbound ()
   (handler-case (%DEFCLASS 'SLOT-MAKUNBOUND-CLASS-01 '(A B C D E F) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'SLOT-MAKUNBOUND-CLASS-01 (LIST) (LIST)) (t (c) nil))
@@ -181544,10 +183783,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'SLOT-MAKUNBOUND-CLASS-01 '(C)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SLOT-MAKUNBOUND-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SLOT-MAKUNBOUND-CLASS-01 NIL) (t (c) nil))
-  (%try-chunk "slot-makunbound" 5417600 1 #'run-ansi-slot-makunbound-chunk-1)
+  (%try-chunk "slot-makunbound" 928384 1 #'run-ansi-slot-makunbound-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === slot-missing.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *SLOT-MISSING-CLASS-01-VAR* NIL)
 (DEFUN %SLOT-MISSING-METHOD-1
        (CLASS OBJ SLOT-NAME OPERATION NEW-VALUE NEW-VALUE-P)
@@ -181722,10 +183964,13 @@ NIL
  ':ANY) (t (c) nil))
   (handler-case (%ADD-SLOT-MISSING-METHOD 'SLOT-MISSING-CLASS-01 #'%SLOT-MISSING-METHOD-2
  '(NOT-THERE) '(SLOT-BOUNDP)) (t (c) nil))
-  (%try-chunk "slot-missing" 3826514 1 #'run-ansi-slot-missing-chunk-1)
+  (%try-chunk "slot-missing" 13968210 1 #'run-ansi-slot-missing-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === slot-unbound.lsp ===
+(in-package :modus.mvm)
 (DEFUN SUNB-A (OBJ) (SLOT-VALUE OBJ 'A))
 (DEFUN SUNB-B (OBJ) (SLOT-VALUE OBJ 'B))
 (DEFUN SET-SUNB-B (OBJ NV) (SET-SLOT-VALUE OBJ 'B NV))
@@ -181850,10 +184095,13 @@ NIL
   (handler-case (%ADD-SLOT-UNBOUND-METHOD 'SLOT-UNBOUND-CLASS-01 NIL #'%SLOT-UNBOUND-METHOD-3) (t (c) nil))
   (handler-case (%ADD-SLOT-UNBOUND-METHOD 'SLOT-UNBOUND-CLASS-01 'E #'%SLOT-UNBOUND-METHOD-4) (t (c) nil))
   (handler-case (%ADD-SLOT-UNBOUND-METHOD 'SLOT-UNBOUND-CLASS-01 'F #'%SLOT-UNBOUND-METHOD-5) (t (c) nil))
-  (%try-chunk "slot-unbound" 14652447 1 #'run-ansi-slot-unbound-chunk-1)
+  (%try-chunk "slot-unbound" 13718559 1 #'run-ansi-slot-unbound-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === slot-value.lsp ===
+(in-package :modus.mvm)
 (DEFPARAMETER *SLOT-VALUE-TEST-SLOT-NAMES* '(A B C D E F G H I J K L M N O))
 (DEFPARAMETER *SLOT-VALUE-TEST-SLOT-VALUES*
   '(T NIL 10 4.0 A 1.0 2.0 3.0d0 4.0d0 5/4 2/3 (A . B) "abcd" #(1 2 3 4) 1))
@@ -182065,11 +184313,14 @@ NIL
  '(A B C D E F G H I J K L M N O)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'SLOT-VALUE-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'SLOT-VALUE-CLASS-02 NIL) (t (c) nil))
-  (%try-chunk "slot-value" 11513733 1 #'run-ansi-slot-value-chunk-1)
-  (%try-chunk "slot-value" 11513733 2 #'run-ansi-slot-value-chunk-2)
+  (%try-chunk "slot-value" 7040901 1 #'run-ansi-slot-value-chunk-1)
+  (%try-chunk "slot-value" 7040901 2 #'run-ansi-slot-value-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === unbound-slot.lsp ===
+(in-package :modus.mvm)
 (defun run-init-unbound-slot ()
   (handler-case (%DEFCLASS 'UBS-CLASS-01 '(A) 'NIL) (t (c) nil))
   (handler-case (%REGISTER-CLOS-SLOT-INFO 'UBS-CLASS-01 (LIST (CONS ':A 'A)) (LIST)) (t (c) nil))
@@ -182151,10 +184402,13 @@ NIL
   (handler-case (%REGISTER-CLOS-CLASS-SLOTS 'UBS-CLASS-02 '(B)) (t (c) nil))
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'UBS-CLASS-02 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'UBS-CLASS-02 NIL) (t (c) nil))
-  (%try-chunk "unbound-slot" 9808607 1 #'run-ansi-unbound-slot-chunk-1)
+  (%try-chunk "unbound-slot" 8940255 1 #'run-ansi-unbound-slot-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === update-instance-for-different-class.lsp ===
+(in-package :modus.mvm)
 (%DEFMETHOD 'UPDATE-INSTANCE-FOR-DIFFERENT-CLASS 'NIL
  (LIST 'UIFDC-CLASS-01A 'UIFDC-CLASS-01B)
  (LAMBDA (FROM-OBJ TO-OBJ &REST INITARGS &KEY &ALLOW-OTHER-KEYS)
@@ -182561,10 +184815,13 @@ NIL
    (DECLARE (IGNORE INITARGS))
    (SET-SLOT-VALUE TO-OBJ 'A 100)
    TO-OBJ)) (t (c) nil))
-  (%try-chunk "update-instance-for-different-class" 8956591 1 #'run-ansi-update-instance-for-different-class-chunk-1)
+  (%try-chunk "update-instance-for-different-class" 912047 1 #'run-ansi-update-instance-for-different-class-chunk-1)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-accessors.lsp ===
+(in-package :modus.mvm)
 (DEFUN WA-A (OBJ) (SLOT-VALUE OBJ 'A))
 (DEFUN SET-WA-A (OBJ NV) (SET-SLOT-VALUE OBJ 'A NV))
 (DEFUN SETF-WA-A (NV OBJ) (SET-SLOT-VALUE OBJ 'A NV))
@@ -182891,11 +185148,14 @@ NIL
   (handler-case (%REGISTER-GF-FN #'SET-WA-C) (t (c) nil))
   (handler-case (%REGISTER-GF-FN #'SETF-WA-C) (t (c) nil))
   (handler-case (FIND-CLASS 'WITH-ACCESSORS-CLASS-01 NIL) (t (c) nil))
-  (%try-chunk "with-accessors" 16066522 1 #'run-ansi-with-accessors-chunk-1)
-  (%try-chunk "with-accessors" 16066522 2 #'run-ansi-with-accessors-chunk-2)
+  (%try-chunk "with-accessors" 12986330 1 #'run-ansi-with-accessors-chunk-1)
+  (%try-chunk "with-accessors" 12986330 2 #'run-ansi-with-accessors-chunk-2)
 )
 
+(in-package :modus.mvm)
+
 ;; === with-slots.lsp ===
+(in-package :modus.mvm)
 (DEFUN %SLOT-UNBOUND-METHOD-6 (CLASS INSTANCE SLOT-NAME) 'MISSING)
 (defun run-init-with-slots ()
   (handler-case (%DEFCLASS 'WITH-SLOTS-CLASS-01 '(A B C) 'NIL) (t (c) nil))
@@ -183501,10 +185761,12 @@ NIL
   (handler-case (%REGISTER-CLOS-DEFAULT-INITARGS 'WITH-SLOTS-CLASS-01 (LIST)) (t (c) nil))
   (handler-case (FIND-CLASS 'WITH-SLOTS-CLASS-01 NIL) (t (c) nil))
   (handler-case (%ADD-SLOT-UNBOUND-METHOD 'WITH-SLOTS-CLASS-01 NIL #'%SLOT-UNBOUND-METHOD-6) (t (c) nil))
-  (%try-chunk "with-slots" 13165239 1 #'run-ansi-with-slots-chunk-1)
-  (%try-chunk "with-slots" 13165239 2 #'run-ansi-with-slots-chunk-2)
-  (%try-chunk "with-slots" 13165239 3 #'run-ansi-with-slots-chunk-3)
+  (%try-chunk "with-slots" 1729207 1 #'run-ansi-with-slots-chunk-1)
+  (%try-chunk "with-slots" 1729207 2 #'run-ansi-with-slots-chunk-2)
+  (%try-chunk "with-slots" 1729207 3 #'run-ansi-with-slots-chunk-3)
 )
+
+(in-package :modus.mvm)
 
 (defvar *skip-below* 0)
 (defvar *run-only-below* 0)

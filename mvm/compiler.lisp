@@ -16383,8 +16383,16 @@
                   (target (if fn-info
                               (function-info-bytecode-offset fn-info)
                               ;; Unresolved: target the %UNRESOLVED-FN stub
-                              ;; which returns nil safely
-                              (let ((stub (gethash (compute-name-hash "%UNRESOLVED-FN") *functions*)))
+                              ;; which returns nil safely.
+                              ;; #215: *FUNCTIONS* is keyed by NAME STRING
+                              ;; (defvar above, :test 'equal).  This looked up
+                              ;; COMPUTE-NAME-HASH's INTEGER, so it never hit
+                              ;; and every unresolved call fell through to
+                              ;; target 0 — which is not a trap but the FIRST
+                              ;; function in the module, called with whatever
+                              ;; arguments the caller pushed.  That is the
+                              ;; ":li-func offset-0" garbage-execution class.
+                              (let ((stub (gethash "%UNRESOLVED-FN" *functions*)))
                                 (if stub
                                     (function-info-bytecode-offset stub)
                                     0)))))
@@ -17393,8 +17401,18 @@
           (maphash (lambda (k v) (incf total v) (push (cons v k) names))
                    *unresolved-calls*)
           (setf names (sort names #'> :key #'car))
-          (format t "~%  === ~D unresolved calls to ~D functions (resolve to %%unresolved-fn → nil) ===~%"
-                  total (length names))
+          ;; #215: say WHERE they resolved to, so a broken stub lookup is
+          ;; visible in the build log instead of silently degrading to
+          ;; target 0 (= the module's FIRST function, called with the
+          ;; caller's arguments).  The old text asserted the safe outcome
+          ;; without checking it, and was wrong for years.
+          (let ((stub (gethash "%UNRESOLVED-FN" *functions*)))
+            (if stub
+                (format t "~%  === ~D unresolved calls to ~D functions (→ %%unresolved-fn @ offset ~D → nil) ===~%"
+                        total (length names)
+                        (function-info-bytecode-offset stub))
+                (format t "~%  === ~D unresolved calls to ~D functions (!! NO %%UNRESOLVED-FN STUB — targeting offset 0, this is garbage execution) ===~%"
+                        total (length names))))
           (dolist (entry (subseq names 0 (min 200 (length names))))
             (format t "    ~4D × ~A~%" (car entry) (cdr entry)))
           (when (> (length names) 200)

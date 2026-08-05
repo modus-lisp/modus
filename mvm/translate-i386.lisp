@@ -289,10 +289,10 @@
    (materialises arguments 5+ — a no-op hands the callee stack garbage),
    #x0531 %MMAP-EXEC-PAGE (returns a page address).")
 
-(defparameter *i386-eax-live-traps* (list #x0510 #x0511)
+(defparameter *i386-eax-live-traps* (list #x0510 #x0511 #x0532)
   "Trap codes whose ARM OWNS EAX, so the :trap dispatch must NOT bracket them
-   with push/pop EAX.  On i386 VR is EAX, and these two are the only traps
-   that traffic in VR:
+   with push/pop EAX.  On i386 VR is EAX, and these are the only traps that
+   traffic in VR:
 
    #x0510 SETJMP     — compiler.lisp emits (:trap #x0510) (:mov dest VR), so
      the result has to arrive in VR.  A trailing `pop eax` would restore the
@@ -300,6 +300,9 @@
      silently never take its handler path.
    #x0511 LONGJMP    — hands the T sentinel to the setjmp resume point in EAX
      and never returns; the bracket's pop is unreachable anyway.
+   #x0532 %JIT-CALL  — compiler.lisp emits (:trap #x0532) (:mov dest VR), so
+     the JIT'd callee's return value arrives in EAX and the bracket's pop
+     would restore the pre-call EAX and discard it.  Exactly SETJMP's case.
 
    #x0512 CLEAR-HANDLER is deliberately ABSENT: there EAX holds the
    handler-case body's result (dest==VR==EAX) and the bracket is exactly what
@@ -2661,6 +2664,67 @@
                 (i386-emit-pop-reg buf +i386-esi+)
                 (i386-emit-pop-reg buf +scratch1+)
                 (i386-emit-pop-reg buf +scratch0+)))
+             ((and (= code #x0531) *i386-linux-mode*)
+              ;; %MMAP-EXEC-PAGE — the ONE new primitive the WS4 JIT needs: a
+              ;; page you can WRITE native bytes into AND then EXECUTE.
+              ;; V0 (ESI) = size, tagged, a page multiple; result = the mmap
+              ;; address, re-tagged into V0.  Mirrors translate-x64's #x0531
+              ;; (PROT_RWX = 7, MAP_PRIVATE|MAP_ANONYMOUS = 0x22, fd = -1).
+              ;;
+              ;; USES old_mmap (syscall 90), NOT mmap2 (192), on purpose:
+              ;; mmap2 passes its 6th argument in EBP, and EBP is VFP here —
+              ;; the frame pointer every spilled vreg is addressed off.
+              ;; old_mmap takes ONE argument, a pointer in EBX to a 6-dword
+              ;; block {addr, len, prot, flags, fd, offset}, which we build on
+              ;; the stack.  Nothing but EBX (V4, stacked) and EAX (already
+              ;; bracketed by the :trap dispatch) is disturbed.  old_mmap's
+              ;; offset field is in BYTES, and ours is 0, so the mmap2
+              ;; page-units subtlety does not arise.
+              (i386-emit-push-reg buf +i386-ebx+)                 ; save V4
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xFE) ; sar esi, 1
+              ;; Build the arg block; pushes descend, so push in reverse.
+              (i386-emit-push-imm32 buf 0)                        ; offset = 0
+              (i386-emit-push-imm32 buf #xFFFFFFFF)               ; fd = -1
+              (i386-emit-push-imm32 buf #x22)                     ; PRIVATE|ANON
+              (i386-emit-push-imm32 buf 7)                        ; PROT_RWX
+              (i386-emit-push-reg buf +i386-esi+)                 ; len
+              (i386-emit-push-imm32 buf 0)                        ; addr = NULL
+              (i386-emit-mov-reg-reg buf +i386-ebx+ +i386-esp+)   ; ebx = &args
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf 90)    ; eax = old_mmap
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80) ; int 0x80
+              (i386-emit-add-reg-imm buf +i386-esp+ 24)           ; drop the block
+              (i386-emit-byte buf #x01) (i386-emit-byte buf #xC0) ; add eax, eax
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC6) ; mov esi, eax
+              (i386-emit-pop-reg buf +i386-ebx+))
+
+             ((= code #x0532)
+              ;; %JIT-CALL — V0 (ESI) holds the callee's byte address as a
+              ;; TAGGED fixnum; untag and CALL it.  The callee builds its own
+              ;; EBP frame and returns in EAX, which already IS the VR the
+              ;; caller reads next.  Same shape as translate-x64's #x0532.
+              ;;
+              ;; #x0532 is in *i386-eax-live-traps* precisely because of that
+              ;; last clause: compiler.lisp emits (:trap #x0532) (:mov dest VR)
+              ;; and VR *is* EAX here, so the dispatch's usual push/pop EAX
+              ;; bracket would restore the pre-call EAX and silently DISCARD
+              ;; the callee's return value — the same failure mode SETJMP has.
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xFE) ; sar esi, 1
+              (i386-emit-byte buf #xFF) (i386-emit-byte buf #xD6)) ; call esi
+
+             ((= code #x0533)
+              ;; %JIT-ICACHE-FLUSH — a NO-OP on x86: the instruction cache is
+              ;; coherent with stores, so bytes written to an exec page are
+              ;; visible to fetch with no maintenance.  AArch64 does the
+              ;; DC CVAU / IC IVAU loop here; x64's arm is a NOP too.
+              (i386-emit-nop buf))
+
+             ((= code #x0534)
+              ;; %JIT-FREE-PAGE — a NO-OP on x86, exactly as on x64: the
+              ;; transient-page reclaim is runtime-gated to
+              ;; *jit-target-arch* :aarch64, so the trap is emitted (mvm-eval
+              ;; is shared source) but never executed here.
+              (i386-emit-nop buf))
+
              (t
               ;; Unimplemented trap.  Recorded at BUILD time (keyed by
               ;; #x10000 + code so it cannot collide with an opcode number)
@@ -3331,6 +3395,49 @@
                  (i386-load-vreg buf +scratch1+ vobj)
                  (i386-emit-sub-reg-imm buf +scratch1+ +tag-object+)
                  (i386-emit-mov-mem-reg buf +scratch1+ (* (1+ idx) 4) +scratch0+)))))
+
+        ;; ============================================
+        ;; SAP (System Area Pointer) — a 1-slot object, subtag #x16, whose
+        ;; single slot holds a RAW machine address rather than a tagged value.
+        ;; Only SAP-NEW and SAP-ADDR are reached by the i386 CL image (one site
+        ;; each); the ref/set opcodes are not emitted here and remain absent.
+        ;;
+        ;; i386 sizing: align16((1+1)*4) = 16 bytes, slot 0 at raw+4 — the
+        ;; same 16 bytes x64 uses, but for a different reason (x64: 8-byte
+        ;; header + 8-byte slot; i386: 4-byte header + 4-byte slot + padding).
+        ;; ============================================
+        ((op= +op-sap-new+)
+         ;; (sap-new Vd Vaddr) — box the RAW address in Vaddr.
+         (let ((vd (first operands)) (vaddr (second operands)))
+           ;; Load the payload FIRST: it may live in a spill slot, and the
+           ;; allocation sequence below owns both scratch registers.
+           (i386-load-vreg buf +scratch0+ vaddr)
+           (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)        ; EDX = base
+           (i386-emit-mov-mem-reg buf +scratch1+ 4 +scratch0+)     ; slot 0 = addr
+           (i386-emit-mov-mem-imm buf +scratch1+ 0 #x116)          ; (1<<8)|#x16
+           (i386-emit-mov-reg-reg buf +scratch0+ +scratch1+)
+           (i386-emit-add-reg-imm buf +scratch0+ 16)
+           (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+           (i386-emit-gc-mark-start buf +scratch1+)                ; object-start
+           (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+           (i386-store-vreg buf vd +scratch1+)))
+
+        ((op= +op-sap-addr+)
+         ;; (sap-addr Vd Vsap) — raw address out, TAGGED as a fixnum so it can
+         ;; be handed to syscall3 (which untags every argument), exactly as
+         ;; translate-x64's arm does.
+         ;;
+         ;; The `shl 1' is lossy for an address >= 2^31 on i386 (x64 loses
+         ;; nothing until 2^63).  Every SAP in this image points into the
+         ;; mmap'd heap at 0x1FFF_xxxx, so it does not bite today; a SAP over a
+         ;; high-half mapping would need a different encoding.  Stated rather
+         ;; than silently assumed.
+         (let ((vd (first operands)) (vsap (second operands)))
+           (i386-load-vreg buf +scratch0+ vsap)
+           (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 4)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)                ; tag
+           (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-obj-tag+)
          ;; (obj-tag Vd Vs) -- extract low 4-bit tag as tagged fixnum

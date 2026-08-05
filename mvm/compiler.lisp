@@ -16409,13 +16409,31 @@
 
           ;; ---- Function address ----
           (:fn-addr
+           ;; #216: an UNKNOWN name must emit the #xFFFFFFF0 sentinel, NOT
+           ;; offset 0 — exactly as the :li-func arm above already does
+           ;; (both arms emit the same MVM-FN-ADDR opcode, so the
+           ;; translators' existing sentinel handling covers this one too).
+           ;;
+           ;; Offset 0 is a VALID bytecode offset: it is the module's first
+           ;; function, and it IS present in the translator's offset→label
+           ;; table.  So `#'undefined-name` did not produce a bad pointer
+           ;; that later traps — it produced a perfectly well-formed,
+           ;; correctly-tagged pointer to the WRONG function, which funcall
+           ;; then happily invoked.  The sentinel misses every fn-table, so
+           ;; native translate loads NIL and funcall signals
+           ;; UNDEFINED-FUNCTION (CLHS-correct); the in-image interpreter
+           ;; resolves it to NIL the same way.
            (let* ((dest-reg (second insn))
                   (fn-name (third insn))
-                  (fn-info (%fn-info-for-key fn-name))
-                  (target (if fn-info
+                  (fn-info (%fn-info-for-key fn-name)))
+             (unless (or fn-info *mvm-eval-runtime-p*)
+               (format *error-output*
+                       ";; WARN fn-addr: unresolved function ~A — emitting NIL sentinel~%"
+                       fn-name))
+             (mvm-fn-addr buf dest-reg
+                          (if fn-info
                               (function-info-bytecode-offset fn-info)
-                              0)))
-             (mvm-fn-addr buf dest-reg target)))
+                              #xFFFFFFF0))))
 
           ;; ---- Memory ----
           (:load

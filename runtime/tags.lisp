@@ -50,9 +50,28 @@
 (defconstant +subtag-symbol+ #x50)
 (defconstant +subtag-function+ #x51)
 (defconstant +subtag-closure+ #x52)
-;;; 0x60-0x6F: MVM objects
-(defconstant +subtag-mvm-bytecode+ #x60)
-(defconstant +subtag-mvm-module+ #x61)
+;;; 0x60-0x6F: floats, then MVM objects
+;;;
+;;; NOTE ON AUTHORITY: this file is a REFERENCE document — it is in package
+;;; :MODUS.RUNTIME and is not loaded by any build script.  The subtags the
+;;; translators actually emit are the ones defined in `mvm/compiler.lisp`.
+;;; Keep the two in sync by hand; when they disagree, compiler.lisp wins.
+;;;
+;;; #x60 is the DOUBLE-FLOAT object subtag, and has been since the numeric
+;;; tower (N1).  THIS table had drifted and still listed #x60 as
+;;; +subtag-mvm-bytecode+ — a name nothing in the tree allocates or reads.
+;;; Recorded here so the next reader does not conclude #x60 is free.
+;;;
+;;; The float family deliberately SKIPS #x61..#x63.  #x61 is
+;;; +subtag-mvm-module+, an object WITH pointer slots that the GC follows.
+;;; A single-float parked there was scanned as an mvm-module, its raw IEEE
+;;; bit-slots were followed as pointers, and the resulting corrupted funcall
+;;; crashed with RIP=0xDEAD1004.  See CLAUDE.md.
+(defconstant +subtag-float+ #x60)         ; double-float (the default float)
+(defconstant +subtag-mvm-module+ #x61)    ; DO NOT hold numeric payloads here
+(defconstant +subtag-single-float+ #x64)
+(defconstant +subtag-short-float+ #x65)
+(defconstant +subtag-long-float+ #x66)
 
 ;;; ============================================================
 ;;; Tag Extraction

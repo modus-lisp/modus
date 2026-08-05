@@ -89,3 +89,57 @@ since (a) rewrites that allocation site anyway.
 
 `SAP-NEW`/`SAP-ADDR` (2 sites) and the 5 traps (8 sites) are independent of
 the representation question and can be closed separately.
+
+## x64 VERIFIED CORRECT (2026-08-05) — the base for (a) is sound
+
+Reviewed and then measured, on a CLI built from current main.
+
+**Code review.** The read path (`sar 1; shl 32` for hi, `sar 1; shl 32;
+shr 32` for lo) exactly inverts the write path (`sar 32; shl 1` for hi,
+`shl 32; shr 32; shl 1` for lo), so the 64 IEEE bits round-trip losslessly.
+Both slots keep low bit 0, preserving the GC-safety property.  `:gc-check`
+IS emitted before every allocating float op (`:fadd/:fsub/:fmul/:fdiv/
+:itof`) in compiler.lisp, and correctly omitted for `:ftoi`, which does not
+allocate — so the missing-gc-check class does not apply here.
+
+**Measured** (all 10 correct):
+
+```
+(+ 1.5d0 2.25d0)            => 3.75d0
+(- 0.0d0 5.5d0)             => -5.5d0
+(* -2.5d0 4.0d0)            => -10.0d0
+(/ 1.0d0 4.0d0)             => 0.25d0
+(- 1.0d0 3.0d0)             => -2.0d0
+(* -1.0d0 (/ 1.0d0 3.0d0))  => -0.3333333333333333d0
+(float 7 1.0d0)             => 7.0d0
+(truncate 3.99d0)           => 3
+(truncate -3.99d0)          => -3
+(< 1.0 2.0) (> -1.0 -2.0) (= 1.5 1.5) => T T T
+```
+
+The negative and full-mantissa cases are the important ones: they drive the
+`hi32` SIGN BIT through the tagged-halves representation — exactly the bit
+that overflows a 32-bit slot on i386.  x64 handles it correctly, which
+confirms the wall is width, not logic.
+
+## Subtag question: RESOLVED, no live collision
+
+Retracting the earlier flag.  `compiler.lisp:71` defines
+`+subtag-float+ = #x60` with the decision recorded in-source: "#x60 stays
+double-float (preserves the boot image and every existing literal)", and
+single/short/long were deliberately placed at `#x64..#x66` *because* `#x61`
+is `+subtag-mvm-module+` — the documented `RIP=0xDEAD1004` incident.
+
+`+subtag-mvm-bytecode+` (`runtime/tags.lisp:54`) is referenced NOWHERE but
+its own definition — nothing allocates or reads it.  So there is no live
+collision; `#x60` belongs to floats in practice and by intent.
+`runtime/tags.lisp` is simply stale and should gain a `+subtag-float+`
+entry (and lose or reserve the unused mvm-bytecode name) as bookkeeping.
+
+## Residual x64 gap (separate from (a))
+
+`:ftoi` has no overflow check: `CVTTSD2SI` returns the integer-indefinite
+value `0x8000000000000000` when the double exceeds the target range, and the
+subsequent `shl rax, 1` turns that into 0 — a silent wrong answer rather
+than a bignum or an error.  Real conformance gap, independent of the
+representation change.

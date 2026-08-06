@@ -1287,6 +1287,61 @@
                   (print-dec (length bytes))
                   (write-string-serial \" bytes to \")
                   (write-string-serial out) (write-char-serial 10)))))))))
+;; ---- #210 RUNG 1: modus --compile-aarch64 <in.lisp> <out> -----------------
+;; The CROSS-ARCH emit.  Identical in shape to %selfhost-compile-file above,
+;; but drives the AArch64 translator baked into this same x64 image and asks
+;; build-image for :linux-aarch64, so an x64 host process writes a Linux/
+;; AArch64 ELF with NO SBCL anywhere in the loop.  This is the thing #210
+;; rung 1 exists to demonstrate.
+(defun %selfhost-compile-file-aa64 (in out)
+  (let ((src (%selfhost-slurp-text in)))
+    (if (null src)
+        (progn (write-string-serial \"modus --compile-aarch64: cannot read \")
+               (write-string-serial in) (write-char-serial 10) (sys-exit 1))
+       (progn
+        ;; (Re)assert the aarch64 emitter config right before the emit, so a
+        ;; prior in-process --compile (x64) can't leave a stale knob behind.
+        (%init-aarch64-translator)
+        ;; Same three codegen knobs the x64 self-compile path uses; they are
+        ;; ARCH-INDEPENDENT compiler settings (static literal baking, no
+        ;; :li-halves, no runtime-eval variable reads), not translator state.
+        (setq *static-build-p* t)
+        (setq *mvm-emit-halves* nil)
+        (setq *mvm-eval-runtime-p* nil)
+        ;; Config probe: these are exactly the globals whose defvar/defparameter
+        ;; init-thunks do NOT run at boot, so print what the emitter is actually
+        ;; about to use.  A NIL here is the signature of a missed co-init.
+        (write-string-serial \"aa64-cfg fn-align=\")
+        (handler-case (write-object *aarch64-fn-align-offset*)
+          (t (c) (write-string-serial \"?\")))
+        (write-string-serial \" linux=\")
+        (handler-case (write-object *aarch64-linux-mode*) (t (c) nil))
+        (write-string-serial \" stackalign=\")
+        (handler-case (write-object *aarch64-stack-align-16*) (t (c) nil))
+        (write-string-serial \" vregmap=\")
+        (handler-case (write-object (a64-phys-reg 17)) (t (c) nil))
+        (write-string-serial \" midpoint=\")
+        (handler-case (write-object *linux-aarch64-gc-midpoint*) (t (c) nil))
+        (write-char-serial 10)
+        ;; Below the initial capacity (no grow) and far above it (forces the
+        ;; doubling path) — first-bad=-1 on both means the buffer is sound.
+        (handler-case (%a64-emit-roundtrip-check 400) (t (c) nil))
+        (handler-case (%a64-emit-roundtrip-check 3000) (t (c) nil))
+        (let ((image (build-image :target :linux-aarch64 :source-text src)))
+          (let ((bytes (kernel-image-image-bytes image))
+                (fd (%selfhost-open-exec out)))
+            (if (< fd 0)
+                (progn (write-string-serial \"modus --compile-aarch64: cannot write \")
+                       (write-string-serial out) (write-char-serial 10) (sys-exit 1))
+                (progn
+                  (%selfhost-write-bytes fd bytes)
+                  (%sys-close fd)
+                  (write-string-serial \"modus: wrote \")
+                  (print-dec (length bytes))
+                  (write-string-serial \" bytes to \")
+                  (write-string-serial out)
+                  (write-string-serial \" (linux-aarch64)\")
+                  (write-char-serial 10)))))))))
 (defun kernel-main ()
   (init-symbol-table)
   (init-keyword-table)
@@ -1426,6 +1481,22 @@
   ;; native Linux ELF and exits; otherwise fall through to the normal CLI.
   (let ((av (handler-case (%cli-collect-argv) (t (c) nil))))
     (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
+             (string= (car (cdr av)) \"--compile-aarch64\"))
+        ;; #210 rung 1 cross-arch emit.  Checked BEFORE \"--compile\" because
+        ;; STRING= is exact (not a prefix test), but keeping it first also
+        ;; makes the intent obvious if that ever changes.
+        (handler-case
+            (progn (%selfhost-compile-file-aa64 (nth 2 av) (nth 3 av)) (sys-exit 0))
+          (t (c) (progn (write-string-serial \"modus --compile-aarch64: error at \")
+                        (handler-case (write-object *current-source-location*)
+                          (t (c3) (write-string-serial \"?loc\")))
+                        (write-string-serial \" cond-type=\")
+                        (handler-case (write-object (type-of c))
+                          (t (c4) (write-string-serial \"?type\")))
+                        (write-string-serial \" cond=\")
+                        (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+                        (write-char-serial 10) (sys-exit 1))))
+    (if (and (consp av) (consp (cdr av)) (stringp (car (cdr av)))
              (string= (car (cdr av)) \"--compile\"))
         (handler-case
             (progn (%selfhost-compile-file (nth 2 av) (nth 3 av)) (sys-exit 0))
@@ -1438,7 +1509,7 @@
                         (write-string-serial \" cond=\")
                         (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
                         (write-char-serial 10) (sys-exit 1))))
-        (handler-case (cli-toplevel) (t (c) (sys-exit 1))))))
+        (handler-case (cli-toplevel) (t (c) (sys-exit 1)))))))
 ")
 
 (defvar *all-runtime-source*

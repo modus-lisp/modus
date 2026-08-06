@@ -671,6 +671,45 @@
   (setf (target-emit-prologue *target-x86-64*) (function emit-function-prologue))
   (setf (target-emit-epilogue *target-x86-64*) (function emit-function-epilogue))
   (register-target *target-x86-64*)
+  ;; #210 rung 1: same treatment for *target-aarch64* (target.lisp:134), so
+  ;; (find-target :aarch64) — which build-image reaches via
+  ;; target-base-arch(:linux-aarch64) → :aarch64 — resolves in-image.  The
+  ;; slot wiring replicates install-aarch64-translator (translate-aarch64.lisp
+  ;; :5306).  Values transcribed from the *target-aarch64* defparameter; note
+  ;; :float-support is left at make-target's :none default, matching it.
+  (setq *target-aarch64*
+        (make-target
+         :name :aarch64
+         :word-size 8
+         :endianness :little
+         :reg-map (vector :x0 :x1 :x2 :x3
+                          :x19 :x20 :x21 :x22
+                          :x23 nil nil nil
+                          nil nil nil nil
+                          :x0 :x24 :x25 :x26 :sp :x29 nil)
+         :n-phys-regs 31
+         :callee-saved (list 4 5 6 7 8)
+         :arg-regs (list 0 1 2 3)
+         :scratch-regs (list 5 6 7 8)
+         :max-inline-regs 8
+         :page-size 4096
+         :translate-fn nil
+         :emit-prologue nil
+         :emit-epilogue nil
+         :emit-boot nil
+         :features (list :has-gic t :has-psci t)))
+  ;; install-aarch64-translator wraps the prologue/epilogue in LAMBDAs that
+  ;; drop the TARGET argument.  Use named shims instead so nothing stores a
+  ;; closure in a struct slot (matching the x64 branch's (function …) style).
+  ;; cross.lisp only ever reads TARGET-TRANSLATE-FN, but set all three so the
+  ;; descriptor is faithful.
+  (setf (target-translate-fn  *target-aarch64*)
+        (function translate-mvm-to-aarch64))
+  (setf (target-emit-prologue *target-aarch64*)
+        (function %a64-target-emit-prologue))
+  (setf (target-emit-epilogue *target-aarch64*)
+        (function %a64-target-emit-epilogue))
+  (register-target *target-aarch64*)
   t)
 ")
 

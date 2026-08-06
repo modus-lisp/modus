@@ -55,27 +55,42 @@
 ;;;              build-x64-repl, build-aarch64-repl, build-rpi-repl,
 ;;;              build-x64-ssh, build-aarch64-ssh, build-aarch64-actors,
 ;;;              build-aarch64-isolated, build-i386-ssh.   (36 -> 28)
+;;; OUTPUT PATHS ARE TRANSCRIBED FROM THE SCRIPTS, not from the docs.  An
+;;; audit of all 28 rows found SEVEN wrong — they had been written from
+;;; BUILDS.md and the run scripts rather than from what each build actually
+;;; writes.  A wrong path here is not cosmetic now that this table is the
+;;; interface: `run.sh` boots the path this column names.
+;;;
+;;; !! COLLISION: build-generic-cli and build-generic BOTH default to
+;;; /tmp/modus, so x64/hosted/-/cli and x64/hosted/-/generic overwrite each
+;;; other.  The old (wrong) table hid this by claiming /tmp/modus-generic for
+;;; the latter.  build-generic honours MODUS_GENERIC_OUT; set it when you
+;;; need both.  Left as-is rather than silently changing a shipping default.
+;;;
+;;; Two rows are PARAMETERISED and the column shows the shape, not a literal:
+;;;   build-bench        -> /tmp/modus-bench-<target>.bin  (per arch)
+;;;   build-*-linux      -> honours MODUS_ANSI_OUT
 ;;; ------------------------------------------------------------------
 (defparameter *matrix*
   '(;; ---------------- hosted (Linux ELF) ----------------
     ("x64/hosted/-/cli"       :x64     :hosted :-    :cli
      :legacy nil :x64     "/tmp/modus"                     "build-generic-cli")
     ("aarch64/hosted/-/cli"   :aarch64 :hosted :-    :cli
-     :legacy nil :aarch64 "/tmp/modus-aarch64-cli"         "build-aarch64-cli")
+     :legacy nil :aarch64 "/home/claude/modus-aa64-cli"    "build-aarch64-cli")
     ("i386/hosted/-/cli"      :i386    :hosted :-    :cli
      :legacy nil :i386    "/tmp/modus-i386-cli"            "build-i386-cli")
     ("x64/hosted/-/ansi"      :x64     :hosted :-    :ansi
      :legacy nil :x64     "/home/claude/modus/tmp/modus-ansi-test" "build-x64-linux")
     ("aarch64/hosted/-/ansi"  :aarch64 :hosted :-    :ansi
-     :legacy nil :aarch64 "/tmp/modus-aarch64-ansi"        "build-aarch64-linux")
+     :legacy nil :aarch64 "/home/claude/modus/tmp/modus-aa64-ansi-test" "build-aarch64-linux")
     ("x64/hosted/-/selfhost"  :x64     :hosted :-    :selfhost
      :legacy nil :x64     "/tmp/modus-selfhost"            "build-modus-selfhost")
     ("x64/hosted/-/generic"   :x64     :hosted :-    :generic
-     :legacy nil :x64     "/tmp/modus-generic"             "build-generic")
+     :legacy nil :x64     "/tmp/modus"                     "build-generic")   ; !! see COLLISION note
     ("x64/hosted/-/mvm"       :x64     :hosted :-    :mvm
-     :legacy nil :x64     "/tmp/modus-mvm"                 "build-mvm")
+     :legacy nil :x64     "/tmp/modus-out"                 "build-mvm")
     ("x64/hosted/-/bench"     :x64     :hosted :-    :bench
-     :legacy nil :x64     "/tmp/modus-bench-x64.bin"       "build-bench")
+     :legacy nil :x64     "/tmp/modus-bench-<target>.bin"  "build-bench")
 
     ;; ---------------- bare / qemu ----------------
     ;; The four REPL cells are MIGRATED: pure table data, no per-cell code.
@@ -87,7 +102,7 @@
      :legacy :i386    :i386    "/tmp/modus-i386.bin"       "build-i386-repl")
 
     ("x64/bare/qemu/cl-repl"  :x64     :bare   :qemu :cl-repl
-     :legacy nil :x64     "/tmp/modus-x64-cl.bin"          "build-x64-cl-repl")
+     :legacy nil :x64     "/tmp/modus-x64-cl-repl.bin"     "build-x64-cl-repl")
     ;; The five SSH/actors cells are MIGRATED — see *COMPOSITES* below.
     ("x64/bare/qemu/ssh"      :x64     :bare   :qemu :ssh
      :native :x86-64  :x64     "/tmp/modus-x64-ssh.bin"    "build-x64-ssh")
@@ -115,7 +130,7 @@
     ("aarch64/bare/rpi/hid"   :aarch64 :bare   :rpi  :hid
      :legacy nil :aarch64 "/tmp/kernel8-hid.img"           "build-rpi-hid")
     ("aarch64/bare/rpi/periph" :aarch64 :bare  :rpi  :periph
-     :legacy nil :aarch64 "/tmp/kernel8.img"               "build-rpi-periph")
+     :legacy nil :aarch64 "/tmp/piboot/kernel8.img"        "build-rpi-periph")
     ("aarch64/bare/rpi/pizero-ssh" :aarch64 :bare :rpi :pizero-ssh
      :legacy nil :aarch64 "/tmp/piboot/kernel8.img"        "build-pizero2w-ssh")
     ("aarch64/bare/rpi/pizero-actors" :aarch64 :bare :rpi :pizero-actors

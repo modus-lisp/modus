@@ -210,7 +210,41 @@ to the `mvm/BUILDS.md` table. The x64 ANSI gate is therefore not applicable
 
 ### aarch64 ANSI runner, range 13300..14600
 
-<!--ANSI-->
+`mvm/build-aarch64-linux.lisp`, `--dynamic-space-size 16384`. BASE built from
+a clean `git archive main` export (verified: `grep -c a64-msub` = 0), NET from
+this branch. Identical shard geometry and timeout on both sides
+(`NSH=8 TMO=900`); the two sweeps were run **sequentially**, never overlapping.
+Matched wall times confirm matched budgets (7m48s / 7m54s).
+
+```
+BASE: passed=2104  CHUNK-CRASH=0  FILE-WEDGE=1   (13300..14600 NSH=8 TMO=900)
+NET:  passed=2132  CHUNK-CRASH=0  FILE-WEDGE=1   (13300..14600 NSH=8 TMO=900)
+```
+
+**Per-ID diff (the metric that counts): +28 gained, 0 LOST.** Crash markers
+identical on both sides. There are no losses, so the "recheck every loss 3×
+isolated and in its containing shard" step is vacuous — I instead re-ran the
+*gains* in isolation (outside the sharded harness), and they reproduce with
+still zero losses.
+
+The gains are causally coherent with a `mod` fix rather than scattered noise —
+they cluster in exactly the arithmetic files that depend on a remainder, and
+`evenp`/`oddp` are literally `(mod x 2)`:
+
+| n | file | IDs |
+|---|---|---|
+| 10 | custom in-image probe battery (outside corpus ranges) | 5530, 5531, 5603, 5604, 9488, 9920, 9964, 9970–9972 |
+| 7 | `number-comparison` | 14009, 14027, 14097–14100, 14122 |
+| 4 | `numerator-denominator` | 14135–14138 |
+| 2 | `divide` | 13443, 13450 |
+| 1 | `evenp` | 13478 |
+| 1 | `oddp` | 14145 |
+| 1 | `logand` | 13723 |
+| 1 | `real` | 14335 |
+| 1 | `round` | 14354 |
+
+(File names resolved through the **NET build's own** freshly written
+`/tmp/ansi-file-ranges.txt`, not a stale copy.)
 
 ### Byte-identity table
 
@@ -266,7 +300,8 @@ arithmetic is involved yet). It needs its own investigation.
 
 - **Does**: `+op-mod+` on aarch64 returned a hard 0 at 9 sites in the CLI image
   and in every bare-metal aarch64 image; it is fixed; x64 is provably
-  untouched.
+  untouched; the aarch64 ANSI range gate is +28 / −0 with identical crash
+  markers.
 - **Does not**: claim the MV convention was broken (it is not), claim this
   fixes `aarch64-ssh` (it does not), or claim the aarch64 image hashes are
   stable (they change, by design).
